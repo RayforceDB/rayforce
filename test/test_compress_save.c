@@ -325,7 +325,7 @@ static test_result_t test_value_ops_copy_encoded(void) {
     ray_enc_counters_reset();
     TEST_ASSERT_STR_EQ(ev_code("(set a (update {v: (* v 2) from: a}))"), "");
     ray_enc_counters_t k; ray_enc_counters_get(&k);
-    TEST_ASSERT_EQ_U(k.materialized, 1);              /* only the updated column */
+    TEST_ASSERT_EQ_U(k.materialized, 0);              /* (* v 2) range-reads v */
     ray_t* r = ray_eval_str("(sum (at b 'v))");
     TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->i64 == 100);
     ray_release(r);
@@ -2939,7 +2939,8 @@ static test_result_t test_expr_compile_bound(void) {
                 if (ex.regs[r].nullable) nullable[gi][s] = true;
                 /* the register reads a source bound on the graph: the
                  * registry's entry for one of the scanned columns (a hit,
-                 * no new bind), encoded exactly at generation 2 */
+                 * no new bind), encoded exactly at generation 2, where it
+                 * is range-read (enc, no captured pointer) */
                 src_set = false;
                 static const char* const cn[3] = { "a", "b", "v" };
                 for (int k = 0; k < 3 && !src_set; k++) {
@@ -2949,10 +2950,15 @@ static test_result_t test_expr_compile_bound(void) {
                     bool scanned = strstr(srcs[s], cn[k]) != NULL;
                     if (scanned) TEST_ASSERT_EQ_I(ray_graph_binds_count(gr), nb);
                     TEST_ASSERT_NULL(err);
-                    ray_t* plain = NULL;
-                    if (!bs || !bs->obj || ray_col_src_plain(bs, &plain) || !plain) continue;
-                    src_set = ex.regs[r].data == ray_data(plain) &&
-                              (bs->obj->type == RAY_ENCCOL) == (gen == 2);
+                    if (!bs || !bs->obj || ex.regs[r].src != bs) continue;
+                    if (gen == 2) {
+                        src_set = bs->obj->type == RAY_ENCCOL && ex.regs[r].enc && !ex.regs[r].data;
+                    } else {
+                        ray_t* plain = NULL;
+                        if (ray_col_src_plain(bs, &plain) || !plain) continue;
+                        src_set = bs->obj->type != RAY_ENCCOL && !ex.regs[r].enc &&
+                                  ex.regs[r].data == ray_data(plain);
+                    }
                 }
                 if (!src_set) break;
             }
@@ -2995,11 +3001,16 @@ static test_result_t test_expr_compile_bound(void) {
         TEST_ASSERT_TRUE(!r && cp_is_bind_error(err));
         ray_error_free(err); err = NULL;
         if (gen == 2) {
+            /* P2: the scan arm no longer decodes (its registers are
+             * range-read), so a failing decode allocation cannot fail the
+             * compile; range-read failures are scanrange/expr_error's */
             ray_enccol_test_fail_alloc(1);
+            ray_enc_counters_reset();
             r = expr_compile(gr, t, d, &ex, &err);
             ray_enccol_test_fail_alloc(0);
-            TEST_ASSERT_TRUE(!r && err && RAY_IS_ERR(err));
-            ray_error_free(err); err = NULL;
+            TEST_ASSERT_TRUE(r && !err);
+            ray_enc_counters_t kc; ray_enc_counters_get(&kc);
+            TEST_ASSERT_EQ_U(kc.materialized, 0);
         }
         ray_release(e4);
 
@@ -3491,8 +3502,9 @@ static test_result_t test_parted_pruning_fetch(void) {
     TEST_ASSERT_EQ_I(out->len, 3000);
     TEST_ASSERT_TRUE(clean);                             /* per-segment tables unbound */
     ray_enc_counters_t c; ray_enc_counters_get(&c);
-    /* columns a and b of the surviving partition, nothing else */
-    TEST_ASSERT_FMT(c.materialized == 2, "materialized %llu segment columns", (unsigned long long)c.materialized);
+    /* columns a and b of the surviving partition are range-read by the
+     * fused (+ a b): nothing is materialized */
+    TEST_ASSERT_FMT(c.materialized == 0, "materialized %llu segment columns", (unsigned long long)c.materialized);
     const int64_t* d = (const int64_t*)ray_data(out);
     for (int i = 0; i < 3000; i++)
         TEST_ASSERT_EQ_I(d[i], (int64_t)i * 4 + (int64_t)i * 5 + 1);   /* partition 1: 4 i + 5 i + 1 */
@@ -3556,7 +3568,8 @@ static test_result_t test_parted_pruning_multi(void) {
     ray_enc_counters_t c; ray_enc_counters_get(&c);
     TEST_ASSERT_TRUE(o2 && !RAY_IS_ERR(o2) && o2->len == 6000);
     TEST_ASSERT_TRUE(clean);
-    TEST_ASSERT_FMT(c.materialized == 4, "materialized %llu segment columns", (unsigned long long)c.materialized);
+    /* the fused (+ a b) range-reads both partitions' columns */
+    TEST_ASSERT_FMT(c.materialized == 0, "materialized %llu segment columns", (unsigned long long)c.materialized);
     ray_t* o0 = pruned_run(t0, Q_LE_02, R_SUM, NULL);
     TEST_ASSERT_TRUE(same_outcome(o0, o2));
     drop_out(o0); drop_out(o2); ray_release(t0); ray_release(t2);
@@ -4905,7 +4918,7 @@ static test_result_t test_select_decodes_referenced_only(void) {
         { "(select {k: k v: v from: u2 where: (> w 5) take: 5})",             3 },
         { "(select {v: v from: u2 desc: v take: 3})",                         1 },
         { "(select {v: v x: x from: u2 where: (> w 5) asc: x take: 4})",      3 },
-        { "(select {z: (+ v x) from: u2 where: (> w 5)})",                    3 },
+        { "(select {z: (+ v x) from: u2 where: (> w 5)})",                    1 },  /* P2: a fused side range-reads */
         { NULL, 0 },
     };
     for (int i = 0; qs[i].q; i++) {

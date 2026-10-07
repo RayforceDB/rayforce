@@ -2026,6 +2026,7 @@ static ray_t* exec_elementwise_tree(ray_graph_t* g, ray_op_t* root) {
                         state[e.id] = EW_DONE;
                         continue;
                     }
+                    if (expr_eval_err_fatal(vec)) { result = vec; goto done; }
                     ray_error_free(vec);   /* fall through to per-node eval */
                 } else if (cerr) {         /* a failed column bind is the query's error */
                     result = cerr;
@@ -2402,6 +2403,8 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     if (expr_compile(g, g->table, op, &ex, &cerr)) {
                         ray_t* vec = expr_eval_full(&ex, nr);
                         if (vec && !RAY_IS_ERR(vec)) return vec;
+                        if (expr_eval_err_fatal(vec)) return vec;   /* a range read failed */
+                        if (vec) ray_error_free(vec);               /* oom: per-node eval */
                     } else if (cerr) {
                         return cerr;
                     }

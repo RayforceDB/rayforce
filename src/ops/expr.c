@@ -874,35 +874,56 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
                  * integer lanes. */
                 if (col_nulls && elem == RAY_SYM)
                     EXPR_BAIL(EXPR_BAIL_NULLS);
-                /* Past every gate: the plain column is requested here, where
-                 * its payload pointer is captured. */
-                ray_t* col = NULL;
-                *err = ray_col_src_plain(src, &col);
-                if (*err) return false;
+                /* Past every gate.  A source whose plain vector is ready
+                 * (generation 0, or a published materialization) keeps
+                 * today's capture; a generation-2 single-file source is
+                 * range-read per morsel (expr_eval_morsel), never
+                 * materialized here.  An encoded parted source keeps
+                 * is_parted (Task 4: its segments). */
+                ray_t* ready = ray_col_src_ready(src);
+                bool enc = !src->parted && !ready;
                 out->regs[r].kind = REG_SCAN;
-                if (src->parted) {
-                    int8_t base = elem;
-                    out->regs[r].col_type = base;
-                    out->regs[r].data = NULL; /* resolved per-segment */
-                    out->regs[r].is_parted = true;
-                    out->regs[r].col_obj = NULL; /* parted: per-segment, no zone-skip */
-                    out->regs[r].parted_col = col;
-                    out->regs[r].type = (base == RAY_F64 || base == RAY_F32)
-                                      ? RAY_F64 : RAY_I64;
-                    out->regs[r].nullable = col_nulls;
-                    out->regs[r].null_src = col_nulls;
-                    out->has_parted = true;
-                } else {
-                    out->regs[r].col_type = col->type;
-                    out->regs[r].col_attrs = col->attrs;
-                    out->regs[r].data = ray_data(col);
+                out->regs[r].src = src;
+                out->regs[r].enc = enc;
+                if (enc) {
+                    out->regs[r].col_type = src->type;
+                    out->regs[r].col_attrs = src->attrs;
+                    out->regs[r].data = NULL;
                     out->regs[r].is_parted = false;
-                    out->regs[r].col_obj = col;
+                    out->regs[r].col_obj = NULL;
                     out->regs[r].parted_col = NULL;
-                    out->regs[r].type = (col->type == RAY_F64 || col->type == RAY_F32)
+                    out->regs[r].type = (src->type == RAY_F64 || src->type == RAY_F32)
                                       ? RAY_F64 : RAY_I64;
                     out->regs[r].nullable = col_nulls;
                     out->regs[r].null_src = col_nulls;
+                } else {
+                    ray_t* col = NULL;
+                    *err = ray_col_src_plain(src, &col);   /* ready, or parted until Task 4 */
+                    if (*err) return false;
+                    if (src->parted) {
+                        int8_t base = elem;
+                        out->regs[r].col_type = base;
+                        out->regs[r].data = NULL; /* resolved per-segment */
+                        out->regs[r].is_parted = true;
+                        out->regs[r].col_obj = NULL; /* parted: per-segment, no zone-skip */
+                        out->regs[r].parted_col = col;
+                        out->regs[r].type = (base == RAY_F64 || base == RAY_F32)
+                                          ? RAY_F64 : RAY_I64;
+                        out->regs[r].nullable = col_nulls;
+                        out->regs[r].null_src = col_nulls;
+                        out->has_parted = true;
+                    } else {
+                        out->regs[r].col_type = col->type;
+                        out->regs[r].col_attrs = col->attrs;
+                        out->regs[r].data = ray_data(col);
+                        out->regs[r].is_parted = false;
+                        out->regs[r].col_obj = col;
+                        out->regs[r].parted_col = NULL;
+                        out->regs[r].type = (col->type == RAY_F64 || col->type == RAY_F32)
+                                          ? RAY_F64 : RAY_I64;
+                        out->regs[r].nullable = col_nulls;
+                        out->regs[r].null_src = col_nulls;
+                    }
                 }
             } else if (node->opcode == OP_CONST) {
                 ray_op_ext_t* ext = find_ext(g, node->id);
@@ -1817,9 +1838,12 @@ static void expr_exec_unary(uint8_t opcode, uint8_t null_aware, int8_t dt, void*
 
 /* Evaluate compiled expression for morsel [start, end).
  * scratch: array of EXPR_MAX_REGS buffers, each EXPR_MORSEL*8 bytes.
- * Returns pointer to output data (morsel-relative indexing). */
+ * rsc: one range scratch per register index, NULL when no register is
+ * encoded.  Returns pointer to output data (morsel-relative indexing);
+ * NULL with an owned *err when a range read fails. */
 static void* expr_eval_morsel(const ray_expr_t* expr, void** scratch,
-                               int64_t start, int64_t end) {
+                              ray_col_scratch_t* rsc, int64_t start, int64_t end,
+                              ray_t** err) {
     int64_t n = end - start;
     if (n <= 0) return NULL;
 
@@ -1835,16 +1859,34 @@ static void* expr_eval_morsel(const ray_expr_t* expr, void** scratch,
                  * Narrow types always go through expr_load_* for sentinel
                  * normalization. */
                 uint8_t ca = expr->regs[r].col_attrs;
-                if (rt == RAY_F64 && ct == RAY_F64) {
-                    rptrs[r] = (double*)expr->regs[r].data + start;
-                } else if (rt == RAY_I64 && (ct == RAY_I64 || ct == RAY_TIMESTAMP)) {
-                    rptrs[r] = (int64_t*)expr->regs[r].data + start;
-                } else if (rt == RAY_I64 && ct == RAY_SYM &&
-                           (ca & RAY_SYM_W_MASK) == RAY_SYM_W64) {
-                    rptrs[r] = (int64_t*)expr->regs[r].data + start;
+                bool hn = expr->regs[r].nullable;
+                bool direct = (rt == RAY_F64 && ct == RAY_F64) ||
+                              (rt == RAY_I64 && (ct == RAY_I64 || ct == RAY_TIMESTAMP)) ||
+                              (rt == RAY_I64 && ct == RAY_SYM && (ca & RAY_SYM_W_MASK) == RAY_SYM_W64);
+                if (expr->regs[r].enc) {
+                    /* generation 2: at most one vector per range read; a
+                     * morsel that straddles a vector boundary is assembled
+                     * piece by piece into this register's scratch */
+                    int64_t at = 0;
+                    rptrs[r] = scratch[r];
+                    while (at < n) {
+                        ray_col_range_t v;
+                        ray_t* e = ray_col_range(expr->regs[r].src, start + at, n - at, &rsc[r], &v);
+                        if (e) { *err = e; return NULL; }
+                        if (v.n <= 0) { *err = ray_error("corrupt", "fused scan: short range read"); return NULL; }
+                        if (at == 0 && v.n == n && direct) { rptrs[r] = (void*)v.data; break; }
+                        if (direct)
+                            memcpy((char*)scratch[r] + at * 8, v.data, (size_t)v.n * 8);
+                        else if (rt == RAY_F64)
+                            expr_load_f64((double*)scratch[r] + at, v.data, ct, v.attrs, hn, 0, v.n);
+                        else
+                            expr_load_i64((int64_t*)scratch[r] + at, v.data, ct, v.attrs, hn, 0, v.n);
+                        at += v.n;
+                    }
+                } else if (direct) {
+                    rptrs[r] = (char*)expr->regs[r].data + (size_t)start * 8;
                 } else {
                     rptrs[r] = scratch[r];
-                    bool hn = expr->regs[r].nullable;
                     if (rt == RAY_F64)
                         expr_load_f64(scratch[r], expr->regs[r].data, ct, ca, hn, start, n);
                     else
@@ -2051,6 +2093,7 @@ typedef struct {
     int8_t out_type;
     rowsel_builder_t* sel_builders;    /* NULL = normal bool/vec output */
     uint32_t          n_sel_builders;  /* slot count (fused mode only)  */
+    ray_scan_fail_t*  fail;            /* range-read failures, keyed by task start */
 } expr_full_ctx_t;
 
 static void expr_full_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
@@ -2058,16 +2101,28 @@ static void expr_full_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t e
     expr_full_ctx_t* c = (expr_full_ctx_t*)ctx;
     const ray_expr_t* expr = c->expr;
     uint8_t esz = ray_elem_size(c->out_type);
+    /* a lower task already failed: this one cannot change the answer (the
+     * coordinator discards the output; a skipped selection builder stays
+     * all-NONE) */
+    if (ray_scan_fail_skip(c->fail, start)) return;
 
     /* Per-worker scratch buffers (heap-allocated via arena, morsel-sized) */
     ray_t* scratch_hdr = NULL;
     /* one morsel buffer per register the expression uses */
     char* scratch_mem = (char*)scratch_alloc(&scratch_hdr,
                             (size_t)(expr->n_regs ? expr->n_regs : 1) * EXPR_MORSEL * 8);
-    if (!scratch_mem) return;
+    if (!scratch_mem) { ray_scan_fail_note(c->fail, start, ray_error("oom", "fused expression scratch")); return; }
     void* scratch[EXPR_MAX_REGS];
     for (uint8_t r = 0; r < expr->n_regs; r++)
         scratch[r] = scratch_mem + (size_t)r * EXPR_MORSEL * 8;
+    /* range scratch, one per register index, only when a register is
+     * read by range */
+    ray_col_scratch_t rsc_arr[EXPR_MAX_REGS];
+    ray_col_scratch_t* rsc = NULL;
+    for (uint8_t r = 0; r < expr->n_regs; r++)
+        if (expr->regs[r].kind == REG_SCAN && expr->regs[r].enc) { rsc = rsc_arr; break; }
+    if (rsc) for (uint8_t r = 0; r < expr->n_regs; r++) ray_col_scratch_init(&rsc[r]);
+    bool failed = false;
 
     /* Chunk-zone skip is only possible for a BOOL predicate over a zone-
      * indexed column; compute the gate once, not per morsel. */
@@ -2109,7 +2164,12 @@ static void expr_full_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t e
                 continue;
             }
         }
-        void* result = expr_eval_morsel(expr, scratch, ms, me);
+        void* result = NULL;
+        if (!failed) {
+            ray_t* err = NULL;
+            result = expr_eval_morsel(expr, scratch, rsc, ms, me, &err);
+            if (err) { ray_scan_fail_note(c->fail, start, err); failed = true; result = NULL; }
+        }
         if (sb) {
             /* Selection mode: emit this morsel's bools (or, on the rare
              * eval-NULL internal error, a none-pass segment so the builder's
@@ -2121,6 +2181,7 @@ static void expr_full_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t e
             memcpy((char*)c->out_data + ms * esz, result, (size_t)(me - ms) * esz);
         }
     }
+    if (rsc) for (uint8_t r = 0; r < expr->n_regs; r++) ray_col_scratch_free(&rsc[r]);
     scratch_free(scratch_hdr);
 }
 
@@ -2187,8 +2248,10 @@ static ray_t* expr_eval_full_parted(const ray_expr_t* expr, int64_t nrows) {
     uint8_t esz = ray_elem_size(expr->out_type);
     ray_pool_t* pool = ray_pool_get();
     int64_t global_off = 0;
+    ray_scan_fail_t fail; ray_scan_fail_init(&fail);
+    bool dispatched = false;
 
-    for (int64_t s = 0; s < n_segs; s++) {
+    for (int64_t s = 0; s < n_segs && !ray_scan_failed(&fail); s++) {
         /* Determine segment length from any non-NULL parted register */
         int64_t seg_len = 0;
         for (uint8_t r = 0; r < expr->n_regs; r++) {
@@ -2224,14 +2287,18 @@ static ray_t* expr_eval_full_parted(const ray_expr_t* expr, int64_t nrows) {
             .expr = &seg_expr,
             .out_data = (char*)ray_data(out) + global_off * esz,
             .out_type = expr->out_type,
+            .fail = &fail,
         };
-        if (pool && seg_len >= RAY_PARALLEL_THRESHOLD)
+        if (pool && seg_len >= RAY_PARALLEL_THRESHOLD) {
             ray_pool_dispatch(pool, expr_full_fn, &ctx, seg_len);
-        else
+            dispatched = true;
+        } else
             expr_full_fn(&ctx, 0, 0, seg_len);
 
         global_off += seg_len;
     }
+    ray_t* ferr = ray_scan_fail_finish(&fail, dispatched ? pool : NULL);
+    if (ferr) { ray_release(out); return ferr; }
     expr_flag_output_nulls(expr, out, nrows);
     return out;
 }
@@ -2246,18 +2313,42 @@ ray_t* expr_eval_full(const ray_expr_t* expr, int64_t nrows) {
     if (!out || RAY_IS_ERR(out)) return out;
     out->len = nrows;
 
+    ray_scan_fail_t fail; ray_scan_fail_init(&fail);
     expr_full_ctx_t ctx = {
-        .expr = expr, .out_data = ray_data(out), .out_type = expr->out_type,
+        .expr = expr, .out_data = ray_data(out), .out_type = expr->out_type, .fail = &fail,
     };
+    for (uint8_t r = 0; r < expr->n_regs; r++)
+        if (expr->regs[r].kind == REG_SCAN && expr->regs[r].enc)
+            ray_col_src_advise(expr->regs[r].src, 0, nrows);
 
     ray_pool_t* pool = ray_pool_get();
-    if (pool && nrows >= RAY_PARALLEL_THRESHOLD)
+    bool par = pool && nrows >= RAY_PARALLEL_THRESHOLD;
+    if (par)
         ray_pool_dispatch(pool, expr_full_fn, &ctx, nrows);
     else
         expr_full_fn(&ctx, 0, 0, nrows);
 
+    ray_t* ferr = ray_scan_fail_finish(&fail, par ? pool : NULL);
+    if (ferr) { ray_release(out); return ferr; }
     expr_flag_output_nulls(expr, out, nrows);
     return out;
+}
+
+/* Run the morsel evaluator of a BOOL program over [start, end) (at most
+ * EXPR_MORSEL rows, any alignment) into out[0 .. end - start). */
+void ray_expr_test_eval_range(const ray_expr_t* expr, int64_t start, int64_t end,
+                              uint8_t* out, ray_t** err) {
+    *err = NULL;
+    ray_t* hdr = NULL;
+    char* mem = (char*)scratch_alloc(&hdr, (size_t)(expr->n_regs ? expr->n_regs : 1) * EXPR_MORSEL * 8);
+    if (!mem) { *err = ray_error("oom", NULL); return; }
+    void* scratch[EXPR_MAX_REGS];
+    ray_col_scratch_t rsc[EXPR_MAX_REGS];
+    for (uint8_t r = 0; r < expr->n_regs; r++) { scratch[r] = mem + (size_t)r * EXPR_MORSEL * 8; ray_col_scratch_init(&rsc[r]); }
+    void* res = expr_eval_morsel(expr, scratch, rsc, start, end, err);
+    if (res && !*err) memcpy(out, res, (size_t)(end - start));
+    for (uint8_t r = 0; r < expr->n_regs; r++) ray_col_scratch_free(&rsc[r]);
+    scratch_free(hdr);
 }
 
 /* ============================================================================
@@ -2431,19 +2522,32 @@ ray_t* exec_pred_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
         pred_sel_builders_alloc(nrows, pool, &parallel, &n_builders);
     if (!builders) return NULL;
 
+    ray_scan_fail_t fail; ray_scan_fail_init(&fail);
     expr_full_ctx_t ctx = {
         .expr           = &ex,
         .out_data       = NULL,
         .out_type       = ex.out_type,
         .sel_builders   = builders,
         .n_sel_builders = n_builders,
+        .fail           = &fail,
     };
+    for (uint8_t r = 0; r < ex.n_regs; r++)
+        if (ex.regs[r].kind == REG_SCAN && ex.regs[r].enc)
+            ray_col_src_advise(ex.regs[r].src, 0, nrows);
     if (parallel)
         ray_pool_dispatch(pool, expr_full_fn, &ctx, nrows);
     else
         expr_full_fn(&ctx, 0, 0, nrows);
 
-    return pred_sel_builders_finish(builders, n_builders, nrows, all_pass);
+    bool ap = false;
+    ray_t* block = pred_sel_builders_finish(builders, n_builders, nrows, &ap);
+    ray_t* ferr = ray_scan_fail_finish(&fail, parallel ? pool : NULL);
+    if (ferr) {
+        if (block) ray_rowsel_release(block);
+        return ferr;
+    }
+    *all_pass = ap;
+    return block;
 }
 
 /* ============================================================================

@@ -11205,6 +11205,7 @@ static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         ray_expr_t ex;
         if (!expr_compile(g, tbl, in, &ex, &cerr)) { ok = false; break; }
         ray_t* v = expr_eval_full(&ex, nrows);
+        if (expr_eval_err_fatal(v)) { cerr = v; ok = false; break; }   /* a range read failed */
         if (!v || RAY_IS_ERR(v) || !ray_is_vec(v) || v->len != nrows) {
             if (v && !RAY_IS_ERR(v)) ray_release(v);
             else if (v) ray_error_free(v);
@@ -12192,7 +12193,8 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                     agg_owned[a] = 1;
                     goto resolve_ins2;
                 }
-                if (vec && RAY_IS_ERR(vec)) ray_release(vec);
+                if (expr_eval_err_fatal(vec)) { rerr = vec; goto resolve_fail; }
+                if (vec && RAY_IS_ERR(vec)) ray_error_free(vec);
             } else if (rerr) {
                 goto resolve_fail;
             }
@@ -12240,8 +12242,11 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                         agg_vecs2[a] = vec;
                         agg_owned2[a] = 1;
                         compiled2 = 1;
+                    } else if (expr_eval_err_fatal(vec)) {
+                        rerr = vec;
+                        goto resolve_fail;
                     } else if (vec) {
-                        ray_release(vec);
+                        ray_error_free(vec);
                     }
                 } else if (rerr) {
                     goto resolve_fail;

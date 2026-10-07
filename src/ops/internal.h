@@ -848,6 +848,9 @@ typedef struct {
         bool        nullable;   /* lanes may contain NULL_I64 / NaN */
         bool        null_src;   /* that nullability traces to a nullable column
                                  * (else: only op-generated sentinels) */
+        ray_col_src_t* src;     /* bound source (REG_SCAN; borrowed from the graph) */
+        bool        enc;        /* src is range-read per morsel (generation 2,
+                                 * single file, not materialized): data is NULL */
         const void* data;       /* column data pointer (REG_SCAN only) */
         ray_t*       col_obj;    /* source column vec (REG_SCAN, non-parted) —
                                   * carries the chunk-zone index for zone-skip */
@@ -1022,6 +1025,21 @@ bool try_prod_sumavg_input_f64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
                                agg_prod_t* out, ray_t** err);
 bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, ray_t** err);
 ray_t* expr_eval_full(const ray_expr_t* expr, int64_t nrows);
+/* A failed expr_eval_full result: NULL or oom keeps the caller's fallback;
+ * any other error (a range read's corrupt, a cancel) is the query's answer,
+ * since a fallback would re-read the same column and hide the path. */
+const char* ray_err_code(ray_t* err);   /* core/runtime.h */
+static inline bool expr_eval_err_fatal(ray_t* v) {
+    return v && RAY_IS_ERR(v) && strcmp(ray_err_code(v), "oom") != 0;
+}
+/* Test hook: run the morsel evaluator of a BOOL program over [start, end)
+ * (at most EXPR_MORSEL rows, any alignment) into out[0 .. end - start). */
+void ray_expr_test_eval_range(const ray_expr_t* expr, int64_t start, int64_t end,
+                              uint8_t* out, ray_t** err);
+
+/* query.c test hook: counts the (count (select ... where <compare>)) fast
+ * path answered since process start. */
+uint64_t ray_query_test_count_fast(void);
 
 /* Fused predicate→selection (skips the full BOOL vec).
  *
@@ -1034,7 +1052,8 @@ ray_t* expr_eval_full(const ray_expr_t* expr, int64_t nrows);
  *   - NULL with *all_pass=1  → every row passed (all-pass = "no selection").
  *   - NULL with *all_pass=0  → disabled / unsupported / OOM — caller falls
  *                              back to exec_node→ray_rowsel_from_pred unchanged.
- *   - an owned error         → a column bind failed; the caller returns it. */
+ *   - an owned error         → a column bind or a range read failed (or the
+ *                              dispatch was cancelled); the caller returns it. */
 ray_t* exec_pred_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
                               bool* all_pass);
 

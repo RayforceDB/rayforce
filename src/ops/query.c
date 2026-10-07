@@ -31,6 +31,7 @@
 #include "lang/env.h"
 #include "ops/ops.h"
 #include "ops/internal.h"
+#include "ops/colbind.h"      /* ray_col_bind_declines — the count fast path binds */
 #include "ops/hash.h"
 #include "ops/glob.h"         /* ray_strpat — str-find in the derived-key program */
 #include "ops/idxop.h"        /* ray_index_kind / RAY_IDX_DICT — dict-code row_gid */
@@ -7665,10 +7666,12 @@ typedef enum {
 } count_cmp_op_t;
 
 typedef struct {
-    const ray_t* col;
+    const ray_t* col;           /* the plain vector; NULL when read by range */
     int64_t     rhs;
     count_cmp_op_t op;
     int64_t*    counts;
+    ray_col_src_t*   src;       /* the bound source (range reads) */
+    ray_scan_fail_t* fail;
 } count_compare_ctx_t;
 
 static inline int64_t count_atom_i64(ray_t* a) {
@@ -7704,15 +7707,12 @@ static count_cmp_op_t count_cmp_flip(count_cmp_op_t op) {
     }
 }
 
-static void count_compare_task(void* vctx, uint32_t worker_id, int64_t start, int64_t end) {
-    count_compare_ctx_t* ctx = (count_compare_ctx_t*)vctx;
-    const ray_t* col = ctx->col;
-    const void* data = ray_data((ray_t*)col);
-    int64_t rhs = ctx->rhs;
-    count_cmp_op_t op = ctx->op;
+/* Rows of data[start, end) (type, attrs: the column's or the piece's)
+ * that compare true against rhs. */
+static int64_t count_compare_span(int8_t type, uint8_t attrs, const void* data,
+                                  int64_t start, int64_t end, int64_t rhs, count_cmp_op_t op) {
     int64_t local = 0;
-
-    switch (col->type) {
+    switch (type) {
     case RAY_BOOL:
     case RAY_U8: {
         const uint8_t* x = (const uint8_t*)data;
@@ -7750,7 +7750,7 @@ static void count_compare_task(void* vctx, uint32_t worker_id, int64_t start, in
         break;
     }
     case RAY_SYM: {
-        uint8_t esz = col_esz(col);
+        uint8_t esz = ray_sym_elem_size(RAY_SYM, attrs);
         for (int64_t i = start; i < end; i++)
             local += count_compare_i64(read_by_esz(data, i, esz), rhs, op);
         break;
@@ -7758,10 +7758,43 @@ static void count_compare_task(void* vctx, uint32_t worker_id, int64_t start, in
     default:
         break;
     }
-    ctx->counts[worker_id] += local;
+    return local;
 }
 
-static int try_count_simple_compare(ray_t* tbl, ray_t* where_expr, int64_t* out_count) {
+static void count_compare_task(void* vctx, uint32_t worker_id, int64_t start, int64_t end) {
+    count_compare_ctx_t* ctx = (count_compare_ctx_t*)vctx;
+    const ray_t* col = ctx->col;
+    ctx->counts[worker_id] += count_compare_span(col->type, col->attrs, ray_data((ray_t*)col),
+                                                 start, end, ctx->rhs, ctx->op);
+}
+
+/* Range reads: one call per piece of the walk (generation 2: per vector). */
+typedef struct { count_compare_ctx_t* c; int64_t local; } count_piece_ctx_t;
+static void count_piece(void* vctx, uint32_t wid, int64_t b, int64_t e, const ray_col_piece_t* p) {
+    (void)wid;
+    count_piece_ctx_t* pc = (count_piece_ctx_t*)vctx;
+    pc->local += count_compare_span(pc->c->src->type, p[0].attrs, p[0].data, 0, e - b,
+                                    pc->c->rhs, pc->c->op);
+}
+static void count_compare_enc_task(void* vctx, uint32_t worker_id, int64_t start, int64_t end) {
+    count_compare_ctx_t* ctx = (count_compare_ctx_t*)vctx;
+    if (ray_scan_fail_skip(ctx->fail, start)) return;
+    count_piece_ctx_t pc = { ctx, 0 };
+    ray_col_src_t* srcs[1] = { ctx->src };
+    const void* plain[1] = { NULL };
+    ray_t* err = ray_col_walk(srcs, plain, 1, start, end, false, &pc, worker_id, count_piece);
+    if (err) { ray_scan_fail_note(ctx->fail, start, err); return; }
+    ctx->counts[worker_id] += pc.local;
+}
+
+/* Counts the fast path answered since process start (test hook). */
+static _Atomic(uint64_t) g_count_fast;
+uint64_t ray_query_test_count_fast(void) { return atomic_load(&g_count_fast); }
+
+/* 1 handled (*out_count), 0 not this shape, -1 a range read failed (*err
+ * owned). */
+static int try_count_simple_compare(ray_t* tbl, ray_t* where_expr, int64_t* out_count,
+                                    ray_t** err) {
     if (!tbl || !where_expr || where_expr->type != RAY_LIST || ray_len(where_expr) != 3)
         return 0;
     ray_t** we = (ray_t**)ray_data(where_expr);
@@ -7811,13 +7844,28 @@ static int try_count_simple_compare(ray_t* tbl, ray_t* where_expr, int64_t* out_
 
     ray_col_meta_t cm;
     if (!ray_table_col_meta(tbl, col_expr->i64, &cm) || cm.len != ray_table_nrows(tbl)) return 0;
-    /* 0 = not handled: the general count path re-reads the column and
-     * reports a failed decode there. */
-    ray_t* col = tbl_col_or_null(tbl, col_expr->i64);
-    if (!col || col->len != ray_table_nrows(tbl)) return 0;
-    if (ray_vec_may_have_nulls(col)) return 0;
+    if (ray_col_bind_declines(tbl, col_expr->i64)) return 0;
+    /* Bind without decoding (finding C2).  A bind failure declines: the
+     * general count path re-reads the column and reports it there. */
+    ray_col_src_t src;
+    ray_t* be = ray_table_col_src(tbl, col_expr->i64, &src);
+    if (be) { ray_error_free(be); return 0; }
+    if (!src.obj) return 0;
+    ray_t* ready = ray_col_src_ready(&src);
+    /* plain: today's loop over the vector; a parted source declines as today
+     * (its wrapper's length is the segment count) */
+    ray_t* col = (ready && !RAY_IS_PARTED(ready->type)) ? ready : NULL;
+    int ok = 0;
+    if (src.parted || src.len != ray_table_nrows(tbl)) goto out;
+    /* A SYM column needs no null proof (issue #533): its null is id 0 in
+     * every domain (a file domain seeds "" at position 0), below every
+     * real id, and the general path ranks a null below everything in all
+     * six comparisons, so a raw id compare against a non-null literal is
+     * already the null-aware count.  (ray_vec_may_have_nulls is always
+     * true for a plain SYM vector, which declined generation 0 here.) */
+    if (src.type != RAY_SYM && (col ? ray_vec_may_have_nulls(col) : src.may_null)) goto out;
 
-    switch (col->type) {
+    switch (src.type) {
     case RAY_BOOL:
     case RAY_U8:
     case RAY_I16:
@@ -7826,13 +7874,13 @@ static int try_count_simple_compare(ray_t* tbl, ray_t* where_expr, int64_t* out_
     case RAY_DATE:
     case RAY_TIME:
     case RAY_TIMESTAMP:
-        if (!is_numeric(rhs_expr) && !is_temporal(rhs_expr)) return 0;
+        if (!is_numeric(rhs_expr) && !is_temporal(rhs_expr)) goto out;
         break;
     case RAY_SYM:
-        if (rhs_expr->type != -RAY_SYM) return 0;
+        if (rhs_expr->type != -RAY_SYM) goto out;
         break;
     default:
-        return 0;
+        goto out;
     }
 
     /* The raw compare below is right only for a literal in the column's own
@@ -7840,10 +7888,10 @@ static int try_count_simple_compare(ray_t* tbl, ray_t* where_expr, int64_t* out_
      * type compared days, milliseconds and nanoseconds as one unit.  A
      * TIMESTAMP column takes a DATE or TIME literal on its nanosecond scale,
      * as the eval path does; every other mix goes the general way. */
-    if (rhs_expr->type == -RAY_F64 || rhs_expr->type == -RAY_F32) return 0;
+    if (rhs_expr->type == -RAY_F64 || rhs_expr->type == -RAY_F32) goto out;
     bool rhs_ns = false;
-    if (is_temporal(rhs_expr) && rhs_expr->type != -col->type) {
-        if (col->type != RAY_TIMESTAMP) return 0;
+    if (is_temporal(rhs_expr) && rhs_expr->type != -src.type) {
+        if (src.type != RAY_TIMESTAMP) goto out;
         rhs_ns = true;
     }
 
@@ -7857,37 +7905,46 @@ static int try_count_simple_compare(ray_t* tbl, ray_t* where_expr, int64_t* out_
     }
     /* SYM cells are positions in the COLUMN's domain; the literal atom
      * carries a runtime id — re-express it (sym-domain Phase 2; no-op
-     * for runtime-domain columns).  Absent ⇒ -1: never equals any cell
-     * (cells are non-negative), so EQ counts 0 and NE counts all —
-     * exactly the absent-literal-matches-nothing contract. */
-    if (col->type == RAY_SYM &&
-        ray_sym_vec_domain(col) != ray_sym_runtime_domain()) {
+     * for runtime-domain columns).  Absent: the general path ranks the
+     * literal above every cell (EQ counts 0, NE all, LT / LE all, GT / GE
+     * none), which INT64_MAX reproduces; -1 would rank it below. */
+    if (src.type == RAY_SYM && src.dom != ray_sym_runtime_domain()) {
         ray_t* s = ray_sym_str(rhs);
-        rhs = s ? ray_sym_vec_lookup(col, ray_str_ptr(s), ray_str_len(s)) : -1;
+        rhs = s ? ray_col_src_sym_find(&src, ray_str_ptr(s), ray_str_len(s)) : -1;
+        if (rhs < 0) rhs = INT64_MAX;
     }
     ray_pool_t* pool = ray_pool_get();
     uint32_t nworkers = pool ? ray_pool_total_workers(pool) : 1;
     ray_t* counts_block = ray_alloc((size_t)nworkers * sizeof(int64_t));
-    if (!counts_block) return 0;
+    if (!counts_block) goto out;
     int64_t* counts = (int64_t*)ray_data(counts_block);
     memset(counts, 0, (size_t)nworkers * sizeof(int64_t));
+    ray_scan_fail_t fail; ray_scan_fail_init(&fail);
     count_compare_ctx_t ctx = {
-        .col = col,
-        .rhs = rhs,
-        .op = op,
-        .counts = counts,
+        .col = col, .rhs = rhs, .op = op, .counts = counts, .src = &src, .fail = &fail,
     };
-    int64_t nrows = col->len;
-    if (pool && nrows >= RAY_PARALLEL_THRESHOLD)
-        ray_pool_dispatch(pool, count_compare_task, &ctx, nrows);
-    else
-        count_compare_task(&ctx, 0, 0, nrows);
-
+    int64_t nrows = src.len;
+    void (*task)(void*, uint32_t, int64_t, int64_t) = col ? count_compare_task : count_compare_enc_task;
+    if (!col) ray_col_src_advise(&src, 0, nrows);
+    bool par = pool && nrows >= RAY_PARALLEL_THRESHOLD;
+    if (par) ray_pool_dispatch(pool, task, &ctx, nrows);
+    else task(&ctx, 0, 0, nrows);
+    ray_t* ferr = ray_scan_fail_finish(&fail, par ? pool : NULL);
+    if (ferr) {
+        *err = ferr;
+        ray_release(counts_block);
+        ok = -1;
+        goto out;
+    }
     int64_t total = 0;
     for (uint32_t i = 0; i < nworkers; i++) total += counts[i];
     ray_release(counts_block);
     *out_count = total;
-    return 1;
+    atomic_fetch_add_explicit(&g_count_fast, 1, memory_order_relaxed);
+    ok = 1;
+out:
+    ray_col_src_release(&src);
+    return ok;
 }
 
 /* A where: value that is not already a BOOL mask of `tn` rows goes through
@@ -7964,7 +8021,14 @@ ray_t* ray_try_count_select_expr(ray_t* expr, int* handled) {
     }
 
     int64_t direct_count = 0;
-    if (try_count_simple_compare(tbl, where_expr, &direct_count)) {
+    ray_t* cerr0 = NULL;
+    int dc = try_count_simple_compare(tbl, where_expr, &direct_count, &cerr0);
+    if (dc < 0) {                       /* a range read failed: the query's error */
+        if (handled) *handled = 1;
+        ray_release(tbl);
+        return cerr0;
+    }
+    if (dc > 0) {
         if (handled) *handled = 1;
         ray_release(tbl);
         return ray_i64(direct_count);
@@ -7978,6 +8042,7 @@ ray_t* ray_try_count_select_expr(ray_t* expr, int* handled) {
     ray_op_t* pred = compile_expr_dag(g, where_expr);
     if (!pred && g->compile_err) {
         ray_t* cerr = graph_take_compile_err(g);
+        if (handled) *handled = 1;      /* the query's answer: eval.c drops an unhandled one */
         ray_graph_free(g);
         ray_release(tbl);
         return cerr;
@@ -8029,7 +8094,8 @@ ray_t* ray_try_count_select_expr(ray_t* expr, int* handled) {
     {
         bool all_pass = false;
         ray_t* fsel = exec_pred_to_selection(g, pred, pre_nrows, &all_pass);
-        if (fsel && RAY_IS_ERR(fsel)) {           /* a failed column bind */
+        if (fsel && RAY_IS_ERR(fsel)) {           /* a failed bind or range read */
+            if (handled) *handled = 1;
             ray_graph_free(g);
             ray_release(tbl);
             return fsel;

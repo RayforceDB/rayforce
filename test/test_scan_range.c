@@ -40,6 +40,9 @@
 #include "store/part.h"
 #include "vec/str.h"
 #include "vec/vec.h"
+#include "ops/internal.h"
+#include "ops/rowsel.h"
+#include "ops/idxop.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1057,6 +1060,262 @@ static test_result_t test_advise_spans(void) {
     PASS();
 }
 
+/* ---- runtime-level helpers shared by Tasks 3-16 ---------------------- */
+#define SR_G0 SR_TMP "/g0/"
+#define SR_G2 SR_TMP "/g2/"
+/* 200000 rows (four chunks, the last partial), saved as generation 0 and 2
+ * from the source table S (T is rebound by every load):
+ *   k I64 = row; g I16 = row % 7; v I32 (null every 10th) = 3*row - 7;
+ *   f F64 (null every 13th) = row; d DATE = row % 900; s SYM five values;
+ *   b BOOL = row % 3 == 0; u U8 = row % 200;
+ *   h I64 = (row * 7919) % 1000003 (unclustered, no nulls: the lazy hash shape). */
+static void srr_setup(void) {
+    sr_rt_setup();
+    sr_eval_ok("(set i (til 200000))");
+    sr_eval_ok("(set S (table [k g v f d s b u h] (list i (as 'I16 (% i 7)) "
+               "(as 'I32 (map (fn [j] (if (== 0 (% j 10)) 0N (- (* 3 j) 7))) i)) "
+               "(as 'F64 (map (fn [j] (if (== 0 (% j 13)) 0N j)) i)) (as 'DATE (% i 900)) "
+               "(take ['a 'b 'c 'd 'e] 200000) (== 0 (% i 3)) (as 'U8 (% i 200)) (% (* i 7919) 1000003))))");
+    sr_eval_ok("(.db.splayed.set \"" SR_G2 "\" S {compress: true})");
+    sr_eval_ok("(.db.splayed.set \"" SR_G0 "\" S {compress: false})");
+}
+static void srr_teardown(void) { ray_idx_lazy_clear(); sr_rt_teardown(); }
+
+static ray_t* sr_load(int gen) {
+    ray_t* t = sr_eval(gen ? "(.db.splayed.get \"" SR_G2 "\")" : "(.db.splayed.get \"" SR_G0 "\")");
+    return (t && !RAY_IS_ERR(t)) ? t : NULL;
+}
+
+/* Run `q` (the table written as T) against a fresh load of each generation:
+ * equal formatted results; the generation-2 run materializes exactly
+ * `want_mat` columns. */
+static test_result_t sr_same(const char* q, uint64_t want_mat) {
+    ray_t* out[2] = { NULL, NULL };
+    for (int gen = 0; gen < 2; gen++) {
+        sr_evalf_ok("(set T (.db.splayed.get \"%s\"))", gen ? SR_G2 : SR_G0);
+        ray_enc_counters_reset();
+        out[gen] = sr_eval(q);
+        TEST_ASSERT_FMT(out[gen] && !RAY_IS_ERR(out[gen]), "gen %d: %s: %s", gen, q,
+                        out[gen] ? ray_error_msg() : "null");
+        if (gen) {
+            ray_enc_counters_t k; ray_enc_counters_get(&k);
+            TEST_ASSERT_FMT(k.materialized == want_mat, "%s: %llu materializations, want %llu",
+                            q, (unsigned long long)k.materialized, (unsigned long long)want_mat);
+        }
+    }
+    ray_t* fa = ray_fmt(out[0], 0); ray_t* fb = ray_fmt(out[1], 0);
+    TEST_ASSERT_FMT(ray_str_len(fa) == ray_str_len(fb) &&
+                    memcmp(ray_str_ptr(fa), ray_str_ptr(fb), ray_str_len(fa)) == 0,
+                    "%s differs:\n%.*s\nvs\n%.*s", q, (int)ray_str_len(fa), ray_str_ptr(fa),
+                    (int)ray_str_len(fb), ray_str_ptr(fb));
+    ray_release(fa); ray_release(fb); ray_release(out[0]); ray_release(out[1]);
+    PASS();
+}
+#define SR_SAME(q, m) do { test_result_t r_ = sr_same((q), (m)); if (r_.status != TEST_PASS) return r_; } while (0)
+
+/* Selection from a fused predicate, compared segment by segment. */
+static test_result_t sr_sel_same(ray_op_t* (*build)(ray_graph_t*)) {
+    ray_t* blk[2] = { NULL, NULL }; bool all[2] = { false, false };
+    for (int gen = 0; gen < 2; gen++) {
+        ray_t* t = sr_load(gen);
+        TEST_ASSERT_NOT_NULL(t);
+        ray_enc_counters_reset();
+        ray_graph_t* g = ray_graph_new(t);
+        ray_op_t* pred = build(g);
+        blk[gen] = exec_pred_to_selection(g, pred, ray_table_nrows(t), &all[gen]);
+        TEST_ASSERT_FMT(!(blk[gen] && RAY_IS_ERR(blk[gen])), "gen %d: %s", gen, ray_error_msg());
+        TEST_ASSERT_TRUE(blk[gen] || all[gen]);                     /* the fused path took it */
+        if (gen) { ray_enc_counters_t k; ray_enc_counters_get(&k); TEST_ASSERT_EQ_U(k.materialized, 0); }
+        ray_graph_free(g); ray_release(t);
+    }
+    TEST_ASSERT_EQ_I(all[0], all[1]);
+    if (blk[0]) {
+        ray_rowsel_t* a = ray_rowsel_meta(blk[0]); ray_rowsel_t* b = ray_rowsel_meta(blk[1]);
+        TEST_ASSERT_EQ_I(a->total_pass, b->total_pass);
+        TEST_ASSERT_EQ_I(a->n_segs, b->n_segs);
+        TEST_ASSERT_TRUE(memcmp(ray_rowsel_flags(blk[0]), ray_rowsel_flags(blk[1]), a->n_segs) == 0);
+        TEST_ASSERT_TRUE(memcmp(ray_rowsel_offsets(blk[0]), ray_rowsel_offsets(blk[1]), (a->n_segs + 1) * 4) == 0);
+        uint32_t nidx = ray_rowsel_offsets(blk[0])[a->n_segs];
+        TEST_ASSERT_TRUE(memcmp(ray_rowsel_idx(blk[0]), ray_rowsel_idx(blk[1]), (size_t)nidx * 2) == 0);
+        ray_rowsel_release(blk[0]); ray_rowsel_release(blk[1]);
+    }
+    PASS();
+}
+
+static ray_op_t* pred_v_gt(ray_graph_t* g)   { return ray_gt(g, ray_scan(g, "v"), ray_const_i64(g, 100000)); }
+static ray_op_t* pred_k_band(ray_graph_t* g) { return ray_and(g, ray_ge(g, ray_scan(g, "k"), ray_const_i64(g, 1000)),
+                                                                  ray_lt(g, ray_scan(g, "k"), ray_const_i64(g, 150000))); }
+static ray_op_t* pred_f_lt(ray_graph_t* g)   { return ray_lt(g, ray_scan(g, "f"), ray_const_f64(g, 77777.5)); }
+static ray_op_t* pred_mixed(ray_graph_t* g)  { return ray_and(g, ray_eq(g, ray_scan(g, "g"), ray_const_i64(g, 3)),
+                                                                  ray_gt(g, ray_add(g, ray_scan(g, "v"), ray_scan(g, "u")), ray_const_i64(g, 500))); }
+
+static test_result_t test_expr_select_equal(void) {
+    test_result_t r;
+    if ((r = sr_sel_same(pred_v_gt)).status != TEST_PASS) return r;
+    if ((r = sr_sel_same(pred_k_band)).status != TEST_PASS) return r;
+    if ((r = sr_sel_same(pred_f_lt)).status != TEST_PASS) return r;    /* nullable F64 */
+    if ((r = sr_sel_same(pred_mixed)).status != TEST_PASS) return r;   /* two encoded registers */
+    PASS();
+}
+
+/* Element-wise fused output: (+ k v) as a whole vector, generation 0 vs 2. */
+static test_result_t test_expr_elementwise_equal(void) {
+    ray_t* res[2];
+    for (int gen = 0; gen < 2; gen++) {
+        ray_t* t = sr_load(gen);
+        ray_enc_counters_reset();
+        ray_graph_t* g = ray_graph_new(t);
+        ray_op_t* e = ray_add(g, ray_scan(g, "k"), ray_scan(g, "v"));
+        res[gen] = ray_execute(g, ray_optimize(g, e));
+        TEST_ASSERT_TRUE(res[gen] && !RAY_IS_ERR(res[gen]));
+        if (gen) { ray_enc_counters_t k; ray_enc_counters_get(&k); TEST_ASSERT_EQ_U(k.materialized, 0); }
+        ray_graph_free(g); ray_release(t);
+    }
+    TEST_ASSERT_EQ_I(res[0]->type, res[1]->type);
+    TEST_ASSERT_EQ_I(res[0]->len, res[1]->len);
+    TEST_ASSERT_EQ_I(res[0]->attrs & RAY_ATTR_HAS_NULLS, res[1]->attrs & RAY_ATTR_HAS_NULLS);
+    TEST_ASSERT_TRUE(memcmp(ray_data(res[0]), ray_data(res[1]), (size_t)res[0]->len * 8) == 0);
+    ray_release(res[0]); ray_release(res[1]);
+    PASS();
+}
+
+/* Review focus 3: a fused morsel that starts mid-vector.  The hook
+ * ray_expr_test_eval_range runs the morsel evaluator over [1000, 1100)
+ * directly (the pool only cuts unaligned tasks above its ring cap), for a
+ * nullable I32 and a nullable F64 column, generation 0 against 2. */
+static test_result_t sr_mid_one(ray_op_t* (*build)(ray_graph_t*)) {
+    uint8_t out[2][100];
+    for (int gen = 0; gen < 2; gen++) {
+        ray_t* t = sr_load(gen);
+        ray_graph_t* g = ray_graph_new(t);
+        ray_expr_t ex;
+        ray_t* cerr = NULL;
+        TEST_ASSERT_TRUE(expr_compile(g, t, build(g), &ex, &cerr));
+        TEST_ASSERT_NULL(cerr);
+        TEST_ASSERT_EQ_I(ex.out_type, RAY_BOOL);
+        ray_t* err = NULL;
+        ray_expr_test_eval_range(&ex, 1000, 1100, out[gen], &err);
+        TEST_ASSERT_NULL(err);
+        ray_graph_free(g); ray_release(t);
+    }
+    TEST_ASSERT_TRUE(memcmp(out[0], out[1], 100) == 0);
+    PASS();
+}
+static ray_op_t* mid_v(ray_graph_t* g) { return ray_lt(g, ray_scan(g, "v"), ray_const_i64(g, 2500)); }
+static ray_op_t* mid_f(ray_graph_t* g) { return ray_gt(g, ray_scan(g, "f"), ray_const_f64(g, 1040.0)); }
+static ray_op_t* mid_vf(ray_graph_t* g) { return ray_and(g, mid_v(g), ray_ne(g, ray_scan(g, "f"), ray_const_f64(g, 1050.0))); }
+static test_result_t test_expr_nulls_midvector(void) {
+    test_result_t r;
+    if ((r = sr_mid_one(mid_v)).status != TEST_PASS) return r;    /* v: null every 10th row */
+    if ((r = sr_mid_one(mid_f)).status != TEST_PASS) return r;    /* f: null every 13th row */
+    if ((r = sr_mid_one(mid_vf)).status != TEST_PASS) return r;   /* two encoded registers */
+    PASS();
+}
+
+/* Review focus 4: a corrupt chunk-2 descriptor surfaces as `corrupt` with
+ * the column path, twice, and nothing leaks. */
+static uint64_t sr_dirent_offset(const char* path, int64_t c) {
+    ray_enc_dirent_t de; memset(&de, 0, sizeof de);
+    FILE* f = fopen(path, "rb");
+    if (f) {
+        if (fseek(f, (long)(RAY_ENC_DIR_OFF + (uint64_t)c * sizeof de), SEEK_SET) != 0 ||
+            fread(&de, sizeof de, 1, f) != 1) de.offset = 0;
+        fclose(f);
+    }
+    return de.offset;
+}
+static void sr_patch(const char* path, long off, uint8_t val) {
+    FILE* f = fopen(path, "r+b"); if (!f) return;
+    if (fseek(f, off, SEEK_SET) == 0) fputc(val, f);
+    fclose(f);
+}
+/* Copy of the generation-2 table with column `col`'s chunk 2 descriptor 0
+ * reserved bytes (rsv0, offset 6) set; returns the resolved column path,
+ * resolved from the directory string the loads below use (trailing slash
+ * included: the load names its columns "<dir>/<col>"). */
+static void sr_make_bad(const char* col, char* path, size_t cap) {
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/bad/\" S {compress: true})");
+    char dir[512];
+    if (ray_splay_resolve_dir(ray_test_tmp(SR_TMP "/bad/"), dir, sizeof dir) != RAY_OK) abort();
+    snprintf(path, cap, "%s/%s", dir, col);
+    uint64_t off = sr_dirent_offset(path, 2);
+    if (!off) abort();
+    sr_patch(path, (long)off + 6, 1);
+}
+static test_result_t test_expr_error(void) {
+    char path[600];
+    sr_make_bad("v", path, sizeof path);
+    for (int i = 0; i < 2; i++) {
+        ray_t* t = sr_eval("(.db.splayed.get \"" SR_TMP "/bad/\")");
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        ray_graph_t* g = ray_graph_new(t);
+        bool all = false;
+        ray_error_clear();
+        ray_t* s = exec_pred_to_selection(g, pred_v_gt(g), ray_table_nrows(t), &all);
+        TEST_ASSERT_TRUE(s && RAY_IS_ERR(s));
+        TEST_ASSERT_STR_EQ(ray_err_code(s), "corrupt");
+        TEST_ASSERT_TRUE(strstr(ray_error_msg(), path) != NULL);
+        ray_error_free(s);
+        ray_graph_free(g); ray_release(t);
+    }
+    PASS();
+}
+
+/* Finding C2: (count (select {from: T where: <compare>})) is answered by
+ * try_count_simple_compare on range reads (ClickBench q2's shape), never
+ * materializing; a corrupt chunk is the query's error. */
+static test_result_t test_count_fast_path(void) {
+    uint64_t f0 = ray_query_test_count_fast();
+    SR_SAME("(count (select {from: T where: (== g 3)}))", 0);       /* I16 */
+    SR_SAME("(count (select {from: T where: (> k 150000)}))", 0);   /* I64 */
+    SR_SAME("(count (select {from: T where: (!= u 7)}))", 0);        /* U8 */
+    SR_SAME("(count (select {from: T where: (< d 100)}))", 0);       /* DATE, integer literal */
+    SR_SAME("(count (select {from: T where: (== s 'c)}))", 0);       /* file-domain SYM */
+    SR_SAME("(count (select {from: T where: (== s 'zz)}))", 0);      /* absent symbol */
+    TEST_ASSERT_EQ_U(ray_query_test_count_fast() - f0, 12);          /* 6 shapes x 2 generations */
+    char path[600];
+    sr_make_bad("k", path, sizeof path);
+    for (int i = 0; i < 2; i++) {
+        ray_error_clear();
+        ray_t* r = sr_eval("(count (select {from: (.db.splayed.get \"" SR_TMP "/bad/\") where: (> k 5)}))");
+        TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+        TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
+        TEST_ASSERT_TRUE(strstr(ray_error_msg(), path) != NULL);
+        ray_error_free(r);
+    }
+    PASS();
+}
+
+/* The fast path's SYM compare over a file domain with nulls and an absent
+ * literal, both generations: equal to the general path (`and ... true`
+ * declines the fast path) in all six comparisons. */
+static test_result_t test_count_fast_sym_nulls(void) {
+    sr_eval_ok("(set N (table [s] (list (take (as 'SYM (list \"zq\" \"aq\" \"\" \"mq\")) 30001))))");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/n0/\" N {compress: false})");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/n2/\" N {compress: true})");
+    static const char* preds[] = {
+        "(== s 'mq)", "(!= s 'mq)", "(< s 'mq)", "(<= s 'mq)", "(> s 'aq)", "(>= s 'aq)",
+        "(== s 'qqq)", "(!= s 'qqq)", "(< s 'qqq)", "(<= s 'qqq)", "(> s 'qqq)", "(>= s 'qqq)",
+    };
+    for (int gen = 0; gen < 2; gen++) {
+        sr_evalf_ok("(set T (.db.splayed.get \"%s\"))", gen ? SR_TMP "/n2/" : SR_TMP "/n0/");
+        for (size_t i = 0; i < sizeof preds / sizeof preds[0]; i++) {
+            char q[256];
+            uint64_t f0 = ray_query_test_count_fast();
+            snprintf(q, sizeof q, "(count (select {from: T where: %s}))", preds[i]);
+            ray_t* a = sr_eval(q);
+            TEST_ASSERT_EQ_U(ray_query_test_count_fast() - f0, 1);
+            snprintf(q, sizeof q, "(count (select {from: T where: (and %s true)}))", preds[i]);
+            ray_t* b = sr_eval(q);
+            TEST_ASSERT_TRUE(a && b && !RAY_IS_ERR(a) && !RAY_IS_ERR(b));
+            TEST_ASSERT_FMT(a->i64 == b->i64, "gen %d %s: fast %lld, general %lld", gen, preds[i],
+                            (long long)a->i64, (long long)b->i64);
+            ray_release(a); ray_release(b);
+        }
+    }
+    PASS();
+}
+
 const test_entry_t scanrange_entries[] = {
     { "scanrange/walk_gen0_zero_copy",     test_walk_gen0_zero_copy,     sr_setup,    sr_teardown },
     { "scanrange/walk_gen2_vectors",       test_walk_gen2_vectors,       sr_setup,    sr_teardown },
@@ -1086,5 +1345,11 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/chunk_stat_f64",            test_chunk_stat_f64,            sr_setup, sr_teardown },
     { "scanrange/byte_range_edges",          test_byte_range_edges,          sr_setup, sr_teardown },
     { "scanrange/advise_spans",              test_advise_spans,              sr_setup, sr_teardown },
+    { "scanrange/expr_select_equal",      test_expr_select_equal,      srr_setup, srr_teardown },
+    { "scanrange/expr_elementwise_equal", test_expr_elementwise_equal, srr_setup, srr_teardown },
+    { "scanrange/expr_nulls_midvector",   test_expr_nulls_midvector,   srr_setup, srr_teardown },
+    { "scanrange/expr_error",             test_expr_error,             srr_setup, srr_teardown },
+    { "scanrange/count_fast_path",        test_count_fast_path,        srr_setup, srr_teardown },
+    { "scanrange/count_fast_sym_nulls",   test_count_fast_sym_nulls,   sr_rt_setup, sr_rt_teardown },
     { NULL, NULL, NULL, NULL },
 };
