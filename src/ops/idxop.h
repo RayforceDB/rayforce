@@ -263,6 +263,40 @@ void ray_idx_stats_init(void);   /* atexit dump when RAY_IDX_STATS set */
 void   ray_idx_note_use(const ray_t* col);
 ray_t* ray_idx_uses_fn(ray_t* tbl);
 
+/* ===== Lazy in-memory HASH (index policy) =====
+ *
+ * The converters persist a CHUNK_ZONE, not a HASH.  A point lookup (an
+ * equality or `in` filter) on an integer column whose zone cannot prune
+ * builds a HASH in memory on first use and reuses it in the same process.
+ * The index lives in a process-wide cache keyed by the plain column object
+ * (generation 0: the table's column; generation 2: the encoded object's
+ * materialization), never in a table slot and never attached to the column,
+ * so no save can see it.  An entry holds one reference to the column and an
+ * indexed heap copy (ray_idx_hash_fn, copy-on-write).  The bytes held stay
+ * within a quarter of ray_sys_ram_limit(); least recently used entries are
+ * evicted to make room.  A column the budget or a failed build declines is
+ * remembered, so later probes do not retry it. */
+
+/* The random-shape test the converters used: a fresh, integer CHUNK_ZONE of
+ * at least 4 non-empty chunks whose mean chunk span exceeds half the global
+ * range, and an index costing at most 5x the column's payload. */
+bool   ray_idx_lazy_hash_wanted(const ray_t* col);
+/* For a probe on `col`: NULL with *out = a retained vector equal to col
+ * carrying a HASH (from the cache, or built now), or NULL with *out = NULL
+ * when no lazy index applies (not wanted, over budget, declined before); an
+ * owned error on failure to build (the caller falls back to its scan). */
+ray_t* ray_idx_lazy_hash(ray_t* col, ray_t** out);
+/* The cached indexed copy for col, borrowed (valid while the entry lives:
+ * tests and single-threaded diagnostics), or NULL. */
+const ray_t* ray_idx_lazy_lookup(const ray_t* col);
+/* Drop the entry of a column object that is going away (the generation-2
+ * object frees its materialization). */
+void   ray_idx_lazy_forget(const ray_t* col);
+/* Tests and runtime teardown: drop every entry; indexed entry count; bytes held. */
+void    ray_idx_lazy_clear(void);
+int64_t ray_idx_lazy_count(void);
+int64_t ray_idx_lazy_bytes(void);
+
 /* ===== Attach / Detach ===== */
 
 /* Build an accelerator and attach.  Numeric types are supported by every

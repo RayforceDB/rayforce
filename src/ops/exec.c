@@ -1397,6 +1397,32 @@ static bool idx_want_ok(const ray_col_meta_t* m, unsigned want) {
            ((want & IDXW_SORTED) && (m->attrs & RAY_ATTR_SORTED));
 }
 
+/* Metadata admits the lazy in-memory hash (ray_idx_lazy_hash): an integer
+ * column, no nulls, a chunk zone the hash may replace.  The column's own
+ * shape test runs on the decoded vector after this. */
+static bool idx_lazy_meta_ok(const ray_col_meta_t* m) {
+    if (m->index_kind != RAY_IDX_CHUNK_ZONE) return false;
+    switch (m->type) {
+    case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
+    case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: break;
+    default: return false;
+    }
+    return m->null_count >= 0 ? m->null_count == 0 : !(m->attrs & RAY_ATTR_HAS_NULLS);
+}
+
+/* An `in` set that is a point lookup for the lazy hash: an integer-family
+ * vector no larger than an eighth of the rows (the dense cutoff the hash
+ * equality probe applies to one key's rows). */
+static bool idx_lazy_set_ok(const ray_t* col, const ray_t* set) {
+    if (!set || RAY_IS_ERR(set) || ray_is_atom(set)) return false;
+    switch (set->type) {
+    case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
+    case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: break;
+    default: return false;
+    }
+    return set->len <= (col->len >> 3);
+}
+
 /* The plain column for a decode that declines (the scan fallback re-reads the
  * column through the accessors and reports a failure with its message). */
 static ray_t* idx_decode_col(ray_t* tbl, int64_t sym) {
@@ -2702,6 +2728,17 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                         }
                         if (!sym_probe_skip) {
                             ray_idx_kind_t eq_kind = ray_index_kind(col);
+                            /* No persisted hash: an unprunable integer zone
+                             * gets the lazy in-memory one (built on this first
+                             * point lookup, reused after).  The indexed copy
+                             * has the table column's rows. */
+                            ray_t* lazy_col = NULL;
+                            if (eq_kind != RAY_IDX_HASH && eq_kind != RAY_IDX_PART) {
+                                ray_t* le = ray_idx_lazy_hash(col, &lazy_col);
+                                if (le) ray_error_free(le);      /* best effort: the scan answers */
+                                if (lazy_col) eq_kind = RAY_IDX_HASH;
+                            }
+                            ray_t* probe_col = lazy_col ? lazy_col : col;
                             if (eq_kind == RAY_IDX_HASH ||
                                 eq_kind == RAY_IDX_PART) {
                                 idx_site_t site = eq_kind == RAY_IDX_HASH
@@ -2709,15 +2746,17 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                                     : IDX_SITE_FILTER_PART;
                                 ray_idx_consults[site]++;
                                 ray_t* sel = eq_kind == RAY_IDX_HASH
-                                    ? ray_index_hash_eq_rowsel(col, key_i)
-                                    : ray_index_part_eq_rowsel(col, key_i);
+                                    ? ray_index_hash_eq_rowsel(probe_col, key_i)
+                                    : ray_index_part_eq_rowsel(probe_col, key_i);
                                 if (sel) {
                                     ray_idx_hits[site]++;
-                                    ray_idx_note_use(col);
+                                    ray_idx_note_use(probe_col);
+                                    if (lazy_col) ray_release(lazy_col);
                                     g->selection = sel;
                                     return input;
                                 }
                             }
+                            if (lazy_col) ray_release(lazy_col);
                             /* sel == NULL: ineligible (wrong/stale index kind,
                              * key out of range) or OOM — fall through to scan. */
                         }
@@ -2769,7 +2808,8 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                         int64_t ki = 0; double kf = 0.0; int isf = 0;
                         has_hash_eq = idx_filter_decode(g, conj[ci], IDXW_NONE, NULL, &cop,
                                                         &ki, &kf, &isf, &cm) &&
-                                      cop == OP_EQ && cm.index_kind == RAY_IDX_HASH;
+                                      cop == OP_EQ && (cm.index_kind == RAY_IDX_HASH ||
+                                                       idx_lazy_meta_ok(&cm));
                     }
                     shape_ok = shape_ok && has_hash_eq;
                     for (int ci = 0; ci < ncj && shape_ok; ci++) {
@@ -2780,7 +2820,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                             shape_ok = false; break;
                         }
                         if (cop == OP_EQ && !eq_col &&
-                            ray_index_kind(c) == RAY_IDX_HASH &&
+                            (ray_index_kind(c) == RAY_IDX_HASH || ray_idx_lazy_hash_wanted(c)) &&
                             (c->type == RAY_SYM ? ki != 0 : !ray_vec_may_have_nulls(c))) {
                             eq_col = c; eq_key = ki;
                         } else if (cop == OP_GE || cop == OP_GT ||
@@ -2793,6 +2833,17 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                             else if (cop == OP_LE) { if (ki < hi) hi = ki; }
                             else                   { if (ki == INT64_MIN) { lo = 1; hi = 0; } else if (ki - 1 < hi) hi = ki - 1; }
                         } else { shape_ok = false; break; }
+                    }
+                    /* The equality column without a persisted hash probes
+                     * its lazy one, built only now that the whole shape
+                     * matched; the range column stays the table's. */
+                    ray_t* eq_lazy = NULL;
+                    if (shape_ok && eq_col && rg_col && rg_col != eq_col &&
+                        ray_index_kind(eq_col) != RAY_IDX_HASH) {
+                        ray_t* le = ray_idx_lazy_hash(eq_col, &eq_lazy);
+                        if (le) ray_error_free(le);      /* best effort: the scan answers */
+                        if (eq_lazy) eq_col = eq_lazy;
+                        else shape_ok = false;
                     }
                     if (shape_ok && eq_col && rg_col && rg_col != eq_col) {
                         ray_idx_consults[IDX_SITE_FILTER_EQRANGE]++;
@@ -2821,6 +2872,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                             if (sel) {
                                 ray_idx_hits[IDX_SITE_FILTER_EQRANGE]++;
                                 ray_idx_note_use(eq_col);
+                                if (eq_lazy) ray_release(eq_lazy);
                                 g->selection = sel;
                                 return input;
                             }
@@ -2855,6 +2907,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                                 if (sel) {
                                     ray_idx_hits[IDX_SITE_FILTER_EQRANGE]++;
                                     ray_idx_note_use(eq_col);
+                                    if (eq_lazy) ray_release(eq_lazy);
                                     g->selection = sel;
                                     return input;
                                 }
@@ -2863,6 +2916,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                         }
                         /* hit < 0 (stale/ineligible index): fall through */
                     }
+                    if (eq_lazy) ray_release(eq_lazy);
                 }
 
                 /* 5. Hash/part-index IN probe:
@@ -2876,18 +2930,31 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                         bool in_col_is_float = (in_col->type == RAY_F32 ||
                                                in_col->type == RAY_F64);
                         ray_idx_kind_t in_kind = ray_index_kind(in_col);
+                        /* No persisted index: a small integer set on an
+                         * unprunable zone probes the lazy in-memory hash. */
+                        ray_t* in_lazy = NULL;
+                        if (in_kind != RAY_IDX_HASH && in_kind != RAY_IDX_PART &&
+                            !in_col_is_float && !ray_vec_may_have_nulls(in_col) &&
+                            idx_lazy_set_ok(in_col, in_set_lit)) {
+                            ray_t* le = ray_idx_lazy_hash(in_col, &in_lazy);
+                            if (le) ray_error_free(le);          /* best effort: the scan answers */
+                            if (in_lazy) in_kind = RAY_IDX_HASH;
+                        }
+                        ray_t* in_probe = in_lazy ? in_lazy : in_col;
                         if ((in_kind == RAY_IDX_HASH || in_kind == RAY_IDX_PART) &&
                             !in_col_is_float) {
                             ray_idx_consults[IDX_SITE_IN]++;
-                            ray_t* sel = ray_index_in_rowsel(in_col, in_set_lit);
+                            ray_t* sel = ray_index_in_rowsel(in_probe, in_set_lit);
                             if (sel) {
                                 ray_idx_hits[IDX_SITE_IN]++;
-                                ray_idx_note_use(in_col);
+                                ray_idx_note_use(in_probe);
+                                if (in_lazy) ray_release(in_lazy);
                                 g->selection = sel;
                                 return input;
                             }
                             /* NULL: guard fired, ineligible, or OOM — fall through. */
                         }
+                        if (in_lazy) ray_release(in_lazy);
                     }
                 }
 

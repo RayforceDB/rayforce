@@ -32,6 +32,7 @@
 #include <time.h>
 #include <dirent.h>
 #include "mem/heap.h"
+#include "mem/cow.h"          /* ray_rc_sync: the lazy-hash probe threads */
 #include "ops/ops.h"
 #include "store/col.h"
 #include "ops/idxop.h"
@@ -2086,6 +2087,221 @@ static test_result_t test_resave_keeps_hash(void) {
     TEST_ASSERT_EQ_I(store_slot_kind(b, 0), RAY_IDX_HASH);
     ray_release(b);
     for (int i = 0; i < 2; i++) (void)ray_test_rm_rf(dirs[i]);
+    PASS();
+}
+
+/* ---- lazy in-memory HASH (index policy PI Task 4) ------------------------
+ * A converted table persists a CHUNK_ZONE, not a HASH.  An equality or `in`
+ * probe on an integer column whose zone cannot prune builds a HASH in
+ * memory on first use, held in a process-wide cache that the save path never
+ * sees.  Generation 2 is covered too (Ruling C1): the hash is built from the
+ * materialized plain column and dropped with the encoded object.  Every
+ * path goes through ray_test_tmp; these run in the equivalence pass as well,
+ * where lz_make's save is generation 2. */
+static ray_runtime_t* g_lzrt;
+static void lz_setup(void) {
+    g_lzrt = ray_runtime_create(0, NULL);
+    (void)ray_test_rm_rf(ray_test_tmp("/tmp/rayforce_lazy"));
+}
+static void lz_teardown(void) {
+    ray_idx_lazy_clear();
+    (void)ray_test_rm_rf(ray_test_tmp("/tmp/rayforce_lazy"));
+    ray_runtime_destroy(g_lzrt);
+}
+static void lz_ok(const char* src) {
+    ray_t* r = ray_eval_str(ray_test_tmp(src));
+    if (r && RAY_IS_ERR(r)) { fprintf(stderr, "%s: %s\n", src, ray_error_msg()); ray_error_free(r); abort(); }
+    if (r) ray_release(r);
+}
+static ray_t* lz_eval(const char* src) { return ray_eval_str(ray_test_tmp(src)); }
+/* A converted-like table: an unclustered I64 column h of 300000 rows whose
+ * file carries a CHUNK_ZONE only (what the converters write), beside a
+ * clustered one v.  `opts` is appended to the save (generation choice). */
+static void lz_make_opts(const char* opts) {
+    char src[256];
+    lz_ok("(set i (til 300000))");
+    snprintf(src, sizeof src,
+             "(.db.splayed.set \"/tmp/rayforce_lazy/a/\" (table [h v] (list (%% (* i 7919) 1000003) i))%s)", opts);
+    lz_ok(src);
+    lz_ok("(set A (.db.splayed.get \"/tmp/rayforce_lazy/a/\"))");
+}
+static void lz_make(void) { lz_make_opts(""); }
+/* The table slot's recorded index kind, never decoding (metadata). */
+static int lz_slot_kind(const char* var, const char* col, ray_t** enc_out) {
+    ray_t* t = ray_env_get(ray_sym_intern(var, strlen(var)));
+    ray_col_meta_t m;
+    int64_t c = -1;
+    for (int64_t k = 0; t && k < ray_table_ncols(t); k++)
+        if (ray_table_col_name(t, k) == ray_sym_intern(col, strlen(col))) c = k;
+    if (c < 0 || !ray_table_col_meta_idx(t, c, &m)) return -1;
+    if (enc_out) *enc_out = m.enc;
+    return (int)m.index_kind;
+}
+
+static test_result_t test_lazy_first_use(void) {
+    lz_make();
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 0);
+    lz_ok("(do (.idx.uses A) null)");
+    ray_t* r = lz_eval("(at (select {v: v from: A where: (== h 7919)}) 'v)");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->len == 1 && ((int64_t*)ray_data(r))[0] == 1);
+    ray_release(r);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 1);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_bytes(), 300000LL * (8 + 58));
+    ray_t* u = lz_eval("(at (.idx.uses A) 'h)");
+    TEST_ASSERT_TRUE(u && !RAY_IS_ERR(u) && u->i64 == 1);          /* attributed to the column */
+    ray_release(u);
+    r = lz_eval("(at (select {v: v from: A where: (in h [7919 15838])}) 'v)");   /* rows 1 and 2 */
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->len == 2 &&
+                     ((int64_t*)ray_data(r))[0] == 1 && ((int64_t*)ray_data(r))[1] == 2);
+    ray_release(r);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 1);                     /* reused, not rebuilt */
+    u = lz_eval("(at (.idx.uses A) 'h)");
+    TEST_ASSERT_TRUE(u && !RAY_IS_ERR(u) && u->i64 == 1);          /* the in probe used it */
+    ray_release(u);
+    /* the table's column is untouched: its slot records a zone, as does the
+     * column a reader gets */
+    TEST_ASSERT_EQ_I(lz_slot_kind("A", "h", NULL), RAY_IDX_CHUNK_ZONE);
+    ray_t* k = lz_eval("(at (.idx.info (at A 'h)) 'kind)");
+    TEST_ASSERT_TRUE(k && !RAY_IS_ERR(k) && k->i64 == ray_sym_intern("chunk_zone", 10));
+    ray_release(k);
+    PASS();
+}
+
+/* An eq-plus-range conjunction (an unsplit AND: a graph run without the
+ * optimizer) probes the lazy hash for its equality. */
+static test_result_t test_lazy_eq_range(void) {
+    lz_make();
+    ray_t* tbl = ray_env_get(ray_sym_intern("A", 1));
+    TEST_ASSERT_TRUE(tbl && tbl->type == RAY_TABLE);
+    uint64_t hits0 = ray_idx_hits[IDX_SITE_FILTER_EQRANGE];
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* pred = ray_and(g, ray_and(g, ray_eq(g, ray_scan(g, "h"), ray_const_i64(g, 15838)),
+                                           ray_ge(g, ray_scan(g, "v"), ray_const_i64(g, 0))),
+                             ray_le(g, ray_scan(g, "v"), ray_const_i64(g, 5)));
+    ray_t* r = ray_execute(g, ray_filter(g, ray_const_table(g, tbl), pred));
+    ray_graph_free(g);
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->type == RAY_TABLE && ray_table_nrows(r) == 1);
+    ray_t* v = ray_table_col(r, ray_sym_intern("v", 1));
+    TEST_ASSERT_TRUE(v && !RAY_IS_ERR(v) && ((int64_t*)ray_data(v))[0] == 2);
+    ray_release(r);
+    TEST_ASSERT_EQ_I(ray_idx_hits[IDX_SITE_FILTER_EQRANGE], hits0 + 1);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 1);
+    PASS();
+}
+
+/* Never persisted: a resave of the probed table records a zone, not a hash. */
+static test_result_t test_lazy_not_persisted(void) {
+    lz_make();
+    lz_ok("(select {v: v from: A where: (== h 7919)})");
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 1);
+    lz_ok("(.db.splayed.set \"/tmp/rayforce_lazy/b/\" A)");
+    lz_ok("(set B (.db.splayed.get \"/tmp/rayforce_lazy/b/\"))");
+    TEST_ASSERT_EQ_I(lz_slot_kind("B", "h", NULL), RAY_IDX_CHUNK_ZONE);
+    ray_t* k = lz_eval("(at (.idx.info (at B 'h)) 'kind)");
+    TEST_ASSERT_TRUE(k && !RAY_IS_ERR(k) && k->i64 == ray_sym_intern("chunk_zone", 10));
+    ray_release(k);
+    PASS();
+}
+
+/* The RAM budget bounds it: below the cost nothing is built, results equal,
+ * and the decline is remembered for the column (no retry per query). */
+static test_result_t test_lazy_budget(void) {
+    lz_make();
+    int64_t saved = __RUNTIME->ram_limit;
+    __RUNTIME->ram_limit = 4LL * (8 + 58) * 300000 - 1;     /* one byte below the bound */
+    ray_t* r = lz_eval("(at (select {v: v from: A where: (== h 7919)}) 'v)");
+    __RUNTIME->ram_limit = saved;
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->len == 1 && ((int64_t*)ray_data(r))[0] == 1);
+    ray_release(r);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 0);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_bytes(), 0);
+    r = lz_eval("(at (select {v: v from: A where: (== h 7919)}) 'v)");    /* budget back: declined stays */
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->len == 1 && ((int64_t*)ray_data(r))[0] == 1);
+    ray_release(r);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 0);
+    PASS();
+}
+
+/* A clustered column (zone pruning works) gets no lazy index, and neither
+ * does a query that is not a point lookup. */
+static test_result_t test_lazy_not_wanted(void) {
+    lz_make();
+    lz_ok("(select {h: h from: A where: (== v 7919)})");
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 0);
+    lz_ok("(select {h: h from: A where: (> h 7919)})");
+    lz_ok("(select {s: (sum h) from: A})");
+    lz_ok("(select {c: (count v) from: A by: h})");
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 0);
+    PASS();
+}
+
+/* Generation 2: the hash comes from the materialized column, the slot keeps
+ * its encoded object and zone, and the entry goes with the object. */
+static test_result_t test_lazy_gen2(void) {
+    lz_make_opts(" {compress: true}");
+    ray_t* enc = NULL;
+    TEST_ASSERT_EQ_I(lz_slot_kind("A", "h", &enc), RAY_IDX_CHUNK_ZONE);
+    TEST_ASSERT_NOT_NULL(enc);                                     /* generation 2 */
+    ray_t* r = lz_eval("(at (select {v: v from: A where: (== h 7919)}) 'v)");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->len == 1 && ((int64_t*)ray_data(r))[0] == 1);
+    ray_release(r);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 1);
+    r = lz_eval("(count (select {v: v from: A where: (in h [7919 15838 3])}))");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->i64 == 2);
+    ray_release(r);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 1);
+    enc = NULL;
+    TEST_ASSERT_EQ_I(lz_slot_kind("A", "h", &enc), RAY_IDX_CHUNK_ZONE);
+    TEST_ASSERT_NOT_NULL(enc);                                     /* still encoded */
+    lz_ok("(.db.splayed.set \"/tmp/rayforce_lazy/b/\" A)");
+    lz_ok("(set B (.db.splayed.get \"/tmp/rayforce_lazy/b/\"))");
+    TEST_ASSERT_EQ_I(lz_slot_kind("B", "h", NULL), RAY_IDX_CHUNK_ZONE);
+    lz_ok("(set B null)");
+    lz_ok("(set A null)");                                         /* the object goes: so does its entry */
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 0);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_bytes(), 0);
+    PASS();
+}
+
+/* Two threads probing the same column at once keep one hash: the loser of
+ * the build race finds the winner's entry under the lock and drops its own. */
+typedef struct { ray_t* col; _Atomic int* go; ray_t* out; ray_t* err; } lz_thr_t;
+static void lz_probe_thread(void* raw) {
+    lz_thr_t* t = raw;
+    ray_rc_sync = true;                                 /* shared objects: atomic counts, as a worker */
+    atomic_fetch_add(t->go, 1);
+    while (atomic_load(t->go) < 2) { }
+    t->err = ray_idx_lazy_hash(t->col, &t->out);
+    if (t->err) { ray_error_free(t->err); t->err = (ray_t*)1; }
+    ray_heap_abandon();
+}
+static test_result_t test_lazy_concurrent(void) {
+    int64_t n = 50000;                                  /* below the parallel build: no pool */
+    ray_t* v = ray_vec_new(RAY_I64, n); v->len = n;
+    for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(v))[i] = (i * 7919) % 1000003;
+    ray_t* z = ray_index_attach_chunk_zone(&v, 12);     /* 13 chunks of 4096 rows */
+    TEST_ASSERT_FALSE(RAY_IS_ERR(z));
+    TEST_ASSERT_TRUE(ray_idx_lazy_hash_wanted(v));
+    for (int round = 0; round < 8; round++) {
+        ray_idx_lazy_clear();
+        _Atomic int go = 0;
+        lz_thr_t t[2]; ray_thread_t th[2];
+        for (int k = 0; k < 2; k++) {
+            t[k] = (lz_thr_t){ .col = v, .go = &go, .out = NULL, .err = NULL };
+            TEST_ASSERT_EQ_I(ray_thread_create(&th[k], lz_probe_thread, &t[k]), RAY_OK);
+        }
+        for (int k = 0; k < 2; k++) ray_thread_join(th[k]);
+        TEST_ASSERT_TRUE(!t[0].err && !t[1].err && t[0].out && t[1].out);
+        TEST_ASSERT_EQ_PTR(t[0].out, t[1].out);           /* one indexed copy */
+        TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 1);
+        TEST_ASSERT_EQ_I(ray_idx_lazy_bytes(), n * (8 + 58));
+        TEST_ASSERT_EQ_PTR(ray_idx_lazy_lookup(v), t[0].out);
+        TEST_ASSERT_EQ_I(ray_index_kind(t[0].out), RAY_IDX_HASH);
+        TEST_ASSERT_EQ_I(ray_index_kind(v), RAY_IDX_CHUNK_ZONE);  /* the column is untouched */
+        ray_release(t[0].out); ray_release(t[1].out);
+    }
+    ray_idx_lazy_clear();
+    ray_release(v);
     PASS();
 }
 
@@ -6321,6 +6537,13 @@ const test_entry_t store_entries[] = {
     { "store/stream_inline_dict", test_stream_inline_dict, store_setup, store_teardown },
     { "store/staged_bulk_no_hash", test_staged_bulk_no_hash, store_setup, store_teardown },
     { "store/resave_keeps_hash", test_resave_keeps_hash, store_setup, store_teardown },
+    { "idxlazy/first_use",     test_lazy_first_use,     lz_setup, lz_teardown },
+    { "idxlazy/eq_range",      test_lazy_eq_range,      lz_setup, lz_teardown },
+    { "idxlazy/not_persisted", test_lazy_not_persisted, lz_setup, lz_teardown },
+    { "idxlazy/budget",        test_lazy_budget,        lz_setup, lz_teardown },
+    { "idxlazy/not_wanted",    test_lazy_not_wanted,    lz_setup, lz_teardown },
+    { "idxlazy/gen2",          test_lazy_gen2,          lz_setup, lz_teardown },
+    { "idxlazy/concurrent",    test_lazy_concurrent,    lz_setup, lz_teardown },
     { "store/stream_region_bytes", test_stream_region_bytes_match, store_setup, store_teardown },
     { "store/stream_finish_failure", test_stream_finish_failure_publishes_nothing, store_setup, store_teardown },
     { "store/stream_cancel_publishes_nothing", test_stream_cancel_publishes_nothing, store_setup, store_teardown },

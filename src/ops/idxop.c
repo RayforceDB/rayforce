@@ -70,6 +70,8 @@ void ray_idx_note_use(const ray_t* col) {
     atomic_flag_clear_explicit(&g_idx_use_lock, memory_order_release);
 }
 
+static const void* lazy_use_key(const ray_t* col);   /* the lazy hash cache, below */
+
 ray_t* ray_idx_uses_fn(ray_t* tbl) {
     if (!tbl || tbl->type != RAY_TABLE)
         return ray_error("type", ".idx.uses expects a table, got %s", tbl ? ray_type_name(tbl->type) : "null");
@@ -98,17 +100,20 @@ ray_t* ray_idx_uses_fn(ray_t* tbl) {
          * materialized, and the materialization carries any index it built. */
         ray_t* enc = ray_table_get_col_enc_idx(tbl, c);
         ray_t* col = enc ? ray_enccol_decoded_peek(enc) : ray_table_col_idx(tbl, c);
-        if (!col || RAY_IS_ERR(col) || !(col->attrs & RAY_ATTR_HAS_INDEX) || !col->index) continue;
+        if (!col || RAY_IS_ERR(col)) continue;
+        /* A lazy in-memory hash counts under the column it was built for. */
+        const void* own = (col->attrs & RAY_ATTR_HAS_INDEX) ? (const void*)col->index : NULL;
+        const void* lazy = lazy_use_key(col);
+        if (!own && !lazy) continue;
+        int64_t cnt = 0;
         for (uint32_t s = 0; s < ns; s++)
-            if (snap[s].key == col->index) {
-                int64_t name = ray_table_col_name(tbl, c);
-                int64_t cnt = (int64_t)snap[s].n;
-                keys = ray_vec_append(keys, &name);
-                if (RAY_IS_ERR(keys)) { ray_release(vals); return ray_error("oom", NULL); }
-                vals = ray_vec_append(vals, &cnt);
-                if (RAY_IS_ERR(vals)) { ray_release(keys); return ray_error("oom", NULL); }
-                break;
-            }
+            if (snap[s].key == own || snap[s].key == lazy) cnt += (int64_t)snap[s].n;
+        if (cnt == 0) continue;
+        int64_t name = ray_table_col_name(tbl, c);
+        keys = ray_vec_append(keys, &name);
+        if (RAY_IS_ERR(keys)) { ray_release(vals); return ray_error("oom", NULL); }
+        vals = ray_vec_append(vals, &cnt);
+        if (RAY_IS_ERR(vals)) { ray_release(keys); return ray_error("oom", NULL); }
     }
     return ray_dict_new(keys, vals);
 }
@@ -4178,4 +4183,208 @@ void ray_index_carry_append(ray_t* src, ray_t* dst) {
     ix->u.hash.order_sym = sx->u.hash.order_sym;
     ix->markers = sx->markers;
     attach_finalize(dst, idx);
+}
+
+/* ---- Lazy in-memory HASH (index policy) ----------------------------------
+ *
+ * See idxop.h.  The cache is a small fixed table under a spin lock: probes
+ * are rare (one per point-lookup filter), so the lock is never contended in
+ * practice.  Allocation, the build and every release run outside it. */
+
+bool ray_idx_lazy_hash_wanted(const ray_t* col) {
+    if (!col || RAY_IS_ERR(col) || !ray_is_vec(col) || (col->attrs & RAY_ATTR_SLICE)) return false;
+    int esz = numeric_elem_size(col->type);
+    if (esz == 0 || col->type == RAY_F32 || col->type == RAY_F64) return false;
+    if (ray_index_kind(col) != RAY_IDX_CHUNK_ZONE) return false;
+    const ray_index_t* ix = ray_index_payload(col->index);
+    if (ix->built_for_len != col->len || ix->u.chunk_zone.is_f64) return false;
+    uint32_t nc = ix->u.chunk_zone.n_chunks;
+    if (nc < 4 || !ix->u.chunk_zone.mins || !ix->u.chunk_zone.maxs) return false;
+    const int64_t* mins = (const int64_t*)ray_data(ix->u.chunk_zone.mins);
+    const int64_t* maxs = (const int64_t*)ray_data(ix->u.chunk_zone.maxs);
+    int64_t gmin = INT64_MAX, gmax = INT64_MIN;
+    for (uint32_t g = 0; g < nc; g++) {
+        if (mins[g] > maxs[g]) continue;               /* all-null chunk */
+        if (mins[g] < gmin) gmin = mins[g];
+        if (maxs[g] > gmax) gmax = maxs[g];
+    }
+    if (gmin == INT64_MAX) return false;
+    uint64_t range = (uint64_t)gmax - (uint64_t)gmin; /* full I64 width: wraps correctly */
+    if (range == 0) return false;
+    double span_sum = 0.0;
+    uint32_t n_eff = 0;
+    for (uint32_t g = 0; g < nc; g++) {
+        if (mins[g] > maxs[g]) continue;
+        span_sum += (double)((uint64_t)maxs[g] - (uint64_t)mins[g]);
+        n_eff++;
+    }
+    if (n_eff < 4 || (span_sum / (double)n_eff) / (double)range <= 0.5) return false;
+    uint64_t cap = 8, want = 2u * (uint64_t)col->len;
+    while (cap < want) cap <<= 1;
+    return cap * 8u + (uint64_t)col->len * 8u <= 5u * (uint64_t)col->len * (uint64_t)esz;
+}
+
+#define LAZY_SLOTS 64
+#define LAZY_HASH_BYTES_PER_ROW 58     /* the converters' hash-build figure, per row */
+/* hcol NULL: a declined column (over budget, or its build failed), kept so
+ * later probes do not retry it; it holds no bytes. */
+typedef struct { const ray_t* key; ray_t* col; ray_t* hcol; int64_t bytes; uint64_t tick; } lazy_ent_t;
+static lazy_ent_t  g_lazy[LAZY_SLOTS];
+static int64_t     g_lazy_bytes;
+static uint64_t    g_lazy_tick;
+static atomic_flag g_lazy_lock = ATOMIC_FLAG_INIT;
+
+static void lazy_lock(void)   { while (atomic_flag_test_and_set_explicit(&g_lazy_lock, memory_order_acquire)) RAY_CPU_RELAX(); }
+static void lazy_unlock(void) { atomic_flag_clear_explicit(&g_lazy_lock, memory_order_release); }
+
+/* References taken out of the table under the lock, released after it. */
+typedef struct { ray_t* objs[2 * LAZY_SLOTS + 2]; int n; } lazy_drop_t;
+static void lazy_take(lazy_drop_t* d, int i) {
+    g_lazy_bytes -= g_lazy[i].bytes;
+    if (g_lazy[i].hcol) d->objs[d->n++] = g_lazy[i].hcol;
+    if (g_lazy[i].col)  d->objs[d->n++] = g_lazy[i].col;
+    memset(&g_lazy[i], 0, sizeof g_lazy[i]);
+}
+static void lazy_drop(lazy_drop_t* d) {
+    for (int i = 0; i < d->n; i++) ray_release(d->objs[i]);
+    d->n = 0;
+}
+static int lazy_find(const ray_t* col) {
+    for (int i = 0; i < LAZY_SLOTS; i++) if (g_lazy[i].key == col) return i;
+    return -1;
+}
+/* A free slot, else the least recently used one emptied into d. */
+static int lazy_slot(lazy_drop_t* d) {
+    int lru = 0;
+    for (int i = 0; i < LAZY_SLOTS; i++) {
+        if (!g_lazy[i].key) return i;
+        if (g_lazy[i].tick < g_lazy[lru].tick) lru = i;
+    }
+    lazy_take(d, lru);
+    return lru;
+}
+
+/* Remember that col gets no lazy index.  Under the lock. */
+static void lazy_decline_locked(ray_t* col, lazy_drop_t* d) {
+    if (lazy_find(col) >= 0) return;
+    int s = lazy_slot(d);
+    ray_retain(col);
+    g_lazy[s] = (lazy_ent_t){ .key = col, .col = col, .hcol = NULL, .bytes = 0, .tick = ++g_lazy_tick };
+}
+static void lazy_decline(ray_t* col) {
+    lazy_drop_t d = { .n = 0 };
+    lazy_lock();
+    lazy_decline_locked(col, &d);
+    lazy_unlock();
+    lazy_drop(&d);
+}
+
+const ray_t* ray_idx_lazy_lookup(const ray_t* col) {
+    lazy_lock();
+    int i = col ? lazy_find(col) : -1;
+    const ray_t* r = i >= 0 ? g_lazy[i].hcol : NULL;
+    lazy_unlock();
+    return r;
+}
+
+/* The index block of col's cached copy, as a .idx.uses key (compared,
+ * never dereferenced), or NULL. */
+static const void* lazy_use_key(const ray_t* col) {
+    lazy_lock();
+    int i = col ? lazy_find(col) : -1;
+    const void* k = i >= 0 && g_lazy[i].hcol ? (const void*)g_lazy[i].hcol->index : NULL;
+    lazy_unlock();
+    return k;
+}
+
+ray_t* ray_idx_lazy_hash(ray_t* col, ray_t** out) {
+    *out = NULL;
+    if (!col || RAY_IS_ERR(col) || !ray_is_vec(col)) return NULL;
+    lazy_lock();
+    int hit = lazy_find(col);
+    if (hit >= 0) {
+        g_lazy[hit].tick = ++g_lazy_tick;
+        if (g_lazy[hit].hcol) { ray_retain(g_lazy[hit].hcol); *out = g_lazy[hit].hcol; }
+        lazy_unlock();
+        return NULL;                                    /* cached, or declined before */
+    }
+    lazy_unlock();
+    /* Not remembered: the shape is decided from the zone's chunk extrema
+     * (O(chunks), nothing built), so it is simply asked again. */
+    if (!ray_idx_lazy_hash_wanted(col)) return NULL;
+    int64_t budget = ray_sys_ram_limit() / 4;
+    if (budget <= 0) return NULL;                       /* no runtime: no budget, no cache */
+    int64_t bytes = col->len * (int64_t)(numeric_elem_size(col->type) + LAZY_HASH_BYTES_PER_ROW);
+    if (bytes > budget) { lazy_decline(col); return NULL; }
+    ray_t* h = ray_idx_hash_fn(col);                    /* copy-on-write: col is never modified */
+    if (!h) { lazy_decline(col); return ray_error("oom", "lazy hash"); }
+    if (RAY_IS_ERR(h)) {
+        /* an interrupted build is the query's cancellation, not the column's */
+        if (strcmp(ray_err_code(h), "cancel") != 0) lazy_decline(col);
+        return h;
+    }
+    if (ray_index_kind(h) != RAY_IDX_HASH) { ray_release(h); lazy_decline(col); return NULL; }
+
+    lazy_drop_t d = { .n = 0 };
+    lazy_lock();
+    int i = lazy_find(col);
+    if (i >= 0 && g_lazy[i].hcol) {
+        /* Another probe built and published it first: use that one. */
+        g_lazy[i].tick = ++g_lazy_tick;
+        ray_retain(g_lazy[i].hcol);
+        *out = g_lazy[i].hcol;
+        lazy_unlock();
+        ray_release(h);
+        return NULL;
+    }
+    if (i >= 0) lazy_take(&d, i);                       /* declined meanwhile: this build stands */
+    while (g_lazy_bytes + bytes > budget) {             /* least recently used first */
+        int lru = -1;
+        for (int k = 0; k < LAZY_SLOTS; k++)
+            if (g_lazy[k].hcol && (lru < 0 || g_lazy[k].tick < g_lazy[lru].tick)) lru = k;
+        if (lru < 0) break;
+        lazy_take(&d, lru);
+    }
+    int s = lazy_slot(&d);
+    ray_retain(col);
+    g_lazy[s] = (lazy_ent_t){ .key = col, .col = col, .hcol = h, .bytes = bytes, .tick = ++g_lazy_tick };
+    g_lazy_bytes += bytes;
+    ray_retain(h);
+    *out = h;
+    lazy_unlock();
+    lazy_drop(&d);
+    return NULL;
+}
+
+void ray_idx_lazy_forget(const ray_t* col) {
+    if (!col) return;
+    lazy_drop_t d = { .n = 0 };
+    lazy_lock();
+    int i = lazy_find(col);
+    if (i >= 0) lazy_take(&d, i);
+    lazy_unlock();
+    lazy_drop(&d);
+}
+
+void ray_idx_lazy_clear(void) {
+    lazy_drop_t d = { .n = 0 };
+    lazy_lock();
+    for (int i = 0; i < LAZY_SLOTS; i++) if (g_lazy[i].key) lazy_take(&d, i);
+    lazy_unlock();
+    lazy_drop(&d);
+}
+
+int64_t ray_idx_lazy_count(void) {
+    int64_t n = 0;
+    lazy_lock();
+    for (int i = 0; i < LAZY_SLOTS; i++) n += g_lazy[i].hcol != NULL;
+    lazy_unlock();
+    return n;
+}
+
+int64_t ray_idx_lazy_bytes(void) {
+    lazy_lock();
+    int64_t b = g_lazy_bytes;
+    lazy_unlock();
+    return b;
 }

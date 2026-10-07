@@ -24,6 +24,23 @@ Suited to "does this value exist in the column" / "which row(s) hold this value"
 
 **Wired today:** filter EQ (integer-family, null-free columns), filter IN, find.  Float equality and null-bearing columns fall back to the scan.
 
+### Hash indexes built on first use
+
+Converted tables persist chunk zones and string dictionaries, not hash
+indexes. When an equality filter, or an `in` filter with a small set of
+integers, meets an integer column whose chunk zone cannot prune (values
+spread over the whole range in every chunk), the engine builds a hash index
+for that column in memory on first use and reuses it for later filters in
+the same process. Compressed columns are covered too: the index is built from
+the decoded column. It is never written to disk and never changes the
+table's column (`.idx.info` still reports its zone). Scans, aggregates and
+range filters never trigger a build. The memory it holds is bounded by a
+quarter of the RAM the process may use (physical memory, or the container's
+memory limit when that is smaller); the least recently used index is dropped
+first, and a column too large for the bound is remembered and scanned without
+retrying. Build one explicitly with `.idx.hash` to persist it
+with the table.
+
 ### Range queries / sorted access — `.idx.sort`
 
 Suited to "values between A and B", ordered-output queries, and distinct. Build cost O(n log n); space O(n) for the row-id permutation. The original column stays in original order — the sort lives in the permutation, not the values.

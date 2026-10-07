@@ -26,6 +26,7 @@
 #include "mem/heap.h"
 #include "mem/sys.h"
 #include "table/sym.h"
+#include "ops/idxop.h"     /* ray_idx_lazy_clear — the lazy hash cache */
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -423,6 +424,10 @@ int64_t ray_vec_get_sym_id(ray_t* vec, int64_t idx) {
 
 void ray_runtime_destroy(ray_runtime_t* rt) {
     if (!rt) return;
+
+    /* The lazy hash cache holds column references: release them while the
+     * heap and the globals that share those columns are still alive. */
+    ray_idx_lazy_clear();
 
     ray_lang_destroy();
 

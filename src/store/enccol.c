@@ -23,7 +23,7 @@
 #include "store/enccol.h"
 #include "store/col.h"
 #include "store/encw.h"          /* ray_encw_type_supported / _summable / _has_dict */
-#include "ops/idxop.h"            /* ray_index_kind_admits */
+#include "ops/idxop.h"            /* ray_index_kind_admits, ray_idx_lazy_forget */
 #include "lang/format.h"          /* ray_type_name */
 #include "core/platform.h"
 #include "mem/sys.h"             /* ray_sys_alloc: the map descriptor, as col.c */
@@ -45,7 +45,10 @@ ray_enccol_t* ray_enccol_of(ray_t* v) {
 }
 
 static void enccol_free(ray_enccol_t* e) {
-    if (e->decoded) ray_release(e->decoded);
+    if (e->decoded) {
+        ray_idx_lazy_forget(e->decoded);     /* a lazy hash goes with its object */
+        ray_release(e->decoded);
+    }
     if (e->dict)    ray_release(e->dict);
     if (e->wrapper) ray_release(e->wrapper);
     if (e->dom && e->dom_owned) ray_sym_domain_release(e->dom);
