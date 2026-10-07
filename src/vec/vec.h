@@ -63,6 +63,10 @@ static inline bool ray_vec_has_nulls(const ray_t* v) {
     return false;
 }
 
+/* Sentinel null test on a raw generation-0 element array (range views,
+ * scan pieces); SYM at the width class in `attrs`. */
+bool ray_raw_is_null(int8_t type, uint8_t attrs, const void* base, int64_t idx);
+
 /* Copy null bits from src to dst (sentinel-based). dst and src must have
  * the same length. Internal helper. */
 ray_err_t ray_vec_copy_nulls(ray_t* dst, const ray_t* src);

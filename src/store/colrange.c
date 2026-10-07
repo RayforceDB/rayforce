@@ -22,6 +22,7 @@
  */
 
 #include "store/colrange.h"
+#include "core/platform.h"
 #include "store/col.h"
 #include "store/enccol.h"
 #include "table/sym.h"
@@ -242,4 +243,176 @@ int64_t ray_col_src_dict_code(const ray_col_src_t* s, const char* str, size_t le
         if (l == len && (len == 0 || memcmp(p, str, len) == 0)) return c;
     }
     return -1;
+}
+
+/* ---- Scan side: cursors, the piece walk, the failure envelope ---- */
+
+uint8_t ray_col_src_esz(const ray_col_src_t* s) { return ray_sym_elem_size(s->type, s->attrs); }
+
+ray_t* ray_col_src_ready(const ray_col_src_t* s) {
+    if (!s || !s->obj) return NULL;
+    if (s->obj->type != RAY_ENCCOL) return s->obj;
+    return ray_enccol_decoded_peek(s->obj);        /* published materialization, or NULL */
+}
+
+void ray_col_cursor_init(ray_col_cursor_t* c, ray_col_src_t* src) {
+    memset(c, 0, sizeof *c);
+    c->src = src;
+    ray_col_scratch_init(&c->sc);
+}
+
+void ray_col_cursor_free(ray_col_cursor_t* c) {
+    ray_col_scratch_free(&c->sc);
+    memset(c, 0, sizeof *c);
+}
+
+ray_t* ray_col_cursor_at(ray_col_cursor_t* c, int64_t r, const ray_col_range_t** out) {
+    *out = NULL;
+    if (c->have && r >= c->v.start && r < c->v.start + c->v.n) { *out = &c->v; return NULL; }
+    ray_col_src_t* s = c->src;
+    if (!s || !s->obj || r < 0 || r >= s->len) return ray_error("range", "scan cursor: row %lld", (long long)r);
+    c->have = false;
+    /* A published materialization is read in place (single: a plain vector;
+     * parted: the plain parted wrapper, read segment by segment). */
+    ray_t* obj = s->obj;
+    if (obj->type == RAY_ENCCOL) {
+        ray_t* pk = ray_enccol_decoded_peek(obj);
+        if (pk) obj = pk;
+    }
+    memset(&c->v, 0, sizeof c->v);
+    c->v.start = r;
+    c->v.type = s->type;
+    c->v.attrs = s->attrs;
+    c->v.dom = s->dom;
+    ray_t* err = range_obj(obj, r, s->len - r, &c->sc, &c->v);   /* ray_col_range's body, same clipping */
+    c->v.start = r;
+    if (err) return err;
+    if (c->v.n <= 0) return ray_error("range", "scan cursor: empty range read at row %lld", (long long)r);
+    c->have = true;
+    *out = &c->v;
+    return NULL;
+}
+
+/* A plain source's piece fields other than data, fixed for the call. */
+static ray_col_piece_t plain_piece(const ray_col_src_t* s) {
+    ray_col_piece_t p = { 0 };
+    p.attrs = s->attrs;
+    p.may_null = s->may_null;
+    p.dom = s->dom;
+    if (s->type == RAY_STR) {
+        ray_t* rd = ray_col_src_ready(s);
+        if (rd && !RAY_IS_PARTED(rd->type)) {
+            ray_t* own = plain_owner(rd);
+            if (own->str_pool && !RAY_IS_ERR(own->str_pool)) p.str_pool = (const char*)ray_data(own->str_pool);
+        }
+    }
+    return p;
+}
+
+#define WALK_STACK 16
+ray_t* ray_col_walk(ray_col_src_t* const* srcs, const void* const* plain, uint32_t n,
+                    int64_t lo, int64_t hi, bool contiguous,
+                    void* ctx, uint32_t wid, ray_col_piece_fn fn) {
+    if (lo >= hi) return NULL;
+    if (contiguous && hi - lo > RAY_COL_BLOCK_ROWS)
+        return ray_error("range", "scan walk: contiguous block of %lld rows", (long long)(hi - lo));
+    ray_col_cursor_t cst[WALK_STACK]; ray_col_piece_t pst[WALK_STACK]; void* bst[WALK_STACK];
+    ray_col_cursor_t* cur = cst; ray_col_piece_t* pc = pst; void** buf = bst;
+    if (n > WALK_STACK) {
+        cur = ray_calloc_raw((size_t)n * sizeof *cur);
+        pc  = ray_calloc_raw((size_t)n * sizeof *pc);
+        buf = ray_calloc_raw((size_t)n * sizeof *buf);
+        if (!cur || !pc || !buf) { ray_free_raw(cur); ray_free_raw(pc); ray_free_raw(buf); return ray_error("oom", "scan walk"); }
+    }
+    /* Plain and skipped sources get their fixed fields once; only cursor
+     * sources hold a cursor (and, contiguous, a buffer) and are re-read per
+     * piece. */
+    bool any_cursor = false;
+    for (uint32_t i = 0; i < n; i++) {
+        pc[i] = srcs[i] ? plain_piece(srcs[i]) : (ray_col_piece_t){ 0 };
+        if (srcs[i] && !plain[i]) {
+            ray_col_cursor_init(&cur[i], srcs[i]);
+            buf[i] = NULL;
+            any_cursor = true;
+        }
+    }
+    ray_t* err = NULL;
+    if (contiguous) {
+        for (uint32_t i = 0; i < n && !err; i++) {
+            ray_col_src_t* s = srcs[i];
+            if (!s) continue;
+            uint8_t esz = ray_col_src_esz(s);
+            if (plain[i]) { pc[i].data = (const char*)plain[i] + (size_t)lo * esz; continue; }
+            if (s->type != RAY_F32 && s->type != RAY_F64) { err = ray_error("nyi", "scan walk: contiguous non-float source"); break; }
+            buf[i] = ray_alloc_raw((size_t)(hi - lo) * esz);
+            if (!buf[i]) { err = ray_error("oom", "scan walk block"); break; }
+            bool mn = false;
+            for (int64_t r = lo; r < hi; ) {
+                const ray_col_range_t* v;
+                if ((err = ray_col_cursor_at(&cur[i], r, &v)) != NULL) break;
+                int64_t take = v->start + v->n - r; if (take > hi - r) take = hi - r;
+                memcpy((char*)buf[i] + (size_t)(r - lo) * esz, (const char*)v->data + (size_t)(r - v->start) * esz, (size_t)take * esz);
+                mn |= v->may_null;
+                r += take;
+            }
+            pc[i].data = buf[i];
+            pc[i].may_null = mn;
+        }
+        if (!err) fn(ctx, wid, lo, hi, pc);
+    } else if (!any_cursor) {
+        /* Every source in place: one piece, no cursor reads. */
+        for (uint32_t i = 0; i < n; i++)
+            if (srcs[i]) pc[i].data = (const char*)plain[i] + (size_t)lo * ray_col_src_esz(srcs[i]);
+        fn(ctx, wid, lo, hi, pc);
+    } else {
+        for (int64_t b = lo; b < hi && !err; ) {
+            int64_t e = hi;
+            for (uint32_t i = 0; i < n; i++) {
+                ray_col_src_t* s = srcs[i];
+                if (!s) continue;
+                if (plain[i]) { pc[i].data = (const char*)plain[i] + (size_t)b * ray_col_src_esz(s); continue; }
+                const ray_col_range_t* v;
+                if ((err = ray_col_cursor_at(&cur[i], b, &v)) != NULL) break;
+                uint8_t vesz = ray_sym_elem_size(v->type, v->attrs);
+                pc[i].data = (const char*)v->data + (size_t)(b - v->start) * vesz;
+                pc[i].attrs = v->attrs; pc[i].may_null = v->may_null;
+                pc[i].str_pool = v->str_pool; pc[i].dom = v->dom;
+                if (v->start + v->n < e) e = v->start + v->n;
+            }
+            if (err) break;
+            fn(ctx, wid, b, e, pc);
+            b = e;
+        }
+    }
+    if (any_cursor)
+        for (uint32_t i = 0; i < n; i++)
+            if (srcs[i] && !plain[i]) { ray_col_cursor_free(&cur[i]); ray_free_raw(buf[i]); }
+    if (n > WALK_STACK) { ray_free_raw(cur); ray_free_raw(pc); ray_free_raw(buf); }
+    return err;
+}
+
+void ray_scan_fail_init(ray_scan_fail_t* f) {
+    memset(f, 0, sizeof *f);
+    atomic_store(&f->key, INT64_MAX);
+}
+
+void ray_scan_fail_note(ray_scan_fail_t* f, int64_t key, ray_t* err) {
+    while (atomic_exchange_explicit(&f->lock, 1, memory_order_acquire)) RAY_CPU_RELAX();
+    if (key < atomic_load_explicit(&f->key, memory_order_relaxed)) {
+        ray_enc_snap_take(&f->snap, err);          /* snapshots on this thread, frees err */
+        atomic_store_explicit(&f->key, key, memory_order_release);
+    } else {
+        ray_error_free(err);
+    }
+    atomic_store_explicit(&f->lock, 0, memory_order_release);
+}
+
+ray_t* ray_scan_fail_error(ray_scan_fail_t* f) {
+    if (!ray_scan_failed(f)) return NULL;
+    /* The snapshot is written under the lock; take it so a note racing a
+     * late reader cannot tear it. */
+    while (atomic_exchange_explicit(&f->lock, 1, memory_order_acquire)) RAY_CPU_RELAX();
+    ray_t* e = ray_enc_snap_error(&f->snap);
+    atomic_store_explicit(&f->lock, 0, memory_order_release);
+    return e;
 }

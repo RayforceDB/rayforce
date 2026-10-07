@@ -43,45 +43,33 @@ static int pair_cmp_idx_then_k(const void* a, const void* b) {
     return (pa[1] > pb[1]) - (pa[1] < pb[1]);
 }
 
-/* Sentinel-based per-element null test.  Caller guarantees v is a
- * non-slice vector (type > 0) and idx is in range.  Returns true iff
- * payload[idx] equals the type-correct NULL_* sentinel.  F64/F32 use
- * (x != x) to detect any NaN bit pattern.  BOOL/U8 are non-nullable
- * and return false. */
-static inline bool sentinel_is_null(const ray_t* v, int64_t idx) {
-    const void* p = ray_data((ray_t*)v);
-    switch (v->type) {
-        case RAY_F64: {
-            double x = ((const double*)p)[idx];
-            return x != x;
-        }
-        case RAY_F32: {
-            float x = ((const float*)p)[idx];
-            return x != x;
-        }
-        case RAY_I64:
-        case RAY_TIMESTAMP:
-            return ((const int64_t*)p)[idx] == NULL_I64;
-        case RAY_I32:
-        case RAY_DATE:
-        case RAY_TIME:
-            return ((const int32_t*)p)[idx] == NULL_I32;
-        case RAY_I16:
-            return ((const int16_t*)p)[idx] == NULL_I16;
-        /* SYM uses id 0 as its canonical in-band null.  Width-aware handling
-         * lives in ray_vec_is_null, so there is no arm here. */
-        case RAY_STR:
-            return ((const ray_str_t*)p)[idx].len == 0;
+/* Sentinel null test on a raw generation-0 element array.  F64/F32 use
+ * (x != x) to detect any NaN bit pattern; SYM tests id 0 at the width class
+ * in `attrs`; BOOL/U8 are non-nullable and return false. */
+bool ray_raw_is_null(int8_t type, uint8_t attrs, const void* p, int64_t idx) {
+    switch (type) {
+        case RAY_F64: { double x = ((const double*)p)[idx]; return x != x; }
+        case RAY_F32: { float x = ((const float*)p)[idx];   return x != x; }
+        case RAY_I64: case RAY_TIMESTAMP: return ((const int64_t*)p)[idx] == NULL_I64;
+        case RAY_I32: case RAY_DATE: case RAY_TIME: return ((const int32_t*)p)[idx] == NULL_I32;
+        case RAY_I16: return ((const int16_t*)p)[idx] == NULL_I16;
+        case RAY_SYM: return ray_read_sym(p, idx, RAY_SYM, attrs) == 0;
+        case RAY_STR: return ((const ray_str_t*)p)[idx].len == 0;
         case RAY_GUID: {
             /* GUID null = 16 all-zero bytes (canonical convention). */
             static const uint8_t Z[16] = {0};
             return memcmp((const uint8_t*)p + idx * 16, Z, 16) == 0;
         }
-        case RAY_BOOL:
-        case RAY_U8:
-        default:
-            return false;
+        default: return false;     /* BOOL, U8: non-nullable */
     }
+}
+
+/* Sentinel-based per-element null test.  Caller guarantees v is a
+ * non-slice vector (type > 0) and idx is in range.  Returns true iff
+ * payload[idx] equals the type-correct NULL_* sentinel.  SYM is resolved
+ * (width-aware) by ray_vec_is_null before it gets here. */
+static inline bool sentinel_is_null(const ray_t* v, int64_t idx) {
+    return ray_raw_is_null(v->type, v->attrs, ray_data((ray_t*)v), idx);
 }
 
 /* In-place drop of attached index — caller must hold a unique ref (rc==1)

@@ -174,6 +174,7 @@ extern const test_entry_t enccol_entries[];
 extern const test_entry_t enccorrupt_entries[];
 extern const test_entry_t large_entries[];
 extern const test_entry_t colrange_entries[];
+extern const test_entry_t scanrange_entries[];
 extern const test_entry_t parted_ragged_entries[];
 extern const test_entry_t compress_entries[];
 extern const test_entry_t fsst_entries[];
@@ -224,6 +225,7 @@ static const test_entry_t* const compiled_groups[] = {
     encfmt_entries,   enconce_entries,   enccol_entries, enccorrupt_entries,
     large_entries,
     colrange_entries,
+    scanrange_entries,
     parted_ragged_entries,
     compress_entries,
     idx_uses_entries,

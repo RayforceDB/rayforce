@@ -25,6 +25,9 @@
 #define RAY_COLRANGE_H
 
 #include <rayforce.h>
+#include <stdatomic.h>
+#include "store/enc_once.h"
+#include "ops/ops.h"   /* RAY_DISPATCH_MORSELS, RAY_MORSEL_ELEMS: the pool's task grain */
 
 struct ray_sym_domain_s;
 
@@ -99,5 +102,86 @@ int64_t ray_col_src_sym_find(const ray_col_src_t* s, const char* str, size_t len
  * -2 no dictionary to resolve against (generation 2 in P1: STR_DICT
  * arrives in P6).  Reads only the generation-0 column's DICT index. */
 int64_t ray_col_src_dict_code(const ray_col_src_t* s, const char* str, size_t len);
+
+/* ---- Scan side: cursors, the piece walk, the failure envelope ---- */
+
+/* The contiguous-mode block bound: the pool's task grain (8192 rows). */
+#define RAY_COL_BLOCK_ROWS (RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS)
+
+/* The source's object is a RAY_ENCCOL (generation 2, or a parted column
+ * with an encoded or synthetic segment). */
+static inline bool ray_col_src_encoded(const ray_col_src_t* s) {
+    return s && s->obj && s->obj->type == RAY_ENCCOL;
+}
+
+/* The plain column a scan can read in place, without decoding: a plain
+ * object (vector, slice, plain parted wrapper) itself, or a RAY_ENCCOL's
+ * published materialization; NULL when reading it would decode.  Borrowed
+ * from the source; never decodes. */
+ray_t*  ray_col_src_ready(const ray_col_src_t* s);
+/* Generation-0 element width of the source (SYM: its persisted width). */
+uint8_t ray_col_src_esz(const ray_col_src_t* s);
+
+/* One source in one task: P1's scratch plus the current view. */
+typedef struct {
+    ray_col_src_t*    src;     /* borrowed; bound for the execution */
+    ray_col_scratch_t sc;
+    ray_col_range_t   v;       /* valid when have */
+    bool              have;
+} ray_col_cursor_t;
+
+void   ray_col_cursor_init(ray_col_cursor_t* c, ray_col_src_t* src);
+void   ray_col_cursor_free(ray_col_cursor_t* c);
+/* The view covering row r (0 <= r < len): the current one when it covers
+ * r, else a range read of [r, len) (generation 2: up to the end of r's
+ * vector; plain: to the source, segment or slice end).  A RAY_ENCCOL whose
+ * materialization is published is read from that vector.  NULL or an
+ * owned error; *out is valid until the next call or the cursor's free. */
+ray_t* ray_col_cursor_at(ray_col_cursor_t* c, int64_t r, const ray_col_range_t** out);
+
+/* One source's view of a piece: data points at the piece's first row. */
+typedef struct {
+    const void* data;
+    uint8_t     attrs;          /* SYM: the width class of data */
+    bool        may_null;
+    const char* str_pool;       /* STR */
+    struct ray_sym_domain_s* dom;
+} ray_col_piece_t;
+
+typedef void (*ray_col_piece_fn)(void* ctx, uint32_t wid, int64_t b, int64_t e,
+                                 const ray_col_piece_t* p);
+
+/* Walk [lo, hi) of n sources.  plain[i] is the base pointer of source i
+ * (its row 0) when it can be read in place, or NULL to read it through a
+ * cursor (generation 2, RAY_ENCCOL_PARTED, a plain parted wrapper); a NULL
+ * srcs[i] is skipped (COUNT inputs).  Each call of fn covers a piece
+ * [b, e) with one ray_col_piece_t per source.  Plain sources point at
+ * plain + b * esz; cursor sources point into their view, so a piece ends
+ * at the nearest view end.  contiguous: one piece [lo, hi)
+ * (hi - lo <= RAY_COL_BLOCK_ROWS), every cursor F32/F64 source copied into
+ * a buffer of the call (any other cursor type is `nyi` in this mode).
+ * Cursors and buffers live for the call: allocate at its start, free at its
+ * end.  NULL or an owned error (fn is not called again after an error). */
+ray_t* ray_col_walk(ray_col_src_t* const* srcs, const void* const* plain, uint32_t n,
+                    int64_t lo, int64_t hi, bool contiguous,
+                    void* ctx, uint32_t wid, ray_col_piece_fn fn);
+
+/* A dispatch's failure envelope: workers note range errors keyed by their
+ * task's first row; the coordinator returns the lowest-keyed one. */
+typedef struct {
+    _Atomic(uint32_t) lock;
+    _Atomic(int64_t)  key;     /* lowest failing key; INT64_MAX when none */
+    ray_enc_snap_t    snap;
+} ray_scan_fail_t;
+
+void   ray_scan_fail_init(ray_scan_fail_t* f);
+/* Consumes err; snapshots its code and this thread's message when key is
+ * the lowest so far. */
+void   ray_scan_fail_note(ray_scan_fail_t* f, int64_t key, ray_t* err);
+static inline bool ray_scan_failed(ray_scan_fail_t* f) {
+    return atomic_load_explicit(&f->key, memory_order_acquire) != INT64_MAX;
+}
+/* NULL, or a fresh error rebuilt on the calling thread. */
+ray_t* ray_scan_fail_error(ray_scan_fail_t* f);
 
 #endif /* RAY_COLRANGE_H */
