@@ -725,6 +725,95 @@ static test_result_t test_reject_depth4(void) {
     PASS();
 }
 
+/* ---- Task 3b: the integer fast kernel never accepts what the reference rejects ---- */
+
+/* Two range reads of vector `vec` of the patched image through one column
+ * object (the chunk validated by the first when its descriptors are sound):
+ * both `corrupt`, naming the path and the rule. */
+static const char* expect_twice(const char* path, int64_t vec, const char* needle) {
+    static char why[512];
+    if (!img_store(path, g_len)) return "store";
+    ray_t* c = ray_col_mmap(path);
+    if (!c || RAY_IS_ERR(c)) { if (c) ray_error_free(c); return "load failed"; }
+    ray_col_src_t src;
+    ray_t* m = ray_col_src_bind(c, &src);
+    if (m) { ray_error_free(m); ray_release(c); return "bind failed"; }
+    ray_col_scratch_t sc; ray_col_scratch_init(&sc);
+    const char* res = NULL;
+    for (int i = 0; i < 2 && !res; i++) {
+        ray_col_range_t r;
+        ray_error_clear();
+        ray_t* e = ray_col_range(&src, vec * RAY_ENC_VEC, RAY_ENC_VEC, &sc, &r);
+        bool ok = e && RAY_IS_ERR(e) && strcmp(ray_err_code(e), "corrupt") == 0 && names_path(path) && has_needle(needle);
+        if (!ok) {
+            snprintf(why, sizeof why, "read %d gave %s: \"%s\", want corrupt [%s]", i + 1,
+                     e && RAY_IS_ERR(e) ? ray_err_code(e) : "a view", e && ray_error_msg() ? ray_error_msg() : "", needle);
+            res = why;
+        }
+        if (e) ray_error_free(e);
+    }
+    ray_col_scratch_free(&sc); ray_col_src_release(&src);
+    ray_release(c);
+    return res;
+}
+#define BAD2(path, vec, needle) do { const char* w_ = expect_twice(path, vec, needle); \
+    TEST_ASSERT_FMT(w_ == NULL, "%s:%d %s", __FILE__, __LINE__, w_); } while (0)
+
+/* 1024 rows of `type` (I16 / I32): 5000 + a hash of i in [0, 64) -> FOR_BP width 6. */
+static ray_t* fk_for(int8_t type) {
+    ray_t* v = ray_vec_new(type, 1024); v->len = 1024;
+    for (int i = 0; i < 1024; i++) {
+        int x = 5000 + (int)(((uint32_t)i * 2654435761u) >> 26);
+        if (type == RAY_I16) ((int16_t*)ray_data(v))[i] = (int16_t)x;
+        else ((int32_t*)ray_data(v))[i] = x;
+    }
+    return v;
+}
+/* 2048 I32 rows 3i + i % 5 -> DELTA_BP (32 heads, small deltas) in both vectors. */
+static ray_t* fk_delta(void) {
+    ray_t* v = ray_vec_new(RAY_I32, 2048); v->len = 2048;
+    for (int i = 0; i < 2048; i++) ((int32_t*)ray_data(v))[i] = 3 * i + i % 5;
+    return v;
+}
+
+static test_result_t test_fast_kernel_corrupt_twice(void) {
+    const char* p = ray_test_tmp(EC_TMP "/fk");
+    size_t at;
+    for (int t = 0; t < 2; t++) {
+        int8_t type = t ? RAY_I32 : RAY_I16;
+        int T = t ? 32 : 16;
+        /* base above the type width */
+        SAVE(fk_for(type), p); NEED_ENC(0, 0, RAY_ENC_FOR_BP); at = payload_at(0, 0);
+        W64(at, (uint64_t)1 << T);                          BAD2(p, 0, "FOR_BP base above the type width");
+        /* a value on the sentinel, no bitmap: base moved onto MIN (offset 0 rows decode to it) */
+        SAVE(fk_for(type), p); at = payload_at(0, 0);
+        W64(at, (uint64_t)1 << (T - 1));                    BAD2(p, 0, "sentinel outside the bitmap");
+        /* the body a word short (the vector, its chunk and the file shrink together) */
+        SAVE(fk_for(type), p);
+        uint64_t pb = rd64(desc_at(0, 0) + 16);
+        W64(desc_at(0, 0) + 16, pb - 8); set_chunk_bytes(0, 3072 + pb - 8);
+        BAD2(p, 0, "FOR_BP body short");
+        /* a word long */
+        SAVE(fk_for(type), p);
+        W64(desc_at(0, 0) + 16, pb + 8); set_chunk_bytes(0, 3072 + pb + 8);
+        BAD2(p, 0, "bytes after the codec body");
+        /* width above the type width: a descriptor rule, so never validated */
+        SAVE(fk_for(type), p);
+        W8(desc_at(0, 0) + 1, (uint8_t)(T + 1));            BAD2(p, 0, "width");
+    }
+    /* DELTA_BP (second vector: the chunk's first vector stays sound) */
+    SAVE(fk_delta(), p); NEED_ENC(0, 1, RAY_ENC_DELTA_BP); at = payload_at(0, 1);
+    TEST_ASSERT_TRUE(g_img[desc_at(0, 1) + 1] > 0);        /* width > 0: a placeholder row exists */
+    W64(at + 8, (uint64_t)1 << 32);                         BAD2(p, 1, "DELTA_BP head above the type width");
+    SAVE(fk_delta(), p); at = payload_at(0, 1);
+    W64(at, (uint64_t)1 << 32);                             BAD2(p, 1, "DELTA_BP base above the type width");
+    SAVE(fk_delta(), p); at = payload_at(0, 1);
+    W32(at + 8 + 8 * 32, 1);                                BAD2(p, 1, "DELTA_BP placeholder not zero");
+    SAVE(fk_delta(), p); at = payload_at(0, 1);
+    W64(at + 8, (uint64_t)1 << 31);                         BAD2(p, 1, "sentinel outside the bitmap");   /* lane 0 head on MIN */
+    PASS();
+}
+
 /* Damage in a range nobody reads stays unread; whoever reads it gets corrupt. */
 static test_result_t test_lazy_validation(void) {
     const char* p = ray_test_tmp(EC_TMP "/lazy");
@@ -858,6 +947,7 @@ const test_entry_t enccorrupt_entries[] = {
     { "enccorrupt/codec_grammar", test_reject_codec_grammar, ec_setup, ec_teardown },
     { "enccorrupt/depth4",        test_reject_depth4,        ec_setup, ec_teardown },
     { "enccorrupt/lazy",          test_lazy_validation,      ec_setup, ec_teardown },
+    { "enccorrupt/fast_kernel_twice", test_fast_kernel_corrupt_twice, ec_setup, ec_teardown },
     { "enccorrupt/fuzz_flips",    test_fuzz_flips,           ec_setup, ec_teardown },
     { NULL, NULL, NULL, NULL },
 };

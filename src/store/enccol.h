@@ -64,6 +64,9 @@ typedef struct ray_enccol_s {
     ray_enc_once_t  once;
     ray_t*          decoded;
     _Atomic(uint64_t) decoded_bytes;  /* bytes produced by this column's vector decodes */
+    /* single file: one byte per chunk, set (release) once the chunk's
+     * descriptors passed validation; never set for a chunk that failed */
+    _Atomic(uint8_t)* desc_ok;
 } ray_enccol_t;
 
 ray_enccol_t* ray_enccol_of(ray_t* v);
@@ -77,8 +80,12 @@ size_t  ray_enccol_own_bytes(ray_t* v);
 int     ray_enccol_children(ray_t* v, ray_t* out[2]);
 
 /* Chunk c's descriptors, validated (spec "Validation": before a chunk's
- * descriptors are used). */
+ * descriptors are used).  A chunk is validated once per column: later
+ * calls trust the mapping, as generation 0 does. */
 ray_t* ray_enccol_chunk_descs(ray_enccol_t* e, int64_t c, ray_enc_desc_t out[64]);
+/* The same, read in place: *out points at the chunk's 64 descriptors in
+ * the mapping (valid while the column is), NULL on an error. */
+ray_t* ray_enccol_chunk_descs_ref(ray_enccol_t* e, int64_t c, const ray_enc_desc_t** out);
 /* Decode vector j of chunk c (descriptor already validated) into `out`
  * (vlen elements, generation-0 element width).  STR: pooled bytes are
  * copied to pool_out[pool_base ...] and descriptors get pool_off =
@@ -87,6 +94,22 @@ ray_t* ray_enccol_chunk_descs(ray_enccol_t* e, int64_t c, ray_enc_desc_t out[64]
  * `out` and `pool_out` are not written. */
 ray_t* ray_enccol_decode_desc(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d,
                               void* out, char* pool_out, uint64_t pool_base, uint64_t pool_cap);
+/* ray_enccol_decode_desc into a private destination: on an error `out`
+ * may hold a partial decode (the caller never publishes it), and the
+ * decoded bytes are returned in *produced instead of counted; the caller
+ * counts them with ray_enccol_note_decoded. */
+ray_t* ray_enccol_decode_into(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d,
+                              void* out, char* pool_out, uint64_t pool_base, uint64_t pool_cap,
+                              uint64_t* produced);
+/* Vector j of chunk c straight into an expression register: RAY_I64 or
+ * RAY_F64 elements (`wide`), nulls as NULL_I64 / NULL_F64, for a FOR_BP or
+ * DELTA_BP vector of a narrow integer column (BOOL, U8, I16, I32, DATE,
+ * TIME).  1 decoded (*produced as ray_enccol_decode_into), 0 declined: the
+ * caller reads the vector by range, which decodes or reports it. */
+int    ray_enccol_decode_wide(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d,
+                              int8_t wide, void* out, uint64_t* produced);
+/* Count decoded bytes (global and per column counters). */
+void   ray_enccol_note_decoded(ray_enccol_t* e, uint64_t bytes);
 /* Decoded-pool bytes of vector j of chunk c (STR; 0 otherwise). */
 ray_t* ray_enccol_desc_pool_bytes(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d,
                                   uint64_t* out);
@@ -127,6 +150,18 @@ void   ray_enccol_test_interrupt_after(int64_t nth);
 /* Parted materialization: 0 auto, 1 always on the coordinator, 2 always per-segment tasks. */
 void   ray_enccol_test_parted_mode(int mode);
 void   ray_enccol_test_refuse_attach(int on);        /* the index attach sees a mismatched root */
+/* Chunk descriptor validations run since process start. */
+uint64_t ray_enccol_test_desc_validations(void);
+/* One top-level integer vector body (`enc`, `width`) of a column of `type`
+ * (SYM: `attrs` width class, ids below `sym_bound`), vlen rows, `bm` the
+ * null bitmap or NULL, n_nulls as its descriptor says.  fast: through the
+ * fast kernel only, writing `wide` elements (0: the generation-0 width;
+ * RAY_I64 / RAY_F64: an expression register); else through the reference
+ * path (wide must be 0).  1 decoded, 0 the fast kernel declined, -1 the
+ * reference path reports it corrupt. */
+int    ray_enccol_test_decode_body(int8_t type, uint8_t attrs, uint32_t sym_bound, uint8_t enc,
+                                   uint8_t width, int n_nulls, const uint8_t* bm, const uint8_t* body,
+                                   uint64_t avail, int vlen, bool fast, int8_t wide, void* out);
 
 /* Wrap a plain-type parted wrapper (RAY_PARTED_BASE + base) whose segments
  * include at least one RAY_ENCCOL; retains the wrapper. */

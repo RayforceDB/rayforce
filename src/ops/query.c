@@ -7708,25 +7708,15 @@ static count_cmp_op_t count_cmp_flip(count_cmp_op_t op) {
 }
 
 /* Rows of data[start, end) (type, attrs: the column's or the piece's)
- * that compare true against rhs. */
-static int64_t count_compare_span(int8_t type, uint8_t attrs, const void* data,
-                                  int64_t start, int64_t end, int64_t rhs, count_cmp_op_t op) {
+ * that compare true against rhs, every element widened to int64: the
+ * reference, and the path of the 64-bit and SYM types. */
+static int64_t count_compare_span_ref(int8_t type, uint8_t attrs, const void* data,
+                                      int64_t start, int64_t end, int64_t rhs, count_cmp_op_t op) {
     int64_t local = 0;
     switch (type) {
     case RAY_BOOL:
     case RAY_U8: {
         const uint8_t* x = (const uint8_t*)data;
-        if ((op == COUNT_CMP_EQ || op == COUNT_CMP_NE) && rhs >= 0 && rhs <= 255) {
-            uint8_t needle = (uint8_t)rhs;
-            if (op == COUNT_CMP_EQ) {
-                for (int64_t i = start; i < end; i++)
-                    local += x[i] == needle;
-            } else {
-                for (int64_t i = start; i < end; i++)
-                    local += x[i] != needle;
-            }
-            break;
-        }
         for (int64_t i = start; i < end; i++)
             local += count_compare_i64((int64_t)x[i], rhs, op);
         break;
@@ -7761,6 +7751,68 @@ static int64_t count_compare_span(int8_t type, uint8_t attrs, const void* data,
     return local;
 }
 
+/* Native-width compares: the literal at the element width, a narrow
+ * counter per piece of at most 65535 rows (it cannot wrap), widened once
+ * per piece. */
+#define COUNT_NATIVE(NAME, ET, ACC)                                                     \
+static int64_t NAME(const ET* restrict x, int64_t n, ET r, count_cmp_op_t op) {         \
+    int64_t total = 0;                                                                  \
+    for (int64_t b = 0; b < n; b += 65535) {                                            \
+        const int64_t e = n - b < 65535 ? n : b + 65535;                                \
+        ACC acc = 0;                                                                    \
+        switch (op) {                                                                   \
+        case COUNT_CMP_EQ: for (int64_t i = b; i < e; i++) acc += x[i] == r; break;     \
+        case COUNT_CMP_NE: for (int64_t i = b; i < e; i++) acc += x[i] != r; break;     \
+        case COUNT_CMP_LT: for (int64_t i = b; i < e; i++) acc += x[i] <  r; break;     \
+        case COUNT_CMP_LE: for (int64_t i = b; i < e; i++) acc += x[i] <= r; break;     \
+        case COUNT_CMP_GT: for (int64_t i = b; i < e; i++) acc += x[i] >  r; break;     \
+        case COUNT_CMP_GE: for (int64_t i = b; i < e; i++) acc += x[i] >= r; break;     \
+        default: break;                                                                 \
+        }                                                                               \
+        total += acc;                                                                   \
+    }                                                                                   \
+    return total;                                                                       \
+}
+COUNT_NATIVE(count_native_u8,  uint8_t, uint16_t)
+COUNT_NATIVE(count_native_i16, int16_t, uint16_t)
+COUNT_NATIVE(count_native_i32, int32_t, uint32_t)
+
+/* A literal outside the element type's values [lo, hi]: the compare is the
+ * same for every element, so the count is all or none. */
+static int64_t count_outside(int64_t rhs, int64_t hi, int64_t n, count_cmp_op_t op) {
+    bool above = rhs > hi;
+    switch (op) {
+    case COUNT_CMP_NE: return n;
+    case COUNT_CMP_LT: case COUNT_CMP_LE: return above ? n : 0;
+    case COUNT_CMP_GT: case COUNT_CMP_GE: return above ? 0 : n;
+    default: return 0;                                              /* EQ */
+    }
+}
+
+/* Rows of data[start, end) (type, attrs: the column's or the piece's)
+ * that compare true against rhs. */
+static int64_t count_compare_span(int8_t type, uint8_t attrs, const void* data,
+                                  int64_t start, int64_t end, int64_t rhs, count_cmp_op_t op) {
+    const int64_t n = end - start;
+    if (n <= 0) return 0;
+    switch (type) {
+    case RAY_BOOL:
+    case RAY_U8:
+        if (rhs < 0 || rhs > UINT8_MAX) return count_outside(rhs, UINT8_MAX, n, op);
+        return count_native_u8((const uint8_t*)data + start, n, (uint8_t)rhs, op);
+    case RAY_I16:
+        if (rhs < INT16_MIN || rhs > INT16_MAX) return count_outside(rhs, INT16_MAX, n, op);
+        return count_native_i16((const int16_t*)data + start, n, (int16_t)rhs, op);
+    case RAY_I32:
+    case RAY_DATE:
+    case RAY_TIME:
+        if (rhs < INT32_MIN || rhs > INT32_MAX) return count_outside(rhs, INT32_MAX, n, op);
+        return count_native_i32((const int32_t*)data + start, n, (int32_t)rhs, op);
+    default:
+        return count_compare_span_ref(type, attrs, data, start, end, rhs, op);
+    }
+}
+
 static void count_compare_task(void* vctx, uint32_t worker_id, int64_t start, int64_t end) {
     count_compare_ctx_t* ctx = (count_compare_ctx_t*)vctx;
     const ray_t* col = ctx->col;
@@ -7790,6 +7842,10 @@ static void count_compare_enc_task(void* vctx, uint32_t worker_id, int64_t start
 /* Counts the fast path answered since process start (test hook). */
 static _Atomic(uint64_t) g_count_fast;
 uint64_t ray_query_test_count_fast(void) { return atomic_load(&g_count_fast); }
+int64_t ray_query_test_count_compare(int8_t type, const void* data, int64_t n, int64_t rhs, int op, bool ref) {
+    return ref ? count_compare_span_ref(type, 0, data, 0, n, rhs, (count_cmp_op_t)op)
+               : count_compare_span(type, 0, data, 0, n, rhs, (count_cmp_op_t)op);
+}
 
 /* 1 handled (*out_count), 0 not this shape, -1 a range read failed (*err
  * owned). */

@@ -1869,6 +1869,15 @@ static void* expr_eval_morsel(const ray_expr_t* expr, void** scratch,
                      * piece by piece into this register's scratch */
                     int64_t at = 0;
                     rptrs[r] = scratch[r];
+                    /* a narrow integer register over one whole vector is
+                     * widened straight from the packed values into the
+                     * register (no range scratch, no expr_load pass) */
+                    if (!direct && (rt == RAY_I64 || rt == RAY_F64) &&
+                        (ct == RAY_BOOL || ct == RAY_U8 || ct == RAY_I16 || ct == RAY_I32 ||
+                         ct == RAY_DATE || ct == RAY_TIME)) {
+                        ray_t* e = ray_col_range_wide(expr->regs[r].src, start, n, &rsc[r], rt, scratch[r], &at);
+                        if (e) { *err = e; return NULL; }
+                    }
                     while (at < n) {
                         ray_col_range_t v;
                         ray_t* e = ray_col_range(expr->regs[r].src, start + at, n - at, &rsc[r], &v);

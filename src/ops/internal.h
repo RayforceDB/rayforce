@@ -1040,6 +1040,12 @@ void ray_expr_test_eval_range(const ray_expr_t* expr, int64_t start, int64_t end
 /* query.c test hook: counts the (count (select ... where <compare>)) fast
  * path answered since process start. */
 uint64_t ray_query_test_count_fast(void);
+/* query.c test hook: rows of data[0, n) of `type` (BOOL, U8, I16, I32,
+ * I64, DATE, TIME, TIMESTAMP) for which `x op rhs` holds, op 1..6 = == !=
+ * < <= > >=; ref: through the reference widening compare instead of the
+ * native-width kernels. */
+int64_t  ray_query_test_count_compare(int8_t type, const void* data, int64_t n, int64_t rhs,
+                                      int op, bool ref);
 
 /* Fused predicate→selection (skips the full BOOL vec).
  *

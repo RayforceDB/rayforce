@@ -64,11 +64,16 @@ typedef struct {
 
 /* Per-source scratch for generation-2 decodes: one fixed vector (1024
  * elements of the widest width, 16 KB) and a growable STR pool, both from
- * ray_alloc_raw.  Serves one source in one scan task. */
+ * ray_alloc_raw.  Serves one source in one scan task.  The bytes it decodes
+ * are counted (ray_enc_counters_get, the column's decoded_bytes) when the
+ * scratch moves to another column or is freed, not per vector: free it
+ * before releasing its source. */
 typedef struct {
     uint8_t* fixed;
     char*    pool;
     size_t   pool_cap;
+    struct ray_enccol_s* acc_e;     /* the column acc_bytes belong to (borrowed) */
+    uint64_t acc_bytes;             /* decoded, not yet counted */
 } ray_col_scratch_t;
 
 /* NULL or an owned error (ray_error_free). */
@@ -92,6 +97,15 @@ void   ray_col_scratch_free(ray_col_scratch_t* s);
  * source's. */
 ray_t* ray_col_range(ray_col_src_t* src, int64_t start, int64_t n,
                      ray_col_scratch_t* scratch, ray_col_range_t* out);
+
+/* Rows [start, start + n) decoded straight into dst as `wide` (RAY_I64 /
+ * RAY_F64) elements, nulls as NULL_I64 / NULL_F64 (an expression
+ * register), when they are exactly one whole vector of a single-file
+ * generation-2 source that ray_enccol_decode_wide takes: *got = n.  Else
+ * *got = 0 and nothing is decoded: read the rows with ray_col_range.  NULL
+ * or an owned error. */
+ray_t* ray_col_range_wide(ray_col_src_t* src, int64_t start, int64_t n, ray_col_scratch_t* scratch,
+                          int8_t wide, void* dst, int64_t* got);
 
 /* Bind a table column without decoding; an absent column leaves out->obj
  * NULL and returns NULL. */

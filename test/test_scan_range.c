@@ -350,9 +350,10 @@ static test_result_t test_cursor_reuses_vector(void) {
         TEST_ASSERT_NULL(ray_col_cursor_at(&cur, rows[i], &rv));
         TEST_ASSERT_EQ_I(((const int32_t*)rv->data)[rows[i] - rv->start], ((int32_t*)ray_data(v))[rows[i]]);
     }
+    ray_col_cursor_free(&cur);                                 /* counted when the scratch goes */
     ray_enc_counters_t k; ray_enc_counters_get(&k);
     TEST_ASSERT_EQ_U(k.decoded_bytes, (3 * 1024 + 784) * 4);   /* vectors 0, 1, 7 and 9 (784 rows) */
-    ray_col_cursor_free(&cur); ray_col_src_release(&s); ray_release(c); ray_release(v);
+    ray_col_src_release(&s); ray_release(c); ray_release(v);
     PASS();
 }
 
@@ -1427,6 +1428,163 @@ static test_result_t test_expr_error_sites(void) {
     PASS();
 }
 
+/* ---- Task 3b: decode speed (counters, native compares, register widening) ---- */
+
+/* Decoded-byte totals are flushed per scratch, not per vector: after a
+ * query they are what one decode of every row read gives (pinned). */
+static test_result_t test_decoded_bytes_pinned(void) {
+    sr_evalf_ok("(set T (.db.splayed.get \"%s\"))", SR_G2);
+    ray_enc_counters_reset();
+    ray_t* r = sr_eval("(count (select {from: T where: (== g 3)}))");      /* the count fast path, I16 */
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    ray_release(r);
+    ray_enc_counters_t k; ray_enc_counters_get(&k);
+    TEST_ASSERT_EQ_U(k.decoded_bytes, 200000 * 2);
+    TEST_ASSERT_EQ_U(k.materialized, 0);
+    ray_t* t = sr_eval("T");
+    ray_t* eg = ray_table_get_col_enc(t, ray_sym_intern("g", 1));
+    TEST_ASSERT_NOT_NULL(eg);
+    uint64_t col0 = atomic_load(&ray_enccol_of(eg)->decoded_bytes);
+    TEST_ASSERT_EQ_U(col0, 200000 * 2);                                      /* per column too */
+    ray_enc_counters_reset();
+    r = sr_eval("(select {z: (+ k v) from: T})");                           /* fused: I64 and nullable I32 registers */
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    ray_release(r);
+    ray_enc_counters_get(&k);
+    TEST_ASSERT_EQ_U(k.decoded_bytes, 200000 * (8 + 4));
+    TEST_ASSERT_EQ_U(k.materialized, 0);
+    ray_enc_counters_reset();
+    r = sr_eval("(select {z: (+ g 1) from: T})");                           /* the widened I16 register */
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    ray_release(r);
+    ray_enc_counters_get(&k);
+    TEST_ASSERT_EQ_U(k.decoded_bytes, 200000 * 2);
+    TEST_ASSERT_EQ_U(atomic_load(&ray_enccol_of(eg)->decoded_bytes), col0 + 200000 * 2);
+    ray_release(t);
+    PASS();
+}
+
+/* The native-width count kernels against the widening reference, all six
+ * compares, literals inside the type, at its bounds and outside it, over
+ * one span longer than 65535 rows. */
+static test_result_t test_count_native_kernels(void) {
+    enum { n = 200003 };
+    static int16_t x16[n]; static int32_t x32[n]; static uint8_t x8[n];
+    uint64_t s = 0x9e3779b97f4a7c15ull;
+    for (int64_t i = 0; i < n; i++) {
+        s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+        x16[i] = (int16_t)(uint16_t)s; x32[i] = (int32_t)(uint32_t)(s >> 16); x8[i] = (uint8_t)(s >> 40);
+    }
+    x16[7] = INT16_MIN; x16[8] = INT16_MAX; x32[7] = INT32_MIN; x32[8] = INT32_MAX; x8[7] = 0; x8[8] = 255;
+    static const int64_t lit16[] = { 0, 5, -77, INT16_MIN, INT16_MAX, INT16_MIN - 1, INT16_MAX + 1, 100000, -100000, INT64_MIN + 1, INT64_MAX };
+    static const int64_t lit32[] = { 0, 5, -77, INT32_MIN, INT32_MAX, (int64_t)INT32_MIN - 1, (int64_t)INT32_MAX + 1, 5000000000ll, -5000000000ll };
+    static const int64_t lit8[] = { 0, 1, 200, 255, 256, -1, 1000 };
+    static const int64_t lens[] = { 200003, 65535, 65536, 1000, 1, 0 };
+    for (int op = 1; op <= 6; op++) {
+        for (size_t li = 0; li < sizeof lens / sizeof lens[0]; li++) {
+            int64_t m = lens[li];
+            for (size_t i = 0; i < sizeof lit16 / sizeof lit16[0]; i++) {
+                int64_t a = ray_query_test_count_compare(RAY_I16, x16, m, lit16[i], op, false);
+                int64_t b = ray_query_test_count_compare(RAY_I16, x16, m, lit16[i], op, true);
+                TEST_ASSERT_FMT(a == b, "I16 op %d lit %lld n %lld: %lld vs %lld", op, (long long)lit16[i], (long long)m, (long long)a, (long long)b);
+            }
+            for (size_t i = 0; i < sizeof lit32 / sizeof lit32[0]; i++) {
+                for (int t = 0; t < 3; t++) {
+                    int8_t ty = t == 0 ? RAY_I32 : t == 1 ? RAY_DATE : RAY_TIME;
+                    int64_t a = ray_query_test_count_compare(ty, x32, m, lit32[i], op, false);
+                    int64_t b = ray_query_test_count_compare(ty, x32, m, lit32[i], op, true);
+                    TEST_ASSERT_FMT(a == b, "type %d op %d lit %lld n %lld: %lld vs %lld", ty, op, (long long)lit32[i], (long long)m, (long long)a, (long long)b);
+                }
+            }
+            for (size_t i = 0; i < sizeof lit8 / sizeof lit8[0]; i++) {
+                for (int t = 0; t < 2; t++) {
+                    int8_t ty = t ? RAY_BOOL : RAY_U8;
+                    int64_t a = ray_query_test_count_compare(ty, x8, m, lit8[i], op, false);
+                    int64_t b = ray_query_test_count_compare(ty, x8, m, lit8[i], op, true);
+                    TEST_ASSERT_FMT(a == b, "type %d op %d lit %lld n %lld: %lld vs %lld", ty, op, (long long)lit8[i], (long long)m, (long long)a, (long long)b);
+                }
+            }
+        }
+    }
+    /* the all-true / all-false answers are exact counts */
+    TEST_ASSERT_EQ_I(ray_query_test_count_compare(RAY_I16, x16, n, 40000, 3, false), n);       /* < above the type */
+    TEST_ASSERT_EQ_I(ray_query_test_count_compare(RAY_I16, x16, n, 40000, 5, false), 0);       /* > above the type */
+    TEST_ASSERT_EQ_I(ray_query_test_count_compare(RAY_I32, x32, n, -5000000000ll, 6, false), n);
+    PASS();
+}
+
+/* The same through queries: both generations, the fast path against the
+ * general one (`and ... true` declines the fast path), nulls included (a
+ * nullable column declines the fast path: the answers still agree). */
+static test_result_t test_count_native_queries(void) {
+    sr_eval_ok("(set i (til 70001))");
+    sr_eval_ok("(set N (table [x y xn yn z] (list (as 'I16 (- (% (* i 7919) 65535) 32767)) "
+               "(as 'I32 (- (% (* i 1000003) 4294967295) 2147483647)) "
+               "(as 'I16 (map (fn [j] (if (== 0 (% j 11)) 0N (- (% j 3000) 1500))) i)) "
+               "(as 'I32 (map (fn [j] (if (== 0 (% j 7)) 0N (* j 9))) i)) (as 'U8 (% i 251)))))");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/c0/\" N {compress: false})");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/c2/\" N {compress: true})");
+    static const char* ops[] = { "==", "!=", "<", "<=", ">", ">=" };
+    static const char* cols[] = { "x", "y", "xn", "z" };
+    static const char* lits[] = { "0", "-1500", "32767", "-32768", "40000", "2147483647", "-2147483649", "251" };
+    static const char* const loads[] = { "(set T (.db.splayed.get \"" SR_TMP "/c0/\"))",
+                                         "(set T (.db.splayed.get \"" SR_TMP "/c2/\"))" };
+    int64_t first[4][6][8];
+    for (int l = 0; l < 2; l++) {
+        sr_eval_ok(loads[l]);
+        for (int c = 0; c < 4; c++)
+            for (int o = 0; o < 6; o++)
+                for (int k = 0; k < 8; k++) {
+                    char q[256];
+                    uint64_t f0 = ray_query_test_count_fast();
+                    snprintf(q, sizeof q, "(count (select {from: T where: (%s %s %s)}))", ops[o], cols[c], lits[k]);
+                    ray_t* a = sr_eval(q);
+                    bool fast = ray_query_test_count_fast() - f0 == 1;
+                    snprintf(q, sizeof q, "(count (select {from: T where: (and (%s %s %s) true)}))", ops[o], cols[c], lits[k]);
+                    ray_t* b = sr_eval(q);
+                    TEST_ASSERT_FMT(a && b && !RAY_IS_ERR(a) && !RAY_IS_ERR(b), "gen %d %s", l * 2, q);
+                    TEST_ASSERT_FMT(a->i64 == b->i64, "gen %d (%s %s %s): fast %lld, general %lld", l * 2, ops[o], cols[c], lits[k],
+                                    (long long)a->i64, (long long)b->i64);
+                    TEST_ASSERT_FMT(fast == (c != 2), "gen %d (%s %s %s): fast path %d", l * 2, ops[o], cols[c], lits[k], fast);
+                    if (l == 0) first[c][o][k] = a->i64;
+                    else TEST_ASSERT_FMT(first[c][o][k] == a->i64, "(%s %s %s): gen 0 %lld, gen 2 %lld", ops[o], cols[c], lits[k],
+                                         (long long)first[c][o][k], (long long)a->i64);
+                    ray_release(a); ray_release(b);
+                }
+    }
+    PASS();
+}
+
+/* Narrow registers widened straight from the packed vector: I16 and I32
+ * with nulls, element-wise and as a filter, both generations equal. */
+static test_result_t test_expr_widened_registers(void) {
+    SR_SAME("(select {z: (+ g 1) from: T})", 0);                 /* I16, no nulls */
+    SR_SAME("(select {z: (* v 2) from: T})", 0);                 /* I32, null every 10th */
+    SR_SAME("(count (select {from: T where: (> (+ g 1) 3)}))", 0);
+    SR_SAME("(select {z: (* (+ v 1) 0.5) from: T})", 0);         /* an F64 program over I32 */
+    sr_eval_ok("(set i (til 70001))");
+    sr_eval_ok("(set W (table [xn yn] (list (as 'I16 (map (fn [j] (if (== 0 (% j 11)) 0N (- (% j 3000) 1500))) i)) "
+               "(as 'I32 (map (fn [j] (if (== 0 (% j 7)) 0N (* j -9))) i)))))");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/w0/\" W {compress: false})");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/w2/\" W {compress: true})");
+    static const char* qs[] = { "(select {z: (+ xn 1) from: T})", "(select {z: (* yn 2) from: T})",
+                                "(select {z: (+ xn yn) from: T})", "(select {z: (* xn 0.25) from: T})" };
+    for (size_t i = 0; i < sizeof qs / sizeof qs[0]; i++) {
+        ray_t* out[2];
+        for (int gen = 0; gen < 2; gen++) {
+            sr_evalf_ok("(set T (.db.splayed.get \"%s\"))", gen ? SR_TMP "/w2/" : SR_TMP "/w0/");
+            ray_enc_counters_reset();
+            out[gen] = sr_eval(qs[i]);
+            TEST_ASSERT_FMT(out[gen] && !RAY_IS_ERR(out[gen]), "%s gen %d", qs[i], gen);
+            if (gen) { ray_enc_counters_t k; ray_enc_counters_get(&k); TEST_ASSERT_EQ_U(k.materialized, 0); }
+        }
+        ray_t* fa = ray_fmt(out[0], 0); ray_t* fb = ray_fmt(out[1], 0);
+        TEST_ASSERT_FMT(ray_str_len(fa) == ray_str_len(fb) && memcmp(ray_str_ptr(fa), ray_str_ptr(fb), ray_str_len(fa)) == 0, "%s differs", qs[i]);
+        ray_release(fa); ray_release(fb); ray_release(out[0]); ray_release(out[1]);
+    }
+    PASS();
+}
+
 const test_entry_t scanrange_entries[] = {
     { "scanrange/walk_gen0_zero_copy",     test_walk_gen0_zero_copy,     sr_setup,    sr_teardown },
     { "scanrange/walk_gen2_vectors",       test_walk_gen2_vectors,       sr_setup,    sr_teardown },
@@ -1464,5 +1622,9 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/count_fast_sym_nulls",   test_count_fast_sym_nulls,   sr_rt_setup, sr_rt_teardown },
     { "scanrange/expr_reuses_materialized", test_expr_reuses_materialized, srr_setup, srr_teardown },
     { "scanrange/expr_error_sites",       test_expr_error_sites,       srr_setup, srr_teardown },
+    { "scanrange/decoded_bytes_pinned",   test_decoded_bytes_pinned,   srr_setup, srr_teardown },
+    { "scanrange/count_native_kernels",   test_count_native_kernels,   sr_setup,  sr_teardown },
+    { "scanrange/count_native_queries",   test_count_native_queries,   sr_rt_setup, sr_rt_teardown },
+    { "scanrange/expr_widened_registers", test_expr_widened_registers, srr_setup, srr_teardown },
     { NULL, NULL, NULL, NULL },
 };

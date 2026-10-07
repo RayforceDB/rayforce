@@ -53,6 +53,7 @@ static void enccol_free(ray_enccol_t* e) {
     if (e->wrapper) ray_release(e->wrapper);
     if (e->dom && e->dom_owned) ray_sym_domain_release(e->dom);
     if (e->map)     ray_file_map_release(e->map);
+    ray_free_raw((void*)e->desc_ok);
     ray_free_raw(e);
 }
 
@@ -287,7 +288,14 @@ ray_t* ray_enccol_open(void* mapped, size_t size, const char* path,
     ray_enc_once_init(&e->once);
     ray_enc_once_init(&e->dict_once);
     uint32_t saved = 0;
-    ray_t* err = enc_validate_load(e, &saved);
+    /* Descriptors and packed bodies are read in place as 8-byte words: the
+     * format keeps every offset 8-aligned, and a mapping starts on a page. */
+    ray_t* err = ((uintptr_t)mapped & 7) ? ray_error("nyi", "column %s: mapping not 8-aligned", e->path)
+                                         : enc_validate_load(e, &saved);
+    if (!err && e->n_chunks > 0) {
+        e->desc_ok = ray_calloc_raw((size_t)e->n_chunks);
+        if (!e->desc_ok) err = ray_error("oom", "column %s: chunk flags", e->path);
+    }
     if (!err && e->type == RAY_SYM) {
         if (dom) {
             int64_t dcount = ray_sym_domain_count(dom);
@@ -372,11 +380,16 @@ static int top_encoding_class(int8_t t, uint8_t enc) {
     }
 }
 
-ray_t* ray_enccol_chunk_descs(ray_enccol_t* e, int64_t c, ray_enc_desc_t out[64]) {
+static _Atomic(uint64_t) g_desc_validations;     /* test hook, see enccol.h */
+uint64_t ray_enccol_test_desc_validations(void) { return atomic_load(&g_desc_validations); }
+
+/* Chunk c's descriptors `out` (64, the bytes at p: in place or a copy)
+ * against the spec's descriptor rules. */
+static ray_t* chunk_descs_validate(ray_enccol_t* e, int64_t c, const ray_enc_desc_t* out, const uint8_t* p,
+                                   const ray_enc_dirent_t* dep) {
     static const uint8_t zero[48];
-    ray_enc_dirent_t de; dirent_at(e, c, &de);
-    const uint8_t* p = e->base + de.offset;
-    memcpy(out, p, RAY_ENC_DESC_AREA);
+    const ray_enc_dirent_t de = *dep;
+    atomic_fetch_add_explicit(&g_desc_validations, 1, memory_order_relaxed);
     int64_t rows = chunk_rows(e, c);
     int nv = (int)((rows + RAY_ENC_VEC - 1) / RAY_ENC_VEC);
     uint64_t at = RAY_ENC_DESC_AREA;
@@ -434,6 +447,39 @@ ray_t* ray_enccol_chunk_descs(ray_enccol_t* e, int64_t c, ray_enc_desc_t out[64]
                                            (long long)c, (unsigned long long)nsum, de.null_count);
     if (at != de.bytes) ENC_CORRUPT("column %s: chunk %lld has %llu bytes after its payloads", e->path,
                                     (long long)c, (unsigned long long)(de.bytes - at));
+    return NULL;
+}
+
+/* Validated once per column (spec "Validation": before a chunk's
+ * descriptors are first used).  The flag is set with release order only
+ * after the chunk passed, and read with acquire: a reader that sees it set
+ * also sees a fully validated chunk, and racing first readers each
+ * validate (the same bytes, the same verdict) before either sets it.  A
+ * failed chunk is never marked, so it fails every read.  Later reads trust
+ * the mapping, as generation 0 trusts its mmap. */
+static bool chunk_validated(const ray_enccol_t* e, int64_t c) {
+    return e->desc_ok && atomic_load_explicit(&e->desc_ok[c], memory_order_acquire);
+}
+
+ray_t* ray_enccol_chunk_descs_ref(ray_enccol_t* e, int64_t c, const ray_enc_desc_t** out) {
+    *out = NULL;
+    ray_enc_dirent_t de; dirent_at(e, c, &de);
+    const uint8_t* p = e->base + de.offset;            /* 8-aligned: ray_enccol_open */
+    const ray_enc_desc_t* d = (const ray_enc_desc_t*)p;
+    if (!chunk_validated(e, c)) {
+        ray_t* err = chunk_descs_validate(e, c, d, p, &de);
+        if (err) return err;
+        if (e->desc_ok) atomic_store_explicit(&e->desc_ok[c], 1, memory_order_release);
+    }
+    *out = d;
+    return NULL;
+}
+
+ray_t* ray_enccol_chunk_descs(ray_enccol_t* e, int64_t c, ray_enc_desc_t out[64]) {
+    const ray_enc_desc_t* d;
+    ray_t* err = ray_enccol_chunk_descs_ref(e, c, &d);
+    if (err) return err;
+    memcpy(out, d, RAY_ENC_DESC_AREA);
     return NULL;
 }
 
@@ -705,11 +751,280 @@ static ray_t* payload_parts(ray_enccol_t* e, int64_t c, int j, const ray_enc_des
     return NULL;
 }
 
-ray_t* ray_enccol_decode_desc(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d,
-                              void* out, char* pool_out, uint64_t pool_base, uint64_t pool_cap) {
+/* ---- Integer fast path: FOR_BP / DELTA_BP straight into the destination ----
+ * One pass unpacks the interleaved lanes at the lane width T, adds the base
+ * (DELTA_BP: the lane's previous row and the delta base) and stores the
+ * element, at the generation-0 width or widened for an expression register.
+ * The nulls are checked after it: a vectorised sentinel scan (fused into the
+ * widening kernels; skipped when the FOR_BP base and width prove that no
+ * value is the sentinel), or with a bitmap one pass that also merges it.
+ * No u64 intermediate, no aside copy.  It accepts exactly what dec_ints accepts:
+ * when anything is off (a size, a base, a head, a placeholder, a sentinel,
+ * a SYM id) it declines, and the reference path decodes or reports the
+ * vector, so a corrupt file keeps its exact error. */
+
+/* Lane l's field of the current row: w bits at bit offset off of word a[l]
+ * (off + w > T: continued in the next word row, a[l + L]).  Arithmetic is
+ * in PT (unsigned, or uint64_t for 64-bit lanes) with shift counts masked
+ * below T, so the compiler keeps T-bit lanes (no widening to int). */
+#define FK_FIELD1(UT, PT, a, l, sr, m)        ((UT)((PT)((PT)(a)[l] >> (sr)) & (PT)(m)))
+#define FK_FIELD2(UT, PT, L, a, l, sr, sl, m) \
+    ((UT)((PT)(((PT)(a)[l] >> (sr)) | ((PT)(a)[(l) + (L)] << (sl))) & (PT)(m)))
+
+/* One row of lanes [0, nl): the T-bit value V stored widened from ST to OT;
+ * SENT: also flag a value on the T-bit pattern s (the widening kernels,
+ * where this beats a second pass over the 8-byte output). */
+#define FK_ROW(UT, ST, OT, SENT, V) do { for (int l = 0; l < nl; l++) {                 \
+        const UT v_ = (V); if (SENT) bad |= (UT)-(UT)(v_ == s); o[l] = (OT)(ST)v_; } } while (0)
+
+/* FOR_BP: out[i] = base + field, rows below n.  ST: the signed (or
+ * unsigned) view the element widens from; OT: the stored element.
+ * Returns the SENT flag (0 without SENT). */
+#define FK_FOR(NAME, UT, PT, TB, ST, OT, SENT)                                          \
+static UT NAME(const UT* restrict in, int w, UT base, OT* restrict out, int n, UT s) { \
+    enum { L = RAY_ENC_VEC / TB };                                                      \
+    const UT m = w >= TB ? (UT)~(UT)0 : (UT)(((PT)1 << w) - 1);                         \
+    UT bad = 0; (void)s;                                                                \
+    for (int r = 0, bit = 0; r * L < n; r++, bit += w) {                                \
+        const int k = bit / TB, off = bit % TB;                                         \
+        const unsigned sr = (unsigned)off & (TB - 1), sl = (unsigned)(TB - off) & (TB - 1); \
+        const int nl = n - r * L < L ? n - r * L : L;                                   \
+        const UT* a = in + (size_t)k * L;                                               \
+        OT* o = out + (size_t)r * L;                                                    \
+        if (w == 0) FK_ROW(UT, ST, OT, SENT, base);                                     \
+        else if (off + w > TB) FK_ROW(UT, ST, OT, SENT, (UT)((PT)base + FK_FIELD2(UT, PT, L, a, l, sr, sl, m))); \
+        else FK_ROW(UT, ST, OT, SENT, (UT)((PT)base + FK_FIELD1(UT, PT, a, l, sr, m))); \
+    }                                                                                   \
+    return bad;                                                                         \
+}
+/* DELTA_BP: row 0 is the heads, row r the row above plus dbase plus field r. */
+#define FK_DELTA(NAME, UT, PT, TB, ST, OT, SENT)                                        \
+static UT NAME(const UT* restrict in, int w, UT dbase, const UT* restrict head,        \
+               OT* restrict out, int n, UT s) {                                         \
+    enum { L = RAY_ENC_VEC / TB };                                                      \
+    const UT m = w >= TB ? (UT)~(UT)0 : (UT)(((PT)1 << w) - 1);                         \
+    UT bad = 0; (void)s;                                                                \
+    UT prev[L];                                                                         \
+    for (int l = 0; l < L; l++) prev[l] = head[l];                                      \
+    { const int nl = n < L ? n : L; OT* o = out; FK_ROW(UT, ST, OT, SENT, prev[l]); }   \
+    for (int r = 1, bit = w; r * L < n; r++, bit += w) {                                \
+        const int k = bit / TB, off = bit % TB;                                         \
+        const unsigned sr = (unsigned)off & (TB - 1), sl = (unsigned)(TB - off) & (TB - 1); \
+        const int nl = n - r * L < L ? n - r * L : L;                                   \
+        const UT* a = in + (size_t)k * L;                                               \
+        OT* o = out + (size_t)r * L;                                                    \
+        if (w == 0) FK_ROW(UT, ST, OT, SENT, prev[l] = (UT)((PT)prev[l] + dbase));      \
+        else if (off + w > TB)                                                          \
+            FK_ROW(UT, ST, OT, SENT, prev[l] = (UT)((PT)prev[l] + dbase + FK_FIELD2(UT, PT, L, a, l, sr, sl, m))); \
+        else FK_ROW(UT, ST, OT, SENT, prev[l] = (UT)((PT)prev[l] + dbase + FK_FIELD1(UT, PT, a, l, sr, m))); \
+    }                                                                                   \
+    return bad;                                                                         \
+}
+FK_FOR(fk_for8,     uint8_t,  unsigned,  8, uint8_t,  uint8_t,  0)
+FK_FOR(fk_for16,    uint16_t, unsigned, 16, uint16_t, uint16_t, 0)
+FK_FOR(fk_for32,    uint32_t, unsigned, 32, uint32_t, uint32_t, 0)
+FK_FOR(fk_for64,    uint64_t, uint64_t, 64, uint64_t, uint64_t, 0)
+FK_FOR(fk_for8_i,   uint8_t,  unsigned,  8, uint8_t,  int64_t,  0)
+FK_FOR(fk_for16_i,  uint16_t, unsigned, 16, int16_t,  int64_t,  1)
+FK_FOR(fk_for32_i,  uint32_t, unsigned, 32, int32_t,  int64_t,  1)
+FK_FOR(fk_for8_f,   uint8_t,  unsigned,  8, uint8_t,  double,   0)
+FK_FOR(fk_for16_f,  uint16_t, unsigned, 16, int16_t,  double,   1)
+FK_FOR(fk_for32_f,  uint32_t, unsigned, 32, int32_t,  double,   1)
+FK_FOR(fk_for16_in, uint16_t, unsigned, 16, int16_t,  int64_t,  0)   /* no value can be the sentinel */
+FK_FOR(fk_for32_in, uint32_t, unsigned, 32, int32_t,  int64_t,  0)
+FK_FOR(fk_for16_fn, uint16_t, unsigned, 16, int16_t,  double,   0)
+FK_FOR(fk_for32_fn, uint32_t, unsigned, 32, int32_t,  double,   0)
+FK_DELTA(fk_dlt16,   uint16_t, unsigned, 16, uint16_t, uint16_t, 0)
+FK_DELTA(fk_dlt32,   uint32_t, unsigned, 32, uint32_t, uint32_t, 0)
+FK_DELTA(fk_dlt64,   uint64_t, uint64_t, 64, uint64_t, uint64_t, 0)
+FK_DELTA(fk_dlt16_i, uint16_t, unsigned, 16, int16_t,  int64_t,  1)
+FK_DELTA(fk_dlt32_i, uint32_t, unsigned, 32, int32_t,  int64_t,  1)
+FK_DELTA(fk_dlt16_f, uint16_t, unsigned, 16, int16_t,  double,   1)
+FK_DELTA(fk_dlt32_f, uint32_t, unsigned, 32, int32_t,  double,   1)
+
+/* Nulls of a signed kind over the stored elements.  scan (no bitmap, the
+ * generation-0 width; the widening kernels flag it themselves): an element
+ * on the sentinel s is damage (true).  merge: rows in the bitmap become the
+ * output null z, and a row outside it on s is damage.  The flags are kept
+ * at the element width (MT) and the loops out of line, so the scan
+ * vectorises. */
+#define FK_SCAN(NAME, OT, MT)                                                           \
+static __attribute__((noinline)) bool NAME(const OT* restrict o, int n, OT s) {        \
+    MT bad = 0;                                                                         \
+    for (int i = 0; i < n; i++) bad |= (MT)-(MT)(o[i] == s);                            \
+    return bad != 0;                                                                    \
+}
+#define FK_MERGE(NAME, OT, MT)                                                          \
+static __attribute__((noinline)) bool NAME(OT* restrict o, int n, const uint8_t* restrict bm, OT s, OT z) { \
+    MT bad = 0;                                                                         \
+    for (int i = 0; i < n; i++) {                                                       \
+        const MT nul = (MT)-(MT)((bm[i >> 3] >> (i & 7)) & 1u);                         \
+        bad |= (MT)~nul & (MT)-(MT)(o[i] == s);                                         \
+        o[i] = nul ? z : o[i];                                                          \
+    }                                                                                   \
+    return bad != 0;                                                                    \
+}
+FK_SCAN(fk_scan16, int16_t, uint16_t)
+FK_SCAN(fk_scan32, int32_t, uint32_t)
+FK_SCAN(fk_scan64, int64_t, uint64_t)
+FK_MERGE(fk_merge16, int16_t, uint16_t)
+FK_MERGE(fk_merge32, int32_t, uint32_t)
+FK_MERGE(fk_merge64, int64_t, uint64_t)
+FK_MERGE(fk_mergef,  double,  uint64_t)
+
+/* SYM ids: below the bound or 0 (the null), and exactly n_nulls zeros. */
+#define FK_SYM(NAME, UT)                                                                \
+static bool NAME(const UT* restrict o, int n, uint64_t bound, int n_nulls) {           \
+    UT bad = 0; uint32_t zeros = 0;                                                     \
+    /* x is bad when x != 0 and x >= bound, i.e. x > lim */                             \
+    const UT lim = bound == 0 ? 0 : bound - 1 > (uint64_t)(UT)~(UT)0 ? (UT)~(UT)0 : (UT)(bound - 1); \
+    for (int i = 0; i < n; i++) {                                                       \
+        zeros += o[i] == 0;                                                             \
+        bad |= (UT)-(UT)((o[i] != 0) & (o[i] > lim));                                   \
+    }                                                                                   \
+    return !bad && zeros == (uint32_t)n_nulls;                                          \
+}
+FK_SYM(fk_sym8,  uint8_t)
+FK_SYM(fk_sym16, uint16_t)
+FK_SYM(fk_sym32, uint32_t)
+FK_SYM(fk_sym64, uint64_t)
+
+static bool fk_int_type(int8_t t) {
+    return t != RAY_F32 && t != RAY_F64 && t != RAY_GUID && t != RAY_STR;
+}
+
+/* Decode a FOR_BP / DELTA_BP vector body of e's type into out: `wide` 0 at
+ * the generation-0 width, RAY_I64 / RAY_F64 widened with nulls as NULL_I64 /
+ * NULL_F64 (narrow non-SYM types only).  1 decoded, 0 declined (out may be
+ * partly written). */
+static int dec_fast(const ray_enccol_t* e, const ray_enc_desc_t* d, int vlen,
+                    const uint8_t* body, uint64_t avail, const uint8_t* bm, int8_t wide, void* out) {
+    const uint8_t enc = d->encoding;
+    if (enc != RAY_ENC_FOR_BP && enc != RAY_ENC_DELTA_BP) return 0;
+    ray_enc_kind_t k;
+    if (!fk_int_type(e->type) || !ray_enc_kind_of(e->type, e->attrs, &k)) return 0;
+    const int T = k.T, w = d->width, L = RAY_ENC_VEC / T;
+    const bool sym = e->type == RAY_SYM, delta = enc == RAY_ENC_DELTA_BP;
+    if (wide && (sym || T == 64)) return 0;
+    if (w > T || vlen < 1 || vlen > RAY_ENC_VEC || (delta && !k.is_signed)) return 0;
+    const size_t osz = wide ? 8 : (size_t)T / 8;
+    if (((uintptr_t)body & 7) || ((uintptr_t)out & (osz - 1))) return 0;
+    if (avail != (uint64_t)(delta ? ray_enc_size_delta(T, w) : ray_enc_size_for(w))) return 0;
+    const uint64_t m = T == 64 ? ~0ull : (1ull << T) - 1;
+    uint64_t base; memcpy(&base, body, 8);
+    if (base & ~m) return 0;
+    const uint8_t* pk = body + 8 + (delta ? 8 * (size_t)L : 0);
+    union { uint8_t b[128]; uint16_t h[64]; uint32_t s[32]; uint64_t q[16]; } head;
+    if (delta) {
+        for (int l = 0; l < L; l++) {
+            uint64_t x; memcpy(&x, body + 8 + 8 * (size_t)l, 8);
+            if (x & ~m) return 0;                                    /* a head above the type width */
+            switch (T) { case 16: head.h[l] = (uint16_t)x; break; case 32: head.s[l] = (uint32_t)x; break; default: head.q[l] = x; break; }
+        }
+        if (w > 0) {                                                 /* row 0 holds zero placeholders */
+            const uint64_t wm = w >= 64 ? ~0ull : (1ull << w) - 1;
+            uint64_t any = 0;
+            switch (T) {
+            case 16: { const uint16_t* a = (const uint16_t*)pk; for (int l = 0; l < L; l++) any |= a[l] & wm; break; }
+            case 32: { const uint32_t* a = (const uint32_t*)pk; for (int l = 0; l < L; l++) any |= a[l] & wm; break; }
+            default: { const uint64_t* a = (const uint64_t*)pk; for (int l = 0; l < L; l++) any |= a[l] & wm; break; }
+            }
+            if (any) return 0;
+        }
+    }
+    const int8_t wt = wide;
+    const uint64_t sent = k.is_signed ? (uint64_t)1 << (T - 1) : 0;   /* the sentinel's T-bit pattern */
+    uint64_t hit = 0;                                                    /* widening kernels: a value on it */
+    /* FOR_BP values are base + u (mod 2^T), u < 2^w: none is the sentinel
+     * unless sentinel - base (mod 2^T) is such a u.  Then no check is
+     * needed, from the body alone (never from the untrusted statistics). */
+    const uint64_t umax = w >= 64 ? ~0ull : (1ull << w) - 1;
+    const bool can_hit = k.is_signed && (delta || ((sent - base) & m) <= umax);
+#define FK_RUN(FOR, DLT, UT, OT) do {                                                    \
+        if (delta) hit = DLT((const UT*)pk, w, (UT)base, (const UT*)head.b, (OT*)out, vlen, (UT)sent); \
+        else       hit = FOR((const UT*)pk, w, (UT)base, (OT*)out, vlen, (UT)sent); } while (0)
+#define FK_RUN_FOR(FOR, UT, OT) hit = FOR((const UT*)pk, w, (UT)base, (OT*)out, vlen, (UT)sent)
+    switch (T * 4 + (wt == RAY_I64 ? 1 : wt == RAY_F64 ? 2 : 0)) {
+    case 8 * 4:      FK_RUN_FOR(fk_for8, uint8_t, uint8_t); break;
+    case 8 * 4 + 1:  FK_RUN_FOR(fk_for8_i, uint8_t, int64_t); break;
+    case 8 * 4 + 2:  FK_RUN_FOR(fk_for8_f, uint8_t, double); break;
+    case 16 * 4:     FK_RUN(fk_for16, fk_dlt16, uint16_t, uint16_t); break;
+    case 16 * 4 + 1: if (can_hit) FK_RUN(fk_for16_i, fk_dlt16_i, uint16_t, int64_t); else FK_RUN_FOR(fk_for16_in, uint16_t, int64_t); break;
+    case 16 * 4 + 2: if (can_hit) FK_RUN(fk_for16_f, fk_dlt16_f, uint16_t, double); else FK_RUN_FOR(fk_for16_fn, uint16_t, double); break;
+    case 32 * 4:     FK_RUN(fk_for32, fk_dlt32, uint32_t, uint32_t); break;
+    case 32 * 4 + 1: if (can_hit) FK_RUN(fk_for32_i, fk_dlt32_i, uint32_t, int64_t); else FK_RUN_FOR(fk_for32_in, uint32_t, int64_t); break;
+    case 32 * 4 + 2: if (can_hit) FK_RUN(fk_for32_f, fk_dlt32_f, uint32_t, double); else FK_RUN_FOR(fk_for32_fn, uint32_t, double); break;
+    case 64 * 4:     FK_RUN(fk_for64, fk_dlt64, uint64_t, uint64_t); break;
+    default: return 0;
+    }
+#undef FK_RUN
+#undef FK_RUN_FOR
+    if (sym) {
+        bool ok;
+        switch (T) {
+        case 8:  ok = fk_sym8((const uint8_t*)out, vlen, e->sym_bound, d->n_nulls); break;
+        case 16: ok = fk_sym16((const uint16_t*)out, vlen, e->sym_bound, d->n_nulls); break;
+        case 32: ok = fk_sym32((const uint32_t*)out, vlen, e->sym_bound, d->n_nulls); break;
+        default: ok = fk_sym64((const uint64_t*)out, vlen, e->sym_bound, d->n_nulls); break;
+        }
+        return ok ? 1 : 0;
+    }
+    if (!k.is_signed) return 1;                                      /* BOOL, U8: no nulls */
+    if (d->n_nulls && !bm) return 0;
+    if (!d->n_nulls) {                                               /* a sentinel outside the (absent) bitmap */
+        if (wt || !can_hit) return hit ? 0 : 1;                      /* flagged by the widening kernel, or impossible */
+        switch (T) {
+        case 16: hit = fk_scan16((const int16_t*)out, vlen, NULL_I16); break;
+        case 32: hit = fk_scan32((const int32_t*)out, vlen, NULL_I32); break;
+        default: hit = fk_scan64((const int64_t*)out, vlen, NULL_I64); break;
+        }
+        return hit ? 0 : 1;
+    }
+    bool bad;
+    if (wt == RAY_F64)
+        bad = fk_mergef((double*)out, vlen, bm, T == 16 ? (double)NULL_I16 : (double)NULL_I32, NULL_F64);
+    else if (wt == RAY_I64)
+        bad = fk_merge64((int64_t*)out, vlen, bm, T == 16 ? (int64_t)NULL_I16 : (int64_t)NULL_I32, NULL_I64);
+    else switch (T) {
+        case 16: bad = fk_merge16((int16_t*)out, vlen, bm, NULL_I16, NULL_I16); break;
+        case 32: bad = fk_merge32((int32_t*)out, vlen, bm, NULL_I32, NULL_I32); break;
+        default: bad = fk_merge64((int64_t*)out, vlen, bm, NULL_I64, NULL_I64); break;
+    }
+    return bad ? 0 : 1;
+}
+
+/* The shared vector decode.  priv: `out` is the caller's private
+ * destination, so the integer fast path writes it directly (a failed decode
+ * may leave it partly written); otherwise the vector is decoded aside and
+ * `out` written only once it is fully validated. */
+static ray_t* dec_aside(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d, int vlen,
+                        const uint8_t* body, uint64_t avail, const uint8_t* bm, void* out,
+                        size_t nbytes, bool try_fast) __attribute__((noinline));
+static ray_t* dec_aside(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d, int vlen,
+                        const uint8_t* body, uint64_t avail, const uint8_t* bm, void* out,
+                        size_t nbytes, bool try_fast) {
+    uint8_t tmp[RAY_ENC_VEC * 16];
+    ray_t* err;
+    if (try_fast && dec_fast(e, d, vlen, body, avail, bm, 0, tmp)) {
+        memcpy(out, tmp, nbytes);
+        return NULL;
+    }
+    switch (e->type) {
+    case RAY_F32: case RAY_F64: err = dec_floats(e, c, j, d, vlen, body, avail, bm, tmp); break;
+    case RAY_GUID:              err = dec_guid(e, c, j, d, vlen, body, avail, tmp); break;
+    default:                    err = dec_ints(e, c, j, d, vlen, body, avail, bm, tmp); break;
+    }
+    if (!err) memcpy(out, tmp, nbytes);
+    return err;
+}
+
+static ray_t* decode_vec(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d,
+                         void* out, char* pool_out, uint64_t pool_base, uint64_t pool_cap,
+                         bool priv, uint64_t* produced) {
     int64_t rows = chunk_rows(e, c);
     int vlen = (int)(rows - (int64_t)j * RAY_ENC_VEC < RAY_ENC_VEC ? rows - (int64_t)j * RAY_ENC_VEC : RAY_ENC_VEC);
     const uint8_t* body = NULL; uint64_t avail = 0; const uint8_t* bm = NULL;
+    *produced = 0;
     ray_t* err = payload_parts(e, c, j, d, vlen, &body, &avail, &bm);
     if (err) return err;
     uint64_t pooled = 0;
@@ -721,22 +1036,70 @@ ray_t* ray_enccol_decode_desc(ray_enccol_t* e, int64_t c, int j, const ray_enc_d
         if (pooled > pool_cap || pool_base > pool_cap - pooled || pool_base + pooled > UINT32_MAX)
             VEC_CORRUPT("pool overflow");
         err = dec_str(e, c, j, d, vlen, body, avail, out, pool_out, pool_base, pool_cap, NULL);
-    } else {
-        /* decode aside and publish only a fully validated vector */
-        uint8_t tmp[RAY_ENC_VEC * 16];
-        switch (e->type) {
-        case RAY_F32: case RAY_F64: err = dec_floats(e, c, j, d, vlen, body, avail, bm, tmp); break;
-        case RAY_GUID:              err = dec_guid(e, c, j, d, vlen, body, avail, tmp); break;
-        default:                    err = dec_ints(e, c, j, d, vlen, body, avail, bm, tmp); break;
-        }
-        if (!err) memcpy(out, tmp, nbytes);
+    } else if (!(priv && dec_fast(e, d, vlen, body, avail, bm, 0, out))) {
+        err = dec_aside(e, c, j, d, vlen, body, avail, bm, out, nbytes, !priv);
     }
-    if (!err) {
-        uint64_t nb = (uint64_t)nbytes + pooled;
-        atomic_fetch_add_explicit(&g_enc_decoded_bytes, nb, memory_order_relaxed);
-        atomic_fetch_add_explicit(&e->decoded_bytes, nb, memory_order_relaxed);   /* per column */
-    }
+    if (!err) *produced = (uint64_t)nbytes + pooled;
     return err;
+}
+
+void ray_enccol_note_decoded(ray_enccol_t* e, uint64_t nb) {
+    if (!nb) return;
+    atomic_fetch_add_explicit(&g_enc_decoded_bytes, nb, memory_order_relaxed);
+    atomic_fetch_add_explicit(&e->decoded_bytes, nb, memory_order_relaxed);   /* per column */
+}
+
+ray_t* ray_enccol_decode_desc(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d,
+                              void* out, char* pool_out, uint64_t pool_base, uint64_t pool_cap) {
+    uint64_t nb;
+    ray_t* err = decode_vec(e, c, j, d, out, pool_out, pool_base, pool_cap, false, &nb);
+    if (!err) ray_enccol_note_decoded(e, nb);
+    return err;
+}
+
+ray_t* ray_enccol_decode_into(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d,
+                              void* out, char* pool_out, uint64_t pool_base, uint64_t pool_cap,
+                              uint64_t* produced) {
+    return decode_vec(e, c, j, d, out, pool_out, pool_base, pool_cap, true, produced);
+}
+
+int ray_enccol_decode_wide(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d,
+                           int8_t wide, void* out, uint64_t* produced) {
+    *produced = 0;
+    if ((wide != RAY_I64 && wide != RAY_F64) || !fk_int_type(e->type) || e->type == RAY_SYM ||
+        ray_enccol_esz(e) == 8)
+        return 0;
+    int64_t rows = chunk_rows(e, c);
+    int vlen = (int)(rows - (int64_t)j * RAY_ENC_VEC < RAY_ENC_VEC ? rows - (int64_t)j * RAY_ENC_VEC : RAY_ENC_VEC);
+    const uint8_t* body = NULL; uint64_t avail = 0; const uint8_t* bm = NULL;
+    ray_t* err = payload_parts(e, c, j, d, vlen, &body, &avail, &bm);
+    if (err) { ray_error_free(err); return 0; }          /* the range read reports it */
+    if (!dec_fast(e, d, vlen, body, avail, bm, wide, out)) return 0;
+    *produced = (uint64_t)vlen * ray_enccol_esz(e);        /* counted as the generation-0 bytes */
+    return 1;
+}
+
+int ray_enccol_test_decode_body(int8_t type, uint8_t attrs, uint32_t sym_bound, uint8_t enc,
+                                uint8_t width, int n_nulls, const uint8_t* bm, const uint8_t* body,
+                                uint64_t avail, int vlen, bool fast, int8_t wide, void* out) {
+    ray_enccol_t* e = ray_calloc_raw(sizeof *e);
+    if (!e) return -1;
+    e->type = type; e->attrs = attrs; e->sym_bound = sym_bound;
+    snprintf(e->path, sizeof e->path, "decode_body");
+    ray_enc_desc_t d; memset(&d, 0, sizeof d);
+    d.encoding = enc; d.width = width; d.n_nulls = (uint16_t)n_nulls;
+    int r;
+    if (fast) {
+        r = dec_fast(e, &d, vlen, body, avail, bm, wide, out);
+    } else if (wide) {
+        r = -1;
+    } else {
+        ray_t* err = dec_ints(e, 0, 0, &d, vlen, body, avail, bm, out);
+        r = err ? -1 : 1;
+        if (err) ray_error_free(err);
+    }
+    ray_free_raw(e);
+    return r;
 }
 
 ray_t* ray_enccol_desc_pool_bytes(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d, uint64_t* out) {
@@ -817,15 +1180,18 @@ static void enc_mat_chunk(void* raw, uint32_t wid, int64_t start, int64_t end) {
             r->failed = true;
             continue;
         }
-        ray_enc_desc_t descs[64];
-        ray_t* err = ray_enccol_chunk_descs(e, c, descs);
+        const ray_enc_desc_t* descs;
+        ray_t* err = ray_enccol_chunk_descs_ref(e, c, &descs);
         int64_t rows = chunk_rows(e, c);
         int nv = (int)((rows + RAY_ENC_VEC - 1) / RAY_ENC_VEC);
         uint64_t pbase = x->chunk_pool ? x->chunk_pool[c] : 0;
+        uint64_t produced = 0;                  /* counted once per chunk */
         for (int j = 0; !err && j < nv; j++) {
             int64_t row = c * RAY_ENC_CHUNK + (int64_t)j * RAY_ENC_VEC;
-            uint8_t* dst = x->out + (size_t)row * esz;
-            err = ray_enccol_decode_desc(e, c, j, &descs[j], dst, x->pool, pbase, x->pool_cap);
+            uint8_t* dst = x->out + (size_t)row * esz;   /* private until published */
+            uint64_t nb = 0;
+            err = ray_enccol_decode_into(e, c, j, &descs[j], dst, x->pool, pbase, x->pool_cap, &nb);
+            produced += nb;
             if (!err && e->type == RAY_STR) {
                 int vlen = ray_enc_vec_len(e->len, row / RAY_ENC_VEC);
                 ray_str_t* s = (ray_str_t*)dst;
@@ -839,6 +1205,7 @@ static void enc_mat_chunk(void* raw, uint32_t wid, int64_t start, int64_t end) {
                 }
             }
         }
+        ray_enccol_note_decoded(e, produced);
         if (err) { ray_enc_snap_take(&r->snap, err); r->failed = true; }
         if (r->failed) {
             int64_t cur = atomic_load_explicit(&x->lowest_failed, memory_order_relaxed);
@@ -1296,3 +1663,4 @@ void ray_enccol_byte_range(const ray_enccol_t* e, int64_t lo, int64_t hi,
     *off = a.offset;
     *len = b.offset + b.bytes - a.offset;
 }
+

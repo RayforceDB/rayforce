@@ -38,7 +38,21 @@
 #define SCRATCH_FIXED_BYTES ((size_t)RAY_ENC_VEC * 16)
 
 void ray_col_scratch_init(ray_col_scratch_t* s) { memset(s, 0, sizeof *s); }
+
+/* Decoded bytes are counted per scratch and column, not per vector: the
+ * counters are shared by every worker. */
+static void scratch_flush(ray_col_scratch_t* s) {
+    if (s->acc_e) ray_enccol_note_decoded(s->acc_e, s->acc_bytes);
+    s->acc_e = NULL;
+    s->acc_bytes = 0;
+}
+static void scratch_count(ray_col_scratch_t* s, ray_enccol_t* e, uint64_t nb) {
+    if (s->acc_e != e) { scratch_flush(s); s->acc_e = e; }
+    s->acc_bytes += nb;
+}
+
 void ray_col_scratch_free(ray_col_scratch_t* s) {
+    scratch_flush(s);
     ray_free_raw(s->fixed);
     ray_free_raw(s->pool);
     memset(s, 0, sizeof *s);
@@ -144,8 +158,8 @@ static ray_t* range_enc(ray_enccol_t* e, int64_t start, int64_t n,
     }
     int64_t c = vec / RAY_ENC_VECS_PER_CHUNK;
     int j = (int)(vec % RAY_ENC_VECS_PER_CHUNK);
-    ray_enc_desc_t descs[RAY_ENC_VECS_PER_CHUNK];
-    ray_t* err = ray_enccol_chunk_descs(e, c, descs);       /* validated once per vector */
+    const ray_enc_desc_t* descs;
+    ray_t* err = ray_enccol_chunk_descs_ref(e, c, &descs);  /* in place; validated once per column */
     if (err) return err;
     if (e->type == RAY_STR) {
         uint64_t pb = 0;
@@ -160,8 +174,10 @@ static ray_t* range_enc(ray_enccol_t* e, int64_t start, int64_t n,
             sc->pool_cap = (size_t)pb;
         }
     }
-    err = ray_enccol_decode_desc(e, c, j, &descs[j], sc->fixed, sc->pool, 0, sc->pool_cap);
-    if (err) return err;
+    uint64_t nb = 0;
+    err = ray_enccol_decode_into(e, c, j, &descs[j], sc->fixed, sc->pool, 0, sc->pool_cap, &nb);
+    if (err) return err;                                    /* the view is never returned */
+    scratch_count(sc, e, nb);
     out->data = sc->fixed + (size_t)off * ray_enccol_esz(e);
     out->n = n;
     out->type = e->type;
@@ -259,6 +275,27 @@ ray_t* ray_col_range(ray_col_src_t* src, int64_t start, int64_t n,
     ray_t* err = range_src(src, src->obj, start, n, scratch, out);
     out->start = start;
     return err;
+}
+
+ray_t* ray_col_range_wide(ray_col_src_t* src, int64_t start, int64_t n, ray_col_scratch_t* sc,
+                          int8_t wide, void* dst, int64_t* got) {
+    *got = 0;
+    if (!src || !src->obj || src->obj->type != RAY_ENCCOL || start < 0 || n <= 0 || start % RAY_ENC_VEC) return NULL;
+    ray_enccol_t* e = ray_enccol_of(src->obj);
+    if (e->kind != RAY_ENCCOL_SINGLE || start >= e->len) return NULL;
+    int64_t vec = start / RAY_ENC_VEC;
+    if (n != ray_enc_vec_len(e->len, vec)) return NULL;
+    int64_t c = vec / RAY_ENC_VECS_PER_CHUNK;
+    const ray_enc_desc_t* descs;
+    ray_t* err = ray_enccol_chunk_descs_ref(e, c, &descs);
+    if (err) return err;
+    uint64_t nb = 0;
+    if (ray_enccol_decode_wide(e, c, (int)(vec % RAY_ENC_VECS_PER_CHUNK), &descs[vec % RAY_ENC_VECS_PER_CHUNK],
+                               wide, dst, &nb)) {
+        scratch_count(sc, e, nb);
+        *got = n;
+    }
+    return NULL;
 }
 
 ray_t* ray_col_src_plain(ray_col_src_t* s, ray_t** out) {
