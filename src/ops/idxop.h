@@ -261,6 +261,9 @@ void ray_idx_stats_init(void);   /* atexit dump when RAY_IDX_STATS set */
  * measurement).  Counts one use of col->index; read and reset through the
  * `.idx.uses` builtin.  No-op for vectors without an index. */
 void   ray_idx_note_use(const ray_t* col);
+/* A consult answered from encv's directory (zone class or exclusion): counts
+ * under the RAY_ENCCOL object itself. */
+void   ray_idx_note_use_enc(const ray_t* encv);
 ray_t* ray_idx_uses_fn(ray_t* tbl);
 
 /* ===== Lazy in-memory HASH (index policy) =====
@@ -303,17 +306,36 @@ bool   ray_idx_lazy_hash_wanted(const ray_t* col);
  * element of the integer vector set.  The caller has ruled out nulls. */
 bool   ray_idx_zone_excludes(const ray_t* col, int64_t key);
 bool   ray_idx_zone_excludes_set(const ray_t* col, const ray_t* set);
+/* Directory twins for a single-file generation-2 column (encv a
+ * RAY_ENCCOL): the answer the zone its materialization would synthesize
+ * (enc_synth_zone / enc_synth_chunk_zone, src/store/enccol.c) gives,
+ * from the same directory entries, never decoding.  UNKNOWN / false for a
+ * parted column, another recorded kind, or a type the zone does not cover. */
+bool   ray_enc_zone_excludes(ray_t* encv, int64_t key);
+bool   ray_enc_zone_excludes_set(ray_t* encv, const ray_t* set);
+bool   ray_enc_lazy_hash_wanted(ray_t* encv);
 /* For a probe on `col`: NULL with *out = a retained vector equal to col
  * carrying a HASH (from the cache, or built now), or NULL with *out = NULL
  * when no lazy index applies (not wanted, over budget, declined before, or
  * still pending: the caller scans and this probe's work is counted); an
  * owned error on failure to build (the caller falls back to its scan). */
 ray_t* ray_idx_lazy_hash(ray_t* col, ray_t** out);
+/* ray_idx_lazy_hash for a single-file generation-2 column (encv its
+ * RAY_ENCCOL): the probes are counted on the encoded payload (any header
+ * copy), and the column is materialized only when the build fires; the
+ * built entry is keyed by that materialization, and *out is its indexed
+ * copy.  ray_idx_lazy_hash / _lookup / _work on the published
+ * materialization meet the same entry. */
+ray_t* ray_idx_lazy_hash_enc(ray_t* encv, ray_t** out);
 /* The cached indexed copy for col, retained (the caller releases it), or NULL. */
 ray_t* ray_idx_lazy_lookup(const ray_t* col);
 /* Drop the entry of a column object that is going away (the generation-2
  * object frees its materialization). */
 void   ray_idx_lazy_forget(const ray_t* col);
+/* An encoded column's payload is freed: its memo (a probe count kept
+ * before the column was materialized) goes with it. */
+struct ray_enccol_s;
+void   ray_idx_lazy_forget_enc(const struct ray_enccol_s* e);
 /* Tests: rows the scans of col's pending probes read (0 once built), or -1
  * when col has no entry or was declined. */
 int64_t ray_idx_lazy_work(const ray_t* col);
@@ -540,6 +562,10 @@ ray_t* ray_index_info(ray_t* v);
 typedef enum { RAY_ZONE_UNKNOWN = 0, RAY_ZONE_ALL = 1, RAY_ZONE_NONE = 2 } ray_zone_class_t;
 ray_zone_class_t ray_index_zone_class(ray_t* col, uint16_t cmp_op,
                                       int64_t key_i, double key_f);
+/* Its directory twin for a generation-2 column recording ZONE (see
+ * ray_enc_zone_excludes): UNKNOWN unless encv is a single-file RAY_ENCCOL
+ * without nulls. */
+ray_zone_class_t ray_enc_zone_class(ray_t* encv, uint16_t cmp_op, int64_t key_i, double key_f);
 
 /* Build an all-NONE rowsel of `n` rows.  Wraps rowsel_from_sorted_ids(n, NULL, 0).
  * Returns NULL on OOM; returns a valid zero-match rowsel on success. */

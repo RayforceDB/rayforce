@@ -1267,7 +1267,9 @@ static test_result_t test_expr_error(void) {
 
 /* Finding C2: (count (select {from: T where: <compare>})) is answered by
  * try_count_simple_compare on range reads (ClickBench q2's shape), never
- * materializing; a corrupt chunk is the query's error. */
+ * materializing; a corrupt chunk the predicate reads is the query's error,
+ * and one its directory decides is never read (spec "Filter with
+ * skipping": a decided chunk touches no descriptor). */
 static test_result_t test_count_fast_path(void) {
     uint64_t f0 = ray_query_test_count_fast();
     SR_SAME("(count (select {from: T where: (== g 3)}))", 0);       /* I16 */
@@ -1281,12 +1283,17 @@ static test_result_t test_count_fast_path(void) {
     sr_make_bad("k", path, sizeof path);
     for (int i = 0; i < 2; i++) {
         ray_error_clear();
-        ray_t* r = sr_eval("(count (select {from: (.db.splayed.get \"" SR_TMP "/bad/\") where: (> k 5)}))");
+        /* chunk 2 (rows 131072..196607) holds 150000: undecided, read */
+        ray_t* r = sr_eval("(count (select {from: (.db.splayed.get \"" SR_TMP "/bad/\") where: (> k 150000)}))");
         TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
         TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
         TEST_ASSERT_TRUE(strstr(ray_error_msg(), path) != NULL);
         ray_error_free(r);
     }
+    /* every row of chunk 2 is above 5: decided all-pass from the directory */
+    ray_t* r = sr_eval("(count (select {from: (.db.splayed.get \"" SR_TMP "/bad/\") where: (> k 5)}))");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->i64 == 199994);
+    ray_release(r);
     PASS();
 }
 
@@ -1793,6 +1800,204 @@ static test_result_t test_expr_parted_seg_lengths(void) {
     PASS();
 }
 
+/* The directory gate decides whole chunks: a predicate true for no row of
+ * chunks 1-3 decodes only chunk 0's vectors. */
+static test_result_t test_zone_dir_skips(void) {
+    ray_t* t = sr_load(2);
+    ray_graph_t* g = ray_graph_new(t);
+    ray_enc_counters_reset();
+    bool all = false;
+    ray_t* s = exec_pred_to_selection(g, ray_lt(g, ray_scan(g, "k"), ray_const_i64(g, 1000)), ray_table_nrows(t), &all);
+    TEST_ASSERT_TRUE(s && !RAY_IS_ERR(s));
+    TEST_ASSERT_EQ_I(ray_rowsel_meta(s)->total_pass, 1000);
+    ray_enc_counters_t k; ray_enc_counters_get(&k);
+    TEST_ASSERT_EQ_U(k.materialized, 0);
+    TEST_ASSERT_EQ_U(k.decoded_bytes, 64 * 1024 * 8);   /* chunk 0's 64 vectors only */
+    ray_rowsel_release(s); ray_graph_free(g); ray_release(t);
+    /* the count fast path decides chunks the same way */
+    sr_eval_ok("(set T (.db.splayed.get \"" SR_G2 "\"))");
+    ray_enc_counters_reset();
+    ray_t* c = sr_eval("(count (select {from: T where: (< k 1000)}))");
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c) && c->i64 == 1000);
+    ray_enc_counters_get(&k);
+    TEST_ASSERT_EQ_U(k.decoded_bytes, 64 * 1024 * 8);
+    sr_drop(c);
+    PASS();
+}
+
+/* Review focus 3: the null rule.  v has a null every 10th row, so no
+ * chunk is decided all-pass for >, and every chunk can be decided
+ * all-fail for > above its maximum.  Results equal generation 0. */
+static test_result_t test_zone_dir_nulls(void) {
+    test_result_t r;
+    if ((r = sr_sel_same(pred_v_gt)).status != TEST_PASS) return r;
+    SR_SAME("(count (select {from: T where: (> v 1000000)}))", 0);   /* every chunk all-fail */
+    SR_SAME("(count (select {from: T where: (< v 1000000)}))", 0);   /* nulls pass < : mixed */
+    SR_SAME("(count (select {from: T where: (>= d 899)}))", 0);
+    PASS();
+}
+
+/* Rows of a graph FILTER over table t, with the materializations it made.
+ * The node runs through exec_node, not ray_execute: the lazy filter returns
+ * t with g->selection installed, and ray_execute's final compaction would
+ * gather (today: materialize) every column of t. */
+static int64_t sr_filter_rows(ray_t* t, ray_op_t* (*build)(ray_graph_t*), uint64_t* mat) {
+    ray_graph_t* g = ray_graph_new(t);
+    ray_op_t* root = ray_filter(g, ray_const_table(g, t), build(g));
+    ray_enc_counters_reset();
+    ray_t* r = exec_node(g, root);
+    ray_enc_counters_t k; ray_enc_counters_get(&k);
+    if (mat) *mat = k.materialized;
+    int64_t n = (r && !RAY_IS_ERR(r)) ? (g->selection ? ray_rowsel_meta(g->selection)->total_pass : ray_table_nrows(r)) : -1;
+    sr_drop(r); ray_graph_free(g);
+    return n;
+}
+static ray_op_t* cpred_v_gt(ray_graph_t* g)  { return ray_gt(g, ray_scan(g, "v"), ray_const_i64(g, 100)); }
+static ray_op_t* cpred_g_eq(ray_graph_t* g)  { return ray_eq(g, ray_scan(g, "g"), ray_const_i64(g, 3)); }
+static ray_op_t* cpred_h_out(ray_graph_t* g) { return ray_eq(g, ray_scan(g, "h"), ray_const_i64(g, 1000004)); }
+static ray_op_t* cpred_h_eq(ray_graph_t* g)  { return ray_eq(g, ray_scan(g, "h"), ray_const_i64(g, 7919)); }
+static ray_op_t* cpred_h_rng(ray_graph_t* g) { return ray_and(g, ray_eq(g, ray_scan(g, "h"), ray_const_i64(g, 7919)),
+                                                                  ray_ge(g, ray_scan(g, "k"), ray_const_i64(g, 0))); }
+
+/* Finding C1: the OP_FILTER consults on a generation-2 column read the
+ * directory: same rows as generation 0, nothing materialized; a key outside
+ * the zone's range is answered as an index hit on both generations. */
+static test_result_t test_filter_consult_dir(void) {
+    ray_op_t* (*preds[])(ray_graph_t*) = { cpred_v_gt, cpred_g_eq, cpred_h_out, cpred_h_rng };
+    for (size_t i = 0; i < sizeof preds / sizeof preds[0]; i++) {
+        int64_t n[2]; uint64_t hits[2];
+        for (int gen = 0; gen < 2; gen++) {
+            ray_t* t = sr_load(gen);
+            TEST_ASSERT_NOT_NULL(t);
+            uint64_t h0 = ray_idx_hits[IDX_SITE_FILTER_ZONE];
+            uint64_t mat = 0;
+            n[gen] = sr_filter_rows(t, preds[i], &mat);
+            hits[gen] = ray_idx_hits[IDX_SITE_FILTER_ZONE] - h0;
+            if (gen) TEST_ASSERT_FMT(mat == 0, "predicate %zu: %llu materializations", i, (unsigned long long)mat);
+            ray_release(t);
+        }
+        TEST_ASSERT_FMT(n[0] >= 0 && n[0] == n[1], "predicate %zu: %lld vs %lld rows", i, (long long)n[0], (long long)n[1]);
+        TEST_ASSERT_EQ_U(hits[0], hits[1]);
+    }
+    PASS();
+}
+
+/* PI lazy hash on a generation-2 column: the first RAY_IDX_LAZY_BUILD_PROBES - 1
+ * point lookups scan by range and materialize nothing; the next one builds
+ * (materializing exactly the probed column once); later probes reuse it.
+ * Every answer equals generation 0's. */
+static test_result_t test_lazy_hash_enc(void) {
+    ray_idx_lazy_clear();
+    ray_t* t0 = sr_load(0);
+    int64_t want = sr_filter_rows(t0, cpred_h_eq, NULL);
+    ray_release(t0);
+    TEST_ASSERT_EQ_I(want, 1);
+    ray_idx_lazy_clear();
+    ray_t* t = sr_load(2);                               /* one load: one encoded object */
+    for (int p = 1; p < RAY_IDX_LAZY_BUILD_PROBES; p++) {
+        uint64_t mat = 9;
+        TEST_ASSERT_EQ_I(sr_filter_rows(t, cpred_h_eq, &mat), want);
+        TEST_ASSERT_FMT(mat == 0, "probe %d materialized %llu", p, (unsigned long long)mat);
+    }
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 0);
+    uint64_t mat = 0;
+    TEST_ASSERT_EQ_I(sr_filter_rows(t, cpred_h_eq, &mat), want);   /* the build */
+    TEST_ASSERT_EQ_U(mat, 1);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 1);
+    TEST_ASSERT_EQ_I(sr_filter_rows(t, cpred_h_eq, &mat), want);   /* reuse */
+    TEST_ASSERT_EQ_U(mat, 0);
+    ray_release(t);
+    ray_idx_lazy_clear();
+    PASS();
+}
+
+/* The IN consult and the eq+range conjunction on generation 2, and the
+ * .idx.uses count of a directory answer.  A set outside the chunk zone's
+ * range is a zone hit on both generations; a set inside it is a pending
+ * lazy probe (nothing materialized).  An eq+range list whose other
+ * conjuncts do not fit the shape never probes h's lazy hash (generation 0
+ * decodes the conjuncts and declines before the probe; generation 2 decides
+ * that from metadata), a fitting one does. */
+static ray_t* sr_i64_set(int64_t a, int64_t b) {
+    ray_t* v = ray_vec_new(RAY_I64, 2);
+    ((int64_t*)ray_data(v))[0] = a; ((int64_t*)ray_data(v))[1] = b;
+    v->len = 2;
+    return v;
+}
+static ray_op_t* cpred_h_in_out(ray_graph_t* g) {
+    ray_t* v = sr_i64_set(1000004, 1000005);
+    ray_op_t* o = ray_in(g, ray_scan(g, "h"), ray_const_vec(g, v));
+    ray_release(v);
+    return o;
+}
+static ray_op_t* cpred_h_in(ray_graph_t* g) {
+    ray_t* v = sr_i64_set(7919, 15838);
+    ray_op_t* o = ray_in(g, ray_scan(g, "h"), ray_const_vec(g, v));
+    ray_release(v);
+    return o;
+}
+static ray_op_t* cpred_h_eq_g(ray_graph_t* g) { return ray_and(g, ray_eq(g, ray_scan(g, "h"), ray_const_i64(g, 7919)),
+                                                                  ray_eq(g, ray_scan(g, "g"), ray_const_i64(g, 3))); }
+static ray_op_t* cpred_h_rng_v(ray_graph_t* g) { return ray_and(g, ray_eq(g, ray_scan(g, "h"), ray_const_i64(g, 7919)),
+                                                                   ray_ge(g, ray_scan(g, "v"), ray_const_i64(g, 0))); }
+static test_result_t test_filter_consult_enc_shapes(void) {
+    ray_op_t* (*preds[])(ray_graph_t*) = { cpred_h_in_out, cpred_h_in, cpred_h_eq_g, cpred_h_rng_v, cpred_h_rng };
+    const int64_t want_entries[] = { 0, 1, 0, 0, 1 };   /* lazy memos after one run */
+    /* the consults decode nothing; the `in` scan that answers a pending
+     * probe still materializes its column until Task 8 range-reads it */
+    const uint64_t want_mat[] = { 0, 1, 0, 0, 0 };
+    for (size_t i = 0; i < sizeof preds / sizeof preds[0]; i++) {
+        int64_t n[2]; uint64_t hits[2];
+        for (int gen = 0; gen < 2; gen++) {
+            ray_idx_lazy_clear();
+            ray_t* t = sr_load(gen);
+            TEST_ASSERT_NOT_NULL(t);
+            uint64_t h0 = ray_idx_hits[IDX_SITE_FILTER_ZONE];
+            uint64_t mat = 0;
+            n[gen] = sr_filter_rows(t, preds[i], &mat);
+            hits[gen] = ray_idx_hits[IDX_SITE_FILTER_ZONE] - h0;
+            if (gen) TEST_ASSERT_FMT(mat == want_mat[i], "predicate %zu: %llu materializations", i, (unsigned long long)mat);
+            TEST_ASSERT_FMT(ray_idx_lazy_entries() == want_entries[i], "predicate %zu gen %d: %lld lazy entries",
+                            i, gen, (long long)ray_idx_lazy_entries());
+            ray_release(t);
+        }
+        TEST_ASSERT_FMT(n[0] >= 0 && n[0] == n[1], "predicate %zu: %lld vs %lld rows", i, (long long)n[0], (long long)n[1]);
+        TEST_ASSERT_EQ_U(hits[0], hits[1]);
+        if (i == 0) TEST_ASSERT_EQ_U(hits[1], 1);
+    }
+    ray_idx_lazy_clear();
+    /* a directory answer counts under its column */
+    sr_eval_ok("(set T (.db.splayed.get \"" SR_G2 "\"))");
+    sr_eval_ok("(do (.idx.uses T) null)");
+    ray_t* c = sr_eval("(count (at (select {h: h from: T where: (== h 1000004)}) 'h))");
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c) && c->i64 == 0);
+    sr_drop(c);
+    ray_t* u = sr_eval("(at (.idx.uses T) 'h)");
+    TEST_ASSERT_TRUE(u && !RAY_IS_ERR(u) && u->i64 == 1);
+    sr_drop(u);
+    PASS();
+}
+
+/* A pending probe on a generation-2 column is a memo of its encoded
+ * payload that holds no reference: the table's release frees the column
+ * (and its mapping) at once, and the memo goes with it; any header copy of
+ * the column meets the same memo. */
+static test_result_t test_lazy_memo_goes_with_table(void) {
+    ray_idx_lazy_clear();
+    int64_t live0 = ray_enccol_test_live();
+    ray_t* t = sr_load(2);
+    TEST_ASSERT_NOT_NULL(t);
+    TEST_ASSERT_TRUE(ray_enccol_test_live() > live0);
+    TEST_ASSERT_EQ_I(sr_filter_rows(t, cpred_h_eq, NULL), 1);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_entries(), 1);
+    TEST_ASSERT_EQ_I(sr_filter_rows(t, cpred_h_eq, NULL), 1);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_entries(), 1);             /* one memo, its work grows */
+    ray_release(t);
+    TEST_ASSERT_EQ_I(ray_enccol_test_live(), live0);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_entries(), 0);
+    PASS();
+}
+
 const test_entry_t scanrange_entries[] = {
     { "scanrange/walk_gen0_zero_copy",     test_walk_gen0_zero_copy,     sr_setup,    sr_teardown },
     { "scanrange/walk_gen2_vectors",       test_walk_gen2_vectors,       sr_setup,    sr_teardown },
@@ -1838,5 +2043,11 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/expr_parted_fail_lowest", test_expr_parted_fail_lowest, sr_rt_setup, sr_rt_teardown },
     { "scanrange/expr_parted_cancel",     test_expr_parted_cancel,     sr_rt_setup, sr_rt_teardown },
     { "scanrange/expr_parted_seg_lengths", test_expr_parted_seg_lengths, sr_rt_setup, sr_rt_teardown },
+    { "scanrange/zone_dir_skips",      test_zone_dir_skips,      srr_setup, srr_teardown },
+    { "scanrange/zone_dir_nulls",      test_zone_dir_nulls,      srr_setup, srr_teardown },
+    { "scanrange/filter_consult_dir",  test_filter_consult_dir,  srr_setup, srr_teardown },
+    { "scanrange/lazy_hash_enc",       test_lazy_hash_enc,       srr_setup, srr_teardown },
+    { "scanrange/filter_consult_enc_shapes", test_filter_consult_enc_shapes, srr_setup, srr_teardown },
+    { "scanrange/lazy_memo_goes_with_table", test_lazy_memo_goes_with_table, srr_setup, srr_teardown },
     { NULL, NULL, NULL, NULL },
 };

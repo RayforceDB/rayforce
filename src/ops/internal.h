@@ -906,6 +906,50 @@ typedef struct {
  * is chosen by both. */
 static inline uint8_t sort_nulls_first(uint8_t desc) { return (uint8_t)!desc; }
 
+/* Column types whose directory statistics are ordered for the zone gate
+ * in P2: BOOL, U8, I16, I32, I64, DATE, TIME, TIMESTAMP. */
+static inline bool zone_dir_type(int8_t t) {
+    return t == RAY_BOOL || t == RAY_U8 || t == RAY_I16 || t == RAY_I32 || t == RAY_I64 ||
+           t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP;
+}
+
+/* Three-valued decision of (col cmp_op cval) over a range from its
+ * non-null extrema: 1 all-pass, 0 all-fail, -1 undecided.  Nulls rank
+ * below every value (zone_cmp_decision's rule).  all_null ranges and
+ * ranges without extrema are undecided. */
+static inline int zone_cmp_core(int64_t cmin, int64_t cmax, bool has_minmax, bool has_nulls,
+                                bool all_null, uint16_t cmp_op, int64_t cval) {
+    if (all_null || !has_minmax || cmin > cmax) return -1;   /* leave to the kernel */
+    switch (cmp_op) {
+    case OP_EQ:
+        if (cval < cmin || cval > cmax)                 return 0;
+        if (!has_nulls && cmin == cmax)                 return 1;
+        break;
+    case OP_NE:
+        if (!has_nulls && (cval < cmin || cval > cmax)) return 1;
+        if (!has_nulls && cmin == cmax && cval == cmin) return 0;
+        break;
+    case OP_LT:
+        if (!has_nulls && cmin >= cval)                 return 0;
+        if (!has_nulls && cmax <  cval)                 return 1;
+        break;
+    case OP_LE:
+        if (!has_nulls && cmin >  cval)                 return 0;
+        if (!has_nulls && cmax <= cval)                 return 1;
+        break;
+    case OP_GT:
+        if (cmax <= cval)                               return 0;
+        if (!has_nulls && cmin >  cval)                 return 1;
+        break;
+    case OP_GE:
+        if (cmax <  cval)                               return 0;
+        if (!has_nulls && cmin >= cval)                 return 1;
+        break;
+    default: break;
+    }
+    return -1;
+}
+
 typedef struct {
     ray_t**       vecs;
     uint8_t*     desc;

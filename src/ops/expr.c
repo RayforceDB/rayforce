@@ -1996,38 +1996,23 @@ static int zone_cmp_decision(const ray_index_t* ix, int64_t ch,
                              uint16_t cmp_op, int64_t cval) {
     const int64_t* mins = (const int64_t*)ray_data(ix->u.chunk_zone.mins);
     const int64_t* maxs = (const int64_t*)ray_data(ix->u.chunk_zone.maxs);
-    int64_t cmin = mins[ch], cmax = maxs[ch];
-    if (cmin > cmax) return ZT_MIXED;        /* all-null chunk: leave to kernel */
     const uint8_t* nb = (const uint8_t*)ray_data(ix->u.chunk_zone.null_bits);
     bool has_nulls = (nb[ch >> 3] >> (ch & 7)) & 1u;
-    switch (cmp_op) {
-    case OP_EQ:
-        if (cval < cmin || cval > cmax)                 return 0;
-        if (!has_nulls && cmin == cmax)                 return 1;
-        break;
-    case OP_NE:
-        if (!has_nulls && (cval < cmin || cval > cmax)) return 1;
-        if (!has_nulls && cmin == cmax && cval == cmin) return 0;
-        break;
-    case OP_LT:
-        if (!has_nulls && cmin >= cval)                 return 0;
-        if (!has_nulls && cmax <  cval)                 return 1;
-        break;
-    case OP_LE:
-        if (!has_nulls && cmin >  cval)                 return 0;
-        if (!has_nulls && cmax <= cval)                 return 1;
-        break;
-    case OP_GT:
-        if (cmax <= cval)                               return 0;
-        if (!has_nulls && cmin >  cval)                 return 1;
-        break;
-    case OP_GE:
-        if (cmax <  cval)                               return 0;
-        if (!has_nulls && cmin >= cval)                 return 1;
-        break;
-    default: break;
-    }
-    return ZT_MIXED;
+    int d = zone_cmp_core(mins[ch], maxs[ch], true, has_nulls, false, cmp_op, cval);
+    return d < 0 ? ZT_MIXED : d;
+}
+
+/* Directory-statistics twin of zone_cmp_decision for a generation-2
+ * register: chunk ch of its bound source (a single file, or the encoded
+ * segment a parted register is rebound to; the morsel rows are the
+ * source's own).  Undecided when the source has no directory. */
+_Static_assert(RAY_ENC_CHUNK == 1 << 16, "the directory gate reads 64K-row chunks");
+static int zone_dir_decision(const ray_col_src_t* src, int64_t ch, uint16_t cmp_op, int64_t cval) {
+    ray_enc_chunk_stat_t st;
+    if (!ray_col_src_chunk_stat(src, ch, &st)) return ZT_MIXED;
+    bool all_null = (int64_t)st.null_count == st.rows;
+    int d = zone_cmp_core(st.min, st.max, st.has_minmax, st.null_count > 0, all_null, cmp_op, cval);
+    return d < 0 ? ZT_MIXED : d;
 }
 
 /* Does `col` carry a fresh, integer/temporal chunk-zone index? */
@@ -2045,7 +2030,9 @@ static inline const ray_index_t* zone_fresh_index(const ray_t* col) {
 static bool expr_zone_eligible(const ray_expr_t* expr) {
     if (expr->out_type != RAY_BOOL) return false;
     for (uint8_t r = 0; r < expr->n_regs; r++)
-        if (expr->regs[r].kind == REG_SCAN && zone_fresh_index(expr->regs[r].col_obj))
+        if (expr->regs[r].kind == REG_SCAN &&
+            (expr->regs[r].enc ? zone_dir_type(expr->regs[r].col_type)
+                               : zone_fresh_index(expr->regs[r].col_obj) != NULL))
             return true;
     return false;
 }
@@ -2060,23 +2047,29 @@ static int expr_zone_decide(const ray_expr_t* expr, int64_t ms, int64_t me) {
         const expr_ins_t* in = &expr->ins[i];
         uint16_t op = in->opcode;
         if (op >= OP_EQ && op <= OP_GE && in->src2 != 0xFF) {
-            const ray_t* col = NULL; int64_t cval = 0; uint16_t cmp = op;
+            const ray_t* col = NULL; int src_reg = -1; int64_t cval = 0; uint16_t cmp = op;
             uint8_t a = in->src1, b = in->src2;
             if (expr->regs[a].kind == REG_SCAN &&
                 expr->regs[b].kind == REG_CONST && expr->regs[b].type == RAY_I64) {
-                col = expr->regs[a].col_obj; cval = expr->regs[b].const_i64;
+                col = expr->regs[a].col_obj; src_reg = a; cval = expr->regs[b].const_i64;
             } else if (expr->regs[b].kind == REG_SCAN &&
                        expr->regs[a].kind == REG_CONST && expr->regs[a].type == RAY_I64) {
-                col = expr->regs[b].col_obj; cval = expr->regs[a].const_i64;
+                col = expr->regs[b].col_obj; src_reg = b; cval = expr->regs[a].const_i64;
                 cmp = zone_swap_op(op);
             }
             int d = ZT_MIXED;
-            const ray_index_t* ix = zone_fresh_index(col);
-            if (ix) {
-                uint8_t log2 = ix->u.chunk_zone.chunk_log2;
-                int64_t s_ch = ms >> log2, e_ch = (me - 1) >> log2;
-                if (s_ch == e_ch && (uint32_t)s_ch < ix->u.chunk_zone.n_chunks)
-                    d = zone_cmp_decision(ix, s_ch, cmp, cval);
+            if (src_reg >= 0 && expr->regs[src_reg].enc) {
+                /* generation 2: the directory's chunk of 64K rows */
+                if (zone_dir_type(expr->regs[src_reg].col_type) && (ms >> 16) == ((me - 1) >> 16))
+                    d = zone_dir_decision(expr->regs[src_reg].src, ms >> 16, cmp, cval);
+            } else {
+                const ray_index_t* ix = zone_fresh_index(col);
+                if (ix) {
+                    uint8_t log2 = ix->u.chunk_zone.chunk_log2;
+                    int64_t s_ch = ms >> log2, e_ch = (me - 1) >> log2;
+                    if (s_ch == e_ch && (uint32_t)s_ch < ix->u.chunk_zone.n_chunks)
+                        d = zone_cmp_decision(ix, s_ch, cmp, cval);
+                }
             }
             tri[in->dst] = d;
         } else if (op == OP_AND && in->src2 != 0xFF) {

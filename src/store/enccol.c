@@ -49,6 +49,7 @@ int64_t ray_enccol_test_live(void) { return atomic_load(&g_enccol_live); }
 
 static void enccol_free(ray_enccol_t* e) {
     atomic_fetch_sub_explicit(&g_enccol_live, 1, memory_order_relaxed);
+    ray_idx_lazy_forget_enc(e);              /* a pending probe count goes with the payload */
     if (e->decoded) {
         ray_idx_lazy_forget(e->decoded);     /* a lazy hash goes with its object */
         ray_release(e->decoded);

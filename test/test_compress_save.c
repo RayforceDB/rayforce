@@ -4906,19 +4906,19 @@ static test_result_t test_select_decodes_referenced_only(void) {
     }
     static const struct { const char* q; uint64_t cols; } qs[] = {
         { "(select {c: (count v) from: u2 where: (> v 100)})",                1 },
-        { "(select {s: (sum v) from: u2 where: (== k 3)})",                   2 },
+        { "(select {s: (sum v) from: u2 where: (== k 3)})",                   1 },  /* P2: k's consult reads the directory */
         { "(select {from: u2 where: (== k 3)})",                              6 },  /* every column is output */
         { "(select {s: (sum v) by: k from: u2})",                             2 },
         { "(select {s: (sum v) c: (max w) by: [k m] from: u2})",              4 },
-        { "(select {s: (sum v) by: k from: u2 where: (> w 5)})",              3 },
+        { "(select {s: (sum v) by: k from: u2 where: (> w 5)})",              2 },  /* P2: w's consult reads the directory */
         { "(select {s: (sum v) by: k from: u2 desc: s take: 2})",             2 },
         { "(select {d: (med v) e: (first w) from: u2})",                      2 },
-        { "(select {d: (avg v) e: (dev w) from: u2 where: (< x 1000)})",      3 },
+        { "(select {d: (avg v) e: (dev w) from: u2 where: (< x 1000)})",      2 },  /* P2: x's consult reads the directory */
         { "(select {k: k v: v from: u2 take: 5})",                            2 },
         { "(select {k: k v: v from: u2 where: (> w 5) take: 5})",             3 },
         { "(select {v: v from: u2 desc: v take: 3})",                         1 },
         { "(select {v: v x: x from: u2 where: (> w 5) asc: x take: 4})",      3 },
-        { "(select {z: (+ v x) from: u2 where: (> w 5)})",                    1 },  /* P2: a fused side range-reads */
+        { "(select {z: (+ v x) from: u2 where: (> w 5)})",                    0 },  /* P2: a fused side range-reads; w's consult reads the directory */
         { NULL, 0 },
     };
     for (int i = 0; qs[i].q; i++) {

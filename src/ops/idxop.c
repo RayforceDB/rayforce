@@ -53,10 +53,7 @@ static atomic_flag g_idx_use_lock = ATOMIC_FLAG_INIT;
  * a server that never asks pays one relaxed load per index use. */
 static atomic_bool g_idx_use_armed;
 
-void ray_idx_note_use(const ray_t* col) {
-    if (!atomic_load_explicit(&g_idx_use_armed, memory_order_relaxed)) return;
-    if (!col || RAY_IS_ERR(col) || !(col->attrs & RAY_ATTR_HAS_INDEX) || !col->index) return;
-    const void* key = col->index;
+static void idx_use_add(const void* key) {
     uint32_t h = (uint32_t)(((uintptr_t)key >> 5) * 2654435761u) & (IDX_USE_SLOTS - 1);
     while (atomic_flag_test_and_set_explicit(&g_idx_use_lock, memory_order_acquire)) { }
     for (uint32_t i = 0; i < IDX_USE_SLOTS; i++) {
@@ -68,6 +65,19 @@ void ray_idx_note_use(const ray_t* col) {
         }
     }                                                     /* table full: drop the count */
     atomic_flag_clear_explicit(&g_idx_use_lock, memory_order_release);
+}
+
+void ray_idx_note_use(const ray_t* col) {
+    if (!atomic_load_explicit(&g_idx_use_armed, memory_order_relaxed)) return;
+    if (!col || RAY_IS_ERR(col) || !(col->attrs & RAY_ATTR_HAS_INDEX) || !col->index) return;
+    idx_use_add(col->index);
+}
+
+/* A directory answer counts under the encoded object itself (it has no
+ * index block until materialized). */
+void ray_idx_note_use_enc(const ray_t* encv) {
+    if (!atomic_load_explicit(&g_idx_use_armed, memory_order_relaxed)) return;
+    if (encv && !RAY_IS_ERR(encv) && encv->type == RAY_ENCCOL) idx_use_add(encv);
 }
 
 static const void* lazy_use_key(const ray_t* col);   /* the lazy hash cache, below */
@@ -100,14 +110,17 @@ ray_t* ray_idx_uses_fn(ray_t* tbl) {
          * materialized, and the materialization carries any index it built. */
         ray_t* enc = ray_table_get_col_enc_idx(tbl, c);
         ray_t* col = enc ? ray_enccol_decoded_peek(enc) : ray_table_col_idx(tbl, c);
-        if (!col || RAY_IS_ERR(col)) continue;
-        /* A lazy in-memory hash counts under the column it was built for. */
-        const void* own = (col->attrs & RAY_ATTR_HAS_INDEX) ? (const void*)col->index : NULL;
-        const void* lazy = lazy_use_key(col);
-        if (!own && !lazy) continue;
+        if (col && RAY_IS_ERR(col)) continue;
+        if (!col && !enc) continue;
+        /* A lazy in-memory hash counts under the column it was built for,
+         * a directory answer under the encoded object. */
+        const void* own = (col && (col->attrs & RAY_ATTR_HAS_INDEX)) ? (const void*)col->index : NULL;
+        const void* lazy = lazy_use_key(enc ? enc : col);
+        const void* dir = enc;                            /* ray_idx_note_use_enc */
+        if (!own && !lazy && !dir) continue;
         int64_t cnt = 0;
         for (uint32_t s = 0; s < ns; s++)
-            if (snap[s].key == own || snap[s].key == lazy) cnt += (int64_t)snap[s].n;
+            if (snap[s].key == own || snap[s].key == lazy || snap[s].key == dir) cnt += (int64_t)snap[s].n;
         if (cnt == 0) continue;
         int64_t name = ray_table_col_name(tbl, c);
         keys = ray_vec_append(keys, &name);
@@ -2321,24 +2334,8 @@ static bool idx_fresh_nonull(ray_t* col, ray_idx_kind_t kind) {
  * Zone-index all/none classification
  * -------------------------------------------------------------------------- */
 
-/* Classify (col cmp_op key) using the zone index min/max for O(1) decision.
- * Integer family (BOOL/U8/I16/I32/I64/DATE/TIME/TIMESTAMP) uses key_i and
- * the zone's min_i/max_i; float family (F32/F64) uses key_f and min_f/max_f.
- * NaN key_f → UNKNOWN immediately (NaN comparison is the null-aware kernel's
- * business).  Returns UNKNOWN when not eligible (no zone, stale, null-bearing,
- * or unsupported type). */
-ray_zone_class_t ray_index_zone_class(ray_t* col, uint16_t cmp_op,
-                                      int64_t key_i, double key_f) {
-    if (!idx_fresh_nonull(col, RAY_IDX_ZONE)) return RAY_ZONE_UNKNOWN;
-    ray_index_t* ix = ray_index_payload(col->index);
-
-    /* Dispatch to integer or float path based on column type. */
-    bool is_float = (col->type == RAY_F32 || col->type == RAY_F64);
-    bool is_int   = !is_float && (numeric_elem_size(col->type) > 0);
-    if (!is_float && !is_int) return RAY_ZONE_UNKNOWN;
-
-    if (is_float && isnan(key_f)) return RAY_ZONE_UNKNOWN;
-
+/* One zone decision text for ray_index_zone_class and its directory twin
+ * ray_enc_zone_class. */
 #define ZONE_CLASSIFY(mn, mx, key) do {                                \
     switch (cmp_op) {                                                  \
     case OP_EQ:                                                        \
@@ -2368,13 +2365,69 @@ ray_zone_class_t ray_index_zone_class(ray_t* col, uint16_t cmp_op,
     }                                                                  \
 } while (0)
 
+/* Classify (col cmp_op key) using the zone index min/max for O(1) decision.
+ * Integer family (BOOL/U8/I16/I32/I64/DATE/TIME/TIMESTAMP) uses key_i and
+ * the zone's min_i/max_i; float family (F32/F64) uses key_f and min_f/max_f.
+ * NaN key_f → UNKNOWN immediately (NaN comparison is the null-aware kernel's
+ * business).  Returns UNKNOWN when not eligible (no zone, stale, null-bearing,
+ * or unsupported type). */
+ray_zone_class_t ray_index_zone_class(ray_t* col, uint16_t cmp_op,
+                                      int64_t key_i, double key_f) {
+    if (!idx_fresh_nonull(col, RAY_IDX_ZONE)) return RAY_ZONE_UNKNOWN;
+    ray_index_t* ix = ray_index_payload(col->index);
+
+    /* Dispatch to integer or float path based on column type. */
+    bool is_float = (col->type == RAY_F32 || col->type == RAY_F64);
+    bool is_int   = !is_float && (numeric_elem_size(col->type) > 0);
+    if (!is_float && !is_int) return RAY_ZONE_UNKNOWN;
+
+    if (is_float && isnan(key_f)) return RAY_ZONE_UNKNOWN;
+
     if (is_int)   { ZONE_CLASSIFY(ix->u.zone.min_i, ix->u.zone.max_i, key_i); }
     else          { ZONE_CLASSIFY(ix->u.zone.min_f, ix->u.zone.max_f, key_f); }
 
-#undef ZONE_CLASSIFY
-
     return RAY_ZONE_UNKNOWN;
 }
+
+/* ---- Directory twins (P2) ----
+ * A single-file generation-2 column records only ZONE or CHUNK_ZONE
+ * (enc_attach_index refuses any other kind), and its materialization
+ * synthesizes that zone from the directory (enc_synth_zone /
+ * enc_synth_chunk_zone, src/store/enccol.c).  These answer what the
+ * synthesized zone would, from the same entries, without decoding. */
+static ray_enccol_t* enc_zone_col(ray_t* encv, uint8_t kind) {
+    if (!encv || RAY_IS_ERR(encv) || encv->type != RAY_ENCCOL) return NULL;
+    ray_enccol_t* e = ray_enccol_of(encv);
+    if (!e || e->kind != RAY_ENCCOL_SINGLE || e->hdr.index_kind != kind) return NULL;
+    return e;
+}
+static double enc_dbl(int64_t b) { double d; memcpy(&d, &b, 8); return d; }
+
+ray_zone_class_t ray_enc_zone_class(ray_t* encv, uint16_t cmp_op, int64_t key_i, double key_f) {
+    ray_enccol_t* e = enc_zone_col(encv, RAY_IDX_ZONE);
+    if (!e || e->null_count != 0) return RAY_ZONE_UNKNOWN;       /* idx_fresh_nonull */
+    bool is_float = (e->type == RAY_F32 || e->type == RAY_F64);
+    bool is_int   = !is_float && (numeric_elem_size(e->type) > 0);
+    if (!is_float && !is_int) return RAY_ZONE_UNKNOWN;
+    if (is_float && isnan(key_f)) return RAY_ZONE_UNKNOWN;
+    /* enc_synth_zone: the chunks with statistics, first of ties; 0/0 when none */
+    bool have = false;
+    int64_t mn = 0, mx = 0;
+    for (int64_t c = 0; c < e->n_chunks; c++) {
+        ray_enc_chunk_stat_t st; ray_enccol_chunk_stat(e, c, &st);
+        if (!st.has_minmax) continue;
+        bool lt = is_float ? enc_dbl(st.min) < enc_dbl(mn) : st.min < mn;
+        bool gt = is_float ? enc_dbl(st.max) > enc_dbl(mx) : st.max > mx;
+        if (!have || lt) mn = st.min;
+        if (!have || gt) mx = st.max;
+        have = true;
+    }
+    if (is_int) { ZONE_CLASSIFY(mn, mx, key_i); }
+    else        { double fmn = enc_dbl(mn), fmx = enc_dbl(mx); ZONE_CLASSIFY(fmn, fmx, key_f); }
+    return RAY_ZONE_UNKNOWN;
+}
+
+#undef ZONE_CLASSIFY
 
 /* qsort comparator: ascending int64 row ids, used by the rowsel
  * builder to put matches into per-segment order. */
@@ -4292,14 +4345,85 @@ bool ray_idx_lazy_hash_wanted(const ray_t* col) {
     return cap * 8u + (uint64_t)col->len * 8u <= 5u * (uint64_t)col->len * (uint64_t)esz;
 }
 
+/* chunk_zone_extrema over the directory of a CHUNK_ZONE generation-2
+ * column: a chunk without statistics is the synthesized zone's empty chunk
+ * (INT64_MAX / INT64_MIN), which chunk_zone_extrema skips. */
+static bool enc_chunk_zone_extrema(ray_t* encv, int64_t* gmin, int64_t* gmax,
+                                   uint32_t* nc_eff, uint32_t* nc_all) {
+    ray_enccol_t* e = enc_zone_col(encv, RAY_IDX_CHUNK_ZONE);
+    if (!e || numeric_elem_size(e->type) == 0 || e->type == RAY_F32 || e->type == RAY_F64) return false;
+    if (e->n_chunks == 0) return false;
+    int64_t lo = INT64_MAX, hi = INT64_MIN;
+    uint32_t n_eff = 0;
+    for (int64_t c = 0; c < e->n_chunks; c++) {
+        ray_enc_chunk_stat_t st; ray_enccol_chunk_stat(e, c, &st);
+        if (!st.has_minmax) continue;
+        if (st.min < lo) lo = st.min;
+        if (st.max > hi) hi = st.max;
+        n_eff++;
+    }
+    if (n_eff == 0) return false;
+    *gmin = lo; *gmax = hi;
+    if (nc_eff) *nc_eff = n_eff;
+    if (nc_all) *nc_all = (uint32_t)e->n_chunks;
+    return true;
+}
+
+bool ray_enc_zone_excludes(ray_t* encv, int64_t key) {
+    int64_t lo, hi;
+    return enc_chunk_zone_extrema(encv, &lo, &hi, NULL, NULL) && (key < lo || key > hi);
+}
+
+bool ray_enc_zone_excludes_set(ray_t* encv, const ray_t* set) {
+    int64_t lo, hi;
+    if (!set || RAY_IS_ERR(set) || ray_is_atom(set)) return false;
+    if (numeric_elem_size(set->type) == 0 || set->type == RAY_F32 || set->type == RAY_F64) return false;
+    if (!enc_chunk_zone_extrema(encv, &lo, &hi, NULL, NULL)) return false;
+    const uint8_t* sb = (const uint8_t*)ray_data((ray_t*)set);
+    for (int64_t i = 0; i < set->len; i++) {
+        int64_t v = set_vec_read_i64(sb, set->type, i);
+        if (v >= lo && v <= hi) return false;
+    }
+    return true;
+}
+
+bool ray_enc_lazy_hash_wanted(ray_t* encv) {
+    int64_t gmin, gmax;
+    uint32_t n_eff = 0, nc = 0;
+    if (!enc_chunk_zone_extrema(encv, &gmin, &gmax, &n_eff, &nc)) return false;
+    ray_enccol_t* e = ray_enccol_of(encv);
+    if (nc < 4 || n_eff < 4) return false;
+    uint64_t range = (uint64_t)gmax - (uint64_t)gmin; /* full I64 width: wraps correctly */
+    if (range == 0) return false;
+    double span_sum = 0.0;
+    for (int64_t c = 0; c < e->n_chunks; c++) {
+        ray_enc_chunk_stat_t st; ray_enccol_chunk_stat(e, c, &st);
+        if (!st.has_minmax) continue;
+        span_sum += (double)((uint64_t)st.max - (uint64_t)st.min);
+    }
+    if ((span_sum / (double)n_eff) / (double)range <= 0.5) return false;
+    int esz = numeric_elem_size(e->type);
+    uint64_t cap = 8, want = 2u * (uint64_t)e->len;
+    while (cap < want) cap <<= 1;
+    return cap * 8u + (uint64_t)e->len * 8u <= 5u * (uint64_t)e->len * (uint64_t)esz;
+}
+
 #define LAZY_SLOTS 64
 #define LAZY_HASH_BYTES_PER_ROW 58     /* the converters' hash-build figure, per row */
 /* An entry is built (hcol set), pending (hcol NULL: a wanted column whose
  * probes are still answered by the scan; work = rows those scans read), or
  * declined (over budget, or its build failed: later probes do not retry).
- * Only a built entry holds bytes. */
+ * Only a built entry holds bytes.
+ *
+ * A generation-2 column probed before it is materialized is a memo keyed by
+ * its encoded payload (enc, not referenced: enccol_free drops it through
+ * ray_idx_lazy_forget_enc, so a memo never keeps a dropped table's mapping
+ * alive); its key is then only a non-NULL slot marker, never dereferenced
+ * or compared.  A build materializes the column, and the built entry is
+ * keyed by that materialization, as any plain column's. */
 typedef struct {
     const ray_t* key; ray_t* col; ray_t* hcol;
+    const ray_enccol_t* enc;
     int64_t bytes; int64_t work; uint64_t tick; bool declined;
 } lazy_ent_t;
 static lazy_ent_t  g_lazy[LAZY_SLOTS];
@@ -4327,8 +4451,32 @@ static void lazy_drop(lazy_drop_t* d) {
     for (int i = 0; i < d->n; i++) ray_release(d->objs[i]);
     d->n = 0;
 }
+/* The published materialization of an encoded payload, or NULL. */
+static const ray_t* lazy_enc_decoded(const ray_enccol_t* e) {
+    if (atomic_load_explicit(&e->once.state, memory_order_acquire) != RAY_ENC_ONCE_DONE) return NULL;
+    return e->decoded;
+}
+/* The entry for col (a plain vector or a RAY_ENCCOL header): keyed by col,
+ * a memo of col's encoded payload, or (an encoded header whose column is
+ * published) keyed by its materialization; a plain col also meets the memo
+ * of the payload it materializes.  So a column's probes meet one entry
+ * whatever its materialization state, and whichever header copy probes. */
 static int lazy_find(const ray_t* col) {
-    for (int i = 0; i < LAZY_SLOTS; i++) if (g_lazy[i].key == col) return i;
+    const ray_enccol_t* ce = NULL;
+    const ray_t* cdec = NULL;
+    if (col->type == RAY_ENCCOL) {
+        ce = ray_enccol_of((ray_t*)col);
+        if (ce) cdec = lazy_enc_decoded(ce);
+    }
+    for (int i = 0; i < LAZY_SLOTS; i++) {
+        if (!g_lazy[i].key) continue;
+        const ray_enccol_t* me = g_lazy[i].enc;
+        if (me) {
+            if (me == ce || (!ce && lazy_enc_decoded(me) == col)) return i;
+            continue;
+        }
+        if (g_lazy[i].key == col || (cdec && g_lazy[i].key == cdec)) return i;
+    }
     return -1;
 }
 /* Entries whose column only the cache still holds: its table is gone (a
@@ -4354,6 +4502,14 @@ static int lazy_slot(lazy_drop_t* d) {
     return v;
 }
 
+/* The key's rows, element type, shape test and plain column.  A
+ * generation-2 key (its RAY_ENCCOL) answers the first three from its header
+ * and directory; lazy_plain materializes it, and runs only when a build fires. */
+static int64_t lazy_len(const ray_t* key)  { return key->type == RAY_ENCCOL ? ray_enccol_of((ray_t*)key)->len : key->len; }
+static int8_t  lazy_type(const ray_t* key) { return key->type == RAY_ENCCOL ? ray_enccol_of((ray_t*)key)->type : key->type; }
+static bool    lazy_wanted(ray_t* key)     { return key->type == RAY_ENCCOL ? ray_enc_lazy_hash_wanted(key) : ray_idx_lazy_hash_wanted(key); }
+static ray_t*  lazy_plain(ray_t* key)      { return key->type == RAY_ENCCOL ? ray_enccol_materialize(key) : key; }
+
 /* Record col without an index: pending (this probe's scan counted as its
  * first work) or declined.  An entry another probe made meanwhile stands. */
 static void lazy_memo(ray_t* col, bool declined) {
@@ -4364,8 +4520,11 @@ static void lazy_memo(ray_t* col, bool declined) {
         if (declined && !g_lazy[i].hcol) g_lazy[i].declined = true;
     } else {
         int s = lazy_slot(&d);
-        ray_retain(col);
-        g_lazy[s] = (lazy_ent_t){ .key = col, .col = col, .work = declined ? 0 : col->len,
+        bool enc = col->type == RAY_ENCCOL;            /* a payload memo, unreferenced */
+        if (!enc) ray_retain(col);
+        g_lazy[s] = (lazy_ent_t){ .key = col, .col = enc ? NULL : col,
+                                  .enc = enc ? ray_enccol_of(col) : NULL,
+                                  .work = declined ? 0 : lazy_len(col),
                                   .tick = ++g_lazy_tick, .declined = declined };
     }
     lazy_unlock();
@@ -4400,13 +4559,11 @@ static const void* lazy_use_key(const ray_t* col) {
     return k;
 }
 
-ray_t* ray_idx_lazy_hash(ray_t* col, ray_t** out) {
-    *out = NULL;
-    if (!col || RAY_IS_ERR(col) || !ray_is_vec(col)) return NULL;
+static ray_t* lazy_hash_keyed(ray_t* key, ray_t** out) {
     lazy_drop_t dead = { .n = 0 };
     lazy_lock();
     lazy_sweep_locked(&dead);
-    int hit = lazy_find(col);
+    int hit = lazy_find(key);
     if (hit >= 0) {
         lazy_ent_t* e = &g_lazy[hit];
         e->tick = ++g_lazy_tick;
@@ -4419,8 +4576,8 @@ ray_t* ray_idx_lazy_hash(ray_t* col, ray_t** out) {
         }
         /* Pending: the scan answers until the rows earlier probes scanned
          * pay for the build (RAY_IDX_LAZY_BUILD_PROBES). */
-        if (e->declined || e->work < (int64_t)(RAY_IDX_LAZY_BUILD_PROBES - 1) * col->len) {
-            if (!e->declined) e->work += col->len;      /* this probe scans */
+        if (e->declined || e->work < (int64_t)(RAY_IDX_LAZY_BUILD_PROBES - 1) * lazy_len(key)) {
+            if (!e->declined) e->work += lazy_len(key);      /* this probe scans */
             lazy_unlock();
             lazy_drop(&dead);
             return NULL;
@@ -4432,28 +4589,34 @@ ray_t* ray_idx_lazy_hash(ray_t* col, ray_t** out) {
         lazy_drop(&dead);
         /* The shape is decided from the zone's chunk extrema (O(chunks),
          * nothing built), so a column it rejects is simply asked again. */
-        if (!ray_idx_lazy_hash_wanted(col)) return NULL;
+        if (!lazy_wanted(key)) return NULL;
     }
     int64_t budget = ray_sys_ram_limit() / 4;
     if (budget <= 0) return NULL;                       /* no runtime: no budget, no cache */
-    int64_t bytes = col->len * (int64_t)(numeric_elem_size(col->type) + LAZY_HASH_BYTES_PER_ROW);
-    if (bytes > budget) { lazy_decline(col); return NULL; }
-    if (hit < 0) { lazy_memo(col, false); return NULL; } /* first probe: the scan answers */
+    int64_t bytes = lazy_len(key) * (int64_t)(numeric_elem_size(lazy_type(key)) + LAZY_HASH_BYTES_PER_ROW);
+    if (bytes > budget) { lazy_decline(key); return NULL; }
+    if (hit < 0) { lazy_memo(key, false); return NULL; } /* first probe: the scan answers */
+    ray_t* plain = lazy_plain(key);                     /* generation 2: the one materialization */
+    if (!plain || RAY_IS_ERR(plain)) {
+        if (!plain) { lazy_decline(key); return ray_error("oom", "lazy hash"); }
+        if (strcmp(ray_err_code(plain), "cancel") != 0) lazy_decline(key);
+        return plain;
+    }
     int fail = atomic_exchange(&g_lazy_fail, 0);
     ray_t* h = fail == 2 ? ray_error("cancel", "interrupted")
              : fail == 1 ? ray_error("oom", "lazy hash")
-             : attach_via(col, attach_hash_mem);        /* copy-on-write: col is never modified */
-    if (!h) { lazy_decline(col); return ray_error("oom", "lazy hash"); }
+             : attach_via(plain, attach_hash_mem);      /* copy-on-write: plain is never modified */
+    if (!h) { lazy_decline(key); return ray_error("oom", "lazy hash"); }
     if (RAY_IS_ERR(h)) {
         /* an interrupted build is the query's cancellation, not the column's */
-        if (strcmp(ray_err_code(h), "cancel") != 0) lazy_decline(col);
+        if (strcmp(ray_err_code(h), "cancel") != 0) lazy_decline(key);
         return h;
     }
-    if (ray_index_kind(h) != RAY_IDX_HASH) { ray_release(h); lazy_decline(col); return NULL; }
+    if (ray_index_kind(h) != RAY_IDX_HASH) { ray_release(h); lazy_decline(key); return NULL; }
 
     lazy_drop_t d = { .n = 0 };
     lazy_lock();
-    int i = lazy_find(col);
+    int i = lazy_find(key);
     if (i >= 0 && g_lazy[i].hcol) {
         /* Another probe built and published it first: use that one. */
         g_lazy[i].tick = ++g_lazy_tick;
@@ -4473,8 +4636,8 @@ ray_t* ray_idx_lazy_hash(ray_t* col, ray_t** out) {
         lazy_take(&d, lru);
     }
     int s = lazy_slot(&d);
-    ray_retain(col);
-    g_lazy[s] = (lazy_ent_t){ .key = col, .col = col, .hcol = h, .bytes = bytes, .tick = ++g_lazy_tick };
+    ray_retain(plain);                                  /* generation 2: keyed by its materialization */
+    g_lazy[s] = (lazy_ent_t){ .key = plain, .col = plain, .hcol = h, .bytes = bytes, .tick = ++g_lazy_tick };
     g_lazy_bytes += bytes;
     ray_retain(h);
     *out = h;
@@ -4483,12 +4646,35 @@ ray_t* ray_idx_lazy_hash(ray_t* col, ray_t** out) {
     return NULL;
 }
 
+ray_t* ray_idx_lazy_hash(ray_t* col, ray_t** out) {
+    *out = NULL;
+    if (!col || RAY_IS_ERR(col) || !ray_is_vec(col)) return NULL;
+    return lazy_hash_keyed(col, out);
+}
+
+ray_t* ray_idx_lazy_hash_enc(ray_t* encv, ray_t** out) {
+    *out = NULL;
+    if (!encv || RAY_IS_ERR(encv) || encv->type != RAY_ENCCOL) return NULL;
+    ray_enccol_t* e = ray_enccol_of(encv);
+    if (!e || e->kind != RAY_ENCCOL_SINGLE) return NULL;
+    return lazy_hash_keyed(encv, out);
+}
+
 void ray_idx_lazy_forget(const ray_t* col) {
     if (!col) return;
     lazy_drop_t d = { .n = 0 };
     lazy_lock();
     int i = lazy_find(col);
     if (i >= 0) lazy_take(&d, i);
+    lazy_unlock();
+    lazy_drop(&d);
+}
+
+void ray_idx_lazy_forget_enc(const ray_enccol_t* e) {
+    if (!e) return;
+    lazy_drop_t d = { .n = 0 };
+    lazy_lock();
+    for (int i = 0; i < LAZY_SLOTS; i++) if (g_lazy[i].enc == e) lazy_take(&d, i);
     lazy_unlock();
     lazy_drop(&d);
 }

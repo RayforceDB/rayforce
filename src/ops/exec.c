@@ -1383,7 +1383,7 @@ static ray_t* exec_in(ray_graph_t* g, ray_op_t* op, ray_t* col, ray_t* set) {
  * differs.  Returns NULL+all_pass=0 for any unsupported shape so the caller
  * falls back to exec_node→ray_rowsel_from_pred unchanged. */
 static int idx_filter_in_decode(ray_graph_t* g, ray_op_t* pred_op, unsigned want,
-                                ray_t** out_col, ray_t** out_set_lit);
+                                ray_t** out_col, ray_t** out_set_lit, ray_col_meta_t* out_meta);
 
 /* What a filter-index consult needs from a column, decided from metadata so
  * an encoded column without it is never decoded to find that out: any index
@@ -1419,14 +1419,17 @@ static ray_t* idx_lazy_err(ray_t* le) {
 /* An `in` set that is a point lookup for the lazy hash: an integer-family
  * vector no larger than an eighth of the rows (the dense cutoff the hash
  * equality probe applies to one key's rows). */
-static bool idx_lazy_set_ok(const ray_t* col, const ray_t* set) {
+static bool idx_lazy_set_ok_len(int64_t len, const ray_t* set) {
     if (!set || RAY_IS_ERR(set) || ray_is_atom(set)) return false;
     switch (set->type) {
     case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
     case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: break;
     default: return false;
     }
-    return set->len <= (col->len >> 3);
+    return set->len <= (len >> 3);
+}
+static bool idx_lazy_set_ok(const ray_t* col, const ray_t* set) {
+    return idx_lazy_set_ok_len(col->len, set);
 }
 
 /* The plain column for a decode that declines (the scan fallback re-reads the
@@ -1435,6 +1438,116 @@ static ray_t* idx_decode_col(ray_t* tbl, int64_t sym) {
     ray_t* col = ray_table_col(tbl, sym);
     if (col && RAY_IS_ERR(col)) { ray_error_free(col); return NULL; }
     return col;
+}
+
+static int idx_filter_decode(ray_graph_t* g, ray_op_t* pred_op, unsigned want,
+                             ray_t** out_col, uint16_t* out_cmp_op,
+                             int64_t* out_key_i, double* out_key_f,
+                             int* out_is_float, ray_col_meta_t* out_meta);
+
+/* The scanned column of a conjunct idx_filter_decode accepted. */
+static int64_t idx_conj_sym(ray_graph_t* g, ray_op_t* pred) {
+    ray_op_t* l = op_child(g, pred, 0);
+    ray_op_ext_t* x = l ? find_ext(g, l->id) : NULL;
+    return x ? x->sym : -1;
+}
+
+/* Metadata may show nulls: a text column always may (ray_vec_may_have_nulls). */
+static bool idx_meta_may_null(const ray_col_meta_t* m) {
+    if (m->type == RAY_SYM || m->type == RAY_STR) return true;
+    return m->null_count >= 0 ? m->null_count != 0 : (m->attrs & RAY_ATTR_HAS_NULLS) != 0;
+}
+
+/* The eq+range conjunction's decode loop decided from metadata: no float
+ * literal, one equality on a hash-eligible column, and ordered compares on
+ * one other null-free column.  Lets a generation-2 equality column probe
+ * its lazy hash only for a shape that would use it. */
+static bool idx_eqrange_meta_ok(ray_graph_t* g, ray_op_t** conj, int ncj) {
+    int64_t eq_sym = -1, rg_sym = -1;
+    for (int ci = 0; ci < ncj; ci++) {
+        uint16_t cop = 0; ray_col_meta_t cm;
+        int64_t ki = 0; double kf = 0.0; int isf = 0;
+        if (!idx_filter_decode(g, conj[ci], IDXW_NONE, NULL, &cop, &ki, &kf, &isf, &cm) || isf)
+            return false;
+        int64_t sym = idx_conj_sym(g, conj[ci]);
+        if (sym < 0) return false;
+        if (cop == OP_EQ && eq_sym < 0 &&
+            (cm.index_kind == RAY_IDX_HASH || idx_lazy_meta_ok(&cm)) &&
+            (cm.type == RAY_SYM ? ki != 0 : !idx_meta_may_null(&cm))) {
+            eq_sym = sym;
+        } else if (cop == OP_GE || cop == OP_GT || cop == OP_LE || cop == OP_LT) {
+            if (idx_meta_may_null(&cm)) return false;
+            if (rg_sym < 0) rg_sym = sym;
+            else if (rg_sym != sym) return false;
+        } else return false;
+    }
+    return eq_sym >= 0 && rg_sym >= 0 && rg_sym != eq_sym;
+}
+
+/* The single-compare consult on a generation-2 column without a published
+ * materialization (finding C1), from its directory: the zone class (recorded
+ * ZONE), an EQ key outside the chunk zone's range, then the PI lazy HASH,
+ * which materializes the column only when the accumulated probes pay for
+ * the build.  Bloom, HASH, PART and SORT are never recorded on generation 2.
+ * 1: every row passes; 2: *sel is the selection; 0: undecided (the fused
+ * scan answers, by range); -1: *err owned.  Mirrors the generation-0 steps
+ * of the OP_FILTER arm: the same counters in the same order, the same null
+ * and float conditions (m->null_count is exact for generation 2). */
+static int idx_filter_enc_consult(ray_t* enc, const ray_col_meta_t* m, uint16_t cmp_op,
+                                  int64_t key_i, double key_f, int is_float,
+                                  int64_t nrows, ray_t** sel, ray_t** err) {
+    *sel = NULL; *err = NULL;
+    if (m->index_kind == RAY_IDX_ZONE) ray_idx_consults[IDX_SITE_FILTER_ZONE]++;
+    switch (ray_enc_zone_class(enc, cmp_op, key_i, key_f)) {
+    case RAY_ZONE_ALL:
+        ray_idx_hits[IDX_SITE_FILTER_ZONE]++;
+        ray_idx_note_use_enc(enc);
+        return 1;
+    case RAY_ZONE_NONE:
+        ray_idx_hits[IDX_SITE_FILTER_ZONE]++;
+        ray_idx_note_use_enc(enc);
+        *sel = ray_index_empty_rowsel(nrows);
+        return *sel ? 2 : 0;
+    default: break;
+    }
+    if (cmp_op != OP_EQ || is_float || m->type == RAY_SYM || m->null_count != 0) return 0;
+    if (ray_enc_zone_excludes(enc, key_i)) {
+        ray_idx_consults[IDX_SITE_FILTER_ZONE]++;
+        *sel = ray_index_empty_rowsel(nrows);
+        if (*sel) { ray_idx_hits[IDX_SITE_FILTER_ZONE]++; ray_idx_note_use_enc(enc); return 2; }
+    }
+    ray_t* lazy = NULL;
+    ray_t* le = idx_lazy_err(ray_idx_lazy_hash_enc(enc, &lazy));
+    if (le) { *err = le; return -1; }
+    if (!lazy) return 0;
+    ray_idx_consults[IDX_SITE_FILTER_HASH]++;
+    *sel = ray_index_hash_eq_rowsel(lazy, key_i);
+    if (*sel) { ray_idx_hits[IDX_SITE_FILTER_HASH]++; ray_idx_note_use(lazy); }
+    ray_release(lazy);
+    return *sel ? 2 : 0;
+}
+
+/* The IN consult's twin: every element outside the chunk zone's range, then
+ * the lazy HASH for a small integer set. */
+static int idx_filter_enc_in_consult(ray_t* enc, const ray_col_meta_t* m, ray_t* set,
+                                     int64_t nrows, ray_t** sel, ray_t** err) {
+    *sel = NULL; *err = NULL;
+    if (m->type == RAY_F32 || m->type == RAY_F64 || m->null_count != 0) return 0;
+    if (ray_enc_zone_excludes_set(enc, set)) {
+        ray_idx_consults[IDX_SITE_FILTER_ZONE]++;
+        *sel = ray_index_empty_rowsel(nrows);
+        if (*sel) { ray_idx_hits[IDX_SITE_FILTER_ZONE]++; ray_idx_note_use_enc(enc); return 2; }
+    }
+    if (!idx_lazy_set_ok_len(m->len, set)) return 0;
+    ray_t* lazy = NULL;
+    ray_t* le = idx_lazy_err(ray_idx_lazy_hash_enc(enc, &lazy));
+    if (le) { *err = le; return -1; }
+    if (!lazy) return 0;
+    ray_idx_consults[IDX_SITE_IN]++;
+    *sel = ray_index_in_rowsel(lazy, set);
+    if (*sel) { ray_idx_hits[IDX_SITE_IN]++; ray_idx_note_use(lazy); }
+    ray_release(lazy);
+    return *sel ? 2 : 0;
 }
 
 typedef struct { in_worker_ctx_t* ic; } in_sel_fill_ctx_t;
@@ -1458,7 +1571,7 @@ ray_t* exec_in_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
      * set) and rejects parted/MAPCOMMON columns + non-CONST sets.  OP_NOT_IN
      * isn't a decode shape (the shared decode is IN-only), so `not-in` falls
      * back to the bool path here — still correct, just unfused. */
-    if (!idx_filter_in_decode(g, pred, IDXW_NONE, &col, &set_lit)) return NULL;
+    if (!idx_filter_in_decode(g, pred, IDXW_NONE, &col, &set_lit, NULL)) return NULL;
     if (ray_is_atom(col) || col->len != nrows) return NULL;
 
     bool negate = (pred->opcode == OP_NOT_IN);
@@ -1513,7 +1626,7 @@ bool ray_slice_group_probe(ray_graph_t* g, ray_op_t* root, ray_t* by_col) {
     ray_t* eq_atom = NULL;   /* owned (built for the eq shape) */
     if (pred->opcode == OP_IN) {   /* NOT_IN also decodes — reject it */
         ray_t* c = NULL; ray_t* set = NULL;
-        if (idx_filter_in_decode(g, pred, IDXW_INDEX, &c, &set) && c == by_col)
+        if (idx_filter_in_decode(g, pred, IDXW_INDEX, &c, &set, NULL) && c == by_col)
             keys = set;
     }
     if (!keys) {
@@ -1674,11 +1787,12 @@ static int idx_filter_decode(ray_graph_t* g, ray_op_t* pred_op, unsigned want,
  * Same column eligibility as idx_filter_decode: default table, not parted,
  * not MAPCOMMON.
  *
- * On success, *out_col is the column vec and *out_set_lit is the CONST
+ * On success, *out_col (when non-NULL; NULL decodes nothing) is the column
+ * vec, *out_meta (when non-NULL) its metadata, and *out_set_lit is the CONST
  * literal vec (borrowed from the ext, valid for the lifetime of the graph).
  * Returns 1 on success, 0 if the shape is not matched. */
 static int idx_filter_in_decode(ray_graph_t* g, ray_op_t* pred_op, unsigned want,
-                                ray_t** out_col, ray_t** out_set_lit) {
+                                ray_t** out_col, ray_t** out_set_lit, ray_col_meta_t* out_meta) {
     if (!pred_op || pred_op->arity != 2) return 0;
     if (pred_op->opcode != OP_IN) return 0;
 
@@ -1701,10 +1815,12 @@ static int idx_filter_in_decode(ray_graph_t* g, ray_op_t* pred_op, unsigned want
     if (!ray_table_col_meta(tbl, lext->sym, &m)) return 0;
     if (RAY_IS_PARTED(m.type) || m.type == RAY_MAPCOMMON) return 0;
     if (!idx_want_ok(&m, want)) return 0;
-    ray_t* col = idx_decode_col(tbl, lext->sym);
-    if (!col) return 0;
-
-    *out_col     = col;
+    if (out_meta) *out_meta = m;
+    if (out_col) {
+        ray_t* col = idx_decode_col(tbl, lext->sym);
+        if (!col) return 0;
+        *out_col = col;
+    }
     *out_set_lit = rext->literal;
     return 1;
 }
@@ -2662,8 +2778,25 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 int64_t  key_i    = 0;
                 double   key_f    = 0.0;
                 int      is_float = 0;
-                if (idx_filter_decode(g, op_child(g, op, 1), IDXW_INDEX, &col, &cmp_op,
-                                      &key_i, &key_f, &is_float, NULL)) {
+                /* A generation-2 column without a published materialization
+                 * is consulted from its directory (finding C1) and never
+                 * decoded here; a published one takes the block below on
+                 * its materialization, which carries the synthesized zone. */
+                ray_col_meta_t fm;
+                bool enc_done = false;
+                if (idx_filter_decode(g, op_child(g, op, 1), IDXW_INDEX, NULL, &cmp_op,
+                                      &key_i, &key_f, &is_float, &fm) &&
+                    fm.enc && !ray_enccol_decoded_peek(fm.enc)) {
+                    enc_done = true;
+                    ray_t* esel = NULL; ray_t* eerr = NULL;
+                    int rc = idx_filter_enc_consult(fm.enc, &fm, cmp_op, key_i, key_f, is_float,
+                                                    ray_table_nrows(input), &esel, &eerr);
+                    if (rc < 0) { ray_release(input); return eerr; }
+                    if (rc == 1) return input;
+                    if (rc == 2) { g->selection = esel; return input; }
+                }
+                if (!enc_done && idx_filter_decode(g, op_child(g, op, 1), IDXW_INDEX, &col, &cmp_op,
+                                                   &key_i, &key_f, &is_float, NULL)) {
                     /* 1. Zone index: O(1) all/none short-circuit. */
                     if (ray_index_kind(col) == RAY_IDX_ZONE)
                         ray_idx_consults[IDX_SITE_FILTER_ZONE]++;
@@ -2825,6 +2958,8 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     /* Metadata first: a conjunct list without an equality on a
                      * hash-indexed column decodes nothing. */
                     bool has_hash_eq = false;
+                    ray_t* eq_enc = NULL;
+                    ray_t* eq_lazy = NULL;
                     for (int ci = 0; ci < ncj && shape_ok && !has_hash_eq; ci++) {
                         uint16_t cop = 0; ray_col_meta_t cm;
                         int64_t ki = 0; double kf = 0.0; int isf = 0;
@@ -2832,8 +2967,24 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                                                         &ki, &kf, &isf, &cm) &&
                                       cop == OP_EQ && (cm.index_kind == RAY_IDX_HASH ||
                                                        idx_lazy_meta_ok(&cm));
+                        if (has_hash_eq && cm.enc && !ray_enccol_decoded_peek(cm.enc) &&
+                            cm.index_kind != RAY_IDX_HASH)
+                            eq_enc = cm.enc;
                     }
                     shape_ok = shape_ok && has_hash_eq;
+                    /* Finding C1: a generation-2 equality column is probed
+                     * (and its lazy HASH built, materializing it) before any
+                     * conjunct column is decoded, once the metadata shows
+                     * the shape the decode below accepts; while the probe is
+                     * still pending the scan answers and nothing is decoded. */
+                    if (shape_ok && eq_enc) {
+                        if (!idx_eqrange_meta_ok(g, conj, ncj)) shape_ok = false;
+                        else {
+                            ray_t* le = idx_lazy_err(ray_idx_lazy_hash_enc(eq_enc, &eq_lazy));
+                            if (le) { ray_release(input); return le; }
+                            if (!eq_lazy) shape_ok = false;
+                        }
+                    }
                     for (int ci = 0; ci < ncj && shape_ok; ci++) {
                         ray_t* c = NULL; uint16_t cop = 0;
                         int64_t ki = 0; double kf = 0.0; int isf = 0;
@@ -2858,15 +3009,16 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     }
                     /* The equality column without a persisted hash probes
                      * its lazy one, built only now that the whole shape
-                     * matched; the range column stays the table's. */
-                    ray_t* eq_lazy = NULL;
-                    if (shape_ok && eq_col && rg_col && rg_col != eq_col &&
+                     * matched (a generation-2 one was probed above, and its
+                     * build published the materialization the decode read);
+                     * the range column stays the table's. */
+                    if (shape_ok && eq_col && rg_col && rg_col != eq_col && !eq_lazy &&
                         ray_index_kind(eq_col) != RAY_IDX_HASH) {
                         ray_t* le = idx_lazy_err(ray_idx_lazy_hash(eq_col, &eq_lazy));
                         if (le) { ray_release(input); return le; }
-                        if (eq_lazy) eq_col = eq_lazy;
-                        else shape_ok = false;
+                        if (!eq_lazy) shape_ok = false;
                     }
+                    if (eq_lazy) eq_col = eq_lazy;
                     if (shape_ok && eq_col && rg_col && rg_col != eq_col) {
                         ray_idx_consults[IDX_SITE_FILTER_EQRANGE]++;
                         /* SYM eq: global intern id -> this column's domain
@@ -2948,7 +3100,21 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 {
                     ray_t* in_col     = NULL;
                     ray_t* in_set_lit = NULL;
-                    if (idx_filter_in_decode(g, op_child(g, op, 1), IDXW_INDEX, &in_col, &in_set_lit)) {
+                    /* generation 2 without a published materialization:
+                     * from the directory, never decoded here */
+                    ray_col_meta_t im;
+                    bool in_enc_done = false;
+                    if (idx_filter_in_decode(g, op_child(g, op, 1), IDXW_INDEX, NULL, &in_set_lit, &im) &&
+                        im.enc && !ray_enccol_decoded_peek(im.enc)) {
+                        in_enc_done = true;
+                        ray_t* isel = NULL; ray_t* ierr = NULL;
+                        int rc = idx_filter_enc_in_consult(im.enc, &im, in_set_lit,
+                                                           ray_table_nrows(input), &isel, &ierr);
+                        if (rc < 0) { ray_release(input); return ierr; }
+                        if (rc == 2) { g->selection = isel; return input; }
+                    }
+                    if (!in_enc_done &&
+                        idx_filter_in_decode(g, op_child(g, op, 1), IDXW_INDEX, &in_col, &in_set_lit, NULL)) {
                         bool in_col_is_float = (in_col->type == RAY_F32 ||
                                                in_col->type == RAY_F64);
                         ray_idx_kind_t in_kind = ray_index_kind(in_col);

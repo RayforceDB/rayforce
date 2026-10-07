@@ -7828,14 +7828,44 @@ static void count_piece(void* vctx, uint32_t wid, int64_t b, int64_t e, const ra
     pc->local += count_compare_span(pc->c->src->type, p[0].attrs, p[0].data, 0, e - b,
                                     pc->c->rhs, pc->c->op);
 }
+/* Chunk ch of the bound source decided from its directory: 1 every row
+ * compares true, 0 none, -1 undecided.  The source has no nulls (the fast
+ * path declines nullable columns other than SYM, which is never decided
+ * here: its ids carry no string order, #738). */
+static int count_chunk_decision(const count_compare_ctx_t* ctx, int64_t ch) {
+    if (!zone_dir_type(ctx->src->type)) return -1;
+    ray_enc_chunk_stat_t st;
+    if (!ray_col_src_chunk_stat(ctx->src, ch, &st)) return -1;
+    uint16_t op;
+    switch (ctx->op) {
+    case COUNT_CMP_EQ: op = OP_EQ; break;
+    case COUNT_CMP_NE: op = OP_NE; break;
+    case COUNT_CMP_LT: op = OP_LT; break;
+    case COUNT_CMP_LE: op = OP_LE; break;
+    case COUNT_CMP_GT: op = OP_GT; break;
+    case COUNT_CMP_GE: op = OP_GE; break;
+    default: return -1;
+    }
+    return zone_cmp_core(st.min, st.max, st.has_minmax, false, false, op, ctx->rhs);
+}
 static void count_compare_enc_task(void* vctx, uint32_t worker_id, int64_t start, int64_t end) {
     count_compare_ctx_t* ctx = (count_compare_ctx_t*)vctx;
     if (ray_scan_fail_skip(ctx->fail, start)) return;
     count_piece_ctx_t pc = { ctx, 0 };
     ray_col_src_t* srcs[1] = { ctx->src };
     const void* plain[1] = { NULL };
-    ray_t* err = ray_col_walk(srcs, plain, 1, start, end, false, &pc, worker_id, count_piece);
-    if (err) { ray_scan_fail_note(ctx->fail, start, err); return; }
+    _Static_assert(RAY_ENC_CHUNK == 1 << 16, "count decisions read 64K-row chunks");
+    for (int64_t b = start; b < end; ) {
+        int64_t e = ((b >> 16) + 1) << 16;                 /* the end of b's chunk */
+        if (e > end) e = end;
+        int d = count_chunk_decision(ctx, b >> 16);
+        if (d == 1) pc.local += e - b;
+        else if (d != 0) {
+            ray_t* err = ray_col_walk(srcs, plain, 1, b, e, false, &pc, worker_id, count_piece);
+            if (err) { ray_scan_fail_note(ctx->fail, start, err); return; }
+        }
+        b = e;
+    }
     ctx->counts[worker_id] += pc.local;
 }
 
