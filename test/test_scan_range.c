@@ -1117,11 +1117,15 @@ static test_result_t sr_same(const char* q, uint64_t want_mat) {
 }
 #define SR_SAME(q, m) do { test_result_t r_ = sr_same((q), (m)); if (r_.status != TEST_PASS) return r_; } while (0)
 
-/* Selection from a fused predicate, compared segment by segment. */
-static test_result_t sr_sel_same(ray_op_t* (*build)(ray_graph_t*)) {
+/* Selection from a fused predicate, compared segment by segment, over the
+ * tables saved at dirs[0] (generation 0) and dirs[1] (generation 2). */
+static test_result_t sr_sel_same_at(const char* const dirs[2], ray_op_t* (*build)(ray_graph_t*)) {
     ray_t* blk[2] = { NULL, NULL }; bool all[2] = { false, false };
     for (int gen = 0; gen < 2; gen++) {
-        ray_t* t = sr_load(gen);
+        char q[600];
+        snprintf(q, sizeof q, "(.db.splayed.get \"%s\")", dirs[gen]);
+        ray_t* t = sr_eval(q);
+        if (t && RAY_IS_ERR(t)) { ray_error_free(t); t = NULL; }
         TEST_ASSERT_NOT_NULL(t);
         ray_enc_counters_reset();
         ray_graph_t* g = ray_graph_new(t);
@@ -1144,6 +1148,10 @@ static test_result_t sr_sel_same(ray_op_t* (*build)(ray_graph_t*)) {
         ray_rowsel_release(blk[0]); ray_rowsel_release(blk[1]);
     }
     PASS();
+}
+static test_result_t sr_sel_same(ray_op_t* (*build)(ray_graph_t*)) {
+    static const char* const dirs[2] = { SR_G0, SR_G2 };
+    return sr_sel_same_at(dirs, build);
 }
 
 static ray_op_t* pred_v_gt(ray_graph_t* g)   { return ray_gt(g, ray_scan(g, "v"), ray_const_i64(g, 100000)); }
@@ -2488,8 +2496,32 @@ static test_result_t test_topk_take_error(void) {
  * materialized, for an integer set, a nullable column under not-in, an F64
  * column and a file-domain SYM set with a literal absent from the domain. */
 static ray_op_t* fpp_v_notin(ray_graph_t* g) {
-    ray_t* set = sr_i64_set(293, 2993);              /* rows 100 and 1000: 1000 is null */
+    /* v = 3*row - 7: 293 and 2993 would be rows 100 and 1000, both null
+     * (row % 10 == 0), so this set matches no row; not-in keeps every
+     * non-null row (the SIMD small-set path) */
+    ray_t* set = sr_i64_set(293, 2993);
     ray_op_t* o = ray_not_in(g, ray_scan(g, "v"), ray_const_vec(g, set)); ray_release(set); return o;
+}
+static ray_op_t* fpp_v_notin_big(ray_graph_t* g) {
+    /* ten needles (the hashed path, past IN_SIMD_SET): rows 1-9 are
+     * non-null members, 293 is a null row's would-be value; not-in must
+     * still drop every null row */
+    ray_t* set = ray_vec_new(RAY_I64, 10); set->len = 10;
+    for (int j = 0; j < 9; j++) ((int64_t*)ray_data(set))[j] = 3 * (j + 1) - 7;
+    ((int64_t*)ray_data(set))[9] = 293;
+    ray_op_t* o = ray_not_in(g, ray_scan(g, "v"), ray_const_vec(g, set)); ray_release(set); return o;
+}
+static ray_op_t* fpp_f_notin(ray_graph_t* g) {
+    ray_t* set = ray_vec_new(RAY_F64, 2); set->len = 2;          /* f = row, null every 13th */
+    ((double*)ray_data(set))[0] = 12.0; ((double*)ray_data(set))[1] = 26.0;   /* 26 is a null row */
+    ray_op_t* o = ray_not_in(g, ray_scan(g, "f"), ray_const_vec(g, set)); ray_release(set); return o;
+}
+static ray_op_t* fpp_w_in(ray_graph_t* g) {                   /* W16 SYM: 300 distinct */
+    ray_t* set = ray_vec_new(RAY_SYM, 3); set->len = 3;
+    ((int64_t*)ray_data(set))[0] = ray_sym_intern("7", 1);
+    ((int64_t*)ray_data(set))[1] = ray_sym_intern("299", 3);
+    ((int64_t*)ray_data(set))[2] = ray_sym_intern("nope", 4);
+    ray_op_t* o = ray_in(g, ray_scan(g, "s"), ray_const_vec(g, set)); ray_release(set); return o;
 }
 static ray_op_t* fpp_f_in(ray_graph_t* g) {
     ray_t* set = ray_vec_new(RAY_F64, 3); set->len = 3;
@@ -2507,8 +2539,16 @@ static test_result_t test_in_selection(void) {
     test_result_t r;
     if ((r = sr_sel_same(fpp_g_in)).status != TEST_PASS) return r;   /* (in g [2 5]) */
     if ((r = sr_sel_same(fpp_v_notin)).status != TEST_PASS) return r;
+    if ((r = sr_sel_same(fpp_v_notin_big)).status != TEST_PASS) return r;
     if ((r = sr_sel_same(fpp_f_in)).status != TEST_PASS) return r;
+    if ((r = sr_sel_same(fpp_f_notin)).status != TEST_PASS) return r;
     if ((r = sr_sel_same(fpp_s_in)).status != TEST_PASS) return r;
+    /* a SYM column of 300 distinct ids is W16: the view's width class */
+    sr_eval_ok("(set W (table [s k] (list (as 'SYM (as 'STR (% (til 70000) 300))) (til 70000))))");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/w0/\" W {compress: false})");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/w2/\" W {compress: true})");
+    static const char* const wdirs[2] = { SR_TMP "/w0/", SR_TMP "/w2/" };
+    if ((r = sr_sel_same_at(wdirs, fpp_w_in)).status != TEST_PASS) return r;
     SR_SAME("(count (select {from: T where: (in s ['a 'e])}))", 0);
     SR_SAME("(count (select {from: T where: (not-in g [0 1 2])}))", 0);
     /* the OP_FILTER IN consult (Task 5) then the fused selection: nothing decoded */

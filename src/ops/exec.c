@@ -712,15 +712,16 @@ static inline int in_set_has_f(const in_worker_ctx_t* c, double v) {
     return 0;
 }
 
-static void exec_in_worker(void* vctx, uint32_t worker_id,
-                           int64_t start, int64_t end) {
-    (void)worker_id;
-    in_worker_ctx_t* c = (in_worker_ctx_t*)vctx;
+/* The worker body, specialized on `rng` (a range-read view in cd, else
+ * the plain column): exec_in_worker instantiates it twice, so the plain
+ * path compiles to loops with no view offset or view null test. */
+RAY_INLINE void exec_in_body(const in_worker_ctx_t* c, int64_t start, int64_t end,
+                             const bool rng) {
     ray_t* col = c->col;
-    const void* cd = c->col_is_atom ? NULL : (c->cd ? c->cd : ray_data(col));
-    int64_t cd_base = c->cd ? c->cd_base : 0;
+    const void* cd = c->col_is_atom ? NULL : (rng ? c->cd : ray_data(col));
+    const int64_t cd_base = rng ? c->cd_base : 0;
     int8_t ct = c->ct;
-    uint8_t cattrs = c->col_is_atom ? 0 : (c->cd ? c->cattrs : col->attrs);
+    uint8_t cattrs = c->col_is_atom ? 0 : (rng ? c->cattrs : col->attrs);
     /* Output index is relative to ob_base so a fused-selection caller can
      * point ob at a morsel-local scratch (ob_base = morsel start) while the
      * column is still read at the absolute row index i: element i writes
@@ -765,7 +766,7 @@ static void exec_in_worker(void* vctx, uint32_t worker_id,
      * the per-element null check is a single ray_vec_is_null call when
      * nulls are present, or eliminated entirely when they are not. */
     bool vec_has_nulls = c->col_has_nulls && !c->col_is_atom;
-    #define IN_IS_NULL(i) (c->cd ? ray_raw_is_null(ct, cattrs, cd, (i) - cd_base) \
+    #define IN_IS_NULL(i) (rng ? ray_raw_is_null(ct, cattrs, cd, (i) - cd_base) \
                                  : ray_vec_is_null(col, (i)))
 
     /* ---- SIMD-friendly fast path -----------------------------------------
@@ -907,6 +908,21 @@ static void exec_in_worker(void* vctx, uint32_t worker_id,
     #undef IN_READ_I64
     #undef IN_READ_F64
     #undef IN_IS_NULL
+}
+
+/* The range-read instance, out of line so the plain instance keeps the
+ * worker's own code layout. */
+static __attribute__((noinline)) void exec_in_worker_rng(const in_worker_ctx_t* c,
+                                                         int64_t start, int64_t end) {
+    exec_in_body(c, start, end, true);
+}
+
+static void exec_in_worker(void* vctx, uint32_t worker_id,
+                           int64_t start, int64_t end) {
+    (void)worker_id;
+    const in_worker_ctx_t* c = (const in_worker_ctx_t*)vctx;
+    if (c->cd) { exec_in_worker_rng(c, start, end); return; }
+    exec_in_body(c, start, end, false);
 }
 
 /* ============================================================================
@@ -1625,7 +1641,12 @@ static void in_sel_fill(void* vctx, ray_col_scratch_t* sc, int64_t start, int64_
  * one range view at a time (a view ends at a generation-2 vector
  * boundary), each through exec_in_worker with cd / cd_base at the view.
  * A failed read is noted keyed by the morsel's first row (a global row:
- * the lowest failure wins) and the rest of the morsel is not-selected. */
+ * the lowest failure wins) and the rest of the morsel is not-selected.
+ * Today a morsel is exactly one generation-2 vector (both RAY_MORSEL_ELEMS =
+ * RAY_ENC_VEC rows, both aligned at row 0), so the loop runs once; it stays
+ * general for a source whose views end inside a morsel: each view is read
+ * at its own offset (cd_base = ob_base = start + at), and the failure key
+ * stays the morsel's first row, the key every view of the morsel shares. */
 typedef struct {
     in_worker_ctx_t* ic;
     ray_col_src_t*   src;
