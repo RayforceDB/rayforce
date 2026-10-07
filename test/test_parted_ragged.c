@@ -461,6 +461,7 @@ static test_result_t test_null_image_shapes(void) {
             memset(ray_data(fill), 0, (size_t)fn * esz);
             if (ty == RAY_I64) for (int64_t i = 0; i < fn; i++) ((int64_t*)ray_data(fill))[i] = NULL_I64;
             if (ty == RAY_F64) for (int64_t i = 0; i < fn; i++) ((double*)ray_data(fill))[i] = NULL_F64;
+            if (ty != RAY_BOOL && fn > 0) fill->attrs |= RAY_ATTR_HAS_NULLS;   /* as the heap fill */
             ray_mem_stats_t m0, m1;
             ray_mem_stats(&m0);
             void* img = NULL; size_t size = 0;
@@ -487,6 +488,121 @@ static test_result_t test_null_image_shapes(void) {
             TEST_ASSERT_EQ_I((int64_t)m1.sys_mapped, (int64_t)m0.sys_mapped);
         }
     }
+    PASS();
+}
+
+/* Whole-file bytes, owned by the caller (ray_free_raw); NULL when unreadable. */
+static uint8_t* file_bytes(const char* path, size_t* n) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    uint8_t* b = len >= 0 ? ray_alloc_raw((size_t)len + 1) : NULL;
+    size_t got = b ? fread(b, 1, (size_t)len, f) : 0;
+    fclose(f);
+    if (!b || got != (size_t)len) { ray_free_raw(b); return NULL; }
+    *n = (size_t)len;
+    return b;
+}
+
+static bool files_equal(const char* x, const char* y) {
+    size_t nx = 0, ny = 0;
+    uint8_t* bx = file_bytes(x, &nx);
+    uint8_t* by = file_bytes(y, &ny);
+    bool eq = bx && by && nx == ny && memcmp(bx, by, nx) == 0;
+    ray_free_raw(bx); ray_free_raw(by);
+    return eq;
+}
+
+/* The lazy segment's image is the file the generation-2 writer writes for
+ * the heap fill it stands for (same header attrs, HAS_NULLS included): the
+ * materialized segment, saved at generation 2, reproduces it byte for byte. */
+static test_result_t test_null_image_is_writer_output(void) {
+    static const int8_t types[] = {
+        RAY_BOOL, RAY_U8, RAY_I16, RAY_I32, RAY_I64, RAY_F32, RAY_F64, RAY_DATE, RAY_TIME,
+        RAY_TIMESTAMP, RAY_STR, RAY_GUID,
+    };
+    static const int64_t lens[] = { 5, 65536, 70000 };
+    for (size_t k = 0; k < sizeof types / sizeof types[0]; k++) {
+        for (size_t li = 0; li < sizeof lens / sizeof lens[0]; li++) {
+            int8_t ty = types[k];
+            int64_t n = lens[li];
+            char root[160], dir[200], img_path[200], out[200];
+            snprintf(root, sizeof root, ray_test_tmp(PR_TMP "/wo_%d_%lld"), (int)ty, (long long)n);
+            for (int p = 0; p < 2; p++) {
+                snprintf(dir, sizeof dir, "%s/2024.01.0%d/t", root, p + 1);
+                ray_t* t = ray_table_new(2);
+                ray_t* a = typed_col(RAY_I64, p == 0 ? 3 : n);
+                t = ray_table_add_col(t, ray_sym_intern("a", 1), a);
+                ray_release(a);
+                if (p == 0) { ray_t* x = typed_col(ty, 3); t = ray_table_add_col(t, ray_sym_intern("x", 1), x); ray_release(x); }
+                TEST_ASSERT_EQ_I(ray_splay_save_mode(t, dir, NULL, RAY_COMPRESS_OFF), RAY_OK);
+                ray_release(t);
+            }
+            ray_t* t = ray_read_parted(root, "t");
+            TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+            ray_t* seg = ray_enccol_seg(ray_table_get_col_enc(t, ray_sym_intern("x", 1)), 1);
+            ray_enccol_t* e = ray_enccol_of(seg);
+            TEST_ASSERT_NOT_NULL(e);
+            snprintf(img_path, sizeof img_path, "%s/image", root);
+            FILE* f = fopen(img_path, "wb");
+            TEST_ASSERT_NOT_NULL(f);
+            TEST_ASSERT_EQ_I((int64_t)fwrite(e->base, 1, (size_t)e->size, f), (int64_t)e->size);
+            fclose(f);
+            ray_t* plain = ray_enccol_materialize(seg);
+            TEST_ASSERT_TRUE(plain && !RAY_IS_ERR(plain));
+            snprintf(out, sizeof out, "%s/writer", root);
+            TEST_ASSERT_EQ_I(ray_col_save_gen(plain, out, 2), RAY_OK);
+            TEST_ASSERT_FMT(files_equal(img_path, out), "type %d len %lld: image is the writer's file",
+                            (int)ty, (long long)n);
+            ray_release(t);
+        }
+    }
+    PASS();
+}
+
+/* A lazy null segment is not an encoded source for generation inheritance:
+ * a table holding it saves, with no compress option over a fresh or
+ * generation-0 destination, as generation 0 byte for byte what the plain
+ * heap fill saves (the 9ca0dee2 eager behaviour); compress true still
+ * writes generation 2. */
+static test_result_t test_lazy_inherits_gen0(void) {
+    TEST_ASSERT_TRUE(write_db(ray_test_tmp(PR_TMP "/inh"), 0, true));
+    ray_t* src = load_db(ray_test_tmp(PR_TMP "/inh"));
+    TEST_ASSERT_NOT_NULL(src);
+    static const char* const cols[] = { "b", "s", "f", "str", "d", "flag" };
+    for (size_t i = 0; i < sizeof cols / sizeof cols[0]; i++) {
+        int64_t id = ray_sym_intern(cols[i], strlen(cols[i]));
+        ray_t* seg = ray_enccol_seg(ray_table_get_col_enc(src, id), 2);
+        TEST_ASSERT_TRUE(seg && seg->type == RAY_ENCCOL);
+        TEST_ASSERT_EQ_I(ray_col_resolve_gen(RAY_COMPRESS_ABSENT, seg, NULL, cols[i], strlen(cols[i])), 0);
+        TEST_ASSERT_TRUE(ray_col_resolve_needs_dest(RAY_COMPRESS_ABSENT, seg));
+        TEST_ASSERT_EQ_I(ray_col_resolve_gen(RAY_COMPRESS_ON, seg, NULL, cols[i], strlen(cols[i])), 2);
+        ray_t* plain = ray_enccol_materialize(seg);
+        TEST_ASSERT_TRUE(plain && !RAY_IS_ERR(plain));
+        for (int mode = 0; mode < 2; mode++) {      /* absent, then compress true */
+            char dl[200], dp[200], fl[260], fp[260];
+            ray_t* tl = ray_table_new(1);
+            tl = ray_table_add_col(tl, id, seg);
+            ray_t* tp = ray_table_new(1);
+            tp = ray_table_add_col(tp, id, plain);
+            snprintf(dl, sizeof dl, ray_test_tmp(PR_TMP "/inh_lazy_%zu_%d"), i, mode);
+            snprintf(dp, sizeof dp, ray_test_tmp(PR_TMP "/inh_plain_%zu_%d"), i, mode);
+            ray_compress_t m = mode ? RAY_COMPRESS_ON : RAY_COMPRESS_ABSENT;
+            char symp[200];
+            snprintf(symp, sizeof symp, "%s/.sym", ray_test_tmp(PR_TMP "/inh"));
+            TEST_ASSERT_EQ_I(ray_splay_save_mode(tl, dl, symp, m), RAY_OK);
+            TEST_ASSERT_EQ_I(ray_splay_save_mode(tp, dp, symp, m), RAY_OK);
+            ray_release(tl); ray_release(tp);
+            snprintf(fl, sizeof fl, "%s/%s", dl, cols[i]);
+            snprintf(fp, sizeof fp, "%s/%s", dp, cols[i]);
+            TEST_ASSERT_FMT(ray_col_file_gen(fl) == (mode ? 2 : 0), "%s mode %d: generation %d", cols[i], mode,
+                            (int)ray_col_file_gen(fl));
+            if (!mode) TEST_ASSERT_FMT(files_equal(fl, fp), "%s: generation 0 bytes equal the heap fill's", cols[i]);
+        }
+    }
+    ray_release(src);
     PASS();
 }
 
@@ -636,6 +752,8 @@ const test_entry_t parted_ragged_entries[] = {
     { "parted_ragged/large",                test_large_ragged,         pr_setup, pr_teardown },
     { "parted_ragged/short_column_refused", test_short_column_refused, pr_setup, pr_teardown },
     { "parted_ragged/null_image_shapes",    test_null_image_shapes,    pr_setup, pr_teardown },
+    { "parted_ragged/null_image_writer",    test_null_image_is_writer_output, pr_setup, pr_teardown },
+    { "parted_ragged/lazy_inherits_gen0",   test_lazy_inherits_gen0,   pr_setup, pr_teardown },
     { "parted_ragged/lazy_open",            test_lazy_open,            pr_setup, pr_teardown },
     { "parted_ragged/lazy_save",            test_lazy_save,            pr_setup, pr_teardown },
     { NULL, NULL, NULL, NULL },

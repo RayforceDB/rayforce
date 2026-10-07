@@ -335,13 +335,16 @@ ray_err_t ray_col_resolve_gen_err(ray_compress_t mode, ray_t* src, const char* c
     if (!colw_src_gen2_ok(src) || mode == RAY_COMPRESS_OFF) return RAY_OK;
     *gen = 2;
     if (mode == RAY_COMPRESS_ON || atomic_load(&g_force_compress)) return RAY_OK;
-    if (src->type == RAY_ENCCOL) return RAY_OK;            /* the slot still holds an encoded column */
+    /* the slot still holds a column saved encoded (a synthetic stand-in,
+     * e.g. a ragged partition's absent column, inherits like a plain one) */
+    if (src->type == RAY_ENCCOL && !ray_enccol_is_synthetic(src)) return RAY_OK;
     return colw_dest_gen(cur, name, nlen, gen);            /* the destination already stores it as 2 */
 }
 
 bool ray_col_resolve_needs_dest(ray_compress_t mode, ray_t* src) {
     return mode == RAY_COMPRESS_ABSENT && colw_src_gen2_ok(src) &&
-           !atomic_load(&g_force_compress) && src->type != RAY_ENCCOL;
+           !atomic_load(&g_force_compress) &&
+           (src->type != RAY_ENCCOL || ray_enccol_is_synthetic(src));
 }
 
 bool ray_col_resolve_type_needs_dest(ray_compress_t mode, int8_t type) {

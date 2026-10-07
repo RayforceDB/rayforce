@@ -1075,6 +1075,22 @@ bool ray_enccol_is_parted(ray_t* encv) {
     return e && e->kind == RAY_ENCCOL_PARTED;
 }
 
+void ray_enccol_set_synthetic(ray_t* encv) {
+    ray_enccol_t* e = ray_enccol_of(encv);
+    if (e && e->kind == RAY_ENCCOL_SINGLE) e->synthetic = true;
+}
+
+bool ray_enccol_is_synthetic(ray_t* encv) {
+    ray_enccol_t* e = ray_enccol_of(encv);
+    if (!e) return false;
+    if (e->kind == RAY_ENCCOL_SINGLE) return e->synthetic;
+    if (!e->wrapper) return false;
+    ray_t** segs = (ray_t**)ray_data(e->wrapper);
+    for (int64_t i = 0; i < e->wrapper->len; i++)
+        if (segs[i] && segs[i]->type == RAY_ENCCOL && !ray_enccol_is_synthetic(segs[i])) return false;
+    return true;
+}
+
 ray_t* ray_enccol_parted_new(ray_t* wrapper) {
     if (!wrapper || RAY_IS_ERR(wrapper) || !RAY_IS_PARTED(wrapper->type))
         return ray_error("type", "parted encoded column needs a parted wrapper");

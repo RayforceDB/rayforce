@@ -52,6 +52,8 @@ typedef struct ray_enccol_s {
     uint32_t        sym_bound;      /* SYM: every id is below this */
     struct ray_sym_domain_s* dom;   /* SYM: the domain ids resolve over (retained unless runtime) */
     bool            dom_owned;
+    bool            synthetic;      /* an in-memory stand-in (a ragged partition's absent
+                                     * column), not data saved encoded */
     char            path[1024];
     uint64_t        vdict_off, vdict_len;  /* VALUE_DICT entry (file offset, bytes); 0 when absent */
     ray_enc_once_t  dict_once;      /* VALUE_DICT validation (Task 7) */
@@ -137,6 +139,12 @@ ray_t* ray_enccol_seg(ray_t* encv, int64_t i);
  * or an owned error. */
 ray_t* ray_enccol_seg_col(ray_t* encv, int64_t i);
 bool   ray_enccol_is_parted(ray_t* encv);
+/* A synthetic column stands in for data that was never saved encoded (a
+ * ragged partition's absent column, ray_read_parted): generation
+ * inheritance treats it as plain.  Parted: every encoded segment is
+ * synthetic. */
+void   ray_enccol_set_synthetic(ray_t* encv);
+bool   ray_enccol_is_synthetic(ray_t* encv);
 
 void ray_enccol_meta(ray_t* encv, ray_col_meta_t* m);
 /* Could materialization attach an index (recorded kind, UNIQUE, or for STR

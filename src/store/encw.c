@@ -488,14 +488,19 @@ ray_err_t ray_encw_finish(ray_encw_t* w) {
 /* An all-null column image (spec "Nulls": every vector CONST of the fill,
  * statistics absent; the non-nullable BOOL / U8 read 0, with statistics).
  * Every full chunk has the same body, so two bodies are encoded (a full
- * chunk and the last) and the full one is copied: the image is about
- * n_chunks x (64 B entry + one chunk body), e.g. 11.5 KiB per 65536 rows of
- * I64 (descriptors plus a bitmap and a CONST per vector), 3.5 KiB for STR.
- * `fill` holds min(len, 65536) null cells of `type` in its generation-0
- * width (SYM: `attrs` width).  The outer header carries HAS_NULLS for every
- * nullable type, in-band text nulls included: every row is a null.  The
- * image lives in a ray_vm_map_anon mapping returned in *out (released by
- * ray_vm_unmap_file, e.g. by ray_enccol_open on failure or its release). */
+ * chunk and the last) and the full one is copied (the format keeps chunks
+ * contiguous, so bodies cannot be shared): the image is about n_chunks x
+ * (64 B entry + one chunk body), 11.5 KiB per 65536 rows of I64 (descriptors
+ * plus a 128 B bitmap and a CONST per vector; ~18 MB per 100M rows) and
+ * 3.5 KiB for STR.  `fill` holds min(len, 65536) null cells of `type` in its
+ * generation-0 width (SYM: `attrs` width) with `attrs` as the heap fill
+ * carries them.  Headers follow ray_encw_finish exactly (persisted attrs of
+ * the source, HAS_NULLS added for bitmap nulls), so the image is byte for
+ * byte the file the generation-2 writer writes for the `len`-row heap fill:
+ * HAS_NULLS on SYM / STR / GUID comes from the fill's attrs, as it would
+ * when that vector is saved.  The image lives in a ray_vm_map_anon mapping
+ * returned in *out (released by ray_vm_unmap_file, e.g. by ray_enccol_open
+ * on failure or its release). */
 ray_err_t ray_encw_null_image(int8_t type, uint8_t attrs, int64_t len, uint32_t sym_count,
                               const void* fill, void** out, size_t* out_size) {
     *out = NULL; *out_size = 0;
@@ -539,7 +544,7 @@ ray_err_t ray_encw_null_image(int8_t type, uint8_t attrs, int64_t len, uint32_t 
     w.pos = size;
     ray_enc_hdr_t eh;
     ray_t hdr;
-    encw_headers(&w, 0, 0, len > 0 && type != RAY_BOOL && type != RAY_U8, &hdr, &eh);
+    encw_headers(&w, 0, 0, w.any_bitmap_null, &hdr, &eh);   /* ray_encw_finish's rule */
     memcpy(img, &hdr, 32);
     memcpy(img + RAY_ENC_HDR_OFF, &eh, sizeof eh);
     *out = img; *out_size = (size_t)size;

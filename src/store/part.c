@@ -324,13 +324,17 @@ static ray_t* missing_seg_fill(int8_t type, int64_t rows, struct ray_sym_domain_
  * Every type generation 2 stores gets a lazy all-null segment: a
  * generation-2 RAY_ENCCOL over an in-memory image (ray_encw_null_image, an
  * anonymous mapping the enccol owns and unmaps), so opening costs about
- * n_chunks x (64 B + one chunk body) — 11.5 KiB per 65536 rows of I64, e.g.
- * 18 MB for 100M rows where a heap fill held 800 MB — and the rows decode
- * only when a query reads them, like any encoded segment (its directory
- * answers null presence without a decode).  Its materialization is
- * missing_seg_fill's value: the same nulls, HAS_NULLS on every nullable
- * type, SYM over `dom`.  The image is never a file: a save re-encodes it
- * through the writers, as any encoded source.  LIST (and every type on a
+ * n_chunks x (64 B + one chunk body) of mapped memory — 11.5 KiB per 65536
+ * rows of I64, ~18 MB per 100M rows where a heap fill held 800 MB — and the
+ * rows decode only when a query reads them, like any encoded segment (its
+ * directory answers null presence without a decode).  The image is the file
+ * the generation-2 writer writes for missing_seg_fill's vector, so its
+ * materialization is that vector: the same nulls and attrs (HAS_NULLS on
+ * every nullable type), SYM over `dom`.  The segment is marked synthetic:
+ * generation inheritance treats it as the plain fill it stands for (a save
+ * without a compress option over a generation-0 or fresh destination writes
+ * generation 0, as the heap fill did).  The image is never a file: a save
+ * re-encodes it through the writers.  LIST (and every type on a
  * host without generation 2) keeps the heap fill: rows x element size,
  * held for the table's lifetime.  `what` names the segment in errors.
  * -------------------------------------------------------------------------- */
@@ -343,7 +347,9 @@ static ray_t* missing_seg(int8_t type, int64_t rows, struct ray_sym_domain_s* do
     ray_err_t e = ray_encw_null_image(type, fill->attrs, rows, 0, ray_data(fill), &img, &size);
     ray_release(fill);
     if (e != RAY_OK) return ray_error(ray_err_code_str(e), "%s: null segment", what);
-    return ray_enccol_open(img, size, what, type == RAY_SYM ? dom : NULL, false);
+    ray_t* v = ray_enccol_open(img, size, what, type == RAY_SYM ? dom : NULL, false);
+    if (v && !RAY_IS_ERR(v)) ray_enccol_set_synthetic(v);   /* inherits as plain (colwrite.c) */
+    return v;
 }
 
 /* --------------------------------------------------------------------------
