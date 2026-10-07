@@ -27,10 +27,10 @@
 #include <rayforce.h>
 #include <stdatomic.h>
 #include "store/enc_once.h"
-#include "store/enccol.h"   /* ray_enc_chunk_stat_t */
 #include "ops/ops.h"   /* RAY_DISPATCH_MORSELS, RAY_MORSEL_ELEMS: the pool's task grain */
 
 struct ray_sym_domain_s;
+struct ray_enc_chunk_stat_s;   /* store/enccol.h */
 
 /* A bound column source: the object a scan reads ranges of.  Binding
  * retains the object (and a non-runtime SYM domain) and never decodes.
@@ -134,11 +134,15 @@ uint8_t ray_col_src_esz(const ray_col_src_t* s);
 
 /* Chunk c's statistics when the source is a single-file generation-2
  * column; false otherwise (plain, parted, slice). */
-bool ray_col_src_chunk_stat(const ray_col_src_t* s, int64_t c, ray_enc_chunk_stat_t* out);
+bool ray_col_src_chunk_stat(const ray_col_src_t* s, int64_t c, struct ray_enc_chunk_stat_s* out);
 /* One sequential read-ahead hint for rows [lo, hi): plain mmapped
  * columns hint their element bytes, generation 2 the chunk bytes from the
  * directory, parted sources each touched segment; heap vectors nothing. */
 void ray_col_src_advise(const ray_col_src_t* s, int64_t lo, int64_t hi);
+/* Test hook: the spans ray_col_src_advise would hint (page-aligned start,
+ * bytes), the first `cap` stored; returns how many there are. */
+int  ray_col_src_test_advise_spans(const ray_col_src_t* s, int64_t lo, int64_t hi,
+                                   uintptr_t* start, size_t* len, int cap);
 
 /* One source in one task: P1's scratch plus the current view. */
 typedef struct {

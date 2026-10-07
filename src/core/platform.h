@@ -158,6 +158,9 @@ void  ray_vm_unmap_file(void* ptr, size_t size);
 /* Zeroed writable memory released by ray_vm_unmap_file (a generated file image). */
 void* ray_vm_map_anon(size_t size);
 void  ray_vm_advise_seq(void* ptr, size_t size);
+/* The host page size (sysconf / GetSystemInfo, read once; 4096 when the host
+ * does not say): what a madvise start must be aligned to. */
+size_t ray_vm_page_size(void);
 void  ray_vm_release(void* ptr, size_t size);
 /* Release physical pages for a free block.  When hugepage is true, only the
  * 2MB-aligned interior is released so a partial MADV_DONTNEED does not

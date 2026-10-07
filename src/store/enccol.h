@@ -147,7 +147,7 @@ void   ray_enccol_set_synthetic(ray_t* encv);
 bool   ray_enccol_is_synthetic(ray_t* encv);
 
 /* One chunk's directory statistics. */
-typedef struct {
+typedef struct ray_enc_chunk_stat_s {
     int64_t  rows;           /* rows in the chunk */
     int64_t  min, max;       /* logical_T values (float types: the double's bits); valid when has_minmax */
     bool     has_minmax;     /* directory flag bit 0 clear */
@@ -159,7 +159,9 @@ typedef struct {
  * load, so this cannot fail.  c must be below e->n_chunks. */
 void ray_enccol_chunk_stat(const ray_enccol_t* e, int64_t c, ray_enc_chunk_stat_t* out);
 /* File byte range holding rows [lo, hi): from the first touched chunk's
- * descriptors to the end of the last touched chunk.  lo < hi. */
+ * descriptors to the end of the last touched chunk.  Precondition:
+ * 0 <= lo < hi <= e->len (a row past the end would read a directory entry
+ * past the last chunk). */
 void ray_enccol_byte_range(const ray_enccol_t* e, int64_t lo, int64_t hi,
                            uint64_t* off, uint64_t* len);
 

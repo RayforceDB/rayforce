@@ -125,6 +125,17 @@ void ray_vm_advise_seq(void* ptr, size_t size) {
     if (ptr) madvise(ptr, size, MADV_SEQUENTIAL);
 }
 
+size_t ray_vm_page_size(void) {
+    static size_t pg = 0;                    /* every thread computes the same value */
+    size_t v = __atomic_load_n(&pg, __ATOMIC_RELAXED);
+    if (v == 0) {
+        long ps = sysconf(_SC_PAGESIZE);
+        v = (ps > 0) ? (size_t)ps : 4096;
+        __atomic_store_n(&pg, v, __ATOMIC_RELAXED);
+    }
+    return v;
+}
+
 void ray_vm_release(void* ptr, size_t size) {
     if (!ptr) return;
 #if defined(RAY_OS_MACOS)
@@ -150,11 +161,7 @@ void ray_vm_release_block(void* blk, size_t bsize, bool hugepage) {
          * read back as zero and the next GC freelist walk crashed on a
          * NULL link (issue #240).  Rounding inward to page-aligned bounds
          * makes the kernel's own rounding a no-op on every platform. */
-        static size_t pg = 0;
-        if (pg == 0) {
-            long ps = sysconf(_SC_PAGESIZE);
-            pg = (ps > 0) ? (size_t)ps : 4096;
-        }
+        size_t pg = ray_vm_page_size();
         uintptr_t s = ((uintptr_t)blk + 32 + (pg - 1)) & ~(uintptr_t)(pg - 1);
         uintptr_t e = ((uintptr_t)blk + bsize) & ~(uintptr_t)(pg - 1);
         if (e > s) ray_vm_release((void*)s, e - s);
@@ -675,6 +682,12 @@ void ray_vm_advise_seq(void* ptr, size_t size) {
     PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0);
 }
 
+size_t ray_vm_page_size(void) {
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return si.dwPageSize ? (size_t)si.dwPageSize : 4096;
+}
+
 void ray_vm_release(void* ptr, size_t size) {
     if (!ptr) return;
     /* DiscardVirtualMemory (Win8.1+) or fallback to decommit+recommit */
@@ -902,6 +915,10 @@ void* ray_vm_map_anon(size_t size) {
 
 /* madvise hints are advisory and have no analog on WASM — no-ops. */
 void ray_vm_advise_seq(void* ptr, size_t size)      { (void)ptr; (void)size; }
+size_t ray_vm_page_size(void) {
+    long ps = sysconf(_SC_PAGESIZE);
+    return (ps > 0) ? (size_t)ps : 4096;
+}
 void ray_vm_release(void* ptr, size_t size)         { (void)ptr; (void)size; }
 
 void ray_vm_release_block(void* blk, size_t bsize, bool hugepage) {

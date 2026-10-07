@@ -817,6 +817,246 @@ static test_result_t test_byte_range_from_directory(void) {
     PASS();
 }
 
+/* ---- Task 2 fix round 1: statistics on nulls, wide sums, floats; exact
+ * byte ranges; the advise spans themselves ---- */
+
+/* 128-bit accumulate of a sign-extended int64 (manual carry). */
+static void sr_add128(uint64_t* lo, int64_t* hi, int64_t x) {
+    uint64_t n = *lo + (uint64_t)x;
+    *hi += (x < 0 ? -1 : 0) + (n < *lo ? 1 : 0);
+    *lo = n;
+}
+
+/* Chunk 1 of an I32 column is entirely null: no min/max, every row null. */
+static test_result_t test_chunk_stat_all_null(void) {
+    int64_t n = 2 * 65536 + 10;
+    ray_t* v = sr_i32(n, 0);
+    for (int64_t i = 65536; i < 2 * 65536; i++) ((int32_t*)ray_data(v))[i] = NULL_I32;
+    v->attrs |= RAY_ATTR_HAS_NULLS;
+    ray_t* c = sr_gen2(v, "an");
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+    ray_col_src_t s; TEST_ASSERT_NULL(ray_col_src_bind(c, &s));
+    ray_enc_chunk_stat_t st;
+    TEST_ASSERT_TRUE(ray_col_src_chunk_stat(&s, 1, &st));
+    TEST_ASSERT_EQ_I(st.rows, 65536);
+    TEST_ASSERT_FALSE(st.has_minmax);
+    TEST_ASSERT_EQ_U(st.null_count, 65536);
+    TEST_ASSERT_EQ_I(st.min, 0); TEST_ASSERT_EQ_I(st.max, 0);
+    TEST_ASSERT_TRUE(ray_col_src_chunk_stat(&s, 0, &st));            /* its neighbours keep theirs */
+    TEST_ASSERT_TRUE(st.has_minmax);
+    TEST_ASSERT_EQ_U(st.null_count, 0);
+    TEST_ASSERT_TRUE(ray_col_src_chunk_stat(&s, 2, &st));
+    TEST_ASSERT_TRUE(st.has_minmax);
+    TEST_ASSERT_EQ_I(st.rows, 10);
+    ray_col_src_release(&s); ray_release(c); ray_release(v);
+    PASS();
+}
+
+/* I64 sums wider than 64 bits: chunk 0 near INT64_MAX (sum_hi > 0), chunk
+ * 1 near -INT64_MAX (sum_hi far below -1), chunk 2 small negatives
+ * (sum_hi == -1), chunk 3 a partial mix with nulls; against a 128-bit
+ * reference. */
+static test_result_t test_chunk_stat_wide_sums(void) {
+    int64_t n = 3 * 65536 + 300;
+    ray_t* v = ray_vec_new(RAY_I64, n); v->len = n;
+    int64_t* d = (int64_t*)ray_data(v);
+    for (int64_t i = 0; i < n; i++) {
+        int64_t ch = i / 65536, j = i % 65536;
+        d[i] = ch == 0 ? INT64_MAX - j : ch == 1 ? -INT64_MAX + j : ch == 2 ? -1 - j
+             : (j % 3 == 0 ? NULL_I64 : INT64_MAX - 7 * j);
+    }
+    v->attrs |= RAY_ATTR_HAS_NULLS;
+    ray_t* c = sr_gen2(v, "ws");
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+    ray_col_src_t s; TEST_ASSERT_NULL(ray_col_src_bind(c, &s));
+    int64_t want_hi_sign[4] = { 1, -2, -1, 1 };     /* > 0, < -1, == -1, > 0 */
+    for (int64_t ch = 0; ch < 4; ch++) {
+        int64_t lo = ch * 65536, hi = lo + 65536 < n ? lo + 65536 : n;
+        uint64_t slo = 0; int64_t shi = 0; uint32_t nn = 0;
+        int64_t mn = INT64_MAX, mx = INT64_MIN;
+        for (int64_t i = lo; i < hi; i++) {
+            if (d[i] == NULL_I64) { nn++; continue; }
+            sr_add128(&slo, &shi, d[i]);
+            if (d[i] < mn) mn = d[i];
+            if (d[i] > mx) mx = d[i];
+        }
+        ray_enc_chunk_stat_t st;
+        TEST_ASSERT_TRUE(ray_col_src_chunk_stat(&s, ch, &st));
+        TEST_ASSERT_EQ_I(st.rows, hi - lo);
+        TEST_ASSERT_TRUE(st.has_minmax);
+        TEST_ASSERT_EQ_I(st.min, mn); TEST_ASSERT_EQ_I(st.max, mx);
+        TEST_ASSERT_EQ_U(st.null_count, nn);
+        TEST_ASSERT_EQ_U(st.sum_lo, slo);
+        TEST_ASSERT_EQ_I(st.sum_hi, shi);
+        if (want_hi_sign[ch] == 1)  TEST_ASSERT_TRUE(st.sum_hi > 0);
+        if (want_hi_sign[ch] == -2) TEST_ASSERT_TRUE(st.sum_hi < -1);
+        if (want_hi_sign[ch] == -1) TEST_ASSERT_EQ_I(st.sum_hi, -1);
+    }
+    ray_col_src_release(&s); ray_release(c); ray_release(v);
+    PASS();
+}
+
+/* F64: min and max carry the doubles' bits. */
+static test_result_t test_chunk_stat_f64(void) {
+    int64_t n = 2 * 65536 + 77;
+    ray_t* v = sr_f64(n, 9);
+    double* d = (double*)ray_data(v);
+    for (int64_t i = 65536; i < n; i++) if (i % 9) d[i] = -d[i] * 1.5;   /* negatives in chunks 1, 2 */
+    ray_t* c = sr_gen2(v, "fs");
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+    ray_col_src_t s; TEST_ASSERT_NULL(ray_col_src_bind(c, &s));
+    for (int64_t ch = 0; ch < 3; ch++) {
+        int64_t lo = ch * 65536, hi = lo + 65536 < n ? lo + 65536 : n;
+        double mn = 0, mx = 0; bool have = false; uint32_t nn = 0;
+        for (int64_t i = lo; i < hi; i++) {
+            if (d[i] != d[i]) { nn++; continue; }
+            if (!have || d[i] < mn) mn = d[i];
+            if (!have || d[i] > mx) mx = d[i];
+            have = true;
+        }
+        ray_enc_chunk_stat_t st;
+        TEST_ASSERT_TRUE(ray_col_src_chunk_stat(&s, ch, &st));
+        TEST_ASSERT_EQ_I(st.rows, hi - lo);
+        TEST_ASSERT_TRUE(st.has_minmax);
+        TEST_ASSERT_EQ_U(st.null_count, nn);
+        double smn, smx;
+        memcpy(&smn, &st.min, sizeof smn); memcpy(&smx, &st.max, sizeof smx);
+        TEST_ASSERT_FMT(smn == mn && smx == mx, "chunk %lld: [%g, %g] want [%g, %g]",
+                        (long long)ch, smn, smx, mn, mx);
+    }
+    ray_col_src_release(&s); ray_release(c); ray_release(v);
+    PASS();
+}
+
+static void sr_dirent(const ray_enccol_t* e, int64_t c, ray_enc_dirent_t* d) {
+    memcpy(d, e->base + RAY_ENC_DIR_OFF + (size_t)c * sizeof *d, sizeof *d);
+}
+
+/* Exact byte ranges over a column with a partial last chunk. */
+static test_result_t test_byte_range_edges(void) {
+    int64_t n = 3 * 65536 + 100;
+    ray_t* v = sr_i32(n, 13);
+    ray_t* c = sr_gen2(v, "be");
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+    ray_enccol_t* e = ray_enccol_of(c);
+    TEST_ASSERT_EQ_I(e->n_chunks, 4);
+    ray_enc_dirent_t d[4];
+    for (int k = 0; k < 4; k++) sr_dirent(e, k, &d[k]);
+    static const struct { int64_t lo, hi; int c0, c1; } cases[] = {
+        { 3 * 65536 + 99, 3 * 65536 + 100, 3, 3 },      /* [n-1, n) */
+        { 0,              3 * 65536 + 100, 0, 3 },      /* [0, n) */
+        { 0,              10,              0, 0 },      /* starts at chunk 0 */
+        { 0,              65537,           0, 1 },      /* chunk 0 into chunk 1 */
+        { 3 * 65536 + 50, 3 * 65536 + 51,  3, 3 },      /* one row of the partial last chunk */
+        { 65535,          65536,           0, 0 },      /* the last row of chunk 0 */
+    };
+    for (size_t k = 0; k < sizeof cases / sizeof cases[0]; k++) {
+        uint64_t off, len;
+        ray_enccol_byte_range(e, cases[k].lo, cases[k].hi, &off, &len);
+        TEST_ASSERT_EQ_U(off, d[cases[k].c0].offset);
+        TEST_ASSERT_EQ_U(len, d[cases[k].c1].offset + d[cases[k].c1].bytes - d[cases[k].c0].offset);
+    }
+    ray_release(c); ray_release(v);
+    PASS();
+}
+
+/* The advise spans: page-aligned start (host page size, at most a page
+ * before the requested bytes), inside the mapping, ending exactly where
+ * the requested bytes end. */
+#define SR_SPANS 8
+typedef struct { uintptr_t a[SR_SPANS]; size_t l[SR_SPANS]; } sr_spans_t;
+static int sr_spans(const ray_col_src_t* s, int64_t lo, int64_t hi, sr_spans_t* o) {
+    return ray_col_src_test_advise_spans(s, lo, hi, o->a, o->l, SR_SPANS);
+}
+static bool sr_span_ok(uintptr_t a, size_t l, uintptr_t map_lo, uintptr_t map_hi,
+                       uintptr_t want_lo, uintptr_t want_hi) {
+    size_t pg = ray_vm_page_size();
+    return pg >= 4096 && (pg & (pg - 1)) == 0 && a % pg == 0 && a >= map_lo && a + l <= map_hi
+           && a <= want_lo && a + l == want_hi && want_lo - a < pg;      /* ends exactly at the bytes */
+}
+static test_result_t test_advise_spans(void) {
+    int64_t n = 3 * 65536 + 100;
+    ray_t* v = sr_i32(n, 0);
+    /* Generation 2: a partial range inside chunks 1-2, the partial last chunk. */
+    ray_t* c = sr_gen2(v, "as");
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+    ray_enccol_t* e = ray_enccol_of(c);
+    ray_enc_dirent_t d1, d2, d3;
+    sr_dirent(e, 1, &d1); sr_dirent(e, 2, &d2); sr_dirent(e, 3, &d3);
+    uintptr_t b = (uintptr_t)e->base, bend = b + e->size;
+    ray_col_src_t s; TEST_ASSERT_NULL(ray_col_src_bind(c, &s));
+    sr_spans_t sp;
+    TEST_ASSERT_EQ_I(sr_spans(&s, 65536 + 5, 2 * 65536 + 10, &sp), 1);
+    TEST_ASSERT_TRUE(sr_span_ok(sp.a[0], sp.l[0], b, bend, b + d1.offset, b + d2.offset + d2.bytes));
+    TEST_ASSERT_EQ_I(sr_spans(&s, n - 1, n, &sp), 1);
+    TEST_ASSERT_TRUE(sr_span_ok(sp.a[0], sp.l[0], b, bend, b + d3.offset, b + d3.offset + d3.bytes));
+    TEST_ASSERT_EQ_I(sr_spans(&s, n - 1, n + 1000, &sp), 1);           /* clamped at the source end */
+    TEST_ASSERT_EQ_I(sr_spans(&s, 9, 9, &sp), 0);                      /* empty */
+    ray_col_src_release(&s);
+    /* Generation 0: a slice of a mapped column. */
+    char p0[512]; snprintf(p0, sizeof p0, "%s/as0", sr_root());
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, p0, 0), RAY_OK);
+    ray_t* m = ray_col_mmap(p0);
+    TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m));
+    if (m->mmod == 1) {                                                 /* mapped (not an equivalence pass) */
+        ray_t* sl = ray_vec_slice(m, 1000, 70000);
+        TEST_ASSERT_TRUE(sl && !RAY_IS_ERR(sl));
+        ray_col_src_t ss; TEST_ASSERT_NULL(ray_col_src_bind(sl, &ss));
+        uintptr_t mb = (uintptr_t)m, md = (uintptr_t)ray_data(m), mend = md + (uintptr_t)n * 4;
+        TEST_ASSERT_EQ_I(sr_spans(&ss, 5, 60000, &sp), 1);
+        TEST_ASSERT_TRUE(sr_span_ok(sp.a[0], sp.l[0], mb, mend, md + 1005 * 4, md + 61000 * 4));
+        ray_col_src_release(&ss); ray_release(sl);
+    }
+    ray_col_src_t sh; TEST_ASSERT_NULL(ray_col_src_bind(v, &sh));     /* heap: no span */
+    TEST_ASSERT_EQ_I(sr_spans(&sh, 0, n, &sp), 0);
+    ray_col_src_release(&sh);
+    /* Parted: a mapped generation-0 segment, a generation-2 segment, a heap
+     * segment, a second mapping of segment 0's file; [500, 2500) touches the
+     * tail of 0, all of 1, the head of 2. */
+    ray_t* s0v = sr_i32(1000, 0); ray_t* s1v = sr_i32(1000, 0);
+    char q0[512], q1[512];
+    snprintf(q0, sizeof q0, "%s/asp0", sr_root()); snprintf(q1, sizeof q1, "%s/asp1", sr_root());
+    TEST_ASSERT_EQ_I(ray_col_save_gen(s0v, q0, 0), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(s1v, q1, 2), RAY_OK);
+    ray_t* g0 = ray_col_mmap(q0); ray_t* g1 = ray_col_mmap(q1); ray_t* g3 = ray_col_mmap(q0);
+    TEST_ASSERT_TRUE(g0 && !RAY_IS_ERR(g0) && g1 && !RAY_IS_ERR(g1) && g1->type == RAY_ENCCOL);
+    TEST_ASSERT_TRUE(g3 && !RAY_IS_ERR(g3));
+    ray_t* w = ray_alloc(4 * sizeof(ray_t*));
+    w->type = RAY_PARTED_BASE + RAY_I32; w->len = 4;
+    ((ray_t**)ray_data(w))[0] = g0; ((ray_t**)ray_data(w))[1] = g1; ((ray_t**)ray_data(w))[2] = s0v;
+    ((ray_t**)ray_data(w))[3] = g3;
+    ray_retain(s0v);
+    ray_t* ep = ray_enccol_parted_new(w);
+    TEST_ASSERT_TRUE(ep && !RAY_IS_ERR(ep));
+    ray_col_src_t sp3; TEST_ASSERT_NULL(ray_col_src_bind(ep, &sp3));
+    ray_enccol_t* e1 = ray_enccol_of(g1);
+    ray_enc_dirent_t f0; sr_dirent(e1, 0, &f0);
+    int ns = sr_spans(&sp3, 500, 2500, &sp);
+    int want = g0->mmod == 1 ? 2 : 1;
+    TEST_ASSERT_EQ_I(ns, want);
+    int k = 0;
+    if (g0->mmod == 1) {
+        uintptr_t gd = (uintptr_t)ray_data(g0);
+        TEST_ASSERT_TRUE(sr_span_ok(sp.a[0], sp.l[0], (uintptr_t)g0, gd + 4000, gd + 2000, gd + 4000));
+        k = 1;
+    }
+    uintptr_t b1 = (uintptr_t)e1->base;
+    TEST_ASSERT_TRUE(sr_span_ok(sp.a[k], sp.l[k], b1, b1 + e1->size, b1 + f0.offset, b1 + f0.offset + f0.bytes));
+    if (g0->mmod == 1) {                                                /* ends inside segment 0 */
+        uintptr_t gd = (uintptr_t)ray_data(g0);
+        TEST_ASSERT_EQ_I(sr_spans(&sp3, 100, 600, &sp), 1);
+        TEST_ASSERT_TRUE(sr_span_ok(sp.a[0], sp.l[0], (uintptr_t)g0, gd + 4000, gd + 400, gd + 2400));
+        uintptr_t g3d = (uintptr_t)ray_data(g3);                       /* rows local to segment 3 */
+        TEST_ASSERT_EQ_I(sr_spans(&sp3, 3200, 3600, &sp), 1);
+        TEST_ASSERT_TRUE(sr_span_ok(sp.a[0], sp.l[0], (uintptr_t)g3, g3d + 4000, g3d + 800, g3d + 2400));
+    }
+    ray_col_src_advise(&sp3, 0, 4000);                                  /* the real hint: no fault */
+    ray_col_src_release(&sp3);
+    ray_release(ep); ray_release(w); ray_release(s1v); ray_release(s0v);
+    ray_release(m); ray_release(c); ray_release(v);
+    PASS();
+}
+
 const test_entry_t scanrange_entries[] = {
     { "scanrange/walk_gen0_zero_copy",     test_walk_gen0_zero_copy,     sr_setup,    sr_teardown },
     { "scanrange/walk_gen2_vectors",       test_walk_gen2_vectors,       sr_setup,    sr_teardown },
@@ -841,5 +1081,10 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/walk_contig_views",       test_walk_contig_views,       sr_setup,    sr_teardown },
     { "scanrange/chunk_stat_matches_data",   test_chunk_stat_matches_data,   sr_setup, sr_teardown },
     { "scanrange/byte_range_from_directory", test_byte_range_from_directory, sr_setup, sr_teardown },
+    { "scanrange/chunk_stat_all_null",       test_chunk_stat_all_null,       sr_setup, sr_teardown },
+    { "scanrange/chunk_stat_wide_sums",      test_chunk_stat_wide_sums,      sr_setup, sr_teardown },
+    { "scanrange/chunk_stat_f64",            test_chunk_stat_f64,            sr_setup, sr_teardown },
+    { "scanrange/byte_range_edges",          test_byte_range_edges,          sr_setup, sr_teardown },
+    { "scanrange/advise_spans",              test_advise_spans,              sr_setup, sr_teardown },
     { NULL, NULL, NULL, NULL },
 };

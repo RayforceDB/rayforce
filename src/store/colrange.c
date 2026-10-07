@@ -487,7 +487,7 @@ ray_t* ray_scan_fail_finish(ray_scan_fail_t* f, ray_pool_t* pool) {
 
 /* ---- Directory statistics and read-ahead ---- */
 
-bool ray_col_src_chunk_stat(const ray_col_src_t* s, int64_t c, ray_enc_chunk_stat_t* out) {
+bool ray_col_src_chunk_stat(const ray_col_src_t* s, int64_t c, struct ray_enc_chunk_stat_s* out) {
     if (!ray_col_src_encoded(s)) return false;
     ray_enccol_t* e = ray_enccol_of(s->obj);
     if (e->kind != RAY_ENCCOL_SINGLE || c < 0 || c >= e->n_chunks) return false;
@@ -495,20 +495,29 @@ bool ray_col_src_chunk_stat(const ray_col_src_t* s, int64_t c, ray_enc_chunk_sta
     return true;
 }
 
-#define ADVISE_PAGE ((uintptr_t)4096)   /* madvise needs a page-aligned start */
+/* One read-ahead span: page-aligned start, bytes. */
+typedef void (*advise_emit_fn)(void* ctx, uintptr_t start, size_t len);
 
-/* Rows [lo, hi) of obj, within its rows.  Every mapping starts on a page
- * boundary (mmap), so rounding the start down stays inside it.  A synthetic
- * segment lives in an anonymous mapping: the hint is harmless there. */
-static void advise_obj(ray_t* obj, int64_t lo, int64_t hi) {
+/* Round p down to the host page.  Every mapping starts on a page boundary
+ * (mmap), so the rounded start stays inside it. */
+static uintptr_t page_down(uintptr_t p) {
+    return p & ~(uintptr_t)(ray_vm_page_size() - 1);
+}
+
+/* The spans of rows [lo, hi) of obj (within its rows), one per touched
+ * mapping: a generation-2 column's chunk bytes from its directory, a plain
+ * mapped column's element bytes, each touched segment of a parted one; a
+ * heap vector has none.  A synthetic segment lives in an anonymous mapping:
+ * its span is as harmless a hint as a file's. */
+static void advise_spans(ray_t* obj, int64_t lo, int64_t hi, advise_emit_fn emit, void* ctx) {
     if (!obj || lo >= hi) return;
     if (obj->type == RAY_ENCCOL) {
         ray_enccol_t* e = ray_enccol_of(obj);
-        if (e->kind == RAY_ENCCOL_PARTED) { advise_obj(e->wrapper, lo, hi); return; }
+        if (e->kind == RAY_ENCCOL_PARTED) { advise_spans(e->wrapper, lo, hi, emit, ctx); return; }
         uint64_t off, len;
         ray_enccol_byte_range(e, lo, hi, &off, &len);
-        uint64_t a = off & ~(uint64_t)(ADVISE_PAGE - 1);
-        ray_vm_advise_seq((void*)(e->base + a), (size_t)(off + len - a));
+        uintptr_t p = (uintptr_t)(e->base + off), a = page_down(p);
+        emit(ctx, a, (size_t)(p + len - a));
         return;
     }
     if (RAY_IS_PARTED(obj->type)) {
@@ -517,7 +526,7 @@ static void advise_obj(ray_t* obj, int64_t lo, int64_t hi) {
         for (int64_t i = 0; i < obj->len && acc < hi; i++) {
             int64_t sl = segs[i] ? ray_table_col_nrows(segs[i]) : 0;
             int64_t a = lo > acc ? lo - acc : 0, b = hi - acc < sl ? hi - acc : sl;
-            if (a < b) advise_obj(segs[i], a, b);
+            if (a < b) advise_spans(segs[i], a, b, emit, ctx);
             acc += sl;
         }
         return;
@@ -527,13 +536,37 @@ static void advise_obj(ray_t* obj, int64_t lo, int64_t hi) {
     int64_t base_row = (obj->attrs & RAY_ATTR_SLICE) ? obj->slice_offset : 0;
     uint8_t esz = ray_sym_elem_size(own->type, own->attrs);
     uintptr_t p = (uintptr_t)ray_data(own) + (uintptr_t)(base_row + lo) * esz;
-    uintptr_t a = p & ~(ADVISE_PAGE - 1);
-    ray_vm_advise_seq((void*)a, (size_t)(p + (uintptr_t)(hi - lo) * esz - a));
+    uintptr_t a = page_down(p);
+    emit(ctx, a, (size_t)(p + (uintptr_t)(hi - lo) * esz - a));
 }
 
-void ray_col_src_advise(const ray_col_src_t* s, int64_t lo, int64_t hi) {
+static void advise_emit(void* ctx, uintptr_t start, size_t len) {
+    (void)ctx;
+    ray_vm_advise_seq((void*)start, len);
+}
+
+/* [lo, hi) clipped to the source's rows. */
+static void advise_walk(const ray_col_src_t* s, int64_t lo, int64_t hi, advise_emit_fn emit, void* ctx) {
     if (!s || !s->obj) return;
     if (lo < 0) lo = 0;
     if (hi > s->len) hi = s->len;
-    advise_obj(s->obj, lo, hi);
+    advise_spans(s->obj, lo, hi, emit, ctx);
+}
+
+void ray_col_src_advise(const ray_col_src_t* s, int64_t lo, int64_t hi) {
+    advise_walk(s, lo, hi, advise_emit, NULL);
+}
+
+typedef struct { uintptr_t* start; size_t* len; int cap, n; } advise_collect_t;
+static void advise_collect(void* ctx, uintptr_t start, size_t len) {
+    advise_collect_t* c = ctx;
+    if (c->n < c->cap) { c->start[c->n] = start; c->len[c->n] = len; }
+    c->n++;
+}
+
+int ray_col_src_test_advise_spans(const ray_col_src_t* s, int64_t lo, int64_t hi,
+                                  uintptr_t* start, size_t* len, int cap) {
+    advise_collect_t c = { start, len, cap, 0 };
+    advise_walk(s, lo, hi, advise_collect, &c);
+    return c.n;
 }
