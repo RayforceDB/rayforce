@@ -85,6 +85,13 @@
 (eqt (u2 P) (u2 F)) -- true
 (set r5 (runs))
 (- r5 r4) -- 1
+;; more wanted than there are groups, past the first-key scan's budget
+;; (70016 rows, 50 groups first seen from 3): the hidden first-row slot
+;; orders them
+(set u5 (fn [tb] (select {c: (count a) by: i from: tb where: (>= date 2024.01.04) take: 60})))
+(eqt (u5 P) (u5 F)) -- true
+(set u6 (fn [tb] (select {c: (count a) s2: (sum b) by: [s i] from: tb where: (> b 3) take: 7})))
+(eqt (u6 P) (u6 F)) -- true
 
 ;; a tiny first partition, no pruning
 (set ns [1 2000 3 70000 10 3])

@@ -16354,6 +16354,128 @@ static inline int64_t grp_sorted_lower_bound(const int64_t* a, int64_t n,
     return lo;
 }
 
+/* The first-seen key set of an unordered take over a parted table: up to
+ * `n` distinct key tuples, in first-seen order over the selected rows
+ * (sel_ids: sorted global row ids, or every row when NULL), read from the
+ * partitions in order.  Keys are partition-key (MAPCOMMON) columns or plain
+ * scan columns of the types agg_read_key_i64 reads.  True with the tuples
+ * (keys[i * n_keys + k], *n_found of them) when n were found, or when every
+ * row was read (all the groups); false when the scan passed its budget or a
+ * key is not such a column (the caller then carries first rows instead).
+ * A segment that fails to materialize is its error in *err. */
+typedef struct {
+    int64_t* keys;     /* found tuples in first-seen order: n * n_keys */
+    int64_t* slot;     /* hash slot -> tuple index, -1 empty: cap */
+    int64_t  cap, n_found;
+    uint32_t n_keys;
+} grp_keyset_t;
+
+static uint64_t grp_keyset_hash(const int64_t* kv, uint32_t n_keys) {
+    uint64_t h = 0x9E3779B97F4A7C15ULL;
+    for (uint32_t k = 0; k < n_keys; k++) { h = (h ^ (uint64_t)kv[k]) * 0x9E3779B97F4A7C15ULL; h ^= h >> 32; }
+    return h * 0xD6E8FEB86659FD93ULL;
+}
+
+/* Index of tuple kv in the set, inserting it when `insert` (returns -1 for
+ * an absent tuple either way). */
+static int64_t grp_keyset_probe(grp_keyset_t* ks, const int64_t* kv, bool insert) {
+    for (int64_t i = (int64_t)(grp_keyset_hash(kv, ks->n_keys) & (uint64_t)(ks->cap - 1));;
+         i = (i + 1) & (ks->cap - 1)) {
+        int64_t t = ks->slot[i];
+        if (t < 0) {
+            if (insert) {
+                memcpy(ks->keys + ks->n_found * ks->n_keys, kv, ks->n_keys * sizeof(int64_t));
+                ks->slot[i] = ks->n_found++;
+            }
+            return -1;
+        }
+        if (memcmp(ks->keys + t * ks->n_keys, kv, ks->n_keys * sizeof(int64_t)) == 0) return t;
+    }
+}
+
+static bool grp_first_keys_scan(ray_t* pt, const int64_t* key_syms, uint32_t n_keys,
+                                int32_t n_parts, const int64_t* sel_ids, int64_t sel_total,
+                                const int64_t* part_off, int64_t n, grp_keyset_t* ks,
+                                ray_t** err) {
+    *err = NULL;
+    if (n_keys == 0 || n_keys > 16 || n > AGG_FIRSTN_MAX) return false;
+    ray_t* mcv[16];
+    for (uint32_t k = 0; k < n_keys; k++) {
+        ray_col_meta_t m;
+        if (!ray_table_col_meta(pt, key_syms[k], &m)) return false;
+        mcv[k] = NULL;
+        if (m.type == RAY_MAPCOMMON) {
+            ray_t* mc = ray_table_col(pt, key_syms[k]);                  /* MAPCOMMON is plain */
+            if (!mc || RAY_IS_ERR(mc)) return false;
+            mcv[k] = ((ray_t**)ray_data(mc))[0];                          /* not-a-table */
+            if (!mcv[k] || !agg_key_i64_type(mcv[k]->type) || mcv[k]->len < n_parts) return false;
+        } else if (!RAY_IS_PARTED(m.type) || !agg_key_i64_type((int8_t)RAY_PARTED_BASETYPE(m.type))) {
+            return false;
+        }
+    }
+    int64_t budget = n * 64 > AGG_FIRSTN_PROBE_ROWS ? n * 64 : AGG_FIRSTN_PROBE_ROWS;
+    int64_t scanned = 0, si = 0;
+    int64_t kv[16];
+    ray_t* seg[16];
+    for (int32_t p = 0; p < n_parts; p++) {
+        int64_t len = -1;
+        for (uint32_t k = 0; k < n_keys; k++) {
+            if (mcv[k]) { seg[k] = NULL; continue; }
+            seg[k] = group_parted_seg_col(pt, key_syms[k], p);
+            if (seg[k] && RAY_IS_ERR(seg[k])) { *err = seg[k]; return false; }
+            if (!seg[k] || !agg_key_i64_type(seg[k]->type)) return false;
+            if (len < 0) len = seg[k]->len;
+            else if (seg[k]->len != len) return false;
+        }
+        if (len < 0) return false;                     /* no parted key: not this route */
+        int64_t lo = 0, hi = len;
+        if (sel_ids) {                                 /* this partition's selected rows */
+            lo = grp_sorted_lower_bound(sel_ids, sel_total, part_off[p]);
+            hi = grp_sorted_lower_bound(sel_ids, sel_total, part_off[p + 1]);
+            si = lo;
+        }
+        for (int64_t j = lo; j < hi; j++) {
+            if (scanned++ >= budget) return false;
+            int64_t r = sel_ids ? sel_ids[j] - part_off[p] : j;
+            for (uint32_t k = 0; k < n_keys; k++)
+                kv[k] = mcv[k] ? agg_read_key_i64(mcv[k], ray_data(mcv[k]), p)
+                               : agg_read_key_i64(seg[k], ray_data(seg[k]), r);
+            grp_keyset_probe(ks, kv, true);
+            if (ks->n_found >= n) return true;
+        }
+    }
+    (void)si;
+    return true;                                       /* every row read: all the groups */
+}
+
+/* The rows of `result` (key columns 0..n_keys) whose key is in the set,
+ * ordered by first-seen rank: an owned table, NULL when a found key has no
+ * result row (the caller declines), or an owned error. */
+static ray_t* grp_keep_first_keys(ray_t* result, grp_keyset_t* ks) {
+    int64_t rows = ray_table_nrows(result);
+    ray_t* okc[16];
+    for (uint32_t k = 0; k < ks->n_keys; k++) {
+        okc[k] = ray_table_col_idx(result, k);
+        if (okc[k] && RAY_IS_ERR(okc[k])) return okc[k];
+        if (!okc[k] || !agg_key_i64_type(okc[k]->type)) return NULL;
+    }
+    ray_t* idx = ray_vec_new(RAY_I64, ks->n_found > 0 ? ks->n_found : 1);
+    if (!idx || RAY_IS_ERR(idx)) return idx ? idx : ray_error("oom", NULL);
+    int64_t* ix = (int64_t*)ray_data(idx);
+    for (int64_t i = 0; i < ks->n_found; i++) ix[i] = -1;
+    int64_t kv[16], found = 0;
+    for (int64_t r = 0; r < rows && found < ks->n_found; r++) {
+        for (uint32_t k = 0; k < ks->n_keys; k++) kv[k] = agg_read_key_i64(okc[k], ray_data(okc[k]), r);
+        int64_t t = grp_keyset_probe(ks, kv, false);
+        if (t >= 0 && ix[t] < 0) { ix[t] = r; found++; }
+    }
+    if (found != ks->n_found) { ray_release(idx); return NULL; }
+    idx->len = found;
+    ray_t* out = ray_at_fn(result, idx);
+    ray_release(idx);
+    return out ? out : ray_error("oom", NULL);
+}
+
 /* The rows of `result` holding the `n` smallest values of its I64 column
  * `ci` (distinct global first-row ids), ordered by that value: an owned
  * table, or an owned error.  A bounded max-heap keeps the selection
@@ -16484,6 +16606,8 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
     size_t pna_n = part_n_aggs_max ? part_n_aggs_max : 1;
 
     ray_t* ret = NULL;   /* pp_cleanup return value (NULL on any early bail) */
+    grp_keyset_t fks = { 0 };   /* first-seen keys of an unordered take (freed in pp_cleanup) */
+    bool frow_by_keys = false;
 
     /* Pushed-down WHERE state (Part A).  saved_sel is captured now and
      * g->selection cleared later (in the setup block below) so the setup's
@@ -16675,6 +16799,32 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
         if (ray_table_col_meta(parted_tbl, frow_sym, &fm_)) goto pp_cleanup;   /* a real column has the name */
         frow_slot = part_n_aggs;
         part_ops[part_n_aggs++] = OP_MIN;
+    }
+    /* Cheaper when the first N distinct keys show up early in the scan
+     * order (or the whole input is short): read them up front and keep
+     * those groups of the merged result in that order; the hidden slot
+     * stays for the rest. */
+    if (frow_sym >= 0 && group_limit <= AGG_FIRSTN_MAX) {
+        int64_t cap = 16;
+        while (cap < group_limit * 4) cap *= 2;
+        fks.n_keys = n_keys;
+        fks.cap = cap;
+        fks.keys = ray_alloc_raw((size_t)group_limit * n_keys * sizeof(int64_t));
+        fks.slot = ray_alloc_raw((size_t)cap * sizeof(int64_t));
+        if (fks.keys && fks.slot) {
+            for (int64_t i = 0; i < cap; i++) fks.slot[i] = -1;
+            bool any_expr = false;
+            for (uint32_t k = 0; k < n_keys; k++) any_expr |= key_is_expr[k] != 0;
+            ray_t* serr = NULL;
+            frow_by_keys = !any_expr &&
+                grp_first_keys_scan(parted_tbl, key_syms, n_keys, n_parts, saved_sel ? sel_ids : NULL,
+                                    sel_total, part_off, group_limit, &fks, &serr);
+            if (serr) { ret = serr; goto pp_cleanup; }
+        }
+        if (frow_by_keys) {                    /* drop the hidden slot */
+            part_n_aggs--;
+            frow_sym = -1;
+        }
     }
 
     /* Merge ops: SUM→SUM, COUNT→SUM, MIN→MIN, MAX→MAX,
@@ -17177,6 +17327,19 @@ batch_fail:
         goto pp_cleanup;
     }
 
+    /* First-seen keys read up front: keep their groups, in that order. */
+    if (frow_by_keys) {
+        ray_t* kept = grp_keep_first_keys(result, &fks);
+        if (!kept || RAY_IS_ERR(kept)) {
+            ray_release(result);
+            if (merge_tbl) ray_release(merge_tbl);
+            ret = kept;                        /* NULL: the concat fallback */
+            goto pp_cleanup;
+        }
+        ray_release(result);
+        result = kept;
+    }
+
     /* First-row slot: keep the group_limit groups with the smallest first
      * row, ordered by it (first-seen order). */
     if (frow_sym >= 0) {
@@ -17387,6 +17550,8 @@ batch_fail:
 
 pp_cleanup:
     if (ef_saved.enabled) ray_group_emit_filter_set(ef_saved);
+    ray_free_raw(fks.keys);
+    ray_free_raw(fks.slot);
     scratch_free(mc_sym_ids_hdr);
     scratch_free(pk_syms_hdr);
     scratch_free(pkeys_hdr);

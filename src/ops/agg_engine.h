@@ -5,6 +5,7 @@
 #include <rayforce.h>
 #include "ops/internal.h"   /* ray_graph_t, ray_op_t, ray_op_ext_t, find_ext */
 #include "ops/agg_acc.h"    /* agg_vtable_t */
+#include "table/sym.h"    /* ray_read_sym */
 
 /* Test/feature knob: route OP_GROUP through the v2 engine when it can handle
  * the query (see agg_v2_can_handle). Enabled by default. */
@@ -18,6 +19,28 @@ extern bool ray_agg_first_n;
  * aggregate into per-task top-bit tables (table stack) and scatter only
  * all-distinct tails; off = the former radix scatter of every row. */
 extern bool ray_agg_tablestack;
+
+/* Unordered take: N first-N limits, shared by the pre-pass (agg_first_n_run)
+ * and the parted group's first-key scan (group.c). */
+#define AGG_FIRSTN_MAX        1024     /* largest take: N the pre-pass serves */
+#define AGG_FIRSTN_PROBE_ROWS 65536    /* prefix budget for the serial scan, at least */
+
+/* Read element `row` of an integer/temporal/SYM column widened to int64. */
+static inline int64_t agg_read_key_i64(ray_t* col, const void* data, int64_t row) {
+    switch (col->type) {
+        case RAY_I64: case RAY_TIMESTAMP: return ((const int64_t*)data)[row];
+        case RAY_I32: case RAY_DATE: case RAY_TIME: return ((const int32_t*)data)[row];
+        case RAY_I16: return ((const int16_t*)data)[row];
+        case RAY_U8:  case RAY_BOOL: return ((const uint8_t*)data)[row];
+        case RAY_SYM: return (int64_t)ray_read_sym(data, row, col->type, col->attrs);
+        default: return 0;  /* gate guarantees only the above reach here */
+    }
+}
+/* The key types agg_read_key_i64 reads. */
+static inline bool agg_key_i64_type(int8_t t) {
+    return t == RAY_I64 || t == RAY_TIMESTAMP || t == RAY_I32 || t == RAY_DATE || t == RAY_TIME ||
+           t == RAY_I16 || t == RAY_U8 || t == RAY_BOOL || t == RAY_SYM;
+}
 
 /* Admission is pure: inspecting a plan must not change execution diagnostics. */
 typedef enum {

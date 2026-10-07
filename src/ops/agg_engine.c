@@ -48,7 +48,6 @@ void agg_route_reason(agg_v2_reason_t reason) {
 }
 
 /* Read element `row` of an integer/temporal/SYM column widened to int64. */
-static inline int64_t agg_read_key_i64(ray_t* col, const void* data, int64_t row);
 /* Dense direct-index serial grouping; defined below agg_run_one. */
 static int agg_group_keys_dense(ray_t** key_cols, int64_t nrows,
                                 const dense_plan_t* dp, agg_groups_t* out);
@@ -6244,8 +6243,6 @@ static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
  * spent — when the N keys are not found within a bounded prefix, or when the
  * N groups hold a large share of the rows (sampled before the parallel pass,
  * counted exactly in it), where aggregating everything costs about the same. */
-#define AGG_FIRSTN_MAX        1024     /* largest take: N the pre-pass serves */
-#define AGG_FIRSTN_PROBE_ROWS 65536    /* prefix budget for the serial scan, at least */
 #define AGG_FIRSTN_SAMPLES    4096     /* evenly spaced rows for the share estimate */
 #define AGG_FIRSTN_SHARE      64       /* full run once the N groups hold 1/64 of the rows */
 
@@ -7195,18 +7192,6 @@ ray_t* exec_group_v2(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
 
     ray_release(prefix_block);
     return result;
-}
-
-/* Read element `row` of an integer/temporal/SYM column widened to int64. */
-static inline int64_t agg_read_key_i64(ray_t* col, const void* data, int64_t row) {
-    switch (col->type) {
-        case RAY_I64: case RAY_TIMESTAMP: return ((const int64_t*)data)[row];
-        case RAY_I32: case RAY_DATE: case RAY_TIME: return ((const int32_t*)data)[row];
-        case RAY_I16: return ((const int16_t*)data)[row];
-        case RAY_U8:  case RAY_BOOL: return ((const uint8_t*)data)[row];
-        case RAY_SYM: return (int64_t)ray_read_sym(data, row, col->type, col->attrs);
-        default: return 0;  /* gate guarantees only the above reach here */
-    }
 }
 
 ray_t* agg_run_one(const agg_vtable_t* vt, ray_t* val_col,
