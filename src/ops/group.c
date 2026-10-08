@@ -103,27 +103,39 @@ static inline double group_fp_at(const void* data, int8_t t, int64_t row) {
  * encoding agg_entry_is_null and the y-side pair-skip can see in an F64
  * slot; a raw (double)sentinel cast would read as a huge finite value.
  * FP cells go through group_fp_at directly: their nulls are NaN already. */
-static inline double group_pack_i64_as_f64(ray_t* col, int64_t row) {
-    int64_t v = read_col_i64(ray_data(col), row, col->type, col->attrs);
-    ray_t* src = (col->attrs & RAY_ATTR_SLICE) ? col->slice_parent : col;
-    if (src && ray_vec_may_have_nulls(src)) {
-        int64_t sent = agg_int_null_sentinel_for(col->type);
+/* The cell at `row` of a raw element array of type t (SYM width from
+ * attrs); may_null is the column's nullability. */
+static inline double group_pack_i64_as_f64_at(const void* data, int64_t row, int8_t t,
+                                              uint8_t attrs, bool may_null) {
+    int64_t v = read_col_i64(data, row, t, attrs);
+    if (may_null) {
+        int64_t sent = agg_int_null_sentinel_for(t);
         if (sent != 0 && v == sent) return (double)NAN;
     }
     return (double)v;
+}
+static inline double group_pack_i64_as_f64(ray_t* col, int64_t row) {
+    ray_t* src = (col->attrs & RAY_ATTR_SLICE) ? col->slice_parent : col;
+    return group_pack_i64_as_f64_at(ray_data(col), row, col->type, col->attrs,
+                                    src && ray_vec_may_have_nulls(src));
 }
 
 /* Pack the y-side cell of an int×int binary agg (entry keeps i64 slots).
  * Declared nulls canonicalize to NULL_I64 regardless of the source width so
  * the accumulator's pair-skip needs no per-agg y-side sentinel plumbing. */
-static inline int64_t group_pack_y_i64(ray_t* col, int64_t row) {
-    int64_t v = read_col_i64(ray_data(col), row, col->type, col->attrs);
-    ray_t* src = (col->attrs & RAY_ATTR_SLICE) ? col->slice_parent : col;
-    if (src && ray_vec_may_have_nulls(src)) {
-        int64_t sent = agg_int_null_sentinel_for(col->type);
+static inline int64_t group_pack_y_i64_at(const void* data, int64_t row, int8_t t,
+                                          uint8_t attrs, bool may_null) {
+    int64_t v = read_col_i64(data, row, t, attrs);
+    if (may_null) {
+        int64_t sent = agg_int_null_sentinel_for(t);
         if (sent != 0 && v == sent) return NULL_I64;
     }
     return v;
+}
+static inline int64_t group_pack_y_i64(ray_t* col, int64_t row) {
+    ray_t* src = (col->attrs & RAY_ATTR_SLICE) ? col->slice_parent : col;
+    return group_pack_y_i64_at(ray_data(col), row, col->type, col->attrs,
+                               src && ray_vec_may_have_nulls(src));
 }
 
 /* Monotonic count of exec_group_per_partition entries (the streaming parted
@@ -5126,7 +5138,8 @@ static inline uint64_t ght_hash_lanes(const int64_t* lane, uint32_t lanes) {
 }
 
 /* Gather one key column's lanes for a batch of rows.  Semantically
- * `dst[j] = read_col_i64(data, rows[j], type, attrs)` for every j — the type
+ * `dst[j] = read_col_i64(data, rows[j] - base, type, attrs)` for every j
+ * (`data` holds row `base` first: a piece of a range read, else 0) — the type
  * (and, for SYM, the stored-id-width) dispatch is hoisted OUT of the row loop,
  * which is the whole point: read_col_i64's switch lowers to a jump table, so
  * the row-major builder pays one indirect jump per key per row and mispredicts
@@ -5135,35 +5148,35 @@ static inline uint64_t ght_hash_lanes(const int64_t* lane, uint32_t lanes) {
  * MUST stay bit-identical to read_col_i64 (ops/internal.h) — narrow signed
  * types sign-extend, SYM ids zero-extend. */
 static inline void group_keys_gather(int64_t* dst, const void* data,
-                                     const int64_t* rows, uint32_t m,
+                                     const int64_t* rows, int64_t base, uint32_t m,
                                      int8_t type, uint8_t attrs) {
     switch (type) {
     case RAY_I64: case RAY_TIMESTAMP:
-        for (uint32_t j = 0; j < m; j++) dst[j] = ((const int64_t*)data)[rows[j]];
+        for (uint32_t j = 0; j < m; j++) dst[j] = ((const int64_t*)data)[rows[j] - base];
         return;
     case RAY_SYM:
         switch (attrs & RAY_SYM_W_MASK) {
         case RAY_SYM_W8:
-            for (uint32_t j = 0; j < m; j++) dst[j] = (int64_t)((const uint8_t*)data)[rows[j]];
+            for (uint32_t j = 0; j < m; j++) dst[j] = (int64_t)((const uint8_t*)data)[rows[j] - base];
             return;
         case RAY_SYM_W16:
-            for (uint32_t j = 0; j < m; j++) dst[j] = (int64_t)((const uint16_t*)data)[rows[j]];
+            for (uint32_t j = 0; j < m; j++) dst[j] = (int64_t)((const uint16_t*)data)[rows[j] - base];
             return;
         case RAY_SYM_W32:
-            for (uint32_t j = 0; j < m; j++) dst[j] = (int64_t)((const uint32_t*)data)[rows[j]];
+            for (uint32_t j = 0; j < m; j++) dst[j] = (int64_t)((const uint32_t*)data)[rows[j] - base];
             return;
         default:
-            for (uint32_t j = 0; j < m; j++) dst[j] = ((const int64_t*)data)[rows[j]];
+            for (uint32_t j = 0; j < m; j++) dst[j] = ((const int64_t*)data)[rows[j] - base];
             return;
         }
     case RAY_I32: case RAY_DATE: case RAY_TIME:
-        for (uint32_t j = 0; j < m; j++) dst[j] = (int64_t)((const int32_t*)data)[rows[j]];
+        for (uint32_t j = 0; j < m; j++) dst[j] = (int64_t)((const int32_t*)data)[rows[j] - base];
         return;
     case RAY_I16:
-        for (uint32_t j = 0; j < m; j++) dst[j] = (int64_t)((const int16_t*)data)[rows[j]];
+        for (uint32_t j = 0; j < m; j++) dst[j] = (int64_t)((const int16_t*)data)[rows[j] - base];
         return;
     default: /* RAY_BOOL, RAY_U8 */
-        for (uint32_t j = 0; j < m; j++) dst[j] = (int64_t)((const uint8_t*)data)[rows[j]];
+        for (uint32_t j = 0; j < m; j++) dst[j] = (int64_t)((const uint8_t*)data)[rows[j] - base];
         return;
     }
 }
@@ -6048,22 +6061,331 @@ static inline bool group_rowsel_pass(ray_t* sel, int64_t row) {
     return false;
 }
 
-void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
-                              uint8_t* key_attrs, ray_t** key_vecs, ray_t** agg_vecs,
-                              ray_t** agg_vecs2,
-                              uint8_t* agg_strlen,
-                              ray_t* rowsel,
-                              int64_t start, int64_t end,
-                              const int64_t* match_idx) {
+/* ---- Range reads of the fat-entry builders (radix phase 1, its v2
+ * sibling, the holistic reprobe, the serial fallback; R-WALK / R-SPARSE) ----
+ *
+ * A builder context carries a grp_rr_t.  A plain one (staged false) reads
+ * whole columns and leaves the rest unused, so a table with no encoded slot
+ * runs today's loops.  A staged one runs its body once per piece of a walk
+ * over its sources: the keys, then the inputs, then the y-sides
+ * (n_keys + 2 * n_aggs; NULL for a source the entries do not read: COUNT, a
+ * holistic input, a missing y-side).  The keys of a group-by with a wide key
+ * (STR, GUID, LIST) are plain and stay unwalked (keys_walked false): their
+ * arms store and compare source rows, so they read the whole columns. */
+typedef struct {
+    ray_col_src_t**  srcs;
+    const void**     plain;        /* [n_src] a plain source's base, NULL for a staged one */
+    uint32_t         n_src;
+    uint32_t         n_keys, n_aggs;
+    const int8_t*    key_types;
+    ray_scan_fail_t* fail;
+    bool             staged;
+    bool             keys_walked;
+} grp_rr_t;
+
+/* What a builder body reads rows through: the whole columns in a plain
+ * context (bases 0), one piece in a staged one.  Keys are read at
+ * row - key_base, inputs at row - row_base; rows stay absolute everywhere
+ * else (selection, entry row ids, FIRST/LAST order). */
+typedef struct {
+    void* const*       key_data;
+    const uint8_t*     key_attrs;   /* the pieces' SYM widths when walked */
+    int64_t            key_base;
+    bool               key_raw;     /* null tests read the key pieces' sentinels */
+    const void* const* agg_ptrs;    /* [n_aggs] input pieces at row_base; NULL: the
+                                     * inputs are read whole through agg_vecs */
+    const void* const* agg_ptrs2;   /* y-sides */
+    const uint8_t*     agg_attrs;   /* the input pieces' SYM widths */
+    const uint8_t*     agg_attrs2;
+    int64_t            row_base;
+} grp_view_t;
+
+static inline grp_view_t grp_view_whole(void* const* key_data, const uint8_t* key_attrs) {
+    return (grp_view_t){ .key_data = key_data, .key_attrs = key_attrs };
+}
+
+/* Key k (type t) is null at `row`: from the piece's sentinel when the keys
+ * are walked, else from the column (ray_vec_is_null). */
+static inline bool grp_key_null(ray_t* kv, const grp_view_t* v, uint32_t k, int8_t t, int64_t row) {
+    return v->key_raw ? ray_raw_is_null(t, v->key_attrs[k], v->key_data[k], row - v->key_base)
+                      : ray_vec_is_null(kv, row);
+}
+
+static inline int64_t sym_strlen_raw(const void* data, int64_t row, uint8_t attrs,
+                                     struct ray_sym_domain_s* dom);
+
+/* Pack one row's aggregate input values into an entry's value slots: the
+ * one packer of every fat-entry builder.  Slot indices come from the layout
+ * (agg_val_slot), never a running counter: holistic aggs and the valueless
+ * OP_COUNT carry -1 and pack nothing.  agg_vecs may be NULL (pure-COUNT
+ * layouts).  In a staged view the cells come from the pieces at
+ * row - row_base with the pieces' SYM widths; agg_vecs[a] (the input or its
+ * stand-in) gives the type, nullability and SYM domain. */
+static void ght_pack_aggs_piece(const ght_layout_t* ly, ray_t* const* agg_vecs,
+                                ray_t* const* agg_vecs2, const uint8_t* agg_strlen,
+                                const grp_view_t* v, int64_t* ev, int64_t row);
+
+/* The plain arm stays inline in every builder's row loop (today's code);
+ * the piece arm is out of line. */
+RAY_INLINE void ght_pack_aggs(const ght_layout_t* ly, ray_t* const* agg_vecs,
+                              ray_t* const* agg_vecs2, const uint8_t* agg_strlen,
+                              const grp_view_t* v, int64_t* ev, int64_t row) {
+    const uint8_t* const aflags = ly->agg_flags;
+    uint16_t na = ly->n_aggs;
+    if (!v->agg_ptrs) {   /* plain: whole columns at `row` */
+        for (uint32_t a = 0; a < na; a++) {
+            uint8_t af = aflags[a];
+            int8_t vs = ly->agg_val_slot[a];
+            if (vs < 0) continue;
+            uint8_t vi = (uint8_t)vs;
+            ray_t* ac = agg_vecs ? agg_vecs[a] : NULL;
+            if (!ac) continue;
+            if (agg_strlen && agg_strlen[a])
+                ev[vi] = group_strlen_at(ac, row);
+            else if (af & GHT_AF_F64) {
+                double d = group_fp_type(ac->type)
+                    ? group_fp_at(ray_data(ac), ac->type, row)
+                    : group_pack_i64_as_f64(ac, row);
+                memcpy(&ev[vi], &d, sizeof(d));
+            }
+            else
+                ev[vi] = read_col_i64(ray_data(ac), row, ac->type, ac->attrs);
+            vi++;
+            /* Binary aggregator: the y-side value in the next slot.
+             * Non-F64 pairs keep i64 slots (group_pack_y_i64
+             * canonicalizes nulls). */
+            if ((af & GHT_AF_BINARY) && agg_vecs2 && agg_vecs2[a]) {
+                ray_t* ay = agg_vecs2[a];
+                if (af & GHT_AF_F64) {
+                    double d = group_fp_type(ay->type)
+                        ? group_fp_at(ray_data(ay), ay->type, row)
+                        : group_pack_i64_as_f64(ay, row);
+                    memcpy(&ev[vi], &d, sizeof(d));
+                }
+                else
+                    ev[vi] = group_pack_y_i64(ay, row);
+                vi++;
+            }
+        }
+        return;
+    }
+    ght_pack_aggs_piece(ly, agg_vecs, agg_vecs2, agg_strlen, v, ev, row);
+}
+
+static void ght_pack_aggs_piece(const ght_layout_t* ly, ray_t* const* agg_vecs,
+                                ray_t* const* agg_vecs2, const uint8_t* agg_strlen,
+                                const grp_view_t* v, int64_t* ev, int64_t row) {
+    const uint8_t* const aflags = ly->agg_flags;
+    uint16_t na = ly->n_aggs;
+    const int64_t r = row - v->row_base;
+    for (uint32_t a = 0; a < na; a++) {
+        uint8_t af = aflags[a];
+        int8_t vs = ly->agg_val_slot[a];
+        if (vs < 0) continue;
+        uint8_t vi = (uint8_t)vs;
+        ray_t* ac = agg_vecs ? agg_vecs[a] : NULL;
+        if (!ac) continue;
+        const void* xd = v->agg_ptrs[a];
+        if (agg_strlen && agg_strlen[a])
+            ev[vi] = ac->type == RAY_STR ? (int64_t)((const ray_str_t*)xd)[r].len
+                   : sym_strlen_raw(xd, r, v->agg_attrs[a], ray_sym_vec_domain(ac));
+        else if (af & GHT_AF_F64) {
+            double d = group_fp_type(ac->type)
+                ? group_fp_at(xd, ac->type, r)
+                : group_pack_i64_as_f64_at(xd, r, ac->type, v->agg_attrs[a],
+                                           ray_vec_may_have_nulls(ac));
+            memcpy(&ev[vi], &d, sizeof(d));
+        }
+        else
+            ev[vi] = read_col_i64(xd, r, ac->type, v->agg_attrs[a]);
+        vi++;
+        if ((af & GHT_AF_BINARY) && agg_vecs2 && agg_vecs2[a]) {
+            ray_t* ay = agg_vecs2[a];
+            const void* yd = v->agg_ptrs2[a];
+            if (af & GHT_AF_F64) {
+                double d = group_fp_type(ay->type) ? group_fp_at(yd, ay->type, r)
+                         : group_pack_i64_as_f64_at(yd, r, ay->type, v->agg_attrs2[a],
+                                                    ray_vec_may_have_nulls(ay));
+                memcpy(&ev[vi], &d, sizeof(d));
+            }
+            else
+                ev[vi] = group_pack_y_i64_at(yd, r, ay->type, v->agg_attrs2[a],
+                                             ray_vec_may_have_nulls(ay));
+            vi++;
+        }
+    }
+}
+
+static ray_t* group_sel_walk(ray_col_src_t* const* srcs, const void* const* plain, uint32_t n,
+                             ray_t* rowsel, int64_t start, int64_t end,
+                             void* ctx, uint32_t wid, ray_col_piece_fn fn);
+
+/* R-SPARSE over the ascending rows idx[i0, i1): one cursor per staged
+ * source for the call (each touched vector is decoded once).  Rows that
+ * every source's current view covers form one run, handed to fn as the
+ * index range [ib, ie) with each piece positioned at row b = idx[ib].
+ * NULL or an owned error (fn is not called again after an error). */
+typedef void (*group_idx_piece_fn)(void* ctx, uint32_t wid, int64_t ib, int64_t ie,
+                                   int64_t b, const ray_col_piece_t* p);
+static ray_t* group_idx_walk(ray_col_src_t* const* srcs, const void* const* plain, uint32_t n,
+                             const int64_t* idx, int64_t i0, int64_t i1,
+                             void* ctx, uint32_t wid, group_idx_piece_fn fn) {
+    if (i0 >= i1) return NULL;
+    enum { IDX_WALK_STACK = 16 };
+    ray_col_cursor_t cst[IDX_WALK_STACK];
+    ray_col_piece_t pst[IDX_WALK_STACK];
+    ray_col_cursor_t* cur = cst;
+    ray_col_piece_t* pc = pst;
+    if (n > IDX_WALK_STACK) {
+        cur = ray_calloc_raw((size_t)n * sizeof *cur);
+        pc  = ray_calloc_raw((size_t)n * sizeof *pc);
+        if (!cur || !pc) { ray_free_raw(cur); ray_free_raw(pc); return ray_error("oom", "scan walk"); }
+    }
+    for (uint32_t s = 0; s < n; s++) {
+        pc[s] = (ray_col_piece_t){ 0 };
+        if (!srcs[s]) continue;
+        pc[s].attrs = srcs[s]->attrs;
+        pc[s].may_null = srcs[s]->may_null;
+        pc[s].dom = srcs[s]->dom;
+        if (!plain[s]) ray_col_cursor_init(&cur[s], srcs[s]);
+    }
+    ray_t* err = NULL;
+    for (int64_t i = i0; i < i1 && !err; ) {
+        int64_t b = idx[i], e = INT64_MAX;
+        for (uint32_t s = 0; s < n; s++) {
+            ray_col_src_t* src = srcs[s];
+            if (!src) continue;
+            if (plain[s]) { pc[s].data = (const char*)plain[s] + (size_t)b * ray_col_src_esz(src); continue; }
+            const ray_col_range_t* v;
+            if ((err = ray_col_cursor_at(&cur[s], b, &v)) != NULL) break;
+            uint8_t vesz = ray_sym_elem_size(v->type, v->attrs);
+            pc[s].data = (const char*)v->data + (size_t)(b - v->start) * vesz;
+            pc[s].attrs = v->attrs; pc[s].may_null = v->may_null;
+            pc[s].str_pool = v->str_pool; pc[s].dom = v->dom;
+            if (v->start + v->n < e) e = v->start + v->n;
+        }
+        if (err) break;
+        int64_t j = i + 1;
+        while (j < i1 && idx[j] < e) j++;
+        fn(ctx, wid, i, j, b, pc);
+        i = j;
+    }
+    for (uint32_t s = 0; s < n; s++)
+        if (srcs[s] && !plain[s]) ray_col_cursor_free(&cur[s]);
+    if (cur != cst) { ray_free_raw(cur); ray_free_raw(pc); }
+    return err;
+}
+
+/* A builder body over rows [start, end) (indices into match_idx when the
+ * context has one) read through view v. */
+typedef void (*grp_body_fn)(void* ctx, const grp_view_t* v, uint32_t wid, int64_t start, int64_t end);
+typedef struct {
+    void*            ctx;
+    grp_body_fn      body;
+    const grp_rr_t*  rr;
+    const grp_view_t* whole;     /* the context's whole-column view (unwalked keys) */
+} grp_piece_ctx_t;
+
+/* The view of one piece positioned at row b; the arrays live in the caller. */
+static void grp_view_bind(const grp_piece_ctx_t* pc, int64_t b, const ray_col_piece_t* p,
+                          void** kd, uint8_t* kat, const void** ap, const void** ap2,
+                          uint8_t* at, uint8_t* at2, grp_view_t* v) {
+    const grp_rr_t* rr = pc->rr;
+    uint32_t nk = rr->n_keys, na = rr->n_aggs;
+    *v = *pc->whole;
+    if (rr->keys_walked) {
+        for (uint32_t k = 0; k < nk; k++) {
+            kd[k] = (void*)p[k].data;
+            kat[k] = rr->key_types[k] == RAY_SYM ? p[k].attrs : pc->whole->key_attrs[k];
+        }
+        v->key_data = kd;
+        v->key_attrs = kat;
+        v->key_base = b;
+        v->key_raw = true;
+    }
+    for (uint32_t a = 0; a < na; a++) {
+        ap[a] = p[nk + a].data;          /* NULL for an input without a source */
+        at[a] = p[nk + a].attrs;
+        ap2[a] = p[nk + na + a].data;
+        at2[a] = p[nk + na + a].attrs;
+    }
+    v->agg_ptrs = ap;
+    v->agg_ptrs2 = ap2;
+    v->agg_attrs = at;
+    v->agg_attrs2 = at2;
+    v->row_base = b;
+}
+
+#define GRP_PIECE_VIEW(pc, b, p, v) \
+    uint32_t nk_ = (pc)->rr->n_keys ? (pc)->rr->n_keys : 1; \
+    uint32_t na_ = (pc)->rr->n_aggs ? (pc)->rr->n_aggs : 1; \
+    void* kd_[nk_]; uint8_t kat_[nk_]; \
+    const void* ap_[na_]; const void* ap2_[na_]; uint8_t at_[na_]; uint8_t at2_[na_]; \
+    grp_view_t v; \
+    grp_view_bind((pc), (b), (p), kd_, kat_, ap_, ap2_, at_, at2_, &v)
+
+static void grp_piece(void* ctx, uint32_t wid, int64_t b, int64_t e, const ray_col_piece_t* p) {
+    grp_piece_ctx_t* pc = (grp_piece_ctx_t*)ctx;
+    GRP_PIECE_VIEW(pc, b, p, v);
+    pc->body(pc->ctx, &v, wid, b, e);
+}
+
+static void grp_idx_piece(void* ctx, uint32_t wid, int64_t ib, int64_t ie, int64_t b,
+                          const ray_col_piece_t* p) {
+    grp_piece_ctx_t* pc = (grp_piece_ctx_t*)ctx;
+    GRP_PIECE_VIEW(pc, b, p, v);
+    pc->body(pc->ctx, &v, wid, ib, ie);
+}
+#undef GRP_PIECE_VIEW
+
+/* The driver of every builder: a plain context runs `body` over [start,
+ * end) through its whole-column view, exactly today's loop; a staged one
+ * by pieces (R-WALK, morsels a selection rejects whole are not read; or
+ * R-SPARSE over the ascending rows idx[start, end)).  A range error is
+ * noted keyed by the task's first row (R-FAIL). */
+static void grp_run(void* ctx, grp_body_fn body, const grp_view_t* whole, const grp_rr_t* rr,
+                    ray_t* rowsel, const int64_t* idx, uint32_t wid, int64_t start, int64_t end) {
+    if (!rr->staged) { body(ctx, whole, wid, start, end); return; }
+    if (ray_scan_fail_skip(rr->fail, start)) return;
+    grp_piece_ctx_t pc = { ctx, body, rr, whole };
+    ray_t* err = idx ? group_idx_walk(rr->srcs, rr->plain, rr->n_src, idx, start, end, &pc, wid, grp_idx_piece)
+                     : group_sel_walk(rr->srcs, rr->plain, rr->n_src, rowsel, start, end, &pc, wid, grp_piece);
+    if (err) ray_scan_fail_note(rr->fail, start, err);
+}
+
+/* The serial builder's context (group_rows_range). */
+typedef struct {
+    group_ht_t*    ht;
+    void**         key_data;
+    int8_t*        key_types;
+    ray_t**        key_vecs;
+    ray_t**        agg_vecs;
+    ray_t**        agg_vecs2;
+    uint8_t*       agg_strlen;
+    ray_t*         rowsel;
+    const int64_t* match_idx;
+    grp_rr_t       rr;
+} group_rows_ctx_t;
+
+static void group_rows_body(void* vctx, const grp_view_t* v, uint32_t wid,
+                            int64_t start, int64_t end) {
+    (void)wid;
+    group_rows_ctx_t* c = (group_rows_ctx_t*)vctx;
+    group_ht_t* ht = c->ht;
+    int8_t* key_types = c->key_types;
+    ray_t** key_vecs = c->key_vecs;
+    ray_t* rowsel = c->rowsel;
+    const int64_t* match_idx = c->match_idx;
+    void* const* key_data = v->key_data;
+    const uint8_t* key_attrs = v->key_attrs;
+    const int64_t kb = v->key_base;   /* keys are read at row - kb */
     const ght_layout_t* ly = &ht->layout;
     uint16_t nk = ly->n_keys;
-    uint16_t na = ly->n_aggs;
     /* Hoisted per-key / per-agg flag bases + scalar shape guards (cut-3
      * register-promotion doctrine): the common int/sym-key numeric path has
      * both guards 0, so the wide/inline/holistic per-slot branches short-
      * circuit on a register test without touching the flag arrays. */
     const uint8_t* const kflags = ly->key_flags;
-    const uint8_t* const aflags = ly->agg_flags;
     uint8_t wide_any = ly->any_wide_key;
     uint32_t mask = ht->ht_cap - 1;
     /* Stack buffer for one entry: hash + (nk+1) key slots + nv agg_vals
@@ -6092,7 +6414,7 @@ void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
 
     /* Wire the HT's key_data + key_pool tables so probe/rehash can
      * resolve wide keys (GUID bytes / STR descriptors) via the source columns. */
-    if (wide_any) { group_ht_set_key_data(ht, key_data); group_ht_set_key_pool(ht, key_vecs); }
+    if (wide_any) { group_ht_set_key_data(ht, c->key_data); group_ht_set_key_pool(ht, key_vecs); }
 
     for (int64_t i = start; i < end; i++) {
         /* Cancellation checkpoint every 65536 rows — ~150 polls on a
@@ -6104,8 +6426,9 @@ void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
         uint64_t h = 0;
         int64_t* ek = (int64_t*)(ebuf + 8);
         if (ly->any_inline_str) {
-            h = inline_build_keys(ly, key_types, key_data, key_attrs, ht->key_pool,
-                                  key_vecs, any_nullable, row, ebuf + 8);
+            /* inline STR: a wide-key layout, whose keys are whole columns */
+            h = inline_build_keys(ly, key_types, c->key_data, key_attrs,
+                                  ht->key_pool, key_vecs, any_nullable, row, ebuf + 8);
         } else {
         /* Non-inline keys are 8 B each, so the null-mask words start at ek[nk]
          * (== ebuf+8+key_off[nk]); write bit k into word k>>6 in place. */
@@ -6120,11 +6443,11 @@ void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
              * stay in lockstep with hash_keys_inline (rehash/merge/lookup). */
             for (uint32_t k = 0; k < nk; k++) {
                 if (__builtin_expect(any_nullable && ray_key_may_be_null(key_vecs[k])
-                             && ray_vec_is_null(key_vecs[k], row), 0)) {
+                             && grp_key_null(key_vecs[k], v, k, key_types[k], row), 0)) {
                     nullw[k >> 6] |= (int64_t)((uint64_t)1 << (k & 63));
                     ek[k] = 0;
                 } else {
-                    ek[k] = read_col_i64(key_data[k], row, key_types[k], key_attrs[k]);
+                    ek[k] = read_col_i64(key_data[k], row - kb, key_types[k], key_attrs[k]);
                 }
             }
             h = ght_hash_lanes(ek, (uint32_t)nk + null_words);
@@ -6133,7 +6456,7 @@ void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
             int8_t t = key_types[k];
             uint64_t kh;
             bool is_null = any_nullable && ray_key_may_be_null(key_vecs[k])
-                           && ray_vec_is_null(key_vecs[k], row);
+                           && grp_key_null(key_vecs[k], v, k, t, row);
             if (is_null) {
                 nullw[k >> 6] |= (int64_t)((uint64_t)1 << (k & 63));
                 ek[k] = 0;  /* canonical null value — real 0 differs via null mask */
@@ -6142,15 +6465,15 @@ void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
                 /* Wide key: store source row index, hash the actual bytes
                  * (GUID fixed / STR SSO via pool). */
                 ek[k] = row;
-                kh = wide_key_hash_at(ly, k, key_data, ht->key_pool, row);
+                kh = wide_key_hash_at(ly, k, c->key_data, ht->key_pool, row);
             } else if (t == RAY_F64) {
                 /* -0.0 -> +0.0 before BOTH the store and the hash. */
-                int64_t kv = group_key_f64_bits(key_data[k], row);
+                int64_t kv = group_key_f64_bits(key_data[k], row - kb);
                 double dv; memcpy(&dv, &kv, 8);
                 ek[k] = kv;
                 kh = ray_hash_f64(dv);
             } else {
-                int64_t kv = read_col_i64(key_data[k], row, t, key_attrs[k]);
+                int64_t kv = read_col_i64(key_data[k], row - kb, t, key_attrs[k]);
                 ek[k] = kv;
                 kh = ray_hash_i64(kv);
             }
@@ -6161,43 +6484,8 @@ void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
         }
         *(uint64_t*)ebuf = h;
 
-        int64_t* ev = (int64_t*)(ebuf + 8 + (size_t)ly->key_region);
-        for (uint32_t a = 0; a < na; a++) {
-            uint8_t af = aflags[a];
-            /* Destination slot comes from the layout, never a running counter:
-             * aggs that reserve no value slot (holistic OP_MEDIAN &c., and
-             * valueless OP_COUNT) carry agg_val_slot == -1, and a running
-             * counter would silently shift every later agg's slot. */
-            int8_t vs = ly->agg_val_slot[a];
-            if (vs < 0) continue;
-            uint8_t vi = (uint8_t)vs;
-            ray_t* ac = agg_vecs[a];
-            if (!ac) continue;
-            if (agg_strlen && agg_strlen[a])
-                ev[vi] = group_strlen_at(ac, row);
-            else if (af & GHT_AF_F64) {
-                double v = group_fp_type(ac->type)
-                    ? group_fp_at(ray_data(ac), ac->type, row)
-                    : group_pack_i64_as_f64(ac, row);
-                memcpy(&ev[vi], &v, sizeof(v));
-            }
-            else
-                ev[vi] = read_col_i64(ray_data(ac), row, ac->type, ac->attrs);
-            vi++;
-            /* Binary aggregator: pack y after x in the same entry. */
-            if ((af & GHT_AF_BINARY) && agg_vecs2 && agg_vecs2[a]) {
-                ray_t* ay = agg_vecs2[a];
-                if (af & GHT_AF_F64) {
-                    double v = group_fp_type(ay->type)
-                        ? group_fp_at(ray_data(ay), ay->type, row)
-                        : group_pack_i64_as_f64(ay, row);
-                    memcpy(&ev[vi], &v, sizeof(v));
-                }
-                else
-                    ev[vi] = group_pack_y_i64(ay, row);
-                vi++;
-            }
-        }
+        ght_pack_aggs(ly, c->agg_vecs, c->agg_vecs2, c->agg_strlen, v,
+                      (int64_t*)(ebuf + 8 + (size_t)ly->key_region), row);
         /* Tail slot: source row index for FIRST/LAST tie-breaking.  Same
          * layout as the radix path's entries so accum_from_entry can read
          * it from the same offset. */
@@ -6206,6 +6494,22 @@ void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
         mask = group_probe_entry(ht, ebuf, key_types, mask);
     }
     scratch_free(ebuf_hdr);   /* NULL (inline ebuf) → no-op */
+}
+
+void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
+                              uint8_t* key_attrs, ray_t** key_vecs, ray_t** agg_vecs,
+                              ray_t** agg_vecs2,
+                              uint8_t* agg_strlen,
+                              ray_t* rowsel,
+                              int64_t start, int64_t end,
+                              const int64_t* match_idx) {
+    group_rows_ctx_t c = {
+        .ht = ht, .key_data = key_data, .key_types = key_types, .key_vecs = key_vecs,
+        .agg_vecs = agg_vecs, .agg_vecs2 = agg_vecs2, .agg_strlen = agg_strlen,
+        .rowsel = rowsel, .match_idx = match_idx,
+    };
+    grp_view_t v = grp_view_whole(key_data, key_attrs);
+    group_rows_body(&c, &v, 0, start, end);
 }
 
 /* ============================================================================
@@ -6508,6 +6812,7 @@ typedef struct {
      * the payload buffers.  Growing 1->2->4->... instead re-copies the whole
      * scattered payload ~2x (28% of ClickBench q16 in memmove). */
     uint32_t       buf_prime;
+    grp_rr_t       rr;            /* range reads (grp_run) */
 } radix_phase1_ctx_t;
 
 /* Pack one row's aggregate input values into the entry staging slots.
@@ -6515,53 +6820,18 @@ typedef struct {
  * two cannot drift; slot indices come from the layout (agg_val_slot), never
  * a running counter. */
 static inline void radix_phase1_pack_aggs(const radix_phase1_ctx_t* c,
+                                          const grp_view_t* v,
                                           const ght_layout_t* ly,
                                           int64_t* agg_vals, int64_t row) {
-    const uint8_t* const aflags = ly->agg_flags;
-    uint16_t na = ly->n_aggs;
-    for (uint32_t a = 0; a < na; a++) {
-        uint8_t af = aflags[a];
-        /* Destination slot from the layout (see group_rows_range): aggs
-         * with no value slot — holistic OP_MEDIAN &c. and valueless
-         * OP_COUNT — carry agg_val_slot == -1 and pack nothing. */
-        int8_t vs = ly->agg_val_slot[a];
-        if (vs < 0) continue;
-        uint8_t vi = (uint8_t)vs;
-        ray_t* ac = c->agg_vecs[a];
-        if (!ac) continue;
-        if (c->agg_strlen && c->agg_strlen[a])
-            agg_vals[vi] = group_strlen_at(ac, row);
-        else if (af & GHT_AF_F64) {
-            double v = group_fp_type(ac->type)
-                ? group_fp_at(ray_data(ac), ac->type, row)
-                : group_pack_i64_as_f64(ac, row);
-            memcpy(&agg_vals[vi], &v, sizeof(v));
-        }
-        else
-            agg_vals[vi] = read_col_i64(ray_data(ac), row, ac->type, ac->attrs);
-        vi++;
-        /* Binary aggregator: read y-side value into the next slot.
-         * Cast non-F64 inputs through read_col_i64 — pearson_corr's
-         * finalize reads both slots as F64 doubles regardless of
-         * input type (i64 will be reinterpreted; for now we only
-         * support F64 inputs cleanly — i64 path is a perf followup). */
-        if ((af & GHT_AF_BINARY) && c->agg_vecs2 && c->agg_vecs2[a]) {
-            ray_t* ay = c->agg_vecs2[a];
-            if (af & GHT_AF_F64) {
-                double v = group_fp_type(ay->type)
-                    ? group_fp_at(ray_data(ay), ay->type, row)
-                    : group_pack_i64_as_f64(ay, row);
-                memcpy(&agg_vals[vi], &v, sizeof(v));
-            }
-            else
-                agg_vals[vi] = group_pack_y_i64(ay, row);
-            vi++;
-        }
-    }
+    ght_pack_aggs(ly, c->agg_vecs, c->agg_vecs2, c->agg_strlen, v, agg_vals, row);
 }
 
-static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
+static void radix_phase1_body(void* ctx, const grp_view_t* v, uint32_t worker_id,
+                              int64_t start, int64_t end) {
     radix_phase1_ctx_t* c = (radix_phase1_ctx_t*)ctx;
+    void* const* key_data = v->key_data;
+    const uint8_t* key_attrs = v->key_attrs;
+    const int64_t kb = v->key_base;   /* keys are read at row - kb */
     const ght_layout_t* ly = &c->layout;
     radix_buf_t* my_bufs = &c->bufs[(size_t)worker_id * c->n_parts];
     uint16_t nk = ly->n_keys;
@@ -6634,17 +6904,17 @@ static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
             if (m == 0) continue;
             for (uint32_t k = 0; k < nk; k++) {
                 if (contiguous)
-                    group_keys_gather_seq(stage[k], c->key_data[k], rowbuf[0], m,
-                                          c->key_types[k], c->key_attrs[k]);
+                    group_keys_gather_seq(stage[k], key_data[k], rowbuf[0] - kb, m,
+                                          c->key_types[k], key_attrs[k]);
                 else
-                    group_keys_gather(stage[k], c->key_data[k], rowbuf, m,
-                                      c->key_types[k], c->key_attrs[k]);
+                    group_keys_gather(stage[k], key_data[k], rowbuf, kb, m,
+                                      c->key_types[k], key_attrs[k]);
             }
             for (uint32_t j = 0; j < m; j++) {
                 int64_t row = rowbuf[j];
                 for (uint32_t k = 0; k < nk; k++) keys[k] = stage[k][j];
                 uint64_t h = ght_hash_lanes(keys, nk);
-                radix_phase1_pack_aggs(c, ly, agg_vals, row);
+                radix_phase1_pack_aggs(c, v, ly, agg_vals, row);
                 uint32_t part = group_radix_part(h, c->n_parts);
                 radix_buf_push(&my_bufs[part], estride, h, keys,
                                agg_vals, nv, row, ly->key_region, c->buf_prime);
@@ -6663,7 +6933,8 @@ static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
         if (!match_idx && c->rowsel && !group_rowsel_pass(c->rowsel, row)) continue;
         uint64_t h = 0;
         if (inline_str) {
-            h = inline_build_keys(ly, c->key_types, c->key_data, c->key_attrs,
+            /* inline STR: a wide-key layout, whose keys are whole columns */
+            h = inline_build_keys(ly, c->key_types, c->key_data, key_attrs,
                                   c->key_pool, c->key_vecs, nullable, row,
                                   keybuf);
         } else {
@@ -6681,12 +6952,12 @@ static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
              * key shape. */
             for (uint32_t k = 0; k < nk; k++) {
                 if (__builtin_expect(nullable && ray_key_may_be_null(c->key_vecs[k])
-                                     && ray_vec_is_null(c->key_vecs[k], row), 0)) {
+                                     && grp_key_null(c->key_vecs[k], v, k, c->key_types[k], row), 0)) {
                     nullw[k >> 6] |= (int64_t)((uint64_t)1 << (k & 63));
                     keys[k] = 0;
                 } else {
-                    keys[k] = read_col_i64(c->key_data[k], row, c->key_types[k],
-                                           c->key_attrs[k]);
+                    keys[k] = read_col_i64(key_data[k], row - kb, c->key_types[k],
+                                           key_attrs[k]);
                 }
             }
             h = ght_hash_lanes(keys, (uint32_t)nk + null_words);
@@ -6695,7 +6966,7 @@ static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
             int8_t t = c->key_types[k];
             uint64_t kh;
             bool is_null = nullable && ray_key_may_be_null(c->key_vecs[k])
-                           && ray_vec_is_null(c->key_vecs[k], row);
+                           && grp_key_null(c->key_vecs[k], v, k, t, row);
             if (is_null) {
                 nullw[k >> 6] |= (int64_t)((uint64_t)1 << (k & 63));
                 keys[k] = 0;
@@ -6705,12 +6976,12 @@ static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                 kh = wide_key_hash_at(ly, k, c->key_data, c->key_pool, row);
             } else if (t == RAY_F64) {
                 /* -0.0 -> +0.0 before BOTH the store and the hash. */
-                int64_t kv = group_key_f64_bits(c->key_data[k], row);
+                int64_t kv = group_key_f64_bits(key_data[k], row - kb);
                 double dv; memcpy(&dv, &kv, 8);
                 keys[k] = kv;
                 kh = ray_hash_f64(dv);
             } else {
-                int64_t kv = read_col_i64(c->key_data[k], row, t, c->key_attrs[k]);
+                int64_t kv = read_col_i64(key_data[k], row - kb, t, key_attrs[k]);
                 keys[k] = kv;
                 kh = ray_hash_i64(kv);
             }
@@ -6720,7 +6991,7 @@ static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
         }
         }
 
-        radix_phase1_pack_aggs(c, ly, agg_vals, row);
+        radix_phase1_pack_aggs(c, v, ly, agg_vals, row);
 
         uint32_t part = group_radix_part(h, c->n_parts);
         radix_buf_push(&my_bufs[part], estride, h,
@@ -6728,6 +6999,13 @@ static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                        agg_vals, nv, row, ly->key_region, c->buf_prime);
     }
     scratch_free(stage_hdr);   /* NULL (inline staging) → no-op */
+}
+
+static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
+    radix_phase1_ctx_t* c = (radix_phase1_ctx_t*)ctx;
+    grp_view_t v = grp_view_whole(c->key_data, c->key_attrs);
+    grp_run(c, radix_phase1_body, &v, &c->rr, c->match_idx ? NULL : c->rowsel, NULL,
+            worker_id, start, end);
 }
 
 /* Process pre-partitioned fat entries into an HT with prefetch batching.
@@ -7225,6 +7503,7 @@ typedef struct {
     uint32_t       ht_grow_cap;      /* slot-count ceiling for HT growth —
                                       * see group_ht_t.grow_cap */
     _Atomic(int)   oom;
+    grp_rr_t       rr;               /* range reads (grp_run; R-SPARSE over match_idx) */
 } radix_v2_phase1_ctx_t;
 
 /* Pack one row's aggregate input values into the entry's agg-value slots.
@@ -7233,46 +7512,29 @@ typedef struct {
  * running counter.  Mirrors radix_phase1_pack_aggs, but tolerates a NULL
  * agg_vecs table (pure-COUNT layouts carry none). */
 static inline void radix_v2_pack_aggs(const radix_v2_phase1_ctx_t* c,
+                                      const grp_view_t* v,
                                       const ght_layout_t* ly,
                                       int64_t* ev, int64_t row) {
-    const uint8_t* const aflags = ly->agg_flags;
-    uint16_t na = ly->n_aggs;
-    for (uint32_t a = 0; a < na; a++) {
-        uint8_t af = aflags[a];
-        int8_t vs = ly->agg_val_slot[a];
-        if (vs < 0) continue;   /* holistic / valueless OP_COUNT */
-        uint8_t vi = (uint8_t)vs;
-        ray_t* ac = c->agg_vecs ? c->agg_vecs[a] : NULL;
-        if (!ac) continue;
-        if (c->agg_strlen && c->agg_strlen[a])
-            ev[vi] = group_strlen_at(ac, row);
-        else if (af & GHT_AF_F64) {
-            double v = group_fp_type(ac->type)
-                ? group_fp_at(ray_data(ac), ac->type, row)
-                : group_pack_i64_as_f64(ac, row);
-            memcpy(&ev[vi], &v, sizeof(v));
-        }
-        else
-            ev[vi] = read_col_i64(ray_data(ac), row, ac->type, ac->attrs);
-        vi++;
-        if ((af & GHT_AF_BINARY) && c->agg_vecs2 && c->agg_vecs2[a]) {
-            ray_t* ay = c->agg_vecs2[a];
-            if (af & GHT_AF_F64) {
-                double v = group_fp_type(ay->type)
-                    ? group_fp_at(ray_data(ay), ay->type, row)
-                    : group_pack_i64_as_f64(ay, row);
-                memcpy(&ev[vi], &v, sizeof(v));
-            }
-            else
-                ev[vi] = group_pack_y_i64(ay, row);
-            vi++;
-        }
-    }
+    ght_pack_aggs(ly, c->agg_vecs, c->agg_vecs2, c->agg_strlen, v, ev, row);
 }
 
-static void radix_v2_phase1_fn(void* ctx, uint32_t worker_id,
-                               int64_t start, int64_t end) {
-    radix_v2_phase1_ctx_t* c = (radix_v2_phase1_ctx_t*)ctx;
+/* One task's phase-1 state, shared by its pieces: the worker's partition
+ * HTs and their live probe masks, the entry staging, and the
+ * partition-major path's counting-sort histogram (NULL: row-major). */
+typedef struct {
+    radix_v2_phase1_ctx_t* c;
+    group_ht_t*  my_hts;
+    uint32_t*    masks;
+    char*        ebuf;
+    const void** kpool;
+    uint32_t*    hist;
+} radix_v2_task_t;
+
+static void radix_v2_phase1_body(void* ctx, const grp_view_t* v, uint32_t worker_id,
+                                 int64_t start, int64_t end) {
+    (void)worker_id;
+    radix_v2_task_t* tk = (radix_v2_task_t*)ctx;
+    radix_v2_phase1_ctx_t* c = tk->c;
     if (atomic_load_explicit(&c->oom, memory_order_relaxed)) return;
     const ght_layout_t* ly = &c->layout;
     uint16_t nk = ly->n_keys;
@@ -7281,32 +7543,13 @@ static void radix_v2_phase1_fn(void* ctx, uint32_t worker_id,
     uint8_t inline_str = ly->any_inline_str;
     uint8_t nullable = c->nullable_mask;
     const int64_t* match_idx = c->match_idx;
-
-    group_ht_t* my_hts = &c->wpart_hts[(size_t)worker_id * c->n_parts];
-    uint32_t masks[c->n_parts];
-    /* A worker may be called for several morsels.  Its partition HTs persist
-     * across calls, so restore each live probe mask instead of treating every
-     * invocation as first use. */
-    for (uint32_t p = 0; p < c->n_parts; p++)
-        masks[p] = my_hts[p].slots ? my_hts[p].ht_cap - 1 : 0;
-
-    /* Stack-resident transient entry + per-key str-pool table, same layout as
-     * group_rows_range.  ≤8 keys/aggs stay on the stack (byte-identical);
-     * wider layouts carve one per-worker heap block ONCE (never per row —
-     * unbounded-slots cut 4): ebuf(entry_stride) | kpool(n_keys ptrs). */
-    char ebuf_stk[8 + 9 * 8 + 8 * 8 + 8];
-    const void* kpool_stk[8];
-    char* ebuf = ebuf_stk;
-    const void** kpool = kpool_stk;
-    ray_t* v2_stage_hdr = NULL;
-    if (ly->entry_stride > sizeof(ebuf_stk) || nk > 8) {
-        char* blk = (char*)scratch_alloc(&v2_stage_hdr,
-            (size_t)ly->entry_stride + (size_t)nk * sizeof(void*));
-        if (!blk) { atomic_store_explicit(&c->oom, 1, memory_order_relaxed); return; }
-        ebuf  = blk;
-        kpool = (const void**)(blk + ly->entry_stride);
-    }
-    derive_key_pool(ly, c->key_vecs, kpool);
+    group_ht_t* my_hts = tk->my_hts;
+    uint32_t* masks = tk->masks;
+    char* ebuf = tk->ebuf;
+    const void** kpool = tk->kpool;
+    void* const* key_data = v->key_data;
+    const uint8_t* key_attrs = v->key_attrs;
+    const int64_t kb = v->key_base;   /* keys are read at row - kb */
 
     /* Partition-major fast path (spec Part A): stage a morsel of rows
      * (hash + partition, no HT access), counting-sort the morsel's
@@ -7327,11 +7570,7 @@ static void radix_v2_phase1_fn(void* ctx, uint32_t worker_id,
      *
      * NOTE: "hashing is identical" is load-bearing and is enforced by the
      * v2_packed branch in the staging loop — see the comment there. */
-    if (!wide_any && !inline_str && !nullable && ly->null_words == 0 &&
-        (ly->need_flags & ~(uint32_t)(GHT_NEED_SUM | GHT_NEED_SUM128)) == 0 &&
-        !(ly->agg_flags_any & (GHT_AF_FIRST | GHT_AF_LAST | GHT_AF_BINARY |
-                               GHT_AF_HOLISTIC)) &&
-        nk >= 1 && nk <= 2 && ly->entry_stride <= 64) {
+    if (tk->hist) {
         enum { V2M = 1024, V2MPF = 8 };
         /* Morsel staging: hashes, key values, source rows, partition ids,
          * partition-order permutation, and the counting-sort histogram.
@@ -7341,7 +7580,8 @@ static void radix_v2_phase1_fn(void* ctx, uint32_t worker_id,
          * morder stays uint16_t — it indexes morsel slots, always <=1024.
          * hist is sized n_parts (not n_parts+1: sparse scheme below writes
          * counts directly into hist[p], no running-offset slot needed) and
-         * is scratch_calloc'd ONCE per dispatch call so it starts zeroed;
+         * is scratch_calloc'd ONCE per dispatch call (radix_v2_phase1_fn,
+         * shared by the task's pieces) so it starts zeroed;
          * each morsel only touches (and only re-zeroes) the partitions it
          * actually hit, tracked via plist, keeping the per-morsel counting
          * sort O(morsel size) instead of O(n_parts) — at 100M rows
@@ -7354,14 +7594,7 @@ static void radix_v2_phase1_fn(void* ctx, uint32_t worker_id,
         uint32_t mpart[V2M];
         uint16_t morder[V2M];
         uint32_t plist[V2M];
-        ray_t* hist_hdr = NULL;
-        uint32_t* hist = (uint32_t*)scratch_calloc(&hist_hdr,
-            (size_t)c->n_parts * sizeof(uint32_t));
-        if (!hist) {
-            atomic_store_explicit(&c->oom, 1, memory_order_relaxed);
-            scratch_free(v2_stage_hdr);
-            return;
-        }
+        uint32_t* hist = tk->hist;
 
         int64_t i = start;
         while (i < end) {
@@ -7382,13 +7615,13 @@ static void radix_v2_phase1_fn(void* ctx, uint32_t worker_id,
                          * (v2_packed never holds with an F64 key — F64 is off
                          * the packed whitelist — but stage the same bits the
                          * generic builder would either way.) */
-                        int64_t kv = group_key_f64_bits(c->key_data[k], row);
+                        int64_t kv = group_key_f64_bits(key_data[k], row - kb);
                         double dv; memcpy(&dv, &kv, 8);
                         mk[(size_t)mn * nk + k] = kv;
                         if (!v2_packed) kh = ray_hash_f64(dv);
                     } else {
-                        int64_t kv = read_col_i64(c->key_data[k], row, t,
-                                                  c->key_attrs[k]);
+                        int64_t kv = read_col_i64(key_data[k], row - kb, t,
+                                                  key_attrs[k]);
                         mk[(size_t)mn * nk + k] = kv;
                         if (!v2_packed) kh = ray_hash_i64(kv);
                     }
@@ -7471,7 +7704,7 @@ static void radix_v2_phase1_fn(void* ctx, uint32_t worker_id,
                  * stay the same size; the source row is mrow[j] and the reads
                  * are identical to the row-major builder's. */
                 if (ly->need_flags)
-                    radix_v2_pack_aggs(c, ly,
+                    radix_v2_pack_aggs(c, v, ly,
                         (int64_t*)(ebuf + 8 + (size_t)ly->key_region), mrow[j]);
                 memcpy(ebuf + ly->entry_stride - 8, &mrow[j], 8);
                 masks[p] = group_probe_entry(&my_hts[p], ebuf,
@@ -7483,8 +7716,6 @@ static void radix_v2_phase1_fn(void* ctx, uint32_t worker_id,
             }
         }
 v2_morsel_done:
-        scratch_free(hist_hdr);
-        scratch_free(v2_stage_hdr);
         return;
     }
 
@@ -7496,7 +7727,8 @@ v2_morsel_done:
         uint64_t h = 0;
         int64_t* ek = (int64_t*)(ebuf + 8);
         if (inline_str) {
-            h = inline_build_keys(ly, c->key_types, c->key_data, c->key_attrs,
+            /* inline STR: a wide-key layout, whose keys are whole columns */
+            h = inline_build_keys(ly, c->key_types, c->key_data, key_attrs,
                                   kpool, c->key_vecs, nullable, row, ebuf + 8);
         } else {
         int64_t* nullw = ek + nk;   /* null-mask words at key_off[nk]==nk*8 */
@@ -7510,11 +7742,11 @@ v2_morsel_done:
              * stay in lockstep with hash_keys_inline (rehash/merge/lookup). */
             for (uint32_t k = 0; k < nk; k++) {
                 if (__builtin_expect(nullable && ray_key_may_be_null(c->key_vecs[k])
-                             && ray_vec_is_null(c->key_vecs[k], row), 0)) {
+                             && grp_key_null(c->key_vecs[k], v, k, c->key_types[k], row), 0)) {
                     nullw[k >> 6] |= (int64_t)((uint64_t)1 << (k & 63));
                     ek[k] = 0;
                 } else {
-                    ek[k] = read_col_i64(c->key_data[k], row, c->key_types[k], c->key_attrs[k]);
+                    ek[k] = read_col_i64(key_data[k], row - kb, c->key_types[k], key_attrs[k]);
                 }
             }
             h = ght_hash_lanes(ek, (uint32_t)nk + null_words);
@@ -7523,7 +7755,7 @@ v2_morsel_done:
             int8_t t = c->key_types[k];
             uint64_t kh;
             bool is_null = nullable && ray_key_may_be_null(c->key_vecs[k])
-                           && ray_vec_is_null(c->key_vecs[k], row);
+                           && grp_key_null(c->key_vecs[k], v, k, t, row);
             if (is_null) {
                 nullw[k >> 6] |= (int64_t)((uint64_t)1 << (k & 63));
                 ek[k] = 0;
@@ -7533,12 +7765,12 @@ v2_morsel_done:
                 kh = wide_key_hash_at(ly, k, c->key_data, kpool, row);
             } else if (t == RAY_F64) {
                 /* -0.0 -> +0.0 before BOTH the store and the hash. */
-                int64_t kv = group_key_f64_bits(c->key_data[k], row);
+                int64_t kv = group_key_f64_bits(key_data[k], row - kb);
                 double dv; memcpy(&dv, &kv, 8);
                 ek[k] = kv;
                 kh = ray_hash_f64(dv);
             } else {
-                int64_t kv = read_col_i64(c->key_data[k], row, t, c->key_attrs[k]);
+                int64_t kv = read_col_i64(key_data[k], row - kb, t, key_attrs[k]);
                 ek[k] = kv;
                 kh = ray_hash_i64(kv);
             }
@@ -7553,7 +7785,7 @@ v2_morsel_done:
          * skips every agg slot; packing here would be a wasted column
          * read per row (a measurable regression on q15-class queries). */
         if (ly->need_flags)
-            radix_v2_pack_aggs(c, ly,
+            radix_v2_pack_aggs(c, v, ly,
                                (int64_t*)(ebuf + 8 + (size_t)ly->key_region), row);
         memcpy(ebuf + ly->entry_stride - 8, &row, 8);
         uint32_t p = group_radix_part(h, c->n_parts);
@@ -7581,8 +7813,67 @@ v2_morsel_done:
         }
         masks[p] = new_mask;
     }
+}
+
+static void radix_v2_phase1_fn(void* ctx, uint32_t worker_id,
+                               int64_t start, int64_t end) {
+    radix_v2_phase1_ctx_t* c = (radix_v2_phase1_ctx_t*)ctx;
+    if (atomic_load_explicit(&c->oom, memory_order_relaxed)) return;
+    const ght_layout_t* ly = &c->layout;
+    uint16_t nk = ly->n_keys;
+    uint8_t wide_any = ly->any_wide_key;
+    uint8_t inline_str = ly->any_inline_str;
+    uint8_t nullable = c->nullable_mask;
+
+    group_ht_t* my_hts = &c->wpart_hts[(size_t)worker_id * c->n_parts];
+    uint32_t masks[c->n_parts];
+    /* A worker may be called for several morsels.  Its partition HTs persist
+     * across calls, so restore each live probe mask instead of treating every
+     * invocation as first use. */
+    for (uint32_t p = 0; p < c->n_parts; p++)
+        masks[p] = my_hts[p].slots ? my_hts[p].ht_cap - 1 : 0;
+
+    /* Stack-resident transient entry + per-key str-pool table, same layout as
+     * group_rows_range.  ≤8 keys/aggs stay on the stack (byte-identical);
+     * wider layouts carve one per-worker heap block ONCE (never per row —
+     * unbounded-slots cut 4): ebuf(entry_stride) | kpool(n_keys ptrs). */
+    char ebuf_stk[8 + 9 * 8 + 8 * 8 + 8];
+    const void* kpool_stk[8];
+    char* ebuf = ebuf_stk;
+    const void** kpool = kpool_stk;
+    ray_t* v2_stage_hdr = NULL;
+    if (ly->entry_stride > sizeof(ebuf_stk) || nk > 8) {
+        char* blk = (char*)scratch_alloc(&v2_stage_hdr,
+            (size_t)ly->entry_stride + (size_t)nk * sizeof(void*));
+        if (!blk) { atomic_store_explicit(&c->oom, 1, memory_order_relaxed); return; }
+        ebuf  = blk;
+        kpool = (const void**)(blk + ly->entry_stride);
+    }
+    derive_key_pool(ly, c->key_vecs, kpool);
+
+    /* The partition-major path of radix_v2_phase1_body takes this shape. */
+    ray_t* hist_hdr = NULL;
+    uint32_t* hist = NULL;
+    if (!wide_any && !inline_str && !nullable && ly->null_words == 0 &&
+        (ly->need_flags & ~(uint32_t)(GHT_NEED_SUM | GHT_NEED_SUM128)) == 0 &&
+        !(ly->agg_flags_any & (GHT_AF_FIRST | GHT_AF_LAST | GHT_AF_BINARY |
+                               GHT_AF_HOLISTIC)) &&
+        nk >= 1 && nk <= 2 && ly->entry_stride <= 64) {
+        hist = (uint32_t*)scratch_calloc(&hist_hdr, (size_t)c->n_parts * sizeof(uint32_t));
+        if (!hist) {
+            atomic_store_explicit(&c->oom, 1, memory_order_relaxed);
+            scratch_free(v2_stage_hdr);
+            return;
+        }
+    }
+    radix_v2_task_t tk = { c, my_hts, masks, ebuf, kpool, hist };
+    grp_view_t v = grp_view_whole(c->key_data, c->key_attrs);
+    grp_run(&tk, radix_v2_phase1_body, &v, &c->rr, c->match_idx ? NULL : c->rowsel,
+            c->rr.staged ? c->match_idx : NULL, worker_id, start, end);
+    scratch_free(hist_hdr);
     scratch_free(v2_stage_hdr);   /* NULL (inline staging) → no-op */
 }
+
 
 typedef struct {
     group_ht_t*   wpart_hts;     /* [n_workers * n_parts] — input */
@@ -9111,15 +9402,35 @@ static bool scalar_stageable(int8_t t, uint16_t op) {
 /* A staged input's plain column for a site that reads whole columns: the
  * source's materialization (a generation-2 column decodes once, through
  * its once-state), retained and owned by the caller's slot. */
-static ray_t* agg_unstage(ray_col_src_t* src, ray_t** vec, uint8_t* owned) {
-    ray_t* plain = NULL;
-    ray_t* err = ray_col_src_plain(src, &plain);   /* random: a route that reads whole columns */
-    if (err) return err;
+/* Take `plain` (a source's plain column, borrowed) into a caller's slot:
+ * retained and owned.  NULL or an owned error. */
+static ray_t* group_own_plain(ray_t* plain, ray_t** vec, uint8_t* owned) {
     if (!plain) return ray_error("domain", "aggregate input: no column");
     ray_retain(plain);
     *vec = plain;
     *owned = 1;
     return NULL;
+}
+
+static ray_t* agg_unstage(ray_col_src_t* src, ray_t** vec, uint8_t* owned) {
+    ray_t* plain = NULL;
+    ray_t* err = ray_col_src_plain(src, &plain);   /* random: a route that reads whole columns */
+    return err ? err : group_own_plain(plain, vec, owned);
+}
+
+/* A zero-length column of a staged source's type standing in for it where
+ * a route reads the column's type, SYM width and domain (layouts, emits);
+ * NULL on OOM. */
+static ray_t* group_src_standin(const ray_col_src_t* s) {
+    ray_t* v = s->type == RAY_SYM ? ray_sym_vec_new(s->attrs & RAY_SYM_W_MASK, 0)
+                                  : ray_vec_new(s->type, 0);
+    if (!v || RAY_IS_ERR(v)) {
+        if (v) ray_error_free(v);
+        return NULL;
+    }
+    if (s->type == RAY_SYM && s->obj->type == RAY_ENCCOL) ray_enccol_adopt_domain(v, s->obj);
+    v->len = 0;
+    return v;
 }
 
 /* The columns emit_agg_columns reads (type, SYM domain): agg_vecs, with a
@@ -9136,18 +9447,13 @@ static ray_t** scalar_emit_vecs(ray_t** hdr, ray_t** agg_vecs, ray_col_src_t** a
     for (uint32_t a = 0; a < n_aggs; a++) {
         ev[a] = agg_vecs[a];
         if (agg_vecs[a] || !agg_srcs[a]) continue;
-        const ray_col_src_t* s = agg_srcs[a];
-        ray_t* v = s->type == RAY_SYM ? ray_sym_vec_new(s->attrs & RAY_SYM_W_MASK, 0)
-                                      : ray_vec_new(s->type, 0);
-        if (!v || RAY_IS_ERR(v)) {
-            if (v) ray_error_free(v);
+        ray_t* v = group_src_standin(agg_srcs[a]);
+        if (!v) {
             for (uint32_t j = 0; j < a; j++) if (!agg_vecs[j] && ev[j]) ray_release(ev[j]);
             scratch_free(*hdr);
             *hdr = NULL;
             return NULL;
         }
-        if (s->type == RAY_SYM && s->obj->type == RAY_ENCCOL) ray_enccol_adopt_domain(v, s->obj);
-        v->len = 0;
         ev[a] = v;
     }
     return ev;
@@ -10017,16 +10323,18 @@ typedef struct {
     int64_t*      row_gid;          /* output [nrows] */
     const int64_t* match_idx;
     ray_t*        rowsel;           /* non-NULL when selection carried as rowsel */
+    grp_rr_t      rr;               /* range reads (grp_run) */
 } reprobe_ctx_t;
 
 /* Resolve one source row to the flat partition-local group id.  The caller
  * owns reusable key staging so a scan performs no per-row allocation. */
-static inline int64_t reprobe_flat_gid(const reprobe_ctx_t* c, int64_t row,
-                                       int64_t* ek_buf, char* keybuf) {
+static inline int64_t reprobe_flat_gid(const reprobe_ctx_t* c, const grp_view_t* v,
+                                       int64_t row, int64_t* ek_buf, char* keybuf) {
     uint32_t nk = c->n_keys;
     int8_t* key_types = c->key_types;
-    void** key_data = c->key_data;
-    uint8_t* key_attrs = c->key_attrs;
+    void* const* key_data = v->key_data;
+    const uint8_t* key_attrs = v->key_attrs;
+    const int64_t kb = v->key_base;   /* keys are read at row - kb */
     ray_t** key_vecs = c->key_vecs;
     uint8_t nullable = c->nullable_mask;
     const uint8_t* const kflags = c->layout->key_flags;
@@ -10035,7 +10343,8 @@ static inline int64_t reprobe_flat_gid(const reprobe_ctx_t* c, int64_t row,
     const int64_t* lookup_keys;
 
     if (c->layout->any_inline_str) {
-        h = inline_build_keys(c->layout, key_types, key_data, key_attrs,
+        /* inline STR: a wide-key layout, whose keys are whole columns */
+        h = inline_build_keys(c->layout, key_types, c->key_data, key_attrs,
                               c->key_pool, key_vecs, nullable, row, keybuf);
         lookup_keys = (const int64_t*)keybuf;
     } else {
@@ -10050,11 +10359,11 @@ static inline int64_t reprobe_flat_gid(const reprobe_ctx_t* c, int64_t row,
              * stay in lockstep with hash_keys_inline (rehash/merge/lookup). */
             for (uint32_t k = 0; k < nk; k++) {
                 if (__builtin_expect(nullable && ray_key_may_be_null(key_vecs[k])
-                             && ray_vec_is_null(key_vecs[k], row), 0)) {
+                             && grp_key_null(key_vecs[k], v, k, key_types[k], row), 0)) {
                     nullw[k >> 6] |= (int64_t)((uint64_t)1 << (k & 63));
                     ek_buf[k] = 0;
                 } else {
-                    ek_buf[k] = read_col_i64(key_data[k], row, key_types[k], key_attrs[k]);
+                    ek_buf[k] = read_col_i64(key_data[k], row - kb, key_types[k], key_attrs[k]);
                 }
             }
             h = ght_hash_lanes(ek_buf, (uint32_t)nk + null_words);
@@ -10063,23 +10372,23 @@ static inline int64_t reprobe_flat_gid(const reprobe_ctx_t* c, int64_t row,
             int8_t t = key_types[k];
             uint64_t kh;
             bool is_null = nullable && ray_key_may_be_null(key_vecs[k])
-                           && ray_vec_is_null(key_vecs[k], row);
+                           && grp_key_null(key_vecs[k], v, k, t, row);
             if (is_null) {
                 nullw[k >> 6] |= (int64_t)((uint64_t)1 << (k & 63));
                 ek_buf[k] = 0;
                 kh = ray_hash_i64(0);
             } else if (wide_any && (kflags[k] & GHT_KEYF_WIDE)) {
                 ek_buf[k] = row;
-                kh = wide_key_hash_at(c->layout, k, key_data, c->key_pool, row);
+                kh = wide_key_hash_at(c->layout, k, c->key_data, c->key_pool, row);
             } else if (t == RAY_F64) {
                 /* -0.0 -> +0.0 before BOTH the store and the hash — the
                  * reprobe MUST derive the same bits phase 1 stored. */
-                int64_t kv = group_key_f64_bits(key_data[k], row);
+                int64_t kv = group_key_f64_bits(key_data[k], row - kb);
                 double dv; memcpy(&dv, &kv, 8);
                 ek_buf[k] = kv;
                 kh = ray_hash_f64(dv);
             } else {
-                int64_t kv = read_col_i64(key_data[k], row, t, key_attrs[k]);
+                int64_t kv = read_col_i64(key_data[k], row - kb, t, key_attrs[k]);
                 ek_buf[k] = kv;
                 kh = ray_hash_i64(kv);
             }
@@ -10098,8 +10407,8 @@ static inline int64_t reprobe_flat_gid(const reprobe_ctx_t* c, int64_t row,
     return (int64_t)c->part_offsets[part] + local;
 }
 
-static void reprobe_rows_fn(void* vctx, uint32_t worker_id,
-                            int64_t start, int64_t end) {
+static void reprobe_rows_body(void* vctx, const grp_view_t* v, uint32_t worker_id,
+                              int64_t start, int64_t end) {
     (void)worker_id;
     reprobe_ctx_t* c = (reprobe_ctx_t*)vctx;
     /* Key lookup staging: ≤8 keys stay on the stack (ek_buf: 8 keys + 1 null
@@ -10129,7 +10438,7 @@ static void reprobe_rows_fn(void* vctx, uint32_t worker_id,
             c->row_gid[row] = -1;
             continue;
         }
-        int64_t flat = reprobe_flat_gid(c, row, ek_buf, keybuf);
+        int64_t flat = reprobe_flat_gid(c, v, row, ek_buf, keybuf);
         if (flat < 0) {
             c->row_gid[row] = -1;
         } else {
@@ -10138,6 +10447,15 @@ static void reprobe_rows_fn(void* vctx, uint32_t worker_id,
         }
     }
     scratch_free(rp_stage_hdr);   /* NULL (inline staging) → no-op */
+}
+
+/* Rows a selection rejects in whole morsels are skipped unread: the caller
+ * pre-fills row_gid with -1. */
+static void reprobe_rows_fn(void* vctx, uint32_t worker_id, int64_t start, int64_t end) {
+    reprobe_ctx_t* c = (reprobe_ctx_t*)vctx;
+    grp_view_t v = grp_view_whole(c->key_data, c->key_attrs);
+    grp_run(c, reprobe_rows_body, &v, &c->rr, c->match_idx ? NULL : c->rowsel, NULL,
+            worker_id, start, end);
 }
 
 /* Histogram + scatter for idx_buf construction.  Identical pattern to
@@ -13909,11 +14227,12 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     }
 
 da_path:;
-    /* The direct-array routes (DA, the sparse-dynamic count) read staged
-     * keys and inputs by range.  Every other route reads plain columns: a
-     * staged key or input takes its plain column at GROUP_UNSTAGE
-     * (materializing a generation-2 one, as ray_table_col did), retained
-     * and owned, and the bound sources are not used past that point. */
+    /* The direct-array routes (DA, the sparse-dynamic count) and the
+     * fat-entry routes at ht_path read staged keys and inputs by range.
+     * The single-key sparse paths read plain columns: a staged key or
+     * input takes its plain column at GROUP_UNSTAGE (materializing a
+     * generation-2 one, as ray_table_col did), retained and owned, and the
+     * bound sources are not used past that point. */
     #define GROUP_UNSTAGE() do { \
         for (uint32_t k_ = 0; k_ < n_keys; k_++) { \
             if (key_vecs[k_] || !key_srcs[k_]) continue; \
@@ -14973,10 +15292,9 @@ da_path:;
         }
     }
 
-    /* Staged columns stay staged only for the sparse-dynamic count below. */
-    if (!(n_keys == 1 && use_emit_filter && n_scan <= UINT32_MAX &&
-          (emit_filter.min_count_exclusive > 0 || emit_filter.top_count_take > 0)))
-        GROUP_UNSTAGE();
+    /* Staged columns stay staged for the sparse-dynamic count and the
+     * fat-entry routes at ht_path; the single-key sparse paths between
+     * them take their plain columns (below). */
     {
         /* n_aggs <= 64: same mask-width bound as da_eligible above — this
          * path's independent agg_f64_mask is also a uint64_t.  Beyond 64
@@ -15135,7 +15453,7 @@ da_path:;
                     return sp_r;
                 }
             }
-            /* The paths below read plain columns. */
+            /* The single-key sparse paths below read plain columns. */
             if (grp_staged) {
                 GROUP_UNSTAGE();
                 for (uint32_t a = 0; a < n_aggs; a++) {
@@ -15639,9 +15957,75 @@ da_path:;
     }
 
 ht_path:;
-    GROUP_UNSTAGE();
     #undef GROUP_UNSTAGE
-    #undef AGG_OWN_SRC_RELEASE
+    /* The fat-entry routes below (radix phase 1, its v2 sibling, the
+     * holistic reprobe, the serial fallback) read staged keys and inputs by
+     * range (R-WALK; R-SPARSE over the v2 survivor list).  Random-access
+     * readers take their plain columns here (R-RANDOM): every key of a
+     * group-by with a wide key (STR, GUID, LIST), because equality compares
+     * every key at stored rows, and exactly the inputs of the holistic
+     * aggregates, whose per-group buffers gather stored rows. */
+    bool ht_wide = false;
+    for (uint32_t k = 0; k < n_keys; k++)
+        if (key_types[k] == RAY_STR || key_types[k] == RAY_GUID || key_types[k] == RAY_LIST)
+            ht_wide = true;
+    if (grp_staged) {
+        for (uint32_t k = 0; k < n_keys && ht_wide; k++) {
+            if (key_vecs[k] || !key_srcs[k]) continue;
+            ray_t* pv = NULL;
+            ray_t* uerr = ray_col_src_plain(key_srcs[k], &pv);   /* random: wide key */
+            if (!uerr) uerr = group_own_plain(pv, &key_vecs[k], &key_owned[k]);
+            if (uerr) { rerr = uerr; goto resolve_fail; }
+            key_srcs[k]  = NULL;
+            key_data[k]  = ray_data(key_vecs[k]);
+            key_types[k] = key_vecs[k]->type;
+            key_attrs[k] = key_vecs[k]->attrs;
+        }
+        for (uint32_t a = 0; a < n_aggs; a++) {
+            if (agg_vecs[a] || !agg_srcs[a]) continue;
+            uint16_t op = ext->agg_ops[a];
+            if (op != OP_MEDIAN && op != OP_QUANTILE && op != OP_MODE && op != OP_TOP_N &&
+                op != OP_BOT_N && !agg_needs_row_gather(agg_srcs[a]->type, op))
+                continue;
+            ray_t* pv = NULL;
+            ray_t* uerr = ray_col_src_plain(agg_srcs[a], &pv);   /* random: holistic aggregate */
+            if (!uerr) uerr = group_own_plain(pv, &agg_vecs[a], &agg_owned[a]);
+            if (uerr) { rerr = uerr; goto resolve_fail; }
+        }
+        grp_staged = false;
+        for (uint32_t k = 0; k < n_keys; k++) if (key_srcs[k] && !key_vecs[k]) grp_staged = true;
+        for (uint32_t a = 0; a < n_aggs; a++)
+            if ((!agg_vecs[a] && agg_srcs[a]) || (!agg_vecs2[a] && agg_srcs2[a])) grp_staged = true;
+    }
+    /* A staged context: each staged column gets a zero-length stand-in
+     * (type, SYM width and domain, HAS_NULLS when the source may hold
+     * nulls), owned like a materialized one, so the layout, the
+     * nullability gates and the emits below read it as the column; the
+     * builders read the source (ht_srcs, keys then inputs then y-sides). */
+    uint32_t ht_n_src = n_keys + 2u * n_aggs;
+    ray_t* ht_rr_hdr = NULL;
+    ray_col_src_t** ht_srcs = NULL;
+    const void** ht_plain = NULL;
+    if (grp_staged) {
+        char* blk = (char*)scratch_calloc(&ht_rr_hdr, (size_t)ht_n_src * 2 * sizeof(void*));
+        if (!blk) { rerr = ray_error("oom", NULL); goto resolve_fail; }
+        ht_srcs = (ray_col_src_t**)(void*)blk;
+        ht_plain = (const void**)(void*)(blk + (size_t)ht_n_src * sizeof(void*));
+        for (uint32_t i = 0; i < ht_n_src; i++) {
+            uint32_t k = i, a = i - n_keys, y = i - n_keys - n_aggs;
+            ray_col_src_t* src = i < n_keys ? (key_vecs[k] ? NULL : key_srcs[k])
+                               : i < n_keys + n_aggs ? (agg_vecs[a] ? NULL : agg_srcs[a])
+                               : (agg_vecs2[y] ? NULL : agg_srcs2[y]);
+            if (!src) continue;
+            ray_t* sv = group_src_standin(src);
+            if (!sv) { scratch_free(ht_rr_hdr); rerr = ray_error("oom", NULL); goto resolve_fail; }
+            if (src->may_null) sv->attrs |= RAY_ATTR_HAS_NULLS;
+            ht_srcs[i] = src;                     /* staged: ht_plain[i] stays NULL */
+            if (i < n_keys)                { key_vecs[k] = sv;  key_owned[k] = 1; }
+            else if (i < n_keys + n_aggs)  { agg_vecs[a] = sv;  agg_owned[a] = 1; }
+            else                           { agg_vecs2[y] = sv; agg_owned2[y] = 1; }
+        }
+    }
     /* n_aggs > 8 guard RETIRED (unbounded-slots cut 4): the HT row-layout is
      * now layout-sized end to end (ght_layout_t agg metadata is unbounded, the
      * entry-staging buffers spill past 8), so this fallback — reached by the
@@ -15657,6 +16041,8 @@ ht_path:;
               if (agg_owned2[a] && agg_vecs2[a]) ray_release(agg_vecs2[a]); }
         for (uint32_t k = 0; k < n_keys; k++)
             if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+        AGG_OWN_SRC_RELEASE();
+        scratch_free(ht_rr_hdr);
         if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
         return ray_error("oom", NULL);
     }
@@ -15699,9 +16085,12 @@ ht_path:;
               if (agg_owned2[a] && agg_vecs2[a]) ray_release(agg_vecs2[a]); }
         for (uint32_t k = 0; k < n_keys; k++)
             if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+        AGG_OWN_SRC_RELEASE();
+        scratch_free(ht_rr_hdr);
         if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
         return ray_error("limit", "group: layout stride/slot budget exceeded (or OOM)");
     }
+
 
     /* Sequential fallback grows strictly from observed groups. */
     uint32_t ht_cap = 2;
@@ -15740,6 +16129,55 @@ ht_path:;
     ray_t* topn_fuse_hdr = NULL;
     ray_t* topn_fuse_cnt_hdr = NULL;
     topn_fuse_t topn_fuse = {0};
+
+    /* The builders' range reads: the staged sources beside plain ones
+     * bound for the walk (a key or input without a graph source is bound
+     * into the route's own source), read in place.  Only the inputs that
+     * own a value slot are read: COUNT and holistic inputs are not. */
+    grp_rr_t ht_rr = { .n_keys = n_keys, .n_aggs = n_aggs, .key_types = key_types };
+    ray_scan_fail_t ht_fail;
+    ray_scan_fail_init(&ht_fail);
+    if (grp_staged) {
+        ray_t* berr = NULL;
+        for (uint32_t k = 0; k < n_keys && !berr; k++) {
+            if (ht_wide) { ht_srcs[k] = NULL; continue; }   /* plain, read whole */
+            if (ht_srcs[k]) continue;                        /* staged */
+            if (key_own_src[k].obj) ray_col_src_release(&key_own_src[k]);
+            berr = ray_col_src_bind(key_vecs[k], &key_own_src[k]);
+            ht_srcs[k] = &key_own_src[k];
+            ht_plain[k] = key_data[k];
+        }
+        for (uint32_t a = 0; a < n_aggs && !berr; a++) {
+            uint32_t i = n_keys + a, j = n_keys + n_aggs + a;
+            bool slot = ght_layout.agg_val_slot[a] >= 0;
+            if (!slot) ht_srcs[i] = NULL;
+            else if (!ht_srcs[i] && agg_vecs[a]) {
+                if (agg_srcs[a]) ht_srcs[i] = agg_srcs[a];
+                else {
+                    if (agg_own_src[a].obj) ray_col_src_release(&agg_own_src[a]);
+                    berr = ray_col_src_bind(agg_vecs[a], &agg_own_src[a]);
+                    ht_srcs[i] = &agg_own_src[a];
+                }
+                ht_plain[i] = ray_data(agg_vecs[a]);
+            }
+            if (!slot || !(ght_layout.agg_flags[a] & GHT_AF_BINARY)) ht_srcs[j] = NULL;
+            else if (!ht_srcs[j] && agg_vecs2[a] && !berr) {
+                if (agg_own_src2[a].obj) ray_col_src_release(&agg_own_src2[a]);
+                berr = ray_col_src_bind(agg_vecs2[a], &agg_own_src2[a]);
+                ht_srcs[j] = &agg_own_src2[a];
+                ht_plain[j] = ray_data(agg_vecs2[a]);
+            }
+        }
+        if (berr) { result = berr; goto cleanup; }
+        for (uint32_t i = 0; i < ht_n_src; i++)
+            if (ht_srcs[i] && !ht_plain[i]) ray_col_src_advise(ht_srcs[i], 0, nrows);
+        ht_rr.srcs = ht_srcs;
+        ht_rr.plain = ht_plain;
+        ht_rr.n_src = ht_n_src;
+        ht_rr.fail = &ht_fail;
+        ht_rr.staged = true;
+        ht_rr.keys_walked = !ht_wide;
+    }
 
     /* ---- top-N ordering-agg resolution, hoisted above the parallel section.
      * Phase 2 now runs each partition's top-k itself, while the partition is
@@ -15967,14 +16405,27 @@ ht_path:;
                 .ht_init_block = v2_cap > 2 ? v2_cap / 2 : 1,
                 .ht_grow_cap   = v2_grow,
                 .oom           = 0,
+                .rr            = ht_rr,
             };
             /* By-value embed the layout, fixing its base pointers to v2p1's
              * own inline arrays (inline) / shared spill (wide); the master
              * ght_layout outlives this dispatch. */
             ght_layout_copy(&v2p1.layout, &ght_layout);
+            ray_scan_fail_init(&ht_fail);
             ray_pool_dispatch(pool, radix_v2_phase1_fn, &v2p1,
                               sel_match ? sel_n : n_scan);
             if (sel_match_block) ray_release(sel_match_block);
+            /* R-FAIL: a range error (or a cancelled staged dispatch) is the
+             * answer; the worker HTs are discarded. */
+            ray_t* v2_ferr = ht_rr.staged ? ray_scan_fail_finish(&ht_fail, pool) : NULL;
+            if (v2_ferr) {
+                for (size_t i = 0; i < v2_n_w; i++)
+                    group_ht_free(&wpart_hts[i]);
+                scratch_free(wpart_hdr);
+                scratch_free(v2_part_hdr);
+                result = v2_ferr;
+                goto cleanup;
+            }
             CHECK_CANCEL_GOTO(pool, cleanup);
             if (atomic_load_explicit(&v2p1.oom, memory_order_relaxed)) {
                 for (size_t i = 0; i < v2_n_w; i++)
@@ -16064,6 +16515,7 @@ v2_done:;
             .match_idx     = match_idx,
             .buf_prime     = (uint32_t)((uint64_t)(n_scan > 0 ? n_scan : 1)
                                 / ((uint64_t)n_total * radix_n_parts) * 5 / 4 + 8),
+            .rr            = ht_rr,
         };
         ght_layout_copy(&p1ctx.layout, &ght_layout);
         /* Wide-key str-pool table (n_keys slots): carve once (never per row);
@@ -16075,8 +16527,14 @@ v2_done:;
             if (!p1ctx.key_pool) { result = ray_error("oom", NULL); goto cleanup; }
             derive_key_pool(&ght_layout, key_vecs, p1ctx.key_pool);
         }
+        ray_scan_fail_init(&ht_fail);
         ray_pool_dispatch(pool, radix_phase1_fn, &p1ctx, n_scan);
         scratch_free(p1_kp_hdr);
+        if (ht_rr.staged) {
+            /* R-FAIL: the scattered entries are discarded at cleanup */
+            ray_t* p1_ferr = ray_scan_fail_finish(&ht_fail, pool);
+            if (p1_ferr) { result = p1_ferr; goto cleanup; }
+        }
         CHECK_CANCEL_GOTO(pool, cleanup);
 
         /* Check for OOM during phase 1 radix buffer growth */
@@ -16707,6 +17165,7 @@ v2_emit:;
                 .row_gid = row_gid,
                 .match_idx = match_idx,
                 .rowsel = rowsel,
+                .rr = ht_rr,
             };
             /* Wide-key str-pool table (n_keys slots): carve once here (never
              * per row); NULL when no wide keys — cut 4. */
@@ -16717,8 +17176,19 @@ v2_emit:;
                 if (!rp.key_pool) { scratch_free(rg_hdr); result = ray_error("oom", NULL); goto cleanup; }
                 derive_key_pool(&ght_layout, key_vecs, rp.key_pool);
             }
+            ray_scan_fail_init(&ht_fail);
             ray_pool_dispatch(pool, reprobe_rows_fn, &rp, n_scan);
             scratch_free(rp_kp_hdr);
+            ray_t* rp_ferr = ht_rr.staged ? ray_scan_fail_finish(&ht_fail, pool) : NULL;
+            if (rp_ferr) {
+                /* R-FAIL: the result under construction is discarded */
+                scratch_free(rg_hdr);
+                for (uint32_t k = 0; k < n_keys; k++) if (key_cols[k]) ray_release(key_cols[k]);
+                for (uint32_t a = 0; a < n_aggs; a++) if (agg_cols[a]) ray_release(agg_cols[a]);
+                ray_release(result);
+                result = rp_ferr;
+                goto cleanup;
+            }
 
             /* Build idx_buf + offsets + grp_cnt via histogram/scatter.
              *
@@ -16968,10 +17438,25 @@ sequential_fallback:;
         result = ray_error("oom", NULL);
         goto cleanup;
     }
-    group_rows_range(&single_ht, key_data, key_types, key_attrs, key_vecs, agg_vecs,
-                     agg_vecs2, agg_strlen, rowsel,
-                     0, n_scan, match_idx);
     final_ht = &single_ht;
+    if (ht_rr.staged) {
+        /* the serial builder by pieces (worker 0) */
+        group_rows_ctx_t grc = {
+            .ht = &single_ht, .key_data = key_data, .key_types = key_types,
+            .key_vecs = key_vecs, .agg_vecs = agg_vecs, .agg_vecs2 = agg_vecs2,
+            .agg_strlen = agg_strlen, .rowsel = rowsel, .match_idx = match_idx,
+            .rr = ht_rr,
+        };
+        grp_view_t gv = grp_view_whole(key_data, key_attrs);
+        ray_scan_fail_init(&ht_fail);
+        grp_run(&grc, group_rows_body, &gv, &grc.rr, match_idx ? NULL : rowsel, NULL, 0, 0, n_scan);
+        ray_t* sq_ferr = ray_scan_fail_finish(&ht_fail, NULL);
+        if (sq_ferr) { result = sq_ferr; goto cleanup; }
+    } else {
+        group_rows_range(&single_ht, key_data, key_types, key_attrs, key_vecs, agg_vecs,
+                         agg_vecs2, agg_strlen, rowsel,
+                         0, n_scan, match_idx);
+    }
     if (ray_interrupted()) { result = ray_error("cancel", "interrupted"); goto cleanup; }
     if (single_ht.oom) { result = ray_error("oom", NULL); goto cleanup; }
 
@@ -17063,6 +17548,7 @@ sequential_fallback:;
      * Built lazily on first need and reused across all median slots. */
     ray_t** med_out = NULL;
     ray_t* med_hdr = NULL;
+    ray_t* hol_err = NULL;   /* the reprobe's range error or a cancel */
     if (ly->agg_flags_any & GHT_AF_HOLISTIC) {
         med_out = (ray_t**)scratch_calloc(&med_hdr,
             (size_t)n_aggs * sizeof(ray_t*));
@@ -17087,100 +17573,47 @@ sequential_fallback:;
                 uint8_t reprobe_nullable_s = 0;   /* 0/1: any key may be null */
                 for (uint32_t k = 0; k < n_keys; k++)
                     if (ray_key_may_be_null(key_vecs[k])) { reprobe_nullable_s = 1; break; }
-                /* Key lookup staging + per-key str-pool table: stack for ≤8
-                 * keys, one heap block for wider (carved once — cut 4). */
+                /* Per-key str-pool table: stack for ≤8 keys, one heap
+                 * block for wider (carved once — cut 4). */
                 const void* reprobe_pool_stk[8];
-                int64_t ek_buf_stk[9];
-                char    keybuf_stk[136];
                 const void** reprobe_pool = reprobe_pool_stk;
-                int64_t* ek_buf = ek_buf_stk;
-                char*    keybuf = keybuf_stk;
                 ray_t*   hol_stage_hdr = NULL;
-                if ((size_t)ly->key_region > sizeof(ek_buf_stk) || n_keys > 8) {
-                    size_t kb = ly->key_region;
-                    char* blk = (char*)scratch_alloc(&hol_stage_hdr,
-                        kb + kb + (size_t)n_keys * sizeof(void*));
-                    if (!blk) {
+                if (n_keys > 8) {
+                    reprobe_pool = (const void**)scratch_alloc(&hol_stage_hdr,
+                        (size_t)n_keys * sizeof(void*));
+                    if (!reprobe_pool) {
                         scratch_free(rg_hdr); scratch_free(cnt_hdr_s);
                         scratch_free(off_hdr_s); scratch_free(pos_hdr_s);
                         result = ray_error("oom", NULL); goto cleanup;
                     }
-                    keybuf       = blk;
-                    ek_buf       = (int64_t*)(blk + kb);
-                    reprobe_pool = (const void**)(blk + kb + kb);
                 }
                 derive_key_pool(ly, key_vecs, reprobe_pool);
-                for (int64_t i = 0; i < n_scan; i++) {
+                /* The reprobe (reprobe_rows_fn on the one HT, worker 0)
+                 * honours the pushed WHERE itself: the holistic fill
+                 * re-scans rows independently of the streaming
+                 * accumulators, so rows a rowsel rejects map to no group
+                 * (-1) — otherwise median/top would aggregate the
+                 * unfiltered group, diverging from every other agg. */
+                memset(row_gid, 0xff, (size_t)nrows * sizeof(int64_t));
+                uint32_t srp_off0 = 0;
+                reprobe_ctx_t srp = {
+                    .key_data = key_data, .key_types = key_types, .key_attrs = key_attrs,
+                    .key_vecs = key_vecs, .n_keys = n_keys,
+                    .nullable_mask = reprobe_nullable_s, .layout = ly,
+                    .key_pool = reprobe_pool, .part_hts = final_ht,
+                    .part_offsets = &srp_off0, .group_out = NULL, .n_parts = 1,
+                    .row_gid = row_gid, .match_idx = match_idx, .rowsel = rowsel,
+                    .rr = ht_rr,
+                };
+                ray_scan_fail_init(&ht_fail);
+                reprobe_rows_fn(&srp, 0, 0, n_scan);
+                hol_err = ht_rr.staged ? ray_scan_fail_finish(&ht_fail, NULL) : NULL;
+                if (!hol_err && ray_interrupted()) hol_err = ray_error("cancel", "interrupted");
+                for (int64_t i = 0; i < n_scan && !hol_err; i++) {
                     int64_t row = match_idx ? match_idx[i] : i;
-                    /* Holistic fill re-scans rows independently of the streaming
-                     * grouping accumulators, so it must honor the pushed WHERE
-                     * filter itself.  When the selection is carried as a rowsel
-                     * (match_idx == NULL, the default), skip rows that don't
-                     * pass — otherwise median/top would aggregate filtered-out
-                     * rows (the unfiltered group), diverging from every other
-                     * agg which already respects the selection. */
                     if (!match_idx && !group_rowsel_pass(rowsel, row)) continue;
-                    uint64_t h = 0;
-                    const int64_t* lookup_keys;
-                    if (ly->any_inline_str) {
-                        h = inline_build_keys(ly, key_types, key_data, key_attrs,
-                                              reprobe_pool, key_vecs, reprobe_nullable_s,
-                                              row, keybuf);
-                        lookup_keys = (const int64_t*)keybuf;
-                    } else {
-                    int64_t* nullw = ek_buf + n_keys;   /* null-mask words at key_off[nk] */
-                    uint32_t null_words = ly->null_words;
-                    for (uint32_t w = 0; w < null_words; w++) nullw[w] = 0;
-                    if (ly->packed_key) {
-                        /* Packed tuple (ly->packed_key): every key is a plain integer lane, so
-                         * the wide/F64 arms of the generic loop below are dead and the whole
-                         * key region — values plus null-mask words — avalanches in ONE
-                         * ght_hash_lanes call instead of nk hashes plus nk-1 combines.  MUST
-                         * stay in lockstep with hash_keys_inline (rehash/merge/lookup). */
-                        for (uint32_t k = 0; k < n_keys; k++) {
-                            if (__builtin_expect(reprobe_nullable_s && ray_key_may_be_null(key_vecs[k])
-                                         && ray_vec_is_null(key_vecs[k], row), 0)) {
-                                nullw[k >> 6] |= (int64_t)((uint64_t)1 << (k & 63));
-                                ek_buf[k] = 0;
-                            } else {
-                                ek_buf[k] = read_col_i64(key_data[k], row, key_types[k], key_attrs[k]);
-                            }
-                        }
-                        h = ght_hash_lanes(ek_buf, (uint32_t)n_keys + null_words);
-                    } else {
-                    for (uint32_t k = 0; k < n_keys; k++) {
-                        int8_t t = key_types[k];
-                        uint64_t kh;
-                        bool is_null = reprobe_nullable_s && ray_key_may_be_null(key_vecs[k])
-                                       && ray_vec_is_null(key_vecs[k], row);
-                        if (is_null) {
-                            nullw[k >> 6] |= (int64_t)((uint64_t)1 << (k & 63));
-                            ek_buf[k] = 0;
-                            kh = ray_hash_i64(0);
-                        } else if (ly->key_flags[k] & GHT_KEYF_WIDE) {
-                            ek_buf[k] = row;
-                            kh = wide_key_hash_at(ly, k, key_data, reprobe_pool, row);
-                        } else if (t == RAY_F64) {
-                            /* -0.0 -> +0.0 before BOTH the store and the hash
-                             * — must match the builder that filled final_ht. */
-                            int64_t kv = group_key_f64_bits(key_data[k], row);
-                            double dv; memcpy(&dv, &kv, 8);
-                            ek_buf[k] = kv;
-                            kh = ray_hash_f64(dv);
-                        } else {
-                            int64_t kv = read_col_i64(key_data[k], row, t, key_attrs[k]);
-                            ek_buf[k] = kv;
-                            kh = ray_hash_i64(kv);
-                        }
-                        h = (k == 0) ? kh : ray_hash_combine(h, kh);
-                    }
-                    h = ght_hash_null_words(h, nullw, null_words);
-                    }
-                    lookup_keys = ek_buf;
-                    }
-                    uint32_t gid = group_ht_lookup_gid(final_ht, h, lookup_keys, key_types);
-                    row_gid[row] = (gid == UINT32_MAX) ? -1 : (int64_t)gid;
-                    if (gid != UINT32_MAX) grp_cnt_s[gid]++;
+                    int64_t gid = row_gid[row];
+                    if (gid >= 0) grp_cnt_s[gid]++;
                 }
                 int64_t total_s = 0;
                 for (uint32_t gi = 0; gi < grp_count; gi++) {
@@ -17189,7 +17622,7 @@ sequential_fallback:;
                     total_s += grp_cnt_s[gi];
                 }
                 ray_t* ix_hdr_s = NULL;
-                int64_t* idx_buf_s = (int64_t*)scratch_alloc(&ix_hdr_s,
+                int64_t* idx_buf_s = hol_err ? NULL : (int64_t*)scratch_alloc(&ix_hdr_s,
                     (size_t)(total_s > 0 ? total_s : 1) * sizeof(int64_t));
                 if (idx_buf_s) {
                     for (int64_t i = 0; i < n_scan; i++) {
@@ -17242,6 +17675,12 @@ sequential_fallback:;
             scratch_free(off_hdr_s);
             scratch_free(pos_hdr_s);
         }
+    }
+    if (hol_err) {
+        scratch_free(med_hdr);   /* no column was filled */
+        ray_release(result);
+        result = hol_err;
+        goto cleanup;
     }
 
     /* Agg columns from inline accumulators */
@@ -17530,6 +17969,8 @@ cleanup:
         { if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]); if (agg_owned2[a] && agg_vecs2[a]) ray_release(agg_vecs2[a]); }
     for (uint32_t k = 0; k < n_keys; k++)
         if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+    AGG_OWN_SRC_RELEASE();
+    scratch_free(ht_rr_hdr);
     if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
 
     /* No explicit GC — top-level statement runner (run_piped / repl)
@@ -17539,6 +17980,7 @@ cleanup:
 
     return result;
 }
+#undef AGG_OWN_SRC_RELEASE
 
 /* Smallest index i in a[0..n) with a[i] >= key (lower_bound over a SORTED
  * ascending int64 array).  Used to slice the flattened global selection ids

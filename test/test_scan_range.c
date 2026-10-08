@@ -3171,8 +3171,8 @@ static test_result_t test_group_route_hook(void) {
     TEST_ASSERT_EQ_U(agg_route_stats().routes[AGG_ROUTE_LEGACY], 0);   /* disarmed */
     sr_drop(r);
     for (int route = 0; route < 4; route++) sr_drop(out[route]);
-    /* 2 skips the direct array: over generation 2 the direct array reads
-     * by range (no materialization), the legacy radix route does not yet */
+    /* 2 skips the direct array: over generation 2 both the direct array
+     * and the legacy radix route read by range (no materialization) */
     uint64_t mat[3];
     for (int route = 1; route <= 2; route++) {
         sr_eval_ok("(set T (.db.splayed.get \"" SR_G2 "\"))");
@@ -3186,7 +3186,7 @@ static test_result_t test_group_route_hook(void) {
         mat[route] = k.materialized;
     }
     TEST_ASSERT_EQ_U(mat[1], 0);
-    TEST_ASSERT_TRUE(mat[2] > 0);
+    TEST_ASSERT_EQ_U(mat[2], 0);
     /* 3 skips the slice-group route: the armed hint folds into a selection */
     sr_eval_ok("(set KS (as 'SYM (at ['aa 'bb 'cc 'dd 'ee 'ff 'gg 'hh] (% (til 4000) 8))))");
     sr_eval_ok("(set TI (table [s f] (list (.attr.set 'grouped KS) (as 'F64 (% (til 4000) 64)))))");
@@ -3459,6 +3459,143 @@ static test_result_t test_sp_dyn_route(void) {
     PASS();
 }
 
+/* ---- Task 12: the legacy radix group route ---- */
+static test_result_t test_radix_route(void) {
+    ray_group_test_route(2);                       /* skip v2 and DA: legacy radix */
+    SR_SAME("(select {c: (count k) s: (sum v) from: T by: k})", 0);                 /* 200000 groups */
+    SR_SAME("(select {c: (count k) from: T where: (> v 1000) by: {k: k s: s}})", 0);  /* SYM in a composite key */
+    SR_SAME("(select {a: (avg f) from: T by: d})", 0);
+    SR_SAME("(select {m: (med v) from: T by: g})", 1);                              /* holistic input materializes */
+    ray_group_test_route(0);
+    PASS();
+}
+
+/* The legacy radix route's shapes beyond the brief's lines: the v2
+ * sibling (null-free inputs, no SYM key) with a survivor list (R-SPARSE)
+ * and a rowsel, every streaming op, binary aggregates, nullable keys, a
+ * holistic input beside staged ones, wide keys, and a pre-materialized
+ * column read in place. */
+static test_result_t test_radix_route_shapes(void) {
+    static const struct { const char* q; uint64_t mat; } qs[] = {
+        /* v2: whole scan, survivor list (< half the rows), rowsel */
+        { "(select {c: (count k) s: (sum k) a: (avg g) from: T by: {g: g u: u}})", 0 },
+        { "(select {c: (count k) s: (sum h) from: T where: (> k 140000) by: {g: g u: u}})", 0 },
+        { "(select {s: (sum h) a: (avg u) from: T where: (> k 50000) by: {d: d b: b}})", 0 },
+        /* phase 1: a SYM key under a rowsel, every streaming op, strlen */
+        { "(select {s: (sum v) mx: (max f) mn: (min d) from: T where: (> g 2) by: s})", 0 },
+        { "(select {f: (first v) l: (last f) vr: (var v) p: (prod b) mn: (min s) mx: (max s) "
+          "n: (sum (strlen s)) e: (avg e) sd: (stddev g) from: T by: {g: g b: b}})", 0 },
+        { "(select {p: (pearson_corr f k) w: (wavg k f) c: (cov h g) from: T by: {g: g u: u}})", 0 },
+        /* nullable keys: I32, F64, and in a composite */
+        { "(select {c: (count k) s: (sum h) from: T by: v})", 0 },
+        { "(select {c: (count k) from: T where: (> k 100) by: f})", 0 },
+        { "(select {c: (count k) a: (avg e) from: T by: {v: v g: g}})", 0 },
+        /* holistic: exactly its input materializes, the others are read by range */
+        { "(select {m: (med v) s: (sum f) c: (count k) from: T by: g})", 1 },
+        { "(select {m: (med v) a: (avg h) from: T where: (> k 1000) by: {g: g b: b}})", 1 },
+        { "(select {q: (med f) x: (med v) from: T by: s})", 2 },
+    };
+    ray_group_test_route(2);
+    for (size_t i = 0; i < sizeof qs / sizeof qs[0]; i++) {
+        test_result_t r = sr_same(qs[i].q, qs[i].mat);
+        if (r.status != TEST_PASS) { ray_group_test_route(0); return r; }
+    }
+    /* a wide (STR) key: every key of the group-by materializes, the inputs
+     * are read by range */
+    sr_eval_ok("(set Z (table [t g v f] (list (as 'STR (% i 50)) (as 'I16 (% i 7)) "
+               "(as 'I32 (map (fn [j] (if (== 0 (% j 10)) 0N j)) i)) (as 'F64 i))))");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/z0/\" Z {compress: false})");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/z2/\" Z {compress: true})");
+    static const struct { const char* q; uint64_t mat; } qz[] = {
+        { "(select {s: (sum v) c: (count g) a: (avg f) from: T by: t})", 1 },
+        { "(select {s: (sum v) m: (max f) from: T where: (> g 1) by: {t: t g: g}})", 2 },
+        { "(select {m: (med f) s: (sum v) from: T by: t})", 2 },
+    };
+    for (size_t i = 0; i < sizeof qz / sizeof qz[0]; i++) {
+        test_result_t r = sr_same_on("(.db.splayed.get \"" SR_TMP "/z0/\")", "(.db.splayed.get \"" SR_TMP "/z2/\")",
+                                     qz[i].q, qz[i].mat);
+        if (r.status != TEST_PASS) { ray_group_test_route(0); return r; }
+    }
+    /* k materialized before the query: read in place beside staged inputs */
+    sr_eval_ok("(set T2M (.db.splayed.get \"" SR_G2 "\"))");
+    ray_t* t = sr_eval("T2M");
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    ray_t* kcol = ray_table_col(t, ray_sym_intern("k", 1));
+    TEST_ASSERT_TRUE(kcol && !RAY_IS_ERR(kcol));
+    sr_drop(t);
+    static const char* const q2m[] = {
+        "(select {c: (count v) s: (sum v) from: T by: k})",
+        "(select {c: (count v) s: (sum f) from: T by: {k: k g: g}})",
+        NULL };
+    for (int i = 0; q2m[i]; i++) {
+        test_result_t r = sr_same_on("(.db.splayed.get \"" SR_G0 "\")", "T2M", q2m[i], 0);
+        if (r.status != TEST_PASS) { ray_group_test_route(0); return r; }
+    }
+    ray_group_test_route(0);
+    PASS();
+}
+
+/* Below the parallel threshold the serial builder (group_rows_range) and
+ * the serial holistic reprobe read by pieces too (worker 0). */
+static test_result_t test_radix_route_serial(void) {
+    sr_eval_ok("(set j (til 50000))");
+    sr_eval_ok("(set SM (table [k g v s f t] (list j (as 'I16 (% j 7)) "
+               "(as 'I32 (map (fn [x] (if (== 0 (% x 10)) 0N x)) j)) (take ['a 'b 'c 'd] 50000) "
+               "(as 'F64 (map (fn [x] (if (== 0 (% x 13)) 0N x)) j)) (as 'STR (% j 30)))))");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/sm0/\" SM {compress: false})");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/sm2/\" SM {compress: true})");
+    static const struct { const char* q; uint64_t mat; } qs[] = {
+        { "(select {c: (count k) s: (sum v) a: (avg f) from: T by: {g: g s: s}})", 0 },
+        { "(select {c: (count k) s: (sum v) from: T where: (> k 100) by: v})", 0 },
+        { "(select {m: (med v) s: (sum f) from: T by: s})", 1 },
+        { "(select {m: (med f) from: T where: (> g 2) by: {g: g s: s}})", 1 },
+        { "(select {s: (sum v) c: (count k) from: T by: t})", 1 },
+        { "(select {m: (med v) a: (avg f) from: T by: {t: t g: g}})", 3 },
+    };
+    ray_group_test_route(2);
+    for (size_t i = 0; i < sizeof qs / sizeof qs[0]; i++) {
+        test_result_t r = sr_same_on("(.db.splayed.get \"" SR_TMP "/sm0/\")", "(.db.splayed.get \"" SR_TMP "/sm2/\")",
+                                     qs[i].q, qs[i].mat);
+        if (r.status != TEST_PASS) { ray_group_test_route(0); return r; }
+    }
+    ray_group_test_route(0);
+    PASS();
+}
+
+/* R-FAIL: a corrupt chunk of a key or an input the radix builders read is
+ * the query's error, on every run: phase 1, the v2 sibling (whole scan and
+ * survivor list), the holistic route. */
+static test_result_t test_radix_route_error(void) {
+    char path[600];
+    static const struct { const char* col; const char* q; } cs[] = {
+        { "k", "(select {c: (count v) s: (sum v) from: B by: k})" },                         /* key, phase 1 */
+        { "v", "(select {c: (count k) s: (sum v) from: B by: {k: k s: s}})" },               /* input, phase 1 */
+        { "h", "(select {c: (count k) s: (sum h) from: B by: {g: g u: u}})" },               /* input, v2 */
+        { "h", "(select {c: (count k) s: (sum h) from: B where: (> k 140000) by: {g: g u: u}})" },   /* v2 R-SPARSE: 59999 survivors, chunk 2 */
+        { "g", "(select {m: (med v) from: B by: g})" },                                      /* key, holistic */
+    };
+    ray_group_test_route(2);
+    for (size_t c = 0; c < sizeof cs / sizeof cs[0]; c++) {
+        if (c == 0 || strcmp(cs[c].col, cs[c - 1].col) != 0) sr_make_bad(cs[c].col, path, sizeof path);
+        for (int i = 0; i < 2; i++) {
+            sr_eval_ok("(set B (.db.splayed.get \"" SR_TMP "/bad/\"))");
+            ray_error_clear();
+            ray_t* r = sr_eval(cs[c].q);
+            TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "%s: no error", cs[c].q);
+            TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
+            TEST_ASSERT_TRUE(strstr(ray_error_msg(), path) != NULL);
+            ray_error_free(r);
+        }
+    }
+    /* chunk 2 (rows 131072..196607) of g is corrupt; a survivor list that
+     * ends before it never reads it */
+    test_result_t t = sr_same_on("(.db.splayed.get \"" SR_G0 "\")", "(.db.splayed.get \"" SR_TMP "/bad/\")",
+                                 "(select {c: (count k) s: (sum h) from: T where: (< k 60000) by: {g: g u: u}})", 0);
+    ray_group_test_route(0);
+    if (t.status != TEST_PASS) return t;
+    PASS();
+}
+
 const test_entry_t scanrange_entries[] = {
     { "scanrange/walk_gen0_zero_copy",     test_walk_gen0_zero_copy,     sr_setup,    sr_teardown },
     { "scanrange/walk_gen2_vectors",       test_walk_gen2_vectors,       sr_setup,    sr_teardown },
@@ -3546,5 +3683,9 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/da_route_error",     test_da_route_error,     srr_setup, srr_teardown },
     { "scanrange/da_route_parted",    test_da_route_parted,    srr_setup, srr_teardown },
     { "scanrange/sp_dyn_route",       test_sp_dyn_route,       srr_setup, srr_teardown },
+    { "scanrange/radix_route",        test_radix_route,        srr_setup, srr_teardown },
+    { "scanrange/radix_route_shapes", test_radix_route_shapes, srr_setup, srr_teardown },
+    { "scanrange/radix_route_serial", test_radix_route_serial, srr_setup, srr_teardown },
+    { "scanrange/radix_route_error",  test_radix_route_error,  srr_setup, srr_teardown },
     { NULL, NULL, NULL, NULL },
 };
