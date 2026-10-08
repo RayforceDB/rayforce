@@ -49,13 +49,17 @@
 #define SI_GROW_MIN  ((int64_t)1 << 20)
 #define SI_GROW_MAX  ((int64_t)1 << 30)
 
+#define SI_BATCH     8192                 /* strings deduplicated together */
+
 /* An index entry is (hash << 32) | (position + 1); 0 is an empty slot. */
-typedef struct { uint64_t mask; _Atomic(uint64_t) e[]; } si_tab_t;
-typedef struct si_old_s { si_tab_t* t; struct si_old_s* next; } si_old_t;
+typedef struct si_tab_s {
+    uint64_t         mask;
+    struct si_tab_s* next;         /* retired: the next one retired with it */
+    _Atomic(uint64_t) e[];
+} si_tab_t;
 typedef struct {
     _Atomic(si_tab_t*) tab;
     int64_t            used;      /* under lock */
-    si_old_t*          old;       /* replaced tables: a lock-free reader may hold one */
 } si_shard_t;
 
 struct ray_symimp_s {
@@ -70,6 +74,14 @@ struct ray_symimp_s {
     int64_t  fsize;                /* the file's current length */
     int64_t  synced;               /* bytes whose writeback was started */
     _Atomic(int64_t)* count_out;
+    /* A replaced shard table may still be read by a lock-free lookup that
+     * loaded it.  Lookups register in the parity of the epoch they start
+     * in; a table retired in epoch e is freed once the epoch has moved
+     * past e + 1, which it only does when no lookup of the other parity
+     * is left (si_reclaim). */
+    _Atomic(uint64_t) epoch;
+    _Atomic(int64_t)  active[2];
+    si_tab_t*        retired[2];  /* under alock, by the parity retired in */
     uint64_t* offc[SI_OFF_CHUNKS]; /* record offset of each position */
     si_shard_t shards[SI_SHARDS];
 };
@@ -78,6 +90,7 @@ static si_tab_t* si_tab_new(uint64_t cap) {
     si_tab_t* t = (si_tab_t*)ray_sys_alloc(sizeof(si_tab_t) + (size_t)cap * sizeof(uint64_t));
     if (!t) return NULL;
     t->mask = cap - 1;
+    t->next = NULL;
     memset((void*)t->e, 0, (size_t)cap * sizeof(uint64_t));
     return t;
 }
@@ -154,14 +167,14 @@ static int64_t si_add(ray_symimp_t* m, si_shard_t* sh, uint32_t h, const char* s
     si_tab_t* t = atomic_load_explicit(&sh->tab, memory_order_relaxed);
     if ((uint64_t)(sh->used + 1) * 2 > t->mask + 1) {
         si_tab_t* nt = si_tab_new((t->mask + 1) * 2);
-        si_old_t* o = (si_old_t*)ray_sys_alloc(sizeof(*o));
-        if (!nt || !o) { ray_sys_free(nt); ray_sys_free(o); return -1; }
+        if (!nt) return -1;
         for (uint64_t i = 0; i <= t->mask; i++) {
             uint64_t e = atomic_load_explicit(&t->e[i], memory_order_relaxed);
             if (e) si_put(nt, e);
         }
-        atomic_store_explicit(&sh->tab, nt, memory_order_release);
-        o->t = t; o->next = sh->old; sh->old = o;
+        atomic_store_explicit(&sh->tab, nt, memory_order_seq_cst);
+        uint64_t ep = atomic_load_explicit(&m->epoch, memory_order_relaxed) & 1;
+        t->next = m->retired[ep]; m->retired[ep] = t;
         t = nt;
     }
     int64_t pos, off;
@@ -174,40 +187,89 @@ static int64_t si_add(ray_symimp_t* m, si_shard_t* sh, uint32_t h, const char* s
     return pos;
 }
 
-/* Hits are found without a lock.  A batch's misses are added together
- * under alock: the lock is taken once per batch rather than per string, and
- * the batch's new strings get neighbouring positions, as the ordinary
- * domain's batch commit gives them (a column's rows then index nearby
- * positions, which its lookups over the vocabulary feel). */
+/* Under alock: free the tables no lookup can still hold and move the
+ * epoch on, unless a lookup of the other parity is still running. */
+static void si_reclaim(ray_symimp_t* m) {
+    uint64_t e = atomic_load_explicit(&m->epoch, memory_order_relaxed);
+    if (atomic_load_explicit(&m->active[(e + 1) & 1], memory_order_seq_cst) != 0) return;
+    for (si_tab_t* t = m->retired[(e + 1) & 1]; t;) { si_tab_t* nx = t->next; ray_sys_free(t); t = nx; }
+    m->retired[(e + 1) & 1] = NULL;
+    atomic_store_explicit(&m->epoch, e + 1, memory_order_seq_cst);
+}
+
+/* Up to SI_BATCH strings.  Equal strings of the batch are looked up once
+ * (a column's neighbouring rows repeat), each against the batch's own
+ * bytes rather than a record of the file.  Hits are found without a lock.
+ * The batch's misses are added together under alock: the lock is taken
+ * once per batch rather than per string, and the new strings get
+ * neighbouring positions, as the ordinary domain's batch commit gives
+ * them (a column's rows then index nearby positions, which its lookups
+ * over the vocabulary feel). */
+static bool si_batch(ray_symimp_t* m, int64_t n, const char* const* strs,
+                     const size_t* lens, const uint32_t* hashes, int64_t* out_pos) {
+    uint16_t loc[2 * SI_BATCH];    /* batch slot -> first such string + 1 */
+    uint16_t first[SI_BATCH];
+    memset(loc, 0, sizeof(loc));
+    for (int64_t i = 0; i < n; i++) {
+        size_t len = strs[i] ? lens[i] : 0;
+        if (len > UINT32_MAX - 4) return false;
+        const char* s = strs[i] ? strs[i] : "";
+        uint32_t slot = hashes[i] & (2 * SI_BATCH - 1);
+        for (;;) {
+            uint16_t j1 = loc[slot];
+            if (!j1) { loc[slot] = (uint16_t)(i + 1); first[i] = (uint16_t)i; break; }
+            int64_t j = j1 - 1;
+            size_t jl = strs[j] ? lens[j] : 0;
+            if (hashes[j] == hashes[i] && jl == len &&
+                (len == 0 || memcmp(strs[j], s, len) == 0)) { first[i] = (uint16_t)j; break; }
+            slot = (slot + 1) & (2 * SI_BATCH - 1);
+        }
+    }
+    int64_t miss = 0;
+    uint64_t e;
+    for (;;) {
+        e = atomic_load_explicit(&m->epoch, memory_order_seq_cst);
+        atomic_fetch_add_explicit(&m->active[e & 1], 1, memory_order_seq_cst);
+        if (atomic_load_explicit(&m->epoch, memory_order_seq_cst) == e) break;
+        atomic_fetch_sub_explicit(&m->active[e & 1], 1, memory_order_release);
+    }
+    for (int64_t i = 0; i < n; i++) {
+        if (first[i] != i) continue;
+        uint32_t h = hashes[i];
+        si_shard_t* sh = &m->shards[h >> (32 - SI_SHARD_LOG)];
+        out_pos[i] = si_find(m, atomic_load_explicit(&sh->tab, memory_order_acquire), h,
+                             strs[i] ? strs[i] : "", strs[i] ? lens[i] : 0);
+        if (out_pos[i] < 0) miss++;
+    }
+    atomic_fetch_sub_explicit(&m->active[e & 1], 1, memory_order_release);
+    bool ok = true;
+    if (miss) {
+        pthread_mutex_lock(&m->alock);
+        for (int64_t i = 0; i < n && ok; i++) {
+            if (first[i] != i || out_pos[i] >= 0) continue;
+            uint32_t h = hashes[i];
+            const char* s = strs[i] ? strs[i] : "";
+            size_t len = strs[i] ? lens[i] : 0;
+            si_shard_t* sh = &m->shards[h >> (32 - SI_SHARD_LOG)];
+            int64_t pos = si_find(m, atomic_load_explicit(&sh->tab, memory_order_relaxed), h, s, len);
+            if (pos < 0) pos = si_add(m, sh, h, s, len);
+            if (pos < 0) ok = false;
+            else out_pos[i] = pos;
+        }
+        si_reclaim(m);
+        pthread_mutex_unlock(&m->alock);
+    }
+    for (int64_t i = 0; ok && i < n; i++) if (first[i] != i) out_pos[i] = out_pos[first[i]];
+    return ok;
+}
+
 bool ray_symimp_intern_batch(ray_symimp_t* m, int64_t n, const char* const* strs,
                              const size_t* lens, const uint32_t* hashes,
                              int64_t* out_pos) {
-    int64_t miss = 0;
-    for (int64_t i = 0; i < n; i++) {
-        uint32_t h = hashes[i];
-        const char* s = strs[i] ? strs[i] : "";
-        size_t len = strs[i] ? lens[i] : 0;
-        if (len > UINT32_MAX - 4) return false;
-        si_shard_t* sh = &m->shards[h >> (32 - SI_SHARD_LOG)];
-        out_pos[i] = si_find(m, atomic_load_explicit(&sh->tab, memory_order_acquire), h, s, len);
-        if (out_pos[i] < 0) miss++;
-    }
-    if (!miss) return true;
-    bool ok = true;
-    pthread_mutex_lock(&m->alock);
-    for (int64_t i = 0; i < n && ok; i++) {
-        if (out_pos[i] >= 0) continue;
-        uint32_t h = hashes[i];
-        const char* s = strs[i] ? strs[i] : "";
-        size_t len = strs[i] ? lens[i] : 0;
-        si_shard_t* sh = &m->shards[h >> (32 - SI_SHARD_LOG)];
-        int64_t pos = si_find(m, atomic_load_explicit(&sh->tab, memory_order_relaxed), h, s, len);
-        if (pos < 0) pos = si_add(m, sh, h, s, len);
-        if (pos < 0) ok = false;
-        else out_pos[i] = pos;
-    }
-    pthread_mutex_unlock(&m->alock);
-    return ok;
+    for (int64_t o = 0; o < n; o += SI_BATCH)
+        if (!si_batch(m, n - o < SI_BATCH ? n - o : SI_BATCH, strs + o, lens + o, hashes + o, out_pos + o))
+            return false;
+    return true;
 }
 
 ray_symimp_t* ray_symimp_create(const char* path, _Atomic(int64_t)* count) {
@@ -215,6 +277,9 @@ ray_symimp_t* ray_symimp_create(const char* path, _Atomic(int64_t)* count) {
     ray_symimp_t* m = (ray_symimp_t*)ray_sys_alloc(sizeof(*m));
     if (!m) return NULL;
     memset(m, 0, sizeof(*m));
+    atomic_init(&m->epoch, 0);
+    atomic_init(&m->active[0], 0);
+    atomic_init(&m->active[1], 0);
     m->fd = -1;
     m->count_out = count;
     size_t pl = strlen(path);
@@ -229,6 +294,8 @@ ray_symimp_t* ray_symimp_create(const char* path, _Atomic(int64_t)* count) {
         if (p != MAP_FAILED) { m->map = (uint8_t*)p; break; }
     }
     if (!m->map) goto fail;
+    /* lookups read one record each, anywhere in the file: no read-around */
+    madvise(m->map, m->reserve, MADV_RANDOM);
     if (pthread_mutex_init(&m->alock, NULL) != 0) goto fail;
     for (int i = 0; i < SI_SHARDS; i++) {
         si_tab_t* t = si_tab_new(SI_TAB0);
@@ -284,8 +351,9 @@ void ray_symimp_free(ray_symimp_t* m) {
     for (int i = 0; i < SI_SHARDS; i++) {
         si_shard_t* sh = &m->shards[i];
         ray_sys_free(atomic_load_explicit(&sh->tab, memory_order_relaxed));
-        for (si_old_t* o = sh->old; o;) { si_old_t* nx = o->next; ray_sys_free(o->t); ray_sys_free(o); o = nx; }
     }
+    for (int k = 0; k < 2; k++)
+        for (si_tab_t* t = m->retired[k]; t;) { si_tab_t* nx = t->next; ray_sys_free(t); t = nx; }
     for (int c = 0; c < SI_OFF_CHUNKS; c++) ray_sys_free(m->offc[c]);
     if (m->map) munmap(m->map, m->reserve);
     if (m->fd >= 0) close(m->fd);

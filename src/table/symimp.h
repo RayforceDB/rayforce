@@ -30,8 +30,8 @@
  * records ([u32 len | bytes], position i = i-th record), so the file is the
  * dictionary's storage: nothing is copied out at the end and its pages are
  * the page cache's to write back and evict.  In memory there are only the
- * record offsets and a hash index split into shards, each with its own
- * lock; a hit is found without any lock.  Position 0 is "".  POSIX only:
+ * record offsets and a hash index split into shards; a hit is found
+ * without a lock, and new strings are added under one.  Position 0 is "".  POSIX only:
  * ray_symimp_create returns NULL elsewhere, and on any failure to set up,
  * and the caller keeps the ordinary domain. */
 
