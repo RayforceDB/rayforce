@@ -7663,6 +7663,8 @@ static int try_count_simple_compare(ray_t* tbl, ray_t* where_expr, int64_t* out_
         break;
     case RAY_SYM:
         if (rhs_expr->type != -RAY_SYM) return 0;
+        /* Intern ids encode equality, not lexical order (#738). */
+        if (op != COUNT_CMP_EQ && op != COUNT_CMP_NE) return 0;
         break;
     default:
         return 0;

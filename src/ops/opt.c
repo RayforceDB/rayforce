@@ -457,6 +457,12 @@ static bool fold_binary_const(ray_graph_t* g, ray_op_t* node) {
     if (!le || !re || !le->literal || !re->literal) return false;
     if (!ray_is_atom(le->literal) || !ray_is_atom(re->literal)) return false;
 
+    /* Symbol ids cannot be constant-folded as ordered integers (#738). */
+    if ((node->opcode == OP_LT || node->opcode == OP_LE ||
+         node->opcode == OP_GT || node->opcode == OP_GE) &&
+        (le->literal->type == -RAY_SYM || re->literal->type == -RAY_SYM))
+        return false;
+
     double lf = 0.0, rf = 0.0;
     int64_t li = 0, ri = 0;
     bool l_is_f64 = false, r_is_f64 = false;
@@ -2006,6 +2012,11 @@ static void pass_partition_pruning(ray_graph_t* g, ray_op_t* root) {
         if (pkey_is_sym != lit_is_sym) {
             continue;
         }
+        /* Raw partition ids have no lexical ordering (#738). Let the
+         * domain-aware predicate executor select these rows instead. */
+        if (pkey_is_sym && (cmp_op == OP_LT || cmp_op == OP_LE ||
+                            cmp_op == OP_GT || cmp_op == OP_GE))
+            continue;
 
         /* Allocate seg_mask bitmap */
         uint32_t n_words = (uint32_t)((n_parts + 63) / 64);

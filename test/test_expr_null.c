@@ -29,6 +29,7 @@
 #include "ops/internal.h"
 #include "mem/heap.h"
 #include "table/sym.h"
+#include "table/domain.h"
 #include "ops/idxop.h"
 #include "ops/fused_pred.h"
 #include <limits.h>
@@ -1404,8 +1405,9 @@ static test_result_t test_diff_f64_andor_chokes(void) {
  * A null SYM is id 0, below every real intern id, and the fallback treats a
  * null SYM as "smaller than everything" in all six comparisons (null == null,
  * null != x, null < x are true; null == x, x < null are false).  Raw id
- * compares in the fused lane give the same table, so the per-query null scan
- * is unnecessary for those shapes.  Consumers that read the lane as a value
+ * equality compares in the fused lane give the same table. Ordered compares
+ * must use lexical ranks (#738), so they now take the vocabulary-LUT path.
+ * Consumers that read the lane as a value
  * (ISNULL, CAST, arithmetic) still need the proof and must bail. */
 
 /* SYM column at the given width: "a","b",NULL,"a","c",NULL,"b","a","c" */
@@ -1474,7 +1476,7 @@ static test_result_t test_diff_sym_nulls_cmp_const(void) {
     };
     test_result_t r = { TEST_PASS, NULL };
     for (size_t i = 0; i < sizeof(builders) / sizeof(builders[0]) && r.status == TEST_PASS; i++)
-        r = diff_run(tbl, builders[i], true);
+        r = diff_run(tbl, builders[i], i < 2 || i == 6);
     ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
     return r;
 }
@@ -1628,7 +1630,152 @@ static test_result_t test_zone_skip_keeps_nulls_fused_pred(void) {
     PASS();
 }
 
+/* #738: vocabularies deliberately disagree with lexical order and with
+ * each other. Check actual lexical answers, not just fused/fallback parity. */
+static ray_t* sym_order_test_vec(ray_sym_domain_t* dom, uint8_t width,
+                                int64_t n, bool right) {
+    const char* left_names[] = {"zz", "mm", "", "aa", "mm"};
+    const char* right_names[] = {"mm", "zz", "", "mm", "aa"};
+    const char** names = right ? right_names : left_names;
+    ray_t* v = ray_sym_vec_new(width, n);
+    if (!v || RAY_IS_ERR(v)) return v;
+    ray_sym_domain_retain(dom);
+    v->sym_domain = dom;
+    v->len = n;
+    for (int64_t i = 0; i < n; i++) {
+        int64_t id = ray_sym_domain_find(dom, names[i % 5], strlen(names[i % 5]));
+        ray_write_sym(ray_data(v), i, id, RAY_SYM, width);
+        if (id == 0) ray_vec_set_null(v, i, true);
+    }
+    return v;
+}
+
+static test_result_t test_sym_ordered_domains_widths(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_sym_domain_t* d1 = ray_sym_domain_new();
+    ray_sym_domain_t* d2 = ray_sym_domain_new();
+    TEST_ASSERT(d1 && d2, "private domains");
+    const char* a[] = {"zz", "mm", "aa"};
+    const char* b[] = {"aa", "zz", "mm"};
+    for (int i = 0; i < 3; i++) {
+        TEST_ASSERT(ray_sym_intern(a[i], 2) >= 0, "runtime intern");
+        TEST_ASSERT(ray_sym_domain_intern(d1, a[i], 2) >= 0, "left intern");
+        TEST_ASSERT(ray_sym_domain_intern(d2, b[i], 2) >= 0, "right intern");
+    }
+    typedef ray_op_t* (*cmp_ctor_t)(ray_graph_t*, ray_op_t*, ray_op_t*);
+    const cmp_ctor_t ctors[] = {ray_lt, ray_le, ray_gt, ray_ge};
+    const int lr[] = {3, 2, 0, 1, 2}, rr[] = {2, 3, 0, 2, 1};
+    for (int domains = 0; domains < 3; domains++) {
+        ray_sym_domain_t* ld = domains == 0 ? ray_sym_runtime_domain() : d1;
+        ray_sym_domain_t* rd = domains == 2 ? d2 : ld;
+        for (uint8_t width = RAY_SYM_W8; width <= RAY_SYM_W64; width++) {
+            int64_t n = domains == 2 && width == RAY_SYM_W16 ? 50000 : 5;
+            ray_t* l = sym_order_test_vec(ld, width, n, false);
+            ray_t* r = sym_order_test_vec(rd, RAY_SYM_W64, n, true);
+            ray_t* tbl = ray_table_new(2);
+            tbl = ray_table_add_col(tbl, ray_sym_intern("s", 1), l);
+            tbl = ray_table_add_col(tbl, ray_sym_intern("t", 1), r);
+            TEST_ASSERT(tbl && !RAY_IS_ERR(tbl), "symbol table");
+            for (int k = 0; k < 4; k++) {
+                /* Column, present string, absent string, null string,
+                 * and a length-one SYM vector from another domain. */
+                for (int mode = 0; mode < 5; mode++) {
+                    ray_graph_t* g = ray_graph_new(tbl);
+                    ray_op_t* rhs;
+                    ray_t* one = NULL;
+                    if (mode == 0) rhs = ray_scan(g, "t");
+                    else if (mode == 4) {
+                        one = sym_order_test_vec(rd, RAY_SYM_W32, 1, true);
+                        rhs = ray_const_vec(g, one);
+                    } else {
+                        const char* lit = mode == 1 ? "mm" : mode == 2 ? "nn" : "";
+                        rhs = ray_const_str(g, lit, strlen(lit));
+                    }
+                    ray_op_t* pred = ctors[k](g, ray_scan(g, "s"), rhs);
+                    ray_t* out = ray_execute(g, pred);
+                    TEST_ASSERT(out && !RAY_IS_ERR(out), "ordered result");
+                    TEST_ASSERT_EQ_I(out->type, RAY_BOOL);
+                    TEST_ASSERT_EQ_I(out->len, n);
+                    for (int64_t i = 0; i < n; i++) {
+                        int left = lr[i % 5] * 2;
+                        int right = mode == 0 ? rr[i % 5] * 2 :
+                                    mode == 2 ? 5 : mode == 3 ? 0 : 4;
+                        bool want = k == 0 ? left < right : k == 1 ? left <= right :
+                                    k == 2 ? left > right : left >= right;
+                        TEST_ASSERT_FMT(((bool*)ray_data(out))[i] == want,
+                            "domain=%d width=%u op=%d mode=%d row=%lld",
+                            domains, width, k, mode, (long long)i);
+                    }
+                    ray_release(out);
+                    ray_graph_free(g);
+                    ray_release(one);
+                }
+            }
+            ray_release(l); ray_release(r); ray_release(tbl);
+        }
+    }
+    ray_sym_domain_release(d1); ray_sym_domain_release(d2);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* Ordered partition keys must not prune segments by raw intern id. Also
+ * exercise a parted SYM data column with a different width per segment. */
+static test_result_t test_sym_ordered_partitions(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    (void)ray_sym_intern("zz", 2);
+    int64_t mm = ray_sym_intern("mm", 2);
+    (void)ray_sym_intern("aa", 2);
+    ray_t* keys = sym_order_test_vec(ray_sym_runtime_domain(), RAY_SYM_W64, 5, false);
+    int64_t counts[] = {2, 2, 2, 2, 2};
+    ray_t* mc = ray_alloc(2 * sizeof(ray_t*));
+    mc->type = RAY_MAPCOMMON; mc->len = 2;
+    ((ray_t**)ray_data(mc))[0] = keys;
+    ((ray_t**)ray_data(mc))[1] = ray_vec_from_raw(RAY_I64, counts, 5);
+    ray_t* vals = ray_alloc(5 * sizeof(ray_t*));
+    vals->type = RAY_PARTED_BASE + RAY_I64; vals->len = 5;
+    ray_t* syms = ray_alloc(5 * sizeof(ray_t*));
+    syms->type = RAY_PARTED_BASE + RAY_SYM; syms->len = 5;
+    for (int i = 0; i < 5; i++) {
+        int64_t rows[] = {2 * i, 2 * i + 1};
+        ((ray_t**)ray_data(vals))[i] = ray_vec_from_raw(RAY_I64, rows, 2);
+        uint8_t width = (uint8_t)(i % 4);
+        ray_t* seg = ray_sym_vec_new(width, 2);
+        seg->len = 2;
+        int64_t id = ray_read_sym(ray_data(keys), i, RAY_SYM, keys->attrs);
+        ray_write_sym(ray_data(seg), 0, id, RAY_SYM, width);
+        ray_write_sym(ray_data(seg), 1, id, RAY_SYM, width);
+        if (id == 0) { ray_vec_set_null(seg, 0, true); ray_vec_set_null(seg, 1, true); }
+        ((ray_t**)ray_data(syms))[i] = seg;
+    }
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("pkey", 4), mc);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("val", 3), vals);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("s", 1), syms);
+    ray_t* lit = ray_sym(mm);
+    for (int key = 0; key < 2; key++) {
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* pred = ray_lt(g, ray_scan(g, key ? "pkey" : "s"), ray_const_atom(g, lit));
+        ray_op_t* root = ray_filter(g, ray_scan(g, "val"), pred);
+        ray_op_t* opt = ray_optimize(g, root);
+        for (uint32_t i = 0; i < g->ext_count; i++)
+            TEST_ASSERT(!g->ext_nodes[i] || !g->ext_nodes[i]->seg_mask,
+                        "symbol ordering cannot prune by numeric id");
+        ray_t* out = ray_execute(g, opt);
+        TEST_ASSERT(out && !RAY_IS_ERR(out), "parted ordering");
+        TEST_ASSERT_EQ_I(out->type, RAY_I64);
+        TEST_ASSERT_EQ_I(out->len, 4);
+        for (int i = 0; i < 4; i++) TEST_ASSERT_EQ_I(((int64_t*)ray_data(out))[i], i + 4);
+        ray_release(out); ray_graph_free(g);
+    }
+    ray_release(lit); ray_release(mc); ray_release(vals); ray_release(syms); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t expr_null_entries[] = {
+    { "expr_null/sym_ordered_partitions", test_sym_ordered_partitions, NULL, NULL },
+    { "expr_null/sym_ordered_domains_widths", test_sym_ordered_domains_widths, NULL, NULL },
     { "expr_null/bail_counter",            test_expr_bail_counter_nulls,          NULL, NULL },
     { "expr_null/nullfree_invariance",     test_nullfree_stream_unchanged,        NULL, NULL },
     { "expr_null/diff_i64_add",            test_diff_i64_add_nullable_prelanding, NULL, NULL },

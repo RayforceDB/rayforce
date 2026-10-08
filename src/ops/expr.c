@@ -697,9 +697,9 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out) {
     /* Issue #533: which nodes may skip the SYM null proof.  A null SYM is
      * id 0, below every real intern id, and the fallback ranks a null SYM
      * below everything in all six comparisons (null == null, null != x,
-     * null < x hold; null == x, x < null do not).  Raw id compares in the
-     * fused lane produce the same table, so a SYM column whose every
-     * consumer in this subtree is EQ..GE against a non-null constant (a
+     * null < x hold; null == x, x < null do not). Raw id equality compares
+     * preserve this; ordered compares bail below to lexical LUTs. A SYM
+     * column whose every consumer is EQ..GE against a non-null constant (a
      * null literal bails at OP_CONST) or another SYM scan needs no O(n)
      * ray_vec_has_nulls walk.  Any other consumer — ISNULL, CAST,
      * arithmetic — reads the lane as a value and keeps the proof. */
@@ -904,6 +904,14 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out) {
                 int8_t t2 = (s2 != 0xFF) ? out->regs[s2].type : t1;
                 uint16_t op = node->opcode;
                 int8_t ot;
+
+                /* SYM lanes contain intern ids, not lexical ranks. Route
+                 * ordering through the vocabulary-LUT executor below;
+                 * equality can keep using the fused integer kernels. */
+                if ((op == OP_LT || op == OP_LE || op == OP_GT || op == OP_GE) &&
+                    (op_child(g, node, 0)->out_type == RAY_SYM ||
+                     (s2 != 0xFF && op_child(g, node, 1)->out_type == RAY_SYM)))
+                    EXPR_BAIL(EXPR_BAIL_OTHER);
 
                 /* Determine output type */
                 if (op == OP_CAST)
@@ -3722,6 +3730,55 @@ static void par_binary_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t 
     }
 }
 
+/* Normalize query scalar operands for the eager SYM comparator. Queries
+ * broadcast length-one vectors and accept STR literals against SYM; eager
+ * mapping broadcasts atoms only and requires matching symbol types. */
+static ray_t* sym_order_operand(ray_t* v, bool scalar) {
+    ray_t* a;
+    if (scalar && !ray_is_atom(v)) {
+        int allocated = 0;
+        a = collection_elem(v, 0, &allocated);
+        if (!allocated) ray_retain(a);
+    } else {
+        a = v;
+        ray_retain(a);
+    }
+    if (!a || RAY_IS_ERR(a)) return a;
+    if (a->type == -RAY_STR) {
+        int64_t id = ray_sym_intern(ray_str_ptr(a), ray_str_len(a));
+        ray_release(a);
+        return id < 0 ? ray_error("memory", "symbol comparison: intern failed") : ray_sym(id);
+    }
+    return a;
+}
+
+static ray_t* exec_sym_order(uint16_t opcode, ray_t* lhs, ray_t* rhs,
+                             bool l_scalar, bool r_scalar) {
+    ray_t* l = sym_order_operand(lhs, l_scalar);
+    if (!l || RAY_IS_ERR(l)) return l;
+    ray_t* r = sym_order_operand(rhs, r_scalar);
+    if (!r || RAY_IS_ERR(r)) { ray_release(l); return r; }
+    ray_binary_fn fn = opcode == OP_LT ? ray_lt_fn : opcode == OP_LE ? ray_lte_fn :
+                       opcode == OP_GT ? ray_gt_fn : ray_gte_fn;
+    /* Reuse the eager vocabulary verdict LUT (column/literal) and union
+     * ranks (column/column, including distinct domains). Row workers read
+     * ids and LUT entries, not strings. Its bounded-allocation fallback
+     * also preserves lexical order. */
+    ray_t* out = atomic_map_binary_op(fn, opcode, l, r);
+    ray_release(l);
+    ray_release(r);
+    if (out && out->type == -RAY_BOOL) {
+        ray_t* vec = ray_vec_new(RAY_BOOL, 1);
+        if (vec && !RAY_IS_ERR(vec)) {
+            vec->len = 1;
+            *(bool*)ray_data(vec) = out->b8;
+        }
+        ray_release(out);
+        return vec;
+    }
+    return out;
+}
+
 ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* rhs) {
     if (!lhs || RAY_IS_ERR(lhs)) return lhs;
     if (!rhs || RAY_IS_ERR(rhs)) return rhs;
@@ -3738,6 +3795,14 @@ ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* 
     } else if (!l_scalar && r_scalar) {
         len = lhs->len;
     }
+
+    int8_t lt = lhs->type < 0 ? (int8_t)-lhs->type : lhs->type;
+    int8_t rt = rhs->type < 0 ? (int8_t)-rhs->type : rhs->type;
+    if ((op->opcode == OP_LT || op->opcode == OP_LE ||
+         op->opcode == OP_GT || op->opcode == OP_GE) &&
+        ((lt == RAY_SYM && (rt == RAY_SYM || rt == RAY_STR)) ||
+         (rt == RAY_SYM && lt == RAY_STR)))
+        return exec_sym_order(op->opcode, lhs, rhs, l_scalar, r_scalar);
 
     if (op->opcode == OP_POW) {
         int8_t lt = ew_value_base_type(lhs);

@@ -1,0 +1,79 @@
+;; #738: query ordering must follow strings, regardless of intern order.
+(set T (table [s n] (list (as 'SYM ["zz" "mm" "" "aa" "mm"]) (til 5))))
+(sum (< (at T 's) 'mm)) -- 2
+(count (select {from: T where: (< s 'mm)})) -- 2
+(at (select {from: T where: (< s 'mm)}) 'n) -- [2 3]
+(at (select {from: T where: (and (< s 'mm) true)}) 'n) -- [2 3]
+(at (select {from: T where: (< s "mm")}) 'n) -- [2 3]
+(sum (<= (at T 's) 'mm)) -- 4
+(count (select {from: T where: (<= s 'mm)})) -- 4
+(at (select {from: T where: (<= s 'mm)}) 'n) -- [1 2 3 4]
+(at (select {from: T where: (and (<= s 'mm) true)}) 'n) -- [1 2 3 4]
+(at (select {from: T where: (<= s "mm")}) 'n) -- [1 2 3 4]
+(sum (> (at T 's) 'mm)) -- 1
+(count (select {from: T where: (> s 'mm)})) -- 1
+(at (select {from: T where: (> s 'mm)}) 'n) -- [0]
+(at (select {from: T where: (and (> s 'mm) true)}) 'n) -- [0]
+(at (select {from: T where: (> s "mm")}) 'n) -- [0]
+(sum (>= (at T 's) 'mm)) -- 3
+(count (select {from: T where: (>= s 'mm)})) -- 3
+(at (select {from: T where: (>= s 'mm)}) 'n) -- [0 1 4]
+(at (select {from: T where: (and (>= s 'mm) true)}) 'n) -- [0 1 4]
+(at (select {from: T where: (>= s "mm")}) 'n) -- [0 1 4]
+(sum (== (at T 's) 'mm)) -- 2
+(count (select {from: T where: (== s 'mm)})) -- 2
+(at (select {from: T where: (== s 'mm)}) 'n) -- [1 4]
+(at (select {from: T where: (and (== s 'mm) true)}) 'n) -- [1 4]
+(at (select {from: T where: (== s "mm")}) 'n) -- [1 4]
+(sum (!= (at T 's) 'mm)) -- 3
+(count (select {from: T where: (!= s 'mm)})) -- 3
+(at (select {from: T where: (!= s 'mm)}) 'n) -- [0 2 3]
+(at (select {from: T where: (and (!= s 'mm) true)}) 'n) -- [0 2 3]
+(at (select {from: T where: (!= s "mm")}) 'n) -- [0 2 3]
+
+;; Operand reversal, projection, compound predicates and absent literals.
+(at (select {from: T where: (> 'mm s)}) 'n) -- [2 3]
+(at (select {v: (< s 'mm) from: T}) 'v) -- [false false true true false]
+(at (select {from: T where: (or (< s 'mm) (> s 'mm))}) 'n) -- [0 2 3]
+(at (select {from: T where: (< s 'nn)}) 'n) -- [1 2 3 4]
+(at (select {from: T where: (< s "nn-uninterned-738")}) 'n) -- [1 2 3 4]
+(at (select {from: T where: (> "nn-uninterned-738" s)}) 'n) -- [1 2 3 4]
+(at (select {from: T where: (<= s "")}) 'n) -- [2]
+(at (select {from: T where: (< s "")}) 'n) -- []
+(at (select {from: T where: (> s "")}) 'n) -- [0 1 3 4]
+
+;; Null-free input reaches the direct count shortcut unless it rejects ordering.
+(set U (table [s n] (list (as 'SYM ["zz" "mm" "aa" "mm"]) (til 4))))
+(count (select {from: U where: (< s 'mm)})) -- 1
+(count (select {from: U where: (<= s 'mm)})) -- 3
+(count (select {from: U where: (> s 'mm)})) -- 1
+(count (select {from: U where: (>= s 'mm)})) -- 3
+
+;; Single-row inputs and empty outputs.
+(set O (table [s] (list (as 'SYM ["aa"]))))
+(count (select {from: O where: (< s 'mm)})) -- 1
+(at (select {v: (< s 'mm) from: O}) 'v) -- [true]
+(set E (select {from: T where: (< n 0)}))
+(count (select {from: E where: (< s 'mm)})) -- 0
+
+;; Parallel-sized input: count, materialized filter, projection and top-k.
+(set B (table [s n] (list (as 'SYM (at ["zz" "mm" "" "aa" "mm"] (% (til 50000) 5))) (til 50000))))
+(count (select {from: B where: (< s 'mm)})) -- 20000
+(count (at (select {from: B where: (and (< s 'mm) true)}) 'n)) -- 20000
+(sum (at (select {v: (< s 'mm) from: B}) 'v)) -- 20000
+(count (select {from: B where: (<= s 'mm)})) -- 40000
+(count (at (select {from: B where: (and (<= s 'mm) true)}) 'n)) -- 40000
+(sum (at (select {v: (<= s 'mm) from: B}) 'v)) -- 40000
+(count (select {from: B where: (> s 'mm)})) -- 10000
+(count (at (select {from: B where: (and (> s 'mm) true)}) 'n)) -- 10000
+(sum (at (select {v: (> s 'mm) from: B}) 'v)) -- 10000
+(count (select {from: B where: (>= s 'mm)})) -- 30000
+(count (at (select {from: B where: (and (>= s 'mm) true)}) 'n)) -- 30000
+(sum (at (select {v: (>= s 'mm) from: B}) 'v)) -- 30000
+(at (select {n: n from: B where: (< s 'mm) asc: n take: 5}) 'n) -- [2 3 7 8 12]
+
+;; Symbol constants must not be folded using integer IDs either.
+(sum (at (select {v: (< 'zz 'mm) from: T}) 'v)) -- 0
+(sum (at (select {v: (> 'zz 'mm) from: T}) 'v)) -- 5
+(sum (at (select {v: (<= 'aa 'mm) from: T}) 'v)) -- 5
+(sum (at (select {v: (>= 'aa 'mm) from: T}) 'v)) -- 0

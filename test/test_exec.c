@@ -12037,7 +12037,7 @@ static test_result_t test_expr_sym_w32_fast_eq_ne(void) {
     ray_release(result);
     ray_graph_free(g);
 
-    /* s < "baz" — W32 SYM LT ordering, hits BR_FAST(uint32_t) at line 1698 */
+    /* s < "baz" — lexical ordering through the vocabulary LUT (#738). */
     g   = ray_graph_new(tbl);
     sc  = ray_scan(g, "s");
     lit = ray_const_str(g, "baz", 3);
@@ -12045,10 +12045,8 @@ static test_result_t test_expr_sym_w32_fast_eq_ne(void) {
     cnt = ray_sum(g, lt);
     result = ray_execute(g, cnt);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    /* Ordering compares intern IDs numerically.
-     * id1=foo, id2=bar, id3=baz are interned in that order: id1<id2<id3.
-     * LT baz(id3): id1<id3(T), id2<id3(T), id3<id3(F), id1<id3(T), id2<id3(T) → 4 */
-    TEST_ASSERT_EQ_I(result->i64, 4);
+    /* Only the two "bar" rows precede "baz", regardless of intern order. */
+    TEST_ASSERT_EQ_I(result->i64, 2);
     ray_release(result);
     ray_graph_free(g);
 
@@ -12274,7 +12272,7 @@ static test_result_t test_expr_sym_w64_fast_scalar(void) {
     ray_release(result);
     ray_graph_free(g);
 
-    /* animal < "dog" — W64 SYM LT (intern ID ordering) */
+    /* animal < "dog" — W64 SYM lexical ordering (#738). */
     g = ray_graph_new(tbl);
     ac  = ray_scan(g, "animal");
     lit = ray_const_str(g, "dog", 3);
@@ -12282,8 +12280,8 @@ static test_result_t test_expr_sym_w64_fast_scalar(void) {
     cnt = ray_sum(g, lt);
     result = ray_execute(g, cnt);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    /* id1=dog(first), id2=cat, id3=bird.  id1<id1(F), id2<id1(F), id3<id1(F), id1<id1(F) → 0 */
-    TEST_ASSERT_EQ_I(result->i64, 0);
+    /* "cat" and "bird" precede "dog". */
+    TEST_ASSERT_EQ_I(result->i64, 2);
     ray_release(result);
     ray_graph_free(g);
 
