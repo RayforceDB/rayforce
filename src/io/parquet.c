@@ -2071,6 +2071,18 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
                     (double)(t1-t0)/1e6,(double)(ray_profile_now_ns()-t1)/1e6);
         }
     }
+    /* One pass: the columns finish side by side and their hash indexes are
+     * built in waves while the symbol file appender is still writing (its
+     * writeback can wait on the column data's); a symbol column's header
+     * takes the domain's final count, which no longer changes.  The
+     * column-by-column passes have closed and indexed theirs already. */
+    if (all && !err) {
+        int64_t tc = trace ? ray_profile_now_ns() : 0;
+        ray_err_t e = ray_col_stream_close_all(writers,r->ncols,false,NULL);
+        if (e != RAY_OK) err = ray_error(ray_err_code_str(e),"parquet: column close failed");
+        else ray_col_stream_hash_all(writers,r->ncols,NULL);
+        if (trace) fprintf(stderr,"parquet phase: close+hash=%.1fms\n",(double)(ray_profile_now_ns()-tc)/1e6);
+    }
     if (sym_running) {
         atomic_store_explicit(&symf.stop,true,memory_order_release);
         ray_thread_join(sym_thread);
@@ -2167,10 +2179,10 @@ finish_columns:
     if (domain) { e = ray_sym_domain_flush_append(domain,true); if (e != RAY_OK) goto io_fail; }
     if (trace) { fprintf(stderr,"parquet phase: sym flush=%.1fms\n",(double)(ray_profile_now_ns()-tp)/1e6); tp = ray_profile_now_ns(); }
     /* All columns are still under a private staging directory (the direct
-     * import has already closed its numeric columns and built their hash
-     * indexes). Commit their final images together below, after the hash
-     * re-read of any column left.  Every column finishes as a pool task;
-     * the renames run serially after. */
+     * import has closed and indexed them already, but for the symbol
+     * columns of its column-by-column passes). Commit their final images
+     * together below, after the hash re-read of any column left.  Every
+     * column finishes as a pool task; the renames run serially after. */
     e = ray_col_stream_close_all(writers,r->ncols,false,NULL);
     if (e != RAY_OK) goto io_fail;
     /* The persisted domain is flushed and every writer is closed (the zone
