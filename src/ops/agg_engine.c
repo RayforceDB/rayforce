@@ -7431,7 +7431,10 @@ static ray_t* agg_first_n_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t 
         return NULL;
     if (sel && ray_rowsel_meta(sel)->nrows != nrows) return NULL;
     if (!agg_firstn_admitted(g, ext, tbl, key_cols)) return NULL;
-    /* random: indexed / first-n / serial whole-column strategy */
+    /* random: indexed / first-n / serial whole-column strategy.  The data
+     * declines below (too few groups, heavy groups) come from reading the
+     * keys at rows, so the keys unstage first; a declined pre-pass leaves the
+     * full run on the plain keys. */
     ray_t* uerr = agg_keys_unstage(key_cols, ks);
     if (uerr) return uerr;
 

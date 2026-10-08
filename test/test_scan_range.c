@@ -3855,6 +3855,10 @@ static test_result_t sr_f64_bits_same(const char* q, const char* col) {
  * materialized, and the strategy the line names is the one that ran. */
 static test_result_t test_v2_route_shapes(void) {
     sr_w_tables();
+    /* The strategy choice weighs replicated slabs against partition traffic
+     * per worker (1 worker: no partitions; 8: {nk s} partitions), so the
+     * routes are pinned at 3 workers; srr_pool_teardown restores the pool. */
+    ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(3), RAY_OK);
     enum { R_LOCAL = 1, R_PART, R_SHARED, R_RADIX, R_TS, R_SH };
     static const struct { const char* q; int route; } qs[] = {
         { "(select {mx: (max n) from: T by: sk})", R_SHARED },
@@ -3868,6 +3872,7 @@ static test_result_t test_v2_route_shapes(void) {
         { "(select {x: (max f) c: (count k) from: T where: (> k 1000) by: {d: d u: u}})", R_PART },
         { "(select {x: (sum f) p: (pearson_corr f n) from: T by: {d: d u: u}})", R_PART },
         { "(select {c: (count k) a: (avg nk) from: T by: {nk: nk s: s}})", R_LOCAL },
+        { "(select {p: (pearson_corr f g) w: (wavg g f) from: T by: g})", R_LOCAL },    /* binary inputs */
     };
     for (size_t i = 0; i < sizeof qs / sizeof qs[0]; i++) {
         agg_route_reset();
@@ -3918,6 +3923,37 @@ static test_result_t test_v2_route_shapes(void) {
     TEST_ASSERT_TRUE(tcol && !RAY_IS_ERR(tcol));
     sr_drop(t);
     if ((r = sr_same_on(SR_W0, "W2M", "(select {c: (count k) s: (sum f) from: T by: t})", 0)).status != TEST_PASS) return r;
+    PASS();
+}
+
+/* A SYM key over a shared symfile larger than the table: its codes are
+ * positions in a 400000-symbol domain, so the dense plan bounds the key from
+ * the directory statistics.  Those exclude the null rows, whose code is 0,
+ * far below the used codes [90000, 139000]: the bounds must still span it
+ * (139001 slots, within the row count, so the plan stays dense). */
+static test_result_t test_v2_sym_shared_dom(void) {
+    sr_eval_ok("(set A (table [s v] (list (as 'SYMBOL (map (fn [j] (format \"y%\" j)) (til 400000))) (til 400000))))");
+    sr_eval_ok("(set B (table [s v] (list (as 'SYMBOL (map (fn [j] (if (== 0 (% j 11)) \"\" "
+               "(format \"y%\" (+ 90000 (* 1000 (% j 50)))))) (til 150000))) (til 150000))))");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/sda/\" A \"" SR_TMP "/sd.sym\" {compress: true})");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/sd0/\" B \"" SR_TMP "/sd.sym\" {compress: false})");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/sd2/\" B \"" SR_TMP "/sd.sym\" {compress: true})");
+    ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(3), RAY_OK);   /* dense at any core count */
+    static const char* const qs[] = {
+        "(select {c: (count v) s: (sum v) from: T by: s})",
+        "(select {c: (count v) mx: (max v) from: T where: (> v 1000) by: s})",
+        NULL };
+    for (int i = 0; qs[i]; i++) {
+        agg_route_reset();
+        test_result_t r = sr_same_on("(.db.splayed.get \"" SR_TMP "/sd0/\" \"" SR_TMP "/sd.sym\")",
+                                     "(.db.splayed.get \"" SR_TMP "/sd2/\" \"" SR_TMP "/sd.sym\")", qs[i], 0);
+        if (r.status != TEST_PASS) return r;
+        agg_route_stats_t rs = agg_route_stats();
+        TEST_ASSERT_FMT(rs.routes[AGG_ROUTE_V2_DENSE] > 0, "%s: not dense (plan %d)", qs[i], (int)rs.dense_plan_available);
+        ray_t* out = sr_eval(qs[i]);   /* T is the generation-2 table */
+        TEST_ASSERT_FMT(out && !RAY_IS_ERR(out) && ray_table_nrows(out) == 51, "%s: groups", qs[i]);
+        sr_drop(out);
+    }
     PASS();
 }
 
@@ -3991,6 +4027,42 @@ static test_result_t test_v2_route_error(void) {
             ray_error_free(r);
         }
         agg_test_force_smallhash(false);
+    }
+    PASS();
+}
+
+/* R-FAIL of the shared dense slab's own dispatch: the slab's sample reads
+ * rows i * step + jitter (step = rows / 1024), so with 197108 rows it never
+ * reaches row 196608 = 1024 * 192, the first row of chunk 3.  A corrupt
+ * vector there is read only by the shared update pass. */
+static test_result_t test_v2_shared_fail(void) {
+    sr_eval_ok("(set X (table [sk n] (list (map (fn [j] (if (== 0 (% j 100)) j 0)) (til 197108)) "
+               "(as 'I32 (- 0 (til 197108))))))");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/xsh/\" X {compress: true})");
+    ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(3), RAY_OK);
+    static const char* const q = "(select {mx: (max n) from: B by: sk})";
+    sr_eval_ok("(set B (.db.splayed.get \"" SR_TMP "/xsh/\"))");
+    agg_route_reset();
+    ray_t* ok = sr_eval(q);
+    TEST_ASSERT_TRUE(ok && !RAY_IS_ERR(ok));
+    sr_drop(ok);
+    TEST_ASSERT_EQ_I((int)agg_route_stats().dense_strategy, AGG_DENSE_SHARED);
+    char dir[512], path[600];
+    if (ray_splay_resolve_dir(ray_test_tmp(SR_TMP "/xsh/"), dir, sizeof dir) != RAY_OK) abort();
+    snprintf(path, sizeof path, "%s/n", dir);
+    uint64_t off = sr_dirent_offset(path, 3);
+    TEST_ASSERT_TRUE(off != 0);
+    sr_patch(path, (long)off + 6, 1);
+    for (int i = 0; i < 2; i++) {
+        sr_eval_ok("(set B (.db.splayed.get \"" SR_TMP "/xsh/\"))");
+        agg_route_reset();
+        ray_error_clear();
+        ray_t* r = sr_eval(q);
+        TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+        TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
+        TEST_ASSERT_FMT(strstr(ray_error_msg(), path) != NULL, "%s", ray_error_msg());
+        ray_error_free(r);
+        TEST_ASSERT_TRUE(agg_route_stats().routes[AGG_ROUTE_V2_DENSE] > 0);
     }
     PASS();
 }
@@ -4092,7 +4164,9 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/v2_sym_key_parted",  test_v2_sym_key_parted,  srr_setup, srr_teardown },
     { "scanrange/v2_parted_routes",   test_v2_parted_routes,   srr_setup, srr_teardown },
     { "scanrange/v2_error",           test_v2_error,           srr_setup, srr_teardown },
-    { "scanrange/v2_route_shapes",    test_v2_route_shapes,    srr_setup, srr_teardown },
+    { "scanrange/v2_route_shapes",    test_v2_route_shapes,    srr_setup, srr_pool_teardown },
+    { "scanrange/v2_sym_shared_dom",  test_v2_sym_shared_dom,  srr_setup, srr_pool_teardown },
+    { "scanrange/v2_shared_fail",     test_v2_shared_fail,     srr_setup, srr_pool_teardown },
     { "scanrange/v2_f64_bits",        test_v2_f64_bits,        srr_setup, srr_teardown },
     { "scanrange/v2_route_error",     test_v2_route_error,     srr_setup, srr_teardown },
     { NULL, NULL, NULL, NULL },

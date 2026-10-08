@@ -4918,7 +4918,7 @@ static test_result_t test_select_bydict_binds_referenced(void) {
         { "(select {s: (sum a) by: {k1: k1 k2: k2} from: %s})",                0 },  /* P2 Task 13 */
         { "(select {c: (count a) by: {m: (%% a 3)} from: %s})",                1 },
         { "(select {s: (sum a) by: {k1: k1 m: (%% k2 3)} from: %s})",          1 },  /* P2 Task 13: the computed key materializes k2 */
-        { "(select {s: (sum a) by: {g: k2} from: %s where: (> a 10)})",        1 },  /* P2 Task 13: v2 reads a by range */
+        { "(select {s: (sum a) by: {g: k2} from: %s where: (> a 10)})",        1 },  /* P2 Task 13: a reads by range; the renamed key {g: k2} materializes k2 */
         { "(select {d: (count (distinct a)) by: (%% k2 3) from: %s})",         2 },
         { "(select {c: (count a) by: {g: (lam_k2)} from: %s})",                20 },  /* a lambda may read any column */
         { NULL, 0 },
