@@ -32,6 +32,7 @@
 #include "core/platform.h"
 #include "mem/sys.h"
 #include "store/fileio.h"   /* ray_file_sync_dir */
+#include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <string.h>
@@ -45,7 +46,7 @@
 #define SI_TAB0      1024                 /* initial slots per shard */
 #define SI_OFF_LOG   20                   /* offsets in chunks of 2^20 */
 #define SI_OFF_CHUNKS 4096                /* 2^32 entries at most */
-#define SI_GROW_MIN  ((int64_t)64 << 20)
+#define SI_GROW_MIN  ((int64_t)1 << 20)
 #define SI_GROW_MAX  ((int64_t)1 << 30)
 
 /* An index entry is (hash << 32) | (position + 1); 0 is an empty slot. */
@@ -112,6 +113,17 @@ static void si_put(si_tab_t* t, uint64_t e) {
     atomic_store_explicit(&t->e[slot], e, memory_order_release);
 }
 
+/* The file grown to `want` bytes.  The blocks are allocated, where the
+ * filesystem can, so a full disk fails here rather than as a fault on a
+ * later write through the mapping. */
+static bool si_grow(ray_symimp_t* m, int64_t want) {
+#if defined(__linux__)
+    if (fallocate(m->fd, 0, (off_t)m->fsize, (off_t)(want - m->fsize)) == 0) return true;
+    if (errno != EOPNOTSUPP) return false;
+#endif
+    return ftruncate(m->fd, (off_t)want) == 0;
+}
+
 /* Room for `bytes` more record bytes: the next position and its offset.
  * The file grows ahead of the tail (the mapping covers it already).
  * Under alock. */
@@ -124,8 +136,9 @@ static bool si_reserve(ray_symimp_t* m, size_t bytes, int64_t* pos, int64_t* off
     }
     if (m->tail + (int64_t)bytes > m->fsize) {
         int64_t grow = m->fsize < SI_GROW_MIN ? SI_GROW_MIN : m->fsize > SI_GROW_MAX ? SI_GROW_MAX : m->fsize;
-        int64_t want = m->tail + (int64_t)bytes + grow;
-        if ((size_t)want > m->reserve || ftruncate(m->fd, (off_t)want) != 0) return false;
+        int64_t need = m->tail + (int64_t)bytes, want = need + grow;
+        if ((size_t)want > m->reserve) want = (int64_t)m->reserve;
+        if (want < need || !si_grow(m, want)) return false;
         m->fsize = want;
     }
     *pos = p; *off = m->tail;
@@ -208,7 +221,7 @@ ray_symimp_t* ray_symimp_create(const char* path, _Atomic(int64_t)* count) {
     m->path = (char*)ray_sys_alloc(pl + 1);
     if (!m->path) goto fail;
     memcpy(m->path, path, pl + 1);
-    m->fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    m->fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0666);
     if (m->fd < 0) goto fail;
     /* Address space for the whole file up front: it only grows by ftruncate. */
     for (m->reserve = (size_t)1 << 40; m->reserve >= ((size_t)1 << 30); m->reserve >>= 2) {
@@ -223,7 +236,7 @@ ray_symimp_t* ray_symimp_create(const char* path, _Atomic(int64_t)* count) {
         atomic_init(&m->shards[i].tab, t);
     }
     m->tail = SI_HEAD;
-    if (ftruncate(m->fd, (off_t)SI_GROW_MIN) != 0) goto fail;
+    if (!si_grow(m, SI_GROW_MIN)) goto fail;
     m->fsize = SI_GROW_MIN;
     uint32_t magic = SI_MAGIC;
     memcpy(m->map, &magic, 4);
@@ -238,6 +251,9 @@ ray_symimp_t* ray_symimp_create(const char* path, _Atomic(int64_t)* count) {
     }
     return m;
 fail:
+    /* the caller falls back to the ordinary domain, which must not find
+     * this file half made */
+    if (m->fd >= 0) unlink(m->path);
     ray_symimp_free(m);
     return NULL;
 }

@@ -786,6 +786,8 @@ static const int64_t g_empty_lut[1] = { -1 };
 
 const int64_t* ray_sym_domain_runtime_lut(ray_sym_domain_t* dom) {
     if (!dom || dom->kind == DOM_RUNTIME) return NULL;
+    /* never asked for: an import's columns are read back through the
+     * file domain, after the import dictionary is gone */
     if (dom->kind == DOM_IMPORT) return NULL;
 
     int64_t* lut = atomic_load_explicit(&dom->runtime_lut, memory_order_acquire);
@@ -1616,8 +1618,8 @@ ray_err_t ray_sym_domain_flush_append(ray_sym_domain_t* dom, bool durable) {
     ray_err_t err = ray_file_lock_ex(lock_fd);
     if (err != RAY_OK) { ray_file_close(lock_fd); return err; }
 
-    /* The file must still be exactly the persisted prefix, as in
-     * ray_sym_domain_flush: anything else is another writer. */
+    /* The file must still be the persisted size: anything else is another
+     * writer. */
     struct stat st;
     bool exists = stat(dom->path, &st) == 0;
     if (disk_count == 0 ? (exists && st.st_size > 0)
@@ -1664,7 +1666,7 @@ ray_err_t ray_sym_domain_flush_append(ray_sym_domain_t* dom, bool durable) {
     }
     if (err == RAY_OK && wn && fwrite(wb, 1, wn, f) != wn) err = RAY_ERR_IO;
     ray_sys_free(wb);
-    /* the count goes in last: a reader of a torn file sees the old count */
+    /* the count goes in last, once the records it covers are written */
     if (err == RAY_OK && (fflush(f) != 0 || !dom_fseek(f, 4) ||
                           fwrite(&count, 8, 1, f) != 1 || fflush(f) != 0))
         err = RAY_ERR_IO;

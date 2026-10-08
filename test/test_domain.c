@@ -2260,14 +2260,14 @@ static test_result_t test_domain_flush_append(void) {
 }
 
 /* ray_sym_domain_create_import: on an 8-worker pool, 32 tasks intern the
- * same 200K strings in the same order at once (every miss is raced), then
- * each its own slice of 3M more, so shard tables and the mapped file both
+ * same 100K strings in the same order at once (every miss is raced), then
+ * each its own slice of 800K more, so shard tables and the mapped file both
  * grow past their first size.  A string gets one position whoever adds it,
  * "" is position 0, the count is the distinct strings plus one, and after
  * the durable flush the file reopens as an ordinary domain with every
  * string at its position. */
-#define IMP_SHARED 200000
-#define IMP_OWN    3000000
+#define IMP_SHARED 100000
+#define IMP_OWN    800000
 #define IMP_N      (IMP_SHARED + IMP_OWN)
 #define IMP_TASKS  32
 typedef struct { ray_sym_domain_t* dom; int64_t* pos; _Atomic(int) bad; } imp_ctx_t;
