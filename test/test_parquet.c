@@ -1,4 +1,7 @@
 /* Copyright (c) 2026 Anton Kundenko. MIT license; see LICENSE. */
+#if !defined(_WIN32)
+#define _POSIX_C_SOURCE 200809L  /* setenv / unsetenv */
+#endif
 #include "test.h"
 #include "io/parquet.h"
 #include "core/pool.h"
@@ -8,6 +11,7 @@
 #include "store/splay.h"
 #include "ops/idxop.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #if !defined(RAY_OS_WINDOWS) && !defined(RAY_OS_WASM)
@@ -292,27 +296,39 @@ static void pq_remove_native(const char* dir, const char** columns, int n) {
     for (int i = 0; i < 3; i++) { snprintf(path,sizeof(path),"%s/%s",dir,special[i]); unlink(path); }
     rmdir(dir);
 }
+/* The direct import picks its pass layout from memory; RAY_PQ_PASS_COLS
+ * forces it, so a test covers both: NULL = the default (one pass on any
+ * test machine), "1" = column by column. */
+static void pq_set_layout(const char* v) {
+#ifdef RAY_OS_WINDOWS
+    _putenv_s("RAY_PQ_PASS_COLS", v ? v : "");
+#else
+    if (v) setenv("RAY_PQ_PASS_COLS", v, 1); else unsetenv("RAY_PQ_PASS_COLS");
+#endif
+}
 static test_result_t test_pq_group_native(void) {
     const char* names[] = {"x","y","s"};
     int64_t tids[] = {ray_sym_intern("I32",3),ray_sym_intern("I64",3),ray_sym_intern("SYM",3)};
     ray_t* types = ray_vec_from_raw(RAY_SYM,tids,3);
     for (int cores = 1; cores <= 8; cores *= 2) {
         ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(cores),RAY_OK);
-        for (int sym = 0; sym < 2; sym++) {
+        for (int sym = 0; sym < 4; sym++) {
+            pq_set_layout(sym >= 2 ? "1" : NULL);
             char dir[160]; snprintf(dir,sizeof(dir),"/tmp/rayforce-pq-groups-%d-%d-%d",(int)getpid(),cores,sym);
-            ray_t* result = ray_parquet_splayed_typed(FIX "row-groups.parquet",dir,sym ? types : NULL);
+            ray_t* result = ray_parquet_splayed_typed(FIX "row-groups.parquet",dir,sym & 1 ? types : NULL);
+            pq_set_layout(NULL);
             TEST_ASSERT_FALSE(RAY_IS_ERR(result)); TEST_ASSERT_EQ_I(result->i64,44009); ray_release(result);
             char domain[200]; snprintf(domain,sizeof(domain),"%s/.sym",dir);
-            ray_t* table = ray_read_splayed(dir,sym ? domain : NULL);
+            ray_t* table = ray_read_splayed(dir,sym & 1 ? domain : NULL);
             TEST_ASSERT_FALSE(RAY_IS_ERR(table)); TEST_ASSERT_EQ_I(ray_table_nrows(table),44009);
             ray_t* strings = ray_table_get_col_idx(table,2);
-            TEST_ASSERT_EQ_I(strings->type,sym ? RAY_SYM : RAY_STR);
+            TEST_ASSERT_EQ_I(strings->type,sym & 1 ? RAY_SYM : RAY_STR);
             for (int64_t i = 0; i < 44009; i++) {
                 TEST_ASSERT_EQ_I(((int32_t*)ray_data(ray_table_get_col_idx(table,0)))[i],i);
                 TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_table_get_col_idx(table,1)))[i],i%13 ? i*3 : NULL_I64);
                 char expected[64]; int n = snprintf(expected,sizeof(expected),"long pooled string row %lld",(long long)i);
                 size_t len; const char* text;
-                if (sym) { ray_t* atom = ray_sym_vec_cell(strings,i); text = ray_str_ptr(atom); len = ray_str_len(atom); }
+                if (sym & 1) { ray_t* atom = ray_sym_vec_cell(strings,i); text = ray_str_ptr(atom); len = ray_str_len(atom); }
                 else text = ray_str_vec_get(strings,i,&len);
                 TEST_ASSERT_EQ_I(len,n); TEST_ASSERT_TRUE(!memcmp(text,expected,len));
             }
@@ -465,10 +481,13 @@ static void* pq_small_stack_worker(void* result) {
  * unclustered column with nulls gets a hash. */
 static test_result_t test_pq_splayed_inline_indexes(void) {
     const char* names[] = {"x","y"};
-    for (int cores = 1; cores <= 4; cores *= 4) {
+    for (int run = 0; run < 4; run++) {
+        int cores = run & 1 ? 4 : 1;
         ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(cores),RAY_OK);
-        char dir[160]; snprintf(dir,sizeof(dir),"/tmp/rayforce-pq-zones-%d-%d",(int)getpid(),cores);
+        char dir[160]; snprintf(dir,sizeof(dir),"/tmp/rayforce-pq-zones-%d-%d",(int)getpid(),run);
+        pq_set_layout(run >= 2 ? "1" : NULL);
         ray_t* result = ray_parquet_splayed_typed(FIX "zones.parquet",dir,NULL);
+        pq_set_layout(NULL);
         TEST_ASSERT_FALSE(RAY_IS_ERR(result)); TEST_ASSERT_EQ_I(result->i64,200000); ray_release(result);
         ray_t* table = ray_read_splayed(dir,NULL);
         TEST_ASSERT_FALSE(RAY_IS_ERR(table));

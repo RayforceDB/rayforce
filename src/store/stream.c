@@ -450,6 +450,13 @@ void ray_col_stream_hash_all(ray_col_stream_t* w, int64_t n, int64_t* col_ns) {
         if (w[c].index) { ray_release(w[c].index); w[c].index = NULL; }
 }
 
+void ray_col_stream_hash_one(ray_col_stream_t* w) {
+    if (!w->wants_hash) return;
+    (void)ray_splay_hash_column(w->path, w->index);   /* best effort */
+    w->wants_hash = false;
+    if (w->index) { ray_release(w->index); w->index = NULL; }
+}
+
 void ray_col_stream_abort(ray_col_stream_t* w) {
     ray_col_stream_drop_lut(w);
     stream_drop_index(w);
