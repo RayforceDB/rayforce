@@ -37,6 +37,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <time.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -186,6 +187,20 @@ void ray_vm_advise_willneed(void* ptr, size_t size) {
     uintptr_t end = (uintptr_t)ptr + size;
     for (; a < end; a += chunk)
         madvise((void*)a, end - a < chunk ? end - a : chunk, MADV_WILLNEED);
+}
+
+void ray_file_writeback_start(int fd, int64_t off, int64_t len) {
+#if defined(__linux__)
+    if (fd >= 0 && off >= 0 && len > 0)
+        (void)sync_file_range(fd, (off64_t)off, (off64_t)len, SYNC_FILE_RANGE_WRITE);
+#else
+    (void)fd; (void)off; (void)len;
+#endif
+}
+
+void ray_sleep_ms(int ms) {
+    struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
+    nanosleep(&ts, NULL);
 }
 
 bool ray_vm_resident(const void* ptr, size_t size) {
@@ -748,6 +763,10 @@ void ray_vm_advise_willneed(void* ptr, size_t size) {
     PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0);
 }
 
+void ray_file_writeback_start(int fd, int64_t off, int64_t len) { (void)fd; (void)off; (void)len; }
+
+void ray_sleep_ms(int ms) { Sleep((DWORD)ms); }
+
 /* No cheap residency query here: report "not resident" so a read-ahead is
  * still requested (PrefetchVirtualMemory skips resident pages itself). */
 bool ray_vm_resident(const void* ptr, size_t size) { (void)ptr; (void)size; return false; }
@@ -968,6 +987,8 @@ void* ray_vm_map_fd_ro(int fd, size_t size) {
 /* madvise hints are advisory and have no analog on WASM — no-ops. */
 void ray_vm_advise_seq(void* ptr, size_t size)      { (void)ptr; (void)size; }
 void ray_vm_advise_willneed(void* ptr, size_t size) { (void)ptr; (void)size; }
+void ray_file_writeback_start(int fd, int64_t off, int64_t len) { (void)fd; (void)off; (void)len; }
+void ray_sleep_ms(int ms)                          { (void)ms; }
 bool ray_vm_resident(const void* ptr, size_t size)  { (void)ptr; (void)size; return true; }
 void ray_vm_release(void* ptr, size_t size)         { (void)ptr; (void)size; }
 

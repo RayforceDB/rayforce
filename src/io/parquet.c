@@ -10,6 +10,7 @@
 #include "core/platform.h"
 #include "core/pool.h"
 #include "core/crc32.h"
+#include "core/profile.h"
 #include "mem/heap.h"
 #include "table/sym.h"
 #include "table/domain.h"
@@ -1783,6 +1784,10 @@ static bool pq_remove_dir(const char* path) {
     return rmdir(path) == 0;
 #endif
 }
+/* Column by column below this many times the output's bytes of memory
+ * (see pq_write_direct). */
+#define PQ_COLWISE_RATIO 2
+
 typedef struct {
     ray_parquet_t* parent;
     ray_col_stream_t* writers;
@@ -1790,55 +1795,67 @@ typedef struct {
     _Atomic uint32_t* nulls;
     _Atomic uint32_t* locks;
     ray_t** errors;
-    _Atomic uint8_t* prefetched;   /* [ngroups]: read-ahead already requested */
+    const int64_t* pass;           /* the columns of the current pass */
+    int64_t npass;
+    const int64_t* chunk_lo;       /* [ngroups * ncols] byte range of each column chunk, */
+    const int64_t* chunk_hi;       /*   lo < 0 when the metadata does not give one */
+    _Atomic uint8_t* prefetched;   /* [ngroups * ncols]: read-ahead already requested */
     int64_t prefetch;              /* row groups requested ahead of the one starting */
+    int64_t ahead_bytes;           /* cap on what one task requests past its own chunk */
+    bool writeback;                /* start each written chunk's writeback (one-pass layout) */
 } pq_direct_work;
 
-/* Byte range of row group g in the file: its column chunks are contiguous,
- * each from its dictionary page (or first data page) for total_compressed
- * bytes.  False when the metadata does not give one. */
-static bool pq_group_bytes(ray_parquet_t* r, int64_t g, int64_t* lo, int64_t* hi) {
+/* Byte range of every column chunk — from its dictionary page (or first
+ * data page) for total_compressed bytes — and each column's uncompressed
+ * total.  False when a row group's metadata cannot be read. */
+static bool pq_chunk_ranges(ray_parquet_t* r, int64_t* lo, int64_t* hi, int64_t* col_bytes) {
     pq_span* cols = ray_calloc_raw((size_t)r->ncols*sizeof(*cols));
-    int64_t rows = 0;
-    bool ok = cols && pq_group_columns(r,g,cols,&rows,NULL);
-    int64_t a = INT64_MAX, b = 0;
-    for (int64_t c = 0; ok && c < r->ncols; c++) {
-        pq_span mf[17];
-        if (!pq_fields(cols[c],mf,17)) { ok = false; break; }
-        int64_t data = pq_get(mf[9],-1), dict = pq_get(mf[11],-1), bytes = pq_get(mf[7],-1);
-        int64_t start = dict > 0 && dict < data ? dict : data;
-        if (start < 0 || bytes < 0 || start > (int64_t)r->size || bytes > (int64_t)r->size - start) { ok = false; break; }
-        if (start < a) a = start;
-        if (start + bytes > b) b = start + bytes;
+    bool ok = cols != NULL;
+    for (int64_t g = 0; ok && g < r->ngroups; g++) {
+        int64_t rows = 0;
+        if (!pq_group_columns(r,g,cols,&rows,NULL)) { ok = false; break; }
+        for (int64_t c = 0; c < r->ncols; c++) {
+            int64_t i = g*r->ncols+c; pq_span mf[17];
+            lo[i] = hi[i] = -1;
+            if (!pq_fields(cols[c],mf,17)) continue;
+            int64_t data = pq_get(mf[9],-1), dict = pq_get(mf[11],-1), bytes = pq_get(mf[7],-1);
+            int64_t raw = pq_get(mf[6],-1), start = dict > 0 && dict < data ? dict : data;
+            if (raw > 0) col_bytes[c] = raw > INT64_MAX - col_bytes[c] ? INT64_MAX : col_bytes[c] + raw;
+            if (start < 0 || bytes < 0 || start > (int64_t)r->size || bytes > (int64_t)r->size - start) continue;
+            lo[i] = start; hi[i] = start + bytes;
+        }
     }
     ray_free_raw(cols);
-    if (!ok || a >= b) return false;
-    *lo = a; *hi = b;
-    return true;
+    return ok;
 }
 
 /* A mapped column chunk is read on first touch, one fault at a time per
- * worker, so a worker has a single read in flight.  On storage with a high
- * per-request latency (a network block device) that latency bounds the
- * import.  The first task of a row group asks the kernel to start reading
- * the next `prefetch` groups in the background: their pages arrive while
- * this group decodes, many requests in flight.  RAY_PQ_PREFETCH sets the
- * depth (default 2, 0 turns it off). */
-static void pq_prefetch_groups(pq_direct_work* w, int64_t g) {
+ * worker, so a worker has a single read in flight; on storage with a high
+ * per-request latency (a network block device) that bounds the import.  A
+ * task asks the kernel for its whole chunk and for the same column's chunks
+ * of the next `prefetch` row groups (up to `ahead_bytes`), so the reads are
+ * in flight together while it decodes.  RAY_PQ_PREFETCH sets the depth
+ * (default 2, 0 turns it off). */
+static void pq_prefetch_chunks(pq_direct_work* w, int64_t g, int64_t c) {
     ray_parquet_t* r = w->parent;
+    int64_t ahead = 0;
     for (int64_t k = 0; k <= w->prefetch && g + k < r->ngroups; k++) {
+        int64_t i = (g+k)*r->ncols+c, lo = w->chunk_lo[i], hi = w->chunk_hi[i];
+        if (lo < 0) continue;
+        if (k > 0 && (ahead += hi - lo) > w->ahead_bytes) break;
         uint8_t z = 0;
-        if (!atomic_compare_exchange_strong_explicit(&w->prefetched[g+k],&z,1,
+        if (!atomic_compare_exchange_strong_explicit(&w->prefetched[i],&z,1,
                 memory_order_relaxed,memory_order_relaxed)) continue;
-        int64_t lo, hi;
-        if (pq_group_bytes(r,g+k,&lo,&hi)) ray_vm_advise_willneed(r->map + lo,(size_t)(hi-lo));
+        ray_vm_advise_willneed(r->map + lo,(size_t)(hi-lo));
     }
 }
 static void pq_write_direct_group(void* ptr, uint32_t worker, int64_t start, int64_t end) {
     (void)worker; pq_direct_work* w = ptr;
     for (int64_t task = start; task < end; task++) {
-        int64_t g = task/w->parent->ncols, c = task%w->parent->ncols;
-        if (w->prefetched) pq_prefetch_groups(w,g);
+        /* Row groups outermost within a pass: a worker reads one group's
+         * chunks of the pass's columns side by side. */
+        int64_t g = task/w->npass, c = w->pass[task%w->npass];
+        if (w->prefetched) pq_prefetch_chunks(w,g,c);
         ray_parquet_t* r = pq_group_reader(w->parent,g);
         if (!r) { w->errors[task] = ray_error("oom",NULL); continue; }
         /* A task is one column chunk, so both groups and columns can occupy
@@ -1879,6 +1896,15 @@ static void pq_write_direct_group(void* ptr, uint32_t worker, int64_t start, int
         /* Unmerged accumulator (task error): ray_col_stream_abort would
          * fclose local.fp a second time, so free the zone directly. */
         if (local.zone) { ray_zone_acc_free(local.zone); ray_free_raw(local.zone); local.zone = NULL; }
+        /* Start this chunk's writeback now: the pages leave while the
+         * import goes on, instead of all at the final sync.  A failed flush
+         * has dropped its buffer, and the close after it may well succeed:
+         * it is the task's error. */
+        if (w->writeback && !w->errors[task]) {
+            if (fflush(local.fp) != 0) w->errors[task] = pq_error("native column write failed");
+            else ray_file_writeback_start(fileno(local.fp),32+w->offsets[g]*(int64_t)size,
+                                          (row-w->offsets[g])*(int64_t)size);
+        }
         if (fclose(local.fp) && !w->errors[task]) w->errors[task] = pq_error("native column close failed");
         if (local.had_nulls) atomic_store_explicit(&w->nulls[c],1,memory_order_relaxed);
         if (!w->errors[task] && row != w->offsets[g+1]) w->errors[task] = pq_error("row group ended before its assigned output range");
@@ -1886,15 +1912,50 @@ static void pq_write_direct_group(void* ptr, uint32_t worker, int64_t start, int
     }
 }
 
+/* While the passes run, a background thread appends the file domain's new
+ * entries to the symbol file every quarter second (and starts their
+ * writeback), so the final flush writes only the tail and its sync finds
+ * the rest on disk. */
+typedef struct { ray_sym_domain_t* dom; _Atomic(bool) stop; _Atomic(int) err; } pq_symflush_t;
+static void pq_symflush_fn(void* arg) {
+    pq_symflush_t* s = arg;
+    while (!atomic_load_explicit(&s->stop,memory_order_acquire)) {
+        ray_err_t e = ray_sym_domain_flush_append(s->dom,false);
+        if (e != RAY_OK) { atomic_store_explicit(&s->err,(int)e,memory_order_release); return; }
+        /* in slices, so the import's end does not wait out the interval */
+        for (int i = 0; i < 25 && !atomic_load_explicit(&s->stop,memory_order_acquire); i++)
+            ray_sleep_ms(10);
+    }
+}
+/* The import runs in passes, each decoding some columns' chunks from every
+ * row group in parallel.  When memory is short next to the output it goes
+ * column by column (a pass is one column, or a few when the file has fewer
+ * row groups than the pool has workers): one column file is written at a
+ * time instead of all of them at once.  Numeric and temporal columns go
+ * first and are closed as soon as their pass ends, their hash index built
+ * while the file is still in the page cache; symbol columns follow in
+ * passes of their own, smallest first, so the file domain only grows once
+ * the other columns are done.  With memory to spare one pass takes every
+ * column, and the columns close and are indexed together after it, as the
+ * row-group import does.  Symbol columns close with the domain, after its
+ * flush. */
 static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
-    int64_t tasks = r->ngroups*r->ncols;
-    if (tasks > UINT32_MAX) return pq_error("too many column chunk tasks");
+    int64_t chunks = r->ngroups*r->ncols;
+    if (chunks > UINT32_MAX) return pq_error("too many column chunk tasks");
     int64_t* offsets = ray_calloc_raw((size_t)(r->ngroups+1)*sizeof(*offsets));
     _Atomic uint32_t* nulls = ray_calloc_raw((size_t)r->ncols*sizeof(*nulls));
     _Atomic uint32_t* locks = ray_calloc_raw((size_t)r->ncols*sizeof(*locks));
-    ray_t** errors = ray_calloc_raw((size_t)(tasks+1)*sizeof(*errors));
+    ray_t** errors = ray_calloc_raw((size_t)(chunks+1)*sizeof(*errors));
+    int64_t* lo = ray_alloc_raw((size_t)(chunks+1)*sizeof(*lo));
+    int64_t* hi = ray_alloc_raw((size_t)(chunks+1)*sizeof(*hi));
+    int64_t* bytes = ray_calloc_raw((size_t)r->ncols*sizeof(*bytes));
+    int64_t* order = ray_alloc_raw((size_t)r->ncols*sizeof(*order));
+    _Atomic uint8_t* prefetched = NULL;
     ray_t* err = NULL;
-    if (!offsets || !nulls || !locks || !errors) { err = ray_error("oom",NULL); goto done; }
+    pq_symflush_t symf = {NULL,false,(int)RAY_OK};
+    ray_thread_t sym_thread = 0;
+    bool sym_running = false;
+    if (!offsets || !nulls || !locks || !errors || !lo || !hi || !bytes || !order) { err = ray_error("oom",NULL); goto done; }
     for (int64_t c = 0; c < r->ncols; c++) {
         size_t size = writers[c].type == RAY_SYM ? 4 : ray_elem_size(writers[c].type);
         if (r->rows > (INT64_MAX-32)/(int64_t)size) { err = pq_error("native column exceeds file offset range"); goto done; }
@@ -1907,30 +1968,137 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
         if (!pq_fields(r->groups[g],fields,8)) { err = pq_error("invalid row group"); goto done; }
         offsets[g+1] = offsets[g]+pq_get(fields[3],0);
     }
-    pq_direct_work work = {r,writers,offsets,nulls,locks,errors,NULL,0};
+    bool ranges = pq_chunk_ranges(r,lo,hi,bytes);
+    /* numeric columns in schema order, then symbol columns by size */
+    int64_t nnum = 0, n = 0;
+    for (int64_t c = 0; c < r->ncols; c++) if (writers[c].type != RAY_SYM) order[n++] = c;
+    nnum = n;
+    for (int64_t c = 0; c < r->ncols; c++) if (writers[c].type == RAY_SYM) {
+        int64_t j = n++;
+        for (; j > nnum && bytes[order[j-1]] > bytes[c]; j--) order[j] = order[j-1];
+        order[j] = c;
+    }
+    ray_pool_t* pool = ray_pool_get();
+    int64_t workers = pool ? (int64_t)ray_pool_total_workers(pool) : 1;
+    /* The pass layout follows memory: physical RAM or the cgroup limit,
+     * the page cache the output competes for (not the heap budget of -m).
+     * Column by column pays off when the output does not fit it with room
+     * to spare: each column is written and indexed while it is hot, and
+     * only it is.  With plenty of memory one pass over every column keeps
+     * all the decode work overlapped with the symbol domain's commits and
+     * wins.  RAY_PQ_PASS_COLS forces columns per pass, symbol passes
+     * included (r->ncols: one pass). */
+    int64_t out_bytes = 0;
+    for (int64_t c = 0; c < r->ncols; c++) {
+        int64_t b = r->rows*(int64_t)(writers[c].type == RAY_SYM ? 4 : ray_elem_size(writers[c].type));
+        out_bytes = b > INT64_MAX - out_bytes ? INT64_MAX : out_bytes + b;
+    }
+    int64_t ram = ray_sys_ram_limit();
+    bool colwise = ram > 0 && ram / PQ_COLWISE_RATIO < out_bytes;
+    /* column by column: enough tasks in a pass for the pool, so a file of
+     * few row groups still takes several columns at once */
+    int64_t width = !colwise ? r->ncols
+                  : r->ngroups > 0 ? (2*workers + r->ngroups - 1)/r->ngroups : r->ncols;
+    if (width < 1) width = 1;
+    bool forced = false;
+    {
+        const char* e = getenv("RAY_PQ_PASS_COLS");
+        if (e && *e && strtol(e,NULL,10) > 0) { width = strtol(e,NULL,10); colwise = width < r->ncols; forced = true; }
+    }
+    if (width > r->ncols) width = r->ncols;
+    bool trace = getenv("RAY_CSV_TRACE") != NULL;   /* the converters' phase trace */
+    pq_direct_work work = {r,writers,offsets,nulls,locks,errors,NULL,0,lo,hi,NULL,0,0,true};
+    /* Starting each chunk's writeback as it is written spares one pass its
+     * final sync; column by column the passes end their files anyway and
+     * the extra I/O requests only slow the decode. */
+    work.writeback = !colwise;
     {
         const char* e = getenv("RAY_PQ_PREFETCH");
         work.prefetch = (e && *e) ? strtol(e,NULL,10) : 2;
-        if (work.prefetch > 0) {
-            work.prefetched = ray_calloc_raw((size_t)r->ngroups);
-            if (work.prefetched) for (int64_t g = 0; g < r->ngroups; g++) atomic_init(&work.prefetched[g],0);
+        if (work.prefetch > 0 && ranges) {
+            prefetched = ray_calloc_raw((size_t)chunks+1);
+            if (prefetched) for (int64_t i = 0; i < chunks; i++) atomic_init(&prefetched[i],0);
+            work.prefetched = prefetched;
+        }
+        /* what the workers keep requested ahead together stays a small
+         * share of memory */
+        int64_t budget = ray_heap_anon_watermark()/16/workers;
+        work.ahead_bytes = budget < ((int64_t)1 << 20) ? (int64_t)1 << 20
+                         : budget > ((int64_t)64 << 20) ? (int64_t)64 << 20 : budget;
+    }
+    /* Symbol columns: one by one, smallest first, while memory is short
+     * (the domain they share grows and is probed at random, and a column
+     * at a time keeps the rest of the working set small); together in one
+     * pass from half the output's bytes of memory, where their decode then
+     * overlaps. */
+    int64_t sym_width = forced ? width : ram > 0 && ram >= out_bytes / 2 ? r->ncols - nnum : 1;
+    if (sym_width < 1) sym_width = 1;
+    if (nnum < r->ncols && writers[order[nnum]].dom) {
+        symf.dom = writers[order[nnum]].dom;
+        if (ray_thread_create(&sym_thread,pq_symflush_fn,&symf) == RAY_OK) sym_running = true;
+    }
+    bool all = !colwise;
+    for (int64_t p = 0; p < r->ncols && !err; p += work.npass) {
+        int64_t wd = all ? r->ncols : p < nnum ? width : sym_width;
+        int64_t lim = all ? r->ncols : p < nnum ? nnum : r->ncols;
+        work.pass = order + p;
+        work.npass = lim - p < wd ? lim - p : wd;
+        int64_t tasks = r->ngroups*work.npass;
+        int64_t t0 = trace ? ray_profile_now_ns() : 0, t1 = 0;
+        if (tasks > 0) {
+            if (ray_pool_par_dispatch_ok(pool,tasks,2)) ray_pool_dispatch_n(pool,pq_write_direct_group,&work,(uint32_t)tasks);
+            else pq_write_direct_group(&work,0,0,tasks);
+        }
+        for (int64_t t = 0; t < tasks; t++) if (errors[t]) {
+            if (!err) err = errors[t]; else ray_release(errors[t]);
+            errors[t] = NULL;
+        }
+        if (!err && ray_interrupted()) err = ray_error("cancel","parquet conversion interrupted");
+        if (!err && atomic_load_explicit(&symf.err,memory_order_acquire) != RAY_OK)
+            err = ray_error(ray_err_code_str((ray_err_t)atomic_load(&symf.err)),"parquet: cannot flush symbol file");
+        if (err) break;
+        if (trace) t1 = ray_profile_now_ns();
+        for (int64_t i = 0; i < work.npass; i++) {
+            int64_t c = work.pass[i];
+            writers[c].rows = r->rows;
+            writers[c].had_nulls = atomic_load_explicit(&nulls[c],memory_order_relaxed) != 0;
+            if (all || writers[c].type == RAY_SYM) continue;
+            ray_err_t e = ray_col_stream_close(&writers[c],false);
+            if (e != RAY_OK) { err = ray_error(ray_err_code_str(e),"parquet: column close failed"); break; }
+            ray_col_stream_hash_one(&writers[c]);
+        }
+        if (trace && !err) {
+            ray_t* nm = ray_sym_str(r->schema[work.pass[0]].name);
+            fprintf(stderr,"parquet pass: first=%.*s cols=%lld %s decode=%.1fms close=%.1fms\n",
+                    (int)ray_str_len(nm),ray_str_ptr(nm),(long long)work.npass,
+                    writers[work.pass[0]].type == RAY_SYM ? "sym" : "num",
+                    (double)(t1-t0)/1e6,(double)(ray_profile_now_ns()-t1)/1e6);
         }
     }
-    ray_pool_t* pool = ray_pool_get();
-    if (ray_pool_par_dispatch_ok(pool,tasks,2)) ray_pool_dispatch_n(pool,pq_write_direct_group,&work,(uint32_t)tasks);
-    else pq_write_direct_group(&work,0,0,tasks);
-    for (int64_t g = 0; g < tasks; g++) if (errors[g]) {
-        if (!err) err = errors[g]; else ray_release(errors[g]);
+    /* One pass: the columns finish side by side and their hash indexes are
+     * built in waves while the symbol file appender is still writing (its
+     * writeback can wait on the column data's); a symbol column's header
+     * takes the domain's final count, which no longer changes.  The
+     * column-by-column passes have closed and indexed theirs already. */
+    if (all && !err) {
+        int64_t tc = trace ? ray_profile_now_ns() : 0;
+        ray_err_t e = ray_col_stream_close_all(writers,r->ncols,false,NULL);
+        if (e != RAY_OK) err = ray_error(ray_err_code_str(e),"parquet: column close failed");
+        else ray_col_stream_hash_all(writers,r->ncols,NULL);
+        if (trace) fprintf(stderr,"parquet phase: close+hash=%.1fms\n",(double)(ray_profile_now_ns()-tc)/1e6);
     }
-    if (!err && ray_interrupted()) err = ray_error("cancel","parquet conversion interrupted");
-    for (int64_t c = 0; c < r->ncols; c++) {
-        writers[c].rows = r->rows;
-        writers[c].had_nulls = atomic_load_explicit(&nulls[c],memory_order_relaxed) != 0;
+    if (sym_running) {
+        atomic_store_explicit(&symf.stop,true,memory_order_release);
+        ray_thread_join(sym_thread);
+        if (!err && atomic_load(&symf.err) != RAY_OK)
+            err = ray_error(ray_err_code_str((ray_err_t)atomic_load(&symf.err)),"parquet: cannot flush symbol file");
     }
-    if (work.prefetched) ray_free_raw((void*)work.prefetched);
 done:
     for (int64_t c = 0; c < r->ncols; c++) r->schema[c].import_domain = NULL;
-    ray_free_raw(offsets); ray_free_raw(nulls); ray_free_raw(locks); ray_free_raw(errors); return err;
+    ray_free_raw(offsets); ray_free_raw(nulls); ray_free_raw(locks); ray_free_raw(errors);
+    ray_free_raw(lo); ray_free_raw(hi); ray_free_raw(bytes); ray_free_raw(order);
+    if (prefetched) ray_free_raw((void*)prefetched);
+    return err;
 }
 ray_t* ray_parquet_splayed_typed(const char* path, const char* dir, ray_t* types) {
 #ifdef RAY_FUZZING
@@ -1952,7 +2120,13 @@ ray_t* ray_parquet_splayed_typed(const char* path, const char* dir, ray_t* types
     if (!writers) { err = ray_error("oom",NULL); goto done; }
     for (int64_t c = 0; c < r->ncols; c++) if (r->schema[c].native_symbol && !domain) {
         snprintf(file,sizeof(file),"%s/.sym",staging);
-        domain = ray_sym_domain_open_or_create(file);
+        /* The direct import (no STR column) builds the symbol file with the
+         * import dictionary: strings go straight into the mapped file. */
+        bool str_cols = false;
+        for (int64_t k = 0; k < r->ncols; k++)
+            if (!r->schema[k].native_symbol && r->schema[k].type == RAY_STR) str_cols = true;
+        if (!str_cols) domain = ray_sym_domain_create_import(file);
+        if (!domain) domain = ray_sym_domain_open_or_create(file);
         if (!domain) { err = ray_error("oom",NULL); goto done; }
         if (ray_sym_domain_intern(domain,"",0) != 0) { err = pq_error("cannot initialize native symbol domain"); goto done; }
     }
@@ -1967,6 +2141,8 @@ ray_t* ray_parquet_splayed_typed(const char* path, const char* dir, ray_t* types
     }
     bool direct = true;
     for (int64_t c = 0; c < r->ncols; c++) if (writers[c].type == RAY_STR) direct = false;
+    bool trace = getenv("RAY_CSV_TRACE") != NULL;
+    int64_t tp = trace ? ray_profile_now_ns() : 0;
     if (direct) {
         err = pq_write_direct(r,writers);
         if (err) goto done;
@@ -2001,21 +2177,29 @@ ray_t* ray_parquet_splayed_typed(const char* path, const char* dir, ray_t* types
     }
     if (!pq_remove_dir(spool)) { e = RAY_ERR_IO; goto io_fail; }
 finish_columns:
-    if (domain) { e = ray_sym_domain_flush(domain,true); if (e != RAY_OK) goto io_fail; }
-    /* All columns are still under a private staging directory. Commit
-     * their final images together below, after the hash re-read.  Every
+    if (trace) { fprintf(stderr,"parquet phase: passes=%.1fms\n",(double)(ray_profile_now_ns()-tp)/1e6); tp = ray_profile_now_ns(); }
+    /* the direct import appended the symbols as they came: this writes
+     * what is left and syncs the file */
+    if (domain) { e = ray_sym_domain_flush_append(domain,true); if (e != RAY_OK) goto io_fail; }
+    if (trace) { fprintf(stderr,"parquet phase: sym flush=%.1fms\n",(double)(ray_profile_now_ns()-tp)/1e6); tp = ray_profile_now_ns(); }
+    /* All columns are still under a private staging directory (the direct
+     * import has closed and indexed them already, but for the symbol
+     * columns of its column-by-column passes). Commit their final images
+     * together below, after the hash re-read of any column left.  Every
      * column finishes as a pool task; the renames run serially after. */
     e = ray_col_stream_close_all(writers,r->ncols,false,NULL);
     if (e != RAY_OK) goto io_fail;
     /* The persisted domain is flushed and every writer is closed (the zone
      * and dictionary indexes were built inline while streaming). Drop the
-     * ingestion hash tables and string arena before the hash re-read of the
+     * ingestion hash tables and string arena before any hash re-read of the
      * integer columns; reopening needs only the file-backed vocabulary. */
     if (domain) {
         ray_sym_domain_release(domain); domain = NULL;
         for (int64_t c = 0; c < opened; c++) writers[c].dom = NULL;
     }
+    if (trace) { fprintf(stderr,"parquet phase: close=%.1fms\n",(double)(ray_profile_now_ns()-tp)/1e6); tp = ray_profile_now_ns(); }
     ray_col_stream_hash_all(writers,r->ncols,NULL);
+    if (trace) { fprintf(stderr,"parquet phase: hash=%.1fms\n",(double)(ray_profile_now_ns()-tp)/1e6); tp = ray_profile_now_ns(); }
     ray_t* schema = ray_vec_new(RAY_STR,r->ncols);
     if (!schema || RAY_IS_ERR(schema)) { err = schema ? schema : ray_error("oom",NULL); goto done; }
     for (int64_t c = 0; c < r->ncols; c++) {
@@ -2037,6 +2221,7 @@ finish_columns:
         e = ray_file_sync(fd); ray_file_close(fd);
         if (e != RAY_OK) goto io_fail;
     }
+    if (trace) { fprintf(stderr,"parquet phase: schema+sync=%.1fms\n",(double)(ray_profile_now_ns()-tp)/1e6); tp = ray_profile_now_ns(); }
     e = ray_file_sync_dir(file);
     if (e != RAY_OK) goto io_fail;
     err = pq_publish(staging,dir,r->rows);
