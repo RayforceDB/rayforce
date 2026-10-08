@@ -1057,7 +1057,13 @@ static ray_t* splay_load_dom_impl(const char* dir, ray_sym_domain_t* dom,
 /* Only the selected generation is kept, so one a reader resolved can be
  * removed before the reader has opened all its files.  A read that fails is
  * tried again while the table keeps resolving to a different generation;
- * a failure on the generation still selected is the table's own. */
+ * a failure on the generation still selected is the table's own.  Each retry
+ * follows a completed publish, so the reader is not counted out: a reader
+ * that is slow to open its files (many columns, slow storage, a busy CPU)
+ * would otherwise fail after a fixed number of saves.  It gives up once the
+ * table has kept changing under it for SPLAY_RESOLVE_WAIT_NS (after at
+ * least SPLAY_RESOLVE_ATTEMPTS attempts), or when interrupted. */
+#define SPLAY_RESOLVE_WAIT_NS  (INT64_C(60) * 1000000000)
 #define SPLAY_RESOLVE_ATTEMPTS 8
 
 static bool splay_moved_on(const char* dir, const char* resolved) {
@@ -1066,12 +1072,32 @@ static bool splay_moved_on(const char* dir, const char* resolved) {
            strcmp(again, resolved) != 0;
 }
 
+/* Whether a read of `resolved` that failed (attempt `attempt` of a loop
+ * started at `t0`) is tried again: 1 yes; 0 no, the failure is the table's
+ * own; -1 interrupted; -2 the table kept changing for too long. */
+static int splay_retry(const char* dir, const char* resolved, int attempt, int64_t t0) {
+    if (!resolved[0] || !splay_moved_on(dir, resolved)) return 0;
+    if (ray_interrupted()) return -1;
+    if (attempt >= SPLAY_RESOLVE_ATTEMPTS &&
+        ray_profile_now_ns() - t0 >= SPLAY_RESOLVE_WAIT_NS) return -2;
+    return 1;
+}
+
+/* The error a reader that stopped retrying (splay_retry < 0) returns in
+ * place of its last attempt's, which only reflects the race. */
+static ray_t* splay_retry_error(int why, const char* dir, ray_t* last) {
+    if (last && RAY_IS_ERR(last)) ray_error_free(last);
+    if (why == -1) return ray_error("cancel", "interrupted");
+    return ray_error("io", "splayed %s: the table kept changing while it was read", dir);
+}
+
 /* Resolve sym_path to a FILE domain.  Missing file → NULL domain with
  * RAY_OK (only an error if a SYM column is later encountered — the
  * symbol-free-table exemption must hold for reads too); existing but
  * unopenable/invalid file → loud error. */
 static ray_t* splay_load_once(const char* dir, const char* sym_path,
-                              bool use_mmap, char* resolved, size_t resolved_sz) {
+                              bool use_mmap, char* resolved, size_t resolved_sz,
+                              ray_sym_domain_t** held) {
     ray_err_t err = ray_splay_resolve_dir(dir, resolved, resolved_sz);
     if (err != RAY_OK)
         return ray_error(ray_err_code_str(err), "cannot resolve splayed generation");
@@ -1083,33 +1109,45 @@ static ray_t* splay_load_once(const char* dir, const char* sym_path,
         struct stat st;
         if (stat(sym_path, &st) == 0) {
             dom = ray_sym_domain_open(sym_path);
+            /* The previous attempt's domain stays open until here, so a
+             * retry extends it instead of reading the symfile again. */
+            if (*held) { ray_sym_domain_release(*held); *held = NULL; }
             if (!dom)
                 return ray_error("corrupt",
                     "symfile %s: unreadable or invalid (bad magic, torn "
                     "record, or missing \"\" at position 0)", sym_path);
         }
     }
+    /* An earlier attempt's domain not replaced above (no symfile this
+     * time) is let go here, before *held is overwritten. */
+    if (*held) ray_sym_domain_release(*held);
     ray_t* tbl = splay_load_dom_impl(resolved, dom, use_mmap);
-    if (dom) ray_sym_domain_release(dom); /* columns hold their own refs */
+    *held = dom;   /* released by the caller; columns hold their own refs */
     return tbl;
 }
 
 static ray_t* splay_load_impl(const char* dir, const char* sym_path,
                               bool use_mmap) {
     char resolved[1024];
+    ray_sym_domain_t* held = NULL;
+    int64_t t0 = ray_profile_now_ns();
+    ray_t* tbl;
     for (int attempt = 1;; attempt++) {
         resolved[0] = '\0';
-        ray_t* tbl = splay_load_once(dir, sym_path, use_mmap, resolved, sizeof(resolved));
-        if (tbl && !RAY_IS_ERR(tbl)) return tbl;
-        if (attempt == SPLAY_RESOLVE_ATTEMPTS || !resolved[0] ||
-            !splay_moved_on(dir, resolved))
-            return tbl;
+        tbl = splay_load_once(dir, sym_path, use_mmap, resolved, sizeof(resolved), &held);
+        if (tbl && !RAY_IS_ERR(tbl)) break;
+        int why = splay_retry(dir, resolved, attempt, t0);
+        if (why < 0) { tbl = splay_retry_error(why, dir, tbl); break; }
+        if (!why) break;
         ray_error_free(tbl);
     }
+    if (held) ray_sym_domain_release(held);
+    return tbl;
 }
 
 bool ray_splay_has_schema(const char* dir) {
     char resolved[1024], schema[1100];
+    int64_t t0 = ray_profile_now_ns();
     for (int attempt = 1;; attempt++) {
         if (ray_splay_resolve_dir(dir, resolved, sizeof(resolved)) != RAY_OK)
             return false;
@@ -1117,8 +1155,7 @@ bool ray_splay_has_schema(const char* dir) {
         if (n < 0 || (size_t)n >= sizeof(schema)) return false;
         struct stat st;
         if (stat(schema, &st) == 0) return S_ISREG(st.st_mode);
-        if (attempt == SPLAY_RESOLVE_ATTEMPTS || !splay_moved_on(dir, resolved))
-            return false;
+        if (splay_retry(dir, resolved, attempt, t0) != 1) return false;
     }
 }
 
@@ -1356,13 +1393,14 @@ static ray_t* splay_read_dom_once(const char* dir, ray_sym_domain_t* dom,
 
 ray_t* ray_read_splayed_dom(const char* dir, struct ray_sym_domain_s* dom) {
     char resolved[1024];
+    int64_t t0 = ray_profile_now_ns();
     for (int attempt = 1;; attempt++) {
         resolved[0] = '\0';
         ray_t* tbl = splay_read_dom_once(dir, dom, resolved, sizeof(resolved));
         if (tbl && !RAY_IS_ERR(tbl)) return tbl;
-        if (attempt == SPLAY_RESOLVE_ATTEMPTS || !resolved[0] ||
-            !splay_moved_on(dir, resolved))
-            return tbl;
+        int why = splay_retry(dir, resolved, attempt, t0);
+        if (why < 0) return splay_retry_error(why, dir, tbl);
+        if (!why) return tbl;
         ray_error_free(tbl);
     }
 }

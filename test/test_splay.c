@@ -2789,6 +2789,7 @@ static test_result_t test_generation_first_write_keeps_others(void) {
 }
 
 #ifndef _WIN32
+#include <fcntl.h>
 #include <signal.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -2797,10 +2798,10 @@ static test_result_t test_generation_first_write_keeps_others(void) {
  * previous generation: make a fresh generation (hard links to the template),
  * select it, remove the one it replaced.  Names are never reused, as the
  * writer's are not.  Plain libc only: it runs in a forked child. */
-static void generation_flip_child(const char* dir, const char* tmpl) {
+static void generation_flip_child(const char* dir, const char* tmpl, int flips) {
     const char* names[] = {".d", "x", "y"};
     struct timespec pause = {0, 100 * 1000};
-    for (int i = 1; i <= 3000; i++) {
+    for (int i = 1; i <= flips; i++) {
         char tmp[1100], cur[1100], path[1200], src[1200];
         snprintf(path, sizeof(path), "%s/.generations/g-%d", dir, i);
         if (mkdir(path, 0755) != 0) _exit(1);
@@ -2852,7 +2853,7 @@ static test_result_t test_generation_reader_races(void) {
     fflush(NULL);
     pid_t child = fork();
     TEST_ASSERT_TRUE(child >= 0);
-    if (child == 0) generation_flip_child(dir, tmpl);
+    if (child == 0) generation_flip_child(dir, tmpl, 3000);
 
     int reads = 0, failures = 0, status = 0;
     while (waitpid(child, &status, WNOHANG) == 0) {
@@ -2868,6 +2869,180 @@ static test_result_t test_generation_reader_races(void) {
     TEST_ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     TEST_ASSERT_TRUE(reads > 0);
     TEST_ASSERT_EQ_I(failures, 0);
+    ray_release(t);
+    rm_rf(dir);
+    rm_rf(tmpl);
+    PASS();
+}
+
+/* The writer of test_generation_retry_releases_domain.  .current is a FIFO,
+ * so each resolve of the reader waits here: the first gets g-1, the second
+ * (the reader asking whether the table moved on) gets g-2 once the symfile
+ * is gone, and every later one reads the plain file `last` puts in place.
+ * Plain libc only: it runs in a forked child. */
+static void held_domain_child(const char* cur, const char* next,
+                              const char* last, const char* sym) {
+    const char* gens[] = {".generations/g-1\n", ".generations/g-2\n"};
+    const char* repl[] = {next, last};
+    for (int i = 0; i < 2; i++) {
+        int fd = open(cur, O_WRONLY);
+        if (fd < 0) _exit(1);
+        if (i == 1 && unlink(sym) != 0) _exit(1);
+        if (rename(repl[i], cur) != 0) _exit(1);
+        size_t len = strlen(gens[i]);
+        if (write(fd, gens[i], len) != (ssize_t)len) _exit(1);
+        close(fd);
+    }
+    _exit(0);
+}
+
+static test_result_t held_domain_run(const char* base, pid_t* child) {
+    char t[1100], sym[1100], sdir[1100], src[1100];
+    char g1[1200], g2[1200], cur[1200], next[1200], last[1200], resolved[1024];
+    snprintf(t, sizeof(t), "%s/t", base);
+    snprintf(sym, sizeof(sym), "%s/t.sym", base);
+    snprintf(sdir, sizeof(sdir), "%s/s", base);
+    snprintf(src, sizeof(src), "%s/src", base);
+    snprintf(g1, sizeof(g1), "%s/.generations/g-1", t);
+    snprintf(g2, sizeof(g2), "%s/.generations/g-2", t);
+    snprintf(cur, sizeof(cur), "%s/.current", t);
+    snprintf(next, sizeof(next), "%s/.current.next", t);
+    snprintf(last, sizeof(last), "%s/.current.last", t);
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(g1), 0);   /* no .d: attempt 1 fails */
+
+    /* The symfile, written by a table with a SYM column. */
+    ray_t* sc = ray_sym_vec_new(RAY_SYM_W64, 1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(sc));
+    sc->len = 1;
+    ((int64_t*)ray_data(sc))[0] = ray_sym_intern("held_a", 6);
+    ray_t* st = ray_table_add_col(ray_table_new(1), ray_sym_intern("s", 1), sc);
+    ray_release(sc);
+    ray_err_t err = ray_splay_save(st, sdir, sym);
+    ray_release(st);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    /* g-2 has no SYM column: it reads without the symfile. */
+    ray_t* pair = generation_pair(2);
+    err = ray_splay_save(pair, src, NULL);
+    ray_release(pair);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(src, resolved, sizeof(resolved)), RAY_OK);
+    TEST_ASSERT_EQ_I(rename(resolved, g2), 0);
+
+    FILE* f = fopen(last, "wb");
+    TEST_ASSERT_NOT_NULL(f);
+    fputs(".generations/g-2\n", f);
+    TEST_ASSERT_EQ_I(fclose(f), 0);
+    if (mkfifo(cur, 0644) != 0 || mkfifo(next, 0644) != 0)
+        SKIP("mkfifo unavailable");
+
+    fflush(NULL);
+    *child = fork();
+    if (*child < 0) SKIP("fork unavailable");
+    if (*child == 0) held_domain_child(cur, next, last, sym);
+
+    ray_t* m = ray_read_splayed(t, sym);
+    bool loaded = m && !RAY_IS_ERR(m) && ray_table_nrows(m) == 2;
+    if (m && RAY_IS_ERR(m)) ray_error_free(m); else if (m) ray_release(m);
+    /* The plain file is in place only if the read came back for g-2. */
+    struct stat cs;
+    TEST_ASSERT_TRUE(stat(cur, &cs) == 0 && S_ISREG(cs.st_mode));
+    int status = 0;
+    TEST_ASSERT_TRUE(waitpid(*child, &status, 0) == *child);
+    *child = -1;
+    TEST_ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    TEST_ASSERT_TRUE(loaded);
+
+    /* No table holds the symfile's domain now.  One the read kept would stay
+     * cached for the path and not open over the removed file. */
+    ray_sym_domain_t* d = ray_sym_domain_open_or_create(sym);
+    bool released = d != NULL;
+    ray_sym_domain_release(d);
+    TEST_ASSERT_TRUE(released);
+    PASS();
+}
+
+/* A read retried after its generation was replaced lets go of the symfile
+ * domain an earlier attempt opened, also when the retry finds the symfile
+ * gone. */
+static test_result_t test_generation_retry_releases_domain(void) {
+    char base[256];
+    snprintf(base, sizeof(base), "/tmp/rayforce_test_splay_held_%ld", (long)getpid());
+    rm_rf(base);
+    pid_t child = -1;
+    test_result_t r = held_domain_run(base, &child);
+    if (child > 0) {
+        kill(child, SIGKILL);
+        waitpid(child, NULL, 0);
+    }
+    rm_rf(base);
+    return r;
+}
+
+/* A reader of a table whose every generation is broken (y shorter than x)
+ * while another process keeps publishing them retries for as long as the
+ * table changes; an interrupt stops it at once, and the read returns an
+ * error, not a table.  Columns of a million rows make each copying attempt
+ * slower than one publish, so the table has always moved on by the time an
+ * attempt fails. */
+static test_result_t test_generation_reader_interrupted(void) {
+    const char* dir = TMP_SPLAY_BASE "/generation_cancel";
+    const char* tmpl = TMP_SPLAY_BASE "/generation_cancel_tmpl";
+    rm_rf(dir);
+    rm_rf(tmpl);
+    const int64_t n = 1000000;
+    ray_t* xc = ray_vec_new(RAY_I64, n);
+    xc->len = n;
+    for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(xc))[i] = i;
+    ray_t* t = ray_table_new(2);
+    t = ray_table_add_col(t, ray_sym_intern("x", 1), xc);
+    t = ray_table_add_col(t, ray_sym_intern("y", 1), xc);
+    ray_release(xc);
+    TEST_ASSERT_EQ_I(ray_splay_save(t, dir, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_save(t, dir, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_save(t, tmpl, NULL), RAY_OK);
+    char resolved[1024], g0[1100], g0y[1200];
+    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(dir, resolved, sizeof(resolved)), RAY_OK);
+    snprintf(g0, sizeof(g0), "%s/.generations/g-0", dir);
+    TEST_ASSERT_EQ_I(rename(resolved, g0), 0);
+    snprintf(g0y, sizeof(g0y), "%s/y", g0);
+    ray_t* short_y = ray_vec_new(RAY_I64, n - 1);
+    short_y->len = n - 1;
+    memset(ray_data(short_y), 0, (size_t)(n - 1) * sizeof(int64_t));
+    TEST_ASSERT_EQ_I(ray_col_save(short_y, TMP_SPLAY_BASE "/generation_cancel_tmpl/y"), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save(short_y, g0y), RAY_OK);
+    ray_release(short_y);
+    FILE* f = fopen(TMP_SPLAY_BASE "/generation_cancel/.current", "wb");
+    TEST_ASSERT_NOT_NULL(f);
+    fputs(".generations/g-0\n", f);
+    fclose(f);
+
+    fflush(NULL);
+    pid_t child = fork();
+    TEST_ASSERT_TRUE(child >= 0);
+    if (child == 0) generation_flip_child(dir, tmpl, 1 << 30);   /* killed below */
+    /* Wait until the writer is publishing. */
+    for (int i = 0; i < 5000; i++) {
+        char now[1024];
+        if (ray_splay_resolve_dir(dir, now, sizeof(now)) == RAY_OK && strcmp(now, g0) != 0) break;
+        struct timespec ms = {0, 1000 * 1000};
+        nanosleep(&ms, NULL);
+    }
+
+    ray_request_interrupt();
+    struct timespec a, b;
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    ray_t* m = ray_splay_load(dir, NULL);
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    ray_clear_interrupt();
+    kill(child, SIGKILL);
+    int status = 0;
+    waitpid(child, &status, 0);
+    double secs = (double)(b.tv_sec - a.tv_sec) + (double)(b.tv_nsec - a.tv_nsec) / 1e9;
+    bool err = m && RAY_IS_ERR(m);
+    if (m && RAY_IS_ERR(m)) ray_error_free(m); else if (m) ray_release(m);
+    TEST_ASSERT_TRUE(err);
+    TEST_ASSERT_TRUE(secs < 2.0);
     ray_release(t);
     rm_rf(dir);
     rm_rf(tmpl);
@@ -2948,6 +3123,8 @@ const test_entry_t splay_entries[] = {
     { "splay/generation_first_write_keeps_others", test_generation_first_write_keeps_others, splay_setup, splay_teardown },
 #ifndef _WIN32
     { "splay/generation_reader_races", test_generation_reader_races, splay_setup, splay_teardown },
+    { "splay/generation_retry_releases_domain", test_generation_retry_releases_domain, splay_setup, splay_teardown },
+    { "splay/generation_reader_interrupted", test_generation_reader_interrupted, splay_setup, splay_teardown },
 #endif
     { "splay/generation_invalid_manifest", test_generation_invalid_manifest, splay_setup, splay_teardown },
     { "splay/generation_writer_exit", test_generation_writer_exit, splay_setup, splay_teardown },
