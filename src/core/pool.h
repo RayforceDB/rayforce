@@ -66,6 +66,26 @@ typedef struct {
     uint64_t steals;   /* successful steal operations */
 } ray_pool_slot_t;
 
+/* Scan read-ahead: the mapped columns a query reads, registered for the
+ * dispatches it runs (ray_pool_scan_set).  While a dispatch runs, each
+ * worker keeps the rows just ahead of the ones it reads requested from
+ * storage (see pool.c).  `gate`, when set, is the zone-index verdict of the
+ * query's filter: bit c clear means no row of [c << gate_log2,
+ * (c + 1) << gate_log2) can pass it, so nothing there is requested.
+ * warm[c]: the rows at the start of column c that were resident when it was
+ * registered (the kernel reads them ahead with the header when the column
+ * is opened); their residency says nothing of what a pass reads. */
+#define RAY_POOL_SCAN_MAX 32
+typedef struct {
+    const uint8_t*  base[RAY_POOL_SCAN_MAX];
+    uint32_t        esz[RAY_POOL_SCAN_MAX];
+    int64_t         warm[RAY_POOL_SCAN_MAX];
+    uint32_t        n;
+    int64_t         rows;
+    const uint64_t* gate;
+    uint8_t         gate_log2;
+} ray_pool_scan_t;
+
 /* Thread pool */
 struct ray_pool {
     ray_thread_t*       threads;       /* worker thread handles [n_workers] */
@@ -113,6 +133,18 @@ struct ray_pool {
     uint32_t           steal;
     uint32_t           trace;         /* RAY_POOL_TRACE: histogram at destroy */
     ray_pool_slot_t*    slots;         /* [n_workers+1], 64-byte aligned */
+    /* Scan read-ahead of the open dispatch: the registered columns (NULL
+     * when none), set by the dispatcher before the window is published and
+     * cleared once it has drained.  With scan_auto the dispatch covers
+     * exactly their rows, ticket base+i holding rows [i*grain, (i+1)*grain),
+     * and the pool requests ahead itself; otherwise only tasks that report
+     * their position (ray_pool_scan_at) do. */
+    const ray_pool_scan_t* scan;
+    bool               scan_auto;
+    uint64_t           scan_base;     /* first ticket of the window */
+    int64_t            scan_grain;    /* rows per ticket */
+    uint64_t           scan_gen;      /* dispatches so far: resets per-thread state */
+    size_t             scan_bytes;    /* bytes kept requested per column and worker */
     void*              slots_raw;     /* the allocation behind `slots` */
     _Atomic(uint64_t)  win_state;     /* 2*windows + (publishing ? 1 : 0) */
 
@@ -175,6 +207,39 @@ void ray_pool_free(ray_pool_t* pool);
 
 /* Dispatch fn over [0, total_elems) partitioned into morsel-sized tasks.
  * Blocks until all tasks complete. Main thread participates as worker 0. */
+/* Register the columns the calling thread's next dispatches scan (NULL
+ * clears); returns the previous registration so nested executions can
+ * restore it.  The registration must outlive those dispatches. */
+const ray_pool_scan_t* ray_pool_scan_set(const ray_pool_scan_t* scan);
+const ray_pool_scan_t* ray_pool_scan_get(void);
+
+/* Called by a task about to read rows [r, end) of an `nrows`-row input:
+ * when that input is the registered one, keep the rows just ahead of r
+ * requested.  For dispatch_n tasks that walk row ranges of their own; a
+ * dispatch over exactly the registered rows needs no call (the pool
+ * requests per ticket).  Cheap when nothing is registered. */
+void ray_pool_scan_at(int64_t nrows, int64_t r, int64_t end);
+
+/* ray_pool_scan_at for a task that reads one registered column, its data
+ * at `col` (a gather): only that column is requested, from the first call
+ * on.  No-op when `col` is not registered for the open dispatch. */
+void ray_pool_scan_col_at(const void* col, int64_t nrows, int64_t r, int64_t end);
+
+/* True when read-ahead is on and the calling thread's registration holds
+ * the `nrows`-row column with data at `col`: a dispatch it makes next can
+ * have its tasks report positions in that column (ray_pool_scan_col_at). */
+bool ray_pool_scan_holds(const void* col, int64_t nrows);
+
+/* Read-ahead is on (RAY_SCAN_PREFETCH unset, or a positive number of KiB).
+ * For requests made outside the per-dispatch windows, which honour the same
+ * switch. */
+bool ray_pool_scan_on(void);
+
+/* Ask for [p, p+bytes) of a file mapping (ray_vm_advise_willneed), with the
+ * work of a large range split over the pool's threads when called outside
+ * a dispatch. */
+void ray_pool_want(const void* p, size_t bytes);
+
 void ray_pool_dispatch(ray_pool_t* pool, ray_pool_fn fn, void* ctx, int64_t total_elems);
 
 /* Dispatch exactly n_tasks tasks, each with range [i, i+1).

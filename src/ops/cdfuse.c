@@ -55,6 +55,7 @@
 #include "ops/hash.h"      /* ray_hash_i64 */
 #include "ops/cdfuse.h"
 #include "table/sym.h"     /* RAY_IS_SYM */
+#include "store/col.h"    /* ray_col_cold — sampled-row read-ahead */
 
 /* Peak-footprint estimate used by the admission gate below: 32B/row for
  * phase 1's records plus up to 24B per (partition, key) pair in phase 2,
@@ -146,13 +147,16 @@ static bool cdf_repeat(cdf_recent_t* recent, uint64_t hash, int64_t key, int64_t
     entry->key = key; entry->value = value; entry->used = true;
     return false;
 }
+static inline int64_t cdf_sample_row(int64_t nrows, int i) {
+    int64_t step = nrows / 1024;
+    return i * step + ray_hash_i64(i) % step;
+}
 static bool cdf_sample_repetition(const cdf_p1_ctx_t* c) {
     if (c->nrows < 1024) return false;
     cdf_recent_t recent[64] = {{0}};
     int repeats = 0;
-    int64_t step = c->nrows / 1024;
     for (int i = 0; i < 1024; i++) {
-        int64_t row = i * step + ray_hash_i64(i) % step;
+        int64_t row = cdf_sample_row(c->nrows, i);
         int64_t key = cdf_read(c->kdata, row, c->ktype, c->kattrs);
         int64_t value = cdf_read(c->vdata, row, c->vtype, c->vattrs);
         repeats += cdf_repeat(recent, cdf_pair_hash(key, value), key, value);
@@ -167,14 +171,20 @@ static void cdf_p1_hist(void* raw, uint32_t wid, int64_t start, int64_t end) {
         if (c->dedup) memset(recent, 0, sizeof(recent));
         int64_t begin = c->nrows / c->nw * task;
         int64_t limit = task + 1 == c->nw ? c->nrows : c->nrows / c->nw * (task + 1);
-        for (int64_t r = begin; r < limit; r++) {
-            int64_t k = cdf_read(c->kdata, r, c->ktype, c->kattrs);
-            int64_t v = cdf_read(c->vdata, r, c->vtype, c->vattrs);
-            uint64_t hash = cdf_pair_hash(k, v);
-            if (c->dedup && cdf_repeat(recent, hash, k, v)) continue;
-            uint32_t part = hash & (c->n_parts - 1);
-            if (my[part].cap == UINT32_MAX) { atomic_store(&c->oom, 1); return; }
-            my[part].cap++;
+        /* The first read of these rows: keep the next ones requested from
+         * storage, block by block (scan read-ahead). */
+        for (int64_t b = begin; b < limit; b += 8192) {
+            int64_t e = limit - b > 8192 ? b + 8192 : limit;
+            ray_pool_scan_at(c->nrows, b, limit);
+            for (int64_t r = b; r < e; r++) {
+                int64_t k = cdf_read(c->kdata, r, c->ktype, c->kattrs);
+                int64_t v = cdf_read(c->vdata, r, c->vtype, c->vattrs);
+                uint64_t hash = cdf_pair_hash(k, v);
+                if (c->dedup && cdf_repeat(recent, hash, k, v)) continue;
+                uint32_t part = hash & (c->n_parts - 1);
+                if (my[part].cap == UINT32_MAX) { atomic_store(&c->oom, 1); return; }
+                my[part].cap++;
+            }
         }
         atomic_fetch_add_explicit(&c->rows_done, limit - begin, memory_order_relaxed);
     }
@@ -621,6 +631,13 @@ ray_t* ray_cd_fused(ray_t* key_col, ray_t* val_col, int64_t nrows) {
         .nrows = nrows,
         .oom = 0, .rows_done = 0,
     };
+    if (nrows >= 1024) {
+        bool kc = ray_col_cold(key_col), vc = ray_col_cold(val_col);
+        for (int i = 0; (kc || vc) && i < 1024; i++) {
+            if (kc) ray_col_want_row(key_col, cdf_sample_row(nrows, i));
+            if (vc) ray_col_want_row(val_col, cdf_sample_row(nrows, i));
+        }
+    }
     p1.dedup = cdf_sample_repetition(&p1);
     if (p1.dedup) ray_profile_tick("count-distinct: source preaggregation");
     ray_profile_tick("count-distinct: prepared");

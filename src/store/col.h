@@ -111,6 +111,20 @@ ray_err_t ray_col_save_sym_encoded(ray_t* vec, const char* path,
 ray_t*    ray_col_load_dom(const char* path, struct ray_sym_domain_s* dom);
 ray_t*    ray_col_mmap_splayed_dom(const char* path, struct ray_sym_domain_s* dom);
 
+/* Scattered reads of a mapped column.  A sampler or a gather that reads
+ * scattered rows of a column mapped from a file and not cached waits on one
+ * page fault per row; asking for the rows' pages first turns that into
+ * about one wait.  ray_col_cold: `col` is a mapped fixed-width column whose
+ * pages are not resident (a few page probes), so a pre-pass pays off.
+ * ray_col_want_row: request the page of one row (no checks).
+ * ray_col_want_rows: request the pages of rows idx[0..n) of a mapped
+ * column, skipping a column found resident: each page once and runs of
+ * adjacent pages as one range, whatever order the rows come in (the whole
+ * column for n >= its length). */
+bool      ray_col_cold(ray_t* col);
+void      ray_col_want_row(ray_t* col, int64_t row);
+void      ray_col_want_rows(ray_t* col, const int64_t* idx, int64_t n);
+
 /* Append an inline index region to an existing (index-less) column file — used
  * by the streaming .csv.splayed builder which writes raw columns first.  `ix`
  * is a const ray_index_t* (void to avoid the ops/ type dependency in this

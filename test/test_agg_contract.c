@@ -1,6 +1,9 @@
 /* Scalar/grouped semantic contracts, independent of optimized admission.
  * Baseline census: docs/aggregation-type-census.csv. Extend this table when
  * language semantics change; adding a vtable alone must not change it. */
+#if defined(__linux__) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L   /* posix_fadvise, fdatasync */
+#endif
 #include "test.h"
 #include "test_rfl.h"
 #include "ops/agg_engine.h"
@@ -13,6 +16,7 @@
 #include "ops/internal.h"
 #include "lang/internal.h"
 #include "lang/env.h"
+#include "table/sym.h"
 #include <math.h>
 
 static ray_runtime_t* contract_runtime;
@@ -2156,6 +2160,168 @@ static test_result_t test_first_n_take(void) {
     PASS();
 }
 
+#if defined(__linux__)
+#include <dirent.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+/* --------------------------------------------------------------------------
+ * Selects over a mapped table whose pages were evicted: the scan read-ahead
+ * registers the columns (select level, zone gate from the filter) and the
+ * grouping kernels report their rows, so every route below reads ahead.
+ * Results must equal the same selects over the in-memory table.
+ * -------------------------------------------------------------------------- */
+#define PFS_ROOT "/tmp/rayforce_test_pf_select"
+#define PFS_DIR  PFS_ROOT "/t/"
+
+static bool pfs_evict(void) {
+    DIR* d = opendir(PFS_DIR);
+    if (!d) return false;
+    bool ok = true;
+    char path[512];
+    for (struct dirent* e; (e = readdir(d)); ) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        snprintf(path, sizeof path, "%s%s", PFS_DIR, e->d_name);
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) continue;
+        if (fdatasync(fd) != 0 || posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) != 0) ok = false;
+        close(fd);
+    }
+    closedir(d);
+    return ok;
+}
+
+static bool pfs_col_resident(const char* name) {
+    ray_t* m = ray_eval_str("pfs_m");
+    if (!m || RAY_IS_ERR(m)) { if (m) ray_error_free(m); return true; }
+    ray_t* col = ray_table_get_col(m, ray_sym_intern(name, strlen(name)));
+    bool res = !col || col->mmod != 1 ||
+               ray_vm_resident(ray_data(col), (size_t)col->len * ray_sym_elem_size(col->type, col->attrs));
+    ray_release(m);
+    return res;
+}
+
+static test_result_t test_select_read_ahead_mapped(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    (void)ray_test_rm_rf(PFS_ROOT);
+    ray_t* r = ray_eval_str(
+        "(set pfs_i (til 400000))"
+        "(set pfs_t (table [k d g u v] (list (div pfs_i 1000) (+ 2013.07.01 (div pfs_i 50000))"
+        " (as 'I16 (% pfs_i 50)) (% (* pfs_i 7919) 1000003) (as 'I32 (% pfs_i 977)))))"
+        "(.db.splayed.set \"" PFS_DIR "\" pfs_t)"
+        "(set pfs_m (.db.splayed.get \"" PFS_DIR "\"))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    if (!pfs_evict() || pfs_col_resident("u")) {
+        (void)ray_test_rm_rf(PFS_ROOT);
+        SKIP("page cache eviction has no effect here");
+    }
+
+    /* X is the table: the mapped one first, then the in-memory oracle. */
+    static const struct { const char* q; agg_route_t route; } cases[] = {
+        { "(select {from:X by:g c:(count v) s:(sum v) where:(and (== k 123) (within d [2013.07.03 2013.07.05])) asc:g})", AGG_ROUTE_NONE },
+        { "(select {from:X c:(count v) s:(sum u) where:(> k 390)})", AGG_ROUTE_NONE },
+        { "(select {from:X by:g s:(sum v) asc:g})", AGG_ROUTE_V2_DENSE },
+        { "(select {from:(select {from:X by:u c:(count v)}) n:(count c) s:(sum c)})", AGG_ROUTE_V2_RADIX },
+        { "(select {from:X by:g n:(count (distinct u)) asc:g})", AGG_ROUTE_NONE },
+        { "(select {from:X by:[u g] c:(count v) take:3})", AGG_ROUTE_NONE },
+        { "(select {from:X s:(sum (+ u v)) where:(> v 5)})", AGG_ROUTE_NONE },
+        { "(select {from:X where:(> v 970) asc:u take:5})", AGG_ROUTE_NONE },
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        char qm[512], qt[512];
+        const char* x = strstr(cases[c].q, "X");
+        snprintf(qm, sizeof qm, "%.*spfs_m%s", (int)(x - cases[c].q), cases[c].q, x + 1);
+        snprintf(qt, sizeof qt, "%.*spfs_t%s", (int)(x - cases[c].q), cases[c].q, x + 1);
+        TEST_ASSERT_TRUE(pfs_evict());
+        agg_route_reset();
+        ray_t* got = ray_eval_str(qm);
+        agg_route_stats_t stats = agg_route_stats();
+        ray_t* want = ray_eval_str(qt);
+        bool ok = got && !RAY_IS_ERR(got) && want && !RAY_IS_ERR(want);
+        if (ok) {
+            ray_t* fg = ray_fmt(got, 0);
+            ray_t* fw = ray_fmt(want, 0);
+            ok = fg && fw && ray_str_len(fg) == ray_str_len(fw) &&
+                 memcmp(ray_str_ptr(fg), ray_str_ptr(fw), ray_str_len(fw)) == 0;
+            if (fg) ray_release(fg);
+            if (fw) ray_release(fw);
+        }
+        if (got) { if (RAY_IS_ERR(got)) ray_error_free(got); else ray_release(got); }
+        if (want) { if (RAY_IS_ERR(want)) ray_error_free(want); else ray_release(want); }
+        TEST_ASSERT_FMT(ok, "case %zu: mapped result differs from the in-memory one", c);
+        if (cases[c].route != AGG_ROUTE_NONE)
+            TEST_ASSERT_FMT(stats.routes[cases[c].route] >= 1,
+                            "case %zu: expected route %d", c, (int)cases[c].route);
+    }
+    r = ray_eval_str("(set pfs_m 0)");
+    if (r) ray_release(r);
+    (void)ray_test_rm_rf(PFS_ROOT);
+    PASS();
+}
+
+/* A filter the zone indexes say nothing about (an expression) may keep a
+ * handful of rows.  The columns read only after it are then requested for
+ * the pages those rows fall on, not whole — judged on the final selection
+ * of an `and`, not its first conjunct; when it keeps most rows they are
+ * read whole.  Results match the in-memory table either way. */
+static test_result_t test_select_read_ahead_sparse_filter(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    (void)ray_test_rm_rf(PFS_ROOT);
+    ray_t* r = ray_eval_str(
+        "(set pfs_i (til 400000))"
+        "(set pfs_t (table [u w s] (list (% (* pfs_i 7919) 1000003) (* pfs_i 3)"
+        " (as 'SYM (map (fn [k] (format \"s%\" (% k 10000))) pfs_i)))))"
+        "(.db.splayed.set \"" PFS_DIR "\" pfs_t)"
+        "(set pfs_m (.db.splayed.get \"" PFS_DIR "\"))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    if (!pfs_evict() || pfs_col_resident("w")) {
+        (void)ray_test_rm_rf(PFS_ROOT);
+        SKIP("page cache eviction has no effect here");
+    }
+    static const struct { const char* q; bool whole; } cases[] = {
+        { "(select {from:X s:(sum w) c:(count w) where:(== (% u 100000) 42)})", false },
+        /* an `and` runs as a chain of filters, the cheap dense one first */
+        { "(select {from:X s:(sum w) c:(count w) where:(and (like s \"s1234\") (!= s \"s1\"))})", false },
+        { "(select {from:X s:(sum w) c:(count w) where:(> (% u 10) 2)})", true },
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        char qm[256], qt[256];
+        const char* x = strstr(cases[c].q, "X");
+        snprintf(qm, sizeof qm, "%.*spfs_m%s", (int)(x - cases[c].q), cases[c].q, x + 1);
+        snprintf(qt, sizeof qt, "%.*spfs_t%s", (int)(x - cases[c].q), cases[c].q, x + 1);
+        TEST_ASSERT_TRUE(pfs_evict());
+        ray_t* got = ray_eval_str(qm);
+        bool resident = pfs_col_resident("w");
+        ray_t* want = ray_eval_str(qt);
+        bool ok = got && !RAY_IS_ERR(got) && want && !RAY_IS_ERR(want);
+        if (ok) {
+            ray_t* fg = ray_fmt(got, 0);
+            ray_t* fw = ray_fmt(want, 0);
+            ok = fg && fw && ray_str_len(fg) == ray_str_len(fw) &&
+                 memcmp(ray_str_ptr(fg), ray_str_ptr(fw), ray_str_len(fw)) == 0;
+            if (fg) ray_release(fg);
+            if (fw) ray_release(fw);
+        }
+        if (got) { if (RAY_IS_ERR(got)) ray_error_free(got); else ray_release(got); }
+        if (want) { if (RAY_IS_ERR(want)) ray_error_free(want); else ray_release(want); }
+        TEST_ASSERT_FMT(ok, "case %zu: mapped result differs from the in-memory one", c);
+        TEST_ASSERT_FMT(resident == cases[c].whole,
+                        "case %zu: column w %s after the query", c,
+                        resident ? "read whole" : "not read whole");
+    }
+    r = ray_eval_str("(set pfs_m 0)");
+    if (r) ray_release(r);
+    (void)ray_test_rm_rf(PFS_ROOT);
+    PASS();
+}
+#endif
+
 const test_entry_t agg_contract_entries[] = {
     { "agg_contract/empty_inference_errors", test_empty_inference_errors, contract_setup, contract_teardown },
     { "agg_contract/nth_bounds", test_nth_bounds, contract_setup, contract_teardown },
@@ -2191,5 +2357,9 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/parallel_native_gather", test_parallel_native_gather, contract_setup, contract_teardown },
     { "agg_contract/parallel_dominant_consumers", test_parallel_dominant_consumers, contract_setup, contract_teardown },
     { "agg_contract/cancelled_group", test_cancelled_group, contract_setup, contract_teardown },
+#if defined(__linux__)
+    { "agg_contract/select_read_ahead_mapped", test_select_read_ahead_mapped, contract_setup, contract_teardown },
+    { "agg_contract/select_read_ahead_sparse_filter", test_select_read_ahead_sparse_filter, contract_setup, contract_teardown },
+#endif
     { NULL, NULL, NULL, NULL },
 };

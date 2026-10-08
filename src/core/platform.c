@@ -45,6 +45,10 @@
 #if defined(RAY_OS_MACOS)
 #include <sys/sysctl.h>   /* sysctlbyname — hw.physicalcpu */
 #endif
+#if defined(RAY_OS_LINUX)
+#include <dirent.h>       /* /sys/block — the read-ahead caps */
+#include <stdatomic.h>
+#endif
 #include "mem/sys.h"
 
 /* --------------------------------------------------------------------------
@@ -111,6 +115,95 @@ void* ray_vm_map_fd_ro(int fd, size_t size) {
 
 void ray_vm_advise_seq(void* ptr, size_t size) {
     if (ptr) madvise(ptr, size, MADV_SEQUENTIAL);
+}
+
+static size_t vm_page_size(void) {
+    static size_t pg = 0;
+    if (pg == 0) {
+        long ps = sysconf(_SC_PAGESIZE);
+        pg = (ps > 0) ? (size_t)ps : 4096;
+    }
+    return pg;
+}
+
+#if defined(RAY_OS_LINUX)
+/* A block device's queue attribute in KiB, -1 when it cannot be read. */
+static long vm_queue_kb(const char* dev, const char* attr) {
+    char path[320], buf[32];
+    snprintf(path, sizeof(path), "/sys/block/%s/queue/%s", dev, attr);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    buf[n] = 0;
+    return strtol(buf, NULL, 10);
+}
+#endif
+
+/* Bytes one WILLNEED is asked for at a time.  Linux reads at most
+ * max(read_ahead_kb, max_sectors_kb) of the file's device per call, and a
+ * longer step would leave the rest of it unread: so the smallest such cap
+ * of the block devices, within [32 KiB, 256 KiB]; 128 KiB, the kernel's
+ * default read-ahead, when none can be read or elsewhere. */
+static size_t vm_willneed_step(void) {
+#if defined(RAY_OS_LINUX)
+    static _Atomic(size_t) cached = 0;
+    size_t step = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (step) return step;
+    DIR* d = opendir("/sys/block");
+    if (d) {
+        struct dirent* e;
+        while ((e = readdir(d))) {
+            if (e->d_name[0] == '.') continue;
+            long ra = vm_queue_kb(e->d_name, "read_ahead_kb");
+            long mx = vm_queue_kb(e->d_name, "max_sectors_kb");
+            long cap = ra > mx ? ra : mx;
+            if (cap > 0 && (!step || ((size_t)cap << 10) < step)) step = (size_t)cap << 10;
+        }
+        closedir(d);
+    }
+    if (!step) step = (size_t)128 << 10;
+    if (step < ((size_t)32 << 10)) step = (size_t)32 << 10;
+    if (step > ((size_t)256 << 10)) step = (size_t)256 << 10;
+    step &= ~(vm_page_size() - 1);
+    if (step < vm_page_size()) step = vm_page_size();   /* pages above 32 KiB */
+    atomic_store_explicit(&cached, step, memory_order_relaxed);
+    return step;
+#else
+    return (size_t)128 << 10;
+#endif
+}
+
+void ray_vm_advise_willneed(void* ptr, size_t size) {
+    if (!ptr || !size) return;
+    /* madvise wants a page-aligned start.  One WILLNEED reads at most what
+     * the device allows per call (vm_willneed_step), so a large range is
+     * requested step by step: each call only queues its reads, so the steps
+     * are all in flight together. */
+    const size_t chunk = vm_willneed_step();
+    uintptr_t a = (uintptr_t)ptr & ~(uintptr_t)(vm_page_size() - 1);
+    uintptr_t end = (uintptr_t)ptr + size;
+    for (; a < end; a += chunk)
+        madvise((void*)a, end - a < chunk ? end - a : chunk, MADV_WILLNEED);
+}
+
+bool ray_vm_resident(const void* ptr, size_t size) {
+    if (!ptr || !size) return true;
+    size_t pg = vm_page_size();
+    uintptr_t a = (uintptr_t)ptr & ~(uintptr_t)(pg - 1);
+    size_t pages = ((uintptr_t)ptr + size - a + pg - 1) / pg;
+    size_t samples = pages < 16 ? pages : 16;
+    for (size_t i = 0; i < samples; i++) {
+        size_t at = samples > 1 ? (pages - 1) * i / (samples - 1) : 0;
+#if defined(RAY_OS_MACOS)
+        char v = 0;
+#else
+        unsigned char v = 0;
+#endif
+        if (mincore((void*)(a + at * pg), pg, &v) != 0 || !(v & 1)) return false;
+    }
+    return true;
 }
 
 void ray_vm_release(void* ptr, size_t size) {
@@ -647,6 +740,18 @@ void ray_vm_advise_seq(void* ptr, size_t size) {
     PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0);
 }
 
+void ray_vm_advise_willneed(void* ptr, size_t size) {
+    if (!ptr || !size) return;
+    WIN32_MEMORY_RANGE_ENTRY entry;
+    entry.VirtualAddress = ptr;
+    entry.NumberOfBytes  = size;
+    PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0);
+}
+
+/* No cheap residency query here: report "not resident" so a read-ahead is
+ * still requested (PrefetchVirtualMemory skips resident pages itself). */
+bool ray_vm_resident(const void* ptr, size_t size) { (void)ptr; (void)size; return false; }
+
 void ray_vm_release(void* ptr, size_t size) {
     if (!ptr) return;
     /* DiscardVirtualMemory (Win8.1+) or fallback to decommit+recommit */
@@ -862,6 +967,8 @@ void* ray_vm_map_fd_ro(int fd, size_t size) {
 
 /* madvise hints are advisory and have no analog on WASM — no-ops. */
 void ray_vm_advise_seq(void* ptr, size_t size)      { (void)ptr; (void)size; }
+void ray_vm_advise_willneed(void* ptr, size_t size) { (void)ptr; (void)size; }
+bool ray_vm_resident(const void* ptr, size_t size)  { (void)ptr; (void)size; return true; }
 void ray_vm_release(void* ptr, size_t size)         { (void)ptr; (void)size; }
 
 void ray_vm_release_block(void* blk, size_t bsize, bool hugepage) {
