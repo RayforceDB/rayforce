@@ -2346,10 +2346,10 @@ static test_result_t test_domain_import_dict(void) {
  * at its first size, and 900K at twice that (a shard's share of 900K stays
  * under the next growth); between the two, committed memory grows by the
  * new tables less the old ones, not by the new tables whole.  A table is
- * cap 8-byte slots plus a header, in whole pages. */
+ * cap 8-byte slots plus a header, counted in 4 KiB units as ray_sys_get_stat
+ * counts every allocation whatever the page size. */
 static int64_t imp_tab_bytes(int64_t cap) {
-    int64_t pg = (int64_t)sysconf(_SC_PAGESIZE);
-    return (cap * 8 + 64 + pg - 1) / pg * pg;
+    return (cap * 8 + 64 + 4095) / 4096 * 4096;
 }
 static bool imp_intern_serial(ray_sym_domain_t* dom, int64_t lo, int64_t hi) {
     imp_ctx_t c = { dom, NULL, 0 };
