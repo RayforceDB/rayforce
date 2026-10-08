@@ -1677,8 +1677,15 @@ static test_result_t test_auto_all_logical_cpus(void) {
 #define PF_PAGES     (PF_ROWS * 8 / 4096)
 #define PF_TASKS     8
 #define PF_LOG2      16                   /* gate chunk: 64K rows, 512 KiB */
-#define PF_PATH      "/tmp/rayforce_test_scan_ahead.col"
-#define PF_PATH_B    "/tmp/rayforce_test_scan_ahead_b.col"
+/* per process, so concurrent runs of the suite do not share the files */
+static char pf_path_a[96], pf_path_b[96];
+static void pf_paths(void) {
+    if (pf_path_a[0]) return;
+    snprintf(pf_path_a, sizeof(pf_path_a), "/tmp/rayforce_test_scan_ahead.%d.col", (int)getpid());
+    snprintf(pf_path_b, sizeof(pf_path_b), "/tmp/rayforce_test_scan_ahead_b.%d.col", (int)getpid());
+}
+#define PF_PATH      (pf_paths(), pf_path_a)
+#define PF_PATH_B    (pf_paths(), pf_path_b)
 
 /* Ticket task: reads the middle row of its rows of column A (ctx), one
  * page of the sixteen a ticket spans — the one the next call of its thread
@@ -2064,8 +2071,14 @@ out:
  * a filter on a sorted column keeps together asks for the pages of those
  * rows only, not for the whole column.
  * -------------------------------------------------------------------------- */
-#define PQ_DIR "/tmp/rayforce_test_scan_q"
-#define PQ_TBL PQ_DIR "/t/"
+static char pq_dir[96], pq_tbl[104];
+static void pq_paths(void) {
+    if (pq_dir[0]) return;
+    snprintf(pq_dir, sizeof(pq_dir), "/tmp/rayforce_test_scan_q.%d", (int)getpid());
+    snprintf(pq_tbl, sizeof(pq_tbl), "%s/t/", pq_dir);
+}
+#define PQ_DIR (pq_paths(), pq_dir)
+#define PQ_TBL (pq_paths(), pq_tbl)
 
 static bool pq_ok(const char* src) {
     ray_t* r = ray_eval_str(src);
@@ -2082,7 +2095,7 @@ static bool pq_evict(void) {
     struct dirent* e;
     char path[512];
     while ((e = readdir(d))) {
-        snprintf(path, sizeof(path), PQ_TBL "%s", e->d_name);
+        snprintf(path, sizeof(path), "%s%s", PQ_TBL, e->d_name);
         struct stat st;
         if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) ok &= pf_evict_one(path);
     }
@@ -2117,8 +2130,9 @@ static void pq_rm(const char* path) {
  * here, -1 on an error. */
 static int pq_open_cold(const char* name, const uint8_t** p, size_t* n) {
     if (!pq_ok("(set M 0)") || !pq_evict()) return -1;
-    if (!pq_ok("(set M (.db.splayed.get \"" PQ_TBL "\"))")) return -1;
-    char src[64];
+    char src[192];
+    snprintf(src, sizeof(src), "(set M (.db.splayed.get \"%s\"))", PQ_TBL);
+    if (!pq_ok(src)) return -1;
     snprintf(src, sizeof(src), "(at M '%s)", name);
     ray_t* col = ray_eval_str(src);
     if (!col || RAY_IS_ERR(col) || col->mmod != 1 || col->len < 2048) {
@@ -2153,11 +2167,13 @@ static test_result_t test_scan_read_ahead_queries(void) {
     int rc;
 
     if (!ray_pool_scan_on()) { res = (test_result_t){ TEST_SKIP, "RAY_SCAN_PREFETCH=0" }; goto out; }
+    char pq_set_src[192];
+    snprintf(pq_set_src, sizeof(pq_set_src), "(.db.splayed.set \"%s\" T)", PQ_TBL);
     pq_rm(PQ_DIR);
     if (!pq_ok("(set N 1048576)") ||
         !pq_ok("(set T (table [k v w g x d] (list (% (* (til N) 7919) 262144) (* (til N) 3)"
                " (* 0.5 (til N)) (% (til N) 100) (% (* (til N) 13) 50000) (/ (til N) 1024))))") ||
-        !pq_ok("(.db.splayed.set \"" PQ_TBL "\" T)") || !pq_ok("(set T 0)")) {
+        !pq_ok(pq_set_src) || !pq_ok("(set T 0)")) {
         res = (test_result_t){ TEST_FAIL, "table" };
         goto out;
     }

@@ -1854,9 +1854,21 @@ void ray_col_want_rows(ray_t* col, const int64_t* idx, int64_t n) {
      * run of marked pages as one range.  The rows may come in any order (a
      * grouping lists one group's after another's); each page is asked for
      * once, and only the pages they touch. */
-    uintptr_t p0 = (uintptr_t)base >> 12;
-    size_t pages = (((uintptr_t)base + bytes - 1) >> 12) - p0 + 1;
-    uint64_t* mark = n > 64 ? ray_calloc_raw((pages + 63) / 64 * sizeof(uint64_t)) : NULL;
+    uintptr_t p0 = UINTPTR_MAX, p1 = 0;
+    size_t pages = 0;
+    uint64_t* mark = NULL;
+    if (n > 64) {
+        /* the bitmap spans the pages the rows touch, not the column */
+        for (int64_t i = 0; i < n; i++) {
+            if (idx[i] < 0 || idx[i] >= col->len) continue;
+            uintptr_t pg = ((uintptr_t)base + (size_t)idx[i] * esz) >> 12;
+            if (pg < p0) p0 = pg;
+            if (pg > p1) p1 = pg;
+        }
+        if (p0 > p1) return;
+        pages = p1 - p0 + 1;
+        mark = ray_calloc_raw((pages + 63) / 64 * sizeof(uint64_t));
+    }
     uintptr_t last = UINTPTR_MAX;
     for (int64_t i = 0; i < n; i++) {
         if (idx[i] < 0 || idx[i] >= col->len) continue;

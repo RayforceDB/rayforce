@@ -1491,14 +1491,19 @@ static void gbi_fill_fn(void* ctxp, uint32_t wid, int64_t start, int64_t end) {
     const char* src = c->src;
     char* dst = c->dst;
     const int64_t* idx = c->idx;
-    if (c->rows) ray_pool_scan_col_at(src, c->rows, idx[start], c->row_end);
-    switch (c->esz) {
-    case 8: for (int64_t i = start; i < end; i++) memcpy(dst + i*8, src + idx[i]*8, 8); break;
-    case 4: for (int64_t i = start; i < end; i++) memcpy(dst + i*4, src + idx[i]*4, 4); break;
-    case 2: for (int64_t i = start; i < end; i++) memcpy(dst + i*2, src + idx[i]*2, 2); break;
-    case 1: for (int64_t i = start; i < end; i++) dst[i] = src[idx[i]]; break;
-    case 16: for (int64_t i = start; i < end; i++) memcpy(dst + i*16, src + idx[i]*16, 16); break;
-    default: for (int64_t i = start; i < end; i++) memcpy(dst + i*c->esz, src + idx[i]*c->esz, c->esz); break;
+    /* the task's rows may span more than one read-ahead window: report
+     * them as the copy goes */
+    for (int64_t lo = start; lo < end; lo += 1024) {
+        int64_t hi = end - lo < 1024 ? end : lo + 1024;
+        if (c->rows) ray_pool_scan_col_at(src, c->rows, idx[lo], c->row_end);
+        switch (c->esz) {
+        case 8: for (int64_t i = lo; i < hi; i++) memcpy(dst + i*8, src + idx[i]*8, 8); break;
+        case 4: for (int64_t i = lo; i < hi; i++) memcpy(dst + i*4, src + idx[i]*4, 4); break;
+        case 2: for (int64_t i = lo; i < hi; i++) memcpy(dst + i*2, src + idx[i]*2, 2); break;
+        case 1: for (int64_t i = lo; i < hi; i++) dst[i] = src[idx[i]]; break;
+        case 16: for (int64_t i = lo; i < hi; i++) memcpy(dst + i*16, src + idx[i]*16, 16); break;
+        default: for (int64_t i = lo; i < hi; i++) memcpy(dst + i*c->esz, src + idx[i]*c->esz, c->esz); break;
+        }
     }
 }
 
@@ -1509,6 +1514,7 @@ static void gbi_fill_fn(void* ctxp, uint32_t wid, int64_t start, int64_t end) {
  * own requested, paced with the gather; else the pages of the rows are
  * requested up front (ray_col_want_rows). */
 static void gbi_want(gbi_ctx_t* gc, ray_t* vec, const int64_t* idx, int64_t n, bool par) {
+    if (!ray_pool_scan_on()) return;
     int64_t lo = n > 0 ? idx[0] : -1, hi = n > 0 ? idx[n - 1] : -1;
     if (par && lo >= 0 && lo <= hi && hi < vec->len &&
         (hi - lo + 1) * gc->esz / 4096 <= n && ray_pool_scan_holds(gc->src, vec->len)) {
