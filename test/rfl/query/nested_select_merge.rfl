@@ -32,3 +32,10 @@
 ;; preserve empty grouped column output, including its serialized schema.
 (at (select {from:(select {from:L752 where:(< x 100)}) where:(== y 1) total:(sum x)}) 'total) -- [1617]
 (ser (select {from:(select {from:L752 where:(> x 20000)}) by:y x:x})) -- (ser (select {from:(do (select {from:L752 where:(> x 20000)})) by:y x:x}))
+
+;; A lambda source shadows the global table: its rows and types govern planning.
+((fn [L752] (count (select {from:(select {from:L752 where:(> x 5)}) where:(> x 0) s:(sum x)}))) (table [x] (list [1 2 3]))) -- 0
+((fn [L752] (count (select {from:(do (select {from:L752 where:(> x 5)})) where:(> x 0) s:(sum x)}))) (table [x] (list [1 2 3]))) -- 0
+(set F752 (take (table [x] (list [1.0 2.0 3.0])) 10000))
+(set Int752 (take (table [x] (list [9223372036854775807 1 2])) 10000))
+((fn [F752] (ser (select {from:(select {from:F752 q:(* x 2)}) total:(sum q)}))) Int752) -- ((fn [F752] (ser (select {from:(do (select {from:F752 q:(* x 2)})) total:(sum q)}))) Int752)

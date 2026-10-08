@@ -252,6 +252,8 @@ static bool merge_prefix_nonempty(ray_t* table, ray_t* where) {
 static ray_t* merge_pair(ray_t* outer, ray_t* inner) {
     ray_t* base = merge_get(inner, 1);
     ray_t* tbl = base;
+    /* ray_env_get searches caller scopes before globals (env_lookup_flat),
+     * so a shadowing lambda source supplies the rows and types proved here. */
     if (base && base->type == -RAY_SYM && !(base->attrs & ATTR_QUOTED) && !ray_sym_is_dotted(base->i64))
         tbl = ray_env_get(base->i64);
     if (!tbl || tbl->type != RAY_TABLE || ray_table_nrows(tbl) < MERGE_MIN_ROWS) return NULL;

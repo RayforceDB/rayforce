@@ -121,8 +121,8 @@ static test_result_t test_select_merge_scopes(void) {
     ray_t* dict = ray_eval_str("(quote {from: (select {from:T where:(== a 1)}) where:(> p 0) total:(sum p)})");
     TEST_ASSERT(dict && !RAY_IS_ERR(dict), "AST");
     ray_t* before = ray_ser(dict);
-    const char* names[] = {"a", "p", "==", "select"};
-    for (int i = 0; i < 4; i++) {
+    const char* names[] = {"a", "p", "==", "select", "T"};
+    for (size_t i = 0; i < sizeof(names)/sizeof(names[0]); i++) {
         ray_env_push_scope();
         ray_t* v = ray_i64(42);
         ray_env_set_local(ray_sym_intern(names[i], strlen(names[i])), v);
