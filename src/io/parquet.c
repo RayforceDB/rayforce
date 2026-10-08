@@ -1820,7 +1820,7 @@ static bool pq_chunk_ranges(ray_parquet_t* r, int64_t* lo, int64_t* hi, int64_t*
             if (!pq_fields(cols[c],mf,17)) continue;
             int64_t data = pq_get(mf[9],-1), dict = pq_get(mf[11],-1), bytes = pq_get(mf[7],-1);
             int64_t raw = pq_get(mf[6],-1), start = dict > 0 && dict < data ? dict : data;
-            if (raw > 0) col_bytes[c] += raw;
+            if (raw > 0) col_bytes[c] = raw > INT64_MAX - col_bytes[c] ? INT64_MAX : col_bytes[c] + raw;
             if (start < 0 || bytes < 0 || start > (int64_t)r->size || bytes > (int64_t)r->size - start) continue;
             lo[i] = start; hi[i] = start + bytes;
         }
@@ -1912,12 +1912,15 @@ static void pq_write_direct_group(void* ptr, uint32_t worker, int64_t start, int
  * entries to the symbol file every quarter second (and starts their
  * writeback), so the final flush writes only the tail and its sync finds
  * the rest on disk. */
-typedef struct { ray_sym_domain_t* dom; _Atomic(bool) stop; ray_err_t err; } pq_symflush_t;
+typedef struct { ray_sym_domain_t* dom; _Atomic(bool) stop; _Atomic(int) err; } pq_symflush_t;
 static void pq_symflush_fn(void* arg) {
     pq_symflush_t* s = arg;
-    while (!atomic_load_explicit(&s->stop,memory_order_acquire) && s->err == RAY_OK) {
-        s->err = ray_sym_domain_flush_append(s->dom,false);
-        ray_sleep_ms(250);
+    while (!atomic_load_explicit(&s->stop,memory_order_acquire)) {
+        ray_err_t e = ray_sym_domain_flush_append(s->dom,false);
+        if (e != RAY_OK) { atomic_store_explicit(&s->err,(int)e,memory_order_release); return; }
+        /* in slices, so the import's end does not wait out the interval */
+        for (int i = 0; i < 25 && !atomic_load_explicit(&s->stop,memory_order_acquire); i++)
+            ray_sleep_ms(10);
     }
 }
 /* The import runs in passes, each decoding some columns' chunks from every
@@ -1926,10 +1929,12 @@ static void pq_symflush_fn(void* arg) {
  * row groups than the pool has workers): one column file is written at a
  * time instead of all of them at once.  Numeric and temporal columns go
  * first and are closed as soon as their pass ends, their hash index built
- * while the file is still in the page cache; symbol columns follow,
- * smallest first, so the file domain only grows once the other columns
- * are done.  With memory to spare one pass takes every column.  Symbol
- * columns close with the domain, after its flush. */
+ * while the file is still in the page cache; symbol columns follow in
+ * passes of their own, smallest first, so the file domain only grows once
+ * the other columns are done.  With memory to spare one pass takes every
+ * column, and the columns close and are indexed together after it, as the
+ * row-group import does.  Symbol columns close with the domain, after its
+ * flush. */
 static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
     int64_t chunks = r->ngroups*r->ncols;
     if (chunks > UINT32_MAX) return pq_error("too many column chunk tasks");
@@ -1943,7 +1948,7 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
     int64_t* order = ray_alloc_raw((size_t)r->ncols*sizeof(*order));
     _Atomic uint8_t* prefetched = NULL;
     ray_t* err = NULL;
-    pq_symflush_t symf = {NULL,false,RAY_OK};
+    pq_symflush_t symf = {NULL,false,(int)RAY_OK};
     ray_thread_t sym_thread = 0;
     bool sym_running = false;
     if (!offsets || !nulls || !locks || !errors || !lo || !hi || !bytes || !order) { err = ray_error("oom",NULL); goto done; }
@@ -1971,25 +1976,30 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
     }
     ray_pool_t* pool = ray_pool_get();
     int64_t workers = pool ? (int64_t)ray_pool_total_workers(pool) : 1;
-    /* The pass layout follows memory.  Column by column pays off when the
-     * output does not fit the page cache with room to spare: each column
-     * is written and indexed while it is hot, and only it is.  With
-     * plenty of memory one pass over every column keeps all the decode
-     * work overlapped with the symbol domain's commits and wins.
-     * RAY_PQ_PASS_COLS forces columns per pass (r->ncols: one pass). */
+    /* The pass layout follows memory: physical RAM or the cgroup limit,
+     * the page cache the output competes for (not the heap budget of -m).
+     * Column by column pays off when the output does not fit it with room
+     * to spare: each column is written and indexed while it is hot, and
+     * only it is.  With plenty of memory one pass over every column keeps
+     * all the decode work overlapped with the symbol domain's commits and
+     * wins.  RAY_PQ_PASS_COLS forces columns per pass, symbol passes
+     * included (r->ncols: one pass). */
     int64_t out_bytes = 0;
-    for (int64_t c = 0; c < r->ncols; c++)
-        out_bytes += r->rows*(int64_t)(writers[c].type == RAY_SYM ? 4 : ray_elem_size(writers[c].type));
+    for (int64_t c = 0; c < r->ncols; c++) {
+        int64_t b = r->rows*(int64_t)(writers[c].type == RAY_SYM ? 4 : ray_elem_size(writers[c].type));
+        out_bytes = b > INT64_MAX - out_bytes ? INT64_MAX : out_bytes + b;
+    }
     int64_t ram = ray_sys_ram_limit();
-    bool colwise = ram > 0 && ram < PQ_COLWISE_RATIO*out_bytes;
+    bool colwise = ram > 0 && ram / PQ_COLWISE_RATIO < out_bytes;
     /* column by column: enough tasks in a pass for the pool, so a file of
      * few row groups still takes several columns at once */
     int64_t width = !colwise ? r->ncols
                   : r->ngroups > 0 ? (2*workers + r->ngroups - 1)/r->ngroups : r->ncols;
     if (width < 1) width = 1;
+    bool forced = false;
     {
         const char* e = getenv("RAY_PQ_PASS_COLS");
-        if (e && *e && strtol(e,NULL,10) > 0) { width = strtol(e,NULL,10); colwise = width < r->ncols; }
+        if (e && *e && strtol(e,NULL,10) > 0) { width = strtol(e,NULL,10); colwise = width < r->ncols; forced = true; }
     }
     if (width > r->ncols) width = r->ncols;
     bool trace = getenv("RAY_CSV_TRACE") != NULL;   /* the converters' phase trace */
@@ -2017,14 +2027,14 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
      * at a time keeps the rest of the working set small); together in one
      * pass from half the output's bytes of memory, where their decode then
      * overlaps. */
-    int64_t sym_width = ram > 0 && 2*ram >= out_bytes ? r->ncols - nnum : 1;
+    int64_t sym_width = forced ? width : ram > 0 && ram >= out_bytes / 2 ? r->ncols - nnum : 1;
     if (sym_width < 1) sym_width = 1;
     if (nnum < r->ncols && writers[order[nnum]].dom) {
         symf.dom = writers[order[nnum]].dom;
         if (ray_thread_create(&sym_thread,pq_symflush_fn,&symf) == RAY_OK) sym_running = true;
     }
+    bool all = !colwise;
     for (int64_t p = 0; p < r->ncols && !err; p += work.npass) {
-        bool all = width >= r->ncols;
         int64_t wd = all ? r->ncols : p < nnum ? width : sym_width;
         int64_t lim = all ? r->ncols : p < nnum ? nnum : r->ncols;
         work.pass = order + p;
@@ -2040,20 +2050,22 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
             errors[t] = NULL;
         }
         if (!err && ray_interrupted()) err = ray_error("cancel","parquet conversion interrupted");
+        if (!err && atomic_load_explicit(&symf.err,memory_order_acquire) != RAY_OK)
+            err = ray_error(ray_err_code_str((ray_err_t)atomic_load(&symf.err)),"parquet: cannot flush symbol file");
         if (err) break;
         if (trace) t1 = ray_profile_now_ns();
         for (int64_t i = 0; i < work.npass; i++) {
             int64_t c = work.pass[i];
             writers[c].rows = r->rows;
             writers[c].had_nulls = atomic_load_explicit(&nulls[c],memory_order_relaxed) != 0;
-            if (writers[c].type == RAY_SYM) continue;
+            if (all || writers[c].type == RAY_SYM) continue;
             ray_err_t e = ray_col_stream_close(&writers[c],false);
             if (e != RAY_OK) { err = ray_error(ray_err_code_str(e),"parquet: column close failed"); break; }
             ray_col_stream_hash_one(&writers[c]);
         }
         if (trace && !err) {
             ray_t* nm = ray_sym_str(r->schema[work.pass[0]].name);
-            fprintf(stderr,"parquet pass: col=%.*s cols=%lld %s decode=%.1fms close=%.1fms\n",
+            fprintf(stderr,"parquet pass: first=%.*s cols=%lld %s decode=%.1fms close=%.1fms\n",
                     (int)ray_str_len(nm),ray_str_ptr(nm),(long long)work.npass,
                     writers[work.pass[0]].type == RAY_SYM ? "sym" : "num",
                     (double)(t1-t0)/1e6,(double)(ray_profile_now_ns()-t1)/1e6);
@@ -2062,7 +2074,8 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
     if (sym_running) {
         atomic_store_explicit(&symf.stop,true,memory_order_release);
         ray_thread_join(sym_thread);
-        if (!err && symf.err != RAY_OK) err = ray_error(ray_err_code_str(symf.err),"parquet: cannot flush symbol file");
+        if (!err && atomic_load(&symf.err) != RAY_OK)
+            err = ray_error(ray_err_code_str((ray_err_t)atomic_load(&symf.err)),"parquet: cannot flush symbol file");
     }
 done:
     for (int64_t c = 0; c < r->ncols; c++) r->schema[c].import_domain = NULL;

@@ -208,9 +208,10 @@ ray_err_t ray_sym_domain_flush(ray_sym_domain_t* dom, bool durable);
  * (header count rewritten after the records), instead of rewriting the
  * whole file through a tmp + rename.  For a symfile one writer builds
  * alone, such as a converter's staging domain, flushed as it grows so the
- * last flush writes only the tail.  Same `.lk` lock and persisted-prefix
- * check as ray_sym_domain_flush; `durable` also syncs the file and its
- * directory, even when nothing new was interned. */
+ * last flush writes only the tail.  Same `.lk` lock as
+ * ray_sym_domain_flush; the file must still have the persisted size.
+ * `durable` also syncs the file and its directory, even when nothing new
+ * was interned. */
 ray_err_t ray_sym_domain_flush_append(ray_sym_domain_t* dom, bool durable);
 
 /* RAY_SYM_AUDIT=1 support (cached at ray_sym_init): when set,
