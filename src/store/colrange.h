@@ -154,6 +154,13 @@ uint8_t ray_col_src_esz(const ray_col_src_t* s);
 /* Chunk c's statistics when the source is a single-file generation-2
  * column; false otherwise (plain, parted, slice). */
 bool ray_col_src_chunk_stat(const ray_col_src_t* s, int64_t c, struct ray_enc_chunk_stat_s* out);
+/* Row `row` of a single-file generation-2 integer source (not SYM) read
+ * without decoding its vector (ray_enccol_point_i64: FOR_BP, or DICT over
+ * FOR_BP, without nulls): 1 served into *out (the value widened to int64),
+ * 0 declined (read the row through a cursor, which decodes or reports the
+ * vector; always for a plain, parted or materialized source), -1 an owned
+ * error in *err.  For samplers: a sampled row costs no vector decode. */
+int  ray_col_src_point_i64(const ray_col_src_t* s, int64_t row, int64_t* out, ray_t** err);
 /* One sequential read-ahead hint for rows [lo, hi): plain mmapped
  * columns hint their element bytes, generation 2 the chunk bytes from the
  * directory, parted sources each touched segment; heap vectors nothing. */

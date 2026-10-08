@@ -3761,6 +3761,60 @@ static test_result_t test_v2_dense_unaligned(void) {
     ray_release(fa); ray_release(fb); ray_release(a); ray_release(b);
     PASS();
 }
+/* Task 13b: decodes per column of one generation-2 group-by.  Rows of
+ * column `name` of table T decoded during query q, over the column's rows
+ * (1.0: every vector decoded exactly once). */
+static double sr_col_decodes(const char* name, uint64_t before) {
+    ray_t* t = sr_eval("T");
+    ray_t* ec = ray_table_get_col_enc(t, ray_sym_intern(name, strlen(name)));
+    double r = -1;
+    if (ec) {
+        ray_enccol_t* e = ray_enccol_of(ec);
+        r = (double)(atomic_load(&e->decoded_bytes) - before) / ((double)e->len * ray_enccol_esz(e));
+    }
+    sr_drop(t);
+    return r;
+}
+static uint64_t sr_col_decoded(const char* name) {
+    ray_t* t = sr_eval("T");
+    ray_t* ec = ray_table_get_col_enc(t, ray_sym_intern(name, strlen(name)));
+    uint64_t r = ec ? atomic_load(&ray_enccol_of(ec)->decoded_bytes) : 0;
+    sr_drop(t);
+    return r;
+}
+
+/* The samplers of the dense and table-stack plans read their sampled keys
+ * without decoding vectors (point reads): the key decodes as often as the
+ * aggregate input walked beside it, the same answers as generation 0. */
+static test_result_t test_v2_decode_once(void) {
+    sr_eval_ok("(set jd (til 600001))");
+    sr_eval_ok("(set DQ (table [k v ts] (list (as 'I32 (% (* jd 7919) 1000)) jd (* (% (* jd 104729) 2000) 100003))))");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/dq2/\" DQ {compress: true})");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/dq0/\" DQ {compress: false})");
+    ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    static const struct { const char* key; const char* q; int route; } qs[] = {
+        { "k",  "(select {s: (sum v) c: (count v) from: T by: k})",  AGG_ROUTE_V2_DENSE },
+        { "ts", "(select {s: (sum v) c: (count v) from: T by: ts})", AGG_ROUTE_V2_TABLESTACK },
+    };
+    for (size_t i = 0; i < sizeof qs / sizeof qs[0]; i++) {
+        test_result_t r = sr_same_on("(.db.splayed.get \"" SR_TMP "/dq0/\")", "(.db.splayed.get \"" SR_TMP "/dq2/\")",
+                                     qs[i].q, 0);
+        if (r.status != TEST_PASS) return r;
+        sr_eval_ok("(set T (.db.splayed.get \"" SR_TMP "/dq2/\"))");
+        uint64_t k0 = sr_col_decoded(qs[i].key), v0 = sr_col_decoded("v");
+        agg_route_reset();
+        ray_t* res = sr_eval(qs[i].q);
+        TEST_ASSERT_TRUE(res && !RAY_IS_ERR(res));
+        ray_release(res);
+        agg_route_stats_t st = agg_route_stats();
+        TEST_ASSERT_FMT(st.routes[qs[i].route] == 1, "%s: route %d not taken", qs[i].q, qs[i].route);
+        if (qs[i].route == AGG_ROUTE_V2_DENSE) TEST_ASSERT_EQ_I(st.dense_strategy, AGG_DENSE_TASK_LOCAL);
+        double kd = sr_col_decodes(qs[i].key, k0), vd = sr_col_decodes("v", v0);
+        TEST_ASSERT_FMT(kd == vd, "%s: key decoded %.4fx, input %.4fx", qs[i].q, kd, vd);
+    }
+    PASS();
+}
+
 /* The pool this test resized is restored even when an assert fails first
  * (finding M11; test/test_parquet.c:262 resizes the pool the same way). */
 static void srr_pool_teardown(void) { ray_pool_destroy(); (void)ray_pool_init_total(0); srr_teardown(); }
@@ -4203,5 +4257,6 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/v2_shared_fail",     test_v2_shared_fail,     srr_setup, srr_pool_teardown },
     { "scanrange/v2_f64_bits",        test_v2_f64_bits,        srr_setup, srr_teardown },
     { "scanrange/v2_route_error",     test_v2_route_error,     srr_setup, srr_teardown },
+    { "scanrange/v2_decode_once",     test_v2_decode_once,     srr_setup, srr_pool_teardown },
     { NULL, NULL, NULL, NULL },
 };

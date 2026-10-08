@@ -557,6 +557,13 @@ bool ray_col_src_chunk_stat(const ray_col_src_t* s, int64_t c, struct ray_enc_ch
     return true;
 }
 
+int ray_col_src_point_i64(const ray_col_src_t* s, int64_t row, int64_t* out, ray_t** err) {
+    *err = NULL;
+    if (!ray_col_src_encoded(s) || ray_enccol_decoded_peek(s->obj)) return 0;   /* the cursor reads it in place */
+    ray_enccol_t* e = ray_enccol_of(s->obj);
+    return e->kind == RAY_ENCCOL_SINGLE ? ray_enccol_point_i64(e, row, out, err) : 0;
+}
+
 /* One read-ahead span: page-aligned start, bytes. */
 typedef void (*advise_emit_fn)(void* ctx, uintptr_t start, size_t len);
 

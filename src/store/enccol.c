@@ -1144,26 +1144,158 @@ int ray_enccol_decode_wide(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc
     return 1;
 }
 
+/* ---- Point reads: one row of a packed vector without decoding it ----
+ * Value i of a packed body is lane i % L, row i / L (L = 1024 / T): its w
+ * bits start at bit (i / L) * w of the lane, in word (bit / T) * L + lane,
+ * continued in the lane's next word when they cross a T-bit boundary.
+ * The body is ray_enc_size_for(w) bytes, so every word read is inside it. */
+static uint64_t point_field(const uint8_t* pk, int T, int w, int i) {
+    if (w == 0) return 0;
+    const int L = RAY_ENC_VEC / T, bit = (i / L) * w, off = bit % T;
+    const size_t at = (size_t)(bit / T) * (size_t)L + (size_t)(i % L), tb = (size_t)T / 8;
+    uint64_t lo = 0, hi = 0;
+    memcpy(&lo, pk + at * tb, tb);                         /* little-endian: the low tb bytes */
+    if (off + w > T) memcpy(&hi, pk + (at + (size_t)L) * tb, tb);
+    uint64_t v = lo >> off;
+    if (off + w > T) v |= hi << (T - off);
+    return w >= 64 ? v : v & ((1ull << w) - 1);
+}
+
+/* Row i of vector body p (avail bytes, descriptor d, no nulls) as its
+ * T-bit pattern: 1 served; 0 declined when the body is not one this read
+ * proves (any codec but FOR_BP and DICT over a FOR_BP code child, a size,
+ * width, base or reserved field off, a code outside the dictionary, the
+ * sentinel), so the vector decode decides; -1 the dictionary's error. */
+static int point_body(ray_enccol_t* e, const ray_enc_desc_t* d, const uint8_t* p, uint64_t avail,
+                      int i, ray_enc_kind_t k, uint64_t* x, ray_t** err) {
+    const uint64_t m = k.T == 64 ? ~0ull : (1ull << k.T) - 1;
+    uint64_t v;
+    if (d->encoding == RAY_ENC_FOR_BP) {
+        const int w = d->width;
+        if (w > k.T || avail != (uint64_t)ray_enc_size_for(w)) return 0;
+        uint64_t base; memcpy(&base, p, 8);
+        if (base & ~m) return 0;
+        v = (base + point_field(p + 8, k.T, w, i)) & m;
+    } else if (d->encoding == RAY_ENC_DICT && d->width == 0) {
+        /* the codes child: an 8-byte header (encoding, width, reserved,
+         * body bytes), then a U32 FOR_BP body filling the payload */
+        if (avail < 16 || p[0] != RAY_ENC_FOR_BP) return 0;
+        const int w = p[1];
+        uint16_t rsv; memcpy(&rsv, p + 2, 2);
+        uint32_t bb; memcpy(&bb, p + 4, 4);
+        if (rsv || w > 32 || (uint64_t)bb + 8 != avail || bb != (uint64_t)ray_enc_size_for(w)) return 0;
+        uint64_t base; memcpy(&base, p + 8, 8);
+        if (base >> 32) return 0;
+        uint64_t code = (base + point_field(p + 16, 32, w, i)) & 0xffffffffull;
+        ray_enc_dict_t dict;
+        if ((*err = enc_dict(e, &dict)) != NULL) return -1;
+        if (code >= dict.n) return 0;
+        v = dict.v[code] & m;
+    } else {
+        return 0;
+    }
+    if (k.is_signed && v == (uint64_t)1 << (k.T - 1)) return 0;   /* the sentinel outside a bitmap */
+    *x = v;
+    return 1;
+}
+
+static bool point_type(const ray_enccol_t* e, ray_enc_kind_t* k) {
+    return fk_int_type(e->type) && e->type != RAY_SYM && ray_enc_kind_of(e->type, e->attrs, k);
+}
+
+int ray_enccol_point_i64(ray_enccol_t* e, int64_t row, int64_t* out, ray_t** err) {
+    *err = NULL;
+    ray_enc_kind_t k;
+    if (e->kind != RAY_ENCCOL_SINGLE || row < 0 || row >= e->len || !point_type(e, &k)) return 0;
+    const int64_t c = row / RAY_ENC_CHUNK;
+    const int j = (int)(row % RAY_ENC_CHUNK / RAY_ENC_VEC), i = (int)(row % RAY_ENC_VEC);
+    const ray_enc_desc_t* descs;
+    if ((*err = ray_enccol_chunk_descs_ref(e, c, &descs)) != NULL) return -1;   /* validated once per chunk */
+    const ray_enc_desc_t* d = &descs[j];
+    if (d->n_nulls) return 0;                              /* the bitmap: the vector decode decides */
+    ray_enc_dirent_t de; dirent_at(e, c, &de);
+    uint64_t x;
+    int r = point_body(e, d, e->base + de.offset + d->payload_off, d->payload_bytes, i, k, &x, err);
+    if (r == 1) *out = ray_enc_logical(x, k);
+    return r;
+}
+
+/* A stand-in column of `type` for the body hooks; with a VALUE_DICT of
+ * dict[0, n_dict) (T-bit patterns), its entry `trim` bytes short. */
+static ray_enccol_t* test_col(int8_t type, uint8_t attrs, uint32_t sym_bound,
+                              const uint64_t* dict, uint32_t n_dict, int trim) {
+    ray_enccol_t* e = ray_calloc_raw(sizeof *e);
+    if (!e) return NULL;
+    e->type = type; e->attrs = attrs; e->sym_bound = sym_bound;
+    snprintf(e->path, sizeof e->path, "decode_body");
+    ray_enc_once_init(&e->dict_once);
+    ray_enc_kind_t k;
+    if (dict && ray_enc_kind_of(type, attrs, &k)) {
+        size_t esz = (size_t)k.T / 8, len = 8 + (size_t)ray_enc_pad8((uint64_t)n_dict * esz);
+        uint8_t* b = ray_calloc_raw(len);
+        if (!b) { ray_free_raw(e); return NULL; }
+        memcpy(b, &n_dict, 4);
+        for (uint32_t i = 0; i < n_dict; i++) memcpy(b + 8 + i * esz, &dict[i], esz);
+        e->base = b;
+        e->vdict_off = 0;
+        e->vdict_len = len - (size_t)trim;
+    }
+    return e;
+}
+static void test_col_free(ray_enccol_t* e) {
+    if (e->dict) ray_release(e->dict);
+    ray_free_raw((void*)e->base);
+    ray_free_raw(e);
+}
+
+int ray_enccol_test_point_body(int8_t type, const uint64_t* dict, uint32_t n_dict, uint8_t enc,
+                               uint8_t width, int n_nulls, const uint8_t* body, uint64_t avail,
+                               int vlen, int64_t* out, int8_t* res) {
+    ray_enccol_t* e = test_col(type, 0, 0, dict, n_dict, 0);
+    if (!e) return -1;
+    ray_enc_desc_t d; memset(&d, 0, sizeof d);
+    d.encoding = enc; d.width = width; d.n_nulls = (uint16_t)n_nulls;
+    ray_enc_kind_t k;
+    const bool ok = point_type(e, &k) && !n_nulls;
+    for (int i = 0; i < vlen; i++) {
+        ray_t* err = NULL;
+        uint64_t x;
+        res[i] = ok ? (int8_t)point_body(e, &d, body, avail, i, k, &x, &err) : 0;
+        if (res[i] == 1) out[i] = ray_enc_logical(x, k);
+        if (err) ray_error_free(err);
+    }
+    test_col_free(e);
+    return 0;
+}
+
+static int test_decode(ray_enccol_t* e, uint8_t enc, uint8_t width, int n_nulls, const uint8_t* bm,
+                       const uint8_t* body, uint64_t avail, int vlen, bool fast, int8_t wide, void* out) {
+    ray_enc_desc_t d; memset(&d, 0, sizeof d);
+    d.encoding = enc; d.width = width; d.n_nulls = (uint16_t)n_nulls;
+    if (fast) return dec_fast(e, &d, vlen, body, avail, bm, wide, out);
+    if (wide) return -1;
+    ray_t* err = dec_ints(e, 0, 0, &d, vlen, body, avail, bm, out);
+    if (err) ray_error_free(err);
+    return err ? -1 : 1;
+}
+
 int ray_enccol_test_decode_body(int8_t type, uint8_t attrs, uint32_t sym_bound, uint8_t enc,
                                 uint8_t width, int n_nulls, const uint8_t* bm, const uint8_t* body,
                                 uint64_t avail, int vlen, bool fast, int8_t wide, void* out) {
-    ray_enccol_t* e = ray_calloc_raw(sizeof *e);
+    ray_enccol_t* e = test_col(type, attrs, sym_bound, NULL, 0, 0);
     if (!e) return -1;
-    e->type = type; e->attrs = attrs; e->sym_bound = sym_bound;
-    snprintf(e->path, sizeof e->path, "decode_body");
-    ray_enc_desc_t d; memset(&d, 0, sizeof d);
-    d.encoding = enc; d.width = width; d.n_nulls = (uint16_t)n_nulls;
-    int r;
-    if (fast) {
-        r = dec_fast(e, &d, vlen, body, avail, bm, wide, out);
-    } else if (wide) {
-        r = -1;
-    } else {
-        ray_t* err = dec_ints(e, 0, 0, &d, vlen, body, avail, bm, out);
-        r = err ? -1 : 1;
-        if (err) ray_error_free(err);
-    }
-    ray_free_raw(e);
+    int r = test_decode(e, enc, width, n_nulls, bm, body, avail, vlen, fast, wide, out);
+    test_col_free(e);
+    return r;
+}
+
+int ray_enccol_test_decode_dict(int8_t type, const uint64_t* dict, uint32_t n_dict, int trim,
+                                int n_nulls, const uint8_t* bm, const uint8_t* body, uint64_t avail,
+                                int vlen, bool fast, void* out) {
+    ray_enccol_t* e = test_col(type, 0, 0, dict, n_dict, trim);
+    if (!e) return -1;
+    int r = test_decode(e, RAY_ENC_DICT, 0, n_nulls, bm, body, avail, vlen, fast, 0, out);
+    test_col_free(e);
     return r;
 }
 

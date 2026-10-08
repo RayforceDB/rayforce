@@ -419,9 +419,13 @@ static ray_t* agg_idx_walk(const agg_rr_t* rr, agg_curs_t* cs, const int64_t* id
 }
 
 /* Single-row reads for the samplers (strided, sparse): in place, or
- * through the cursor of a staged source.  *err is set on a range error. */
+ * from a staged source's packed vector (a point read, no vector decode),
+ * else through its cursor.  *err is set on a range error. */
 static inline int64_t agg_key_at(const agg_rr_t* rr, agg_curs_t* cs, uint32_t k, int64_t r, ray_t** err) {
     if (!rr->srcs[k]) return agg_read_key_i64_raw(rr->key_types[k], rr->key_attrs[k], rr->plain[k], r);
+    int64_t x;
+    int pr = ray_col_src_point_i64(rr->srcs[k], r, &x, err);
+    if (pr) return pr > 0 ? x : 0;
     const ray_col_range_t* v;
     if ((*err = ray_col_cursor_at(&cs->cur[k], r, &v)) != NULL) return 0;
     return agg_read_key_i64_raw(rr->key_types[k], v->attrs, v->data, r - v->start);

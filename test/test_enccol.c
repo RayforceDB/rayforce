@@ -824,6 +824,295 @@ static test_result_t test_fast_kernel_equal(void) {
     PASS();
 }
 
+/* ---- Task 13b: point reads and the DICT kernel against the reference decode ---- */
+
+/* Element i of a generation-0 vector of `type`, widened to int64. */
+static int64_t gen0_at(int8_t type, const void* d, int i) {
+    switch (type) {
+    case RAY_I64: case RAY_TIMESTAMP: return ((const int64_t*)d)[i];
+    case RAY_I32: case RAY_DATE: case RAY_TIME: return ((const int32_t*)d)[i];
+    case RAY_I16: return ((const int16_t*)d)[i];
+    default: return ((const uint8_t*)d)[i];
+    }
+}
+
+/* A DICT vector body into out (8-aligned): the codes base + u[i] (1024 of
+ * them) as a U32 FOR_BP child of width w.  Returns its bytes. */
+static uint64_t dict_body(uint8_t* out, const uint64_t* u, int w, uint64_t base) {
+    uint32_t bb = (uint32_t)ray_enc_size_for(w);
+    memset(out, 0, 8 + (size_t)bb);
+    out[0] = RAY_ENC_FOR_BP; out[1] = (uint8_t)w;
+    memcpy(out + 4, &bb, 4);
+    memcpy(out + 8, &base, 8);
+    if (w) ray_enc_pack(u, 32, w, out + 16);
+    return 8 + (uint64_t)bb;
+}
+
+/* Every row's point read of a body equals the reference decode's row
+ * (dict: a DICT body over dict[0, n_dict)). */
+static test_result_t point_case(int8_t type, uint8_t enc, const uint64_t* dict, uint32_t n_dict,
+                                uint8_t width, const uint8_t* body, uint64_t avail, int vlen, const char* what) {
+    static uint8_t ref[RAY_ENC_VEC * 8];
+    static int64_t pv[RAY_ENC_VEC]; static int8_t res[RAY_ENC_VEC];
+    int rr = dict ? ray_enccol_test_decode_dict(type, dict, n_dict, 0, 0, NULL, body, avail, vlen, false, ref)
+                  : ray_enccol_test_decode_body(type, 0, 0, enc, width, 0, NULL, body, avail, vlen, false, 0, ref);
+    TEST_ASSERT_FMT(rr == 1, "%s: reference %d", what, rr);
+    TEST_ASSERT_EQ_I(ray_enccol_test_point_body(type, dict, n_dict, enc, width, 0, body, avail, vlen, pv, res), 0);
+    for (int i = 0; i < vlen; i++) {
+        TEST_ASSERT_FMT(res[i] == 1, "%s: row %d declined (%d)", what, i, res[i]);
+        TEST_ASSERT_FMT(pv[i] == gen0_at(type, ref, i), "%s: row %d point %lld, decode %lld", what, i,
+                        (long long)pv[i], (long long)gen0_at(type, ref, i));
+    }
+    PASS();
+}
+
+/* A strictly ascending dictionary of n values of kind k spread over the
+ * whole non-null range (the extremes MIN + 1 and MAX included). */
+static void dict_values(uint64_t* dv, uint32_t n, ray_enc_kind_t k) {
+    const uint64_t m = k.T == 64 ? ~0ull : (1ull << k.T) - 1;
+    __int128 lo = -(((__int128)1) << (k.T - 1)) + 1, hi = (((__int128)1) << (k.T - 1)) - 1;
+    for (uint32_t j = 0; j < n; j++)
+        dv[j] = (uint64_t)(n == 1 ? lo : lo + (hi - lo) * (__int128)j / (__int128)(n - 1)) & m;
+}
+
+static test_result_t test_point_read_equal(void) {
+    static const int8_t ftypes[] = { RAY_U8, RAY_BOOL, RAY_I16, RAY_I32, RAY_I64, RAY_DATE, RAY_TIME, RAY_TIMESTAMP };
+    static const int lens[] = { 1024, 1000, 77, 1 };
+    static uint64_t v[RAY_ENC_VEC], u[RAY_ENC_VEC], dv[65536], bodyw[RAY_ENC_VEC / 2 + 4];
+    char what[160];
+    g_seed = 0x13b1;
+    /* FOR_BP: widths 0, 1, T - 1 and T, negative bases, the extremes */
+    for (size_t ti = 0; ti < sizeof ftypes / sizeof ftypes[0]; ti++) {
+        int8_t type = ftypes[ti];
+        ray_enc_kind_t k; TEST_ASSERT_TRUE(ray_enc_kind_of(type, 0, &k));
+        const int T = k.T;
+        const uint64_t m = T == 64 ? ~0ull : (1ull << T) - 1;
+        int widths[4] = { 0, 1, T - 1, T };
+        for (int wi = 0; wi < 4; wi++) {
+            int w = widths[wi];
+            for (size_t li = 0; li < sizeof lens / sizeof lens[0]; li++) {
+                int n = lens[li];
+                if (w > 0 && n == 1) continue;
+                uint64_t span = w == 0 ? 0 : (w == 64 ? ~0ull : (1ull << w) - 1), base;
+                if (!k.is_signed) {
+                    base = rng() % (m - span + 1);
+                } else {
+                    if (w == T) span -= 1;                        /* [MIN + 1, MAX]: off the sentinel */
+                    __int128 lo = -(((__int128)1) << (T - 1)) + 1, hi = (((__int128)1) << (T - 1)) - 1;
+                    uint64_t room = (uint64_t)(hi - lo + 1 - (__int128)span);
+                    __int128 lb = lo + (__int128)(rng() % (wi & 1 ? room / 2 + 1 : room));   /* odd: negative */
+                    base = (uint64_t)lb & m;
+                }
+                for (int i = 0; i < n; i++) v[i] = (base + (span ? rng() % span : 0)) & m;
+                if (span && n > 1) { v[0] = base; v[n - 1] = (base + span) & m; }
+                ray_enc_buf_t b = { 0 }; ray_enc_choice_t ch;
+                TEST_ASSERT_TRUE(ray_enc_write_as(RAY_ENC_FOR_BP, v, n, k, NULL, &b, &ch));
+                if (n == 1024) TEST_ASSERT_EQ_I(ch.width, w);
+                snprintf(what, sizeof what, "FOR type %d w %d n %d", type, ch.width, n);
+                test_result_t r = point_case(type, RAY_ENC_FOR_BP, NULL, 0, ch.width, b.p, b.len, n, what);
+                ray_enc_buf_free(&b);
+                if (r.status != TEST_PASS) return r;
+            }
+        }
+    }
+    /* DICT over a FOR_BP code child: code widths 0..16, dictionaries of 1,
+     * 2, 255, 256 and 65535 values, full and partial vectors */
+    static const int8_t dtypes[] = { RAY_I16, RAY_I32, RAY_I64, RAY_DATE, RAY_TIMESTAMP };
+    static const uint32_t sizes[] = { 1, 2, 255, 256, 65535 };
+    for (size_t ti = 0; ti < sizeof dtypes / sizeof dtypes[0]; ti++) {
+        ray_enc_kind_t k; TEST_ASSERT_TRUE(ray_enc_kind_of(dtypes[ti], 0, &k));
+        for (size_t si = 0; si < sizeof sizes / sizeof sizes[0]; si++) {
+            uint32_t nd = sizes[si];
+            dict_values(dv, nd, k);
+            for (int w = 0; w <= 16; w++)
+                for (int li = 0; li < 3; li++) {
+                    int n = lens[li];
+                    uint64_t span = 1ull << w, base = nd >= span ? rng() % (nd - span + 1) : 0;
+                    uint64_t lim = nd >= span ? span : nd;              /* codes base + u below nd */
+                    memset(u, 0, sizeof u);
+                    for (int i = 0; i < n; i++) u[i] = rng() % lim;
+                    u[0] = 0; u[n - 1] = lim - 1;
+                    uint64_t len = dict_body((uint8_t*)bodyw, u, w, base);
+                    snprintf(what, sizeof what, "DICT type %d dict %u w %d n %d", dtypes[ti], nd, w, n);
+                    test_result_t r = point_case(dtypes[ti], RAY_ENC_DICT, dv, nd, 0, (const uint8_t*)bodyw, len, n, what);
+                    if (r.status != TEST_PASS) return r;
+                }
+        }
+    }
+    PASS();
+}
+
+/* A point read never serves a row the decode would refuse: on nulls, the
+ * sentinel, any other codec, and every corruption it reads, it declines. */
+static test_result_t test_point_read_declines(void) {
+    static uint64_t v[RAY_ENC_VEC], u[RAY_ENC_VEC], bodyw[RAY_ENC_VEC / 2 + 4];
+    static int64_t pv[RAY_ENC_VEC]; static int8_t res[RAY_ENC_VEC];
+    static uint8_t ref[RAY_ENC_VEC * 8];
+    ray_enc_kind_t k32 = { 32, true }, k16 = { 16, true };
+    for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = (uint64_t)(uint32_t)(int32_t)(i % 300 - 100);
+    ray_enc_buf_t b = { 0 }; ray_enc_choice_t ch;
+    TEST_ASSERT_TRUE(ray_enc_write_as(RAY_ENC_FOR_BP, v, RAY_ENC_VEC, k32, NULL, &b, &ch));
+    /* nulls in the vector: the bitmap decides */
+    TEST_ASSERT_EQ_I(ray_enccol_test_point_body(RAY_I32, NULL, 0, RAY_ENC_FOR_BP, ch.width, 3, b.p, b.len, RAY_ENC_VEC, pv, res), 0);
+    for (int i = 0; i < RAY_ENC_VEC; i++) TEST_ASSERT_EQ_I(res[i], 0);
+    /* a body one word short, a base above the type width, a width above T */
+    TEST_ASSERT_EQ_I(ray_enccol_test_decode_body(RAY_I32, 0, 0, RAY_ENC_FOR_BP, ch.width, 0, NULL, b.p, b.len - 8, RAY_ENC_VEC, false, 0, ref), -1);
+    TEST_ASSERT_EQ_I(ray_enccol_test_point_body(RAY_I32, NULL, 0, RAY_ENC_FOR_BP, ch.width, 0, b.p, b.len - 8, RAY_ENC_VEC, pv, res), 0);
+    for (int i = 0; i < RAY_ENC_VEC; i++) TEST_ASSERT_EQ_I(res[i], 0);
+    uint64_t base0; memcpy(&base0, b.p, 8);
+    uint64_t bad = base0 | (1ull << 32);
+    memcpy(b.p, &bad, 8);
+    TEST_ASSERT_EQ_I(ray_enccol_test_decode_body(RAY_I32, 0, 0, RAY_ENC_FOR_BP, ch.width, 0, NULL, b.p, b.len, RAY_ENC_VEC, false, 0, ref), -1);
+    TEST_ASSERT_EQ_I(ray_enccol_test_point_body(RAY_I32, NULL, 0, RAY_ENC_FOR_BP, ch.width, 0, b.p, b.len, RAY_ENC_VEC, pv, res), 0);
+    for (int i = 0; i < RAY_ENC_VEC; i++) TEST_ASSERT_EQ_I(res[i], 0);
+    memcpy(b.p, &base0, 8);
+    ray_enc_buf_free(&b);
+    {
+        static uint64_t wb[1 + RAY_ENC_VEC * 17 / 64];               /* width 17 over I16 */
+        memset(wb, 0, sizeof wb);
+        TEST_ASSERT_EQ_I(ray_enccol_test_decode_body(RAY_I16, 0, 0, RAY_ENC_FOR_BP, 17, 0, NULL, (const uint8_t*)wb, sizeof wb, RAY_ENC_VEC, false, 0, ref), -1);
+        TEST_ASSERT_EQ_I(ray_enccol_test_point_body(RAY_I16, NULL, 0, RAY_ENC_FOR_BP, 17, 0, (const uint8_t*)wb, sizeof wb, RAY_ENC_VEC, pv, res), 0);
+        for (int i = 0; i < RAY_ENC_VEC; i++) TEST_ASSERT_EQ_I(res[i], 0);
+    }
+    /* the sentinel outside the (absent) bitmap: that row declines, the
+     * vector is corrupt to the decode */
+    for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = (uint64_t)(uint16_t)(int16_t)(i % 50 - 25);
+    v[700] = 0x8000;
+    TEST_ASSERT_TRUE(ray_enc_write_as(RAY_ENC_FOR_BP, v, RAY_ENC_VEC, k16, NULL, &b, &ch));
+    TEST_ASSERT_EQ_I(ray_enccol_test_decode_body(RAY_I16, 0, 0, RAY_ENC_FOR_BP, ch.width, 0, NULL, b.p, b.len, RAY_ENC_VEC, false, 0, ref), -1);
+    TEST_ASSERT_EQ_I(ray_enccol_test_point_body(RAY_I16, NULL, 0, RAY_ENC_FOR_BP, ch.width, 0, b.p, b.len, RAY_ENC_VEC, pv, res), 0);
+    TEST_ASSERT_EQ_I(res[700], 0);
+    TEST_ASSERT_EQ_I(res[699], 1);
+    TEST_ASSERT_EQ_I(pv[699], 699 % 50 - 25);
+    ray_enc_buf_free(&b);
+    /* every other codec declines */
+    for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = (uint64_t)(uint32_t)(int32_t)(i / 100 * 3 - 7);
+    static const uint8_t others[] = { RAY_ENC_RAW, RAY_ENC_CONST, RAY_ENC_DELTA_BP, RAY_ENC_RLE };
+    for (size_t o = 0; o < sizeof others; o++) {
+        if (others[o] == RAY_ENC_CONST) for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = 5;
+        TEST_ASSERT_TRUE(ray_enc_write_as(others[o], v, RAY_ENC_VEC, k32, NULL, &b, &ch));
+        TEST_ASSERT_EQ_I(ray_enccol_test_decode_body(RAY_I32, 0, 0, others[o], ch.width, 0, NULL, b.p, b.len, RAY_ENC_VEC, false, 0, ref), 1);
+        TEST_ASSERT_EQ_I(ray_enccol_test_point_body(RAY_I32, NULL, 0, others[o], ch.width, 0, b.p, b.len, RAY_ENC_VEC, pv, res), 0);
+        for (int i = 0; i < RAY_ENC_VEC; i++) TEST_ASSERT_FMT(res[i] == 0, "codec %u row %d served", others[o], i);
+        ray_enc_buf_free(&b);
+    }
+    /* SYM and the float types are never point-read */
+    TEST_ASSERT_TRUE(ray_enc_write_as(RAY_ENC_FOR_BP, v, RAY_ENC_VEC, k32, NULL, &b, &ch));
+    TEST_ASSERT_EQ_I(ray_enccol_test_point_body(RAY_SYM, NULL, 0, RAY_ENC_FOR_BP, ch.width, 0, b.p, b.len, 8, pv, res), 0);
+    for (int i = 0; i < 8; i++) TEST_ASSERT_EQ_I(res[i], 0);
+    ray_enc_buf_free(&b);
+    /* DICT: a code at the dictionary size, a child base above 32 bits, a
+     * reserved child field, a short body, a RAW code child */
+    static const uint64_t dv3[3] = { 10, 20, 30 };
+    for (int i = 0; i < RAY_ENC_VEC; i++) u[i] = (uint64_t)(i % 3);
+    u[9] = 3;
+    uint64_t len = dict_body((uint8_t*)bodyw, u, 2, 0);
+    TEST_ASSERT_EQ_I(ray_enccol_test_decode_dict(RAY_I64, dv3, 3, 0, 0, NULL, (const uint8_t*)bodyw, len, RAY_ENC_VEC, false, ref), -1);
+    TEST_ASSERT_EQ_I(ray_enccol_test_point_body(RAY_I64, dv3, 3, RAY_ENC_DICT, 0, 0, (const uint8_t*)bodyw, len, RAY_ENC_VEC, pv, res), 0);
+    TEST_ASSERT_EQ_I(res[9], 0);
+    TEST_ASSERT_EQ_I(res[8], 1);
+    TEST_ASSERT_EQ_I(pv[8], 30);
+    u[9] = 0;
+    len = dict_body((uint8_t*)bodyw, u, 2, 1ull << 32);
+    TEST_ASSERT_EQ_I(ray_enccol_test_decode_dict(RAY_I64, dv3, 3, 0, 0, NULL, (const uint8_t*)bodyw, len, RAY_ENC_VEC, false, ref), -1);
+    TEST_ASSERT_EQ_I(ray_enccol_test_point_body(RAY_I64, dv3, 3, RAY_ENC_DICT, 0, 0, (const uint8_t*)bodyw, len, RAY_ENC_VEC, pv, res), 0);
+    for (int i = 0; i < RAY_ENC_VEC; i++) TEST_ASSERT_EQ_I(res[i], 0);
+    len = dict_body((uint8_t*)bodyw, u, 2, 0);
+    ((uint8_t*)bodyw)[2] = 1;
+    TEST_ASSERT_EQ_I(ray_enccol_test_decode_dict(RAY_I64, dv3, 3, 0, 0, NULL, (const uint8_t*)bodyw, len, RAY_ENC_VEC, false, ref), -1);
+    TEST_ASSERT_EQ_I(ray_enccol_test_point_body(RAY_I64, dv3, 3, RAY_ENC_DICT, 0, 0, (const uint8_t*)bodyw, len, RAY_ENC_VEC, pv, res), 0);
+    for (int i = 0; i < RAY_ENC_VEC; i++) TEST_ASSERT_EQ_I(res[i], 0);
+    ((uint8_t*)bodyw)[2] = 0;
+    TEST_ASSERT_EQ_I(ray_enccol_test_decode_dict(RAY_I64, dv3, 3, 0, 0, NULL, (const uint8_t*)bodyw, len - 8, RAY_ENC_VEC, false, ref), -1);
+    TEST_ASSERT_EQ_I(ray_enccol_test_point_body(RAY_I64, dv3, 3, RAY_ENC_DICT, 0, 0, (const uint8_t*)bodyw, len - 8, RAY_ENC_VEC, pv, res), 0);
+    for (int i = 0; i < RAY_ENC_VEC; i++) TEST_ASSERT_EQ_I(res[i], 0);
+    /* a code child of width 33 (above the U32 codes) */
+    {
+        static uint64_t wb[2 + RAY_ENC_VEC * 33 / 64];
+        memset(wb, 0, sizeof wb);
+        uint32_t bb = (uint32_t)ray_enc_size_for(33);
+        ((uint8_t*)wb)[0] = RAY_ENC_FOR_BP; ((uint8_t*)wb)[1] = 33; memcpy((uint8_t*)wb + 4, &bb, 4);
+        TEST_ASSERT_EQ_I(ray_enccol_test_decode_dict(RAY_I64, dv3, 3, 0, 0, NULL, (const uint8_t*)wb, 8 + bb, RAY_ENC_VEC, false, ref), -1);
+        TEST_ASSERT_EQ_I(ray_enccol_test_point_body(RAY_I64, dv3, 3, RAY_ENC_DICT, 0, 0, (const uint8_t*)wb, 8 + bb, RAY_ENC_VEC, pv, res), 0);
+        for (int i = 0; i < RAY_ENC_VEC; i++) TEST_ASSERT_EQ_I(res[i], 0);
+    }
+    /* a RAW code child is sound, but not a body the point read takes */
+    {
+        uint8_t* p = (uint8_t*)bodyw;
+        memset(p, 0, 8 + RAY_ENC_VEC * 4);
+        uint32_t bb = RAY_ENC_VEC * 4;
+        p[0] = RAY_ENC_RAW; memcpy(p + 4, &bb, 4);
+        for (int i = 0; i < RAY_ENC_VEC; i++) { uint32_t c = (uint32_t)(i % 3); memcpy(p + 8 + 4 * i, &c, 4); }
+        TEST_ASSERT_EQ_I(ray_enccol_test_decode_dict(RAY_I64, dv3, 3, 0, 0, NULL, p, 8 + bb, RAY_ENC_VEC, false, ref), 1);
+        TEST_ASSERT_EQ_I(ray_enccol_test_point_body(RAY_I64, dv3, 3, RAY_ENC_DICT, 0, 0, p, 8 + bb, RAY_ENC_VEC, pv, res), 0);
+        for (int i = 0; i < RAY_ENC_VEC; i++) TEST_ASSERT_EQ_I(res[i], 0);
+    }
+    /* a dictionary value on the sentinel: that row declines */
+    static const uint64_t dvs[3] = { 0x8000000000000000ull, 20, 30 };
+    for (int i = 0; i < RAY_ENC_VEC; i++) u[i] = (uint64_t)(i % 3);
+    len = dict_body((uint8_t*)bodyw, u, 2, 0);
+    TEST_ASSERT_EQ_I(ray_enccol_test_point_body(RAY_I64, dvs, 3, RAY_ENC_DICT, 0, 0, (const uint8_t*)bodyw, len, RAY_ENC_VEC, pv, res), 0);
+    TEST_ASSERT_EQ_I(res[0], 0);
+    TEST_ASSERT_EQ_I(res[1], 1);
+    TEST_ASSERT_EQ_I(pv[1], 20);
+    PASS();
+}
+
+/* Through a loaded column: every row of a FOR_BP or DICT vector without
+ * nulls is served and equals the materialization; vectors with nulls and
+ * other codecs decline; nothing is decoded; a materialized column
+ * declines (its cursor reads it in place). */
+static test_result_t test_point_read_column(void) {
+    static const int64_t big[4] = { -900000000001ll, 11, 77, 123456789012345ll };
+    const int64_t n = 70000;
+    ray_t* a = ray_vec_new(RAY_I32, n); a->len = n;
+    ray_t* d = ray_vec_new(RAY_I64, n); d->len = n;
+    for (int64_t i = 0; i < n; i++) {
+        ((int32_t*)ray_data(a))[i] = (i / 1024) % 5 == 3 && i % 97 == 0 ? NULL_I32 : (int32_t)((i * 7919) % 100000 - 50000);
+        ((int64_t*)ray_data(d))[i] = big[(uint32_t)((uint32_t)i * 2654435761u) >> 30];
+    }
+    a->attrs |= RAY_ATTR_HAS_NULLS;
+    ray_t* src[2] = { a, d };
+    const char* names[2] = { ENCCOL_TMP "/pa", ENCCOL_TMP "/pd" };
+    for (int c = 0; c < 2; c++) {
+        TEST_ASSERT_EQ_I(ray_col_save_gen(src[c], ray_test_tmp(names[c]), 2), RAY_OK);
+        ray_t* col = ray_col_mmap(ray_test_tmp(names[c]));
+        TEST_ASSERT_TRUE(col && !RAY_IS_ERR(col));
+        ray_enccol_t* e = ray_enccol_of(col);
+        ray_col_src_t s;
+        TEST_ASSERT_NULL(ray_col_src_bind(col, &s));
+        ray_enc_counters_reset();
+        int64_t served = 0, declined = 0;
+        for (int64_t r = 0; r < n; r++) {
+            int64_t x = 0; ray_t* err = NULL;
+            int pr = ray_col_src_point_i64(&s, r, &x, &err);
+            TEST_ASSERT_FMT(pr >= 0 && !err, "col %d row %lld: %d", c, (long long)r, pr);
+            ray_enc_desc_t ds[RAY_ENC_VECS_PER_CHUNK];
+            TEST_ASSERT_NULL(ray_enccol_chunk_descs(e, r / RAY_ENC_CHUNK, ds));
+            const ray_enc_desc_t dd = ds[r % RAY_ENC_CHUNK / RAY_ENC_VEC];
+            bool want = !dd.n_nulls && (dd.encoding == RAY_ENC_FOR_BP || dd.encoding == RAY_ENC_DICT);
+            TEST_ASSERT_FMT(pr == (want ? 1 : 0), "col %d row %lld: %d, encoding %u nulls %u", c, (long long)r, pr,
+                            dd.encoding, dd.n_nulls);
+            if (pr == 1) {
+                served++;
+                TEST_ASSERT_FMT(x == gen0_at(src[c]->type, ray_data(src[c]), (int)r), "col %d row %lld", c, (long long)r);
+            } else declined++;
+        }
+        ray_enc_counters_t k; ray_enc_counters_get(&k);
+        TEST_ASSERT_EQ_U(k.decoded_bytes, 0);
+        TEST_ASSERT_TRUE(served > n / 2);
+        if (c == 0) TEST_ASSERT_TRUE(declined >= 13 * 1024);    /* the vectors with nulls, the RAW tail */
+        ray_t* m = ray_enccol_materialize(col);
+        TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m));
+        int64_t x; ray_t* err = NULL;
+        TEST_ASSERT_EQ_I(ray_col_src_point_i64(&s, 5, &x, &err), 0);
+        ray_col_src_release(&s);
+        ray_release(col);
+    }
+    ray_release(a); ray_release(d);
+    PASS();
+}
+
 /* A chunk's descriptors are validated once per column, whichever reader
  * comes first (range reads by any scratch, materialization), not once per
  * vector; a corrupt chunk is never marked and fails every read. */
@@ -2111,6 +2400,9 @@ const test_entry_t enccol_entries[] = {
     { "enccol/decode_rejects_payload", test_decode_rejects_payload, enccol_setup, enccol_teardown },
     { "enccol/dict_once_concurrent",   test_dict_once_concurrent,   enccol_setup, enccol_teardown },
     { "enccol/fast_kernel_equal",      test_fast_kernel_equal,      enccol_setup, enccol_teardown },
+    { "enccol/point_read_equal",       test_point_read_equal,       enccol_setup, enccol_teardown },
+    { "enccol/point_read_declines",    test_point_read_declines,    enccol_setup, enccol_teardown },
+    { "enccol/point_read_column",      test_point_read_column,      enccol_setup, enccol_teardown },
     { "enccol/desc_validated_once",    test_desc_validated_once,    enccol_setup, enccol_teardown },
     { "enccol/desc_first_touch_concurrent", test_desc_first_touch_concurrent, enccol_setup, enccol_teardown },
     { "enccol/scratch_outlives_source", test_scratch_outlives_source, enccol_setup, enccol_teardown },
