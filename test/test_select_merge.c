@@ -37,6 +37,8 @@ static void materialized(const char* src, char* dst) {
 static test_result_t test_select_merge_cases(void) {
     ray_t* t = ray_eval_str("(set T (table [a b k p s text] (list [0 1 1 0 1] [1 1 0 1 1] [0 1 0 1 0] [1.0 2.0 0Nf 4.0 5.0] [' alpha beta alpha beta] [\"\" \"a\" \"b\" \"a\" \"b\"])))");
     TEST_ASSERT(t && !RAY_IS_ERR(t), "fixture"); drop(t);
+    t = ray_eval_str("(set T (take T 10000))");
+    TEST_ASSERT(t && !RAY_IS_ERR(t), "multi-morsel fixture"); drop(t);
     const struct { const char* query; bool merge; } cases[] = {
         {"{from: (select {from: T where: (== a 1)}) where: (== b 1) total: (sum p)}", true},
         {"{from: (select {from: T where: (== a 1) a:a b:b k:k p:p s:s text:text q:(* p 2)}) by:k total:(sum q)}", true},
@@ -51,8 +53,8 @@ static test_result_t test_select_merge_cases(void) {
         {"{from: (select {from: T z:p k:k}) total:(sum z)}", true},
         {"{from: (select {from: T z:p k:k}) total:(sum 'z)}", true},
         {"{from: (select {from: T k:k q:(* p 2)}) total:(sum q) desc:total take:1}", true},
-        {"{from: (select {from: T k:k q:(* p 2)}) where:(> q 3)}", true},
-        {"{from: (select {from: (select {from: T where:(== a 1)}) where:(== b 1)}) total:(sum p)}", true},
+        {"{from: (select {from: T k:k q:(* p 2)}) where:(> q 3)}", false},
+        {"{from: (select {from: (select {from: T where:(== a 1)}) where:(== b 1)}) total:(sum p)}", false},
         {"{from: (select {from: T where:(== a 1)}) p:p desc:p take:2}", true},
         /* Aggregates/windows/length changes cannot move across an outer filter. */
         {"{from: (select {from: T p:p q:(- p (avg p))}) where:(> p 1) q:q}", false},
@@ -114,7 +116,9 @@ static test_result_t test_select_merge_cases(void) {
 static test_result_t test_select_merge_scopes(void) {
     ray_t* t = ray_eval_str("(set T (table [a p] (list [0 1 1] [1.0 2.0 3.0])))");
     TEST_ASSERT(t && !RAY_IS_ERR(t), "fixture"); drop(t);
-    ray_t* dict = ray_eval_str("(quote {from: (select {from:T where:(== a 1)}) total:(sum p)})");
+    t = ray_eval_str("(set T (take T 10000))");
+    TEST_ASSERT(t && !RAY_IS_ERR(t), "multi-morsel fixture"); drop(t);
+    ray_t* dict = ray_eval_str("(quote {from: (select {from:T where:(== a 1)}) where:(> p 0) total:(sum p)})");
     TEST_ASSERT(dict && !RAY_IS_ERR(dict), "AST");
     ray_t* before = ray_ser(dict);
     const char* names[] = {"a", "p", "==", "select"};
@@ -149,8 +153,51 @@ static test_result_t test_select_merge_scopes(void) {
     PASS();
 }
 
+static test_result_t test_select_merge_review(void) {
+    ray_t* r = ray_eval_str("(set T (table [p b] (list (as 'F64 (til 20000)) (% (til 20000) 7))))");
+    TEST_ASSERT(r && !RAY_IS_ERR(r), "ramp fixture"); drop(r);
+    r = ray_eval_str("(set D (take (table [f] (list [1.7976931348623157e308 -1.7976931348623157e308 1.0])) 10002))");
+    TEST_ASSERT(r && !RAY_IS_ERR(r), "overflow fixture"); drop(r);
+    r = ray_eval_str("(set S (take T 10))");
+    TEST_ASSERT(r && !RAY_IS_ERR(r), "small fixture"); drop(r);
+    const struct { const char* query; bool merge; } cases[] = {
+        {"{from: (select {from:D c:(+ f 1e300)}) total:(sum c)}", false},
+        {"{from: (select {from:D c:(+ f 1e300)}) total:(avg c)}", false},
+        {"{from: (select {from:T where:(== b 1)}) total:(sum p)}", false},
+        {"{from: (select {from:T where:(> b 3)}) total:(count p)}", false},
+        {"{from: (select {from:T where:(> p 19990.0)}) by:b total:(sum p)}", false},
+        {"{from: (select {from:T where:(== p 15000.0)}) by:b total:(sum p)}", false},
+        {"{from: (select {from:T where:(> p 20000.0)}) by:b total:(sum p)}", false},
+        {"{from: (select {from:T where:(== p 63.0)}) by:b total:(sum p)}", true},
+        {"{from: (select {from:T where:(== p 64.0)}) by:b total:(sum p)}", false},
+        {"{from: (select {from: (select {from:T where:(> p 19990.0)}) by:b total:(sum p)}) total:total}", false},
+        {"{from: (select {from:T q0:(* p 1.0001) q1:(+ q0 q0) q2:(+ q1 q1) q3:(+ q2 q2) q4:(+ q3 q3) q5:(+ q4 q4)}) where:(> q5 1) v:q5}", false},
+        {"{from: (select {from:T q:(* p 2)}) a:q b:q}", false},
+        {"{from: (select {from:S where:(> p 1)}) take:2}", false},
+    };
+    for (size_t i = 0; i < sizeof(cases)/sizeof(cases[0]); i++) {
+        char source[4096], reference[8192];
+        snprintf(source, sizeof(source), "(quote %s)", cases[i].query);
+        ray_t* dict = ray_eval_str(source);
+        TEST_ASSERT(dict && !RAY_IS_ERR(dict), "review AST");
+        ray_t* plan = ray_select_merge_plan(dict);
+        TEST_ASSERT_FMT((plan != NULL) == cases[i].merge, "review admission case %zu", i);
+        drop(plan); drop(dict);
+        snprintf(source, sizeof(source), "(select %s)", cases[i].query);
+        materialized(source, reference);
+        ray_t* got = ray_eval_str(source), *want = ray_eval_str(reference);
+        TEST_ASSERT_FMT(got && want && !RAY_IS_ERR(got) && !RAY_IS_ERR(want), "review query case %zu", i);
+        ray_t* a = ray_ser(got), *b = ray_ser(want);
+        TEST_ASSERT(a && b && !RAY_IS_ERR(a) && !RAY_IS_ERR(b), "review serialization");
+        TEST_ASSERT_FMT(a->len == b->len && !memcmp(ray_data(a), ray_data(b), a->len), "review result case %zu", i);
+        drop(a); drop(b); drop(got); drop(want);
+    }
+    PASS();
+}
+
 const test_entry_t select_merge_entries[] = {
     {"select_merge/cases", test_select_merge_cases, setup, teardown},
     {"select_merge/scopes", test_select_merge_scopes, setup, teardown},
+    {"select_merge/review", test_select_merge_review, setup, teardown},
     {NULL, NULL, NULL, NULL},
 };

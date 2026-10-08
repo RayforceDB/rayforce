@@ -13,6 +13,11 @@
 (set N752 (table [x] (list [0Nf 1.0 2.0])))
 (at (select {from:(select {from:N752 x:x q:(- x 0.7)}) where:(== x 0Nf) s:(sum q)}) 's) -- [0.0]
 
+;; Overflow creates nulls even though the source has no HAS_NULLS flag.
+(set D754 (table [f] (list [1.7976931348623157e308 -1.7976931348623157e308 1.0])))
+(at (select {from:(select {from:D754 c:(+ f 1e300)}) total:(sum c)}) 'total) -- (at (select {from:(do (select {from:D754 c:(+ f 1e300)})) total:(sum c)}) 'total)
+(at (select {from:(select {from:D754 c:(+ f 1e300)}) total:(avg c)}) 'total) -- (at (select {from:(do (select {from:D754 c:(+ f 1e300)})) total:(avg c)}) 'total)
+
 ;; Numeric width and dropped-column errors must survive.
 (set W752 (table [x y] (list (as 'I32 [1 2 3]) [4 5 6])))
 (at (select {from:(select {from:W752 x:x}) take:2}) 'x) -- [1i 2i]

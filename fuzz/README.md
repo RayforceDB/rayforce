@@ -46,6 +46,10 @@ same queries wrapped in `do` to force inner materialization. It checks serialize
 results and error codes, allowing relative/absolute tolerance `1e-12` only for
 F64 aggregate values (fusion changes addition order). Row expressions, schema,
 order and null metadata still compare exactly.
+The generator also covers extreme F64 values and tables of 8,191, 8,192,
+16,385 and 131,073 rows. Run `RAY_FUZZ_CORES=4 make fuzz-select_merge` to
+exercise parallel execution; the default remains serial for deterministic
+coverage. `RAY_FUZZ_CORES` is read only by this fuzz driver.
 
 `fuzz-smoke` covers `parse`, `numparse`, and `de` (the fast, stateless
 targets); `eval`, `csv`, `journal`, and `select_merge` run in the nightly `fuzz-long` job

@@ -19,7 +19,7 @@ static unsigned byte(const uint8_t* data, size_t size, size_t* at) {
 
 /* Fusing a floating sum can change its addition order. Permit roundoff only
  * in the generated aggregate `total`; row expressions, schema and wire attrs
- * still compare exactly. The generator uses small finite numbers and nulls. */
+ * still compare exactly, including nulls created by extreme F64 arithmetic. */
 static bool aggregate_roundoff(ray_t* a, ray_t* b) {
     if (a->type != RAY_TABLE || b->type != RAY_TABLE ||
         ray_table_ncols(a) != ray_table_ncols(b) || ray_table_nrows(a) != ray_table_nrows(b) ||
@@ -81,7 +81,11 @@ static void query(char* out, const unsigned* choices, bool barrier) {
 }
 
 int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
-    ray_fuzz_init();
+    if (!ray_fuzz_ready && getenv("RAY_FUZZ_CORES")) {
+        setenv("RAYFORCE_CORES", getenv("RAY_FUZZ_CORES"), 1);
+        ray_runtime_create(0, NULL);
+        ray_fuzz_ready = 1;
+    } else ray_fuzz_init();
     size_t at = 0;
     unsigned choices[7];
     for (int i = 0; i < 7; i++) choices[i] = byte(data, size, &at);
@@ -103,10 +107,14 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
             } else if (col == 5) {
                 const char* str[] = {"\"\"", "\"a\"", "\"b\""};
                 pos += snprintf(src + pos, sizeof(src) - pos, "%s ", str[v % 3]);
-            } else if (v % 7 == 0) {
+            } else if (v % 7 == 0 && !(col == 3 && v >= 250 && v <= 253)) {
                 pos += snprintf(src + pos, sizeof(src) - pos, "%s ", col == 3 ? "0Nf" : "0N");
             } else if (col == 3) {
-                pos += snprintf(src + pos, sizeof(src) - pos, "%u.%u ", v % 17, (v / 17) % 10);
+                const char* edge = v == 250 ? "1.7976931348623157e308" :
+                                   v == 251 ? "-1.7976931348623157e308" :
+                                   v == 252 ? "1e300" : v == 253 ? "-1e300" : NULL;
+                if (edge) pos += snprintf(src + pos, sizeof(src) - pos, "%s ", edge);
+                else pos += snprintf(src + pos, sizeof(src) - pos, "%u.%u ", v % 17, (v / 17) % 10);
             } else {
                 pos += snprintf(src + pos, sizeof(src) - pos, "%u ", v % 3);
             }
@@ -117,6 +125,18 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     ray_t* t = ray_eval_str(src);
     if (!t || RAY_IS_ERR(t)) abort();
     drop(t);
+    /* Occasionally cross the merge threshold, morsel boundaries and the
+     * parallel dispatch threshold. A short input still controls all values. */
+    unsigned scale = choices[2] >> 4;
+    int large_rows = scale == 12 ? 8191 : scale == 13 ? 8192 :
+                     scale == 14 ? 16385 : scale == 15 ? 131073 : 0;
+    if (rows && large_rows) {
+        char grow[64];
+        snprintf(grow, sizeof(grow), "(set T (take T %d))", large_rows);
+        t = ray_eval_str(grow);
+        if (!t || RAY_IS_ERR(t)) abort();
+        drop(t);
+    }
     char optimized[4096], reference[4096];
     query(optimized, choices, false); query(reference, choices, true);
     ray_t* got = ray_eval_str(optimized), *want = ray_eval_str(reference);
@@ -137,7 +157,7 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         drop(a); drop(b);
     }
     if (!equal) {
-        fprintf(stderr, "Fixture: %s\nOptimized: %s\nReference: %s\n", src, optimized, reference);
+        fprintf(stderr, "Fixture: %s\nExpanded rows: %d\nOptimized: %s\nReference: %s\n", src, large_rows, optimized, reference);
         abort();
     }
     drop(got); drop(want);

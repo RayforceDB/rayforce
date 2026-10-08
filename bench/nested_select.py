@@ -8,10 +8,27 @@ optimizer flag. All three variants must serialize identically before timing.
 """
 import argparse
 import os
+import re
 from pathlib import Path
 import statistics
 import subprocess
 import tempfile
+
+
+def materialized(expr):
+    """Wrap every literal from/select boundary, including three-layer cases."""
+    insertions = []
+    for match in re.finditer(r"from:\s*(?=\(select)", expr):
+        start = match.end()
+        depth = 0
+        for end in range(start, len(expr)):
+            depth += (expr[end] == "(") - (expr[end] == ")")
+            if depth == 0:
+                insertions.extend(((start, "(do "), (end + 1, ")")))
+                break
+    for pos, text in sorted(insertions, reverse=True):
+        expr = expr[:pos] + text + expr[pos:]
+    return expr
 
 
 def main():
@@ -25,6 +42,7 @@ def main():
         parser.error("rows and runs must be positive")
     lines = [f"(set I (til {args.rows}))"]
     cases = []
+    check_count = 0
     for width in (4, 40):
         cols = ["a", "b", "k", "p"] + [f"c{i}" for i in range(width - 4)]
         vals = ["(% I 3)", "(% I 5)", "(% I 100)", "(as 'F64 I)"] + [f"(+ I {i})" for i in range(width - 4)]
@@ -38,17 +56,31 @@ def main():
             ("from:T where:(== a 1)", "take:10", "from:T where:(== a 1) take:10"),
             (f"from:T {identity}", "where:(== a 1) total:(sum p)",
              "from:T where:(== a 1) total:(sum p)"),
+            # Review regressions: single predicate, rare/late and absent matches.
+            ("from:T where:(== b 1)", "total:(sum p)",
+             "from:T where:(== b 1) total:(sum p)"),
+            ("from:T where:(> b 3)", "total:(count a)",
+             "from:T where:(> b 3) total:(count a)"),
+            (f"from:T where:(> p {max(0, args.rows - 10)}.0)", "total:(sum p)", None),
+            (f"from:T where:(== p {args.rows * 3 // 4}.0)", "total:(sum p)", None),
+            (f"from:T where:(> p {max(0, args.rows - 10)}.0)", "by:k total:(sum p)", None),
+            (f"from:T where:(> p {args.rows}.0)", "total:(sum p)", None),
+            (f"from:T where:(> p {args.rows}.0)", "by:k total:(sum p)", None),
+            ("from:T q0:(* p 1.0001) q1:(+ q0 q0) q2:(+ q1 q1) q3:(+ q2 q2) q4:(+ q3 q3) q5:(+ q4 q4)",
+             "where:(> q5 1) v:q5", None),
+            (f"from:(select {{from:T where:(> p {max(0, args.rows - 10)}.0)}}) by:k total:(sum p)",
+             "total:total", None),
         ]
         for number, (inner, outer, flat) in enumerate(shapes, 1):
             tag = f"{width}/S{number}"
-            variants = {
-                "materialized": f"(select {{from:(do (select {{{inner}}})) {outer}}})",
-                "nested": f"(select {{from:(select {{{inner}}}) {outer}}})",
-                "manual": f"(select {{{flat}}})",
-            }
+            nested = f"(select {{from:(select {{{inner}}}) {outer}}})"
+            variants = {"materialized": materialized(nested), "nested": nested}
+            if flat is not None:
+                variants["manual"] = f"(select {{{flat}}})"
             for name, expr in variants.items():
                 lines.append(f"(set B_{name} (ser {expr}))")
-            for name in ("nested", "manual"):
+            for name in list(variants)[1:]:
+                check_count += 1
                 lines.append(f'(println "CHECK {tag} {name} %" (if (== (count B_materialized) (count B_{name})) (all (== B_materialized B_{name})) false))')
             for expr in variants.values():
                 lines.append(f"(timeit {expr})")
@@ -60,12 +92,17 @@ def main():
     lines.append("(exit 0)")
     with tempfile.TemporaryDirectory(prefix="ray-nested-select-") as tmp:
         script = Path(tmp) / "bench.rfl"
-        script.write_text("\n".join(lines) + "\n")
+        # Keep the expanded matrix below the parser's top-level expression limit.
+        script.write_text("\n".join(
+            "(do\n" + "\n".join(lines[i:i + 64]) + "\n)"
+            for i in range(0, len(lines), 64)) + "\n")
         result = subprocess.run([str(Path(args.binary).resolve()), str(script)],
                                 env={**os.environ, "RAYFORCE_CORES": str(args.cores)},
-                                capture_output=True, text=True, check=True)
+                                capture_output=True, text=True)
+    if result.returncode:
+        raise RuntimeError(f"benchmark failed:\n{result.stdout}\n{result.stderr}")
     checks = [line for line in result.stdout.splitlines() if line.startswith("CHECK ")]
-    if len(checks) != len(cases) * 2 or any(not line.endswith("true") for line in checks):
+    if len(checks) != check_count or any(not line.endswith("true") for line in checks):
         raise RuntimeError(f"serialized results differ or benchmark failed:\n{result.stdout}\n{result.stderr}")
     times = {}
     for line in result.stdout.splitlines():
@@ -76,11 +113,12 @@ def main():
     print("| Columns/shape | Materialized ms | Nested ms | Manual ms | Speedup |")
     print("|---|---:|---:|---:|---:|")
     for case in cases:
-        values = [times[(case, name)] for name in ("materialized", "nested", "manual")]
+        values = [times[(case, name)] for name in ("materialized", "nested")]
         if any(len(v) != args.runs for v in values):
             raise RuntimeError("incomplete timing output")
-        old, new, manual = map(statistics.median, values)
-        print(f"| {case} | {old:.4f} | {new:.4f} | {manual:.4f} | {old / new:.2f}x |")
+        old, new = map(statistics.median, values)
+        manual = f"{statistics.median(times[(case, 'manual')]):.4f}" if (case, "manual") in times else "—"
+        print(f"| {case} | {old:.4f} | {new:.4f} | {manual} | {old / new:.2f}x |")
 
 
 if __name__ == "__main__":
