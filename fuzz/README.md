@@ -52,15 +52,18 @@ exercise parallel execution; the default remains serial for deterministic
 coverage. `RAY_FUZZ_CORES` is read only by this fuzz driver. The generator
 includes products of two independent F64 columns, squares, nested products,
 and scalar/grouped reductions. PR CI runs this target for one minute each in
-serial and four-worker modes; its nightly campaign uses four workers.
+serial and four-worker modes, each with a fresh corpus and the committed seeds.
+This leaves time for mutations instead of spending the whole short run replaying
+the growing cache. Its nightly campaign uses four workers and a cached corpus.
 
 `fuzz-smoke` covers `parse`, `numparse`, and `de` (the fast, stateless
 targets); `eval`, `csv`, `journal`, and `select_merge` run in the nightly `fuzz-long` job
 (`.github/workflows/nightly.yml`), 15 minutes each over a cached corpus.
 
-Grown corpora live in `fuzz/corpus/<target>/` (gitignored); committed starter
-inputs live in `fuzz/seeds/<target>/`.  Regenerate the working corpora from the
-test suite before a session:
+Grown corpora live in `fuzz/corpus/<target>/` (gitignored); override the root with
+`FUZZ_CORPUS_ROOT=/path/to/corpus` to use a separate working corpus. Committed
+starter inputs in `fuzz/seeds/<target>/` are included with either root.
+Regenerate the working corpora from the test suite before a session:
 
 ```sh
 scripts/fuzz-seed-parse.sh      # parse/eval inputs from test/rfl

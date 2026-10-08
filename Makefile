@@ -376,6 +376,7 @@ compdb:
 # The system toolchain on macOS does not ship the fuzzer runtime, so
 # these targets are Linux-only by design; CI gates them to ubuntu.
 FUZZ_RUNTIME ?= 60
+FUZZ_CORPUS_ROOT ?= fuzz/corpus
 FUZZ_OPTS     = -rss_limit_mb=4096 -timeout=10 -max_len=65536 -print_final_stats=1
 FUZZ_TARGETS  = parse numparse de eval csv journal parquet select_merge
 # Escape hatch for hosts where clang auto-selects a gcc toolchain dir that
@@ -406,14 +407,14 @@ build_fuzz/fuzz_%: fuzz/fuzz_%.c $(FUZZ_LIB_OBJ)
 .PRECIOUS: build_fuzz/fuzz_%
 
 fuzz-%: build_fuzz/fuzz_%
-	@mkdir -p fuzz/corpus/$*
+	@mkdir -p "$(FUZZ_CORPUS_ROOT)/$*"
 	@dict=$(DICT_$*); \
 	 dictopt=$${dict:+-dict=fuzz/dict/$$dict.dict}; \
 	 seeds=$$( [ -d fuzz/seeds/$* ] && echo fuzz/seeds/$* ); \
 	 set -x; \
 	 ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 \
 	 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
-	   ./build_fuzz/fuzz_$* fuzz/corpus/$* $$seeds \
+	   ./build_fuzz/fuzz_$* "$(FUZZ_CORPUS_ROOT)/$*" $$seeds \
 	   $$dictopt $(FUZZ_OPTS) -max_total_time=$(FUZZ_RUNTIME)
 
 # Short smoke pass for PR CI — a healthy corpus finds nothing new in a
