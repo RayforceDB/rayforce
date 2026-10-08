@@ -1834,13 +1834,14 @@ bool ray_col_cold(ray_t* col) {
 }
 
 void ray_col_want_row(ray_t* col, int64_t row) {
+    if (!ray_pool_scan_on()) return;
     size_t esz = ray_sym_elem_size(col->type, col->attrs);
     ray_vm_advise_willneed((uint8_t*)ray_data(col) + (size_t)row * esz, esz);
 }
 
 void ray_col_want_rows(ray_t* col, const int64_t* idx, int64_t n) {
     size_t esz = col_fixed_esz(col);
-    if (!esz || n <= 0) return;
+    if (!esz || n <= 0 || !ray_pool_scan_on()) return;
     const uint8_t* base = (const uint8_t*)ray_data(col);
     /* A few rows: the first one's page stands for the column (one probe);
      * more: a sample of the column's pages. */

@@ -230,8 +230,9 @@ void ray_pool_scan_col_at(const void* col, int64_t nrows, int64_t r, int64_t end
  * have its tasks report positions in that column (ray_pool_scan_col_at). */
 bool ray_pool_scan_holds(const void* col, int64_t nrows);
 
-/* Read-ahead is on (RAY_SCAN_PREFETCH is not 0).  For requests made outside
- * the per-dispatch windows, which honour the same switch. */
+/* Read-ahead is on (RAY_SCAN_PREFETCH unset, or a positive number of KiB).
+ * For requests made outside the per-dispatch windows, which honour the same
+ * switch. */
 bool ray_pool_scan_on(void);
 
 /* Ask for [p, p+bytes) of a file mapping (ray_vm_advise_willneed), with the

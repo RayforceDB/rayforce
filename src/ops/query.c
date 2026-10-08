@@ -9265,6 +9265,7 @@ static void select_scan_want_range(uintptr_t a, uintptr_t b, uintptr_t* lo, uint
  * the rows selected by `sel` fall on, adjacent pages as one range. */
 static void select_scan_want_selected(const uint8_t* base, size_t esz, int64_t rows,
                                       ray_t* sel) {
+    if (!ray_pool_scan_on()) return;
     ray_rowsel_t* m = ray_rowsel_meta(sel);
     const uint8_t* fl = ray_rowsel_flags(sel);
     const uint32_t* off = ray_rowsel_offsets(sel);

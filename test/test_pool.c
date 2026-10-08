@@ -2165,6 +2165,12 @@ static long pq_majflt(void) {
 }
 
 static test_result_t test_scan_read_ahead_queries(void) {
+    char prev_prefetch[32] = "";
+    bool prefetch_off = false;
+    {
+        const char* e = getenv("RAY_SCAN_PREFETCH");
+        if (e) snprintf(prev_prefetch, sizeof(prev_prefetch), "%s", e);
+    }
     ray_runtime_t* rt = ray_runtime_create(0, NULL);
     TEST_ASSERT_NOT_NULL(rt);
     uint32_t cores = ray_pool_total_workers(ray_pool_get());
@@ -2247,7 +2253,44 @@ static test_result_t test_scan_read_ahead_queries(void) {
         goto out;
     }
 
+    /* RAY_SCAN_PREFETCH=0: nothing is asked for, so each page a query reads
+     * is faulted in by the query itself.  The filter keeps one row in 4096,
+     * each on its own page of w, which w's held-back read would ask for; a
+     * per-group distinct count samples 1024 rows of its value column first
+     * (all of x but the 128 pages opening it read). */
+    {
+        static const struct { const char* col; const char* query; const char* pass; long pages; } off[] = {
+            { "w", "(count (select {from: M s: (sum w) by: g where: (== (% v 4096) 7)}))",
+              "held-back column", 256 },
+            { "x", "(count (select {from: M c: (count (distinct x)) by: g}))",
+              "distinct-count sample", 1920 },
+        };
+        setenv("RAY_SCAN_PREFETCH", "0", 1);
+        prefetch_off = true;
+        ray_pool_destroy();
+        for (size_t i = 0; i < sizeof(off) / sizeof(off[0]); i++) {
+            if ((rc = pq_open_cold(off[i].col, &p, &n))) {
+                res = rc > 0 ? (test_result_t){ TEST_SKIP, "page cache eviction has no effect here" }
+                             : (test_result_t){ TEST_FAIL, "open" };
+                goto out;
+            }
+            long before = pq_majflt();
+            if (!pq_ok(off[i].query)) { res = (test_result_t){ TEST_FAIL, off[i].query }; goto out; }
+            long faults = pq_majflt() - before;
+            if (faults < off[i].pages * 3 / 4) {
+                snprintf(msg, sizeof(msg), "%s asked for pages with read-ahead off: %ld major faults over %ld pages read of %s",
+                         off[i].pass, faults, off[i].pages, off[i].col);
+                res = (test_result_t){ TEST_FAIL, msg };
+                goto out;
+            }
+        }
+    }
+
 out:
+    if (prefetch_off) {
+        if (prev_prefetch[0]) setenv("RAY_SCAN_PREFETCH", prev_prefetch, 1);
+        else unsetenv("RAY_SCAN_PREFETCH");
+    }
     pq_ok("(set M 0)");
     pq_rm(PQ_DIR);
     ray_runtime_destroy(rt);

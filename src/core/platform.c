@@ -45,6 +45,10 @@
 #if defined(RAY_OS_MACOS)
 #include <sys/sysctl.h>   /* sysctlbyname — hw.physicalcpu */
 #endif
+#if defined(RAY_OS_LINUX)
+#include <dirent.h>       /* /sys/block — the read-ahead caps */
+#include <stdatomic.h>
+#endif
 #include "mem/sys.h"
 
 /* --------------------------------------------------------------------------
@@ -122,13 +126,62 @@ static size_t vm_page_size(void) {
     return pg;
 }
 
+#if defined(RAY_OS_LINUX)
+/* A block device's queue attribute in KiB, -1 when it cannot be read. */
+static long vm_queue_kb(const char* dev, const char* attr) {
+    char path[320], buf[32];
+    snprintf(path, sizeof(path), "/sys/block/%s/queue/%s", dev, attr);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    buf[n] = 0;
+    return strtol(buf, NULL, 10);
+}
+#endif
+
+/* Bytes one WILLNEED is asked for at a time.  Linux reads at most
+ * max(read_ahead_kb, max_sectors_kb) of the file's device per call, and a
+ * longer step would leave the rest of it unread: so the smallest such cap
+ * of the block devices, within [32 KiB, 256 KiB]; 128 KiB, the kernel's
+ * default read-ahead, when none can be read or elsewhere. */
+static size_t vm_willneed_step(void) {
+#if defined(RAY_OS_LINUX)
+    static _Atomic(size_t) cached = 0;
+    size_t step = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (step) return step;
+    DIR* d = opendir("/sys/block");
+    if (d) {
+        struct dirent* e;
+        while ((e = readdir(d))) {
+            if (e->d_name[0] == '.') continue;
+            long ra = vm_queue_kb(e->d_name, "read_ahead_kb");
+            long mx = vm_queue_kb(e->d_name, "max_sectors_kb");
+            long cap = ra > mx ? ra : mx;
+            if (cap > 0 && (!step || ((size_t)cap << 10) < step)) step = (size_t)cap << 10;
+        }
+        closedir(d);
+    }
+    if (!step) step = (size_t)128 << 10;
+    if (step < ((size_t)32 << 10)) step = (size_t)32 << 10;
+    if (step > ((size_t)256 << 10)) step = (size_t)256 << 10;
+    step &= ~(vm_page_size() - 1);
+    if (step < vm_page_size()) step = vm_page_size();   /* pages above 32 KiB */
+    atomic_store_explicit(&cached, step, memory_order_relaxed);
+    return step;
+#else
+    return (size_t)128 << 10;
+#endif
+}
+
 void ray_vm_advise_willneed(void* ptr, size_t size) {
     if (!ptr || !size) return;
-    /* madvise wants a page-aligned start.  One WILLNEED reads at most a
-     * readahead window (Linux caps it at max(io_pages, ra_pages)), so a
-     * large range is requested window by window: each call only queues its
-     * reads, so the windows are all in flight together. */
-    const size_t chunk = (size_t)256 << 10;
+    /* madvise wants a page-aligned start.  One WILLNEED reads at most what
+     * the device allows per call (vm_willneed_step), so a large range is
+     * requested step by step: each call only queues its reads, so the steps
+     * are all in flight together. */
+    const size_t chunk = vm_willneed_step();
     uintptr_t a = (uintptr_t)ptr & ~(uintptr_t)(vm_page_size() - 1);
     uintptr_t end = (uintptr_t)ptr + size;
     for (; a < end; a += chunk)

@@ -1094,7 +1094,13 @@ bool ray_pool_scan_holds(const void* col, int64_t nrows) {
     return g_pool.scan_bytes && pool_scan_col_bit(t_scan, col, nrows);
 }
 
-bool ray_pool_scan_on(void) { return g_pool.scan_bytes != 0; }
+bool ray_pool_scan_on(void) {
+    if (atomic_load_explicit(&g_pool_init_state, memory_order_acquire) == 2)
+        return g_pool.scan_bytes != 0;
+    /* no pool yet: the switch as the pool will read it */
+    const char* e = getenv("RAY_SCAN_PREFETCH");
+    return !(e && *e && strtol(e, NULL, 10) <= 0);
+}
 
 /* Asking for a range costs the caller about a microsecond a page: the
  * kernel allocates and queues each page before the call returns.  A large
