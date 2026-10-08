@@ -46,6 +46,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <stdatomic.h>
 
 #define TMP_DOM_SYM_PATH "/tmp/rayforce_test_domain_sym"
 #define TMP_DOM_COL_PATH "/tmp/rayforce_test_domain_col"
@@ -2191,8 +2192,159 @@ static test_result_t test_domain_private(void) {
     ray_release(v);
     PASS();
 }
+
+/* ray_sym_domain_flush_append: a symfile grown in three appends (the first
+ * creating it, the last with nothing new but syncing) holds exactly the
+ * bytes one ray_sym_domain_flush of the same vocabulary writes, reopens
+ * with every position, and a file changed behind the domain's back is
+ * refused as another writer. */
+static bool dom_file_bytes(const char* path, uint8_t** out, long* n) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return false;
+    fseek(f, 0, SEEK_END); *n = ftell(f); fseek(f, 0, SEEK_SET);
+    *out = (uint8_t*)ray_sys_alloc((size_t)*n + 1);
+    bool ok = *out && fread(*out, 1, (size_t)*n, f) == (size_t)*n;
+    fclose(f);
+    return ok;
+}
+static test_result_t test_domain_flush_append(void) {
+    const char* pa = TMP_DOM_SYM_PATH "_app";
+    const char* pb = TMP_DOM_SYM_PATH "_one";
+    char buf[64];
+    for (int k = 0; k < 2; k++) {
+        const char* p = k ? pb : pa;
+        unlink(p);
+        snprintf(buf, sizeof(buf), "%s.lk", p); unlink(buf);
+    }
+    ray_sym_domain_t* a = ray_sym_domain_open_or_create(pa);
+    ray_sym_domain_t* b = ray_sym_domain_open_or_create(pb);
+    TEST_ASSERT_NOT_NULL(a); TEST_ASSERT_NOT_NULL(b);
+    for (int round = 0; round < 3; round++) {
+        int n = round == 2 ? 0 : 500 + 300 * round;
+        for (int i = 0; i < n; i++) {
+            int l = snprintf(buf, sizeof(buf), "r%d-%d%s", round, i, i % 7 ? "" : "-a-longer-string");
+            TEST_ASSERT_TRUE(ray_sym_domain_intern(a, buf, (size_t)l) >= 0);
+            TEST_ASSERT_TRUE(ray_sym_domain_intern(b, buf, (size_t)l) >= 0);
+        }
+        TEST_ASSERT_EQ_I(ray_sym_domain_flush_append(a, round == 2), RAY_OK);
+    }
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush(b, true), RAY_OK);
+    uint8_t *fa = NULL, *fb = NULL; long na = 0, nb = 0;
+    TEST_ASSERT_TRUE(dom_file_bytes(pa, &fa, &na));
+    TEST_ASSERT_TRUE(dom_file_bytes(pb, &fb, &nb));
+    TEST_ASSERT_EQ_I(na, nb);
+    TEST_ASSERT_EQ_I(memcmp(fa, fb, (size_t)na), 0);
+    ray_sys_free(fa); ray_sys_free(fb);
+    int64_t count = ray_sym_domain_count(a);
+
+    /* another writer: the file is no longer the persisted prefix */
+    FILE* f = fopen(pa, "ab");
+    TEST_ASSERT_NOT_NULL(f);
+    fputc(0, f); fclose(f);
+    TEST_ASSERT_TRUE(ray_sym_domain_intern(a, "late", 4) >= 0);
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush_append(a, false), RAY_ERR_CORRUPT);
+    ray_sym_domain_release(a);
+    ray_sym_domain_release(b);
+
+    ray_sym_domain_t* re = ray_sym_domain_open(pb);
+    TEST_ASSERT_NOT_NULL(re);
+    TEST_ASSERT_EQ_I(ray_sym_domain_count(re), count);
+    TEST_ASSERT_EQ_I(ray_sym_domain_find(re, "r1-799", 6) >= 0, 1);
+    ray_sym_domain_release(re);
+    for (int k = 0; k < 2; k++) {
+        const char* p = k ? pb : pa;
+        unlink(p);
+        snprintf(buf, sizeof(buf), "%s.lk", p); unlink(buf);
+    }
+    PASS();
+}
+
+/* ray_sym_domain_create_import: on an 8-worker pool, 32 tasks intern the
+ * same 200K strings in the same order at once (every miss is raced), then
+ * each its own slice of 3M more, so shard tables and the mapped file both
+ * grow past their first size.  A string gets one position whoever adds it,
+ * "" is position 0, the count is the distinct strings plus one, and after
+ * the durable flush the file reopens as an ordinary domain with every
+ * string at its position. */
+#define IMP_SHARED 200000
+#define IMP_OWN    3000000
+#define IMP_N      (IMP_SHARED + IMP_OWN)
+#define IMP_TASKS  32
+typedef struct { ray_sym_domain_t* dom; int64_t* pos; _Atomic(int) bad; } imp_ctx_t;
+static int imp_str(int64_t i, char* buf) { return snprintf(buf, 32, "import-%lld-%c", (long long)i, (char)('a' + i % 26)); }
+static void imp_range(imp_ctx_t* c, int64_t s, int64_t e) {
+    enum { B = 512 };
+    char bufs[B][32]; const char* strs[B]; size_t lens[B]; uint32_t hs[B]; int64_t out[B];
+    for (int64_t i = s; i < e; i += B) {
+        int64_t n = e - i < B ? e - i : B;
+        for (int64_t j = 0; j < n; j++) {
+            lens[j] = (size_t)imp_str(i + j, bufs[j]); strs[j] = bufs[j];
+            hs[j] = (uint32_t)ray_hash_bytes(strs[j], lens[j]);
+        }
+        if (!ray_sym_domain_intern_batch(c->dom, n, strs, lens, hs, out)) { atomic_store(&c->bad, 1); return; }
+        for (int64_t j = 0; j < n; j++) {
+            int64_t prev = 0;
+            if (!atomic_compare_exchange_strong((_Atomic(int64_t)*)&c->pos[i + j], &prev, out[j]) && prev != out[j])
+                atomic_store(&c->bad, 1);
+        }
+    }
+}
+static void imp_task(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid; (void)end;
+    imp_ctx_t* c = (imp_ctx_t*)raw;
+    imp_range(c, 0, IMP_SHARED);
+    int64_t per = IMP_OWN / IMP_TASKS;
+    imp_range(c, IMP_SHARED + start * per, IMP_SHARED + (start + 1) * per);
+}
+static test_result_t test_domain_import_dict(void) {
+    const char* p = TMP_DOM_SYM_PATH "_imp";
+    unlink(p);
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(8), RAY_OK);
+    ray_pool_t* pool = ray_pool_get();
+    ray_sym_domain_t* dom = ray_sym_domain_create_import(p);
+    if (!dom) { ray_pool_destroy(); SKIP("import dictionary unsupported here"); }
+    TEST_ASSERT_EQ_I(ray_sym_domain_count(dom), 1);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom, "", 0), 0);
+    imp_ctx_t ctx = { dom, (int64_t*)ray_sys_alloc((size_t)IMP_N * sizeof(int64_t)), 0 };
+    TEST_ASSERT_NOT_NULL(ctx.pos);
+    memset(ctx.pos, 0, (size_t)IMP_N * sizeof(int64_t));
+    if (pool && pool->n_workers > 0) ray_pool_dispatch_n(pool, imp_task, &ctx, IMP_TASKS);
+    else for (int t = 0; t < IMP_TASKS; t++) imp_task(&ctx, 0, t, t + 1);
+    TEST_ASSERT_EQ_I(atomic_load(&ctx.bad), 0);
+    TEST_ASSERT_EQ_I(ray_sym_domain_count(dom), IMP_N + 1);
+    /* one more append and its single-string intern agree */
+    int64_t z = ray_sym_domain_intern(dom, "late-one", 8);
+    TEST_ASSERT_EQ_I(z, IMP_N + 1);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom, "late-one", 8), z);
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush(dom, true), RAY_OK);
+    ray_sym_domain_release(dom);
+
+    ray_sym_domain_t* re = ray_sym_domain_open(p);
+    TEST_ASSERT_NOT_NULL(re);
+    TEST_ASSERT_EQ_I(ray_sym_domain_count(re), IMP_N + 2);
+    int64_t bad = 0;
+    char buf[32];
+    for (int64_t i = 0; i < IMP_N; i += 997) {
+        int l = imp_str(i, buf);
+        ray_t* s = ray_sym_domain_str(re, ctx.pos[i]);
+        if (!s || ray_str_len(s) != (size_t)l || memcmp(ray_str_ptr(s), buf, (size_t)l)) bad++;
+        if (ray_sym_domain_find(re, buf, (size_t)l) != ctx.pos[i]) bad++;
+    }
+    TEST_ASSERT_EQ_I(bad, 0);
+    TEST_ASSERT_EQ_I(ray_sym_domain_find(re, "", 0), 0);
+    TEST_ASSERT_EQ_I(ray_sym_domain_find(re, "late-one", 8), IMP_N + 1);
+    ray_sym_domain_release(re);
+    ray_sys_free(ctx.pos);
+    ray_pool_destroy();
+    unlink(p);
+    unlink(TMP_DOM_SYM_PATH "_imp.lk");
+    PASS();
+}
 const test_entry_t domain_entries[] = {
     { "domain/private", test_domain_private, domain_setup, domain_teardown },
+    { "domain/flush_append", test_domain_flush_append, domain_setup, domain_teardown },
+    { "domain/import_dict", test_domain_import_dict, domain_setup, domain_teardown },
     { "domain/runtime_identity",        test_domain_runtime_identity,        domain_setup, domain_teardown },
     { "domain/runtime_delegation",      test_domain_runtime_delegation,      domain_setup, domain_teardown },
     { "domain/vec_new_attach",          test_domain_vec_new_attach,          domain_setup, domain_teardown },

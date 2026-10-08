@@ -1908,6 +1908,18 @@ static void pq_write_direct_group(void* ptr, uint32_t worker, int64_t start, int
     }
 }
 
+/* While the passes run, a background thread appends the file domain's new
+ * entries to the symbol file every quarter second (and starts their
+ * writeback), so the final flush writes only the tail and its sync finds
+ * the rest on disk. */
+typedef struct { ray_sym_domain_t* dom; _Atomic(bool) stop; ray_err_t err; } pq_symflush_t;
+static void pq_symflush_fn(void* arg) {
+    pq_symflush_t* s = arg;
+    while (!atomic_load_explicit(&s->stop,memory_order_acquire) && s->err == RAY_OK) {
+        s->err = ray_sym_domain_flush_append(s->dom,false);
+        ray_sleep_ms(250);
+    }
+}
 /* The import runs in passes, each decoding some columns' chunks from every
  * row group in parallel.  When memory is short next to the output it goes
  * column by column (a pass is one column, or a few when the file has fewer
@@ -1931,6 +1943,9 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
     int64_t* order = ray_alloc_raw((size_t)r->ncols*sizeof(*order));
     _Atomic uint8_t* prefetched = NULL;
     ray_t* err = NULL;
+    pq_symflush_t symf = {NULL,false,RAY_OK};
+    ray_thread_t sym_thread = 0;
+    bool sym_running = false;
     if (!offsets || !nulls || !locks || !errors || !lo || !hi || !bytes || !order) { err = ray_error("oom",NULL); goto done; }
     for (int64_t c = 0; c < r->ncols; c++) {
         size_t size = writers[c].type == RAY_SYM ? 4 : ray_elem_size(writers[c].type);
@@ -2004,6 +2019,10 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
      * overlaps. */
     int64_t sym_width = ram > 0 && 2*ram >= out_bytes ? r->ncols - nnum : 1;
     if (sym_width < 1) sym_width = 1;
+    if (nnum < r->ncols && writers[order[nnum]].dom) {
+        symf.dom = writers[order[nnum]].dom;
+        if (ray_thread_create(&sym_thread,pq_symflush_fn,&symf) == RAY_OK) sym_running = true;
+    }
     for (int64_t p = 0; p < r->ncols && !err; p += work.npass) {
         bool all = width >= r->ncols;
         int64_t wd = all ? r->ncols : p < nnum ? width : sym_width;
@@ -2040,6 +2059,11 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
                     (double)(t1-t0)/1e6,(double)(ray_profile_now_ns()-t1)/1e6);
         }
     }
+    if (sym_running) {
+        atomic_store_explicit(&symf.stop,true,memory_order_release);
+        ray_thread_join(sym_thread);
+        if (!err && symf.err != RAY_OK) err = ray_error(ray_err_code_str(symf.err),"parquet: cannot flush symbol file");
+    }
 done:
     for (int64_t c = 0; c < r->ncols; c++) r->schema[c].import_domain = NULL;
     ray_free_raw(offsets); ray_free_raw(nulls); ray_free_raw(locks); ray_free_raw(errors);
@@ -2067,7 +2091,13 @@ ray_t* ray_parquet_splayed_typed(const char* path, const char* dir, ray_t* types
     if (!writers) { err = ray_error("oom",NULL); goto done; }
     for (int64_t c = 0; c < r->ncols; c++) if (r->schema[c].native_symbol && !domain) {
         snprintf(file,sizeof(file),"%s/.sym",staging);
-        domain = ray_sym_domain_open_or_create(file);
+        /* The direct import (no STR column) builds the symbol file with the
+         * import dictionary: strings go straight into the mapped file. */
+        bool str_cols = false;
+        for (int64_t k = 0; k < r->ncols; k++)
+            if (!r->schema[k].native_symbol && r->schema[k].type == RAY_STR) str_cols = true;
+        if (!str_cols) domain = ray_sym_domain_create_import(file);
+        if (!domain) domain = ray_sym_domain_open_or_create(file);
         if (!domain) { err = ray_error("oom",NULL); goto done; }
         if (ray_sym_domain_intern(domain,"",0) != 0) { err = pq_error("cannot initialize native symbol domain"); goto done; }
     }
@@ -2119,7 +2149,9 @@ ray_t* ray_parquet_splayed_typed(const char* path, const char* dir, ray_t* types
     if (!pq_remove_dir(spool)) { e = RAY_ERR_IO; goto io_fail; }
 finish_columns:
     if (trace) { fprintf(stderr,"parquet phase: passes=%.1fms\n",(double)(ray_profile_now_ns()-tp)/1e6); tp = ray_profile_now_ns(); }
-    if (domain) { e = ray_sym_domain_flush(domain,true); if (e != RAY_OK) goto io_fail; }
+    /* the direct import appended the symbols as they came: this writes
+     * what is left and syncs the file */
+    if (domain) { e = ray_sym_domain_flush_append(domain,true); if (e != RAY_OK) goto io_fail; }
     if (trace) { fprintf(stderr,"parquet phase: sym flush=%.1fms\n",(double)(ray_profile_now_ns()-tp)/1e6); tp = ray_profile_now_ns(); }
     /* All columns are still under a private staging directory (the direct
      * import has already closed its numeric columns and built their hash
