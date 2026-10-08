@@ -146,10 +146,13 @@ Functions that take other functions as arguments.
 
 Operations on vectors as collections.
 
+Outside queries, `in` matches null to null and `not-in` is its logical complement. Inside query expressions, null input rows return `false` for both operations and null set elements are ignored, whether the expression runs through a query plan or the evaluator.
+
 | Function | Type | Description | Example |
 |---|---|---|---|
 | `distinct` | unary | Remove duplicates | `(distinct [1 2 2 3])` → `[1 2 3]` |
 | `in` | binary | Membership test (element in vector) | `(in 2 [1 2 3])` → `true` |
+| `not-in` | binary | Negated membership test | `(not-in 2 [1 3])` → `true` |
 | `except` | binary | Set difference | `(except [1 2 3] [2])` → `[1 3]` |
 | `union` | binary | Set union | `(union [1 2] [2 3])` → `[1 2 3]` |
 | `sect` | binary | Set intersection | `(sect [1 2 3] [2 3 4])` → `[2 3]` |

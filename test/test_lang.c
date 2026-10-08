@@ -1561,6 +1561,17 @@ static test_result_t test_eval_pivot_multi_index(void) {
     PASS();
 }
 
+static test_result_t test_eval_zone_sym_diagnostic(void) {
+    ray_t* r = ray_eval_str("(.idx.zone ['a 'b])");
+    TEST_ASSERT(r && RAY_IS_ERR(r), "SYM zone index remains unsupported");
+    TEST_ASSERT_STR_EQ(ray_err_code(r), "nyi");
+    TEST_ASSERT_NOT_NULL(ray_error_msg());
+    TEST_ASSERT_STR_EQ(ray_error_msg(),
+                      "zone: only numeric/temporal vectors supported (got type 12)");
+    ray_release(r);
+    PASS();
+}
+
 static test_result_t test_eval_select_where_in_sym_vs_atom_mismatch(void) {
     /* Intern the probe sym so we know its numeric ID, then embed
      * that ID as a decimal literal in the source string so the i64
@@ -9924,6 +9935,7 @@ const test_entry_t lang_entries[] = {
     { "lang/temporal/extract_epoch",            test_temporal_extract_epoch,            lang_setup, lang_teardown },
     { "lang/temporal/date_trunc_month_case",    test_temporal_date_trunc_month_case,    lang_setup, lang_teardown },
 
+    { "lang/zone_sym_diagnostic", test_eval_zone_sym_diagnostic, lang_setup, lang_teardown },
     { "lang/io/read_procfs_zero_size", test_read_procfs_reports_zero_size, lang_setup, lang_teardown },
     { "lang/io/read_unsized_bounded", test_read_unsized_stream_is_bounded, lang_setup, lang_teardown },
     { "lang/io/exec_capture_bounded", test_exec_capture_is_bounded, lang_setup, lang_teardown },

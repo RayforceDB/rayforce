@@ -1,0 +1,16 @@
+;; @requires: posix (fixture cleanup via .sys.exec)
+;; Query fallback must preserve membership semantics across symbol domains.
+(.sys.exec "rm -rf /tmp/rfl_membership_fallback") -- 0
+(set T (table [s x] (list (as 'SYM (list "a" "" "b")) [1 0Nl 2])))
+(.db.splayed.set "/tmp/rfl_membership_fallback/1/t/" T)
+(.db.splayed.set "/tmp/rfl_membership_fallback/2/t/" T)
+(set U (.db.splayed.get "/tmp/rfl_membership_fallback/1/t/"))
+(set P (.db.parted.get "/tmp/rfl_membership_fallback/" 't))
+(at (select {from: U where: (in s (as 'SYM (list "a" "")))}) 'x) -- [1]
+(at (select {from: U where: (not-in s (as 'SYM (list "a" "")))}) 'x) -- [2]
+(at (select {from: U where: (not-in s (as 'SYM (list "zz")))}) 'x) -- [1 2]
+(at (select {v: (not-in s (as 'SYM (list "a" ""))) from: U}) 'v) -- [false false true]
+(at (select {from: P where: (in s (as 'SYM (list "a" "")))}) 'x) -- [1 1]
+(at (select {from: P where: (not-in s (as 'SYM (list "a" "")))}) 'x) -- [2 2]
+(at (select {v: (not-in s (as 'SYM (list "a" ""))) from: P}) 'v) -- [false false true false false true]
+(.sys.exec "rm -rf /tmp/rfl_membership_fallback") -- 0

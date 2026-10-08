@@ -1,0 +1,39 @@
+;; Membership must give the same query result for a bound probe (DAG) and
+;; an inline constructor (interpreter), including nulls on either side.
+(set T (table [s x k] (list (as 'SYM (list "a" "" "b" "a" "" "c")) [1 0Nl 2 1 0Nl 3] [0 0 0 1 1 1])))
+(set NA (as 'SYM (list "" "a")))
+(at (select {from: T where: (in s NA)}) 'x) -- [1 1]
+(at (select {from: T where: (in s (as 'SYM (list "" "a")))}) 'x) -- [1 1]
+(at (select {from: T where: (not-in s NA)}) 'x) -- [2 3]
+(at (select {from: T where: (not-in s (as 'SYM (list "" "a")))}) 'x) -- [2 3]
+(at (select {from: T where: (not-in s (as 'SYM (list "")))}) 'x) -- [1 2 1 3]
+(at (select {from: T where: (not-in s (as 'SYM (list)))}) 'x) -- [1 2 1 3]
+(at (select {from: T where: (not-in s (as 'SYM (list "zz")))}) 'x) -- [1 2 1 3]
+(count (select {from: T where: (in s (as 'SYM (list "")))})) -- 0
+(count (select {from: T where: (in s (as 'SYM (list "" "a")))})) -- 2
+(count (select {from: T where: (not-in s (as 'SYM (list "" "a")))})) -- 2
+
+;; Per-row projection, grouped filtering, and update filtering use the same rule.
+(at (select {v: (in s (as 'SYM (list "" "a"))) from: T}) 'v) -- [true false false true false false]
+(at (select {v: (not-in s (as 'SYM (list "" "a"))) from: T}) 'v) -- [false false true false false true]
+(sum (at (select {n: (count x) by: k from: T where: (in s (as 'SYM (list "" "a")))}) 'n)) -- 2
+(sum (at (select {n: (count x) by: k from: T where: (not-in s (as 'SYM (list "" "a")))}) 'n)) -- 2
+(at (update {x: 9 from: T where: (not-in s (as 'SYM (list "" "a")))}) 'x) -- [1 0Nl 9 1 0Nl 9]
+(at (update {x: 9 from: T where: (in s (as 'SYM (list "" "a")))}) 'x) -- [9 0Nl 2 9 0Nl 3]
+
+;; Numeric nulls and a boxed probe use the same query contract.
+(at (select {from: T where: (in x (list 0Nl 1))}) 'x) -- [1 1]
+(at (select {from: T where: (not-in x (list 0Nl 1))}) 'x) -- [2 3]
+(at (select {v: (not-in x (list 0Nl 1)) from: T}) 'v) -- [false false true false false true]
+(set Empty (table [s] (list (as 'SYM (list)))))
+(count (select {from: Empty where: (not-in s (as 'SYM (list "a")))})) -- 0
+
+;; Outside queries, collection membership retains null-equals-null semantics;
+;; not-in is its complement, and query state does not escape after evaluation.
+(in (at T 's) NA) -- [true true false true true false]
+(not-in (at T 's) NA) -- [false false true false false true]
+(not-in 2 [1 3]) -- true
+(not-in 0Nl [1]) -- true
+(not-in 0Nl [0Nl]) -- false
+((fn [v] (not-in v [1 3])) [1 2 3]) -- [false true false]
+(not-in [1]) !- arity

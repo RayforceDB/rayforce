@@ -3319,7 +3319,8 @@ static void ray_register_builtins(void) {
 
     /* Collection operations */
     register_unary("distinct", RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_distinct_fn);
-    register_binary("in",      RAY_FN_NONE, ray_in_fn);
+    register_binary("in",      RAY_FN_NONE, ray_in_eval_fn);
+    register_binary("not-in",  RAY_FN_NONE, ray_not_in_fn);
     register_binary("except",  RAY_FN_NONE, ray_except_fn);
     register_binary("union",   RAY_FN_NONE, ray_union_fn);
     register_binary("sect",    RAY_FN_NONE, ray_sect_fn);

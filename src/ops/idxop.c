@@ -763,8 +763,8 @@ static ray_t* prepare_attach_ex(ray_t** vp, const char* what,
     if (numeric_elem_size(v->type) == 0 &&
         !(allow_str && v->type == RAY_STR) &&
         !(allow_sym && v->type == RAY_SYM)) {
-        return ray_error("nyi", "%s: only numeric/sym vectors supported (got type %d)",
-                         what, (int)v->type);
+        return ray_error("nyi", "%s: only numeric/temporal%s%s vectors supported (got type %d)",
+                         what, allow_sym ? "/sym" : "", allow_str ? "/str" : "", (int)v->type);
     }
     return v;
 }

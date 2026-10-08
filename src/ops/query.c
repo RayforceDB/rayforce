@@ -1637,6 +1637,31 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
             ray_op_t* args[16];
             for (int64_t i = 0; i < n - 1; i++)
                 args[i] = &g->nodes[arg_ids[i]];
+            /* Constant collection operands concatenate as collections, even
+             * for SYM/STR vectors. They are not row-wise string operands. */
+            if (n == 3 && args[0]->opcode == OP_CONST && args[1]->opcode == OP_CONST) {
+                ray_op_ext_t* a = find_ext(g, arg_ids[0]);
+                ray_op_ext_t* b = find_ext(g, arg_ids[1]);
+                if (a && b && a->literal && b->literal &&
+                    (ray_is_vec(a->literal) || ray_is_vec(b->literal) ||
+                     (args[0]->out_type != RAY_SYM && args[0]->out_type != RAY_STR) ||
+                     (args[1]->out_type != RAY_SYM && args[1]->out_type != RAY_STR))) {
+                    ray_t* value = ray_concat_fn(a->literal, b->literal);
+                    if (!value) return NULL;
+                    if (RAY_IS_ERR(value)) { g->compile_err = value; return NULL; }
+                    ray_op_t* out = ray_is_atom(value) ? ray_const_atom(g, value)
+                                                     : ray_const_vec(g, value);
+                    ray_release(value);
+                    return out;
+                }
+            }
+            /* OP_CONCAT is a string kernel. Numeric collection concatenation
+             * belongs to the whole-column evaluation fallback. */
+            for (int64_t i = 0; i < n - 1; i++) {
+                int8_t t = args[i]->out_type;
+                if (RAY_IS_PARTED(t)) t = (int8_t)RAY_PARTED_BASETYPE(t);
+                if (t != RAY_SYM && t != RAY_STR) return NULL;
+            }
             return ray_concat(g, args, (int)(n - 1));
         }
 
@@ -2427,7 +2452,7 @@ static ray_t* select_fallback_passthrough_col(ray_t* expr, ray_t* tbl, int64_t n
  * (see eval_expr_whole_column).  Matched on the top-level head only —
  * a whole-column verb nested under an element-wise op has ambiguous length
  * semantics and is left to the per-row path. */
-static int is_whole_column_projection(ray_t* expr) {
+static int is_whole_column_projection(ray_t* expr, ray_t* tbl) {
     if (!expr || expr->type != RAY_LIST) return 0;
     if (ray_len(expr) < 2) return 0;
     ray_t* head = ((ray_t**)ray_data(expr))[0];
@@ -2436,6 +2461,30 @@ static int is_whole_column_projection(ray_t* expr) {
     if (!s) return 0;
     size_t l = ray_str_len(s);
     const char* p = ray_str_ptr(s);
+    if (l == 6 && memcmp(p, "concat", 6) == 0) {
+        /* Preserve row-wise text concatenation when another projection
+         * forces fallback, but evaluate collection concat once. Compilation
+         * only inspects types/literals; it does not run user expressions. */
+        ray_graph_t* g = ray_graph_new(tbl);
+        if (!g) return 0;
+        ray_op_t* op = compile_expr_dag(g, expr);
+        int whole = 0;
+        if (op && op->opcode == OP_CONST) {
+            ray_op_ext_t* ext = find_ext(g, op->id);
+            whole = ext && ext->literal && !ray_is_atom(ext->literal);
+        } else if (!op) {
+            ray_t** elems = (ray_t**)ray_data(expr);
+            for (int64_t i = 1; i < ray_len(expr); i++) {
+                ray_op_t* arg = compile_expr_dag(g, elems[i]);
+                if (!arg) continue;
+                int8_t t = arg->out_type;
+                if (RAY_IS_PARTED(t)) t = (int8_t)RAY_PARTED_BASETYPE(t);
+                if (t != RAY_SYM && t != RAY_STR) { whole = 1; break; }
+            }
+        }
+        ray_graph_free(g);
+        return whole;
+    }
     return (l == 8 && memcmp(p, "distinct", 8) == 0) ||
            (l == 7 && memcmp(p, "reverse", 7) == 0) ||
            (l == 3 && memcmp(p, "asc", 3) == 0) ||
@@ -7142,7 +7191,7 @@ static ray_t* eval_scalar_agg_outputs(ray_t** dict_elems, int64_t dict_n,
          * would feed it one scalar cell at a time, making `count` report the
          * row count instead of the distinct count (issue #405).  Mirror the
          * projection fallback's routing and evaluate it once. */
-        ray_t* src = is_whole_column_projection(agg_elems[1])
+        ray_t* src = is_whole_column_projection(agg_elems[1], tbl)
                    ? eval_expr_whole_column(agg_elems[1], tbl)
                    : eval_expr_per_row(agg_elems[1], tbl, nrows);
         if (!src || RAY_IS_ERR(src)) {
@@ -13664,7 +13713,7 @@ by_dict_done:
                      * alias bound below as a one-row column must not be read
                      * per row.  A bare column name is the column itself. */
                     ray_t* expr = dict_elems[i + 1];
-                    int whole_verb = is_whole_column_projection(expr);
+                    int whole_verb = is_whole_column_projection(expr, tbl);
                     int one_value = !whole_verb &&
                                     (!any_row_proj ||
                                      (select_fallback_has_agg(expr) && !expr_refs_row_column(expr, tbl)));

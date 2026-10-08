@@ -24,6 +24,7 @@
 /*  Collection / higher-order builtins — extracted from eval.c  */
 
 #include "lang/internal.h"
+#include "lang/env.h"
 #include "core/types.h"
 #include "core/pool.h"
 #include "ops/hash.h"
@@ -1618,6 +1619,54 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
     }
     if (_bx) ray_release(_bx);
     return make_bool(0);
+}
+
+/* Interpreter membership inside queries follows the plan's null-row rule.
+ * Keep ray_in_fn itself context-free: collection operations and the GUID
+ * plan fallback call it directly and apply their own semantics. */
+static ray_t* eval_membership(ray_t* val, ray_t* vec, bool negate) {
+    bool query = ray_env_query_scope_above(0);
+    if (query && RAY_IS_PARTED(val->type)) {
+        ray_t* flat = parted_to_flat_vec(val);
+        if (!flat || RAY_IS_ERR(flat)) return flat ? flat : ray_error("oom", NULL);
+        ray_t* r = eval_membership(flat, vec, negate);
+        ray_release(flat);
+        return r;
+    }
+    ray_t* r = ray_in_fn(val, vec);
+    if (!r || RAY_IS_ERR(r)) return r;
+    if (query && ray_is_atom(val) && RAY_ATOM_IS_NULL(val)) {
+        ray_release(r);
+        return make_bool(0);
+    }
+    if (r->type == RAY_BOOL) {
+        uint8_t* out = (uint8_t*)ray_data(r);
+        for (int64_t i = 0; i < r->len; i++) {
+            if (negate) out[i] = (uint8_t)!out[i];
+            if (query && !ray_is_atom(val)) {
+                bool is_null = val->type == RAY_LIST
+                    ? RAY_ATOM_IS_NULL(((ray_t**)ray_data(val))[i])
+                    : ray_vec_is_null(val, i);
+                if (is_null) out[i] = 0;
+            }
+        }
+        return r;
+    }
+    if (negate) {
+        ray_t* out = ray_not_fn(r);
+        ray_release(r);
+        return out;
+    }
+    return r;
+}
+
+ray_t* ray_in_eval_fn(ray_t* val, ray_t* vec) {
+    if (!ray_env_query_scope_above(0)) return ray_in_fn(val, vec);
+    return eval_membership(val, vec, false);
+}
+
+ray_t* ray_not_in_fn(ray_t* val, ray_t* vec) {
+    return eval_membership(val, vec, true);
 }
 
 /* Helper: convert a boxed list result back to a typed vector if the original was typed */
