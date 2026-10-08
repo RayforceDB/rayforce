@@ -3523,13 +3523,110 @@ static test_result_t test_radix_route_shapes(void) {
     ray_t* kcol = ray_table_col(t, ray_sym_intern("k", 1));
     TEST_ASSERT_TRUE(kcol && !RAY_IS_ERR(kcol));
     sr_drop(t);
+    /* h materialized too: the v2 survivor list (R-SPARSE) reads a plain
+     * input in place at each run's first row */
+    t = sr_eval("T2M");
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    ray_t* hcol = ray_table_col(t, ray_sym_intern("h", 1));
+    TEST_ASSERT_TRUE(hcol && !RAY_IS_ERR(hcol));
+    sr_drop(t);
     static const char* const q2m[] = {
         "(select {c: (count v) s: (sum v) from: T by: k})",
         "(select {c: (count v) s: (sum f) from: T by: {k: k g: g}})",
+        "(select {c: (count k) s: (sum h) from: T where: (> k 140000) by: {g: g u: u}})",
         NULL };
     for (int i = 0; q2m[i]; i++) {
         test_result_t r = sr_same_on("(.db.splayed.get \"" SR_G0 "\")", "T2M", q2m[i], 0);
         if (r.status != TEST_PASS) { ray_group_test_route(0); return r; }
+    }
+    /* a non-inline wide key (GUID) beside a fixed one: the keys stay plain
+     * and unwalked, the inputs are read by range */
+    sr_eval_ok("(set Q (table [q g v] (list (take (guid 37) 200000) (as 'I16 (% i 7)) i)))");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/q0/\" Q {compress: false})");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/q2/\" Q {compress: true})");
+    test_result_t rq = sr_same_on("(.db.splayed.get \"" SR_TMP "/q0/\")", "(.db.splayed.get \"" SR_TMP "/q2/\")",
+                                  "(select {s: (sum v) c: (count v) from: T by: {q: q g: g}})", 2);
+    ray_group_test_route(0);
+    if (rq.status != TEST_PASS) return rq;
+    PASS();
+}
+
+/* Fix round 1 (I3): the single-key sparse paths of the legacy route (the
+ * emit-filter key-range scatter, the sparse i64 table and its heavy-hitter
+ * sum pass) read staged keys and inputs by pieces, and their fallback to
+ * the fat-entry routes takes them staged: nothing materializes. */
+static test_result_t test_radix_route_sparse(void) {
+    static const char* const qs[] = {
+        /* the sparse i64 table, sum arm */
+        "(select {c: (count k) s: (sum h) from: T by: k})",
+        "(select {s: (sum h) a: (avg k) from: T by: h})",
+        "(select {s: (sum h) from: T by: u})",
+        "(select {c: (count k) s: (sum k) from: T where: (> k 100) by: h})",
+        "(select {c: (count k) s: (sum h) a: (avg u) from: T by: s})",              /* SYM key, by piece width */
+        /* the emit-filter key range under a sparse selection: bounds by a scan */
+        "(select {c: (count k) s: (sum h) from: T where: (< k 1000) by: h desc: c take: 3})",
+        "(select {c: (count k) s: (sum u) a: (avg h) from: T where: (> k 180000) by: h desc: c take: 3})",
+        /* the emit-filter sparse table (a SYM key never takes the key range):
+         * the count arm, then the heavy hitters' sums */
+        "(select {c: (count k) s: (sum h) from: T where: (< k 5) by: s desc: c take: 2})",
+        NULL };
+    ray_group_test_route(2);
+    for (int i = 0; qs[i]; i++) {
+        test_result_t r = sr_same(qs[i], 0);
+        if (r.status != TEST_PASS) { ray_group_test_route(0); return r; }
+    }
+    /* keys the dense count declines (negative, or past its cap) reach the
+     * emit-filter key range without a selection: n's bounds come from the
+     * directory, m's span takes the second (marker) sum pass, w's does not
+     * fit (the sparse table), p / q are I32 with negatives (the range reads
+     * them unsigned, so their directory bounds are not used) */
+    sr_eval_ok("(set N (table [n m w p q x] (list (- (% (* i 7919) 1000003) 500000) "
+               "(* (- (% i 1000) 500) 40000) (* (- (% i 1000) 500) 1000000) "
+               "(as 'I32 (- (% i 1000) 2000)) (as 'I32 (- (% i 1000) 500)) i)))");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/n0/\" N {compress: false})");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/n2/\" N {compress: true})");
+    static const char* const qn[] = {
+        "(select {c: (count x) s: (sum x) from: T by: n desc: c take: 3})",
+        "(select {c: (count x) s: (sum x) a: (avg x) from: T by: m desc: c take: 3})",
+        "(select {c: (count x) s: (sum x) from: T by: w desc: c take: 3})",
+        "(select {c: (count x) s: (sum x) from: T by: p desc: c take: 3})",
+        "(select {c: (count x) s: (sum x) from: T by: q desc: c take: 3})",
+        "(select {c: (count x) s: (sum x) from: T where: (> x 1000) by: m desc: c take: 3})",
+        "(select {s: (sum x) a: (avg n) from: T by: w})",
+        NULL };
+    for (int i = 0; qn[i]; i++) {
+        test_result_t r = sr_same_on("(.db.splayed.get \"" SR_TMP "/n0/\")", "(.db.splayed.get \"" SR_TMP "/n2/\")",
+                                     qn[i], 0);
+        if (r.status != TEST_PASS) { ray_group_test_route(0); return r; }
+    }
+    /* the fallback: an emit-filter sparse table over more than 2^21 rows
+     * goes to the fat-entry routes, which read the key and input staged */
+    sr_eval_ok("(set jf (til 2200000))");
+    sr_eval_ok("(set F (table [w x] (list (* (% jf 1000) 1000000) jf)))");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/f0/\" F {compress: false})");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/f2/\" F {compress: true})");
+    test_result_t t = sr_same_on("(.db.splayed.get \"" SR_TMP "/f0/\")", "(.db.splayed.get \"" SR_TMP "/f2/\")",
+                                 "(select {c: (count x) s: (sum x) from: T by: w desc: c take: 3})", 0);
+    if (t.status != TEST_PASS) { ray_group_test_route(0); return t; }
+    /* R-FAIL: a corrupt chunk of the key or an input is the query's error */
+    char path[600];
+    static const struct { const char* col; const char* q; } cs[] = {
+        { "h", "(select {c: (count k) s: (sum h) from: B by: k})" },                  /* input, sum arm */
+        { "k", "(select {c: (count k) s: (sum h) from: B by: k})" },                  /* key, sum arm */
+        { "h", "(select {c: (count k) s: (sum u) from: B where: (> k 180000) by: h desc: c take: 3})" },   /* key bounds */
+        { "u", "(select {c: (count k) s: (sum u) from: B where: (> k 180000) by: h desc: c take: 3})" },   /* range input */
+    };
+    for (size_t c = 0; c < sizeof cs / sizeof cs[0]; c++) {
+        if (c == 0 || strcmp(cs[c].col, cs[c - 1].col) != 0) sr_make_bad(cs[c].col, path, sizeof path);
+        for (int i = 0; i < 2; i++) {
+            sr_eval_ok("(set B (.db.splayed.get \"" SR_TMP "/bad/\"))");
+            ray_error_clear();
+            ray_t* r = sr_eval(cs[c].q);
+            TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "%s: no error", cs[c].q);
+            TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
+            TEST_ASSERT_TRUE(strstr(ray_error_msg(), path) != NULL);
+            ray_error_free(r);
+        }
     }
     ray_group_test_route(0);
     PASS();
@@ -3987,6 +4084,7 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/sp_dyn_route",       test_sp_dyn_route,       srr_setup, srr_teardown },
     { "scanrange/radix_route",        test_radix_route,        srr_setup, srr_teardown },
     { "scanrange/radix_route_shapes", test_radix_route_shapes, srr_setup, srr_teardown },
+    { "scanrange/radix_route_sparse", test_radix_route_sparse, srr_setup, srr_teardown },
     { "scanrange/radix_route_serial", test_radix_route_serial, srr_setup, srr_teardown },
     { "scanrange/radix_route_error",  test_radix_route_error,  srr_setup, srr_teardown },
     { "scanrange/v2_routes",          test_v2_routes,          srr_setup, srr_teardown },

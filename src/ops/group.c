@@ -12856,6 +12856,187 @@ static ray_t* exec_group_sp_dyn_emit(const sp_dyn_ctx_t* c) {
     return r;
 }
 
+/* ---- Range reads of the single-key sparse paths (R-WALK) ----------------
+ * exec_group_run's single-key sparse paths (the emit-filter key-range
+ * scatter and the sparse i64 table, reached past the dense count) run each
+ * pass of a staged context by pieces, serially and in row order, so the
+ * sums fold exactly as the plain loops fold them.  srcs[0] is the key's
+ * source and srcs[1 + a] each staged input's; a plain key or input has a
+ * NULL slot and is read in place at its absolute row (key_plain,
+ * agg_ptrs[a]).  A COUNT input has no slot: it is never read.  Staged SYM
+ * and STR inputs are not eligible (sp_eligible), so a strlen input is
+ * always plain. */
+enum { SPW_MINMAX, SPW_RANGE, SPW_MARKER, SPW_HT_COUNT, SPW_HT_SUM, SPW_HEAVY };
+typedef struct {
+    int              pass;
+    ray_op_ext_t*    ext;
+    uint32_t         n_aggs;
+    int8_t           key_type;
+    const void*      key_plain;     /* a plain key's base (srcs[0] NULL) */
+    uint8_t          key_esz;       /* its width */
+    void* const*     agg_ptrs;      /* plain inputs' bases; NULL for a staged one */
+    const int8_t*    agg_types;
+    const uint8_t*   agg_strlen;
+    ray_t* const*    agg_vecs;
+    ray_t**          strlen_sym_strings;
+    uint32_t         strlen_sym_count;
+    uint64_t         agg_f64_mask;
+    ray_col_src_t**  srcs;          /* [1 + n_aggs] */
+    ray_t*           rowsel;
+    /* the pass's state */
+    bool             have_key;      /* SPW_MINMAX: bounds of the keys read */
+    int64_t          min_key, max_key;
+    uint32_t*        range_count;   /* SPW_RANGE counts, SPW_MARKER markers */
+    da_val_t*        sums;          /* SPW_RANGE: the range sums (NULL: none); MARKER / HEAVY: dense */
+    int64_t*         sums_hi;       /* their high words (integer AVG), or NULL */
+    sparse_i64_ht_t* ht;            /* HT_COUNT / HT_SUM: the table; HEAVY: the heavy hitters */
+    bool             need_sum;
+    bool             stop;          /* sparse_i64_touch failed: the caller falls back */
+} sp_walk_ctx_t;
+
+/* Row r's inputs folded into sums (and hi, when not NULL), the staged ones
+ * read from the piece positioned at row b. */
+static inline void sp_walk_sums(const sp_walk_ctx_t* c, const ray_col_piece_t* p, int64_t b,
+                                int64_t r, da_val_t* sums, int64_t* hi) {
+    for (uint32_t a = 0; a < c->n_aggs; a++) {
+        if (c->ext->agg_ops[a] == OP_COUNT) continue;
+        const void* d;
+        int64_t rr;
+        if (c->srcs[1 + a]) { d = p[1 + a].data; rr = r - b; }
+        else if (c->agg_ptrs[a]) { d = c->agg_ptrs[a]; rr = r; }
+        else continue;
+        if (c->agg_strlen[a])
+            sums[a].i = wrap_add_i64(sums[a].i, group_strlen_at_cached(c->agg_vecs[a], r,
+                                                   c->strlen_sym_strings, c->strlen_sym_count));
+        else if (c->agg_f64_mask & ((uint64_t)1 << a))
+            sums[a].f += group_fp_at(d, c->agg_types[a], rr);
+        else if (hi)
+            ray_i128_add(&hi[a], (uint64_t*)&sums[a].i, read_col_i64(d, rr, c->agg_types[a], 0));
+        else
+            sums[a].i = wrap_add_i64(sums[a].i, read_col_i64(d, rr, c->agg_types[a], 0));
+    }
+}
+
+static void sp_walk_piece(void* ctx, uint32_t wid, int64_t b, int64_t e, const ray_col_piece_t* p) {
+    (void)wid;
+    sp_walk_ctx_t* c = (sp_walk_ctx_t*)ctx;
+    if (c->stop) return;
+    const bool ks = c->srcs[0] != NULL;
+    const void* kd = ks ? p[0].data : c->key_plain;
+    const int64_t kb = ks ? b : 0;                  /* the key is read at r - kb */
+    const uint8_t kesz = ks ? ray_sym_elem_size(c->key_type, p[0].attrs) : c->key_esz;
+    const uint32_t n = c->n_aggs;
+    for (int64_t r = b; r < e; r++) {
+        if (c->rowsel && !group_rowsel_pass(c->rowsel, r)) continue;
+        int64_t key = read_by_esz(kd, r - kb, kesz);
+        switch (c->pass) {
+        case SPW_MINMAX:
+            if (!c->have_key) { c->min_key = c->max_key = key; c->have_key = true; }
+            else if (key < c->min_key) c->min_key = key;
+            else if (key > c->max_key) c->max_key = key;
+            break;
+        case SPW_RANGE: {
+            uint64_t off = (uint64_t)key - (uint64_t)c->min_key;
+            if (c->range_count[off] != UINT32_MAX) c->range_count[off]++;
+            if (c->sums)
+                sp_walk_sums(c, p, b, r, &c->sums[(size_t)off * n],
+                             c->sums_hi ? &c->sums_hi[(size_t)off * n] : NULL);
+            break;
+        }
+        case SPW_MARKER: {
+            uint32_t marker = c->range_count[(uint64_t)key - (uint64_t)c->min_key];
+            if (!marker) break;
+            size_t gi = (size_t)(marker - 1u) * n;
+            sp_walk_sums(c, p, b, r, &c->sums[gi], c->sums_hi ? &c->sums_hi[gi] : NULL);
+            break;
+        }
+        case SPW_HT_COUNT:
+        case SPW_HT_SUM: {
+            bool ns = c->pass == SPW_HT_SUM && c->need_sum;
+            int32_t slot;
+            if (!sparse_i64_touch(c->ht, key, (uint8_t)n, ns, &slot)) { c->stop = true; return; }
+            c->ht->counts[slot]++;
+            if (ns)
+                sp_walk_sums(c, p, b, r, &c->ht->sums[(size_t)slot * n],
+                             c->ht->sums_hi ? &c->ht->sums_hi[(size_t)slot * n] : NULL);
+            break;
+        }
+        case SPW_HEAVY: {
+            int32_t hs = sparse_i64_find_slot(c->ht, key);
+            if (!c->ht->used[hs] || c->ht->keys[hs] != key) break;
+            size_t gi = (size_t)(uint32_t)c->ht->counts[hs] * n;
+            sp_walk_sums(c, p, b, r, &c->sums[gi], c->sums_hi ? &c->sums_hi[gi] : NULL);
+            break;
+        }
+        }
+    }
+}
+
+/* One pass over rows [lo, hi) by pieces (the selection's rejected morsels
+ * skipped), polling for cancellation between blocks.  A pass that reads no
+ * input (the bounds, the counts, a range scatter without sums) walks the
+ * key alone; a pass whose sources are all plain runs as one piece.  NULL,
+ * or the range error keyed by the failing block's first row, or `cancel`. */
+static ray_t* __attribute__((noinline))
+sp_walk_run(sp_walk_ctx_t* c, int pass, int64_t lo, int64_t hi) {
+    c->pass = pass;
+    c->stop = false;
+    bool key_only = pass == SPW_MINMAX || pass == SPW_HT_COUNT ||
+                    (pass == SPW_RANGE && !c->sums) || (pass == SPW_HT_SUM && !c->need_sum);
+    uint32_t n = key_only ? 1 : 1 + c->n_aggs;
+    bool any = false;
+    for (uint32_t i = 0; i < n; i++) any |= c->srcs[i] != NULL;
+    const void* plain[1 + 64] = { 0 };    /* sp_eligible caps n_aggs at 64; plain slots are NULL */
+    ray_col_piece_t none[1 + 64];
+    memset(none, 0, sizeof none);
+    ray_scan_fail_t fail;
+    ray_scan_fail_init(&fail);
+    for (int64_t s = lo; s < hi && !c->stop; s += 65536) {
+        if (ray_interrupted()) break;     /* ray_scan_fail_finish: `cancel` */
+        int64_t q = hi - s > 65536 ? s + 65536 : hi;
+        if (!any) { sp_walk_piece(c, 0, s, q, none); continue; }
+        ray_t* err = group_sel_walk(c->srcs, plain, n, c->rowsel, s, q, c, 0, sp_walk_piece);
+        if (err) { ray_scan_fail_note(&fail, s, err); break; }
+    }
+    return ray_scan_fail_finish(&fail, NULL);
+}
+
+/* The key range of the emit-filter scatter, read unsigned (read_by_esz) as
+ * that scatter reads it.  Without a selection a staged key's chunks fold
+ * their directory bounds where those are exact for the unsigned read (no
+ * null, and a non-negative minimum or a 64-bit key); every other chunk is
+ * scanned by range.  A selection scans the selected rows.  NULL or the
+ * pass's error. */
+static ray_t* sp_walk_key_range(sp_walk_ctx_t* c, int64_t n_scan) {
+    c->have_key = false;
+    ray_col_src_t* src = c->srcs[0];
+    ray_enc_chunk_stat_t st;
+    int64_t nch = (n_scan + RAY_ENC_CHUNK - 1) / RAY_ENC_CHUNK;
+    if (c->rowsel || !src || src->len != n_scan || nch == 0 || !ray_col_src_chunk_stat(src, 0, &st))
+        return sp_walk_run(c, SPW_MINMAX, 0, n_scan);
+    bool have = false;
+    int64_t mn = 0, mx = 0;
+    uint8_t esz = ray_sym_elem_size(c->key_type, src->attrs);
+    for (int64_t ch = 0; ch < nch; ch++) {
+        (void)ray_col_src_chunk_stat(src, ch, &st);
+        if (st.has_minmax && st.null_count == 0 && (esz == 8 || st.min >= 0)) {
+            if (!have || st.min < mn) mn = st.min;
+            if (!have || st.max > mx) mx = st.max;
+            have = true;
+            continue;
+        }
+        int64_t lo = ch * RAY_ENC_CHUNK, hi = lo + RAY_ENC_CHUNK < n_scan ? lo + RAY_ENC_CHUNK : n_scan;
+        ray_t* err = sp_walk_run(c, SPW_MINMAX, lo, hi);   /* folds into have_key / min_key / max_key */
+        if (err) return err;
+    }
+    if (have) {
+        if (!c->have_key || mn < c->min_key) c->min_key = mn;
+        if (!c->have_key || mx > c->max_key) c->max_key = mx;
+        c->have_key = true;
+    }
+    return NULL;
+}
+
 /* Route test hook (ray_group_test_route, internal.h). */
 static int g_group_test_route;
 void ray_group_test_route(int route) { g_group_test_route = route; }
@@ -14227,12 +14408,13 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     }
 
 da_path:;
-    /* The direct-array routes (DA, the sparse-dynamic count) and the
-     * fat-entry routes at ht_path read staged keys and inputs by range.
-     * The single-key sparse paths read plain columns: a staged key or
-     * input takes its plain column at GROUP_UNSTAGE (materializing a
-     * generation-2 one, as ray_table_col did), retained and owned, and the
-     * bound sources are not used past that point. */
+    /* The direct-array routes (DA, the sparse-dynamic count), the
+     * single-key sparse paths and the fat-entry routes at ht_path read
+     * staged keys and inputs by range.  GROUP_UNSTAGE remains for a
+     * selection flattened to match_idx (below): each staged key or input
+     * takes its plain column (materializing a generation-2 one, as
+     * ray_table_col did), retained and owned, and the bound sources are
+     * not used past that point. */
     #define GROUP_UNSTAGE() do { \
         for (uint32_t k_ = 0; k_ < n_keys; k_++) { \
             if (key_vecs[k_] || !key_srcs[k_]) continue; \
@@ -14262,7 +14444,14 @@ da_path:;
     for (uint32_t k = 0; k < n_keys; k++) if (key_srcs[k]) grp_staged = true;
     for (uint32_t a = 0; a < n_aggs; a++)
         if ((!agg_vecs[a] && agg_srcs[a]) || (!agg_vecs2[a] && agg_srcs2[a])) grp_staged = true;
-    if (grp_staged && match_idx) { GROUP_UNSTAGE(); grp_staged = false; }   /* rows not contiguous */
+    /* Rows not contiguous: unstaged here, so a staged context never has a
+     * match_idx.  Every staged reader below relies on that (grp_run walks
+     * rows, or R-SPARSE over its own survivor list, never match_idx). */
+    if (grp_staged && match_idx) { GROUP_UNSTAGE(); grp_staged = false; }
+    /* The single-key sparse paths' stand-ins for the staged key and inputs
+     * (bit a: input a), dropped again at ht_path. */
+    bool sp_sv_key = false;
+    uint64_t sp_sv_agg = 0;
     /* ---- Direct-array fast path for low-cardinality integer keys ---- */
     /* Supports multi-key via a composite index when its state remains O(input). */
     {
@@ -15292,9 +15481,9 @@ da_path:;
         }
     }
 
-    /* Staged columns stay staged for the sparse-dynamic count and the
-     * fat-entry routes at ht_path; the single-key sparse paths between
-     * them take their plain columns (below). */
+    /* Staged columns stay staged for the sparse-dynamic count, the
+     * single-key sparse paths (sp_walk_run) and the fat-entry routes at
+     * ht_path. */
     {
         /* n_aggs <= 64: same mask-width bound as da_eligible above — this
          * path's independent agg_f64_mask is also a uint64_t.  Beyond 64
@@ -15453,15 +15642,40 @@ da_path:;
                     return sp_r;
                 }
             }
-            /* The single-key sparse paths below read plain columns. */
+            /* A staged context stays staged: the passes below read its key
+             * and inputs by pieces (sp_walk_run, R-WALK; COUNT inputs are
+             * not read), a plain one in place.  Each staged column gets a
+             * zero-length stand-in (type, SYM width and domain) for the
+             * emit, owned like a materialization; ht_path drops them again,
+             * its builders reading the sources themselves. */
+            ray_col_src_t* spw_srcs[1 + 64];
+            sp_walk_ctx_t spw;
+            memset(&spw, 0, sizeof spw);
             if (grp_staged) {
-                GROUP_UNSTAGE();
-                for (uint32_t a = 0; a < n_aggs; a++) {
-                    if (!sp_agg_src[a]) continue;
-                    agg_ptrs[a] = ray_data(agg_vecs[a]);
-                    sp_agg_src[a] = NULL;
+                spw_srcs[0] = key_vecs[0] ? NULL : key_srcs[0];
+                for (uint32_t a = 0; a < n_aggs; a++)
+                    spw_srcs[1 + a] = ext->agg_ops[a] == OP_COUNT ? NULL : sp_agg_src[a];
+                if (!key_vecs[0]) {
+                    ray_t* sv = group_src_standin(key_srcs[0]);
+                    if (!sv) { rerr = ray_error("oom", NULL); goto resolve_fail; }
+                    key_vecs[0] = sv; key_owned[0] = 1; sp_sv_key = true;
                 }
-                key_esz = ray_sym_elem_size(key_types[0], key_attrs[0]);
+                for (uint32_t a = 0; a < n_aggs; a++) {
+                    if (agg_vecs[a] || !agg_srcs[a]) continue;
+                    ray_t* sv = group_src_standin(agg_srcs[a]);
+                    if (!sv) { rerr = ray_error("oom", NULL); goto resolve_fail; }
+                    agg_vecs[a] = sv; agg_owned[a] = 1; sp_sv_agg |= (uint64_t)1 << a;
+                }
+                for (uint32_t i = 0; i < 1 + n_aggs; i++)
+                    if (spw_srcs[i]) ray_col_src_advise(spw_srcs[i], 0, nrows);
+                spw = (sp_walk_ctx_t){
+                    .ext = ext, .n_aggs = n_aggs, .key_type = key_types[0],
+                    .key_plain = key_data[0], .key_esz = key_esz,
+                    .agg_ptrs = agg_ptrs, .agg_types = agg_types, .agg_strlen = agg_strlen,
+                    .agg_vecs = agg_vecs, .strlen_sym_strings = strlen_sym_strings,
+                    .strlen_sym_count = strlen_sym_count, .agg_f64_mask = agg_f64_mask,
+                    .srcs = spw_srcs, .rowsel = rowsel, .need_sum = sp_need_sum,
+                };
             }
 
             if (use_emit_filter &&
@@ -15470,6 +15684,11 @@ da_path:;
                 key_types[0] != RAY_SYM && n_scan <= UINT32_MAX) {
                 bool have_key = false;
                 int64_t min_key = 0, max_key = 0;
+                if (grp_staged) {   /* directory bounds where exact, else by range */
+                    ray_t* werr = sp_walk_key_range(&spw, n_scan);
+                    if (werr) { rerr = werr; goto resolve_fail; }
+                    have_key = spw.have_key; min_key = spw.min_key; max_key = spw.max_key;
+                } else
                 for (int64_t i = 0; i < n_scan; i++) {
                     int64_t r = match_idx ? match_idx[i] : i;
                     if (!match_idx && rowsel && !group_rowsel_pass(rowsel, r))
@@ -15516,6 +15735,16 @@ da_path:;
                         }
                     }
 
+                    if (grp_staged) {
+                        spw.min_key = min_key; spw.range_count = range_count;
+                        spw.sums = range_sum; spw.sums_hi = range_sum_hi;
+                        ray_t* werr = sp_walk_run(&spw, SPW_RANGE, 0, n_scan);
+                        if (werr) {
+                            scratch_free(range_sum_hdr); scratch_free(range_hi_hdr);
+                            scratch_free(cnt_hdr);
+                            rerr = werr; goto resolve_fail;
+                        }
+                    } else
                     for (int64_t i = 0; i < n_scan; i++) {
                         int64_t r = match_idx ? match_idx[i] : i;
                         if (!match_idx && rowsel && !group_rowsel_pass(rowsel, r))
@@ -15570,6 +15799,7 @@ da_path:;
                             if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
                         for (uint32_t k = 0; k < n_keys; k++)
                             if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+                        AGG_OWN_SRC_RELEASE();
                         if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
                         return result ? result : ray_error("oom", NULL);
                     }
@@ -15587,6 +15817,7 @@ da_path:;
                             if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
                         for (uint32_t k = 0; k < n_keys; k++)
                             if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+                        AGG_OWN_SRC_RELEASE();
                         if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
                         return key_col ? key_col : ray_error("oom", NULL);
                     }
@@ -15612,6 +15843,7 @@ da_path:;
                             if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
                         for (uint32_t k = 0; k < n_keys; k++)
                             if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+                        AGG_OWN_SRC_RELEASE();
                         if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
                         return ray_error("oom", NULL);
                     }
@@ -15640,7 +15872,18 @@ da_path:;
                         gi++;
                     }
 
-                    if (sp_need_sum && !range_sum) {
+                    if (sp_need_sum && !range_sum && grp_staged) {
+                        spw.min_key = min_key; spw.range_count = range_count;
+                        spw.sums = dense_sum; spw.sums_hi = dense_sum_hi;
+                        ray_t* werr = sp_walk_run(&spw, SPW_MARKER, 0, n_scan);
+                        if (werr) {
+                            scratch_free(_h_sum); scratch_free(_h_sum_hi); scratch_free(_h_cnt);
+                            scratch_free(range_sum_hdr); scratch_free(range_hi_hdr);
+                            scratch_free(cnt_hdr);
+                            ray_release(key_col); ray_release(result);
+                            rerr = werr; goto resolve_fail;
+                        }
+                    } else if (sp_need_sum && !range_sum) {
                         for (int64_t i = 0; i < n_scan; i++) {
                             int64_t r = match_idx ? match_idx[i] : i;
                             if (!match_idx && rowsel && !group_rowsel_pass(rowsel, r))
@@ -15695,6 +15938,7 @@ da_path:;
                         if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
                     for (uint32_t k = 0; k < n_keys; k++)
                         if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+                    AGG_OWN_SRC_RELEASE();
                     if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
                     return result;
                 }
@@ -15714,6 +15958,12 @@ da_path:;
                 if (!sparse_i64_init(&sp_ht, (uint32_t)expected, n_aggs, false, false))
                     goto ht_path;
 
+                if (grp_staged) {
+                    spw.ht = &sp_ht;
+                    ray_t* werr = sp_walk_run(&spw, SPW_HT_COUNT, 0, n_scan);
+                    if (werr) { sparse_i64_free(&sp_ht); rerr = werr; goto resolve_fail; }
+                    if (spw.stop) sp_ok = false;
+                } else
                 for (int64_t i = 0; i < n_scan; i++) {
                     int64_t r = match_idx ? match_idx[i] : i;
                     if (!match_idx && rowsel && !group_rowsel_pass(rowsel, r))
@@ -15734,6 +15984,12 @@ da_path:;
                                      sp_need_sum128))
                     goto ht_path;
 
+                if (grp_staged) {
+                    spw.ht = &sp_ht;
+                    ray_t* werr = sp_walk_run(&spw, SPW_HT_SUM, 0, n_scan);
+                    if (werr) { sparse_i64_free(&sp_ht); rerr = werr; goto resolve_fail; }
+                    if (spw.stop) sp_ok = false;
+                } else
                 for (int64_t i = 0; i < n_scan; i++) {
                     int64_t r = match_idx ? match_idx[i] : i;
                     if (!match_idx && rowsel && !group_rowsel_pass(rowsel, r))
@@ -15796,6 +16052,7 @@ da_path:;
                     if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
                 for (uint32_t k = 0; k < n_keys; k++)
                     if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+                AGG_OWN_SRC_RELEASE();
                 if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
                 return result ? result : ray_error("oom", NULL);
             }
@@ -15812,6 +16069,7 @@ da_path:;
                     if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
                 for (uint32_t k = 0; k < n_keys; k++)
                     if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+                AGG_OWN_SRC_RELEASE();
                 if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
                 return key_col ? key_col : ray_error("oom", NULL);
             }
@@ -15837,6 +16095,7 @@ da_path:;
                     if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
                 for (uint32_t k = 0; k < n_keys; k++)
                     if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+                AGG_OWN_SRC_RELEASE();
                 if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
                 return ray_error("oom", NULL);
             }
@@ -15857,6 +16116,7 @@ da_path:;
                         if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
                     for (uint32_t k = 0; k < n_keys; k++)
                         if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+                    AGG_OWN_SRC_RELEASE();
                     if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
                     return ray_error("oom", NULL);
                 }
@@ -15880,6 +16140,7 @@ da_path:;
                             if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
                         for (uint32_t k = 0; k < n_keys; k++)
                             if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+                        AGG_OWN_SRC_RELEASE();
                         if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
                         return ray_error("oom", NULL);
                     }
@@ -15897,7 +16158,17 @@ da_path:;
             }
             sparse_i64_free(&sp_ht);
 
-            if (use_emit_filter && sp_need_sum) {
+            if (use_emit_filter && sp_need_sum && grp_staged) {
+                spw.ht = &heavy_ht;
+                spw.sums = dense_sum; spw.sums_hi = dense_sum_hi;
+                ray_t* werr = sp_walk_run(&spw, SPW_HEAVY, 0, n_scan);
+                if (werr) {
+                    scratch_free(_h_sum); scratch_free(_h_sum_hi); scratch_free(_h_cnt);
+                    ray_release(key_col); ray_release(result);
+                    sparse_i64_free(&heavy_ht);
+                    rerr = werr; goto resolve_fail;
+                }
+            } else if (use_emit_filter && sp_need_sum) {
                 for (int64_t i = 0; i < n_scan; i++) {
                     int64_t r = match_idx ? match_idx[i] : i;
                     if (!match_idx && rowsel && !group_rowsel_pass(rowsel, r))
@@ -15951,6 +16222,7 @@ da_path:;
                 if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
             for (uint32_t k = 0; k < n_keys; k++)
                 if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+            AGG_OWN_SRC_RELEASE();
             if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
             return result;
         }
@@ -15958,6 +16230,11 @@ da_path:;
 
 ht_path:;
     #undef GROUP_UNSTAGE
+    /* The single-key sparse paths fell back: their stand-ins go, the
+     * builders below read the staged sources. */
+    if (sp_sv_key) { ray_release(key_vecs[0]); key_vecs[0] = NULL; key_owned[0] = 0; }
+    for (uint32_t a = 0; a < n_aggs && sp_sv_agg; a++)
+        if (sp_sv_agg & ((uint64_t)1 << a)) { ray_release(agg_vecs[a]); agg_vecs[a] = NULL; agg_owned[a] = 0; }
     /* The fat-entry routes below (radix phase 1, its v2 sibling, the
      * holistic reprobe, the serial fallback) read staged keys and inputs by
      * range (R-WALK; R-SPARSE over the v2 survivor list).  Random-access
@@ -16177,6 +16454,9 @@ ht_path:;
         ht_rr.fail = &ht_fail;
         ht_rr.staged = true;
         ht_rr.keys_walked = !ht_wide;
+        /* The builders walk rows (or the v2 survivor list), never match_idx:
+         * a staged context has none (unstaged at da_path). */
+        assert(!match_idx);
     }
 
     /* ---- top-N ordering-agg resolution, hoisted above the parallel section.
