@@ -27,3 +27,8 @@
 (set I752 (til 20000))
 (set L752 (table [x y] (list I752 (% I752 3))))
 (at (select {from:(select {from:L752 where:(> x 8192)}) where:(== y 1) take:3}) 'x) -- [8194 8197 8200]
+
+;; Admitted rewrites on a table above the size cutoff: combine filters and
+;; preserve empty grouped column output, including its serialized schema.
+(at (select {from:(select {from:L752 where:(< x 100)}) where:(== y 1) total:(sum x)}) 'total) -- [1617]
+(ser (select {from:(select {from:L752 where:(> x 20000)}) by:y x:x})) -- (ser (select {from:(do (select {from:L752 where:(> x 20000)})) by:y x:x}))

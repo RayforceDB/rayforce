@@ -168,6 +168,8 @@ static test_result_t test_select_merge_review(void) {
         {"{from: (select {from:T where:(> p 19990.0)}) by:b total:(sum p)}", false},
         {"{from: (select {from:T where:(== p 15000.0)}) by:b total:(sum p)}", false},
         {"{from: (select {from:T where:(> p 20000.0)}) by:b total:(sum p)}", false},
+        {"{from: (select {from:T where:(> p 20000.0)}) by:b p:p}", true},
+        {"{from: (select {from:T where:(> p 19990.0)}) by:b p:p}", true},
         {"{from: (select {from:T where:(== p 63.0)}) by:b total:(sum p)}", true},
         {"{from: (select {from:T where:(== p 64.0)}) by:b total:(sum p)}", false},
         {"{from: (select {from: (select {from:T where:(> p 19990.0)}) by:b total:(sum p)}) total:total}", false},
