@@ -1690,7 +1690,7 @@ static void pf_paths(void) {
 /* Ticket task: reads the middle row of its rows of column A (ctx), one
  * page of the sixteen a ticket spans — the one the next call of its thread
  * looks at to tell whether A is read. */
-static volatile int64_t pf_sink;
+static _Atomic int64_t pf_sink;   /* read sink, written by every worker */
 static void pf_touch(void* ctx, uint32_t w, int64_t s, int64_t e) {
     (void)w;
     pf_sink += ((const int64_t*)ctx)[s + (e - s) / 2];
