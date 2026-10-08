@@ -29,6 +29,7 @@
 
 #include "col.h"
 #include "core/platform.h"
+#include "core/pool.h"     /* ray_pool_want — large scattered-row requests */
 #include "mem/heap.h"
 #include "mem/sys.h"   /* ray_sys_alloc — the shared-mapping descriptor */
 #include "store/serde.h"
@@ -1846,14 +1847,42 @@ void ray_col_want_rows(ray_t* col, const int64_t* idx, int64_t n) {
     if (n <= 64 ? (idx[0] >= 0 && idx[0] < col->len &&
                    ray_vm_resident(base + (size_t)idx[0] * esz, esz))
                 : !ray_col_cold(col)) return;
+    size_t bytes = (size_t)col->len * esz;
+    /* As many rows as the column holds: about every page of it. */
+    if (n >= col->len) { ray_pool_want(base, bytes); return; }
+    /* More than a few: mark the pages the rows fall on, then request each
+     * run of marked pages as one range.  The rows may come in any order (a
+     * grouping lists one group's after another's); each page is asked for
+     * once, and only the pages they touch. */
+    uintptr_t p0 = (uintptr_t)base >> 12;
+    size_t pages = (((uintptr_t)base + bytes - 1) >> 12) - p0 + 1;
+    uint64_t* mark = n > 64 ? ray_calloc_raw((pages + 63) / 64 * sizeof(uint64_t)) : NULL;
     uintptr_t last = UINTPTR_MAX;
     for (int64_t i = 0; i < n; i++) {
         if (idx[i] < 0 || idx[i] >= col->len) continue;
         const uint8_t* p = base + (size_t)idx[i] * esz;
         if (((uintptr_t)p >> 12) == last) continue;
         last = (uintptr_t)p >> 12;
-        ray_vm_advise_willneed((void*)p, esz);
+        if (mark) mark[(last - p0) >> 6] |= UINT64_C(1) << ((last - p0) & 63);
+        else ray_vm_advise_willneed((void*)p, esz);
     }
+    if (!mark) return;
+    size_t run = 0;
+    bool open = false;
+    for (size_t w = 0; w < (pages + 63) / 64; w++) {
+        uint64_t m = mark[w];
+        if (m == (open ? ~UINT64_C(0) : 0)) continue;
+        for (unsigned b = 0; b < 64; b++) {
+            bool on = (m >> b) & 1;
+            if (on == open) continue;
+            size_t pg = w * 64 + b;
+            if (on) run = pg;
+            else ray_pool_want((void*)((p0 + run) << 12), (pg - run) << 12);
+            open = on;
+        }
+    }
+    if (open) ray_pool_want((void*)((p0 + run) << 12), (pages - run) << 12);
+    ray_free_raw(mark);
 }
 
 ray_t* ray_col_mmap_splayed_dom(const char* path, struct ray_sym_domain_s* dom) {

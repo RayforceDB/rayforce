@@ -198,16 +198,33 @@ static bool pool_steal(ray_pool_t* pool, uint32_t w, uint32_t* c0, uint32_t* c1)
  * the mapped columns it reads (ray_pool_scan_set); while one of its
  * dispatches runs, each thread keeps the next `scan_bytes` of every
  * registered column, from the row it is at, requested (MADV_WILLNEED,
- * window by window), topping the request up once half of it is used.
+ * window by window), topping the request up once half of it is used.  A
+ * window stops where the thread's own run of rows does: the rows past it
+ * are another thread's to ask for, and asking twice costs on fast storage.
  *
  * The row comes from the ticket for a dispatch over exactly the registered
  * rows (ticket base+i holds rows [i*grain, (i+1)*grain)), and from the task
- * itself (ray_pool_scan_at) for dispatch_n tasks that walk a row range.
+ * itself (ray_pool_scan_at) for dispatch_n tasks that walk a row range, or
+ * (ray_pool_scan_col_at) for tasks that know the one column they read.
  * Rows of zone chunks the query's filter rules out (scan->gate) are never
  * requested.  RAY_SCAN_PREFETCH sets the window in KiB (default 4096, 0
  * turns read-ahead off); it is read when the pool is created.
  * -------------------------------------------------------------------------- */
 static RAY_TLS const ray_pool_scan_t* t_scan;
+
+/* Dispatch generations, process-wide: a pool made again after
+ * ray_pool_destroy (which zeroes it) must not meet per-thread state left
+ * by a dispatch of the old one under the same number. */
+static _Atomic(uint64_t) pool_scan_gens;
+
+/* Where residency cannot be queried (ray_vm_resident is always false) the
+ * probe below would never see a column read: there every column counts as
+ * read, as before the probe. */
+#if defined(RAY_OS_WINDOWS)
+#define POOL_SCAN_PROBED 0
+#else
+#define POOL_SCAN_PROBED 1
+#endif
 
 /* What this thread has requested for the current dispatch: rows
  * [lo[c], hi[c]) of column c.  Stale (gen differs) at a new dispatch.
@@ -269,15 +286,17 @@ static void pool_scan_request(const ray_pool_scan_t* s, uint32_t c, int64_t a, i
     if (run >= 0) pool_scan_willneed(s, c, run, b);
 }
 
-/* This thread is about to read row r and goes on towards `end`. */
-static void pool_scan_ahead(ray_pool_t* pool, int64_t r, int64_t end) {
+/* This thread is about to read row r and goes on towards `end`.  `reads`:
+ * the columns the caller says it reads, by bit (0 when it does not say, and
+ * the probe finds them). */
+static void pool_scan_ahead(ray_pool_t* pool, int64_t r, int64_t end, uint32_t reads) {
     const ray_pool_scan_t* s = pool->scan;
     if (end > s->rows) end = s->rows;
     if (r < 0 || r >= end) return;
     pool_scan_tls_t* t = &t_pf;
     if (t->gen != pool->scan_gen) {
         t->gen = pool->scan_gen;
-        t->active = 0;
+        t->active = POOL_SCAN_PROBED ? 0 : UINT32_MAX;
         t->last = -1;
         memset(t->miss, 0, sizeof(t->miss));
         for (uint32_t c = 0; c < s->n; c++) t->lo[c] = t->hi[c] = r;
@@ -288,13 +307,18 @@ static void pool_scan_ahead(ray_pool_t* pool, int64_t r, int64_t end) {
         int64_t ch = r >> s->gate_log2;
         if (!((s->gate[ch >> 6] >> (ch & 63)) & 1)) { t->last = -1; return; }
     }
-    /* Which columns were read over the rows behind this one.  A column
-     * found unread a few times is one this pass reads sparsely or not at
-     * all: this thread stops probing it for the rest of the dispatch. */
-    if (t->last >= 0 && t->last != r) {
+    /* Which columns were read over the rows behind this one; the rows a
+     * column had resident when registered tell nothing (scan->warm).  A
+     * column found unread a few times is one this pass reads sparsely or
+     * not at all: this thread stops probing it for the rest of the
+     * dispatch.  A caller that names its columns needs no probe, from its
+     * first call. */
+    if (reads) {
+        t->active |= reads;
+    } else if (t->last >= 0 && t->last != r) {
         int64_t mid = (t->last < r ? t->last + r : r + t->last) / 2;
         for (uint32_t c = 0; c < s->n && c < 32; c++) {
-            if ((t->active >> c & 1) || t->miss[c] >= 4) continue;
+            if ((t->active >> c & 1) || t->miss[c] >= 4 || mid < s->warm[c]) continue;
             if (ray_vm_resident(s->base[c] + (size_t)mid * s->esz[c], 1))
                 t->active |= UINT32_C(1) << c;
             else
@@ -316,10 +340,16 @@ static void pool_scan_ahead(ray_pool_t* pool, int64_t r, int64_t end) {
     }
 }
 
-static inline void pool_scan_ticket(ray_pool_t* pool, uint32_t tk) {
+/* Ticket tk is next, and this thread's run of tickets goes on to `until`
+ * (to the tail of own range `s` when given): past it are other threads'
+ * rows, which they ask for themselves. */
+static inline void pool_scan_ticket(ray_pool_t* pool, uint32_t tk, uint32_t until,
+                                    ray_pool_slot_t* s) {
     if (!pool->scan_auto) return;
-    pool_scan_ahead(pool, (int64_t)(uint32_t)(tk - (uint32_t)pool->scan_base) * pool->scan_grain,
-                    pool->scan->rows);
+    if (s) until = RANGE_TAIL(atomic_load_explicit(&s->range, memory_order_relaxed));
+    uint32_t base = (uint32_t)pool->scan_base;
+    pool_scan_ahead(pool, (int64_t)(uint32_t)(tk - base) * pool->scan_grain,
+                    (int64_t)(uint32_t)(until - base) * pool->scan_grain, 0);
 }
 
 static void pool_run_steal(ray_pool_t* pool, uint32_t w, bool prog) {
@@ -329,7 +359,7 @@ static void pool_run_steal(ray_pool_t* pool, uint32_t w, bool prog) {
         uint32_t tk;
         while (pool_range_take(s, &tk)) {
             if ((uint32_t)(tk - ch0) < (uint32_t)(ch1 - ch0)) s->stolen++; else s->own++;
-            pool_scan_ticket(pool, tk);
+            pool_scan_ticket(pool, tk, 0, s);
             pool_exec(pool, w, tk);
             if (prog) ray_progress_pump();
         }
@@ -357,7 +387,7 @@ static void pool_run_steal(ray_pool_t* pool, uint32_t w, bool prog) {
         }
         s->stolen += c1 - c0;
         for (; c0 != c1; c0++) {
-            pool_scan_ticket(pool, c0);
+            pool_scan_ticket(pool, c0, c1, NULL);
             pool_exec(pool, w, c0);
             if (prog) ray_progress_pump();
         }
@@ -697,7 +727,7 @@ void ray_pool_free(ray_pool_t* pool) {
  * rows (`total` elements, `grain` per ticket from `base`). */
 static void pool_scan_begin(ray_pool_t* pool, int64_t total, uint64_t base, int64_t grain) {
     const ray_pool_scan_t* sc = (pool->scan_bytes && t_scan && t_scan->n) ? t_scan : NULL;
-    pool->scan_gen++;
+    pool->scan_gen = atomic_fetch_add_explicit(&pool_scan_gens, 1, memory_order_relaxed) + 1;
     pool->scan = sc;
     pool->scan_auto = sc && pool->steal && grain > 0 && sc->rows == total;
     pool->scan_base = base;
@@ -1042,7 +1072,58 @@ void ray_pool_scan_at(int64_t nrows, int64_t r, int64_t end) {
     ray_pool_t* pool = &g_pool;
     const ray_pool_scan_t* s = pool->scan;
     if (!s || s->rows != nrows) return;
-    pool_scan_ahead(pool, r, end);
+    pool_scan_ahead(pool, r, end, 0);
+}
+
+/* The bit of the `nrows`-row column at `col` in registration `s`; 0 when
+ * it is not registered there. */
+static uint32_t pool_scan_col_bit(const ray_pool_scan_t* s, const void* col, int64_t nrows) {
+    if (!s || s->rows != nrows) return 0;
+    for (uint32_t c = 0; c < s->n && c < 32; c++)
+        if (s->base[c] == (const uint8_t*)col) return UINT32_C(1) << c;
+    return 0;
+}
+
+void ray_pool_scan_col_at(const void* col, int64_t nrows, int64_t r, int64_t end) {
+    ray_pool_t* pool = &g_pool;
+    uint32_t bit = pool_scan_col_bit(pool->scan, col, nrows);
+    if (bit) pool_scan_ahead(pool, r, end, bit);
+}
+
+bool ray_pool_scan_holds(const void* col, int64_t nrows) {
+    return g_pool.scan_bytes && pool_scan_col_bit(t_scan, col, nrows);
+}
+
+bool ray_pool_scan_on(void) { return g_pool.scan_bytes != 0; }
+
+/* Asking for a range costs the caller about a microsecond a page: the
+ * kernel allocates and queues each page before the call returns.  A large
+ * range asked for outside a dispatch is split over the pool's threads. */
+typedef struct {
+    uintptr_t a, end;
+    size_t    step;
+} pool_want_ctx_t;
+
+static void pool_want_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    const pool_want_ctx_t* c = raw;
+    for (int64_t i = start; i < end; i++) {
+        uintptr_t a = c->a + (uintptr_t)i * c->step;
+        ray_vm_advise_willneed((void*)a, c->end - a < c->step ? c->end - a : c->step);
+    }
+}
+
+void ray_pool_want(const void* p, size_t bytes) {
+    ray_pool_t* pool = &g_pool;
+    size_t step = (size_t)1 << 20;
+    if (bytes / step > RAY_POOL_INIT_TASKS) step = (bytes + RAY_POOL_INIT_TASKS - 1) / RAY_POOL_INIT_TASKS;
+    uint32_t n = (uint32_t)((bytes + step - 1) / step);
+    if (n < 4 || !ray_pool_par_dispatch_ok(pool, n, 4)) {
+        ray_vm_advise_willneed((void*)p, bytes);
+        return;
+    }
+    pool_want_ctx_t c = { (uintptr_t)p, (uintptr_t)p + bytes, step };
+    ray_pool_dispatch_n(pool, pool_want_fn, &c, n);
 }
 
 /* --------------------------------------------------------------------------

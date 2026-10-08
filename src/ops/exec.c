@@ -4258,9 +4258,19 @@ void exec_scan_add_col(ray_pool_scan_t* s, ray_t* col) {
     s->rows = col->len;
     const uint8_t* base = (const uint8_t*)ray_data(col);
     for (uint32_t k = 0; k < s->n; k++) if (s->base[k] == base) return;
-    if (s->n >= RAY_POOL_SCAN_MAX || ray_vm_resident(base, (size_t)col->len * esz)) return;
+    size_t bytes = (size_t)col->len * esz;
+    if (s->n >= RAY_POOL_SCAN_MAX || ray_vm_resident(base, bytes)) return;
+    /* The pages at its start that are resident already, up to 4 MiB: read
+     * ahead with the header when the column was opened (see warm).  They
+     * run on from the first, so halving finds where they end. */
+    size_t lo = 0, hi = (bytes < ((size_t)4 << 20) ? bytes : ((size_t)4 << 20)) / 4096;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (ray_vm_resident(base + mid * 4096, 1)) lo = mid + 1; else hi = mid;
+    }
     s->base[s->n] = base;
     s->esz[s->n] = (uint32_t)esz;
+    s->warm[s->n] = (int64_t)(lo * 4096 / esz);
     s->n++;
 }
 

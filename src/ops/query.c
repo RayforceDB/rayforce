@@ -6453,20 +6453,14 @@ static ray_t* try_count_distinct_v2_rewrite(
  * n_groups with the per-group distinct count. */
 /* The per-group gathers of count_distinct_per_group_buf read `src` at the
  * rows its groups list.  On a mapped column that is not cached they would
- * wait on one page fault at a time: request those rows first — the whole
- * column when there is at least a quarter of a listed row per page of it,
- * else the pages of the listed rows. */
+ * wait on one page fault at a time: request the pages those rows fall on
+ * first, runs of them as one range — clustered rows ask for their stretch
+ * of the column only.  Scan read-ahead, so RAY_SCAN_PREFETCH=0 turns it off. */
 static void cd_want_group_rows(ray_t* src, const int64_t* idx_buf,
                                const int64_t* offsets, const int64_t* grp_cnt,
                                int64_t n_groups) {
-    if (!src || RAY_IS_ERR(src) || n_groups <= 0 || !ray_col_cold(src)) return;
-    int64_t total = offsets[n_groups - 1] + grp_cnt[n_groups - 1];
-    size_t esz = ray_sym_elem_size(src->type, src->attrs);
-    if (total <= 0 || esz == 0 || src->len <= 0) return;
-    if ((double)total / (double)src->len * (4096.0 / (double)esz) >= 0.25)
-        ray_vm_advise_willneed(ray_data(src), (size_t)src->len * esz);
-    else
-        ray_col_want_rows(src, idx_buf, total);
+    if (!src || RAY_IS_ERR(src) || n_groups <= 0 || !ray_pool_scan_on()) return;
+    ray_col_want_rows(src, idx_buf, offsets[n_groups - 1] + grp_cnt[n_groups - 1]);
 }
 
 static ray_t* count_distinct_per_group_buf(ray_t* inner_expr, ray_t* tbl,
@@ -9200,6 +9194,7 @@ static void scan_gate_drop_cached(ray_pool_scan_t* s) {
         if (!cached) { k++; continue; }
         s->base[k] = s->base[s->n - 1];
         s->esz[k] = s->esz[s->n - 1];
+        s->warm[k] = s->warm[s->n - 1];
         s->n--;
     }
 }
@@ -9228,10 +9223,11 @@ static void select_scan_register(ray_t** args, ray_t* dict, ray_t* tbl, ray_t* w
     bool rows_set = ss->scan.rows >= 0;
     if (!rows_set) ss->scan.rows = nrows;   /* the gate is sized by it */
     if (where) scan_gate_where(ss, where, tbl, 0);
-    if (ss->scan.gate) scan_gate_drop_cached(&ss->scan);
     bool defer = where && !ss->scan.gate;
     for (int i = 0; i < n; i++)
         exec_scan_add_col(defer ? &ss->defer : &ss->scan, ray_table_get_col(tbl, syms[i]));
+    /* Once every column is in: the gate's cached ones are not requested. */
+    if (ss->scan.gate) scan_gate_drop_cached(&ss->scan);
     /* A column the filter also reads is requested with it. */
     for (uint32_t k = 0; k < ss->defer.n; ) {
         bool dup = false;
@@ -9239,6 +9235,7 @@ static void select_scan_register(ray_t** args, ray_t* dict, ray_t* tbl, ray_t* w
         if (!dup) { k++; continue; }
         ss->defer.base[k] = ss->defer.base[ss->defer.n - 1];
         ss->defer.esz[k] = ss->defer.esz[ss->defer.n - 1];
+        ss->defer.warm[k] = ss->defer.warm[ss->defer.n - 1];
         ss->defer.n--;
     }
     /* No mapped column at all: leave ray_execute its own registration. */
@@ -9308,6 +9305,7 @@ void ray_select_scan_filtered(ray_t* sel, int64_t kept) {
             if (ss->scan.n < RAY_POOL_SCAN_MAX) {
                 ss->scan.base[ss->scan.n] = d->base[k];
                 ss->scan.esz[ss->scan.n] = d->esz[k];
+                ss->scan.warm[ss->scan.n] = d->warm[k];
                 ss->scan.n++;
             }
         } else if (pass > 0) {

@@ -71,11 +71,15 @@ typedef struct {
  * worker keeps the rows just ahead of the ones it reads requested from
  * storage (see pool.c).  `gate`, when set, is the zone-index verdict of the
  * query's filter: bit c clear means no row of [c << gate_log2,
- * (c + 1) << gate_log2) can pass it, so nothing there is requested. */
+ * (c + 1) << gate_log2) can pass it, so nothing there is requested.
+ * warm[c]: the rows at the start of column c that were resident when it was
+ * registered (the kernel reads them ahead with the header when the column
+ * is opened); their residency says nothing of what a pass reads. */
 #define RAY_POOL_SCAN_MAX 32
 typedef struct {
     const uint8_t*  base[RAY_POOL_SCAN_MAX];
     uint32_t        esz[RAY_POOL_SCAN_MAX];
+    int64_t         warm[RAY_POOL_SCAN_MAX];
     uint32_t        n;
     int64_t         rows;
     const uint64_t* gate;
@@ -215,6 +219,25 @@ const ray_pool_scan_t* ray_pool_scan_get(void);
  * dispatch over exactly the registered rows needs no call (the pool
  * requests per ticket).  Cheap when nothing is registered. */
 void ray_pool_scan_at(int64_t nrows, int64_t r, int64_t end);
+
+/* ray_pool_scan_at for a task that reads one registered column, its data
+ * at `col` (a gather): only that column is requested, from the first call
+ * on.  No-op when `col` is not registered for the open dispatch. */
+void ray_pool_scan_col_at(const void* col, int64_t nrows, int64_t r, int64_t end);
+
+/* True when read-ahead is on and the calling thread's registration holds
+ * the `nrows`-row column with data at `col`: a dispatch it makes next can
+ * have its tasks report positions in that column (ray_pool_scan_col_at). */
+bool ray_pool_scan_holds(const void* col, int64_t nrows);
+
+/* Read-ahead is on (RAY_SCAN_PREFETCH is not 0).  For requests made outside
+ * the per-dispatch windows, which honour the same switch. */
+bool ray_pool_scan_on(void);
+
+/* Ask for [p, p+bytes) of a file mapping (ray_vm_advise_willneed), with the
+ * work of a large range split over the pool's threads when called outside
+ * a dispatch. */
+void ray_pool_want(const void* p, size_t bytes);
 
 void ray_pool_dispatch(ray_pool_t* pool, ray_pool_fn fn, void* ctx, int64_t total_elems);
 
