@@ -2989,6 +2989,16 @@ static test_result_t test_scalar_route_shapes(void) {
     ray_enc_counters_get(&kc);
     TEST_ASSERT_EQ_U(kc.decoded_bytes, 0);
     sr_drop(r);
+    /* a nullable column's avg / min / max at planning */
+    static const char* const qn = "(select {a: (avg v) mn: (min v) mx: (max v) c: (count v) from: T})";
+    SR_SAME(qn, 0);
+    sr_eval_ok("(set T (.db.splayed.get \"" SR_G2 "\"))");
+    ray_enc_counters_reset();
+    r = sr_eval(qn);
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    ray_enc_counters_get(&kc);
+    TEST_ASSERT_EQ_U(kc.decoded_bytes, 0);
+    sr_drop(r);
     /* float extremes are not answered there (the zone declines them) */
     SR_SAME("(select {mn: (min f) mx: (max e) from: T})", 0);
     /* SYM extremes in the domain's order (never by raw ids), widths per piece */
@@ -3000,19 +3010,29 @@ static test_result_t test_scalar_route_shapes(void) {
     SR_SAME("(select {mn: (min d) mx: (max d) a: (avg d) from: T where: (> g 3)})", 0);   /* DATE */
     /* a holistic input reads its plain column (R-RANDOM): only k */
     SR_SAME("(select {m: (med k) s: (sum v) from: T where: (> g 0)})", 1);
-    /* an encoded STR strlen input is declined to the plain path */
     PASS();
 }
 
-/* The tight F64 kernel over a staged column gives the generation-0 bits:
- * a serial run (fewer rows than the parallel threshold, so one block and a
- * deterministic order) over non-integral values. */
+/* The tight F64 kernel sums by explicit lanes (row mod 8, combined in one
+ * fixed order) on both generations: a serial run (fewer rows than the
+ * parallel threshold: one task, a deterministic order) over non-integral
+ * values (whose sum depends on the order: a plain row-order sum differs)
+ * gives generation 0's bits from zero-copy pieces, and exactly the
+ * lane reference computed here, whatever the build. */
 static test_result_t test_scalar_route_f64_bits(void) {
+    const int64_t n = 60000;
     sr_eval_ok("(set i (til 60000))");
-    sr_eval_ok("(set R (table [x] (list (* (as 'F64 i) 0.1))))");
+    sr_eval_ok("(set R (table [x] (list (* (as 'F64 (% (* i 7919) 1000003)) 0.37))))");
     sr_eval_ok("(.db.splayed.set \"" SR_TMP "/sf0/\" R {compress: false})");
     sr_eval_ok("(.db.splayed.set \"" SR_TMP "/sf2/\" R {compress: true})");
-    static const char* const q[] = { "(select {s: (sum (+ x 0.5)) from: T})",
+    volatile double lane[8] = { 0 };
+    for (int64_t r = 0; r < n; r++) lane[r & 7] += (double)((r * 7919) % 1000003) * 0.37;
+    volatile double ab = (lane[0] + lane[1]), cd = (lane[2] + lane[3]);
+    volatile double ef = (lane[4] + lane[5]), gh = (lane[6] + lane[7]);
+    volatile double lo = ab + cd, hi = ef + gh;
+    double ref = lo + hi;
+    static const char* const q[] = { "(select {s: (sum x) from: T})",
+                                     "(select {s: (sum (+ x 0.5)) from: T})",
                                      "(select {a: (avg (+ x 0.25)) from: T})", NULL };
     for (int i = 0; q[i]; i++) {
         double v[2];
@@ -3029,6 +3049,7 @@ static test_result_t test_scalar_route_f64_bits(void) {
             if (gen) TEST_ASSERT_EQ_U(k.materialized, 0);
         }
         TEST_ASSERT_FMT(memcmp(&v[0], &v[1], sizeof v[0]) == 0, "%s: %.17g vs %.17g", q[i], v[0], v[1]);
+        if (i == 0) TEST_ASSERT_FMT(memcmp(&v[0], &ref, sizeof ref) == 0, "lanes: %.17g vs reference %.17g", v[0], ref);
     }
     PASS();
 }
@@ -3091,6 +3112,104 @@ static test_result_t test_group_route_hook(void) {
     TEST_ASSERT_EQ_U(agg_route_stats().routes[AGG_ROUTE_LEGACY], 0);   /* disarmed */
     sr_drop(r);
     for (int route = 0; route < 4; route++) sr_drop(out[route]);
+    /* 2 skips the direct array: over generation 2 the direct array reads
+     * by range (no materialization), the legacy radix route does not yet */
+    uint64_t mat[3];
+    for (int route = 1; route <= 2; route++) {
+        sr_eval_ok("(set T (.db.splayed.get \"" SR_G2 "\"))");
+        ray_group_test_route(route);
+        ray_enc_counters_reset();
+        r = sr_eval(q);
+        ray_enc_counters_t k; ray_enc_counters_get(&k);
+        ray_group_test_route(0);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+        sr_drop(r);
+        mat[route] = k.materialized;
+    }
+    TEST_ASSERT_EQ_U(mat[1], 0);
+    TEST_ASSERT_TRUE(mat[2] > 0);
+    /* 3 skips the slice-group route: the armed hint folds into a selection */
+    sr_eval_ok("(set KS (as 'SYM (at ['aa 'bb 'cc 'dd 'ee 'ff 'gg 'hh] (% (til 4000) 8))))");
+    sr_eval_ok("(set TI (table [s f] (list (.attr.set 'grouped KS) (as 'F64 (% (til 4000) 64)))))");
+    const char* qs = "(select {sv: (sum f) from: TI by: s asc: s where: (in s ['aa 'cc])})";
+    ray_t* so[2];
+    uint64_t sl[2];
+    for (int i = 0; i < 2; i++) {
+        ray_group_test_route(i ? 3 : 0);
+        agg_route_reset();
+        so[i] = sr_eval(qs);
+        sl[i] = agg_route_stats().routes[AGG_ROUTE_SLICES];
+        ray_group_test_route(0);
+        TEST_ASSERT_TRUE(so[i] && !RAY_IS_ERR(so[i]) && ray_table_nrows(so[i]) == 2);
+    }
+    TEST_ASSERT_TRUE(sl[0] > 0);
+    TEST_ASSERT_EQ_U(sl[1], 0);
+    ray_t* fa = ray_fmt(so[0], 0); ray_t* fb = ray_fmt(so[1], 0);
+    TEST_ASSERT_TRUE(ray_str_len(fa) == ray_str_len(fb) &&
+                     memcmp(ray_str_ptr(fa), ray_str_ptr(fb), ray_str_len(fa)) == 0);
+    ray_release(fa); ray_release(fb); sr_drop(so[0]); sr_drop(so[1]);
+    PASS();
+}
+
+/* Fix round 1 (I1): a SYM input wider than W8 (3000 symbols: W16) is read
+ * at each piece's width, with and without a selection; an encoded STR
+ * strlen input is declined to the plain path (it materializes). */
+static test_result_t test_scalar_route_wide_sym(void) {
+    const int64_t n = 200000;
+    ray_t* sv = ray_sym_vec_new(RAY_SYM_W64, n); sv->len = n;
+    ray_t* tv = ray_vec_new(RAY_STR, n); tv->len = 0;
+    for (int64_t i = 0; i < n; i++) {
+        char b[24]; int nb = snprintf(b, sizeof b, "sym%lld", (long long)((i * 7) % 3000));
+        ((int64_t*)ray_data(sv))[i] = ray_sym_intern(b, (size_t)nb);
+        tv = ray_str_vec_append(tv, b, (size_t)nb);
+    }
+    ray_env_set(ray_sym_intern("wsv", 3), sv); ray_release(sv);
+    ray_env_set(ray_sym_intern("wtv", 3), tv); ray_release(tv);
+    sr_eval_ok("(set WS (table [s t g] (list wsv wtv (as 'I16 (% (til 200000) 7)))))");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/ws0/\" WS {compress: false})");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/ws2/\" WS {compress: true})");
+    const char* t0 = "(.db.splayed.get \"" SR_TMP "/ws0/\")";
+    const char* t2 = "(.db.splayed.get \"" SR_TMP "/ws2/\")";
+    sr_evalf_ok("(set T %s)", t2);
+    ray_t* T = sr_eval("T");
+    ray_col_meta_t m;
+    TEST_ASSERT_TRUE(T && ray_table_col_meta(T, ray_sym_intern("s", 1), &m) && m.enc &&
+                     (m.attrs & RAY_SYM_W_MASK) == RAY_SYM_W16);
+    sr_drop(T);
+    static const struct { const char* q; uint64_t mat; } qs[] = {
+        { "(select {mn: (min s) mx: (max s) l: (sum (strlen s)) from: T})", 0 },
+        { "(select {mn: (min s) mx: (max s) l: (avg (strlen s)) f: (first s) from: T where: (> g 2)})", 0 },
+        { "(select {l: (sum (strlen s)) from: T where: (> g 0)})", 0 },
+        { "(select {l: (sum (strlen t)) c: (count g) from: T where: (> g 2)})", 1 },   /* STR: declined, t materializes */
+    };
+    for (size_t i = 0; i < sizeof qs / sizeof qs[0]; i++) {
+        test_result_t r = sr_same_on(t0, t2, qs[i].q, qs[i].mat);
+        if (r.status != TEST_PASS) return r;
+    }
+    PASS();
+}
+
+/* Fix round 1 (I2): plain inputs bound beside staged ones in one context:
+ * an expression input, and a column an earlier query materialized. */
+static test_result_t test_scalar_route_mixed(void) {
+    SR_SAME("(select {s: (sum (+ k g)) m: (max v) from: T where: (> g 0)})", 0);
+    SR_SAME("(select {s: (sum (* f g)) m: (min d) a: (avg v) from: T where: (> k 10)})", 0);
+    SR_SAME("(select {s: (sum (+ k g)) a: (avg (* f 2.0)) l: (last v) from: T})", 0);
+    /* k materialized before the query: read in place beside staged v */
+    sr_eval_ok("(set T2M (.db.splayed.get \"" SR_G2 "\"))");
+    ray_t* t = sr_eval("T2M");
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    ray_t* kcol = ray_table_col(t, ray_sym_intern("k", 1));
+    TEST_ASSERT_TRUE(kcol && !RAY_IS_ERR(kcol));
+    sr_drop(t);
+    static const char* const q[] = {   /* not sum / avg of k: a ready bare k would be a linear plan */
+        "(select {mx: (max k) s: (sum v) a: (avg g) from: T where: (> g 0)})",
+        "(select {mn: (min k) l: (last k) m: (max v) from: T where: (> g 2)})",
+        NULL };
+    for (int i = 0; q[i]; i++) {
+        test_result_t r = sr_same_on("(.db.splayed.get \"" SR_G0 "\")", "T2M", q[i], 0);
+        if (r.status != TEST_PASS) return r;
+    }
     PASS();
 }
 
@@ -3334,6 +3453,8 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/scalar_route_f64_bits", test_scalar_route_f64_bits, srr_setup, srr_teardown },
     { "scanrange/scalar_route_error", test_scalar_route_error, srr_setup, srr_teardown },
     { "scanrange/group_route_hook",   test_group_route_hook,   srr_setup, srr_teardown },
+    { "scanrange/scalar_route_wide_sym", test_scalar_route_wide_sym, srr_setup, srr_teardown },
+    { "scanrange/scalar_route_mixed", test_scalar_route_mixed, srr_setup, srr_teardown },
     { "scanrange/da_route",           test_da_route,           srr_setup, srr_teardown },
     { "scanrange/da_route_shapes",    test_da_route_shapes,    srr_setup, srr_teardown },
     { "scanrange/da_route_error",     test_da_route_error,     srr_setup, srr_teardown },

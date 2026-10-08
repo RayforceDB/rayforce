@@ -8896,46 +8896,94 @@ static void scalar_sum_i64_fn(void* ctx, uint32_t worker_id, int64_t start, int6
     scalar_run_staged((scalar_ctx_t*)ctx, worker_id, start, end, scalar_sum_i64_body);
 }
 
-/* Tight SIMD-friendly loop for single SUM/AVG on f64 (no mask).  The task
- * keeps one partial sum, added to the accumulator once; the release build
- * reassociates (vectorizes) that loop, so its grouping of additions
- * depends on the block it is given.  A staged task therefore gathers its
- * whole block [start, end) contiguously first (the walk's pieces copied
- * into one task buffer; a serial run's block is the whole column, beyond
- * the walk's contiguous bound) and runs the same loop over it: the partial
- * is the bits generation 0 computes for that block. */
-__attribute__((noinline)) static double scalar_f64_partial(const double* restrict data, int64_t n) {
-    double sum = 0.0;
-    for (int64_t r = 0; r < n; r++)
-        sum += data[r];
-    return sum;
+/* Tight loop for single SUM/AVG on f64 (no mask), by explicit lanes: row r
+ * adds into lane r mod SC_F64_LANES, each lane in row order, and the task's
+ * partial is the lanes combined in one fixed order.  The answer therefore
+ * depends only on the rows each task covers, never on how a task's rows are
+ * cut into pieces, nor on the compiler (the lanes are pinned against
+ * reassociation): a staged task reads zero-copy pieces with its lanes
+ * carried across them and gives generation 0's bits for the same task. */
+#define SC_F64_LANES 8
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+#define SC_F64_PIN(v) __asm__("" : "+x"(v))
+#elif defined(__GNUC__) && defined(__aarch64__)
+#define SC_F64_PIN(v) __asm__("" : "+w"(v))
+#else
+#define SC_F64_PIN(v) ((void)0)
+#endif
+typedef struct { double l[SC_F64_LANES]; } sc_f64_lanes_t;
+
+/* Rows [row0, row0 + n) at d into the lanes. */
+static void sc_f64_lanes_add(sc_f64_lanes_t* restrict s, const double* restrict d, int64_t row0, int64_t n) {
+    int64_t i = 0;
+    for (; i < n && ((row0 + i) & (SC_F64_LANES - 1)); i++)
+        s->l[(row0 + i) & (SC_F64_LANES - 1)] += d[i];
+#if defined(__GNUC__) && defined(__AVX__)
+    /* two 4-lane vectors: lanes {0..3} {4..7}, each lane still one
+     * row-order chain (a vector add is lane-wise): the same bits as the
+     * 2-lane and scalar forms below */
+    typedef double sc_v4d __attribute__((vector_size(32)));
+    sc_v4d v0, v1;
+    memcpy(&v0, &s->l[0], 32); memcpy(&v1, &s->l[4], 32);
+    for (; i + SC_F64_LANES <= n; i += SC_F64_LANES) {
+        sc_v4d x0, x1;
+        memcpy(&x0, d + i, 32); memcpy(&x1, d + i + 4, 32);
+        v0 += x0; v1 += x1;
+        SC_F64_PIN(v0); SC_F64_PIN(v1);
+    }
+    memcpy(&s->l[0], &v0, 32); memcpy(&s->l[4], &v1, 32);
+#elif defined(__GNUC__)
+    /* four 2-lane vectors: lanes {0,1} {2,3} {4,5} {6,7}, each lane still
+     * one row-order chain (a vector add is lane-wise) */
+    typedef double sc_v2d __attribute__((vector_size(16)));
+    sc_v2d v0, v1, v2, v3;
+    memcpy(&v0, &s->l[0], 16); memcpy(&v1, &s->l[2], 16);
+    memcpy(&v2, &s->l[4], 16); memcpy(&v3, &s->l[6], 16);
+    for (; i + SC_F64_LANES <= n; i += SC_F64_LANES) {
+        sc_v2d x0, x1, x2, x3;
+        memcpy(&x0, d + i, 16);     memcpy(&x1, d + i + 2, 16);
+        memcpy(&x2, d + i + 4, 16); memcpy(&x3, d + i + 6, 16);
+        v0 += x0; v1 += x1; v2 += x2; v3 += x3;
+        SC_F64_PIN(v0); SC_F64_PIN(v1); SC_F64_PIN(v2); SC_F64_PIN(v3);
+    }
+    memcpy(&s->l[0], &v0, 16); memcpy(&s->l[2], &v1, 16);
+    memcpy(&s->l[4], &v2, 16); memcpy(&s->l[6], &v3, 16);
+#else
+    for (; i + SC_F64_LANES <= n; i += SC_F64_LANES)
+        for (int l = 0; l < SC_F64_LANES; l++) s->l[l] += d[i + l];
+#endif
+    for (; i < n; i++)
+        s->l[(row0 + i) & (SC_F64_LANES - 1)] += d[i];
 }
 
-typedef struct { double* buf; int64_t lo; } scalar_f64_gather_t;
+static double sc_f64_lanes_total(const sc_f64_lanes_t* s) {
+    double a = s->l[0] + s->l[1]; SC_F64_PIN(a);
+    double b = s->l[2] + s->l[3]; SC_F64_PIN(b);
+    double c = s->l[4] + s->l[5]; SC_F64_PIN(c);
+    double d = s->l[6] + s->l[7]; SC_F64_PIN(d);
+    double ab = a + b; SC_F64_PIN(ab);
+    double cd = c + d; SC_F64_PIN(cd);
+    return ab + cd;
+}
 
-static void scalar_f64_gather(void* ctx, uint32_t wid, int64_t b, int64_t e, const ray_col_piece_t* p) {
+static void scalar_f64_piece(void* ctx, uint32_t wid, int64_t b, int64_t e, const ray_col_piece_t* p) {
     (void)wid;
-    scalar_f64_gather_t* gc = (scalar_f64_gather_t*)ctx;
-    memcpy(gc->buf + (b - gc->lo), p[0].data, (size_t)(e - b) * sizeof(double));
+    sc_f64_lanes_add((sc_f64_lanes_t*)ctx, (const double*)p[0].data, b, e - b);
 }
 
 static void scalar_sum_f64_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
     scalar_ctx_t* c = (scalar_ctx_t*)ctx;
     da_accum_t* acc = &c->accums[worker_id];
+    sc_f64_lanes_t lanes = { { 0 } };
     if (!c->staged) {
-        acc->sum[0].f += scalar_f64_partial((const double*)c->agg_ptrs[0] + start, end - start);
-        acc->count[0] += end - start;
-        return;
+        sc_f64_lanes_add(&lanes, (const double*)c->agg_ptrs[0] + start, start, end - start);
+    } else {
+        if (ray_scan_fail_skip(c->fail, start)) return;
+        ray_t* err = ray_col_walk(c->srcs, c->plain, 1, start, end, false, &lanes, worker_id, scalar_f64_piece);
+        if (err) { ray_scan_fail_note(c->fail, start, err); return; }
     }
-    if (ray_scan_fail_skip(c->fail, start)) return;
-    double* buf = (double*)ray_alloc_raw((size_t)(end - start) * sizeof(double));
-    if (!buf) { ray_scan_fail_note(c->fail, start, ray_error("oom", "scalar sum block")); return; }
-    scalar_f64_gather_t gc = { buf, start };
-    ray_t* err = ray_col_walk(c->srcs, c->plain, 1, start, end, false, &gc, worker_id, scalar_f64_gather);
-    if (err) { ray_free_raw(buf); ray_scan_fail_note(c->fail, start, err); return; }
-    acc->sum[0].f += scalar_f64_partial(buf, end - start);
+    acc->sum[0].f += sc_f64_lanes_total(&lanes);
     acc->count[0] += end - start;
-    ray_free_raw(buf);
 }
 
 /* Tight loop for single SUM/AVG on integer linear expression (no mask).
@@ -13434,7 +13482,9 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                     }
                     sc_srcs[a] = &agg_own_src[a];
                 }
-                sc_plain[a] = agg_vecs[a] ? ray_data(agg_vecs[a]) : NULL;
+                /* the source's in-place base: NULL for a staged source and
+                 * for a plain parted wrapper (no single base), read by range */
+                sc_plain[a] = ray_col_src_base(sc_srcs[a]);
                 if (!sc_plain[a]) ray_col_src_advise(sc_srcs[a], 0, nrows);
             }
         }

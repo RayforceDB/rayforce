@@ -2822,6 +2822,17 @@ static test_result_t test_try_plans_bound(void) {
             TEST_ASSERT_TRUE(fa && !RAY_IS_ERR(fa) && fb && !RAY_IS_ERR(fb));
             TEST_ASSERT_TRUE(try_linear_sumavg_input_i64(gr, t, d_lin, &lin, &err));
             TEST_ASSERT_TRUE(lin.term_ptrs[0] == ray_data(fb) || lin.term_ptrs[0] == ray_data(fa));
+            ray_t* ff = ray_table_col(t, ray_sym_intern("f", 1));
+            ray_t* fg = ray_table_col(t, ray_sym_intern("g", 1));
+            TEST_ASSERT_TRUE(ff && !RAY_IS_ERR(ff) && fg && !RAY_IS_ERR(fg));
+            TEST_ASSERT_TRUE(try_prod_sumavg_input_f64(gr, t, d_fg, &prod, &err)); TEST_ASSERT_NULL(err);
+            TEST_ASSERT_TRUE(prod.pa == ray_data(ff) && prod.pb == ray_data(fg));
+            memset(&aff, 0, sizeof aff);
+            TEST_ASSERT_TRUE(try_affine_sumavg_input(gr, t, d_af, &vec, &aff, &err)); TEST_ASSERT_NULL(err);
+            TEST_ASSERT_TRUE(vec == ff && vec->type == RAY_F64 && aff.bias_f64 == -1.5);
+            memset(&aff, 0, sizeof aff);
+            TEST_ASSERT_TRUE(try_affine_sumavg_input(gr, t, d_ai, &vec, &aff, &err));
+            TEST_ASSERT_TRUE(vec == fa && vec->type == RAY_I64 && ((const int64_t*)ray_data(vec))[1234] == 234);
         } else {
             /* linear: 2 * b + a + 7 */
             TEST_ASSERT_TRUE(d_lin && try_linear_sumavg_input_i64(gr, t, d_lin, &lin, &err));
