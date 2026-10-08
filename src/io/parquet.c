@@ -1897,10 +1897,14 @@ static void pq_write_direct_group(void* ptr, uint32_t worker, int64_t start, int
          * fclose local.fp a second time, so free the zone directly. */
         if (local.zone) { ray_zone_acc_free(local.zone); ray_free_raw(local.zone); local.zone = NULL; }
         /* Start this chunk's writeback now: the pages leave while the
-         * import goes on, instead of all at the final sync. */
-        if (w->writeback && !w->errors[task] && fflush(local.fp) == 0)
-            ray_file_writeback_start(fileno(local.fp),32+w->offsets[g]*(int64_t)size,
-                                     (row-w->offsets[g])*(int64_t)size);
+         * import goes on, instead of all at the final sync.  A failed flush
+         * has dropped its buffer, and the close after it may well succeed:
+         * it is the task's error. */
+        if (w->writeback && !w->errors[task]) {
+            if (fflush(local.fp) != 0) w->errors[task] = pq_error("native column write failed");
+            else ray_file_writeback_start(fileno(local.fp),32+w->offsets[g]*(int64_t)size,
+                                          (row-w->offsets[g])*(int64_t)size);
+        }
         if (fclose(local.fp) && !w->errors[task]) w->errors[task] = pq_error("native column close failed");
         if (local.had_nulls) atomic_store_explicit(&w->nulls[c],1,memory_order_relaxed);
         if (!w->errors[task] && row != w->offsets[g+1]) w->errors[task] = pq_error("row group ended before its assigned output range");
