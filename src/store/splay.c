@@ -1118,6 +1118,9 @@ static ray_t* splay_load_once(const char* dir, const char* sym_path,
                     "record, or missing \"\" at position 0)", sym_path);
         }
     }
+    /* An earlier attempt's domain not replaced above (no symfile this
+     * time) is let go here, before *held is overwritten. */
+    if (*held) ray_sym_domain_release(*held);
     ray_t* tbl = splay_load_dom_impl(resolved, dom, use_mmap);
     *held = dom;   /* released by the caller; columns hold their own refs */
     return tbl;
