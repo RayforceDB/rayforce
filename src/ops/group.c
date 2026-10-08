@@ -10444,6 +10444,8 @@ typedef struct {
      * that computes SUM b (-1 = b runs its own loop). */
     int8_t            pair_sum[16];
     int8_t            fused_by[16];
+    int64_t*          wide;     /* [workers * SG_CHUNK_ROWS]: widened
+                                 * narrow row ids (NULL if none narrow) */
 } sg_ctx_t;
 
 /* Fused-product partial over a CONTIGUOUS row range — type-specialized
@@ -10558,13 +10560,21 @@ static inline void sg_pair_accum(ray_t* x, ray_t* y, uint16_t op,
 }
 
 static void sg_accum_fn(void* raw, uint32_t wid, int64_t tstart, int64_t tend) {
-    (void)wid;
     sg_ctx_t* c = (sg_ctx_t*)raw;
     for (int64_t ti = tstart; ti < tend; ti++) {
         const sg_task_t* tk = &c->tasks[ti];
         const ray_idx_slice_t* sl = &c->slices[tk->gi];
-        const int64_t* restrict rows = sl->rows ? sl->rows + tk->lo : NULL;
         int64_t n = tk->hi - tk->lo;
+        const int64_t* rows = NULL;
+        if (sl->rows.p && !sl->rows.narrow) {
+            rows = (const int64_t*)sl->rows.p + tk->lo;
+        } else if (sl->rows.p) {
+            /* Narrow row ids: widen this task's chunk once. */
+            int64_t* w = c->wide + (size_t)wid * SG_CHUNK_ROWS;
+            const uint32_t* src = (const uint32_t*)sl->rows.p + tk->lo;
+            for (int64_t j = 0; j < n; j++) w[j] = (int64_t)src[j];
+            rows = w;
+        }
         /* Parted layout: each key's rows form one contiguous run — the
          * accumulate then streams raw column pointers and vectorizes. */
         bool contig = (n > 0 && (!rows || rows[n - 1] - rows[0] + 1 == n));
@@ -10717,9 +10727,9 @@ static ray_t* sg_hint_to_selection(ray_graph_t* g, ray_t* tbl) {
         int64_t* ids = (int64_t*)ray_data(hdr);
         int64_t w = 0;
         for (int64_t i = 0; i < K; i++) {
-            if (sl[i].rows) {
-                memcpy(ids + w, sl[i].rows,
-                       (size_t)sl[i].n * sizeof(int64_t));
+            if (sl[i].rows.p) {
+                for (int64_t j = 0; j < sl[i].n; j++)
+                    ids[w + j] = ray_idx_rows_at(sl[i].rows, j);
             } else {
                 for (int64_t j = 0; j < sl[i].n; j++)
                     ids[w + j] = sl[i].first + j;
@@ -10946,7 +10956,7 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         }
         sg_ctx_t ctx = { slices, tasks, agg_vecs, agg_vecs2, prod, ext->agg_ops,
                          n_aggs, partials, part_hi, part_sumsq, part_sum_y,
-                         part_sumsq_y, part_sumxy, {0}, {0} };
+                         part_sumsq_y, part_sumxy, {0}, {0}, NULL };
         /* Shared-stream pairing: a bare-scan SUM/AVG over the same column
          * a product's int side already streams rides the product loop —
          * one pass over the column instead of two. */
@@ -10975,13 +10985,34 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             }
         }
         ray_pool_t* pool = ray_pool_get();
+        bool par = pool && n_tasks > 1 && total_rows >= RAY_PARALLEL_THRESHOLD;
+        ray_t* wide_hdr = NULL;
+        for (int64_t i = 0; i < K; i++) {
+            if (!slices[i].rows.narrow) continue;
+            size_t nw = par ? ray_pool_total_workers(pool) : 1;
+            ctx.wide = (int64_t*)scratch_alloc(&wide_hdr,
+                           nw * SG_CHUNK_ROWS * sizeof(int64_t));
+            if (!ctx.wide) {
+                scratch_free(sum_hdr); scratch_free(cnt_hdr);
+                scratch_free(sumsq_hdr); scratch_free(sum_y_hdr);
+                scratch_free(sumsq_y_hdr); scratch_free(sumxy_hdr);
+                scratch_free(sum_hi_hdr); scratch_free(part_hi_hdr);
+                ray_free(task_hdr);
+                scratch_free(part_hdr);
+                scratch_free(part_sumsq_hdr); scratch_free(part_sum_y_hdr);
+                scratch_free(part_sumsq_y_hdr); scratch_free(part_sumxy_hdr);
+                return NULL;    /* OOM → generic path via fallback */
+            }
+            break;
+        }
         /* dispatch_n: n_tasks is a task count (tens), far below the
          * element-grain of ray_pool_dispatch, which would lump them
          * into ONE serial task. */
-        if (pool && n_tasks > 1 && total_rows >= RAY_PARALLEL_THRESHOLD)
+        if (par)
             ray_pool_dispatch_n(pool, sg_accum_fn, &ctx, (uint32_t)n_tasks);
         else
             sg_accum_fn(&ctx, 0, 0, n_tasks);
+        scratch_free(wide_hdr);
         /* Fold task partials in task order — chunk-sequential per group,
          * independent of worker count. */
         for (int64_t ti = 0; ti < n_tasks; ti++) {

@@ -97,6 +97,11 @@ typedef enum {
  * passenger index by pointer.  Clear = heap-resident index (freed normally),
  * including a runtime-built index attached to an mmap'd column. */
 #define RAY_MARK_MMAP    0x02
+/* Hash index whose slot table takes a key's home slot from the TOP bits of
+ * its mixed hash (the partitioned builder); clear = the low bits, as every
+ * table built before it.  Fixed for the life of the table: a rebuild picks
+ * its own. */
+#define RAY_MARK_HASH_HIGH 0x04
 
 /* The payload stored inside data[] of a RAY_INDEX ray_t. */
 typedef struct {
@@ -118,7 +123,10 @@ typedef struct {
         struct {                /* RAY_IDX_HASH — CSR grouped layout */
             /* Open-addressing bucket table over DISTINCT keys plus a CSR
              * (offsets + contiguous row lists) grouping of the rows:
-             *   table[mask+1]  slot -> group id + 1 (0 = empty bucket)
+             *   table[mask+1]  slot -> group id + 1 (0 = empty bucket); a
+             *                  key's home slot is the top bits of its mixed
+             *                  hash under RAY_MARK_HASH_HIGH (groups then in
+             *                  hash order), else the low bits
              *   gkeys[n_groups]     key value per group (i64-canonical;
              *                       SYM stores the column-domain id)
              *   offs[n_groups+1]    rows[] slice bounds per group
@@ -572,6 +580,24 @@ int ray_index_find_vec(ray_t* col, ray_t* needles, int64_t* out, bool* any_miss)
  * fails the append. */
 void ray_index_carry_append(ray_t* src, ray_t* dst);
 
+/* Row ids borrowed from a hash index: 64-bit, or unsigned 32-bit when the
+ * index was built narrow (any column below 2^32 rows).  Read with
+ * ray_idx_rows_at. */
+typedef struct {
+    const void* p;
+    bool        narrow;
+} ray_idx_rows_t;
+
+static inline int64_t ray_idx_rows_at(ray_idx_rows_t r, int64_t i) {
+    return r.narrow ? (int64_t)((const uint32_t*)r.p)[i]
+                    : ((const int64_t*)r.p)[i];
+}
+/* The ids from position `off` on. */
+static inline ray_idx_rows_t ray_idx_rows_from(ray_idx_rows_t r, int64_t off) {
+    r.p = (const uint8_t*)r.p + off * (r.narrow ? 4 : 8);
+    return r;
+}
+
 /* ===== Hash-index group slice (CSR accessor) =====
  *
  * Resolve `key` to its group's contiguous ascending row-id slice.
@@ -579,15 +605,17 @@ void ray_index_carry_append(ray_t* src, ray_t* dst);
  * value (canonicalized through the storage width like the eq probe).
  *
  * Returns:
- *    1 → hit: *rows_out points at the ascending row ids, *n_out the size.
+ *    1 → hit: *rows_out holds the ascending row ids, *n_out the size.
  *        The slice borrows the index payload — valid while the index is.
- *    0 → key provably absent (*rows_out NULL, *n_out 0).
+ *    0 → key provably absent (rows_out->p NULL, *n_out 0).
  *   -1 → not eligible (no fresh hash index / bad key) — caller falls back. */
 int ray_index_hash_group(ray_t* col, int64_t key,
-                         const int64_t** rows_out, int64_t* n_out);
+                         ray_idx_rows_t* rows_out, int64_t* n_out);
 
 /* Build a rowsel from ASCENDING row ids (empty n=0 is valid).  NULL on OOM. */
 ray_t* ray_index_rowsel_from_ids(int64_t nrows, const int64_t* ids, int64_t n);
+/* Same, from row ids borrowed from an index. */
+ray_t* ray_index_rowsel_from_rows(int64_t nrows, ray_idx_rows_t ids, int64_t n);
 
 /* ===== Slice-group resolution (FILTER + GROUP-by-key fusion) =====
  *
@@ -596,8 +624,8 @@ ray_t* ray_index_rowsel_from_ids(int64_t nrows, const int64_t* ids, int64_t n);
  * valid while the index is). */
 typedef struct {
     int64_t        dom;   /* column-domain key id */
-    const int64_t* rows;  /* ascending row ids (borrowed); NULL if contiguous */
-    int64_t        first; /* first physical row when rows == NULL */
+    ray_idx_rows_t rows;  /* ascending row ids (borrowed); .p NULL if contiguous */
+    int64_t        first; /* first physical row when rows.p == NULL */
     int64_t        n;     /* slice length (> 0) */
 } ray_idx_slice_t;
 
