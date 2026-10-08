@@ -377,7 +377,7 @@ compdb:
 # these targets are Linux-only by design; CI gates them to ubuntu.
 FUZZ_RUNTIME ?= 60
 FUZZ_OPTS     = -rss_limit_mb=4096 -timeout=10 -max_len=65536 -print_final_stats=1
-FUZZ_TARGETS  = parse numparse de eval csv journal parquet
+FUZZ_TARGETS  = parse numparse de eval csv journal parquet select_merge
 # Escape hatch for hosts where clang auto-selects a gcc toolchain dir that
 # lacks libstdc++ (e.g. a partially-installed newer gcc shadowing the real
 # one).  Normally empty; set on such a box, e.g.

@@ -15,6 +15,7 @@ runtime).
 | `fuzz_csv`      | `ray_read_csv*`        | CSV reader (input via memfd) |
 | `fuzz_journal`  | `ray_journal_validate` / `ray_journal_replay` | journal framing walk + replay |
 | `fuzz_parquet`  | `ray_parquet_open` / `ray_parquet_next` | footer, page, encoding and optional index parsers |
+| `fuzz_select_merge` | nested `select` vs materialized `select` | two/three-layer queries, nullable numeric/SYM/STR columns, serialized results and errors |
 
 The journal log is a sequence of IPC frames verbatim, so the `de` corpus also
 hardens journal replay's decode step.
@@ -37,10 +38,17 @@ input has no such construct.
 make fuzz-parse                 # 60s (default) run of one target
 make fuzz-parse FUZZ_RUNTIME=0  # run until a crash / Ctrl-C
 make fuzz-smoke                 # short pass over the fast targets (PR CI gate)
+make fuzz-select_merge FUZZ_RUNTIME=600 # structured nested-query differential check
 ```
 
+`select_merge` generates two/three-layer queries and compares them with the
+same queries wrapped in `do` to force inner materialization. It checks serialized
+results and error codes, allowing relative/absolute tolerance `1e-12` only for
+F64 aggregate values (fusion changes addition order). Row expressions, schema,
+order and null metadata still compare exactly.
+
 `fuzz-smoke` covers `parse`, `numparse`, and `de` (the fast, stateless
-targets); `eval`, `csv`, and `journal` run in the nightly `fuzz-long` job
+targets); `eval`, `csv`, `journal`, and `select_merge` run in the nightly `fuzz-long` job
 (`.github/workflows/nightly.yml`), 15 minutes each over a cached corpus.
 
 Grown corpora live in `fuzz/corpus/<target>/` (gitignored); committed starter

@@ -51,7 +51,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [parse, numparse, de, eval, csv, journal]
+        target: [parse, numparse, de, eval, csv, journal, select_merge]
     steps:
       - uses: actions/checkout@v4
         with: { ref: dev }
