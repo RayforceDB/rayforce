@@ -55,6 +55,9 @@
 #include <time.h>
 
 /* Every path below goes through ray_test_tmp (a per-process root). */
+/* Written as "/tmp/..." in the sources: every use goes through
+ * ray_test_tmp (sr_root, sr_eval*, the helpers), which rewrites it under the
+ * process's own root, so concurrent suites never share it. */
 #define SR_TMP "/tmp/rayforce_scanrange"
 static const char* sr_root(void) { return ray_test_tmp(SR_TMP); }
 
@@ -3017,8 +3020,10 @@ static test_result_t test_scalar_route_shapes(void) {
  * fixed order) on both generations: a serial run (fewer rows than the
  * parallel threshold: one task, a deterministic order) over non-integral
  * values (whose sum depends on the order: a plain row-order sum differs)
- * gives generation 0's bits from zero-copy pieces, and exactly the
- * lane reference computed here, whatever the build. */
+ * gives generation 0's bits from zero-copy pieces, and exactly the lane
+ * reference computed here.  The kernel pins its lanes on every target a
+ * GCC-compatible compiler builds (group.c, SC_F64_PIN), so this holds
+ * under the release build's -fassociative-math too. */
 static test_result_t test_scalar_route_f64_bits(void) {
     const int64_t n = 60000;
     sr_eval_ok("(set i (til 60000))");
@@ -3050,6 +3055,60 @@ static test_result_t test_scalar_route_f64_bits(void) {
         }
         TEST_ASSERT_FMT(memcmp(&v[0], &v[1], sizeof v[0]) == 0, "%s: %.17g vs %.17g", q[i], v[0], v[1]);
         if (i == 0) TEST_ASSERT_FMT(memcmp(&v[0], &ref, sizeof ref) == 0, "lanes: %.17g vs reference %.17g", v[0], ref);
+    }
+    PASS();
+}
+
+/* Fix round 2: the lanes' combine order is the fixed tree, never a fold:
+ * x[0] = 2^53 and x[1..7] = 1.0 (every other row 0) sum to exactly
+ * 2^53 + 6 (lane 0's 2^53 + 1 rounds to 2^53, the other pairs are exact);
+ * a left fold gives 2^53.  Both generations, serially. */
+static test_result_t test_scalar_route_f64_combine(void) {
+    const int64_t n = 60000;
+    ray_t* xv = ray_vec_new(RAY_F64, n); xv->len = n;
+    double* x = (double*)ray_data(xv);
+    for (int64_t r = 0; r < n; r++) x[r] = r == 0 ? 9007199254740992.0 : r < 8 ? 1.0 : 0.0;
+    ray_env_set(ray_sym_intern("cxv", 3), xv); ray_release(xv);
+    sr_eval_ok("(set CX (table [x] (list cxv)))");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/cx0/\" CX {compress: false})");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/cx2/\" CX {compress: true})");
+    for (int gen = 0; gen < 2; gen++) {
+        sr_evalf_ok("(set T (.db.splayed.get \"%s\"))", gen ? SR_TMP "/cx2/" : SR_TMP "/cx0/");
+        ray_t* r = sr_eval("(first (first (value (select {s: (sum x) from: T}))))");
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->type == -RAY_F64);
+        TEST_ASSERT_FMT(r->f64 == 9007199254740998.0, "gen %d: %.17g", gen, r->f64);
+        sr_drop(r);
+    }
+    PASS();
+}
+
+/* Fix round 2: a piece starting at a row not a multiple of 8 realigns
+ * through the head loop; the cut sum equals the whole block's and the lane
+ * reference, on lane-weighted data where any lane mix-up changes the bits.
+ * (The engine's tasks and pieces start 1024-aligned: the hook drives the
+ * staged piece function directly.) */
+static test_result_t test_scalar_route_f64_unaligned(void) {
+    const int64_t n = 5000;
+    static const double m[8] = { -11, 11, -1, 1, 11, 1, -13, 1 };
+    static double d[5000];
+    static const int64_t row0s[] = { 0, 3, 1021 };
+    static const int64_t cuts[] = { 5, 13, 1000, 1027, 2049, 4099 };
+    for (size_t k = 0; k < sizeof row0s / sizeof row0s[0]; k++) {
+        int64_t row0 = row0s[k];
+        volatile double lane[8] = { 0 };
+        for (int64_t r = 0; r < n; r++) {
+            d[r] = 0.37 * (double)(((r + row0) * 7919) % 1000003) * m[(r + row0) & 7];
+            lane[(r + row0) & 7] += d[r];
+        }
+        volatile double ab = lane[0] + lane[1], cd = lane[2] + lane[3];
+        volatile double ef = lane[4] + lane[5], gh = lane[6] + lane[7];
+        volatile double lo = ab + cd, hi = ef + gh;
+        double ref = lo + hi, whole, cut;
+        ray_group_test_f64_lanes(d, row0, n, cuts, (int)(sizeof cuts / sizeof cuts[0]), &whole, &cut);
+        TEST_ASSERT_FMT(memcmp(&whole, &ref, sizeof ref) == 0, "row0 %lld: whole %.17g vs ref %.17g",
+                        (long long)row0, whole, ref);
+        TEST_ASSERT_FMT(memcmp(&cut, &ref, sizeof ref) == 0, "row0 %lld: cut %.17g vs ref %.17g",
+                        (long long)row0, cut, ref);
     }
     PASS();
 }
@@ -3477,6 +3536,8 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/group_route_hook",   test_group_route_hook,   srr_setup, srr_teardown },
     { "scanrange/scalar_route_wide_sym", test_scalar_route_wide_sym, srr_setup, srr_teardown },
     { "scanrange/scalar_route_mixed", test_scalar_route_mixed, srr_setup, srr_teardown },
+    { "scanrange/scalar_route_f64_combine", test_scalar_route_f64_combine, srr_setup, srr_teardown },
+    { "scanrange/scalar_route_f64_unaligned", test_scalar_route_f64_unaligned, srr_setup, srr_teardown },
     { "scanrange/da_route",           test_da_route,           srr_setup, srr_teardown },
     { "scanrange/da_route_shapes",    test_da_route_shapes,    srr_setup, srr_teardown },
     { "scanrange/da_route_error",     test_da_route_error,     srr_setup, srr_teardown },

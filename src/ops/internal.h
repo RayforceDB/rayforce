@@ -1199,6 +1199,11 @@ ray_t* ray_reduce_src(ray_col_src_t* src, uint16_t opcode, int8_t out_type);
  * radix); 3 also skip the slice-group probe.  Disarmed by
  * ray_test_hooks_off. */
 void ray_group_test_route(int route);
+/* Test hook (C tests only): the scalar route's F64 lane sum of d[0, n) at
+ * absolute row row0, as one block (*whole) and as pieces cut at cuts[]
+ * through the staged piece function (*cut). */
+void ray_group_test_f64_lanes(const double* d, int64_t row0, int64_t n, const int64_t* cuts,
+                              int ncuts, double* whole, double* cut);
 ray_t* exec_reduction_src(ray_graph_t* g, ray_op_t* op, ray_col_src_t* src);
 /* ray_first_fn / ray_last_fn of a bound source for the types they read
  * with collection_elem among those served here (I32, I16, BOOL, U8, DATE,

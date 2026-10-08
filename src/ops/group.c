@@ -8900,14 +8900,23 @@ static void scalar_sum_i64_fn(void* ctx, uint32_t worker_id, int64_t start, int6
  * adds into lane r mod SC_F64_LANES, each lane in row order, and the task's
  * partial is the lanes combined in one fixed order.  The answer therefore
  * depends only on the rows each task covers, never on how a task's rows are
- * cut into pieces, nor on the compiler (the lanes are pinned against
- * reassociation): a staged task reads zero-copy pieces with its lanes
- * carried across them and gives generation 0's bits for the same task. */
+ * cut into pieces: a staged task reads zero-copy pieces with its lanes
+ * carried across them and gives generation 0's bits for the same task.
+ *
+ * The release build reassociates float math (-fassociative-math), so every
+ * intermediate the order depends on is pinned with SC_F64_PIN: an empty asm
+ * that claims to read and write the value, which no compiler may move an
+ * addition across.  GCC-compatible compilers (gcc, clang, emscripten) pin
+ * on every target: in a vector register on x86 and aarch64, through memory
+ * elsewhere.  Other compilers get no pin: the guarantee there rests on the
+ * compiler not reassociating (MSVC's default /fp:precise does not). */
 #define SC_F64_LANES 8
 #if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
 #define SC_F64_PIN(v) __asm__("" : "+x"(v))
 #elif defined(__GNUC__) && defined(__aarch64__)
 #define SC_F64_PIN(v) __asm__("" : "+w"(v))
+#elif defined(__GNUC__)
+#define SC_F64_PIN(v) __asm__("" : "+m"(v))
 #else
 #define SC_F64_PIN(v) ((void)0)
 #endif
@@ -8916,8 +8925,11 @@ typedef struct { double l[SC_F64_LANES]; } sc_f64_lanes_t;
 /* Rows [row0, row0 + n) at d into the lanes. */
 static void sc_f64_lanes_add(sc_f64_lanes_t* restrict s, const double* restrict d, int64_t row0, int64_t n) {
     int64_t i = 0;
-    for (; i < n && ((row0 + i) & (SC_F64_LANES - 1)); i++)
-        s->l[(row0 + i) & (SC_F64_LANES - 1)] += d[i];
+    for (; i < n && ((row0 + i) & (SC_F64_LANES - 1)); i++) {
+        double v = s->l[(row0 + i) & (SC_F64_LANES - 1)] + d[i];
+        SC_F64_PIN(v);
+        s->l[(row0 + i) & (SC_F64_LANES - 1)] = v;
+    }
 #if defined(__GNUC__) && defined(__AVX__)
     /* two 4-lane vectors: lanes {0..3} {4..7}, each lane still one
      * row-order chain (a vector add is lane-wise): the same bits as the
@@ -8925,6 +8937,7 @@ static void sc_f64_lanes_add(sc_f64_lanes_t* restrict s, const double* restrict 
     typedef double sc_v4d __attribute__((vector_size(32)));
     sc_v4d v0, v1;
     memcpy(&v0, &s->l[0], 32); memcpy(&v1, &s->l[4], 32);
+    SC_F64_PIN(v0); SC_F64_PIN(v1);   /* the head's last adds stay folded in */
     for (; i + SC_F64_LANES <= n; i += SC_F64_LANES) {
         sc_v4d x0, x1;
         memcpy(&x0, d + i, 32); memcpy(&x1, d + i + 4, 32);
@@ -8939,6 +8952,7 @@ static void sc_f64_lanes_add(sc_f64_lanes_t* restrict s, const double* restrict 
     sc_v2d v0, v1, v2, v3;
     memcpy(&v0, &s->l[0], 16); memcpy(&v1, &s->l[2], 16);
     memcpy(&v2, &s->l[4], 16); memcpy(&v3, &s->l[6], 16);
+    SC_F64_PIN(v0); SC_F64_PIN(v1); SC_F64_PIN(v2); SC_F64_PIN(v3);
     for (; i + SC_F64_LANES <= n; i += SC_F64_LANES) {
         sc_v2d x0, x1, x2, x3;
         memcpy(&x0, d + i, 16);     memcpy(&x1, d + i + 2, 16);
@@ -8950,10 +8964,13 @@ static void sc_f64_lanes_add(sc_f64_lanes_t* restrict s, const double* restrict 
     memcpy(&s->l[4], &v2, 16); memcpy(&s->l[6], &v3, 16);
 #else
     for (; i + SC_F64_LANES <= n; i += SC_F64_LANES)
-        for (int l = 0; l < SC_F64_LANES; l++) s->l[l] += d[i + l];
+        for (int l = 0; l < SC_F64_LANES; l++) { double v = s->l[l] + d[i + l]; SC_F64_PIN(v); s->l[l] = v; }
 #endif
-    for (; i < n; i++)
-        s->l[(row0 + i) & (SC_F64_LANES - 1)] += d[i];
+    for (; i < n; i++) {
+        double v = s->l[(row0 + i) & (SC_F64_LANES - 1)] + d[i];
+        SC_F64_PIN(v);
+        s->l[(row0 + i) & (SC_F64_LANES - 1)] = v;
+    }
 }
 
 static double sc_f64_lanes_total(const sc_f64_lanes_t* s) {
@@ -8969,6 +8986,25 @@ static double sc_f64_lanes_total(const sc_f64_lanes_t* s) {
 static void scalar_f64_piece(void* ctx, uint32_t wid, int64_t b, int64_t e, const ray_col_piece_t* p) {
     (void)wid;
     sc_f64_lanes_add((sc_f64_lanes_t*)ctx, (const double*)p[0].data, b, e - b);
+}
+
+/* Test hook (internal.h): rows [0, n) of d summed as one block at row0 and
+ * as the pieces cut at cuts[] (ascending, inside (0, n)) through the staged
+ * piece function; both totals out.  The engine's tasks and pieces start
+ * 1024-aligned, so only this hook reaches an unaligned piece start. */
+void ray_group_test_f64_lanes(const double* d, int64_t row0, int64_t n, const int64_t* cuts,
+                              int ncuts, double* whole, double* cut) {
+    sc_f64_lanes_t a = { { 0 } }, b = { { 0 } };
+    sc_f64_lanes_add(&a, d, row0, n);
+    *whole = sc_f64_lanes_total(&a);
+    int64_t lo = 0;
+    for (int k = 0; k <= ncuts; k++) {
+        int64_t hi = k < ncuts ? cuts[k] : n;
+        ray_col_piece_t p = { .data = d + lo };
+        scalar_f64_piece(&b, 0, row0 + lo, row0 + hi, &p);
+        lo = hi;
+    }
+    *cut = sc_f64_lanes_total(&b);
 }
 
 static void scalar_sum_f64_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
