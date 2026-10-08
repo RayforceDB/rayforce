@@ -3608,6 +3608,40 @@ static test_result_t test_radix_route_sparse(void) {
     test_result_t t = sr_same_on("(.db.splayed.get \"" SR_TMP "/f0/\")", "(.db.splayed.get \"" SR_TMP "/f2/\")",
                                  "(select {c: (count x) s: (sum x) from: T by: w desc: c take: 3})", 0);
     if (t.status != TEST_PASS) { ray_group_test_route(0); return t; }
+    /* Fix round 2: a non-null F64 input read from a staged piece (the f64
+     * arm rebases its row like the integer arms), under the sparse table's
+     * sum pass and the emit-filter's heavy-hitter pass */
+    sr_eval_ok("(set P (table [h w x] (list (% (* i 7919) 1000003) (* (% i 1000) 1000000) (as 'F64 i))))");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/p0/\" P {compress: false})");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/p2/\" P {compress: true})");
+    static const char* const qp[] = {
+        "(select {s: (sum x) a: (avg x) from: T by: h})",
+        "(select {c: (count x) from: T by: w desc: c take: 3})",
+        "(select {c: (count x) from: T where: (> x 1000) by: w desc: c take: 3})",
+        "(select {c: (count x) s: (sum x) from: T where: (> x 1000) by: w desc: c take: 3})",
+        NULL };
+    for (int i = 0; qp[i]; i++) {
+        test_result_t r = sr_same_on("(.db.splayed.get \"" SR_TMP "/p0/\")", "(.db.splayed.get \"" SR_TMP "/p2/\")",
+                                     qp[i], 0);
+        if (r.status != TEST_PASS) { ray_group_test_route(0); return r; }
+    }
+    /* A plain (materialized) key and a plain input beside staged columns:
+     * the plain one is read at the absolute row, the staged at the piece's */
+    sr_eval_ok("(set T2M (.db.splayed.get \"" SR_G2 "\"))");
+    ray_t* tm = sr_eval("T2M");
+    TEST_ASSERT_TRUE(tm && !RAY_IS_ERR(tm));
+    ray_t* kc = ray_table_col(tm, ray_sym_intern("k", 1));
+    ray_t* hc = ray_table_col(tm, ray_sym_intern("h", 1));
+    TEST_ASSERT_TRUE(kc && !RAY_IS_ERR(kc) && hc && !RAY_IS_ERR(hc));
+    sr_drop(tm);
+    static const char* const qm[] = {
+        "(select {c: (count u) s: (sum u) from: T by: k})",     /* plain key, staged input */
+        "(select {c: (count k) s: (sum h) from: T by: u})",     /* plain inputs, staged key */
+        NULL };
+    for (int i = 0; qm[i]; i++) {
+        test_result_t r = sr_same_on("(.db.splayed.get \"" SR_G0 "\")", "T2M", qm[i], 0);
+        if (r.status != TEST_PASS) { ray_group_test_route(0); return r; }
+    }
     /* R-FAIL: a corrupt chunk of the key or an input is the query's error */
     char path[600];
     static const struct { const char* col; const char* q; } cs[] = {
