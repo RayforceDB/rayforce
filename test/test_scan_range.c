@@ -3248,6 +3248,25 @@ static test_result_t test_da_route_shapes(void) {
     ray_enc_counters_t kc; ray_enc_counters_get(&kc);
     TEST_ASSERT_EQ_U(kc.decoded_bytes, 200000);
     sr_drop(r);
+    /* binary aggregates: both inputs staged, the y-side read by pieces */
+    SR_SAME("(select {p: (pearson_corr f k) c: (cov k f) w: (wavg k f) ws: (wsum f h) from: T by: g})", 0);
+    SR_SAME("(select {p: (pearson_corr k h) w: (wavg g f) from: T where: (> k 1000) by: {g: g b: b}})", 0);
+    /* strlen of symbols of lengths 1-3 (a piece read at the wrong row
+     * gives a different length) and binary aggregates over a second table */
+    sr_eval_ok("(set Y (table [g w x y] (list (as 'I16 (% i 7)) (as 'SYM (as 'STR (% (* i 7) 400))) "
+               "(* (as 'F64 i) 0.5) (% (* i 7919) 1003))))");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/y0/\" Y {compress: false})");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/y2/\" Y {compress: true})");
+    static const char* const qy[] = {
+        "(select {l: (avg (strlen w)) s: (sum (strlen w)) from: T by: g})",
+        "(select {l: (sum (strlen w)) from: T where: (> y 10) by: g})",
+        "(select {p: (pearson_corr x y) c: (cov y x) w: (wavg y x) ws: (wsum x y) from: T by: g})",
+        NULL };
+    for (int q = 0; qy[q]; q++) {
+        test_result_t t = sr_same_on("(.db.splayed.get \"" SR_TMP "/y0/\")", "(.db.splayed.get \"" SR_TMP "/y2/\")",
+                                     qy[q], 0);
+        if (t.status != TEST_PASS) { ray_group_test_route(0); return t; }
+    }
     ray_group_test_route(0);
     PASS();
 }
@@ -3324,6 +3343,9 @@ static test_result_t test_sp_dyn_route(void) {
         NULL };
     ray_group_test_route(2);                       /* skip v2 and the direct array */
     for (int i = 0; q2[i]; i++) SR_SAME(q2[i], 0);
+    /* binary aggregates never take the sparse-dynamic count (SUM / AVG /
+     * COUNT only): the hash route, on plain columns, answers as generation 0 */
+    SR_SAME("(select {c: (count k) p: (pearson_corr f k) w: (wavg k f) from: T by: s desc: c take: 3})", UINT64_MAX);
     ray_group_test_route(1);
     SR_SAME("(select {c: (count k) from: T by: h desc: c take: 3})", 0);   /* the DA range does not fit */
     /* the parallel fill (262144 rows or more) walks the key */

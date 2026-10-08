@@ -12863,7 +12863,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
      * `cleanup:` label). */
     uint32_t vla_aggs = n_aggs > 0 ? n_aggs : 1;
     ray_t* vla_hdr = NULL;
-    size_t vla_bytes = (size_t)vla_aggs * (2 * sizeof(ray_t*) + sizeof(ray_col_src_t*)
+    size_t vla_bytes = (size_t)vla_aggs * (2 * sizeof(ray_t*) + 2 * sizeof(ray_col_src_t*)
                         + 2 * sizeof(ray_col_src_t)
                         + sizeof(agg_affine_t) + sizeof(agg_linear_t)
                         + sizeof(agg_prod_t) + 3 * sizeof(uint8_t));
@@ -12882,8 +12882,11 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
      * encoded affine / strlen base, a plain input of a staged context),
      * released at its exits (AGG_OWN_SRC_RELEASE). */
     ray_col_src_t** agg_srcs  = (ray_col_src_t**)(agg_vecs2 + vla_aggs);
-    ray_col_src_t* agg_own_src = (ray_col_src_t*)(agg_srcs + vla_aggs);
-    /* the y-sides' sources in a staged direct-array context */
+    /* The binary aggregates' second inputs, bound the same way: agg_srcs2[a]
+     * set with agg_vecs2[a] NULL is a staged y-side. */
+    ray_col_src_t** agg_srcs2 = agg_srcs + vla_aggs;
+    ray_col_src_t* agg_own_src = (ray_col_src_t*)(agg_srcs2 + vla_aggs);
+    /* plain y-sides bound in a staged direct-array context */
     ray_col_src_t* agg_own_src2 = agg_own_src + vla_aggs;
     agg_affine_t* agg_affine = (agg_affine_t*)(agg_own_src2 + vla_aggs);
     agg_linear_t* agg_linear = (agg_linear_t*)(agg_affine + vla_aggs);
@@ -13016,11 +13019,20 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             ray_op_t* agg_input_op2 = op_node(g, ext->agg_ins2[a]);
             ray_op_ext_t* agg_ext2 = find_ext(g, agg_input_op2->id);
             if (agg_ext2 && agg_ext2->base.opcode == OP_SCAN) {
-                agg_vecs2[a] = ray_table_col(tbl, agg_ext2->sym);
-                if (agg_vecs2[a] && RAY_IS_ERR(agg_vecs2[a])) {
-                    rerr = agg_vecs2[a];
-                    agg_vecs2[a] = NULL;
-                    goto resolve_fail;
+                if (ray_col_bind_declines(tbl, agg_ext2->sym)) {
+                    agg_vecs2[a] = ray_table_col(tbl, agg_ext2->sym);   /* today's path (partition key, slice) */
+                    if (agg_vecs2[a] && RAY_IS_ERR(agg_vecs2[a])) {
+                        rerr = agg_vecs2[a];
+                        agg_vecs2[a] = NULL;
+                        goto resolve_fail;
+                    }
+                } else {
+                    ray_col_src_t* src = ray_graph_bind_col(g, tbl, agg_ext2->sym, &rerr);   /* no decode */
+                    if (rerr) goto resolve_fail;
+                    ray_t* ready = src ? ray_col_src_ready(src) : NULL;
+                    if (ready && !RAY_IS_PARTED(ready->type)) agg_vecs2[a] = ready;
+                    else if (src && RAY_IS_PARTED(src->obj->type)) agg_vecs2[a] = src->obj;   /* never here */
+                    else agg_srcs2[a] = src;                                /* staged (or absent: NULL) */
                 }
             } else if (agg_ext2 && agg_ext2->base.opcode == OP_CONST && agg_ext2->literal) {
                 agg_vecs2[a] = agg_ext2->literal;
@@ -13877,9 +13889,15 @@ da_path:;
             key_attrs[k_] = key_vecs[k_]->attrs; \
         } \
         for (uint32_t a_ = 0; a_ < n_aggs; a_++) { \
-            if (agg_vecs[a_] || !agg_srcs[a_]) continue; \
-            ray_t* uerr_ = agg_unstage(agg_srcs[a_], &agg_vecs[a_], &agg_owned[a_]); \
-            if (uerr_) { rerr = uerr_; goto resolve_fail; } \
+            if (!agg_vecs[a_] && agg_srcs[a_]) { \
+                ray_t* uerr_ = agg_unstage(agg_srcs[a_], &agg_vecs[a_], &agg_owned[a_]); \
+                if (uerr_) { rerr = uerr_; goto resolve_fail; } \
+            } \
+            if (!agg_vecs2[a_] && agg_srcs2[a_]) { \
+                ray_t* uerr_ = agg_unstage(agg_srcs2[a_], &agg_vecs2[a_], &agg_owned2[a_]); \
+                if (uerr_) { rerr = uerr_; goto resolve_fail; } \
+                agg_srcs2[a_] = NULL; \
+            } \
         } \
         AGG_OWN_SRC_RELEASE(); \
         grp_staged = false; \
@@ -13887,7 +13905,8 @@ da_path:;
     /* Some key or input is staged (a generation-2 column not materialized). */
     bool grp_staged = false;
     for (uint32_t k = 0; k < n_keys; k++) if (key_srcs[k]) grp_staged = true;
-    for (uint32_t a = 0; a < n_aggs; a++) if (!agg_vecs[a] && agg_srcs[a]) grp_staged = true;
+    for (uint32_t a = 0; a < n_aggs; a++)
+        if ((!agg_vecs[a] && agg_srcs[a]) || (!agg_vecs2[a] && agg_srcs2[a])) grp_staged = true;
     if (grp_staged && match_idx) { GROUP_UNSTAGE(); grp_staged = false; }   /* rows not contiguous */
     /* ---- Direct-array fast path for low-cardinality integer keys ---- */
     /* Supports multi-key via a composite index when its state remains O(input). */
@@ -13936,7 +13955,18 @@ da_path:;
              * be accumulated as a real value — must stay on the HT path. */
             if (agg_is_binary_agg(aop)) {
                 ray_t* yv2 = (agg_vecs2 ? agg_vecs2[a] : NULL);
-                if (!yv2) { da_eligible = false; }
+                ray_col_src_t* ys = (!yv2 && agg_srcs2[a]) ? agg_srcs2[a] : NULL;   /* staged */
+                if (ys) {
+                    /* the same gate on the source's type, length and nullability */
+                    int8_t t2 = ys->type;
+                    bool y_fp  = group_fp_type(t2);
+                    bool y_int = (t2 == RAY_I16 || t2 == RAY_I32 || t2 == RAY_I64 ||
+                                  t2 == RAY_DATE || t2 == RAY_TIME || t2 == RAY_TIMESTAMP ||
+                                  t2 == RAY_BOOL || t2 == RAY_U8);
+                    if (ys->len < n_scan || (!y_fp && !y_int) || (!y_fp && ys->may_null))
+                        da_eligible = false;
+                }
+                else if (!yv2) { da_eligible = false; }
                 else if (yv2->len < n_scan) {
                     /* Short y (e.g. an OP_CONST vector literal): da_accum_row
                      * indexes y by absolute row — would read out of bounds. */
@@ -14207,7 +14237,11 @@ da_path:;
                  * branch skips those PAIRS, so nn must be allocated or the
                  * emitter would divide by the full group count. */
                 agg_ptrs2[a] = NULL; agg_types2[a] = 0;
-                if (agg_is_binary_agg(ext->agg_ops[a]) && agg_vecs2 && agg_vecs2[a]) {
+                if (agg_is_binary_agg(ext->agg_ops[a]) && !agg_vecs2[a] && agg_srcs2[a]) {
+                    agg_types2[a] = agg_srcs2[a]->type;          /* staged: read by pieces */
+                    if (group_fp_type(agg_types2[a]) && agg_srcs2[a]->may_null)
+                        da_any_nullable = true;
+                } else if (agg_is_binary_agg(ext->agg_ops[a]) && agg_vecs2 && agg_vecs2[a]) {
                     agg_ptrs2[a]  = ray_data(agg_vecs2[a]);
                     agg_types2[a] = agg_vecs2[a]->type;
                     ray_t* ysrc = (agg_vecs2[a]->attrs & RAY_ATTR_SLICE)
@@ -14440,16 +14474,22 @@ da_path:;
                         }
                         da_plain[i] = agg_vecs[a] ? ray_data(agg_vecs[a]) : NULL;
                     }
-                    if (agg_ptrs2[a] && !da_berr) {
-                        da_berr = ray_col_src_bind(agg_vecs2[a], &agg_own_src2[a]);
-                        da_srcs[n_keys + n_aggs + a] = &agg_own_src2[a];
-                        da_plain[n_keys + n_aggs + a] = agg_ptrs2[a];
+                    if (agg_is_binary_agg(ext->agg_ops[a]) && !da_berr) {
+                        uint32_t j = n_keys + n_aggs + a;
+                        if (!agg_vecs2[a] && agg_srcs2[a]) {
+                            da_srcs[j] = agg_srcs2[a];             /* staged */
+                        } else if (agg_ptrs2[a]) {
+                            da_berr = ray_col_src_bind(agg_vecs2[a], &agg_own_src2[a]);
+                            da_srcs[j] = &agg_own_src2[a];
+                            da_plain[j] = agg_ptrs2[a];
+                        }
                     }
                 }
                 for (uint32_t i = 0; i < da_n_src && !da_berr; i++)
                     if (da_srcs[i] && !da_plain[i]) ray_col_src_advise(da_srcs[i], 0, nrows);
             }
             if (da_berr) {
+                if (da_agg_cols) scalar_emit_vecs_free(da_ac_hdr, da_agg_cols, agg_vecs, n_aggs);
                 if (da_key_cols) scalar_emit_vecs_free(da_kc_hdr, da_key_cols, key_vecs, n_keys);
                 for (uint32_t w = 0; w < da_n_workers; w++) da_accum_free(&accums[w]);
                 scratch_free(accums_hdr);
