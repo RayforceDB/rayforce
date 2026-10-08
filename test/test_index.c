@@ -28,6 +28,7 @@
 #include "mem/heap.h"
 #include "mem/sys.h"
 #include "core/pool.h"
+#include "core/platform.h"
 #include "mem/cow.h"
 #include "vec/vec.h"
 #include "table/sym.h"
@@ -35,12 +36,15 @@
 #include "ops/rowsel.h"
 #include "store/col.h"
 #include <string.h>
+#include <stdatomic.h>
+#include <stddef.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <math.h>
+#include <time.h>
 
 /* ─── Helpers ──────────────────────────────────────────────────────── */
 
@@ -286,12 +290,12 @@ static test_result_t test_index_hash_attach_drop(void) {
     TEST_ASSERT_EQ_I(ix->u.hash.offs->len, 5);
 
     /* CSR slice for key 7: rows 0 and 2 (both store 7), ascending. */
-    const int64_t* grows = NULL;
+    ray_idx_rows_t grows = { NULL, false };
     int64_t gn = 0;
     TEST_ASSERT_EQ_I(ray_index_hash_group(w, 7, &grows, &gn), 1);
     TEST_ASSERT_EQ_I(gn, 2);
-    TEST_ASSERT_EQ_I(grows[0], 0);
-    TEST_ASSERT_EQ_I(grows[1], 2);
+    TEST_ASSERT_EQ_I(ray_idx_rows_at(grows, 0), 0);
+    TEST_ASSERT_EQ_I(ray_idx_rows_at(grows, 1), 2);
     /* Absent key → provable miss. */
     TEST_ASSERT_EQ_I(ray_index_hash_group(w, 42, &grows, &gn), 0);
 
@@ -332,10 +336,56 @@ static test_result_t test_index_hash_with_nulls_preserved(void) {
     PASS();
 }
 
-/* Large column: the build runs partition-parallel above 64k rows and must
- * produce the serial walk's layout — groups in first-occurrence order, rows
- * ascending inside a group, nulls excluded — checked against a reference
- * computed the obvious way. */
+/* The hash index's key mix (the splitmix64 finalizer), restated here to
+ * check the layout the builder promises: groups in ascending order of the
+ * mix, each key's home slot in its top bits. */
+static uint64_t idx_mix64(uint64_t x) {
+    x ^= x >> 30;
+    x *= 0xbf58476d1ce4e5b9ULL;
+    x ^= x >> 27;
+    x *= 0x94d049bb133111ebULL;
+    x ^= x >> 31;
+    return x;
+}
+static int idx_mix_cmp(const void* a, const void* b) {
+    uint64_t x = idx_mix64((uint64_t)*(const int64_t*)a), y = idx_mix64((uint64_t)*(const int64_t*)b);
+    return x < y ? -1 : x > y;
+}
+static int64_t idx_arr_get(const ray_t* v, int64_t i) {
+    return v->type == RAY_I32 ? (int64_t)((const uint32_t*)ray_data((ray_t*)v))[i]
+                              : ((const int64_t*)ray_data((ray_t*)v))[i];
+}
+/* `ix`'s groups ascend by mix, and its slot table is exactly the one that
+ * inserting the groups in order with linear probing from the top-bit home
+ * gives. */
+static test_result_t idx_table_check(const ray_index_t* ix) {
+    TEST_ASSERT_TRUE(ix->markers & RAY_MARK_HASH_HIGH);
+    uint64_t mask = ix->u.hash.mask, cap = mask + 1;
+    TEST_ASSERT_EQ_I(ix->u.hash.table->len, (int64_t)cap);
+    int sh = __builtin_clzll(mask);
+    const int64_t* gk = (const int64_t*)ray_data(ix->u.hash.gkeys);
+    int64_t ng = ix->u.hash.n_groups;
+    int64_t* ref = (int64_t*)ray_sys_alloc((size_t)cap * sizeof(int64_t));
+    TEST_ASSERT_NOT_NULL(ref);
+    memset(ref, 0, (size_t)cap * sizeof(int64_t));
+    int64_t bad = 0;
+    for (int64_t g = 0; g < ng; g++) {
+        if (g > 0 && idx_mix64((uint64_t)gk[g - 1]) >= idx_mix64((uint64_t)gk[g])) bad++;
+        uint64_t s = idx_mix64((uint64_t)gk[g]) >> sh;
+        while (ref[s]) s = (s + 1) & mask;
+        ref[s] = g + 1;
+    }
+    for (uint64_t s = 0; s < cap; s++)
+        if (idx_arr_get(ix->u.hash.table, (int64_t)s) != ref[s]) bad++;
+    ray_sys_free(ref);
+    TEST_ASSERT_EQ_I(bad, 0);
+    PASS();
+}
+
+/* Large column: the build runs partition-parallel above 64k rows.  Groups
+ * come in ascending order of the key's mix, rows ascend inside a group and
+ * nulls are excluded — checked against a reference computed the obvious
+ * way. */
 static test_result_t test_index_hash_large_parallel(void) {
     ray_heap_init();
     /* The parallel build needs the pool; create it before the attach so
@@ -353,7 +403,8 @@ static test_result_t test_index_hash_large_parallel(void) {
     for (int64_t i = 0; i < n; i += 977)
         TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, i, true), RAY_OK);
 
-    /* reference: first-occurrence group ids and counts */
+    /* reference: the distinct keys and their counts, then the groups in
+     * ascending order of the key's mixed hash */
     int64_t* gid_of_key = (int64_t*)ray_sys_alloc((size_t)kmax * sizeof(int64_t));
     int64_t* ref_key    = (int64_t*)ray_sys_alloc((size_t)kmax * sizeof(int64_t));
     int64_t* ref_cnt    = (int64_t*)ray_sys_alloc((size_t)kmax * sizeof(int64_t));
@@ -363,10 +414,13 @@ static test_result_t test_index_hash_large_parallel(void) {
     for (int64_t i = 0; i < n; i++) {
         if (ray_vec_is_null(v, i)) continue;
         int64_t k = xs[i] + 17;
-        if (gid_of_key[k] < 0) { gid_of_key[k] = ref_groups; ref_key[ref_groups++] = xs[i]; }
-        ref_cnt[gid_of_key[k]]++;
+        if (gid_of_key[k] < 0) { gid_of_key[k] = 0; ref_key[ref_groups++] = xs[i]; }
         ref_keys++;
     }
+    qsort(ref_key, (size_t)ref_groups, sizeof(int64_t), idx_mix_cmp);
+    for (int64_t g = 0; g < ref_groups; g++) gid_of_key[ref_key[g] + 17] = g;
+    for (int64_t i = 0; i < n; i++)
+        if (!ray_vec_is_null(v, i)) ref_cnt[gid_of_key[xs[i] + 17]]++;
 
     ray_t* w = v;
     ray_t* r = ray_index_attach_hash(&w);
@@ -376,29 +430,36 @@ static test_result_t test_index_hash_large_parallel(void) {
     TEST_ASSERT_EQ_I(ix->u.hash.n_keys, ref_keys);
     TEST_ASSERT_EQ_I(ix->u.hash.n_groups, ref_groups);
     const int64_t* gk = (const int64_t*)ray_data(ix->u.hash.gkeys);
-    const int64_t* of = (const int64_t*)ray_data(ix->u.hash.offs);
-    const int64_t* rw = (const int64_t*)ray_data(ix->u.hash.rows);
-    TEST_ASSERT_EQ_I(of[0], 0);
-    TEST_ASSERT_EQ_I(of[ref_groups], ref_keys);
-    /* Serial layout: groups in first-occurrence order, each with its count,
-     * rows ascending and all storing the group's key. */
+    /* The slot table, group offsets and row ids are stored narrow below
+     * 2^32 rows. */
+    TEST_ASSERT_EQ_I(ix->u.hash.table->type, RAY_I32);
+    TEST_ASSERT_EQ_I(ix->u.hash.offs->type, RAY_I32);
+    TEST_ASSERT_EQ_I(ix->u.hash.rows->type, RAY_I32);
+    const uint32_t* of = (const uint32_t*)ray_data(ix->u.hash.offs);
+    const uint32_t* rw = (const uint32_t*)ray_data(ix->u.hash.rows);
+    TEST_ASSERT_EQ_I((int64_t)of[0], 0);
+    TEST_ASSERT_EQ_I((int64_t)of[ref_groups], ref_keys);
+    /* Groups in hash order, each with its count, rows ascending and all
+     * storing the group's key; the table is the in-order insertion's. */
     for (int64_t g = 0; g < ref_groups; g++) {
         TEST_ASSERT_EQ_I(gk[g], ref_key[g]);
-        TEST_ASSERT_EQ_I(of[g + 1] - of[g], ref_cnt[g]);
-        for (int64_t j = of[g]; j < of[g + 1]; j++) {
+        TEST_ASSERT_EQ_I((int64_t)of[g + 1] - (int64_t)of[g], ref_cnt[g]);
+        for (int64_t j = (int64_t)of[g]; j < (int64_t)of[g + 1]; j++) {
             TEST_ASSERT_EQ_I(xs[rw[j]], ref_key[g]);
-            if (j > of[g]) TEST_ASSERT_TRUE(rw[j] > rw[j - 1]);
+            if (j > (int64_t)of[g]) TEST_ASSERT_TRUE(rw[j] > rw[j - 1]);
         }
     }
+    test_result_t tr = idx_table_check(ix);
+    if (tr.status != TEST_PASS) return tr;
     /* table probes: every key resolves to its group, an absent key misses */
     for (int64_t k = 0; k < kmax; k += 61) {
-        const int64_t* grows = NULL;
+        ray_idx_rows_t grows = { NULL, false };
         int64_t gn = 0;
         TEST_ASSERT_EQ_I(ray_index_hash_group(w, k - 17, &grows, &gn), 1);
         TEST_ASSERT_EQ_I(gn, ref_cnt[gid_of_key[k]]);
     }
     {
-        const int64_t* grows = NULL;
+        ray_idx_rows_t grows = { NULL, false };
         int64_t gn = 0;
         TEST_ASSERT_EQ_I(ray_index_hash_group(w, kmax + 1000, &grows, &gn), 0);
     }
@@ -580,6 +641,415 @@ static test_result_t test_index_persistence_roundtrip(void) {
 
     ray_release(loaded);
     ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── Narrow hash index on disk ───────────────────────────────────────
+ *
+ * Below 2^32 rows the hash index keeps its slot table, group offsets and
+ * row ids as 32-bit values; with top-bit homes it is written as layout
+ * generation 3.  A column saved that way maps back with the same answers;
+ * low-bit tables as written before (generation 2 narrow, generation 1 with
+ * 64-bit arrays) still map; and a region whose generation disagrees with
+ * its arrays or its home rule is not trusted (the column loads unindexed). */
+static ray_t* idx_widen(ray_t* v) {
+    if (v->type != RAY_I32) return v;
+    ray_t* w = ray_vec_new(RAY_I64, v->len);
+    w->len = v->len;
+    for (int64_t i = 0; i < v->len; i++)
+        ((int64_t*)ray_data(w))[i] = (int64_t)((const uint32_t*)ray_data(v))[i];
+    ray_release(v);
+    return w;
+}
+static ray_t* hx_test_narrow(ray_t* v) {
+    if (v->type != RAY_I64) return v;
+    ray_t* w = ray_vec_new(RAY_I32, v->len);
+    w->len = v->len;
+    for (int64_t i = 0; i < v->len; i++)
+        ((uint32_t*)ray_data(w))[i] = (uint32_t)((const int64_t*)ray_data(v))[i];
+    ray_release(v);
+    return w;
+}
+static test_result_t idx_narrow_check(ray_t* col, int64_t n, int64_t keys) {
+    TEST_ASSERT_TRUE(col->attrs & RAY_ATTR_HAS_INDEX);
+    TEST_ASSERT_EQ_I(ray_index_kind(col), RAY_IDX_HASH);
+    for (int64_t k = 0; k < keys + 3; k++) {
+        int64_t want = k < keys ? k : -1;
+        TEST_ASSERT_EQ_I(ray_index_find_row(col, k), want);
+        ray_idx_rows_t rows = { NULL, false }; int64_t gn = 0;
+        int hit = ray_index_hash_group(col, k, &rows, &gn);
+        if (k >= keys) { TEST_ASSERT_EQ_I(hit, 0); continue; }
+        TEST_ASSERT_EQ_I(hit, 1);
+        TEST_ASSERT_EQ_I(gn, (n - 1 - k) / keys + 1);
+        for (int64_t j = 0; j < gn; j++) TEST_ASSERT_EQ_I(ray_idx_rows_at(rows, j), k + j * keys);
+    }
+    PASS();
+}
+/* An interrupt makes a pool dispatch skip its tasks.  Narrowing the arrays
+ * of a just-built hash index runs as one; interrupted there it must keep the
+ * wide arrays it was copying, not install an unfilled copy. */
+static test_result_t test_index_hash_narrow_interrupted(void) {
+    ray_heap_init();
+    ray_pool_t* pool = ray_pool_get();
+    if (!pool || pool->n_workers == 0) { ray_heap_destroy(); SKIP("needs pool workers"); }
+    const int64_t n = 200000, keys = 1000;
+    ray_t* v = ray_vec_new(RAY_STR, n);
+    char buf[16];
+    for (int64_t i = 0; i < n; i++) {
+        int l = snprintf(buf, sizeof buf, "k%d", (int)(i % keys));
+        v = ray_str_vec_append(v, buf, (size_t)l);
+    }
+    ray_t* w = v;
+    atomic_store(&pool->cancelled, 1);
+    ray_t* r = ray_index_attach_hash(&w);
+    atomic_store(&pool->cancelled, 0);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_index_kind(w), RAY_IDX_HASH);
+    int64_t bad = 0;
+    for (int64_t k = 0; k < keys; k++) {
+        int l = snprintf(buf, sizeof buf, "k%d", (int)k);
+        ray_t* a = ray_str(buf, (size_t)l);
+        if (ray_index_find_atom(w, a) != k) bad++;
+        ray_release(a);
+    }
+    TEST_ASSERT_EQ_I(bad, 0);
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* Overwrite one byte of the index region at the end of column file `path`
+ * (`off` from the region start). */
+static bool idx_patch_byte(const char* path, const ray_index_t* ix, int64_t off, uint8_t val) {
+    struct stat st;
+    if (stat(path, &st) != 0) return false;
+    int64_t region = ray_index_inline_size(ix);
+    FILE* f = fopen(path, "r+b");
+    if (!f) return false;
+    bool ok = fseek(f, (long)(st.st_size - region + off), SEEK_SET) == 0 &&
+              fwrite(&val, 1, 1, f) == 1;
+    fclose(f);
+    return ok;
+}
+/* Re-lay `ix`'s slot table as builders before the top-bit homes did (low
+ * bits, groups inserted in order), as an index persisted by them reads. */
+static void idx_low_layout(ray_index_t* ix) {
+    ray_t* t = ix->u.hash.table;
+    uint64_t mask = ix->u.hash.mask;
+    const int64_t* gk = (const int64_t*)ray_data(ix->u.hash.gkeys);
+    memset(ray_data(t), 0, (size_t)t->len * (size_t)ray_elem_size(t->type));
+    for (int64_t g = 0; g < ix->u.hash.n_groups; g++) {
+        uint64_t s = idx_mix64((uint64_t)gk[g]) & mask;
+        while (idx_arr_get(t, (int64_t)s) != 0) s = (s + 1) & mask;
+        if (t->type == RAY_I32) ((uint32_t*)ray_data(t))[s] = (uint32_t)(g + 1);
+        else                    ((int64_t*)ray_data(t))[s] = g + 1;
+    }
+    ix->markers &= (uint8_t)~RAY_MARK_HASH_HIGH;
+}
+static test_result_t test_index_hash_narrow_roundtrip(void) {
+    ray_heap_init();
+    const int64_t n = 100000, keys = 977;
+    ray_t* v = ray_vec_new(RAY_I64, n);
+    v->len = n;
+    for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(v))[i] = i % keys;
+    ray_t* w = v;
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_hash(&w)));
+    ray_index_t* ix = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I(ix->u.hash.table->type, RAY_I32);
+    TEST_ASSERT_EQ_I(ix->u.hash.offs->type, RAY_I32);
+    TEST_ASSERT_EQ_I(ix->u.hash.rows->type, RAY_I32);
+    test_result_t r = idx_narrow_check(w, n, keys);
+    if (r.status != TEST_PASS) return r;
+
+    char path[] = "/tmp/idx_narrow_XXXXXX";
+    int fd = mkstemp(path);
+    TEST_ASSERT_TRUE(fd >= 0);
+    close(fd);
+
+    /* generation 3: top-bit homes, narrow arrays map back as written */
+    TEST_ASSERT_EQ_I(ray_col_save(w, path), RAY_OK);
+    ray_t* m = ray_col_mmap(path);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(m));
+    TEST_ASSERT_EQ_I(m->index->order, 3);
+    TEST_ASSERT_TRUE(ray_index_payload(m->index)->markers & RAY_MARK_HASH_HIGH);
+    TEST_ASSERT_EQ_I(ray_index_payload(m->index)->u.hash.offs->type, RAY_I32);
+    TEST_ASSERT_EQ_I(ray_index_payload(m->index)->u.hash.rows->type, RAY_I32);
+    r = idx_narrow_check(m, n, keys);
+    ray_release(m);
+    if (r.status != TEST_PASS) { unlink(path); return r; }
+
+    /* the generation and the home rule must agree, either way round */
+    const int64_t mk_off = 32 + (int64_t)offsetof(ray_index_t, markers);
+    TEST_ASSERT_TRUE(idx_patch_byte(path, ix, mk_off, (uint8_t)(ix->markers & ~RAY_MARK_HASH_HIGH)));
+    m = ray_col_mmap(path);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(m));
+    TEST_ASSERT_FALSE(m->attrs & RAY_ATTR_HAS_INDEX);
+    ray_release(m);
+    TEST_ASSERT_TRUE(idx_patch_byte(path, ix, mk_off, ix->markers));
+    TEST_ASSERT_TRUE(idx_patch_byte(path, ix, (int64_t)offsetof(ray_t, order), 2));
+    m = ray_col_mmap(path);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(m));
+    TEST_ASSERT_FALSE(m->attrs & RAY_ATTR_HAS_INDEX);
+    ray_release(m);
+
+    /* generation 2: a low-bit table with narrow arrays still maps */
+    idx_low_layout(ix);
+    TEST_ASSERT_EQ_I(ray_col_save(w, path), RAY_OK);
+    m = ray_col_mmap(path);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(m));
+    TEST_ASSERT_EQ_I(m->index->order, 2);
+    TEST_ASSERT_FALSE(ray_index_payload(m->index)->markers & RAY_MARK_HASH_HIGH);
+    r = idx_narrow_check(m, n, keys);
+    ray_release(m);
+    if (r.status != TEST_PASS) { unlink(path); return r; }
+
+    /* generation 1: an index written with 64-bit arrays still maps */
+    ix->u.hash.table = idx_widen(ix->u.hash.table);
+    ix->u.hash.offs  = idx_widen(ix->u.hash.offs);
+    ix->u.hash.rows  = idx_widen(ix->u.hash.rows);
+    TEST_ASSERT_EQ_I(ray_col_save(w, path), RAY_OK);
+    m = ray_col_mmap(path);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(m));
+    TEST_ASSERT_EQ_I(m->index->order, 1);
+    TEST_ASSERT_EQ_I(ray_index_payload(m->index)->u.hash.offs->type, RAY_I64);
+    TEST_ASSERT_EQ_I(ray_index_payload(m->index)->u.hash.rows->type, RAY_I64);
+    r = idx_narrow_check(m, n, keys);
+    ray_release(m);
+    if (r.status != TEST_PASS) { unlink(path); return r; }
+
+    /* a generation-1 region holding a narrow array is not trusted */
+    ix->u.hash.offs = hx_test_narrow(ix->u.hash.offs);
+    TEST_ASSERT_EQ_I(ray_col_save(w, path), RAY_OK);   /* written as generation 2 */
+    TEST_ASSERT_TRUE(idx_patch_byte(path, ix, (int64_t)offsetof(ray_t, order), 1));
+    m = ray_col_mmap(path);
+    unlink(path);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(m));
+    TEST_ASSERT_FALSE(m->attrs & RAY_ATTR_HAS_INDEX);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(m))[978], 1);   /* the data itself still reads */
+    ray_release(m);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── Partitioned hash build ──────────────────────────────────────────
+ *
+ * Numeric and SYM columns are indexed by the partitioned builder: groups in
+ * ascending order of the key's mix, homes in the top bits, so the arrays
+ * follow from the data alone. */
+
+/* n rows: a third of them one hot key, the rest spread, some null. */
+static ray_t* idx_part_col_n(int64_t n) {
+    ray_t* v = ray_vec_new(RAY_I64, n);
+    if (!v || RAY_IS_ERR(v)) return v;
+    v->len = n;
+    int64_t* xs = (int64_t*)ray_data(v);
+    uint64_t s = 0x9E3779B97F4A7C15ULL;
+    for (int64_t i = 0; i < n; i++) {
+        s = s * 6364136223846793005ULL + 1442695040888963407ULL;
+        xs[i] = (s >> 33) % 3 == 0 ? 42 : (int64_t)((s >> 20) % 700000) - 350000;
+    }
+    for (int64_t i = 0; i < n; i += 1013) ray_vec_set_null_checked(v, i, true);
+    return v;
+}
+static ray_t* idx_part_col(void) { return idx_part_col_n(2000000); }
+static bool idx_arr_same(const ray_t* a, const ray_t* b) {
+    return a->type == b->type && a->len == b->len &&
+           memcmp(ray_data((ray_t*)a), ray_data((ray_t*)b),
+                  (size_t)a->len * (size_t)ray_elem_size(a->type)) == 0;
+}
+static bool idx_same(const ray_index_t* a, const ray_index_t* b) {
+    return a->u.hash.n_groups == b->u.hash.n_groups && a->u.hash.n_keys == b->u.hash.n_keys &&
+           a->u.hash.mask == b->u.hash.mask && a->markers == b->markers &&
+           idx_arr_same(a->u.hash.table, b->u.hash.table) &&
+           idx_arr_same(a->u.hash.gkeys, b->u.hash.gkeys) &&
+           idx_arr_same(a->u.hash.offs, b->u.hash.offs) &&
+           idx_arr_same(a->u.hash.rows, b->u.hash.rows);
+}
+
+/* The same column built in parallel, serially, and under a memory budget
+ * small enough to split it into many more partitions and batches (the hot
+ * key's partition alone is larger than a batch) gives the same bytes; the
+ * groups cover every non-null row exactly once. */
+static test_result_t test_index_hash_part_invariant(void) {
+    ray_heap_init();
+    (void)ray_pool_get();
+    ray_t* cols[3];
+    for (int c = 0; c < 3; c++) {
+        cols[c] = idx_part_col();
+        TEST_ASSERT_FALSE(RAY_IS_ERR(cols[c]));
+        if (c == 1) atomic_store(&ray_parallel_flag, 1);
+        if (c == 2) ray_heap_set_anon_watermark(INT64_C(4) << 20);
+        ray_t* r = ray_index_attach_hash(&cols[c]);
+        if (c == 1) atomic_store(&ray_parallel_flag, 0);
+        if (c == 2) ray_heap_set_anon_watermark(0);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        TEST_ASSERT_EQ_I(ray_index_kind(cols[c]), RAY_IDX_HASH);
+    }
+    const ray_index_t* ix = ray_index_payload(cols[0]->index);
+    TEST_ASSERT_TRUE(idx_same(ix, ray_index_payload(cols[1]->index)));
+    TEST_ASSERT_TRUE(idx_same(ix, ray_index_payload(cols[2]->index)));
+    test_result_t tr = idx_table_check(ix);
+    if (tr.status != TEST_PASS) return tr;
+
+    ray_t* v = cols[0];
+    const int64_t* xs = (const int64_t*)ray_data(v);
+    const int64_t* gk = (const int64_t*)ray_data(ix->u.hash.gkeys);
+    int64_t n = v->len, nn = 0, bad = 0;
+    uint8_t* seen = (uint8_t*)ray_sys_alloc((size_t)n);
+    TEST_ASSERT_NOT_NULL(seen);
+    memset(seen, 0, (size_t)n);
+    for (int64_t g = 0; g < ix->u.hash.n_groups; g++) {
+        int64_t lo = idx_arr_get(ix->u.hash.offs, g), hi = idx_arr_get(ix->u.hash.offs, g + 1);
+        if (hi <= lo) bad++;
+        for (int64_t j = lo; j < hi; j++) {
+            int64_t row = idx_arr_get(ix->u.hash.rows, j);
+            if (seen[row]++ || ray_vec_is_null(v, row) || xs[row] != gk[g]) bad++;
+            if (j > lo && row <= idx_arr_get(ix->u.hash.rows, j - 1)) bad++;
+        }
+    }
+    for (int64_t i = 0; i < n; i++) {
+        if (ray_vec_is_null(v, i)) { if (seen[i]) bad++; continue; }
+        nn++;
+        if (!seen[i]) bad++;
+    }
+    ray_sys_free(seen);
+    TEST_ASSERT_EQ_I(bad, 0);
+    TEST_ASSERT_EQ_I(ix->u.hash.n_keys, nn);
+    for (int c = 0; c < 3; c++) ray_release(cols[c]);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* Small tables: a run of slots that passes the last slot continues from
+ * slot 0.  Many small random columns, each checked slot by slot and probed
+ * for every key and for absent ones; some of them must wrap for the test
+ * to mean anything. */
+static test_result_t test_index_hash_part_wraps(void) {
+    ray_heap_init();
+    uint64_t s = 12345;
+    int64_t wraps = 0, bad = 0;
+    for (int t = 0; t < 2000; t++) {
+        int64_t m = 2 + t % 30, n = 3 * m;
+        int64_t keys[32];
+        for (int64_t k = 0; k < m; k++) {
+            s = s * 6364136223846793005ULL + 1442695040888963407ULL;
+            keys[k] = (int64_t)s;
+        }
+        ray_t* v = ray_vec_new(RAY_I64, n);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+        v->len = n;
+        for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(v))[i] = keys[(i * 7) % m];
+        ray_t* w = v;
+        TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_hash(&w)));
+        const ray_index_t* ix = ray_index_payload(w->index);
+        test_result_t tr = idx_table_check(ix);
+        if (tr.status != TEST_PASS) return tr;
+        int sh = __builtin_clzll(ix->u.hash.mask);
+        const int64_t* gk = (const int64_t*)ray_data(ix->u.hash.gkeys);
+        for (int64_t sl = 0; sl <= (int64_t)ix->u.hash.mask; sl++) {
+            int64_t g1 = idx_arr_get(ix->u.hash.table, sl);
+            if (g1 && (int64_t)(idx_mix64((uint64_t)gk[g1 - 1]) >> sh) > sl) { wraps++; break; }
+        }
+        for (int64_t k = 0; k < m; k++) {
+            int64_t first = -1;
+            for (int64_t i = 0; i < n && first < 0; i++)
+                if (((int64_t*)ray_data(w))[i] == keys[k]) first = i;
+            if (ray_index_find_row(w, keys[k]) != first) bad++;
+        }
+        if (ray_index_find_row(w, keys[0] ^ 1) != -1 && (keys[0] ^ 1) != keys[1]) bad++;
+        ray_release(w);
+    }
+    TEST_ASSERT_EQ_I(bad, 0);
+    TEST_ASSERT_TRUE(wraps > 0);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* An interrupt makes a pool dispatch skip its tasks: the build reports the
+ * cancel and leaves the column unindexed, and the next build is whole. */
+static test_result_t test_index_hash_part_interrupted(void) {
+    ray_heap_init();
+    ray_pool_t* pool = ray_pool_get();
+    if (!pool) { ray_heap_destroy(); SKIP("needs the pool"); }
+    const int64_t n = 300000;
+    ray_t* v = ray_vec_new(RAY_I64, n);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    v->len = n;
+    for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(v))[i] = i % 5000;
+    ray_t* w = v;
+    atomic_store(&pool->cancelled, 1);
+    ray_t* r = ray_index_attach_hash(&w);
+    atomic_store(&pool->cancelled, 0);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    ray_error_free(r);
+    TEST_ASSERT_FALSE(w->attrs & RAY_ATTR_HAS_INDEX);
+    r = ray_index_attach_hash(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    test_result_t tr = idx_narrow_check(w, n, 5000);
+    if (tr.status != TEST_PASS) return tr;
+    tr = idx_table_check(ray_index_payload(w->index));
+    if (tr.status != TEST_PASS) return tr;
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* The interrupt can land anywhere in the build, in particular inside a
+ * batch's row pass, whose skipped tasks leave their partitions in hand.
+ * One build is timed, then interrupts are raised at points spread over
+ * that time, under a budget that splits the column into many batches:
+ * each attempt either reports the cancel and leaves the column as it was,
+ * or completes with exactly the uninterrupted index, and the build after
+ * each attempt is whole. */
+static int64_t idx_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+static void idx_interrupt_after(void* arg) {
+    int64_t ns = *(const int64_t*)arg;
+    struct timespec ts = { (time_t)(ns / 1000000000), (long)(ns % 1000000000) };
+    nanosleep(&ts, NULL);
+    ray_request_interrupt();
+}
+static test_result_t test_index_hash_part_interrupt_sweep(void) {
+    ray_heap_init();
+    ray_pool_t* pool = ray_pool_get();
+    if (!pool || ray_pool_total_workers(pool) < 2) { ray_heap_destroy(); SKIP("needs workers"); }
+    ray_heap_set_anon_watermark(INT64_C(64) << 20);   /* batches of 128K rows */
+    ray_t* ref = idx_part_col_n(500000);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ref));
+    int64_t t0 = idx_now_ns();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_hash(&ref)));
+    int64_t took = idx_now_ns() - t0;
+    const ray_index_t* rix = ray_index_payload(ref->index);
+    int64_t cancelled = 0, bad = 0;
+    for (int k = 0; k < 6; k++) {
+        ray_t* v = idx_part_col_n(500000);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+        int64_t delay = took * k / 6;
+        ray_thread_t th;
+        TEST_ASSERT_EQ_I(ray_thread_create(&th, idx_interrupt_after, &delay), RAY_OK);
+        ray_t* r = ray_index_attach_hash(&v);
+        ray_thread_join(th);
+        ray_clear_interrupt();
+        if (RAY_IS_ERR(r)) {
+            cancelled++;
+            ray_error_free(r);
+            if (v->attrs & RAY_ATTR_HAS_INDEX) bad++;
+            if (memcmp(ray_data(v), ray_data(ref), (size_t)v->len * 8) != 0) bad++;
+            TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_hash(&v)));
+        }
+        if (!idx_same(rix, ray_index_payload(v->index))) bad++;
+        ray_release(v);
+    }
+    ray_heap_set_anon_watermark(0);
+    TEST_ASSERT_EQ_I(bad, 0);
+    TEST_ASSERT_TRUE(cancelled > 0);
+    ray_release(ref);
     ray_heap_destroy();
     PASS();
 }
@@ -2619,12 +3089,12 @@ static test_result_t test_index_hash_collisions(void) {
     TEST_ASSERT_EQ_I(ih->u.hash.n_groups, 1);
 
     /* One CSR group holding rows 0..4 in ascending order. */
-    const int64_t* grows = NULL;
+    ray_idx_rows_t grows = { NULL, false };
     int64_t gn = 0;
     TEST_ASSERT_EQ_I(ray_index_hash_group(w, 5, &grows, &gn), 1);
     TEST_ASSERT_EQ_I(gn, 5);
     for (int64_t i = 0; i < 5; i++)
-        TEST_ASSERT_EQ_I(grows[i], i);
+        TEST_ASSERT_EQ_I(ray_idx_rows_at(grows, i), i);
 
     ray_release(w);
     ray_heap_destroy();
@@ -3849,6 +4319,12 @@ const test_entry_t index_entries[] = {
     { "index/aux_helper_slice",          test_index_aux_helper_slice,          NULL, NULL },
     { "index/drop_under_shared_cow",         test_index_drop_under_shared_cow,         NULL, NULL },
     { "index/mapped_drop_unmaps_tail", test_index_mapped_drop_unmaps_tail, NULL, NULL },
+    { "index/hash_narrow_roundtrip", test_index_hash_narrow_roundtrip, NULL, NULL },
+    { "index/hash_narrow_interrupted", test_index_hash_narrow_interrupted, NULL, NULL },
+    { "index/hash_part_invariant", test_index_hash_part_invariant, NULL, NULL },
+    { "index/hash_part_wraps", test_index_hash_part_wraps, NULL, NULL },
+    { "index/hash_part_interrupted", test_index_hash_part_interrupted, NULL, NULL },
+    { "index/hash_part_interrupt_sweep", test_index_hash_part_interrupt_sweep, NULL, NULL },
     { "index/persistence_roundtrip",         test_index_persistence_roundtrip,         NULL, NULL },
     { "index/bool_zone_and_hash",            test_index_bool_zone_and_hash,            NULL, NULL },
     { "index/i16_zone_and_hash",             test_index_i16_zone_and_hash,             NULL, NULL },

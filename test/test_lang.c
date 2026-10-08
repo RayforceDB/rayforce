@@ -9438,12 +9438,13 @@ static test_result_t test_read_unsized_stream_is_bounded(void) {
     if (!probe) SKIP("/dev/zero unavailable");
     fclose(probe);
 
-    /* ray_heap_anon_watermark() resolves the 0 sentinel to physical RAM, so
-     * restoring what it returns would pin the watermark to a number where
-     * the suite found "use physical RAM".  Detect that case and put the
-     * sentinel back instead, which keeps this test order-independent. */
+    /* ray_heap_anon_watermark() resolves the 0 sentinel to the default
+     * threshold, so restoring what it returns would pin the watermark to a
+     * number where the suite found "use the default".  Detect that case and
+     * put the sentinel back instead, which keeps this test order-independent. */
     int64_t saved = ray_heap_anon_watermark();
-    bool was_default = (saved == ray_sys_total_ram());
+    ray_heap_set_anon_watermark(0);
+    bool was_default = (saved == ray_heap_anon_watermark());
     /* budget = (watermark - committed) / 4, so this leaves ~1 MB. */
     ray_heap_set_anon_watermark(ray_heap_anon_committed() + 4 * 1024 * 1024);
 
@@ -9500,7 +9501,8 @@ static test_result_t test_exec_capture_is_bounded(void) {
     SKIP("shell capture unavailable");
 #else
     int64_t saved = ray_heap_anon_watermark();
-    bool was_default = (saved == ray_sys_total_ram());
+    ray_heap_set_anon_watermark(0);
+    bool was_default = (saved == ray_heap_anon_watermark());
     ray_heap_set_anon_watermark(ray_heap_anon_committed() + 4 * 1024 * 1024);
 
     ray_t* args[2];

@@ -346,9 +346,12 @@ int64_t ray_poll_run_for(ray_poll_t* poll, int timeout_ms)
             /* A fired timer is work, and on a timer-driven server it is the
              * only work there is: without this stamp the decay sees an idle
              * process mid-workload, and — having disarmed itself — never
-             * looks again. */
-            if (ray_timers_fire_expired((ray_timers_t*)poll->timers) > 0)
+             * looks again.  It is also a unit of work ending, so the same
+             * boundary relief as after an IPC request applies. */
+            if (ray_timers_fire_expired((ray_timers_t*)poll->timers) > 0) {
                 ray_heap_note_activity();
+                ray_heap_relieve();
+            }
         }
         /* After the events of this wakeup, not before: a request handled
          * above has just re-stamped the activity clock, so a busy loop

@@ -1,4 +1,7 @@
 /* Copyright (c) 2026 Anton Kundenko. MIT license; see LICENSE. */
+#if !defined(_WIN32)
+#define _POSIX_C_SOURCE 200809L  /* setenv / unsetenv */
+#endif
 #include "test.h"
 #include "io/parquet.h"
 #include "core/pool.h"
@@ -8,6 +11,7 @@
 #include "store/splay.h"
 #include "ops/idxop.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #if !defined(RAY_OS_WINDOWS) && !defined(RAY_OS_WASM)
@@ -292,27 +296,39 @@ static void pq_remove_native(const char* dir, const char** columns, int n) {
     for (int i = 0; i < 3; i++) { snprintf(path,sizeof(path),"%s/%s",dir,special[i]); unlink(path); }
     rmdir(dir);
 }
+/* The direct import picks its pass layout from memory; RAY_PQ_PASS_COLS
+ * forces it, so a test covers both: NULL = the default (one pass on any
+ * test machine), "1" = column by column. */
+static void pq_set_layout(const char* v) {
+#ifdef RAY_OS_WINDOWS
+    _putenv_s("RAY_PQ_PASS_COLS", v ? v : "");
+#else
+    if (v) setenv("RAY_PQ_PASS_COLS", v, 1); else unsetenv("RAY_PQ_PASS_COLS");
+#endif
+}
 static test_result_t test_pq_group_native(void) {
     const char* names[] = {"x","y","s"};
     int64_t tids[] = {ray_sym_intern("I32",3),ray_sym_intern("I64",3),ray_sym_intern("SYM",3)};
     ray_t* types = ray_vec_from_raw(RAY_SYM,tids,3);
     for (int cores = 1; cores <= 8; cores *= 2) {
         ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(cores),RAY_OK);
-        for (int sym = 0; sym < 2; sym++) {
+        for (int sym = 0; sym < 4; sym++) {
+            pq_set_layout(sym >= 2 ? "1" : NULL);
             char dir[160]; snprintf(dir,sizeof(dir),"/tmp/rayforce-pq-groups-%d-%d-%d",(int)getpid(),cores,sym);
-            ray_t* result = ray_parquet_splayed_typed(FIX "row-groups.parquet",dir,sym ? types : NULL);
+            ray_t* result = ray_parquet_splayed_typed(FIX "row-groups.parquet",dir,sym & 1 ? types : NULL);
+            pq_set_layout(NULL);
             TEST_ASSERT_FALSE(RAY_IS_ERR(result)); TEST_ASSERT_EQ_I(result->i64,44009); ray_release(result);
             char domain[200]; snprintf(domain,sizeof(domain),"%s/.sym",dir);
-            ray_t* table = ray_read_splayed(dir,sym ? domain : NULL);
+            ray_t* table = ray_read_splayed(dir,sym & 1 ? domain : NULL);
             TEST_ASSERT_FALSE(RAY_IS_ERR(table)); TEST_ASSERT_EQ_I(ray_table_nrows(table),44009);
             ray_t* strings = ray_table_get_col_idx(table,2);
-            TEST_ASSERT_EQ_I(strings->type,sym ? RAY_SYM : RAY_STR);
+            TEST_ASSERT_EQ_I(strings->type,sym & 1 ? RAY_SYM : RAY_STR);
             for (int64_t i = 0; i < 44009; i++) {
                 TEST_ASSERT_EQ_I(((int32_t*)ray_data(ray_table_get_col_idx(table,0)))[i],i);
                 TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_table_get_col_idx(table,1)))[i],i%13 ? i*3 : NULL_I64);
                 char expected[64]; int n = snprintf(expected,sizeof(expected),"long pooled string row %lld",(long long)i);
                 size_t len; const char* text;
-                if (sym) { ray_t* atom = ray_sym_vec_cell(strings,i); text = ray_str_ptr(atom); len = ray_str_len(atom); }
+                if (sym & 1) { ray_t* atom = ray_sym_vec_cell(strings,i); text = ray_str_ptr(atom); len = ray_str_len(atom); }
                 else text = ray_str_vec_get(strings,i,&len);
                 TEST_ASSERT_EQ_I(len,n); TEST_ASSERT_TRUE(!memcmp(text,expected,len));
             }
@@ -465,10 +481,13 @@ static void* pq_small_stack_worker(void* result) {
  * unclustered column with nulls gets a hash. */
 static test_result_t test_pq_splayed_inline_indexes(void) {
     const char* names[] = {"x","y"};
-    for (int cores = 1; cores <= 4; cores *= 4) {
+    for (int run = 0; run < 4; run++) {
+        int cores = run & 1 ? 4 : 1;
         ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(cores),RAY_OK);
-        char dir[160]; snprintf(dir,sizeof(dir),"/tmp/rayforce-pq-zones-%d-%d",(int)getpid(),cores);
+        char dir[160]; snprintf(dir,sizeof(dir),"/tmp/rayforce-pq-zones-%d-%d",(int)getpid(),run);
+        pq_set_layout(run >= 2 ? "1" : NULL);
         ray_t* result = ray_parquet_splayed_typed(FIX "zones.parquet",dir,NULL);
+        pq_set_layout(NULL);
         TEST_ASSERT_FALSE(RAY_IS_ERR(result)); TEST_ASSERT_EQ_I(result->i64,200000); ray_release(result);
         ray_t* table = ray_read_splayed(dir,NULL);
         TEST_ASSERT_FALSE(RAY_IS_ERR(table));
@@ -510,6 +529,47 @@ static test_result_t test_pq_small_stack(void) {
     SKIP("requires POSIX thread stack attributes");
 #endif
 }
+#if defined(__linux__)
+#include <signal.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
+/* A row group's chunk ends with a flush of the bytes its stream still
+ * buffers (glibc writes whole blocks of a large write at once and keeps the
+ * tail).  The file size limit here falls inside that tail of the first
+ * chunk of x (rows 0-5002, the first task), so it is the flush that fails:
+ * the import must report that chunk's failure, not a later write's, and
+ * publish nothing. */
+static test_result_t test_pq_chunk_flush_error(void) {
+    ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(1),RAY_OK);
+    int64_t tids[] = {ray_sym_intern("I32",3),ray_sym_intern("I64",3),ray_sym_intern("SYM",3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM,tids,3);
+    char dir[160]; snprintf(dir,sizeof(dir),"/tmp/rayforce-pq-flush-%d",(int)getpid());
+    struct rlimit old, lim;
+    TEST_ASSERT_EQ_I(getrlimit(RLIMIT_FSIZE,&old),0);
+    lim = old; lim.rlim_cur = 32 + 5003*4 - 1;
+    void (*prev)(int) = signal(SIGXFSZ,SIG_IGN);
+    pq_set_layout(NULL);
+    TEST_ASSERT_EQ_I(setrlimit(RLIMIT_FSIZE,&lim),0);
+    ray_t* result = ray_parquet_splayed_typed(FIX "row-groups.parquet",dir,types);
+    setrlimit(RLIMIT_FSIZE,&old);
+    signal(SIGXFSZ,prev);
+    ray_release(types);
+    bool failed = RAY_IS_ERR(result);
+    const char* code = failed ? ray_err_code(result) : "";
+    bool on_chunk = failed && code && strcmp(code,"parquet") == 0;   /* the flush, not a later write */
+    if (failed) ray_error_free(result); else ray_release(result);
+    struct stat st;
+    bool published = stat(dir,&st) == 0;
+    char staging[200]; snprintf(staging,sizeof(staging),"%s.parquet-partial",dir);
+    const char* names[] = {"x","y","s"};
+    pq_remove_native(dir,names,3); pq_remove_native(staging,names,3);
+    ray_pool_destroy();
+    TEST_ASSERT_TRUE(failed);
+    TEST_ASSERT_FALSE(published);
+    TEST_ASSERT_TRUE(on_chunk);
+    PASS();
+}
+#endif
 const test_entry_t parquet_entries[] = {
     {"parquet/small_stack",test_pq_small_stack,NULL,NULL},
     {"parquet/parted_symbols",test_pq_parted_symbols,pq_setup,pq_teardown},
@@ -522,6 +582,9 @@ const test_entry_t parquet_entries[] = {
     {"parquet/bloom",test_pq_bloom,pq_setup,pq_teardown},
     {"parquet/native_edges",test_pq_native_edges,pq_setup,pq_teardown},
     {"parquet/group_native",test_pq_group_native,pq_setup,pq_teardown},
+#if defined(__linux__)
+    {"parquet/chunk_flush_error",test_pq_chunk_flush_error,pq_setup,pq_teardown},
+#endif
     {"parquet/splayed_inline_indexes",test_pq_splayed_inline_indexes,pq_setup,pq_teardown},
     {"parquet/parallel",test_pq_parallel,pq_setup,pq_teardown},
     {"parquet/range",test_pq_range,pq_setup,pq_teardown},

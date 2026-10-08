@@ -101,6 +101,14 @@ ray_sym_domain_t* ray_sym_domain_open(const char* path);
  * open-or-create entry point. */
 ray_sym_domain_t* ray_sym_domain_open_or_create(const char* path);
 
+/* A fresh symbol file at `path` that one converter builds alone, the
+ * strings appended straight into the mapped file (see table/symimp.h):
+ * intern, intern_batch, count, flush / flush_append (append: header and
+ * writeback; durable: cut and sync) and release only.  Not cached by path.
+ * NULL where unsupported or on failure; the caller then uses
+ * ray_sym_domain_open_or_create. */
+ray_sym_domain_t* ray_sym_domain_create_import(const char* path);
+
 /* New private, refcounted in-memory dictionary. Supports the same concurrent
  * append and resolution operations as FILE domains, without a cache entry or
  * backing file. Attached vectors keep it alive. flush returns RAY_ERR_DOMAIN. */
@@ -195,6 +203,16 @@ const char* ray_sym_domain_path(ray_sym_domain_t* dom);
  * nothing new was interned.  RUNTIME: RAY_OK (the global table owns its
  * own persistence). */
 ray_err_t ray_sym_domain_flush(ray_sym_domain_t* dom, bool durable);
+
+/* Append the entries interned since the last flush to the symfile in place
+ * (header count rewritten after the records), instead of rewriting the
+ * whole file through a tmp + rename.  For a symfile one writer builds
+ * alone, such as a converter's staging domain, flushed as it grows so the
+ * last flush writes only the tail.  Same `.lk` lock as
+ * ray_sym_domain_flush; the file must still have the persisted size.
+ * `durable` also syncs the file and its directory, even when nothing new
+ * was interned. */
+ray_err_t ray_sym_domain_flush_append(ray_sym_domain_t* dom, bool durable);
 
 /* RAY_SYM_AUDIT=1 support (cached at ray_sym_init): when set,
  * ray_sym_vec_cell cross-checks every resolution and aborts with full

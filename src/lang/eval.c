@@ -42,6 +42,7 @@
 #include "core/qlog.h"     /* ray_qlog_enabled — arm capture for query logging */
 #include "store/serde.h"   /* ray_serde_size — result footprint for spans */
 #include "table/sym.h"
+#include "store/col.h"    /* ray_col_want_rows — gather read-ahead */
 #include "mem/heap.h"
 #include "core/pool.h"
 #include "mem/sys.h"
@@ -1480,6 +1481,8 @@ typedef struct {
     char*          dst;
     const int64_t* idx;
     uint8_t        esz;
+    int64_t        rows;      /* src's rows when each task reads ahead (gbi_want); 0 otherwise */
+    int64_t        row_end;   /* one past the last row idx lists */
 } gbi_ctx_t;
 
 static void gbi_fill_fn(void* ctxp, uint32_t wid, int64_t start, int64_t end) {
@@ -1488,14 +1491,38 @@ static void gbi_fill_fn(void* ctxp, uint32_t wid, int64_t start, int64_t end) {
     const char* src = c->src;
     char* dst = c->dst;
     const int64_t* idx = c->idx;
-    switch (c->esz) {
-    case 8: for (int64_t i = start; i < end; i++) memcpy(dst + i*8, src + idx[i]*8, 8); break;
-    case 4: for (int64_t i = start; i < end; i++) memcpy(dst + i*4, src + idx[i]*4, 4); break;
-    case 2: for (int64_t i = start; i < end; i++) memcpy(dst + i*2, src + idx[i]*2, 2); break;
-    case 1: for (int64_t i = start; i < end; i++) dst[i] = src[idx[i]]; break;
-    case 16: for (int64_t i = start; i < end; i++) memcpy(dst + i*16, src + idx[i]*16, 16); break;
-    default: for (int64_t i = start; i < end; i++) memcpy(dst + i*c->esz, src + idx[i]*c->esz, c->esz); break;
+    /* the task's rows may span more than one read-ahead window: report
+     * them as the copy goes */
+    for (int64_t lo = start; lo < end; lo += 1024) {
+        int64_t hi = end - lo < 1024 ? end : lo + 1024;
+        if (c->rows) ray_pool_scan_col_at(src, c->rows, idx[lo], c->row_end);
+        switch (c->esz) {
+        case 8: for (int64_t i = lo; i < hi; i++) memcpy(dst + i*8, src + idx[i]*8, 8); break;
+        case 4: for (int64_t i = lo; i < hi; i++) memcpy(dst + i*4, src + idx[i]*4, 4); break;
+        case 2: for (int64_t i = lo; i < hi; i++) memcpy(dst + i*2, src + idx[i]*2, 2); break;
+        case 1: for (int64_t i = lo; i < hi; i++) dst[i] = src[idx[i]]; break;
+        case 16: for (int64_t i = lo; i < hi; i++) memcpy(dst + i*16, src + idx[i]*16, 16); break;
+        default: for (int64_t i = lo; i < hi; i++) memcpy(dst + i*c->esz, src + idx[i]*c->esz, c->esz); break;
+        }
     }
+}
+
+/* Reading a cold mapped column at scattered rows waits on one page fault
+ * at a time.  When `idx` lists rows of a column registered for scan
+ * read-ahead (core/pool.c) in order, with about a row per page of their
+ * stretch or more, each task of the parallel gather keeps the rows past its
+ * own requested, paced with the gather; else the pages of the rows are
+ * requested up front (ray_col_want_rows). */
+static void gbi_want(gbi_ctx_t* gc, ray_t* vec, const int64_t* idx, int64_t n, bool par) {
+    if (!ray_pool_scan_on()) return;
+    int64_t lo = n > 0 ? idx[0] : -1, hi = n > 0 ? idx[n - 1] : -1;
+    if (par && lo >= 0 && lo <= hi && hi < vec->len &&
+        (hi - lo + 1) * gc->esz / 4096 <= n && ray_pool_scan_holds(gc->src, vec->len)) {
+        gc->rows = vec->len;
+        gc->row_end = hi + 1;
+        return;
+    }
+    ray_col_want_rows(vec, idx, n);
 }
 
 /* Reorder vector elements by an index array */
@@ -1533,7 +1560,9 @@ ray_t* gather_by_idx(ray_t* vec, int64_t* idx, int64_t n) {
                          .dst = (char*)ray_data(result),
                          .idx = idx, .esz = esz };
         ray_pool_t* gpool = ray_pool_get();
-        if (gbi_par_ok(gpool, n))
+        bool par = gbi_par_ok(gpool, n);
+        gbi_want(&gc, vec, idx, n, par);   /* scattered rows of a cold mapped column */
+        if (par)
             ray_pool_dispatch(gpool, gbi_fill_fn, &gc, n);
         else
             gbi_fill_fn(&gc, 0, 0, n);
@@ -1575,7 +1604,9 @@ ray_t* gather_by_idx(ray_t* vec, int64_t* idx, int64_t n) {
                      .dst = (char*)ray_data(result),
                      .idx = idx, .esz = esz };
     ray_pool_t* gpool = ray_pool_get();
-    if (gbi_par_ok(gpool, n))
+    bool par = gbi_par_ok(gpool, n);
+    gbi_want(&gc, vec, idx, n, par);   /* scattered rows of a cold mapped column */
+    if (par)
         ray_pool_dispatch(gpool, gbi_fill_fn, &gc, n);
     else
         gbi_fill_fn(&gc, 0, 0, n);

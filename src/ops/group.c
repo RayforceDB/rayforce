@@ -3025,7 +3025,7 @@ static int64_t mode_large_group(ray_t* src, const int64_t* rows, int64_t count) 
     while (c.partitions < c.tasks) c.partitions *= 2;
     /* Includes the scattered records and the worst hash-table capacity. */
     if ((uint64_t)count > SIZE_MAX / 160 ||
-        (uint64_t)count * 160 > (uint64_t)ray_heap_anon_watermark() / 4) return -4;
+        (uint64_t)count * 160 > (uint64_t)ray_heap_mem_budget() / 4) return -4;
     ray_t *records_hdr = NULL, *scatter_hdr = NULL, *hist_hdr = NULL;
     c.records = scratch_alloc(&records_hdr, (size_t)count * sizeof(mode_record_t));
     c.histogram = scratch_calloc(&hist_hdr,
@@ -10444,6 +10444,8 @@ typedef struct {
      * that computes SUM b (-1 = b runs its own loop). */
     int8_t            pair_sum[16];
     int8_t            fused_by[16];
+    int64_t*          wide;     /* [workers * SG_CHUNK_ROWS]: widened
+                                 * narrow row ids (NULL if none narrow) */
 } sg_ctx_t;
 
 /* Fused-product partial over a CONTIGUOUS row range — type-specialized
@@ -10558,13 +10560,21 @@ static inline void sg_pair_accum(ray_t* x, ray_t* y, uint16_t op,
 }
 
 static void sg_accum_fn(void* raw, uint32_t wid, int64_t tstart, int64_t tend) {
-    (void)wid;
     sg_ctx_t* c = (sg_ctx_t*)raw;
     for (int64_t ti = tstart; ti < tend; ti++) {
         const sg_task_t* tk = &c->tasks[ti];
         const ray_idx_slice_t* sl = &c->slices[tk->gi];
-        const int64_t* restrict rows = sl->rows ? sl->rows + tk->lo : NULL;
         int64_t n = tk->hi - tk->lo;
+        const int64_t* rows = NULL;
+        if (sl->rows.p && !sl->rows.narrow) {
+            rows = (const int64_t*)sl->rows.p + tk->lo;
+        } else if (sl->rows.p) {
+            /* Narrow row ids: widen this task's chunk once. */
+            int64_t* w = c->wide + (size_t)wid * SG_CHUNK_ROWS;
+            const uint32_t* src = (const uint32_t*)sl->rows.p + tk->lo;
+            for (int64_t j = 0; j < n; j++) w[j] = (int64_t)src[j];
+            rows = w;
+        }
         /* Parted layout: each key's rows form one contiguous run — the
          * accumulate then streams raw column pointers and vectorizes. */
         bool contig = (n > 0 && (!rows || rows[n - 1] - rows[0] + 1 == n));
@@ -10717,9 +10727,9 @@ static ray_t* sg_hint_to_selection(ray_graph_t* g, ray_t* tbl) {
         int64_t* ids = (int64_t*)ray_data(hdr);
         int64_t w = 0;
         for (int64_t i = 0; i < K; i++) {
-            if (sl[i].rows) {
-                memcpy(ids + w, sl[i].rows,
-                       (size_t)sl[i].n * sizeof(int64_t));
+            if (sl[i].rows.p) {
+                for (int64_t j = 0; j < sl[i].n; j++)
+                    ids[w + j] = ray_idx_rows_at(sl[i].rows, j);
             } else {
                 for (int64_t j = 0; j < sl[i].n; j++)
                     ids[w + j] = sl[i].first + j;
@@ -10946,7 +10956,7 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         }
         sg_ctx_t ctx = { slices, tasks, agg_vecs, agg_vecs2, prod, ext->agg_ops,
                          n_aggs, partials, part_hi, part_sumsq, part_sum_y,
-                         part_sumsq_y, part_sumxy, {0}, {0} };
+                         part_sumsq_y, part_sumxy, {0}, {0}, NULL };
         /* Shared-stream pairing: a bare-scan SUM/AVG over the same column
          * a product's int side already streams rides the product loop —
          * one pass over the column instead of two. */
@@ -10975,13 +10985,34 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             }
         }
         ray_pool_t* pool = ray_pool_get();
+        bool par = pool && n_tasks > 1 && total_rows >= RAY_PARALLEL_THRESHOLD;
+        ray_t* wide_hdr = NULL;
+        for (int64_t i = 0; i < K; i++) {
+            if (!slices[i].rows.narrow) continue;
+            size_t nw = par ? ray_pool_total_workers(pool) : 1;
+            ctx.wide = (int64_t*)scratch_alloc(&wide_hdr,
+                           nw * SG_CHUNK_ROWS * sizeof(int64_t));
+            if (!ctx.wide) {
+                scratch_free(sum_hdr); scratch_free(cnt_hdr);
+                scratch_free(sumsq_hdr); scratch_free(sum_y_hdr);
+                scratch_free(sumsq_y_hdr); scratch_free(sumxy_hdr);
+                scratch_free(sum_hi_hdr); scratch_free(part_hi_hdr);
+                ray_free(task_hdr);
+                scratch_free(part_hdr);
+                scratch_free(part_sumsq_hdr); scratch_free(part_sum_y_hdr);
+                scratch_free(part_sumsq_y_hdr); scratch_free(part_sumxy_hdr);
+                return NULL;    /* OOM → generic path via fallback */
+            }
+            break;
+        }
         /* dispatch_n: n_tasks is a task count (tens), far below the
          * element-grain of ray_pool_dispatch, which would lump them
          * into ONE serial task. */
-        if (pool && n_tasks > 1 && total_rows >= RAY_PARALLEL_THRESHOLD)
+        if (par)
             ray_pool_dispatch_n(pool, sg_accum_fn, &ctx, (uint32_t)n_tasks);
         else
             sg_accum_fn(&ctx, 0, 0, n_tasks);
+        scratch_free(wide_hdr);
         /* Fold task partials in task order — chunk-sequential per group,
          * independent of worker count. */
         for (int64_t ti = 0; ti < n_tasks; ti++) {
@@ -11227,18 +11258,18 @@ typedef struct {
     ray_group_emit_filter_t emit_filter;
 } sp_dyn_ctx_t;
 
-/* Parallel dense-count fill for the sp_dyn pure-count case: each worker
- * scatters its row slice into a private uint32[bound] array; the caller
- * merges them into range_count.  The serial scatter was the Amdahl wall of
- * every single-SYM-key "top-N by count" query (ClickBench q13: 88ms of a
- * 110ms query in one thread's cache-miss loop; flat 8->16 core scaling).
+/* Parallel dense-count fill for the legacy sparse-dynamic path: each worker
+ * scatters its row slice into a private uint32[stride] array with `bound`
+ * live counters and cache-line padding.  The caller merges the live
+ * counters into range_count.
  * A key outside [0, bound) sets `fail` and the caller falls back to the
  * serial path — correctness never depends on the bound being right. */
 typedef struct {
     const void*    key_data;
     uint8_t        key_esz;
-    uint32_t*      counts;      /* [n_workers * bound] */
+    uint32_t*      counts;      /* 64-byte aligned [n_workers * stride] */
     uint64_t       bound;
+    size_t         stride;     /* counters per worker, padded to cache lines */
     uint32_t       n_workers;
     const int64_t* match_idx;
     ray_t*         rowsel;
@@ -11249,7 +11280,7 @@ static void sp_dyn_pcount_fn(void* vctx, uint32_t wid, int64_t start,
                              int64_t end) {
     sp_dyn_pcount_ctx_t* c = (sp_dyn_pcount_ctx_t*)vctx;
     if (atomic_load_explicit(&c->fail, memory_order_relaxed)) return;
-    uint32_t* my = c->counts + (size_t)(wid % c->n_workers) * c->bound;
+    uint32_t* my = c->counts + (size_t)(wid % c->n_workers) * c->stride;
     const int64_t* match_idx = c->match_idx;
     const uint64_t bound = c->bound;
     const uint8_t esz = c->key_esz;
@@ -11345,17 +11376,31 @@ exec_group_sp_dyn_emit(const sp_dyn_ctx_t* c) {
                     else if (key_esz == 2)   bound = 1u << 16;
                     ray_pool_t* dp = ray_pool_get();
                     uint32_t dnw = dp ? ray_pool_total_workers(dp) : 1;
+                    /* Isolate adjacent workers' boundary counters even when
+                     * bound is not a cache-line multiple.  Pad each slice
+                     * and align the base, retaining the scratch header for
+                     * cleanup.  The earlier dense path handles small spans.
+                     * Include alignment slack in the memory cap; allocations
+                     * just below the old cap may now fall back to serial. */
+                    const size_t pc_line = 64;
+                    const size_t pc_per_line = pc_line / sizeof(uint32_t);
+                    size_t stride = ((size_t)bound + pc_per_line - 1)
+                                  & ~(pc_per_line - 1);
+                    uint64_t pc_bytes = (uint64_t)dnw * stride * sizeof(uint32_t)
+                                      + pc_line - 1;
                     if (bound > 0 && dp && dnw >= 2 &&
-                        (uint64_t)dnw * bound * sizeof(uint32_t) <= (512u << 20)) {
+                        pc_bytes <= (512u << 20)) {
                         ray_t* pc_hdr = NULL;
-                        uint32_t* pc = (uint32_t*)scratch_calloc(&pc_hdr,
-                            (size_t)dnw * bound * sizeof(uint32_t));
-                        if (pc) {
+                        void* raw = scratch_calloc(&pc_hdr, (size_t)pc_bytes);
+                        if (raw) {
+                            uint32_t* pc = (uint32_t*)(void*)
+                                (((uintptr_t)raw + pc_line - 1) & ~(uintptr_t)(pc_line - 1));
                             sp_dyn_pcount_ctx_t pctx = {
                                 .key_data  = key_data[0],
                                 .key_esz   = key_esz,
                                 .counts    = pc,
                                 .bound     = bound,
+                                .stride    = stride,
                                 .n_workers = dnw,
                                 .match_idx = match_idx,
                                 .rowsel    = rowsel,
@@ -11380,7 +11425,7 @@ exec_group_sp_dyn_emit(const sp_dyn_ctx_t* c) {
                                 }
                                 if (bound <= cap) {
                                     for (uint32_t w = 0; w < dnw; w++) {
-                                        const uint32_t* src = pc + (size_t)w * bound;
+                                        const uint32_t* src = pc + (size_t)w * stride;
                                         for (uint64_t o = 0; o < bound; o++) {
                                             uint64_t s = (uint64_t)range_count[o] + src[o];
                                             range_count[o] = s > UINT32_MAX

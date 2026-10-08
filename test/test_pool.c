@@ -1653,6 +1653,653 @@ static test_result_t test_auto_all_logical_cpus(void) {
 }
 #endif
 
+#if defined(__linux__)
+#include <dirent.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
+
+/* --------------------------------------------------------------------------
+ * Test: scan read-ahead requests the registered rows from storage.
+ *
+ * A column file is evicted from the page cache, registered, and walked by
+ * tasks that read a page of it here and there at most, with the kernel's
+ * own read-ahead on faults off (MADV_RANDOM): the rest of its pages can
+ * only become resident because the pool asked the kernel for them.  A
+ * dispatch over exactly its rows is read ahead per ticket; a dispatch_n
+ * task reports its position through ray_pool_scan_at; the chunks a gate
+ * rules out are never requested.  Skipped where eviction has no effect
+ * (tmpfs keeps its pages) or read-ahead is turned off (RAY_SCAN_PREFETCH=0).
+ * -------------------------------------------------------------------------- */
+#define PF_ROWS      ((int64_t)1 << 20)   /* 8 MiB of int64 */
+#define PF_PAGES     (PF_ROWS * 8 / 4096)
+#define PF_TASKS     8
+#define PF_LOG2      16                   /* gate chunk: 64K rows, 512 KiB */
+/* per process, so concurrent runs of the suite do not share the files */
+static char pf_path_a[96], pf_path_b[96];
+static void pf_paths(void) {
+    if (pf_path_a[0]) return;
+    snprintf(pf_path_a, sizeof(pf_path_a), "/tmp/rayforce_test_scan_ahead.%d.col", (int)getpid());
+    snprintf(pf_path_b, sizeof(pf_path_b), "/tmp/rayforce_test_scan_ahead_b.%d.col", (int)getpid());
+}
+#define PF_PATH      (pf_paths(), pf_path_a)
+#define PF_PATH_B    (pf_paths(), pf_path_b)
+
+/* Ticket task: reads the middle row of its rows of column A (ctx), one
+ * page of the sixteen a ticket spans — the one the next call of its thread
+ * looks at to tell whether A is read. */
+static _Atomic int64_t pf_sink;   /* read sink, written by every worker */
+static void pf_touch(void* ctx, uint32_t w, int64_t s, int64_t e) {
+    (void)w;
+    pf_sink += ((const int64_t*)ctx)[s + (e - s) / 2];
+}
+
+/* dispatch_n task t walks rows [t*per, (t+1)*per) of column A (ctx),
+ * reading only the first 8192 of them; the rest is left to read-ahead. */
+static void pf_walk(void* ctx, uint32_t w, int64_t s, int64_t e) {
+    (void)w;
+    const int64_t* a = (const int64_t*)ctx;
+    const int64_t per = PF_ROWS / PF_TASKS;
+    for (int64_t t = s; t < e; t++)
+        for (int64_t r = t * per; r < (t + 1) * per; r += 8192) {
+            ray_pool_scan_at(PF_ROWS, r, (t + 1) * per);
+            if (r == t * per) {
+                int64_t sum = 0;
+                for (int64_t i = r; i < r + 8192; i += 512) sum += a[i];
+                pf_sink += sum;
+            }
+        }
+}
+
+/* As pf_walk over columns A and B (ctx: their bases), block by block: the
+ * middle row of A in the first block, the middle row of B in each block
+ * from the seventh on.  A block's call looks at the middle of the block
+ * before, so B is found unread at the calls of blocks 1-4. */
+static void pf_walk_late(void* ctx, uint32_t w, int64_t s, int64_t e) {
+    (void)w;
+    const int64_t* const* col = (const int64_t* const*)ctx;
+    const int64_t per = PF_ROWS / PF_TASKS;
+    for (int64_t t = s; t < e; t++)
+        for (int64_t r = t * per, k = 0; r < (t + 1) * per; r += 8192, k++) {
+            ray_pool_scan_at(PF_ROWS, r, (t + 1) * per);
+            if (k == 0) pf_sink += col[0][r + 4096];
+            if (k >= 6) pf_sink += col[1][r + 4096];
+        }
+}
+
+/* As pf_walk, naming column A (ctx) as the one read and reading none of it. */
+static void pf_walk_named(void* ctx, uint32_t w, int64_t s, int64_t e) {
+    (void)w;
+    const int64_t per = PF_ROWS / PF_TASKS;
+    for (int64_t t = s; t < e; t++)
+        for (int64_t r = t * per; r < (t + 1) * per; r += 8192)
+            ray_pool_scan_col_at(ctx, PF_ROWS, r, (t + 1) * per);
+}
+
+/* One task over every gate chunk of column A (ctx) — even chunks pass the
+ * gate: a call at each chunk's start; from the fifth gated-in chunk on, a
+ * second call half way through, with the row between the two calls read. */
+static void pf_walk_gaps(void* ctx, uint32_t w, int64_t s, int64_t e) {
+    (void)w; (void)s; (void)e;
+    const int64_t* a = (const int64_t*)ctx;
+    const int64_t chunk = (int64_t)1 << PF_LOG2;
+    int in = 0;
+    for (int64_t c0 = 0; c0 < PF_ROWS; c0 += chunk) {
+        ray_pool_scan_at(PF_ROWS, c0, PF_ROWS);
+        if ((c0 / chunk) % 2 || in++ < 4) continue;
+        pf_sink += a[c0 + chunk / 4];
+        ray_pool_scan_at(PF_ROWS, c0 + chunk / 2, PF_ROWS);
+    }
+}
+
+static bool pf_evict_one(const char* path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return false;
+    bool ok = fdatasync(fd) == 0 && posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) == 0;
+    close(fd);
+    return ok;
+}
+static bool pf_evict(void) { return pf_evict_one(PF_PATH) && pf_evict_one(PF_PATH_B); }
+
+/* Map a column file with the kernel's read-ahead on faults off: a page
+ * read through the mapping brings no neighbours in with it. */
+static uint8_t* pf_map(const char* path, size_t* size) {
+    uint8_t* p = (uint8_t*)ray_vm_map_file(path, size);
+    if (p) posix_madvise(p, *size, POSIX_MADV_RANDOM);
+    return p;
+}
+
+/* No sampled page of [p, p+n) is resident. */
+static bool pf_none_resident(const uint8_t* p, size_t n) {
+    for (size_t off = 0; off < n; off += n / 16)
+        if (ray_vm_resident(p + off, 4096)) return false;
+    return true;
+}
+
+/* Pages this process has read stay mapped and are not evicted: drop both
+ * columns' mappings, evict the files, map them again and re-register. */
+/* Wait out the reads a case started: a page still being read is in the
+ * page cache but locked, eviction skips it and it turns up resident in the
+ * next case.  Touching each present page waits for its read to finish. */
+static void pf_settle(const uint8_t* p, size_t n) {
+    for (size_t off = 0; off < n; off += 4096)
+        if (ray_vm_resident(p + off, 1)) pf_sink += p[off];
+}
+
+static bool pf_reset(uint8_t** base, size_t* size, uint8_t** bbase, size_t* bsize,
+                     ray_pool_scan_t* scan) {
+    pf_settle(*base, *size);
+    pf_settle(*bbase, *bsize);
+    ray_vm_unmap_file(*base, *size);
+    ray_vm_unmap_file(*bbase, *bsize);
+    *base = *bbase = NULL;
+    if (!pf_evict()) return false;
+    *base = pf_map(PF_PATH, size);
+    *bbase = pf_map(PF_PATH_B, bsize);
+    if (!*base || !*bbase) return false;
+    scan->base[0] = *base;
+    scan->base[1] = *bbase;
+    return pf_none_resident(*base, *size) && pf_none_resident(*bbase, *bsize);
+}
+
+/* Resident pages of [p, p+n), probed one by one. */
+static int64_t pf_resident_pages(const uint8_t* p, size_t n) {
+    int64_t k = 0;
+    for (size_t off = 0; off < n; off += 4096) k += ray_vm_resident(p + off, 1);
+    return k;
+}
+
+/* Bounded wait (~10 s) for `want` pages of [p, p+n) to be resident. */
+static bool pf_wait_pages(const uint8_t* p, size_t n, int64_t want) {
+    for (int i = 0; i < 2000; i++) {
+        if (pf_resident_pages(p, n) >= want) return true;
+        struct timespec ts = { 0, 5000000 };
+        nanosleep(&ts, NULL);
+    }
+    return false;
+}
+
+/* Bounded wait for the kernel to finish the reads: every sampled page of
+ * [p, p+n) resident.  Returns false after ~10 s. */
+static bool pf_wait_resident(const void* p, size_t n) {
+    for (int i = 0; i < 20000; i++) {
+        if (ray_vm_resident(p, n)) return true;
+        struct timespec ts = { 0, 500000 };
+        nanosleep(&ts, NULL);
+    }
+    return false;
+}
+
+static test_result_t test_scan_read_ahead(void) {
+    ray_heap_init();
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    ray_pool_t* pool = ray_pool_get();
+    TEST_ASSERT_NOT_NULL(pool);
+    test_result_t res = { TEST_PASS, NULL };
+    uint8_t* base = NULL;
+    uint8_t* bbase = NULL;
+    size_t size = 0, bsize = 0;
+
+    const char* paths[2] = { PF_PATH, PF_PATH_B };
+    for (int k = 0; k < 2; k++) {
+        FILE* f = fopen(paths[k], "wb");
+        TEST_ASSERT_NOT_NULL(f);
+        for (int64_t i = 0; i < PF_ROWS; i++) fwrite(&i, sizeof(i), 1, f);
+        fclose(f);
+    }
+    base = pf_map(PF_PATH, &size);
+    bbase = pf_map(PF_PATH_B, &bsize);
+    TEST_ASSERT_NOT_NULL(base);
+    TEST_ASSERT_NOT_NULL(bbase);
+    TEST_ASSERT_EQ_U(size, (uint64_t)PF_ROWS * 8);
+
+    if (!pool->scan_bytes) { res = (test_result_t){ TEST_SKIP, "RAY_SCAN_PREFETCH=0" }; goto out; }
+    if (!pf_evict() || ray_vm_resident(base, size) || !pf_none_resident(bbase, bsize)) {
+        res = (test_result_t){ TEST_SKIP, "page cache eviction has no effect here" };
+        goto out;
+    }
+
+    /* Column B is registered but no dispatch below reads it: it must never
+     * be requested. */
+    ray_pool_scan_t scan = { .base = { base, bbase }, .esz = { 8, 8 }, .n = 2, .rows = PF_ROWS };
+    const ray_pool_scan_t* prev = ray_pool_scan_set(&scan);
+
+    /* Per ticket: a dispatch over exactly the registered rows (range mode
+     * only; the shared cursor hands consecutive tickets to different
+     * threads, so there is no per-thread run to read ahead of).  A ticket
+     * reads one page of A: enough for its thread to see A read, while the
+     * other pages come in only by request — all but those of the first
+     * ticket, before which nothing was seen read. */
+    if (pool->steal) {
+        ray_pool_dispatch(pool, pf_touch, base, PF_ROWS);
+        if (!pf_wait_pages(base, size, PF_PAGES * 7 / 8)) {
+            res = (test_result_t){ TEST_FAIL, "per-ticket read-ahead left the rows unread" };
+            goto restore;
+        }
+        if (!pf_none_resident(bbase, bsize)) {
+            res = (test_result_t){ TEST_FAIL, "per-ticket read-ahead requested a column no ticket read" };
+            goto restore;
+        }
+        if (!pf_reset(&base, &size, &bbase, &bsize, &scan)) { res = (test_result_t){ TEST_FAIL, "evict" }; goto restore; }
+    }
+
+    /* Reported positions: dispatch_n tasks walking row ranges, reading the
+     * first rows of each; the rest of A is requested, B is not. */
+    ray_pool_dispatch_n(pool, pf_walk, base, PF_TASKS);
+    if (!pf_wait_resident(base, size)) {
+        res = (test_result_t){ TEST_FAIL, "task-reported read-ahead left the rows unread" };
+        goto restore;
+    }
+    if (!pf_none_resident(bbase, bsize)) {
+        res = (test_result_t){ TEST_FAIL, "task-reported read-ahead requested a column no task read" };
+        goto restore;
+    }
+    if (!pf_reset(&base, &size, &bbase, &bsize, &scan)) { res = (test_result_t){ TEST_FAIL, "evict" }; goto restore; }
+
+    /* A column read sparsely: B is first read in the seventh block of each
+     * task, after four probes found it unread.  It is never probed again,
+     * so never requested; A, read in the first block, is. */
+    const uint8_t* cols[2] = { base, bbase };
+    ray_pool_dispatch_n(pool, pf_walk_late, cols, PF_TASKS);
+    if (!pf_wait_pages(base, size, PF_PAGES * 7 / 8)) {
+        res = (test_result_t){ TEST_FAIL, "a column read from the first block was not requested" };
+        goto restore;
+    }
+    if (pf_resident_pages(bbase, bsize) > PF_PAGES / 8) {
+        res = (test_result_t){ TEST_FAIL, "a column found unread four times was requested" };
+        goto restore;
+    }
+    if (!pf_reset(&base, &size, &bbase, &bsize, &scan)) { res = (test_result_t){ TEST_FAIL, "evict" }; goto restore; }
+
+    /* A task that names the column it reads has it requested from its first
+     * call, without reading any of it. */
+    ray_pool_dispatch_n(pool, pf_walk_named, base, PF_TASKS);
+    if (!pf_wait_pages(base, size, PF_PAGES * 15 / 16)) {
+        res = (test_result_t){ TEST_FAIL, "a named column was not requested" };
+        goto restore;
+    }
+    if (!pf_none_resident(bbase, bsize)) {
+        res = (test_result_t){ TEST_FAIL, "a column no task named was requested" };
+        goto restore;
+    }
+    if (!pf_reset(&base, &size, &bbase, &bsize, &scan)) { res = (test_result_t){ TEST_FAIL, "evict" }; goto restore; }
+
+    /* Gate: only even chunks may pass, so odd chunks are never requested. */
+    uint64_t gate = 0;
+    const int64_t n_chunks = PF_ROWS >> PF_LOG2;
+    for (int64_t c = 0; c < n_chunks; c += 2) gate |= UINT64_C(1) << c;
+    scan.gate = &gate;
+    scan.gate_log2 = PF_LOG2;
+    ray_pool_dispatch_n(pool, pf_walk, base, PF_TASKS);
+    const size_t chunk = ((size_t)1 << PF_LOG2) * 8;
+    for (int64_t c = 0; c < n_chunks; c++) {
+        const uint8_t* p = base + (size_t)c * chunk;
+        if (c % 2 == 0 && !pf_wait_resident(p, chunk)) {
+            res = (test_result_t){ TEST_FAIL, "a gated-in chunk was not read" };
+            goto restore;
+        }
+        if (c % 2 == 1 && ray_vm_resident(p + chunk / 2, 4096)) {
+            res = (test_result_t){ TEST_FAIL, "a gated-out chunk was read" };
+            goto restore;
+        }
+    }
+    if (!pf_reset(&base, &size, &bbase, &bsize, &scan)) { res = (test_result_t){ TEST_FAIL, "evict" }; goto restore; }
+
+    /* A gated-out chunk ends the run: the first call past it does not probe
+     * the rows the gate skipped (which nobody reads).  Single calls between
+     * gaps there then cost the column no probes, and the run that reads it
+     * gets it requested — the later gated-in chunks, past what was read. */
+    ray_pool_dispatch_n(pool, pf_walk_gaps, base, 1);
+    for (int64_t c = 10; c < n_chunks; c += 2) {
+        if (!pf_wait_resident(base + (size_t)c * chunk + chunk / 2, chunk / 2)) {
+            res = (test_result_t){ TEST_FAIL, "probes across gated-out chunks kept the column from being requested" };
+            goto restore;
+        }
+    }
+
+    /* Outside a dispatch the hooks have nothing registered to act on. */
+    ray_pool_scan_at(PF_ROWS, 0, PF_ROWS);
+    ray_pool_scan_col_at(base, PF_ROWS, 0, PF_ROWS);
+
+restore:
+    ray_pool_scan_set(prev);
+out:
+    if (base) ray_vm_unmap_file(base, size);
+    if (bbase) ray_vm_unmap_file(bbase, bsize);
+    remove(PF_PATH);
+    remove(PF_PATH_B);
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init(0), RAY_OK);
+    ray_heap_destroy();
+    return res;
+}
+
+/* --------------------------------------------------------------------------
+ * Test: what a thread saw of a dispatch does not outlive the pool.
+ *
+ * The main thread runs tasks of each dispatch and keeps, per thread, the
+ * columns it saw read and the rows it requested, under the generation of
+ * that dispatch.  ray_pool_destroy zeroes the pool, and the pool made after
+ * it numbers its own dispatches: none of them may take that state for its
+ * own.  Column B, read by the old pool's first dispatch and not by the new
+ * pool's first, must not be requested by the latter.
+ * -------------------------------------------------------------------------- */
+
+/* As pf_walk over columns A and B (ctx: their bases): one page of each in
+ * the first block of every task. */
+static void pf_walk_both(void* ctx, uint32_t w, int64_t s, int64_t e) {
+    (void)w;
+    const int64_t* const* col = (const int64_t* const*)ctx;
+    const int64_t per = PF_ROWS / PF_TASKS;
+    for (int64_t t = s; t < e; t++)
+        for (int64_t r = t * per; r < (t + 1) * per; r += 8192) {
+            ray_pool_scan_at(PF_ROWS, r, (t + 1) * per);
+            if (r == t * per) pf_sink += col[0][r + 4096] + col[1][r + 4096];
+        }
+}
+
+static test_result_t test_scan_read_ahead_new_pool(void) {
+    ray_heap_init();
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    ray_pool_t* pool = ray_pool_get();
+    TEST_ASSERT_NOT_NULL(pool);
+    test_result_t res = { TEST_PASS, NULL };
+    uint8_t* base = NULL;
+    uint8_t* bbase = NULL;
+    size_t size = 0, bsize = 0;
+
+    const char* paths[2] = { PF_PATH, PF_PATH_B };
+    for (int k = 0; k < 2; k++) {
+        FILE* f = fopen(paths[k], "wb");
+        TEST_ASSERT_NOT_NULL(f);
+        for (int64_t i = 0; i < PF_ROWS; i++) fwrite(&i, sizeof(i), 1, f);
+        fclose(f);
+    }
+    base = pf_map(PF_PATH, &size);
+    bbase = pf_map(PF_PATH_B, &bsize);
+    TEST_ASSERT_NOT_NULL(base);
+    TEST_ASSERT_NOT_NULL(bbase);
+
+    if (!pool->scan_bytes) { res = (test_result_t){ TEST_SKIP, "RAY_SCAN_PREFETCH=0" }; goto out; }
+    if (!pf_evict() || ray_vm_resident(base, size) || !pf_none_resident(bbase, bsize)) {
+        res = (test_result_t){ TEST_SKIP, "page cache eviction has no effect here" };
+        goto out;
+    }
+
+    ray_pool_scan_t scan = { .base = { base, bbase }, .esz = { 8, 8 }, .n = 2, .rows = PF_ROWS };
+    const ray_pool_scan_t* prev = ray_pool_scan_set(&scan);
+    const uint8_t* cols[2] = { base, bbase };
+    ray_pool_dispatch_n(pool, pf_walk_both, cols, PF_TASKS);
+
+    ray_pool_destroy();
+    if (ray_pool_init_total(4) != RAY_OK || !(pool = ray_pool_get())) {
+        res = (test_result_t){ TEST_FAIL, "pool init" };
+        goto restore;
+    }
+    if (!pf_reset(&base, &size, &bbase, &bsize, &scan)) { res = (test_result_t){ TEST_FAIL, "evict" }; goto restore; }
+    ray_pool_dispatch_n(pool, pf_walk, base, PF_TASKS);
+    if (!pf_wait_resident(base, size)) {
+        res = (test_result_t){ TEST_FAIL, "task-reported read-ahead left the rows unread" };
+        goto restore;
+    }
+    if (!pf_none_resident(bbase, bsize)) {
+        res = (test_result_t){ TEST_FAIL, "a column only the old pool's dispatch read was requested" };
+        goto restore;
+    }
+
+restore:
+    ray_pool_scan_set(prev);
+out:
+    if (base) ray_vm_unmap_file(base, size);
+    if (bbase) ray_vm_unmap_file(bbase, bsize);
+    remove(PF_PATH);
+    remove(PF_PATH_B);
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init(0), RAY_OK);
+    ray_heap_destroy();
+    return res;
+}
+
+/* --------------------------------------------------------------------------
+ * Test: the passes of a query that first read a mapped column request it.
+ *
+ * A splayed table is written, evicted from the page cache and opened, and
+ * the column under test gets the kernel's read-ahead on faults turned off
+ * (MADV_RANDOM): each of its pages the query reads without having asked
+ * for it first is a major fault of its own.  The pass that first reads the
+ * column asks for it: the scatter of the dense partitioned route (`sum v
+ * by k`, 256K key slots), the holistic reduce of the indexed route (`med w
+ * by k`), the gathers of a filtered group that compacts its rows (`count
+ * distinct x` and `med w` by g, where v > 30) and the pass of a filtered
+ * group over the selected rows (`sum w` by g, where v > 30).  A column the select
+ * names and no pass reads is not asked for, however much of its start the
+ * kernel read along with its header.  A per-group count distinct over rows
+ * a filter on a sorted column keeps together asks for the pages of those
+ * rows only, not for the whole column.
+ * -------------------------------------------------------------------------- */
+static char pq_dir[96], pq_tbl[104];
+static void pq_paths(void) {
+    if (pq_dir[0]) return;
+    snprintf(pq_dir, sizeof(pq_dir), "/tmp/rayforce_test_scan_q.%d", (int)getpid());
+    snprintf(pq_tbl, sizeof(pq_tbl), "%s/t/", pq_dir);
+}
+#define PQ_DIR (pq_paths(), pq_dir)
+#define PQ_TBL (pq_paths(), pq_tbl)
+
+static bool pq_ok(const char* src) {
+    ray_t* r = ray_eval_str(src);
+    bool ok = r && !RAY_IS_ERR(r);
+    if (r) ray_release(r);
+    return ok;
+}
+
+/* Evict every file of the table. */
+static bool pq_evict(void) {
+    DIR* d = opendir(PQ_TBL);
+    if (!d) return false;
+    bool ok = true;
+    struct dirent* e;
+    char path[512];
+    while ((e = readdir(d))) {
+        snprintf(path, sizeof(path), "%s%s", PQ_TBL, e->d_name);
+        struct stat st;
+        if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) ok &= pf_evict_one(path);
+    }
+    closedir(d);
+    return ok;
+}
+
+/* Remove the tree at `path` (a table written again keeps generations). */
+static void pq_rm(const char* path) {
+    struct stat st;
+    if (lstat(path, &st) != 0) return;
+    if (S_ISDIR(st.st_mode)) {
+        DIR* d = opendir(path);
+        if (d) {
+            struct dirent* e;
+            char sub[512];
+            while ((e = readdir(d))) {
+                if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+                snprintf(sub, sizeof(sub), "%s/%s", path, e->d_name);
+                pq_rm(sub);
+            }
+            closedir(d);
+        }
+        rmdir(path);
+    } else {
+        remove(path);
+    }
+}
+
+/* Open the table cold as M, with the kernel's read-ahead on faults off for
+ * column `name`; its data through *p, *n.  1 when eviction has no effect
+ * here, -1 on an error. */
+static int pq_open_cold(const char* name, const uint8_t** p, size_t* n) {
+    if (!pq_ok("(set M 0)") || !pq_evict()) return -1;
+    char src[192];
+    snprintf(src, sizeof(src), "(set M (.db.splayed.get \"%s\"))", PQ_TBL);
+    if (!pq_ok(src)) return -1;
+    snprintf(src, sizeof(src), "(at M '%s)", name);
+    ray_t* col = ray_eval_str(src);
+    if (!col || RAY_IS_ERR(col) || col->mmod != 1 || col->len < 2048) {
+        if (col) ray_release(col);
+        return -1;
+    }
+    *p = (const uint8_t*)ray_data(col);
+    *n = (size_t)col->len * 8;
+    ray_release(col);   /* M holds it */
+    uintptr_t a = (uintptr_t)*p & ~(uintptr_t)4095;
+    posix_madvise((void*)a, (uintptr_t)*p + *n - a, POSIX_MADV_RANDOM);
+    /* Opening reads the header, and the kernel the pages after it. */
+    return pf_none_resident(*p + (512 << 10), *n - (512 << 10)) ? 0 : 1;
+}
+
+static long pq_majflt(void) {
+    struct rusage u;
+    getrusage(RUSAGE_SELF, &u);
+    return u.ru_majflt;
+}
+
+static test_result_t test_scan_read_ahead_queries(void) {
+    char prev_prefetch[32] = "";
+    bool prefetch_off = false;
+    {
+        const char* e = getenv("RAY_SCAN_PREFETCH");
+        if (e) snprintf(prev_prefetch, sizeof(prev_prefetch), "%s", e);
+    }
+    ray_runtime_t* rt = ray_runtime_create(0, NULL);
+    TEST_ASSERT_NOT_NULL(rt);
+    uint32_t cores = ray_pool_total_workers(ray_pool_get());
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    test_result_t res = { TEST_PASS, NULL };
+    static char msg[160];
+    const uint8_t* p = NULL;
+    size_t n = 0;
+    int rc;
+
+    if (!ray_pool_scan_on()) { res = (test_result_t){ TEST_SKIP, "RAY_SCAN_PREFETCH=0" }; goto out; }
+    char pq_set_src[192];
+    snprintf(pq_set_src, sizeof(pq_set_src), "(.db.splayed.set \"%s\" T)", PQ_TBL);
+    pq_rm(PQ_DIR);
+    if (!pq_ok("(set N 1048576)") ||
+        !pq_ok("(set T (table [k v w g x d] (list (% (* (til N) 7919) 262144) (* (til N) 3)"
+               " (* 0.5 (til N)) (% (til N) 100) (% (* (til N) 13) 50000) (/ (til N) 1024))))") ||
+        !pq_ok(pq_set_src) || !pq_ok("(set T 0)")) {
+        res = (test_result_t){ TEST_FAIL, "table" };
+        goto out;
+    }
+
+    static const struct { const char* col; const char* query; const char* pass; } q[] = {
+        { "v", "(count (select {from: M s: (sum v) by: k}))", "dense partition scatter" },
+        { "w", "(count (select {from: M m: (med w) by: k}))", "indexed holistic reduce" },
+        { "w", "(count (select {from: M c: (count (distinct x)) m: (med w) by: g where: (> v 30)}))",
+          "filtered group gather" },
+        { "w", "(count (select {from: M s: (sum w) by: g where: (> v 30)}))", "filtered dense group" },
+    };
+    for (size_t i = 0; i < sizeof(q) / sizeof(q[0]); i++) {
+        if ((rc = pq_open_cold(q[i].col, &p, &n))) {
+            res = rc > 0 ? (test_result_t){ TEST_SKIP, "page cache eviction has no effect here" }
+                         : (test_result_t){ TEST_FAIL, "open" };
+            goto out;
+        }
+        long before = pq_majflt();
+        if (!pq_ok(q[i].query)) { res = (test_result_t){ TEST_FAIL, q[i].query }; goto out; }
+        long faults = pq_majflt() - before;
+        if (faults > (long)(n / 4096 / 4)) {
+            snprintf(msg, sizeof(msg), "%s: %ld major faults over %zu pages of %s",
+                     q[i].pass, faults, n / 4096, q[i].col);
+            res = (test_result_t){ TEST_FAIL, msg };
+            goto out;
+        }
+    }
+
+    /* `count w` reads none of w, which the select registers all the same:
+     * the pages at its start the kernel read along with the header must not
+     * pass for a pass reading it, or the thread over the first rows asks
+     * for the next window of w. */
+    if ((rc = pq_open_cold("w", &p, &n))) {
+        res = rc > 0 ? (test_result_t){ TEST_SKIP, "page cache eviction has no effect here" }
+                     : (test_result_t){ TEST_FAIL, "open" };
+        goto out;
+    }
+    if (!pq_ok("(count (select {from: M c: (count w) s: (sum v) by: g}))")) {
+        res = (test_result_t){ TEST_FAIL, "count w" };
+        goto out;
+    }
+    if (pf_resident_pages(p + (512 << 10), n - (1024 << 10)) > 0) {
+        res = (test_result_t){ TEST_FAIL, "a column no pass read was requested" };
+        goto out;
+    }
+
+    /* d sorted, 1024 rows a value: the filter keeps the last 16K rows, the
+     * last 128 KiB of x.  Nothing before them may be asked for (the start
+     * of the file was read with its header). */
+    if ((rc = pq_open_cold("x", &p, &n))) {
+        res = rc > 0 ? (test_result_t){ TEST_SKIP, "page cache eviction has no effect here" }
+                     : (test_result_t){ TEST_FAIL, "open" };
+        goto out;
+    }
+    if (!pq_ok("(count (select {from: M c: (count (distinct x)) s: (sum v) by: g where: (within d [1008 1023])}))")) {
+        res = (test_result_t){ TEST_FAIL, "clustered count distinct" };
+        goto out;
+    }
+    if (pf_resident_pages(p + n / 4, n / 2) > 0) {
+        res = (test_result_t){ TEST_FAIL, "count distinct over clustered rows asked for pages none of them is on" };
+        goto out;
+    }
+
+    /* RAY_SCAN_PREFETCH=0: nothing is asked for, so each page a query reads
+     * is faulted in by the query itself.  The filter keeps one row in 4096,
+     * each on its own page of w, which w's held-back read would ask for; a
+     * per-group distinct count samples 1024 rows of its value column first
+     * (all of x but the 128 pages opening it read). */
+    {
+        static const struct { const char* col; const char* query; const char* pass; long pages; } off[] = {
+            { "w", "(count (select {from: M s: (sum w) by: g where: (== (% v 4096) 7)}))",
+              "held-back column", 256 },
+            { "x", "(count (select {from: M c: (count (distinct x)) by: g}))",
+              "distinct-count sample", 1920 },
+        };
+        setenv("RAY_SCAN_PREFETCH", "0", 1);
+        prefetch_off = true;
+        ray_pool_destroy();
+        for (size_t i = 0; i < sizeof(off) / sizeof(off[0]); i++) {
+            if ((rc = pq_open_cold(off[i].col, &p, &n))) {
+                res = rc > 0 ? (test_result_t){ TEST_SKIP, "page cache eviction has no effect here" }
+                             : (test_result_t){ TEST_FAIL, "open" };
+                goto out;
+            }
+            long before = pq_majflt();
+            if (!pq_ok(off[i].query)) { res = (test_result_t){ TEST_FAIL, off[i].query }; goto out; }
+            long faults = pq_majflt() - before;
+            if (faults < off[i].pages * 3 / 4) {
+                snprintf(msg, sizeof(msg), "%s asked for pages with read-ahead off: %ld major faults over %ld pages read of %s",
+                         off[i].pass, faults, off[i].pages, off[i].col);
+                res = (test_result_t){ TEST_FAIL, msg };
+                goto out;
+            }
+        }
+    }
+
+out:
+    if (prefetch_off) {
+        if (prev_prefetch[0]) setenv("RAY_SCAN_PREFETCH", prev_prefetch, 1);
+        else unsetenv("RAY_SCAN_PREFETCH");
+    }
+    pq_ok("(set M 0)");
+    pq_rm(PQ_DIR);
+    ray_runtime_destroy(rt);
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(cores), RAY_OK);
+    return res;
+}
+#endif
+
 const test_entry_t pool_entries[] = {
 #if defined(__linux__) || defined(__APPLE__)
     { "pool/auto_all_logical_cpus", test_auto_all_logical_cpus, NULL, NULL },
@@ -1697,6 +2344,9 @@ const test_entry_t pool_entries[] = {
     { "pool/epoll_sel_cap_growth",  test_epoll_sel_cap_growth,  NULL, NULL },
     { "pool/epoll_hup_branch",      test_epoll_hup_branch,      NULL, NULL },
     { "pool/epoll_hup_no_errfn",    test_epoll_hup_no_errfn,    NULL, NULL },
+    { "pool/scan_read_ahead",       test_scan_read_ahead,       NULL, NULL },
+    { "pool/scan_read_ahead_new_pool", test_scan_read_ahead_new_pool, NULL, NULL },
+    { "pool/scan_read_ahead_queries", test_scan_read_ahead_queries, NULL, NULL },
 #endif
     { NULL, NULL, NULL, NULL },
 };

@@ -259,8 +259,10 @@ void ray_heap_release_pages(void);
  *   none is pending (nothing to release, or decay disabled).  An event loop
  *   uses it to bound a wait it would otherwise make indefinite.
  * ray_heap_decay          — sweep if due and if the worker pool is
- *   quiescent; returns the number of blocks released, or -1 if it did
- *   nothing.  Safe to call from any maintenance point.
+ *   quiescent: release the pages of free blocks and unmap empty spill pools
+ *   of the caller's heap and the workers'; returns the number of blocks
+ *   released, or -1 if it did nothing.  Safe to call from any maintenance
+ *   point.
  *
  * The threshold is fixed policy, reachable only through
  * ray_heap_set_decay_ms: negative disables the decay, 0 releases at the
@@ -268,6 +270,12 @@ void ray_heap_release_pages(void);
 void    ray_heap_note_activity(void);
 int64_t ray_heap_decay_due_ms(void);
 int64_t ray_heap_decay(void);
+/* At a statement boundary: when the next pool would not fit under the anon
+ * watermark and handing back what is free would make it fit, unmap empty
+ * pools, drain the direct-block cache and release the pages of free blocks
+ * now rather than at the idle decay.  No-op otherwise, inside parallel work,
+ * and without file spill (Windows). */
+int64_t ray_heap_relieve(void);
 
 /* Set the threshold directly; negative disables.  The environment is read
  * once on first use, so this exists to let a test drive the policy without
@@ -329,21 +337,28 @@ static inline bool ray_direct_file_backed(const ray_t* v) {
     return ((const ray_direct_hdr_t*)((const char*)v - RAY_DIRECT_HDR))->swap_fd >= 0;
 }
 
-/* Anonymous (RAM-resident, OOM-killable) pool + direct bytes currently
- * committed by the heap.  Allocations that would push this past the anon
- * watermark (default: physical RAM, or the container's cgroup memory limit
- * when that is smaller — ray_sys_ram_limit) are backed by a disk spill file
+/* Anonymous (RAM-resident, OOM-killable) pool, direct and sys bytes currently
+ * committed.  Allocations that would push this past the anon watermark
+ * (default: ray_sys_ram_limit — physical RAM, or the container's cgroup
+ * memory limit when that is smaller — less a quarter of it, at least 3 GiB
+ * and at most half, left to the page cache) are backed by a disk spill file
  * instead — file-backed pages are always reclaimable, so they cannot trigger
  * the OOM killer.  ray_heap_set_anon_watermark overrides the threshold (0
  * restores the default); intended for diagnostics and tests. */
 int64_t ray_heap_anon_committed(void);
 /* High-water mark of the anon-committed footprint since process start — the
- * peak RAM an operator actually demanded (pools + direct; excludes spill). */
+ * peak RAM an operator actually demanded (pools, direct and sys blocks;
+ * excludes spill). */
 int64_t ray_heap_anon_peak(void);
 /* Current anon watermark in bytes (the effective spill threshold; resolves 0
- * to ray_sys_ram_limit()). */
+ * to the default, ray_sys_ram_limit() less the page-cache room). */
 int64_t ray_heap_anon_watermark(void);
 void    ray_heap_set_anon_watermark(int64_t bytes);
+/* The RAM a query may plan for (sizing gates, cache budgets): the watermark
+ * when one was set (-m), else ray_sys_ram_limit().  Unlike the default
+ * watermark it does not leave the page-cache room, which decides where new
+ * memory goes, not how much a query may hold. */
+int64_t ray_heap_mem_budget(void);
 /* Release every block held by the direct-allocation reuse cache back to
  * the kernel (their committed-RAM accounting drops with them).  The cache
  * self-drains under watermark pressure; this is for tests and explicit

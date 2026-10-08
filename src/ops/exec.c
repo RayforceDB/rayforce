@@ -2108,6 +2108,9 @@ void ray_exec_memo_pop(ray_graph_t* g, const ray_exec_memo_save_t* save) {
     g->memo_hdr = save->hdr; g->memo_table = save->table;
 }
 
+/* Row filters being executed on this thread, the outermost first. */
+static RAY_TLS int tl_filter_depth;
+
 ray_t* exec_node(ray_graph_t* g, ray_op_t* op) {
     if (!op) return ray_error("nyi", NULL);
 
@@ -2159,8 +2162,21 @@ ray_t* exec_node(ray_graph_t* g, ray_op_t* op) {
         }
     }
 
+    /* A row filter (not a HAVING over a group); an `and` runs as a chain of
+     * them, each executing the next one in as its input. */
+    bool row_filter = false;
+    if (op->opcode == OP_FILTER) {
+        ray_op_t* fc = op_child(g, op, 0);
+        row_filter = !fc || fc->opcode != OP_GROUP;
+    }
+    if (row_filter) tl_filter_depth++;
     ray_t* _prof_result = exec_node_inner(g, op);
     tl_exec_depth--;
+    /* The outermost filter of a chain has the final selection: the
+     * select's columns held back for it can be requested now. */
+    if (row_filter && --tl_filter_depth == 0 && _prof_result && !RAY_IS_ERR(_prof_result))
+        ray_select_scan_filtered(g->selection,
+            _prof_result->type == RAY_TABLE ? ray_table_nrows(_prof_result) : 0);
 
     /* First consumer of a shared node: keep a ref for the others (a lazy
      * value is not kept — materialising it is the consumer's business). */
@@ -2693,7 +2709,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                             if (dom_id < 0) absent = true;
                             else probe = dom_id;
                         }
-                        const int64_t* grows = NULL;
+                        ray_idx_rows_t grows = { NULL, false };
                         int64_t gn = 0;
                         int hit = absent ? 0
                             : ray_index_hash_group(eq_col, probe, &grows, &gn);
@@ -2713,7 +2729,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                             bool mono = true;
                             int64_t prevv = INT64_MIN;
                             for (int64_t pp = 0; pp < gn; pp++) {
-                                int64_t v = read_col_i64(rgd, grows[pp], rt, ra);
+                                int64_t v = read_col_i64(rgd, ray_idx_rows_at(grows, pp), rt, ra);
                                 if (v < prevv) { mono = false; break; }
                                 prevv = v;
                             }
@@ -2721,19 +2737,19 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                                 int64_t a = 0, b = gn;   /* first pos >= lo */
                                 while (a < b) {
                                     int64_t m = a + (b - a) / 2;
-                                    if (read_col_i64(rgd, grows[m], rt, ra) < lo) a = m + 1;
+                                    if (read_col_i64(rgd, ray_idx_rows_at(grows, m), rt, ra) < lo) a = m + 1;
                                     else b = m;
                                 }
                                 int64_t startp = a;
                                 b = gn;                   /* first pos > hi */
                                 while (a < b) {
                                     int64_t m = a + (b - a) / 2;
-                                    if (read_col_i64(rgd, grows[m], rt, ra) <= hi) a = m + 1;
+                                    if (read_col_i64(rgd, ray_idx_rows_at(grows, m), rt, ra) <= hi) a = m + 1;
                                     else b = m;
                                 }
                                 int64_t nrows = ray_table_nrows(input);
-                                ray_t* sel = ray_index_rowsel_from_ids(
-                                    nrows, grows + startp, a - startp);
+                                ray_t* sel = ray_index_rowsel_from_rows(
+                                    nrows, ray_idx_rows_from(grows, startp), a - startp);
                                 if (sel) {
                                     ray_idx_hits[IDX_SITE_FILTER_EQRANGE]++;
                                     g->selection = sel;
@@ -4261,6 +4277,57 @@ static ray_t* validate_scan_columns(ray_graph_t* g) {
     return NULL;
 }
 
+void exec_scan_init(ray_pool_scan_t* s) {
+    s->n = 0;
+    s->rows = -1;
+    s->gate = NULL;
+    s->gate_log2 = 0;
+}
+
+void exec_scan_add_col(ray_pool_scan_t* s, ray_t* col) {
+    if (!col || col->mmod != 1 || col->type <= 0 || RAY_IS_PARTED(col->type) ||
+        col->type == RAY_MAPCOMMON || col->type == RAY_LIST || col->type == RAY_STR) return;
+    if (col->len <= 0 || (s->rows >= 0 && col->len != s->rows)) return;
+    size_t esz = ray_sym_elem_size(col->type, col->attrs);
+    if (esz == 0) return;
+    s->rows = col->len;
+    const uint8_t* base = (const uint8_t*)ray_data(col);
+    for (uint32_t k = 0; k < s->n; k++) if (s->base[k] == base) return;
+    size_t bytes = (size_t)col->len * esz;
+    if (s->n >= RAY_POOL_SCAN_MAX || ray_vm_resident(base, bytes)) return;
+    /* The pages at its start that are resident already, up to 4 MiB: read
+     * ahead with the header when the column was opened (see warm).  They
+     * run on from the first, so halving finds where they end. */
+    size_t lo = 0, hi = (bytes < ((size_t)4 << 20) ? bytes : ((size_t)4 << 20)) / 4096;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (ray_vm_resident(base + mid * 4096, 1)) lo = mid + 1; else hi = mid;
+    }
+    s->base[s->n] = base;
+    s->esz[s->n] = (uint32_t)esz;
+    s->warm[s->n] = (int64_t)(lo * 4096 / esz);
+    s->n++;
+}
+
+/* The graph's scanned columns, when they are mapped (see exec_scan_add_col);
+ * NULL when no scan reads a mapped column. */
+static const ray_pool_scan_t* exec_scan_columns(ray_graph_t* g, ray_pool_scan_t* s) {
+    exec_scan_init(s);
+    for (uint32_t i = 0; i < g->node_count; i++) {
+        ray_op_t* op = &g->nodes[i];
+        if (op->opcode != OP_SCAN) continue;
+        ray_op_ext_t* ext = find_ext(g, op->id);
+        if (!ext) continue;
+        uint16_t tid = 0;
+        memcpy(&tid, ext->base.pad, sizeof(tid));
+        ray_t* tbl = (tid > 0 && g->tables && (uint32_t)(tid - 1) < g->n_tables)
+                   ? g->tables[tid - 1] : g->table;
+        if (!tbl || tbl->type != RAY_TABLE) continue;
+        exec_scan_add_col(s, ray_table_get_col(tbl, ext->sym));
+    }
+    return s->rows >= 0 ? s : NULL;
+}
+
 ray_t* ray_execute(ray_graph_t* g, ray_op_t* root) {
     /* The qstats capture mode is armed once per query at the eval boundary
      * (ray_eval, eval_depth==0) — covering PROF (profiler/query-log) AND the
@@ -4275,12 +4342,20 @@ ray_t* ray_execute(ray_graph_t* g, ray_op_t* root) {
      * would reset the elapsed clock and fire premature "final" ticks. */
     ray_t* scan_err = validate_scan_columns(g);
     if (scan_err) return scan_err;
+    /* Scan read-ahead: a registration over mapped columns made by the
+     * caller (a select, which also knows its filter) stands; otherwise the
+     * graph's own mapped scans are registered for its dispatches. */
+    ray_pool_scan_t scan;
+    const ray_pool_scan_t* prev_scan = ray_pool_scan_get();
+    bool own_scan = !prev_scan || prev_scan->rows < 0;
+    if (own_scan) ray_pool_scan_set(exec_scan_columns(g, &scan));
     /* Never NULL: callers test RAY_IS_ERR, which is false for NULL, and then
      * dereference.  The inner paths hand NULL back unchanged when a node,
      * a compaction or a merge fails to allocate (the flat path's
      * `return result`, the streaming path's seg_tbl / partial / merged
      * returns); `(times <lazy> ...)` would then crash in loop_count. */
     ray_t* result = ray_execute_inner(g, root);
+    if (own_scan) ray_pool_scan_set(prev_scan);
     return result ? result : ray_error("oom", NULL);
 }
 

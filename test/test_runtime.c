@@ -319,7 +319,8 @@ static test_result_t test_oom_sentinel_is_well_formed(void) {
 /* The default anon watermark is the RAM this process may actually use:
  * physical RAM, capped by a container / cgroup limit when one is set
  * (#688).  It must be positive and never above physical RAM, and the heap's
- * default watermark must resolve to it. */
+ * default watermark must resolve to it less the page-cache room: a quarter,
+ * at least 3 GiB, at most half (#712). */
 static test_result_t test_ram_limit_caps_total_ram(void) {
     ray_err_t err = RAY_OK;
     ray_runtime_t* rt = ray_runtime_create_with_sym_err(NULL, &err);
@@ -333,8 +334,12 @@ static test_result_t test_ram_limit_caps_total_ram(void) {
     TEST_ASSERT_EQ_I(limit, (cg > 0 && cg < phys) ? cg : phys);
     int64_t previous = ray_heap_anon_watermark();
     ray_heap_set_anon_watermark(0);                /* 0 = default */
-    TEST_ASSERT_EQ_I(ray_heap_anon_watermark(), limit);
-    ray_heap_set_anon_watermark(previous == limit ? 0 : previous);
+    int64_t room = limit / 4;
+    if (room < (INT64_C(3) << 30)) room = INT64_C(3) << 30;
+    if (room > limit / 2) room = limit / 2;
+    int64_t want = limit - room;
+    TEST_ASSERT_EQ_I(ray_heap_anon_watermark(), want);
+    ray_heap_set_anon_watermark(previous == want ? 0 : previous);
     ray_runtime_destroy(rt);
     PASS();
 }

@@ -2432,18 +2432,18 @@ static int asof_lslot_cmp(const void* a, const void* b) {
 }
 
 typedef struct {
-    const int64_t* rows;
+    ray_idx_rows_t rows;
     int64_t start;
     int64_t n;
     uint8_t contig;
 } asof_idx_slice_t;
 
 static inline int64_t asof_slice_row(const asof_idx_slice_t* s, int64_t p) {
-    return s->contig ? s->start + p : s->rows[p];
+    return s->contig ? s->start + p : ray_idx_rows_at(s->rows, p);
 }
 
 static int asof_part_group(ray_t* col, int64_t key, asof_idx_slice_t* out) {
-    out->rows = NULL;
+    out->rows = (ray_idx_rows_t){ NULL, false };
     out->start = 0;
     out->n = 0;
     out->contig = 1;
@@ -2497,7 +2497,7 @@ static int asof_part_group(ray_t* col, int64_t key, asof_idx_slice_t* out) {
 }
 
 static int asof_index_group(ray_t* col, int64_t key, asof_idx_slice_t* out) {
-    out->rows = NULL;
+    out->rows = (ray_idx_rows_t){ NULL, false };
     out->start = 0;
     out->n = 0;
     out->contig = 0;
@@ -2537,14 +2537,14 @@ static bool asof_verify_idx_slices(const asof_idx_slice_t* sl, int32_t n_groups,
 }
 
 /* Per-slice ascending-time verify over a collected probe set (see the
- * single-eq index variant below).  gsl holds n_groups (grows, gn) pairs.
+ * single-eq index variant below).  gsl holds the n_groups hash slices.
  * Contiguous slices verify with a sequential scan over rt_time; scattered
  * ones fall back to the gathered walk.  Above the parallel threshold the
  * pairs are chunked across the pool; each chunk covers the adjacent
  * pairs (i-1, i) for i in [max(start,1), end) within its slice, so
  * chunk boundaries re-check the crossing pair and no pair is skipped.
  * Returns false at the first violation (shared bail flag). */
-typedef struct { const int64_t* grows; int64_t lo, hi; } asof_vchunk_t;
+typedef struct { ray_idx_rows_t grows; int64_t lo, hi; } asof_vchunk_t;
 typedef struct {
     const asof_vchunk_t* chunks;
     const int64_t* rt_time;
@@ -2559,16 +2559,17 @@ static void asof_verify_fn(void* raw, uint32_t wid, int64_t cstart,
     for (int64_t ci = cstart; ci < cend; ci++) {
         if (!*c->ok) return;
         const asof_vchunk_t* ch = &c->chunks[ci];
-        const int64_t* restrict rows = ch->grows;
+        ray_idx_rows_t rows = ch->grows;
         int64_t lo = ch->lo, hi = ch->hi;
         if (lo < 1) lo = 1;
         bool contig = (hi > lo) &&
-                      (rows[hi - 1] - rows[lo - 1] == hi - lo);
+                      (ray_idx_rows_at(rows, hi - 1) -
+                       ray_idx_rows_at(rows, lo - 1) == hi - lo);
         if (contig) {
             /* Branchless block accumulation: `bad += (next < cur)` maps to
              * packed i64 compares (the early-exit form stays scalar), with
              * a per-block bail so a violation still stops the scan early. */
-            const int64_t* restrict tv = t + rows[lo - 1];
+            const int64_t* restrict tv = t + ray_idx_rows_at(rows, lo - 1);
             int64_t n = hi - lo;
             int64_t bad = 0;
             for (int64_t b = 0; b < n; b += 4096) {
@@ -2577,38 +2578,35 @@ static void asof_verify_fn(void* raw, uint32_t wid, int64_t cstart,
                     bad += (int64_t)(tv[i + 1] < tv[i]);
                 if (bad) { *c->ok = 0; return; }
             }
-        } else {
+        } else if (rows.narrow) {
+            const uint32_t* restrict r = (const uint32_t*)rows.p;
             for (int64_t i = lo; i < hi; i++)
-                if (t[rows[i]] < t[rows[i - 1]]) { *c->ok = 0; return; }
+                if (t[r[i]] < t[r[i - 1]]) { *c->ok = 0; return; }
+        } else {
+            const int64_t* restrict r = (const int64_t*)rows.p;
+            for (int64_t i = lo; i < hi; i++)
+                if (t[r[i]] < t[r[i - 1]]) { *c->ok = 0; return; }
         }
     }
 }
 
 #define ASOF_VERIFY_CHUNK 65536
-static bool asof_verify_slices(const int64_t* gsl, int32_t n_groups,
+static bool asof_verify_slices(const asof_idx_slice_t* gsl, int32_t n_groups,
                                const int64_t* rt_time, int64_t total_rows) {
     int64_t n_chunks = 0;
     for (int32_t g = 0; g < n_groups; g++)
-        n_chunks += (gsl[2 * g + 1] + ASOF_VERIFY_CHUNK - 1)
+        n_chunks += (gsl[g].n + ASOF_VERIFY_CHUNK - 1)
                     / ASOF_VERIFY_CHUNK;
     if (n_chunks <= 0) return true;
     ray_t* ch_hdr = NULL;
     asof_vchunk_t* chunks = (asof_vchunk_t*)scratch_alloc(&ch_hdr,
                                 (size_t)n_chunks * sizeof(asof_vchunk_t));
-    if (!chunks) {
-        /* OOM — serial gathered walk, no allocation. */
-        for (int32_t g = 0; g < n_groups; g++) {
-            const int64_t* rows = (const int64_t*)(intptr_t)gsl[2 * g];
-            int64_t gn = gsl[2 * g + 1];
-            for (int64_t p = 1; p < gn; p++)
-                if (rt_time[rows[p]] < rt_time[rows[p - 1]]) return false;
-        }
-        return true;
-    }
+    if (!chunks)   /* OOM — serial gathered walk, no allocation. */
+        return asof_verify_idx_slices(gsl, n_groups, rt_time);
     int64_t w = 0;
     for (int32_t g = 0; g < n_groups; g++) {
-        const int64_t* rows = (const int64_t*)(intptr_t)gsl[2 * g];
-        int64_t gn = gsl[2 * g + 1];
+        ray_idx_rows_t rows = gsl[g].rows;
+        int64_t gn = gsl[g].n;
         for (int64_t lo = 0; lo < gn; lo += ASOF_VERIFY_CHUNK) {
             int64_t hi = lo + ASOF_VERIFY_CHUNK;
             if (hi > gn) hi = gn;
@@ -2829,21 +2827,8 @@ static bool asof_hash_group_match(uint32_t n_eq,
             }
             if (served && !rt_time_sorted && !idx_ordered && verify_rows > 0) {
                 if (ray_index_kind(rt_eq[0]) == RAY_IDX_HASH) {
-                    ray_t* hv_hdr = NULL;
-                    int64_t* hv = (int64_t*)scratch_alloc(&hv_hdr,
-                        (size_t)(n_groups > 0 ? n_groups : 1) * 2 *
-                        sizeof(int64_t));
-                    if (hv) {
-                        for (int32_t g = 0; g < n_groups; g++) {
-                            hv[2 * g] = (int64_t)(intptr_t)gsl[g].rows;
-                            hv[2 * g + 1] = gsl[g].n;
-                        }
-                        served = asof_verify_slices(hv, n_groups, rt_time,
-                                                    verify_rows);
-                        scratch_free(hv_hdr);
-                    } else {
-                        served = asof_verify_idx_slices(gsl, n_groups, rt_time);
-                    }
+                    served = asof_verify_slices(gsl, n_groups, rt_time,
+                                                verify_rows);
                 } else {
                     served = asof_verify_idx_slices(gsl, n_groups, rt_time);
                 }
