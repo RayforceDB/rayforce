@@ -42,12 +42,15 @@
 (at (select {from: T where: (< s "")}) 'n) -- []
 (at (select {from: T where: (> s "")}) 'n) -- [0 1 3 4]
 
-;; Null-free input reaches the direct count shortcut unless it rejects ordering.
+;; SYM columns conservatively fail the count shortcut's null proof, even
+;; without null rows. Check counts and row identities through the DAG path.
 (set U (table [s n] (list (as 'SYM ["zz" "mm" "aa" "mm"]) (til 4))))
 (count (select {from: U where: (< s 'mm)})) -- 1
 (count (select {from: U where: (<= s 'mm)})) -- 3
 (count (select {from: U where: (> s 'mm)})) -- 1
 (count (select {from: U where: (>= s 'mm)})) -- 3
+(at (select {from: U where: (< s 'mm)}) 'n) -- [2]
+(at (select {from: U where: (> s 'mm)}) 'n) -- [0]
 
 ;; Single-row inputs and empty outputs.
 (set O (table [s] (list (as 'SYM ["aa"]))))

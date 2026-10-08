@@ -1046,6 +1046,8 @@ ray_t* exec_in_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
                             bool* all_pass);
 ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input);
 ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* rhs);
+ray_t* exec_sym_order(uint16_t opcode, ray_t* lhs, ray_t* rhs,
+                      bool l_scalar, bool r_scalar);
 
 /* ── sort_exec.c ── */
 int sort_cmp(const sort_cmp_ctx_t* ctx, int64_t a, int64_t b);

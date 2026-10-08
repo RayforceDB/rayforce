@@ -1773,7 +1773,76 @@ static test_result_t test_sym_ordered_partitions(void) {
     PASS();
 }
 
+/* A few used ids spread across a much larger domain exercise sparse-map
+ * growth, union ranking, and scalar broadcasts without runtime interning. */
+static test_result_t test_sym_ordered_sparse_no_intern(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_sym_domain_t* dom[2] = {ray_sym_domain_new(), ray_sym_domain_new()};
+    TEST_ASSERT(dom[0] && dom[1], "domains");
+    enum { VOCAB = 70001, PERIOD = 257, N = 50003 };
+    char buf[64];
+    for (int side = 0; side < 2; side++) {
+        for (int i = 0; i < VOCAB; i++) {
+            int value = side ? VOCAB - 1 - i : i;
+            int len = snprintf(buf, sizeof(buf), "common-prefix-%05d", value);
+            TEST_ASSERT(ray_sym_domain_intern(dom[side], buf, (size_t)len) >= 0, "intern fixture");
+        }
+    }
+    ray_t* col[2];
+    int values[2][N];
+    for (int side = 0; side < 2; side++) {
+        col[side] = ray_sym_vec_new(side ? RAY_SYM_W64 : RAY_SYM_W32, N);
+        TEST_ASSERT(col[side] && !RAY_IS_ERR(col[side]), "column");
+        col[side]->len = N;
+        ray_sym_domain_retain(dom[side]); col[side]->sym_domain = dom[side];
+        for (int i = 0; i < N; i++) {
+            int j = i % PERIOD;
+            int value = j % 31 == 0 ? -1 : (j * (side ? 521 : 271)) % VOCAB;
+            values[side][i] = value;
+            int64_t id = value < 0 ? 0 : side ? VOCAB - value : value + 1;
+            ray_write_sym(ray_data(col[side]), i, id, RAY_SYM, col[side]->attrs);
+        }
+    }
+    uint32_t before = ray_sym_count();
+    const uint16_t ops[] = {OP_LT, OP_LE, OP_GT, OP_GE};
+    for (int k = 0; k < 4; k++) {
+        ray_t* out = exec_sym_order(ops[k], col[0], col[1], false, false);
+        TEST_ASSERT(out && !RAY_IS_ERR(out), "sparse union ranks");
+        for (int i = 0; i < N; i++) {
+            int l = values[0][i], r = values[1][i];
+            bool want = k == 0 ? l < r : k == 1 ? l <= r : k == 2 ? l > r : l >= r;
+            TEST_ASSERT_EQ_I(((bool*)ray_data(out))[i], want);
+        }
+        ray_release(out);
+    }
+    for (int q = 0; q < 64; q++) {
+        int value = 30000 + q;
+        int len = snprintf(buf, sizeof(buf), "common-prefix-%05d-extra", value);
+        ray_t* lit = ray_str(buf, (size_t)len);
+        ray_t* out = exec_sym_order(OP_LT, col[0], lit, false, true);
+        TEST_ASSERT(out && !RAY_IS_ERR(out), "sparse literal verdicts");
+        for (int i = 0; i < N; i++)
+            TEST_ASSERT_EQ_I(((bool*)ray_data(out))[i], values[0][i] <= value);
+        ray_release(out); ray_release(lit);
+    }
+    /* A scalar from a FILE-like domain must not translate its vocabulary
+     * into runtime ids just to obtain the literal's bytes. */
+    ray_t* one = ray_vec_slice(col[1], 1, 1);
+    ray_t* out = exec_sym_order(OP_GT, one, col[0], true, false);
+    TEST_ASSERT(out && !RAY_IS_ERR(out), "domain scalar broadcast");
+    for (int i = 0; i < N; i++)
+        TEST_ASSERT_EQ_I(((bool*)ray_data(out))[i], values[1][1] > values[0][i]);
+    TEST_ASSERT_EQ_I(ray_sym_count(), before);
+    ray_release(out); ray_release(one);
+    for (int side = 0; side < 2; side++) {
+        ray_release(col[side]); ray_sym_domain_release(dom[side]);
+    }
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t expr_null_entries[] = {
+    { "expr_null/sym_ordered_sparse_no_intern", test_sym_ordered_sparse_no_intern, NULL, NULL },
     { "expr_null/sym_ordered_partitions", test_sym_ordered_partitions, NULL, NULL },
     { "expr_null/sym_ordered_domains_widths", test_sym_ordered_domains_widths, NULL, NULL },
     { "expr_null/bail_counter",            test_expr_bail_counter_nulls,          NULL, NULL },

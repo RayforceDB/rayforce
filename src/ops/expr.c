@@ -906,7 +906,7 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out) {
                 int8_t ot;
 
                 /* SYM lanes contain intern ids, not lexical ranks. Route
-                 * ordering through the vocabulary-LUT executor below;
+                 * ordering through the used-id lookup/rank executor;
                  * equality can keep using the fused integer kernels. */
                 if ((op == OP_LT || op == OP_LE || op == OP_GT || op == OP_GE) &&
                     (op_child(g, node, 0)->out_type == RAY_SYM ||
@@ -3247,9 +3247,9 @@ static void binary_range(ray_op_t* op, int8_t out_type,
         } else if (l_esz == 4) {
             /* SYM W32 stores unsigned IDs; for EQ/NE the unsigned compare
              * gives the same result as the signed compare against r_i64
-             * (truncated to 32-bit).  For ordering ops we keep the signed
-             * compare (matches the previous generic-path semantics for
-             * I32/DATE/TIME). */
+             * (truncated to 32-bit). Ordered SYM/SYM and SYM/STR
+             * comparisons go to exec_sym_order; the raw ordered arm is
+             * retained for mixed SYM/numeric DAG operands. */
             if (RAY_IS_SYM(lhs->type)) {
                 if (opc == OP_EQ || opc == OP_NE) {
                     const uint32_t* d = (const uint32_t*)lbase;
@@ -3728,55 +3728,6 @@ static void par_binary_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t 
                      c->l_f64, c->r_f64, c->l_i64, c->r_i64,
                      s_lo, s_hi);
     }
-}
-
-/* Normalize query scalar operands for the eager SYM comparator. Queries
- * broadcast length-one vectors and accept STR literals against SYM; eager
- * mapping broadcasts atoms only and requires matching symbol types. */
-static ray_t* sym_order_operand(ray_t* v, bool scalar) {
-    ray_t* a;
-    if (scalar && !ray_is_atom(v)) {
-        int allocated = 0;
-        a = collection_elem(v, 0, &allocated);
-        if (!allocated) ray_retain(a);
-    } else {
-        a = v;
-        ray_retain(a);
-    }
-    if (!a || RAY_IS_ERR(a)) return a;
-    if (a->type == -RAY_STR) {
-        int64_t id = ray_sym_intern(ray_str_ptr(a), ray_str_len(a));
-        ray_release(a);
-        return id < 0 ? ray_error("memory", "symbol comparison: intern failed") : ray_sym(id);
-    }
-    return a;
-}
-
-static ray_t* exec_sym_order(uint16_t opcode, ray_t* lhs, ray_t* rhs,
-                             bool l_scalar, bool r_scalar) {
-    ray_t* l = sym_order_operand(lhs, l_scalar);
-    if (!l || RAY_IS_ERR(l)) return l;
-    ray_t* r = sym_order_operand(rhs, r_scalar);
-    if (!r || RAY_IS_ERR(r)) { ray_release(l); return r; }
-    ray_binary_fn fn = opcode == OP_LT ? ray_lt_fn : opcode == OP_LE ? ray_lte_fn :
-                       opcode == OP_GT ? ray_gt_fn : ray_gte_fn;
-    /* Reuse the eager vocabulary verdict LUT (column/literal) and union
-     * ranks (column/column, including distinct domains). Row workers read
-     * ids and LUT entries, not strings. Its bounded-allocation fallback
-     * also preserves lexical order. */
-    ray_t* out = atomic_map_binary_op(fn, opcode, l, r);
-    ray_release(l);
-    ray_release(r);
-    if (out && out->type == -RAY_BOOL) {
-        ray_t* vec = ray_vec_new(RAY_BOOL, 1);
-        if (vec && !RAY_IS_ERR(vec)) {
-            vec->len = 1;
-            *(bool*)ray_data(vec) = out->b8;
-        }
-        ray_release(out);
-        return vec;
-    }
-    return out;
 }
 
 ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* rhs) {
