@@ -4519,31 +4519,14 @@ ray_t* exec_reduction_src(ray_graph_t* g, ray_op_t* op, ray_col_src_t* src) {
     return ray_reduce_src(src, op->opcode, op->out_type);
 }
 
-/* ray_first_fn / ray_last_fn of a bare OP_SCAN lazy over an encoded slot
- * whose type they read with collection_elem: row 0 (len - 1) itself,
- * nulls included, read through a cursor.  NULL: not that shape (the
- * caller reads the column). */
-ray_t* ray_reduce_lazy_elem(ray_t* lazy, bool last) {
-    ray_graph_t* g = RAY_LAZY_GRAPH(lazy);
-    ray_op_t* op = RAY_LAZY_OP(lazy);
-    if (!g || !op || op->opcode != OP_SCAN || !g->table) return NULL;
-    int8_t t = op->out_type;
+/* ray_first_fn / ray_last_fn of a bound source whose type they read with
+ * collection_elem: row 0 (len - 1) itself, nulls included. */
+ray_t* ray_reduce_src_elem(ray_col_src_t* src, bool last) {
+    int8_t t = src->type;
     if (!(t == RAY_I32 || t == RAY_I16 || t == RAY_BOOL || t == RAY_U8 ||
           t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP)) return NULL;
-    ray_op_ext_t* ext = find_ext(g, op->id);
-    uint16_t tid = 0;
-    if (ext) memcpy(&tid, ext->base.pad, sizeof tid);
-    if (!ext || tid != 0) return NULL;                   /* only g->table's columns */
-    ray_t* tbl = g->table;
-    if (!ray_table_get_col_enc(tbl, ext->sym) || ray_col_bind_declines(tbl, ext->sym)) return NULL;
-    ray_col_src_t src;
-    ray_t* err = ray_table_col_src(tbl, ext->sym, &src);
-    if (err) return err;
-    ray_t* r = NULL;
-    if (src.obj && src.type == t && !((t == RAY_BOOL || t == RAY_U8) && src.may_null))
-        r = reduce_src_edge(&src, last, false);
-    ray_col_src_release(&src);
-    return r;
+    if ((t == RAY_BOOL || t == RAY_U8) && src->may_null) return NULL;
+    return reduce_src_edge(src, last, false);
 }
 
 /* ============================================================================

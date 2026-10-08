@@ -856,6 +856,10 @@ static void ray_release_owned_refs(ray_t* v) {
                 ray_graph_free(g);
                 RAY_LAZY_GRAPH(v) = NULL;
             }
+            if (v->attrs & RAY_LAZY_COLREF) {           /* a column reference holds its table */
+                ray_t** tp = (ray_t**)ray_data(v);
+                if (*tp) { ray_release(*tp); *tp = NULL; }
+            }
             return;
         }
         /* I64 atom tagged as an HNSW handle owns a ray_hnsw_t — free it
@@ -988,8 +992,15 @@ bool ray_retain_owned_refs(ray_t* v) {
             if (LAMBDA_CLOSURE(v)) ray_retain(LAMBDA_CLOSURE(v));
             return true;
         }
-        /* Lazy handles own their graph uniquely — no retain on copy */
-        if (v->type == RAY_LAZY) return true;
+        /* Lazy handles own their graph uniquely — no retain on copy; a
+         * column reference shares its table */
+        if (v->type == RAY_LAZY) {
+            if (v->attrs & RAY_LAZY_COLREF) {
+                ray_t* t = *(ray_t**)ray_data(v);
+                if (t) ray_retain(t);
+            }
+            return true;
+        }
         /* HNSW handle owns its ray_hnsw_t uniquely.  Deep-clone the index
          * so the copy is an independent owner with the same semantics as
          * the source.  On clone-OOM, detach the copy (so caller can free
@@ -1113,6 +1124,7 @@ static void ray_detach_owned_refs(ray_t* v) {
         if (v->type == RAY_LAZY) {
             RAY_LAZY_GRAPH(v) = NULL;
             RAY_LAZY_OP(v)    = NULL;
+            if (v->attrs & RAY_LAZY_COLREF) *(ray_t**)ray_data(v) = NULL;
             return;
         }
         /* HNSW handle: ownership has been transferred elsewhere; stop the

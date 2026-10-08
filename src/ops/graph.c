@@ -1954,7 +1954,59 @@ ray_t* ray_lazy_wrap(ray_graph_t* g, ray_op_t* op) {
     return h;
 }
 
+/* ---- Column-reference lazies ---- */
+
+typedef struct { ray_t* tbl; int64_t sym; } lazy_colref_t;
+
+ray_t* ray_lazy_colref(ray_t* tbl, int64_t sym) {
+    ray_t* h = ray_alloc(sizeof(lazy_colref_t));
+    if (!h) return ray_error("oom", NULL);
+    h->type  = RAY_LAZY;
+    h->attrs = RAY_LAZY_COLREF;
+    RAY_LAZY_GRAPH(h) = NULL;
+    RAY_LAZY_OP(h)    = NULL;
+    lazy_colref_t* c = (lazy_colref_t*)ray_data(h);
+    c->tbl = tbl;
+    c->sym = sym;
+    ray_retain(tbl);
+    return h;
+}
+
+bool ray_lazy_colref_get(ray_t* lazy, ray_t** tbl, int64_t* sym) {
+    if (!ray_is_lazy(lazy) || !(lazy->attrs & RAY_LAZY_COLREF)) return false;
+    lazy_colref_t* c = (lazy_colref_t*)ray_data(lazy);
+    if (!c->tbl) return false;
+    *tbl = c->tbl;
+    *sym = c->sym;
+    return true;
+}
+
+ray_t* ray_lazy_promote(ray_t* lazy) {
+    ray_t* tbl; int64_t sym;
+    if (!ray_lazy_colref_get(lazy, &tbl, &sym)) return NULL;
+    ray_t* nm = ray_sym_str(sym);                       /* borrowed */
+    size_t nl = (nm && !RAY_IS_ERR(nm)) ? ray_str_len(nm) : 0;
+    char nb[256];
+    if (nl == 0 || nl >= sizeof nb || memchr(ray_str_ptr(nm), '\0', nl))
+        return ray_error("domain", "lazy column: name not scannable");
+    memcpy(nb, ray_str_ptr(nm), nl);
+    nb[nl] = '\0';                                      /* ray_scan interns strlen(name) bytes */
+    ray_graph_t* g = ray_graph_new(tbl);                /* retains tbl */
+    if (!g) return ray_error("oom", NULL);
+    ray_op_t* sc = ray_scan(g, nb);
+    if (!sc) { ray_graph_free(g); return ray_error("oom", NULL); }
+    lazy_colref_t* c = (lazy_colref_t*)ray_data(lazy);
+    c->tbl = NULL;
+    lazy->attrs &= (uint8_t)~RAY_LAZY_COLREF;
+    RAY_LAZY_GRAPH(lazy) = g;
+    RAY_LAZY_OP(lazy)    = sc;
+    ray_release(tbl);                                   /* the graph holds its own */
+    return NULL;
+}
+
 ray_t* ray_lazy_append(ray_t* lazy, uint16_t opcode) {
+    ray_t* perr = ray_lazy_promote(lazy);
+    if (perr) return perr;
     ray_graph_t* g    = RAY_LAZY_GRAPH(lazy);
     ray_op_t*    prev = RAY_LAZY_OP(lazy);
     if (!g || !prev)
@@ -2024,6 +2076,8 @@ ray_t* ray_lazy_append(ray_t* lazy, uint16_t opcode) {
 }
 
 ray_t* ray_lazy_append_param(ray_t* lazy, uint16_t opcode, int64_t param) {
+    ray_t* perr = ray_lazy_promote(lazy);
+    if (perr) return perr;
     ray_graph_t* g    = RAY_LAZY_GRAPH(lazy);
     ray_op_t*    prev = RAY_LAZY_OP(lazy);
     if (!g || !prev)
@@ -2057,6 +2111,14 @@ ray_t* ray_lazy_append_param(ray_t* lazy, uint16_t opcode, int64_t param) {
 
 ray_t* ray_lazy_materialize(ray_t* val) {
     if (!ray_is_lazy(val)) return val;
+
+    /* A column reference forces to what (at tbl 'col) returned eagerly. */
+    ray_t* ctbl; int64_t csym;
+    if (ray_lazy_colref_get(val, &ctbl, &csym)) {
+        ray_t* r = ray_table_col_value(ctbl, csym);
+        ray_release(val);
+        return r;
+    }
 
     ray_graph_t* g  = RAY_LAZY_GRAPH(val);
     ray_op_t*    op = RAY_LAZY_OP(val);

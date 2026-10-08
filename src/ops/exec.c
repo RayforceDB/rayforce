@@ -2686,7 +2686,11 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
             /* A reduction of an encoded column's scan, no selection: reduce
              * the bound source (directory answer or range reads) instead of
              * materializing it.  A table without an encoded slot never
-             * enters (sm.enc is NULL). */
+             * enters (sm.enc is NULL).  With a selection installed the
+             * reduction must read only the selected rows (exec_reduction's
+             * selection branch); no language shape reaches this arm with one
+             * today (a select with a where takes the group path), so that
+             * case keeps the plain path rather than going untested. */
             ray_op_t* child = op_child(g, op, 0);
             if (child && child->opcode == OP_SCAN && !g->selection) {
                 ray_op_ext_t* se = find_ext(g, child->id);

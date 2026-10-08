@@ -171,6 +171,20 @@ static ray_t* range_enc(ray_enccol_t* e, int64_t start, int64_t n,
     const ray_enc_desc_t* descs;
     ray_t* err = ray_enccol_chunk_descs_ref(e, c, &descs);  /* in place; validated once per column */
     if (err) return err;
+    if (e->type == RAY_F64 || e->type == RAY_F32) {
+        /* a RAW vector without nulls is its own decode: read it in place */
+        const void* pv = ray_enccol_raw_float_view(e, c, j, &descs[j]);
+        if (pv) {
+            out->data = (const uint8_t*)pv + (size_t)off * ray_enccol_esz(e);
+            out->n = n;
+            out->type = e->type;
+            out->attrs = e->attrs;
+            out->may_null = false;
+            out->str_pool = NULL;
+            out->dom = NULL;
+            return NULL;
+        }
+    }
     if (e->type == RAY_STR) {
         uint64_t pb = 0;
         err = ray_enccol_desc_pool_bytes(e, c, j, &descs[j], &pb);

@@ -1190,11 +1190,13 @@ ray_t* exec_reduction(ray_graph_t* g, ray_op_t* op, ray_t* input);
  * caller takes the plain path); otherwise a result or an owned error. */
 ray_t* ray_reduce_src(ray_col_src_t* src, uint16_t opcode, int8_t out_type);
 ray_t* exec_reduction_src(ray_graph_t* g, ray_op_t* op, ray_col_src_t* src);
-/* ray_first_fn / ray_last_fn of a bare OP_SCAN lazy ((at tbl 'col) of an
- * encoded slot) for the types they read with collection_elem: row 0
- * (len - 1) itself, a null row a typed null, read by range.  NULL when the
- * lazy is not that shape; else an atom or an owned error. */
-ray_t* ray_reduce_lazy_elem(ray_t* lazy, bool last);
+/* ray_first_fn / ray_last_fn of a bound source for the types they read
+ * with collection_elem among those served here (I32, I16, BOOL, U8, DATE,
+ * TIME, TIMESTAMP): row 0 (len - 1) itself, a null row a typed null, read
+ * by range.  NULL for any other type; else an atom or an owned error. */
+ray_t* ray_reduce_src_elem(ray_col_src_t* src, bool last);
+/* (collection.c) The value (at tbl 'col) returns eagerly. */
+ray_t* ray_table_col_value(ray_t* tbl, int64_t sym);
 ray_t* exec_count_distinct(ray_graph_t* g, ray_op_t* op, ray_t* input);
 
 /* Parallel distinct for large fixed-width columns: radix-partitioned

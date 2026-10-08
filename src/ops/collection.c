@@ -2420,40 +2420,33 @@ ray_t* ray_cross_fn(ray_t* a, ray_t* b) {
     return out;
 }
 
-/* An encoded slot whose forced scan equals today's `at` value: a single-file
- * column (OP_SCAN materializes it exactly as ray_table_col does), or a
- * parted one of a numeric / temporal base type (OP_SCAN's flatten and
- * parted_to_flat_vec then build the same vector).  F32 keeps the column:
- * a lazy chain's min / max keep the F32 out type where the vector builtins
- * answer F64 (ray_min_op), so the lazy would change the answer's type. */
+/* An encoded slot whose promoted scan equals today's `at` value: a
+ * single-file column (OP_SCAN materializes it exactly as ray_table_col
+ * does), or a parted one of a numeric / temporal base type (OP_SCAN's
+ * flatten and parted_to_flat_vec then build the same vector).  Forcing the
+ * reference itself always reads ray_table_col_value. */
 static bool at_lazy_ok(ray_t* enc) {
     ray_col_meta_t m;
     if (!ray_col_meta_of(enc, &m)) return false;
     int8_t b = RAY_IS_PARTED(m.type) ? (int8_t)RAY_PARTED_BASETYPE(m.type) : m.type;
-    if (b == RAY_F32) return false;
     if (!ray_enccol_is_parted(enc)) return true;
     switch (b) {
     case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
-    case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: case RAY_F64: return true;
+    case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: case RAY_F32: case RAY_F64: return true;
     default: return false;
     }
 }
 
-/* A lazy (OP_SCAN of column sym of tbl): an aggregate over it reduces on
- * the bound source; forcing it materializes.  NULL: read the column below. */
-static ray_t* at_lazy_scan(ray_t* tbl, int64_t sym) {
-    ray_t* nm = ray_sym_str(sym);                       /* borrowed */
-    if (!nm || RAY_IS_ERR(nm)) return NULL;
-    size_t nl = ray_str_len(nm);
-    char nb[256];
-    if (nl == 0 || nl >= sizeof nb || memchr(ray_str_ptr(nm), '\0', nl)) return NULL;
-    memcpy(nb, ray_str_ptr(nm), nl);
-    nb[nl] = '\0';                                      /* ray_scan interns strlen(name) bytes */
-    ray_graph_t* g = ray_graph_new(tbl);                /* retains tbl */
-    if (!g) return ray_error("oom", NULL);
-    ray_op_t* sc = ray_scan(g, nb);
-    if (!sc) { ray_graph_free(g); return ray_error("oom", NULL); }
-    return ray_lazy_wrap(g, sc);                        /* owns g, frees it on failure */
+/* The value (at tbl 'col) returns eagerly: the column, a parted one
+ * flattened, MAPCOMMON materialized.  An owned value or error. */
+ray_t* ray_table_col_value(ray_t* tbl, int64_t sym) {
+    ray_t* col = ray_table_col(tbl, sym);
+    if (col && RAY_IS_ERR(col)) return col;
+    if (!col) return ray_error("domain", "at: unknown table column");
+    if (RAY_IS_PARTED(col->type)) return parted_to_flat_vec(col);
+    if (col->type == RAY_MAPCOMMON) return materialize_mapcommon(col);
+    ray_retain(col);
+    return col;
 }
 
 /* (at vec idx) or (at table 'col) — index into vector or table */
@@ -2465,18 +2458,11 @@ ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
      * direct `(at table 'col)` must materialize it so downstream `(at col i)` /
      * count / formatting see a dense vector instead of failing with `type`. */
     if (vec->type == RAY_TABLE && idx->type == -RAY_SYM) {
+        /* An encoded slot stays a column reference: an aggregate over it
+         * reduces on the bound source; forcing it reads the column below. */
         ray_t* enc = ray_table_get_col_enc(vec, idx->i64);
-        if (enc && at_lazy_ok(enc)) {
-            ray_t* lz = at_lazy_scan(vec, idx->i64);
-            if (lz) return lz;
-        }
-        ray_t* col = ray_table_col(vec, idx->i64);
-        if (col && RAY_IS_ERR(col)) return col;
-        if (!col) return ray_error("domain", "at: unknown table column");
-        if (RAY_IS_PARTED(col->type)) return parted_to_flat_vec(col);
-        if (col->type == RAY_MAPCOMMON) return materialize_mapcommon(col);
-        ray_retain(col);
-        return col;
+        if (enc && at_lazy_ok(enc)) return ray_lazy_colref(vec, idx->i64);
+        return ray_table_col_value(vec, idx->i64);
     }
 
     /* Table row access by integer index: (at table 0) → {col1: val1, col2: val2} */

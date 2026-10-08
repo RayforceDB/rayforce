@@ -965,6 +965,18 @@ ray_op_t* ray_graph_input_vec(ray_graph_t* g, ray_t* vec);
 ray_t*    ray_lazy_wrap(ray_graph_t* g, ray_op_t* op);
 ray_t*    ray_lazy_append(ray_t* lazy, uint16_t opcode);
 
+/* Column-reference lazy: (at tbl 'col) of an encoded slot.  A RAY_LAZY header
+ * with RAY_LAZY_COLREF in attrs and no graph (GRAPH / OP slots NULL); its
+ * data holds the retained table and the column sym.  The aggregate builtins
+ * answer it on the bound source; ray_lazy_append / ray_lazy_materialize and
+ * every other reader of the lazy slots promote or force it first. */
+#define RAY_LAZY_COLREF 0x01
+ray_t*    ray_lazy_colref(ray_t* tbl, int64_t sym);          /* retains tbl */
+bool      ray_lazy_colref_get(ray_t* lazy, ray_t** tbl, int64_t* sym);   /* borrowed */
+/* Turn a column reference into the OP_SCAN graph it stands for, in place;
+ * a no-op for any other lazy.  NULL or an owned error. */
+ray_t*    ray_lazy_promote(ray_t* lazy);
+
 /* Active query from-table during tree-walk evaluation of query expressions
  * (B3 Part 2).  Set by bind_all_columns while a query's columns are mounted
  * in the local env, cleared/restored on scope pop.  The evaluator consults

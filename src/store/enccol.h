@@ -82,6 +82,11 @@ typedef struct ray_enccol_s {
     /* single file: one byte per chunk, set (release) once the chunk's
      * descriptors passed validation; never set for a chunk that failed */
     _Atomic(uint8_t)* desc_ok;
+    /* single-file F32 / F64: one byte per chunk, set (release) once every
+     * RAW vector of the chunk without nulls or trailer passed the checks
+     * dec_floats makes (no NaN outside the bitmap, zero padding, no bytes
+     * after the body); never set for a chunk that failed */
+    _Atomic(uint8_t)* fraw_ok;
     /* single file: ray_enccol_dir_totals' cache; totals_state 0 none,
      * 1 being stored, 2 stored (acquire before reading totals) */
     _Atomic(uint8_t) totals_state;
@@ -117,6 +122,12 @@ ray_t* ray_enccol_decode_desc(ray_enccol_t* e, int64_t c, int j, const ray_enc_d
  * may hold a partial decode (the caller never publishes it), and the
  * decoded bytes are returned in *produced instead of counted; the caller
  * counts them with ray_enccol_note_decoded. */
+/* Vector j of chunk c (descriptors validated) read in place: the mapped
+ * payload of a RAW F32 / F64 vector with no nulls and no trailer, whose
+ * bits equal its decode, once its chunk's float checks passed (validated
+ * once per chunk, a failure never cached).  NULL: decode it instead (the
+ * decode reports a corrupt vector). */
+const void* ray_enccol_raw_float_view(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d);
 ray_t* ray_enccol_decode_into(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d,
                               void* out, char* pool_out, uint64_t pool_base, uint64_t pool_cap,
                               uint64_t* produced);

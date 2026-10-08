@@ -31,6 +31,7 @@
 #include "core/platform.h"
 #include "core/pool.h"
 #include "lang/eval.h"
+#include "lang/env.h"
 #include "lang/format.h"
 #include "lang/parse.h"
 #include "store/col.h"
@@ -46,6 +47,7 @@
 #include "ops/idxop.h"
 #include "ops/fused_pred.h"
 #include "ops/fused_topk.h"
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1072,14 +1074,27 @@ static test_result_t test_advise_spans(void) {
  *   k I64 = row; g I16 = row % 7; v I32 (null every 10th) = 3*row - 7;
  *   f F64 (null every 13th) = row; d DATE = row % 900; s SYM five values;
  *   b BOOL = row % 3 == 0; u U8 = row % 200;
- *   h I64 = (row * 7919) % 1000003 (unclustered, no nulls: the lazy hash shape). */
+ *   h I64 = (row * 7919) % 1000003 (unclustered, no nulls: the lazy hash shape);
+ *   e F32 (null every 17th) = row / 2. */
+/* Bind `name` to an F32 vector of n rows: row * scale, null every
+ * null_every-th row (0: none).  Rayfall has no F32 cast. */
+static void sr_bind_f32(const char* name, int64_t n, int64_t null_every, float scale) {
+    ray_t* v = ray_vec_new(RAY_F32, n); v->len = n;
+    for (int64_t i = 0; i < n; i++)
+        ((float*)ray_data(v))[i] = (null_every && i % null_every == 0) ? NULL_F32 : (float)i * scale;
+    if (null_every) v->attrs |= RAY_ATTR_HAS_NULLS;
+    ray_env_set(ray_sym_intern(name, strlen(name)), v);
+    ray_release(v);
+}
 static void srr_setup(void) {
     sr_rt_setup();
     sr_eval_ok("(set i (til 200000))");
-    sr_eval_ok("(set S (table [k g v f d s b u h] (list i (as 'I16 (% i 7)) "
+    sr_bind_f32("ef", 200000, 17, 0.5);
+    sr_eval_ok("(set S (table [k g v f d s b u h e] (list i (as 'I16 (% i 7)) "
                "(as 'I32 (map (fn [j] (if (== 0 (% j 10)) 0N (- (* 3 j) 7))) i)) "
                "(as 'F64 (map (fn [j] (if (== 0 (% j 13)) 0N j)) i)) (as 'DATE (% i 900)) "
-               "(take ['a 'b 'c 'd 'e] 200000) (== 0 (% i 3)) (as 'U8 (% i 200)) (% (* i 7919) 1000003))))");
+               "(take ['a 'b 'c 'd 'e] 200000) (== 0 (% i 3)) (as 'U8 (% i 200)) (% (* i 7919) 1000003) "
+               "ef)))");
     sr_eval_ok("(.db.splayed.set \"" SR_G2 "\" S {compress: true})");
     sr_eval_ok("(.db.splayed.set \"" SR_G0 "\" S {compress: false})");
 }
@@ -2640,7 +2655,7 @@ static test_result_t test_reduce_scan(void) {
     /* stddev is not lazy-aware (it materializes its argument and computes
      * in two passes, unlike the one-pass OP_STDDEV): the column is read */
     SR_SAME("(stddev (at T 'g))", 1);
-    SR_SAME("(sum (at T 'f))", 0);            /* nullable F64 over 200000 rows: bit-identical */
+    SR_SAME("(sum (at T 'f))", 0);            /* nullable F64 over 200000 rows (integral values: exact in any order) */
     SR_SAME("(stddev (at T 'f))", 1);
     SR_SAME("(count (at T 'v))", 0);          /* count over the lazy: no force */
     SR_SAME("(at T 'k)", 1);                  /* a value handed to the user is a plain column */
@@ -2659,8 +2674,25 @@ static test_result_t test_reduce_scan_ops(void) {
         "(any (at T 'b))", "(all (at T 'u))", "(any (at T 'v))", "(all (at T 'f))",
         "(avg (at T 'f))", "(avg (at T 'd))", "(avg (at T 'b))", "(sum (at T 'b))",
         "(sum (at T 'g))", "(sum (at T 'h))", "(avg (at T 'h))", "(count (at T 's))",
-        "(count (at T 'd))", NULL };
+        "(count (at T 'd))", "(sum (at T 'e))", "(avg (at T 'e))", "(min (at T 'e))", "(max (at T 'e))",
+        "(first (at T 'e))", "(last (at T 'e))", "(prod (at T 'e))", "(any (at T 'e))", NULL };
     for (int i = 0; q0[i]; i++) SR_SAME(q0[i], 0);
+    /* F32: the answers' types are the vector builtins' (F64 for every one) */
+    static const char* const qf[] = { "(sum (at T 'e))", "(avg (at T 'e))", "(min (at T 'e))", "(max (at T 'e))",
+                                      "(first (at T 'e))", "(last (at T 'e))", NULL };
+    for (int i = 0; qf[i]; i++) {
+        int8_t ty[2];
+        for (int gen = 0; gen < 2; gen++) {
+            sr_evalf_ok("(set T (.db.splayed.get \"%s\"))", gen ? SR_G2 : SR_G0);
+            ray_t* r = sr_eval(qf[i]);
+            TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+            ty[gen] = r->type;
+            sr_drop(r);
+        }
+        TEST_ASSERT_FMT(ty[0] == ty[1] && ty[0] == -RAY_F64, "%s: types %d / %d", qf[i], ty[0], ty[1]);
+    }
+    /* a reduction after a selection reads the selected rows, not the column */
+    SR_SAME("(select {s: (sum v) m: (min f) from: T where: (> k 150000)})", 2);   /* select path: Task 10 */
     /* not served by the range reduction: the column is materialized once */
     SR_SAME("(min (at T 's))", 1);
     SR_SAME("(count (distinct (at T 'g)))", 1);
@@ -2669,6 +2701,13 @@ static test_result_t test_reduce_scan_ops(void) {
     SR_SAME("(at T ['k 'v])", 2);             /* a list of plain columns, never of lazies */
     SR_SAME("(sum (+ 1 (at T 'k)))", 1);
     SR_SAME("(get T 'g)", 1);
+    /* a column reference promoted to its scan by the other lazy-aware ops */
+    SR_SAME("(count (distinct (at T 's)))", 1);
+    SR_SAME("(first (upper (at T 's)))", 1);
+    SR_SAME("(last (msum 3 (at T 'k)))", 1);
+    SR_SAME("(sum ((fn [t] (at t 'k)) T))", 0);    /* returned from a lambda, still a reference */
+    SR_SAME("(sum (at T 'k))", 0);
+    SR_SAME("(do (set c (at T 'v)) (+ (sum c) (count c)))", 1);   /* a bound value is forced */
     PASS();
 }
 
@@ -2715,6 +2754,17 @@ static test_result_t test_reduce_scan_edges(void) {
         test_result_t r = sr_same_on("(.db.splayed.get \"" SR_TMP "/e0/\")", "(.db.splayed.get \"" SR_TMP "/e2/\")", q[i], 0);
         if (r.status != TEST_PASS) return r;
     }
+    /* the last non-null value is the first row of the last 1024-row view,
+     * nulls after it */
+    sr_eval_ok("(set L (table [l lf] (list (map (fn [j] (if (> j 69632) 0N j)) i) "
+               "(as 'F64 (map (fn [j] (if (> j 69632) 0N j)) i)))))");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/l0/\" L {compress: false})");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/l2/\" L {compress: true})");
+    static const char* const ql[] = { "(last (at T 'l))", "(last (at T 'lf))", "(first (at T 'l))", NULL };
+    for (int i = 0; ql[i]; i++) {
+        test_result_t r = sr_same_on("(.db.splayed.get \"" SR_TMP "/l0/\")", "(.db.splayed.get \"" SR_TMP "/l2/\")", ql[i], 0);
+        if (r.status != TEST_PASS) return r;
+    }
     sr_eval_ok("(.db.splayed.set \"" SR_TMP "/z0e/\" (take E 0) {compress: false})");
     sr_eval_ok("(.db.splayed.set \"" SR_TMP "/z2e/\" (take E 0) {compress: true})");
     static const char* const qe[] = { "(sum (at T 'z))", "(avg (at T 'n))", "(min (at T 'x))", "(max (at T 'z))",
@@ -2736,13 +2786,25 @@ static test_result_t test_reduce_dir_answers(void) {
                                      "(max (at T 'v))", "(count (at T 'k))", NULL };
     for (int i = 0; q[i]; i++) {
         SR_SAME(q[i], 0);
+        sr_eval_ok("(set T (.db.splayed.get \"" SR_G0 "\"))");
+        ray_t* r0 = sr_eval(q[i]);
+        TEST_ASSERT_TRUE(r0 && !RAY_IS_ERR(r0));
+        ray_t* f0 = ray_fmt(r0, 0);
         sr_eval_ok("(set T (.db.splayed.get \"" SR_G2 "\"))");
-        ray_enc_counters_reset();
-        ray_t* r = sr_eval(q[i]);
-        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
-        ray_enc_counters_t k; ray_enc_counters_get(&k);
-        TEST_ASSERT_FMT(k.decoded_bytes == 0, "%s decoded %llu bytes", q[i], (unsigned long long)k.decoded_bytes);
-        sr_drop(r);
+        /* twice on the same load: the second reads the cached directory totals */
+        for (int rep = 0; rep < 2; rep++) {
+            ray_enc_counters_reset();
+            ray_t* r = sr_eval(q[i]);
+            TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+            ray_enc_counters_t k; ray_enc_counters_get(&k);
+            TEST_ASSERT_FMT(k.decoded_bytes == 0, "%s decoded %llu bytes", q[i], (unsigned long long)k.decoded_bytes);
+            ray_t* f2 = ray_fmt(r, 0);
+            TEST_ASSERT_FMT(ray_str_len(f0) == ray_str_len(f2) && memcmp(ray_str_ptr(f0), ray_str_ptr(f2), ray_str_len(f0)) == 0,
+                            "%s run %d: %.*s vs %.*s", q[i], rep, (int)ray_str_len(f0), ray_str_ptr(f0), (int)ray_str_len(f2), ray_str_ptr(f2));
+            ray_release(f2);
+            sr_drop(r);
+        }
+        ray_release(f0); sr_drop(r0);
     }
     /* no directory answer: read by range, nothing materialized */
     sr_eval_ok("(set T (.db.splayed.get \"" SR_G2 "\"))");
@@ -2772,6 +2834,66 @@ static test_result_t test_reduce_error(void) {
     ray_t* r = sr_eval("(first (at (.db.splayed.get \"" SR_TMP "/bad/\") 'f))");
     TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
     sr_drop(r);
+    PASS();
+}
+
+/* Ruling Q1: a RAW float vector without nulls is read in place (nothing
+ * decoded) once its chunk passed the float checks; a NaN in such a vector
+ * is a null outside the bitmap: corrupt, on every read. */
+static test_result_t test_raw_float_view(void) {
+    sr_eval_ok("(set i (til 140000))");
+    sr_bind_f32("yf", 140000, 0, 0.25f);
+    sr_eval_ok("(set R (table [x y] (list (as 'F64 (% i 1000)) yf)))");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/r0/\" R {compress: false})");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/r2/\" R {compress: true})");
+    static const char* const q[] = { "(sum (at T 'x))", "(sum (at T 'y))", "(avg (at T 'y))", "(prod (at T 'x))",
+                                     "(any (at T 'y))", "(first (at T 'x))", "(last (at T 'y))", NULL };
+    for (int i = 0; q[i]; i++) {
+        test_result_t r = sr_same_on("(.db.splayed.get \"" SR_TMP "/r0/\")", "(.db.splayed.get \"" SR_TMP "/r2/\")", q[i], 0);
+        if (r.status != TEST_PASS) return r;
+    }
+    sr_eval_ok("(set T (.db.splayed.get \"" SR_TMP "/r2/\"))");
+    for (int rep = 0; rep < 2; rep++) {
+        ray_enc_counters_reset();
+        ray_t* r = sr_eval("(sum (at T 'x))");
+        ray_enc_counters_t k; ray_enc_counters_get(&k);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+        TEST_ASSERT_EQ_U(k.decoded_bytes, 0);
+        TEST_ASSERT_EQ_U(k.materialized, 0);
+        sr_drop(r);
+    }
+    /* chunk 1, vector 3, element 5 of x set to a NaN */
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/rbad/\" R {compress: true})");
+    char dir[512], path[600];
+    if (ray_splay_resolve_dir(ray_test_tmp(SR_TMP "/rbad/"), dir, sizeof dir) != RAY_OK) abort();
+    snprintf(path, sizeof path, "%s/x", dir);
+    uint64_t coff = sr_dirent_offset(path, 1);
+    TEST_ASSERT_TRUE(coff != 0);
+    ray_enc_desc_t de; memset(&de, 0, sizeof de);
+    FILE* f = fopen(path, "r+b");
+    TEST_ASSERT_NOT_NULL(f);
+    TEST_ASSERT_TRUE(fseek(f, (long)(coff + 3 * sizeof de), SEEK_SET) == 0 && fread(&de, sizeof de, 1, f) == 1);
+    TEST_ASSERT_EQ_I(de.encoding, 0);                    /* RAW */
+    TEST_ASSERT_EQ_I(de.n_nulls, 0);
+    double nan = NAN;
+    TEST_ASSERT_TRUE(fseek(f, (long)(coff + de.payload_off + 5 * 8), SEEK_SET) == 0 && fwrite(&nan, 8, 1, f) == 1);
+    fclose(f);
+    for (int rep = 0; rep < 2; rep++) {
+        ray_error_clear();
+        ray_t* r = sr_eval("(sum (at (.db.splayed.get \"" SR_TMP "/rbad/\") 'x))");
+        TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+        TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
+        TEST_ASSERT_TRUE(strstr(ray_error_msg(), path) != NULL);
+        ray_error_free(r);
+    }
+    /* on one load: the failed chunk is never cached as checked */
+    sr_eval_ok("(set B (.db.splayed.get \"" SR_TMP "/rbad/\"))");
+    for (int rep = 0; rep < 2; rep++) {
+        ray_t* r = sr_eval("(sum (at B 'x))");
+        TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+        TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
+        ray_error_free(r);
+    }
     PASS();
 }
 
@@ -2893,5 +3015,6 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/reduce_dir_answers", test_reduce_dir_answers, srr_setup, srr_teardown },
     { "scanrange/reduce_error",       test_reduce_error,       srr_setup, srr_teardown },
     { "scanrange/at_parted_value",    test_at_parted_value,    srr_setup, srr_teardown },
+    { "scanrange/raw_float_view",     test_raw_float_view,     srr_setup, srr_teardown },
     { NULL, NULL, NULL, NULL },
 };

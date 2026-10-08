@@ -59,6 +59,7 @@ static void enccol_free(ray_enccol_t* e) {
     if (e->dom && e->dom_owned) ray_sym_domain_release(e->dom);
     if (e->map)     ray_file_map_release(e->map);
     ray_free_raw((void*)e->desc_ok);
+    ray_free_raw((void*)e->fraw_ok);
     ray_free_raw(e);
 }
 
@@ -306,6 +307,10 @@ ray_t* ray_enccol_open(void* mapped, size_t size, const char* path,
     if (!err && e->n_chunks > 0) {
         e->desc_ok = ray_calloc_raw((size_t)e->n_chunks);
         if (!e->desc_ok) err = ray_error("oom", "column %s: chunk flags", e->path);
+        if (!err && enc_type_float(e->type)) {
+            e->fraw_ok = ray_calloc_raw((size_t)e->n_chunks);
+            if (!e->fraw_ok) err = ray_error("oom", "column %s: chunk flags", e->path);
+        }
     }
     if (!err && e->type == RAY_SYM) {
         if (dom) {
@@ -1008,6 +1013,55 @@ static int dec_fast(const ray_enccol_t* e, const ray_enc_desc_t* d, int vlen,
  * destination, so the integer fast path writes it directly (a failed decode
  * may leave it partly written); otherwise the vector is decoded aside and
  * `out` written only once it is fully validated. */
+/* The reference decoders by type, into out (vlen elements). */
+static ray_t* dec_ref(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d, int vlen,
+                      const uint8_t* body, uint64_t avail, const uint8_t* bm, void* out) {
+    switch (e->type) {
+    case RAY_F32: case RAY_F64: return dec_floats(e, c, j, d, vlen, body, avail, bm, out);
+    case RAY_GUID:              return dec_guid(e, c, j, d, vlen, body, avail, out);
+    default:                    return dec_ints(e, c, j, d, vlen, body, avail, bm, out);
+    }
+}
+
+/* RAW float vector j of chunk c without nulls or trailer: the checks
+ * dec_floats makes on it, without the copy. */
+static bool raw_float_vec_ok(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d) {
+    int64_t rows = chunk_rows(e, c);
+    int vlen = (int)(rows - (int64_t)j * RAY_ENC_VEC < RAY_ENC_VEC ? rows - (int64_t)j * RAY_ENC_VEC : RAY_ENC_VEC);
+    const uint8_t* p = NULL; uint64_t avail = 0; const uint8_t* bm = NULL;
+    ray_t* err = payload_parts(e, c, j, d, vlen, &p, &avail, &bm);
+    if (err) { ray_error_free(err); return false; }
+    const size_t esz = e->type == RAY_F32 ? 4 : 8;
+    uint64_t body = ray_enc_pad8((uint64_t)vlen * esz);
+    if (bm || body != avail || ((uintptr_t)p & 7)) return false;
+    if (!all_zero(p + (size_t)vlen * esz, (size_t)(body - (uint64_t)vlen * esz))) return false;
+    if (esz == 4) {
+        for (int i = 0; i < vlen; i++) { float f; memcpy(&f, p + 4 * i, 4); if (f != f) return false; }
+    } else {
+        for (int i = 0; i < vlen; i++) { double x; memcpy(&x, p + 8 * i, 8); if (x != x) return false; }
+    }
+    return true;
+}
+
+static bool raw_float_eligible(const ray_enc_desc_t* d) {
+    return d->encoding == RAY_ENC_RAW && d->n_nulls == 0 && !(d->flags & RAY_ENC_DESC_TRAILER);
+}
+
+const void* ray_enccol_raw_float_view(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d) {
+    if (!e->fraw_ok || e->kind != RAY_ENCCOL_SINGLE || !raw_float_eligible(d)) return NULL;
+    if (!atomic_load_explicit(&e->fraw_ok[c], memory_order_acquire)) {
+        const ray_enc_desc_t* descs;
+        ray_t* err = ray_enccol_chunk_descs_ref(e, c, &descs);
+        if (err) { ray_error_free(err); return NULL; }
+        int nv = (int)((chunk_rows(e, c) + RAY_ENC_VEC - 1) / RAY_ENC_VEC);
+        for (int v = 0; v < nv; v++)
+            if (raw_float_eligible(&descs[v]) && !raw_float_vec_ok(e, c, v, &descs[v])) return NULL;
+        atomic_store_explicit(&e->fraw_ok[c], 1, memory_order_release);
+    }
+    ray_enc_dirent_t de; dirent_at(e, c, &de);
+    return e->base + de.offset + d->payload_off;      /* no bitmap: n_nulls == 0 */
+}
+
 static ray_t* dec_aside(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d, int vlen,
                         const uint8_t* body, uint64_t avail, const uint8_t* bm, void* out,
                         size_t nbytes, bool try_fast) __attribute__((noinline));
@@ -1020,11 +1074,7 @@ static ray_t* dec_aside(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t*
         memcpy(out, tmp, nbytes);
         return NULL;
     }
-    switch (e->type) {
-    case RAY_F32: case RAY_F64: err = dec_floats(e, c, j, d, vlen, body, avail, bm, tmp); break;
-    case RAY_GUID:              err = dec_guid(e, c, j, d, vlen, body, avail, tmp); break;
-    default:                    err = dec_ints(e, c, j, d, vlen, body, avail, bm, tmp); break;
-    }
+    err = dec_ref(e, c, j, d, vlen, body, avail, bm, tmp);
     if (!err) memcpy(out, tmp, nbytes);
     return err;
 }
@@ -1047,8 +1097,12 @@ static ray_t* decode_vec(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t
         if (pooled > pool_cap || pool_base > pool_cap - pooled || pool_base + pooled > UINT32_MAX)
             VEC_CORRUPT("pool overflow");
         err = dec_str(e, c, j, d, vlen, body, avail, out, pool_out, pool_base, pool_cap, NULL);
-    } else if (!(priv && dec_fast(e, d, vlen, body, avail, bm, 0, out))) {
-        err = dec_aside(e, c, j, d, vlen, body, avail, bm, out, nbytes, !priv);
+    } else if (priv) {
+        /* a private destination may hold a partial vector on failure (it is
+         * never returned): decode straight into it, no aside copy */
+        if (!dec_fast(e, d, vlen, body, avail, bm, 0, out)) err = dec_ref(e, c, j, d, vlen, body, avail, bm, out);
+    } else {
+        err = dec_aside(e, c, j, d, vlen, body, avail, bm, out, nbytes, true);
     }
     if (!err) *produced = (uint64_t)nbytes + pooled;
     return err;
