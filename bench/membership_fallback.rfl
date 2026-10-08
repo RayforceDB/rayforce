@@ -1,0 +1,16 @@
+;; PR #744 evaluator membership regression. Release build, -c 8.
+;; Twenty million rows; milliseconds, first iteration is warmup.
+(set n 20000000)
+(set x (% (til n) 10))
+(set vocab (as 'SYM (as 'STR (til 10))))
+(set T (table [x s] (list x (at vocab x))))
+(println "symbol-inline-probe")
+(map (fn [_] (println (timeit (select {from: T where: (in s (as 'SYM (list "1" "5" "7")))})))) (til 7))
+(println "integer-inline-probe")
+(map (fn [_] (println (timeit (select {from: T where: (in x (distinct [1 5 7]))})))) (til 7))
+(println "symbol-planned-probe")
+(set probe (as 'SYM (list "1" "5" "7")))
+(map (fn [_] (println (timeit (select {from: T where: (in s probe)})))) (til 7))
+(println "integer-planned-probe")
+(map (fn [_] (println (timeit (select {from: T where: (in x [1 5 7])})))) (til 7))
+(exit 0)

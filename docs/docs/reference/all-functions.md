@@ -247,7 +247,9 @@ Functions that take other functions as arguments for mapping, folding, and filte
 
 Operations on vectors and lists as collections — set operations, indexing, searching, and construction.
 
-Outside queries, `in` matches null to null and `not-in` is its logical complement. Inside query expressions, null input rows return `false` for both operations and null set elements are ignored on both the planned and evaluator paths.
+Outside queries, `in` matches null to null. `not-in` inverts each membership result, preserving nested list/vector shapes. For numeric, temporal, SYM, and GUID membership evaluated during a query (including called functions), null input rows return `false` for both operations. STR string/character membership keeps its collection behavior and is not supported by the typed query-plan kernel.
+
+Query `concat` uses row-wise string concatenation for text operands, including a text vector with a scalar. Two constant typed vectors concatenate as collections; numeric collection concatenation evaluates over the whole column, or each group inside an aggregate. Non-text collection concatenation is binary. Output columns of different lengths are rejected; a standalone collection projection may change the row count.
 
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|

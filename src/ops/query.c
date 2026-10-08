@@ -1637,18 +1637,25 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
             ray_op_t* args[16];
             for (int64_t i = 0; i < n - 1; i++)
                 args[i] = &g->nodes[arg_ids[i]];
-            /* Constant collection operands concatenate as collections, even
-             * for SYM/STR vectors. They are not row-wise string operands. */
+            /* Two constant vectors concatenate as collections. Text vectors
+             * with a scalar retain the query's row-wise string operation. */
             if (n == 3 && args[0]->opcode == OP_CONST && args[1]->opcode == OP_CONST) {
                 ray_op_ext_t* a = find_ext(g, arg_ids[0]);
                 ray_op_ext_t* b = find_ext(g, arg_ids[1]);
                 if (a && b && a->literal && b->literal &&
-                    (ray_is_vec(a->literal) || ray_is_vec(b->literal) ||
+                    ((ray_is_vec(a->literal) && ray_is_vec(b->literal)) ||
                      (args[0]->out_type != RAY_SYM && args[0]->out_type != RAY_STR) ||
                      (args[1]->out_type != RAY_SYM && args[1]->out_type != RAY_STR))) {
                     ray_t* value = ray_concat_fn(a->literal, b->literal);
                     if (!value) return NULL;
-                    if (RAY_IS_ERR(value)) { g->compile_err = value; return NULL; }
+                    if (RAY_IS_ERR(value)) {
+                        if (!g->compile_err) g->compile_err = value;
+                        else ray_error_free(value);
+                        return NULL;
+                    }
+                    /* The typed membership executor cannot consume a boxed
+                     * mixed-type probe. Leave it to evaluator membership. */
+                    if (value->type == RAY_LIST) { ray_release(value); return NULL; }
                     ray_op_t* out = ray_is_atom(value) ? ray_const_atom(g, value)
                                                      : ray_const_vec(g, value);
                     ray_release(value);
@@ -2211,7 +2218,36 @@ static int expr_contains_agg(ray_t* expr) {
     return 0;
 }
 
-static int is_group_dag_agg_expr(ray_t* expr);  /* defined below */
+static int expr_contains_call_named(ray_t* expr, const char* name, size_t name_len);
+
+/* Collection concat changes row counts; text concat is still row-wise.
+ * Compile only the concat subtree to distinguish them without evaluating
+ * user functions. Without a table, conservatively decline the shortcut. */
+static bool expr_has_collection_concat(ray_t* expr, ray_t* tbl) {
+    if (!expr_contains_call_named(expr, "concat", 6)) return false;
+    if (!tbl) return true;
+    if (!expr || expr->type != RAY_LIST || ray_len(expr) == 0) return false;
+    ray_t** elems = ray_data(expr);
+    ray_t* name = elems[0] && elems[0]->type == -RAY_SYM
+        ? ray_sym_str(elems[0]->i64) : NULL;
+    if (name && ray_str_len(name) == 6 && !memcmp(ray_str_ptr(name), "concat", 6)) {
+        ray_graph_t* g = ray_graph_new(tbl);
+        if (!g) return true;
+        ray_op_t* op = compile_expr_dag(g, expr);
+        bool collection = !op || op->opcode != OP_CONCAT;
+        if (op && op->opcode == OP_CONST) {
+            ray_op_ext_t* ext = find_ext(g, op->id);
+            if (ext && ext->literal && ray_is_atom(ext->literal)) collection = false;
+        }
+        ray_graph_free(g);
+        return collection;
+    }
+    for (int64_t i = 1; i < ray_len(expr); i++)
+        if (expr_has_collection_concat(elems[i], tbl)) return true;
+    return false;
+}
+
+static int is_group_dag_agg_expr(ray_t* expr, ray_t* tbl);  /* defined below */
 static bool simplify_agg_idiom(ray_t* val_expr, ray_t* tbl,
                                uint16_t* out_op, ray_t** out_arg);
 
@@ -2295,7 +2331,7 @@ static ray_t* agg_arith_rewrite(ray_t* expr, ray_t* tbl,
                                 ray_t** hexprs, int64_t* hnames,
                                 int* n_hidden, int cap, int* ok) {
     if (!*ok || !expr) { *ok = 0; return NULL; }
-    if (expr->type == RAY_LIST && is_group_dag_agg_expr(expr) &&
+    if (expr->type == RAY_LIST && is_group_dag_agg_expr(expr, tbl) &&
         hidden_agg_shape_ok(expr)) {
         ray_t** el = (ray_t**)ray_data(expr);
         /* nested agg inside the agg argument: not a DAG shape — bail */
@@ -2363,7 +2399,7 @@ static ray_t* try_decompose_agg_arith(ray_t* val_expr, ray_t* tbl,
                                       ray_t** hexprs, int64_t* hnames,
                                       int* n_hidden, int cap) {
     if (!val_expr || val_expr->type != RAY_LIST) return NULL;
-    if (is_group_dag_agg_expr(val_expr)) return NULL;  /* plain agg path */
+    if (is_group_dag_agg_expr(val_expr, tbl)) return NULL;  /* plain agg path */
     if (!expr_contains_agg(val_expr)) return NULL;
     int ok = 1;
     int saved = *n_hidden;
@@ -2495,7 +2531,7 @@ static int is_whole_column_projection(ray_t* expr, ray_t* tbl) {
  * `(count (distinct col))` is semantically an aggregate, but `distinct`
  * is not a row-aligned DAG input inside GROUP.  Route it through the
  * per-group eval fallback so `distinct` sees each group's slice. */
-static int is_group_dag_agg_expr(ray_t* expr) {
+static int is_group_dag_agg_expr(ray_t* expr, ray_t* tbl) {
     if (!is_agg_expr(expr)) return 0;
     ray_t** elems = (ray_t**)ray_data(expr);
     uint16_t op = resolve_agg_opcode(elems[0]->i64);
@@ -2506,7 +2542,8 @@ static int is_group_dag_agg_expr(ray_t* expr) {
                                    NULL))
             return 0;
     }
-    return !expr_contains_call_named(elems[1], "distinct", 8);
+    return !expr_contains_call_named(elems[1], "distinct", 8) &&
+           !expr_has_collection_concat(elems[1], tbl);
 }
 
 static bool expr_literal_is_temporal(ray_t* expr) {
@@ -2550,7 +2587,7 @@ static bool expr_contains_temporal_arith(ray_t* expr, ray_t* tbl) {
 }
 
 static int is_group_dag_agg_expr_dag_safe(ray_t* expr, ray_t* tbl) {
-    if (!is_group_dag_agg_expr(expr)) return 0;
+    if (!is_group_dag_agg_expr(expr, tbl)) return 0;
 
     ray_t** elems = (ray_t**)ray_data(expr);
     uint16_t op = resolve_agg_opcode(elems[0]->i64);
@@ -2835,7 +2872,7 @@ static bool match_group_count_emit_filter(ray_t* from_expr, ray_t* where_expr,
             kid == take_id || kid == asc_id || kid == desc_id)
             continue;
         ray_t* val = iv[i + 1];
-        if (!is_group_dag_agg_expr(val))
+        if (!is_group_dag_agg_expr(val, NULL))
             continue;
         ray_t** ae = (ray_t**)ray_data(val);
         uint16_t op = resolve_agg_opcode(ae[0]->i64);
@@ -2916,7 +2953,7 @@ static bool match_group_desc_count_take(ray_t** dict_elems, int64_t dict_n,
             kid == take_id || kid == asc_id || kid == desc_id)
             continue;
         ray_t* val = dict_elems[i + 1];
-        if (!is_group_dag_agg_expr(val))
+        if (!is_group_dag_agg_expr(val, NULL))
             continue;
         ray_t** ae = (ray_t**)ray_data(val);
         uint16_t op = resolve_agg_opcode(ae[0]->i64);
@@ -2954,20 +2991,24 @@ static int is_aggr_unary_call(ray_t* expr) {
     return (fn_obj->attrs & RAY_FN_AGGR) != 0;
 }
 
-static int is_streaming_aggr_unary_call(ray_t* expr) {
+static int is_streaming_aggr_unary_call(ray_t* expr, ray_t* tbl) {
+    /* Collection concat changes the source length. Evaluate it within
+     * each group rather than slicing a concatenated full-table result. */
+    if (expr_has_collection_concat(expr, tbl)) return 0;
     if (!is_aggr_unary_call(expr)) return 0;
     ray_t** elems = (ray_t**)ray_data(expr);
     return !expr_contains_call_named(elems[1], "distinct", 8);
 }
 
-static int is_plain_count_expr(ray_t* expr) {
+static int is_plain_count_expr(ray_t* expr, ray_t* tbl) {
     if (!expr || expr->type != RAY_LIST) return 0;
     int64_t n = ray_len(expr);
     if (n < 2) return 0;
     ray_t** elems = (ray_t**)ray_data(expr);
     if (!elems[0] || elems[0]->type != -RAY_SYM) return 0;
     if (resolve_agg_opcode(elems[0]->i64) != OP_COUNT) return 0;
-    return !expr_contains_call_named(elems[1], "distinct", 8);
+    return !expr_contains_call_named(elems[1], "distinct", 8) &&
+           !expr_has_collection_concat(elems[1], tbl);
 }
 
 /* NOTE: binary-aggregator gates (is_aggr_binary_call /
@@ -3109,7 +3150,7 @@ static int64_t select_output_count(ray_t** dict_elems, int64_t dict_n) {
  * node as one hidden slot).  Pure structural walk — cheap, compile-time. */
 static int64_t count_agg_subexprs(ray_t* expr) {
     if (!expr) return 0;
-    if (is_group_dag_agg_expr(expr)) return 1;
+    if (is_group_dag_agg_expr(expr, NULL)) return 1;
     if (expr->type != RAY_LIST) return 0;
     ray_t** e = (ray_t**)ray_data(expr);
     int64_t n = ray_len(expr), c = 0;
@@ -8275,7 +8316,7 @@ static ray_t* try_temporal_group_materialize(ray_t* dict, ray_t* tbl) {
     #define MAT_CHECK(value) do { if (!(value) || RAY_IS_ERR(value)) { failure = (value); (value) = NULL; goto oom; } } while (0)
     for (int64_t i = 0; i < ray_dict_len(dict); i++) {
         ray_t* expr = ray_list_get(vals, i);
-        if (!expr || !is_group_dag_agg_expr(expr)) continue;
+        if (!expr || !is_group_dag_agg_expr(expr, tbl)) continue;
         ray_t** es = ray_data(expr);
         uint16_t kind = resolve_agg_opcode(es[0]->i64);
         int argc = agg_is_binary_agg(kind) ? 2 : 1;
@@ -9098,7 +9139,7 @@ static ray_t* select_plan_computed_key(ray_t* dict, ray_t* tbl, int64_t* key_nam
         ray_t* v = ((ray_t**)ray_data(vals))[i];
         /* the routing's own test for an output the DAG group cannot serve */
         if (is_single_group_key_projection(by_expr, v)) continue;
-        if (is_group_dag_agg_expr(v)) continue;
+        if (is_group_dag_agg_expr(v, tbl)) continue;
         if (is_decomposable_agg_compound(v, tbl)) continue;
         needs_eval = true;
     }
@@ -9788,7 +9829,7 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
                 if (kid == from_id || kid == where_id || kid == by_id ||
                     kid == take_id || kid == asc_id || kid == desc_id ||
                     kid == nearest_id) continue;
-                if (!is_group_dag_agg_expr(dict_elems[i + 1])) defer_ok = false;
+                if (!is_group_dag_agg_expr(dict_elems[i + 1], tbl)) defer_ok = false;
             }
             for (int64_t i = 0; i < nk && defer_ok; i++) {
                 ray_t* k = d_elems[i * 2];
@@ -9884,7 +9925,7 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
                     kid == take_id || kid == asc_id || kid == desc_id ||
                     kid == nearest_id) continue;
                 ray_t* val = dict_elems[i + 1];
-                if (!is_group_dag_agg_expr(val)) continue;
+                if (!is_group_dag_agg_expr(val, tbl)) continue;
                 ray_t** ae = (ray_t**)ray_data(val);
                 if (!ae[0] || ae[0]->type != -RAY_SYM) continue;
                 if (ae[0]->i64 == count_sym) continue;
@@ -10648,7 +10689,7 @@ by_dict_done:
                     kid == take_id || kid == asc_id || kid == desc_id) continue;
                 if (is_single_group_key_projection(by_expr, dict_elems[i + 1]))
                     continue;
-                if (is_group_dag_agg_expr(dict_elems[i + 1])) continue;
+                if (is_group_dag_agg_expr(dict_elems[i + 1], tbl)) continue;
                 /* Arithmetic over aggregates is served by hidden agg slots
                  * plus one post-group evaluation on any key shape; it must
                  * not push multi-key queries onto eval-level grouping. */
@@ -10938,7 +10979,7 @@ by_dict_done:
                         if (kid == from_id || kid == where_id || kid == by_id ||
                             kid == take_id || kid == asc_id || kid == desc_id) continue;
                         ray_t* val_expr_item = dict_elems[i + 1];
-                        if (!is_plain_count_expr(val_expr_item)) {
+                        if (!is_plain_count_expr(val_expr_item, eval_tbl)) {
                             /* Not a plain count expr — use the general path
                              * (never silently drop outputs). */
                             count_only = false;
@@ -11232,7 +11273,7 @@ by_dict_done:
                         continue;
                     }
 
-                    if (is_streaming_aggr_unary_call(val_expr_item)) {
+                    if (is_streaming_aggr_unary_call(val_expr_item, eval_tbl)) {
                         ray_t** agg_elems = (ray_t**)ray_data(val_expr_item);
                         ray_t* agg_fn_name = agg_elems[0];
                         ray_t* agg_col_expr = agg_elems[1];
@@ -11828,7 +11869,7 @@ by_dict_done:
                     }
                 }
 
-                if (is_streaming_aggr_unary_call(val_expr_item)) {
+                if (is_streaming_aggr_unary_call(val_expr_item, eval_tbl)) {
                     /* Streaming-style per-group AGG branch.  Accepts both
                      * the resolve_agg_opcode whitelist (sum/avg/min/max/...)
                      * and the broader RAY_FN_AGGR + RAY_UNARY set
@@ -14910,7 +14951,7 @@ by_dict_done:
                      * group and calling the unary fn directly into a typed
                      * vec.  Equivalent perf-class to the streaming AGG path
                      * the eval-fallback uses for the same shapes. */
-                    if (is_streaming_aggr_unary_call(nonagg_exprs[ni])) {
+                    if (is_streaming_aggr_unary_call(nonagg_exprs[ni], tbl)) {
                         ray_t* col = NULL;
                         /* `(med col)` fast path — bucket-scatter values
                          * into a reused scratch and quickselect, skipping
@@ -15072,7 +15113,7 @@ by_dict_done:
                 for (int64_t ni = 0; ni < n_nonaggs; ni++) {
                     ray_t* expr = nonagg_exprs[ni];
                     ray_t* empty_list = match_count_distinct(expr) ? ray_vec_new(RAY_I64, 0)
-                        : is_streaming_aggr_unary_call(expr) ? aggr_unary_per_group_buf(expr, tbl, NULL, NULL, NULL, 0)
+                        : is_streaming_aggr_unary_call(expr, tbl) ? aggr_unary_per_group_buf(expr, tbl, NULL, NULL, NULL, 0)
                         : can_atom_broadcast(expr) ? atom_broadcast_vec(expr, 0) : ray_list_new(0);
                     if (!empty_list || RAY_IS_ERR(empty_list)) {
                         ray_release(result); ray_release(tbl);

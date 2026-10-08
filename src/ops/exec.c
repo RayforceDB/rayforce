@@ -3778,6 +3778,15 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     ray_table_set_col_idx(result, c, wide);
                     ray_release(wide);
                 }
+                /* Length-changing constant projections must not silently
+                 * truncate or pad the other columns during materialization. */
+                ray_t* shape_err = ray_table_validate_rectangular(result, "select");
+                if (shape_err) {
+                    ray_release(result);
+                    g->table = saved_table;
+                    ray_release(input);
+                    return shape_err;
+                }
             }
 
             g->table = saved_table;

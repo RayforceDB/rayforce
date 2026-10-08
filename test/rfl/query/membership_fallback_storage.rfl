@@ -13,4 +13,7 @@
 (at (select {from: P where: (in s (as 'SYM (list "a" "")))}) 'x) -- [1 1]
 (at (select {from: P where: (not-in s (as 'SYM (list "a" "")))}) 'x) -- [2 2]
 (at (select {v: (not-in s (as 'SYM (list "a" ""))) from: P}) 'v) -- [false false true false false true]
+;; MAPCOMMON partition keys need materialization on the evaluator path too.
+(at (select {from: P where: (in part (distinct [1]))}) 'x) -- [1 0Nl 2]
+(at (select {from: P where: (not-in part (distinct [1]))}) 'x) -- [1 0Nl 2]
 (.sys.exec "rm -rf /tmp/rfl_membership_fallback") -- 0

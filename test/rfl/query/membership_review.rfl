@@ -1,0 +1,26 @@
+;; Mixed concat results stay on general membership, never a typed LIST probe.
+(set T (table [s x] (list ['a 'b 'a] [1 2 3])))
+(at (select {from: T where: (in s (concat ['a] [1]))}) 'x) -- [1 3]
+(at (select {from: T where: (not-in s (concat ['a] [1]))}) 'x) -- [2]
+(at (select {v: (in s (concat 'a 1)) from: T}) 'v) -- [true false true]
+(at (select {v: (not-in s (concat 'a 1)) from: T}) 'v) -- [false true false]
+
+;; Nested results retain their shape under negation, including in WHERE errors.
+(not-in ["ab" "c"] "a") -- (list [false true] [true])
+(in ["ab" "c"] "a") -- (list [true false] [false])
+(not-in (list (list 1 2) (list 3)) [1]) -- (list [false true] [true])
+(set S (table [ss] (list ["ab" "c"])))
+(select {from: S where: (in ss (list "" "a"))}) !- type
+(select {from: S where: (not-in ss (list "" "a"))}) !- type
+
+;; Empty evaluator membership must produce an empty BOOL predicate.
+(set E (table [s x] (list (as 'SYM (list)) (til 0))))
+(count (select {from: E where: (in s (as 'SYM (list "a")))})) -- 0
+(count (select {from: E where: (not-in s (as 'SYM (list "a")))})) -- 0
+
+;; F64 and temporal inline probes use the same null-aware typed kernel.
+(set F (table [f d] (list [1.0 0Nf 2.0] [2024.01.01 0Nd 2024.01.02])))
+(at (select {from: F where: (in f (distinct [0Nf 1.0]))}) 'f) -- [1.0]
+(at (select {from: F where: (not-in f (distinct [0Nf 1.0]))}) 'f) -- [2.0]
+(at (select {from: F where: (in d (distinct [0Nd 2024.01.01]))}) 'f) -- [1.0]
+(at (select {from: F where: (not-in d (distinct [0Nd 2024.01.01]))}) 'f) -- [2.0]
