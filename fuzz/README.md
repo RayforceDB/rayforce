@@ -49,7 +49,10 @@ order and null metadata still compare exactly.
 The generator also covers extreme F64 values and tables of 8,191, 8,192,
 16,385 and 131,073 rows. Run `RAY_FUZZ_CORES=4 make fuzz-select_merge` to
 exercise parallel execution; the default remains serial for deterministic
-coverage. `RAY_FUZZ_CORES` is read only by this fuzz driver.
+coverage. `RAY_FUZZ_CORES` is read only by this fuzz driver. The generator
+includes products of two independent F64 columns, squares, nested products,
+and scalar/grouped reductions. PR CI runs this target for one minute each in
+serial and four-worker modes; its nightly campaign uses four workers.
 
 `fuzz-smoke` covers `parse`, `numparse`, and `de` (the fast, stateless
 targets); `eval`, `csv`, `journal`, and `select_merge` run in the nightly `fuzz-long` job

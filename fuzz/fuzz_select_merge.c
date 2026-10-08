@@ -65,18 +65,27 @@ static void query(char* out, const unsigned* choices, bool barrier) {
         "total:(sum q)", "q:q", "take:3", "p:p desc:p take:2",
         "a:(+ a 1) r:a", "total:(count s)"
     };
-    static const char* const computed[] = {"(* p 2)", "(* p 1.7)", "(+ p 1.3)", "(- p 0.7)"};
+    static const char* const computed[] = {
+        "(* p 2)", "(* p 1.7)", "(+ p 1.3)", "(- p 0.7)",
+        "(* p r)", "(* p p)", "(* (* p 2) r)", "(* p a)",
+        "(* (* a 2) 1.0)", "(* (* p 1e300) 1e-300)"
+    };
+    static const char* const reductions[] = {
+        "total:(sum q)", "total:(avg q)", "total:(min q)",
+        "total:(max q)", "by:k total:(sum q)", "by:k total:(avg q)"
+    };
     char projection[256];
-    snprintf(projection, sizeof(projection), "a:a b:b k:k p:p s:s text:text q:%s", computed[(choices[1] / 10) % 4]);
+    snprintf(projection, sizeof(projection), "a:a b:b k:k p:p s:s text:text q:%s", computed[(choices[1] / 10) % 10]);
     snprintf(out, 4096, "(select {from:T %s %s})", filters[choices[0] % 8],
              choices[1] % 10 == 2 ? projection : projections[choices[1] % 10]);
     for (unsigned layer = 0; layer < 1 + choices[2] % 2; layer++) {
         char prev[4096];
         strcpy(prev, out);
+        unsigned output = choices[4 + layer * 2];
         /* Each layer adds at most 200 bytes; the generated depth is <= 3. */
         snprintf(out, 4096, "(select {from:%s%.3000s%s %s %s})", barrier ? "(do " : "", prev,
                  barrier ? ")" : "", filters[choices[3 + layer * 2] % 8],
-                 outputs[choices[4 + layer * 2] % 10]);
+                 output % 10 == 4 ? reductions[(output / 10) % 6] : outputs[output % 10]);
     }
 }
 
@@ -91,10 +100,11 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     for (int i = 0; i < 7; i++) choices[i] = byte(data, size, &at);
     unsigned rows = byte(data, size, &at) % 33;
     char src[8192]; size_t pos = 0;
-    pos += snprintf(src + pos, sizeof(src) - pos, "(set T (table [a b k p s text] (list ");
-    for (int col = 0; col < 6; col++) {
+    pos += snprintf(src + pos, sizeof(src) - pos, "(set T (table [a b k p s text r] (list ");
+    for (int col = 0; col < 7; col++) {
+        bool floating = col == 3 || col == 6;
         if (!rows) {
-            static const char* const empty[] = {"[0]", "[0]", "[0]", "[0.0]", "[alpha]", "[\"a\"]"};
+            static const char* const empty[] = {"[0]", "[0]", "[0]", "[0.0]", "[alpha]", "[\"a\"]", "[0.0]"};
             pos += snprintf(src + pos, sizeof(src) - pos, "(take %s 0) ", empty[col]);
             continue;
         }
@@ -107,16 +117,17 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
             } else if (col == 5) {
                 const char* str[] = {"\"\"", "\"a\"", "\"b\""};
                 pos += snprintf(src + pos, sizeof(src) - pos, "%s ", str[v % 3]);
-            } else if (v % 7 == 0 && !(col == 3 && v >= 250 && v <= 253)) {
-                pos += snprintf(src + pos, sizeof(src) - pos, "%s ", col == 3 ? "0Nf" : "0N");
-            } else if (col == 3) {
+            } else if (v % 7 == 0 && !(floating && v >= 250 && v <= 253)) {
+                pos += snprintf(src + pos, sizeof(src) - pos, "%s ", floating ? "0Nf" : "0N");
+            } else if (floating) {
                 const char* edge = v == 250 ? "1.7976931348623157e308" :
                                    v == 251 ? "-1.7976931348623157e308" :
                                    v == 252 ? "1e300" : v == 253 ? "-1e300" : NULL;
                 if (edge) pos += snprintf(src + pos, sizeof(src) - pos, "%s ", edge);
                 else pos += snprintf(src + pos, sizeof(src) - pos, "%u.%u ", v % 17, (v / 17) % 10);
             } else {
-                pos += snprintf(src + pos, sizeof(src) - pos, "%u ", v % 3);
+                if (v == 250) pos += snprintf(src + pos, sizeof(src) - pos, "4611686018427387904 ");
+                else pos += snprintf(src + pos, sizeof(src) - pos, "%u ", v % 3);
             }
         }
         src[pos++] = ']'; src[pos++] = ' ';

@@ -82,6 +82,10 @@ jobs:
           scripts/fuzz-seed-frames.sh || true
       - name: Fuzz smoke
         run: make fuzz-smoke
+      - name: Nested select differential fuzz (serial and parallel)
+        run: |
+          make fuzz-select_merge FUZZ_RUNTIME=60
+          RAY_FUZZ_CORES=4 make fuzz-select_merge FUZZ_RUNTIME=60
       - name: Upload crash artifacts
         if: failure()
         uses: actions/upload-artifact@v4

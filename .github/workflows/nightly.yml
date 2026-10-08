@@ -52,6 +52,9 @@ jobs:
       fail-fast: false
       matrix:
         target: [parse, numparse, de, eval, csv, journal, select_merge]
+        include:
+          - target: select_merge
+            cores: 4
     steps:
       - uses: actions/checkout@v4
         with: { ref: dev }
@@ -67,6 +70,8 @@ jobs:
           scripts/fuzz-seed-parse.sh || true
           scripts/fuzz-seed-frames.sh || true
       - name: Fuzz ${{ matrix.target }} (15 min)
+        env:
+          RAY_FUZZ_CORES: ${{ matrix.cores || 0 }}
         run: make fuzz-${{ matrix.target }} FUZZ_RUNTIME=900
       - name: Upload crash artifacts
         if: failure()

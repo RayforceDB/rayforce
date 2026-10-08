@@ -3,8 +3,9 @@
 
 Build: make release
 Run:   python3 bench/nested_select.py --binary ./rayforce --rows 5000000
+Sparse: add --a-period 1000 --widths 4 --rows 20000000
 The baseline uses `do` to keep the inner select materialized, without a runtime
-optimizer flag. All three variants must serialize identically before timing.
+optimizer flag. Every available variant must serialize identically before timing.
 """
 import argparse
 import os
@@ -37,15 +38,18 @@ def main():
     parser.add_argument("--rows", type=int, default=5_000_000)
     parser.add_argument("--runs", type=int, default=7)
     parser.add_argument("--cores", type=int, default=4)
+    parser.add_argument("--a-period", type=int, default=3,
+                        help="inner equality selectivity is 1 / a-period")
+    parser.add_argument("--widths", type=int, nargs="+", choices=(4, 40), default=(4, 40))
     args = parser.parse_args()
-    if args.rows < 1 or args.runs < 1:
-        parser.error("rows and runs must be positive")
+    if args.rows < 1 or args.runs < 1 or args.a_period < 2:
+        parser.error("rows/runs must be positive and a-period must be at least 2")
     lines = [f"(set I (til {args.rows}))"]
     cases = []
     check_count = 0
-    for width in (4, 40):
+    for width in args.widths:
         cols = ["a", "b", "k", "p"] + [f"c{i}" for i in range(width - 4)]
-        vals = ["(% I 3)", "(% I 5)", "(% I 100)", "(as 'F64 I)"] + [f"(+ I {i})" for i in range(width - 4)]
+        vals = [f"(% I {args.a_period})", "(% I 5)", "(% I 100)", "(as 'F64 I)"] + [f"(+ I {i})" for i in range(width - 4)]
         lines.append(f"(set T (table [{' '.join(cols)}] (list {' '.join(vals)})))")
         identity = " ".join(f"{c}:{c}" for c in cols)
         shapes = [
@@ -70,6 +74,12 @@ def main():
              "where:(> q5 1) v:q5", None),
             (f"from:(select {{from:T where:(> p {max(0, args.rows - 10)}.0)}}) by:k total:(sum p)",
              "total:total", None),
+            # Vary --a-period to compare selective and dense inner filters.
+            ("from:T where:(< a 10)", "where:(== b 1) total:(sum p)", None),
+            ("from:T where:(== a 1) q:p", "where:(> q 5) total:(avg q)", None),
+            (f"from:T where:(< a {max(1, args.a_period * 4 // 5)})",
+             "where:(== b 1) total:(sum p)", None),
+            ("from:T where:(== a 1)", "where:(== b 1) p:p", None),
         ]
         for number, (inner, outer, flat) in enumerate(shapes, 1):
             tag = f"{width}/S{number}"
@@ -109,7 +119,7 @@ def main():
         if line.startswith("TIME "):
             _, case, variant, ms = line.split()
             times.setdefault((case, variant), []).append(float(ms))
-    print(f"{args.rows:,} rows, {args.cores} workers, median of {args.runs} interleaved runs; all serialized results equal.")
+    print(f"{args.rows:,} rows, {args.cores} workers, a-period {args.a_period}, median of {args.runs} interleaved runs; all serialized results equal.")
     print("| Columns/shape | Materialized ms | Nested ms | Manual ms | Speedup |")
     print("|---|---:|---:|---:|---:|")
     for case in cases:

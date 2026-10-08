@@ -40,7 +40,8 @@ static test_result_t test_select_merge_cases(void) {
     t = ray_eval_str("(set T (take T 10000))");
     TEST_ASSERT(t && !RAY_IS_ERR(t), "multi-morsel fixture"); drop(t);
     const struct { const char* query; bool merge; } cases[] = {
-        {"{from: (select {from: T where: (== a 1)}) where: (== b 1) total: (sum p)}", true},
+        {"{from: (select {from: T where: (== a 1)}) where: (== b 1) total: (sum p)}", false},
+        {"{from: (select {from: T where: (== a 1)}) where: (== b 1) by:k total: (sum p)}", true},
         {"{from: (select {from: T where: (== a 1) a:a b:b k:k p:p s:s text:text q:(* p 2)}) by:k total:(sum q)}", true},
         {"{from: (select {from: T where: (== a 1) p:p k:k}) take: 2}", true},
         {"{from: (select {from: T a:a b:b k:k p:p s:s text:text}) where:(== a 1) total:(sum p)}", true},
@@ -118,7 +119,7 @@ static test_result_t test_select_merge_scopes(void) {
     TEST_ASSERT(t && !RAY_IS_ERR(t), "fixture"); drop(t);
     t = ray_eval_str("(set T (take T 10000))");
     TEST_ASSERT(t && !RAY_IS_ERR(t), "multi-morsel fixture"); drop(t);
-    ray_t* dict = ray_eval_str("(quote {from: (select {from:T where:(== a 1)}) where:(> p 0) total:(sum p)})");
+    ray_t* dict = ray_eval_str("(quote {from: (select {from:T where:(== a 1)}) where:(> p 0) by:a total:(sum p)})");
     TEST_ASSERT(dict && !RAY_IS_ERR(dict), "AST");
     ray_t* before = ray_ser(dict);
     const char* names[] = {"a", "p", "==", "select", "T"};
@@ -158,11 +159,24 @@ static test_result_t test_select_merge_review(void) {
     TEST_ASSERT(r && !RAY_IS_ERR(r), "ramp fixture"); drop(r);
     r = ray_eval_str("(set D (take (table [f] (list [1.7976931348623157e308 -1.7976931348623157e308 1.0])) 10002))");
     TEST_ASSERT(r && !RAY_IS_ERR(r), "overflow fixture"); drop(r);
+    r = ray_eval_str("(set E (take (table [f g k] (list [1e300 1e10 -1e300 3.0] [1e300 2.0 1e300 4.0] [0 1 0 1])) 10000))");
+    TEST_ASSERT(r && !RAY_IS_ERR(r), "product overflow fixture"); drop(r);
+    r = ray_eval_str("(set M (take (table [i] (list [4611686018427387904 1])) 10000))");
+    TEST_ASSERT(r && !RAY_IS_ERR(r), "mixed intermediate fixture"); drop(r);
     r = ray_eval_str("(set S (take T 10))");
     TEST_ASSERT(r && !RAY_IS_ERR(r), "small fixture"); drop(r);
     const struct { const char* query; bool merge; } cases[] = {
         {"{from: (select {from:D c:(+ f 1e300)}) total:(sum c)}", false},
         {"{from: (select {from:D c:(+ f 1e300)}) total:(avg c)}", false},
+        {"{from: (select {from:E c:(* f g)}) total:(sum c)}", false},
+        {"{from: (select {from:E c:(* f g)}) total:(avg c)}", false},
+        {"{from: (select {from:E c:(* f f)}) total:(sum c)}", false},
+        {"{from: (select {from:E k:k c:(* f g)}) by:k total:(sum c)}", false},
+        {"{from: (select {from:E c:(* (* f 2) g)}) total:(sum c)}", false},
+        {"{from: (select {from:M c:(* (* i 2) 1.0)}) total:(sum c)}", false},
+        {"{from: (select {from:E c:(* f g)}) c:c}", true},
+        {"{from: (select {from:T where:(== b 1)}) where:(> p 5) total:(sum p)}", false},
+        {"{from: (select {from:T where:(< b 3)}) where:(> p 5) total:(avg p)}", false},
         {"{from: (select {from:T where:(== b 1)}) total:(sum p)}", false},
         {"{from: (select {from:T where:(> b 3)}) total:(count p)}", false},
         {"{from: (select {from:T where:(> p 19990.0)}) by:b total:(sum p)}", false},

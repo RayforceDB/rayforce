@@ -30,7 +30,7 @@
 
 ;; Admitted rewrites on a table above the size cutoff: combine filters and
 ;; preserve empty grouped column output, including its serialized schema.
-(at (select {from:(select {from:L752 where:(< x 100)}) where:(== y 1) total:(sum x)}) 'total) -- [1617]
+(at (select {from:(select {from:L752 where:(< x 100)}) where:(== y 1) by:y total:(sum x)}) 'total) -- [1617]
 (ser (select {from:(select {from:L752 where:(> x 20000)}) by:y x:x})) -- (ser (select {from:(do (select {from:L752 where:(> x 20000)})) by:y x:x}))
 
 ;; A lambda source shadows the global table: its rows and types govern planning.
@@ -39,3 +39,9 @@
 (set F752 (take (table [x] (list [1.0 2.0 3.0])) 10000))
 (set Int752 (take (table [x] (list [9223372036854775807 1 2])) 10000))
 ((fn [F752] (ser (select {from:(select {from:F752 q:(* x 2)}) total:(sum q)}))) Int752) -- ((fn [F752] (ser (select {from:(do (select {from:F752 q:(* x 2)})) total:(sum q)}))) Int752)
+
+;; Column products overflow into null lanes before a materialized reduction.
+(set E754 (take (table [f g] (list [1e300 1e10 -1e300 3.0] [1e300 2.0 1e300 4.0])) 10000))
+(at (select {from:(select {from:E754 c:(* f g)}) total:(sum c)}) 'total) -- [50000000030000.0]
+(at (select {from:(select {from:E754 c:(* f g)}) total:(avg c)}) 'total) -- [10000000006.0]
+(ser (select {from:(select {from:E754 c:(* f f)}) total:(sum c)})) -- (ser (select {from:(do (select {from:E754 c:(* f f)})) total:(sum c)}))

@@ -172,14 +172,22 @@ static ray_t* merge_expr(merge_scope_t* s, ray_t* e, int* type, bool* column, in
     return out;
 }
 
-static bool merge_has_offset(ray_t* e) {
-    if (e->type != RAY_LIST) return false;
+/* Computed aggregates admit only literal scales of an F64 column. Other
+ * arithmetic can create null lanes that existing flat reduction paths do
+ * not handle like a materialized vector: offsets, column products, and I64
+ * intermediates (even when a later multiplier promotes the result to F64). */
+static bool merge_scaled_f64(ray_t* table, ray_t* e) {
+    if (e->type == -RAY_SYM) {
+        ray_t* col = ray_table_get_col(table, e->i64);
+        return col && col->type == RAY_F64;
+    }
+    if (e->type != RAY_LIST || e->len != 3) return false;
     ray_t** es = ray_data(e);
     ray_t* fn = ray_env_get(es[0]->i64);
-    if (fn && fn->type == RAY_BINARY &&
-        ((ray_binary_fn)(uintptr_t)fn->i64 == ray_add_fn ||
-         (ray_binary_fn)(uintptr_t)fn->i64 == ray_sub_fn)) return true;
-    for (int64_t i = 1; i < e->len; i++) if (merge_has_offset(es[i])) return true;
+    if (!fn || fn->type != RAY_BINARY || (ray_binary_fn)(uintptr_t)fn->i64 != ray_mul_fn) return false;
+    for (int i = 1; i <= 2; i++)
+        if ((es[i]->type == -RAY_I64 || es[i]->type == -RAY_F64) && !RAY_ATOM_IS_NULL(es[i]) &&
+            merge_scaled_f64(table, es[3 - i])) return true;
     return false;
 }
 
@@ -193,10 +201,7 @@ static ray_t* merge_output(merge_scope_t* s, ray_t* e, int* type) {
             return NULL;
         ray_t* arg = merge_expr(s, es[1], type, &col, 0);
         if (!arg || !col || (!merge_numeric(*type) && f != ray_count_fn)) { merge_drop(arg); return NULL; }
-        /* Offset lowering cannot account for nulls CREATED by F64 overflow,
-         * even when the input has no HAS_NULLS flag. Integer intermediates
-         * can likewise overflow into their null sentinel. */
-        if (arg->type == RAY_LIST && (*type != RAY_F64 || merge_has_offset(arg))) {
+        if (arg->type == RAY_LIST && !merge_scaled_f64(s->table, arg)) {
             merge_drop(arg); return NULL;
         }
         ray_t* r = merge_call(es[0], arg, NULL);
@@ -267,9 +272,10 @@ static ray_t* merge_pair(ray_t* outer, ray_t* inner) {
     ray_t* ok = ray_dict_keys(outer), **ov = ray_data(ray_dict_vals(outer));
     for (int64_t i = 0; i < ik->len; i++) if (merge_clause(sym_cell_runtime_id(ik, i)) > 2) return NULL;
     if (merge_get(outer, 7)) return NULL;
-    /* The single-predicate scalar reduction path is slower than compacting
-     * first. Keep it materialized; the two-predicate and grouped wins remain. */
-    if (merge_get(inner, 2) && !merge_get(outer, 2) && !merge_get(outer, 3)) {
+    /* Scalar reductions can lose to compacting a selective inner filter,
+     * even with an outer predicate. Keep them materialized until the planner
+     * has a cost estimate that accounts for the inner filter's selectivity. */
+    if (merge_get(inner, 2) && !merge_get(outer, 3)) {
         for (int64_t i = 0; i < ok->len; i++)
             if (!merge_clause(sym_cell_runtime_id(ok, i)) &&
                 ov[i]->type == RAY_LIST && ov[i]->len == 2) return NULL;
