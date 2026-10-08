@@ -19,3 +19,24 @@
 (select {v: (concat [1 2 3] [4]) w: x from: T}) !- domain
 (at (select {v: (concat 1 2) from: T}) 'v) -- [1 2]
 (at (select {v: (concat 1 2) w: x from: T2}) 'w) -- [1 2]
+
+;; Multiple hidden text aggregates must reserve every DAG aggregate slot.
+(set A (table [x k s] (list [1 2 3 4 5] [0 0 1 2 2] ['a 'b 'c 'd 'e])))
+(at (select {n: (+ (count (concat s "!")) (count (concat s "?"))) by: k from: A asc: k}) 'n) -- [4 2 4]
+(at (select {n: (+ (sum x) (count (concat s "?"))) by: k from: A asc: k}) 'n) -- [5 4 11]
+(at (select {n: (- (max x) (count (concat s "!"))) by: k from: A asc: k}) 'n) -- [0 2 3]
+(at (select {n: (+ (count (concat s "!")) (count (concat s "?"))) by: k from: (select {from: A where: (> x 1)}) asc: k}) 'n) -- [2 2 4]
+;; Scalars broadcast to the collection projection's length, in either order.
+(at (select {a: [1 2] b: 5 from: T}) 'b) -- [5 5]
+(at (select {a: (concat 1 2) b: 5 from: T}) 'b) -- [5 5]
+(at (select {b: 5 a: (concat 1 2) from: T}) 'b) -- [5 5]
+
+;; take: limits a rectangular projection; it cannot repair ragged columns.
+(select {b: x a: [1 2] from: T take: 2}) !- domain
+;; Top-N and nested count filters must agree with the planner's agg slots.
+(at (select {a: (count (concat s "!")) b: (sum x) by: k from: A desc: b take: 1}) 'k) -- [2]
+(at (select {from: (select {a: (count (concat s "!")) b: (count x) by: k from: A}) where: (> b 1) asc: k}) 'k) -- [0 2]
+
+(set B (table [x k s] (list [1 2 3 4 5] [0 0 1 2 2] ['longlong 'longlong 'c 'd 'e])))
+(at (select {a: (sum (strlen (concat s "!"))) b: (sum x) by: k from: B desc: b take: 1}) 'k) -- [2]
+(at (select {a: (sum (strlen (concat s "!"))) b: (sum x) by: k from: B desc: a take: 1}) 'k) -- [0]

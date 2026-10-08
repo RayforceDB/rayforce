@@ -892,7 +892,7 @@ static test_result_t test_eval_select_where_in_guid_nulls(void) {
     TEST_ASSERT_EQ_I(ray_table_nrows(result), 1);
 
     ray_release(result);
-    /* Payload-null GUIDs may come from older files without HAS_NULLS.
+    /* GUID producers can emit payload nulls without HAS_NULLS.
      * The inline distinct probe forces evaluator membership. */
     col->attrs &= (uint8_t)~RAY_ATTR_HAS_NULLS;
     ray_t* bound = ray_eval_str("(set Pg (at t 'g))");

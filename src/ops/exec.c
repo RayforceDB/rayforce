@@ -3729,6 +3729,19 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
             int64_t nr_in = ray_table_nrows(input);
             if (result && !RAY_IS_ERR(result)) {
                 int64_t rc = ray_table_ncols(result);
+                /* A collection projection may change the row count. Use
+                 * its length for scalar broadcasting; unequal non-scalar
+                 * lengths are rejected below, independently of column order. */
+                int64_t broadcast_len = nr_in;
+                bool has_collection = false;
+                for (int64_t c = 0; c < rc; c++) {
+                    ray_t* cv = ray_table_get_col_idx(result, c);
+                    if (!cv || cv->type < 0) continue;
+                    int64_t len = ray_parted_nrows(cv);
+                    if (len == 1) continue;
+                    if (!has_collection) broadcast_len = len;
+                    has_collection = true;
+                }
                 bool has_full = false;
                 if (nr_in != 1) {
                     for (int64_t c = 0; c < rc; c++) {
@@ -3752,6 +3765,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                         if (!op_tree_is_const(g, columns[c])) all_const = false;
                     has_full = all_const;
                 }
+                if (has_collection) has_full = true;
                 /* Every column a scalar: the reductions inside them already
                  * walked the where: selection (exec_reduction), so the
                  * one-row result is final.  Left installed, the selection
@@ -3762,11 +3776,11 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     g->selection = NULL;
                 }
                 /* A LIST here is an atom enlist has no vector for (F32). */
-                for (int64_t c = 0; nr_in != 1 && has_full && c < rc; c++) {
+                for (int64_t c = 0; broadcast_len != 1 && has_full && c < rc; c++) {
                     ray_t* cv = ray_table_get_col_idx(result, c);
                     if (!cv || cv->type < 0 || RAY_IS_PARTED(cv->type) ||
                         cv->type == RAY_MAPCOMMON || cv->len != 1) continue;
-                    ray_t* n_obj = make_i64(nr_in);
+                    ray_t* n_obj = make_i64(broadcast_len);
                     ray_t* wide = n_obj ? ray_take_fn(cv, n_obj) : ray_error("oom", NULL);
                     if (n_obj) ray_release(n_obj);
                     if (!wide || RAY_IS_ERR(wide)) {

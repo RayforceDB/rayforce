@@ -2854,6 +2854,10 @@ static bool match_group_count_emit_filter(ray_t* from_expr, ray_t* where_expr,
         return false;
     ray_t* by = dict_get(inner, "by");
     if (!by) return false;
+    /* The child source is not resolved yet. Concat's text/collection
+     * distinction can change aggregate slot numbering, so do not arm an
+     * index-based filter without that type information. */
+    if (expr_contains_call_named(ray_dict_vals(inner), "concat", 6)) return false;
 
     DICT_VIEW_DECL(iv);
     DICT_VIEW_OPEN(inner, iv);
@@ -2907,7 +2911,7 @@ static bool positive_take_i64(ray_t* expr, int64_t* out) {
     return true;
 }
 
-static bool match_group_desc_count_take(ray_t** dict_elems, int64_t dict_n,
+static bool match_group_desc_count_take(ray_t* tbl, ray_t** dict_elems, int64_t dict_n,
                                         int64_t from_id, int64_t where_id,
                                         int64_t by_id, int64_t take_id,
                                         int64_t asc_id, int64_t desc_id,
@@ -2953,7 +2957,7 @@ static bool match_group_desc_count_take(ray_t** dict_elems, int64_t dict_n,
             kid == take_id || kid == asc_id || kid == desc_id)
             continue;
         ray_t* val = dict_elems[i + 1];
-        if (!is_group_dag_agg_expr(val, NULL))
+        if (!is_group_dag_agg_expr(val, tbl))
             continue;
         ray_t** ae = (ray_t**)ray_data(val);
         uint16_t op = resolve_agg_opcode(ae[0]->i64);
@@ -3147,14 +3151,14 @@ static int64_t select_output_count(ray_t** dict_elems, int64_t dict_n) {
 
 /* Upper bound on the aggregate subcalls a compound output decomposes
  * into (try_decompose_agg_arith extracts each is_group_dag_agg_expr
- * node as one hidden slot).  Pure structural walk — cheap, compile-time. */
-static int64_t count_agg_subexprs(ray_t* expr) {
+ * node as one hidden slot). Use the same source types as the rewrite. */
+static int64_t count_agg_subexprs(ray_t* expr, ray_t* tbl) {
     if (!expr) return 0;
-    if (is_group_dag_agg_expr(expr, NULL)) return 1;
+    if (is_group_dag_agg_expr(expr, tbl)) return 1;
     if (expr->type != RAY_LIST) return 0;
     ray_t** e = (ray_t**)ray_data(expr);
     int64_t n = ray_len(expr), c = 0;
-    for (int64_t i = 0; i < n; i++) c += count_agg_subexprs(e[i]);
+    for (int64_t i = 0; i < n; i++) c += count_agg_subexprs(e[i], tbl);
     return c;
 }
 
@@ -9893,7 +9897,7 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
         ray_group_emit_filter_t prefilter_top_count;
         memset(&prefilter_top_count, 0, sizeof(prefilter_top_count));
         bool prefilter_top_n_match =
-            match_group_desc_count_take(dict_elems, dict_n, from_id, where_id,
+            match_group_desc_count_take(tbl, dict_elems, dict_n, from_id, where_id,
                                         by_id, take_id, asc_id, desc_id,
                                         &prefilter_top_count);
         /* A computed by-key (e.g. `(xbar EventTime …)`) is materialised over
@@ -10150,7 +10154,7 @@ by_dict_done:
         if (kid == from_id || kid == where_id || kid == by_id ||
             kid == take_id || kid == asc_id || kid == desc_id ||
             kid == nearest_id) continue;
-        hidden_max += count_agg_subexprs(dict_elems[i + 1]);
+        hidden_max += count_agg_subexprs(dict_elems[i + 1], tbl);
     }
     if (n_out_max < 1) n_out_max = 1;          /* zero-size alloc guard */
     if (hidden_max < 1) hidden_max = 1;
@@ -10651,7 +10655,7 @@ by_dict_done:
     if (by_expr) {
         ray_group_emit_filter_t cur_emit = ray_group_emit_filter_get();
         if (!cur_emit.enabled &&
-            match_group_desc_count_take(dict_elems, dict_n, from_id, where_id,
+            match_group_desc_count_take(tbl, dict_elems, dict_n, from_id, where_id,
                                         by_id, take_id, asc_id, desc_id,
                                         &pre_top_emit))
             pre_top_emit_matched = true;
