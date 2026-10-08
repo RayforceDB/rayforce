@@ -1107,7 +1107,7 @@ static ray_t* sr_load(int gen) {
 
 /* Run `q` (the table written as T) against a fresh load of each generation:
  * equal formatted results; the generation-2 run materializes exactly
- * `want_mat` columns. */
+ * `want_mat` columns (UINT64_MAX: not checked). */
 static test_result_t sr_same_on(const char* t0, const char* t2, const char* q, uint64_t want_mat) {
     ray_t* out[2] = { NULL, NULL };
     for (int gen = 0; gen < 2; gen++) {
@@ -1116,7 +1116,7 @@ static test_result_t sr_same_on(const char* t0, const char* t2, const char* q, u
         out[gen] = sr_eval(q);
         TEST_ASSERT_FMT(out[gen] && !RAY_IS_ERR(out[gen]), "gen %d: %s: %s", gen, q,
                         out[gen] ? ray_error_msg() : "null");
-        if (gen) {
+        if (gen && want_mat != UINT64_MAX) {   /* UINT64_MAX: answers only */
             ray_enc_counters_t k; ray_enc_counters_get(&k);
             TEST_ASSERT_FMT(k.materialized == want_mat, "%s: %llu materializations, want %llu",
                             q, (unsigned long long)k.materialized, (unsigned long long)want_mat);
@@ -3094,6 +3094,168 @@ static test_result_t test_group_route_hook(void) {
     PASS();
 }
 
+/* ---- Task 11: the direct-array group route and its key prescan ---- */
+static test_result_t test_da_route(void) {
+    ray_group_test_route(1);                       /* skip v2: the legacy ladder chooses DA for a small key range */
+    SR_SAME("(select {s: (sum v) c: (count k) from: T by: g})", 0);
+    SR_SAME("(select {s: (sum f) mx: (max d) from: T where: (> k 1000) by: g})", 0);
+    SR_SAME("(select {c: (count k) a: (avg v) from: T by: {g: g b: b}})", 0);   /* composite gid */
+    SR_SAME("(select {c: (count k) from: T by: u})", 0);                          /* U8 key, 200 groups */
+    ray_group_test_route(0);
+    PASS();
+}
+
+/* The direct-array route's shapes beyond the brief's lines. */
+static test_result_t test_da_route_shapes(void) {
+    ray_group_test_route(1);
+    /* a SYM key: slots over the domain's ids (never ordered by raw id) */
+    SR_SAME("(select {c: (count k) s: (sum v) from: T by: s})", 0);
+    /* SYM inputs (domain order, widths per piece), strlen, FIRST / LAST */
+    SR_SAME("(select {mn: (min s) mx: (max s) l: (avg (strlen s)) f: (first v) z: (last f) from: T by: g})", 0);
+    /* PROD, second moments, ALL / ANY, F32 / DATE / BOOL / U8 inputs */
+    SR_SAME("(select {p: (prod b) vr: (var v) sd: (stddev f) al: (all b) an: (any u) from: T where: (> g 0) by: u})", 0);
+    SR_SAME("(select {mn: (min e) mx: (max d) s: (sum e) a: (avg u) from: T by: {b: b g: g}})", 0);
+    /* a selection whose directory superset range does not fit the slot
+     * budget: the exact range by a scan, the route generation 0 takes */
+    SR_SAME("(select {c: (count k) s: (sum v) from: T where: (< h 262000) by: h})", 0);
+    /* a computed key beside a staged one (the key expression reads k plain) */
+    SR_SAME("(select {c: (count k) s: (sum v) from: T by: {g: g m: (% k 3)}})", 1);
+    /* the directory prescan decodes no key: u is read once, by the
+     * accumulation (COUNT reads no input) */
+    sr_eval_ok("(set T (.db.splayed.get \"" SR_G2 "\"))");
+    ray_enc_counters_reset();
+    ray_t* r = sr_eval("(select {c: (count k) from: T by: u})");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    ray_enc_counters_t kc; ray_enc_counters_get(&kc);
+    TEST_ASSERT_EQ_U(kc.decoded_bytes, 200000);
+    sr_drop(r);
+    ray_group_test_route(0);
+    PASS();
+}
+
+/* R-FAIL: a corrupt chunk of a key or an input the route reads is the
+ * query's error, on every run. */
+static test_result_t test_da_route_error(void) {
+    char path[600];
+    static const struct { const char* col; const char* q; } cs[] = {
+        { "g", "(select {s: (sum v) c: (count k) from: B by: g})" },          /* key, accumulation */
+        { "v", "(select {s: (sum v) c: (count k) from: B by: g})" },          /* input */
+        { "v", "(select {s: (sum v) from: B where: (> k 5) by: {g: g b: b}})" },
+    };
+    ray_group_test_route(1);
+    for (size_t c = 0; c < sizeof cs / sizeof cs[0]; c++) {
+        if (c == 0 || strcmp(cs[c].col, cs[c - 1].col) != 0) sr_make_bad(cs[c].col, path, sizeof path);
+        for (int i = 0; i < 2; i++) {
+            sr_eval_ok("(set B (.db.splayed.get \"" SR_TMP "/bad/\"))");
+            ray_error_clear();
+            ray_t* r = sr_eval(cs[c].q);
+            TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "%s: no error", cs[c].q);
+            TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
+            TEST_ASSERT_TRUE(strstr(ray_error_msg(), path) != NULL);
+            ray_error_free(r);
+        }
+    }
+    /* chunk 2 (rows 131072..196607) of v is corrupt; a selection that ends
+     * before it never reads it */
+    test_result_t t = sr_same_on("(.db.splayed.get \"" SR_G0 "\")", "(.db.splayed.get \"" SR_TMP "/bad/\")",
+                                 "(select {s: (sum v) c: (count k) from: T where: (< k 100000) by: g})", 0);
+    ray_group_test_route(0);
+    if (t.status != TEST_PASS) return t;
+    PASS();
+}
+
+/* Partitioned generation-2 tables (exec_group_parted gives each partition's
+ * segments to the route), and a ragged generation-0 table whose missing
+ * column is a synthetic null segment, answer as their references.  Answers
+ * only: the parted dispatch's own segment reads are Task 14's. */
+static test_result_t test_da_route_parted(void) {
+    for (int gen = 0; gen <= 2; gen += 2)
+        for (int p = 0; p < 3; p++)
+            sr_evalf_ok("(.db.splayed.set \"" SR_TMP "/dp%d/2024.01.0%d/t/\" "
+                        "(table [g v] (list (as 'I16 (%% (til 70000) 7)) (as 'I32 (map (fn [j] (if (== 0 (%% j 11)) 0N j)) (til 70000))))) "
+                        "{compress: %s})", gen, p + 1, gen ? "true" : "false");
+    for (int p = 0; p < 3; p++) {
+        const char* tbl = p == 2 ? "(table [g] (list (as 'I16 (% (til 70000) 7))))"
+                                 : "(table [g v] (list (as 'I16 (% (til 70000) 7)) (til 70000)))";
+        const char* ref = p == 2 ? "(table [g v] (list (as 'I16 (% (til 70000) 7)) (take [0Nl] 70000)))" : tbl;
+        sr_evalf_ok("(.db.splayed.set \"" SR_TMP "/drg/2024.01.0%d/t/\" %s {compress: false})", p + 1, tbl);
+        sr_evalf_ok("(.db.splayed.set \"" SR_TMP "/drf/2024.01.0%d/t/\" %s {compress: false})", p + 1, ref);
+    }
+    ray_group_test_route(1);
+    static const char* const q[] = { "(select {s: (sum v) c: (count v) mx: (max v) from: T by: g})",
+                                     "(select {a: (avg v) f: (first v) from: T where: (> v 100) by: g})", NULL };
+    for (int i = 0; q[i]; i++) {
+        test_result_t r = sr_same_on("(.db.parted.get \"" SR_TMP "/dp0\" 't)", "(.db.parted.get \"" SR_TMP "/dp2\" 't)", q[i], UINT64_MAX);
+        if (r.status == TEST_PASS)
+            r = sr_same_on("(.db.parted.get \"" SR_TMP "/drf\" 't)", "(.db.parted.get \"" SR_TMP "/drg\" 't)", q[i], UINT64_MAX);
+        if (r.status != TEST_PASS) { ray_group_test_route(0); return r; }
+    }
+    ray_group_test_route(0);
+    PASS();
+}
+
+/* The sparse-dynamic count route (a top-N by count over one key, reached
+ * when the direct array declines): staged keys and inputs by range. */
+static test_result_t test_sp_dyn_route(void) {
+    static const char* const q2[] = {
+        "(select {c: (count k) from: T by: s desc: c take: 3})",                     /* SYM, count only */
+        "(select {c: (count k) s: (sum k) a: (avg g) from: T by: u desc: c take: 3})", /* sums, first pass */
+        "(select {c: (count k) s: (sum k) from: T by: s desc: c take: 3})",          /* SYM: the sum pass */
+        "(select {c: (count k) s: (sum h) from: T where: (> g 0) by: s desc: c take: 2})",
+        NULL };
+    ray_group_test_route(2);                       /* skip v2 and the direct array */
+    for (int i = 0; q2[i]; i++) SR_SAME(q2[i], 0);
+    ray_group_test_route(1);
+    SR_SAME("(select {c: (count k) from: T by: h desc: c take: 3})", 0);   /* the DA range does not fit */
+    /* the parallel fill (262144 rows or more) walks the key */
+    sr_eval_ok("(set W (table [s x] (list (take ['a 'b 'c 'd 'e 'f 'g] 300000) (til 300000))))");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/w0/\" W {compress: false})");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/w2/\" W {compress: true})");
+    ray_group_test_route(2);
+    test_result_t t = sr_same_on("(.db.splayed.get \"" SR_TMP "/w0/\")", "(.db.splayed.get \"" SR_TMP "/w2/\")",
+                                 "(select {c: (count x) from: T by: s desc: c take: 3})", 0);
+    if (t.status != TEST_PASS) { ray_group_test_route(0); return t; }
+    /* R-FAIL on both passes and the parallel fill */
+    char path[600];
+    static const struct { const char* col; const char* q; } cs[] = {
+        { "s", "(select {c: (count k) from: B by: s desc: c take: 3})" },
+        { "s", "(select {c: (count k) s: (sum k) from: B by: s desc: c take: 3})" },
+        { "k", "(select {c: (count k) s: (sum k) from: B by: s desc: c take: 3})" },
+        { "k", "(select {c: (count k) s: (sum k) from: B by: u desc: c take: 3})" },
+    };
+    for (size_t c = 0; c < sizeof cs / sizeof cs[0]; c++) {
+        if (c == 0 || strcmp(cs[c].col, cs[c - 1].col) != 0) sr_make_bad(cs[c].col, path, sizeof path);
+        for (int i = 0; i < 2; i++) {
+            sr_eval_ok("(set B (.db.splayed.get \"" SR_TMP "/bad/\"))");
+            ray_error_clear();
+            ray_t* r = sr_eval(cs[c].q);
+            TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "%s: no error", cs[c].q);
+            TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
+            TEST_ASSERT_TRUE(strstr(ray_error_msg(), path) != NULL);
+            ray_error_free(r);
+        }
+    }
+    /* the parallel fill's range error */
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/wbad/\" W {compress: true})");
+    char dir[512];
+    TEST_ASSERT_TRUE(ray_splay_resolve_dir(ray_test_tmp(SR_TMP "/wbad/"), dir, sizeof dir) == RAY_OK);
+    snprintf(path, sizeof path, "%s/s", dir);
+    uint64_t off = sr_dirent_offset(path, 2);
+    TEST_ASSERT_TRUE(off != 0);
+    sr_patch(path, (long)off + 6, 1);
+    for (int i = 0; i < 2; i++) {
+        sr_eval_ok("(set B (.db.splayed.get \"" SR_TMP "/wbad/\"))");
+        ray_error_clear();
+        ray_t* r = sr_eval("(select {c: (count x) from: B by: s desc: c take: 3})");
+        TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+        TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
+        TEST_ASSERT_TRUE(strstr(ray_error_msg(), path) != NULL);
+        ray_error_free(r);
+    }
+    ray_group_test_route(0);
+    PASS();
+}
+
 const test_entry_t scanrange_entries[] = {
     { "scanrange/walk_gen0_zero_copy",     test_walk_gen0_zero_copy,     sr_setup,    sr_teardown },
     { "scanrange/walk_gen2_vectors",       test_walk_gen2_vectors,       sr_setup,    sr_teardown },
@@ -3172,5 +3334,10 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/scalar_route_f64_bits", test_scalar_route_f64_bits, srr_setup, srr_teardown },
     { "scanrange/scalar_route_error", test_scalar_route_error, srr_setup, srr_teardown },
     { "scanrange/group_route_hook",   test_group_route_hook,   srr_setup, srr_teardown },
+    { "scanrange/da_route",           test_da_route,           srr_setup, srr_teardown },
+    { "scanrange/da_route_shapes",    test_da_route_shapes,    srr_setup, srr_teardown },
+    { "scanrange/da_route_error",     test_da_route_error,     srr_setup, srr_teardown },
+    { "scanrange/da_route_parted",    test_da_route_parted,    srr_setup, srr_teardown },
+    { "scanrange/sp_dyn_route",       test_sp_dyn_route,       srr_setup, srr_teardown },
     { NULL, NULL, NULL, NULL },
 };

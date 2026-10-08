@@ -7654,6 +7654,28 @@ static void radix_v2_phase2_fn(void* ctx, uint32_t worker_id,
  * Parallel direct-array accumulation for low-cardinality single integer key
  * ============================================================================ */
 
+/* R-WALK of [start, end) over n sources (ray_col_walk), skipping the
+ * morsels a selection rejects whole: those rows are never read, so a range
+ * error there never surfaces.  NULL or an owned error. */
+static ray_t* group_sel_walk(ray_col_src_t* const* srcs, const void* const* plain, uint32_t n,
+                             ray_t* rowsel, int64_t start, int64_t end,
+                             void* ctx, uint32_t wid, ray_col_piece_fn fn) {
+    const uint8_t* flags = rowsel ? ray_rowsel_flags(rowsel) : NULL;
+    if (!flags) return ray_col_walk(srcs, plain, n, start, end, false, ctx, wid, fn);
+    const int64_t M = RAY_MORSEL_ELEMS;
+    for (int64_t r = start; r < end; ) {
+        while (r < end && flags[r / M] == RAY_SEL_NONE) r = (r / M + 1) * M;
+        if (r >= end) break;
+        int64_t q = r;
+        while (q < end && flags[q / M] != RAY_SEL_NONE) q = (q / M + 1) * M;
+        if (q > end) q = end;
+        ray_t* err = ray_col_walk(srcs, plain, n, r, q, false, ctx, wid, fn);
+        if (err) return err;
+        r = q;
+    }
+    return NULL;
+}
+
 /* Parallel min/max scan for direct-array key range detection */
 typedef struct {
     const void* key_data;
@@ -7668,11 +7690,20 @@ typedef struct {
      * contributing row count, direct-array state would be superlinear. */
     int64_t          span_budget;
     _Atomic(int)*    abort_flag;
+    /* Range reads (R-WALK).  src NULL: key_data is the whole column (row
+     * base 0).  A staged key (generation 2) is read by pieces: key_data and
+     * key_attrs then describe the piece starting at row_base.  scan_chunk:
+     * NULL scans every row; else only the directory chunks marked 1 (the
+     * others' bounds came from their statistics). */
+    int64_t          row_base;
+    ray_col_src_t*   src;
+    const uint8_t*   scan_chunk;
+    ray_scan_fail_t* fail;
 } minmax_ctx_t;
 
-static void minmax_scan_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
-    minmax_ctx_t* c = (minmax_ctx_t*)ctx;
+static void minmax_scan_body(minmax_ctx_t* c, uint32_t worker_id, int64_t start, int64_t end) {
     uint32_t wid = worker_id % c->n_workers;
+    const int64_t rb = c->row_base;
     const int64_t* match_idx = c->match_idx;
     int64_t kmin = INT64_MAX, kmax = INT64_MIN;
     int8_t t = c->key_type;
@@ -7701,7 +7732,7 @@ static void minmax_scan_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t
                 } \
                 int64_t r = match_idx ? match_idx[i] : i; \
                 if (!match_idx && c->rowsel && !group_rowsel_pass(c->rowsel, r)) continue; \
-                int64_t v = (int64_t)CAST kd[r]; \
+                int64_t v = (int64_t)CAST kd[r - rb]; \
                 if (t == RAY_SYM && v == 0) continue; \
                 if (v < kmin) kmin = v; \
                 if (v > kmax) kmax = v; \
@@ -7730,6 +7761,41 @@ minmax_done:
     /* Merge with existing per-worker values (a worker may process multiple morsels) */
     if (kmin < c->per_worker_min[wid]) c->per_worker_min[wid] = kmin;
     if (kmax > c->per_worker_max[wid]) c->per_worker_max[wid] = kmax;
+}
+
+/* One piece of a staged key: the body over [b, e) with the piece's base
+ * and SYM width. */
+static void minmax_piece(void* ctx, uint32_t wid, int64_t b, int64_t e, const ray_col_piece_t* p) {
+    minmax_ctx_t local = *(minmax_ctx_t*)ctx;
+    local.key_data = p[0].data;
+    local.key_attrs = p[0].attrs;
+    local.row_base = b;
+    minmax_scan_body(&local, wid, b, e);
+}
+
+static void minmax_scan_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
+    minmax_ctx_t* c = (minmax_ctx_t*)ctx;
+    if (!c->src) { minmax_scan_body(c, worker_id, start, end); return; }
+    if (ray_scan_fail_skip(c->fail, start)) return;
+    ray_col_src_t* const srcs[1] = { c->src };
+    const void* const plain[1] = { NULL };
+    ray_t* err = NULL;
+    for (int64_t lo = start; lo < end && !err; ) {
+        int64_t hi = end;
+        if (c->scan_chunk) {
+            /* the run of chunks to scan from lo, clipped to the task */
+            int64_t ch = lo / RAY_ENC_CHUNK;
+            if (!c->scan_chunk[ch]) { lo = (ch + 1) * RAY_ENC_CHUNK; continue; }
+            int64_t q = ch + 1;
+            while (q * RAY_ENC_CHUNK < end && c->scan_chunk[q]) q++;
+            if (q * RAY_ENC_CHUNK < hi) hi = q * RAY_ENC_CHUNK;
+        }
+        if (atomic_load_explicit(c->abort_flag, memory_order_relaxed)) break;
+        err = group_sel_walk(srcs, plain, 1, c->match_idx ? NULL : c->rowsel,
+                             lo, hi, c, worker_id, minmax_piece);
+        lo = hi;
+    }
+    if (err) ray_scan_fail_note(c->fail, start, err);
 }
 
 typedef union { double f; int64_t i; } da_val_t;
@@ -8102,7 +8168,28 @@ typedef struct {
      * entry off the mapping instead of pinning (and checking null) per row. */
     ray_sym_domain_raw_t* agg_raw;
     uint8_t*       agg_raw_ok;
+    /* Range reads (R-WALK).  A plain context (staged false) reads whole
+     * columns: row_base 0, srcs/plain/piece_attrs/fail unused.  A staged
+     * one (some key or input is generation 2) runs each task through
+     * ray_col_walk over n_src sources, the keys first, then the inputs,
+     * then the binary aggregates' y-sides: key_ptrs / agg_ptrs / agg_ptrs2
+     * then address row row_base of the piece, and piece_attrs[i] is source
+     * i's SYM width there.  Rows stay absolute (selection, FIRST/LAST,
+     * fused-product terms); only the piece reads subtract row_base. */
+    int64_t          row_base;
+    ray_col_src_t**  srcs;         /* [n_src]; NULL: nothing read (COUNT, fused, absent) */
+    const void**     plain;        /* [n_src]: a ready source's base, NULL for a staged one */
+    uint32_t         n_src;
+    const uint8_t*   piece_attrs;
+    ray_scan_fail_t* fail;
+    bool             staged;
 } da_ctx_t;
+
+/* SYM attrs (width) of agg input a: the piece's when staged. */
+static inline uint8_t da_agg_attrs(const da_ctx_t* c, uint32_t a) {
+    if (c->piece_attrs) return c->piece_attrs[c->n_keys + a];
+    return c->agg_cols[a] ? c->agg_cols[a]->attrs : 0;
+}
 
 typedef struct {
     uint8_t*   used;
@@ -8357,6 +8444,8 @@ static inline int da_key_is_unsigned(int8_t t) {
 }
 
 /* Composite GID from multi-key. Planning bounds total_slots to INT32_MAX. */
+/* `r` is the row within the key pieces (r - row_base; the absolute row for
+ * a plain context). */
 static inline int32_t da_composite_gid(da_ctx_t* c, int64_t r) {
     int32_t gid = 0;
     for (uint32_t k = 0; k < c->n_keys; k++) {
@@ -8731,23 +8820,8 @@ static void scalar_run_staged(scalar_ctx_t* c, uint32_t wid, int64_t start, int6
     if (!c->staged) { body(c, wid, start, end); return; }
     if (ray_scan_fail_skip(c->fail, start)) return;
     scalar_piece_ctx_t pc = { c, body };
-    const uint8_t* flags = c->rowsel ? ray_rowsel_flags(c->rowsel) : NULL;
-    const int64_t M = RAY_MORSEL_ELEMS;
-    ray_t* err = NULL;
-    for (int64_t r = start; r < end && !err; ) {
-        if (flags) {
-            while (r < end && flags[r / M] == RAY_SEL_NONE) r = (r / M + 1) * M;
-            if (r >= end) break;
-        }
-        int64_t q = end;
-        if (flags) {
-            q = r;
-            while (q < end && flags[q / M] != RAY_SEL_NONE) q = (q / M + 1) * M;
-            if (q > end) q = end;
-        }
-        err = ray_col_walk(c->srcs, c->plain, c->n_aggs, r, q, false, &pc, wid, scalar_piece);
-        r = q;
-    }
+    ray_t* err = group_sel_walk((ray_col_src_t* const*)c->srcs, c->plain, c->n_aggs, c->rowsel,
+                                start, end, &pc, wid, scalar_piece);
     if (err) ray_scan_fail_note(c->fail, start, err);
 }
 
@@ -9146,8 +9220,20 @@ static void scalar_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
  * is the empty string, length 0).  SYM: null is id 0; a FILE-domain entry's
  * length is the u32 prefix in the pinned mapping; anything else resolves
  * as group_strlen_at_cached does. */
-static inline int64_t da_strlen_at(const da_ctx_t* c, uint32_t a, int64_t r) {
+static inline int64_t da_strlen_at(const da_ctx_t* c, uint32_t a, int64_t r, int64_t rr) {
     const ray_t* col = c->agg_cols[a];
+    if (c->piece_attrs && col->type == RAY_SYM) {
+        /* staged context: the id from the piece (row rr); agg_cols[a] is
+         * the column or its stand-in, carrying the domain */
+        int64_t sid = ray_read_sym(c->agg_ptrs[a], rr, RAY_SYM, da_agg_attrs(c, a));
+        if (sid == 0) return 0;
+        if (c->agg_raw_ok && c->agg_raw_ok[a] && sid > 0 && sid < c->agg_raw[a].count) {
+            size_t sl;
+            (void)ray_sym_domain_raw_str(&c->agg_raw[a], sid, &sl);
+            return (int64_t)sl;
+        }
+        return sym_strlen_raw(c->agg_ptrs[a], rr, da_agg_attrs(c, a), ray_sym_vec_domain((ray_t*)col));
+    }
     if (col->type == RAY_STR) {
         const ray_str_t* elems; const char* pool; (void)pool;
         str_resolve(col, &elems, &pool);
@@ -9183,7 +9269,9 @@ static inline bool da_sym_lex_lt(const da_ctx_t* c, uint32_t a_idx, int64_t x, i
     return sym_lex_lt(ray_sym_vec_domain(c->agg_cols[a_idx]), x, y);
 }
 
-static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64_t r) {
+/* Row r (absolute: selection, FIRST/LAST order, fused-product terms) is
+ * read from the input pieces at rr = r - row_base. */
+static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64_t r, int64_t rr) {
     uint8_t n_aggs = c->n_aggs;
     acc->count[gid]++;
     size_t base = (size_t)gid * n_aggs;
@@ -9205,11 +9293,11 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
             }
             if (!c->agg_ptrs[a]) continue;
             if (c->agg_strlen && c->agg_strlen[a]) {
-                acc->sum[idx].i = wrap_add_i64(acc->sum[idx].i, da_strlen_at(c, a, r));
+                acc->sum[idx].i = wrap_add_i64(acc->sum[idx].i, da_strlen_at(c, a, r, rr));
                 if (nn) nn[idx]++;
             } else if (f64m & ((uint64_t)1 << a)) {
                 /* NaN payload = null, skip from sum. */
-                double v = group_fp_at(c->agg_ptrs[a], c->agg_types[a], r);
+                double v = group_fp_at(c->agg_ptrs[a], c->agg_types[a], rr);
                 if (RAY_LIKELY(v == v)) { acc->sum[idx].f += v; if (nn) nn[idx]++; }
             } else {
                 /* NULL_I* sentinel = null, skip from sum.  Only paid when
@@ -9217,8 +9305,7 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
                  * INT_MIN value in a HAS_NULLS column is indistinguishable
                  * from a null and is dropped — this is the standard cost of
                  * sentinel-based null encoding for integers. */
-                uint8_t v_attrs = c->agg_cols[a] ? c->agg_cols[a]->attrs : 0;
-                int64_t v = read_col_i64(c->agg_ptrs[a], r, c->agg_types[a], v_attrs);
+                int64_t v = read_col_i64(c->agg_ptrs[a], rr, c->agg_types[a], da_agg_attrs(c, a));
                 if (RAY_LIKELY(!((inm >> a) & 1) || v != c->agg_int_null_sentinel[a])) {
                     if (acc->sum_hi) ray_i128_add(&acc->sum_hi[idx], (uint64_t*)&acc->sum[idx].i, v);
                     else acc->sum[idx].i = wrap_add_i64(acc->sum[idx].i, v);
@@ -9257,11 +9344,10 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
             fv = prod_val_f64(&c->agg_prod[a], r);
             iv = (int64_t)fv;
         } else if (c->agg_strlen && c->agg_strlen[a]) {
-            iv = da_strlen_at(c, a, r);
+            iv = da_strlen_at(c, a, r, rr);
             fv = (double)iv;
         } else {
-            uint8_t attrs = c->agg_cols[a] ? c->agg_cols[a]->attrs : 0;
-            da_read_val(c->agg_ptrs[a], c->agg_types[a], attrs, r, &fv, &iv);
+            da_read_val(c->agg_ptrs[a], c->agg_types[a], da_agg_attrs(c, a), rr, &fv, &iv);
         }
         uint16_t op = c->agg_ops[a];
         bool is_f = group_fp_type(c->agg_types[a]);
@@ -9298,7 +9384,7 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
              * finalises PEARSON/COV/WAVG/WSUM from (Σx,Σx²,Σy,Σy²,Σxy,n). */
             double xv = is_f ? fv : (double)iv;
             double yv; int64_t yi;
-            da_read_val(c->agg_ptrs2[a], c->agg_types2[a], 0, r, &yv, &yi);
+            da_read_val(c->agg_ptrs2[a], c->agg_types2[a], 0, rr, &yv, &yi);
             bool y_is_f = group_fp_type(c->agg_types2[a]);
             double yval = y_is_f ? yv : (double)yi;
             bool y_null = y_is_f ? !(yval == yval) : false;
@@ -9378,9 +9464,9 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
     if (last_advanced)  acc->last_row[gid]  = r;
 }
 
-static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
-    da_ctx_t* c = (da_ctx_t*)ctx;
+static void da_accum_body(da_ctx_t* c, uint32_t worker_id, int64_t start, int64_t end) {
     da_accum_t* acc = &c->accums[worker_id];
+    const int64_t rb = c->row_base;   /* pieces: rows are read at r - rb */
     uint8_t n_aggs = c->n_aggs;
     uint8_t n_keys = c->n_keys;
     const int64_t* match_idx = c->match_idx;
@@ -9389,6 +9475,7 @@ static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t en
      * Templated by key element size: the entire loop is stamped out per width
      * so the compiler generates direct movzbl/movzwl/movl/movq — zero dispatch. */
     #define DA_PF_DIST 8
+    /* The prefetch row stays below `end`, the piece end when staged. */
     #define DA_SINGLE_KEY_LOOP(KTYPE, KCAST) \
     do { \
         const KTYPE* kp = (const KTYPE*)c->key_ptrs[0]; \
@@ -9399,15 +9486,15 @@ static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t en
             if (!match_idx && c->rowsel && !group_rowsel_pass(c->rowsel, r)) continue; \
             if (da_pf && RAY_LIKELY(i + DA_PF_DIST < end)) { \
                 int64_t pf_r = match_idx ? match_idx[i + DA_PF_DIST] : (i + DA_PF_DIST); \
-                int64_t pfk = (int64_t)KCAST kp[pf_r]; \
+                int64_t pfk = (int64_t)KCAST kp[pf_r - rb]; \
                 if (c->key_types[0] == RAY_SYM && pfk == 0) pfk = kmin; \
                 __builtin_prefetch(&acc->count[(int32_t)(pfk - kmin)], 1, 1); \
                 if (acc->sum) __builtin_prefetch( \
                     &acc->sum[(size_t)(int32_t)(pfk - kmin) * n_aggs], 1, 1); \
             } \
-            int64_t kv = (int64_t)KCAST kp[r]; \
+            int64_t kv = (int64_t)KCAST kp[r - rb]; \
             if (c->key_types[0] == RAY_SYM && kv == 0) kv = kmin; \
-            da_accum_row(c, acc, (int32_t)(kv - kmin), r); \
+            da_accum_row(c, acc, (int32_t)(kv - kmin), r, r - rb); \
         } \
     } while (0)
 
@@ -9444,11 +9531,11 @@ static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t en
             if (!match_idx && c->rowsel && !group_rowsel_pass(c->rowsel, r)) continue; \
             if (_da_pf && RAY_LIKELY(i + DA_PF_DIST < end)) { \
                 int64_t pf_r = match_idx ? match_idx[i + DA_PF_DIST] : (i + DA_PF_DIST); \
-                int32_t pf_gid = GID_FN(pf_r); \
+                int32_t pf_gid = GID_FN(pf_r - rb); \
                 __builtin_prefetch(&acc->count[pf_gid], 1, 1); \
                 if (acc->sum) __builtin_prefetch(&acc->sum[(size_t)pf_gid * n_aggs], 1, 1); \
             } \
-            da_accum_row(c, acc, GID_FN(r), r); \
+            da_accum_row(c, acc, GID_FN(r - rb), r, r - rb); \
         } \
     } while (0)
 
@@ -9513,6 +9600,58 @@ static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t en
     #undef DA_PF_DIST
 }
 
+typedef void (*da_body_fn)(da_ctx_t*, uint32_t, int64_t, int64_t);
+typedef struct {
+    da_ctx_t*  c;
+    da_body_fn body;
+} da_piece_ctx_t;
+
+/* One piece [b, e): a copy of the context whose key and input pointers
+ * address row b, with the pieces' SYM widths. */
+static void da_piece(void* ctx, uint32_t wid, int64_t b, int64_t e, const ray_col_piece_t* p) {
+    da_piece_ctx_t* pc = (da_piece_ctx_t*)ctx;
+    da_ctx_t local = *pc->c;
+    uint32_t nk = local.n_keys, na = local.n_aggs;
+    void* kp[nk ? nk : 1];
+    uint8_t kat[nk ? nk : 1], kesz[nk ? nk : 1];
+    void* ap[na ? na : 1];
+    void* ap2[na ? na : 1];
+    uint8_t attrs[local.n_src ? local.n_src : 1];
+    for (uint32_t i = 0; i < local.n_src; i++) attrs[i] = p[i].attrs;
+    for (uint32_t k = 0; k < nk; k++) {
+        kp[k] = (void*)p[k].data;
+        kat[k] = local.key_types[k] == RAY_SYM ? p[k].attrs : local.key_attrs[k];
+        kesz[k] = ray_sym_elem_size(local.key_types[k], kat[k]);
+    }
+    for (uint32_t a = 0; a < na; a++) {
+        ap[a] = (void*)p[nk + a].data;          /* NULL for an input without a source */
+        ap2[a] = (void*)p[nk + na + a].data;
+    }
+    local.row_base = b;
+    local.key_ptrs = kp;
+    local.key_attrs = kat;
+    local.key_esz = kesz;
+    local.agg_ptrs = ap;
+    local.agg_ptrs2 = ap2;
+    local.piece_attrs = attrs;
+    pc->body(&local, wid, b, e);
+}
+
+/* R-WALK driver: a plain context runs `body` over [start, end) as today; a
+ * staged one by pieces (morsels a selection rejects whole are not read),
+ * and a range error is noted keyed by the task's first row. */
+static void da_run_staged(da_ctx_t* c, uint32_t wid, int64_t start, int64_t end, da_body_fn body) {
+    if (!c->staged) { body(c, wid, start, end); return; }
+    if (ray_scan_fail_skip(c->fail, start)) return;
+    da_piece_ctx_t pc = { c, body };
+    ray_t* err = group_sel_walk(c->srcs, c->plain, c->n_src, c->rowsel, start, end, &pc, wid, da_piece);
+    if (err) ray_scan_fail_note(c->fail, start, err);
+}
+
+static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
+    da_run_staged((da_ctx_t*)ctx, worker_id, start, end, da_accum_body);
+}
+
 /* ---- slot-partitioned accumulate --------------------------------------
  * For a pool with more workers than the per-worker slot budget allows.
  * Pass 1 (nw tasks, contiguous row ranges in order): each row's group is
@@ -9560,7 +9699,7 @@ static void da_part_scatter_fn(void* raw, uint32_t wid, int64_t task, int64_t ta
     for (int64_t i = start; i < end; i++) {
         int64_t r = match_idx ? match_idx[i] : i;
         if (!match_idx && c->rowsel && !group_rowsel_pass(c->rowsel, r)) continue;
-        uint32_t t = (uint32_t)da_composite_gid(c, r) / p->span;
+        uint32_t t = (uint32_t)da_composite_gid(c, r) / p->span;   /* plain context only */
         if (!da_bucket_push(&mine[t], (int32_t)r)) {
             atomic_store_explicit(&p->oom, 1, memory_order_relaxed);
             return;
@@ -9578,7 +9717,7 @@ static void da_part_drain_fn(void* raw, uint32_t wid, int64_t start, int64_t end
         const da_bucket_t* b = &p->buckets[(size_t)w * p->k + t];
         for (int64_t j = 0; j < b->len; j++) {
             int64_t r = b->data[j];
-            da_accum_row(c, acc, da_composite_gid(c, r), r);
+            da_accum_row(c, acc, da_composite_gid(c, r), r, r);
         }
     }
 }
@@ -11709,6 +11848,16 @@ typedef struct {
     ray_t*         match_idx_block;
     ray_t*         vla_hdr;
     ray_group_emit_filter_t emit_filter;
+    /* Range reads.  staged: the key or some input is generation 2 and not
+     * materialized.  key_src / agg_src[a] are then the staged sources (NULL
+     * for a plain one, read in place at its absolute row); the parallel
+     * fill walks the key (R-WALK), the serial passes read every staged
+     * source through its cursor (R-SPARSE: rows ascend within a pass).
+     * key_vecs / agg_vecs hold a zero-length stand-in (type, SYM width and
+     * domain) for each staged column. */
+    bool           staged;
+    ray_col_src_t* key_src;
+    ray_col_src_t** agg_src;
 } sp_dyn_ctx_t;
 
 /* Parallel dense-count fill for the sp_dyn pure-count case: each worker
@@ -11727,22 +11876,24 @@ typedef struct {
     const int64_t* match_idx;
     ray_t*         rowsel;
     _Atomic(int)   fail;
+    /* Range reads (R-WALK): src NULL reads key_data as the whole column; a
+     * staged key (key_data NULL) by pieces.  Range errors go to scan_fail. */
+    ray_col_src_t*   src;
+    ray_scan_fail_t* scan_fail;
 } sp_dyn_pcount_ctx_t;
 
-static void sp_dyn_pcount_fn(void* vctx, uint32_t wid, int64_t start,
-                             int64_t end) {
-    sp_dyn_pcount_ctx_t* c = (sp_dyn_pcount_ctx_t*)vctx;
+/* Rows [start, end), the key read from kd (its row rb) at width esz. */
+RAY_INLINE void sp_dyn_pcount_body(sp_dyn_pcount_ctx_t* c, const void* kd, uint8_t esz, int64_t rb,
+                               uint32_t wid, int64_t start, int64_t end) {
     if (atomic_load_explicit(&c->fail, memory_order_relaxed)) return;
     uint32_t* my = c->counts + (size_t)(wid % c->n_workers) * c->bound;
     const int64_t* match_idx = c->match_idx;
     const uint64_t bound = c->bound;
-    const uint8_t esz = c->key_esz;
-    const void* kd = c->key_data;
     for (int64_t i = start; i < end; i++) {
         int64_t r = match_idx ? match_idx[i] : i;
         if (!match_idx && c->rowsel && !group_rowsel_pass(c->rowsel, r))
             continue;
-        int64_t key = read_by_esz(kd, r, esz);
+        int64_t key = read_by_esz(kd, r - rb, esz);
         if ((uint64_t)key >= bound) {   /* negative wraps huge — caught too */
             atomic_store_explicit(&c->fail, 1, memory_order_relaxed);
             return;
@@ -11751,8 +11902,53 @@ static void sp_dyn_pcount_fn(void* vctx, uint32_t wid, int64_t start,
     }
 }
 
+static void sp_dyn_pcount_piece(void* ctx, uint32_t wid, int64_t b, int64_t e, const ray_col_piece_t* p) {
+    sp_dyn_pcount_ctx_t* c = (sp_dyn_pcount_ctx_t*)ctx;
+    sp_dyn_pcount_body(c, p[0].data, ray_sym_elem_size(c->src->type, p[0].attrs), b, wid, b, e);
+}
+
+static void sp_dyn_pcount_fn(void* vctx, uint32_t wid, int64_t start,
+                             int64_t end) {
+    sp_dyn_pcount_ctx_t* c = (sp_dyn_pcount_ctx_t*)vctx;
+    if (!c->src) { sp_dyn_pcount_body(c, c->key_data, c->key_esz, 0, wid, start, end); return; }
+    if (atomic_load_explicit(&c->fail, memory_order_relaxed)) return;
+    if (ray_scan_fail_skip(c->scan_fail, start)) return;
+    ray_col_src_t* const srcs[1] = { c->src };
+    const void* const plain[1] = { NULL };
+    ray_t* err = group_sel_walk(srcs, plain, 1, c->match_idx ? NULL : c->rowsel,
+                                start, end, c, wid, sp_dyn_pcount_piece);
+    if (err) ray_scan_fail_note(c->scan_fail, start, err);
+}
+
+/* R-SPARSE reads of row r through a staged source's cursor: the view
+ * covering r, NULL with *err set (the first error kept) on failure. */
+static inline const ray_col_range_t* sp_cur_view(ray_col_cursor_t* cur, int64_t r, ray_t** err) {
+    const ray_col_range_t* v = NULL;
+    ray_t* e = ray_col_cursor_at(cur, r, &v);
+    if (e) { if (!*err) *err = e; else ray_error_free(e); return NULL; }
+    return v;
+}
+static inline int64_t sp_cur_key(ray_col_cursor_t* cur, int64_t r, ray_t** err) {
+    const ray_col_range_t* v = sp_cur_view(cur, r, err);
+    return v ? read_by_esz(v->data, r - v->start, ray_sym_elem_size(v->type, v->attrs)) : 0;
+}
+static inline double sp_cur_f64(ray_col_cursor_t* cur, int64_t r, int8_t t, ray_t** err) {
+    const ray_col_range_t* v = sp_cur_view(cur, r, err);
+    return v ? group_fp_at(v->data, t, r - v->start) : 0.0;
+}
+static inline int64_t sp_cur_i64(ray_col_cursor_t* cur, int64_t r, int8_t t, ray_t** err) {
+    const ray_col_range_t* v = sp_cur_view(cur, r, err);
+    return v ? read_col_i64(v->data, r - v->start, t, v->attrs) : 0;
+}
+static inline int64_t sp_cur_strlen(ray_col_cursor_t* cur, int64_t r, ray_t** err) {
+    const ray_col_range_t* v = sp_cur_view(cur, r, err);
+    return v ? sym_strlen_raw(v->data, r - v->start, v->attrs, v->dom ? v->dom : cur->src->dom) : 0;
+}
+
+/* sp_cur: a staged context's cursors (the key's first, then one per input;
+ * a plain source's slot unused); NULL for a plain context. */
 static ray_t* __attribute__((noinline))
-exec_group_sp_dyn_emit(const sp_dyn_ctx_t* c) {
+exec_group_sp_dyn_emit_run(const sp_dyn_ctx_t* c, ray_col_cursor_t* sp_cur) {
     ray_graph_t*   g          = c->g;
     ray_op_ext_t*  ext        = c->ext;
     void**         key_data   = c->key_data;
@@ -11780,6 +11976,8 @@ exec_group_sp_dyn_emit(const sp_dyn_ctx_t* c) {
     ray_t*         match_idx_block = c->match_idx_block;
     ray_t*         vla_hdr    = c->vla_hdr;
     ray_group_emit_filter_t emit_filter = c->emit_filter;
+    ray_col_src_t* const* agg_src = c->agg_src;
+    ray_t* sp_err = NULL;   /* a staged range read's error: the answer */
 
                 uint64_t cap = key_esz == 1 ? 256u
                              : key_esz == 2 ? (1u << 16)
@@ -11835,6 +12033,8 @@ exec_group_sp_dyn_emit(const sp_dyn_ctx_t* c) {
                         uint32_t* pc = (uint32_t*)scratch_calloc(&pc_hdr,
                             (size_t)dnw * bound * sizeof(uint32_t));
                         if (pc) {
+                            ray_scan_fail_t pfail;
+                            ray_scan_fail_init(&pfail);
                             sp_dyn_pcount_ctx_t pctx = {
                                 .key_data  = key_data[0],
                                 .key_esz   = key_esz,
@@ -11844,10 +12044,17 @@ exec_group_sp_dyn_emit(const sp_dyn_ctx_t* c) {
                                 .match_idx = match_idx,
                                 .rowsel    = rowsel,
                                 .fail      = 0,
+                                .src       = c->key_src,
+                                .scan_fail = &pfail,
                             };
+                            if (c->key_src) ray_col_src_advise(c->key_src, 0, n_scan);
                             ray_pool_dispatch(dp, sp_dyn_pcount_fn, &pctx,
                                               n_scan);
-                            if (!atomic_load_explicit(&pctx.fail,
+                            /* R-FAIL: a staged key's range error is the answer */
+                            if (c->key_src) sp_err = ray_scan_fail_finish(&pfail, dp);
+                            if (sp_err) {
+                                dyn_ok = false;
+                            } else if (!atomic_load_explicit(&pctx.fail,
                                                       memory_order_relaxed)) {
                                 /* Grow range_count to the bound, then merge
                                  * worker arrays with saturation. */
@@ -11884,10 +12091,25 @@ exec_group_sp_dyn_emit(const sp_dyn_ctx_t* c) {
                     }
                 }
 
+/* Row reads of the passes below.  DYN_ST (defined at each pass) 0: whole
+ * columns at the absolute row, exactly the plain code; 1: a staged source
+ * through its cursor (R-SPARSE, rows ascending), its error kept in sp_err. */
+#define DYN_KEY(r) ((DYN_ST && c->key_src) ? sp_cur_key(&sp_cur[0], (r), &sp_err)      \
+                                           : read_by_esz(key_data[0], (r), key_esz))
+#define DYN_HAS(a) (agg_ptrs[a] || (DYN_ST && agg_src[a]))
+#define DYN_STRLEN(a, r) ((DYN_ST && agg_src[a]) ? sp_cur_strlen(&sp_cur[1 + (a)], (r), &sp_err) \
+    : group_strlen_at_cached(agg_vecs[a], (r), strlen_sym_strings, strlen_sym_count))
+#define DYN_F64(a, r) ((DYN_ST && agg_src[a]) ? sp_cur_f64(&sp_cur[1 + (a)], (r), agg_types[a], &sp_err) \
+    : group_fp_at(agg_ptrs[a], agg_types[a], (r)))
+#define DYN_I64(a, r) ((DYN_ST && agg_src[a]) ? sp_cur_i64(&sp_cur[1 + (a)], (r), agg_types[a], &sp_err) \
+    : read_col_i64(agg_ptrs[a], (r), agg_types[a], 0))
+#define DYN_FAILED (DYN_ST && sp_err)
+
 #define DYN_DENSE_ACCUM_ROW(row_expr)                                            \
     do {                                                                         \
         int64_t dyn_row = (row_expr);                                            \
-        int64_t key = read_by_esz(key_data[0], dyn_row, key_esz);                \
+        int64_t key = DYN_KEY(dyn_row);                                          \
+        if (DYN_FAILED) { dyn_ok = false; goto dyn_dense_done; }                 \
         if (key < 0 || (uint64_t)key >= max_dense_cap) {                         \
             dyn_ok = false;                                                      \
             goto dyn_dense_done;                                                 \
@@ -11939,57 +12161,76 @@ exec_group_sp_dyn_emit(const sp_dyn_ctx_t* c) {
         if (range_sum) {                                                         \
             da_val_t* sums = &range_sum[(size_t)off * n_aggs];                   \
             for (uint32_t a = 0; a < n_aggs; a++) {                               \
-                if (ext->agg_ops[a] == OP_COUNT || !agg_ptrs[a]) continue;       \
+                if (ext->agg_ops[a] == OP_COUNT || !DYN_HAS(a)) continue;        \
                 if (agg_strlen[a])                                               \
-                    sums[a].i = wrap_add_i64(                                    \
-                        sums[a].i,                                               \
-                        group_strlen_at_cached(                                  \
-                            agg_vecs[a], dyn_row, strlen_sym_strings, strlen_sym_count)); \
+                    sums[a].i = wrap_add_i64(sums[a].i, DYN_STRLEN(a, dyn_row));  \
                 else if (agg_f64_mask & ((uint64_t)1 << a))                      \
-                    sums[a].f += group_fp_at(agg_ptrs[a], agg_types[a], dyn_row); \
+                    sums[a].f += DYN_F64(a, dyn_row);                            \
                 else if (range_sum_hi)                                           \
                     ray_i128_add(&range_sum_hi[(size_t)off * n_aggs + a],         \
-                                 (uint64_t*)&sums[a].i,                          \
-                                 read_col_i64(agg_ptrs[a], dyn_row, agg_types[a], 0)); \
+                                 (uint64_t*)&sums[a].i, DYN_I64(a, dyn_row));    \
                 else                                                             \
-                    sums[a].i = wrap_add_i64(                                    \
-                        sums[a].i,                                               \
-                        read_col_i64(agg_ptrs[a], dyn_row, agg_types[a], 0));     \
+                    sums[a].i = wrap_add_i64(sums[a].i, DYN_I64(a, dyn_row));     \
             }                                                                    \
+            if (DYN_FAILED) { dyn_ok = false; goto dyn_dense_done; }             \
         }                                                                        \
     } while (0)
 
+/* One pass of DYN_DENSE_ACCUM_ROW over the rows (the selection's segments
+ * ascending), reading through the DYN_* accessors defined at its use. */
+#define DYN_DENSE_ACCUM_PASS()                                                   \
+	                if (dyn_ok && match_idx) {                                   \
+	                    for (int64_t i = 0; i < n_scan; i++)                     \
+	                        DYN_DENSE_ACCUM_ROW(match_idx[i]);                   \
+	                } else if (dyn_ok && rowsel) {                               \
+	                    ray_rowsel_t* m = ray_rowsel_meta(rowsel);               \
+	                    const uint8_t* flags = ray_rowsel_flags(rowsel);         \
+	                    const uint32_t* offs = ray_rowsel_offsets(rowsel);       \
+	                    const uint16_t* idx = ray_rowsel_idx(rowsel);            \
+	                    uint32_t nseg = (uint32_t)((m->nrows + RAY_MORSEL_ELEMS - 1) / \
+	                                              RAY_MORSEL_ELEMS);             \
+	                    for (uint32_t seg = 0; seg < nseg; seg++) {              \
+	                        int64_t base = (int64_t)seg * RAY_MORSEL_ELEMS;      \
+	                        if (flags[seg] == RAY_SEL_NONE) continue;            \
+	                        if (flags[seg] == RAY_SEL_ALL) {                     \
+	                            int64_t end = base + RAY_MORSEL_ELEMS;           \
+	                            if (end > m->nrows) end = m->nrows;              \
+	                            for (int64_t r = base; r < end; r++)             \
+	                                DYN_DENSE_ACCUM_ROW(r);                      \
+	                        } else {                                             \
+	                            for (uint32_t p = offs[seg]; p < offs[seg + 1]; p++) \
+	                                DYN_DENSE_ACCUM_ROW(base + idx[p]);          \
+	                        }                                                    \
+	                    }                                                        \
+	                } else if (dyn_ok) {                                         \
+	                    for (int64_t r = 0; r < n_scan; r++)                     \
+	                        DYN_DENSE_ACCUM_ROW(r);                              \
+	                }
+
+
 	                if (dyn_par_done) {
 	                    /* counts merged by the parallel fill above */
-	                } else if (dyn_ok && match_idx) {
-	                    for (int64_t i = 0; i < n_scan; i++)
-	                        DYN_DENSE_ACCUM_ROW(match_idx[i]);
-	                } else if (dyn_ok && rowsel) {
-	                    ray_rowsel_t* m = ray_rowsel_meta(rowsel);
-	                    const uint8_t* flags = ray_rowsel_flags(rowsel);
-	                    const uint32_t* offs = ray_rowsel_offsets(rowsel);
-	                    const uint16_t* idx = ray_rowsel_idx(rowsel);
-	                    uint32_t nseg = (uint32_t)((m->nrows + RAY_MORSEL_ELEMS - 1) /
-	                                              RAY_MORSEL_ELEMS);
-	                    for (uint32_t seg = 0; seg < nseg; seg++) {
-	                        int64_t base = (int64_t)seg * RAY_MORSEL_ELEMS;
-	                        if (flags[seg] == RAY_SEL_NONE) continue;
-	                        if (flags[seg] == RAY_SEL_ALL) {
-	                            int64_t end = base + RAY_MORSEL_ELEMS;
-	                            if (end > m->nrows) end = m->nrows;
-	                            for (int64_t r = base; r < end; r++)
-	                                DYN_DENSE_ACCUM_ROW(r);
-	                        } else {
-	                            for (uint32_t p = offs[seg]; p < offs[seg + 1]; p++)
-	                                DYN_DENSE_ACCUM_ROW(base + idx[p]);
-	                        }
-	                    }
-	                } else if (dyn_ok) {
-	                    for (int64_t r = 0; r < n_scan; r++)
-	                        DYN_DENSE_ACCUM_ROW(r);
+	                } else if (!sp_cur) {
+#define DYN_ST 0
+	                    DYN_DENSE_ACCUM_PASS()
+#undef DYN_ST
+	                } else {
+#define DYN_ST 1
+	                    DYN_DENSE_ACCUM_PASS()
+#undef DYN_ST
 	                }
 dyn_dense_done:
+#undef DYN_DENSE_ACCUM_PASS
 #undef DYN_DENSE_ACCUM_ROW
+                if (sp_err) {   /* R-FAIL: the range error is the answer */
+                    scratch_free(range_sum_hdr); scratch_free(range_hi_hdr); scratch_free(cnt_hdr);
+                    for (uint32_t a = 0; a < n_aggs; a++)
+                        if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
+                    for (uint32_t k = 0; k < n_keys; k++)
+                        if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+                    if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
+                    return sp_err;
+                }
 
 	                if (dyn_ok && have_dyn_key) {
                     uint32_t total_groups = 0;
@@ -12089,58 +12330,77 @@ dyn_dense_done:
 #define DYN_DENSE_SUM_ROW(row_expr)                                              \
     do {                                                                         \
         int64_t dyn_row = (row_expr);                                            \
-        int64_t key = read_by_esz(key_data[0], dyn_row, key_esz);                \
+        int64_t key = DYN_KEY(dyn_row);                                          \
+        if (DYN_FAILED) goto dyn_sum_done;                                       \
         if (key < 0 || (uint64_t)key > max_seen) break;                          \
         uint32_t marker = range_count[(uint64_t)key];                            \
         if (!marker) break;                                                      \
         da_val_t* sums = &dense_sum[(size_t)(marker - 1u) * n_aggs];             \
         for (uint32_t a = 0; a < n_aggs; a++) {                                   \
-            if (ext->agg_ops[a] == OP_COUNT || !agg_ptrs[a]) continue;           \
+            if (ext->agg_ops[a] == OP_COUNT || !DYN_HAS(a)) continue;            \
             if (agg_strlen[a])                                                   \
-                sums[a].i = wrap_add_i64(                                        \
-                    sums[a].i,                                                   \
-                    group_strlen_at_cached(                                      \
-                        agg_vecs[a], dyn_row, strlen_sym_strings, strlen_sym_count)); \
+                sums[a].i = wrap_add_i64(sums[a].i, DYN_STRLEN(a, dyn_row));      \
             else if (agg_f64_mask & ((uint64_t)1 << a))                          \
-                sums[a].f += group_fp_at(agg_ptrs[a], agg_types[a], dyn_row);    \
+                sums[a].f += DYN_F64(a, dyn_row);                                \
             else if (dense_sum_hi)                                               \
                 ray_i128_add(&dense_sum_hi[(size_t)(marker - 1u) * n_aggs + a],  \
-                             (uint64_t*)&sums[a].i,                              \
-                             read_col_i64(agg_ptrs[a], dyn_row, agg_types[a], 0)); \
+                             (uint64_t*)&sums[a].i, DYN_I64(a, dyn_row));        \
             else                                                                 \
-                sums[a].i = wrap_add_i64(                                        \
-                    sums[a].i,                                                   \
-                    read_col_i64(agg_ptrs[a], dyn_row, agg_types[a], 0));        \
+                sums[a].i = wrap_add_i64(sums[a].i, DYN_I64(a, dyn_row));         \
         }                                                                        \
+        if (DYN_FAILED) goto dyn_sum_done;                                       \
     } while (0)
-                        if (match_idx) {
-                            for (int64_t i = 0; i < n_scan; i++)
-                                DYN_DENSE_SUM_ROW(match_idx[i]);
-                        } else if (rowsel) {
-                            ray_rowsel_t* m = ray_rowsel_meta(rowsel);
-                            const uint8_t* flags = ray_rowsel_flags(rowsel);
-                            const uint32_t* offs = ray_rowsel_offsets(rowsel);
-                            const uint16_t* idx = ray_rowsel_idx(rowsel);
-                            uint32_t nseg = (uint32_t)((m->nrows + RAY_MORSEL_ELEMS - 1) /
-                                                      RAY_MORSEL_ELEMS);
-                            for (uint32_t seg = 0; seg < nseg; seg++) {
-                                int64_t base = (int64_t)seg * RAY_MORSEL_ELEMS;
-                                if (flags[seg] == RAY_SEL_NONE) continue;
-                                if (flags[seg] == RAY_SEL_ALL) {
-                                    int64_t end = base + RAY_MORSEL_ELEMS;
-                                    if (end > m->nrows) end = m->nrows;
-                                    for (int64_t r = base; r < end; r++)
-                                        DYN_DENSE_SUM_ROW(r);
-                                } else {
-                                    for (uint32_t p = offs[seg]; p < offs[seg + 1]; p++)
-                                        DYN_DENSE_SUM_ROW(base + idx[p]);
-                                }
-                            }
-                        } else {
-                            for (int64_t r = 0; r < n_scan; r++)
-                                DYN_DENSE_SUM_ROW(r);
+#define DYN_DENSE_SUM_PASS()                                                     \
+                        if (match_idx) {                                         \
+                            for (int64_t i = 0; i < n_scan; i++)                 \
+                                DYN_DENSE_SUM_ROW(match_idx[i]);                 \
+                        } else if (rowsel) {                                     \
+                            ray_rowsel_t* m = ray_rowsel_meta(rowsel);           \
+                            const uint8_t* flags = ray_rowsel_flags(rowsel);     \
+                            const uint32_t* offs = ray_rowsel_offsets(rowsel);   \
+                            const uint16_t* idx = ray_rowsel_idx(rowsel);        \
+                            uint32_t nseg = (uint32_t)((m->nrows + RAY_MORSEL_ELEMS - 1) / \
+                                                      RAY_MORSEL_ELEMS);         \
+                            for (uint32_t seg = 0; seg < nseg; seg++) {          \
+                                int64_t base = (int64_t)seg * RAY_MORSEL_ELEMS;  \
+                                if (flags[seg] == RAY_SEL_NONE) continue;        \
+                                if (flags[seg] == RAY_SEL_ALL) {                 \
+                                    int64_t end = base + RAY_MORSEL_ELEMS;       \
+                                    if (end > m->nrows) end = m->nrows;          \
+                                    for (int64_t r = base; r < end; r++)         \
+                                        DYN_DENSE_SUM_ROW(r);                    \
+                                } else {                                         \
+                                    for (uint32_t p = offs[seg]; p < offs[seg + 1]; p++) \
+                                        DYN_DENSE_SUM_ROW(base + idx[p]);        \
+                                }                                                \
+                            }                                                    \
+                        } else {                                                 \
+                            for (int64_t r = 0; r < n_scan; r++)                 \
+                                DYN_DENSE_SUM_ROW(r);                            \
                         }
+                        if (!sp_cur) {
+#define DYN_ST 0
+                            DYN_DENSE_SUM_PASS()
+#undef DYN_ST
+                        } else {
+#define DYN_ST 1
+                            DYN_DENSE_SUM_PASS()
+#undef DYN_ST
+                        }
+                    dyn_sum_done:
+#undef DYN_DENSE_SUM_PASS
 #undef DYN_DENSE_SUM_ROW
+                        if (sp_err) {   /* R-FAIL: the range error is the answer */
+                            scratch_free(_h_sum); scratch_free(_h_sum_hi); scratch_free(_h_cnt);
+                            scratch_free(range_sum_hdr); scratch_free(range_hi_hdr); scratch_free(cnt_hdr);
+                            ray_release(key_col); ray_release(result);
+                            for (uint32_t a = 0; a < n_aggs; a++)
+                                if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
+                            for (uint32_t k = 0; k < n_keys; k++)
+                                if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+                            if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
+                            return sp_err;
+                        }
                     }
 
                     ray_op_ext_t* key_ext = find_ext(g, ext->keys[0]);
@@ -12173,6 +12433,25 @@ dyn_dense_done:
     /* Dynamic-dense probe bailed (unbounded key or no surviving row): shared
      * resources are untouched — caller continues on the next sp path. */
     return NULL;
+}
+#undef DYN_KEY
+#undef DYN_HAS
+#undef DYN_STRLEN
+#undef DYN_F64
+#undef DYN_I64
+#undef DYN_FAILED
+
+/* A staged context reads each staged source through its own cursor for
+ * the serial passes; they are freed when the route returns. */
+static ray_t* exec_group_sp_dyn_emit(const sp_dyn_ctx_t* c) {
+    if (!c->staged) return exec_group_sp_dyn_emit_run(c, NULL);
+    uint32_t n = 1 + c->n_aggs;
+    ray_col_cursor_t cur[n];
+    ray_col_cursor_init(&cur[0], c->key_src);
+    for (uint32_t a = 0; a < c->n_aggs; a++) ray_col_cursor_init(&cur[1 + a], c->agg_src[a]);
+    ray_t* r = exec_group_sp_dyn_emit_run(c, cur);
+    for (uint32_t i = 0; i < n; i++) ray_col_cursor_free(&cur[i]);
+    return r;
 }
 
 /* Route test hook (ray_group_test_route, internal.h). */
@@ -12429,13 +12708,35 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
      * used to consult the dict known-cardinality map for the DA-reject. */
     int64_t key_scan_sym[vla_keys];
     for (uint32_t k = 0; k < vla_keys; k++) key_scan_sym[k] = -1;
+    /* Bound sources of the scan keys (R-BIND): key_srcs[k] set with
+     * key_vecs[k] NULL is a generation-2 key not materialized (staged), read
+     * by range on the direct-array routes; every other route takes its plain
+     * column (group_unstage).  The sources are the graph's (borrowed). */
+    ray_col_src_t* key_srcs[vla_keys];
+    memset(key_srcs, 0, vla_keys * sizeof(ray_col_src_t*));
+    /* Sources this function binds for plain keys of a staged direct-array
+     * context, released with the inputs' own sources (AGG_OWN_SRC_RELEASE). */
+    ray_col_src_t key_own_src[vla_keys];
+    memset(key_own_src, 0, vla_keys * sizeof(ray_col_src_t));
     for (uint32_t k = 0; k < n_keys; k++) {
         ray_op_t* key_op = op_node(g, ext->keys[k]);
         ray_op_ext_t* key_ext = find_ext(g, key_op->id);
         if (key_ext && key_ext->base.opcode == OP_SCAN) {
-            key_vecs[k] = ray_table_col(tbl, key_ext->sym);
-            if (key_vecs[k] && RAY_IS_ERR(key_vecs[k])) {
-                ray_t* kerr = key_vecs[k];
+            ray_t* kerr = NULL;
+            if (ray_col_bind_declines(tbl, key_ext->sym)) {
+                key_vecs[k] = ray_table_col(tbl, key_ext->sym);   /* today's path (partition key, slice) */
+                if (key_vecs[k] && RAY_IS_ERR(key_vecs[k])) { kerr = key_vecs[k]; key_vecs[k] = NULL; }
+            } else {
+                ray_col_src_t* src = ray_graph_bind_col(g, tbl, key_ext->sym, &kerr);   /* no decode */
+                if (src && !kerr) {
+                    ray_t* ready = ray_col_src_ready(src);
+                    if (ready && !RAY_IS_PARTED(ready->type)) key_vecs[k] = ready;
+                    else if (RAY_IS_PARTED(src->obj->type)) key_vecs[k] = src->obj;   /* plain parted wrapper:
+                                                                 * never here (exec_group_parted) */
+                    else key_srcs[k] = src;                     /* staged */
+                }
+            }
+            if (kerr) {
                 for (uint32_t j = 0; j < k; j++)
                     if (key_owned[j] && key_vecs[j]) ray_release(key_vecs[j]);
                 return kerr;
@@ -12488,7 +12789,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 return vec;
             }
         }
-        if (!key_vecs[k]) {
+        if (!key_vecs[k] && !key_srcs[k]) {
             for (uint32_t j = 0; j < k; j++)
                 if (key_owned[j] && key_vecs[j]) ray_release(key_vecs[j]);
             return ray_error("domain", "by: column not found in table");
@@ -12515,7 +12816,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     uint32_t vla_aggs = n_aggs > 0 ? n_aggs : 1;
     ray_t* vla_hdr = NULL;
     size_t vla_bytes = (size_t)vla_aggs * (2 * sizeof(ray_t*) + sizeof(ray_col_src_t*)
-                        + sizeof(ray_col_src_t)
+                        + 2 * sizeof(ray_col_src_t)
                         + sizeof(agg_affine_t) + sizeof(agg_linear_t)
                         + sizeof(agg_prod_t) + 3 * sizeof(uint8_t));
     uint8_t* vla_blk = (uint8_t*)scratch_calloc(&vla_hdr, vla_bytes);
@@ -12534,15 +12835,21 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
      * released at its exits (AGG_OWN_SRC_RELEASE). */
     ray_col_src_t** agg_srcs  = (ray_col_src_t**)(agg_vecs2 + vla_aggs);
     ray_col_src_t* agg_own_src = (ray_col_src_t*)(agg_srcs + vla_aggs);
-    agg_affine_t* agg_affine = (agg_affine_t*)(agg_own_src + vla_aggs);
+    /* the y-sides' sources in a staged direct-array context */
+    ray_col_src_t* agg_own_src2 = agg_own_src + vla_aggs;
+    agg_affine_t* agg_affine = (agg_affine_t*)(agg_own_src2 + vla_aggs);
     agg_linear_t* agg_linear = (agg_linear_t*)(agg_affine + vla_aggs);
     agg_prod_t*   agg_prod   = (agg_prod_t*)(agg_linear + vla_aggs);
     uint8_t*      agg_owned  = (uint8_t*)(agg_prod + vla_aggs);
     uint8_t*      agg_owned2 = agg_owned + vla_aggs;
     uint8_t*      agg_strlen = agg_owned2 + vla_aggs;
     #define AGG_OWN_SRC_RELEASE() do { \
-        for (uint32_t s_ = 0; s_ < vla_aggs; s_++) \
+        for (uint32_t s_ = 0; s_ < vla_aggs; s_++) { \
             if (agg_own_src[s_].obj) ray_col_src_release(&agg_own_src[s_]); \
+            if (agg_own_src2[s_].obj) ray_col_src_release(&agg_own_src2[s_]); \
+        } \
+        for (uint32_t s_ = 0; s_ < vla_keys; s_++) \
+            if (key_own_src[s_].obj) ray_col_src_release(&key_own_src[s_]); \
     } while (0)
 
     ray_t* rerr = NULL;     /* a failed column bind in the planners below */
@@ -12766,6 +13073,10 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             key_data[k]  = ray_data(key_vecs[k]);
             key_types[k] = key_vecs[k]->type;
             key_attrs[k] = key_vecs[k]->attrs;
+        } else if (key_srcs[k]) {
+            key_data[k]  = NULL;                 /* staged: read by range */
+            key_types[k] = key_srcs[k]->type;
+            key_attrs[k] = key_srcs[k]->attrs;
         } else {
             key_data[k]  = NULL;
             key_types[k] = 0;
@@ -13500,16 +13811,34 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     }
 
 da_path:;
-    /* The routes below read plain columns: a staged input takes its plain
-     * column here (materializing a generation-2 one, as ray_table_col did),
-     * retained and owned; the bound sources are not used past this point. */
-    for (uint32_t a = 0; a < n_aggs; a++) {
-        if (agg_vecs[a] || !agg_srcs[a]) continue;
-        ray_t* uerr = agg_unstage(agg_srcs[a], &agg_vecs[a], &agg_owned[a]);
-        if (uerr) { rerr = uerr; goto resolve_fail; }
-    }
-    AGG_OWN_SRC_RELEASE();
-    #undef AGG_OWN_SRC_RELEASE
+    /* The direct-array routes (DA, the sparse-dynamic count) read staged
+     * keys and inputs by range.  Every other route reads plain columns: a
+     * staged key or input takes its plain column at GROUP_UNSTAGE
+     * (materializing a generation-2 one, as ray_table_col did), retained
+     * and owned, and the bound sources are not used past that point. */
+    #define GROUP_UNSTAGE() do { \
+        for (uint32_t k_ = 0; k_ < n_keys; k_++) { \
+            if (key_vecs[k_] || !key_srcs[k_]) continue; \
+            ray_t* uerr_ = agg_unstage(key_srcs[k_], &key_vecs[k_], &key_owned[k_]); \
+            if (uerr_) { rerr = uerr_; goto resolve_fail; } \
+            key_srcs[k_]  = NULL; \
+            key_data[k_]  = ray_data(key_vecs[k_]); \
+            key_types[k_] = key_vecs[k_]->type; \
+            key_attrs[k_] = key_vecs[k_]->attrs; \
+        } \
+        for (uint32_t a_ = 0; a_ < n_aggs; a_++) { \
+            if (agg_vecs[a_] || !agg_srcs[a_]) continue; \
+            ray_t* uerr_ = agg_unstage(agg_srcs[a_], &agg_vecs[a_], &agg_owned[a_]); \
+            if (uerr_) { rerr = uerr_; goto resolve_fail; } \
+        } \
+        AGG_OWN_SRC_RELEASE(); \
+        grp_staged = false; \
+    } while (0)
+    /* Some key or input is staged (a generation-2 column not materialized). */
+    bool grp_staged = false;
+    for (uint32_t k = 0; k < n_keys; k++) if (key_srcs[k]) grp_staged = true;
+    for (uint32_t a = 0; a < n_aggs; a++) if (!agg_vecs[a] && agg_srcs[a]) grp_staged = true;
+    if (grp_staged && match_idx) { GROUP_UNSTAGE(); grp_staged = false; }   /* rows not contiguous */
     /* ---- Direct-array fast path for low-cardinality integer keys ---- */
     /* Supports multi-key via a composite index when its state remains O(input). */
     {
@@ -13586,9 +13915,12 @@ da_path:;
             if (agg_vecs[a] &&
                 agg_needs_row_gather(agg_vecs[a]->type, aop))
                 da_eligible = false;
+            if (!agg_vecs[a] && agg_srcs[a] &&
+                agg_needs_row_gather(agg_srcs[a]->type, aop))
+                da_eligible = false;
         }
         for (uint32_t k = 0; k < n_keys && da_eligible; k++) {
-            if (!key_data[k]) { da_eligible = false; break; }
+            if (!key_data[k] && !key_srcs[k]) { da_eligible = false; break; }
             int8_t t = key_types[k];
             if (t != RAY_I64 && t != RAY_SYM && t != RAY_I32
                 && t != RAY_TIMESTAMP && t != RAY_DATE && t != RAY_TIME
@@ -13602,6 +13934,8 @@ da_path:;
                              ? key_vecs[k]->slice_parent : key_vecs[k];
                 if (t != RAY_SYM && ray_vec_may_have_nulls(src))
                     da_eligible = false;
+            } else if (t != RAY_SYM && key_srcs[k]->may_null) {
+                da_eligible = false;              /* staged: the directory's null counts */
             }
         }
 
@@ -13637,8 +13971,17 @@ da_path:;
         bool da_fits = false;
 
 
+        /* A staged key's bounds come from its directory statistics where
+         * every chunk has them (no decode); under a selection those bound
+         * the selected rows too (a superset range).  Should that superset
+         * not fit, the prescan runs again by range over the selected rows,
+         * so the route is the one generation 0 takes. */
+        bool mm_dir_ok = true;
+    da_prescan:
         if (da_eligible) {
             da_fits = true;
+            bool mm_dir_wide = false;     /* a directory superset was used */
+            total_slots = 1;
             ray_pool_t* mm_pool = ray_pool_get();
             uint32_t mm_n = (mm_pool && nrows >= RAY_PARALLEL_THRESHOLD)
                             ? ray_pool_total_workers(mm_pool) : 1;
@@ -13653,23 +13996,62 @@ da_path:;
                     mm_mins[w] = INT64_MAX;
                     mm_maxs[w] = INT64_MIN;
                 }
-                minmax_ctx_t mm_ctx = {
-                    .key_data       = key_data[k],
-                    .key_type       = key_types[k],
-                    .key_attrs      = key_attrs[k],
-                    .per_worker_min = mm_mins,
-                    .per_worker_max = mm_maxs,
-                    .n_workers      = mm_n,
-                    .match_idx      = match_idx,
-                    .rowsel         = rowsel,
-                    .span_budget    = (int64_t)da_slot_budget,
-                    .abort_flag     = &mm_abort,
-                };
-                if (mm_n > 1) {
-                    ray_pool_dispatch(mm_pool, minmax_scan_fn, &mm_ctx, n_scan);
-                } else {
-                    minmax_scan_fn(&mm_ctx, 0, 0, n_scan);
+                /* Staged key: fold the directory's chunk bounds; chunks
+                 * without statistics (and not all null) are scanned. */
+                ray_t* sc_hdr = NULL;
+                uint8_t* scan_chunk = NULL;
+                bool mm_scan = true;
+                if (key_srcs[k] && mm_dir_ok) {
+                    ray_enc_chunk_stat_t st;
+                    int64_t nch = (key_srcs[k]->len + RAY_ENC_CHUNK - 1) / RAY_ENC_CHUNK;
+                    if (nch > 0 && ray_col_src_chunk_stat(key_srcs[k], 0, &st)) {
+                        scan_chunk = (uint8_t*)scratch_calloc(&sc_hdr, (size_t)nch);
+                        if (!scan_chunk) { rerr = ray_error("oom", NULL); goto resolve_fail; }
+                        int64_t dmin = INT64_MAX, dmax = INT64_MIN;
+                        mm_scan = false;
+                        for (int64_t ch = 0; ch < nch; ch++) {
+                            (void)ray_col_src_chunk_stat(key_srcs[k], ch, &st);
+                            if ((int64_t)st.null_count >= st.rows) continue;   /* all null */
+                            if (!st.has_minmax) { scan_chunk[ch] = 1; mm_scan = true; continue; }
+                            if (st.min < dmin) dmin = st.min;
+                            if (st.max > dmax) dmax = st.max;
+                        }
+                        mm_mins[0] = dmin;
+                        mm_maxs[0] = dmax;
+                        if (rowsel) mm_dir_wide = true;
+                    }
                 }
+                ray_scan_fail_t mm_fail;
+                ray_scan_fail_init(&mm_fail);
+                if (mm_scan) {
+                    minmax_ctx_t mm_ctx = {
+                        .key_data       = key_data[k],
+                        .key_type       = key_types[k],
+                        .key_attrs      = key_attrs[k],
+                        .per_worker_min = mm_mins,
+                        .per_worker_max = mm_maxs,
+                        .n_workers      = mm_n,
+                        .match_idx      = match_idx,
+                        .rowsel         = rowsel,
+                        .span_budget    = (int64_t)da_slot_budget,
+                        .abort_flag     = &mm_abort,
+                        .row_base       = 0,
+                        .src            = key_srcs[k],
+                        .scan_chunk     = scan_chunk,
+                        .fail           = &mm_fail,
+                    };
+                    if (key_srcs[k]) ray_col_src_advise(key_srcs[k], 0, nrows);
+                    if (mm_n > 1) {
+                        ray_pool_dispatch(mm_pool, minmax_scan_fn, &mm_ctx, n_scan);
+                    } else {
+                        minmax_scan_fn(&mm_ctx, 0, 0, n_scan);
+                    }
+                }
+                scratch_free(sc_hdr);
+                /* R-FAIL: a staged key's range error is the answer */
+                ray_t* mm_err = key_srcs[k] && mm_scan
+                    ? ray_scan_fail_finish(&mm_fail, mm_n > 1 ? mm_pool : NULL) : NULL;
+                if (mm_err) { rerr = mm_err; goto resolve_fail; }
                 if (atomic_load_explicit(&mm_abort, memory_order_relaxed)) {
                     da_fits = false;
                     break;
@@ -13702,6 +14084,10 @@ da_path:;
                     break;
                 }
                 total_slots *= range;
+            }
+            if (!da_fits && mm_dir_wide) {   /* a superset did not fit: the exact range */
+                mm_dir_ok = false;
+                goto da_prescan;
             }
         }
 
@@ -13788,22 +14174,27 @@ da_path:;
                     da_int_null_sentinel[a] = 0;
                     continue;
                 }
-                if (agg_vecs[a]) {
-                    agg_ptrs[a]  = ray_data(agg_vecs[a]);
-                    agg_types[a] = agg_vecs[a]->type;
-                    if (group_fp_type(agg_vecs[a]->type))
+                /* A staged input: type and nullability from its bound source
+                 * (text always may hold nulls, as ray_vec_may_have_nulls
+                 * answers for the plain column); read by pieces. */
+                ray_col_src_t* ssrc = (!agg_vecs[a] && agg_srcs[a]) ? agg_srcs[a] : NULL;
+                if (agg_vecs[a] || ssrc) {
+                    int8_t t = ssrc ? ssrc->type : agg_vecs[a]->type;
+                    bool may_null = ssrc ? (ssrc->may_null || t == RAY_SYM || t == RAY_STR)
+                                         : ray_vec_may_have_nulls(agg_vecs[a]);
+                    agg_ptrs[a]  = ssrc ? NULL : ray_data(agg_vecs[a]);
+                    agg_types[a] = t;
+                    if (group_fp_type(t))
                         agg_f64_mask |= ((uint64_t)1 << a);
-                    da_int_null_sentinel[a] = agg_int_null_sentinel_for(agg_vecs[a]->type);
+                    da_int_null_sentinel[a] = agg_int_null_sentinel_for(t);
                     /* Only set the int-null mask bit for storage types whose
                      * sentinel is meaningful. BOOL/U8 are non-nullable; SYM
                      * zero is skipped by aggregates. F64 has its own NaN path. */
-                    int8_t t = agg_vecs[a]->type;
                     bool is_sentinel_typed = (t == RAY_I16 || t == RAY_I32 || t == RAY_I64 ||
                                               t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP || t == RAY_SYM);
-                    if (is_sentinel_typed && ray_vec_may_have_nulls(agg_vecs[a]))
+                    if (is_sentinel_typed && may_null)
                         da_int_null_mask |= ((uint64_t)1 << a);
-                    if (ray_vec_may_have_nulls(agg_vecs[a]) &&
-                        (group_fp_type(agg_vecs[a]->type) || is_sentinel_typed))
+                    if (may_null && (group_fp_type(t) || is_sentinel_typed))
                         da_any_nullable = true;
                 } else {
                     agg_ptrs[a]  = NULL;
@@ -13849,11 +14240,13 @@ da_path:;
                  * budget those keep the serial scan in row order. */
                 da_n_workers = 1;
             } else if ((uint64_t)da_n_workers > max_workers) {
-                if (n_slots >= 2 * da_n_workers && nrows <= INT32_MAX) {
+                if (n_slots >= 2 * da_n_workers && nrows <= INT32_MAX && !grp_staged) {
                     /* Partition the SLOTS instead: one pass buckets the row
                      * ids by slot span, then one task per span drains its
                      * buckets into the single accumulator set.  Twice as
-                     * many spans as workers evens out skewed groups. */
+                     * many spans as workers evens out skewed groups.  Not
+                     * for a staged context: the drain reads rows at random
+                     * (bucketed), so it takes the ranged scan instead. */
                     da_part_tasks = 2 * da_n_workers;
                     if (da_part_tasks > n_slots) da_part_tasks = n_slots;
                     da_n_workers = 1;
@@ -13963,6 +14356,58 @@ da_path:;
                     break;
                 }
             }
+            /* The columns the merge and the emit read (type, SYM width and
+             * domain): a zero-length stand-in of the source's type for each
+             * staged key and input. */
+            ray_t *da_kc_hdr = NULL, *da_ac_hdr = NULL;
+            ray_t** da_key_cols = scalar_emit_vecs(&da_kc_hdr, key_vecs, key_srcs, n_keys);
+            ray_t** da_agg_cols = da_key_cols ? scalar_emit_vecs(&da_ac_hdr, agg_vecs, agg_srcs, n_aggs) : NULL;
+            /* A staged context reads every key and input through a source
+             * (R-WALK): the keys, then the inputs, then the y-sides; plain
+             * ones are bound beside the staged ones, COUNT and fused-product
+             * slots read none. */
+            uint32_t da_n_src = n_keys + 2u * n_aggs;
+            ray_col_src_t* da_srcs[da_n_src ? da_n_src : 1];
+            const void* da_plain[da_n_src ? da_n_src : 1];
+            ray_t* da_berr = da_agg_cols ? NULL : ray_error("oom", NULL);
+            if (grp_staged && !da_berr) {
+                for (uint32_t i = 0; i < da_n_src; i++) { da_srcs[i] = NULL; da_plain[i] = NULL; }
+                for (uint32_t k = 0; k < n_keys && !da_berr; k++) {
+                    if (key_srcs[k]) { da_srcs[k] = key_srcs[k]; continue; }
+                    da_berr = ray_col_src_bind(key_vecs[k], &key_own_src[k]);
+                    da_srcs[k] = &key_own_src[k];
+                    da_plain[k] = key_data[k];
+                }
+                for (uint32_t a = 0; a < n_aggs && !da_berr; a++) {
+                    uint32_t i = n_keys + a;
+                    if (!agg_prod[a].enabled && ext->agg_ops[a] != OP_COUNT &&
+                        (agg_vecs[a] || agg_srcs[a])) {
+                        if (agg_srcs[a]) {
+                            da_srcs[i] = agg_srcs[a];
+                        } else {
+                            da_berr = ray_col_src_bind(agg_vecs[a], &agg_own_src[a]);
+                            da_srcs[i] = &agg_own_src[a];
+                        }
+                        da_plain[i] = agg_vecs[a] ? ray_data(agg_vecs[a]) : NULL;
+                    }
+                    if (agg_ptrs2[a] && !da_berr) {
+                        da_berr = ray_col_src_bind(agg_vecs2[a], &agg_own_src2[a]);
+                        da_srcs[n_keys + n_aggs + a] = &agg_own_src2[a];
+                        da_plain[n_keys + n_aggs + a] = agg_ptrs2[a];
+                    }
+                }
+                for (uint32_t i = 0; i < da_n_src && !da_berr; i++)
+                    if (da_srcs[i] && !da_plain[i]) ray_col_src_advise(da_srcs[i], 0, nrows);
+            }
+            if (da_berr) {
+                if (da_key_cols) scalar_emit_vecs_free(da_kc_hdr, da_key_cols, key_vecs, n_keys);
+                for (uint32_t w = 0; w < da_n_workers; w++) da_accum_free(&accums[w]);
+                scratch_free(accums_hdr);
+                rerr = da_berr;
+                goto resolve_fail;
+            }
+            ray_scan_fail_t da_fail;
+            ray_scan_fail_init(&da_fail);
             da_ctx_t da_ctx = {
                 .accums      = accums,
                 .sym_strings = da_sym_strings,
@@ -13979,7 +14424,7 @@ da_path:;
                 .agg_ptrs2   = agg_ptrs2,
                 .agg_types2  = agg_types2,
                 .agg_types   = agg_types,
-                .agg_cols    = agg_vecs,
+                .agg_cols    = da_agg_cols,
                 .agg_strlen  = agg_strlen,
                 .agg_prod    = agg_prod,
                 .agg_ops     = ext->agg_ops,
@@ -13993,6 +14438,13 @@ da_path:;
                 .match_idx   = match_idx,
                 .rowsel      = rowsel,
                 .da_n_scan   = n_scan,
+                .row_base    = 0,
+                .srcs        = grp_staged ? da_srcs : NULL,
+                .plain       = grp_staged ? da_plain : NULL,
+                .n_src       = da_n_src,
+                .piece_attrs = NULL,
+                .fail        = &da_fail,
+                .staged      = grp_staged,
             };
             /* Pin each SYM agg column's vocabulary once for the accumulate. */
             ray_t* agg_raw_hdr = NULL;
@@ -14003,9 +14455,9 @@ da_path:;
                     da_ctx.agg_raw = (ray_sym_domain_raw_t*)rm;
                     da_ctx.agg_raw_ok = (uint8_t*)(rm + (size_t)n_aggs * sizeof(ray_sym_domain_raw_t));
                     for (uint32_t a = 0; a < n_aggs; a++)
-                        if (agg_vecs[a] && agg_vecs[a]->type == RAY_SYM)
+                        if (da_agg_cols[a] && da_agg_cols[a]->type == RAY_SYM)
                             da_ctx.agg_raw_ok[a] = ray_sym_domain_raw_pin(
-                                ray_sym_vec_domain(agg_vecs[a]), &da_ctx.agg_raw[a]) ? 1 : 0;
+                                ray_sym_vec_domain(da_agg_cols[a]), &da_ctx.agg_raw[a]) ? 1 : 0;
                 }
             }
 
@@ -14019,6 +14471,18 @@ da_path:;
             else
                 da_accum_fn(&da_ctx, 0, 0, n_scan);
             if (agg_raw_hdr) scratch_free(agg_raw_hdr);
+            /* R-FAIL: a range error (or a cancelled staged dispatch) is the
+             * answer; the partial accumulators are discarded. */
+            ray_t* da_err = grp_staged
+                ? ray_scan_fail_finish(&da_fail, da_n_workers > 1 ? da_pool : NULL) : NULL;
+            if (da_err) {
+                for (uint32_t w = 0; w < da_n_workers; w++) da_accum_free(&accums[w]);
+                scratch_free(accums_hdr);
+                scalar_emit_vecs_free(da_ac_hdr, da_agg_cols, agg_vecs, n_aggs);
+                scalar_emit_vecs_free(da_kc_hdr, da_key_cols, key_vecs, n_keys);
+                rerr = da_err;
+                goto resolve_fail;
+            }
 
             /* Merge target is always accums[0] */
             da_accum_t* merged = &accums[0];
@@ -14098,7 +14562,7 @@ da_path:;
                                  * INT64_MAX is the "no value seen" seed. */
                                 if (wa->min_val[i].i != INT64_MAX &&
                                     (merged->min_val[i].i == INT64_MAX ||
-                                     sym_lex_lt(ray_sym_vec_domain(agg_vecs[a]),
+                                     sym_lex_lt(ray_sym_vec_domain(da_agg_cols[a]),
                                                 wa->min_val[i].i, merged->min_val[i].i)))
                                     merged->min_val[i].i = wa->min_val[i].i;
                             } else {
@@ -14118,7 +14582,7 @@ da_path:;
                                  * INT64_MIN is the "no value seen" seed. */
                                 if (wa->max_val[i].i != INT64_MIN &&
                                     (merged->max_val[i].i == INT64_MIN ||
-                                     sym_lex_gt(ray_sym_vec_domain(agg_vecs[a]),
+                                     sym_lex_gt(ray_sym_vec_domain(da_agg_cols[a]),
                                                 wa->max_val[i].i, merged->max_val[i].i)))
                                     merged->max_val[i].i = wa->max_val[i].i;
                             } else {
@@ -14143,7 +14607,7 @@ da_path:;
                     .n_aggs        = n_aggs,
                     .agg_types     = agg_types,
                     .agg_ops       = ext->agg_ops,
-                    .agg_cols      = agg_vecs,
+                    .agg_cols      = da_agg_cols,
                 };
                 ray_pool_dispatch(da_pool, da_merge_fn, &merge_ctx, (int64_t)n_slots);
             } else {
@@ -14207,7 +14671,7 @@ da_path:;
                                  * INT64_MAX is the "no value seen" seed. */
                                 if (wa->min_val[i].i != INT64_MAX &&
                                     (merged->min_val[i].i == INT64_MAX ||
-                                     sym_lex_lt(ray_sym_vec_domain(agg_vecs[a]),
+                                     sym_lex_lt(ray_sym_vec_domain(da_agg_cols[a]),
                                                 wa->min_val[i].i, merged->min_val[i].i)))
                                     merged->min_val[i].i = wa->min_val[i].i;
                             } else {
@@ -14227,7 +14691,7 @@ da_path:;
                                  * INT64_MIN is the "no value seen" seed. */
                                 if (wa->max_val[i].i != INT64_MIN &&
                                     (merged->max_val[i].i == INT64_MIN ||
-                                     sym_lex_gt(ray_sym_vec_domain(agg_vecs[a]),
+                                     sym_lex_gt(ray_sym_vec_domain(da_agg_cols[a]),
                                                 wa->max_val[i].i, merged->max_val[i].i)))
                                     merged->max_val[i].i = wa->max_val[i].i;
                             } else {
@@ -14277,17 +14741,20 @@ da_path:;
             ray_t* result = ray_table_new(total_cols);
             if (!result || RAY_IS_ERR(result)) {
                 da_accum_free(&accums[0]); scratch_free(accums_hdr);
+                scalar_emit_vecs_free(da_ac_hdr, da_agg_cols, agg_vecs, n_aggs);
+                scalar_emit_vecs_free(da_kc_hdr, da_key_cols, key_vecs, n_keys);
                 for (uint32_t a = 0; a < n_aggs; a++)
                     { if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]); if (agg_owned2[a] && agg_vecs2[a]) ray_release(agg_vecs2[a]); }
                 for (uint32_t k = 0; k < n_keys; k++)
                     if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+                AGG_OWN_SRC_RELEASE();
                 if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
                 return result ? result : ray_error("oom", NULL);
             }
 
             /* Key columns — decompose composite slot back to per-key values */
             for (uint32_t k = 0; k < n_keys; k++) {
-                ray_t* src_col = key_vecs[k];
+                ray_t* src_col = da_key_cols[k];   /* the column or its stand-in */
                 if (!src_col) continue;
                 ray_t* key_col = col_vec_new(src_col, (int64_t)grp_count);
                 out_col_adopt_str_pool(key_col, src_col);
@@ -14353,7 +14820,7 @@ da_path:;
                 gi++;
             }
 
-            emit_agg_columns(&result, g, ext, agg_vecs, grp_count, n_aggs,
+            emit_agg_columns(&result, g, ext, da_agg_cols, grp_count, n_aggs,
                              (double*)dense_sum, (int64_t*)dense_sum, dense_sum_hi,
                              (double*)dense_min_val, (double*)dense_max_val,
                              (int64_t*)dense_min_val, (int64_t*)dense_max_val,
@@ -14368,20 +14835,27 @@ da_path:;
             scratch_free(_h_dshi);
 
             da_accum_free(&accums[0]); scratch_free(accums_hdr);
+            scalar_emit_vecs_free(da_ac_hdr, da_agg_cols, agg_vecs, n_aggs);
+            scalar_emit_vecs_free(da_kc_hdr, da_key_cols, key_vecs, n_keys);
             for (uint32_t a = 0; a < n_aggs; a++)
                 { if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]); if (agg_owned2[a] && agg_vecs2[a]) ray_release(agg_vecs2[a]); }
             for (uint32_t k = 0; k < n_keys; k++)
                 if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+            AGG_OWN_SRC_RELEASE();
             if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
             return result;
         }
     }
 
+    /* Staged columns stay staged only for the sparse-dynamic count below. */
+    if (!(n_keys == 1 && use_emit_filter && n_scan <= UINT32_MAX &&
+          (emit_filter.min_count_exclusive > 0 || emit_filter.top_count_take > 0)))
+        GROUP_UNSTAGE();
     {
         /* n_aggs <= 64: same mask-width bound as da_eligible above — this
          * path's independent agg_f64_mask is also a uint64_t.  Beyond 64
          * aggs, fall through to the hash path. */
-        bool sp_eligible = (nrows > 0 && n_keys == 1 && key_data[0] != NULL &&
+        bool sp_eligible = (nrows > 0 && n_keys == 1 && (key_data[0] != NULL || key_srcs[0]) &&
                              n_aggs <= 64);
         int8_t kt = sp_eligible ? key_types[0] : 0;
         if (sp_eligible && kt != RAY_I64 && kt != RAY_I32 && kt != RAY_I16 &&
@@ -14393,6 +14867,8 @@ da_path:;
                          ? key_vecs[0]->slice_parent : key_vecs[0];
             if (kt != RAY_SYM && ray_vec_may_have_nulls(src))
                 sp_eligible = false;
+        } else if (sp_eligible && kt != RAY_SYM && key_srcs[0]->may_null) {
+            sp_eligible = false;                  /* staged: the directory's null counts */
         }
         bool sp_need_sum = false;
         /* An integer AVG divides the exact 128-bit sum: the scatter arrays
@@ -14410,13 +14886,16 @@ da_path:;
                  * NULL_F64 sentinels.  Fall back to slower paths that
                  * mask nulls properly.  (The multi-key radix HT at
                  * accum_from_entry inherits the same nullable-agg gap.) */
+                ray_col_src_t* ssrc = (!agg_vecs[a] && agg_srcs[a]) ? agg_srcs[a] : NULL;
+                int8_t at = agg_vecs[a] ? agg_vecs[a]->type : ssrc ? ssrc->type : 0;
                 if (agg_vecs[a] && ray_vec_may_have_nulls(agg_vecs[a]))
                     sp_eligible = false;
+                else if (ssrc && (ssrc->may_null || at == RAY_SYM || at == RAY_STR))
+                    sp_eligible = false;          /* staged: as ray_vec_may_have_nulls */
                 else {
                     sp_need_sum = true;
-                    if (op == OP_AVG && !(agg_vecs[a] && group_fp_type(agg_vecs[a]->type)) &&
-                        !agg_strlen[a] &&
-                        group_avg_needs_hi(agg_vecs[a] ? agg_vecs[a]->type : 0, nrows))
+                    if (op == OP_AVG && !group_fp_type(at) && !agg_strlen[a] &&
+                        group_avg_needs_hi(at, nrows))
                         sp_need_sum128 = true;
                 }
             }
@@ -14435,12 +14914,14 @@ da_path:;
              * not a VLA bound. */
             void* agg_ptrs[vla_aggs];
             int8_t agg_types[vla_aggs];
+            ray_col_src_t* sp_agg_src[vla_aggs];   /* staged inputs' sources */
             uint64_t agg_f64_mask = 0;
             for (uint32_t a = 0; a < n_aggs; a++) {
-                if (agg_vecs[a]) {
-                    agg_ptrs[a] = ray_data(agg_vecs[a]);
-                    agg_types[a] = agg_vecs[a]->type;
-                    if (group_fp_type(agg_vecs[a]->type))
+                sp_agg_src[a] = (!agg_vecs[a] && agg_srcs[a]) ? agg_srcs[a] : NULL;
+                if (agg_vecs[a] || sp_agg_src[a]) {
+                    agg_ptrs[a] = agg_vecs[a] ? ray_data(agg_vecs[a]) : NULL;   /* NULL: staged */
+                    agg_types[a] = agg_vecs[a] ? agg_vecs[a]->type : sp_agg_src[a]->type;
+                    if (group_fp_type(agg_types[a]))
                         agg_f64_mask |= ((uint64_t)1 << a);
                 } else {
                     agg_ptrs[a] = NULL;
@@ -14487,12 +14968,25 @@ da_path:;
                 (emit_filter.min_count_exclusive > 0 ||
                  emit_filter.top_count_take > 0) &&
                 n_scan <= UINT32_MAX) {
+                /* Staged columns: stand-ins carry the type, SYM width and
+                 * domain the emit reads. */
+                ray_t *sp_kc_hdr = NULL, *sp_ac_hdr = NULL;
+                ray_t** sp_key_cols = scalar_emit_vecs(&sp_kc_hdr, key_vecs, key_srcs, n_keys);
+                ray_t** sp_agg_cols = sp_key_cols ? scalar_emit_vecs(&sp_ac_hdr, agg_vecs, agg_srcs, n_aggs) : NULL;
+                if (!sp_agg_cols) {
+                    if (sp_key_cols) scalar_emit_vecs_free(sp_kc_hdr, sp_key_cols, key_vecs, n_keys);
+                    rerr = ray_error("oom", NULL);
+                    goto resolve_fail;
+                }
+                for (uint32_t a = 0; a < n_aggs; a++)
+                    if (sp_agg_src[a]) ray_col_src_advise(sp_agg_src[a], 0, nrows);
+                if (key_srcs[0]) ray_col_src_advise(key_srcs[0], 0, nrows);
                 sp_dyn_ctx_t sc = {
                     .g = g, .ext = ext, .key_data = key_data,
-                    .key_types = key_types, .key_vecs = key_vecs,
+                    .key_types = key_types, .key_vecs = sp_key_cols,
                     .key_owned = key_owned, .agg_ptrs = agg_ptrs,
                     .agg_types = agg_types, .agg_strlen = agg_strlen,
-                    .agg_vecs = agg_vecs, .agg_owned = agg_owned,
+                    .agg_vecs = sp_agg_cols, .agg_owned = agg_owned,
                     .agg_affine = agg_affine, .agg_prod = agg_prod,
                     .strlen_sym_strings = strlen_sym_strings,
                     .strlen_sym_count = strlen_sym_count,
@@ -14501,10 +14995,29 @@ da_path:;
                     .sp_need_sum = sp_need_sum, .sp_need_sum128 = sp_need_sum128,
                     .match_idx = match_idx,
                     .rowsel = rowsel, .match_idx_block = match_idx_block,
-                    .vla_hdr = vla_hdr, .emit_filter = emit_filter,
+                    /* freed here, after the inputs' own sources it holds */
+                    .vla_hdr = NULL, .emit_filter = emit_filter,
+                    .staged = grp_staged, .key_src = key_srcs[0], .agg_src = sp_agg_src,
                 };
                 ray_t* sp_r = exec_group_sp_dyn_emit(&sc);
-                if (sp_r) return sp_r;
+                scalar_emit_vecs_free(sp_ac_hdr, sp_agg_cols, agg_vecs, n_aggs);
+                scalar_emit_vecs_free(sp_kc_hdr, sp_key_cols, key_vecs, n_keys);
+                if (sp_r) {
+                    /* the route released the keys and inputs it owned */
+                    AGG_OWN_SRC_RELEASE();
+                    scratch_free(vla_hdr);
+                    return sp_r;
+                }
+            }
+            /* The paths below read plain columns. */
+            if (grp_staged) {
+                GROUP_UNSTAGE();
+                for (uint32_t a = 0; a < n_aggs; a++) {
+                    if (!sp_agg_src[a]) continue;
+                    agg_ptrs[a] = ray_data(agg_vecs[a]);
+                    sp_agg_src[a] = NULL;
+                }
+                key_esz = ray_sym_elem_size(key_types[0], key_attrs[0]);
             }
 
             if (use_emit_filter &&
@@ -15000,6 +15513,9 @@ da_path:;
     }
 
 ht_path:;
+    GROUP_UNSTAGE();
+    #undef GROUP_UNSTAGE
+    #undef AGG_OWN_SRC_RELEASE
     /* n_aggs > 8 guard RETIRED (unbounded-slots cut 4): the HT row-layout is
      * now layout-sized end to end (ght_layout_t agg metadata is unbounded, the
      * entry-staging buffers spill past 8), so this fallback — reached by the
