@@ -872,8 +872,10 @@ ray_t* ray_gc_fn(ray_t** args, int64_t n) {
     (void)args;
     if (n != 0) return ray_error("arity", ".sys.gc takes no arguments");
     ray_heap_gc();
-    /* Same statement-boundary rule as the REPL: an explicit maintenance
-     * call is also a chance to notice the process has gone quiet. */
+    /* Same statement-boundary rules as the REPL: under memory pressure what
+     * is free goes back now, and an explicit maintenance call is also a
+     * chance to notice the process has gone quiet. */
+    ray_heap_relieve();
     ray_heap_decay();
     return ray_i64(0);
 }

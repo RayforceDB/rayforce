@@ -191,4 +191,12 @@ ray_err_t ray_pool_init(uint32_t n_workers);
 ray_err_t ray_pool_init_total(uint32_t total_workers);
 void     ray_pool_destroy(void);
 
+/* Call fn on the heap of every worker of the live singleton pool; nothing
+ * when no pool is running (this never starts one).  For heap maintenance on
+ * the dispatcher's thread with ray_parallel_flag clear: a parked worker
+ * allocates and frees nothing until the next dispatch, so its heap may be
+ * worked on from there — which holds for no other thread's heap. */
+struct ray_heap;
+void ray_pool_each_worker_heap(void (*fn)(struct ray_heap* h, void* ctx), void* ctx);
+
 #endif /* RAY_POOL_H */

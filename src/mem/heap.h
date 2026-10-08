@@ -259,8 +259,10 @@ void ray_heap_release_pages(void);
  *   none is pending (nothing to release, or decay disabled).  An event loop
  *   uses it to bound a wait it would otherwise make indefinite.
  * ray_heap_decay          — sweep if due and if the worker pool is
- *   quiescent; returns the number of blocks released, or -1 if it did
- *   nothing.  Safe to call from any maintenance point.
+ *   quiescent: release the pages of free blocks and unmap empty spill pools
+ *   of the caller's heap and the workers'; returns the number of blocks
+ *   released, or -1 if it did nothing.  Safe to call from any maintenance
+ *   point.
  *
  * The threshold is fixed policy, reachable only through
  * ray_heap_set_decay_ms: negative disables the decay, 0 releases at the
@@ -268,9 +270,11 @@ void ray_heap_release_pages(void);
 void    ray_heap_note_activity(void);
 int64_t ray_heap_decay_due_ms(void);
 int64_t ray_heap_decay(void);
-/* At a statement boundary: when the anon footprint is past the watermark,
- * unmap empty pools and release the pages of free blocks now rather than at
- * the idle decay.  No-op otherwise, or inside parallel work. */
+/* At a statement boundary: when the next pool would not fit under the anon
+ * watermark and handing back what is free would make it fit, unmap empty
+ * pools, drain the direct-block cache and release the pages of free blocks
+ * now rather than at the idle decay.  No-op otherwise, inside parallel work,
+ * and without file spill (Windows). */
 int64_t ray_heap_relieve(void);
 
 /* Set the threshold directly; negative disables.  The environment is read
