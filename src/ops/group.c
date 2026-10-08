@@ -11258,18 +11258,18 @@ typedef struct {
     ray_group_emit_filter_t emit_filter;
 } sp_dyn_ctx_t;
 
-/* Parallel dense-count fill for the sp_dyn pure-count case: each worker
- * scatters its row slice into a private uint32[bound] array; the caller
- * merges them into range_count.  The serial scatter was the Amdahl wall of
- * every single-SYM-key "top-N by count" query (ClickBench q13: 88ms of a
- * 110ms query in one thread's cache-miss loop; flat 8->16 core scaling).
+/* Parallel dense-count fill for the legacy sparse-dynamic path: each worker
+ * scatters its row slice into a private uint32[stride] array with `bound`
+ * live counters and cache-line padding.  The caller merges the live
+ * counters into range_count.
  * A key outside [0, bound) sets `fail` and the caller falls back to the
  * serial path — correctness never depends on the bound being right. */
 typedef struct {
     const void*    key_data;
     uint8_t        key_esz;
-    uint32_t*      counts;      /* [n_workers * bound] */
+    uint32_t*      counts;      /* 64-byte aligned [n_workers * stride] */
     uint64_t       bound;
+    size_t         stride;     /* counters per worker, padded to cache lines */
     uint32_t       n_workers;
     const int64_t* match_idx;
     ray_t*         rowsel;
@@ -11280,7 +11280,7 @@ static void sp_dyn_pcount_fn(void* vctx, uint32_t wid, int64_t start,
                              int64_t end) {
     sp_dyn_pcount_ctx_t* c = (sp_dyn_pcount_ctx_t*)vctx;
     if (atomic_load_explicit(&c->fail, memory_order_relaxed)) return;
-    uint32_t* my = c->counts + (size_t)(wid % c->n_workers) * c->bound;
+    uint32_t* my = c->counts + (size_t)(wid % c->n_workers) * c->stride;
     const int64_t* match_idx = c->match_idx;
     const uint64_t bound = c->bound;
     const uint8_t esz = c->key_esz;
@@ -11376,17 +11376,31 @@ exec_group_sp_dyn_emit(const sp_dyn_ctx_t* c) {
                     else if (key_esz == 2)   bound = 1u << 16;
                     ray_pool_t* dp = ray_pool_get();
                     uint32_t dnw = dp ? ray_pool_total_workers(dp) : 1;
+                    /* Isolate adjacent workers' boundary counters even when
+                     * bound is not a cache-line multiple.  Pad each slice
+                     * and align the base, retaining the scratch header for
+                     * cleanup.  The earlier dense path handles small spans.
+                     * Include alignment slack in the memory cap; allocations
+                     * just below the old cap may now fall back to serial. */
+                    const size_t pc_line = 64;
+                    const size_t pc_per_line = pc_line / sizeof(uint32_t);
+                    size_t stride = ((size_t)bound + pc_per_line - 1)
+                                  & ~(pc_per_line - 1);
+                    uint64_t pc_bytes = (uint64_t)dnw * stride * sizeof(uint32_t)
+                                      + pc_line - 1;
                     if (bound > 0 && dp && dnw >= 2 &&
-                        (uint64_t)dnw * bound * sizeof(uint32_t) <= (512u << 20)) {
+                        pc_bytes <= (512u << 20)) {
                         ray_t* pc_hdr = NULL;
-                        uint32_t* pc = (uint32_t*)scratch_calloc(&pc_hdr,
-                            (size_t)dnw * bound * sizeof(uint32_t));
-                        if (pc) {
+                        void* raw = scratch_calloc(&pc_hdr, (size_t)pc_bytes);
+                        if (raw) {
+                            uint32_t* pc = (uint32_t*)(void*)
+                                (((uintptr_t)raw + pc_line - 1) & ~(uintptr_t)(pc_line - 1));
                             sp_dyn_pcount_ctx_t pctx = {
                                 .key_data  = key_data[0],
                                 .key_esz   = key_esz,
                                 .counts    = pc,
                                 .bound     = bound,
+                                .stride    = stride,
                                 .n_workers = dnw,
                                 .match_idx = match_idx,
                                 .rowsel    = rowsel,
@@ -11411,7 +11425,7 @@ exec_group_sp_dyn_emit(const sp_dyn_ctx_t* c) {
                                 }
                                 if (bound <= cap) {
                                     for (uint32_t w = 0; w < dnw; w++) {
-                                        const uint32_t* src = pc + (size_t)w * bound;
+                                        const uint32_t* src = pc + (size_t)w * stride;
                                         for (uint64_t o = 0; o < bound; o++) {
                                             uint64_t s = (uint64_t)range_count[o] + src[o];
                                             range_count[o] = s > UINT32_MAX

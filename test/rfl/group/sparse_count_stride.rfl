@@ -1,0 +1,33 @@
+;; Issue #740: the sparse-dynamic count fill and merge must use the same
+;; padded worker stride.  The key span exceeds the legacy dense-array floor
+;; (262144), and >262144 rows enable the parallel fill.  The computed SUM
+;; with an armed count emit filter keeps this query on the legacy ladder.
+;; Small-domain COUNT queries use other paths and cannot cover this code.
+;;
+;; Include symbol 0, irregular counts, and four boosted groups so the top-5
+;; cutoff has no ties.  Compare all output columns with a full grouping,
+;; sorted and truncated only after materialization (no count emit filter).
+
+(set i740 (til 300000))
+(set d740 (as 'SYM (concat [""] (as 'STR (+ 1000000 (til 270000))))))
+(set k740 (* (% (* i740 i740) 270001) (as 'I64 (!= 0 (% i740 17)))))
+(set boost740 (concat (concat (take [1] 100) (take [4] 200)) (concat (take [9] 300) (take [16] 400))))
+(set t740 (table [s v] (list (at d740 (concat k740 boost740)) (% (* (til 301000) 13) 97))))
+
+(set full740 (select {from: t740 by: s c: (count v) s2: (sum (* v 2))}))
+(sum (at full740 'c)) -- 301000
+(== (sum (at full740 's2)) (* 2 (sum (at t740 'v)))) -- true
+(set expected740 (take (xdesc full740 'c) 5))
+(at expected740 'c) -- [17649 403 303 203 103]
+(set top740 (select {from: t740 by: s c: (count v) s2: (sum (* v 2)) desc: c take: 5}))
+(count top740) -- 5
+(all (== (at top740 's) (at expected740 's))) -- true
+(all (== (at top740 'c) (at expected740 'c))) -- true
+(all (== (at top740 's2) (at expected740 's2))) -- true
+
+;; A HAVING count threshold uses the same fill without a top-N limit.
+(set having740 (select {from: (select {from: t740 by: s c: (count v) s2: (sum (* v 2))}) where: (> c 100) desc: c}))
+(count having740) -- 5
+(all (== (at having740 's) (at expected740 's))) -- true
+(all (== (at having740 'c) (at expected740 'c))) -- true
+(all (== (at having740 's2) (at expected740 's2))) -- true
