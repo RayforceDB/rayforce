@@ -70,6 +70,53 @@ static test_result_t text_null_operations(int8_t type) {
 static test_result_t test_sym_payload_nulls(void) { return text_null_operations(RAY_SYM); }
 static test_result_t test_str_payload_nulls(void) { return text_null_operations(RAY_STR); }
 
+/* #739: negating SYM membership must keep null rows false at every width,
+ * with or without HAS_NULLS, in both serial and pool-dispatched kernels. */
+static test_result_t test_sym_membership_nulls(void) {
+    const uint8_t widths[] = { RAY_SYM_W8, RAY_SYM_W16, RAY_SYM_W32, RAY_SYM_W64 };
+    const int64_t lengths[] = { 6, 70002 };
+    /* Use existing runtime-domain IDs so they fit even the 8-bit column. */
+    const int64_t ids[] = { 1, 0, 2, 1, 0, 3 };
+    const uint8_t expected[2][6] = {
+        { 1, 0, 0, 1, 0, 0 },
+        { 0, 0, 1, 0, 0, 1 },
+    };
+    TEST_ASSERT(ray_sym_count() > 3, "runtime symbols exist");
+    ray_t* set = ray_sym_vec_new(RAY_SYM_W64, 2);
+    TEST_ASSERT(set && !RAY_IS_ERR(set), "membership set");
+    set->len = 2;
+    ray_write_sym(ray_data(set), 0, 1, RAY_SYM, set->attrs);
+    ray_write_sym(ray_data(set), 1, 0, RAY_SYM, set->attrs);
+    for (size_t w = 0; w < sizeof(widths); w++) {
+        for (size_t l = 0; l < sizeof(lengths) / sizeof(lengths[0]); l++) {
+            ray_t* col = ray_sym_vec_new(widths[w], lengths[l]);
+            TEST_ASSERT(col && !RAY_IS_ERR(col), "membership column");
+            col->len = lengths[l];
+            for (int64_t i = 0; i < col->len; i++)
+                ray_write_sym(ray_data(col), i, ids[i % 6], RAY_SYM, col->attrs);
+            for (int flagged = 0; flagged < 2; flagged++) {
+                if (flagged) col->attrs |= RAY_ATTR_HAS_NULLS;
+                else col->attrs &= (uint8_t)~RAY_ATTR_HAS_NULLS;
+                for (int negate = 0; negate < 2; negate++) {
+                    ray_t* r = ray_in_vec_exec(col, set, negate != 0);
+                    TEST_ASSERT(r && !RAY_IS_ERR(r), "membership result");
+                    TEST_ASSERT_EQ_I(r->type, RAY_BOOL);
+                    TEST_ASSERT_EQ_I(r->len, col->len);
+                    const uint8_t* out = (const uint8_t*)ray_data(r);
+                    for (int64_t i = 0; i < r->len; i++)
+                        TEST_ASSERT_FMT(out[i] == expected[negate][i % 6],
+                            "membership width=%u len=%lld flagged=%d negate=%d row=%lld",
+                            widths[w], (long long)col->len, flagged, negate, (long long)i);
+                    ray_release(r);
+                }
+            }
+            ray_release(col);
+        }
+    }
+    ray_release(set);
+    PASS();
+}
+
 static test_result_t test_dense_sym_zero(void) {
     /* All widths, both metadata states: zero must remain a real group key. */
     const uint8_t widths[] = { RAY_SYM_W8, RAY_SYM_W16, RAY_SYM_W32, RAY_SYM_W64 };
@@ -213,6 +260,7 @@ static test_result_t test_sym_expr_admission(void) {
 }
 
 const test_entry_t text_null_entries[] = {
+    { "text_null/sym_membership_nulls", test_sym_membership_nulls, text_null_setup, text_null_teardown },
     { "text_null/sym_hash_routes", test_sym_hash_routes, text_null_setup, text_null_teardown },
     { "text_null/sym_expr_admission", test_sym_expr_admission, text_null_setup, text_null_teardown },
     { "text_null/sym_without_flag", test_sym_payload_nulls, text_null_setup, text_null_teardown },
