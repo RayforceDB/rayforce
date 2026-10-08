@@ -2476,7 +2476,7 @@ static ray_t* select_fallback_passthrough_col(ray_t* expr, ray_t* tbl, int64_t n
 }
 
 /* True when a projection's TOP-LEVEL call is a "whole-column verb": a
- * length-changing / reordering builtin (distinct, asc, desc, reverse) that
+ * collection builtin (distinct, asc, desc, reverse, enlist) that
  * consumes an entire column vector and returns a vector.  The DAG compiler
  * has no bucket for these — they are neither element-wise ops nor
  * scalar-reducing aggregations — so `compile_expr_dag` returns NULL and the
@@ -2521,7 +2521,8 @@ static int is_whole_column_projection(ray_t* expr, ray_t* tbl) {
         ray_graph_free(g);
         return whole;
     }
-    return (l == 8 && memcmp(p, "distinct", 8) == 0) ||
+    return (l == 6 && memcmp(p, "enlist", 6) == 0) ||
+           (l == 8 && memcmp(p, "distinct", 8) == 0) ||
            (l == 7 && memcmp(p, "reverse", 7) == 0) ||
            (l == 3 && memcmp(p, "asc", 3) == 0) ||
            (l == 4 && memcmp(p, "desc", 4) == 0);
@@ -8453,6 +8454,25 @@ static ray_t* select_fallback_broadcast(ray_t* v, int64_t n) {
     return wide;
 }
 
+/* Scalar columns stay one cell until every collection length is known.
+ * This also handles an empty source and scalar outputs before a collection. */
+static ray_t* select_fallback_finish_columns(ray_t* result, uint32_t* scalar_cols,
+                                            int64_t nrows) {
+    for (int64_t c = 0; c < ray_table_ncols(result); c++) {
+        if (!scalar_cols[c]) continue;
+        ray_t* col = ray_table_get_col_idx(result, c);
+        ray_retain(col);
+        ray_t* wide = select_fallback_broadcast(col, nrows);
+        if (!wide || RAY_IS_ERR(wide)) {
+            ray_release(result);
+            return wide ? wide : ray_error("oom", NULL);
+        }
+        ray_table_set_col_idx(result, c, wide);
+        ray_release(wide);
+    }
+    return result;
+}
+
 static bool select_alias_skip_form(ray_t* head) {
     if (!head || head->type != -RAY_SYM || (head->attrs & ATTR_QUOTED)) return false;
     ray_t* s = ray_sym_str(head->i64);
@@ -13741,7 +13761,10 @@ by_dict_done:
                 scratch_free(scal_hdr);
                 if (!any_agg) any_row_proj = 1;
                 int64_t bcast_len = any_row_proj ? nrows : 1;
-                int64_t out_len = -1;   /* length of the first materialized column */
+                int64_t out_len = -1;   /* common non-scalar column length */
+                /* Compilation was abandoned; reuse its alias-id scratch. */
+                uint32_t* scalar_cols = alias_ids;
+                int64_t output_col = 0;
                 for (int64_t i = 0; i + 1 < dict_n; i += 2) {
                     int64_t kid = dict_elems[i]->i64;
                     if (kid == from_id || kid == where_id || kid == by_id ||
@@ -13751,8 +13774,8 @@ by_dict_done:
                      * entire column and must be evaluated once, not scattered
                      * per-row; so must a one-value projection (an aggregate,
                      * alone or under scalar arithmetic / a scalar `if`), whose
-                     * value is then broadcast.  Everything else — literals,
-                     * lambda calls, and a row column mixed with an aggregate
+                     * value is then broadcast. Lambda calls and a row column
+                     * mixed with an aggregate
                      * in one expression — keeps the row-by-row semantics.
                      * With no row projection at all nothing is scattered: an
                      * alias bound below as a one-row column must not be read
@@ -13761,7 +13784,9 @@ by_dict_done:
                     int whole_verb = is_whole_column_projection(expr, tbl);
                     int one_value = !whole_verb &&
                                     (!any_row_proj ||
-                                     (select_fallback_has_agg(expr) && !expr_refs_row_column(expr, tbl)));
+                                     (select_fallback_has_agg(expr) && !expr_refs_row_column(expr, tbl)) ||
+                                     (ray_is_atom(expr) && expr->type != -RAY_SYM));
+                    bool scalar_col = false;
                     /* A row column mixed with an aggregate in one
                      * expression: its aggregates are reduced once over
                      * the whole table before the scatter, which would
@@ -13791,7 +13816,11 @@ by_dict_done:
                                 : (whole_verb || one_value)
                                 ? eval_expr_whole_column(expr, tbl)
                                 : eval_expr_per_row(expr, tbl, nrows);
-                            if (one_value) col = select_fallback_broadcast(col, bcast_len);
+                            bool enlist_scalar = whole_verb && expr->type == RAY_LIST &&
+                                ((ray_t**)ray_data(expr))[0]->i64 == ray_sym_intern("enlist", 6);
+                            scalar_col = col && !RAY_IS_ERR(col) && (one_value || enlist_scalar) &&
+                                (ray_is_atom(col) || (ray_is_vec(col) && ray_len(col) == 1));
+                            if (scalar_col) col = select_fallback_broadcast(col, 1);
                         }
                         if (reduced) ray_release(reduced);
                     }
@@ -13808,9 +13837,10 @@ by_dict_done:
                      * projection (e.g. distinct) beside a full-length column would
                      * yield a ragged table.  Reject rather than emit one. */
                     int64_t col_len = ray_len(col);
-                    if (out_len < 0) {
+                    scalar_cols[output_col++] = scalar_col;
+                    if (!scalar_col && out_len < 0) {
                         out_len = col_len;
-                    } else if (col_len != out_len) {
+                    } else if (!scalar_col && col_len != out_len) {
                         ray_release(col);
                         ray_release(result);
                         if (nearest_handle_owned) ray_release(nearest_handle_owned);
@@ -13826,8 +13856,13 @@ by_dict_done:
                      * table and stays unbound.  In an all-aggregate select
                      * the one-row value is what a later projection reads
                      * (`{m: (max ts) y: (+ m 1)}`), and nothing scatters it. */
-                    if (col_len == bcast_len) {
-                        ray_t* bound = select_fallback_bind_alias(tbl, kid, col);
+                    if (scalar_col || col_len == bcast_len) {
+                        ray_t* alias_col = col;
+                        ray_retain(alias_col);
+                        if (scalar_col) alias_col = select_fallback_broadcast(alias_col, bcast_len);
+                        ray_t* bound = !alias_col || RAY_IS_ERR(alias_col) ? alias_col
+                            : select_fallback_bind_alias(tbl, kid, alias_col);
+                        if (alias_col && !RAY_IS_ERR(alias_col)) ray_release(alias_col);
                         if (!bound || RAY_IS_ERR(bound)) {
                             ray_release(col);
                             ray_release(result);
@@ -13849,6 +13884,8 @@ by_dict_done:
                         scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return result;
                     }
                 }
+                result = select_fallback_finish_columns(result, scalar_cols,
+                                                          out_len >= 0 ? out_len : bcast_len);
                 if (nearest_handle_owned) ray_release(nearest_handle_owned);
                 if (nearest_query_owned)  ray_free_raw(nearest_query_owned);
                 ray_graph_free(g); ray_release(tbl);

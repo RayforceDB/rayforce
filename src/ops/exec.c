@@ -3780,6 +3780,9 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     ray_t* cv = ray_table_get_col_idx(result, c);
                     if (!cv || cv->type < 0 || RAY_IS_PARTED(cv->type) ||
                         cv->type == RAY_MAPCOMMON || cv->len != 1) continue;
+                    /* One input row does not turn a row-aligned expression
+                     * into a scalar. Only constants/reductions may expand. */
+                    if (nr_in == 1 && !op_tree_is_scalar(g, columns[c])) continue;
                     ray_t* n_obj = make_i64(broadcast_len);
                     ray_t* wide = n_obj ? ray_take_fn(cv, n_obj) : ray_error("oom", NULL);
                     if (n_obj) ray_release(n_obj);
@@ -3800,6 +3803,15 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     g->table = saved_table;
                     ray_release(input);
                     return shape_err;
+                }
+                if (g->selection && ray_table_nrows(result) != nr_in) {
+                    ray_t* err = ray_error("length",
+                        "select: collection projection has %lld rows; where requires %lld input-aligned rows",
+                        (long long)ray_table_nrows(result), (long long)nr_in);
+                    ray_release(result);
+                    g->table = saved_table;
+                    ray_release(input);
+                    return err;
                 }
             }
 

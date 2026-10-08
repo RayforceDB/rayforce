@@ -3435,7 +3435,7 @@ static void ray_register_builtins(void) {
     register_unary("nil?",      RAY_FN_NONE, ray_nil_fn);
     register_unary("where",     RAY_FN_NONE, ray_where_fn);
     register_unary("group",     RAY_FN_NONE, ray_group_indices_fn);
-    register_binary("concat",   RAY_FN_NONE, ray_concat_fn);
+    register_binary("concat",   RAY_FN_NONE, ray_concat_eval_fn);
     register_unary("raze",      RAY_FN_NONE, ray_raze_fn);
     register_unary("ungroup",   RAY_FN_NONE, ray_ungroup_fn);
     register_binary("within",   RAY_FN_NONE, ray_within_fn);

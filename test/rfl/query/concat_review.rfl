@@ -40,3 +40,16 @@
 (set B (table [x k s] (list [1 2 3 4 5] [0 0 1 2 2] ['longlong 'longlong 'c 'd 'e])))
 (at (select {a: (sum (strlen (concat s "!"))) b: (sum x) by: k from: B desc: b take: 1}) 'k) -- [2]
 (at (select {a: (sum (strlen (concat s "!"))) b: (sum x) by: k from: B desc: a take: 1}) 'k) -- [0]
+
+;; An aggregate scalar, not just a literal, broadcasts to a collection.
+(at (select {a: (concat 1 2) b: (sum x) from: T}) 'b) -- [6 6]
+(at (select {b: (sum x) a: (concat 1 2) from: T}) 'b) -- [6 6]
+;; A one-row input column is still a column, not a broadcast scalar.
+(set O (table [x] (list [7])))
+(select {a: [1 2] b: x from: O}) !- domain
+(select {b: x a: [1 2] from: O}) !- domain
+(select {a: [1 2] b: (+ x 0) from: O}) !- domain
+(at (select {a: [1 2] b: (sum x) from: O}) 'b) -- [7 7]
+;; A deferred WHERE selection requires input-aligned collection projections.
+(select {a: [1 2] b: 5 from: T where: (> x 1)}) !- length
+(select {a: (concat 1 2) b: (sum x) from: T where: (> x 1)}) !- length

@@ -1,0 +1,24 @@
+(set A (table [x k s] (list [1 2 3 4 5] [0 0 1 2 2] ['a 'b 'c 'd 'e])))
+;; Filtered COUNT needs no stored column for its computed input.
+(at (select {n: (count (upper s)) by: k from: A where: (> x 1) asc: k}) 'n) -- [1 1 2]
+(at (select {n: (count (concat s "!")) by: k from: A where: (> x 1) asc: k}) 'n) -- [1 1 2]
+(at (select {n: (+ (count (concat s "!")) (count (concat s "?"))) by: k from: A where: (> x 1) asc: k}) 'n) -- [2 2 4]
+;; Per-group fallback retains query text concat alongside collection aggregates.
+(at (select {n: (+ (count (concat s "!")) (count (concat x [9]))) by: k from: A asc: k}) 'n) -- [5 3 5]
+(at (select {n: (+ (count (concat s "!")) (count (distinct x))) by: k from: A asc: k}) 'n) -- [4 2 4]
+(set T (table [x] (list [1 2 3])))
+(at (select {a: (concat [1] [2]) b: (enlist 7) from: T}) 'b) -- [7 7]
+(at (select {b: (enlist 7) a: (concat [1] [2]) from: T}) 'b) -- [7 7]
+
+;; Scalar-only fallback keeps its usual source row count.
+(at (select {b: (enlist 7) from: T}) 'b) -- [7 7 7]
+(at (select {a: (concat [1] [2]) b: (enlist 7) c: 5 from: T}) 'c) -- [5 5]
+(at (select {c: 5 b: (enlist 7) a: (concat [1] [2]) from: T}) 'c) -- [5 5]
+(set E (table [x] (list (til 0))))
+(at (select {b: (enlist 7) a: (concat [1] [2]) from: E}) 'b) -- [7 7]
+(select {a: (concat [1] [2]) b: (enlist 7) c: x from: T}) !- length
+;; Mixed grouped expressions also work with direct WHERE and an empty selection.
+(at (select {n: (+ (count (concat s "!")) (count (distinct x))) by: k from: A where: (> x 1) asc: k}) 'n) -- [2 2 4]
+(count (select {n: (+ (count (concat s "!")) (count (distinct x))) by: k from: A where: (> x 9)})) -- 0
+;; The collection concat primitive remains unchanged outside query scope.
+(concat ['a] 'b) -- ['a 'b]

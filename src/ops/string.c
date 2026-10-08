@@ -27,6 +27,7 @@
 #include "ops/rowsel.h"
 #include "core/pool.h"
 #include "lang/format.h"   /* ray_type_name (error context) */
+#include "lang/env.h"
 #include "lang/internal.h" /* ray_like_fn (list-of-strings delegate) */
 
 /* ============================================================================
@@ -1404,41 +1405,8 @@ ray_t* exec_replace(ray_graph_t* g, ray_op_t* op) {
     return result;
 }
 
-/* CONCAT(a, b, ...) */
-ray_t* exec_concat(ray_graph_t* g, ray_op_t* op) {
-    ray_op_ext_t* ext = find_ext(g, op->id);
-    if (!ext) return ray_error("nyi", NULL);
-    int64_t raw_nargs = ext->sym;
-    if (raw_nargs < 2 || raw_nargs > 255) return ray_error("arity", "concat: expected 2 to 255 arguments, got %lld", (long long)raw_nargs);
-    int n_args = (int)raw_nargs;
-
-    /* Evaluate all inputs */
-    ray_t* args_stack[16];
-    ray_t** args = args_stack;
-    ray_t* args_hdr = NULL;
-    if (n_args > 16) {
-        args = (ray_t**)scratch_calloc(&args_hdr, (size_t)n_args * sizeof(ray_t*));
-        if (!args) return ray_error("oom", NULL);
-    }
-
-    args[0] = exec_node(g, op_child(g, op, 0));
-    args[1] = exec_node(g, op_child(g, op, 1));
-    uint32_t* trail = (uint32_t*)((char*)(ext + 1));
-    for (int i = 2; i < n_args; i++) {
-        args[i] = exec_node(g, &g->nodes[trail[i - 2]]);
-    }
-    /* Error check */
-    for (int i = 0; i < n_args; i++) {
-        if (!args[i] || RAY_IS_ERR(args[i])) {
-            ray_t* err = args[i];
-            for (int j = 0; j < n_args; j++) {
-                if (j != i && args[j] && !RAY_IS_ERR(args[j])) ray_release(args[j]);
-            }
-            scratch_free(args_hdr);
-            return err;
-        }
-    }
-
+/* Shared text kernel. Consumes one reference to each argument. */
+static ray_t* concat_text_values(ray_t** args, int n_args) {
     /* Derive nrows from first vector arg (scalar args have byte-length in len) */
     int64_t nrows = 1;
     bool out_str = false;
@@ -1451,7 +1419,6 @@ ray_t* exec_concat(ray_graph_t* g, ray_op_t* op) {
     ray_t* result = ray_vec_new(out_str ? RAY_STR : RAY_SYM, nrows);
     if (!result || RAY_IS_ERR(result)) {
         for (int i = 0; i < n_args; i++) ray_release(args[i]);
-        scratch_free(args_hdr);
         return result;
     }
     if (!out_str) result->len = nrows;
@@ -1508,7 +1475,6 @@ ray_t* exec_concat(ray_graph_t* g, ray_op_t* op) {
             if (!buf) {
                 ray_release(result);
                 for (int i = 0; i < n_args; i++) ray_release(args[i]);
-                scratch_free(args_hdr);
                 return ray_error("oom", NULL);
             }
             buf_cap = total + 1;
@@ -1550,6 +1516,60 @@ ray_t* exec_concat(ray_graph_t* g, ray_op_t* op) {
         scratch_free(dyn_hdr);
     }
     for (int i = 0; i < n_args; i++) ray_release(args[i]);
+    return result;
+}
+
+/* CONCAT(a, b, ...) */
+ray_t* exec_concat(ray_graph_t* g, ray_op_t* op) {
+    ray_op_ext_t* ext = find_ext(g, op->id);
+    if (!ext) return ray_error("nyi", NULL);
+    int64_t raw_nargs = ext->sym;
+    if (raw_nargs < 2 || raw_nargs > 255) return ray_error("arity", "concat: expected 2 to 255 arguments, got %lld", (long long)raw_nargs);
+    int n_args = (int)raw_nargs;
+
+    /* Evaluate all inputs */
+    ray_t* args_stack[16];
+    ray_t** args = args_stack;
+    ray_t* args_hdr = NULL;
+    if (n_args > 16) {
+        args = (ray_t**)scratch_calloc(&args_hdr, (size_t)n_args * sizeof(ray_t*));
+        if (!args) return ray_error("oom", NULL);
+    }
+
+    args[0] = exec_node(g, op_child(g, op, 0));
+    args[1] = exec_node(g, op_child(g, op, 1));
+    uint32_t* trail = (uint32_t*)((char*)(ext + 1));
+    for (int i = 2; i < n_args; i++) {
+        args[i] = exec_node(g, &g->nodes[trail[i - 2]]);
+    }
+    /* Error check */
+    for (int i = 0; i < n_args; i++) {
+        if (!args[i] || RAY_IS_ERR(args[i])) {
+            ray_t* err = args[i];
+            for (int j = 0; j < n_args; j++) {
+                if (j != i && args[j] && !RAY_IS_ERR(args[j])) ray_release(args[j]);
+            }
+            scratch_free(args_hdr);
+            return err;
+        }
+    }
+
+    ray_t* result = concat_text_values(args, n_args);
     scratch_free(args_hdr);
     return result;
+}
+
+/* Query fallback keeps vector/scalar text concat on the same row-wise
+ * kernel as the planner, including within mixed per-group expressions. */
+ray_t* ray_concat_eval_fn(ray_t* a, ray_t* b) {
+    bool av = a->type == RAY_SYM || a->type == RAY_STR;
+    bool bv = b->type == RAY_SYM || b->type == RAY_STR;
+    bool aa = a->type == -RAY_SYM || a->type == -RAY_STR;
+    bool ba = b->type == -RAY_SYM || b->type == -RAY_STR;
+    if (!ray_env_query_scope_above(0) || !((av && ba) || (aa && bv)))
+        return ray_concat_fn(a, b);
+    ray_t* args[2] = { a, b };
+    ray_retain(a);
+    ray_retain(b);
+    return concat_text_values(args, 2);
 }

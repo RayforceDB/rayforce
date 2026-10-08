@@ -6969,7 +6969,7 @@ static ray_t* agg_build_compact(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         if (!seen) want[n_want++] = s;
     }
     for (uint32_t a = 0; a < ext->n_aggs; a++) {
-        if (ext->agg_ops[a] == OP_COUNT && !(ext->agg_ins && ext->agg_ins[a] != RAY_OP_NONE))
+        if (ext->agg_ops[a] == OP_COUNT)
             continue;                       /* COUNT needs no typed input */
         ray_op_t* ins[2] = { ext->agg_ins ? op_node(g, ext->agg_ins[a]) : NULL,
                              ext->agg_ins2 ? op_node(g, ext->agg_ins2[a]) : NULL };
