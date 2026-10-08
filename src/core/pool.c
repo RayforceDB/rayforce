@@ -941,3 +941,17 @@ void ray_cancel_reset(void) {
     if (atomic_load_explicit(&g_pool_init_state, memory_order_acquire) == 2)
         atomic_store_explicit(&g_pool.cancelled, 0, memory_order_release);
 }
+
+/* The worker heaps of the live pool, for heap maintenance run from the
+ * dispatcher's thread between dispatches (see pool_reclaim_worker_heaps for
+ * why only these).  Like ray_cancel it touches the pool only when it is
+ * already live, so maintenance never starts one. */
+void ray_pool_each_worker_heap(void (*fn)(ray_heap_t* h, void* ctx), void* ctx) {
+    if (atomic_load_explicit(&g_pool_init_state, memory_order_acquire) != 2)
+        return;
+    for (uint32_t i = 0; i < g_pool.n_workers; i++) {
+        ray_heap_t* h = (ray_heap_t*)atomic_load_explicit(&g_pool.worker_heaps[i],
+                                                          memory_order_acquire);
+        if (h) fn(h, ctx);
+    }
+}

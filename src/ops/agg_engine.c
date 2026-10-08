@@ -6701,7 +6701,7 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
          * this is data-derived and independent of cache or RAM size. */
         uint32_t dense_workers = ray_pool_total_workers(pool);
         double scatter_budget = (double)eff_n * 2 * (8.0 * (ext->n_keys + ext->n_aggs + 1));
-        int64_t watermark = ray_heap_anon_watermark();
+        int64_t watermark = ray_heap_mem_budget();
         double dense_budget = scatter_budget;
         if (dense_budget > (double)SIZE_MAX) dense_budget = (double)SIZE_MAX;
         if (watermark > 0 && dense_budget > (double)watermark / 4) dense_budget = (double)watermark / 4;

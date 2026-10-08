@@ -3025,7 +3025,7 @@ static int64_t mode_large_group(ray_t* src, const int64_t* rows, int64_t count) 
     while (c.partitions < c.tasks) c.partitions *= 2;
     /* Includes the scattered records and the worst hash-table capacity. */
     if ((uint64_t)count > SIZE_MAX / 160 ||
-        (uint64_t)count * 160 > (uint64_t)ray_heap_anon_watermark() / 4) return -4;
+        (uint64_t)count * 160 > (uint64_t)ray_heap_mem_budget() / 4) return -4;
     ray_t *records_hdr = NULL, *scatter_hdr = NULL, *hist_hdr = NULL;
     c.records = scratch_alloc(&records_hdr, (size_t)count * sizeof(mode_record_t));
     c.histogram = scratch_calloc(&hist_hdr,

@@ -26,6 +26,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdbool.h>
 
 /* --------------------------------------------------------------------------
  * System-level mmap allocator for infrastructure that can't use the buddy
@@ -38,10 +39,15 @@
  * so ray_sys_free() needs no size argument.
  * -------------------------------------------------------------------------- */
 
+/* Page-granular allocations off the per-thread heaps.  They count toward
+ * the heap's anonymous watermark, and large ones spill to a file past it
+ * (ray_heap_sys_map / ray_heap_sys_unmap, defined in mem/heap.c). */
 void* ray_sys_alloc(size_t size);
 void* ray_sys_realloc(void* ptr, size_t new_size);
 void  ray_sys_free(void* ptr);
 char* ray_sys_strdup(const char* s);
+void* ray_heap_sys_map(size_t size, bool* spilled);
+void  ray_heap_sys_unmap(void* p, size_t size, bool spilled);
 
 /* --------------------------------------------------------------------------
  * Global memory accounting.  Two counters give the true runtime picture:

@@ -35,9 +35,10 @@
 typedef struct {
     size_t map_size;   /* total mmap'd bytes (header + user, page-rounded) */
     size_t usr_size;   /* user-requested bytes (for realloc memcpy) */
+    bool   spilled;    /* mapped over a spill file (ray_heap_sys_map) */
     /* Padding sized so the struct totals SYS_HDR_SIZE on both 32-bit
-     * (WASM, size_t=4 → pad=24) and 64-bit (Linux/macOS, size_t=8 → pad=16). */
-    char   _pad[SYS_HDR_SIZE - 2 * sizeof(size_t)];
+     * (WASM, size_t=4) and 64-bit (Linux/macOS, size_t=8). */
+    char   _pad[SYS_HDR_SIZE - 2 * sizeof(size_t) - sizeof(bool)];
 } sys_hdr_t;
 
 _Static_assert(sizeof(sys_hdr_t) == SYS_HDR_SIZE, "sys_hdr_t must be 32 bytes");
@@ -77,19 +78,21 @@ void* ray_sys_alloc(size_t size) {
     if (size == 0) size = 1;
     if (size > SIZE_MAX - SYS_HDR_SIZE) return NULL;
     size_t total = page_round(SYS_HDR_SIZE + size);
-    void* p = ray_vm_alloc(total);
+    bool spilled = false;
+    void* p = ray_heap_sys_map(total, &spilled);
     if (!p) return NULL;
 
     sys_hdr_t* hdr = (sys_hdr_t*)p;
     hdr->map_size = total;
     hdr->usr_size = size;
+    hdr->spilled  = spilled;
     return (char*)p + SYS_HDR_SIZE;
 }
 
 void ray_sys_free(void* ptr) {
     if (!ptr) return;
     sys_hdr_t* hdr = (sys_hdr_t*)((char*)ptr - SYS_HDR_SIZE);
-    ray_vm_free(hdr, hdr->map_size);
+    ray_heap_sys_unmap(hdr, hdr->map_size, hdr->spilled);
 }
 
 /* L5: ray_sys_realloc(ptr, 0) frees ptr and returns NULL, matching the
