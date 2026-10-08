@@ -1780,8 +1780,18 @@ static bool pf_none_resident(const uint8_t* p, size_t n) {
 
 /* Pages this process has read stay mapped and are not evicted: drop both
  * columns' mappings, evict the files, map them again and re-register. */
+/* Wait out the reads a case started: a page still being read is in the
+ * page cache but locked, eviction skips it and it turns up resident in the
+ * next case.  Touching each present page waits for its read to finish. */
+static void pf_settle(const uint8_t* p, size_t n) {
+    for (size_t off = 0; off < n; off += 4096)
+        if (ray_vm_resident(p + off, 1)) pf_sink += p[off];
+}
+
 static bool pf_reset(uint8_t** base, size_t* size, uint8_t** bbase, size_t* bsize,
                      ray_pool_scan_t* scan) {
+    pf_settle(*base, *size);
+    pf_settle(*bbase, *bsize);
     ray_vm_unmap_file(*base, *size);
     ray_vm_unmap_file(*bbase, *bsize);
     *base = *bbase = NULL;
