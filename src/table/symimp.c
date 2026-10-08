@@ -50,6 +50,7 @@
 #define SI_GROW_MAX  ((int64_t)1 << 30)
 
 #define SI_BATCH     8192                 /* strings deduplicated together */
+_Static_assert(SI_BATCH <= 65535, "a batch's dedupe slots hold uint16 indexes");
 
 /* An index entry is (hash << 32) | (position + 1); 0 is an empty slot. */
 typedef struct si_tab_s {
@@ -187,14 +188,16 @@ static int64_t si_add(ray_symimp_t* m, si_shard_t* sh, uint32_t h, const char* s
     return pos;
 }
 
-/* Under alock: free the tables no lookup can still hold and move the
- * epoch on, unless a lookup of the other parity is still running. */
-static void si_reclaim(ray_symimp_t* m) {
+/* Under alock: take the tables no lookup can still hold and move the
+ * epoch on, unless a lookup of the other parity is still running.  The
+ * caller frees what it gets back after unlocking. */
+static si_tab_t* si_reclaim(ray_symimp_t* m) {
     uint64_t e = atomic_load_explicit(&m->epoch, memory_order_relaxed);
-    if (atomic_load_explicit(&m->active[(e + 1) & 1], memory_order_seq_cst) != 0) return;
-    for (si_tab_t* t = m->retired[(e + 1) & 1]; t;) { si_tab_t* nx = t->next; ray_sys_free(t); t = nx; }
+    if (atomic_load_explicit(&m->active[(e + 1) & 1], memory_order_seq_cst) != 0) return NULL;
+    si_tab_t* done = m->retired[(e + 1) & 1];
     m->retired[(e + 1) & 1] = NULL;
     atomic_store_explicit(&m->epoch, e + 1, memory_order_seq_cst);
+    return done;
 }
 
 /* Up to SI_BATCH strings.  Equal strings of the batch are looked up once
@@ -209,12 +212,14 @@ static bool si_batch(ray_symimp_t* m, int64_t n, const char* const* strs,
                      const size_t* lens, const uint32_t* hashes, int64_t* out_pos) {
     uint16_t loc[2 * SI_BATCH];    /* batch slot -> first such string + 1 */
     uint16_t first[SI_BATCH];
-    memset(loc, 0, sizeof(loc));
+    uint32_t lmask = 15;
+    while (lmask + 1 < (uint32_t)(2 * n)) lmask = lmask * 2 + 1;
+    memset(loc, 0, (size_t)(lmask + 1) * sizeof(loc[0]));
     for (int64_t i = 0; i < n; i++) {
         size_t len = strs[i] ? lens[i] : 0;
         if (len > UINT32_MAX - 4) return false;
         const char* s = strs[i] ? strs[i] : "";
-        uint32_t slot = hashes[i] & (2 * SI_BATCH - 1);
+        uint32_t slot = hashes[i] & lmask;
         for (;;) {
             uint16_t j1 = loc[slot];
             if (!j1) { loc[slot] = (uint16_t)(i + 1); first[i] = (uint16_t)i; break; }
@@ -222,7 +227,7 @@ static bool si_batch(ray_symimp_t* m, int64_t n, const char* const* strs,
             size_t jl = strs[j] ? lens[j] : 0;
             if (hashes[j] == hashes[i] && jl == len &&
                 (len == 0 || memcmp(strs[j], s, len) == 0)) { first[i] = (uint16_t)j; break; }
-            slot = (slot + 1) & (2 * SI_BATCH - 1);
+            slot = (slot + 1) & lmask;
         }
     }
     int64_t miss = 0;
@@ -243,6 +248,7 @@ static bool si_batch(ray_symimp_t* m, int64_t n, const char* const* strs,
     }
     atomic_fetch_sub_explicit(&m->active[e & 1], 1, memory_order_release);
     bool ok = true;
+    si_tab_t* done = NULL;
     if (miss) {
         pthread_mutex_lock(&m->alock);
         for (int64_t i = 0; i < n && ok; i++) {
@@ -256,9 +262,10 @@ static bool si_batch(ray_symimp_t* m, int64_t n, const char* const* strs,
             if (pos < 0) ok = false;
             else out_pos[i] = pos;
         }
-        si_reclaim(m);
+        done = si_reclaim(m);
         pthread_mutex_unlock(&m->alock);
     }
+    for (si_tab_t* t = done; t;) { si_tab_t* nx = t->next; ray_sys_free(t); t = nx; }
     for (int64_t i = 0; ok && i < n; i++) if (first[i] != i) out_pos[i] = out_pos[first[i]];
     return ok;
 }
@@ -294,8 +301,6 @@ ray_symimp_t* ray_symimp_create(const char* path, _Atomic(int64_t)* count) {
         if (p != MAP_FAILED) { m->map = (uint8_t*)p; break; }
     }
     if (!m->map) goto fail;
-    /* lookups read one record each, anywhere in the file: no read-around */
-    madvise(m->map, m->reserve, MADV_RANDOM);
     if (pthread_mutex_init(&m->alock, NULL) != 0) goto fail;
     for (int i = 0; i < SI_SHARDS; i++) {
         si_tab_t* t = si_tab_new(SI_TAB0);
@@ -340,6 +345,11 @@ ray_err_t ray_symimp_sync(ray_symimp_t* m, bool durable) {
     if (err != RAY_OK) return err;
     if (!durable) {
         ray_file_writeback_start(m->fd, from, tail - from);
+        /* A lookup reads one record of the written part, anywhere in it:
+         * no read-around there.  The tail being appended keeps the default,
+         * so its new pages fault in by the window. */
+        size_t done_bytes = (size_t)tail & ~((size_t)sysconf(_SC_PAGESIZE) - 1);
+        if (done_bytes) madvise(m->map, done_bytes, MADV_RANDOM);
         return RAY_OK;
     }
     if (msync(m->map, (size_t)tail, MS_SYNC) != 0 || fsync(m->fd) != 0) return RAY_ERR_IO;
