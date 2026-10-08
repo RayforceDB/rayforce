@@ -3319,6 +3319,9 @@ static test_result_t test_da_route_shapes(void) {
     static const char* const qy[] = {
         "(select {l: (avg (strlen w)) s: (sum (strlen w)) from: T by: g})",
         "(select {l: (sum (strlen w)) from: T where: (> y 10) by: g})",
+        /* strlen beside min / max: the accumulation's general arm (a
+         * strlen under min / max is an expression, not a strlen input) */
+        "(select {l: (sum (strlen w)) a: (avg (strlen w)) m: (min y) x: (max x) from: T by: g})",
         "(select {p: (pearson_corr x y) c: (cov y x) w: (wavg y x) ws: (wsum x y) from: T by: g})",
         NULL };
     for (int q = 0; qy[q]; q++) {
