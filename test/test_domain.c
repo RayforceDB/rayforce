@@ -2341,10 +2341,58 @@ static test_result_t test_domain_import_dict(void) {
     unlink(TMP_DOM_SYM_PATH "_imp.lk");
     PASS();
 }
+/* The import dictionary frees a shard table it replaced once no lookup can
+ * hold it.  Serially, 300K strings leave every one of the 1024 shard tables
+ * at its first size, and 900K at twice that (a shard's share of 900K stays
+ * under the next growth); between the two, committed memory grows by the
+ * new tables less the old ones, not by the new tables whole.  A table is
+ * cap 8-byte slots plus a header, in whole pages. */
+static int64_t imp_tab_bytes(int64_t cap) {
+    int64_t pg = (int64_t)sysconf(_SC_PAGESIZE);
+    return (cap * 8 + 64 + pg - 1) / pg * pg;
+}
+static bool imp_intern_serial(ray_sym_domain_t* dom, int64_t lo, int64_t hi) {
+    imp_ctx_t c = { dom, NULL, 0 };
+    enum { B = 512 };
+    char bufs[B][32]; const char* strs[B]; size_t lens[B]; uint32_t hs[B]; int64_t out[B];
+    for (int64_t i = lo; i < hi; i += B) {
+        int64_t n = hi - i < B ? hi - i : B;
+        for (int64_t j = 0; j < n; j++) {
+            lens[j] = (size_t)imp_str(i + j, bufs[j]); strs[j] = bufs[j];
+            hs[j] = (uint32_t)ray_hash_bytes(strs[j], lens[j]);
+        }
+        if (!ray_sym_domain_intern_batch(c.dom, n, strs, lens, hs, out)) return false;
+    }
+    return true;
+}
+static test_result_t test_domain_import_dict_reclaim(void) {
+    const char* p = TMP_DOM_SYM_PATH "_impr";
+    unlink(p);
+    ray_sym_domain_t* dom = ray_sym_domain_create_import(p);
+    if (!dom) SKIP("import dictionary unsupported here");
+    TEST_ASSERT_TRUE(imp_intern_serial(dom, 0, 300000));
+    /* one more new string: the last batch's replaced tables are freed by
+     * the next batch that adds */
+    TEST_ASSERT_TRUE(ray_sym_domain_intern(dom, "flush-a", 7) > 0);
+    int64_t a = 0, b = 0;
+    ray_sys_get_stat(&a, NULL);
+    TEST_ASSERT_TRUE(imp_intern_serial(dom, 300000, 900000));
+    TEST_ASSERT_TRUE(ray_sym_domain_intern(dom, "flush-b", 7) > 0);
+    ray_sys_get_stat(&b, NULL);
+    int64_t grew = b - a, small = imp_tab_bytes(1024), big = imp_tab_bytes(2048);
+    TEST_ASSERT_TRUE(grew >= 1024 * (big - small) - (1 << 20));   /* every shard grew */
+    TEST_ASSERT_TRUE(grew < 1024 * (big - small / 2));            /* and gave its old table back */
+    TEST_ASSERT_EQ_I(ray_sym_domain_count(dom), 900003);
+    ray_sym_domain_release(dom);
+    unlink(p);
+    unlink(TMP_DOM_SYM_PATH "_impr.lk");
+    PASS();
+}
 const test_entry_t domain_entries[] = {
     { "domain/private", test_domain_private, domain_setup, domain_teardown },
     { "domain/flush_append", test_domain_flush_append, domain_setup, domain_teardown },
     { "domain/import_dict", test_domain_import_dict, domain_setup, domain_teardown },
+    { "domain/import_dict_reclaim", test_domain_import_dict_reclaim, domain_setup, domain_teardown },
     { "domain/runtime_identity",        test_domain_runtime_identity,        domain_setup, domain_teardown },
     { "domain/runtime_delegation",      test_domain_runtime_delegation,      domain_setup, domain_teardown },
     { "domain/vec_new_attach",          test_domain_vec_new_attach,          domain_setup, domain_teardown },
