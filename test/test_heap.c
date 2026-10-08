@@ -3026,8 +3026,11 @@ static test_result_t test_relieve_inflight_free(void) {
 }
 
 /* Spill pools hold the spill file's dirty page cache, which releasing a
- * block's pages does not free; the boundary unmaps the empty ones, and the
- * heap's last pool stays whatever it is.  .sys.gc is a boundary too. */
+ * block's pages does not free.  The boundary still leaves the empty ones
+ * mapped — a repeat that spills would only create their files again — and
+ * unmaps only the empty anon pools; the idle decay takes the spill pools
+ * later, the heap's last pool staying whatever it is.  .sys.gc is a
+ * boundary too. */
 static test_result_t test_relieve_spill_pools(void) {
 #if defined(_WIN32)
     SKIP("file-backed spill is POSIX-only");
@@ -3058,15 +3061,25 @@ static test_result_t test_relieve_spill_pools(void) {
     ray_free(a2);
     ray_free(a1);
 
-    /* Room for a pool once an anon one goes: the four go but one. */
+    /* Room for a pool once an anon one goes: both anon pools go, the spill
+     * pools stay.  The decay is off here so that only the boundary acts. */
     relieve_pressure(RELIEVE_POOL);
+    ray_heap_set_decay_ms(-1);
     ray_t* rc = ray_gc_fn(NULL, 0);
     if (rc) ray_release(rc);
-    bool gone = h->pool_count == 1 && relieve_backed_pools(h) == 0;
+    bool kept = h->pool_count == 2 && relieve_backed_pools(h) == 2;
+
+    /* Once the process goes quiet, the decay unmaps them but the last. */
+    ray_heap_set_decay_ms(0);
+    ray_heap_note_activity();
+    ray_heap_decay();
+    ray_heap_set_decay_ms(RAY_HEAP_DECAY_MS_TEST_DEFAULT);
+    bool gone = h->pool_count == 1;
 
     relieve_env_end(&e, h, NULL);
     TEST_ASSERT(layout, "two anon pools, then two spill pools");
-    TEST_ASSERT(gone, "(.sys.gc) unmapped the spill pools and all but one pool");
+    TEST_ASSERT(kept, "(.sys.gc) unmapped the anon pools and kept the spill pools");
+    TEST_ASSERT(gone, "the decay unmapped the spill pools but the last");
     PASS();
 }
 
@@ -3162,6 +3175,231 @@ static test_result_t test_relieve_skips_other_heaps(void) {
     TEST_ASSERT(relieved, "the caller's own empty pool went");
     TEST_ASSERT(spared, "the relief left the other heap alone");
     TEST_ASSERT(spared_decay, "and so did the decay");
+    PASS();
+}
+
+/* A footprint a pool short of the watermark is not pressure by itself.
+ * Each light statement here maps one pool more than the live data and frees
+ * it, which fits; handing that pool back at every boundary would only make
+ * the next statement map and fault it again (#750).  A heavy statement
+ * first, which needs the relief, shows that neither its peak nor the pools
+ * its relief took make the light statement that maps one of them again
+ * look like one that would cross. */
+static test_result_t test_relieve_steady_state(void) {
+#if defined(_WIN32)
+    SKIP("no file spill, so no relief: the watermark decides nothing");
+#endif
+    enum { N = 8, H = 3 };
+    relieve_env_t e;
+    relieve_env_begin(&e);
+    ray_heap_t* h = relieve_heap_new(&e);
+    if (!h) { relieve_env_end(&e, NULL, NULL); SKIP("no fresh heap"); }
+
+    /* The live data, x, holds pool 1. */
+    int64_t base = ray_heap_anon_committed();
+    ray_t* x = ray_alloc(RELIEVE_HALF);
+    if (!x) { relieve_env_end(&e, h, NULL); SKIP("blocks unavailable"); }
+    ray_heap_relieve();
+
+    /* The heavy statement maps H more pools and frees them. */
+    ray_t* hv[H] = {0};
+    bool ok = true;
+    for (int i = 0; i < H; i++) ok = ok && (hv[i] = ray_alloc(RELIEVE_HALF)) != NULL;
+    for (int i = 0; i < H; i++) if (hv[i]) ray_free(hv[i]);
+    bool heavy = ok && h->pool_count == 1 + H;
+    ray_heap_set_anon_watermark(base + 2 * RELIEVE_POOL + RELIEVE_POOL / 2);
+    ray_heap_relieve();
+    bool heavy_relieved = h->pool_count == 1;
+
+    /* N light statements. */
+    int taken = 0;
+    for (int i = 0; ok && i < N; i++) {
+        ray_t* y = ray_alloc(RELIEVE_HALF);
+        if (!y) { ok = false; break; }
+        memset(ray_data(y), i, 4096);
+        ray_free(y);
+        uint32_t pools = h->pool_count;
+        ray_heap_relieve();
+        if (h->pool_count < pools) taken++;
+    }
+    bool kept = h->pool_count == 2;
+
+    ray_free(x);
+    relieve_env_end(&e, h, NULL);
+    TEST_ASSERT(heavy, "the heavy statement mapped its pools");
+    TEST_ASSERT(heavy_relieved, "and its boundary handed them back");
+    TEST_ASSERT_TRUE(ok);
+    TEST_ASSERT_EQ_I(taken, 0);
+    TEST_ASSERT(kept, "the light statements kept reusing their pool");
+    PASS();
+}
+
+/* A statement that leaves the footprint grown may cross the watermark if it
+ * runs again, though its own peak stayed under it and nothing spilled.  Its
+ * boundary hands back what it left free, even with room for a pool and
+ * more left under the watermark.  The pools an earlier relief took do not
+ * excuse that growth: the first statement after it that maps memory settles
+ * them, mapping back fewer. */
+static test_result_t test_relieve_repeat_growth(void) {
+#if defined(_WIN32)
+    SKIP("no file spill, so no relief: the watermark decides nothing");
+#endif
+    enum { T = 3 };
+    relieve_env_t e;
+    relieve_env_begin(&e);
+    ray_heap_t* h = relieve_heap_new(&e);
+    if (!h) { relieve_env_end(&e, NULL, NULL); SKIP("no fresh heap"); }
+
+    /* w holds pool 1. */
+    int64_t base = ray_heap_anon_committed();
+    ray_t* w = ray_alloc(RELIEVE_HALF);
+    if (!w) { relieve_env_end(&e, h, NULL); SKIP("blocks unavailable"); }
+    ray_heap_relieve();
+
+    /* An earlier statement maps T pools and frees them, and its boundary
+     * hands them back; the next one maps a single pool, for v. */
+    ray_t* t[T] = {0};
+    bool ok = true;
+    for (int i = 0; i < T; i++) ok = ok && (t[i] = ray_alloc(RELIEVE_HALF)) != NULL;
+    for (int i = 0; i < T; i++) if (t[i]) ray_free(t[i]);
+    ray_heap_set_anon_watermark(base + 2 * RELIEVE_POOL);
+    ray_heap_relieve();
+    bool earlier = ok && h->pool_count == 1;
+    ray_heap_set_anon_watermark(INT64_C(1) << 40);
+    ray_t* v = ray_alloc(RELIEVE_HALF);
+    ray_heap_relieve();
+
+    /* The statement: y1 and y2 are its temporaries, x what it keeps — three
+     * pools more, two of them empty at its end. */
+    ray_t* y1 = v ? ray_alloc(RELIEVE_HALF) : NULL;
+    ray_t* y2 = v ? ray_alloc(RELIEVE_HALF) : NULL;
+    ray_t* x = v ? ray_alloc(RELIEVE_HALF) : NULL;
+    if (!v || !y1 || !y2 || !x) {
+        if (y1) ray_free(y1);
+        if (y2) ray_free(y2);
+        if (x) ray_free(x);
+        if (v) ray_free(v);
+        ray_free(w);
+        relieve_env_end(&e, h, NULL);
+        SKIP("blocks unavailable");
+    }
+    ray_free(y1);
+    ray_free(y2);
+    bool layout = h->pool_count == 5;
+
+    /* Its peak, five pools, is a pool under the watermark; run again from
+     * here it would need three more. */
+    ray_heap_set_anon_watermark(base + 6 * RELIEVE_POOL);
+    ray_heap_relieve();
+    bool relieved = h->pool_count == 3 && heap_find_pool(h, x) >= 0
+                 && heap_find_pool(h, v) >= 0 && heap_find_pool(h, w) >= 0
+                 && ray_heap_anon_committed() == base + 3 * RELIEVE_POOL;
+
+    ray_free(x);
+    ray_free(v);
+    ray_free(w);
+    relieve_env_end(&e, h, NULL);
+    TEST_ASSERT(earlier, "the earlier statement's pools went back");
+    TEST_ASSERT(layout, "one pool per half-pool block");
+    TEST_ASSERT(relieved, "the two empty pools went back");
+    PASS();
+}
+
+/* A statement that spilled crossed the watermark whatever its peak says:
+ * what went to a spill file is not in the anonymous footprint.  Its
+ * boundary hands back what is free even when the peak and the growth alone
+ * would not — a direct block, a pool or an off-heap block that spilled
+ * alike.  With nothing to unmap and nothing cached it does nothing at all,
+ * and the free blocks keep their pages. */
+static test_result_t test_relieve_after_spill(void) {
+#if defined(_WIN32)
+    SKIP("file-backed spill is POSIX-only");
+#endif
+    const size_t big = (size_t)48 << 20;
+    const size_t fsz = (1u << 20) - 64;
+    relieve_env_t e;
+    relieve_env_begin(&e);
+    ray_heap_t* h = relieve_heap_new(&e);
+    if (!h) { relieve_env_end(&e, NULL, NULL); SKIP("no fresh heap"); }
+
+    /* x holds pool 1, y pool 2; f is freed with its pages faulted in. */
+    ray_t* x = ray_alloc(RELIEVE_HALF);
+    ray_t* y = ray_alloc(RELIEVE_HALF);
+    ray_t* f = ray_alloc(fsz);
+    if (!x || !y || !f) {
+        if (x) ray_free(x);
+        if (y) ray_free(y);
+        if (f) ray_free(f);
+        relieve_env_end(&e, h, NULL);
+        SKIP("blocks unavailable");
+    }
+    memset(ray_data(f), 0x5A, fsz);
+    const char* probe = (const char*)f + (512u << 10);
+    ray_free(f);
+    ray_heap_relieve();
+
+    /* A direct block spills with room for a pool still under the watermark,
+     * and there is nothing to hand back. */
+    int64_t c0 = ray_heap_anon_committed();
+    ray_heap_set_anon_watermark(c0 + RELIEVE_POOL + 8 * RELIEVE_MB);
+    ray_t* d = ray_alloc(big);
+    bool spilled = d && ray_direct_file_backed(d);
+    if (d) ray_free(d);
+    if (!spilled) {
+        ray_free(x);
+        ray_free(y);
+        relieve_env_end(&e, h, NULL);
+        SKIP("no spill file");
+    }
+    int res0 = relieve_resident(probe);
+    int64_t r0 = ray_heap_relieve();
+    bool idle = r0 == 0 && h->pool_count == 2 && ray_heap_anon_committed() == c0
+             && relieve_resident(probe) == res0;
+
+    /* Again, now with y's pool empty: it goes. */
+    ray_free(y);
+    d = ray_alloc(big);
+    if (d) ray_free(d);
+    ray_heap_relieve();
+    bool direct = h->pool_count == 1 && heap_find_pool(h, x) >= 0;
+
+    /* A pool: y2 maps an anon pool, z past the watermark a spill pool. */
+    ray_heap_set_anon_watermark(INT64_C(1) << 40);
+    ray_t* y2 = ray_alloc(RELIEVE_HALF);
+    ray_heap_set_anon_watermark(ray_heap_anon_committed() + 8 * RELIEVE_MB);
+    ray_t* z = ray_alloc(RELIEVE_HALF);
+    bool pool_spilled = y2 && z && !relieve_pool_is_backed(h, y2)
+                     && relieve_pool_is_backed(h, z);
+    if (y2) ray_free(y2);
+    if (z) ray_free(z);
+    ray_heap_relieve();
+    bool pool = h->pool_count == 2 && relieve_backed_pools(h) == 1;
+
+    /* An off-heap block: y3 takes the spill pool's free half, y4 maps an
+     * anon pool, and s spills. */
+    ray_heap_set_anon_watermark(INT64_C(1) << 40);
+    ray_t* y3 = ray_alloc(RELIEVE_HALF);
+    ray_t* y4 = ray_alloc(RELIEVE_HALF);
+    ray_heap_set_anon_watermark(ray_heap_anon_committed() + 8 * RELIEVE_MB);
+    int64_t c1 = ray_heap_anon_committed();
+    void* s = ray_sys_alloc((size_t)16 << 20);
+    bool sys_spilled = y3 && y4 && s && ray_heap_anon_committed() == c1
+                    && relieve_pool_is_backed(h, y3) && !relieve_pool_is_backed(h, y4);
+    if (s) ray_sys_free(s);
+    if (y3) ray_free(y3);
+    if (y4) ray_free(y4);
+    ray_heap_relieve();
+    bool sys = h->pool_count == 2 && relieve_backed_pools(h) == 1;
+
+    ray_free(x);
+    relieve_env_end(&e, h, NULL);
+    TEST_ASSERT(idle, "nothing to hand back, nothing done");
+    if (res0 >= 0) TEST_ASSERT(res0 == 1, "the free block's pages were resident");
+    TEST_ASSERT(direct, "a spilled direct block: the empty pool went");
+    TEST_ASSERT(pool_spilled, "an anon pool, then a spill pool");
+    TEST_ASSERT(pool, "a spilled pool: the empty anon pool went, the spill pool stayed");
+    TEST_ASSERT(sys_spilled, "the off-heap block spilled");
+    TEST_ASSERT(sys, "a spilled off-heap block: the empty anon pool went");
     PASS();
 }
 
@@ -3647,6 +3885,9 @@ const test_entry_t heap_entries[] = {
     { "heap/relieve_spill_pools",      test_relieve_spill_pools,         heap_setup, heap_teardown },
     { "heap/decay_unmaps_spill_pools", test_decay_unmaps_spill_pools,    heap_setup, heap_teardown },
     { "heap/relieve_skips_other_heaps", test_relieve_skips_other_heaps,  heap_setup, heap_teardown },
+    { "heap/relieve_steady_state",     test_relieve_steady_state,        heap_setup, heap_teardown },
+    { "heap/relieve_repeat_growth",    test_relieve_repeat_growth,       heap_setup, heap_teardown },
+    { "heap/relieve_after_spill",      test_relieve_after_spill,         heap_setup, heap_teardown },
     { "heap/direct_cache_concurrent", test_direct_cache_concurrent_replacement, heap_setup, heap_teardown },
     { "heap/anon_watermark_spill",     test_anon_watermark_spill,              heap_setup, heap_teardown },
     { "heap/slab_byte_budget",         test_slab_byte_budget,            heap_setup, heap_teardown },

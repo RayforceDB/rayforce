@@ -347,21 +347,39 @@ void ray_mem_trace_end(ray_mem_trace_t* out) {
 static _Atomic(int64_t) g_anon_committed = 0;
 static _Atomic(int64_t) g_anon_watermark = 0;   /* 0 = the default (heap_anon_watermark) */
 static _Atomic(int64_t) g_anon_peak      = 0;   /* high-water of g_anon_committed */
+/* The same high-water since the last statement boundary, and the number of
+ * mappings that went past RAM — to a spill file, or to RAM beyond the
+ * watermark when no spill file could be made.  Both are what
+ * ray_heap_relieve learns a statement's memory from. */
+static _Atomic(int64_t) g_anon_stmt_peak = 0;
+static _Atomic(int64_t) g_anon_spills    = 0;
+
+static void heap_peak_raise(_Atomic(int64_t)* peak, int64_t nv) {
+    int64_t pk = atomic_load_explicit(peak, memory_order_relaxed);
+    while (nv > pk &&
+           !atomic_compare_exchange_weak_explicit(peak, &pk, nv,
+                                                   memory_order_relaxed,
+                                                   memory_order_relaxed)) {
+        /* pk reloaded with the current value on failure; retry. */
+    }
+}
 
 /* Commit `bytes` of anonymous (RAM-resident) footprint and advance the peak
- * high-water.  Called from the anon-commit sites (pools, direct blocks, sys
+ * high-waters.  Called from the anon-commit sites (pools, direct blocks, sys
  * blocks); file-backed spill mappings never call this (they must not count
  * toward the RAM watermark). */
 static void heap_anon_commit(int64_t bytes) {
     int64_t nv = atomic_fetch_add_explicit(&g_anon_committed, bytes,
                                             memory_order_relaxed) + bytes;
-    int64_t pk = atomic_load_explicit(&g_anon_peak, memory_order_relaxed);
-    while (nv > pk &&
-           !atomic_compare_exchange_weak_explicit(&g_anon_peak, &pk, nv,
-                                                   memory_order_relaxed,
-                                                   memory_order_relaxed)) {
-        /* pk reloaded with the current value on failure; retry. */
-    }
+    heap_peak_raise(&g_anon_peak, nv);
+    heap_peak_raise(&g_anon_stmt_peak, nv);
+}
+
+/* A mapping went past RAM: called once per pool, direct or sys block mapped
+ * over a spill file — the watermark's call, or a refused anonymous mapping —
+ * or taken from RAM past the watermark because no spill file could be made. */
+static void heap_anon_spilled(void) {
+    atomic_fetch_add_explicit(&g_anon_spills, 1, memory_order_relaxed);
 }
 
 /* Threshold above which anon allocations spill to disk.  Default keeps our
@@ -769,6 +787,8 @@ static bool heap_add_pool(ray_heap_t* h, uint8_t order) {
 
     if (swap_fd < 0)   /* anonymous pool: counts toward the RAM watermark */
         heap_anon_commit((int64_t)pool_size);
+    if (over || swap_fd >= 0)
+        heap_anon_spilled();
 
     return true;
 }
@@ -1475,6 +1495,8 @@ static ray_t* heap_alloc_direct(ray_heap_t* h, size_t data_size) {
         }
         if (swap_fd < 0)   /* anonymous: counts toward the RAM watermark */
             heap_anon_commit((int64_t)map_size);
+        if (force_file || swap_fd >= 0)
+            heap_anon_spilled();
     }
 
     ray_direct_hdr_t* hdr = (ray_direct_hdr_t*)base;
@@ -2180,11 +2202,14 @@ void* ray_heap_sys_map(size_t size, bool* spilled) {
     if (!to_file) p = ray_vm_alloc(size);
     if (!p && big) {
         p = heap_sys_map_file(size);
-        if (p) { *spilled = true; return p; }
+        if (p) { *spilled = true; heap_anon_spilled(); return p; }
     }
     /* No spill file (no writable spill directory, disk full): RAM rather
      * than failing — callers of ray_sys_alloc grow core tables with it. */
-    if (!p && to_file) p = ray_vm_alloc(size);
+    if (!p && to_file) {
+        p = ray_vm_alloc(size);
+        if (p) heap_anon_spilled();
+    }
 #else
     p = ray_vm_alloc(size);
 #endif
@@ -2436,15 +2461,15 @@ static void dfd_validate_freelists(void) {
 
 /* Which pools a reclaim may unmap: oversized ones (gc pass 4), spill ones
  * (the idle decay — releasing a spill block's pages frees nothing, see
- * heap_release_free_pages), or every pool (ray_heap_relieve). */
+ * heap_release_free_pages), or every anonymous one (ray_heap_relieve). */
 #define RAY_RECLAIM_OVERSIZED  1u
 #define RAY_RECLAIM_SPILL      2u
-#define RAY_RECLAIM_ALL        (RAY_RECLAIM_OVERSIZED | RAY_RECLAIM_SPILL | 4u)
+#define RAY_RECLAIM_ANON       4u
 
 static bool heap_reclaim_admits(const ray_pool_entry_t* pe, unsigned mode) {
-    return mode == RAY_RECLAIM_ALL
-        || ((mode & RAY_RECLAIM_OVERSIZED) && pe->pool_order > RAY_HEAP_POOL_ORDER)
-        || ((mode & RAY_RECLAIM_SPILL) && pe->backed);
+    return ((mode & RAY_RECLAIM_OVERSIZED) && pe->pool_order > RAY_HEAP_POOL_ORDER)
+        || ((mode & RAY_RECLAIM_SPILL) && pe->backed)
+        || ((mode & RAY_RECLAIM_ANON) && !pe->backed);
 }
 
 /* The pools of h that `mode` admits and that may be entirely free, into
@@ -2884,17 +2909,23 @@ static void heap_relieve_measure(ray_heap_t* h, void* ctx) {
     heap_drain_foreign(h);
     heap_flush_slabs(h);
     uint32_t cand[RAY_MAX_POOLS];
-    uint32_t n = heap_empty_pool_candidates(h, RAY_RECLAIM_ALL, cand);
+    uint32_t n = heap_empty_pool_candidates(h, RAY_RECLAIM_ANON, cand);
     /* With every pool empty, the reclaim keeps the first. */
     for (uint32_t i = (n == h->pool_count) ? 1 : 0; i < n; i++)
-        if (!h->pools[cand[i]].backed)
-            *(int64_t*)ctx += (int64_t)BSIZEOF(h->pools[cand[i]].pool_order);
+        *(int64_t*)ctx += (int64_t)BSIZEOF(h->pools[cand[i]].pool_order);
 }
 
 static void heap_relieve_apply(ray_heap_t* h, void* ctx) {
-    (void)heap_reclaim_empty_pools(h, RAY_RECLAIM_ALL);
+    (void)heap_reclaim_empty_pools(h, RAY_RECLAIM_ANON);
     *(int64_t*)ctx += heap_release_free_pages(h);
 }
+
+/* What one boundary hands the next: the anonymous footprint it left, which
+ * is where the next statement starts, the spill count it saw, and the bytes
+ * the last relief handed back, until a statement maps memory again. */
+static _Atomic(int64_t) g_relieve_start  = 0;
+static _Atomic(int64_t) g_relieve_spills = 0;
+static _Atomic(int64_t) g_relieve_debt   = 0;
 
 /* Statement boundary under memory pressure.  A free block keeps its pages
  * and a standard pool stays mapped, so the next query reuses them without
@@ -2904,20 +2935,37 @@ static void heap_relieve_apply(ray_heap_t* h, void* ctx) {
  * next query's new memory goes to spill files.  A repeated heavy query then
  * ran an order of magnitude slower than its first run.
  *
- * So once the next pool would no longer fit under the watermark, a boundary
- * hands back what the statement left free: empty pools are unmapped — an
- * anon one leaves the watermark count, a spill one takes its dirty page
- * cache with it — the direct-block cache is drained, and the pages of the
- * remaining free blocks are released.  But only when that brings the next
- * pool back under the watermark.  When live data holds the footprint past
- * it (more data than the limit, a process that started above -m) the next
- * query's memory spills whatever is given back, and giving it back anyway
- * only makes every statement map and fault it all again — kept, its pools
- * and pages are at least reused.  Finding out costs a drain and a slab
- * flush per heap and a few header reads per possibly-empty pool
- * (heap_empty_pool_candidates), so a boundary under steady pressure stays
- * cheap.  Below the watermark the kept memory is what a repeated query
- * reuses, so nothing changes there either.
+ * So a boundary asks whether the statement that just ended would cross the
+ * watermark if it ran again: whether it spilled, or whether its peak plus
+ * what it added to the footprint reaches the watermark.  Only then does it
+ * hand back what the statement left free: empty anonymous pools are
+ * unmapped, the direct-block cache is drained, and the pages of the
+ * remaining free blocks are released.  A footprint near the watermark is
+ * not enough by itself: a statement that fits reuses what it left, and
+ * taking that away only makes it map and fault it again at every boundary.
+ *
+ * What a relief hands back stays owed to the workload until the next
+ * statement that maps memory, and that statement's growth does not count
+ * as far as it only takes the debt back; whatever it leaves is written off.
+ * A statement that maps back what the last relief took and nothing more
+ * therefore brings on no further relief, and a process in a steady state
+ * settles instead of trading the same pool back and forth at every
+ * boundary.  One that needs more than it got back, or spills, is relieved
+ * again.
+ *
+ * Empty spill pools stay mapped: a repeat that spills would only create
+ * their files again, and unmapping a few hundred MB of dirty file pages is
+ * itself as slow as a query.  The idle decay unmaps them once the process
+ * goes quiet.
+ *
+ * And only when handing back makes room for a pool under the watermark.
+ * When live data holds the footprint past it (more data than the limit, a
+ * process that started above -m) the next query's memory spills whatever is
+ * given back, and giving it back anyway only makes every statement map and
+ * fault it all again — kept, its pools and pages are at least reused.
+ * Finding out costs a drain and a slab flush per heap and a few header reads
+ * per possibly-empty pool (heap_empty_pool_candidates), and is done only for
+ * a statement that would cross; any other boundary is a few relaxed loads.
  *
  * Only this thread's heap and the parked workers' are visited
  * (heap_each_quiescent).  Without file spill (Windows) the watermark does not
@@ -2932,15 +2980,36 @@ int64_t ray_heap_relieve(void) {
     const int64_t pool = (int64_t)BSIZEOF(RAY_HEAP_POOL_ORDER);
     int64_t wm = heap_anon_watermark();
     int64_t committed = atomic_load_explicit(&g_anon_committed, memory_order_relaxed);
-    if (wm <= 0 || committed + pool <= wm) return 0;
 
-    int64_t room = direct_cache_bytes();
-    heap_each_quiescent(heap_relieve_measure, &room);
-    if (committed - room + pool > wm) return 0;
+    /* The statement that just ended: its peak, whether it spilled, and what
+     * it added to the footprint beyond taking back the debt.  A statement
+     * that mapped nothing leaves the debt for the next one. */
+    int64_t peak = atomic_load_explicit(&g_anon_stmt_peak, memory_order_relaxed);
+    if (peak < committed) peak = committed;
+    int64_t spills = atomic_load_explicit(&g_anon_spills, memory_order_relaxed);
+    bool spilled = atomic_exchange_explicit(&g_relieve_spills, spills,
+                                            memory_order_relaxed) != spills;
+    int64_t start = atomic_load_explicit(&g_relieve_start, memory_order_relaxed);
+    int64_t debt = atomic_load_explicit(&g_relieve_debt, memory_order_relaxed);
+    int64_t growth = committed > start ? committed - start : 0;
+    growth -= growth < debt ? growth : debt;
+    if (peak > start) debt = 0;
 
-    int64_t released = 0;
-    direct_cache_drain();
-    heap_each_quiescent(heap_relieve_apply, &released);
+    int64_t released = 0, after = committed;
+    if (wm > 0 && (spilled || peak + growth >= wm)) {
+        int64_t room = direct_cache_bytes();
+        heap_each_quiescent(heap_relieve_measure, &room);
+        if (room > 0 && committed - room + pool <= wm) {
+            direct_cache_drain();
+            heap_each_quiescent(heap_relieve_apply, &released);
+            after = atomic_load_explicit(&g_anon_committed, memory_order_relaxed);
+            debt = after < committed ? committed - after : 0;
+        }
+    }
+    /* The next statement starts here. */
+    atomic_store_explicit(&g_relieve_debt, debt, memory_order_relaxed);
+    atomic_store_explicit(&g_relieve_start, after, memory_order_relaxed);
+    atomic_store_explicit(&g_anon_stmt_peak, after, memory_order_relaxed);
     return released;
 }
 

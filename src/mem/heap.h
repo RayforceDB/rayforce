@@ -270,11 +270,14 @@ void ray_heap_release_pages(void);
 void    ray_heap_note_activity(void);
 int64_t ray_heap_decay_due_ms(void);
 int64_t ray_heap_decay(void);
-/* At a statement boundary: when the next pool would not fit under the anon
- * watermark and handing back what is free would make it fit, unmap empty
- * pools, drain the direct-block cache and release the pages of free blocks
- * now rather than at the idle decay.  No-op otherwise, inside parallel work,
- * and without file spill (Windows). */
+/* At a statement boundary: when the statement that just ended spilled, or
+ * run again would reach the anon watermark (its peak plus what it added to
+ * the footprint, less what it only took back from an earlier relief), and
+ * handing back what is free leaves room for a pool under the watermark,
+ * unmap empty anonymous pools, drain the direct-block cache and release the
+ * pages of free blocks now rather than at the idle decay.  Empty spill pools
+ * are left to the idle decay.  No-op otherwise, inside parallel work, and
+ * without file spill (Windows). */
 int64_t ray_heap_relieve(void);
 
 /* Set the threshold directly; negative disables.  The environment is read
