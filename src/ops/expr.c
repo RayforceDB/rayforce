@@ -407,6 +407,10 @@ bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
          * sentinels.  Refuse the fast plan and let the caller fall back
          * to the generic masked path. */
         if (srcs[i]->may_null) return false;
+        /* the plan reads whole-column pointers: an encoded term not yet
+         * materialized declines (a shape decline, *err NULL), and the
+         * scalar route evaluates the expression by range reads instead */
+        if (!ray_col_src_base(srcs[i])) return false;
     }
     for (uint8_t i = 0; i < lin.n_terms; i++) {
         ray_t* col = NULL;
@@ -447,6 +451,9 @@ bool try_prod_sumavg_input_f64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
     if (sa->parted || sb->parted) return false;
     if (sa->may_null || sb->may_null)
         return false;
+    /* whole-column pointers only: an encoded side not yet materialized
+     * declines (the input is evaluated by range reads instead) */
+    if (!ray_col_src_base(sa) || !ray_col_src_base(sb)) return false;
     #define PROD_OK_T(t) ((t) == RAY_F64 || (t) == RAY_I64 || (t) == RAY_I32 || \
                           (t) == RAY_I16 || (t) == RAY_U8  || (t) == RAY_BOOL)
     if (!PROD_OK_T(sa->type) || !PROD_OK_T(sb->type)) return false;
@@ -465,8 +472,18 @@ bool try_prod_sumavg_input_f64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
     return true;
 }
 
-/* Detect SUM/AVG affine inputs of form (scan +/- const) and return scan vector
- * plus the additive bias so we can adjust results from (sum,count) directly. */
+/* The affine plan's column object: the ready plain column (generation 0,
+ * or a published materialization), else the bound source's own object (a
+ * RAY_ENCCOL), which the caller binds and reads by range.  Never decodes. */
+static ray_t* affine_base_obj(ray_col_src_t* src) {
+    ray_t* ready = ray_col_src_ready(src);
+    return ready ? ready : src->obj;
+}
+
+/* Detect SUM/AVG affine inputs of form (scan +/- const) and return the scan's
+ * column object (a plain vector, or a RAY_ENCCOL the caller binds: see
+ * affine_base_obj) plus the additive bias so we can adjust results from
+ * (sum,count) directly. */
 bool try_affine_sumavg_input(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
                                     ray_t** out_vec, agg_affine_t* out_affine, ray_t** err) {
     *err = NULL;
@@ -523,8 +540,7 @@ bool try_affine_sumavg_input(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
     int8_t bt = base_src->type;
     ray_t* base_vec = NULL;
     if (bt == RAY_F64) {
-        *err = ray_col_src_plain(base_src, &base_vec);
-        if (*err) return false;
+        base_vec = affine_base_obj(base_src);
         out_affine->enabled = true;
         out_affine->bias_f64 = (double)sign * (c_is_f64 ? c_f : (double)c_i);
         out_affine->bias_i64 = (int64_t)out_affine->bias_f64;
@@ -545,8 +561,7 @@ bool try_affine_sumavg_input(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
         } else {
             c = c_i;
         }
-        *err = ray_col_src_plain(base_src, &base_vec);
-        if (*err) return false;
+        base_vec = affine_base_obj(base_src);
         out_affine->enabled = true;
         out_affine->bias_i64 = sign > 0 ? c : -c;
         out_affine->bias_f64 = (double)out_affine->bias_i64;

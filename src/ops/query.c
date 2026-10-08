@@ -658,13 +658,30 @@ static ray_t* tbl_col_idx_or_null(ray_t* tbl, int64_t idx) {
     return c;
 }
 
+/* A generation-2 column's answer to agg `op` from its directory, exactly
+ * where the generation-0 column answers from its CHUNK_ZONE below
+ * (ray_zone_dir_answer, finding C3): COUNT, integer SUM / AVG, and MIN /
+ * MAX of non-float types (the is_f64 zone declines float extremes).  NULL
+ * when that answer does not exist (the query runs at execution). */
+static ray_t* select_agg_dir_answer(const ray_col_meta_t* m, uint16_t op, int64_t nrows) {
+    bool fl = m->type == RAY_F32 || m->type == RAY_F64;
+    ray_t* atom = op == OP_COUNT ? ray_i64(nrows)
+                : (op == OP_SUM || op == OP_AVG || ((op == OP_MIN || op == OP_MAX) && !fl))
+                  ? ray_zone_dir_answer(m->enc, op) : NULL;
+    if (atom && (RAY_IS_ERR(atom) || !ray_is_atom(atom))) {
+        if (RAY_IS_ERR(atom)) ray_error_free(atom); else ray_release(atom);
+        return NULL;
+    }
+    return atom;
+}
+
 /* See the call site in ray_select_impl.  NULL: some output is not answerable
  * from metadata (the caller plans the query as usual). */
 static ray_t* select_aggs_from_metadata(ray_t* tbl, ray_t** dict_elems, int64_t dict_n,
                                         int64_t from_id) {
     int64_t nrows = ray_table_nrows(tbl);
     if (nrows <= 0) return NULL;   /* empty tables keep the planner's answers */
-    int64_t n_out = 0;
+    int64_t n_out = 0, n_enc = 0;
     for (int64_t i = 0; i + 1 < dict_n; i += 2) {
         if (dict_elems[i]->i64 == from_id) continue;
         ray_t* e = dict_elems[i + 1];
@@ -672,14 +689,19 @@ static ray_t* select_aggs_from_metadata(ray_t* tbl, ray_t** dict_elems, int64_t 
         ray_t** el = (ray_t**)ray_data(e);
         if (el[0]->type != -RAY_SYM || (el[0]->attrs & ATTR_QUOTED)) return NULL;
         if (el[1]->type != -RAY_SYM || (el[1]->attrs & ATTR_QUOTED)) return NULL;
-        /* A generation-2 column has its CHUNK_ZONE only after materialization:
-         * the planning-time answer is skipped and the aggregate runs at
-         * execution, as for a column without a zone. */
         ray_col_meta_t m;
-        if (!ray_table_col_meta(tbl, el[1]->i64, &m) || m.enc ||
+        if (!ray_table_col_meta(tbl, el[1]->i64, &m) ||
             m.type < RAY_BOOL || m.type > RAY_STR || RAY_IS_PARTED(m.type) ||
             m.type == RAY_MAPCOMMON || (m.attrs & RAY_ATTR_SLICE) || m.len != nrows)
             return NULL;
+        if (m.enc) {   /* generation 2: from the directory, no decode */
+            ray_t* atom = select_agg_dir_answer(&m, resolve_agg_opcode(el[0]->i64), nrows);
+            if (!atom) return NULL;
+            ray_release(atom);
+            n_out++;
+            n_enc++;
+            continue;
+        }
         ray_t* col = ray_table_col(tbl, el[1]->i64);   /* plain slot: no decode */
         if (!col || RAY_IS_ERR(col)) {
             if (col) ray_error_free(col);
@@ -716,18 +738,24 @@ static ray_t* select_aggs_from_metadata(ray_t* tbl, ray_t** dict_elems, int64_t 
         int64_t kid = dict_elems[i]->i64;
         if (kid == from_id) continue;
         ray_t** el = (ray_t**)ray_data(dict_elems[i + 1]);
-        ray_t* col = ray_table_col(tbl, el[1]->i64);   /* plain (checked above) */
-        if (!col || RAY_IS_ERR(col)) {
-            if (col) ray_error_free(col);
-            ray_release(res);
-            return NULL;
+        ray_col_meta_t m;
+        ray_t* atom = NULL;
+        if (n_enc > 0 && ray_table_col_meta(tbl, el[1]->i64, &m) && m.enc) {
+            atom = select_agg_dir_answer(&m, resolve_agg_opcode(el[0]->i64), nrows);
+        } else {
+            ray_t* col = ray_table_col(tbl, el[1]->i64);   /* plain (checked above) */
+            if (!col || RAY_IS_ERR(col)) {
+                if (col) ray_error_free(col);
+                ray_release(res);
+                return NULL;
+            }
+            uint16_t op = resolve_agg_opcode(el[0]->i64);
+            atom = op == OP_COUNT ? ray_i64(nrows)
+                 : op == OP_MIN   ? ray_min_fn(col)
+                 : op == OP_MAX   ? ray_max_fn(col)
+                 : op == OP_SUM   ? ray_sum_fn(col)
+                 :                  ray_avg_fn(col);
         }
-        uint16_t op = resolve_agg_opcode(el[0]->i64);
-        ray_t* atom = op == OP_COUNT ? ray_i64(nrows)
-                    : op == OP_MIN   ? ray_min_fn(col)
-                    : op == OP_MAX   ? ray_max_fn(col)
-                    : op == OP_SUM   ? ray_sum_fn(col)
-                    :                  ray_avg_fn(col);
         if (!atom || RAY_IS_ERR(atom) || !ray_is_atom(atom)) {
             if (atom && RAY_IS_ERR(atom)) ray_error_free(atom); else if (atom) ray_release(atom);
             ray_release(res);

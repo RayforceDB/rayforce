@@ -2799,33 +2799,57 @@ static test_result_t test_try_plans_bound(void) {
         TEST_ASSERT_EQ_U(k.materialized, 0);
         TEST_ASSERT_TRUE(ray_graph_binds_count(gr) >= 3);
 
-        /* linear: 2 * b + a + 7 */
-        TEST_ASSERT_TRUE(d_lin && try_linear_sumavg_input_i64(gr, t, d_lin, &lin, &err));
-        TEST_ASSERT_NULL(err);
-        TEST_ASSERT_TRUE(lin.enabled && lin.n_terms == 2 && lin.bias_i64 == 7);
-        for (int64_t i = 0; i < CP_N; i += 997) {
-            int64_t sum = lin.bias_i64;
-            for (uint8_t j = 0; j < lin.n_terms; j++) sum += lin.coeff_i64[j] * ((const int64_t*)lin.term_ptrs[j])[i];
-            TEST_ASSERT_EQ_I(sum, 2 * ((i * 7) % 1000) + (i % 1000) + 7);
+        if (gen == 2) {
+            /* P2 Task 10: the linear and product plans read whole-column
+             * pointers, so encoded terms not yet materialized decline them
+             * (a shape decline: *err NULL, nothing decoded); the affine plan
+             * hands back the encoded object for the caller to bind. */
+            TEST_ASSERT_FALSE(try_linear_sumavg_input_i64(gr, t, d_lin, &lin, &err)); TEST_ASSERT_NULL(err);
+            TEST_ASSERT_FALSE(try_prod_sumavg_input_f64(gr, t, d_fg, &prod, &err));   TEST_ASSERT_NULL(err);
+            TEST_ASSERT_FALSE(try_prod_sumavg_input_f64(gr, t, d_fa, &prod, &err));   TEST_ASSERT_NULL(err);
+            memset(&aff, 0, sizeof aff);
+            TEST_ASSERT_TRUE(d_af && try_affine_sumavg_input(gr, t, d_af, &vec, &aff, &err));
+            TEST_ASSERT_NULL(err);
+            TEST_ASSERT_TRUE(aff.enabled && aff.bias_f64 == -1.5 && vec && vec->type == RAY_ENCCOL);
+            TEST_ASSERT_TRUE(vec == ray_table_get_col_enc(t, ray_sym_intern("f", 1)));
+            memset(&aff, 0, sizeof aff);
+            TEST_ASSERT_TRUE(d_ai && try_affine_sumavg_input(gr, t, d_ai, &vec, &aff, &err));
+            TEST_ASSERT_TRUE(aff.enabled && aff.bias_i64 == 5 && vec->type == RAY_ENCCOL);
+            ray_enc_counters_get(&k); TEST_ASSERT_EQ_U(k.materialized, 0);
+            /* a published materialization is a ready column: the plans take it */
+            ray_t* fa = ray_table_col(t, ray_sym_intern("a", 1));
+            ray_t* fb = ray_table_col(t, ray_sym_intern("b", 1));
+            TEST_ASSERT_TRUE(fa && !RAY_IS_ERR(fa) && fb && !RAY_IS_ERR(fb));
+            TEST_ASSERT_TRUE(try_linear_sumavg_input_i64(gr, t, d_lin, &lin, &err));
+            TEST_ASSERT_TRUE(lin.term_ptrs[0] == ray_data(fb) || lin.term_ptrs[0] == ray_data(fa));
+        } else {
+            /* linear: 2 * b + a + 7 */
+            TEST_ASSERT_TRUE(d_lin && try_linear_sumavg_input_i64(gr, t, d_lin, &lin, &err));
+            TEST_ASSERT_NULL(err);
+            TEST_ASSERT_TRUE(lin.enabled && lin.n_terms == 2 && lin.bias_i64 == 7);
+            for (int64_t i = 0; i < CP_N; i += 997) {
+                int64_t sum = lin.bias_i64;
+                for (uint8_t j = 0; j < lin.n_terms; j++) sum += lin.coeff_i64[j] * ((const int64_t*)lin.term_ptrs[j])[i];
+                TEST_ASSERT_EQ_I(sum, 2 * ((i * 7) % 1000) + (i % 1000) + 7);
+            }
+            /* product: f * g (F64 x F64) and f * a (F64 x I64) */
+            TEST_ASSERT_TRUE(d_fg && try_prod_sumavg_input_f64(gr, t, d_fg, &prod, &err));
+            TEST_ASSERT_NULL(err);
+            TEST_ASSERT_TRUE(prod.enabled && prod.ta == RAY_F64 && prod.tb == RAY_F64);
+            for (int64_t i = 0; i < CP_N; i += 997)
+                TEST_ASSERT_TRUE(((const double*)prod.pa)[i] * ((const double*)prod.pb)[i] == (double)(i % 64) * 0.5 * ((double)(i % 32) * 0.25));
+            TEST_ASSERT_TRUE(d_fa && try_prod_sumavg_input_f64(gr, t, d_fa, &prod, &err));
+            TEST_ASSERT_TRUE(prod.ta == RAY_F64 && prod.tb == RAY_I64);
+            /* affine: f - 1.5, a + 5 */
+            memset(&aff, 0, sizeof aff);
+            TEST_ASSERT_TRUE(d_af && try_affine_sumavg_input(gr, t, d_af, &vec, &aff, &err));
+            TEST_ASSERT_NULL(err);
+            TEST_ASSERT_TRUE(aff.enabled && aff.bias_f64 == -1.5 && vec && vec->type == RAY_F64 && vec->len == CP_N);
+            TEST_ASSERT_TRUE(((const double*)ray_data(vec))[5] == 2.5);
+            memset(&aff, 0, sizeof aff);
+            TEST_ASSERT_TRUE(d_ai && try_affine_sumavg_input(gr, t, d_ai, &vec, &aff, &err));
+            TEST_ASSERT_TRUE(aff.enabled && aff.bias_i64 == 5 && vec->type == RAY_I64 && ((const int64_t*)ray_data(vec))[1234] == 234);
         }
-        /* product: f * g (F64 x F64) and f * a (F64 x I64) */
-        TEST_ASSERT_TRUE(d_fg && try_prod_sumavg_input_f64(gr, t, d_fg, &prod, &err));
-        TEST_ASSERT_NULL(err);
-        TEST_ASSERT_TRUE(prod.enabled && prod.ta == RAY_F64 && prod.tb == RAY_F64);
-        for (int64_t i = 0; i < CP_N; i += 997)
-            TEST_ASSERT_TRUE(((const double*)prod.pa)[i] * ((const double*)prod.pb)[i] == (double)(i % 64) * 0.5 * ((double)(i % 32) * 0.25));
-        TEST_ASSERT_TRUE(d_fa && try_prod_sumavg_input_f64(gr, t, d_fa, &prod, &err));
-        TEST_ASSERT_TRUE(prod.ta == RAY_F64 && prod.tb == RAY_I64);
-        /* affine: f - 1.5, a + 5 */
-        memset(&aff, 0, sizeof aff);
-        TEST_ASSERT_TRUE(d_af && try_affine_sumavg_input(gr, t, d_af, &vec, &aff, &err));
-        TEST_ASSERT_NULL(err);
-        TEST_ASSERT_TRUE(aff.enabled && aff.bias_f64 == -1.5 && vec && vec->type == RAY_F64 && vec->len == CP_N);
-        TEST_ASSERT_TRUE(((const double*)ray_data(vec))[5] == 2.5);
-        memset(&aff, 0, sizeof aff);
-        TEST_ASSERT_TRUE(d_ai && try_affine_sumavg_input(gr, t, d_ai, &vec, &aff, &err));
-        TEST_ASSERT_TRUE(aff.enabled && aff.bias_i64 == 5 && vec->type == RAY_I64 && ((const int64_t*)ray_data(vec))[1234] == 234);
-        if (gen == 2) { ray_enc_counters_get(&k); TEST_ASSERT_EQ_U(k.materialized, 4); }
 
         ray_release(e1); ray_release(e2); ray_release(e3); ray_release(e4);
         ray_release(e5); ray_release(e6); ray_release(e7); ray_release(e8);
@@ -2858,7 +2882,9 @@ static test_result_t test_try_plans_bound(void) {
         if (err) ray_error_free(err);
         err = NULL;
         TEST_ASSERT_TRUE(bind_err && bind_err2 && bind_err3);
-        /* a failed materialization of a bound encoded column */
+        /* a failed materialization of a bound encoded column: the plans
+         * no longer request one (P2 Task 10: they decline, or hand back the
+         * encoded object), so the failure never fires */
         if (gen == 2) {
             ray_enccol_test_fail_alloc(1);
             r = try_linear_sumavg_input_i64(gr, t, dl, &lin, &err);
@@ -2878,7 +2904,7 @@ static test_result_t test_try_plans_bound(void) {
             ray_enccol_test_fail_alloc(0);
             bool plain_err3 = !r && err && RAY_IS_ERR(err);
             if (err) ray_error_free(err);
-            TEST_ASSERT_TRUE(plain_err && plain_err2 && plain_err3);
+            TEST_ASSERT_TRUE(!plain_err && !plain_err2 && !plain_err3);
         }
         ray_release(e1); ray_release(e2); ray_release(e3);
         ray_graph_free(gr);
@@ -4535,10 +4561,12 @@ static test_result_t test_scalar_agg_planning_zoned(void) {
         TEST_ASSERT_FMT(r && !RAY_IS_ERR(r), "query %d", i);
         ray_release(r);
         ray_enc_counters_t c; ray_enc_counters_get(&c);
-        /* The query reaches execution (answered from the zone during
-         * planning would leave UINT64_MAX) and nothing decodes before it. */
-        TEST_ASSERT_FMT(c.at_first_exec == 0, "query %d: %llu materialized before execution", i,
-                        (unsigned long long)c.at_first_exec);
+        /* P2 Task 10 (finding C3): answered during planning from the
+         * directory, as generation 0 answers from its zone, so the query
+         * never reaches ray_execute (UINT64_MAX) and nothing decodes. */
+        TEST_ASSERT_FMT(c.at_first_exec == UINT64_MAX && c.materialized == 0,
+                        "query %d: %llu materialized, at first exec %llu", i,
+                        (unsigned long long)c.materialized, (unsigned long long)c.at_first_exec);
     }
     ray_t* r = ray_eval_str("(sum (at u 'v))");
     TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->i64 == (int64_t)69999 * 70000 / 2);
@@ -4915,15 +4943,15 @@ static test_result_t test_select_decodes_referenced_only(void) {
         TEST_ASSERT_FMT(enc, "column %s is encoded", cn[c]);
     }
     static const struct { const char* q; uint64_t cols; } qs[] = {
-        { "(select {c: (count v) from: u2 where: (> v 100)})",                1 },
-        { "(select {s: (sum v) from: u2 where: (== k 3)})",                   1 },  /* P2: k's consult reads the directory */
+        { "(select {c: (count v) from: u2 where: (> v 100)})",                0 },  /* P2 Task 10: the scalar route range-reads */
+        { "(select {s: (sum v) from: u2 where: (== k 3)})",                   0 },  /* P2: k's consult reads the directory; Task 10: v by range */
         { "(select {from: u2 where: (== k 3)})",                              6 },  /* every column is output */
         { "(select {s: (sum v) by: k from: u2})",                             2 },
         { "(select {s: (sum v) c: (max w) by: [k m] from: u2})",              4 },
         { "(select {s: (sum v) by: k from: u2 where: (> w 5)})",              2 },  /* P2: w's consult reads the directory */
         { "(select {s: (sum v) by: k from: u2 desc: s take: 2})",             2 },
-        { "(select {d: (med v) e: (first w) from: u2})",                      2 },
-        { "(select {d: (avg v) e: (dev w) from: u2 where: (< x 1000)})",      2 },  /* P2: x's consult reads the directory */
+        { "(select {d: (med v) e: (first w) from: u2})",                      1 },  /* P2 Task 10: med reads plain v, first w by range */
+        { "(select {d: (avg v) e: (dev w) from: u2 where: (< x 1000)})",      0 },  /* P2: x's consult reads the directory; Task 10: v, w by range */
         { "(select {k: k v: v from: u2 take: 5})",                            2 },
         { "(select {k: k v: v from: u2 where: (> w 5) take: 5})",             2 },  /* P2: the take scan range-reads w */
         { "(select {v: v from: u2 desc: v take: 3})",                         1 },
@@ -5084,7 +5112,7 @@ static test_result_t test_select_parted_prunes_fetch(void) {
     ray_release(t);
     static const struct { const char* q; uint64_t cols; int64_t rows; } qs[] = {
         { "(select {from: t where: (== date 2024.01.02)})",                      2, 3000 },  /* a and b of 01.02 */
-        { "(select {s: (sum a) from: t where: (== date 2024.01.02)})",           1, 1 },     /* a of 01.02 */
+        { "(select {s: (sum a) from: t where: (== date 2024.01.02)})",           0, 1 },     /* P2 Task 10: the scalar route range-reads a of 01.02 */
         { "(select {c: (count a) from: t by: b where: (== date 2024.01.02)})",   2, 3000 },  /* a and b of 01.02 */
         { "(select {a: a from: t where: (<= date 2024.01.02) take: 10})",        2, 10 },    /* a of 01.01 and 01.02 */
         { "(select {a: a from: t where: (<= date 2024.01.02) asc: b})",          4, 6000 },  /* a and b of 01.01, 01.02 */
@@ -5440,8 +5468,12 @@ static test_result_t test_select_planning_no_materialize(void) {
         TEST_ASSERT_FMT(r && !RAY_IS_ERR(r), "query %d: %s", i, r ? ray_err_code(r) : "null");
         ray_release(r);
         ray_enc_counters_t c; ray_enc_counters_get(&c);
-        TEST_ASSERT_FMT(c.at_first_exec == 0, "query %d materialized %llu columns before execution",
-                        i, (unsigned long long)c.at_first_exec);
+        /* query 4 is answered at planning from the directory (P2 Task 10,
+         * finding C3), so it never reaches ray_execute: nothing decodes */
+        if (i == 4) TEST_ASSERT_FMT(c.at_first_exec == UINT64_MAX && c.materialized == 0,
+                                    "query %d: answered from the directory", i);
+        else TEST_ASSERT_FMT(c.at_first_exec == 0, "query %d materialized %llu columns before execution",
+                             i, (unsigned long long)c.at_first_exec);
     }
     PASS();
 }

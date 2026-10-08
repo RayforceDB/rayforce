@@ -442,6 +442,10 @@ bool ray_zone_int_sum128(ray_t* x, int64_t* hi_out, uint64_t* lo_out, int64_t* n
  * CHUNK_ZONE (the zone the materialization would synthesize), from the
  * directory; NULL when that zone path would not answer. */
 ray_t* ray_zone_dir_answer(ray_t* encv, uint16_t opcode);
+/* ray_zone_int_sum128's twin for the same columns: the exact 128-bit sum
+ * and non-null count from the directory; false when the zone the
+ * materialization would synthesize carries no integer sums. */
+bool ray_zone_dir_int_sum128(ray_t* encv, int64_t* hi, uint64_t* lo, int64_t* nn);
 
 /* Build a RAY_IDX_DICT (codes + distinct values) for STR vector `v` WITHOUT
  * attaching it — standalone RAY_INDEX object (caller releases / attaches).

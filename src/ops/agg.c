@@ -603,6 +603,19 @@ ray_t* ray_zone_dir_answer(ray_t* encv, uint16_t opcode) {
     }
 }
 
+bool ray_zone_dir_int_sum128(ray_t* encv, int64_t* hi, uint64_t* lo, int64_t* nn) {
+    ray_enccol_t* e = zone_dir_col(encv);
+    if (!e) return false;
+    int8_t t = e->type;
+    /* ray_zone_int_sum128 answers the integer types whose zone has aggs */
+    if (!(t == RAY_I64 || t == RAY_I32 || t == RAY_I16 || t == RAY_U8) || !ray_encw_type_summable(t))
+        return false;
+    ray_enc_col_totals_t z;
+    ray_enccol_dir_totals(e, &z);
+    *hi = z.sum_hi; *lo = z.sum_lo; *nn = z.nonnull;
+    return true;
+}
+
 ray_t* ray_sum_fn(ray_t* x) {
     if (ray_is_lazy(x)) AGG_LAZY(x, OP_SUM);
     if (RAY_IS_PARTED(x->type)) return agg_parted_sum(x);

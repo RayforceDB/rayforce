@@ -1066,6 +1066,11 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
 /* The try_* planners and expr_compile return false for "not this shape".  A
  * failed column bind (or plain request) also returns false but leaves an
  * owned error in *err (ray_error_free); *err is NULL otherwise. */
+/* try_affine_sumavg_input's *out_vec is the base scan's column object: the
+ * plain column when it is ready, else a RAY_ENCCOL the caller binds
+ * (ray_col_src_bind) and reads by range.  try_linear_sumavg_input_i64 and
+ * try_prod_sumavg_input_f64 read whole-column pointers: an encoded term not
+ * yet materialized declines them (*err NULL). */
 bool try_affine_sumavg_input(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
                              ray_t** out_vec, agg_affine_t* out_affine, ray_t** err);
 bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
@@ -1189,6 +1194,11 @@ ray_t* exec_reduction(ray_graph_t* g, ray_op_t* op, ray_t* input);
  * else by range reads.  NULL when the type or op is not served here (the
  * caller takes the plain path); otherwise a result or an owned error. */
 ray_t* ray_reduce_src(ray_col_src_t* src, uint16_t opcode, int8_t out_type);
+/* Test hook (C tests only): 0 normal routing; 1 skip the v2 aggregate
+ * engine (legacy ladder); 2 also skip the direct-array route (legacy
+ * radix); 3 also skip the slice-group probe.  Disarmed by
+ * ray_test_hooks_off. */
+void ray_group_test_route(int route);
 ray_t* exec_reduction_src(ray_graph_t* g, ray_op_t* op, ray_col_src_t* src);
 /* ray_first_fn / ray_last_fn of a bound source for the types they read
  * with collection_elem among those served here (I32, I16, BOOL, U8, DATE,
