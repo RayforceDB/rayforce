@@ -2521,8 +2521,22 @@ static int is_whole_column_projection(ray_t* expr, ray_t* tbl) {
         ray_graph_free(g);
         return whole;
     }
-    return (l == 6 && memcmp(p, "enlist", 6) == 0) ||
-           (l == 8 && memcmp(p, "distinct", 8) == 0) ||
+    if (l == 6 && memcmp(p, "enlist", 6) == 0) {
+        /* Only a single scalar value can stand for a broadcast column.
+         * Column arguments, vector constants and multi-argument enlist
+         * remain per-row constructors. Aggregate arguments are handled by
+         * the fallback's existing one-value rule. */
+        if (ray_len(expr) != 2) return 0;
+        ray_t* value = ((ray_t**)ray_data(expr))[1];
+        if (!ray_is_atom(value)) return 0;
+        if (value->type == -RAY_SYM) {
+            if (ray_table_get_col(tbl, value->i64) &&
+                !ray_env_has_lexical_local(value->i64)) return 0;
+            if (!(value->attrs & ATTR_QUOTED)) value = ray_env_get(value->i64);
+        }
+        return value && ray_is_atom(value);
+    }
+    return (l == 8 && memcmp(p, "distinct", 8) == 0) ||
            (l == 7 && memcmp(p, "reverse", 7) == 0) ||
            (l == 3 && memcmp(p, "asc", 3) == 0) ||
            (l == 4 && memcmp(p, "desc", 4) == 0);

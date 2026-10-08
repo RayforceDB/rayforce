@@ -22,3 +22,16 @@
 (count (select {n: (+ (count (concat s "!")) (count (distinct x))) by: k from: A where: (> x 9)})) -- 0
 ;; The collection concat primitive remains unchanged outside query scope.
 (concat ['a] 'b) -- ['a 'b]
+
+;; Enlist with columns stays a per-row constructor, including quoted names.
+(at (select {p: (enlist x) from: T}) 'p) -- (list [1] [2] [3])
+(at (select {p: (enlist 'x) y: x from: T}) 'p) -- (list [1] [2] [3])
+(at (select {p: (enlist x (+ x 1)) from: T}) 'p) -- (list [1 2] [2 3] [3 4])
+(at (select {p: (enlist x) y: x from: T}) 'y) -- [1 2 3]
+(at (select {n: (count (enlist x)) from: T}) 'n) -- [3]
+(at (select {p: (enlist 7 8) from: T}) 'p) -- (list [7 8] [7 8] [7 8])
+(count (select {p: (enlist [7 8]) from: T})) -- 3
+(set EC [7 8])
+(count (select {p: (enlist EC) from: T})) -- 3
+(set ES 7)
+(at (select {p: (enlist ES) a: (concat 1 2) from: T}) 'p) -- [7 7]
