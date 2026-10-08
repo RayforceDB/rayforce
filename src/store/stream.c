@@ -443,8 +443,9 @@ void ray_col_stream_hash_all(ray_col_stream_t* w, int64_t n, int64_t* col_ns) {
             stream_hash_task(&ctx, 0, 0, 1);
         }
     }
-    if (!cand)   /* OOM on the candidate list: the columns keep their zones */
-        for (int64_t c = 0; c < n; c++) w[c].wants_hash = false;
+    /* built (or, OOM on the candidate list, left with their zones): a
+     * later call has nothing to do for them */
+    for (int64_t c = 0; c < n; c++) w[c].wants_hash = false;
     ray_free_raw(cand);
     for (int64_t c = 0; c < n; c++)
         if (w[c].index) { ray_release(w[c].index); w[c].index = NULL; }
