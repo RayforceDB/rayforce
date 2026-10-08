@@ -3596,6 +3596,308 @@ static test_result_t test_radix_route_error(void) {
     PASS();
 }
 
+/* ---- Task 13: the v2 aggregate engine reads by pieces ---- */
+
+static test_result_t test_v2_routes(void) {
+    agg_route_reset();
+    SR_SAME("(select {s: (sum v) c: (count k) from: T by: g})", 0);                     /* dense */
+    SR_SAME("(select {s: (sum f) a: (avg v) from: T where: (> k 5000) by: g})", 0);     /* dense, sel */
+    SR_SAME("(select {c: (count k) from: T by: {g: g s: s}})", 0);                      /* multi key */
+    SR_SAME("(select {c: (count k) mn: (min v) from: T by: h})", 0);                    /* high cardinality: radix */
+    SR_SAME("(select {c: (count k) from: T where: (== b true) by: d})", 0);
+    SR_SAME("(select {x: (max f) from: T by: {d: d u: u}})", 0);
+    agg_route_stats_t rs = agg_route_stats();
+    TEST_ASSERT_TRUE(rs.routes[AGG_ROUTE_V2_DENSE] + rs.routes[AGG_ROUTE_V2_SERIAL_DENSE] > 0);
+    TEST_ASSERT_TRUE(rs.routes[AGG_ROUTE_V2_RADIX] + rs.routes[AGG_ROUTE_V2_TABLESTACK] > 0);
+    PASS();
+}
+
+/* Review focus 1: a 200001-row table on 3 workers gives dense blocks of
+ * 66667 rows, none vector-aligned. */
+static test_result_t test_v2_dense_unaligned(void) {
+    sr_eval_ok("(set Q (table [g v] (list (as 'I16 (% (til 200001) 5)) (til 200001))))");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/q2/\" Q {compress: true})");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/q0/\" Q {compress: false})");
+    ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(3), RAY_OK);
+    ray_t* a = sr_eval("(select {s: (sum v) from: (.db.splayed.get \"" SR_TMP "/q0/\") by: g})");
+    ray_enc_counters_reset();
+    ray_t* b = sr_eval("(select {s: (sum v) from: (.db.splayed.get \"" SR_TMP "/q2/\") by: g})");
+    ray_enc_counters_t k; ray_enc_counters_get(&k);
+    TEST_ASSERT_TRUE(a && b && !RAY_IS_ERR(a) && !RAY_IS_ERR(b));
+    ray_t* fa = ray_fmt(a, 0); ray_t* fb = ray_fmt(b, 0);
+    TEST_ASSERT_TRUE(ray_str_len(fa) == ray_str_len(fb) && memcmp(ray_str_ptr(fa), ray_str_ptr(fb), ray_str_len(fa)) == 0);
+    TEST_ASSERT_EQ_U(k.materialized, 0);
+    ray_release(fa); ray_release(fb); ray_release(a); ray_release(b);
+    PASS();
+}
+/* The pool this test resized is restored even when an assert fails first
+ * (finding M11; test/test_parquet.c:262 resizes the pool the same way). */
+static void srr_pool_teardown(void) { ray_pool_destroy(); (void)ray_pool_init_total(0); srr_teardown(); }
+
+/* Review focus 2: a SYM key over two partitions of different width classes. */
+static test_result_t test_v2_sym_key_parted(void) {
+    for (int gen = 0; gen <= 2; gen += 2)
+        for (int p = 0; p < 2; p++)
+            sr_evalf_ok("(.db.splayed.set \"" SR_TMP "/sp%d/2024.01.0%d/t/\" "
+                        "(table [s v] (list (as 'SYMBOL (map (fn [j] (format \"w%%\" (%% j %d))) (til 70000))) (til 70000))) "
+                        "\"" SR_TMP "/sp%d/.sym\" {compress: %s})", gen, p + 1, p ? 300 : 20, gen, gen ? "true" : "false");
+    ray_t* a = sr_eval("(select {c: (count v) s: (sum v) from: (.db.parted.get \"" SR_TMP "/sp0\" 't) by: s})");
+    ray_enc_counters_reset();
+    ray_t* b = sr_eval("(select {c: (count v) s: (sum v) from: (.db.parted.get \"" SR_TMP "/sp2\" 't) by: s})");
+    ray_enc_counters_t k; ray_enc_counters_get(&k);
+    TEST_ASSERT_TRUE(a && b && !RAY_IS_ERR(a) && !RAY_IS_ERR(b));
+    ray_t* fa = ray_fmt(a, 0); ray_t* fb = ray_fmt(b, 0);
+    TEST_ASSERT_TRUE(ray_str_len(fa) == ray_str_len(fb) && memcmp(ray_str_ptr(fa), ray_str_ptr(fb), ray_str_len(fa)) == 0);
+    TEST_ASSERT_EQ_U(k.materialized, 1);   /* the cardinality sample's segment 0 of s (Task 14) */
+    TEST_ASSERT_EQ_I(ray_table_nrows(b), 300);
+    ray_release(fa); ray_release(fb); ray_release(a); ray_release(b);
+    PASS();
+}
+
+/* Findings I5, I6, I8: parted group-bys on encoded segments go
+ * per-partition (each sub-table holds encoded segment slots); the partition
+ * key keeps today's path; a ragged generation-0 table answers as its
+ * explicit-null reference.  Nothing materializes. */
+static ray_t* sr_q(const char* q, uint64_t* mat) {
+    ray_enc_counters_reset();
+    ray_t* r = sr_eval(q);
+    ray_enc_counters_t k; ray_enc_counters_get(&k);
+    if (mat) *mat = k.materialized;
+    return r;
+}
+static bool sr_same_text(ray_t* a, ray_t* b) {
+    if (!a || !b || RAY_IS_ERR(a) || RAY_IS_ERR(b)) return false;
+    ray_t* fa = ray_fmt(a, 0); ray_t* fb = ray_fmt(b, 0);
+    bool same = ray_str_len(fa) == ray_str_len(fb) && memcmp(ray_str_ptr(fa), ray_str_ptr(fb), ray_str_len(fa)) == 0;
+    ray_release(fa); ray_release(fb);
+    return same;
+}
+static test_result_t test_v2_parted_routes(void) {
+    sr_parted_xy(SR_TMP "/vp2", 7, false, false);          /* every partition generation 2 */
+    sr_parted_xy(SR_TMP "/vp0", 0, false, false);
+    sr_parted_xy(SR_TMP "/vrg", 0, true, false);
+    sr_parted_xy(SR_TMP "/vrf", 0, false, true);
+    static const char* const q[] = {
+        "(select {s: (sum x) c: (count x) from: (.db.parted.get \"%s\" 't) by: y})",   /* low cardinality: per partition */
+        "(select {s: (sum x) from: (.db.parted.get \"%s\" 't) by: date})",            /* the partition key (MAPCOMMON) */
+        "(select {m: (max x) from: (.db.parted.get \"%s\" 't) where: (> x 100) by: y})",
+        NULL,
+    };
+    for (int i = 0; q[i]; i++) {
+        char a[512], b[512];
+        snprintf(a, sizeof a, q[i], SR_TMP "/vp0"); snprintf(b, sizeof b, q[i], SR_TMP "/vp2");
+        int64_t pp0 = ray_group_perpart_runs();
+        uint64_t m = 9;
+        ray_t* r0 = sr_q(a, NULL); ray_t* r2 = sr_q(b, &m);
+        TEST_ASSERT_FMT(sr_same_text(r0, r2), "%s", q[i]);
+        /* exec_group_parted's cardinality sample still materializes the
+         * key's segment 0 (group_parted_seg_col: Task 14 reads it by range);
+         * the per-partition v2 runs materialize nothing. */
+        uint64_t want = i == 1 ? 0 : 1;
+        TEST_ASSERT_FMT(m == want, "%s: %llu materializations", q[i], (unsigned long long)m);
+        if (i != 1) TEST_ASSERT_TRUE(ray_group_perpart_runs() - pp0 >= 2);  /* both generations per partition */
+        sr_drop(r0); sr_drop(r2);
+        snprintf(a, sizeof a, q[i], SR_TMP "/vrf"); snprintf(b, sizeof b, q[i], SR_TMP "/vrg");
+        r0 = sr_q(a, NULL); r2 = sr_q(b, &m);
+        TEST_ASSERT_FMT(sr_same_text(r0, r2), "ragged: %s", q[i]);
+        TEST_ASSERT_EQ_U(m, 0);
+        sr_drop(r0); sr_drop(r2);
+    }
+    PASS();
+}
+
+/* Review focus 4: a corrupt chunk under a group-by. */
+static test_result_t test_v2_error(void) {
+    char path[600];
+    sr_make_bad("v", path, sizeof path);
+    ray_error_clear();
+    ray_t* r = sr_eval("(select {s: (sum v) from: (.db.splayed.get \"" SR_TMP "/bad/\") by: g})");
+    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+    TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
+    TEST_ASSERT_TRUE(strstr(ray_error_msg(), path) != NULL);
+    ray_error_free(r);
+    PASS();
+}
+
+/* Table W: a column for every v2 strategy's shape (200000 rows).
+ *   sk  skewed key, 200000-slot range, mostly 0 (shared dense: max n)
+ *   t   1000 sparse groups (table stack)      h   near-unique (radix)
+ *   c1, c2  composite whose raw range product overflows (compacted dense)
+ *   nk  nullable I32 key of 50 values           f   nullable F64 with fractions */
+static void sr_w_tables(void) {
+    sr_eval_ok("(set W (table [k g s f n sk t c1 c2 nk h d u] (list i (as 'I16 (% i 7)) "
+               "(take ['a 'b 'c 'd 'e] 200000) "
+               "(as 'F64 (map (fn [j] (if (== 0 (% j 13)) 0N (* j 0.37))) i)) (as 'I32 (- 0 i)) "
+               "(map (fn [j] (if (== 0 (% j 100)) j 0)) i) (* (% i 1000) 1000003) "
+               "(* (% i 100) 1000) (* (% i 50) 1000) "
+               "(as 'I32 (map (fn [j] (if (== 0 (% j 10)) 0N (% j 50))) i)) (% (* i 7919) 1000003) "
+               "(as 'DATE (% i 900)) (as 'U8 (% i 200)))))");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/w0/\" W {compress: false})");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/w2/\" W {compress: true})");
+}
+#define SR_W0 "(.db.splayed.get \"" SR_TMP "/w0/\")"
+#define SR_W2 "(.db.splayed.get \"" SR_TMP "/w2/\")"
+
+/* The F64 column `col` of q's result, generation 0 against 2: equal bits. */
+static test_result_t sr_f64_bits_same(const char* q, const char* col) {
+    ray_t* out[2];
+    for (int gen = 0; gen < 2; gen++) {
+        sr_evalf_ok("(set T %s)", gen ? SR_W2 : SR_W0);
+        out[gen] = sr_eval(q);
+        TEST_ASSERT_FMT(out[gen] && !RAY_IS_ERR(out[gen]), "gen %d: %s", gen, q);
+    }
+    ray_t* a = ray_table_get_col(out[0], ray_sym_intern(col, strlen(col)));
+    ray_t* b = ray_table_get_col(out[1], ray_sym_intern(col, strlen(col)));
+    TEST_ASSERT_TRUE(a && b && a->type == RAY_F64 && b->type == RAY_F64 && a->len == b->len && a->len > 0);
+    TEST_ASSERT_FMT(memcmp(ray_data(a), ray_data(b), (size_t)a->len * 8) == 0, "%s: %s bits differ", q, col);
+    ray_release(out[0]); ray_release(out[1]);
+    PASS();
+}
+
+/* Every v2 strategy over staged keys and inputs: equal answers, nothing
+ * materialized, and the strategy the line names is the one that ran. */
+static test_result_t test_v2_route_shapes(void) {
+    sr_w_tables();
+    enum { R_LOCAL = 1, R_PART, R_SHARED, R_RADIX, R_TS, R_SH };
+    static const struct { const char* q; int route; } qs[] = {
+        { "(select {mx: (max n) from: T by: sk})", R_SHARED },
+        { "(select {c: (count k) s: (sum f) a: (avg g) from: T by: t})", R_TS },
+        { "(select {c: (count k) mx: (max f) from: T where: (> k 1000) by: t})", R_TS },
+        { "(select {c: (count k) s: (sum g) from: T where: (> k 1000) by: h})", R_RADIX },
+        { "(select {p: (pearson_corr f g) c: (count k) from: T by: {h: h g: g}})", R_RADIX },
+        { "(select {c: (count k) s: (sum f) from: T by: {c1: c1 c2: c2}})", R_LOCAL },
+        { "(select {c: (count k) s: (sum f) mn: (min n) from: T by: nk})", R_LOCAL },
+        { "(select {s: (sum f) v: (var n) from: T where: (> g 2) by: s})", R_LOCAL },
+        { "(select {x: (max f) c: (count k) from: T where: (> k 1000) by: {d: d u: u}})", R_PART },
+        { "(select {x: (sum f) p: (pearson_corr f n) from: T by: {d: d u: u}})", R_PART },
+        { "(select {c: (count k) a: (avg nk) from: T by: {nk: nk s: s}})", R_LOCAL },
+    };
+    for (size_t i = 0; i < sizeof qs / sizeof qs[0]; i++) {
+        agg_route_reset();
+        test_result_t r = sr_same_on(SR_W0, SR_W2, qs[i].q, 0);
+        if (r.status != TEST_PASS) return r;
+        agg_route_stats_t rs = agg_route_stats();   /* the generation-2 run */
+        bool ok = false;
+        switch (qs[i].route) {
+            case R_LOCAL:  ok = rs.routes[AGG_ROUTE_V2_DENSE] && rs.dense_strategy == AGG_DENSE_TASK_LOCAL; break;
+            case R_PART:   ok = rs.routes[AGG_ROUTE_V2_DENSE] && rs.dense_strategy == AGG_DENSE_PARTITIONED; break;
+            case R_SHARED: ok = rs.routes[AGG_ROUTE_V2_DENSE] && rs.dense_strategy == AGG_DENSE_SHARED; break;
+            case R_RADIX:  ok = rs.routes[AGG_ROUTE_V2_RADIX] > 0; break;
+            case R_TS:     ok = rs.routes[AGG_ROUTE_V2_TABLESTACK] > 0; break;
+        }
+        TEST_ASSERT_FMT(ok, "%s: not on route %d (dense strategy %d)", qs[i].q, qs[i].route, (int)rs.dense_strategy);
+    }
+    /* the small hash (the radix strategy's allocation fallback), forced:
+     * staged keys are grouped by key words, merged and emitted from them.
+     * Its group order follows the workers' ranges, so the lines sort. */
+    static const char* const qsh[] = {
+        "(select {from: (select {c: (count k) s: (sum f) from: T by: t}) asc: t})",
+        "(select {from: (select {c: (count k) mx: (max f) from: T where: (> k 1000) by: {t: t s: s}}) asc: t})",
+        "(select {from: (select {c: (count k) s: (sum g) from: T by: {nk: nk h: h}}) asc: h})",
+        NULL };
+    agg_test_force_smallhash(true);
+    for (int i = 0; qsh[i]; i++) {
+        agg_route_reset();
+        test_result_t r = sr_same_on(SR_W0, SR_W2, qsh[i], 0);
+        if (r.status != TEST_PASS) { agg_test_force_smallhash(false); return r; }
+        TEST_ASSERT_FMT(agg_route_stats().routes[AGG_ROUTE_V2_SMALLHASH] > 0, "%s: not small hash", qsh[i]);
+    }
+    agg_test_force_smallhash(false);
+    /* random strategies take plain columns: the serial path (below the
+     * parallel threshold), the indexed driver (median), first-N */
+    sr_eval_ok("(set W5 (take W 50000))");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/w50/\" W5 {compress: false})");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/w52/\" W5 {compress: true})");
+    test_result_t r = sr_same_on("(.db.splayed.get \"" SR_TMP "/w50/\")", "(.db.splayed.get \"" SR_TMP "/w52/\")",
+                                 "(select {c: (count k) s: (sum f) from: T by: {g: g s: s}})", UINT64_MAX);
+    if (r.status != TEST_PASS) return r;
+    if ((r = sr_same_on(SR_W0, SR_W2, "(select {m: (med f) c: (count k) from: T by: g})", UINT64_MAX)).status != TEST_PASS) return r;
+    if ((r = sr_same_on(SR_W0, SR_W2, "(select {c: (count k) s: (sum n) from: T by: h take: 5})", UINT64_MAX)).status != TEST_PASS) return r;
+    /* k materialized before the query: read in place beside staged inputs */
+    sr_eval_ok("(set W2M " SR_W2 ")");
+    ray_t* t = sr_eval("W2M");
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    ray_t* tcol = ray_table_col(t, ray_sym_intern("t", 1));
+    TEST_ASSERT_TRUE(tcol && !RAY_IS_ERR(tcol));
+    sr_drop(t);
+    if ((r = sr_same_on(SR_W0, "W2M", "(select {c: (count k) s: (sum f) from: T by: t})", 0)).status != TEST_PASS) return r;
+    PASS();
+}
+
+/* Float sums keep their bits across generations on every strategy: the
+ * aggregates fold row by row into their states, in row order, whatever
+ * the pieces. */
+static test_result_t test_v2_f64_bits(void) {
+    sr_w_tables();
+    static const char* const qs[] = {
+        "(select {s: (sum f) from: T by: g})",                              /* task-local dense */
+        "(select {s: (sum f) from: T where: (> k 77) by: g})",              /* dense, selection */
+        "(select {s: (sum f) from: T by: {d: d u: u}})",                    /* partitioned */
+        "(select {s: (sum f) from: T by: h})",                              /* radix */
+        "(select {s: (sum f) from: T by: t})",                              /* table stack */
+        "(select {s: (sum f) from: T where: (> k 77) by: t})",
+        NULL };
+    /* (the small hash folds worker partials whose rows follow the pool's
+     * scheduling: its float bits vary run to run in either generation) */
+    for (int i = 0; qs[i]; i++) {
+        test_result_t r = sr_f64_bits_same(qs[i], "s");
+        if (r.status != TEST_PASS) return r;
+    }
+    PASS();
+}
+
+/* R-FAIL on every strategy: a corrupt chunk of a key or an input is the
+ * query's error (code and path), on every run. */
+static test_result_t test_v2_route_error(void) {
+    sr_w_tables();
+    char path[600];
+    /* Grouped by column (one corrupt copy each).  A sampler that reads the
+     * corrupt vector first (the shared-slab sample, the table stack gate)
+     * answers the same error. */
+    static const struct { const char* col; const char* q; bool sh; } cs[] = {
+        { "g",  "(select {s: (sum f) from: B by: g})", false },                          /* dense key */
+        { "f",  "(select {s: (sum f) from: B where: (> k 1000) by: g})", false },         /* dense sel input */
+        { "f",  "(select {x: (sum f) from: B by: {d: d u: u}})", false },                 /* partitioned input */
+        { "f",  "(select {x: (max f) from: B where: (> k 1000) by: {d: d u: u}})", false },
+        { "f",  "(select {s: (sum f) from: B by: h})", false },                           /* radix scatter */
+        { "f",  "(select {s: (sum f) from: B where: (> k 1000) by: h})", false },
+        { "f",  "(select {c: (count k) s: (sum f) from: B by: t})", false },              /* table stack */
+        { "f",  "(select {c: (count k) s: (sum f) from: B where: (> k 1000) by: t})", false },
+        { "f",  "(select {s: (sum f) from: B where: (> k 1000) by: t})", true },          /* small hash */
+        { "f",  "(select {s: (sum f) from: B by: t})", true },
+        { "u",  "(select {x: (sum f) from: B by: {d: d u: u}})", false },                 /* partitioned key */
+        { "n",  "(select {mx: (max n) from: B by: sk})", false },                         /* shared input */
+        { "h",  "(select {c: (count k) from: B by: h})", false },                         /* radix key */
+        { "h",  "(select {c: (count k) from: B where: (> k 1000) by: h})", false },
+        { "t",  "(select {c: (count k) s: (sum f) from: B by: t})", false },              /* table stack key */
+        { "t",  "(select {c: (count k) from: B by: t})", true },                          /* small hash key */
+    };
+    for (size_t c = 0; c < sizeof cs / sizeof cs[0]; c++) {
+        if (c == 0 || strcmp(cs[c].col, cs[c - 1].col) != 0) {
+            sr_eval_ok("(.db.splayed.set \"" SR_TMP "/wbad/\" W {compress: true})");
+            char dir[512];
+            if (ray_splay_resolve_dir(ray_test_tmp(SR_TMP "/wbad/"), dir, sizeof dir) != RAY_OK) abort();
+            snprintf(path, sizeof path, "%s/%s", dir, cs[c].col);
+            uint64_t off = sr_dirent_offset(path, 2);
+            TEST_ASSERT_TRUE(off != 0);
+            sr_patch(path, (long)off + 6, 1);
+        }
+        agg_test_force_smallhash(cs[c].sh);
+        for (int i = 0; i < 2; i++) {
+            sr_eval_ok("(set B (.db.splayed.get \"" SR_TMP "/wbad/\"))");
+            ray_error_clear();
+            ray_t* r = sr_eval(cs[c].q);
+            if (!(r && RAY_IS_ERR(r))) agg_test_force_smallhash(false);
+            TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "%s (bad %s): no error", cs[c].q, cs[c].col);
+            TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
+            TEST_ASSERT_FMT(strstr(ray_error_msg(), path) != NULL, "%s: %s", cs[c].q, ray_error_msg());
+            ray_error_free(r);
+        }
+        agg_test_force_smallhash(false);
+    }
+    PASS();
+}
+
 const test_entry_t scanrange_entries[] = {
     { "scanrange/walk_gen0_zero_copy",     test_walk_gen0_zero_copy,     sr_setup,    sr_teardown },
     { "scanrange/walk_gen2_vectors",       test_walk_gen2_vectors,       sr_setup,    sr_teardown },
@@ -3687,5 +3989,13 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/radix_route_shapes", test_radix_route_shapes, srr_setup, srr_teardown },
     { "scanrange/radix_route_serial", test_radix_route_serial, srr_setup, srr_teardown },
     { "scanrange/radix_route_error",  test_radix_route_error,  srr_setup, srr_teardown },
+    { "scanrange/v2_routes",          test_v2_routes,          srr_setup, srr_teardown },
+    { "scanrange/v2_dense_unaligned", test_v2_dense_unaligned, srr_setup, srr_pool_teardown },
+    { "scanrange/v2_sym_key_parted",  test_v2_sym_key_parted,  srr_setup, srr_teardown },
+    { "scanrange/v2_parted_routes",   test_v2_parted_routes,   srr_setup, srr_teardown },
+    { "scanrange/v2_error",           test_v2_error,           srr_setup, srr_teardown },
+    { "scanrange/v2_route_shapes",    test_v2_route_shapes,    srr_setup, srr_teardown },
+    { "scanrange/v2_f64_bits",        test_v2_f64_bits,        srr_setup, srr_teardown },
+    { "scanrange/v2_route_error",     test_v2_route_error,     srr_setup, srr_teardown },
     { NULL, NULL, NULL, NULL },
 };

@@ -25,16 +25,21 @@ extern bool ray_agg_tablestack;
 #define AGG_FIRSTN_MAX        1024     /* largest take: N the pre-pass serves */
 #define AGG_FIRSTN_PROBE_ROWS 65536    /* prefix budget for the serial scan, at least */
 
-/* Read element `row` of an integer/temporal/SYM column widened to int64. */
-static inline int64_t agg_read_key_i64(ray_t* col, const void* data, int64_t row) {
-    switch (col->type) {
-        case RAY_I64: case RAY_TIMESTAMP: return ((const int64_t*)data)[row];
-        case RAY_I32: case RAY_DATE: case RAY_TIME: return ((const int32_t*)data)[row];
-        case RAY_I16: return ((const int16_t*)data)[row];
-        case RAY_U8:  case RAY_BOOL: return ((const uint8_t*)data)[row];
-        case RAY_SYM: return (int64_t)ray_read_sym(data, row, col->type, col->attrs);
+/* Read element `i` of integer/temporal/SYM data of `type` widened to int64;
+ * a SYM element's width comes from `attrs` (a column's, or a range piece's). */
+static inline int64_t agg_read_key_i64_raw(int8_t type, uint8_t attrs, const void* data, int64_t i) {
+    switch (type) {
+        case RAY_I64: case RAY_TIMESTAMP: return ((const int64_t*)data)[i];
+        case RAY_I32: case RAY_DATE: case RAY_TIME: return ((const int32_t*)data)[i];
+        case RAY_I16: return ((const int16_t*)data)[i];
+        case RAY_U8:  case RAY_BOOL: return ((const uint8_t*)data)[i];
+        case RAY_SYM: return (int64_t)ray_read_sym(data, i, RAY_SYM, attrs);
         default: return 0;  /* gate guarantees only the above reach here */
     }
+}
+/* Read element `row` of an integer/temporal/SYM column widened to int64. */
+static inline int64_t agg_read_key_i64(ray_t* col, const void* data, int64_t row) {
+    return agg_read_key_i64_raw(col->type, col->attrs, data, row);
 }
 /* The key types agg_read_key_i64 reads. */
 static inline bool agg_key_i64_type(int8_t t) {
@@ -109,6 +114,10 @@ void agg_route_note_key_domain(void);
 agg_route_stats_t agg_route_stats(void);
 void agg_route_record(agg_route_t route);
 void agg_route_reason(agg_v2_reason_t reason);
+/* Test hook (C tests only): the parallel int/SYM-key strategies run the
+ * small hash (their allocation-failure fallback) in place of the table
+ * stack and the radix scatter.  Disarmed by ray_test_hooks_off. */
+void agg_test_force_smallhash(bool on);
 
 /* True iff the v2 engine fully supports this group node over this table.
  * Conservative: any uncertainty → false → caller uses the existing engine. */

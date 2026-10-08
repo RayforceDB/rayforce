@@ -2593,7 +2593,9 @@ static test_result_t test_compile_paths_bound(void) {
             if (!is_err) break;
             TEST_ASSERT_FMT(be, "query %d bind %d: not the bind error", i, n);
         }
-        TEST_ASSERT_FMT(n - 1 == 2, "query %d: %d binds", i, n - 1);   /* v and w, each failing in turn */
+        /* v and w, each failing in turn, and the group key k (P2 Task 13:
+         * the v2 engine binds its keys) */
+        TEST_ASSERT_FMT(n - 1 == (i == 1 ? 2 : 3), "query %d: %d binds", i, n - 1);
     }
     PASS();
 }
@@ -3194,10 +3196,12 @@ static test_result_t test_group_desc_bound(void) {
             agg_route_stats_t st = agg_route_stats();
             TEST_ASSERT_FMT(out[gi] && !RAY_IS_ERR(out[gi]), "case %zu gen %d ran", c, gi * 2);
             TEST_ASSERT_FMT(st.routes[cases[c].route] == 1, "case %zu gen %d route", c, gi * 2);
-            /* every failure before the first success is the bind error: both value columns */
+            /* every failure before the first success is the bind error: the
+             * key (P2 Task 13: the v2 engine binds its keys) and both value
+             * columns */
             bool all_err = false;
             int nb = cp_bind_sweep(cp_group_body, &cx, &all_err);
-            TEST_ASSERT_FMT(all_err && nb == 2, "case %zu gen %d sweep nb=%d all_err=%d", c, gi * 2, nb, all_err);
+            TEST_ASSERT_FMT(all_err && nb == 3, "case %zu gen %d sweep nb=%d all_err=%d", c, gi * 2, nb, all_err);
             ray_release(t);
         }
         TEST_ASSERT_FMT(cp_groups_same(out[0], out[1], cases[c].groups, 2), "case %zu answers differ", c);
@@ -4910,11 +4914,11 @@ static test_result_t test_select_bydict_binds_referenced(void) {
     TEST_ASSERT_STR_EQ(ev_code("(set lam_k2 (fn [] (% k2 2)))"), "");
     TEST_ASSERT_STR_EQ(ev_code(ray_test_tmp("(.db.splayed.set \"" CS_TMP "/w2\" t {compress: true})")), "");
     static const struct { const char* q; uint64_t cols; } qs[] = {
-        { "(select {c: (count a) by: {k1: k1 k2: k2} from: %s})",              2 },
-        { "(select {s: (sum a) by: {k1: k1 k2: k2} from: %s})",                3 },
+        { "(select {c: (count a) by: {k1: k1 k2: k2} from: %s})",              0 },  /* P2 Task 13: v2 reads keys by range */
+        { "(select {s: (sum a) by: {k1: k1 k2: k2} from: %s})",                0 },  /* P2 Task 13 */
         { "(select {c: (count a) by: {m: (%% a 3)} from: %s})",                1 },
-        { "(select {s: (sum a) by: {k1: k1 m: (%% k2 3)} from: %s})",          3 },
-        { "(select {s: (sum a) by: {g: k2} from: %s where: (> a 10)})",        2 },
+        { "(select {s: (sum a) by: {k1: k1 m: (%% k2 3)} from: %s})",          1 },  /* P2 Task 13: the computed key materializes k2 */
+        { "(select {s: (sum a) by: {g: k2} from: %s where: (> a 10)})",        1 },  /* P2 Task 13: v2 reads a by range */
         { "(select {d: (count (distinct a)) by: (%% k2 3) from: %s})",         2 },
         { "(select {c: (count a) by: {g: (lam_k2)} from: %s})",                20 },  /* a lambda may read any column */
         { NULL, 0 },
@@ -4957,10 +4961,10 @@ static test_result_t test_select_decodes_referenced_only(void) {
         { "(select {c: (count v) from: u2 where: (> v 100)})",                0 },  /* P2 Task 10: the scalar route range-reads */
         { "(select {s: (sum v) from: u2 where: (== k 3)})",                   0 },  /* P2: k's consult reads the directory; Task 10: v by range */
         { "(select {from: u2 where: (== k 3)})",                              6 },  /* every column is output */
-        { "(select {s: (sum v) by: k from: u2})",                             2 },
-        { "(select {s: (sum v) c: (max w) by: [k m] from: u2})",              4 },
+        { "(select {s: (sum v) by: k from: u2})",                             0 },  /* P2 Task 13: v2 reads by range */
+        { "(select {s: (sum v) c: (max w) by: [k m] from: u2})",              0 },  /* P2 Task 13 */
         { "(select {s: (sum v) by: k from: u2 where: (> w 5)})",              2 },  /* P2: w's consult reads the directory */
-        { "(select {s: (sum v) by: k from: u2 desc: s take: 2})",             2 },
+        { "(select {s: (sum v) by: k from: u2 desc: s take: 2})",             0 },  /* P2 Task 13 */
         { "(select {d: (med v) e: (first w) from: u2})",                      1 },  /* P2 Task 10: med reads plain v, first w by range */
         { "(select {d: (avg v) e: (dev w) from: u2 where: (< x 1000)})",      0 },  /* P2: x's consult reads the directory; Task 10: v, w by range */
         { "(select {k: k v: v from: u2 take: 5})",                            2 },
