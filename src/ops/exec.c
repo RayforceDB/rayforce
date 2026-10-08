@@ -637,7 +637,8 @@ typedef struct {
     uint8_t*       ob;       /* output base; element i writes ob[i - ob_base] */
     int64_t        ob_base;  /* 0 for full-vec output; morsel start for fused-sel */
     int8_t         ct;
-    /* SYM columns: per-domain-position membership verdict (1 = in set),
+    /* SYM columns: per-domain-position membership verdict (1 = in set;
+     * null slot preadjusted so XOR with negate always yields 0),
      * built once over the VOCABULARY in in_build_worker_ctx.  Turns the
      * per-row linear set scan into one byte load — any set size, width-
      * specialized, vectorizable.  NULL when not applicable. */
@@ -1120,6 +1121,9 @@ static in_ctx_status_t in_build_worker_ctx(ray_t* col, ray_t* set, bool negate,
                 memset(lut, 0, (size_t)d);
                 for (int64_t j = 0; j < sv_len; j++)
                     if (svi[j] >= 0 && svi[j] < d) lut[svi[j]] = 1;
+                /* Null rows fail both in and not-in. The worker XORs every
+                 * entry with negate, so preadjust ID 0 to keep it false. */
+                lut[0] = (uint8_t)negate;
                 *lut_hdr_out = lh;
                 symlut = lut;
             }
