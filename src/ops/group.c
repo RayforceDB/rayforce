@@ -11227,11 +11227,10 @@ typedef struct {
     ray_group_emit_filter_t emit_filter;
 } sp_dyn_ctx_t;
 
-/* Parallel dense-count fill for the sp_dyn pure-count case: each worker
- * scatters its row slice into a private uint32[bound] array; the caller
- * merges them into range_count.  The serial scatter was the Amdahl wall of
- * every single-SYM-key "top-N by count" query (ClickBench q13: 88ms of a
- * 110ms query in one thread's cache-miss loop; flat 8->16 core scaling).
+/* Parallel dense-count fill for the legacy sparse-dynamic path: each worker
+ * scatters its row slice into a private uint32[stride] array with `bound`
+ * live counters and cache-line padding.  The caller merges the live
+ * counters into range_count.
  * A key outside [0, bound) sets `fail` and the caller falls back to the
  * serial path — correctness never depends on the bound being right. */
 typedef struct {
@@ -11346,10 +11345,12 @@ exec_group_sp_dyn_emit(const sp_dyn_ctx_t* c) {
                     else if (key_esz == 2)   bound = 1u << 16;
                     ray_pool_t* dp = ray_pool_get();
                     uint32_t dnw = dp ? ray_pool_total_workers(dp) : 1;
-                    /* Small symbol domains otherwise put several workers'
-                     * hot counters on the same cache line.  Pad each slice
+                    /* Isolate adjacent workers' boundary counters even when
+                     * bound is not a cache-line multiple.  Pad each slice
                      * and align the base, retaining the scratch header for
-                     * cleanup.  Include alignment slack in the memory cap. */
+                     * cleanup.  The earlier dense path handles small spans.
+                     * Include alignment slack in the memory cap; allocations
+                     * just below the old cap may now fall back to serial. */
                     const size_t pc_line = 64;
                     const size_t pc_per_line = pc_line / sizeof(uint32_t);
                     size_t stride = ((size_t)bound + pc_per_line - 1)
