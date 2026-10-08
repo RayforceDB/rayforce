@@ -9317,6 +9317,8 @@ void ray_select_scan_filtered(ray_t* sel, int64_t kept) {
 }
 
 ray_t* ray_select(ray_t** args, int64_t n) {
+    ray_t* merged = n > 0 ? ray_select_merge_plan(args[0]) : NULL;
+    if (merged) args = &merged;
     select_scan_t ss = { .args = args };
     exec_scan_init(&ss.scan);
     exec_scan_init(&ss.defer);
@@ -9327,6 +9329,7 @@ ray_t* ray_select(ray_t** args, int64_t n) {
     t_select_scan = prev_ss;
     ray_pool_scan_set(prev_scan);
     if (ss.gate_hdr) scratch_free(ss.gate_hdr);
+    if (merged) ray_release(merged);
     return r;
 }
 

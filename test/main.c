@@ -158,6 +158,7 @@ extern const test_entry_t repl_entries[];
 extern const test_entry_t rowsel_entries[];
 extern const test_entry_t runtime_entries[];
 extern const test_entry_t sel_entries[];
+extern const test_entry_t select_merge_entries[];
 extern const test_entry_t sort_entries[];
 extern const test_entry_t splay_entries[];
 extern const test_entry_t store_entries[];
@@ -203,7 +204,7 @@ static const test_entry_t* const compiled_groups[] = {
     pipe_entries,     platform_entries,
     pool_entries,     progress_entries,
     public_api_entries,
-    repl_entries,     rowsel_entries,   runtime_entries,  sel_entries,
+    repl_entries,     rowsel_entries,   runtime_entries,  sel_entries, select_merge_entries,
     sort_entries,     splay_entries,    store_entries,
     stress_eval_entries,
     stress_matrix_entries,
