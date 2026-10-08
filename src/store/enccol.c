@@ -1666,6 +1666,39 @@ void ray_enccol_chunk_stat(const ray_enccol_t* e, int64_t c, ray_enc_chunk_stat_
     out->sum_lo = de.sum_lo; out->sum_hi = de.sum_hi;
 }
 
+void ray_enccol_dir_totals(ray_enccol_t* e, ray_enc_col_totals_t* out) {
+    if (atomic_load_explicit(&e->totals_state, memory_order_acquire) == 2) { *out = e->totals; return; }
+    bool fl = enc_type_float(e->type);
+    out->sum_wrapped = 0; out->sum_hi = 0; out->sum_lo = 0; out->nonnull = 0;
+    out->min_i = INT64_MAX; out->max_i = INT64_MIN;
+    out->min_f = INFINITY;  out->max_f = -INFINITY;
+    for (int64_t c = 0; c < e->n_chunks; c++) {
+        ray_enc_dirent_t de;
+        dirent_at(e, c, &de);
+        out->sum_wrapped += de.sum_lo;
+        uint64_t l = out->sum_lo + de.sum_lo;              /* ray_i128_add128 */
+        out->sum_hi += (int64_t)de.sum_hi + (l < de.sum_lo ? 1 : 0);
+        out->sum_lo = l;
+        out->nonnull += chunk_rows(e, c) - (int64_t)de.null_count;
+        if (de.flags & RAY_ENC_STAT_ABSENT) continue;
+        if (fl) {
+            double mn = dbl_of(de.min), mx = dbl_of(de.max);
+            if (mn < out->min_f) out->min_f = mn;
+            if (mx > out->max_f) out->max_f = mx;
+        } else {
+            if (de.min < out->min_i) out->min_i = de.min;
+            if (de.max > out->max_i) out->max_i = de.max;
+        }
+    }
+    /* first finisher stores the (identical) totals; readers wait for 2 */
+    uint8_t idle = 0;
+    if (atomic_compare_exchange_strong_explicit(&e->totals_state, &idle, 1,
+                                                memory_order_acq_rel, memory_order_relaxed)) {
+        e->totals = *out;
+        atomic_store_explicit(&e->totals_state, 2, memory_order_release);
+    }
+}
+
 void ray_enccol_byte_range(const ray_enccol_t* e, int64_t lo, int64_t hi,
                            uint64_t* off, uint64_t* len) {
     int64_t c0 = lo / RAY_ENC_CHUNK, c1 = (hi - 1) / RAY_ENC_CHUNK;

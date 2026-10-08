@@ -2551,6 +2551,15 @@ static void exec_release_tmp(ray_graph_t* g, ray_t* t) {
     ray_release(t);
 }
 
+/* The table an OP_SCAN reads: pad[0..1] holds table_id + 1, 0 = g->table. */
+static ray_t* scan_table_of(ray_graph_t* g, ray_op_ext_t* ext) {
+    uint16_t stored_table_id = 0;
+    memcpy(&stored_table_id, ext->base.pad, sizeof(uint16_t));
+    if (stored_table_id > 0 && g->tables && (stored_table_id - 1) < g->n_tables)
+        return g->tables[stored_table_id - 1];
+    return g->table;
+}
+
 static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
     if (!op) return ray_error("nyi", NULL);
 
@@ -2559,15 +2568,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
             ray_op_ext_t* ext = find_ext(g, op->id);
             if (!ext) return ray_error("nyi", NULL);
 
-            /* Resolve table: pad[0..1] stores table_id+1 (0 = default g->table) */
-            uint16_t stored_table_id = 0;
-            memcpy(&stored_table_id, ext->base.pad, sizeof(uint16_t));
-            ray_t* scan_tbl;
-            if (stored_table_id > 0 && g->tables && (stored_table_id - 1) < g->n_tables) {
-                scan_tbl = g->tables[stored_table_id - 1];
-            } else {
-                scan_tbl = g->table;
-            }
+            ray_t* scan_tbl = scan_table_of(g, ext);
             if (!scan_tbl) return ray_error("schema", NULL);
             ray_t* col = ray_table_col(scan_tbl, ext->sym);
             if (!col) return ray_error("schema", NULL);
@@ -2682,7 +2683,29 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
         case OP_MIN: case OP_MAX:
         case OP_COUNT: case OP_AVG: case OP_FIRST: case OP_LAST:
         case OP_STDDEV: case OP_STDDEV_POP: case OP_VAR: case OP_VAR_POP: {
-            ray_t* input = exec_node(g, op_child(g, op, 0));
+            /* A reduction of an encoded column's scan, no selection: reduce
+             * the bound source (directory answer or range reads) instead of
+             * materializing it.  A table without an encoded slot never
+             * enters (sm.enc is NULL). */
+            ray_op_t* child = op_child(g, op, 0);
+            if (child && child->opcode == OP_SCAN && !g->selection) {
+                ray_op_ext_t* se = find_ext(g, child->id);
+                ray_t* scan_tbl = se ? scan_table_of(g, se) : NULL;
+                ray_col_meta_t sm;
+                if (scan_tbl && ray_table_col_meta(scan_tbl, se->sym, &sm) && sm.enc &&
+                    !ray_col_bind_declines(scan_tbl, se->sym)) {
+                    ray_t* berr = NULL;
+                    ray_col_src_t* src = ray_graph_bind_col(g, scan_tbl, se->sym, &berr);
+                    if (berr) return berr;
+                    if (src) {
+                        if (src->type > 0 && !agg_type_admitted(op->opcode, src->type))
+                            return ray_error("type", "aggregate: element type not admitted for this aggregation, got %s", ray_type_name(src->type));
+                        ray_t* r = exec_reduction_src(g, op, src);
+                        if (r) return r;            /* NULL: type not served, plain path below */
+                    }
+                }
+            }
+            ray_t* input = exec_node(g, child);
             if (!input || RAY_IS_ERR(input)) return input;
             /* Compact lazy selection before reducing — filters may have
              * set g->selection without materializing a compacted table. */

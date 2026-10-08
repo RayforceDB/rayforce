@@ -436,6 +436,12 @@ bool ray_zone_int_sum(ray_t* x, int64_t* sum_out, int64_t* nn_out);
  * metadata: true when the per-chunk high words are stored, or when no
  * partial sum can wrap int64 (then the wrapped sum is the exact one). */
 bool ray_zone_int_sum128(ray_t* x, int64_t* hi_out, uint64_t* lo_out, int64_t* nn_out);
+/* OP_SUM / OP_AVG / OP_MIN / OP_MAX of a single-file generation-2 column
+ * whose recorded index is CHUNK_ZONE, answered as ray_sum_fn / ray_avg_fn /
+ * ray_min_fn / ray_max_fn answer the generation-0 column from its
+ * CHUNK_ZONE (the zone the materialization would synthesize), from the
+ * directory; NULL when that zone path would not answer. */
+ray_t* ray_zone_dir_answer(ray_t* encv, uint16_t opcode);
 
 /* Build a RAY_IDX_DICT (codes + distinct values) for STR vector `v` WITHOUT
  * attaching it — standalone RAY_INDEX object (caller releases / attaches).

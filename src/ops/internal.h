@@ -1182,6 +1182,19 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
 
 /* ── group.c ── */
 ray_t* exec_reduction(ray_graph_t* g, ray_op_t* op, ray_t* input);
+/* Reduction `opcode` (out_type: the op's, 0 for the input's) over a bound
+ * encoded source without a selection: the result exec_reduction gives over
+ * its materialization, from directory statistics where agg.c answers a
+ * generation-0 CHUNK_ZONE column from its zone (ray_zone_dir_answer),
+ * else by range reads.  NULL when the type or op is not served here (the
+ * caller takes the plain path); otherwise a result or an owned error. */
+ray_t* ray_reduce_src(ray_col_src_t* src, uint16_t opcode, int8_t out_type);
+ray_t* exec_reduction_src(ray_graph_t* g, ray_op_t* op, ray_col_src_t* src);
+/* ray_first_fn / ray_last_fn of a bare OP_SCAN lazy ((at tbl 'col) of an
+ * encoded slot) for the types they read with collection_elem: row 0
+ * (len - 1) itself, a null row a typed null, read by range.  NULL when the
+ * lazy is not that shape; else an atom or an owned error. */
+ray_t* ray_reduce_lazy_elem(ray_t* lazy, bool last);
 ray_t* exec_count_distinct(ray_graph_t* g, ray_op_t* op, ray_t* input);
 
 /* Parallel distinct for large fixed-width columns: radix-partitioned

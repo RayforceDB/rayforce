@@ -25,6 +25,8 @@
 #include "ops/ops.h"
 #include "ops/internal.h"
 #include "ops/idxop.h"   /* RAY_IDX_CHUNK_ZONE fast path for min/max */
+#include "store/enccol.h"  /* directory twins of the zone answers */
+#include "store/encw.h"    /* ray_encw_type_summable */
 #include "mem/heap.h"
 
 #include <stdlib.h>  /* qsort (introselect fallback) */
@@ -466,8 +468,99 @@ bool ray_zone_int_sum128(ray_t* x, int64_t* hi_out, uint64_t* lo_out, int64_t* n
     return true;
 }
 
+/* (at tbl 'col) of an encoded slot is a bare OP_SCAN lazy (collection.c):
+ * the column type it reads, so a builtin rejects the lazy with the message
+ * it gives the column itself; 0 for any other lazy. */
+static int8_t at_lazy_type(ray_t* x) {
+    ray_op_t* op = RAY_LAZY_OP(x);
+    return (RAY_LAZY_GRAPH(x) && op && op->opcode == OP_SCAN) ? op->out_type : 0;
+}
+
+/* first / last of a bare scan lazy whose type ray_first_fn / ray_last_fn
+ * read with collection_elem (row 0 / len - 1 itself, nulls included, where
+ * OP_FIRST / OP_LAST skip nulls): read that row by range, or force the
+ * column and answer as for it.  NULL: append the op. */
+static ray_t* at_lazy_edge(ray_t* x, bool last) {
+    int8_t t = at_lazy_type(x);
+    if (!(t == RAY_SYM || t == RAY_I32 || t == RAY_I16 || t == RAY_GUID || t == RAY_STR ||
+          t == RAY_BOOL || t == RAY_U8 || t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP))
+        return NULL;
+    ray_t* r = ray_reduce_lazy_elem(x, last);
+    if (r) return r;
+    ray_retain(x);                                   /* materialize consumes one reference */
+    ray_t* v = ray_lazy_materialize(x);
+    if (!v || RAY_IS_ERR(v)) return v ? v : ray_error("oom", NULL);
+    r = last ? ray_last_fn(v) : ray_first_fn(v);
+    ray_release(v);
+    return r;
+}
+
+/* ---- Directory twins of the CHUNK_ZONE answers (P2) ----
+ * A single-file generation-2 column whose recorded index is CHUNK_ZONE is
+ * materialized with the chunk zone enc_synth_chunk_zone builds from its
+ * directory (enccol.c): aggs [sum_lo | non-null rows | sum_hi] for the
+ * summable types, mins / maxs with absent chunks at the empty extrema.
+ * These read the same entries and return what ray_sum_fn, ray_avg_fn,
+ * ray_min_fn and ray_max_fn return from that zone. */
+static ray_enccol_t* zone_dir_col(ray_t* encv) {
+    if (!encv || encv->type != RAY_ENCCOL) return NULL;
+    ray_enccol_t* e = ray_enccol_of(encv);
+    if (!e || e->kind != RAY_ENCCOL_SINGLE || e->synthetic || e->hdr.index_kind != RAY_IDX_CHUNK_ZONE)
+        return NULL;
+    return e;
+}
+
+ray_t* ray_zone_dir_answer(ray_t* encv, uint16_t opcode) {
+    ray_enccol_t* e = zone_dir_col(encv);
+    if (!e) return NULL;
+    int8_t t = e->type;
+    bool fl = t == RAY_F32 || t == RAY_F64;
+    /* zone_aggs: present only for the summable, non-float types */
+    bool have_aggs = !fl && ray_encw_type_summable(t);
+    bool int_sum_type = t == RAY_I64 || t == RAY_I32 || t == RAY_I16 || t == RAY_U8;   /* ray_sum_fn / ray_avg_fn */
+    if ((opcode == OP_SUM || opcode == OP_AVG) && !(int_sum_type && have_aggs)) return NULL;
+    if ((opcode == OP_MIN || opcode == OP_MAX) && !ray_zone_acc_supported(t)) return NULL;   /* enc_attach_index */
+    if (opcode != OP_SUM && opcode != OP_AVG && opcode != OP_MIN && opcode != OP_MAX) return NULL;
+    /* the synthesized aggs carry the high words (3 * n): the exact total */
+    ray_enc_col_totals_t z;
+    ray_enccol_dir_totals(e, &z);
+    switch (opcode) {
+    case OP_SUM:
+        return make_i64((int64_t)z.sum_wrapped);                            /* ray_zone_int_sum */
+    case OP_AVG:
+        if (z.nonnull == 0) return ray_typed_null(-RAY_F64);
+        return make_f64(ray_i128_to_f64(z.sum_hi, z.sum_lo) / (double)z.nonnull);   /* ray_zone_int_sum128 */
+    default: {
+        bool mx = opcode == OP_MAX;
+        if (fl) {
+            /* absent chunks sit at the synthesized +/-inf and never win */
+            double m = mx ? z.max_f : z.min_f;
+            if (m == (mx ? -INFINITY : INFINITY)) return ray_typed_null(-RAY_F64);
+            return make_f64(m);
+        }
+        int64_t m = mx ? z.max_i : z.min_i;
+        /* all-null by the non-null counts when the zone has them */
+        if (have_aggs ? z.nonnull == 0 : m == (mx ? INT64_MIN : INT64_MAX)) return ray_typed_null(-t);
+        switch (t) {
+        case RAY_BOOL:      return ray_bool((bool)m);
+        case RAY_U8:        return ray_u8((uint8_t)m);
+        case RAY_I16:       return ray_i16((int16_t)m);
+        case RAY_I32:       return ray_i32((int32_t)m);
+        case RAY_DATE:      return ray_date((int32_t)m);
+        case RAY_TIME:      return ray_time(m);
+        case RAY_TIMESTAMP: return ray_timestamp(m);
+        default:            return ray_i64(m);
+        }
+    }
+    }
+}
+
 ray_t* ray_sum_fn(ray_t* x) {
-    if (ray_is_lazy(x)) return ray_lazy_append(x, OP_SUM);
+    if (ray_is_lazy(x)) {
+        int8_t lt = at_lazy_type(x);
+        if (lt > 0 && !agg_type_admitted(OP_SUM, lt)) return ray_error("type", "sum expects a numeric or time-duration vector, got %s", ray_type_name(lt));
+        return ray_lazy_append(x, OP_SUM);
+    }
     if (RAY_IS_PARTED(x->type)) return agg_parted_sum(x);
     if (ray_is_atom(x)) {
         /* u8/i16 scalar sum promotes to i64 */
@@ -547,7 +640,11 @@ ray_t* ray_sum_fn(ray_t* x) {
 }
 
 ray_t* ray_prod_fn(ray_t* x) {
-    if (ray_is_lazy(x)) return ray_lazy_append(x, OP_PROD);
+    if (ray_is_lazy(x)) {
+        int8_t lt = at_lazy_type(x);
+        if (lt > 0 && !agg_type_admitted(OP_PROD, lt)) return ray_error("type", "prod expects a numeric vector, got %s", ray_type_name(lt));
+        return ray_lazy_append(x, OP_PROD);
+    }
     if (RAY_IS_PARTED(x->type)) return agg_parted_prod(x);
     if (ray_is_atom(x)) { ray_retain(x); return x; }
     if (ray_is_vec(x)) {
@@ -585,7 +682,11 @@ ray_t* ray_prod_fn(ray_t* x) {
 }
 
 ray_t* ray_all_fn(ray_t* x) {
-    if (ray_is_lazy(x)) return ray_lazy_append(x, OP_ALL);
+    if (ray_is_lazy(x)) {
+        int8_t lt = at_lazy_type(x);
+        if (lt > 0 && !agg_numeric_flat_type(lt)) return ray_error("type", "all expects a numeric vector, got %s", ray_type_name(lt));
+        return ray_lazy_append(x, OP_ALL);
+    }
     if (RAY_IS_PARTED(x->type)) return agg_parted_truth(x, 1);
     if (ray_is_atom(x)) {
         if (!is_numeric(x)) return ray_error("type", "all expects numeric values, got %s", ray_type_name(x->type));
@@ -597,7 +698,11 @@ ray_t* ray_all_fn(ray_t* x) {
 }
 
 ray_t* ray_any_fn(ray_t* x) {
-    if (ray_is_lazy(x)) return ray_lazy_append(x, OP_ANY);
+    if (ray_is_lazy(x)) {
+        int8_t lt = at_lazy_type(x);
+        if (lt > 0 && !agg_numeric_flat_type(lt)) return ray_error("type", "any expects a numeric vector, got %s", ray_type_name(lt));
+        return ray_lazy_append(x, OP_ANY);
+    }
     if (RAY_IS_PARTED(x->type)) return agg_parted_truth(x, 0);
     if (ray_is_atom(x)) {
         if (!is_numeric(x)) return ray_error("type", "any expects numeric values, got %s", ray_type_name(x->type));
@@ -626,7 +731,11 @@ ray_t* ray_count_fn(ray_t* x) {
 }
 
 ray_t* ray_avg_fn(ray_t* x) {
-    if (ray_is_lazy(x)) return ray_lazy_append(x, OP_AVG);
+    if (ray_is_lazy(x)) {
+        int8_t lt = at_lazy_type(x);
+        if (lt > 0 && !agg_type_admitted(OP_AVG, lt)) return ray_error("type", "avg expects a numeric or temporal vector, got %s", ray_type_name(lt));
+        return ray_lazy_append(x, OP_AVG);
+    }
     if (RAY_IS_PARTED(x->type)) return agg_parted_avg(x);
     if (ray_is_atom(x)) {
         if (RAY_ATOM_IS_NULL(x)) return ray_typed_null(-RAY_F64);
@@ -787,7 +896,10 @@ ray_t* ray_max_fn(ray_t* x) {
 }
 
 ray_t* ray_first_fn(ray_t* x) {
-    if (ray_is_lazy(x)) return ray_lazy_append(x, OP_FIRST);
+    if (ray_is_lazy(x)) {
+        ray_t* e = at_lazy_edge(x, false);
+        return e ? e : ray_lazy_append(x, OP_FIRST);
+    }
     /* String first: return first char */
     if (ray_is_atom(x) && (-x->type) == RAY_STR) {
         size_t slen = ray_str_len(x);
@@ -826,7 +938,10 @@ ray_t* ray_first_fn(ray_t* x) {
 }
 
 ray_t* ray_last_fn(ray_t* x) {
-    if (ray_is_lazy(x)) return ray_lazy_append(x, OP_LAST);
+    if (ray_is_lazy(x)) {
+        ray_t* e = at_lazy_edge(x, true);
+        return e ? e : ray_lazy_append(x, OP_LAST);
+    }
     /* String last: return last char */
     if (ray_is_atom(x) && (-x->type) == RAY_STR) {
         size_t slen = ray_str_len(x);

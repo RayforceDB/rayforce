@@ -1093,10 +1093,10 @@ static ray_t* sr_load(int gen) {
 /* Run `q` (the table written as T) against a fresh load of each generation:
  * equal formatted results; the generation-2 run materializes exactly
  * `want_mat` columns. */
-static test_result_t sr_same(const char* q, uint64_t want_mat) {
+static test_result_t sr_same_on(const char* t0, const char* t2, const char* q, uint64_t want_mat) {
     ray_t* out[2] = { NULL, NULL };
     for (int gen = 0; gen < 2; gen++) {
-        sr_evalf_ok("(set T (.db.splayed.get \"%s\"))", gen ? SR_G2 : SR_G0);
+        sr_evalf_ok("(set T %s)", gen ? t2 : t0);
         ray_enc_counters_reset();
         out[gen] = sr_eval(q);
         TEST_ASSERT_FMT(out[gen] && !RAY_IS_ERR(out[gen]), "gen %d: %s: %s", gen, q,
@@ -1114,6 +1114,9 @@ static test_result_t sr_same(const char* q, uint64_t want_mat) {
                     (int)ray_str_len(fb), ray_str_ptr(fb));
     ray_release(fa); ray_release(fb); ray_release(out[0]); ray_release(out[1]);
     PASS();
+}
+static test_result_t sr_same(const char* q, uint64_t want_mat) {
+    return sr_same_on("(.db.splayed.get \"" SR_G0 "\")", "(.db.splayed.get \"" SR_G2 "\")", q, want_mat);
 }
 #define SR_SAME(q, m) do { test_result_t r_ = sr_same((q), (m)); if (r_.status != TEST_PASS) return r_; } while (0)
 
@@ -1360,7 +1363,7 @@ static test_result_t test_count_fast_sym_nulls(void) {
  * reads) and is not decoded again. */
 static test_result_t test_expr_reuses_materialized(void) {
     sr_evalf_ok("(set T (.db.splayed.get \"%s\"))", SR_G2);
-    ray_t* s = sr_eval("(sum (at T 'v))");                          /* materializes v */
+    ray_t* s = sr_eval("(at T 'v)");                                /* forced at the top: materializes v */
     TEST_ASSERT_TRUE(s && !RAY_IS_ERR(s));
     ray_release(s);
     ray_t* t = sr_eval("T");
@@ -2568,7 +2571,7 @@ static test_result_t test_in_selection(void) {
  * by the `in` selection: nothing decoded again. */
 static test_result_t test_in_selection_reuses_materialized(void) {
     sr_evalf_ok("(set T (.db.splayed.get \"%s\"))", SR_G2);
-    ray_t* s = sr_eval("(sum (at T 'g))");                          /* materializes g */
+    ray_t* s = sr_eval("(at T 'g)");                                /* forced at the top: materializes g */
     TEST_ASSERT_TRUE(s && !RAY_IS_ERR(s));
     ray_release(s);
     ray_t* t = sr_eval("T");
@@ -2621,6 +2624,200 @@ static test_result_t test_in_selection_error(void) {
         ray_error_free(s);
         ray_graph_free(g); ray_release(t);
     }
+    PASS();
+}
+
+/* ---- Task 9: reductions over a scan; (at tbl 'col) on an encoded slot ---- */
+
+static test_result_t test_reduce_scan(void) {
+    SR_SAME("(sum (at T 'k))", 0);
+    SR_SAME("(avg (at T 'v))", 0);
+    SR_SAME("(min (at T 'd))", 0);
+    SR_SAME("(max (at T 'f))", 0);
+    SR_SAME("(sum (at T 'u))", 0);
+    SR_SAME("(first (at T 'v))", 0);
+    SR_SAME("(last (at T 'f))", 0);
+    /* stddev is not lazy-aware (it materializes its argument and computes
+     * in two passes, unlike the one-pass OP_STDDEV): the column is read */
+    SR_SAME("(stddev (at T 'g))", 1);
+    SR_SAME("(sum (at T 'f))", 0);            /* nullable F64 over 200000 rows: bit-identical */
+    SR_SAME("(stddev (at T 'f))", 1);
+    SR_SAME("(count (at T 'v))", 0);          /* count over the lazy: no force */
+    SR_SAME("(at T 'k)", 1);                  /* a value handed to the user is a plain column */
+    PASS();
+}
+
+/* Every served op and type over the lazy, and the shapes that keep reading
+ * the column: same answers as generation 0. */
+static test_result_t test_reduce_scan_ops(void) {
+    static const char* const q0[] = {
+        "(last (at T 'v))", "(first (at T 'f))", "(first (at T 'd))", "(last (at T 'd))",
+        "(first (at T 'g))", "(last (at T 'b))", "(first (at T 'u))", "(first (at T 'k))",
+        "(last (at T 'k))", "(min (at T 'b))", "(max (at T 'g))", "(min (at T 'v))",
+        "(max (at T 'v))", "(min (at T 'f))", "(min (at T 'k))", "(max (at T 'h))",
+        "(prod (at T 'b))", "(prod (at T 'g))", "(prod (at T 'f))", "(all (at T 'b))",
+        "(any (at T 'b))", "(all (at T 'u))", "(any (at T 'v))", "(all (at T 'f))",
+        "(avg (at T 'f))", "(avg (at T 'd))", "(avg (at T 'b))", "(sum (at T 'b))",
+        "(sum (at T 'g))", "(sum (at T 'h))", "(avg (at T 'h))", "(count (at T 's))",
+        "(count (at T 'd))", NULL };
+    for (int i = 0; q0[i]; i++) SR_SAME(q0[i], 0);
+    /* not served by the range reduction: the column is materialized once */
+    SR_SAME("(min (at T 's))", 1);
+    SR_SAME("(count (distinct (at T 'g)))", 1);
+    SR_SAME("(sum (reverse (at T 'k)))", 1);
+    SR_SAME("(first (asc (at T 'v)))", 1);
+    SR_SAME("(at T ['k 'v])", 2);             /* a list of plain columns, never of lazies */
+    SR_SAME("(sum (+ 1 (at T 'k)))", 1);
+    SR_SAME("(get T 'g)", 1);
+    PASS();
+}
+
+/* A builtin that rejects the column's type rejects the lazy with the
+ * message it gives the column. */
+static test_result_t test_reduce_scan_type_errors(void) {
+    static const char* const q[] = { "(sum (at T 'd))", "(sum (at T 's))", "(avg (at T 's))",
+                                     "(prod (at T 'd))", "(all (at T 'd))", "(any (at T 's))", NULL };
+    for (int i = 0; q[i]; i++) {
+        char msg[2][256]; const char* code[2];
+        for (int gen = 0; gen < 2; gen++) {
+            sr_evalf_ok("(set T (.db.splayed.get \"%s\"))", gen ? SR_G2 : SR_G0);
+            ray_error_clear();
+            ray_enc_counters_reset();
+            ray_t* r = sr_eval(q[i]);
+            TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "gen %d: %s: not an error", gen, q[i]);
+            code[gen] = ray_err_code(r);
+            snprintf(msg[gen], sizeof msg[gen], "%s", ray_error_msg());
+            ray_error_free(r);
+            ray_enc_counters_t k; ray_enc_counters_get(&k);
+            if (gen) TEST_ASSERT_FMT(k.materialized == 0, "%s materialized", q[i]);
+        }
+        TEST_ASSERT_STR_EQ(code[0], code[1]);
+        TEST_ASSERT_FMT(strcmp(msg[0], msg[1]) == 0, "%s: '%s' vs '%s'", q[i], msg[0], msg[1]);
+    }
+    PASS();
+}
+
+/* All-null columns, wide integer sums (the low word wraps, avg reads the
+ * exact 128-bit total) and an empty table. */
+static test_result_t test_reduce_scan_edges(void) {
+    sr_eval_ok("(set i (til 70000))");
+    sr_eval_ok("(set E (table [n x z w] (list (as 'I32 (take [0N] 70000)) (as 'F64 (take [0N] 70000)) "
+               "(* i 131762457669) (- 0 (* i 131762457669)))))");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/e0/\" E {compress: false})");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/e2/\" E {compress: true})");
+    static const char* const q[] = {
+        "(sum (at T 'n))", "(avg (at T 'n))", "(min (at T 'n))", "(max (at T 'n))", "(first (at T 'n))",
+        "(last (at T 'n))", "(prod (at T 'n))", "(all (at T 'n))", "(any (at T 'n))", "(count (at T 'n))",
+        "(sum (at T 'x))", "(avg (at T 'x))", "(min (at T 'x))", "(max (at T 'x))", "(first (at T 'x))",
+        "(last (at T 'x))", "(sum (at T 'z))", "(avg (at T 'z))", "(min (at T 'z))", "(max (at T 'z))",
+        "(sum (at T 'w))", "(avg (at T 'w))", "(min (at T 'w))", "(prod (at T 'z))", NULL };
+    for (int i = 0; q[i]; i++) {
+        test_result_t r = sr_same_on("(.db.splayed.get \"" SR_TMP "/e0/\")", "(.db.splayed.get \"" SR_TMP "/e2/\")", q[i], 0);
+        if (r.status != TEST_PASS) return r;
+    }
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/z0e/\" (take E 0) {compress: false})");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/z2e/\" (take E 0) {compress: true})");
+    static const char* const qe[] = { "(sum (at T 'z))", "(avg (at T 'n))", "(min (at T 'x))", "(max (at T 'z))",
+                                      "(first (at T 'n))", "(last (at T 'x))", "(count (at T 'z))", NULL };
+    for (int i = 0; qe[i]; i++) {
+        test_result_t r = sr_same_on("(.db.splayed.get \"" SR_TMP "/z0e/\")", "(.db.splayed.get \"" SR_TMP "/z2e/\")", qe[i], 0);
+        if (r.status != TEST_PASS) return r;
+    }
+    PASS();
+}
+
+/* Finding C3: whole-column sum / avg / min / max of a CHUNK_ZONE column are
+ * answered from the directory (generation 0 answers them from its zone):
+ * nothing decoded at all. */
+static test_result_t test_reduce_dir_answers(void) {
+    static const char* const q[] = { "(sum (at T 'k))", "(avg (at T 'v))", "(min (at T 'd))",
+                                     "(max (at T 'u))", "(avg (at T 'k))", "(sum (at T 'g))",
+                                     "(min (at T 'f))", "(max (at T 'f))", "(min (at T 'b))",
+                                     "(max (at T 'v))", "(count (at T 'k))", NULL };
+    for (int i = 0; q[i]; i++) {
+        SR_SAME(q[i], 0);
+        sr_eval_ok("(set T (.db.splayed.get \"" SR_G2 "\"))");
+        ray_enc_counters_reset();
+        ray_t* r = sr_eval(q[i]);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+        ray_enc_counters_t k; ray_enc_counters_get(&k);
+        TEST_ASSERT_FMT(k.decoded_bytes == 0, "%s decoded %llu bytes", q[i], (unsigned long long)k.decoded_bytes);
+        sr_drop(r);
+    }
+    /* no directory answer: read by range, nothing materialized */
+    sr_eval_ok("(set T (.db.splayed.get \"" SR_G2 "\"))");
+    ray_enc_counters_reset();
+    ray_t* r = sr_eval("(sum (at T 'f))");
+    ray_enc_counters_t k; ray_enc_counters_get(&k);
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_U(k.materialized, 0);
+    TEST_ASSERT_EQ_U(k.decoded_bytes, 200000 * 8);
+    sr_drop(r);
+    PASS();
+}
+
+static test_result_t test_reduce_error(void) {
+    char path[600];
+    sr_make_bad("f", path, sizeof path);              /* F64: no directory answer, the walk reads chunk 2 */
+    for (int i = 0; i < 2; i++) {
+        ray_error_clear();
+        ray_t* r = sr_eval("(sum (at (.db.splayed.get \"" SR_TMP "/bad/\") 'f))");
+        TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+        TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
+        TEST_ASSERT_TRUE(strstr(ray_error_msg(), path) != NULL);
+        ray_error_free(r);
+    }
+    /* first / last read their row through the cursor: chunk 2 is never touched
+     * by first; last reads chunk 3 then 2 only while the rows are null */
+    ray_t* r = sr_eval("(first (at (.db.splayed.get \"" SR_TMP "/bad/\") 'f))");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    sr_drop(r);
+    PASS();
+}
+
+/* Finding I11: (at P 'v) on a parted generation-2 table forces to the value
+ * generation 0's parted_to_flat_vec gives; sum over it reduces by range. */
+static test_result_t test_at_parted_value(void) {
+    for (int gen = 0; gen <= 2; gen += 2)
+        for (int p = 0; p < 2; p++)
+            sr_evalf_ok("(.db.splayed.set \"" SR_TMP "/ap%d/2024.01.0%d/t/\" "
+                        "(table [v] (list (as 'I32 (map (fn [j] (if (== 0 (%% j 11)) 0N j)) (til 70000))))) {compress: %s})",
+                        gen, p + 1, gen ? "true" : "false");
+    ray_t* a = sr_eval("(at (.db.parted.get \"" SR_TMP "/ap0\" 't) 'v)");
+    ray_enc_counters_reset();
+    ray_t* s2 = sr_eval("(sum (at (.db.parted.get \"" SR_TMP "/ap2\" 't) 'v))");
+    ray_enc_counters_t k; ray_enc_counters_get(&k);
+    TEST_ASSERT_EQ_U(k.materialized, 0);
+    ray_t* s0 = sr_eval("(sum (at (.db.parted.get \"" SR_TMP "/ap0\" 't) 'v))");
+    ray_t* b = sr_eval("(at (.db.parted.get \"" SR_TMP "/ap2\" 't) 'v)");
+    TEST_ASSERT_TRUE(sr_vec_eq(a, b));                 /* type, length, HAS_NULLS, payload */
+    TEST_ASSERT_TRUE(s0 && s2 && !RAY_IS_ERR(s0) && !RAY_IS_ERR(s2) && s0->i64 == s2->i64);
+    sr_drop(a); sr_drop(b); sr_drop(s0); sr_drop(s2);
+    static const char* const q[] = { "(first (at T 'v))", "(last (at T 'v))", "(min (at T 'v))", "(max (at T 'v))",
+                                     "(avg (at T 'v))", "(count (at T 'v))", "(prod (at T 'v))", "(any (at T 'v))", NULL };
+    for (int i = 0; q[i]; i++) {
+        test_result_t r = sr_same_on("(.db.parted.get \"" SR_TMP "/ap0\" 't)", "(.db.parted.get \"" SR_TMP "/ap2\" 't)", q[i], 0);
+        if (r.status != TEST_PASS) return r;
+    }
+    /* ruling I5: a ragged generation-0 table's synthetic null segment reads
+     * by range and answers as its explicit-null reference */
+    sr_parted_xy(SR_TMP "/arg", 0, true, false);
+    sr_parted_xy(SR_TMP "/aref", 0, false, true);
+    sr_parted_xy(SR_TMP "/amx", 3, true, false);
+    static const char* const qr[] = { "(sum (at T 'y))", "(avg (at T 'y))", "(min (at T 'y))", "(max (at T 'y))",
+                                      "(first (at T 'y))", "(last (at T 'y))", "(count (at T 'y))", NULL };
+    for (int i = 0; qr[i]; i++) {
+        test_result_t r = sr_same_on("(.db.parted.get \"" SR_TMP "/aref\" 't)", "(.db.parted.get \"" SR_TMP "/arg\" 't)", qr[i], 0);
+        if (r.status != TEST_PASS) return r;
+        r = sr_same_on("(.db.parted.get \"" SR_TMP "/aref\" 't)", "(.db.parted.get \"" SR_TMP "/amx\" 't)", qr[i], 0);
+        if (r.status != TEST_PASS) return r;
+    }
+    ray_t* fa = sr_eval("(at (.db.parted.get \"" SR_TMP "/aref\" 't) 'y)");
+    ray_t* fb = sr_eval("(at (.db.parted.get \"" SR_TMP "/arg\" 't) 'y)");
+    ray_t* fc = sr_eval("(at (.db.parted.get \"" SR_TMP "/amx\" 't) 'y)");
+    TEST_ASSERT_TRUE(sr_vec_eq(fa, fb));
+    TEST_ASSERT_TRUE(sr_vec_eq(fa, fc));
+    sr_drop(fa); sr_drop(fb); sr_drop(fc);
     PASS();
 }
 
@@ -2689,5 +2886,12 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/in_selection",          test_in_selection,          srr_setup, srr_teardown },
     { "scanrange/in_selection_reuses_materialized", test_in_selection_reuses_materialized, srr_setup, srr_teardown },
     { "scanrange/in_selection_error",    test_in_selection_error,    srr_setup, srr_teardown },
+    { "scanrange/reduce_scan",        test_reduce_scan,        srr_setup, srr_teardown },
+    { "scanrange/reduce_scan_ops",    test_reduce_scan_ops,    srr_setup, srr_teardown },
+    { "scanrange/reduce_scan_type_errors", test_reduce_scan_type_errors, srr_setup, srr_teardown },
+    { "scanrange/reduce_scan_edges",  test_reduce_scan_edges,  srr_setup, srr_teardown },
+    { "scanrange/reduce_dir_answers", test_reduce_dir_answers, srr_setup, srr_teardown },
+    { "scanrange/reduce_error",       test_reduce_error,       srr_setup, srr_teardown },
+    { "scanrange/at_parted_value",    test_at_parted_value,    srr_setup, srr_teardown },
     { NULL, NULL, NULL, NULL },
 };

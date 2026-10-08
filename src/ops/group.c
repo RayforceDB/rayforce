@@ -584,11 +584,18 @@ static ray_t* agg_wide_reduce(ray_t* input, uint16_t op,
             REDUCE_SYM_EXTREME(input, base, start, end, acc, idx, dom, 1, 1, WANT_MIN); \
     } while (0)
 
-static void reduce_range(ray_t* input, int64_t start, int64_t end,
-                         reduce_acc_t* acc, bool has_nulls,
-                         const int64_t* idx, uint16_t opcode) {
-    void* base = ray_data(input);
-    switch (input->type) {
+/* The reduction kernel over raw elements: `base` is row 0 of a column of
+ * `type`.  `input` is read only by the SYM arm (cell width, domain) and by
+ * the BOOL / U8 bitmap null test, which never runs: those types are
+ * non-nullable.  A raw caller (ray_reduce_src) passes input NULL and never
+ * a SYM column. */
+static void reduce_range_raw(int8_t type, uint8_t attrs, const void* cbase,
+                             struct ray_sym_domain_s* dom, ray_t* input,
+                             int64_t start, int64_t end, reduce_acc_t* acc,
+                             bool has_nulls, const int64_t* idx, uint16_t opcode) {
+    (void)attrs;
+    void* base = (void*)cbase;      /* the loops only read */
+    switch (type) {
     case RAY_BOOL: case RAY_U8:
         DISPATCH_BITMAP_I_OPCODE(uint8_t, input, base, start, end, acc,
                                  has_nulls, idx, opcode); break;
@@ -612,7 +619,6 @@ static void reduce_range(ray_t* input, int64_t start, int64_t end,
          * order is by string content (matches asc/desc), not by intern
          * id.  Same 4-way dispatch to eliminate the per-element
          * null/idx branches. */
-        struct ray_sym_domain_s* dom = ray_sym_vec_domain(input);
         if (opcode == OP_MIN)
             DISPATCH_SYM_EXTREME(input, base, start, end, acc, has_nulls,
                                  idx, dom, 1);
@@ -623,6 +629,14 @@ static void reduce_range(ray_t* input, int64_t start, int64_t end,
     }
     default: break;
     }
+}
+
+static void reduce_range(ray_t* input, int64_t start, int64_t end,
+                         reduce_acc_t* acc, bool has_nulls,
+                         const int64_t* idx, uint16_t opcode) {
+    reduce_range_raw(input->type, input->attrs, ray_data(input),
+                     input->type == RAY_SYM ? ray_sym_vec_domain(input) : NULL, input,
+                     start, end, acc, has_nulls, idx, opcode);
 }
 
 /* Context for parallel reduction */
@@ -4118,15 +4132,54 @@ static ray_t* reduction_i64_result(int64_t val, int8_t out_type, ray_t* src) {
     }
 }
 
-static ray_t* reduction_extreme_result(ray_op_t* op, int8_t in_type, bool found,
+static ray_t* reduction_extreme_result(int8_t op_out_type, int8_t in_type, bool found,
                                        double fval, int64_t ival, ray_t* src) {
-    int8_t out_type = op->out_type ? op->out_type : in_type;
+    int8_t out_type = op_out_type ? op_out_type : in_type;
     if (!found) return ray_typed_null(-out_type);
     /* Single-null float model: min/max of finite inputs is finite, but guard
      * against an ±Inf init sentinel surfacing as a value. */
     if (out_type == RAY_F64) return ray_f64(ray_f64_fin(fval));
     if (out_type == RAY_F32) return ray_f32((float)fval);
     return reduction_i64_result(ival, out_type, out_type == RAY_SYM ? src : NULL);
+}
+
+/* The result of reduction `opcode` (op_out_type: the op's out type, 0 for
+ * the input's) from the merged accumulator over scan_n rows of in_type.
+ * `input` is read only for SYM results (the domain of the cell id). */
+static ray_t* reduce_result(uint16_t opcode, int8_t op_out_type, int8_t in_type,
+                            const reduce_acc_t* m, int64_t scan_n, ray_t* input) {
+    bool fp = in_type == RAY_F64 || in_type == RAY_F32;
+    ray_t* sym_src = in_type == RAY_SYM ? input : NULL;
+    switch (opcode) {
+        case OP_SUM:   return fp ? ray_f64(ray_f64_fin(m->sum_f)) : (in_type == RAY_TIME ? ray_time(m->sum_i) : ray_i64(m->sum_i));
+        case OP_PROD:  return fp ? ray_f64(ray_f64_fin(m->prod_f)) : ray_i64(m->prod_i);
+        case OP_ALL:   return ray_bool(m->zero_count == 0);
+        case OP_ANY:   return ray_bool(m->cnt > m->zero_count);
+        case OP_MIN:   return reduction_extreme_result(op_out_type, in_type, m->cnt > 0, m->min_f, m->min_i, input);
+        case OP_MAX:   return reduction_extreme_result(op_out_type, in_type, m->cnt > 0, m->max_f, m->max_i, input);
+        /* COUNT returns total length including nulls — matches ray_count_fn's
+         * "count all elements" semantics, not SQL's COUNT(col) non-null count. */
+        case OP_COUNT: return ray_i64(scan_n);
+        case OP_AVG:   return m->cnt > 0 ? ray_f64(ray_f64_fin(fp ? m->sum_f / m->cnt : ray_i128_to_f64(m->sum_hi, (uint64_t)m->sum_i) / m->cnt)) : ray_typed_null(-RAY_F64);
+        case OP_FIRST: return m->has_first ? (group_fp_type(in_type) ? ray_f64(m->first_f) : reduction_i64_result(m->first_i, in_type, sym_src)) : ray_typed_null(-(op_out_type ? op_out_type : in_type));
+        case OP_LAST:  return m->has_first ? (group_fp_type(in_type) ? ray_f64(m->last_f) : reduction_i64_result(m->last_i, in_type, sym_src)) : ray_typed_null(-(op_out_type ? op_out_type : in_type));
+        case OP_VAR: case OP_VAR_POP:
+        case OP_STDDEV: case OP_STDDEV_POP: {
+            bool insufficient = (opcode == OP_VAR || opcode == OP_STDDEV) ? m->cnt <= 1 : m->cnt <= 0;
+            if (insufficient) return ray_typed_null(-RAY_F64);
+            double mean, var_pop;
+            if (fp) { mean = m->sum_f / m->cnt; var_pop = m->sum_sq_f / m->cnt - mean * mean; }
+            else { mean = m->sum_d / m->cnt; var_pop = (double)m->sum_sq_i / m->cnt - mean * mean; }
+            if (var_pop < 0) var_pop = 0;
+            double val;
+            if (opcode == OP_VAR_POP) val = var_pop;
+            else if (opcode == OP_VAR) val = var_pop * m->cnt / (m->cnt - 1);
+            else if (opcode == OP_STDDEV_POP) val = sqrt(var_pop);
+            else val = sqrt(var_pop * m->cnt / (m->cnt - 1));
+            return ray_f64(ray_f64_fin(val));
+        }
+        default:       return ray_error("nyi", NULL);
+    }
 }
 
 ray_t* exec_reduction(ray_graph_t* g, ray_op_t* op, ray_t* input) {
@@ -4290,38 +4343,7 @@ ray_t* exec_reduction(ray_graph_t* g, ray_op_t* op, ray_t* input) {
             }
         }
 
-        ray_t* result;
-        switch (op->opcode) {
-            case OP_SUM:   result = (in_type == RAY_F64 || in_type == RAY_F32) ? ray_f64(ray_f64_fin(merged.sum_f)) : (in_type == RAY_TIME ? ray_time(merged.sum_i) : ray_i64(merged.sum_i)); break;
-            case OP_PROD:  result = (in_type == RAY_F64 || in_type == RAY_F32) ? ray_f64(ray_f64_fin(merged.prod_f)) : ray_i64(merged.prod_i); break;
-            case OP_ALL:   result = ray_bool(merged.zero_count == 0); break;
-            case OP_ANY:   result = ray_bool(merged.cnt > merged.zero_count); break;
-            case OP_MIN:   result = reduction_extreme_result(op, in_type, merged.cnt > 0, merged.min_f, merged.min_i, input); break;
-            case OP_MAX:   result = reduction_extreme_result(op, in_type, merged.cnt > 0, merged.max_f, merged.max_i, input); break;
-            /* COUNT returns total length including nulls — matches ray_count_fn's
-             * "count all elements" semantics, not SQL's COUNT(col) non-null count. */
-            case OP_COUNT: result = ray_i64(scan_n); break;
-            case OP_AVG:   result = merged.cnt > 0 ? ray_f64(ray_f64_fin((in_type == RAY_F64 || in_type == RAY_F32) ? merged.sum_f / merged.cnt : ray_i128_to_f64(merged.sum_hi, (uint64_t)merged.sum_i) / merged.cnt)) : ray_typed_null(-RAY_F64); break;
-            case OP_FIRST: result = merged.has_first ? (group_fp_type(in_type) ? ray_f64(merged.first_f) : reduction_i64_result(merged.first_i, in_type, in_type == RAY_SYM ? input : NULL)) : ray_typed_null(-(op->out_type ? op->out_type : in_type)); break;
-            case OP_LAST:  result = merged.has_first ? (group_fp_type(in_type) ? ray_f64(merged.last_f) : reduction_i64_result(merged.last_i, in_type, in_type == RAY_SYM ? input : NULL)) : ray_typed_null(-(op->out_type ? op->out_type : in_type)); break;
-            case OP_VAR: case OP_VAR_POP:
-            case OP_STDDEV: case OP_STDDEV_POP: {
-                bool insufficient = (op->opcode == OP_VAR || op->opcode == OP_STDDEV) ? merged.cnt <= 1 : merged.cnt <= 0;
-                if (insufficient) { result = ray_typed_null(-RAY_F64); break; }
-                double mean, var_pop;
-                if (in_type == RAY_F64 || in_type == RAY_F32) { mean = merged.sum_f / merged.cnt; var_pop = merged.sum_sq_f / merged.cnt - mean * mean; }
-                else { mean = merged.sum_d / merged.cnt; var_pop = (double)merged.sum_sq_i / merged.cnt - mean * mean; }
-                if (var_pop < 0) var_pop = 0;
-                double val;
-                if (op->opcode == OP_VAR_POP) val = var_pop;
-                else if (op->opcode == OP_VAR) val = var_pop * merged.cnt / (merged.cnt - 1);
-                else if (op->opcode == OP_STDDEV_POP) val = sqrt(var_pop);
-                else val = sqrt(var_pop * merged.cnt / (merged.cnt - 1));
-                result = ray_f64(ray_f64_fin(val));
-                break;
-            }
-            default:       result = ray_error("nyi", NULL); break;
-        }
+        ray_t* result = reduce_result(op->opcode, op->out_type, in_type, &merged, scan_n, input);
         scratch_free(accs_hdr);
         if (sel_idx_block) ray_release(sel_idx_block);
         return result;
@@ -4332,36 +4354,196 @@ ray_t* exec_reduction(ray_graph_t* g, ray_op_t* op, ray_t* input) {
     reduce_range(input, 0, scan_n, &acc, has_nulls, sel_idx, op->opcode);
     if (sel_idx_block) ray_release(sel_idx_block);
 
-    switch (op->opcode) {
-        case OP_SUM:   return (in_type == RAY_F64 || in_type == RAY_F32) ? ray_f64(ray_f64_fin(acc.sum_f)) : (in_type == RAY_TIME ? ray_time(acc.sum_i) : ray_i64(acc.sum_i));
-        case OP_PROD:  return (in_type == RAY_F64 || in_type == RAY_F32) ? ray_f64(ray_f64_fin(acc.prod_f)) : ray_i64(acc.prod_i);
-        case OP_ALL:   return ray_bool(acc.zero_count == 0);
-        case OP_ANY:   return ray_bool(acc.cnt > acc.zero_count);
-        case OP_MIN:   return reduction_extreme_result(op, in_type, acc.cnt > 0, acc.min_f, acc.min_i, input);
-        case OP_MAX:   return reduction_extreme_result(op, in_type, acc.cnt > 0, acc.max_f, acc.max_i, input);
-        /* COUNT returns total length including nulls — matches ray_count_fn's
-         * "count all elements" semantics, not SQL's COUNT(col) non-null count. */
-        case OP_COUNT: return ray_i64(scan_n);
-        case OP_AVG:   return acc.cnt > 0 ? ray_f64(ray_f64_fin((in_type == RAY_F64 || in_type == RAY_F32) ? acc.sum_f / acc.cnt : ray_i128_to_f64(acc.sum_hi, (uint64_t)acc.sum_i) / acc.cnt)) : ray_typed_null(-RAY_F64);
-        case OP_FIRST: return acc.has_first ? (group_fp_type(in_type) ? ray_f64(acc.first_f) : reduction_i64_result(acc.first_i, in_type, in_type == RAY_SYM ? input : NULL)) : ray_typed_null(-(op->out_type ? op->out_type : in_type));
-        case OP_LAST:  return acc.has_first ? (group_fp_type(in_type) ? ray_f64(acc.last_f) : reduction_i64_result(acc.last_i, in_type, in_type == RAY_SYM ? input : NULL)) : ray_typed_null(-(op->out_type ? op->out_type : in_type));
-        case OP_VAR: case OP_VAR_POP:
-        case OP_STDDEV: case OP_STDDEV_POP: {
-            bool insufficient = (op->opcode == OP_VAR || op->opcode == OP_STDDEV) ? acc.cnt <= 1 : acc.cnt <= 0;
-            if (insufficient) return ray_typed_null(-RAY_F64);
-            double mean, var_pop;
-            if (in_type == RAY_F64 || in_type == RAY_F32) { mean = acc.sum_f / acc.cnt; var_pop = acc.sum_sq_f / acc.cnt - mean * mean; }
-            else { mean = acc.sum_d / acc.cnt; var_pop = (double)acc.sum_sq_i / acc.cnt - mean * mean; }
-            if (var_pop < 0) var_pop = 0;
-            double val;
-            if (op->opcode == OP_VAR_POP) val = var_pop;
-            else if (op->opcode == OP_VAR) val = var_pop * acc.cnt / (acc.cnt - 1);
-            else if (op->opcode == OP_STDDEV_POP) val = sqrt(var_pop);
-            else val = sqrt(var_pop * acc.cnt / (acc.cnt - 1));
-            return ray_f64(ray_f64_fin(val));
+    return reduce_result(op->opcode, op->out_type, in_type, &acc, scan_n, input);
+}
+
+/* ---- Reductions over a bound encoded source (P2) ----
+ * The answer exec_reduction gives over the source's materialization, read
+ * by range: each task walks its rows piece by piece (R-WALK) into the
+ * worker's accumulator.  REDUCE_LOOP_I / _F accumulate every row straight
+ * into the accumulator's fields (no per-call partial), so the pieces of a
+ * task add in the same order as one call over the task: float sums,
+ * squares and products are the same bits as the plain loop's. */
+
+typedef struct {
+    ray_col_src_t*  src;
+    const void*     base;        /* the source read in place, or NULL (by range) */
+    reduce_acc_t*   accs;        /* one per worker */
+    bool            has_nulls;
+    uint16_t        opcode;
+    ray_scan_fail_t fail;
+} par_reduce_src_ctx_t;
+
+static void reduce_piece(void* ctx, uint32_t wid, int64_t b, int64_t e, const ray_col_piece_t* p) {
+    par_reduce_src_ctx_t* c = (par_reduce_src_ctx_t*)ctx;
+    reduce_range_raw(c->src->type, p[0].attrs, p[0].data, NULL, NULL, 0, e - b,
+                     &c->accs[wid], c->has_nulls, NULL, c->opcode);
+}
+
+static void par_reduce_src_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
+    par_reduce_src_ctx_t* c = (par_reduce_src_ctx_t*)ctx;
+    if (ray_scan_fail_skip(&c->fail, start)) return;
+    ray_col_src_t* srcs[1] = { c->src };
+    const void* plain[1] = { c->base };
+    ray_t* err = ray_col_walk(srcs, plain, 1, start, end, false, c, wid, reduce_piece);
+    if (err) ray_scan_fail_note(&c->fail, start, err);
+}
+
+static bool reduce_src_type(int8_t t) {
+    return t == RAY_BOOL || t == RAY_U8 || t == RAY_I16 || t == RAY_I32 || t == RAY_I64 ||
+           t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP || t == RAY_F32 || t == RAY_F64;
+}
+
+/* The atom exec_reduction's first / last short-circuit builds from row i
+ * of view v. */
+static ray_t* src_row_value(int8_t t, const ray_col_range_t* v, int64_t i) {
+    if (t == RAY_F64) return ray_f64(((const double*)v->data)[i]);
+    if (t == RAY_F32) return ray_f64((double)((const float*)v->data)[i]);
+    return reduction_i64_result(read_col_i64(v->data, i, t, v->attrs), t, NULL);
+}
+
+/* First (last) value of a served source.  skip_nulls: the first (last)
+ * non-null row, exec_reduction's short-circuit (a typed null when there is
+ * none); else row 0 (len - 1) itself, ray_first_fn / ray_last_fn's
+ * collection_elem (a null row is a typed null).  Nulls are told by the
+ * sentinel only when the source may hold nulls, as the vector's HAS_NULLS
+ * gates them.  Last reads blocks of RAY_MORSEL_ELEMS rows backwards, each
+ * forwards view by view, so every vector is decoded once.  An owned atom or
+ * error. */
+static ray_t* reduce_src_edge(ray_col_src_t* src, bool last, bool skip_nulls) {
+    int8_t t = src->type;
+    int64_t len = src->len;
+    bool mn = src->may_null;
+    if (len <= 0) return ray_typed_null(-t);
+    ray_col_cursor_t cur;
+    ray_col_cursor_init(&cur, src);
+    const ray_col_range_t* v;
+    ray_t* out = NULL;
+    if (!skip_nulls) {
+        int64_t r = last ? len - 1 : 0;
+        out = ray_col_cursor_at(&cur, r, &v);
+        if (!out) {
+            int64_t i = r - v->start;
+            out = (mn && ray_raw_is_null(t, v->attrs, v->data, i)) ? ray_typed_null(-t) : src_row_value(t, v, i);
         }
-        default:       return ray_error("nyi", NULL);
+    } else if (!last) {
+        for (int64_t r = 0; r < len && !out; ) {
+            if ((out = ray_col_cursor_at(&cur, r, &v)) != NULL) break;
+            int64_t ve = v->start + v->n;
+            for (; r < ve; r++)
+                if (!mn || !ray_raw_is_null(t, v->attrs, v->data, r - v->start)) {
+                    out = src_row_value(t, v, r - v->start);
+                    break;
+                }
+        }
+    } else {
+        for (int64_t hi = len; hi > 0 && !out; ) {
+            int64_t lo = ((hi - 1) / RAY_MORSEL_ELEMS) * RAY_MORSEL_ELEMS;
+            ray_t* found = NULL;
+            for (int64_t r = lo; r < hi; ) {
+                ray_t* err = ray_col_cursor_at(&cur, r, &v);
+                if (err) { if (found) ray_release(found); found = err; break; }
+                int64_t ve = v->start + v->n < hi ? v->start + v->n : hi;
+                for (int64_t q = ve - 1; q >= r; q--)
+                    if (!mn || !ray_raw_is_null(t, v->attrs, v->data, q - v->start)) {
+                        if (found) ray_release(found);
+                        found = src_row_value(t, v, q - v->start);
+                        break;
+                    }
+                r = ve;
+            }
+            out = found;
+            hi = lo;
+        }
     }
+    ray_col_cursor_free(&cur);
+    return out ? out : ray_typed_null(-t);
+}
+
+ray_t* ray_reduce_src(ray_col_src_t* src, uint16_t opcode, int8_t out_type) {
+    int8_t t = src->type;
+    int64_t len = src->len;
+    if (opcode == OP_COUNT) return ray_i64(len);         /* the length, whatever the type */
+    if (!reduce_src_type(t)) return NULL;
+    switch (opcode) {
+    case OP_SUM: case OP_PROD: case OP_ALL: case OP_ANY: case OP_MIN: case OP_MAX:
+    case OP_AVG: case OP_FIRST: case OP_LAST:
+    case OP_VAR: case OP_VAR_POP: case OP_STDDEV: case OP_STDDEV_POP: break;
+    default: return NULL;
+    }
+    /* BOOL / U8 nulls would be a bitmap the raw kernel cannot read; the
+     * producers reject them, this keeps the plain path if one appears. */
+    if ((t == RAY_BOOL || t == RAY_U8) && src->may_null) return NULL;
+    /* Finding C3: generation 0 answers a CHUNK_ZONE column's sum / avg /
+     * min / max from its zone; the directory gives the same numbers.  For
+     * an integer type they are exec_reduction's too.  A float extreme is
+     * taken only where exec_reduction would build the same atom: an F64
+     * result (F32 under an F64 out type) that is finite (exec_reduction
+     * maps an infinite extreme to null, the zone does not). */
+    bool fl = t == RAY_F32 || t == RAY_F64;
+    bool mm_ok = t == RAY_F32 ? out_type == RAY_F64 : (out_type == 0 || out_type == t);
+    bool dir_ok = opcode == OP_SUM || opcode == OP_AVG ||
+                  ((opcode == OP_MIN || opcode == OP_MAX) && mm_ok);
+    ray_t* dir = dir_ok ? ray_zone_dir_answer(src->obj, opcode) : NULL;
+    if (dir && fl && dir->type == -RAY_F64 && !RAY_ATOM_IS_NULL(dir) && !(fabs(dir->f64) <= DBL_MAX)) {
+        ray_release(dir);
+        dir = NULL;
+    }
+    if (dir) return dir;
+    if (opcode == OP_FIRST || opcode == OP_LAST)
+        return reduce_src_edge(src, opcode == OP_LAST, true);
+    ray_pool_t* pool = ray_pool_get();
+    uint32_t nw = (pool && len >= RAY_PARALLEL_THRESHOLD) ? ray_pool_total_workers(pool) : 1;
+    ray_t* accs_hdr;
+    reduce_acc_t* accs = (reduce_acc_t*)scratch_calloc(&accs_hdr, nw * sizeof(reduce_acc_t));
+    if (!accs) return ray_error("oom", NULL);
+    for (uint32_t i = 0; i < nw; i++) reduce_acc_init(&accs[i]);
+    par_reduce_src_ctx_t ctx = { .src = src, .base = ray_col_src_base(src), .accs = accs,
+                                 .has_nulls = src->may_null, .opcode = opcode };
+    ray_scan_fail_init(&ctx.fail);
+    if (len > 0) ray_col_src_advise(src, 0, len);
+    if (nw > 1) ray_pool_dispatch(pool, par_reduce_src_fn, &ctx, len);
+    else if (len > 0) par_reduce_src_fn(&ctx, 0, 0, len);
+    ray_t* err = ray_scan_fail_finish(&ctx.fail, nw > 1 ? pool : NULL);
+    if (err) { scratch_free(accs_hdr); return err; }
+    /* worker 0 is the base, the rest merged in order (exec_reduction) */
+    reduce_acc_t merged = accs[0];
+    for (uint32_t i = 1; i < nw; i++) reduce_merge(&merged, &accs[i], t, NULL, opcode);
+    ray_t* res = reduce_result(opcode, out_type, t, &merged, len, NULL);
+    scratch_free(accs_hdr);
+    return res;
+}
+
+ray_t* exec_reduction_src(ray_graph_t* g, ray_op_t* op, ray_col_src_t* src) {
+    (void)g;
+    return ray_reduce_src(src, op->opcode, op->out_type);
+}
+
+/* ray_first_fn / ray_last_fn of a bare OP_SCAN lazy over an encoded slot
+ * whose type they read with collection_elem: row 0 (len - 1) itself,
+ * nulls included, read through a cursor.  NULL: not that shape (the
+ * caller reads the column). */
+ray_t* ray_reduce_lazy_elem(ray_t* lazy, bool last) {
+    ray_graph_t* g = RAY_LAZY_GRAPH(lazy);
+    ray_op_t* op = RAY_LAZY_OP(lazy);
+    if (!g || !op || op->opcode != OP_SCAN || !g->table) return NULL;
+    int8_t t = op->out_type;
+    if (!(t == RAY_I32 || t == RAY_I16 || t == RAY_BOOL || t == RAY_U8 ||
+          t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP)) return NULL;
+    ray_op_ext_t* ext = find_ext(g, op->id);
+    uint16_t tid = 0;
+    if (ext) memcpy(&tid, ext->base.pad, sizeof tid);
+    if (!ext || tid != 0) return NULL;                   /* only g->table's columns */
+    ray_t* tbl = g->table;
+    if (!ray_table_get_col_enc(tbl, ext->sym) || ray_col_bind_declines(tbl, ext->sym)) return NULL;
+    ray_col_src_t src;
+    ray_t* err = ray_table_col_src(tbl, ext->sym, &src);
+    if (err) return err;
+    ray_t* r = NULL;
+    if (src.obj && src.type == t && !((t == RAY_BOOL || t == RAY_U8) && src.may_null))
+        r = reduce_src_edge(&src, last, false);
+    ray_col_src_release(&src);
+    return r;
 }
 
 /* ============================================================================

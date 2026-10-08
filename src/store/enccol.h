@@ -36,6 +36,21 @@ struct ray_sym_domain_s;
 #define RAY_ENCCOL_SINGLE 1
 #define RAY_ENCCOL_PARTED 2
 
+/* Whole-column totals of a single-file column's directory, in one pass
+ * (what a loop of ray_enccol_chunk_stat over every chunk would add up):
+ * the wrapping sum of the chunk low words, the exact 128-bit sum, the
+ * non-null rows, and the extremes over the chunks with min/max (integer
+ * types in min_i / max_i from INT64_MAX / INT64_MIN, float types in
+ * min_f / max_f from +inf / -inf). */
+typedef struct {
+    uint64_t sum_wrapped;
+    int64_t  sum_hi;
+    uint64_t sum_lo;
+    int64_t  nonnull;
+    int64_t  min_i, max_i;
+    double   min_f, max_f;
+} ray_enc_col_totals_t;
+
 typedef struct ray_enccol_s {
     _Atomic(uint32_t) rc;           /* shared by RAY_ENCCOL header copies */
     uint8_t  kind;                  /* RAY_ENCCOL_SINGLE / RAY_ENCCOL_PARTED */
@@ -67,6 +82,10 @@ typedef struct ray_enccol_s {
     /* single file: one byte per chunk, set (release) once the chunk's
      * descriptors passed validation; never set for a chunk that failed */
     _Atomic(uint8_t)* desc_ok;
+    /* single file: ray_enccol_dir_totals' cache; totals_state 0 none,
+     * 1 being stored, 2 stored (acquire before reading totals) */
+    _Atomic(uint8_t) totals_state;
+    ray_enc_col_totals_t totals;
 } ray_enccol_t;
 
 ray_enccol_t* ray_enccol_of(ray_t* v);
@@ -198,6 +217,8 @@ typedef struct ray_enc_chunk_stat_s {
 /* Chunk c of a single-file encoded column; the directory was verified at
  * load, so this cannot fail.  c must be below e->n_chunks. */
 void ray_enccol_chunk_stat(const ray_enccol_t* e, int64_t c, ray_enc_chunk_stat_t* out);
+/* The totals below, computed once per column (the directory is immutable). */
+void ray_enccol_dir_totals(ray_enccol_t* e, ray_enc_col_totals_t* out);
 /* File byte range holding rows [lo, hi): from the first touched chunk's
  * descriptors to the end of the last touched chunk.  Precondition:
  * 0 <= lo < hi <= e->len (a row past the end would read a directory entry
