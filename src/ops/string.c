@@ -1571,6 +1571,36 @@ ray_t* exec_concat(ray_graph_t* g, ray_op_t* op) {
 ray_t* ray_concat_text_fn(ray_t* a, ray_t* b, bool str_out) {
     if (a->type == -RAY_STR && b->type == -RAY_STR) return ray_concat_fn(a, b);
     bool atoms = ray_is_atom(a) && ray_is_atom(b);
+    if (atoms && (a->type == -RAY_SYM || a->type == -RAY_STR) &&
+        (b->type == -RAY_SYM || b->type == -RAY_STR)) {
+        /* Two cells, the row-by-row case: build the atom directly rather
+         * than a one-row vector that is unpacked again. */
+        ray_t* sa = a->type == -RAY_SYM ? ray_sym_str(a->i64) : NULL;
+        ray_t* sb = b->type == -RAY_SYM ? ray_sym_str(b->i64) : NULL;
+        if ((a->type == -RAY_SYM && !sa) || (b->type == -RAY_SYM && !sb)) {
+            if (sa) ray_release(sa);
+            if (sb) ray_release(sb);
+            return ray_error("oom", NULL);
+        }
+        const char* pa = sa ? ray_str_ptr(sa) : ray_str_ptr(a);
+        const char* pb = sb ? ray_str_ptr(sb) : ray_str_ptr(b);
+        size_t la = sa ? ray_str_len(sa) : ray_str_len(a);
+        size_t lb = sb ? ray_str_len(sb) : ray_str_len(b);
+        char small[256];
+        ray_t* hdr = NULL;
+        char* buf = la + lb <= sizeof small ? small : (char*)scratch_calloc(&hdr, la + lb + 1);
+        ray_t* out;
+        if (!buf) out = ray_error("oom", NULL);
+        else {
+            memcpy(buf, pa, la);
+            memcpy(buf + la, pb, lb);
+            out = str_out ? ray_str(buf, la + lb) : ray_sym(ray_sym_intern(buf, la + lb));
+        }
+        if (hdr) scratch_free(hdr);
+        if (sa) ray_release(sa);
+        if (sb) ray_release(sb);
+        return out;
+    }
     ray_t* args[2] = { a, b };
     ray_retain(a);
     ray_retain(b);
