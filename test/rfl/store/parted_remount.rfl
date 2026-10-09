@@ -1,0 +1,54 @@
+;; .db.parted.get reuses unchanged partitions across calls.
+;;
+;; A second mount of the same root keeps the partitions whose files did not
+;; change and loads only the ones that are new or replaced; partitions that
+;; disappeared are dropped.  Reuse must be invisible: every remount reports
+;; exactly what is on disk, and a view taken earlier keeps its own rows.
+
+(.sys.exec "rm -rf /tmp/rfl_parted_remount") -- 0
+(set S "/tmp/rfl_parted_remount/.sym")
+(.db.splayed.set "/tmp/rfl_parted_remount/2024.01.01/t" (table [id s] (list [1 2 3] (as 'sym ["a" "b" "c"]))) S)
+(.db.splayed.set "/tmp/rfl_parted_remount/2024.01.02/t" (table [id s] (list [4 5 6] (as 'sym ["d" "e" "f"]))) S)
+
+(set T1 (.db.parted.get "/tmp/rfl_parted_remount" 't))
+(count T1) -- 6
+(sum (get T1 'id)) -- 21
+
+;; Nothing changed: the remount answers the same.
+(set T1b (.db.parted.get "/tmp/rfl_parted_remount" 't))
+(count T1b) -- 6
+(sum (get T1b 'id)) -- 21
+
+;; A partition replaced (a new generation) and a symbol appended.
+(.db.splayed.set "/tmp/rfl_parted_remount/2024.01.02/t" (table [id s] (list [40 50 60 70] (as 'sym ["d" "e" "f" "g"]))) S)
+(set T2 (.db.parted.get "/tmp/rfl_parted_remount" 't))
+(count T2) -- 7
+(sum (get T2 'id)) -- 226
+(count (select {s: s from: T2 where: (== s 'g)})) -- 1
+;; The earlier view is untouched.
+(count T1) -- 6
+(sum (get T1 'id)) -- 21
+
+;; A partition added.
+(.db.splayed.set "/tmp/rfl_parted_remount/2024.01.03/t" (table [id s] (list [7] (as 'sym ["h"]))) S)
+(set T3 (.db.parted.get "/tmp/rfl_parted_remount" 't))
+(count T3) -- 8
+(sum (get T3 'id)) -- 233
+
+;; A partition removed.
+(.sys.exec "rm -rf /tmp/rfl_parted_remount/2024.01.01") -- 0
+(set T4 (.db.parted.get "/tmp/rfl_parted_remount" 't))
+(count T4) -- 5
+(sum (get T4 'id)) -- 227
+
+;; A column file replaced by another tool inside the same generation: the
+;; per-file signature (inode, size, time) must see it.  2024.01.04 holds one
+;; row like 2024.01.03, so its id file fits in place.
+(.db.splayed.set "/tmp/rfl_parted_remount/2024.01.04/t" (table [id s] (list [9] (as 'sym ["h"]))) S)
+(count (.db.parted.get "/tmp/rfl_parted_remount" 't)) -- 6
+(.sys.exec "cp /tmp/rfl_parted_remount/2024.01.04/t/id /tmp/rfl_parted_remount/2024.01.03/t/id") -- 0
+(set T5 (.db.parted.get "/tmp/rfl_parted_remount" 't))
+(count T5) -- 6
+(sum (get T5 'id)) -- 238
+
+(.sys.exec "rm -rf /tmp/rfl_parted_remount") -- 0

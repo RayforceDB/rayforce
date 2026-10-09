@@ -56,6 +56,8 @@ Returns a `table` with every column memory-mapped — zero allocation per row.
 
 Signature: `(.db.parted.get "db_root" 'tbl_name)`. The table name **must** be a quoted symbol atom (e.g. `'trades`), not a string.
 
+Calling it again on the same root is cheap: partitions whose files did not change since the previous call are reused, and only new or replaced partitions are loaded. A partition counts as unchanged when it still resolves to the same generation directory and the schema and column files in it have the same identity, size and modification time. Partitions that disappeared from the root are dropped. Reused partitions stay mapped in the process until a later call finds them changed or gone, so a process that follows a growing database pays for the new partition only. A table returned earlier keeps the rows it had.
+
 Returns a single logical table assembled from every partition directory under `db_root/tbl_name/`. The result carries a virtual `MAPCOMMON` partition column derived from directory names, and every data column is a `RAY_PARTED_*` view over the segment files. Partition pruning kicks in automatically for `select` predicates on the virtual column.
 
 The directory names decide the key type and the partition order. `YYYY.MM.DD` names give a `date` column; digit-only names give an `int64` `part` column and are ordered by value, so `1`, `2`, `10` load as `[1 2 10]` with no zero-padding; any other digit/dot names give a `sym` `part` column in name order. A digit-only name that does not fit `int64` is rejected as `corrupt`, and the message names the directory.

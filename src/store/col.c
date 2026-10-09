@@ -529,6 +529,13 @@ static ray_t* col_read_recursive(const uint8_t** pp, size_t* remaining) {
         *pp += data_size; *remaining -= data_size;
 
         if (type == RAY_STR) {
+            /* The nested format carries no hash mark, and files from before
+             * the hash cache hold padding in the descriptor's last four
+             * bytes.  Drop whatever was copied: a zero hash32 is the lazy
+             * state every consumer computes from (ray_str_t_hash32). */
+            ray_str_t* elems = (ray_str_t*)ray_data(vec);
+            for (int64_t i = 0; i < len; i++)
+                if (!ray_str_is_inline(&elems[i])) elems[i].hash32 = 0;
             if (*remaining < 8) { ray_release(vec); return ray_error("corrupt", NULL); }
             uint64_t pool_size;
             memcpy(&pool_size, *pp, 8);
@@ -899,6 +906,9 @@ static ray_err_t col_save_impl(ray_t* vec, const char* path, bool durable) {
         /* For RAY_SYM: store sym count in rc field (always 0 on disk otherwise).
          * This serves as O(1) fast-reject metadata on load. */
         header.rc = (vec->type == RAY_SYM) ? ray_sym_count() : 0;
+        /* STR: every pooled descriptor goes to disk with its content hash
+         * (filled in below), and the header says so (col.h). */
+        if (vec->type == RAY_STR) ray_col_stamp_str_hashed(&header);
 
         /* HAS_INDEX rebase: an attached accelerator index displaces the
          * 16-byte aux union with an index pointer.  Strip HAS_INDEX from the
@@ -998,7 +1008,40 @@ static ray_err_t col_save_impl(ray_t* vec, const char* path, bool durable) {
             data = ray_data(vec);
         }
 
-        if (data_size > 0) {
+        if (data_size > 0 && vec->type == RAY_STR) {
+            /* Pooled descriptors are written with their content hash filled
+             * in (RAY_COL_STR_HASHED).  They are staged through a bounded
+             * buffer: the source may be a mapped or shared column, and a
+             * save must not write into it.  A hash the column already
+             * caches is reused; a missing one (lazy, 0) is computed here. */
+            const ray_str_t* src = (const ray_str_t*)data;
+            ray_t* pool_owner = (vec->attrs & RAY_ATTR_SLICE) ? vec->slice_parent : vec;
+            const char* pool_base = NULL;
+            size_t pool_len = 0;
+            if (pool_owner->str_pool && !RAY_IS_ERR(pool_owner->str_pool) &&
+                pool_owner->str_pool->len > 0) {
+                pool_base = (const char*)ray_data(pool_owner->str_pool);
+                pool_len  = (size_t)pool_owner->str_pool->len;
+            }
+            ray_str_t buf[1024];
+            for (int64_t off = 0; off < vec->len; ) {
+                int64_t cnt = vec->len - off < 1024 ? vec->len - off : 1024;
+                memcpy(buf, src + off, (size_t)cnt * sizeof(ray_str_t));
+                for (int64_t i = 0; i < cnt; i++) {
+                    if (ray_str_is_inline(&buf[i])) continue;
+                    if (!pool_base || buf[i].pool_off > pool_len ||
+                        buf[i].len > pool_len - buf[i].pool_off) {
+                        fclose(f); remove(tmp_path); return RAY_ERR_CORRUPT;
+                    }
+                    buf[i].hash32 = ray_str_t_hash32(&buf[i], pool_base);
+                }
+                written = fwrite(buf, 1, (size_t)cnt * sizeof(ray_str_t), f);
+                if (written != (size_t)cnt * sizeof(ray_str_t)) {
+                    fclose(f); remove(tmp_path); return RAY_ERR_IO;
+                }
+                off += cnt;
+            }
+        } else if (data_size > 0) {
             written = fwrite(data, 1, data_size, f);
             if (written != data_size) { fclose(f); remove(tmp_path); ray_free_raw(sym_xlate); return RAY_ERR_IO; }
         }
@@ -1338,7 +1381,12 @@ static ray_err_t col_validate_str_region(ray_t* hdr, const void* ptr,
         }
     }
 
-    /* Pre-hash-cache column files persisted the descriptor's final four
+    /* A current writer stores every pooled descriptor's content hash and
+     * marks the header (RAY_COL_STR_HASHED, col.h): those descriptors are
+     * taken as written, so mapping the column reads no string bytes and
+     * dirties no descriptor page.
+     *
+     * Pre-hash-cache column files persisted the descriptor's final four
      * bytes as uninitialized padding.  A nonzero legacy value must never be
      * trusted as a content hash: equal strings could otherwise probe
      * different join/group slots and silently produce wrong results.
@@ -1346,11 +1394,19 @@ static ray_err_t col_validate_str_region(ray_t* hdr, const void* ptr,
      * ray_vm_map_file is MAP_PRIVATE / copy-on-write, so refreshing the
      * validated descriptors repairs both callers: ray_col_load copies these
      * values into its buddy block, while ray_col_mmap retains the private
-     * repaired mapping without modifying the file. */
-    for (int64_t i = 0; i < hdr->len; i++) {
-        if (ray_str_is_inline(&elems[i])) continue;
-        uint32_t h = (uint32_t)ray_str_t_hash(&elems[i], pool_base);
-        elems[i].hash32 = h != 0 ? h : 1u;
+     * repaired mapping without modifying the file.  Only a descriptor whose
+     * stored value is wrong is written, so pages that happen to be right
+     * stay shared with the page cache.  Read rc with memcpy: file bytes are
+     * not atomic storage. */
+    uint32_t disk_rc;
+    memcpy(&disk_rc, (const char*)hdr + offsetof(ray_t, rc), sizeof(disk_rc));
+    if (disk_rc != RAY_COL_STR_HASHED) {
+        for (int64_t i = 0; i < hdr->len; i++) {
+            if (ray_str_is_inline(&elems[i])) continue;
+            uint32_t h = (uint32_t)ray_str_t_hash(&elems[i], pool_base);
+            h = h != 0 ? h : 1u;
+            if (elems[i].hash32 != h) elems[i].hash32 = h;
+        }
     }
 
     out->has_str_pool = true;
