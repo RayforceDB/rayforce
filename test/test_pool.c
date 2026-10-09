@@ -1780,12 +1780,13 @@ static bool pf_none_resident(const uint8_t* p, size_t n) {
 
 /* Pages this process has read stay mapped and are not evicted: drop both
  * columns' mappings, evict the files, map them again and re-register. */
-/* Wait out the reads a case started: a page still being read is in the
- * page cache but locked, eviction skips it and it turns up resident in the
- * next case.  Touching each present page waits for its read to finish. */
+/* Finish every read before eviction. mincore reports an in-flight page as
+ * absent until it is uptodate, so probing residency first can skip exactly
+ * the reads that need draining. Fault every page, including those absent
+ * from the residency snapshot, then unmap and evict before the next case. */
 static void pf_settle(const uint8_t* p, size_t n) {
     for (size_t off = 0; off < n; off += 4096)
-        if (ray_vm_resident(p + off, 1)) pf_sink += p[off];
+        pf_sink += p[off];
 }
 
 static bool pf_reset(uint8_t** base, size_t* size, uint8_t** bbase, size_t* bsize,
