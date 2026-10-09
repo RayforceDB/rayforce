@@ -1568,25 +1568,28 @@ ray_t* exec_concat(ray_graph_t* g, ray_op_t* op) {
 
 /* Query fallback uses the same text kernel after checking argument syntax.
  * Ordinary builtin calls retain collection semantics. */
-ray_t* ray_concat_text_fn(ray_t* a, ray_t* b, bool str_out) {
+ray_t* ray_concat_text_fn(ray_t* a, ray_t* b, bool str_out, uint8_t rows_mask) {
     if (a->type == -RAY_STR && b->type == -RAY_STR) return ray_concat_fn(a, b);
     bool atoms = ray_is_atom(a) && ray_is_atom(b);
+    /* A null cell of a column is empty text, as the vector kernel reads a
+     * null element; a null literal operand follows the kernel's null rule. */
+    bool a_null = RAY_ATOM_IS_NULL(a), b_null = RAY_ATOM_IS_NULL(b);
     if (atoms && (a->type == -RAY_SYM || a->type == -RAY_STR) &&
         (b->type == -RAY_SYM || b->type == -RAY_STR) &&
-        !RAY_ATOM_IS_NULL(a) && !RAY_ATOM_IS_NULL(b)) {   /* a null operand: the kernel's null rule */
+        (!a_null || (rows_mask & 1)) && (!b_null || (rows_mask & 2))) {
         /* Two cells, the row-by-row case: build the atom directly rather
          * than a one-row vector that is unpacked again. */
-        ray_t* sa = a->type == -RAY_SYM ? ray_sym_str(a->i64) : NULL;
-        ray_t* sb = b->type == -RAY_SYM ? ray_sym_str(b->i64) : NULL;
-        if ((a->type == -RAY_SYM && !sa) || (b->type == -RAY_SYM && !sb)) {
+        ray_t* sa = a->type == -RAY_SYM && !a_null ? ray_sym_str(a->i64) : NULL;
+        ray_t* sb = b->type == -RAY_SYM && !b_null ? ray_sym_str(b->i64) : NULL;
+        if ((a->type == -RAY_SYM && !a_null && !sa) || (b->type == -RAY_SYM && !b_null && !sb)) {
             if (sa) ray_release(sa);
             if (sb) ray_release(sb);
             return ray_error("oom", NULL);
         }
-        const char* pa = sa ? ray_str_ptr(sa) : ray_str_ptr(a);
-        const char* pb = sb ? ray_str_ptr(sb) : ray_str_ptr(b);
-        size_t la = sa ? ray_str_len(sa) : ray_str_len(a);
-        size_t lb = sb ? ray_str_len(sb) : ray_str_len(b);
+        const char* pa = a_null ? "" : sa ? ray_str_ptr(sa) : ray_str_ptr(a);
+        const char* pb = b_null ? "" : sb ? ray_str_ptr(sb) : ray_str_ptr(b);
+        size_t la = a_null ? 0 : sa ? ray_str_len(sa) : ray_str_len(a);
+        size_t lb = b_null ? 0 : sb ? ray_str_len(sb) : ray_str_len(b);
         char small[256];
         ray_t* hdr = NULL;
         char* buf = la + lb <= sizeof small ? small : (char*)scratch_calloc(&hdr, la + lb + 1);

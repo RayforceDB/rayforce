@@ -349,6 +349,7 @@ ray_t* ray_try_fn(ray_t* expr, ray_t* handler_expr) {
         return handler;
     }
 
+    g_eval_rows = -1;   /* the handler's own evaluation sets it */
     ray_t* handler_result = ray_try_handle(handler, err_val);
     ray_release(err_val);
     ray_release(handler);
@@ -2278,6 +2279,8 @@ static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
                                bool query, uint64_t row_args, bool named,
                                int8_t* out_rows) {
     if (out_rows) *out_rows = -1;
+    /* A lambda called inside a named helper's body is that body's text. */
+    if (query && !named) named = ray_eval_query_helper_literals();
     /* Lazy compilation on first call.  A closure is never compiled; a
      * lambda written inline in a query is one (it captures the query's
      * bindings), so it runs on the tree walker below, where `named` keeps
@@ -2405,7 +2408,7 @@ static bool vm_fn_rowwise(const ray_t* fn_obj) {
 /* Control forms return one of their operands, so the operand's provenance
  * is the form's; every other special form builds a new value. */
 static bool form_inherits_rows(const ray_t* head) {
-    static const char* const forms[] = { "if", "cond", "do", "let", "and", "or", "return", "try" };
+    static const char* const forms[] = { "if", "do", "let", "set", "and", "or", "try" };
     const char* name = ray_fn_name(head);
     for (size_t i = 0; i < sizeof forms / sizeof *forms; i++)
         if (strcmp(name, forms[i]) == 0) return true;
@@ -2449,7 +2452,8 @@ static ray_t* vm_call_binary(ray_t* fn_obj, ray_t* left, ray_t* right,
          * collection semantics; a bound vector never has row provenance. */
         result = ray_concat_text_fn(left, right,
                                     (left->type == -RAY_STR && left_rows == 1) ||
-                                    (right->type == -RAY_STR && right_rows == 1));
+                                    (right->type == -RAY_STR && right_rows == 1),
+                                    (uint8_t)((left_rows == 1 ? 1 : 0) | (right_rows == 1 ? 2 : 0)));
         *out_rows = 1;
     /* Fast path: atoms have negative type — skip collection check entirely.
      * Only call is_collection when at least one arg has type >= 0 (vector/list). */
@@ -3100,11 +3104,12 @@ op_tryh: {
      * is invoked with the error; any other value is the fallback result. */
     ray_t* err_val = POP();
     ray_t* handler = POP();
+    g_eval_rows = -1;   /* an interpreted handler reports its value's provenance */
     ray_t* result  = ray_try_handle(handler, err_val);  /* borrows both */
     ray_release(err_val);
     ray_release(handler);
     if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }
-    PUSHR(result, 2);   /* a handler's value: provenance unknown */
+    PUSHR(result, vrows_from(g_eval_rows));
     DISPATCH();
 }
 
@@ -4327,7 +4332,8 @@ ray_t* ray_eval(ray_t* obj) {
                 if (scalar_ok && (ray_is_atom(left) || lr) && (ray_is_atom(right) || rr)) {
                     result = ray_concat_text_fn(left, right,
                                                 (left->type == -RAY_STR && lr) ||
-                                                (right->type == -RAY_STR && rr));
+                                                (right->type == -RAY_STR && rr),
+                                                (uint8_t)((lr ? 1 : 0) | (rr ? 2 : 0)));
                     rows = lr || rr;
                 } else {
                     result = fn(left, right);
@@ -4366,7 +4372,8 @@ ray_t* ray_eval(ray_t* obj) {
                     ret = err; goto out;
                 }
             }
-            rows = any_rows && ray_active_query_table() && vm_fn_rowwise(head) ? any_rows : 0;
+            rows = fn == ray_return_fn ? any_rows
+                 : any_rows && ray_active_query_table() && vm_fn_rowwise(head) ? any_rows : 0;
             if (!(head->attrs & RAY_FN_LAZY_AWARE)) {
                 ray_t* err = materialize_owned_args(args, argc);
                 if (err) { ray_release(head); ret = err; goto out; }

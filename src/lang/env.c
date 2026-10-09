@@ -197,6 +197,13 @@ ray_t* ray_env_capture_locals(void) {
     }
 
     int64_t* key_ids = (int64_t*)ray_data(keys);
+    /* The captured bindings' row provenance, kept under a key no source
+     * token can spell, so a closure called from a query still knows which
+     * of its captures are row data. */
+    ray_t* flags = ray_vec_new(RAY_U8, capacity);
+    if (!flags || RAY_IS_ERR(flags)) { ray_release(keys); ray_release(vals); return flags ? flags : ray_error("oom", NULL); }
+    flags->len = 0;
+    bool any_flag = false;
     /* Top-to-bottom flattening preserves ordinary lexical lookup: the first
      * occurrence of a name is the value visible at closure creation. */
     for (int32_t d = __VM->scope_depth - 1; d >= 0; d--) {
@@ -208,9 +215,11 @@ ray_t* ray_env_capture_locals(void) {
                 if (key_ids[k] == f->keys[i]) { seen = true; break; }
             if (seen) continue;
             key_ids[keys->len++] = f->keys[i];
+            ((uint8_t*)ray_data(flags))[flags->len++] = f->rows[i];
+            if (f->rows[i]) any_flag = true;
             vals = ray_list_append(vals, f->vals[i]);
             if (!vals || RAY_IS_ERR(vals)) {
-                ray_release(keys);
+                ray_release(keys); ray_release(flags);
                 return vals ? vals : ray_error("oom", NULL);
             }
         }
@@ -219,8 +228,15 @@ ray_t* ray_env_capture_locals(void) {
     if (keys->len == 0) {
         ray_release(keys);
         ray_release(vals);
+        ray_release(flags);
         return NULL;
     }
+    if (any_flag) {
+        key_ids[keys->len++] = ray_sym_intern(" rows", 5);
+        vals = ray_list_append(vals, flags);
+        if (!vals || RAY_IS_ERR(vals)) { ray_release(keys); ray_release(flags); return vals ? vals : ray_error("oom", NULL); }
+    }
+    ray_release(flags);
     return ray_dict_new(keys, vals);
 }
 
@@ -239,9 +255,16 @@ ray_err_t ray_env_push_capture(ray_t* capture) {
         return RAY_ERR_TYPE;
     }
     ray_t** value_items = (ray_t**)ray_data(vals);
+    int64_t rows_sym = ray_sym_intern(" rows", 5);
+    const uint8_t* flags = NULL;
+    for (int64_t i = 0; i < keys->len; i++)
+        if (ray_read_sym(ray_data(keys), i, RAY_SYM, keys->attrs) == rows_sym &&
+            value_items[i] && value_items[i]->type == RAY_U8)
+            flags = (const uint8_t*)ray_data(value_items[i]);
     for (int64_t i = 0; i < keys->len; i++) {
         int64_t sym = ray_read_sym(ray_data(keys), i, RAY_SYM, keys->attrs);
-        ray_err_t err = ray_env_set_local(sym, value_items[i]);
+        if (sym == rows_sym) continue;
+        ray_err_t err = ray_env_set_local_rows(sym, value_items[i], flags ? flags[i] : 0);
         if (err != RAY_OK) {
             ray_env_pop_scope();
             return err;
@@ -353,16 +376,21 @@ static ray_t* env_lookup_flat_rows(int64_t sym_id, uint8_t* rows) {
      * (cf. ray_env_get_local, already guarded). Such a thread has no
      * local scopes; global bindings must still resolve. */
     if (__VM) {
+        /* Provenance is relative to the innermost query: a binding below
+         * that query's frame belongs to an outer context and is plain data
+         * for the inner one. */
+        bool outer = false;
         for (int32_t d = __VM->scope_depth - 1; d >= 0; d--) {
             ray_scope_frame_t* f = &__VM->scope_stack[d];
             for (int32_t i = 0; i < f->count; i++) {
                 if (f->keys[i] != sym_id) continue;
-                if (rows) *rows = f->rows[i];
+                if (rows) *rows = outer ? 0 : f->rows[i];
                 return f->vals[i];
             }
+            if (f->kind == RAY_SCOPE_QUERY) outer = true;
             if (f->kind == RAY_SCOPE_CALL) {
                 ray_t* v = env_call_frame_value(f, sym_id);
-                if (v) { if (rows) *rows = 1; return v; }
+                if (v) { if (rows) *rows = outer ? 0 : 1; return v; }
                 break;
             }
         }
@@ -658,10 +686,12 @@ ray_err_t ray_env_set_local_rows(int64_t sym_id, ray_t* val, uint8_t rows) {
  * call frames included, globals excluded), or -1 when it is not bound. */
 int ray_env_binding_rows(int64_t sym_id) {
     if (!__VM) return -1;
+    bool outer = false;
     for (int32_t d = __VM->scope_depth - 1; d >= 0; d--) {
         ray_scope_frame_t* f = &__VM->scope_stack[d];
         for (int32_t i = 0; i < f->count; i++)
-            if (f->keys[i] == sym_id) return f->rows[i];
+            if (f->keys[i] == sym_id) return outer ? 0 : f->rows[i];
+        if (f->kind == RAY_SCOPE_QUERY) outer = true;
         if (f->kind == RAY_SCOPE_CALL) break;
     }
     return -1;

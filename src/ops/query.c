@@ -10030,10 +10030,18 @@ ray_t* ray_select(ray_t** args, int64_t n) {
 static bool expr_needs_rows_deep(ray_t* expr, int depth) {
     if (!expr || depth > 8 || expr->type != RAY_LIST || !expr->len || (expr->attrs & ATTR_QUOTED)) return false;
     ray_t** el = (ray_t**)ray_data(expr);
-    if (el[0]->type == RAY_LIST) return true;   /* an inline lambda */
+    if (el[0]->type == RAY_LIST) {               /* an inline lambda: its body */
+        ray_t** head = (ray_t**)ray_data(el[0]);
+        for (int64_t i = 2; i < el[0]->len; i++)
+            if (expr_needs_rows_deep(head[i], depth + 1)) return true;
+    }
     if (el[0]->type == -RAY_SYM && !(el[0]->attrs & ATTR_QUOTED)) {
-        if (agg_arith_head_is_control(el[0]->i64) || select_sym_is(el[0], "cond", 4)) return true;
-        ray_t* gv = ray_env_get_global(el[0]->i64);
+        /* Only a condition over one value needs rows; a sequence, a
+         * binding or a loop in the body does not. */
+        if (select_sym_is(el[0], "if", 2) || select_sym_is(el[0], "cond", 4) ||
+            select_sym_is(el[0], "and", 3) || select_sym_is(el[0], "or", 2)) return true;
+        ray_t* gv = ray_env_get_lexical_local(el[0]->i64);
+        if (!gv) gv = ray_env_get_global(el[0]->i64);
         if (gv && gv->type == RAY_LAMBDA) {
             ray_t* bodies = LAMBDA_BODY(gv);
             if (bodies && bodies->type == RAY_LIST)

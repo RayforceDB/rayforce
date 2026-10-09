@@ -165,3 +165,31 @@ CNT -- 3
 (key (select {n: (count (distinct x)) by: (dbl x) from: T})) -- ['x 'n]
 (set hif (fn [v] 1 (if (> v 2) (* v 10) v)))
 (at (select {n: (count x) by: (hif x) from: (table [x] (list [1 2 3 4]))}) 'x) -- [1 2 30 40]
+;; Provenance is relative to the innermost query: a nested query inside a
+;; helper does not take the caller's row value as its own row data.
+(set hn (fn [v] 1 (at (select {r: (concat w v) from: U}) 'r)))
+(set OUT 0)
+(set gset (fn [v] 1 (set OUT (hn v)) 0))
+(update {r: (gset s) from: T})
+OUT -- ['p 'q 'r 'a 'b 'c]
+;; A let, a sequence or a loop in an opaque key's body keeps the key whole;
+;; only a condition over one value makes it row by row, and a helper bound
+;; with let is looked through as a global one is.
+(set hlet2 (fn [v] (let m (min v)) (- v m)))
+(at (select {n: (count v) by: (hlet2 v) from: TB}) 'v) -- [0 1 2 9 19 29]
+(at (select {n: (count v) by: (hlet2 v) from: TB where: (> v 2)}) 'v) -- [0 7 17 27]
+((fn [t] (let h (fn [v] 1 (if (> v 2) (* v 10) v))) (at (select {n: (count x) by: (h x) from: t}) 'x)) (table [x] (list [1 2 3 4]))) -- [1 2 30 40]
+;; A null cell is empty text row by row, as the vector kernel reads it; a
+;; null literal still nulls the row.
+(at (select {r: (concat s 'zz) e: (reverse x) from: T4}) 'r) -- ['azz 'zz 'czz 'dzz]
+;; A lambda inside a named closure's body is that body's text: its quoted
+;; symbols are symbols.  set keeps its value's provenance; so does a try
+;; handler's value used inside the helper.
+(set mk (fn [a] (fn [b] ((fn [z] (concat z (concat 'x a))) b))))
+(set cl (mk 'k))
+(at (select {r: (cl s) e: (reverse x) from: T}) 'r) -- (list ['a 'x 'k] ['b 'x 'k] ['c 'x 'k])
+(at (select {r: ((fn [v] (concat (set G v) "!")) s) e: (reverse x) from: T}) 'r) -- ['a! 'b! 'c!]
+(set hy (fn [v] 1 (concat (try (+ v 's) (fn [e] v)) "!")))
+(at (select {r: (hy s) e: (reverse x) from: T}) 'r) -- ['a! 'b! 'c!]
+(at (select {r: ((fn [v] 1 (concat (ht v) "!")) s) e: (reverse x) from: T}) 'r) -- ['a! 'b! 'c!]
+(key (select {by: (dbl x) from: T})) -- ['x 's]
