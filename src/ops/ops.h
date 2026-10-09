@@ -601,6 +601,11 @@ typedef struct ray_graph {
      * retry, since the interpreter's `if` tests one truth value and would
      * write the then-branch to every row. */
     bool            if_refused;
+
+    /* Set by exec_group_parted around an in-place concat group: the
+     * table's parted columns are grouped from their segments (no flatten);
+     * exec_group_run skips its parted dispatch. */
+    bool            grp_seg_stream;
 } ray_graph_t;
 
 /* ===== Morsel Iterator ===== */

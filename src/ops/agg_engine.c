@@ -74,6 +74,15 @@ static bool agg_indexed_supported(uint16_t op, int8_t t) {
     return false;
 }
 
+/* A column's metadata as the v2 engine routes it: under an in-place concat
+ * group (g->grp_seg_stream) a parted column reads as its base type, since
+ * its sources are read from the segments; otherwise unchanged. */
+static bool agg_col_meta(ray_graph_t* g, ray_t* tbl, int64_t sym, ray_col_meta_t* m) {
+    if (!ray_table_col_meta(tbl, sym, m)) return false;
+    if (g->grp_seg_stream && RAY_IS_PARTED(m->type)) m->type = (int8_t)RAY_PARTED_BASETYPE(m->type);
+    return true;
+}
+
 agg_v2_reason_t agg_v2_admission(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     if (!g || !op || !tbl) return AGG_V2_SHAPE;
     ray_op_ext_t* ext = find_ext(g, op->id);
@@ -117,7 +126,7 @@ agg_v2_reason_t agg_v2_admission(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         if (!key || key->opcode != OP_SCAN) return AGG_V2_KEY_EXPRESSION;
         ray_op_ext_t* kext = find_ext(g, key->id);
         ray_col_meta_t km;
-        if (!kext || !ray_table_col_meta(tbl, kext->sym, &km)) return AGG_V2_SHAPE;
+        if (!kext || !agg_col_meta(g, tbl, kext->sym, &km)) return AGG_V2_SHAPE;
         switch (km.type) {
             case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8:
             case RAY_BOOL: case RAY_DATE: case RAY_TIME:
@@ -139,14 +148,14 @@ agg_v2_reason_t agg_v2_admission(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         for (uint32_t k = 0; k < ext->n_keys; k++) {
             ray_op_ext_t* ke = find_ext(g, ext->keys[k]);
             ray_col_meta_t cm;
-            if (!ray_table_col_meta(tbl, ke->sym, &cm)) continue;   /* present: the key loop above checked */
+            if (!agg_col_meta(g, tbl, ke->sym, &cm)) continue;   /* present: the key loop above checked */
             if (cm.type == RAY_F32 || cm.type == RAY_F64) floating = true;
             if (cm.type == RAY_STR || cm.type == RAY_GUID || cm.type == RAY_LIST) indexed = true;
         }
         for (uint32_t a = 0; a < ext->n_aggs; a++) {
             ray_op_ext_t* ie = find_ext(g, ext->agg_ins[a]);
             ray_col_meta_t cm;
-            if (ie && ray_table_col_meta(tbl, ie->sym, &cm) && agg_indexed_supported(ext->agg_ops[a], cm.type)) indexed = true;
+            if (ie && agg_col_meta(g, tbl, ie->sym, &cm) && agg_indexed_supported(ext->agg_ops[a], cm.type)) indexed = true;
         }
         if (floating && !indexed) return AGG_V2_PARALLEL_WIDE;
     }
@@ -160,7 +169,7 @@ agg_v2_reason_t agg_v2_admission(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
             if (!in || in->opcode != OP_SCAN) return AGG_V2_AGG_EXPRESSION;
             ray_op_ext_t* ie = find_ext(g, in->id);
             ray_col_meta_t im;
-            bool ih = ie && ray_table_col_meta(tbl, ie->sym, &im);
+            bool ih = ie && agg_col_meta(g, tbl, ie->sym, &im);
             if (ih && agg_indexed_supported(ext->agg_ops[a], im.type)) continue;
             const agg_vtable_t* vt = ih ? agg_resolve(ext->agg_ops[a], im.type) : NULL;
             if (!vt) return AGG_V2_AGG_TYPE;
@@ -173,8 +182,8 @@ agg_v2_reason_t agg_v2_admission(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
             if (!xin || xin->opcode != OP_SCAN || !yin || yin->opcode != OP_SCAN) return AGG_V2_AGG_EXPRESSION;
             ray_op_ext_t* xe = find_ext(g, xin->id); ray_op_ext_t* ye = find_ext(g, yin->id);
             ray_col_meta_t xm, ym;
-            if (!xe || !ye || !ray_table_col_meta(tbl, xe->sym, &xm)
-                || !ray_table_col_meta(tbl, ye->sym, &ym)) return AGG_V2_SHAPE;
+            if (!xe || !ye || !agg_col_meta(g, tbl, xe->sym, &xm)
+                || !agg_col_meta(g, tbl, ye->sym, &ym)) return AGG_V2_SHAPE;
             if (!agg_resolve(ext->agg_ops[a], xm.type)) return AGG_V2_AGG_TYPE;
             if (!agg_resolve(ext->agg_ops[a], ym.type)) return AGG_V2_AGG_TYPE;
             continue;  /* admitted */
@@ -188,7 +197,7 @@ agg_v2_reason_t agg_v2_admission(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         if (!in || in->opcode != OP_SCAN) return AGG_V2_AGG_EXPRESSION;
         ray_op_ext_t* ie = find_ext(g, in->id);
         ray_col_meta_t im;
-        if (!ie || !ray_table_col_meta(tbl, ie->sym, &im)) return AGG_V2_SHAPE;
+        if (!ie || !agg_col_meta(g, tbl, ie->sym, &im)) return AGG_V2_SHAPE;
         if (agg_indexed_supported(ext->agg_ops[a], im.type)) continue;
         const agg_vtable_t* vt = agg_resolve(ext->agg_ops[a], im.type);
         if (!vt) return AGG_V2_AGG_TYPE;
@@ -454,7 +463,11 @@ static inline const void* agg_elem_at(const agg_rr_t* rr, agg_curs_t* cs, uint32
  * a strategy reads the column's type, SYM width, domain and nullability
  * (plans, layouts, emits); NULL on OOM.  Its data is never read. */
 static ray_t* agg_src_standin(const ray_col_src_t* s) {
-    ray_t* v = s->type == RAY_SYM ? ray_sym_vec_new(s->attrs & RAY_SYM_W_MASK, 0)
+    /* a parted SYM source's own width is not authoritative (segments may
+     * differ): the stand-in takes the widest segment's, which plans and
+     * emits size their slots and output by */
+    uint8_t w = s->parted ? parted_sym_width(s->obj) : (s->attrs & RAY_SYM_W_MASK);
+    ray_t* v = s->type == RAY_SYM ? ray_sym_vec_new(w, 0)
                                   : ray_vec_new(s->type, 0);
     if (!v || RAY_IS_ERR(v)) {
         if (v) ray_error_free(v);
@@ -1474,7 +1487,7 @@ static bool agg_vo_init(agg_vo_t* vo, ray_graph_t* g, ray_op_ext_t* ext, ray_t* 
     for (uint32_t a = 0; a < na; a++) {
         ray_op_ext_t* ie = find_ext(g, ext->agg_ins[a]);
         ray_col_meta_t vm;
-        bool vh = ext->agg_ops[a] != OP_COUNT && ie && ray_table_col_meta(tbl, ie->sym, &vm);
+        bool vh = ext->agg_ops[a] != OP_COUNT && ie && agg_col_meta(g, tbl, ie->sym, &vm);
         int8_t in_type = vh ? vm.type : RAY_I64;
         vo->vts[a] = agg_resolve(ext->agg_ops[a], in_type);
         vo->off[a] = vo->block;
@@ -7258,6 +7271,43 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                                 int64_t group_limit,
                                 const ray_group_emit_filter_t* efp);
 
+/* A segment-streamed table (g->grp_seg_stream) holding a parted column. */
+static bool agg_seg_parted(ray_graph_t* g, ray_t* tbl) {
+    if (!g->grp_seg_stream) return false;
+    int64_t nc = ray_table_ncols(tbl);
+    for (int64_t c = 0; c < nc; c++) {
+        ray_col_meta_t m;
+        if (ray_table_col_meta_idx(tbl, c, &m) && RAY_IS_PARTED(m.type)) return true;
+    }
+    return false;
+}
+
+/* R-RANDOM over a segment-streamed table: a strategy that reads keys or
+ * inputs at stored rows or whole runs over a flat copy of the table, each
+ * parted column copied from its segments by range (parted_flatten_fixed,
+ * the concat fallback's own copy), released when the run returns. */
+static ray_t* agg_seg_flat_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
+                               int64_t nrows, ray_t* sel,
+                               const int64_t* sel_prefix, int64_t n_sel,
+                               int64_t group_limit,
+                               const ray_group_emit_filter_t* efp) {
+    int64_t nc = ray_table_ncols(tbl);
+    ray_t* flat = ray_table_new(nc > 0 ? nc : 1);
+    for (int64_t c = 0; c < nc && flat && !RAY_IS_ERR(flat); c++) {
+        ray_t* slot = ray_table_slot_idx(tbl, c);
+        ray_col_meta_t m;
+        ray_t* v = ray_col_meta_of(slot, &m) && RAY_IS_PARTED(m.type) ? parted_flatten_fixed(slot, nrows) : slot;
+        if (!v || RAY_IS_ERR(v)) { ray_release(flat); return v ? v : ray_error("oom", NULL); }
+        flat = ray_table_add_col(flat, ray_table_col_name(tbl, c), v);
+        if (v != slot) ray_release(v);
+    }
+    if (!flat || RAY_IS_ERR(flat)) return flat ? flat : ray_error("oom", NULL);
+    ray_t* r = exec_group_v2_run_inner(g, op, flat, nrows, sel, sel_prefix, n_sel, group_limit, efp);
+    ray_graph_unbind_table(g, flat);
+    ray_release(flat);
+    return r;
+}
+
 /* Trim a full group result to the emit filter's keep set (the same decision
  * the native selections make, over the finished aggregate column).  Row
  * order is preserved.  Consumes `result`; a failure keeps the full result,
@@ -7547,7 +7597,7 @@ static bool agg_firstn_admitted(ray_graph_t* g, ray_op_ext_t* ext, ray_t* tbl,
         ray_op_ext_t* ie = find_ext(g, ext->agg_ins[a]);
         if (!ie || ie->base.opcode != OP_SCAN) return false;
         ray_col_meta_t cm;
-        if (!ray_table_col_meta(tbl, ie->sym, &cm)) return false;
+        if (!agg_col_meta(g, tbl, ie->sym, &cm)) return false;
         if (aop == OP_COUNT) continue;
         switch (cm.type) {
             case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8:
@@ -7614,7 +7664,10 @@ static ray_t* agg_first_n_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t 
     /* random: indexed / first-n / serial whole-column strategy.  The data
      * declines below (too few groups, heavy groups) come from reading the
      * keys at rows, so the keys unstage first; a declined pre-pass leaves the
-     * full run on the plain keys. */
+     * full run on the plain keys.  A segment-streamed table runs the whole
+     * group over its flat copy (the pre-pass included). */
+    if (agg_seg_parted(g, tbl))
+        return agg_seg_flat_run(g, op, tbl, nrows, sel, sel_prefix, n_sel, group_limit, NULL);
     ray_t* uerr = agg_keys_unstage(key_cols, ks);
     if (uerr) return uerr;
 
@@ -7901,7 +7954,7 @@ static ray_t* exec_group_v2_run_keys(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     for (uint32_t a = 0; a < ext->n_aggs; a++) {
         ray_op_ext_t* ie = find_ext(g, ext->agg_ins[a]);
         ray_col_meta_t cm;
-        if (ie && ray_table_col_meta(tbl, ie->sym, &cm) && agg_indexed_supported(ext->agg_ops[a], cm.type)) indexed = true;
+        if (ie && agg_col_meta(g, tbl, ie->sym, &cm) && agg_indexed_supported(ext->agg_ops[a], cm.type)) indexed = true;
     }
     if (indexed) {
         if (sel) {
@@ -7913,8 +7966,10 @@ static ray_t* exec_group_v2_run_keys(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             if (compact && !RAY_IS_ERR(compact)) { ray_graph_unbind_table(g, compact); ray_release(compact); }
             ray_release(idx); return result;
         }
-        agg_route_record(AGG_ROUTE_V2_INDEXED);
         /* random: indexed / first-n / serial whole-column strategy */
+        if (agg_seg_parted(g, tbl))
+            return agg_seg_flat_run(g, op, tbl, nrows, sel, sel_prefix, n_sel, group_limit, efp);
+        agg_route_record(AGG_ROUTE_V2_INDEXED);
         ray_t* uerr = agg_keys_unstage(key_cols, ks);
         if (uerr) return uerr;
         ray_t* result = agg_indexed_run(g, op, tbl, key_cols, key_syms, nrows);
@@ -8197,8 +8252,12 @@ static ray_t* exec_group_v2_run_keys(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         }
         /* Hash fallback (F64 / STR keys): not a chunked strategy — compact. */
         if (sel) AGG_RUN_COMPACT_FALLBACK();
-        agg_route_record(AGG_ROUTE_V2_INDEXED);
         /* random: indexed / first-n / serial whole-column strategy */
+        if (agg_seg_parted(g, tbl)) {
+            agg_vo_free(&vo); agg_dense_plan_free(&dp);
+            return agg_seg_flat_run(g, op, tbl, nrows, sel, sel_prefix, n_sel, group_limit, efp);
+        }
+        agg_route_record(AGG_ROUTE_V2_INDEXED);
         ray_t* uerr = agg_keys_unstage(key_cols, ks);
         if (uerr) { agg_vo_free(&vo); agg_dense_plan_free(&dp); return uerr; }
         { ray_t* r = agg_indexed_run(g, op, tbl, key_cols, key_syms, nrows);
@@ -8213,8 +8272,12 @@ static ray_t* exec_group_v2_run_keys(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
      * count is below the parallel threshold here → small; not a perf blocker). */
     if (sel) AGG_RUN_COMPACT_FALLBACK();
 
-    agg_route_record(dense ? AGG_ROUTE_V2_SERIAL_DENSE : AGG_ROUTE_V2_SERIAL_HASH);
     /* random: indexed / first-n / serial whole-column strategy */
+    if (agg_seg_parted(g, tbl)) {
+        agg_dense_plan_free(&dp);
+        return agg_seg_flat_run(g, op, tbl, nrows, sel, sel_prefix, n_sel, group_limit, efp);
+    }
+    agg_route_record(dense ? AGG_ROUTE_V2_SERIAL_DENSE : AGG_ROUTE_V2_SERIAL_HASH);
     ray_t* uerr = agg_keys_unstage(key_cols, ks);
     if (uerr) { agg_dense_plan_free(&dp); return uerr; }
     agg_groups_t groups = {0};
@@ -8314,10 +8377,15 @@ static ray_t* agg_build_compact(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         return compact ? compact : ray_error("oom", NULL);
     }
     for (uint32_t i = 0; i < n_want; i++) {
-        ray_t* src = ray_table_col(tbl, want[i]);
+        /* a segment-streamed table's parted column: its flat copy */
+        ray_col_meta_t pm;
+        bool parted = g->grp_seg_stream && ray_table_col_meta(tbl, want[i], &pm) && RAY_IS_PARTED(pm.type);
+        ray_t* src = parted ? parted_flatten_fixed(ray_table_slot(tbl, want[i]), ray_table_nrows(tbl))
+                            : ray_table_col(tbl, want[i]);
         if (src && RAY_IS_ERR(src)) { ray_release(compact); scratch_free(want_hdr); return src; }
         if (!src) { ray_release(compact); scratch_free(want_hdr); return ray_error("nyi", NULL); }
         ray_t* gcol = gather_by_idx(src, idx, n_sel);   /* fresh, no alias */
+        if (parted) ray_release(src);
         if (!gcol || RAY_IS_ERR(gcol)) {
             ray_release(compact); scratch_free(want_hdr);
             return gcol ? gcol : ray_error("oom", NULL);

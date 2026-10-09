@@ -1271,6 +1271,22 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit)
  * entries.  O(1) per query; surfaced via (.sys.mem)'s "group-perpart-runs". */
 int64_t ray_group_perpart_runs(void);
 
+/* Monotonic count of exec_group_parted's in-place concat groups (the
+ * parted columns grouped from their segments, no flatten).  Tests. */
+int64_t ray_group_segstream_runs(void);
+
+/* A parted fixed-width column (a plain parted wrapper or a RAY_ENCCOL_PARTED
+ * slot; base neither STR nor LIST) copied into one owned flat vector of
+ * `total` rows: segments read by range (in place when plain or already
+ * materialized, a vector at a time when encoded; never materialized), SYM
+ * cells at the widest segment's width over the first segment's domain,
+ * HAS_NULLS from the segments.  An owned vector or error. */
+ray_t* parted_flatten_fixed(ray_t* col, int64_t total);
+/* The widest SYM width class over a parted SYM column's segments (a plain
+ * parted wrapper or a RAY_ENCCOL_PARTED slot), read from their headers: the
+ * width a vector holding every segment's ids needs.  0 for anything else. */
+uint8_t parted_sym_width(ray_t* col);
+
 /* Monotonic count of streaming parted asof-join per-partition (day) runs
  * bumped once per partition processed by the streaming asof path in query.c.
  * O(1) per partition; surfaced via (.sys.mem)'s "asof-perpart-runs". */

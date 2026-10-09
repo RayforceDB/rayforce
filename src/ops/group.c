@@ -151,6 +151,12 @@ int64_t ray_group_perpart_runs(void) {
                                 memory_order_relaxed);
 }
 
+/* Entries of exec_group_parted's in-place concat (group_seg_stream_ok). */
+static _Atomic(int64_t) ray_group_segstream_runs_ctr = 0;
+int64_t ray_group_segstream_runs(void) {
+    return atomic_load_explicit(&ray_group_segstream_runs_ctr, memory_order_relaxed);
+}
+
 /* ============================================================================
  * Reduction execution
  * ============================================================================ */
@@ -10619,15 +10625,146 @@ static int group_expr_src_syms(ray_graph_t* g, uint32_t root_id,
  * pushed-down WHERE is active (the per-partition sub-group applies the
  * filter, not the key materialization). */
 
-/* Segment p of a parted slot as a plain vector (borrowed), NULL when it is
- * missing or the slot is not parted, or an owned error when an encoded
- * segment fails to materialize. */
-static ray_t* group_parted_seg_col(ray_t* tbl, int64_t sym, int64_t p) {
-    ray_t* enc = ray_table_get_col_enc(tbl, sym);
-    if (enc) return ray_enccol_is_parted(enc) ? ray_enccol_seg_col(enc, p) : NULL;
-    ray_t* col = ray_table_col(tbl, sym);
-    if (!col || RAY_IS_ERR(col) || !RAY_IS_PARTED(col->type)) return NULL;
-    return ((ray_t**)ray_data(col))[p];                 /* parted wrapper, not a table */
+/* Partition p's segment of column sym bound as a source (never decodes):
+ * NULL with s->obj NULL when the segment is missing, or an owned error. */
+static ray_t* grp_seg_bind(ray_t* tbl, int64_t sym, int64_t p, ray_col_src_t* s) {
+    memset(s, 0, sizeof *s);
+    ray_t* seg = ray_table_parted_seg(tbl, sym, p);           /* borrowed */
+    return seg ? ray_col_src_bind(seg, s) : NULL;
+}
+
+/* Rows [lo, hi) of a bound segment source read by range (zero copy for a
+ * plain or already materialized segment, one vector at a time for an
+ * encoded one): fn(ctx, piece data, piece attrs, n) per piece.  NULL, or an
+ * owned error. */
+typedef void (*grp_seg_fn)(void* ctx, const void* data, uint8_t attrs, int64_t n);
+typedef struct { void* ctx; grp_seg_fn fn; } grp_seg_walk_t;
+static void grp_seg_piece(void* ctx, uint32_t wid, int64_t b, int64_t e, const ray_col_piece_t* p) {
+    (void)wid;
+    grp_seg_walk_t* w = (grp_seg_walk_t*)ctx;
+    w->fn(w->ctx, p[0].data, p[0].attrs, e - b);
+}
+static ray_t* grp_seg_read(ray_col_src_t* s, int64_t lo, int64_t hi, void* ctx, grp_seg_fn fn) {
+    if (hi > s->len) hi = s->len;
+    if (lo >= hi) return NULL;
+    const void* plain[1] = { ray_col_src_base(s) };          /* in place when ready */
+    ray_col_src_t* srcs[1] = { s };
+    grp_seg_walk_t w = { ctx, fn };
+    return ray_col_walk(srcs, plain, 1, lo, hi, false, &w, 0, grp_seg_piece);
+}
+
+/* parted_flatten_fixed's copy of one piece into the flat vector. */
+typedef struct { void* out; int8_t base; uint8_t out_attrs; } grp_flat_t;
+static void grp_flat_piece(void* ctx, uint32_t wid, int64_t b, int64_t e, const ray_col_piece_t* p) {
+    (void)wid;
+    grp_flat_t* f = (grp_flat_t*)ctx;
+    uint8_t esz = ray_sym_elem_size(f->base, f->out_attrs);
+    if (f->base != RAY_SYM || ((p[0].attrs ^ f->out_attrs) & RAY_SYM_W_MASK) == 0) {
+        memcpy((char*)f->out + (size_t)b * esz, p[0].data, (size_t)(e - b) * esz);
+        return;
+    }
+    /* a narrower segment: ids are positions in the shared domain, widened verbatim */
+    for (int64_t i = 0; i < e - b; i++)
+        ray_write_sym(f->out, b + i, (uint64_t)ray_read_sym(p[0].data, i, RAY_SYM, p[0].attrs),
+                      RAY_SYM, f->out_attrs);
+}
+
+/* Over a parted column's segment headers (never decodes): the widest SYM
+ * width and whether any segment holds nulls. */
+static void parted_seg_scan(ray_t* col, int64_t n_segs, uint8_t* width, bool* nulls) {
+    *width = 0;
+    *nulls = false;
+    for (int64_t i = 0; i < n_segs; i++) {
+        ray_t* sg = col->type == RAY_ENCCOL ? ray_enccol_seg(col, i) : ((ray_t**)ray_data(col))[i];
+        if (!sg) continue;
+        ray_col_meta_t sm;
+        ray_col_meta_of(sg, &sm);
+        if ((sm.attrs & RAY_SYM_W_MASK) > *width) *width = sm.attrs & RAY_SYM_W_MASK;
+        if (sg->type == RAY_ENCCOL ? (sm.null_count >= 0 ? sm.null_count > 0 : (sm.attrs & RAY_ATTR_HAS_NULLS) != 0)
+                                   : (sg->attrs & RAY_ATTR_HAS_NULLS) != 0)
+            *nulls = true;
+    }
+}
+
+uint8_t parted_sym_width(ray_t* col) {
+    ray_col_meta_t m;
+    if (!ray_col_meta_of(col, &m) || !RAY_IS_PARTED(m.type) || RAY_PARTED_BASETYPE(m.type) != RAY_SYM) return 0;
+    uint8_t w;
+    bool nulls;
+    parted_seg_scan(col, m.n_segs, &w, &nulls);
+    return w;
+}
+
+ray_t* parted_flatten_fixed(ray_t* col, int64_t total) {
+    ray_col_meta_t m;
+    if (!ray_col_meta_of(col, &m) || !RAY_IS_PARTED(m.type)) return ray_error("type", "flatten: not a parted column");
+    int8_t base = (int8_t)RAY_PARTED_BASETYPE(m.type);
+    uint8_t w;
+    bool any_null;
+    parted_seg_scan(col, m.n_segs, &w, &any_null);
+    if (base != RAY_SYM) w = 0;
+    uint8_t nulls = any_null ? RAY_ATTR_HAS_NULLS : 0;
+    ray_t* flat = typed_vec_new(base, w, total > 0 ? total : 1);
+    if (!flat || RAY_IS_ERR(flat)) return flat ? flat : ray_error("oom", NULL);
+    ray_col_src_t s;
+    ray_t* err = ray_col_src_bind(col, &s);
+    if (err) { ray_release(flat); return err; }
+    /* segment cells are copied id-preserving — all partitions resolve over
+     * the root symfile's domain (PARTED contract): the first segment's */
+    if (base == RAY_SYM && s.dom && s.dom != ray_sym_runtime_domain()) {
+        ray_sym_domain_retain(s.dom);
+        flat->sym_domain = s.dom;
+    }
+    int64_t n = s.len < total ? s.len : total;
+    grp_flat_t f = { ray_data(flat), base, w };
+    const void* plain[1] = { NULL };                 /* a parted source reads through its cursor */
+    ray_col_src_t* srcs[1] = { &s };
+    err = n > 0 ? ray_col_walk(srcs, plain, 1, 0, n, false, &f, 0, grp_flat_piece) : NULL;
+    ray_col_src_release(&s);
+    if (err) { ray_release(flat); return err; }
+    flat->len = total;
+    flat->attrs |= nulls;
+    return flat;
+}
+
+/* The cardinality sample's folds over a segment's pieces: the SYM presence
+ * bitmap, the I64 / I32 value span (nulls fold as values). */
+typedef struct {
+    uint64_t* bits;
+    uint32_t  sym_n;
+    int64_t   lo, hi;
+    bool      any;
+} grp_card_t;
+static void grp_card_sym(void* ctx, const void* data, uint8_t attrs, int64_t n) {
+    grp_card_t* c = (grp_card_t*)ctx;
+    for (int64_t r = 0; r < n; r++) {
+        uint32_t id = (uint32_t)ray_read_sym(data, r, RAY_SYM, attrs);
+        if (id < c->sym_n) c->bits[id / 64] |= 1ULL << (id % 64);
+    }
+}
+static void grp_card_i64(void* ctx, const void* data, uint8_t attrs, int64_t n) {
+    (void)attrs;
+    grp_card_t* c = (grp_card_t*)ctx;
+    if (n <= 0) return;
+    const int64_t* v = (const int64_t*)data;
+    int64_t lo = c->any ? c->lo : v[0], hi = c->any ? c->hi : v[0];
+    for (int64_t r = 0; r < n; r++) {
+        if (v[r] < lo) lo = v[r];
+        if (v[r] > hi) hi = v[r];
+    }
+    c->lo = lo; c->hi = hi; c->any = true;
+}
+static void grp_card_i32(void* ctx, const void* data, uint8_t attrs, int64_t n) {
+    (void)attrs;
+    grp_card_t* c = (grp_card_t*)ctx;
+    if (n <= 0) return;
+    const int32_t* v = (const int32_t*)data;
+    int32_t lo = c->any ? (int32_t)c->lo : v[0], hi = c->any ? (int32_t)c->hi : v[0];
+    for (int64_t r = 0; r < n; r++) {
+        if (v[r] < lo) lo = v[r];
+        if (v[r] > hi) hi = v[r];
+    }
+    c->lo = lo; c->hi = hi; c->any = true;
 }
 
 /* The first owned error among `n` column lookups (the others are disposed
@@ -10664,6 +10801,50 @@ static ray_t* group_eval_part_expr(ray_graph_t* g, ray_t* parted_tbl,
         return NULL;
     }
     return vec;
+}
+
+static int g_group_test_route;   /* defined with ray_group_test_route below */
+
+/* The in-place concat's eligibility: v2 groups the parted columns from
+ * their segments (every source staged, R-WALK through every SCAN site).
+ * Every key a scan of a parted fixed-width integer, temporal or SYM column;
+ * every aggregate a streaming one over a scan of a parted number column
+ * (or a count), with no second input and no parameter; no selection (v2's
+ * compact prologue would gather the parted sources) and no unordered take
+ * (v2's first-N pre-pass reads keys at rows); and v2 admits the shape over
+ * the base types. */
+static bool group_seg_stream_ok(ray_graph_t* g, ray_op_t* op, ray_op_ext_t* ext,
+                                ray_t* parted_tbl, int64_t group_limit) {
+    if (!ray_agg_engine_v2 || g_group_test_route >= 1 || g->selection || g->sg_col ||
+        ext->n_keys == 0 || group_limit < 0)
+        return false;
+    if (group_limit > 0 && !ray_group_emit_filter_active().enabled) return false;
+    for (uint32_t k = 0; k < ext->n_keys; k++) {
+        ray_op_ext_t* ke = find_ext(g, ext->keys[k]);
+        ray_col_meta_t m;
+        if (!ke || ke->base.opcode != OP_SCAN || !ray_table_col_meta(parted_tbl, ke->sym, &m) ||
+            !RAY_IS_PARTED(m.type)) return false;
+        if (!agg_key_i64_type((int8_t)RAY_PARTED_BASETYPE(m.type))) return false;
+    }
+    for (uint32_t a = 0; a < ext->n_aggs; a++) {
+        uint16_t aop = ext->agg_ops[a];
+        if (aop != OP_SUM && aop != OP_COUNT && aop != OP_MIN && aop != OP_MAX && aop != OP_AVG &&
+            aop != OP_FIRST && aop != OP_LAST && aop != OP_VAR && aop != OP_VAR_POP &&
+            aop != OP_STDDEV && aop != OP_STDDEV_POP) return false;
+        if ((ext->agg_ins2 && ext->agg_ins2[a] != RAY_OP_NONE) || (ext->agg_k && ext->agg_k[a])) return false;
+        ray_op_ext_t* ae = find_ext(g, ext->agg_ins[a]);
+        if (aop == OP_COUNT && (!ae || ae->base.opcode != OP_SCAN)) continue;
+        ray_col_meta_t m;
+        if (!ae || ae->base.opcode != OP_SCAN || !ray_table_col_meta(parted_tbl, ae->sym, &m) ||
+            !RAY_IS_PARTED(m.type)) return false;
+        int8_t b = (int8_t)RAY_PARTED_BASETYPE(m.type);
+        if (!((b >= RAY_BOOL && b <= RAY_TIMESTAMP) || b == RAY_F32 || b == RAY_F64)) return false;
+    }
+    bool saved = g->grp_seg_stream;
+    g->grp_seg_stream = true;
+    bool ok = agg_v2_admission(g, op, parted_tbl) == AGG_V2_ADMITTED;
+    g->grp_seg_stream = saved;
+    return ok;
 }
 
 /* --------------------------------------------------------------------------
@@ -10878,57 +11059,55 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
              * per-partition sub-GROUP-BY, contributes 0 to cardinality. */
             if (pcm.type == RAY_MAPCOMMON) { continue; }
             if (!RAY_IS_PARTED(pcm.type)) { est_groups = rows_per_part; break; }
-            ray_t* seg0 = group_parted_seg_col(parted_tbl, key_syms[k], sp);
-            if (seg0 && RAY_IS_ERR(seg0)) {
+            /* segment sp read by range: a plain segment in place, an encoded
+             * one a vector at a time (never materialized) */
+            ray_col_src_t ss;
+            ray_t* serr = grp_seg_bind(parted_tbl, key_syms[k], sp, &ss);
+            if (serr) {
                 scratch_free(key_syms_hdr); scratch_free(agg_syms_hdr);
                 scratch_free(key_is_expr_hdr); scratch_free(agg_is_expr_hdr);
                 scratch_free(borrow_hdr); scratch_free(esrc_hdr);
-                return seg0;
+                return serr;
             }
-            if (!seg0 || seg0->len <= 0) { est_groups = rows_per_part; break; }
+            if (!ss.obj || ss.len <= 0) { ray_col_src_release(&ss); est_groups = rows_per_part; break; }
             int8_t bt = RAY_PARTED_BASETYPE(pcm.type);
             int64_t card;
+            grp_card_t cc = { .bits = NULL };
+            ray_t* bits_hdr = NULL;
             if (RAY_IS_SYM(bt)) {
-                /* seg0's cell ids are positions in ITS domain — size the
-                 * presence bitmap by that domain's count, not the global
-                 * intern count (a FILE-domain position can exceed the
-                 * global count → OOB).  Identical value pre-flip. */
-                int64_t dom_n = ray_sym_domain_count(ray_sym_vec_domain(seg0));
-                uint32_t sym_n = (dom_n > 0 && dom_n <= UINT32_MAX) ? (uint32_t)dom_n : 0;
-                if (sym_n == 0 || sym_n > 4194304) { est_groups = rows_per_part; break; }
-                size_t bwords = ((size_t)sym_n + 63) / 64;
-                ray_t* bits_hdr = NULL;
-                uint64_t* bits = (uint64_t*)scratch_calloc(&bits_hdr, bwords * 8);
-                if (!bits) { est_groups = rows_per_part; break; }
-                for (int64_t r = 0; r < seg0->len; r++) {
-                    uint32_t id = (uint32_t)ray_read_sym(ray_data(seg0), r, seg0->type, seg0->attrs);
-                    bits[id / 64] |= 1ULL << (id % 64);
-                }
+                /* the segment's cell ids are positions in ITS domain — size
+                 * the presence bitmap by that domain's count, not the global
+                 * intern count (a FILE-domain position can exceed the global
+                 * count → OOB).  Identical value pre-flip. */
+                int64_t dom_n = ray_sym_domain_count(ss.dom);
+                cc.sym_n = (dom_n > 0 && dom_n <= UINT32_MAX) ? (uint32_t)dom_n : 0;
+                if (cc.sym_n == 0 || cc.sym_n > 4194304) { ray_col_src_release(&ss); est_groups = rows_per_part; break; }
+                size_t bwords = ((size_t)cc.sym_n + 63) / 64;
+                cc.bits = (uint64_t*)scratch_calloc(&bits_hdr, bwords * 8);
+                if (!cc.bits) { ray_col_src_release(&ss); est_groups = rows_per_part; break; }
+                serr = grp_seg_read(&ss, 0, ss.len, &cc, grp_card_sym);
                 card = 0;
                 for (size_t i = 0; i < bwords; i++)
-                    card += __builtin_popcountll(bits[i]);
+                    card += __builtin_popcountll(cc.bits[i]);
                 scratch_free(bits_hdr);
             } else if (bt == RAY_I64) {
-                const int64_t* v = (const int64_t*)ray_data(seg0);
-                int64_t lo = v[0], hi = v[0];
-                for (int64_t r = 1; r < seg0->len; r++) {
-                    if (v[r] < lo) lo = v[r];
-                    if (v[r] > hi) hi = v[r];
-                }
+                serr = grp_seg_read(&ss, 0, ss.len, &cc, grp_card_i64);
                 /* The span in u64: a null (INT64_MIN) beside a positive
                  * value overflows the signed difference. */
-                uint64_t span = (uint64_t)hi - (uint64_t)lo;
+                uint64_t span = (uint64_t)cc.hi - (uint64_t)cc.lo;
                 card = span >= (uint64_t)rows_per_part ? rows_per_part : (int64_t)span + 1;
             } else if (bt == RAY_I32) {
-                const int32_t* v = (const int32_t*)ray_data(seg0);
-                int32_t lo = v[0], hi = v[0];
-                for (int64_t r = 1; r < seg0->len; r++) {
-                    if (v[r] < lo) lo = v[r];
-                    if (v[r] > hi) hi = v[r];
-                }
-                card = (int64_t)hi - (int64_t)lo + 1;
+                serr = grp_seg_read(&ss, 0, ss.len, &cc, grp_card_i32);
+                card = cc.hi - cc.lo + 1;
             } else {
-                card = seg0->len;
+                card = ss.len;
+            }
+            ray_col_src_release(&ss);
+            if (serr) {
+                scratch_free(key_syms_hdr); scratch_free(agg_syms_hdr);
+                scratch_free(key_is_expr_hdr); scratch_free(agg_is_expr_hdr);
+                scratch_free(borrow_hdr); scratch_free(esrc_hdr);
+                return serr;
             }
             if (card > rows_per_part / est_groups) { est_groups = rows_per_part; break; }
             est_groups *= card;
@@ -10987,6 +11166,32 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
     scratch_free(esrc_hdr);
 
     /* ---- Concat fallback ---- */
+    /* In place: the parted columns grouped from their segments, no flatten.
+     * The table holds the slot objects themselves (plain parted wrappers or
+     * RAY_ENCCOL_PARTED), unread. */
+    if (group_seg_stream_ok(g, op, ext, parted_tbl, group_limit)) {
+        ray_t* in_place = ray_table_new((int64_t)n_keys + (int64_t)n_aggs);
+        if (!in_place || RAY_IS_ERR(in_place)) return in_place ? in_place : ray_error("oom", NULL);
+        for (uint32_t i = 0; i < n_keys + n_aggs; i++) {
+            ray_op_ext_t* e2 = find_ext(g, i < n_keys ? ext->keys[i] : ext->agg_ins[i - n_keys]);
+            if (!e2 || e2->base.opcode != OP_SCAN) continue;               /* a count without input */
+            ray_col_meta_t dm;
+            if (ray_table_col_meta(in_place, e2->sym, &dm)) continue;      /* already added */
+            in_place = ray_table_add_col(in_place, e2->sym, ray_table_slot(parted_tbl, e2->sym));
+            if (!in_place || RAY_IS_ERR(in_place)) return in_place ? in_place : ray_error("oom", NULL);
+        }
+        atomic_fetch_add_explicit(&ray_group_segstream_runs_ctr, 1, memory_order_relaxed);
+        ray_t* saved = g->table;
+        bool saved_stream = g->grp_seg_stream;
+        g->table = in_place;
+        g->grp_seg_stream = true;
+        ray_t* result = exec_group(g, op, in_place, group_limit);
+        g->grp_seg_stream = saved_stream;
+        g->table = saved;
+        ray_graph_unbind_table(g, in_place);                              /* its binds die with it */
+        ray_release(in_place);
+        return result;
+    }
     /* ---- Concat-only-needed-columns fallback ----
      * Used when query has AVG or expression keys/aggs.
      * Only concatenates the columns actually referenced by the GROUP BY. */
@@ -11064,15 +11269,25 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
 
         int64_t cols_to_iter = n_needed > 0 ? (int64_t)n_needed : ncols;
         for (int64_t ci = 0; ci < cols_to_iter; ci++) {
-            ray_t* col;
-            int64_t name_id;
-            if (n_needed > 0) {
-                col = ray_table_col(parted_tbl, needed[ci]);
-                name_id = needed[ci];
-            } else {
-                col = ray_table_col_idx(parted_tbl, ci);
-                name_id = ray_table_col_name(parted_tbl, ci);
+            int64_t name_id = n_needed > 0 ? needed[ci] : ray_table_col_name(parted_tbl, ci);
+            /* A parted fixed-width column is copied from its segments by
+             * range (an encoded segment is never materialized); the others
+             * take their plain column. */
+            ray_col_meta_t fm;
+            if (ray_table_col_meta(parted_tbl, name_id, &fm) && RAY_IS_PARTED(fm.type) &&
+                RAY_PARTED_BASETYPE(fm.type) != RAY_STR && RAY_PARTED_BASETYPE(fm.type) != RAY_LIST) {
+                ray_t* flat = parted_flatten_fixed(ray_table_slot(parted_tbl, name_id), total_rows);
+                if (!flat || RAY_IS_ERR(flat)) {
+                    ray_release(flat_tbl);
+                    scratch_free(needed_hdr);
+                    return flat ? flat : ray_error("oom", NULL);
+                }
+                flat_tbl = ray_table_add_col(flat_tbl, name_id, flat);
+                ray_release(flat);
+                continue;
             }
+            ray_t* col = n_needed > 0 ? ray_table_col(parted_tbl, needed[ci])
+                                      : ray_table_col_idx(parted_tbl, ci);
             if (col && RAY_IS_ERR(col)) {
                 ray_release(flat_tbl);
                 scratch_free(needed_hdr);
@@ -11097,41 +11312,8 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
 
             int8_t base_type = (int8_t)RAY_PARTED_BASETYPE(col->type);
             ray_t** segs = (ray_t**)ray_data(col);
-            ray_t* flat;
-
-            if (base_type == RAY_STR) {
-                flat = parted_flatten_str(segs, col->len, total_rows);
-            } else if (base_type == RAY_LIST) {
-                flat = parted_flatten_list(segs, col->len, total_rows);
-            } else {
-                uint8_t base_attrs = (base_type == RAY_SYM)
-                                   ? parted_sym_max_attrs(segs, col->len) : 0;
-                flat = typed_vec_new(base_type, base_attrs, total_rows);
-                if (!flat || RAY_IS_ERR(flat)) {
-                    ray_release(flat_tbl);
-                    scratch_free(needed_hdr);
-                    return flat ? flat : ray_error("oom", NULL);
-                }
-                /* segment cells are copied id-preserving — all partitions
-                 * resolve over the root symfile's domain (PARTED
-                 * contract); adopt it from the first SYM segment. */
-                if (base_type == RAY_SYM)
-                    ray_sym_vec_adopt_domain(flat, sym_domain_rep(col));
-                flat->len = total_rows;
-
-                int64_t offset = 0;
-                uint8_t seg_nulls = 0;
-                for (int32_t p = 0; p < n_parts; p++) {
-                    ray_t* seg = segs[p];
-                    if (!seg || seg->len <= 0) continue;
-                    parted_copy_cells(ray_data(flat), base_type, base_attrs,
-                                      offset, seg, 0, seg->len);
-                    seg_nulls |= seg->attrs & RAY_ATTR_HAS_NULLS;
-                    offset += seg->len;
-                }
-                /* Null propagation: propagate HAS_NULLS across segments. */
-                flat->attrs |= seg_nulls;
-            }
+            ray_t* flat = base_type == RAY_STR ? parted_flatten_str(segs, col->len, total_rows)
+                                               : parted_flatten_list(segs, col->len, total_rows);
             if (!flat || RAY_IS_ERR(flat)) {
                 ray_release(flat_tbl);
                 scratch_free(needed_hdr);
@@ -13096,8 +13278,9 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         if (err) return err;
     }
 
-    /* Parted dispatch: detect parted input columns */
-    {
+    /* Parted dispatch: detect parted input columns (not under an in-place
+     * concat group, whose parted columns are read from their segments) */
+    if (!g->grp_seg_stream) {
         int64_t nc = ray_table_ncols(tbl);
         for (int64_t c = 0; c < nc; c++) {
             ray_col_meta_t pm;
@@ -18357,38 +18540,54 @@ static bool grp_first_keys_scan(ray_t* pt, const int64_t* key_syms, uint32_t n_k
         }
     }
     int64_t budget = n * 64 > AGG_FIRSTN_PROBE_ROWS ? n * 64 : AGG_FIRSTN_PROBE_ROWS;
-    int64_t scanned = 0, si = 0;
+    int64_t scanned = 0;
     int64_t kv[16];
-    ray_t* seg[16];
-    for (int32_t p = 0; p < n_parts; p++) {
+    /* Each key's partition-p segment is bound as a source and read through
+     * a cursor: rows ascend within a partition, so each touched vector of an
+     * encoded segment decodes once and a plain segment is read in place. */
+    ray_col_src_t src[16];
+    ray_col_cursor_t cur[16];
+    bool done = false, ok = true;
+    for (int32_t p = 0; p < n_parts && !done && ok; p++) {
         int64_t len = -1;
         for (uint32_t k = 0; k < n_keys; k++) {
-            if (mcv[k]) { seg[k] = NULL; continue; }
-            seg[k] = group_parted_seg_col(pt, key_syms[k], p);
-            if (seg[k] && RAY_IS_ERR(seg[k])) { *err = seg[k]; return false; }
-            if (!seg[k] || !agg_key_i64_type(seg[k]->type)) return false;
-            if (len < 0) len = seg[k]->len;
-            else if (seg[k]->len != len) return false;
+            memset(&src[k], 0, sizeof src[k]);
+            ray_col_cursor_init(&cur[k], &src[k]);
         }
-        if (len < 0) return false;                     /* no parted key: not this route */
-        int64_t lo = 0, hi = len;
-        if (sel_ids) {                                 /* this partition's selected rows */
+        for (uint32_t k = 0; k < n_keys && ok; k++) {
+            if (mcv[k]) continue;
+            ray_t* berr = grp_seg_bind(pt, key_syms[k], p, &src[k]);
+            if (berr) { *err = berr; ok = false; break; }
+            if (!src[k].obj || !agg_key_i64_type(src[k].type)) { ok = false; break; }
+            if (len < 0) len = src[k].len;
+            else if (src[k].len != len) { ok = false; break; }
+        }
+        if (ok && len < 0) ok = false;                 /* no parted key: not this route */
+        int64_t lo = 0, hi = ok ? len : 0;
+        if (ok && sel_ids) {                           /* this partition's selected rows */
             lo = grp_sorted_lower_bound(sel_ids, sel_total, part_off[p]);
             hi = grp_sorted_lower_bound(sel_ids, sel_total, part_off[p + 1]);
-            si = lo;
         }
-        for (int64_t j = lo; j < hi; j++) {
-            if (scanned++ >= budget) return false;
+        for (int64_t j = lo; ok && j < hi; j++) {
+            if (scanned++ >= budget) { ok = false; break; }
             int64_t r = sel_ids ? sel_ids[j] - part_off[p] : j;
-            for (uint32_t k = 0; k < n_keys; k++)
-                kv[k] = mcv[k] ? agg_read_key_i64(mcv[k], ray_data(mcv[k]), p)
-                               : agg_read_key_i64(seg[k], ray_data(seg[k]), r);
+            for (uint32_t k = 0; k < n_keys && ok; k++) {
+                if (mcv[k]) { kv[k] = agg_read_key_i64(mcv[k], ray_data(mcv[k]), p); continue; }
+                const ray_col_range_t* v;
+                ray_t* cerr = ray_col_cursor_at(&cur[k], r, &v);
+                if (cerr) { *err = cerr; ok = false; break; }
+                kv[k] = agg_read_key_i64_raw(src[k].type, v->attrs, v->data, r - v->start);
+            }
+            if (!ok) break;
             grp_keyset_probe(ks, kv, true);
-            if (ks->n_found >= n) return true;
+            if (ks->n_found >= n) { done = true; break; }
+        }
+        for (uint32_t k = 0; k < n_keys; k++) {
+            ray_col_cursor_free(&cur[k]);
+            if (src[k].obj) ray_col_src_release(&src[k]);
         }
     }
-    (void)si;
-    return true;                                       /* every row read: all the groups */
+    return ok;                                         /* every row read (or n found): all the groups */
 }
 
 /* The rows of `result` (key columns 0..n_keys) whose key is in the set,

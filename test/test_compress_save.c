@@ -5128,7 +5128,7 @@ static test_result_t test_select_parted_prunes_fetch(void) {
     static const struct { const char* q; uint64_t cols; int64_t rows; } qs[] = {
         { "(select {from: t where: (== date 2024.01.02)})",                      2, 3000 },  /* a and b of 01.02 */
         { "(select {s: (sum a) from: t where: (== date 2024.01.02)})",           0, 1 },     /* P2 Task 10: the scalar route range-reads a of 01.02 */
-        { "(select {c: (count a) from: t by: b where: (== date 2024.01.02)})",   2, 3000 },  /* a and b of 01.02 */
+        { "(select {c: (count a) from: t by: b where: (== date 2024.01.02)})",   0, 3000 },  /* P2 Task 14: the parted group reads a and b of 01.02 by range */
         { "(select {a: a from: t where: (<= date 2024.01.02) take: 10})",        2, 10 },    /* a of 01.01 and 01.02 */
         { "(select {a: a from: t where: (<= date 2024.01.02) asc: b})",          4, 6000 },  /* a and b of 01.01, 01.02 */
         { "(select {c: (count a) from: t where: (> date 2024.01.03)})",          0, 1 },     /* the stand-in alone */
