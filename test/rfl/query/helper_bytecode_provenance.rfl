@@ -53,3 +53,18 @@
 (mb ['a 'b]) -- ['a 'b 'zz]
 (h 5) -- 10
 (hcol 'q) !- name
+;; At the query level, an opaque helper given row data yields row data.
+(set id (fn [v] 1 v))
+(at (select {v: (concat (id s) "!") e: (reverse x) from: T}) 'v) -- ['a! 'b! 'c!]
+(at (update {v: (mb (id s)) from: T}) 'v) -- ['azz 'bzz 'czz]
+(at (select {from: T where: (in (concat (id s) "!") ['a! 'c!])}) 'x) -- [1 3]
+(at (select {n: (count (concat (id s) "!")) by: x from: T asc: x}) 'n) -- [1 1 1]
+(at (select {v: (concat s (id L)) from: T}) 'v) -- ['a 'b 'c 'u 'v]
+;; A source column shadows a global helper of the same name inside a helper
+;; body, on the planned path and in fallbacks alike.
+(set s (fn [v] v))
+(set hs (fn [v] 1 (s v)))
+(select {v: (hs x) from: T}) !- type
+(select {v: ((fn [v] (s v)) x) from: T}) !- name
+(set TN (table [x q] (list [1 2 3] [4 5 6])))
+(at (select {v: (hs x) from: TN}) 'v) -- [1 2 3]

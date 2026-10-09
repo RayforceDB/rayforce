@@ -320,7 +320,10 @@ ray_t* ray_query_helper_value(int64_t sym);   /* ops/query.c */
 /* A lookup that reaches a query helper's call frame: a free name that is
  * a source column binds, on first use, to what the query's own expressions
  * see for it (the column, or the current row's cell); the frame owns that
- * binding for the call.  Any other name falls through to the globals. */
+ * binding for the call, so a source column shadows a global of the same
+ * name here as it does in a body the planner inlines.  Any other name
+ * falls through to the globals.  The frame grows past RAY_FRAME_CAP on
+ * demand; only an allocation failure leaves the name unbound. */
 static ray_t* env_call_frame_value(ray_scope_frame_t* f, int64_t sym_id) {
     if (!f->table) return NULL;
     ray_t* v = ray_query_helper_value(sym_id);

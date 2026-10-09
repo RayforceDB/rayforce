@@ -2388,9 +2388,15 @@ static ray_t* vm_exec(ray_t* lambda, ray_t** call_args, int64_t argc) {
 
 /* Whether a builtin keeps row provenance: the planner lowers it row by
  * row, so its result over a column-derived operand is column-derived.
- * Cached by object; builtins are long-lived globals. */
+ * Cached by object for one symbol-table epoch: the builtin objects live
+ * as long as the runtime, and a re-init frees and reallocates them. */
 static bool vm_fn_rowwise(const ray_t* fn_obj) {
     static _Thread_local struct { const ray_t* fn; bool rowwise; } cache[64];
+    static _Thread_local uint64_t epoch;
+    if (epoch != ray_sym_epoch() || !epoch) {
+        memset(cache, 0, sizeof cache);
+        epoch = ray_sym_epoch();
+    }
     size_t h = ((uintptr_t)fn_obj >> 4) & 63;
     if (cache[h].fn == fn_obj) return cache[h].rowwise;
     const char* name = ray_fn_name(fn_obj);
@@ -2939,7 +2945,9 @@ unary_done:
             result = ray_error("type", "apply: head is not callable, got %s", ray_type_name(fn_obj->type));
             break;
         }
-        uint8_t result_rows = args_bits && fn_obj->type != RAY_LAMBDA && vm_fn_rowwise(fn_obj);
+        uint8_t result_rows = args_bits &&
+            (fn_obj->type == RAY_UNARY || fn_obj->type == RAY_BINARY || fn_obj->type == RAY_VARY) &&
+            vm_fn_rowwise(fn_obj);
         ray_release(fn_obj);
         if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }
         PUSHR(result, result_rows);
@@ -3136,8 +3144,14 @@ op_scope_end: {
     /* Stack: [.., calld_result, syms_vec] — sync the frame back into the
      * slots and pop it; the dynamic eval's result stays on the stack. */
     ray_t *syms = POP();
+    /* A local rebound inside the window has unknown provenance: clear its
+     * flag, as for any value the VM did not derive itself. */
+    ray_t *before[64];
+    int64_t nsync = syms->len < 64 ? syms->len : 64;
+    for (int64_t i = 0; i < nsync; i++) before[i] = LOCAL(i);
     ray_env_scope_sync((const int64_t*)ray_data(syms),
                        (int32_t)syms->len, &vm.ps[vm.fp]);
+    for (int64_t i = 0; i < nsync; i++) if (LOCAL(i) != before[i]) LROWS(i) = 0;
     ray_release(syms);
     WIN_CLOSE();
     DISPATCH();

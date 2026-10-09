@@ -157,6 +157,33 @@ static void lang_teardown(void) {
     ray_runtime_destroy(__RUNTIME);
 }
 
+
+/* ---- Test: query helper row provenance survives a runtime re-init ----
+ * The row-wise builtin tables and the per-object verdict cache behind the
+ * bytecode provenance flags are keyed on the symbol-table epoch; a stale
+ * entry would silently turn text concat into a collection append. */
+static test_result_t test_query_helper_reinit(void) {
+    for (int round = 0; round < 2; round++) {
+        if (round) {
+            ray_runtime_destroy(__RUNTIME);
+            ray_runtime_create(0, NULL);
+            /* Shift user symbol ids before the helpers are defined again. */
+            ray_t* shift = ray_eval_str("(set shifted (list 'zz0 'zz1 'zz2 'zz3 'zz4 'zz5 'zz6 'zz7))");
+            if (shift && !RAY_IS_ERR(shift)) ray_release(shift); else if (shift) ray_error_free(shift);
+        }
+        ray_t* setup = ray_eval_str("(do (set T (table [x s] (list [1 2 3] ['a 'b 'c])))"
+                                    " (set hup (fn [v] 1 (concat (upper v) \"!\")))"
+                                    " (set hif (fn [v] 1 (if (> 1 0) (concat v \"?\") v))) 1)");
+        TEST_ASSERT_NOT_NULL(setup);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+        ray_release(setup);
+        ASSERT_EQ("(at (update {r: (hup s) from: T}) 'r)", "['A! 'B! 'C!]");
+        ASSERT_EQ("(at (update {r: (hif s) from: T}) 'r)", "['a? 'b? 'c?]");
+        ASSERT_EQ("(at (select {from: T where: (in (hup s) ['A! 'C!])}) 'x)", "[1 3]");
+    }
+    PASS();
+}
+
 /* ---- Dummy function for testing ---- */
 static ray_t* dummy_unary(ray_t* x) { return ray_retain(x), x; }
 static ray_t* dummy_binary(ray_t* x, ray_t* y) { (void)y; return ray_retain(x), x; }
@@ -9947,6 +9974,7 @@ const test_entry_t lang_entries[] = {
     { "lang/temporal/date_trunc_month_case",    test_temporal_date_trunc_month_case,    lang_setup, lang_teardown },
 
     { "lang/zone_sym_diagnostic", test_eval_zone_sym_diagnostic, lang_setup, lang_teardown },
+    { "lang/query_helper_reinit", test_query_helper_reinit, lang_setup, lang_teardown },
     { "lang/io/read_procfs_zero_size", test_read_procfs_reports_zero_size, lang_setup, lang_teardown },
     { "lang/io/read_unsized_bounded", test_read_unsized_stream_is_bounded, lang_setup, lang_teardown },
     { "lang/io/exec_capture_bounded", test_exec_capture_is_bounded, lang_setup, lang_teardown },

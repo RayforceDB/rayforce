@@ -1233,11 +1233,12 @@ bool ray_query_rowwise_builtin(int64_t id) {
         "day", "dayofweek", "dayofyear", "hour", "minute", "month", "second", "year",
     };
     enum { N = sizeof names / sizeof *names };
+    /* Sym ids are only stable within one symbol-table epoch (sym.h). */
     static _Thread_local int64_t ids[N];
-    static _Thread_local bool interned;
-    if (!interned) {
+    static _Thread_local uint64_t epoch;
+    if (epoch != ray_sym_epoch() || !epoch) {
         for (size_t i = 0; i < N; i++) ids[i] = ray_sym_intern(names[i], strlen(names[i]));
-        interned = true;
+        epoch = ray_sym_epoch();
     }
     for (size_t i = 0; i < N; i++) if (ids[i] == id) return true;
     return false;
@@ -2123,13 +2124,14 @@ static bool query_inline_pure_builtin(int64_t id) {
         "time", "timestamp", "timeit", "times", "do", "each", "over", "scan",
     };
     enum { NFORMS = sizeof forms / sizeof *forms, NIMPURE = sizeof impure / sizeof *impure };
-    /* Interned once: this runs for every call node of every helper. */
+    /* Interned once per symbol-table epoch (sym.h): this runs for every
+     * call node of every helper, and ids do not survive a re-init. */
     static _Thread_local int64_t form_ids[NFORMS], impure_ids[NIMPURE];
-    static _Thread_local bool interned;
-    if (!interned) {
+    static _Thread_local uint64_t epoch;
+    if (epoch != ray_sym_epoch() || !epoch) {
         for (size_t i = 0; i < NFORMS; i++) form_ids[i] = ray_sym_intern(forms[i], strlen(forms[i]));
         for (size_t i = 0; i < NIMPURE; i++) impure_ids[i] = ray_sym_intern(impure[i], strlen(impure[i]));
-        interned = true;
+        epoch = ray_sym_epoch();
     }
     for (size_t i = 0; i < NFORMS; i++) if (form_ids[i] == id) return true;
     for (size_t i = 0; i < NIMPURE; i++) if (impure_ids[i] == id) return false;
@@ -5812,11 +5814,32 @@ static bool query_expr_reads_rows_on(ray_t* expr, ray_t* tbl) {
         if (es[0]->type != -RAY_SYM) return false;
         int64_t id = es[0]->i64;
         ray_t* fn = ray_env_get(id);
-        if (!fn || fn->type == RAY_LAMBDA) return false;
-        if (!ray_query_rowwise_builtin(id)) return false;
+        if (!fn) return false;
+        /* An opaque helper's result over row data is row data: the VM
+         * tracks that inside the call; here only its arguments are known. */
+        if (fn->type != RAY_LAMBDA && !ray_query_rowwise_builtin(id)) return false;
         for (int64_t i = 1; i < expr->len; i++)
             if (query_expr_reads_rows_on(es[i], tbl)) return true;
         return false;
+    }
+    if (expr->type == RAY_LIST && expr->len >= 2) {
+        ray_t** es = ray_data(expr);
+        ray_t* fn = es[0]->type == -RAY_SYM && !(es[0]->attrs & ATTR_QUOTED) &&
+                    !ray_table_get_col(tbl, es[0]->i64) ? ray_env_get(es[0]->i64) : NULL;
+        if (fn && fn->type == RAY_LAMBDA) {
+            /* The planner inlines what it can; a helper it cannot lower
+             * yields row data when it was given row data. */
+            ray_graph_t* g = ray_graph_new(tbl);
+            if (!g) return false;
+            ray_op_t* op = compile_expr_dag(g, expr);
+            bool reads_rows = op && !op_tree_is_scalar(g, op->id);
+            bool lowered = op != NULL;
+            ray_graph_free(g);
+            if (lowered) return reads_rows;
+            for (int64_t i = 1; i < expr->len; i++)
+                if (query_expr_reads_rows_on(es[i], tbl)) return true;
+            return false;
+        }
     }
     query_dependency_cache_t* cache = g_query_dependencies;
     if (cache && cache->table == tbl)
