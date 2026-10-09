@@ -49,11 +49,11 @@
 #else
 #include <unistd.h>
 #endif
-#if !defined(RAY_OS_WINDOWS) && !defined(RAY_OS_WASM)
-#include <errno.h>
-#include <fcntl.h>      /* fallocate, F_PREALLOCATE: the in-place hash region */
+#if defined(__linux__)
+#include <fcntl.h>      /* fallocate: the in-place hash region */
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>    /* fstatfs: the filesystems it is built in place on */
 #endif
 
 /* --------------------------------------------------------------------------
@@ -773,7 +773,43 @@ ray_err_t ray_col_append_index(const char* path, const void* ix_v,
     return err;
 }
 
-#if !defined(RAY_OS_WINDOWS) && !defined(RAY_OS_WASM)
+#if defined(__linux__)
+/* Debug builds: RAY_HASH_INJECT names a step of the in-place build to fail
+ * there, for the tests — "fs": the filesystem is not one it trusts. */
+static bool col_hash_inject(const char* step) {
+#if defined(DEBUG)
+    const char* e = getenv("RAY_HASH_INJECT");
+    return e && strcmp(e, step) == 0;
+#else
+    (void)step;
+    return false;
+#endif
+}
+
+/* Writing the region through a shared mapping is safe only where the
+ * blocks it lands on are held before the first write: a write fault that
+ * needs a block on a full disk is a SIGBUS, and a writeback that fails is
+ * lost without a word (the fwrite append gets ENOSPC instead).  So the
+ * filesystems whose fallocate reserves what the writes use — not
+ * copy-on-write ones (ZFS, btrfs, bcachefs: an overwrite takes new space),
+ * nor network or user ones (NFS, SMB, Ceph, FUSE: the server decides) —
+ * and overlayfs, which hands both the mapping and the fallocate to its
+ * upper layer (ext4 or xfs where overlayfs runs containers). */
+static bool col_fs_reserves(int fd) {
+    if (col_hash_inject("fs")) return false;
+    struct statfs sf;
+    if (fstatfs(fd, &sf) != 0) return false;
+    switch ((unsigned long)sf.f_type) {
+    case 0xEF53UL:       /* ext4 (an ext2/3 one has no fallocate: refused there) */
+    case 0x58465342UL:   /* xfs */
+    case 0x01021994UL:   /* tmpfs */
+    case 0x794C7630UL:   /* overlayfs */
+        return true;
+    default:
+        return false;
+    }
+}
+
 /* A column file's index region, mapped writable for a build in place. */
 typedef struct {
     int      fd;
@@ -783,29 +819,15 @@ typedef struct {
     size_t   map_len;
 } col_region_t;
 
-/* The file grown to `end` bytes with its blocks allocated where the
- * filesystem can, so a full disk fails here rather than as a fault on a
- * write through the mapping. */
-static bool col_grow(int fd, int64_t from, int64_t end) {
-#if defined(__linux__)
-    if (fallocate(fd, 0, (off_t)from, (off_t)(end - from)) == 0) return true;
-    if (errno != EOPNOTSUPP) return false;
-#elif defined(__APPLE__)
-    fstore_t fs = { .fst_flags = F_ALLOCATEALL, .fst_posmode = F_PEOFPOSMODE,
-                    .fst_offset = 0, .fst_length = (off_t)(end - from) };
-    if (fcntl(fd, F_PREALLOCATE, &fs) == -1) return false;
-#else
-    (void)from;
-#endif
-    return ftruncate(fd, (off_t)end) == 0;
-}
-
-/* ray_index_region_fn: `bytes` of region at region_off, zero-filled. */
+/* ray_index_region_fn: `bytes` of region at region_off, zero-filled, its
+ * blocks allocated first — a full disk fails here, not as a fault on a write
+ * through the mapping.  NULL when either cannot be done. */
 static uint8_t* col_region_map(void* raw, int64_t bytes) {
     col_region_t* r = (col_region_t*)raw;
     if (r->map || bytes <= 0) return NULL;
     int64_t end = r->region_off + bytes;
-    if (!col_grow(r->fd, r->payload_end, end)) return NULL;
+    if (fallocate(r->fd, 0, (off_t)r->payload_end, (off_t)(end - r->payload_end)) != 0)
+        return NULL;
     long ps = sysconf(_SC_PAGESIZE);
     int64_t pg = ps > 0 ? (int64_t)ps : 4096;
     int64_t moff = r->region_off & ~(pg - 1);
@@ -819,7 +841,9 @@ static uint8_t* col_region_map(void* raw, int64_t bytes) {
 #endif
 
 ray_err_t ray_col_build_hash_index(const char* path, ray_t* col, void* trace) {
-#if defined(RAY_OS_WINDOWS) || defined(RAY_OS_WASM)
+#if !defined(__linux__)
+    /* Elsewhere the blocks a mapped write lands on cannot be held up front
+     * (macOS: APFS is copy-on-write) — the caller builds in memory. */
     (void)path; (void)col; (void)trace;
     return RAY_ERR_NYI;
 #else
@@ -835,6 +859,7 @@ ray_err_t ray_col_build_hash_index(const char* path, ray_t* col, void* trace) {
         return RAY_ERR_IO;
     }
     if (mg == COL_IDX_AUX_MAGIC) { close(fd); return RAY_ERR_CORRUPT; }   /* indexed already */
+    if (!col_fs_reserves(fd)) { close(fd); return RAY_ERR_NYI; }
     col_region_t r = { .fd = fd, .payload_end = (int64_t)st.st_size,
                        .region_off = ((int64_t)st.st_size + 31) & ~(int64_t)31 };
     ray_err_t err = ray_index_hash_build_region(col, col_region_map, &r, tr);

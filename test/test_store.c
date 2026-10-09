@@ -2351,10 +2351,24 @@ static int64_t store_file_size(const char* path) {
     return stat(path, &st) == 0 ? (int64_t)st.st_size : -1;
 }
 
+/* Does `dir` take the in-place build (Linux, a filesystem whose fallocate
+ * holds the blocks)?  Probed with a small column. */
+static bool store_in_place(const char* dir) {
+    char p[240];
+    snprintf(p, sizeof(p), "%s/.probe", dir);
+    ray_t* v = store_hash_col(RAY_I64, 1000, 10, 0);
+    bool ok = v && !RAY_IS_ERR(v) && ray_col_save_bulk(v, p) == RAY_OK &&
+              store_hash_build(p) == RAY_OK;
+    if (v && !RAY_IS_ERR(v)) ray_release(v);
+    unlink(p);
+    return ok;
+}
+
 /* Built in place, the column file holds exactly the bytes the in-memory
  * build appended — numeric, temporal, float with nulls, SYM ids, every key
  * distinct or few — with one batch and with many (the counting pass), and
- * the index loads and answers. */
+ * the index loads and answers.  Where the in-place build does not apply,
+ * the same through ray_splay_hash_column's in-memory route. */
 static test_result_t test_col_build_hash_index_bytes(void) {
     (void)ray_pool_get();
     char name[16];
@@ -2364,6 +2378,7 @@ static test_result_t test_col_build_hash_index_bytes(void) {
     }
     char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-hidx-%d", (int)getpid());
     TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    bool in_place = store_in_place(dir);
     char a[200], b[200];
     snprintf(a, sizeof(a), "%s/a", dir);
     snprintf(b, sizeof(b), "%s/b", dir);
@@ -2381,7 +2396,8 @@ static test_result_t test_col_build_hash_index_bytes(void) {
             if (!v || RAY_IS_ERR(v)) { bad++; continue; }
             if (ray_col_save_bulk(v, a) != RAY_OK || ray_col_save_bulk(v, b) != RAY_OK) bad++;
             int64_t payload = store_file_size(a);
-            if (store_hash_build(a) != RAY_OK || store_hash_append_legacy(b) != RAY_OK) bad++;
+            ray_err_t e = in_place ? store_hash_build(a) : ray_splay_hash_column(a, NULL);
+            if (e != RAY_OK || store_hash_append_legacy(b) != RAY_OK) bad++;
             if (!store_files_same(a, b) || store_file_size(a) <= payload) bad++;
             ray_t* m = ray_col_mmap(a);
             if (!m || RAY_IS_ERR(m) || ray_index_kind(m) != RAY_IDX_HASH) bad++;
@@ -2410,17 +2426,20 @@ static test_result_t test_col_build_hash_index_refusals(void) {
     char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-hidx-ref-%d", (int)getpid());
     TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
     char p[200]; snprintf(p, sizeof(p), "%s/a", dir);
-    ray_t* v = store_hash_col(RAY_I64, 100000, 5003, 0);
-    TEST_ASSERT_EQ_I(ray_col_save_bulk(v, p), RAY_OK);
-    TEST_ASSERT_EQ_I(store_hash_build(p), RAY_OK);
-    int64_t indexed = store_file_size(p);
-    TEST_ASSERT_EQ_I(store_hash_build(p), RAY_ERR_CORRUPT);
-    TEST_ASSERT_EQ_I(store_file_size(p), indexed);
-    ray_t* m = ray_col_mmap(p);
-    TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m));
-    TEST_ASSERT_EQ_I(ray_index_kind(m), RAY_IDX_HASH);
-    ray_release(m);
-    ray_release(v);
+    ray_t* m = NULL;
+    if (store_in_place(dir)) {
+        ray_t* v = store_hash_col(RAY_I64, 100000, 5003, 0);
+        TEST_ASSERT_EQ_I(ray_col_save_bulk(v, p), RAY_OK);
+        TEST_ASSERT_EQ_I(store_hash_build(p), RAY_OK);
+        int64_t indexed = store_file_size(p);
+        TEST_ASSERT_EQ_I(store_hash_build(p), RAY_ERR_CORRUPT);
+        TEST_ASSERT_EQ_I(store_file_size(p), indexed);
+        m = ray_col_mmap(p);
+        TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m));
+        TEST_ASSERT_EQ_I(ray_index_kind(m), RAY_IDX_HASH);
+        ray_release(m);
+        ray_release(v);
+    }
 
     ray_t* s = ray_vec_new(RAY_STR, 4);
     s = ray_str_vec_append(s, "alpha", 5);
@@ -2441,6 +2460,46 @@ static test_result_t test_col_build_hash_index_refusals(void) {
     PASS();
 }
 
+/* On a filesystem the in-place build does not trust (copy-on-write,
+ * network, user — or any platform but Linux) it leaves the file alone, and
+ * ray_splay_hash_column builds the index in memory and appends it: the same
+ * bytes.  Debug builds pretend the filesystem is untrusted. */
+static test_result_t test_col_build_hash_index_untrusted_fs(void) {
+#if defined(__linux__) && !defined(DEBUG)
+    SKIP("RAY_HASH_INJECT is read by debug builds only");
+#endif
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-hidx-fs-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    char a[200], b[200];
+    snprintf(a, sizeof(a), "%s/a", dir);
+    snprintf(b, sizeof(b), "%s/b", dir);
+#if defined(DEBUG)
+    TEST_ASSERT_EQ_I(setenv("RAY_HASH_INJECT", "fs", 1), 0);
+#endif
+    ray_t* v = store_hash_col(RAY_I64, 300000, 5003, 977);
+    TEST_ASSERT_EQ_I(ray_col_save_bulk(v, a), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save_bulk(v, b), RAY_OK);
+    int64_t payload = store_file_size(a);
+    ray_err_t direct = store_hash_build(a);
+    int64_t after = store_file_size(a);
+    ray_err_t routed = ray_splay_hash_column(a, NULL);
+#if defined(DEBUG)
+    unsetenv("RAY_HASH_INJECT");
+#endif
+    TEST_ASSERT_EQ_I(direct, RAY_ERR_NYI);
+    TEST_ASSERT_EQ_I(after, payload);
+    TEST_ASSERT_EQ_I(routed, RAY_OK);
+    TEST_ASSERT_EQ_I(store_hash_append_legacy(b), RAY_OK);
+    TEST_ASSERT_TRUE(store_files_same(a, b));
+    ray_t* m = ray_col_mmap(a);
+    TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m));
+    TEST_ASSERT_EQ_I(ray_index_kind(m), RAY_IDX_HASH);
+    ray_release(m);
+    ray_release(v);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+}
+
 /* A build that fails after the file was grown cuts it back: the region's
  * blocks cannot be allocated past RLIMIT_FSIZE (a full disk alike), the
  * file is left at its payload, loads unindexed, and builds once there is
@@ -2450,6 +2509,7 @@ static test_result_t test_col_build_hash_index_rollback(void) {
 #ifdef RAY_OS_LINUX
     char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-hidx-rb-%d", (int)getpid());
     TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    if (!store_in_place(dir)) { (void)ray_test_rm_rf(dir); SKIP("no in-place build on this filesystem"); }
     char p[200]; snprintf(p, sizeof(p), "%s/a", dir);
     int64_t n = 50000;
     ray_t* v = store_hash_col(RAY_I64, n, 997, 0);
@@ -2505,6 +2565,7 @@ static test_result_t test_col_build_hash_index_interrupt(void) {
     if (!pool || ray_pool_total_workers(pool) < 2) SKIP("needs workers");
     char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-hidx-int-%d", (int)getpid());
     TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    if (!store_in_place(dir)) { (void)ray_test_rm_rf(dir); SKIP("no in-place build on this filesystem"); }
     char p[200], r[200];
     snprintf(p, sizeof(p), "%s/a", dir);
     snprintf(r, sizeof(r), "%s/ref", dir);
@@ -6751,6 +6812,7 @@ const test_entry_t store_entries[] = {
     { "store/stream_hash_candidate", test_stream_hash_candidate, store_setup, store_teardown },
     { "store/col_build_hash_index_bytes", test_col_build_hash_index_bytes, store_setup, store_teardown },
     { "store/col_build_hash_index_refusals", test_col_build_hash_index_refusals, store_setup, store_teardown },
+    { "store/col_build_hash_index_untrusted_fs", test_col_build_hash_index_untrusted_fs, store_setup, store_teardown },
     { "store/col_build_hash_index_rollback", test_col_build_hash_index_rollback, store_setup, store_teardown },
     { "store/col_build_hash_index_interrupt", test_col_build_hash_index_interrupt, store_setup, store_teardown },
     { "store/stream_inline_dict", test_stream_inline_dict, store_setup, store_teardown },

@@ -138,9 +138,12 @@ ray_err_t ray_col_append_index(const char* path, const void* ix,
  * written there once instead of staged in memory and copied in.  Same bytes
  * as ray_col_append_index of the index ray_index_attach_hash builds.  The
  * marker is stamped last; on failure the file is cut back to the payload.
- * RAY_ERR_NYI (file untouched) where the in-place build does not apply: a
- * STR column, or no shared file mappings.  `trace` is a ray_hash_trace_t*
- * (NULL: none), void as `ix` above. */
+ * RAY_ERR_NYI (file untouched) where the in-place build does not apply and
+ * the caller builds in memory and appends instead: a STR column, or a
+ * platform or filesystem where the region's blocks cannot be held before
+ * the mapping writes them (anything but Linux on ext4, xfs, tmpfs or
+ * overlayfs).  `trace` is a ray_hash_trace_t* (NULL: none), void as `ix`
+ * above. */
 ray_err_t ray_col_build_hash_index(const char* path, ray_t* col, void* trace);
 
 /* Seek f to its end, pad to 32 bytes and write ix's inline region there;
