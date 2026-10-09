@@ -1405,12 +1405,14 @@ ray_t* exec_replace(ray_graph_t* g, ray_op_t* op) {
     return result;
 }
 
-/* Shared text kernel. Consumes one reference to each argument. */
-static ray_t* concat_text_values(ray_t** args, int n_args) {
+/* Shared text kernel. Consumes one reference to each argument.  A STR
+ * vector makes the result STR; `str_out` says a STR atom does too (a cell
+ * of a STR column read row by row). */
+static ray_t* concat_text_values(ray_t** args, int n_args, bool str_out) {
     /* Only atoms broadcast. A one-row vector is still a vector, and an
      * empty vector must never be indexed as if it contained row zero. */
     int64_t nrows = 1;
-    bool out_str = false, has_vector = false;
+    bool out_str = str_out, has_vector = false;
     for (int a = 0; a < n_args; a++) {
         if (args[a]->type == RAY_STR) out_str = true;
         if (ray_is_atom(args[a])) continue;
@@ -1559,20 +1561,20 @@ ray_t* exec_concat(ray_graph_t* g, ray_op_t* op) {
         }
     }
 
-    ray_t* result = concat_text_values(args, n_args);
+    ray_t* result = concat_text_values(args, n_args, false);
     scratch_free(args_hdr);
     return result;
 }
 
 /* Query fallback uses the same text kernel after checking argument syntax.
  * Ordinary builtin calls retain collection semantics. */
-ray_t* ray_concat_text_fn(ray_t* a, ray_t* b) {
+ray_t* ray_concat_text_fn(ray_t* a, ray_t* b, bool str_out) {
     if (a->type == -RAY_STR && b->type == -RAY_STR) return ray_concat_fn(a, b);
     bool atoms = ray_is_atom(a) && ray_is_atom(b);
     ray_t* args[2] = { a, b };
     ray_retain(a);
     ray_retain(b);
-    ray_t* result = concat_text_values(args, 2);
+    ray_t* result = concat_text_values(args, 2, str_out);
     if (!atoms || !result || RAY_IS_ERR(result)) return result;
     int allocated = 0;
     ray_t* atom = collection_elem(result, 0, &allocated);

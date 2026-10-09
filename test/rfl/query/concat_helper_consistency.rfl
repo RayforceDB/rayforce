@@ -1,0 +1,79 @@
+(set T (table [x k s] (list [1 2 3 4 5] [0 0 1 1 2] ['a 'b 'c 'd 'e])))
+(set T3 (table [x s t] (list [1 2 3] ['a 'b 'c] (list "p" "q" "r"))))
+(set TS (table [k s suffix] (list [0 0 1] ['a 'b 'c] ['x 'y 'z])))
+;; An opaque helper around row text must not send the planner into endless
+;; expansion, and a pure helper around a whole-column verb is that verb.
+(set hrv (fn [v] (reverse v)))
+(at (select {n: (first (hrv (concat s "!"))) from: T}) 'n) -- ['e!]
+(at (select {n: (first (hrv (concat s "!"))) e: (reverse x) from: T}) 'n) -- ['e! 'e! 'e! 'e! 'e!]
+(at (select {v: (hrv s) from: T}) 'v) -- ['e 'd 'c 'b 'a]
+(at (select {v: (hrv s) e: (reverse x) from: T}) 'v) -- ['e 'd 'c 'b 'a]
+(set mrv (fn [v] 1 (reverse v)))
+(count (select {n: (first (mrv (concat s "!"))) from: T})) -- 1
+;; A grouped output named like its key keeps both columns, the key first.
+(key (select {k: (first x) n: (count (distinct x)) by: k from: T asc: k})) -- ['k 'k 'n]
+(value (select {k: (first x) n: (count (distinct x)) by: k from: T asc: k})) -- (list [0 1 2] [1 3 5] [2 2 1])
+(key (select {g: (first x) n: (count (distinct x)) by: {g: k} from: T})) -- ['g 'g 'n]
+;; Grouped fallback outputs follow the requested order, as planned outputs do.
+(key (select {n: (+ (count s) (count (distinct x))) m: (sum x) by: k from: T})) -- ['k 'n 'm]
+(key (select {m: (sum x) n: (+ (count s) (count (distinct x))) by: k from: T})) -- ['k 'm 'n]
+(key (select {n: (+ (count s) (count (distinct x))) m: (sum x) by: k from: T desc: m take: 2})) -- ['k 'n 'm]
+(key (select {n: (sum x) m: (count s) by: k from: T})) -- ['k 'n 'm]
+;; Helpers built from pure builtins outside the planner's tables are inlined.
+(set hss (fn [v] (concat (substr v 0 1) 'z)))
+(at (select {n: (+ (count (hss s)) (count (distinct x))) by: k from: T asc: k}) 'n) -- [4 4 2]
+(at (select {v: (hss s) e: (reverse x) from: T}) 'v) -- ['az 'bz 'cz 'dz 'ez]
+(set hxb (fn [v] (xbar 2 v)))
+(at (select {v: (hxb x) e: (reverse x) from: T}) 'v) -- [2 2 0 0 0]
+(set hw (fn [v] (within v [2 4])))
+(at (select {from: T where: (hw x)}) 'x) -- [2 3 4]
+;; Effects never move: an effectful argument runs once per row, and an
+;; effectful body is called once per row rather than inlined.
+(set calls 0)
+(set eff (fn [v] (set calls (+ calls 1)) v))
+(set ign (fn [a b] a))
+(at (select {v: (ign s (eff s)) from: T}) 'v) -- ['a 'b 'c 'd 'e]
+calls -- 5
+(set ticks 0)
+(set tick (fn [v] (do (set ticks (+ ticks 1)) v)))
+(at (select {v: (tick s) e: (reverse x) from: T}) 'v) -- ['a 'b 'c 'd 'e]
+ticks -- 5
+;; A quoted symbol inside a helper body is the symbol on every path, even
+;; when a column has that spelling and whatever operator consumes it.
+(set hqt (fn [v] (concat v 't)))
+(at (select {v: (hqt s) from: T3}) 'v) -- ['at 'bt 'ct]
+(at (select {v: (hqt s) e: (reverse x) from: T3}) 'v) -- ['at 'bt 'ct]
+(at (update {v: (hqt s) from: T3}) 'v) -- ['at 'bt 'ct]
+(at (select {from: T3 where: (in (hqt s) ['at 'ct])}) 'x) -- [1 3]
+(set hut (fn [v] (concat v (upper 't))))
+(at (select {v: (hut s) from: T3}) 'v) -- ['aT 'bT 'cT]
+(at (select {v: (hut s) e: (reverse x) from: T3}) 'v) -- ['aT 'bT 'cT]
+(set heq (fn [v] (== v 'a)))
+(at (select {v: (heq s) e: (reverse x) from: T3}) 'v) -- [true false false]
+(set hqt2 (fn [v] ((fn [w] (concat w 't)) v)))
+(at (select {v: (hqt2 s) e: (reverse x) from: T3}) 'v) -- ['at 'bt 'ct]
+;; A lambda written inline in the query keeps the query's column rule for
+;; literals, on the planned path and in every fallback.
+(at (select {v: ((fn [v] (concat v 's)) s) from: T}) 'v) -- ['aa 'bb 'cc 'dd 'ee]
+(at (select {v: ((fn [v] (concat v 's)) s) e: (reverse x) from: T}) 'v) -- ['aa 'bb 'cc 'dd 'ee]
+(at (update {v: ((fn [v] (concat v 's)) s) from: T}) 'v) -- ['aa 'bb 'cc 'dd 'ee]
+(at (select {v: ((fn [v] (concat v (upper 't))) s) from: T3}) 'v) -- ["aP" "bQ" "cR"]
+(at (select {v: ((fn [v] (concat v (upper 't))) s) e: (reverse x) from: T3}) 'v) -- ["aP" "bQ" "cR"]
+(at (select {o: ((fn [x] 'x) 999) e: (reverse x) from: T}) 'o) -- [1 2 3 4 5]
+;; A nested helper's free name is its global on the planned path too.
+(set label 'G)
+(set inner (fn [v] (concat v label)))
+(set outer (fn [v label] (inner v)))
+(at (select {v: (outer s 'L) from: T}) 'v) -- ['aG 'bG 'cG 'dG 'eG]
+(at (update {v: (outer s 'L) from: T}) 'v) -- ['aG 'bG 'cG 'dG 'eG]
+(at (select {from: T where: (in (outer s 'L) ['aG 'xG])}) 'x) -- [1]
+;; A grouped derived output: an alias that replaces a source column does not
+;; capture a helper's free name; without a global the name is an error.
+(set suffix "!")
+(set sfxg (fn [v] (concat v suffix)))
+(at (select {suffix: (first s) a: (first s) v: (sfxg a) by: k from: TS asc: k}) 'v) -- ['a! 'c!]
+(set hng (fn [v] (concat v nosuch)))
+(select {a: (first s) v: (hng a) by: k from: TS}) !- name
+;; A whole-column projection expands helpers inside its operands.
+(set sfx (fn [v] (concat v "!")))
+(at (select {v: (concat s (first (sfx s))) from: T}) 'v) -- ['aa! 'ba! 'ca! 'da! 'ea!]

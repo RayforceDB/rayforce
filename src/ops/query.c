@@ -1097,7 +1097,7 @@ static bool unsorted_positive_take_limit(ray_t** dict_elems, int64_t dict_n,
  * uniformly by ray_graph_free.
  * -------------------------------------------------------------------------- */
 static ray_op_t* cexpr_env_lookup(ray_graph_t* g, int64_t sym) {
-    for (int i = g->cexpr_env_top - 1; i >= 0; i--)
+    for (int i = g->cexpr_env_top - 1; i >= g->cexpr_env_base; i--)
         if (g->cexpr_env[i].sym == sym)
             return &g->nodes[g->cexpr_env[i].node_id];
     return NULL;
@@ -1352,6 +1352,11 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
      * the rule fires only when a query table is bound.  A literal naming no
      * column stays a const atom node. */
     if (expr->type == -RAY_SYM) {
+        /* Inside a named helper's body a literal symbol is the symbol
+         * itself, as it is when the helper runs as bytecode: the column
+         * rule belongs to text written in the query, inline lambdas
+         * included. */
+        if (g->cexpr_helper_depth) return ray_const_atom(g, expr);
         /* A literal naming an EARLIER PROJECTION of the same select resolves
          * to it, exactly as the bare name does — and ahead of a source
          * column of the same name, as the bare name does.  The alias store
@@ -1437,9 +1442,7 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
                 g->cexpr_env_top++;
                 pushed++;
             }
-            g->cexpr_lambda_depth++;
             ray_op_t* result = compile_expr_dag(g, body);
-            g->cexpr_lambda_depth--;
             cexpr_env_pop(g, pushed);
             return result;
         }
@@ -1473,6 +1476,15 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
                             actual_ids[i] = a->id;
                         }
                         int64_t* fids = (int64_t*)ray_data(formals);
+                        /* The body was written outside this select and
+                         * outside any helper that calls it: a free name in
+                         * it is a global (or a column), never an output
+                         * alias of the select nor a formal of the calling
+                         * helper.  Hide both while the body compiles; the
+                         * actuals above were compiled in the caller's scope
+                         * and keep seeing aliases and formals. */
+                        int saved_base = g->cexpr_env_base;
+                        g->cexpr_env_base = g->cexpr_env_top;
                         int pushed = 0;
                         for (int64_t i = 0; i < nf; i++) {
                             g->cexpr_env[g->cexpr_env_top].sym     = fids[i];
@@ -1480,19 +1492,14 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
                             g->cexpr_env_top++;
                             pushed++;
                         }
-                        /* The body was written outside this select: a free
-                         * name in it is a global (or a column), never an
-                         * output alias of the select that happens to call
-                         * the lambda.  Hide the alias store while the body
-                         * compiles; the actuals above were compiled in the
-                         * projection's own scope and keep seeing aliases. */
                         int saved_aliases = g->sel_alias_n;
                         g->sel_alias_n = 0;
-                        g->cexpr_lambda_depth++;
+                        g->cexpr_helper_depth++;
                         ray_op_t* result = compile_expr_dag(g, body);
-                        g->cexpr_lambda_depth--;
+                        g->cexpr_helper_depth--;
                         g->sel_alias_n = saved_aliases;
                         cexpr_env_pop(g, pushed);
+                        g->cexpr_env_base = saved_base;
                         return result;
                     }
                 }
@@ -1637,11 +1644,7 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
             if (n < 2 || n - 1 > 16) return NULL;
             uint32_t arg_ids[16];
             for (int64_t i = 1; i < n; i++) {
-                /* A helper's quoted text suffix is a literal even when its
-                 * spelling matches a column in the calling query. */
-                ray_op_t* a = g->cexpr_lambda_depth && elems[i]->type == -RAY_SYM &&
-                              (elems[i]->attrs & ATTR_QUOTED)
-                    ? ray_const_atom(g, elems[i]) : compile_expr_dag(g, elems[i]);
+                ray_op_t* a = compile_expr_dag(g, elems[i]);
                 if (!a) return NULL;
                 arg_ids[i - 1] = a->id;
             }
@@ -2088,9 +2091,39 @@ static _Thread_local query_dependency_cache_t* g_query_dependencies;
 
 typedef struct { int64_t name; ray_t* expr; } query_inline_binding_t;
 
-/* Fallback can inline pure collection expressions even when the DAG cannot
- * lower their types or shapes. Never move effects or opaque user calls. */
-static bool query_inline_pure(ray_t* expr, int depth, bool collections) {
+/* A builtin whose call can move from a helper body into the query
+ * expression without changing what the program does: no effects, no
+ * input but its arguments, no unevaluated-argument forms except the
+ * conditionals the planner already understands. */
+static bool query_inline_pure_builtin(int64_t id) {
+    static const char* const forms[] = { "if", "and", "or", "cond", "quote" };
+    static const char* const impure[] = {
+        "println", "print", "show", "rand", "raise", "try", "eval", "apply",
+        "time", "timestamp", "timeit", "times", "do", "each", "over", "scan",
+    };
+    enum { NFORMS = sizeof forms / sizeof *forms, NIMPURE = sizeof impure / sizeof *impure };
+    /* Interned once: this runs for every call node of every helper. */
+    static _Thread_local int64_t form_ids[NFORMS], impure_ids[NIMPURE];
+    static _Thread_local bool interned;
+    if (!interned) {
+        for (size_t i = 0; i < NFORMS; i++) form_ids[i] = ray_sym_intern(forms[i], strlen(forms[i]));
+        for (size_t i = 0; i < NIMPURE; i++) impure_ids[i] = ray_sym_intern(impure[i], strlen(impure[i]));
+        interned = true;
+    }
+    for (size_t i = 0; i < NFORMS; i++) if (form_ids[i] == id) return true;
+    for (size_t i = 0; i < NIMPURE; i++) if (impure_ids[i] == id) return false;
+    if (ray_sym_is_dotted(id)) return false;          /* system namespaces */
+    ray_t* s = ray_sym_str(id);
+    if (s && ray_str_len(s) && ray_str_ptr(s)[0] == '.') return false;
+    ray_t* fn = ray_env_get(id);
+    if (!fn || (fn->type != RAY_UNARY && fn->type != RAY_BINARY && fn->type != RAY_VARY))
+        return false;
+    return !(fn->attrs & (RAY_FN_RESTRICTED | RAY_FN_SPECIAL_FORM));
+}
+
+/* Fallback can inline pure expressions even when the DAG cannot lower
+ * their types or shapes. Never move effects or opaque user calls. */
+static bool query_inline_pure(ray_t* expr, int depth) {
     if (!expr || depth > 24) return false;
     if (expr->type != RAY_LIST || (expr->attrs & ATTR_QUOTED)) return true;
     if (!expr->len) return true;
@@ -2098,19 +2131,9 @@ static bool query_inline_pure(ray_t* expr, int depth, bool collections) {
     if (!es[0] || es[0]->type != -RAY_SYM) return false;
     int64_t id = es[0]->i64;
     if (id == ray_sym_intern("quote", 5)) return expr->len == 2;
-    ray_t* fn = ray_env_get(id);
-    if (!fn || (fn->type != RAY_UNARY && fn->type != RAY_BINARY && fn->type != RAY_VARY))
-        return false;
-    bool known = resolve_unary_dag(id) || resolve_binary_dag(id) || resolve_agg_opcode(id) ||
-                 id == ray_sym_intern("concat", 6) || id == ray_sym_intern("as", 2) ||
-                 id == ray_sym_intern("if", 2) || id == ray_sym_intern("and", 3) ||
-                 id == ray_sym_intern("or", 2);
-    if (!known && collections)
-        known = id == ray_sym_intern("distinct", 8) || id == ray_sym_intern("reverse", 7) ||
-                id == ray_sym_intern("asc", 3) || id == ray_sym_intern("desc", 4);
-    if (!known) return false;
+    if (!query_inline_pure_builtin(id)) return false;
     for (int64_t i = 1; i < expr->len; i++)
-        if (!query_inline_pure(es[i], depth + 1, collections)) return false;
+        if (!query_inline_pure(es[i], depth + 1)) return false;
     return true;
 }
 
@@ -2134,29 +2157,24 @@ static ray_t* query_quote_value(ray_t* value) {
  * private binding for a helper's free source reference in that case; its
  * actual arguments continue to read the visible alias. */
 typedef struct {
-    ray_t* root;
     ray_t* table;                /* borrowed until a private column is added */
     bool owned;
+    /* Grouped derived outputs: the source rows are gone, so a free name
+     * that named a source column means its global binding, as it does
+     * when the helper runs as bytecode. */
+    bool globals_for_source;
     int next;
 } query_inline_scope_t;
 
-static bool query_expr_has_symbol(ray_t* expr, int64_t id) {
-    if (expr->type == -RAY_SYM) return expr->i64 == id;
-    if (expr->type != RAY_LIST) return false;
-    ray_t** es = ray_data(expr);
-    for (int64_t i = 0; i < expr->len; i++)
-        if (query_expr_has_symbol(es[i], id)) return true;
-    return false;
-}
-
+/* The private name must be free in the evaluation table and the globals;
+ * a lexical binding of the same spelling wins over a query column anyway. */
 static ray_t* query_inline_source_col(query_inline_scope_t* scope, ray_t* col) {
     char name[48];
     int64_t id;
     do {
         int len = snprintf(name, sizeof name, "__query_source_%d", scope->next++);
         id = ray_sym_intern(name, len);
-    } while (ray_table_get_col(scope->table, id) || ray_env_get(id) ||
-             query_expr_has_symbol(scope->root, id));
+    } while (ray_table_get_col(scope->table, id) || ray_env_get(id));
     if (!scope->owned) { ray_retain(scope->table); scope->owned = true; }
     scope->table = ray_table_add_col(scope->table, id, col);
     if (!scope->table || RAY_IS_ERR(scope->table)) return NULL;
@@ -2169,13 +2187,19 @@ static ray_t* query_inline_walk(ray_t* expr, ray_t* tbl,
                                query_inline_binding_t* bindings, int nb,
                                int depth, int* budget, bool named_body, query_inline_scope_t* scope) {
     if (!expr || depth > 24 || --*budget < 0) return NULL;
+    /* A literal symbol in a named helper's body is the symbol, as in
+     * bytecode; text written in the query, inline lambdas included, keeps
+     * the query's column rule. */
+    if (named_body && expr->type == -RAY_SYM && (expr->attrs & ATTR_QUOTED))
+        return query_quote_value(expr);
     if (expr->type == -RAY_SYM && !(expr->attrs & ATTR_QUOTED)) {
         for (int i = nb - 1; i >= 0; i--) if (bindings[i].name == expr->i64) {
             ray_retain(bindings[i].expr);
             return bindings[i].expr;
         }
         ray_t* source_col = named_body ? ray_table_get_col(tbl, expr->i64) : NULL;
-        if (source_col && scope && scope->table && !RAY_IS_ERR(scope->table) &&
+        if (source_col && scope && scope->globals_for_source) source_col = NULL;
+        else if (source_col && scope && scope->table && !RAY_IS_ERR(scope->table) &&
             source_col != ray_table_get_col(scope->table, expr->i64))
             return query_inline_source_col(scope, source_col);
         if (named_body && !source_col) {
@@ -2226,10 +2250,6 @@ static ray_t* query_inline_walk(ray_t* expr, ray_t* tbl,
     out->len = 0;
     for (int64_t i = 0; i < expr->len; i++) {
         if (i == 0) { dst[i] = es[i]; ray_retain(dst[i]); }
-        else if (bindings && es[0]->type == -RAY_SYM &&
-                 es[0]->i64 == ray_sym_intern("concat", 6) &&
-                 es[i]->type == -RAY_SYM && (es[i]->attrs & ATTR_QUOTED))
-            dst[i] = query_quote_value(es[i]);
         else dst[i] = query_inline_walk(es[i], tbl, bindings, nb, depth + 1, budget, named_body, scope);
         if (!dst[i]) { ray_release(out); return NULL; }
         out->len++;
@@ -2242,12 +2262,13 @@ static ray_t* query_inline_walk(ray_t* expr, ray_t* tbl,
     query_inline_binding_t formals[64];
     for (int64_t i = 0; i < params->len; i++)
         formals[i] = (query_inline_binding_t){sym_cell_runtime_id(params, i), dst[i + 1]};
+    /* An inline lambda inside a named helper's body is still that body. */
     ray_t* expanded = query_inline_walk(body, tbl, formals, (int)params->len,
-                                       depth + 1, budget, named, scope);
+                                       depth + 1, budget, named || named_body, scope);
     if (!expanded) return out;
-    if (!query_inline_pure(expanded, 0, false)) { ray_release(expanded); return out; }
+    if (!query_inline_pure(expanded, 0)) { ray_release(expanded); return out; }
     for (int64_t i = 1; i < out->len; i++)
-        if (!query_inline_pure(dst[i], 0, false)) { ray_release(expanded); return out; }
+        if (!query_inline_pure(dst[i], 0)) { ray_release(expanded); return out; }
     ray_release(out);
     return expanded;
 }
@@ -2468,8 +2489,17 @@ static bool expr_has_collection_concat(ray_t* expr, ray_t* tbl) {
         /* Only helpers the native compiler cannot lower need expansion.
          * Walk calls once, rather than re-expanding every enclosing aggregate. */
         ray_t* expanded = query_inline_helpers(expr, tbl);
-        collection = expr_contains_call_named(expanded, "concat", 6) &&
-                     expr_has_collection_concat(expanded, tbl);
+        ray_t** ex = expanded->type == RAY_LIST && expanded->len ? ray_data(expanded) : NULL;
+        if (ex && ex[0]->type == -RAY_SYM && ex[0]->i64 == name) {
+            /* The call could not be expanded (an opaque helper): it is a
+             * collection operation only if an argument is one. */
+            collection = false;
+            for (int64_t i = 1; i < expanded->len && !collection; i++)
+                collection = expr_has_collection_concat(ex[i], tbl);
+        } else {
+            collection = expr_contains_call_named(expanded, "concat", 6) &&
+                         expr_has_collection_concat(expanded, tbl);
+        }
         ray_release(expanded);
         return collection;
     }
@@ -2706,40 +2736,6 @@ static ray_t* select_fallback_passthrough_col(ray_t* expr, ray_t* tbl, int64_t n
     return col;
 }
 
-static bool query_expr_reads_rows_on(ray_t* expr, ray_t* tbl);
-
-/* Some text operations deliberately have no DAG node. Their source
- * dependency still distinguishes column text from a bound collection. */
-static bool query_text_operand(ray_t* expr, ray_t* tbl) {
-    ray_graph_t* g = ray_graph_new(tbl);
-    if (!g) return false;
-    ray_op_t* op = compile_expr_dag(g, expr);
-    bool text = op && (op->out_type == RAY_SYM || op->out_type == RAY_STR) &&
-                (!op_tree_is_scalar(g, op->id) || op_tree_is_atom(g, op->id));
-    ray_graph_free(g);
-    if (text || !expr || expr->type != RAY_LIST || expr->len < 2) return text;
-    ray_t** es = ray_data(expr);
-    if (es[0]->type != -RAY_SYM) return false;
-    int64_t id = es[0]->i64;
-    ray_t* fn = ray_env_get(id);
-    if (!fn || fn->type == RAY_LAMBDA) return false;
-    if (id == ray_sym_intern("as", 2) && expr->len == 3 && es[1]->type == -RAY_SYM &&
-        (es[1]->i64 == ray_sym_intern("SYM", 3) || es[1]->i64 == ray_sym_intern("STR", 3)))
-        return query_expr_reads_rows_on(es[2], tbl) ||
-               (ray_is_atom(es[2]) && es[2]->type != -RAY_SYM);
-    if (id == ray_sym_intern("reverse", 7) || id == ray_sym_intern("asc", 3) ||
-        id == ray_sym_intern("desc", 4) || id == ray_sym_intern("at", 2))
-        return query_text_operand(es[1], tbl);
-    return false;
-}
-
-static bool query_concat_text_operands(ray_t* expr, ray_t* tbl) {
-    ray_t** es = ray_data(expr);
-    for (int64_t i = 1; i < expr->len; i++)
-        if (!query_text_operand(es[i], tbl)) return false;
-    return true;
-}
-
 /* True when a projection's TOP-LEVEL call is a "whole-column verb": a
  * collection builtin (distinct, asc, desc, reverse, enlist) that
  * consumes an entire column vector and returns a vector.  The DAG compiler
@@ -2784,10 +2780,12 @@ static int is_whole_column_projection(ray_t* expr, ray_t* tbl) {
             ray_op_ext_t* ext = find_ext(g, op->id);
             whole = ext && ext->literal && !ray_is_atom(ext->literal);
         } else if (!op) {
-            /* A declined concat is a collection operation over complete
-             * operands. In particular a column plus a bound vector must
-             * not be retried separately for each row. */
-            whole = !query_concat_text_operands(expr, tbl);
+            /* A declined concat consumes complete operands: a column plus
+             * a bound vector is a collection append, and an operand the
+             * compiler has no node for (a reordered, indexed or cast
+             * column) means the same whole column it means in update,
+             * where and by.  Neither may be retried for each row. */
+            whole = 1;
         }
         ray_graph_free(g);
         return whole;
@@ -2828,12 +2826,37 @@ static bool expr_is_constant_collection(ray_t* expr, ray_t* tbl, bool* lowered) 
     return collection;
 }
 
+/* True when an aggregate's input must be evaluated per group rather than
+ * lowered as a row-aligned input: a constant collection (its length is
+ * independent of the source rows; `collections` says the caller cares), or
+ * a collection concat the compiler cannot lower.  A source column, or a
+ * column expression free of concat and helper calls, needs no trial
+ * compile — the planner asks this for every aggregate several times. */
+static bool agg_input_needs_group_eval(ray_t* arg, ray_t* tbl, bool collections) {
+    if (!arg) return false;
+    if (tbl && tbl->type == RAY_TABLE) {
+        if (arg->type == -RAY_SYM) {
+            bool local = !(arg->attrs & ATTR_QUOTED) && ray_env_has_lexical_local(arg->i64);
+            if (!local && ray_table_get_col(tbl, arg->i64)) return false;
+            if (!collections) return false;
+        } else if (arg->type != RAY_LIST) {
+            return collections && ray_is_vec(arg);
+        } else if (!expr_contains_call_named(arg, "concat", 6) && !query_expr_has_helper(arg)) {
+            if (!collections || expr_refs_row_column(arg, tbl)) return false;
+        }
+    }
+    bool lowered = false;
+    bool constant = expr_is_constant_collection(arg, tbl, &lowered);
+    if (constant && collections) return true;
+    if (lowered) return false;
+    return expr_has_collection_concat(arg, tbl);
+}
+
 static int is_group_dag_agg_expr(ray_t* expr, ray_t* tbl) {
     if (!is_agg_expr(expr)) return 0;
     ray_t** elems = (ray_t**)ray_data(expr);
     uint16_t op = resolve_agg_opcode(elems[0]->i64);
-    bool lowered = false;
-    if (op == OP_COUNT && expr_is_constant_collection(elems[1], tbl, &lowered)) return 0;
+    if (expr_contains_call_named(elems[1], "distinct", 8)) return 0;
     if (op == OP_QUANTILE) {
         if (ray_len(expr) < 3) return 0;
         if (!quantile_literal_prob(elems[2],
@@ -2841,8 +2864,7 @@ static int is_group_dag_agg_expr(ray_t* expr, ray_t* tbl) {
                                    NULL))
             return 0;
     }
-    return !expr_contains_call_named(elems[1], "distinct", 8) &&
-           (lowered || !expr_has_collection_concat(elems[1], tbl));
+    return !agg_input_needs_group_eval(elems[1], tbl, op == OP_COUNT);
 }
 
 static bool expr_literal_is_temporal(ray_t* expr) {
@@ -3299,10 +3321,8 @@ static int is_streaming_aggr_unary_call(ray_t* expr, ray_t* tbl) {
      * each group rather than slicing a concatenated full-table result. */
     if (!is_aggr_unary_call(expr)) return 0;
     ray_t** elems = (ray_t**)ray_data(expr);
-    bool lowered = false;
-    if (expr_is_constant_collection(elems[1], tbl, &lowered)) return 0;
-    if (!lowered && expr_has_collection_concat(elems[1], tbl)) return 0;
-    return !expr_contains_call_named(elems[1], "distinct", 8);
+    if (expr_contains_call_named(elems[1], "distinct", 8)) return 0;
+    return !agg_input_needs_group_eval(elems[1], tbl, true);
 }
 
 static int is_plain_count_expr(ray_t* expr, ray_t* tbl) {
@@ -3312,10 +3332,8 @@ static int is_plain_count_expr(ray_t* expr, ray_t* tbl) {
     ray_t** elems = (ray_t**)ray_data(expr);
     if (!elems[0] || elems[0]->type != -RAY_SYM) return 0;
     if (resolve_agg_opcode(elems[0]->i64) != OP_COUNT) return 0;
-    bool lowered = false;
-    if (expr_is_constant_collection(elems[1], tbl, &lowered)) return 0;
-    return !expr_contains_call_named(elems[1], "distinct", 8) &&
-           (lowered || !expr_has_collection_concat(elems[1], tbl));
+    if (expr_contains_call_named(elems[1], "distinct", 8)) return 0;
+    return !agg_input_needs_group_eval(elems[1], tbl, true);
 }
 
 /* NOTE: binary-aggregator gates (is_aggr_binary_call /
@@ -7643,10 +7661,14 @@ static ray_t* eval_scalar_agg_outputs(ray_t** dict_elems, int64_t dict_n,
          * would feed it one scalar cell at a time, making `count` report the
          * row count instead of the distinct count (issue #405).  Mirror the
          * projection fallback's routing and evaluate it once. */
-        ray_t* src = (is_whole_column_projection(agg_elems[1], tbl) ||
-                     expr_is_constant_collection(agg_elems[1], tbl, NULL))
-                   ? eval_expr_whole_column(agg_elems[1], tbl)
-                   : eval_expr_per_row(agg_elems[1], tbl, nrows);
+        /* Expand helpers first: a pure helper around such a verb is the
+         * verb, and must not be fed one cell at a time either. */
+        ray_t* agg_src_expr = query_inline_helpers(agg_elems[1], tbl);
+        ray_t* src = (is_whole_column_projection(agg_src_expr, tbl) ||
+                     expr_is_constant_collection(agg_src_expr, tbl, NULL))
+                   ? eval_expr_whole_column_impl(agg_src_expr, tbl)
+                   : eval_expr_per_row_impl(agg_src_expr, tbl, nrows);
+        ray_release(agg_src_expr);
         if (!src || RAY_IS_ERR(src)) {
             ray_release(result);
             return src ? src : ray_error("domain", "select: failed to evaluate aggregation source");
@@ -9479,7 +9501,16 @@ static ray_t* select_apply_derived(ray_t* result, ray_t* dict, select_alias_plan
     int64_t n_groups = ray_table_nrows(result);
     for (int64_t d = 0; d < plan->n_derived; d++) {
         ray_t* expr = plan->derived_exprs[d];
-        ray_t* expanded = query_inline_helpers(expr, source);
+        /* The group result carries no source rows: a helper's free name
+         * that named a source column means its global binding here, and an
+         * output alias never captures it. */
+        ray_t* expanded = NULL;
+        if (query_expr_has_helper(expr)) {
+            int budget = 1024;
+            query_inline_scope_t scope = { .globals_for_source = true };
+            expanded = query_inline_walk(expr, source, NULL, 0, 0, &budget, false, &scope);
+        }
+        if (!expanded) { ray_retain(expr); expanded = expr; }
         ray_t* col = select_derived_needs_rows(expr)
             ? eval_expr_per_row_impl(expanded, result, n_groups)
             : eval_expr_whole_column_impl(expanded, result);
@@ -9506,21 +9537,56 @@ static ray_t* select_apply_derived(ray_t* result, ray_t* dict, select_alias_plan
     int64_t take_id = ray_sym_intern("take", 4), asc_id = ray_sym_intern("asc", 3), desc_id = ray_sym_intern("desc", 4);
     int64_t nearest_id = ray_sym_intern("nearest", 7);
     int64_t ncols = ray_table_ncols(result);
+    /* Already laid out — keys, then the outputs in the dict's order, no
+     * hidden slots and no repeated name — leaves nothing to do.  This is
+     * the common case for a grouped fallback with one output. */
+    if (plan->n_hidden == 0) {
+        int64_t c = 0, want = 0;
+        bool laid_out = true;
+        for (int64_t i = 0; i + 1 < dv_n && laid_out; i += 2) {
+            int64_t cn = dv[i]->i64;
+            if (cn == from_id || cn == where_id || cn == by_id || cn == take_id || cn == asc_id || cn == desc_id || cn == nearest_id) continue;
+            if (!ray_table_get_col(result, cn)) continue;   /* folded away */
+            want++;
+            while (c < ncols && ray_table_col_name(result, c) != cn) {
+                /* a key: must not be named like any output */
+                int64_t kn = ray_table_col_name(result, c);
+                for (int64_t j = 0; j + 1 < dv_n && laid_out; j += 2) if (dv[j]->i64 == kn) laid_out = false;
+                c++;
+            }
+            if (c >= ncols) laid_out = false;
+            else c++;
+        }
+        if (c != ncols) laid_out = false;   /* trailing columns: misplaced */
+        if (laid_out && want > 0) {
+            if (plan->sort_after)
+                result = apply_sort_take(result, dv, dv_n, asc_id, desc_id, take_id, NULL);
+            DICT_VIEW_CLOSE(dv);
+            return result;
+        }
+    }
     ray_t* out = ray_table_new(ncols);
     if (!out || RAY_IS_ERR(out)) { DICT_VIEW_CLOSE(dv); ray_release(result); return out ? out : ray_error("oom", NULL); }
+    /* An output may carry a key's name (`{k: (first x) … by: k}`): the
+     * engine then emits both, the key first.  The last column of a name is
+     * the output; any earlier one is a key. */
     for (int64_t c = 0; c < ncols && out && !RAY_IS_ERR(out); c++) {
         int64_t cn = ray_table_col_name(result, c);
-        bool is_output = false, is_hidden = false;
+        bool is_output = false, is_hidden = false, last = true;
         for (int64_t i = 0; i + 1 < dv_n; i += 2)
             if (dv[i]->i64 == cn && cn != from_id && cn != where_id && cn != by_id && cn != take_id && cn != asc_id && cn != desc_id && cn != nearest_id) { is_output = true; break; }
         for (int64_t h = 0; h < plan->n_hidden; h++) if (plan->hidden_names[h] == cn) { is_hidden = true; break; }
-        if (is_output || is_hidden) continue;
+        for (int64_t c2 = c + 1; c2 < ncols && last; c2++)
+            if (ray_table_col_name(result, c2) == cn) last = false;
+        if ((is_output && last) || is_hidden) continue;
         out = ray_table_add_col(out, cn, ray_table_get_col_idx(result, c));
     }
     for (int64_t i = 0; i + 1 < dv_n && out && !RAY_IS_ERR(out); i += 2) {
         int64_t cn = dv[i]->i64;
         if (cn == from_id || cn == where_id || cn == by_id || cn == take_id || cn == asc_id || cn == desc_id || cn == nearest_id) continue;
-        ray_t* col = ray_table_get_col(result, cn);
+        ray_t* col = NULL;
+        for (int64_t c = ncols - 1; c >= 0 && !col; c--)
+            if (ray_table_col_name(result, c) == cn) col = ray_table_get_col_idx(result, c);
         if (!col) continue;   /* an output the engine folded away (e.g. a key projection) */
         out = ray_table_add_col(out, cn, col);
     }
@@ -14522,7 +14588,7 @@ by_dict_done:
                     }
                     ray_t* col;
                     ray_t* expanded = NULL;
-                    query_inline_scope_t scope = { .root = expr, .table = tbl };
+                    query_inline_scope_t scope = { .table = tbl };
                     if (reduced && RAY_IS_ERR(reduced)) {
                         col = reduced;
                     } else {
@@ -17067,13 +17133,13 @@ ray_t* ray_update(ray_t** args, int64_t n) {
             bool expand = query_expr_has_helper(agg_expr);
             if (expand) {
                 ray_t* candidate = query_inline_helpers(agg_expr, tbl);
-                if (query_inline_pure(candidate, 0, true)) {
+                if (query_inline_pure(candidate, 0)) {
                     prepared_expr = candidate;
                     agg_expr = candidate;
                     expand = false;
                 } else ray_release(candidate);
             }
-            bool cache_dependencies = !expand && query_inline_pure(agg_expr, 0, true);
+            bool cache_dependencies = !expand && query_inline_pure(agg_expr, 0);
 
             /* We need to evaluate the aggregate per group.
              * Build the result column by evaluating the expression on each group's subset. */

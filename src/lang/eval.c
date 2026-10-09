@@ -2239,12 +2239,20 @@ typedef struct query_call_scope {
     ray_t* params;
     uint64_t rows;
     int32_t depth;
+    bool named;          /* called by name: text written outside the query */
 } query_call_scope_t;
 static _Thread_local query_call_scope_t* g_query_call_scope;
 
 bool ray_eval_query_helper_active(void) {
     return g_query_call_scope &&
            !ray_env_query_scope_above(g_query_call_scope->depth);
+}
+
+/* A literal symbol keeps bytecode's meaning inside a named helper's body.
+ * A lambda written inline in the query is query text: its literals follow
+ * the query's column rule, as on the planned path. */
+bool ray_eval_query_helper_literals(void) {
+    return ray_eval_query_helper_active() && g_query_call_scope->named;
 }
 
 int ray_eval_query_param_rows(int64_t sym_id) {
@@ -2260,7 +2268,7 @@ int ray_eval_query_param_rows(int64_t sym_id) {
 /* Ordinary calls use bytecode; query fallback interprets the retained AST
  * so concat can distinguish column parameters from bound collections. */
 static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
-                               bool query, uint64_t row_args) {
+                               bool query, uint64_t row_args, bool named) {
     /* Lazy compilation on first call */
     if (!query && !LAMBDA_CLOSURE(lambda) && !LAMBDA_IS_COMPILED(lambda)) {
         ray_compile(lambda);
@@ -2293,7 +2301,8 @@ static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
     if (query && !has_closure)
         __VM->scope_stack[__VM->scope_depth - 1].kind = RAY_SCOPE_CALL;
     query_call_scope_t call = { .prev = g_query_call_scope, .params = params_list,
-                               .rows = row_args, .depth = ray_env_scope_depth() };
+                               .rows = row_args, .depth = ray_env_scope_depth(),
+                               .named = named || ray_eval_query_helper_literals() };
     if (query) g_query_call_scope = &call;
 
     /* Bind 'self' to the current lambda for recursion */
@@ -2326,7 +2335,7 @@ static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
 }
 
 ray_t* call_lambda(ray_t* lambda, ray_t** call_args, int64_t argc) {
-    return call_lambda_impl(lambda, call_args, argc, false, 0);
+    return call_lambda_impl(lambda, call_args, argc, false, 0, false);
 }
 
 /* ══════════════════════════════════════════
@@ -3916,9 +3925,10 @@ ray_t* ray_eval(ray_t* obj) {
          * scope chain — so a literal never captures a lambda/let local, and
          * the rule fires only while a query is active (ray_active_query_table
          * is NULL otherwise).  A literal naming no column returns itself.
-         * Helper bodies keep bytecode's literal semantics; a nested query
-         * re-enables its own column-name interpretation. */
-        if (obj->type == -RAY_SYM && !ray_eval_query_helper_active()) {
+         * Named helper bodies keep bytecode's literal semantics; an inline
+         * lambda is query text, and a nested query re-enables its own
+         * column-name interpretation. */
+        if (obj->type == -RAY_SYM && !ray_eval_query_helper_literals()) {
             /* The column — or, during a per-row evaluation, its cell in the
              * current row (ray_active_query_literal). */
             ray_t* v = ray_active_query_literal(obj->i64);
@@ -4147,10 +4157,18 @@ ray_t* ray_eval(ray_t* obj) {
                      (left->type == RAY_SYM || left->type == RAY_STR ||
                       left->type == -RAY_SYM || left->type == -RAY_STR) &&
                      (right->type == RAY_SYM || right->type == RAY_STR ||
-                      right->type == -RAY_SYM || right->type == -RAY_STR) &&
-                     (ray_is_atom(left) || ray_query_expr_reads_rows(elems[1])) &&
-                     (ray_is_atom(right) || ray_query_expr_reads_rows(elems[2])))
-                result = ray_concat_text_fn(left, right);
+                      right->type == -RAY_SYM || right->type == -RAY_STR)) {
+                /* Row by row, a column's cell is an atom: it still carries
+                 * the column's row provenance, and a STR cell its type. */
+                bool left_rows = ray_query_expr_reads_rows(elems[1]);
+                bool right_rows = ray_query_expr_reads_rows(elems[2]);
+                if ((ray_is_atom(left) || left_rows) && (ray_is_atom(right) || right_rows))
+                    result = ray_concat_text_fn(left, right,
+                                                (left->type == -RAY_STR && left_rows) ||
+                                                (right->type == -RAY_STR && right_rows));
+                else
+                    result = fn(left, right);
+            }
             else
                 result = fn(left, right);
             ray_release(left);
@@ -4202,7 +4220,8 @@ ray_t* ray_eval(ray_t* obj) {
             uint64_t row_args = 0;
             if (query) for (int64_t i = 0; i < argc; i++)
                 if (ray_query_expr_reads_rows(elems[i + 1])) row_args |= UINT64_C(1) << i;
-            ray_t* result = call_lambda_impl(head, args, argc, query, row_args);
+            bool named = elems[0]->type == -RAY_SYM && !(elems[0]->attrs & ATTR_QUOTED);
+            ray_t* result = call_lambda_impl(head, args, argc, query, row_args, named);
             for (int64_t i = 0; i < argc; i++) ray_release(args[i]);
             ray_release(head);
             if (RAY_IS_ERR(result))
