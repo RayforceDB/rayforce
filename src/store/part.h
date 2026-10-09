@@ -29,6 +29,11 @@
 /* Partitioned table */
 ray_t*    ray_read_parted(const char* db_root, const char* table_name);
 
+/* Drop every partition table ray_read_parted keeps for reuse across mounts
+ * (see "Partition reuse across mounts" in part.c).  Runtime shutdown calls
+ * it before the heap and symbol table go away. */
+void      ray_parted_cache_clear(void);
+
 /* Enumerate the table names under a parted db root — the splayed-table
  * subdirectories (those with a `.d` schema) of the first partition.
  * Returns a sorted RAY_SYM vector of names suitable for ray_read_parted,

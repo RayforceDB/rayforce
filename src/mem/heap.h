@@ -213,6 +213,16 @@ typedef struct ray_dispatch  ray_dispatch_t;
 
 void     ray_heap_init(void);
 void     ray_heap_destroy(void);
+
+/* A process-global structure that keeps objects of a per-thread heap (the
+ * partition cache in store/part.c) must let go of them before that heap's
+ * pools are unmapped.  ray_heap_destroy calls every registered function
+ * first, on the owning thread, with the dying heap's id, while its memory
+ * is still mapped and the heap still registered, so the callback can
+ * release those objects normally.  Registration is idempotent per function
+ * and holds a handful of entries; it returns false when the table is full. */
+typedef void (*ray_heap_teardown_fn)(uint16_t heap_id);
+bool     ray_heap_on_teardown(ray_heap_teardown_fn fn);
 /* Detach the calling thread from its heap WITHOUT tearing the heap down:
  * the heap stays registered with its pools intact and is handed to the next
  * thread that calls ray_heap_init().

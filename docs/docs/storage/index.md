@@ -17,8 +17,16 @@ The header carries a single-byte format generation. The current generation is `0
  * Bytes  0-31:   ray_t header (type, attrs, len, etc.)
  * Bytes 32-N:    element data (len * elem_size bytes)
  *                nulls use type-correct sentinels in this payload
+ *
+ * String columns (RAY_STR) continue:
+ * Bytes 32-N:    16-byte descriptors; a string longer than 12 bytes
+ *                lives in the pool and its descriptor carries the
+ *                pool offset and a 32-bit content hash
+ * Bytes N+1..:   32-byte pool header, then the pool bytes
  */
 ```
+
+A string column file written by the current engine stores the content hash of every pooled string in its descriptor and marks the header to say so. Loading or mapping such a file checks descriptor bounds only: no string bytes are read and no descriptor page is written, so the mapping stays shared with the page cache. Files written before the hash was stored carry padding in that field; the loaders detect the missing mark, recompute the hashes and repair them in the private mapping, without touching the file.
 
 ### C API
 
@@ -185,6 +193,8 @@ ray_t* trades = ray_read_parted("db", "trades");
 
 !!! note "Rayfall builtin"
     Use `.db.parted.get` from Rayfall to load partitioned tables: `(.db.parted.get "db" 'trades)`. See the [Rayfall Storage Builtins](#rayfall-storage) section below.
+
+Mounting the same root again reuses every partition whose files are unchanged. The loader keeps each partition's table keyed by its path, together with the generation directory it was read from and the identity, size and modification time of its schema and column files. On the next call a partition that still matches is returned by reference, a changed one is loaded afresh, and one that is gone is dropped. A process that follows a database another process appends to therefore pays for the new partition only, instead of for every column file of every partition. The kept partitions are released when the runtime shuts down.
 
 !!! warning "`update` over a partitioned table materializes in memory"
     `update` on a partitioned table flattens the whole table into memory first — the parted/`MAPCOMMON` columns cannot be mutated in place — so the result is an ordinary in-memory table. It is **not** written back to the store: re-reading the root returns the original values, and the returned table loses its parted / memory-mapped identity.

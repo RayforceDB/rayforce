@@ -130,6 +130,7 @@ ray_err_t ray_col_stream_append(ray_col_stream_t* w,
         uint64_t bytes = col->str_pool ? (uint64_t)col->str_pool->len : 0;
         if (bytes > UINT32_MAX-w->pool_bytes) return RAY_ERR_RANGE;
         const ray_str_t* src = ray_data(col);
+        const char* pool_base = bytes ? (const char*)ray_data(col->str_pool) : NULL;
         ray_str_t buf[1024];
         for (int64_t off = 0; off < n;) {
             if (ray_interrupted()) return RAY_ERR_CANCEL;
@@ -138,6 +139,10 @@ ray_err_t ray_col_stream_append(ray_col_stream_t* w,
             for (int64_t i = 0; i < count; i++) {
                 if (buf[i].len > RAY_STR_INLINE_MAX) {
                     if (buf[i].pool_off > bytes || buf[i].len > bytes-buf[i].pool_off) return RAY_ERR_CORRUPT;
+                    /* Stored with its content hash (RAY_COL_STR_HASHED):
+                     * reuse a cached one, compute a missing one against the
+                     * chunk's own pool, before the offset is rebased. */
+                    buf[i].hash32 = ray_str_t_hash32(&buf[i], pool_base);
                     buf[i].pool_off += (uint32_t)w->pool_bytes;
                 }
                 if (!buf[i].len) w->had_nulls = true;
@@ -293,6 +298,8 @@ ray_err_t ray_col_stream_finish(ray_col_stream_t* w, bool durable) {
          * fast-reject against the FILE domain). */
         hdr.rc = (w->type == RAY_SYM)
             ? (uint32_t)ray_sym_domain_count(w->dom) : 0;
+        /* STR: every pooled descriptor was appended with its content hash. */
+        if (w->type == RAY_STR) ray_col_stamp_str_hashed(&hdr);
         if (w->had_nulls) hdr.attrs |= RAY_ATTR_HAS_NULLS;
         /* Stamp the on-disk format major version into `order` so the
          * streamed column file shares the exact identity ray_col_save
