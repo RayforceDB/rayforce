@@ -1785,6 +1785,9 @@ static bool pf_none_resident(const uint8_t* p, size_t n) {
  * the reads that need draining. Fault every page, including those absent
  * from the residency snapshot, then unmap and evict before the next case. */
 static void pf_settle(const uint8_t* p, size_t n) {
+    /* This mapping is about to be discarded; allow read-ahead while draining
+     * so cold pages do not each require a separate synchronous read. */
+    posix_madvise((void*)p, n, POSIX_MADV_NORMAL);
     for (size_t off = 0; off < n; off += 4096)
         pf_sink += p[off];
 }
