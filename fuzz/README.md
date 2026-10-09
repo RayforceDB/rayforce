@@ -45,11 +45,7 @@ make fuzz-select_merge FUZZ_RUNTIME=600 # structured nested-query differential c
 same queries wrapped in `do` to force inner materialization. It checks serialized
 results and error codes, allowing relative/absolute tolerance `1e-12` only for
 F64 aggregate values (fusion changes addition order). Row expressions, schema,
-order and null metadata still compare exactly. In parallel mode, when the
-planner rejects composition at every layer, only F64 aggregate values and
-their null flags may differ: the unchanged parallel reduction can itself
-produce different cancellation/overflow results as worker scheduling changes.
-The strict aggregate oracle remains enabled whenever any layer is composed.
+order and null metadata still compare exactly.
 The generator also covers extreme F64 values and tables of 8,191, 8,192,
 16,385 and 131,073 rows. Run `RAY_FUZZ_CORES=4 make fuzz-select_merge` to
 exercise parallel execution; the default remains serial for deterministic

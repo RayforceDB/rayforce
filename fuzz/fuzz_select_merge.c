@@ -6,7 +6,6 @@
 #include "lang/eval.h"
 #include "store/serde.h"
 #include "vec/vec.h"
-#include "ops/internal.h"
 #include <math.h>
 
 static void drop(ray_t* x) {
@@ -19,10 +18,9 @@ static unsigned byte(const uint8_t* data, size_t size, size_t* at) {
 }
 
 /* Fusing a floating sum can change its addition order. Permit roundoff only
- * in the generated aggregate `total`. For composed queries, nulls created
- * by extreme F64 arithmetic still compare exactly. The parallel exception
- * below applies only when no layer of the query was composed. */
-static bool aggregate_roundoff(ray_t* a, ray_t* b, bool unmerged_parallel) {
+ * in the generated aggregate `total`; row expressions, schema and wire attrs
+ * still compare exactly, including nulls created by extreme F64 arithmetic. */
+static bool aggregate_roundoff(ray_t* a, ray_t* b) {
     if (a->type != RAY_TABLE || b->type != RAY_TABLE ||
         ray_table_ncols(a) != ray_table_ncols(b) || ray_table_nrows(a) != ray_table_nrows(b) ||
         (a->attrs & (RAY_ATTR_HAS_NULLS | RAY_ATTR_SORTED)) !=
@@ -37,15 +35,8 @@ static bool aggregate_roundoff(ray_t* a, ray_t* b, bool unmerged_parallel) {
                     !memcmp(ray_data(sx), ray_data(sy), sx->len);
         drop(sx); drop(sy);
         if (same) continue;
-        if (name != total || x->type != RAY_F64 || y->type != RAY_F64 || x->len != y->len) return false;
-        /* No rewrite took place: both executions use the same reduction.
-         * Worker scheduling can change cancellation/overflow, even 0 vs NaN.
-         * All other columns, schema and errors still compare exactly. */
-        if (unmerged_parallel) {
-            if ((x->attrs ^ y->attrs) & ~RAY_ATTR_HAS_NULLS) return false;
-            continue;
-        }
-        if ((x->attrs & RAY_ATTR_HAS_NULLS) != (y->attrs & RAY_ATTR_HAS_NULLS)) return false;
+        if (name != total || x->type != RAY_F64 || y->type != RAY_F64 || x->len != y->len ||
+            (x->attrs & RAY_ATTR_HAS_NULLS) != (y->attrs & RAY_ATTR_HAS_NULLS)) return false;
         const double* xv = ray_data(x), *yv = ray_data(y);
         for (int64_t row = 0; row < x->len; row++) {
             bool xn = ray_vec_is_null(x, row), yn = ray_vec_is_null(y, row);
@@ -56,32 +47,6 @@ static bool aggregate_roundoff(ray_t* a, ray_t* b, bool unmerged_parallel) {
         }
     }
     return true;
-}
-
-/* Check every layer, not just the outer one: an inner composition can run
- * even when its parent is rejected. Failure to inspect remains strict. */
-static bool query_has_merge(const char* query) {
-    char quoted[4128];
-    snprintf(quoted, sizeof(quoted), "(quote %s)", query);
-    ray_t* ast = ray_eval_str(quoted);
-    if (!ast || RAY_IS_ERR(ast)) { drop(ast); return true; }
-    ray_t* call = ast;
-    bool merged = false;
-    while (call && call->type == RAY_LIST && call->len == 2) {
-        ray_t* dict = ((ray_t**)ray_data(call))[1];
-        if (!dict || dict->type != RAY_DICT) { merged = true; break; }
-        ray_t* plan = ray_select_merge_plan(dict);
-        if (plan) { drop(plan); merged = true; break; }
-        ray_t* key = ray_sym(ray_sym_intern("from", 4));
-        ray_t* from = ray_dict_get(dict, key);
-        drop(key);
-        if (!from || RAY_IS_ERR(from)) { drop(from); merged = true; break; }
-        /* ast keeps the nested expression alive after dropping this ref. */
-        call = from;
-        drop(from);
-    }
-    drop(ast);
-    return merged;
 }
 
 static void query(char* out, const unsigned* choices, bool barrier) {
@@ -193,10 +158,7 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         ray_t* a = ray_ser(got), *b = ray_ser(want);
         equal = a && b && !RAY_IS_ERR(a) && !RAY_IS_ERR(b) &&
                 a->len == b->len && !memcmp(ray_data(a), ray_data(b), a->len);
-        if (!equal) equal = aggregate_roundoff(got, want, false);
-        if (!equal && ray_pool_get() && ray_pool_total_workers(ray_pool_get()) > 1 &&
-            !query_has_merge(optimized))
-            equal = aggregate_roundoff(got, want, true);
+        if (!equal) equal = aggregate_roundoff(got, want);
         if (!equal && a && b && !RAY_IS_ERR(a) && !RAY_IS_ERR(b)) {
             fprintf(stderr, "Serialized lengths: %lld / %lld\n", (long long)a->len, (long long)b->len);
             for (int64_t i = 0; i < a->len && i < b->len; i++)
