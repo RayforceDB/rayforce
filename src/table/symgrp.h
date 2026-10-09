@@ -104,6 +104,7 @@ typedef struct {
     int64_t store_kept, windows;                    /* records kept from the window before */
     int64_t stage_bytes;                            /* the tasks' arrays: their chunks' bytes */
     int64_t rec_bytes, wb_bytes;                    /* records written; bytes whose writeback the windows started */
+    int64_t adopted;                                /* strings direct passes added, taken into the logs */
     int64_t deferred, compares, cmp_bytes, collisions, redo;
 } ray_symgrp_stats_t;
 
@@ -114,6 +115,10 @@ ray_symgrp_order_t ray_symgrp_order(const ray_symgrp_t* g);
 /* A pass over `ntasks` tasks in `groups` hash groups (a power of two up to
  * RAY_SYMGRP_MAX); `workers` bounds the worker ids given to ray_symgrp_defer. */
 bool ray_symgrp_begin(ray_symgrp_t* g, int64_t ntasks, int groups, int64_t workers);
+/* Before a pass: the import dictionary's strings added outside the grouped
+ * passes (by direct ones, which come first) taken into the logs, hashed as
+ * the stage's strings are (ray_hash_bytes, `hmask` its bits kept). */
+bool ray_symgrp_adopt(ray_symgrp_t* g, uint64_t hmask);
 /* Step 1: task t's distinct strings, fp[i].local == i + 1; counts[i] the
  * rows of local id i + 1 (RAY_SYMGRP_FREQ; NULL otherwise).  Thread-safe
  * across tasks. */

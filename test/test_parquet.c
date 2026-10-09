@@ -359,42 +359,92 @@ static void pb_list(pq_buf* b, int n, int type) {
     else { pb_byte(b, (uint8_t)(0xf0 | type)); pb_var(b, (uint64_t)n); }
 }
 /* Columns x, s (fn of the row) and t (fn of the row + rows / 2: a
- * vocabulary that meets s's, for the second column's pass). */
+ * vocabulary that meets s's, for the second column's pass).  A test may set
+ * pq_synth_t, column t's own function of the row, and pq_synth_dict, the
+ * columns (bit c) written dictionary-encoded (a dictionary page of the
+ * chunk's distinct strings, then the ids), and resets them after. */
 #define PQ_SYNTH_COLS 3
+static pq_synth_fn pq_synth_t;
+static unsigned pq_synth_dict;
+static const char* pq_synth_row(pq_synth_fn fn, int c, int64_t r, int64_t rows, char* buf, uint32_t* len) {
+    return c == 2 && pq_synth_t ? pq_synth_t(r, buf, len) : fn(c == 1 ? r : r + rows / 2, buf, len);
+}
 static bool pq_synth(const char* path, int64_t rows, int64_t groups, pq_synth_fn fn) {
-    pq_buf f = {0}, page = {0}, levels = {0}, values = {0};
+    pq_buf f = {0}, page = {0}, levels = {0}, values = {0}, dict = {0}, doff = {0};
     int64_t* at = (int64_t*)ray_sys_alloc((size_t)groups * PQ_SYNTH_COLS * sizeof(int64_t));
     int64_t* sz = (int64_t*)ray_sys_alloc((size_t)groups * PQ_SYNTH_COLS * sizeof(int64_t));
-    if (!at || !sz) return false;
+    int64_t* dat = (int64_t*)ray_sys_alloc((size_t)groups * PQ_SYNTH_COLS * sizeof(int64_t));
+    if (!at || !sz || !dat) return false;
     pb_bytes(&f, "PAR1", 4);
     char buf[256];
     for (int64_t g = 0; g < groups; g++) {
         int64_t lo = rows * g / groups, hi = rows * (g + 1) / groups;
         for (int c = 0; c < PQ_SYNTH_COLS; c++) {
-            levels.n = values.n = page.n = 0;
+            bool dicted = c && (pq_synth_dict >> c & 1);
+            levels.n = values.n = page.n = dict.n = doff.n = 0;
             if (c == 0) for (int64_t r = lo; r < hi; r++) { int32_t x = (int32_t)r; pb_bytes(&values, &x, 4); }
             else {
                 uint8_t bits = 0;
                 int64_t n = hi - lo, groups8 = (n + 7) / 8;
                 pb_var(&levels, (uint64_t)(groups8 * 2 + 1));
+                pq_buf ids = {0};
                 for (int64_t r = lo; r < lo + groups8 * 8; r++) {
                     uint32_t len = 0;
-                    const char* s = r < hi ? fn(c == 1 ? r : r + rows / 2, buf, &len) : NULL;
-                    if (s) { bits |= (uint8_t)(1u << ((r - lo) & 7)); pb_bytes(&values, &len, 4); pb_bytes(&values, s, len); }
+                    const char* s = r < hi ? pq_synth_row(fn, c, r, rows, buf, &len) : NULL;
+                    if (s) {
+                        bits |= (uint8_t)(1u << ((r - lo) & 7));
+                        if (!dicted) { pb_bytes(&values, &len, 4); pb_bytes(&values, s, len); }
+                        else {
+                            /* the entry's id, the entry added on its first occurrence */
+                            uint32_t id = 0, nd = (uint32_t)(doff.n / 4);
+                            for (; id < nd; id++) {
+                                uint32_t o; memcpy(&o, doff.p + id * 4, 4);
+                                uint32_t l; memcpy(&l, dict.p + o, 4);
+                                if (l == len && !memcmp(dict.p + o + 4, s, len)) break;
+                            }
+                            if (id == nd) { uint32_t o = (uint32_t)dict.n; pb_bytes(&doff, &o, 4); pb_bytes(&dict, &len, 4); pb_bytes(&dict, s, len); }
+                            pb_bytes(&ids, &id, 4);
+                        }
+                    }
                     if (((r - lo) & 7) == 7) { pb_byte(&levels, bits); bits = 0; }
                 }
                 uint32_t ln = (uint32_t)levels.n;
                 pb_bytes(&page, &ln, 4); pb_bytes(&page, levels.p, levels.n);
+                if (dicted) {
+                    /* the ids: their bit width, then a run of one a value */
+                    uint32_t nd = (uint32_t)(doff.n / 4), bw = 1;
+                    while (bw < 32 && ((uint64_t)1 << bw) < nd) bw++;
+                    pb_byte(&values, (uint8_t)bw);
+                    for (size_t i = 0; i + 4 <= ids.n; i += 4) {
+                        uint32_t id; memcpy(&id, ids.p + i, 4);
+                        pb_var(&values, 2);
+                        pb_bytes(&values, &id, (bw + 7) / 8);
+                    }
+                    if (ids.bad) values.bad = true;
+                }
+                ray_sys_free(ids.p);
             }
             pb_bytes(&page, values.p, values.n);
             int last = 0;
             int64_t start = (int64_t)f.n;
+            dat[g * PQ_SYNTH_COLS + c] = -1;
+            if (dicted) {
+                pb_i(&f, &last, 1, PB_I32, 2);
+                pb_i(&f, &last, 2, PB_I32, (int64_t)dict.n);
+                pb_i(&f, &last, 3, PB_I32, (int64_t)dict.n);
+                pb_field(&f, &last, 7, PB_STRUCT);
+                { int l = 0; pb_i(&f, &l, 1, PB_I32, (int64_t)(doff.n / 4)); pb_i(&f, &l, 2, PB_I32, 0); pb_byte(&f, 0); }
+                pb_byte(&f, 0);
+                pb_bytes(&f, dict.p, dict.n);
+                dat[g * PQ_SYNTH_COLS + c] = (int64_t)f.n;
+                last = 0;
+            }
             pb_i(&f, &last, 1, PB_I32, 0);
             pb_i(&f, &last, 2, PB_I32, (int64_t)page.n);
             pb_i(&f, &last, 3, PB_I32, (int64_t)page.n);
             pb_field(&f, &last, 5, PB_STRUCT);
             int l2 = 0;
-            pb_i(&f, &l2, 1, PB_I32, hi - lo); pb_i(&f, &l2, 2, PB_I32, 0);
+            pb_i(&f, &l2, 1, PB_I32, hi - lo); pb_i(&f, &l2, 2, PB_I32, dicted ? 8 : 0);
             pb_i(&f, &l2, 3, PB_I32, 3); pb_i(&f, &l2, 4, PB_I32, 3);
             pb_byte(&f, 0); pb_byte(&f, 0);
             pb_bytes(&f, page.p, page.n);
@@ -426,13 +476,15 @@ static bool pq_synth(const char* path, int64_t rows, int64_t groups, pq_synth_fn
             pb_field(&f, &lc, 3, PB_STRUCT);
             int lm = 0;
             pb_i(&f, &lm, 1, PB_I32, c ? 6 : 1);
-            pb_field(&f, &lm, 2, PB_LIST); pb_list(&f, 2, PB_I32); pb_zz(&f, 0); pb_zz(&f, 3);
+            if (dat[i] >= 0) { pb_field(&f, &lm, 2, PB_LIST); pb_list(&f, 3, PB_I32); pb_zz(&f, 0); pb_zz(&f, 3); pb_zz(&f, 8); }
+            else { pb_field(&f, &lm, 2, PB_LIST); pb_list(&f, 2, PB_I32); pb_zz(&f, 0); pb_zz(&f, 3); }
             pb_field(&f, &lm, 3, PB_LIST); pb_list(&f, 1, PB_BIN); pb_bin(&f, cols[c], 1);
             pb_i(&f, &lm, 4, PB_I32, 0);
             pb_i(&f, &lm, 5, PB_I64, n);
             pb_i(&f, &lm, 6, PB_I64, sz[i]);
             pb_i(&f, &lm, 7, PB_I64, sz[i]);
-            pb_i(&f, &lm, 9, PB_I64, at[i]);
+            pb_i(&f, &lm, 9, PB_I64, dat[i] >= 0 ? dat[i] : at[i]);
+            if (dat[i] >= 0) pb_i(&f, &lm, 11, PB_I64, at[i]);
             pb_byte(&f, 0);   /* meta */
             pb_byte(&f, 0);   /* column chunk */
             total += sz[i];
@@ -445,12 +497,13 @@ static bool pq_synth(const char* path, int64_t rows, int64_t groups, pq_synth_fn
     pb_byte(&f, 0);
     uint32_t flen = (uint32_t)(f.n - (size_t)footer);
     pb_bytes(&f, &flen, 4); pb_bytes(&f, "PAR1", 4);
-    bool ok = !f.bad && !page.bad && !levels.bad && !values.bad;
+    bool ok = !f.bad && !page.bad && !levels.bad && !values.bad && !dict.bad && !doff.bad;
     FILE* out = ok ? fopen(path, "wb") : NULL;
     ok = out && fwrite(f.p, 1, f.n, out) == f.n;
     if (out && fclose(out)) ok = false;
     ray_sys_free(f.p); ray_sys_free(page.p); ray_sys_free(levels.p); ray_sys_free(values.p);
-    ray_sys_free(at); ray_sys_free(sz);
+    ray_sys_free(dict.p); ray_sys_free(doff.p);
+    ray_sys_free(at); ray_sys_free(sz); ray_sys_free(dat);
     return ok;
 }
 /* The columns s and t of an import as strings: true when every row is
@@ -465,7 +518,7 @@ static bool pq_synth_check(const char* dir, int64_t rows, pq_synth_fn fn) {
         ray_t* s = ray_table_get_col_idx(t, c);
         for (int64_t r = 0; ok && r < rows; r++) {
             uint32_t len = 0;
-            const char* want = fn(c == 1 ? r : r + rows / 2, buf, &len);
+            const char* want = pq_synth_row(fn, c, r, rows, buf, &len);
             if (!want) len = 0;
             ray_t* text = ray_sym_vec_cell(s, r);
             ok = text && ray_str_len(text) == len && (!len || !memcmp(ray_str_ptr(text), want, len));
@@ -879,6 +932,14 @@ static double pq_trace_sum(const char* buf, const char* key, int* lines) {
     if (lines) *lines = n;
     return sum;
 }
+/* Whether the trace's first line starting with `line` has `token` in it. */
+static bool pq_trace_line_has(const char* buf, const char* line, const char* token) {
+    const char* p = strstr(buf, line);
+    if (!p) return false;
+    const char* e = strchr(p, '\n');
+    const char* q = strstr(p, token);
+    return q && (!e || q < e);
+}
 /* The entries of an import's symbol file (its header count). */
 static int64_t pq_sym_count(const char* dir) {
     char path[200]; snprintf(path, sizeof(path), "%s/.sym", dir);
@@ -1117,6 +1178,100 @@ static test_result_t test_pq_sym_grouped_layout(void) {
     pq_set_env("RAY_PQ_SYM_GROUPS", NULL);
     ray_release(types); unlink(src);
     PASS();
+}
+
+/* A low-cardinality column (40 strings, nulls, dictionary-encoded) and a
+ * high-cardinality one: a string of its own a row but every fifth, which
+ * is one of the other column's, or (sparse) one in twenty rows, 34 bytes
+ * of its own, the rest null: fewer bytes than the other column's, so it
+ * comes first by size. */
+static const char* pq_synth_lowcard(int64_t r, char* buf, uint32_t* len) {
+    if (r % 31 == 0) return NULL;
+    *len = (uint32_t)snprintf(buf, 256, "c%02lld", (long long)((r * 7) % 40));
+    return buf;
+}
+static const char* pq_synth_highcard(int64_t r, char* buf, uint32_t* len) {
+    if (r % 5 == 0) return pq_synth_lowcard(r + 1, buf, len);
+    *len = (uint32_t)snprintf(buf, 256, "u%06lld-high", (long long)r);
+    return buf;
+}
+static const char* pq_synth_sparse(int64_t r, char* buf, uint32_t* len) {
+    if (r % 20) return NULL;
+    *len = (uint32_t)snprintf(buf, 256, "sparse-%06lld-and-twenty-bytes", (long long)r);
+    return buf;
+}
+/* Grouped or direct, column by column: with symbol text past a quarter of
+ * the memory the decision assumes (RAY_PQ_SYM_RAM, debug builds) the
+ * low-cardinality column still goes direct, decoded once, ahead of the
+ * grouped one (the sparse one included, smaller as it is), which takes its
+ * strings into its index: every row's string and the direct import's
+ * vocabulary (none twice), on one worker and four (the direct pass's
+ * positions follow the workers, as the direct import's do); the trace
+ * tells which column went which way.  Forced grouped, both columns are. */
+static test_result_t test_pq_sym_mixed_modes(void) {
+#if !defined(DEBUG)
+    SKIP("the memory the decision assumes is a debug-build knob");
+#else
+    pq_sym_env_clear();
+    char src[160], dir[160];
+    snprintf(src, sizeof(src), "/tmp/rayforce-pq-mixmode-%d.parquet", (int)getpid());
+    snprintf(dir, sizeof(dir), "/tmp/rayforce-pq-mixmode-%d", (int)getpid());
+    const int64_t rows = 20000;
+    int64_t tids[] = {ray_sym_intern("I32",3), ray_sym_intern("SYM",3), ray_sym_intern("SYM",3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 3);
+    const char* names[] = {"x","s","t"};
+    size_t cap = (size_t)1 << 16;
+    char* trace = (char*)ray_sys_alloc(cap);
+    TEST_ASSERT_TRUE(trace != NULL);
+    int bad = 0;
+    for (int v = 0; v < 2; v++) {
+        pq_synth_t = v ? pq_synth_sparse : pq_synth_highcard; pq_synth_dict = 1u << 1;
+        bool made = pq_synth(src, rows, 4, pq_synth_lowcard);
+        TEST_ASSERT_TRUE(made);
+        ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(1), RAY_OK);
+        pq_set_symmode("direct");
+        ray_t* res = pq_traced_import(src, dir, types, trace, cap);
+        pq_set_symmode(NULL);
+        TEST_ASSERT_FALSE(!res || RAY_IS_ERR(res)); ray_release(res);
+        TEST_ASSERT_TRUE(pq_synth_check(dir, rows, pq_synth_lowcard));
+        int64_t words = pq_sym_count(dir);
+        pq_remove_native(dir, names, 3);
+        /* the sparse column first by size */
+        if (v && !(strstr(trace, "parquet symcol: col=t ") < strstr(trace, "parquet symcol: col=s "))) bad++;
+        for (int run = 0; run < 3; run++) {
+            ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(run == 1 ? 4 : 1), RAY_OK);
+            pq_set_env("RAY_PQ_SYM_RAM", v ? "262144" : "1048576");
+            pq_set_symmode(run == 2 ? "grouped" : NULL);
+            res = pq_traced_import(src, dir, types, trace, cap);
+            pq_sym_env_clear();
+            if (!res || RAY_IS_ERR(res)) {
+                fprintf(stderr, "  %d/%d: import failed: %s\n", v, run, res ? ray_err_code(res) : "null");
+                if (res) ray_error_free(res);
+                char partial[200]; snprintf(partial, sizeof(partial), "%s.parquet-partial", dir);
+                pq_remove_native(partial, names, 3);
+                bad++; continue;
+            }
+            ray_release(res);
+            if (!pq_synth_check(dir, rows, pq_synth_lowcard)) { fprintf(stderr, "  %d/%d: rows differ\n", v, run); bad++; }
+            if (pq_sym_count(dir) != words) { fprintf(stderr, "  %d/%d: %lld symbols, direct %lld\n", v, run, (long long)pq_sym_count(dir), (long long)words); bad++; }
+            bool s_direct = pq_trace_line_has(trace, "parquet symcol: col=s ", " mode=direct");
+            bool t_grouped = pq_trace_line_has(trace, "parquet symcol: col=t ", " mode=grouped");
+            int passes = 0;
+            double adopted = pq_trace_sum(trace, "adopted", &passes);
+            fprintf(stderr, "  %d/%d: s %s, t %s, grouped passes %d, adopted %.0f\n", v, run, s_direct ? "direct" : "grouped",
+                    t_grouped ? "grouped" : "direct", passes, adopted);
+            if (run < 2 ? !s_direct || !t_grouped || passes != 1 || adopted != 40 : s_direct || !t_grouped || passes != 2) bad++;
+            pq_remove_native(dir, names, 3);
+        }
+        unlink(src);
+    }
+    pq_synth_t = NULL; pq_synth_dict = 0;
+    ray_pool_destroy();
+    ray_sys_free(trace);
+    ray_release(types);
+    TEST_ASSERT_EQ_I(bad, 0);
+    PASS();
+#endif
 }
 
 /* The grouped import failing: out of memory in each of its steps (a debug
@@ -1378,7 +1533,7 @@ static bool pq_edge_check(const char* dir, int64_t rows, pq_synth_fn fn, const c
         if (nulls) nulls[c - 1] = (s->attrs & RAY_ATTR_HAS_NULLS) != 0;
         for (int64_t r = 0; ok && r < rows; r++) {
             uint32_t len = 0;
-            const char* want = fn(c == 1 ? r : r + rows / 2, buf, &len);
+            const char* want = pq_synth_row(fn, c, r, rows, buf, &len);
             if (!want) len = 0;
             ray_t* text = ray_sym_vec_cell(s, r);
             ok = text && ray_str_len(text) == len && (!len || !memcmp(ray_str_ptr(text), want, len));
@@ -1708,6 +1863,7 @@ const test_entry_t parquet_entries[] = {
     {"parquet/sym_grouped",test_pq_sym_grouped,pq_setup,pq_teardown},
     {"parquet/sym_grouped_collisions",test_pq_sym_grouped_collisions,pq_setup,pq_teardown},
     {"parquet/sym_grouped_layout",test_pq_sym_grouped_layout,pq_setup,pq_teardown},
+    {"parquet/sym_mixed_modes",test_pq_sym_mixed_modes,pq_setup,pq_teardown},
     {"parquet/sym_grouped_failures",test_pq_sym_grouped_failures,pq_setup,pq_teardown},
     {"parquet/dict_page_size",test_pq_dict_page_size,pq_setup,pq_teardown},
     {"parquet/import_no_growth",test_pq_import_no_growth,pq_setup,pq_teardown},

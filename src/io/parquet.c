@@ -1843,8 +1843,13 @@ static void pq_trade_buffers(pq_column* c, pq_column* spare) {
 
 /* Byte range of every column chunk — from its dictionary page (or first
  * data page) for total_compressed bytes — and each column's uncompressed
- * total.  False when a row group's metadata cannot be read. */
-static bool pq_chunk_ranges(ray_parquet_t* r, int64_t* lo, int64_t* hi, int64_t* col_bytes) {
+ * total.  `col_vocab` (may be NULL): each column's distinct strings'
+ * bytes, bounded from the footer alone: a chunk's dictionary page (its
+ * stored bytes), or the whole chunk where it has none or holds more than
+ * the dictionary's ids could take (at most 4 bytes and a level a value:
+ * the writer fell back to PLAIN pages).  False when a row group's metadata
+ * cannot be read. */
+static bool pq_chunk_ranges(ray_parquet_t* r, int64_t* lo, int64_t* hi, int64_t* col_bytes, int64_t* col_vocab) {
     pq_span* cols = ray_calloc_raw((size_t)r->ncols*sizeof(*cols));
     bool ok = cols != NULL;
     for (int64_t g = 0; ok && g < r->ngroups; g++) {
@@ -1857,6 +1862,12 @@ static bool pq_chunk_ranges(ray_parquet_t* r, int64_t* lo, int64_t* hi, int64_t*
             int64_t data = pq_get(mf[9],-1), dict = pq_get(mf[11],-1), bytes = pq_get(mf[7],-1);
             int64_t raw = pq_get(mf[6],-1), start = dict > 0 && dict < data ? dict : data;
             if (raw > 0) col_bytes[c] = raw > INT64_MAX - col_bytes[c] ? INT64_MAX : col_bytes[c] + raw;
+            if (col_vocab && raw > 0) {
+                int64_t values = pq_get(mf[5],-1), v = raw;
+                if (dict > 0 && dict < data && values >= 0 && values < INT64_MAX/8 && raw - (data-dict) <= values*5 + 4096)
+                    v = data-dict < raw ? data-dict : raw;
+                col_vocab[c] = v > INT64_MAX - col_vocab[c] ? INT64_MAX : col_vocab[c] + v;
+            }
             if (start < 0 || bytes < 0 || start > (int64_t)r->size || bytes > (int64_t)r->size - start) continue;
             lo[i] = start; hi[i] = start + bytes;
         }
@@ -2571,7 +2582,8 @@ static void pq_sym_grouped(pq_direct_work* dw, ray_symgrp_t* g, ray_symimp_t* im
     if (trace) { io0 = pq_io_now(); t0 = ray_profile_now_ns(); }
     w.ws = (pq_gscratch*)ray_sys_alloc((size_t)workers*sizeof(pq_gscratch));   /* zero-filled */
     w.nws = w.ws ? workers : 0;
-    if (!w.ws || !ray_symgrp_begin(g,tasks,groups,workers)) { dw->errors[0] = ray_error("oom",NULL); goto out; }
+    /* the strings earlier direct passes added, into the index first */
+    if (!w.ws || !ray_symgrp_adopt(g,w.hmask) || !ray_symgrp_begin(g,tasks,groups,workers)) { dw->errors[0] = ray_error("oom",NULL); goto out; }
     /* first decode */
     if (tasks > 0) {
         if (ray_pool_par_dispatch_ok(pool,tasks,2)) ray_pool_dispatch_n(pool,pq_g1_task,&w,(uint32_t)tasks);
@@ -2627,7 +2639,7 @@ static void pq_sym_grouped(pq_direct_work* dw, ray_symgrp_t* g, ray_symimp_t* im
         static const char* orders[] = {"rows","shards","freq","rowsflat"};
         fprintf(stderr,"parquet symgrp: col=%.*s order=%s groups=%d windows=%lld rows=%lld gens=%lld staged=%lld stage_mb=%.1f arena_mb=%.1f"
                 " owners=%lld again=%lld again_mb=%.1f old=%lld refs=%lld log_loaded=%lld budget_mb=%.0f store_cap_mb=%.0f store_pos=%lld store_spans=%lld store_mb=%.1f"
-                " store_read_mb=%.1f store_kept=%lld deferred=%lld settle_read_mb=%.1f compares=%lld cmp_mb=%.1f collisions=%lld redo=%lld entries=%lld rec_bytes=%lld wb_bytes=%lld\n",
+                " store_read_mb=%.1f store_kept=%lld deferred=%lld settle_read_mb=%.1f compares=%lld cmp_mb=%.1f collisions=%lld redo=%lld entries=%lld rec_bytes=%lld wb_bytes=%lld adopted=%lld\n",
                 (int)ray_str_len(nm),ray_str_ptr(nm),orders[ray_symgrp_order(g)],groups,(long long)st.windows,
                 (long long)atomic_load(&w.rows),(long long)atomic_load(&w.gens),(long long)st.staged,(double)st.stage_bytes/1048576.0,(double)arena/1048576.0,
                 (long long)st.owners,(long long)st.again,(double)st.again_bytes/1048576.0,(long long)st.old,(long long)st.refs,(long long)st.log_loaded,
@@ -2636,7 +2648,7 @@ static void pq_sym_grouped(pq_direct_work* dw, ray_symgrp_t* g, ray_symimp_t* im
                 (double)st.store_read/1048576.0,(long long)st.store_kept,
                 (long long)st.deferred,(double)st.settle_read/1048576.0,(long long)st.compares,(double)st.cmp_bytes/1048576.0,
                 (long long)st.collisions,(long long)st.redo,(long long)ray_symgrp_entries(g),
-                (long long)st.rec_bytes,(long long)st.wb_bytes);
+                (long long)st.rec_bytes,(long long)st.wb_bytes,(long long)st.adopted);
         fprintf(stderr,"parquet symgrp io:");
         pq_io_print("decode1",io0,io1,t0,t1);
         pq_io_print("resolve",io1,io2,t1,t2);
@@ -2684,6 +2696,7 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
     int64_t* lo = ray_alloc_raw((size_t)(chunks+1)*sizeof(*lo));
     int64_t* hi = ray_alloc_raw((size_t)(chunks+1)*sizeof(*hi));
     int64_t* bytes = ray_calloc_raw((size_t)r->ncols*sizeof(*bytes));
+    int64_t* vocab = ray_calloc_raw((size_t)r->ncols*sizeof(*vocab));   /* pq_chunk_ranges */
     int64_t* order = ray_alloc_raw((size_t)r->ncols*sizeof(*order));
     _Atomic uint8_t* prefetched = NULL;
     pq_column* spare = NULL;   /* pq_direct_work.spare */
@@ -2694,7 +2707,7 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
     pq_symflush_t symf = {NULL,false,(int)RAY_OK};
     ray_thread_t sym_thread = 0;
     bool sym_running = false;
-    if (!offsets || !nulls || !locks || !errors || !lo || !hi || !bytes || !order) { err = ray_error("oom",NULL); goto done; }
+    if (!offsets || !nulls || !locks || !errors || !lo || !hi || !bytes || !vocab || !order) { err = ray_error("oom",NULL); goto done; }
     for (int64_t c = 0; c < r->ncols; c++) {
         size_t size = writers[c].type == RAY_SYM ? 4 : ray_elem_size(writers[c].type);
         if (r->rows > (INT64_MAX-32)/(int64_t)size) { err = pq_error("native column exceeds file offset range"); goto done; }
@@ -2707,7 +2720,7 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
         if (!pq_fields(r->groups[g],fields,8)) { err = pq_error("invalid row group"); goto done; }
         offsets[g+1] = offsets[g]+pq_get(fields[3],0);
     }
-    bool ranges = pq_chunk_ranges(r,lo,hi,bytes);
+    bool ranges = pq_chunk_ranges(r,lo,hi,bytes,vocab);
     /* numeric columns in schema order, then symbol columns by size */
     int64_t nnum = 0, n = 0;
     for (int64_t c = 0; c < r->ncols; c++) if (writers[c].type != RAY_SYM) order[n++] = c;
@@ -2777,21 +2790,62 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
     /* The symbol columns go direct (each string probes the import
      * dictionary) unless their strings would make it too big to probe at
      * random: then grouped (table/symgrp.h), column by column.  Decided from
-     * their chunks' uncompressed bytes against a quarter of memory;
-     * RAY_PQ_SYM_MODE=direct|grouped decides instead, and RAY_PQ_SYM_ORDER
-     * (rows|shards|freq|rowsflat) and RAY_PQ_SYM_GROUPS set the grouped import's
-     * order of new positions and hash groups. */
+     * their chunks' uncompressed bytes against a quarter of memory, and
+     * then column by column: a column whose vocabulary (pq_chunk_ranges'
+     * bound) is a small share of memory still goes direct, decoded once,
+     * smallest first while those columns' vocabularies stay within a
+     * sixteenth together.  The direct columns go first (the dictionary's
+     * index serves only them), the grouped ones after them, which take
+     * the direct ones' strings into their own index (ray_symgrp_adopt).
+     * RAY_PQ_SYM_MODE=direct|grouped decides for every column instead, and
+     * RAY_PQ_SYM_ORDER (rows|shards|freq|rowsflat) and RAY_PQ_SYM_GROUPS set
+     * the grouped import's order of new positions and hash groups.  Debug
+     * builds: RAY_PQ_SYM_RAM sets the memory these decisions assume. */
     pq_sym_mode mode = PQ_SYM_AUTO;
     {
         const char* e = getenv("RAY_PQ_SYM_MODE");
         if (e && !strcmp(e,"direct")) mode = PQ_SYM_DIRECT;
         else if (e && !strcmp(e,"grouped")) mode = PQ_SYM_GROUPED;
     }
+    int64_t sram = ram;
+#if defined(DEBUG)
+    {
+        const char* e = getenv("RAY_PQ_SYM_RAM");
+        if (e && *e && strtoll(e,NULL,10) > 0) sram = strtoll(e,NULL,10);
+    }
+#endif
     simp = nnum < r->ncols ? ray_sym_domain_import(writers[order[nnum]].dom) : NULL;
+    int64_t nd = r->ncols;   /* order[nnum, nd): direct symbol columns, [nd, ncols): grouped */
     if (mode == PQ_SYM_AUTO && simp) {
         int64_t text = 0;
         for (int64_t i = nnum; i < r->ncols; i++) text = bytes[order[i]] > INT64_MAX - text ? INT64_MAX : text + bytes[order[i]];
-        mode = ram > 0 && text > ram / 4 ? PQ_SYM_GROUPED : PQ_SYM_DIRECT;
+        mode = sram > 0 && text > sram / 4 ? PQ_SYM_GROUPED : PQ_SYM_DIRECT;
+        if (mode == PQ_SYM_GROUPED) {
+            /* the direct ones, marked by a negated vocabulary */
+            int64_t sum = 0, ndirect = 0;
+            for (;;) {
+                int64_t best = -1;
+                for (int64_t i = nnum; i < r->ncols; i++) {
+                    int64_t c = order[i];
+                    if (vocab[c] >= 0 && (best < 0 || vocab[c] < vocab[best])) best = c;
+                }
+                if (best < 0 || vocab[best] > sram / 64 || vocab[best] > sram / 16 - sum) break;
+                sum += vocab[best]; vocab[best] = -1 - vocab[best]; ndirect++;
+            }
+            if (ndirect == r->ncols - nnum) mode = PQ_SYM_DIRECT;
+            else {
+                /* direct first, each part by size as before (a stable split) */
+                int64_t at = nnum;
+                for (int64_t i = nnum; i < r->ncols; i++) {
+                    int64_t c = order[i];
+                    if (vocab[c] >= 0) continue;
+                    for (int64_t j = i; j > at; j--) order[j] = order[j-1];
+                    order[at++] = c;
+                }
+                nd = at;
+            }
+            for (int64_t i = nnum; i < r->ncols; i++) if (vocab[order[i]] < 0) vocab[order[i]] = -1 - vocab[order[i]];
+        }
     }
     if (mode == PQ_SYM_GROUPED && simp) {
         ray_symgrp_order_t so = RAY_SYMGRP_ROWS;
@@ -2801,8 +2855,15 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
         else if (e && !strcmp(e,"rowsflat")) so = RAY_SYMGRP_ROWS_FLAT;
         sgrp = ray_symgrp_new(simp,so);
         if (!sgrp) { err = ray_error("oom",NULL); goto done; }
-        sym_width = 1;
-    }
+        if (nd == r->ncols) nd = nnum;   /* forced: every symbol column grouped */
+    } else nd = r->ncols;
+    if (trace && simp)
+        for (int64_t i = nnum; i < r->ncols; i++) {
+            ray_t* nm = ray_sym_str(r->schema[order[i]].name);
+            fprintf(stderr,"parquet symcol: col=%.*s text_mb=%.3f vocab_mb=%.3f mode=%s\n",
+                    (int)ray_str_len(nm),ray_str_ptr(nm),(double)bytes[order[i]]/1048576.0,
+                    (double)vocab[order[i]]/1048576.0,i < nd ? "direct" : "grouped");
+        }
     if (!sgrp && nnum < r->ncols && writers[order[nnum]].dom) {
         symf.dom = writers[order[nnum]].dom;
         if (ray_thread_create(&sym_thread,pq_symflush_fn,&symf) == RAY_OK) sym_running = true;
@@ -2811,13 +2872,13 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
     if (trace && symf.dom) ray_sym_domain_import_stats(symf.dom,&ist);
     bool all = !colwise && !sgrp;
     for (int64_t p = 0; p < r->ncols && !err; p += work.npass) {
-        int64_t wd = all ? r->ncols : p < nnum ? width : sym_width;
-        int64_t lim = all ? r->ncols : p < nnum ? nnum : r->ncols;
+        int64_t wd = all ? r->ncols : p < nnum ? width : p < nd ? sym_width : 1;
+        int64_t lim = all ? r->ncols : p < nnum ? nnum : p < nd ? nd : r->ncols;
         work.pass = order + p;
         work.npass = lim - p < wd ? lim - p : wd;
         int64_t tasks = r->ngroups*work.npass;
         int64_t t0 = trace ? ray_profile_now_ns() : 0, t1 = 0;
-        if (sgrp && p >= nnum) {
+        if (sgrp && p >= nd) {
             /* memory for the pass: what is left under the anon watermark */
             int64_t wm = ray_heap_anon_watermark();
             int64_t budget = wm > 0 ? wm - ray_heap_anon_committed() : (int64_t)1 << 30;
@@ -2898,7 +2959,7 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
 done:
     for (int64_t c = 0; c < r->ncols; c++) r->schema[c].import_domain = NULL;
     ray_free_raw(offsets); ray_free_raw(nulls); ray_free_raw(locks); ray_free_raw(errors);
-    ray_free_raw(lo); ray_free_raw(hi); ray_free_raw(bytes); ray_free_raw(order);
+    ray_free_raw(lo); ray_free_raw(hi); ray_free_raw(bytes); ray_free_raw(vocab); ray_free_raw(order);
     if (prefetched) ray_free_raw((void*)prefetched);
     for (int64_t i = 0; i < nspare; i++) {
         ray_free_raw(spare[i].page); ray_free_raw(spare[i].dict); ray_free_raw(spare[i].symbols);

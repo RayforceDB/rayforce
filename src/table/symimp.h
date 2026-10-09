@@ -97,6 +97,9 @@ void ray_symimp_writeback(ray_symimp_t* m, int64_t off, int64_t len);
  * and the offset of its length prefix. */
 const char* ray_symimp_get(const ray_symimp_t* m, int64_t pos, uint32_t* len);
 int64_t ray_symimp_offset(const ray_symimp_t* m, int64_t pos);
+/* Entries (positions) the file holds, the records written of all but those
+ * reserved and not yet put. */
+int64_t ray_symimp_count(const ray_symimp_t* m);
 /* Ask for file bytes [off, off + len) to be read ahead (MADV_WILLNEED). */
 void ray_symimp_willneed(const ray_symimp_t* m, int64_t off, int64_t len);
 

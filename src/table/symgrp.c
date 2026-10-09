@@ -23,6 +23,7 @@
 
 #include "symgrp.h"
 #include "symimp.h"
+#include "ops/hash.h"
 
 #if defined(RAY_OS_LINUX) || defined(RAY_OS_MACOS) || defined(__linux__) || defined(__APPLE__)
 
@@ -151,6 +152,7 @@ struct ray_symgrp_s {
     pthread_mutex_t    lock;              /* sg_collide */
     sg_list_t          logs[RAY_SYMGRP_MAX];
     int64_t            entries;
+    int64_t            known;             /* positions below it in the logs (or 0, ""): ray_symgrp_adopt */
     /* the pass */
     int                lg;                /* log2 of the groups */
     int64_t            ntasks, workers;
@@ -461,6 +463,7 @@ bool ray_symgrp_resolve(ray_symgrp_t* g) {
     for (int64_t t = 0; t < g->ntasks; t++) bytes += g->tasks[t].bytes;
     g->nown = nown; g->st.owners += nown;
     if (ok && nown) ok = ray_symimp_reserve(g->imp, nown, bytes, &g->pos0, &g->off0);
+    if (ok && nown) g->known = g->pos0 + nown;   /* indexed below, ROWS* or not */
     if (ok && nown) g->st.rec_bytes += bytes;
     if (ok && sg_rows(g)) {
         /* positions by task, then by local id: the strings later tasks meet
@@ -700,6 +703,31 @@ static void sg_ra_at(const ray_symimp_t* imp, sg_ra_t* ra, int64_t off, int64_t*
     }
 }
 
+/* The import dictionary's strings the logs do not hold (those direct
+ * passes interned before the first grouped one) into the logs: read once,
+ * in file order, and hashed as the grouped passes hash them. */
+bool ray_symgrp_adopt(ray_symgrp_t* g, uint64_t hmask) {
+    int64_t count = ray_symimp_count(g->imp), from = g->known > 1 ? g->known : 1;
+    if (count <= from) { if (count > g->known) g->known = count; return true; }
+    sg_ra_t ra = {0};
+    int64_t spans = 0, read = 0;
+    bool ok = sg_ra_add(&ra, ray_symimp_offset(g->imp, from), ray_symimp_offset(g->imp, count - 1) + 4, &spans) &&
+              sg_ra_end(&ra);
+    for (int64_t pos = from; ok && pos < count; pos++) {
+        sg_ra_at(g->imp, &ra, ray_symimp_offset(g->imp, pos), &read);
+        uint32_t len;
+        const char* s = ray_symimp_get(g->imp, pos, &len);
+        uint64_t h = ray_hash_bytes(s, len) & hmask;
+        sg_ent_t* x = (sg_ent_t*)sg_push(&g->logs[sg_log(h)], sizeof(sg_ent_t));
+        if (!x) { ok = false; break; }
+        *x = (sg_ent_t){h, len, (uint32_t)pos};
+        g->entries++;
+    }
+    ray_sys_free(ra.p);
+    if (ok) { g->st.adopted += count - from; g->known = count; }
+    return ok;
+}
+
 /* The records the window's candidates point at from before it: positions
  * (with the candidates' lengths, which their records share) sorted; those
  * the previous window loaded too are copied from it (a string common in the
@@ -834,7 +862,7 @@ static int64_t sg_collide(ray_symgrp_t* g, uint64_t h, const char* s, uint32_t l
             g->chi = o0 + 4 + (int64_t)len;
             g->st.rec_bytes += 4 + (int64_t)len;
             *x = (sg_ent_t){h, len, (uint32_t)p0};
-            g->entries++;
+            g->entries++; g->known = p0 + 1;
             pos = p0;
         }
     }
@@ -949,6 +977,7 @@ ray_symgrp_order_t ray_symgrp_order(const ray_symgrp_t* g) { return g->order; }
 ray_symgrp_t* ray_symgrp_new(struct ray_symimp_s* imp, ray_symgrp_order_t order) { (void)imp; (void)order; return NULL; }
 void ray_symgrp_free(ray_symgrp_t* g) { (void)g; }
 bool ray_symgrp_begin(ray_symgrp_t* g, int64_t ntasks, int groups, int64_t workers) { (void)g; (void)ntasks; (void)groups; (void)workers; return false; }
+bool ray_symgrp_adopt(ray_symgrp_t* g, uint64_t hmask) { (void)g; (void)hmask; return false; }
 bool ray_symgrp_stage(ray_symgrp_t* g, int64_t t, int64_t n, const ray_symgrp_fp_t* fp, const uint32_t* counts) { (void)g; (void)t; (void)n; (void)fp; (void)counts; return false; }
 bool ray_symgrp_resolve(ray_symgrp_t* g) { (void)g; return false; }
 int64_t ray_symgrp_task_size(const ray_symgrp_t* g, int64_t t) { (void)g; (void)t; return 0; }
