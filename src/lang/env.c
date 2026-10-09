@@ -187,6 +187,7 @@ ray_t* ray_env_capture_locals(void) {
     for (int32_t d = 0; d < __VM->scope_depth; d++)
         capacity += __VM->scope_stack[d].count;
     if (capacity == 0) return NULL;
+    capacity += 1;   /* room for the provenance entry appended below */
 
     ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, capacity);
     ray_t* vals = ray_list_new(capacity);

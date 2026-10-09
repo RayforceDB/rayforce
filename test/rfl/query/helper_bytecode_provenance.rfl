@@ -193,3 +193,18 @@ OUT -- ['p 'q 'r 'a 'b 'c]
 (at (select {r: (hy s) e: (reverse x) from: T}) 'r) -- ['a! 'b! 'c!]
 (at (select {r: ((fn [v] 1 (concat (ht v) "!")) s) e: (reverse x) from: T}) 'r) -- ['a! 'b! 'c!]
 (key (select {by: (dbl x) from: T})) -- ['x 's]
+;; A closure created inside a query while several row bindings are live:
+;; its capture holds every binding plus their provenance.
+(set TC (table [x s] (list [1 2 3 4] ['a 'b 'c 'd])))
+(at (select {v: ((fn [a] (let b 1) (let c 2) (let d 3) ((fn [z] (concat z (if (> b 0) "!" "?"))) a)) s) e: (reverse x) from: TC}) 'v) -- ['a! 'b! 'c! 'd!]
+(at (select {v: ((fn [a] (let b 1) (let c 2) (let d 3) (let e 4) (let f 5) (let g 6) (let h 7) (let i 8) (let j 9) (let k 10) (let l 11) ((fn [z] (concat z (if (> l 0) "!" "?"))) a)) s) e: (reverse x) from: TC}) 'v) -- ['a! 'b! 'c! 'd!]
+;; A filtered COUNT over a nullable column counts the kept rows, with or
+;; without a computed input.
+(set TN (table [k x s] (list [0 0 1 1 2] [1 2 3 4 5] (as 'SYM ["a" "" "c" "" "e"]))))
+(at (select {n: (count s) by: k from: TN where: (> x 1) asc: k}) 'n) -- [1 2 1]
+(at (select {n: (count (upper s)) by: k from: TN where: (> x 1) asc: k}) 'n) -- [1 2 1]
+;; A closure created directly in a per-row expression with exactly four
+;; live cells (no call frame in between): the capture must have room for
+;; its provenance entry.
+(set T4C (table [a b c d] (list ['p 'q] ['r 's] ['t 'u] ['v 'w])))
+(at (select {v: (at (map (fn [z] (concat z "!")) (list a b c d)) 0) e: (reverse a) from: T4C}) 'v) -- ['p! 'q!]
