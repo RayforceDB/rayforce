@@ -86,6 +86,10 @@ void ray_symimp_stats(ray_symimp_t* m, ray_symimp_stats_t* out);
  * ray_symimp_intern_batch fails: its shard tables miss these records. */
 bool ray_symimp_reserve(ray_symimp_t* m, int64_t n, int64_t bytes, int64_t* pos0, int64_t* off0);
 void ray_symimp_put(ray_symimp_t* m, int64_t pos, int64_t off, const char* s, uint32_t len);
+/* Or written by the caller with ray_symimp_write (pwrite: no page of the
+ * mapping is faulted in for it), its offset noted with ray_symimp_place. */
+void ray_symimp_place(ray_symimp_t* m, int64_t pos, int64_t off);
+bool ray_symimp_write(ray_symimp_t* m, int64_t off, const void* buf, size_t n);
 /* Record `pos` of the file, written: its bytes (in the mapping) and length,
  * and the offset of its length prefix. */
 const char* ray_symimp_get(const ray_symimp_t* m, int64_t pos, uint32_t* len);

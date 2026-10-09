@@ -869,7 +869,7 @@ static test_result_t test_pq_sym_grouped(void) {
     int64_t tids[] = {ray_sym_intern("I32",3), ray_sym_intern("SYM",3), ray_sym_intern("SYM",3)};
     ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 3);
     const char* names[] = {"x","s","t"};
-    const char* orders[] = {"rows","shards","freq"};
+    const char* orders[] = {"rows","shards","freq","rowsflat"};
     char dir[160], ref[160], a[200], b[200];
     snprintf(dir, sizeof(dir), "/tmp/rayforce-pq-sg-direct-%d", (int)getpid());
     pq_set_symmode("direct");
@@ -882,7 +882,7 @@ static test_result_t test_pq_sym_grouped(void) {
     pq_remove_native(dir, names, 3);
     pq_set_env("RAY_PQ_SYM_GROUPS", "4");
     pq_set_env("RAY_PQ_SYM_WINDOW", "4096");   /* debug builds: several windows */
-    for (int o = 0; o < 3; o++) {
+    for (int o = 0; o < 4; o++) {
         pq_set_env("RAY_PQ_SYM_ORDER", orders[o]);
         snprintf(ref, sizeof(ref), "/tmp/rayforce-pq-sg-%d-%d-1", (int)getpid(), o);
         for (int cores = 1; cores <= 8; cores *= 2) {
@@ -933,7 +933,7 @@ static test_result_t test_pq_sym_grouped_collisions(void) {
     int64_t tids[] = {ray_sym_intern("I32",3), ray_sym_intern("SYM",3), ray_sym_intern("SYM",3)};
     ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 3);
     const char* names[] = {"x","s","t"};
-    const char* orders[] = {"rows","shards","freq"};
+    const char* orders[] = {"rows","shards","freq","rowsflat"};
     snprintf(dir, sizeof(dir), "/tmp/rayforce-pq-coll-%d", (int)getpid());
     ray_t* res = ray_parquet_splayed_typed(mix, dir, types);   /* direct */
     TEST_ASSERT_FALSE(RAY_IS_ERR(res)); ray_release(res);
@@ -942,9 +942,9 @@ static test_result_t test_pq_sym_grouped_collisions(void) {
     pq_set_env("RAY_PQ_SYM_ARENA", "200");
     /* one window (candidates of other tasks deferred, mismatches redone)
      * or a window a task (candidates compared with records read before) */
-    for (int run = 0; run < 12; run++) {
-            int o = run % 3, cores = run & 4 ? 4 : 1;
-            pq_set_env("RAY_PQ_SYM_WINDOW", run >= 6 ? "64" : NULL);
+    for (int run = 0; run < 16; run++) {
+            int o = run % 4, cores = run & 4 ? 4 : 1;
+            pq_set_env("RAY_PQ_SYM_WINDOW", run >= 8 ? "64" : NULL);
             ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(cores), RAY_OK);
             pq_set_env("RAY_PQ_SYM_ORDER", orders[o]);
             pq_set_env("RAY_PQ_SYM_HASH_BITS", "0");
@@ -968,6 +968,98 @@ static test_result_t test_pq_sym_grouped_collisions(void) {
     ray_release(types); unlink(src); unlink(mix);
     PASS();
 #endif
+}
+
+/* Strings as a column of addresses has them: half the rows a string of
+ * their own, the rest drawn from a few heavy hitters and a long tail
+ * (k uniform below m, m uniform in 1..4000), 20 to 119 bytes. */
+static const char* pq_synth_zipf(int64_t r, char* buf, uint32_t* len) {
+    uint64_t x = (uint64_t)r * UINT64_C(0x9E3779B97F4A7C15);
+    x ^= x >> 29; x *= UINT64_C(0xBF58476D1CE4E5B9); x ^= x >> 32;
+    uint64_t key = x & 1 ? (uint64_t)r : (x >> 1) % (1 + (x >> 40) % 4000);
+    int n = snprintf(buf, 256, "%c%llu/", x & 1 ? 'u' : 'z', (unsigned long long)key);
+    int want = 20 + (int)((key * 7919) % 100);
+    if (n < want) { memset(buf + n, 'p', (size_t)(want - n)); n = want; }
+    *len = (uint32_t)n;
+    return buf;
+}
+/* The positions the grouped import gives a pass's new strings: under
+ * "rows" first the strings a later row group meets again, then the others,
+ * each part in first-occurrence order; under "rowsflat" all of them in
+ * first-occurrence order.  On one worker and four, over several windows
+ * (debug builds), the vocabulary the direct import's. */
+static test_result_t test_pq_sym_grouped_layout(void) {
+    pq_sym_env_clear();
+    char src[160], dir[160], sym[200];
+    snprintf(src, sizeof(src), "/tmp/rayforce-pq-zipf-%d.parquet", (int)getpid());
+    snprintf(dir, sizeof(dir), "/tmp/rayforce-pq-layout-%d", (int)getpid());
+    snprintf(sym, sizeof(sym), "%s/.sym", dir);
+    const int64_t rows = 24000, groups = 12;
+    TEST_ASSERT_TRUE(pq_synth(src, rows, groups, pq_synth_zipf));
+    int64_t tids[] = {ray_sym_intern("I32",3), ray_sym_intern("SYM",3), ray_sym_intern("SYM",3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 3);
+    const char* names[] = {"x","s","t"};
+    ray_t* res = ray_parquet_splayed_typed(src, dir, types);   /* direct */
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res)); ray_release(res);
+    int64_t words = pq_sym_count(dir);
+    pq_remove_native(dir, names, 3);
+    pq_set_env("RAY_PQ_SYM_WINDOW", "16384");
+    for (int run = 0; run < 4; run++) {
+        bool split = run < 2;
+        ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(run & 1 ? 4 : 1), RAY_OK);
+        pq_set_env("RAY_PQ_SYM_ORDER", split ? "rows" : "rowsflat");
+        pq_set_env("RAY_PQ_SYM_GROUPS", run & 1 ? "64" : NULL);   /* a group table over and over */
+        pq_set_symmode("grouped");
+        res = ray_parquet_splayed_typed(src, dir, types);
+        pq_set_symmode(NULL);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(res)); ray_release(res);
+        TEST_ASSERT_TRUE(pq_synth_check(dir, rows, pq_synth_zipf));
+        TEST_ASSERT_EQ_I(pq_sym_count(dir), words);
+        /* the column of the first pass (the smaller chunks), the one whose
+         * strings hold positions 1 to their count: their first row and
+         * whether a later row group has them too, by position */
+        ray_t* t = ray_read_splayed(dir, sym);
+        TEST_ASSERT_FALSE(!t || RAY_IS_ERR(t));
+        int64_t* first = (int64_t*)ray_sys_alloc((size_t)words * sizeof(int64_t));
+        uint8_t* again = (uint8_t*)ray_sys_alloc((size_t)words);
+        TEST_ASSERT_TRUE(first && again);
+        int64_t met = 0, others = 0, passes = 0;
+        bool order = true, parted = true;
+        for (int c = 1; c < 3; c++) {
+            ray_t* s = ray_table_get_col_idx(t, c);
+            int64_t distinct = 0, run1 = 0;
+            for (int64_t p = 0; p < words; p++) { first[p] = -1; again[p] = 0; }
+            for (int64_t r = 0; r < rows; r++) {
+                int64_t p = ray_read_sym(ray_data(s), r, RAY_SYM, s->attrs);
+                if (p <= 0 || p >= words) continue;
+                if (first[p] < 0) { first[p] = r; distinct++; }
+                else if (first[p] * groups / rows != r * groups / rows) again[p] = 1;
+            }
+            while (run1 + 1 < words && first[run1 + 1] >= 0) run1++;
+            if (run1 != distinct) continue;
+            passes++;
+            int64_t last[2] = {-1, -1};
+            for (int64_t p = 1; p <= run1; p++) {
+                int a = split ? again[p] : 0;
+                if (first[p] < last[a]) order = false;
+                last[a] = first[p];
+                if (again[p]) met++; else others++;
+                if (split && again[p] && others) parted = false;
+            }
+        }
+        ray_sys_free(first); ray_sys_free(again);
+        ray_release(t);
+        TEST_ASSERT_EQ_I(passes, 1);
+        TEST_ASSERT_TRUE(met > 100 && others > 100);
+        TEST_ASSERT_TRUE(order);
+        TEST_ASSERT_TRUE(parted);
+        pq_remove_native(dir, names, 3);
+        ray_pool_destroy();
+    }
+    pq_set_env("RAY_PQ_SYM_ORDER", NULL); pq_set_env("RAY_PQ_SYM_WINDOW", NULL);
+    pq_set_env("RAY_PQ_SYM_GROUPS", NULL);
+    ray_release(types); unlink(src);
+    PASS();
 }
 
 /* The grouped import failing: out of memory in each of its steps (a debug
@@ -1182,6 +1274,7 @@ const test_entry_t parquet_entries[] = {
     {"parquet/group_native",test_pq_group_native,pq_setup,pq_teardown},
     {"parquet/sym_grouped",test_pq_sym_grouped,pq_setup,pq_teardown},
     {"parquet/sym_grouped_collisions",test_pq_sym_grouped_collisions,pq_setup,pq_teardown},
+    {"parquet/sym_grouped_layout",test_pq_sym_grouped_layout,pq_setup,pq_teardown},
     {"parquet/sym_grouped_failures",test_pq_sym_grouped_failures,pq_setup,pq_teardown},
     {"parquet/dict_page_size",test_pq_dict_page_size,pq_setup,pq_teardown},
     {"parquet/import_no_growth",test_pq_import_no_growth,pq_setup,pq_teardown},

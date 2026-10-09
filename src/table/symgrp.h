@@ -66,9 +66,14 @@ typedef struct ray_symgrp_s ray_symgrp_t;
 
 /* The order a pass's new strings take positions in. */
 typedef enum {
-    RAY_SYMGRP_ROWS   = 0,   /* first occurrence: task by task, each in its rows' order */
+    RAY_SYMGRP_ROWS   = 0,   /* first occurrence, the strings later tasks meet
+                              * again first: those, task by task in their rows'
+                              * order, then the others the same way (the
+                              * records a later window compares with lie
+                              * together, not spread over the pass's) */
     RAY_SYMGRP_SHARDS = 1,   /* hash group, then task, then first occurrence */
     RAY_SYMGRP_FREQ   = 2,   /* most rows first; ties by first occurrence */
+    RAY_SYMGRP_ROWS_FLAT = 3,/* first occurrence: task by task, each in its rows' order */
 } ray_symgrp_order_t;
 
 /* A task-distinct string as step 1 saw it; local ids count from 1 (0 is the
@@ -81,14 +86,18 @@ typedef struct {
     uint32_t pos;     /* the position; for OLD and REF until the bytes are compared */
     uint32_t kind;
     uint32_t owner;   /* REF: the task whose NEW string it is */
-    int64_t  off;     /* NEW: its record's file offset (-1 under ROWS: the
-                       * task's records follow one another from
-                       * ray_symgrp_task_off, in local id order) */
+    uint32_t again;   /* NEW under ROWS: a later task meets it too */
+    int64_t  off;     /* NEW: its record's file offset (-1 under ROWS and
+                       * ROWS_FLAT: the task's records follow one another,
+                       * in local id order, from ray_symgrp_task_off of
+                       * `again`) */
 } ray_symgrp_res_t;
 
 typedef struct {
     int64_t staged, groups, log_loaded, owners, old, refs;
+    int64_t again, again_bytes;                    /* ROWS: new strings later tasks meet */
     int64_t store_pos, store_spans, store_bytes;   /* records read from the file */
+    int64_t store_read, settle_read;                /* bytes asked of the file for them */
     int64_t store_kept, windows;                    /* records kept from the window before */
     int64_t deferred, compares, cmp_bytes, collisions, redo;
 } ray_symgrp_stats_t;
@@ -111,8 +120,9 @@ bool ray_symgrp_resolve(ray_symgrp_t* g);
 /* Step 3: task t's verdicts, res[local] for local ids 1..n (n as staged). */
 int64_t ray_symgrp_task_size(const ray_symgrp_t* g, int64_t t);
 bool ray_symgrp_task(const ray_symgrp_t* g, int64_t t, ray_symgrp_res_t* res);
-/* RAY_SYMGRP_ROWS: the file offset of task t's first new record. */
-int64_t ray_symgrp_task_off(const ray_symgrp_t* g, int64_t t);
+/* RAY_SYMGRP_ROWS, ROWS_FLAT: the file offset of task t's first new record,
+ * of those later tasks meet again (`again`) or of the others. */
+int64_t ray_symgrp_task_off(const ray_symgrp_t* g, int64_t t, bool again);
 /* The window of tasks [ta, return value) whose candidates' records stay
  * within `budget` bytes (one task at least). */
 int64_t ray_symgrp_window(const ray_symgrp_t* g, int64_t ta, int64_t budget);

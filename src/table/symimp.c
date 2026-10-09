@@ -341,6 +341,21 @@ void ray_symimp_put(ray_symimp_t* m, int64_t pos, int64_t off, const char* s, ui
     m->offc[pos >> SI_OFF_LOG][pos & ((1 << SI_OFF_LOG) - 1)] = (uint64_t)off;
 }
 
+void ray_symimp_place(ray_symimp_t* m, int64_t pos, int64_t off) {
+    m->offc[pos >> SI_OFF_LOG][pos & ((1 << SI_OFF_LOG) - 1)] = (uint64_t)off;
+}
+
+bool ray_symimp_write(ray_symimp_t* m, int64_t off, const void* buf, size_t n) {
+    const char* p = (const char*)buf;
+    while (n) {
+        ssize_t w = pwrite(m->fd, p, n, (off_t)off);
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) return false;
+        p += w; off += w; n -= (size_t)w;
+    }
+    return true;
+}
+
 int64_t ray_symimp_offset(const ray_symimp_t* m, int64_t pos) {
     return (int64_t)si_off(m, pos);
 }
@@ -487,6 +502,8 @@ bool ray_symimp_reserve(ray_symimp_t* m, int64_t n, int64_t bytes, int64_t* pos0
 void ray_symimp_put(ray_symimp_t* m, int64_t pos, int64_t off, const char* s, uint32_t len) {
     (void)m; (void)pos; (void)off; (void)s; (void)len;
 }
+void ray_symimp_place(ray_symimp_t* m, int64_t pos, int64_t off) { (void)m; (void)pos; (void)off; }
+bool ray_symimp_write(ray_symimp_t* m, int64_t off, const void* buf, size_t n) { (void)m; (void)off; (void)buf; (void)n; return false; }
 int64_t ray_symimp_offset(const ray_symimp_t* m, int64_t pos) { (void)m; (void)pos; return -1; }
 const char* ray_symimp_get(const ray_symimp_t* m, int64_t pos, uint32_t* len) { (void)m; (void)pos; *len = 0; return NULL; }
 void ray_symimp_willneed(const ray_symimp_t* m, int64_t off, int64_t len) { (void)m; (void)off; (void)len; }
