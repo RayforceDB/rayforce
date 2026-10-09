@@ -1413,16 +1413,25 @@ ray_err_t ray_splay_hash_column(const char* path, ray_t* zone) {
     if (!col || RAY_IS_ERR(col)) { if (col) ray_error_free(col); return RAY_ERR_IO; }
     ray_err_t err = RAY_ERR_IO;
     int64_t t1 = trace ? ray_profile_now_ns() : 0;
+    ray_hash_trace_t ht;
+    memset(&ht, 0, sizeof(ht));
+    if (trace) ray_index_hash_trace(&ht);
     ray_t* hi = ray_idx_hash_fn(col);
+    ray_index_hash_trace(NULL);
     int64_t t2 = trace ? ray_profile_now_ns() : 0;
     if (hi && !RAY_IS_ERR(hi) && (hi->attrs & RAY_ATTR_HAS_INDEX)) {
+        ray_hash_mark_t tm = trace ? ray_hash_trace_mark() : (ray_hash_mark_t){0};
         err = ray_col_append_index(path, ray_index_payload(hi->index), hi->len, hi->type);
         if (trace) {
             const ray_index_t* hx = ray_index_payload(hi->index);
+            /* the region is read from the built arrays and written to the file */
+            ray_hash_trace_add(&ht, RAY_HXT_APPEND, tm, 2 * ray_index_inline_size(hx));
             fprintf(stderr, "splayed hash: file=%s rows=%" PRId64 " keys=%" PRId64 " groups=%" PRId64
                             " mmap=%.1fms build=%.1fms write=%.1fms\n",
                     path, hi->len, hx->u.hash.n_keys, hx->u.hash.n_groups,
                     (double)(t1 - t0) / 1e6, (double)(t2 - t1) / 1e6, (double)(ray_profile_now_ns() - t2) / 1e6);
+            ray_hash_trace_print(stderr, "splayed hash io", &ht,
+                                 hi->len * (int64_t)ray_sym_elem_size(hi->type, hi->attrs));
         }
         ray_release(hi);
     } else if (hi) {

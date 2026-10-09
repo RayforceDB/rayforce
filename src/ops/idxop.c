@@ -37,6 +37,9 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#if defined(__linux__)
+#include <sys/resource.h>   /* getrusage: the hash build trace */
+#endif
 
 /* ── Routing observability counters (diagnostic, unsynchronized) ── */
 uint64_t ray_idx_consults[IDX_SITE__N];
@@ -1616,6 +1619,57 @@ ray_t* ray_index_inline_map(uint8_t* region, int64_t region_size) {
  * rows[offs[gid]..offs[gid+1]).
  * -------------------------------------------------------------------------- */
 
+/* ── Hash-index build trace ── */
+ray_hash_mark_t ray_hash_trace_mark(void) {
+    ray_hash_mark_t m = { ray_profile_now_ns(), 0, 0, 0 };
+#if defined(__linux__)
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) == 0) m.majflt = ru.ru_majflt;
+    FILE* f = fopen("/proc/self/io", "r");
+    if (f) {
+        char line[128];
+        while (fgets(line, sizeof(line), f)) {
+            long long x;
+            if (sscanf(line, "read_bytes: %lld", &x) == 1) m.rd = x;
+            else if (sscanf(line, "write_bytes: %lld", &x) == 1) m.wr = x;
+        }
+        fclose(f);
+    }
+#endif
+    return m;
+}
+
+void ray_hash_trace_add(ray_hash_trace_t* t, int ph, ray_hash_mark_t since, int64_t moved) {
+    if (!t || ph < 0 || ph >= RAY_HXT_N) return;
+    ray_hash_mark_t now = ray_hash_trace_mark();
+    t->ns[ph] += now.ns - since.ns;
+    t->majflt[ph] += now.majflt - since.majflt;
+    t->rd[ph] += now.rd - since.rd;
+    t->wr[ph] += now.wr - since.wr;
+    t->moved[ph] += moved;
+}
+
+void ray_hash_trace_print(FILE* f, const char* what, const ray_hash_trace_t* t, int64_t col_bytes) {
+    static const char* names[RAY_HXT_N] = {
+        "copy", "count", "bucket", "distinct", "groups", "table", "append" };
+    int64_t moved = 0;
+    fprintf(f, "%s:", what);
+    for (int p = 0; p < RAY_HXT_N; p++) {
+        if (!t->ns[p] && !t->moved[p]) continue;
+        moved += t->moved[p];
+        fprintf(f, " %s=%.1fms/%lldflt/%.1fMBr/%.1fMBw/moved=%.1fMB(%.2fx)", names[p],
+                (double)t->ns[p] / 1e6, (long long)t->majflt[p],
+                (double)t->rd[p] / 1048576.0, (double)t->wr[p] / 1048576.0,
+                (double)t->moved[p] / 1048576.0,
+                col_bytes > 0 ? (double)t->moved[p] / (double)col_bytes : 0.0);
+    }
+    fprintf(f, " total_moved=%.1fMB(%.2fx)\n", (double)moved / 1048576.0,
+            col_bytes > 0 ? (double)moved / (double)col_bytes : 0.0);
+}
+
+static RAY_TLS ray_hash_trace_t* hx_trace;
+void ray_index_hash_trace(ray_hash_trace_t* t) { hx_trace = t; }
+
 /* Partitioned build of the CSR hash layout for numeric / SYM keys.
  *
  * Groups are numbered in ascending order of mix64(key word) — for these key
@@ -1930,6 +1984,10 @@ static int hash_build_part(ray_t* v, ray_t** gkeys_out, ray_t** offs_out,
     int64_t max_batch = h.n_part < workers * 4 ? h.n_part : workers * 4;
     h.part_cap0 = batch_rows;
     bool ok = false;
+    ray_hash_trace_t* tr = hx_trace;
+    ray_hash_mark_t tm = tr ? ray_hash_trace_mark() : (ray_hash_mark_t){0};
+    int64_t colb = n * (int64_t)ray_sym_elem_size(v->type, v->attrs);
+    int64_t es = h.wide ? 8 : 4;
     h.cnt      = (int64_t*)ray_alloc_raw(cnt_b);
     h.part_off = (int64_t*)ray_alloc_raw((size_t)(h.n_part + 1) * sizeof(int64_t));
     h.part     = (hb_part_t*)ray_calloc_raw((size_t)max_batch * sizeof(hb_part_t));
@@ -1939,6 +1997,7 @@ static int hash_build_part(ray_t* v, ray_t** gkeys_out, ray_t** offs_out,
     /* 1: bucket the key words and row ids by partition */
     if (par) ray_pool_dispatch_n(pool, hb_count, &h, (uint32_t)h.n_tasks);
     else     hb_count(&h, 0, 0, 1);
+    if (tr) { ray_hash_trace_add(tr, RAY_HXT_COUNT, tm, colb); tm = ray_hash_trace_mark(); }
     if (hb_stopped(pool)) goto done;
     {
         int64_t run = 0;
@@ -1958,6 +2017,7 @@ static int hash_build_part(ray_t* v, ray_t** gkeys_out, ray_t** offs_out,
     if (!h.kw || !h.rid) goto done;
     if (par) ray_pool_dispatch_n(pool, hb_bucket, &h, (uint32_t)h.n_tasks);
     else     hb_bucket(&h, 0, 0, 1);
+    if (tr) { ray_hash_trace_add(tr, RAY_HXT_BUCKET, tm, colb + n_keys * (8 + es)); tm = ray_hash_trace_mark(); }
     if (hb_stopped(pool)) goto done;
 
     /* 2: partitions in batches; groups are at most the keys, so the group
@@ -1991,6 +2051,11 @@ static int hash_build_part(ray_t* v, ray_t** gkeys_out, ray_t** offs_out,
     gkeys->len = n_groups; offs->len = n_groups + 1; rows->len = n_keys;
     ray_free_raw(h.kw);  h.kw = NULL;
     ray_free_raw(h.rid); h.rid = NULL;
+    if (tr) {
+        ray_hash_trace_add(tr, RAY_HXT_GROUPS, tm, n_keys * (8 + es) +
+                           n_groups * 8 + (n_groups + 1) * es + n_keys * es);
+        tm = ray_hash_trace_mark();
+    }
 
     /* 3: the slot table in one forward sweep */
     {
@@ -2033,6 +2098,12 @@ done:
     }
     *gkeys_out = hb_trim(gkeys, n_groups, n_keys);
     *offs_out  = hb_trim(offs, n_groups + 1, n_keys + 1);
+    if (tr) {
+        int64_t mv = n_groups * 8 + table->len * es;   /* the sweep */
+        if (*gkeys_out != gkeys) mv += 2 * n_groups * 8;
+        if (*offs_out != offs)   mv += 2 * (n_groups + 1) * es;
+        ray_hash_trace_add(tr, RAY_HXT_TABLE, tm, mv);
+    }
     *rows_out = rows; *table_out = table;
     *n_keys_out = n_keys; *n_groups_out = n_groups;
     return 1;
@@ -2041,8 +2112,13 @@ done:
 ray_t* ray_index_attach_hash(ray_t** vp) {
     /* allow_str: keyed on a byte hash with payload-verified compares;
      * allow_sym: RAY_SYM uses domain ids. */
+    ray_hash_mark_t tm = hx_trace ? ray_hash_trace_mark() : (ray_hash_mark_t){0};
+    ray_t* v0 = (vp && *vp && !RAY_IS_ERR(*vp)) ? *vp : NULL;
     ray_t* v = prepare_attach_ex(vp, "hash", true, true);
     if (RAY_IS_ERR(v)) return v;
+    if (hx_trace && v != v0)   /* a shared parent was copied before the build */
+        ray_hash_trace_add(hx_trace, RAY_HXT_COPY, tm,
+                           2 * v->len * (int64_t)ray_sym_elem_size(v->type, v->attrs));
     bool is_str = (v->type == RAY_STR);
 
     int64_t n = v->len;

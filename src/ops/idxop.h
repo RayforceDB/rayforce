@@ -399,6 +399,26 @@ void    ray_index_inline_write(uint8_t* dst, const ray_index_t* ix);
 bool    ray_index_inline_write_file(FILE* f, const ray_index_t* ix);
 ray_t*  ray_index_inline_map(uint8_t* region, int64_t region_size);
 
+/* ── Hash-index build trace (RAY_CSV_TRACE) ──
+ * Per phase of one build: wall time, major faults, the bytes the process
+ * read and wrote (/proc/self/io; zero off Linux), and `moved`, the bytes the
+ * phase's own passes read and write by design (each array a pass reads or
+ * writes in full, once per pass) — the I/O it costs when nothing fits in
+ * memory. */
+enum { RAY_HXT_COPY, RAY_HXT_COUNT, RAY_HXT_BUCKET, RAY_HXT_DISTINCT,
+       RAY_HXT_GROUPS, RAY_HXT_TABLE, RAY_HXT_APPEND, RAY_HXT_N };
+typedef struct {
+    int64_t ns[RAY_HXT_N], majflt[RAY_HXT_N], rd[RAY_HXT_N], wr[RAY_HXT_N], moved[RAY_HXT_N];
+} ray_hash_trace_t;
+typedef struct { int64_t ns, majflt, rd, wr; } ray_hash_mark_t;
+ray_hash_mark_t ray_hash_trace_mark(void);
+/* Phase `ph` ran since `since` and moved `moved` bytes. */
+void ray_hash_trace_add(ray_hash_trace_t* t, int ph, ray_hash_mark_t since, int64_t moved);
+/* One line: each phase that ran, `moved` also as a multiple of `col_bytes`. */
+void ray_hash_trace_print(FILE* f, const char* what, const ray_hash_trace_t* t, int64_t col_bytes);
+/* The next hash builds on this thread add their phases to `t` (NULL: off). */
+void ray_index_hash_trace(ray_hash_trace_t* t);
+
 /* Drop any attached index from *vp.  No-op if none.  Restores the
  * pre-attach aux state byte-for-byte.  Returns *vp. */
 ray_t* ray_index_drop(ray_t** vp);
