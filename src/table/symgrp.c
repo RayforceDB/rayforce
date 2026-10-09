@@ -728,6 +728,15 @@ bool ray_symgrp_adopt(ray_symgrp_t* g, uint64_t hmask) {
     return ok;
 }
 
+/* Whether verdict word `w` of window [ta, ..) is a candidate whose record
+ * the window loads (an earlier pass's or an earlier window's), and its
+ * position. */
+static inline bool sg_loaded(const ray_symgrp_t* g, uint64_t w, int64_t ta, uint32_t* pos) {
+    if (SG_KIND(w) == RAY_SYMGRP_OLD) { *pos = (uint32_t)SG_VAL(w); return true; }
+    if (SG_KIND(w) == RAY_SYMGRP_REF && sg_ref_task(g, SG_VAL(w)) < ta) { *pos = sg_ref_pos(g, SG_VAL(w)); return true; }
+    return false;
+}
+
 /* The records the window's candidates point at from before it: positions
  * (with the candidates' lengths, which their records share) sorted; those
  * the previous window loaded too are copied from it (a string common in the
@@ -735,8 +744,12 @@ bool ray_symgrp_adopt(ray_symgrp_t* g, uint64_t hmask) {
  * (sg_ra_t) and copied from the file. */
 bool ray_symgrp_load(ray_symgrp_t* g, int64_t ta, int64_t tb) {
     g->st.windows++;
+    /* the candidates counted first: arrays by the window's staged strings
+     * would cost 16 bytes a string of a column of new ones */
     int64_t n = 0;
-    for (int64_t t = ta; t < tb; t++) n += g->tasks[t].n;
+    uint32_t cp;
+    for (int64_t t = ta; t < tb; t++)
+        for (int64_t i = 0; i < g->tasks[t].n; i++) n += sg_loaded(g, g->tasks[t].r[i], ta, &cp);
     uint64_t* a = (uint64_t*)ray_sys_alloc((size_t)(n ? n : 1) * sizeof(uint64_t));
     uint64_t* tmp = (uint64_t*)ray_sys_alloc((size_t)(n ? n : 1) * sizeof(uint64_t));
     if (g->spos && sg_inject("reload")) { ray_sys_free(a); a = NULL; }
@@ -749,14 +762,8 @@ bool ray_symgrp_load(ray_symgrp_t* g, int64_t ta, int64_t tb) {
     int64_t m = 0;
     for (int64_t t = ta; t < tb; t++) {
         const sg_task_t* k = &g->tasks[t];
-        for (int64_t i = 0; i < k->n; i++) {
-            uint64_t w = k->r[i];
-            uint32_t pos;
-            if (SG_KIND(w) == RAY_SYMGRP_OLD) pos = (uint32_t)SG_VAL(w);
-            else if (SG_KIND(w) == RAY_SYMGRP_REF && sg_ref_task(g, SG_VAL(w)) < ta) pos = sg_ref_pos(g, SG_VAL(w));
-            else continue;
-            a[m++] = ((uint64_t)pos << 32) | k->fp[i].len;
-        }
+        for (int64_t i = 0; i < k->n; i++)
+            if (sg_loaded(g, k->r[i], ta, &cp)) a[m++] = ((uint64_t)cp << 32) | k->fp[i].len;
     }
     bool ok = sg_sort_hi(a, tmp, m);
     int64_t u = 0, bytes = 0;
