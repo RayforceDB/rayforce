@@ -1407,14 +1407,19 @@ ray_t* exec_replace(ray_graph_t* g, ray_op_t* op) {
 
 /* Shared text kernel. Consumes one reference to each argument. */
 static ray_t* concat_text_values(ray_t** args, int n_args) {
-    /* Derive nrows from first vector arg (scalar args have byte-length in len) */
+    /* Only atoms broadcast. A one-row vector is still a vector, and an
+     * empty vector must never be indexed as if it contained row zero. */
     int64_t nrows = 1;
-    bool out_str = false;
+    bool out_str = false, has_vector = false;
     for (int a = 0; a < n_args; a++) {
-        int8_t at = args[a]->type;
-        if (at == RAY_STR) { out_str = true; if (nrows == 1) nrows = args[a]->len; }
-        if (RAY_IS_SYM(at)) { if (nrows == 1) nrows = args[a]->len; }
-        if (!ray_is_atom(args[a]) && nrows == 1) { nrows = args[a]->len; }
+        if (args[a]->type == RAY_STR) out_str = true;
+        if (ray_is_atom(args[a])) continue;
+        if (has_vector && args[a]->len != nrows) {
+            for (int i = 0; i < n_args; i++) ray_release(args[i]);
+            return ray_error("length", "concat: text columns must have equal lengths");
+        }
+        nrows = args[a]->len;
+        has_vector = true;
     }
     ray_t* result = ray_vec_new(out_str ? RAY_STR : RAY_SYM, nrows);
     if (!result || RAY_IS_ERR(result)) {
@@ -1449,11 +1454,11 @@ static ray_t* concat_text_values(ray_t** args, int n_args) {
             if (t == RAY_STR) {
                 const ray_str_t* elems; const char* p;
                 str_resolve(args[a], &elems, &p);
-                int64_t ar = ray_is_atom(args[a]) ? 0 : (r < args[a]->len ? r : 0);
+                int64_t ar = r;
                 total += elems[ar].len;
             } else if (RAY_IS_SYM(t)) {
                 const char* sp; size_t sl;
-                int64_t ar = ray_is_atom(args[a]) ? 0 : (r < args[a]->len ? r : 0);
+                int64_t ar = r;
                 sym_elem(args[a], ar, &sp, &sl);
                 total += sl;
             } else if (t == -RAY_STR) {
@@ -1485,13 +1490,13 @@ static ray_t* concat_text_values(ray_t** args, int n_args) {
             if (t == RAY_STR) {
                 const ray_str_t* elems; const char* pool;
                 str_resolve(args[a], &elems, &pool);
-                int64_t ar = ray_is_atom(args[a]) ? 0 : (r < args[a]->len ? r : 0);
+                int64_t ar = r;
                 const char* sp = ray_str_t_ptr(&elems[ar], pool);
                 size_t sl = elems[ar].len;
                 if (bi + sl < buf_cap) { memcpy(buf + bi, sp, sl); bi += sl; }
             } else if (RAY_IS_SYM(t)) {
                 const char* sp; size_t sl;
-                int64_t ar = ray_is_atom(args[a]) ? 0 : (r < args[a]->len ? r : 0);
+                int64_t ar = r;
                 sym_elem(args[a], ar, &sp, &sl);
                 if (bi + sl < buf_cap) { memcpy(buf + bi, sp, sl); bi += sl; }
             } else if (t == -RAY_STR) {
@@ -1562,8 +1567,16 @@ ray_t* exec_concat(ray_graph_t* g, ray_op_t* op) {
 /* Query fallback uses the same text kernel after checking argument syntax.
  * Ordinary builtin calls retain collection semantics. */
 ray_t* ray_concat_text_fn(ray_t* a, ray_t* b) {
+    if (a->type == -RAY_STR && b->type == -RAY_STR) return ray_concat_fn(a, b);
+    bool atoms = ray_is_atom(a) && ray_is_atom(b);
     ray_t* args[2] = { a, b };
     ray_retain(a);
     ray_retain(b);
-    return concat_text_values(args, 2);
+    ray_t* result = concat_text_values(args, 2);
+    if (!atoms || !result || RAY_IS_ERR(result)) return result;
+    int allocated = 0;
+    ray_t* atom = collection_elem(result, 0, &allocated);
+    if (atom && !allocated) ray_retain(atom);
+    ray_release(result);
+    return atom;
 }

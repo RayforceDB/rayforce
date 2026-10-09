@@ -33,9 +33,9 @@
 (at (select {n: (+ (count (concat V "c")) (count (distinct x))) by: k from: T asc: k}) 'n) -- [4 4 3]
 (at (update {n: (count (strings)) from: T}) 'n) -- [2 2 2 2 2]
 
-;; Inlining a function must not change its concat to a query text operation.
-(at (select {from: T where: (> (count (append-c s)) 5)}) 's) -- ['a 'b 'c 'd 'e]
-(at (select {from: T where: (> (count ((fn [v] (concat v 'c)) s)) 5)}) 's) -- ['a 'b 'c 'd 'e]
-(at (select {n: (+ (count (append-c s)) (count (distinct x))) by: k from: T asc: k}) 'n) -- [5 5 3]
+;; Inlining preserves column text operations through helper parameters.
+(at (select {from: T where: (> (count (append-c s)) 4)}) 's) -- ['a 'b 'c 'd 'e]
+(at (select {from: T where: (> (count ((fn [v] (concat v 'c)) s)) 4)}) 's) -- ['a 'b 'c 'd 'e]
+(at (select {n: (+ (count (append-c s)) (count (distinct x))) by: k from: T asc: k}) 'n) -- [4 4 2]
 ;; Variadic text concat may carry the column in its third argument.
 (at (select {v: (concat (concat "!" "?" s) "!") from: T}) 'v) -- (as 'SYM ["!?a!" "!?b!" "!?c!" "!?d!" "!?e!"])

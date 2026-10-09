@@ -1,0 +1,53 @@
+(set T (table [x k s t] (list [1 2 3 4 5] [0 0 1 1 2] ['a 'b 'c 'd 'e] (list "p" "q" "r" "s" "t"))))
+(set sfx (fn [v] (concat v "!")))
+(set sfs (fn [v] (concat v 'zz)))
+;; Helper parameters inherit column semantics when inlined by the query.
+(at (select {v: (sfx s) from: T}) 'v) -- ['a! 'b! 'c! 'd! 'e!]
+(at (select {v: (sfs s) from: T}) 'v) -- ['azz 'bzz 'czz 'dzz 'ezz]
+(at (select {n: (count (sfx s)) by: k from: T asc: k}) 'n) -- [2 2 1]
+(at (update {v: (sfs s) from: T}) 'v) -- ['azz 'bzz 'czz 'dzz 'ezz]
+(at (select {from: T where: (in (sfs s) ['azz 'czz])}) 'x) -- [1 3]
+(count (select {n: (count x) by: (sfs s) from: T})) -- 5
+(at (select {v: (sfx t) from: T}) 'v) -- ["p!" "q!" "r!" "s!" "t!"]
+(set h (fn [v] (concat ['p 'q] 'r)))
+(at (select {v: (h x) from: T}) 'v) -- ['p 'q 'r]
+(at (select {v: (h x) e: (enlist 7) from: T}) 'v) -- ['p 'q 'r]
+;; Both update predicate routes and grouped evaluation publish their table.
+(at (update {n: (+ (count (concat s 'zz)) (count (distinct x))) by: k from: T}) 'n) -- [4 4 4 4 2]
+(at (update {n: (+ (count (concat s "!")) (count (distinct x))) by: k from: T}) 'n) -- [4 4 4 4 2]
+(at (update {x: 0 from: T where: (> (+ (count (concat s 'zz)) (count (distinct x))) 10)}) 'x) -- [1 2 3 4 5]
+(at (update {n: 0 from: T where: (> (+ (count (concat s 'zz)) (count (distinct x))) 10)}) 'x) -- [1 2 3 4 5]
+;; A bound vector is a collection, in either order and for every group size.
+(set L3 ['u 'v 'w])
+(at (select {n: (+ (count (concat s L3)) (count (distinct x))) by: k from: T asc: k}) 'n) -- [7 7 5]
+(at (select {n: (+ (count (concat L3 s)) (count (distinct x))) by: k from: T asc: k}) 'n) -- [7 7 5]
+(at (select {n: (+ (count (concat s (take ['a] 0))) (count (distinct x))) by: k from: T asc: k}) 'n) -- [4 4 2]
+(set ES (as 'STR (list)))
+(at (select {n: (+ (sum (strlen (concat t ES))) (count (distinct x))) by: k from: T asc: k}) 'n) -- [4 4 2]
+(at (select {v: (concat t ES) from: T}) 'v) -- ["p" "q" "r" "s" "t"]
+(at (select {v: (concat ES t) from: T}) 'v) -- ["p" "q" "r" "s" "t"]
+(at (select {v: (concat s L3) from: T}) 'v) -- ['a 'b 'c 'd 'e 'u 'v 'w]
+;; Computed constants stay collections on planned and forced fallback paths.
+(set L ['a 'b])
+(at (select {v: (concat (upper L) 'c) from: T}) 'v) -- ['A 'B 'c]
+(at (select {v: (concat (upper L) 'c) e: (enlist 7) from: T}) 'v) -- ['A 'B 'c]
+;; This shadowing case reaches the per-group evaluator, not the planner.
+((fn [s] (at (select {n: (+ (count (concat s 'c)) (count (distinct x))) by: k from: T asc: k}) 'n)) ['a 'b]) -- [5 5 4]
+;; A third-argument column is not a scalar to broadcast on a one-row source.
+(set O (table [s] (list ['a])))
+(select {v: (concat "!" "?" s) a: [1 2] from: O}) !- domain
+;; Mixing an inlined helper with an unsupported aggregate also keeps its rows.
+(at (select {n: (+ (count (sfx s)) (count (distinct x))) by: k from: T asc: k}) 'n) -- [4 4 2]
+
+(at (update {n: (+ (count (sfx s)) (count (distinct x))) by: k from: T}) 'n) -- [4 4 4 4 2]
+(at (select {v: (sfx s) e: (enlist 7) from: T}) 'v) -- ['a! 'b! 'c! 'd! 'e!]
+;; Constant collection counts are independent of the source row count.
+(at (select {n: (count (concat L 'c)) from: T}) 'n) -- [3]
+(at (select {n: (count [1 2]) from: T}) 'n) -- [2]
+(at (select {n: (count L) from: T}) 'n) -- [2]
+(at (select {n: (count L) m: (sum x) from: T}) 'n) -- [2]
+(at (select {n: (count L) from: T where: (> x 3)}) 'n) -- [2]
+(at (select {n: (count L) from: T where: (> x 9)}) 'n) -- [2]
+(at (select {n: (count L) by: k from: T asc: k}) 'n) -- [2 2 2]
+(at (select {n: (count (concat L 'c)) by: k from: T asc: k}) 'n) -- [3 3 3]
+(at (select {n: (count L) x: x from: T}) 'n) -- [2 2 2 2 2]

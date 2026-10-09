@@ -4100,15 +4100,13 @@ ray_t* ray_eval(ray_t* obj) {
             ray_t* result;
             if ((fn_attrs & RAY_FN_ATOMIC) && (is_collection(left) || is_collection(right)))
                 result = atomic_map_binary_op(fn, fn_opcode, left, right);
-            else if (fn == ray_concat_fn &&
-                     ((left->type == RAY_SYM || left->type == RAY_STR) ||
-                      (right->type == RAY_SYM || right->type == RAY_STR)) &&
+            else if (fn == ray_concat_fn && ray_active_query_table() &&
                      (left->type == RAY_SYM || left->type == RAY_STR ||
                       left->type == -RAY_SYM || left->type == -RAY_STR) &&
                      (right->type == RAY_SYM || right->type == RAY_STR ||
                       right->type == -RAY_SYM || right->type == -RAY_STR) &&
-                     (ray_query_expr_reads_rows(elems[1]) ||
-                      ray_query_expr_reads_rows(elems[2])))
+                     (ray_is_atom(left) || ray_query_expr_reads_rows(elems[1])) &&
+                     (ray_is_atom(right) || ray_query_expr_reads_rows(elems[2])))
                 result = ray_concat_text_fn(left, right);
             else
                 result = fn(left, right);
