@@ -675,27 +675,31 @@ static int64_t pq_dict_max_len(ray_parquet_t* r, pq_span meta) {
  * strings, and one fixed 65,536-row batch would hold all of it) and the
  * longest dictionary entry (dictionary pages; each row may repeat it).
  * PQ_POOL_MAX remains the hard limit.  Deterministic from the file, so the
- * partitioned writer can count partitions with it before decoding. */
+ * partitioned writer can count partitions with it before decoding.  `cols`
+ * is the group's column chunk metadata (pq_group_columns). */
+static int64_t pq_cols_batch(ray_parquet_t* r, const pq_span* cols) {
+    int64_t batch = r->batch_rows;
+    for (int64_t i = 0; i < r->nselected; i++) {
+        const pq_schema* sc = &r->schema[r->selected[i]];
+        if (sc->physical != 6 || sc->type != RAY_STR || sc->import_domain) continue;
+        pq_span mf[17];
+        if (!pq_fields(cols[r->selected[i]],mf,17)) continue;
+        int64_t values = pq_get(mf[5],-1), bytes = pq_get(mf[6],-1);
+        if (values <= 0 || bytes <= 0) continue;
+        int64_t per_row = bytes/values + 1;
+        int64_t longest = pq_dict_max_len(r,cols[r->selected[i]]) + 1;
+        if (longest > per_row) per_row = longest;
+        int64_t cap = (int64_t)PQ_POOL_TARGET/per_row;
+        if (cap < 1) cap = 1;
+        if (cap < batch) batch = cap;
+    }
+    return batch;
+}
 static int64_t pq_group_batch(ray_parquet_t* r, int64_t g) {
     int64_t batch = r->batch_rows, rows;
     pq_span* cols = ray_alloc_raw((size_t)r->ncols*sizeof(*cols));
     if (!cols) return batch;
-    if (pq_group_columns(r,g,cols,&rows,NULL)) {
-        for (int64_t i = 0; i < r->nselected; i++) {
-            const pq_schema* sc = &r->schema[r->selected[i]];
-            if (sc->physical != 6 || sc->type != RAY_STR || sc->import_domain) continue;
-            pq_span mf[17];
-            if (!pq_fields(cols[r->selected[i]],mf,17)) continue;
-            int64_t values = pq_get(mf[5],-1), bytes = pq_get(mf[6],-1);
-            if (values <= 0 || bytes <= 0) continue;
-            int64_t per_row = bytes/values + 1;
-            int64_t longest = pq_dict_max_len(r,cols[r->selected[i]]) + 1;
-            if (longest > per_row) per_row = longest;
-            int64_t cap = (int64_t)PQ_POOL_TARGET/per_row;
-            if (cap < 1) cap = 1;
-            if (cap < batch) batch = cap;
-        }
-    }
+    if (pq_group_columns(r,g,cols,&rows,NULL)) batch = pq_cols_batch(r,cols);
     ray_free_raw(cols);
     return batch;
 }
@@ -709,7 +713,7 @@ static const char* pq_start_group(ray_parquet_t* r) {
      * chunks, with a dictionary page and data_page_offset 0, which the
      * chunk checks below would reject. */
     if (r->group_left == 0) { ray_free_raw(cols); return NULL; }
-    r->group_batch = pq_group_batch(r,r->group);
+    r->group_batch = pq_cols_batch(r,cols);   /* the metadata just read, not read again */
     /* Bounds and Bloom filters describe non-null values. A WHERE accepting
      * nulls must decode these groups/pages, including native null sentinels
      * in required columns. Explicit read ranges still exclude nulls. */
@@ -1360,14 +1364,16 @@ done:
 }
 
 /* Row-group tasks share only immutable mapping/schema data. Each task owns its
- * cursors, page buffers, dictionary and selection. The parent outlives the join. */
-static ray_parquet_t* pq_group_reader(const ray_parquet_t* parent, int64_t group) {
+ * cursors, page buffers, dictionary and selection. The parent outlives the join.
+ * Cursors for the first `nselected` of the parent's selected columns (all of
+ * them, or the one column a direct import task sets). */
+static ray_parquet_t* pq_group_reader(const ray_parquet_t* parent, int64_t group, int64_t nselected) {
     ray_parquet_t* r = ray_calloc_raw(sizeof(*r));
     if (!r) return NULL;
     r->borrowed = true; r->map = parent->map; r->size = parent->size; r->data_end = parent->data_end;
     r->schema = parent->schema; r->groups = parent->groups; r->ncols = parent->ncols;
     r->ngroups = group+1; r->group = group-1; r->batch_rows = parent->batch_rows;
-    r->nselected = parent->nselected; r->noutput = parent->noutput;
+    r->nselected = nselected; r->noutput = parent->noutput;
     r->filter_pos = parent->filter_pos; r->filter_lo = parent->filter_lo; r->filter_hi = parent->filter_hi;
     r->filter_nulls = parent->filter_nulls;
     r->text_pattern = parent->text_pattern; r->text_pos = parent->text_pos;
@@ -1406,7 +1412,7 @@ typedef struct { ray_parquet_t* parent; int64_t first; ray_t** tables; } pq_read
 static void pq_read_group(void* ptr, uint32_t worker, int64_t start, int64_t end) {
     (void)worker; pq_read_work* w = ptr;
     for (int64_t i = start; i < end; i++) {
-        ray_parquet_t* r = pq_group_reader(w->parent,w->first+i);
+        ray_parquet_t* r = pq_group_reader(w->parent,w->first+i,w->parent->nselected);
         w->tables[i] = r ? pq_materialize(r) : ray_error("oom",NULL);
     }
 }
@@ -1641,7 +1647,7 @@ static ray_t* pq_write_reader(ray_parquet_t* r, const char* root, const char* ta
 static void pq_write_group(void* ptr, uint32_t worker, int64_t start, int64_t end) {
     (void)worker; pq_native_work* w = ptr;
     for (int64_t g = start; g < end; g++) {
-        ray_parquet_t* r = pq_group_reader(w->parent,g);
+        ray_parquet_t* r = pq_group_reader(w->parent,g,w->parent->nselected);
         if (!r) { w->errors[g] = ray_error("oom",NULL); continue; }
         w->errors[g] = pq_write_reader(r,w->root,w->table,w->offsets[g],w->durable);
         ray_parquet_close(r);
@@ -1808,7 +1814,24 @@ typedef struct {
     int64_t prefetch;              /* row groups requested ahead of the one starting */
     int64_t ahead_bytes;           /* cap on what one task requests past its own chunk */
     bool writeback;                /* start each written chunk's writeback (one-pass layout) */
+    pq_column* spare;              /* [nspare] each worker's buffers between its tasks */
+    int64_t nspare;
 } pq_direct_work;
+
+/* Trade a task cursor's page, dictionary and symbol buffers with its
+ * worker's spare ones: a worker grows them once for all its tasks, instead
+ * of each task allocating and doubling its own. */
+static void pq_trade_buffers(pq_column* c, pq_column* spare) {
+    uint8_t* page = c->page; size_t page_cap = c->page_cap;
+    uint8_t* dict = c->dict; size_t dict_cap = c->dict_cap;
+    pq_symbol_scratch* symbols = c->symbols;
+    c->page = spare->page; c->page_cap = spare->page_cap;
+    c->dict = spare->dict; c->dict_cap = spare->dict_cap;
+    c->symbols = spare->symbols;
+    spare->page = page; spare->page_cap = page_cap;
+    spare->dict = dict; spare->dict_cap = dict_cap;
+    spare->symbols = symbols;
+}
 
 /* Byte range of every column chunk — from its dictionary page (or first
  * data page) for total_compressed bytes — and each column's uncompressed
@@ -1855,23 +1878,29 @@ static void pq_prefetch_chunks(pq_direct_work* w, int64_t g, int64_t c) {
     }
 }
 static void pq_write_direct_group(void* ptr, uint32_t worker, int64_t start, int64_t end) {
-    (void)worker; pq_direct_work* w = ptr;
+    pq_direct_work* w = ptr;
+    pq_column* spare = (int64_t)worker < w->nspare ? &w->spare[worker] : NULL;
     for (int64_t task = start; task < end; task++) {
         /* Row groups outermost within a pass: a worker reads one group's
          * chunks of the pass's columns side by side. */
         int64_t g = task/w->npass, c = w->pass[task%w->npass];
         if (w->prefetched) pq_prefetch_chunks(w,g,c);
-        ray_parquet_t* r = pq_group_reader(w->parent,g);
+        ray_parquet_t* r = pq_group_reader(w->parent,g,1);
         if (!r) { w->errors[task] = ray_error("oom",NULL); continue; }
         /* A task is one column chunk, so both groups and columns can occupy
          * workers. Narrow schemas still get one task per row group. */
         r->selected[0] = (int32_t)c; r->nselected = r->noutput = 1;
+        if (spare) pq_trade_buffers(&r->cursors[0],spare);
         int64_t row = w->offsets[g];
         ray_col_stream_t local = {0};
         local.type = w->writers[c].type; local.dom = w->writers[c].dom;
         size_t size = local.type == RAY_SYM ? 4 : ray_elem_size(local.type);
         local.fp = fopen(w->writers[c].tmp_path,"r+b");
-        if (!local.fp) { w->errors[task] = pq_error("cannot open native column"); ray_parquet_close(r); continue; }
+        if (!local.fp) {
+            w->errors[task] = pq_error("cannot open native column");
+            if (spare) pq_trade_buffers(&r->cursors[0],spare);
+            ray_parquet_close(r); continue;
+        }
         int64_t offset = 32+row*(int64_t)size;
 #ifdef RAY_OS_WINDOWS
         bool seek = _fseeki64(local.fp,offset,SEEK_SET) == 0;
@@ -1913,6 +1942,7 @@ static void pq_write_direct_group(void* ptr, uint32_t worker, int64_t start, int
         if (fclose(local.fp) && !w->errors[task]) w->errors[task] = pq_error("native column close failed");
         if (local.had_nulls) atomic_store_explicit(&w->nulls[c],1,memory_order_relaxed);
         if (!w->errors[task] && row != w->offsets[g+1]) w->errors[task] = pq_error("row group ended before its assigned output range");
+        if (spare) pq_trade_buffers(&r->cursors[0],spare);
         ray_parquet_close(r);
     }
 }
@@ -1956,6 +1986,8 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
     int64_t* bytes = ray_calloc_raw((size_t)r->ncols*sizeof(*bytes));
     int64_t* order = ray_alloc_raw((size_t)r->ncols*sizeof(*order));
     _Atomic uint8_t* prefetched = NULL;
+    pq_column* spare = NULL;   /* pq_direct_work.spare */
+    int64_t nspare = 0;
     ray_t* err = NULL;
     pq_symflush_t symf = {NULL,false,(int)RAY_OK};
     ray_thread_t sym_thread = 0;
@@ -2012,7 +2044,9 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
     }
     if (width > r->ncols) width = r->ncols;
     bool trace = getenv("RAY_CSV_TRACE") != NULL;   /* the converters' phase trace */
-    pq_direct_work work = {r,writers,offsets,nulls,locks,errors,NULL,0,lo,hi,NULL,0,0,true};
+    spare = ray_calloc_raw((size_t)workers*sizeof(*spare));   /* best effort */
+    if (spare) nspare = workers;
+    pq_direct_work work = {r,writers,offsets,nulls,locks,errors,NULL,0,lo,hi,NULL,0,0,true,spare,nspare};
     /* Starting each chunk's writeback as it is written spares one pass its
      * final sync; column by column the passes end their files anyway and
      * the extra I/O requests only slow the decode. */
@@ -2114,6 +2148,10 @@ done:
     ray_free_raw(offsets); ray_free_raw(nulls); ray_free_raw(locks); ray_free_raw(errors);
     ray_free_raw(lo); ray_free_raw(hi); ray_free_raw(bytes); ray_free_raw(order);
     if (prefetched) ray_free_raw((void*)prefetched);
+    for (int64_t i = 0; i < nspare; i++) {
+        ray_free_raw(spare[i].page); ray_free_raw(spare[i].dict); ray_free_raw(spare[i].symbols);
+    }
+    ray_free_raw(spare);
     return err;
 }
 ray_t* ray_parquet_splayed_typed(const char* path, const char* dir, ray_t* types) {
@@ -2514,7 +2552,7 @@ typedef struct {
 static void pq_aggregate_group(void* ptr, uint32_t worker, int64_t start, int64_t end) {
     (void)worker; pq_aggregate_work* w = ptr;
     for (int64_t i = start; i < end; i++) {
-        ray_parquet_t* r = pq_group_reader(w->parent,w->first+i);
+        ray_parquet_t* r = pq_group_reader(w->parent,w->first+i,w->parent->nselected);
         pq_aggregate* aggs = ray_calloc_raw((size_t)w->n*sizeof(*aggs));
         w->states[i] = aggs;
         if (!r || !aggs) { w->errors[i] = ray_error("oom",NULL); ray_parquet_close(r); continue; }
