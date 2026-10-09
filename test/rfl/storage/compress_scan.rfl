@@ -1,14 +1,15 @@
+;; @requires: posix  (cleanup runs through a POSIX shell via .sys.exec)
 ;; .idx.info over a compressed (generation 2) and a plain (generation 0)
 ;; splayed column: format generation and bytes, read without decoding.
-(.sys.exec "rm -rf rf_test_cscan_a rf_test_cscan_b") -- 0
+(.sys.exec "rm -rf /tmp/rf_test_cscan_a /tmp/rf_test_cscan_b") -- 0
 (set S (table [k] (list (til 150000))))
-(.db.splayed.set "rf_test_cscan_a/" S {compress: true})
-(.db.splayed.set "rf_test_cscan_b/" S {compress: false})
-(set A (.db.splayed.get "rf_test_cscan_a/"))
-(set B (.db.splayed.get "rf_test_cscan_b/"))
+(.db.splayed.set "/tmp/rf_test_cscan_a/" S {compress: true})
+(.db.splayed.set "/tmp/rf_test_cscan_b/" S {compress: false})
+(set A (.db.splayed.get "/tmp/rf_test_cscan_a/"))
+(set B (.db.splayed.get "/tmp/rf_test_cscan_b/"))
 (at (.idx.info A 'k) 'gen) -- 2
 (at (.idx.info B 'k) 'gen) -- 0
 (at (.idx.info A 'k) 'raw_bytes) -- 1200000
 (at (.idx.info A 'k) 'materialized) -- false
 (.idx.info [1 2 3]) -- (.idx.info [1 2 3])
-(.sys.exec "rm -rf rf_test_cscan_a rf_test_cscan_b") -- 0
+(.sys.exec "rm -rf /tmp/rf_test_cscan_a /tmp/rf_test_cscan_b") -- 0

@@ -5098,6 +5098,99 @@ static test_result_t sr_corrupt_load_twice(const char* dir_expr, const char* q, 
     PASS();
 }
 
+/* The reported number of `src` (an integer-valued rayfall expression). */
+static int64_t ii_i64(const char* src) {
+    ray_t* r = sr_eval(src);
+    int64_t v = (r && !RAY_IS_ERR(r)) ? r->i64 : INT64_MIN;
+    sr_drop(r);
+    return v;
+}
+static bool ii_err(const char* src, const char* code, const char* needle) {
+    ray_t* r = sr_eval(src);
+    bool ok = r && RAY_IS_ERR(r) && strcmp(ray_err_code(r), code) == 0 &&
+              ray_error_msg() && strstr(ray_error_msg(), needle);
+    sr_drop(r);
+    return ok;
+}
+
+/* STR pool bytes, parted sums and segments, a mixed parted column, the
+ * index key and the argument errors of (.idx.info table 'col). */
+static test_result_t test_idx_info_report(void) {
+    /* STR: len * 16 plus the pool, in both generations, and the pool counts */
+    sr_eval_ok("(set ST (table [s] (list (as 'STR (map (fn [j] (format \"a-long-string-value-%\" (% j 977))) (til 70000))))))");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/is2/\" ST {compress: true})");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/is0/\" ST {compress: false})");
+    sr_eval_ok("(set S2 (.db.splayed.get \"" SR_TMP "/is2/\"))");
+    sr_eval_ok("(set S0 (.db.splayed.get \"" SR_TMP "/is0/\"))");
+    int64_t r2 = ii_i64("(at (.idx.info S2 's) 'raw_bytes)");
+    int64_t r0 = ii_i64("(at (.idx.info S0 's) 'raw_bytes)");
+    int64_t e0 = ii_i64("(at (.idx.info S0 's) 'encoded_bytes)");
+    TEST_ASSERT_TRUE(r0 > 70000 * 16);               /* the pool is counted */
+    TEST_ASSERT_EQ_I(r2, r0);
+    TEST_ASSERT_EQ_I(e0, r0);                        /* plain: encoded is raw */
+    TEST_ASSERT_EQ_I(ii_i64("(at (.idx.info S2 's) 'gen)"), 2);
+    TEST_ASSERT_TRUE(ii_i64("(at (.idx.info S2 's) 'encoded_bytes)") > 0);
+
+    /* parted, every segment generation 2: sums over the segments */
+    sr_parted_xy(SR_TMP "/ip2", 7, false, false);
+    sr_eval_ok("(set P2 (.db.parted.get \"" SR_TMP "/ip2\" 't))");
+    TEST_ASSERT_EQ_I(ii_i64("(at (.idx.info P2 'x) 'gen)"), 2);
+    TEST_ASSERT_EQ_I(ii_i64("(at (.idx.info P2 'x) 'segments)"), 3);
+    TEST_ASSERT_EQ_I(ii_i64("(at (.idx.info P2 'x) 'raw_bytes)"), 3 * 70000 * 8);
+    TEST_ASSERT_EQ_I(ii_i64("(sum (value (at (.idx.info P2 'x) 'enc)))"), 3 * 69);
+    int64_t seg = 0;
+    for (int p = 1; p <= 3; p++) {
+        char q[256];
+        snprintf(q, sizeof q, "(at (.idx.info (.db.splayed.get \"" SR_TMP "/ip2/2024.01.0%d/t/\") 'x) 'encoded_bytes)", p);
+        seg += ii_i64(q);
+    }
+    TEST_ASSERT_TRUE(seg > 0);
+    TEST_ASSERT_EQ_I(ii_i64("(at (.idx.info P2 'x) 'encoded_bytes)"), seg);
+
+    /* parted, every segment plain: raw and encoded are the segment sums */
+    sr_parted_xy(SR_TMP "/ip0", 0, false, false);
+    sr_eval_ok("(set P0 (.db.parted.get \"" SR_TMP "/ip0\" 't))");
+    TEST_ASSERT_EQ_I(ii_i64("(at (.idx.info P0 'x) 'gen)"), 0);
+    TEST_ASSERT_EQ_I(ii_i64("(at (.idx.info P0 'x) 'segments)"), 3);
+    TEST_ASSERT_EQ_I(ii_i64("(at (.idx.info P0 'x) 'raw_bytes)"), 3 * 70000 * 8);
+    TEST_ASSERT_EQ_I(ii_i64("(at (.idx.info P0 'x) 'encoded_bytes)"), 3 * 70000 * 8);
+
+    /* mixed: two compressed segments and a synthetic one report generation 2;
+     * the synthetic stand-in adds raw bytes but no file bytes */
+    sr_parted_xy(SR_TMP "/imx", 3, true, false);
+    sr_eval_ok("(set PM (.db.parted.get \"" SR_TMP "/imx\" 't))");
+    TEST_ASSERT_EQ_I(ii_i64("(at (.idx.info PM 'y) 'gen)"), 2);
+    TEST_ASSERT_EQ_I(ii_i64("(at (.idx.info PM 'y) 'raw_bytes)"), 3 * 70000 * 8);
+    TEST_ASSERT_EQ_I(ii_i64("(sum (value (at (.idx.info PM 'y) 'enc)))"), 2 * 69);
+    /* ragged all-plain: synthetic stand-in contributes no file bytes */
+    sr_parted_xy(SR_TMP "/irg0", 0, true, false);
+    sr_eval_ok("(set PR (.db.parted.get \"" SR_TMP "/irg0\" 't))");
+    TEST_ASSERT_EQ_I(ii_i64("(at (.idx.info PR 'y) 'encoded_bytes)"), 2 * 70000 * 8);
+    TEST_ASSERT_EQ_I(ii_i64("(sum (value (at (.idx.info PR 'y) 'enc)))"), 0);
+
+    /* the index key: generation 2 is the recorded kind, generation 0 the attached index */
+    sr_eval_ok("(set T (.db.splayed.get \"" SR_G2 "\"))");
+    ray_t* ik = sr_eval("(at (.idx.info T 'k) 'index)");
+    TEST_ASSERT_TRUE(ik && !RAY_IS_ERR(ik) && ik->type == -RAY_SYM &&
+                     strcmp(ray_str_ptr(ray_sym_str(ik->i64)), "chunk_zone") == 0);
+    sr_drop(ik);
+    sr_eval_ok("(set IH (table [a] (list (.idx.hash [1 2 3 1]))))");
+    ray_t* hk = sr_eval("(at (at (.idx.info IH 'a) 'index) 'kind)");
+    TEST_ASSERT_TRUE(hk && !RAY_IS_ERR(hk) && hk->type == -RAY_SYM &&
+                     strcmp(ray_str_ptr(ray_sym_str(hk->i64)), "hash") == 0);
+    sr_drop(hk);
+    ray_t* nk = sr_eval("(at (.idx.info (table [a] (list [1 2 3])) 'a) 'index)");
+    TEST_ASSERT_TRUE(nk == RAY_NULL_OBJ);
+
+    /* argument errors */
+    TEST_ASSERT_TRUE(ii_err("(.idx.info T 'k 'k)", "arity", "expected"));
+    TEST_ASSERT_TRUE(ii_err("(.idx.info)", "arity", "expected"));
+    TEST_ASSERT_TRUE(ii_err("(.idx.info [1 2 3] 'k)", "type", "table"));
+    TEST_ASSERT_TRUE(ii_err("(.idx.info T \"k\")", "type", "symbol"));
+    TEST_ASSERT_TRUE(ii_err("(.idx.info T 'nope)", "domain", "no such column"));
+    PASS();
+}
+
 static test_result_t test_v2_forged_parted_segment(void) {
     sr_forged_parted(SR_TMP "/fp0", 0);
     sr_forged_parted(SR_TMP "/fp2", 2);
@@ -5281,5 +5374,6 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/v2_radix_record_order", test_v2_radix_record_order, sr_rt_setup, srr_pool_teardown },
     { "scanrange/v2_forged_parted_segment", test_v2_forged_parted_segment, sr_rt_setup, srr_teardown },
     { "scanrange/idx_info_table",     test_idx_info_table,     srr_setup, srr_teardown },
+    { "scanrange/idx_info_report",    test_idx_info_report,    srr_setup, srr_teardown },
     { NULL, NULL, NULL, NULL },
 };

@@ -33,6 +33,7 @@
 #include "store/encw.h"
 #include "store/enccol.h"
 #include "vec/str.h"
+#include "ops/idxop.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1281,6 +1282,32 @@ static bool fuzz_one(const char* p, const char** bad) {
     return rejected;
 }
 
+/* .idx.info reads descriptors without decoding: a forged encoding byte is
+ * "corrupt", not a wrong report. */
+static test_result_t test_idx_info_corrupt(void) {
+    const char* p = ray_test_tmp(EC_TMP "/info");
+    SAVE(bool_runs(), p); NEED_ENC(0, 0, RAY_ENC_RLE);
+    W8(desc_at(0, 0), 0xFF);
+    TEST_ASSERT_TRUE(img_store(p, g_len));
+    ray_t* c = ray_col_mmap(p);
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+    ray_enccol_info_t ci;
+    ray_t* err = ray_enccol_info(c, &ci);
+    TEST_ASSERT_TRUE(err && RAY_IS_ERR(err) && strcmp(ray_err_code(err), "corrupt") == 0);
+    ray_error_free(err);
+    int64_t nid = ray_sym_intern("b", 1);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, nid, c);
+    TEST_ASSERT_TRUE(tbl && !RAY_IS_ERR(tbl));
+    ray_t* sym = ray_sym(nid);
+    ray_t* args[2] = { tbl, sym };
+    ray_t* e = ray_idx_info_vary_fn(args, 2);
+    TEST_ASSERT_TRUE(e && RAY_IS_ERR(e) && strcmp(ray_err_code(e), "corrupt") == 0);
+    ray_error_free(e);
+    ray_release(sym); ray_release(tbl); ray_release(c);
+    PASS();
+}
+
 /* Random byte flips: an error or a well-formed result, never a crash, a
  * hang or a read outside the mapping (ASan/UBSan).  Whole-file flips must
  * reject something; flips confined to the headers, directory and
@@ -1348,6 +1375,7 @@ const test_entry_t enccorrupt_entries[] = {
     { "enccorrupt/stats_values",  test_stats_values,         ec_setup, ec_teardown },
     { "enccorrupt/stats_point_read", test_stats_point_read,  ec_setup, ec_teardown },
     { "enccorrupt/stats_guard",   test_stats_guard,          ec_setup, ec_teardown },
+    { "enccorrupt/idx_info",      test_idx_info_corrupt,     ec_setup, ec_teardown },
     { "enccorrupt/fuzz_flips",    test_fuzz_flips,           ec_setup, ec_teardown },
     { NULL, NULL, NULL, NULL },
 };

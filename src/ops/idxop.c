@@ -3766,14 +3766,6 @@ ray_t* ray_idx_info_fn(ray_t* v) {
     return ray_index_info(v);
 }
 
-/* Generation-0 payload bytes of one plain vector (STR: its pool too). */
-static uint64_t info_plain_bytes(ray_t* s) {
-    if (!s || !ray_is_vec(s)) return 0;
-    uint64_t b = (uint64_t)s->len * ray_sym_elem_size(s->type, s->attrs);
-    if (s->type == RAY_STR && s->str_pool) b += (uint64_t)s->str_pool->len;
-    return b;
-}
-
 static const char* const k_enc_names[10] = {
     "raw", "const", "for_bp", "delta_bp", "rle", "dict", "alp", "alp_rd", "str_dict", "fsst"
 };
@@ -3810,10 +3802,10 @@ ray_t* ray_idx_info_vary_fn(ray_t** args, int64_t n) {
         gen2 = !ci.synthetic;
     } else if (RAY_IS_PARTED(m.type)) {
         ray_t** seg = (ray_t**)ray_data(slot);
-        for (int64_t i = 0; i < slot->len; i++) ci.raw_bytes += info_plain_bytes(seg[i]);
+        for (int64_t i = 0; i < slot->len; i++) ci.raw_bytes += ray_enccol_plain_bytes(seg[i]);
         ci.encoded_bytes = ci.raw_bytes;
     } else {
-        ci.raw_bytes = ci.encoded_bytes = info_plain_bytes(slot);
+        ci.raw_bytes = ci.encoded_bytes = ray_enccol_plain_bytes(slot);
     }
 
     ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 8);

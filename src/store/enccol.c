@@ -2058,7 +2058,8 @@ void ray_enccol_meta(ray_t* encv, ray_col_meta_t* m) {
 }
 
 /* Generation-0 payload bytes of a plain vector (STR: its pool too). */
-static uint64_t plain_raw_bytes(ray_t* s) {
+uint64_t ray_enccol_plain_bytes(ray_t* s) {
+    if (!s || !ray_is_vec(s)) return 0;
     uint64_t b = (uint64_t)s->len * ray_sym_elem_size(s->type, s->attrs);
     if (s->type == RAY_STR && s->str_pool) b += (uint64_t)s->str_pool->len;
     return b;
@@ -2080,7 +2081,7 @@ ray_t* ray_enccol_info(ray_t* encv, ray_enccol_info_t* out) {
                 if (err) return err;
             } else {
                 memset(&si, 0, sizeof si);
-                si.encoded_bytes = si.raw_bytes = plain_raw_bytes(s);
+                si.encoded_bytes = si.raw_bytes = ray_enccol_plain_bytes(s);
             }
             for (int k = 0; k < 10; k++) out->vectors[k] += si.vectors[k];
             out->encoded_bytes += si.encoded_bytes;
@@ -2090,7 +2091,9 @@ ray_t* ray_enccol_info(ray_t* encv, ray_enccol_info_t* out) {
         out->materialized |= ray_enccol_decoded_peek(encv) != NULL;
         return NULL;
     }
-    for (int64_t c = 0; c < e->n_chunks; c++) {
+    /* a synthetic stand-in has an in-memory null image, not a file: no
+     * encodings and no file bytes */
+    for (int64_t c = 0; !out->synthetic && c < e->n_chunks; c++) {
         const ray_enc_desc_t* d;
         ray_t* err = ray_enccol_chunk_descs_ref(e, c, &d);
         if (err) return err;
@@ -2098,7 +2101,7 @@ ray_t* ray_enccol_info(ray_t* encv, ray_enccol_info_t* out) {
         int nv = (int)(((rows > RAY_ENC_CHUNK ? RAY_ENC_CHUNK : rows) + RAY_ENC_VEC - 1) / RAY_ENC_VEC);
         for (int j = 0; j < nv; j++) if (d[j].encoding < 10) out->vectors[d[j].encoding]++;
     }
-    out->encoded_bytes = e->hdr.end_off;
+    out->encoded_bytes = out->synthetic ? 0 : e->hdr.end_off;
     out->raw_bytes = (uint64_t)e->len * ray_enccol_esz(e) + (e->type == RAY_STR ? e->hdr.str_pool_bytes : 0);
     out->materialized = ray_enccol_decoded_peek(encv) != NULL;
     return NULL;

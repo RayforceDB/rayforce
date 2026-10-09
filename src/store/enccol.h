@@ -264,11 +264,14 @@ bool   ray_enccol_is_synthetic(ray_t* encv);
  * memory) and never decodes a payload. */
 typedef struct {
     int64_t  vectors[10];
-    uint64_t encoded_bytes;   /* file bytes (end_off); a plain parted segment counts its raw bytes */
+    uint64_t encoded_bytes;   /* file bytes (end_off) of real encoded files; a plain parted segment
+                               * counts its raw bytes, a synthetic stand-in counts 0 */
     uint64_t raw_bytes;       /* generation-0 payload: len * width (+ STR pool) */
     bool     materialized;
     bool     synthetic;       /* every encoded segment is a synthetic stand-in */
 } ray_enccol_info_t;
+/* Generation-0 payload bytes of a plain vector: len * width (+ STR pool). */
+uint64_t ray_enccol_plain_bytes(ray_t* v);
 /* NULL, or an owned error from a chunk's descriptor validation. */
 ray_t* ray_enccol_info(ray_t* encv, ray_enccol_info_t* out);
 
