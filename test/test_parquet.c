@@ -6,6 +6,7 @@
 #include "io/parquet.h"
 #include "core/pool.h"
 #include "mem/heap.h"
+#include "mem/sys.h"
 #include "table/sym.h"
 #include "store/part.h"
 #include "store/splay.h"
@@ -299,12 +300,193 @@ static void pq_remove_native(const char* dir, const char** columns, int n) {
 /* The direct import picks its pass layout from memory; RAY_PQ_PASS_COLS
  * forces it, so a test covers both: NULL = the default (one pass on any
  * test machine), "1" = column by column. */
-static void pq_set_layout(const char* v) {
+static void pq_set_env(const char* name, const char* v) {
 #ifdef RAY_OS_WINDOWS
-    _putenv_s("RAY_PQ_PASS_COLS", v ? v : "");
+    _putenv_s(name, v ? v : "");
 #else
-    if (v) setenv("RAY_PQ_PASS_COLS", v, 1); else unsetenv("RAY_PQ_PASS_COLS");
+    if (v) setenv(name, v, 1); else unsetenv(name);
 #endif
+}
+static void pq_set_layout(const char* v) { pq_set_env("RAY_PQ_PASS_COLS", v); }
+/* The symbol columns' import: NULL = the default (direct on any test
+ * file), "grouped" = two decodes and the hash-grouped dictionary
+ * (table/symgrp.h), "direct" forced. */
+static void pq_set_symmode(const char* v) { pq_set_env("RAY_PQ_SYM_MODE", v); }
+/* Every knob of the grouped import back to its default (a failed test can
+ * leave one set). */
+static void pq_sym_env_clear(void) {
+    const char* knobs[] = {"RAY_PQ_SYM_MODE","RAY_PQ_SYM_ORDER","RAY_PQ_SYM_GROUPS","RAY_PQ_SYM_WINDOW",
+                           "RAY_PQ_SYM_ARENA","RAY_PQ_SYM_HASH_BITS","RAY_PQ_SYM_INJECT","RAY_PQ_PASS_COLS"};
+    for (size_t i = 0; i < sizeof(knobs)/sizeof(knobs[0]); i++) pq_set_env(knobs[i], NULL);
+}
+
+/* A Parquet file for the grouped import's tests: `groups` row groups of
+ * x, the row as a required INT32, and s, an optional BYTE_ARRAY (UTF8) that
+ * fn gives (NULL for a null); PLAIN, uncompressed, one v1 data page per
+ * chunk.  The thrift compact encoding of test/data/parquet/generate.py. */
+typedef const char* (*pq_synth_fn)(int64_t row, char* buf, uint32_t* len);
+typedef struct { uint8_t* p; size_t n, cap; bool bad; } pq_buf;
+static void pb_bytes(pq_buf* b, const void* s, size_t n) {
+    if (b->bad) return;
+    if (b->n + n > b->cap) {
+        size_t cap = b->cap ? b->cap : 4096;
+        while (cap < b->n + n) cap *= 2;
+        uint8_t* p = (uint8_t*)ray_sys_realloc(b->p, cap);
+        if (!p) { b->bad = true; return; }
+        b->p = p; b->cap = cap;
+    }
+    if (n) memcpy(b->p + b->n, s, n);
+    b->n += n;
+}
+static void pb_byte(pq_buf* b, uint8_t v) { pb_bytes(b, &v, 1); }
+static void pb_var(pq_buf* b, uint64_t v) {
+    while (v > 127) { pb_byte(b, (uint8_t)((v & 127) | 128)); v >>= 7; }
+    pb_byte(b, (uint8_t)v);
+}
+static void pb_zz(pq_buf* b, int64_t v) { pb_var(b, ((uint64_t)v << 1) ^ (uint64_t)(v >> 63)); }
+enum { PB_I32 = 5, PB_I64 = 6, PB_BIN = 8, PB_LIST = 9, PB_STRUCT = 12 };
+static void pb_field(pq_buf* b, int* last, int id, int type) {
+    int d = id - *last;
+    if (d > 0 && d < 16) pb_byte(b, (uint8_t)((d << 4) | type));
+    else { pb_byte(b, (uint8_t)type); pb_zz(b, id); }
+    *last = id;
+}
+static void pb_i(pq_buf* b, int* last, int id, int type, int64_t v) { pb_field(b, last, id, type); pb_zz(b, v); }
+static void pb_bin(pq_buf* b, const char* s, size_t n) { pb_var(b, n); pb_bytes(b, s, n); }
+static void pb_list(pq_buf* b, int n, int type) {
+    if (n < 15) pb_byte(b, (uint8_t)((n << 4) | type));
+    else { pb_byte(b, (uint8_t)(0xf0 | type)); pb_var(b, (uint64_t)n); }
+}
+/* Columns x, s (fn of the row) and t (fn of the row + rows / 2: a
+ * vocabulary that meets s's, for the second column's pass). */
+#define PQ_SYNTH_COLS 3
+static bool pq_synth(const char* path, int64_t rows, int64_t groups, pq_synth_fn fn) {
+    pq_buf f = {0}, page = {0}, levels = {0}, values = {0};
+    int64_t* at = (int64_t*)ray_sys_alloc((size_t)groups * PQ_SYNTH_COLS * sizeof(int64_t));
+    int64_t* sz = (int64_t*)ray_sys_alloc((size_t)groups * PQ_SYNTH_COLS * sizeof(int64_t));
+    if (!at || !sz) return false;
+    pb_bytes(&f, "PAR1", 4);
+    char buf[256];
+    for (int64_t g = 0; g < groups; g++) {
+        int64_t lo = rows * g / groups, hi = rows * (g + 1) / groups;
+        for (int c = 0; c < PQ_SYNTH_COLS; c++) {
+            levels.n = values.n = page.n = 0;
+            if (c == 0) for (int64_t r = lo; r < hi; r++) { int32_t x = (int32_t)r; pb_bytes(&values, &x, 4); }
+            else {
+                uint8_t bits = 0;
+                int64_t n = hi - lo, groups8 = (n + 7) / 8;
+                pb_var(&levels, (uint64_t)(groups8 * 2 + 1));
+                for (int64_t r = lo; r < lo + groups8 * 8; r++) {
+                    uint32_t len = 0;
+                    const char* s = r < hi ? fn(c == 1 ? r : r + rows / 2, buf, &len) : NULL;
+                    if (s) { bits |= (uint8_t)(1u << ((r - lo) & 7)); pb_bytes(&values, &len, 4); pb_bytes(&values, s, len); }
+                    if (((r - lo) & 7) == 7) { pb_byte(&levels, bits); bits = 0; }
+                }
+                uint32_t ln = (uint32_t)levels.n;
+                pb_bytes(&page, &ln, 4); pb_bytes(&page, levels.p, levels.n);
+            }
+            pb_bytes(&page, values.p, values.n);
+            int last = 0;
+            int64_t start = (int64_t)f.n;
+            pb_i(&f, &last, 1, PB_I32, 0);
+            pb_i(&f, &last, 2, PB_I32, (int64_t)page.n);
+            pb_i(&f, &last, 3, PB_I32, (int64_t)page.n);
+            pb_field(&f, &last, 5, PB_STRUCT);
+            int l2 = 0;
+            pb_i(&f, &l2, 1, PB_I32, hi - lo); pb_i(&f, &l2, 2, PB_I32, 0);
+            pb_i(&f, &l2, 3, PB_I32, 3); pb_i(&f, &l2, 4, PB_I32, 3);
+            pb_byte(&f, 0); pb_byte(&f, 0);
+            pb_bytes(&f, page.p, page.n);
+            at[g * PQ_SYNTH_COLS + c] = start; sz[g * PQ_SYNTH_COLS + c] = (int64_t)f.n - start;
+        }
+    }
+    static const char* cols[PQ_SYNTH_COLS] = {"x","s","t"};
+    int64_t footer = (int64_t)f.n;
+    int last = 0;
+    pb_i(&f, &last, 1, PB_I32, 1);
+    pb_field(&f, &last, 2, PB_LIST); pb_list(&f, PQ_SYNTH_COLS + 1, PB_STRUCT);
+    { int l = 0; pb_i(&f, &l, 3, PB_I32, 0); pb_field(&f, &l, 4, PB_BIN); pb_bin(&f, "schema", 6); pb_i(&f, &l, 5, PB_I32, PQ_SYNTH_COLS); pb_byte(&f, 0); }
+    { int l = 0; pb_i(&f, &l, 1, PB_I32, 1); pb_i(&f, &l, 3, PB_I32, 0); pb_field(&f, &l, 4, PB_BIN); pb_bin(&f, "x", 1); pb_byte(&f, 0); }
+    for (int c = 1; c < PQ_SYNTH_COLS; c++) {
+        int l = 0;
+        pb_i(&f, &l, 1, PB_I32, 6); pb_i(&f, &l, 3, PB_I32, 1);
+        pb_field(&f, &l, 4, PB_BIN); pb_bin(&f, cols[c], 1); pb_i(&f, &l, 6, PB_I32, 0); pb_byte(&f, 0);
+    }
+    pb_i(&f, &last, 3, PB_I64, rows);
+    pb_field(&f, &last, 4, PB_LIST); pb_list(&f, (int)groups, PB_STRUCT);
+    for (int64_t g = 0; g < groups; g++) {
+        int64_t n = rows * (g + 1) / groups - rows * g / groups, total = 0;
+        int l = 0;
+        pb_field(&f, &l, 1, PB_LIST); pb_list(&f, PQ_SYNTH_COLS, PB_STRUCT);
+        for (int c = 0; c < PQ_SYNTH_COLS; c++) {
+            int64_t i = g * PQ_SYNTH_COLS + c;
+            int lc = 0;
+            pb_i(&f, &lc, 2, PB_I64, at[i]);
+            pb_field(&f, &lc, 3, PB_STRUCT);
+            int lm = 0;
+            pb_i(&f, &lm, 1, PB_I32, c ? 6 : 1);
+            pb_field(&f, &lm, 2, PB_LIST); pb_list(&f, 2, PB_I32); pb_zz(&f, 0); pb_zz(&f, 3);
+            pb_field(&f, &lm, 3, PB_LIST); pb_list(&f, 1, PB_BIN); pb_bin(&f, cols[c], 1);
+            pb_i(&f, &lm, 4, PB_I32, 0);
+            pb_i(&f, &lm, 5, PB_I64, n);
+            pb_i(&f, &lm, 6, PB_I64, sz[i]);
+            pb_i(&f, &lm, 7, PB_I64, sz[i]);
+            pb_i(&f, &lm, 9, PB_I64, at[i]);
+            pb_byte(&f, 0);   /* meta */
+            pb_byte(&f, 0);   /* column chunk */
+            total += sz[i];
+        }
+        pb_i(&f, &l, 2, PB_I64, total);
+        pb_i(&f, &l, 3, PB_I64, n);
+        pb_byte(&f, 0);
+    }
+    pb_field(&f, &last, 6, PB_BIN); pb_bin(&f, "rayforce test", 13);
+    pb_byte(&f, 0);
+    uint32_t flen = (uint32_t)(f.n - (size_t)footer);
+    pb_bytes(&f, &flen, 4); pb_bytes(&f, "PAR1", 4);
+    bool ok = !f.bad && !page.bad && !levels.bad && !values.bad;
+    FILE* out = ok ? fopen(path, "wb") : NULL;
+    ok = out && fwrite(f.p, 1, f.n, out) == f.n;
+    if (out && fclose(out)) ok = false;
+    ray_sys_free(f.p); ray_sys_free(page.p); ray_sys_free(levels.p); ray_sys_free(values.p);
+    ray_sys_free(at); ray_sys_free(sz);
+    return ok;
+}
+/* The columns s and t of an import as strings: true when every row is
+ * fn's (a null and "" both the empty symbol). */
+static bool pq_synth_check(const char* dir, int64_t rows, pq_synth_fn fn) {
+    char sym[200]; snprintf(sym, sizeof(sym), "%s/.sym", dir);
+    ray_t* t = ray_read_splayed(dir, sym);
+    if (!t || RAY_IS_ERR(t)) { if (t) ray_error_free(t); return false; }
+    bool ok = ray_table_nrows(t) == rows;
+    char buf[256];
+    for (int c = 1; ok && c < PQ_SYNTH_COLS; c++) {
+        ray_t* s = ray_table_get_col_idx(t, c);
+        for (int64_t r = 0; ok && r < rows; r++) {
+            uint32_t len = 0;
+            const char* want = fn(c == 1 ? r : r + rows / 2, buf, &len);
+            if (!want) len = 0;
+            ray_t* text = ray_sym_vec_cell(s, r);
+            ok = text && ray_str_len(text) == len && (!len || !memcmp(ray_str_ptr(text), want, len));
+            if (ok && ((int32_t*)ray_data(ray_table_get_col_idx(t, 0)))[r] != r) ok = false;
+        }
+    }
+    ray_release(t);
+    return ok;
+}
+/* A whole file's bytes compared with another's. */
+static bool pq_same_file(const char* a, const char* b) {
+    FILE* fa = fopen(a, "rb"); FILE* fb = fopen(b, "rb");
+    bool ok = fa && fb;
+    while (ok) {
+        char x[4096], y[4096];
+        size_t na = fread(x, 1, sizeof(x), fa), nb = fread(y, 1, sizeof(y), fb);
+        if (na != nb || memcmp(x, y, na)) ok = false;
+        if (!na) break;
+    }
+    if (fa) fclose(fa);
+    if (fb) fclose(fb);
+    return ok;
 }
 static test_result_t test_pq_group_native(void) {
     const char* names[] = {"x","y","s"};
@@ -312,11 +494,16 @@ static test_result_t test_pq_group_native(void) {
     ray_t* types = ray_vec_from_raw(RAY_SYM,tids,3);
     for (int cores = 1; cores <= 8; cores *= 2) {
         ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(cores),RAY_OK);
-        for (int sym = 0; sym < 4; sym++) {
+        /* 0-3: STR or SYM, one pass or column by column; 5 and 7: SYM
+         * through the grouped import */
+        for (int run = 0; run < 8; run++) {
+            if (run == 4 || run == 6) continue;
+            int sym = run & 3;
             pq_set_layout(sym >= 2 ? "1" : NULL);
-            char dir[160]; snprintf(dir,sizeof(dir),"/tmp/rayforce-pq-groups-%d-%d-%d",(int)getpid(),cores,sym);
+            pq_set_symmode(run >= 4 ? "grouped" : NULL);
+            char dir[160]; snprintf(dir,sizeof(dir),"/tmp/rayforce-pq-groups-%d-%d-%d",(int)getpid(),cores,run);
             ray_t* result = ray_parquet_splayed_typed(FIX "row-groups.parquet",dir,sym & 1 ? types : NULL);
-            pq_set_layout(NULL);
+            pq_set_layout(NULL); pq_set_symmode(NULL);
             TEST_ASSERT_FALSE(RAY_IS_ERR(result)); TEST_ASSERT_EQ_I(result->i64,44009); ray_release(result);
             char domain[200]; snprintf(domain,sizeof(domain),"%s/.sym",dir);
             ray_t* table = ray_read_splayed(dir,sym & 1 ? domain : NULL);
@@ -344,16 +531,23 @@ static test_result_t test_pq_group_native(void) {
     const char* unames[] = {"day","ts","s"};
     int64_t units[] = {ray_sym_intern("UNIX_DATE",9),ray_sym_intern("UNIX_SECONDS",12),ray_sym_intern("SYM",3)};
     types = ray_vec_from_raw(RAY_SYM,units,3);
-    char dir[160]; snprintf(dir,sizeof(dir),"/tmp/rayforce-pq-unix-%d",(int)getpid());
-    ray_t* result = ray_parquet_splayed_typed(FIX "unix.parquet",dir,types);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(result)); ray_release(result); ray_release(types);
-    char domain[200]; snprintf(domain,sizeof(domain),"%s/.sym",dir);
-    ray_t* table = ray_read_splayed(dir,domain); TEST_ASSERT_FALSE(RAY_IS_ERR(table));
-    TEST_ASSERT_EQ_I(ray_table_get_col_idx(table,0)->type,RAY_DATE);
-    TEST_ASSERT_EQ_I(((int32_t*)ray_data(ray_table_get_col_idx(table,0)))[1],1);
-    TEST_ASSERT_EQ_I(ray_table_get_col_idx(table,1)->type,RAY_TIMESTAMP);
-    TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_table_get_col_idx(table,1)))[1],1000000000);
-    ray_release(table); pq_remove_native(dir,unames,3);
+    for (int grouped = 0; grouped < 2; grouped++) {
+        char dir[160]; snprintf(dir,sizeof(dir),"/tmp/rayforce-pq-unix-%d-%d",(int)getpid(),grouped);
+        pq_set_symmode(grouped ? "grouped" : NULL);
+        ray_t* result = ray_parquet_splayed_typed(FIX "unix.parquet",dir,types);
+        pq_set_symmode(NULL);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result)); ray_release(result);
+        char domain[200]; snprintf(domain,sizeof(domain),"%s/.sym",dir);
+        ray_t* table = ray_read_splayed(dir,domain); TEST_ASSERT_FALSE(RAY_IS_ERR(table));
+        TEST_ASSERT_EQ_I(ray_table_get_col_idx(table,0)->type,RAY_DATE);
+        TEST_ASSERT_EQ_I(((int32_t*)ray_data(ray_table_get_col_idx(table,0)))[1],1);
+        TEST_ASSERT_EQ_I(ray_table_get_col_idx(table,1)->type,RAY_TIMESTAMP);
+        TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_table_get_col_idx(table,1)))[1],1000000000);
+        ray_t* text = ray_sym_vec_cell(ray_table_get_col_idx(table,2),1);
+        TEST_ASSERT_TRUE(text && !strcmp(ray_str_ptr(text),"pooled string number two"));
+        ray_release(table); pq_remove_native(dir,unames,3);
+    }
+    ray_release(types);
     PASS();
 }
 /* The direct import over dictionary pages, stored (flat-0-v1) and Snappy
@@ -369,12 +563,13 @@ static test_result_t test_pq_native_dictionary(void) {
     int64_t ids[] = {ray_sym_intern("I32",3),ray_sym_intern("SYM",3),ray_sym_intern("I16",3),
         ray_sym_intern("I64",3),ray_sym_intern("DATE",4),ray_sym_intern("TIMESTAMP",9),ray_sym_intern("F64",3)};
     ray_t* types = ray_vec_from_raw(RAY_SYM,ids,7);
-    for (int run = 0; run < 8; run++) {
+    for (int run = 0; run < 16; run++) {   /* 8-15: the grouped import */
         ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(run & 2 ? 4 : 1),RAY_OK);
         char dir[160]; snprintf(dir,sizeof(dir),"/tmp/rayforce-pq-dict-%d-%d",(int)getpid(),run);
         pq_set_layout(run & 4 ? "1" : NULL);
+        pq_set_symmode(run & 8 ? "grouped" : NULL);
         ray_t* result = ray_parquet_splayed_typed(files[run & 1],dir,types);
-        pq_set_layout(NULL);
+        pq_set_layout(NULL); pq_set_symmode(NULL);
         TEST_ASSERT_FALSE(RAY_IS_ERR(result)); TEST_ASSERT_EQ_I(result->i64,18); ray_release(result);
         char sym[200]; snprintf(sym,sizeof(sym),"%s/.sym",dir);
         ray_t* table = ray_read_splayed(dir,sym);
@@ -411,30 +606,43 @@ static test_result_t test_pq_native_edges(void) {
         if (first) TEST_ASSERT_TRUE(!memcmp(text,"a repeated pooled string",24));
     }
     ray_release(t);
-    char dir[160]; snprintf(dir,sizeof(dir),"/tmp/rayforce-pq-rle-%d",(int)getpid());
-    t = ray_parquet_splayed_typed(FIX "rle-runs.parquet",dir,types);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(t)); ray_release(t); ray_release(types);
-    char sym[200]; snprintf(sym,sizeof(sym),"%s/.sym",dir);
-    t = ray_read_splayed(dir,sym); TEST_ASSERT_FALSE(RAY_IS_ERR(t));
-    for (int i = 0; i < 24597; i++) {
-        ray_t* text = ray_sym_vec_cell(ray_table_get_col_idx(t,2),i);
-        TEST_ASSERT_EQ_I(ray_str_len(text),i%8199 < 4099 ? 24 : 0);
+    char dir[160], sym[200];
+    for (int grouped = 0; grouped < 2; grouped++) {
+        snprintf(dir,sizeof(dir),"/tmp/rayforce-pq-rle-%d-%d",(int)getpid(),grouped);
+        pq_set_symmode(grouped ? "grouped" : NULL);
+        t = ray_parquet_splayed_typed(FIX "rle-runs.parquet",dir,types);
+        pq_set_symmode(NULL);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(t)); ray_release(t);
+        snprintf(sym,sizeof(sym),"%s/.sym",dir);
+        t = ray_read_splayed(dir,sym); TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+        for (int i = 0; i < 24597; i++) {
+            ray_t* text = ray_sym_vec_cell(ray_table_get_col_idx(t,2),i);
+            TEST_ASSERT_EQ_I(ray_str_len(text),i%8199 < 4099 ? 24 : 0);
+        }
+        ray_release(t);
+        const char* names[] = {"x","y","s"}; pq_remove_native(dir,names,3);
     }
-    ray_release(t);
-    const char* names[] = {"x","y","s"}; pq_remove_native(dir,names,3);
+    ray_release(types);
     int64_t empty_ids[] = {ray_sym_intern("I32",3),ray_sym_intern("SYM",3),ray_sym_intern("I16",3),
         ray_sym_intern("I64",3),ray_sym_intern("DATE",4),ray_sym_intern("TIMESTAMP",9),ray_sym_intern("F64",3)};
     types = ray_vec_from_raw(RAY_SYM,empty_ids,7);
     snprintf(dir,sizeof(dir),"/tmp/rayforce-pq-empty-native-%d",(int)getpid());
+    pq_set_symmode("grouped");   /* no row group: the grouped import's empty pass */
     t = ray_parquet_splayed_typed(FIX "empty.parquet",dir,types);
+    pq_set_symmode(NULL);
     TEST_ASSERT_FALSE(RAY_IS_ERR(t)); TEST_ASSERT_EQ_I(t->i64,0); ray_release(t);
     snprintf(sym,sizeof(sym),"%s/.sym",dir);
     t = ray_read_splayed(dir,sym); TEST_ASSERT_FALSE(RAY_IS_ERR(t)); TEST_ASSERT_EQ_I(ray_table_nrows(t),0); ray_release(t);
     const char* enames[] = {"x","name","flag","wide","day","ts","f"}; pq_remove_native(dir,enames,7);
     /* A corrupt worker must join the others and leave the final name absent. */
-    t = ray_parquet_splayed_typed(FIX "projection.parquet",dir,types);
-    TEST_ASSERT_TRUE(RAY_IS_ERR(t)); ray_release(t); TEST_ASSERT_TRUE(access(dir,F_OK) != 0);
-    char partial[200]; snprintf(partial,sizeof(partial),"%s.parquet-partial",dir); pq_remove_native(partial,enames,7);
+    char partial[200];
+    for (int grouped = 0; grouped < 2; grouped++) {
+        pq_set_symmode(grouped ? "grouped" : NULL);
+        t = ray_parquet_splayed_typed(FIX "projection.parquet",dir,types);
+        pq_set_symmode(NULL);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(t)); ray_release(t); TEST_ASSERT_TRUE(access(dir,F_OK) != 0);
+        snprintf(partial,sizeof(partial),"%s.parquet-partial",dir); pq_remove_native(partial,enames,7);
+    }
     /* Typed partition import uses the same native epoch/width contract. */
     snprintf(dir,sizeof(dir),"/tmp/rayforce-pq-typed-parts-%d",(int)getpid());
     t = ray_parquet_parted_typed(FIX "flat-1-v2.parquet",dir,"hits",types);
@@ -610,6 +818,216 @@ static test_result_t test_pq_chunk_flush_error(void) {
     PASS();
 }
 #endif
+
+/* Rows for the grouped import: repeats inside and across row groups,
+ * nulls, "" and strings past the inline bytes. */
+static const char* pq_synth_mixed(int64_t r, char* buf, uint32_t* len) {
+    if (r % 17 == 0) return NULL;
+    if (r % 23 == 0) { *len = 0; return buf; }
+    int n = snprintf(buf, 256, "v%lld-%s", (long long)((r * 7919) % 3001),
+                     r % 3 ? "s" : "a longer tail past the inline bytes");
+    *len = (uint32_t)n;
+    return buf;
+}
+/* 48 strings of one length told apart by one byte: the first, the middle
+ * or the last. */
+static const char* pq_synth_alike(int64_t r, char* buf, uint32_t* len) {
+    if (r % 29 == 0) return NULL;
+    memcpy(buf, "abcdefghijklmnopqrstuvwxyz012345", 32);
+    int v = (int)((r * 13) % 48), at = v < 16 ? 0 : v < 32 ? 16 : 31;
+    buf[at] = (char)('A' + v % 16);
+    *len = 32;
+    return buf;
+}
+/* A unique 100-byte string a row. */
+static const char* pq_synth_long(int64_t r, char* buf, uint32_t* len) {
+    int n = snprintf(buf, 256, "%08lld", (long long)r);
+    memset(buf + n, 'x', (size_t)(100 - n));
+    *len = 100;
+    return buf;
+}
+/* The entries of an import's symbol file (its header count). */
+static int64_t pq_sym_count(const char* dir) {
+    char path[200]; snprintf(path, sizeof(path), "%s/.sym", dir);
+    FILE* f = fopen(path, "rb");
+    uint8_t head[12];
+    int64_t count = -1;
+    if (f && fread(head, 1, 12, f) == 12) memcpy(&count, head + 4, 8);
+    if (f) fclose(f);
+    return count;
+}
+
+/* The grouped import of a 9-row-group file: every row's string, the same
+ * vocabulary as the direct import's, and positions (the symbol file and the
+ * column file byte for byte) that do not depend on the worker count, in
+ * every order of new positions, over several hash groups and windows. */
+static test_result_t test_pq_sym_grouped(void) {
+    pq_sym_env_clear();
+    char src[160]; snprintf(src, sizeof(src), "/tmp/rayforce-pq-synth-%d.parquet", (int)getpid());
+    const int64_t rows = 20000;
+    TEST_ASSERT_TRUE(pq_synth(src, rows, 9, pq_synth_mixed));
+    int64_t tids[] = {ray_sym_intern("I32",3), ray_sym_intern("SYM",3), ray_sym_intern("SYM",3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 3);
+    const char* names[] = {"x","s","t"};
+    const char* orders[] = {"rows","shards","freq"};
+    char dir[160], ref[160], a[200], b[200];
+    snprintf(dir, sizeof(dir), "/tmp/rayforce-pq-sg-direct-%d", (int)getpid());
+    pq_set_symmode("direct");
+    ray_t* res = ray_parquet_splayed_typed(src, dir, types);
+    pq_set_symmode(NULL);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res)); ray_release(res);
+    TEST_ASSERT_TRUE(pq_synth_check(dir, rows, pq_synth_mixed));
+    int64_t words = pq_sym_count(dir);
+    TEST_ASSERT_TRUE(words > 1000);
+    pq_remove_native(dir, names, 3);
+    pq_set_env("RAY_PQ_SYM_GROUPS", "4");
+    pq_set_env("RAY_PQ_SYM_WINDOW", "4096");   /* debug builds: several windows */
+    for (int o = 0; o < 3; o++) {
+        pq_set_env("RAY_PQ_SYM_ORDER", orders[o]);
+        snprintf(ref, sizeof(ref), "/tmp/rayforce-pq-sg-%d-%d-1", (int)getpid(), o);
+        for (int cores = 1; cores <= 8; cores *= 2) {
+            ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(cores), RAY_OK);
+            snprintf(dir, sizeof(dir), "/tmp/rayforce-pq-sg-%d-%d-%d", (int)getpid(), o, cores);
+            pq_set_symmode("grouped"); pq_set_layout(cores == 2 ? "1" : NULL);
+            res = ray_parquet_splayed_typed(src, dir, types);
+            pq_set_symmode(NULL); pq_set_layout(NULL);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(res)); TEST_ASSERT_EQ_I(res->i64, rows); ray_release(res);
+            TEST_ASSERT_TRUE(pq_synth_check(dir, rows, pq_synth_mixed));
+            TEST_ASSERT_EQ_I(pq_sym_count(dir), words);   /* no string twice */
+            if (cores > 1) {
+                snprintf(a, sizeof(a), "%s/.sym", ref); snprintf(b, sizeof(b), "%s/.sym", dir);
+                TEST_ASSERT_TRUE(pq_same_file(a, b));
+                for (int c = 1; c < 3; c++) {
+                    snprintf(a, sizeof(a), "%s/%s", ref, names[c]); snprintf(b, sizeof(b), "%s/%s", dir, names[c]);
+                    TEST_ASSERT_TRUE(pq_same_file(a, b));
+                }
+                pq_remove_native(dir, names, 3);
+            }
+            ray_pool_destroy();
+        }
+        pq_remove_native(ref, names, 3);
+    }
+    pq_set_env("RAY_PQ_SYM_ORDER", NULL); pq_set_env("RAY_PQ_SYM_GROUPS", NULL);
+    pq_set_env("RAY_PQ_SYM_WINDOW", NULL);
+    ray_release(types); unlink(src);
+    PASS();
+}
+
+/* Hash collisions on purpose (a debug build keeps none of the hash's bits):
+ * 48 strings of one length that differ only in their first, middle or last
+ * byte all share a hash, and the dedupe arena is small enough to start
+ * over inside a chunk.  Every candidate is then compared, most mismatch,
+ * and each string still gets one position of its own, in every order, on
+ * one worker and four; with some of the bits kept the vocabulary is the
+ * direct import's. */
+static test_result_t test_pq_sym_grouped_collisions(void) {
+#if !defined(DEBUG)
+    SKIP("hash truncation is a debug-build knob");
+#else
+    pq_sym_env_clear();
+    char src[160], mix[160], dir[160];
+    snprintf(src, sizeof(src), "/tmp/rayforce-pq-alike-%d.parquet", (int)getpid());
+    snprintf(mix, sizeof(mix), "/tmp/rayforce-pq-mixed-%d.parquet", (int)getpid());
+    TEST_ASSERT_TRUE(pq_synth(src, 3000, 5, pq_synth_alike));
+    TEST_ASSERT_TRUE(pq_synth(mix, 6000, 4, pq_synth_mixed));
+    int64_t tids[] = {ray_sym_intern("I32",3), ray_sym_intern("SYM",3), ray_sym_intern("SYM",3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 3);
+    const char* names[] = {"x","s","t"};
+    const char* orders[] = {"rows","shards","freq"};
+    snprintf(dir, sizeof(dir), "/tmp/rayforce-pq-coll-%d", (int)getpid());
+    ray_t* res = ray_parquet_splayed_typed(mix, dir, types);   /* direct */
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res)); ray_release(res);
+    int64_t words = pq_sym_count(dir);
+    pq_remove_native(dir, names, 3);
+    pq_set_env("RAY_PQ_SYM_ARENA", "200");
+    /* one window (candidates of other tasks deferred, mismatches redone)
+     * or a window a task (candidates compared with records read before) */
+    for (int run = 0; run < 12; run++) {
+            int o = run % 3, cores = run & 4 ? 4 : 1;
+            pq_set_env("RAY_PQ_SYM_WINDOW", run >= 6 ? "64" : NULL);
+            ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(cores), RAY_OK);
+            pq_set_env("RAY_PQ_SYM_ORDER", orders[o]);
+            pq_set_env("RAY_PQ_SYM_HASH_BITS", "0");
+            pq_set_symmode("grouped");
+            res = ray_parquet_splayed_typed(src, dir, types);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(res)); ray_release(res);
+            TEST_ASSERT_TRUE(pq_synth_check(dir, 3000, pq_synth_alike));
+            TEST_ASSERT_EQ_I(pq_sym_count(dir), 49);   /* "" and the 48 */
+            pq_remove_native(dir, names, 3);
+            pq_set_env("RAY_PQ_SYM_HASH_BITS", "6");
+            res = ray_parquet_splayed_typed(mix, dir, types);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(res)); ray_release(res);
+            TEST_ASSERT_TRUE(pq_synth_check(dir, 6000, pq_synth_mixed));
+            TEST_ASSERT_EQ_I(pq_sym_count(dir), words);
+            pq_remove_native(dir, names, 3);
+            ray_pool_destroy();
+        }
+    pq_set_symmode(NULL);
+    pq_set_env("RAY_PQ_SYM_ORDER", NULL); pq_set_env("RAY_PQ_SYM_HASH_BITS", NULL);
+    pq_set_env("RAY_PQ_SYM_ARENA", NULL); pq_set_env("RAY_PQ_SYM_WINDOW", NULL);
+    ray_release(types); unlink(src); unlink(mix);
+    PASS();
+#endif
+}
+
+/* The grouped import failing: out of memory in each of its steps (a debug
+ * build injects it), cancelled in the middle, and the symbol file unable to
+ * grow (the file size limit; the direct import too).  Each reports its
+ * error and publishes nothing. */
+static test_result_t test_pq_sym_grouped_failures(void) {
+    pq_sym_env_clear();
+    char src[160], big[160], dir[160], partial[200];
+    snprintf(src, sizeof(src), "/tmp/rayforce-pq-fail-%d.parquet", (int)getpid());
+    snprintf(big, sizeof(big), "/tmp/rayforce-pq-fail-big-%d.parquet", (int)getpid());
+    snprintf(dir, sizeof(dir), "/tmp/rayforce-pq-fail-%d", (int)getpid());
+    snprintf(partial, sizeof(partial), "%s.parquet-partial", dir);
+    TEST_ASSERT_TRUE(pq_synth(src, 20000, 9, pq_synth_mixed));
+    TEST_ASSERT_TRUE(pq_synth(big, 20000, 4, pq_synth_long));
+    int64_t tids[] = {ray_sym_intern("I32",3), ray_sym_intern("SYM",3), ray_sym_intern("SYM",3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 3);
+    const char* names[] = {"x","s","t"};
+    ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+#if defined(DEBUG)
+    const char* steps[] = {"r1","p2","load","r2","settle","cancel"};
+    for (int i = 0; i < 6; i++) {
+        pq_set_symmode("grouped");
+        pq_set_env("RAY_PQ_SYM_INJECT", steps[i]);
+        ray_t* res = ray_parquet_splayed_typed(src, dir, types);
+        pq_set_env("RAY_PQ_SYM_INJECT", NULL); pq_set_symmode(NULL);
+        bool failed = res && RAY_IS_ERR(res);
+        bool cancel = failed && !strcmp(ray_err_code(res), "cancel");
+        if (res) { if (failed) ray_error_free(res); else ray_release(res); }
+        ray_clear_interrupt();
+        TEST_ASSERT_TRUE(failed);
+        TEST_ASSERT_TRUE(cancel == (i == 5));
+        TEST_ASSERT_TRUE(access(dir, F_OK) != 0);
+        pq_remove_native(partial, names, 3);
+    }
+#endif
+#if defined(__linux__)
+    /* 2 MB of records; the column files are 80 KB */
+    for (int grouped = 0; grouped < 2; grouped++) {
+        struct rlimit old, lim;
+        TEST_ASSERT_EQ_I(getrlimit(RLIMIT_FSIZE, &old), 0);
+        lim = old; lim.rlim_cur = 1536 << 10;
+        void (*prev)(int) = signal(SIGXFSZ, SIG_IGN);
+        pq_set_symmode(grouped ? "grouped" : "direct");
+        TEST_ASSERT_EQ_I(setrlimit(RLIMIT_FSIZE, &lim), 0);
+        ray_t* res = ray_parquet_splayed_typed(big, dir, types);
+        setrlimit(RLIMIT_FSIZE, &old);
+        signal(SIGXFSZ, prev);
+        pq_set_symmode(NULL);
+        bool failed = res && RAY_IS_ERR(res);
+        if (res) { if (failed) ray_error_free(res); else ray_release(res); }
+        TEST_ASSERT_TRUE(failed);
+        TEST_ASSERT_TRUE(access(dir, F_OK) != 0);
+        pq_remove_native(partial, names, 3);
+    }
+#endif
+    ray_pool_destroy();
+    ray_release(types); unlink(src); unlink(big);
+    PASS();
+}
 const test_entry_t parquet_entries[] = {
     {"parquet/small_stack",test_pq_small_stack,NULL,NULL},
     {"parquet/parted_symbols",test_pq_parted_symbols,pq_setup,pq_teardown},
@@ -623,6 +1041,9 @@ const test_entry_t parquet_entries[] = {
     {"parquet/native_edges",test_pq_native_edges,pq_setup,pq_teardown},
     {"parquet/native_dictionary",test_pq_native_dictionary,pq_setup,pq_teardown},
     {"parquet/group_native",test_pq_group_native,pq_setup,pq_teardown},
+    {"parquet/sym_grouped",test_pq_sym_grouped,pq_setup,pq_teardown},
+    {"parquet/sym_grouped_collisions",test_pq_sym_grouped_collisions,pq_setup,pq_teardown},
+    {"parquet/sym_grouped_failures",test_pq_sym_grouped_failures,pq_setup,pq_teardown},
 #if defined(__linux__)
     {"parquet/chunk_flush_error",test_pq_chunk_flush_error,pq_setup,pq_teardown},
 #endif

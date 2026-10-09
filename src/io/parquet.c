@@ -12,9 +12,11 @@
 #include "core/crc32.h"
 #include "core/profile.h"
 #include "mem/heap.h"
+#include "mem/sys.h"        /* ray_sys_free: the grouped import's redo list */
 #include "table/sym.h"
 #include "table/domain.h"
 #include "table/symimp.h"   /* ray_symimp_stats_t: RAY_CSV_TRACE */
+#include "table/symgrp.h"   /* the grouped symbol import */
 #include "vec/str.h"
 #include "vec/vec.h"
 #include "ops/idxop.h"
@@ -34,6 +36,9 @@
 #include <sys/stat.h>
 #ifndef RAY_OS_WINDOWS
 #include <unistd.h>
+#endif
+#if defined(__linux__)
+#include <sys/resource.h>   /* getrusage: the grouped import's trace */
 #endif
 #if defined(__SSE2__)
 #include <emmintrin.h>
@@ -1962,6 +1967,489 @@ static void pq_symflush_fn(void* arg) {
             ray_sleep_ms(10);
     }
 }
+
+/* ---- the grouped symbol import (table/symgrp.h) ---------------------------
+ * A symbol column whose strings would make the import dictionary too big to
+ * probe at random goes in two decodes of its chunks: the first deduplicates
+ * each chunk and stages its distinct strings' hashes and lengths, the
+ * dictionary then gives them verdicts one hash group at a time, and the
+ * second decode writes the new strings, compares every candidate's bytes
+ * with its record and writes the codes.  No string is kept between the two;
+ * the symbol file is only appended to and read in position order. */
+typedef enum { PQ_SYM_AUTO, PQ_SYM_DIRECT, PQ_SYM_GROUPED } pq_sym_mode;
+
+/* One chunk's exact dedupe: local ids by first occurrence (0 is the null
+ * and "" row), a repeat found by length, then hash, then bytes.  The bytes
+ * of the generation's strings sit in an arena; when it is full the table
+ * starts over, so a later repeat gets an id of its own, which the
+ * dictionary links to the first.  Both decodes make the same ids. */
+typedef struct {
+    ray_symgrp_fp_t* fp;        /* local id i + 1 at fp[i] */
+    uint32_t* cnt;              /* FREQ: rows per local id */
+    int64_t n, cap;
+    uint32_t* slot; uint64_t mask;
+    int64_t* aoff;              /* arena offset, by local id - first */
+    char* arena; int64_t abytes, acap, first, gens;
+} pq_dedup;
+
+static void pq_dedup_free(pq_dedup* d) {
+    ray_free_raw(d->fp); ray_free_raw(d->cnt); ray_free_raw(d->slot);
+    ray_free_raw(d->aoff); ray_free_raw(d->arena);
+    memset(d,0,sizeof(*d));
+}
+static bool pq_dedup_init(pq_dedup* d, int64_t acap, bool counts) {
+    memset(d,0,sizeof(*d));
+    d->acap = acap; d->first = 1; d->cap = 1024; d->mask = 2047;
+    d->fp = ray_alloc_raw((size_t)d->cap*sizeof(*d->fp));
+    d->aoff = ray_alloc_raw((size_t)d->cap*sizeof(*d->aoff));
+    d->slot = ray_calloc_raw((size_t)(d->mask+1)*sizeof(*d->slot));
+    d->arena = ray_alloc_raw((size_t)acap);
+    if (counts) d->cnt = ray_calloc_raw((size_t)(d->cap+1)*sizeof(*d->cnt));
+    return d->fp && d->aoff && d->slot && d->arena && (!counts || d->cnt);
+}
+static bool pq_dedup_rehash(pq_dedup* d, uint64_t cap) {
+    uint32_t* s = ray_calloc_raw((size_t)cap*sizeof(*s));
+    if (!s) return false;
+    ray_free_raw(d->slot); d->slot = s; d->mask = cap-1;
+    for (int64_t id = d->first; id <= d->n; id++) {
+        uint64_t i = d->fp[id-1].h & d->mask;
+        while (d->slot[i]) i = (i+1) & d->mask;
+        d->slot[i] = (uint32_t)id;
+    }
+    return true;
+}
+/* The local id of a non-empty string; *fresh when it is its first
+ * occurrence (of the generation).  0 on allocation failure. */
+static uint32_t pq_dedup_id(pq_dedup* d, uint64_t h, const char* s, uint32_t len, bool* fresh) {
+    uint64_t i = h & d->mask;
+    for (uint32_t v; (v = d->slot[i]); i = (i+1) & d->mask) {
+        const ray_symgrp_fp_t* f = &d->fp[v-1];
+        if (f->len == len && f->h == h && !memcmp(d->arena+d->aoff[v-d->first],s,len)) { *fresh = false; return v; }
+    }
+    *fresh = true;
+    if (d->n >= UINT32_MAX-1) return 0;
+    if (d->abytes+len > d->acap && d->n >= d->first) {
+        /* a new generation */
+        memset(d->slot,0,(size_t)(d->mask+1)*sizeof(*d->slot));
+        d->abytes = 0; d->first = d->n+1; d->gens++;
+        i = h & d->mask;
+    }
+    if (d->n == d->cap) {
+        int64_t nc = d->cap*2;
+        ray_symgrp_fp_t* fp = ray_realloc_raw(d->fp,(size_t)nc*sizeof(*fp));
+        if (!fp) return 0;
+        d->fp = fp;
+        if (d->cnt) {
+            uint32_t* c = ray_realloc_raw(d->cnt,(size_t)(nc+1)*sizeof(*c));
+            if (!c) return 0;
+            memset(c+d->cap+1,0,(size_t)(nc-d->cap)*sizeof(*c));
+            d->cnt = c;
+        }
+        d->cap = nc;
+    }
+    if (d->n+1-d->first >= (int64_t)(d->mask+1)/2) {
+        int64_t* ao = ray_realloc_raw(d->aoff,(size_t)(d->mask+1)*sizeof(*ao));
+        if (!ao || (d->aoff = ao, !pq_dedup_rehash(d,(d->mask+1)*2))) return 0;
+        i = h & d->mask;
+        while (d->slot[i]) i = (i+1) & d->mask;
+    }
+    if (d->abytes+len > d->acap) {   /* one string past the arena */
+        char* a = ray_realloc_raw(d->arena,(size_t)(d->abytes+len));
+        if (!a) return 0;
+        d->arena = a; d->acap = d->abytes+len;
+    }
+    if (len) memcpy(d->arena+d->abytes,s,len);
+    d->aoff[d->n+1-d->first] = d->abytes; d->abytes += len;
+    d->fp[d->n] = (ray_symgrp_fp_t){h,len,(uint32_t)(d->n+1)};
+    d->slot[i] = (uint32_t)(++d->n);
+    return (uint32_t)d->n;
+}
+
+typedef struct {
+    pq_direct_work* dw;
+    int64_t c;                   /* the column */
+    ray_symgrp_t* g;
+    ray_symimp_t* imp;
+    int64_t ta, tb;              /* the window of the second decode */
+    int64_t acap;                /* dedupe arena per task */
+    uint64_t hmask;              /* the hashes kept (all but in a collision test) */
+    bool counts, redo;
+    _Atomic(int64_t) rows, gens;
+} pq_gwork;
+
+/* One chunk's walk, either decode. */
+typedef struct {
+    pq_gwork* w;
+    int64_t t;
+    uint32_t worker;
+    pq_dedup d;
+    uint32_t* dmap;              /* dictionary index -> local id */
+    bool second;
+    int64_t nres;                /* second: local ids the first decode made */
+    ray_symgrp_res_t* res;       /* second: verdicts by local id */
+    uint32_t* map;               /* second: positions by local id */
+    int64_t cursor;              /* second, ROWS: next record's offset */
+    uint32_t* codes; int64_t ncodes;
+    ray_t* vec; ray_col_stream_t* out;
+    int64_t cmp, cmpb;
+    const char* err;
+} pq_gtask;
+
+/* A local id's first occurrence in the second decode: its verdict. */
+static bool pq_g2_first(pq_gtask* k, uint32_t local, uint64_t h, const char* s, uint32_t len) {
+    ray_symgrp_res_t* v = &k->res[local];
+    int64_t pos = v->pos;
+    if (v->kind == RAY_SYMGRP_NEW) {
+        int64_t off = v->off;
+        if (off < 0) { off = k->cursor; k->cursor += 4+(int64_t)len; }
+        if (!k->w->redo) ray_symimp_put(k->w->imp,pos,off,s,len);   /* a redo wrote it already */
+    } else if (v->kind == RAY_SYMGRP_REF && v->owner != k->t && v->owner >= k->w->ta) {
+        /* another task of the window writes the record: compared after it
+         * (a redo takes what that comparison settled) */
+        if (k->w->redo) {
+            int64_t o = ray_symgrp_override(k->w->g,k->t,local);
+            if (o >= 0) pos = o;
+        } else if (!ray_symgrp_defer(k->w->g,k->worker,k->t,local,h,(uint32_t)pos,s,len)) return false;
+    } else if (v->kind == RAY_SYMGRP_OLD || v->kind == RAY_SYMGRP_REF) {
+        /* compared now (in a redo again: a mismatch finds the position its
+         * first run added) */
+        k->cmp++; k->cmpb += len;
+        if (!ray_symgrp_same(k->w->g,(uint32_t)pos,s,len)) {
+            pos = ray_symgrp_collide(k->w->g,h,s,len);
+            if (pos < 0) return false;
+        }
+    } else return false;
+    k->map[local] = (uint32_t)pos;
+    return true;
+}
+
+/* A string's local id, first occurrences seen to. */
+static bool pq_g_local(pq_gtask* k, const char* s, uint32_t len, uint32_t* local) {
+    if (!len) { *local = 0; return true; }
+    uint64_t h = ray_hash_bytes(s,len) & k->w->hmask;
+    bool fresh;
+    uint32_t id = pq_dedup_id(&k->d,h,s,len,&fresh);
+    if (!id || (k->second && id > k->nres)) return false;
+    if (fresh && k->second && !pq_g2_first(k,id,h,s,len)) return false;
+    *local = id;
+    return true;
+}
+
+static bool pq_g_flush(pq_gtask* k) {
+    if (!k->ncodes) return true;
+    k->vec->len = k->ncodes;
+    ray_err_t e = ray_col_stream_append(k->out,k->vec);
+    k->ncodes = 0;
+    return e == RAY_OK;
+}
+/* `run` rows of local id `local`. */
+static bool pq_g_emit(pq_gtask* k, uint32_t local, int64_t run) {
+    if (k->d.cnt) k->d.cnt[local] += (uint32_t)run;
+    if (!k->second) return true;
+    uint32_t pos = k->map[local];
+    while (run > 0) {
+        int64_t room = PQ_BATCH-k->ncodes, m = run < room ? run : room;
+        for (int64_t i = 0; i < m; i++) k->codes[k->ncodes+i] = pos;
+        k->ncodes += m; run -= m;
+        if (k->ncodes == PQ_BATCH && !pq_g_flush(k)) return false;
+    }
+    return true;
+}
+
+/* The chunk's rows, as pq_decode_symbols reads them. */
+static const char* pq_g_walk(pq_column* c, pq_schema* s, int64_t rows, pq_gtask* k) {
+    for (int64_t at = 0; at < rows;) {
+        if (ray_interrupted()) return "scan interrupted";
+        if (!c->page_left) { const char* err = pq_page(c,s,NULL); if (err) return err; }
+        if (c->have_dict && !k->dmap) {
+            k->dmap = ray_alloc_raw((size_t)(c->dict_count ? c->dict_count : 1)*sizeof(*k->dmap));
+            if (!k->dmap) return "symbol dictionary allocation failed";
+            for (int64_t i = 0; i < c->dict_count; i++)
+                if (!pq_g_local(k,(const char*)c->strings[i].p,c->strings[i].n,&k->dmap[i])) return "symbol allocation failed";
+        }
+        int64_t n = rows-at < c->page_left ? rows-at : c->page_left;
+        for (int64_t i = 0; i < n; i++) {
+            uint32_t local;
+            if (!c->optional && c->encoding && c->ids.left && !c->ids.packed) {
+                uint32_t id = c->ids.value;
+                if (id >= c->dict_count || !k->dmap) return "invalid symbol dictionary index";
+                local = k->dmap[id];
+                if (!local && s->strict) return "nonnull empty text collides with native null";
+                int64_t run = n-i < (int64_t)c->ids.left ? n-i : (int64_t)c->ids.left;
+                if (!pq_g_emit(k,local,run)) return "symbol code write failed";
+                c->ids.left -= (uint64_t)run; i += run-1; continue;
+            }
+            uint32_t present = 1;
+            if (c->optional && (!pq_rle_next(&c->defs,&present) || present > 1)) return "invalid definition levels";
+            if (!present) { c->page_nulls++; if (!pq_g_emit(k,0,1)) return "symbol code write failed"; continue; }
+            if (c->encoding) {
+                uint32_t id;
+                if (!pq_rle_next(&c->ids,&id) || id >= c->dict_count || !k->dmap) return "invalid symbol dictionary index";
+                local = k->dmap[id];
+                if (!local && s->strict) return "nonnull empty text collides with native null";
+            } else {
+                const uint8_t *lp, *p;
+                if (!pq_take(&c->values,4,&lp)) return "truncated string length";
+                uint32_t len = pq_u32(lp);
+                if (!pq_take(&c->values,len,&p)) return "truncated string data";
+                if (s->strict && (!len || (s->converted == 0 && !pq_utf8(p,len))))
+                    return "nonnull text is empty or invalid UTF-8";
+                if (!pq_g_local(k,(const char*)p,len,&local)) return "symbol allocation failed";
+            }
+            if (!pq_g_emit(k,local,1)) return "symbol code write failed";
+        }
+        at += n; c->page_left -= n; c->chunk_left -= n;
+        if (!c->page_left) {
+            if (c->optional && !pq_rle_done(&c->defs)) return "excess definition levels";
+            if (c->expected_nulls >= 0 && c->page_nulls != c->expected_nulls) return "v2 null count mismatch";
+            if (c->encoding) { if (!pq_rle_done(&c->ids)) return "excess dictionary indices"; }
+            else if (c->values.p != c->values.end) return "excess string values";
+            if (!c->chunk_left && c->chunk.p != c->chunk.end) return "excess column pages";
+        }
+    }
+    return NULL;
+}
+
+/* Fault injection for the suite: RAY_PQ_SYM_INJECT names the step that
+ * fails as out of memory ("r1", "p2", "load", "r2", "settle") or is
+ * cancelled ("cancel"); debug builds only. */
+static bool pq_g_inject(const char* step) {
+#if defined(DEBUG)
+    const char* e = getenv("RAY_PQ_SYM_INJECT");
+    if (!e || strcmp(e,step) != 0) return false;
+    if (!strcmp(step,"cancel")) { ray_request_interrupt(); return false; }
+    return true;
+#else
+    (void)step; return false;
+#endif
+}
+
+/* The chunk's reader, its cursor holding the worker's buffers. */
+static ray_parquet_t* pq_g_reader(pq_gwork* w, int64_t g, uint32_t worker, const char** err) {
+    pq_direct_work* dw = w->dw;
+    ray_parquet_t* r = pq_group_reader(dw->parent,g,1);
+    if (!r) { *err = "row group allocation failed"; return NULL; }
+    r->selected[0] = (int32_t)w->c; r->nselected = r->noutput = 1;
+    if ((int64_t)worker < dw->nspare) pq_trade_buffers(&r->cursors[0],&dw->spare[worker]);
+    r->group++;
+    *err = pq_start_group(r);
+    return r;
+}
+static void pq_g_reader_close(pq_gwork* w, ray_parquet_t* r, uint32_t worker) {
+    if ((int64_t)worker < w->dw->nspare) pq_trade_buffers(&r->cursors[0],&w->dw->spare[worker]);
+    ray_parquet_close(r);
+}
+/* The chunk read ahead again for the second decode (and the same column's
+ * next chunks), whatever the first asked for. */
+static void pq_g_prefetch(pq_direct_work* w, int64_t g, int64_t c) {
+    if (!w->prefetched) return;
+    ray_parquet_t* r = w->parent;
+    int64_t ahead = 0;
+    for (int64_t k = 0; k <= w->prefetch && g + k < r->ngroups; k++) {
+        int64_t i = (g+k)*r->ncols+c, lo = w->chunk_lo[i], hi = w->chunk_hi[i];
+        if (lo < 0) continue;
+        if (k > 0 && (ahead += hi - lo) > w->ahead_bytes) break;
+        ray_vm_advise_willneed(r->map + lo,(size_t)(hi-lo));
+    }
+}
+
+/* First decode of row group g: stage its distinct strings. */
+static void pq_g1_task(void* ptr, uint32_t worker, int64_t start, int64_t end) {
+    pq_gwork* w = ptr; pq_direct_work* dw = w->dw;
+    for (int64_t g = start; g < end; g++) {
+        if (dw->prefetched) pq_prefetch_chunks(dw,g,w->c);
+        pq_gtask k = {.w = w, .t = g, .worker = worker};
+        const char* err = NULL;
+        ray_parquet_t* r = pq_g_reader(w,g,worker,&err);
+        if (!err && !pq_dedup_init(&k.d,w->acap,w->counts)) err = "symbol dedupe allocation failed";
+        if (!err && pq_g_inject("r1")) err = "symbol dedupe allocation failed";
+        if (!err && r->group_left) {
+            pq_schema schema = r->schema[w->c]; schema.import_domain = NULL;
+            err = pq_g_walk(&r->cursors[0],&schema,r->group_left,&k);
+        }
+        if (!err) atomic_fetch_add_explicit(&w->rows,r->group_rows,memory_order_relaxed);
+        if (!err && !ray_symgrp_stage(w->g,g,k.d.n,k.d.fp,k.d.cnt ? k.d.cnt+1 : NULL))
+            err = "symbol staging allocation failed";
+        atomic_fetch_add_explicit(&w->gens,k.d.gens,memory_order_relaxed);
+        if (err && !dw->errors[g]) dw->errors[g] = pq_error(err);
+        pq_dedup_free(&k.d); ray_free_raw(k.dmap);
+        if (r) pq_g_reader_close(w,r,worker);
+    }
+}
+
+/* Second decode of row group g: records, comparisons, codes. */
+static void pq_g2_task(void* ptr, uint32_t worker, int64_t start, int64_t end) {
+    pq_gwork* w = ptr; pq_direct_work* dw = w->dw;
+    for (int64_t i = start; i < end; i++) {
+        int64_t g = w->redo ? i : w->ta+i;   /* a redo is given its task itself */
+        pq_g_prefetch(dw,g,w->c);
+        pq_gtask k = {.w = w, .t = g, .worker = worker, .second = true};
+        ray_col_stream_t local = {0};
+        const char* err = NULL;
+        int64_t n = ray_symgrp_task_size(w->g,g);
+        k.nres = n;
+        ray_parquet_t* r = pq_g_reader(w,g,worker,&err);
+        k.res = ray_alloc_raw((size_t)(n+1)*sizeof(*k.res));
+        k.map = ray_alloc_raw((size_t)(n+1)*sizeof(*k.map));
+        k.codes = NULL;
+        k.vec = ray_sym_vec_new(RAY_SYM_W32,PQ_BATCH);
+        if (!err && (!k.res || !k.map || !k.vec || RAY_IS_ERR(k.vec) || !pq_dedup_init(&k.d,w->acap,false)))
+            err = "symbol code allocation failed";
+        if (!err && pq_g_inject("r2")) err = "symbol code allocation failed";
+        if (!err) (void)pq_g_inject("cancel");   /* the walk below sees it */
+        if (!err && !ray_symgrp_task(w->g,g,k.res)) err = "symbol verdicts unavailable";
+        if (!err) {
+            k.map[0] = 0;
+            k.cursor = ray_symgrp_task_off(w->g,g);
+            k.vec->sym_domain = dw->writers[w->c].dom; ray_sym_domain_retain(k.vec->sym_domain);
+            k.codes = (uint32_t*)ray_data(k.vec);
+            local.type = RAY_SYM; local.dom = dw->writers[w->c].dom;
+            local.fp = fopen(dw->writers[w->c].tmp_path,"r+b");
+            if (!local.fp) err = "cannot open native column";
+        }
+        if (!err) {
+            int64_t offset = 32+dw->offsets[g]*4;
+#ifdef RAY_OS_WINDOWS
+            bool seek = _fseeki64(local.fp,offset,SEEK_SET) == 0;
+#else
+            bool seek = fseeko(local.fp,(off_t)offset,SEEK_SET) == 0;
+#endif
+            if (!seek) err = "cannot seek native output range";
+        }
+        k.out = &local;
+        if (!err && r->group_left) {
+            pq_schema schema = r->schema[w->c]; schema.import_domain = NULL;
+            err = pq_g_walk(&r->cursors[0],&schema,r->group_left,&k);
+        }
+        if (!err && !pq_g_flush(&k)) err = "native column write failed";
+        if (!err && dw->writeback) {
+            if (fflush(local.fp) != 0) err = "native column write failed";
+            else ray_file_writeback_start(fileno(local.fp),32+dw->offsets[g]*4,(dw->offsets[g+1]-dw->offsets[g])*4);
+        }
+        if (local.fp && fclose(local.fp) && !err) err = "native column close failed";
+        if (!err && local.rows != dw->offsets[g+1]-dw->offsets[g]) err = "row group ended before its assigned output range";
+        if (local.had_nulls) atomic_store_explicit(&dw->nulls[w->c],1,memory_order_relaxed);
+        if (err && !dw->errors[g]) dw->errors[g] = ray_interrupted() ? ray_error("cancel","parquet conversion interrupted") : pq_error(err);
+        ray_symgrp_note(w->g,k.cmp,k.cmpb);
+        if (k.vec && !RAY_IS_ERR(k.vec)) ray_release(k.vec);
+        pq_dedup_free(&k.d); ray_free_raw(k.dmap); ray_free_raw(k.res); ray_free_raw(k.map);
+        if (r) pq_g_reader_close(w,r,worker);
+    }
+}
+
+/* /proc/self/io and the major faults, for the trace's phase lines. */
+typedef struct { int64_t rd, wr, syscr, syscw, majflt; } pq_io_t;
+static pq_io_t pq_io_now(void) {
+    pq_io_t io = {0};
+#if defined(__linux__)
+    FILE* f = fopen("/proc/self/io","r");
+    if (f) {
+        char line[128];
+        while (fgets(line,sizeof(line),f)) {
+            long long v;
+            if (sscanf(line,"read_bytes: %lld",&v) == 1) io.rd = v;
+            else if (sscanf(line,"write_bytes: %lld",&v) == 1) io.wr = v;
+            else if (sscanf(line,"syscr: %lld",&v) == 1) io.syscr = v;
+            else if (sscanf(line,"syscw: %lld",&v) == 1) io.syscw = v;
+        }
+        fclose(f);
+    }
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF,&ru) == 0) io.majflt = ru.ru_majflt;
+#endif
+    return io;
+}
+static void pq_io_print(const char* phase, pq_io_t a, pq_io_t b, int64_t t0, int64_t t1) {
+    fprintf(stderr," %s=%.1fms rd=%.1fMB wr=%.1fMB syscr=%lld syscw=%lld majflt=%lld",phase,
+            (double)(t1-t0)/1e6,(double)(b.rd-a.rd)/1048576.0,(double)(b.wr-a.wr)/1048576.0,
+            (long long)(b.syscr-a.syscr),(long long)(b.syscw-a.syscw),(long long)(b.majflt-a.majflt));
+}
+
+/* One symbol column, grouped: errors land in dw->errors by row group. */
+static void pq_sym_grouped(pq_direct_work* dw, ray_symgrp_t* g, ray_symimp_t* imp, int64_t c,
+                           int groups, int64_t budget, int64_t workers, bool trace) {
+    ray_parquet_t* r = dw->parent;
+    ray_pool_t* pool = ray_pool_get();
+    pq_gwork w = {.dw = dw, .c = c, .g = g, .imp = imp, .hmask = UINT64_MAX};
+    w.acap = budget/4/workers;
+    if (w.acap < ((int64_t)4 << 20)) w.acap = (int64_t)4 << 20;
+    w.counts = ray_symgrp_order(g) == RAY_SYMGRP_FREQ;
+#if defined(DEBUG)
+    {
+        const char* e = getenv("RAY_PQ_SYM_HASH_BITS");
+        if (e && *e) { long b = strtol(e,NULL,10); w.hmask = b <= 0 ? 0 : b >= 64 ? UINT64_MAX : (UINT64_C(1) << b) - 1; }
+        e = getenv("RAY_PQ_SYM_ARENA");
+        if (e && *e && strtol(e,NULL,10) > 0) w.acap = strtol(e,NULL,10);
+    }
+#endif
+    atomic_init(&w.rows,0); atomic_init(&w.gens,0);
+    int64_t tasks = r->ngroups;
+    pq_io_t io0 = {0}, io1 = {0}, io2 = {0}, io3 = {0};
+    int64_t t0 = 0, t1 = 0, t2 = 0, t3 = 0;
+    if (trace) { io0 = pq_io_now(); t0 = ray_profile_now_ns(); }
+    if (!ray_symgrp_begin(g,tasks,groups,workers)) { dw->errors[0] = ray_error("oom",NULL); return; }
+    /* first decode */
+    if (tasks > 0) {
+        if (ray_pool_par_dispatch_ok(pool,tasks,2)) ray_pool_dispatch_n(pool,pq_g1_task,&w,(uint32_t)tasks);
+        else pq_g1_task(&w,0,0,tasks);
+    }
+    for (int64_t t = 0; t < tasks; t++) if (dw->errors[t]) return;
+    if (ray_interrupted()) return;
+    if (trace) { io1 = pq_io_now(); t1 = ray_profile_now_ns(); }
+    /* the verdicts, group by group */
+    if (pq_g_inject("p2") || !ray_symgrp_resolve(g)) { dw->errors[0] = pq_error("symbol dictionary allocation or file growth failed"); return; }
+    if (trace) { io2 = pq_io_now(); t2 = ray_profile_now_ns(); }
+    /* second decode, window by window: the candidates' records of a window
+     * (from earlier passes and windows) in half the budget */
+    int64_t store = budget/2 < ((int64_t)16 << 20) ? (int64_t)16 << 20 : budget/2;
+#if defined(DEBUG)
+    {
+        const char* e = getenv("RAY_PQ_SYM_WINDOW");
+        if (e && *e && strtol(e,NULL,10) > 0) store = strtol(e,NULL,10);
+    }
+#endif
+    for (int64_t ta = 0; ta < tasks;) {
+        int64_t tb = ray_symgrp_window(g,ta,store);
+        if (pq_g_inject("load") || !ray_symgrp_load(g,ta,tb)) { dw->errors[ta] = pq_error("symbol record load failed"); return; }
+        w.ta = ta; w.tb = tb; w.redo = false;
+        if (ray_pool_par_dispatch_ok(pool,tb-ta,2)) ray_pool_dispatch_n(pool,pq_g2_task,&w,(uint32_t)(tb-ta));
+        else pq_g2_task(&w,0,0,tb-ta);
+        for (int64_t t = ta; t < tb; t++) if (dw->errors[t]) return;
+        if (ray_interrupted()) return;
+        int64_t* redo = NULL; int64_t nredo = 0;
+        if (pq_g_inject("settle") || !ray_symgrp_settle(g,&redo,&nredo)) { dw->errors[ta] = pq_error("symbol comparison failed"); return; }
+        /* the tasks whose deferred candidates did not match: their codes again */
+        w.redo = true;
+        for (int64_t i = 0; i < nredo && !dw->errors[redo[i]]; i++) pq_g2_task(&w,0,redo[i],redo[i]+1);
+        ray_sys_free(redo);
+        for (int64_t t = ta; t < tb; t++) if (dw->errors[t]) return;
+        (void)ray_symimp_sync(imp,false);   /* the window's records start to disk */
+        ta = tb;
+    }
+    if (trace) {
+        io3 = pq_io_now(); t3 = ray_profile_now_ns();
+        ray_symgrp_stats_t st;
+        ray_symgrp_stats(g,&st);
+        ray_t* nm = ray_sym_str(r->schema[c].name);
+        static const char* orders[] = {"rows","shards","freq"};
+        fprintf(stderr,"parquet symgrp: col=%.*s order=%s groups=%d windows=%lld rows=%lld gens=%lld staged=%lld"
+                " owners=%lld old=%lld refs=%lld log_loaded=%lld store_pos=%lld store_spans=%lld store_mb=%.1f"
+                " store_kept=%lld deferred=%lld compares=%lld cmp_mb=%.1f collisions=%lld redo=%lld entries=%lld\n",
+                (int)ray_str_len(nm),ray_str_ptr(nm),orders[ray_symgrp_order(g)],groups,(long long)st.windows,
+                (long long)atomic_load(&w.rows),(long long)atomic_load(&w.gens),(long long)st.staged,
+                (long long)st.owners,(long long)st.old,(long long)st.refs,(long long)st.log_loaded,
+                (long long)st.store_pos,(long long)st.store_spans,(double)st.store_bytes/1048576.0,
+                (long long)st.store_kept,
+                (long long)st.deferred,(long long)st.compares,(double)st.cmp_bytes/1048576.0,
+                (long long)st.collisions,(long long)st.redo,(long long)ray_symgrp_entries(g));
+        fprintf(stderr,"parquet symgrp io:");
+        pq_io_print("decode1",io0,io1,t0,t1);
+        pq_io_print("resolve",io1,io2,t1,t2);
+        pq_io_print("decode2",io2,io3,t2,t3);
+        fprintf(stderr,"\n");
+    }
+}
+
 /* The import runs in passes, each decoding some columns' chunks from every
  * row group in parallel.  When memory is short next to the output it goes
  * column by column (a pass is one column, or a few when the file has fewer
@@ -1988,6 +2476,8 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
     _Atomic uint8_t* prefetched = NULL;
     pq_column* spare = NULL;   /* pq_direct_work.spare */
     int64_t nspare = 0;
+    ray_symgrp_t* sgrp = NULL;   /* the grouped symbol import, or NULL */
+    ray_symimp_t* simp = NULL;
     ray_t* err = NULL;
     pq_symflush_t symf = {NULL,false,(int)RAY_OK};
     ray_thread_t sym_thread = 0;
@@ -2072,13 +2562,41 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
      * overlaps. */
     int64_t sym_width = forced ? width : ram > 0 && ram >= out_bytes / 2 ? r->ncols - nnum : 1;
     if (sym_width < 1) sym_width = 1;
-    if (nnum < r->ncols && writers[order[nnum]].dom) {
+    /* The symbol columns go direct (each string probes the import
+     * dictionary) unless their strings would make it too big to probe at
+     * random: then grouped (table/symgrp.h), column by column.  Decided from
+     * their chunks' uncompressed bytes against a quarter of memory;
+     * RAY_PQ_SYM_MODE=direct|grouped decides instead, and RAY_PQ_SYM_ORDER
+     * (rows|shards|freq) and RAY_PQ_SYM_GROUPS set the grouped import's
+     * order of new positions and hash groups. */
+    pq_sym_mode mode = PQ_SYM_AUTO;
+    {
+        const char* e = getenv("RAY_PQ_SYM_MODE");
+        if (e && !strcmp(e,"direct")) mode = PQ_SYM_DIRECT;
+        else if (e && !strcmp(e,"grouped")) mode = PQ_SYM_GROUPED;
+    }
+    simp = nnum < r->ncols ? ray_sym_domain_import(writers[order[nnum]].dom) : NULL;
+    if (mode == PQ_SYM_AUTO && simp) {
+        int64_t text = 0;
+        for (int64_t i = nnum; i < r->ncols; i++) text = bytes[order[i]] > INT64_MAX - text ? INT64_MAX : text + bytes[order[i]];
+        mode = ram > 0 && text > ram / 4 ? PQ_SYM_GROUPED : PQ_SYM_DIRECT;
+    }
+    if (mode == PQ_SYM_GROUPED && simp) {
+        ray_symgrp_order_t so = RAY_SYMGRP_ROWS;
+        const char* e = getenv("RAY_PQ_SYM_ORDER");
+        if (e && !strcmp(e,"shards")) so = RAY_SYMGRP_SHARDS;
+        else if (e && !strcmp(e,"freq")) so = RAY_SYMGRP_FREQ;
+        sgrp = ray_symgrp_new(simp,so);
+        if (!sgrp) { err = ray_error("oom",NULL); goto done; }
+        sym_width = 1;
+    }
+    if (!sgrp && nnum < r->ncols && writers[order[nnum]].dom) {
         symf.dom = writers[order[nnum]].dom;
         if (ray_thread_create(&sym_thread,pq_symflush_fn,&symf) == RAY_OK) sym_running = true;
     }
     ray_symimp_stats_t ist;   /* the import dictionary's counts, per pass */
     if (trace && symf.dom) ray_sym_domain_import_stats(symf.dom,&ist);
-    bool all = !colwise;
+    bool all = !colwise && !sgrp;
     for (int64_t p = 0; p < r->ncols && !err; p += work.npass) {
         int64_t wd = all ? r->ncols : p < nnum ? width : sym_width;
         int64_t lim = all ? r->ncols : p < nnum ? nnum : r->ncols;
@@ -2086,7 +2604,22 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
         work.npass = lim - p < wd ? lim - p : wd;
         int64_t tasks = r->ngroups*work.npass;
         int64_t t0 = trace ? ray_profile_now_ns() : 0, t1 = 0;
-        if (tasks > 0) {
+        if (sgrp && p >= nnum) {
+            /* memory for the pass: what is left under the anon watermark */
+            int64_t wm = ray_heap_anon_watermark();
+            int64_t budget = wm > 0 ? wm - ray_heap_anon_committed() : (int64_t)1 << 30;
+            if (budget < ((int64_t)64 << 20)) budget = (int64_t)64 << 20;
+            /* hash groups: a group's index table (~24 B an entry, the
+             * column's rows bounding its new strings) within a quarter */
+            int groups = 1;
+            const char* e = getenv("RAY_PQ_SYM_GROUPS");
+            if (e && *e && strtol(e,NULL,10) > 0) groups = (int)strtol(e,NULL,10);
+            else {
+                int64_t need = (ray_symgrp_entries(sgrp) + r->rows) * 24;
+                while (groups < RAY_SYMGRP_MAX && need / groups > budget / 4) groups *= 2;
+            }
+            pq_sym_grouped(&work,sgrp,simp,work.pass[0],groups,budget,workers,trace);
+        } else if (tasks > 0) {
             if (ray_pool_par_dispatch_ok(pool,tasks,2)) ray_pool_dispatch_n(pool,pq_write_direct_group,&work,(uint32_t)tasks);
             else pq_write_direct_group(&work,0,0,tasks);
         }
@@ -2152,6 +2685,7 @@ done:
         ray_free_raw(spare[i].page); ray_free_raw(spare[i].dict); ray_free_raw(spare[i].symbols);
     }
     ray_free_raw(spare);
+    ray_symgrp_free(sgrp);
     return err;
 }
 ray_t* ray_parquet_splayed_typed(const char* path, const char* dir, ray_t* types) {
