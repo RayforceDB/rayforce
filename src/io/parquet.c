@@ -2163,10 +2163,15 @@ typedef struct {
     const char* err;
 } pq_gtask;
 
+static bool pq_g_inject(const char* step);
+/* Records to the symbol file (RAY_PQ_SYM_INJECT=write fails them). */
+static bool pq_g_write(pq_gtask* k, int64_t off, const void* p, size_t n) {
+    return !pq_g_inject("write") && ray_symimp_write(k->w->imp,off,p,n);
+}
 /* The task's buffered records of run `a` to the file. */
 static bool pq_g_wflush1(pq_gtask* k, int a) {
     if (!k->wlen[a]) return true;
-    bool ok = ray_symimp_write(k->w->imp,k->woff[a],k->wbuf[a],(size_t)k->wlen[a]);
+    bool ok = pq_g_write(k,k->woff[a],k->wbuf[a],(size_t)k->wlen[a]);
     k->woff[a] += k->wlen[a]; k->wlen[a] = 0;
     return ok;
 }
@@ -2180,7 +2185,7 @@ static bool pq_g_record(pq_gtask* k, int a, int64_t pos, int64_t off, const char
     if (k->wlen[a] + 4 + (int64_t)len > PQ_GWBUF && !pq_g_wflush1(k,a)) return false;
     if (!k->wlen[a]) k->woff[a] = off;
     if (4 + (int64_t)len > PQ_GWBUF)   /* past the buffer: straight to the file */
-        return ray_symimp_write(k->w->imp,off,&len,4) && ray_symimp_write(k->w->imp,off+4,s,len) &&
+        return pq_g_write(k,off,&len,4) && pq_g_write(k,off+4,s,len) &&
                (k->woff[a] = off + 4 + len, true);
     memcpy(k->wbuf[a] + k->wlen[a],&len,4);
     if (len) memcpy(k->wbuf[a] + k->wlen[a] + 4,s,len);
@@ -2327,8 +2332,8 @@ static const char* pq_g_walk(pq_column* c, pq_schema* s, int64_t rows, pq_gtask*
 
 /* Fault injection for the suite: RAY_PQ_SYM_INJECT names the step that
  * fails as out of memory ("r1", "p2", "load", "r2", "settle"; "reload" in
- * table/symgrp.c: a window's load after the first) or is
- * cancelled ("cancel"); debug builds only. */
+ * table/symgrp.c: a window's load after the first), whose record writes
+ * fail ("write"), or is cancelled ("cancel"); debug builds only. */
 static bool pq_g_inject(const char* step) {
 #if defined(DEBUG)
     const char* e = getenv("RAY_PQ_SYM_INJECT");

@@ -1275,9 +1275,9 @@ static test_result_t test_pq_sym_mixed_modes(void) {
 }
 
 /* The grouped import failing: out of memory in each of its steps (a debug
- * build injects it), cancelled in the middle, and the symbol file unable to
- * grow (the file size limit; the direct import too).  Each reports its
- * error and publishes nothing. */
+ * build injects it), its record writes failing, cancelled in the middle,
+ * and the symbol file unable to grow (the file size limit; the direct
+ * import too).  Each reports its error and publishes nothing. */
 static test_result_t test_pq_sym_grouped_failures(void) {
     pq_sym_env_clear();
     char src[160], big[160], dir[160], partial[200];
@@ -1292,18 +1292,19 @@ static test_result_t test_pq_sym_grouped_failures(void) {
     const char* names[] = {"x","s","t"};
     ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
 #if defined(DEBUG)
-    const char* steps[] = {"r1","p2","load","r2","settle","cancel"};
-    for (int i = 0; i < 6; i++) {
+    const char* steps[] = {"r1","p2","load","reload","r2","write","settle","cancel"};
+    for (int i = 0; i < 8; i++) {
         pq_set_symmode("grouped");
         pq_set_env("RAY_PQ_SYM_INJECT", steps[i]);
+        pq_set_env("RAY_PQ_SYM_WINDOW", "4096");   /* a window a row group: "reload" fails one */
         ray_t* res = ray_parquet_splayed_typed(src, dir, types);
-        pq_set_env("RAY_PQ_SYM_INJECT", NULL); pq_set_symmode(NULL);
+        pq_set_env("RAY_PQ_SYM_INJECT", NULL); pq_set_env("RAY_PQ_SYM_WINDOW", NULL); pq_set_symmode(NULL);
         bool failed = res && RAY_IS_ERR(res);
         bool cancel = failed && !strcmp(ray_err_code(res), "cancel");
         if (res) { if (failed) ray_error_free(res); else ray_release(res); }
         ray_clear_interrupt();
         TEST_ASSERT_TRUE(failed);
-        TEST_ASSERT_TRUE(cancel == (i == 5));
+        TEST_ASSERT_TRUE(cancel == (i == 7));
         TEST_ASSERT_TRUE(access(dir, F_OK) != 0);
         pq_remove_native(partial, names, 3);
     }
@@ -1731,9 +1732,9 @@ static test_result_t test_pq_sym_grouped_fail_leaks(void) {
     ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 3);
     const char* names[] = {"x","s","t"};
     ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(1), RAY_OK);
-    const char* steps[] = {"r1","p2","load","reload","r2","settle","cancel",NULL};
+    const char* steps[] = {"r1","p2","load","reload","r2","write","settle","cancel",NULL};
     int bad = 0;
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < 9; i++) {
         size_t base = 0, sbase = 0;
         for (int k = 0; k < 5; k++) {
             pq_set_symmode("grouped");
