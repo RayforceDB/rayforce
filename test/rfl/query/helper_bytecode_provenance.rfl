@@ -87,3 +87,10 @@
 (set h4 (fn [v] 1 (count s)))
 (at (select {n: (first (h4 x)) by: x from: T asc: x}) 'n) -- [1 1 1]
 (at (update {n: (first (h4 x)) by: x from: T}) 'n) -- [1 1 1]
+;; An opaque helper can be the group key: it is evaluated once over the
+;; table and grouped as a hidden column named after its column argument.
+(key (select {n: (count x) by: (mb s) from: T})) -- ['s 'n]
+(at (select {n: (count x) by: (mb s) from: T asc: s}) 's) -- ['azz 'bzz 'czz]
+(at (select {n: (sum x) by: (hlet s) from: T desc: n}) 'n) -- [3 2 1]
+(at (select {n: (sum x) by: (hlet s) from: T where: (> x 1) asc: s}) 's) -- ['B! 'C!]
+(count (select {n: (count x) by: (mb s) from: T desc: n take: 2})) -- 2

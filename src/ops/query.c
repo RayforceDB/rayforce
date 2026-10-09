@@ -10023,7 +10023,32 @@ static ray_t* select_plan_computed_key(ray_t* dict, ray_t* tbl, int64_t* key_nam
     int64_t nd = ray_dict_len(dict);
     int64_t hidden = ray_sym_intern(SELECT_COMPUTED_KEY, strlen(SELECT_COMPUTED_KEY));
     int64_t kname = derived_key_name(by_expr);
-    bool needs_eval = false;
+    /* A key the planner cannot lower (an opaque helper: several statements,
+     * a closure, recursion) is evaluated once over the whole table, where
+     * its column arguments keep their rows, and grouped as a hidden column
+     * named after the expression. */
+    int64_t hidden_in = ray_sym_intern(SELECT_COMPUTED_KEY "_in", strlen(SELECT_COMPUTED_KEY "_in"));
+    ray_t* keyed = NULL;        /* tbl plus the evaluated key column */
+    if (query_expr_has_helper(by_expr) && !ray_table_get_col(tbl, hidden) &&
+        !ray_table_get_col(tbl, hidden_in)) {
+        ray_graph_t* g = ray_graph_new(tbl);
+        bool lowered = g && compile_expr_dag(g, by_expr) != NULL;
+        if (g) ray_graph_free(g);
+        if (!lowered) {
+            ray_t* keyvec = eval_expr_whole_column(by_expr, tbl);
+            if (keyvec && !RAY_IS_ERR(keyvec) && ray_is_lazy(keyvec)) keyvec = ray_lazy_materialize(keyvec);
+            if (!keyvec || RAY_IS_ERR(keyvec)) return keyvec ? keyvec : ray_error("oom", NULL);
+            if (!(ray_is_vec(keyvec) || keyvec->type == RAY_LIST) || ray_len(keyvec) != ray_table_nrows(tbl)) {
+                ray_release(keyvec);
+                return ray_error("length", "select by: key expression must yield one value per row");
+            }
+            ray_retain(tbl);
+            keyed = ray_table_add_col(tbl, hidden_in, keyvec);
+            ray_release(keyvec);
+            if (!keyed || RAY_IS_ERR(keyed)) return keyed ? keyed : ray_error("oom", NULL);
+        }
+    }
+    bool needs_eval = keyed != NULL;
     for (int64_t i = 0; i < nd; i++) {
         int64_t kid = sym_cell_runtime_id(keys, i);
         bool clause = false;
@@ -10039,12 +10064,15 @@ static ray_t* select_plan_computed_key(ray_t* dict, ray_t* tbl, int64_t* key_nam
     }
     if (!needs_eval || ray_table_get_col(tbl, hidden)) return NULL;
 
+    /* The hidden key is the expression itself, or the evaluated column. */
     ray_t* bk = ray_vec_new(RAY_SYM, 1);
     ray_t* bv = ray_list_new(1);
+    ray_t* key_val = keyed ? ray_sym(hidden_in) : by_expr;
     if (bk && !RAY_IS_ERR(bk)) { ((int64_t*)ray_data(bk))[0] = hidden; bk->len = 1; }
-    if (bv && !RAY_IS_ERR(bv)) bv = ray_list_append(bv, by_expr);
+    if (bv && !RAY_IS_ERR(bv) && key_val && !RAY_IS_ERR(key_val)) bv = ray_list_append(bv, key_val);
+    if (keyed && key_val && !RAY_IS_ERR(key_val)) ray_release(key_val);
     ray_t* by_dict = ray_dict_new(bk, bv);
-    if (!by_dict || RAY_IS_ERR(by_dict)) return by_dict ? by_dict : ray_error("oom", NULL);
+    if (!by_dict || RAY_IS_ERR(by_dict)) { if (keyed) ray_release(keyed); return by_dict ? by_dict : ray_error("oom", NULL); }
 
     ray_t* engine = dict;
     ray_retain(engine);
@@ -10054,8 +10082,9 @@ static ray_t* select_plan_computed_key(ray_t* dict, ray_t* tbl, int64_t* key_nam
     ray_release(by_dict);
     ray_t* k_from = ray_sym(rid[0]);
     if (engine && !RAY_IS_ERR(engine) && k_from && !RAY_IS_ERR(k_from))
-        engine = ray_dict_upsert(engine, k_from, tbl);
+        engine = ray_dict_upsert(engine, k_from, keyed ? keyed : tbl);
     if (k_from) ray_release(k_from);
+    if (keyed) ray_release(keyed);
     /* asc:/desc: name result columns: the derived key is the hidden one */
     for (int r = 4; r <= 5 && engine && !RAY_IS_ERR(engine); r++) {
         ray_t* sv = dict_get(engine, reserved[r]);
