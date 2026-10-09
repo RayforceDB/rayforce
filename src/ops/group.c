@@ -12573,11 +12573,12 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         if (sc_n < 1) sc_n = 1;
 
         /* Each chunk's 1-slot arrays (n_aggs entries each) fill one
-         * cache-line-aligned block, padded to a whole number of lines:
-         * blocks that shared a line bounced it across cores on every row
+         * block aligned to a 128-byte line pair, padded to whole pairs:
+         * blocks that shared a line (or a pair the adjacent-line
+         * prefetcher fetches together) bounced it across cores on every row
          * (on a two-socket 48-thread box the keyless SUM/COUNT/AVG over
          * 100M rows took 8.8 s against 0.27 s on one socket). */
-        const size_t sc_line = 64;
+        const size_t sc_line = 128;
         size_t sc_words = 1;                                   /* count[1] */
         size_t sc_off_sum = 0, sc_off_hi = 0, sc_off_min = 0, sc_off_max = 0;
         size_t sc_off_sq = 0, sc_off_nn = 0;
