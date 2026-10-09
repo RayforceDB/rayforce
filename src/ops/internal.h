@@ -1270,6 +1270,9 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit)
 /* Monotonic count of streaming parted-GROUP kernel (exec_group_per_partition)
  * entries.  O(1) per query; surfaced via (.sys.mem)'s "group-perpart-runs". */
 int64_t ray_group_perpart_runs(void);
+/* Per-partition non-null count slots built for nullable AVG/VAR/DEV inputs
+ * (test hook; a null-free input keeps the row count). */
+int64_t ray_group_perpart_nn_slots(void);
 
 /* Monotonic count of exec_group_parted's in-place concat groups (the
  * parted columns grouped from their segments, no flatten).  Tests. */

@@ -151,6 +151,16 @@ int64_t ray_group_perpart_runs(void) {
                                 memory_order_relaxed);
 }
 
+/* Monotonic count of the per-partition non-null count slots built as a SUM
+ * of a not-null indicator (one per nullable AVG/VAR/DEV input per
+ * partition); a null-free input keeps the row count and adds none.  Test
+ * hook, O(1) per slot. */
+static _Atomic(int64_t) ray_group_perpart_nn_ctr = 0;
+
+int64_t ray_group_perpart_nn_slots(void) {
+    return atomic_load_explicit(&ray_group_perpart_nn_ctr, memory_order_relaxed);
+}
+
 /* Per-partition unordered takes answered from grp_first_keys_scan's keys. */
 static _Atomic(int64_t) ray_group_firstkeys_runs_ctr = 0;
 int64_t ray_group_firstkeys_runs(void) {
@@ -18691,6 +18701,21 @@ static ray_t* pp_concat_varlen(int8_t type, ray_t** srcs, int64_t n_srcs,
                            : parted_flatten_list(srcs, n_srcs, total);
 }
 
+/* Every segment of the parted column `sym` holds no null: a generation-2
+ * segment by its directory null count, a plain one by its HAS_NULLS flag.
+ * A missing segment, or an encoded one without a null count, counts as
+ * nullable. */
+static bool pp_input_null_free(ray_t* parted_tbl, int64_t sym, int32_t n_parts) {
+    for (int32_t p = 0; p < n_parts; p++) {
+        ray_t* seg = ray_table_parted_seg(parted_tbl, sym, p);
+        ray_col_meta_t m;
+        if (!seg || !ray_col_meta_of(seg, &m)) return false;
+        if (m.null_count >= 0) { if (m.null_count > 0) return false; continue; }
+        if (m.enc || ray_vec_may_have_nulls(seg)) return false;
+    }
+    return true;
+}
+
 /* --------------------------------------------------------------------------
  * exec_group_per_partition — per-partition GROUP BY with merge
  *
@@ -18794,6 +18819,8 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
     uint16_t* std_orig_op  = scratch_alloc(&std_orig_op_hdr,  agg_n * sizeof(uint16_t));
     uint8_t*  std_sq_slot  = scratch_alloc(&std_sq_slot_hdr,  agg_n * sizeof(uint8_t));
     uint8_t*  std_cnt_slot = scratch_alloc(&std_cnt_slot_hdr, agg_n * sizeof(uint8_t));
+    ray_t* cnt_nn_hdr = NULL;   /* per count slot (AVG's, then STDDEV/VAR's): counts non-nulls */
+    uint8_t*  cnt_nn       = scratch_alloc(&cnt_nn_hdr,       agg_n * sizeof(uint8_t));
 
     /* decomposed per-partition/merge slot carves (sized part_n_aggs_max) */
     ray_t *part_ops_hdr = NULL, *merge_ops_hdr = NULL, *part_agg_syms_hdr = NULL,
@@ -18809,7 +18836,7 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
     int64_t*  unique_agg    = scratch_alloc(&unique_agg_hdr,    pna_n * sizeof(int64_t));
 
     if (!mc_sym_ids || !pk_syms || !pkeys || !mkeys || !avg_idx || !std_idx ||
-        !std_orig_op || !std_sq_slot || !std_cnt_slot || !part_ops ||
+        !std_orig_op || !std_sq_slot || !std_cnt_slot || !cnt_nn || !part_ops ||
         !merge_ops || !part_agg_syms || !part_needs_sq || !agg_name_ids ||
         !pagg_ins || !magg_ins || !unique_agg)
         goto pp_cleanup;
@@ -18931,16 +18958,21 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
         std_sq_slot[i] = part_n_aggs;
         part_ops[part_n_aggs++] = OP_SUM;  /* SUM(x²) */
     }
-    /* Append the non-null count of each AVG column, then of each STDDEV/VAR
-     * column: a SUM over the input's not-null indicator (built per partition
-     * below).  OP_COUNT counts rows, nulls included, while SUM(x) and
-     * SUM(x²) skip nulls, so a row count would divide a nullable input's
-     * sums by too many (#767). */
-    for (uint32_t i = 0; i < n_avg; i++)
-        part_ops[part_n_aggs++] = OP_SUM;
+    /* Append the count of each AVG column, then of each STDDEV/VAR column.
+     * OP_COUNT counts rows, nulls included, while SUM(x) and SUM(x²) skip
+     * nulls (#767): an input that may hold a null counts its non-nulls, a
+     * SUM over its not-null indicator (built per partition below).  A column
+     * input whose every segment is null-free keeps the row count. */
+    for (uint32_t i = 0; i < n_avg; i++) {
+        uint32_t a = avg_idx[i];
+        cnt_nn[i] = agg_is_expr[a] || !pp_input_null_free(parted_tbl, agg_syms[a], n_parts);
+        part_ops[part_n_aggs++] = cnt_nn[i] ? OP_SUM : OP_COUNT;
+    }
     for (uint32_t i = 0; i < n_std; i++) {
+        uint32_t a = std_idx[i];
+        cnt_nn[n_avg + i] = agg_is_expr[a] || !pp_input_null_free(parted_tbl, agg_syms[a], n_parts);
         std_cnt_slot[i] = part_n_aggs;
-        part_ops[part_n_aggs++] = OP_SUM;
+        part_ops[part_n_aggs++] = cnt_nn[n_avg + i] ? OP_SUM : OP_COUNT;
     }
 
     /* First-row slot: an unordered `take: N` (group_limit > 0) keeps the
@@ -19187,10 +19219,12 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                 ray_op_t* xf = (x->out_type == RAY_F64) ? x : ray_cast(pg, x, RAY_F64);
                 pagg_ins[sq] = ray_mul(pg, xf, xf);
             }
-            /* The non-null count slots (AVG's, then STDDEV/VAR's): SUM of
-             * the input's not-null indicator as I64. */
+            /* The non-null count slots of nullable inputs (AVG's, then
+             * STDDEV/VAR's): SUM of the input's not-null indicator as I64. */
             for (uint32_t j = 0; j < n_avg + n_std; j++) {
+                if (!cnt_nn[j]) continue;
                 uint32_t cs = j < n_avg ? n_aggs + n_std + j : std_cnt_slot[j - n_avg];
+                atomic_fetch_add_explicit(&ray_group_perpart_nn_ctr, 1, memory_order_relaxed);
                 ray_op_t* nn = ray_not(pg, ray_isnull(pg, pagg_ins[cs]));
                 pagg_ins[cs] = nn ? ray_cast(pg, nn, RAY_I64) : NULL;
                 if (!pagg_ins[cs]) { ray_graph_free(pg); pp_release_sub(g, sub); goto batch_fail; }
@@ -19622,18 +19656,15 @@ batch_fail:
 
                 double* out = (double*)ray_data(avg_col);
                 const int64_t* cv = (const int64_t*)ray_data(cnt_col);
-                if (sum_col->type == RAY_F64) {
-                    const double* sv = (const double*)ray_data(sum_col);
-                    for (int64_t r = 0; r < nrows; r++)
-                        out[r] = cv[r] > 0 ? ray_f64_fin(sv[r] / (double)cv[r]) : NULL_F64;
-                } else {
-                    const int64_t* sv = (const int64_t*)ray_data(sum_col);
-                    for (int64_t r = 0; r < nrows; r++)
-                        out[r] = cv[r] > 0 ? ray_f64_fin((double)sv[r] / (double)cv[r]) : NULL_F64;
+                bool sum_f64 = sum_col->type == RAY_F64;
+                const double*  svf = (const double*)ray_data(sum_col);
+                const int64_t* svi = (const int64_t*)ray_data(sum_col);
+                for (int64_t r = 0; r < nrows; r++) {
+                    /* a group whose every input is null averages to null */
+                    if (cv[r] <= 0) { out[r] = NULL_F64; ray_vec_set_null(avg_col, r, true); continue; }
+                    double sv = sum_f64 ? svf[r] : (double)svi[r];
+                    out[r] = ray_f64_fin(sv / (double)cv[r]);
                 }
-                /* a group whose every input is null averages to null */
-                for (int64_t r = 0; r < nrows; r++)
-                    if (cv[r] <= 0) ray_vec_set_null(avg_col, r, true);
                 /* Single-null float model: flip HAS_NULLS for any avg
                  * canonicalized to NULL_F64 (overflow). */
                 grp_finalize_nulls(avg_col);
@@ -19768,6 +19799,7 @@ pp_cleanup:
     scratch_free(std_orig_op_hdr);
     scratch_free(std_sq_slot_hdr);
     scratch_free(std_cnt_slot_hdr);
+    scratch_free(cnt_nn_hdr);
     scratch_free(part_ops_hdr);
     scratch_free(merge_ops_hdr);
     scratch_free(part_agg_syms_hdr);

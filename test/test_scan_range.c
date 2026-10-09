@@ -5656,9 +5656,43 @@ static test_result_t test_parted_nullable_stats(void) {
         snprintf(tp, sizeof tp, "(.db.parted.get \"" SR_TMP "/ns%d\" 't)", gen);
         for (int i = 0; qs[i]; i++) {
             int64_t r0 = ray_group_perpart_runs();
+            int64_t n0 = ray_group_perpart_nn_slots();
             test_result_t r = sr_same_on("M", tp, qs[i], UINT64_MAX);
             if (r.status != TEST_PASS) return r;
             TEST_ASSERT_FMT(ray_group_perpart_runs() > r0, "gen %d %s: not the per-partition route", gen, qs[i]);
+            TEST_ASSERT_FMT(ray_group_perpart_nn_slots() > n0, "gen %d %s: nullable input counted by rows", gen, qs[i]);
+        }
+    }
+    /* Fix round 2: a null-free input (g, and z, no null) keeps the row
+     * count: no non-null count slot is built, and the answers still equal
+     * memory's.  A nullable one beside it builds only its own. */
+    sr_eval_ok("(set M (table [g x y z] (list (% jj 5) (as 'F64 (map (fn [i] (if (== 0 (% i 4)) 0N (* 1.0 i))) jj)) "
+               "(map (fn [i] (if (== 0 (% i 3)) 0N i)) jj) (as 'F64 jj))))");
+    for (int gen = 0; gen <= 2; gen += 2)
+        for (int p = 0; p < 3; p++)
+            sr_evalf_ok("(.db.splayed.set \"" SR_TMP "/nz%d/2024.01.0%d/t/\" "
+                        "(table [g x y z] (list (%% (til 35000) 5) "
+                        "(as 'F64 (map (fn [i] (if (== 0 (%% i 4)) 0N (* 1.0 i))) (til 35000))) "
+                        "(map (fn [i] (if (== 0 (%% i 3)) 0N i)) (til 35000)) (as 'F64 (til 35000)))) "
+                        "\"" SR_TMP "/nz%d/.sym\" {compress: %s})", gen, p + 1, gen, gen ? "true" : "false");
+    static const struct { const char* q; int64_t nn; } zs[] = {
+        { "(select {a: (avg z) b: (avg g) v: (var z) d: (dev g) from: T by: g asc: g})", 0 },
+        { "(select {a: (avg z) v: (var_pop z) from: T where: (> z 100.0) by: g asc: g})", 0 },
+        { "(select {a: (avg z) b: (avg x) from: T by: g asc: g})", 3 },      /* x's slot, per partition */
+        { NULL, 0 },
+    };
+    for (int gen = 0; gen <= 2; gen += 2) {
+        char tp[256];
+        snprintf(tp, sizeof tp, "(.db.parted.get \"" SR_TMP "/nz%d\" 't)", gen);
+        for (int i = 0; zs[i].q; i++) {
+            int64_t r0 = ray_group_perpart_runs();
+            int64_t n0 = ray_group_perpart_nn_slots();
+            test_result_t r = sr_same_on("M", tp, zs[i].q, UINT64_MAX);
+            if (r.status != TEST_PASS) return r;
+            TEST_ASSERT_FMT(ray_group_perpart_runs() > r0, "gen %d %s: not the per-partition route", gen, zs[i].q);
+            /* sr_same_on runs the query once on the parted table */
+            TEST_ASSERT_FMT(ray_group_perpart_nn_slots() - n0 == zs[i].nn, "gen %d %s: %lld non-null count slots, want %lld",
+                            gen, zs[i].q, (long long)(ray_group_perpart_nn_slots() - n0), (long long)zs[i].nn);
         }
     }
     PASS();
