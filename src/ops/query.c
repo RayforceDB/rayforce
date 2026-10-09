@@ -6357,6 +6357,12 @@ static ray_t* try_count_distinct_v2_rewrite(
             ray_graph_free(g_in);
             return (fres && RAY_IS_ERR(fres)) ? fres : NULL;
         }
+        /* The filter hands back an owned reference to the input table and
+         * leaves the matching rows on g_in->selection, which the group below
+         * reads.  The constant node keeps the graph's own reference until
+         * ray_graph_free, so this one is dropped now; kept, it pinned `tbl`
+         * for good and the next insert into it copied every column (#757). */
+        ray_release(fres);
     }
     ray_op_t* inner = ray_group(g_in, keys_in, n_K + 1,
                                 agg_ops_in, agg_ins_in, 1);

@@ -40,3 +40,16 @@
 (count T) -- 786
 (count (window {from: T part: [instrument] order: [rid] funcs: {n: (count v)}})) -- 786
 (== (sum (at (window {from: T part: [instrument] order: [rid] frame: 'running funcs: {s: (sum v)}}) 's)) (sum (at (window {from: T part: [instrument] order: [rid] frame: 'running funcs: {s: (sum v)}}) 's))) -- true
+;; #757: the count-distinct rewrite ran its where: as a filter node and kept
+;; the result, which is the input table itself with a reference of its own,
+;; releasing it only on error.  A lone (count (distinct x)) under a where:
+;; and a by: kept one extra reference on its table per call, so the table
+;; was never freed and the next insert into it copied every column.
+(probe (fn [p] (count (select {from: (mk p) where: (> rid 3) by: instrument n: (count (distinct v))}))) 5 60) -- true
+(probe (fn [p] (count (select {from: (mk p) where: (> rid 3) by: [instrument rid] n: (count (distinct v))}))) 5 60) -- true
+(probe (fn [p] (count (select {from: (mk p) where: (> rid 3) by: instrument n: (count (distinct v)) desc: n take: 3}))) 5 60) -- true
+;; the same table reused across calls is not released twice
+(set T2 (mk 2))
+(map (fn [p] (select {from: T2 where: (> rid 3) by: instrument n: (count (distinct v))})) (til 50))
+(count T2) -- 786
+(sum (at (select {from: T2 where: (> rid 3) by: instrument n: (count (distinct v))}) 'n)) -- 784
