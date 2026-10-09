@@ -1,0 +1,71 @@
+;; #756 — a select grouped by two or more keys failed with `name` when it held
+;; a `(count (distinct x))` beside an aggregate over an expression, such as
+;; `(sum (if …))`.  The shape took the eval-level grouping, which evaluated an
+;; aggregate's argument with no column in scope — and that grouping is serial.
+;; A plain multi-key by: whose only non-DAG outputs are distinct counts and
+;; literal broadcasts now stays on the parallel DAG path: the post-group
+;; scatter maps rows to groups through the composite key.  The eval-level
+;; grouping (a row expression beside the key) evaluates an aggregate's
+;; argument over the selected rows, as a row-wise projection.
+(set T (table [k1 k2 id st v] (list (take ['a 'b 'c 'd 'e] 1000) (take ['p 'q 'r 's 't 'u 'v 'w 'x] 1000) (% (til 1000) 300) (take ['ok 'ok 'ok 'ok 'ok 'ok 'bad] 1000) (% (til 1000) 7))))
+;; the oracle: the two aggregates in two selects, joined on the keys
+(set O (left-join [k1 k2] (select {from: T by: [k1 k2] n: (count (distinct id)) asc: [k1 k2]}) (select {from: T by: [k1 k2] bad: (sum (if (== st 'bad) 1 0))})))
+(set A (select {from: T by: [k1 k2] n: (count (distinct id)) bad: (sum (if (== st 'bad) 1 0)) asc: [k1 k2]}))
+(count A) -- 45
+(key A) -- ['k1 'k2 'bad 'n]
+(at A 'k1) -- (at O 'k1)
+(at A 'k2) -- (at O 'k2)
+(at A 'n) -- (at O 'n)
+(at A 'bad) -- (at O 'bad)
+(sum (at A 'bad)) -- 142
+;; the aggregates in the other order, and an aggregate over arithmetic
+(at (select {from: T by: [k1 k2] bad: (sum (if (== st 'bad) 1 0)) n: (count (distinct id)) asc: [k1 k2]}) 'n) -- (at O 'n)
+(at (select {from: T by: [k1 k2] n: (count (distinct id)) m: (max (+ id 1)) asc: [k1 k2]}) 'm) -- (at (select {from: T by: [k1 k2] m: (max (+ id 1)) asc: [k1 k2]}) 'm)
+;; the inner-select form the issue used as a workaround agrees
+(at (select {from: (select {from: T id: id k1: k1 k2: k2 bad_arg: (if (== st 'bad) 1 0)}) by: [k1 k2] n: (count (distinct id)) bad: (sum bad_arg) asc: [k1 k2]}) 'bad) -- (at O 'bad)
+
+;; where: — a whole-key filter, and one that keeps part of every morsel
+(set Ow (left-join [k1 k2] (select {from: T where: (!= k1 'a) by: [k1 k2] n: (count (distinct id)) asc: [k1 k2]}) (select {from: T where: (!= k1 'a) by: [k1 k2] bad: (sum (if (== st 'bad) 1 0))})))
+(set Aw (select {from: T where: (!= k1 'a) by: [k1 k2] n: (count (distinct id)) bad: (sum (if (== st 'bad) 1 0)) asc: [k1 k2]}))
+(count Aw) -- 36
+(at Aw 'n) -- (at Ow 'n)
+(at Aw 'bad) -- (at Ow 'bad)
+(set Om (left-join [k1 k2] (select {from: T where: (< v 3) by: [k1 k2] n: (count (distinct id)) asc: [k1 k2]}) (select {from: T where: (< v 3) by: [k1 k2] c: (count id)})))
+(set Am (select {from: T where: (< v 3) by: [k1 k2] n: (count (distinct id)) c: (count id) asc: [k1 k2]}))
+(count Am) -- 45
+(at Am 'n) -- (at Om 'n)
+(at Am 'c) -- (at Om 'c)
+(count (select {from: T where: (> v 100) by: [k1 k2] n: (count (distinct id)) bad: (sum (if (== st 'bad) 1 0))})) -- 0
+
+;; three keys, one of them an integer column
+(set O3 (left-join [k1 k2 v] (select {from: T by: [k1 k2 v] n: (count (distinct id)) asc: [k1 k2 v]}) (select {from: T by: [k1 k2 v] s: (sum (* id 2))})))
+(set A3 (select {from: T by: [k1 k2 v] n: (count (distinct id)) s: (sum (* id 2)) asc: [k1 k2 v]}))
+(count A3) -- 315
+(at A3 'n) -- (at O3 'n)
+(at A3 's) -- (at O3 's)
+
+;; a literal broadcast beside the distinct count; desc:/take: over the result
+(at (select {from: T by: [k1 k2] one: 1 n: (count (distinct id)) asc: [k1 k2]}) 'n) -- (at O 'n)
+(sum (at (select {from: T by: [k1 k2] one: 1 n: (count (distinct id))}) 'one)) -- 45
+(at (select {from: T by: [k1 k2] n: (count (distinct id)) bad: (sum (if (== st 'bad) 1 0)) desc: bad take: 3}) 'bad) -- (at (select {from: O desc: bad take: 3}) 'bad)
+
+;; the eval-level grouping: a row expression beside the key keeps it, and
+;; the expression aggregate evaluates there too — two keys and one
+(at (select {from: T by: [k1 k2] bad: (sum (if (== st 'bad) 1 0)) r: (+ v 1) asc: [k1 k2]}) 'bad) -- (at O 'bad)
+(at (select {from: T by: [k1 k2] n: (count (distinct id)) bad: (sum (if (== st 'bad) 1 0)) r: (+ v 1) asc: [k1 k2]}) 'n) -- (at O 'n)
+(at (select {from: T by: k1 bad: (sum (if (== st 'bad) 1 0)) r: (+ v 1) asc: k1}) 'bad) -- (at (select {from: T by: k1 bad: (sum (if (== st 'bad) 1 0)) asc: k1}) 'bad)
+;; a distinct count alone beside a composite key takes the same path when its
+;; (keys, value) grouping would not be dense — two keys, where:, a by-dict —
+;; and the two-pass rewrite otherwise (xlo: 7 values beside 45 groups)
+(at (select {from: T by: [k1 k2] n: (count (distinct id)) asc: [k1 k2]}) 'n) -- (at O 'n)
+(at (select {from: T where: (!= k1 'a) by: [k1 k2] n: (count (distinct id)) asc: [k1 k2]}) 'n) -- (at Ow 'n)
+(at (select {from: T by: {a: k1 b: k2} n: (count (distinct id)) asc: [a b]}) 'n) -- (at O 'n)
+(key (select {from: T by: {a: k1 b: k2} n: (count (distinct id))})) -- ['a 'b 'n]
+(at (select {from: T by: [k1 k2] n: (count (distinct v)) asc: [k1 k2]}) 'n) -- (at (select {from: T by: [k1 k2] one: 1 n: (count (distinct v)) asc: [k1 k2]}) 'n)
+(at (select {from: T by: [k1 k2] n: (count (distinct id)) desc: n take: 3}) 'n) -- (at (select {from: O desc: n take: 3}) 'n)
+;; an aggregate over an `if` under where: — the v2 engine takes it through
+;; a materialized input instead of the legacy group
+(at (select {from: T where: (!= k1 'a) by: [k1 k2] bad: (sum (if (== st 'bad) 1 0)) asc: [k1 k2]}) 'bad) -- (at Ow 'bad)
+(at (select {from: T where: (< v 3) by: k1 bad: (sum (if (== st 'bad) 1 0)) asc: k1}) 'bad) -- (at (select {from: (select {from: T where: (< v 3) k1: k1 b: (if (== st 'bad) 1 0)}) by: k1 bad: (sum b) asc: k1}) 'bad)
+;; one key, the shape that always worked
+(at (select {from: T by: k1 n: (count (distinct id)) bad: (sum (if (== st 'bad) 1 0)) asc: k1}) 'bad) -- (at (select {from: T by: k1 bad: (sum (if (== st 'bad) 1 0)) asc: k1}) 'bad)

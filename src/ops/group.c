@@ -11139,8 +11139,22 @@ static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             ok = false; break;   /* user column shadows the synthetic name */
         }
         ray_expr_t ex;
-        if (!expr_compile(g, tbl, in, &ex)) { ok = false; break; }
-        ray_t* v = expr_eval_full(&ex, nrows);
+        ray_t* v;
+        if (expr_compile(g, tbl, in, &ex)) {
+            v = expr_eval_full(&ex, nrows);
+        } else {
+            /* An input the element-wise compiler declines — an `if`, say:
+             * `(sum (if (== st 'bad) 1 0))` used to drop the whole group onto
+             * the legacy path, 6x slower under a WHERE selection (#756).  The
+             * DAG executor materializes it row-wise over the whole table; the
+             * selection is cleared around the call so the vector comes back
+             * at full length (the final gather only compacts tables, but the
+             * node's own paths need not see the selection). */
+            ray_t* saved_sel = g->selection;
+            g->selection = NULL;
+            v = ray_execute(g, in);
+            g->selection = saved_sel;
+        }
         if (!v || RAY_IS_ERR(v) || !ray_is_vec(v) || v->len != nrows) {
             if (v && !RAY_IS_ERR(v)) ray_release(v);
             else if (v) ray_release(v);
