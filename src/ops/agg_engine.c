@@ -1582,14 +1582,28 @@ static void agg_sel_bounds_rows(void* raw, const agg_view_t* v, uint32_t wid, in
     (void)wid;
     agg_sel_bounds_run_t* t = raw;
     const agg_sel_bounds_ctx_t* c = t->c;
+    const int64_t* rows = t->rows;
+    const int64_t base = v->base;
     for (uint32_t k = 0; k < c->n_keys; k++) {
         int64_t mn = t->mins[k], mx = t->maxs[k];
-        for (int64_t i = ib; i < ie; i++) {
-            int64_t val = agg_vkey(v, c->krr->key_types, k, t->rows[i]);
-            if (c->nullable[k] && val == c->nulls[k]) continue;
-            if (val < mn) mn = val;
-            if (val > mx) mx = val;
+        const bool nullable = c->nullable[k];
+        const int64_t null = c->nulls[k];
+        const void* kd = v->key_data[k];
+        /* the key's width switched once per run, not per row */
+#define SEL_BOUNDS_LOOP(LD) for (int64_t i = ib; i < ie; i++) {               \
+            int64_t val = (LD);                                                 \
+            if (nullable && val == null) continue;                              \
+            if (val < mn) mn = val;                                             \
+            if (val > mx) mx = val;                                             \
         }
+        switch (c->krr->key_types[k]) {
+        case RAY_I64: case RAY_TIMESTAMP:        SEL_BOUNDS_LOOP(((const int64_t*)kd)[rows[i] - base]); break;
+        case RAY_I32: case RAY_DATE: case RAY_TIME: SEL_BOUNDS_LOOP(((const int32_t*)kd)[rows[i] - base]); break;
+        case RAY_I16:                            SEL_BOUNDS_LOOP(((const int16_t*)kd)[rows[i] - base]); break;
+        case RAY_U8: case RAY_BOOL:              SEL_BOUNDS_LOOP(((const uint8_t*)kd)[rows[i] - base]); break;
+        default:                                 SEL_BOUNDS_LOOP(agg_vkey(v, c->krr->key_types, k, rows[i])); break;
+        }
+#undef SEL_BOUNDS_LOOP
         t->mins[k] = mn; t->maxs[k] = mx;
     }
 }

@@ -3908,6 +3908,42 @@ static test_result_t test_v2_sel_bounds(void) {
     PASS();
 }
 
+/* The selected rows' key bounds of every key width (I64, I32 with nulls
+ * and negatives, I16 with negatives, DATE, BOOL, U8, SYM): a filtered group-by answers as the same
+ * group-by over the filtered table (both ordered by the key: the two
+ * routes emit groups in different orders), in both generations. */
+static test_result_t test_v2_sel_key_types(void) {
+    sr_eval_ok("(set KT (table [a n g d b u s h] (list (+ 5000000000 (% (* i 13) 500)) "
+               "(as 'I32 (map (fn [j] (if (== 0 (% j 10)) 0N (+ 70000 (% j 300)))) i)) (as 'I16 (- (% i 7) 3)) "
+               "(as 'DATE (+ 20000 (% i 900))) (== 0 (% i 3)) (as 'U8 (+ 50 (% i 200))) (take ['a 'b 'c 'd 'e] 200000) "
+               "(% (* i 7919) 1000003))))");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/kt2/\" KT {compress: true})");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/kt0/\" KT {compress: false})");
+    static const char* const keys[] = { "a", "n", "g", "d", "b", "u", "s", NULL };
+    for (int gen = 0; gen < 2; gen++) {
+        sr_evalf_ok("(set T (.db.splayed.get \"%s\"))", gen ? SR_TMP "/kt2/" : SR_TMP "/kt0/");
+        for (int i = 0; keys[i]; i++) {
+            char a[256], b[256];
+            snprintf(a, sizeof a, "(select {c: (count h) s: (sum h) from: T where: (> h 500000) by: %s asc: %s})", keys[i], keys[i]);
+            snprintf(b, sizeof b, "(select {c: (count h) s: (sum h) from: (select {from: T where: (> h 500000)}) by: %s asc: %s})",
+                     keys[i], keys[i]);
+            agg_route_reset();
+            ray_t* ra = sr_eval(a);
+            agg_route_stats_t sa = agg_route_stats();
+            agg_route_reset();
+            ray_t* rb = sr_eval(b);
+            agg_route_stats_t sb = agg_route_stats();
+            TEST_ASSERT_FMT(sr_same_text(ra, rb), "gen %d: %s differs from the filtered table's", gen * 2, a);
+            TEST_ASSERT_FMT(sa.dense_plan_available && sb.dense_plan_available, "gen %d: %s: no dense plan", gen * 2, a);
+            /* the unfiltered plan sizes a SYM key from its domain, not its ids */
+            TEST_ASSERT_FMT(i == 6 || sa.dense_local_slots == sb.dense_local_slots, "gen %d: %s: %llu slots, the filtered table's %llu",
+                            gen * 2, a, (unsigned long long)sa.dense_local_slots, (unsigned long long)sb.dense_local_slots);
+            ray_release(ra); ray_release(rb);
+        }
+    }
+    PASS();
+}
+
 /* The pool this test resized is restored even when an assert fails first
  * (finding M11; test/test_parquet.c:262 resizes the pool the same way). */
 static void srr_pool_teardown(void) { ray_pool_destroy(); (void)ray_pool_init_total(0); srr_teardown(); }
@@ -4352,5 +4388,6 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/v2_route_error",     test_v2_route_error,     srr_setup, srr_teardown },
     { "scanrange/v2_decode_once",     test_v2_decode_once,     srr_setup, srr_pool_teardown },
     { "scanrange/v2_sel_bounds",      test_v2_sel_bounds,      srr_setup, srr_teardown },
+    { "scanrange/v2_sel_key_types",   test_v2_sel_key_types,   srr_setup, srr_teardown },
     { NULL, NULL, NULL, NULL },
 };
