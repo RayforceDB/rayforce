@@ -1841,4 +1841,7 @@ static inline bool ray_pred_atom_type_ok(int8_t t) {
     }
 }
 
+/* Owned merged query dict, or NULL when nested select composition is unsafe. */
+ray_t* ray_select_merge_plan(ray_t* dict);
+
 #endif /* RAY_EXEC_INTERNAL_H */
