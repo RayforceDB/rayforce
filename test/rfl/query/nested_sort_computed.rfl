@@ -1,0 +1,8 @@
+(set NS744 (table [x] (list (til 8192))))
+(at (select {from:(select {from:NS744 q:(* x 2)}) desc:q take:3}) 'q) -- [16382 16380 16378]
+(at (select {from:(select {from:NS744 q:(* x 2)}) asc:q take:3}) 'q) -- [0 2 4]
+(count (select {from:(select {from:NS744 q:(* x 2)}) desc:q})) -- 8192
+(at (select {from:(select {from:NS744 q:(* x 2) where:(> x 2)}) asc:q take:3}) 'q) -- [6 8 10]
+(at (select {from:(select {from:NS744 q:(* x 2.0)}) desc:q take:3}) 'q) -- [16382.0 16380.0 16378.0]
+(at (select {from:(select {from:NS744 q:x}) desc:q take:3}) 'q) -- [8191 8190 8189]
+(at (select {from:(select {from:NS744 x:x}) desc:x take:3}) 'x) -- [8191 8190 8189]
