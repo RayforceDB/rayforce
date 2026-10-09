@@ -208,3 +208,36 @@ OUT -- ['p 'q 'r 'a 'b 'c]
 ;; its provenance entry.
 (set T4C (table [a b c d] (list ['p 'q] ['r 's] ['t 'u] ['v 'w])))
 (at (select {v: (at (map (fn [z] (concat z "!")) (list a b c d)) 0) e: (reverse a) from: T4C}) 'v) -- ['p! 'q!]
+;; A closure stores no provenance. Called while the frames it captured from
+;; are live, its captures take the provenance their bindings have now,
+;; relative to the innermost query; an escaped closure's captures are data.
+(set hc (fn [v] 1 (let f (fn [z] (concat z v))) (at (select {q: (f w) from: U}) 'q)))
+(set OUT2 0)
+(update {r: ((fn [v] 1 (set OUT2 (hc v)) 0) s) from: T})
+OUT2 -- (list ['p 'a 'b 'c] ['q 'a 'b 'c] ['r 'a 'b 'c])
+(set hy2 (fn [v] 1 (at (select {r: (concat w (try (+ v 's) (fn [e] v))) from: U}) 'r)))
+(set OUT3 0)
+(update {r: ((fn [v] 1 (set OUT3 (hy2 v)) 0) s) from: T})
+OUT3 -- ['p 'q 'r 'a 'b 'c]
+(set hc2 (fn [v] 1 (let f (fn [z] z)) (at (select {q: (concat w (f v)) from: U}) 'q)))
+(set OUT4 0)
+(update {r: ((fn [v] 1 (set OUT4 (hc2 v)) 0) s) from: T})
+OUT4 -- ['p 'q 'r 'a 'b 'c]
+;; The opaque-key gate: and/or work elementwise, a global helper's body
+;; resolves names globally, and an if over an aggregate condition is one
+;; value for the whole column.
+(set hand (fn [v] 1 (and (> v (avg v)) (< v 25))))
+(at (select {n: (count v) by: (hand v) from: TB}) 'v) -- [false true]
+(set hmin (fn [v] (- v (min v))))
+(set hg (fn [v] 1 (hmin v)))
+((fn [t] (let hmin (fn [v] (if (> v 2) (* v 10) v))) (at (select {n: (count v) by: (hg v) from: t}) 'v)) TB) -- [0 1 2 9 19 29]
+(set hifl (fn [v] (let m (if (> (count v) 0) (min v) 0)) (- v m)))
+(at (select {n: (count v) by: (hifl v) from: TB}) 'v) -- [0 1 2 9 19 29]
+(at (select {n: (count v) by: ((fn [v] (let m (min v)) (- v m)) v) from: TB}) 'v) -- [0 1 2 9 19 29]
+;; A null STR literal nulls the row on both paths; a null cell in a compiled
+;; helper is empty text; return passes provenance through.
+(set TS2 (table [x t] (list [1 2] (list "a" "b"))))
+(at (select {r: (concat t "") e: (reverse x) from: TS2}) 'r) -- (as 'STR ["" ""])
+(set hz (fn [v] 1 (concat v 'zz)))
+(at (select {r: (hz s) e: (reverse x) from: T4}) 'r) -- ['azz 'zz 'czz 'dzz]
+(at (select {r: ((fn [v] 1 (concat (return v) "!")) s) e: (reverse x) from: T}) 'r) -- ['a! 'b! 'c!]

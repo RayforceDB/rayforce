@@ -1569,11 +1569,11 @@ ray_t* exec_concat(ray_graph_t* g, ray_op_t* op) {
 /* Query fallback uses the same text kernel after checking argument syntax.
  * Ordinary builtin calls retain collection semantics. */
 ray_t* ray_concat_text_fn(ray_t* a, ray_t* b, bool str_out, uint8_t rows_mask) {
-    if (a->type == -RAY_STR && b->type == -RAY_STR) return ray_concat_fn(a, b);
     bool atoms = ray_is_atom(a) && ray_is_atom(b);
     /* A null cell of a column is empty text, as the vector kernel reads a
      * null element; a null literal operand follows the kernel's null rule. */
     bool a_null = RAY_ATOM_IS_NULL(a), b_null = RAY_ATOM_IS_NULL(b);
+    if (a->type == -RAY_STR && b->type == -RAY_STR && !a_null && !b_null) return ray_concat_fn(a, b);
     if (atoms && (a->type == -RAY_SYM || a->type == -RAY_STR) &&
         (b->type == -RAY_SYM || b->type == -RAY_STR) &&
         (!a_null || (rows_mask & 1)) && (!b_null || (rows_mask & 2))) {

@@ -2547,6 +2547,12 @@ static ray_t* vm_exec_rows(ray_t* lambda, ray_t** call_args, int64_t argc,
     ray_t **cpool = (ray_t **)ray_data(LAMBDA_CONSTS(lambda));
     int32_t ip = 0;
     ray_t *vm_err_obj = NULL;
+    /* The running frame's slots, for closures created here and called by a
+     * builtin after their window closed (a try handler, a lambda passed to
+     * map): their captures' provenance is read from the slots. */
+    ray_live_slots_t live_prev = ray_env_set_live_slots(
+        (ray_live_slots_t){ &vm.ps[vm.fp], &vm.rows[vm.fp], n_locals, scope_base });
+#define LIVE_SLOTS() ray_env_set_live_slots((ray_live_slots_t){ &vm.ps[vm.fp], &vm.rows[vm.fp], n_locals, scope_base })
 
 #define DISPATCH() goto *dispatch[code[ip++]]
 #define PUSH(v)    do { if (vm.sp >= VM_STACK_SIZE) goto vm_error_limit; vm.rows[vm.sp] = 0; vm.ps[vm.sp++] = (v); } while(0)
@@ -2869,6 +2875,7 @@ op_callf: {
             code = (uint8_t *)ray_data(LAMBDA_BC(fn_obj));
             cpool = (ray_t **)ray_data(LAMBDA_CONSTS(fn_obj));
             ip = 0;
+            LIVE_SLOTS();
             DISPATCH();
         }
     }
@@ -2989,6 +2996,7 @@ op_calls: {
     }
 
     ip = 0;
+    LIVE_SLOTS();
     DISPATCH();
 }
 
@@ -3054,6 +3062,7 @@ op_ret: {
     if (vm.rp == 0) {
         /* Top-level return */
         if (out_rows) *out_rows = result_rows;
+        ray_env_set_live_slots(live_prev);
         ray_release(vm.fn);
 #undef vm
         ray_free(vm_block);
@@ -3074,6 +3083,7 @@ op_ret: {
         n_locals = LAMBDA_NLOCALS(vm.fn);
     }
     /* Self-call (fn==NULL): vm.fn/code/cpool/n_locals are already correct */
+    LIVE_SLOTS();
     PUSHR(result, result_rows);
     DISPATCH();
 }
@@ -3229,6 +3239,7 @@ vm_error_cleanup: {
         code = (uint8_t *)ray_data(LAMBDA_BC(vm.fn));
         cpool = (ray_t **)ray_data(LAMBDA_CONSTS(vm.fn));
         ip = trap.handler_ip;
+        LIVE_SLOTS();
         PUSH(err_val);
         DISPATCH();
     }
@@ -3253,6 +3264,7 @@ vm_error_cleanup: {
         if (vm.rs[i].fn) ray_release(vm.rs[i].fn);
     for (int32_t i = 0; i < vm.tp; i++)
         ray_release(vm.ts[i].fn);
+    ray_env_set_live_slots(live_prev);
 #undef vm
     ray_free(vm_block);
     if (vm_err_obj)
@@ -3270,6 +3282,7 @@ vm_error_cleanup: {
 #undef PEEK
 #undef LOCAL
 #undef LROWS
+#undef LIVE_SLOTS
 #undef vm
 }
 
