@@ -219,6 +219,19 @@ bool agg_dense_plan(ray_t** key_cols, uint32_t n_keys,
                     const agg_vtable_t** vts, uint32_t n_aggs,
                     int64_t nrows, dense_plan_t* out);
 
+/* An estimate of the groups the key tuple (key_cols) forms, for a planner
+ * choosing between strategies before any grouping runs
+ * (try_count_distinct_v2_rewrite): the product of per-key estimates over a
+ * strided sample of up to 65,536 rows (every row below that).  An integer
+ * or temporal key contributes its sampled span, as the dense planner's raw
+ * range would; a SYM key its distinct codes in the sample — codes of a
+ * shared domain interleave, so a span would overstate a 5-value key by
+ * orders of magnitude — or its domain count once the sample saturates.  An
+ * estimate, never a bound: a planner weighs it against thresholds with
+ * slack.  -1 when a key is not a dense key type, the input is empty, or
+ * the product overflows. */
+int64_t agg_group_card_estimate(ray_t** key_cols, uint32_t n_keys, int64_t nrows);
+
 /* Result column name for a plain-column-input aggregate: input column name
  * (ray_sym_str of in_sym) + per-op suffix (_sum/_count/_mean/_min/_max/...),
  * interned.  Falls back to in_sym on buffer overflow.  Behavior-identical to

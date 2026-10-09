@@ -498,6 +498,92 @@ static bool agg_dense_plan_compact(ray_t** key_cols, uint32_t n_keys, int64_t nr
     return true;
 }
 
+/* An estimate of the groups a key tuple forms — see agg_engine.h.  The
+ * sample is 64 blocks of 1,024 rows spread evenly over the input (every row
+ * below 65,536), read with the typed bounds loop above; a SYM key's codes
+ * go through a small open-addressing set. */
+enum { AGG_EST_BLOCKS = 64, AGG_EST_BLOCK = 1024,
+       AGG_EST_SET_CAP = 1 << 18 };   /* > 2 x the sample: short probes */
+
+static int64_t agg_sym_distinct_sampled(ray_t* key, int64_t nrows,
+                                        int64_t* sampled_out) {
+    int64_t* set = ray_alloc_raw((size_t)AGG_EST_SET_CAP * sizeof(int64_t));
+    if (!set) return -1;
+    memset(set, 0xFF, (size_t)AGG_EST_SET_CAP * sizeof(int64_t));   /* -1: empty */
+    const void* data = ray_data(key);
+    int64_t n = 0, sampled = 0;
+    int nb = nrows <= (int64_t)AGG_EST_BLOCKS * AGG_EST_BLOCK ? 1 : AGG_EST_BLOCKS;
+    for (int b = 0; b < nb; b++) {
+        int64_t lo = nb == 1 ? 0 : nrows / nb * b;
+        int64_t hi = nb == 1 ? nrows : lo + AGG_EST_BLOCK;
+        if (hi > nrows) hi = nrows;
+        for (int64_t r = lo; r < hi; r++) {
+            int64_t code = ray_read_sym(data, r, key->type, key->attrs);
+            uint64_t h = ((uint64_t)code * 0x9E3779B97F4A7C15ULL) >> 46;
+            for (;;) {
+                if (set[h] == -1) { set[h] = code; n++; break; }
+                if (set[h] == code) break;
+                h = (h + 1) & (AGG_EST_SET_CAP - 1);
+            }
+        }
+        sampled += hi - lo;
+    }
+    ray_free_raw(set);
+    *sampled_out = sampled;
+    return n;
+}
+
+int64_t agg_group_card_estimate(ray_t** key_cols, uint32_t n_keys, int64_t nrows) {
+    if (n_keys < 1 || n_keys > 16 || nrows <= 0) return -1;
+    int64_t total = 1;
+    for (uint32_t k = 0; k < n_keys; k++) {
+        ray_t* kc = key_cols[k];
+        int64_t est;
+        switch (kc->type) {
+        case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8:
+        case RAY_BOOL: case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: {
+            bool nullable = ray_vec_may_have_nulls(kc);
+            int64_t null = agg_key_null(kc->type);
+            int64_t mn = INT64_MAX, mx = INT64_MIN;
+            int nb = nrows <= (int64_t)AGG_EST_BLOCKS * AGG_EST_BLOCK ? 1 : AGG_EST_BLOCKS;
+            for (int b = 0; b < nb; b++) {
+                int64_t lo = nb == 1 ? 0 : nrows / nb * b;
+                int64_t hi = nb == 1 ? nrows : lo + AGG_EST_BLOCK;
+                if (hi > nrows) hi = nrows;
+                int64_t l, h;
+                agg_key_bounds(kc, lo, hi, nullable, null, &l, &h);
+                if (l < mn) mn = l;
+                if (h > mx) mx = h;
+            }
+            if (mx < mn) { est = 1; break; }            /* nulls only */
+            uint64_t span = (uint64_t)mx - (uint64_t)mn;
+            if (span >= (uint64_t)INT64_MAX - 2) return -1;
+            est = (int64_t)span + 1 + (nullable ? 1 : 0);
+            break;
+        }
+        case RAY_SYM: {
+            int64_t sampled = 0;
+            int64_t n = agg_sym_distinct_sampled(kc, nrows, &sampled);
+            if (n < 0) return -1;
+            est = n;
+            if (sampled < nrows && n * 4 >= sampled * 3) {
+                /* nearly every sampled row distinct: the vocabulary is far
+                 * larger than the sample — its domain bounds it */
+                int64_t dc = ray_sym_domain_count(ray_sym_vec_domain(kc));
+                if (dc > est) est = dc;
+            }
+            break;
+        }
+        default:
+            return -1;
+        }
+        if (est <= 0) est = 1;
+        if (total > INT64_MAX / est) return -1;
+        total *= est;
+    }
+    return total;
+}
+
 bool agg_dense_plan(ray_t** key_cols, uint32_t n_keys,
                     const agg_vtable_t** vts, uint32_t n_aggs,
                     int64_t nrows, dense_plan_t* out) {

@@ -2056,6 +2056,30 @@ static ray_t* bind_all_columns(ray_t* tbl) {
     return prev;
 }
 
+static ray_t* group_key_eval(ray_t* v, ray_t* tbl);
+
+/* The column of an aggregate's argument expression over `tbl`: the
+ * full-column evaluation the eval-level grouping slices per group
+ * (`(sum (if (== st 'bad) 1 0))`, #756).  Evaluated with the columns in
+ * scope and as a row-wise projection where it compiles (group_key_eval),
+ * since the eval-level `if` tests whole-vector truthiness.  A lazy result
+ * is materialized, since the per-group ray_at_fn consumes lazy arguments.
+ * Owned ref, or an error. */
+static ray_t* select_eval_over_table(ray_t* expr, ray_t* tbl) {
+    if (ray_env_push_query_scope() != RAY_OK) return ray_error("oom", NULL);
+    ray_t* _aqt = bind_all_columns(tbl);
+    ray_t* v = group_key_eval(expr, tbl);
+    g_active_query_table = _aqt;
+    ray_env_pop_scope();
+    if (!v) return ray_error("domain", "select by: failed to evaluate aggregation source");
+    if (RAY_IS_ERR(v)) return v;
+    if (ray_is_lazy(v)) {
+        v = ray_lazy_materialize(v);
+        if (!v) return ray_error("domain", "select by: failed to materialize aggregation source");
+    }
+    return v;
+}
+
 static ray_t* eval_where_mask(ray_t* where_expr, ray_t* tbl, const char* label) {
     if (ray_env_push_query_scope() != RAY_OK) return ray_error("oom", NULL);
     ray_t* _aqt = bind_all_columns(tbl);
@@ -6090,6 +6114,38 @@ static ray_t* query_materialize_parted_col(ray_t* col) {
     return flat;
 }
 
+/* The scatter path serves a distinct count beside the group by K: the
+ * post-group row→group map and a per-group dedup over the slices (the
+ * global-hash kernel past 50 K groups).  This many groups and beyond, its
+ * map and kernel fall behind the two-pass rewrite's radix grouping. */
+#define CD_SCATTER_MAX_GROUPS (256 * 1024)
+
+/* Whether the two-pass rewrite below (group by (K, X), then count per K)
+ * beats grouping by K and counting distinct X over each group's slice — the
+ * path a `(count (distinct X))` takes beside other aggregates, and the one
+ * the planner falls back to when this returns false (#756).
+ *
+ * The rewrite wins when its (K, X) grouping is dense: the packed key space
+ * fits the row count, so the dedup is a direct-index pass.  Past that it is
+ * a radix grouping that materializes and orders every (K, X) tuple — 1.8 GB
+ * and 3x the time of the slice dedup at 10 M rows with 45 groups of 3 M
+ * distinct values — unless the groups are so many that the scatter's own
+ * machinery is the slower one, or so few that its per-group dedup leaves
+ * most workers idle.  The group and value counts are sampled estimates
+ * (agg_group_card_estimate), a fraction of a millisecond at any size. */
+static bool cd_two_pass_preferred(ray_t** K_cols, int n_K, ray_t* X_col,
+                                  int64_t nrows) {
+    int64_t k_est = agg_group_card_estimate(K_cols, (uint32_t)n_K, nrows);
+    if (k_est < 0 || k_est > nrows) return true;   /* K unbounded: many groups */
+    ray_pool_t* pool = ray_pool_get();
+    int64_t workers = pool ? (int64_t)ray_pool_total_workers(pool) : 1;
+    if (k_est <= workers) return true;    /* fewer groups than workers */
+    if (k_est > CD_SCATTER_MAX_GROUPS) return true;
+    int64_t x_est = agg_group_card_estimate(&X_col, 1, nrows);
+    if (x_est < 1) return false;          /* X unbounded: (K, X) is radix */
+    return k_est <= nrows / x_est;        /* (K, X) packs within the rows */
+}
+
 /* Planner rewrite for `(select {K: K c: (count (distinct X)) from: T
  * [where: W] by: K [desc: c take: N]})`.
  *
@@ -6313,6 +6369,13 @@ static ray_t* try_count_distinct_v2_rewrite(
             }
         }
     }
+
+    /* The two-pass rewrite only where it wins (cd_two_pass_preferred); the
+     * select otherwise groups by K and counts distinct X over the group
+     * slices (a by-dict of column refs is rewritten to a key vector on the
+     * way there). */
+    if (!cd_two_pass_preferred(K_cols, n_K, X_col, ray_table_nrows(tbl)))
+        return NULL;
 
     /* === Inner pass: group by (K1, ..., Kn, X) on the source table === */
     ray_graph_t* g_in = ray_graph_new(tbl);
@@ -6936,6 +6999,239 @@ static void rgid_probe_str_fn(void* ctx_, uint32_t worker_id,
         }
         x->row_gid[r] = found;
     }
+}
+
+/* Composite (multi-key) row→gid probe: the sibling of rgid_probe_fn for a
+ * `by: [k1 k2 ...]` of fixed-width / SYM keys (#756).  The hash table maps
+ * each result group's key tuple (gk[gid * nk ..]) to gid + 1; a row hashes
+ * its nk key cells, read as int64 the way the single-key probe reads them,
+ * and walks the slots comparing tuples.  Rows a selection drops get -1, as
+ * in rgid_probe_fn.  The table is read-only and row_gid writes are
+ * disjoint, so workers need no synchronisation. */
+typedef struct {
+    int                nk;
+    const void* const* key_data;   /* [nk] flat source key column data */
+    const int8_t*      key_type;   /* [nk] */
+    const uint8_t*     key_attrs;  /* [nk] */
+    const int64_t*     gk;         /* [n_groups * nk] group key tuples */
+    const int64_t*     hk_gid_p1;  /* [mask + 1]: gid + 1, 0 = empty */
+    uint64_t           mask;
+    int64_t*           row_gid;
+    const uint8_t*     sel_flg;    /* NULL: every row */
+    const uint32_t*    sel_offs;
+    const uint16_t*    sel_idx;
+    uint32_t           sel_n_segs;
+} rgid_probe_mk_ctx_t;
+
+static inline uint64_t rgid_mk_hash_step(uint64_t h, int64_t v) {
+    h ^= (uint64_t)v;
+    h *= 0x9E3779B97F4A7C15ULL;
+    h ^= h >> 33;
+    return h;
+}
+
+static inline int64_t rgid_mk_probe_row(const rgid_probe_mk_ctx_t* x, int64_t r) {
+    uint64_t h = 0x9E3779B97F4A7C15ULL;
+    for (int k = 0; k < x->nk; k++)
+        h = rgid_mk_hash_step(h, key_read_i64(x->key_data[k], r,
+                                              x->key_type[k], x->key_attrs[k]));
+    uint64_t s = h & x->mask;
+    for (;;) {
+        int64_t g_p1 = x->hk_gid_p1[s];
+        if (g_p1 == 0) return -1;
+        const int64_t* t = x->gk + (g_p1 - 1) * x->nk;
+        int k = 0;
+        for (; k < x->nk; k++)
+            if (t[k] != key_read_i64(x->key_data[k], r, x->key_type[k], x->key_attrs[k]))
+                break;
+        if (k == x->nk) return g_p1 - 1;
+        s = (s + 1) & x->mask;
+    }
+}
+
+static void rgid_probe_mk_fn(void* ctx_, uint32_t worker_id,
+                             int64_t start, int64_t end) {
+    (void)worker_id;
+    const rgid_probe_mk_ctx_t* x = (const rgid_probe_mk_ctx_t*)ctx_;
+    if (!x->sel_flg) {
+        for (int64_t r = start; r < end; r++) x->row_gid[r] = rgid_mk_probe_row(x, r);
+        return;
+    }
+    uint32_t seg_lo = (uint32_t)(start / RAY_MORSEL_ELEMS);
+    uint32_t seg_hi = (uint32_t)((end + RAY_MORSEL_ELEMS - 1) / RAY_MORSEL_ELEMS);
+    if (seg_hi > x->sel_n_segs) seg_hi = x->sel_n_segs;
+    int64_t covered = start;
+    for (uint32_t seg = seg_lo; seg < seg_hi; seg++) {
+        int64_t base = (int64_t)seg * RAY_MORSEL_ELEMS;
+        int64_t s_lo = base, s_hi = base + RAY_MORSEL_ELEMS;
+        if (s_lo < start) s_lo = start;
+        if (s_hi > end)   s_hi = end;
+        covered = s_hi;
+        uint8_t f = x->sel_flg[seg];
+        if (f == RAY_SEL_NONE) {
+            for (int64_t r = s_lo; r < s_hi; r++) x->row_gid[r] = -1;
+        } else if (f == RAY_SEL_ALL) {
+            for (int64_t r = s_lo; r < s_hi; r++) x->row_gid[r] = rgid_mk_probe_row(x, r);
+        } else {
+            uint8_t in_seg[RAY_MORSEL_ELEMS / 8] = {0};
+            uint32_t off = x->sel_offs[seg];
+            uint32_t cnt = x->sel_offs[seg + 1] - off;
+            for (uint32_t i = 0; i < cnt; i++) {
+                uint16_t loc = x->sel_idx[off + i];
+                in_seg[loc >> 3] |= (uint8_t)(1u << (loc & 7));
+            }
+            for (int64_t r = s_lo; r < s_hi; r++) {
+                uint16_t loc = (uint16_t)(r - base);
+                x->row_gid[r] = (in_seg[loc >> 3] & (1u << (loc & 7)))
+                    ? rgid_mk_probe_row(x, r) : -1;
+            }
+        }
+    }
+    /* rows past the selection's last segment are not selected */
+    for (int64_t r = covered; r < end; r++) x->row_gid[r] = -1;
+}
+
+/* The base types the composite probe reads: KEY_READ's coverage less STR,
+ * which the single-key scatter resolves through its own descriptor probe. */
+static int rgid_mk_key_type_ok(int8_t bt) {
+    switch (bt) {
+    case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
+    case RAY_F32: case RAY_F64: case RAY_DATE: case RAY_TIME:
+    case RAY_TIMESTAMP: case RAY_SYM:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* True when `by_expr` is a `by: [k1 k2 ...]` whose keys are all columns of
+ * `tbl` the composite probe can read.  Such a select stays on the DAG path
+ * when its only non-DAG outputs are count(distinct) aggregates and literal
+ * broadcasts; the post-group scatter then maps rows to groups through
+ * rgid_build_multikey.  STR, GUID, LIST and mapcommon keys keep their
+ * existing routes. */
+static int multikey_scatter_keys_ok(ray_t* by_expr, ray_t* tbl) {
+    if (!by_expr || by_expr->type != RAY_SYM || ray_len(by_expr) < 2) return 0;
+    const int64_t* ids = (const int64_t*)ray_data(by_expr);
+    for (int64_t k = 0; k < ray_len(by_expr); k++) {
+        ray_t* col = ray_table_get_col(tbl, ids[k]);
+        if (!col || col->type == RAY_MAPCOMMON) return 0;
+        int8_t bt = col->type;
+        if (RAY_IS_PARTED(bt)) bt = (int8_t)RAY_PARTED_BASETYPE(bt);
+        if (!rgid_mk_key_type_ok(bt)) return 0;
+    }
+    return 1;
+}
+
+/* Build row_gid[nrows] for a composite key: one tuple per result group from
+ * `result`'s key columns, hashed; then every row of `tbl`'s key columns is
+ * probed (in parallel when the input is large).  Parted source keys are
+ * flattened for the probe.  Rows `selection` drops get -1.  Returns NULL on
+ * success, else an owned error. */
+static ray_t* rgid_build_multikey(ray_t* tbl, ray_t* result, ray_t* by_expr,
+                                  int64_t nrows, int64_t n_groups,
+                                  ray_t* selection, int64_t* row_gid) {
+    int nk = (int)ray_len(by_expr);
+    const int64_t* ids = (const int64_t*)ray_data(by_expr);
+    ray_t* err = NULL;
+    ray_t* cols_hdr = NULL;
+    ray_t* gk_hdr = NULL;
+    ray_t* slot_hdr = NULL;
+    /* [nk] scan columns, [nk] owned flags, [nk] data, [nk] types, [nk] attrs */
+    size_t cols_sz = (size_t)nk * (2 * sizeof(ray_t*) + sizeof(void*) + 2);
+    uint8_t* cols_mem = (uint8_t*)scratch_calloc(&cols_hdr, cols_sz);
+    if (!cols_mem) return ray_error("oom", NULL);
+    ray_t**      scan  = (ray_t**)cols_mem;
+    ray_t**      grp   = scan + nk;
+    const void** kdata = (const void**)(grp + nk);
+    int8_t*      ktype = (int8_t*)(kdata + nk);
+    uint8_t*     kattr = (uint8_t*)(ktype + nk);
+    uint8_t*     owned = NULL;
+    ray_t* owned_hdr = NULL;
+    owned = (uint8_t*)scratch_calloc(&owned_hdr, (size_t)nk);
+    if (!owned) { scratch_free(cols_hdr); return ray_error("oom", NULL); }
+
+    for (int k = 0; k < nk && !err; k++) {
+        ray_t* orig = ray_table_get_col(tbl, ids[k]);
+        ray_t* g    = ray_table_get_col(result, ids[k]);
+        if (!orig || !g) { err = ray_error("domain", "select by: group key column not found"); break; }
+        ray_t* sc = orig;
+        if (RAY_IS_PARTED(sc->type) || sc->type == RAY_MAPCOMMON) {
+            sc = query_materialize_parted_col(sc);
+            if (!sc || RAY_IS_ERR(sc)) { err = sc ? sc : ray_error("oom", NULL); break; }
+            owned[k] = 1;
+        }
+        if (!rgid_mk_key_type_ok(sc->type) || g->type != sc->type ||
+            ray_len(sc) != nrows || ray_len(g) != n_groups) {
+            if (owned[k]) ray_release(sc);
+            owned[k] = 0;
+            err = ray_error("type", "group key type mismatch");
+            break;
+        }
+        scan[k] = sc; grp[k] = g;
+        kdata[k] = ray_data(sc); ktype[k] = sc->type; kattr[k] = sc->attrs;
+    }
+
+    uint64_t cap = 0, mask = 0;
+    int64_t* gk = NULL;
+    int64_t* slot = NULL;
+    if (!err) {
+        cap = (uint64_t)n_groups * 2;
+        if (cap < 32) cap = 32;
+        uint64_t c = 1;
+        while (c && c < cap) c <<= 1;
+        if (!c) err = ray_error("oom", NULL);
+        else {
+            cap = c; mask = cap - 1;
+            gk = (int64_t*)scratch_alloc(&gk_hdr, (size_t)n_groups * (size_t)nk * sizeof(int64_t));
+            slot = (int64_t*)scratch_calloc(&slot_hdr, (size_t)cap * sizeof(int64_t));
+            if (!gk || !slot) err = ray_error("oom", NULL);
+        }
+    }
+    if (!err) {
+        for (int64_t gi = 0; gi < n_groups; gi++)
+            for (int k = 0; k < nk; k++)
+                gk[gi * nk + k] = key_read_i64(ray_data(grp[k]), gi, grp[k]->type, grp[k]->attrs);
+        for (int64_t gi = 0; gi < n_groups; gi++) {
+            const int64_t* t = gk + gi * nk;
+            uint64_t h = 0x9E3779B97F4A7C15ULL;
+            for (int k = 0; k < nk; k++) h = rgid_mk_hash_step(h, t[k]);
+            uint64_t s = h & mask;
+            for (;;) {
+                int64_t cur = slot[s];
+                if (cur == 0) { slot[s] = gi + 1; break; }
+                const int64_t* u = gk + (cur - 1) * nk;
+                int k = 0;
+                for (; k < nk; k++) if (u[k] != t[k]) break;
+                if (k == nk) break;   /* duplicate tuple — keep the first */
+                s = (s + 1) & mask;
+            }
+        }
+        rgid_probe_mk_ctx_t ctx = {
+            .nk = nk, .key_data = kdata, .key_type = ktype, .key_attrs = kattr,
+            .gk = gk, .hk_gid_p1 = slot, .mask = mask, .row_gid = row_gid,
+            .sel_flg = NULL, .sel_offs = NULL, .sel_idx = NULL, .sel_n_segs = 0,
+        };
+        if (selection) {
+            ray_rowsel_t* sm = ray_rowsel_meta(selection);
+            ctx.sel_flg    = ray_rowsel_flags(selection);
+            ctx.sel_offs   = ray_rowsel_offsets(selection);
+            ctx.sel_idx    = ray_rowsel_idx(selection);
+            ctx.sel_n_segs = sm->n_segs;
+        }
+        ray_pool_t* pool = ray_pool_get();
+        if (pool && nrows >= 200000 && ray_pool_total_workers(pool) >= 2)
+            ray_pool_dispatch(pool, rgid_probe_mk_fn, &ctx, nrows);
+        else
+            rgid_probe_mk_fn(&ctx, 0, 0, nrows);
+    }
+
+    for (int k = 0; k < nk; k++) if (owned[k] && scan[k]) ray_release(scan[k]);
+    if (gk_hdr) scratch_free(gk_hdr);
+    if (slot_hdr) scratch_free(slot_hdr);
+    scratch_free(owned_hdr);
+    scratch_free(cols_hdr);
+    return err;
 }
 
 /* Forward declarations for eval-level groupby fallback */
@@ -11024,7 +11320,14 @@ by_dict_done:
             } else if (by_expr->type == RAY_SYM && ray_len(by_expr) == 1) {
                 single_scalar_key = 1;
             }
-            if (!single_scalar_key) use_eval_group = 1;
+            /* A plain multi-key by: stays on the DAG path when the outputs
+             * the DAG cannot serve are count(distinct) aggregates and
+             * literal broadcasts (no true row expression): the scatter
+             * maps rows to groups through the composite key (#756).  The
+             * eval-level grouping it took before is serial. */
+            if (!single_scalar_key &&
+                !(!any_true_nonagg && multikey_scatter_keys_ok(by_expr, tbl)))
+                use_eval_group = 1;
         }
         if (use_eval_group) {
             /* Apply WHERE filter first (if any), then eval-level groupby */
@@ -11513,13 +11816,11 @@ by_dict_done:
                             if (src_col_val) ray_retain(src_col_val);
                         }
                         if (!src_col_val) {
-                            src_col_val = ray_eval(agg_col_expr);
-                            /* Materialize a lazy result up front: the
-                             * per-group ray_at_fn consumes lazy args
-                             * (see aggr_unary_per_group_buf). */
-                            if (src_col_val && ray_is_lazy(src_col_val))
-                                src_col_val = ray_lazy_materialize(src_col_val);
-                            if (!src_col_val || RAY_IS_ERR(src_col_val)) {
+                            /* An expression argument reads the columns:
+                             * evaluate it over the selected rows with the
+                             * columns in scope (#756). */
+                            src_col_val = select_eval_over_table(agg_col_expr, eval_tbl);
+                            if (RAY_IS_ERR(src_col_val)) {
                                 for (int ai = 0; ai < n_agg_out; ai++) if (agg_results[ai]) ray_release(agg_results[ai]);
                                 scratch_free(aggnames_hdr); scratch_free(aggres_hdr); scratch_free(keycols_hdr);
                                 ray_release(groups); if (eval_tbl != tbl) ray_release(eval_tbl); ray_release(tbl);
@@ -12117,12 +12418,10 @@ by_dict_done:
                         if (src_col_val) ray_retain(src_col_val);
                     }
                     if (!src_col_val) {
-                        src_col_val = ray_eval(agg_col_expr);
-                        /* Materialize a lazy result up front: the
-                         * per-group ray_at_fn consumes lazy args
-                         * (see aggr_unary_per_group_buf). */
-                        if (src_col_val && !RAY_IS_ERR(src_col_val) && ray_is_lazy(src_col_val))
-                            src_col_val = ray_lazy_materialize(src_col_val);
+                        /* An expression argument reads the columns:
+                         * evaluate it over the selected rows with the
+                         * columns in scope (#756). */
+                        src_col_val = select_eval_over_table(agg_col_expr, eval_tbl);
                         if (RAY_IS_ERR(src_col_val)) {
                             for (int ai = 0; ai < n_agg_out; ai++) { if (agg_results[ai]) ray_release(agg_results[ai]); }
                             scratch_free(aggnames_hdr); scratch_free(aggres_hdr);
@@ -14607,12 +14906,20 @@ by_dict_done:
                 }
             }
 
-            /* Resolve key sym — gated to single scalar key above. */
+            /* Resolve key sym — a single scalar key, or the first key of a
+             * composite by: (routed here by multikey_scatter_keys_ok): the
+             * first key resolves the row count and the type checks below,
+             * and rgid_build_multikey maps rows over every key. */
             int64_t ks = -1;
+            int64_t mk_nk = 0;
             if (by_expr->type == -RAY_SYM && !(by_expr->attrs & ATTR_QUOTED))
                 ks = by_expr->i64;
             else if (by_expr->type == RAY_SYM && ray_len(by_expr) == 1)
                 ks = ((int64_t*)ray_data(by_expr))[0];
+            else if (by_expr->type == RAY_SYM && ray_len(by_expr) > 1) {
+                mk_nk = ray_len(by_expr);
+                ks = ((int64_t*)ray_data(by_expr))[0];
+            }
 
             if (ks < 0) {
                 ray_release(result); ray_release(tbl);
@@ -14753,7 +15060,18 @@ by_dict_done:
                  * 5M * 730K ≈ 4T comparisons.  Build a value→gid hash
                  * instead so each row is one O(1) probe. */
                 int rgid_did_mask = 0;
-                if (okt == RAY_STR) {
+                if (mk_nk > 1) {
+                    ray_t* mk_err = rgid_build_multikey(tbl, result, by_expr, nrows,
+                                                        n_groups, saved_selection, row_gid);
+                    if (mk_err) {
+                        ray_free(gk_hdr); ray_free(rg_hdr); ray_free(cnt_hdr);
+                        ray_free(off_hdr); ray_free(pos_hdr);
+                        RELEASE_SCAN_KEY();
+                        ray_release(result); ray_release(tbl);
+                        scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return mk_err;
+                    }
+                    rgid_did_mask = 1;   /* the probe applied the selection */
+                } else if (okt == RAY_STR) {
                     /* Dict-code row_gid fast path: when the group key is a
                      * dict-encoded STR column, exec_group already grouped on its
                      * int32 codes and stashed the per-result-group codes.  Build
