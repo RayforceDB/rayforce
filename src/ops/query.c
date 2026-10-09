@@ -2080,32 +2080,37 @@ static _Thread_local query_dependency_cache_t* g_query_dependencies;
 
 typedef struct { int64_t name; ray_t* expr; } query_inline_binding_t;
 
-/* Substitution must not move a free name into the query's alias scope. */
-static bool query_helper_closed(ray_t* expr, ray_t* params) {
-    if (!expr) return false;
-    if (expr->type == -RAY_SYM && !(expr->attrs & ATTR_QUOTED)) {
-        for (int64_t i = 0; i < params->len; i++)
-            if (sym_cell_runtime_id(params, i) == expr->i64) return true;
-        return false;
-    }
-    if (expr->type != RAY_LIST || (expr->attrs & ATTR_QUOTED)) return true;
-    ray_t** es = ray_data(expr);
-    for (int64_t i = 1; i < expr->len; i++)
-        if (!query_helper_closed(es[i], params)) return false;
-    return true;
-}
-
 /* Expand only calls accepted by the DAG compiler. This gives fallback the
  * same column semantics through pure helper parameters without executing
  * user code while planning. Scope forms and captured closures stay opaque. */
 static ray_t* query_inline_walk(ray_t* expr, ray_t* tbl,
                                query_inline_binding_t* bindings, int nb,
-                               int depth, int* budget) {
+                               int depth, int* budget, bool named_body) {
     if (!expr || depth > 24 || --*budget < 0) return NULL;
     if (expr->type == -RAY_SYM && !(expr->attrs & ATTR_QUOTED)) {
         for (int i = nb - 1; i >= 0; i--) if (bindings[i].name == expr->i64) {
             ray_retain(bindings[i].expr);
             return bindings[i].expr;
+        }
+        if (named_body && !ray_table_get_col(tbl, expr->i64)) {
+            /* A named helper's free name belongs to its global scope, not
+             * to an earlier select alias. Quote the value so a SYM or LIST
+             * constant cannot be reinterpreted as a column or a call. */
+            ray_t* value = ray_env_get_global(expr->i64);
+            if (!value || !(ray_is_atom(value) || ray_is_vec(value))) return NULL;
+            ray_t* quoted = ray_list_new(2);
+            if (!quoted || RAY_IS_ERR(quoted)) {
+                if (quoted) ray_error_free(quoted);
+                return NULL;
+            }
+            ray_t** q = ray_data(quoted);
+            q[0] = ray_sym(ray_sym_intern("quote", 5));
+            if (!q[0] || RAY_IS_ERR(q[0])) {
+                if (q[0]) ray_error_free(q[0]);
+                quoted->len = 0; ray_release(quoted); return NULL;
+            }
+            q[1] = value; ray_retain(value); quoted->len = 2;
+            return quoted;
         }
     }
     if (expr->type != RAY_LIST || expr->len == 0 || (expr->attrs & ATTR_QUOTED)) {
@@ -2119,6 +2124,7 @@ static ray_t* query_inline_walk(ray_t* expr, ray_t* tbl,
         ray_retain(expr); return expr;
     }
     ray_t* params = NULL, *body = NULL;
+    bool named = false;
     if (es[0]->type == -RAY_SYM && !(es[0]->attrs & ATTR_QUOTED) &&
         !ray_table_get_col(tbl, es[0]->i64)) {
         ray_t* fn = ray_env_get(es[0]->i64);
@@ -2128,6 +2134,7 @@ static ray_t* query_inline_walk(ray_t* expr, ray_t* tbl,
             if (bodies && bodies->type == RAY_LIST && bodies->len == 1) {
                 params = LAMBDA_PARAMS(fn);
                 body = ((ray_t**)ray_data(bodies))[0];
+                named = true;
             }
         }
     } else if (es[0]->type == RAY_LIST && es[0]->len == 3) {
@@ -2145,13 +2152,13 @@ static ray_t* query_inline_walk(ray_t* expr, ray_t* tbl,
     out->len = 0;
     for (int64_t i = 0; i < expr->len; i++) {
         if (i == 0) { dst[i] = es[i]; ray_retain(dst[i]); }
-        else dst[i] = query_inline_walk(es[i], tbl, bindings, nb, depth + 1, budget);
+        else dst[i] = query_inline_walk(es[i], tbl, bindings, nb, depth + 1, budget, named_body);
         if (!dst[i]) { ray_release(out); return NULL; }
         out->len++;
     }
     out->attrs = expr->attrs;
     if (!params || params->type != RAY_SYM || params->len != expr->len - 1 ||
-        nb + params->len > 64 || !query_helper_closed(body, params) ||
+        params->len > 64 ||
         expr_contains_call_named(body, "let", 3) ||
         expr_contains_call_named(body, "fn", 2)) return out;
     ray_graph_t* g = ray_graph_new(tbl);
@@ -2159,10 +2166,11 @@ static ray_t* query_inline_walk(ray_t* expr, ray_t* tbl,
     bool admitted = compile_expr_dag(g, out) != NULL;
     ray_graph_free(g);
     if (!admitted) return out;
+    query_inline_binding_t formals[64];
     for (int64_t i = 0; i < params->len; i++)
-        bindings[nb + i] = (query_inline_binding_t){sym_cell_runtime_id(params, i), dst[i + 1]};
-    ray_t* expanded = query_inline_walk(body, tbl, bindings, nb + (int)params->len,
-                                       depth + 1, budget);
+        formals[i] = (query_inline_binding_t){sym_cell_runtime_id(params, i), dst[i + 1]};
+    ray_t* expanded = query_inline_walk(body, tbl, formals, (int)params->len,
+                                       depth + 1, budget, named);
     ray_release(out);
     return expanded;
 }
@@ -2170,7 +2178,7 @@ static ray_t* query_inline_walk(ray_t* expr, ray_t* tbl,
 static ray_t* query_inline_helpers(ray_t* expr, ray_t* tbl) {
     query_inline_binding_t bindings[64];
     int budget = 1024;
-    ray_t* expanded = query_inline_walk(expr, tbl, bindings, 0, 0, &budget);
+    ray_t* expanded = query_inline_walk(expr, tbl, bindings, 0, 0, &budget, false);
     if (!expanded) { ray_retain(expr); expanded = expr; }
     return expanded;
 }
@@ -14329,9 +14337,16 @@ by_dict_done:
                         if (reduced && !RAY_IS_ERR(reduced)) expr = reduced;
                     }
                     ray_t* col;
+                    ray_t* expanded = NULL;
                     if (reduced && RAY_IS_ERR(reduced)) {
                         col = reduced;
                     } else {
+                        /* Expand after aggregate classification: a helper's
+                         * own reduction retains its row-local scope. Use the
+                         * source schema so prior aliases cannot capture free
+                         * names; actual arguments still evaluate in tbl. */
+                        expanded = query_inline_helpers(expr, g->table);
+                        expr = expanded;
                         col = select_fallback_passthrough_col(expr, tbl, nrows);
                         if (!col) {
                             /* An expression over earlier one-value outputs
@@ -14354,6 +14369,7 @@ by_dict_done:
                         }
                         if (reduced) ray_release(reduced);
                     }
+                    if (expanded) ray_release(expanded);
                     if (!col || RAY_IS_ERR(col)) {
                         ray_t* err = col ? col : ray_error("domain", "select: failed to evaluate output column expression");
                         ray_release(result);

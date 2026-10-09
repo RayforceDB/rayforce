@@ -51,3 +51,17 @@
 (at (select {n: (count L) by: k from: T asc: k}) 'n) -- [2 2 2]
 (at (select {n: (count (concat L 'c)) by: k from: T asc: k}) 'n) -- [3 3 3]
 (at (select {n: (count L) x: x from: T}) 'n) -- [2 2 2 2 2]
+;; Free helper constants retain their global binding in fallback, including
+;; when an earlier projection uses the same name as an alias.
+(set suffix "!")
+(set sfxg (fn [v] (concat v suffix)))
+(at (select {n: (+ (count (sfxg s)) (count (distinct x))) by: k from: T asc: k}) 'n) -- [4 4 2]
+(at (select {v: (sfxg s) e: (enlist 7) from: T}) 'v) -- ['a! 'b! 'c! 'd! 'e!]
+(at (select {suffix: (upper s) e: (reverse x) v: (sfxg s) from: T}) 'v) -- ['a! 'b! 'c! 'd! 'e!]
+(at (update {n: (+ (count (sfxg s)) (count (distinct x))) by: k from: T}) 'n) -- [4 4 4 4 2]
+(set suffix 's)
+(at (select {v: (sfxg s) e: (enlist 7) from: T}) 'v) -- ['as 'bs 'cs 'ds 'es]
+;; Real source columns still have the compiler's column precedence.
+(set TS (table [s suffix] (list ['a 'b] ['x 'y])))
+(at (select {v: (sfxg s) from: TS}) 'v) -- ['ax 'by]
+(at (select {v: (sfxg s) e: (reverse suffix) from: TS}) 'v) -- ['ax 'by]

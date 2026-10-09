@@ -43,6 +43,8 @@ static inline const char* ray_fn_name(const ray_t* fn) {
 ray_err_t ray_env_init(void);
 void     ray_env_destroy(void);
 ray_t*    ray_env_get(int64_t sym_id);
+/* Borrowed flat global binding, ignoring local/query frames. */
+ray_t*    ray_env_get_global(int64_t sym_id);
 ray_t*    ray_env_get_local(int64_t sym_id);
 
 /* User-facing binder.  Refuses any name starting with `.` — that root is

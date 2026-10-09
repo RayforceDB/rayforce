@@ -680,7 +680,7 @@ static ray_err_t env_set_dotted(int64_t sym_id, ray_t* val,
 }
 
 /* Scope-specific base lookups used by env_set_dotted. */
-static ray_t* lookup_global(int64_t sym_id) {
+ray_t* ray_env_get_global(int64_t sym_id) {
     for (int32_t i = 0; i < g_env.count; i++) {
         if (g_env.keys[i] == sym_id) return g_env.vals[i];
     }
@@ -711,7 +711,7 @@ bool ray_sym_is_reserved(int64_t sym_id) {
 
 ray_err_t ray_env_bind(int64_t sym_id, ray_t* val) {
     if (ray_sym_is_dotted(sym_id)) {
-        return env_set_dotted(sym_id, val, lookup_global, env_bind_global);
+        return env_set_dotted(sym_id, val, ray_env_get_global, env_bind_global);
     }
     return env_bind_global(sym_id, val);
 }
@@ -731,7 +731,7 @@ ray_err_t ray_env_set(int64_t sym_id, ray_t* val) {
      * flip, env_bind_global would also be reached via ray_env_bind below
      * and the slot would carry user=0 — leaving it out of <base>.qdb. */
     if (ray_sym_is_dotted(sym_id))
-        return env_set_dotted(sym_id, val, lookup_global, env_bind_global_user);
+        return env_set_dotted(sym_id, val, ray_env_get_global, env_bind_global_user);
     return env_bind_global_user(sym_id, val);
 }
 
