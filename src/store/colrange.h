@@ -165,12 +165,22 @@ uint8_t ray_col_src_esz(const ray_col_src_t* s);
 /* Chunk c's statistics when the source is a single-file generation-2
  * column; false otherwise (plain, parted, slice). */
 bool ray_col_src_chunk_stat(const ray_col_src_t* s, int64_t c, struct ray_enc_chunk_stat_s* out);
-/* Row `row` of a single-file generation-2 integer source (not SYM) read
- * without decoding its vector (ray_enccol_point_i64: FOR_BP, or DICT over
- * FOR_BP, without nulls): 1 served into *out (the value widened to int64),
- * 0 declined (read the row through a cursor, which decodes or reports the
- * vector; always for a plain, parted or materialized source), -1 an owned
- * error in *err.  For samplers: a sampled row costs no vector decode. */
+/* The statistics of a parted source, chunk by chunk in row order: fn is
+ * called for rows [lo, hi) of every RAY_ENC_CHUNK-row chunk of every
+ * segment, with the chunk's directory statistics when the segment is a
+ * single-file generation-2 column, else NULL (a plain segment).  False
+ * when the source is not parted, or with an owned *err (OOM).  A consumer
+ * that sizes memory from these statistics sets stats_guard: the range
+ * reads then check every segment's values against its own chunks'. */
+typedef void (*ray_col_chunk_fn)(void* ctx, int64_t lo, int64_t hi, const struct ray_enc_chunk_stat_s* st);
+bool ray_col_src_parted_chunks(ray_col_src_t* s, void* ctx, ray_col_chunk_fn fn, ray_t** err);
+/* Row `row` of a single-file or parted generation-2 integer source (not
+ * SYM) read without decoding its vector (ray_enccol_point_i64: FOR_BP, or
+ * DICT over FOR_BP, without nulls; a parted row is its segment's): 1
+ * served into *out (the value widened to int64), 0 declined (read the row
+ * through a cursor, which decodes or reports the vector; always for a
+ * plain or materialized source or segment), -1 an owned error in *err.
+ * For samplers: a sampled row costs no vector decode. */
 int  ray_col_src_point_i64(const ray_col_src_t* s, int64_t row, int64_t* out, ray_t** err);
 /* One sequential read-ahead hint for rows [lo, hi): plain mmapped
  * columns hint their element bytes, generation 2 the chunk bytes from the

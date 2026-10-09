@@ -10773,6 +10773,28 @@ static void grp_card_i32(void* ctx, const void* data, uint8_t attrs, int64_t n) 
     c->lo = lo; c->hi = hi; c->any = true;
 }
 
+/* The I64 / I32 value span of a generation-2 segment from its directory,
+ * without decoding: every chunk's statistics, a chunk with nulls also
+ * folding its null sentinel (the scan above folds nulls as values), so the
+ * span is the scan's.  False when a chunk has no statistics (the caller
+ * scans).  It only picks the route; nothing is sized from it. */
+static bool grp_card_dir(const ray_col_src_t* s, int64_t null, grp_card_t* c) {
+    ray_enc_chunk_stat_t st;
+    int64_t nch = (s->len + RAY_ENC_CHUNK - 1) / RAY_ENC_CHUNK;
+    if (nch <= 0 || !ray_col_src_chunk_stat(s, 0, &st)) return false;
+    int64_t lo = INT64_MAX, hi = INT64_MIN;
+    for (int64_t ch = 0; ch < nch; ch++) {
+        (void)ray_col_src_chunk_stat(s, ch, &st);
+        if (st.null_count > 0) { if (null < lo) lo = null; if (null > hi) hi = null; }
+        if ((int64_t)st.null_count >= st.rows) continue;
+        if (!st.has_minmax) return false;
+        if (st.min < lo) lo = st.min;
+        if (st.max > hi) hi = st.max;
+    }
+    c->lo = lo; c->hi = hi; c->any = true;
+    return true;
+}
+
 /* The first owned error among `n` column lookups (the others are disposed
  * of), or NULL when none failed. */
 static ray_t* group_first_err(ray_t** c, int n) {
@@ -11097,13 +11119,15 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
                     card += __builtin_popcountll(cc.bits[i]);
                 scratch_free(bits_hdr);
             } else if (bt == RAY_I64) {
-                serr = grp_seg_read(&ss, 0, ss.len, &cc, grp_card_i64);
+                if (!grp_card_dir(&ss, NULL_I64, &cc))
+                    serr = grp_seg_read(&ss, 0, ss.len, &cc, grp_card_i64);
                 /* The span in u64: a null (INT64_MIN) beside a positive
                  * value overflows the signed difference. */
                 uint64_t span = (uint64_t)cc.hi - (uint64_t)cc.lo;
                 card = span >= (uint64_t)rows_per_part ? rows_per_part : (int64_t)span + 1;
             } else if (bt == RAY_I32) {
-                serr = grp_seg_read(&ss, 0, ss.len, &cc, grp_card_i32);
+                if (!grp_card_dir(&ss, NULL_I32, &cc))
+                    serr = grp_seg_read(&ss, 0, ss.len, &cc, grp_card_i32);
                 card = cc.hi - cc.lo + 1;
             } else {
                 card = ss.len;

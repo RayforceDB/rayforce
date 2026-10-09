@@ -4765,6 +4765,243 @@ static test_result_t test_v2_shared_fail(void) {
     PASS();
 }
 
+/* ---- Task 14b: group keys decoded once per run ---- */
+
+/* RQ: 600000 rows; k a near-unique wide I64 key (j*7919 mod 600011 is
+ * injective over the rows, times 1000003: a range far past the rows, so
+ * no dense plan), m = j % 7, v = j, f = j / 8, p = j*7919 mod 500009 (a
+ * wide dense key: the partitioned strategy); saved splayed (rq0, rq2)
+ * and as three 200000-row partitions (rp0, rp2). */
+static void sr_radix_tables(void) {
+    sr_eval_ok("(set jr (til 600000))");
+    sr_eval_ok("(set RQ (table [k m v f p] (list (* (% (* jr 7919) 600011) 1000003) (% jr 7) jr (/ (as 'F64 jr) 8.0) "
+               "(% (* jr 7919) 500009))))");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/rq0/\" RQ {compress: false})");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/rq2/\" RQ {compress: true})");
+    for (int p = 0; p < 3; p++)
+        for (int gen = 0; gen <= 2; gen += 2)
+            sr_evalf_ok("(.db.splayed.set \"" SR_TMP "/rp%d/2024.01.0%d/t/\" (take (drop RQ %d) 200000) {compress: %s})",
+                        gen, p + 1, p * 200000, gen ? "true" : "false");
+}
+
+/* Bytes decoded so far of column `name` of T: its own count, or the sum
+ * over a parted column's encoded segments; *full: the column's
+ * generation-0 bytes. */
+static uint64_t sr_col_dec_any(const char* name, uint64_t* full) {
+    ray_t* t = sr_eval("T");
+    ray_t* ec = ray_table_get_col_enc(t, ray_sym_intern(name, strlen(name)));
+    uint64_t r = 0;
+    *full = 0;
+    if (ec) {
+        ray_enccol_t* e = ray_enccol_of(ec);
+        if (e->kind == RAY_ENCCOL_SINGLE) {
+            r = atomic_load(&e->decoded_bytes);
+            *full = (uint64_t)e->len * ray_enccol_esz(e);
+        } else for (int64_t i = 0; e->wrapper && i < e->wrapper->len; i++) {
+            ray_t* sg = ray_enccol_seg(ec, i);
+            if (!sg || sg->type != RAY_ENCCOL) continue;
+            ray_enccol_t* se = ray_enccol_of(sg);
+            r += atomic_load(&se->decoded_bytes);
+            *full += (uint64_t)se->len * ray_enccol_esz(se);
+        }
+    }
+    sr_drop(t);
+    return r;
+}
+
+/* q16's shape, a two-input aggregate and two keys on the v2 radix route,
+ * and a wide dense key on the partitioned strategy (its histogram reads the
+ * key, its scatter the input),
+ * splayed and parted generation 2: each column q reads decodes once per
+ * run (the key once across the count and the scatter, the parted key's
+ * bounds and its cardinality sample from its segments' directories, the
+ * second key's compaction not attempted when it cannot fit), within 5% of
+ * its bytes (the samplers' point reads, the vectors a chunk starts
+ * inside); the answers and routes are generation 0's. */
+static test_result_t test_v2_radix_decode_once(void) {
+    sr_radix_tables();
+    ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    static const struct { const char* q; const char* cols[3]; bool partitioned; } qs[] = {
+        { "(select {k: k c: (count k) from: T by: k desc: c take: 10})", { "k", NULL }, false },
+        { "(select {c: (count v) s: (sum v) from: T by: k})", { "k", "v", NULL }, false },
+        { "(select {c: (count v) s: (sum v) from: T by: {k: k m: m}})", { "k", "m", "v" }, false },
+        { "(select {c: (count v) s: (sum v) from: T by: p})", { "p", "v", NULL }, true },
+    };
+    static const char* const t2[] = { "(.db.splayed.get \"" SR_TMP "/rq2/\")", "(.db.parted.get \"" SR_TMP "/rp2\" 't)" };
+    static const char* const t0[] = { "(.db.splayed.get \"" SR_TMP "/rq0/\")", "(.db.parted.get \"" SR_TMP "/rp0\" 't)" };
+    for (size_t i = 0; i < sizeof qs / sizeof qs[0]; i++)
+        for (int s = 0; s < 2; s++) {
+            test_result_t r = sr_same_route(t0[s], t2[s], qs[i].q);
+            if (r.status != TEST_PASS) return r;
+            sr_evalf_ok("(set T %s)", t2[s]);
+            sr_drop(sr_eval(qs[i].q));                    /* binds and loads once: the pin is per run */
+            uint64_t before[3], full[3];
+            for (int c = 0; c < 3 && qs[i].cols[c]; c++) before[c] = sr_col_dec_any(qs[i].cols[c], &full[c]);
+            agg_route_reset();
+            ray_t* res = sr_eval(qs[i].q);
+            agg_route_stats_t st = agg_route_stats();
+            TEST_ASSERT_FMT(res && !RAY_IS_ERR(res), "%s: %s", qs[i].q, ray_error_msg() ? ray_error_msg() : "");
+            sr_drop(res);
+            if (qs[i].partitioned)
+                TEST_ASSERT_FMT(st.routes[AGG_ROUTE_V2_DENSE] == 1 && st.dense_strategy == AGG_DENSE_PARTITIONED,
+                                "%s (%s): not the partitioned dense route", qs[i].q, s ? "parted" : "splayed");
+            else
+                TEST_ASSERT_FMT(st.routes[AGG_ROUTE_V2_RADIX] == 1, "%s (%s): not the radix route", qs[i].q, s ? "parted" : "splayed");
+            for (int c = 0; c < 3 && qs[i].cols[c]; c++) {
+                uint64_t f;
+                double x = (double)(sr_col_dec_any(qs[i].cols[c], &f) - before[c]) / (double)full[c];
+                TEST_ASSERT_FMT(full[c] > 0 && x >= 1.0 && x <= 1.05, "%s (%s): %s decoded %.4fx", qs[i].q,
+                                s ? "parted" : "splayed", qs[i].cols[c], x);
+            }
+        }
+    /* Staging that would not fit the last-level cache keeps the two passes:
+     * the key decodes twice (count and scatter), the input once (the
+     * scatter alone reads it; each pass re-reads the vector its chunks start
+ * inside); the same answer. */
+    ray_cache_llc_set_for_test(4096);
+    static const char* const q2 = "(select {c: (count v) s: (sum v) from: T by: k})";
+    test_result_t r = sr_same_route(t0[0], t2[0], q2);
+    if (r.status != TEST_PASS) { ray_cache_llc_set_for_test(0); return r; }
+    sr_evalf_ok("(set T %s)", t2[0]);
+    uint64_t fk, fv, k0 = sr_col_dec_any("k", &fk), v0 = sr_col_dec_any("v", &fv);
+    agg_route_reset();
+    ray_t* res = sr_eval(q2);
+    agg_route_stats_t st = agg_route_stats();
+    ray_cache_llc_set_for_test(0);
+    TEST_ASSERT_TRUE(res && !RAY_IS_ERR(res));
+    sr_drop(res);
+    TEST_ASSERT_TRUE(st.routes[AGG_ROUTE_V2_RADIX] == 1);
+    double xk = (double)(sr_col_dec_any("k", &fk) - k0) / (double)fk, xv = (double)(sr_col_dec_any("v", &fv) - v0) / (double)fv;
+    TEST_ASSERT_FMT(xk >= 2.0 && xk <= 2.1 && xv >= 1.0 && xv <= 1.05, "two passes: k %.4fx, v %.4fx", xk, xv);
+    PASS();
+}
+
+/* Byte-equal answers (.csv.write) of generation 0 and 2 over the radix
+ * route: one and two keys, a SYM key beside a wide one, F64 sums (their
+ * bits: the records of a partition keep input order), q16's top 10, and a
+ * ragged parted table (partition 3 lacks v and f: synthetic null
+ * segments) against its generation-0 twin. */
+static bool sr_csv_of(const char* q, const char* path, char** out, size_t* n) {
+    char e[1024];
+    snprintf(e, sizeof e, "(.csv.write %s \"%s\")", q, path);
+    ray_t* r = sr_eval(e);
+    bool ok = r && !RAY_IS_ERR(r);
+    sr_drop(r);
+    FILE* f = ok ? fopen(path, "rb") : NULL;
+    if (!f) return false;
+    fseek(f, 0, SEEK_END); long len = ftell(f); fseek(f, 0, SEEK_SET);
+    *out = malloc((size_t)len + 1);
+    *n = fread(*out, 1, (size_t)len, f);
+    fclose(f);
+    return *n == (size_t)len;
+}
+static test_result_t sr_csv_same(const char* t0, const char* t2, const char* q) {
+    char p0[512], p2[512];
+    snprintf(p0, sizeof p0, "%s/a0.csv", sr_root()); snprintf(p2, sizeof p2, "%s/a2.csv", sr_root());
+    char* b[2] = { NULL, NULL };
+    size_t n[2] = { 0, 0 };
+    for (int gen = 0; gen < 2; gen++) {
+        sr_evalf_ok("(set T %s)", gen ? t2 : t0);
+        if (!sr_csv_of(q, gen ? p2 : p0, &b[gen], &n[gen])) { free(b[0]); free(b[1]); FAIL("csv"); }
+    }
+    bool same = n[0] == n[1] && n[0] > 0 && memcmp(b[0], b[1], n[0]) == 0;
+    free(b[0]); free(b[1]);
+    TEST_ASSERT_FMT(same, "%s: generation 0 and 2 differ (%zu / %zu bytes)", q, n[0], n[1]);
+    PASS();
+}
+static test_result_t test_v2_radix_answers(void) {
+    sr_radix_tables();
+    sr_eval_ok("(set RS (table [s k v f] (list (as 'SYMBOL (map (fn [j] (format \"w%\" (% j 50))) jr)) "
+               "(* (% (* jr 7919) 600011) 1000003) jr (/ (as 'F64 jr) 8.0))))");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/rs0/\" RS {compress: false})");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/rs2/\" RS {compress: true})");
+    for (int gen = 0; gen <= 2; gen += 2)
+        for (int p = 0; p < 3; p++)
+            sr_evalf_ok("(.db.splayed.set \"" SR_TMP "/rr%d/2024.01.0%d/t/\" (select {%s from: (take (drop RQ %d) 200000)}) {compress: %s})",
+                        gen, p + 1, p == 2 ? "k: k m: m" : "k: k m: m v: v f: f", p * 200000, gen ? "true" : "false");
+    ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    static const char* const qs[] = {
+        "(select {c: (count v) s: (sum v) a: (sum f) from: T by: k})",
+        "(select {c: (count v) a: (sum f) mx: (max v) from: T by: {k: k m: m}})",
+        "(select {k: k c: (count k) from: T by: k desc: c take: 10})",
+        "(select {c: (count v) a: (sum f) from: T where: (> v 1000) by: k})",
+        NULL,
+    };
+    static const char* const t2[] = { "(.db.splayed.get \"" SR_TMP "/rq2/\")", "(.db.parted.get \"" SR_TMP "/rp2\" 't)" };
+    static const char* const t0[] = { "(.db.splayed.get \"" SR_TMP "/rq0/\")", "(.db.parted.get \"" SR_TMP "/rp0\" 't)" };
+    for (int i = 0; qs[i]; i++)
+        for (int s = 0; s < 2; s++) {
+            agg_route_reset();
+            test_result_t r = sr_csv_same(t0[s], t2[s], qs[i]);
+            if (r.status != TEST_PASS) return r;
+            TEST_ASSERT_FMT(agg_route_stats().routes[AGG_ROUTE_V2_RADIX] == 2, "%s: not radix on both", qs[i]);
+        }
+    agg_route_reset();
+    test_result_t r = sr_csv_same("(.db.splayed.get \"" SR_TMP "/rs0/\")", "(.db.splayed.get \"" SR_TMP "/rs2/\")",
+                                  "(select {c: (count v) a: (sum f) from: T by: {s: s k: k}})");
+    if (r.status != TEST_PASS) return r;
+    TEST_ASSERT_TRUE(agg_route_stats().routes[AGG_ROUTE_V2_RADIX] == 2);
+    agg_route_reset();
+    r = sr_csv_same("(.db.parted.get \"" SR_TMP "/rr0\" 't)", "(.db.parted.get \"" SR_TMP "/rr2\" 't)",
+                    "(select {c: (count v) s: (sum v) a: (sum f) from: T by: k})");
+    if (r.status != TEST_PASS) return r;
+    TEST_ASSERT_TRUE(agg_route_stats().routes[AGG_ROUTE_V2_RADIX] == 2);
+    PASS();
+}
+
+/* The parted directory consumer (design (b)): a parted key's dense bounds
+ * come from its segments' statistics, so its passes read under the guard,
+ * which checks every segment against its own chunks.  Three partitions of
+ * 70000 rows; k = j*7 % 1000, except partition 2's chunk 0, j*7 % 5001
+ * with a null every 100 rows (the samplers' point reads decline there).
+ * 1000 groups take the in-place concat.  Partition 2's chunk 0 statistics
+ * (directory and descriptors, still nested) lowered to 999: `corrupt`
+ * naming that segment's file, twice, through range reads and through the
+ * published materialization; unpatched, generation 0's answer. */
+static void sr_forged_parted(const char* root, int gen) {
+    for (int p = 0; p < 3; p++)
+        sr_evalf_ok("(.db.splayed.set \"%s/2024.01.0%d/t/\" (table [k v] (list %s (til 70000))) {compress: %s})",
+                    root, p + 1,
+                    p == 1 ? "(map (fn [j] (if (< j 65536) (if (== 0 (% j 100)) 0N (% (* j 7) 5001)) (% (* j 7) 1000))) (til 70000))"
+                           : "(% (* (til 70000) 7) 1000)",
+                    gen ? "true" : "false");
+}
+static test_result_t test_v2_forged_parted_segment(void) {
+    sr_forged_parted(SR_TMP "/fp0", 0);
+    sr_forged_parted(SR_TMP "/fp2", 2);
+    static const char* const q = "(select {s: (sum v) c: (count v) from: T by: k})";
+    int64_t s0 = ray_group_segstream_runs();
+    test_result_t r = sr_same_route("(.db.parted.get \"" SR_TMP "/fp0\" 't)", "(.db.parted.get \"" SR_TMP "/fp2\" 't)", q);
+    if (r.status != TEST_PASS) return r;
+    TEST_ASSERT_TRUE(ray_group_segstream_runs() - s0 == 2);          /* both in place */
+    sr_forged_parted(SR_TMP "/fpb", 2);
+    char dir[512], path[600];
+    if (ray_splay_resolve_dir(ray_test_tmp(SR_TMP "/fpb/2024.01.02/t/"), dir, sizeof dir) != RAY_OK) FAIL("resolve");
+    size_t dl = strlen(dir);
+    snprintf(path, sizeof path, "%s%sk", dir, (dl && dir[dl - 1] == '/') ? "" : "/");
+    if (!sr_forge_max(path, 0, 999)) FAIL("forge");
+    r = sr_corrupt_twice("(.db.parted.get \"" SR_TMP "/fpb\" 't)", q, path);
+    if (r.status != TEST_PASS) return r;
+    /* the parted materialization published first: read in place only once
+     * every segment lies inside its statistics */
+    for (int rep = 0; rep < 2; rep++) {
+        sr_eval_ok("(set T (.db.parted.get \"" SR_TMP "/fpb\" 't))");
+        ray_t* t = sr_eval("T");
+        ray_t* ec = ray_table_get_col_enc(t, ray_sym_intern("k", 1));
+        TEST_ASSERT_TRUE(ec && ray_enccol_is_parted(ec));
+        ray_t* m = ray_enccol_materialize(ec);
+        TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m));
+        sr_drop(t);
+        ray_error_clear();
+        ray_t* res = sr_eval(q);
+        TEST_ASSERT_FMT(res && RAY_IS_ERR(res), "materialized (read %d): answered", rep + 1);
+        TEST_ASSERT_FMT(strcmp(ray_err_code(res), "corrupt") == 0 && ray_error_msg() && strstr(ray_error_msg(), path),
+                        "materialized (read %d): %s \"%s\"", rep + 1, ray_err_code(res), ray_error_msg() ? ray_error_msg() : "");
+        ray_error_free(res);
+    }
+    PASS();
+}
+
 const test_entry_t scanrange_entries[] = {
     { "scanrange/walk_gen0_zero_copy",     test_walk_gen0_zero_copy,     sr_setup,    sr_teardown },
     { "scanrange/walk_gen2_vectors",       test_walk_gen2_vectors,       sr_setup,    sr_teardown },
@@ -4881,5 +5118,8 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/v2_forged_consumers", test_v2_forged_consumers, srr_setup, srr_teardown },
     { "scanrange/v2_forged_serial_dense", test_v2_forged_serial_dense, srr_setup, srr_teardown },
     { "scanrange/v2_sel_key_types",   test_v2_sel_key_types,   srr_setup, srr_teardown },
+    { "scanrange/v2_radix_decode_once", test_v2_radix_decode_once, sr_rt_setup, srr_pool_teardown },
+    { "scanrange/v2_radix_answers",   test_v2_radix_answers,   sr_rt_setup, srr_pool_teardown },
+    { "scanrange/v2_forged_parted_segment", test_v2_forged_parted_segment, sr_rt_setup, srr_teardown },
     { NULL, NULL, NULL, NULL },
 };

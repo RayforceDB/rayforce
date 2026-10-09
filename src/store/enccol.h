@@ -291,7 +291,8 @@ ray_t* ray_enccol_check_dir(ray_enccol_t* e, int64_t c, int j, const void* data,
 /* Vector j of chunk c already passed ray_enccol_check_dir. */
 bool   ray_enccol_dir_vec_ok(const ray_enccol_t* e, int64_t c, int j);
 /* The same over every chunk of the column's published materialization,
- * once per column (a success is cached; the mapping is immutable).  NULL
+ * once per column (a success is cached; the mapping is immutable); a
+ * parted column checks each encoded segment against its own chunks.  NULL
  * when nothing is published. */
 ray_t* ray_enccol_check_dir_all(ray_t* encv);
 

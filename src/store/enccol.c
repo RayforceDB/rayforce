@@ -2122,8 +2122,22 @@ ray_t* ray_enccol_check_dir(ray_enccol_t* e, int64_t c, int j, const void* data,
 
 ray_t* ray_enccol_check_dir_all(ray_t* encv) {
     ray_enccol_t* e = ray_enccol_of(encv);
-    if (!e || e->kind != RAY_ENCCOL_SINGLE) return NULL;
+    if (!e) return NULL;
     if (atomic_load_explicit(&e->mat_dir_ok, memory_order_acquire)) return NULL;
+    if (e->kind == RAY_ENCCOL_PARTED) {
+        /* every encoded segment against its own statistics (the parted
+         * materialization holds the segments' own) */
+        if (!e->wrapper || !ray_enccol_decoded_peek(encv)) return NULL;
+        ray_t** segs = (ray_t**)ray_data(e->wrapper);
+        for (int64_t i = 0; i < e->wrapper->len; i++) {
+            if (!segs[i] || segs[i]->type != RAY_ENCCOL) continue;
+            ray_t* err = ray_enccol_check_dir_all(segs[i]);
+            if (err) return err;
+        }
+        atomic_store_explicit(&e->mat_dir_ok, 1, memory_order_release);
+        return NULL;
+    }
+    if (e->kind != RAY_ENCCOL_SINGLE) return NULL;
     ray_t* m = ray_enccol_decoded_peek(encv);
     if (!m) return NULL;
     const uint8_t esz = ray_enccol_esz(e);

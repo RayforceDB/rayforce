@@ -268,7 +268,9 @@ static ray_t* range_obj(ray_t* obj, int64_t start, int64_t n, const int64_t* off
         int64_t sl = off[lo + 1] - off[lo];              /* > 0: start < off[lo + 1] */
         int64_t local = start - off[lo];
         if (n > sl - local) n = sl - local;              /* never cross a segment */
-        return range_obj(segs[lo], local, n, NULL, false, sc, out);   /* parted: no statistics used */
+        /* the guard of a parted source checks each segment against its
+         * own statistics (ray_col_src_parted_chunks serves them) */
+        return range_obj(segs[lo], local, n, NULL, guard, sc, out);
     }
     range_plain(obj, start, n, out);
     return NULL;
@@ -613,11 +615,49 @@ bool ray_col_src_chunk_stat(const ray_col_src_t* s, int64_t c, struct ray_enc_ch
     return true;
 }
 
+bool ray_col_src_parted_chunks(ray_col_src_t* s, void* ctx, ray_col_chunk_fn fn, ray_t** err) {
+    *err = NULL;
+    if (!s || !s->obj || !s->parted) return false;
+    ray_t* w = parted_wrapper(s->obj);
+    if (!w) return false;
+    const int64_t* off;
+    if ((*err = src_seg_off(s, w, &off)) != NULL) return false;
+    ray_t** segs = (ray_t**)ray_data(w);
+    for (int64_t i = 0; i < w->len; i++) {
+        int64_t sl = off[i + 1] - off[i];
+        ray_enccol_t* e = segs[i] && segs[i]->type == RAY_ENCCOL ? ray_enccol_of(segs[i]) : NULL;
+        if (e && (e->kind != RAY_ENCCOL_SINGLE || e->len != sl)) e = NULL;
+        for (int64_t c = 0; c * RAY_ENC_CHUNK < sl; c++) {
+            int64_t lo = off[i] + c * RAY_ENC_CHUNK;
+            int64_t hi = lo + RAY_ENC_CHUNK < off[i + 1] ? lo + RAY_ENC_CHUNK : off[i + 1];
+            ray_enc_chunk_stat_t st;
+            if (e) ray_enccol_chunk_stat(e, c, &st);
+            fn(ctx, lo, hi, e ? &st : NULL);
+        }
+    }
+    return true;
+}
+
 int ray_col_src_point_i64(const ray_col_src_t* s, int64_t row, int64_t* out, ray_t** err) {
     *err = NULL;
     if (!ray_col_src_encoded(s) || ray_enccol_decoded_peek(s->obj)) return 0;   /* the cursor reads it in place */
     ray_enccol_t* e = ray_enccol_of(s->obj);
-    return e->kind == RAY_ENCCOL_SINGLE ? ray_enccol_point_i64(e, row, out, err) : 0;
+    if (e->kind == RAY_ENCCOL_SINGLE) return ray_enccol_point_i64(e, row, out, err);
+    /* parted: the row's segment, when it is a single-file encoded one */
+    ray_t* w = parted_wrapper(s->obj);
+    const int64_t* off;
+    if (!w || w->len <= 0 || row < 0 || row >= s->len) return 0;
+    ray_t* oerr = src_seg_off((ray_col_src_t*)s, w, &off);  /* seg_off: published once, atomically */
+    if (oerr) { ray_error_free(oerr); return 0; }          /* the cursor reports it */
+    int64_t lo = 0, hi = w->len - 1;                       /* the last i with off[i] <= row */
+    while (lo < hi) {
+        int64_t mid = lo + (hi - lo + 1) / 2;
+        if (off[mid] <= row) lo = mid; else hi = mid - 1;
+    }
+    ray_t* sg = ((ray_t**)ray_data(w))[lo];
+    if (!sg || sg->type != RAY_ENCCOL || ray_enccol_decoded_peek(sg)) return 0;
+    ray_enccol_t* se = ray_enccol_of(sg);
+    return se->kind == RAY_ENCCOL_SINGLE ? ray_enccol_point_i64(se, row - off[lo], out, err) : 0;
 }
 
 /* One read-ahead span: page-aligned start, bytes. */
