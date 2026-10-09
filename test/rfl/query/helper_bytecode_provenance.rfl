@@ -68,3 +68,9 @@
 (select {v: ((fn [v] (s v)) x) from: T}) !- name
 (set TN (table [x q] (list [1 2 3] [4 5 6])))
 (at (select {v: (hs x) from: TN}) 'v) -- [1 2 3]
+;; A lambda written inline in the query that reaches the runtime (several
+;; statements, so the planner does not substitute it) is still query text:
+;; its literals follow the column rule, which bytecode constants could not.
+(at (select {v: ((fn [v] 1 (concat v 's)) s) e: (reverse x) from: T}) 'v) -- ['aa 'bb 'cc]
+(at (update {v: ((fn [v] 1 (concat v 's)) s) from: T}) 'v) -- ['aa 'bb 'cc]
+(at (select {o: ((fn [v] 1 'x) s) e: (reverse x) from: T}) 'o) -- [1 2 3]

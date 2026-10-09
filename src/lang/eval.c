@@ -2271,13 +2271,13 @@ int ray_eval_query_param_rows(int64_t sym_id) {
  * so concat can distinguish column parameters from bound collections. */
 static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
                                bool query, uint64_t row_args, bool named) {
-    /* Lazy compilation on first call.  A lambda written inline in a query
-     * keeps the tree walker when called from one: its literal symbols
-     * follow the query's column rule, which bytecode constants cannot. */
-    bool bytecode = !query || named;
-    if (bytecode && !LAMBDA_CLOSURE(lambda) && !LAMBDA_IS_COMPILED(lambda))
+    /* Lazy compilation on first call.  A closure is never compiled; a
+     * lambda written inline in a query is one (it captures the query's
+     * bindings), so it runs on the tree walker below, where `named` keeps
+     * its literal symbols on the query's column rule. */
+    if (!LAMBDA_CLOSURE(lambda) && !LAMBDA_IS_COMPILED(lambda))
         ray_compile(lambda);
-    if (bytecode && LAMBDA_IS_COMPILED(lambda)) {
+    if (LAMBDA_IS_COMPILED(lambda)) {
         if (!query) return vm_exec(lambda, call_args, argc);
         /* Row provenance rides on the VM stack.  The call frame hides the
          * query's aliases and locals; source columns stay visible through
