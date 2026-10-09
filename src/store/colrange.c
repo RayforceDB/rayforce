@@ -156,7 +156,7 @@ static void range_plain(ray_t* v, int64_t start, int64_t n, ray_col_range_t* out
     out->dom = v->type == RAY_SYM ? ray_sym_vec_domain(v) : NULL;
 }
 
-static ray_t* range_enc(ray_enccol_t* e, int64_t start, int64_t n,
+static ray_t* range_enc(ray_enccol_t* e, int64_t start, int64_t n, bool guard,
                         ray_col_scratch_t* sc, ray_col_range_t* out) {
     int64_t vec = start / RAY_ENC_VEC;
     int64_t off = start % RAY_ENC_VEC;
@@ -201,6 +201,8 @@ static ray_t* range_enc(ray_enccol_t* e, int64_t start, int64_t n,
     uint64_t nb = 0;
     err = ray_enccol_decode_into(e, c, j, &descs[j], sc->fixed, sc->pool, 0, sc->pool_cap, &nb);
     if (err) return err;                                    /* the view is never returned */
+    /* the consumer guard: its memory was sized from the chunk's statistics */
+    if (guard && (err = ray_enccol_check_dir(e, c, j, sc->fixed, (int)vlen, descs[j].n_nulls > 0)) != NULL) return err;
     scratch_count(sc, e, nb);
     out->data = sc->fixed + (size_t)off * ray_enccol_esz(e);
     out->n = n;
@@ -246,11 +248,11 @@ static ray_t* src_seg_off(ray_col_src_t* s, ray_t* w, const int64_t** out) {
 }
 
 /* off: the parted wrapper's segment offsets (src_seg_off), NULL otherwise. */
-static ray_t* range_obj(ray_t* obj, int64_t start, int64_t n, const int64_t* off,
+static ray_t* range_obj(ray_t* obj, int64_t start, int64_t n, const int64_t* off, bool guard,
                         ray_col_scratch_t* sc, ray_col_range_t* out) {
     if (obj->type == RAY_ENCCOL) {
         ray_enccol_t* e = ray_enccol_of(obj);
-        if (e->kind == RAY_ENCCOL_SINGLE) return range_enc(e, start, n, sc, out);
+        if (e->kind == RAY_ENCCOL_SINGLE) return range_enc(e, start, n, guard, sc, out);
         obj = e->wrapper;
     }
     if (RAY_IS_PARTED(obj->type)) {
@@ -266,7 +268,7 @@ static ray_t* range_obj(ray_t* obj, int64_t start, int64_t n, const int64_t* off
         int64_t sl = off[lo + 1] - off[lo];              /* > 0: start < off[lo + 1] */
         int64_t local = start - off[lo];
         if (n > sl - local) n = sl - local;              /* never cross a segment */
-        return range_obj(segs[lo], local, n, NULL, sc, out);
+        return range_obj(segs[lo], local, n, NULL, false, sc, out);   /* parted: no statistics used */
     }
     range_plain(obj, start, n, out);
     return NULL;
@@ -282,7 +284,7 @@ static ray_t* range_src(ray_col_src_t* s, ray_t* obj, int64_t start, int64_t n,
         ray_t* err = src_seg_off(s, w, &off);
         if (err) return err;
     }
-    return range_obj(obj, start, n, off, sc, out);
+    return range_obj(obj, start, n, off, s->stats_guard, sc, out);
 }
 
 ray_t* ray_col_range(ray_col_src_t* src, int64_t start, int64_t n,
@@ -308,6 +310,10 @@ ray_t* ray_col_range_wide(ray_col_src_t* src, int64_t start, int64_t n, ray_col_
     ray_enccol_t* e = ray_enccol_of(src->obj);
     if (e->kind != RAY_ENCCOL_SINGLE || start >= e->len) return NULL;
     int64_t vec = start / RAY_ENC_VEC;
+    /* under the consumer guard only a vector already found inside its
+     * chunk's statistics; otherwise the range read checks it */
+    if (src->stats_guard && !ray_enccol_dir_vec_ok(e, vec / RAY_ENC_VECS_PER_CHUNK, (int)(vec % RAY_ENC_VECS_PER_CHUNK)))
+        return NULL;
     if (n != ray_enc_vec_len(e->len, vec)) return NULL;
     int64_t c = vec / RAY_ENC_VECS_PER_CHUNK;
     const ray_enc_desc_t* descs;
@@ -394,7 +400,12 @@ ray_t* ray_col_cursor_at(ray_col_cursor_t* c, int64_t r, const ray_col_range_t**
     ray_t* obj = s->obj;
     if (obj->type == RAY_ENCCOL) {
         ray_t* pk = ray_enccol_decoded_peek(obj);
-        if (pk) obj = pk;
+        if (pk) {
+            /* the guard over a published materialization: once per column */
+            ray_t* gerr = s->stats_guard ? ray_enccol_check_dir_all(obj) : NULL;
+            if (gerr) return gerr;
+            obj = pk;
+        }
     }
     memset(&c->v, 0, sizeof c->v);
     c->v.start = r;

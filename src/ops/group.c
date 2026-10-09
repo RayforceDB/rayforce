@@ -13052,6 +13052,7 @@ static ray_t* sp_walk_key_range(sp_walk_ctx_t* c, int64_t n_scan) {
         if (!c->have_key || mn < c->min_key) c->min_key = mn;
         if (!c->have_key || mx > c->max_key) c->max_key = mx;
         c->have_key = true;
+        src->stats_guard = true;      /* the range arrays are sized from statistics: guard the key */
     }
     return NULL;
 }
@@ -14658,6 +14659,7 @@ da_path:;
                             if (!st.has_minmax) { scan_chunk[ch] = 1; mm_scan = true; continue; }
                             if (st.min < dmin) dmin = st.min;
                             if (st.max > dmax) dmax = st.max;
+                            key_srcs[k]->stats_guard = true;   /* the arrays are sized from statistics */
                         }
                         mm_mins[0] = dmin;
                         mm_maxs[0] = dmax;

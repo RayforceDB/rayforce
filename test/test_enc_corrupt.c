@@ -909,26 +909,7 @@ static test_result_t test_stats_nested(void) {
     PASS();
 }
 
-/* Vector `vec` of the patched image read widened to I64 (an expression
- * register): declined, so the range read reports it. */
-static const char* wide_declines(const char* path, int64_t vec) {
-    if (!img_store(path, g_len)) return "store";
-    ray_t* c = ray_col_mmap(path);
-    if (!c || RAY_IS_ERR(c)) { if (c) ray_error_free(c); return "load failed"; }
-    ray_col_src_t src;
-    ray_t* m = ray_col_src_bind(c, &src);
-    if (m) { ray_error_free(m); ray_release(c); return "bind failed"; }
-    ray_col_scratch_t sc; ray_col_scratch_init(&sc);
-    static int64_t dst[RAY_ENC_VEC];
-    int64_t got = -1;
-    ray_t* e = ray_col_range_wide(&src, vec * RAY_ENC_VEC, RAY_ENC_VEC, &sc, RAY_I64, dst, &got);
-    const char* res = e ? "the widened read failed instead of declining" : got != 0 ? "the widened read served the vector" : NULL;
-    if (e) ray_error_free(e);
-    ray_col_scratch_free(&sc); ray_col_src_release(&src);
-    ray_release(c);
-    return res;
-}
-/* the unpatched control: the widened read serves the vector */
+/* The widened read of vector `vec` of the patched image serves it. */
 static bool wide_serves(const char* path, int64_t vec) {
     if (!img_store(path, g_len)) return false;
     ray_t* c = ray_col_mmap(path);
@@ -946,72 +927,67 @@ static bool wide_serves(const char* path, int64_t vec) {
     ray_release(c);
     return ok;
 }
-#define WIDE_DECLINES(path, vec) do { const char* w_ = wide_declines(path, vec); \
+
+/* Vector `vec` of the patched image read twice by range through one
+ * column: both reads succeed (decode does not hold these values to the
+ * statistics; a consumer that sizes memory from them guards it). */
+static const char* reads_ok(const char* path, int64_t vec) {
+    static char why[512];
+    if (!img_store(path, g_len)) return "store";
+    ray_t* c = ray_col_mmap(path);
+    if (!c || RAY_IS_ERR(c)) { if (c) ray_error_free(c); return "load failed"; }
+    ray_col_src_t src;
+    ray_t* m = ray_col_src_bind(c, &src);
+    if (m) { ray_error_free(m); ray_release(c); return "bind failed"; }
+    ray_col_scratch_t sc; ray_col_scratch_init(&sc);
+    const char* res = NULL;
+    for (int i = 0; i < 2 && !res; i++) {
+        ray_col_range_t r;
+        ray_error_clear();
+        ray_t* e = ray_col_range(&src, vec * RAY_ENC_VEC, RAY_ENC_VEC, &sc, &r);
+        if (e) {
+            snprintf(why, sizeof why, "read %d gave %s: \"%s\"", i + 1, RAY_IS_ERR(e) ? ray_err_code(e) : "?",
+                     ray_error_msg() ? ray_error_msg() : "");
+            res = why;
+            ray_error_free(e);
+        }
+    }
+    ray_col_scratch_free(&sc); ray_col_src_release(&src);
+    ray_release(c);
+    return res;
+}
+#define READS_OK(path, vec) do { const char* w_ = reads_ok(path, vec); \
     TEST_ASSERT_FMT(w_ == NULL, "%s:%d %s", __FILE__, __LINE__, w_); } while (0)
 
-/* A decoded non-null value outside its vector's statistics (the
- * descriptor moved inward past a real value, still inside the chunk's):
- * corrupt on every decode path an aware consumer reads (the FOR_BP and
- * DELTA_BP kernels at both widths, with and without a bitmap, the DICT
- * kernel, the SYM kernel, the reference decode, the float view and copy,
- * the widened read, the materialization), on the first read and the
- * second. */
+/* The decode-side contract for a descriptor moved inward past a real value
+ * (still inside its chunk's): the encodings whose check is free to fuse
+ * (DICT's gather, SYM's id check, the floats' NaN scan) are `corrupt` on
+ * the first read and the second; FOR_BP, DELTA_BP, RLE and RAW integer
+ * vectors, read natively or widened, decode as stored: the consumers that
+ * size memory from statistics guard them (scanrange/v2_forged_*). */
 static test_result_t test_stats_values(void) {
     const char* p = ray_test_tmp(EC_TMP "/sv");
     size_t D;
     for (int t = 0; t < 2; t++) {
         int8_t type = t ? RAY_I32 : RAY_I16;
-        /* the range spans the full width (min + 2^w - 1 == max): the FOR_BP proof holds unpatched */
         SAVE(fk_for(type), p); NEED_ENC(0, 0, RAY_ENC_FOR_BP); D = desc_at(0, 0);
-        TEST_ASSERT_EQ_U(rd64(D + 40) - rd64(D + 32), (1u << g_img[D + 1]) - 1);
+        W64(D + 40, rd64(D + 40) - 1);                      READS_OK(p, 0);
         TEST_ASSERT_TRUE(wide_serves(p, 0));
-        W64(D + 40, rd64(D + 40) - 1);                      BAD2(p, 0, VALUE_OUT);
-        EXPECT(p, 1, "corrupt", VALUE_OUT);
-        WIDE_DECLINES(p, 0);
-        SAVE(fk_for(type), p); D = desc_at(0, 0);
-        W64(D + 32, rd64(D + 32) + 1);                      BAD2(p, 0, VALUE_OUT);
-        WIDE_DECLINES(p, 0);
-        /* with a null bitmap: the merge */
         SAVE(fk_for_nulls(type), p); NEED_ENC(0, 0, RAY_ENC_FOR_BP); D = desc_at(0, 0);
-        TEST_ASSERT_TRUE(wide_serves(p, 0));
-        W64(D + 40, rd64(D + 40) - 1);                      BAD2(p, 0, VALUE_OUT);
-        WIDE_DECLINES(p, 0);
+        W64(D + 32, rd64(D + 32) + 1);                      READS_OK(p, 0);
     }
-    /* I32 FOR_BP whose range is not a full width (no proof): the kernel checks */
-    {
-        ray_t* v = ray_vec_new(RAY_I32, 1024); v->len = 1024;
-        for (int i = 0; i < 1024; i++) ((int32_t*)ray_data(v))[i] = 100 + i % 7;
-        SAVE(v, p);
-    }
-    NEED_ENC(0, 0, RAY_ENC_FOR_BP); D = desc_at(0, 0);
-    TEST_ASSERT_TRUE(rd64(D + 40) - rd64(D + 32) < (1u << g_img[D + 1]) - 1);
-    W64(D + 40, rd64(D + 40) - 1);                          BAD2(p, 0, VALUE_OUT);
-    /* DELTA_BP (vector 1), at both widths */
     SAVE(fk_delta(), p); NEED_ENC(0, 1, RAY_ENC_DELTA_BP); D = desc_at(0, 1);
-    W64(D + 40, rd64(D + 40) - 1);                          BAD2(p, 1, VALUE_OUT);
-    SAVE(fk_delta(), p); D = desc_at(0, 1);
-    W64(D + 32, rd64(D + 32) + 1);                          BAD2(p, 1, VALUE_OUT);
-    {
-        ray_t* v = ray_vec_new(RAY_I16, 2048); v->len = 2048;
-        for (int i = 0; i < 2048; i++) ((int16_t*)ray_data(v))[i] = (int16_t)(3 * i + i % 5 - 3000);
-        SAVE(v, p); NEED_ENC(0, 1, RAY_ENC_DELTA_BP); D = desc_at(0, 1);
-        TEST_ASSERT_TRUE(wide_serves(p, 1));
-        W64(D + 40, rd64(D + 40) - 1);                      BAD2(p, 1, VALUE_OUT);
-        WIDE_DECLINES(p, 1);
-    }
+    W64(D + 40, rd64(D + 40) - 1);                          READS_OK(p, 1);
+    SAVE(bool_runs(), p); NEED_ENC(0, 0, RAY_ENC_RLE);
+    W64(desc_at(0, 0) + 40, 0);                             READS_OK(p, 0);
+    SAVE(i32_nulls_raw(), p); NEED_ENC(0, 0, RAY_ENC_RAW); D = desc_at(0, 0);
+    W64(D + 40, rd64(D + 40) - 1);                          READS_OK(p, 0);
     /* DICT over FOR_BP codes: the kernel's gather (values 11, 77, 900000000001, 123456789012345) */
     SAVE(i64_dict(), p); NEED_ENC(0, 0, RAY_ENC_DICT); D = desc_at(0, 0);
     W64(D + 40, 900000000001ull);                           BAD2(p, 0, VALUE_OUT);
     EXPECT(p, 1, "corrupt", VALUE_OUT);
     SAVE(i64_dict(), p); D = desc_at(0, 0);
     W64(D + 32, 77);                                        BAD2(p, 0, VALUE_OUT);
-    /* the reference decode: BOOL RLE, I32 RAW with a bitmap */
-    SAVE(bool_runs(), p); NEED_ENC(0, 0, RAY_ENC_RLE);
-    W64(desc_at(0, 0) + 40, 0);                             BAD2(p, 0, VALUE_OUT);
-    SAVE(i32_nulls_raw(), p); NEED_ENC(0, 0, RAY_ENC_RAW); D = desc_at(0, 0);
-    W64(D + 40, rd64(D + 40) - 1);                          BAD2(p, 0, VALUE_OUT);
-    SAVE(i32_nulls_raw(), p); D = desc_at(0, 0);
-    W64(D + 32, rd64(D + 32) + 1);                          BAD2(p, 0, VALUE_OUT);
     {   /* SYM FOR_BP, ids 1..32 */
         uint8_t ids[1024];
         for (int i = 0; i < 1024; i++) ids[i] = (uint8_t)(1 + ((uint32_t)i * 2654435761u >> 27));
@@ -1035,6 +1011,97 @@ static test_result_t test_stats_values(void) {
         double hi = 98.0; wr(desc_at(0, 0) + 40, &hi, 8);   BAD2(p, 0, VALUE_OUT);
     }
     SAVE(f32_plain(), p); { double hi = 2.5; wr(desc_at(0, 0) + 40, &hi, 8); } BAD2(p, 0, VALUE_OUT);
+    PASS();
+}
+
+/* The consumer guard at the range read (ray_col_src_t.stats_guard): a
+ * value outside its chunk's directory statistics is `corrupt` naming the
+ * path, on both reads; an unpatched vector reads; a widened read declines
+ * so the range read checks; the materialization is checked once. */
+static const char* guard_reads(const char* path, int64_t vec, bool want_bad) {
+    static char why[512];
+    if (!img_store(path, g_len)) return "store";
+    ray_t* c = ray_col_mmap(path);
+    if (!c || RAY_IS_ERR(c)) { if (c) ray_error_free(c); return "load failed"; }
+    ray_col_src_t src;
+    ray_t* m = ray_col_src_bind(c, &src);
+    if (m) { ray_error_free(m); ray_release(c); return "bind failed"; }
+    src.stats_guard = true;
+    ray_col_scratch_t sc; ray_col_scratch_init(&sc);
+    const char* res = NULL;
+    static int64_t dst[RAY_ENC_VEC];
+    int64_t got = -1;
+    ray_t* we = ray_col_range_wide(&src, vec * RAY_ENC_VEC, RAY_ENC_VEC, &sc, RAY_I64, dst, &got);
+    if (we || got != 0) { res = "the widened read did not decline under the guard"; if (we) ray_error_free(we); }
+    for (int i = 0; i < 2 && !res; i++) {
+        ray_col_range_t r;
+        ray_error_clear();
+        ray_t* e = ray_col_range(&src, vec * RAY_ENC_VEC, RAY_ENC_VEC, &sc, &r);
+        bool bad = e && RAY_IS_ERR(e) && strcmp(ray_err_code(e), "corrupt") == 0 && names_path(path) &&
+                   has_needle("value outside the chunk's statistics");
+        if (want_bad ? !bad : e != NULL) {
+            snprintf(why, sizeof why, "guarded read %d gave %s: \"%s\"", i + 1, e ? ray_err_code(e) : "a view",
+                     e && ray_error_msg() ? ray_error_msg() : "");
+            res = why;
+        }
+        if (e) ray_error_free(e);
+    }
+    /* through a cursor over the published materialization */
+    if (!res) {
+        ray_t* mat = ray_enccol_materialize(c);
+        if (mat && !RAY_IS_ERR(mat)) {
+            for (int i = 0; i < 2 && !res; i++) {
+                ray_col_cursor_t cur; ray_col_cursor_init(&cur, &src);
+                const ray_col_range_t* v;
+                ray_error_clear();
+                ray_t* e = ray_col_cursor_at(&cur, vec * RAY_ENC_VEC, &v);
+                bool bad = e && strcmp(ray_err_code(e), "corrupt") == 0 && names_path(path);
+                if (want_bad ? !bad : e != NULL) {
+                    snprintf(why, sizeof why, "materialized read %d gave %s", i + 1, e ? ray_err_code(e) : "a view");
+                    res = why;
+                }
+                if (e) ray_error_free(e);
+                ray_col_cursor_free(&cur);
+            }
+        } else if (mat) ray_error_free(mat);
+    }
+    ray_col_scratch_free(&sc); ray_col_src_release(&src);
+    ray_release(c);
+    return res;
+}
+#define GUARD_READS(path, vec, bad) do { const char* w_ = guard_reads(path, vec, bad); \
+    TEST_ASSERT_FMT(w_ == NULL, "%s:%d %s", __FILE__, __LINE__, w_); } while (0)
+
+static test_result_t test_stats_guard(void) {
+    const char* p = ray_test_tmp(EC_TMP "/sg");
+    for (int t = 0; t < 2; t++) {
+        int8_t type = t ? RAY_I32 : RAY_I16;
+        SAVE(fk_for(type), p); GUARD_READS(p, 0, false);
+        /* the chunk's maximum (and the vector's, to nest) below a real value */
+        uint64_t mx = rd64(DIR(0) + 24);
+        W64(DIR(0) + 24, mx - 1); W64(desc_at(0, 0) + 40, mx - 1);   GUARD_READS(p, 0, true);
+        SAVE(fk_for(type), p);
+        uint64_t mn = rd64(DIR(0) + 16);
+        W64(DIR(0) + 16, mn + 1); W64(desc_at(0, 0) + 32, mn + 1);   GUARD_READS(p, 0, true);
+        /* with a null bitmap: the nulls take no part */
+        SAVE(fk_for_nulls(type), p); GUARD_READS(p, 0, false);
+        mx = rd64(DIR(0) + 24);
+        W64(DIR(0) + 24, mx - 1); W64(desc_at(0, 0) + 40, mx - 1);   GUARD_READS(p, 0, true);
+    }
+    SAVE(fk_delta(), p); GUARD_READS(p, 1, false);
+    W64(DIR(0) + 24, rd64(DIR(0) + 24) - 1); W64(desc_at(0, 1) + 40, rd64(DIR(0) + 24));
+    GUARD_READS(p, 1, true);
+    {   /* I64 and U8 */
+        ray_t* v = ray_vec_new(RAY_I64, 1024); v->len = 1024;
+        for (int i = 0; i < 1024; i++) ((int64_t*)ray_data(v))[i] = -5000000000ll + i % 300;
+        SAVE(v, p); GUARD_READS(p, 0, false);
+        W64(DIR(0) + 16, (uint64_t)(-5000000000ll + 1)); W64(desc_at(0, 0) + 32, (uint64_t)(-5000000000ll + 1));
+        GUARD_READS(p, 0, true);
+        ray_t* u = ray_vec_new(RAY_U8, 1024); u->len = 1024;
+        for (int i = 0; i < 1024; i++) ((uint8_t*)ray_data(u))[i] = (uint8_t)(10 + i % 200);
+        SAVE(u, p); GUARD_READS(p, 0, false);
+        W64(DIR(0) + 24, 208); W64(desc_at(0, 0) + 40, 208);         GUARD_READS(p, 0, true);
+    }
     PASS();
 }
 
@@ -1232,6 +1299,7 @@ const test_entry_t enccorrupt_entries[] = {
     { "enccorrupt/stats_nested",  test_stats_nested,         ec_setup, ec_teardown },
     { "enccorrupt/stats_values",  test_stats_values,         ec_setup, ec_teardown },
     { "enccorrupt/stats_point_read", test_stats_point_read,  ec_setup, ec_teardown },
+    { "enccorrupt/stats_guard",   test_stats_guard,          ec_setup, ec_teardown },
     { "enccorrupt/fuzz_flips",    test_fuzz_flips,           ec_setup, ec_teardown },
     { NULL, NULL, NULL, NULL },
 };

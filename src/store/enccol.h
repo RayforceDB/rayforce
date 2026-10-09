@@ -91,6 +91,14 @@ typedef struct ray_enccol_s {
      * 1 being stored, 2 stored (acquire before reading totals) */
     _Atomic(uint8_t) totals_state;
     ray_enc_col_totals_t totals;
+    /* single file: set (release) once the published materialization's
+     * values were found inside their chunks' statistics
+     * (ray_enccol_check_dir_all); never set on a failure */
+    _Atomic(uint8_t) mat_dir_ok;
+    /* single file: per chunk, bit j set (release) once vector j's values
+     * were found inside the chunk's statistics (ray_enccol_check_dir);
+     * never set on a failure */
+    _Atomic(uint64_t)* dir_vec_ok;
 } ray_enccol_t;
 
 ray_enccol_t* ray_enccol_of(ray_t* v);
@@ -265,6 +273,22 @@ void ray_enccol_dir_totals(ray_enccol_t* e, ray_enc_col_totals_t* out);
  * past the last chunk). */
 void ray_enccol_byte_range(const ray_enccol_t* e, int64_t lo, int64_t hi,
                            uint64_t* off, uint64_t* len);
+
+/* The consumer guard (ray_col_src_t.stats_guard): the non-null values of
+ * vector j of chunk c, decoded at data (vlen elements at the generation-0
+ * width, nulls in band; may_null: the vector has nulls), lie inside the
+ * chunk's directory statistics.  A consumer that sized memory from those
+ * statistics reads only values that fit it.  Integer types other than SYM
+ * (whose ids decode checks); a chunk without statistics passes.  A vector
+ * that passed is recorded and not scanned again (a failure is not).  NULL,
+ * or `corrupt` naming the column. */
+ray_t* ray_enccol_check_dir(ray_enccol_t* e, int64_t c, int j, const void* data, int vlen, bool may_null);
+/* Vector j of chunk c already passed ray_enccol_check_dir. */
+bool   ray_enccol_dir_vec_ok(const ray_enccol_t* e, int64_t c, int j);
+/* The same over every chunk of the column's published materialization,
+ * once per column (a success is cached; the mapping is immutable).  NULL
+ * when nothing is published. */
+ray_t* ray_enccol_check_dir_all(ray_t* encv);
 
 void ray_enccol_meta(ray_t* encv, ray_col_meta_t* m);
 /* Could materialization attach an index (recorded kind, UNIQUE, or for STR

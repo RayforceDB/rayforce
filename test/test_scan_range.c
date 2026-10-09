@@ -3941,6 +3941,85 @@ static void sr_patch64(const char* path, long off, uint64_t val) {
     if (fseek(f, off, SEEK_SET) == 0) (void)fwrite(&val, 8, 1, f);
     fclose(f);
 }
+/* Chunk c of the generation-2 column file at path: its directory maximum
+ * and every vector descriptor's maximum above x lowered to x, so the
+ * statistics still nest and validate, and only the values lie above them
+ * (the consumer guard's case).  False on an I/O error or a vector whose
+ * minimum lies above x. */
+static bool sr_forge_max(const char* path, int64_t c, int64_t x) {
+    FILE* f = fopen(path, "r+b"); if (!f) return false;
+    ray_enc_dirent_t de;
+    long doff = (long)(RAY_ENC_DIR_OFF + (uint64_t)c * sizeof de);
+    bool ok = fseek(f, doff, SEEK_SET) == 0 && fread(&de, sizeof de, 1, f) == 1 && !(de.flags & RAY_ENC_STAT_ABSENT);
+    if (ok) { de.max = x; ok = fseek(f, doff, SEEK_SET) == 0 && fwrite(&de, sizeof de, 1, f) == 1; }
+    for (int j = 0; ok && j < RAY_ENC_VECS_PER_CHUNK; j++) {
+        ray_enc_desc_t d;
+        long off = (long)(de.offset + (uint64_t)j * sizeof d);
+        ok = fseek(f, off, SEEK_SET) == 0 && fread(&d, sizeof d, 1, f) == 1;
+        if (!ok || (d.encoding == 0 && d.payload_bytes == 0)) break;     /* past the last vector */
+        if (d.flags & RAY_ENC_STAT_ABSENT || d.max <= x) continue;
+        if (d.min > x) { ok = false; break; }
+        d.max = x;
+        ok = fseek(f, off, SEEK_SET) == 0 && fwrite(&d, sizeof d, 1, f) == 1;
+    }
+    return fclose(f) == 0 && ok;
+}
+/* q over the table at dir (set as T) gives `corrupt` naming path, twice. */
+static test_result_t sr_corrupt_twice(const char* dir_expr, const char* q, const char* path) {
+    for (int rep = 0; rep < 2; rep++) {
+        sr_evalf_ok("(set T %s)", dir_expr);
+        ray_error_clear();
+        ray_t* r = sr_eval(q);
+        TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "%s (read %d): answered", q, rep + 1);
+        TEST_ASSERT_FMT(strcmp(ray_err_code(r), "corrupt") == 0 && ray_error_msg() && strstr(ray_error_msg(), path),
+                        "%s (read %d): %s \"%s\"", q, rep + 1, ray_err_code(r), ray_error_msg() ? ray_error_msg() : "");
+        ray_error_free(r);
+    }
+    PASS();
+}
+
+/* The consumer guards: every consumer kind that sizes memory from the
+ * directory statistics, over a key whose chunk 3 statistics (directory
+ * and descriptors, still nested) are lowered below its values.  The dense
+ * plan unfiltered (the directory prescan) and filtered (the selection
+ * bounds), the direct array, the sparse emit-filter range: each `corrupt`
+ * naming the key, twice; the same queries on the unpatched table answer
+ * as generation 0. */
+static test_result_t test_v2_forged_consumers(void) {
+    /* k: j*7 % 1000 in chunks 0-2, % 5001 in chunk 3 with a null every
+     * 100 rows (so the samplers' point reads decline there and only the
+     * guard sees the values); g: % 50, % 101; n: a wide I64 key (the
+     * sparse range), + 400000 in chunk 3 */
+    sr_eval_ok("(set jf (til 262144))");
+    sr_eval_ok("(set ja (til 196608))");
+    sr_eval_ok("(set jb (+ 196608 (til 65536)))");
+    sr_eval_ok("(set FC (table [k g n v] (list (concat (% (* ja 7) 1000) (map (fn [j] (if (== 0 (% j 100)) 0N (% (* j 7) 5001))) jb)) "
+               "(as 'I16 (concat (% (* ja 7) 50) (% (* jb 7) 101))) "
+               "(concat (- (% (* ja 7919) 1000003) 500000) (+ 400000 (% (* jb 7919) 1000003))) jf)))");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/fc0/\" FC {compress: false})");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/fc2/\" FC {compress: true})");
+    static const struct { const char* col; int64_t x; int route; const char* q; } cs[] = {
+        { "k", 999,    0, "(select {s: (sum v) c: (count v) from: T by: k})" },                     /* dense, directory prescan */
+        { "k", 999,    0, "(select {s: (sum v) c: (count v) from: T where: (> v 0) by: k})" },      /* dense, selection bounds */
+        { "g", 49,     1, "(select {s: (sum v) c: (count v) from: T by: g})" },                     /* the direct array */
+        { "n", 500003, 2, "(select {c: (count v) s: (sum v) from: T by: n desc: c take: 3})" },     /* the sparse range */
+    };
+    for (size_t i = 0; i < sizeof cs / sizeof cs[0]; i++) {
+        ray_group_test_route(cs[i].route);
+        test_result_t r = sr_same_on("(.db.splayed.get \"" SR_TMP "/fc0/\")", "(.db.splayed.get \"" SR_TMP "/fc2/\")", cs[i].q, 0);
+        if (r.status != TEST_PASS) { ray_group_test_route(0); return r; }
+        sr_eval_ok("(.db.splayed.set \"" SR_TMP "/fcb/\" FC {compress: true})");
+        char dir[512], path[600];
+        if (ray_splay_resolve_dir(ray_test_tmp(SR_TMP "/fcb/"), dir, sizeof dir) != RAY_OK) { ray_group_test_route(0); FAIL("resolve"); }
+        snprintf(path, sizeof path, "%s/%s", dir, cs[i].col);
+        if (!sr_forge_max(path, 3, cs[i].x)) { ray_group_test_route(0); FAIL("forge"); }
+        r = sr_corrupt_twice("(.db.splayed.get \"" SR_TMP "/fcb/\")", cs[i].q, path);
+        ray_group_test_route(0);
+        if (r.status != TEST_PASS) return r;
+    }
+    PASS();
+}
+
 static test_result_t test_v2_forged_dir_max(void) {
     sr_eval_ok("(set BF (table [k v] (list (concat (% (* (til 196608) 7) 1000) (% (* (+ 196608 (til 65536)) 7) 5001)) (til 262144))))");
     sr_eval_ok("(.db.splayed.set \"" SR_TMP "/fm/\" BF {compress: true})");
@@ -4453,6 +4532,7 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/v2_decode_once",     test_v2_decode_once,     srr_setup, srr_pool_teardown },
     { "scanrange/v2_sel_bounds",      test_v2_sel_bounds,      srr_setup, srr_teardown },
     { "scanrange/v2_forged_dir_max",  test_v2_forged_dir_max,  srr_setup, srr_teardown },
+    { "scanrange/v2_forged_consumers", test_v2_forged_consumers, srr_setup, srr_teardown },
     { "scanrange/v2_sel_key_types",   test_v2_sel_key_types,   srr_setup, srr_teardown },
     { NULL, NULL, NULL, NULL },
 };

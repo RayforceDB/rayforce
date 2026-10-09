@@ -45,6 +45,12 @@ typedef struct {
     int64_t len;                    /* rows (parted: sum over segments) */
     bool    may_null;               /* HAS_NULLS, or directory null counts for generation 2 */
     bool    parted;                 /* a parted source (per-range attrs are authoritative) */
+    bool    stats_guard;            /* set by a consumer that sized memory from this source's
+                                     * directory statistics (before its pass reads it): every
+                                     * range read checks its values against their chunk's
+                                     * statistics (ray_enccol_check_dir), a widened read
+                                     * declines until its vector passed; `corrupt` on a
+                                     * value outside them */
     _Atomic(int64_t*) seg_off;      /* parted: segment row offsets (n_segs + 1), built on the
                                      * first range read, published once, owned (a by-value
                                      * copy would free it twice), freed on release */

@@ -606,6 +606,7 @@ static ray_t* agg_key_bounds_staged(const agg_rr_t* krr, uint32_t k, int64_t row
     int64_t nch = (rows + RAY_ENC_CHUNK - 1) / RAY_ENC_CHUNK;
     ray_enc_chunk_stat_t st;
     bool dir = nch > 0 && ray_col_src_chunk_stat(src, 0, &st);
+    bool from_stats = false;
     ray_t* hdr = NULL;
     int64_t* spans = (int64_t*)scratch_alloc(&hdr, (size_t)(nch > 0 ? nch : 1) * 4 * sizeof(int64_t));
     if (!spans) return ray_error("oom", NULL);
@@ -620,11 +621,16 @@ static ray_t* agg_key_bounds_staged(const agg_rr_t* krr, uint32_t k, int64_t row
             if (st.has_minmax) {
                 if (st.min < mn) mn = st.min;
                 if (st.max > mx) mx = st.max;
+                from_stats = true;
                 continue;
             }
         }
         spans[n * 2] = b; spans[n * 2 + 1] = e; n++;
     }
+    /* Memory is about to be sized from the statistics: the passes that
+     * read this key check its values against them (a forged statistic is
+     * `corrupt`, never a write past the plan). */
+    if (from_stats) src->stats_guard = true;
     ray_t* err = NULL;
     if (n > 0) {
         ray_col_src_t* one_src[1] = { src };
@@ -1737,6 +1743,9 @@ static bool agg_sel_bounds_dir(const agg_sel_bounds_ctx_t* bc, int64_t* mins, in
     }
     if (ok) ok = agg_sel_bounds_round(bc, state, nch, spc, spans, tb, mins, maxs);
     scratch_free(hdr);
+    /* the bounds rest on the statistics of the chunks not scanned: the
+     * passes that read the keys check their values against them */
+    if (ok) for (uint32_t k = 0; k < nk; k++) krr->srcs[k]->stats_guard = true;
     return ok;
 }
 
