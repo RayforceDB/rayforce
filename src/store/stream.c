@@ -152,6 +152,22 @@ ray_err_t ray_col_stream_append(ray_col_stream_t* w,
             if (!w->pool_fp || fwrite(ray_data(col->str_pool),1,(size_t)bytes,w->pool_fp) != bytes) return RAY_ERR_IO;
         }
         w->pool_bytes += bytes;
+    } else if (w->type == RAY_SYM && ray_sym_vec_domain(col) == w->dom &&
+               (col->attrs & RAY_SYM_W_MASK) == RAY_SYM_W32) {
+        /* Already encoded over the target domain at the file's width (a
+         * converter's own symbol decode): the cells are the positions,
+         * written as they are in one request.  HAS_NULLS from a position 0
+         * among them, as the arm below decides it (not from the chunk's
+         * flag); once found, the later chunks are not scanned. */
+        const uint32_t* p = (const uint32_t*)ray_data(col);
+        for (int64_t off = 0; off < n && !w->had_nulls; off += 8192) {
+            int64_t end = n - off < 8192 ? n : off + 8192;
+            uint32_t lo = UINT32_MAX;
+            for (int64_t i = off; i < end; i++) lo = p[i] < lo ? p[i] : lo;
+            if (!lo) w->had_nulls = true;
+        }
+        if (n && fwrite(p, sizeof(uint32_t), (size_t)n, w->fp) != (size_t)n)
+            return RAY_ERR_IO;
     } else if (w->type == RAY_SYM) {
         /* Encode cells as positions in the target symfile's domain:
          * resolve each cell through the chunk vec's own domain and

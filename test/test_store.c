@@ -1966,11 +1966,12 @@ static test_result_t test_stream_sentinel_publishes_has_nulls(void) {
 }
 
 /* SYM writer chunks.  A chunk already encoded over the writer's domain (a
- * converter's own decode) is written as it is and never makes the runtime
- * id cache; a runtime-domain chunk makes it and gets its positions through
- * it.  HAS_NULLS follows the positions written, not a chunk's flag: a
- * flagged chunk without position 0 publishes none, an unflagged one holding
- * it publishes it. */
+ * converter's own decode) is written as it is, W32 straight and narrower
+ * widths widened, and never makes the runtime id cache; a runtime-domain
+ * chunk makes it and gets its positions through it.  HAS_NULLS follows the
+ * positions written, not a chunk's flag: a flagged chunk without position 0
+ * publishes none, an unflagged one holding it, even in its last cell,
+ * publishes it. */
 static bool stream_sym_read(const char* path, ray_t* hdr, uint32_t* pos, int64_t n) {
     FILE* f = fopen(path, "rb");
     if (!f) return false;
@@ -1978,8 +1979,8 @@ static bool stream_sym_read(const char* path, ray_t* hdr, uint32_t* pos, int64_t
     fclose(f);
     return ok;
 }
-static ray_t* stream_sym_chunk(ray_sym_domain_t* dom, int64_t n) {
-    ray_t* v = ray_sym_vec_new(RAY_SYM_W32, n);
+static ray_t* stream_sym_chunk(ray_sym_domain_t* dom, int64_t n, uint8_t width) {
+    ray_t* v = ray_sym_vec_new(width, n);
     if (!v || RAY_IS_ERR(v)) return NULL;
     v->sym_domain = dom; ray_sym_domain_retain(dom);
     v->len = n; v->attrs &= (uint8_t)~RAY_ATTR_HAS_NULLS;
@@ -2005,13 +2006,16 @@ static test_result_t test_stream_sym_chunks(void) {
     TEST_ASSERT_NOT_NULL(back);
     ray_t hdr;
 
-    /* "d": two chunks over the domain, the first flagged, neither holding 0 */
-    ray_t* c1 = stream_sym_chunk(dom, n);
-    ray_t* c2 = stream_sym_chunk(dom, n);
-    TEST_ASSERT_TRUE(c1 && c2);
+    /* "d": three chunks over the domain, none holding 0: W32 flagged, W32,
+     * then W16 (re-encoded to the file's W32) */
+    ray_t* c1 = stream_sym_chunk(dom, n, RAY_SYM_W32);
+    ray_t* c2 = stream_sym_chunk(dom, n, RAY_SYM_W32);
+    ray_t* c4 = stream_sym_chunk(dom, n, RAY_SYM_W16);
+    TEST_ASSERT_TRUE(c1 && c2 && c4);
     for (int64_t i = 0; i < n; i++) {
         ((uint32_t*)ray_data(c1))[i] = (uint32_t)at[1 + i % (K - 1)];
         ((uint32_t*)ray_data(c2))[i] = (uint32_t)at[1 + (i * 3) % (K - 1)];
+        ((uint16_t*)ray_data(c4))[i] = (uint16_t)at[1 + (i * 5) % (K - 1)];
     }
     c1->attrs |= RAY_ATTR_HAS_NULLS;
     ray_col_stream_t w;
@@ -2019,26 +2023,33 @@ static test_result_t test_stream_sym_chunks(void) {
     TEST_ASSERT_NULL(w.lut_id);
     TEST_ASSERT_EQ_I(ray_col_stream_append(&w, c1), RAY_OK);
     TEST_ASSERT_EQ_I(ray_col_stream_append(&w, c2), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_append(&w, c4), RAY_OK);
     TEST_ASSERT_NULL(w.lut_id);
     TEST_ASSERT_EQ_I(ray_col_stream_close(&w, false), RAY_OK);
     snprintf(path, sizeof(path), "%s/d", dir);
-    TEST_ASSERT_TRUE(stream_sym_read(path, &hdr, back, 2 * n));
+    TEST_ASSERT_TRUE(stream_sym_read(path, &hdr, back, 3 * n));
     TEST_ASSERT_EQ_I(hdr.type, RAY_SYM);
-    TEST_ASSERT_EQ_I(hdr.len, 2 * n);
+    TEST_ASSERT_EQ_I(hdr.len, 3 * n);
     TEST_ASSERT_FALSE(hdr.attrs & RAY_ATTR_HAS_NULLS);
     TEST_ASSERT_EQ_I(memcmp(back, ray_data(c1), (size_t)n * 4), 0);
     TEST_ASSERT_EQ_I(memcmp(back + n, ray_data(c2), (size_t)n * 4), 0);
+    int64_t bad = 0;
+    for (int64_t i = 0; i < n; i++)
+        if (back[2 * n + i] != ((uint16_t*)ray_data(c4))[i]) bad++;
+    TEST_ASSERT_EQ_I(bad, 0);
 
-    /* "r": an unflagged chunk over the domain holding 0, then two
-     * runtime-domain chunks without "" (the cache made, then hit) */
-    ray_t* c3 = stream_sym_chunk(dom, n);
+    /* "r": an unflagged chunk over the domain whose only 0 is its last
+     * cell, then two runtime-domain chunks without "" (the cache made,
+     * then hit) */
+    ray_t* c3 = stream_sym_chunk(dom, n, RAY_SYM_W32);
     ray_t* rt = ray_sym_vec_new(RAY_SYM_W64, n);
     TEST_ASSERT_TRUE(c3 && rt && !RAY_IS_ERR(rt));
     rt->len = n;
     for (int64_t i = 0; i < n; i++) {
-        ((uint32_t*)ray_data(c3))[i] = (uint32_t)at[i % K];
+        ((uint32_t*)ray_data(c3))[i] = (uint32_t)at[1 + i % (K - 1)];
         ((int64_t*)ray_data(rt))[i] = id[1 + (i * 7) % (K - 1)];
     }
+    ((uint32_t*)ray_data(c3))[n - 1] = 0;
     TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("r", 1), RAY_SYM, dom), RAY_OK);
     TEST_ASSERT_EQ_I(ray_col_stream_append(&w, c3), RAY_OK);
     TEST_ASSERT_NULL(w.lut_id);
@@ -2052,12 +2063,11 @@ static test_result_t test_stream_sym_chunks(void) {
     TEST_ASSERT_EQ_I(hdr.len, 3 * n);
     TEST_ASSERT_TRUE(hdr.attrs & RAY_ATTR_HAS_NULLS);
     TEST_ASSERT_EQ_I(memcmp(back, ray_data(c3), (size_t)n * 4), 0);
-    int64_t bad = 0;
     for (int64_t i = 0; i < 2 * n; i++)
         if (back[n + i] != (uint32_t)at[1 + ((i % n) * 7) % (K - 1)]) bad++;
     TEST_ASSERT_EQ_I(bad, 0);
 
-    ray_release(c1); ray_release(c2); ray_release(c3); ray_release(rt);
+    ray_release(c1); ray_release(c2); ray_release(c3); ray_release(c4); ray_release(rt);
     ray_sys_free(back);
     ray_sym_domain_release(dom);
     (void)ray_test_rm_rf(dir);
