@@ -2090,7 +2090,7 @@ typedef struct { int64_t name; ray_t* expr; } query_inline_binding_t;
 
 /* Fallback can inline pure collection expressions even when the DAG cannot
  * lower their types or shapes. Never move effects or opaque user calls. */
-static bool query_inline_pure(ray_t* expr, int depth) {
+static bool query_inline_pure(ray_t* expr, int depth, bool collections) {
     if (!expr || depth > 24) return false;
     if (expr->type != RAY_LIST || (expr->attrs & ATTR_QUOTED)) return true;
     if (!expr->len) return true;
@@ -2105,9 +2105,12 @@ static bool query_inline_pure(ray_t* expr, int depth) {
                  id == ray_sym_intern("concat", 6) || id == ray_sym_intern("as", 2) ||
                  id == ray_sym_intern("if", 2) || id == ray_sym_intern("and", 3) ||
                  id == ray_sym_intern("or", 2);
+    if (!known && collections)
+        known = id == ray_sym_intern("distinct", 8) || id == ray_sym_intern("reverse", 7) ||
+                id == ray_sym_intern("asc", 3) || id == ray_sym_intern("desc", 4);
     if (!known) return false;
     for (int64_t i = 1; i < expr->len; i++)
-        if (!query_inline_pure(es[i], depth + 1)) return false;
+        if (!query_inline_pure(es[i], depth + 1, collections)) return false;
     return true;
 }
 
@@ -2242,14 +2245,32 @@ static ray_t* query_inline_walk(ray_t* expr, ray_t* tbl,
     ray_t* expanded = query_inline_walk(body, tbl, formals, (int)params->len,
                                        depth + 1, budget, named, scope);
     if (!expanded) return out;
-    if (!query_inline_pure(expanded, 0)) { ray_release(expanded); return out; }
+    if (!query_inline_pure(expanded, 0, false)) { ray_release(expanded); return out; }
     for (int64_t i = 1; i < out->len; i++)
-        if (!query_inline_pure(dst[i], 0)) { ray_release(expanded); return out; }
+        if (!query_inline_pure(dst[i], 0, false)) { ray_release(expanded); return out; }
     ray_release(out);
     return expanded;
 }
 
+static bool query_expr_has_helper(ray_t* expr) {
+    if (!expr || expr->type != RAY_LIST || (expr->attrs & ATTR_QUOTED) || !expr->len)
+        return false;
+    ray_t** es = ray_data(expr);
+    if (es[0]->type == RAY_LIST) return true;
+    if (es[0]->type == -RAY_SYM) {
+        int64_t id = es[0]->i64;
+        if (id == ray_sym_intern("quote", 5) || id == ray_sym_intern("fn", 2) ||
+            id == ray_sym_intern("let", 3)) return false;
+        ray_t* fn = ray_env_get(id);
+        if (fn && fn->type == RAY_LAMBDA) return true;
+    }
+    for (int64_t i = 1; i < expr->len; i++)
+        if (query_expr_has_helper(es[i])) return true;
+    return false;
+}
+
 static ray_t* query_inline_helpers(ray_t* expr, ray_t* tbl) {
+    if (!query_expr_has_helper(expr)) { ray_retain(expr); return expr; }
     int budget = 1024;
     ray_t* expanded = query_inline_walk(expr, tbl, NULL, 0, 0, &budget, false, NULL);
     if (!expanded) { ray_retain(expr); expanded = expr; }
@@ -2685,6 +2706,40 @@ static ray_t* select_fallback_passthrough_col(ray_t* expr, ray_t* tbl, int64_t n
     return col;
 }
 
+static bool query_expr_reads_rows_on(ray_t* expr, ray_t* tbl);
+
+/* Some text operations deliberately have no DAG node. Their source
+ * dependency still distinguishes column text from a bound collection. */
+static bool query_text_operand(ray_t* expr, ray_t* tbl) {
+    ray_graph_t* g = ray_graph_new(tbl);
+    if (!g) return false;
+    ray_op_t* op = compile_expr_dag(g, expr);
+    bool text = op && (op->out_type == RAY_SYM || op->out_type == RAY_STR) &&
+                (!op_tree_is_scalar(g, op->id) || op_tree_is_atom(g, op->id));
+    ray_graph_free(g);
+    if (text || !expr || expr->type != RAY_LIST || expr->len < 2) return text;
+    ray_t** es = ray_data(expr);
+    if (es[0]->type != -RAY_SYM) return false;
+    int64_t id = es[0]->i64;
+    ray_t* fn = ray_env_get(id);
+    if (!fn || fn->type == RAY_LAMBDA) return false;
+    if (id == ray_sym_intern("as", 2) && expr->len == 3 && es[1]->type == -RAY_SYM &&
+        (es[1]->i64 == ray_sym_intern("SYM", 3) || es[1]->i64 == ray_sym_intern("STR", 3)))
+        return query_expr_reads_rows_on(es[2], tbl) ||
+               (ray_is_atom(es[2]) && es[2]->type != -RAY_SYM);
+    if (id == ray_sym_intern("reverse", 7) || id == ray_sym_intern("asc", 3) ||
+        id == ray_sym_intern("desc", 4) || id == ray_sym_intern("at", 2))
+        return query_text_operand(es[1], tbl);
+    return false;
+}
+
+static bool query_concat_text_operands(ray_t* expr, ray_t* tbl) {
+    ray_t** es = ray_data(expr);
+    for (int64_t i = 1; i < expr->len; i++)
+        if (!query_text_operand(es[i], tbl)) return false;
+    return true;
+}
+
 /* True when a projection's TOP-LEVEL call is a "whole-column verb": a
  * collection builtin (distinct, asc, desc, reverse, enlist) that
  * consumes an entire column vector and returns a vector.  The DAG compiler
@@ -2732,7 +2787,7 @@ static int is_whole_column_projection(ray_t* expr, ray_t* tbl) {
             /* A declined concat is a collection operation over complete
              * operands. In particular a column plus a bound vector must
              * not be retried separately for each row. */
-            whole = 1;
+            whole = !query_concat_text_operands(expr, tbl);
         }
         ray_graph_free(g);
         return whole;
@@ -5674,8 +5729,7 @@ static ray_t* nonagg_eval_per_group_buf(ray_t* expr, ray_t* tbl,
 /* The evaluator has argument syntax here, unlike a builtin called from a
  * lambda or apply. Only column-derived vectors use query text concat.
  * Bare columns need no graph allocation on the per-group hot path. */
-bool ray_query_expr_reads_rows(ray_t* expr) {
-    ray_t* tbl = g_active_query_table;
+static bool query_expr_reads_rows_on(ray_t* expr, ray_t* tbl) {
     if (!tbl || tbl->type != RAY_TABLE || !expr) return false;
     if (expr->type == -RAY_SYM) {
         if (!(expr->attrs & ATTR_QUOTED) && ray_env_has_lexical_local(expr->i64))
@@ -5686,7 +5740,16 @@ bool ray_query_expr_reads_rows(ray_t* expr) {
     if (expr->type == RAY_LIST && expr->len == 3) {
         ray_t** es = ray_data(expr);
         if (es[0]->type == -RAY_SYM && es[0]->i64 == ray_sym_intern("as", 2))
-            return ray_query_expr_reads_rows(es[2]);
+            return query_expr_reads_rows_on(es[2], tbl);
+    }
+    if (expr->type == RAY_LIST && expr->len >= 2) {
+        ray_t** es = ray_data(expr);
+        if (es[0]->type == -RAY_SYM) {
+            int64_t id = es[0]->i64;
+            if (id == ray_sym_intern("reverse", 7) || id == ray_sym_intern("asc", 3) ||
+                id == ray_sym_intern("desc", 4) || id == ray_sym_intern("at", 2))
+                return query_expr_reads_rows_on(es[1], tbl);
+        }
     }
     query_dependency_cache_t* cache = g_query_dependencies;
     if (cache && cache->table == tbl)
@@ -5703,6 +5766,10 @@ bool ray_query_expr_reads_rows(ray_t* expr) {
         cache->reads_rows[cache->n++] = reads_rows;
     }
     return reads_rows;
+}
+
+bool ray_query_expr_reads_rows(ray_t* expr) {
+    return query_expr_reads_rows_on(expr, g_active_query_table);
 }
 
 /* The value a literal column-name symbol stands for while a query is
@@ -12029,7 +12096,7 @@ by_dict_done:
                         agg_results[n_agg_out] = agg_vec;
                         n_agg_out++;
                     } else {
-                        ray_t* per_group = nonagg_eval_per_group(val_expr_item, eval_tbl, groups, n_groups);
+                        ray_t* per_group = nonagg_eval_per_group(val_expr_item, eval_tbl, groups, out_groups);
                         if (!per_group || RAY_IS_ERR(per_group)) {
                             for (int ai = 0; ai < n_agg_out; ai++) if (agg_results[ai]) ray_release(agg_results[ai]);
                             scratch_free(aggnames_hdr); scratch_free(aggres_hdr); scratch_free(keycols_hdr);
@@ -15867,6 +15934,12 @@ by_dict_done:
         }
     }
 
+    /* Fallback outputs are appended after native aggregates. Restore the
+     * requested output order using the same layout pass as derived aliases. */
+    if (by_expr && n_nonaggs > 0 && result && !RAY_IS_ERR(result)) {
+        select_alias_plan_t layout = {0};
+        result = select_apply_derived(result, dict, &layout, tbl);
+    }
     ray_release(tbl);
 
     /* Post-process: apply sort/take for group-by queries.  Runs
@@ -16493,7 +16566,7 @@ static bool update_dag_err_final(ray_t* out, bool if_refused) {
  * one cell: that is an error (#692).  When both paths fail, the planner's error (a misspelt
  * column: `schema: column 'x' not found`) wins over the interpreter's less
  * specific one.  Owned; a one-element vector is its atom. */
-static ray_t* update_eval_on(ray_t* sub, ray_t* expr) {
+static ray_t* update_eval_on_impl(ray_t* sub, ray_t* expr, bool expand) {
     ray_t* out = NULL;
     ray_t* cerr = NULL;
     bool if_refused = false;
@@ -16536,11 +16609,12 @@ static ray_t* update_eval_on(ray_t* sub, ray_t* expr) {
         if (!per_row) {
             ray_env_push_query_scope();
             ray_t* prev_table = bind_all_columns(sub);
-            out = eval_query_expr(expr, sub);
+            out = expand ? eval_query_expr(expr, sub) : ray_eval(expr);
             g_active_query_table = prev_table;
             ray_env_pop_scope();
         } else {
-            out = eval_expr_per_row(expr, sub, nrows);
+            out = expand ? eval_expr_per_row(expr, sub, nrows)
+                         : eval_expr_per_row_impl(expr, sub, nrows);
         }
         if ((!out || RAY_IS_ERR(out)) && cerr) {
             if (out) ray_error_free(out);
@@ -16552,6 +16626,10 @@ static ray_t* update_eval_on(ray_t* sub, ray_t* expr) {
     if (RAY_IS_ERR(out)) return out;
     if (ray_is_lazy(out)) out = ray_lazy_materialize(out);
     return update_scalar_vec(out, ray_table_nrows(sub));
+}
+
+static ray_t* update_eval_on(ray_t* sub, ray_t* expr) {
+    return update_eval_on_impl(sub, expr, true);
 }
 
 static bool update_numeric_promo(int8_t ct, int8_t et) {
@@ -16950,9 +17028,14 @@ ray_t* ray_update(ray_t** args, int64_t n) {
         ray_t** upd_cols = (ray_t**)(upd_names + upd_slots);
         uint8_t* upd_used = (uint8_t*)(upd_cols + upd_slots);
 
+        ray_t* prepared_expr = NULL;
+        query_dependency_cache_t dependencies = {0};
         #define UPDATE_BY_CLEANUP_COLS() do {                                      \
             for (int64_t _ui = 0; _ui < n_updates; _ui++)                          \
                 if (upd_cols[_ui]) ray_release(upd_cols[_ui]);                     \
+            if (prepared_expr) { ray_release(prepared_expr); prepared_expr = NULL; } \
+            for (int _di = 0; _di < dependencies.n; _di++) ray_release(dependencies.exprs[_di]); \
+            dependencies.n = 0;                                                   \
             scratch_free(upd_hdr);                                                 \
         } while (0)
 
@@ -16962,6 +17045,18 @@ ray_t* ray_update(ray_t** args, int64_t n) {
             int64_t kid = dict_elems[d]->i64;
             if (kid == from_id || kid == where_id || kid == by_id) continue;
             ray_t* agg_expr = dict_elems[d + 1];
+            /* Pure helpers can be expanded once for every group's identical
+             * schema. Keep effectful expressions on the per-group path. */
+            bool expand = query_expr_has_helper(agg_expr);
+            if (expand) {
+                ray_t* candidate = query_inline_helpers(agg_expr, tbl);
+                if (query_inline_pure(candidate, 0, true)) {
+                    prepared_expr = candidate;
+                    agg_expr = candidate;
+                    expand = false;
+                } else ray_release(candidate);
+            }
+            bool cache_dependencies = !expand && query_inline_pure(agg_expr, 0, true);
 
             /* We need to evaluate the aggregate per group.
              * Build the result column by evaluating the expression on each group's subset. */
@@ -17034,7 +17129,13 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                  * eval-level fallback with the group's columns bound (an
                  * aggregate the DAG declines, e.g. over temporal + - *,
                  * used to fail here with "failed to compile"). */
-                ray_t* agg_result = update_eval_on(sub_tbl, agg_expr);
+                query_dependency_cache_t* prev_dependencies = g_query_dependencies;
+                if (cache_dependencies) {
+                    dependencies.table = sub_tbl;
+                    g_query_dependencies = &dependencies;
+                }
+                ray_t* agg_result = update_eval_on_impl(sub_tbl, agg_expr, expand);
+                g_query_dependencies = prev_dependencies;
                 ray_release(sub_tbl);
 
                 if (RAY_IS_ERR(agg_result)) { ray_release(out_col); UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return agg_result; }
@@ -17116,6 +17217,9 @@ ray_t* ray_update(ray_t** args, int64_t n) {
             upd_names[upd_i] = kid;
             upd_cols[upd_i] = out_col;
             upd_i++;
+            if (prepared_expr) { ray_release(prepared_expr); prepared_expr = NULL; }
+            for (int di = 0; di < dependencies.n; di++) ray_release(dependencies.exprs[di]);
+            dependencies.n = 0;
         }
 
         /* Build result in schema order: replace existing targets in place, then

@@ -1,0 +1,20 @@
+(set T (table [x k s] (list [1 2 3 4 5] [0 0 1 1 2] ['a 'b 'c 'd 'e])))
+(set L ['u 'v])
+;; Fallback count keeps its position beside a native aggregate.
+(key (select {c: (count L) m: (sum x) by: k from: T})) -- ['k 'c 'm]
+(key (select {m: (sum x) c: (count L) by: k from: T})) -- ['k 'm 'c]
+(at (select {c: (count L) m: (sum x) by: k from: T asc: k}) 'c) -- [2 2 2]
+;; Multi-key/top-N count must count the constant collection, not group rows.
+(at (select {c: (count L) by: [k s] take: 2 from: T}) 'c) -- [2 2]
+;; An in-place update's fallback WHERE binds the query's source columns.
+(update {x: 0 from: 'T where: (in (concat (as 'SYM x) "!") ['1! '3!])})
+(at T 'x) -- [0 2 0 4 5]
+;; Uncompiled column-derived text operands retain row-wise projection scope.
+(set T3 (table [x s ss] (list [1 2 3] ['a 'b 'c] (list "p" "q" "r"))))
+(at (select {v: (concat ss (reverse ss)) from: T3}) 'v) -- ["pp" "qq" "rr"]
+(at (select {v: (concat ss (asc ss)) from: T3}) 'v) -- ["pp" "qq" "rr"]
+(at (select {v: (concat s (as 'STR x)) from: T3}) 'v) -- ['a1 'b2 'c3]
+(select {v: (concat s (at s [2 1 0])) from: T3}) !- type
+;; Updates evaluate these same operations over complete group columns.
+(at (update {v: (concat ss (reverse ss)) from: T3}) 'v) -- ["pr" "qq" "rp"]
+(at (update {v: (concat s (at s [2 1 0])) from: T3}) 'v) -- ['ac 'bb 'ca]
