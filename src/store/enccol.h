@@ -209,7 +209,8 @@ int    ray_enccol_test_decode_body(int8_t type, uint8_t attrs, uint32_t sym_boun
                                    uint64_t avail, int vlen, bool fast, int8_t wide, void* out);
 /* One top-level DICT vector body of a column of `type` whose VALUE_DICT
  * holds dict[0, n_dict) (T-bit patterns), the entry `trim` bytes short;
- * otherwise as ray_enccol_test_decode_body at the generation-0 width. */
+ * otherwise as ray_enccol_test_decode_body at the generation-0 width (fast:
+ * the dictionary validated first, as a column's first decode leaves it). */
 int    ray_enccol_test_decode_dict(int8_t type, const uint64_t* dict, uint32_t n_dict, int trim,
                                    int n_nulls, const uint8_t* bm, const uint8_t* body, uint64_t avail,
                                    int vlen, bool fast, void* out);

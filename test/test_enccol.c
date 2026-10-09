@@ -942,6 +942,158 @@ static test_result_t test_point_read_equal(void) {
     PASS();
 }
 
+static test_result_t decode_expect_corrupt(ray_enccol_t* e, int64_t vec, const char* what);
+
+/* The fast DICT kernel against the reference decode of one body: the same
+ * bytes, nothing written past the vector. */
+static test_result_t dict_kernel_case(int8_t type, const uint64_t* dv, uint32_t nd, const uint8_t* body,
+                                      uint64_t len, int n, int n_nulls, const uint8_t* bm, const char* what) {
+    static _Alignas(8) uint8_t ref[RAY_ENC_VEC * 8 + 8], fast[RAY_ENC_VEC * 8 + 8];   /* the kernel's alignment */
+    memset(ref, 0xA5, sizeof ref); memset(fast, 0x5A, sizeof fast);
+    int rr = ray_enccol_test_decode_dict(type, dv, nd, 0, n_nulls, bm, body, len, n, false, ref);
+    int fr = ray_enccol_test_decode_dict(type, dv, nd, 0, n_nulls, bm, body, len, n, true, fast);
+    TEST_ASSERT_FMT(rr == 1, "%s: reference %d", what, rr);
+    TEST_ASSERT_FMT(fr == 1, "%s: fast kernel %d", what, fr);
+    size_t esz = ray_sym_elem_size(type, 0);
+    TEST_ASSERT_FMT(memcmp(ref, fast, (size_t)n * esz) == 0, "%s: fast differs", what);
+    TEST_ASSERT_FMT(fast[(size_t)n * esz] == 0x5A, "%s: wrote past the vector", what);
+    PASS();
+}
+
+/* The DICT kernel: code widths 0..16, dictionaries of 1, 2, 255, 256 and
+ * 65535 values, full and partial vectors, with and without nulls. */
+static test_result_t test_dict_kernel_equal(void) {
+    static const int8_t dtypes[] = { RAY_I16, RAY_I32, RAY_I64, RAY_DATE, RAY_TIME, RAY_TIMESTAMP };
+    static const uint32_t sizes[] = { 1, 2, 255, 256, 65535 };
+    static const int lens[] = { 1024, 1000, 77, 1 };
+    static uint64_t u[RAY_ENC_VEC], dv[65536], bodyw[RAY_ENC_VEC / 2 + 4];
+    static uint8_t bm[RAY_ENC_VEC / 8];
+    char what[160];
+    g_seed = 0x13b2;
+    for (size_t ti = 0; ti < sizeof dtypes / sizeof dtypes[0]; ti++) {
+        ray_enc_kind_t k; TEST_ASSERT_TRUE(ray_enc_kind_of(dtypes[ti], 0, &k));
+        for (size_t si = 0; si < sizeof sizes / sizeof sizes[0]; si++) {
+            uint32_t nd = sizes[si];
+            dict_values(dv, nd, k);
+            for (int w = 0; w <= 16; w++)
+                for (size_t li = 0; li < sizeof lens / sizeof lens[0]; li++) {
+                    int n = lens[li];
+                    uint64_t span = 1ull << w, base = nd >= span ? rng() % (nd - span + 1) : 0;
+                    uint64_t lim = nd >= span ? span : nd;
+                    memset(u, 0, sizeof u);
+                    for (int i = 0; i < n; i++) u[i] = rng() % lim;
+                    u[0] = 0; u[n - 1] = lim - 1;
+                    uint64_t len = dict_body((uint8_t*)bodyw, u, w, base);
+                    snprintf(what, sizeof what, "DICT type %d dict %u w %d n %d", dtypes[ti], nd, w, n);
+                    test_result_t r = dict_kernel_case(dtypes[ti], dv, nd, (const uint8_t*)bodyw, len, n, 0, NULL, what);
+                    if (r.status != TEST_PASS) return r;
+                    /* nulls in the bitmap fold in (any code underneath) */
+                    memset(bm, 0, sizeof bm);
+                    int nn = 0;
+                    for (int i = 0; i < n; i += 11) { bm[i >> 3] |= (uint8_t)(1u << (i & 7)); nn++; }
+                    snprintf(what, sizeof what, "DICT nulls type %d dict %u w %d n %d", dtypes[ti], nd, w, n);
+                    if ((r = dict_kernel_case(dtypes[ti], dv, nd, (const uint8_t*)bodyw, len, n, nn, bm, what)).status != TEST_PASS)
+                        return r;
+                }
+        }
+    }
+    PASS();
+}
+
+/* Every check of the reference DICT path stands in the kernel: a code at
+ * the dictionary size, a child header or size off, a RAW code child, a
+ * dictionary value on the sentinel outside the bitmap, a dictionary entry
+ * one byte short.  The kernel declines (the reference reports or decodes
+ * it); through a file, the code outside the dictionary is `corrupt` on
+ * every read. */
+static test_result_t test_dict_kernel_rejects(void) {
+    static uint64_t u[RAY_ENC_VEC], bodyw[RAY_ENC_VEC / 2 + 4];
+    static _Alignas(8) uint8_t out[RAY_ENC_VEC * 8];
+    static const uint64_t dv3[3] = { 10, 20, 30 };
+    const uint8_t* body = (const uint8_t*)bodyw;
+    for (int i = 0; i < RAY_ENC_VEC; i++) u[i] = (uint64_t)(i % 3);
+    uint64_t len = dict_body((uint8_t*)bodyw, u, 2, 0);
+    TEST_ASSERT_EQ_I(ray_enccol_test_decode_dict(RAY_I64, dv3, 3, 0, 0, NULL, body, len, RAY_ENC_VEC, true, out), 1);
+    /* the dictionary's entry one byte short: the kernel declines, the reference reports it */
+    TEST_ASSERT_EQ_I(ray_enccol_test_decode_dict(RAY_I64, dv3, 3, 1, 0, NULL, body, len, RAY_ENC_VEC, true, out), 0);
+    TEST_ASSERT_EQ_I(ray_enccol_test_decode_dict(RAY_I64, dv3, 3, 1, 0, NULL, body, len, RAY_ENC_VEC, false, out), -1);
+    /* a code at the dictionary size, in the last row of a partial vector */
+    u[76] = 3;
+    len = dict_body((uint8_t*)bodyw, u, 2, 0);
+    TEST_ASSERT_EQ_I(ray_enccol_test_decode_dict(RAY_I64, dv3, 3, 0, 0, NULL, body, len, 77, true, out), 0);
+    TEST_ASSERT_EQ_I(ray_enccol_test_decode_dict(RAY_I64, dv3, 3, 0, 0, NULL, body, len, 77, false, out), -1);
+    TEST_ASSERT_EQ_I(ray_enccol_test_decode_dict(RAY_I64, dv3, 3, 0, 0, NULL, body, len, 76, true, out), 1);   /* past the vector: unread */
+    /* under a null row too: every code is checked */
+    {
+        static uint8_t bm[RAY_ENC_VEC / 8];
+        memset(bm, 0, sizeof bm); bm[76 >> 3] |= (uint8_t)(1u << (76 & 7));
+        TEST_ASSERT_EQ_I(ray_enccol_test_decode_dict(RAY_I64, dv3, 3, 0, 1, bm, body, len, 77, true, out), 0);
+        TEST_ASSERT_EQ_I(ray_enccol_test_decode_dict(RAY_I64, dv3, 3, 0, 1, bm, body, len, 77, false, out), -1);
+    }
+    u[76] = 76 % 3;
+    /* a child base above 32 bits, a reserved byte, a body one word short, one word long */
+    len = dict_body((uint8_t*)bodyw, u, 2, 1ull << 32);
+    TEST_ASSERT_EQ_I(ray_enccol_test_decode_dict(RAY_I64, dv3, 3, 0, 0, NULL, body, len, RAY_ENC_VEC, true, out), 0);
+    TEST_ASSERT_EQ_I(ray_enccol_test_decode_dict(RAY_I64, dv3, 3, 0, 0, NULL, body, len, RAY_ENC_VEC, false, out), -1);
+    len = dict_body((uint8_t*)bodyw, u, 2, 0);
+    ((uint8_t*)bodyw)[3] = 1;
+    TEST_ASSERT_EQ_I(ray_enccol_test_decode_dict(RAY_I64, dv3, 3, 0, 0, NULL, body, len, RAY_ENC_VEC, true, out), 0);
+    TEST_ASSERT_EQ_I(ray_enccol_test_decode_dict(RAY_I64, dv3, 3, 0, 0, NULL, body, len, RAY_ENC_VEC, false, out), -1);
+    ((uint8_t*)bodyw)[3] = 0;
+    TEST_ASSERT_EQ_I(ray_enccol_test_decode_dict(RAY_I64, dv3, 3, 0, 0, NULL, body, len - 8, RAY_ENC_VEC, true, out), 0);
+    TEST_ASSERT_EQ_I(ray_enccol_test_decode_dict(RAY_I64, dv3, 3, 0, 0, NULL, body, len - 8, RAY_ENC_VEC, false, out), -1);
+    TEST_ASSERT_EQ_I(ray_enccol_test_decode_dict(RAY_I64, dv3, 3, 0, 0, NULL, body, len + 8, RAY_ENC_VEC, true, out), 0);
+    TEST_ASSERT_EQ_I(ray_enccol_test_decode_dict(RAY_I64, dv3, 3, 0, 0, NULL, body, len + 8, RAY_ENC_VEC, false, out), -1);
+    /* a dictionary value on the sentinel, no bitmap: corrupt; in the bitmap: a null */
+    static const uint64_t dvs[3] = { 0x8000000000000000ull, 20, 30 };
+    TEST_ASSERT_EQ_I(ray_enccol_test_decode_dict(RAY_I64, dvs, 3, 0, 0, NULL, body, len, RAY_ENC_VEC, true, out), 0);
+    TEST_ASSERT_EQ_I(ray_enccol_test_decode_dict(RAY_I64, dvs, 3, 0, 0, NULL, body, len, RAY_ENC_VEC, false, out), -1);
+    {
+        static uint8_t bm[RAY_ENC_VEC / 8];
+        memset(bm, 0, sizeof bm);
+        int nn = 0;
+        for (int i = 0; i < RAY_ENC_VEC; i += 3) { bm[i >> 3] |= (uint8_t)(1u << (i & 7)); nn++; }
+        TEST_ASSERT_EQ_I(ray_enccol_test_decode_dict(RAY_I64, dvs, 3, 0, nn, bm, body, len, RAY_ENC_VEC, false, out), 1);
+        TEST_ASSERT_EQ_I(ray_enccol_test_decode_dict(RAY_I64, dvs, 3, 0, nn, bm, body, len, RAY_ENC_VEC, true, out), 1);
+        TEST_ASSERT_TRUE(((int64_t*)out)[0] == NULL_I64 && ((int64_t*)out)[1] == 20);
+    }
+    /* a RAW code child decodes by the reference path only */
+    {
+        uint8_t* p = (uint8_t*)bodyw;
+        memset(p, 0, 8 + RAY_ENC_VEC * 4);
+        uint32_t bb = RAY_ENC_VEC * 4;
+        p[0] = RAY_ENC_RAW; memcpy(p + 4, &bb, 4);
+        for (int i = 0; i < RAY_ENC_VEC; i++) { uint32_t c = (uint32_t)(i % 3); memcpy(p + 8 + 4 * i, &c, 4); }
+        TEST_ASSERT_EQ_I(ray_enccol_test_decode_dict(RAY_I64, dv3, 3, 0, 0, NULL, p, 8 + bb, RAY_ENC_VEC, true, out), 0);
+        TEST_ASSERT_EQ_I(ray_enccol_test_decode_dict(RAY_I64, dv3, 3, 0, 0, NULL, p, 8 + bb, RAY_ENC_VEC, false, out), 1);
+    }
+    /* through a file: patch the code child's base so that codes reach the
+     * dictionary size; corrupt on the first read and on the second */
+    static const int64_t vals[4] = { 11, 900000000001ll, 77, 123456789012345ll };
+    ray_t* v = ray_vec_new(RAY_I64, 1024); v->len = 1024;
+    for (int i = 0; i < 1024; i++) ((int64_t*)ray_data(v))[i] = vals[(uint32_t)((uint32_t)i * 2654435761u) >> 30];
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(ENCCOL_TMP "/dk"), 2), RAY_OK);
+    ray_release(v);
+    ray_t* c = ray_col_mmap(ray_test_tmp(ENCCOL_TMP "/dk"));
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+    ray_enccol_t* e = ray_enccol_of(c);
+    ray_enc_desc_t d0; memcpy(&d0, e->base + 160, 48);
+    TEST_ASSERT_EQ_I(d0.encoding, RAY_ENC_DICT);
+    TEST_ASSERT_EQ_I(e->base[160 + d0.payload_off], RAY_ENC_FOR_BP);   /* the code child */
+    TEST_ASSERT_EQ_I(e->base[160 + d0.payload_off + 1], 2);
+    ray_release(c);
+    uint64_t one = 1;
+    patch(ray_test_tmp(ENCCOL_TMP "/dk"), 160 + (long)d0.payload_off + 8, &one, 8);
+    c = ray_col_mmap(ray_test_tmp(ENCCOL_TMP "/dk"));
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+    for (int read = 0; read < 2; read++) {
+        test_result_t r = decode_expect_corrupt(ray_enccol_of(c), 0, read ? "second read" : "first read");
+        if (r.status != TEST_PASS) { ray_release(c); return r; }
+    }
+    ray_release(c);
+    PASS();
+}
+
 /* A point read never serves a row the decode would refuse: on nulls, the
  * sentinel, any other codec, and every corruption it reads, it declines. */
 static test_result_t test_point_read_declines(void) {
@@ -2401,6 +2553,8 @@ const test_entry_t enccol_entries[] = {
     { "enccol/dict_once_concurrent",   test_dict_once_concurrent,   enccol_setup, enccol_teardown },
     { "enccol/fast_kernel_equal",      test_fast_kernel_equal,      enccol_setup, enccol_teardown },
     { "enccol/point_read_equal",       test_point_read_equal,       enccol_setup, enccol_teardown },
+    { "enccol/dict_kernel_equal",      test_dict_kernel_equal,      enccol_setup, enccol_teardown },
+    { "enccol/dict_kernel_rejects",    test_dict_kernel_rejects,    enccol_setup, enccol_teardown },
     { "enccol/point_read_declines",    test_point_read_declines,    enccol_setup, enccol_teardown },
     { "enccol/point_read_column",      test_point_read_column,      enccol_setup, enccol_teardown },
     { "enccol/desc_validated_once",    test_desc_validated_once,    enccol_setup, enccol_teardown },

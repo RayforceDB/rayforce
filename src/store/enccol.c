@@ -553,7 +553,18 @@ bad:
     return NULL;
 }
 
+/* The validated dictionary once published, else false (never validates):
+ * read without the once-state's lock, as the DONE store releases the slot
+ * it publishes (ray_enccol_decoded_peek relies on the same). */
+static bool enc_dict_ready(const ray_enccol_t* e, ray_enc_dict_t* out) {
+    if (atomic_load_explicit(&e->dict_once.state, memory_order_acquire) != RAY_ENC_ONCE_DONE) return false;
+    out->v = (const uint64_t*)ray_data(e->dict);
+    out->n = (uint32_t)e->dict->len;
+    return true;
+}
+
 static ray_t* enc_dict(ray_enccol_t* e, ray_enc_dict_t* out) {
+    if (enc_dict_ready(e, out)) return NULL;      /* every vector decode of a DICT column asks */
     ray_t* d = ray_enc_once_get(&e->dict_once, &e->dict, enc_dict_validate, e);
     if (RAY_IS_ERR(d)) return d;
     out->v = (const uint64_t*)ray_data(d);
@@ -909,16 +920,80 @@ static bool fk_int_type(int8_t t) {
     return t != RAY_F32 && t != RAY_F64 && t != RAY_GUID && t != RAY_STR;
 }
 
+/* Nulls of a signed kind after a fast decode at the generation-0 width,
+ * without a widening kernel's flag: no bitmap, a sentinel scan (can_hit:
+ * one is possible); with one, the merge.  1 sound, 0 declined. */
+static int fk_nulls_native(const ray_enc_desc_t* d, int T, int vlen, const uint8_t* bm, bool can_hit, void* out) {
+    if (d->n_nulls && !bm) return 0;
+    bool bad;
+    if (!d->n_nulls) {
+        if (!can_hit) return 1;
+        switch (T) {
+        case 16: bad = fk_scan16((const int16_t*)out, vlen, NULL_I16); break;
+        case 32: bad = fk_scan32((const int32_t*)out, vlen, NULL_I32); break;
+        default: bad = fk_scan64((const int64_t*)out, vlen, NULL_I64); break;
+        }
+        return bad ? 0 : 1;
+    }
+    switch (T) {
+    case 16: bad = fk_merge16((int16_t*)out, vlen, bm, NULL_I16, NULL_I16); break;
+    case 32: bad = fk_merge32((int32_t*)out, vlen, bm, NULL_I32, NULL_I32); break;
+    default: bad = fk_merge64((int64_t*)out, vlen, bm, NULL_I64, NULL_I64); break;
+    }
+    return bad ? 0 : 1;
+}
+
+/* DICT over a U32 FOR_BP code child, at the generation-0 width: the codes
+ * unpacked by the lane kernel, checked below the dictionary size in one
+ * or-reduce, gathered from the validated dictionary, then the nulls as the
+ * FOR_BP path checks them.  It accepts exactly what dec_ints accepts and
+ * declines on anything else (a RAW or RLE code child, a child header or
+ * size off, a dictionary not yet validated, a code outside it, a
+ * sentinel), so the reference path decodes or reports the vector (and
+ * runs the dictionary's one validation, with its errors). */
+static int dec_fast_dict(ray_enccol_t* e, const ray_enc_desc_t* d, int vlen, const uint8_t* body,
+                         uint64_t avail, const uint8_t* bm, ray_enc_kind_t k, void* out) {
+    if (d->width || !k.is_signed || avail < 16 || body[0] != RAY_ENC_FOR_BP) return 0;
+    const int w = body[1];
+    uint16_t rsv; memcpy(&rsv, body + 2, 2);
+    uint32_t bb; memcpy(&bb, body + 4, 4);
+    if (rsv || w > 32 || (uint64_t)bb + 8 != avail || bb != (uint64_t)ray_enc_size_for(w)) return 0;
+    uint64_t base; memcpy(&base, body + 8, 8);
+    if (base >> 32) return 0;
+    ray_enc_dict_t dict;
+    if (!enc_dict_ready(e, &dict)) return 0;                 /* validation and its errors: the reference path */
+    _Alignas(64) uint32_t codes[RAY_ENC_VEC];
+    (void)fk_for32((const uint32_t*)(body + 16), w, (uint32_t)base, codes, vlen, 0);
+    const uint32_t lim = dict.n - 1;                         /* a validated dictionary is not empty */
+    uint32_t bad = 0;
+    for (int i = 0; i < vlen; i++) bad |= (uint32_t)-(uint32_t)(codes[i] > lim);
+    if (bad) return 0;
+    const uint64_t* dv = dict.v;
+    switch (k.T) {
+    case 16: { uint16_t* o = out; for (int i = 0; i < vlen; i++) o[i] = (uint16_t)dv[codes[i]]; break; }
+    case 32: { uint32_t* o = out; for (int i = 0; i < vlen; i++) o[i] = (uint32_t)dv[codes[i]]; break; }
+    case 64: { uint64_t* o = out; for (int i = 0; i < vlen; i++) o[i] = dv[codes[i]]; break; }
+    default: return 0;
+    }
+    return fk_nulls_native(d, k.T, vlen, bm, true, out);
+}
+
 /* Decode a FOR_BP / DELTA_BP vector body of e's type into out: `wide` 0 at
  * the generation-0 width, RAY_I64 / RAY_F64 widened with nulls as NULL_I64 /
- * NULL_F64 (narrow non-SYM types only).  1 decoded, 0 declined (out may be
- * partly written). */
-static int dec_fast(const ray_enccol_t* e, const ray_enc_desc_t* d, int vlen,
+ * NULL_F64 (narrow non-SYM types only).  DICT over a FOR_BP code child at
+ * the generation-0 width (dec_fast_dict).  1 decoded, 0 declined (out may
+ * be partly written). */
+static int dec_fast(ray_enccol_t* e, const ray_enc_desc_t* d, int vlen,
                     const uint8_t* body, uint64_t avail, const uint8_t* bm, int8_t wide, void* out) {
     const uint8_t enc = d->encoding;
-    if (enc != RAY_ENC_FOR_BP && enc != RAY_ENC_DELTA_BP) return 0;
+    if (enc != RAY_ENC_FOR_BP && enc != RAY_ENC_DELTA_BP && enc != RAY_ENC_DICT) return 0;
     ray_enc_kind_t k;
     if (!fk_int_type(e->type) || !ray_enc_kind_of(e->type, e->attrs, &k)) return 0;
+    if (enc == RAY_ENC_DICT) {
+        if (wide || e->type == RAY_SYM || vlen < 1 || vlen > RAY_ENC_VEC) return 0;
+        if (((uintptr_t)body & 7) || ((uintptr_t)out & ((size_t)k.T / 8 - 1))) return 0;
+        return dec_fast_dict(e, d, vlen, body, avail, bm, k, out);
+    }
     const int T = k.T, w = d->width, L = RAY_ENC_VEC / T;
     const bool sym = e->type == RAY_SYM, delta = enc == RAY_ENC_DELTA_BP;
     if (wide && (sym || T == 64)) return 0;
@@ -986,26 +1061,14 @@ static int dec_fast(const ray_enccol_t* e, const ray_enc_desc_t* d, int vlen,
         return ok ? 1 : 0;
     }
     if (!k.is_signed) return 1;                                      /* BOOL, U8: no nulls */
+    if (!wt) return fk_nulls_native(d, T, vlen, bm, can_hit, out);
     if (d->n_nulls && !bm) return 0;
-    if (!d->n_nulls) {                                               /* a sentinel outside the (absent) bitmap */
-        if (wt || !can_hit) return hit ? 0 : 1;                      /* flagged by the widening kernel, or impossible */
-        switch (T) {
-        case 16: hit = fk_scan16((const int16_t*)out, vlen, NULL_I16); break;
-        case 32: hit = fk_scan32((const int32_t*)out, vlen, NULL_I32); break;
-        default: hit = fk_scan64((const int64_t*)out, vlen, NULL_I64); break;
-        }
-        return hit ? 0 : 1;
-    }
+    if (!d->n_nulls) return hit ? 0 : 1;                             /* flagged by the widening kernel, or impossible */
     bool bad;
     if (wt == RAY_F64)
         bad = fk_mergef((double*)out, vlen, bm, T == 16 ? (double)NULL_I16 : (double)NULL_I32, NULL_F64);
-    else if (wt == RAY_I64)
+    else
         bad = fk_merge64((int64_t*)out, vlen, bm, T == 16 ? (int64_t)NULL_I16 : (int64_t)NULL_I32, NULL_I64);
-    else switch (T) {
-        case 16: bad = fk_merge16((int16_t*)out, vlen, bm, NULL_I16, NULL_I16); break;
-        case 32: bad = fk_merge32((int32_t*)out, vlen, bm, NULL_I32, NULL_I32); break;
-        default: bad = fk_merge64((int64_t*)out, vlen, bm, NULL_I64, NULL_I64); break;
-    }
     return bad ? 0 : 1;
 }
 
@@ -1294,6 +1357,11 @@ int ray_enccol_test_decode_dict(int8_t type, const uint64_t* dict, uint32_t n_di
                                 int vlen, bool fast, void* out) {
     ray_enccol_t* e = test_col(type, 0, 0, dict, n_dict, trim);
     if (!e) return -1;
+    if (fast) {                                   /* the kernel reads a published dictionary only */
+        ray_enc_dict_t dd;
+        ray_t* err = enc_dict(e, &dd);
+        if (err) ray_error_free(err);
+    }
     int r = test_decode(e, RAY_ENC_DICT, 0, n_nulls, bm, body, avail, vlen, fast, 0, out);
     test_col_free(e);
     return r;
