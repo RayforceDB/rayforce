@@ -1,0 +1,55 @@
+(set T (table [x s] (list [1 2 3] ['a 'b 'c])))
+(set TS (table [x s suffix] (list [1 2 3] ['a 'b 'c] ['p 'q 'r])))
+;; A helper called from a query fallback runs as bytecode: return, lazy
+;; arguments read twice, deep recursion and error locations behave as they
+;; do outside a query.
+(set h (fn [v] (return (* v 2)) 0))
+(at (select {v: (h x) from: T}) 'v) -- [2 4 6]
+(at (update {v: (h x) from: T}) 'v) -- [2 4 6]
+(at (select {from: T where: (in (h x) [2 6])}) 'x) -- [1 3]
+(set hloop (fn [v] (let i 0) (while (< i 10) (let i (+ i 1)) (if (== i 4) (return (+ v i)))) -1))
+(at (select {v: (hloop x) from: T}) 'v) -- [5 6 7]
+(set d (fn [v] 1 (+ v v)))
+(at (select {r: (d (sum x)) from: T}) 'r) -- [12]
+(at (update {r: (d (max x)) from: T}) 'r) -- [6 6 6]
+(at (select {r: ((fn [v] 1 (if (> v 0) v 0)) (first x)) from: T}) 'r) -- [1]
+(set rd (fn [n] (if (== n 0) 0 (+ 1 (self (- n 1))))))
+(at (select {v: (+ x (rd 100)) from: T}) 'v) -- [101 102 103]
+(set bad (fn [v] 1 (+ v 's)))
+(select {v: (bad x) from: T}) !- type
+;; Row provenance follows values through locals, nested calls and results:
+;; a column argument keeps text concat, a bound vector stays a collection.
+(set hlet (fn [v] (let w (upper v)) (concat w "!")))
+(at (update {r: (hlet s) from: T}) 'r) -- ['A! 'B! 'C!]
+(at (select {from: T where: (in (hlet s) ['A! 'C!])}) 'x) -- [1 3]
+(at (select {n: (count (hlet s)) by: x from: T asc: x}) 'n) -- [1 1 1]
+(set hnest (fn [a b c] 1 (concat a (concat b c))))
+(at (update {r: (hnest s "!" "?") from: T}) 'r) -- ['a!? 'b!? 'c!?]
+(set sub1 (fn [v] 1 (concat v "!")))
+(set hsub (fn [v] 1 (sub1 (substr v 0 1))))
+(at (update {r: (hsub s) from: T}) 'r) -- ['a! 'b! 'c!]
+(set mb (fn [v] 1 (concat v 'zz)))
+(at (select {n: (+ (count (mb s)) (count (distinct x))) by: x from: T asc: x}) 'n) -- [2 2 2]
+(set L ['u 'v])
+(set mbtwo (fn [a b] 1 (concat a b)))
+(update {v: (mbtwo s L) from: T}) !- length
+;; A free name that is a source column is the row's cell, with provenance,
+;; exactly as the single-statement form the planner inlines; an output
+;; alias never captures it, and a missing global stays an error.
+(set hcol (fn [v] 1 (concat v s)))
+(at (select {v: (hcol s) from: T}) 'v) -- ['aa 'bb 'cc]
+(at (select {v: ((fn [v] (concat v s)) s) from: T}) 'v) -- ['aa 'bb 'cc]
+(at (select {from: T where: (in (hcol s) ['aa 'cc])}) 'x) -- [1 3]
+(set hclo (fn [v] 1 ((fn [w] (concat w s)) v)))
+(at (select {v: (hclo s) from: T}) 'v) -- ['aa 'bb 'cc]
+(set suffix "!")
+(set mbg (fn [v] 1 (concat v suffix)))
+(at (select {v: (mbg s) from: TS}) 'v) -- ['ap 'bq 'cr]
+(at (select {suffix: (upper s) e: (reverse x) v: (mbg s) from: TS}) 'v) -- ['ap 'bq 'cr]
+(at (select {suffix: (upper s) e: (reverse x) v: (mbg s) from: T}) 'v) -- ['a! 'b! 'c!]
+(set ha (fn [v] 1 (concat v aa)))
+(select {aa: (upper s) e: (reverse x) v: (ha s) from: T}) !- name
+;; Outside a query nothing changes.
+(mb ['a 'b]) -- ['a 'b 'zz]
+(h 5) -- 10
+(hcol 'q) !- name

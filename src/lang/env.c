@@ -314,7 +314,26 @@ void ray_env_destroy(void) {
 /* Flat (non-dotted) lookup — scope stack top-down, then global env.
  * Returns NULL if not bound.  Always used as the head-segment resolver
  * for dotted paths, and as the fast path for plain names. */
-static ray_t* env_lookup_flat(int64_t sym_id) {
+static ray_err_t env_frame_bind(ray_scope_frame_t* f, int64_t sym_id, ray_t* val);
+ray_t* ray_query_helper_value(int64_t sym);   /* ops/query.c */
+
+/* A lookup that reaches a query helper's call frame: a free name that is
+ * a source column binds, on first use, to what the query's own expressions
+ * see for it (the column, or the current row's cell); the frame owns that
+ * binding for the call.  Any other name falls through to the globals. */
+static ray_t* env_call_frame_value(ray_scope_frame_t* f, int64_t sym_id) {
+    if (!f->table) return NULL;
+    ray_t* v = ray_query_helper_value(sym_id);
+    if (!v) return NULL;
+    if (RAY_IS_ERR(v)) { ray_error_free(v); return NULL; }
+    ray_err_t err = env_frame_bind(f, sym_id, v);
+    ray_release(v);
+    return err == RAY_OK ? f->vals[f->count - 1] : NULL;
+}
+
+/* `rows`, when given, is set when the value is a query source column (or
+ * its cell) read through a helper's call frame. */
+static ray_t* env_lookup_flat_rows(int64_t sym_id, uint8_t* rows) {
     /* FFI/embedding callers reach this on threads that never bound a VM
      * (cf. ray_env_get_local, already guarded). Such a thread has no
      * local scopes; global bindings must still resolve. */
@@ -324,13 +343,21 @@ static ray_t* env_lookup_flat(int64_t sym_id) {
             for (int32_t i = 0; i < f->count; i++) {
                 if (f->keys[i] == sym_id) return f->vals[i];
             }
-            if (f->kind == RAY_SCOPE_CALL) break;
+            if (f->kind == RAY_SCOPE_CALL) {
+                ray_t* v = env_call_frame_value(f, sym_id);
+                if (v) { if (rows) *rows = 1; return v; }
+                break;
+            }
         }
     }
     for (int32_t i = 0; i < g_env.count; i++) {
         if (g_env.keys[i] == sym_id) return g_env.vals[i];
     }
     return NULL;
+}
+
+static ray_t* env_lookup_flat(int64_t sym_id) {
+    return env_lookup_flat_rows(sym_id, NULL);
 }
 
 ray_t* ray_env_get_local(int64_t sym_id) {
@@ -381,11 +408,16 @@ ray_t* ray_env_get(int64_t sym_id) {
  * fresh result.  Those fresh allocations are exactly why this function
  * has a different retain contract from ray_env_get. */
 ray_t* ray_env_resolve(int64_t sym_id) {
+    return ray_env_resolve_rows(sym_id, NULL);
+}
+
+ray_t* ray_env_resolve_rows(int64_t sym_id, uint8_t* rows) {
+    if (rows) *rows = 0;
     /* Flat lookup first — short-circuits dotted reserved builtins
      * (`.sys.gc`, `.os.getenv`, …) that are additionally bound flat
      * alongside their namespace dict.  Non-dotted names take the
      * same path. */
-    ray_t* flat = env_lookup_flat(sym_id);
+    ray_t* flat = env_lookup_flat_rows(sym_id, rows);
     if (flat) { ray_retain(flat); return flat; }
     if (!ray_sym_is_dotted(sym_id)) return NULL;
 
@@ -396,7 +428,7 @@ ray_t* ray_env_resolve(int64_t sym_id) {
     /* `v` is either a borrowed env/container pointer (fresh=false) or a
      * fresh temporal-extract result (fresh=true).  When switching between
      * the two we must release the previous fresh value to avoid leaks. */
-    ray_t* v = env_lookup_flat(segs[0]);
+    ray_t* v = env_lookup_flat_rows(segs[0], rows);
     bool   fresh = false;
 
     for (int i = 1; v && i < n; i++) {
@@ -540,8 +572,7 @@ static ray_err_t env_bind_global_user(int64_t sym_id, ray_t* val) {
     return env_bind_global_impl(sym_id, val, 1);
 }
 
-static ray_err_t env_bind_local(int64_t sym_id, ray_t* val) {
-    ray_scope_frame_t* f = &__VM->scope_stack[__VM->scope_depth - 1];
+static ray_err_t env_frame_bind(ray_scope_frame_t* f, int64_t sym_id, ray_t* val) {
     for (int32_t i = 0; i < f->count; i++) {
         if (f->keys[i] == sym_id) {
             if (val == NULL) {
@@ -582,6 +613,10 @@ static ray_err_t env_bind_local(int64_t sym_id, ray_t* val) {
     f->vals[f->count] = val;
     f->count++;
     return RAY_OK;
+}
+
+static ray_err_t env_bind_local(int64_t sym_id, ray_t* val) {
+    return env_frame_bind(&__VM->scope_stack[__VM->scope_depth - 1], sym_id, val);
 }
 
 /* Dotted-path write.  base_lookup(head_sym) returns the current binding in
@@ -760,9 +795,18 @@ static ray_err_t env_push_scope(uint8_t kind) {
     f->cap = RAY_FRAME_CAP;
     f->count = 0;
     f->kind = kind;
+    f->table = NULL;
     __VM->scope_depth++;
     return RAY_OK;
 }
+
+ray_err_t ray_env_push_call_scope(ray_t* table) {
+    ray_err_t err = env_push_scope(RAY_SCOPE_CALL);
+    if (err != RAY_OK) return err;
+    __VM->scope_stack[__VM->scope_depth - 1].table = table;
+    return RAY_OK;
+}
+
 
 ray_err_t ray_env_push_scope(void) {
     return env_push_scope(RAY_SCOPE_LEXICAL);
@@ -786,6 +830,7 @@ void ray_env_pop_scope(void) {
     f->cap = RAY_FRAME_CAP;
     f->count = 0;
     f->kind = RAY_SCOPE_LEXICAL;
+    f->table = NULL;
 }
 
 /* Materialize compiled-lambda locals into a fresh scope frame — the

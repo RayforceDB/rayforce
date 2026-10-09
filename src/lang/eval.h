@@ -163,6 +163,7 @@ typedef struct {
     ray_t    *fn;                    /* current lambda */
     int32_t  tp;                    /* trap stack pointer */
     ray_t    *ps[VM_STACK_SIZE];     /* program stack */
+    uint8_t  rows[VM_STACK_SIZE];    /* ps[i] is derived from query rows */
     vm_ctx_t rs[VM_STACK_SIZE];     /* return stack */
     vm_trap_t ts[VM_TRAP_SIZE];     /* trap frames */
 } ray_exec_t;

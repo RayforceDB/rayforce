@@ -51,6 +51,11 @@ typedef struct {
     int32_t  cap;
     int32_t  count;
     uint8_t  kind;
+    /* RAY_SCOPE_CALL only: the query's source table (borrowed, may be
+     * NULL).  Lookups that reach this frame still see its columns before
+     * falling to the globals, as a helper body compiled in a query does;
+     * the query's aliases and locals below the frame stay hidden. */
+    ray_t*   table;
 } ray_scope_frame_t;
 
 /* ===== Per-thread VM =====

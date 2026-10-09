@@ -976,6 +976,15 @@ ray_t*    ray_lazy_append(ray_t* lazy, uint16_t opcode);
  * so a literal never captures a lambda/let local and resolution fires only
  * inside a query.  Returns NULL when no query is active. */
 ray_t* ray_active_query_table(void);
+/* The table a helper called from a query may read columns from: the
+ * source schema while a projection binds aliases, else the active table. */
+ray_t* ray_query_helper_table(void);
+/* Owned: the source column `sym` names, or its cell during a per-row
+ * evaluation; NULL when it names none. */
+ray_t* ray_query_helper_value(int64_t sym);
+/* A builtin the planner lowers row by row: its result over a column-derived
+ * operand is itself column-derived. */
+bool ray_query_rowwise_builtin(int64_t sym_id);
 ray_t* ray_active_query_literal(int64_t sym);
 bool ray_query_expr_reads_rows(ray_t* expr);
 

@@ -142,6 +142,12 @@ int64_t ray_env_builtin_sym(const ray_t* fn);
 
 /* Local scope stack for lexical binding (let, do, lambda) */
 ray_err_t ray_env_push_scope(void);
+/* A named-call boundary: lookups below it see only `table`'s columns
+ * (NULL for none) and then the globals. */
+ray_err_t ray_env_push_call_scope(ray_t* table);
+/* ray_env_resolve, also reporting through `rows` whether the value is a
+ * query source column (or its cell) read through a helper's call frame. */
+ray_t*    ray_env_resolve_rows(int64_t sym_id, uint8_t* rows);
 ray_err_t ray_env_push_query_scope(void);
 void ray_env_pop_scope(void);
 int32_t   ray_env_scope_depth(void);

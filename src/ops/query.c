@@ -1225,6 +1225,24 @@ static ray_op_t* compile_const_str_expr(ray_graph_t* g, ray_t* expr) {
 
 static int expr_contains_call_named(ray_t* expr, const char* name, size_t name_len);
 
+bool ray_query_rowwise_builtin(int64_t id) {
+    if (resolve_unary_dag(id) || resolve_binary_dag(id) || resolve_agg_opcode(id)) return true;
+    /* Forms compile_expr_dag lowers by name rather than through a table. */
+    static const char* const names[] = {
+        "as", "if", "and", "or", "cond", "pow", "substr", "replace", "xbar", "within",
+        "day", "dayofweek", "dayofyear", "hour", "minute", "month", "second", "year",
+    };
+    enum { N = sizeof names / sizeof *names };
+    static _Thread_local int64_t ids[N];
+    static _Thread_local bool interned;
+    if (!interned) {
+        for (size_t i = 0; i < N; i++) ids[i] = ray_sym_intern(names[i], strlen(names[i]));
+        interned = true;
+    }
+    for (size_t i = 0; i < N; i++) if (ids[i] == id) return true;
+    return false;
+}
+
 /* Compile a Rayfall AST expression into a DAG node */
 ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
     if (!expr) return NULL;
@@ -2079,6 +2097,9 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
  * Column-membership scoped and query-only by construction — see
  * ray_active_query_table. */
 static _Thread_local ray_t* g_active_query_table = NULL;
+/* The source schema while a projection fallback binds output aliases into
+ * its evaluation table; a helper's free names read columns from here. */
+static _Thread_local ray_t* g_query_source_table = NULL;
 /* Dependency classification is stable across group slices. Cache it for
  * one grouped evaluation so computed text does not compile per group. */
 typedef struct {
@@ -2316,6 +2337,9 @@ static _Thread_local ray_t*  g_active_query_row_tbl   = NULL;
 static _Thread_local int32_t g_active_query_row_depth = 0;
 
 ray_t* ray_active_query_table(void) { return g_active_query_table; }
+ray_t* ray_query_helper_table(void) {
+    return g_query_source_table ? g_query_source_table : g_active_query_table;
+}
 
 /* Mount columns AND publish `tbl` as the active query table; returns the
  * previously-active table so the caller can restore it after the matching
@@ -2849,6 +2873,15 @@ static bool agg_input_needs_group_eval(ray_t* arg, ray_t* tbl, bool collections)
     bool constant = expr_is_constant_collection(arg, tbl, &lowered);
     if (constant && collections) return true;
     if (lowered) return false;
+    /* A helper the planner can neither lower nor expand (several
+     * statements, a closure, recursion) runs per group in the evaluator,
+     * where its argument keeps the group's rows. */
+    if (tbl && tbl->type == RAY_TABLE && query_expr_has_helper(arg)) {
+        ray_t* expanded = query_inline_helpers(arg, tbl);
+        bool opaque = query_expr_has_helper(expanded);
+        ray_release(expanded);
+        if (opaque) return true;
+    }
     return expr_has_collection_concat(arg, tbl);
 }
 
@@ -5780,8 +5813,7 @@ static bool query_expr_reads_rows_on(ray_t* expr, ray_t* tbl) {
         int64_t id = es[0]->i64;
         ray_t* fn = ray_env_get(id);
         if (!fn || fn->type == RAY_LAMBDA) return false;
-        if (!(resolve_unary_dag(id) || resolve_binary_dag(id) || resolve_agg_opcode(id) ||
-              id == ray_sym_intern("if", 2))) return false;
+        if (!ray_query_rowwise_builtin(id)) return false;
         for (int64_t i = 1; i < expr->len; i++)
             if (query_expr_reads_rows_on(es[i], tbl)) return true;
         return false;
@@ -5813,6 +5845,26 @@ bool ray_query_expr_reads_rows(ray_t* expr) {
  * so `'price` reads what `price` reads wherever the expression is
  * evaluated.  Owned ref; NULL when no query is active or the name is not a
  * column of it. */
+/* What a helper's free name that is a source column stands for: the whole
+ * column, or during a per-row evaluation the current row's cell, as the
+ * query's own expressions see it.  Owned; NULL when `sym` is no column. */
+ray_t* ray_query_helper_value(int64_t sym) {
+    ray_t* src = ray_query_helper_table();
+    if (!src || src->type != RAY_TABLE) return NULL;
+    ray_t* col = ray_table_get_col(src, sym);
+    if (!col) return NULL;
+    if (g_active_query_row < 0 || g_active_query_table != g_active_query_row_tbl ||
+        g_active_query_row >= ray_len(col) ||
+        ray_env_query_scope_above(g_active_query_row_depth)) {
+        ray_retain(col); return col;
+    }
+    int allocated = 0;
+    ray_t* cell = collection_elem(col, g_active_query_row, &allocated);
+    if (!cell || RAY_IS_ERR(cell)) return cell;
+    if (!allocated) ray_retain(cell);
+    return cell;
+}
+
 ray_t* ray_active_query_literal(int64_t sym) {
     ray_t* qt = g_active_query_table;
     if (!qt || qt->type != RAY_TABLE) return NULL;
@@ -14589,6 +14641,10 @@ by_dict_done:
                     ray_t* col;
                     ray_t* expanded = NULL;
                     query_inline_scope_t scope = { .table = tbl };
+                    /* A helper called from this output reads source columns,
+                     * not the aliases bound into the evaluation table. */
+                    ray_t* prev_source = g_query_source_table;
+                    g_query_source_table = g->table;
                     if (reduced && RAY_IS_ERR(reduced)) {
                         col = reduced;
                     } else {
@@ -14634,6 +14690,7 @@ by_dict_done:
                     }
                     if (scope.owned && scope.table) ray_release(scope.table);
                     if (expanded) ray_release(expanded);
+                    g_query_source_table = prev_source;
                     if (!col || RAY_IS_ERR(col)) {
                         ray_t* err = col ? col : ray_error("domain", "select: failed to evaluate output column expression");
                         ray_release(result);
