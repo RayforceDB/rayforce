@@ -37,6 +37,7 @@ typedef struct {
 #define RAY_FRAME_CAP  64
 #define RAY_SCOPE_LEXICAL 0
 #define RAY_SCOPE_QUERY   1
+#define RAY_SCOPE_CALL    2  /* interpreted named call: stop at globals */
 
 /* One lexical or synthetic query scope frame.  keys/vals start out pointing
  * at the inline arrays and move to heap blocks if the frame grows past

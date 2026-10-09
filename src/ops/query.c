@@ -5732,6 +5732,10 @@ static ray_t* nonagg_eval_per_group_buf(ray_t* expr, ray_t* tbl,
 static bool query_expr_reads_rows_on(ray_t* expr, ray_t* tbl) {
     if (!tbl || tbl->type != RAY_TABLE || !expr) return false;
     if (expr->type == -RAY_SYM) {
+        if (!(expr->attrs & ATTR_QUOTED)) {
+            int rows = ray_eval_query_param_rows(expr->i64);
+            if (rows >= 0) return rows != 0;
+        }
         if (!(expr->attrs & ATTR_QUOTED) && ray_env_has_lexical_local(expr->i64))
             return false;
         if (ray_table_get_col(tbl, expr->i64)) return true;
@@ -5750,6 +5754,19 @@ static bool query_expr_reads_rows_on(ray_t* expr, ray_t* tbl) {
                 id == ray_sym_intern("desc", 4) || id == ray_sym_intern("at", 2))
                 return query_expr_reads_rows_on(es[1], tbl);
         }
+    }
+    if (ray_eval_query_helper_active()) {
+        if (expr->type != RAY_LIST || !expr->len || (expr->attrs & ATTR_QUOTED)) return false;
+        ray_t** es = ray_data(expr);
+        if (es[0]->type != -RAY_SYM) return false;
+        int64_t id = es[0]->i64;
+        ray_t* fn = ray_env_get(id);
+        if (!fn || fn->type == RAY_LAMBDA) return false;
+        if (!(resolve_unary_dag(id) || resolve_binary_dag(id) || resolve_agg_opcode(id) ||
+              id == ray_sym_intern("if", 2))) return false;
+        for (int64_t i = 1; i < expr->len; i++)
+            if (query_expr_reads_rows_on(es[i], tbl)) return true;
+        return false;
     }
     query_dependency_cache_t* cache = g_query_dependencies;
     if (cache && cache->table == tbl)

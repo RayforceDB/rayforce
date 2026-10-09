@@ -147,8 +147,21 @@ ray_t* ray_env_get_lexical_local(int64_t sym_id) {
         if (f->kind == RAY_SCOPE_QUERY) continue;
         for (int32_t i = 0; i < f->count; i++)
             if (f->keys[i] == sym_id) return f->vals[i];
+        if (f->kind == RAY_SCOPE_CALL) break;
     }
     return NULL;
+}
+
+int32_t ray_env_lexical_scope_depth(int64_t sym_id) {
+    if (!__VM) return -1;
+    for (int32_t d = __VM->scope_depth - 1; d >= 0; d--) {
+        ray_scope_frame_t* f = &__VM->scope_stack[d];
+        if (f->kind == RAY_SCOPE_QUERY) continue;
+        for (int32_t i = 0; i < f->count; i++)
+            if (f->keys[i] == sym_id) return d + 1;
+        if (f->kind == RAY_SCOPE_CALL) break;
+    }
+    return -1;
 }
 
 bool ray_env_has_lexical_local(int64_t sym_id) {
@@ -193,6 +206,7 @@ ray_t* ray_env_capture_locals(void) {
                 return vals ? vals : ray_error("oom", NULL);
             }
         }
+        if (f->kind == RAY_SCOPE_CALL) break;
     }
     if (keys->len == 0) {
         ray_release(keys);
@@ -310,6 +324,7 @@ static ray_t* env_lookup_flat(int64_t sym_id) {
             for (int32_t i = 0; i < f->count; i++) {
                 if (f->keys[i] == sym_id) return f->vals[i];
             }
+            if (f->kind == RAY_SCOPE_CALL) break;
         }
     }
     for (int32_t i = 0; i < g_env.count; i++) {
@@ -324,6 +339,7 @@ ray_t* ray_env_get_local(int64_t sym_id) {
         ray_scope_frame_t* f = &__VM->scope_stack[d];
         for (int32_t i = 0; i < f->count; i++)
             if (f->keys[i] == sym_id) return f->vals[i];
+        if (f->kind == RAY_SCOPE_CALL) break;
     }
     return NULL;
 }
@@ -429,6 +445,7 @@ ray_t* ray_env_resolve(int64_t sym_id) {
                     break;
                 }
             }
+            if (f->kind == RAY_SCOPE_CALL) break;
         }
         if (!fn) {
             for (int32_t k = 0; k < g_env.count; k++) {

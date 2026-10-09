@@ -375,4 +375,8 @@ ray_t* ray_raise_fn(ray_t* val);
 ray_t* ray_try_fn(ray_t* expr, ray_t* handler_expr);
 
 
+/* -1 outside an interpreted query helper; otherwise parameter row provenance. */
+int ray_eval_query_param_rows(int64_t sym_id);
+bool ray_eval_query_helper_active(void);
+
 #endif /* RAY_EVAL_H */

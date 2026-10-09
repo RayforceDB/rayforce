@@ -2232,15 +2232,42 @@ static ray_t* vm_exec(ray_t* lambda, ray_t** call_args, int64_t argc);
  * a name that was no longer "self", shadowing whatever variable owned it. */
 static int64_t g_call_self_sym = -1;
 
-/* Call a lambda: compile on first call, then execute bytecode. */
-ray_t* call_lambda(ray_t* lambda, ray_t** call_args, int64_t argc) {
+/* Query fallback carries argument provenance through helpers the planner
+ * cannot inline. A nested query installs its own column context. */
+typedef struct query_call_scope {
+    struct query_call_scope* prev;
+    ray_t* params;
+    uint64_t rows;
+    int32_t depth;
+} query_call_scope_t;
+static _Thread_local query_call_scope_t* g_query_call_scope;
+
+bool ray_eval_query_helper_active(void) {
+    return g_query_call_scope &&
+           !ray_env_query_scope_above(g_query_call_scope->depth);
+}
+
+int ray_eval_query_param_rows(int64_t sym_id) {
+    if (!ray_eval_query_helper_active()) return -1;
+    query_call_scope_t* call = g_query_call_scope;
+    if (ray_env_lexical_scope_depth(sym_id) != call->depth) return 0;
+    const int64_t* ids = ray_data(call->params);
+    for (int64_t i = 0; i < call->params->len && i < 64; i++)
+        if (ids[i] == sym_id) return (call->rows >> i) & 1;
+    return 0;
+}
+
+/* Ordinary calls use bytecode; query fallback interprets the retained AST
+ * so concat can distinguish column parameters from bound collections. */
+static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
+                               bool query, uint64_t row_args) {
     /* Lazy compilation on first call */
-    if (!LAMBDA_CLOSURE(lambda) && !LAMBDA_IS_COMPILED(lambda)) {
+    if (!query && !LAMBDA_CLOSURE(lambda) && !LAMBDA_IS_COMPILED(lambda)) {
         ray_compile(lambda);
     }
 
     /* If compilation succeeded, run bytecode; otherwise fall back to tree-walk */
-    if (LAMBDA_IS_COMPILED(lambda)) {
+    if (!query && LAMBDA_IS_COMPILED(lambda)) {
         return vm_exec(lambda, call_args, argc);
     }
 
@@ -2256,10 +2283,18 @@ ray_t* call_lambda(ray_t* lambda, ray_t** call_args, int64_t argc) {
     bool has_closure = LAMBDA_CLOSURE(lambda) != NULL;
     if (has_closure && ray_env_push_capture(LAMBDA_CLOSURE(lambda)) != RAY_OK)
         return ray_error("oom", NULL);
+    if (query && has_closure)
+        __VM->scope_stack[__VM->scope_depth - 1].kind = RAY_SCOPE_CALL;
     if (ray_env_push_scope() != RAY_OK) {
         if (has_closure) ray_env_pop_scope();
         return ray_error("oom", NULL);
     }
+
+    if (query && !has_closure)
+        __VM->scope_stack[__VM->scope_depth - 1].kind = RAY_SCOPE_CALL;
+    query_call_scope_t call = { .prev = g_query_call_scope, .params = params_list,
+                               .rows = row_args, .depth = ray_env_scope_depth() };
+    if (query) g_query_call_scope = &call;
 
     /* Bind 'self' to the current lambda for recursion */
     if (g_call_self_sym < 0) g_call_self_sym = ray_sym_intern("self", 4);
@@ -2277,15 +2312,21 @@ ray_t* call_lambda(ray_t* lambda, ray_t** call_args, int64_t argc) {
         if (result) ray_release(result);
         result = ray_eval(body_exprs[i]);
         if (RAY_IS_ERR(result)) {
+            if (query) g_query_call_scope = call.prev;
             ray_env_pop_scope();
             if (has_closure) ray_env_pop_scope();
             return result;
         }
     }
 
+    if (query) g_query_call_scope = call.prev;
     ray_env_pop_scope();
     if (has_closure) ray_env_pop_scope();
     return result;
+}
+
+ray_t* call_lambda(ray_t* lambda, ray_t** call_args, int64_t argc) {
+    return call_lambda_impl(lambda, call_args, argc, false, 0);
 }
 
 /* ══════════════════════════════════════════
@@ -3874,8 +3915,10 @@ ray_t* ray_eval(ray_t* obj) {
          * consult ONLY the active query table's column set — never the env
          * scope chain — so a literal never captures a lambda/let local, and
          * the rule fires only while a query is active (ray_active_query_table
-         * is NULL otherwise).  A literal naming no column returns itself. */
-        if (obj->type == -RAY_SYM) {
+         * is NULL otherwise).  A literal naming no column returns itself.
+         * Helper bodies keep bytecode's literal semantics; a nested query
+         * re-enables its own column-name interpretation. */
+        if (obj->type == -RAY_SYM && !ray_eval_query_helper_active()) {
             /* The column — or, during a per-row evaluation, its cell in the
              * current row (ray_active_query_literal). */
             ray_t* v = ray_active_query_literal(obj->i64);
@@ -4155,7 +4198,11 @@ ray_t* ray_eval(ray_t* obj) {
                     ret = err; goto out;
                 }
             }
-            ray_t* result = call_lambda(head, args, argc);
+            bool query = ray_active_query_table() != NULL;
+            uint64_t row_args = 0;
+            if (query) for (int64_t i = 0; i < argc; i++)
+                if (ray_query_expr_reads_rows(elems[i + 1])) row_args |= UINT64_C(1) << i;
+            ray_t* result = call_lambda_impl(head, args, argc, query, row_args);
             for (int64_t i = 0; i < argc; i++) ray_release(args[i]);
             ray_release(head);
             if (RAY_IS_ERR(result))
