@@ -124,7 +124,9 @@ ray_t* ray_table_col_src(ray_t* tbl, int64_t name_id, ray_col_src_t* out);
 
 /* The bound source's plain column (borrowed; valid while the source is
  * bound): the object itself for generation 0, the cached materialization
- * for generation 2.  NULL or an owned error. */
+ * for generation 2, checked against its chunks' statistics under
+ * stats_guard (ray_enccol_check_dir_all: `corrupt` naming the column).
+ * NULL or an owned error. */
 ray_t*  ray_col_src_plain(ray_col_src_t* s, ray_t** out);
 /* Literal translation into the source's SYM domain, without decoding:
  * the position of the bytes, -1 when absent. */
@@ -147,8 +149,11 @@ static inline bool ray_col_src_encoded(const ray_col_src_t* s) {
 
 /* The plain column a scan can read in place, without decoding: a plain
  * object (vector, slice, plain parted wrapper) itself, or a RAY_ENCCOL's
- * published materialization; NULL when reading it would decode.  Borrowed
- * from the source; never decodes. */
+ * published materialization; NULL when reading it would decode.  Under
+ * stats_guard a materialization is ready only once its values lie inside
+ * their chunks' statistics (ray_enccol_check_dir_all); otherwise NULL, and
+ * the range reads report `corrupt`.  Borrowed from the source; never
+ * decodes. */
 ray_t*  ray_col_src_ready(const ray_col_src_t* s);
 /* The base pointer (row 0) a scan reads the source at in place: the ready
  * plain vector's data; NULL when it must be read by range (not ready, or a

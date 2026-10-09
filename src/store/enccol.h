@@ -234,6 +234,11 @@ int    ray_enccol_test_decode_dict(int8_t type, const uint64_t* dict, uint32_t n
 int    ray_enccol_test_point_body(int8_t type, const uint64_t* dict, uint32_t n_dict, uint8_t enc,
                                   uint8_t width, int n_nulls, const uint8_t* body, uint64_t avail,
                                   int vlen, int64_t* out, int8_t* res);
+/* The same with the descriptor's statistics [mn, mx] when `stats`, so the
+ * point read's value check runs: a value outside them is res[i] -1. */
+int    ray_enccol_test_point_body_stats(int8_t type, const uint64_t* dict, uint32_t n_dict, uint8_t enc,
+                                        uint8_t width, int n_nulls, const uint8_t* body, uint64_t avail,
+                                        int vlen, bool stats, int64_t mn, int64_t mx, int64_t* out, int8_t* res);
 
 /* Wrap a plain-type parted wrapper (RAY_PARTED_BASE + base) whose segments
  * include at least one RAY_ENCCOL; retains the wrapper. */

@@ -4020,6 +4020,84 @@ static test_result_t test_v2_forged_consumers(void) {
     PASS();
 }
 
+/* The mirror of sr_forge_max on the minimum: chunk c's directory minimum
+ * and every vector descriptor's minimum below x raised to x.  False on an
+ * I/O error or a vector whose maximum lies below x. */
+static bool sr_forge_min(const char* path, int64_t c, int64_t x) {
+    FILE* f = fopen(path, "r+b"); if (!f) return false;
+    ray_enc_dirent_t de;
+    long doff = (long)(RAY_ENC_DIR_OFF + (uint64_t)c * sizeof de);
+    bool ok = fseek(f, doff, SEEK_SET) == 0 && fread(&de, sizeof de, 1, f) == 1 && !(de.flags & RAY_ENC_STAT_ABSENT);
+    if (ok) { de.min = x; ok = fseek(f, doff, SEEK_SET) == 0 && fwrite(&de, sizeof de, 1, f) == 1; }
+    for (int j = 0; ok && j < RAY_ENC_VECS_PER_CHUNK; j++) {
+        ray_enc_desc_t d;
+        long off = (long)(de.offset + (uint64_t)j * sizeof d);
+        ok = fseek(f, off, SEEK_SET) == 0 && fread(&d, sizeof d, 1, f) == 1;
+        if (!ok || (d.encoding == 0 && d.payload_bytes == 0)) break;     /* past the last vector */
+        if (d.flags & RAY_ENC_STAT_ABSENT || d.min >= x) continue;
+        if (d.max < x) { ok = false; break; }
+        d.min = x;
+        ok = fseek(f, off, SEEK_SET) == 0 && fwrite(&d, sizeof d, 1, f) == 1;
+    }
+    return fclose(f) == 0 && ok;
+}
+
+/* Fix round 3: the serial dense path.  One chunk of 60000 rows, under
+ * RAY_PARALLEL_THRESHOLD, so the group-by sizes its dense plan from the
+ * directory and then takes the serial path, which reads the key's whole
+ * materialization (agg_keys_unstage -> ray_col_src_plain).  Key k is
+ * j * 7 % 5001 (FOR_BP); kn the same with a null every 100 rows.  The
+ * chunk's statistics (directory and descriptors, still nested) are moved
+ * inside the values: the maximum lowered to 999, or the minimum raised to
+ * 4000.  Each query gives `corrupt` naming the key, twice, and never
+ * indexes the slot map past the plan; unpatched it answers as generation
+ * 0 on the serial dense route.  A buffered aggregate (med) is admitted to
+ * v2 only as an indexed shape: its keys are unstaged before any plan, so
+ * nothing is sized from the statistics and the forged table answers as
+ * generation 0, small (one chunk) and large (four chunks, with a pool). */
+static test_result_t test_v2_forged_serial_dense(void) {
+    sr_eval_ok("(set js (til 60000))");
+    sr_eval_ok("(set FS (table [k kn v] (list (% (* js 7) 5001) "
+               "(map (fn [j] (if (== 0 (% j 100)) 0N (% (* j 7) 5001))) js) js)))");
+    sr_eval_ok("(set jm (til 262144))");
+    sr_eval_ok("(set FM (table [k v] (list (% (* jm 7) 5001) jm)))");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/fs0/\" FS {compress: false})");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/fs2/\" FS {compress: true})");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/fm0/\" FM {compress: false})");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/fm2/\" FM {compress: true})");
+    static const struct { const char* tbl; const char* col; int64_t chunk; bool raise; int64_t x; int route; const char* q; } cs[] = {
+        { "fs", "k",  0, false, 999,  AGG_ROUTE_V2_SERIAL_DENSE, "(select {s: (sum v) c: (count v) from: T by: k})" },
+        { "fs", "kn", 0, false, 999,  AGG_ROUTE_V2_SERIAL_DENSE, "(select {s: (sum v) c: (count v) from: T by: kn})" },
+        { "fs", "k",  0, true,  4000, AGG_ROUTE_V2_SERIAL_DENSE, "(select {s: (sum v) c: (count v) from: T by: k})" },
+        { "fs", "k",  0, false, 999,  AGG_ROUTE_V2_SERIAL_DENSE, "(select {s: (sum v) c: (count v) from: T by: k take: 4})" },
+        { "fs", "k",  0, false, 999,  AGG_ROUTE_V2_INDEXED,      "(select {m: (med v) c: (count v) from: T by: k})" },
+        { "fm", "k",  2, false, 999,  AGG_ROUTE_V2_INDEXED,      "(select {m: (med v) c: (count v) from: T by: k})" },
+    };
+    for (size_t i = 0; i < sizeof cs / sizeof cs[0]; i++) {
+        char t0[256], t2[256], tb[256], src[256];
+        snprintf(t0, sizeof t0, "(.db.splayed.get \"" SR_TMP "/%s0/\")", cs[i].tbl);
+        snprintf(t2, sizeof t2, "(.db.splayed.get \"" SR_TMP "/%s2/\")", cs[i].tbl);
+        snprintf(tb, sizeof tb, "(.db.splayed.get \"" SR_TMP "/%sb/\")", cs[i].tbl);
+        agg_route_reset();
+        test_result_t r = sr_same_on(t0, t2, cs[i].q, UINT64_MAX);
+        if (r.status != TEST_PASS) return r;
+        TEST_ASSERT_FMT(agg_route_stats().routes[cs[i].route] > 0, "%s: not route %d", cs[i].q, cs[i].route);
+        snprintf(src, sizeof src, "(.db.splayed.set \"" SR_TMP "/%sb/\" %s {compress: true})", cs[i].tbl,
+                 strcmp(cs[i].tbl, "fs") == 0 ? "FS" : "FM");
+        sr_eval_ok(src);
+        char rel[256], dir[512], path[600];
+        snprintf(rel, sizeof rel, SR_TMP "/%sb/", cs[i].tbl);
+        if (ray_splay_resolve_dir(ray_test_tmp(rel), dir, sizeof dir) != RAY_OK) FAIL("resolve");
+        snprintf(path, sizeof path, "%s/%s", dir, cs[i].col);
+        if (!(cs[i].raise ? sr_forge_min(path, cs[i].chunk, cs[i].x) : sr_forge_max(path, cs[i].chunk, cs[i].x)))
+            FAIL("forge");
+        r = cs[i].route == AGG_ROUTE_V2_INDEXED ? sr_same_on(t0, tb, cs[i].q, UINT64_MAX)
+                                                : sr_corrupt_twice(tb, cs[i].q, path);
+        if (r.status != TEST_PASS) return r;
+    }
+    PASS();
+}
+
 static test_result_t test_v2_forged_dir_max(void) {
     sr_eval_ok("(set BF (table [k v] (list (concat (% (* (til 196608) 7) 1000) (% (* (+ 196608 (til 65536)) 7) 5001)) (til 262144))))");
     sr_eval_ok("(.db.splayed.set \"" SR_TMP "/fm/\" BF {compress: true})");
@@ -4533,6 +4611,7 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/v2_sel_bounds",      test_v2_sel_bounds,      srr_setup, srr_teardown },
     { "scanrange/v2_forged_dir_max",  test_v2_forged_dir_max,  srr_setup, srr_teardown },
     { "scanrange/v2_forged_consumers", test_v2_forged_consumers, srr_setup, srr_teardown },
+    { "scanrange/v2_forged_serial_dense", test_v2_forged_serial_dense, srr_setup, srr_teardown },
     { "scanrange/v2_sel_key_types",   test_v2_sel_key_types,   srr_setup, srr_teardown },
     { NULL, NULL, NULL, NULL },
 };

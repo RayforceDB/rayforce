@@ -3360,6 +3360,7 @@ static ray_t* exec_group_v2_parallel_dense(
                 int64_t row = begin + (end - begin - 1) * sample / 63;
                 int64_t key = d.key_srcs[0] ? agg_key_at(&d.rr, &scs, 0, row, &serr)
                                             : agg_read_key_i64(key_cols[0], key_data[0], row);
+                if (serr) break;                 /* key is 0: never a slot (a remap would read past it) */
                 int64_t slot = agg_dense_component(dp, 0, key);
                 if (slot < low) low = slot;
                 if (slot > high) high = slot;

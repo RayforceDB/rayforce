@@ -1063,6 +1063,41 @@ static const char* guard_reads(const char* path, int64_t vec, bool want_bad) {
                 if (e) ray_error_free(e);
                 ray_col_cursor_free(&cur);
             }
+            /* the plain and in-place accessors (the serial strategies'
+             * unstage, the walks' base pointers): the same check, so a
+             * guarded source never hands out unchecked values */
+            for (int i = 0; i < 2 && !res; i++) {
+                ray_t* rd = ray_col_src_ready(&src);
+                const void* bp = ray_col_src_base(&src);
+                if (want_bad ? (rd || bp) : (rd != mat || bp != ray_data(mat))) {
+                    snprintf(why, sizeof why, "ready read %d gave %s", i + 1, rd ? "the materialization" : "nothing");
+                    res = why;
+                    break;
+                }
+                ray_t* pl = NULL;
+                ray_error_clear();
+                ray_t* e = ray_col_src_plain(&src, &pl);
+                bool bad = e && strcmp(ray_err_code(e), "corrupt") == 0 && names_path(path) &&
+                           has_needle("value outside the chunk's statistics") && !pl;
+                if (want_bad ? !bad : (e != NULL || pl != mat)) {
+                    snprintf(why, sizeof why, "plain read %d gave %s", i + 1, e ? ray_err_code(e) : "the column");
+                    res = why;
+                }
+                if (e) ray_error_free(e);
+            }
+            /* unguarded, the materialization is ready as ever */
+            if (!res) {
+                ray_col_src_t un;
+                ray_t* be = ray_col_src_bind(c, &un);
+                if (be) { ray_error_free(be); res = "bind failed"; }
+                else {
+                    ray_t* pl = NULL;
+                    ray_t* e = ray_col_src_plain(&un, &pl);
+                    if (ray_col_src_ready(&un) != mat || e || pl != mat) res = "the unguarded source did not read in place";
+                    if (e) ray_error_free(e);
+                    ray_col_src_release(&un);
+                }
+            }
         } else if (mat) ray_error_free(mat);
     }
     ray_col_scratch_free(&sc); ray_col_src_release(&src);

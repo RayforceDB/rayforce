@@ -1094,6 +1094,42 @@ static test_result_t test_dict_kernel_rejects(void) {
     PASS();
 }
 
+/* The point read's value check (fix round 3, M2): with the descriptor's
+ * statistics kept, a served value outside them is refused (-1); inside
+ * them every row is served with its value.  FOR_BP I32 (the maximum
+ * lowered, the minimum raised) and DICT I64. */
+static test_result_t test_point_read_stats(void) {
+    static uint64_t v[RAY_ENC_VEC], u[RAY_ENC_VEC], bodyw[RAY_ENC_VEC / 2 + 4];
+    static int64_t pv[RAY_ENC_VEC]; static int8_t res[RAY_ENC_VEC];
+    ray_enc_kind_t k32 = { 32, true };
+    for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = (uint64_t)(uint32_t)(int32_t)(i % 300 - 100);
+    ray_enc_buf_t b = { 0 }; ray_enc_choice_t ch;
+    TEST_ASSERT_TRUE(ray_enc_write_as(RAY_ENC_FOR_BP, v, RAY_ENC_VEC, k32, NULL, &b, &ch));
+    static const struct { int64_t mn, mx; } st[] = { { -100, 199 }, { -100, 150 }, { 0, 199 }, { -100, 0 } };
+    for (size_t s = 0; s < sizeof st / sizeof st[0]; s++) {
+        TEST_ASSERT_EQ_I(ray_enccol_test_point_body_stats(RAY_I32, NULL, 0, RAY_ENC_FOR_BP, ch.width, 0, b.p, b.len,
+                                                          RAY_ENC_VEC, true, st[s].mn, st[s].mx, pv, res), 0);
+        for (int i = 0; i < RAY_ENC_VEC; i++) {
+            int64_t want = i % 300 - 100;
+            bool in = want >= st[s].mn && want <= st[s].mx;
+            TEST_ASSERT_FMT(res[i] == (in ? 1 : -1), "[%lld, %lld] row %d (%lld): %d", (long long)st[s].mn,
+                            (long long)st[s].mx, i, (long long)want, res[i]);
+            if (in) TEST_ASSERT_EQ_I(pv[i], want);
+        }
+    }
+    ray_enc_buf_free(&b);
+    static const uint64_t dv3[3] = { 10, 20, 30 };
+    for (int i = 0; i < RAY_ENC_VEC; i++) u[i] = (uint64_t)(i % 3);
+    uint64_t len = dict_body((uint8_t*)bodyw, u, 2, 0);
+    TEST_ASSERT_EQ_I(ray_enccol_test_point_body_stats(RAY_I64, dv3, 3, RAY_ENC_DICT, 0, 0, (const uint8_t*)bodyw, len,
+                                                      RAY_ENC_VEC, true, 10, 30, pv, res), 0);
+    for (int i = 0; i < RAY_ENC_VEC; i++) { TEST_ASSERT_EQ_I(res[i], 1); TEST_ASSERT_EQ_I(pv[i], dv3[i % 3]); }
+    TEST_ASSERT_EQ_I(ray_enccol_test_point_body_stats(RAY_I64, dv3, 3, RAY_ENC_DICT, 0, 0, (const uint8_t*)bodyw, len,
+                                                      RAY_ENC_VEC, true, 10, 20, pv, res), 0);
+    for (int i = 0; i < RAY_ENC_VEC; i++) TEST_ASSERT_EQ_I(res[i], i % 3 == 2 ? -1 : 1);
+    PASS();
+}
+
 /* A point read never serves a row the decode would refuse: on nulls, the
  * sentinel, any other codec, and every corruption it reads, it declines. */
 static test_result_t test_point_read_declines(void) {
@@ -2556,6 +2592,7 @@ const test_entry_t enccol_entries[] = {
     { "enccol/dict_kernel_equal",      test_dict_kernel_equal,      enccol_setup, enccol_teardown },
     { "enccol/dict_kernel_rejects",    test_dict_kernel_rejects,    enccol_setup, enccol_teardown },
     { "enccol/point_read_declines",    test_point_read_declines,    enccol_setup, enccol_teardown },
+    { "enccol/point_read_stats",       test_point_read_stats,       enccol_setup, enccol_teardown },
     { "enccol/point_read_column",      test_point_read_column,      enccol_setup, enccol_teardown },
     { "enccol/desc_validated_once",    test_desc_validated_once,    enccol_setup, enccol_teardown },
     { "enccol/desc_first_touch_concurrent", test_desc_first_touch_concurrent, enccol_setup, enccol_teardown },

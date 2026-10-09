@@ -1375,6 +1375,23 @@ static bool point_type(const ray_enccol_t* e, ray_enc_kind_t* k) {
     return fk_int_type(e->type) && e->type != RAY_SYM && ray_enc_kind_of(e->type, e->attrs, k);
 }
 
+/* Row i of vector j of chunk c (descriptor d, body p of avail bytes) as
+ * its logical value, checked against the vector's statistics (and so its
+ * chunk's): 1 served, 0 declined, -1 with *err. */
+static int point_read(ray_enccol_t* e, const ray_enc_desc_t* d, const uint8_t* p, uint64_t avail,
+                      int64_t c, int j, int i, ray_enc_kind_t k, int64_t* out, ray_t** err) {
+    uint64_t x;
+    int r = point_body(e, d, p, avail, i, k, &x, err);
+    if (r != 1) return r;
+    const int64_t v = ray_enc_logical(x, k);
+    if (!(d->flags & RAY_ENC_STAT_ABSENT) && (v < d->min || v > d->max)) {
+        *err = ray_error("corrupt", "column %s: chunk %lld vector %d value outside its statistics", e->path, (long long)c, j);
+        return -1;
+    }
+    *out = v;
+    return 1;
+}
+
 int ray_enccol_point_i64(ray_enccol_t* e, int64_t row, int64_t* out, ray_t** err) {
     *err = NULL;
     ray_enc_kind_t k;
@@ -1385,17 +1402,7 @@ int ray_enccol_point_i64(ray_enccol_t* e, int64_t row, int64_t* out, ray_t** err
     if ((*err = ray_enccol_chunk_descs_ref(e, c, &descs)) != NULL) return -1;   /* validated once per chunk */
     const ray_enc_desc_t* d = &descs[j];
     ray_enc_dirent_t de; dirent_at(e, c, &de);
-    uint64_t x;
-    int r = point_body(e, d, e->base + de.offset + d->payload_off, d->payload_bytes, i, k, &x, err);
-    if (r != 1) return r;
-    /* a sampled value inside its vector's statistics (and so its chunk's) */
-    const int64_t v = ray_enc_logical(x, k);
-    if (!(d->flags & RAY_ENC_STAT_ABSENT) && (v < d->min || v > d->max)) {
-        *err = ray_error("corrupt", "column %s: chunk %lld vector %d value outside its statistics", e->path, (long long)c, j);
-        return -1;
-    }
-    *out = v;
-    return 1;
+    return point_read(e, d, e->base + de.offset + d->payload_off, d->payload_bytes, c, j, i, k, out, err);
 }
 
 /* A stand-in column of `type` for the body hooks; with a VALUE_DICT of
@@ -1426,24 +1433,33 @@ static void test_col_free(ray_enccol_t* e) {
     ray_free_raw(e);
 }
 
-int ray_enccol_test_point_body(int8_t type, const uint64_t* dict, uint32_t n_dict, uint8_t enc,
-                               uint8_t width, int n_nulls, const uint8_t* body, uint64_t avail,
-                               int vlen, int64_t* out, int8_t* res) {
+int ray_enccol_test_point_body_stats(int8_t type, const uint64_t* dict, uint32_t n_dict, uint8_t enc,
+                                     uint8_t width, int n_nulls, const uint8_t* body, uint64_t avail,
+                                     int vlen, bool stats, int64_t mn, int64_t mx, int64_t* out, int8_t* res) {
     ray_enccol_t* e = test_col(type, 0, 0, dict, n_dict, 0);
     if (!e) return -1;
     ray_enc_desc_t d; memset(&d, 0, sizeof d);
-    d.encoding = enc; d.width = width; d.n_nulls = (uint16_t)n_nulls; d.flags = RAY_ENC_STAT_ABSENT;
+    d.encoding = enc; d.width = width; d.n_nulls = (uint16_t)n_nulls;
+    d.flags = stats ? 0 : RAY_ENC_STAT_ABSENT;
+    d.min = stats ? mn : 0; d.max = stats ? mx : 0;
     ray_enc_kind_t k;
     const bool ok = point_type(e, &k);
     for (int i = 0; i < vlen; i++) {
         ray_t* err = NULL;
-        uint64_t x;
-        res[i] = ok ? (int8_t)point_body(e, &d, body, avail, i, k, &x, &err) : 0;
-        if (res[i] == 1) out[i] = ray_enc_logical(x, k);
+        int64_t v = 0;
+        res[i] = ok ? (int8_t)point_read(e, &d, body, avail, 0, 0, i, k, &v, &err) : 0;
+        if (res[i] == 1) out[i] = v;
         if (err) ray_error_free(err);
     }
     test_col_free(e);
     return 0;
+}
+
+int ray_enccol_test_point_body(int8_t type, const uint64_t* dict, uint32_t n_dict, uint8_t enc,
+                               uint8_t width, int n_nulls, const uint8_t* body, uint64_t avail,
+                               int vlen, int64_t* out, int8_t* res) {
+    return ray_enccol_test_point_body_stats(type, dict, n_dict, enc, width, n_nulls, body, avail, vlen,
+                                            false, 0, 0, out, res);
 }
 
 /* The descriptor of a hook body carries the statistics a writer would

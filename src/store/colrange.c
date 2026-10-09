@@ -335,6 +335,9 @@ ray_t* ray_col_src_plain(ray_col_src_t* s, ray_t** out) {
     if (s->obj->type != RAY_ENCCOL) { *out = s->obj; return NULL; }
     ray_t* p = ray_enccol_materialize(s->obj);     /* the object's once-state, cached */
     if (RAY_IS_ERR(p)) return p;
+    /* the consumer guard over the whole materialization: once per column */
+    ray_t* gerr = s->stats_guard ? ray_enccol_check_dir_all(s->obj) : NULL;
+    if (gerr) return gerr;
     *out = p;
     return NULL;
 }
@@ -370,7 +373,15 @@ uint8_t ray_col_src_esz(const ray_col_src_t* s) { return ray_sym_elem_size(s->ty
 ray_t* ray_col_src_ready(const ray_col_src_t* s) {
     if (!s || !s->obj) return NULL;
     if (s->obj->type != RAY_ENCCOL) return s->obj;
-    return ray_enccol_decoded_peek(s->obj);        /* published materialization, or NULL */
+    ray_t* pk = ray_enccol_decoded_peek(s->obj);   /* published materialization, or NULL */
+    if (pk && s->stats_guard) {
+        /* the consumer guard: in place only once the materialization is
+         * inside its statistics (cached per column); otherwise not ready,
+         * and the range reads or ray_col_src_plain report the failure */
+        ray_t* gerr = ray_enccol_check_dir_all(s->obj);
+        if (gerr) { ray_error_free(gerr); return NULL; }
+    }
+    return pk;
 }
 
 const void* ray_col_src_base(const ray_col_src_t* s) {
