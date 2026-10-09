@@ -258,6 +258,20 @@ bool   ray_enccol_is_parted(ray_t* encv);
 void   ray_enccol_set_synthetic(ray_t* encv);
 bool   ray_enccol_is_synthetic(ray_t* encv);
 
+/* A column's format, for .idx.info: vectors per encoding code (RAW ..
+ * FSST), file bytes, generation-0 bytes, whether the plain column exists.
+ * Reads descriptors only (statistics are reported, never trusted to size
+ * memory) and never decodes a payload. */
+typedef struct {
+    int64_t  vectors[10];
+    uint64_t encoded_bytes;   /* file bytes (end_off); a plain parted segment counts its raw bytes */
+    uint64_t raw_bytes;       /* generation-0 payload: len * width (+ STR pool) */
+    bool     materialized;
+    bool     synthetic;       /* every encoded segment is a synthetic stand-in */
+} ray_enccol_info_t;
+/* NULL, or an owned error from a chunk's descriptor validation. */
+ray_t* ray_enccol_info(ray_t* encv, ray_enccol_info_t* out);
+
 /* One chunk's directory statistics. */
 typedef struct ray_enc_chunk_stat_s {
     int64_t  rows;           /* rows in the chunk */

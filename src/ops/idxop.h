@@ -815,6 +815,7 @@ ray_t* ray_idx_bloom_fn(ray_t* v);  /* (.idx.bloom v) -> v with bloom attached *
 ray_t* ray_idx_drop_fn (ray_t* v);  /* (.idx.drop  v) -> v with index removed */
 ray_t* ray_idx_has_fn  (ray_t* v);  /* (.idx.has?  v) -> 0b/1b */
 ray_t* ray_idx_info_fn (ray_t* v);  /* (.idx.info  v) -> dict of metadata */
+ray_t* ray_idx_info_vary_fn(ray_t** args, int64_t n);  /* (.idx.info col) | (.idx.info table 'col) */
 
 ray_t* ray_attr_set_fn (ray_t* name, ray_t* v); /* (.attr.set 'name v) */
 ray_t* ray_attr_get_fn (ray_t* v);              /* (.attr.get v) -> sym vec */

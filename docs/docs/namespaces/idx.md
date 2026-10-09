@@ -19,7 +19,7 @@ Indexes are dropped automatically when the column is mutated (`alter set`, `upda
 | [`.idx.bloom`](#idx-bloom) | unary | — | Attach a Bloom filter. |
 | [`.idx.drop`](#idx-drop) | unary | — | Detach whatever index the vector carries. |
 | [`.idx.has?`](#idx-has-p) | unary | — | True if the vector carries any index. |
-| [`.idx.info`](#idx-info) | unary | — | Dict describing the attached index. |
+| [`.idx.info`](#idx-info) | variadic | — | Dict describing the attached index, or a table column's format. |
 
 ## `.idx.zone` { #idx-zone }
 
@@ -70,6 +70,24 @@ Signature: `(.idx.info v)`. Returns a dict if the vector carries an index, or th
 ```lisp
 (.idx.info (.idx.bloom [1 2 3 4 5]))
 ;; => {kind: 'bloom, length: 5, m_bits: 64, k: 4, n_keys: 5, ...}
+```
+
+Signature: `(.idx.info table 'col)`. Describes a table column's on-disk format without decoding it. Returns a dict:
+
+| Key | Meaning |
+|-----|---------|
+| `gen` | `2` for a compressed column, `0` for a plain one (a ragged generation-0 parted table also reports `0`). |
+| `enc` | Encoding name (`raw const for_bp delta_bp rle dict alp alp_rd str_dict fsst`) to vector count, nonzero counts only; empty for generation 0. |
+| `encoded_bytes` | Bytes of the encoded column file (a parted column sums its segments). |
+| `raw_bytes` | Bytes of the column as a plain vector (a string column includes its pool). |
+| `materialized` | `true` once the plain column has been decoded and cached. |
+| `index` | Generation 0: `.idx.info` of the attached index. Generation 2: the recorded index kind (`'none` when none); never materializes. |
+| `segments` | Parted column only: the segment count. |
+
+```lisp
+(set T (.db.splayed.get "trades/"))
+(.idx.info T 'price)
+;; => {gen: 2, enc: {alp: 196}, encoded_bytes: ..., raw_bytes: ..., materialized: false, index: 'none}
 ```
 
 ## See also

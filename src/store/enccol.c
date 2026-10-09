@@ -2049,6 +2049,53 @@ void ray_enccol_meta(ray_t* encv, ray_col_meta_t* m) {
     m->null_count = e->null_count;
 }
 
+/* Generation-0 payload bytes of a plain vector (STR: its pool too). */
+static uint64_t plain_raw_bytes(ray_t* s) {
+    uint64_t b = (uint64_t)s->len * ray_sym_elem_size(s->type, s->attrs);
+    if (s->type == RAY_STR && s->str_pool) b += (uint64_t)s->str_pool->len;
+    return b;
+}
+
+ray_t* ray_enccol_info(ray_t* encv, ray_enccol_info_t* out) {
+    memset(out, 0, sizeof *out);
+    ray_enccol_t* e = ray_enccol_of(encv);
+    if (!e) return ray_error("type", "info: not an encoded column");
+    out->synthetic = ray_enccol_is_synthetic(encv);
+    if (e->kind == RAY_ENCCOL_PARTED) {
+        int64_t ns = e->wrapper ? e->wrapper->len : 0;
+        for (int64_t i = 0; i < ns; i++) {
+            ray_t* s = ray_enccol_seg(encv, i);
+            if (!s) continue;
+            ray_enccol_info_t si;
+            if (s->type == RAY_ENCCOL) {
+                ray_t* err = ray_enccol_info(s, &si);
+                if (err) return err;
+            } else {
+                memset(&si, 0, sizeof si);
+                si.encoded_bytes = si.raw_bytes = plain_raw_bytes(s);
+            }
+            for (int k = 0; k < 10; k++) out->vectors[k] += si.vectors[k];
+            out->encoded_bytes += si.encoded_bytes;
+            out->raw_bytes += si.raw_bytes;
+            out->materialized |= si.materialized;
+        }
+        out->materialized |= ray_enccol_decoded_peek(encv) != NULL;
+        return NULL;
+    }
+    for (int64_t c = 0; c < e->n_chunks; c++) {
+        const ray_enc_desc_t* d;
+        ray_t* err = ray_enccol_chunk_descs_ref(e, c, &d);
+        if (err) return err;
+        int64_t rows = e->len - c * RAY_ENC_CHUNK;
+        int nv = (int)(((rows > RAY_ENC_CHUNK ? RAY_ENC_CHUNK : rows) + RAY_ENC_VEC - 1) / RAY_ENC_VEC);
+        for (int j = 0; j < nv; j++) if (d[j].encoding < 10) out->vectors[d[j].encoding]++;
+    }
+    out->encoded_bytes = e->hdr.end_off;
+    out->raw_bytes = (uint64_t)e->len * ray_enccol_esz(e) + (e->type == RAY_STR ? e->hdr.str_pool_bytes : 0);
+    out->materialized = ray_enccol_decoded_peek(encv) != NULL;
+    return NULL;
+}
+
 bool ray_enccol_may_have_index(ray_t* encv) {
     ray_enccol_t* e = ray_enccol_of(encv);
     if (!e || e->kind != RAY_ENCCOL_SINGLE) return false;

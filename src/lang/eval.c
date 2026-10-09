@@ -3668,7 +3668,7 @@ static void ray_register_builtins(void) {
     register_unary (".idx.bloom",  RAY_FN_NONE, ray_idx_bloom_fn);
     register_unary (".idx.drop",   RAY_FN_NONE, ray_idx_drop_fn);
     register_unary (".idx.has?",   RAY_FN_NONE, ray_idx_has_fn);
-    register_unary (".idx.info",   RAY_FN_NONE, ray_idx_info_fn);
+    register_vary  (".idx.info",   RAY_FN_NONE, ray_idx_info_vary_fn);
 
     /* Semantic attributes (see src/ops/idxop.c: (.attr.*) family) */
     register_binary(".attr.set",   RAY_FN_NONE, ray_attr_set_fn);

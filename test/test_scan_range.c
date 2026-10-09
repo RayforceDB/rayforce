@@ -4966,6 +4966,40 @@ static void sr_forged_parted(const char* root, int gen) {
                            : "(% (* (til 70000) 7) 1000)",
                     gen ? "true" : "false");
 }
+static test_result_t test_idx_info_table(void) {
+    sr_eval_ok("(set T (.db.splayed.get \"" SR_G2 "\"))");
+    ray_enc_counters_reset();
+    ray_t* d = sr_eval("(.idx.info T 'k)");
+    TEST_ASSERT_TRUE(d && !RAY_IS_ERR(d));
+    ray_t* g = sr_eval("(at (.idx.info T 'k) 'gen)");
+    TEST_ASSERT_EQ_I(g->i64, 2);
+    ray_t* m = sr_eval("(at (.idx.info T 'k) 'materialized)");
+    TEST_ASSERT_FALSE(m->b8);
+    ray_t* e = sr_eval("(sum (value (at (.idx.info T 'g) 'enc)))");             /* every vector has one encoding */
+    TEST_ASSERT_TRUE(e && !RAY_IS_ERR(e) && e->i64 == 196);            /* 200000 rows: 196 vectors */
+    ray_t* rb = sr_eval("(at (.idx.info T 'k) 'raw_bytes)");
+    TEST_ASSERT_EQ_I(rb->i64, 200000 * 8);
+    ray_enc_counters_t k; ray_enc_counters_get(&k);
+    TEST_ASSERT_EQ_U(k.materialized, 0);
+    TEST_ASSERT_EQ_U(k.decoded_bytes, 0);
+    sr_eval_ok("(sum (at T 'g))");                                      /* range reads: still not materialized */
+    ray_t* m2 = sr_eval("(at (.idx.info T 'g) 'materialized)");
+    TEST_ASSERT_FALSE(m2->b8);
+    sr_eval_ok("(set gg (at T 'g))");                                   /* set forces the lazy: materializes */
+    sr_eval_ok("(count gg)");
+    ray_t* m3 = sr_eval("(at (.idx.info T 'g) 'materialized)");
+    TEST_ASSERT_TRUE(m3->b8);
+    ray_t* g0 = sr_eval("(at (.idx.info (.db.splayed.get \"" SR_G0 "\") 'k) 'gen)");
+    TEST_ASSERT_EQ_I(g0->i64, 0);
+    /* ruling I5: a ragged generation-0 parted column reports generation 0 */
+    sr_parted_xy(SR_TMP "/irg", 0, true, false);
+    ray_t* gr = sr_eval("(at (.idx.info (.db.parted.get \"" SR_TMP "/irg\" 't) 'y) 'gen)");
+    TEST_ASSERT_TRUE(gr && !RAY_IS_ERR(gr) && gr->i64 == 0);
+    sr_drop(d); sr_drop(g); sr_drop(m); sr_drop(e); sr_drop(rb);
+    sr_drop(m2); sr_drop(m3); sr_drop(g0); sr_drop(gr);
+    PASS();
+}
+
 static test_result_t test_v2_forged_parted_segment(void) {
     sr_forged_parted(SR_TMP "/fp0", 0);
     sr_forged_parted(SR_TMP "/fp2", 2);
@@ -5121,5 +5155,6 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/v2_radix_decode_once", test_v2_radix_decode_once, sr_rt_setup, srr_pool_teardown },
     { "scanrange/v2_radix_answers",   test_v2_radix_answers,   sr_rt_setup, srr_pool_teardown },
     { "scanrange/v2_forged_parted_segment", test_v2_forged_parted_segment, sr_rt_setup, srr_teardown },
+    { "scanrange/idx_info_table",     test_idx_info_table,     srr_setup, srr_teardown },
     { NULL, NULL, NULL, NULL },
 };

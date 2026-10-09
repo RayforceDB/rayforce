@@ -3608,6 +3608,25 @@ static ray_t* dict_append_sym_sym(ray_t** keys, ray_t** vals, const char* k, con
     return *vals;
 }
 
+static ray_t* dict_append_sym_bool(ray_t** keys, ray_t** vals, const char* k, bool b) {
+    int64_t kid = ray_sym_intern(k, strlen(k));
+    *keys = ray_vec_append(*keys, &kid);
+    if (RAY_IS_ERR(*keys)) return *keys;
+    ray_t* bv = ray_bool(b ? 1 : 0);
+    *vals = ray_list_append(*vals, bv);
+    ray_release(bv);
+    return *vals;
+}
+
+/* Appends `nested` (borrowed) under k. */
+static ray_t* dict_append_sym_obj(ray_t** keys, ray_t** vals, const char* k, ray_t* nested) {
+    int64_t kid = ray_sym_intern(k, strlen(k));
+    *keys = ray_vec_append(*keys, &kid);
+    if (RAY_IS_ERR(*keys)) return *keys;
+    *vals = ray_list_append(*vals, nested);
+    return *vals;
+}
+
 ray_t* ray_index_info(ray_t* v) {
     if (!ray_index_has(v)) return RAY_NULL_OBJ;
     ray_index_t* ix = ray_index_payload(v->index);
@@ -3745,6 +3764,112 @@ ray_t* ray_idx_has_fn(ray_t* v) {
 
 ray_t* ray_idx_info_fn(ray_t* v) {
     return ray_index_info(v);
+}
+
+/* Generation-0 payload bytes of one plain vector (STR: its pool too). */
+static uint64_t info_plain_bytes(ray_t* s) {
+    if (!s || !ray_is_vec(s)) return 0;
+    uint64_t b = (uint64_t)s->len * ray_sym_elem_size(s->type, s->attrs);
+    if (s->type == RAY_STR && s->str_pool) b += (uint64_t)s->str_pool->len;
+    return b;
+}
+
+static const char* const k_enc_names[10] = {
+    "raw", "const", "for_bp", "delta_bp", "rle", "dict", "alp", "alp_rd", "str_dict", "fsst"
+};
+
+/* (.idx.info col) | (.idx.info table 'col): the column's format.  Reads
+ * metadata and chunk descriptors only; nothing is decoded. */
+ray_t* ray_idx_info_vary_fn(ray_t** args, int64_t n) {
+    if (n == 1) {
+        ray_t* v = args[0];
+        if (v && ray_is_lazy(v)) {            /* a lazy column arrives unforced */
+            ray_t* m = ray_lazy_materialize(v);
+            if (!m || RAY_IS_ERR(m)) return m;
+            ray_t* r = ray_idx_info_fn(m);
+            ray_release(m);
+            return r;
+        }
+        return ray_idx_info_fn(v);
+    }
+    if (n != 2) return ray_error("arity", ".idx.info: expected (col) or (table 'col)");
+    ray_t* tbl = args[0];
+    ray_t* nm = args[1];
+    if (!tbl || RAY_IS_ERR(tbl) || tbl->type != RAY_TABLE || !nm || nm->type != -RAY_SYM)
+        return ray_error("type", ".idx.info: expected a table and a column name symbol");
+    ray_col_meta_t m;
+    if (!ray_table_col_meta(tbl, nm->i64, &m)) return ray_error("domain", ".idx.info: no such column");
+
+    ray_enccol_info_t ci;
+    memset(&ci, 0, sizeof ci);
+    bool gen2 = false;
+    ray_t* slot = ray_table_slot(tbl, nm->i64);
+    if (m.enc) {
+        ray_t* err = ray_enccol_info(m.enc, &ci);
+        if (err) return err;
+        gen2 = !ci.synthetic;
+    } else if (RAY_IS_PARTED(m.type)) {
+        ray_t** seg = (ray_t**)ray_data(slot);
+        for (int64_t i = 0; i < slot->len; i++) ci.raw_bytes += info_plain_bytes(seg[i]);
+        ci.encoded_bytes = ci.raw_bytes;
+    } else {
+        ci.raw_bytes = ci.encoded_bytes = info_plain_bytes(slot);
+    }
+
+    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 8);
+    if (RAY_IS_ERR(keys)) return keys;
+    ray_t* vals = ray_list_new(8);
+    if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
+    ray_t* r;
+    r = dict_append_sym_i64(&keys, &vals, "gen", gen2 ? 2 : 0);
+    if (RAY_IS_ERR(r)) goto fail;
+
+    ray_t* ek = ray_sym_vec_new(RAY_SYM_W64, 10);
+    ray_t* ev = RAY_IS_ERR(ek) ? ek : ray_list_new(10);
+    if (RAY_IS_ERR(ek) || RAY_IS_ERR(ev)) {
+        r = RAY_IS_ERR(ek) ? ek : ev;
+        if (!RAY_IS_ERR(ek)) ray_release(ek);
+        goto fail;
+    }
+    if (gen2) {
+        for (int k = 0; k < 10; k++) {
+            if (!ci.vectors[k]) continue;
+            r = dict_append_sym_i64(&ek, &ev, k_enc_names[k], ci.vectors[k]);
+            if (RAY_IS_ERR(r)) { if (!RAY_IS_ERR(ek)) ray_release(ek); if (!RAY_IS_ERR(ev)) ray_release(ev); goto fail; }
+        }
+    }
+    ray_t* ed = ray_dict_new(ek, ev);
+    if (RAY_IS_ERR(ed)) { r = ed; goto fail; }
+    r = dict_append_sym_obj(&keys, &vals, "enc", ed);
+    ray_release(ed);
+    if (RAY_IS_ERR(r)) goto fail;
+
+    r = dict_append_sym_i64(&keys, &vals, "encoded_bytes", (int64_t)ci.encoded_bytes);
+    if (RAY_IS_ERR(r)) goto fail;
+    r = dict_append_sym_i64(&keys, &vals, "raw_bytes", (int64_t)ci.raw_bytes);
+    if (RAY_IS_ERR(r)) goto fail;
+    r = dict_append_sym_bool(&keys, &vals, "materialized", ci.materialized);
+    if (RAY_IS_ERR(r)) goto fail;
+
+    if (gen2) {
+        r = dict_append_sym_sym(&keys, &vals, "index", kind_name((ray_idx_kind_t)m.index_kind));
+    } else {
+        ray_t* ix = ray_idx_info_fn(m.enc ? RAY_NULL_OBJ : slot);   /* synthetic: no index */
+        if (RAY_IS_ERR(ix)) { r = ix; goto fail; }
+        r = dict_append_sym_obj(&keys, &vals, "index", ix);
+        if (ix != RAY_NULL_OBJ) ray_release(ix);
+    }
+    if (RAY_IS_ERR(r)) goto fail;
+    if (m.n_segs) {
+        r = dict_append_sym_i64(&keys, &vals, "segments", m.n_segs);
+        if (RAY_IS_ERR(r)) goto fail;
+    }
+    return ray_dict_new(keys, vals);
+
+fail:
+    if (!RAY_IS_ERR(keys)) ray_release(keys);
+    if (!RAY_IS_ERR(vals)) ray_release(vals);
+    return r;
 }
 
 /* --------------------------------------------------------------------------
