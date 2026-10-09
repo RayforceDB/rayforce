@@ -775,7 +775,8 @@ ray_err_t ray_col_append_index(const char* path, const void* ix_v,
 
 #if defined(__linux__)
 /* Debug builds: RAY_HASH_INJECT names a step of the in-place build to fail
- * there, for the tests — "fs": the filesystem is not one it trusts. */
+ * there, for the tests — "fs": the filesystem is not one it trusts;
+ * "grow", "map": the region cannot be allocated, or mapped. */
 static bool col_hash_inject(const char* step) {
 #if defined(DEBUG)
     const char* e = getenv("RAY_HASH_INJECT");
@@ -817,23 +818,28 @@ typedef struct {
     int64_t  region_off;    /* where the region starts: the payload, 32-aligned */
     uint8_t* map;           /* the mapping, from the page holding region_off */
     size_t   map_len;
+    bool     refused;       /* the region could not be allocated or mapped */
 } col_region_t;
 
 /* ray_index_region_fn: `bytes` of region at region_off, zero-filled, its
  * blocks allocated first — a full disk fails here, not as a fault on a write
- * through the mapping.  NULL when either cannot be done. */
+ * through the mapping.  NULL (refused) when either cannot be done. */
 static uint8_t* col_region_map(void* raw, int64_t bytes) {
     col_region_t* r = (col_region_t*)raw;
     if (r->map || bytes <= 0) return NULL;
     int64_t end = r->region_off + bytes;
-    if (fallocate(r->fd, 0, (off_t)r->payload_end, (off_t)(end - r->payload_end)) != 0)
+    if (col_hash_inject("grow") ||
+        fallocate(r->fd, 0, (off_t)r->payload_end, (off_t)(end - r->payload_end)) != 0) {
+        r->refused = true;
         return NULL;
+    }
     long ps = sysconf(_SC_PAGESIZE);
     int64_t pg = ps > 0 ? (int64_t)ps : 4096;
     int64_t moff = r->region_off & ~(pg - 1);
-    void* p = mmap(NULL, (size_t)(end - moff), PROT_READ | PROT_WRITE, MAP_SHARED,
+    void* p = col_hash_inject("map") ? MAP_FAILED
+            : mmap(NULL, (size_t)(end - moff), PROT_READ | PROT_WRITE, MAP_SHARED,
                    r->fd, (off_t)moff);
-    if (p == MAP_FAILED) return NULL;
+    if (p == MAP_FAILED) { r->refused = true; return NULL; }
     r->map = (uint8_t*)p;
     r->map_len = (size_t)(end - moff);
     return r->map + (r->region_off - moff);
@@ -874,6 +880,10 @@ ray_err_t ray_col_build_hash_index(const char* path, ray_t* col, void* trace) {
     /* Without the marker the loader requires the exact payload length.
      * Best effort, as in ray_col_append_index. */
     if (err != RAY_OK) (void)!ftruncate(fd, (off_t)r.payload_end);
+    /* A region that could not be allocated or mapped is no reason to go
+     * without the index: the caller builds it in memory and appends it,
+     * where a full disk is an ENOSPC like any other write. */
+    if (err == RAY_ERR_IO && r.refused) err = RAY_ERR_NYI;
     if (close(fd) != 0 && err == RAY_OK) err = RAY_ERR_IO;
     if (tr) ray_hash_trace_add(tr, RAY_HXT_APPEND, tm, 0);
     return err;

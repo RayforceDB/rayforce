@@ -2500,11 +2500,67 @@ static test_result_t test_col_build_hash_index_untrusted_fs(void) {
     PASS();
 }
 
-/* A build that fails after the file was grown cuts it back: the region's
- * blocks cannot be allocated past RLIMIT_FSIZE (a full disk alike), the
- * file is left at its payload, loads unindexed, and builds once there is
- * room.  The column is under the parallel threshold: the child has no pool
- * workers. */
+/* A region that cannot be allocated or mapped this time (debug builds
+ * inject either) does not cost the column its hash index: the in-place
+ * build gives way (NYI, the file at its payload) and ray_splay_hash_column
+ * and a splayed save build it in memory and append it — the same bytes. */
+static test_result_t test_col_build_hash_index_refused(void) {
+#if defined(DEBUG)
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-hidx-ref2-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    if (!store_in_place(dir)) { (void)ray_test_rm_rf(dir); SKIP("no in-place build on this filesystem"); }
+    char a[200], b[200];
+    snprintf(a, sizeof(a), "%s/a", dir);
+    snprintf(b, sizeof(b), "%s/b", dir);
+    ray_t* v = store_hash_col(RAY_I64, 300000, 5003, 977);
+    static const char* steps[2] = { "grow", "map" };
+    int64_t bad = 0;
+    for (int plan = 0; plan < 2; plan++) {          /* one batch; the counting pass first */
+        if (plan == 1) ray_heap_set_anon_watermark(INT64_C(4) << 20);
+        for (int s = 0; s < 2; s++) {
+            if (ray_col_save_bulk(v, a) != RAY_OK || ray_col_save_bulk(v, b) != RAY_OK) bad++;
+            int64_t payload = store_file_size(a);
+            TEST_ASSERT_EQ_I(setenv("RAY_HASH_INJECT", steps[s], 1), 0);
+            ray_err_t direct = store_hash_build(a);
+            int64_t after = store_file_size(a);
+            ray_err_t routed = ray_splay_hash_column(a, NULL);
+            unsetenv("RAY_HASH_INJECT");
+            if (direct != RAY_ERR_NYI || after != payload || routed != RAY_OK) bad++;
+            if (store_hash_append_legacy(b) != RAY_OK || !store_files_same(a, b)) bad++;
+            ray_t* m = ray_col_mmap(a);
+            if (!m || RAY_IS_ERR(m) || ray_index_kind(m) != RAY_IDX_HASH) bad++;
+            if (m && !RAY_IS_ERR(m)) ray_release(m); else if (m) ray_error_free(m);
+        }
+        if (plan == 1) ray_heap_set_anon_watermark(0);
+    }
+    /* a splayed save under the same refusal still hashes the column */
+    int64_t name = ray_sym_intern("k", 1);
+    ray_t* t = ray_table_new(1);
+    t = ray_table_add_col(t, name, v);
+    char sd[200]; snprintf(sd, sizeof(sd), "%s/t", dir);
+    TEST_ASSERT_EQ_I(setenv("RAY_HASH_INJECT", "map", 1), 0);
+    ray_err_t se = ray_splay_save(t, sd, NULL);
+    unsetenv("RAY_HASH_INJECT");
+    TEST_ASSERT_EQ_I(se, RAY_OK);
+    ray_t* back = ray_read_splayed(sd, NULL);
+    TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
+    if (ray_index_kind(ray_table_get_col(back, name)) != RAY_IDX_HASH) bad++;
+    ray_release(back);
+    ray_release(t);
+    ray_release(v);
+    TEST_ASSERT_EQ_I(bad, 0);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+#else
+    SKIP("RAY_HASH_INJECT is read by debug builds only");
+#endif
+}
+
+/* The region's blocks cannot be allocated past RLIMIT_FSIZE (a full disk
+ * alike): the in-place build says so (NYI: the caller builds in memory),
+ * the file is left at its payload, loads unindexed, and builds once there
+ * is room.  The column is under the parallel threshold: the child has no
+ * pool workers. */
 static test_result_t test_col_build_hash_index_rollback(void) {
 #ifdef RAY_OS_LINUX
     char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-hidx-rb-%d", (int)getpid());
@@ -2521,7 +2577,7 @@ static test_result_t test_col_build_hash_index_rollback(void) {
         if (getrlimit(RLIMIT_FSIZE, &limit)) _exit(2);
         limit.rlim_cur = (rlim_t)payload + 40;     /* the pad fits, the region doesn't */
         if (signal(SIGXFSZ, SIG_IGN) == SIG_ERR || setrlimit(RLIMIT_FSIZE, &limit)) _exit(2);
-        _exit(store_hash_build(p) == RAY_ERR_IO ? 0 : 1);
+        _exit(store_hash_build(p) == RAY_ERR_NYI ? 0 : 1);
     }
     int status;
     TEST_ASSERT_EQ_I(waitpid(pid, &status, 0), pid);
@@ -6813,6 +6869,7 @@ const test_entry_t store_entries[] = {
     { "store/col_build_hash_index_bytes", test_col_build_hash_index_bytes, store_setup, store_teardown },
     { "store/col_build_hash_index_refusals", test_col_build_hash_index_refusals, store_setup, store_teardown },
     { "store/col_build_hash_index_untrusted_fs", test_col_build_hash_index_untrusted_fs, store_setup, store_teardown },
+    { "store/col_build_hash_index_refused", test_col_build_hash_index_refused, store_setup, store_teardown },
     { "store/col_build_hash_index_rollback", test_col_build_hash_index_rollback, store_setup, store_teardown },
     { "store/col_build_hash_index_interrupt", test_col_build_hash_index_interrupt, store_setup, store_teardown },
     { "store/stream_inline_dict", test_stream_inline_dict, store_setup, store_teardown },
