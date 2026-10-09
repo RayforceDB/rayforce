@@ -116,7 +116,9 @@ agg_v2_reason_t agg_v2_admission(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         ray_op_ext_t* ke = find_ext(g, ext->keys[0]);
         if (ke && ke->sym == ray_sym_intern("_src", 4)) {
             ray_col_meta_t cm;
-            if (ray_table_col_meta(tbl, ray_sym_intern("_count", 6), &cm) && cm.type == RAY_I64) return AGG_V2_SHAPE;
+            /* agg_col_meta: a parted _count (an in-place concat's probe) is
+             * its base I64, so the shortcut keeps the group as over the flatten */
+            if (agg_col_meta(g, tbl, ray_sym_intern("_count", 6), &cm) && cm.type == RAY_I64) return AGG_V2_SHAPE;
         }
     }
 
@@ -8377,15 +8379,15 @@ static ray_t* agg_build_compact(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         return compact ? compact : ray_error("oom", NULL);
     }
     for (uint32_t i = 0; i < n_want; i++) {
-        /* a segment-streamed table's parted column: its flat copy */
-        ray_col_meta_t pm;
-        bool parted = g->grp_seg_stream && ray_table_col_meta(tbl, want[i], &pm) && RAY_IS_PARTED(pm.type);
-        ray_t* src = parted ? parted_flatten_fixed(ray_table_slot(tbl, want[i]), ray_table_nrows(tbl))
-                            : ray_table_col(tbl, want[i]);
+        /* Never a parted column: an in-place concat group runs no selection
+         * (group_seg_stream_ok) and its first-N pre-pass runs over the flat
+         * copy (agg_seg_flat_run), so a segment-streamed table never reaches
+         * a compact gather. */
+        ray_t* src = ray_table_col(tbl, want[i]);
         if (src && RAY_IS_ERR(src)) { ray_release(compact); scratch_free(want_hdr); return src; }
         if (!src) { ray_release(compact); scratch_free(want_hdr); return ray_error("nyi", NULL); }
+        assert(!RAY_IS_PARTED(src->type));
         ray_t* gcol = gather_by_idx(src, idx, n_sel);   /* fresh, no alias */
-        if (parted) ray_release(src);
         if (!gcol || RAY_IS_ERR(gcol)) {
             ray_release(compact); scratch_free(want_hdr);
             return gcol ? gcol : ray_error("oom", NULL);

@@ -151,6 +151,12 @@ int64_t ray_group_perpart_runs(void) {
                                 memory_order_relaxed);
 }
 
+/* Per-partition unordered takes answered from grp_first_keys_scan's keys. */
+static _Atomic(int64_t) ray_group_firstkeys_runs_ctr = 0;
+int64_t ray_group_firstkeys_runs(void) {
+    return atomic_load_explicit(&ray_group_firstkeys_runs_ctr, memory_order_relaxed);
+}
+
 /* Entries of exec_group_parted's in-place concat (group_seg_stream_ok). */
 static _Atomic(int64_t) ray_group_segstream_runs_ctr = 0;
 int64_t ray_group_segstream_runs(void) {
@@ -19529,6 +19535,7 @@ batch_fail:
         }
         ray_release(result);
         result = kept;
+        atomic_fetch_add_explicit(&ray_group_firstkeys_runs_ctr, 1, memory_order_relaxed);
     }
 
     /* First-row slot: keep the group_limit groups with the smallest first

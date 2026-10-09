@@ -1274,6 +1274,9 @@ int64_t ray_group_perpart_runs(void);
 /* Monotonic count of exec_group_parted's in-place concat groups (the
  * parted columns grouped from their segments, no flatten).  Tests. */
 int64_t ray_group_segstream_runs(void);
+/* Monotonic count of per-partition unordered takes answered from the
+ * first keys read up front (grp_first_keys_scan).  Tests. */
+int64_t ray_group_firstkeys_runs(void);
 
 /* A parted fixed-width column (a plain parted wrapper or a RAY_ENCCOL_PARTED
  * slot; base neither STR nor LIST) copied into one owned flat vector of

@@ -4240,11 +4240,13 @@ static test_result_t test_v2_parted_routes(void) {
 }
 
 /* Task 14: a 3-partition table with a high-cardinality key (u: unique per
- * row) and a low one (m), generation 0 and generation 2. */
+ * row) and low ones (m; g, whose second value first appears at row 3000,
+ * past the first vector and its scratch), generation 0 and generation 2. */
 static void sr_parted_keys(const char* root, int gen) {
     for (int p = 0; p < 3; p++)
         sr_evalf_ok("(.db.splayed.set \"%s/2024.01.0%d/t/\" "
-                    "(table [u m x f] (list (+ %d (til 70000)) (%% (til 70000) 5) (til 70000) (as 'F64 (%% (til 70000) 13)))) {compress: %s})",
+                    "(table [u m x f g] (list (+ %d (til 70000)) (%% (til 70000) 5) (til 70000) (as 'F64 (%% (til 70000) 13)) "
+                    "(div (til 70000) 3000))) {compress: %s})",
                     root, p + 1, p * 70000, gen ? "true" : "false");
 }
 static test_result_t test_parted_concat_in_place(void) {
@@ -4297,13 +4299,21 @@ static test_result_t test_parted_sample_reads(void) {
         "(select {c: (count x) from: (.db.parted.get \"%s\" 't) by: m})",            /* sample: low cardinality */
         "(select {c: (count x) from: (.db.parted.get \"%s\" 't) by: u take: 5})",    /* unordered take: first keys */
         "(select {c: (count x) from: (.db.parted.get \"%s\" 't) by: m take: 3})",    /* per partition: grp_first_keys_scan */
+        "(select {c: (count x) from: (.db.parted.get \"%s\" 't) by: g take: 3})",    /* first keys past the first vector */
         NULL,
     };
     for (int i = 0; q[i]; i++) {
         char a[512], b[512];
         snprintf(a, sizeof a, q[i], SR_TMP "/ks0"); snprintf(b, sizeof b, q[i], SR_TMP "/ks2");
         uint64_t m = 9;
+        int64_t s0 = ray_group_segstream_runs(), f0 = ray_group_firstkeys_runs();
         ray_t* r0 = sr_q(a, NULL); ray_t* r2 = sr_q(b, &m);
+        /* none is an in-place concat: low cardinality goes per partition,
+         * and an unordered take keeps the flatten */
+        TEST_ASSERT_FMT(ray_group_segstream_runs() == s0, "not in place: %s", q[i]);
+        /* the per-partition takes keep the first keys read up front (a wrong
+         * read declines to the concat: same answer, so the route is pinned) */
+        TEST_ASSERT_FMT(ray_group_firstkeys_runs() - f0 == (i >= 2 ? 2 : 0), "first keys: %s", q[i]);
         TEST_ASSERT_FMT(sr_same_text(r0, r2), "%s", q[i]);
         TEST_ASSERT_FMT(m == 0, "%s: %llu materializations", q[i], (unsigned long long)m);
         sr_drop(r0); sr_drop(r2);
@@ -4354,6 +4364,102 @@ static test_result_t test_parted_in_place_random(void) {
         TEST_ASSERT_FMT(m == 0, "%s: %llu materializations", b, (unsigned long long)m);
         sr_drop(r0); sr_drop(r2); sr_drop(rf);
     }
+    PASS();
+}
+
+/* Fix round 1, I1: a factorized-expand shaped parted table (_src key,
+ * _count weights).  Over the flatten, v2 declines the shape (its _count
+ * probe) and exec_group's shortcut answers from _count; the in-place
+ * concat must decline it too.  The shortcut's answer: one row per _src in
+ * table order, every aggregate the row's _count. */
+static test_result_t test_parted_factorized_count(void) {
+    for (int p = 0; p < 3; p++)
+        sr_evalf_ok("(.db.splayed.set \"" SR_TMP "/fc0/2024.01.0%d/t/\" "
+                    "(table [_src _count v] (list (+ %d (til 50000)) (+ 1 (%% (til 50000) 3)) (til 50000))) {compress: false})",
+                    p + 1, p * 50000);
+    sr_eval_ok("(set P (.db.parted.get \"" SR_TMP "/fc0\" 't))");
+    static const char* const q[] = {
+        "(select {c: (count v) s: (sum _count) from: P by: _src})",
+        "(select {c: (count _count) from: P by: _src})",
+        NULL,
+    };
+    for (int i = 0; q[i]; i++) {
+        int64_t s0 = ray_group_segstream_runs();
+        char b[256];
+        snprintf(b, sizeof b, "(set R %s)", q[i]);
+        sr_eval_ok(b);
+        TEST_ASSERT_FMT(ray_group_segstream_runs() == s0, "not in place: %s", q[i]);
+        ray_t* a = sr_eval("(at R 'c)");
+        ray_t* w = sr_eval("(at P '_count)");
+        TEST_ASSERT_FMT(sr_same_text(a, w), "%s: c is the row's _count", q[i]);
+        ray_t* k = sr_eval("(at R '_src)");
+        ray_t* t = sr_eval("(til 150000)");
+        TEST_ASSERT_FMT(sr_same_text(k, t), "%s: table order", q[i]);
+        ray_t* n = sr_eval("(sum (at R 'c))");
+        TEST_ASSERT_FMT(n && !RAY_IS_ERR(n) && n->i64 == 299997, "%s: weighted count", q[i]);
+        sr_drop(a); sr_drop(w); sr_drop(k); sr_drop(t); sr_drop(n);
+    }
+    PASS();
+}
+
+/* Fix round 1, I2: the cardinality sample partition is the narrowest (250
+ * symbols: W8) and a later one wider (1000 and 5000 symbols: W16): the
+ * stand-in, the dense plan and the flat copy take the widest segment's
+ * width, not the first's. */
+static test_result_t test_parted_sym_narrow_first(void) {
+    static const int nsym[3] = { 250, 1000, 5000 };
+    for (int gen = 0; gen <= 2; gen += 2)
+        for (int p = 0; p < 3; p++)
+            sr_evalf_ok("(.db.splayed.set \"" SR_TMP "/sn%d/2024.01.0%d/t/\" "
+                        "(table [s u v] (list (as 'SYMBOL (map (fn [j] (format \"n%%\" (%% j %d))) (til 22000))) (+ %d (til 22000)) (til 22000))) "
+                        "\"" SR_TMP "/sn%d/.sym\" {compress: %s})", gen, p + 1, nsym[p], p * 22000, gen, gen ? "true" : "false");
+    static const char* const q[] = {
+        "(select {c: (count v) t: (sum v) from: (.db.parted.get \"" SR_TMP "/sn%d\" 't) by: s})",
+        "(select {c: (count v) t: (sum v) from: (.db.parted.get \"" SR_TMP "/sn%d\" 't) by: {s: s u: u}})",
+        NULL,
+    };
+    static const char* const fq[] = {
+        "(select {s: s c: c t: t from: (select {c: (count v) t: (sum v) z: (sum (+ v 0)) from: (.db.parted.get \"" SR_TMP "/sn0\" 't) by: s})})",
+        "(select {s: s u: u c: c t: t from: (select {c: (count v) t: (sum v) z: (sum (+ v 0)) from: (.db.parted.get \"" SR_TMP "/sn0\" 't) by: {s: s u: u}})})",
+    };
+    for (int i = 0; q[i]; i++) {
+        char a[512], b[512];
+        snprintf(a, sizeof a, q[i], 0); snprintf(b, sizeof b, q[i], 2);
+        int64_t s0 = ray_group_segstream_runs();
+        uint64_t m = 9;
+        ray_t* r0 = sr_q(a, NULL); ray_t* r2 = sr_q(b, &m);
+        TEST_ASSERT_FMT(ray_group_segstream_runs() - s0 == 2, "in place: %s", q[i]);
+        ray_t* rf = sr_eval(fq[i]);
+        TEST_ASSERT_FMT(ray_group_segstream_runs() - s0 == 2, "flattened: %s", fq[i]);
+        TEST_ASSERT_FMT(sr_same_text(r0, r2), "%s", q[i]);
+        TEST_ASSERT_FMT(sr_same_text(r0, rf), "flatten: %s", q[i]);
+        TEST_ASSERT_FMT(m == 0, "%s: %llu materializations", q[i], (unsigned long long)m);
+        TEST_ASSERT_EQ_I(ray_table_nrows(r0), i ? 66000 : 5000);
+        sr_drop(r0); sr_drop(r2); sr_drop(rf);
+    }
+    PASS();
+}
+
+/* Fix round 1, minor 3: nulls in a flattened and an in-place input keep
+ * HAS_NULLS (a sum skips them).  u pairs rows; f is null every 7th row.
+ * The reference is the same rows grouped as one in-memory table. */
+static test_result_t test_parted_flatten_nulls(void) {
+    for (int p = 0; p < 3; p++)
+        sr_evalf_ok("(.db.splayed.set \"" SR_TMP "/fn0/2024.01.0%d/t/\" "
+                    "(table [u x f] (list (div (+ %d (til 30000)) 2) (til 30000) "
+                    "(as 'F64 (map (fn [j] (if (== 0 (%% j 7)) 0N j)) (til 30000))))) {compress: false})",
+                    p + 1, p * 30000);
+    sr_eval_ok("(set M (table [u x f] (list (div (til 90000) 2) (% (til 90000) 30000) "
+               "(as 'F64 (map (fn [j] (if (== 0 (% (% j 30000) 7)) 0N (% j 30000))) (til 90000))))))");
+    ray_t* ref = sr_eval("(select {s: (sum f) from: M by: u})");
+    int64_t s0 = ray_group_segstream_runs();
+    ray_t* in = sr_eval("(select {s: (sum f) from: (.db.parted.get \"" SR_TMP "/fn0\" 't) by: u})");
+    TEST_ASSERT_TRUE(ray_group_segstream_runs() - s0 == 1);
+    ray_t* fl = sr_eval("(select {u: u s: s from: (select {s: (sum f) z: (sum (+ x 0)) from: (.db.parted.get \"" SR_TMP "/fn0\" 't) by: u})})");
+    TEST_ASSERT_TRUE(ray_group_segstream_runs() - s0 == 1);
+    TEST_ASSERT_TRUE(sr_same_text(ref, in));
+    TEST_ASSERT_TRUE(sr_same_text(ref, fl));
+    sr_drop(ref); sr_drop(in); sr_drop(fl);
     PASS();
 }
 
@@ -4760,6 +4866,9 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/parted_sample_reads",        test_parted_sample_reads,        srr_setup, srr_teardown },
     { "scanrange/parted_sym_widths_in_place", test_parted_sym_widths_in_place, srr_setup, srr_teardown },
     { "scanrange/parted_in_place_random",     test_parted_in_place_random,     srr_setup, srr_teardown },
+    { "scanrange/parted_factorized_count",    test_parted_factorized_count,    srr_setup, srr_teardown },
+    { "scanrange/parted_sym_narrow_first",    test_parted_sym_narrow_first,    srr_setup, srr_teardown },
+    { "scanrange/parted_flatten_nulls",       test_parted_flatten_nulls,       srr_setup, srr_teardown },
     { "scanrange/v2_error",           test_v2_error,           srr_setup, srr_teardown },
     { "scanrange/v2_route_shapes",    test_v2_route_shapes,    srr_setup, srr_pool_teardown },
     { "scanrange/v2_sym_shared_dom",  test_v2_sym_shared_dom,  srr_setup, srr_pool_teardown },
