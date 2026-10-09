@@ -356,6 +356,46 @@ static test_result_t test_pq_group_native(void) {
     ray_release(table); pq_remove_native(dir,unames,3);
     PASS();
 }
+/* The direct import over dictionary pages, stored (flat-0-v1) and Snappy
+ * (flat-1-v2): two row groups whose chunks each hold a dictionary page, two
+ * dictionary-encoded data pages and a PLAIN one, with nulls and an empty
+ * string (both the SYM null), on one worker and four, in one pass and
+ * column by column. */
+static test_result_t test_pq_native_dictionary(void) {
+    const char* files[] = {FIX "flat-0-v1.parquet",FIX "flat-1-v2.parquet"};
+    const char* names[] = {"x","name","flag","wide","day","ts","f"};
+    const char* strings[] = {"alpha","a long string over twelve bytes","","","alpha","beta","gamma","delta","z"};
+    int64_t expect[] = {1,NULL_I32,3,4,5,NULL_I32,7,8,9};
+    int64_t ids[] = {ray_sym_intern("I32",3),ray_sym_intern("SYM",3),ray_sym_intern("I16",3),
+        ray_sym_intern("I64",3),ray_sym_intern("DATE",4),ray_sym_intern("TIMESTAMP",9),ray_sym_intern("F64",3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM,ids,7);
+    for (int run = 0; run < 8; run++) {
+        ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(run & 2 ? 4 : 1),RAY_OK);
+        char dir[160]; snprintf(dir,sizeof(dir),"/tmp/rayforce-pq-dict-%d-%d",(int)getpid(),run);
+        pq_set_layout(run & 4 ? "1" : NULL);
+        ray_t* result = ray_parquet_splayed_typed(files[run & 1],dir,types);
+        pq_set_layout(NULL);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result)); TEST_ASSERT_EQ_I(result->i64,18); ray_release(result);
+        char sym[200]; snprintf(sym,sizeof(sym),"%s/.sym",dir);
+        ray_t* table = ray_read_splayed(dir,sym);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(table)); TEST_ASSERT_EQ_I(ray_table_nrows(table),18);
+        ray_t* name = ray_table_get_col_idx(table,1);
+        TEST_ASSERT_EQ_I(name->type,RAY_SYM);
+        TEST_ASSERT_TRUE(name->attrs & RAY_ATTR_HAS_NULLS);
+        for (int64_t i = 0; i < 18; i++) {
+            int j = (int)(i%9); size_t len = strlen(strings[j]);
+            ray_t* text = ray_sym_vec_cell(name,i);
+            TEST_ASSERT_TRUE(text != NULL); TEST_ASSERT_EQ_I(ray_str_len(text),len);
+            TEST_ASSERT_TRUE(!len || !memcmp(ray_str_ptr(text),strings[j],len));
+            TEST_ASSERT_EQ_I(((int32_t*)ray_data(ray_table_get_col_idx(table,0)))[i],expect[j]);
+            TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_table_get_col_idx(table,3)))[i],100+j);
+        }
+        ray_release(table); pq_remove_native(dir,names,7);
+        ray_pool_destroy();
+    }
+    ray_release(types);
+    PASS();
+}
 static test_result_t test_pq_native_edges(void) {
     int64_t ids[] = {ray_sym_intern("I32",3),ray_sym_intern("I64",3),ray_sym_intern("SYM",3)};
     ray_t* types = ray_vec_from_raw(RAY_SYM,ids,3);
@@ -581,6 +621,7 @@ const test_entry_t parquet_entries[] = {
     {"parquet/indexes",test_pq_indexes,pq_setup,pq_teardown},
     {"parquet/bloom",test_pq_bloom,pq_setup,pq_teardown},
     {"parquet/native_edges",test_pq_native_edges,pq_setup,pq_teardown},
+    {"parquet/native_dictionary",test_pq_native_dictionary,pq_setup,pq_teardown},
     {"parquet/group_native",test_pq_group_native,pq_setup,pq_teardown},
 #if defined(__linux__)
     {"parquet/chunk_flush_error",test_pq_chunk_flush_error,pq_setup,pq_teardown},

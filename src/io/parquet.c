@@ -748,10 +748,15 @@ static bool pq_unpack(pq_column* c, const uint8_t* p, size_t n, size_t decoded, 
     if (!ray_parquet_snappy(p,n,c->page,decoded)) return false;
     *out = c->page; return true;
 }
-static bool pq_dictionary(pq_column* c, pq_schema* s, const uint8_t* data, size_t n, int64_t count) {
+/* A dictionary page of `size` bytes in the file, `n` decoded: decompressed
+ * straight into c->dict (not through c->page and a copy), or copied there
+ * when stored. */
+static bool pq_dictionary(pq_column* c, pq_schema* s, const uint8_t* payload, size_t size, size_t n, int64_t count) {
     if (c->have_dict || count < 0 || (uint64_t)count > PQ_MAX_PAGE/sizeof(pq_string)) return false;
     if (!pq_reserve(&c->dict,&c->dict_cap,n)) return false;
-    if (n) memcpy(c->dict,data,n);
+    if (c->codec) { if (!ray_parquet_snappy(payload,size,c->dict,n)) return false; }
+    else if (size != n) return false;
+    else if (n) memcpy(c->dict,payload,n);
     c->dict_count = count; c->have_dict = true;
     if (s->physical == 6) {
         c->strings = ray_calloc_raw((size_t)(count ? count : 1)*sizeof(*c->strings));
@@ -820,8 +825,7 @@ static const char* pq_page(pq_column* c, pq_schema* s, int64_t* skip) {
         if (kind == 2) {
             if (!pq_fields(f[7],h,9) || !pq_num(h[1],&count) ||
                 (pq_get(h[2],-1) != 0 && pq_get(h[2],-1) != 2) ||
-                !pq_unpack(c,payload,(size_t)size,(size_t)raw,true,&data) ||
-                !pq_dictionary(c,s,data,(size_t)raw,count)) return "invalid dictionary page";
+                !pq_dictionary(c,s,payload,(size_t)size,(size_t)raw,count)) return "invalid dictionary page";
             continue;
         }
         if (kind == 0) {
