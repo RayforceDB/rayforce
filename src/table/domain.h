@@ -108,6 +108,10 @@ ray_sym_domain_t* ray_sym_domain_open_or_create(const char* path);
  * NULL where unsupported or on failure; the caller then uses
  * ray_sym_domain_open_or_create. */
 ray_sym_domain_t* ray_sym_domain_create_import(const char* path);
+/* Such a domain's interning counts (RAY_CSV_TRACE), as ray_symimp_stats
+ * gives them (table/symimp.h).  False for any other domain. */
+struct ray_symimp_stats_s;
+bool ray_sym_domain_import_stats(ray_sym_domain_t* dom, struct ray_symimp_stats_s* out);
 
 /* New private, refcounted in-memory dictionary. Supports the same concurrent
  * append and resolution operations as FILE domains, without a cache entry or

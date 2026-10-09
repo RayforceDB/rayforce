@@ -707,6 +707,12 @@ ray_sym_domain_t* ray_sym_domain_create_import(const char* path) {
     return d;
 }
 
+bool ray_sym_domain_import_stats(ray_sym_domain_t* dom, struct ray_symimp_stats_s* out) {
+    if (!dom || dom->kind != DOM_IMPORT) return false;
+    ray_symimp_stats(dom->imp, out);
+    return true;
+}
+
 ray_sym_domain_t* ray_sym_domain_new(void) {
     ray_sym_domain_t* d = ray_sys_alloc(sizeof(*d));
     if (!d) return NULL;

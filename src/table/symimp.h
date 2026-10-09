@@ -56,4 +56,25 @@ bool ray_symimp_intern_batch(ray_symimp_t* m, int64_t n, const char* const* strs
 ray_err_t ray_symimp_sync(ray_symimp_t* m, bool durable);
 void ray_symimp_free(ray_symimp_t* m);
 
+/* What the interning did, for the converters' RAY_CSV_TRACE: the counts
+ * since the last call (which resets them), then the sizes now.  Counted
+ * per batch whether or not anyone reads them. */
+typedef struct ray_symimp_stats_s {
+    int64_t strings;     /* strings interned */
+    int64_t dedup;       /* of them repeats inside their batch */
+    int64_t probes;      /* lock-free lookups: each batch's distinct strings */
+    int64_t hits;        /* of them found */
+    int64_t added;       /* strings appended (the other misses were added
+                          * by another batch in the meantime) */
+    int64_t slots;       /* index slots read by every lookup */
+    int64_t false_tags;  /* of them with the hash but another string */
+    int64_t grows;       /* shard tables doubled */
+    int64_t grow_bytes;  /* bytes of the tables rehashed into new ones */
+    int64_t count;       /* entries */
+    int64_t rec_bytes;   /* the file's records and header */
+    int64_t tab_bytes;   /* the shard tables */
+    int64_t off_bytes;   /* the record offsets */
+} ray_symimp_stats_t;
+void ray_symimp_stats(ray_symimp_t* m, ray_symimp_stats_t* out);
+
 #endif

@@ -14,6 +14,7 @@
 #include "mem/heap.h"
 #include "table/sym.h"
 #include "table/domain.h"
+#include "table/symimp.h"   /* ray_symimp_stats_t: RAY_CSV_TRACE */
 #include "vec/str.h"
 #include "vec/vec.h"
 #include "ops/idxop.h"
@@ -2037,6 +2038,8 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
         symf.dom = writers[order[nnum]].dom;
         if (ray_thread_create(&sym_thread,pq_symflush_fn,&symf) == RAY_OK) sym_running = true;
     }
+    ray_symimp_stats_t ist;   /* the import dictionary's counts, per pass */
+    if (trace && symf.dom) ray_sym_domain_import_stats(symf.dom,&ist);
     bool all = !colwise;
     for (int64_t p = 0; p < r->ncols && !err; p += work.npass) {
         int64_t wd = all ? r->ncols : p < nnum ? width : sym_width;
@@ -2073,6 +2076,15 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
                     (int)ray_str_len(nm),ray_str_ptr(nm),(long long)work.npass,
                     writers[work.pass[0]].type == RAY_SYM ? "sym" : "num",
                     (double)(t1-t0)/1e6,(double)(ray_profile_now_ns()-t1)/1e6);
+            if (symf.dom && ray_sym_domain_import_stats(symf.dom,&ist) && ist.strings)
+                fprintf(stderr,"parquet symimp: strings=%lld dedup=%lld probes=%lld hits=%lld added=%lld"
+                        " slots=%lld false_tags=%lld grows=%lld grow_mb=%.1f"
+                        " entries=%lld rec_mb=%.1f tab_mb=%.1f offc_mb=%.1f\n",
+                        (long long)ist.strings,(long long)ist.dedup,(long long)ist.probes,
+                        (long long)ist.hits,(long long)ist.added,(long long)ist.slots,
+                        (long long)ist.false_tags,(long long)ist.grows,(double)ist.grow_bytes/1048576.0,
+                        (long long)ist.count,(double)ist.rec_bytes/1048576.0,
+                        (double)ist.tab_bytes/1048576.0,(double)ist.off_bytes/1048576.0);
         }
     }
     /* One pass: the columns finish side by side and their hash indexes are
