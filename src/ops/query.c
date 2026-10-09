@@ -6142,7 +6142,7 @@ static bool cd_two_pass_preferred(ray_t** K_cols, int n_K, ray_t* X_col,
     if (k_est <= workers) return true;    /* fewer groups than workers */
     if (k_est > CD_SCATTER_MAX_GROUPS) return true;
     int64_t x_est = agg_group_card_estimate(&X_col, 1, nrows);
-    if (x_est < 0) return false;          /* X unbounded: (K, X) is radix */
+    if (x_est < 1) return false;          /* X unbounded: (K, X) is radix */
     return k_est <= nrows / x_est;        /* (K, X) packs within the rows */
 }
 
