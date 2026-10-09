@@ -9425,8 +9425,7 @@ static ray_t* group_own_plain(ray_t* plain, ray_t** vec, uint8_t* owned) {
  * source's materialization (a generation-2 column decodes once, through
  * its once-state), retained and owned by the caller's slot.  Callers: the
  * scalar route's inputs outside scalar_stageable (holistic and row-gathered
- * aggregates, wide types) and GROUP_UNSTAGE (a selection flattened to
- * match_idx, which exec_group_run no longer builds). */
+ * aggregates, wide types). */
 static ray_t* agg_unstage(ray_col_src_t* src, ray_t** vec, uint8_t* owned) {
     ray_t* plain = NULL;
     ray_t* err = ray_col_src_plain(src, &plain);   /* random: unstage: scalar holistic or wide input */
@@ -14643,44 +14642,17 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
 da_path:;
     /* The direct-array routes (DA, the sparse-dynamic count), the
      * single-key sparse paths and the fat-entry routes at ht_path read
-     * staged keys and inputs by range.  GROUP_UNSTAGE remains for a
-     * selection flattened to match_idx (below): each staged key or input
-     * takes its plain column (materializing a generation-2 one, as
-     * ray_table_col did), retained and owned, and the bound sources are
-     * not used past that point. */
-    #define GROUP_UNSTAGE() do { \
-        for (uint32_t k_ = 0; k_ < n_keys; k_++) { \
-            if (key_vecs[k_] || !key_srcs[k_]) continue; \
-            ray_t* uerr_ = agg_unstage(key_srcs[k_], &key_vecs[k_], &key_owned[k_]); \
-            if (uerr_) { rerr = uerr_; goto resolve_fail; } \
-            key_srcs[k_]  = NULL; \
-            key_data[k_]  = ray_data(key_vecs[k_]); \
-            key_types[k_] = key_vecs[k_]->type; \
-            key_attrs[k_] = key_vecs[k_]->attrs; \
-        } \
-        for (uint32_t a_ = 0; a_ < n_aggs; a_++) { \
-            if (!agg_vecs[a_] && agg_srcs[a_]) { \
-                ray_t* uerr_ = agg_unstage(agg_srcs[a_], &agg_vecs[a_], &agg_owned[a_]); \
-                if (uerr_) { rerr = uerr_; goto resolve_fail; } \
-            } \
-            if (!agg_vecs2[a_] && agg_srcs2[a_]) { \
-                ray_t* uerr_ = agg_unstage(agg_srcs2[a_], &agg_vecs2[a_], &agg_owned2[a_]); \
-                if (uerr_) { rerr = uerr_; goto resolve_fail; } \
-                agg_srcs2[a_] = NULL; \
-            } \
-        } \
-        AGG_OWN_SRC_RELEASE(); \
-        grp_staged = false; \
-    } while (0)
+     * staged keys and inputs by range. */
     /* Some key or input is staged (a generation-2 column not materialized). */
     bool grp_staged = false;
     for (uint32_t k = 0; k < n_keys; k++) if (key_srcs[k]) grp_staged = true;
     for (uint32_t a = 0; a < n_aggs; a++)
         if ((!agg_vecs[a] && agg_srcs[a]) || (!agg_vecs2[a] && agg_srcs2[a])) grp_staged = true;
-    /* Rows not contiguous: unstaged here, so a staged context never has a
-     * match_idx.  Every staged reader below relies on that (grp_run walks
-     * rows, or R-SPARSE over its own survivor list, never match_idx). */
-    if (grp_staged && match_idx) { GROUP_UNSTAGE(); grp_staged = false; }
+    /* match_idx is never built here (a selection streams as the rowsel),
+     * so a staged context never has one.  Every staged reader below relies
+     * on that (grp_run walks rows, or R-SPARSE over its own survivor list,
+     * never match_idx). */
+    assert(!(grp_staged && match_idx) && "group: a staged context with a flattened selection");
     /* The single-key sparse paths' stand-ins for the staged key and inputs
      * (bit a: input a), dropped again at ht_path. */
     bool sp_sv_key = false;
@@ -16463,7 +16435,6 @@ da_path:;
     }
 
 ht_path:;
-    #undef GROUP_UNSTAGE
     /* The single-key sparse paths fell back: their stand-ins go, the
      * builders below read the staged sources. */
     if (sp_sv_key) { ray_release(key_vecs[0]); key_vecs[0] = NULL; key_owned[0] = 0; }

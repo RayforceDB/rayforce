@@ -5258,8 +5258,7 @@ static test_result_t test_v2_forged_parted_segment(void) {
  * operators, key widths and clauses: k and h stand for the I64 columns
  * (WatchID, UserID), v for the nullable I32 (ClientIP), g and u for the
  * narrow integers, d for EventDate and s for the SYM columns.  q18 and q39
- * are pinned in sr_gaps instead (they still materialize), and q35 is a
- * parted gap (sr_gaps_parted). */
+ * are pinned in sr_gaps instead (they still materialize). */
 #define SR_Q18 "(select {c: (count h) from: T by: {h: h s: s} take: 10})"
 #define SR_Q35 "(select {one: 1 s: s c: (count s) from: T by: s desc: c take: 10})"
 #define SR_Q39 "(take (select {s: s p: (count s) from: T where: (and (== g 3) (>= d 100) (<= d 400) " \
@@ -5316,24 +5315,21 @@ static const sr_gap_t sr_gaps[] = {
     /* the v2 compact fallback alone: a filtered group-by under the parallel
      * threshold gathers its key and input (agg_build_compact) */
     { SR_COMPACT_GROUP, 2 },
-    /* a conjunctive where: declines the count-of-select shortcut
-     * (ray_try_count_select_expr); the select's final compaction gathers
-     * every column (ray_execute -> sel_compact) before count */
-    { SR_AND_COUNT, 10 },
+    /* a conjunctive where: is counted off its selection (Task 15b) */
+    { SR_AND_COUNT, 0 },
     { NULL, 0 },
 };
-/* The parted arm's gaps (three partitions of eight columns).  q18 takes the
- * flat-copy run (agg_seg_flat_run) and gathers nothing there. */
+/* The parted arm's gaps (three partitions of eight columns).  q35's constant
+ * output no longer flattens the table (Task 15b): it is in the scan-only
+ * set. */
 static const sr_gap_t sr_gaps_parted[] = {
-    /* q35: a non-aggregate output (`one: 1`) beside a parted group-by
-     * flattens the whole table (ray_select_impl ->
-     * query_materialize_parted_table): every column of every segment */
-    { SR_Q35, 24 },
+    /* q18 takes the flat-copy run (agg_seg_flat_run) and gathers nothing */
+    { SR_Q18, 0 },
     /* q39: the filter refinement and the compact fallback, per segment */
     { SR_Q39, 6 },
     { SR_COMPACT_GROUP, 2 },
-    /* every column of every segment, as on the splayed table */
-    { SR_AND_COUNT, 24 },
+    /* counted off the selection per segment, as on the splayed table */
+    { SR_AND_COUNT, 0 },
     { NULL, 0 },
 };
 
@@ -5405,7 +5401,9 @@ static test_result_t test_no_materialization(void) {
 
 /* The parted arm of the gate: the same shapes over three partitions of a
  * generation-2 parted table (the in-place routes) against generation 0. */
-static test_result_t test_no_materialization_parted(void) {
+/* The parted battery tables: three partitions of eight columns, written as
+ * generation 0 (np0) and generation 2 (np2). */
+static void sr_np_tables(void) {
     for (int gen = 0; gen <= 2; gen += 2)
         for (int p = 0; p < 3; p++)
             sr_evalf_ok("(.db.splayed.set \"" SR_TMP "/np%d/2024.01.0%d/t/\" "
@@ -5415,6 +5413,12 @@ static test_result_t test_no_materialization_parted(void) {
                         "(as 'U8 (%% (til 70000) 200)) (%% (* (+ (til 70000) %d) 7919) 1000003))) "
                         "\"" SR_TMP "/np%d/.sym\" {compress: %s})",
                         gen, p + 1, p * 70000, p * 70000, gen, gen ? "true" : "false");
+}
+#define SR_NP0 "(.db.parted.get \"" SR_TMP "/np0\" 't)"
+#define SR_NP2 "(.db.parted.get \"" SR_TMP "/np2\" 't)"
+
+static test_result_t test_no_materialization_parted(void) {
+    sr_np_tables();
     static const char* const shapes[] = {
         "(count (select {from: T where: (!= g 0)}))",
         "(sum (at T 'v))",
@@ -5423,14 +5427,148 @@ static test_result_t test_no_materialization_parted(void) {
         "(select {c: (count k) from: T by: k})",
         NULL,
     };
-    const char* t0 = "(.db.parted.get \"" SR_TMP "/np0\" 't)";
-    const char* t2 = "(.db.parted.get \"" SR_TMP "/np2\" 't)";
+    const char* t0 = SR_NP0;
+    const char* t2 = SR_NP2;
     test_result_t r = sr_battery(t0, t2, shapes, 0, NULL);
-    /* q35 is a parted gap (sr_gaps_parted) */
-    if (r.status == TEST_PASS) r = sr_battery(t0, t2, sr_clickbench_scan, 0, SR_Q35);
+    if (r.status == TEST_PASS) r = sr_battery(t0, t2, sr_clickbench_scan, 0, NULL);
     for (int i = 0; r.status == TEST_PASS && sr_gaps_parted[i].q; i++)
         r = sr_same_on(t0, t2, sr_gaps_parted[i].q, sr_gaps_parted[i].mat);
     return r;
+}
+
+/* Gap 5 (Task 15b): a count over a conjunctive filter is answered from the
+ * selection, gathering no column, on splayed and parted tables of either
+ * generation.  Each count equals the row count of the select the shortcut
+ * stands for (the gathering select, read through `at`), on both
+ * generations; conjunctions with nullable columns, SYM equality and SYM
+ * order (#738), three conjuncts and an all-false one are covered.  The
+ * single-compare shortcut is untouched (test_count_fast_path). */
+static test_result_t sr_count_and_on(const char* t0, const char* t2, const char* w, uint64_t want_mat) {
+    char q[512], ref[512];
+    snprintf(q, sizeof q, "(count (select {from: T where: %s}))", w);
+    snprintf(ref, sizeof ref, "(count (at (select {from: T where: %s}) 'k))", w);
+    test_result_t r = sr_same_on(t0, t2, q, want_mat);
+    if (r.status != TEST_PASS) return r;
+    for (int gen = 0; gen < 2; gen++) {
+        sr_evalf_ok("(set T %s)", gen ? t2 : t0);
+        ray_t* a = sr_eval(q);
+        ray_t* b = sr_eval(ref);
+        TEST_ASSERT_FMT(a && b && !RAY_IS_ERR(a) && !RAY_IS_ERR(b) && a->type == -RAY_I64 &&
+                        b->type == -RAY_I64 && a->i64 == b->i64,
+                        "gen %d %s: %lld, the select has %lld rows", gen, w,
+                        (long long)(a && !RAY_IS_ERR(a) ? a->i64 : -1),
+                        (long long)(b && !RAY_IS_ERR(b) ? b->i64 : -1));
+        sr_drop(a); sr_drop(b);
+    }
+    PASS();
+}
+static test_result_t test_count_and(void) {
+    static const char* const splayed[] = {
+        "(and (== g 3) (!= u 0))",
+        "(and (> v 100) (< f 150000.0))",                    /* nullable I32 and F64 */
+        "(and (== g 3) (>= d 100) (<= d 400))",
+        "(and (== g 3) (== g 4))",                           /* all false */
+        "(and (> k 199990) (== b true) (!= v 0))",
+        NULL,
+    };
+    const char* t0 = "(.db.splayed.get \"" SR_G0 "\")";
+    const char* t2 = "(.db.splayed.get \"" SR_G2 "\")";
+    for (int i = 0; splayed[i]; i++) {
+        test_result_t r = sr_count_and_on(t0, t2, splayed[i], 0);
+        if (r.status != TEST_PASS) return r;
+    }
+    /* A file-domain SYM compare is not scan-only (the plan's Decision): the
+     * fused program bails on the column's domain and the domain-aware
+     * executor reads every conjunct's column whole.  Answers only, pinned
+     * at that count. */
+    static const sr_gap_t sym[] = {
+        { "(and (== s 'b) (> k 1000))", 2 },
+        { "(and (< s 'c) (== b true))", 1 },                 /* SYM order is by string (#738) */
+        { NULL, 0 },
+    };
+    for (int i = 0; sym[i].q; i++) {
+        test_result_t r = sr_count_and_on(t0, t2, sym[i].q, sym[i].mat);
+        if (r.status != TEST_PASS) return r;
+    }
+    sr_np_tables();
+    static const char* const parted[] = {
+        "(and (== g 3) (!= u 0))",
+        "(and (> v 100) (< v 150000))",                      /* nullable I32 */
+        "(and (== g 3) (== g 4))",
+        "(and (>= k 69990) (< k 70010) (!= v 0))",           /* across a partition edge */
+        NULL,
+    };
+    for (int i = 0; parted[i]; i++) {
+        test_result_t r = sr_count_and_on(SR_NP0, SR_NP2, parted[i], 0);
+        if (r.status != TEST_PASS) return r;
+    }
+    static const sr_gap_t sym_parted[] = {
+        { "(and (== s 'b) (> k 1000))", 6 },
+        { "(and (< s 'c) (== b true))", 3 },
+        { NULL, 0 },
+    };
+    for (int i = 0; sym_parted[i].q; i++) {
+        test_result_t r = sr_count_and_on(SR_NP0, SR_NP2, sym_parted[i].q, sym_parted[i].mat);
+        if (r.status != TEST_PASS) return r;
+    }
+    PASS();
+}
+
+/* Gap 4 (Task 15b): a constant output beside a parted group-by groups the
+ * table in place (the segment-streaming route of Task 14) and broadcasts
+ * the constant over the result rows; the table is never flattened.  Each
+ * shape answers as over generation 0, gathers nothing on generation 2,
+ * runs in place on both, and equals the same group-by without its constant
+ * outputs with the constants added (their type and length included).  The
+ * generation-2 count is the proof that nothing flattened (a flatten reads
+ * every segment of every column); the in-place counter shows the constant
+ * leaves the bare group-by's route unchanged on both generations. */
+static test_result_t test_const_beside_parted_group(void) {
+    sr_np_tables();
+    static const struct { const char* q; const char* bare; const char* checks; uint64_t mat; } shapes[] = {
+        { SR_Q35, "(select {s: s c: (count s) from: T by: s desc: c take: 10})",
+          "(and (== (type (at R 'one)) 'I64) (all (== (at R 'one) (take 1 (count R)))))", 0 },
+        { "(select {one: 1 f: 2.5 sy: 'x st: \"ab\" dt: 2024.01.02 bo: true c: (count k) from: T by: g})",
+          "(select {c: (count k) from: T by: g})",
+          "(and (== (type (at R 'f)) 'F64) (== (type (at R 'sy)) 'SYM) (== (type (at R 'st)) 'STR) "
+          "(== (type (at R 'dt)) 'DATE) (== (type (at R 'bo)) 'B8) (== (count (at R 'st)) 7) "
+          "(all (== (at R 'f) (take 2.5 7))) (all (== (at R 'sy) (take 'x 7))))", 0 },
+        { "(select {one: 1 c: (count k) from: T where: (!= u 0) by: s})",
+          "(select {c: (count k) from: T where: (!= u 0) by: s})",
+          "(all (== (at R 'one) (take 1 5)))", 0 },
+        /* no group: the compact fallback gathers the key and input (a P3
+         * gap, sr_gaps' SR_COMPACT_GROUP), with or without the constant */
+        { "(select {one: 1 c: (count k) from: T where: (== g 9) by: s})",
+          "(select {c: (count k) from: T where: (== g 9) by: s})",
+          "(and (== (type (at R 'one)) 'I64) (== 0 (count (at R 'one))))", 2 },
+        { "(select {c: (sum v) one: 1 from: T by: k desc: c take: 5})",
+          "(select {c: (sum v) from: T by: k desc: c take: 5})",
+          "(all (== (at R 'one) (take 1 5)))", 0 },
+        { "(select {one: (+ 1 2) c: (count k) from: T by: g})",                 /* a scalar expression */
+          "(select {c: (count k) from: T by: g})",
+          "(and (== (type (at R 'one)) 'LIST) (== 7 (count (at R 'one))) (== 3 (first (at R 'one))))", 0 },
+    };
+    for (size_t i = 0; i < sizeof shapes / sizeof shapes[0]; i++) {
+        int64_t s0 = ray_group_segstream_runs();
+        test_result_t r = sr_same_on(SR_NP0, SR_NP2, shapes[i].bare, shapes[i].mat);
+        if (r.status != TEST_PASS) return r;
+        int64_t s1 = ray_group_segstream_runs();
+        r = sr_same_on(SR_NP0, SR_NP2, shapes[i].q, shapes[i].mat);
+        if (r.status != TEST_PASS) return r;
+        /* the constant leaves the route as it is without it */
+        TEST_ASSERT_FMT(ray_group_segstream_runs() - s1 == s1 - s0, "%s: not the bare group's route", shapes[i].q);
+        sr_eval_ok("(set T " SR_NP2 ")");
+        sr_evalf_ok("(set R %s)", shapes[i].q);
+        sr_evalf_ok("(set B %s)", shapes[i].bare);
+        ray_t* ok = sr_eval(shapes[i].checks);
+        TEST_ASSERT_FMT(ok && ok->type == -RAY_BOOL && ok->b8, "%s: constant columns", shapes[i].q);
+        sr_drop(ok);
+        /* the other columns are the bare group-by's */
+        ray_t* eq = sr_eval("(all (map (fn [c] (and (== (count (at R c)) (count (at B c))) (all (== (at R c) (at B c))))) (key B)))");
+        TEST_ASSERT_FMT(eq && eq->type == -RAY_BOOL && eq->b8, "%s: differs from %s", shapes[i].q, shapes[i].bare);
+        sr_drop(eq);
+    }
+    PASS();
 }
 
 const test_entry_t scanrange_entries[] = {
@@ -5557,6 +5695,7 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/idx_info_report",    test_idx_info_report,    srr_setup, srr_teardown },
     { "scanrange/no_materialization", test_no_materialization, srr_setup, srr_teardown },
     { "scanrange/no_materialization_parted", test_no_materialization_parted, srr_setup, srr_teardown },
-    { "scanrange/no_materialization", test_no_materialization, srr_setup, srr_teardown },
+    { "scanrange/count_and",          test_count_and,          srr_setup, srr_teardown },
+    { "scanrange/const_beside_parted_group", test_const_beside_parted_group, srr_setup, srr_teardown },
     { NULL, NULL, NULL, NULL },
 };

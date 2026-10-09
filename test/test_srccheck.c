@@ -202,6 +202,26 @@ static bool plain_marker_ok(const char* line) {
     return false;
 }
 
+/* One source line requests a plain column without a marker on that line. */
+static bool plain_line_bad(const char* line) {
+    return strstr(line, "ray_col_src_plain(") && !plain_marker_ok(line);
+}
+
+/* Unmarked request lines in `text`, as the tree check counts them in a
+ * file. */
+static int plain_text_bad(const char* text) {
+    char line[4096]; int bad = 0;
+    while (*text) {
+        const char* nl = strchr(text, '\n');
+        size_t n = nl ? (size_t)(nl - text) : strlen(text);
+        if (n >= sizeof line) n = sizeof line - 1;
+        memcpy(line, text, n); line[n] = 0;
+        if (plain_line_bad(line)) bad++;
+        text += nl ? n + 1 : n;
+    }
+    return bad;
+}
+
 static void check_plain_requests(const char* p, const char* rel, srccheck_acc_t* acc) {
     acc->nseen++;
     if (strcmp(rel, "src/table/table.c") == 0) acc->saw_table = true;
@@ -211,8 +231,7 @@ static void check_plain_requests(const char* p, const char* rel, srccheck_acc_t*
     char line[4096]; int ln = 0;
     while (fgets(line, sizeof line, f)) {
         ln++;
-        if (!strstr(line, "ray_col_src_plain(")) continue;
-        if (plain_marker_ok(line)) continue;
+        if (!plain_line_bad(line)) continue;
         if (!acc->nbad) snprintf(acc->bad, sizeof acc->bad, "%s:%d unmarked ray_col_src_plain", rel, ln);
         acc->nbad++;
     }
@@ -240,6 +259,14 @@ static test_result_t test_plain_marker_forms(void) {
     TEST_ASSERT_FALSE(plain_marker_ok("x = ray_col_src_plain(s, &c);   /* random: wide keys */"));
     TEST_ASSERT_FALSE(plain_marker_ok("x = ray_col_src_plain(s, &c);   /* random: a route that reads whole columns */"));
     TEST_ASSERT_FALSE(plain_marker_ok("x = ray_col_src_plain(s, &c);   /* ready: never decodes */"));
+    /* The check is a text match on each line, not a parse: */
+    /* a marker on the following line does not mark the call; */
+    TEST_ASSERT_EQ_I(plain_text_bad("x = ray_col_src_plain(s, &c);\n/* random: wide key */\n"), 1);
+    /* a call written in a // comment counts as a call; */
+    TEST_ASSERT_EQ_I(plain_text_bad("// ray_col_src_plain(s, &c) reads the column whole\n"), 1);
+    /* one marker covers every call on its line. */
+    TEST_ASSERT_EQ_I(plain_text_bad("a = ray_col_src_plain(s, &c); b = ray_col_src_plain(t, &d);   /* ready-only */\n"), 0);
+    TEST_ASSERT_EQ_I(plain_text_bad("a = ray_col_src_plain(s, &c); b = ray_col_src_plain(t, &d);\n"), 1);
     PASS();
 }
 

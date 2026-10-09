@@ -7271,6 +7271,57 @@ static ray_t* atom_broadcast_vec(ray_t* a, int64_t n) {
     return v;
 }
 
+/* A grouped output that is the same value for every group, decided from
+ * the AST alone: 1 for a self-evaluating literal (can_atom_broadcast), 2
+ * for a call of an atomic builtin over such literals and such calls
+ * (`(+ 1 2)`), which yields an atom.  A name that is a column, a lexical
+ * local or anything but an atomic builtin (lambdas, special forms,
+ * aggregates) is not constant: 0.  The post-group scatter broadcasts a
+ * constant without reading the table, so a constant output does not need
+ * the flat table a row-dependent one does. */
+static int const_output_expr(ray_t* e, ray_t* tbl, int depth) {
+    if (can_atom_broadcast(e)) return 1;
+    if (!e || e->type != RAY_LIST || depth > 16) return 0;
+    int64_t n = ray_len(e);
+    if (n < 2) return 0;
+    ray_t** el = (ray_t**)ray_data(e);
+    ray_t* h = el[0];
+    if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED)) return 0;
+    if (tbl_has_col(tbl, h->i64) || ray_env_has_lexical_local(h->i64)) return 0;
+    if (resolve_agg_opcode(h->i64)) return 0;
+    ray_t* fn = ray_env_get(h->i64);
+    if (!fn || (fn->type != RAY_UNARY && fn->type != RAY_BINARY && fn->type != RAY_VARY))
+        return 0;
+    if (!(fn->attrs & (RAY_FN_ATOMIC | RAY_FN_LEFT_ATOMIC | RAY_FN_RIGHT_ATOMIC)) ||
+        (fn->attrs & (RAY_FN_AGGR | RAY_FN_SPECIAL_FORM)))
+        return 0;
+    for (int64_t i = 1; i < n; i++)
+        if (!const_output_expr(el[i], tbl, depth + 1)) return 0;
+    return 2;
+}
+
+/* The non-aggregate columns of a grouped select that has no group: an
+ * empty grouped aggregate keeps its result type, a literal its own type,
+ * and any other expression is an empty LIST.  Consumes `result`; returns it
+ * extended, or an error. */
+static ray_t* grouped_nonagg_empty(ray_t* result, ray_t* tbl, ray_t* const* exprs,
+                                   const int64_t* names, int64_t n) {
+    for (int64_t ni = 0; ni < n; ni++) {
+        ray_t* expr = exprs[ni];
+        ray_t* empty_list = match_count_distinct(expr) ? ray_vec_new(RAY_I64, 0)
+            : is_streaming_aggr_unary_call(expr) ? aggr_unary_per_group_buf(expr, tbl, NULL, NULL, NULL, 0)
+            : can_atom_broadcast(expr) ? atom_broadcast_vec(expr, 0) : ray_list_new(0);
+        if (!empty_list || RAY_IS_ERR(empty_list)) {
+            ray_release(result);
+            return empty_list ? empty_list : ray_error("oom", NULL);
+        }
+        result = ray_table_add_col(result, names[ni], empty_list);
+        ray_release(empty_list);
+        if (RAY_IS_ERR(result)) return result;
+    }
+    return result;
+}
+
 static ray_t* scalar_result_col(ray_t* value) {
     if (!value || RAY_IS_ERR(value)) return value ? value : ray_error("domain", "select: scalar aggregate produced no result");
 
@@ -8073,6 +8124,15 @@ static ray_t* where_mask_spread(ray_t* m, int64_t tn, const char* label) {
     return ray_where_mask_coerce(m, tn, label);
 }
 
+/* `where` is an `(and ...)` call of two or more conjuncts. */
+static bool count_where_is_and(ray_t* w) {
+    if (!w || w->type != RAY_LIST || ray_len(w) < 3) return false;
+    ray_t* h = ((ray_t**)ray_data(w))[0];
+    if (!h || h->type != -RAY_SYM) return false;
+    ray_t* wn = ray_sym_str(h->i64);
+    return wn && ray_str_len(wn) == 3 && memcmp(ray_str_ptr(wn), "and", 3) == 0;
+}
+
 ray_t* ray_try_count_select_expr(ray_t* expr, int* handled) {
     if (handled) *handled = 0;
     if (!expr || expr->type != RAY_LIST || ray_len(expr) != 2) return NULL;
@@ -8089,15 +8149,6 @@ ray_t* ray_try_count_select_expr(ray_t* expr, int* handled) {
     ray_t* from_expr = dict_get(dict, "from");
     ray_t* where_expr = dict_get(dict, "where");
     if (!from_expr) return NULL;
-    if (where_expr && where_expr->type == RAY_LIST && ray_len(where_expr) >= 3) {
-        ray_t** we = (ray_t**)ray_data(where_expr);
-        if (we[0] && we[0]->type == -RAY_SYM) {
-            ray_t* wn = ray_sym_str(we[0]->i64);
-            if (wn && ray_str_len(wn) == 3 &&
-                memcmp(ray_str_ptr(wn), "and", 3) == 0)
-                return NULL;
-        }
-    }
 
     int64_t from_id    = dict_key_id(dict, "from");
     int64_t where_id   = dict_key_id(dict, "where");
@@ -8133,6 +8184,20 @@ ray_t* ray_try_count_select_expr(ray_t* expr, int* handled) {
         int64_t nrows = ray_table_nrows(tbl);
         ray_release(tbl);
         return ray_i64(nrows);
+    }
+
+    /* A conjunction is counted off its selection below (the fused
+     * predicate, else the bool mask), never gathering a column, when every
+     * conjunct is a call reading a column: the shape the select's chained
+     * filters take.  A constant conjunct (`(and (> a 2) 0.0)`) is decided
+     * by the optimizer's folding, which only the select runs: decline. */
+    if (count_where_is_and(where_expr)) {
+        ray_t** we = (ray_t**)ray_data(where_expr);
+        for (int64_t i = 1; i < ray_len(where_expr); i++)
+            if (!we[i] || we[i]->type != RAY_LIST || !expr_refs_row_column(we[i], tbl)) {
+                ray_release(tbl);
+                return NULL;
+            }
     }
 
     int64_t direct_count = 0;
@@ -13147,6 +13212,10 @@ by_dict_done:
                         continue;
                     }
                 }
+                /* A constant output is broadcast over the groups after the
+                 * group runs (the scatter's constant arm), reading no row:
+                 * a parted table stays in place and a WHERE stays fused. */
+                if (const_output_expr(expr, tbl, 0)) continue;
                 has_nonagg_needing_flat = 1;
             }
         }
@@ -15172,6 +15241,18 @@ by_dict_done:
         if (result && !RAY_IS_ERR(result) && result->type == RAY_TABLE) {
             int64_t n_groups = ray_table_nrows(result);
 
+            /* Every non-agg constant (const_output_expr) reads no row, so
+             * with no group the key is not read either: the empty columns
+             * are built directly. */
+            int all_const = 1;
+            for (int64_t ni = 0; ni < n_nonaggs && all_const; ni++)
+                if (!const_output_expr(nonagg_exprs[ni], tbl, 0)) all_const = 0;
+            if (n_groups == 0 && all_const) {
+                result = grouped_nonagg_empty(result, tbl, nonagg_exprs, nonagg_names, n_nonaggs);
+                if (RAY_IS_ERR(result)) { ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return result; }
+                goto nonagg_done;
+            }
+
             /* R8 fast path: every non-agg is a literal atom expression
              * with no column refs.  Skip the entire row→gid mapping —
              * each non-agg becomes a typed broadcast vec the same width
@@ -15206,6 +15287,62 @@ by_dict_done:
                         }
                     }
                     goto nonagg_done;
+                }
+                /* Every non-agg constant, some a call (`(+ 1 2)`): each is
+                 * evaluated once, as the row scatter below does, and its
+                 * atom broadcast into per-group LIST cells, the scatter's
+                 * constant disposition; the literals among them take that
+                 * disposition too.  No row is read, so a parted table is
+                 * never flattened for it.  A value that is not an atom
+                 * (an atomic builtin over atoms yields one) goes the row
+                 * way, which evaluates the pure call again. */
+                if (all_const) {
+                    ray_t* cvals_hdr = NULL;
+                    ray_t** cvals = (ray_t**)scratch_calloc(&cvals_hdr,
+                        (size_t)n_nonaggs * sizeof(ray_t*));
+                    if (!cvals) {
+                        ray_release(result); ray_release(tbl);
+                        scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL);
+                    }
+                    ray_t* cerr = NULL;
+                    int all_atoms = 1;
+                    for (int64_t ni = 0; ni < n_nonaggs && !cerr && all_atoms; ni++) {
+                        if (ray_env_push_query_scope() != RAY_OK) { cerr = ray_error("oom", NULL); break; }
+                        ray_t* bind_err_ = NULL;
+                        ray_t* _aqt = bind_referenced_query(tbl, &nonagg_exprs[ni], 1, &bind_err_);
+                        ray_t* v = bind_err_ ? bind_err_ : ray_eval(nonagg_exprs[ni]);
+                        g_active_query_table = _aqt;
+                        ray_env_pop_scope();
+                        if (!v || RAY_IS_ERR(v)) {
+                            cerr = v ? v : ray_error("domain", "select by: failed to evaluate non-aggregate column expression");
+                            break;
+                        }
+                        cvals[ni] = v;
+                        if (!ray_is_atom(v)) all_atoms = 0;
+                    }
+                    for (int64_t ni = 0; ni < n_nonaggs && !cerr && all_atoms; ni++) {
+                        ray_t* list_col = ray_alloc((size_t)n_groups * sizeof(ray_t*));
+                        if (!list_col) { cerr = ray_error("oom", NULL); break; }
+                        list_col->type = RAY_LIST;
+                        list_col->len = n_groups;
+                        ray_t** cells = (ray_t**)ray_data(list_col);
+                        for (int64_t gi = 0; gi < n_groups; gi++) {
+                            ray_retain(cvals[ni]);
+                            cells[gi] = cvals[ni];
+                        }
+                        result = ray_table_add_col(result, nonagg_names[ni], list_col);
+                        ray_release(list_col);
+                        if (RAY_IS_ERR(result)) { cerr = result; result = NULL; }
+                    }
+                    for (int64_t ni = 0; ni < n_nonaggs; ni++)
+                        if (cvals[ni]) ray_release(cvals[ni]);
+                    scratch_free(cvals_hdr);
+                    if (cerr) {
+                        if (result) ray_release(result);
+                        ray_release(tbl);
+                        scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return cerr;
+                    }
+                    if (all_atoms) goto nonagg_done;
                 }
             }
 
@@ -15950,21 +16087,8 @@ by_dict_done:
                 }
                 #undef RELEASE_SCAN_KEY
             } else {
-                /* Empty grouped aggregates retain their result type;
-                 * ordinary row expressions produce per-group LIST cells. */
-                for (int64_t ni = 0; ni < n_nonaggs; ni++) {
-                    ray_t* expr = nonagg_exprs[ni];
-                    ray_t* empty_list = match_count_distinct(expr) ? ray_vec_new(RAY_I64, 0)
-                        : is_streaming_aggr_unary_call(expr) ? aggr_unary_per_group_buf(expr, tbl, NULL, NULL, NULL, 0)
-                        : can_atom_broadcast(expr) ? atom_broadcast_vec(expr, 0) : ray_list_new(0);
-                    if (!empty_list || RAY_IS_ERR(empty_list)) {
-                        ray_release(result); ray_release(tbl);
-                        scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return empty_list ? empty_list : ray_error("oom", NULL);
-                    }
-                    result = ray_table_add_col(result, nonagg_names[ni], empty_list);
-                    ray_release(empty_list);
-                    if (RAY_IS_ERR(result)) { ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return result; }
-                }
+                result = grouped_nonagg_empty(result, tbl, nonagg_exprs, nonagg_names, n_nonaggs);
+                if (RAY_IS_ERR(result)) { ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return result; }
             }
         nonagg_done: ;  /* R8 fast-path target; nothing else to do here */
         }
