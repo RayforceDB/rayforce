@@ -46,10 +46,11 @@ typedef struct ray_symimp_s ray_symimp_t;
 /* Create (truncating) the symbol file at `path`.  `count` receives the
  * number of entries as they are added. */
 ray_symimp_t* ray_symimp_create(const char* path, _Atomic(int64_t)* count);
-/* Position of each string, adding the new ones; thread-safe.  False on
- * allocation or file growth failure. */
+/* Position of each string, adding the new ones; thread-safe.  hashes[i] is
+ * ray_hash_bytes of strs[i], all 64 bits (shard, home slot and tag come
+ * from separate bits).  False on allocation or file growth failure. */
 bool ray_symimp_intern_batch(ray_symimp_t* m, int64_t n, const char* const* strs,
-                             const size_t* lens, const uint32_t* hashes,
+                             const size_t* lens, const uint64_t* hashes,
                              int64_t* out_pos);
 /* Write the header count and start writing back what was added since the
  * last call; `durable` cuts the file to its records and syncs it. */

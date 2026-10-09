@@ -259,7 +259,7 @@ typedef struct { const uint8_t* p; uint32_t n; } pq_string;
 typedef struct {
     const char* strings[8192];
     size_t lengths[8192];
-    uint32_t hashes[8192];
+    uint64_t hashes[8192];   /* ray_hash_bytes, all 64 bits */
     int64_t ids[8192], positions[8192];
 } pq_symbol_scratch;
 typedef struct {
@@ -781,14 +781,14 @@ static bool pq_dictionary(pq_column* c, pq_schema* s, const uint8_t* payload, si
             pq_symbol_scratch* scratch = pq_symbols(c);
             if (!scratch) return false;
             const char** strings = scratch->strings; size_t* lengths = scratch->lengths;
-            uint32_t* hashes = scratch->hashes;
+            uint64_t* hashes = scratch->hashes;
             for (int64_t off = 0; off < count; off += 8192) {
                 int64_t n = count-off < 8192 ? count-off : 8192;
                 for (int64_t i = 0; i < n; i++) {
                     strings[i] = (const char*)c->strings[off+i].p; lengths[i] = c->strings[off+i].n;
-                    hashes[i] = (uint32_t)ray_hash_bytes(strings[i],lengths[i]);
+                    hashes[i] = ray_hash_bytes(strings[i],lengths[i]);
                 }
-                if (!ray_sym_domain_intern_batch(s->import_domain,n,strings,lengths,hashes,c->symbol_ids+off)) return false;
+                if (!ray_sym_domain_intern_batch64(s->import_domain,n,strings,lengths,hashes,c->symbol_ids+off)) return false;
             }
         }
         return true;
@@ -968,7 +968,7 @@ static const char* pq_decode_symbols(pq_column* c, pq_schema* s, ray_t** out, in
     v->sym_domain = s->import_domain; ray_sym_domain_retain(v->sym_domain);
     v->len = rows; *out = v; uint32_t* dst = ray_data(v);
     const char** strings = scratch->strings; size_t* lengths = scratch->lengths;
-    uint32_t* hashes = scratch->hashes;
+    uint64_t* hashes = scratch->hashes;
     int64_t* ids = scratch->ids; int64_t* positions = scratch->positions;
     for (int64_t at = 0; at < rows;) {
         if (ray_interrupted()) return "scan interrupted";
@@ -1006,11 +1006,11 @@ static const char* pq_decode_symbols(pq_column* c, pq_schema* s, ray_t** out, in
                 if (s->strict && (!len || (s->converted == 0 && !pq_utf8(p,len))))
                     return "nonnull text is empty or invalid UTF-8";
                 strings[count] = (const char*)p; lengths[count] = len;
-                hashes[count] = (uint32_t)ray_hash_bytes(p,len); positions[count++] = at+i;
+                hashes[count] = ray_hash_bytes(p,len); positions[count++] = at+i;
             }
         }
         if (count) {
-            if (!ray_sym_domain_intern_batch(s->import_domain,count,strings,lengths,hashes,ids)) return "symbol domain allocation failed";
+            if (!ray_sym_domain_intern_batch64(s->import_domain,count,strings,lengths,hashes,ids)) return "symbol domain allocation failed";
             for (int64_t i = 0; i < count; i++) {
                 if (ids[i] < 0 || (uint64_t)ids[i] >= UINT32_MAX) return "symbol domain exceeds W32";
                 dst[positions[i]] = (uint32_t)ids[i]; if (!ids[i]) v->attrs |= RAY_ATTR_HAS_NULLS;
@@ -1159,14 +1159,14 @@ static const char* pq_intern_selected(pq_column* c, ray_t** vector, ray_sym_doma
     if (!dst || RAY_IS_ERR(dst)) { if (dst) ray_release(dst); return "symbol allocation failed"; }
     dst->sym_domain = domain; ray_sym_domain_retain(domain); dst->len = src->len;
     const char** strings = scratch->strings; size_t* lengths = scratch->lengths;
-    uint32_t* hashes = scratch->hashes; int64_t* ids = scratch->ids;
+    uint64_t* hashes = scratch->hashes; int64_t* ids = scratch->ids;
     for (int64_t at = 0; at < src->len; at += 8192) {
         int64_t n = src->len-at < 8192 ? src->len-at : 8192;
         for (int64_t i = 0; i < n; i++) {
             strings[i] = ray_str_vec_get(src,at+i,&lengths[i]);
-            hashes[i] = (uint32_t)ray_hash_bytes(strings[i],lengths[i]);
+            hashes[i] = ray_hash_bytes(strings[i],lengths[i]);
         }
-        if (!ray_sym_domain_intern_batch(domain,n,strings,lengths,hashes,ids)) {
+        if (!ray_sym_domain_intern_batch64(domain,n,strings,lengths,hashes,ids)) {
             ray_release(dst); return "symbol domain allocation failed";
         }
         for (int64_t i = 0; i < n; i++) {

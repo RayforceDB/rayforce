@@ -42,7 +42,7 @@
 #define SI_MAGIC     0x4C525453U          /* "STRL", the symbol file's magic */
 #define SI_HEAD      12                   /* magic + count */
 #define SI_SHARD_LOG 10
-#define SI_SHARDS    (1 << SI_SHARD_LOG)  /* by the hash's top bits */
+#define SI_SHARDS    (1 << SI_SHARD_LOG)  /* by the 64-bit hash's top bits */
 #define SI_TAB0      1024                 /* initial slots per shard */
 #define SI_OFF_LOG   20                   /* offsets in chunks of 2^20 */
 #define SI_OFF_CHUNKS 4096                /* 2^32 entries at most */
@@ -56,7 +56,14 @@ _Static_assert(SI_BATCH <= 65535, "a batch's dedupe slots hold uint16 indexes");
 enum { SI_ST_STRINGS, SI_ST_DEDUP, SI_ST_PROBES, SI_ST_HITS, SI_ST_ADDED,
        SI_ST_SLOTS, SI_ST_FALSE, SI_ST_GROWS, SI_ST_GROWB, SI_ST_N };
 
-/* An index entry is (hash << 32) | (position + 1); 0 is an empty slot. */
+/* An index entry is (tag << 32) | (position + 1), 0 an empty slot; the tag
+ * is the 64-bit hash's low 32 bits, of which the low log2(slots) give the
+ * home slot (and the slot again in a table twice the size).  The shard comes
+ * from the top bits, outside the tag, so two strings of one home slot are
+ * told apart by 32 - log2(slots) tag bits (15 at 2^17 slots) before their
+ * bytes are compared; a shard taken from the tag's own top bits left 10
+ * fewer. */
+static inline uint32_t si_shard_of(uint64_t h) { return (uint32_t)(h >> (64 - SI_SHARD_LOG)); }
 typedef struct si_tab_s {
     uint64_t         mask;
     struct si_tab_s* next;         /* retired: the next one retired with it */
@@ -117,14 +124,14 @@ static inline bool si_eq(const ray_symimp_t* m, int64_t pos, const char* s, size
     return l == len && (len == 0 || memcmp(r + 4, s, len) == 0);
 }
 
-static int64_t si_find(const ray_symimp_t* m, const si_tab_t* t, uint32_t h,
+static int64_t si_find(const ray_symimp_t* m, const si_tab_t* t, uint32_t tag,
                        const char* s, size_t len, int64_t* st) {
-    uint64_t slot = h & t->mask;
+    uint64_t slot = tag & t->mask;
     for (;;) {
         uint64_t e = atomic_load_explicit(&t->e[slot], memory_order_acquire);
         st[SI_ST_SLOTS]++;
         if (!e) return -1;
-        if ((uint32_t)(e >> 32) == h) {
+        if ((uint32_t)(e >> 32) == tag) {
             int64_t pos = (int64_t)(uint32_t)e - 1;
             if (si_eq(m, pos, s, len)) return pos;
             st[SI_ST_FALSE]++;
@@ -176,7 +183,7 @@ static bool si_reserve(ray_symimp_t* m, size_t bytes, int64_t* pos, int64_t* off
 }
 
 /* Under alock: the string is not in the shard; append it. */
-static int64_t si_add(ray_symimp_t* m, si_shard_t* sh, uint32_t h, const char* s, size_t len,
+static int64_t si_add(ray_symimp_t* m, si_shard_t* sh, uint32_t tag, const char* s, size_t len,
                       int64_t* st) {
     si_tab_t* t = atomic_load_explicit(&sh->tab, memory_order_relaxed);
     if ((uint64_t)(sh->used + 1) * 2 > t->mask + 1) {
@@ -198,7 +205,7 @@ static int64_t si_add(ray_symimp_t* m, si_shard_t* sh, uint32_t h, const char* s
     uint32_t l32 = (uint32_t)len;
     memcpy(m->map + off, &l32, 4);
     if (len) memcpy(m->map + off + 4, s, len);
-    si_put(t, ((uint64_t)h << 32) | (uint64_t)(pos + 1));
+    si_put(t, ((uint64_t)tag << 32) | (uint64_t)(pos + 1));
     sh->used++;
     st[SI_ST_ADDED]++;
     return pos;
@@ -225,7 +232,7 @@ static si_tab_t* si_reclaim(ray_symimp_t* m) {
  * them (a column's rows then index nearby positions, which its lookups
  * over the vocabulary feel). */
 static bool si_batch(ray_symimp_t* m, int64_t n, const char* const* strs,
-                     const size_t* lens, const uint32_t* hashes, int64_t* out_pos) {
+                     const size_t* lens, const uint64_t* hashes, int64_t* out_pos) {
     uint16_t loc[2 * SI_BATCH];    /* batch slot -> first such string + 1 */
     uint16_t first[SI_BATCH];
     uint32_t lmask = 15;
@@ -235,7 +242,7 @@ static bool si_batch(ray_symimp_t* m, int64_t n, const char* const* strs,
         size_t len = strs[i] ? lens[i] : 0;
         if (len > UINT32_MAX - 4) return false;
         const char* s = strs[i] ? strs[i] : "";
-        uint32_t slot = hashes[i] & lmask;
+        uint32_t slot = (uint32_t)hashes[i] & lmask;
         for (;;) {
             uint16_t j1 = loc[slot];
             if (!j1) { loc[slot] = (uint16_t)(i + 1); first[i] = (uint16_t)i; break; }
@@ -256,9 +263,8 @@ static bool si_batch(ray_symimp_t* m, int64_t n, const char* const* strs,
     }
     for (int64_t i = 0; i < n; i++) {
         if (first[i] != i) continue;
-        uint32_t h = hashes[i];
-        si_shard_t* sh = &m->shards[h >> (32 - SI_SHARD_LOG)];
-        out_pos[i] = si_find(m, atomic_load_explicit(&sh->tab, memory_order_acquire), h,
+        si_shard_t* sh = &m->shards[si_shard_of(hashes[i])];
+        out_pos[i] = si_find(m, atomic_load_explicit(&sh->tab, memory_order_acquire), (uint32_t)hashes[i],
                              strs[i] ? strs[i] : "", strs[i] ? lens[i] : 0, st);
         st[SI_ST_PROBES]++;
         if (out_pos[i] < 0) miss++;
@@ -273,12 +279,12 @@ static bool si_batch(ray_symimp_t* m, int64_t n, const char* const* strs,
         pthread_mutex_lock(&m->alock);
         for (int64_t i = 0; i < n && ok; i++) {
             if (first[i] != i || out_pos[i] >= 0) continue;
-            uint32_t h = hashes[i];
+            uint32_t tag = (uint32_t)hashes[i];
             const char* s = strs[i] ? strs[i] : "";
             size_t len = strs[i] ? lens[i] : 0;
-            si_shard_t* sh = &m->shards[h >> (32 - SI_SHARD_LOG)];
-            int64_t pos = si_find(m, atomic_load_explicit(&sh->tab, memory_order_relaxed), h, s, len, st);
-            if (pos < 0) pos = si_add(m, sh, h, s, len, st);
+            si_shard_t* sh = &m->shards[si_shard_of(hashes[i])];
+            int64_t pos = si_find(m, atomic_load_explicit(&sh->tab, memory_order_relaxed), tag, s, len, st);
+            if (pos < 0) pos = si_add(m, sh, tag, s, len, st);
             if (pos < 0) ok = false;
             else out_pos[i] = pos;
         }
@@ -293,7 +299,7 @@ static bool si_batch(ray_symimp_t* m, int64_t n, const char* const* strs,
 }
 
 bool ray_symimp_intern_batch(ray_symimp_t* m, int64_t n, const char* const* strs,
-                             const size_t* lens, const uint32_t* hashes,
+                             const size_t* lens, const uint64_t* hashes,
                              int64_t* out_pos) {
     for (int64_t o = 0; o < n; o += SI_BATCH)
         if (!si_batch(m, n - o < SI_BATCH ? n - o : SI_BATCH, strs + o, lens + o, hashes + o, out_pos + o))
@@ -340,7 +346,7 @@ ray_symimp_t* ray_symimp_create(const char* path, _Atomic(int64_t)* count) {
     {
         const char* e = "";
         size_t z = 0;
-        uint32_t h0 = (uint32_t)ray_hash_bytes("", 0);
+        uint64_t h0 = ray_hash_bytes("", 0);
         int64_t p0 = -1;
         if (!ray_symimp_intern_batch(m, 1, &e, &z, &h0, &p0) || p0 != 0) goto fail;
     }
@@ -419,7 +425,7 @@ void ray_symimp_free(ray_symimp_t* m) {
 
 ray_symimp_t* ray_symimp_create(const char* path, _Atomic(int64_t)* count) { (void)path; (void)count; return NULL; }
 bool ray_symimp_intern_batch(ray_symimp_t* m, int64_t n, const char* const* strs,
-                             const size_t* lens, const uint32_t* hashes, int64_t* out_pos) {
+                             const size_t* lens, const uint64_t* hashes, int64_t* out_pos) {
     (void)m; (void)n; (void)strs; (void)lens; (void)hashes; (void)out_pos; return false;
 }
 ray_err_t ray_symimp_sync(ray_symimp_t* m, bool durable) { (void)m; (void)durable; return RAY_ERR_IO; }

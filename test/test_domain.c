@@ -37,6 +37,7 @@
 #include "mem/heap.h"
 #include "table/sym.h"
 #include "table/domain.h"
+#include "table/symimp.h"   /* ray_symimp_stats_t: the import dictionary's counts */
 #include "store/col.h"
 #include "store/serde.h"
 #include "core/pool.h"   /* the batch intern probes on the pool */
@@ -2388,11 +2389,72 @@ static test_result_t test_domain_import_dict_reclaim(void) {
     unlink(TMP_DOM_SYM_PATH "_impr.lk");
     PASS();
 }
+/* The import dictionary takes the shard from the 64-bit hash's top bits and
+ * keeps its low 32 as the slot tag.  Crafted hashes (the dictionary trusts
+ * the caller's): 1024 strings whose hashes share the low 32 bits but not
+ * the top 10 land in 1024 shards, and are added and found again without a
+ * single tag matching another string; 64 strings sharing one whole hash all
+ * get positions of their own and are found by their bytes.  Every position
+ * survives a re-intern, and the 32-bit entry point, which hashes again,
+ * finds strings the 64-bit one added under their real hashes. */
+#define IMP_SPREAD 1024
+#define IMP_SAME   64
+static test_result_t test_domain_import_dict_tags(void) {
+    const char* p = TMP_DOM_SYM_PATH "_impt";
+    unlink(p);
+    ray_sym_domain_t* dom = ray_sym_domain_create_import(p);
+    if (!dom) SKIP("import dictionary unsupported here");
+    enum { N = IMP_SPREAD + IMP_SAME };
+    static char bufs[N][32];
+    const char* strs[N]; size_t lens[N]; uint64_t hs[N]; int64_t pos[N], again[N];
+    for (int i = 0; i < N; i++) {
+        lens[i] = (size_t)snprintf(bufs[i], sizeof(bufs[i]), "tag-%d", i); strs[i] = bufs[i];
+        hs[i] = i < IMP_SPREAD ? ((uint64_t)i << 54) | UINT64_C(0x5a5a5a5a)
+                               : UINT64_C(0x0123456789abcdef);
+    }
+    ray_symimp_stats_t st;
+    ray_sym_domain_import_stats(dom, &st);   /* from zero */
+    TEST_ASSERT_TRUE(ray_sym_domain_intern_batch64(dom, IMP_SPREAD, strs, lens, hs, pos));
+    TEST_ASSERT_TRUE(ray_sym_domain_intern_batch64(dom, IMP_SPREAD, strs, lens, hs, again));
+    TEST_ASSERT_TRUE(ray_sym_domain_import_stats(dom, &st));
+    TEST_ASSERT_EQ_I(st.added, IMP_SPREAD);
+    TEST_ASSERT_EQ_I(st.hits, IMP_SPREAD);
+    TEST_ASSERT_EQ_I(st.false_tags, 0);
+    /* one at a time, so each is looked up in the shard the others fill */
+    for (int i = IMP_SPREAD; i < N; i++)
+        TEST_ASSERT_TRUE(ray_sym_domain_intern_batch64(dom, 1, strs + i, lens + i, hs + i, pos + i));
+    for (int i = IMP_SPREAD; i < N; i++)
+        TEST_ASSERT_TRUE(ray_sym_domain_intern_batch64(dom, 1, strs + i, lens + i, hs + i, again + i));
+    TEST_ASSERT_TRUE(ray_sym_domain_import_stats(dom, &st));
+    TEST_ASSERT_EQ_I(st.added, IMP_SAME);
+    TEST_ASSERT_TRUE(st.false_tags > 0);
+    for (int i = 0; i < N; i++) {
+        TEST_ASSERT_EQ_I(pos[i], i + 1);   /* "" is position 0 */
+        TEST_ASSERT_EQ_I(again[i], pos[i]);
+    }
+    TEST_ASSERT_EQ_I(ray_sym_domain_count(dom), N + 1);
+    /* real hashes: added through the 64-bit entry, found through the 32-bit */
+    const char* real = "a real hash";
+    size_t rl = strlen(real);
+    uint64_t rh = ray_hash_bytes(real, rl);
+    uint32_t rh32 = (uint32_t)rh;
+    int64_t r64 = -1, r32 = -2;
+    TEST_ASSERT_TRUE(ray_sym_domain_intern_batch64(dom, 1, &real, &rl, &rh, &r64));
+    TEST_ASSERT_TRUE(ray_sym_domain_intern_batch(dom, 1, &real, &rl, &rh32, &r32));
+    TEST_ASSERT_EQ_I(r64, N + 1);
+    TEST_ASSERT_EQ_I(r32, r64);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom, real, rl), r64);
+    ray_sym_domain_release(dom);
+    unlink(p);
+    unlink(TMP_DOM_SYM_PATH "_impt.lk");
+    PASS();
+}
 const test_entry_t domain_entries[] = {
     { "domain/private", test_domain_private, domain_setup, domain_teardown },
     { "domain/flush_append", test_domain_flush_append, domain_setup, domain_teardown },
     { "domain/import_dict", test_domain_import_dict, domain_setup, domain_teardown },
     { "domain/import_dict_reclaim", test_domain_import_dict_reclaim, domain_setup, domain_teardown },
+    { "domain/import_dict_tags", test_domain_import_dict_tags, domain_setup, domain_teardown },
     { "domain/runtime_identity",        test_domain_runtime_identity,        domain_setup, domain_teardown },
     { "domain/runtime_delegation",      test_domain_runtime_delegation,      domain_setup, domain_teardown },
     { "domain/vec_new_attach",          test_domain_vec_new_attach,          domain_setup, domain_teardown },

@@ -193,6 +193,12 @@ int64_t ray_sym_domain_intern(ray_sym_domain_t* dom, const char* str, size_t len
 bool ray_sym_domain_intern_batch(ray_sym_domain_t* dom, int64_t n,
                                  const char* const* strs, const size_t* lens,
                                  const uint32_t* hashes, int64_t* out_pos);
+/* The same with hashes[i] = ray_hash_bytes of strs[i], all 64 bits: the
+ * import dictionary keys on them (the 32-bit entry point hashes its strings
+ * again for it); the other domains take their low 32 bits. */
+bool ray_sym_domain_intern_batch64(ray_sym_domain_t* dom, int64_t n,
+                                   const char* const* strs, const size_t* lens,
+                                   const uint64_t* hashes, int64_t* out_pos);
 
 /* Number of entries in the domain. */
 int64_t ray_sym_domain_count(ray_sym_domain_t* dom);
