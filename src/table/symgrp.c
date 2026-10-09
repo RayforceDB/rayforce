@@ -161,6 +161,7 @@ struct ray_symgrp_s {
     uint32_t*          pos_of;            /* [nown] */
     uint32_t*          t_of;              /* [nown] */
     int64_t*           off_of;            /* [nown]: SHARDS, FREQ */
+    int64_t            aend, rend;        /* ROWS*: the ends of the runs met again and of the others */
     int64_t*           offb;              /* [2 ntasks]: ROWS*, a task's records (the
                                            * others, then those met again) */
     uint32_t*          gslots;            /* step 2's group table, sized for the largest */
@@ -175,6 +176,7 @@ struct ray_symgrp_s {
     sg_list_t*         dl;                /* [workers] deferred candidates */
     sg_list_t*         db;                /* [workers] their bytes */
     sg_ovr_t*          ovr;               /* by (t, local) */
+    int64_t            clo, chi;          /* records sg_collide added since the last writeback */
     int64_t            novr;
     ray_symgrp_stats_t st;
     _Atomic(int64_t)   compares, cmp_bytes;
@@ -229,6 +231,7 @@ bool ray_symgrp_begin(ray_symgrp_t* g, int64_t ntasks, int groups, int64_t worke
     g->lg = lg;
     g->ntasks = ntasks < 0 ? 0 : ntasks;
     g->workers = workers < 1 ? 1 : workers;
+    g->clo = g->chi = 0;
     g->tasks = (sg_task_t*)ray_sys_alloc((size_t)(g->ntasks ? g->ntasks : 1) * sizeof(sg_task_t));
     g->dl = (sg_list_t*)ray_sys_alloc((size_t)g->workers * sizeof(sg_list_t));
     g->db = (sg_list_t*)ray_sys_alloc((size_t)g->workers * sizeof(sg_list_t));
@@ -458,6 +461,7 @@ bool ray_symgrp_resolve(ray_symgrp_t* g) {
     for (int64_t t = 0; t < g->ntasks; t++) bytes += g->tasks[t].bytes;
     g->nown = nown; g->st.owners += nown;
     if (ok && nown) ok = ray_symimp_reserve(g->imp, nown, bytes, &g->pos0, &g->off0);
+    if (ok && nown) g->st.rec_bytes += bytes;
     if (ok && sg_rows(g)) {
         /* positions by task, then by local id: the strings later tasks meet
          * again (ROWS) first, task by task, then the others; in each a
@@ -482,6 +486,7 @@ bool ray_symgrp_resolve(ray_symgrp_t* g) {
             }
             base += k->owned - k->nagain; abase += k->nagain;
         }
+        g->aend = aoff; g->rend = off;
         /* the new strings join the index, task by task */
         for (int64_t t = 0; ok && t < g->ntasks; t++) {
             const sg_task_t* k = &g->tasks[t];
@@ -596,6 +601,39 @@ int64_t ray_symgrp_window(const ray_symgrp_t* g, int64_t ta, int64_t budget) {
     int64_t tb = ta, sum = 0;
     while (tb < g->ntasks && (tb == ta || sum + g->tasks[tb].cand <= budget)) sum += g->tasks[tb++].cand;
     return tb;
+}
+
+/* Writeback of what window [ta, tb) wrote, started as the window ends: the
+ * whole pass's records reserved at once, the file's sync would start only
+ * the first window's and leave the rest dirty until the final one.  ROWS*:
+ * the window's run of the strings met again and its run of the others,
+ * each contiguous; SHARDS, FREQ: the span of the window's new records; and
+ * the records the window's collisions added. */
+static void sg_wb(ray_symgrp_t* g, int64_t lo, int64_t hi) {
+    if (hi <= lo) return;
+    ray_symimp_writeback(g->imp, lo, hi - lo);
+    g->st.wb_bytes += hi - lo;
+}
+void ray_symgrp_writeback(ray_symgrp_t* g, int64_t ta, int64_t tb) {
+    if (ta < 0 || tb > g->ntasks || ta >= tb) return;
+    if (sg_rows(g) && g->offb) {
+        sg_wb(g, g->offb[2 * ta + 1], tb < g->ntasks ? g->offb[2 * tb + 1] : g->aend);
+        sg_wb(g, g->offb[2 * ta], tb < g->ntasks ? g->offb[2 * tb] : g->rend);
+    } else if (g->off_of) {
+        int64_t lo = INT64_MAX, hi = 0;
+        for (int64_t t = ta; t < tb; t++) {
+            const sg_task_t* k = &g->tasks[t];
+            for (int64_t i = 0; i < k->n; i++) {
+                if (SG_KIND(k->r[i]) != RAY_SYMGRP_NEW) continue;
+                int64_t off = g->off_of[SG_VAL(k->r[i])], end = off + 4 + k->fp[i].len;
+                if (off < lo) lo = off;
+                if (end > hi) hi = end;
+            }
+        }
+        sg_wb(g, lo, hi);
+    }
+    sg_wb(g, g->clo, g->chi);
+    g->clo = g->chi = 0;
 }
 
 /* Records read in position order go through spans of neighbouring records
@@ -792,6 +830,9 @@ static int64_t sg_collide(ray_symgrp_t* g, uint64_t h, const char* s, uint32_t l
         if (ray_symimp_reserve(g->imp, 1, 4 + (int64_t)len, &p0, &o0) &&
             (x = (sg_ent_t*)sg_push(&g->logs[sg_log(h)], sizeof(sg_ent_t)))) {
             ray_symimp_put(g->imp, p0, o0, s, len);
+            if (g->chi <= g->clo) g->clo = o0;
+            g->chi = o0 + 4 + (int64_t)len;
+            g->st.rec_bytes += 4 + (int64_t)len;
             *x = (sg_ent_t){h, len, (uint32_t)p0};
             g->entries++;
             pos = p0;
@@ -914,6 +955,7 @@ int64_t ray_symgrp_task_size(const ray_symgrp_t* g, int64_t t) { (void)g; (void)
 bool ray_symgrp_task(const ray_symgrp_t* g, int64_t t, ray_symgrp_res_t* res) { (void)g; (void)t; (void)res; return false; }
 int64_t ray_symgrp_task_off(const ray_symgrp_t* g, int64_t t, bool again) { (void)g; (void)t; (void)again; return -1; }
 int64_t ray_symgrp_window(const ray_symgrp_t* g, int64_t ta, int64_t budget) { (void)g; (void)budget; return ta + 1; }
+void ray_symgrp_writeback(ray_symgrp_t* g, int64_t ta, int64_t tb) { (void)g; (void)ta; (void)tb; }
 bool ray_symgrp_load(ray_symgrp_t* g, int64_t ta, int64_t tb) { (void)g; (void)ta; (void)tb; return false; }
 bool ray_symgrp_same(ray_symgrp_t* g, uint32_t pos, const char* s, uint32_t len) { (void)g; (void)pos; (void)s; (void)len; return false; }
 bool ray_symgrp_defer(ray_symgrp_t* g, uint32_t worker, int64_t t, uint32_t local, uint64_t h, uint32_t pos, const char* s, uint32_t len) {

@@ -893,7 +893,12 @@ static int64_t pq_sym_count(const char* dir) {
 /* The grouped import of a 9-row-group file: every row's string, the same
  * vocabulary as the direct import's, and positions (the symbol file and the
  * column file byte for byte) that do not depend on the worker count, in
- * every order of new positions, over several hash groups and windows. */
+ * every order of new positions, over several hash groups and windows.  Its
+ * trace: no collision on this data (a comparison that never matched would
+ * still give every string a position, through the collision path), and
+ * every record's writeback started by the window that wrote it (exactly
+ * the records' bytes in the orders that write each window's records side
+ * by side). */
 static test_result_t test_pq_sym_grouped(void) {
     pq_sym_env_clear();
     char src[160]; snprintf(src, sizeof(src), "/tmp/rayforce-pq-synth-%d.parquet", (int)getpid());
@@ -904,6 +909,9 @@ static test_result_t test_pq_sym_grouped(void) {
     const char* names[] = {"x","s","t"};
     const char* orders[] = {"rows","shards","freq","rowsflat"};
     char dir[160], ref[160], a[200], b[200];
+    size_t cap = (size_t)1 << 16;
+    char* trace = (char*)ray_sys_alloc(cap);
+    TEST_ASSERT_TRUE(trace != NULL);
     snprintf(dir, sizeof(dir), "/tmp/rayforce-pq-sg-direct-%d", (int)getpid());
     pq_set_symmode("direct");
     ray_t* res = ray_parquet_splayed_typed(src, dir, types);
@@ -922,11 +930,20 @@ static test_result_t test_pq_sym_grouped(void) {
             ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(cores), RAY_OK);
             snprintf(dir, sizeof(dir), "/tmp/rayforce-pq-sg-%d-%d-%d", (int)getpid(), o, cores);
             pq_set_symmode("grouped"); pq_set_layout(cores == 2 ? "1" : NULL);
-            res = ray_parquet_splayed_typed(src, dir, types);
+            res = pq_traced_import(src, dir, types, trace, cap);
             pq_set_symmode(NULL); pq_set_layout(NULL);
             TEST_ASSERT_FALSE(RAY_IS_ERR(res)); TEST_ASSERT_EQ_I(res->i64, rows); ray_release(res);
             TEST_ASSERT_TRUE(pq_synth_check(dir, rows, pq_synth_mixed));
             TEST_ASSERT_EQ_I(pq_sym_count(dir), words);   /* no string twice */
+            int passes = 0;
+            double windows = pq_trace_sum(trace, "windows", &passes);
+            double recb = pq_trace_sum(trace, "rec_bytes", NULL), wbb = pq_trace_sum(trace, "wb_bytes", NULL);
+            TEST_ASSERT_EQ_I(passes, 2);
+            TEST_ASSERT_TRUE(windows > 2 * passes);
+            TEST_ASSERT_TRUE(pq_trace_sum(trace, "collisions", NULL) == 0);
+            TEST_ASSERT_TRUE(recb > 0);
+            if (o == 0 || o == 3) TEST_ASSERT_TRUE(wbb == recb);
+            else TEST_ASSERT_TRUE(wbb >= recb);
             if (cores > 1) {
                 snprintf(a, sizeof(a), "%s/.sym", ref); snprintf(b, sizeof(b), "%s/.sym", dir);
                 TEST_ASSERT_TRUE(pq_same_file(a, b));
@@ -942,6 +959,7 @@ static test_result_t test_pq_sym_grouped(void) {
     }
     pq_set_env("RAY_PQ_SYM_ORDER", NULL); pq_set_env("RAY_PQ_SYM_GROUPS", NULL);
     pq_set_env("RAY_PQ_SYM_WINDOW", NULL);
+    ray_sys_free(trace);
     ray_release(types); unlink(src);
     PASS();
 }
@@ -982,10 +1000,16 @@ static test_result_t test_pq_sym_grouped_collisions(void) {
             pq_set_env("RAY_PQ_SYM_ORDER", orders[o]);
             pq_set_env("RAY_PQ_SYM_HASH_BITS", "0");
             pq_set_symmode("grouped");
-            res = ray_parquet_splayed_typed(src, dir, types);
+            char trace[8192];
+            res = pq_traced_import(src, dir, types, trace, sizeof(trace));
             TEST_ASSERT_FALSE(RAY_IS_ERR(res)); ray_release(res);
             TEST_ASSERT_TRUE(pq_synth_check(dir, 3000, pq_synth_alike));
             TEST_ASSERT_EQ_I(pq_sym_count(dir), 49);   /* "" and the 48 */
+            /* the trace counts the collisions, and the writeback covers the
+             * records they added */
+            TEST_ASSERT_TRUE(pq_trace_sum(trace, "collisions", NULL) > 0);
+            double recb = pq_trace_sum(trace, "rec_bytes", NULL), wbb = pq_trace_sum(trace, "wb_bytes", NULL);
+            TEST_ASSERT_TRUE(o == 0 || o == 3 ? wbb == recb : wbb >= recb);
             pq_remove_native(dir, names, 3);
             pq_set_env("RAY_PQ_SYM_HASH_BITS", "6");
             res = ray_parquet_splayed_typed(mix, dir, types);

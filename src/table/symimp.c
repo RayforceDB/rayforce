@@ -356,6 +356,10 @@ bool ray_symimp_write(ray_symimp_t* m, int64_t off, const void* buf, size_t n) {
     return true;
 }
 
+void ray_symimp_writeback(ray_symimp_t* m, int64_t off, int64_t len) {
+    ray_file_writeback_start(m->fd, off, len);
+}
+
 int64_t ray_symimp_offset(const ray_symimp_t* m, int64_t pos) {
     return (int64_t)si_off(m, pos);
 }
@@ -504,6 +508,7 @@ void ray_symimp_put(ray_symimp_t* m, int64_t pos, int64_t off, const char* s, ui
 }
 void ray_symimp_place(ray_symimp_t* m, int64_t pos, int64_t off) { (void)m; (void)pos; (void)off; }
 bool ray_symimp_write(ray_symimp_t* m, int64_t off, const void* buf, size_t n) { (void)m; (void)off; (void)buf; (void)n; return false; }
+void ray_symimp_writeback(ray_symimp_t* m, int64_t off, int64_t len) { (void)m; (void)off; (void)len; }
 int64_t ray_symimp_offset(const ray_symimp_t* m, int64_t pos) { (void)m; (void)pos; return -1; }
 const char* ray_symimp_get(const ray_symimp_t* m, int64_t pos, uint32_t* len) { (void)m; (void)pos; *len = 0; return NULL; }
 void ray_symimp_willneed(const ray_symimp_t* m, int64_t off, int64_t len) { (void)m; (void)off; (void)len; }

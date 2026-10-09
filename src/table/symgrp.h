@@ -103,6 +103,7 @@ typedef struct {
     int64_t store_read, settle_read;                /* bytes asked of the file for them */
     int64_t store_kept, windows;                    /* records kept from the window before */
     int64_t stage_bytes;                            /* the tasks' arrays: their chunks' bytes */
+    int64_t rec_bytes, wb_bytes;                    /* records written; bytes whose writeback the windows started */
     int64_t deferred, compares, cmp_bytes, collisions, redo;
 } ray_symgrp_stats_t;
 
@@ -153,6 +154,9 @@ bool ray_symgrp_mismatch(ray_symgrp_t* g, uint32_t worker, int64_t t, uint32_t l
 bool ray_symgrp_settle(ray_symgrp_t* g, int64_t** redo, int64_t* nredo);
 /* The position settled for (t, local) after a mismatch; -1 if none. */
 int64_t ray_symgrp_override(const ray_symgrp_t* g, int64_t t, uint32_t local);
+/* After the window and its codes written again: start the writeback of the
+ * records it wrote (and of those its collisions added). */
+void ray_symgrp_writeback(ray_symgrp_t* g, int64_t ta, int64_t tb);
 /* Step 3's own comparisons, for the counts. */
 void ray_symgrp_note(ray_symgrp_t* g, int64_t compares, int64_t bytes);
 /* End of the pass: its state freed, the logs kept for the next. */

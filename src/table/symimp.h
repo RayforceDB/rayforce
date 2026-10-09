@@ -90,6 +90,9 @@ void ray_symimp_put(ray_symimp_t* m, int64_t pos, int64_t off, const char* s, ui
  * mapping is faulted in for it), its offset noted with ray_symimp_place. */
 void ray_symimp_place(ray_symimp_t* m, int64_t pos, int64_t off);
 bool ray_symimp_write(ray_symimp_t* m, int64_t off, const void* buf, size_t n);
+/* Start writing back file bytes [off, off + len): records the caller has
+ * written, ray_symimp_sync covering everything reserved at once. */
+void ray_symimp_writeback(ray_symimp_t* m, int64_t off, int64_t len);
 /* Record `pos` of the file, written: its bytes (in the mapping) and length,
  * and the offset of its length prefix. */
 const char* ray_symimp_get(const ray_symimp_t* m, int64_t pos, uint32_t* len);
