@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 #if !defined(RAY_OS_WINDOWS) && !defined(RAY_OS_WASM)
 #include <pthread.h>
 #endif
@@ -846,6 +847,38 @@ static const char* pq_synth_long(int64_t r, char* buf, uint32_t* len) {
     *len = 100;
     return buf;
 }
+/* An import with RAY_CSV_TRACE set, its trace (stderr) kept in buf, which
+ * ends with a NUL; buf is empty when stderr cannot be redirected. */
+static ray_t* pq_traced_import(const char* src, const char* dir, ray_t* types, char* buf, size_t cap) {
+    char path[160]; snprintf(path, sizeof(path), "/tmp/rayforce-pq-trace-%d.txt", (int)getpid());
+    buf[0] = 0;
+    fflush(stderr);
+    int saved = dup(2), fd = open(path, O_CREAT | O_TRUNC | O_RDWR, 0600);
+    bool redirected = saved >= 0 && fd >= 0 && dup2(fd, 2) >= 0;
+    if (fd >= 0) close(fd);
+    pq_set_env("RAY_CSV_TRACE", "1");
+    ray_t* res = ray_parquet_splayed_typed(src, dir, types);
+    pq_set_env("RAY_CSV_TRACE", NULL);
+    fflush(stderr);
+    if (redirected) dup2(saved, 2);
+    if (saved >= 0) close(saved);
+    FILE* f = redirected ? fopen(path, "rb") : NULL;
+    size_t n = f ? fread(buf, 1, cap - 1, f) : 0;
+    if (f) fclose(f);
+    buf[n] = 0;
+    unlink(path);
+    return res;
+}
+/* The sum of a trace field (" key=value") over the trace's lines, and how
+ * many lines have it. */
+static double pq_trace_sum(const char* buf, const char* key, int* lines) {
+    char pat[64]; snprintf(pat, sizeof(pat), " %s=", key);
+    size_t pl = strlen(pat);
+    double sum = 0; int n = 0;
+    for (const char* p = buf; (p = strstr(p, pat)); p += pl) { sum += strtod(p + pl, NULL); n++; }
+    if (lines) *lines = n;
+    return sum;
+}
 /* The entries of an import's symbol file (its header count). */
 static int64_t pq_sym_count(const char* dir) {
     char path[200]; snprintf(path, sizeof(path), "%s/.sym", dir);
@@ -1449,9 +1482,11 @@ static test_result_t test_pq_sym_grouped_edges(void) {
     PASS();
 #endif
 }
-/* Probe (not in the default run's assertions beyond correctness): a file of
- * many small row groups, grouped or direct by PQ_RG_MODE, prints the
- * process's committed-memory peak, so the two modes can be compared in
+/* A file of many small row groups (4000 of 2 rows; PQ_RG_GROUPS), grouped
+ * (or direct by PQ_RG_MODE): the grouped pass's staged arrays and its
+ * workers' dedupe arenas cost memory by the rows, not a few pages a row
+ * group or the generation limit (their bytes from the trace).  It prints
+ * the process's committed-memory peak too, for the modes compared in
  * separate processes. */
 static test_result_t test_pq_sym_grouped_rowgroups(void) {
     pq_sym_env_clear();
@@ -1469,20 +1504,32 @@ static test_result_t test_pq_sym_grouped_rowgroups(void) {
     ray_mem_stats_t st0, st1;
     ray_mem_stats(&st0);
     pq_set_symmode(mode ? mode : "grouped");
-    ray_t* res = ray_parquet_splayed_typed(src, dir, types);
+    size_t cap = (size_t)1 << 16;
+    char* trace = (char*)ray_sys_alloc(cap);
+    TEST_ASSERT_TRUE(trace != NULL);
+    ray_t* res = pq_traced_import(src, dir, types, trace, cap);
     pq_set_symmode(NULL);
     ray_mem_stats(&st1);
     bool failed = !res || RAY_IS_ERR(res);
     if (failed) fprintf(stderr, "  rowgroups: import failed: %s\n", res ? ray_err_code(res) : "null");
     if (res) { if (failed) ray_error_free(res); else ray_release(res); }
+    int passes = 0;
+    double stage = pq_trace_sum(trace, "stage_mb", &passes);
+    double arena = pq_trace_sum(trace, "arena_mb", NULL);
+    ray_sys_free(trace);
     long hwm = -1;
     FILE* f = fopen("/proc/self/status", "r");
     if (f) { char line[256]; while (fgets(line, sizeof(line), f)) if (!strncmp(line, "VmHWM:", 6)) hwm = atol(line + 6); fclose(f); }
-    fprintf(stderr, "  rowgroups: mode=%s groups=%lld sys_peak=%.1fMB (before %.1fMB) VmHWM=%ldkB\n",
-            mode ? mode : "grouped", (long long)groups, (double)st1.sys_peak / 1048576.0,
+    fprintf(stderr, "  rowgroups: mode=%s groups=%lld stage=%.1fMB arenas=%.1fMB in %d passes sys_peak=%.1fMB (before %.1fMB) VmHWM=%ldkB\n",
+            mode ? mode : "grouped", (long long)groups, stage, arena, passes, (double)st1.sys_peak / 1048576.0,
             (double)st0.sys_peak / 1048576.0, hwm);
     TEST_ASSERT_FALSE(failed);
     TEST_ASSERT_TRUE(pq_synth_check(dir, rows, pq_synth_mixed));
+    if (!mode || !strcmp(mode, "grouped")) {
+        TEST_ASSERT_EQ_I(passes, 2);
+        TEST_ASSERT_TRUE(stage <= 2.0 * passes * (double)(groups > 4000 ? groups / 4000 : 1));
+        TEST_ASSERT_TRUE(arena <= 1.0 * passes);   /* four workers, their arenas grown to the chunks' bytes */
+    }
     pq_remove_native(dir, names, 3);
     ray_pool_destroy();
     ray_release(types); unlink(src);

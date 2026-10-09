@@ -2008,13 +2008,17 @@ static void pq_dedup_free(pq_dedup* d) {
     ray_free_raw(d->aoff); ray_free_raw(d->arena);
     memset(d,0,sizeof(*d));
 }
-static bool pq_dedup_init(pq_dedup* d, int64_t acap, bool counts) {
+/* The arena starts small and doubles up to a generation's bytes: a worker
+ * whose chunks are small never holds the generation limit's memory. */
+#define PQ_DEDUP_ARENA0 ((int64_t)64 << 10)
+static bool pq_dedup_init(pq_dedup* d, int64_t alim, bool counts) {
     memset(d,0,sizeof(*d));
-    d->acap = d->alim = acap; d->first = 1; d->cap = 1024; d->mask = 2047;
+    d->alim = alim; d->acap = alim < PQ_DEDUP_ARENA0 ? alim : PQ_DEDUP_ARENA0;
+    d->first = 1; d->cap = 1024; d->mask = 2047;
     d->fp = ray_alloc_raw((size_t)d->cap*sizeof(*d->fp));
     d->aoff = ray_alloc_raw((size_t)d->cap*sizeof(*d->aoff));
     d->slot = ray_calloc_raw((size_t)(d->mask+1)*sizeof(*d->slot));
-    d->arena = ray_alloc_raw((size_t)acap);
+    d->arena = ray_alloc_raw((size_t)(d->acap > 0 ? d->acap : 1));
     if (counts) d->cnt = ray_calloc_raw((size_t)(d->cap+1)*sizeof(*d->cnt));
     return d->fp && d->aoff && d->slot && d->arena && (!counts || d->cnt);
 }
@@ -2076,10 +2080,15 @@ static uint32_t pq_dedup_id(pq_dedup* d, uint64_t h, const char* s, uint32_t len
         i = h & d->mask;
         while (d->slot[i]) i = (i+1) & d->mask;
     }
-    if (d->abytes+len > d->acap) {   /* one string past the arena */
-        char* a = ray_realloc_raw(d->arena,(size_t)(d->abytes+len));
+    if (d->abytes+len > d->acap) {
+        /* doubled up to the generation's bytes (past them by one string at
+         * most) */
+        int64_t need = d->abytes+len, nc = d->acap*2;
+        if (nc > d->alim) nc = d->alim;
+        if (nc < need) nc = need;
+        char* a = ray_realloc_raw(d->arena,(size_t)nc);
         if (!a) return 0;
-        d->arena = a; d->acap = d->abytes+len;
+        d->arena = a; d->acap = nc;
     }
     if (len) memcpy(d->arena+d->abytes,s,len);
     d->aoff[d->n+1-d->first] = d->abytes; d->abytes += len;
@@ -2609,13 +2618,15 @@ static void pq_sym_grouped(pq_direct_work* dw, ray_symgrp_t* g, ray_symimp_t* im
         io3 = pq_io_now(); t3 = ray_profile_now_ns();
         ray_symgrp_stats_t st;
         ray_symgrp_stats(g,&st);
+        int64_t arena = 0;   /* the workers' dedupe arenas, as grown */
+        for (int64_t i = 0; i < w.nws; i++) arena += w.ws[i].d.acap;
         ray_t* nm = ray_sym_str(r->schema[c].name);
         static const char* orders[] = {"rows","shards","freq","rowsflat"};
-        fprintf(stderr,"parquet symgrp: col=%.*s order=%s groups=%d windows=%lld rows=%lld gens=%lld staged=%lld"
+        fprintf(stderr,"parquet symgrp: col=%.*s order=%s groups=%d windows=%lld rows=%lld gens=%lld staged=%lld stage_mb=%.1f arena_mb=%.1f"
                 " owners=%lld again=%lld again_mb=%.1f old=%lld refs=%lld log_loaded=%lld budget_mb=%.0f store_cap_mb=%.0f store_pos=%lld store_spans=%lld store_mb=%.1f"
                 " store_read_mb=%.1f store_kept=%lld deferred=%lld settle_read_mb=%.1f compares=%lld cmp_mb=%.1f collisions=%lld redo=%lld entries=%lld\n",
                 (int)ray_str_len(nm),ray_str_ptr(nm),orders[ray_symgrp_order(g)],groups,(long long)st.windows,
-                (long long)atomic_load(&w.rows),(long long)atomic_load(&w.gens),(long long)st.staged,
+                (long long)atomic_load(&w.rows),(long long)atomic_load(&w.gens),(long long)st.staged,(double)st.stage_bytes/1048576.0,(double)arena/1048576.0,
                 (long long)st.owners,(long long)st.again,(double)st.again_bytes/1048576.0,(long long)st.old,(long long)st.refs,(long long)st.log_loaded,
                 (double)budget/1048576.0,(double)store/1048576.0,
                 (long long)st.store_pos,(long long)st.store_spans,(double)st.store_bytes/1048576.0,

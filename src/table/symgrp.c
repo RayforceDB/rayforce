@@ -31,6 +31,7 @@
 #include <stdlib.h>
 #include <stdatomic.h>
 #include <string.h>
+#include <unistd.h>
 
 /* ---- append-only chunk lists --------------------------------------------
  * Items of one size in chunks that double from 16 KB to 4 MB: a small list
@@ -154,6 +155,8 @@ struct ray_symgrp_s {
     int                lg;                /* log2 of the groups */
     int64_t            ntasks, workers;
     sg_task_t*         tasks;
+    sg_list_t          stage;             /* the tasks' arrays (sg_stage_alloc) */
+    pthread_mutex_t    slock;             /* stage */
     int64_t            nown, pos0, off0;
     uint32_t*          pos_of;            /* [nown] */
     uint32_t*          t_of;              /* [nown] */
@@ -190,6 +193,7 @@ ray_symgrp_t* ray_symgrp_new(ray_symimp_t* imp, ray_symgrp_order_t order) {
     g->imp = imp; g->order = order;
     atomic_init(&g->compares, 0); atomic_init(&g->cmp_bytes, 0);
     if (pthread_mutex_init(&g->lock, NULL) != 0) { ray_sys_free(g); return NULL; }
+    if (pthread_mutex_init(&g->slock, NULL) != 0) { pthread_mutex_destroy(&g->lock); ray_sys_free(g); return NULL; }
     return g;
 }
 
@@ -204,12 +208,7 @@ void ray_symgrp_end(ray_symgrp_t* g) {
     sg_window_free(g);
     ray_sys_free(g->dl); ray_sys_free(g->db); g->dl = g->db = NULL;
     ray_sys_free(g->ovr); g->ovr = NULL; g->novr = 0;
-    if (g->tasks) for (int64_t t = 0; t < g->ntasks; t++) {
-        sg_task_t* k = &g->tasks[t];
-        ray_sys_free(k->fp); ray_sys_free(k->seg); ray_sys_free(k->r);
-        ray_sys_free(k->cnt); ray_sys_free(k->own); ray_sys_free(k->rank);
-        ray_sys_free(k->again); ray_sys_free(k->arank);
-    }
+    sg_list_free(&g->stage);   /* every task's arrays */
     ray_sys_free(g->tasks); g->tasks = NULL; g->ntasks = 0;
     ray_sys_free(g->pos_of); ray_sys_free(g->t_of); ray_sys_free(g->off_of); ray_sys_free(g->offb);
     g->pos_of = NULL; g->t_of = NULL; g->off_of = NULL; g->offb = NULL; g->nown = 0;
@@ -219,7 +218,7 @@ void ray_symgrp_free(ray_symgrp_t* g) {
     if (!g) return;
     ray_symgrp_end(g);
     for (int i = 0; i < RAY_SYMGRP_MAX; i++) sg_list_free(&g->logs[i]);
-    pthread_mutex_destroy(&g->lock);
+    pthread_mutex_destroy(&g->lock); pthread_mutex_destroy(&g->slock);
     ray_sys_free(g);
 }
 
@@ -237,6 +236,52 @@ bool ray_symgrp_begin(ray_symgrp_t* g, int64_t ntasks, int groups, int64_t worke
     return true;   /* zero-filled (mem/sys.h) */
 }
 
+/* ---- the pass's staging ------------------------------------------------
+ * A task's arrays (its distinct strings, their verdicts and hash group
+ * bounds, the ROWS bitmaps) are one block cut from chunks the pass's tasks
+ * share: a file of many small row groups costs bytes by its rows, not
+ * mappings by its row groups.  A block past an eighth of a chunk is a
+ * mapping of its own.  Zero-filled (fresh mappings, never reused in the
+ * pass); all freed with the pass. */
+#define SG_STAGE_CHUNK (((int64_t)1 << 20) - 256)
+/* What a block of `bytes` maps (mem/sys.h: a header, whole pages). */
+static int64_t sg_mapped(int64_t bytes) {
+    int64_t pg = (int64_t)sysconf(_SC_PAGESIZE);
+    if (pg <= 0) pg = 4096;
+    return (bytes + 32 + pg - 1) / pg * pg;
+}
+static void* sg_stage_alloc(ray_symgrp_t* g, int64_t bytes) {
+    bytes = (bytes + 15) & ~(int64_t)15;
+    pthread_mutex_lock(&g->slock);
+    sg_list_t* l = &g->stage;
+    sg_chunk_t* c = l->tail;
+    void* p = NULL;
+    if (bytes > SG_STAGE_CHUNK / 8) {
+        /* full from the start, at the head: the tail stays the chunk cut */
+        sg_chunk_t* nc = (sg_chunk_t*)ray_sys_alloc(sizeof(sg_chunk_t) + (size_t)bytes);
+        if (nc) {
+            nc->n = nc->cap = bytes; nc->next = l->head;
+            l->head = nc; if (!l->tail) l->tail = nc;
+            g->st.stage_bytes += sg_mapped((int64_t)sizeof(sg_chunk_t) + bytes);
+            p = nc->data;
+        }
+    } else {
+        if (!c || c->cap - c->n < bytes) {
+            sg_chunk_t* nc = (sg_chunk_t*)ray_sys_alloc(sizeof(sg_chunk_t) + (size_t)SG_STAGE_CHUNK);
+            if (nc) {
+                nc->n = 0; nc->cap = SG_STAGE_CHUNK; nc->next = NULL;
+                if (c) c->next = nc; else l->head = nc;
+                l->tail = nc;
+                g->st.stage_bytes += sg_mapped((int64_t)sizeof(sg_chunk_t) + SG_STAGE_CHUNK);
+            }
+            c = nc;
+        }
+        if (c) { p = c->data + c->n; c->n += bytes; }
+    }
+    pthread_mutex_unlock(&g->slock);
+    return p;
+}
+
 static inline int sg_group(const ray_symgrp_t* g, uint64_t h) {
     return g->lg ? (int)(h >> (64 - g->lg)) : 0;
 }
@@ -247,30 +292,32 @@ bool ray_symgrp_stage(ray_symgrp_t* g, int64_t t, int64_t n, const ray_symgrp_fp
     if (t < 0 || t >= g->ntasks || n < 0) return false;
     sg_task_t* k = &g->tasks[t];
     int ng = 1 << g->lg;
+    bool freq = g->order == RAY_SYMGRP_FREQ, rows = sg_rows(g);
+    int64_t words = rows ? (n + 1 + 63) / 64 : 0;
+    /* one block: seg, fp, r, then cnt (FREQ) or the bitmaps and their
+     * ranks (ROWS*), each at a multiple of 8 */
+    int64_t o_fp = (ng + 1) * 8, o_r = o_fp + n * (int64_t)sizeof(*fp), o_x = o_r + n * 8;
+    int64_t bytes = o_x + (freq ? ((n + 1) * 4 + 7) / 8 * 8 : 0) + words * 24;
+    char* b = (char*)sg_stage_alloc(g, bytes);
+    if (!b) return false;
     k->n = n;
-    k->seg = (int64_t*)ray_sys_alloc((size_t)(ng + 1) * sizeof(int64_t));
-    k->fp = (ray_symgrp_fp_t*)ray_sys_alloc((size_t)(n ? n : 1) * sizeof(*fp));
-    k->r = (uint64_t*)ray_sys_alloc((size_t)(n ? n : 1) * sizeof(uint64_t));
-    if (!k->seg || !k->fp || !k->r) return false;
+    k->seg = (int64_t*)b;
+    k->fp = (ray_symgrp_fp_t*)(b + o_fp);
+    k->r = (uint64_t*)(b + o_r);
     for (int64_t i = 0; i < n; i++) k->seg[sg_group(g, fp[i].h) + 1]++;
     for (int i = 0; i < ng; i++) k->seg[i + 1] += k->seg[i];
-    int64_t* at = (int64_t*)ray_sys_alloc((size_t)ng * sizeof(int64_t));
-    if (!at) return false;
+    int64_t at[RAY_SYMGRP_MAX];
     memcpy(at, k->seg, (size_t)ng * sizeof(int64_t));
     for (int64_t i = 0; i < n; i++) k->fp[at[sg_group(g, fp[i].h)]++] = fp[i];
-    ray_sys_free(at);
-    if (g->order == RAY_SYMGRP_FREQ) {
-        k->cnt = (uint32_t*)ray_sys_alloc((size_t)(n + 1) * sizeof(uint32_t));
-        if (!k->cnt) return false;
+    if (freq) {
+        k->cnt = (uint32_t*)(b + o_x);
         for (int64_t i = 0; i < n; i++) k->cnt[i + 1] = counts ? counts[i] : 1;
     }
-    if (sg_rows(g)) {
-        int64_t words = (n + 1 + 63) / 64;
-        k->own = (uint64_t*)ray_sys_alloc((size_t)words * sizeof(uint64_t));
-        k->again = (uint64_t*)ray_sys_alloc((size_t)words * sizeof(uint64_t));
-        k->rank = (uint32_t*)ray_sys_alloc((size_t)words * sizeof(uint32_t));
-        k->arank = (uint32_t*)ray_sys_alloc((size_t)words * sizeof(uint32_t));
-        if (!k->own || !k->again || !k->rank || !k->arank) return false;
+    if (rows) {
+        k->own = (uint64_t*)(b + o_x);
+        k->again = k->own + words;
+        k->rank = (uint32_t*)(k->again + words);
+        k->arank = k->rank + words;
     }
     return true;
 }

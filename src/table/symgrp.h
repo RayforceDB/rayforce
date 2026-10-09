@@ -102,6 +102,7 @@ typedef struct {
     int64_t store_pos, store_spans, store_bytes;   /* records read from the file */
     int64_t store_read, settle_read;                /* bytes asked of the file for them */
     int64_t store_kept, windows;                    /* records kept from the window before */
+    int64_t stage_bytes;                            /* the tasks' arrays: their chunks' bytes */
     int64_t deferred, compares, cmp_bytes, collisions, redo;
 } ray_symgrp_stats_t;
 
