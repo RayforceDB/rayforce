@@ -713,6 +713,10 @@ bool ray_sym_domain_import_stats(ray_sym_domain_t* dom, struct ray_symimp_stats_
     return true;
 }
 
+struct ray_symimp_s* ray_sym_domain_import(ray_sym_domain_t* dom) {
+    return dom && dom->kind == DOM_IMPORT ? dom->imp : NULL;
+}
+
 ray_sym_domain_t* ray_sym_domain_new(void) {
     ray_sym_domain_t* d = ray_sys_alloc(sizeof(*d));
     if (!d) return NULL;

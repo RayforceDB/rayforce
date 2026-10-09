@@ -112,6 +112,9 @@ ray_sym_domain_t* ray_sym_domain_create_import(const char* path);
  * gives them (table/symimp.h).  False for any other domain. */
 struct ray_symimp_stats_s;
 bool ray_sym_domain_import_stats(ray_sym_domain_t* dom, struct ray_symimp_stats_s* out);
+/* Such a domain's import dictionary (for the grouped import,
+ * table/symgrp.h); NULL for any other domain. */
+struct ray_symimp_s* ray_sym_domain_import(ray_sym_domain_t* dom);
 
 /* New private, refcounted in-memory dictionary. Supports the same concurrent
  * append and resolution operations as FILE domains, without a cache entry or

@@ -95,6 +95,8 @@ struct ray_symimp_s {
     _Atomic(int64_t)  active[2];
     si_tab_t*        retired[2];  /* under alock, by the parity retired in */
     uint64_t* offc[SI_OFF_CHUNKS]; /* record offset of each position */
+    bool     reserved;             /* ray_symimp_reserve used: the shard
+                                    * tables no longer cover every record */
     si_shard_t shards[SI_SHARDS];
     _Atomic(int64_t) st[SI_ST_N];  /* ray_symimp_stats, past what lookups read */
 };
@@ -301,10 +303,58 @@ static bool si_batch(ray_symimp_t* m, int64_t n, const char* const* strs,
 bool ray_symimp_intern_batch(ray_symimp_t* m, int64_t n, const char* const* strs,
                              const size_t* lens, const uint64_t* hashes,
                              int64_t* out_pos) {
+    if (m->reserved) return false;   /* its index misses the reserved records */
     for (int64_t o = 0; o < n; o += SI_BATCH)
         if (!si_batch(m, n - o < SI_BATCH ? n - o : SI_BATCH, strs + o, lens + o, hashes + o, out_pos + o))
             return false;
     return true;
+}
+
+bool ray_symimp_reserve(ray_symimp_t* m, int64_t n, int64_t bytes, int64_t* pos0, int64_t* off0) {
+    if (n < 0 || bytes < 0) return false;
+    pthread_mutex_lock(&m->alock);
+    bool ok = m->count + n <= (int64_t)UINT32_MAX - 1 && m->tail + bytes <= (int64_t)m->reserve;
+    for (int64_t c = m->count >> SI_OFF_LOG; ok && n && c <= (m->count + n - 1) >> SI_OFF_LOG; c++)
+        if (!m->offc[c]) {
+            m->offc[c] = (uint64_t*)ray_sys_alloc(((size_t)1 << SI_OFF_LOG) * sizeof(uint64_t));
+            ok = m->offc[c] != NULL;
+        }
+    if (ok && m->tail + bytes > m->fsize) {
+        int64_t want = m->tail + bytes + SI_GROW_MIN;
+        if ((size_t)want > m->reserve) want = (int64_t)m->reserve;
+        ok = si_grow(m, want);
+        if (ok) m->fsize = want;
+    }
+    if (ok) {
+        m->reserved = true;
+        *pos0 = m->count; *off0 = m->tail;
+        m->count += n; m->tail += bytes;
+        atomic_store_explicit(m->count_out, m->count, memory_order_release);
+    }
+    pthread_mutex_unlock(&m->alock);
+    return ok;
+}
+
+void ray_symimp_put(ray_symimp_t* m, int64_t pos, int64_t off, const char* s, uint32_t len) {
+    memcpy(m->map + off, &len, 4);
+    if (len) memcpy(m->map + off + 4, s, len);
+    m->offc[pos >> SI_OFF_LOG][pos & ((1 << SI_OFF_LOG) - 1)] = (uint64_t)off;
+}
+
+int64_t ray_symimp_offset(const ray_symimp_t* m, int64_t pos) {
+    return (int64_t)si_off(m, pos);
+}
+
+const char* ray_symimp_get(const ray_symimp_t* m, int64_t pos, uint32_t* len) {
+    const uint8_t* r = m->map + si_off(m, pos);
+    memcpy(len, r, 4);
+    return (const char*)r + 4;
+}
+
+void ray_symimp_willneed(const ray_symimp_t* m, int64_t off, int64_t len) {
+    size_t pg = (size_t)sysconf(_SC_PAGESIZE);
+    size_t lo = (size_t)off & ~(pg - 1), hi = (size_t)(off + len);
+    if (hi > lo) (void)madvise(m->map + lo, hi - lo, MADV_WILLNEED);
 }
 
 ray_symimp_t* ray_symimp_create(const char* path, _Atomic(int64_t)* count) {
@@ -431,5 +481,14 @@ bool ray_symimp_intern_batch(ray_symimp_t* m, int64_t n, const char* const* strs
 ray_err_t ray_symimp_sync(ray_symimp_t* m, bool durable) { (void)m; (void)durable; return RAY_ERR_IO; }
 void ray_symimp_free(ray_symimp_t* m) { (void)m; }
 void ray_symimp_stats(ray_symimp_t* m, ray_symimp_stats_t* out) { (void)m; *out = (ray_symimp_stats_t){0}; }
+bool ray_symimp_reserve(ray_symimp_t* m, int64_t n, int64_t bytes, int64_t* pos0, int64_t* off0) {
+    (void)m; (void)n; (void)bytes; (void)pos0; (void)off0; return false;
+}
+void ray_symimp_put(ray_symimp_t* m, int64_t pos, int64_t off, const char* s, uint32_t len) {
+    (void)m; (void)pos; (void)off; (void)s; (void)len;
+}
+int64_t ray_symimp_offset(const ray_symimp_t* m, int64_t pos) { (void)m; (void)pos; return -1; }
+const char* ray_symimp_get(const ray_symimp_t* m, int64_t pos, uint32_t* len) { (void)m; (void)pos; *len = 0; return NULL; }
+void ray_symimp_willneed(const ray_symimp_t* m, int64_t off, int64_t len) { (void)m; (void)off; (void)len; }
 
 #endif
