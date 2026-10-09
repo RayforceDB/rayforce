@@ -899,13 +899,26 @@ static test_result_t test_stats_nested(void) {
     BAD(p, 1, "corrupt", "vector 0 statistics missing under the chunk's");
     SAVE(i32_for(), p); W32(DIR(0) + 56, RAY_ENC_STAT_ABSENT); W64(DIR(0) + 16, 0); W64(DIR(0) + 24, 0);
     BAD(p, 1, "corrupt", "vector 0 statistics under a chunk without them");
-    /* statistics outside the type (the chunk's moved with them, so they nest) */
+    /* statistics outside the type: a vector's (the type is checked before
+     * the nesting) ... */
+    SAVE(i32_for(), p); W64(desc_at(0, 0) + 40, 1ull << 40);
+    BAD(p, 1, "corrupt", "vector 0 statistics outside the type");
+    SAVE(fk_for(RAY_I16), p); W64(desc_at(0, 0) + 32, (uint64_t)(int64_t)-40000);
+    BAD(p, 1, "corrupt", "vector 0 statistics outside the type");
+    SAVE(bool_runs(), p); W64(desc_at(0, 0) + 40, 256);
+    BAD(p, 1, "corrupt", "vector 0 statistics outside the type");
+    /* ... and the chunk's, at load (fix round 1 of 14b: a directory
+     * statistic sizes spans before any descriptor is read) */
     SAVE(i32_for(), p); W64(desc_at(0, 0) + 40, 1ull << 40); W64(DIR(0) + 24, 1ull << 40);
-    BAD(p, 1, "corrupt", "vector 0 statistics outside the type");
+    BAD(p, 0, "corrupt", "chunk 0 statistics outside the type");
+    SAVE(i32_for(), p); W64(DIR(0) + 24, (uint64_t)INT64_MAX);
+    BAD(p, 0, "corrupt", "chunk 0 statistics outside the type");
+    SAVE(i32_for(), p); W64(DIR(0) + 16, (uint64_t)INT64_MIN);
+    BAD(p, 0, "corrupt", "chunk 0 statistics outside the type");
     SAVE(fk_for(RAY_I16), p); W64(desc_at(0, 0) + 32, (uint64_t)(int64_t)-40000); W64(DIR(0) + 16, (uint64_t)(int64_t)-40000);
-    BAD(p, 1, "corrupt", "vector 0 statistics outside the type");
+    BAD(p, 0, "corrupt", "chunk 0 statistics outside the type");
     SAVE(bool_runs(), p); W64(desc_at(0, 0) + 40, 256); W64(DIR(0) + 24, 256);
-    BAD(p, 1, "corrupt", "vector 0 statistics outside the type");
+    BAD(p, 0, "corrupt", "chunk 0 statistics outside the type");
     PASS();
 }
 

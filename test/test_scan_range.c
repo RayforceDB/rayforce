@@ -4817,7 +4817,11 @@ static uint64_t sr_col_dec_any(const char* name, uint64_t* full) {
  * bounds and its cardinality sample from its segments' directories, the
  * second key's compaction not attempted when it cannot fit), within 5% of
  * its bytes (the samplers' point reads, the vectors a chunk starts
- * inside); the answers and routes are generation 0's. */
+ * inside); the answers and routes are generation 0's.  The 1.05 bound
+ * holds because k here is FOR_BP, which the samplers' point reads serve:
+ * a key whose vectors are mostly RLE (the ClickBench UserID) decodes
+ * 1.052-1.055 per run, the table-stack precheck's sampled rows each
+ * decoding a vector (the point read does not serve RLE). */
 static test_result_t test_v2_radix_decode_once(void) {
     sr_radix_tables();
     ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
@@ -4949,6 +4953,71 @@ static test_result_t test_v2_radix_answers(void) {
     PASS();
 }
 
+/* Fix round 1: the record order of a radix partition.  RO: 600000 rows,
+ * 40000 groups of 15 rows each spread over the whole table (k = (j *
+ * 7919 mod 40000) * 1000003, a wide key: radix), s a SYM of the group, f = j / 7.0
+ * (an inexact sum: its bits follow the order the records arrive in).  At
+ * 2 and 8 workers, `by k` and `by {s k}` answer byte for byte the same
+ * (.csv.write) on generation 0, on generation 2 through the fused pass
+ * (the key decodes once), and on generation 2 through the two passes
+ * (forced by a 4 KiB last-level cache: the key decodes twice); the fused
+ * pass also on three partitions.  A phase 2 that walked a partition's
+ * chunk runs in any other order changes the sums. */
+static test_result_t test_v2_radix_record_order(void) {
+    sr_eval_ok("(set jo (til 600000))");
+    sr_eval_ok("(set RO (table [s k f] (list (as 'SYMBOL (map (fn [j] (format \"w%\" (% (% (* j 7919) 40000) 50))) jo)) "
+               "(* (% (* jo 7919) 40000) 1000003) (/ (as 'F64 jo) 7.0))))");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/ro0/\" RO {compress: false})");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/ro2/\" RO {compress: true})");
+    for (int p = 0; p < 3; p++)
+        sr_evalf_ok("(.db.splayed.set \"" SR_TMP "/rop/2024.01.0%d/t/\" (take (drop RO %d) 200000) {compress: true})",
+                    p + 1, p * 200000);
+    static const char* const qs[] = {
+        "(select {c: (count f) a: (sum f) from: T by: k})",
+        "(select {c: (count f) a: (sum f) from: T by: {s: s k: k}})",
+    };
+    /* layouts: generation 0, fused generation 2, two-pass generation 2, fused parted generation 2 */
+    static const char* const tb[] = {
+        "(.db.splayed.get \"" SR_TMP "/ro0/\")", "(.db.splayed.get \"" SR_TMP "/ro2/\")",
+        "(.db.splayed.get \"" SR_TMP "/ro2/\")", "(.db.parted.get \"" SR_TMP "/rop\" 't)",
+    };
+    static const char* const tn[] = { "gen 0", "gen 2 fused", "gen 2 two passes", "gen 2 parted fused" };
+    static const int workers[] = { 2, 8 };
+    char path[512];
+    snprintf(path, sizeof path, "%s/ro.csv", sr_root());
+    for (int w = 0; w < 2; w++) {
+        ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(workers[w]), RAY_OK);
+        for (int i = 0; i < 2; i++) {
+            char* ref = NULL; size_t nref = 0;
+            for (int l = 0; l < 4; l++) {
+                sr_evalf_ok("(set T %s)", tb[l]);
+                sr_drop(sr_eval(qs[i]));                      /* binds and loads once */
+                uint64_t fk, k0 = sr_col_dec_any("k", &fk);
+                if (l == 2) ray_cache_llc_set_for_test(4096);
+                agg_route_reset();
+                char* b = NULL; size_t n = 0;
+                bool ok = sr_csv_of(qs[i], path, &b, &n);
+                agg_route_stats_t st = agg_route_stats();
+                ray_cache_llc_set_for_test(0);
+                double xk = l ? (double)(sr_col_dec_any("k", &fk) - k0) / (double)fk : 0.0;
+                bool route = st.routes[AGG_ROUTE_V2_RADIX] == 1 &&
+                             (l == 0 || (l == 2 ? xk >= 2.0 && xk <= 2.2 : xk >= 1.0 && xk <= 1.05));
+                bool same = ok && (l == 0 || (n == nref && memcmp(b, ref, n) == 0));
+                if (l == 0 && ok) { ref = b; nref = n; } else free(b);
+                if (!ok || !route || !same) {
+                    free(ref);
+                    TEST_ASSERT_FMT(ok, "%s, %d workers, %s: csv", qs[i], workers[w], tn[l]);
+                    TEST_ASSERT_FMT(route, "%s, %d workers, %s: radix %llu, key decoded %.4fx", qs[i], workers[w], tn[l],
+                                    (unsigned long long)st.routes[AGG_ROUTE_V2_RADIX], xk);
+                    TEST_ASSERT_FMT(same, "%s, %d workers: %s differs from gen 0 (%zu / %zu bytes)", qs[i], workers[w], tn[l], n, nref);
+                }
+            }
+            free(ref);
+        }
+    }
+    PASS();
+}
+
 /* The parted directory consumer (design (b)): a parted key's dense bounds
  * come from its segments' statistics, so its passes read under the guard,
  * which checks every segment against its own chunks.  Three partitions of
@@ -5000,6 +5069,35 @@ static test_result_t test_idx_info_table(void) {
     PASS();
 }
 
+/* Fix round 1: chunk c's directory minimum (set_min) or maximum of the
+ * generation-2 column file at path set to x, the descriptors untouched.
+ * False on an I/O error or a chunk without statistics. */
+static bool sr_forge_dirent(const char* path, int64_t c, bool set_min, int64_t x) {
+    FILE* f = fopen(path, "r+b"); if (!f) return false;
+    ray_enc_dirent_t de;
+    long doff = (long)(RAY_ENC_DIR_OFF + (uint64_t)c * sizeof de);
+    bool ok = fseek(f, doff, SEEK_SET) == 0 && fread(&de, sizeof de, 1, f) == 1 && !(de.flags & RAY_ENC_STAT_ABSENT);
+    if (ok) { if (set_min) de.min = x; else de.max = x; }
+    ok = ok && fseek(f, doff, SEEK_SET) == 0 && fwrite(&de, sizeof de, 1, f) == 1;
+    return fclose(f) == 0 && ok;
+}
+/* The table at dir_expr, loaded and queried with q, gives `corrupt` naming
+ * path (at the load or at the query), twice. */
+static test_result_t sr_corrupt_load_twice(const char* dir_expr, const char* q, const char* path) {
+    for (int rep = 0; rep < 2; rep++) {
+        ray_error_clear();
+        char e[1024];
+        snprintf(e, sizeof e, "(set T %s)", dir_expr);
+        ray_t* r = sr_eval(e);
+        if (r && !RAY_IS_ERR(r)) { sr_drop(r); ray_error_clear(); r = sr_eval(q); }
+        TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "%s (read %d): answered", q, rep + 1);
+        TEST_ASSERT_FMT(strcmp(ray_err_code(r), "corrupt") == 0 && ray_error_msg() && strstr(ray_error_msg(), path),
+                        "%s (read %d): %s \"%s\" (want %s)", q, rep + 1, ray_err_code(r), ray_error_msg() ? ray_error_msg() : "", path);
+        ray_error_free(r);
+    }
+    PASS();
+}
+
 static test_result_t test_v2_forged_parted_segment(void) {
     sr_forged_parted(SR_TMP "/fp0", 0);
     sr_forged_parted(SR_TMP "/fp2", 2);
@@ -5032,6 +5130,32 @@ static test_result_t test_v2_forged_parted_segment(void) {
         TEST_ASSERT_FMT(strcmp(ray_err_code(res), "corrupt") == 0 && ray_error_msg() && strstr(ray_error_msg(), path),
                         "materialized (read %d): %s \"%s\"", rep + 1, ray_err_code(res), ray_error_msg() ? ray_error_msg() : "");
         ray_error_free(res);
+    }
+    /* Fix round 1: a directory statistic outside its column's type is
+     * `corrupt` at open.  An I32 key's first segment (the cardinality sample) chunk 0 maximum raised to
+     * INT64_MAX, its minimum lowered to INT64_MIN, and its maximum raised to
+     * 2^31 (a 64-bit value past I32): the cardinality sample and the dense
+     * bounds both read these, so each is `corrupt` naming the file, twice. */
+    static const char* const qi = "(select {s: (sum v) c: (count v) from: T by: i})";
+    for (int p = 0; p < 3; p++)
+        for (int gen = 0; gen <= 2; gen += 2)
+            sr_evalf_ok("(.db.splayed.set \"" SR_TMP "/fi%d/2024.01.0%d/t/\" (table [i v] (list (as 'I32 (%% (* (til 70000) 7) 1000)) "
+                        "(til 70000))) {compress: %s})", gen, p + 1, gen ? "true" : "false");
+    r = sr_same_route("(.db.parted.get \"" SR_TMP "/fi0\" 't)", "(.db.parted.get \"" SR_TMP "/fi2\" 't)", qi);
+    if (r.status != TEST_PASS) return r;
+    static const struct { bool set_min; int64_t x; } fi[] = {
+        { false, INT64_MAX }, { true, INT64_MIN }, { false, (int64_t)INT32_MAX + 1 },
+    };
+    for (size_t i = 0; i < sizeof fi / sizeof fi[0]; i++) {
+        for (int p = 0; p < 3; p++)
+            sr_evalf_ok("(.db.splayed.set \"" SR_TMP "/fib/2024.01.0%d/t/\" (table [i v] (list (as 'I32 (%% (* (til 70000) 7) 1000)) "
+                        "(til 70000))) {compress: true})", p + 1);
+        if (ray_splay_resolve_dir(ray_test_tmp(SR_TMP "/fib/2024.01.01/t"), dir, sizeof dir) != RAY_OK) FAIL("resolve");
+        dl = strlen(dir);
+        snprintf(path, sizeof path, "%s%si", dir, (dl && dir[dl - 1] == '/') ? "" : "/");
+        if (!sr_forge_dirent(path, 0, fi[i].set_min, fi[i].x)) FAIL("forge");
+        r = sr_corrupt_load_twice("(.db.parted.get \"" SR_TMP "/fib\" 't)", qi, path);
+        if (r.status != TEST_PASS) return r;
     }
     PASS();
 }
@@ -5154,6 +5278,7 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/v2_sel_key_types",   test_v2_sel_key_types,   srr_setup, srr_teardown },
     { "scanrange/v2_radix_decode_once", test_v2_radix_decode_once, sr_rt_setup, srr_pool_teardown },
     { "scanrange/v2_radix_answers",   test_v2_radix_answers,   sr_rt_setup, srr_pool_teardown },
+    { "scanrange/v2_radix_record_order", test_v2_radix_record_order, sr_rt_setup, srr_pool_teardown },
     { "scanrange/v2_forged_parted_segment", test_v2_forged_parted_segment, sr_rt_setup, srr_teardown },
     { "scanrange/idx_info_table",     test_idx_info_table,     srr_setup, srr_teardown },
     { NULL, NULL, NULL, NULL },

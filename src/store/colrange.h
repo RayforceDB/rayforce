@@ -180,8 +180,9 @@ bool ray_col_src_parted_chunks(ray_col_src_t* s, void* ctx, ray_col_chunk_fn fn,
  * served into *out (the value widened to int64), 0 declined (read the row
  * through a cursor, which decodes or reports the vector; always for a
  * plain or materialized source or segment), -1 an owned error in *err.
- * For samplers: a sampled row costs no vector decode. */
-int  ray_col_src_point_i64(const ray_col_src_t* s, int64_t row, int64_t* out, ray_t** err);
+ * For samplers: a sampled row costs no vector decode.  A parted source
+ * publishes its segment offsets on first use (so the source is not const). */
+int  ray_col_src_point_i64(ray_col_src_t* s, int64_t row, int64_t* out, ray_t** err);
 /* One sequential read-ahead hint for rows [lo, hi): plain mmapped
  * columns hint their element bytes, generation 2 the chunk bytes from the
  * directory, parted sources each touched segment; heap vectors nothing. */

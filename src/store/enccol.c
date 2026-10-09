@@ -112,6 +112,14 @@ ray_t* ray_enccol_wrap(ray_enccol_t* e) {
 
 static bool enc_type_nullable(int8_t t)  { return t != RAY_BOOL && t != RAY_U8; }
 static bool enc_type_float(int8_t t)     { return t == RAY_F32 || t == RAY_F64; }
+/* An integer statistic v inside the logical range of kind k (the lane
+ * width and signedness: BOOL / U8 8 unsigned, I16 / I32 / I64 / DATE /
+ * TIME / TIMESTAMP signed, SYM ids unsigned at the column's id width). */
+static bool stat_in_kind(ray_enc_kind_t k, int64_t v) {
+    if (k.T == 64) return k.is_signed || v >= 0;
+    if (k.is_signed) { const int64_t h = (int64_t)1 << (k.T - 1); return v >= -h && v < h; }
+    return v >= 0 && v < ((int64_t)1 << k.T);
+}
 
 static bool all_zero(const uint8_t* p, size_t n) {
     for (size_t i = 0; i < n; i++) if (p[i]) return false;
@@ -214,6 +222,8 @@ static ray_t* enc_validate_load(ray_enccol_t* e, uint32_t* saved_sym) {
         ENC_CORRUPT("column %s: directory past the end of the file", e->path);
     uint64_t prev = RAY_ENC_DIR_OFF + (uint64_t)e->n_chunks * sizeof(ray_enc_dirent_t);
     bool summable = ray_encw_type_summable(h.type);
+    ray_enc_kind_t kind;
+    const bool have_kind = ray_enc_kind_of(h.type, h.attrs, &kind);
     e->null_count = 0;
     for (int64_t c = 0; c < e->n_chunks; c++) {
         ray_enc_dirent_t de;
@@ -247,6 +257,10 @@ static ray_t* enc_validate_load(ray_enccol_t* e, uint32_t* saved_sym) {
                 if (isnan(mn) || isnan(mx) || mn > mx) ENC_CORRUPT("column %s: chunk %lld float bounds", e->path, (long long)c);
             } else if (de.min > de.max) {
                 ENC_CORRUPT("column %s: chunk %lld min above max", e->path, (long long)c);
+            } else if (have_kind && (!stat_in_kind(kind, de.min) || !stat_in_kind(kind, de.max))) {
+                /* consumers take spans and slot counts from these: a value
+                 * outside the type is damage, never a wider range */
+                ENC_CORRUPT("column %s: chunk %lld statistics outside the type", e->path, (long long)c);
             }
         }
         if (!summable && (de.sum_lo || de.sum_hi)) ENC_CORRUPT("column %s: chunk %lld sum on an unsummed type", e->path, (long long)c);
@@ -404,12 +418,6 @@ static int top_encoding_class(int8_t t, uint8_t enc) {
 /* An integer statistic is a logical value of its type: inside the T-bit
  * kind's range.  The decode kernels compare values against statistics in
  * T-bit modular arithmetic, which is exact only for statistics inside it. */
-static bool stat_in_kind(ray_enc_kind_t k, int64_t v) {
-    if (k.T == 64) return k.is_signed || v >= 0;
-    if (k.is_signed) { const int64_t h = (int64_t)1 << (k.T - 1); return v >= -h && v < h; }
-    return v >= 0 && v < ((int64_t)1 << k.T);
-}
-
 static _Atomic(uint64_t) g_desc_validations;     /* test hook, see enccol.h */
 uint64_t ray_enccol_test_desc_validations(void) { return atomic_load(&g_desc_validations); }
 

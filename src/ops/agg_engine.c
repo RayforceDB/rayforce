@@ -4932,8 +4932,12 @@ static void agg_radix_group_fn(void* vctx, uint32_t wid, int64_t start, int64_t 
 
 /* Phase 2 of a fused context: agg_radix_group_fn over each partition's
  * chunk runs in chunk order (the same records in the same order as the
- * global layout).  A copy rather than a shared body: sharing the loop with
- * the global layout's measured 2-4% slower on generation 0 (q16). */
+ * global layout).  A copy rather than a shared body: one always-inline
+ * body over a run table (the global layout one run per partition)
+ * measured q16 1.3% slower on generation 0 (73.8 against 72.8 ms) and 3%
+ * slower on generation 2.  The two must group the same records in the
+ * same order: scanrange/v2_radix_record_order compares their answers
+ * byte for byte. */
 static void agg_radix_group_fused_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
     agg_radix_ctx_t* c = (agg_radix_ctx_t*)vctx;
@@ -5993,15 +5997,22 @@ static ray_t* exec_group_v2_parallel_radix(
         if (want_rows < RAY_COL_BLOCK_ROWS) want_rows = RAY_COL_BLOCK_ROWS;
         uint64_t llc_bytes = ray_cache_llc_bytes();
         double cache_budget = (llc_bytes ? (double)llc_bytes : 32.0 * 1048576.0) * 0.75;
-        int64_t cap = (int64_t)(cache_budget / ((double)nw * (double)rec));
+        /* a worker's staging: the records and the partition ids of a
+         * chunk (rec + 2 bytes a row) and the partitions' write cursors */
+        double per_worker = cache_budget / (double)nw - (double)n_parts * sizeof(uint32_t);
+        int64_t cap = per_worker > 0 ? (int64_t)(per_worker / ((double)rec + sizeof(uint16_t))) : 0;
         if (fused && chunk_rows > want_rows) {
             if (want_rows > cap) fused = false;
-            else {
-                uint64_t nch = ((uint64_t)n_in + (uint64_t)want_rows - 1) / (uint64_t)want_rows;
-                if (nch * n_parts * sizeof(uint32_t) <= AGG_RADIX_COUNT_BUDGET) chunk_rows = want_rows;
-                else fused = false;
-            }
+            else chunk_rows = want_rows;
         } else if (fused && chunk_rows > cap) fused = false;
+        /* the count matrix and the runs (twice its size) live together
+         * until the runs are written */
+        uint64_t nch = ((uint64_t)n_in + (uint64_t)chunk_rows - 1) / (uint64_t)chunk_rows;
+        if (fused && nch * n_parts * 3 * sizeof(uint32_t) > AGG_RADIX_COUNT_BUDGET) {
+            fused = false;
+            chunk_rows = (int64_t)(((uint64_t)n_in + want - 1) / want);   /* the two passes' chunks */
+            if (chunk_rows < 1) chunk_rows = 1;
+        }
     }
     uint32_t n_chunks = (uint32_t)((n_in + chunk_rows - 1) / chunk_rows);
 

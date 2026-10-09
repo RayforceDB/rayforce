@@ -8027,7 +8027,7 @@ static void minmax_scan_body(minmax_ctx_t* c, uint32_t worker_id, int64_t start,
                                              memory_order_relaxed)) \
                         goto minmax_done; \
                     if (kmax >= kmin && \
-                        (uint64_t)(kmax - kmin) > (uint64_t)span_budget) { \
+                        (uint64_t)kmax - (uint64_t)kmin > (uint64_t)span_budget) { \
                         atomic_store_explicit(c->abort_flag, 1, \
                                               memory_order_relaxed); \
                         goto minmax_done; \
@@ -11118,17 +11118,14 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
                 for (size_t i = 0; i < bwords; i++)
                     card += __builtin_popcountll(cc.bits[i]);
                 scratch_free(bits_hdr);
-            } else if (bt == RAY_I64) {
-                if (!grp_card_dir(&ss, NULL_I64, &cc))
-                    serr = grp_seg_read(&ss, 0, ss.len, &cc, grp_card_i64);
-                /* The span in u64: a null (INT64_MIN) beside a positive
-                 * value overflows the signed difference. */
+            } else if (bt == RAY_I64 || bt == RAY_I32) {
+                if (!grp_card_dir(&ss, bt == RAY_I64 ? NULL_I64 : NULL_I32, &cc))
+                    serr = grp_seg_read(&ss, 0, ss.len, &cc, bt == RAY_I64 ? grp_card_i64 : grp_card_i32);
+                /* The span in u64, clamped: a null (INT64_MIN) beside a
+                 * positive value overflows the signed difference; never
+                 * rely on the directory's statistics for the arithmetic. */
                 uint64_t span = (uint64_t)cc.hi - (uint64_t)cc.lo;
                 card = span >= (uint64_t)rows_per_part ? rows_per_part : (int64_t)span + 1;
-            } else if (bt == RAY_I32) {
-                if (!grp_card_dir(&ss, NULL_I32, &cc))
-                    serr = grp_seg_read(&ss, 0, ss.len, &cc, grp_card_i32);
-                card = cc.hi - cc.lo + 1;
             } else {
                 card = ss.len;
             }

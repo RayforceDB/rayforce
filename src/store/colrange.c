@@ -638,7 +638,7 @@ bool ray_col_src_parted_chunks(ray_col_src_t* s, void* ctx, ray_col_chunk_fn fn,
     return true;
 }
 
-int ray_col_src_point_i64(const ray_col_src_t* s, int64_t row, int64_t* out, ray_t** err) {
+int ray_col_src_point_i64(ray_col_src_t* s, int64_t row, int64_t* out, ray_t** err) {
     *err = NULL;
     if (!ray_col_src_encoded(s) || ray_enccol_decoded_peek(s->obj)) return 0;   /* the cursor reads it in place */
     ray_enccol_t* e = ray_enccol_of(s->obj);
@@ -647,7 +647,7 @@ int ray_col_src_point_i64(const ray_col_src_t* s, int64_t row, int64_t* out, ray
     ray_t* w = parted_wrapper(s->obj);
     const int64_t* off;
     if (!w || w->len <= 0 || row < 0 || row >= s->len) return 0;
-    ray_t* oerr = src_seg_off((ray_col_src_t*)s, w, &off);  /* seg_off: published once, atomically */
+    ray_t* oerr = src_seg_off(s, w, &off);                  /* seg_off: published once, atomically */
     if (oerr) { ray_error_free(oerr); return 0; }          /* the cursor reports it */
     int64_t lo = 0, hi = w->len - 1;                       /* the last i with off[i] <= row */
     while (lo < hi) {
