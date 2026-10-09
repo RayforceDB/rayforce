@@ -547,6 +547,7 @@ typedef struct ray_graph {
         uint32_t   node_id;
     } cexpr_env[32];
     int             cexpr_env_top;
+    int             cexpr_lambda_depth;
 
     /* Output aliases of the select being compiled (src/ops/query.c):
      * the projections compiled so far, in order.  A name reference or a

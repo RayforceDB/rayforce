@@ -1437,7 +1437,9 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
                 g->cexpr_env_top++;
                 pushed++;
             }
+            g->cexpr_lambda_depth++;
             ray_op_t* result = compile_expr_dag(g, body);
+            g->cexpr_lambda_depth--;
             cexpr_env_pop(g, pushed);
             return result;
         }
@@ -1486,7 +1488,9 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
                          * projection's own scope and keep seeing aliases. */
                         int saved_aliases = g->sel_alias_n;
                         g->sel_alias_n = 0;
+                        g->cexpr_lambda_depth++;
                         ray_op_t* result = compile_expr_dag(g, body);
+                        g->cexpr_lambda_depth--;
                         g->sel_alias_n = saved_aliases;
                         cexpr_env_pop(g, pushed);
                         return result;
@@ -1633,7 +1637,11 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
             if (n < 2 || n - 1 > 16) return NULL;
             uint32_t arg_ids[16];
             for (int64_t i = 1; i < n; i++) {
-                ray_op_t* a = compile_expr_dag(g, elems[i]);
+                /* A helper's quoted text suffix is a literal even when its
+                 * spelling matches a column in the calling query. */
+                ray_op_t* a = g->cexpr_lambda_depth && elems[i]->type == -RAY_SYM &&
+                              (elems[i]->attrs & ATTR_QUOTED)
+                    ? ray_const_atom(g, elems[i]) : compile_expr_dag(g, elems[i]);
                 if (!a) return NULL;
                 arg_ids[i - 1] = a->id;
             }
@@ -2080,37 +2088,100 @@ static _Thread_local query_dependency_cache_t* g_query_dependencies;
 
 typedef struct { int64_t name; ray_t* expr; } query_inline_binding_t;
 
-/* Expand only calls accepted by the DAG compiler. This gives fallback the
- * same column semantics through pure helper parameters without executing
- * user code while planning. Scope forms and captured closures stay opaque. */
+/* Fallback can inline pure collection expressions even when the DAG cannot
+ * lower their types or shapes. Never move effects or opaque user calls. */
+static bool query_inline_pure(ray_t* expr, int depth) {
+    if (!expr || depth > 24) return false;
+    if (expr->type != RAY_LIST || (expr->attrs & ATTR_QUOTED)) return true;
+    if (!expr->len) return true;
+    ray_t** es = ray_data(expr);
+    if (!es[0] || es[0]->type != -RAY_SYM) return false;
+    int64_t id = es[0]->i64;
+    if (id == ray_sym_intern("quote", 5)) return expr->len == 2;
+    ray_t* fn = ray_env_get(id);
+    if (!fn || (fn->type != RAY_UNARY && fn->type != RAY_BINARY && fn->type != RAY_VARY))
+        return false;
+    bool known = resolve_unary_dag(id) || resolve_binary_dag(id) || resolve_agg_opcode(id) ||
+                 id == ray_sym_intern("concat", 6) || id == ray_sym_intern("as", 2) ||
+                 id == ray_sym_intern("if", 2) || id == ray_sym_intern("and", 3) ||
+                 id == ray_sym_intern("or", 2);
+    if (!known) return false;
+    for (int64_t i = 1; i < expr->len; i++)
+        if (!query_inline_pure(es[i], depth + 1)) return false;
+    return true;
+}
+
+static ray_t* query_quote_value(ray_t* value) {
+    ray_t* quoted = ray_list_new(2);
+    if (!quoted || RAY_IS_ERR(quoted)) {
+        if (quoted) ray_error_free(quoted);
+        return NULL;
+    }
+    ray_t** q = ray_data(quoted);
+    q[0] = ray_sym(ray_sym_intern("quote", 5));
+    if (!q[0] || RAY_IS_ERR(q[0])) {
+        if (q[0]) ray_error_free(q[0]);
+        quoted->len = 0; ray_release(quoted); return NULL;
+    }
+    q[1] = value; ray_retain(value); quoted->len = 2;
+    return quoted;
+}
+
+/* A projection can replace a source column with an output alias. Keep a
+ * private binding for a helper's free source reference in that case; its
+ * actual arguments continue to read the visible alias. */
+typedef struct {
+    ray_t* root;
+    ray_t* table;                /* borrowed until a private column is added */
+    bool owned;
+    int next;
+} query_inline_scope_t;
+
+static bool query_expr_has_symbol(ray_t* expr, int64_t id) {
+    if (expr->type == -RAY_SYM) return expr->i64 == id;
+    if (expr->type != RAY_LIST) return false;
+    ray_t** es = ray_data(expr);
+    for (int64_t i = 0; i < expr->len; i++)
+        if (query_expr_has_symbol(es[i], id)) return true;
+    return false;
+}
+
+static ray_t* query_inline_source_col(query_inline_scope_t* scope, ray_t* col) {
+    char name[48];
+    int64_t id;
+    do {
+        int len = snprintf(name, sizeof name, "__query_source_%d", scope->next++);
+        id = ray_sym_intern(name, len);
+    } while (ray_table_get_col(scope->table, id) || ray_env_get(id) ||
+             query_expr_has_symbol(scope->root, id));
+    if (!scope->owned) { ray_retain(scope->table); scope->owned = true; }
+    scope->table = ray_table_add_col(scope->table, id, col);
+    if (!scope->table || RAY_IS_ERR(scope->table)) return NULL;
+    return ray_sym(id);
+}
+
+/* Source schema and evaluation schema differ after aliases/group outputs.
+ * Free names use the former; actual arguments keep their calling scope. */
 static ray_t* query_inline_walk(ray_t* expr, ray_t* tbl,
                                query_inline_binding_t* bindings, int nb,
-                               int depth, int* budget, bool named_body) {
+                               int depth, int* budget, bool named_body, query_inline_scope_t* scope) {
     if (!expr || depth > 24 || --*budget < 0) return NULL;
     if (expr->type == -RAY_SYM && !(expr->attrs & ATTR_QUOTED)) {
         for (int i = nb - 1; i >= 0; i--) if (bindings[i].name == expr->i64) {
             ray_retain(bindings[i].expr);
             return bindings[i].expr;
         }
-        if (named_body && !ray_table_get_col(tbl, expr->i64)) {
+        ray_t* source_col = named_body ? ray_table_get_col(tbl, expr->i64) : NULL;
+        if (source_col && scope && scope->table && !RAY_IS_ERR(scope->table) &&
+            source_col != ray_table_get_col(scope->table, expr->i64))
+            return query_inline_source_col(scope, source_col);
+        if (named_body && !source_col) {
             /* A named helper's free name belongs to its global scope, not
              * to an earlier select alias. Quote the value so a SYM or LIST
              * constant cannot be reinterpreted as a column or a call. */
             ray_t* value = ray_env_get_global(expr->i64);
             if (!value || !(ray_is_atom(value) || ray_is_vec(value))) return NULL;
-            ray_t* quoted = ray_list_new(2);
-            if (!quoted || RAY_IS_ERR(quoted)) {
-                if (quoted) ray_error_free(quoted);
-                return NULL;
-            }
-            ray_t** q = ray_data(quoted);
-            q[0] = ray_sym(ray_sym_intern("quote", 5));
-            if (!q[0] || RAY_IS_ERR(q[0])) {
-                if (q[0]) ray_error_free(q[0]);
-                quoted->len = 0; ray_release(quoted); return NULL;
-            }
-            q[1] = value; ray_retain(value); quoted->len = 2;
-            return quoted;
+            return query_quote_value(value);
         }
     }
     if (expr->type != RAY_LIST || expr->len == 0 || (expr->attrs & ATTR_QUOTED)) {
@@ -2152,7 +2223,11 @@ static ray_t* query_inline_walk(ray_t* expr, ray_t* tbl,
     out->len = 0;
     for (int64_t i = 0; i < expr->len; i++) {
         if (i == 0) { dst[i] = es[i]; ray_retain(dst[i]); }
-        else dst[i] = query_inline_walk(es[i], tbl, bindings, nb, depth + 1, budget, named_body);
+        else if (bindings && es[0]->type == -RAY_SYM &&
+                 es[0]->i64 == ray_sym_intern("concat", 6) &&
+                 es[i]->type == -RAY_SYM && (es[i]->attrs & ATTR_QUOTED))
+            dst[i] = query_quote_value(es[i]);
+        else dst[i] = query_inline_walk(es[i], tbl, bindings, nb, depth + 1, budget, named_body, scope);
         if (!dst[i]) { ray_release(out); return NULL; }
         out->len++;
     }
@@ -2161,24 +2236,22 @@ static ray_t* query_inline_walk(ray_t* expr, ray_t* tbl,
         params->len > 64 ||
         expr_contains_call_named(body, "let", 3) ||
         expr_contains_call_named(body, "fn", 2)) return out;
-    ray_graph_t* g = ray_graph_new(tbl);
-    if (!g) return out;
-    bool admitted = compile_expr_dag(g, out) != NULL;
-    ray_graph_free(g);
-    if (!admitted) return out;
     query_inline_binding_t formals[64];
     for (int64_t i = 0; i < params->len; i++)
         formals[i] = (query_inline_binding_t){sym_cell_runtime_id(params, i), dst[i + 1]};
     ray_t* expanded = query_inline_walk(body, tbl, formals, (int)params->len,
-                                       depth + 1, budget, named);
+                                       depth + 1, budget, named, scope);
+    if (!expanded) return out;
+    if (!query_inline_pure(expanded, 0)) { ray_release(expanded); return out; }
+    for (int64_t i = 1; i < out->len; i++)
+        if (!query_inline_pure(dst[i], 0)) { ray_release(expanded); return out; }
     ray_release(out);
     return expanded;
 }
 
 static ray_t* query_inline_helpers(ray_t* expr, ray_t* tbl) {
-    query_inline_binding_t bindings[64];
     int budget = 1024;
-    ray_t* expanded = query_inline_walk(expr, tbl, bindings, 0, 0, &budget, false);
+    ray_t* expanded = query_inline_walk(expr, tbl, NULL, 0, 0, &budget, false, NULL);
     if (!expanded) { ray_retain(expr); expanded = expr; }
     return expanded;
 }
@@ -2352,25 +2425,34 @@ static int expr_contains_agg(ray_t* expr) {
  * Compile only the concat subtree to distinguish them without evaluating
  * user functions. Without a table, conservatively decline the shortcut. */
 static bool expr_has_collection_concat(ray_t* expr, ray_t* tbl) {
-    if (!expr_contains_call_named(expr, "concat", 6)) return false;
-    if (!tbl) return true;
-    if (!expr || expr->type != RAY_LIST || ray_len(expr) == 0) return false;
+    if (!expr || expr->type != RAY_LIST || (expr->attrs & ATTR_QUOTED) || !expr->len)
+        return false;
     ray_t** elems = ray_data(expr);
-    ray_t* name = elems[0] && elems[0]->type == -RAY_SYM
-        ? ray_sym_str(elems[0]->i64) : NULL;
-    if (name && ray_str_len(name) == 6 && !memcmp(ray_str_ptr(name), "concat", 6)) {
+    int64_t name = elems[0]->type == -RAY_SYM ? elems[0]->i64 : -1;
+    bool concat = name == ray_sym_intern("concat", 6);
+    ray_t* fn = name >= 0 ? ray_env_get(name) : NULL;
+    bool helper = fn && fn->type == RAY_LAMBDA;
+    if (concat || helper) {
+        if (!tbl) return true;
         ray_graph_t* g = ray_graph_new(tbl);
         if (!g) return true;
         ray_op_t* op = compile_expr_dag(g, expr);
-        bool collection = !op || op->opcode != OP_CONCAT;
+        bool collection = !op || (concat && op->opcode != OP_CONCAT);
         if (op && op->opcode == OP_CONST) {
             ray_op_ext_t* ext = find_ext(g, op->id);
-            if (ext && ext->literal && ray_is_atom(ext->literal)) collection = false;
+            if (ext && ext->literal) collection = !ray_is_atom(ext->literal);
         }
         ray_graph_free(g);
+        if (concat || !collection) return collection;
+        /* Only helpers the native compiler cannot lower need expansion.
+         * Walk calls once, rather than re-expanding every enclosing aggregate. */
+        ray_t* expanded = query_inline_helpers(expr, tbl);
+        collection = expr_contains_call_named(expanded, "concat", 6) &&
+                     expr_has_collection_concat(expanded, tbl);
+        ray_release(expanded);
         return collection;
     }
-    for (int64_t i = 1; i < ray_len(expr); i++)
+    for (int64_t i = 1; i < expr->len; i++)
         if (expr_has_collection_concat(elems[i], tbl)) return true;
     return false;
 }
@@ -2680,10 +2762,11 @@ static int is_whole_column_projection(ray_t* expr, ray_t* tbl) {
  * `(count (distinct col))` is semantically an aggregate, but `distinct`
  * is not a row-aligned DAG input inside GROUP.  Route it through the
  * per-group eval fallback so `distinct` sees each group's slice. */
-static bool expr_is_constant_collection(ray_t* expr, ray_t* tbl) {
+static bool expr_is_constant_collection(ray_t* expr, ray_t* tbl, bool* lowered) {
     ray_graph_t* g = ray_graph_new(tbl);
     if (!g) return false;
     ray_op_t* op = compile_expr_dag(g, expr);
+    if (lowered) *lowered = op != NULL;
     bool collection = op && op_tree_is_scalar(g, op->id) &&
                       !op_tree_is_atom(g, op->id);
     ray_graph_free(g);
@@ -2694,7 +2777,8 @@ static int is_group_dag_agg_expr(ray_t* expr, ray_t* tbl) {
     if (!is_agg_expr(expr)) return 0;
     ray_t** elems = (ray_t**)ray_data(expr);
     uint16_t op = resolve_agg_opcode(elems[0]->i64);
-    if (op == OP_COUNT && expr_is_constant_collection(elems[1], tbl)) return 0;
+    bool lowered = false;
+    if (op == OP_COUNT && expr_is_constant_collection(elems[1], tbl, &lowered)) return 0;
     if (op == OP_QUANTILE) {
         if (ray_len(expr) < 3) return 0;
         if (!quantile_literal_prob(elems[2],
@@ -2703,7 +2787,7 @@ static int is_group_dag_agg_expr(ray_t* expr, ray_t* tbl) {
             return 0;
     }
     return !expr_contains_call_named(elems[1], "distinct", 8) &&
-           !expr_has_collection_concat(elems[1], tbl);
+           (lowered || !expr_has_collection_concat(elems[1], tbl));
 }
 
 static bool expr_literal_is_temporal(ray_t* expr) {
@@ -3158,10 +3242,11 @@ static int is_aggr_unary_call(ray_t* expr) {
 static int is_streaming_aggr_unary_call(ray_t* expr, ray_t* tbl) {
     /* Collection concat changes the source length. Evaluate it within
      * each group rather than slicing a concatenated full-table result. */
-    if (expr_has_collection_concat(expr, tbl)) return 0;
     if (!is_aggr_unary_call(expr)) return 0;
     ray_t** elems = (ray_t**)ray_data(expr);
-    if (expr_is_constant_collection(elems[1], tbl)) return 0;
+    bool lowered = false;
+    if (expr_is_constant_collection(elems[1], tbl, &lowered)) return 0;
+    if (!lowered && expr_has_collection_concat(elems[1], tbl)) return 0;
     return !expr_contains_call_named(elems[1], "distinct", 8);
 }
 
@@ -3172,9 +3257,10 @@ static int is_plain_count_expr(ray_t* expr, ray_t* tbl) {
     ray_t** elems = (ray_t**)ray_data(expr);
     if (!elems[0] || elems[0]->type != -RAY_SYM) return 0;
     if (resolve_agg_opcode(elems[0]->i64) != OP_COUNT) return 0;
-    if (expr_is_constant_collection(elems[1], tbl)) return 0;
+    bool lowered = false;
+    if (expr_is_constant_collection(elems[1], tbl, &lowered)) return 0;
     return !expr_contains_call_named(elems[1], "distinct", 8) &&
-           !expr_has_collection_concat(elems[1], tbl);
+           (lowered || !expr_has_collection_concat(elems[1], tbl));
 }
 
 /* NOTE: binary-aggregator gates (is_aggr_binary_call /
@@ -5597,6 +5683,11 @@ bool ray_query_expr_reads_rows(ray_t* expr) {
         if (ray_table_get_col(tbl, expr->i64)) return true;
         if (!ray_sym_is_dotted(expr->i64)) return false;
     } else if (expr->type != RAY_LIST) return false;
+    if (expr->type == RAY_LIST && expr->len == 3) {
+        ray_t** es = ray_data(expr);
+        if (es[0]->type == -RAY_SYM && es[0]->i64 == ray_sym_intern("as", 2))
+            return ray_query_expr_reads_rows(es[2]);
+    }
     query_dependency_cache_t* cache = g_query_dependencies;
     if (cache && cache->table == tbl)
         for (int i = 0; i < cache->n; i++)
@@ -5825,14 +5916,14 @@ static ray_t* eval_expr_per_row(ray_t* expr, ray_t* tbl, int64_t nrows) {
  * defines its output column's length, which may differ from the table's row
  * count — the caller enforces cross-column length agreement.  Mirrors
  * eval_expr_per_row's scope save/restore, including on every error exit. */
-static ray_t* eval_expr_whole_column(ray_t* expr, ray_t* tbl) {
+static ray_t* eval_expr_whole_column_impl(ray_t* expr, ray_t* tbl) {
     if (ray_env_push_query_scope() != RAY_OK) return ray_error("oom", NULL);
     ray_t* _aqt = bind_all_columns(tbl);
     /* Whole columns here, even when a per-row evaluation of an outer select
      * is in progress (a nested select inside one of its outputs). */
     int64_t _aqr = g_active_query_row;
     g_active_query_row = -1;
-    ray_t* result = eval_query_expr(expr, tbl);
+    ray_t* result = ray_eval(expr);
     /* distinct/asc/desc/reverse return a lazy DAG chain (RAY_LAZY) — force it
      * to a concrete vector while the source columns it captured are still
      * bound in this scope. */
@@ -5843,6 +5934,13 @@ static ray_t* eval_expr_whole_column(ray_t* expr, ray_t* tbl) {
     ray_env_pop_scope();
     if (!result)
         return ray_error("domain", "select: whole-column expression evaluation failed");
+    return result;
+}
+
+static ray_t* eval_expr_whole_column(ray_t* expr, ray_t* tbl) {
+    ray_t* expanded = query_inline_helpers(expr, tbl);
+    ray_t* result = eval_expr_whole_column_impl(expanded, tbl);
+    ray_release(expanded);
     return result;
 }
 
@@ -7462,7 +7560,7 @@ static ray_t* eval_scalar_agg_outputs(ray_t** dict_elems, int64_t dict_n,
          * row count instead of the distinct count (issue #405).  Mirror the
          * projection fallback's routing and evaluate it once. */
         ray_t* src = (is_whole_column_projection(agg_elems[1], tbl) ||
-                     expr_is_constant_collection(agg_elems[1], tbl))
+                     expr_is_constant_collection(agg_elems[1], tbl, NULL))
                    ? eval_expr_whole_column(agg_elems[1], tbl)
                    : eval_expr_per_row(agg_elems[1], tbl, nrows);
         if (!src || RAY_IS_ERR(src)) {
@@ -9289,7 +9387,7 @@ static bool select_derived_needs_rows(ray_t* expr) {
  * one visible to the next), drops the hidden aggregate columns, restores
  * the dict's output order and applies the sort keys and take: that were
  * held back.  Consumes `result`. */
-static ray_t* select_apply_derived(ray_t* result, ray_t* dict, select_alias_plan_t* plan) {
+static ray_t* select_apply_derived(ray_t* result, ray_t* dict, select_alias_plan_t* plan, ray_t* source) {
     if (!result || RAY_IS_ERR(result)) return result;
     if (ray_is_lazy(result)) result = ray_lazy_materialize(result);
     if (!result || RAY_IS_ERR(result)) return result;
@@ -9297,9 +9395,11 @@ static ray_t* select_apply_derived(ray_t* result, ray_t* dict, select_alias_plan
     int64_t n_groups = ray_table_nrows(result);
     for (int64_t d = 0; d < plan->n_derived; d++) {
         ray_t* expr = plan->derived_exprs[d];
+        ray_t* expanded = query_inline_helpers(expr, source);
         ray_t* col = select_derived_needs_rows(expr)
-            ? eval_expr_per_row(expr, result, n_groups)
-            : eval_expr_whole_column(expr, result);
+            ? eval_expr_per_row_impl(expanded, result, n_groups)
+            : eval_expr_whole_column_impl(expanded, result);
+        ray_release(expanded);
         if (!col || RAY_IS_ERR(col)) { ray_release(result); return col ? col : ray_error("oom", NULL); }
         if (ray_is_lazy(col)) col = ray_lazy_materialize(col);
         if (!col || RAY_IS_ERR(col)) { ray_release(result); return col ? col : ray_error("oom", NULL); }
@@ -9830,7 +9930,7 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
         if (engine && RAY_IS_ERR(engine)) { ray_release(tbl); return engine; }
         if (engine) {
             ray_t* r = ray_select_impl(&engine, 1, true);
-            if (plan.n_derived > 0) r = select_apply_derived(r, dict, &plan);
+            if (plan.n_derived > 0) r = select_apply_derived(r, dict, &plan, tbl);
             select_alias_plan_free(&plan);
             ray_release(engine);
             ray_release(tbl);
@@ -14338,6 +14438,7 @@ by_dict_done:
                     }
                     ray_t* col;
                     ray_t* expanded = NULL;
+                    query_inline_scope_t scope = { .root = expr, .table = tbl };
                     if (reduced && RAY_IS_ERR(reduced)) {
                         col = reduced;
                     } else {
@@ -14345,30 +14446,43 @@ by_dict_done:
                          * own reduction retains its row-local scope. Use the
                          * source schema so prior aliases cannot capture free
                          * names; actual arguments still evaluate in tbl. */
-                        expanded = query_inline_helpers(expr, g->table);
+                        int inline_budget = 1024;
+                        expanded = query_inline_walk(expr, g->table, NULL, 0, 0,
+                                                     &inline_budget, false, &scope);
+                        if (!expanded) { ray_retain(expr); expanded = expr; }
                         expr = expanded;
-                        col = select_fallback_passthrough_col(expr, tbl, nrows);
-                        if (!col) {
-                            /* An expression over earlier one-value outputs
-                             * with no aggregate of its own reads them at
-                             * row 0, as the row path reads a cell: they are
-                             * bound as one-row columns, and over the whole
-                             * column `(til m)` saw `[6]`, not 6 (#698). */
-                            int at_row0 = one_value && !whole_verb &&
-                                          !ray_is_atom(expr) &&
-                                          !select_fallback_has_agg(expr);
-                            col = at_row0 ? eval_expr_per_row(expr, tbl, 1)
-                                : (whole_verb || one_value)
-                                ? eval_expr_whole_column(expr, tbl)
-                                : eval_expr_per_row(expr, tbl, nrows);
-                            bool enlist_scalar = whole_verb && expr->type == RAY_LIST &&
-                                ((ray_t**)ray_data(expr))[0]->i64 == ray_sym_intern("enlist", 6);
-                            scalar_col = col && !RAY_IS_ERR(col) && (one_value || enlist_scalar) &&
-                                (ray_is_atom(col) || (ray_is_vec(col) && ray_len(col) == 1));
-                            if (scalar_col) col = select_fallback_broadcast(col, 1);
+                        ray_t* eval_tbl = scope.table;
+                        /* A helper may expose a collection concat that must
+                         * consume its complete operands, just like inline. */
+                        if (!eval_tbl || RAY_IS_ERR(eval_tbl)) {
+                            col = eval_tbl ? eval_tbl : ray_error("oom", NULL);
+                            scope.owned = false;
+                        } else {
+                            if (!whole_verb) whole_verb = is_whole_column_projection(expr, eval_tbl);
+                            col = select_fallback_passthrough_col(expr, eval_tbl, nrows);
+                            if (!col) {
+                                /* An expression over earlier one-value outputs
+                                 * with no aggregate of its own reads them at
+                                 * row 0, as the row path reads a cell: they are
+                                 * bound as one-row columns, and over the whole
+                                 * column `(til m)` saw `[6]`, not 6 (#698). */
+                                int at_row0 = one_value && !whole_verb &&
+                                              !ray_is_atom(expr) &&
+                                              !select_fallback_has_agg(expr);
+                                col = at_row0 ? eval_expr_per_row_impl(expr, eval_tbl, 1)
+                                    : (whole_verb || one_value)
+                                    ? eval_expr_whole_column_impl(expr, eval_tbl)
+                                    : eval_expr_per_row_impl(expr, eval_tbl, nrows);
+                                bool enlist_scalar = whole_verb && expr->type == RAY_LIST &&
+                                    ((ray_t**)ray_data(expr))[0]->i64 == ray_sym_intern("enlist", 6);
+                                scalar_col = col && !RAY_IS_ERR(col) && (one_value || enlist_scalar) &&
+                                    (ray_is_atom(col) || (ray_is_vec(col) && ray_len(col) == 1));
+                                if (scalar_col) col = select_fallback_broadcast(col, 1);
+                            }
                         }
                         if (reduced) ray_release(reduced);
                     }
+                    if (scope.owned && scope.table) ray_release(scope.table);
                     if (expanded) ray_release(expanded);
                     if (!col || RAY_IS_ERR(col)) {
                         ray_t* err = col ? col : ray_error("domain", "select: failed to evaluate output column expression");
