@@ -1684,7 +1684,7 @@ static ray_t* pq_write_groups(ray_parquet_t* r, const char* root, const char* ta
         ray_pool_dispatch_n(pool,pq_write_group,&work,(uint32_t)ng);
     } else pq_write_group(&work,0,0,ng);
     for (int64_t g = 0; g < ng; g++) if (errors[g]) {
-        if (!err) err = errors[g]; else ray_release(errors[g]);
+        if (!err) err = errors[g]; else ray_error_free(errors[g]);
     }
     if (!err && ray_interrupted()) err = ray_error("cancel","parquet conversion interrupted");
 done:
@@ -2898,7 +2898,7 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
             else pq_write_direct_group(&work,0,0,tasks);
         }
         for (int64_t t = 0; t < tasks; t++) if (errors[t]) {
-            if (!err) err = errors[t]; else ray_release(errors[t]);
+            if (!err) err = errors[t]; else ray_error_free(errors[t]);
             errors[t] = NULL;
         }
         if (!err && ray_interrupted()) err = ray_error("cancel","parquet conversion interrupted");
@@ -3395,7 +3395,7 @@ static ray_t* pq_aggregate_groups(ray_parquet_t* r, pq_aggregate* aggs, int64_t 
         pq_aggregate_work work = {r,first,n,np,aggs,states,gids,predicates,errors};
         ray_pool_dispatch_n(pool,pq_aggregate_group,&work,count);
         for (uint32_t i = 0; i < count; i++) {
-            if (errors[i]) { if (!err) err = errors[i]; else ray_release(errors[i]); }
+            if (errors[i]) { if (!err) err = errors[i]; else ray_error_free(errors[i]); }
             if (!states[i]) { if (!err) err = ray_error("cancel","parquet scan interrupted"); continue; }
             for (int64_t a = 0; a < n; a++) {
                 if (!err) aggs[a].kernel->merge(aggs[a].state,states[i][a].state,NULL);

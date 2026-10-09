@@ -1753,8 +1753,9 @@ static test_result_t test_pq_sym_grouped_fail_leaks(void) {
             if (k == 4) {
                 fprintf(stderr, "  fail_leaks %-6s heap %+lld B sys %+lld B\n", steps[i] ? steps[i] : "none",
                         (long long)st.bytes_allocated - (long long)base, (long long)st.sys_current - (long long)sbase);
-                /* a window's copy left behind is a few pages a run */
-                if (st.bytes_allocated > base + (64u << 10) || st.sys_current > sbase + (8u << 10)) bad++;
+                /* a window's copy left behind is a few pages a run, the
+                 * row groups' errors past the first a few hundred bytes */
+                if (st.bytes_allocated > base + 512 || st.sys_current > sbase + (8u << 10)) bad++;
             }
         }
     }
