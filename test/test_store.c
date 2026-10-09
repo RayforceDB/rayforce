@@ -44,6 +44,7 @@
 #include "core/sock.h"
 #include "core/platform.h"
 #include "core/runtime.h"
+#include "core/pool.h"
 #include "lang/eval.h"
 #include "lang/internal.h"
 #include "mem/sys.h"
@@ -2239,6 +2240,9 @@ static test_result_t test_stream_inline_zone_one_chunk(void) {
     PASS();
 }
 
+static bool store_files_same(const char* a, const char* b);
+static ray_err_t store_hash_append_legacy(const char* path);
+
 /* Unclustered I64 over four chunks: no inline index, the zone is kept and
  * wants_hash set; ray_splay_hash_column then appends a hash. */
 static test_result_t test_stream_hash_candidate(void) {
@@ -2264,7 +2268,277 @@ static test_result_t test_stream_hash_candidate(void) {
     back = ray_col_mmap(path);
     TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
     TEST_ASSERT_EQ_I(ray_index_kind(back), RAY_IDX_HASH);
-    ray_release(back); ray_release(v);
+    ray_release(back);
+    /* the file is the one the in-memory build appended before */
+    char ref[200]; snprintf(ref, sizeof(ref), "%s/ref", dir);
+    TEST_ASSERT_EQ_I(ray_col_save_bulk(v, ref), RAY_OK);
+    TEST_ASSERT_EQ_I(store_hash_append_legacy(ref), RAY_OK);
+    TEST_ASSERT_TRUE(store_files_same(path, ref));
+    ray_release(v);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+}
+
+/* ---- hash index built in place in the column file ---------------------- */
+
+/* n rows of `type` keyed as idx_reg_col in test_index.c: keys spread over
+ * `keys` values, every null_every-th row null.  SYM ids stay below the
+ * interned count (the bare mmap validates them). */
+static ray_t* store_hash_col(int8_t type, int64_t n, int64_t keys, int64_t null_every) {
+    ray_t* v = type == RAY_SYM ? ray_sym_vec_new(RAY_SYM_W32, n > 0 ? n : 1)
+                               : ray_vec_new(type, n > 0 ? n : 1);
+    if (!v || RAY_IS_ERR(v)) return v;
+    v->len = n;
+    void* d = ray_data(v);
+    for (int64_t i = 0; i < n; i++) {
+        int64_t k = (int64_t)(((uint64_t)i * 2654435761ull) % (uint64_t)keys) - keys / 3;
+        switch (type) {
+        case RAY_I32: case RAY_DATE: ((int32_t*)d)[i] = (int32_t)k; break;
+        case RAY_I64: case RAY_TIMESTAMP: ((int64_t*)d)[i] = k * 1000003; break;
+        case RAY_F64: ((double*)d)[i] = (double)k * 0.25; break;
+        case RAY_SYM: ((uint32_t*)d)[i] = (uint32_t)(k + keys / 3 + 1); break;
+        default: break;
+        }
+    }
+    for (int64_t i = 0; null_every && i < n; i += null_every)
+        if (ray_vec_set_null_checked(v, i, true) != RAY_OK) { ray_release(v); return NULL; }
+    return v;
+}
+
+/* Files `a` and `b` hold the same bytes. */
+static bool store_files_same(const char* a, const char* b) {
+    struct stat sa, sb;
+    if (stat(a, &sa) != 0 || stat(b, &sb) != 0 || sa.st_size != sb.st_size) return false;
+    size_t sz = (size_t)sa.st_size;
+    uint8_t* ba = (uint8_t*)ray_alloc_raw(sz ? sz : 1);
+    uint8_t* bb = (uint8_t*)ray_alloc_raw(sz ? sz : 1);
+    FILE* fa = fopen(a, "rb");
+    FILE* fb = fopen(b, "rb");
+    bool ok = ba && bb && fa && fb && fread(ba, 1, sz, fa) == sz &&
+              fread(bb, 1, sz, fb) == sz && memcmp(ba, bb, sz) == 0;
+    if (fa) fclose(fa);
+    if (fb) fclose(fb);
+    ray_free_raw(ba); ray_free_raw(bb);
+    return ok;
+}
+
+/* The hash index appended to index-less column file `path` as before the
+ * in-place build: attached to the mapped column, then copied into the file. */
+static ray_err_t store_hash_append_legacy(const char* path) {
+    ray_t* col = ray_col_mmap(path);
+    if (!col || RAY_IS_ERR(col)) { if (col) ray_error_free(col); return RAY_ERR_IO; }
+    ray_t* r = ray_index_attach_hash(&col);
+    ray_err_t err = RAY_ERR_OOM;
+    if (!RAY_IS_ERR(r))
+        err = ray_col_append_index(path, ray_index_payload(col->index), col->len, col->type);
+    else
+        ray_error_free(r);
+    ray_release(col);
+    return err;
+}
+
+/* The same, built in place over the mapped column. */
+static ray_err_t store_hash_build(const char* path) {
+    ray_t* col = ray_col_mmap(path);
+    if (!col || RAY_IS_ERR(col)) { if (col) ray_error_free(col); return RAY_ERR_IO; }
+    ray_err_t err = ray_col_build_hash_index(path, col, NULL);
+    ray_release(col);
+    return err;
+}
+
+static int64_t store_file_size(const char* path) {
+    struct stat st;
+    return stat(path, &st) == 0 ? (int64_t)st.st_size : -1;
+}
+
+/* Built in place, the column file holds exactly the bytes the in-memory
+ * build appended — numeric, temporal, float with nulls, SYM ids, every key
+ * distinct or few — with one batch and with many (the counting pass), and
+ * the index loads and answers. */
+static test_result_t test_col_build_hash_index_bytes(void) {
+    (void)ray_pool_get();
+    char name[16];
+    for (int i = 0; i < 2000; i++) {   /* SYM ids below the interned count */
+        int l = snprintf(name, sizeof(name), "hx%d", i);
+        TEST_ASSERT_TRUE(ray_sym_intern(name, (size_t)l) >= 0);
+    }
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-hidx-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    char a[200], b[200];
+    snprintf(a, sizeof(a), "%s/a", dir);
+    snprintf(b, sizeof(b), "%s/b", dir);
+    static const struct { int8_t type; int64_t n, keys, null_every; } shapes[] = {
+        { RAY_I64, 200000, 200000, 0 }, { RAY_I64, 300000, 5003, 977 },
+        { RAY_I32, 1000, 10, 0 },       { RAY_TIMESTAMP, 90000, 70001, 0 },
+        { RAY_F64, 100000, 2003, 101 }, { RAY_SYM, 120000, 997, 0 },
+        { RAY_I64, 1, 1, 0 },
+    };
+    int64_t bad = 0;
+    for (int plan = 0; plan < 2; plan++) {
+        if (plan == 1) ray_heap_set_anon_watermark(INT64_C(4) << 20);
+        for (size_t s = 0; s < sizeof(shapes) / sizeof(shapes[0]); s++) {
+            ray_t* v = store_hash_col(shapes[s].type, shapes[s].n, shapes[s].keys, shapes[s].null_every);
+            if (!v || RAY_IS_ERR(v)) { bad++; continue; }
+            if (ray_col_save_bulk(v, a) != RAY_OK || ray_col_save_bulk(v, b) != RAY_OK) bad++;
+            int64_t payload = store_file_size(a);
+            if (store_hash_build(a) != RAY_OK || store_hash_append_legacy(b) != RAY_OK) bad++;
+            if (!store_files_same(a, b) || store_file_size(a) <= payload) bad++;
+            ray_t* m = ray_col_mmap(a);
+            if (!m || RAY_IS_ERR(m) || ray_index_kind(m) != RAY_IDX_HASH) bad++;
+            else if ((shapes[s].type == RAY_I64 || shapes[s].type == RAY_TIMESTAMP) && shapes[s].n > 2) {
+                /* row 2's key finds its group, row 2 among its rows */
+                int64_t key = ((int64_t*)ray_data(m))[2];
+                ray_idx_rows_t rows = { NULL, false }; int64_t gn = 0, hit = 0;
+                if (ray_index_hash_group(m, key, &rows, &gn) != 1) bad++;
+                for (int64_t j = 0; j < gn; j++) hit += ray_idx_rows_at(rows, j) == 2;
+                if (hit != 1) bad++;
+            }
+            if (m && !RAY_IS_ERR(m)) ray_release(m); else if (m) ray_error_free(m);
+            ray_release(v);
+        }
+        if (plan == 1) ray_heap_set_anon_watermark(0);
+    }
+    TEST_ASSERT_EQ_I(bad, 0);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+}
+
+/* A file that already carries an index is refused and left as it is; a
+ * STR column is not built in place (the caller takes the in-memory path)
+ * and its file is not touched. */
+static test_result_t test_col_build_hash_index_refusals(void) {
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-hidx-ref-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    char p[200]; snprintf(p, sizeof(p), "%s/a", dir);
+    ray_t* v = store_hash_col(RAY_I64, 100000, 5003, 0);
+    TEST_ASSERT_EQ_I(ray_col_save_bulk(v, p), RAY_OK);
+    TEST_ASSERT_EQ_I(store_hash_build(p), RAY_OK);
+    int64_t indexed = store_file_size(p);
+    TEST_ASSERT_EQ_I(store_hash_build(p), RAY_ERR_CORRUPT);
+    TEST_ASSERT_EQ_I(store_file_size(p), indexed);
+    ray_t* m = ray_col_mmap(p);
+    TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m));
+    TEST_ASSERT_EQ_I(ray_index_kind(m), RAY_IDX_HASH);
+    ray_release(m);
+    ray_release(v);
+
+    ray_t* s = ray_vec_new(RAY_STR, 4);
+    s = ray_str_vec_append(s, "alpha", 5);
+    s = ray_str_vec_append(s, "beta", 4);
+    char q[200]; snprintf(q, sizeof(q), "%s/s", dir);
+    TEST_ASSERT_EQ_I(ray_col_save_bulk(s, q), RAY_OK);
+    int64_t plain = store_file_size(q);
+    TEST_ASSERT_EQ_I(store_hash_build(q), RAY_ERR_NYI);
+    TEST_ASSERT_EQ_I(store_file_size(q), plain);
+    /* ray_splay_hash_column takes the in-memory path for it */
+    TEST_ASSERT_EQ_I(ray_splay_hash_column(q, NULL), RAY_OK);
+    m = ray_col_mmap(q);
+    TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m));
+    TEST_ASSERT_EQ_I(ray_index_kind(m), RAY_IDX_HASH);
+    ray_release(m);
+    ray_release(s);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+}
+
+/* A build that fails after the file was grown cuts it back: the region's
+ * blocks cannot be allocated past RLIMIT_FSIZE (a full disk alike), the
+ * file is left at its payload, loads unindexed, and builds once there is
+ * room.  The column is under the parallel threshold: the child has no pool
+ * workers. */
+static test_result_t test_col_build_hash_index_rollback(void) {
+#ifdef RAY_OS_LINUX
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-hidx-rb-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    char p[200]; snprintf(p, sizeof(p), "%s/a", dir);
+    int64_t n = 50000;
+    ray_t* v = store_hash_col(RAY_I64, n, 997, 0);
+    TEST_ASSERT_EQ_I(ray_col_save_bulk(v, p), RAY_OK);
+    int64_t payload = store_file_size(p);
+    pid_t pid = fork(); TEST_ASSERT_TRUE(pid >= 0);
+    if (!pid) {
+        struct rlimit limit;
+        if (getrlimit(RLIMIT_FSIZE, &limit)) _exit(2);
+        limit.rlim_cur = (rlim_t)payload + 40;     /* the pad fits, the region doesn't */
+        if (signal(SIGXFSZ, SIG_IGN) == SIG_ERR || setrlimit(RLIMIT_FSIZE, &limit)) _exit(2);
+        _exit(store_hash_build(p) == RAY_ERR_IO ? 0 : 1);
+    }
+    int status;
+    TEST_ASSERT_EQ_I(waitpid(pid, &status, 0), pid);
+    TEST_ASSERT_TRUE(WIFEXITED(status)); TEST_ASSERT_EQ_I(WEXITSTATUS(status), 0);
+    TEST_ASSERT_EQ_I(store_file_size(p), payload);
+    ray_t* back = ray_col_mmap(p);
+    TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
+    TEST_ASSERT_FALSE(back->attrs & RAY_ATTR_HAS_INDEX);
+    TEST_ASSERT_EQ_I(back->len, n);
+    ray_release(back);
+    TEST_ASSERT_EQ_I(store_hash_build(p), RAY_OK);
+    back = ray_col_mmap(p);
+    TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
+    TEST_ASSERT_EQ_I(ray_index_kind(back), RAY_IDX_HASH);
+    ray_release(back);
+    ray_release(v);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+#else
+    SKIP("requires Linux RLIMIT_FSIZE fault injection");
+#endif
+}
+
+/* Interrupted at points spread over a build under a budget of many
+ * batches — before the region is laid out, while it is filled — the build
+ * reports the cancel and the file is back at its payload, or it completes
+ * with the uninterrupted bytes. */
+static void store_interrupt_after(void* arg) {
+    int64_t ns = *(const int64_t*)arg;
+    struct timespec ts = { (time_t)(ns / 1000000000), (long)(ns % 1000000000) };
+    nanosleep(&ts, NULL);
+    ray_request_interrupt();
+}
+static int64_t store_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+static test_result_t test_col_build_hash_index_interrupt(void) {
+    ray_pool_t* pool = ray_pool_get();
+    if (!pool || ray_pool_total_workers(pool) < 2) SKIP("needs workers");
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-hidx-int-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    char p[200], r[200];
+    snprintf(p, sizeof(p), "%s/a", dir);
+    snprintf(r, sizeof(r), "%s/ref", dir);
+    ray_t* v = store_hash_col(RAY_I64, 500000, 70001, 1013);
+    ray_heap_set_anon_watermark(INT64_C(64) << 20);   /* batches of 128K rows */
+    TEST_ASSERT_EQ_I(ray_col_save_bulk(v, r), RAY_OK);
+    int64_t payload = store_file_size(r);
+    atomic_store(&pool->cancelled, 1);
+    TEST_ASSERT_EQ_I(store_hash_build(r), RAY_ERR_CANCEL);
+    atomic_store(&pool->cancelled, 0);
+    TEST_ASSERT_EQ_I(store_file_size(r), payload);
+    int64_t t0 = store_now_ns();
+    TEST_ASSERT_EQ_I(store_hash_build(r), RAY_OK);
+    int64_t took = store_now_ns() - t0;
+    int64_t cancelled = 0, bad = 0;
+    for (int k = 0; k < 8; k++) {
+        if (ray_col_save_bulk(v, p) != RAY_OK) { bad++; continue; }
+        int64_t delay = took * k / 8;
+        ray_thread_t th;
+        TEST_ASSERT_EQ_I(ray_thread_create(&th, store_interrupt_after, &delay), RAY_OK);
+        ray_err_t e = store_hash_build(p);
+        ray_thread_join(th);
+        ray_clear_interrupt();
+        if (e == RAY_OK) { if (!store_files_same(p, r)) bad++; continue; }
+        cancelled++;
+        if (e != RAY_ERR_CANCEL || store_file_size(p) != payload) bad++;
+        ray_t* back = ray_col_mmap(p);
+        if (!back || RAY_IS_ERR(back) || (back->attrs & RAY_ATTR_HAS_INDEX)) bad++;
+        if (back && !RAY_IS_ERR(back)) ray_release(back); else if (back) ray_error_free(back);
+    }
+    ray_heap_set_anon_watermark(0);
+    TEST_ASSERT_EQ_I(bad, 0);
+    TEST_ASSERT_TRUE(cancelled > 0);
+    ray_release(v);
     (void)ray_test_rm_rf(dir);
     PASS();
 }
@@ -6475,6 +6749,10 @@ const test_entry_t store_entries[] = {
     { "store/stream_index_write_failure", test_stream_index_write_failure_drops_index, store_setup, store_teardown },
     { "store/stream_inline_zone_one_chunk", test_stream_inline_zone_one_chunk, store_setup, store_teardown },
     { "store/stream_hash_candidate", test_stream_hash_candidate, store_setup, store_teardown },
+    { "store/col_build_hash_index_bytes", test_col_build_hash_index_bytes, store_setup, store_teardown },
+    { "store/col_build_hash_index_refusals", test_col_build_hash_index_refusals, store_setup, store_teardown },
+    { "store/col_build_hash_index_rollback", test_col_build_hash_index_rollback, store_setup, store_teardown },
+    { "store/col_build_hash_index_interrupt", test_col_build_hash_index_interrupt, store_setup, store_teardown },
     { "store/stream_inline_dict", test_stream_inline_dict, store_setup, store_teardown },
     { "store/stream_hash_wave", test_stream_hash_wave, store_setup, store_teardown },
     { "store/stream_region_bytes", test_stream_region_bytes_match, store_setup, store_teardown },

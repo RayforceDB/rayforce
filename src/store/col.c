@@ -49,6 +49,12 @@
 #else
 #include <unistd.h>
 #endif
+#if !defined(RAY_OS_WINDOWS) && !defined(RAY_OS_WASM)
+#include <errno.h>
+#include <fcntl.h>      /* fallocate, F_PREALLOCATE: the in-place hash region */
+#include <sys/mman.h>
+#include <sys/stat.h>
+#endif
 
 /* --------------------------------------------------------------------------
  * validate_sym_bounds -- check all indices in a RAY_SYM column are < sym_count
@@ -765,6 +771,88 @@ ray_err_t ray_col_append_index(const char* path, const void* ix_v,
     if (payload_end) (void)ray_col_truncate(f, payload_end);
     fclose(f);
     return err;
+}
+
+#if !defined(RAY_OS_WINDOWS) && !defined(RAY_OS_WASM)
+/* A column file's index region, mapped writable for a build in place. */
+typedef struct {
+    int      fd;
+    int64_t  payload_end;   /* the file's length before: the column payload */
+    int64_t  region_off;    /* where the region starts: the payload, 32-aligned */
+    uint8_t* map;           /* the mapping, from the page holding region_off */
+    size_t   map_len;
+} col_region_t;
+
+/* The file grown to `end` bytes with its blocks allocated where the
+ * filesystem can, so a full disk fails here rather than as a fault on a
+ * write through the mapping. */
+static bool col_grow(int fd, int64_t from, int64_t end) {
+#if defined(__linux__)
+    if (fallocate(fd, 0, (off_t)from, (off_t)(end - from)) == 0) return true;
+    if (errno != EOPNOTSUPP) return false;
+#elif defined(__APPLE__)
+    fstore_t fs = { .fst_flags = F_ALLOCATEALL, .fst_posmode = F_PEOFPOSMODE,
+                    .fst_offset = 0, .fst_length = (off_t)(end - from) };
+    if (fcntl(fd, F_PREALLOCATE, &fs) == -1) return false;
+#else
+    (void)from;
+#endif
+    return ftruncate(fd, (off_t)end) == 0;
+}
+
+/* ray_index_region_fn: `bytes` of region at region_off, zero-filled. */
+static uint8_t* col_region_map(void* raw, int64_t bytes) {
+    col_region_t* r = (col_region_t*)raw;
+    if (r->map || bytes <= 0) return NULL;
+    int64_t end = r->region_off + bytes;
+    if (!col_grow(r->fd, r->payload_end, end)) return NULL;
+    long ps = sysconf(_SC_PAGESIZE);
+    int64_t pg = ps > 0 ? (int64_t)ps : 4096;
+    int64_t moff = r->region_off & ~(pg - 1);
+    void* p = mmap(NULL, (size_t)(end - moff), PROT_READ | PROT_WRITE, MAP_SHARED,
+                   r->fd, (off_t)moff);
+    if (p == MAP_FAILED) return NULL;
+    r->map = (uint8_t*)p;
+    r->map_len = (size_t)(end - moff);
+    return r->map + (r->region_off - moff);
+}
+#endif
+
+ray_err_t ray_col_build_hash_index(const char* path, ray_t* col, void* trace) {
+#if defined(RAY_OS_WINDOWS) || defined(RAY_OS_WASM)
+    (void)path; (void)col; (void)trace;
+    return RAY_ERR_NYI;
+#else
+    if (!path || !col || RAY_IS_ERR(col)) return RAY_ERR_DOMAIN;
+    if (col->type == RAY_STR) return RAY_ERR_NYI;
+    ray_hash_trace_t* tr = (ray_hash_trace_t*)trace;
+    int fd = open(path, O_RDWR | O_CLOEXEC);
+    if (fd < 0) return RAY_ERR_IO;
+    uint32_t mg = 0;
+    struct stat st;
+    if (pread(fd, &mg, 4, 0) != 4 || fstat(fd, &st) != 0 || st.st_size < 32) {
+        close(fd);
+        return RAY_ERR_IO;
+    }
+    if (mg == COL_IDX_AUX_MAGIC) { close(fd); return RAY_ERR_CORRUPT; }   /* indexed already */
+    col_region_t r = { .fd = fd, .payload_end = (int64_t)st.st_size,
+                       .region_off = ((int64_t)st.st_size + 31) & ~(int64_t)31 };
+    ray_err_t err = ray_index_hash_build_region(col, col_region_map, &r, tr);
+    ray_hash_mark_t tm = tr ? ray_hash_trace_mark() : (ray_hash_mark_t){0};
+    /* the pages stay in the page cache, dirty: the writeback is the kernel's */
+    if (r.map) munmap(r.map, r.map_len);
+    if (err == RAY_OK) {
+        /* the region is in the file before the marker claims it */
+        mg = COL_IDX_AUX_MAGIC;
+        if (pwrite(fd, &mg, 4, 0) != 4) err = RAY_ERR_IO;
+    }
+    /* Without the marker the loader requires the exact payload length.
+     * Best effort, as in ray_col_append_index. */
+    if (err != RAY_OK) (void)!ftruncate(fd, (off_t)r.payload_end);
+    if (close(fd) != 0 && err == RAY_OK) err = RAY_ERR_IO;
+    if (tr) ray_hash_trace_add(tr, RAY_HXT_APPEND, tm, 0);
+    return err;
+#endif
 }
 
 /* Does the payload hold the type's null sentinel anywhere?  Sequential

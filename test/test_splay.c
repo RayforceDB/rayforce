@@ -44,6 +44,8 @@
 #include "io/csv.h"       /* ray_csv_save_splayed_named_opts */
 #include "mem/sys.h"
 #include "core/pool.h"
+#include "ops/idxop.h"      /* hash indexes a save builds in place */
+#include <stdatomic.h>
 #include <string.h>
 #include <stdio.h>
 #include <stddef.h>
@@ -3113,6 +3115,106 @@ static test_result_t test_generation_writer_exit(void) {
     PASS();
 }
 
+/* Column file `name` of the generation `dir` resolves to, read whole into a
+ * raw buffer (*len its size); NULL when unreadable. */
+static uint8_t* splay_read_col_file(const char* dir, const char* name, size_t* len) {
+    char gen[1024], path[1200];
+    if (ray_splay_resolve_dir(dir, gen, sizeof(gen)) != RAY_OK) return NULL;
+    snprintf(path, sizeof(path), "%s/%s", gen, name);
+    FILE* f = fopen(path, "rb");
+    if (!f) return NULL;
+    uint8_t* buf = NULL;
+    if (fseek(f, 0, SEEK_END) == 0) {
+        long sz = ftell(f);
+        if (sz > 0 && fseek(f, 0, SEEK_SET) == 0 && (buf = (uint8_t*)ray_alloc_raw((size_t)sz)) &&
+            fread(buf, 1, (size_t)sz, f) != (size_t)sz) { ray_free_raw(buf); buf = NULL; }
+        *len = sz > 0 ? (size_t)sz : 0;
+    }
+    fclose(f);
+    return buf;
+}
+
+/* A save builds its hash indexes in the column files.  An unclustered
+ * numeric column the save hashes on its own holds exactly the bytes of the
+ * same column saved with its hash built in memory; a SYM column's explicit
+ * hash, rebuilt over the file's positions, answers lookups.  With the
+ * pool's per-column tasks and serially. */
+static test_result_t test_save_hash_in_place(void) {
+    ray_pool_t* pool = ray_pool_get();
+    const char* d_auto = TMP_SPLAY_BASE "/hash_auto";
+    const char* d_mem  = TMP_SPLAY_BASE "/hash_mem";
+    const char* y_auto = TMP_SPLAY_BASE "/hash_auto_sym";
+    const char* y_mem  = TMP_SPLAY_BASE "/hash_mem_sym";
+    mkdir(TMP_SPLAY_BASE, 0755);
+    const int64_t n = 300000;
+    int64_t ids[997];
+    char name[16];
+    for (int k = 0; k < 997; k++) {
+        int l = snprintf(name, sizeof(name), "hk%d", k);
+        ids[k] = ray_sym_intern(name, (size_t)l);
+    }
+    int64_t bad = 0;
+    for (int plan = 0; plan < 2; plan++) {
+        if (plan == 1) { if (!pool) continue; atomic_store(&ray_parallel_flag, 1); }
+        ray_t* a = ray_vec_new(RAY_I64, n);
+        ray_t* t = ray_vec_new(RAY_TIMESTAMP, n);
+        ray_t* s = ray_sym_vec_new(RAY_SYM_W64, n);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(a)); TEST_ASSERT_FALSE(RAY_IS_ERR(t)); TEST_ASSERT_FALSE(RAY_IS_ERR(s));
+        a->len = t->len = s->len = n;
+        for (int64_t i = 0; i < n; i++) {
+            ((int64_t*)ray_data(a))[i] = (int64_t)(((uint64_t)i * 2654435761ull) % 1000000007ull);
+            ((int64_t*)ray_data(t))[i] = (int64_t)(((uint64_t)i * 17) % 70001) * 1000000007;
+            ((int64_t*)ray_data(s))[i] = ids[(i * 31) % 997];
+        }
+        ray_t* sh = s; ray_retain(sh);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_hash(&sh)));
+        int64_t na = ray_sym_intern("a", 1), nt = ray_sym_intern("t", 1), ns = ray_sym_intern("s", 1);
+        ray_t* t1 = ray_table_new(3);
+        t1 = ray_table_add_col(t1, na, a);
+        t1 = ray_table_add_col(t1, nt, t);
+        t1 = ray_table_add_col(t1, ns, sh);
+        ray_t* ah = a; ray_retain(ah);
+        ray_t* th = t; ray_retain(th);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_hash(&ah)));
+        TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_hash(&th)));
+        ray_t* t2 = ray_table_new(3);
+        t2 = ray_table_add_col(t2, na, ah);
+        t2 = ray_table_add_col(t2, nt, th);
+        t2 = ray_table_add_col(t2, ns, s);
+        rm_rf(d_auto); rm_rf(d_mem); unlink(y_auto); unlink(y_mem);
+        TEST_ASSERT_EQ_I(ray_splay_save(t1, d_auto, y_auto), RAY_OK);
+        TEST_ASSERT_EQ_I(ray_splay_save(t2, d_mem, y_mem), RAY_OK);
+        if (plan == 1) atomic_store(&ray_parallel_flag, 0);
+        static const char* cols[2] = { "a", "t" };
+        for (int c = 0; c < 2; c++) {
+            size_t la = 0, lm = 0;
+            uint8_t* fa = splay_read_col_file(d_auto, cols[c], &la);
+            uint8_t* fm = splay_read_col_file(d_mem, cols[c], &lm);
+            if (!fa || !fm || la != lm || la <= 32 + (size_t)n * 8 || memcmp(fa, fm, la) != 0) bad++;
+            ray_free_raw(fa); ray_free_raw(fm);
+        }
+        ray_t* back = ray_read_splayed(d_auto, y_auto);   /* mapped: the indexes ride along */
+        TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
+        ray_t* bs = ray_table_get_col(back, ns);
+        ray_t* ba = ray_table_get_col(back, na);
+        if (!bs || ray_index_kind(bs) != RAY_IDX_HASH || !ba || ray_index_kind(ba) != RAY_IDX_HASH) bad++;
+        for (int k = 0; k < 997 && bs; k += 37) {
+            ray_t* atom = ray_sym(ids[k]);
+            int64_t first = -1;
+            for (int64_t i = 0; i < n && first < 0; i++) if ((i * 31) % 997 == k) first = i;
+            if (ray_index_find_atom(bs, atom) != first) bad++;
+            ray_release(atom);
+        }
+        ray_release(back);
+        ray_release(t1); ray_release(t2);
+        ray_release(a); ray_release(t); ray_release(s);
+        ray_release(ah); ray_release(th); ray_release(sh);
+    }
+    rm_rf(d_auto); rm_rf(d_mem); unlink(y_auto); unlink(y_mem);
+    TEST_ASSERT_EQ_I(bad, 0);
+    PASS();
+}
+
 const test_entry_t splay_entries[] = {
 #ifndef _WIN32
     { "splay/generation_prune_unlinks_symlink", test_generation_prune_unlinks_symlink, splay_setup, splay_teardown },
@@ -3173,5 +3275,6 @@ const test_entry_t splay_entries[] = {
     { "splay/resolution_explicit_wins",   test_resolution_explicit_wins,        splay_setup, splay_teardown },
     { "splay/csv_symfile_order",          test_csv_splayed_symfile_order,       splay_setup, splay_teardown },
     { "splay/csv_quote_mode_per_file",    test_csv_splayed_quote_mode_per_file, splay_setup, splay_teardown },
+    { "splay/save_hash_in_place",         test_save_hash_in_place,              splay_setup, splay_teardown },
     { NULL, NULL, NULL, NULL },
 };

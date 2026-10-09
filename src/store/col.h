@@ -132,6 +132,17 @@ void      ray_col_want_rows(ray_t* col, const int64_t* idx, int64_t n);
 ray_err_t ray_col_append_index(const char* path, const void* ix,
                                int64_t col_len, int8_t col_type);
 
+/* Build the hash index of `col`, the payload of index-less column file
+ * `path`, and append it as the inline region, built in place: the file is
+ * extended (its blocks allocated) and the region mapped, and the arrays are
+ * written there once instead of staged in memory and copied in.  Same bytes
+ * as ray_col_append_index of the index ray_index_attach_hash builds.  The
+ * marker is stamped last; on failure the file is cut back to the payload.
+ * RAY_ERR_NYI (file untouched) where the in-place build does not apply: a
+ * STR column, or no shared file mappings.  `trace` is a ray_hash_trace_t*
+ * (NULL: none), void as `ix` above. */
+ray_err_t ray_col_build_hash_index(const char* path, ray_t* col, void* trace);
+
 /* Seek f to its end, pad to 32 bytes and write ix's inline region there;
  * flushes. Does not touch the header. The caller stamps the marker with
  * ray_col_stamp_index or rolls the file back on error. */

@@ -404,20 +404,38 @@ ray_t*  ray_index_inline_map(uint8_t* region, int64_t region_size);
  * read and wrote (/proc/self/io; zero off Linux), and `moved`, the bytes the
  * phase's own passes read and write by design (each array a pass reads or
  * writes in full, once per pass) — the I/O it costs when nothing fits in
- * memory. */
-enum { RAY_HXT_COPY, RAY_HXT_COUNT, RAY_HXT_BUCKET, RAY_HXT_DISTINCT,
+ * memory.  count: the column read for the partition histogram; bucket: the
+ * column read again into key words and row ids; distinct: the groups of
+ * each partition counted; groups: deduped and stored, and the slot table
+ * filled alongside when its size is known; table: the slot table after the
+ * groups, and the arrays cut to size; append: the region into the file. */
+enum { RAY_HXT_COUNT, RAY_HXT_BUCKET, RAY_HXT_DISTINCT,
        RAY_HXT_GROUPS, RAY_HXT_TABLE, RAY_HXT_APPEND, RAY_HXT_N };
 typedef struct {
     int64_t ns[RAY_HXT_N], majflt[RAY_HXT_N], rd[RAY_HXT_N], wr[RAY_HXT_N], moved[RAY_HXT_N];
+    int64_t cwr[RAY_HXT_N];     /* dirty bytes dropped before their writeback */
+    int64_t n_keys, n_groups;   /* the index built */
 } ray_hash_trace_t;
-typedef struct { int64_t ns, majflt, rd, wr; } ray_hash_mark_t;
+typedef struct { int64_t ns, majflt, rd, wr, cwr; } ray_hash_mark_t;
 ray_hash_mark_t ray_hash_trace_mark(void);
 /* Phase `ph` ran since `since` and moved `moved` bytes. */
 void ray_hash_trace_add(ray_hash_trace_t* t, int ph, ray_hash_mark_t since, int64_t moved);
 /* One line: each phase that ran, `moved` also as a multiple of `col_bytes`. */
 void ray_hash_trace_print(FILE* f, const char* what, const ray_hash_trace_t* t, int64_t col_bytes);
-/* The next hash builds on this thread add their phases to `t` (NULL: off). */
-void ray_index_hash_trace(ray_hash_trace_t* t);
+
+/* Build the hash index of numeric or SYM vector `v` straight into its
+ * persisted inline region, without attaching it and without staging the
+ * arrays in memory: once the region's size is known, `map(ctx, bytes)`
+ * returns `bytes` of zero-filled writable memory (NULL when it cannot),
+ * and the build writes there exactly the bytes ray_index_inline_write would
+ * write for the index ray_index_attach_hash builds on `v`.  RAY_ERR_NYI for
+ * a type the partitioned builder does not take (STR) — nothing was mapped;
+ * RAY_ERR_IO when map failed, RAY_ERR_OOM / RAY_ERR_CANCEL when the build
+ * did: the mapped memory, if any, holds no complete region.  `tr` (may be
+ * NULL) collects the phases. */
+typedef uint8_t* (*ray_index_region_fn)(void* ctx, int64_t bytes);
+ray_err_t ray_index_hash_build_region(ray_t* v, ray_index_region_fn map, void* ctx,
+                                      ray_hash_trace_t* tr);
 
 /* Drop any attached index from *vp.  No-op if none.  Restores the
  * pre-attach aux state byte-for-byte.  Returns *vp. */

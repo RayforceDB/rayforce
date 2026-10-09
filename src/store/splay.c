@@ -1163,6 +1163,29 @@ ray_t* ray_splay_load(const char* dir, const char* sym_path) {
     return splay_load_impl(dir, sym_path, false);
 }
 
+/* `dir`/<name of column c> into out[cap]; false when it does not fit. */
+static bool splay_col_path(const char* dir, ray_t* tbl, int64_t c, char* out, size_t cap) {
+    ray_t* nstr = ray_sym_str(ray_table_col_name(tbl, c));
+    if (!nstr || RAY_IS_ERR(nstr)) return false;
+    int n = snprintf(out, cap, "%s/%.*s", dir, (int)ray_str_len(nstr), ray_str_ptr(nstr));
+    return n > 0 && (size_t)n < cap;
+}
+
+/* Hash-index `col` and append the index to its index-less file `path`:
+ * built in place in the file (no copy of the column, the arrays written
+ * once), or where that does not apply, attached to a copy and appended. */
+static ray_err_t splay_hash_append(const char* path, ray_t* col) {
+    ray_err_t err = ray_col_build_hash_index(path, col, NULL);
+    if (err != RAY_ERR_NYI) return err;
+    ray_t* hi = ray_idx_hash_fn(col);
+    if (!hi || RAY_IS_ERR(hi)) { if (hi) ray_error_free(hi); return RAY_ERR_OOM; }
+    err = (hi->attrs & RAY_ATTR_HAS_INDEX)
+        ? ray_col_append_index(path, ray_index_payload(hi->index), hi->len, hi->type)
+        : RAY_ERR_IO;
+    ray_release(hi);
+    return err;
+}
+
 /* Build + persist accelerator indexes for a freshly-streamed splayed store.
  * The .csv.splayed writer emits raw columns; this scans each eligible numeric
  * column once and APPENDS a chunk-zone index region to its file (no data
@@ -1204,14 +1227,7 @@ static void splay_build_index_col(const char* dir, ray_t* tbl, int64_t c, ray_t*
                 if (n > 0 && n < (int)sizeof(path)) {
                     ray_t* fc = ray_col_load(path);  /* file-local codes */
                     if (fc && !RAY_IS_ERR(fc)) {
-                        ray_t* fi = ray_idx_hash_fn(fc);  /* hash over file-local */
-                        if (fi && !RAY_IS_ERR(fi)) {
-                            (void)ray_col_append_index(path,
-                                ray_index_payload(fi->index), fi->len, RAY_SYM);
-                            ray_release(fi);
-                        } else if (fi) {
-                            ray_error_free(fi);
-                        }
+                        (void)splay_hash_append(path, fc);  /* hash over file-local */
                         ray_release(fc);
                     } else if (fc) {
                         ray_error_free(fc);
@@ -1266,23 +1282,12 @@ static void splay_build_index_col(const char* dir, ray_t* tbl, int64_t c, ray_t*
                 *deferred = idx;
                 return;
             }
-            ray_t* hi = ray_idx_hash_fn(col);
-            if (hi && !RAY_IS_ERR(hi) && (hi->attrs & RAY_ATTR_HAS_INDEX)) {
+            char hpath[1100];
+            if (splay_col_path(dir, tbl, c, hpath, sizeof(hpath)) &&
+                splay_hash_append(hpath, col) == RAY_OK) {
                 ray_release(idx);          /* zone sacrificed for the hash */
-                idx = NULL;
-                ray_t* nstr = ray_sym_str(ray_table_col_name(tbl, c));
-                if (nstr && !RAY_IS_ERR(nstr)) {
-                    char path[1100];
-                    int n = snprintf(path, sizeof(path), "%s/%.*s", dir,
-                                     (int)ray_str_len(nstr), ray_str_ptr(nstr));
-                    if (n > 0 && n < (int)sizeof(path))
-                        (void)ray_col_append_index(path,
-                            ray_index_payload(hi->index), hi->len, hi->type);
-                }
-                ray_release(hi);
                 return;
             }
-            if (hi) { if (RAY_IS_ERR(hi)) ray_error_free(hi); else ray_release(hi); }
             /* Hash build failed — fall through and persist the zone. */
         }
 
@@ -1355,11 +1360,22 @@ void ray_splay_build_indexes(const char* dir, ray_t* tbl) {
         memset(deferred, 0, (size_t)nc * 2 * sizeof(ray_t*));
         splay_index_ctx_t ctx = { .dir = dir, .tbl = tbl, .deferred = deferred, .hashed = deferred + nc };
         ray_pool_dispatch_n(pool, splay_build_index_task, &ctx, (uint32_t)nc);
-        /* Hash builds one after another (each parallel inside), then the
-         * writes of all deferred columns together. */
+        /* Hash builds one after another (each parallel inside), each into
+         * its file; where that cannot be done in place, built in memory and
+         * written with the zones of the other deferred columns. */
         for (int64_t c = 0; c < nc; c++) {
             if (!deferred[c]) continue;
-            ray_t* hi = ray_idx_hash_fn(ray_table_get_col_idx(tbl, c));
+            ray_t* col = ray_table_get_col_idx(tbl, c);
+            char path[1100];
+            ray_err_t e = splay_col_path(dir, tbl, c, path, sizeof(path))
+                        ? ray_col_build_hash_index(path, col, NULL) : RAY_ERR_IO;
+            if (e == RAY_OK) {               /* the zone is sacrificed for the hash */
+                ray_release(deferred[c]);
+                deferred[c] = NULL;
+                continue;
+            }
+            if (e != RAY_ERR_NYI) continue;   /* the zone, then */
+            ray_t* hi = ray_idx_hash_fn(col);
             if (hi && !RAY_IS_ERR(hi) && (hi->attrs & RAY_ATTR_HAS_INDEX)) ctx.hashed[c] = hi;
             else if (hi) { if (RAY_IS_ERR(hi)) ray_error_free(hi); else ray_release(hi); }
         }
@@ -1411,31 +1427,43 @@ ray_err_t ray_splay_hash_column(const char* path, ray_t* zone) {
     int64_t t0 = trace ? ray_profile_now_ns() : 0;
     ray_t* col = ray_col_mmap(path);
     if (!col || RAY_IS_ERR(col)) { if (col) ray_error_free(col); return RAY_ERR_IO; }
-    ray_err_t err = RAY_ERR_IO;
     int64_t t1 = trace ? ray_profile_now_ns() : 0;
     ray_hash_trace_t ht;
     memset(&ht, 0, sizeof(ht));
-    if (trace) ray_index_hash_trace(&ht);
-    ray_t* hi = ray_idx_hash_fn(col);
-    ray_index_hash_trace(NULL);
-    int64_t t2 = trace ? ray_profile_now_ns() : 0;
-    if (hi && !RAY_IS_ERR(hi) && (hi->attrs & RAY_ATTR_HAS_INDEX)) {
-        ray_hash_mark_t tm = trace ? ray_hash_trace_mark() : (ray_hash_mark_t){0};
-        err = ray_col_append_index(path, ray_index_payload(hi->index), hi->len, hi->type);
-        if (trace) {
-            const ray_index_t* hx = ray_index_payload(hi->index);
+    /* The build reads the column front to back, twice, and not again:
+     * larger read-ahead, and its pages are the first to go under pressure
+     * rather than the build's own. */
+    if (col->len > 0)   /* from the header: madvise wants the mapping's page */
+        ray_vm_advise_seq(col, 32 + (size_t)col->len * ray_sym_elem_size(col->type, col->attrs));
+    /* Built over the mapping, straight into the file: the arrays are
+     * written once, where they end up, and the column is not copied. */
+    ray_err_t err = ray_col_build_hash_index(path, col, trace ? &ht : NULL);
+    if (err == RAY_ERR_NYI) {
+        /* No in-place build here: attached in memory, then appended.  The
+         * mapping is the column's only reference, so the attach builds on it
+         * rather than on a copy. */
+        ray_t* r = ray_index_attach_hash(&col);
+        if (!RAY_IS_ERR(r) && (col->attrs & RAY_ATTR_HAS_INDEX)) {
+            const ray_index_t* hx = ray_index_payload(col->index);
+            ht.n_keys = hx->u.hash.n_keys;
+            ht.n_groups = hx->u.hash.n_groups;
+            ray_hash_mark_t tm = trace ? ray_hash_trace_mark() : (ray_hash_mark_t){0};
+            err = ray_col_append_index(path, hx, col->len, col->type);
             /* the region is read from the built arrays and written to the file */
-            ray_hash_trace_add(&ht, RAY_HXT_APPEND, tm, 2 * ray_index_inline_size(hx));
-            fprintf(stderr, "splayed hash: file=%s rows=%" PRId64 " keys=%" PRId64 " groups=%" PRId64
-                            " mmap=%.1fms build=%.1fms write=%.1fms\n",
-                    path, hi->len, hx->u.hash.n_keys, hx->u.hash.n_groups,
-                    (double)(t1 - t0) / 1e6, (double)(t2 - t1) / 1e6, (double)(ray_profile_now_ns() - t2) / 1e6);
-            ray_hash_trace_print(stderr, "splayed hash io", &ht,
-                                 hi->len * (int64_t)ray_sym_elem_size(hi->type, hi->attrs));
+            if (trace) ray_hash_trace_add(&ht, RAY_HXT_APPEND, tm, 2 * ray_index_inline_size(hx));
+        } else {
+            if (RAY_IS_ERR(r)) ray_error_free(r);
+            err = RAY_ERR_IO;
         }
-        ray_release(hi);
-    } else if (hi) {
-        if (RAY_IS_ERR(hi)) ray_error_free(hi); else ray_release(hi);
+    }
+    int64_t t2 = trace ? ray_profile_now_ns() : 0;
+    if (trace && err == RAY_OK) {
+        fprintf(stderr, "splayed hash: file=%s rows=%" PRId64 " keys=%" PRId64 " groups=%" PRId64
+                        " mmap=%.1fms build=%.1fms write=%.1fms\n",
+                path, col->len, ht.n_keys, ht.n_groups, (double)(t1 - t0) / 1e6,
+                (double)(t2 - t1 - ht.ns[RAY_HXT_APPEND]) / 1e6, (double)ht.ns[RAY_HXT_APPEND] / 1e6);
+        ray_hash_trace_print(stderr, "splayed hash io", &ht,
+                             col->len * (int64_t)ray_sym_elem_size(col->type, col->attrs));
     }
     if (err != RAY_OK && zone)
         err = ray_col_append_index(path, ray_index_payload(zone), col->len, col->type);

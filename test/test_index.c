@@ -1054,6 +1054,312 @@ static test_result_t test_index_hash_part_interrupt_sweep(void) {
     PASS();
 }
 
+/* ─── Hash index built in place ──────────────────────────────────────────
+ *
+ * ray_index_hash_build_region writes into memory the caller hands it the
+ * region ray_index_inline_write lays out for the index ray_index_attach_hash
+ * builds — byte for byte, block headers included — whatever the shape,
+ * memory budget or core count.  The memory here stands in for the column
+ * file the store maps. */
+typedef struct { uint8_t* buf; int64_t bytes; int calls; bool fail; } idx_region_ctx_t;
+static uint8_t* idx_region_map(void* raw, int64_t bytes) {
+    idx_region_ctx_t* c = (idx_region_ctx_t*)raw;
+    c->calls++;
+    if (c->fail) return NULL;
+    c->buf = (uint8_t*)ray_calloc_raw((size_t)bytes);
+    c->bytes = bytes;
+    return c->buf;
+}
+
+/* n rows of `type`, keys spread over `keys` values (negative ones too), every
+ * null_every-th row null (0: none). */
+static ray_t* idx_reg_col(int8_t type, int64_t n, int64_t keys, int64_t null_every) {
+    ray_t* v = type == RAY_SYM ? ray_sym_vec_new(RAY_SYM_W32, n > 0 ? n : 1)
+                               : ray_vec_new(type, n > 0 ? n : 1);
+    if (!v || RAY_IS_ERR(v)) return v;
+    v->len = n;
+    void* d = ray_data(v);
+    for (int64_t i = 0; i < n; i++) {
+        int64_t k = (int64_t)(((uint64_t)i * 2654435761ull) % (uint64_t)keys) - keys / 3;
+        switch (type) {
+        case RAY_BOOL:      ((uint8_t*)d)[i] = (uint8_t)(k & 1); break;
+        case RAY_U8:        ((uint8_t*)d)[i] = (uint8_t)k; break;
+        case RAY_I16:       ((int16_t*)d)[i] = (int16_t)k; break;
+        case RAY_I32: case RAY_DATE: ((int32_t*)d)[i] = (int32_t)k; break;
+        case RAY_I64: case RAY_TIMESTAMP: ((int64_t*)d)[i] = k * 1000003; break;
+        case RAY_F64:       ((double*)d)[i] = k == 0 ? -0.0 : k == 1 ? 0.0 : (double)k * 0.25; break;
+        case RAY_SYM:       ((uint32_t*)d)[i] = (uint32_t)(k + keys); break;
+        default: break;
+        }
+    }
+    for (int64_t i = 0; null_every && i < n; i += null_every)
+        if (ray_vec_set_null_checked(v, i, true) != RAY_OK) { ray_release(v); return NULL; }
+    return v;
+}
+
+/* The region of `v` built in place equals the one of its attached index;
+ * `ref` (may be NULL) keeps that index's region for the caller. */
+static bool idx_region_same(ray_t* v, idx_region_ctx_t* ref) {
+    idx_region_ctx_t c = {0};
+    ray_err_t e = ray_index_hash_build_region(v, idx_region_map, &c, NULL);
+    ray_t* w = v;
+    ray_retain(w);                        /* the attach builds on a copy */
+    ray_t* r = ray_index_attach_hash(&w);
+    bool ok = e == RAY_OK && c.calls == 1 && !RAY_IS_ERR(r);
+    if (!RAY_IS_ERR(r)) {
+        const ray_index_t* ix = ray_index_payload(w->index);
+        int64_t size = ray_index_inline_size(ix);
+        uint8_t* want = (uint8_t*)ray_calloc_raw((size_t)size);
+        ray_index_inline_write(want, ix);
+        ok = ok && size == c.bytes && memcmp(want, c.buf, (size_t)size) == 0;
+        if (ref) { ref->buf = want; ref->bytes = size; } else ray_free_raw(want);
+    } else {
+        ray_error_free(r);
+    }
+    ray_release(w);
+    ray_free_raw(c.buf);
+    return ok;
+}
+
+typedef struct { int8_t type; int64_t n, keys, null_every; } idx_reg_shape_t;
+static const idx_reg_shape_t idx_reg_shapes[] = {
+    { RAY_I64,       200000, 200000,   0 },   /* every key distinct */
+    { RAY_I64,       300000,   5003, 977 },   /* gkeys and offs cut to the groups */
+    { RAY_I32,         1000,     10,   0 },   /* few groups, kept at the key count */
+    { RAY_F64,       100000,   2003, 101 },   /* -0.0, +0.0 and NaN */
+    { RAY_DATE,       70000,   3000,  13 },
+    { RAY_TIMESTAMP,  90000,  90000,   0 },
+    { RAY_I16,        50000,  30000,   7 },
+    { RAY_U8,         20000,    256,   0 },
+    { RAY_BOOL,        5000,      2,   0 },
+    { RAY_SYM,       120000,    997,   0 },   /* domain ids */
+    { RAY_I64,            0,      1,   0 },   /* empty */
+    { RAY_I64,            1,      1,   0 },   /* one row */
+    { RAY_I64,         2000,     50,   1 },   /* every row null */
+};
+
+/* Every shape under three plans: the default (one batch), serial, and a
+ * budget small enough for many batches and the counting pass; each gives
+ * the attached index's region. */
+static test_result_t test_index_hash_region_bytes(void) {
+    ray_heap_init();
+    (void)ray_pool_get();
+    int64_t bad = 0;
+    for (int plan = 0; plan < 3; plan++) {
+        if (plan == 1) atomic_store(&ray_parallel_flag, 1);
+        if (plan == 2) ray_heap_set_anon_watermark(INT64_C(4) << 20);
+        for (size_t s = 0; s < sizeof(idx_reg_shapes) / sizeof(idx_reg_shapes[0]); s++) {
+            const idx_reg_shape_t* sh = &idx_reg_shapes[s];
+            ray_t* v = idx_reg_col(sh->type, sh->n, sh->keys, sh->null_every);
+            if (!v || RAY_IS_ERR(v)) { bad++; continue; }
+            if (!idx_region_same(v, NULL)) bad++;
+            ray_release(v);
+        }
+        ray_t* hot = idx_part_col_n(300000);   /* a partition larger than a batch */
+        if (!idx_region_same(hot, NULL)) bad++;
+        ray_release(hot);
+        if (plan == 1) atomic_store(&ray_parallel_flag, 0);
+        if (plan == 2) ray_heap_set_anon_watermark(0);
+    }
+    TEST_ASSERT_EQ_I(bad, 0);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* A column large enough for its key words to take a direct block, built in
+ * many batches: spilled, each batch's key words are punched out of the
+ * spill file once read, and the later batches still find theirs; and the
+ * same with the block anonymous (left alone). */
+static test_result_t test_index_hash_region_discard(void) {
+    ray_heap_init();
+    (void)ray_pool_get();
+    ray_t* v = idx_reg_col(RAY_I64, 2200000, 70001, 0);   /* key words: 17.6 MB, a direct block */
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    int64_t bad = 0;
+    for (int plan = 0; plan < 2; plan++) {
+        ray_heap_direct_cache_drain();
+        ray_heap_set_anon_watermark(plan == 0 ? INT64_C(4) << 20
+                                              : ray_heap_anon_committed() + (INT64_C(96) << 20));
+        if (!idx_region_same(v, NULL)) bad++;
+        ray_heap_set_anon_watermark(0);
+    }
+    TEST_ASSERT_EQ_I(bad, 0);
+    ray_release(v);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* The block headers keep their arrays' allocation order: gkeys and offs are
+ * allocated for the keys and cut to the groups only when the slack is worth
+ * a copy, so a region built in place must take the same capacities. */
+static test_result_t test_index_hash_region_capacity(void) {
+    ray_heap_init();
+    ray_t* few = idx_reg_col(RAY_I32, 1000, 10, 0);        /* slack under 1 MB: kept */
+    ray_t* many = idx_reg_col(RAY_I64, 300000, 5003, 0);   /* cut */
+    TEST_ASSERT_FALSE(RAY_IS_ERR(few)); TEST_ASSERT_FALSE(RAY_IS_ERR(many));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_hash(&few)));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_hash(&many)));
+    const ray_index_t* a = ray_index_payload(few->index);
+    const ray_index_t* b = ray_index_payload(many->index);
+    TEST_ASSERT_EQ_I(a->u.hash.n_groups, 10);
+    TEST_ASSERT_EQ_I(a->u.hash.gkeys->order, ray_order_for_size(1000 * 8));
+    TEST_ASSERT_EQ_I(a->u.hash.offs->order, ray_order_for_size(1001 * 4));
+    TEST_ASSERT_EQ_I(b->u.hash.n_groups, 5003);
+    TEST_ASSERT_EQ_I(b->u.hash.gkeys->order, ray_order_for_size(5003 * 8));
+    /* and the regions built in place say the same */
+    ray_t* v1 = idx_reg_col(RAY_I32, 1000, 10, 0);
+    ray_t* v2 = idx_reg_col(RAY_I64, 300000, 5003, 0);
+    TEST_ASSERT_TRUE(idx_region_same(v1, NULL));
+    TEST_ASSERT_TRUE(idx_region_same(v2, NULL));
+    ray_release(v1); ray_release(v2);
+    ray_release(few); ray_release(many);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* Row ids past 32 bits take 64-bit arrays; the threshold is lowered here
+ * (debug builds) so a small column takes that layout. */
+static test_result_t test_index_hash_region_wide(void) {
+#if defined(DEBUG)
+    ray_heap_init();
+    (void)ray_pool_get();
+    TEST_ASSERT_EQ_I(setenv("RAY_HASH_WIDE_ROWS", "100", 1), 0);
+    int64_t bad = 0;
+    for (int plan = 0; plan < 2; plan++) {
+        if (plan == 1) ray_heap_set_anon_watermark(INT64_C(4) << 20);
+        ray_t* v = idx_reg_col(RAY_I64, 300000, 5003, 977);
+        idx_region_ctx_t ref = {0};
+        if (!idx_region_same(v, &ref)) bad++;
+        /* the table, offs and rows blocks are I64 in the region */
+        ray_t* m = ref.buf ? ray_index_inline_map(ref.buf, ref.bytes) : NULL;
+        if (!m) bad++;
+        else {
+            const ray_index_t* ix = ray_index_payload(m);
+            if (ix->u.hash.table->type != RAY_I64 || ix->u.hash.offs->type != RAY_I64 ||
+                ix->u.hash.rows->type != RAY_I64 || ix->u.hash.n_groups != 5003) bad++;
+        }
+        ray_free_raw(ref.buf);
+        ray_t* w = idx_reg_col(RAY_I32, 1000, 10, 0);
+        if (!idx_region_same(w, NULL)) bad++;
+        ray_release(v); ray_release(w);
+        if (plan == 1) ray_heap_set_anon_watermark(0);
+    }
+    unsetenv("RAY_HASH_WIDE_ROWS");
+    TEST_ASSERT_EQ_I(bad, 0);
+    ray_heap_destroy();
+    PASS();
+#else
+    SKIP("RAY_HASH_WIDE_ROWS is read by debug builds only");
+#endif
+}
+
+/* What the in-place build refuses or fails on: a STR column (the attach
+ * keeps its own walk) and a slice before anything is mapped; a mapping that
+ * cannot be made; and a column already carrying another index, whose
+ * pre-index aux the region records as the attach does after dropping it.
+ * A failed build leaves nothing allocated. */
+static test_result_t test_index_hash_region_guards(void) {
+    ray_heap_init();
+    (void)ray_pool_get();
+    idx_region_ctx_t c = {0};
+    ray_t* s = ray_vec_new(RAY_STR, 4);
+    s = ray_str_vec_append(s, "a", 1);
+    s = ray_str_vec_append(s, "b", 1);
+    TEST_ASSERT_EQ_I(ray_index_hash_build_region(s, idx_region_map, &c, NULL), RAY_ERR_NYI);
+    TEST_ASSERT_EQ_I(c.calls, 0);
+    ray_release(s);
+
+    ray_t* v = idx_reg_col(RAY_I64, 300000, 5003, 977);
+    ray_t* sl = ray_vec_slice(v, 10, 1000);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(sl));
+    TEST_ASSERT_EQ_I(ray_index_hash_build_region(sl, idx_region_map, &c, NULL), RAY_ERR_NYI);
+    TEST_ASSERT_EQ_I(c.calls, 0);
+    ray_release(sl);
+
+    for (int plan = 0; plan < 2; plan++) {      /* mapped after one batch, after the count */
+        if (plan == 1) ray_heap_set_anon_watermark(INT64_C(4) << 20);
+        idx_region_ctx_t f = { .fail = true };
+        ray_mem_trace_t mt;
+        TEST_ASSERT_TRUE(ray_mem_trace_begin());
+        ray_err_t e = ray_index_hash_build_region(v, idx_region_map, &f, NULL);
+        ray_mem_trace_end(&mt);
+        if (plan == 1) ray_heap_set_anon_watermark(0);
+        TEST_ASSERT_EQ_I(e, RAY_ERR_IO);
+        TEST_ASSERT_EQ_I(f.calls, 1);
+        TEST_ASSERT_EQ_I(mt.net_bytes, 0);
+    }
+
+    ray_t* z = v;
+    ray_retain(z);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_zone(&z)));   /* z: a copy with a zone */
+    TEST_ASSERT_TRUE(z->attrs & RAY_ATTR_HAS_INDEX);
+    TEST_ASSERT_TRUE(idx_region_same(z, NULL));
+    ray_release(z);
+    ray_release(v);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* Interrupted anywhere — the pool cancelled up front, or an interrupt at
+ * points spread over a build under a budget of many batches — the build
+ * reports the cancel and leaves nothing allocated, or completes with
+ * exactly the uninterrupted region. */
+static test_result_t test_index_hash_region_interrupt(void) {
+    ray_heap_init();
+    ray_pool_t* pool = ray_pool_get();
+    if (!pool || ray_pool_total_workers(pool) < 2) { ray_heap_destroy(); SKIP("needs workers"); }
+    ray_t* v = idx_part_col_n(500000);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    ray_mem_trace_t mt;
+    idx_region_ctx_t c = {0};
+    atomic_store(&pool->cancelled, 1);
+    TEST_ASSERT_TRUE(ray_mem_trace_begin());
+    ray_err_t e = ray_index_hash_build_region(v, idx_region_map, &c, NULL);
+    ray_free_raw(c.buf);
+    ray_mem_trace_end(&mt);
+    atomic_store(&pool->cancelled, 0);
+    TEST_ASSERT_EQ_I(e, RAY_ERR_CANCEL);
+    TEST_ASSERT_EQ_I(mt.net_bytes, 0);
+
+    ray_heap_set_anon_watermark(INT64_C(64) << 20);   /* batches of 128K rows */
+    idx_region_ctx_t ref = {0};
+    TEST_ASSERT_TRUE(idx_region_same(v, &ref));
+    int64_t t0 = idx_now_ns();
+    idx_region_ctx_t once = {0};
+    TEST_ASSERT_EQ_I(ray_index_hash_build_region(v, idx_region_map, &once, NULL), RAY_OK);
+    int64_t took = idx_now_ns() - t0;
+    ray_free_raw(once.buf);
+    int64_t cancelled = 0, bad = 0;
+    for (int k = 0; k < 8; k++) {
+        idx_region_ctx_t a = {0};
+        int64_t delay = took * k / 8;
+        ray_thread_t th;
+        TEST_ASSERT_TRUE(ray_mem_trace_begin());
+        TEST_ASSERT_EQ_I(ray_thread_create(&th, idx_interrupt_after, &delay), RAY_OK);
+        e = ray_index_hash_build_region(v, idx_region_map, &a, NULL);
+        ray_thread_join(th);
+        ray_clear_interrupt();
+        if (e == RAY_OK) {
+            if (a.bytes != ref.bytes || memcmp(a.buf, ref.buf, (size_t)ref.bytes) != 0) bad++;
+            ray_free_raw(a.buf);
+            ray_mem_trace_end(&mt);
+        } else {
+            cancelled++;
+            if (e != RAY_ERR_CANCEL) bad++;
+            ray_free_raw(a.buf);
+            ray_mem_trace_end(&mt);
+            if (mt.net_bytes != 0) bad++;
+        }
+    }
+    ray_heap_set_anon_watermark(0);
+    ray_free_raw(ref.buf);
+    TEST_ASSERT_EQ_I(bad, 0);
+    TEST_ASSERT_TRUE(cancelled > 0);
+    ray_release(v);
+    ray_heap_destroy();
+    PASS();
+}
+
 /* ─── Mapped column drops its own index: the whole mapping is unmapped ──
  *
  * A column loaded by mmap with an inline index region is longer than its
@@ -4325,6 +4631,12 @@ const test_entry_t index_entries[] = {
     { "index/hash_part_wraps", test_index_hash_part_wraps, NULL, NULL },
     { "index/hash_part_interrupted", test_index_hash_part_interrupted, NULL, NULL },
     { "index/hash_part_interrupt_sweep", test_index_hash_part_interrupt_sweep, NULL, NULL },
+    { "index/hash_region_bytes", test_index_hash_region_bytes, NULL, NULL },
+    { "index/hash_region_capacity", test_index_hash_region_capacity, NULL, NULL },
+    { "index/hash_region_discard", test_index_hash_region_discard, NULL, NULL },
+    { "index/hash_region_wide", test_index_hash_region_wide, NULL, NULL },
+    { "index/hash_region_guards", test_index_hash_region_guards, NULL, NULL },
+    { "index/hash_region_interrupt", test_index_hash_region_interrupt, NULL, NULL },
     { "index/persistence_roundtrip",         test_index_persistence_roundtrip,         NULL, NULL },
     { "index/bool_zone_and_hash",            test_index_bool_zone_and_hash,            NULL, NULL },
     { "index/i16_zone_and_hash",             test_index_i16_zone_and_hash,             NULL, NULL },

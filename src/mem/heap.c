@@ -1937,6 +1937,30 @@ void ray_free_raw(void* p) {
     ray_free((ray_t*)((char*)p - 32));   /* 32 = ray_t header before the data */
 }
 
+void ray_raw_discard(void* p, size_t from, size_t upto) {
+#if RAY_HEAP_FILE_SPILL && defined(MADV_REMOVE)
+    if (!p || upto <= from) return;
+    ray_t* v = (ray_t*)((char*)p - 32);
+    /* An anonymous block is below the watermark, and the direct-block
+     * cache keeps it resident for its next use: left alone. */
+    if (!ray_is_direct(v) || !ray_direct_file_backed(v)) return;
+    size_t room = ray_block_data_bytes(v);
+    if (upto > room) upto = room;
+    long ps = sysconf(_SC_PAGESIZE);
+    uintptr_t pg = ps > 0 ? (uintptr_t)ps : 4096;
+    /* whole pages only, and never the first: it holds the headers */
+    uintptr_t first = ((uintptr_t)p + pg - 1) & ~(pg - 1);
+    uintptr_t lo = ((uintptr_t)p + from) & ~(pg - 1);
+    uintptr_t hi = ((uintptr_t)p + upto) & ~(pg - 1);
+    if (lo < first) lo = first;
+    if (hi <= lo) return;
+    /* punched out of the spill file: a dirty page is dropped, not written */
+    (void)madvise((void*)lo, hi - lo, MADV_REMOVE);
+#else
+    (void)p; (void)from; (void)upto;
+#endif
+}
+
 void* ray_realloc_raw(void* p, size_t n) {
     if (!p) return ray_alloc_raw(n);
     ray_t* v = (ray_t*)((char*)p - 32);

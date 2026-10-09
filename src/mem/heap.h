@@ -337,6 +337,14 @@ static inline bool ray_direct_file_backed(const ray_t* v) {
     return ((const ray_direct_hdr_t*)((const char*)v - RAY_DIRECT_HDR))->swap_fd >= 0;
 }
 
+/* Bytes [0, upto) of ray_alloc_raw block `p` are not read again, and [0,
+ * from) of them were reported before.  When `p` is spilled (a direct block
+ * over a spill file), the whole pages among them are punched out of the
+ * file now: a dirty one is never written back, and the page cache it held
+ * is free for what comes next.  They read zero after.  A no-op for every
+ * other block (and where the platform cannot punch a mapped range). */
+void ray_raw_discard(void* p, size_t from, size_t upto);
+
 /* Anonymous (RAM-resident, OOM-killable) pool, direct and sys bytes currently
  * committed.  Allocations that would push this past the anon watermark
  * (default: ray_sys_ram_limit — physical RAM, or the container's cgroup
