@@ -1637,11 +1637,14 @@ static inline bool group_has_keys(ray_graph_t* g, ray_op_t* group_op) {
 
 /* True when every leaf of the op tree under `id` is a constant or, with
  * `reduced`, sits under a reduction. */
-static bool op_tree_leaves(ray_graph_t* g, uint32_t id, bool reduced, int depth) {
+static bool op_tree_leaves(ray_graph_t* g, uint32_t id, bool reduced, bool atoms_only, int depth) {
     if (id >= g->node_count || depth > 64) return false;
     ray_op_t* n = &g->nodes[id];
     switch (n->opcode) {
-    case OP_CONST: return true;
+    case OP_CONST: {
+        ray_op_ext_t* x = find_ext(g, id);
+        return !atoms_only || (x && x->literal && ray_is_atom(x->literal));
+    }
     case OP_SCAN:  return false;
     case OP_SUM: case OP_PROD: case OP_ALL: case OP_ANY:
     case OP_MIN: case OP_MAX:
@@ -1653,10 +1656,17 @@ static bool op_tree_leaves(ray_graph_t* g, uint32_t id, bool reduced, int depth)
     }
     if (n->arity == 0) return false;
     for (uint32_t i = 0; i < n->arity && i < 2; i++)
-        if (!op_tree_leaves(g, n->in_id[i], reduced, depth + 1)) return false;
+        if (!op_tree_leaves(g, n->in_id[i], reduced, atoms_only, depth + 1)) return false;
     if (n->opcode == OP_IF) {           /* the else branch rides in the ext */
         ray_op_ext_t* x = find_ext(g, id);
-        if (!x || !op_tree_leaves(g, x->third_in, reduced, depth + 1)) return false;
+        if (!x || !op_tree_leaves(g, x->third_in, reduced, atoms_only, depth + 1)) return false;
+    }
+    if (n->opcode == OP_CONCAT) {
+        ray_op_ext_t* x = find_ext(g, id);
+        if (!x) return false;
+        uint32_t* extra = (uint32_t*)(x + 1);
+        for (int64_t i = 2; i < x->sym; i++)
+            if (!op_tree_leaves(g, extra[i - 2], reduced, atoms_only, depth + 1)) return false;
     }
     return true;
 }
@@ -1665,14 +1675,19 @@ static bool op_tree_leaves(ray_graph_t* g, uint32_t id, bool reduced, int depth)
  * leaf is a constant or sits under a reduction.  Tells a scalar-only SELECT
  * column (`(+ (sum x) 0)`) from a one-row one, which the column lengths
  * cannot on a one-row table (#675). */
-static bool op_tree_is_scalar(ray_graph_t* g, uint32_t id) {
-    return op_tree_leaves(g, id, true, 0);
+bool op_tree_is_scalar(ray_graph_t* g, uint32_t id) {
+    return op_tree_leaves(g, id, true, false, 0);
+}
+
+/* As above, but vector constants do not count as scalar atoms. */
+bool op_tree_is_atom(ray_graph_t* g, uint32_t id) {
+    return op_tree_leaves(g, id, true, true, 0);
 }
 
 /* True when the op tree under `id` reads no column at all, not even under a
  * reduction: a literal, or an expression over literals. */
 static bool op_tree_is_const(ray_graph_t* g, uint32_t id) {
-    return op_tree_leaves(g, id, false, 0);
+    return op_tree_leaves(g, id, false, false, 0);
 }
 
 /* Execute a pushed-down filter interposed as a GROUP's inputs[0]

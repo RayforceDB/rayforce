@@ -1,11 +1,11 @@
 (set T (table [x k] (list [1 2 3] [0 0 1])))
 (set T2 (table [x] (list [1 2])))
-;; Text vector/scalar concat retains the query string kernel in both orders.
-(at (select {v: (concat ['a 'b] "!") from: T2}) 'v) -- ['a! 'b!]
-(at (select {v: (concat "!" ['a 'b]) from: T2}) 'v) -- (as 'SYM ["!a" "!b"])
-(at (select {v: (concat ['a 'b] '!) from: T2}) 'v) -- ['a! 'b!]
+;; Constant text collections keep ordinary concat semantics in both orders.
+(at (select {v: (concat ['a 'b] "!") from: T2}) 'v) !- type
+(at (select {v: (concat "!" ['a 'b]) from: T2}) 'v) !- type
+(at (select {v: (concat ['a 'b] '!) from: T2}) 'v) -- ['a 'b '!]
 (set L ['a 'b])
-(at (select {v: (concat L "!") from: T2}) 'v) -- ['a! 'b!]
+(at (select {v: (concat L "!") from: T2}) 'v) !- type
 ;; Both typed vectors still concatenate as collections.
 (at (select {v: (concat ['a] ['b]) from: T2}) 'v) -- ['a 'b]
 ;; A grouped aggregate evaluates collection concat on each complete group.

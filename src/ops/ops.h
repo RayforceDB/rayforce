@@ -968,6 +968,7 @@ ray_t*    ray_lazy_append(ray_t* lazy, uint16_t opcode);
  * inside a query.  Returns NULL when no query is active. */
 ray_t* ray_active_query_table(void);
 ray_t* ray_active_query_literal(int64_t sym);
+bool ray_query_expr_reads_rows(ray_t* expr);
 
 #ifdef __cplusplus
 }

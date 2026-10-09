@@ -3466,7 +3466,7 @@ static void ray_register_builtins(void) {
     register_unary("nil?",      RAY_FN_NONE, ray_nil_fn);
     register_unary("where",     RAY_FN_NONE, ray_where_fn);
     register_unary("group",     RAY_FN_NONE, ray_group_indices_fn);
-    register_binary("concat",   RAY_FN_NONE, ray_concat_eval_fn);
+    register_binary("concat",   RAY_FN_NONE, ray_concat_fn);
     register_unary("raze",      RAY_FN_NONE, ray_raze_fn);
     register_unary("ungroup",   RAY_FN_NONE, ray_ungroup_fn);
     register_binary("within",   RAY_FN_NONE, ray_within_fn);
@@ -4100,6 +4100,16 @@ ray_t* ray_eval(ray_t* obj) {
             ray_t* result;
             if ((fn_attrs & RAY_FN_ATOMIC) && (is_collection(left) || is_collection(right)))
                 result = atomic_map_binary_op(fn, fn_opcode, left, right);
+            else if (fn == ray_concat_fn &&
+                     ((left->type == RAY_SYM || left->type == RAY_STR) ||
+                      (right->type == RAY_SYM || right->type == RAY_STR)) &&
+                     (left->type == RAY_SYM || left->type == RAY_STR ||
+                      left->type == -RAY_SYM || left->type == -RAY_STR) &&
+                     (right->type == RAY_SYM || right->type == RAY_STR ||
+                      right->type == -RAY_SYM || right->type == -RAY_STR) &&
+                     (ray_query_expr_reads_rows(elems[1]) ||
+                      ray_query_expr_reads_rows(elems[2])))
+                result = ray_concat_text_fn(left, right);
             else
                 result = fn(left, right);
             ray_release(left);

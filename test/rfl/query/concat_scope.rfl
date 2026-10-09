@@ -1,0 +1,41 @@
+(set T (table [x k s] (list [1 2 3 4 5] [0 0 1 1 2] ['a 'b 'c 'd 'e])))
+;; A query must not change collection concat inside user functions.
+(set allowed (fn [] (concat ['a 'b] 'c)))
+(allowed) -- ['a 'b 'c]
+(at (select {from: T where: (in s (allowed))}) 's) -- ['a 'b 'c]
+(at (select {from: T where: (> (count (allowed)) 2)}) 's) -- ['a 'b 'c 'd 'e]
+(at (update {n: (count (allowed)) from: T}) 'n) -- [3 3 3 3 3]
+(set append-c (fn [v] (concat v 'c)))
+(at (select {from: T where: (in s (append-c ['a 'b]))}) 's) -- ['a 'b 'c]
+;; Literal and global collections have the same meaning on both paths.
+(at (select {from: T where: (in s (concat ['a 'b] 'c))}) 's) -- ['a 'b 'c]
+(at (select {from: T where: (in s (concat 'a ['b 'c]))}) 's) -- ['a 'b 'c]
+(set L ['a 'b])
+(at (select {from: T where: (in s (concat L 'c))}) 's) -- ['a 'b 'c]
+(at (select {n: (+ (count (concat L 'c)) (count (distinct x))) by: k from: T asc: k}) 'n) -- [5 5 4]
+(at (select {n: (+ (count (concat 'c L)) (count (distinct x))) by: k from: T asc: k}) 'n) -- [5 5 4]
+(at (select {n: (+ (count (concat ['a 'b] 'c)) (count (distinct x))) by: k from: T asc: k}) 'n) -- [5 5 4]
+(at (select {n: (+ (count (concat (upper L) 'c)) (count (distinct x))) by: k from: T asc: k}) 'n) -- [5 5 4]
+(at (select {v: (concat L 'c) from: T}) 'v) -- ['a 'b 'c]
+;; Lexical bindings win over a same-named source column.
+((fn [s] (at (select {v: (concat s 'c) from: T}) 'v)) ['a 'b]) -- ['a 'b 'c]
+;; Force per-group fallback: both argument orders must join column text.
+(at (select {n: (+ (count (concat s "!")) (count (distinct x))) by: k from: T asc: k}) 'n) -- [4 4 2]
+(at (select {n: (+ (count (concat "!" s)) (count (distinct x))) by: k from: T asc: k}) 'n) -- [4 4 2]
+(at (select {n: (+ (sum (strlen (concat "!" s))) (count (distinct x))) by: k from: T asc: k}) 'n) -- [6 6 3]
+(at (select {n: (+ (sum (strlen (concat "!" (upper s)))) (count (distinct x))) by: k from: T asc: k}) 'n) -- [6 6 3]
+(at (select {n: (+ (sum (strlen (concat (upper s) "!"))) (count (distinct x))) by: k from: T asc: k}) 'n) -- [6 6 3]
+;; Two text columns also keep their row-wise meaning in fallback.
+(at (select {n: (+ (sum (strlen (concat s s))) (count (distinct x))) by: k from: T asc: k}) 'n) -- [6 6 3]
+;; STR collection semantics match ordinary concat too.
+(set V ["a" "b"])
+(set strings (fn [] (concat V "c")))
+(at (select {n: (+ (count (concat V "c")) (count (distinct x))) by: k from: T asc: k}) 'n) -- [4 4 3]
+(at (update {n: (count (strings)) from: T}) 'n) -- [2 2 2 2 2]
+
+;; Inlining a function must not change its concat to a query text operation.
+(at (select {from: T where: (> (count (append-c s)) 5)}) 's) -- ['a 'b 'c 'd 'e]
+(at (select {from: T where: (> (count ((fn [v] (concat v 'c)) s)) 5)}) 's) -- ['a 'b 'c 'd 'e]
+(at (select {n: (+ (count (append-c s)) (count (distinct x))) by: k from: T asc: k}) 'n) -- [5 5 3]
+;; Variadic text concat may carry the column in its third argument.
+(at (select {v: (concat (concat "!" "?" s) "!") from: T}) 'v) -- (as 'SYM ["!?a!" "!?b!" "!?c!" "!?d!" "!?e!"])

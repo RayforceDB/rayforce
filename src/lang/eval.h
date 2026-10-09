@@ -278,7 +278,7 @@ ray_t* ray_apply_fn(ray_t** args, int64_t n);
 ray_t* ray_distinct_fn(ray_t* x);
 ray_t* ray_in_fn(ray_t* val, ray_t* vec);
 ray_t* ray_in_eval_fn(ray_t* val, ray_t* vec);
-ray_t* ray_concat_eval_fn(ray_t* a, ray_t* b);
+ray_t* ray_concat_text_fn(ray_t* a, ray_t* b);
 ray_t* ray_not_in_fn(ray_t* val, ray_t* vec);
 ray_t* ray_except_fn(ray_t* vec1, ray_t* vec2);
 ray_t* ray_union_fn(ray_t* vec1, ray_t* vec2);

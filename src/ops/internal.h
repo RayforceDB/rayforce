@@ -47,6 +47,10 @@
 #include <string.h>
 #include <math.h>
 
+/* True if every leaf is constant or reduced to a scalar. */
+bool op_tree_is_scalar(ray_graph_t* g, uint32_t id);
+bool op_tree_is_atom(ray_graph_t* g, uint32_t id);
+
 /* Borrow only while the symbol table stays read-only through the dispatch
  * barrier. Workers compare or copy source-domain codes without interning.
  * File-domain lookup keeps its own publication/lifetime contract. */

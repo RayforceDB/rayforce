@@ -1223,6 +1223,8 @@ static ray_op_t* compile_const_str_expr(ray_graph_t* g, ray_t* expr) {
  * all previously-returned pointers).  The ID is stable; only the
  * backing address may change. */
 
+static int expr_contains_call_named(ray_t* expr, const char* name, size_t name_len);
+
 /* Compile a Rayfall AST expression into a DAG node */
 ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
     if (!expr) return NULL;
@@ -1406,6 +1408,9 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
 
             ray_t* formals = hel[1];
             ray_t* body    = hel[2];
+            /* Inlining must not turn a function's collection concat into
+             * the query's column text operation. */
+            if (expr_contains_call_named(body, "concat", 6)) return NULL;
             if (!ray_is_vec(formals) || formals->type != RAY_SYM) return NULL;
             int64_t nf = formals->len;
             if (n - 1 != nf) return NULL;              /* arity mismatch */
@@ -1462,6 +1467,7 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
                     if (n - 1 == nf && nf <= 16 &&
                         g->cexpr_env_top + (int)nf <= 32) {
                         ray_t* body = ((ray_t**)ray_data(body_lst))[0];
+                        if (expr_contains_call_named(body, "concat", 6)) return NULL;
                         uint32_t actual_ids[16];
                         for (int64_t i = 0; i < nf; i++) {
                             ray_op_t* a = compile_expr_dag(g, elems[i + 1]);
@@ -1638,13 +1644,13 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
             ray_op_t* args[16];
             for (int64_t i = 0; i < n - 1; i++)
                 args[i] = &g->nodes[arg_ids[i]];
-            /* Two constant vectors concatenate as collections. Text vectors
-             * with a scalar retain the query's row-wise string operation. */
+            /* Constant collections keep ordinary concat semantics in a query.
+             * Scalar text expressions retain the existing string operation. */
             if (n == 3 && args[0]->opcode == OP_CONST && args[1]->opcode == OP_CONST) {
                 ray_op_ext_t* a = find_ext(g, arg_ids[0]);
                 ray_op_ext_t* b = find_ext(g, arg_ids[1]);
                 if (a && b && a->literal && b->literal &&
-                    ((ray_is_vec(a->literal) && ray_is_vec(b->literal)) ||
+                    (ray_is_vec(a->literal) || ray_is_vec(b->literal) ||
                      (args[0]->out_type != RAY_SYM && args[0]->out_type != RAY_STR) ||
                      (args[1]->out_type != RAY_SYM && args[1]->out_type != RAY_STR))) {
                     ray_t* value = ray_concat_fn(a->literal, b->literal);
@@ -1670,6 +1676,12 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
                 if (RAY_IS_PARTED(t)) t = (int8_t)RAY_PARTED_BASETYPE(t);
                 if (t != RAY_SYM && t != RAY_STR) return NULL;
             }
+            bool reads_rows = false, all_atoms = true;
+            for (int64_t i = 0; i < n - 1; i++) {
+                if (!op_tree_is_scalar(g, arg_ids[i])) reads_rows = true;
+                if (!op_tree_is_atom(g, arg_ids[i])) all_atoms = false;
+            }
+            if (!reads_rows && !all_atoms) return NULL;
             return ray_concat(g, args, (int)(n - 1));
         }
 
@@ -2219,8 +2231,6 @@ static int expr_contains_agg(ray_t* expr) {
     return 0;
 }
 
-static int expr_contains_call_named(ray_t* expr, const char* name, size_t name_len);
-
 /* Collection concat changes row counts; text concat is still row-wise.
  * Compile only the concat subtree to distinguish them without evaluating
  * user functions. Without a table, conservatively decline the shortcut. */
@@ -2511,13 +2521,16 @@ static int is_whole_column_projection(ray_t* expr, ray_t* tbl) {
             whole = ext && ext->literal && !ray_is_atom(ext->literal);
         } else if (!op) {
             ray_t** elems = (ray_t**)ray_data(expr);
+            bool constants = true;
             for (int64_t i = 1; i < ray_len(expr); i++) {
                 ray_op_t* arg = compile_expr_dag(g, elems[i]);
-                if (!arg) continue;
+                if (!arg) { constants = false; continue; }
+                if (!op_tree_is_scalar(g, arg->id)) constants = false;
                 int8_t t = arg->out_type;
                 if (RAY_IS_PARTED(t)) t = (int8_t)RAY_PARTED_BASETYPE(t);
                 if (t != RAY_SYM && t != RAY_STR) { whole = 1; break; }
             }
+            if (constants) whole = 1;
         }
         ray_graph_free(g);
         return whole;
@@ -5423,6 +5436,26 @@ static ray_t* nonagg_eval_per_group_buf(ray_t* expr, ray_t* tbl,
     ray_t* res = nonagg_eval_per_group_core(expr, tbl, buf_idx_feed, &st, n_groups);
     ray_release(scratch);
     return res;
+}
+
+/* The evaluator has argument syntax here, unlike a builtin called from a
+ * lambda or apply. Only column-derived vectors use query text concat.
+ * Bare columns need no graph allocation on the per-group hot path. */
+bool ray_query_expr_reads_rows(ray_t* expr) {
+    ray_t* tbl = g_active_query_table;
+    if (!tbl || tbl->type != RAY_TABLE || !expr) return false;
+    if (expr->type == -RAY_SYM) {
+        if (!(expr->attrs & ATTR_QUOTED) && ray_env_has_lexical_local(expr->i64))
+            return false;
+        if (ray_table_get_col(tbl, expr->i64)) return true;
+        if (!ray_sym_is_dotted(expr->i64)) return false;
+    } else if (expr->type != RAY_LIST) return false;
+    ray_graph_t* g = ray_graph_new(tbl);
+    if (!g) return false;
+    ray_op_t* op = compile_expr_dag(g, expr);
+    bool reads_rows = op && !op_tree_is_scalar(g, op->id);
+    ray_graph_free(g);
+    return reads_rows;
 }
 
 /* The value a literal column-name symbol stands for while a query is

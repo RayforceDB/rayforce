@@ -1559,15 +1559,9 @@ ray_t* exec_concat(ray_graph_t* g, ray_op_t* op) {
     return result;
 }
 
-/* Query fallback keeps vector/scalar text concat on the same row-wise
- * kernel as the planner, including within mixed per-group expressions. */
-ray_t* ray_concat_eval_fn(ray_t* a, ray_t* b) {
-    bool av = a->type == RAY_SYM || a->type == RAY_STR;
-    bool bv = b->type == RAY_SYM || b->type == RAY_STR;
-    bool aa = a->type == -RAY_SYM || a->type == -RAY_STR;
-    bool ba = b->type == -RAY_SYM || b->type == -RAY_STR;
-    if (!ray_env_query_scope_above(0) || !((av && ba) || (aa && bv)))
-        return ray_concat_fn(a, b);
+/* Query fallback uses the same text kernel after checking argument syntax.
+ * Ordinary builtin calls retain collection semantics. */
+ray_t* ray_concat_text_fn(ray_t* a, ray_t* b) {
     ray_t* args[2] = { a, b };
     ray_retain(a);
     ray_retain(b);
