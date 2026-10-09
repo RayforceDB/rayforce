@@ -426,7 +426,58 @@ static ray_col_piece_t plain_piece(const ray_col_src_t* s) {
     return p;
 }
 
+/* The piece loop of a non-contiguous walk over cursors cur (one per cursor
+ * source; their views persist past the call) and the fixed fields pc. */
+static ray_t* walk_pieces(ray_col_src_t* const* srcs, const void* const* plain, uint32_t n,
+                          ray_col_cursor_t* cur, ray_col_piece_t* pc, int64_t lo, int64_t hi,
+                          void* ctx, uint32_t wid, ray_col_piece_fn fn) {
+    ray_t* err = NULL;
+    for (int64_t b = lo; b < hi && !err; ) {
+        int64_t e = hi;
+        for (uint32_t i = 0; i < n; i++) {
+            ray_col_src_t* s = srcs[i];
+            if (!s) continue;
+            if (plain[i]) { pc[i].data = (const char*)plain[i] + (size_t)b * ray_col_src_esz(s); continue; }
+            const ray_col_range_t* v;
+            if ((err = ray_col_cursor_at(&cur[i], b, &v)) != NULL) break;
+            uint8_t vesz = ray_sym_elem_size(v->type, v->attrs);
+            pc[i].data = (const char*)v->data + (size_t)(b - v->start) * vesz;
+            pc[i].attrs = v->attrs; pc[i].may_null = v->may_null;
+            pc[i].str_pool = v->str_pool; pc[i].dom = v->dom;
+            if (v->start + v->n < e) e = v->start + v->n;
+        }
+        if (err) break;
+        fn(ctx, wid, b, e, pc);
+        b = e;
+    }
+    return err;
+}
+
 #define WALK_STACK 16
+ray_t* ray_col_walk_cur(ray_col_src_t* const* srcs, const void* const* plain, uint32_t n,
+                        ray_col_cursor_t* cur, int64_t lo, int64_t hi,
+                        void* ctx, uint32_t wid, ray_col_piece_fn fn) {
+    if (lo >= hi) return NULL;
+    ray_col_piece_t pst[WALK_STACK];
+    ray_col_piece_t* pc = n > WALK_STACK ? ray_calloc_raw((size_t)n * sizeof *pc) : pst;
+    if (!pc) return ray_error("oom", "scan walk");
+    bool any_cursor = false;
+    for (uint32_t i = 0; i < n; i++) {
+        pc[i] = srcs[i] ? plain_piece(srcs[i]) : (ray_col_piece_t){ 0 };
+        any_cursor |= srcs[i] && !plain[i];
+    }
+    ray_t* err = NULL;
+    if (any_cursor) {
+        err = walk_pieces(srcs, plain, n, cur, pc, lo, hi, ctx, wid, fn);
+    } else {
+        for (uint32_t i = 0; i < n; i++)
+            if (srcs[i]) pc[i].data = (const char*)plain[i] + (size_t)lo * ray_col_src_esz(srcs[i]);
+        fn(ctx, wid, lo, hi, pc);
+    }
+    if (pc != pst) ray_free_raw(pc);
+    return err;
+}
+
 ray_t* ray_col_walk(ray_col_src_t* const* srcs, const void* const* plain, uint32_t n,
                     int64_t lo, int64_t hi, bool contiguous,
                     void* ctx, uint32_t wid, ray_col_piece_fn fn) {
@@ -488,24 +539,7 @@ ray_t* ray_col_walk(ray_col_src_t* const* srcs, const void* const* plain, uint32
             if (srcs[i]) pc[i].data = (const char*)plain[i] + (size_t)lo * ray_col_src_esz(srcs[i]);
         fn(ctx, wid, lo, hi, pc);
     } else {
-        for (int64_t b = lo; b < hi && !err; ) {
-            int64_t e = hi;
-            for (uint32_t i = 0; i < n; i++) {
-                ray_col_src_t* s = srcs[i];
-                if (!s) continue;
-                if (plain[i]) { pc[i].data = (const char*)plain[i] + (size_t)b * ray_col_src_esz(s); continue; }
-                const ray_col_range_t* v;
-                if ((err = ray_col_cursor_at(&cur[i], b, &v)) != NULL) break;
-                uint8_t vesz = ray_sym_elem_size(v->type, v->attrs);
-                pc[i].data = (const char*)v->data + (size_t)(b - v->start) * vesz;
-                pc[i].attrs = v->attrs; pc[i].may_null = v->may_null;
-                pc[i].str_pool = v->str_pool; pc[i].dom = v->dom;
-                if (v->start + v->n < e) e = v->start + v->n;
-            }
-            if (err) break;
-            fn(ctx, wid, b, e, pc);
-            b = e;
-        }
+        err = walk_pieces(srcs, plain, n, cur, pc, lo, hi, ctx, wid, fn);
     }
     if (any_cursor)
         for (uint32_t i = 0; i < n; i++)

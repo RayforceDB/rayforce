@@ -3789,7 +3789,10 @@ static uint64_t sr_col_decoded(const char* name) {
 
 /* The samplers of the dense and table-stack plans read their sampled keys
  * without decoding vectors (point reads): the key decodes as often as the
- * aggregate input walked beside it, the same answers as generation 0. */
+ * aggregate input walked beside it.  A task walks its consecutive blocks
+ * through one cursor set, so a vector is decoded once per task that reads
+ * it: at most one extra vector per task (the one its range starts inside).
+ * The same answers as generation 0. */
 static test_result_t test_v2_decode_once(void) {
     sr_eval_ok("(set jd (til 600001))");
     sr_eval_ok("(set DQ (table [k v ts] (list (as 'I32 (% (* jd 7919) 1000)) jd (* (% (* jd 104729) 2000) 100003))))");
@@ -3815,6 +3818,11 @@ static test_result_t test_v2_decode_once(void) {
         if (qs[i].route == AGG_ROUTE_V2_DENSE) TEST_ASSERT_EQ_I(st.dense_strategy, AGG_DENSE_TASK_LOCAL);
         double kd = sr_col_decodes(qs[i].key, k0), vd = sr_col_decodes("v", v0);
         TEST_ASSERT_FMT(kd == vd, "%s: key decoded %.4fx, input %.4fx", qs[i].q, kd, vd);
+        uint32_t tasks = qs[i].route == AGG_ROUTE_V2_DENSE ? st.dense_tasks : st.ts_tasks;
+        TEST_ASSERT_TRUE(tasks > 1);
+        double cap = 1.0 + (double)tasks * RAY_ENC_VEC / 600001.0;
+        TEST_ASSERT_FMT(vd >= 1.0 && vd <= cap, "%s: input decoded %.4fx over %u tasks (at most %.4fx)",
+                        qs[i].q, vd, tasks, cap);
     }
     PASS();
 }

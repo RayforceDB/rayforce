@@ -388,6 +388,19 @@ static void agg_curs_free(agg_curs_t* cs, const agg_rr_t* rr) {
     cs->cur = NULL;
 }
 
+/* agg_walk through the task's cursors cs (agg_curs_init), which persist
+ * across its calls: a task walking consecutive blocks decodes the vector
+ * one block ends inside once, not once per block. */
+static bool agg_walk_cs(const agg_rr_t* rr, agg_curs_t* cs, void* ctx, agg_body_fn body,
+                        uint32_t wid, int64_t start, int64_t end, int64_t key) {
+    if (ray_scan_fail_skip(rr->fail, key)) return false;
+    agg_piece_ctx_t pc = { ctx, body, rr };
+    ray_t* err = ray_col_walk_cur(rr->srcs, rr->plain, rr->n_src, cs->cur, start, end, &pc, wid, agg_piece);
+    if (!err) return true;
+    ray_scan_fail_note(rr->fail, key, err);
+    return false;
+}
+
 /* R-SPARSE over the ascending rows idx[i0, i1) through the task's cursors:
  * the rows every staged source's current view covers form one run, handed
  * to body as the index range [ib, ie) with a view positioned at idx[ib].
@@ -2349,7 +2362,8 @@ static void agg_dense_phaseA_fn(void* vctx, const agg_view_t* v, uint32_t wid, i
 /* One slab per logical task, independent of the physical worker executing it.
  * A large pool can run a memory-bounded number of dense tasks safely.  Each
  * 8192-row sub-block runs over the whole columns, or by pieces when a source
- * is staged (whatever the block's alignment; a range error stops the task). */
+ * is staged (whatever the block's alignment, through the task's cursors; a
+ * range error stops the task). */
 static void agg_dense_task_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
     agg_dense_ctx_t* c = raw;
@@ -2370,10 +2384,16 @@ static void agg_dense_task_fn(void* raw, uint32_t wid, int64_t start, int64_t en
         else if (!c->rr->staged)
             for (int64_t row = begin; row < limit && !agg_cancelled(); row += 8192)
                 agg_dense_phaseA_fn(c, c->whole, (uint32_t)task, row, limit - row < 8192 ? limit : row + 8192);
-        else
-            for (int64_t row = begin; row < limit && !agg_cancelled(); row += 8192)
-                if (!agg_walk(c->rr, c, agg_dense_phaseA_fn, (uint32_t)task, row,
-                              limit - row < 8192 ? limit : row + 8192, begin)) break;
+        else {
+            agg_curs_t cs;
+            if (!agg_curs_init(&cs, c->rr)) ray_scan_fail_note(c->rr->fail, begin, ray_error("oom", NULL));
+            else {
+                for (int64_t row = begin; row < limit && !agg_cancelled(); row += 8192)
+                    if (!agg_walk_cs(c->rr, &cs, c, agg_dense_phaseA_fn, (uint32_t)task, row,
+                                     limit - row < 8192 ? limit : row + 8192, begin)) break;
+                agg_curs_free(&cs, c->rr);
+            }
+        }
         if (loc->eager) for (int64_t s = 0; s < loc->slots; s++)
             if (loc->first_row[s] != INT64_MAX)
                 loc->occupied[s / 64] |= UINT64_C(1) << (s % 64);
@@ -3187,11 +3207,14 @@ static void agg_dense_shared_block(void* raw, const agg_view_t* v, uint32_t wid,
 static void agg_dense_shared_rows(void* raw, uint32_t wid, int64_t start, int64_t end) {
     agg_dense_shared_ctx_t* c = raw;
     const agg_desc_t* d = c->desc;
+    agg_curs_t cs = { .cur = NULL };
+    if (d->staged && !agg_curs_init(&cs, &d->rr)) { ray_scan_fail_note(d->rr.fail, start, ray_error("oom", NULL)); return; }
     for (int64_t begin = start; begin < end && !agg_cancelled(); begin += 8192) {
         int64_t limit = end - begin < 8192 ? end : begin + 8192;
         if (!d->staged) agg_dense_shared_block(c, &d->whole, wid, begin, limit);
-        else if (!agg_walk(&d->rr, c, agg_dense_shared_block, wid, begin, limit, start)) break;
+        else if (!agg_walk_cs(&d->rr, &cs, c, agg_dense_shared_block, wid, begin, limit, start)) break;
     }
+    agg_curs_free(&cs, &d->rr);
 }
 
 static void agg_dense_shared_occupied(void* raw, uint32_t wid, int64_t start, int64_t end) {
@@ -3704,11 +3727,14 @@ static void agg_sh_phaseA_fn(void* vctx, uint32_t wid, int64_t start, int64_t en
         return;
     }
 
+    agg_curs_t tc = { .cur = NULL };
+    if (rr->staged && !agg_curs_init(&tc, rr)) { sh->oom = 1; return; }
     for (int64_t cs = start; cs < end && !sh->oom; cs += AGG_SH_CHUNK) {
         int64_t ce = cs + AGG_SH_CHUNK; if (ce > end) ce = end;
         if (!rr->staged) agg_sh_rows(c, c->whole, wid, cs, ce);
-        else if (!agg_walk(rr, c, agg_sh_rows, wid, cs, ce, start)) return;
+        else if (!agg_walk_cs(rr, &tc, c, agg_sh_rows, wid, cs, ce, start)) break;
     }
+    agg_curs_free(&tc, rr);
 }
 
 /* Parallel small-hash fallback.  Precondition: int/SYM keys and streaming
@@ -4208,28 +4234,25 @@ static void agg_radix_scatter_rows(void* raw, const agg_view_t* v, uint32_t wid,
  * runs of its selected rows (R-SPARSE through the chunk's cursors); a
  * range error is noted keyed by the chunk's first position. */
 static void agg_radix_chunk_staged(agg_radix_ctx_t* c, uint32_t* cur, int64_t start, int64_t end,
-                                   uint32_t wid, bool scatter) {
+                                   uint32_t wid, bool scatter, agg_curs_t* cs) {
     const agg_rr_t* rr = c->rr;
     agg_body_fn body = scatter ? agg_radix_scatter_rows : agg_radix_count_rows;
     if (!c->sel) {
         agg_radix_run_t t = { c, cur, NULL, 0 };
-        (void)agg_walk(rr, &t, body, wid, start, end, start);
+        (void)agg_walk_cs(rr, cs, &t, body, wid, start, end, start);
         return;
     }
     if (ray_scan_fail_skip(rr->fail, start)) return;
-    agg_curs_t cs;
-    if (!agg_curs_init(&cs, rr)) { ray_scan_fail_note(rr->fail, start, ray_error("oom", NULL)); return; }
     int64_t rows[AGG_SEL_CHUNK];
     agg_sel_cursor_t sc;
     agg_sel_cursor_init(&sc, c->sel, c->sel_prefix, start, end);
     int64_t pos = start, cn;
     while ((cn = agg_sel_cursor_next(&sc, rows)) > 0) {
         agg_radix_run_t t = { c, cur, rows, pos };
-        ray_t* err = agg_idx_walk(rr, &cs, rows, 0, cn, &t, body, wid);
+        ray_t* err = agg_idx_walk(rr, cs, rows, 0, cn, &t, body, wid);
         if (err) { ray_scan_fail_note(rr->fail, start, err); break; }
         pos += cn;
     }
-    agg_curs_free(&cs, rr);
 }
 
 /* Run one pass over chunk `ch`: input positions [start,end) in chunk order
@@ -4237,14 +4260,15 @@ static void agg_radix_chunk_staged(agg_radix_ctx_t* c, uint32_t* cur, int64_t st
  * and `scatter` constant at both call sites, so the count and the scatter
  * loops specialize.  A chunk's count row doubles as its pass-2 write cursors
  * and is touched only by the task running that chunk.  A staged context
- * reads its sources by range (agg_radix_chunk_staged). */
-RAY_INLINE void agg_radix_chunk_pass(agg_radix_ctx_t* c, int64_t ch, uint32_t wid, bool scatter) {
+ * reads its sources by range (agg_radix_chunk_staged) through the task's
+ * cursors cs (the chunks of one task are consecutive). */
+RAY_INLINE void agg_radix_chunk_pass(agg_radix_ctx_t* c, int64_t ch, uint32_t wid, bool scatter, agg_curs_t* cs) {
     int64_t start = ch * c->chunk_rows;
     int64_t end = start + c->chunk_rows;
     if (end > c->n_in) end = c->n_in;
     uint32_t* cur = c->cnt + (size_t)ch * c->n_parts;
     if (!scatter) memset(cur, 0, (size_t)c->n_parts * sizeof(uint32_t));
-    if (c->rr->staged) { agg_radix_chunk_staged(c, cur, start, end, wid, scatter); return; }
+    if (c->rr->staged) { agg_radix_chunk_staged(c, cur, start, end, wid, scatter, cs); return; }
     if (c->sel) {
         int64_t rows[AGG_SEL_CHUNK];
         agg_sel_cursor_t sc;
@@ -4261,9 +4285,22 @@ RAY_INLINE void agg_radix_chunk_pass(agg_radix_ctx_t* c, int64_t ch, uint32_t wi
 }
 
 /* Phase 1, pass 1: count each chunk's rows per partition. */
+/* One cursor set per task call (staged sources), over its consecutive chunks;
+ * on OOM the first chunk's failure is noted and the call does nothing. */
+static bool agg_radix_task_curs(agg_radix_ctx_t* c, int64_t ch0, agg_curs_t* cs) {
+    cs->cur = NULL;
+    if (!c->rr->staged || agg_curs_init(cs, c->rr)) return true;
+    ray_scan_fail_note(c->rr->fail, ch0 * c->chunk_rows, ray_error("oom", NULL));
+    return false;
+}
+
 static void agg_radix_count_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    agg_radix_ctx_t* c = (agg_radix_ctx_t*)vctx;
+    agg_curs_t cs;
+    if (!agg_radix_task_curs(c, start, &cs)) return;
     for (int64_t ch = start; ch < end; ch++)
-        agg_radix_chunk_pass((agg_radix_ctx_t*)vctx, ch, wid, false);
+        agg_radix_chunk_pass(c, ch, wid, false, &cs);
+    agg_curs_free(&cs, c->rr);
 }
 
 /* Phase 1, prefix: for a band of partitions, turn every chunk's count into
@@ -4298,8 +4335,12 @@ static void agg_radix_prefix_fn(void* vctx, uint32_t wid, int64_t start, int64_t
 
 /* Phase 1, pass 2: write each chunk's packed records at their exact slots. */
 static void agg_radix_scatter_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    agg_radix_ctx_t* c = (agg_radix_ctx_t*)vctx;
+    agg_curs_t cs;
+    if (!agg_radix_task_curs(c, start, &cs)) return;
     for (int64_t ch = start; ch < end; ch++)
-        agg_radix_chunk_pass((agg_radix_ctx_t*)vctx, ch, wid, true);
+        agg_radix_chunk_pass(c, ch, wid, true, &cs);
+    agg_curs_free(&cs, c->rr);
 }
 
 /* Phase 2: group + accumulate one partition by walking its packed payload
@@ -5844,8 +5885,9 @@ static void agg_ts_range_rows(void* raw, const agg_view_t* v, uint32_t wid, int6
 
 /* Visit one chunk of rows of a task: original rows `rows[i]` (or pos0 + i
  * when rows == NULL) at logical input positions pos0 + i.  Staged sources
- * are read by pieces of the chunk, or by runs of its selected rows through
- * the task's cursors `cs`.  False on a range error (noted keyed by `key`). */
+ * are read by pieces of the chunk (through the task's cursors `cs` when
+ * given), or by runs of its selected rows through them.  False on a range
+ * error (noted keyed by `key`). */
 static bool agg_ts_chunk(agg_ts_ctx_t* c, agg_ts_task_t* ts,
                          const int64_t* rows, int64_t pos0, int64_t n,
                          agg_sel_scratch_t* sc, uint32_t* gid, int64_t* keys,
@@ -5861,7 +5903,8 @@ static bool agg_ts_chunk(agg_ts_ctx_t* c, agg_ts_task_t* ts,
     else if (rows) {
         ray_t* err = agg_idx_walk(rr, cs, rows, 0, n, &run, agg_ts_idx_rows, wid);
         if (err) { ray_scan_fail_note(rr->fail, key, err); return false; }
-    } else if (!agg_walk(rr, &run, agg_ts_range_rows, wid, pos0, pos0 + n, key)) return false;
+    } else if (cs ? !agg_walk_cs(rr, cs, &run, agg_ts_range_rows, wid, pos0, pos0 + n, key)
+                  : !agg_walk(rr, &run, agg_ts_range_rows, wid, pos0, pos0 + n, key)) return false;
     if (ts->oom) return true;
     if (ts->scatter) { ts->rows += n; ts->scattered += n; }
     else { ts->top->rows += n; ts->rows += n; }
@@ -5903,10 +5946,13 @@ static void agg_ts_phase1_fn(void* vctx, uint32_t wid, int64_t start, int64_t en
             agg_curs_free(&cs, rr);
             agg_sel_scratch_free(&sc);
         } else {
+            agg_curs_t tc = { .cur = NULL };
+            if (rr->staged && !agg_curs_init(&tc, rr)) { ts->oom = 1; continue; }
             for (int64_t cs = lo; cs < hi && !ts->oom; cs += AGG_TS_CHUNK) {
                 int64_t ce = cs + AGG_TS_CHUNK; if (ce > hi) ce = hi;
-                if (!agg_ts_chunk(c, ts, NULL, cs, ce - cs, NULL, gid, keys, wid, NULL, lo)) break;
+                if (!agg_ts_chunk(c, ts, NULL, cs, ce - cs, NULL, gid, keys, wid, rr->staged ? &tc : NULL, lo)) break;
             }
+            agg_curs_free(&tc, rr);
         }
         for (agg_ts_table_t* tab = ts->top; tab; tab = tab->prev) ts->entries += tab->ng;
     }

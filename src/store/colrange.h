@@ -214,6 +214,15 @@ ray_t* ray_col_walk(ray_col_src_t* const* srcs, const void* const* plain, uint32
                     int64_t lo, int64_t hi, bool contiguous,
                     void* ctx, uint32_t wid, ray_col_piece_fn fn);
 
+/* ray_col_walk's non-contiguous mode through the caller's cursors: cur[i]
+ * is source i's cursor (ray_col_cursor_init'd for every srcs[i] with a NULL
+ * plain[i]; other entries unused), kept by the caller across calls.  A task
+ * walking consecutive blocks with one cursor set decodes the vector one
+ * block ends inside once, not once per block.  NULL or an owned error. */
+ray_t* ray_col_walk_cur(ray_col_src_t* const* srcs, const void* const* plain, uint32_t n,
+                        ray_col_cursor_t* cur, int64_t lo, int64_t hi,
+                        void* ctx, uint32_t wid, ray_col_piece_fn fn);
+
 /* A dispatch's failure envelope (R-FAIL): a worker notes a range error
  * keyed by its task's first row and stops reading.  The answer is the
  * lowest-keyed failure, independent of scheduling, so a task may return
