@@ -2074,6 +2074,103 @@ static test_result_t test_stream_sym_chunks(void) {
     PASS();
 }
 
+/* A W32 chunk over another symbol file's domain is re-encoded string by
+ * string, at the writer's own width as at any other: its positions mean
+ * nothing in the writer's domain (the other file holds the same words in
+ * another order, and one more). */
+static test_result_t test_stream_sym_foreign(void) {
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-stream-symf-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    char sp[200], sp2[200], path[200];
+    snprintf(sp, sizeof(sp), "%s/.sym", dir); snprintf(sp2, sizeof(sp2), "%s/.sym2", dir);
+    ray_sym_domain_t* dom = ray_sym_domain_open_or_create(sp);
+    ray_sym_domain_t* other = ray_sym_domain_open_or_create(sp2);
+    TEST_ASSERT_TRUE(dom && other);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom, "", 0), 0);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(other, "", 0), 0);
+    enum { K = 5 };
+    const char* words[K] = {"alpha", "beta", "gamma", "a string past the inline bytes", "only in the other"};
+    int64_t at2[K];
+    for (int k = 0; k < K - 1; k++) TEST_ASSERT_TRUE(ray_sym_domain_intern(dom, words[k], strlen(words[k])) > 0);
+    for (int k = K - 1; k >= 0; k--) {
+        at2[k] = ray_sym_domain_intern(other, words[k], strlen(words[k]));
+        TEST_ASSERT_TRUE(at2[k] > 0);
+    }
+    int64_t n = 20000;
+    ray_t* c = stream_sym_chunk(other, n, RAY_SYM_W32);
+    TEST_ASSERT_NOT_NULL(c);
+    for (int64_t i = 0; i < n; i++) ((uint32_t*)ray_data(c))[i] = (uint32_t)at2[(i * 3) % K];
+    ray_col_stream_t w;
+    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("f", 1), RAY_SYM, dom), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_append(&w, c), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_close(&w, false), RAY_OK);
+    int64_t at[K];
+    for (int k = 0; k < K; k++) {
+        at[k] = ray_sym_domain_find(dom, words[k], strlen(words[k]));
+        TEST_ASSERT_TRUE(at[k] > 0);   /* the fifth added by the append */
+    }
+    uint32_t* back = (uint32_t*)ray_sys_alloc((size_t)n * sizeof(uint32_t));
+    TEST_ASSERT_NOT_NULL(back);
+    ray_t hdr;
+    snprintf(path, sizeof(path), "%s/f", dir);
+    TEST_ASSERT_TRUE(stream_sym_read(path, &hdr, back, n));
+    TEST_ASSERT_FALSE(hdr.attrs & RAY_ATTR_HAS_NULLS);
+    int64_t bad = 0;
+    for (int64_t i = 0; i < n; i++) if (back[i] != (uint32_t)at[(i * 3) % K]) bad++;
+    TEST_ASSERT_EQ_I(bad, 0);
+    ray_release(c); ray_sys_free(back);
+    ray_sym_domain_release(dom); ray_sym_domain_release(other);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+}
+
+/* The runtime id cache starts empty whatever its memory held: the blocks it
+ * is carved from were freed full of one runtime id, which must then be
+ * interned on first sight rather than read from a stale slot. */
+static test_result_t test_stream_sym_lut_stale(void) {
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-stream-syml-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    char sp[200], path[200]; snprintf(sp, sizeof(sp), "%s/.sym", dir);
+    ray_sym_domain_t* dom = ray_sym_domain_open_or_create(sp);
+    TEST_ASSERT_NOT_NULL(dom);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom, "", 0), 0);
+    TEST_ASSERT_TRUE(ray_sym_domain_intern(dom, "filler", 6) > 0);
+    int64_t x = ray_sym_intern("a stale runtime id", 18);
+    TEST_ASSERT_TRUE(x > 0);
+    /* blocks of the cache's two sizes (2^19 ids, 2^19 positions), freed full of x */
+    void* blk[8];
+    for (int i = 0; i < 8; i++) {
+        size_t sz = (size_t)1 << (i < 4 ? 22 : 21);
+        blk[i] = ray_alloc_raw(sz);
+        TEST_ASSERT_NOT_NULL(blk[i]);
+        for (size_t j = 0; j < sz / 8; j++) ((int64_t*)blk[i])[j] = x;
+    }
+    for (int i = 7; i >= 0; i--) ray_free_raw(blk[i]);
+    int64_t n = 1000;
+    ray_t* rt = ray_sym_vec_new(RAY_SYM_W64, n);
+    TEST_ASSERT_TRUE(rt && !RAY_IS_ERR(rt));
+    rt->len = n;
+    for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(rt))[i] = x;
+    ray_col_stream_t w;
+    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("l", 1), RAY_SYM, dom), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_append(&w, rt), RAY_OK);
+    TEST_ASSERT_NOT_NULL(w.lut_id);
+    TEST_ASSERT_EQ_I(ray_col_stream_close(&w, false), RAY_OK);
+    int64_t want = ray_sym_domain_find(dom, "a stale runtime id", 18);
+    TEST_ASSERT_EQ_I(want, 2);
+    uint32_t back[1000];
+    ray_t hdr;
+    snprintf(path, sizeof(path), "%s/l", dir);
+    TEST_ASSERT_TRUE(stream_sym_read(path, &hdr, back, n));
+    int64_t bad = 0;
+    for (int64_t i = 0; i < n; i++) if (back[i] != (uint32_t)want) bad++;
+    TEST_ASSERT_EQ_I(bad, 0);
+    ray_release(rt);
+    ray_sym_domain_release(dom);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+}
+
 /* An index region that cannot be written (ENOSPC/EFBIG) is dropped: close
  * cuts the file back to the payload and publishes the column without the
  * index.  Everything runs in the forked child so no FILE* state is shared
@@ -6373,6 +6470,8 @@ const test_entry_t store_entries[] = {
     { "store/zone_acc_sentinel_without_flag", test_zone_acc_sentinel_without_flag, store_setup, store_teardown },
     { "store/stream_sentinel_has_nulls", test_stream_sentinel_publishes_has_nulls, store_setup, store_teardown },
     { "store/stream_sym_chunks", test_stream_sym_chunks, store_setup, store_teardown },
+    { "store/stream_sym_foreign", test_stream_sym_foreign, store_setup, store_teardown },
+    { "store/stream_sym_lut_stale", test_stream_sym_lut_stale, store_setup, store_teardown },
     { "store/stream_index_write_failure", test_stream_index_write_failure_drops_index, store_setup, store_teardown },
     { "store/stream_inline_zone_one_chunk", test_stream_inline_zone_one_chunk, store_setup, store_teardown },
     { "store/stream_hash_candidate", test_stream_hash_candidate, store_setup, store_teardown },

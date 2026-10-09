@@ -1028,6 +1028,145 @@ static test_result_t test_pq_sym_grouped_failures(void) {
     ray_release(types); unlink(src); unlink(big);
     PASS();
 }
+
+/* One row group of six rows of a required BYTE_ARRAY column s, every row
+ * the first entry of a stored (uncompressed) dictionary page of two entries
+ * whose header declares `declared` decoded bytes and `count` entries. */
+static bool pq_dict_file(const char* path, int64_t declared, int64_t count) {
+    pq_buf f = {0}, dict = {0}, data = {0};
+    const char* entries[] = {"first", "second-entry-longer"};
+    for (int k = 0; k < 2; k++) {
+        uint32_t l = (uint32_t)strlen(entries[k]);
+        pb_bytes(&dict, &l, 4); pb_bytes(&dict, entries[k], l);
+    }
+    const int64_t rows = 6;
+    pb_byte(&data, 1); pb_var(&data, (uint64_t)rows << 1); pb_byte(&data, 0);   /* width 1, a run of id 0 */
+    pb_bytes(&f, "PAR1", 4);
+    int64_t start = (int64_t)f.n;
+    int last = 0;
+    pb_i(&f, &last, 1, PB_I32, 2); pb_i(&f, &last, 2, PB_I32, declared); pb_i(&f, &last, 3, PB_I32, (int64_t)dict.n);
+    pb_field(&f, &last, 7, PB_STRUCT);
+    { int l = 0; pb_i(&f, &l, 1, PB_I32, count); pb_i(&f, &l, 2, PB_I32, 0); pb_byte(&f, 0); }
+    pb_byte(&f, 0);
+    pb_bytes(&f, dict.p, dict.n);
+    int64_t data_off = (int64_t)f.n;
+    last = 0;
+    pb_i(&f, &last, 1, PB_I32, 0); pb_i(&f, &last, 2, PB_I32, (int64_t)data.n); pb_i(&f, &last, 3, PB_I32, (int64_t)data.n);
+    pb_field(&f, &last, 5, PB_STRUCT);
+    { int l = 0; pb_i(&f, &l, 1, PB_I32, rows); pb_i(&f, &l, 2, PB_I32, 8); pb_i(&f, &l, 3, PB_I32, 3); pb_i(&f, &l, 4, PB_I32, 3); pb_byte(&f, 0); }
+    pb_byte(&f, 0);
+    pb_bytes(&f, data.p, data.n);
+    int64_t chunk = (int64_t)f.n - start, footer = (int64_t)f.n;
+    last = 0;
+    pb_i(&f, &last, 1, PB_I32, 1);
+    pb_field(&f, &last, 2, PB_LIST); pb_list(&f, 2, PB_STRUCT);
+    { int l = 0; pb_i(&f, &l, 3, PB_I32, 0); pb_field(&f, &l, 4, PB_BIN); pb_bin(&f, "schema", 6); pb_i(&f, &l, 5, PB_I32, 1); pb_byte(&f, 0); }
+    { int l = 0; pb_i(&f, &l, 1, PB_I32, 6); pb_i(&f, &l, 3, PB_I32, 0); pb_field(&f, &l, 4, PB_BIN); pb_bin(&f, "s", 1); pb_i(&f, &l, 6, PB_I32, 0); pb_byte(&f, 0); }
+    pb_i(&f, &last, 3, PB_I64, rows);
+    pb_field(&f, &last, 4, PB_LIST); pb_list(&f, 1, PB_STRUCT);
+    {
+        int l = 0;
+        pb_field(&f, &l, 1, PB_LIST); pb_list(&f, 1, PB_STRUCT);
+        int lc = 0;
+        pb_i(&f, &lc, 2, PB_I64, start);
+        pb_field(&f, &lc, 3, PB_STRUCT);
+        int lm = 0;
+        pb_i(&f, &lm, 1, PB_I32, 6);
+        pb_field(&f, &lm, 2, PB_LIST); pb_list(&f, 3, PB_I32); pb_zz(&f, 0); pb_zz(&f, 3); pb_zz(&f, 8);
+        pb_field(&f, &lm, 3, PB_LIST); pb_list(&f, 1, PB_BIN); pb_bin(&f, "s", 1);
+        pb_i(&f, &lm, 4, PB_I32, 0);
+        pb_i(&f, &lm, 5, PB_I64, rows);
+        pb_i(&f, &lm, 6, PB_I64, chunk);
+        pb_i(&f, &lm, 7, PB_I64, chunk);
+        pb_i(&f, &lm, 9, PB_I64, data_off);
+        pb_i(&f, &lm, 11, PB_I64, start);
+        pb_byte(&f, 0);   /* meta */
+        pb_byte(&f, 0);   /* column chunk */
+        pb_i(&f, &l, 2, PB_I64, chunk);
+        pb_i(&f, &l, 3, PB_I64, rows);
+        pb_byte(&f, 0);
+    }
+    pb_field(&f, &last, 6, PB_BIN); pb_bin(&f, "rayforce test", 13);
+    pb_byte(&f, 0);
+    uint32_t flen = (uint32_t)(f.n - (size_t)footer);
+    pb_bytes(&f, &flen, 4); pb_bytes(&f, "PAR1", 4);
+    bool ok = !f.bad && !dict.bad && !data.bad;
+    FILE* out = ok ? fopen(path, "wb") : NULL;
+    ok = out && fwrite(f.p, 1, f.n, out) == f.n;
+    if (out && fclose(out)) ok = false;
+    ray_sys_free(f.p); ray_sys_free(dict.p); ray_sys_free(data.p);
+    return ok;
+}
+/* A stored dictionary page must decode to exactly the bytes it stores: a
+ * header that declares fewer (here just the first entry's, with a count of
+ * one, which would parse) or many more (up to the 64 MiB page limit, far
+ * past the file) is an invalid page, for the read and for the direct and
+ * grouped imports alike; the honest page reads. */
+static test_result_t test_pq_dict_page_size(void) {
+    pq_sym_env_clear();
+    char src[160], dir[160], partial[200];
+    snprintf(src, sizeof(src), "/tmp/rayforce-pq-dictsize-%d.parquet", (int)getpid());
+    snprintf(dir, sizeof(dir), "/tmp/rayforce-pq-dictsize-%d", (int)getpid());
+    snprintf(partial, sizeof(partial), "%s.parquet-partial", dir);
+    int64_t tid = ray_sym_intern("SYM", 3);
+    ray_t* types = ray_vec_from_raw(RAY_SYM, &tid, 1);
+    const char* names[] = {"s"};
+    const int64_t declared[3] = {4 + 5, (INT64_C(64) << 20) - 1, 4 + 5 + 4 + 19};
+    const int64_t counts[3] = {1, 2, 2};
+    for (int c = 0; c < 3; c++) {
+        bool honest = c == 2;
+        TEST_ASSERT_TRUE(pq_dict_file(src, declared[c], counts[c]));
+        ray_t* t = ray_parquet_read(src, NULL);
+        TEST_ASSERT_TRUE(t != NULL);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(t) != honest);
+        if (honest) {
+            size_t len; const char* text = ray_str_vec_get(ray_table_get_col_idx(t, 0), 5, &len);
+            TEST_ASSERT_TRUE(len == 5 && !memcmp(text, "first", 5));
+        }
+        if (RAY_IS_ERR(t)) ray_error_free(t); else ray_release(t);
+        for (int grouped = 0; grouped < 2; grouped++) {
+            pq_set_symmode(grouped ? "grouped" : "direct");
+            t = ray_parquet_splayed_typed(src, dir, types);
+            pq_set_symmode(NULL);
+            TEST_ASSERT_TRUE(t != NULL);
+            TEST_ASSERT_TRUE(RAY_IS_ERR(t) != honest);
+            if (RAY_IS_ERR(t)) ray_error_free(t); else ray_release(t);
+            TEST_ASSERT_TRUE((access(dir, F_OK) == 0) == honest);
+            pq_remove_native(dir, names, 1); pq_remove_native(partial, names, 1);
+        }
+    }
+    ray_release(types); unlink(src);
+    PASS();
+}
+/* Imports keep no memory after they end: the per-worker buffers the tasks
+ * share (pages, dictionaries, symbol scratch) and each pass's state are
+ * freed, direct and grouped.  One worker, so the calling thread's heap holds
+ * it all; eight imports, the bytes allocated after the second and the last. */
+static test_result_t test_pq_import_no_growth(void) {
+    pq_sym_env_clear();
+    ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(1), RAY_OK);
+    int64_t tids[] = {ray_sym_intern("I32",3), ray_sym_intern("I64",3), ray_sym_intern("SYM",3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 3);
+    const char* names[] = {"x","y","s"};
+    for (int grouped = 0; grouped < 2; grouped++) {
+        size_t base = 0;
+        for (int i = 0; i < 8; i++) {
+            char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-pq-growth-%d-%d-%d", (int)getpid(), grouped, i);
+            pq_set_symmode(grouped ? "grouped" : "direct");
+            ray_t* res = ray_parquet_splayed_typed(FIX "row-groups.parquet", dir, types);
+            pq_set_symmode(NULL);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(res)); ray_release(res);
+            pq_remove_native(dir, names, 3);
+            ray_mem_stats_t st;
+            ray_mem_stats(&st);
+            if (i == 1) base = st.bytes_allocated;
+            if (i == 7) TEST_ASSERT_TRUE(st.bytes_allocated <= base + (64u << 10));
+        }
+    }
+    ray_release(types);
+    ray_pool_destroy();
+    PASS();
+}
 const test_entry_t parquet_entries[] = {
     {"parquet/small_stack",test_pq_small_stack,NULL,NULL},
     {"parquet/parted_symbols",test_pq_parted_symbols,pq_setup,pq_teardown},
@@ -1044,6 +1183,8 @@ const test_entry_t parquet_entries[] = {
     {"parquet/sym_grouped",test_pq_sym_grouped,pq_setup,pq_teardown},
     {"parquet/sym_grouped_collisions",test_pq_sym_grouped_collisions,pq_setup,pq_teardown},
     {"parquet/sym_grouped_failures",test_pq_sym_grouped_failures,pq_setup,pq_teardown},
+    {"parquet/dict_page_size",test_pq_dict_page_size,pq_setup,pq_teardown},
+    {"parquet/import_no_growth",test_pq_import_no_growth,pq_setup,pq_teardown},
 #if defined(__linux__)
     {"parquet/chunk_flush_error",test_pq_chunk_flush_error,pq_setup,pq_teardown},
 #endif

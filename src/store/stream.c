@@ -58,10 +58,11 @@ static void ray_col_stream_drop_lut(ray_col_stream_t* w) {
     w->lut_id = NULL; w->lut_pos = NULL;
 }
 
-/* The runtime id -> position cache, made by the first runtime-domain chunk
- * (6 MB, 4 of them written here): a writer fed chunks already encoded over
- * its domain never needs it.  Best effort: without it every cell probes the
- * domain. */
+/* The runtime id -> position cache, made by the first runtime-domain chunk:
+ * 4 MiB of ids and 2 MiB of positions, each a block one order up with its
+ * header (8 MB and 4 MB, 12 MB committed, the 4 MiB of ids written here).
+ * A writer fed chunks already encoded over its domain never needs it.  Best
+ * effort: without it every cell probes the domain. */
 static bool ray_col_stream_lut(ray_col_stream_t* w) {
     if (w->lut_id) return true;
     w->lut_id  = (int64_t*)ray_alloc_raw((size_t)COL_STREAM_LUT * sizeof(int64_t));

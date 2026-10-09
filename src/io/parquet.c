@@ -1945,6 +1945,12 @@ static void pq_write_direct_group(void* ptr, uint32_t worker, int64_t start, int
                                           (row-w->offsets[g])*(int64_t)size);
         }
         if (fclose(local.fp) && !w->errors[task]) w->errors[task] = pq_error("native column close failed");
+        /* The task's writer owns no file of its own (tmp_path is the
+         * column's, left unset here): abort only frees what an append may
+         * have made, such as the runtime id cache of a runtime-domain
+         * chunk. */
+        local.fp = NULL;
+        ray_col_stream_abort(&local);
         if (local.had_nulls) atomic_store_explicit(&w->nulls[c],1,memory_order_relaxed);
         if (!w->errors[task] && row != w->offsets[g+1]) w->errors[task] = pq_error("row group ended before its assigned output range");
         if (spare) pq_trade_buffers(&r->cursors[0],spare);
@@ -2327,6 +2333,8 @@ static void pq_g2_task(void* ptr, uint32_t worker, int64_t start, int64_t end) {
             else ray_file_writeback_start(fileno(local.fp),32+dw->offsets[g]*4,(dw->offsets[g+1]-dw->offsets[g])*4);
         }
         if (local.fp && fclose(local.fp) && !err) err = "native column close failed";
+        local.fp = NULL;
+        ray_col_stream_abort(&local);   /* frees what an append made; no file of its own */
         if (!err && local.rows != dw->offsets[g+1]-dw->offsets[g]) err = "row group ended before its assigned output range";
         if (local.had_nulls) atomic_store_explicit(&dw->nulls[w->c],1,memory_order_relaxed);
         if (err && !dw->errors[g]) dw->errors[g] = ray_interrupted() ? ray_error("cancel","parquet conversion interrupted") : pq_error(err);
