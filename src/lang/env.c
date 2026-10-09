@@ -140,12 +140,19 @@ int64_t ray_env_builtin_sym(const ray_t* fn) {
  * an inner query can bind a same-named column over an outer query column.
  * Query-local callers push a query frame before probing, so scanning every
  * frame still excludes the binding currently being installed. */
+/* A query helper's call frame binds source columns on demand above
+ * `table_from`; those are the query's columns, not lexical locals. */
+static int32_t env_frame_lexical_count(const ray_scope_frame_t* f) {
+    return f->kind == RAY_SCOPE_CALL && f->table ? f->table_from : f->count;
+}
+
 ray_t* ray_env_get_lexical_local(int64_t sym_id) {
     if (!__VM) return NULL;
     for (int32_t d = __VM->scope_depth - 1; d >= 0; d--) {
         ray_scope_frame_t* f = &__VM->scope_stack[d];
         if (f->kind == RAY_SCOPE_QUERY) continue;
-        for (int32_t i = 0; i < f->count; i++)
+        int32_t n = env_frame_lexical_count(f);
+        for (int32_t i = 0; i < n; i++)
             if (f->keys[i] == sym_id) return f->vals[i];
         if (f->kind == RAY_SCOPE_CALL) break;
     }
@@ -157,7 +164,8 @@ int32_t ray_env_lexical_scope_depth(int64_t sym_id) {
     for (int32_t d = __VM->scope_depth - 1; d >= 0; d--) {
         ray_scope_frame_t* f = &__VM->scope_stack[d];
         if (f->kind == RAY_SCOPE_QUERY) continue;
-        for (int32_t i = 0; i < f->count; i++)
+        int32_t n = env_frame_lexical_count(f);
+        for (int32_t i = 0; i < n; i++)
             if (f->keys[i] == sym_id) return d + 1;
         if (f->kind == RAY_SCOPE_CALL) break;
     }
@@ -316,7 +324,6 @@ void ray_env_destroy(void) {
  * for dotted paths, and as the fast path for plain names. */
 static ray_err_t env_frame_bind(ray_scope_frame_t* f, int64_t sym_id, ray_t* val);
 ray_t* ray_query_helper_value(int64_t sym);   /* ops/query.c */
-bool   ray_query_helper_aliases(void);        /* ops/query.c */
 
 /* A lookup that reaches a query helper's call frame: a free name that is
  * a source column binds, on first use, to what the query's own expressions
@@ -325,20 +332,12 @@ bool   ray_query_helper_aliases(void);        /* ops/query.c */
  * name here as it does in a body the planner inlines.  Any other name
  * falls through to the globals.  The frame grows past RAY_FRAME_CAP on
  * demand; only an allocation failure leaves the name unbound. */
-static ray_t* env_call_frame_value(ray_scope_frame_t* f, int32_t depth, int64_t sym_id) {
-    if (!f->table || !ray_table_get_col(f->table, sym_id)) return NULL;
-    ray_t* v = NULL;
-    /* The query's own binding of the column — the row's cell, the group's
-     * slice or the whole column — sits in the frames below.  While a
-     * projection binds output aliases there, the source table decides. */
-    if (!ray_query_helper_aliases()) {
-        for (int32_t k = depth - 1; k >= 0 && !v; k--) {
-            ray_scope_frame_t* g = &__VM->scope_stack[k];
-            for (int32_t i = 0; i < g->count; i++)
-                if (g->keys[i] == sym_id) { v = g->vals[i]; if (v) ray_retain(v); break; }
-        }
-    }
-    if (!v) v = ray_query_helper_value(sym_id);
+static ray_t* env_call_frame_value(ray_scope_frame_t* f, int64_t sym_id) {
+    if (!f->table) return NULL;
+    /* The query decides what the column means here: the row's cell, the
+     * group's rows or the whole column.  Nothing below the frame is read,
+     * so a caller's locals stay hidden. */
+    ray_t* v = ray_query_helper_value(sym_id);
     if (!v) return NULL;
     if (RAY_IS_ERR(v)) { ray_error_free(v); return NULL; }
     ray_err_t err = env_frame_bind(f, sym_id, v);
@@ -357,13 +356,15 @@ static ray_t* env_lookup_flat_rows(int64_t sym_id, uint8_t* rows) {
             ray_scope_frame_t* f = &__VM->scope_stack[d];
             for (int32_t i = 0; i < f->count; i++) {
                 if (f->keys[i] != sym_id) continue;
-                /* A source column bound earlier in this call keeps its
-                 * provenance on every later read, not only the first. */
-                if (rows && f->kind == RAY_SCOPE_CALL && f->table && i >= f->table_from) *rows = 1;
+                /* A query frame holds the query's column bindings (cells,
+                 * slices or columns); a source column bound earlier in a
+                 * call keeps its provenance on every later read. */
+                if (rows && (f->kind == RAY_SCOPE_QUERY ||
+                             (f->kind == RAY_SCOPE_CALL && f->table && i >= f->table_from))) *rows = 1;
                 return f->vals[i];
             }
             if (f->kind == RAY_SCOPE_CALL) {
-                ray_t* v = env_call_frame_value(f, d, sym_id);
+                ray_t* v = env_call_frame_value(f, sym_id);
                 if (v) { if (rows) *rows = 1; return v; }
                 break;
             }

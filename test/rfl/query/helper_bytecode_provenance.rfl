@@ -94,3 +94,49 @@
 (at (select {n: (sum x) by: (hlet s) from: T desc: n}) 'n) -- [3 2 1]
 (at (select {n: (sum x) by: (hlet s) from: T where: (> x 1) asc: s}) 's) -- ['B! 'C!]
 (count (select {n: (count x) by: (mb s) from: T desc: n take: 2})) -- 2
+;; Without row data among the operands, concat inside any function keeps
+;; collection semantics, whatever called it.
+(set cc (fn [acc y] (concat acc y)))
+(at (select {v: (fold cc ['p 'q 'r]) from: T}) 'v) -- (list ['p 'q 'r] ['p 'q 'r] ['p 'q 'r])
+(set two (fn [] 1 (concat 'a 'b)))
+(at (update {n: (+ x (count (two))) from: T}) 'n) -- [3 4 5]
+(set gx (fn [a] (concat a 'x)))
+(at (update {v: (map gx s) from: T}) 'v) -- (list ['a 'x] ['b 'x] ['c 'x])
+;; Only deterministic, effect-free builtins are inlined: a random input is
+;; computed once, an effectful argument runs once per row, a raise raises.
+(set gg (fn [g] (== g g)))
+(at (select {v: (gg (first (guid 1))) e: x from: T}) 'v) -- [true true true]
+(set dup (fn [g] (count (distinct (concat g g)))))
+(at (select {v: (dup (guid 3)) e: (reverse x) from: T}) 'v) -- [3 3 3]
+(set CNT 0)
+(set eff (fn [v] (set CNT (+ CNT 1)) v))
+(set ign (fn [a b] a))
+(at (select {v: (ign s (map eff ['p])) from: T}) 'v) -- ['a 'b 'c]
+CNT -- 3
+(select {v: (ign s (raise 'boom)) from: T}) !- domain
+;; A caller's locals never reach a helper, grouped or not; a nested query
+;; inside a helper leaves the enclosing group's rows in place.
+(set TY (table [k x y s] (list [0 0 1 1 2] [1 2 3 4 5] [10 20 30 40 50] ['a 'b 'c 'd 'e])))
+(set cs (fn [v] 1 (count s)))
+(set fs (fn [v] 1 (first s)))
+((fn [t] (let s 'LOCAL) (at (select {r: (fs x) by: k from: t asc: k}) 'r)) TY) -- ['a 'c 'e]
+((fn [t] (let s (til 7)) (at (select {r: (cs x) by: k from: t asc: k}) 'r)) TY) -- [2 2 1]
+(set nq (fn [v] 1 (let q (select {r: (cs x) by: k from: TY})) (count s)))
+(at (select {n: (nq x) by: k from: TY asc: k}) 'n) -- [2 2 1]
+;; Reordering a column keeps its rows, in a helper as in the query.
+(set rv (fn [v] 1 (concat v (reverse v))))
+(at (update {v: (rv s) from: TY}) 'v) -- ['ae 'bd 'cc 'db 'ea]
+;; A bound vector returned by a helper is not row data.
+(set L3 ['p 'q 'r])
+(set k3 (fn [v] 1 L3))
+(select {v: (concat (k3 s) "!") from: T}) !- type
+;; Provenance through a cast or a bucket bound with let, and through a
+;; conditional form over a let local.
+(set hx (fn [v] 1 (let w (as 'SYM v)) (concat w "!")))
+(at (select {from: T where: (in (hx s) ['a! 'c!])}) 'x) -- [1 3]
+(set hb (fn [v] 1 (let w (xbar v 2)) (+ w 0)))
+(at (select {n: (sum (hb x)) by: x from: T asc: x}) 'n) -- [0 2 2]
+(set hw (fn [v] 1 (let w v) (or false (in (concat w "!") ['a! 'c!]))))
+(at (select {from: T where: (hw s)}) 'x) -- [1 3]
+;; Every grouped result keeps the requested output order.
+(key (select {n: (+ (count s) 1) m: (sum x) by: k from: TY})) -- ['k 'n 'm]

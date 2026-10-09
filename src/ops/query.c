@@ -1228,9 +1228,11 @@ static int expr_contains_call_named(ray_t* expr, const char* name, size_t name_l
 bool ray_query_rowwise_builtin(int64_t id) {
     if (resolve_unary_dag(id) || resolve_binary_dag(id) || resolve_agg_opcode(id)) return true;
     /* Forms compile_expr_dag lowers by name rather than through a table. */
+    /* reverse/asc/desc reorder a column but keep every row of it. */
     static const char* const names[] = {
         "as", "if", "and", "or", "cond", "pow", "substr", "replace", "xbar", "within",
         "day", "dayofweek", "dayofyear", "hour", "minute", "month", "second", "year",
+        "reverse", "asc", "desc", "at",
     };
     enum { N = sizeof names / sizeof *names };
     /* Sym ids are only stable within one symbol-table epoch (sym.h). */
@@ -2114,40 +2116,48 @@ static _Thread_local query_dependency_cache_t* g_query_dependencies;
 typedef struct { int64_t name; ray_t* expr; } query_inline_binding_t;
 
 /* A builtin whose call can move from a helper body into the query
- * expression without changing what the program does: no effects, no
- * input but its arguments, no unevaluated-argument forms except the
- * conditionals the planner already understands. */
+ * expression without changing what the program does: deterministic, no
+ * effects, no input but its arguments, and never calling back into user
+ * code.  Everything the planner lowers qualifies, plus the collection
+ * verbs the fallback evaluates whole; anything else keeps the call. */
 static bool query_inline_pure_builtin(int64_t id) {
-    static const char* const forms[] = { "if", "and", "or", "cond", "quote" };
-    static const char* const impure[] = {
-        "println", "print", "show", "rand", "raise", "try", "eval", "apply",
-        "time", "timestamp", "timeit", "times", "do", "each", "over", "scan",
+    static const char* const pure[] = {
+        "quote", "concat", "distinct", "reverse", "asc", "desc", "iasc", "idesc", "rank",
+        "til", "take", "drop", "enlist", "list", "count", "first", "last", "at", "in",
+        "not-in", "except", "union", "sect", "where", "raze", "flip", "key", "value",
+        "type", "sublist", "differ", "fills", "group", "upper", "lower", "trim", "strlen",
+        "like", "ilike", "str-find", "nil?",
     };
-    enum { NFORMS = sizeof forms / sizeof *forms, NIMPURE = sizeof impure / sizeof *impure };
+    enum { NPURE = sizeof pure / sizeof *pure };
     /* Interned once per symbol-table epoch (sym.h): this runs for every
      * call node of every helper, and ids do not survive a re-init. */
-    static _Thread_local int64_t form_ids[NFORMS], impure_ids[NIMPURE];
+    static _Thread_local int64_t pure_ids[NPURE];
     static _Thread_local uint64_t epoch;
     if (epoch != ray_sym_epoch() || !epoch) {
-        for (size_t i = 0; i < NFORMS; i++) form_ids[i] = ray_sym_intern(forms[i], strlen(forms[i]));
-        for (size_t i = 0; i < NIMPURE; i++) impure_ids[i] = ray_sym_intern(impure[i], strlen(impure[i]));
+        for (size_t i = 0; i < NPURE; i++) pure_ids[i] = ray_sym_intern(pure[i], strlen(pure[i]));
         epoch = ray_sym_epoch();
     }
-    for (size_t i = 0; i < NFORMS; i++) if (form_ids[i] == id) return true;
-    for (size_t i = 0; i < NIMPURE; i++) if (impure_ids[i] == id) return false;
-    if (ray_sym_is_dotted(id)) return false;          /* system namespaces */
-    ray_t* s = ray_sym_str(id);
-    if (s && ray_str_len(s) && ray_str_ptr(s)[0] == '.') return false;
+    bool known = ray_query_rowwise_builtin(id);
+    for (size_t i = 0; i < NPURE && !known; i++) known = pure_ids[i] == id;
+    if (!known) return false;
     ray_t* fn = ray_env_get(id);
-    if (!fn || (fn->type != RAY_UNARY && fn->type != RAY_BINARY && fn->type != RAY_VARY))
-        return false;
-    return !(fn->attrs & (RAY_FN_RESTRICTED | RAY_FN_SPECIAL_FORM));
+    if (!fn) return id == pure_ids[0];                 /* quote is a form */
+    if (fn->type == RAY_LAMBDA) return false;          /* shadowed by a user helper */
+    return !(fn->attrs & RAY_FN_RESTRICTED);
 }
 
 /* Fallback can inline pure expressions even when the DAG cannot lower
  * their types or shapes. Never move effects or opaque user calls. */
 static bool query_inline_pure(ray_t* expr, int depth) {
     if (!expr || depth > 24) return false;
+    if (expr->type == -RAY_SYM && !(expr->attrs & ATTR_QUOTED)) {
+        /* A name standing for a user function may be called by whatever
+         * receives it; its effects cannot be moved or duplicated.  Globals
+         * only: a scoped lookup here would bind a column into a helper's
+         * call frame as a side effect. */
+        ray_t* v = ray_env_get_global(expr->i64);
+        return !(v && v->type == RAY_LAMBDA);
+    }
     if (expr->type != RAY_LIST || (expr->attrs & ATTR_QUOTED)) return true;
     if (!expr->len) return true;
     ray_t** es = ray_data(expr);
@@ -2345,7 +2355,7 @@ ray_t* ray_active_query_table(void) { return g_active_query_table; }
 ray_t* ray_query_helper_table(void) {
     return g_query_source_table ? g_query_source_table : g_active_query_table;
 }
-bool ray_query_helper_aliases(void) { return g_query_source_table != NULL; }
+
 
 /* Mount columns AND publish `tbl` as the active query table; returns the
  * previously-active table so the caller can restore it after the matching
@@ -5553,9 +5563,10 @@ static ray_t* nonagg_eval_per_group_impl(ray_t* expr, ray_t* tbl,
                 if (err) { ray_error_free(err); bound = 0; }
             }
             if (bound) {
+                ray_t* prev_group_idx = g_active_query_group_idx;
                 g_active_query_group_idx = empty_idx;
                 ray_t* cell = ray_eval(expr);
-                g_active_query_group_idx = NULL;
+                g_active_query_group_idx = prev_group_idx;
                 if (cell && !RAY_IS_ERR(cell) && ray_is_lazy(cell)) cell = ray_lazy_materialize(cell);
                 if (cell && !RAY_IS_ERR(cell)) {
                     int8_t t = cell->type;
@@ -5592,9 +5603,10 @@ static ray_t* nonagg_eval_per_group_impl(ray_t* expr, ray_t* tbl,
                 return err;
             }
         }
+        ray_t* prev_group_idx = g_active_query_group_idx;
         g_active_query_group_idx = idx_list;
         ray_t* cell = ray_eval(expr);
-        g_active_query_group_idx = NULL;
+        g_active_query_group_idx = prev_group_idx;
         if (!cell || RAY_IS_ERR(cell)) {
             g_active_query_table = _aqt;
             ray_env_pop_scope();
@@ -16143,7 +16155,7 @@ by_dict_done:
 
     /* Fallback outputs are appended after native aggregates. Restore the
      * requested output order using the same layout pass as derived aliases. */
-    if (by_expr && n_nonaggs > 0 && result && !RAY_IS_ERR(result)) {
+    if (by_expr && result && !RAY_IS_ERR(result)) {
         select_alias_plan_t layout = {0};
         result = select_apply_derived(result, dict, &layout, tbl);
     }

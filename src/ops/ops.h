@@ -979,8 +979,6 @@ ray_t* ray_active_query_table(void);
 /* The table a helper called from a query may read columns from: the
  * source schema while a projection binds aliases, else the active table. */
 ray_t* ray_query_helper_table(void);
-/* True while a projection binds output aliases into its evaluation table. */
-bool ray_query_helper_aliases(void);
 /* Owned: the source column `sym` names, or its cell during a per-row
  * evaluation; NULL when it names none. */
 ray_t* ray_query_helper_value(int64_t sym);
