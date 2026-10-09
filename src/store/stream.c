@@ -50,23 +50,25 @@ ray_err_t ray_col_stream_open(ray_col_stream_t* w,
     if (!w->fp) return RAY_ERR_IO;
     ray_t zero = {0};
     if (fwrite(&zero, 1, 32, w->fp) != 32) return RAY_ERR_IO;
-    if (type == RAY_SYM) {
-        /* best effort: without the cache every cell probes the domain */
-        w->lut_id  = (int64_t*)ray_alloc_raw((size_t)COL_STREAM_LUT * sizeof(int64_t));
-        w->lut_pos = (uint32_t*)ray_alloc_raw((size_t)COL_STREAM_LUT * sizeof(uint32_t));
-        if (!w->lut_id || !w->lut_pos) {
-            ray_free_raw(w->lut_id); ray_free_raw(w->lut_pos);
-            w->lut_id = NULL; w->lut_pos = NULL;
-        } else {
-            memset(w->lut_id, 0xff, (size_t)COL_STREAM_LUT * sizeof(int64_t));
-        }
-    }
     return RAY_OK;
 }
 
 static void ray_col_stream_drop_lut(ray_col_stream_t* w) {
     ray_free_raw(w->lut_id); ray_free_raw(w->lut_pos);
     w->lut_id = NULL; w->lut_pos = NULL;
+}
+
+/* The runtime id -> position cache, made by the first runtime-domain chunk
+ * (6 MB, 4 of them written here): a writer fed chunks already encoded over
+ * its domain never needs it.  Best effort: without it every cell probes the
+ * domain. */
+static bool ray_col_stream_lut(ray_col_stream_t* w) {
+    if (w->lut_id) return true;
+    w->lut_id  = (int64_t*)ray_alloc_raw((size_t)COL_STREAM_LUT * sizeof(int64_t));
+    w->lut_pos = (uint32_t*)ray_alloc_raw((size_t)COL_STREAM_LUT * sizeof(uint32_t));
+    if (!w->lut_id || !w->lut_pos) { ray_col_stream_drop_lut(w); return false; }
+    memset(w->lut_id, 0xff, (size_t)COL_STREAM_LUT * sizeof(int64_t));
+    return true;
 }
 
 ray_err_t ray_col_stream_index_begin(ray_col_stream_t* w, int64_t start_row) {
@@ -159,7 +161,8 @@ ray_err_t ray_col_stream_append(ray_col_stream_t* w,
          * A runtime-domain chunk vec goes through the id -> position
          * cache: only a value's first encounter pays the domain probe. */
         bool direct = ray_sym_vec_domain(col) == w->dom;
-        bool cached = ray_sym_vec_domain(col) == ray_sym_runtime_domain() && w->lut_id;
+        bool cached = !direct && ray_sym_vec_domain(col) == ray_sym_runtime_domain() &&
+                      ray_col_stream_lut(w);
         const void* cd = ray_data(col);
         uint32_t buf[8192];
         for (int64_t off = 0; off < n; ) {
