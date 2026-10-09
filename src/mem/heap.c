@@ -1937,13 +1937,13 @@ void ray_free_raw(void* p) {
     ray_free((ray_t*)((char*)p - 32));   /* 32 = ray_t header before the data */
 }
 
-void ray_raw_discard(void* p, size_t from, size_t upto) {
+bool ray_raw_discard(void* p, size_t from, size_t upto) {
 #if RAY_HEAP_FILE_SPILL && defined(MADV_REMOVE)
-    if (!p || upto <= from) return;
+    if (!p || upto <= from) return false;
     ray_t* v = (ray_t*)((char*)p - 32);
     /* An anonymous block is below the watermark, and the direct-block
      * cache keeps it resident for its next use: left alone. */
-    if (!ray_is_direct(v) || !ray_direct_file_backed(v)) return;
+    if (!ray_is_direct(v) || !ray_direct_file_backed(v)) return false;
     size_t room = ray_block_data_bytes(v);
     if (upto > room) upto = room;
     long ps = sysconf(_SC_PAGESIZE);
@@ -1953,11 +1953,15 @@ void ray_raw_discard(void* p, size_t from, size_t upto) {
     uintptr_t lo = ((uintptr_t)p + from) & ~(pg - 1);
     uintptr_t hi = ((uintptr_t)p + upto) & ~(pg - 1);
     if (lo < first) lo = first;
-    if (hi <= lo) return;
+    if (hi <= lo) return false;
     /* punched out of the spill file: a dirty page is dropped, not written */
-    (void)madvise((void*)lo, hi - lo, MADV_REMOVE);
+    return madvise((void*)lo, hi - lo, MADV_REMOVE) == 0;
 #else
+    /* No way to punch a mapped range here (macOS has no MADV_REMOVE, and
+     * F_PUNCHHOLE does not say what it does to pages mapped shared): the
+     * pages stay until the block is freed, as before. */
     (void)p; (void)from; (void)upto;
+    return false;
 #endif
 }
 

@@ -342,8 +342,9 @@ static inline bool ray_direct_file_backed(const ray_t* v) {
  * over a spill file), the whole pages among them are punched out of the
  * file now: a dirty one is never written back, and the page cache it held
  * is free for what comes next.  They read zero after.  A no-op for every
- * other block (and where the platform cannot punch a mapped range). */
-void ray_raw_discard(void* p, size_t from, size_t upto);
+ * other block, and where the platform cannot punch a mapped range.  True
+ * when pages were punched out. */
+bool ray_raw_discard(void* p, size_t from, size_t upto);
 
 /* Anonymous (RAM-resident, OOM-killable) pool, direct and sys bytes currently
  * committed.  Allocations that would push this past the anon watermark

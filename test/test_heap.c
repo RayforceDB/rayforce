@@ -2699,10 +2699,12 @@ static test_result_t test_sys_alloc_zero_fill(void) {
 
 /* ray_raw_discard punches out of a spilled block's file the whole pages
  * that lie in the range reported — they read zero after — and nothing else:
- * not the first page (it holds the headers), not a page the range only
- * reaches into (it goes with the report that covers it), nothing past the
- * block.  An anonymous block (the direct-block cache keeps it for its next
- * use) and a small one are left as they are. */
+ * not the first page (it holds the headers: the block still frees as a
+ * direct block), not a page the range only reaches into (it goes with the
+ * report that covers it), nothing past the block.  An anonymous block (the
+ * direct-block cache keeps it for its next use) and a small one are left as
+ * they are, and so is everything where the platform cannot punch a mapped
+ * range (no MADV_REMOVE: macOS) — the call says whether it did. */
 static test_result_t test_raw_discard(void) {
 #if defined(_WIN32)
     SKIP("file-backed spill is POSIX-only");
@@ -2716,6 +2718,8 @@ static test_result_t test_raw_discard(void) {
         bool spill = k == 1;
         ray_heap_direct_cache_drain();
         int64_t base = ray_heap_anon_committed();
+        ray_mem_stats_t s0;
+        ray_mem_stats(&s0);
         ray_heap_set_anon_watermark(base + (spill ? INT64_C(1) << 20 : INT64_C(256) << 20));
         /* a neighbour mapped first: mappings grow down, so the block maps
          * right below it and a report past the block's end would reach it */
@@ -2730,29 +2734,37 @@ static test_result_t test_raw_discard(void) {
         size_t head = (size_t)((((uintptr_t)p + pg - 1) & ~(uintptr_t)(pg - 1)) - (uintptr_t)p);
         /* three and a half pages past the first page boundary: three go */
         size_t upto = head + 3 * pg + pg / 2;
-        ray_raw_discard(p, 0, upto);
+        bool punched = ray_raw_discard(p, 0, upto);
+#if defined(MADV_REMOVE)
+        if (punched != spill) bad++;          /* where it can, a spilled block's pages go */
+#else
+        if (punched) bad++;
+#endif
         for (size_t i = 0; i < big; i += 64)
-            if ((p[i] == 0) != (spill && i >= head && i < head + 3 * pg)) { bad++; break; }
+            if ((p[i] == 0) != (punched && i >= head && i < head + 3 * pg)) { bad++; break; }
         /* the next report takes the page the first one reached into */
-        ray_raw_discard(p, upto, head + 6 * pg);
+        if (ray_raw_discard(p, upto, head + 6 * pg) != punched) bad++;
         for (size_t i = 0; i < big; i += 64)
-            if ((p[i] == 0) != (spill && i >= head && i < head + 6 * pg)) { bad++; break; }
+            if ((p[i] == 0) != (punched && i >= head && i < head + 6 * pg)) { bad++; break; }
         /* a report past the end stops at the block */
-        ray_raw_discard(p, head + 6 * pg, big + big / 2);
+        if (ray_raw_discard(p, head + 6 * pg, big + big / 2) != punched) bad++;
         for (size_t i = 0; i < big; i += 64)
-            if ((p[i] == 0) != (spill && i >= head)) { bad++; break; }
+            if ((p[i] == 0) != (punched && i >= head)) { bad++; break; }
         for (size_t i = 0; i < big; i += 64) if (g[i] != 0x77) { bad++; break; }
         if (v->type != RAY_U8 || v->len != (int64_t)big) bad++;
         ray_free_raw(p);
         ray_free_raw(g);
         ray_heap_direct_cache_drain();
         if (ray_heap_anon_committed() != base) bad++;
+        ray_mem_stats_t s1;   /* both freed as direct blocks, their mappings gone */
+        ray_mem_stats(&s1);
+        if (s1.direct_bytes != s0.direct_bytes || s1.direct_count != s0.direct_count) bad++;
     }
     ray_heap_set_anon_watermark(previous);
     uint8_t* s = (uint8_t*)ray_alloc_raw(64 * 1024);   /* a buddy block: left alone */
     TEST_ASSERT_NOT_NULL(s);
     memset(s, 0x5a, 64 * 1024);
-    ray_raw_discard(s, 0, 64 * 1024);
+    if (ray_raw_discard(s, 0, 64 * 1024)) bad++;
     for (size_t i = 0; i < 64 * 1024; i++) if (s[i] != 0x5a) { bad++; break; }
     ray_free_raw(s);
     TEST_ASSERT_EQ_I(bad, 0);
