@@ -1559,6 +1559,7 @@ typedef struct {
     const int64_t* sel_prefix;
     int64_t n_sel;
     uint32_t tasks;
+    const int64_t* spans;   /* [tasks][2] selected-ordinal ranges; NULL: n_sel split evenly */
     int64_t* task_bounds;   /* [tasks][2][n_keys]: min row, max row per key */
 } agg_sel_bounds_ctx_t;
 
@@ -1590,8 +1591,9 @@ static void agg_sel_bounds_fn(void* raw, uint32_t wid, int64_t start, int64_t en
         int64_t* mins = c->task_bounds + (2 * (size_t)task) * c->n_keys;
         int64_t* maxs = mins + c->n_keys;
         for (uint32_t k = 0; k < c->n_keys; k++) { mins[k] = INT64_MAX; maxs[k] = INT64_MIN; }
-        int64_t begin = c->n_sel / c->tasks * task;
-        int64_t limit = task + 1 == c->tasks ? c->n_sel : c->n_sel / c->tasks * (task + 1);
+        int64_t begin = c->spans ? c->spans[2 * task] : c->n_sel / c->tasks * task;
+        int64_t limit = c->spans ? c->spans[2 * task + 1]
+                      : task + 1 == c->tasks ? c->n_sel : c->n_sel / c->tasks * (task + 1);
         agg_sel_cursor_t cur;
         agg_sel_cursor_init(&cur, c->sel, c->sel_prefix, begin, limit);
         agg_sel_bounds_run_t t = { c, rows, mins, maxs };
@@ -1608,6 +1610,99 @@ static void agg_sel_bounds_fn(void* raw, uint32_t wid, int64_t start, int64_t en
         }
         agg_curs_free(&cs, krr);
     }
+}
+
+/* The chunks of state 2 scanned by their selected rows (one task each),
+ * folded into mins / maxs and marked 3.  False on a range error or cancel. */
+static bool agg_sel_bounds_round(const agg_sel_bounds_ctx_t* bc, uint8_t* state, int64_t nch, int64_t spc,
+                                 int64_t* spans, int64_t* tb, int64_t* mins, int64_t* maxs) {
+    const uint32_t nsegs = ray_rowsel_meta(bc->sel)->n_segs;
+    int64_t n = 0, rows = 0;
+    for (int64_t ch = 0; ch < nch; ch++) {
+        if (state[ch] != 2) continue;
+        int64_t se = (ch + 1) * spc < (int64_t)nsegs ? (ch + 1) * spc : (int64_t)nsegs;
+        spans[2 * n] = bc->sel_prefix[ch * spc];
+        spans[2 * n + 1] = bc->sel_prefix[se];
+        rows += spans[2 * n + 1] - spans[2 * n];
+        state[ch] = 3;
+        n++;
+    }
+    if (n == 0) return true;
+    agg_sel_bounds_ctx_t c = *bc;
+    c.tasks = (uint32_t)n; c.spans = spans; c.task_bounds = tb;
+    ray_pool_t* pool = ray_pool_get();
+    bool par = pool && n > 1 && rows >= RAY_PARALLEL_THRESHOLD;
+    ray_scan_fail_init(bc->krr->fail);
+    if (par) ray_pool_dispatch_n(pool, agg_sel_bounds_fn, &c, (uint32_t)n);
+    else agg_sel_bounds_fn(&c, 0, 0, n);
+    ray_t* err = ray_scan_fail_finish(bc->krr->fail, par ? pool : NULL);
+    if (err) { ray_error_free(err); return false; }
+    for (int64_t t = 0; t < n; t++)
+        for (uint32_t k = 0; k < bc->n_keys; k++) {
+            int64_t mn = tb[(2 * (size_t)t) * bc->n_keys + k], mx = tb[(2 * (size_t)t + 1) * bc->n_keys + k];
+            if (mn < mins[k]) mins[k] = mn;
+            if (mx > maxs[k]) maxs[k] = mx;
+        }
+    return true;
+}
+
+/* The selected rows' key bounds of staged keys, exactly the full scan's
+ * (so the plan, its route and its emit order are generation 0's), reading
+ * only the chunks that can move them.  A chunk's directory min / max bound
+ * its rows, so a chunk with no nulls whose statistics lie inside the bounds
+ * found so far cannot change them: round 1 scans the selected rows of each
+ * key's chunks holding the lowest minimum and the highest maximum and of
+ * every chunk without statistics or with nulls; round 2 the chunks whose
+ * statistics still reach outside.  Bounds only widen as chunks are read, so
+ * no chunk skipped after round 2 could move them.  False (the caller scans
+ * every selected row) unless every key is a single-file staged non-SYM
+ * source with a directory; also on a scan error or cancel, so that the full
+ * scan reports the lowest failure. */
+static bool agg_sel_bounds_dir(const agg_sel_bounds_ctx_t* bc, int64_t* mins, int64_t* maxs) {
+    const agg_rr_t* krr = bc->krr;
+    const uint32_t nk = bc->n_keys;
+    const ray_rowsel_t* m = ray_rowsel_meta(bc->sel);
+    const int64_t nrows = m->nrows, nch = (nrows + RAY_ENC_CHUNK - 1) / RAY_ENC_CHUNK;
+    const int64_t spc = RAY_ENC_CHUNK / RAY_MORSEL_ELEMS;      /* selection segments per chunk */
+    ray_enc_chunk_stat_t st;
+    if (nch < 1) return false;
+    for (uint32_t k = 0; k < nk; k++)
+        if (!krr->srcs[k] || krr->key_types[k] == RAY_SYM || krr->srcs[k]->len != nrows ||
+            !ray_col_src_chunk_stat(krr->srcs[k], 0, &st))
+            return false;
+    ray_t* hdr;
+    int64_t* spans = (int64_t*)scratch_alloc(&hdr, (size_t)nch * (2 + 2 * nk) * sizeof(int64_t) + (size_t)nch);
+    if (!spans) return false;
+    int64_t* tb = spans + 2 * nch;
+    uint8_t* state = (uint8_t*)(tb + 2 * (size_t)nch * nk);   /* 0 no selected row, 1 skippable, 2 to scan, 3 scanned */
+    int64_t lo_ch[16], hi_ch[16], lo_v[16], hi_v[16];
+    for (uint32_t k = 0; k < nk; k++) { lo_ch[k] = hi_ch[k] = -1; lo_v[k] = INT64_MAX; hi_v[k] = INT64_MIN; }
+    for (int64_t ch = 0; ch < nch; ch++) {
+        int64_t se = (ch + 1) * spc < (int64_t)m->n_segs ? (ch + 1) * spc : (int64_t)m->n_segs;
+        state[ch] = bc->sel_prefix[se] > bc->sel_prefix[ch * spc];
+        for (uint32_t k = 0; k < nk && state[ch]; k++) {
+            (void)ray_col_src_chunk_stat(krr->srcs[k], ch, &st);
+            if (!st.has_minmax || st.null_count) { state[ch] = 2; continue; }
+            if (st.min < lo_v[k]) { lo_v[k] = st.min; lo_ch[k] = ch; }
+            if (st.max > hi_v[k]) { hi_v[k] = st.max; hi_ch[k] = ch; }
+        }
+    }
+    for (uint32_t k = 0; k < nk; k++) {
+        if (lo_ch[k] >= 0) state[lo_ch[k]] = 2;
+        if (hi_ch[k] >= 0) state[hi_ch[k]] = 2;
+        mins[k] = INT64_MAX; maxs[k] = INT64_MIN;
+    }
+    bool ok = agg_sel_bounds_round(bc, state, nch, spc, spans, tb, mins, maxs);
+    for (int64_t ch = 0; ok && ch < nch; ch++) {
+        if (state[ch] != 1) continue;
+        for (uint32_t k = 0; k < nk; k++) {
+            (void)ray_col_src_chunk_stat(krr->srcs[k], ch, &st);
+            if (st.min < mins[k] || st.max > maxs[k]) { state[ch] = 2; break; }
+        }
+    }
+    if (ok) ok = agg_sel_bounds_round(bc, state, nch, spc, spans, tb, mins, maxs);
+    scratch_free(hdr);
+    return ok;
 }
 
 static bool agg_dense_plan_sel(ray_t** key_cols, const agg_rr_t* krr, uint32_t n_keys, int64_t n_sel,
@@ -1652,28 +1747,31 @@ static bool agg_dense_plan_sel(ray_t** key_cols, const agg_rr_t* krr, uint32_t n
     agg_sel_bounds_ctx_t bc = { .krr = krr,
         .nullable = out->nullable, .nulls = out->nulls, .n_keys = n_keys,
         .sel = sel, .sel_prefix = sel_prefix, .n_sel = n_sel, .tasks = tasks };
-    ray_t* tb_hdr;
-    bc.task_bounds = (int64_t*)scratch_alloc(&tb_hdr, 2u * (size_t)tasks * n_keys * sizeof(int64_t));
-    if (!bc.task_bounds) { scratch_free(pre_hdr); return false; }
-    if (krr->staged) {
-        ray_scan_fail_init(krr->fail);
-        for (uint32_t k = 0; k < n_keys; k++)
-            if (krr->srcs[k]) ray_col_src_advise(krr->srcs[k], 0, ray_rowsel_meta(sel)->nrows);
-    }
-    if (tasks > 1) ray_pool_dispatch_n(pool, agg_sel_bounds_fn, &bc, tasks);
-    else agg_sel_bounds_fn(&bc, 0, 0, 1);
-    if (krr->staged && (*err = ray_scan_fail_finish(krr->fail, tasks > 1 ? pool : NULL)) != NULL) {
-        scratch_free(tb_hdr); scratch_free(pre_hdr);
-        return false;
-    }
-    for (uint32_t t = 0; t < tasks; t++)
-        for (uint32_t k = 0; k < n_keys; k++) {
-            int64_t mn = bc.task_bounds[(2 * (size_t)t) * n_keys + k];
-            int64_t mx = bc.task_bounds[(2 * (size_t)t + 1) * n_keys + k];
-            if (mn < mins[k]) mins[k] = mn;
-            if (mx > maxs[k]) maxs[k] = mx;
+    if (!krr->staged || !agg_sel_bounds_dir(&bc, mins, maxs)) {
+        for (uint32_t k = 0; k < n_keys; k++) { mins[k] = INT64_MAX; maxs[k] = INT64_MIN; }
+        ray_t* tb_hdr;
+        bc.task_bounds = (int64_t*)scratch_alloc(&tb_hdr, 2u * (size_t)tasks * n_keys * sizeof(int64_t));
+        if (!bc.task_bounds) { scratch_free(pre_hdr); return false; }
+        if (krr->staged) {
+            ray_scan_fail_init(krr->fail);
+            for (uint32_t k = 0; k < n_keys; k++)
+                if (krr->srcs[k]) ray_col_src_advise(krr->srcs[k], 0, ray_rowsel_meta(sel)->nrows);
         }
-    scratch_free(tb_hdr);
+        if (tasks > 1) ray_pool_dispatch_n(pool, agg_sel_bounds_fn, &bc, tasks);
+        else agg_sel_bounds_fn(&bc, 0, 0, 1);
+        if (krr->staged && (*err = ray_scan_fail_finish(krr->fail, tasks > 1 ? pool : NULL)) != NULL) {
+            scratch_free(tb_hdr); scratch_free(pre_hdr);
+            return false;
+        }
+        for (uint32_t t = 0; t < tasks; t++)
+            for (uint32_t k = 0; k < n_keys; k++) {
+                int64_t mn = bc.task_bounds[(2 * (size_t)t) * n_keys + k];
+                int64_t mx = bc.task_bounds[(2 * (size_t)t + 1) * n_keys + k];
+                if (mn < mins[k]) mins[k] = mn;
+                if (mx > maxs[k]) maxs[k] = mx;
+            }
+        scratch_free(tb_hdr);
+    }
     for (uint32_t k = 0; k < n_keys; k++) {
         if (!agg_dense_range(out, k, mins[k], maxs[k])) { scratch_free(pre_hdr); return false; }
     }

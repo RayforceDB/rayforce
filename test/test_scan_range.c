@@ -3815,6 +3815,87 @@ static test_result_t test_v2_decode_once(void) {
     PASS();
 }
 
+static bool sr_same_text(ray_t* a, ray_t* b);
+
+/* q over the tables t0 / t2: the same answer, the same routes, dense
+ * strategy and dense-plan availability (agg_route_stats). */
+static test_result_t sr_same_route(const char* t0, const char* t2, const char* q) {
+    agg_route_stats_t st[2];
+    ray_t* out[2] = { NULL, NULL };
+    for (int gen = 0; gen < 2; gen++) {
+        sr_evalf_ok("(set T %s)", gen ? t2 : t0);
+        agg_route_reset();
+        out[gen] = sr_eval(q);
+        st[gen] = agg_route_stats();
+        TEST_ASSERT_FMT(out[gen] && !RAY_IS_ERR(out[gen]), "gen %d: %s: %s", gen, q, out[gen] ? ray_error_msg() : "null");
+    }
+    for (int r = 0; r < AGG_ROUTE_COUNT; r++)
+        TEST_ASSERT_FMT(st[0].routes[r] == st[1].routes[r], "%s: route %d taken %llu / %llu times", q, r,
+                        (unsigned long long)st[0].routes[r], (unsigned long long)st[1].routes[r]);
+    TEST_ASSERT_FMT(st[0].dense_strategy == st[1].dense_strategy, "%s: dense strategy %d / %d", q,
+                    (int)st[0].dense_strategy, (int)st[1].dense_strategy);
+    TEST_ASSERT_FMT(st[0].dense_plan_available == st[1].dense_plan_available, "%s: dense plan %d / %d", q,
+                    (int)st[0].dense_plan_available, (int)st[1].dense_plan_available);
+    TEST_ASSERT_FMT(st[0].dense_local_slots == st[1].dense_local_slots, "%s: dense slots %llu / %llu", q,
+                    (unsigned long long)st[0].dense_local_slots, (unsigned long long)st[1].dense_local_slots);
+    TEST_ASSERT_TRUE(sr_same_text(out[0], out[1]));
+    ray_release(out[0]); ray_release(out[1]);
+    PASS();
+}
+
+/* The selection prescan's key bounds read only the chunks whose
+ * directory statistics can move them, and equal the full scan's: chunk 0
+ * holds the lowest minimum and chunk 1 the highest maximum on unselected
+ * rows, chunk 2's lowest selected key (2) lies below both of their
+ * selected keys, the other chunks lie inside; a nullable key with an
+ * all-null chunk and a chunk with nulls; filters of one row, of no row
+ * and of an all-null chunk only.  Route, plan and answer as generation 0. */
+static test_result_t test_v2_sel_bounds(void) {
+    const int64_t n = 10 * 65536 + 1234;
+    ray_t* k = ray_vec_new(RAY_I64, n); k->len = n;
+    ray_t* kn = ray_vec_new(RAY_I64, n); kn->len = n;
+    ray_t* s = ray_vec_new(RAY_I64, n); s->len = n;
+    int64_t* kd = ray_data(k); int64_t* knd = ray_data(kn); int64_t* sd = ray_data(s);
+    for (int64_t i = 0; i < n; i++) { kd[i] = 10 + (i * 7919) % 11; sd[i] = 1; }
+    kd[0] = -5; sd[0] = 0; kd[1] = 50; sd[1] = 0;                 /* chunk 0: the lowest minimum, unselected */
+    kd[65536] = 1000000; sd[65536] = 0;                           /* chunk 1: the highest maximum, unselected */
+    kd[131072 + 5] = 2;                                           /* chunk 2: the lowest selected key */
+    kd[131072 + 6] = 1; sd[131072 + 6] = 0; kd[131072 + 7] = 30; sd[131072 + 7] = 0;
+    for (int64_t i = 0; i < n; i++)
+        knd[i] = (i >= 4 * 65536 && i < 5 * 65536) || (i >= 5 * 65536 && i < 6 * 65536 && i % 100 == 0) ? NULL_I64 : kd[i];
+    kn->attrs |= RAY_ATTR_HAS_NULLS;
+    ray_env_set(ray_sym_intern("bk", 2), k); ray_env_set(ray_sym_intern("bkn", 3), kn); ray_env_set(ray_sym_intern("bs", 2), s);
+    ray_release(k); ray_release(kn); ray_release(s);
+    sr_eval_ok("(set SB (table [k kn s v w] (list bk bkn bs (til 656594) (% (til 656594) 3))))");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/sb2/\" SB {compress: true})");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/sb0/\" SB {compress: false})");
+    static const char* const qs[] = {
+        "(select {c: (count v) s: (sum v) from: T where: (== s 1) by: k})",
+        "(select {c: (count v) s: (sum v) from: T where: (== s 1) by: kn})",
+        "(select {c: (count v) s: (sum v) from: T where: (== s 1) by: {k: k w: w}})",
+        "(select {c: (count v) s: (sum v) from: T where: (== v 77) by: k})",                       /* one row */
+        "(select {c: (count v) s: (sum v) from: T where: (== v -1) by: k})",                       /* no row */
+        "(select {c: (count v) s: (sum v) from: T where: (and (>= v 262144) (< v 327680)) by: kn})",   /* the all-null chunk */
+        "(select {c: (count v) s: (sum v) from: T where: (and (>= v 131072) (< v 196608)) by: k})",    /* one chunk */
+        NULL };
+    for (int i = 0; qs[i]; i++) {
+        test_result_t r = sr_same_route("(.db.splayed.get \"" SR_TMP "/sb0/\")", "(.db.splayed.get \"" SR_TMP "/sb2/\")", qs[i]);
+        if (r.status != TEST_PASS) return r;
+    }
+    /* the dense plan of the first: chunks 0, 1 and 2 are read for its bounds,
+     * not all ten (a full prescan reads the key once more than the pass) */
+    sr_eval_ok("(set T (.db.splayed.get \"" SR_TMP "/sb2/\"))");
+    uint64_t k0 = sr_col_decoded("k");
+    agg_route_reset();
+    ray_t* res = sr_eval(qs[0]);
+    TEST_ASSERT_TRUE(res && !RAY_IS_ERR(res));
+    ray_release(res);
+    TEST_ASSERT_TRUE(agg_route_stats().dense_plan_available);
+    double kdec = sr_col_decodes("k", k0);
+    TEST_ASSERT_FMT(kdec < 1.5, "key decoded %.3fx", kdec);
+    PASS();
+}
+
 /* The pool this test resized is restored even when an assert fails first
  * (finding M11; test/test_parquet.c:262 resizes the pool the same way). */
 static void srr_pool_teardown(void) { ray_pool_destroy(); (void)ray_pool_init_total(0); srr_teardown(); }
@@ -4258,5 +4339,6 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/v2_f64_bits",        test_v2_f64_bits,        srr_setup, srr_teardown },
     { "scanrange/v2_route_error",     test_v2_route_error,     srr_setup, srr_teardown },
     { "scanrange/v2_decode_once",     test_v2_decode_once,     srr_setup, srr_pool_teardown },
+    { "scanrange/v2_sel_bounds",      test_v2_sel_bounds,      srr_setup, srr_teardown },
     { NULL, NULL, NULL, NULL },
 };
