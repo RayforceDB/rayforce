@@ -7958,14 +7958,18 @@ int64_t ray_query_test_count_compare(int8_t type, const void* data, int64_t n, i
 
 /* 1 handled (*out_count), 0 not this shape, -1 a range read failed (*err
  * owned). */
-static int try_count_simple_compare(ray_t* tbl, ray_t* where_expr, int64_t* out_count,
-                                    ray_t** err) {
-    if (!tbl || !where_expr || where_expr->type != RAY_LIST || ray_len(where_expr) != 3)
-        return 0;
-    ray_t** we = (ray_t**)ray_data(where_expr);
-    if (!we[0] || we[0]->type != -RAY_SYM) return 0;
+/* `(op col literal)` or `(op literal col)` with op one of < > == != <= >=,
+ * the column an unquoted name and the literal a non-null atom that is not a
+ * name (nor a quoted symbol naming a column): the column's name, the
+ * literal and the op as read column-first.  false for any other shape. */
+static bool count_cmp_parse(ray_t* tbl, ray_t* e, count_cmp_op_t* op_out,
+                            ray_t** col_out, ray_t** rhs_out) {
+    if (!tbl || !e || e->type != RAY_LIST || ray_len(e) != 3)
+        return false;
+    ray_t** we = (ray_t**)ray_data(e);
+    if (!we[0] || we[0]->type != -RAY_SYM) return false;
     ray_t* op_name = ray_sym_str(we[0]->i64);
-    if (!op_name) return 0;
+    if (!op_name) return false;
     const char* op_s = ray_str_ptr(op_name);
     size_t op_len = ray_str_len(op_name);
     count_cmp_op_t op = 0;
@@ -7978,7 +7982,7 @@ static int try_count_simple_compare(ray_t* tbl, ray_t* where_expr, int64_t* out_
         else if (op_s[0] == '<' && op_s[1] == '=') op = COUNT_CMP_LE;
         else if (op_s[0] == '>' && op_s[1] == '=') op = COUNT_CMP_GE;
     }
-    if (!op) return 0;
+    if (!op) return false;
 
     ray_t* col_expr = we[1];
     ray_t* rhs_expr = we[2];
@@ -7990,11 +7994,11 @@ static int try_count_simple_compare(ray_t* tbl, ray_t* where_expr, int64_t* out_
         op = count_cmp_flip(op);
     }
     if (!col_expr || col_expr->type != -RAY_SYM || (col_expr->attrs & ATTR_QUOTED))
-        return 0;
+        return false;
     if (!rhs_expr || !ray_is_atom(rhs_expr) ||
         (rhs_expr->type == -RAY_SYM && !(rhs_expr->attrs & ATTR_QUOTED)) ||
         RAY_ATOM_IS_NULL(rhs_expr))
-        return 0;
+        return false;
 
     /* B3 Part 2: a QUOTED -RAY_SYM rhs that NAMES a from-table column does
      * NOT compare against the literal symbol — inside a query it resolves to
@@ -8005,7 +8009,40 @@ static int try_count_simple_compare(ray_t* tbl, ray_t* where_expr, int64_t* out_
      * and is handled here as before. */
     if (rhs_expr->type == -RAY_SYM && (rhs_expr->attrs & ATTR_QUOTED) &&
         tbl_has_col(tbl, rhs_expr->i64))
-        return 0;
+        return false;
+    *op_out = op; *col_out = col_expr; *rhs_out = rhs_expr;
+    return true;
+}
+
+/* The literal suits the compare of a `type` column, as the single-compare
+ * count reads it: an integer, BOOL or temporal column takes an integer or
+ * temporal literal (no float; a temporal of another type only on TIMESTAMP),
+ * a SYM column a symbol under == / != only (#738).  `float_ok` also admits a
+ * numeric literal on an F32 / F64 column (the conjunction whitelist; the
+ * single-compare kernel has no float compare). */
+static bool count_cmp_types_ok(int8_t type, count_cmp_op_t op, ray_t* rhs, bool float_ok) {
+    switch (type) {
+    case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
+    case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP:
+        if (!is_numeric(rhs) && !is_temporal(rhs)) return false;
+        if (rhs->type == -RAY_F64 || rhs->type == -RAY_F32) return false;
+        if (is_temporal(rhs) && rhs->type != -type && type != RAY_TIMESTAMP) return false;
+        return true;
+    case RAY_SYM:
+        return rhs->type == -RAY_SYM && (op == COUNT_CMP_EQ || op == COUNT_CMP_NE);
+    case RAY_F32: case RAY_F64:
+        return float_ok && is_numeric(rhs);
+    default:
+        return false;
+    }
+}
+
+static int try_count_simple_compare(ray_t* tbl, ray_t* where_expr, int64_t* out_count,
+                                    ray_t** err) {
+    count_cmp_op_t op = 0;
+    ray_t* col_expr = NULL;
+    ray_t* rhs_expr = NULL;
+    if (!count_cmp_parse(tbl, where_expr, &op, &col_expr, &rhs_expr)) return 0;
 
     ray_col_meta_t cm;
     if (!ray_table_col_meta(tbl, col_expr->i64, &cm) || cm.len != ray_table_nrows(tbl)) return 0;
@@ -8029,38 +8066,15 @@ static int try_count_simple_compare(ray_t* tbl, ray_t* where_expr, int64_t* out_
      * declined generation 0 here.)  Ordered SYM compares decline below. */
     if (src.type != RAY_SYM && (col ? ray_vec_may_have_nulls(col) : src.may_null)) goto out;
 
-    switch (src.type) {
-    case RAY_BOOL:
-    case RAY_U8:
-    case RAY_I16:
-    case RAY_I32:
-    case RAY_I64:
-    case RAY_DATE:
-    case RAY_TIME:
-    case RAY_TIMESTAMP:
-        if (!is_numeric(rhs_expr) && !is_temporal(rhs_expr)) goto out;
-        break;
-    case RAY_SYM:
-        if (rhs_expr->type != -RAY_SYM) goto out;
-        /* Symbols order by string, not by intern id or domain position
-         * (#738): only EQ / NE are raw-id answers. */
-        if (op != COUNT_CMP_EQ && op != COUNT_CMP_NE) goto out;
-        break;
-    default:
-        goto out;
-    }
-
-    /* The raw compare below is right only for a literal in the column's own
-     * units.  A float literal decoded to 0 here, and a different temporal
-     * type compared days, milliseconds and nanoseconds as one unit.  A
-     * TIMESTAMP column takes a DATE or TIME literal on its nanosecond scale,
-     * as the eval path does; every other mix goes the general way. */
-    if (rhs_expr->type == -RAY_F64 || rhs_expr->type == -RAY_F32) goto out;
-    bool rhs_ns = false;
-    if (is_temporal(rhs_expr) && rhs_expr->type != -src.type) {
-        if (src.type != RAY_TIMESTAMP) goto out;
-        rhs_ns = true;
-    }
+    /* Symbols order by string, not by intern id or domain position (#738):
+     * only EQ / NE are raw-id answers.  The raw compare below is right only
+     * for a literal in the column's own units.  A float literal decoded to 0
+     * here, and a different temporal type compared days, milliseconds and
+     * nanoseconds as one unit.  A TIMESTAMP column takes a DATE or TIME
+     * literal on its nanosecond scale, as the eval path does; every other mix
+     * goes the general way. */
+    if (!count_cmp_types_ok(src.type, op, rhs_expr, false)) goto out;
+    bool rhs_ns = is_temporal(rhs_expr) && rhs_expr->type != -src.type;
 
     int64_t rhs = count_atom_i64(rhs_expr);
     if (rhs_ns) {
@@ -8133,6 +8147,32 @@ static bool count_where_is_and(ray_t* w) {
     return wn && ray_str_len(wn) == 3 && memcmp(ray_str_ptr(wn), "and", 3) == 0;
 }
 
+/* A conjunct the count shortcut answers as the select does: a nested
+ * `(and ...)` of such conjuncts, or a compare of a column with a literal the
+ * single-compare count would take (count_cmp_parse, count_cmp_types_ok),
+ * plus a numeric literal on a float column.  Nullability is not part of the
+ * shape: a null cell fails every compare in the selection as in the
+ * select. */
+static bool count_conj_ok(ray_t* tbl, ray_t* e, int depth) {
+    if (depth > 16) return false;
+    if (count_where_is_and(e)) {
+        ray_t** el = (ray_t**)ray_data(e);
+        for (int64_t i = 1; i < ray_len(e); i++)
+            if (!count_conj_ok(tbl, el[i], depth + 1)) return false;
+        return true;
+    }
+    count_cmp_op_t op = 0;
+    ray_t* col = NULL;
+    ray_t* rhs = NULL;
+    if (!count_cmp_parse(tbl, e, &op, &col, &rhs)) return false;
+    ray_col_meta_t cm;
+    if (!ray_table_col_meta(tbl, col->i64, &cm)) return false;
+    int8_t type = RAY_IS_PARTED(cm.type) ? (int8_t)RAY_PARTED_BASETYPE(cm.type) : cm.type;
+    /* a column shorter than the table is a scalar broadcast */
+    if (!RAY_IS_PARTED(cm.type) && cm.len != ray_table_nrows(tbl)) return false;
+    return count_cmp_types_ok(type, op, rhs, true);
+}
+
 ray_t* ray_try_count_select_expr(ray_t* expr, int* handled) {
     if (handled) *handled = 0;
     if (!expr || expr->type != RAY_LIST || ray_len(expr) != 2) return NULL;
@@ -8187,17 +8227,14 @@ ray_t* ray_try_count_select_expr(ray_t* expr, int* handled) {
     }
 
     /* A conjunction is counted off its selection below (the fused
-     * predicate, else the bool mask), never gathering a column, when every
-     * conjunct is a call reading a column: the shape the select's chained
-     * filters take.  A constant conjunct (`(and (> a 2) 0.0)`) is decided
-     * by the optimizer's folding, which only the select runs: decline. */
-    if (count_where_is_and(where_expr)) {
-        ray_t** we = (ray_t**)ray_data(where_expr);
-        for (int64_t i = 1; i < ray_len(where_expr); i++)
-            if (!we[i] || we[i]->type != RAY_LIST || !expr_refs_row_column(we[i], tbl)) {
-                ray_release(tbl);
-                return NULL;
-            }
+     * predicate, else the bool mask), never gathering a column, only when
+     * every conjunct is whitelisted (count_conj_ok).  Anything else (`or`,
+     * constants, aggregates, arithmetic) is the select's: its optimizer
+     * folds constants and its chained filters refine what an aggregate
+     * reads. */
+    if (count_where_is_and(where_expr) && !count_conj_ok(tbl, where_expr, 0)) {
+        ray_release(tbl);
+        return NULL;
     }
 
     int64_t direct_count = 0;
@@ -15306,19 +15343,24 @@ by_dict_done:
                     }
                     ray_t* cerr = NULL;
                     int all_atoms = 1;
-                    for (int64_t ni = 0; ni < n_nonaggs && !cerr && all_atoms; ni++) {
-                        if (ray_env_push_query_scope() != RAY_OK) { cerr = ray_error("oom", NULL); break; }
+                    /* One query scope for them all: a constant binds no
+                     * column (const_output_expr admits no column name). */
+                    if (ray_env_push_query_scope() != RAY_OK) cerr = ray_error("oom", NULL);
+                    else {
                         ray_t* bind_err_ = NULL;
-                        ray_t* _aqt = bind_referenced_query(tbl, &nonagg_exprs[ni], 1, &bind_err_);
-                        ray_t* v = bind_err_ ? bind_err_ : ray_eval(nonagg_exprs[ni]);
+                        ray_t* _aqt = bind_referenced_query(tbl, nonagg_exprs, n_nonaggs, &bind_err_);
+                        if (bind_err_) cerr = bind_err_;
+                        for (int64_t ni = 0; ni < n_nonaggs && !cerr && all_atoms; ni++) {
+                            ray_t* v = ray_eval(nonagg_exprs[ni]);
+                            if (!v || RAY_IS_ERR(v)) {
+                                cerr = v ? v : ray_error("domain", "select by: failed to evaluate non-aggregate column expression");
+                                break;
+                            }
+                            cvals[ni] = v;
+                            if (!ray_is_atom(v)) all_atoms = 0;
+                        }
                         g_active_query_table = _aqt;
                         ray_env_pop_scope();
-                        if (!v || RAY_IS_ERR(v)) {
-                            cerr = v ? v : ray_error("domain", "select by: failed to evaluate non-aggregate column expression");
-                            break;
-                        }
-                        cvals[ni] = v;
-                        if (!ray_is_atom(v)) all_atoms = 0;
                     }
                     for (int64_t ni = 0; ni < n_nonaggs && !cerr && all_atoms; ni++) {
                         ray_t* list_col = ray_alloc((size_t)n_groups * sizeof(ray_t*));

@@ -5399,8 +5399,6 @@ static test_result_t test_no_materialization(void) {
     PASS();
 }
 
-/* The parted arm of the gate: the same shapes over three partitions of a
- * generation-2 parted table (the in-place routes) against generation 0. */
 /* The parted battery tables: three partitions of eight columns, written as
  * generation 0 (np0) and generation 2 (np2). */
 static void sr_np_tables(void) {
@@ -5417,6 +5415,8 @@ static void sr_np_tables(void) {
 #define SR_NP0 "(.db.parted.get \"" SR_TMP "/np0\" 't)"
 #define SR_NP2 "(.db.parted.get \"" SR_TMP "/np2\" 't)"
 
+/* The parted arm of the gate: the same shapes over three partitions of a
+ * generation-2 parted table (the in-place routes) against generation 0. */
 static test_result_t test_no_materialization_parted(void) {
     sr_np_tables();
     static const char* const shapes[] = {
@@ -5462,6 +5462,54 @@ static test_result_t sr_count_and_on(const char* t0, const char* t2, const char*
     }
     PASS();
 }
+/* A conjunction the shortcut must leave to the select (Fix round 1): the
+ * count equals the gathering select's row count, or both fail with the same
+ * error, on both generations. */
+static test_result_t sr_count_and_declines(const char* t0, const char* t2, const char* w) {
+    char q[512], ref[512];
+    snprintf(q, sizeof q, "(count (select {from: T where: %s}))", w);
+    snprintf(ref, sizeof ref, "(count (at (select {from: T where: %s}) 'k))", w);
+    for (int gen = 0; gen < 2; gen++) {
+        sr_evalf_ok("(set T %s)", gen ? t2 : t0);
+        ray_error_clear();
+        ray_t* a = sr_eval(q);
+        char am[256]; snprintf(am, sizeof am, "%s", (a && RAY_IS_ERR(a) && ray_error_msg()) ? ray_error_msg() : "");
+        char ac[64]; snprintf(ac, sizeof ac, "%s", (a && RAY_IS_ERR(a)) ? ray_err_code(a) : "");
+        ray_error_clear();
+        ray_t* b = sr_eval(ref);
+        bool ae = !a || RAY_IS_ERR(a), be = !b || RAY_IS_ERR(b);
+        if (ae || be) {
+            TEST_ASSERT_FMT(ae && be && a && b && strcmp(ac, ray_err_code(b)) == 0 &&
+                            strcmp(am, ray_error_msg() ? ray_error_msg() : "") == 0,
+                            "gen %d %s: \"%s: %s\", the select \"%s: %s\"", gen, w, ac, am,
+                            be && b ? ray_err_code(b) : "-", be && ray_error_msg() ? ray_error_msg() : "");
+        } else {
+            TEST_ASSERT_FMT(a->type == -RAY_I64 && b->type == -RAY_I64 && a->i64 == b->i64,
+                            "gen %d %s: %lld, the select has %lld rows", gen, w,
+                            (long long)a->i64, (long long)b->i64);
+        }
+        sr_drop(a); sr_drop(b);
+    }
+    PASS();
+}
+/* Conjuncts outside the whitelist: constants nested in `or` / `and`, an
+ * aggregate (the select's chained filters refine its input), arithmetic,
+ * `if`, a non-bool conjunct (the select's error text), an ordered SYM
+ * compare, a quoted symbol naming a column, and `in`. */
+static const char* const sr_and_declined[] = {
+    "(and (> k 2) (or 0.0 (> g 1)))",
+    "(and (> k 2) (or (> g 1) 0.0))",
+    "(and (> k 2) (and (> g 1) 1.5))",
+    "(and (> k 2) (> k (avg k)))",
+    "(and (> k 2) (> (+ k 1) 5))",
+    "(and (> k 2) (if true (> g 1) (> g 2)))",
+    "(and (> k 2) (+ 1 (* 0 k)))",
+    "(and (< s 'c) (== b true))",                           /* SYM order is by string (#738) */
+    "(and (== s 'b) (> k 1000))",                           /* 'b names a column: a column compare */
+    "(and (> k 2) (in g [1 2]))",
+    NULL,
+};
+
 static test_result_t test_count_and(void) {
     static const char* const splayed[] = {
         "(and (== g 3) (!= u 0))",
@@ -5482,15 +5530,22 @@ static test_result_t test_count_and(void) {
      * executor reads every conjunct's column whole.  Answers only, pinned
      * at that count. */
     static const sr_gap_t sym[] = {
-        { "(and (== s 'b) (> k 1000))", 2 },
-        { "(and (< s 'c) (== b true))", 1 },                 /* SYM order is by string (#738) */
+        { "(and (== s 'c) (> k 1000))", 1 },
         { NULL, 0 },
     };
     for (int i = 0; sym[i].q; i++) {
         test_result_t r = sr_count_and_on(t0, t2, sym[i].q, sym[i].mat);
         if (r.status != TEST_PASS) return r;
     }
+    for (int i = 0; sr_and_declined[i]; i++) {
+        test_result_t r = sr_count_and_declines(t0, t2, sr_and_declined[i]);
+        if (r.status != TEST_PASS) return r;
+    }
     sr_np_tables();
+    for (int i = 0; sr_and_declined[i]; i++) {
+        test_result_t r = sr_count_and_declines(SR_NP0, SR_NP2, sr_and_declined[i]);
+        if (r.status != TEST_PASS) return r;
+    }
     static const char* const parted[] = {
         "(and (== g 3) (!= u 0))",
         "(and (> v 100) (< v 150000))",                      /* nullable I32 */
@@ -5503,8 +5558,7 @@ static test_result_t test_count_and(void) {
         if (r.status != TEST_PASS) return r;
     }
     static const sr_gap_t sym_parted[] = {
-        { "(and (== s 'b) (> k 1000))", 6 },
-        { "(and (< s 'c) (== b true))", 3 },
+        { "(and (== s 'c) (> k 1000))", 3 },
         { NULL, 0 },
     };
     for (int i = 0; sym_parted[i].q; i++) {
@@ -5567,6 +5621,45 @@ static test_result_t test_const_beside_parted_group(void) {
         ray_t* eq = sr_eval("(all (map (fn [c] (and (== (count (at R c)) (count (at B c))) (all (== (at R c) (at B c))))) (key B)))");
         TEST_ASSERT_FMT(eq && eq->type == -RAY_BOOL && eq->b8, "%s: differs from %s", shapes[i].q, shapes[i].bare);
         sr_drop(eq);
+    }
+    PASS();
+}
+
+/* Issue #767: a per-partition group-by divides avg and var/dev by the
+ * input's non-null count (it divided by the row count).  Three partitions
+ * of 35000 rows, an I64 key of five values (the per-partition route), a
+ * nullable F64 and a nullable I64, against the same rows in memory, with
+ * and without a where, a constant beside the group, and groups whose every
+ * input is null (null averages, as in memory); generation 0 and 2. */
+static test_result_t test_parted_nullable_stats(void) {
+    for (int gen = 0; gen <= 2; gen += 2)
+        for (int p = 0; p < 3; p++)
+            sr_evalf_ok("(.db.splayed.set \"" SR_TMP "/ns%d/2024.01.0%d/t/\" "
+                        "(table [g x y] (list (%% (til 35000) 5) "
+                        "(as 'F64 (map (fn [i] (if (== 0 (%% i 4)) 0N (* 1.0 i))) (til 35000))) "
+                        "(map (fn [i] (if (== 0 (%% i 3)) 0N i)) (til 35000)))) "
+                        "\"" SR_TMP "/ns%d/.sym\" {compress: %s})", gen, p + 1, gen, gen ? "true" : "false");
+    sr_eval_ok("(set jj (concat (til 35000) (concat (til 35000) (til 35000))))");
+    sr_eval_ok("(set M (table [g x y] (list (% jj 5) (as 'F64 (map (fn [i] (if (== 0 (% i 4)) 0N (* 1.0 i))) jj)) "
+               "(map (fn [i] (if (== 0 (% i 3)) 0N i)) jj))))");
+    static const char* const qs[] = {
+        "(select {a: (avg x) b: (avg y) from: T by: g asc: g})",
+        "(select {v: (var x) w: (var y) vp: (var_pop x) wp: (var_pop y) from: T by: g asc: g})",
+        "(select {d: (dev x) e: (dev y) s: (stddev x) t: (stddev y) sp: (stddev_pop y) from: T by: g asc: g})",
+        "(select {a: (avg x) b: (avg y) v: (var x) d: (dev y) from: T where: (> y 100) by: g asc: g})",
+        "(select {one: 1 a: (avg x) v: (var y) from: T by: g asc: g})",
+        "(select {a: (avg x) v: (var x) d: (dev x) c: (count x) from: T where: (== 0 (% y 4)) by: g asc: g})",
+        NULL,
+    };
+    for (int gen = 0; gen <= 2; gen += 2) {
+        char tp[256];
+        snprintf(tp, sizeof tp, "(.db.parted.get \"" SR_TMP "/ns%d\" 't)", gen);
+        for (int i = 0; qs[i]; i++) {
+            int64_t r0 = ray_group_perpart_runs();
+            test_result_t r = sr_same_on("M", tp, qs[i], UINT64_MAX);
+            if (r.status != TEST_PASS) return r;
+            TEST_ASSERT_FMT(ray_group_perpart_runs() > r0, "gen %d %s: not the per-partition route", gen, qs[i]);
+        }
     }
     PASS();
 }
@@ -5696,6 +5789,7 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/no_materialization", test_no_materialization, srr_setup, srr_teardown },
     { "scanrange/no_materialization_parted", test_no_materialization_parted, srr_setup, srr_teardown },
     { "scanrange/count_and",          test_count_and,          srr_setup, srr_teardown },
+    { "scanrange/parted_nullable_stats", test_parted_nullable_stats, srr_setup, srr_teardown },
     { "scanrange/const_beside_parted_group", test_const_beside_parted_group, srr_setup, srr_teardown },
     { NULL, NULL, NULL, NULL },
 };

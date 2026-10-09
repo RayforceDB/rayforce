@@ -18698,8 +18698,9 @@ static ray_t* pp_concat_varlen(int8_t type, ray_t** srcs, int64_t n_srcs,
  * then merges the small partial results via a second exec_group pass.
  *
  * Merge ops: SUM→SUM, COUNT→SUM, MIN→MIN, MAX→MAX, FIRST→FIRST, LAST→LAST.
- * AVG: decomposed into SUM+COUNT per partition, merged, then divided.
- * STDDEV/VAR: decomposed into SUM(x)+SUM(x²)+COUNT(x) per partition,
+ * AVG: decomposed into SUM+N per partition, merged, then divided, where N is
+ *   the input's non-null count (a SUM of its not-null indicator).
+ * STDDEV/VAR: decomposed into SUM(x)+SUM(x²)+N per partition,
  *   merged with SUM, then final variance/stddev computed from merged totals.
  *
  * Pushed-down WHERE (g->selection set): the global selection covers the parted
@@ -18930,13 +18931,16 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
         std_sq_slot[i] = part_n_aggs;
         part_ops[part_n_aggs++] = OP_SUM;  /* SUM(x²) */
     }
-    /* Append COUNT for each AVG column */
+    /* Append the non-null count of each AVG column, then of each STDDEV/VAR
+     * column: a SUM over the input's not-null indicator (built per partition
+     * below).  OP_COUNT counts rows, nulls included, while SUM(x) and
+     * SUM(x²) skip nulls, so a row count would divide a nullable input's
+     * sums by too many (#767). */
     for (uint32_t i = 0; i < n_avg; i++)
-        part_ops[part_n_aggs++] = OP_COUNT;
-    /* Append COUNT for each STDDEV/VAR column */
+        part_ops[part_n_aggs++] = OP_SUM;
     for (uint32_t i = 0; i < n_std; i++) {
         std_cnt_slot[i] = part_n_aggs;
-        part_ops[part_n_aggs++] = OP_COUNT;
+        part_ops[part_n_aggs++] = OP_SUM;
     }
 
     /* First-row slot: an unordered `take: N` (group_limit > 0) keeps the
@@ -19182,6 +19186,14 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                  * for large x (matters near INT_MAX). */
                 ray_op_t* xf = (x->out_type == RAY_F64) ? x : ray_cast(pg, x, RAY_F64);
                 pagg_ins[sq] = ray_mul(pg, xf, xf);
+            }
+            /* The non-null count slots (AVG's, then STDDEV/VAR's): SUM of
+             * the input's not-null indicator as I64. */
+            for (uint32_t j = 0; j < n_avg + n_std; j++) {
+                uint32_t cs = j < n_avg ? n_aggs + n_std + j : std_cnt_slot[j - n_avg];
+                ray_op_t* nn = ray_not(pg, ray_isnull(pg, pagg_ins[cs]));
+                pagg_ins[cs] = nn ? ray_cast(pg, nn, RAY_I64) : NULL;
+                if (!pagg_ins[cs]) { ray_graph_free(pg); pp_release_sub(g, sub); goto batch_fail; }
             }
 
             ray_op_t* proot = ray_group(pg, pkeys, n_part_keys,
@@ -19609,17 +19621,19 @@ batch_fail:
                 avg_col->len = nrows;
 
                 double* out = (double*)ray_data(avg_col);
+                const int64_t* cv = (const int64_t*)ray_data(cnt_col);
                 if (sum_col->type == RAY_F64) {
                     const double* sv = (const double*)ray_data(sum_col);
-                    const int64_t* cv = (const int64_t*)ray_data(cnt_col);
                     for (int64_t r = 0; r < nrows; r++)
-                        out[r] = cv[r] > 0 ? ray_f64_fin(sv[r] / (double)cv[r]) : 0.0;
+                        out[r] = cv[r] > 0 ? ray_f64_fin(sv[r] / (double)cv[r]) : NULL_F64;
                 } else {
                     const int64_t* sv = (const int64_t*)ray_data(sum_col);
-                    const int64_t* cv = (const int64_t*)ray_data(cnt_col);
                     for (int64_t r = 0; r < nrows; r++)
-                        out[r] = cv[r] > 0 ? ray_f64_fin((double)sv[r] / (double)cv[r]) : 0.0;
+                        out[r] = cv[r] > 0 ? ray_f64_fin((double)sv[r] / (double)cv[r]) : NULL_F64;
                 }
+                /* a group whose every input is null averages to null */
+                for (int64_t r = 0; r < nrows; r++)
+                    if (cv[r] <= 0) ray_vec_set_null(avg_col, r, true);
                 /* Single-null float model: flip HAS_NULLS for any avg
                  * canonicalized to NULL_F64 (overflow). */
                 grp_finalize_nulls(avg_col);
