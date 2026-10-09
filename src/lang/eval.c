@@ -55,6 +55,30 @@
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
+
+/* Row provenance of the value the most recent ray_eval returned: 1 derived
+ * from the active query's rows (a query frame's column binding, a helper's
+ * source column, a row-wise builtin over one, a compiled helper's result),
+ * 0 not, -1 unknown (an interpreted closure's result).  Read by the caller
+ * right after the ray_eval that produced it. */
+static _Thread_local int8_t g_eval_rows = -1;
+
+/* Tri-state combination: a row operand makes the result rows; otherwise an
+ * unknown operand makes it unknown. */
+static inline int8_t rows_join(int8_t a, int8_t b) {
+    if (a == 1 || b == 1) return 1;
+    if (a < 0 || b < 0) return -1;
+    return 0;
+}
+/* The VM's encoding of the same: 0 no, 1 rows, 2 unknown. */
+static inline uint8_t vrows_join(uint8_t a, uint8_t b) {
+    if (a == 1 || b == 1) return 1;
+    if (a == 2 || b == 2) return 2;
+    return 0;
+}
+static inline uint8_t vrows_from(int8_t r) { return r < 0 ? 2 : (uint8_t)r; }
+static inline int8_t  vrows_to(uint8_t r)  { return r == 2 ? -1 : (int8_t)r; }
+
 #include <math.h>
 #include <signal.h>
 #include <time.h>
@@ -1912,11 +1936,12 @@ ray_t* ray_let_fn(ray_t* name_obj, ray_t* val_expr) {
         return ray_error("type", "let: name must be a symbol, got %s", ray_type_name(name_obj->type));
     ray_t* val = ray_eval(val_expr);
     if (RAY_IS_ERR(val)) return val;
+    uint8_t rows = vrows_from(g_eval_rows);   /* the local keeps its value's provenance */
     /* Materialize lazy handles before binding */
     if (ray_is_lazy(val))
         val = ray_lazy_materialize(val);
     if (RAY_IS_ERR(val)) return val;
-    ray_err_t err = ray_env_set_local(name_obj->i64, val);
+    ray_err_t err = ray_env_set_local_rows(name_obj->i64, val, rows);
     if (err != RAY_OK) { ray_release(val); return ray_error(ray_err_code_str(err), NULL); }
     return val;
 }
@@ -2234,41 +2259,17 @@ static ray_t* vm_exec_rows(ray_t* lambda, ray_t** call_args, int64_t argc,
  * a name that was no longer "self", shadowing whatever variable owned it. */
 static int64_t g_call_self_sym = -1;
 
-/* Query fallback carries argument provenance through helpers the planner
- * cannot inline. A nested query installs its own column context. */
-typedef struct query_call_scope {
-    struct query_call_scope* prev;
-    ray_t* params;
-    uint64_t rows;
-    int32_t depth;
-    bool named;          /* called by name: text written outside the query */
-} query_call_scope_t;
-static _Thread_local query_call_scope_t* g_query_call_scope;
-/* Row provenance of the value the most recent ray_eval returned: 1 derived
- * from the active query's rows, 0 not, -1 unknown (an interpreted helper's
- * result).  Read by the caller right after the ray_eval that produced it. */
-static _Thread_local int8_t g_eval_rows = -1;
-
+/* Inside a helper called from a query (a call frame above the query's
+ * frames).  Literal symbols keep bytecode's meaning in a helper called by
+ * name; a lambda written inline in the query is query text and follows the
+ * column rule. */
 bool ray_eval_query_helper_active(void) {
-    return g_query_call_scope &&
-           !ray_env_query_scope_above(g_query_call_scope->depth);
+    return ray_env_in_query_helper(NULL);
 }
 
-/* A literal symbol keeps bytecode's meaning inside a named helper's body.
- * A lambda written inline in the query is query text: its literals follow
- * the query's column rule, as on the planned path. */
 bool ray_eval_query_helper_literals(void) {
-    return ray_eval_query_helper_active() && g_query_call_scope->named;
-}
-
-int ray_eval_query_param_rows(int64_t sym_id) {
-    if (!ray_eval_query_helper_active()) return -1;
-    query_call_scope_t* call = g_query_call_scope;
-    if (ray_env_lexical_scope_depth(sym_id) != call->depth) return 0;
-    const int64_t* ids = ray_data(call->params);
-    for (int64_t i = 0; i < call->params->len && i < 64; i++)
-        if (ids[i] == sym_id) return (call->rows >> i) & 1;
-    return 0;
+    bool named = false;
+    return ray_env_in_query_helper(&named) && named;
 }
 
 /* Ordinary calls use bytecode; query fallback interprets the retained AST
@@ -2288,12 +2289,12 @@ static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
         /* Row provenance rides on the VM stack.  The call frame hides the
          * query's aliases and locals; source columns stay visible through
          * its table, then the globals, as in a body the planner inlines. */
-        if (ray_env_push_call_scope(ray_query_helper_table()) != RAY_OK)
+        if (ray_env_push_call_scope(ray_query_helper_table(), named) != RAY_OK)
             return ray_error("oom", NULL);
         uint8_t result_rows = 0;
         ray_t* result = vm_exec_rows(lambda, call_args, argc, row_args, &result_rows);
         ray_env_pop_scope();
-        if (out_rows) *out_rows = (int8_t)result_rows;
+        if (out_rows) *out_rows = vrows_to(result_rows);
         return result;
     }
 
@@ -2309,17 +2310,13 @@ static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
     bool has_closure = LAMBDA_CLOSURE(lambda) != NULL;
     if (has_closure && ray_env_push_capture(LAMBDA_CLOSURE(lambda)) != RAY_OK)
         return ray_error("oom", NULL);
-    if (query && has_closure) ray_env_mark_call_scope(ray_query_helper_table());
+    if (query && has_closure) ray_env_mark_call_scope(ray_query_helper_table(), named);
     if (ray_env_push_scope() != RAY_OK) {
         if (has_closure) ray_env_pop_scope();
         return ray_error("oom", NULL);
     }
 
-    if (query && !has_closure) ray_env_mark_call_scope(ray_query_helper_table());
-    query_call_scope_t call = { .prev = g_query_call_scope, .params = params_list,
-                               .rows = row_args, .depth = ray_env_scope_depth(),
-                               .named = named || ray_eval_query_helper_literals() };
-    if (query) g_query_call_scope = &call;
+    if (query && !has_closure) ray_env_mark_call_scope(ray_query_helper_table(), named);
 
     /* Bind 'self' to the current lambda for recursion */
     if (g_call_self_sym < 0) g_call_self_sym = ray_sym_intern("self", 4);
@@ -2334,16 +2331,15 @@ static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
             ray_retain(arg);
             arg = ray_lazy_materialize(arg);
             if (!arg || RAY_IS_ERR(arg)) {
-                if (query) g_query_call_scope = call.prev;
                 ray_env_pop_scope();
                 if (has_closure) ray_env_pop_scope();
                 return arg ? arg : ray_error("type", NULL);
             }
-            (void)ray_env_set_local(param_ids[i], arg);
-            ray_release(arg);
-        } else {
-            (void)ray_env_set_local(param_ids[i], arg);
         }
+        /* Parameters carry the arguments' row provenance into the body. */
+        uint8_t rows = query && i < 64 ? (uint8_t)((row_args >> i) & 1) : 0;
+        (void)ray_env_set_local_rows(param_ids[i], arg, rows);
+        if (arg != call_args[i]) ray_release(arg);
     }
 
     int64_t body_count = ray_len(body);
@@ -2353,14 +2349,12 @@ static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
         if (result) ray_release(result);
         result = ray_eval(body_exprs[i]);
         if (RAY_IS_ERR(result)) {
-            if (query) g_query_call_scope = call.prev;
             ray_env_pop_scope();
             if (has_closure) ray_env_pop_scope();
             return result;
         }
     }
 
-    if (query) g_query_call_scope = call.prev;
     ray_env_pop_scope();
     if (has_closure) ray_env_pop_scope();
     return result;
@@ -2408,6 +2402,16 @@ static bool vm_fn_rowwise(const ray_t* fn_obj) {
     return rowwise;
 }
 
+/* Control forms return one of their operands, so the operand's provenance
+ * is the form's; every other special form builds a new value. */
+static bool form_inherits_rows(const ray_t* head) {
+    static const char* const forms[] = { "if", "cond", "do", "let", "and", "or", "return", "try" };
+    const char* name = ray_fn_name(head);
+    for (size_t i = 0; i < sizeof forms / sizeof *forms; i++)
+        if (strcmp(name, forms[i]) == 0) return true;
+    return false;
+}
+
 static bool vm_text_value(const ray_t* v) {
     return v->type == RAY_SYM || v->type == RAY_STR || v->type == -RAY_SYM || v->type == -RAY_STR;
 }
@@ -2436,25 +2440,26 @@ static ray_t* vm_call_binary(ray_t* fn_obj, ray_t* left, ray_t* right,
     if (RAY_UNLIKELY(RAY_IS_NULL(left) || RAY_IS_NULL(right))) {
         result = (fn == (ray_binary_fn)ray_eq_fn || fn == (ray_binary_fn)ray_neq_fn)
                  ? fn(left, right) : ray_error("type", NULL);
-    } else if (fn == ray_concat_fn && (left_rows || right_rows) &&
+    } else if (fn == ray_concat_fn && (left_rows == 1 || right_rows == 1) &&
                vm_text_value(left) && vm_text_value(right) &&
-               (left_rows || ray_is_atom(left)) && (right_rows || ray_is_atom(right))) {
+               (left_rows == 1 || ray_is_atom(left)) && (right_rows == 1 || ray_is_atom(right))) {
         /* Query text concat: a column's cells joined row by row, as the
          * planner does for the query's own expressions.  Without row data
          * among the operands, a call inside a function keeps ordinary
          * collection semantics; a bound vector never has row provenance. */
         result = ray_concat_text_fn(left, right,
-                                    (left->type == -RAY_STR && left_rows) ||
-                                    (right->type == -RAY_STR && right_rows));
-        *out_rows = left_rows | right_rows;
+                                    (left->type == -RAY_STR && left_rows == 1) ||
+                                    (right->type == -RAY_STR && right_rows == 1));
+        *out_rows = 1;
     /* Fast path: atoms have negative type — skip collection check entirely.
      * Only call is_collection when at least one arg has type >= 0 (vector/list). */
-    } else if ((fn_obj->attrs & RAY_FN_ATOMIC) && (left->type >= 0 || right->type >= 0)) {
-        result = atomic_map_binary_op(fn, RAY_FN_OPCODE(fn_obj), left, right);
-        *out_rows = (left_rows | right_rows) && vm_fn_rowwise(fn_obj);
     } else {
-        result = fn(left, right);
-        *out_rows = (left_rows | right_rows) && vm_fn_rowwise(fn_obj);
+        uint8_t joined = vrows_join(left_rows, right_rows);
+        if ((fn_obj->attrs & RAY_FN_ATOMIC) && (left->type >= 0 || right->type >= 0))
+            result = atomic_map_binary_op(fn, RAY_FN_OPCODE(fn_obj), left, right);
+        else
+            result = fn(left, right);
+        *out_rows = joined && vm_fn_rowwise(fn_obj) ? joined : 0;
     }
     ray_release(left);
     ray_release(right);
@@ -2538,10 +2543,6 @@ static ray_t* vm_exec_rows(ray_t* lambda, ray_t** call_args, int64_t argc,
     ray_t **cpool = (ray_t **)ray_data(LAMBDA_CONSTS(lambda));
     int32_t ip = 0;
     ray_t *vm_err_obj = NULL;
-    /* An OP_SCOPE_BEGIN..END window inside a query: the tree walker sees
-     * the locals as names and reads their row provenance from here. */
-    query_call_scope_t win_scope;
-    bool win_active = false;
 
 #define DISPATCH() goto *dispatch[code[ip++]]
 #define PUSH(v)    do { if (vm.sp >= VM_STACK_SIZE) goto vm_error_limit; vm.rows[vm.sp] = 0; vm.ps[vm.sp++] = (v); } while(0)
@@ -2551,7 +2552,6 @@ static ray_t* vm_exec_rows(ray_t* lambda, ray_t** call_args, int64_t argc,
 #define PEEK()     (vm.ps[vm.sp - 1])
 #define LOCAL(s)   (vm.ps[vm.fp + (s)])
 #define LROWS(s)   (vm.rows[vm.fp + (s)])
-#define WIN_CLOSE() do { if (win_active) { g_query_call_scope = win_scope.prev; ray_release(win_scope.params); win_active = false; } } while (0)
 
     DISPATCH();
 
@@ -2736,7 +2736,7 @@ op_call1: {
         result = atomic_map_unary(fn, arg);
     else
         result = fn(arg);
-    uint8_t result_rows = arg_rows && vm_fn_rowwise(fn_obj);
+    uint8_t result_rows = arg_rows && vm_fn_rowwise(fn_obj) ? arg_rows : 0;
     ray_release(arg);
     ray_release(fn_obj);
     if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }
@@ -2772,7 +2772,7 @@ op_calln: {
     uint8_t args_rows = 0;
     for (int32_t i = n - 1; i >= 0; i--) {
         fn_args[i] = POP();
-        args_rows |= POPPED_ROWS();
+        args_rows = vrows_join(args_rows, POPPED_ROWS());
     }
     ray_t *fn_obj = POP();
     if (RAY_UNLIKELY(fn_is_restricted(fn_obj))) {
@@ -2787,7 +2787,7 @@ op_calln: {
         if (err) { ray_release(fn_obj); vm_err_obj = err; goto vm_error; }
     }
     ray_t *result = fn(fn_args, n);
-    uint8_t result_rows = args_rows && vm_fn_rowwise(fn_obj);
+    uint8_t result_rows = args_rows && vm_fn_rowwise(fn_obj) ? args_rows : 0;
     for (int32_t i = 0; i < n; i++)
         ray_release(fn_args[i]);
     ray_release(fn_obj);
@@ -2801,11 +2801,13 @@ op_callf: {
     if (n > 64) goto vm_error;
     ray_t *fn_args[64];
     uint8_t arg_rows[64];
+    uint8_t args_any = 0;
     uint64_t args_bits = 0;
     for (int32_t i = n - 1; i >= 0; i--) {
         fn_args[i] = POP();
         arg_rows[i] = POPPED_ROWS();
-        if (arg_rows[i]) args_bits |= UINT64_C(1) << i;
+        args_any = vrows_join(args_any, arg_rows[i]);
+        if (arg_rows[i] == 1) args_bits |= UINT64_C(1) << i;
     }
     ray_t *fn_obj = POP();
 
@@ -2870,6 +2872,7 @@ op_callf: {
     /* Non-lambda or uncompiled: dispatch by type */
     {
         ray_t *result;
+        int8_t lambda_rows = -1;
         switch (fn_obj->type) {
         case RAY_UNARY:
             if (fn_is_restricted(fn_obj)) { for (int32_t i = 0; i < n; i++) ray_release(fn_args[i]); result = ray_error("access", "restricted"); break; }
@@ -2939,7 +2942,7 @@ unary_done:
             /* An uncompiled lambda (a closure): interpreted, with the
              * arguments' row provenance when a query is active. */
             bool in_query = ray_active_query_table() != NULL;
-            result = call_lambda_impl(fn_obj, fn_args, n, in_query, args_bits, true, NULL);
+            result = call_lambda_impl(fn_obj, fn_args, n, in_query, args_bits, true, &lambda_rows);
             for (int32_t i = 0; i < n; i++) ray_release(fn_args[i]);
             break;
         }
@@ -2948,9 +2951,9 @@ unary_done:
             result = ray_error("type", "apply: head is not callable, got %s", ray_type_name(fn_obj->type));
             break;
         }
-        uint8_t result_rows = args_bits &&
-            (fn_obj->type == RAY_UNARY || fn_obj->type == RAY_BINARY || fn_obj->type == RAY_VARY) &&
-            vm_fn_rowwise(fn_obj);
+        uint8_t result_rows = fn_obj->type == RAY_LAMBDA ? vrows_from(lambda_rows)
+            : args_any && (fn_obj->type == RAY_UNARY || fn_obj->type == RAY_BINARY || fn_obj->type == RAY_VARY) &&
+              vm_fn_rowwise(fn_obj) ? args_any : 0;
         ray_release(fn_obj);
         if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }
         PUSHR(result, result_rows);
@@ -2994,7 +2997,7 @@ op_calld: {
         ray_t *result = ray_eval(ast);
         ray_release(ast);
         if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }
-        PUSH(result);
+        PUSHR(result, vrows_from(g_eval_rows));
         DISPATCH();
     }
     /* n>0: build call list and eval */
@@ -3019,7 +3022,7 @@ op_calld: {
     ray_t *result = ray_eval(call_list);
     ray_release(call_list);
     if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }
-    PUSH(result);
+    PUSHR(result, vrows_from(g_eval_rows));
     DISPATCH();
 }
 
@@ -3047,7 +3050,6 @@ op_ret: {
     if (vm.rp == 0) {
         /* Top-level return */
         if (out_rows) *out_rows = result_rows;
-        WIN_CLOSE();
         ray_release(vm.fn);
 #undef vm
         ray_free(vm_block);
@@ -3102,7 +3104,7 @@ op_tryh: {
     ray_release(err_val);
     ray_release(handler);
     if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }
-    PUSH(result);
+    PUSHR(result, 2);   /* a handler's value: provenance unknown */
     DISPATCH();
 }
 
@@ -3124,22 +3126,13 @@ op_scope_begin: {
      * the value of syms[i]) plus self into a fresh scope frame so the
      * OP_CALLD that follows can resolve them via the tree walker. */
     ray_t *syms = POP();
+    /* The locals' row provenance travels with the bindings, so the tree
+     * walker inside the window sees it as it sees any local's. */
     ray_err_t err = ray_env_scope_bind((const int64_t*)ray_data(syms),
                                        (int32_t)syms->len,
-                                       &vm.ps[vm.fp], vm.fn);
-    if (err != RAY_OK) { ray_release(syms); goto vm_error_limit; }
-    if (ray_active_query_table() && !win_active) {
-        /* The tree walker inside this window reads the locals as names;
-         * hand it their row provenance as an interpreted call would. */
-        uint64_t bits = 0;
-        for (int64_t i = 0; i < syms->len && i < 64; i++)
-            if (LROWS(i)) bits |= UINT64_C(1) << i;
-        win_scope = (query_call_scope_t){ .prev = g_query_call_scope, .params = syms,
-                                          .rows = bits, .depth = ray_env_scope_depth(),
-                                          .named = true };
-        g_query_call_scope = &win_scope;
-        win_active = true;              /* keeps the ref to syms */
-    } else ray_release(syms);
+                                       &vm.ps[vm.fp], &vm.rows[vm.fp], vm.fn);
+    ray_release(syms);
+    if (err != RAY_OK) goto vm_error_limit;
     DISPATCH();
 }
 
@@ -3154,9 +3147,8 @@ op_scope_end: {
     for (int64_t i = 0; i < nsync; i++) before[i] = LOCAL(i);
     ray_env_scope_sync((const int64_t*)ray_data(syms),
                        (int32_t)syms->len, &vm.ps[vm.fp]);
-    for (int64_t i = 0; i < nsync; i++) if (LOCAL(i) != before[i]) LROWS(i) = 0;
+    for (int64_t i = 0; i < nsync; i++) if (LOCAL(i) != before[i]) LROWS(i) = 2;
     ray_release(syms);
-    WIN_CLOSE();
     DISPATCH();
 }
 
@@ -3206,7 +3198,6 @@ vm_error_cleanup: {
          * OP_SCOPE_END) */
         while (ray_env_scope_depth() > trap.scope_depth)
             ray_env_pop_scope();
-        if (win_active && ray_env_scope_depth() < win_scope.depth) WIN_CLOSE();
 
         /* Get error value.  If __VM->raise_val is set, a user (raise x)
          * just ran — its value is the real payload the handler must
@@ -3242,7 +3233,6 @@ vm_error_cleanup: {
     /* Unwind any scope frames this exec materialized and didn't end */
     while (ray_env_scope_depth() > scope_base)
         ray_env_pop_scope();
-    WIN_CLOSE();
 
     /* Build error trace: current frame + callers from return stack */
     add_error_frame(vm.fn, ip > 0 ? ip - 1 : 0);
@@ -3275,7 +3265,6 @@ vm_error_cleanup: {
 #undef PEEK
 #undef LOCAL
 #undef LROWS
-#undef WIN_CLOSE
 #undef vm
 }
 
@@ -4071,7 +4060,7 @@ ray_t* ray_eval(ray_t* obj) {
              * it directly rather than treating it as a found value. */
             if (RAY_IS_ERR(val)) { ret = val; goto out; }
             /* env_resolve hands back an owned ref; no extra retain. */
-            rows = val_rows || ray_eval_query_param_rows(obj->i64) > 0;
+            rows = vrows_to(val_rows);
             ret = val; goto out;
         }
         /* Literal symbol (ATTR_QUOTED set).  Inside a query, a literal that
@@ -4194,7 +4183,7 @@ ray_t* ray_eval(ray_t* obj) {
                 if (!left || RAY_IS_ERR(left)) { ray_release(head); ret = left ? left : ray_error("type", NULL); goto out; }
                 ray_t* right = ray_eval(elems[2]);
                 int8_t right_rows = g_eval_rows;
-                rows = rowwise && (left_rows > 0 || right_rows > 0);
+                rows = rowwise ? rows_join(left_rows, right_rows) : 0;
                 ray_release(head);
                 if (!right || RAY_IS_ERR(right)) { ray_release(left); ret = right ? right : ray_error("type", NULL); goto out; }
                 if (ray_is_lazy(left)) {
@@ -4232,7 +4221,7 @@ ray_t* ray_eval(ray_t* obj) {
                 }
             }
             ray_t* arg = ray_eval(elems[1]);
-            rows = rowwise && g_eval_rows > 0;
+            rows = rowwise ? g_eval_rows : 0;
             ray_release(head);
             if (arg && RAY_IS_ERR(arg)) { ret = arg; goto out; }
             /* Materialise lazy arg for non-lazy-aware fns.
@@ -4261,9 +4250,10 @@ ray_t* ray_eval(ray_t* obj) {
             ray_binary_fn fn = (ray_binary_fn)(uintptr_t)head->i64;
             uint8_t fn_attrs = head->attrs;
             if (fn_attrs & RAY_FN_SPECIAL_FORM) {
+                bool inherits = form_inherits_rows(head);
                 ray_release(head);
                 ret = fn(elems[1], elems[2]);
-                rows = g_eval_rows;   /* a form returns one of its operands */
+                rows = inherits ? g_eval_rows : 0;
                 goto out;
             }
             bool rowwise = ray_active_query_table() && vm_fn_rowwise(head);
@@ -4317,7 +4307,7 @@ ray_t* ray_eval(ray_t* obj) {
             uint16_t fn_opcode = RAY_FN_OPCODE(head);
             ray_release(head);
             ray_t* result;
-            rows = rowwise && (left_rows > 0 || right_rows > 0);
+            rows = rowwise ? rows_join(left_rows, right_rows) : 0;
             if ((fn_attrs & RAY_FN_ATOMIC) && (is_collection(left) || is_collection(right)))
                 result = atomic_map_binary_op(fn, fn_opcode, left, right);
             else if (fn == ray_concat_fn && ray_active_query_table() &&
@@ -4354,18 +4344,21 @@ ray_t* ray_eval(ray_t* obj) {
             if (fn_is_restricted(head)) { ray_release(head); ret = ray_error("access", "restricted"); goto out; }
             ray_vary_fn fn = (ray_vary_fn)(uintptr_t)head->i64;
             if (head->attrs & RAY_FN_SPECIAL_FORM) {
+                /* A control form returns one of its operands; any other
+                 * form (a query, a table op) builds a new value. */
+                bool inherits = form_inherits_rows(head);
                 ray_release(head);
                 ret = fn(elems + 1, n - 1);
-                rows = g_eval_rows;   /* a form returns one of its operands */
+                rows = inherits ? g_eval_rows : 0;
                 goto out;
             }
             int64_t argc = n - 1;
             if (argc > 64) { ray_release(head); ret = ray_error("domain", "call: too many args, max 64, got %lld", (long long)argc); goto out; }
             ray_t* args[64];
-            bool any_rows = false;
+            int8_t any_rows = 0;
             for (int64_t i = 0; i < argc; i++) {
                 args[i] = ray_eval(elems[i + 1]);
-                any_rows |= g_eval_rows > 0;
+                any_rows = rows_join(any_rows, g_eval_rows);
                 if (!args[i] || RAY_IS_ERR(args[i])) {
                     ray_t* err = (!args[i]) ? ray_error("type", NULL) : args[i];
                     for (int64_t j = 0; j < i; j++) ray_release(args[j]);
@@ -4373,7 +4366,7 @@ ray_t* ray_eval(ray_t* obj) {
                     ret = err; goto out;
                 }
             }
-            rows = any_rows && ray_active_query_table() && vm_fn_rowwise(head);
+            rows = any_rows && ray_active_query_table() && vm_fn_rowwise(head) ? any_rows : 0;
             if (!(head->attrs & RAY_FN_LAZY_AWARE)) {
                 ray_t* err = materialize_owned_args(args, argc);
                 if (err) { ray_release(head); ret = err; goto out; }

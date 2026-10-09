@@ -144,10 +144,17 @@ int64_t ray_env_builtin_sym(const ray_t* fn);
 ray_err_t ray_env_push_scope(void);
 /* A named-call boundary: lookups below it see only `table`'s columns
  * (NULL for none) and then the globals. */
-ray_err_t ray_env_push_call_scope(ray_t* table);
+ray_err_t ray_env_push_call_scope(ray_t* table, bool named);
 /* Turn the top frame into a call boundary (its current bindings stay
  * ordinary locals; source columns bind above them). */
-void      ray_env_mark_call_scope(ray_t* table);
+void      ray_env_mark_call_scope(ray_t* table, bool named);
+/* True inside a helper called from a query (a call frame above the
+ * query's frames); `named` reports whether it was called by name. */
+bool      ray_env_in_query_helper(bool* named);
+/* Bind a local with a row-provenance flag (0 no, 1 rows, 2 unknown). */
+ray_err_t ray_env_set_local_rows(int64_t sym_id, ray_t* val, uint8_t rows);
+/* Provenance flag of the binding `sym_id` resolves to, or -1 if unbound. */
+int       ray_env_binding_rows(int64_t sym_id);
 /* ray_env_resolve, also reporting through `rows` whether the value is a
  * query source column (or its cell) read through a helper's call frame. */
 ray_t*    ray_env_resolve_rows(int64_t sym_id, uint8_t* rows);
@@ -173,7 +180,7 @@ ray_err_t ray_env_push_capture(ray_t* capture);
  * sync: write the frame's (possibly let-updated) values back into the
  * slots, then pop the frame. */
 ray_err_t ray_env_scope_bind(const int64_t* syms, int32_t n, ray_t** slots,
-                             ray_t* self_obj);
+                             const uint8_t* rows, ray_t* self_obj);
 void      ray_env_scope_sync(const int64_t* syms, int32_t n, ray_t** slots);
 
 #endif /* RAY_ENV_H */

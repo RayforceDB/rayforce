@@ -140,3 +140,28 @@ CNT -- 3
 (at (select {from: T where: (hw s)}) 'x) -- [1 3]
 ;; Every grouped result keeps the requested output order.
 (key (select {n: (+ (count s) 1) m: (sum x) by: k from: TY})) -- ['k 'n 'm]
+;; A nested query's result is a new value, not the outer query's row data;
+;; a let local in an interpreted lambda and a try handler's value keep the
+;; provenance of what they hold.
+(set U (table [w y] (list ['p 'q 'r] [1 2 3])))
+(set id1 (fn [z] 1 z))
+(at (select {v: (concat (at (select {w: (id1 w) from: U}) 'w) 'zz) from: T}) 'v) -- ['p 'q 'r 'zz]
+(at (select {from: T where: (in (at (select {w: (id1 w) from: U}) 'w) ['p])}) 'x) -- [1]
+(at (select {r: ((fn [v] (let w v) (concat w "!")) s) from: T}) 'r) -- ['a! 'b! 'c!]
+(set ht (fn [v] (try (+ v 's) (fn [e] v))))
+(at (update {r: (concat (ht s) "!") from: T}) 'r) -- ['a! 'b! 'c!]
+(at (select {from: T where: (in (concat (ht s) "!") ['a! 'c!])}) 'x) -- [1 3]
+;; A null operand follows the kernel's null rule row by row too.
+(set T4 (table [x s] (list [1 2 3 4] (as 'SYM ["a" "" "c" "d"]))))
+(at (select {r: (concat s "") e: (reverse x) from: T4}) 'r) -- (as 'SYM ["" "" "" ""])
+;; An opaque by: key sees the rows where: keeps, is named like a planned
+;; key, and a body with a condition over one value runs row by row.
+(set TB (table [v g] (list [1 2 3 10 20 30] ['a 'a 'b 'b 'c 'c])))
+(set ha (fn [v] 1 (> v (avg v))))
+(at (select {n: (count v) by: (ha v) from: TB where: (< v 5)}) 'n) -- [2 1]
+(at (select {n: (count v) by: (ha v) from: TB where: (< v 5)}) 'v) -- [false true]
+(at (select {n: (count (distinct g)) by: (ha v) from: TB where: (< v 5)}) 'n) -- [1 1]
+(set dbl (fn [v] 1 (* v 2)))
+(key (select {n: (count (distinct x)) by: (dbl x) from: T})) -- ['x 'n]
+(set hif (fn [v] 1 (if (> v 2) (* v 10) v)))
+(at (select {n: (count x) by: (hif x) from: (table [x] (list [1 2 3 4]))}) 'x) -- [1 2 30 40]

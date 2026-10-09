@@ -1572,7 +1572,8 @@ ray_t* ray_concat_text_fn(ray_t* a, ray_t* b, bool str_out) {
     if (a->type == -RAY_STR && b->type == -RAY_STR) return ray_concat_fn(a, b);
     bool atoms = ray_is_atom(a) && ray_is_atom(b);
     if (atoms && (a->type == -RAY_SYM || a->type == -RAY_STR) &&
-        (b->type == -RAY_SYM || b->type == -RAY_STR)) {
+        (b->type == -RAY_SYM || b->type == -RAY_STR) &&
+        !RAY_ATOM_IS_NULL(a) && !RAY_ATOM_IS_NULL(b)) {   /* a null operand: the kernel's null rule */
         /* Two cells, the row-by-row case: build the atom directly rather
          * than a one-row vector that is unpacked again. */
         ray_t* sa = a->type == -RAY_SYM ? ray_sym_str(a->i64) : NULL;
