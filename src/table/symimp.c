@@ -92,12 +92,17 @@ struct ray_symimp_s {
     _Atomic(int64_t) st[SI_ST_N];  /* ray_symimp_stats, past what lookups read */
 };
 
+/* The slots start empty because ray_sys_alloc memory reads zero: a fresh
+ * anonymous mapping or a new preallocated spill file, never a recycled
+ * block (the contract in mem/sys.h).  Zeroing them again would be a pass
+ * over the whole table before the rehash writes it, and on a spill file its
+ * dirty pages could go to disk as zeros before the rehash dirties them
+ * again. */
 static si_tab_t* si_tab_new(uint64_t cap) {
     si_tab_t* t = (si_tab_t*)ray_sys_alloc(sizeof(si_tab_t) + (size_t)cap * sizeof(uint64_t));
     if (!t) return NULL;
     t->mask = cap - 1;
     t->next = NULL;
-    memset((void*)t->e, 0, (size_t)cap * sizeof(uint64_t));
     return t;
 }
 

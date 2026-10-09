@@ -2666,6 +2666,37 @@ static test_result_t test_sys_alloc_watermark(void) {
     PASS();
 }
 
+/* ray_sys_alloc memory reads zero in every byte (mem/sys.h; the import
+ * dictionary's shard tables are not cleared): a small block, a large
+ * anonymous one and a large spilled one, each also right after a block of
+ * its size was written all over and freed. */
+static test_result_t test_sys_alloc_zero_fill(void) {
+#if defined(_WIN32)
+    SKIP("file-backed spill is POSIX-only");
+#endif
+    const size_t sizes[3] = { 8192 + 16, 4u * 1024 * 1024, 4u * 1024 * 1024 };
+    int64_t previous = ray_heap_anon_watermark();
+    int64_t nonzero = 0, wrong_path = 0;
+    for (int k = 0; k < 3; k++) {
+        bool spill = k == 2;
+        ray_heap_direct_cache_drain();
+        int64_t base = ray_heap_anon_committed();
+        ray_heap_set_anon_watermark(base + (spill ? INT64_C(1) << 20 : INT64_C(64) << 20));
+        for (int round = 0; round < 2; round++) {
+            uint64_t* p = (uint64_t*)ray_sys_alloc(sizes[k]);
+            TEST_ASSERT_NOT_NULL(p);
+            if ((ray_heap_anon_committed() == base) != spill) wrong_path++;
+            for (size_t i = 0; i < sizes[k] / 8; i++) if (p[i]) nonzero++;
+            memset(p, 0xa5, sizes[k]);
+            ray_sys_free(p);
+        }
+    }
+    ray_heap_set_anon_watermark(previous);
+    TEST_ASSERT_EQ_I(wrong_path, 0);
+    TEST_ASSERT_EQ_I(nonzero, 0);
+    PASS();
+}
+
 /* ---- Statement-boundary relief (ray_heap_relieve) ----------------------
  *
  * The relief works on the calling thread's heap and the parked pool
@@ -3639,6 +3670,7 @@ const test_entry_t heap_entries[] = {
     { "heap/direct_cache_many_entries", test_direct_cache_many_entries, heap_setup, heap_teardown },
     { "heap/direct_cache_replaces_old", test_direct_cache_replaces_old_blocks, heap_setup, heap_teardown },
     { "heap/sys_alloc_watermark", test_sys_alloc_watermark, heap_setup, heap_teardown },
+    { "heap/sys_alloc_zero_fill", test_sys_alloc_zero_fill, heap_setup, heap_teardown },
     { "heap/relieve_under_pressure", test_relieve_under_pressure, heap_setup, heap_teardown },
     { "heap/relieve_needs_room",       test_relieve_needs_room,          heap_setup, heap_teardown },
     { "heap/relieve_drains_flushes",   test_relieve_drains_and_flushes,  heap_setup, heap_teardown },

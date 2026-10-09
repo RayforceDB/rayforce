@@ -2140,7 +2140,10 @@ static void heap_swap_dir(char* out, size_t cap) {
  * of RAY_SYS_SPILL_MIN bytes or more that would cross the watermark is mapped
  * over a spill file instead (#712), or taken from RAM when no spill file can be
  * made.  The file is unlinked and its descriptor closed at once — the mapping
- * keeps it — so spilled blocks hold no fds.
+ * keeps it — so spilled blocks hold no fds.  Either way the block reads zero
+ * (fresh anonymous memory, or a new file created O_EXCL and preallocated),
+ * which ray_sys_alloc promises its callers (mem/sys.h): it never comes from
+ * the direct-block cache.
  * -------------------------------------------------------------------------- */
 #define RAY_SYS_SPILL_MIN ((size_t)1 << 20)
 

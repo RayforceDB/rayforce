@@ -938,6 +938,8 @@ void* ray_vm_alloc(size_t size) {
          * Round up to a 64KB WASM page. */
         size_t aligned = (size + 65535u) & ~(size_t)65535u;
         p = aligned_alloc(65536, aligned);
+        /* zero-filled, as a fresh mapping is (ray_sys_alloc's contract) */
+        if (p) memset(p, 0, aligned);
     }
     if (p) ray_sys_track_add((int64_t)size);
     return p;
