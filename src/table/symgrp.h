@@ -45,9 +45,12 @@
  *      compared with a copy of its record read beforehand in position
  *      order (ray_symgrp_load); one pointing at a record another task of the
  *      window writes is compared once the window is done (ray_symgrp_defer,
- *      ray_symgrp_settle).  A mismatch, a true hash collision, gets the
- *      string's exact position from the logs, a new one if need be
- *      (ray_symgrp_collide): two different strings never share a position.
+ *      ray_symgrp_settle).  A mismatch, a true hash collision, is kept for
+ *      the window's end too (ray_symgrp_mismatch): ray_symgrp_settle gives
+ *      the window's mismatches, in the order their strings first occur, their
+ *      exact positions from the logs, new ones if need be, and their tasks
+ *      write their codes again.  Two different strings never share a
+ *      position, and the positions do not depend on the workers.
  *
  * Nothing reads the symbol file at random but those collisions, and the
  * index is touched one group at a time.  POSIX only, as the import
@@ -136,16 +139,19 @@ bool ray_symgrp_same(ray_symgrp_t* g, uint32_t pos, const char* s, uint32_t len)
  * compared by ray_symgrp_settle.  `worker` < the workers of begin. */
 bool ray_symgrp_defer(ray_symgrp_t* g, uint32_t worker, int64_t t, uint32_t local, uint64_t h,
                       uint32_t pos, const char* s, uint32_t len);
-/* After the window: compare the deferred candidates in position order.  A
- * mismatch gets its exact position, kept for ray_symgrp_override, and its
- * task is listed in *redo (*nredo tasks, ascending) to write its codes again. */
+/* A candidate compared already that did not match: its position is given
+ * by ray_symgrp_settle.  `worker` as for ray_symgrp_defer. */
+bool ray_symgrp_mismatch(ray_symgrp_t* g, uint32_t worker, int64_t t, uint32_t local, uint64_t h,
+                         const char* s, uint32_t len);
+/* After the window: compare the deferred candidates in position order, then
+ * give every mismatch (those and ray_symgrp_mismatch's), by task and local
+ * id, its exact position: an earlier string of equal hash and length, or a
+ * new record.  The positions are kept for ray_symgrp_override, and the
+ * mismatches' tasks listed in *redo (*nredo tasks, ascending) to write their
+ * codes again. */
 bool ray_symgrp_settle(ray_symgrp_t* g, int64_t** redo, int64_t* nredo);
 /* The position settled for (t, local) after a mismatch; -1 if none. */
 int64_t ray_symgrp_override(const ray_symgrp_t* g, int64_t t, uint32_t local);
-/* The exact position of a string whose candidate did not match: an earlier
- * string of equal hash and length, or a new record.  Thread-safe; -1 on
- * failure. */
-int64_t ray_symgrp_collide(ray_symgrp_t* g, uint64_t h, const char* s, uint32_t len);
 /* Step 3's own comparisons, for the counts. */
 void ray_symgrp_note(ray_symgrp_t* g, int64_t compares, int64_t bytes);
 /* End of the pass: its state freed, the logs kept for the next. */

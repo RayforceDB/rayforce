@@ -2191,25 +2191,23 @@ static bool pq_g2_first(pq_gtask* k, uint32_t local, uint64_t h, const char* s, 
             int64_t off = k->cursor[a]; k->cursor[a] += 4+(int64_t)len;
             if (!k->w->redo && !pq_g_record(k,a,pos,off,s,len)) return false;
         } else if (!k->w->redo) ray_symimp_put(k->w->imp,pos,v->off,s,len);
-    } else if (v->kind == RAY_SYMGRP_REF && v->owner != k->t && v->owner >= k->w->ta) {
-        /* another task of the window writes the record: compared after it
-         * (a redo takes what that comparison settled) */
+    } else if (v->kind == RAY_SYMGRP_OLD || v->kind == RAY_SYMGRP_REF) {
         if (k->w->redo) {
+            /* compared in the first run: a mismatch has the position the
+             * window's settle gave it */
             int64_t o = ray_symgrp_override(k->w->g,k->t,local);
             if (o >= 0) pos = o;
-        } else if (!ray_symgrp_defer(k->w->g,k->worker,k->t,local,h,(uint32_t)pos,s,len)) return false;
-    } else if (v->kind == RAY_SYMGRP_OLD || v->kind == RAY_SYMGRP_REF) {
-        /* compared now (in a redo again: a mismatch finds the position its
-         * first run added) */
-        k->cmp++; k->cmpb += len;
-        bool same = v->kind == RAY_SYMGRP_REF && v->owner == k->t ? pq_g_same_own(k,(uint32_t)pos,s,len)
-                                                                  : ray_symgrp_same(k->w->g,(uint32_t)pos,s,len);
-        if (!same) {
-            /* the collision path reads records through the mapping: the
-             * task's own go out first */
-            if (!pq_g_wflush(k)) return false;
-            pos = ray_symgrp_collide(k->w->g,h,s,len);
-            if (pos < 0) return false;
+        } else if (v->kind == RAY_SYMGRP_REF && v->owner != k->t && v->owner >= k->w->ta) {
+            /* another task of the window writes the record: compared after it */
+            if (!ray_symgrp_defer(k->w->g,k->worker,k->t,local,h,(uint32_t)pos,s,len)) return false;
+        } else {
+            /* compared now; a mismatch takes its position at the window's
+             * end, in an order the workers do not decide (the codes written
+             * meanwhile are written again) */
+            k->cmp++; k->cmpb += len;
+            bool same = v->kind == RAY_SYMGRP_REF && v->owner == k->t ? pq_g_same_own(k,(uint32_t)pos,s,len)
+                                                                      : ray_symgrp_same(k->w->g,(uint32_t)pos,s,len);
+            if (!same && !ray_symgrp_mismatch(k->w->g,k->worker,k->t,local,h,s,len)) return false;
         }
     } else return false;
     k->map[local] = (uint32_t)pos;
@@ -2308,7 +2306,8 @@ static const char* pq_g_walk(pq_column* c, pq_schema* s, int64_t rows, pq_gtask*
 }
 
 /* Fault injection for the suite: RAY_PQ_SYM_INJECT names the step that
- * fails as out of memory ("r1", "p2", "load", "r2", "settle") or is
+ * fails as out of memory ("r1", "p2", "load", "r2", "settle"; "reload" in
+ * table/symgrp.c: a window's load after the first) or is
  * cancelled ("cancel"); debug builds only. */
 static bool pq_g_inject(const char* step) {
 #if defined(DEBUG)
@@ -2319,6 +2318,12 @@ static bool pq_g_inject(const char* step) {
 #else
     (void)step; return false;
 #endif
+}
+
+/* A grouped task's error: "cancel" once the import is interrupted (the
+ * walks stop on it with an error of their own), as the direct import has it. */
+static ray_t* pq_g_error(const char* err) {
+    return ray_interrupted() ? ray_error("cancel","parquet conversion interrupted") : pq_error(err);
 }
 
 /* The chunk's reader, its cursor holding the worker's buffers. */
@@ -2413,7 +2418,7 @@ static void pq_g1_task(void* ptr, uint32_t worker, int64_t start, int64_t end) {
         if (!err && !ray_symgrp_stage(w->g,g,k.d.n,k.d.fp,k.d.cnt ? k.d.cnt+1 : NULL))
             err = "symbol staging allocation failed";
         atomic_fetch_add_explicit(&w->gens,k.d.gens,memory_order_relaxed);
-        if (err && !dw->errors[g]) dw->errors[g] = pq_error(err);
+        if (err && !dw->errors[g]) dw->errors[g] = pq_g_error(err);
         pq_g_scratch_back(ws,&k);
         if (r) pq_g_reader_close(w,r,worker);
     }
@@ -2489,7 +2494,7 @@ static void pq_g2_task(void* ptr, uint32_t worker, int64_t start, int64_t end) {
         ray_col_stream_abort(&local);   /* frees what an append made; no file of its own */
         if (!err && local.rows != dw->offsets[g+1]-dw->offsets[g]) err = "row group ended before its assigned output range";
         if (local.had_nulls) atomic_store_explicit(&dw->nulls[w->c],1,memory_order_relaxed);
-        if (err && !dw->errors[g]) dw->errors[g] = ray_interrupted() ? ray_error("cancel","parquet conversion interrupted") : pq_error(err);
+        if (err && !dw->errors[g]) dw->errors[g] = pq_g_error(err);
         ray_symgrp_note(w->g,k.cmp,k.cmpb);
         pq_g_scratch_back(ws,&k);
         if (r) pq_g_reader_close(w,r,worker);
@@ -2567,7 +2572,7 @@ static void pq_sym_grouped(pq_direct_work* dw, ray_symgrp_t* g, ray_symimp_t* im
     if (ray_interrupted()) goto out;
     if (trace) { io1 = pq_io_now(); t1 = ray_profile_now_ns(); }
     /* the verdicts, group by group */
-    if (pq_g_inject("p2") || !ray_symgrp_resolve(g)) { dw->errors[0] = pq_error("symbol dictionary allocation or file growth failed"); goto out; }
+    if (pq_g_inject("p2") || !ray_symgrp_resolve(g)) { dw->errors[0] = pq_g_error("symbol dictionary allocation or file growth failed"); goto out; }
     if (trace) { io2 = pq_io_now(); t2 = ray_profile_now_ns(); }
     /* second decode, window by window: the candidates' records of a window
      * (from earlier passes and windows) in half the budget */
@@ -2581,7 +2586,7 @@ static void pq_sym_grouped(pq_direct_work* dw, ray_symgrp_t* g, ray_symimp_t* im
     for (int64_t ta = 0; ta < tasks;) {
         int64_t tb = ray_symgrp_window(g,ta,store);
         pq_tio_t la = pq_tio_now(trace);
-        if (pq_g_inject("load") || !ray_symgrp_load(g,ta,tb)) { dw->errors[ta] = pq_error("symbol record load failed"); goto out; }
+        if (pq_g_inject("load") || !ray_symgrp_load(g,ta,tb)) { dw->errors[ta] = pq_g_error("symbol record load failed"); goto out; }
         pq_tio_add(&w,PQ_GS_LOAD,la,pq_tio_now(trace));
         w.ta = ta; w.tb = tb; w.redo = false;
         if (ray_pool_par_dispatch_ok(pool,tb-ta,2)) ray_pool_dispatch_n(pool,pq_g2_task,&w,(uint32_t)(tb-ta));
@@ -2590,7 +2595,7 @@ static void pq_sym_grouped(pq_direct_work* dw, ray_symgrp_t* g, ray_symimp_t* im
         if (ray_interrupted()) goto out;
         int64_t* redo = NULL; int64_t nredo = 0;
         pq_tio_t sa = pq_tio_now(trace);
-        if (pq_g_inject("settle") || !ray_symgrp_settle(g,&redo,&nredo)) { dw->errors[ta] = pq_error("symbol comparison failed"); goto out; }
+        if (pq_g_inject("settle") || !ray_symgrp_settle(g,&redo,&nredo)) { dw->errors[ta] = pq_g_error("symbol comparison failed"); goto out; }
         pq_tio_add(&w,PQ_GS_SETTLE,sa,pq_tio_now(trace));
         /* the tasks whose deferred candidates did not match: their codes again */
         w.redo = true;

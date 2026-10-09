@@ -28,6 +28,7 @@
 
 #include "mem/sys.h"
 #include <pthread.h>
+#include <stdlib.h>
 #include <stdatomic.h>
 #include <string.h>
 
@@ -85,6 +86,17 @@ static const char* sg_keep(sg_list_t* l, const char* s, uint32_t len) {
     return p;
 }
 
+/* Fault injection for the suite, the import's RAY_PQ_SYM_INJECT (debug
+ * builds): "reload" fails a window's load after the first. */
+static bool sg_inject(const char* step) {
+#if defined(DEBUG)
+    const char* e = getenv("RAY_PQ_SYM_INJECT");
+    return e && !strcmp(e, step);
+#else
+    (void)step; return false;
+#endif
+}
+
 /* Stable sort of 64-bit words by their high 32 bits (two 16-bit radix
  * passes); tmp is n words. */
 static bool sg_sort_hi(uint64_t* a, uint64_t* tmp, int64_t n) {
@@ -108,7 +120,8 @@ static bool sg_sort_hi(uint64_t* a, uint64_t* tmp, int64_t n) {
 
 typedef struct { uint64_t h; uint32_t len, pos; } sg_ent_t;                 /* a log entry */
 typedef struct { uint64_t h; uint32_t len, t, local, count; } sg_own_t;      /* a new string */
-typedef struct { int64_t t; uint64_t h; const char* s; uint32_t local, pos, len; } sg_def_t;
+/* A candidate compared after its window (or known not to match: `miss`). */
+typedef struct { int64_t t; uint64_t h; const char* s; uint32_t local, pos, len, miss; } sg_def_t;
 typedef struct { int64_t t; uint32_t local, pos; } sg_ovr_t;
 
 /* Verdict words: kind in the top 2 bits; NEW and REF hold an owner id, OLD
@@ -134,7 +147,7 @@ typedef struct {
 struct ray_symgrp_s {
     ray_symimp_t*      imp;
     ray_symgrp_order_t order;
-    pthread_mutex_t    lock;              /* ray_symgrp_collide */
+    pthread_mutex_t    lock;              /* sg_collide */
     sg_list_t          logs[RAY_SYMGRP_MAX];
     int64_t            entries;
     /* the pass */
@@ -608,16 +621,18 @@ static void sg_ra_at(const ray_symimp_t* imp, sg_ra_t* ra, int64_t off, int64_t*
  * column is read from the file once), the rest are read in position order
  * (sg_ra_t) and copied from the file. */
 bool ray_symgrp_load(ray_symgrp_t* g, int64_t ta, int64_t tb) {
-    uint32_t* opos = g->spos; uint32_t* olen = g->slen; int64_t* ooff = g->soff;
-    char* obuf = g->sbuf; int64_t on = g->sn;
-    g->spos = NULL; g->slen = NULL; g->soff = NULL; g->sbuf = NULL; g->sn = 0;
-    sg_window_free(g);
     g->st.windows++;
     int64_t n = 0;
     for (int64_t t = ta; t < tb; t++) n += g->tasks[t].n;
     uint64_t* a = (uint64_t*)ray_sys_alloc((size_t)(n ? n : 1) * sizeof(uint64_t));
     uint64_t* tmp = (uint64_t*)ray_sys_alloc((size_t)(n ? n : 1) * sizeof(uint64_t));
+    if (g->spos && sg_inject("reload")) { ray_sys_free(a); a = NULL; }
+    /* failed: the previous window's copy stays with g (sg_window_free) */
     if (!a || !tmp) { ray_sys_free(a); ray_sys_free(tmp); return false; }
+    uint32_t* opos = g->spos; uint32_t* olen = g->slen; int64_t* ooff = g->soff;
+    char* obuf = g->sbuf; int64_t on = g->sn;
+    g->spos = NULL; g->slen = NULL; g->soff = NULL; g->sbuf = NULL; g->sn = 0;
+    sg_window_free(g);
     int64_t m = 0;
     for (int64_t t = ta; t < tb; t++) {
         const sg_task_t* k = &g->tasks[t];
@@ -690,17 +705,30 @@ bool ray_symgrp_same(ray_symgrp_t* g, uint32_t pos, const char* s, uint32_t len)
     return rl == len && (len == 0 || memcmp(r, s, len) == 0);
 }
 
-bool ray_symgrp_defer(ray_symgrp_t* g, uint32_t worker, int64_t t, uint32_t local, uint64_t h,
-                      uint32_t pos, const char* s, uint32_t len) {
+static bool sg_defer(ray_symgrp_t* g, uint32_t worker, int64_t t, uint32_t local, uint64_t h,
+                     uint32_t pos, const char* s, uint32_t len, bool miss) {
     if ((int64_t)worker >= g->workers) return false;
     const char* kept = sg_keep(&g->db[worker], s, len);
     sg_def_t* d = (sg_def_t*)sg_push(&g->dl[worker], sizeof(sg_def_t));
     if (!kept || !d) return false;
-    *d = (sg_def_t){t, h, kept, local, pos, len};
+    *d = (sg_def_t){t, h, kept, local, pos, len, miss};
     return true;
 }
+bool ray_symgrp_defer(ray_symgrp_t* g, uint32_t worker, int64_t t, uint32_t local, uint64_t h,
+                      uint32_t pos, const char* s, uint32_t len) {
+    return sg_defer(g, worker, t, local, h, pos, s, len, false);
+}
+bool ray_symgrp_mismatch(ray_symgrp_t* g, uint32_t worker, int64_t t, uint32_t local, uint64_t h,
+                         const char* s, uint32_t len) {
+    return sg_defer(g, worker, t, local, h, 0, s, len, true);
+}
 
-int64_t ray_symgrp_collide(ray_symgrp_t* g, uint64_t h, const char* s, uint32_t len) {
+/* The exact position of a string whose candidate did not match: an earlier
+ * string of equal hash and length, or a new record at the file's end.  The
+ * positions it adds follow the order it is called in, so it is called from
+ * one thread, in an order that does not depend on the workers
+ * (ray_symgrp_settle). */
+static int64_t sg_collide(ray_symgrp_t* g, uint64_t h, const char* s, uint32_t len) {
     pthread_mutex_lock(&g->lock);
     int64_t pos = -1;
     for (sg_chunk_t* c = g->logs[sg_log(h)].head; pos < 0 && c; c = c->next)
@@ -736,61 +764,66 @@ bool ray_symgrp_settle(ray_symgrp_t* g, int64_t** redo, int64_t* nredo) {
     ray_sys_free(g->ovr); g->ovr = NULL; g->novr = 0;
     int64_t n = 0;
     for (int64_t w = 0; w < g->workers; w++) n += g->dl[w].n;
-    g->st.deferred += n;
     if (!n) return true;
-    /* every deferred candidate, by position */
+    /* every candidate left to compare, by position (the known mismatches
+     * apart) */
     sg_def_t** all = (sg_def_t**)ray_sys_alloc((size_t)n * sizeof(sg_def_t*));
     uint64_t* a = (uint64_t*)ray_sys_alloc((size_t)n * sizeof(uint64_t));
     uint64_t* tmp = (uint64_t*)ray_sys_alloc((size_t)n * sizeof(uint64_t));
     bool ok = all && a && tmp;
-    int64_t k = 0;
+    int64_t k = 0, nc = 0;
     for (int64_t w = 0; ok && w < g->workers; w++)
         for (sg_chunk_t* c = g->dl[w].head; c; c = c->next)
             for (int64_t i = 0; i < c->n; i++, k++) {
                 all[k] = (sg_def_t*)c->data + i;
-                a[k] = ((uint64_t)all[k]->pos << 32) | (uint64_t)k;
+                if (!all[k]->miss) a[nc++] = ((uint64_t)all[k]->pos << 32) | (uint64_t)k;
             }
-    ok = ok && sg_sort_hi(a, tmp, n);
+    g->st.deferred += nc;
+    ok = ok && sg_sort_hi(a, tmp, nc);
     sg_ra_t ra = {0};
     int64_t spans = 0;
-    for (int64_t i = 0; ok && i < n; i++) {
+    for (int64_t i = 0; ok && i < nc; i++) {
         const sg_def_t* d = all[(uint32_t)a[i]];
         int64_t off = ray_symimp_offset(g->imp, d->pos);
         ok = sg_ra_add(&ra, off, off + 4 + d->len, &spans);
     }
     ok = ok && sg_ra_end(&ra);
-    sg_ovr_t* ovr = NULL; int64_t novr = 0, covr = 0;
     int64_t cmp = 0, cmpb = 0;
-    for (int64_t i = 0; ok && i < n; i++) {
-        const sg_def_t* d = all[(uint32_t)a[i]];
+    for (int64_t i = 0; ok && i < nc; i++) {
+        sg_def_t* d = all[(uint32_t)a[i]];
         uint32_t rl;
         sg_ra_at(g->imp, &ra, ray_symimp_offset(g->imp, d->pos), &g->st.settle_read);
         const char* r = ray_symimp_get(g->imp, d->pos, &rl);
         cmp++; cmpb += d->len;
-        if (rl == d->len && (d->len == 0 || memcmp(r, d->s, d->len) == 0)) continue;
-        int64_t p = ray_symgrp_collide(g, d->h, d->s, d->len);
-        if (p < 0) { ok = false; break; }
-        if (novr == covr) {
-            covr = covr ? covr * 2 : 16;
-            sg_ovr_t* no = (sg_ovr_t*)ray_sys_realloc(ovr, (size_t)covr * sizeof(sg_ovr_t));
-            if (!no) { ok = false; break; }
-            ovr = no;
-        }
-        ovr[novr++] = (sg_ovr_t){d->t, d->local, (uint32_t)p};
+        if (rl != d->len || (d->len && memcmp(r, d->s, d->len) != 0)) d->miss = 1;
     }
     atomic_fetch_add_explicit(&g->compares, cmp, memory_order_relaxed);
     atomic_fetch_add_explicit(&g->cmp_bytes, cmpb, memory_order_relaxed);
     ray_sys_free(ra.p);
+    /* The mismatches, true collisions, by (task, local id): the order their
+     * strings first occur in the column, whichever worker ran which task, so
+     * the records sg_collide adds take the same positions on any pool.  Two
+     * stable passes, local id first. */
+    int64_t nm = 0;
+    for (int64_t i = 0; ok && i < n; i++)
+        if (all[i]->miss) a[nm++] = ((uint64_t)all[i]->local << 32) | (uint64_t)i;
+    ok = ok && sg_sort_hi(a, tmp, nm);
+    for (int64_t i = 0; ok && i < nm; i++)
+        a[i] = ((uint64_t)(uint32_t)all[(uint32_t)a[i]]->t << 32) | (uint32_t)a[i];
+    ok = ok && sg_sort_hi(a, tmp, nm);
+    sg_ovr_t* ovr = ok && nm ? (sg_ovr_t*)ray_sys_alloc((size_t)nm * sizeof(sg_ovr_t)) : NULL;
+    if (nm && !ovr) ok = false;
+    int64_t novr = 0;
+    for (int64_t i = 0; ok && i < nm; i++) {
+        const sg_def_t* d = all[(uint32_t)a[i]];
+        int64_t p = sg_collide(g, d->h, d->s, d->len);
+        if (p < 0) { ok = false; break; }
+        ovr[novr++] = (sg_ovr_t){d->t, d->local, (uint32_t)p};
+    }
     ray_sys_free(all); ray_sys_free(a); ray_sys_free(tmp);
     for (int64_t w = 0; w < g->workers; w++) { sg_list_free(&g->dl[w]); sg_list_free(&g->db[w]); }
     if (!ok) { ray_sys_free(ovr); return false; }
-    /* by (task, local id), insertion sort: mismatches are true collisions */
-    for (int64_t i = 1; i < novr; i++) {
-        sg_ovr_t x = ovr[i]; int64_t j = i;
-        while (j > 0 && sg_ovr_cmp(&ovr[j - 1], x.t, x.local) > 0) { ovr[j] = ovr[j - 1]; j--; }
-        ovr[j] = x;
-    }
-    g->ovr = ovr; g->novr = novr;
+    g->ovr = ovr; g->novr = novr;   /* by (task, local id) */
     if (novr) {
         int64_t* rd = (int64_t*)ray_sys_alloc((size_t)novr * sizeof(int64_t));
         if (!rd) return false;
@@ -841,7 +874,9 @@ bool ray_symgrp_defer(ray_symgrp_t* g, uint32_t worker, int64_t t, uint32_t loca
 }
 bool ray_symgrp_settle(ray_symgrp_t* g, int64_t** redo, int64_t* nredo) { (void)g; *redo = NULL; *nredo = 0; return false; }
 int64_t ray_symgrp_override(const ray_symgrp_t* g, int64_t t, uint32_t local) { (void)g; (void)t; (void)local; return -1; }
-int64_t ray_symgrp_collide(ray_symgrp_t* g, uint64_t h, const char* s, uint32_t len) { (void)g; (void)h; (void)s; (void)len; return -1; }
+bool ray_symgrp_mismatch(ray_symgrp_t* g, uint32_t worker, int64_t t, uint32_t local, uint64_t h, const char* s, uint32_t len) {
+    (void)g; (void)worker; (void)t; (void)local; (void)h; (void)s; (void)len; return false;
+}
 void ray_symgrp_end(ray_symgrp_t* g) { (void)g; }
 void ray_symgrp_note(ray_symgrp_t* g, int64_t compares, int64_t bytes) { (void)g; (void)compares; (void)bytes; }
 void ray_symgrp_stats(ray_symgrp_t* g, ray_symgrp_stats_t* out) { (void)g; *out = (ray_symgrp_stats_t){0}; }

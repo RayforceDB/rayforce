@@ -1259,6 +1259,368 @@ static test_result_t test_pq_import_no_growth(void) {
     ray_pool_destroy();
     PASS();
 }
+/* Edge inputs for the grouped import, each against the direct import of the
+ * same file: strings past the 1 MB record buffer, a 4 MB read piece and the
+ * 32 MB read-ahead (equal prefixes, told apart by their last bytes), a
+ * string a later row group meets again only in the last one, row groups of
+ * no rows, every string unique, every string the same; in every order, one
+ * worker and four, one window or a window per row group, all of the hash or
+ * none of it.  Every row's string, the vocabulary's size (no string lost
+ * or twice), the null flag, and the files byte for byte across the worker
+ * counts.  The default run is a subset (PQ_EDGE_FULL=1 runs all of it,
+ * PQ_EDGE_ONLY=name one set, the PQ_EDGE_* knobs below change the runs). */
+static char* pq_big;
+static const char* pq_big_row(uint32_t len, char fill, int64_t key, uint32_t* out) {
+    memset(pq_big, fill, len);
+    char tail[24]; int n = snprintf(tail, sizeof(tail), "#%lld", (long long)key);
+    if ((uint32_t)n <= len) memcpy(pq_big + len - (uint32_t)n, tail, (size_t)n);
+    *out = len;
+    return pq_big;
+}
+static const char* pq_synth_huge(int64_t r, char* buf, uint32_t* len) {
+    switch (r % 8) {
+    case 0: return NULL;
+    case 1: *len = 0; return buf;
+    case 2: return pq_big_row((1u << 20) - 4, 'b', (r / 8) % 2, len);   /* the 1 MB buffer exactly */
+    case 3: return pq_big_row((1u << 20) - 3, 'b', (r / 8) % 3, len);   /* a byte past it */
+    case 4: return pq_big_row((4u << 20) + 7, 'c', (r / 8) % 2, len);   /* past a 4 MB piece */
+    case 5: *len = (uint32_t)snprintf(buf, 256, "k%lld", (long long)(r % 3)); return buf;
+    case 6: return pq_big_row(300000, 'd', r % 5, len);
+    default: return r == 15 ? pq_big_row(33u << 20, 'e', 7, len)          /* past the 32 MB read-ahead */
+                            : pq_big_row((2u << 20) + 1, 'e', (r / 8) % 2, len);
+    }
+}
+/* 4000 rows in 8 row groups of 500: forty strings of the first group met
+ * again only in the last, ten of the fourth met again only in the last,
+ * the rest unique. */
+static const char* pq_synth_last(int64_t r, char* buf, uint32_t* len) {
+    int64_t g = (r % 4000) / 500;
+    int n;
+    if ((g == 0 || g == 7) && r % 5 == 0) n = snprintf(buf, 256, "again-%lld", (long long)((r / 5) % 40));
+    else if ((g == 3 || g == 7) && r % 7 == 1) n = snprintf(buf, 256, "mid-%lld", (long long)((r / 7) % 10));
+    else if (r % 97 == 0) return NULL;
+    else n = snprintf(buf, 256, "u%06lld", (long long)r);
+    *len = (uint32_t)n;
+    return buf;
+}
+static const char* pq_synth_same(int64_t r, char* buf, uint32_t* len) {
+    (void)r;
+    *len = (uint32_t)snprintf(buf, 256, "one and the same string");
+    return buf;
+}
+/* pq_synth_check, telling the first row that differs. */
+static bool pq_edge_check(const char* dir, int64_t rows, pq_synth_fn fn, const char* what, int nulls[2]) {
+    char sym[200]; snprintf(sym, sizeof(sym), "%s/.sym", dir);
+    ray_t* t = ray_read_splayed(dir, sym);
+    if (!t || RAY_IS_ERR(t)) { fprintf(stderr, "  [%s] read failed\n", what); if (t) ray_error_free(t); return false; }
+    bool ok = ray_table_nrows(t) == rows;
+    if (!ok) fprintf(stderr, "  [%s] rows %lld != %lld\n", what, (long long)ray_table_nrows(t), (long long)rows);
+    char buf[256];
+    for (int c = 1; ok && c < PQ_SYNTH_COLS; c++) {
+        ray_t* s = ray_table_get_col_idx(t, c);
+        if (nulls) nulls[c - 1] = (s->attrs & RAY_ATTR_HAS_NULLS) != 0;
+        for (int64_t r = 0; ok && r < rows; r++) {
+            uint32_t len = 0;
+            const char* want = fn(c == 1 ? r : r + rows / 2, buf, &len);
+            if (!want) len = 0;
+            ray_t* text = ray_sym_vec_cell(s, r);
+            ok = text && ray_str_len(text) == len && (!len || !memcmp(ray_str_ptr(text), want, len));
+            if (!ok) fprintf(stderr, "  [%s] col %d row %lld: want len %u, got len %lld pos %lld\n", what, c, (long long)r,
+                             len, text ? (long long)ray_str_len(text) : -1LL,
+                             (long long)ray_read_sym(ray_data(s), r, RAY_SYM, s->attrs));
+        }
+    }
+    ray_release(t);
+    return ok;
+}
+typedef struct { const char* name; pq_synth_fn fn; int64_t rows, groups; bool big, opt; } pq_edge_set;
+static test_result_t test_pq_sym_grouped_edges(void) {
+#if !defined(DEBUG)
+    SKIP("window and hash knobs are debug-build only");
+#else
+    pq_sym_env_clear();
+    pq_big = (char*)ray_sys_alloc((size_t)34 << 20);
+    TEST_ASSERT_TRUE(pq_big != NULL);
+    const pq_edge_set sets[] = {
+        {"huge", pq_synth_huge, 24, 6, true, false},
+        {"last", pq_synth_last, 4000, 8, false, false},
+        {"zero", pq_synth_mixed, 7, 10, false, false},
+        {"unique", pq_synth_long, 3000, 6, false, false},
+        {"same", pq_synth_same, 3000, 5, false, false},
+        {"zipf", pq_synth_zipf, 24000, 12, false, true},
+        {"mixed", pq_synth_mixed, 20000, 9, false, true},
+    };
+    const char* e_arena = getenv("PQ_EDGE_ARENA");
+    const char* e_bits = getenv("PQ_EDGE_BITS");
+    const char* e_groups = getenv("PQ_EDGE_GROUPS");
+    const char* e_window = getenv("PQ_EDGE_WINDOW");
+    int e_cores = getenv("PQ_EDGE_CORES") ? atoi(getenv("PQ_EDGE_CORES")) : 4;
+    bool full = getenv("PQ_EDGE_FULL") != NULL;
+    const char* orders[] = {"rows","shards","freq","rowsflat"};
+    const char* names[] = {"x","s","t"};
+    int64_t tids[] = {ray_sym_intern("I32",3), ray_sym_intern("SYM",3), ray_sym_intern("SYM",3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 3);
+    char src[160], dir[160], ref[160], a[220], b[220], what[160];
+    int fails = 0;
+    const char* only = getenv("PQ_EDGE_ONLY");
+    for (size_t si = 0; si < sizeof(sets) / sizeof(sets[0]); si++) {
+        const pq_edge_set* S = &sets[si];
+        if (only ? strcmp(only, S->name) != 0 : S->opt) continue;   /* zipf, mixed: by name only (the other tests cover them) */
+        snprintf(src, sizeof(src), "/tmp/rayforce-pq-edge-%d-%s.parquet", (int)getpid(), S->name);
+        TEST_ASSERT_TRUE(pq_synth(src, S->rows, S->groups, S->fn));
+        snprintf(dir, sizeof(dir), "/tmp/rayforce-pq-edge-%d", (int)getpid());
+        ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+        pq_set_symmode("direct");
+        ray_t* res = ray_parquet_splayed_typed(src, dir, types);
+        pq_set_symmode(NULL);
+        if (!res || RAY_IS_ERR(res)) {
+            fprintf(stderr, "  [%s direct] import failed: %s\n", S->name, res ? ray_err_code(res) : "null");
+            if (res) ray_error_free(res);
+            fails++; unlink(src); continue;
+        }
+        ray_release(res);
+        int dn[2] = {0, 0};
+        snprintf(what, sizeof(what), "%s direct", S->name);
+        if (!pq_edge_check(dir, S->rows, S->fn, what, dn)) fails++;
+        int64_t words = pq_sym_count(dir);
+        pq_remove_native(dir, names, 3);
+        for (int o = 0; o < 4; o++) {
+            for (int run = 0; run < 8; run++) {
+                int cores = run & 1 ? e_cores : 1;
+                const char* window = run & 2 ? (e_window ? e_window : "1") : NULL;
+                const char* bits = run & 4 ? (e_bits ? e_bits : "0") : NULL;
+                /* the default run: the big records in "rows" only and all of the
+                 * hash; the truncated hash (every candidate a collision, slow
+                 * under the sanitizers) in "rows" with one window.  PQ_EDGE_FULL=1: every
+                 * order with every knob, the big records' collisions in "rows" */
+                if (S->big && (full ? bits && o != 0 : bits || o != 0)) continue;
+                if (!full && bits && (o != 0 || window)) continue;
+                snprintf(what, sizeof(what), "%s %s cores=%d window=%s bits=%s", S->name, orders[o], cores,
+                         window ? window : "-", bits ? bits : "-");
+                ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(cores), RAY_OK);
+                snprintf(ref, sizeof(ref), "/tmp/rayforce-pq-edge-%d-ref-%d", (int)getpid(), run & 6);
+                const char* out = cores == 1 ? ref : dir;
+                pq_set_symmode("grouped");
+                pq_set_env("RAY_PQ_SYM_ORDER", orders[o]);
+                pq_set_env("RAY_PQ_SYM_WINDOW", window);
+                pq_set_env("RAY_PQ_SYM_HASH_BITS", bits);
+                pq_set_env("RAY_PQ_SYM_ARENA", e_arena);
+                pq_set_env("RAY_PQ_SYM_GROUPS", e_groups);
+                res = ray_parquet_splayed_typed(src, out, types);
+                pq_sym_env_clear();
+                if (!res || RAY_IS_ERR(res)) {
+                    fprintf(stderr, "  [%s] import failed: %s\n", what, res ? ray_err_code(res) : "null");
+                    if (res) ray_error_free(res);
+                    char partial[240]; snprintf(partial, sizeof(partial), "%s.parquet-partial", out);
+                    pq_remove_native(partial, names, 3);
+                    fails++; continue;
+                }
+                TEST_ASSERT_EQ_I(res->i64, S->rows); ray_release(res);
+                int gn[2] = {0, 0};
+                if (!pq_edge_check(out, S->rows, S->fn, what, gn)) fails++;
+                if (pq_sym_count(out) != words) {
+                    fprintf(stderr, "  [%s] symbols %lld, direct %lld\n", what, (long long)pq_sym_count(out), (long long)words);
+                    fails++;
+                }
+                if (gn[0] != dn[0] || gn[1] != dn[1]) {
+                    fprintf(stderr, "  [%s] null flags %d/%d, direct %d/%d\n", what, gn[0], gn[1], dn[0], dn[1]);
+                    fails++;
+                }
+                if (cores > 1) {
+                    bool same = true;
+                    snprintf(a, sizeof(a), "%s/.sym", ref); snprintf(b, sizeof(b), "%s/.sym", dir);
+                    same = pq_same_file(a, b);
+                    for (int c = 1; c < 3; c++) {
+                        snprintf(a, sizeof(a), "%s/%s", ref, names[c]); snprintf(b, sizeof(b), "%s/%s", dir, names[c]);
+                        if (!pq_same_file(a, b)) same = false;
+                    }
+                    if (!same) { fprintf(stderr, "  [%s] files differ from one worker's\n", what); fails++; }
+                    pq_remove_native(dir, names, 3);
+                    pq_remove_native(ref, names, 3);
+                }
+            }
+        }
+        unlink(src);
+    }
+    ray_pool_destroy();
+    ray_sys_free(pq_big); pq_big = NULL;
+    ray_release(types);
+    TEST_ASSERT_EQ_I(fails, 0);
+    PASS();
+#endif
+}
+/* Probe (not in the default run's assertions beyond correctness): a file of
+ * many small row groups, grouped or direct by PQ_RG_MODE, prints the
+ * process's committed-memory peak, so the two modes can be compared in
+ * separate processes. */
+static test_result_t test_pq_sym_grouped_rowgroups(void) {
+    pq_sym_env_clear();
+    const char* mode = getenv("PQ_RG_MODE");
+    int64_t groups = getenv("PQ_RG_GROUPS") ? atoll(getenv("PQ_RG_GROUPS")) : 4000;
+    int64_t rows = groups * 2;
+    char src[160], dir[160];
+    snprintf(src, sizeof(src), "/tmp/rayforce-pq-rg-%d.parquet", (int)getpid());
+    snprintf(dir, sizeof(dir), "/tmp/rayforce-pq-rg-%d", (int)getpid());
+    TEST_ASSERT_TRUE(pq_synth(src, rows, groups, pq_synth_mixed));
+    int64_t tids[] = {ray_sym_intern("I32",3), ray_sym_intern("SYM",3), ray_sym_intern("SYM",3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 3);
+    const char* names[] = {"x","s","t"};
+    ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    ray_mem_stats_t st0, st1;
+    ray_mem_stats(&st0);
+    pq_set_symmode(mode ? mode : "grouped");
+    ray_t* res = ray_parquet_splayed_typed(src, dir, types);
+    pq_set_symmode(NULL);
+    ray_mem_stats(&st1);
+    bool failed = !res || RAY_IS_ERR(res);
+    if (failed) fprintf(stderr, "  rowgroups: import failed: %s\n", res ? ray_err_code(res) : "null");
+    if (res) { if (failed) ray_error_free(res); else ray_release(res); }
+    long hwm = -1;
+    FILE* f = fopen("/proc/self/status", "r");
+    if (f) { char line[256]; while (fgets(line, sizeof(line), f)) if (!strncmp(line, "VmHWM:", 6)) hwm = atol(line + 6); fclose(f); }
+    fprintf(stderr, "  rowgroups: mode=%s groups=%lld sys_peak=%.1fMB (before %.1fMB) VmHWM=%ldkB\n",
+            mode ? mode : "grouped", (long long)groups, (double)st1.sys_peak / 1048576.0,
+            (double)st0.sys_peak / 1048576.0, hwm);
+    TEST_ASSERT_FALSE(failed);
+    TEST_ASSERT_TRUE(pq_synth_check(dir, rows, pq_synth_mixed));
+    pq_remove_native(dir, names, 3);
+    ray_pool_destroy();
+    ray_release(types); unlink(src);
+    PASS();
+}
+/* The grouped import's failures keep no memory: each injected failure run
+ * five times on one worker, the heap's and the system allocator's bytes
+ * after the second run and after the last. */
+static test_result_t test_pq_sym_grouped_fail_leaks(void) {
+#if !defined(DEBUG)
+    SKIP("failure injection is a debug-build knob");
+#else
+    pq_sym_env_clear();
+    char src[160], dir[160], partial[200];
+    snprintf(src, sizeof(src), "/tmp/rayforce-pq-fleak-%d.parquet", (int)getpid());
+    snprintf(dir, sizeof(dir), "/tmp/rayforce-pq-fleak-%d", (int)getpid());
+    snprintf(partial, sizeof(partial), "%s.parquet-partial", dir);
+    TEST_ASSERT_TRUE(pq_synth(src, 20000, 9, pq_synth_mixed));
+    int64_t tids[] = {ray_sym_intern("I32",3), ray_sym_intern("SYM",3), ray_sym_intern("SYM",3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 3);
+    const char* names[] = {"x","s","t"};
+    ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(1), RAY_OK);
+    const char* steps[] = {"r1","p2","load","reload","r2","settle","cancel",NULL};
+    int bad = 0;
+    for (int i = 0; i < 8; i++) {
+        size_t base = 0, sbase = 0;
+        for (int k = 0; k < 5; k++) {
+            pq_set_symmode("grouped");
+            pq_set_env("RAY_PQ_SYM_WINDOW", "4096");
+            pq_set_env("RAY_PQ_SYM_HASH_BITS", "6");
+            pq_set_env("RAY_PQ_SYM_INJECT", steps[i]);
+            ray_t* res = ray_parquet_splayed_typed(src, dir, types);
+            pq_sym_env_clear();
+            bool failed = res && RAY_IS_ERR(res);
+            if (res) { if (failed) ray_error_free(res); else ray_release(res); }
+            ray_clear_interrupt();
+            if (failed != (steps[i] != NULL)) bad++;
+            pq_remove_native(partial, names, 3);
+            pq_remove_native(dir, names, 3);
+            ray_mem_stats_t st; ray_mem_stats(&st);
+            if (k == 1) { base = st.bytes_allocated; sbase = st.sys_current; }
+            if (k == 4) {
+                fprintf(stderr, "  fail_leaks %-6s heap %+lld B sys %+lld B\n", steps[i] ? steps[i] : "none",
+                        (long long)st.bytes_allocated - (long long)base, (long long)st.sys_current - (long long)sbase);
+                /* a window's copy left behind is a few pages a run */
+                if (st.bytes_allocated > base + (64u << 10) || st.sys_current > sbase + (8u << 10)) bad++;
+            }
+        }
+    }
+    ray_pool_destroy();
+    ray_release(types); unlink(src);
+    TEST_ASSERT_EQ_I(bad, 0);
+    PASS();
+#endif
+}
+/* A cancelled import reports "cancel" whichever symbol import runs, the
+ * interrupt seen in the first decode of the grouped one as well. */
+static test_result_t test_pq_sym_grouped_cancel_code(void) {
+    pq_sym_env_clear();
+    char src[160], dir[160], partial[200];
+    snprintf(src, sizeof(src), "/tmp/rayforce-pq-ccode-%d.parquet", (int)getpid());
+    snprintf(dir, sizeof(dir), "/tmp/rayforce-pq-ccode-%d", (int)getpid());
+    snprintf(partial, sizeof(partial), "%s.parquet-partial", dir);
+    TEST_ASSERT_TRUE(pq_dict_file(src, 4 + 5 + 4 + 19, 2));
+    int64_t tid = ray_sym_intern("SYM", 3);
+    ray_t* types = ray_vec_from_raw(RAY_SYM, &tid, 1);
+    const char* names[] = {"s"};
+    char codes[2][32];
+    for (int grouped = 0; grouped < 2; grouped++) {
+        pq_set_symmode(grouped ? "grouped" : "direct");
+        ray_request_interrupt();
+        ray_t* res = ray_parquet_splayed_typed(src, dir, types);
+        ray_clear_interrupt();
+        pq_set_symmode(NULL);
+        snprintf(codes[grouped], sizeof(codes[grouped]), "%s", res && RAY_IS_ERR(res) ? ray_err_code(res) : "ok");
+        if (res) { if (RAY_IS_ERR(res)) ray_error_free(res); else ray_release(res); }
+        pq_remove_native(dir, names, 1); pq_remove_native(partial, names, 1);
+    }
+    fprintf(stderr, "  cancel codes: direct=%s grouped=%s\n", codes[0], codes[1]);
+    ray_release(types); unlink(src);
+    TEST_ASSERT_TRUE(!strcmp(codes[0], "cancel"));
+    TEST_ASSERT_TRUE(!strcmp(codes[1], "cancel"));
+    PASS();
+}
+/* Hash collisions resolved in parallel: with none of the hash's bits kept
+ * every candidate of one length collides, and the records the collisions
+ * add must not take positions in the order the workers reach them.  The
+ * symbol file and the columns are the same bytes on one worker, two, four
+ * and eight, run after run, in one window (candidates of other tasks
+ * deferred) and in a window a task (compared at once), and in another
+ * order of new positions. */
+static test_result_t test_pq_sym_grouped_collision_determinism(void) {
+#if !defined(DEBUG)
+    SKIP("hash truncation is a debug-build knob");
+#else
+    pq_sym_env_clear();
+    char src[160], dir[2][160], a[220], b[220];
+    snprintf(src, sizeof(src), "/tmp/rayforce-pq-cdet-%d.parquet", (int)getpid());
+    TEST_ASSERT_TRUE(pq_synth(src, 3000, 4, pq_synth_mixed));
+    int64_t tids[] = {ray_sym_intern("I32",3), ray_sym_intern("SYM",3), ray_sym_intern("SYM",3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 3);
+    const char* names[] = {"x","s","t"};
+    static const int cores[] = {1, 2, 4, 8, 4, 8};
+    const int nruns = (int)(sizeof(cores) / sizeof(cores[0]));
+    int differ = 0;
+    for (int v = 0; v < 3; v++) {
+        for (int i = 0; i < nruns; i++) {
+            if (v && i && i != 3) continue;   /* the other variants: one worker and eight */
+            int d = i ? 1 : 0;
+            snprintf(dir[d], sizeof(dir[d]), "/tmp/rayforce-pq-cdet-%d-%d", (int)getpid(), d);
+            ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(cores[i]), RAY_OK);
+            pq_set_symmode("grouped");
+            pq_set_env("RAY_PQ_SYM_ORDER", v == 2 ? "shards" : "rows");
+            pq_set_env("RAY_PQ_SYM_WINDOW", v == 1 ? "1" : NULL);
+            pq_set_env("RAY_PQ_SYM_HASH_BITS", "0");
+            ray_t* res = ray_parquet_splayed_typed(src, dir[d], types);
+            pq_sym_env_clear();
+            TEST_ASSERT_FALSE(!res || RAY_IS_ERR(res)); ray_release(res);
+            TEST_ASSERT_TRUE(pq_synth_check(dir[d], 3000, pq_synth_mixed));
+            if (!i) continue;
+            bool same = true;
+            snprintf(a, sizeof(a), "%s/.sym", dir[0]); snprintf(b, sizeof(b), "%s/.sym", dir[1]);
+            if (!pq_same_file(a, b)) same = false;
+            for (int c = 1; c < 3; c++) {
+                snprintf(a, sizeof(a), "%s/%s", dir[0], names[c]); snprintf(b, sizeof(b), "%s/%s", dir[1], names[c]);
+                if (!pq_same_file(a, b)) same = false;
+            }
+            if (!same) { fprintf(stderr, "  variant %d, %d workers: files differ from one worker's\n", v, cores[i]); differ++; }
+            pq_remove_native(dir[1], names, 3);
+        }
+        pq_remove_native(dir[0], names, 3);
+    }
+    ray_pool_destroy();
+    ray_release(types); unlink(src);
+    TEST_ASSERT_EQ_I(differ, 0);
+    PASS();
+#endif
+}
 const test_entry_t parquet_entries[] = {
     {"parquet/small_stack",test_pq_small_stack,NULL,NULL},
     {"parquet/parted_symbols",test_pq_parted_symbols,pq_setup,pq_teardown},
@@ -1278,6 +1640,11 @@ const test_entry_t parquet_entries[] = {
     {"parquet/sym_grouped_failures",test_pq_sym_grouped_failures,pq_setup,pq_teardown},
     {"parquet/dict_page_size",test_pq_dict_page_size,pq_setup,pq_teardown},
     {"parquet/import_no_growth",test_pq_import_no_growth,pq_setup,pq_teardown},
+    {"parquet/symgrp_collision_determinism",test_pq_sym_grouped_collision_determinism,pq_setup,pq_teardown},
+    {"parquet/symgrp_cancel_code",test_pq_sym_grouped_cancel_code,pq_setup,pq_teardown},
+    {"parquet/symgrp_edges",test_pq_sym_grouped_edges,pq_setup,pq_teardown},
+    {"parquet/symgrp_fail_leaks",test_pq_sym_grouped_fail_leaks,pq_setup,pq_teardown},
+    {"parquet/symgrp_rowgroups",test_pq_sym_grouped_rowgroups,pq_setup,pq_teardown},
 #if defined(__linux__)
     {"parquet/chunk_flush_error",test_pq_chunk_flush_error,pq_setup,pq_teardown},
 #endif
