@@ -13,3 +13,36 @@
 (at (.idx.info A 'k) 'materialized) -- false
 (.idx.info [1 2 3]) -- (.idx.info [1 2 3])
 (.sys.exec "rm -rf /tmp/rf_test_cscan_a /tmp/rf_test_cscan_b") -- 0
+;; Compressed-columns P2: the scan shapes over a generation-2 splayed table
+;; answer exactly as over the generation-0 copy of the same data, and leave
+;; the scanned columns unmaterialized (a top-k's sort key is the exception).
+(.sys.exec "rm -rf /tmp/rf_test_cscan") -- 0
+(set i (til 150000))
+(set T (table [k g v f s] (list i (as 'I16 (% i 9)) (as 'I32 (map (fn [j] (if (== 0 (% j 11)) 0N j)) i)) (as 'F64 (% i 977)) (take ['x 'y 'z] 150000))))
+(.db.splayed.set "/tmp/rf_test_cscan/g2/" T {compress: true})
+(.db.splayed.set "/tmp/rf_test_cscan/g0/" T {compress: false})
+(set A (.db.splayed.get "/tmp/rf_test_cscan/g2/"))
+(set B (.db.splayed.get "/tmp/rf_test_cscan/g0/"))
+(count (select {from: A where: (> v 70000)})) -- (count (select {from: B where: (> v 70000)}))
+(count (select {from: A where: (== g 4)})) -- (count (select {from: B where: (== g 4)}))
+(sum (at A 'v)) -- (sum (at B 'v))
+(avg (at A 'f)) -- (avg (at B 'f))
+(min (at A 'k)) -- (min (at B 'k))
+(at (select {s: (sum v) from: A by: g}) 's) -- (at (select {s: (sum v) from: B by: g}) 's)
+(at (.idx.info A 'v) 'materialized) -- false
+(at (.idx.info A 'g) 'materialized) -- false
+(at (.idx.info A 'f) 'materialized) -- false
+(at (.idx.info A 'k) 'materialized) -- false
+;; a filtered group-by over fewer survivors than the parallel threshold
+;; gathers its key and input (the v2 compact fallback, a Task 15 gap); its
+;; SYM equality predicate reads the column whole (exec_node OP_SCAN in the
+;; pre-executed filter: the gate's "file-domain SYM compare" class)
+(at (select {c: (count k) from: A where: (== s 'y) by: g}) 'c) -- (at (select {c: (count k) from: B where: (== s 'y) by: g}) 'c)
+(at (.idx.info A 'g) 'materialized) -- true
+(at (.idx.info A 'k) 'materialized) -- true
+(at (.idx.info A 's) 'materialized) -- true
+(at (select {m: (max f) from: A where: (< k 1000)}) 'm) -- (at (select {m: (max f) from: B where: (< k 1000)}) 'm)
+(at (select {k: k from: A where: (> v 100) desc: k take: 3}) 'k) -- (at (select {k: k from: B where: (> v 100) desc: k take: 3}) 'k)
+(at (.idx.info A 'v) 'materialized) -- false
+(at (.idx.info A 'f) 'materialized) -- false
+(.sys.exec "rm -rf /tmp/rf_test_cscan") -- 0

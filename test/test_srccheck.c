@@ -176,11 +176,103 @@ static test_result_t test_tmp_paths_per_process(void) {
     PASS();
 }
 
+/* P2: every request for a bound source's plain column is either guarded to
+ * a ready source or a declared random-access site.  The definition and the
+ * declaration (colrange.c / colrange.h) are skipped.  A `random:` marker
+ * names one of the audited classes (Task 15's table), so a new site cannot
+ * pass under an invented or misspelled reason. */
+static const char* const plain_classes[] = {
+    "index probe", "sort", "top-k sort key", "top-k gather (P3)", "selection gather (P3)",
+    "holistic aggregate", "wide key", "indexed v2 strategy", "first-n", "slice group",
+    "STR strlen", "join", "datalog", "pivot", "window", "user value",
+    "unstage: scalar holistic or wide input", "unstage: v2 whole-column strategy",
+    NULL,
+};
+static bool plain_marker_ok(const char* line) {
+    if (strstr(line, "/* ready-only */")) return true;
+    const char* m = strstr(line, "/* random: ");
+    if (!m) return false;
+    m += strlen("/* random: ");
+    const char* end = strstr(m, " */");
+    if (!end) return false;
+    for (int i = 0; plain_classes[i]; i++) {
+        size_t n = strlen(plain_classes[i]);
+        if ((size_t)(end - m) == n && strncmp(m, plain_classes[i], n) == 0) return true;
+    }
+    return false;
+}
+
+static void check_plain_requests(const char* p, const char* rel, srccheck_acc_t* acc) {
+    acc->nseen++;
+    if (strcmp(rel, "src/table/table.c") == 0) acc->saw_table = true;
+    if (strcmp(rel, "src/store/colrange.c") == 0 || strcmp(rel, "src/store/colrange.h") == 0) return;
+    FILE* f = fopen(p, "rb");
+    if (!f) return;
+    char line[4096]; int ln = 0;
+    while (fgets(line, sizeof line, f)) {
+        ln++;
+        if (!strstr(line, "ray_col_src_plain(")) continue;
+        if (plain_marker_ok(line)) continue;
+        if (!acc->nbad) snprintf(acc->bad, sizeof acc->bad, "%s:%d unmarked ray_col_src_plain", rel, ln);
+        acc->nbad++;
+    }
+    fclose(f);
+}
+
+static test_result_t test_plain_requests_marked(void) {
+    struct stat st;
+    const char* root = stat("src/table/table.c", &st) == 0 ? "." : "..";
+    char dir[64]; snprintf(dir, sizeof dir, "%s/src", root);
+    srccheck_acc_t acc = { "", 0, 0, false };
+    walk(dir, "src", &acc, check_plain_requests);
+    TEST_ASSERT_FMT(acc.saw_table && acc.nseen > 50, "source tree not scanned (%d files)", acc.nseen);
+    TEST_ASSERT_FMT(acc.nbad == 0, "%s (%d sites)", acc.bad, acc.nbad);
+    PASS();
+}
+
+/* The marker check itself: the accepted forms, and the near misses. */
+static test_result_t test_plain_marker_forms(void) {
+    TEST_ASSERT_TRUE(plain_marker_ok("x = ray_col_src_plain(s, &c);   /* ready-only */"));
+    TEST_ASSERT_TRUE(plain_marker_ok("x = ray_col_src_plain(s, &c);   /* random: wide key */"));
+    TEST_ASSERT_TRUE(plain_marker_ok("x = ray_col_src_plain(s, &c);   /* random: top-k gather (P3) */"));
+    TEST_ASSERT_FALSE(plain_marker_ok("x = ray_col_src_plain(s, &c);"));
+    TEST_ASSERT_FALSE(plain_marker_ok("x = ray_col_src_plain(s, &c);   /* random: */"));
+    TEST_ASSERT_FALSE(plain_marker_ok("x = ray_col_src_plain(s, &c);   /* random: wide keys */"));
+    TEST_ASSERT_FALSE(plain_marker_ok("x = ray_col_src_plain(s, &c);   /* random: a route that reads whole columns */"));
+    TEST_ASSERT_FALSE(plain_marker_ok("x = ray_col_src_plain(s, &c);   /* ready: never decodes */"));
+    PASS();
+}
+
+/* P1's transitional whole-table decode (carry 4) stays removed. */
+static void check_no_table_decode(const char* p, const char* rel, srccheck_acc_t* acc) {
+    static const char* const needles[] = { "TABLE_DECODE_OR_RETURN", NULL };
+    acc->nseen++;
+    if (strcmp(rel, "src/table/table.c") == 0) acc->saw_table = true;
+    int ln = first_hit(p, needles);
+    if (ln) {
+        if (!acc->nbad) snprintf(acc->bad, sizeof acc->bad, "%s:%d names TABLE_DECODE_OR_RETURN", rel, ln);
+        acc->nbad++;
+    }
+}
+static test_result_t test_no_table_decode_or_return(void) {
+    struct stat st;
+    const char* root = stat("src/table/table.c", &st) == 0 ? "." : "..";
+    char dir[64]; snprintf(dir, sizeof dir, "%s/src", root);
+    srccheck_acc_t acc = { "", 0, 0, false };
+    walk(dir, "src", &acc, check_no_table_decode);
+    TEST_ASSERT_FMT(acc.saw_table && acc.nseen > 50, "source tree not scanned (%d files)", acc.nseen);
+    TEST_ASSERT_FMT(acc.nbad == 0, "%s (%d files)", acc.bad, acc.nbad);
+    PASS();
+}
+
 const test_entry_t srccheck_entries[] = {
     { "srccheck/no_legacy_getters", test_no_legacy_getters, NULL, NULL },
     { "srccheck/no_raw_column_list",  test_no_raw_column_list,  NULL, NULL },
     { "srccheck/materializer_attach", test_materializer_attach, NULL, NULL },
     { "srccheck/cols_inplace_plain", test_cols_inplace_plain, NULL, NULL },
     { "srccheck/tmp_paths_per_process", test_tmp_paths_per_process, NULL, NULL },
+    { "srccheck/plain_requests_marked",      test_plain_requests_marked,      NULL, NULL },
+    { "srccheck/plain_marker_forms",         test_plain_marker_forms,         NULL, NULL },
+    { "srccheck/no_table_decode_or_return",  test_no_table_decode_or_return,  NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };

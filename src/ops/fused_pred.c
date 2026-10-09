@@ -832,9 +832,11 @@ static int fp_src_supported(const ray_col_src_t* s) {
     return !fp_src_has_nulls(s);
 }
 
-/* The step that captures a payload pointer asks for the plain column. */
+/* The step that captures a payload pointer asks for the plain column.  Both
+ * callers hold a ready source (fp_bind_fields only when out->enc is false;
+ * the STR dictionary leg only for a generation-0 column), so it never decodes. */
 static int fp_src_plain(ray_col_src_t* s, ray_t** col, ray_t** err) {
-    ray_t* e = ray_col_src_plain(s, col);
+    ray_t* e = ray_col_src_plain(s, col);   /* ready-only */
     if (e) { *err = e; return -1; }
     return 0;
 }

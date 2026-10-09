@@ -5253,6 +5253,186 @@ static test_result_t test_v2_forged_parted_segment(void) {
     PASS();
 }
 
+/* The ClickBench scan-only set of the P2 gate (the plan's Task 17
+ * SCAN_ONLY), each written over the battery tables' columns with the same
+ * operators, key widths and clauses: k and h stand for the I64 columns
+ * (WatchID, UserID), v for the nullable I32 (ClientIP), g and u for the
+ * narrow integers, d for EventDate and s for the SYM columns.  q18 and q39
+ * are pinned in sr_gaps instead (they still materialize), and q35 is a
+ * parted gap (sr_gaps_parted). */
+#define SR_Q18 "(select {c: (count h) from: T by: {h: h s: s} take: 10})"
+#define SR_Q35 "(select {one: 1 s: s c: (count s) from: T by: s desc: c take: 10})"
+#define SR_Q39 "(take (select {s: s p: (count s) from: T where: (and (== g 3) (>= d 100) (<= d 400) " \
+               "(== b false) (!= u 0)) by: s desc: p take: 1010}) -10)"
+#define SR_COMPACT_GROUP "(select {c: (count k) from: T where: (< k 1000) by: g})"
+#define SR_AND_COUNT "(count (select {from: T where: (and (== g 3) (!= u 0))}))"
+static const char* const sr_clickbench_scan[] = {
+    "(count T)",                                                                          /* q1 */
+    "(count (select {from: T where: (!= u 0)}))",                                         /* q2 */
+    "(table [a b c] (list (list (sum (at T 'g))) (list (count T)) (list (avg (at T 'v)))))", /* q3 */
+    "(avg (at T 'h))",                                                                    /* q4 */
+    "(table [a b] (list (list (min (at T 'd))) (list (max (at T 'd)))))",                 /* q7 */
+    "(select {u: u c: (count u) from: T where: (!= u 0) by: u desc: c take: 10})",        /* q8 */
+    "(select {h: h c: (count h) from: T by: h desc: c take: 10})",                        /* q16 */
+    "(select {c: (count h) from: T by: {h: h s: s} desc: c take: 10})",                   /* q17 */
+    "(select {c: (count v) s: (sum g) a: (avg u) from: T by: {k: k v: v} desc: c take: 10})", /* q33 */
+    "(select {s: s c: (count s) from: T by: s desc: c take: 10})",                        /* q34 */
+    SR_Q35,                                                                               /* q35 */
+    NULL,
+};
+
+/* Each shape answers as over generation 0 with `want` materializations on
+ * the generation-2 table (dirs t0 / t2, written as T); at_first_exec is
+ * latched only by ray_execute (scalar and filtered grouped shapes
+ * pre-execute through exec_node, P1 Task 33), so it is checked only where
+ * it latched (M8). */
+static test_result_t sr_battery(const char* t0, const char* t2, const char* const* shapes, uint64_t want,
+                                const char* skip) {
+    for (int i = 0; shapes[i]; i++) {
+        if (skip && strcmp(shapes[i], skip) == 0) continue;
+        test_result_t r = sr_same_on(t0, t2, shapes[i], want);
+        if (r.status != TEST_PASS) return r;
+        ray_enc_counters_t k; ray_enc_counters_get(&k);
+        TEST_ASSERT_FMT(k.at_first_exec == 0 || k.at_first_exec == UINT64_MAX,
+                        "%s: %llu materializations before execution", shapes[i],
+                        (unsigned long long)k.at_first_exec);
+    }
+    PASS();
+}
+
+/* Scan-only shapes that still materialize (the Task 15 report's gaps),
+ * pinned at today's count so a fix or a regression shows here.  Each names
+ * the route that gathers. */
+typedef struct { const char* q; uint64_t mat; } sr_gap_t;
+static const sr_gap_t sr_gaps[] = {
+    /* q18: a group-by take without an order runs the first-n pre-pass
+     * (agg_first_n_run), whose keys unstage (agg_keys_unstage, first-n) */
+    { SR_Q18, 2 },
+    /* q39: the conjunction's later filter refines a selective first one by
+     * gathering its predicate column (exec_node OP_FILTER -> sel_compact),
+     * and the v2 group over fewer survivors than the parallel threshold
+     * gathers its key (AGG_RUN_COMPACT_FALLBACK -> agg_build_compact) */
+    { SR_Q39, 2 },
+    /* the v2 compact fallback alone: a filtered group-by under the parallel
+     * threshold gathers its key and input (agg_build_compact) */
+    { SR_COMPACT_GROUP, 2 },
+    /* a conjunctive where: declines the count-of-select shortcut
+     * (ray_try_count_select_expr); the select's final compaction gathers
+     * every column (ray_execute -> sel_compact) before count */
+    { SR_AND_COUNT, 10 },
+    { NULL, 0 },
+};
+/* The parted arm's gaps (three partitions of eight columns).  q18 takes the
+ * flat-copy run (agg_seg_flat_run) and gathers nothing there. */
+static const sr_gap_t sr_gaps_parted[] = {
+    /* q35: a non-aggregate output (`one: 1`) beside a parted group-by
+     * flattens the whole table (ray_select_impl ->
+     * query_materialize_parted_table): every column of every segment */
+    { SR_Q35, 24 },
+    /* q39: the filter refinement and the compact fallback, per segment */
+    { SR_Q39, 6 },
+    { SR_COMPACT_GROUP, 2 },
+    /* every column of every segment, as on the splayed table */
+    { SR_AND_COUNT, 24 },
+    { NULL, 0 },
+};
+
+/* Review focus 5: every scan-only shape, planning included, leaves the
+ * materialization counter at zero on a generation-2 table; the binding
+ * assert is the final count (sr_same).  Then the ClickBench scan-only set,
+ * the known gaps at their pinned counts, and the row-returning filter: both
+ * ray_execute of a bare FILTER (the API caller, Task 5) and a language
+ * select that returns the filtered table compact the selection through
+ * sel_compact, gathering every column (selection gather, P3); counting the
+ * same filter gathers none (the first shape). */
+static test_result_t test_no_materialization(void) {
+    static const char* const shapes[] = {
+        "(count (select {from: T where: (!= g 0)}))",
+        "(count (select {from: T where: (> v 1000)}))",
+        "(select {c: (count k) from: T where: (and (>= k 1000) (< k 150000) (== b true))})",
+        "(select {s: (sum v) a: (avg f) mn: (min d) mx: (max u) from: T})",
+        "(sum (at T 'v))",
+        "(avg (at T 'f))",
+        "(min (at T 'd))",
+        "(select {s: (sum v) c: (count k) from: T by: g})",
+        "(select {c: (count k) from: T where: (> v 100) by: {g: g s: s}})",
+        "(select {c: (count k) from: T by: k})",
+        "(select {c: (count k) from: T where: (== h 1000004)})",
+        "(select {s: (sum (+ k 5)) t: (sum (* f 2.0)) from: T where: (< g 4)})",
+        "(select {l: (avg (strlen s)) from: T})",
+        NULL,
+    };
+    const char* t0 = "(.db.splayed.get \"" SR_G0 "\")";
+    const char* t2 = "(.db.splayed.get \"" SR_G2 "\")";
+    test_result_t r = sr_battery(t0, t2, shapes, 0, NULL);
+    if (r.status == TEST_PASS) r = sr_battery(t0, t2, sr_clickbench_scan, 0, NULL);
+    for (int i = 0; r.status == TEST_PASS && sr_gaps[i].q; i++)
+        r = sr_same_on(t0, t2, sr_gaps[i].q, sr_gaps[i].mat);
+    if (r.status != TEST_PASS) return r;
+
+    uint64_t mat[2] = { 0, 0 };
+    int64_t rows[2] = { -1, -1 };
+    for (int lang = 0; lang < 2; lang++) {
+        ray_t* t = sr_load(1);
+        TEST_ASSERT_NOT_NULL(t);
+        if (lang) {
+            ray_env_set(ray_sym_intern("T", 1), t);
+            ray_enc_counters_reset();
+            ray_t* q = sr_eval("(select {from: T where: (> v 100)})");
+            TEST_ASSERT_TRUE(q && !RAY_IS_ERR(q) && q->type == RAY_TABLE);
+            rows[lang] = ray_table_nrows(q);
+            sr_drop(q);
+        } else {
+            ray_graph_t* g = ray_graph_new(t);
+            ray_op_t* root = ray_filter(g, ray_const_table(g, t), cpred_v_gt(g));
+            ray_enc_counters_reset();
+            ray_t* q = ray_execute(g, ray_optimize(g, root));
+            TEST_ASSERT_TRUE(q && !RAY_IS_ERR(q) && q->type == RAY_TABLE);
+            rows[lang] = ray_table_nrows(q);
+            sr_drop(q); ray_graph_free(g);
+        }
+        ray_enc_counters_t k; ray_enc_counters_get(&k);
+        mat[lang] = k.materialized;
+        ray_release(t);
+    }
+    TEST_ASSERT_EQ_I(rows[0], rows[1]);
+    TEST_ASSERT_FMT(mat[0] == 10, "ray_execute of a bare FILTER: %llu materializations, want 10 (every column)",
+                    (unsigned long long)mat[0]);
+    TEST_ASSERT_FMT(mat[1] == 10, "select of the same filter: %llu materializations, want 10 (every column)",
+                    (unsigned long long)mat[1]);
+    PASS();
+}
+
+/* The parted arm of the gate: the same shapes over three partitions of a
+ * generation-2 parted table (the in-place routes) against generation 0. */
+static test_result_t test_no_materialization_parted(void) {
+    for (int gen = 0; gen <= 2; gen += 2)
+        for (int p = 0; p < 3; p++)
+            sr_evalf_ok("(.db.splayed.set \"" SR_TMP "/np%d/2024.01.0%d/t/\" "
+                        "(table [k g v d s b u h] (list (+ (til 70000) %d) (as 'I16 (%% (til 70000) 7)) "
+                        "(as 'I32 (map (fn [j] (if (== 0 (%% j 10)) 0N (- (* 3 j) 7))) (til 70000))) "
+                        "(as 'DATE (%% (til 70000) 900)) (take ['a 'b 'c 'd 'e] 70000) (== 0 (%% (til 70000) 3)) "
+                        "(as 'U8 (%% (til 70000) 200)) (%% (* (+ (til 70000) %d) 7919) 1000003))) "
+                        "\"" SR_TMP "/np%d/.sym\" {compress: %s})",
+                        gen, p + 1, p * 70000, p * 70000, gen, gen ? "true" : "false");
+    static const char* const shapes[] = {
+        "(count (select {from: T where: (!= g 0)}))",
+        "(sum (at T 'v))",
+        "(select {s: (sum v) c: (count k) from: T by: g})",
+        "(select {c: (count k) from: T where: (> v 100) by: {g: g s: s}})",
+        "(select {c: (count k) from: T by: k})",
+        NULL,
+    };
+    const char* t0 = "(.db.parted.get \"" SR_TMP "/np0\" 't)";
+    const char* t2 = "(.db.parted.get \"" SR_TMP "/np2\" 't)";
+    test_result_t r = sr_battery(t0, t2, shapes, 0, NULL);
+    /* q35 is a parted gap (sr_gaps_parted) */
+    if (r.status == TEST_PASS) r = sr_battery(t0, t2, sr_clickbench_scan, 0, SR_Q35);
+    for (int i = 0; r.status == TEST_PASS && sr_gaps_parted[i].q; i++)
+        r = sr_same_on(t0, t2, sr_gaps_parted[i].q, sr_gaps_parted[i].mat);
+    return r;
+}
+
 const test_entry_t scanrange_entries[] = {
     { "scanrange/walk_gen0_zero_copy",     test_walk_gen0_zero_copy,     sr_setup,    sr_teardown },
     { "scanrange/walk_gen2_vectors",       test_walk_gen2_vectors,       sr_setup,    sr_teardown },
@@ -5375,5 +5555,8 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/v2_forged_parted_segment", test_v2_forged_parted_segment, sr_rt_setup, srr_teardown },
     { "scanrange/idx_info_table",     test_idx_info_table,     srr_setup, srr_teardown },
     { "scanrange/idx_info_report",    test_idx_info_report,    srr_setup, srr_teardown },
+    { "scanrange/no_materialization", test_no_materialization, srr_setup, srr_teardown },
+    { "scanrange/no_materialization_parted", test_no_materialization_parted, srr_setup, srr_teardown },
+    { "scanrange/no_materialization", test_no_materialization, srr_setup, srr_teardown },
     { NULL, NULL, NULL, NULL },
 };

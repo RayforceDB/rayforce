@@ -414,7 +414,7 @@ bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
     }
     for (uint8_t i = 0; i < lin.n_terms; i++) {
         ray_t* col = NULL;
-        *err = ray_col_src_plain(srcs[i], &col);
+        *err = ray_col_src_plain(srcs[i], &col);   /* ready-only */
         if (*err) return false;
         out_plan->term_ptrs[i] = ray_data(col);
         out_plan->term_types[i] = srcs[i]->type;
@@ -462,9 +462,9 @@ bool try_prod_sumavg_input_f64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
 
     ray_t* ca = NULL;
     ray_t* cb = NULL;
-    *err = ray_col_src_plain(sa, &ca);
+    *err = ray_col_src_plain(sa, &ca);   /* ready-only */
     if (*err) return false;
-    *err = ray_col_src_plain(sb, &cb);
+    *err = ray_col_src_plain(sb, &cb);   /* ready-only */
     if (*err) return false;
     out->enabled = true;
     out->pa = ray_data(ca); out->ta = sa->type; out->aa = sa->attrs;
@@ -919,7 +919,7 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
                     ray_t* col = NULL;
                     if (enc_parted) col = src->obj;        /* segments read by expr_eval_full_parted */
                     else {
-                        *err = ray_col_src_plain(src, &col);   /* ready: never decodes */
+                        *err = ray_col_src_plain(src, &col);   /* ready-only */
                         if (*err) return false;
                     }
                     if (src->parted) {

@@ -78,7 +78,7 @@ Signature: `(.idx.info table 'col)`. Describes a table column's on-disk format w
 |-----|---------|
 | `gen` | `2` for a compressed column, `0` for a plain one (a ragged generation-0 parted table also reports `0`). |
 | `enc` | Encoding name (`raw const for_bp delta_bp rle dict alp alp_rd str_dict fsst`) to vector count, nonzero counts only; empty for generation 0. |
-| `encoded_bytes` | Bytes of the encoded column file (a parted column sums its segments). |
+| `encoded_bytes` | Bytes of the encoded column file (a parted column sums its segments). A synthetic stand-in segment (a ragged partition's absent column) adds nothing to `encoded_bytes` or the `enc` counts but does count in `raw_bytes`, and a plain parted segment counts its raw bytes. |
 | `raw_bytes` | Bytes of the column as a plain vector (a string column includes its pool). |
 | `materialized` | `true` once the plain column has been decoded and cached. |
 | `index` | Generation 0: `.idx.info` of the attached index. Generation 2: the recorded index kind (`'none` when none); never materializes. |

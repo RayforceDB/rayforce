@@ -9411,9 +9411,6 @@ static bool scalar_stageable(int8_t t, uint16_t op) {
     }
 }
 
-/* A staged input's plain column for a site that reads whole columns: the
- * source's materialization (a generation-2 column decodes once, through
- * its once-state), retained and owned by the caller's slot. */
 /* Take `plain` (a source's plain column, borrowed) into a caller's slot:
  * retained and owned.  NULL or an owned error. */
 static ray_t* group_own_plain(ray_t* plain, ray_t** vec, uint8_t* owned) {
@@ -9424,9 +9421,15 @@ static ray_t* group_own_plain(ray_t* plain, ray_t** vec, uint8_t* owned) {
     return NULL;
 }
 
+/* A staged input's plain column for a site that reads whole columns: the
+ * source's materialization (a generation-2 column decodes once, through
+ * its once-state), retained and owned by the caller's slot.  Callers: the
+ * scalar route's inputs outside scalar_stageable (holistic and row-gathered
+ * aggregates, wide types) and GROUP_UNSTAGE (a selection flattened to
+ * match_idx, which exec_group_run no longer builds). */
 static ray_t* agg_unstage(ray_col_src_t* src, ray_t** vec, uint8_t* owned) {
     ray_t* plain = NULL;
-    ray_t* err = ray_col_src_plain(src, &plain);   /* random: a route that reads whole columns */
+    ray_t* err = ray_col_src_plain(src, &plain);   /* random: unstage: scalar holistic or wide input */
     return err ? err : group_own_plain(plain, vec, owned);
 }
 

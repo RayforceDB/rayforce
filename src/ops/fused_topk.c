@@ -544,7 +544,7 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
             && kt != RAY_F32 && kt != RAY_F64 && kt != RAY_GUID)
             { fpk_unpin_keys(ctx.keys, i); ray_graph_free(g); return NULL; }
         ray_t* col = NULL;
-        ray_t* perr = ray_col_src_plain(ksrc, &col);
+        ray_t* perr = ray_col_src_plain(ksrc, &col);   /* random: top-k sort key */
         if (perr) { fpk_unpin_keys(ctx.keys, i); ray_graph_free(g); return perr; }
         ctx.keys[i].type      = kt;
         ctx.keys[i].attrs     = col->attrs;
@@ -716,7 +716,7 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
         if (gerr) { build_ok = 0; break; }
         if (!ssrc) { build_ok = 0; break; }
         ray_t* src = NULL;
-        gerr = ray_col_src_plain(ssrc, &src);        /* P3: vector-grouped range reads */
+        gerr = ray_col_src_plain(ssrc, &src);   /* random: top-k gather (P3) */
         if (gerr) { build_ok = 0; break; }
         ray_t* col = gather_by_idx(src, global_idx, global_n);
         if (!col || RAY_IS_ERR(col)) { build_ok = 0; break; }
@@ -975,7 +975,7 @@ ray_t* ray_fused_take_select(ray_t* tbl,
         if (gerr) { build_ok = 0; break; }
         if (!ssrc) { build_ok = 0; break; }
         ray_t* src = NULL;
-        gerr = ray_col_src_plain(ssrc, &src);        /* P3: vector-grouped range reads */
+        gerr = ray_col_src_plain(ssrc, &src);   /* random: top-k gather (P3) */
         if (gerr) { build_ok = 0; break; }
         ray_t* col = gather_by_idx(src, out, out_n);
         if (!col || RAY_IS_ERR(col)) { build_ok = 0; break; }

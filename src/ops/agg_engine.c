@@ -503,7 +503,7 @@ static ray_t* agg_keys_unstage(ray_t** key_cols, agg_keyset_t* ks) {
     for (uint32_t k = 0; k < ks->rr.n_keys; k++) {
         if (!ks->srcs[k]) continue;
         ray_t* plain = NULL;
-        ray_t* err = ray_col_src_plain(ks->srcs[k], &plain);
+        ray_t* err = ray_col_src_plain(ks->srcs[k], &plain);   /* random: unstage: v2 whole-column strategy */
         if (err) return err;
         if (!plain) return ray_error("domain", "group key: no column");
         key_cols[k] = plain;               /* borrowed: valid while the source is bound */
