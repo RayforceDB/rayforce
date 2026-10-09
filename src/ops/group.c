@@ -12975,7 +12975,11 @@ static void sp_walk_piece(void* ctx, uint32_t wid, int64_t b, int64_t e, const r
     const void* kd = ks ? p[0].data : c->key_plain;
     const int64_t kb = ks ? b : 0;                  /* the key is read at r - kb */
     const uint8_t kesz = ks ? ray_sym_elem_size(c->key_type, p[0].attrs) : c->key_esz;
-#define SPW_WIDTHS(P) do { switch (kesz) {                                                  case 1:  sp_walk_rows(c, p, b, e, kd, kb, (P), 1); break;                          case 2:  sp_walk_rows(c, p, b, e, kd, kb, (P), 2); break;                          case 4:  sp_walk_rows(c, p, b, e, kd, kb, (P), 4); break;                          default: sp_walk_rows(c, p, b, e, kd, kb, (P), 8); break; } } while (0)
+#define SPW_WIDTHS(P) do { switch (kesz) {                                              \
+    case 1:  sp_walk_rows(c, p, b, e, kd, kb, (P), 1); break;                               \
+    case 2:  sp_walk_rows(c, p, b, e, kd, kb, (P), 2); break;                               \
+    case 4:  sp_walk_rows(c, p, b, e, kd, kb, (P), 4); break;                               \
+    default: sp_walk_rows(c, p, b, e, kd, kb, (P), 8); break; } } while (0)
     switch (c->pass) {
     case SPW_MINMAX:   SPW_WIDTHS(SPW_MINMAX); break;
     case SPW_RANGE:    SPW_WIDTHS(SPW_RANGE); break;

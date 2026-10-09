@@ -855,6 +855,246 @@ static test_result_t test_fast_kernel_corrupt_twice(void) {
     PASS();
 }
 
+/* ---- Task 13b fix round 1: statistics that size memory are checked ----
+ * The directory's chunk statistics size engine structures (dense slabs,
+ * direct arrays, key ranges), so the reader keeps every decoded value
+ * inside them: each vector's statistics nest inside its chunk's (checked
+ * with the chunk's descriptors), and each decoded non-null value lies
+ * inside its vector's (checked by every decode path).  A violation is
+ * `corrupt`; a forged statistic is never trusted for memory. */
+
+#define STATS_OUT "statistics outside the chunk's"
+#define VALUE_OUT "value outside its statistics"
+
+/* Descriptor statistics reaching outside the chunk's, a vector without
+ * statistics under a chunk with them, statistics outside the type: the
+ * chunk's descriptor validation rejects each. */
+static test_result_t test_stats_nested(void) {
+    const char* p = ray_test_tmp(EC_TMP "/sn");
+    size_t D;
+    SAVE(i32_for(), p); D = desc_at(0, 0);
+    TEST_ASSERT_EQ_U(rd64(D + 40), rd64(DIR(0) + 24));
+    W64(D + 40, rd64(DIR(0) + 24) + 1);                     BAD(p, 1, "corrupt", "vector 0 " STATS_OUT);
+    SAVE(i32_for(), p); D = desc_at(0, 0);
+    W64(D + 32, rd64(DIR(0) + 16) - 1);                     BAD(p, 1, "corrupt", "vector 0 " STATS_OUT);
+    SAVE(i32_for(), p); D = desc_at(0, 0);
+    W64(D + 40, rd64(DIR(0) + 24) + 1);                     BAD(p, 2, "corrupt", "vector 0 " STATS_OUT);   /* a range read */
+    SAVE(f64_stats(), p); { double hi = 100.0; wr(desc_at(0, 0) + 40, &hi, 8); } BAD(p, 1, "corrupt", STATS_OUT);
+    SAVE(f64_stats(), p); { double lo = -1.0; wr(desc_at(0, 0) + 32, &lo, 8); }  BAD(p, 1, "corrupt", STATS_OUT);
+    {   /* SYM ids 1..4: the vector's maximum 5 is inside the domain, outside the chunk */
+        uint8_t ids[4] = { 1, 2, 3, 4 };
+        SAVE_SYM(ids, 4, p); W64(desc_at(0, 0) + 40, 5);    BAD(p, 1, "corrupt", STATS_OUT);
+    }
+    /* the second vector of a chunk: the chunk's range is the union */
+    {
+        ray_t* v = ray_vec_new(RAY_I32, 2048); v->len = 2048;
+        for (int i = 0; i < 2048; i++) ((int32_t*)ray_data(v))[i] = i < 1024 ? 100 + i % 7 : 200 + i % 9;
+        SAVE(v, p);
+        TEST_ASSERT_EQ_U(rd64(DIR(0) + 16), 100); TEST_ASSERT_EQ_U(rd64(DIR(0) + 24), 208);
+        W64(desc_at(0, 1) + 40, 209);                       BAD(p, 1, "corrupt", "vector 1 " STATS_OUT);
+    }
+    /* a vector without statistics under a chunk with them */
+    SAVE(i32_for(), p); D = desc_at(0, 0);
+    W16(D + 4, RAY_ENC_STAT_ABSENT); W64(D + 32, 0); W64(D + 40, 0);
+    BAD(p, 1, "corrupt", "vector 0 statistics missing under the chunk's");
+    SAVE(i32_for(), p); W32(DIR(0) + 56, RAY_ENC_STAT_ABSENT); W64(DIR(0) + 16, 0); W64(DIR(0) + 24, 0);
+    BAD(p, 1, "corrupt", "vector 0 statistics under a chunk without them");
+    /* statistics outside the type (the chunk's moved with them, so they nest) */
+    SAVE(i32_for(), p); W64(desc_at(0, 0) + 40, 1ull << 40); W64(DIR(0) + 24, 1ull << 40);
+    BAD(p, 1, "corrupt", "vector 0 statistics outside the type");
+    SAVE(fk_for(RAY_I16), p); W64(desc_at(0, 0) + 32, (uint64_t)(int64_t)-40000); W64(DIR(0) + 16, (uint64_t)(int64_t)-40000);
+    BAD(p, 1, "corrupt", "vector 0 statistics outside the type");
+    SAVE(bool_runs(), p); W64(desc_at(0, 0) + 40, 256); W64(DIR(0) + 24, 256);
+    BAD(p, 1, "corrupt", "vector 0 statistics outside the type");
+    PASS();
+}
+
+/* Vector `vec` of the patched image read widened to I64 (an expression
+ * register): declined, so the range read reports it. */
+static const char* wide_declines(const char* path, int64_t vec) {
+    if (!img_store(path, g_len)) return "store";
+    ray_t* c = ray_col_mmap(path);
+    if (!c || RAY_IS_ERR(c)) { if (c) ray_error_free(c); return "load failed"; }
+    ray_col_src_t src;
+    ray_t* m = ray_col_src_bind(c, &src);
+    if (m) { ray_error_free(m); ray_release(c); return "bind failed"; }
+    ray_col_scratch_t sc; ray_col_scratch_init(&sc);
+    static int64_t dst[RAY_ENC_VEC];
+    int64_t got = -1;
+    ray_t* e = ray_col_range_wide(&src, vec * RAY_ENC_VEC, RAY_ENC_VEC, &sc, RAY_I64, dst, &got);
+    const char* res = e ? "the widened read failed instead of declining" : got != 0 ? "the widened read served the vector" : NULL;
+    if (e) ray_error_free(e);
+    ray_col_scratch_free(&sc); ray_col_src_release(&src);
+    ray_release(c);
+    return res;
+}
+/* the unpatched control: the widened read serves the vector */
+static bool wide_serves(const char* path, int64_t vec) {
+    if (!img_store(path, g_len)) return false;
+    ray_t* c = ray_col_mmap(path);
+    if (!c || RAY_IS_ERR(c)) { if (c) ray_error_free(c); return false; }
+    ray_col_src_t src;
+    ray_t* m = ray_col_src_bind(c, &src);
+    if (m) { ray_error_free(m); ray_release(c); return false; }
+    ray_col_scratch_t sc; ray_col_scratch_init(&sc);
+    static int64_t dst[RAY_ENC_VEC];
+    int64_t got = -1;
+    ray_t* e = ray_col_range_wide(&src, vec * RAY_ENC_VEC, RAY_ENC_VEC, &sc, RAY_I64, dst, &got);
+    bool ok = !e && got == RAY_ENC_VEC;
+    if (e) ray_error_free(e);
+    ray_col_scratch_free(&sc); ray_col_src_release(&src);
+    ray_release(c);
+    return ok;
+}
+#define WIDE_DECLINES(path, vec) do { const char* w_ = wide_declines(path, vec); \
+    TEST_ASSERT_FMT(w_ == NULL, "%s:%d %s", __FILE__, __LINE__, w_); } while (0)
+
+/* A decoded non-null value outside its vector's statistics (the
+ * descriptor moved inward past a real value, still inside the chunk's):
+ * corrupt on every decode path an aware consumer reads (the FOR_BP and
+ * DELTA_BP kernels at both widths, with and without a bitmap, the DICT
+ * kernel, the SYM kernel, the reference decode, the float view and copy,
+ * the widened read, the materialization), on the first read and the
+ * second. */
+static test_result_t test_stats_values(void) {
+    const char* p = ray_test_tmp(EC_TMP "/sv");
+    size_t D;
+    for (int t = 0; t < 2; t++) {
+        int8_t type = t ? RAY_I32 : RAY_I16;
+        /* the range spans the full width (min + 2^w - 1 == max): the FOR_BP proof holds unpatched */
+        SAVE(fk_for(type), p); NEED_ENC(0, 0, RAY_ENC_FOR_BP); D = desc_at(0, 0);
+        TEST_ASSERT_EQ_U(rd64(D + 40) - rd64(D + 32), (1u << g_img[D + 1]) - 1);
+        TEST_ASSERT_TRUE(wide_serves(p, 0));
+        W64(D + 40, rd64(D + 40) - 1);                      BAD2(p, 0, VALUE_OUT);
+        EXPECT(p, 1, "corrupt", VALUE_OUT);
+        WIDE_DECLINES(p, 0);
+        SAVE(fk_for(type), p); D = desc_at(0, 0);
+        W64(D + 32, rd64(D + 32) + 1);                      BAD2(p, 0, VALUE_OUT);
+        WIDE_DECLINES(p, 0);
+        /* with a null bitmap: the merge */
+        SAVE(fk_for_nulls(type), p); NEED_ENC(0, 0, RAY_ENC_FOR_BP); D = desc_at(0, 0);
+        TEST_ASSERT_TRUE(wide_serves(p, 0));
+        W64(D + 40, rd64(D + 40) - 1);                      BAD2(p, 0, VALUE_OUT);
+        WIDE_DECLINES(p, 0);
+    }
+    /* I32 FOR_BP whose range is not a full width (no proof): the kernel checks */
+    {
+        ray_t* v = ray_vec_new(RAY_I32, 1024); v->len = 1024;
+        for (int i = 0; i < 1024; i++) ((int32_t*)ray_data(v))[i] = 100 + i % 7;
+        SAVE(v, p);
+    }
+    NEED_ENC(0, 0, RAY_ENC_FOR_BP); D = desc_at(0, 0);
+    TEST_ASSERT_TRUE(rd64(D + 40) - rd64(D + 32) < (1u << g_img[D + 1]) - 1);
+    W64(D + 40, rd64(D + 40) - 1);                          BAD2(p, 0, VALUE_OUT);
+    /* DELTA_BP (vector 1), at both widths */
+    SAVE(fk_delta(), p); NEED_ENC(0, 1, RAY_ENC_DELTA_BP); D = desc_at(0, 1);
+    W64(D + 40, rd64(D + 40) - 1);                          BAD2(p, 1, VALUE_OUT);
+    SAVE(fk_delta(), p); D = desc_at(0, 1);
+    W64(D + 32, rd64(D + 32) + 1);                          BAD2(p, 1, VALUE_OUT);
+    {
+        ray_t* v = ray_vec_new(RAY_I16, 2048); v->len = 2048;
+        for (int i = 0; i < 2048; i++) ((int16_t*)ray_data(v))[i] = (int16_t)(3 * i + i % 5 - 3000);
+        SAVE(v, p); NEED_ENC(0, 1, RAY_ENC_DELTA_BP); D = desc_at(0, 1);
+        TEST_ASSERT_TRUE(wide_serves(p, 1));
+        W64(D + 40, rd64(D + 40) - 1);                      BAD2(p, 1, VALUE_OUT);
+        WIDE_DECLINES(p, 1);
+    }
+    /* DICT over FOR_BP codes: the kernel's gather (values 11, 77, 900000000001, 123456789012345) */
+    SAVE(i64_dict(), p); NEED_ENC(0, 0, RAY_ENC_DICT); D = desc_at(0, 0);
+    W64(D + 40, 900000000001ull);                           BAD2(p, 0, VALUE_OUT);
+    EXPECT(p, 1, "corrupt", VALUE_OUT);
+    SAVE(i64_dict(), p); D = desc_at(0, 0);
+    W64(D + 32, 77);                                        BAD2(p, 0, VALUE_OUT);
+    /* the reference decode: BOOL RLE, I32 RAW with a bitmap */
+    SAVE(bool_runs(), p); NEED_ENC(0, 0, RAY_ENC_RLE);
+    W64(desc_at(0, 0) + 40, 0);                             BAD2(p, 0, VALUE_OUT);
+    SAVE(i32_nulls_raw(), p); NEED_ENC(0, 0, RAY_ENC_RAW); D = desc_at(0, 0);
+    W64(D + 40, rd64(D + 40) - 1);                          BAD2(p, 0, VALUE_OUT);
+    SAVE(i32_nulls_raw(), p); D = desc_at(0, 0);
+    W64(D + 32, rd64(D + 32) + 1);                          BAD2(p, 0, VALUE_OUT);
+    {   /* SYM FOR_BP, ids 1..32 */
+        uint8_t ids[1024];
+        for (int i = 0; i < 1024; i++) ids[i] = (uint8_t)(1 + ((uint32_t)i * 2654435761u >> 27));
+        SAVE_SYM(ids, 1024, p); NEED_ENC(0, 0, RAY_ENC_FOR_BP); D = desc_at(0, 0);
+        TEST_ASSERT_EQ_U(rd64(D + 32), 1); TEST_ASSERT_EQ_U(rd64(D + 40), 32);
+        W64(D + 40, 31);                                    BAD2(p, 0, VALUE_OUT);
+        SAVE_SYM(ids, 1024, p); W64(desc_at(0, 0) + 32, 2); BAD2(p, 0, VALUE_OUT);
+        /* the reference decode of a SYM RLE vector */
+        for (int i = 0; i < 1024; i++) ids[i] = (uint8_t)(1 + i / 100);
+        SAVE_SYM(ids, 1024, p); NEED_ENC(0, 0, RAY_ENC_RLE);
+        W64(desc_at(0, 0) + 40, 10);                        BAD2(p, 0, VALUE_OUT);
+    }
+    /* floats: RAW without nulls (read in place), with a NaN null (the copy) */
+    SAVE(f64_stats(), p); NEED_ENC(0, 0, RAY_ENC_RAW);
+    { double hi = 98.0; wr(desc_at(0, 0) + 40, &hi, 8); }  BAD2(p, 0, VALUE_OUT);
+    SAVE(f64_stats(), p); { double lo = 0.5; wr(desc_at(0, 0) + 32, &lo, 8); } BAD2(p, 0, VALUE_OUT);
+    {
+        ray_t* f = f64_stats();
+        ((double*)ray_data(f))[10] = NAN; f->attrs |= RAY_ATTR_HAS_NULLS;
+        SAVE(f, p); TEST_ASSERT_TRUE(rd64(desc_at(0, 0)) >> 16 & 0xFFFF);
+        double hi = 98.0; wr(desc_at(0, 0) + 40, &hi, 8);   BAD2(p, 0, VALUE_OUT);
+    }
+    SAVE(f32_plain(), p); { double hi = 2.5; wr(desc_at(0, 0) + 40, &hi, 8); } BAD2(p, 0, VALUE_OUT);
+    PASS();
+}
+
+/* The point read (the samplers' row read): a row above a descriptor
+ * maximum patched below it is corrupt, naming the path, on every read; a
+ * row inside it is served.  FOR_BP and DICT. */
+static const char* point_reads(const char* path, const int64_t* want, int64_t n, int64_t over, bool patched) {
+    static char why[512];
+    if (!img_store(path, g_len)) return "store";
+    ray_t* c = ray_col_mmap(path);
+    if (!c || RAY_IS_ERR(c)) { if (c) ray_error_free(c); return "load failed"; }
+    ray_col_src_t src;
+    ray_t* m = ray_col_src_bind(c, &src);
+    if (m) { ray_error_free(m); ray_release(c); return "bind failed"; }
+    const char* res = NULL;
+    int64_t bad = 0;
+    for (int pass = 0; pass < 2 && !res; pass++)
+        for (int64_t r = 0; r < n && !res; r++) {
+            int64_t x = 0; ray_t* err = NULL;
+            ray_error_clear();
+            int pr = ray_col_src_point_i64(&src, r, &x, &err);
+            if (want[r] > over) {
+                bool ok = pr == -1 && err && strcmp(ray_err_code(err), "corrupt") == 0 && names_path(path) && has_needle(VALUE_OUT);
+                if (!ok) { snprintf(why, sizeof why, "pass %d row %lld (%lld): point read %d \"%s\", want corrupt", pass, (long long)r,
+                                    (long long)want[r], pr, err && ray_error_msg() ? ray_error_msg() : ""); res = why; }
+                bad += pass == 0;
+            } else if (pr != 1 || x != want[r]) {
+                snprintf(why, sizeof why, "pass %d row %lld: point read %d value %lld, want %lld", pass, (long long)r, pr,
+                         (long long)x, (long long)want[r]);
+                res = why;
+            }
+            if (err) ray_error_free(err);
+        }
+    if (!res && patched != (bad > 0)) res = patched ? "no row above the patched maximum" : "a row above the maximum";
+    ray_col_src_release(&src);
+    ray_release(c);
+    return res;
+}
+#define POINT_READS(path, want, n, over, patched) do { const char* w_ = point_reads(path, want, n, over, patched); \
+    TEST_ASSERT_FMT(w_ == NULL, "%s:%d %s", __FILE__, __LINE__, w_); } while (0)
+
+static test_result_t test_stats_point_read(void) {
+    const char* p = ray_test_tmp(EC_TMP "/sp");
+    static int64_t want[1024];
+    ray_t* v = i32_for();
+    for (int i = 0; i < 1024; i++) want[i] = ((int32_t*)ray_data(v))[i];
+    SAVE(v, p); NEED_ENC(0, 0, RAY_ENC_FOR_BP);
+    int64_t mx = (int64_t)rd64(desc_at(0, 0) + 40);
+    POINT_READS(p, want, 1024, mx, false);                   /* control: every row served */
+    W64(desc_at(0, 0) + 40, (uint64_t)(mx - 1));
+    POINT_READS(p, want, 1024, mx - 1, true);
+    v = i64_dict();
+    for (int i = 0; i < 1024; i++) want[i] = ((int64_t*)ray_data(v))[i];
+    SAVE(v, p); NEED_ENC(0, 0, RAY_ENC_DICT);
+    POINT_READS(p, want, 1024, INT64_MAX, false);
+    W64(desc_at(0, 0) + 40, 900000000001ull);
+    POINT_READS(p, want, 1024, 900000000001ll, true);
+    PASS();
+}
+
 /* Damage in a range nobody reads stays unread; whoever reads it gets corrupt. */
 static test_result_t test_lazy_validation(void) {
     const char* p = ray_test_tmp(EC_TMP "/lazy");
@@ -989,6 +1229,9 @@ const test_entry_t enccorrupt_entries[] = {
     { "enccorrupt/depth4",        test_reject_depth4,        ec_setup, ec_teardown },
     { "enccorrupt/lazy",          test_lazy_validation,      ec_setup, ec_teardown },
     { "enccorrupt/fast_kernel_twice", test_fast_kernel_corrupt_twice, ec_setup, ec_teardown },
+    { "enccorrupt/stats_nested",  test_stats_nested,         ec_setup, ec_teardown },
+    { "enccorrupt/stats_values",  test_stats_values,         ec_setup, ec_teardown },
+    { "enccorrupt/stats_point_read", test_stats_point_read,  ec_setup, ec_teardown },
     { "enccorrupt/fuzz_flips",    test_fuzz_flips,           ec_setup, ec_teardown },
     { NULL, NULL, NULL, NULL },
 };

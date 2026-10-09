@@ -1653,6 +1653,8 @@ static bool agg_sel_bounds_round(const agg_sel_bounds_ctx_t* bc, uint8_t* state,
         rows += spans[2 * n + 1] - spans[2 * n];
         state[ch] = 3;
         n++;
+        for (uint32_t k = 0; k < bc->n_keys; k++)       /* clipped to the source's rows */
+            ray_col_src_advise(bc->krr->srcs[k], ch * RAY_ENC_CHUNK, (ch + 1) * RAY_ENC_CHUNK);
     }
     if (n == 0) return true;
     agg_sel_bounds_ctx_t c = *bc;
@@ -1709,6 +1711,12 @@ static bool agg_sel_bounds_dir(const agg_sel_bounds_ctx_t* bc, int64_t* mins, in
         state[ch] = bc->sel_prefix[se] > bc->sel_prefix[ch * spc];
         for (uint32_t k = 0; k < nk && state[ch]; k++) {
             (void)ray_col_src_chunk_stat(krr->srcs[k], ch, &st);
+            /* Conservative: a chunk with nulls is always scanned.  Its
+             * statistics bound only its non-null rows, which is all the
+             * scan folds when the plan holds the key nullable (the usual
+             * case: the column's null count makes it so); scanning keeps
+             * the bounds exact without relying on that, and such chunks
+             * are few. */
             if (!st.has_minmax || st.null_count) { state[ch] = 2; continue; }
             if (st.min < lo_v[k]) { lo_v[k] = st.min; lo_ch[k] = ch; }
             if (st.max > hi_v[k]) { hi_v[k] = st.max; hi_ch[k] = ch; }

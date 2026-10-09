@@ -142,11 +142,13 @@ int    ray_enccol_decode_wide(ray_enccol_t* e, int64_t c, int j, const ray_enc_d
  * vector without decoding the vector: a FOR_BP vector, or DICT over a
  * FOR_BP code child, with no nulls.  The chunk's descriptors are validated
  * (once per chunk); the row's body size, base, reserved fields, code (below
- * the dictionary size) and the sentinel are checked; the other rows of the
- * vector are not read, so a sampler may see a row of a vector the full
- * decode later reports.  1 served (*out: the value widened to int64, as the
- * decode would hold it), 0 declined (read the vector by range: it decodes
- * or reports it), -1 an owned error in *err (descriptors or dictionary). */
+ * the dictionary size), the sentinel and the value against the vector's
+ * statistics are checked; the other rows of the vector are not read, so a
+ * sampler may see a row of a vector the full decode later reports.  1
+ * served (*out: the value widened to int64, as the decode would hold it),
+ * 0 declined (read the vector by range: it decodes or reports it), -1 an
+ * owned error in *err (descriptors, dictionary, or the value outside its
+ * statistics: `corrupt`). */
 int    ray_enccol_point_i64(ray_enccol_t* e, int64_t row, int64_t* out, ray_t** err);
 /* A reference on the column's payload (the RAY_ENCCOL headers share it). */
 void   ray_enccol_ref(ray_enccol_t* e);
@@ -202,8 +204,10 @@ uint64_t ray_enccol_test_desc_validations(void);
  * null bitmap or NULL, n_nulls as its descriptor says.  fast: through the
  * fast kernel only, writing `wide` elements (0: the generation-0 width;
  * RAY_I64 / RAY_F64: an expression register); else through the reference
- * path (wide must be 0).  1 decoded, 0 the fast kernel declined, -1 the
- * reference path reports it corrupt. */
+ * path (wide must be 0).  The descriptor's statistics are the non-null
+ * range of the body's reference decode, as a writer gives them (absent
+ * when that decode fails or every row is null).  1 decoded, 0 the fast
+ * kernel declined, -1 the reference path reports it corrupt. */
 int    ray_enccol_test_decode_body(int8_t type, uint8_t attrs, uint32_t sym_bound, uint8_t enc,
                                    uint8_t width, int n_nulls, const uint8_t* bm, const uint8_t* body,
                                    uint64_t avail, int vlen, bool fast, int8_t wide, void* out);
@@ -214,8 +218,9 @@ int    ray_enccol_test_decode_body(int8_t type, uint8_t attrs, uint32_t sym_boun
 int    ray_enccol_test_decode_dict(int8_t type, const uint64_t* dict, uint32_t n_dict, int trim,
                                    int n_nulls, const uint8_t* bm, const uint8_t* body, uint64_t avail,
                                    int vlen, bool fast, void* out);
-/* ray_enccol_point_i64's read of every row [0, vlen) of one top-level body
- * (`enc`, `width`, n_nulls as its descriptor says) of a column of `type`
+/* ray_enccol_point_i64's body read of every row [0, vlen) of one top-level
+ * body (`enc`, `width`, n_nulls as its descriptor says; no statistics) of a
+ * column of `type`
  * with the VALUE_DICT dict[0, n_dict) (NULL: none): res[i] is the point
  * read's 1 / 0 / -1 and out[i] its value when served.  0, or -1 on OOM. */
 int    ray_enccol_test_point_body(int8_t type, const uint64_t* dict, uint32_t n_dict, uint8_t enc,

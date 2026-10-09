@@ -396,6 +396,15 @@ static int top_encoding_class(int8_t t, uint8_t enc) {
     }
 }
 
+/* An integer statistic is a logical value of its type: inside the T-bit
+ * kind's range.  The decode kernels compare values against statistics in
+ * T-bit modular arithmetic, which is exact only for statistics inside it. */
+static bool stat_in_kind(ray_enc_kind_t k, int64_t v) {
+    if (k.T == 64) return k.is_signed || v >= 0;
+    if (k.is_signed) { const int64_t h = (int64_t)1 << (k.T - 1); return v >= -h && v < h; }
+    return v >= 0 && v < ((int64_t)1 << k.T);
+}
+
 static _Atomic(uint64_t) g_desc_validations;     /* test hook, see enccol.h */
 uint64_t ray_enccol_test_desc_validations(void) { return atomic_load(&g_desc_validations); }
 
@@ -411,6 +420,9 @@ static ray_t* chunk_descs_validate(ray_enccol_t* e, int64_t c, const ray_enc_des
     uint64_t at = RAY_ENC_DESC_AREA;
     uint64_t nsum = 0;
     int T = lane_width(e);
+    ray_enc_kind_t kind;
+    const bool have_kind = ray_enc_kind_of(e->type, e->attrs, &kind);
+    const bool de_absent = de.flags & RAY_ENC_STAT_ABSENT;
     for (int j = 0; j < RAY_ENC_VECS_PER_CHUNK; j++) {
         const ray_enc_desc_t* d = &out[j];
         if (j >= nv) {
@@ -456,7 +468,31 @@ static ray_t* chunk_descs_validate(ray_enccol_t* e, int64_t c, const ray_enc_des
             } else if (e->type == RAY_SYM && (d->min < 1 || (uint64_t)d->max >= e->sym_bound ||
                                               (T < 64 && ((uint64_t)d->max >> T)))) {
                 ENC_CORRUPT("column %s: chunk %lld vector %d SYM statistics outside the domain or the id width", e->path, (long long)c, j);
+            } else if (have_kind && (!stat_in_kind(kind, d->min) || !stat_in_kind(kind, d->max))) {
+                ENC_CORRUPT("column %s: chunk %lld vector %d statistics outside the type", e->path, (long long)c, j);
             }
+        }
+        /* Statistics nest: the chunk's directory range sizes engine
+         * structures (dense slabs, direct arrays, key ranges), and decode
+         * keeps every value inside its vector's range, so each vector's
+         * range must lie inside the chunk's.  A vector with values carries
+         * statistics exactly when its chunk does (the writer's rule): one
+         * without them under a chunk with them would leave its values
+         * unchecked against the range consumers use. */
+        if (!all_null && absent != de_absent) {
+            if (absent) ENC_CORRUPT("column %s: chunk %lld vector %d statistics missing under the chunk's", e->path, (long long)c, j);
+            ENC_CORRUPT("column %s: chunk %lld vector %d statistics under a chunk without them", e->path, (long long)c, j);
+        }
+        if (!absent && !de_absent) {
+            bool out;
+            if (enc_type_float(e->type)) {
+                double mn, mx, dmn, dmx;
+                memcpy(&mn, &d->min, 8); memcpy(&mx, &d->max, 8); memcpy(&dmn, &de.min, 8); memcpy(&dmx, &de.max, 8);
+                out = mn < dmn || mx > dmx;
+            } else {
+                out = d->min < de.min || d->max > de.max;
+            }
+            if (out) ENC_CORRUPT("column %s: chunk %lld vector %d statistics outside the chunk's", e->path, (long long)c, j);
         }
     }
     if (nsum != de.null_count) ENC_CORRUPT("column %s: chunk %lld descriptor null counts sum to %llu, directory says %u", e->path,
@@ -595,6 +631,9 @@ static ray_t* dec_ints(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* 
     if ((uint64_t)used != avail) VEC_CORRUPT("bytes after the codec body");
     uint8_t esz = ray_enccol_esz(e);
     const bool sym = e->type == RAY_SYM;
+    /* every non-null value inside the vector's statistics (absent only on
+     * an all-null vector, chunk_descs_validate): checked below */
+    const bool has_st = !(d->flags & RAY_ENC_STAT_ABSENT);
     int zeros = 0;
     for (int i = 0; i < vlen; i++) {
         bool null = bm && ((bm[i >> 3] >> (i & 7)) & 1);
@@ -621,6 +660,12 @@ static ray_t* dec_ints(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* 
         }
     }
     if (e->type == RAY_SYM && zeros != d->n_nulls) VEC_CORRUPT("SYM null count");
+    /* last, so a vector that also breaks a rule above reports that one */
+    for (int i = 0; has_st && i < vlen; i++) {
+        if ((bm && ((bm[i >> 3] >> (i & 7)) & 1)) || (sym && bits[i] == 0)) continue;
+        const int64_t lv = ray_enc_logical(bits[i], k);
+        if (lv < d->min || lv > d->max) VEC_CORRUPT("value outside its statistics");
+    }
     return NULL;
 }
 
@@ -637,6 +682,9 @@ static ray_t* dec_floats(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t
         if (!all_zero(p + (size_t)vlen * esz, (size_t)(body - (uint64_t)vlen * esz))) VEC_CORRUPT("float body padding");
         memcpy(out, p, (size_t)vlen * esz);
     }
+    const bool has_st = !(d->flags & RAY_ENC_STAT_ABSENT);
+    double smin = 0, smax = 0;
+    if (has_st) { memcpy(&smin, &d->min, 8); memcpy(&smax, &d->max, 8); }
     for (int i = 0; i < vlen; i++) {
         bool null = bm && ((bm[i >> 3] >> (i & 7)) & 1);
         uint8_t* q = (uint8_t*)out + i * esz;
@@ -645,6 +693,7 @@ static ray_t* dec_floats(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t
         } else {
             double x; if (f32) { float f; memcpy(&f, q, 4); x = f; } else memcpy(&x, q, 8);
             if (x != x) VEC_CORRUPT("NaN outside the bitmap");
+            if (has_st && (x < smin || x > smax)) VEC_CORRUPT("value outside its statistics");
         }
     }
     uint64_t rest = avail - body;
@@ -785,9 +834,12 @@ static ray_t* payload_parts(ray_enccol_t* e, int64_t c, int j, const ray_enc_des
  * The nulls are checked after it: a vectorised sentinel scan (fused into the
  * widening kernels; skipped when the FOR_BP base and width prove that no
  * value is the sentinel), or with a bitmap one pass that also merges it.
- * No u64 intermediate, no aside copy.  It accepts exactly what dec_ints accepts:
- * when anything is off (a size, a base, a head, a placeholder, a sentinel,
- * a SYM id) it declines, and the reference path decodes or reports the
+ * The same pass keeps every value inside the vector's statistics (a
+ * max-reduce of its distance above the minimum; skipped when the FOR_BP
+ * base and width prove it).  No u64 intermediate, no aside copy.  It
+ * accepts exactly what dec_ints accepts: when anything is off (a size, a
+ * base, a head, a placeholder, a sentinel, a SYM id, a value outside the
+ * statistics) it declines, and the reference path decodes or reports the
  * vector, so a corrupt file keeps its exact error. */
 
 /* Lane l's field of the current row: w bits at bit offset off of word a[l]
@@ -800,52 +852,67 @@ static ray_t* payload_parts(ray_enccol_t* e, int64_t c, int j, const ray_enc_des
 
 /* One row of lanes [0, nl): the T-bit value V stored widened from ST to OT;
  * SENT: also flag a value on the T-bit pattern s (the widening kernels,
- * where this beats a second pass over the 8-byte output). */
-#define FK_ROW(UT, ST, OT, SENT, V) do { for (int l = 0; l < nl; l++) {                 \
-        const UT v_ = (V); if (SENT) bad |= (UT)-(UT)(v_ == s); o[l] = (OT)(ST)v_; } } while (0)
+ * where this beats a second pass over the 8-byte output); RNG: also fold
+ * the value's distance above lo into dm, the largest seen. */
+#define FK_ROW(UT, ST, OT, SENT, RNG, V) do { for (int l = 0; l < nl; l++) {            \
+        const UT v_ = (V); if (SENT) bad |= (UT)-(UT)(v_ == s);                          \
+        if (RNG) { const UT r_ = (UT)(v_ - lo); dm = r_ > dm ? r_ : dm; }                \
+        o[l] = (OT)(ST)v_; } } while (0)
+
+/* The kernels' result: bit 0 a value on the sentinel (SENT), bit 1 a value
+ * outside the vector's statistics [lo, lo + span] (RNG), in T-bit modular
+ * arithmetic, which is exact for statistics inside the type
+ * (chunk_descs_validate). */
+#define FK_HIT_SENT 1u
+#define FK_HIT_RANGE 2u
+#define FK_RESULT(RNG) ((bad ? FK_HIT_SENT : 0u) | ((RNG) && dm > span ? FK_HIT_RANGE : 0u))
 
 /* FOR_BP: out[i] = base + field, rows below n.  ST: the signed (or
- * unsigned) view the element widens from; OT: the stored element.
- * Returns the SENT flag (0 without SENT). */
-#define FK_FOR(NAME, UT, PT, TB, ST, OT, SENT)                                          \
-static UT NAME(const UT* restrict in, int w, UT base, OT* restrict out, int n, UT s) { \
+ * unsigned) view the element widens from; OT: the stored element.  NAME
+ * checks the statistics; NAME##_np does not (dec_fast proves them). */
+#define FK_FOR1(NAME, UT, PT, TB, ST, OT, SENT, RNG)                                    \
+static __attribute__((unused)) unsigned NAME(const UT* restrict in, int w, UT base,  \
+                     OT* restrict out, int n, UT s, UT lo, UT span) {                   \
     enum { L = RAY_ENC_VEC / TB };                                                      \
     const UT m = w >= TB ? (UT)~(UT)0 : (UT)(((PT)1 << w) - 1);                         \
-    UT bad = 0; (void)s;                                                                \
+    UT bad = 0, dm = 0; (void)s; (void)lo; (void)span;                                  \
     for (int r = 0, bit = 0; r * L < n; r++, bit += w) {                                \
         const int k = bit / TB, off = bit % TB;                                         \
         const unsigned sr = (unsigned)off & (TB - 1), sl = (unsigned)(TB - off) & (TB - 1); \
         const int nl = n - r * L < L ? n - r * L : L;                                   \
         const UT* a = in + (size_t)k * L;                                               \
         OT* o = out + (size_t)r * L;                                                    \
-        if (w == 0) FK_ROW(UT, ST, OT, SENT, base);                                     \
-        else if (off + w > TB) FK_ROW(UT, ST, OT, SENT, (UT)((PT)base + FK_FIELD2(UT, PT, L, a, l, sr, sl, m))); \
-        else FK_ROW(UT, ST, OT, SENT, (UT)((PT)base + FK_FIELD1(UT, PT, a, l, sr, m))); \
+        if (w == 0) FK_ROW(UT, ST, OT, SENT, RNG, base);                                \
+        else if (off + w > TB) FK_ROW(UT, ST, OT, SENT, RNG, (UT)((PT)base + FK_FIELD2(UT, PT, L, a, l, sr, sl, m))); \
+        else FK_ROW(UT, ST, OT, SENT, RNG, (UT)((PT)base + FK_FIELD1(UT, PT, a, l, sr, m))); \
     }                                                                                   \
-    return bad;                                                                         \
+    return FK_RESULT(RNG);                                                              \
 }
+#define FK_FOR(NAME, UT, PT, TB, ST, OT, SENT)                                          \
+    FK_FOR1(NAME, UT, PT, TB, ST, OT, SENT, 1)                                          \
+    FK_FOR1(NAME##_np, UT, PT, TB, ST, OT, SENT, 0)
 /* DELTA_BP: row 0 is the heads, row r the row above plus dbase plus field r. */
 #define FK_DELTA(NAME, UT, PT, TB, ST, OT, SENT)                                        \
-static UT NAME(const UT* restrict in, int w, UT dbase, const UT* restrict head,        \
-               OT* restrict out, int n, UT s) {                                         \
+static unsigned NAME(const UT* restrict in, int w, UT dbase, const UT* restrict head,  \
+                     OT* restrict out, int n, UT s, UT lo, UT span) {                   \
     enum { L = RAY_ENC_VEC / TB };                                                      \
     const UT m = w >= TB ? (UT)~(UT)0 : (UT)(((PT)1 << w) - 1);                         \
-    UT bad = 0; (void)s;                                                                \
+    UT bad = 0, dm = 0; (void)s;                                                        \
     UT prev[L];                                                                         \
     for (int l = 0; l < L; l++) prev[l] = head[l];                                      \
-    { const int nl = n < L ? n : L; OT* o = out; FK_ROW(UT, ST, OT, SENT, prev[l]); }   \
+    { const int nl = n < L ? n : L; OT* o = out; FK_ROW(UT, ST, OT, SENT, 1, prev[l]); } \
     for (int r = 1, bit = w; r * L < n; r++, bit += w) {                                \
         const int k = bit / TB, off = bit % TB;                                         \
         const unsigned sr = (unsigned)off & (TB - 1), sl = (unsigned)(TB - off) & (TB - 1); \
         const int nl = n - r * L < L ? n - r * L : L;                                   \
         const UT* a = in + (size_t)k * L;                                               \
         OT* o = out + (size_t)r * L;                                                    \
-        if (w == 0) FK_ROW(UT, ST, OT, SENT, prev[l] = (UT)((PT)prev[l] + dbase));      \
+        if (w == 0) FK_ROW(UT, ST, OT, SENT, 1, prev[l] = (UT)((PT)prev[l] + dbase));   \
         else if (off + w > TB)                                                          \
-            FK_ROW(UT, ST, OT, SENT, prev[l] = (UT)((PT)prev[l] + dbase + FK_FIELD2(UT, PT, L, a, l, sr, sl, m))); \
-        else FK_ROW(UT, ST, OT, SENT, prev[l] = (UT)((PT)prev[l] + dbase + FK_FIELD1(UT, PT, a, l, sr, m))); \
+            FK_ROW(UT, ST, OT, SENT, 1, prev[l] = (UT)((PT)prev[l] + dbase + FK_FIELD2(UT, PT, L, a, l, sr, sl, m))); \
+        else FK_ROW(UT, ST, OT, SENT, 1, prev[l] = (UT)((PT)prev[l] + dbase + FK_FIELD1(UT, PT, a, l, sr, m))); \
     }                                                                                   \
-    return bad;                                                                         \
+    return FK_RESULT(1);                                                                \
 }
 FK_FOR(fk_for8,     uint8_t,  unsigned,  8, uint8_t,  uint8_t,  0)
 FK_FOR(fk_for16,    uint16_t, unsigned, 16, uint16_t, uint16_t, 0)
@@ -899,15 +966,16 @@ FK_MERGE(fk_merge32, int32_t, uint32_t)
 FK_MERGE(fk_merge64, int64_t, uint64_t)
 FK_MERGE(fk_mergef,  double,  uint64_t)
 
-/* SYM ids: below the bound or 0 (the null), and exactly n_nulls zeros. */
+/* SYM ids: below the bound or 0 (the null), the non-null ones inside the
+ * vector's statistics [lo, lo + span], and exactly n_nulls zeros. */
 #define FK_SYM(NAME, UT)                                                                \
-static bool NAME(const UT* restrict o, int n, uint64_t bound, int n_nulls) {           \
+static bool NAME(const UT* restrict o, int n, uint64_t bound, int n_nulls, UT lo, UT span) { \
     UT bad = 0; uint32_t zeros = 0;                                                     \
     /* x is bad when x != 0 and x >= bound, i.e. x > lim */                             \
     const UT lim = bound == 0 ? 0 : bound - 1 > (uint64_t)(UT)~(UT)0 ? (UT)~(UT)0 : (UT)(bound - 1); \
     for (int i = 0; i < n; i++) {                                                       \
         zeros += o[i] == 0;                                                             \
-        bad |= (UT)-(UT)((o[i] != 0) & (o[i] > lim));                                   \
+        bad |= (UT)-(UT)((o[i] != 0) & ((o[i] > lim) | ((UT)(o[i] - lo) > span)));     \
     }                                                                                   \
     return !bad && zeros == (uint32_t)n_nulls;                                          \
 }
@@ -943,14 +1011,42 @@ static int fk_nulls_native(const ray_enc_desc_t* d, int T, int vlen, const uint8
     return bad ? 0 : 1;
 }
 
+/* The rows outside the bitmap inside the vector's statistics, read from a
+ * fast decode's output (nulls merged; `wide` as dec_fast's): the exact
+ * check behind a kernel's range flag over a vector with nulls. */
+static bool fk_range_exact(const ray_enc_desc_t* d, const void* out, int T, int8_t wide, int vlen, const uint8_t* bm) {
+    for (int i = 0; i < vlen; i++) {
+        if ((bm[i >> 3] >> (i & 7)) & 1) continue;
+        int64_t v;
+        if (wide == RAY_F64)              v = (int64_t)((const double*)out)[i];
+        else if (wide == RAY_I64 || T == 64) v = ((const int64_t*)out)[i];
+        else if (T == 32)                 v = ((const int32_t*)out)[i];
+        else                              v = ((const int16_t*)out)[i];
+        if (v < d->min || v > d->max) return false;
+    }
+    return true;
+}
+
+/* The vector's statistics as the kernels check them: lo and span (max -
+ * min) as T-bit patterns, exact for statistics inside the type
+ * (chunk_descs_validate).  Without statistics (an all-null vector) every
+ * value passes: span is all ones. */
+static void fk_stats(const ray_enc_desc_t* d, uint64_t m, uint64_t* lo, uint64_t* span) {
+    const bool has = !(d->flags & RAY_ENC_STAT_ABSENT);
+    *lo = has ? (uint64_t)d->min & m : 0;
+    *span = has ? ((uint64_t)d->max - (uint64_t)d->min) & m : m;
+}
+
 /* DICT over a U32 FOR_BP code child, at the generation-0 width: the codes
  * unpacked by the lane kernel, checked below the dictionary size in one
- * or-reduce, gathered from the validated dictionary, then the nulls as the
- * FOR_BP path checks them.  It accepts exactly what dec_ints accepts and
+ * or-reduce, gathered from the validated dictionary with the values'
+ * distance above the statistics' minimum folded into a max-reduce, then
+ * the nulls as the FOR_BP path checks them.  It accepts exactly what dec_ints accepts and
  * declines on anything else (a RAW or RLE code child, a child header or
  * size off, a dictionary not yet validated, a code outside it, a
- * sentinel), so the reference path decodes or reports the vector (and
- * runs the dictionary's one validation, with its errors). */
+ * sentinel, a value outside the statistics), so the reference path decodes
+ * or reports the vector (and runs the dictionary's one validation, with
+ * its errors). */
 static int dec_fast_dict(ray_enccol_t* e, const ray_enc_desc_t* d, int vlen, const uint8_t* body,
                          uint64_t avail, const uint8_t* bm, ray_enc_kind_t k, void* out) {
     if (d->width || !k.is_signed || avail < 16 || body[0] != RAY_ENC_FOR_BP) return 0;
@@ -963,19 +1059,31 @@ static int dec_fast_dict(ray_enccol_t* e, const ray_enc_desc_t* d, int vlen, con
     ray_enc_dict_t dict;
     if (!enc_dict_ready(e, &dict)) return 0;                 /* validation and its errors: the reference path */
     _Alignas(64) uint32_t codes[RAY_ENC_VEC];
-    (void)fk_for32((const uint32_t*)(body + 16), w, (uint32_t)base, codes, vlen, 0);
+    (void)fk_for32_np((const uint32_t*)(body + 16), w, (uint32_t)base, codes, vlen, 0, 0, 0);
     const uint32_t lim = dict.n - 1;                         /* a validated dictionary is not empty */
     uint32_t bad = 0;
     for (int i = 0; i < vlen; i++) bad |= (uint32_t)-(uint32_t)(codes[i] > lim);
     if (bad) return 0;
     const uint64_t* dv = dict.v;
+    uint64_t lo, span;
+    fk_stats(d, k.T == 64 ? ~0ull : (1ull << k.T) - 1, &lo, &span);
+    bool range_hit = false;
+#define FK_GATHER(UT) do { UT* o = out; UT dm = 0;                                       \
+        for (int i = 0; i < vlen; i++) {                                                \
+            const UT v = (UT)dv[codes[i]], r = (UT)(v - (UT)lo);                        \
+            dm = r > dm ? r : dm; o[i] = v;                                             \
+        }                                                                               \
+        range_hit = dm > (UT)span; } while (0)
     switch (k.T) {
-    case 16: { uint16_t* o = out; for (int i = 0; i < vlen; i++) o[i] = (uint16_t)dv[codes[i]]; break; }
-    case 32: { uint32_t* o = out; for (int i = 0; i < vlen; i++) o[i] = (uint32_t)dv[codes[i]]; break; }
-    case 64: { uint64_t* o = out; for (int i = 0; i < vlen; i++) o[i] = dv[codes[i]]; break; }
+    case 16: FK_GATHER(uint16_t); break;
+    case 32: FK_GATHER(uint32_t); break;
+    case 64: FK_GATHER(uint64_t); break;
     default: return 0;
     }
-    return fk_nulls_native(d, k.T, vlen, bm, true, out);
+#undef FK_GATHER
+    if (range_hit && !(bm && d->n_nulls)) return 0;           /* a value outside the statistics */
+    if (!fk_nulls_native(d, k.T, vlen, bm, true, out)) return 0;
+    return !range_hit || fk_range_exact(d, out, k.T, 0, vlen, bm) ? 1 : 0;
 }
 
 /* Decode a FOR_BP / DELTA_BP vector body of e's type into out: `wide` 0 at
@@ -1031,10 +1139,20 @@ static int dec_fast(ray_enccol_t* e, const ray_enc_desc_t* d, int vlen,
      * needed, from the body alone (never from the untrusted statistics). */
     const uint64_t umax = w >= 64 ? ~0ull : (1ull << w) - 1;
     const bool can_hit = k.is_signed && (delta || ((sent - base) & m) <= umax);
+    /* Every value inside the vector's statistics, checked in the kernel.
+     * FOR_BP proves it from the body when the base is the minimum and the
+     * width spans no further than the maximum (values are base + u, u <
+     * 2^w): the unchecked kernel.  SYM: the id check below owns it (a
+     * null id 0 lies below the statistics). */
+    uint64_t lo, span;
+    fk_stats(d, m, &lo, &span);
+    const bool proven = sym || (!delta && base == lo && umax <= span);
 #define FK_RUN(FOR, DLT, UT, OT) do {                                                    \
-        if (delta) hit = DLT((const UT*)pk, w, (UT)base, (const UT*)head.b, (OT*)out, vlen, (UT)sent); \
-        else       hit = FOR((const UT*)pk, w, (UT)base, (OT*)out, vlen, (UT)sent); } while (0)
-#define FK_RUN_FOR(FOR, UT, OT) hit = FOR((const UT*)pk, w, (UT)base, (OT*)out, vlen, (UT)sent)
+        if (delta) hit = DLT((const UT*)pk, w, (UT)base, (const UT*)head.b, (OT*)out, vlen, (UT)sent, (UT)lo, (UT)span); \
+        else FK_RUN_FOR(FOR, UT, OT); } while (0)
+#define FK_RUN_FOR(FOR, UT, OT)                                                          \
+        hit = proven ? FOR##_np((const UT*)pk, w, (UT)base, (OT*)out, vlen, (UT)sent, (UT)lo, (UT)span) \
+                     : FOR((const UT*)pk, w, (UT)base, (OT*)out, vlen, (UT)sent, (UT)lo, (UT)span)
     switch (T * 4 + (wt == RAY_I64 ? 1 : wt == RAY_F64 ? 2 : 0)) {
     case 8 * 4:      FK_RUN_FOR(fk_for8, uint8_t, uint8_t); break;
     case 8 * 4 + 1:  FK_RUN_FOR(fk_for8_i, uint8_t, int64_t); break;
@@ -1050,18 +1168,30 @@ static int dec_fast(ray_enccol_t* e, const ray_enc_desc_t* d, int vlen,
     }
 #undef FK_RUN
 #undef FK_RUN_FOR
+    /* A value outside the statistics.  Without nulls: damage, the
+     * reference decode reports it.  With a bitmap it may be a null slot's
+     * bits (a writer fills them with the minimum, so this is rare): the
+     * rows outside the bitmap are checked exactly once the nulls are in. */
+    const bool range_hit = hit & FK_HIT_RANGE;
+    if (range_hit && !(bm && d->n_nulls)) return 0;
+    hit &= FK_HIT_SENT;
     if (sym) {
+        /* the SYM check owns the statistics of the non-null ids (the
+         * kernel's unsigned range includes the null id 0) */
         bool ok;
         switch (T) {
-        case 8:  ok = fk_sym8((const uint8_t*)out, vlen, e->sym_bound, d->n_nulls); break;
-        case 16: ok = fk_sym16((const uint16_t*)out, vlen, e->sym_bound, d->n_nulls); break;
-        case 32: ok = fk_sym32((const uint32_t*)out, vlen, e->sym_bound, d->n_nulls); break;
-        default: ok = fk_sym64((const uint64_t*)out, vlen, e->sym_bound, d->n_nulls); break;
+        case 8:  ok = fk_sym8((const uint8_t*)out, vlen, e->sym_bound, d->n_nulls, (uint8_t)lo, (uint8_t)span); break;
+        case 16: ok = fk_sym16((const uint16_t*)out, vlen, e->sym_bound, d->n_nulls, (uint16_t)lo, (uint16_t)span); break;
+        case 32: ok = fk_sym32((const uint32_t*)out, vlen, e->sym_bound, d->n_nulls, (uint32_t)lo, (uint32_t)span); break;
+        default: ok = fk_sym64((const uint64_t*)out, vlen, e->sym_bound, d->n_nulls, lo, span); break;
         }
         return ok ? 1 : 0;
     }
     if (!k.is_signed) return 1;                                      /* BOOL, U8: no nulls */
-    if (!wt) return fk_nulls_native(d, T, vlen, bm, can_hit, out);
+    if (!wt) {
+        if (!fk_nulls_native(d, T, vlen, bm, can_hit, out)) return 0;
+        return !range_hit || fk_range_exact(d, out, T, 0, vlen, bm) ? 1 : 0;
+    }
     if (d->n_nulls && !bm) return 0;
     if (!d->n_nulls) return hit ? 0 : 1;                             /* flagged by the widening kernel, or impossible */
     bool bad;
@@ -1069,7 +1199,8 @@ static int dec_fast(ray_enccol_t* e, const ray_enc_desc_t* d, int vlen,
         bad = fk_mergef((double*)out, vlen, bm, T == 16 ? (double)NULL_I16 : (double)NULL_I32, NULL_F64);
     else
         bad = fk_merge64((int64_t*)out, vlen, bm, T == 16 ? (int64_t)NULL_I16 : (int64_t)NULL_I32, NULL_I64);
-    return bad ? 0 : 1;
+    if (bad) return 0;
+    return !range_hit || fk_range_exact(d, out, T, wt, vlen, bm) ? 1 : 0;
 }
 
 /* The shared vector decode.  priv: `out` is the caller's private
@@ -1098,10 +1229,14 @@ static bool raw_float_vec_ok(ray_enccol_t* e, int64_t c, int j, const ray_enc_de
     uint64_t body = ray_enc_pad8((uint64_t)vlen * esz);
     if (bm || body != avail || ((uintptr_t)p & 7)) return false;
     if (!all_zero(p + (size_t)vlen * esz, (size_t)(body - (uint64_t)vlen * esz))) return false;
+    /* and every value inside the vector's statistics, as dec_floats checks */
+    const bool has_st = !(d->flags & RAY_ENC_STAT_ABSENT);
+    double smin = -INFINITY, smax = INFINITY;
+    if (has_st) { memcpy(&smin, &d->min, 8); memcpy(&smax, &d->max, 8); }
     if (esz == 4) {
-        for (int i = 0; i < vlen; i++) { float f; memcpy(&f, p + 4 * i, 4); if (f != f) return false; }
+        for (int i = 0; i < vlen; i++) { float f; memcpy(&f, p + 4 * i, 4); if (f != f || f < smin || f > smax) return false; }
     } else {
-        for (int i = 0; i < vlen; i++) { double x; memcpy(&x, p + 8 * i, 8); if (x != x) return false; }
+        for (int i = 0; i < vlen; i++) { double x; memcpy(&x, p + 8 * i, 8); if (x != x || x < smin || x > smax) return false; }
     }
     return true;
 }
@@ -1224,13 +1359,15 @@ static uint64_t point_field(const uint8_t* pk, int T, int w, int i) {
     return w >= 64 ? v : v & ((1ull << w) - 1);
 }
 
-/* Row i of vector body p (avail bytes, descriptor d, no nulls) as its
- * T-bit pattern: 1 served; 0 declined when the body is not one this read
- * proves (any codec but FOR_BP and DICT over a FOR_BP code child, a size,
- * width, base or reserved field off, a code outside the dictionary, the
- * sentinel), so the vector decode decides; -1 the dictionary's error. */
+/* Row i of vector body p (avail bytes, descriptor d) as its T-bit
+ * pattern: 1 served; 0 declined when the vector has nulls (the bitmap
+ * decides) or the body is not one this read proves (any codec but FOR_BP
+ * and DICT over a FOR_BP code child, a size, width, base or reserved field
+ * off, a code outside the dictionary, the sentinel), so the vector decode
+ * decides; -1 the dictionary's error. */
 static int point_body(ray_enccol_t* e, const ray_enc_desc_t* d, const uint8_t* p, uint64_t avail,
                       int i, ray_enc_kind_t k, uint64_t* x, ray_t** err) {
+    if (d->n_nulls) return 0;
     const uint64_t m = k.T == 64 ? ~0ull : (1ull << k.T) - 1;
     uint64_t v;
     if (d->encoding == RAY_ENC_FOR_BP) {
@@ -1275,12 +1412,18 @@ int ray_enccol_point_i64(ray_enccol_t* e, int64_t row, int64_t* out, ray_t** err
     const ray_enc_desc_t* descs;
     if ((*err = ray_enccol_chunk_descs_ref(e, c, &descs)) != NULL) return -1;   /* validated once per chunk */
     const ray_enc_desc_t* d = &descs[j];
-    if (d->n_nulls) return 0;                              /* the bitmap: the vector decode decides */
     ray_enc_dirent_t de; dirent_at(e, c, &de);
     uint64_t x;
     int r = point_body(e, d, e->base + de.offset + d->payload_off, d->payload_bytes, i, k, &x, err);
-    if (r == 1) *out = ray_enc_logical(x, k);
-    return r;
+    if (r != 1) return r;
+    /* the value inside the vector's statistics, as the vector decode checks it */
+    const int64_t v = ray_enc_logical(x, k);
+    if (!(d->flags & RAY_ENC_STAT_ABSENT) && (v < d->min || v > d->max)) {
+        *err = ray_error("corrupt", "column %s: chunk %lld vector %d value outside its statistics", e->path, (long long)c, j);
+        return -1;
+    }
+    *out = v;
+    return 1;
 }
 
 /* A stand-in column of `type` for the body hooks; with a VALUE_DICT of
@@ -1317,9 +1460,9 @@ int ray_enccol_test_point_body(int8_t type, const uint64_t* dict, uint32_t n_dic
     ray_enccol_t* e = test_col(type, 0, 0, dict, n_dict, 0);
     if (!e) return -1;
     ray_enc_desc_t d; memset(&d, 0, sizeof d);
-    d.encoding = enc; d.width = width; d.n_nulls = (uint16_t)n_nulls;
+    d.encoding = enc; d.width = width; d.n_nulls = (uint16_t)n_nulls; d.flags = RAY_ENC_STAT_ABSENT;
     ray_enc_kind_t k;
-    const bool ok = point_type(e, &k) && !n_nulls;
+    const bool ok = point_type(e, &k);
     for (int i = 0; i < vlen; i++) {
         ray_t* err = NULL;
         uint64_t x;
@@ -1331,10 +1474,37 @@ int ray_enccol_test_point_body(int8_t type, const uint64_t* dict, uint32_t n_dic
     return 0;
 }
 
+/* The descriptor of a hook body carries the statistics a writer would
+ * give it: the non-null range of its reference decode (absent when that
+ * fails or every row is null), so the decoders check against real ones. */
+static void test_desc_stats(ray_enccol_t* e, ray_enc_desc_t* d, int vlen, const uint8_t* body, uint64_t avail,
+                            const uint8_t* bm) {
+    d->flags = RAY_ENC_STAT_ABSENT;
+    ray_enc_kind_t k;
+    if (!ray_enc_kind_of(e->type, e->attrs, &k) || vlen < 1 || vlen > RAY_ENC_VEC) return;
+    _Alignas(8) uint8_t tmp[RAY_ENC_VEC * 8];
+    ray_t* err = dec_ints(e, 0, 0, d, vlen, body, avail, bm, tmp);
+    if (err) { ray_error_free(err); return; }
+    const uint8_t esz = ray_enccol_esz(e);
+    bool have = false;
+    int64_t mn = 0, mx = 0;
+    for (int i = 0; i < vlen; i++) {
+        uint64_t x = 0;
+        memcpy(&x, tmp + (size_t)i * esz, esz);
+        if ((bm && ((bm[i >> 3] >> (i & 7)) & 1)) || (e->type == RAY_SYM && x == 0)) continue;
+        const int64_t v = ray_enc_logical(x, k);
+        if (!have || v < mn) mn = v;
+        if (!have || v > mx) mx = v;
+        have = true;
+    }
+    if (have) { d->flags = 0; d->min = mn; d->max = mx; }
+}
+
 static int test_decode(ray_enccol_t* e, uint8_t enc, uint8_t width, int n_nulls, const uint8_t* bm,
                        const uint8_t* body, uint64_t avail, int vlen, bool fast, int8_t wide, void* out) {
     ray_enc_desc_t d; memset(&d, 0, sizeof d);
     d.encoding = enc; d.width = width; d.n_nulls = (uint16_t)n_nulls;
+    test_desc_stats(e, &d, vlen, body, avail, bm);
     if (fast) return dec_fast(e, &d, vlen, body, avail, bm, wide, out);
     if (wide) return -1;
     ray_t* err = dec_ints(e, 0, 0, &d, vlen, body, avail, bm, out);

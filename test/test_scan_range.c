@@ -3894,6 +3894,27 @@ static test_result_t test_v2_sel_bounds(void) {
         test_result_t r = sr_same_route("(.db.splayed.get \"" SR_TMP "/sb0/\")", "(.db.splayed.get \"" SR_TMP "/sb2/\")", qs[i]);
         if (r.status != TEST_PASS) return r;
     }
+    /* the mirror of round 2 on the maximum: chunk 0 holds the lowest minimum
+     * and the highest maximum, both on unselected rows (its selected keys are
+     * 10..20); chunk 1's statistics are [10, 500] with 500 selected, so only
+     * its maximum reaches outside the bounds round 1 found */
+    {
+        const int64_t m = 4 * 65536;
+        ray_t* k2 = ray_vec_new(RAY_I64, m); k2->len = m;
+        ray_t* s2 = ray_vec_new(RAY_I64, m); s2->len = m;
+        int64_t* k2d = ray_data(k2); int64_t* s2d = ray_data(s2);
+        for (int64_t i = 0; i < m; i++) { k2d[i] = 10 + (i * 7919) % 11; s2d[i] = 1; }
+        k2d[0] = -5; s2d[0] = 0; k2d[1] = 100000; s2d[1] = 0;
+        k2d[65536 + 3] = 500;
+        ray_env_set(ray_sym_intern("bk2", 3), k2); ray_env_set(ray_sym_intern("bs2", 3), s2);
+        ray_release(k2); ray_release(s2);
+        sr_eval_ok("(set SM (table [k s v] (list bk2 bs2 (til 262144))))");
+        sr_eval_ok("(.db.splayed.set \"" SR_TMP "/sm2/\" SM {compress: true})");
+        sr_eval_ok("(.db.splayed.set \"" SR_TMP "/sm0/\" SM {compress: false})");
+        test_result_t r = sr_same_route("(.db.splayed.get \"" SR_TMP "/sm0/\")", "(.db.splayed.get \"" SR_TMP "/sm2/\")",
+                                        "(select {c: (count v) s: (sum v) from: T where: (== s 1) by: k})");
+        if (r.status != TEST_PASS) return r;
+    }
     /* the dense plan of the first: chunks 0, 1 and 2 are read for its bounds,
      * not all ten (a full prescan reads the key once more than the pass) */
     sr_eval_ok("(set T (.db.splayed.get \"" SR_TMP "/sb2/\"))");
@@ -3905,6 +3926,49 @@ static test_result_t test_v2_sel_bounds(void) {
     TEST_ASSERT_TRUE(agg_route_stats().dense_plan_available);
     double kdec = sr_col_decodes("k", k0);
     TEST_ASSERT_FMT(kdec < 1.5, "key decoded %.3fx", kdec);
+    PASS();
+}
+
+/* Task 13b fix round 1: directory statistics size the dense plans, so a
+ * forged one must not reach memory.  Key k is j * 7 % 1000 in chunks 0-2
+ * and j * 7 % 5001 in chunk 3; chunk 3's directory maximum is patched from
+ * 5000 to 999 and the file still loads.  The filtered (the selection
+ * bounds) and the unfiltered (the directory prescan) group-bys both
+ * report `corrupt` naming the column, twice, and never write past the
+ * slab (ASan). */
+static void sr_patch64(const char* path, long off, uint64_t val) {
+    FILE* f = fopen(path, "r+b"); if (!f) return;
+    if (fseek(f, off, SEEK_SET) == 0) (void)fwrite(&val, 8, 1, f);
+    fclose(f);
+}
+static test_result_t test_v2_forged_dir_max(void) {
+    sr_eval_ok("(set BF (table [k v] (list (concat (% (* (til 196608) 7) 1000) (% (* (+ 196608 (til 65536)) 7) 5001)) (til 262144))))");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/fm/\" BF {compress: true})");
+    char dir[512], path[600];
+    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(ray_test_tmp(SR_TMP "/fm/"), dir, sizeof dir), RAY_OK);
+    snprintf(path, sizeof path, "%s/k", dir);
+    ray_enc_dirent_t de; memset(&de, 0, sizeof de);
+    FILE* f = fopen(path, "rb");
+    TEST_ASSERT_TRUE(f != NULL);
+    TEST_ASSERT_TRUE(fseek(f, (long)(RAY_ENC_DIR_OFF + 3 * sizeof de), SEEK_SET) == 0 && fread(&de, sizeof de, 1, f) == 1);
+    fclose(f);
+    TEST_ASSERT_EQ_I(de.max, 5000);
+    TEST_ASSERT_EQ_I(de.flags & RAY_ENC_STAT_ABSENT, 0);
+    sr_patch64(path, (long)(RAY_ENC_DIR_OFF + 3 * sizeof de + offsetof(ray_enc_dirent_t, max)), 999);
+    static const char* const qs[] = {
+        "(count (select {s: (sum v) from: T where: (> v 0) by: k}))",
+        "(count (select {s: (sum v) from: T by: k}))",
+        NULL };
+    for (int i = 0; qs[i]; i++)
+        for (int rep = 0; rep < 2; rep++) {
+            sr_eval_ok("(set T (.db.splayed.get \"" SR_TMP "/fm/\"))");
+            ray_error_clear();
+            ray_t* r = sr_eval(qs[i]);
+            TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "%s (read %d): answered", qs[i], rep + 1);
+            TEST_ASSERT_FMT(strcmp(ray_err_code(r), "corrupt") == 0 && ray_error_msg() && strstr(ray_error_msg(), path),
+                            "%s (read %d): %s \"%s\"", qs[i], rep + 1, ray_err_code(r), ray_error_msg() ? ray_error_msg() : "");
+            ray_error_free(r);
+        }
     PASS();
 }
 
@@ -4388,6 +4452,7 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/v2_route_error",     test_v2_route_error,     srr_setup, srr_teardown },
     { "scanrange/v2_decode_once",     test_v2_decode_once,     srr_setup, srr_pool_teardown },
     { "scanrange/v2_sel_bounds",      test_v2_sel_bounds,      srr_setup, srr_teardown },
+    { "scanrange/v2_forged_dir_max",  test_v2_forged_dir_max,  srr_setup, srr_teardown },
     { "scanrange/v2_sel_key_types",   test_v2_sel_key_types,   srr_setup, srr_teardown },
     { NULL, NULL, NULL, NULL },
 };
