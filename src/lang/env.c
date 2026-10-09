@@ -316,6 +316,7 @@ void ray_env_destroy(void) {
  * for dotted paths, and as the fast path for plain names. */
 static ray_err_t env_frame_bind(ray_scope_frame_t* f, int64_t sym_id, ray_t* val);
 ray_t* ray_query_helper_value(int64_t sym);   /* ops/query.c */
+bool   ray_query_helper_aliases(void);        /* ops/query.c */
 
 /* A lookup that reaches a query helper's call frame: a free name that is
  * a source column binds, on first use, to what the query's own expressions
@@ -324,9 +325,20 @@ ray_t* ray_query_helper_value(int64_t sym);   /* ops/query.c */
  * name here as it does in a body the planner inlines.  Any other name
  * falls through to the globals.  The frame grows past RAY_FRAME_CAP on
  * demand; only an allocation failure leaves the name unbound. */
-static ray_t* env_call_frame_value(ray_scope_frame_t* f, int64_t sym_id) {
-    if (!f->table) return NULL;
-    ray_t* v = ray_query_helper_value(sym_id);
+static ray_t* env_call_frame_value(ray_scope_frame_t* f, int32_t depth, int64_t sym_id) {
+    if (!f->table || !ray_table_get_col(f->table, sym_id)) return NULL;
+    ray_t* v = NULL;
+    /* The query's own binding of the column — the row's cell, the group's
+     * slice or the whole column — sits in the frames below.  While a
+     * projection binds output aliases there, the source table decides. */
+    if (!ray_query_helper_aliases()) {
+        for (int32_t k = depth - 1; k >= 0 && !v; k--) {
+            ray_scope_frame_t* g = &__VM->scope_stack[k];
+            for (int32_t i = 0; i < g->count; i++)
+                if (g->keys[i] == sym_id) { v = g->vals[i]; if (v) ray_retain(v); break; }
+        }
+    }
+    if (!v) v = ray_query_helper_value(sym_id);
     if (!v) return NULL;
     if (RAY_IS_ERR(v)) { ray_error_free(v); return NULL; }
     ray_err_t err = env_frame_bind(f, sym_id, v);
@@ -344,10 +356,14 @@ static ray_t* env_lookup_flat_rows(int64_t sym_id, uint8_t* rows) {
         for (int32_t d = __VM->scope_depth - 1; d >= 0; d--) {
             ray_scope_frame_t* f = &__VM->scope_stack[d];
             for (int32_t i = 0; i < f->count; i++) {
-                if (f->keys[i] == sym_id) return f->vals[i];
+                if (f->keys[i] != sym_id) continue;
+                /* A source column bound earlier in this call keeps its
+                 * provenance on every later read, not only the first. */
+                if (rows && f->kind == RAY_SCOPE_CALL && f->table && i >= f->table_from) *rows = 1;
+                return f->vals[i];
             }
             if (f->kind == RAY_SCOPE_CALL) {
-                ray_t* v = env_call_frame_value(f, sym_id);
+                ray_t* v = env_call_frame_value(f, d, sym_id);
                 if (v) { if (rows) *rows = 1; return v; }
                 break;
             }
@@ -799,6 +815,7 @@ static ray_err_t env_push_scope(uint8_t kind) {
     f->count = 0;
     f->kind = kind;
     f->table = NULL;
+    f->table_from = 0;
     __VM->scope_depth++;
     return RAY_OK;
 }
@@ -806,8 +823,15 @@ static ray_err_t env_push_scope(uint8_t kind) {
 ray_err_t ray_env_push_call_scope(ray_t* table) {
     ray_err_t err = env_push_scope(RAY_SCOPE_CALL);
     if (err != RAY_OK) return err;
-    __VM->scope_stack[__VM->scope_depth - 1].table = table;
+    ray_env_mark_call_scope(table);
     return RAY_OK;
+}
+
+void ray_env_mark_call_scope(ray_t* table) {
+    ray_scope_frame_t* f = &__VM->scope_stack[__VM->scope_depth - 1];
+    f->kind = RAY_SCOPE_CALL;
+    f->table = table;
+    f->table_from = f->count;
 }
 
 
@@ -834,6 +858,7 @@ void ray_env_pop_scope(void) {
     f->count = 0;
     f->kind = RAY_SCOPE_LEXICAL;
     f->table = NULL;
+    f->table_from = 0;
 }
 
 /* Materialize compiled-lambda locals into a fresh scope frame — the

@@ -74,3 +74,16 @@
 (at (select {v: ((fn [v] 1 (concat v 's)) s) e: (reverse x) from: T}) 'v) -- ['aa 'bb 'cc]
 (at (update {v: ((fn [v] 1 (concat v 's)) s) from: T}) 'v) -- ['aa 'bb 'cc]
 (at (select {o: ((fn [v] 1 'x) s) e: (reverse x) from: T}) 'o) -- [1 2 3]
+;; A free source column keeps its provenance on every read, not only the
+;; first, through concat and through a row-wise builtin.
+(set h2 (fn [v] 1 (concat (concat s v) s)))
+(at (select {v: (h2 s) from: T}) 'v) -- ['aaa 'bbb 'ccc]
+(at (update {v: (h2 s) from: T}) 'v) -- ['aaa 'bbb 'ccc]
+(at (select {from: T where: (in (h2 s) ['aaa 'ccc])}) 'x) -- [1 3]
+(set h3 (fn [v] 1 (concat (upper s) s)))
+(at (update {v: (h3 x) from: T}) 'v) -- ['Aa 'Bb 'Cc]
+(at (select {n: (count (h3 x)) by: x from: T asc: x}) 'n) -- [1 1 1]
+;; Per group, a free source column is the group's rows, like a parameter.
+(set h4 (fn [v] 1 (count s)))
+(at (select {n: (first (h4 x)) by: x from: T asc: x}) 'n) -- [1 1 1]
+(at (update {n: (first (h4 x)) by: x from: T}) 'n) -- [1 1 1]

@@ -56,6 +56,10 @@ typedef struct {
      * falling to the globals, as a helper body compiled in a query does;
      * the query's aliases and locals below the frame stay hidden. */
     ray_t*   table;
+    /* RAY_SCOPE_CALL only: bindings at this index and above are source
+     * columns bound on demand (every lookup of them carries row
+     * provenance); earlier ones are a closure's captured values. */
+    int32_t  table_from;
 } ray_scope_frame_t;
 
 /* ===== Per-thread VM =====

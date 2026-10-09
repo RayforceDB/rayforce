@@ -2301,19 +2301,13 @@ static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
     bool has_closure = LAMBDA_CLOSURE(lambda) != NULL;
     if (has_closure && ray_env_push_capture(LAMBDA_CLOSURE(lambda)) != RAY_OK)
         return ray_error("oom", NULL);
-    if (query && has_closure) {
-        __VM->scope_stack[__VM->scope_depth - 1].kind = RAY_SCOPE_CALL;
-        __VM->scope_stack[__VM->scope_depth - 1].table = ray_query_helper_table();
-    }
+    if (query && has_closure) ray_env_mark_call_scope(ray_query_helper_table());
     if (ray_env_push_scope() != RAY_OK) {
         if (has_closure) ray_env_pop_scope();
         return ray_error("oom", NULL);
     }
 
-    if (query && !has_closure) {
-        __VM->scope_stack[__VM->scope_depth - 1].kind = RAY_SCOPE_CALL;
-        __VM->scope_stack[__VM->scope_depth - 1].table = ray_query_helper_table();
-    }
+    if (query && !has_closure) ray_env_mark_call_scope(ray_query_helper_table());
     query_call_scope_t call = { .prev = g_query_call_scope, .params = params_list,
                                .rows = row_args, .depth = ray_env_scope_depth(),
                                .named = named || ray_eval_query_helper_literals() };

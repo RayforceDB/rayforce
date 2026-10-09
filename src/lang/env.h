@@ -145,6 +145,9 @@ ray_err_t ray_env_push_scope(void);
 /* A named-call boundary: lookups below it see only `table`'s columns
  * (NULL for none) and then the globals. */
 ray_err_t ray_env_push_call_scope(ray_t* table);
+/* Turn the top frame into a call boundary (its current bindings stay
+ * ordinary locals; source columns bind above them). */
+void      ray_env_mark_call_scope(ray_t* table);
 /* ray_env_resolve, also reporting through `rows` whether the value is a
  * query source column (or its cell) read through a helper's call frame. */
 ray_t*    ray_env_resolve_rows(int64_t sym_id, uint8_t* rows);

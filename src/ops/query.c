@@ -2334,6 +2334,9 @@ static ray_t* eval_query_expr(ray_t* expr, ray_t* tbl) {
  * and no nested query has opened a scope since — a nested select, a
  * per-group evaluation or a where-mask over any table (the same one
  * included) binds whole columns and must see whole columns. */
+/* The rows of the group being evaluated by the per-group fallback, while
+ * its expression runs: a helper's free source column is sliced by it. */
+static _Thread_local ray_t*  g_active_query_group_idx = NULL;
 static _Thread_local int64_t g_active_query_row       = -1;
 static _Thread_local ray_t*  g_active_query_row_tbl   = NULL;
 static _Thread_local int32_t g_active_query_row_depth = 0;
@@ -2342,6 +2345,7 @@ ray_t* ray_active_query_table(void) { return g_active_query_table; }
 ray_t* ray_query_helper_table(void) {
     return g_query_source_table ? g_query_source_table : g_active_query_table;
 }
+bool ray_query_helper_aliases(void) { return g_query_source_table != NULL; }
 
 /* Mount columns AND publish `tbl` as the active query table; returns the
  * previously-active table so the caller can restore it after the matching
@@ -5444,13 +5448,13 @@ static ray_t* derived_key_over_sym_domain(ray_t* by_expr, ray_t* tbl, ray_t* sel
  * Helper used inside the per-group hot loop (slices the table's column
  * via ray_at_fn, hands the slice to env_bind_local which retains, then
  * drops our ref).  Returns 0 on success, error ray_t* on failure. */
-static ray_t* bind_col_slice(int64_t sym, ray_t* col, ray_t* idx_list) {
-    /* For typed-vec col + RAY_I64 idx vec, gather directly so the bound
-     * slice is the same typed vector as the source — `(at v idx)` would
-     * box every element into a RAY_LIST of atoms, which breaks any
-     * per-group expression that expects a numeric vec (`desc`, `take`,
-     * `asc`, etc.).  Fall back to ray_at_fn for LIST inputs and other
-     * shapes the gather kernel doesn't cover. */
+/* The rows `idx_list` of `col`, owned.  For typed-vec col + RAY_I64 idx
+ * vec, gather directly so the slice is the same typed vector as the
+ * source — `(at v idx)` would box every element into a RAY_LIST of atoms,
+ * which breaks any per-group expression that expects a numeric vec
+ * (`desc`, `take`, `asc`, etc.).  Fall back to ray_at_fn for LIST inputs
+ * and other shapes the gather kernel doesn't cover. */
+static ray_t* slice_col_by_idx(ray_t* col, ray_t* idx_list) {
     ray_t* slice = NULL;
     if (col && ray_is_vec(col) && idx_list &&
         idx_list->type == RAY_I64 && ray_is_vec(idx_list)) {
@@ -5458,9 +5462,12 @@ static ray_t* bind_col_slice(int64_t sym, ray_t* col, ray_t* idx_list) {
         slice = gather_by_idx(col, (int64_t*)idx_data, ray_len(idx_list));
     }
     if (!slice) slice = ray_at_fn(col, idx_list);
-    if (!slice || RAY_IS_ERR(slice)) {
-        return slice ? slice : ray_error("oom", NULL);
-    }
+    return slice ? slice : ray_error("oom", NULL);
+}
+
+static ray_t* bind_col_slice(int64_t sym, ray_t* col, ray_t* idx_list) {
+    ray_t* slice = slice_col_by_idx(col, idx_list);
+    if (!slice || RAY_IS_ERR(slice)) return slice ? slice : ray_error("oom", NULL);
     ray_env_set_query_local(sym, slice);
     ray_release(slice);
     return NULL;
@@ -5546,7 +5553,9 @@ static ray_t* nonagg_eval_per_group_impl(ray_t* expr, ray_t* tbl,
                 if (err) { ray_error_free(err); bound = 0; }
             }
             if (bound) {
+                g_active_query_group_idx = empty_idx;
                 ray_t* cell = ray_eval(expr);
+                g_active_query_group_idx = NULL;
                 if (cell && !RAY_IS_ERR(cell) && ray_is_lazy(cell)) cell = ray_lazy_materialize(cell);
                 if (cell && !RAY_IS_ERR(cell)) {
                     int8_t t = cell->type;
@@ -5583,7 +5592,9 @@ static ray_t* nonagg_eval_per_group_impl(ray_t* expr, ray_t* tbl,
                 return err;
             }
         }
+        g_active_query_group_idx = idx_list;
         ray_t* cell = ray_eval(expr);
+        g_active_query_group_idx = NULL;
         if (!cell || RAY_IS_ERR(cell)) {
             g_active_query_table = _aqt;
             ray_env_pop_scope();
@@ -5876,6 +5887,10 @@ ray_t* ray_query_helper_value(int64_t sym) {
     if (!src || src->type != RAY_TABLE) return NULL;
     ray_t* col = ray_table_get_col(src, sym);
     if (!col) return NULL;
+    /* Per-group evaluation: the group's rows of the column, as the
+     * expression's own column references are bound. */
+    if (g_active_query_group_idx && src == g_active_query_table)
+        return slice_col_by_idx(col, g_active_query_group_idx);
     if (g_active_query_row < 0 || g_active_query_table != g_active_query_row_tbl ||
         g_active_query_row >= ray_len(col) ||
         ray_env_query_scope_above(g_active_query_row_depth)) {
