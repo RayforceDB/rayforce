@@ -1166,22 +1166,30 @@ static test_result_t test_index_hash_region_bytes(void) {
     PASS();
 }
 
-/* A column large enough for its key words to take a direct block, built in
- * many batches: spilled, each batch's key words are punched out of the
- * spill file once read, and the later batches still find theirs; and the
- * same with the block anonymous (left alone). */
+/* A column with arrays past the pool order, direct blocks in memory whose
+ * headers carry the direct order byte, and arrays below it: 2.2M distinct
+ * keys (gkeys 17.6 MB and table 32 MB direct, offs and rows 8.8 MB not; key
+ * words 17.6 MB), built in many batches against the in-memory build's own
+ * sizing.  Spilled, each batch's key words are punched out of their spill
+ * file once read and the later batches still find theirs, and the blocks
+ * are freed as direct blocks after (the punch spares their header page);
+ * anonymous, they are left alone. */
 static test_result_t test_index_hash_region_discard(void) {
     ray_heap_init();
     (void)ray_pool_get();
-    ray_t* v = idx_reg_col(RAY_I64, 2200000, 70001, 0);   /* key words: 17.6 MB, a direct block */
+    ray_t* v = idx_reg_col(RAY_I64, 2200000, 2200000, 0);
     TEST_ASSERT_FALSE(RAY_IS_ERR(v));
     int64_t bad = 0;
     for (int plan = 0; plan < 2; plan++) {
         ray_heap_direct_cache_drain();
+        ray_mem_stats_t s0, s1;
+        ray_mem_stats(&s0);
         ray_heap_set_anon_watermark(plan == 0 ? INT64_C(4) << 20
                                               : ray_heap_anon_committed() + (INT64_C(96) << 20));
         if (!idx_region_same(v, NULL)) bad++;
         ray_heap_set_anon_watermark(0);
+        ray_mem_stats(&s1);
+        if (s1.direct_bytes != s0.direct_bytes || s1.direct_count != s0.direct_count) bad++;
     }
     TEST_ASSERT_EQ_I(bad, 0);
     ray_release(v);

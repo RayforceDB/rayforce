@@ -49,7 +49,7 @@
 #else
 #include <unistd.h>
 #endif
-#if defined(__linux__)
+#if defined(RAY_OS_LINUX)
 #include <fcntl.h>      /* fallocate: the in-place hash region */
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -773,10 +773,12 @@ ray_err_t ray_col_append_index(const char* path, const void* ix_v,
     return err;
 }
 
-#if defined(__linux__)
+#if defined(RAY_OS_LINUX)
 /* Debug builds: RAY_HASH_INJECT names a step of the in-place build to fail
  * there, for the tests — "fs": the filesystem is not one it trusts;
- * "grow", "map": the region cannot be allocated, or mapped. */
+ * "grow", "map": the region cannot be allocated, or mapped; "build": an
+ * interrupt as soon as it is mapped; "premarker": the process ends with
+ * the region written, before the marker. */
 static bool col_hash_inject(const char* step) {
 #if defined(DEBUG)
     const char* e = getenv("RAY_HASH_INJECT");
@@ -842,12 +844,13 @@ static uint8_t* col_region_map(void* raw, int64_t bytes) {
     if (p == MAP_FAILED) { r->refused = true; return NULL; }
     r->map = (uint8_t*)p;
     r->map_len = (size_t)(end - moff);
+    if (col_hash_inject("build")) ray_request_interrupt();
     return r->map + (r->region_off - moff);
 }
 #endif
 
 ray_err_t ray_col_build_hash_index(const char* path, ray_t* col, void* trace) {
-#if !defined(__linux__)
+#if !defined(RAY_OS_LINUX)
     /* Elsewhere the blocks a mapped write lands on cannot be held up front
      * (macOS: APFS is copy-on-write) — the caller builds in memory. */
     (void)path; (void)col; (void)trace;
@@ -873,6 +876,7 @@ ray_err_t ray_col_build_hash_index(const char* path, ray_t* col, void* trace) {
     /* the pages stay in the page cache, dirty: the writeback is the kernel's */
     if (r.map) munmap(r.map, r.map_len);
     if (err == RAY_OK) {
+        if (col_hash_inject("premarker")) _exit(86);
         /* the region is in the file before the marker claims it */
         mg = COL_IDX_AUX_MAGIC;
         if (pwrite(fd, &mg, 4, 0) != 4) err = RAY_ERR_IO;

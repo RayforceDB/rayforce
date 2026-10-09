@@ -2323,11 +2323,17 @@ static bool store_files_same(const char* a, const char* b) {
 }
 
 /* The hash index appended to index-less column file `path` as before the
- * in-place build: attached to the mapped column, then copied into the file. */
+ * in-place build: attached to the mapped column, then copied into the file.
+ * Built under a small budget, so a column of more than one batch takes the
+ * route the in-memory build always took — arrays at the key count, cut to
+ * the groups after — and not the sizes the in-place build computes. */
 static ray_err_t store_hash_append_legacy(const char* path) {
     ray_t* col = ray_col_mmap(path);
     if (!col || RAY_IS_ERR(col)) { if (col) ray_error_free(col); return RAY_ERR_IO; }
+    int64_t wm = ray_heap_anon_watermark();
+    ray_heap_set_anon_watermark(INT64_C(4) << 20);
     ray_t* r = ray_index_attach_hash(&col);
+    ray_heap_set_anon_watermark(wm);
     ray_err_t err = RAY_ERR_OOM;
     if (!RAY_IS_ERR(r))
         err = ray_col_append_index(path, ray_index_payload(col->index), col->len, col->type);
@@ -2465,7 +2471,7 @@ static test_result_t test_col_build_hash_index_refusals(void) {
  * ray_splay_hash_column builds the index in memory and appends it: the same
  * bytes.  Debug builds pretend the filesystem is untrusted. */
 static test_result_t test_col_build_hash_index_untrusted_fs(void) {
-#if defined(__linux__) && !defined(DEBUG)
+#if defined(RAY_OS_LINUX) && !defined(DEBUG)
     SKIP("RAY_HASH_INJECT is read by debug builds only");
 #endif
     char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-hidx-fs-%d", (int)getpid());
@@ -2553,6 +2559,91 @@ static test_result_t test_col_build_hash_index_refused(void) {
     PASS();
 #else
     SKIP("RAY_HASH_INJECT is read by debug builds only");
+#endif
+}
+
+/* A build that fails once the region is allocated and mapped (debug
+ * builds raise an interrupt right there) cuts the file back to its payload:
+ * it loads unindexed and builds again after.  One batch and many. */
+static test_result_t test_col_build_hash_index_truncate(void) {
+#if defined(DEBUG)
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-hidx-tr-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    if (!store_in_place(dir)) { (void)ray_test_rm_rf(dir); SKIP("no in-place build on this filesystem"); }
+    char p[200]; snprintf(p, sizeof(p), "%s/a", dir);
+    ray_t* v = store_hash_col(RAY_I64, 300000, 5003, 977);
+    int64_t bad = 0;
+    for (int plan = 0; plan < 2; plan++) {
+        if (plan == 1) ray_heap_set_anon_watermark(INT64_C(4) << 20);
+        if (ray_col_save_bulk(v, p) != RAY_OK) bad++;
+        int64_t payload = store_file_size(p);
+        TEST_ASSERT_EQ_I(setenv("RAY_HASH_INJECT", "build", 1), 0);
+        ray_err_t e = store_hash_build(p);
+        unsetenv("RAY_HASH_INJECT");
+        ray_clear_interrupt();
+        if (e != RAY_ERR_CANCEL || store_file_size(p) != payload) bad++;
+        ray_t* back = ray_col_mmap(p);
+        if (!back || RAY_IS_ERR(back) || (back->attrs & RAY_ATTR_HAS_INDEX) || back->len != 300000) bad++;
+        if (back && !RAY_IS_ERR(back)) ray_release(back); else if (back) ray_error_free(back);
+        if (store_hash_build(p) != RAY_OK) bad++;
+        back = ray_col_mmap(p);
+        if (!back || RAY_IS_ERR(back) || ray_index_kind(back) != RAY_IDX_HASH) bad++;
+        if (back && !RAY_IS_ERR(back)) ray_release(back); else if (back) ray_error_free(back);
+        if (plan == 1) ray_heap_set_anon_watermark(0);
+    }
+    ray_release(v);
+    TEST_ASSERT_EQ_I(bad, 0);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+#else
+    SKIP("RAY_HASH_INJECT is read by debug builds only");
+#endif
+}
+
+/* The marker goes on last: a process that ends with the whole region
+ * written but before the marker (debug builds end it right there, in a
+ * child) leaves a file that does not claim an index.  The column is under
+ * the parallel threshold: the child has no pool workers. */
+static test_result_t test_col_build_hash_index_marker_last(void) {
+#if defined(DEBUG) && defined(RAY_OS_LINUX)
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-hidx-mk-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    if (!store_in_place(dir)) { (void)ray_test_rm_rf(dir); SKIP("no in-place build on this filesystem"); }
+    char p[200], r[200];
+    snprintf(p, sizeof(p), "%s/a", dir);
+    snprintf(r, sizeof(r), "%s/ref", dir);
+    ray_t* v = store_hash_col(RAY_I64, 50000, 997, 0);
+    TEST_ASSERT_EQ_I(ray_col_save_bulk(v, p), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save_bulk(v, r), RAY_OK);
+    int64_t payload = store_file_size(p);
+    TEST_ASSERT_EQ_I(store_hash_build(r), RAY_OK);
+    pid_t pid = fork(); TEST_ASSERT_TRUE(pid >= 0);
+    if (!pid) {
+        if (setenv("RAY_HASH_INJECT", "premarker", 1)) _exit(2);
+        (void)store_hash_build(p);
+        _exit(3);                                  /* not reached: it ends inside */
+    }
+    int status;
+    TEST_ASSERT_EQ_I(waitpid(pid, &status, 0), pid);
+    TEST_ASSERT_TRUE(WIFEXITED(status)); TEST_ASSERT_EQ_I(WEXITSTATUS(status), 86);
+    /* the whole region is there, the header claims nothing */
+    TEST_ASSERT_EQ_I(store_file_size(p), store_file_size(r));
+    TEST_ASSERT_TRUE(store_file_size(p) > payload);
+    uint32_t mp = 0, mr = 0;
+    FILE* f = fopen(p, "rb"); TEST_ASSERT_NOT_NULL(f);
+    TEST_ASSERT_EQ_I((int64_t)fread(&mp, 1, 4, f), 4); fclose(f);
+    f = fopen(r, "rb"); TEST_ASSERT_NOT_NULL(f);
+    TEST_ASSERT_EQ_I((int64_t)fread(&mr, 1, 4, f), 4); fclose(f);
+    TEST_ASSERT_TRUE(mr != 0);          /* the finished file's marker */
+    TEST_ASSERT_TRUE(mp != mr);
+    ray_t* back = ray_col_mmap(p);      /* longer than its payload, unclaimed: refused */
+    TEST_ASSERT_TRUE(back && RAY_IS_ERR(back));
+    ray_error_free(back);
+    ray_release(v);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+#else
+    SKIP("needs a debug build on Linux");
 #endif
 }
 
@@ -6870,6 +6961,8 @@ const test_entry_t store_entries[] = {
     { "store/col_build_hash_index_refusals", test_col_build_hash_index_refusals, store_setup, store_teardown },
     { "store/col_build_hash_index_untrusted_fs", test_col_build_hash_index_untrusted_fs, store_setup, store_teardown },
     { "store/col_build_hash_index_refused", test_col_build_hash_index_refused, store_setup, store_teardown },
+    { "store/col_build_hash_index_truncate", test_col_build_hash_index_truncate, store_setup, store_teardown },
+    { "store/col_build_hash_index_marker_last", test_col_build_hash_index_marker_last, store_setup, store_teardown },
     { "store/col_build_hash_index_rollback", test_col_build_hash_index_rollback, store_setup, store_teardown },
     { "store/col_build_hash_index_interrupt", test_col_build_hash_index_interrupt, store_setup, store_teardown },
     { "store/stream_inline_dict", test_stream_inline_dict, store_setup, store_teardown },
