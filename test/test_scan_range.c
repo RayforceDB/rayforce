@@ -3579,10 +3579,12 @@ static test_result_t test_radix_route_sparse(void) {
      * emit-filter key range without a selection: n's bounds come from the
      * directory, m's span takes the second (marker) sum pass, w's does not
      * fit (the sparse table), p / q are I32 with negatives (the range reads
-     * them unsigned, so their directory bounds are not used) */
-    sr_eval_ok("(set N (table [n m w p q x] (list (- (% (* i 7919) 1000003) 500000) "
+     * them unsigned, so their directory bounds are not used), t is I16
+     * (the two-byte key arm) */
+    sr_eval_ok("(set N (table [n m w p q t x] (list (- (% (* i 7919) 1000003) 500000) "
                "(* (- (% i 1000) 500) 40000) (* (- (% i 1000) 500) 1000000) "
-               "(as 'I32 (- (% i 1000) 2000)) (as 'I32 (- (% i 1000) 500)) i)))");
+               "(as 'I32 (- (% i 1000) 2000)) (as 'I32 (- (% i 1000) 500)) "
+               "(as 'I16 (- (% (* i 7919) 60001) 30000)) i)))");
     sr_eval_ok("(.db.splayed.set \"" SR_TMP "/n0/\" N {compress: false})");
     sr_eval_ok("(.db.splayed.set \"" SR_TMP "/n2/\" N {compress: true})");
     static const char* const qn[] = {
@@ -3593,6 +3595,8 @@ static test_result_t test_radix_route_sparse(void) {
         "(select {c: (count x) s: (sum x) from: T by: q desc: c take: 3})",
         "(select {c: (count x) s: (sum x) from: T where: (> x 1000) by: m desc: c take: 3})",
         "(select {s: (sum x) a: (avg n) from: T by: w})",
+        "(select {c: (count x) s: (sum x) from: T by: t})",
+        "(select {c: (count x) s: (sum x) from: T by: t desc: c take: 3})",
         NULL };
     for (int i = 0; qn[i]; i++) {
         test_result_t r = sr_same_on("(.db.splayed.get \"" SR_TMP "/n0/\")", "(.db.splayed.get \"" SR_TMP "/n2/\")",

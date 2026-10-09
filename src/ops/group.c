@@ -12895,9 +12895,10 @@ typedef struct {
 } sp_walk_ctx_t;
 
 /* Row r's inputs folded into sums (and hi, when not NULL), the staged ones
- * read from the piece positioned at row b. */
-static inline void sp_walk_sums(const sp_walk_ctx_t* c, const ray_col_piece_t* p, int64_t b,
-                                int64_t r, da_val_t* sums, int64_t* hi) {
+ * read from the piece positioned at row b.  Inlined into each pass's row
+ * loop (sp_walk_rows), as generation 0's loop is into exec_group_run. */
+static inline __attribute__((always_inline)) void sp_walk_sums(const sp_walk_ctx_t* c, const ray_col_piece_t* p,
+                                                               int64_t b, int64_t r, da_val_t* sums, int64_t* hi) {
     for (uint32_t a = 0; a < c->n_aggs; a++) {
         if (c->ext->agg_ops[a] == OP_COUNT) continue;
         const void* d;
@@ -12917,6 +12918,55 @@ static inline void sp_walk_sums(const sp_walk_ctx_t* c, const ray_col_piece_t* p
     }
 }
 
+/* One pass over the rows [b, e) of a piece, `pass` and the key width
+ * `kesz` constants of each inlined copy (sp_walk_piece switches on them
+ * once per piece): no per-row pass switch or width read, the pass's state
+ * held in locals.  The key is read at r - kb. */
+static inline __attribute__((always_inline)) void sp_walk_rows(sp_walk_ctx_t* c, const ray_col_piece_t* p,
+                                                               int64_t b, int64_t e, const void* kd, int64_t kb,
+                                                               const int pass, const uint8_t kesz) {
+    const uint32_t n = c->n_aggs;
+    ray_t* const rowsel = c->rowsel;
+    uint32_t* const rc = c->range_count;
+    da_val_t* const sums = c->sums;
+    int64_t* const sums_hi = c->sums_hi;
+    sparse_i64_ht_t* const ht = c->ht;
+    const uint64_t min_key = (uint64_t)c->min_key;
+    const bool ns = pass == SPW_HT_SUM && c->need_sum;
+    bool have = c->have_key;
+    int64_t mn = c->min_key, mx = c->max_key;
+    for (int64_t r = b; r < e; r++) {
+        if (rowsel && !group_rowsel_pass(rowsel, r)) continue;
+        const int64_t key = read_by_esz(kd, r - kb, kesz);
+        if (pass == SPW_MINMAX) {
+            if (!have) { mn = mx = key; have = true; }
+            else if (key < mn) mn = key;
+            else if (key > mx) mx = key;
+        } else if (pass == SPW_RANGE) {
+            uint64_t off = (uint64_t)key - min_key;
+            if (rc[off] != UINT32_MAX) rc[off]++;
+            if (sums) sp_walk_sums(c, p, b, r, &sums[(size_t)off * n], sums_hi ? &sums_hi[(size_t)off * n] : NULL);
+        } else if (pass == SPW_MARKER) {
+            uint32_t marker = rc[(uint64_t)key - min_key];
+            if (!marker) continue;
+            size_t gi = (size_t)(marker - 1u) * n;
+            sp_walk_sums(c, p, b, r, &sums[gi], sums_hi ? &sums_hi[gi] : NULL);
+        } else if (pass == SPW_HT_COUNT || pass == SPW_HT_SUM) {
+            int32_t slot;
+            if (!sparse_i64_touch(ht, key, (uint8_t)n, ns, &slot)) { c->stop = true; return; }
+            ht->counts[slot]++;
+            if (ns) sp_walk_sums(c, p, b, r, &ht->sums[(size_t)slot * n],
+                                 ht->sums_hi ? &ht->sums_hi[(size_t)slot * n] : NULL);
+        } else {                                          /* SPW_HEAVY */
+            int32_t hs = sparse_i64_find_slot(ht, key);
+            if (!ht->used[hs] || ht->keys[hs] != key) continue;
+            size_t gi = (size_t)(uint32_t)ht->counts[hs] * n;
+            sp_walk_sums(c, p, b, r, &sums[gi], sums_hi ? &sums_hi[gi] : NULL);
+        }
+    }
+    if (pass == SPW_MINMAX) { c->have_key = have; c->min_key = mn; c->max_key = mx; }
+}
+
 static void sp_walk_piece(void* ctx, uint32_t wid, int64_t b, int64_t e, const ray_col_piece_t* p) {
     (void)wid;
     sp_walk_ctx_t* c = (sp_walk_ctx_t*)ctx;
@@ -12925,51 +12975,16 @@ static void sp_walk_piece(void* ctx, uint32_t wid, int64_t b, int64_t e, const r
     const void* kd = ks ? p[0].data : c->key_plain;
     const int64_t kb = ks ? b : 0;                  /* the key is read at r - kb */
     const uint8_t kesz = ks ? ray_sym_elem_size(c->key_type, p[0].attrs) : c->key_esz;
-    const uint32_t n = c->n_aggs;
-    for (int64_t r = b; r < e; r++) {
-        if (c->rowsel && !group_rowsel_pass(c->rowsel, r)) continue;
-        int64_t key = read_by_esz(kd, r - kb, kesz);
-        switch (c->pass) {
-        case SPW_MINMAX:
-            if (!c->have_key) { c->min_key = c->max_key = key; c->have_key = true; }
-            else if (key < c->min_key) c->min_key = key;
-            else if (key > c->max_key) c->max_key = key;
-            break;
-        case SPW_RANGE: {
-            uint64_t off = (uint64_t)key - (uint64_t)c->min_key;
-            if (c->range_count[off] != UINT32_MAX) c->range_count[off]++;
-            if (c->sums)
-                sp_walk_sums(c, p, b, r, &c->sums[(size_t)off * n],
-                             c->sums_hi ? &c->sums_hi[(size_t)off * n] : NULL);
-            break;
-        }
-        case SPW_MARKER: {
-            uint32_t marker = c->range_count[(uint64_t)key - (uint64_t)c->min_key];
-            if (!marker) break;
-            size_t gi = (size_t)(marker - 1u) * n;
-            sp_walk_sums(c, p, b, r, &c->sums[gi], c->sums_hi ? &c->sums_hi[gi] : NULL);
-            break;
-        }
-        case SPW_HT_COUNT:
-        case SPW_HT_SUM: {
-            bool ns = c->pass == SPW_HT_SUM && c->need_sum;
-            int32_t slot;
-            if (!sparse_i64_touch(c->ht, key, (uint8_t)n, ns, &slot)) { c->stop = true; return; }
-            c->ht->counts[slot]++;
-            if (ns)
-                sp_walk_sums(c, p, b, r, &c->ht->sums[(size_t)slot * n],
-                             c->ht->sums_hi ? &c->ht->sums_hi[(size_t)slot * n] : NULL);
-            break;
-        }
-        case SPW_HEAVY: {
-            int32_t hs = sparse_i64_find_slot(c->ht, key);
-            if (!c->ht->used[hs] || c->ht->keys[hs] != key) break;
-            size_t gi = (size_t)(uint32_t)c->ht->counts[hs] * n;
-            sp_walk_sums(c, p, b, r, &c->sums[gi], c->sums_hi ? &c->sums_hi[gi] : NULL);
-            break;
-        }
-        }
+#define SPW_WIDTHS(P) do { switch (kesz) {                                                  case 1:  sp_walk_rows(c, p, b, e, kd, kb, (P), 1); break;                          case 2:  sp_walk_rows(c, p, b, e, kd, kb, (P), 2); break;                          case 4:  sp_walk_rows(c, p, b, e, kd, kb, (P), 4); break;                          default: sp_walk_rows(c, p, b, e, kd, kb, (P), 8); break; } } while (0)
+    switch (c->pass) {
+    case SPW_MINMAX:   SPW_WIDTHS(SPW_MINMAX); break;
+    case SPW_RANGE:    SPW_WIDTHS(SPW_RANGE); break;
+    case SPW_MARKER:   SPW_WIDTHS(SPW_MARKER); break;
+    case SPW_HT_COUNT: SPW_WIDTHS(SPW_HT_COUNT); break;
+    case SPW_HT_SUM:   SPW_WIDTHS(SPW_HT_SUM); break;
+    default:           SPW_WIDTHS(SPW_HEAVY); break;
     }
+#undef SPW_WIDTHS
 }
 
 /* One pass over rows [lo, hi) by pieces (the selection's rejected morsels
