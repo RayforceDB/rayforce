@@ -36,19 +36,27 @@ FLOOR_MS, FLOOR_GAP_MS = 1.0, 0.05
 # cold | rss.  Data only: the controller trims rows as the fix tasks land.
 # GATE (P3-exempt) skips exactly these (query, arm, metric) clauses.
 P3_DEFERRALS = [
-    ("q2",  "AB", "warm",  "run-level compute (count over RLE runs)"),
-    ("q8",  "AB", "warm",  "run-level compute (group over RLE runs)"),
-    ("q18", "A",  "warm",  "row-list / selection gather (P3 path 2)"),
-    ("q18", "AB", "first", "row-list / selection gather (P3 path 2)"),
-    ("q18", "B",  "warm",  "parted q18 residual after 17c"),
-    ("q39", "AB", "warm",  "selection gather (P3 path 2)"),
-    ("q39", "AB", "first", "selection gather (P3 path 2)"),
-    ("q39", "AB", "cold",  "selection gather reads whole columns cold (P3)"),
-    ("q42", "AB", "warm",  "point gathers"),
-    ("q24", "AB", "rss",   "top-k output gather"),
-    ("q25", "AB", "rss",   "top-k output gather"),
-    ("q26", "AB", "rss",   "top-k output gather"),
-    ("q27", "AB", "rss",   "top-k output gather"),
+    # (query, arms, metric, max_ratio, reason).  max_ratio is about 1.5x the
+    # ratio measured on the first gate run; above it the exemption lapses and
+    # the clause fails, so a regression of a deferred query still shows.  For
+    # rss the ratio is the arm's peak-RSS ratio (informational, not gated).
+    ("q2",  "AB", "warm",  8.0, "run-level compute (count over RLE runs)"),
+    ("q8",  "AB", "warm",  5.5, "run-level compute (group over RLE runs)"),
+    ("q18", "A",  "warm",  1.5, "row-list / selection gather (P3 path 2)"),
+    ("q18", "AB", "first", 4.1, "row-list / selection gather (P3 path 2)"),
+    ("q18", "B",  "warm",  8.5, "parted q18 residual after 17c"),
+    ("q39", "AB", "warm",  1.5, "selection gather (P3 path 2)"),
+    ("q39", "AB", "first", 4.0, "selection gather (P3 path 2)"),
+    ("q39", "AB", "cold",  3.2, "selection gather reads whole columns cold (P3)"),
+    ("q42", "AB", "warm",  4.0, "point gathers"),
+    ("q24", "A",  "rss",   2.4, "top-k output gather"),
+    ("q25", "A",  "rss",   2.4, "top-k output gather"),
+    ("q26", "A",  "rss",   2.4, "top-k output gather"),
+    ("q27", "A",  "rss",   2.4, "top-k output gather"),
+    ("q24", "B",  "rss",   1.6, "top-k output gather"),
+    ("q25", "B",  "rss",   1.6, "top-k output gather"),
+    ("q26", "B",  "rss",   1.6, "top-k output gather"),
+    ("q27", "B",  "rss",   1.6, "top-k output gather"),
 ]
 PI_SPLAYED_FIRST_TOTAL = 2.99    # RESULTS.md "PI index policy": gen-2 first-run total 7 740 vs 2 586 ms
 ARMS = {"A": ("g0", "g2", "splayed g0 vs g2"), "B": ("p0", "p2", "parted p0 vs p2"),
@@ -77,7 +85,7 @@ def answer(arm, q):
         if sa == sb: return "same", ("order" if ra != rb else "")
     return ("noise" if sb != sb2 else "DIFF"), ""
 
-allraw = {}; verdict = {}; orders = defaultdict(list); worst = {}
+verdict_gate = {}; allraw = {}; verdict = {}; orders = defaultdict(list); worst = {}
 for arm, (va, vb, title) in ARMS.items():
     if not any(k[0] == arm for k in runs): continue
     print(f"## arm {arm}: {title} (ms; ratio = {vb}/{va})")
@@ -120,22 +128,33 @@ for arm, (va, vb, title) in ARMS.items():
             ok = rows[q][i] <= bound or (a_ < FLOOR_MS and b_ < FLOOR_MS and abs(b_ - a_) <= FLOOR_GAP_MS)
             out.append((q, ok))
         return out
-    def big(qs, i): return [rows[q][i] for q in qs if raw[q][0][0] >= FLOOR_MS]
+    def big(qs, i): return [rows[q][i] for q in qs if raw[q][i][0] >= FLOOR_MS]
     if arm in ("A", "B"):
-        w = big(scan, 0); c = [rows[q][3] for q in scan if raw[q][3][0] >= FLOOR_MS]; fr = big(scan, 1)
-        small = [q for q in scan if raw[q][0][0] < FLOOR_MS]
-        fails = {"warm": clauses(scan, 0, 1.05, "warm"), "first": clauses(scan, 1, 1.10, "first"),
-                 "cold": [(q, ok) for q, ok in clauses(scan, 3, 1.10, "cold") if not math.isnan(rows[q][3])],
+        # gated as scan-only: measured scan-only, plus any SCAN_ONLY-list query
+        # that measured as materializing (it keeps its first and cold clauses)
+        gate = [q for q in QS if q in rows and (measured_scan(q) or q in SCAN_ONLY)]
+        other = [q for q in other if q not in gate]
+        unexpected = [q for q in gate if not measured_scan(q) and q in SCAN_ONLY and mat.get((arm, q)) is not None]
+        nomat = [q for q in rows if (arm, q) not in mat]
+        v["_unexpected"] = unexpected; v["_matmissing"] = nomat
+        v["_gate"] = gate
+        v["_g"] = {m: [(q, rows[q][i], raw[q][i][0]) for q in gate if not math.isnan(rows[q][i])] for m, i in (("warm", 0), ("first", 1), ("cold", 3))}
+        fails = {"warm": clauses(gate, 0, 1.05, "warm"), "first": clauses(gate, 1, 1.10, "first"),
+                 "cold": [(q, ok) for q, ok in clauses(gate, 3, 1.10, "cold") if not math.isnan(rows[q][3])],
                  "materializing_warm": clauses(other, 0, 1.05, "warm")}
         v["_clauses"] = fails
-        v["_gm"] = {"warm": gmean(w) <= 1.00, "first": gmean(fr) <= 1.00, "cold": bool(c) and gmean(c) < 1.00}
-        v["_cold_nan"] = any(math.isnan(rows[q][3]) for q in scan)
-        worst[arm] = {"warm": top5(scan, 0), "cold": top5(scan, 3), "first": top5(scan, 1),
+        v["_cold_nan"] = any(math.isnan(rows[q][3]) for q in gate)
+        w, fr, c = big(gate, 0), big(gate, 1), big(gate, 3)
+        worst[arm] = {"warm": top5(gate, 0), "cold": top5(gate, 3), "first": top5(gate, 1),
                       "materializing_warm": top5(other, 0)}
-        print(f"scan_only(measured) n={len(scan)} gmean over base>=1ms n={len(w)}: warm={gmean(w):.3f} "
-              f"first={gmean(fr):.3f} cold={gmean(c):.3f}; worst warm={max([rows[q][0] for q in scan], default=float('nan')):.3f}")
-        print("below_1ms_excluded_from_gmean " + (" ".join(small) if small else "none"))
-        print("measured_materializing " + (" ".join(f"{q}({len(mat.get((arm, q), '').strip('[]').split())} cols)" for q in other) if other else "none"))
+        print(f"scan_only(gated) n={len(gate)}; gmeans over base>=1ms (per column): warm n={len(w)} {gmean(w):.3f}, "
+              f"first n={len(fr)} {gmean(fr):.3f}, cold n={len(c)} {gmean(c):.3f}; worst warm={max([rows[q][0] for q in gate], default=float('nan')):.3f}")
+        for m, i in (("warm", 0), ("first", 1), ("cold", 3)):
+            sm = [q for q in gate if raw[q][i][0] < FLOOR_MS or math.isnan(raw[q][i][0])]
+            print(f"below_1ms_excluded_from_{m}_gmean " + (" ".join(sm) if sm else "none"))
+        print("mat rows missing " + (" ".join(nomat) if nomat else "none"))
+        print("scan_only_list_but_materializing " + (" ".join(unexpected) if unexpected else "none"))
+        print("measured_materializing " + (" ".join(f"{q}({len(mat.get((arm, q), '').strip('[]').split())} cols)" for q in QS if q in rows and not measured_scan(q)) if any(not measured_scan(q) for q in rows) else "none"))
         print("class_vs_SCAN_ONLY_list_disagreements " + (" ".join(f"{q}(measured {'scan' if measured_scan(q) else 'materializing'}, list {'scan' if q in SCAN_ONLY else 'other'})" for q in disagree) if disagree else "none"))
         for cl, lst in worst[arm].items(): print(f"worst5 {cl} {lst}")
         if arm == "A":
@@ -154,7 +173,7 @@ for arm, (va, vb, title) in ARMS.items():
             s0, s1 = stats(arm, "base", "q16"), stats(arm, "p2", "q16")
             v["q16_first"] = s1[1] < s0[1]
             print(f"q16 first run base {s0[1]:.1f} ms, p2 {s1[1]:.1f} ms (carry 2)")
-    allraw[arm] = (rows, raw)
+    allraw[arm] = (rows, raw); verdict_gate[arm] = set(v.get('_gate', ()))
     verdict[arm] = v
     print()
 
@@ -164,17 +183,29 @@ for arm, lines in encs.items():
 if bad_rows: print("unparsed timing rows (query error?): " + "; ".join(bad_rows))
 print(f"sizes {size}  peak_rss_kb {mem}  evict_modes {','.join(sorted(modes))}  ragged_partition {ragged}  meta {meta}")
 
-def exempt_set(arm):
-    return {(q, m) for q, arms, m, _ in P3_DEFERRALS if arm in arms}
+COL = {"warm": 0, "first": 1, "cold": 3}
+def exempt_ok(arm, q, m):
+    """The deferral for (q, arm, m) applies while its ratio stays <= max_ratio."""
+    for dq, arms, dm, mx, _ in P3_DEFERRALS:
+        if dq == q and dm == m and arm in arms:
+            r = allraw[arm][0][q][COL[m]] if q in allraw[arm][0] else float("nan")
+            return r <= mx
+    return False
+def deferred_any(arm, q):
+    return any(dq == q and arm in arms and dm != "rss" for dq, arms, dm, _, _ in P3_DEFERRALS)
 def fields(arm, exempt):
     v = dict(verdict.get(arm, {}))
-    cl = v.pop("_clauses", None); gm = v.pop("_gm", None); cn = v.pop("_cold_nan", False)
+    cl = v.pop("_clauses", None); g = v.pop("_g", None); cn = v.pop("_cold_nan", False)
+    un = v.pop("_unexpected", []); nm = v.pop("_matmissing", []); v.pop("_gate", None)
     if cl is None: return v
-    ex = exempt_set(arm) if exempt else set()
+    ex = (lambda q, m: exempt_ok(arm, q, m)) if exempt else (lambda q, m: False)
     out = {"answers": v["answers"]}
     for m in ("warm", "cold", "first"):
-        out[m] = all(ok for q, ok in cl[m] if (q, m) not in ex) and gm[m] and not (m == "cold" and cn)
-    out["materializing_warm"] = all(ok for q, ok in cl["materializing_warm"] if (q, "warm") not in ex)
+        gm = gmean([r for q, r, base in g[m] if base >= FLOOR_MS and not ex(q, m)])
+        out[m] = (all(ok for q, ok in cl[m] if not ex(q, m)) and gm <= (1.00 if m != "cold" else 0.9999)
+                  and not (m == "cold" and cn))
+    out["materializing_warm"] = all(ok for q, ok in cl["materializing_warm"] if not ex(q, "warm"))
+    out["no_unexpected_materialization"] = not nm and all(exempt and deferred_any(arm, q) for q in un)
     if "first_total" in v: out["first_total"] = v["first_total"]
     return out
 def fmt(arm, exempt):
@@ -185,24 +216,26 @@ for exempt, tag in ((False, "strict"), (True, "P3-exempt")):
           f"gen0-parted[{fmt('C1', exempt)}] gen0-ragged[{fmt('R', exempt)}]")
     ok = all(arm in verdict for arm in ARMS) and all(all(fields(a, exempt).values()) for a in ARMS if a in verdict)
     print(f"P2 GATE ({tag}): " + ("PASS" if ok else "FAIL"))
-parts = []; rss_seen = set()
-colname = {"warm": 0, "first": 1, "cold": 3}
-for q, arms, m, why in P3_DEFERRALS:
+parts = []
+for q, arms, m, mx, why in P3_DEFERRALS:
     for arm in arms:
         if arm not in allraw: continue
         rows, raw = allraw[arm]
         if m == "rss":
-            if (arm, why) in rss_seen: continue
-            rss_seen.add((arm, why))
-            qs = "/".join(x[0] for x in P3_DEFERRALS if x[2] == "rss" and arm in x[1] and x[3] == why)
-            q = qs
-            va = ARMS[arm][0]; vb = ARMS[arm][1]
+            va, vb = ARMS[arm][0], ARMS[arm][1]
             a_, b_ = mem.get((arm, va)), mem.get((arm, vb))
-            parts.append(f"{q}/{arm}/rss[{why}]: peak-RSS over all queries {a_} -> {b_} kB (x{ratio(a_, b_):.2f})" if a_ and b_ else f"{q}/{arm}/rss[{why}]: n/a")
+            r = ratio(a_, b_) if a_ and b_ else float("nan")
+            parts.append(f"{q}/{arm}/rss[{why}]: arm peak-RSS {a_} -> {b_} kB (x{r:.2f}, max {mx}) not gated"
+                         + (" EXCEEDS-MAX" if r > mx else ""))
         elif q in rows:
-            a_, b_ = raw[q][colname[m]]
-            r = rows[q][colname[m]]
+            i = COL[m]
+            a_, b_ = raw[q][i]; r = rows[q][i]
             bound = 1.05 if m == "warm" else 1.10
-            st = "within-bound" if r <= bound or (a_ < FLOOR_MS and b_ < FLOOR_MS and abs(b_ - a_) <= FLOOR_GAP_MS) else "EXEMPTED"
+            gated = q in verdict_gate.get(arm, ()) or m == "warm"
+            if math.isnan(r): st = "no data (not gated)"
+            elif not gated: st = "not gated (materializing)"
+            elif r <= bound or (a_ < FLOOR_MS and b_ < FLOOR_MS and abs(b_ - a_) <= FLOOR_GAP_MS): st = "within-bound"
+            elif r <= mx: st = "EXEMPTED"
+            else: st = f"EXEMPTION-LAPSED (x{r:.3f} > max {mx})"
             parts.append(f"{q}/{arm}/{m}[{why}]: {a_:.2f} -> {b_:.2f} ms (x{r:.3f}) {st}")
 print("P3-EXEMPT LIST " + "; ".join(parts))

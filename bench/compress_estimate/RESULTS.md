@@ -445,18 +445,31 @@ alternated rounds, minimum-round warm).  Measured on the 10M store:
 Gate rule (p2_summary.py): a per-query clause passes at ratio <= its bound
 (1.05 warm, 1.10 first and cold), or when both medians are < 1 ms and the
 gap is <= 0.05 ms (about 1.4x the largest sub-ms A/A gap, 35 us; it does not
-hide the real q25/q27 regression of +0.14-0.19 ms).  Geometric means cover
+hide the q25/q27 rows: on the old P2 gen-0 splayed arm q25 is 0.95 -> 1.03
+ms and q27 0.93 -> 1.08 ms, which fail because p2 crosses 1 ms, so the
+sub-ms clause does not apply (the PI section's 15-round confirm of q25,
+1.056 on a different head/dev pair, is a separate measurement and is not
+evidence about this arm))  Geometric means cover
 only queries whose base median is >= 1 ms; the excluded queries are
 printed (`below_1ms_excluded_from_gmean`), because a +-6% ratio wobble on
 0.2 us answers moves a gmean and means nothing.  Above 4 ms A/A stays within
 +-1.1%, so 1.05 keeps a 4x margin.
 
 Query classes are taken from the materialization the run measured (the
-`mat` rows), not a fixed list: q5, q20, q36 do not materialize, q18 and q39
-do.  The plan's pre-run SCAN_ONLY list is kept as a cross-check and its
+`mat` rows), not a fixed list: q5, q20, q36 do not materialize; splayed q18
+and q39, and parted q39, do.  A SCAN_ONLY-list query that materializes stays
+gated as scan-only (warm, first, cold) and fails `no_unexpected_materialization`
+unless it is in P3_DEFERRALS for that arm; a missing `mat` row fails the same field.  The plan's pre-run SCAN_ONLY list is kept as a cross-check and its
 disagreements are printed.  Expected P3 deferrals are a data table
 (`P3_DEFERRALS`) in p2_summary.py; the output has GATE (strict), GATE
 (P3-exempt) and the exempt list with each exempted query's measured numbers.
+Each deferral has a `max_ratio` (about 1.5x its first measured ratio); above it
+the exemption lapses and the clause fails.
+
+The 1.10 bound on first and cold is a per-query tolerance for cold and
+first-run noise.  The spec's "cold is faster" requirement is carried by the
+aggregate: the cold geometric mean (queries with a cold base median >= 1 ms)
+must be < 1.00.  Geometric-mean filters use each column's own base median.
 
 ### arm A: splayed g0 vs g2 (ms; ratio = g2/g0)
 
