@@ -73,7 +73,11 @@ typedef struct {
  * ray_alloc_raw.  Serves one source in one scan task.  The bytes it decodes
  * are counted (ray_enc_counters_get, the column's decoded_bytes) when the
  * scratch moves to another column or is freed, not per vector; the scratch
- * holds a reference on that column meanwhile, so it may outlive its source. */
+ * holds a reference on that column meanwhile, so it may outlive its source.
+ * A RAW vector read in place (ray_enccol_raw_view) decodes nothing: an
+ * integer one (SYM included) still counts the bytes it delivers, so a key's
+ * read-once counts hold whatever its vectors' encodings; a float one
+ * counts none. */
 typedef struct {
     uint8_t* fixed;
     char*    pool;

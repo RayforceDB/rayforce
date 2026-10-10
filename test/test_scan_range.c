@@ -5976,10 +5976,16 @@ static test_result_t test_ragged_gen0_no_decode(void) {
         "(select {c: (count x) s: (sum x) from: T by: y asc: y take: 3})",
         "(select {s: (sum y) c: (count y) from: T by: x desc: s take: 3})",
         "(select {s: (sum x) from: T by: y desc: s take: 4})",
+        /* a null constant: the zone rule leaves every morsel mixed (ZT_MIXED),
+         * the stand-in included; the compare reads the stand-in's nulls (its
+         * materialization: the decode pins do not apply to these three) */
+        "(count (select {from: T where: (== y 0Nl)}))",
+        "(count (select {from: T where: (!= y 0Nl)}))",
+        "(count (select {from: T where: (and (> x 100) (== y 0Nl))}))",
         NULL,
     };
-    static const int64_t skips[] = { 69, 69, 69, 69, 69, 69, 0, 69, 0, 0, 0, 0 };
-    static const int64_t fill[]  = { 0, 0, 0, 0, 0, 0, 0, 0, 560000, 560000, 560000, 560000 };
+    static const int64_t skips[] = { 69, 69, 69, 69, 69, 69, 0, 69, 0, 0, 0, 0, 0, 0, 0 };
+    static const int64_t fill[]  = { 0, 0, 0, 0, 0, 0, 0, 0, 560000, 560000, 560000, 560000, 0, 0, 0 };
     for (int i = 0; q[i]; i++) {
         sr_eval_ok("(set T (.db.parted.get \"" SR_TMP "/rnf\" 't))");
         ray_t* r0 = sr_eval(q[i]);
@@ -5989,7 +5995,7 @@ static test_result_t test_ragged_gen0_no_decode(void) {
         ray_t* r1 = sr_eval(q[i]);
         ray_enc_counters_t k; ray_enc_counters_get(&k);
         TEST_ASSERT_FMT(sr_same_text(r0, r1), "ragged: %s", q[i]);
-        TEST_ASSERT_FMT(k.decoded_bytes == 0 && k.materialized == 0, "%s: %llu bytes decoded, %llu materialized",
+        TEST_ASSERT_FMT(i >= 12 || (k.decoded_bytes == 0 && k.materialized == 0), "%s: %llu bytes decoded, %llu materialized",
                         q[i], (unsigned long long)k.decoded_bytes, (unsigned long long)k.materialized);
         int64_t dz = ray_expr_test_zone_skips() - z0, df = ray_group_null_fill_bytes() - f0;
         TEST_ASSERT_FMT(dz == skips[i], "%s: %lld morsels decided from statistics, want %lld", q[i],
@@ -6025,39 +6031,72 @@ static test_result_t test_ragged_gen0_no_decode(void) {
  * transient budget (AGG_COMPACT_BITMAP_BUDGET) of it.  A stand-in of more
  * rows than that holds of I64 is grouped by the piece walk instead: no fill
  * byte, nothing materialized, the explicit-null reference's answers, on the
- * in-place group and per partition. */
+ * in-place group and per partition (each query's route pinned).  The budget
+ * is the query's, shared by its columns: two stand-ins that each fit but not
+ * together get one fill, the other is walked. */
+static test_result_t sr_fill_route(const char* ref, const char* dut, const char* q, bool in_place,
+                                   int64_t want_fill) {
+    sr_evalf_ok("(set T (.db.parted.get \"%s\" 't))", ref);
+    ray_t* r0 = sr_eval(q);
+    sr_evalf_ok("(set T (.db.parted.get \"%s\" 't))", dut);
+    ray_enc_counters_reset();
+    int64_t f0 = ray_group_null_fill_bytes(), s0 = ray_group_segstream_runs(), p0 = ray_group_perpart_runs();
+    ray_t* r1 = sr_eval(q);
+    ray_enc_counters_t k; ray_enc_counters_get(&k);
+    int64_t ds = ray_group_segstream_runs() - s0, dp = ray_group_perpart_runs() - p0;
+    TEST_ASSERT_FMT(sr_same_text(r0, r1), "ragged: %s", q);
+    TEST_ASSERT_FMT(ray_group_null_fill_bytes() - f0 == want_fill, "%s: %lld bytes of null fill, want %lld", q,
+                    (long long)(ray_group_null_fill_bytes() - f0), (long long)want_fill);
+    TEST_ASSERT_FMT(k.materialized == 0, "%s: %llu materialized", q, (unsigned long long)k.materialized);
+    TEST_ASSERT_FMT(in_place ? (ds == 1 && dp == 0) : (ds == 0 && dp == 1), "%s: in place %lld, per partition %lld",
+                    q, (long long)ds, (long long)dp);
+    sr_drop(r0); sr_drop(r1);
+    PASS();
+}
 static test_result_t test_ragged_fill_bounded(void) {
     const int64_t big = (int64_t)(AGG_COMPACT_BITMAP_BUDGET / sizeof(int64_t)) + 65536;
     for (int ref = 0; ref < 2; ref++) {
         const char* root = ref ? SR_TMP "/rbf" : SR_TMP "/rbd";
-        sr_evalf_ok("(.db.splayed.set \"%s/2024.01.01/t/\" (table [x y] (list (%% (til 70000) 7) (%% (til 70000) 97))) "
-                    "{compress: false})", root);
+        sr_evalf_ok("(.db.splayed.set \"%s/2024.01.01/t/\" (table [x k y] (list (%% (til 70000) 7) (til 70000) "
+                    "(%% (til 70000) 97))) {compress: false})", root);
         sr_evalf_ok("(.db.splayed.set \"%s/2024.01.02/t/\" %s {compress: false})", root,
-                    ref ? "(table [x y] (list (% (til 4259840) 7) (take [0Nl] 4259840)))"
-                        : "(table [x] (list (% (til 4259840) 7)))");
+                    ref ? "(table [x k y] (list (% (til 4259840) 7) (til 4259840) (take [0Nl] 4259840)))"
+                        : "(table [x k] (list (% (til 4259840) 7) (til 4259840)))");
     }
     TEST_ASSERT_FMT(big == 4259840, "budget rows %lld: update the partition size", (long long)big);
-    static const char* const q[] = {
-        "(select {s: (sum y) c: (count y) from: T by: x asc: x})",        /* in place */
-        "(select {s: (sum y) c: (count y) a: (avg y) from: T by: x asc: x})",
-        "(select {c: (count x) s: (sum x) from: T by: y asc: y take: 3})",
-        "(select {s: (sum x) from: T by: y desc: s take: 4})",
-        NULL,
+    /* a key of few groups is grouped per partition; a key of a group per
+     * row in place */
+    static const struct { const char* q; bool in_place; } q[] = {
+        { "(select {s: (sum y) c: (count y) from: T by: x asc: x})", false },
+        { "(select {s: (sum y) c: (count y) a: (avg y) from: T by: x asc: x})", false },
+        { "(select {c: (count x) s: (sum x) from: T by: y asc: y take: 3})", false },
+        { "(select {s: (sum x) from: T by: y desc: s take: 4})", false },
+        { "(select {s: (sum y) c: (count y) from: T by: k desc: s take: 3})", true },
+        { "(select {c: (count y) from: T by: k desc: c take: 3})", true },
+        { NULL, false },
     };
-    for (int i = 0; q[i]; i++) {
-        sr_eval_ok("(set T (.db.parted.get \"" SR_TMP "/rbf\" 't))");
-        ray_t* r0 = sr_eval(q[i]);
-        sr_eval_ok("(set T (.db.parted.get \"" SR_TMP "/rbd\" 't))");
-        ray_enc_counters_reset();
-        int64_t f0 = ray_group_null_fill_bytes();
-        ray_t* r1 = sr_eval(q[i]);
-        ray_enc_counters_t k; ray_enc_counters_get(&k);
-        TEST_ASSERT_FMT(sr_same_text(r0, r1), "ragged: %s", q[i]);
-        TEST_ASSERT_FMT(ray_group_null_fill_bytes() == f0, "%s: %lld bytes of null fill over the budget", q[i],
-                        (long long)(ray_group_null_fill_bytes() - f0));
-        TEST_ASSERT_FMT(k.materialized == 0, "%s: %llu materialized", q[i], (unsigned long long)k.materialized);
-        sr_drop(r0); sr_drop(r1);
+    test_result_t r;
+    for (int i = 0; q[i].q; i++)
+        if ((r = sr_fill_route(SR_TMP "/rbf", SR_TMP "/rbd", q[i].q, q[i].in_place, 0)).status != TEST_PASS) return r;
+    /* two stand-ins of 3M I64 rows (24 MB each, 48 MB together) */
+    const int64_t two = 3000000;
+    TEST_ASSERT_TRUE(two * 8 <= (int64_t)AGG_COMPACT_BITMAP_BUDGET && 2 * two * 8 > (int64_t)AGG_COMPACT_BITMAP_BUDGET);
+    for (int ref = 0; ref < 2; ref++) {
+        const char* root = ref ? SR_TMP "/r2f" : SR_TMP "/r2d";
+        sr_evalf_ok("(.db.splayed.set \"%s/2024.01.01/t/\" (table [x k y z] (list (%% (til 70000) 7) (til 70000) "
+                    "(%% (til 70000) 97) (%% (til 70000) 89))) {compress: false})", root);
+        sr_evalf_ok("(.db.splayed.set \"%s/2024.01.02/t/\" %s {compress: false})", root,
+                    ref ? "(table [x k y z] (list (% (til 3000000) 7) (til 3000000) (take [0Nl] 3000000) (take [0Nl] 3000000)))"
+                        : "(table [x k] (list (% (til 3000000) 7) (til 3000000)))");
     }
+    static const struct { const char* q; bool in_place; } q2[] = {
+        { "(select {s: (sum y) t: (sum z) from: T by: x asc: x})", false },
+        { "(select {s: (sum y) t: (sum z) c: (count z) from: T by: k desc: s take: 3})", true },
+        { NULL, false },
+    };
+    for (int i = 0; q2[i].q; i++)
+        if ((r = sr_fill_route(SR_TMP "/r2f", SR_TMP "/r2d", q2[i].q, q2[i].in_place, two * 8)).status != TEST_PASS)
+            return r;
     PASS();
 }
 

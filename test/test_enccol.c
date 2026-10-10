@@ -1129,6 +1129,15 @@ static test_result_t test_runs_kernel_declines(void) {
     bm[350 >> 3] |= (uint8_t)(1u << (350 & 7));               /* all in: sound */
     for (int i = 0; i < RAY_ENC_VEC; i++) want[i] = i >= 300 && i < 400 ? 0x8000 : want[i];
     if ((r = rk_check(RAY_I16, 0, RAY_ENC_RLE, 0, buf, 72, RAY_ENC_VEC, bm, 100, true, want, "sentinel run in the bitmap")).status != TEST_PASS) return r;
+    {   /* a descriptor width on a run (or RAW) body: the descriptor check
+         * rejects it at validation; the kernel declines it on its own */
+        static uint8_t out[RAY_ENC_VEC * 2];
+        RK_FRESH();
+        int fr = ray_enccol_test_decode_body(RAY_I16, 0, 1u << 30, RAY_ENC_RLE, 3, 0, NULL, buf, 72, 1024, true, 0, out);
+        TEST_ASSERT_FMT(fr == 0, "RLE with a descriptor width: fast %d", fr);
+        fr = ray_enccol_test_decode_body(RAY_I16, 0, 1u << 30, RAY_ENC_RAW, 1, 0, NULL, buf, 2048, 1024, true, 0, out);
+        TEST_ASSERT_FMT(fr == 0, "RAW with a descriptor width: fast %d", fr);
+    }
     RK_FRESH(); memset(buf + 72, 0, 8);                 RK_BAD(RAY_I16, 0, RAY_ENC_RLE, 80, 1024, NULL, 0, "a word after the body");
     RK_FRESH();                                         RK_BAD(RAY_I16, 0, RAY_ENC_RLE, 64, 1024, NULL, 0, "a word short");
     RK_FRESH();                                         RK_BAD(RAY_I16, 0, RAY_ENC_RLE, 4, 1024, NULL, 0, "header short");
@@ -1151,6 +1160,17 @@ static test_result_t test_runs_kernel_declines(void) {
     RK_FRESH(); buf[eh + 1] = 17;                       RK_BAD(RAY_I16, 0, RAY_ENC_RLE, b.len, 1024, NULL, 0, "DELTA ends width above T");
     RK_FRESH(); u64 = 1ull << 16; memcpy(buf + eh + 8, &u64, 8); RK_BAD(RAY_I16, 0, RAY_ENC_RLE, b.len, 1024, NULL, 0, "DELTA ends base above T");
     RK_FRESH(); u64 = 1ull << 16; memcpy(buf + eh + 16 + 8 * 5, &u64, 8); RK_BAD(RAY_I16, 0, RAY_ENC_RLE, b.len, 1024, NULL, 0, "DELTA ends head above T");
+    /* a head with its low 16 bits kept and bit 16 set: the ends it unpacks
+     * are the sound ones, so only the head's type check rejects it */
+    for (int l = 0; l < (int)L16; l += 21) {
+        RK_FRESH(); memcpy(&u64, buf + eh + 16 + 8 * (size_t)l, 8);
+        TEST_ASSERT_TRUE(u64 <= 0xFFFF);
+        u64 |= 1ull << 16; memcpy(buf + eh + 16 + 8 * (size_t)l, &u64, 8);
+        RK_BAD(RAY_I16, 0, RAY_ENC_RLE, b.len, 1024, NULL, 0, "DELTA ends head above 0xFFFF, low bits sound");
+        RK_FRESH(); memcpy(&u64, buf + eh + 16 + 8 * (size_t)l, 8);
+        u64 |= 1ull << 63; memcpy(buf + eh + 16 + 8 * (size_t)l, &u64, 8);
+        RK_BAD(RAY_I16, 0, RAY_ENC_RLE, b.len, 1024, NULL, 0, "DELTA ends head bit 63, low bits sound");
+    }
     RK_FRESH(); buf[eh + 16 + 8 * L16 + 2 * 7] |= 1;    RK_BAD(RAY_I16, 0, RAY_ENC_RLE, b.len, 1024, NULL, 0, "DELTA ends placeholder");
     RK_FRESH(); buf[eh] = RAY_ENC_DELTA_BP; buf[8] = RAY_ENC_DELTA_BP; RK_BAD(RAY_I16, 0, RAY_ENC_RLE, b.len, 1024, NULL, 0, "DELTA values");
     ray_enc_buf_free(&b);

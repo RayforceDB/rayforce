@@ -1303,7 +1303,7 @@ static int dec_fast(ray_enccol_t* e, const ray_enc_desc_t* d, int vlen,
     ray_enc_kind_t k;
     if (!fk_int_type(e->type) || !ray_enc_kind_of(e->type, e->attrs, &k)) return 0;
     if (enc == RAY_ENC_CONST || enc == RAY_ENC_RLE || enc == RAY_ENC_RAW) {
-        if (vlen < 1 || vlen > RAY_ENC_VEC || ((uintptr_t)body & 7)) return 0;
+        if (d->width || vlen < 1 || vlen > RAY_ENC_VEC || ((uintptr_t)body & 7)) return 0;   /* a width only on BP */
         if (wide && (e->type == RAY_SYM || k.T == 64 || enc == RAY_ENC_RAW)) return 0;
         if ((uintptr_t)out & ((wide ? 8 : (size_t)k.T / 8) - 1)) return 0;
         return enc == RAY_ENC_RAW ? dec_fast_raw(e, d, vlen, body, avail, bm, k, out)

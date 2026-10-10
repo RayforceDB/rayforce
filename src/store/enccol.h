@@ -184,7 +184,10 @@ ray_t* ray_enccol_materialize(ray_t* encv);
  * never decodes and is safe against a concurrent materialize. */
 ray_t* ray_enccol_decoded_peek(ray_t* encv);
 
-/* Counters (spec "Instrumentation"); reset by tests. */
+/* Counters (spec "Instrumentation"); reset by tests.  decoded_bytes is
+ * the bytes vector decodes produce, plus the bytes an integer RAW vector
+ * read in place delivers (ray_enccol_raw_view through a range read); a
+ * float RAW view delivers its bytes uncounted. */
 typedef struct {
     uint64_t materialized;
     uint64_t decoded_bytes;
