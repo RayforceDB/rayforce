@@ -56,6 +56,10 @@ typedef struct {
     int32_t  cap;
     int32_t  count;
     uint8_t  kind;
+    /* A lambda call's frame: a closure made inside the body captures the
+     * bindings down to here and no further.  A caller's locals are not
+     * the body's, whether the body runs compiled or interpreted. */
+    uint8_t  lexical;
     /* RAY_SCOPE_CALL only: the call was made by name, so the body's text
      * was written outside the query and its literal symbols are literals. */
     uint8_t  named;

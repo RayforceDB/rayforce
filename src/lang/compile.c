@@ -44,7 +44,7 @@ typedef struct {
 
     struct { int64_t sym_id; int32_t slot; } locals[256];
     int32_t  n_locals;
-    int32_t  n_fixed;    /* params + captures: slots that are always bound */
+    int32_t  n_fixed;    /* params: the slots that are always bound */
     int32_t  max_locals;
     bool     error;
     ray_t   *lambda;     /* the lambda being compiled (for 'self' resolution) */
@@ -635,6 +635,26 @@ static void compile_list(compiler_t *c, ray_t *ast) {
         return;
     }
 
+    /* `eval` and `resolve` read names from text at run time: the tree
+     * walker that serves them resolves through the scope frames, so the
+     * call runs inside a window that binds this frame's locals, captures
+     * included, the way a dynamic special form does. */
+    int32_t dyn_syms_idx = -1;
+    if (head->type == -RAY_SYM && !(head->attrs & ATTR_QUOTED) && !head_local &&
+        (head->i64 == sf_eval || head->i64 == sf_resolve) && c->n_locals > 0) {
+        ray_t *syms = ray_alloc((size_t)c->n_locals * sizeof(int64_t));
+        if (!syms || RAY_IS_ERR(syms)) { c->error = true; return; }
+        syms->type = RAY_I64;
+        syms->len  = c->n_locals;
+        int64_t *ids = (int64_t*)ray_data(syms);
+        for (int32_t i = 0; i < c->n_locals; i++) ids[i] = c->locals[i].sym_id;
+        dyn_syms_idx = add_constant(c, syms);
+        ray_release(syms);
+        if (c->error) return;
+        emit_const(c, dyn_syms_idx);
+        emit(c, OP_SCOPE_BEGIN);
+    }
+
     /* General function call: compile head, args, then dispatch.
      * If head resolved to a builtin at compile time, emit LOADCONST
      * instead of RESOLVE to skip the runtime hash lookup. */
@@ -652,29 +672,37 @@ static void compile_list(compiler_t *c, ray_t *ast) {
     /* Record call-site span so errors point to the call expression, not the last arg */
     EMIT_DBG(c, ast);
 
+    bool emitted = false;
     if (fn) {
         switch (fn->type) {
         case RAY_UNARY:
-            if (argc == 1) { emit(c, OP_CALL1); return; }
+            if (argc == 1) { emit(c, OP_CALL1); emitted = true; }
             break;
         case RAY_BINARY:
-            if (argc == 2) { emit(c, OP_CALL2); return; }
+            if (argc == 2) { emit(c, OP_CALL2); emitted = true; }
             break;
         case RAY_VARY:
             emit(c, OP_CALLN);
             emit(c, (uint8_t)argc);
-            return;
+            emitted = true;
+            break;
         case RAY_LAMBDA:
             emit(c, OP_CALLF);
             emit(c, (uint8_t)argc);
-            return;
+            emitted = true;
+            break;
         default:
             break;
         }
     }
-
-    emit(c, OP_CALLF);
-    emit(c, (uint8_t)argc);
+    if (!emitted) {
+        emit(c, OP_CALLF);
+        emit(c, (uint8_t)argc);
+    }
+    if (dyn_syms_idx >= 0) {
+        emit_const(c, dyn_syms_idx);
+        emit(c, OP_SCOPE_END);
+    }
 }
 
 /* ── Compile expression ── */
@@ -837,7 +865,19 @@ static ray_t *closure_capture_names(ray_t *lambda) {
  * without emitting, when the literal cannot be compiled this way; the
  * caller then falls back to evaluating the literal through the tree
  * walker. */
+static bool compile_fn_template_at(compiler_t *c, ray_t *ast);
+/* Templates compile their nested literals at once, each level on the C
+ * stack; past this depth the literal falls back to the dynamic eval path,
+ * whose closures compile one level at a time when they are called. */
+static _Thread_local int g_template_depth = 0;
 static bool compile_fn_template(compiler_t *c, ray_t *ast) {
+    if (g_template_depth >= 32) return false;
+    g_template_depth++;
+    bool ok = compile_fn_template_at(c, ast);
+    g_template_depth--;
+    return ok;
+}
+static bool compile_fn_template_at(compiler_t *c, ray_t *ast) {
     ray_t **elems = (ray_t**)ray_data(ast);
     int64_t n = ray_len(ast);
     /* Parameters: a SYM vector; `[]` parses as an empty vector of another
@@ -962,6 +1002,10 @@ static bool compile_lambda(ray_t *lambda, ray_t *capnames) {
     for (int64_t i = 0; i < param_count; i++) {
         if (add_local(&c, param_ids[i]) < 0) { c.error = true; break; }
     }
+    /* Only the parameters are always bound.  A capture slot can be empty
+     * (its `let` had not run when the closure was made), so it reads like
+     * a `let` slot: the global of that name, or a name error. */
+    c.n_fixed = c.n_locals;
 
     /* A closure's captures are locals of its body, bound before it runs:
      * a `let` of a captured name writes the same slot, a capture named
@@ -994,7 +1038,6 @@ static bool compile_lambda(ray_t *lambda, ray_t *capnames) {
             ray_release(pairs);
         }
     }
-    c.n_fixed = c.n_locals;
 
     /* Compile body expressions */
     ray_t *body = LAMBDA_BODY(lambda);

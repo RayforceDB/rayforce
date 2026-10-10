@@ -259,7 +259,7 @@ ray_t* ray_env_capture_locals_rows(ray_t** flags_out, uint32_t* serial_out) {
             }
         }
         if (f->kind == RAY_SCOPE_QUERY) outer = true;
-        if (f->kind == RAY_SCOPE_CALL) break;
+        if (f->kind == RAY_SCOPE_CALL || f->lexical) break;
     }
     if (keys->len == 0) {
         ray_release(keys);
@@ -921,6 +921,7 @@ static ray_err_t env_push_scope(uint8_t kind) {
     f->cap = RAY_FRAME_CAP;
     f->count = 0;
     f->kind = kind;
+    f->lexical = 0;
     f->rows = f->rows_inline;
     f->named = 0;
     f->table = NULL;
@@ -949,6 +950,14 @@ void ray_env_mark_call_scope(ray_t* table, bool named) {
     f->table_from = f->count;
 }
 
+
+/* Mark the frame `below` levels under the top one as a lexical boundary
+ * for closure capture (see ray_scope_frame_t.lexical). */
+void ray_env_mark_lexical_scope(int32_t below) {
+    if (!__VM) return;
+    int32_t d = __VM->scope_depth - 1 - below;
+    if (d >= 0) __VM->scope_stack[d].lexical = 1;
+}
 
 ray_err_t ray_env_push_scope(void) {
     return env_push_scope(RAY_SCOPE_LEXICAL);

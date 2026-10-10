@@ -2373,6 +2373,9 @@ static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
         if (has_closure) ray_env_pop_scope();
         return ray_error("oom", NULL);
     }
+    /* Closures made inside the body capture down to this call's frames
+     * (its captures and parameters), never the caller's locals. */
+    ray_env_mark_lexical_scope(has_closure ? 1 : 0);
 
     if (query && !has_closure) ray_env_mark_call_scope(ray_query_helper_table(), named);
 

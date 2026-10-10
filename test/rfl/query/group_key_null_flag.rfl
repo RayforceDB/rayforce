@@ -50,3 +50,11 @@
 (set qn (select {from: TF where: (< a 5) by: f s: (sum p)}))
 (count qn) -- 8
 (at (ser (at qn 'f)) 17) -- 0x40
+;; a single null key landing on the last slot of a scan block (4095 non-null
+;; keys, then the null) keeps the flag
+(set i (til 131073))
+(set TB (table [a k p] (list (% i 5) (as 'I64 (% i 4095)) (as 'F64 i))))
+(set TB (update {k: (if (== a 4) 0N k) from: TB}))
+(set gotb (select {from: TB by: k total: (sum p)}))
+(count gotb) -- 4096
+(at (ser (at gotb 'k)) 17) -- 0x40

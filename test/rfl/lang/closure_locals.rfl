@@ -121,3 +121,37 @@
 ;; a lazy value captured by interpreted code is materialized as well
 (set c2 (do (let v (asc [3 1 2])) (fn [] (at v 0))))
 (list (c2) (c2)) -- [1 1]
+
+;; a capture whose let did not run is unbound inside the closure: the global
+;; of that name, or a name error, never a silent zero
+(set scale 10)
+(set fsc (fn [xs flag] (if flag (let scale 2)) (map (fn [v] (* v scale)) xs)))
+(fsc [1 2 3] false) -- [10 20 30]
+(fsc [1 2 3] true) -- [2 4 6]
+(fsc [1 2 3] false) -- [10 20 30]
+(set fq (fn [flag] (if flag (let q 2)) ((fn [] q))))
+(fq false) !- name
+(fq true) -- 2
+;; eval and resolve inside a compiled body see its locals and captures
+(set mke (fn [y] (fn [] (eval (parse "y")))))
+((mke 7)) -- 7
+(set y 100)
+((mke 7)) -- 7
+(set fres (fn [a] (resolve 'a)))
+(fres 3) -- 3
+;; closures capture lexically: a caller's locals are not the body's, whether
+;; the maker runs compiled or interpreted
+(set yl 1)
+(set mkl1 (fn [] (fn [] yl)))
+((do (let yl 5) (mkl1))) -- 1
+(set mkl2 (fn [] (if false (set 1 2)) (fn [] yl)))
+((do (let yl 5) (mkl2))) -- 1
+;; a lazy value reaching a literal's window from a compiled frame is
+;; materialized when captured (the literal falls back to the tree walker)
+(set c3 ((fn [v] (fn [] (if false (set 1 2)) (at v 0))) (asc [3 1 2])))
+(list (c3) (c3)) -- [1 1]
+;; a literal nested far deeper than the template compiler follows still works
+(set base (parse "(fn [] k)"))
+(set wrap (fn [inner] (concat (take base 2) (enlist inner))))
+(set build (fn [n] (let a (parse "k")) (times n (let a (wrap a))) a))
+(nil? ((eval (concat (take (parse "(fn [k] 0)") 2) (enlist (build 2000)))) 7)) -- false

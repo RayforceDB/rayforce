@@ -403,3 +403,15 @@ CNT10 -- 6
 ;; later uncaught error in a fresh interpreter is reported at its own place
 (write "/tmp/rfl_trace_clear.rfl" "(set TB (table [v] (list [1 2 3 10 20 30]))) (set kneg (fn [v] 1 (if (< v 0) (raise 'negative) (% v 7)))) (select {n: (count v) by: (kneg v) from: TB}) (+ 1 'a)")
 (.sys.exec "./rayforce /tmp/rfl_trace_clear.rfl 2>&1 | grep -c negative | grep -qx 0") -- 0
+;; an effect reached through a parameter counts: the parameter means the
+;; argument it is bound to, not a global or let of the same name
+(set CNT12 0)
+(set eff12 (fn [x] (set CNT12 (+ CNT12 1)) x))
+(set H12 (dict ['a] (list eff12)))
+(set h12 (fn [x] x))
+(set ky12 (fn [v] 1 (let g (fn [h12] (h12 v))) (g (at H12 'a)) (if (< v 4) 0 1)))
+(at (select {n: (count v) by: (ky12 v) from: T10}) 'n) -- [3 3]
+CNT12 -- 6
+;; and a pure helper passed through a parameter keeps the whole column
+(set kp12 (fn [v] 1 (let g (fn [f] (f v))) (> (g kg10) 0)))
+(at (select {n: (count v) by: (kp12 v) from: T10}) 'n) -- [3 3]
