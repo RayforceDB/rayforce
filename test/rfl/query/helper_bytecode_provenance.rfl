@@ -241,3 +241,36 @@ OUT4 -- ['p 'q 'r 'a 'b 'c]
 (set hz (fn [v] 1 (concat v 'zz)))
 (at (select {r: (hz s) e: (reverse x) from: T4}) 'r) -- ['azz 'zz 'czz 'dzz]
 (at (select {r: ((fn [v] 1 (concat (return v) "!")) s) e: (reverse x) from: T}) 'r) -- ['a! 'b! 'c!]
+;; A closure's capture flags live in the query frame it was made under and
+;; apply only while that frame is the innermost query; identity of the
+;; captured object never matters, nor which compiled frame calls it.
+(set mk2 (fn [c] (fn [z] (concat z c))))
+(set E2 (mk2 (at T 's)))
+(set hk (fn [v] (take (count (first (map E2 ['p]))) (count v))))
+(at (update {r: (hk s) from: T}) 'r) -- [4 4 4]
+(set hd3 (fn [v] (let d (at T 's)) (try (+ d 's) (fn [e] (count (concat 'p d))))))
+(at (update {r: (hd3 s) from: T}) 'r) -- [4 4 4]
+(set G (fn [f u] 1 (take (count (first (map f ['p]))) (count u))))
+(set H (fn [v] 1 (let f (fn [z] (concat z v))) (at (update {q: (G f s) from: T}) 'q)))
+(at (update {r: (H s) from: T}) 'r) -- [4 4 4]
+(set hr (fn [v f d] 1 (if (== d 0) (hr ['x 'y] (fn [z] (concat z v)) 1) (take (count (first (map f ['p]))) 3))))
+(set hr2 (fn [v d] 1 (let f (fn [z] (concat z v))) (if (== d 0) (hr2 ['x 'y] 1) 0) (take (count (first (map f ['p]))) 3)))
+(at (update {r: (hr s 0 0) from: T}) 'r) -- [3 3 3]
+(at (update {r: (hr2 s 0) from: T}) 'r) -- [3 3 3]
+;; A closure made in a compiled helper and called through another function.
+(set h1 (fn [v] 1 (let f (fn [z] (concat z v))) (count (first (map (fn [g] (g 'p)) (list f))))))
+(at (update {r: (h1 s) from: T}) 'r) -- [3 3 3]
+;; The opaque key is evaluated whole; only a conditional that actually
+;; tested a vector derived from the rows makes it run row by row.
+(set N0 0)
+(set clampz (fn [m] (if (> m 0) m 0)))
+(at (select {n: (count v) by: ((fn [v] 1 (if (> (count v) N0) (- v (min v)) v)) v) from: TB}) 'v) -- [0 1 2 9 19 29]
+(at (select {n: (count v) by: ((fn [v] (let m (min v)) (if (> m 0) (- v m) v)) v) from: TB}) 'v) -- [0 1 2 9 19 29]
+(at (select {n: (count v) by: ((fn [v] 1 (- v (clampz (min v)))) v) from: TB}) 'v) -- [0 1 2 9 19 29]
+(at (select {n: (count v) by: ((fn [v] 1 (if (in 10 v) (- v (min v)) v)) v) from: TB}) 'v) -- [0 1 2 9 19 29]
+(at (select {n: (count v) by: ((fn [v] 1 (if (== (type v) 'I64) (- v (min v)) v)) v) from: TB}) 'v) -- [0 1 2 9 19 29]
+;; Two STR literals join as strings on both paths; a try fallback value
+;; keeps its provenance like a handler's result.
+(set TS3 (table [x t] (list [1 2 3] (list "a" "" "c"))))
+(at (select {r: (concat "" "x") e: (reverse x) from: TS3}) 'r) -- (list "x" "x" "x")
+(at (select {r: ((fn [v] (concat (try (+ v 's) v) "!")) s) e: (reverse x) from: T}) 'r) -- ['a! 'b! 'c!]

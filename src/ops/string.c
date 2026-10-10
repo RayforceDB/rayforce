@@ -1573,7 +1573,10 @@ ray_t* ray_concat_text_fn(ray_t* a, ray_t* b, bool str_out, uint8_t rows_mask) {
     /* A null cell of a column is empty text, as the vector kernel reads a
      * null element; a null literal operand follows the kernel's null rule. */
     bool a_null = RAY_ATOM_IS_NULL(a), b_null = RAY_ATOM_IS_NULL(b);
-    if (a->type == -RAY_STR && b->type == -RAY_STR && !a_null && !b_null) return ray_concat_fn(a, b);
+    /* Two STR literals join as strings, as the planner folds them; a STR
+     * cell beside a null literal follows the kernel's null rule. */
+    if (a->type == -RAY_STR && b->type == -RAY_STR && (rows_mask == 0 || (!a_null && !b_null)))
+        return ray_concat_fn(a, b);
     if (atoms && (a->type == -RAY_SYM || a->type == -RAY_STR) &&
         (b->type == -RAY_SYM || b->type == -RAY_STR) &&
         (!a_null || (rows_mask & 1)) && (!b_null || (rows_mask & 2))) {

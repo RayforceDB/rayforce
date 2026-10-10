@@ -349,7 +349,9 @@ ray_t* ray_try_fn(ray_t* expr, ray_t* handler_expr) {
         return handler;
     }
 
-    g_eval_rows = -1;   /* the handler's own evaluation sets it */
+    /* A callable handler's own evaluation sets the provenance; a fallback
+     * value keeps the one its expression had. */
+    if (handler->type == RAY_LAMBDA || handler->type == RAY_UNARY) g_eval_rows = -1;
     ray_t* handler_result = ray_try_handle(handler, err_val);
     ray_release(err_val);
     ray_release(handler);
@@ -1952,6 +1954,9 @@ ray_t* ray_cond_fn(ray_t** args, int64_t n) {
     if (n < 2) return ray_error("domain", "if: expected at least 2 args (cond then), got %lld", (long long)n);
     ray_t* cond = ray_eval(args[0]);
     if (RAY_IS_ERR(cond)) return cond;
+    /* A vector condition derived from the query's rows: the expression
+     * needed row-by-row evaluation (see the opaque by: key). */
+    if (g_eval_rows == 1 && !ray_is_atom(cond)) __VM->rows_cond++;
     /* Materialize lazy handles before testing truthiness */
     if (ray_is_lazy(cond))
         cond = ray_lazy_materialize(cond);
@@ -2547,12 +2552,6 @@ static ray_t* vm_exec_rows(ray_t* lambda, ray_t** call_args, int64_t argc,
     ray_t **cpool = (ray_t **)ray_data(LAMBDA_CONSTS(lambda));
     int32_t ip = 0;
     ray_t *vm_err_obj = NULL;
-    /* The running frame's slots, for closures created here and called by a
-     * builtin after their window closed (a try handler, a lambda passed to
-     * map): their captures' provenance is read from the slots. */
-    ray_live_slots_t live_prev = ray_env_set_live_slots(
-        (ray_live_slots_t){ &vm.ps[vm.fp], &vm.rows[vm.fp], n_locals, scope_base });
-#define LIVE_SLOTS() ray_env_set_live_slots((ray_live_slots_t){ &vm.ps[vm.fp], &vm.rows[vm.fp], n_locals, scope_base })
 
 #define DISPATCH() goto *dispatch[code[ip++]]
 #define PUSH(v)    do { if (vm.sp >= VM_STACK_SIZE) goto vm_error_limit; vm.rows[vm.sp] = 0; vm.ps[vm.sp++] = (v); } while(0)
@@ -2709,6 +2708,7 @@ op_jmpf: {
     int16_t offset = (int16_t)((code[ip] << 8) | code[ip + 1]);
     ip += 2;
     ray_t *cond = POP();
+    if (POPPED_ROWS() == 1 && cond && !ray_is_atom(cond)) __VM->rows_cond++;
     int truthy = is_truthy(cond);
     ray_release(cond);
     if (!truthy) ip += offset;
@@ -2821,9 +2821,10 @@ op_callf: {
     }
     ray_t *fn_obj = POP();
 
-    /* Compiled lambda: push frame, switch to callee bytecode */
+    /* Compiled lambda: push frame, switch to callee bytecode.  A closure
+     * is never compiled: its captured environment lives in frames. */
     if (fn_obj->type == RAY_LAMBDA) {
-        if (!LAMBDA_IS_COMPILED(fn_obj))
+        if (!LAMBDA_CLOSURE(fn_obj) && !LAMBDA_IS_COMPILED(fn_obj))
             ray_compile(fn_obj);
 
         if (LAMBDA_IS_COMPILED(fn_obj)) {
@@ -2875,7 +2876,6 @@ op_callf: {
             code = (uint8_t *)ray_data(LAMBDA_BC(fn_obj));
             cpool = (ray_t **)ray_data(LAMBDA_CONSTS(fn_obj));
             ip = 0;
-            LIVE_SLOTS();
             DISPATCH();
         }
     }
@@ -2996,7 +2996,6 @@ op_calls: {
     }
 
     ip = 0;
-    LIVE_SLOTS();
     DISPATCH();
 }
 
@@ -3062,7 +3061,6 @@ op_ret: {
     if (vm.rp == 0) {
         /* Top-level return */
         if (out_rows) *out_rows = result_rows;
-        ray_env_set_live_slots(live_prev);
         ray_release(vm.fn);
 #undef vm
         ray_free(vm_block);
@@ -3083,7 +3081,6 @@ op_ret: {
         n_locals = LAMBDA_NLOCALS(vm.fn);
     }
     /* Self-call (fn==NULL): vm.fn/code/cpool/n_locals are already correct */
-    LIVE_SLOTS();
     PUSHR(result, result_rows);
     DISPATCH();
 }
@@ -3114,12 +3111,14 @@ op_tryh: {
      * is invoked with the error; any other value is the fallback result. */
     ray_t* err_val = POP();
     ray_t* handler = POP();
-    g_eval_rows = -1;   /* an interpreted handler reports its value's provenance */
+    uint8_t handler_rows = POPPED_ROWS();
+    bool callable = handler->type == RAY_LAMBDA || handler->type == RAY_UNARY;
+    if (callable) g_eval_rows = -1;   /* an interpreted handler reports its value's provenance */
     ray_t* result  = ray_try_handle(handler, err_val);  /* borrows both */
     ray_release(err_val);
     ray_release(handler);
     if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }
-    PUSHR(result, vrows_from(g_eval_rows));
+    PUSHR(result, callable ? vrows_from(g_eval_rows) : handler_rows);
     DISPATCH();
 }
 
@@ -3239,7 +3238,6 @@ vm_error_cleanup: {
         code = (uint8_t *)ray_data(LAMBDA_BC(vm.fn));
         cpool = (ray_t **)ray_data(LAMBDA_CONSTS(vm.fn));
         ip = trap.handler_ip;
-        LIVE_SLOTS();
         PUSH(err_val);
         DISPATCH();
     }
@@ -3264,7 +3262,6 @@ vm_error_cleanup: {
         if (vm.rs[i].fn) ray_release(vm.rs[i].fn);
     for (int32_t i = 0; i < vm.tp; i++)
         ray_release(vm.ts[i].fn);
-    ray_env_set_live_slots(live_prev);
 #undef vm
     ray_free(vm_block);
     if (vm_err_obj)
@@ -3282,7 +3279,6 @@ vm_error_cleanup: {
 #undef PEEK
 #undef LOCAL
 #undef LROWS
-#undef LIVE_SLOTS
 #undef vm
 }
 

@@ -181,6 +181,9 @@ ray_err_t ray_env_set_query_local(int64_t sym_id, ray_t* val) {
                                               : ray_env_set_local_rows(sym_id, val, 1);
 }
 
+static void env_query_frame_record(ray_t* capture, ray_t* flags);
+static ray_t* env_query_frame_flags(ray_t* capture);
+
 ray_t* ray_env_capture_locals(void) {
     if (!__VM || __VM->scope_depth == 0) return NULL;
     int64_t capacity = 0;
@@ -197,6 +200,12 @@ ray_t* ray_env_capture_locals(void) {
     }
 
     int64_t* key_ids = (int64_t*)ray_data(keys);
+    /* The captures' row provenance, relative to the innermost query: a
+     * binding below that query's frame is plain data for it. */
+    ray_t* flags = ray_vec_new(RAY_U8, capacity);
+    if (!flags || RAY_IS_ERR(flags)) { ray_release(keys); ray_release(vals); return flags ? flags : ray_error("oom", NULL); }
+    flags->len = 0;
+    bool any_flag = false, outer = false;
     /* Top-to-bottom flattening preserves ordinary lexical lookup: the first
      * occurrence of a name is the value visible at closure creation. */
     for (int32_t d = __VM->scope_depth - 1; d >= 0; d--) {
@@ -208,51 +217,31 @@ ray_t* ray_env_capture_locals(void) {
                 if (key_ids[k] == f->keys[i]) { seen = true; break; }
             if (seen) continue;
             key_ids[keys->len++] = f->keys[i];
+            uint8_t r = outer ? 0 : f->rows[i];
+            ((uint8_t*)ray_data(flags))[flags->len++] = r;
+            if (r) any_flag = true;
             vals = ray_list_append(vals, f->vals[i]);
             if (!vals || RAY_IS_ERR(vals)) {
-                ray_release(keys);
+                ray_release(keys); ray_release(flags);
                 return vals ? vals : ray_error("oom", NULL);
             }
         }
+        if (f->kind == RAY_SCOPE_QUERY) outer = true;
         if (f->kind == RAY_SCOPE_CALL) break;
     }
     if (keys->len == 0) {
         ray_release(keys);
         ray_release(vals);
+        ray_release(flags);
         return NULL;
     }
-    return ray_dict_new(keys, vals);
+    ray_t* capture = ray_dict_new(keys, vals);
+    if (capture && !RAY_IS_ERR(capture) && any_flag) env_query_frame_record(capture, flags);
+    ray_release(flags);
+    return capture;
 }
 
-static _Thread_local ray_live_slots_t g_live_slots;
 
-ray_live_slots_t ray_env_set_live_slots(ray_live_slots_t slots) {
-    ray_live_slots_t prev = g_live_slots;
-    g_live_slots = slots;
-    return prev;
-}
-
-/* Row provenance of the binding `sym_id` currently resolves to, if that
- * binding still holds `val`, relative to the innermost query; else the
- * flag of the running compiled frame's slot holding `val`; -1 when neither
- * holds it. */
-static int env_live_binding_rows(int64_t sym_id, ray_t* val) {
-    bool outer = false;
-    for (int32_t d = __VM->scope_depth - 1; d >= 0; d--) {
-        ray_scope_frame_t* f = &__VM->scope_stack[d];
-        for (int32_t i = 0; i < f->count; i++)
-            if (f->keys[i] == sym_id) return f->vals[i] == val ? (outer ? 0 : f->rows[i]) : -1;
-        if (f->kind == RAY_SCOPE_QUERY) outer = true;
-        if (f->kind == RAY_SCOPE_CALL) break;
-    }
-    if (g_live_slots.vals) {
-        for (int32_t d = __VM->scope_depth - 1; d >= g_live_slots.depth; d--)
-            if (__VM->scope_stack[d].kind == RAY_SCOPE_QUERY) return 0;   /* an inner query runs */
-        for (int32_t k = 0; k < g_live_slots.n; k++)
-            if (g_live_slots.vals[k] == val) return g_live_slots.rows[k];
-    }
-    return -1;
-}
 
 ray_err_t ray_env_push_capture(ray_t* capture) {
     if (ray_env_push_scope() != RAY_OK) return RAY_ERR_OOM;
@@ -269,29 +258,16 @@ ray_err_t ray_env_push_capture(ray_t* capture) {
         return RAY_ERR_TYPE;
     }
     ray_t** value_items = (ray_t**)ray_data(vals);
-    /* A closure stores no provenance: it is relative to a query.  When the
-     * closure is called while the frames it captured from are still live
-     * (a try handler, a lambda passed to a builtin), each capture takes the
-     * provenance its binding has now, relative to the innermost query; an
-     * escaped closure's captures are plain data. */
-    bool query = ray_active_query_table() != NULL;
-    int64_t n = keys->len;
-    uint8_t flags_small[64];
-    uint8_t* flags = n <= 64 ? flags_small : NULL;
-    if (query) {
-        /* Resolved before the capture frame is pushed, against the live
-         * frames; the capture frame itself is the top frame afterwards. */
-        __VM->scope_depth--;
-        for (int64_t i = 0; i < n && flags; i++) {
-            int64_t sym = ray_read_sym(ray_data(keys), i, RAY_SYM, keys->attrs);
-            int r = env_live_binding_rows(sym, value_items[i]);
-            flags[i] = r < 0 ? 0 : (uint8_t)r;
-        }
-        __VM->scope_depth++;
-    }
-    for (int64_t i = 0; i < n; i++) {
+    /* A closure carries no provenance of its own: the flags recorded when
+     * it was made live in the query frame it was made under, and apply only
+     * while that frame is still the innermost query.  Anywhere else the
+     * captures are plain data. */
+    ray_t* flags = env_query_frame_flags(capture);
+    const uint8_t* fl = flags && flags->type == RAY_U8 && flags->len == keys->len
+                      ? (const uint8_t*)ray_data(flags) : NULL;
+    for (int64_t i = 0; i < keys->len; i++) {
         int64_t sym = ray_read_sym(ray_data(keys), i, RAY_SYM, keys->attrs);
-        ray_err_t err = ray_env_set_local_rows(sym, value_items[i], query && flags ? flags[i] : 0);
+        ray_err_t err = ray_env_set_local_rows(sym, value_items[i], fl ? fl[i] : 0);
         if (err != RAY_OK) {
             ray_env_pop_scope();
             return err;
@@ -375,7 +351,6 @@ void ray_env_destroy(void) {
 static ray_err_t env_frame_bind(ray_scope_frame_t* f, int64_t sym_id, ray_t* val);
 static ray_err_t env_frame_bind_rows(ray_scope_frame_t* f, int64_t sym_id, ray_t* val, uint8_t rows);
 ray_t* ray_query_helper_value(int64_t sym);   /* ops/query.c */
-ray_t* ray_active_query_table(void);          /* ops/query.c */
 
 /* A lookup that reaches a query helper's call frame: a free name that is
  * a source column binds, on first use, to what the query's own expressions
@@ -920,8 +895,51 @@ static ray_err_t env_push_scope(uint8_t kind) {
     f->named = 0;
     f->table = NULL;
     f->table_from = 0;
+    f->cap_keys = NULL;
+    f->cap_flags = NULL;
+    f->cap_n = f->cap_cap = 0;
     __VM->scope_depth++;
     return RAY_OK;
+}
+
+/* The innermost query frame, or NULL. */
+static ray_scope_frame_t* env_query_frame(void) {
+    for (int32_t d = __VM->scope_depth - 1; d >= 0; d--)
+        if (__VM->scope_stack[d].kind == RAY_SCOPE_QUERY) return &__VM->scope_stack[d];
+    return NULL;
+}
+
+/* Remember the capture flags of a closure created under the innermost
+ * query frame; dropped with the frame. */
+static void env_query_frame_record(ray_t* capture, ray_t* flags) {
+    ray_scope_frame_t* q = env_query_frame();
+    if (!q) return;
+    if (q->cap_n >= q->cap_cap) {
+        int32_t nc = q->cap_cap ? q->cap_cap * 2 : 8;
+        void** nk = (void**)ray_sys_alloc(sizeof(void*) * (size_t)nc);
+        ray_t** nf = (ray_t**)ray_sys_alloc(sizeof(ray_t*) * (size_t)nc);
+        if (!nk || !nf) { if (nk) ray_sys_free(nk); if (nf) ray_sys_free(nf); return; }
+        if (q->cap_n) {
+            memcpy(nk, q->cap_keys, sizeof(void*) * (size_t)q->cap_n);
+            memcpy(nf, q->cap_flags, sizeof(ray_t*) * (size_t)q->cap_n);
+        }
+        if (q->cap_keys) ray_sys_free(q->cap_keys);
+        if (q->cap_flags) ray_sys_free(q->cap_flags);
+        q->cap_keys = nk; q->cap_flags = nf; q->cap_cap = nc;
+    }
+    q->cap_keys[q->cap_n] = capture;
+    ray_retain(flags);
+    q->cap_flags[q->cap_n++] = flags;
+}
+
+/* The flags recorded for `capture` under the innermost query frame, newest
+ * first; NULL when the closure was made under another query or none. */
+static ray_t* env_query_frame_flags(ray_t* capture) {
+    ray_scope_frame_t* q = env_query_frame();
+    if (!q) return NULL;
+    for (int32_t i = q->cap_n - 1; i >= 0; i--)
+        if (q->cap_keys[i] == capture) return q->cap_flags[i];
+    return NULL;
 }
 
 ray_err_t ray_env_push_call_scope(ray_t* table, bool named) {
@@ -958,6 +976,10 @@ void ray_env_pop_scope(void) {
     if (f->keys != f->keys_inline) ray_sys_free(f->keys);
     if (f->vals != f->vals_inline) ray_sys_free(f->vals);
     if (f->rows != f->rows_inline) ray_sys_free(f->rows);
+    for (int32_t i = 0; i < f->cap_n; i++) ray_release(f->cap_flags[i]);
+    if (f->cap_keys) ray_sys_free(f->cap_keys);
+    if (f->cap_flags) ray_sys_free(f->cap_flags);
+    f->cap_keys = NULL; f->cap_flags = NULL; f->cap_n = f->cap_cap = 0;
     f->keys = f->keys_inline;
     f->vals = f->vals_inline;
     f->rows = f->rows_inline;

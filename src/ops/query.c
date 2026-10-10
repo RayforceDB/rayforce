@@ -10027,50 +10027,6 @@ ray_t* ray_select(ray_t** args, int64_t n) {
 /* Whether an expression, looking through the bodies of the helpers it
  * names, holds a form that takes one condition or one value: such a key
  * is evaluated row by row, as a derived output is. */
-/* A name outside any aggregate call: the expression's value depends on
- * which row it is evaluated for. */
-static bool expr_mentions_rows(ray_t* expr, int depth) {
-    if (!expr || depth > 16) return false;
-    if (expr->type == -RAY_SYM) return !(expr->attrs & ATTR_QUOTED);
-    if (expr->type != RAY_LIST || !expr->len || (expr->attrs & ATTR_QUOTED)) return false;
-    if (is_agg_expr(expr)) return false;
-    ray_t** el = (ray_t**)ray_data(expr);
-    for (int64_t i = 1; i < expr->len; i++)
-        if (expr_mentions_rows(el[i], depth + 1)) return true;
-    return false;
-}
-
-/* Whether an expression, looking through the bodies of the helpers it
- * names, holds a condition over one row's value (an `if` or `cond` whose
- * condition is not an aggregate): such a key is evaluated row by row, as
- * a derived output is.  `global_scope`: inside a global helper's body
- * names are globals, never the caller's locals. */
-static bool expr_needs_rows_deep(ray_t* expr, int depth, bool global_scope) {
-    if (!expr || depth > 8 || expr->type != RAY_LIST || !expr->len || (expr->attrs & ATTR_QUOTED)) return false;
-    ray_t** el = (ray_t**)ray_data(expr);
-    if (el[0]->type == RAY_LIST) {               /* an inline lambda: its body */
-        ray_t** head = (ray_t**)ray_data(el[0]);
-        for (int64_t i = 2; i < el[0]->len; i++)
-            if (expr_needs_rows_deep(head[i], depth + 1, global_scope)) return true;
-    }
-    if (el[0]->type == -RAY_SYM && !(el[0]->attrs & ATTR_QUOTED)) {
-        if ((select_sym_is(el[0], "if", 2) || select_sym_is(el[0], "cond", 4)) &&
-            expr->len > 1 && expr_mentions_rows(el[1], 0)) return true;
-        ray_t* gv = global_scope ? NULL : ray_env_get_lexical_local(el[0]->i64);
-        bool global = gv == NULL;
-        if (!gv) gv = ray_env_get_global(el[0]->i64);
-        if (gv && gv->type == RAY_LAMBDA) {
-            ray_t* bodies = LAMBDA_BODY(gv);
-            if (bodies && bodies->type == RAY_LIST)
-                for (int64_t i = 0; i < bodies->len; i++)
-                    if (expr_needs_rows_deep(((ray_t**)ray_data(bodies))[i], depth + 1, global_scope || global)) return true;
-        }
-    }
-    for (int64_t i = 1; i < expr->len; i++)
-        if (expr_needs_rows_deep(el[i], depth + 1, global_scope)) return true;
-    return false;
-}
-
 static ray_t* select_plan_computed_key(ray_t* dict, ray_t* tbl, int64_t* key_name) {
     ray_t* by_expr = dict_get(dict, "by");
     if (!by_expr || by_expr->type != RAY_LIST || ray_len(by_expr) < 1) return NULL;
@@ -10115,12 +10071,17 @@ static ray_t* select_plan_computed_key(ray_t* dict, ray_t* tbl, int64_t* key_nam
                 base = filtered;
                 where_applied = true;
             }
-            /* A body with a condition over one value runs row by row, as a
-             * derived output does; anything else sees the whole column. */
+            /* The key sees the whole column.  If a conditional inside it
+             * tested a vector derived from the rows, the body meant one
+             * row at a time: evaluate it again row by row, as a derived
+             * output with a condition is. */
             int64_t nrows = ray_table_nrows(base);
-            ray_t* keyvec = expr_needs_rows_deep(by_expr, 0, false)
-                ? eval_expr_per_row(by_expr, base, nrows)
-                : eval_expr_whole_column(by_expr, base);
+            int32_t conds = __VM->rows_cond;
+            ray_t* keyvec = eval_expr_whole_column(by_expr, base);
+            if (__VM->rows_cond != conds && keyvec && !RAY_IS_ERR(keyvec)) {
+                ray_release(keyvec);
+                keyvec = eval_expr_per_row(by_expr, base, nrows);
+            }
             if (keyvec && !RAY_IS_ERR(keyvec) && ray_is_lazy(keyvec)) keyvec = ray_lazy_materialize(keyvec);
             if (!keyvec || RAY_IS_ERR(keyvec)) { ray_release(base); return keyvec ? keyvec : ray_error("oom", NULL); }
             if (!(ray_is_vec(keyvec) || keyvec->type == RAY_LIST) || ray_len(keyvec) != nrows) {

@@ -68,6 +68,15 @@ typedef struct {
      * columns bound on demand; earlier ones are a closure's captured
      * values or the call's parameters. */
     int32_t  table_from;
+    /* RAY_SCOPE_QUERY only: the row provenance of closures created while
+     * this query frame was the innermost one, keyed by the closure's
+     * capture object.  A closure called later takes its captures'
+     * provenance from here, so it is valid exactly as long as the query
+     * frame it belongs to; nothing about it leaves the frame. */
+    void**   cap_keys;
+    ray_t**  cap_flags;
+    int32_t  cap_n;
+    int32_t  cap_cap;
 } ray_scope_frame_t;
 
 /* ===== Per-thread VM =====
@@ -86,6 +95,9 @@ typedef struct {
      * block within the first 32 bytes — ray_sys_alloc data starts at
      * page+32, so offsets 0..31 share one cache line. */
     int32_t          eval_depth;
+    /* Bumped when a conditional tests a vector condition derived from the
+     * active query's rows: the expression needed row-by-row evaluation. */
+    int32_t          rows_cond;
     int32_t          scope_depth;
     bool             restricted; /* -U connection on this stack */
     int32_t          id;

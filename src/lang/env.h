@@ -155,12 +155,7 @@ bool      ray_env_in_query_helper(bool* named);
 ray_err_t ray_env_set_local_rows(int64_t sym_id, ray_t* val, uint8_t rows);
 /* Provenance flag of the binding `sym_id` resolves to, or -1 if unbound. */
 int       ray_env_binding_rows(int64_t sym_id);
-/* The running compiled frame's locals and their provenance flags, so a
- * closure created in that frame and called by a builtin can still find
- * the provenance of what it captured.  `depth` is the scope depth the
- * frame runs at; a query frame above it makes the slots outer data. */
-typedef struct { ray_t** vals; const uint8_t* rows; int32_t n; int32_t depth; } ray_live_slots_t;
-ray_live_slots_t ray_env_set_live_slots(ray_live_slots_t slots);
+
 /* ray_env_resolve, also reporting through `rows` whether the value is a
  * query source column (or its cell) read through a helper's call frame. */
 ray_t*    ray_env_resolve_rows(int64_t sym_id, uint8_t* rows);
