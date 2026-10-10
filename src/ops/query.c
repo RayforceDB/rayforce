@@ -13191,6 +13191,8 @@ by_dict_done:
                                             : (kt == RAY_LIST)
                                               ? ray_list_new(0)
                                               : ray_vec_new(kt, 0);
+                        } else if (ck_vec && !RAY_IS_ERR(ck_vec) && ck_vec->type < 0) {
+                            empty_key_vec = atom_broadcast_vec(ck_vec, 0);   /* one value */
                         }
                         if (ck_vec && !RAY_IS_ERR(ck_vec)) ray_release(ck_vec);
                     }
@@ -13234,6 +13236,19 @@ by_dict_done:
                     if (filtered_tbl != tbl) ray_release(filtered_tbl);
                     ray_release(tbl);
                     scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return computed_key ? computed_key : ray_error("domain", "select by: failed to evaluate group key expression");
+                }
+                /* One value (a name bound to an atom) is the key of every
+                 * row, as the grouping above read it: one group. */
+                if (computed_key->type < 0) {
+                    ray_t* wide = atom_broadcast_vec(computed_key, ray_table_nrows(filtered_tbl));
+                    ray_release(computed_key);
+                    if (!wide || RAY_IS_ERR(wide)) {
+                        if (filtered_tbl != tbl) ray_release(filtered_tbl);
+                        ray_release(tbl);
+                        scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv);
+                        return wide ? wide : ray_error("type", "by: cannot broadcast the key");
+                    }
+                    computed_key = wide;
                 }
                 /* A key of another length is no row-aligned key (the DAG
                  * group's rule; one value is one group): its group rows

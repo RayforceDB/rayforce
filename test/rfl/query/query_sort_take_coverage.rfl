@@ -339,3 +339,17 @@
 ;; xfail: a where: that drops rows refuses the local (4 values for 3 rows),
 ;; where the with-output form filters the local too: [10 30] [3 4]
 ;; ((fn [y] (select {by: y from: Tcksh where: (> x 1)})) [10 10 30 30]) -- (table [y x] (list [10 30] [3 4]))
+;; a name bound to one value is one group, as the with-output form groups
+;; it; the branch handed the atom to a grouping that takes vectors only.
+;; A name bound to a function is no key.
+(set Acka 5)
+(set Acks "abc")
+(select {by: Acka from: Tckg}) -- (table [Acka x y] (list [5] [3] [30]))
+(at (select {by: Acka from: Tckg}) 'Acka) -- (first (value (select {c: (first x) by: Acka from: Tckg})))
+(at (select {by: Acka from: Tckg}) 'x) -- (at (select {c: (first x) by: Acka from: Tckg}) 'c)
+(select {by: Acks from: Tckg where: (> x 3)}) -- (table [Acks x y] (list (list "abc") [4] [40]))
+((fn [] (let F 2.5) (select {by: F from: Tckg}))) -- (table [F x y] (list [2.5] [3] [30]))
+(type (at (select {by: Acka from: Tckg where: (> y 100)}) 'Acka)) -- 'I64
+(count (select {by: Acka from: Tckg where: (> y 100)})) -- 0
+(select {by: sum from: Tckg}) !- domain
+(select {c: (count y) by: sum from: Tckg}) !- domain
