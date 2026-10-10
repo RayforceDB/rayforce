@@ -9455,13 +9455,13 @@ static bool clause_names_sym(ray_t* v, int64_t s) {
 }
 
 /* May the narrow copy of a parted table add a row-number column named
- * `row_sym`?  Not when the table has a column of that name, the select
+ * `row_sym`?  Not when the table has a column of that name or the select
  * names it anywhere (as a key, an alias, or a value the column would
- * shadow), or a variable of that name is bound. */
+ * shadow).  A variable of that name is shadowed only through a name the
+ * select writes, or code it runs (parted_clauses_plain declines that). */
 static bool parted_row_name_free(ray_t* dict, ray_t* tbl, int64_t row_sym) {
     if (ray_table_get_col(tbl, row_sym)) return false;
-    if (clause_names_sym(dict, row_sym)) return false;
-    return !ray_env_get_lexical_local(row_sym) && !ray_env_get(row_sym);
+    return !clause_names_sym(dict, row_sym);
 }
 
 /* Does the clause value `v` run code whose column reads it does not show:
