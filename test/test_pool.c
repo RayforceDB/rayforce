@@ -1974,6 +1974,7 @@ out:
     ray_pool_destroy();
     TEST_ASSERT_EQ_I(ray_pool_init(0), RAY_OK);
     ray_heap_destroy();
+    (void)pf_sink;   /* read the sink once, or clang flags it set but never used */
     return res;
 }
 
