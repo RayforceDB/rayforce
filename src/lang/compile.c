@@ -867,18 +867,23 @@ static bool syms_contain(ray_t *syms, int64_t id) {
 
 /* The capture names a closure body can reach: the closure dict's keys that
  * the body mentions (every key when the body uses eval or resolve), never
- * `self`.  A SYM vector the caller releases, or NULL for none. */
-static ray_t *closure_capture_names(ray_t *lambda) {
+ * `self`.  A SYM vector the caller releases, or NULL for none.  *failed is
+ * set when the body could not be walked (nesting past the walk's guard, or
+ * an allocation failure): NULL then means "unknown", not "none", and the
+ * body must not be compiled without its captures. */
+static ray_t *closure_capture_names(ray_t *lambda, bool *failed) {
+    *failed = false;
     ray_t *closure = LAMBDA_CLOSURE(lambda);
     if (!closure) return NULL;
     ray_t *keys = ray_dict_keys(closure);
     if (!keys || keys->len == 0) return NULL;
     init_sf_syms();
     ray_t *mentioned = ray_vec_new(RAY_I64, 16);
-    if (!mentioned || RAY_IS_ERR(mentioned)) return NULL;
+    if (!mentioned || RAY_IS_ERR(mentioned)) { *failed = true; return NULL; }
     bool dynamic = false;
     bool ok = ast_collect_syms(LAMBDA_BODY(lambda), &mentioned, &dynamic);
     ray_t *names = ok ? ray_sym_vec_new(RAY_SYM_W64, keys->len) : NULL;
+    if (!names || RAY_IS_ERR(names)) *failed = true;
     if (names && !RAY_IS_ERR(names)) {
         int64_t *out = (int64_t*)ray_data(names);
         names->len = 0;
@@ -1013,7 +1018,7 @@ static bool compile_fn_template_at(compiler_t *c, ray_t *ast) {
     return true;
 }
 
-ray_t *ray_closure_capture_names(ray_t *lambda) { return closure_capture_names(lambda); }
+ray_t *ray_closure_capture_names(ray_t *lambda) { bool failed; return closure_capture_names(lambda, &failed); }
 
 /* Every symbol a body mentions (I64 vector, owned by the caller) and whether
  * it uses eval or resolve; NULL on allocation failure. */
@@ -1052,7 +1057,17 @@ bool ray_compile_with_captures(ray_t *lambda, ray_t *capnames, bool closure_body
 void ray_compile(ray_t *lambda) {
     if (LAMBDA_IS_COMPILED(lambda)) return;
     if (!closure_shape_ok(LAMBDA_CLOSURE(lambda))) return;
-    ray_t *names = closure_capture_names(lambda);
+    bool walk_failed = false;
+    ray_t *names = closure_capture_names(lambda, &walk_failed);
+    /* A body the walk gave up on mentions captures it cannot list: bind
+     * every capture, as for a body that uses eval, or compiled without
+     * them its captured names would resolve as globals.  When that does
+     * not compile either (more captures than a frame holds), the body
+     * stays on the tree walker. */
+    if (walk_failed) {
+        names = ray_closure_names_from(LAMBDA_CLOSURE(lambda), NULL, true);
+        if (!names) { LAMBDA_NLOCALS(lambda) = -1; return; }
+    }
     /* A closure body resolves its free names at call time; a lambda made
      * with nothing captured keeps the builtins it names baked in. */
     if (!compile_lambda(lambda, names, LAMBDA_CLOSURE(lambda) != NULL))

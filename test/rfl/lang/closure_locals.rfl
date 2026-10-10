@@ -233,6 +233,18 @@ rb -- [6 3]
 ((mkI 600) 1) -- 1
 ((mkI 1500) 1) -- 1
 ((mkI 2500) 1) !- limit
+;; a closure body nested past the capture walk's guard (1024 levels) keeps its
+;; captures: it compiles with every capture bound, never with a captured name
+;; resolved as a global (the global kd here); past the compiler's own guard
+;; it is left to the tree walker, which stops at its depth limit
+(set wrapK (fn [inner] (concat (take (parse "(if true 0)") 2) (enlist inner))))
+(set buildK (fn [n] (let a (parse "(+ kd x)")) (times n (let a (wrapK a))) a))
+(set mkK (fn [n] (eval (concat (take (parse "(fn [kd] 0)") 2) (enlist (concat (take (parse "(fn [x] 0)") 2) (enlist (buildK n))))))))
+(set kd 5000)
+(((mkK 600) 100) 1) -- 101
+(((mkK 1100) 100) 1) -- 101
+(((mkK 2000) 100) 1) -- 101
+(((mkK 2500) 100) 1) !- limit
 ;; closures made from one literal match by capture set in either order
 (set mkd2 (fn [flag k] (if false (set 1 2)) (if flag (let extra2 1)) (fn [] (list k (try extra2 'none)))))
 (set dd3 (mkd2 false 2))

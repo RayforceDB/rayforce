@@ -292,6 +292,36 @@ static test_result_t test_closure_lazy_capture_vm(void) {
     PASS();
 }
 
+/* The symbol walk behind a closure's capture names stops at 1024 levels
+ * of nesting rather than following the text down the C stack; the closure
+ * compiler then binds every capture (closure_locals.rfl pins that). */
+static test_result_t test_closure_sym_walk_guard(void) {
+    ray_t* mk = ray_eval_str("(do (set nestw (fn [n] (let a (parse \"kw\")) (times n (let a (list a))) a)) 0)");
+    TEST_ASSERT_NOT_NULL(mk);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(mk));
+    ray_release(mk);
+    int depths[2] = { 1000, 1100 };
+    for (int i = 0; i < 2; i++) {
+        char src[64];
+        snprintf(src, sizeof src, "(nestw %d)", depths[i]);
+        ray_t* ast = ray_eval_str(src);
+        TEST_ASSERT_NOT_NULL(ast);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(ast));
+        bool dynamic = false;
+        int64_t weight = 0;
+        ray_t* ment = ray_closure_mentioned_syms(ast, &dynamic, &weight);
+        if (i == 0) {
+            TEST_ASSERT(ment != NULL, "a body within the guard is walked");
+            TEST_ASSERT_EQ_I(ment->len, 1);
+            ray_release(ment);
+        } else {
+            TEST_ASSERT(ment == NULL, "a body past the guard is given up on");
+        }
+        ray_release(ast);
+    }
+    PASS();
+}
+
 /* ---- Dummy function for testing ---- */
 static ray_t* dummy_unary(ray_t* x) { return ray_retain(x), x; }
 static ray_t* dummy_binary(ray_t* x, ray_t* y) { (void)y; return ray_retain(x), x; }
@@ -10085,6 +10115,7 @@ const test_entry_t lang_entries[] = {
     { "lang/query_helper_reinit", test_query_helper_reinit, lang_setup, lang_teardown },
     { "lang/closure_malformed_capture", test_closure_malformed_capture, lang_setup, lang_teardown },
     { "lang/closure_lazy_capture_vm", test_closure_lazy_capture_vm, lang_setup, lang_teardown },
+    { "lang/closure_sym_walk_guard", test_closure_sym_walk_guard, lang_setup, lang_teardown },
     { "lang/io/read_procfs_zero_size", test_read_procfs_reports_zero_size, lang_setup, lang_teardown },
     { "lang/io/read_unsized_bounded", test_read_unsized_stream_is_bounded, lang_setup, lang_teardown },
     { "lang/io/exec_capture_bounded", test_exec_capture_is_bounded, lang_setup, lang_teardown },
