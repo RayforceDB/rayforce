@@ -9551,10 +9551,11 @@ static ray_t* select_parted_first_rows(ray_t* dict, ray_t* tbl, bool aliases_res
     int64_t nkeys = by_expr->type == RAY_DICT ? ray_dict_len(by_expr)
                   : by_expr->type == RAY_SYM ? ray_len(by_expr) : 1;
 
-    /* Names a key column may take: `key`, a computed key's derived name,
-     * a dotted key's tail and full name, a by-dict's keys.  A column of
-     * that name stays real: the key may replace it. */
-    int64_t nkn_max = 4 + (by_expr->type == RAY_DICT ? ray_dict_len(by_expr) : 0);
+    /* Names a key column may take: a computed key's derived name (`key`
+     * when it names no column), a dotted key's tail and full name, a
+     * by-dict's keys.  A column of that name stays real: the key may
+     * replace it. */
+    int64_t nkn_max = 3 + (by_expr->type == RAY_DICT ? ray_dict_len(by_expr) : 0);
     ray_t* buf_hdr = NULL;
     int64_t* refs = (int64_t*)scratch_alloc(&buf_hdr,
         (size_t)(nc + nkn_max) * sizeof(int64_t) + (size_t)nc * sizeof(uint8_t));
@@ -9577,7 +9578,6 @@ static ray_t* select_parted_first_rows(ray_t* dict, ray_t* tbl, bool aliases_res
             nref = collect_col_refs_set(v, tbl, refs, (int)nc, nref);
         }
     }
-    keynames[nkn++] = ray_sym_intern("key", 3);
     keynames[nkn++] = derived_key_name(by_expr);
     if (by_expr->type == -RAY_SYM && ray_sym_is_dotted(by_expr->i64)) {
         const int64_t* segs;
