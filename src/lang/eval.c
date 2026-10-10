@@ -2171,13 +2171,20 @@ typedef struct {
     bool    failed;    /* the body did not compile: its closures stay interpreted */
     ray_t*  names;     /* capture names (SYM vector) or NULL */
     ray_t*  tmpl;      /* the compiled template, or NULL when `failed` */
+    int64_t bytes;     /* what the literal's text holds (ray_closure_mentioned_syms) */
 } closure_tmpl_t;
-enum { CLOSURE_TMPL_MAX_WEIGHT = 65536 };   /* vector elements a cached literal may hold */
+/* The entries keep their literals' text alive after every closure made
+ * from them is gone, so the table is bounded by bytes: a literal holding
+ * more than CLOSURE_TMPL_MAX_BYTES is not kept, and older entries make
+ * room once the table holds CLOSURE_TMPL_BUDGET. */
+enum { CLOSURE_TMPL_MAX_BYTES = 64 * 1024, CLOSURE_TMPL_BUDGET = 1024 * 1024 };
 static _Thread_local closure_tmpl_t g_closure_tmpl[CLOSURE_TMPL_SLOTS];
 static _Thread_local uint32_t g_closure_tmpl_next;
 static _Thread_local uint64_t g_closure_tmpl_epoch;
+static _Thread_local int64_t g_closure_tmpl_bytes;   /* sum of the entries' bytes */
 
 static void closure_tmpl_drop(closure_tmpl_t* e) {
+    g_closure_tmpl_bytes -= e->bytes;
     if (e->params) ray_release(e->params);
     for (int64_t i = 0; i < e->nbody && i < CLOSURE_TMPL_MAX_BODY; i++) if (e->body[i]) ray_release(e->body[i]);
     if (e->mentioned) ray_release(e->mentioned);
@@ -2192,6 +2199,7 @@ static void closure_tmpl_reset(void) {
     for (int i = 0; i < CLOSURE_TMPL_SLOTS; i++) closure_tmpl_drop(&g_closure_tmpl[i]);
     g_closure_tmpl_next = 0;
     g_closure_tmpl_epoch = 0;
+    g_closure_tmpl_bytes = 0;
 }
 
 /* Another thread's table after the runtime it filled it under was
@@ -2200,6 +2208,7 @@ static void closure_tmpl_reset(void) {
 static void closure_tmpl_forget(void) {
     memset(g_closure_tmpl, 0, sizeof g_closure_tmpl);
     g_closure_tmpl_next = 0;
+    g_closure_tmpl_bytes = 0;
 }
 
 /* Does `closure`'s capture set, filtered by the entry's mentioned symbols,
@@ -2268,7 +2277,7 @@ static void closure_share_template(ray_t* lambda) {
     int64_t weight = 0;
     ray_t* mentioned = ray_closure_mentioned_syms(body, &dynamic, &weight);
     if (!mentioned) return;
-    if (weight > CLOSURE_TMPL_MAX_WEIGHT) {
+    if (weight > CLOSURE_TMPL_MAX_BYTES) {
         /* A literal built around a large constant is not kept: the table
          * would hold the constant alive after its closures are gone. */
         ray_release(mentioned);
@@ -2298,12 +2307,17 @@ static void closure_share_template(ray_t* lambda) {
     }
     closure_tmpl_t* e = &g_closure_tmpl[g_closure_tmpl_next++ % CLOSURE_TMPL_SLOTS];
     closure_tmpl_drop(e);
+    /* Make room within the budget, oldest entries first. */
+    for (uint32_t k = 0; k < CLOSURE_TMPL_SLOTS && g_closure_tmpl_bytes + weight > CLOSURE_TMPL_BUDGET; k++)
+        closure_tmpl_drop(&g_closure_tmpl[(g_closure_tmpl_next + k) % CLOSURE_TMPL_SLOTS]);
     ray_retain(params); e->params = params;
     for (int64_t k = 0; k < body->len; k++) { ray_retain(bn[k]); e->body[k] = bn[k]; }
     e->nbody = body->len;
     e->mentioned = mentioned;   /* owned */
     e->dynamic = dynamic;
     e->failed = !compiled;
+    e->bytes = weight;
+    g_closure_tmpl_bytes += weight;
     e->names = names;   /* owned, may be NULL */
     e->tmpl = tmpl;     /* owned, NULL when failed */
     if (compiled) closure_share_from(lambda, tmpl);

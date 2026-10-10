@@ -277,6 +277,24 @@ r6 -- [6 3]
 (set bsL 0)
 (.sys.gc)
 (< (- (heapL) h0L) 4000000) -- true
+;; ... literals each just under the per-literal bound share one budget
+(set bigM (fn [i] (eval (concat (take baseL 2) (enlist (concat (parse "(+ x)") (enlist (+ i (til 7000)))))))))
+(set bsL (map bigM (til 4)))
+(set bsL 0)
+(set h0L (do (.sys.gc) (heapL)))
+(set bsL (map bigM (til 300)))
+(set bsL 0)
+(.sys.gc)
+(< (- (heapL) h0L) 4000000) -- true
+;; ... and a long string counts by its bytes
+(set bigS (fn [i] (eval (concat (take baseL 2) (enlist (concat (parse "(+ (count x))") (enlist (format "%" (+ i (til 20000))))))))))
+(set bsL (map bigS (til 4)))
+(set bsL 0)
+(set h0L (do (.sys.gc) (heapL)))
+(set bsL (map bigS (til 300)))
+(set bsL 0)
+(.sys.gc)
+(< (- (heapL) h0L) 4000000) -- true
 ;; a body nested past the compiler's depth guard (2048 levels) is left to the
 ;; tree walker instead of recursing further down the C stack. a chain of
 ;; nested if's shows which engine ran: the compiled body runs it as jumps and

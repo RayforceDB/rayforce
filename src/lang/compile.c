@@ -25,6 +25,7 @@
 #include "lang/env.h"
 #include "lang/nfo.h"
 #include "table/sym.h"   /* ray_read_sym — capture names */
+#include "core/block.h"  /* ray_block_size — a literal's weight */
 #include <stdbool.h>
 #include <string.h>
 
@@ -815,13 +816,31 @@ static bool ast_collect_syms(ray_t *ast, ray_t **out, bool *dynamic) {
     int64_t weight = 0;
     return ast_collect_syms_at(ast, out, dynamic, 0, &weight);
 }
-/* `weight` accumulates the elements of the vectors the text holds, so a
- * literal built around a large constant is not kept in a template table;
- * nesting past 1024 levels is given up on (the literal then has no
- * template and compiles when called). */
+/* The bytes a text node holds: its header and payload, a string atom's
+ * or a string vector's characters, and the whole parent of a slice. */
+static int64_t ast_node_bytes(ray_t *v) {
+    if (ray_is_atom(v)) {
+        int64_t b = (int64_t)ray_block_size(v);
+        if (v->type == -RAY_STR && !((v->slen >= 1 && v->slen <= 7) || (v->slen == 0 && !v->obj)) && v->obj)
+            b += ast_node_bytes(v->obj);
+        else if (v->type == -RAY_GUID && v->obj)
+            b += ast_node_bytes(v->obj);
+        return b;
+    }
+    if ((v->attrs & RAY_ATTR_SLICE) && v->slice_parent) return ast_node_bytes(v->slice_parent);
+    int64_t b = (int64_t)ray_block_size(v);
+    if (v->type == RAY_STR && v->str_pool) b += (int64_t)ray_block_size(v->str_pool);
+    return b;
+}
+
+/* `weight` accumulates the bytes the text holds (ast_node_bytes of every
+ * node), so a literal built around a large constant, a long string
+ * included, is not kept in a template table; nesting past 1024 levels is
+ * given up on (the literal then has no template and compiles when called). */
 static bool ast_collect_syms_at(ray_t *ast, ray_t **out, bool *dynamic, int depth, int64_t *weight) {
     if (!ast || !*out) return false;
     if (depth > 1024) return false;
+    *weight += ast_node_bytes(ast);
     if (ast->type == -RAY_SYM) {
         int64_t id = ast->i64;
         if (id == sf_eval || id == sf_resolve) *dynamic = true;
@@ -844,7 +863,6 @@ static bool ast_collect_syms_at(ray_t *ast, ray_t **out, bool *dynamic, int dept
     }
     if (ast->type == RAY_LIST) {
         ray_t **elems = (ray_t**)ray_data(ast);
-        *weight += ast->len;
         for (int64_t i = 0; i < ast->len; i++)
             if (!ast_collect_syms_at(elems[i], out, dynamic, depth + 1, weight)) return false;
         return true;
@@ -854,7 +872,6 @@ static bool ast_collect_syms_at(ray_t *ast, ray_t **out, bool *dynamic, int dept
         return ast_collect_syms_at(slots[0], out, dynamic, depth + 1, weight) &&
                ast_collect_syms_at(slots[1], out, dynamic, depth + 1, weight);
     }
-    if (ast->type > 0 && ast->type != RAY_SYM) *weight += ast->len;   /* a typed vector constant */
     return true;
 }
 
