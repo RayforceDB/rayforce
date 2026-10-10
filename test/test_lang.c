@@ -2326,6 +2326,28 @@ static test_result_t test_eval_select_by_nonagg_colref_vs_const(void) {
     PASS();
 }
 
+/* ---- Test: a by: key that is no value ----
+ * A name bound to a function or to null is refused, with or without an
+ * output, by what it is: the refusal of a function once caught null too
+ * and called it a function. */
+static test_result_t test_eval_select_by_key_not_a_value(void) {
+    static const char* const cases[][2] = {
+        { "(select {by: sum from: (table [x y] (list [3 1] [30 10]))})", "function" },
+        { "(select {c: (count y) by: sum from: (table [x y] (list [3 1] [30 10]))})", "function" },
+        { "(do (set Nk (println \"\")) (select {by: Nk from: (table [x y] (list [3 1] [30 10]))}))", "null" },
+        { "(do (set Nk (println \"\")) (select {c: (count y) by: Nk from: (table [x y] (list [3 1] [30 10]))}))", "null" },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        ray_t* r = ray_eval_str(cases[i][0]);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+        TEST_ASSERT_STR_EQ(ray_err_code(r), "domain");
+        const char* msg = ray_error_msg();
+        TEST_ASSERT_FMT(msg && strstr(msg, cases[i][1]), "case %zu: %s", i, msg ? msg : "(none)");
+        ray_error_free(r);
+    }
+    PASS();
+}
+
 /* ---- Test: non-agg literal/short vectors broadcast ----
  * Regression: the over-eager fix that routed all RAY_LIST results
  * through gather_by_idx also swept up literal lists like `[1 2]`
@@ -9617,6 +9639,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/select_by_str_nonagg_list_col", test_eval_select_by_str_nonagg_list_col, lang_setup, lang_teardown },
     { "lang/eval/select_by_nonagg_broadcast", test_eval_select_by_nonagg_broadcast, lang_setup, lang_teardown },
     { "lang/eval/select_by_nonagg_colref_vs_const", test_eval_select_by_nonagg_colref_vs_const, lang_setup, lang_teardown },
+    { "lang/eval/select_by_key_not_a_value", test_eval_select_by_key_not_a_value, lang_setup, lang_teardown },
     { "lang/eval/select_by_nonagg_with_agg_subexpr", test_eval_select_by_nonagg_with_agg_subexpr, lang_setup, lang_teardown },
     { "lang/eval/select_by_nonagg_sort_take", test_eval_select_by_nonagg_sort_take, lang_setup, lang_teardown },
     { "lang/eval/select_by_take_clamps", test_eval_select_by_take_clamps, lang_setup, lang_teardown },

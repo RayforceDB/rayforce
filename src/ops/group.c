@@ -11988,14 +11988,19 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             g->table = tbl;
             ray_t* vec = exec_node(g, key_op);
             g->table = saved_table;
-            /* A name bound to a function (`by: sum`) is no value to group
-             * on; ray_is_atom counts it as one and the broadcast below
-             * failed on its type. */
-            if (vec && !RAY_IS_ERR(vec) && vec->type >= RAY_LAMBDA) {
+            if (vec && !RAY_IS_ERR(vec) && ray_is_lazy(vec))
+                vec = ray_lazy_materialize(vec);
+            /* A name bound to a function (`by: sum`) or to null is no value
+             * to group on; ray_is_atom counts both as one, and the broadcast
+             * below failed on their type. */
+            if (vec && !RAY_IS_ERR(vec) &&
+                ((vec->type >= RAY_LAMBDA && vec->type <= RAY_VARY) || vec->type == RAY_NULL)) {
+                bool is_fn = vec->type != RAY_NULL;
                 ray_release(vec);
                 for (uint32_t j = 0; j < k; j++)
                     if (key_owned[j] && key_vecs[j]) ray_release(key_vecs[j]);
-                return ray_error("domain", "by: the key is a function, not a value");
+                return ray_error("domain", is_fn ? "by: the key is a function, not a value"
+                                                 : "by: the key is null, not a value");
             }
             if (vec && !RAY_IS_ERR(vec)) {
                 /* A key that evaluates to one value (a constant, or a `let`
