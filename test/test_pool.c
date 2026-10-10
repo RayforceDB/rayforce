@@ -32,6 +32,7 @@
 #include "core/poll.h"
 #include "core/platform.h"
 #include "core/timer.h"
+#include "core/profile.h"   /* ray_profile_now_ns: bounded waits */
 #include "mem/heap.h"
 #include "ops/ops.h"
 #include <stdatomic.h>
@@ -425,11 +426,17 @@ static test_result_t test_dispatch_reclaims_worker_blocks(void) {
     ray_err_t err = ray_pool_create(&pool, 3);
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
-    /* ray_pool_create returns before the workers have started; a worker
-     * publishes its heap once it has run ray_heap_init.  Wait for all three
-     * on that published state, so every slot below is a real heap. */
+    /* A worker publishes its heap once it has run ray_heap_init (and
+     * ray_pool_create waits for that).  Wait for all three on that
+     * published state, so every slot below is a real heap; one that never
+     * shows (its heap init failed) fails the test within a bound rather
+     * than hanging it. */
+    int64_t until = ray_profile_now_ns() + (int64_t)30 * 1000000000;
     for (uint32_t w = 0; w < pool.n_workers; w++)
-        while (!atomic_load(&pool.worker_heaps[w])) RAY_CPU_RELAX();
+        while (!atomic_load(&pool.worker_heaps[w])) {
+            if (ray_profile_now_ns() > until) { ray_pool_free(&pool); FAIL("a worker published no heap"); }
+            RAY_CPU_RELAX();
+        }
 
     /* Rounds of "workers allocate, main frees" until a round in which at
      * least one block really came from a worker (main is worker 0 and can

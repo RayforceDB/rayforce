@@ -12,6 +12,7 @@
 #include "store/splay.h"
 #include "ops/idxop.h"
 #include "core/runtime.h"   /* ray_error_msg: the skeptic probes */
+#include "core/profile.h"   /* ray_profile_now_ns: pq_pool's bounded wait */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,13 +28,22 @@ static void pq_teardown(void) { ray_sym_destroy(); ray_heap_destroy(); }
 /* A pool of `cores` workers, every one of them started.  Its workers read
  * the environment as they start (ray_heap_init's getenv), and these tests
  * set and unset variables right after making a pool; ray_pool_init_total
- * waits for the workers itself, and this does not rely on it. */
+ * waits for the workers itself, and this does not rely on it.  A worker
+ * whose heap never shows (its ray_heap_init failed) fails the pool within
+ * a bound instead of hanging the test. */
 static ray_err_t pq_pool(int cores) {
     ray_pool_destroy();
     ray_err_t e = ray_pool_init_total((uint32_t)cores);
     ray_pool_t* p = ray_pool_get();
+    int64_t until = ray_profile_now_ns() + (int64_t)30 * 1000000000;
     for (uint32_t i = 0; e == RAY_OK && p && i < p->n_workers; i++)
-        while (!atomic_load_explicit(&p->worker_heaps[i], memory_order_acquire)) RAY_CPU_RELAX();
+        while (!atomic_load_explicit(&p->worker_heaps[i], memory_order_acquire)) {
+            if (ray_profile_now_ns() > until) {
+                fprintf(stderr, "  pq_pool: worker %u of %u has no heap\n", i, p->n_workers);
+                return RAY_ERR_OOM;
+            }
+            RAY_CPU_RELAX();
+        }
     return e;
 }
 #define FIX "test/data/parquet/"
@@ -2996,6 +3006,68 @@ static test_result_t test_pq_symgrp_empty_group(void) {
     PASS();
 #endif
 }
+/* A mixed import over a degenerate hash (RAY_PQ_SYM_HASH_BITS=0: every
+ * string of the grouped column in one hash group, each new one compared
+ * with those before it): p and q direct and seeded, u grouped (PLAIN, few
+ * distinct strings, which keeps the compares few under the sanitizers), on
+ * one worker and on two: the same files, every row right. */
+static test_result_t test_pq_symgrp_degenerate_hash(void) {
+#if !defined(DEBUG)
+    SKIP("the memory the decision assumes is a debug-build knob");
+#else
+    pq_sym_env_clear();
+    char src[160], dir[160], ref[160];
+    snprintf(src, sizeof(src), "/tmp/rayforce-pqdh-%d.parquet", (int)getpid());
+    snprintf(dir, sizeof(dir), "/tmp/rayforce-pqdh-%d", (int)getpid());
+    snprintf(ref, sizeof(ref), "/tmp/rayforce-pqdh-%d-ref", (int)getpid());
+    const char* fnames[4] = {"x","p","q","u"};
+    const char* nm[3] = {"p","q","u"};
+    pq_synth_fn fns[3] = {pqx_lowcard, pqx_card100, pqx_lowcard};
+    unsigned fl[3] = {PQX_DICT | PQX_SNAPPY, PQX_DICT, 0};
+    int64_t tids[4] = {ray_sym_intern("I32", 3), ray_sym_intern("SYM", 3), ray_sym_intern("SYM", 3), ray_sym_intern("SYM", 3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 4);
+    size_t cap = (size_t)1 << 16;
+    char* trace = (char*)ray_sys_alloc(cap);
+    TEST_ASSERT_TRUE(trace != NULL);
+    const int64_t rows = 18000;
+    TEST_ASSERT_TRUE(pqx_synth(src, rows, 6, 3, nm, fns, fl));
+    TEST_ASSERT_EQ_I(pq_pool(1), RAY_OK);
+    int64_t words = 0;
+    int64_t sram = sk_mixed_ram(src, dir, types, fnames, 4, trace, cap, &words);
+    TEST_ASSERT_TRUE(sram > 0);
+    char ramv[32]; snprintf(ramv, sizeof(ramv), "%lld", (long long)sram);
+    int bad = 0;
+    for (int cores = 1; cores <= 2; cores++) {
+        const char* out = cores == 1 ? ref : dir;
+        TEST_ASSERT_EQ_I(pq_pool(cores), RAY_OK);
+        pq_set_env("RAY_PQ_SYM_RAM", ramv);
+        pq_set_env("RAY_PQ_SYM_HASH_BITS", "0");
+        ray_t* res = pq_traced_import(src, out, types, trace, cap);
+        pq_sym_env_clear();
+        TEST_ASSERT_FALSE(!res || RAY_IS_ERR(res)); ray_release(res);
+        char what[64]; snprintf(what, sizeof(what), "degenerate hash %d", cores);
+        if (!pqx_check(out, rows, 3, nm, fns, what, NULL)) bad++;
+        bool pd = pq_trace_line_has(trace, "parquet symcol: col=p ", " mode=direct");
+        bool qd = pq_trace_line_has(trace, "parquet symcol: col=q ", " mode=direct");
+        bool ug = pq_trace_line_has(trace, "parquet symcol: col=u ", " mode=grouped");
+        bool seeded = strstr(trace, "parquet symseed:") != NULL;
+        double collisions = pq_trace_sum(trace, "collisions", NULL);
+        bool same = cores == 1 || sk_files_same(ref, out, fnames + 1, 3);
+        fprintf(stderr, "  [%s] p %s q %s u %s%s, %.0f collisions, %lld symbols (direct %lld)%s\n", what, pd ? "D" : "G",
+                qd ? "D" : "G", ug ? "G" : "D", seeded ? " seeded" : "", collisions, (long long)pq_sym_count(out),
+                (long long)words, same ? "" : ", FILES DIFFER");
+        if (!pd || !qd || !ug || !seeded || collisions <= 0 || !same || pq_sym_count(out) != words) bad++;
+    }
+    pq_remove_native(dir, fnames, 4);
+    pq_remove_native(ref, fnames, 4);
+    unlink(src);
+    ray_pool_destroy();
+    ray_sys_free(trace);
+    ray_release(types);
+    TEST_ASSERT_EQ_I(bad, 0);
+    PASS();
+#endif
+}
 /* A dictionary column the reader cannot decode: a codec it does not take
  * (ZSTD, 6), or a dictionary page of an encoding it does not know (3).  The
  * import reports the decoder's own reason, forced direct and as a mixed
@@ -3122,6 +3194,7 @@ const test_entry_t parquet_entries[] = {
     {"parquet/sk_mixed_workers",test_pq_sk_mixed_workers,pq_setup,pq_teardown},
     {"parquet/sk_lying_stats",test_pq_sk_lying_stats,pq_setup,pq_teardown},
     {"parquet/symgrp_empty_group",test_pq_symgrp_empty_group,pq_setup,pq_teardown},
+    {"parquet/symgrp_degenerate_hash",test_pq_symgrp_degenerate_hash,pq_setup,pq_teardown},
     {"parquet/sk_codec_message",test_pq_sk_codec_message,pq_setup,pq_teardown},
     {"parquet/small_stack",test_pq_small_stack,NULL,NULL},
     {"parquet/parted_symbols",test_pq_parted_symbols,pq_setup,pq_teardown},
