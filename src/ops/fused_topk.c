@@ -164,8 +164,10 @@ typedef struct {
     const uint32_t* zorder;
     int64_t        nrows;
     /* range-read failures of the predicate scan, keyed by the morsel's
-     * first row: the lowest wins */
-    ray_scan_fail_t fail;
+     * first row: the lowest wins.  Held by pointer (the envelope lives on
+     * the coordinator's stack): embedding it here put a few hundred bytes
+     * between the hot read-only fields and moved the top-k loop's layout. */
+    ray_scan_fail_t* fail;
     /* written by every worker with a full heap: own cache line, away from
      * the read-only zone pointers above */
     _Alignas(64) _Atomic(int64_t) bound;
@@ -410,18 +412,22 @@ static inline void fpk_heapify(const fpk_par_ctx_t* c, int64_t* heap, int32_t n)
  * rows (one ascending run within a chunk: the rest are higher keys), as
  * does a failure noted below them.  The task's other chunk slots may lie
  * lower and are still scanned (fpk_par_fn). */
-static inline void fpk_scan_rows(fpk_par_ctx_t* c, fp_scratch_t* fs, int64_t* hidx, int32_t* hnp,
-                                 int32_t k, int64_t row, int64_t end, int64_t chunk) {
+RAY_INLINE void fpk_scan_rows(fpk_par_ctx_t* c, fp_scratch_t* fs, int64_t* hidx, int32_t* hnp,
+                              int32_t k, int64_t row, int64_t end, int64_t chunk, const bool rs) {
     int32_t hn = *hnp;
     while (row < end) {
         if (chunk >= 0 && fpk_chunk_pruned(c, chunk)) break;
-        if (ray_scan_fail_skip(&c->fail, row)) break;
+        if (rs && ray_scan_fail_skip(c->fail, row)) break;
         int64_t mend = row + RAY_MORSEL_ELEMS;
         if (mend > end) mend = end;
         int64_t mlen = mend - row;
         uint8_t bits[RAY_MORSEL_ELEMS];
-        ray_t* pe = fp_eval_pred_rs(&c->pred, row, mend, bits, fs);
-        if (pe) { ray_scan_fail_note(&c->fail, row, pe); break; }
+        if (rs) {
+            ray_t* pe = fp_eval_pred_rs(&c->pred, row, mend, bits, fs);
+            if (pe) { ray_scan_fail_note(c->fail, row, pe); break; }
+        } else {
+            fp_eval_pred(&c->pred, row, mend, bits);   /* no child is read by range */
+        }
 
         for (int64_t r = 0; r < mlen; r++) {
             if (!bits[r]) continue;
@@ -444,20 +450,22 @@ static inline void fpk_scan_rows(fpk_par_ctx_t* c, fp_scratch_t* fs, int64_t* hi
     *hnp = hn;
 }
 
-/* Worker fn: [start, end) is a range of physical rows, or — with a zone
+/* Worker body: [start, end) is a range of physical rows, or — with a zone
  * order — of virtual rows whose chunk slots map to physical chunks.  The
- * range-read scratch lives and dies with the task. */
-static void fpk_par_fn(void* raw, uint32_t worker_id, int64_t start, int64_t end) {
+ * range-read scratch lives and dies with the task.  `rs` (some predicate
+ * child is read by range) is constant per instance: the plain one keeps
+ * the generation-0 loop, with no scratch and no failure envelope. */
+RAY_INLINE void fpk_par_body(void* raw, uint32_t worker_id, int64_t start, int64_t end, const bool rs) {
     fpk_par_ctx_t* c = (fpk_par_ctx_t*)raw;
     if (atomic_load_explicit(&c->oom, memory_order_relaxed)) return;
     int32_t  k    = (int32_t)c->k;
     int64_t* hidx = &c->heap_idx[(size_t)worker_id * (size_t)k];
     int32_t  hn   = c->heap_n[worker_id];
     fp_scratch_t fs;
-    fp_scratch_init(&fs);
+    if (rs) fp_scratch_init(&fs);
 
     if (!c->zmin) {
-        fpk_scan_rows(c, &fs, hidx, &hn, k, start, end, -1);
+        fpk_scan_rows(c, &fs, hidx, &hn, k, start, end, -1, rs);
     } else {
         int64_t span = (int64_t)1 << c->zlog2;
         int64_t v = start;
@@ -471,13 +479,21 @@ static void fpk_par_fn(void* raw, uint32_t worker_id, int64_t start, int64_t end
                 int64_t p0 = (g << c->zlog2) + (v - sbeg);
                 int64_t p1 = (g << c->zlog2) + (send - sbeg);
                 if (p1 > c->nrows) p1 = c->nrows;
-                if (p0 < p1) fpk_scan_rows(c, &fs, hidx, &hn, k, p0, p1, g);
+                if (p0 < p1) fpk_scan_rows(c, &fs, hidx, &hn, k, p0, p1, g, rs);
             }
             v = send;
         }
     }
-    fp_scratch_free(&fs);
+    if (rs) fp_scratch_free(&fs);
     c->heap_n[worker_id] = hn;
+}
+
+static void fpk_par_fn_plain(void* raw, uint32_t worker_id, int64_t start, int64_t end) {
+    fpk_par_body(raw, worker_id, start, end, false);
+}
+
+static void fpk_par_fn(void* raw, uint32_t worker_id, int64_t start, int64_t end) {
+    fpk_par_body(raw, worker_id, start, end, true);
 }
 
 /* Insertion sort over K entries so output rows match full-sort + take order. */
@@ -611,7 +627,9 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
         if (!ctx.sym_strings) { fp_pred_cleanup(&ctx.pred); ray_graph_free(g); fpk_unpin_keys(ctx.keys, n_sort_keys); return NULL; }
     }
     atomic_store_explicit(&ctx.oom, 0, memory_order_relaxed);
-    ray_scan_fail_init(&ctx.fail);
+    ray_scan_fail_t fail;
+    ctx.fail = &fail;
+    ray_scan_fail_init(ctx.fail);
 
     /* Allocate per-worker heaps. */
     ray_pool_t* pool = ray_pool_get();
@@ -646,13 +664,16 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
             ctx.zorder = ord;
         }
     }
-    if (pool) ray_pool_dispatch(pool, fpk_par_fn, &ctx, span_rows);
-    else      fpk_par_fn(&ctx, 0, 0, span_rows);
+    bool rs = false;
+    for (uint8_t i = 0; i < ctx.pred.n_children; i++) rs |= ctx.pred.children[i].enc;
+    void (*par_fn)(void*, uint32_t, int64_t, int64_t) = rs ? fpk_par_fn : fpk_par_fn_plain;
+    if (pool) ray_pool_dispatch(pool, par_fn, &ctx, span_rows);
+    else      par_fn(&ctx, 0, 0, span_rows);
     if (zord_hdr) { scratch_free(zord_hdr); ctx.zorder = NULL; }
 
     /* A failed range read (or a cancelled dispatch: skipped tasks noted
      * nothing) is the query's error, never a partial top-k. */
-    ray_t* ferr = ray_scan_fail_finish(&ctx.fail, pool);
+    ray_t* ferr = ray_scan_fail_finish(ctx.fail, pool);
     if (ferr) {
         scratch_free(idx_hdr); scratch_free(hn_hdr);
         fp_pred_cleanup(&ctx.pred);

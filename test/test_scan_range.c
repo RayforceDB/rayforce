@@ -5698,6 +5698,90 @@ static test_result_t test_parted_nullable_stats(void) {
     PASS();
 }
 
+/* Task 17d: a per-partition avg over an expression builds a non-null
+ * count slot only when the expression can yield a null.  `avg`/`sum` of
+ * (strlen c) reads a null cell as length 0 on every grouped route (the
+ * inline strlen), so it keeps the row count; a cast of a null-free integer
+ * to F64 is null-free.  Arithmetic over strlen and var/dev of strlen
+ * (evaluated, a null cell a null length) still count non-nulls.  Answers
+ * equal the same rows in memory, generation 0 and 2. */
+static test_result_t test_parted_expr_null_free(void) {
+    for (int gen = 0; gen <= 2; gen += 2)
+        for (int p = 0; p < 3; p++)
+            sr_evalf_ok("(.db.splayed.set \"" SR_TMP "/ne%d/2024.01.0%d/t/\" "
+                        "(table [g s y z] (list (%% (til 35000) 5) "
+                        "(map (fn [i] (if (== 0 (%% i 4)) \"\" (if (== 0 (%% i 3)) \"abcdef\" \"ab\"))) (til 35000)) "
+                        "(map (fn [i] (if (== 0 (%% i 6)) (as 'SYM \"\") (if (== 0 (%% i 5)) 'xyz 'q))) (til 35000)) "
+                        "(til 35000))) "
+                        "\"" SR_TMP "/ne%d/.sym\" {compress: %s})", gen, p + 1, gen, gen ? "true" : "false");
+    sr_eval_ok("(set jj (concat (til 35000) (concat (til 35000) (til 35000))))");
+    sr_eval_ok("(set M (table [g s y z] (list (% jj 5) "
+               "(map (fn [i] (if (== 0 (% i 4)) \"\" (if (== 0 (% i 3)) \"abcdef\" \"ab\"))) jj) "
+               "(map (fn [i] (if (== 0 (% i 6)) (as 'SYM \"\") (if (== 0 (% i 5)) 'xyz 'q))) jj) jj)))");
+    static const struct { const char* q; int64_t nn; } qs[] = {
+        { "(select {a: (avg (strlen s)) from: T by: g asc: g})", 0 },
+        { "(select {a: (avg (strlen y)) b: (sum (strlen s)) c: (count s) from: T by: g asc: g})", 0 },
+        { "(select {a: (avg (strlen s)) from: T where: (!= s \"\") by: g asc: g})", 0 },
+        { "(select {a: (avg (as 'F64 z)) b: (avg (as 'I64 g)) from: T by: g asc: g})", 0 },
+        { "(select {a: (avg (+ 1 (strlen s))) from: T by: g asc: g})", 3 },   /* one slot per partition */
+        { "(select {v: (var (strlen s)) from: T by: g asc: g})", 3 },
+        { NULL, 0 },
+    };
+    for (int gen = 0; gen <= 2; gen += 2) {
+        char tp[256];
+        snprintf(tp, sizeof tp, "(.db.parted.get \"" SR_TMP "/ne%d\" 't)", gen);
+        for (int i = 0; qs[i].q; i++) {
+            int64_t r0 = ray_group_perpart_runs();
+            int64_t n0 = ray_group_perpart_nn_slots();
+            test_result_t r = sr_same_on("M", tp, qs[i].q, UINT64_MAX);
+            if (r.status != TEST_PASS) return r;
+            TEST_ASSERT_FMT(ray_group_perpart_runs() > r0, "gen %d %s: not the per-partition route", gen, qs[i].q);
+            TEST_ASSERT_FMT(ray_group_perpart_nn_slots() - n0 == qs[i].nn, "gen %d %s: %lld non-null count slots, want %lld",
+                            gen, qs[i].q, (long long)(ray_group_perpart_nn_slots() - n0), (long long)qs[i].nn);
+        }
+    }
+    PASS();
+}
+
+/* Task 17d: a ragged generation-0 table's synthetic null segment is
+ * decided from its statistics, never decoded.  A compare over the column
+ * fills its rows from the all-null rule (the predicate and the count of a
+ * select); the in-place group reads the plain segments where they are and
+ * the stand-in as a fill of nulls.  Answers equal the explicit-null
+ * reference, nothing is decoded or materialized. */
+static test_result_t test_ragged_gen0_no_decode(void) {
+    sr_parted_xy(SR_TMP "/rnd", 0, true, false);
+    sr_parted_xy(SR_TMP "/rnf", 0, false, true);
+    static const char* const q[] = {
+        "(count (select {from: T where: (!= y 0)}))",
+        "(count (select {from: T where: (== y 5)}))",
+        "(count (select {from: T where: (< y 3)}))",
+        "(count (select {from: T where: (<= y 3)}))",
+        "(count (select {from: T where: (> y 3)}))",
+        "(count (select {from: T where: (>= y 3)}))",
+        "(count (select {from: T where: (and (> x 100) (!= y 7))}))",
+        "(select {s: (sum x) from: T where: (< y 50)})",
+        "(select {c: (count y) from: T where: (!= y 0) by: y desc: c take: 5})",
+        "(select {c: (count x) s: (sum x) from: T by: y asc: y take: 3})",
+        "(select {s: (sum y) c: (count y) from: T by: x desc: s take: 3})",
+        "(select {s: (sum x) from: T by: y desc: s take: 4})",
+        NULL,
+    };
+    for (int i = 0; q[i]; i++) {
+        sr_eval_ok("(set T (.db.parted.get \"" SR_TMP "/rnf\" 't))");
+        ray_t* r0 = sr_eval(q[i]);
+        sr_eval_ok("(set T (.db.parted.get \"" SR_TMP "/rnd\" 't))");
+        ray_enc_counters_reset();
+        ray_t* r1 = sr_eval(q[i]);
+        ray_enc_counters_t k; ray_enc_counters_get(&k);
+        TEST_ASSERT_FMT(sr_same_text(r0, r1), "ragged: %s", q[i]);
+        TEST_ASSERT_FMT(k.decoded_bytes == 0 && k.materialized == 0, "%s: %llu bytes decoded, %llu materialized",
+                        q[i], (unsigned long long)k.decoded_bytes, (unsigned long long)k.materialized);
+        sr_drop(r0); sr_drop(r1);
+    }
+    PASS();
+}
+
 const test_entry_t scanrange_entries[] = {
     { "scanrange/walk_gen0_zero_copy",     test_walk_gen0_zero_copy,     sr_setup,    sr_teardown },
     { "scanrange/walk_gen2_vectors",       test_walk_gen2_vectors,       sr_setup,    sr_teardown },
@@ -5824,6 +5908,8 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/no_materialization_parted", test_no_materialization_parted, srr_setup, srr_teardown },
     { "scanrange/count_and",          test_count_and,          srr_setup, srr_teardown },
     { "scanrange/parted_nullable_stats", test_parted_nullable_stats, srr_setup, srr_teardown },
+    { "scanrange/parted_expr_null_free", test_parted_expr_null_free, srr_setup, srr_teardown },
+    { "scanrange/ragged_gen0_no_decode", test_ragged_gen0_no_decode, srr_setup, srr_teardown },
     { "scanrange/const_beside_parted_group", test_const_beside_parted_group, srr_setup, srr_teardown },
     { NULL, NULL, NULL, NULL },
 };

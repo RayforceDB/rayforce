@@ -8498,9 +8498,11 @@ typedef struct {
     bool             staged;
 } da_ctx_t;
 
-/* SYM attrs (width) of agg input a: the piece's when staged. */
-static inline uint8_t da_agg_attrs(const da_ctx_t* c, uint32_t a) {
-    if (c->piece_attrs) return c->piece_attrs[c->n_keys + a];
+/* SYM attrs (width) of agg input a: the piece's when staged.  `staged` is
+ * a compile-time constant in every caller: the plain instances fold the
+ * piece test away. */
+static inline uint8_t da_agg_attrs(const da_ctx_t* c, uint32_t a, const bool staged) {
+    if (staged && c->piece_attrs) return c->piece_attrs[c->n_keys + a];
     return c->agg_cols[a] ? c->agg_cols[a]->attrs : 0;
 }
 
@@ -9634,19 +9636,20 @@ static void scalar_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
  * is the empty string, length 0).  SYM: null is id 0; a FILE-domain entry's
  * length is the u32 prefix in the pinned mapping; anything else resolves
  * as group_strlen_at_cached does. */
-static inline int64_t da_strlen_at(const da_ctx_t* c, uint32_t a, int64_t r, int64_t rr) {
+RAY_INLINE int64_t da_strlen_at(const da_ctx_t* c, uint32_t a, int64_t r, int64_t rr,
+                                const bool staged) {
     const ray_t* col = c->agg_cols[a];
-    if (c->piece_attrs && col->type == RAY_SYM) {
+    if (staged && c->piece_attrs && col->type == RAY_SYM) {
         /* staged context: the id from the piece (row rr); agg_cols[a] is
          * the column or its stand-in, carrying the domain */
-        int64_t sid = ray_read_sym(c->agg_ptrs[a], rr, RAY_SYM, da_agg_attrs(c, a));
+        int64_t sid = ray_read_sym(c->agg_ptrs[a], rr, RAY_SYM, da_agg_attrs(c, a, staged));
         if (sid == 0) return 0;
         if (c->agg_raw_ok && c->agg_raw_ok[a] && sid > 0 && sid < c->agg_raw[a].count) {
             size_t sl;
             (void)ray_sym_domain_raw_str(&c->agg_raw[a], sid, &sl);
             return (int64_t)sl;
         }
-        return sym_strlen_raw(c->agg_ptrs[a], rr, da_agg_attrs(c, a), ray_sym_vec_domain((ray_t*)col));
+        return sym_strlen_raw(c->agg_ptrs[a], rr, da_agg_attrs(c, a, staged), ray_sym_vec_domain((ray_t*)col));
     }
     if (col->type == RAY_STR) {
         const ray_str_t* elems; const char* pool; (void)pool;
@@ -9684,8 +9687,10 @@ static inline bool da_sym_lex_lt(const da_ctx_t* c, uint32_t a_idx, int64_t x, i
 }
 
 /* Row r (absolute: selection, FIRST/LAST order, fused-product terms) is
- * read from the input pieces at rr = r - row_base. */
-static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64_t r, int64_t rr) {
+ * read from the input pieces at rr = r - row_base.  `staged` is constant
+ * per instance (see da_accum_body). */
+RAY_INLINE void da_accum_row_body(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64_t r, int64_t rr,
+                                  const bool staged) {
     uint8_t n_aggs = c->n_aggs;
     acc->count[gid]++;
     size_t base = (size_t)gid * n_aggs;
@@ -9707,7 +9712,7 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
             }
             if (!c->agg_ptrs[a]) continue;
             if (c->agg_strlen && c->agg_strlen[a]) {
-                acc->sum[idx].i = wrap_add_i64(acc->sum[idx].i, da_strlen_at(c, a, r, rr));
+                acc->sum[idx].i = wrap_add_i64(acc->sum[idx].i, da_strlen_at(c, a, r, rr, staged));
                 if (nn) nn[idx]++;
             } else if (f64m & ((uint64_t)1 << a)) {
                 /* NaN payload = null, skip from sum. */
@@ -9719,7 +9724,7 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
                  * INT_MIN value in a HAS_NULLS column is indistinguishable
                  * from a null and is dropped — this is the standard cost of
                  * sentinel-based null encoding for integers. */
-                int64_t v = read_col_i64(c->agg_ptrs[a], rr, c->agg_types[a], da_agg_attrs(c, a));
+                int64_t v = read_col_i64(c->agg_ptrs[a], rr, c->agg_types[a], da_agg_attrs(c, a, staged));
                 if (RAY_LIKELY(!((inm >> a) & 1) || v != c->agg_int_null_sentinel[a])) {
                     if (acc->sum_hi) ray_i128_add(&acc->sum_hi[idx], (uint64_t*)&acc->sum[idx].i, v);
                     else acc->sum[idx].i = wrap_add_i64(acc->sum[idx].i, v);
@@ -9758,10 +9763,10 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
             fv = prod_val_f64(&c->agg_prod[a], r);
             iv = (int64_t)fv;
         } else if (c->agg_strlen && c->agg_strlen[a]) {
-            iv = da_strlen_at(c, a, r, rr);
+            iv = da_strlen_at(c, a, r, rr, staged);
             fv = (double)iv;
         } else {
-            da_read_val(c->agg_ptrs[a], c->agg_types[a], da_agg_attrs(c, a), rr, &fv, &iv);
+            da_read_val(c->agg_ptrs[a], c->agg_types[a], da_agg_attrs(c, a, staged), rr, &fv, &iv);
         }
         uint16_t op = c->agg_ops[a];
         bool is_f = group_fp_type(c->agg_types[a]);
@@ -9878,9 +9883,29 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
     if (last_advanced)  acc->last_row[gid]  = r;
 }
 
-static void da_accum_body(da_ctx_t* c, uint32_t worker_id, int64_t start, int64_t end) {
+/* The row step, out of line once per instance (as before range reads):
+ * the plain one reads whole columns with no piece widths. */
+static void da_accum_row_plain(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64_t r, int64_t rr) {
+    da_accum_row_body(c, acc, gid, r, rr, false);
+}
+
+static void da_accum_row_staged(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64_t r, int64_t rr) {
+    da_accum_row_body(c, acc, gid, r, rr, true);
+}
+
+RAY_INLINE void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64_t r, int64_t rr,
+                             const bool staged) {
+    if (staged) da_accum_row_staged(c, acc, gid, r, rr);
+    else        da_accum_row_plain(c, acc, gid, r, rr);
+}
+
+/* One body, two instances: da_accum_plain (whole columns: rb folds to 0
+ * and the piece widths drop out, the pre-range-read codegen) and
+ * da_accum_staged (a piece of the R-WALK, rows read at r - row_base). */
+RAY_INLINE void da_accum_body(da_ctx_t* c, uint32_t worker_id, int64_t start, int64_t end,
+                              const bool staged) {
     da_accum_t* acc = &c->accums[worker_id];
-    const int64_t rb = c->row_base;   /* pieces: rows are read at r - rb */
+    const int64_t rb = staged ? c->row_base : 0;   /* pieces: rows are read at r - rb */
     uint8_t n_aggs = c->n_aggs;
     uint8_t n_keys = c->n_keys;
     const int64_t* match_idx = c->match_idx;
@@ -9908,7 +9933,7 @@ static void da_accum_body(da_ctx_t* c, uint32_t worker_id, int64_t start, int64_
             } \
             int64_t kv = (int64_t)KCAST kp[r - rb]; \
             if (c->key_types[0] == RAY_SYM && kv == 0) kv = kmin; \
-            da_accum_row(c, acc, (int32_t)(kv - kmin), r, r - rb); \
+            da_accum_row(c, acc, (int32_t)(kv - kmin), r, r - rb, staged); \
         } \
     } while (0)
 
@@ -9949,7 +9974,7 @@ static void da_accum_body(da_ctx_t* c, uint32_t worker_id, int64_t start, int64_
                 __builtin_prefetch(&acc->count[pf_gid], 1, 1); \
                 if (acc->sum) __builtin_prefetch(&acc->sum[(size_t)pf_gid * n_aggs], 1, 1); \
             } \
-            da_accum_row(c, acc, GID_FN(r - rb), r, r - rb); \
+            da_accum_row(c, acc, GID_FN(r - rb), r, r - rb, staged); \
         } \
     } while (0)
 
@@ -10014,6 +10039,14 @@ static void da_accum_body(da_ctx_t* c, uint32_t worker_id, int64_t start, int64_
     #undef DA_PF_DIST
 }
 
+static void da_accum_plain(da_ctx_t* c, uint32_t worker_id, int64_t start, int64_t end) {
+    da_accum_body(c, worker_id, start, end, false);
+}
+
+static void da_accum_staged(da_ctx_t* c, uint32_t worker_id, int64_t start, int64_t end) {
+    da_accum_body(c, worker_id, start, end, true);
+}
+
 typedef void (*da_body_fn)(da_ctx_t*, uint32_t, int64_t, int64_t);
 typedef struct {
     da_ctx_t*  c;
@@ -10063,7 +10096,9 @@ static void da_run_staged(da_ctx_t* c, uint32_t wid, int64_t start, int64_t end,
 }
 
 static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
-    da_run_staged((da_ctx_t*)ctx, worker_id, start, end, da_accum_body);
+    da_ctx_t* c = (da_ctx_t*)ctx;
+    if (!c->staged) { da_accum_plain(c, worker_id, start, end); return; }
+    da_run_staged(c, worker_id, start, end, da_accum_staged);
 }
 
 /* ---- slot-partitioned accumulate --------------------------------------
@@ -10131,7 +10166,7 @@ static void da_part_drain_fn(void* raw, uint32_t wid, int64_t start, int64_t end
         const da_bucket_t* b = &p->buckets[(size_t)w * p->k + t];
         for (int64_t j = 0; j < b->len; j++) {
             int64_t r = b->data[j];
-            da_accum_row(c, acc, da_composite_gid(c, r), r, r);
+            da_accum_row(c, acc, da_composite_gid(c, r), r, r, false);
         }
     }
 }
@@ -10845,6 +10880,84 @@ static ray_t* group_eval_part_expr(ray_graph_t* g, ray_t* parted_tbl,
 
 static int g_group_test_route;   /* defined with ray_group_test_route below */
 
+/* A ragged partition's synthetic all-null segment `sg` (ray_read_parted's
+ * stand-in for a column the partition lacks) as a plain vector: its
+ * published materialization, or, known all null, a fill of the type's null
+ * (never a decode).  NULL: not a synthetic segment, or a type without a
+ * fixed width (the caller reads sg as it is); else an owned vector or error. */
+static ray_t* grp_synth_plain(ray_t* sg) {
+    if (!sg || sg->type != RAY_ENCCOL || !ray_enccol_is_synthetic(sg) || ray_enccol_is_parted(sg)) return NULL;
+    ray_t* pk = ray_enccol_decoded_peek(sg);
+    if (pk) { ray_retain(pk); return pk; }
+    ray_col_meta_t sm;
+    if (!ray_col_meta_of(sg, &sm)) return NULL;
+    int8_t base = sm.type;
+    switch (base) {
+    case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
+    case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: case RAY_F32: case RAY_F64: case RAY_SYM:
+        break;
+    default:
+        return NULL;
+    }
+    int64_t rows = sm.len;
+    ray_t* f = base == RAY_SYM ? ray_sym_vec_new(sm.attrs & RAY_SYM_W_MASK, rows > 0 ? rows : 1)
+                               : ray_vec_new(base, rows > 0 ? rows : 1);
+    if (!f || RAY_IS_ERR(f)) return f ? f : ray_error("oom", NULL);
+    f->len = rows;
+    void* p = ray_data(f);
+    switch (base) {
+    case RAY_F64: for (int64_t r = 0; r < rows; r++) ((double*)p)[r] = NULL_F64; break;
+    case RAY_F32: for (int64_t r = 0; r < rows; r++) ((float*)p)[r] = NULL_F32; break;
+    case RAY_I64: case RAY_TIMESTAMP: for (int64_t r = 0; r < rows; r++) ((int64_t*)p)[r] = NULL_I64; break;
+    case RAY_I32: case RAY_DATE: case RAY_TIME: for (int64_t r = 0; r < rows; r++) ((int32_t*)p)[r] = NULL_I32; break;
+    case RAY_I16: for (int64_t r = 0; r < rows; r++) ((int16_t*)p)[r] = NULL_I16; break;
+    default:      memset(p, 0, (size_t)rows * ray_sym_elem_size(base, f->attrs)); break;  /* SYM id 0, BOOL/U8 0 */
+    }
+    /* the materialization's attrs: HAS_NULLS on every nullable type */
+    if (base != RAY_BOOL && base != RAY_U8 && rows > 0) f->attrs |= RAY_ATTR_HAS_NULLS;
+    if (base == RAY_SYM) {
+        /* the stand-in's domain: the db's, the one every partition resolves over */
+        ray_col_src_t ss;
+        ray_t* be = ray_col_src_bind(sg, &ss);
+        if (be) { ray_release(f); return be; }
+        if (ss.dom && ss.dom != ray_sym_runtime_domain()) { ray_sym_domain_retain(ss.dom); f->sym_domain = ss.dom; }
+        ray_col_src_release(&ss);
+    }
+    return f;
+}
+
+/* A generation-0 ragged column (a RAY_ENCCOL_PARTED whose only encoded
+ * segments are synthetic stand-ins) as a plain parted wrapper for the
+ * in-place group: the plain segments as they are, each stand-in as
+ * grp_synth_plain's vector.  The group then reads every segment in place on
+ * the plain loops, as a column with no ragged partition does.  NULL: not
+ * such a column, or a stand-in of a type grp_synth_plain leaves (the slot
+ * is grouped as it is); else an owned wrapper or error. */
+static ray_t* grp_ragged_plain(ray_t* slot) {
+    if (!slot || slot->type != RAY_ENCCOL || !ray_enccol_is_parted(slot) ||
+        !ray_enccol_is_synthetic(slot)) return NULL;
+    ray_col_meta_t m;
+    if (!ray_col_meta_of(slot, &m) || !RAY_IS_PARTED(m.type)) return NULL;
+    int64_t ns = m.n_segs;
+    ray_t* w = ray_alloc((size_t)(ns > 0 ? ns : 1) * sizeof(ray_t*));
+    if (!w || RAY_IS_ERR(w)) return w ? w : ray_error("oom", NULL);
+    w->type = m.type;
+    w->len = ns;
+    w->attrs = 0;
+    memset(w->aux, 0, 16);
+    ray_t** segs = (ray_t**)ray_data(w);
+    memset(segs, 0, (size_t)(ns > 0 ? ns : 1) * sizeof(ray_t*));
+    for (int64_t i = 0; i < ns; i++) {
+        ray_t* sg = ray_enccol_seg(slot, i);
+        if (!sg) continue;
+        if (sg->type != RAY_ENCCOL) { ray_retain(sg); segs[i] = sg; continue; }
+        ray_t* f = grp_synth_plain(sg);
+        if (!f || RAY_IS_ERR(f)) { ray_release(w); return f; }   /* NULL: the slot as it is */
+        segs[i] = f;
+    }
+    return w;
+}
+
 /* The in-place concat's eligibility: v2 groups the parted columns from
  * their segments (every source staged, R-WALK through every SCAN site).
  * Every key a scan of a parted fixed-width integer, temporal or SYM column;
@@ -11216,7 +11329,11 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
             if (!e2 || e2->base.opcode != OP_SCAN) continue;               /* a count without input */
             ray_col_meta_t dm;
             if (ray_table_col_meta(in_place, e2->sym, &dm)) continue;      /* already added */
-            in_place = ray_table_add_col(in_place, e2->sym, ray_table_slot(parted_tbl, e2->sym));
+            ray_t* slot = ray_table_slot(parted_tbl, e2->sym);
+            ray_t* plain = grp_ragged_plain(slot);
+            if (plain && RAY_IS_ERR(plain)) { ray_release(in_place); return plain; }
+            in_place = ray_table_add_col(in_place, e2->sym, plain ? plain : slot);
+            if (plain) ray_release(plain);
             if (!in_place || RAY_IS_ERR(in_place)) return in_place ? in_place : ray_error("oom", NULL);
         }
         atomic_fetch_add_explicit(&ray_group_segstream_runs_ctr, 1, memory_order_relaxed);
@@ -18716,6 +18833,53 @@ static bool pp_input_null_free(ray_t* parted_tbl, int64_t sym, int32_t n_parts) 
     return true;
 }
 
+/* The per-partition expression input `op` (a node of g over the parted
+ * table) yields no null when its inputs hold none.  A column scan is
+ * pp_input_null_free; strlen is null-free over a null-free input; a cast of
+ * a null-free integer to I64 or F64 is exact.  Everything else counts as
+ * nullable: integer arithmetic surfaces an overflow as null, float
+ * arithmetic can make a NaN, a division a null. */
+static bool pp_expr_null_free(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
+                              int32_t n_parts, int depth) {
+    if (!op || depth > 8) return false;
+    switch (op->opcode) {
+    case OP_SCAN: {
+        ray_op_ext_t* x = find_ext(g, op->id);
+        return x && pp_input_null_free(parted_tbl, x->sym, n_parts);
+    }
+    case OP_STRLEN:
+        return op->arity == 1 &&
+               pp_expr_null_free(g, op_child(g, op, 0), parted_tbl, n_parts, depth + 1);
+    case OP_CAST: {
+        ray_op_t* in = op->arity == 1 ? op_child(g, op, 0) : NULL;
+        if (!in || (op->out_type != RAY_I64 && op->out_type != RAY_F64)) return false;
+        int8_t t = in->out_type;
+        if (t != RAY_BOOL && t != RAY_U8 && t != RAY_I16 && t != RAY_I32 && t != RAY_I64)
+            return false;
+        return pp_expr_null_free(g, in, parted_tbl, n_parts, depth + 1);
+    }
+    default:
+        return false;
+    }
+}
+
+/* AVG input a of the per-partition group counts every row: a column known
+ * null-free, an expression that is (pp_expr_null_free), or (strlen c) of a
+ * column scan, which every grouped route aggregates inline with a null cell
+ * as length 0 (try_strlen_sumavg_input); its evaluated null is a 0 in the
+ * partition's SUM as well. */
+static bool pp_avg_counts_rows(ray_graph_t* g, ray_op_ext_t* ext, uint32_t a,
+                               const uint8_t* agg_is_expr, const int64_t* agg_syms,
+                               ray_t* parted_tbl, int32_t n_parts) {
+    if (!agg_is_expr[a]) return pp_input_null_free(parted_tbl, agg_syms[a], n_parts);
+    ray_op_t* in = op_node(g, ext->agg_ins[a]);
+    if (in && in->opcode == OP_STRLEN && in->arity == 1) {
+        ray_op_t* c = op_child(g, in, 0);
+        if (c && c->opcode == OP_SCAN) return true;
+    }
+    return pp_expr_null_free(g, in, parted_tbl, n_parts, 0);
+}
+
 /* --------------------------------------------------------------------------
  * exec_group_per_partition — per-partition GROUP BY with merge
  *
@@ -18961,16 +19125,19 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
     /* Append the count of each AVG column, then of each STDDEV/VAR column.
      * OP_COUNT counts rows, nulls included, while SUM(x) and SUM(x²) skip
      * nulls (#767): an input that may hold a null counts its non-nulls, a
-     * SUM over its not-null indicator (built per partition below).  A column
-     * input whose every segment is null-free keeps the row count. */
+     * SUM over its not-null indicator (built per partition below).  An input
+     * that cannot hold one (a null-free column, an expression over null-free
+     * columns that yields none, an AVG of strlen) keeps the row count. */
     for (uint32_t i = 0; i < n_avg; i++) {
         uint32_t a = avg_idx[i];
-        cnt_nn[i] = agg_is_expr[a] || !pp_input_null_free(parted_tbl, agg_syms[a], n_parts);
+        cnt_nn[i] = !pp_avg_counts_rows(g, ext, a, agg_is_expr, agg_syms, parted_tbl, n_parts);
         part_ops[part_n_aggs++] = cnt_nn[i] ? OP_SUM : OP_COUNT;
     }
     for (uint32_t i = 0; i < n_std; i++) {
         uint32_t a = std_idx[i];
-        cnt_nn[n_avg + i] = agg_is_expr[a] || !pp_input_null_free(parted_tbl, agg_syms[a], n_parts);
+        cnt_nn[n_avg + i] = agg_is_expr[a]
+            ? !pp_expr_null_free(g, op_node(g, ext->agg_ins[a]), parted_tbl, n_parts, 0)
+            : !pp_input_null_free(parted_tbl, agg_syms[a], n_parts);
         std_cnt_slot[i] = part_n_aggs;
         part_ops[part_n_aggs++] = cnt_nn[n_avg + i] ? OP_SUM : OP_COUNT;
     }
@@ -19135,9 +19302,12 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                 ray_t* seg = ray_table_parted_seg(parted_tbl, borrow_syms[j], p);
                 if (!seg) { pp_release_sub(g, sub); goto batch_fail; }
                 if (part_nrows < 0) part_nrows = seg->len;
-                ray_retain(seg);
-                sub = ray_table_add_col(sub, borrow_syms[j], seg);
-                ray_release(seg);
+                /* a ragged partition's synthetic segment: its nulls in place */
+                ray_t* fill = grp_synth_plain(seg);
+                if (fill && RAY_IS_ERR(fill)) { ray_error_free(fill); pp_release_sub(g, sub); goto batch_fail; }
+                if (!fill) ray_retain(seg);
+                sub = ray_table_add_col(sub, borrow_syms[j], fill ? fill : seg);
+                ray_release(fill ? fill : seg);
             }
 
             /* Materialize expression keys / agg inputs over this partition.

@@ -1858,6 +1858,38 @@ static void expr_exec_unary(uint8_t opcode, uint8_t null_aware, int8_t dt, void*
     }
 }
 
+/* Encoded register r's rows [start, start + n) inside one directory chunk
+ * whose every row is null: fill dst with what the decode and expr_load_*
+ * would give (the widened null, or the raw sentinel for a register compiled
+ * null-free) and return true, reading no payload.  False: not such a chunk,
+ * or a type this does not cover (the range read runs). */
+static bool expr_enc_null_fill(const ray_expr_t* expr, uint8_t r, int64_t start, int64_t n, void* dst) {
+    const __typeof__(expr->regs[0])* rg = &expr->regs[r];
+    if ((start >> 16) != ((start + n - 1) >> 16)) return false;
+    int8_t ct = rg->col_type, rt = rg->type;
+    int64_t raw;
+    switch (ct) {
+    case RAY_I64: case RAY_TIMESTAMP:           raw = NULL_I64; break;
+    case RAY_I32: case RAY_DATE: case RAY_TIME: raw = NULL_I32; break;
+    case RAY_I16:                               raw = NULL_I16; break;
+    case RAY_F64: case RAY_F32:                 raw = 0; break;
+    default: return false;
+    }
+    ray_enc_chunk_stat_t st;
+    if (!ray_col_src_chunk_stat(rg->src, start >> 16, &st) || st.rows <= 0 ||
+        (int64_t)st.null_count != st.rows) return false;
+    bool fl = ct == RAY_F64 || ct == RAY_F32;
+    if (rt == RAY_F64) {
+        double v = fl || rg->nullable ? NULL_F64 : (double)raw;
+        for (int64_t j = 0; j < n; j++) ((double*)dst)[j] = v;
+        return true;
+    }
+    if (rt != RAY_I64 || fl) return false;
+    int64_t v = rg->nullable ? NULL_I64 : raw;
+    for (int64_t j = 0; j < n; j++) ((int64_t*)dst)[j] = v;
+    return true;
+}
+
 /* Evaluate compiled expression for morsel [start, end).
  * scratch: array of EXPR_MAX_REGS buffers, each EXPR_MORSEL*8 bytes.
  * rsc: one range scratch per register index, NULL when no register is
@@ -1891,6 +1923,10 @@ static void* expr_eval_morsel(const ray_expr_t* expr, void** scratch,
                      * piece by piece into this register's scratch */
                     int64_t at = 0;
                     rptrs[r] = scratch[r];
+                    /* a morsel inside an all-null directory chunk (a ragged
+                     * partition's synthetic segment) loads as the nulls the
+                     * decode would give, without decoding */
+                    if (expr_enc_null_fill(expr, r, start, n, scratch[r])) continue;
                     /* a narrow integer register over one whole vector is
                      * widened straight from the packed values into the
                      * register (no range scratch, no expr_load pass) */
@@ -2017,6 +2053,21 @@ static int zone_cmp_decision(const ray_index_t* ix, int64_t ch,
     return d < 0 ? ZT_MIXED : d;
 }
 
+/* (null cmp_op cval) for a chunk whose every row is null (a ragged
+ * partition's synthetic segment, an all-null chunk): every lane loads as
+ * NULL_I64, and both the null-aware and the plain i64 kernels give one
+ * answer for it, decided by whether cval is itself NULL_I64. */
+static int zone_all_null_decision(uint16_t cmp_op, int64_t cval) {
+    bool cn = cval == NULL_I64;
+    switch (cmp_op) {
+    case OP_EQ: case OP_GE: return cn ? 1 : 0;
+    case OP_NE: case OP_LT: return cn ? 0 : 1;
+    case OP_LE:             return 1;
+    case OP_GT:             return 0;
+    default:                return ZT_MIXED;
+    }
+}
+
 /* Directory-statistics twin of zone_cmp_decision for a generation-2
  * register: chunk ch of its bound source (a single file, or the encoded
  * segment a parted register is rebound to; the morsel rows are the
@@ -2026,6 +2077,7 @@ static int zone_dir_decision(const ray_col_src_t* src, int64_t ch, uint16_t cmp_
     ray_enc_chunk_stat_t st;
     if (!ray_col_src_chunk_stat(src, ch, &st)) return ZT_MIXED;
     bool all_null = (int64_t)st.null_count == st.rows;
+    if (all_null && st.rows > 0) return zone_all_null_decision(cmp_op, cval);
     int d = zone_cmp_core(st.min, st.max, st.has_minmax, st.null_count > 0, all_null, cmp_op, cval);
     return d < 0 ? ZT_MIXED : d;
 }
