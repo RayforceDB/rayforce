@@ -364,3 +364,12 @@ CNT9 -- 6
 (set fg9 (mkg9 "!"))
 (at (select {r: (fg9 name) e: (reverse s) from: TC9}) 'r) -- ["a!" "b!"]
 (at (select {r: (fg9 name) from: TC9}) 'r) -- ["a!" "b!"]
+;; a closure can be the key too, pure or not; its capture is never a column
+(set mkk9 (fn [c] (fn [v] (% v c))))
+(set kk9 (mkk9 7))
+(at (select {n: (count v) by: (kk9 v) from: TB9}) 'v) -- [1 2 3 6]
+(set CNT9 0)
+(set mki9 (fn [c] (fn [v] (set CNT9 (+ CNT9 1)) (% v c))))
+(set ki9 (mki9 7))
+(at (select {n: (count v) by: (ki9 v) from: TB9}) 'v) -- [1 2 3 6]
+CNT9 -- 6
