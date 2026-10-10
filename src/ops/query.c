@@ -9466,7 +9466,17 @@ static ray_t* select_parted_first_rows(ray_t* dict, ray_t* tbl, bool aliases_res
     static const char* const clause[] = { "by", "asc", "desc" };
     for (int i = 0; i < 3; i++) {
         ray_t* v = dict_get(dict, clause[i]);
-        if (v) nref = collect_col_refs_set(v, tbl, refs, (int)nc, nref);
+        if (!v) continue;
+        /* A quoted symbol standing for the whole clause names a column
+         * there too (`by: 's`, `desc: 'h`); collect_col_refs_set takes
+         * only name references. */
+        if (v->type == -RAY_SYM && (v->attrs & ATTR_QUOTED)) {
+            bool seen = !ray_table_get_col(tbl, v->i64);
+            for (int j = 0; j < nref && !seen; j++) if (refs[j] == v->i64) seen = true;
+            if (!seen && nref < nc) refs[nref++] = v->i64;
+        } else {
+            nref = collect_col_refs_set(v, tbl, refs, (int)nc, nref);
+        }
     }
     keynames[nkn++] = ray_sym_intern("key", 3);
     keynames[nkn++] = derived_key_name(by_expr);

@@ -391,6 +391,12 @@
 (set Vck7 [1 1 2 2 3 3 3])
 (select {by: Vck7 from: Pck}) -- (select {by: Vck7 from: Mck})
 (select {by: x from: Pck take: [1 2]}) -- (select {by: x from: Mck take: [1 2]})
+;; a quoted symbol naming the key or the sort column is that column too
+(select {by: 's from: Pck}) -- (select {by: 's from: Mck})
+(select {by: 'r from: Pck}) -- (select {by: 'r from: Mck})
+(select {by: 'date from: Pck}) -- (select {by: 'date from: Mck})
+(select {by: s from: Pck desc: 'y}) -- (select {by: s from: Mck desc: 'y})
+(select {by: s from: Pck asc: 'r take: 2}) -- (select {by: s from: Mck asc: 'r take: 2})
 (.sys.exec "rm -rf /tmp/rfl_ckparted")
 ;; a column named as a computed key is (`key`) is read for real, not taken
 ;; for a row number: the key replaces it in the result
