@@ -245,6 +245,47 @@ static test_result_t test_closure_malformed_capture(void) {
     PASS();
 }
 
+/* A lazy handle passed through the C API to a compiled closure maker reaches
+ * the maker's parameter slot unmaterialized (Rayfall call sites materialize
+ * lazy arguments, call_lambda does not).  The closure must capture the
+ * concrete value: a lazy handle is single-use, and a dict holding the
+ * handle would fail the closure's second call. */
+static test_result_t test_closure_lazy_capture_vm(void) {
+    ray_t* mk = ray_eval_str("(fn [v] (fn [] (at v 0)))");
+    TEST_ASSERT_NOT_NULL(mk);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(mk));
+    /* A lazy handle over a constant vector, as a deferred DAG result is. */
+    ray_t* vec = ray_eval_str("[1 2 3]");
+    TEST_ASSERT_NOT_NULL(vec);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+    ray_graph_t* g = ray_graph_new(NULL);
+    TEST_ASSERT_NOT_NULL(g);
+    ray_t* lazy = ray_lazy_wrap(g, ray_graph_input_vec(g, vec));
+    TEST_ASSERT_NOT_NULL(lazy);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(lazy));
+    TEST_ASSERT(ray_is_lazy(lazy), "the argument must be a lazy handle");
+    ray_t* args[1] = { lazy };
+    ray_t* clo = call_lambda(mk, args, 1);
+    TEST_ASSERT_NOT_NULL(clo);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(clo));
+    TEST_ASSERT_EQ_I(clo->type, RAY_LAMBDA);
+    TEST_ASSERT(LAMBDA_IS_COMPILED(mk), "the maker compiles on its first call");
+    TEST_ASSERT(LAMBDA_IS_COMPILED(clo), "a closure made by compiled code is born compiled");
+    for (int i = 0; i < 3; i++) {
+        ray_t* r = call_lambda(clo, NULL, 0);
+        TEST_ASSERT_NOT_NULL(r);
+        TEST_ASSERT_FMT(!RAY_IS_ERR(r), "call %d of a closure over a lazy capture failed: %s", i + 1, ray_err_code(r));
+        TEST_ASSERT_EQ_I(r->type, -RAY_I64);
+        TEST_ASSERT_EQ_I(r->i64, 1);
+        ray_release(r);
+    }
+    ray_release(clo);
+    ray_release(lazy);
+    ray_release(vec);
+    ray_release(mk);
+    PASS();
+}
+
 /* ---- Dummy function for testing ---- */
 static ray_t* dummy_unary(ray_t* x) { return ray_retain(x), x; }
 static ray_t* dummy_binary(ray_t* x, ray_t* y) { (void)y; return ray_retain(x), x; }
@@ -10037,6 +10078,7 @@ const test_entry_t lang_entries[] = {
     { "lang/zone_sym_diagnostic", test_eval_zone_sym_diagnostic, lang_setup, lang_teardown },
     { "lang/query_helper_reinit", test_query_helper_reinit, lang_setup, lang_teardown },
     { "lang/closure_malformed_capture", test_closure_malformed_capture, lang_setup, lang_teardown },
+    { "lang/closure_lazy_capture_vm", test_closure_lazy_capture_vm, lang_setup, lang_teardown },
     { "lang/io/read_procfs_zero_size", test_read_procfs_reports_zero_size, lang_setup, lang_teardown },
     { "lang/io/read_unsized_bounded", test_read_unsized_stream_is_bounded, lang_setup, lang_teardown },
     { "lang/io/exec_capture_bounded", test_exec_capture_is_bounded, lang_setup, lang_teardown },

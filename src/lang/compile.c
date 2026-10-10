@@ -840,16 +840,42 @@ static ray_t *closure_capture_names(ray_t *lambda) {
 static bool compile_fn_template(compiler_t *c, ray_t *ast) {
     ray_t **elems = (ray_t**)ray_data(ast);
     int64_t n = ray_len(ast);
+    /* Parameters: a SYM vector; `[]` parses as an empty vector of another
+     * type and a list of symbol atoms can occur too, both normalized to a
+     * SYM vector here. */
     ray_t *params = elems[1];
-    if (!params || params->type != RAY_SYM) return false;
+    if (!params) return false;
+    bool own_params = false;
+    if (params->len == 0 && params->type != RAY_SYM && params->type > 0) {
+        ray_t *pv = ray_sym_vec_new(RAY_SYM_W64, 1);
+        if (!pv || RAY_IS_ERR(pv)) return false;
+        pv->len = 0;
+        params = pv;
+        own_params = true;
+    } else if (params->type == RAY_LIST) {
+        ray_t **pe = (ray_t**)ray_data(params);
+        for (int64_t i = 0; i < params->len; i++)
+            if (!pe[i] || pe[i]->type != -RAY_SYM) return false;
+        ray_t *pv = ray_sym_vec_new(RAY_SYM_W64, params->len > 0 ? params->len : 1);
+        if (!pv || RAY_IS_ERR(pv)) return false;
+        for (int64_t i = 0; i < params->len; i++) ((int64_t*)ray_data(pv))[i] = pe[i]->i64;
+        pv->len = params->len;
+        params = pv;
+        own_params = true;
+    } else if (params->type != RAY_SYM) {
+        return false;
+    }
     for (int64_t i = 0; i < params->len; i++)
-        if (ray_sym_is_reserved(ray_read_sym(ray_data(params), i, RAY_SYM, params->attrs))) return false;
+        if (ray_sym_is_reserved(ray_read_sym(ray_data(params), i, RAY_SYM, params->attrs))) {
+            if (own_params) ray_release(params);
+            return false;
+        }
 
     ray_t *mentioned = ray_vec_new(RAY_I64, 16);
-    if (!mentioned || RAY_IS_ERR(mentioned)) return false;
+    if (!mentioned || RAY_IS_ERR(mentioned)) { if (own_params) ray_release(params); return false; }
     bool dynamic = false, ok = true;
     for (int64_t i = 2; i < n && ok; i++) ok = ast_collect_syms(elems[i], &mentioned, &dynamic);
-    if (!ok) { ray_release(mentioned); return false; }
+    if (!ok) { ray_release(mentioned); if (own_params) ray_release(params); return false; }
 
     /* Capture names and the enclosing slots they come from, in slot order. */
     ray_t *names = ray_sym_vec_new(RAY_SYM_W64, c->n_locals > 0 ? c->n_locals : 1);
@@ -858,6 +884,7 @@ static bool compile_fn_template(compiler_t *c, ray_t *ast) {
         ray_release(mentioned);
         if (names && !RAY_IS_ERR(names)) ray_release(names);
         if (slots && !RAY_IS_ERR(slots)) ray_release(slots);
+        if (own_params) ray_release(params);
         return false;
     }
     names->len = 0; slots->len = 0;
@@ -878,6 +905,7 @@ static bool compile_fn_template(compiler_t *c, ray_t *ast) {
     ray_t *tmpl = ray_alloc(LAMBDA_SLOTS * sizeof(ray_t*));
     if (!body || RAY_IS_ERR(body) || !tmpl || RAY_IS_ERR(tmpl)) {
         ray_release(names); ray_release(slots);
+        if (own_params) ray_release(params);
         if (body && !RAY_IS_ERR(body)) { body->type = RAY_LIST; body->len = 0; ray_release(body); }
         if (tmpl && !RAY_IS_ERR(tmpl)) { tmpl->type = RAY_LAMBDA; memset(ray_data(tmpl), 0, LAMBDA_SLOTS * sizeof(ray_t*)); ray_release(tmpl); }
         return false;
@@ -889,7 +917,7 @@ static bool compile_fn_template(compiler_t *c, ray_t *ast) {
     tmpl->attrs = 0;
     tmpl->len = 0;
     memset(ray_data(tmpl), 0, LAMBDA_SLOTS * sizeof(ray_t*));
-    ray_retain(params);
+    if (!own_params) ray_retain(params);   /* a fresh vector is owned already */
     LAMBDA_PARAMS(tmpl) = params;
     LAMBDA_BODY(tmpl) = body;
     if (c->lambda && LAMBDA_NFO(c->lambda)) { ray_retain(LAMBDA_NFO(c->lambda)); LAMBDA_NFO(tmpl) = LAMBDA_NFO(c->lambda); }

@@ -118,12 +118,6 @@
 (set b2 (mkb 2))
 (list (b1 1) (b2 1)) -- [3 5]
 (< (- (.mem.objsize (list b1 b2)) (.mem.objsize b1)) 600) -- true
-;; also when the lazy reaches the maker through a compiled call, so that the
-;; parameter slot itself holds the handle
-(set mkl (fn [v] (fn [] (at v 0))))
-(set outl (fn [xs] (mkl (asc xs))))
-(set c3 (outl [3 1 2]))
-(list (c3) (c3)) -- [1 1]
 ;; a lazy value captured by interpreted code is materialized as well
 (set c2 (do (let v (asc [3 1 2])) (fn [] (at v 0))))
 (list (c2) (c2)) -- [1 1]

@@ -3240,9 +3240,12 @@ op_mkclosure: {
      * count, and captures the current frame's slots named by `names`, with
      * their row flags, which apply while the innermost query frame is the
      * one of now.  A slot still empty (its `let` has not run) is not
-     * captured, as the tree walker would not bind it either.  A lazy slot
-     * is captured as is: every read of it (OP_LOADENV) materializes into
-     * the reading frame's slot and the dict's handle stays usable. */
+     * captured, as the tree walker would not bind it either; a lazy slot
+     * is materialized first, into the slot too: a lazy handle is single-use
+     * (materializing frees its graph in place), and the dict would hold a
+     * dead handle after the closure's first call.  Rayfall text does not
+     * reach here with one (call sites materialize lazy arguments), but a
+     * caller of the C API can. */
     ray_t *slots = POP();
     ray_t *names = POP();
     ray_t *tmpl  = POP();
@@ -3272,6 +3275,17 @@ op_mkclosure: {
         if (slot < 0 || slot >= n_locals) continue;
         ray_t *v = LOCAL(slot);
         if (!v) continue;
+        if (ray_is_lazy(v)) {
+            v = ray_lazy_materialize(v);   /* consumes the slot's ref */
+            LOCAL(slot) = v && !RAY_IS_ERR(v) ? v : NULL;
+            if (!v || RAY_IS_ERR(v)) {
+                ray_release(keys); ray_release(vals); ray_release(flags);
+                lam->type = -RAY_I64; ray_release(lam);
+                ray_release(slots); ray_release(names); ray_release(tmpl);
+                vm_err_obj = v ? v : ray_error("type", NULL);
+                goto vm_error;
+            }
+        }
         ((int64_t*)ray_data(keys))[keys->len++] = ray_read_sym(ray_data(names), i, RAY_SYM, names->attrs);
         vals = ray_list_append(vals, v);
         uint8_t r = LROWS(slot) == 1 ? 1 : 0;
