@@ -13085,6 +13085,10 @@ by_dict_done:
                 key_sym = by_expr->i64;
             else if (by_expr->type == RAY_SYM && ray_len(by_expr) == 1)
                 key_sym = ((int64_t*)ray_data(by_expr))[0];
+            /* So must a name that is no column of the table (a global
+             * vector): the grouping above evaluated it as an expression. */
+            if (key_sym >= 0 && !ray_table_get_col(filtered_tbl, key_sym))
+                key_sym = -1;
 
             if (n_groups == 0) {
                 ray_release(grouped);

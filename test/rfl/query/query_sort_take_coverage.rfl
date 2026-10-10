@@ -306,3 +306,21 @@
 (select {by: ((fn [a] (concat a 99)) x) from: Tckk}) !- length
 ;; one value is one group, holding the first row
 (select {by: ((fn [a] [7]) x) from: Tcks}) -- (table [x r] (list [7] (list "c-long-string-over-12")))
+;; a name that is no column (a global vector) is grouped by its values, as
+;; the with-output and by-dict forms group it.  The branch took it for a
+;; column and dereferenced the NULL its lookup returned.
+(set Tckg (table [x y] (list [3 1 4 2] [30 10 40 20])))
+(set Vck1 [7])
+(set Vck4 [1 1 2 2])
+(set VckL (list [1] [1] [2] [2]))
+(select {by: Vck1 from: Tckg}) -- (table [Vck1 x y] (list [7] [3] [30]))
+(select {by: Vck4 from: Tckg}) -- (table [Vck4 x y] (list [1 2] [3 4] [30 40]))
+(value (select {by: Vck4 from: Tckg})) -- (value (select {by: {k: Vck4} from: Tckg}))
+(at (select {by: Vck4 from: Tckg}) 'Vck4) -- (first (value (select {c: (count y) by: Vck4 from: Tckg})))
+(select {by: Vck4 from: Tckg desc: y take: 1}) -- (table [Vck4 x y] (list [2] [4] [40]))
+(select {by: Vck1 from: Tckg where: (> y 15)}) -- (table [Vck1 x y] (list [7] [3] [30]))
+(key (select {by: Vck1 from: Tckg where: (> y 100)})) -- ['Vck1 'x 'y]
+(count (select {by: Vck1 from: Tckg where: (> y 100)})) -- 0
+;; a global LIST is no key here, as with an output
+(select {by: VckL from: Tckg}) !- schema
+(select {c: (count y) by: VckL from: Tckg}) !- schema
