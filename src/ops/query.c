@@ -8736,22 +8736,8 @@ static int64_t eval_group_keep_cap(ray_t* tbl) {
     return ray_table_ncols(tbl) + (vm ? vm->proj_keep_n : 0) + 1;
 }
 
-/* Filter-compaction keep-set for a grouped select whose where: runs as its
- * own filter before the group (#769): every eval-level group but the one
- * filt_compact_keep serves, and the DAG group's materialize path (a
- * count(distinct) output over a parted table).  The group reads the
- * filtered table through its by: and its outputs only — take:, asc: and
- * desc: order and cut the grouped result — so the filter need only gather
- * the columns those expressions name: the by-keys, the column refs of
- * every output expression
- * (collect_col_refs_set), and the outer select's proj_keep.  An output
- * whose reads cannot be named (a lambda, a local, a quoted name, eval —
- * expr_reads_named_columns_only) keeps every column, and so does the
- * implicit-all group (no outputs: first of every column) unless a
- * projection hint at this depth says which of its columns the consumer
- * reads, as filt_compact_keep does.  Returns the deduped keep count, or 0
- * (carry all).  `max` is eval_group_keep_cap(tbl): keys and refs are
- * deduped columns of `tbl`, so the bound is never reached. */
+/* Can every column `e` reads be named (expr_reads_named_columns_only)?
+ * A by-dict is judged by its values. */
 static bool eval_group_keep_ok(ray_t* e, ray_t* tbl) {
     if (e && e->type == RAY_DICT) {                  /* a by-dict: its values */
         ray_t* vals = ray_dict_vals(e);
@@ -8764,6 +8750,31 @@ static bool eval_group_keep_ok(ray_t* e, ray_t* tbl) {
     return expr_reads_named_columns_only(e, tbl);
 }
 
+/* Filter-compaction keep-set for a grouped select whose where: runs as its
+ * own filter before the group (#769): every eval-level group but the one
+ * filt_compact_keep serves, and the DAG group's materialize path (a
+ * count(distinct) output over a parted table).  A group with outputs
+ * reads the filtered table through its by: and its outputs only — take:,
+ * asc: and desc: order and cut the grouped result, whose columns are the
+ * keys and the outputs — so the filter need only gather the columns those
+ * expressions name: the by-keys and the column refs of every output
+ * expression (collect_col_refs_set).  An output whose reads cannot be
+ * named (a lambda, a local, a quoted name, eval —
+ * expr_reads_named_columns_only) keeps every column.
+ *
+ * The implicit-all group (no outputs) emits the first of every column, so
+ * it keeps every column unless, exactly as filt_compact_keep requires, a
+ * projection hint is active at this depth (proj_keep names what the
+ * consumer reads) AND the select has no clause but from/where/by: a take:,
+ * asc: or desc: there sorts or cuts by columns the consumer never names
+ * (and a group with them is not the shape the hint describes).  Under
+ * those conditions the set is keys ∪ proj_keep.
+ *
+ * Returns the deduped keep count, or 0 (carry all).  `max` is
+ * eval_group_keep_cap(tbl): the keys and refs are distinct columns of
+ * `tbl` (at most ncols together, the dedup set is shared) and proj_keep
+ * adds at most proj_keep_n, so n stays below max; should it ever reach max
+ * a column may have been dropped, and the set is declined (carry all). */
 static int eval_group_keep(ray_t* dict, ray_t* by_expr, ray_t* tbl, int64_t n_out,
                            int64_t from_id, int64_t where_id, int64_t by_id,
                            int64_t take_id, int64_t asc_id, int64_t desc_id,
@@ -8771,23 +8782,29 @@ static int eval_group_keep(ray_t* dict, ray_t* by_expr, ray_t* tbl, int64_t n_ou
     ray_vm_t* vm = __VM;
     bool hint = vm && vm->proj_active && vm->eval_depth == vm->proj_depth + 1;
     if (n_out == 0 && !hint) return 0;               /* first of every column */
-    int n = 0;
-    if (by_expr && by_expr->type == RAY_SYM) {       /* by: [k1 k2 …] */
-        int64_t nk = ray_len(by_expr);
-        for (int64_t k = 0; k < nk; k++) {
-            int64_t s = sym_cell_runtime_id(by_expr, k);
-            if (!tbl_has_col(tbl, s)) return 0;      /* a key made later: carry all */
-            bool dup = false;
-            for (int j = 0; j < n; j++) if (out[j] == s) { dup = true; break; }
-            if (!dup && n < max) out[n++] = s;
-        }
-    } else {
-        if (!eval_group_keep_ok(by_expr, tbl)) return 0;
-        n = collect_col_refs_set(by_expr, tbl, out, max, n);
-    }
     DICT_VIEW_DECL(pv);
     DICT_VIEW_OPEN(dict, pv);
     if (DICT_VIEW_OVERFLOW(pv)) { DICT_VIEW_CLOSE(pv); return 0; }
+    if (n_out == 0) {                                /* only from/where/by */
+        for (int64_t i = 0; i + 1 < pv_n; i += 2) {
+            int64_t kid = pv[i]->i64;
+            if (kid != from_id && kid != where_id && kid != by_id) { DICT_VIEW_CLOSE(pv); return 0; }
+        }
+    }
+    int n = 0;
+    if (by_expr && by_expr->type == RAY_SYM) {       /* by: [k1 k2 …] */
+        int64_t nk = ray_len(by_expr);
+        for (int64_t k = 0; k < nk && n < max; k++) {
+            int64_t s = sym_cell_runtime_id(by_expr, k);
+            if (!tbl_has_col(tbl, s)) { DICT_VIEW_CLOSE(pv); return 0; }   /* a key made later: carry all */
+            bool dup = false;
+            for (int j = 0; j < n; j++) if (out[j] == s) { dup = true; break; }
+            if (!dup) out[n++] = s;
+        }
+    } else {
+        if (!eval_group_keep_ok(by_expr, tbl)) { DICT_VIEW_CLOSE(pv); return 0; }
+        n = collect_col_refs_set(by_expr, tbl, out, max, n);
+    }
     for (int64_t i = 0; i + 1 < pv_n; i += 2) {
         int64_t kid = pv[i]->i64;
         if (kid == from_id || kid == where_id || kid == by_id ||
@@ -8796,13 +8813,13 @@ static int eval_group_keep(ray_t* dict, ray_t* by_expr, ray_t* tbl, int64_t n_ou
         n = collect_col_refs_set(pv[i + 1], tbl, out, max, n);
     }
     DICT_VIEW_CLOSE(pv);  /* pv dead past the clause scan */
-    for (int j = 0; hint && j < vm->proj_keep_n; j++) {
+    for (int j = 0; hint && j < vm->proj_keep_n && n < max; j++) {
         int64_t s = vm->proj_keep[j];
         bool dup = false;
         for (int q = 0; q < n; q++) if (out[q] == s) { dup = true; break; }
-        if (!dup && n < max) out[n++] = s;
+        if (!dup) out[n++] = s;
     }
-    return n;
+    return n < max ? n : 0;                          /* a full buffer may have dropped one */
 }
 
 /* Materialize pure temporal arithmetic with the unit-aware evaluator once,

@@ -5482,6 +5482,41 @@ static test_result_t test_parted_eval_group_keep(void) {
         test_result_t r = sr_same_on(SR_NP0, SR_NP2, all[i], UINT64_MAX);
         if (r.status != TEST_PASS) return r;
     }
+    /* Fix round 1: an implicit group under an outer projection hint keeps
+     * every column when it sorts or takes (only from/where/by narrow it,
+     * as filt_compact_keep requires): the sort column, an outer lambda's
+     * dynamic read and a quoted name are not in proj_keep.  Expected values
+     * are 80a28e49's answers over the generation-0 tables; both
+     * generations must give them. */
+    static const struct { const char* q; const char* want; } base_ans[] = {
+        { "(at (select {g: g from: (select {from: T where: (> v 3) by: [g s] desc: d take: 3})}) 'g)", "[2 6 3]" },
+        { "(sum (at (select {g: g from: (select {from: T where: (> v 3) by: [g s] desc: d})}) 'g))", "105" },
+        { "(count (select {g: g from: (select {from: T where: (> v 3) by: [g s] desc: d})}))", "35" },
+        { "(at (select {g: g from: (select {from: T where: (> v 3) by: {g: g s: s} asc: k take: 3})}) 'g)", "[4 5 6]" },
+        { "(at (select {g: g from: (select {from: T where: (> v 3) by: [g s] asc: [u k] take: 3})}) 'g)", "[4 5 6]" },
+        { "(at (select {c: (count (distinct g)) from: (select {from: T where: (> v 3) by: [g s] desc: d take: 3})}) 'c)", "[3]" },
+        { "(do (set fu (fn [z] (+ z u))) "
+          "(at (select {m: (sum (fu g)) from: (select {from: T where: (> v 3) by: [g s] take: 5})}) 'm))", "[46]" },
+        { "(at (select {m: (sum 'u) from: (select {from: T where: (> v 3) by: [g s] take: 5})}) 'm)", "[30]" },
+        /* the narrowed shape (from/where/by only) answers as before */
+        { "(at (select {g: g from: (select {from: T where: (> v 3) by: [g s]})}) 'g)",
+          "[4 5 6 0 1 2 4 5 6 0 1 2 3 4 5 0 1 2 3 4 5 6 0 1 3 4 5 6 0 1 2 3 3 6 2]" },
+        { NULL, NULL },
+    };
+    for (int gen = 0; gen < 2; gen++) {
+        sr_evalf_ok("(set T %s)", gen ? SR_NP2 : SR_NP0);
+        for (int i = 0; base_ans[i].q; i++) {
+            ray_t* got = sr_eval(base_ans[i].q);
+            ray_t* want = sr_eval(base_ans[i].want);
+            bool same = sr_same_text(got, want);
+            ray_t* fg = (got && !RAY_IS_ERR(got)) ? ray_fmt(got, 0) : NULL;
+            TEST_ASSERT_FMT(same, "gen %d: %s: %.*s, base %s", gen ? 2 : 0, base_ans[i].q,
+                            fg ? (int)ray_str_len(fg) : 5, fg ? ray_str_ptr(fg) : (got ? ray_err_code(got) : "null"),
+                            base_ans[i].want);
+            if (fg) ray_release(fg);
+            sr_drop(got); ray_release(want);
+        }
+    }
     PASS();
 }
 
