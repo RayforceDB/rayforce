@@ -80,6 +80,7 @@ typedef struct {
  * counts none. */
 typedef struct {
     uint8_t* fixed;
+    bool     fixed_lent;            /* fixed is the caller's (ray_col_scratch_lend): never freed here */
     char*    pool;
     size_t   pool_cap;
     struct ray_enccol_s* acc_e;     /* the column acc_bytes belong to (a reference) */
@@ -87,11 +88,25 @@ typedef struct {
     uint64_t wide_hits;             /* ray_col_range_wide decodes, not yet counted */
 } ray_col_scratch_t;
 
+/* The fixed vector a scan task lends its scratch from its own stack, so
+ * a worker's first decode allocates nothing: a fresh worker heap maps and
+ * faults in a whole pool on its first allocation, a fixed cost per worker
+ * that generation 0, reading its columns in place, never pays.  One per
+ * scratch, alive until the scratch is freed. */
+#define RAY_COL_FIXED_BYTES ((size_t)1024 * 16)   /* one vector of the widest element (GUID) */
+typedef struct { _Alignas(64) uint8_t b[RAY_COL_FIXED_BYTES]; } ray_col_fixed_t;
+
 /* NULL or an owned error (ray_error_free). */
 ray_t* ray_col_src_bind(ray_t* col, ray_col_src_t* out);
 void   ray_col_src_release(ray_col_src_t* s);
 void   ray_col_scratch_init(ray_col_scratch_t* s);
 void   ray_col_scratch_free(ray_col_scratch_t* s);
+/* An initialised scratch decodes into buf (the caller's, outliving the
+ * scratch's use) instead of a fixed vector from the heap. */
+void   ray_col_scratch_lend(ray_col_scratch_t* s, ray_col_fixed_t* buf);
+/* Test hook: fixed vectors range reads took from the heap since process
+ * start (a lent scratch takes none). */
+uint64_t ray_col_test_fixed_allocs(void);
 
 /* Range of [start, start + n), clipped at the source end, at a parted
  * segment or slice boundary and (generation 2) at the next vector boundary;
@@ -217,6 +232,8 @@ typedef struct {
 } ray_col_cursor_t;
 
 void   ray_col_cursor_init(ray_col_cursor_t* c, ray_col_src_t* src);
+/* ray_col_cursor_init with its scratch lent buf (ray_col_scratch_lend). */
+void   ray_col_cursor_init_lent(ray_col_cursor_t* c, ray_col_src_t* src, ray_col_fixed_t* buf);
 void   ray_col_cursor_free(ray_col_cursor_t* c);
 /* The view covering row r (0 <= r < len): the current one when it covers
  * r, else a range read of [r, len) (generation 2: up to the end of r's

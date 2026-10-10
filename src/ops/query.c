@@ -7951,8 +7951,9 @@ static void count_compare_enc_task(void* vctx, uint32_t worker_id, int64_t start
     _Static_assert(RAY_ENC_CHUNK == 1 << 16, "count decisions read 64K-row chunks");
     const uint16_t op = count_zone_op(ctx->op);
     const bool by_vec = op && zone_dir_type(ctx->src->type);
+    ray_col_fixed_t fixed;                                 /* the task's decode vector: no worker heap */
     ray_col_cursor_t cur;
-    ray_col_cursor_init(&cur, ctx->src);
+    ray_col_cursor_init_lent(&cur, ctx->src, &fixed);
     ray_t* err = NULL;
     for (int64_t b = start; b < end && !err; ) {
         int64_t e = ((b >> 16) + 1) << 16;                 /* the end of b's chunk */

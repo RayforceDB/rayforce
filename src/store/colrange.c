@@ -36,8 +36,18 @@
 
 /* Fixed scratch: one vector of the widest element (GUID, 16 bytes). */
 #define SCRATCH_FIXED_BYTES ((size_t)RAY_ENC_VEC * 16)
+_Static_assert(SCRATCH_FIXED_BYTES == RAY_COL_FIXED_BYTES, "a lent fixed vector holds one vector");
 
 void ray_col_scratch_init(ray_col_scratch_t* s) { memset(s, 0, sizeof *s); }
+
+void ray_col_scratch_lend(ray_col_scratch_t* s, ray_col_fixed_t* buf) {
+    if (!s->fixed_lent) ray_free_raw(s->fixed);
+    s->fixed = buf->b;
+    s->fixed_lent = true;
+}
+
+static _Atomic(uint64_t) g_fixed_allocs;           /* test hook */
+uint64_t ray_col_test_fixed_allocs(void) { return atomic_load(&g_fixed_allocs); }
 
 /* Decoded bytes are counted per scratch and column, not per vector: the
  * counters are shared by every worker.  The scratch references the column
@@ -63,7 +73,7 @@ static void scratch_count(ray_col_scratch_t* s, ray_enccol_t* e, uint64_t nb) {
 
 void ray_col_scratch_free(ray_col_scratch_t* s) {
     scratch_flush(s);
-    ray_free_raw(s->fixed);
+    if (!s->fixed_lent) ray_free_raw(s->fixed);
     ray_free_raw(s->pool);
     memset(s, 0, sizeof *s);
 }
@@ -165,6 +175,7 @@ static ray_t* range_enc(ray_enccol_t* e, int64_t start, int64_t n, bool guard,
     if (!sc->fixed) {
         sc->fixed = ray_alloc_raw(SCRATCH_FIXED_BYTES);
         if (!sc->fixed) return ray_error("oom", "range read scratch");
+        atomic_fetch_add_explicit(&g_fixed_allocs, 1, memory_order_relaxed);
     }
     int64_t c = vec / RAY_ENC_VECS_PER_CHUNK;
     int j = (int)(vec % RAY_ENC_VECS_PER_CHUNK);
@@ -401,6 +412,11 @@ void ray_col_cursor_init(ray_col_cursor_t* c, ray_col_src_t* src) {
     memset(c, 0, sizeof *c);
     c->src = src;
     ray_col_scratch_init(&c->sc);
+}
+
+void ray_col_cursor_init_lent(ray_col_cursor_t* c, ray_col_src_t* src, ray_col_fixed_t* buf) {
+    ray_col_cursor_init(c, src);
+    ray_col_scratch_lend(&c->sc, buf);
 }
 
 void ray_col_cursor_free(ray_col_cursor_t* c) {

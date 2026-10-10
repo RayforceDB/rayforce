@@ -1329,6 +1329,22 @@ static test_result_t test_count_fast_path(void) {
     PASS();
 }
 
+/* Task 17i: the count fast path's tasks decode into a fixed vector lent
+ * from their own stack, so a worker's first decode takes nothing from its
+ * heap (a fresh worker heap maps a whole pool on its first allocation:
+ * ClickBench q2's first run).  The answers equal generation 0's. */
+static test_result_t test_count_fast_lent_scratch(void) {
+    uint64_t f0 = ray_query_test_count_fast(), a0 = ray_col_test_fixed_allocs();
+    SR_SAME("(count (select {from: T where: (== g 3)}))", 0);       /* I16 */
+    SR_SAME("(count (select {from: T where: (> k 150000)}))", 0);   /* I64 */
+    SR_SAME("(count (select {from: T where: (!= u 7)}))", 0);        /* U8 */
+    SR_SAME("(count (select {from: T where: (== s 'c)}))", 0);       /* file-domain SYM */
+    TEST_ASSERT_EQ_U(ray_query_test_count_fast() - f0, 8);
+    TEST_ASSERT_FMT(ray_col_test_fixed_allocs() == a0, "%llu fixed vectors from the heap",
+                    (unsigned long long)(ray_col_test_fixed_allocs() - a0));
+    PASS();
+}
+
 /* The fast path's SYM compare, on an in-memory (runtime-domain) table and
  * over a file domain at both generations, with nulls and an absent
  * literal: EQ / NE take the fast path and equal the general path (`and
@@ -6406,6 +6422,7 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/expr_nulls_midvector",   test_expr_nulls_midvector,   srr_setup, srr_teardown },
     { "scanrange/expr_error",             test_expr_error,             srr_setup, srr_teardown },
     { "scanrange/count_fast_path",        test_count_fast_path,        srr_setup, srr_teardown },
+    { "scanrange/count_fast_lent_scratch", test_count_fast_lent_scratch, srr_setup, srr_teardown },
     { "scanrange/count_fast_sym_nulls",   test_count_fast_sym_nulls,   sr_rt_setup, sr_rt_teardown },
     { "scanrange/expr_reuses_materialized", test_expr_reuses_materialized, srr_setup, srr_teardown },
     { "scanrange/expr_error_sites",       test_expr_error_sites,       srr_setup, srr_teardown },
