@@ -379,4 +379,42 @@
 (select {by: {k: (* x 2)} from: Pck}) -- (select {by: {k: (* x 2)} from: Mck})
 (select {by: date from: Pck}) -- (select {by: date from: Mck})
 (select {by: x from: Pck where: (> y 15)}) -- (select {by: x from: Mck where: (> y 15)})
+;; it groups on the columns the clauses name and gathers the others at the
+;; rows kept: a sort key only in desc:/asc:, a by-dict value's column, the
+;; partition key sorted, every row its own group, a key from a global
+(select {by: x from: Pck desc: r take: 3}) -- (select {by: x from: Mck desc: r take: 3})
+(select {by: x from: Pck asc: s}) -- (select {by: x from: Mck asc: s})
+(select {by: {k: y} from: Pck}) -- (select {by: {k: y} from: Mck})
+(select {by: {k: (% y 20)} from: Pck}) -- (select {by: {k: (% y 20)} from: Mck})
+(select {by: date from: Pck desc: date}) -- (select {by: date from: Mck desc: date})
+(select {by: y from: Pck}) -- (select {by: y from: Mck})
+(set Vck7 [1 1 2 2 3 3 3])
+(select {by: Vck7 from: Pck}) -- (select {by: Vck7 from: Mck})
+(select {by: x from: Pck take: [1 2]}) -- (select {by: x from: Mck take: [1 2]})
 (.sys.exec "rm -rf /tmp/rfl_ckparted")
+;; a column named as a computed key is (`key`) is read for real, not taken
+;; for a row number: the key replaces it in the result
+(.sys.exec "rm -rf /tmp/rfl_ckpkey")
+(.db.splayed.set "/tmp/rfl_ckpkey/2024.01.01/t/" (table [x key] (list [3 1 4] [7 8 9])))
+(.db.splayed.set "/tmp/rfl_ckpkey/2024.01.02/t/" (table [x key] (list [2 3 1 5] [6 5 4 3])))
+(set Pckk (.db.parted.get "/tmp/rfl_ckpkey/" 't))
+(set Mckk (select {from: Pckk where: (>= x 0)}))
+(select {by: (+ (% x 2) 1) from: Pckk}) -- (select {by: (+ (% x 2) 1) from: Mckk})
+(select {by: 5 from: Pckk}) -- (select {by: 5 from: Mckk})
+(.sys.exec "rm -rf /tmp/rfl_ckpkey")
+;; the columns no clause names are read at the kept rows only: a wide string
+;; column the select never reads costs nothing near its flattened size (14 MB
+;; here when the whole table was flattened)
+(.sys.exec "rm -rf /tmp/rfl_ckwide")
+(set Wck (concat "wide-unused-string-column-value-over-twelve-bytes-" (as 'STR (% (til 10000) 1000))))
+(set Kck (% (til 10000) 10))
+(map (fn [d] (.db.splayed.set (format "/tmp/rfl_ckwide/2024.01.0%/t/" d) (table [k w] (list Kck Wck)))) [1 2 3 4 5 6 7 8])
+(set Wck 0)
+(set Kck 0)
+(set Pw (.db.parted.get "/tmp/rfl_ckwide/" 't))
+(set pk0 (at (.sys.mem) 'peak-bytes))
+(set Rw (select {by: k from: Pw}))
+(< (- (at (.sys.mem) 'peak-bytes) pk0) 2000000) -- true
+(count Rw) -- 10
+(at Rw 'w) -- (concat "wide-unused-string-column-value-over-twelve-bytes-" (as 'STR (til 10)))
+(.sys.exec "rm -rf /tmp/rfl_ckwide")
