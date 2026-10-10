@@ -49,6 +49,10 @@
 #endif
 #if defined(RAY_OS_LINUX)
 #include <dirent.h>       /* /sys/block — the read-ahead caps */
+#include <sys/resource.h> /* getrusage: ray_io_counters */
+#if !defined(RUSAGE_THREAD)
+#define RUSAGE_THREAD 1
+#endif
 #endif
 #include "mem/sys.h"
 
@@ -1059,4 +1063,28 @@ uint64_t ray_cache_llc_bytes(void) {
     if (g_llc_for_test) return g_llc_for_test;
 #endif
     return cache_llc_probe();
+}
+
+/* ---- I/O counters for the traces ----------------------------------------- */
+void ray_io_counters(bool thread, ray_io_counters_t* out) {
+    *out = (ray_io_counters_t){0};
+#if defined(RAY_OS_LINUX)
+    struct rusage ru;
+    if (getrusage(thread ? RUSAGE_THREAD : RUSAGE_SELF, &ru) == 0) out->majflt = ru.ru_majflt;
+    FILE* f = fopen(thread ? "/proc/thread-self/io" : "/proc/self/io", "r");
+    if (f) {
+        char line[128];
+        while (fgets(line, sizeof(line), f)) {
+            long long v;
+            if (sscanf(line, "read_bytes: %lld", &v) == 1) out->rd = v;
+            else if (sscanf(line, "write_bytes: %lld", &v) == 1) out->wr = v;
+            else if (sscanf(line, "cancelled_write_bytes: %lld", &v) == 1) out->cwr = v;
+            else if (sscanf(line, "syscr: %lld", &v) == 1) out->syscr = v;
+            else if (sscanf(line, "syscw: %lld", &v) == 1) out->syscw = v;
+        }
+        fclose(f);
+    }
+#else
+    (void)thread;
+#endif
 }

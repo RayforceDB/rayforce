@@ -37,9 +37,6 @@
 #ifndef RAY_OS_WINDOWS
 #include <unistd.h>
 #endif
-#if defined(__linux__)
-#include <sys/resource.h>   /* getrusage: the grouped import's trace */
-#endif
 #if defined(__SSE2__)
 #include <emmintrin.h>
 #endif
@@ -2574,27 +2571,13 @@ static void pq_g_prefetch(pq_direct_work* w, int64_t g, int64_t c) {
 
 /* The calling thread's major faults, read and written bytes and time
  * (the trace's split; zero without it). */
-#if defined(__linux__) && !defined(RUSAGE_THREAD)
-#define RUSAGE_THREAD 1
-#endif
 static pq_tio_t pq_tio_now(bool on) {
     pq_tio_t io = {0};
     if (!on) return io;
     io.ns = ray_profile_now_ns();
-#if defined(__linux__)
-    struct rusage ru;
-    if (getrusage(RUSAGE_THREAD,&ru) == 0) io.majflt = ru.ru_majflt;
-    FILE* f = fopen("/proc/thread-self/io","r");
-    if (f) {
-        char line[128];
-        while (fgets(line,sizeof(line),f)) {
-            long long v;
-            if (sscanf(line,"read_bytes: %lld",&v) == 1) io.rd = v;
-            else if (sscanf(line,"write_bytes: %lld",&v) == 1) io.wr = v;
-        }
-        fclose(f);
-    }
-#endif
+    ray_io_counters_t c;
+    ray_io_counters(true,&c);
+    io.majflt = c.majflt; io.rd = c.rd; io.wr = c.wr;
     return io;
 }
 static void pq_tio_add(pq_gwork* w, int part, pq_tio_t a, pq_tio_t b) {
@@ -2729,27 +2712,12 @@ static void pq_g2_task(void* ptr, uint32_t worker, int64_t start, int64_t end) {
     }
 }
 
-/* /proc/self/io and the major faults, for the trace's phase lines. */
+/* The process's I/O counters (ray_io_counters), for the trace's phase lines. */
 typedef struct { int64_t rd, wr, syscr, syscw, majflt; } pq_io_t;
 static pq_io_t pq_io_now(void) {
-    pq_io_t io = {0};
-#if defined(__linux__)
-    FILE* f = fopen("/proc/self/io","r");
-    if (f) {
-        char line[128];
-        while (fgets(line,sizeof(line),f)) {
-            long long v;
-            if (sscanf(line,"read_bytes: %lld",&v) == 1) io.rd = v;
-            else if (sscanf(line,"write_bytes: %lld",&v) == 1) io.wr = v;
-            else if (sscanf(line,"syscr: %lld",&v) == 1) io.syscr = v;
-            else if (sscanf(line,"syscw: %lld",&v) == 1) io.syscw = v;
-        }
-        fclose(f);
-    }
-    struct rusage ru;
-    if (getrusage(RUSAGE_SELF,&ru) == 0) io.majflt = ru.ru_majflt;
-#endif
-    return io;
+    ray_io_counters_t c;
+    ray_io_counters(false,&c);
+    return (pq_io_t){c.rd,c.wr,c.syscr,c.syscw,c.majflt};
 }
 static void pq_io_print(const char* phase, pq_io_t a, pq_io_t b, int64_t t0, int64_t t1) {
     fprintf(stderr," %s=%.1fms rd=%.1fMB wr=%.1fMB syscr=%lld syscw=%lld majflt=%lld",phase,

@@ -37,9 +37,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
-#if defined(__linux__)
-#include <sys/resource.h>   /* getrusage: the hash build trace */
-#endif
+#include "core/platform.h"   /* ray_io_counters: the hash build trace */
 
 /* ── Routing observability counters (diagnostic, unsynchronized) ── */
 uint64_t ray_idx_consults[IDX_SITE__N];
@@ -1632,21 +1630,9 @@ ray_t* ray_index_inline_map(uint8_t* region, int64_t region_size) {
 /* ── Hash-index build trace ── */
 ray_hash_mark_t ray_hash_trace_mark(void) {
     ray_hash_mark_t m = { ray_profile_now_ns(), 0, 0, 0, 0 };
-#if defined(__linux__)
-    struct rusage ru;
-    if (getrusage(RUSAGE_SELF, &ru) == 0) m.majflt = ru.ru_majflt;
-    FILE* f = fopen("/proc/self/io", "r");
-    if (f) {
-        char line[128];
-        while (fgets(line, sizeof(line), f)) {
-            long long x;
-            if (sscanf(line, "read_bytes: %lld", &x) == 1) m.rd = x;
-            else if (sscanf(line, "write_bytes: %lld", &x) == 1) m.wr = x;
-            else if (sscanf(line, "cancelled_write_bytes: %lld", &x) == 1) m.cwr = x;
-        }
-        fclose(f);
-    }
-#endif
+    ray_io_counters_t io;
+    ray_io_counters(false, &io);
+    m.majflt = io.majflt; m.rd = io.rd; m.wr = io.wr; m.cwr = io.cwr;
     return m;
 }
 
