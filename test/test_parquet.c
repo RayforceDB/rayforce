@@ -2021,8 +2021,14 @@ static void pqx_snappy(pq_buf* o, const uint8_t* s, size_t n) {
  * gone bad on disk), the string it then reads kept in pqx_flipped; 3 that,
  * and a data page's last byte flipped so.  pqx_xflip: the x column's pages,
  * -2 (the default) without checksums, -1 with them, g >= 0 with them and
- * row group g's flipped. */
+ * row group g's flipped.  pqx_pfault[g]: what goes wrong in row group g of
+ * the first symbol column (PQX_PF_CRCFLIP its dictionary page flipped past
+ * its checksum, the column written PQX_CRC; PQX_PF_BADDICT its dictionary
+ * page encoded 3), two of them in different row groups for the order the
+ * import reports them in. */
+enum { PQX_PF_CRCFLIP = 1, PQX_PF_BADDICT = 2 };
 static int64_t pqx_xflip = -2;
+static unsigned pqx_pfault[16];
 static int pqx_crc = 0;
 static char pqx_flipped[256];
 static uint32_t pqx_flipped_len = 0;
@@ -2101,7 +2107,8 @@ static bool pqx_synth(const char* path, int64_t rows, int64_t groups, int n, con
                 continue;
             }
             unsigned fl = flags[c - 1];
-            pqx_crc = !(fl & PQX_CRC) ? 0 : (fl & PQX_CRCFLIP) && g == groups - 1 ? 2 : 1;
+            unsigned pf = c == 1 && g < 16 ? pqx_pfault[g] : 0;
+            pqx_crc = !(fl & PQX_CRC) ? 0 : ((fl & PQX_CRCFLIP) && g == groups - 1) || (pf & PQX_PF_CRCFLIP) ? 2 : 1;
             bool snappy = (fl & PQX_SNAPPY) != 0, dicted = (fl & (PQX_DICT | PQX_FALLBACK)) != 0;
             pq_synth_fn fn = fns[c - 1];
             int64_t mid = !dicted ? lo : (fl & PQX_FALLBACK) && hi - lo >= 2 ? lo + (hi - lo) * ((fl & PQX_LATE) ? 7 : 4) / 8 : hi;
@@ -2114,7 +2121,7 @@ static bool pqx_synth(const char* path, int64_t rows, int64_t groups, int n, con
                     uint32_t o = (uint32_t)dict.n; pb_bytes(&doff, &o, 4); pb_bytes(&dict, &len, 4); pb_bytes(&dict, s, len);
                 }
                 dio[i] = (int64_t)f.n;
-                pqx_page(&f, 2, &dict, (int64_t)(doff.n / 4), (fl & PQX_BADDICT) ? 3 : 0, snappy, &rawt[i]);
+                pqx_page(&f, 2, &dict, (int64_t)(doff.n / 4), (fl & PQX_BADDICT) || (pf & PQX_PF_BADDICT) ? 3 : 0, snappy, &rawt[i]);
             }
             dpo[i] = (int64_t)f.n;
             for (int part = 0; part < 2; part++) {
@@ -3524,7 +3531,9 @@ static test_result_t test_pq_sk4_data_offset(void) {
  * chunk's checks before its pages refuse; and a dictionary page whose
  * checksum fails, in the last row group only, which a pool worker as likely
  * as not reads (its message carried to the thread that reports it), the
- * parted import's row-group tasks too. */
+ * parted import's row-group tasks too.  And two pages that fail, in row
+ * groups 1 and 3 of p, each way round: every run reports row group 1's,
+ * whichever task failed first or was noted last. */
 static test_result_t test_pq_sk4_grouped_message(void) {
     pq_sym_env_clear();
     char src[160], dir[160], partial[240];
@@ -3538,10 +3547,21 @@ static test_result_t test_pq_sk4_grouped_message(void) {
     ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 3);
     TEST_ASSERT_EQ_I(pq_pool(2), RAY_OK);
     int bad = 0;
-    static const unsigned cases[] = {PQX_DICT | PQX_BADDICT, PQX_DICT | PQX_ZSTD, PQX_DICT | PQX_CRC | PQX_CRCFLIP};
+    /* f1, f3: the faults of row groups 1 and 3 (pqx_pfault); want: the
+     * message every run must report, the lower row group's */
+    static const struct { unsigned flags, f1, f3; const char* want; } cases[] = {
+        {PQX_DICT | PQX_BADDICT, 0, 0, NULL},
+        {PQX_DICT | PQX_ZSTD, 0, 0, NULL},
+        {PQX_DICT | PQX_CRC | PQX_CRCFLIP, 0, 0, NULL},
+        {PQX_DICT | PQX_CRC, PQX_PF_CRCFLIP, PQX_PF_BADDICT, "page checksum mismatch (column p)"},
+        {PQX_DICT | PQX_CRC, PQX_PF_BADDICT, PQX_PF_CRCFLIP, "invalid dictionary page (column p)"},
+    };
     for (size_t v = 0; v < sizeof(cases) / sizeof(cases[0]); v++) {
-    unsigned fl[2] = {cases[v], PQX_DICT};
-    TEST_ASSERT_TRUE(pqx_synth(src, 12000, 4, 2, nm, fns, fl));
+    unsigned fl[2] = {cases[v].flags, PQX_DICT};
+    pqx_pfault[1] = cases[v].f1; pqx_pfault[3] = cases[v].f3;
+    bool made = pqx_synth(src, 12000, 4, 2, nm, fns, fl);
+    pqx_pfault[1] = pqx_pfault[3] = 0;
+    TEST_ASSERT_TRUE(made);
     char msgs[4][256];
     static const char* what[4] = {"direct", "grouped", "grouped", "parted"};
     for (int run = 0; run < 4; run++) {   /* direct, grouped on two workers, grouped on four, parted on four */
@@ -3555,7 +3575,7 @@ static test_result_t test_pq_sk4_grouped_message(void) {
         const char* msg = ray_error_msg();
         snprintf(msgs[run], sizeof(msgs[run]), "%s", msg ? msg : "(no message)");
         fprintf(stderr, "  [sk4 message %zu %s %d] %s: %s\n", v, what[run], cores, failed ? "failed" : "imported", msgs[run]);
-        if (!failed || !strstr(msgs[run], "(column p)")) bad++;
+        if (!failed || !strstr(msgs[run], "(column p)") || (cases[v].want && strcmp(msgs[run], cases[v].want))) bad++;
         if (res) { if (RAY_IS_ERR(res)) ray_error_free(res); else ray_release(res); }
         if (run < 3) { pq_remove_native(dir, fnames, 3); pq_remove_native(partial, fnames, 3); }
         else { (void)ray_test_rm_rf(partial); (void)ray_test_rm_rf(dir); }
