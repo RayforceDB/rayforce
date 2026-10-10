@@ -13093,6 +13093,11 @@ by_dict_done:
              * vector): the grouping above evaluated it as an expression. */
             if (key_sym >= 0 && !ray_table_get_col(filtered_tbl, key_sym))
                 key_sym = -1;
+            /* And a column name the grouping did not read as that column: a
+             * local of the same name shadows it, the key is the local's value
+             * and its grouped column is not named after the column. */
+            if (key_sym >= 0 && !ray_table_get_col(grouped, key_sym))
+                key_sym = -1;
 
             if (n_groups == 0) {
                 ray_release(grouped);
@@ -13370,6 +13375,15 @@ by_dict_done:
              * grp_key_col points into grouped — must not access after release. */
             ray_t* grp_key_col = ray_table_get_col(grouped, key_sym);
             int8_t kt = orig_key_col ? orig_key_col->type : 0;
+            /* Both hold once key_sym names a column the grouping read (see
+             * where key_sym is resolved); refuse rather than read unset keys. */
+            if (!orig_key_col || !grp_key_col) {
+                ray_release(grouped);
+                if (filtered_tbl != tbl) ray_release(filtered_tbl);
+                ray_release(tbl);
+                scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv);
+                return ray_error("domain", "select by: group key column not found");
+            }
 
             /* Heap-allocate gk_vals when n_groups > 256 */
             int64_t gk_stack[256];

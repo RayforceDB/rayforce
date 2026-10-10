@@ -324,3 +324,18 @@
 ;; a global LIST is no key here, as with an output
 (select {by: VckL from: Tckg}) !- schema
 (select {c: (count y) by: VckL from: Tckg}) !- schema
+;; a local that shadows a column: the grouping groups by the local, as the
+;; with-output form does, and names its key column after no column.  The
+;; branch looked the key up by the column's name and read unset group keys.
+(set Tcksh (table [x y] (list [3 1 4 2] [30 10 40 20])))
+(set Tcksl (table [k s l] (list [1 2 3 4] (list "aa" "bb" "cc" "dd") (list [1] [2] [3] [4]))))
+((fn [y] (select {by: y from: Tcksh})) [10 10 30 30]) -- (table [y x] (list [10 30] [3 4]))
+((fn [y] (at (select {by: y from: Tcksh}) 'y)) [10 10 30 30]) -- ((fn [y] (first (value (select {c: (first x) by: y from: Tcksh})))) [10 10 30 30])
+((fn [y] (at (select {by: y from: Tcksh}) 'x)) [10 10 30 30]) -- ((fn [y] (at (select {c: (first x) by: y from: Tcksh}) 'c)) [10 10 30 30])
+((fn [k] (select {by: k from: Tcksl})) [9 9 9 9]) -- (table [k s l] (list [9] (list "aa") (list [1])))
+((fn [] (let y [10 10 30 30]) (select {by: y from: Tcksh}))) -- (table [y x] (list [10 30] [3 4]))
+((fn [y] (select {by: y from: Tcksh desc: y})) [10 10 30 30]) -- (table [y x] (list [30 10] [4 3]))
+((fn [y] (select {by: y from: Tcksh where: (> x 0)})) [10 10 30 30]) -- (table [y x] (list [10 30] [3 4]))
+;; xfail: a where: that drops rows refuses the local (4 values for 3 rows),
+;; where the with-output form filters the local too: [10 30] [3 4]
+;; ((fn [y] (select {by: y from: Tcksh where: (> x 1)})) [10 10 30 30]) -- (table [y x] (list [10 30] [3 4]))
