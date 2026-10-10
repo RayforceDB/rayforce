@@ -9464,6 +9464,47 @@ static bool parted_row_name_free(ray_t* dict, ray_t* tbl, int64_t row_sym) {
     return !ray_env_get_lexical_local(row_sym) && !ray_env_get(row_sym);
 }
 
+/* Does the clause value `v` run code whose column reads it does not show:
+ * a lambda (written in place, or a name bound to one, quoted or not), a
+ * call whose callee is computed, a name bound to a container that may hold
+ * lambdas, or text or a name evaluated at run time (eval, parse, resolve,
+ * load, value)? */
+static bool clause_runs_code(ray_t* v) {
+    if (!v || RAY_IS_ERR(v)) return false;
+    if (v->type == RAY_LAMBDA) return true;
+    if (v->type == -RAY_SYM) {
+        ray_t* b = ray_env_get_lexical_local(v->i64);
+        if (!b) b = ray_env_get(v->i64);
+        if (!b) return false;
+        if (b->type == RAY_LAMBDA) return true;
+        return !(v->attrs & ATTR_QUOTED) &&
+               (b->type == RAY_LIST || b->type == RAY_DICT || b->type == RAY_TABLE);
+    }
+    if (v->type == RAY_DICT) return clause_runs_code(ray_dict_vals(v));
+    if (v->type != RAY_LIST) return false;
+    ray_t** el = (ray_t**)ray_data(v);
+    if (v->len > 0 && (el[0]->type == RAY_LIST ||
+                       select_sym_is(el[0], "fn", 2) || select_sym_is(el[0], "eval", 4) ||
+                       select_sym_is(el[0], "parse", 5) || select_sym_is(el[0], "resolve", 7) ||
+                       select_sym_is(el[0], "load", 4) || select_sym_is(el[0], "value", 5)))
+        return true;
+    for (int64_t i = 0; i < v->len; i++) if (clause_runs_code(el[i])) return true;
+    return false;
+}
+
+/* Can the narrow copy of a parted table answer this select: every column
+ * a clause reads is written in it (no code that reads columns unseen). */
+static bool parted_clauses_plain(ray_t* dict) {
+    ray_t* keys = ray_dict_keys(dict);
+    ray_t* vals = ray_dict_vals(dict);
+    if (!keys || keys->type != RAY_SYM || !vals || vals->type != RAY_LIST) return false;
+    int64_t id_from = ray_sym_intern("from", 4);
+    for (int64_t i = 0; i < ray_dict_len(dict); i++)
+        if (sym_cell_runtime_id(keys, i) != id_from &&
+            clause_runs_code(((ray_t**)ray_data(vals))[i])) return false;
+    return true;
+}
+
 /* Rows rv[0..n) of a parted table, gathered one column at a time without
  * flattening the table: the rows are marked, a column is compacted to the
  * marked rows (in ascending order) by sel_compact, and when rv is not
@@ -9573,7 +9614,7 @@ static ray_t* select_parted_first_rows(ray_t* dict, ray_t* tbl, bool aliases_res
     ray_t* by_expr = dict_get(dict, "by");
     if (!by_expr) return NULL;
     int64_t row_sym = ray_sym_intern("__row", 5);
-    if (!parted_row_name_free(dict, tbl, row_sym)) return NULL;
+    if (!parted_row_name_free(dict, tbl, row_sym) || !parted_clauses_plain(dict)) return NULL;
     /* the key columns the result leads with */
     int64_t nkeys = by_expr->type == RAY_DICT ? ray_dict_len(by_expr)
                   : by_expr->type == RAY_SYM ? ray_len(by_expr) : 1;
@@ -9727,7 +9768,7 @@ static ray_t* select_parted_sorted(ray_t* dict, ray_t* tbl, bool aliases_resolve
     int64_t nc = ray_table_ncols(tbl);
     if (nc <= 0 || nc > 256) return NULL;   /* sel_compact's column limit */
     int64_t row_sym = ray_sym_intern("__row", 5);
-    if (!parted_row_name_free(dict, tbl, row_sym)) return NULL;
+    if (!parted_row_name_free(dict, tbl, row_sym) || !parted_clauses_plain(dict)) return NULL;
     ray_t* keys = ray_dict_keys(dict);
     ray_t* vals = ray_dict_vals(dict);
     int64_t nd = ray_dict_len(dict);

@@ -473,6 +473,25 @@
 (set Mrn (select {from: Prn where: (>= i 0)}))
 (select {by: {__row: s} from: Prn}) -- (select {by: {__row: s} from: Mrn})
 (count (select {by: {__row: s} from: Prn})) -- 3
+;; nor one a select reads unseen: a helper that reads a column by name, or
+;; a name made at run time (the column a helper or eval reads is not in
+;; the clauses, so the narrow copy would miss it or offer the row number)
+(set hx (fn [] i))
+(select {by: {k: (hx)} from: Prn}) -- (select {by: {k: (hx)} from: Mrn})
+(set hr2 (fn [] __row))
+(select {by: {k: (hr2)} from: Mrn}) !- name
+(select {by: {k: (hr2)} from: Prn}) !- name
+(select {by: {k: (eval (parse "__row"))} from: Mrn}) !- name
+(select {by: {k: (eval (parse "__row"))} from: Prn}) !- name
+(select {by: {k: (eval (as 'SYMBOL "__row"))} from: Mrn}) !- name
+(select {by: {k: (eval (as 'SYMBOL "__row"))} from: Prn}) !- name
+;; the helper called by a quoted name, through a computed callee, or out of
+;; a list
+(set hy (fn [x] i))
+(set Ly (list hy))
+(select {by: {k: ('hy 0)} from: Prn}) -- (select {by: {k: ('hy 0)} from: Mrn})
+(select {by: {k: ((first Ly) 0)} from: Prn}) -- (select {by: {k: ((first Ly) 0)} from: Mrn})
+(select {by: {k: (first (map (first Ly) [0]))} from: Prn}) -- (select {by: {k: (first (map (first Ly) [0]))} from: Mrn})
 (set __row [1 1 2 2 3 3 3])
 (select {by: {k: __row} from: Prn}) -- (select {by: {k: __row} from: Mrn})
 (count (select {by: {k: __row} from: Prn})) -- 3
