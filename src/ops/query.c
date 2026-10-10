@@ -1480,7 +1480,9 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
             !(g->table && g->table->type == RAY_TABLE &&
               ray_table_get_col(g->table, head->i64))) {
             ray_t* gv = ray_env_get(head->i64);
-            if (gv && gv->type == RAY_LAMBDA) {
+            /* Not a closure: its captures are not in the planner's scope,
+             * and a captured name would resolve to a column or a global. */
+            if (gv && gv->type == RAY_LAMBDA && !LAMBDA_CLOSURE(gv)) {
                 ray_t* formals  = LAMBDA_PARAMS(gv);
                 ray_t* body_lst = LAMBDA_BODY(gv);
                 if (formals && body_lst && body_lst->type == RAY_LIST &&
@@ -2356,8 +2358,10 @@ static ray_t* query_inline_walk(ray_t* expr, ray_t* tbl,
     if (es[0]->type == -RAY_SYM && !(es[0]->attrs & ATTR_QUOTED) &&
         !ray_table_get_col(tbl, es[0]->i64)) {
         ray_t* fn = ray_env_get(es[0]->i64);
-        if (fn && fn->type == RAY_LAMBDA &&
-            !(LAMBDA_IS_COMPILED(fn) && LAMBDA_CLOSURE(fn))) {
+        /* A closure's body reads its captures; inlined, those names would
+         * resolve to columns or globals instead.  Never inline one, however
+         * often it has been called (a closure compiles on its second call). */
+        if (fn && fn->type == RAY_LAMBDA && !LAMBDA_CLOSURE(fn)) {
             ray_t* bodies = LAMBDA_BODY(fn);
             if (bodies && bodies->type == RAY_LIST && bodies->len == 1) {
                 params = LAMBDA_PARAMS(fn);
@@ -10187,6 +10191,7 @@ static ray_t* select_plan_computed_key(ray_t* dict, ray_t* tbl, int64_t* key_nam
                 if (keyvec && RAY_IS_ERR(keyvec)) {
                     ray_error_free(keyvec);
                     if (__VM->raise_val) { ray_release(__VM->raise_val); __VM->raise_val = NULL; }
+                    if (__VM->return_val) { ray_release(__VM->return_val); __VM->return_val = NULL; }
                     ray_clear_error_trace();
                     __VM->err.msg[0] = '\0';
                 }

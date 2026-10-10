@@ -344,3 +344,23 @@ CNT9 -- 6
 (at (select {r: ((fn [] (concat 'p "!"))) from: T9}) 'r) -- [x! y! z!]
 ;; return ends a lambda written in query text, which stays interpreted
 (at (select {r: ((fn [a] (return (concat a "!")) a) v) from: T9}) 'r) -- ["1!" "2!" "3!"]
+
+;; ── a closure is never inlined into a query ───────────────────────────────
+;; Its body reads its captures; inlined, a captured name would read a source
+;; column or a global of that name.  Whether the closure has run before (it
+;; compiles on its second call) must not matter.
+(set mk9 (fn [s] (fn [v] (concat v s))))
+(set f9 (mk9 "!"))
+(set TC9 (table [name s] (list ["a" "b"] ["x" "y"])))
+(at (select {r: (f9 name) e: (reverse s) from: TC9}) 'r) -- ["a!" "b!"]
+(at (select {r: (f9 name) from: TC9}) 'r) -- ["a!" "b!"]
+(count (select {from: TC9 where: (== (f9 name) "a!")})) -- 1
+(f9 "q") -- "q!"
+(f9 "q") -- "q!"
+(at (select {r: (f9 name) e: (reverse s) from: TC9}) 'r) -- ["a!" "b!"]
+(at (select {r: (f9 name) from: TC9}) 'r) -- ["a!" "b!"]
+(set G9 "g")
+(set mkg9 (fn [G9] (fn [v] (concat v G9))))
+(set fg9 (mkg9 "!"))
+(at (select {r: (fg9 name) e: (reverse s) from: TC9}) 'r) -- ["a!" "b!"]
+(at (select {r: (fg9 name) from: TC9}) 'r) -- ["a!" "b!"]

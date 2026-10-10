@@ -3269,8 +3269,8 @@ op_scope_end: {
     ray_t *syms = POP();
     /* A local rebound inside the window has unknown provenance: clear its
      * flag, as for any value the VM did not derive itself. */
-    ray_t *before[64];
-    int64_t nsync = syms->len < 64 ? syms->len : 64;
+    ray_t *before[256];   /* a frame has at most 256 slots (compile.c add_local) */
+    int64_t nsync = syms->len < 256 ? syms->len : 256;
     for (int64_t i = 0; i < nsync; i++) before[i] = LOCAL(i);
     ray_env_scope_sync((const int64_t*)ray_data(syms),
                        (int32_t)syms->len, &vm.ps[vm.fp]);
