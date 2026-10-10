@@ -449,9 +449,10 @@ hide the q25/q27 rows: on the old P2 gen-0 splayed arm q25 is 0.95 -> 1.03
 ms and q27 0.93 -> 1.08 ms, which fail because p2 crosses 1 ms, so the
 sub-ms clause does not apply (the PI section's 15-round confirm of q25,
 1.056 on a different head/dev pair, is a separate measurement and is not
-evidence about this arm))  Geometric means cover
-only queries whose base median is >= 1 ms; the excluded queries are
-printed (`below_1ms_excluded_from_gmean`), because a +-6% ratio wobble on
+evidence about this arm).  Geometric means cover only queries whose base
+median is >= 1 ms; the excluded queries are printed per column
+(`below_1ms_excluded_from_warm_gmean`, `below_1ms_excluded_from_first_gmean`,
+`below_1ms_excluded_from_cold_gmean`), because a +-6% ratio wobble on
 0.2 us answers moves a gmean and means nothing.  Above 4 ms A/A stays within
 +-1.1%, so 1.05 keeps a 4x margin.
 
@@ -459,12 +460,14 @@ Query classes are taken from the materialization the run measured (the
 `mat` rows), not a fixed list: q5, q20, q36 do not materialize; splayed q18
 and q39, and parted q39, do.  A SCAN_ONLY-list query that materializes stays
 gated as scan-only (warm, first, cold) and fails `no_unexpected_materialization`
-unless it is in P3_DEFERRALS for that arm; a missing `mat` row fails the same field.  The plan's pre-run SCAN_ONLY list is kept as a cross-check and its
-disagreements are printed.  Expected P3 deferrals are a data table
+unless it is in P3_DEFERRALS for that arm; a missing `mat` row fails the
+same field.  The plan's pre-run SCAN_ONLY list is kept as a cross-check and
+its disagreements are printed.  Expected P3 deferrals are a data table
 (`P3_DEFERRALS`) in p2_summary.py; the output has GATE (strict), GATE
 (P3-exempt) and the exempt list with each exempted query's measured numbers.
-Each deferral has a `max_ratio` (about 1.5x its first measured ratio); above it
-the exemption lapses and the clause fails.
+Each deferral has a `max_ratio` per arm (about 1.5x its measured ratio, set
+from the gate re-run below); above it the exemption lapses and the clause
+fails.
 
 The 1.10 bound on first and cold is a per-query tolerance for cold and
 first-run noise.  The spec's "cold is faster" requirement is carried by the
@@ -797,9 +800,440 @@ Gate (failing clauses, worst five, ratio gen2/gen0 or p2/base):
 - gen0 parted warm: q28 1.168, q1 1.069, q21 1.014, q31 1.010, q23 1.008
 - gen0 ragged warm: q8 1.468, q28 1.174, q2 1.136, q41 1.051, q40 1.039
 
+Gate lines of this run as printed by the current p2_summary.py (noise floor,
+measured classes, the first P3_DEFERRALS table; the first run's own printout
+used an older clause set):
+
 ```
-GATE (strict) splayed[answers=PASS warm=FAIL cold=FAIL first=FAIL materializing_warm=FAIL scan_only_zero=FAIL first_total=PASS] parted[answers=PASS warm=FAIL cold=FAIL first=FAIL materializing_warm=FAIL scan_only_zero=FAIL] gen0-splayed[answers=PASS warm=FAIL] gen0-parted[answers=PASS warm=FAIL q16_first=PASS] gen0-ragged[answers=PASS warm=FAIL]
+GATE (strict) splayed[answers=PASS warm=FAIL cold=FAIL first=FAIL materializing_warm=FAIL no_unexpected_materialization=FAIL first_total=PASS] parted[answers=PASS warm=FAIL cold=FAIL first=FAIL materializing_warm=FAIL no_unexpected_materialization=FAIL] gen0-splayed[answers=PASS warm=FAIL] gen0-parted[answers=PASS warm=FAIL q16_first=PASS] gen0-ragged[answers=PASS warm=FAIL]
 P2 GATE (strict): FAIL
-GATE (P3-deferred q18 q39 exempt) splayed[answers=PASS warm=FAIL cold=FAIL first=FAIL materializing_warm=FAIL scan_only_zero=PASS first_total=PASS] parted[answers=PASS warm=FAIL cold=FAIL first=FAIL materializing_warm=FAIL scan_only_zero=PASS] gen0-splayed[answers=PASS warm=FAIL] gen0-parted[answers=PASS warm=FAIL q16_first=PASS] gen0-ragged[answers=PASS warm=FAIL]
-P2 GATE (P3-deferred q18 q39 exempt): FAIL
+GATE (P3-exempt) splayed[answers=PASS warm=FAIL cold=PASS first=FAIL materializing_warm=FAIL no_unexpected_materialization=PASS first_total=PASS] parted[answers=PASS warm=FAIL cold=FAIL first=FAIL materializing_warm=FAIL no_unexpected_materialization=PASS] gen0-splayed[answers=PASS warm=FAIL] gen0-parted[answers=PASS warm=FAIL q16_first=PASS] gen0-ragged[answers=PASS warm=FAIL]
+P2 GATE (P3-exempt): FAIL
 ```
+
+
+## P2 gate (re-run)
+
+Re-run of the P2 gate after the gate fix tasks 17a-17h, on HEAD a09a54eb
+(release build, sha256 4b72499b44ed) against the base 80a28e49 (release
+build from `git archive`, sha256 c204703a62de).  Method, loads, arms and
+store sizes are as in "P2 range reads" above: `p2_bench.sh all` as
+committed, 5 alternated rounds, 3 cold trials per query (fadvise eviction),
+full answers compared; the ragged partition 9 keeps 40 columns.  Raw data:
+/home/hetoku/data/tmp/p2_rerun/p2.tsv (summary.txt beside it).  The machine
+was otherwise idle (19:13-21:05).
+
+Sizes are unchanged (g0 5 948 677 939 B, g2 3 307 128 731 B; p0
+4 807 844 987 B, p2 2 072 366 907 B).  Peak RSS over all 43 queries: g0
+5 111 620 kB, g2 8 099 412 kB (x1.58; the q24-q27 whole-row top-k
+gathers stay cached); p0 15 208 624 kB, p2 15 875 328 kB (x1.04).
+Answers: identical on all five arms (0 mismatches, 0 order differences).
+
+### Gate lines
+
+```
+GATE (strict) splayed[answers=PASS warm=FAIL cold=FAIL first=FAIL materializing_warm=FAIL no_unexpected_materialization=FAIL first_total=PASS] parted[answers=PASS warm=FAIL cold=PASS first=FAIL materializing_warm=FAIL no_unexpected_materialization=FAIL] gen0-splayed[answers=PASS warm=PASS] gen0-parted[answers=PASS warm=PASS q16_first=PASS] gen0-ragged[answers=PASS warm=PASS]
+P2 GATE (strict): FAIL
+GATE (P3-exempt) splayed[answers=PASS warm=FAIL cold=PASS first=FAIL materializing_warm=PASS no_unexpected_materialization=PASS first_total=PASS] parted[answers=PASS warm=FAIL cold=PASS first=FAIL materializing_warm=FAIL no_unexpected_materialization=PASS] gen0-splayed[answers=PASS warm=PASS] gen0-parted[answers=PASS warm=PASS q16_first=PASS] gen0-ragged[answers=PASS warm=PASS]
+P2 GATE (P3-exempt): FAIL
+```
+
+**The P2 gate fails in both variants.**  Generation 0 now passes on every
+arm (splayed warm gmean 0.972, parted 0.772, ragged 0.759; q16 parted first
+run 146.4 -> 100.8 ms), as do answers, no_unexpected_materialization,
+splayed first_total (1.836 vs PI's 2.99) and both cold clauses with the
+deferrals.  The P3-exempt failures:
+
+| clause | query | a -> b (ms) | ratio | deferral |
+|---|---|---|---|---|
+| splayed warm (scan-only) | q33 | 203.29 -> 226.35 | 1.113 | none |
+| splayed warm (scan-only) | q34 | 39.03 -> 41.10 | 1.053 | none |
+| splayed first (scan-only) | q2 | 1.70 -> 5.49 | 3.219 | q2 has a warm deferral only |
+| parted warm (scan-only) | q33 | 211.41 -> 227.61 | 1.077 | none |
+| parted first (scan-only) | q8 | 8.33 -> 11.87 | 1.424 | q8 has a warm deferral only |
+| parted materializing warm | q32 | 68.71 -> 73.86 | 1.075 | none |
+
+No other query fails a clause after the exemptions.  Below the bound but
+close: splayed q35 warm 1.048, parted q31 warm 1.033.  Every failing ratio
+reproduces in all five rounds: splayed q33 g0 203.3-205.3 against g2
+226.4-230.8 ms; q34 39.0-39.3 against 41.1-41.4 ms; q2 first run 1.64-1.82
+against 5.06-5.60 ms.
+
+### What the fixes moved (first gate run -> re-run, ratio gen2/gen0)
+
+- Splayed warm: q2 5.288 -> 1.086 (0.66 ms), q8 3.585 -> 1.424, q17
+  1.284 -> 1.016, q20 2.888 -> 0.633, q42 2.611 -> 1.664, q15 1.411 ->
+  1.023, q19 1.180 -> 1.031.  q33 1.116 -> 1.113 (unchanged).
+- Parted warm: q18 5.676 -> 1.088, q8 3.020 -> 1.060, q2 1.494 -> 1.002,
+  q31 2.627 -> 1.033, q32 2.477 -> 1.075, q19 1.638 -> 1.027, q42 1.716 ->
+  1.237, q36 1.257 -> 1.002.  q33 1.144 -> 1.077.
+- Parted q11, q12, q14 and q23 now gather only their own columns (2-4
+  instead of 105); p0 warm q11 357 -> 24 ms, q14 1 117 -> 102 ms; their p2
+  first runs are 1.10-1.28x p0 instead of 1.7-4.7x.
+- First runs: splayed q24-q27 790-830 -> 450-484 ms (still 14-105x g0: the
+  whole-row top-k gather materializes 100 columns); all-43 first-run total
+  2.453 -> 1.836.
+- Generation 0 against the base: parted q28 1.168 -> 0.983, ragged q28
+  1.174 -> 0.990, ragged q8 1.468 -> 0.906, ragged q2 1.136 -> 0.976,
+  splayed q25 / q27 0.874 / 0.932, splayed q28 0.986.
+
+### Profiles of the worst failures
+
+Profiled on recreated splayed stores (deleted afterwards), the gate's p2
+binary, perf without call graphs.
+
+- **Splayed q33** (`by {WatchID ClientIP}`, count, sum, avg, `desc: c
+  take: 10`; 25 runs).  g2 takes the fused radix pass that 17c admitted
+  for 32-byte records; g0 keeps the two-pass radix over the plain columns.
+  Radix samples: g0 96.1 K (agg_radix_group_fn 30.8%, scatter_fn 23.2%,
+  count_fn 6.9%); g2 107.9 K (agg_radix_group_fused_fn 36.9%,
+  agg_radix_chunk_fused 14.9%, agg_radix_stage_block 9.2%,
+  fused_totals_fn 1.1%), so +12% in the radix itself.  Decode is small
+  (dec_fast_runs 2.3%), and memmove is about the same on both (12-14%).  The
+  residual is the fused route's staging copy and a slower group pass over
+  chunk-major partitions, not decoding.  Parted q33 (1.077) has the same
+  shape.
+- **Splayed q2 first run** (`count where AdvEngineID != 0`; 1.6 -> 5.5
+  ms; run 2 is 0.8 ms on both).  CPU and page faults are about equal over
+  the process (g0 333.7 ms task-clock and 36 073 faults; g2 342.5 ms and
+  35 675).  The difference is one kernel hotspot (+4 951 samples over 60
+  processes; the symbol is hidden by kptr_restrict) and dec_fast_runs
+  (+1 111).  On g2 each pool worker creates its 32 MB buddy arena
+  (`madvise(MADV_HUGEPAGE)` on 8 arenas, seen in strace) on its first decode
+  and faults in fresh zeroed huge pages; g0's count reads the mapped plain
+  column in place and allocates nothing in the workers.  This is a fixed
+  first-parallel-decode cost per process (about 4 ms), not per query.  By
+  the same reading, parted q8's first run (+3.5 ms) is the same fixed
+  cost.  This was inferred and not profiled separately.
+- **Splayed q34** (`by URL`, count, `take: 10`): g2 adds the URL key decode
+  (dec_fast 9.7% of samples); agg_dense_partition_count_rows drops on g2,
+  and the net is +5%.
+
+### Remaining P3 deferrals (P3_DEFERRALS, max_ratio about 1.5x the re-run ratio, per arm)
+
+```
+q2/A/warm[run-level compute (count over RLE runs)]: 0.61 -> 0.66 ms (x1.086) EXEMPTED
+q8/A/warm[run-level compute (group over RLE runs)]: 3.55 -> 5.05 ms (x1.424) EXEMPTED
+q8/B/warm[run-level compute (group over RLE runs)]: 6.28 -> 6.66 ms (x1.060) EXEMPTED
+q18/A/first[row-list gather (first-n keys published, P3 path 2)]: 13.46 -> 26.70 ms (x1.983) EXEMPTED
+q18/B/warm[row-list gather (parted first-n compact build, P3)]: 17.06 -> 18.56 ms (x1.088) EXEMPTED
+q39/A/first[selection gather (P3 path 2)]: 14.55 -> 34.94 ms (x2.402) EXEMPTED
+q39/B/first[selection gather (P3 path 2)]: 27.30 -> 41.04 ms (x1.503) EXEMPTED
+q39/A/cold[selection gather reads whole columns cold (P3)]: 38.04 -> 81.94 ms (x2.154) EXEMPTED
+q42/A/warm[point gathers of the selected keys (P3)]: 4.52 -> 7.53 ms (x1.664) EXEMPTED
+q42/B/warm[point gathers of the selected keys (P3)]: 13.21 -> 16.34 ms (x1.237) EXEMPTED
+q24/A/rss[top-k output gather RSS]: arm peak-RSS 5111620 -> 8099412 kB (x1.58, max 2.4) not gated
+q25/A/rss[top-k output gather RSS]: arm peak-RSS 5111620 -> 8099412 kB (x1.58, max 2.4) not gated
+q26/A/rss[top-k output gather RSS]: arm peak-RSS 5111620 -> 8099412 kB (x1.58, max 2.4) not gated
+q27/A/rss[top-k output gather RSS]: arm peak-RSS 5111620 -> 8099412 kB (x1.58, max 2.4) not gated
+```
+
+Removed because their clauses now pass: q2 parted warm, q18 splayed warm,
+q18 parted first, q39 warm (both loads), q39 parted cold, and the parted
+q24-q27 RSS rows (parted peak RSS x1.04).
+
+### Per-query tables (re-run)
+
+#### arm A: splayed g0 vs g2 (ms; ratio = g2/g0)
+
+| q | warm_a | warm_b | wr | first_a | first_b | fr | 3run_a | 3run_b | tr | cold_a | cold_b | cr | materialized | answers |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| q1 | 0.00 | 0.00 | 1.000 | 0.01 | 0.01 | 0.949 | 0.01 | 0.01 | 0.947 | 0.01 | 0.01 | 1.599 | [] | same |
+| q2 | 0.61 | 0.66 | 1.086 | 1.70 | 5.49 | 3.219 | 3.26 | 6.89 | 2.111 | 38.51 | 6.16 | 0.160 | [] | same |
+| q3 | 3.79 | 0.00 | 0.001 | 5.74 | 0.04 | 0.007 | 13.40 | 0.05 | 0.004 | 94.24 | 0.04 | 0.000 | [] | same |
+| q4 | 0.00 | 0.00 | 1.128 | 0.03 | 0.03 | 1.214 | 0.03 | 0.03 | 1.206 | 0.02 | 0.03 | 1.551 | [] | same |
+| q5 | 0.00 | 0.00 | 1.303 | 0.03 | 0.03 | 1.030 | 0.03 | 0.03 | 1.033 | 0.03 | 0.03 | 0.989 | [] | same |
+| q6 | 0.00 | 0.00 | 1.201 | 0.03 | 0.03 | 0.881 | 0.03 | 0.03 | 0.889 | 0.04 | 0.03 | 0.981 | [] | same |
+| q7 | 0.00 | 0.00 | 1.103 | 0.02 | 0.04 | 1.766 | 0.02 | 0.04 | 1.652 | 0.02 | 0.04 | 1.680 | [] | same |
+| q8 | 3.55 | 5.05 | 1.424 | 9.44 | 9.87 | 1.046 | 16.69 | 20.11 | 1.205 | 41.36 | 10.76 | 0.260 | [] | same |
+| q9 | 75.06 | 74.98 | 0.999 | 114.34 | 125.02 | 1.093 | 266.42 | 278.85 | 1.047 | 698.31 | 155.01 | 0.222 | [RegionID UserID] | same |
+| q10 | 68.90 | 72.07 | 1.046 | 104.68 | 120.58 | 1.152 | 242.78 | 267.98 | 1.104 | 427.77 | 158.53 | 0.371 | [RegionID UserID] | same |
+| q11 | 16.12 | 16.04 | 0.995 | 25.11 | 40.65 | 1.619 | 57.67 | 73.03 | 1.266 | 255.95 | 61.36 | 0.240 | [UserID MobilePhoneModel] | same |
+| q12 | 16.18 | 16.24 | 1.004 | 25.81 | 44.30 | 1.717 | 59.76 | 77.41 | 1.295 | 291.81 | 65.94 | 0.226 | [UserID MobilePhone MobilePhoneModel] | same |
+| q13 | 32.01 | 32.08 | 1.002 | 41.77 | 48.69 | 1.166 | 106.63 | 113.51 | 1.065 | 112.69 | 63.89 | 0.567 | [SearchPhrase] | same |
+| q14 | 62.67 | 63.03 | 1.006 | 88.97 | 105.38 | 1.184 | 217.83 | 236.32 | 1.085 | 315.91 | 140.80 | 0.446 | [UserID SearchPhrase] | same |
+| q15 | 36.50 | 37.35 | 1.023 | 48.21 | 57.46 | 1.192 | 122.73 | 133.70 | 1.089 | 155.79 | 102.64 | 0.659 | [SearchPhrase] | same |
+| q16 | 69.84 | 67.42 | 0.965 | 94.34 | 87.91 | 0.932 | 235.40 | 226.02 | 0.960 | 255.81 | 162.48 | 0.635 | [] | same |
+| q17 | 92.86 | 94.32 | 1.016 | 128.91 | 124.79 | 0.968 | 316.31 | 316.21 | 1.000 | 474.95 | 254.52 | 0.536 | [] | same |
+| q18 | 6.85 | 6.86 | 1.000 | 13.46 | 26.70 | 1.983 | 27.28 | 40.65 | 1.490 | 663.98 | 61.71 | 0.093 | [UserID SearchPhrase] | same |
+| q19 | 138.42 | 142.69 | 1.031 | 210.43 | 211.84 | 1.007 | 490.20 | 502.86 | 1.026 | 674.62 | 439.78 | 0.652 | [EventTime] | same |
+| q20 | 1.14 | 0.72 | 0.633 | 6.76 | 5.80 | 0.859 | 9.42 | 7.38 | 0.784 | 57.72 | 16.35 | 0.283 | [] | same |
+| q21 | 41.72 | 41.77 | 1.001 | 45.25 | 53.08 | 1.173 | 130.18 | 137.60 | 1.057 | 77.09 | 92.35 | 1.198 | [URL] | same |
+| q22 | 27.55 | 27.50 | 0.998 | 32.10 | 58.67 | 1.828 | 87.85 | 114.60 | 1.304 | 185.06 | 133.91 | 0.724 | [UserID URL SearchPhrase] | same |
+| q23 | 48.77 | 48.92 | 1.003 | 60.42 | 92.66 | 1.534 | 159.54 | 192.46 | 1.206 | 492.28 | 204.24 | 0.415 | [Title UserID URL SearchPhrase] | same |
+| q24 | 29.30 | 29.43 | 1.005 | 34.47 | 483.77 | 14.036 | 93.41 | 542.82 | 5.811 | 618.09 | 1229.60 | 1.989 | <100 columns> | same |
+| q25 | 0.94 | 0.95 | 1.011 | 4.46 | 451.93 | 101.392 | 6.44 | 454.06 | 70.496 | 305.32 | 1206.99 | 3.953 | <100 columns> | same |
+| q26 | 10.82 | 10.80 | 0.998 | 15.31 | 459.17 | 29.984 | 37.01 | 481.05 | 12.997 | 585.28 | 1227.12 | 2.097 | <100 columns> | same |
+| q27 | 0.98 | 0.90 | 0.919 | 4.27 | 450.00 | 105.411 | 6.42 | 451.97 | 70.425 | 302.35 | 1207.00 | 3.992 | <100 columns> | same |
+| q28 | 80.93 | 66.20 | 0.818 | 83.14 | 80.92 | 0.973 | 246.00 | 215.26 | 0.875 | 219.68 | 120.88 | 0.550 | [URL] | same |
+| q29 | 349.56 | 349.14 | 0.999 | 436.06 | 445.20 | 1.021 | 1136.91 | 1146.86 | 1.009 | 512.71 | 492.02 | 0.960 | [Referer] | same |
+| q30 | 0.02 | 0.03 | 1.709 | 2.81 | 5.36 | 1.904 | 2.88 | 5.43 | 1.884 | 56.07 | 11.36 | 0.203 | [ResolutionWidth] | same |
+| q31 | 51.88 | 51.59 | 0.994 | 69.69 | 94.36 | 1.354 | 173.70 | 198.10 | 1.140 | 317.84 | 139.08 | 0.438 | [ClientIP IsRefresh ResolutionWidth SearchEngineID SearchPhrase] | same |
+| q32 | 58.95 | 58.87 | 0.999 | 85.08 | 107.21 | 1.260 | 203.40 | 226.66 | 1.114 | 442.13 | 283.20 | 0.641 | [ClientIP IsRefresh ResolutionWidth SearchPhrase] | same |
+| q33 | 203.29 | 226.35 | 1.113 | 365.04 | 373.20 | 1.022 | 776.52 | 833.91 | 1.074 | 593.34 | 566.05 | 0.954 | [] | same |
+| q34 | 39.03 | 41.10 | 1.053 | 69.48 | 73.98 | 1.065 | 148.04 | 156.24 | 1.055 | 141.98 | 110.62 | 0.779 | [] | same |
+| q35 | 39.29 | 41.17 | 1.048 | 69.90 | 73.94 | 1.058 | 151.71 | 157.04 | 1.035 | 138.49 | 110.54 | 0.798 | [] | same |
+| q36 | 64.06 | 64.21 | 1.002 | 88.60 | 81.73 | 0.922 | 217.62 | 213.36 | 0.980 | 160.18 | 126.43 | 0.789 | [] | same |
+| q37 | 16.56 | 16.54 | 0.999 | 27.10 | 44.94 | 1.659 | 60.88 | 78.54 | 1.290 | 43.66 | 87.74 | 2.010 | [EventDate URL IsRefresh DontCountHits] | same |
+| q38 | 14.91 | 14.91 | 1.000 | 24.54 | 42.29 | 1.724 | 55.71 | 72.18 | 1.296 | 43.25 | 81.69 | 1.889 | [Title EventDate IsRefresh DontCountHits] | same |
+| q39 | 7.16 | 7.23 | 1.010 | 14.55 | 34.94 | 2.402 | 28.97 | 49.55 | 1.710 | 38.04 | 81.94 | 2.154 | [EventDate URL IsRefresh IsLink IsDownload] | same |
+| q40 | 58.91 | 58.46 | 0.992 | 90.61 | 127.01 | 1.402 | 210.68 | 245.31 | 1.164 | 118.32 | 229.58 | 1.940 | [EventDate CounterID URL Referer IsRefresh TraficSourceID SearchEngineID AdvEngineID] | same |
+| q41 | 5.79 | 5.75 | 0.993 | 13.17 | 27.12 | 2.059 | 25.41 | 39.19 | 1.542 | 74.77 | 48.43 | 0.648 | [EventDate CounterID IsRefresh TraficSourceID] | same |
+| q42 | 4.52 | 7.53 | 1.664 | 11.14 | 27.83 | 2.498 | 20.54 | 43.31 | 2.109 | 39.07 | 39.70 | 1.016 | [EventDate CounterID IsRefresh DontCountHits] | same |
+| q43 | 8.95 | 8.90 | 0.994 | 18.32 | 41.98 | 2.291 | 37.10 | 60.29 | 1.625 | 41.87 | 146.39 | 3.497 | [EventTime EventDate CounterID IsRefresh DontCountHits] | same |
+
+```
+totals over all 43: warm 1788.4 vs 1807.8 (1.011); first run 2585.3 vs 4746.0 (1.836); 3-run 6202.8 vs 8416.9 (1.357)
+answer_mismatches none
+order_differences none
+scan_only(gated) n=17; gmeans over base>=1ms (per column): warm n=11 0.512, first n=12 0.821, cold n=12 0.270; worst warm=1.424
+below_1ms_excluded_from_warm_gmean q1 q2 q4 q5 q6 q7
+below_1ms_excluded_from_first_gmean q1 q4 q5 q6 q7
+below_1ms_excluded_from_cold_gmean q1 q4 q5 q6 q7
+mat rows missing none
+scan_only_list_but_materializing q18 q39
+measured_materializing q9(2 cols) q10(2 cols) q11(2 cols) q12(3 cols) q13(1 cols) q14(2 cols) q15(1 cols) q18(2 cols) q19(1 cols) q21(1 cols) q22(3 cols) q23(4 cols) q24(100 cols) q25(100 cols) q26(100 cols) q27(100 cols) q28(1 cols) q29(1 cols) q30(1 cols) q31(5 cols) q32(4 cols) q37(4 cols) q38(4 cols) q39(5 cols) q40(8 cols) q41(4 cols) q42(4 cols) q43(5 cols)
+class_vs_SCAN_ONLY_list_disagreements q5(measured scan, list other) q6(measured scan, list other) q18(measured materializing, list scan) q20(measured scan, list other) q36(measured scan, list other) q39(measured materializing, list scan)
+worst5 warm [(1.424, 'q8'), (1.303, 'q5'), (1.201, 'q6'), (1.128, 'q4'), (1.113, 'q33')]
+worst5 cold [(2.154, 'q39'), (1.68, 'q7'), (1.599, 'q1'), (1.551, 'q4'), (0.989, 'q5')]
+worst5 first [(3.219, 'q2'), (2.402, 'q39'), (1.983, 'q18'), (1.766, 'q7'), (1.214, 'q4')]
+worst5 materializing_warm [(1.709, 'q30'), (1.664, 'q42'), (1.046, 'q10'), (1.031, 'q19'), (1.023, 'q15')]
+first_run_total_ratio 1.836 (PI after P1: 2.99)
+pi_row q41 warm 0.993 first 2.059 3run 1.542
+pi_row q42 warm 1.664 first 2.498 3run 2.109
+```
+
+#### arm B: parted p0 vs p2 (ms; ratio = p2/p0)
+
+| q | warm_a | warm_b | wr | first_a | first_b | fr | 3run_a | 3run_b | tr | cold_a | cold_b | cr | materialized | answers |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| q1 | 0.00 | 0.00 | 0.939 | 0.01 | 0.01 | 1.021 | 0.01 | 0.01 | 1.013 | 0.01 | 0.01 | 1.641 | [] | same |
+| q2 | 6.59 | 6.61 | 1.002 | 17.02 | 16.66 | 0.979 | 30.59 | 29.92 | 0.978 | 46.71 | 16.12 | 0.345 | [] | same |
+| q3 | 526.01 | 5.80 | 0.011 | 546.45 | 10.36 | 0.019 | 1605.41 | 22.22 | 0.014 | 572.75 | 14.51 | 0.025 | [] | same |
+| q4 | 273.95 | 7.40 | 0.027 | 324.65 | 12.19 | 0.038 | 875.53 | 27.25 | 0.031 | 364.44 | 31.48 | 0.086 | [] | same |
+| q5 | 275.75 | 0.00 | 0.000 | 318.24 | 0.03 | 0.000 | 879.49 | 0.03 | 0.000 | 367.60 | 0.03 | 0.000 | [] | same |
+| q6 | 340.90 | 340.28 | 0.998 | 9631.26 | 9644.03 | 1.001 | 10315.67 | 10322.85 | 1.001 | 9704.46 | 9738.85 | 1.004 | [SearchPhrase] | same |
+| q7 | 528.29 | 2.55 | 0.005 | 552.67 | 6.78 | 0.012 | 1614.34 | 12.05 | 0.007 | 584.52 | 6.99 | 0.012 | [] | same |
+| q8 | 6.28 | 6.66 | 1.060 | 8.33 | 11.87 | 1.424 | 21.43 | 25.28 | 1.179 | 40.91 | 12.13 | 0.297 | [] | same |
+| q9 | 85.49 | 83.04 | 0.971 | 151.33 | 168.06 | 1.111 | 325.67 | 339.87 | 1.044 | 392.07 | 190.61 | 0.486 | [RegionID UserID] | same |
+| q10 | 79.28 | 79.92 | 1.008 | 152.67 | 173.23 | 1.135 | 317.84 | 338.26 | 1.064 | 445.44 | 204.18 | 0.458 | [RegionID UserID] | same |
+| q11 | 24.22 | 23.35 | 0.964 | 59.87 | 66.57 | 1.112 | 110.25 | 115.41 | 1.047 | 386.31 | 86.32 | 0.223 | [UserID MobilePhoneModel] | same |
+| q12 | 26.76 | 25.89 | 0.968 | 61.73 | 71.87 | 1.164 | 115.70 | 123.51 | 1.067 | 442.56 | 91.15 | 0.206 | [UserID MobilePhone MobilePhoneModel] | same |
+| q13 | 40.16 | 39.51 | 0.984 | 70.53 | 76.09 | 1.079 | 151.55 | 160.77 | 1.061 | 155.34 | 89.21 | 0.574 | [SearchPhrase] | same |
+| q14 | 102.09 | 101.84 | 0.998 | 153.81 | 168.49 | 1.095 | 356.99 | 376.16 | 1.054 | 447.03 | 198.01 | 0.443 | [UserID SearchPhrase] | same |
+| q15 | 46.66 | 46.36 | 0.994 | 89.59 | 87.05 | 0.972 | 185.61 | 181.49 | 0.978 | 212.99 | 104.60 | 0.491 | [SearchPhrase] | same |
+| q16 | 72.51 | 67.96 | 0.937 | 98.04 | 88.21 | 0.900 | 244.76 | 225.69 | 0.922 | 249.61 | 151.20 | 0.606 | [] | same |
+| q17 | 95.54 | 94.71 | 0.991 | 134.48 | 127.27 | 0.946 | 328.35 | 317.25 | 0.966 | 475.44 | 238.70 | 0.502 | [] | same |
+| q18 | 17.06 | 18.56 | 1.088 | 83.65 | 33.74 | 0.403 | 118.10 | 71.25 | 0.603 | 338.42 | 60.62 | 0.179 | [] | same |
+| q19 | 141.22 | 145.00 | 1.027 | 335.90 | 247.66 | 0.737 | 622.09 | 542.34 | 0.872 | 758.54 | 368.74 | 0.486 | [EventTime] | same |
+| q20 | 4.64 | 1.58 | 0.341 | 14.10 | 12.11 | 0.859 | 23.72 | 15.78 | 0.665 | 157.26 | 22.40 | 0.142 | [] | same |
+| q21 | 41.61 | 41.81 | 1.005 | 46.89 | 57.16 | 1.219 | 130.39 | 144.36 | 1.107 | 87.97 | 98.27 | 1.117 | [URL] | same |
+| q22 | 60.42 | 60.33 | 0.998 | 86.10 | 111.74 | 1.298 | 208.76 | 235.71 | 1.129 | 231.42 | 181.49 | 0.784 | [UserID URL SearchPhrase] | same |
+| q23 | 90.09 | 89.70 | 0.996 | 119.09 | 151.84 | 1.275 | 300.76 | 332.59 | 1.106 | 471.79 | 267.51 | 0.567 | [Title UserID URL SearchPhrase] | same |
+| q24 | 44.58 | 43.67 | 0.980 | 136.70 | 611.73 | 4.475 | 225.91 | 703.59 | 3.114 | 9627.33 | 1710.92 | 0.178 | <105 columns> | same |
+| q25 | 1055.56 | 1049.63 | 0.994 | 1324.40 | 1695.02 | 1.280 | 3459.65 | 3799.65 | 1.098 | 9637.01 | 2802.51 | 0.291 | <105 columns> | same |
+| q26 | 1107.19 | 1099.57 | 0.993 | 1467.45 | 1841.83 | 1.255 | 3693.59 | 4043.28 | 1.095 | 9841.52 | 2960.88 | 0.301 | <105 columns> | same |
+| q27 | 1070.09 | 1059.40 | 0.990 | 1337.34 | 1705.59 | 1.275 | 3481.39 | 3840.98 | 1.103 | 9685.41 | 2824.07 | 0.292 | <105 columns> | same |
+| q28 | 90.95 | 87.22 | 0.959 | 146.37 | 148.83 | 1.017 | 328.87 | 326.29 | 0.992 | 306.51 | 187.99 | 0.613 | [URL] | same |
+| q29 | 356.07 | 356.45 | 1.001 | 466.66 | 472.08 | 1.012 | 1185.18 | 1186.91 | 1.001 | 556.14 | 515.04 | 0.926 | [Referer] | same |
+| q30 | 259.57 | 261.38 | 1.007 | 278.00 | 286.12 | 1.029 | 817.88 | 834.14 | 1.020 | 285.72 | 297.50 | 1.041 | [ResolutionWidth] | same |
+| q31 | 54.99 | 56.81 | 1.033 | 125.08 | 104.90 | 0.839 | 236.97 | 223.06 | 0.941 | 425.79 | 140.07 | 0.329 | [SearchPhrase] | same |
+| q32 | 68.71 | 73.86 | 1.075 | 178.93 | 132.71 | 0.742 | 317.34 | 282.16 | 0.889 | 617.89 | 297.80 | 0.482 | [SearchPhrase] | same |
+| q33 | 211.41 | 227.61 | 1.077 | 372.78 | 390.88 | 1.049 | 807.99 | 847.37 | 1.049 | 612.81 | 613.61 | 1.001 | [] | same |
+| q34 | 42.93 | 44.02 | 1.025 | 95.60 | 78.23 | 0.818 | 181.73 | 166.67 | 0.917 | 179.56 | 117.91 | 0.657 | [] | same |
+| q35 | 42.87 | 44.05 | 1.028 | 95.81 | 78.05 | 0.815 | 182.40 | 167.37 | 0.918 | 180.97 | 116.55 | 0.644 | [] | same |
+| q36 | 145.14 | 145.50 | 1.002 | 213.77 | 197.79 | 0.925 | 511.69 | 494.86 | 0.967 | 298.14 | 207.53 | 0.696 | [] | same |
+| q37 | 35.93 | 34.19 | 0.952 | 71.33 | 83.84 | 1.175 | 143.19 | 153.65 | 1.073 | 224.38 | 127.33 | 0.567 | [EventDate URL IsRefresh DontCountHits] | same |
+| q38 | 34.95 | 33.26 | 0.952 | 67.59 | 84.08 | 1.244 | 143.55 | 151.44 | 1.055 | 222.49 | 127.73 | 0.574 | [Title EventDate IsRefresh DontCountHits] | same |
+| q39 | 15.03 | 13.32 | 0.886 | 27.30 | 41.04 | 1.503 | 57.34 | 73.05 | 1.274 | 116.25 | 49.94 | 0.430 | [EventDate URL IsRefresh IsLink IsDownload] | same |
+| q40 | 116.16 | 116.46 | 1.003 | 423.77 | 364.75 | 0.861 | 658.30 | 601.00 | 0.913 | 788.41 | 457.05 | 0.580 | [EventDate IsRefresh] | same |
+| q41 | 17.57 | 17.14 | 0.976 | 39.42 | 58.70 | 1.489 | 74.96 | 97.70 | 1.303 | 265.79 | 229.63 | 0.864 | [EventDate CounterID IsRefresh TraficSourceID URLHash] | same |
+| q42 | 13.21 | 16.34 | 1.237 | 23.99 | 45.40 | 1.893 | 50.56 | 81.18 | 1.606 | 192.16 | 165.19 | 0.860 | [EventDate CounterID IsRefresh WindowClientWidth WindowClientHeight DontCountHits] | same |
+| q43 | 27.80 | 25.74 | 0.926 | 40.92 | 63.19 | 1.544 | 97.11 | 117.60 | 1.211 | 128.79 | 157.31 | 1.221 | [EventTime EventDate IsRefresh DontCountHits] | same |
+
+```
+totals over all 43: warm 7696.2 vs 6094.5 (0.792); first run 19989.6 vs 19827.8 (0.992); 3-run 35538.6 vs 32152.0 (0.905)
+answer_mismatches none
+order_differences none
+scan_only(gated) n=16; gmeans over base>=1ms (per column): warm n=15 0.159, first n=15 0.231, cold n=15 0.142; worst warm=1.088
+below_1ms_excluded_from_warm_gmean q1
+below_1ms_excluded_from_first_gmean q1
+below_1ms_excluded_from_cold_gmean q1
+mat rows missing none
+scan_only_list_but_materializing q39
+measured_materializing q6(1 cols) q9(2 cols) q10(2 cols) q11(2 cols) q12(3 cols) q13(1 cols) q14(2 cols) q15(1 cols) q19(1 cols) q21(1 cols) q22(3 cols) q23(4 cols) q24(105 cols) q25(105 cols) q26(105 cols) q27(105 cols) q28(1 cols) q29(1 cols) q30(1 cols) q31(1 cols) q32(1 cols) q37(4 cols) q38(4 cols) q39(5 cols) q40(2 cols) q41(5 cols) q42(6 cols) q43(4 cols)
+class_vs_SCAN_ONLY_list_disagreements q5(measured scan, list other) q20(measured scan, list other) q36(measured scan, list other) q39(measured materializing, list scan)
+worst5 warm [(1.088, 'q18'), (1.077, 'q33'), (1.06, 'q8'), (1.028, 'q35'), (1.025, 'q34')]
+worst5 cold [(1.641, 'q1'), (1.001, 'q33'), (0.696, 'q36'), (0.657, 'q34'), (0.644, 'q35')]
+worst5 first [(1.503, 'q39'), (1.424, 'q8'), (1.049, 'q33'), (1.021, 'q1'), (0.979, 'q2')]
+worst5 materializing_warm [(1.237, 'q42'), (1.075, 'q32'), (1.033, 'q31'), (1.027, 'q19'), (1.008, 'q10')]
+pi_row q41 warm 0.976 first 1.489 3run 1.303
+pi_row q42 warm 1.237 first 1.893 3run 1.606
+```
+
+#### arm C0: splayed g0, base vs p2 binary (ms; ratio = p2/base)
+
+| q | warm_a | warm_b | wr | first_a | first_b | fr | 3run_a | 3run_b | tr | cold_a | cold_b | cr | materialized | answers |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| q1 | 0.00 | 0.00 | 1.058 | 0.01 | 0.01 | 1.820 | 0.01 | 0.01 | 1.765 | nan | nan | nan |  | same |
+| q2 | 1.11 | 0.63 | 0.567 | 2.01 | 1.67 | 0.833 | 4.32 | 3.11 | 0.719 | nan | nan | nan |  | same |
+| q3 | 3.78 | 3.79 | 1.003 | 5.73 | 5.83 | 1.017 | 13.35 | 13.49 | 1.010 | nan | nan | nan |  | same |
+| q4 | 0.00 | 0.00 | 1.063 | 0.02 | 0.02 | 1.170 | 0.02 | 0.03 | 1.160 | nan | nan | nan |  | same |
+| q5 | 0.00 | 0.00 | 1.087 | 0.02 | 0.03 | 1.258 | 0.02 | 0.03 | 1.268 | nan | nan | nan |  | same |
+| q6 | 0.00 | 0.00 | 1.052 | 0.02 | 0.03 | 1.196 | 0.02 | 0.03 | 1.195 | nan | nan | nan |  | same |
+| q7 | 0.00 | 0.00 | 0.995 | 0.02 | 0.02 | 1.123 | 0.02 | 0.02 | 1.089 | nan | nan | nan |  | same |
+| q8 | 3.49 | 3.53 | 1.012 | 9.08 | 8.80 | 0.969 | 16.27 | 16.07 | 0.988 | nan | nan | nan |  | same |
+| q9 | 75.71 | 75.25 | 0.994 | 113.89 | 112.32 | 0.986 | 268.58 | 262.98 | 0.979 | nan | nan | nan |  | same |
+| q10 | 69.02 | 69.16 | 1.002 | 97.58 | 97.05 | 0.995 | 237.44 | 238.34 | 1.004 | nan | nan | nan |  | same |
+| q11 | 16.13 | 16.17 | 1.002 | 25.15 | 25.09 | 0.998 | 57.83 | 57.83 | 1.000 | nan | nan | nan |  | same |
+| q12 | 16.47 | 16.30 | 0.990 | 25.73 | 25.77 | 1.001 | 59.09 | 59.34 | 1.004 | nan | nan | nan |  | same |
+| q13 | 31.93 | 32.19 | 1.008 | 41.16 | 41.85 | 1.017 | 105.01 | 106.02 | 1.010 | nan | nan | nan |  | same |
+| q14 | 62.81 | 62.57 | 0.996 | 87.56 | 89.78 | 1.025 | 216.46 | 218.50 | 1.009 | nan | nan | nan |  | same |
+| q15 | 36.45 | 36.37 | 0.998 | 48.39 | 48.17 | 0.996 | 125.50 | 125.06 | 0.997 | nan | nan | nan |  | same |
+| q16 | 69.63 | 70.03 | 1.006 | 93.90 | 95.05 | 1.012 | 236.61 | 235.36 | 0.995 | nan | nan | nan |  | same |
+| q17 | 92.95 | 93.00 | 1.001 | 129.64 | 130.41 | 1.006 | 320.42 | 317.92 | 0.992 | nan | nan | nan |  | same |
+| q18 | 6.91 | 6.89 | 0.997 | 14.45 | 14.63 | 1.013 | 28.35 | 28.40 | 1.002 | nan | nan | nan |  | same |
+| q19 | 137.54 | 136.75 | 0.994 | 210.31 | 207.22 | 0.985 | 490.43 | 491.09 | 1.001 | nan | nan | nan |  | same |
+| q20 | 1.16 | 1.13 | 0.977 | 6.78 | 6.87 | 1.013 | 9.36 | 9.79 | 1.045 | nan | nan | nan |  | same |
+| q21 | 41.86 | 41.77 | 0.998 | 45.19 | 45.25 | 1.001 | 129.10 | 130.72 | 1.013 | nan | nan | nan |  | same |
+| q22 | 27.52 | 27.57 | 1.002 | 32.13 | 32.00 | 0.996 | 87.65 | 87.56 | 0.999 | nan | nan | nan |  | same |
+| q23 | 48.78 | 48.88 | 1.002 | 60.45 | 60.51 | 1.001 | 159.52 | 159.40 | 0.999 | nan | nan | nan |  | same |
+| q24 | 29.18 | 29.57 | 1.013 | 34.34 | 34.87 | 1.015 | 92.88 | 94.20 | 1.014 | nan | nan | nan |  | same |
+| q25 | 1.03 | 0.90 | 0.874 | 4.42 | 4.44 | 1.004 | 6.46 | 6.62 | 1.024 | nan | nan | nan |  | same |
+| q26 | 10.75 | 10.81 | 1.005 | 15.36 | 15.38 | 1.001 | 37.22 | 37.40 | 1.005 | nan | nan | nan |  | same |
+| q27 | 0.96 | 0.89 | 0.932 | 4.39 | 4.36 | 0.993 | 6.42 | 6.25 | 0.974 | nan | nan | nan |  | same |
+| q28 | 82.86 | 81.72 | 0.986 | 85.43 | 86.03 | 1.007 | 251.42 | 249.28 | 0.991 | nan | nan | nan |  | same |
+| q29 | 353.72 | 348.33 | 0.985 | 443.88 | 438.75 | 0.988 | 1157.92 | 1140.94 | 0.985 | nan | nan | nan |  | same |
+| q30 | 0.02 | 0.02 | 0.996 | 3.04 | 3.04 | 0.999 | 3.12 | 3.11 | 0.998 | nan | nan | nan |  | same |
+| q31 | 52.87 | 51.52 | 0.975 | 70.78 | 69.53 | 0.982 | 177.98 | 173.27 | 0.974 | nan | nan | nan |  | same |
+| q32 | 59.35 | 59.38 | 1.000 | 88.91 | 86.25 | 0.970 | 208.12 | 205.19 | 0.986 | nan | nan | nan |  | same |
+| q33 | 202.16 | 201.70 | 0.998 | 364.33 | 365.65 | 1.004 | 784.03 | 776.80 | 0.991 | nan | nan | nan |  | same |
+| q34 | 39.27 | 39.08 | 0.995 | 70.43 | 69.85 | 0.992 | 149.04 | 150.74 | 1.011 | nan | nan | nan |  | same |
+| q35 | 39.36 | 39.26 | 0.998 | 70.41 | 70.55 | 1.002 | 149.31 | 149.38 | 1.000 | nan | nan | nan |  | same |
+| q36 | 63.98 | 64.20 | 1.003 | 86.95 | 88.00 | 1.012 | 215.52 | 218.22 | 1.012 | nan | nan | nan |  | same |
+| q37 | 17.06 | 16.61 | 0.973 | 27.52 | 27.27 | 0.991 | 61.92 | 60.38 | 0.975 | nan | nan | nan |  | same |
+| q38 | 15.99 | 14.90 | 0.932 | 25.23 | 24.68 | 0.978 | 58.10 | 55.08 | 0.948 | nan | nan | nan |  | same |
+| q39 | 7.40 | 7.08 | 0.956 | 14.65 | 14.59 | 0.996 | 29.92 | 29.00 | 0.969 | nan | nan | nan |  | same |
+| q40 | 59.06 | 58.41 | 0.989 | 90.37 | 90.25 | 0.999 | 210.38 | 211.54 | 1.006 | nan | nan | nan |  | same |
+| q41 | 5.82 | 5.66 | 0.972 | 13.42 | 13.49 | 1.005 | 25.68 | 25.27 | 0.984 | nan | nan | nan |  | same |
+| q42 | 4.60 | 4.47 | 0.971 | 11.08 | 11.18 | 1.009 | 20.72 | 20.45 | 0.987 | nan | nan | nan |  | same |
+| q43 | 9.27 | 8.99 | 0.969 | 18.92 | 18.66 | 0.986 | 38.18 | 37.35 | 0.978 | nan | nan | nan |  | same |
+
+```
+totals over all 43: warm 1797.9 vs 1785.5 (0.993); first run 2593.1 vs 2585.2 (0.997); 3-run 6249.7 vs 6211.6 (0.994)
+answer_mismatches none
+order_differences none
+gen0 warm_gmean(base>=1ms n=36)=0.972 warm_worst=1.087 worst5 [(1.087, 'q5'), (1.063, 'q4'), (1.058, 'q1'), (1.052, 'q6'), (1.013, 'q24')]
+```
+
+#### arm C1: parted p0, base vs p2 binary (ms; ratio = p2/base)
+
+| q | warm_a | warm_b | wr | first_a | first_b | fr | 3run_a | 3run_b | tr | cold_a | cold_b | cr | materialized | answers |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| q1 | 0.00 | 0.00 | 1.090 | 0.01 | 0.01 | 1.125 | 0.01 | 0.01 | 1.111 | nan | nan | nan |  | same |
+| q2 | 6.62 | 6.59 | 0.996 | 17.18 | 17.15 | 0.998 | 30.46 | 30.56 | 1.003 | nan | nan | nan |  | same |
+| q3 | 534.35 | 528.84 | 0.990 | 554.47 | 547.36 | 0.987 | 1637.37 | 1611.73 | 0.984 | nan | nan | nan |  | same |
+| q4 | 273.69 | 277.05 | 1.012 | 323.52 | 321.92 | 0.995 | 880.75 | 875.73 | 0.994 | nan | nan | nan |  | same |
+| q5 | 274.70 | 274.50 | 0.999 | 325.77 | 324.56 | 0.996 | 882.26 | 880.37 | 0.998 | nan | nan | nan |  | same |
+| q6 | 344.40 | 337.23 | 0.979 | 9648.98 | 9655.06 | 1.001 | 10339.67 | 10350.37 | 1.001 | nan | nan | nan |  | same |
+| q7 | 525.73 | 528.95 | 1.006 | 551.41 | 554.90 | 1.006 | 1610.41 | 1620.07 | 1.006 | nan | nan | nan |  | same |
+| q8 | 9.16 | 6.29 | 0.687 | 21.57 | 8.00 | 0.371 | 39.84 | 20.79 | 0.522 | nan | nan | nan |  | same |
+| q9 | 89.55 | 85.31 | 0.953 | 176.83 | 151.68 | 0.858 | 359.03 | 323.14 | 0.900 | nan | nan | nan |  | same |
+| q10 | 86.64 | 78.62 | 0.907 | 204.89 | 153.82 | 0.751 | 383.09 | 313.25 | 0.818 | nan | nan | nan |  | same |
+| q11 | 357.31 | 23.88 | 0.067 | 574.30 | 59.12 | 0.103 | 1297.61 | 109.92 | 0.085 | nan | nan | nan |  | same |
+| q12 | 357.85 | 26.72 | 0.075 | 572.31 | 60.61 | 0.106 | 1293.21 | 114.46 | 0.089 | nan | nan | nan |  | same |
+| q13 | 40.19 | 40.15 | 0.999 | 70.24 | 69.98 | 0.996 | 150.94 | 150.99 | 1.000 | nan | nan | nan |  | same |
+| q14 | 1129.54 | 100.67 | 0.089 | 1397.99 | 154.03 | 0.110 | 3668.26 | 362.92 | 0.099 | nan | nan | nan |  | same |
+| q15 | 46.65 | 46.71 | 1.001 | 89.22 | 89.09 | 0.999 | 185.76 | 187.00 | 1.007 | nan | nan | nan |  | same |
+| q16 | 76.24 | 72.65 | 0.953 | 146.38 | 100.75 | 0.688 | 300.37 | 249.16 | 0.830 | nan | nan | nan |  | same |
+| q17 | 103.75 | 96.00 | 0.925 | 205.42 | 134.51 | 0.655 | 413.72 | 329.87 | 0.797 | nan | nan | nan |  | same |
+| q18 | 17.17 | 17.09 | 0.995 | 83.45 | 84.35 | 1.011 | 118.02 | 119.23 | 1.010 | nan | nan | nan |  | same |
+| q19 | 141.35 | 140.66 | 0.995 | 336.38 | 337.38 | 1.003 | 623.39 | 623.63 | 1.000 | nan | nan | nan |  | same |
+| q20 | 4.60 | 4.63 | 1.006 | 14.49 | 14.55 | 1.004 | 24.10 | 24.16 | 1.003 | nan | nan | nan |  | same |
+| q21 | 41.63 | 41.67 | 1.001 | 46.63 | 46.61 | 1.000 | 130.32 | 131.78 | 1.011 | nan | nan | nan |  | same |
+| q22 | 60.72 | 60.59 | 0.998 | 85.47 | 86.07 | 1.007 | 207.97 | 209.51 | 1.007 | nan | nan | nan |  | same |
+| q23 | 93.52 | 90.20 | 0.965 | 203.74 | 117.91 | 0.579 | 394.43 | 298.81 | 0.758 | nan | nan | nan |  | same |
+| q24 | 44.43 | 44.38 | 0.999 | 125.11 | 125.24 | 1.001 | 214.87 | 214.58 | 0.999 | nan | nan | nan |  | same |
+| q25 | 1069.78 | 1056.88 | 0.988 | 1324.12 | 1307.36 | 0.987 | 3469.64 | 3430.01 | 0.989 | nan | nan | nan |  | same |
+| q26 | 1122.13 | 1110.46 | 0.990 | 1471.87 | 1455.46 | 0.989 | 3728.19 | 3679.84 | 0.987 | nan | nan | nan |  | same |
+| q27 | 1081.82 | 1065.90 | 0.985 | 1331.94 | 1318.89 | 0.990 | 3500.73 | 3460.25 | 0.988 | nan | nan | nan |  | same |
+| q28 | 92.33 | 90.79 | 0.983 | 147.18 | 146.18 | 0.993 | 333.85 | 330.50 | 0.990 | nan | nan | nan |  | same |
+| q29 | 361.75 | 359.14 | 0.993 | 472.76 | 463.18 | 0.980 | 1201.24 | 1186.46 | 0.988 | nan | nan | nan |  | same |
+| q30 | 265.87 | 262.26 | 0.986 | 279.86 | 278.97 | 0.997 | 824.85 | 819.02 | 0.993 | nan | nan | nan |  | same |
+| q31 | 54.98 | 55.85 | 1.016 | 124.60 | 126.63 | 1.016 | 237.76 | 239.78 | 1.008 | nan | nan | nan |  | same |
+| q32 | 68.83 | 68.77 | 0.999 | 181.36 | 177.90 | 0.981 | 319.34 | 315.84 | 0.989 | nan | nan | nan |  | same |
+| q33 | 217.08 | 211.63 | 0.975 | 461.88 | 370.82 | 0.803 | 902.25 | 800.63 | 0.887 | nan | nan | nan |  | same |
+| q34 | 43.35 | 43.01 | 0.992 | 95.46 | 95.52 | 1.001 | 182.01 | 181.82 | 0.999 | nan | nan | nan |  | same |
+| q35 | 386.86 | 43.09 | 0.111 | 2293.99 | 95.82 | 0.042 | 3068.90 | 182.94 | 0.060 | nan | nan | nan |  | same |
+| q36 | 148.58 | 145.19 | 0.977 | 217.67 | 216.57 | 0.995 | 517.52 | 511.81 | 0.989 | nan | nan | nan |  | same |
+| q37 | 36.53 | 36.28 | 0.993 | 69.09 | 69.57 | 1.007 | 142.20 | 142.04 | 0.999 | nan | nan | nan |  | same |
+| q38 | 36.39 | 34.92 | 0.960 | 67.76 | 68.35 | 1.009 | 145.06 | 144.49 | 0.996 | nan | nan | nan |  | same |
+| q39 | 15.37 | 15.09 | 0.982 | 27.56 | 27.10 | 0.983 | 58.44 | 57.82 | 0.989 | nan | nan | nan |  | same |
+| q40 | 117.56 | 116.38 | 0.990 | 422.82 | 420.97 | 0.996 | 659.83 | 659.49 | 0.999 | nan | nan | nan |  | same |
+| q41 | 17.60 | 17.70 | 1.006 | 38.81 | 38.69 | 0.997 | 74.59 | 74.48 | 0.998 | nan | nan | nan |  | same |
+| q42 | 13.40 | 13.16 | 0.982 | 24.35 | 23.96 | 0.984 | 51.68 | 50.69 | 0.981 | nan | nan | nan |  | same |
+| q43 | 28.46 | 27.93 | 0.981 | 41.61 | 40.51 | 0.974 | 99.65 | 96.87 | 0.972 | nan | nan | nan |  | same |
+
+```
+totals over all 43: warm 9838.5 vs 7703.8 (0.783); first run 24870.4 vs 19957.1 (0.802); 3-run 44703.6 vs 35516.8 (0.794)
+answer_mismatches none
+order_differences none
+gen0 warm_gmean(base>=1ms n=42)=0.772 warm_worst=1.090 worst5 [(1.09, 'q1'), (1.016, 'q31'), (1.012, 'q4'), (1.006, 'q7'), (1.006, 'q41')]
+q16 first run base 146.4 ms, p2 100.7 ms (carry 2)
+```
+
+#### arm R: parted ragged, base vs p2 binary (ms; ratio = p2/base)
+
+| q | warm_a | warm_b | wr | first_a | first_b | fr | 3run_a | 3run_b | tr | cold_a | cold_b | cr | materialized | answers |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| q1 | 0.00 | 0.00 | 1.033 | 0.01 | 0.01 | 1.157 | 0.01 | 0.01 | 1.141 | nan | nan | nan |  | same |
+| q2 | 7.74 | 7.56 | 0.976 | 18.21 | 17.03 | 0.935 | 33.78 | 32.26 | 0.955 | nan | nan | nan |  | same |
+| q3 | 570.68 | 264.47 | 0.463 | 593.63 | 286.44 | 0.483 | 1753.58 | 827.68 | 0.472 | nan | nan | nan |  | same |
+| q4 | 274.36 | 273.91 | 0.998 | 323.51 | 320.98 | 0.992 | 876.45 | 880.59 | 1.005 | nan | nan | nan |  | same |
+| q5 | 275.33 | 273.71 | 0.994 | 324.77 | 321.02 | 0.988 | 883.16 | 877.90 | 0.994 | nan | nan | nan |  | same |
+| q6 | 340.49 | 339.03 | 0.996 | 9640.19 | 9661.39 | 1.002 | 10333.78 | 10353.71 | 1.002 | nan | nan | nan |  | same |
+| q7 | 522.08 | 523.52 | 1.003 | 551.47 | 559.12 | 1.014 | 1604.08 | 1621.32 | 1.011 | nan | nan | nan |  | same |
+| q8 | 9.65 | 8.74 | 0.906 | 22.43 | 10.20 | 0.455 | 41.75 | 27.89 | 0.668 | nan | nan | nan |  | same |
+| q9 | 89.46 | 85.23 | 0.953 | 177.06 | 153.64 | 0.868 | 357.59 | 327.12 | 0.915 | nan | nan | nan |  | same |
+| q10 | 86.66 | 79.39 | 0.916 | 203.33 | 155.38 | 0.764 | 380.75 | 315.48 | 0.829 | nan | nan | nan |  | same |
+| q11 | 372.93 | 23.61 | 0.063 | 644.72 | 57.90 | 0.090 | 1393.45 | 106.95 | 0.077 | nan | nan | nan |  | same |
+| q12 | 373.12 | 26.53 | 0.071 | 644.14 | 60.36 | 0.094 | 1389.89 | 114.68 | 0.083 | nan | nan | nan |  | same |
+| q13 | 39.85 | 40.12 | 1.007 | 69.70 | 70.43 | 1.010 | 151.89 | 152.43 | 1.004 | nan | nan | nan |  | same |
+| q14 | 1181.37 | 100.65 | 0.085 | 1503.10 | 154.65 | 0.103 | 3877.27 | 361.74 | 0.093 | nan | nan | nan |  | same |
+| q15 | 46.24 | 46.43 | 1.004 | 88.24 | 89.71 | 1.017 | 184.36 | 186.29 | 1.011 | nan | nan | nan |  | same |
+| q16 | 75.98 | 72.39 | 0.953 | 145.43 | 97.06 | 0.667 | 298.59 | 242.06 | 0.811 | nan | nan | nan |  | same |
+| q17 | 103.85 | 95.30 | 0.918 | 205.24 | 133.87 | 0.652 | 417.19 | 329.34 | 0.789 | nan | nan | nan |  | same |
+| q18 | 17.19 | 17.13 | 0.997 | 83.54 | 83.49 | 0.999 | 118.13 | 119.50 | 1.012 | nan | nan | nan |  | same |
+| q19 | 141.25 | 140.96 | 0.998 | 336.46 | 336.21 | 0.999 | 621.70 | 624.61 | 1.005 | nan | nan | nan |  | same |
+| q20 | 4.55 | 4.47 | 0.982 | 14.14 | 14.09 | 0.997 | 23.38 | 23.54 | 1.007 | nan | nan | nan |  | same |
+| q21 | 41.69 | 41.74 | 1.001 | 46.50 | 46.32 | 0.996 | 130.36 | 129.92 | 0.997 | nan | nan | nan |  | same |
+| q22 | 60.45 | 60.37 | 0.999 | 85.22 | 85.55 | 1.004 | 208.61 | 206.46 | 0.990 | nan | nan | nan |  | same |
+| q23 | 93.51 | 89.87 | 0.961 | 270.26 | 117.38 | 0.434 | 461.68 | 297.66 | 0.645 | nan | nan | nan |  | same |
+| q24 | 44.31 | 44.26 | 0.999 | 188.12 | 167.80 | 0.892 | 282.45 | 260.80 | 0.923 | nan | nan | nan |  | same |
+| q25 | 1119.49 | 1107.83 | 0.990 | 1416.34 | 1391.46 | 0.982 | 3658.41 | 3620.41 | 0.990 | nan | nan | nan |  | same |
+| q26 | 1171.45 | 1157.76 | 0.988 | 1579.79 | 1537.59 | 0.973 | 3938.50 | 3864.10 | 0.981 | nan | nan | nan |  | same |
+| q27 | 1130.19 | 1115.29 | 0.987 | 1437.34 | 1394.53 | 0.970 | 3709.24 | 3636.16 | 0.980 | nan | nan | nan |  | same |
+| q28 | 91.64 | 90.70 | 0.990 | 149.64 | 145.44 | 0.972 | 335.88 | 329.34 | 0.981 | nan | nan | nan |  | same |
+| q29 | 362.11 | 356.39 | 0.984 | 469.82 | 469.73 | 1.000 | 1199.84 | 1187.90 | 0.990 | nan | nan | nan |  | same |
+| q30 | 263.74 | 260.65 | 0.988 | 279.10 | 276.54 | 0.991 | 820.49 | 825.98 | 1.007 | nan | nan | nan |  | same |
+| q31 | 55.11 | 54.93 | 0.997 | 124.07 | 124.85 | 1.006 | 236.20 | 239.57 | 1.014 | nan | nan | nan |  | same |
+| q32 | 68.55 | 68.69 | 1.002 | 179.32 | 177.13 | 0.988 | 317.66 | 317.15 | 0.998 | nan | nan | nan |  | same |
+| q33 | 215.95 | 211.00 | 0.977 | 463.39 | 371.76 | 0.802 | 902.95 | 802.26 | 0.888 | nan | nan | nan |  | same |
+| q34 | 43.26 | 43.24 | 0.999 | 95.56 | 96.33 | 1.008 | 182.08 | 183.51 | 1.008 | nan | nan | nan |  | same |
+| q35 | 409.93 | 43.03 | 0.105 | 2395.54 | 95.91 | 0.040 | 3220.16 | 187.46 | 0.058 | nan | nan | nan |  | same |
+| q36 | 147.75 | 144.95 | 0.981 | 217.38 | 214.19 | 0.985 | 514.99 | 513.51 | 0.997 | nan | nan | nan |  | same |
+| q37 | 36.27 | 35.92 | 0.990 | 72.81 | 71.50 | 0.982 | 147.63 | 144.61 | 0.980 | nan | nan | nan |  | same |
+| q38 | 35.29 | 34.51 | 0.978 | 73.83 | 72.22 | 0.978 | 146.27 | 143.42 | 0.981 | nan | nan | nan |  | same |
+| q39 | 15.14 | 14.91 | 0.985 | 29.21 | 28.23 | 0.966 | 60.14 | 64.27 | 1.069 | nan | nan | nan |  | same |
+| q40 | 151.35 | 154.65 | 1.022 | 460.99 | 454.20 | 0.985 | 769.15 | 766.33 | 0.996 | nan | nan | nan |  | same |
+| q41 | 17.63 | 17.14 | 0.972 | 40.28 | 38.22 | 0.949 | 76.28 | 72.76 | 0.954 | nan | nan | nan |  | same |
+| q42 | 13.27 | 12.72 | 0.958 | 26.50 | 23.80 | 0.898 | 53.40 | 49.56 | 0.928 | nan | nan | nan |  | same |
+| q43 | 28.17 | 27.59 | 0.979 | 41.64 | 40.82 | 0.980 | 98.96 | 96.52 | 0.975 | nan | nan | nan |  | same |
+
+```
+totals over all 43: warm 10149.0 vs 7611.3 (0.750); first run 25732.0 vs 20024.5 (0.778); 3-run 46212.1 vs 35464.8 (0.767)
+answer_mismatches none
+order_differences none
+gen0 warm_gmean(base>=1ms n=42)=0.759 warm_worst=1.033 worst5 [(1.033, 'q1'), (1.022, 'q40'), (1.007, 'q13'), (1.004, 'q15'), (1.003, 'q7')]
+```
+

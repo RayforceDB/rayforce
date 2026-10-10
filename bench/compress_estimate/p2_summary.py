@@ -32,31 +32,31 @@ SCAN_ONLY = {"q1", "q2", "q3", "q4", "q7", "q8", "q16", "q17", "q18", "q33", "q3
 # at ratio <= bound, or when both medians are < 1 ms and the gap is <= 0.05 ms.
 # Geometric means cover only queries whose base median is >= 1 ms.
 FLOOR_MS, FLOOR_GAP_MS = 1.0, 0.05
-# P3 deferral table: (query, arms, metric, reason).  metric is warm | first |
-# cold | rss.  Data only: the controller trims rows as the fix tasks land.
+# P3 deferral table: (query, arms, metric, max_ratio, reason).  metric is
+# warm | first | cold | rss.  Data only: the controller trims rows as the fix
+# tasks land.
 # GATE (P3-exempt) skips exactly these (query, arm, metric) clauses.
 P3_DEFERRALS = [
-    # (query, arms, metric, max_ratio, reason).  max_ratio is about 1.5x the
-    # ratio measured on the first gate run; above it the exemption lapses and
-    # the clause fails, so a regression of a deferred query still shows.  For
-    # rss the ratio is the arm's peak-RSS ratio (informational, not gated).
-    ("q2",  "AB", "warm",  8.0, "run-level compute (count over RLE runs)"),
-    ("q8",  "AB", "warm",  5.5, "run-level compute (group over RLE runs)"),
-    ("q18", "A",  "warm",  1.5, "row-list / selection gather (P3 path 2)"),
-    ("q18", "AB", "first", 4.1, "row-list / selection gather (P3 path 2)"),
-    ("q18", "B",  "warm",  8.5, "parted q18 residual after 17c"),
-    ("q39", "AB", "warm",  1.5, "selection gather (P3 path 2)"),
-    ("q39", "AB", "first", 4.0, "selection gather (P3 path 2)"),
-    ("q39", "AB", "cold",  3.2, "selection gather reads whole columns cold (P3)"),
-    ("q42", "AB", "warm",  4.0, "point gathers"),
-    ("q24", "A",  "rss",   2.4, "top-k output gather"),
-    ("q25", "A",  "rss",   2.4, "top-k output gather"),
-    ("q26", "A",  "rss",   2.4, "top-k output gather"),
-    ("q27", "A",  "rss",   2.4, "top-k output gather"),
-    ("q24", "B",  "rss",   1.6, "top-k output gather"),
-    ("q25", "B",  "rss",   1.6, "top-k output gather"),
-    ("q26", "B",  "rss",   1.6, "top-k output gather"),
-    ("q27", "B",  "rss",   1.6, "top-k output gather"),
+    # (query, arms, metric, max_ratio, reason).  One row per arm, so each arm
+    # has its own cap.  max_ratio is about 1.5x the ratio measured on the gate
+    # re-run (HEAD a09a54eb); above it the exemption lapses and the clause
+    # fails, so a regression of a deferred query still shows.  For rss the
+    # ratio is the arm's peak-RSS ratio (informational, not gated).  Rows whose
+    # clause passed on the re-run were removed.
+    ("q2",  "A",  "warm",  1.63, "run-level compute (count over RLE runs)"),
+    ("q8",  "A",  "warm",  2.14, "run-level compute (group over RLE runs)"),
+    ("q8",  "B",  "warm",  1.59, "run-level compute (group over RLE runs)"),
+    ("q18", "A",  "first", 2.97, "row-list gather (first-n keys published, P3 path 2)"),
+    ("q18", "B",  "warm",  1.63, "row-list gather (parted first-n compact build, P3)"),
+    ("q39", "A",  "first", 3.60, "selection gather (P3 path 2)"),
+    ("q39", "B",  "first", 2.25, "selection gather (P3 path 2)"),
+    ("q39", "A",  "cold",  3.23, "selection gather reads whole columns cold (P3)"),
+    ("q42", "A",  "warm",  2.50, "point gathers of the selected keys (P3)"),
+    ("q42", "B",  "warm",  1.86, "point gathers of the selected keys (P3)"),
+    ("q24", "A",  "rss",   2.4,  "top-k output gather RSS"),
+    ("q25", "A",  "rss",   2.4,  "top-k output gather RSS"),
+    ("q26", "A",  "rss",   2.4,  "top-k output gather RSS"),
+    ("q27", "A",  "rss",   2.4,  "top-k output gather RSS"),
 ]
 PI_SPLAYED_FIRST_TOTAL = 2.99    # RESULTS.md "PI index policy": gen-2 first-run total 7 740 vs 2 586 ms
 ARMS = {"A": ("g0", "g2", "splayed g0 vs g2"), "B": ("p0", "p2", "parted p0 vs p2"),
