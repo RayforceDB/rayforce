@@ -322,11 +322,30 @@ ray_t* ray_raise_fn(ray_t* val) {
  *     ((fn [data] (try (raise "x") data)) 123)  ->  123
  *
  * Borrows both `handler` and `err_val`; returns a new owned ref. */
+static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
+                               bool query, uint64_t row_args, bool named,
+                               int8_t* out_rows);
+
 ray_t* ray_try_handle(ray_t* handler, ray_t* err_val) {
     if (handler->type == RAY_LAMBDA || handler->type == RAY_UNARY)
         return call_fn1(handler, err_val);   /* borrows err_val */
     ray_retain(handler);
     return handler;                          /* fallback value */
+}
+
+/* ray_try_handle that also reports the handler value's row provenance:
+ * a lambda handler's result flag, -1 (unknown) for a builtin, and
+ * `fallback_rows` for a plain fallback value. */
+static ray_t* try_handle_rows(ray_t* handler, ray_t* err_val, int8_t fallback_rows, int8_t* rows) {
+    *rows = -1;
+    if (handler->type == RAY_LAMBDA) {
+        ray_t* args[1] = { err_val };
+        return call_lambda_impl(handler, args, 1, ray_active_query_table() != NULL, 0, true, rows);
+    }
+    if (handler->type == RAY_UNARY) return call_fn1(handler, err_val);
+    *rows = fallback_rows;
+    ray_retain(handler);
+    return handler;
 }
 
 /* (try expr handler) — evaluate expr; on error, dispatch the (evaluated)
@@ -349,12 +368,13 @@ ray_t* ray_try_fn(ray_t* expr, ray_t* handler_expr) {
         return handler;
     }
 
-    /* A callable handler's own evaluation sets the provenance; a fallback
-     * value keeps the one its expression had. */
-    if (handler->type == RAY_LAMBDA || handler->type == RAY_UNARY) g_eval_rows = -1;
-    ray_t* handler_result = ray_try_handle(handler, err_val);
+    /* A lambda handler reports its result's provenance; a fallback value
+     * keeps the one its expression had (g_eval_rows after evaluating it). */
+    int8_t handler_rows = -1;
+    ray_t* handler_result = try_handle_rows(handler, err_val, g_eval_rows, &handler_rows);
     ray_release(err_val);
     ray_release(handler);
+    g_eval_rows = handler_rows;
     return handler_result;
 }
 
@@ -1954,9 +1974,9 @@ ray_t* ray_cond_fn(ray_t** args, int64_t n) {
     if (n < 2) return ray_error("domain", "if: expected at least 2 args (cond then), got %lld", (long long)n);
     ray_t* cond = ray_eval(args[0]);
     if (RAY_IS_ERR(cond)) return cond;
-    /* A vector condition derived from the query's rows: the expression
-     * needed row-by-row evaluation (see the opaque by: key). */
-    if (g_eval_rows == 1 && !ray_is_atom(cond)) __VM->rows_cond++;
+    /* A vector condition tested whole: the expression may have needed
+     * row-by-row evaluation (see the opaque by: key). */
+    if (!ray_is_atom(cond)) __VM->rows_cond++;
     /* Materialize lazy handles before testing truthiness */
     if (ray_is_lazy(cond))
         cond = ray_lazy_materialize(cond);
@@ -2144,18 +2164,25 @@ ray_t* ray_fn(ray_t** args, int64_t n) {
         }
     }
 
-    ray_t* closure = ray_env_capture_locals();
+    ray_t* caprows = NULL;
+    uint32_t capq = 0;
+    ray_t* closure = ray_env_capture_locals_rows(&caprows, &capq);
     if (closure && RAY_IS_ERR(closure)) return closure;
+    /* A lambda made inside a query is query text: it keeps the query's
+     * literal rule by running on the tree walker, so it is never compiled.
+     * The serial of the query frame marks it. */
+    if (!capq) capq = ray_env_query_serial();
 
-    /* Create lambda object with space for 8 slots:
-     * [0] params, [1] body, [2] bytecode, [3] constants, [4] n_locals,
-     * [5] nfo (source location), [6] dbg (debug metadata), [7] closure. */
-    ray_t* lambda = ray_alloc(8 * sizeof(ray_t*));
-    if (!lambda) { ray_release(closure); return ray_error("oom", NULL); }
+    /* Create lambda object (layout in eval.h): params, body, bytecode,
+     * constants, n_locals, nfo, dbg, closure, capture row flags, query. */
+    ray_t* lambda = ray_alloc(LAMBDA_SLOTS * sizeof(ray_t*));
+    if (!lambda) { ray_release(closure); if (caprows) ray_release(caprows); return ray_error("oom", NULL); }
     lambda->type = RAY_LAMBDA;
     lambda->attrs = 0;
     lambda->len = 0;
-    memset(ray_data(lambda), 0, 8 * sizeof(ray_t*));
+    memset(ray_data(lambda), 0, LAMBDA_SLOTS * sizeof(ray_t*));
+    LAMBDA_CAPROWS(lambda) = caprows;   /* owned */
+    LAMBDA_CAPQ(lambda) = capq;
 
     /* Store params list */
     ray_retain(params_list);
@@ -2286,11 +2313,11 @@ static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
     if (out_rows) *out_rows = -1;
     /* A lambda called inside a named helper's body is that body's text. */
     if (query && !named) named = ray_eval_query_helper_literals();
-    /* Lazy compilation on first call.  A closure is never compiled; a
-     * lambda written inline in a query is one (it captures the query's
-     * bindings), so it runs on the tree walker below, where `named` keeps
-     * its literal symbols on the query's column rule. */
-    if (!LAMBDA_CLOSURE(lambda) && !LAMBDA_IS_COMPILED(lambda))
+    /* Lazy compilation on first call; a closure compiles too, its captures
+     * loaded as fixed values (OP_LOADCAP).  A lambda made inside a query
+     * (LAMBDA_CAPQ set) is query text and keeps the query's literal rule on
+     * the tree walker. */
+    if (!LAMBDA_IS_COMPILED(lambda) && !LAMBDA_CAPQ(lambda))
         ray_compile(lambda);
     if (LAMBDA_IS_COMPILED(lambda)) {
         if (!query) return vm_exec(lambda, call_args, argc);
@@ -2316,7 +2343,8 @@ static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
         return ray_error("arity", "expected %" PRId64 " args, got %" PRId64, param_count, argc);
 
     bool has_closure = LAMBDA_CLOSURE(lambda) != NULL;
-    if (has_closure && ray_env_push_capture(LAMBDA_CLOSURE(lambda)) != RAY_OK)
+    if (has_closure && ray_env_push_capture(LAMBDA_CLOSURE(lambda), LAMBDA_CAPROWS(lambda),
+                                            LAMBDA_CAPQ(lambda)) != RAY_OK)
         return ray_error("oom", NULL);
     if (query && has_closure) ray_env_mark_call_scope(ray_query_helper_table(), named);
     if (ray_env_push_scope() != RAY_OK) {
@@ -2362,6 +2390,7 @@ static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
             return result;
         }
     }
+    if (out_rows) *out_rows = g_eval_rows;   /* the body's last value's provenance */
 
     ray_env_pop_scope();
     if (has_closure) ray_env_pop_scope();
@@ -2369,7 +2398,7 @@ static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
 }
 
 ray_t* call_lambda(ray_t* lambda, ray_t** call_args, int64_t argc) {
-    if (!LAMBDA_CLOSURE(lambda) && !LAMBDA_IS_COMPILED(lambda)) ray_compile(lambda);
+    if (!LAMBDA_IS_COMPILED(lambda) && !LAMBDA_CAPQ(lambda)) ray_compile(lambda);
     if (LAMBDA_IS_COMPILED(lambda)) return vm_exec(lambda, call_args, argc);
     return call_lambda_impl(lambda, call_args, argc, false, 0, false, NULL);
 }
@@ -2509,6 +2538,7 @@ static ray_t* vm_exec_rows(ray_t* lambda, ray_t** call_args, int64_t argc,
         [OP_SCOPE_END]     = &&op_scope_end,
         [OP_TRYH]          = &&op_tryh,
         [OP_FORCE]         = &&op_force,
+        [OP_LOADCAP]       = &&op_loadcap,
     };
 
     /* Arity check before allocating VM state */
@@ -2708,7 +2738,7 @@ op_jmpf: {
     int16_t offset = (int16_t)((code[ip] << 8) | code[ip + 1]);
     ip += 2;
     ray_t *cond = POP();
-    if (POPPED_ROWS() == 1 && cond && !ray_is_atom(cond)) __VM->rows_cond++;
+    if (cond && !ray_is_atom(cond)) __VM->rows_cond++;   /* a vector tested whole */
     int truthy = is_truthy(cond);
     ray_release(cond);
     if (!truthy) ip += offset;
@@ -2821,10 +2851,10 @@ op_callf: {
     }
     ray_t *fn_obj = POP();
 
-    /* Compiled lambda: push frame, switch to callee bytecode.  A closure
-     * is never compiled: its captured environment lives in frames. */
+    /* Compiled lambda: push frame, switch to callee bytecode.  A lambda
+     * made inside a query stays on the tree walker (see call_lambda_impl). */
     if (fn_obj->type == RAY_LAMBDA) {
-        if (!LAMBDA_CLOSURE(fn_obj) && !LAMBDA_IS_COMPILED(fn_obj))
+        if (!LAMBDA_IS_COMPILED(fn_obj) && !LAMBDA_CAPQ(fn_obj))
             ray_compile(fn_obj);
 
         if (LAMBDA_IS_COMPILED(fn_obj)) {
@@ -3112,13 +3142,31 @@ op_tryh: {
     ray_t* err_val = POP();
     ray_t* handler = POP();
     uint8_t handler_rows = POPPED_ROWS();
-    bool callable = handler->type == RAY_LAMBDA || handler->type == RAY_UNARY;
-    if (callable) g_eval_rows = -1;   /* an interpreted handler reports its value's provenance */
-    ray_t* result  = ray_try_handle(handler, err_val);  /* borrows both */
+    int8_t result_rows = -1;
+    ray_t* result = try_handle_rows(handler, err_val, vrows_to(handler_rows), &result_rows);  /* borrows both */
     ray_release(err_val);
     ray_release(handler);
     if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }
-    PUSHR(result, callable ? vrows_from(g_eval_rows) : handler_rows);
+    PUSHR(result, vrows_from(result_rows));
+    DISPATCH();
+}
+
+op_loadcap: {
+    /* A closure's capture: a fixed value, with the row flag it was made
+     * with while the query frame it was made under is the innermost one. */
+    uint8_t idx = code[ip++];
+    ray_t *cap = LAMBDA_CLOSURE(vm.fn);
+    ray_t *cvals = cap ? ray_dict_vals(cap) : NULL;
+    if (!cvals || idx >= cvals->len) goto vm_error_name;
+    ray_t *val = ((ray_t**)ray_data(cvals))[idx];
+    uint8_t val_rows = 0;
+    ray_t *flags = LAMBDA_CAPROWS(vm.fn);
+    if (flags && idx < flags->len && LAMBDA_CAPQ(vm.fn) &&
+        LAMBDA_CAPQ(vm.fn) == ray_env_query_serial())
+        val_rows = ((uint8_t*)ray_data(flags))[idx];
+    if (val) ray_retain(val);
+    else val = make_i64(0);
+    PUSHR(val, val_rows);
     DISPATCH();
 }
 
@@ -3147,6 +3195,20 @@ op_scope_begin: {
                                        &vm.ps[vm.fp], &vm.rows[vm.fp], vm.fn);
     ray_release(syms);
     if (err != RAY_OK) goto vm_error_limit;
+    /* The closure's own captures are locals of the window too, so a lambda
+     * created inside it captures them in turn. */
+    if (LAMBDA_CLOSURE(vm.fn)) {
+        ray_t *ck = ray_dict_keys(LAMBDA_CLOSURE(vm.fn));
+        ray_t *cv = ray_dict_vals(LAMBDA_CLOSURE(vm.fn));
+        ray_t *cf = LAMBDA_CAPROWS(vm.fn);
+        bool live = cf && LAMBDA_CAPQ(vm.fn) && LAMBDA_CAPQ(vm.fn) == ray_env_query_serial();
+        for (int64_t i = 0; ck && cv && i < ck->len && i < cv->len; i++) {
+            int64_t sym = ray_read_sym(ray_data(ck), i, RAY_SYM, ck->attrs);
+            if (ray_env_get_local(sym)) continue;   /* a local shadows a capture */
+            ray_t *v = ((ray_t**)ray_data(cv))[i];
+            if (v) (void)ray_env_set_local_rows(sym, v, live && i < cf->len ? ((uint8_t*)ray_data(cf))[i] : 0);
+        }
+    }
     DISPATCH();
 }
 

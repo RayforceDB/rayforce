@@ -171,7 +171,13 @@ bool      ray_env_has_lexical_local(int64_t sym_id);
 int32_t   ray_env_lexical_scope_depth(int64_t sym_id);
 ray_err_t ray_env_set_query_local(int64_t sym_id, ray_t* val);
 ray_t*    ray_env_capture_locals(void);
-ray_err_t ray_env_push_capture(ray_t* capture);
+/* The same, also returning the captures' row flags (RAY_U8, owned, NULL
+ * when none is set) and the serial of the innermost query frame (0 if
+ * none): the flags are meaningful only under that frame. */
+ray_t*    ray_env_capture_locals_rows(ray_t** flags, uint32_t* serial);
+ray_err_t ray_env_push_capture(ray_t* capture, ray_t* flags, uint32_t serial);
+/* Serial of the innermost query frame, 0 outside queries. */
+uint32_t  ray_env_query_serial(void);
 
 /* Compiled-lambda local materialization (OP_SCOPE_BEGIN / OP_SCOPE_END).
  * bind: push a fresh frame and bind syms[i] -> slots[i] (NULL slots —

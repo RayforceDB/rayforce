@@ -68,15 +68,11 @@ typedef struct {
      * columns bound on demand; earlier ones are a closure's captured
      * values or the call's parameters. */
     int32_t  table_from;
-    /* RAY_SCOPE_QUERY only: the row provenance of closures created while
-     * this query frame was the innermost one, keyed by the closure's
-     * capture object.  A closure called later takes its captures'
-     * provenance from here, so it is valid exactly as long as the query
-     * frame it belongs to; nothing about it leaves the frame. */
-    void**   cap_keys;
-    ray_t**  cap_flags;
-    int32_t  cap_n;
-    int32_t  cap_cap;
+    /* RAY_SCOPE_QUERY only: a serial unique to this frame instance.  A
+     * closure made while it was the innermost query records it with its
+     * captures' row flags; those flags apply only while a frame with this
+     * serial is the innermost query again. */
+    uint32_t serial;
 } ray_scope_frame_t;
 
 /* ===== Per-thread VM =====

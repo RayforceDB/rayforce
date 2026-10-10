@@ -96,6 +96,9 @@ enum {
                        * push handler as a fallback value */
     OP_FORCE,         /* materialize TOS if it is a lazy handle (so a
                        * let-bound local holds a concrete, reusable value) */
+    OP_LOADCAP,       /* push captured value: operand = index into the
+                       * closure (1 byte); carries the capture's row flag
+                       * while the query it was made under is innermost */
     OP__COUNT
 };
 
@@ -112,7 +115,11 @@ enum {
  *   data[5] = ray_t* nfo          (source location info, NULL if absent)
  *   data[6] = ray_t* dbg          (debug metadata, NULL if absent)
  *   data[7] = ray_t* closure      (captured lexical locals, NULL if empty)
+ *   data[8] = ray_t* caprows      (RAY_U8 row flag per capture, or NULL)
+ *   data[9] = uint32_t capq       (serial of the query frame the closure was
+ *                                  made under, 0 if none; never serialized)
  */
+#define LAMBDA_SLOTS 10
 
 #define RAY_FN_COMPILED  0x40   /* lambda has been compiled to bytecode */
 
@@ -124,6 +131,8 @@ enum {
 #define LAMBDA_NFO(lam)       (((ray_t**)ray_data(lam))[5])
 #define LAMBDA_DBG(lam)       (((ray_t**)ray_data(lam))[6])
 #define LAMBDA_CLOSURE(lam)   (((ray_t**)ray_data(lam))[7])
+#define LAMBDA_CAPROWS(lam)   (((ray_t**)ray_data(lam))[8])
+#define LAMBDA_CAPQ(lam)      (*((uint32_t*)&((ray_t**)ray_data(lam))[9]))
 
 #define LAMBDA_IS_COMPILED(lam) ((lam)->attrs & RAY_FN_COMPILED)
 

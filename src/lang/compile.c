@@ -24,6 +24,7 @@
 #include "lang/eval.h"
 #include "lang/env.h"
 #include "lang/nfo.h"
+#include "table/sym.h"   /* ray_read_sym — capture names */
 #include <stdbool.h>
 #include <string.h>
 
@@ -243,11 +244,20 @@ static void init_sf_syms(void) {
  * the env, where a tree-walk local would shadow a global.  Conservative
  * by construction — descends lists, dicts, and sym vectors. */
 static bool ast_refs_locals(compiler_t *c, ray_t *ast);
+/* Index of `id` among the compiled lambda's captures, or -1. */
+static int32_t find_capture(compiler_t *c, int64_t id) {
+    if (!c->lambda || !LAMBDA_CLOSURE(c->lambda)) return -1;
+    ray_t* keys = ray_dict_keys(LAMBDA_CLOSURE(c->lambda));
+    if (!keys || keys->type != RAY_SYM) return -1;
+    for (int64_t i = 0; i < keys->len && i < 256; i++)
+        if (ray_read_sym(ray_data(keys), i, RAY_SYM, keys->attrs) == id) return (int32_t)i;
+    return -1;
+}
 static bool sym_is_local_ref(compiler_t *c, int64_t id) {
     if (id == sf_self || id == sf_eval || id == sf_resolve) return true;
     for (int32_t i = c->n_locals - 1; i >= 0; i--)
         if (c->locals[i].sym_id == id) return true;
-    return false;
+    return find_capture(c, id) >= 0;   /* a capture is a local of the closure */
 }
 static bool ast_refs_locals(compiler_t *c, ray_t *ast) {
     if (!ast) return false;
@@ -680,9 +690,15 @@ static void compile_expr(compiler_t *c, ray_t *ast) {
                 return;
             }
             int32_t slot = find_local(c, ast->i64);
+            int32_t cap = slot >= 0 ? -1 : find_capture(c, ast->i64);
             if (slot >= 0) {
                 emit(c, OP_LOADENV);
                 emit(c, (uint8_t)slot);
+            } else if (cap >= 0) {
+                /* A closure's capture is a fixed value: load it directly,
+                 * with the row flag it carries for the query it was made in. */
+                emit(c, OP_LOADCAP);
+                emit(c, (uint8_t)cap);
             } else {
                 int32_t idx = add_constant(c, ast);
                 if (idx < 256) {

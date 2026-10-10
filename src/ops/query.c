@@ -10078,8 +10078,11 @@ static ray_t* select_plan_computed_key(ray_t* dict, ray_t* tbl, int64_t* key_nam
             int64_t nrows = ray_table_nrows(base);
             int32_t conds = __VM->rows_cond;
             ray_t* keyvec = eval_expr_whole_column(by_expr, base);
-            if (__VM->rows_cond != conds && keyvec && !RAY_IS_ERR(keyvec)) {
-                ray_release(keyvec);
+            if (__VM->rows_cond != conds || !keyvec || RAY_IS_ERR(keyvec)) {
+                /* Also when the whole-column run failed: a body written for
+                 * one row may not accept a column at all. */
+                if (keyvec && RAY_IS_ERR(keyvec)) ray_error_free(keyvec);
+                else if (keyvec) ray_release(keyvec);
                 keyvec = eval_expr_per_row(by_expr, base, nrows);
             }
             if (keyvec && !RAY_IS_ERR(keyvec) && ray_is_lazy(keyvec)) keyvec = ray_lazy_materialize(keyvec);

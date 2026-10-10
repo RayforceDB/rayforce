@@ -1158,8 +1158,9 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len) {
             }
         }
 
-        /* Build lambda: allocate with 8 slots (same as eval.c). */
-        ray_t* lambda = ray_alloc(8 * sizeof(ray_t*));
+        /* Build lambda with the layout eval.c uses; the row-provenance
+         * slots stay empty, they never travel. */
+        ray_t* lambda = ray_alloc(LAMBDA_SLOTS * sizeof(ray_t*));
         if (!lambda || RAY_IS_ERR(lambda)) {
             ray_release(params);
             ray_release(body);
@@ -1169,7 +1170,7 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len) {
         lambda->type = RAY_LAMBDA;
         lambda->attrs = 0;
         lambda->len = 0;
-        memset(ray_data(lambda), 0, 8 * sizeof(ray_t*));
+        memset(ray_data(lambda), 0, LAMBDA_SLOTS * sizeof(ray_t*));
         ((ray_t**)ray_data(lambda))[0] = params;
         ((ray_t**)ray_data(lambda))[1] = body;
         LAMBDA_CLOSURE(lambda) = closure;

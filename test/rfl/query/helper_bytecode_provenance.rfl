@@ -274,3 +274,34 @@ OUT4 -- ['p 'q 'r 'a 'b 'c]
 (set TS3 (table [x t] (list [1 2 3] (list "a" "" "c"))))
 (at (select {r: (concat "" "x") e: (reverse x) from: TS3}) 'r) -- (list "x" "x" "x")
 (at (select {r: ((fn [v] (concat (try (+ v 's) v) "!")) s) e: (reverse x) from: T}) 'r) -- ['a! 'b! 'c!]
+;; A closure's capture flags live on the closure with the serial of the
+;; query frame it was made under; no record is keyed by address, so a dead
+;; closure's address cannot lend its flags, and lookups are constant time.
+(set LX ['x 'y])
+(set mkf (fn [v] 1 (let f (fn [z] (concat z v))) (count (first (map f ['p])))))
+(set hsix (fn [v] 1 (set OUT6 (map (fn [i] (if (== 0 (% i 2)) (mkf v) (mkf LX))) (til 6))) 0))
+(update {r: (hsix s) from: T})
+OUT6 -- [3 3 3 3 3 3]
+;; A conditional that tests any vector during the whole-column run of an
+;; opaque key sends it row by row, whatever produced the vector; so does a
+;; whole-column run that fails.
+(at (select {n: (count v) by: ((fn [v] 1 (if (> (fill 0 v) 2) (* v 10) v)) v) from: TB}) 'v) -- [1 2 30 100 200 300]
+(set gt2 ((fn [t] (fn [w] (> w t))) 2))
+(at (select {n: (count v) by: ((fn [v] 1 (if (gt2 v) (* v 10) v)) v) from: TB}) 'v) -- [1 2 30 100 200 300]
+(at (select {n: (count v) by: ((fn [v] 1 (if (> v 2) (count (til v)) v)) v) from: TB}) 'v) -- [1 2 3 10 20 30]
+(at (select {n: (count v) by: ((fn [v] 1 (eval (list 'if (list '> v 2) (list '* v 10) v))) v) from: TB}) 'v) -- [1 2 30 100 200 300]
+;; Closures compile, with their captures loaded as fixed values: a
+;; recursive closure called from a compiled helper keeps bytecode's depth,
+;; and a closure passed through another function keeps its environment,
+;; inside and outside a query.
+(set rr (((fn [a] (fn [b] (fn [n] (if (== n 0) 0 (+ 1 (self (- n 1))))))) 1) 2))
+(set callr (fn [n] 1 (rr n)))
+(callr 50) -- 50
+((fn [g] (g 'p)) (fn [z] (concat z 'q))) -- ['p 'q]
+(set mkadd (fn [k] (fn [v] (+ v k))))
+((mkadd 1) 2) -- 3
+(set outer2 (fn [a] (fn [b] ((fn [z] (concat z (concat 'x a))) b))))
+((outer2 'k) 'q) -- ['q 'x 'k]
+;; A compiled try with a fallback value keeps that value's provenance.
+(set hf (fn [v] 1 (concat (try (+ v 's) v) "!")))
+(at (select {r: (hf s) e: (reverse x) from: T}) 'r) -- ['a! 'b! 'c!]
