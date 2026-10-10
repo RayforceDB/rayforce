@@ -1840,9 +1840,12 @@ static test_result_t test_zone_dir_skips(void) {
     ray_graph_t* g = ray_graph_new(t);
     ray_enc_counters_reset();
     bool all = false;
+    uint64_t dv0 = ray_enccol_test_desc_validations();
     ray_t* s = exec_pred_to_selection(g, ray_lt(g, ray_scan(g, "k"), ray_const_i64(g, 1000)), ray_table_nrows(t), &all);
     TEST_ASSERT_TRUE(s && !RAY_IS_ERR(s));
     TEST_ASSERT_EQ_I(ray_rowsel_meta(s)->total_pass, 1000);
+    /* the chunk gate decides chunks 1-3 before their descriptors are read */
+    TEST_ASSERT_EQ_U(ray_enccol_test_desc_validations() - dv0, 1);
     ray_enc_counters_t k; ray_enc_counters_get(&k);
     TEST_ASSERT_EQ_U(k.materialized, 0);
     TEST_ASSERT_EQ_U(k.decoded_bytes, 1024 * 8);        /* chunk 0's vector 0 only */
@@ -1850,10 +1853,12 @@ static test_result_t test_zone_dir_skips(void) {
     /* the count fast path decides chunks the same way */
     sr_eval_ok("(set T (.db.splayed.get \"" SR_G2 "\"))");
     ray_enc_counters_reset();
+    dv0 = ray_enccol_test_desc_validations();
     ray_t* c = sr_eval("(count (select {from: T where: (< k 1000)}))");
     TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c) && c->i64 == 1000);
     ray_enc_counters_get(&k);
     TEST_ASSERT_EQ_U(k.decoded_bytes, 1024 * 8);
+    TEST_ASSERT_EQ_U(ray_enccol_test_desc_validations() - dv0, 1);
     sr_drop(c);
     PASS();
 }
@@ -2269,6 +2274,7 @@ static test_result_t test_fp_range_dir_gate(void) {
     TEST_ASSERT_EQ_I(fp_compile_pred(g, fpp_k_lt(g), t, &p, &e), 0);
     TEST_ASSERT_TRUE(p.children[0].enc);
     ray_enc_counters_reset();
+    const uint64_t dv0 = ray_enccol_test_desc_validations();
     fp_scratch_t sc; fp_scratch_init(&sc);
     uint8_t b[RAY_MORSEL_ELEMS];
     int64_t n = ray_table_nrows(t), pass = 0;
@@ -2281,6 +2287,9 @@ static test_result_t test_fp_range_dir_gate(void) {
     TEST_ASSERT_EQ_I(pass, 70000);
     ray_enc_counters_t k; ray_enc_counters_get(&k);
     TEST_ASSERT_EQ_U(k.decoded_bytes, 1024 * 8);
+    /* the chunk gate decides chunks 0, 2 and 3 before their descriptors
+     * are read: only chunk 1's are validated */
+    TEST_ASSERT_EQ_U(ray_enccol_test_desc_validations() - dv0, 1);
     TEST_ASSERT_EQ_U(k.materialized, 0);
     fp_pred_cleanup(&p); ray_graph_free(g); ray_release(t);
     PASS();
@@ -3987,6 +3996,61 @@ static test_result_t test_v2_sel_bounds_split(void) {
     PASS();
 }
 
+/* Task 17b fix round 1: the dense-impossible shortcut of the split prescan
+ * at its boundary.  g (SYM) holds one new symbol per row (two rows per
+ * symbol in the nullable table), so its selected ids span exactly the
+ * selected symbols; k (staged I64) is 5 on every selected row (the
+ * nullable table: one null, so its range is 2).  The other keys' product
+ * equals n_sel (the selection plan is dense, as on generation 0) or
+ * exceeds it (no selection plan, k not read for bounds).  Route, plan and
+ * slots as generation 0: an early verdict at the boundary would differ. */
+static test_result_t test_v2_sel_bounds_boundary(void) {
+    sr_eval_ok("(set bi (til 200000))");
+    sr_eval_ok("(set BB (table [g k v] (list (as 'SYM (as 'STR (+ 100000 bi))) (take [5] 200000) bi)))");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/bb2/\" BB {compress: true})");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/bb0/\" BB {compress: false})");
+    sr_eval_ok("(set BN (table [g k v] (list (as 'SYM (as 'STR (+ 100000 (div bi 2)))) "
+               "(map (fn [j] (if (== j 7) 0Nl 5)) bi) bi)))");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/bn2/\" BN {compress: true})");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/bn0/\" BN {compress: false})");
+    /* k_bounds: k is read for the selection bounds (the other keys' product
+     * is at most n_sel).  When the selection plan fails the group plans over
+     * the table, so the route stats alone cannot show the verdict. */
+    static const struct { const char* t; const char* q; bool k_bounds; } qs[] = {
+        /* 5000 rows, g spans 5000 ids: product == n_sel */
+        { "bb", "(select {c: (count v) from: T where: (< v 5000) by: [g k]})", true },
+        { "bb", "(select {c: (count v) from: T where: (< v 5000) by: [k g]})", true },
+        /* 5000 rows, g spans 5001 ids (row 1 left out): product == n_sel + 1 */
+        { "bb", "(select {c: (count v) from: T where: (and (<= v 5000) (!= v 1)) by: [g k]})", false },
+        { "bb", "(select {c: (count v) from: T where: (and (<= v 5000) (!= v 1)) by: [k g]})", false },
+        /* nullable k (range 2): 5000 rows, g spans 2500 ids: 2 x 2500 == n_sel */
+        { "bn", "(select {c: (count v) from: T where: (< v 5000) by: [g k]})", true },
+        /* 5000 rows (0, 3..5001), g spans 2501 ids: 2 x 2501 > n_sel, but g
+         * alone fits, so k is read and the plan fails on the product */
+        { "bn", "(select {c: (count v) from: T where: (and (<= v 5001) (!= v 1) (!= v 2)) by: [g k]})", true },
+        { NULL, NULL, false },
+    };
+    for (int i = 0; qs[i].q; i++) {
+        char t0[128], t2[128];
+        snprintf(t0, sizeof t0, "(.db.splayed.get \"" SR_TMP "/%s0/\")", qs[i].t);
+        snprintf(t2, sizeof t2, "(.db.splayed.get \"" SR_TMP "/%s2/\")", qs[i].t);
+        test_result_t r = sr_same_route(t0, t2, qs[i].q);
+        if (r.status != TEST_PASS) return r;
+        sr_evalf_ok("(set T %s)", t2);
+        uint64_t k0 = sr_col_decoded("k");
+        ray_t* res = sr_eval(qs[i].q);
+        TEST_ASSERT_TRUE(res && !RAY_IS_ERR(res));
+        ray_release(res);
+        /* the pass reads all of k (200000 I64); the bounds prescan adds the
+         * five vectors of the selected rows, or nothing when the other keys
+         * already rule the plan out */
+        const uint64_t want = 200000 * 8 + (qs[i].k_bounds ? 5 * RAY_ENC_VEC * 8 : 0);
+        TEST_ASSERT_FMT(sr_col_decoded("k") - k0 == want, "%s: %llu bytes of k decoded, want %llu", qs[i].q,
+                        (unsigned long long)(sr_col_decoded("k") - k0), (unsigned long long)want);
+    }
+    PASS();
+}
+
 /* Task 13b fix round 1: directory statistics size the dense plans, so a
  * forged one must not reach memory.  Key k is j * 7 % 1000 in chunks 0-2
  * and j * 7 % 5001 in chunk 3; chunk 3's directory maximum is patched from
@@ -4073,6 +4137,38 @@ static test_result_t test_v2_forged_consumers(void) {
         if (!sr_forge_max(path, 3, cs[i].x)) { ray_group_test_route(0); FAIL("forge"); }
         r = sr_corrupt_twice("(.db.splayed.get \"" SR_TMP "/fcb/\")", cs[i].q, path);
         ray_group_test_route(0);
+        if (r.status != TEST_PASS) return r;
+    }
+    PASS();
+}
+
+/* Task 17b fix round 1: the split prescan over a forged directory.  A mixed
+ * key set (SYM g scanned exactly, staged I64 k through the directory path
+ * as a set of its own) whose k chunk 3 maximum (directory and descriptors)
+ * is lowered below its values: `corrupt` naming k, twice, and no write past
+ * a slab (ASan).  Unpatched, the answers are generation 0's. */
+static test_result_t test_v2_forged_split(void) {
+    sr_eval_ok("(set jf (til 262144))");
+    sr_eval_ok("(set ja (til 196608))");
+    sr_eval_ok("(set jb (+ 196608 (til 65536)))");
+    sr_eval_ok("(set FS (table [k g v] (list (concat (% (* ja 7) 1000) (map (fn [j] (if (== 0 (% j 100)) 0N (% (* j 7) 5001))) jb)) "
+               "(as 'SYM (as 'STR (% jf 3))) jf)))");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/fs0/\" FS {compress: false})");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/fs2/\" FS {compress: true})");
+    static const char* const qs[] = {
+        "(select {s: (sum v) c: (count v) from: T where: (> v 0) by: [g k]})",
+        "(select {s: (sum v) c: (count v) from: T where: (> v 0) by: [k g]})",
+        NULL,
+    };
+    for (int i = 0; qs[i]; i++) {
+        test_result_t r = sr_same_route("(.db.splayed.get \"" SR_TMP "/fs0/\")", "(.db.splayed.get \"" SR_TMP "/fs2/\")", qs[i]);
+        if (r.status != TEST_PASS) return r;
+        sr_eval_ok("(.db.splayed.set \"" SR_TMP "/fsb/\" FS {compress: true})");
+        char dir[512], path[600];
+        if (ray_splay_resolve_dir(ray_test_tmp(SR_TMP "/fsb/"), dir, sizeof dir) != RAY_OK) FAIL("resolve");
+        snprintf(path, sizeof path, "%s/k", dir);
+        if (!sr_forge_max(path, 3, 999)) FAIL("forge");
+        r = sr_corrupt_twice("(.db.splayed.get \"" SR_TMP "/fsb/\")", qs[i], path);
         if (r.status != TEST_PASS) return r;
     }
     PASS();
@@ -6409,6 +6505,8 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/ragged_fill_bounded",   test_ragged_fill_bounded,   srr_setup, srr_teardown },
     { "scanrange/vec_stat_decide",       test_vec_stat_decide,       sr_rt_setup, sr_rt_teardown },
     { "scanrange/v2_sel_bounds_split",   test_v2_sel_bounds_split,   sr_rt_setup, sr_rt_teardown },
+    { "scanrange/v2_sel_bounds_boundary", test_v2_sel_bounds_boundary, sr_rt_setup, sr_rt_teardown },
+    { "scanrange/v2_forged_split",       test_v2_forged_split,       sr_rt_setup, sr_rt_teardown },
     { "scanrange/const_beside_parted_group", test_const_beside_parted_group, srr_setup, srr_teardown },
     { NULL, NULL, NULL, NULL },
 };

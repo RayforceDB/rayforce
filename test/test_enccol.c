@@ -1695,10 +1695,6 @@ static test_result_t test_dict_kernel_rejects(void) {
     PASS();
 }
 
-/* The point read's value check (fix round 3, M2): with the descriptor's
- * statistics kept, a served value outside them is refused (-1); inside
- * them every row is served with its value.  FOR_BP I32 (the maximum
- * lowered, the minimum raised) and DICT I64. */
 /* Task 17b: the CONST / RLE point read equals the reference decode on every
  * row, for every integer kind, lengths 1024, 1000, 77 and 1, run counts
  * 1..1024 and every legal child pair; a run whose value is outside the
@@ -1764,6 +1760,9 @@ static test_result_t test_point_read_runs(void) {
     TEST_ASSERT_EQ_I(ray_enccol_test_point_body_stats(RAY_I32, NULL, 0, RAY_ENC_RLE, 0, 0, b.p, b.len, RAY_ENC_VEC,
                                                       true, 10, 20, pv, res), 0);
     for (int i = 0; i < RAY_ENC_VEC; i++) TEST_ASSERT_FMT(res[i] == (i < 600 ? 1 : -1), "stats out: row %d %d", i, res[i]);
+    /* a run vector with nulls declines every row (the bitmap decides) */
+    TEST_ASSERT_EQ_I(ray_enccol_test_point_body(RAY_I32, NULL, 0, RAY_ENC_RLE, 0, 1, b.p, b.len, RAY_ENC_VEC, pv, res), 0);
+    for (int i = 0; i < RAY_ENC_VEC; i++) TEST_ASSERT_FMT(res[i] == 0, "nulls: row %d %d", i, res[i]);
     /* a descriptor width on a run body declines */
     TEST_ASSERT_EQ_I(ray_enccol_test_point_body(RAY_I32, NULL, 0, RAY_ENC_RLE, 3, 0, b.p, b.len, RAY_ENC_VEC, pv, res), 0);
     for (int i = 0; i < RAY_ENC_VEC; i++) TEST_ASSERT_EQ_I(res[i], 0);
@@ -1771,6 +1770,10 @@ static test_result_t test_point_read_runs(void) {
     PASS();
 }
 
+/* The point read's value check (fix round 3, M2): with the descriptor's
+ * statistics kept, a served value outside them is refused (-1); inside
+ * them every row is served with its value.  FOR_BP I32 (the maximum
+ * lowered, the minimum raised) and DICT I64. */
 static test_result_t test_point_read_stats(void) {
     static uint64_t v[RAY_ENC_VEC], u[RAY_ENC_VEC], bodyw[RAY_ENC_VEC / 2 + 4];
     static int64_t pv[RAY_ENC_VEC]; static int8_t res[RAY_ENC_VEC];

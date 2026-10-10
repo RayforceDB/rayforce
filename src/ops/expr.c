@@ -2064,10 +2064,10 @@ static int zone_cmp_decision(const ray_index_t* ix, int64_t ch,
 /* (null cmp_op cval) for a chunk of a synthetic stand-in whose every row is
  * null: every lane loads as NULL_I64, which both the null-aware and the
  * plain i64 kernels rank below every value, so null == c, null > c and
- * null >= c fail and null != c, null < c and null <= c pass.  A null
- * constant is left to the kernel. */
-static int zone_all_null_decision(uint16_t cmp_op, int64_t cval) {
-    if (cval == NULL_I64) return ZT_MIXED;
+ * null >= c fail and null != c, null < c and null <= c pass.  The constant
+ * is never the null (expr_zone_decide leaves a null constant to the
+ * kernel). */
+static int zone_all_null_decision(uint16_t cmp_op) {
     switch (cmp_op) {
     case OP_EQ: case OP_GT: case OP_GE: return 0;
     case OP_NE: case OP_LT: case OP_LE: return 1;
@@ -2084,7 +2084,7 @@ static int zone_dir_decision(const ray_col_src_t* src, int64_t ch, uint16_t cmp_
     ray_enc_chunk_stat_t st;
     if (!ray_col_src_chunk_stat(src, ch, &st)) return ZT_MIXED;
     bool all_null = (int64_t)st.null_count == st.rows;
-    if (all_null && st.rows > 0 && expr_src_synthetic(src)) return zone_all_null_decision(cmp_op, cval);
+    if (all_null && st.rows > 0 && expr_src_synthetic(src)) return zone_all_null_decision(cmp_op);
     int d = zone_cmp_core(st.min, st.max, st.has_minmax, st.null_count > 0, all_null, cmp_op, cval);
     return d < 0 ? ZT_MIXED : d;
 }
@@ -2142,6 +2142,11 @@ static int expr_zone_decide(const ray_expr_t* expr, int64_t ms, int64_t me) {
                 cmp = zone_swap_op(op);
             }
             int d = ZT_MIXED;
+            /* A null constant is left to the kernel, before any arm: no
+             * extrema rule covers it.  Unreachable today (the compiler bails
+             * a null constant, EXPR_BAIL_CONST), it guards every arm if that
+             * bail is ever relaxed. */
+            if (src_reg >= 0 && cval == NULL_I64) src_reg = -1;
             if (src_reg >= 0 && expr->regs[src_reg].enc) {
                 /* generation 2: the directory's chunk of 64K rows, then the
                  * descriptor of the vector the morsel lies in */
