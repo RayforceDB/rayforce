@@ -261,6 +261,17 @@ rb -- [6 3]
 ((mkcc 'z) ['a 'b]) -- ['a 'b 'z]
 (set mkmx (fn [k] (fn [v] (+ (max v) k))))
 ((mkmx 1) [3 9 2]) -- 10
+;; ... and the generic null rule for a unary builtin: only nil?, type and ser
+;; take the null, any other raises a type error, as on the tree walker
+(set mkn (fn [k] (fn [v] (count v))))
+((mkn 0) null) !- type
+((mkn 0) null) !- type
+(set mkn2 (fn [k] (fn [v] (list (nil? v) (type v)))))
+((mkn2 0) null) -- (list true 'null)
+(set dn (dict ['a 'b] (list 1 null)))
+(set mkn3 (fn [k] (fn [key0] (first (at dn key0)))))
+((mkn3 0) 'b) !- type
+((mkn3 0) 'a) -- 1
 ;; a top-level helper keeps elementwise arithmetic on a column
 (set hn2 (fn [v] 1 (* v 2)))
 (hn2 [1 2 3]) -- [2 4 6]

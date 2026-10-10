@@ -3166,7 +3166,12 @@ op_callf: {
                 fn_args[0] = ray_lazy_materialize(fn_args[0]); /* consumes owned ref */
                 if (!fn_args[0] || RAY_IS_ERR(fn_args[0])) { result = fn_args[0] ? fn_args[0] : ray_error("type", NULL); fn_args[0] = NULL; break; }
             }
-            if ((fn_obj->attrs & RAY_FN_ATOMIC) && fn_args[0] && fn_args[0]->type >= 0)
+            /* The generic null: only nil?, type and ser take it, as on the
+             * tree walker and in OP_CALL1. */
+            if (RAY_UNLIKELY(RAY_IS_NULL(fn_args[0])))
+                result = (unary == (ray_unary_fn)ray_nil_fn || unary == (ray_unary_fn)ray_type_fn ||
+                          unary == (ray_unary_fn)ray_ser_fn) ? unary(fn_args[0]) : ray_error("type", NULL);
+            else if ((fn_obj->attrs & RAY_FN_ATOMIC) && fn_args[0] && fn_args[0]->type >= 0)
                 result = atomic_map_unary(unary, fn_args[0]);
             else
                 result = unary(fn_args[0]);
