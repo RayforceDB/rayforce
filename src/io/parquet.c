@@ -1902,6 +1902,17 @@ static int pq_value_pages(pq_span stats) {
     }
     return any;
 }
+/* Sums and products of a footer's sizes, which are the file's word: never
+ * negative, saturating at INT64_MAX instead of wrapping. */
+static inline int64_t pq_sat_add(int64_t a, int64_t b) {
+    if (a < 0) a = 0;
+    if (b < 0) b = 0;
+    return a > INT64_MAX - b ? INT64_MAX : a + b;
+}
+static inline int64_t pq_sat_mul(int64_t a, int64_t b) {
+    if (a <= 0 || b <= 0) return 0;
+    return a > INT64_MAX / b ? INT64_MAX : a * b;
+}
 /* An upper bound on the memory the direct import would hold for a symbol
  * chunk's distinct strings: their bytes and PQ_DIRECT_STRING_COST each.  A
  * dictionary page counts its decoded bytes and entries (from its header);
@@ -1909,7 +1920,7 @@ static int pq_value_pages(pq_span stats) {
  * dictionary, the encoding stats naming such a page, or no stats at all
  * (unsure: then every data byte may be a string's, a string at least the 4
  * bytes of its length prefix).  An unreadable dictionary header counts the
- * whole chunk so. */
+ * whole chunk so.  Saturating, never negative. */
 static int64_t pq_chunk_vocab(ray_parquet_t* r, pq_span* mf, bool* dict_only) {
     int64_t raw = pq_get(mf[6],-1), values = pq_get(mf[5],-1);
     int64_t data = pq_get(mf[9],-1), dict = pq_get(mf[11],-1);
@@ -1918,12 +1929,12 @@ static int64_t pq_chunk_vocab(ray_parquet_t* r, pq_span* mf, bool* dict_only) {
     if (values < 0 || values > raw) values = raw;
     int64_t draw, entries, rest = raw, bound = 0;
     if (dict > 0 && dict < data && pq_dict_header(r,dict,&draw,&entries)) {
-        bound = draw + PQ_DIRECT_STRING_COST*entries;
+        bound = pq_sat_add(draw,pq_sat_mul(PQ_DIRECT_STRING_COST,entries));
         *dict_only = pq_value_pages(mf[13]) == 0;
         rest = *dict_only ? 0 : raw > draw ? raw - draw : raw;
     }
     int64_t n = rest / 4 < values ? rest / 4 : values;
-    return bound + rest + PQ_DIRECT_STRING_COST*n;
+    return pq_sat_add(pq_sat_add(bound,rest),pq_sat_mul(PQ_DIRECT_STRING_COST,n));
 }
 /* The symbol columns' bounds (pq_chunk_vocab), summed over the row groups,
  * into vocab[c] for the columns order[from, to), and in dict_only[c]
@@ -1951,7 +1962,7 @@ static void pq_vocab_bounds(ray_parquet_t* r, const int64_t* order, int64_t from
                 }
                 bool only;
                 int64_t v = pq_chunk_vocab(r,mf,&only);
-                vocab[c] = v > INT64_MAX - vocab[c] ? INT64_MAX : vocab[c] + v;
+                vocab[c] = pq_sat_add(vocab[c],v);
                 if (!only) dict_only[c] = 0;
             }
         }
@@ -2842,6 +2853,7 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
     int64_t* bytes = ray_calloc_raw((size_t)r->ncols*sizeof(*bytes));
     int64_t* vocab = ray_calloc_raw((size_t)r->ncols*sizeof(*vocab));   /* pq_vocab_bounds */
     uint8_t* donly = ray_calloc_raw((size_t)r->ncols);   /* pq_vocab_bounds */
+    uint8_t* pick = ray_calloc_raw((size_t)r->ncols);    /* the direct ones of a grouped import */
     int64_t* order = ray_alloc_raw((size_t)r->ncols*sizeof(*order));
     _Atomic uint8_t* prefetched = NULL;
     pq_column* spare = NULL;   /* pq_direct_work.spare */
@@ -2852,7 +2864,7 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
     pq_symflush_t symf = {NULL,false,(int)RAY_OK};
     ray_thread_t sym_thread = 0;
     bool sym_running = false;
-    if (!offsets || !nulls || !locks || !errors || !lo || !hi || !bytes || !vocab || !donly || !order) { err = ray_error("oom",NULL); goto done; }
+    if (!offsets || !nulls || !locks || !errors || !lo || !hi || !bytes || !vocab || !donly || !pick || !order) { err = ray_error("oom",NULL); goto done; }
     for (int64_t c = 0; c < r->ncols; c++) {
         size_t size = writers[c].type == RAY_SYM ? 4 : ray_elem_size(writers[c].type);
         if (r->rows > (INT64_MAX-32)/(int64_t)size) { err = pq_error("native column exceeds file offset range"); goto done; }
@@ -2982,17 +2994,17 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
         if (mode == PQ_SYM_GROUPED) {
             /* the direct ones (only columns whose chunks are dictionaries and
              * ids: their dictionaries seeded in row-group order make their
-             * positions the workers' no matter), marked by a negated
-             * vocabulary */
+             * positions the workers' no matter), marked in pick[] (the
+             * bounds are never negative, saturating at INT64_MAX) */
             int64_t sum = 0, ndirect = 0;
             for (;;) {
                 int64_t best = -1;
                 for (int64_t i = nnum; i < r->ncols; i++) {
                     int64_t c = order[i];
-                    if (vocab[c] >= 0 && donly[c] && (best < 0 || vocab[c] < vocab[best])) best = c;
+                    if (!pick[c] && donly[c] && (best < 0 || vocab[c] < vocab[best])) best = c;
                 }
                 if (best < 0 || vocab[best] > sram / 64 || vocab[best] > sram / 16 - sum) break;
-                sum += vocab[best]; vocab[best] = -1 - vocab[best]; ndirect++;
+                sum += vocab[best]; pick[best] = 1; ndirect++;
             }
             seed = ndirect > 0;
             if (ndirect == r->ncols - nnum) mode = PQ_SYM_DIRECT;
@@ -3001,13 +3013,12 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
                 int64_t at = nnum;
                 for (int64_t i = nnum; i < r->ncols; i++) {
                     int64_t c = order[i];
-                    if (vocab[c] >= 0) continue;
+                    if (!pick[c]) continue;
                     for (int64_t j = i; j > at; j--) order[j] = order[j-1];
                     order[at++] = c;
                 }
                 nd = at;
             }
-            for (int64_t i = nnum; i < r->ncols; i++) if (vocab[order[i]] < 0) vocab[order[i]] = -1 - vocab[order[i]];
         }
     }
     if (mode == PQ_SYM_GROUPED && simp) {
@@ -3142,7 +3153,7 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
 done:
     for (int64_t c = 0; c < r->ncols; c++) r->schema[c].import_domain = NULL;
     ray_free_raw(offsets); ray_free_raw(nulls); ray_free_raw(locks); ray_free_raw(errors);
-    ray_free_raw(lo); ray_free_raw(hi); ray_free_raw(bytes); ray_free_raw(vocab); ray_free_raw(donly); ray_free_raw(order);
+    ray_free_raw(lo); ray_free_raw(hi); ray_free_raw(bytes); ray_free_raw(vocab); ray_free_raw(donly); ray_free_raw(pick); ray_free_raw(order);
     if (prefetched) ray_free_raw((void*)prefetched);
     for (int64_t i = 0; i < nspare; i++) {
         ray_free_raw(spare[i].page); ray_free_raw(spare[i].dict); ray_free_raw(spare[i].symbols);
