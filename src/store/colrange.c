@@ -171,17 +171,23 @@ static ray_t* range_enc(ray_enccol_t* e, int64_t start, int64_t n, bool guard,
     const ray_enc_desc_t* descs;
     ray_t* err = ray_enccol_chunk_descs_ref(e, c, &descs);  /* in place; validated once per column */
     if (err) return err;
-    if (e->type == RAY_F64 || e->type == RAY_F32) {
-        /* a RAW vector without nulls is its own decode: read it in place */
-        const void* pv = ray_enccol_raw_float_view(e, c, j, &descs[j]);
+    if (e->type != RAY_STR && e->type != RAY_GUID) {
+        /* a RAW vector without nulls is its own decode: read it in place
+         * (the consumer guard checks it as it checks a decode).  An
+         * integer one counts its bytes as delivered, so the read-once
+         * counts of a key hold whatever its vectors' encodings; a float
+         * one counts none (Task 9). */
+        const void* pv = ray_enccol_raw_view(e, c, j, &descs[j]);
         if (pv) {
+            if (guard && (err = ray_enccol_check_dir(e, c, j, pv, (int)vlen, false)) != NULL) return err;
+            if (e->type != RAY_F64 && e->type != RAY_F32) scratch_count(sc, e, (uint64_t)vlen * ray_enccol_esz(e));
             out->data = (const uint8_t*)pv + (size_t)off * ray_enccol_esz(e);
             out->n = n;
             out->type = e->type;
             out->attrs = e->attrs;
             out->may_null = false;
             out->str_pool = NULL;
-            out->dom = NULL;
+            out->dom = e->type == RAY_SYM ? e->dom : NULL;
             return NULL;
         }
     }

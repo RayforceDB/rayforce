@@ -82,11 +82,13 @@ typedef struct ray_enccol_s {
     /* single file: one byte per chunk, set (release) once the chunk's
      * descriptors passed validation; never set for a chunk that failed */
     _Atomic(uint8_t)* desc_ok;
-    /* single-file F32 / F64: one byte per chunk, set (release) once every
-     * RAW vector of the chunk without nulls or trailer passed the checks
-     * dec_floats makes (no NaN outside the bitmap, zero padding, no bytes
-     * after the body); never set for a chunk that failed */
-    _Atomic(uint8_t)* fraw_ok;
+    /* single file, floats and integers (not GUID or STR): one byte per
+     * chunk, set (release) once every RAW vector of the chunk without
+     * nulls or trailer passed the checks its decode makes (floats: no NaN
+     * outside the bitmap; integers: no sentinel, SYM ids in the domain and
+     * the statistics; zero padding, no bytes after the body); never set
+     * for a chunk that failed */
+    _Atomic(uint8_t)* raw_ok;
     /* single file: ray_enccol_dir_totals' cache; totals_state 0 none,
      * 1 being stored, 2 stored (acquire before reading totals) */
     _Atomic(uint8_t) totals_state;
@@ -131,18 +133,19 @@ ray_t* ray_enccol_decode_desc(ray_enccol_t* e, int64_t c, int j, const ray_enc_d
  * decoded bytes are returned in *produced instead of counted; the caller
  * counts them with ray_enccol_note_decoded. */
 /* Vector j of chunk c (descriptors validated) read in place: the mapped
- * payload of a RAW F32 / F64 vector with no nulls and no trailer, whose
- * bits equal its decode, once its chunk's float checks passed (validated
- * once per chunk, a failure never cached).  NULL: decode it instead (the
- * decode reports a corrupt vector). */
-const void* ray_enccol_raw_float_view(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d);
+ * payload of a RAW vector with no nulls and no trailer (F32, F64 and the
+ * integer types, SYM included), whose bits equal its decode, once its
+ * chunk's RAW checks passed (validated once per chunk, a failure never
+ * cached).  NULL: decode it instead (the decode reports a corrupt vector).
+ * A consumer guard (stats_guard) still checks the values it reads. */
+const void* ray_enccol_raw_view(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d);
 ray_t* ray_enccol_decode_into(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d,
                               void* out, char* pool_out, uint64_t pool_base, uint64_t pool_cap,
                               uint64_t* produced);
 /* Vector j of chunk c straight into an expression register: RAY_I64 or
- * RAY_F64 elements (`wide`), nulls as NULL_I64 / NULL_F64, for a FOR_BP or
- * DELTA_BP vector of a narrow integer column (BOOL, U8, I16, I32, DATE,
- * TIME).  1 decoded (*produced as ray_enccol_decode_into), 0 declined: the
+ * RAY_F64 elements (`wide`), nulls as NULL_I64 / NULL_F64, for a FOR_BP,
+ * DELTA_BP, CONST or RLE vector of a narrow integer column (BOOL, U8, I16,
+ * I32, DATE, TIME).  1 decoded (*produced as ray_enccol_decode_into), 0 declined: the
  * caller reads the vector by range, which decodes or reports it. */
 int    ray_enccol_decode_wide(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d,
                               int8_t wide, void* out, uint64_t* produced);

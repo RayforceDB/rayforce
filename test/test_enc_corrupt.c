@@ -973,6 +973,151 @@ static const char* reads_ok(const char* path, int64_t vec) {
 #define READS_OK(path, vec) do { const char* w_ = reads_ok(path, vec); \
     TEST_ASSERT_FMT(w_ == NULL, "%s:%d %s", __FILE__, __LINE__, w_); } while (0)
 
+/* ---- Task 17a: the CONST / RLE / RAW kernels and the RAW view never accept what the reference rejects ---- */
+
+/* 1024 I16 rows in 11 runs of 100 (1000, 1003, ...; the last 24 rows) ->
+ * RLE with RAW children: [nr][0] @0, values hdr @8, body @16 (24 B), ends
+ * hdr @40, body @48 (24 B).  nulls: rows 300..399 null (a bitmap first). */
+static ray_t* rk_i16_runs(bool nulls) {
+    ray_t* v = ray_vec_new(RAY_I16, 1024); v->len = 1024;
+    for (int i = 0; i < 1024; i++)
+        ((int16_t*)ray_data(v))[i] = nulls && i >= 300 && i < 400 ? NULL_I16 : (int16_t)(1000 + 3 * (i / 100));
+    if (nulls) v->attrs |= RAY_ATTR_HAS_NULLS;
+    return v;
+}
+/* 65536 + 2048 distinct I64 rows: the first chunk takes a VALUE_DICT, the
+ * second chunk's two vectors are RAW without nulls (global vectors 64, 65). */
+static ray_t* rk_i64_raw2(void) {
+    ray_t* v = ray_vec_new(RAY_I64, 67584); v->len = 67584;
+    for (int64_t i = 0; i < 67584; i++) {
+        uint64_t h = (uint64_t)(i + 1) * 0x9E3779B97F4A7C15ull;      /* a 64-bit mix: no runs, no lane deltas */
+        h ^= h >> 31; h *= 0xBF58476D1CE4E5B9ull; h ^= h >> 29;
+        ((int64_t*)ray_data(v))[i] = (int64_t)h == NULL_I64 ? 1 : (int64_t)h;
+    }
+    return v;
+}
+
+/* 1024 I32 rows of 7 -> CONST, 8 B: the value, then zero padding. */
+static ray_t* rk_i32_const(void) {
+    ray_t* v = ray_vec_new(RAY_I32, 1024); v->len = 1024;
+    for (int i = 0; i < 1024; i++) ((int32_t*)ray_data(v))[i] = 7;
+    return v;
+}
+
+/* Range reads of vectors a and b in turn through one column object, twice:
+ * a reads (decoded, not in place: its chunk's RAW check failed on b), b is
+ * `corrupt` naming the path and the rule each time. */
+static const char* view_memo(const char* path, int64_t a, int64_t b, const char* needle) {
+    static char why[512];
+    if (!img_store(path, g_len)) return "store";
+    ray_t* c = ray_col_mmap(path);
+    if (!c || RAY_IS_ERR(c)) { if (c) ray_error_free(c); return "load failed"; }
+    ray_enccol_t* e = ray_enccol_of(c);
+    ray_col_src_t src;
+    ray_t* m = ray_col_src_bind(c, &src);
+    if (m) { ray_error_free(m); ray_release(c); return "bind failed"; }
+    ray_col_scratch_t sc; ray_col_scratch_init(&sc);
+    const char* res = NULL;
+    for (int i = 0; i < 4 && !res; i++) {
+        ray_col_range_t r;
+        ray_error_clear();
+        ray_t* err = ray_col_range(&src, (i & 1 ? b : a) * RAY_ENC_VEC, RAY_ENC_VEC, &sc, &r);
+        if (!(i & 1)) {
+            if (err || ((const uint8_t*)r.data >= e->base && (const uint8_t*)r.data < e->base + e->size)) {
+                snprintf(why, sizeof why, "read %d of vector %lld gave %s", i + 1, (long long)a, err ? ray_err_code(err) : "a view in place");
+                res = why;
+            }
+        } else if (!(err && RAY_IS_ERR(err) && strcmp(ray_err_code(err), "corrupt") == 0 && names_path(path) && has_needle(needle))) {
+            snprintf(why, sizeof why, "read %d of vector %lld gave %s: \"%s\", want corrupt [%s]", i + 1, (long long)b,
+                     err ? ray_err_code(err) : "a view", err && ray_error_msg() ? ray_error_msg() : "", needle);
+            res = why;
+        }
+        if (err) ray_error_free(err);
+    }
+    ray_col_scratch_free(&sc); ray_col_src_release(&src);
+    ray_release(c);
+    return res;
+}
+#define VIEW_MEMO(path, a, b, needle) do { const char* w_ = view_memo(path, a, b, needle); \
+    TEST_ASSERT_FMT(w_ == NULL, "%s:%d %s", __FILE__, __LINE__, w_); } while (0)
+
+static test_result_t test_runs_kernel_corrupt_twice(void) {
+    const char* p = ray_test_tmp(EC_TMP "/rk");
+    size_t at;
+    /* RLE I16 with RAW children */
+#define RK_RUNS() do { SAVE(rk_i16_runs(false), p); NEED_ENC(0, 0, RAY_ENC_RLE); at = payload_at(0, 0); \
+        TEST_ASSERT_TRUE(rd64(at) == 11 && g_img[at + 8] == RAY_ENC_RAW && g_img[at + 40] == RAY_ENC_RAW); } while (0)
+    RK_RUNS(); W32(at + 4, 1);                      BAD2(p, 0, "RLE reserved word not zero");
+    RK_RUNS(); W32(at, 0);                          BAD2(p, 0, "RLE run count out of range");
+    RK_RUNS(); W32(at, 2000);                       BAD2(p, 0, "RLE run count out of range");
+    RK_RUNS(); W8(at + 8 + 2, 1);                   BAD2(p, 0, "child header reserved bytes not zero");
+    RK_RUNS(); W32(at + 8 + 4, 20);                 BAD2(p, 0, "child body size not a multiple of 8");
+    RK_RUNS(); W32(at + 8 + 4, 4096);               BAD2(p, 0, "child body overruns its parent");
+    RK_RUNS(); W8(at + 8, RAY_ENC_RLE);             BAD2(p, 0, "encoding illegal in this slot or depth");
+    RK_RUNS(); W8(at + 40, RAY_ENC_CONST);          BAD2(p, 0, "encoding illegal in this slot or depth");
+    RK_RUNS(); W8(at + 8 + 1, 3);                   BAD2(p, 0, "width on a non-packed encoding");
+    RK_RUNS(); W8(at + 16 + 22, 1);                 BAD2(p, 0, "RAW padding not zero");
+    RK_RUNS(); W16(at + 48 + 4, 150);               BAD2(p, 0, "RLE run ends not ascending or past the vector");
+    RK_RUNS(); W16(at + 48 + 10, 2000);             BAD2(p, 0, "RLE run ends not ascending or past the vector");
+    RK_RUNS(); W16(at + 48 + 20, 1023);             BAD2(p, 0, "RLE last run end is not the vector length");
+    RK_RUNS(); W16(at + 16 + 6, 0x8000);            BAD2(p, 0, "sentinel outside the bitmap");
+    {   /* the payload a word long, a word short */
+        RK_RUNS(); uint64_t pb = rd64(desc_at(0, 0) + 16);
+        W64(desc_at(0, 0) + 16, pb + 8); set_chunk_bytes(0, 3072 + pb + 8);  BAD2(p, 0, "bytes after the codec body");
+        RK_RUNS();
+        W64(desc_at(0, 0) + 16, pb - 8); set_chunk_bytes(0, 3072 + pb - 8);  BAD2(p, 0, "child body overruns its parent");
+    }
+    /* with a bitmap (rows 300..399): a run outside it on the sentinel is
+     * corrupt; the run under it on the sentinel reads */
+    SAVE(rk_i16_runs(true), p); NEED_ENC(0, 0, RAY_ENC_RLE); at = payload_at(0, 0) + 128;
+    TEST_ASSERT_TRUE(rd64(desc_at(0, 0)) >> 16 & 0xFFFF);
+    TEST_ASSERT_TRUE(rd64(at) == 11 && g_img[at + 8] == RAY_ENC_RAW);
+    W16(at + 16 + 4, 0x8000);                       BAD2(p, 0, "sentinel outside the bitmap");   /* rows 200..299 */
+    SAVE(rk_i16_runs(true), p); at = payload_at(0, 0) + 128;
+    W16(at + 16 + 6, 0x8000);                       READS_OK(p, 0);                                /* rows 300..399 */
+    /* CONST I32 */
+    SAVE(rk_i32_const(), p); NEED_ENC(0, 0, RAY_ENC_CONST); at = payload_at(0, 0);
+    W32(at, 0x80000000u);                           BAD2(p, 0, "sentinel outside the bitmap");
+    SAVE(rk_i32_const(), p); at = payload_at(0, 0);
+    W8(at + 5, 1);                                  BAD2(p, 0, "RAW padding not zero");
+    /* SYM RLE (ids 1 + i / 100, bound 200): values RAW 11 B @16, ends hdr @32 */
+    {
+        uint8_t ids[1024];
+        for (int i = 0; i < 1024; i++) ids[i] = (uint8_t)(1 + i / 100);
+        SAVE_SYM(ids, 1024, p); NEED_ENC(0, 0, RAY_ENC_RLE); at = payload_at(0, 0);
+        TEST_ASSERT_TRUE(g_img[at + 8] == RAY_ENC_RAW && g_img[at + 32] == RAY_ENC_RAW);
+        W8(at + 16 + 3, 250);                       BAD2(p, 0, "SYM id outside the symbol domain");
+        SAVE_SYM(ids, 1024, p); at = payload_at(0, 0);
+        W8(at + 16 + 3, 0);                         BAD2(p, 0, "SYM null count");
+        for (int i = 0; i < 1024; i++) ids[i] = 5;
+        SAVE_SYM(ids, 1024, p); NEED_ENC(0, 0, RAY_ENC_CONST); at = payload_at(0, 0);
+        W8(at, 0);                                  BAD2(p, 0, "SYM null count");
+        SAVE_SYM(ids, 1024, p); at = payload_at(0, 0);
+        W8(at, 250);                                BAD2(p, 0, "SYM id outside the symbol domain");
+        /* RAW SYM (read in place when sound), 1023 ids: one byte of padding */
+        for (int i = 0; i < 1024; i++) ids[i] = (uint8_t)(1 + ((uint32_t)i * 2654435761u >> 24) % 199);
+        SAVE_SYM(ids, 1023, p); NEED_ENC(0, 0, RAY_ENC_RAW); at = payload_at(0, 0);
+        W8(at + 1023, 1);                           BAD2(p, 0, "RAW padding not zero");
+        SAVE_SYM(ids, 1023, p); at = payload_at(0, 0);
+        W8(at + 700, 250);                          BAD2(p, 0, "SYM id outside the symbol domain");
+        SAVE_SYM(ids, 1023, p); at = payload_at(0, 0);
+        W8(at + 700, 0);                            BAD2(p, 0, "SYM null count");
+    }
+    /* RAW I32 with a bitmap (decoded, not read in place) */
+    SAVE(i32_nulls_raw(), p); NEED_ENC(0, 0, RAY_ENC_RAW); at = payload_at(0, 0);
+    W32(at + 128 + 4, (uint32_t)NULL_I32);          BAD2(p, 0, "sentinel outside the bitmap");
+    /* RAW I64 without nulls (read in place when sound), chunk 1 */
+    SAVE(rk_i64_raw2(), p); NEED_ENC(1, 0, RAY_ENC_RAW); NEED_ENC(1, 1, RAY_ENC_RAW);
+    TEST_ASSERT_EQ_U(rd64(desc_at(1, 1)) >> 16 & 0xFFFF, 0);
+    W64(payload_at(1, 1) + 8 * 5, (uint64_t)1 << 63);   BAD2(p, 65, "sentinel outside the bitmap");
+    /* one corrupt vector: its chunk is never cached as checked, so the
+     * sound vector beside it is decoded, and the corrupt one reported, on
+     * every read */
+    VIEW_MEMO(p, 64, 65, "sentinel outside the bitmap");
+#undef RK_RUNS
+    PASS();
+}
+
 /* The decode-side contract for a descriptor moved inward past a real value
  * (still inside its chunk's): the encodings whose check is free to fuse
  * (DICT's gather, SYM's id check, the floats' NaN scan) are `corrupt` on
@@ -1013,6 +1158,23 @@ static test_result_t test_stats_values(void) {
         for (int i = 0; i < 1024; i++) ids[i] = (uint8_t)(1 + i / 100);
         SAVE_SYM(ids, 1024, p); NEED_ENC(0, 0, RAY_ENC_RLE);
         W64(desc_at(0, 0) + 40, 10);                        BAD2(p, 0, VALUE_OUT);
+    }
+    /* integer RAW without nulls, read in place: I64 as decoded (not held
+     * to the statistics), SYM checked as its decode checks it */
+    SAVE(rk_i64_raw2(), p); NEED_ENC(1, 0, RAY_ENC_RAW); D = desc_at(1, 0);
+    W64(D + 40, rd64(D + 40) - 1);                          READS_OK(p, 64);
+    {
+        uint8_t ids[1024];
+        for (int i = 0; i < 1024; i++) ids[i] = (uint8_t)(1 + ((uint32_t)i * 2654435761u >> 24) % 199);
+        SAVE_SYM(ids, 1024, p); NEED_ENC(0, 0, RAY_ENC_RAW); D = desc_at(0, 0);
+        W64(D + 40, rd64(D + 40) - 1);                      BAD2(p, 0, VALUE_OUT);
+        SAVE_SYM(ids, 1024, p); D = desc_at(0, 0);
+        W64(D + 32, rd64(D + 32) + 1);                      BAD2(p, 0, VALUE_OUT);
+        /* CONST SYM 9: the chunk widened to [9, 10], the vector moved to [10, 10] */
+        for (int i = 0; i < 1024; i++) ids[i] = 9;
+        SAVE_SYM(ids, 1024, p); NEED_ENC(0, 0, RAY_ENC_CONST); D = desc_at(0, 0);
+        TEST_ASSERT_EQ_U(rd64(D + 40), 9);
+        W64(DIR(0) + 24, 10); W64(D + 32, 10); W64(D + 40, 10); BAD2(p, 0, VALUE_OUT);
     }
     /* floats: RAW without nulls (read in place), with a NaN null (the copy) */
     SAVE(f64_stats(), p); NEED_ENC(0, 0, RAY_ENC_RAW);
@@ -1140,6 +1302,17 @@ static test_result_t test_stats_guard(void) {
     SAVE(fk_delta(), p); GUARD_READS(p, 1, false);
     W64(DIR(0) + 24, rd64(DIR(0) + 24) - 1); W64(desc_at(0, 1) + 40, rd64(DIR(0) + 24));
     GUARD_READS(p, 1, true);
+    /* RLE (I16, RAW children) and RAW I64 read in place (chunk 1) */
+    SAVE(rk_i16_runs(false), p); GUARD_READS(p, 0, false);
+    W64(DIR(0) + 24, rd64(DIR(0) + 24) - 1); W64(desc_at(0, 0) + 40, rd64(DIR(0) + 24));
+    GUARD_READS(p, 0, true);
+    SAVE(rk_i64_raw2(), p); NEED_ENC(1, 0, RAY_ENC_RAW); GUARD_READS(p, 64, false);
+    {   /* the chunk's maximum (and its vector's) one below the real one */
+        const int top = (int64_t)rd64(desc_at(1, 0) + 40) > (int64_t)rd64(desc_at(1, 1) + 40) ? 0 : 1;
+        TEST_ASSERT_EQ_U(rd64(desc_at(1, top) + 40), rd64(DIR(1) + 24));
+        W64(DIR(1) + 24, rd64(DIR(1) + 24) - 1); W64(desc_at(1, top) + 40, rd64(DIR(1) + 24));
+        GUARD_READS(p, 64 + top, true);
+    }
     {   /* I64 and U8 */
         ray_t* v = ray_vec_new(RAY_I64, 1024); v->len = 1024;
         for (int i = 0; i < 1024; i++) ((int64_t*)ray_data(v))[i] = -5000000000ll + i % 300;
@@ -1371,6 +1544,7 @@ const test_entry_t enccorrupt_entries[] = {
     { "enccorrupt/depth4",        test_reject_depth4,        ec_setup, ec_teardown },
     { "enccorrupt/lazy",          test_lazy_validation,      ec_setup, ec_teardown },
     { "enccorrupt/fast_kernel_twice", test_fast_kernel_corrupt_twice, ec_setup, ec_teardown },
+    { "enccorrupt/runs_kernel_twice", test_runs_kernel_corrupt_twice, ec_setup, ec_teardown },
     { "enccorrupt/stats_nested",  test_stats_nested,         ec_setup, ec_teardown },
     { "enccorrupt/stats_values",  test_stats_values,         ec_setup, ec_teardown },
     { "enccorrupt/stats_point_read", test_stats_point_read,  ec_setup, ec_teardown },

@@ -59,7 +59,7 @@ static void enccol_free(ray_enccol_t* e) {
     if (e->dom && e->dom_owned) ray_sym_domain_release(e->dom);
     if (e->map)     ray_file_map_release(e->map);
     ray_free_raw((void*)e->desc_ok);
-    ray_free_raw((void*)e->fraw_ok);
+    ray_free_raw((void*)e->raw_ok);
     ray_free_raw((void*)e->dir_vec_ok);
     ray_free_raw(e);
 }
@@ -322,9 +322,9 @@ ray_t* ray_enccol_open(void* mapped, size_t size, const char* path,
     if (!err && e->n_chunks > 0) {
         e->desc_ok = ray_calloc_raw((size_t)e->n_chunks);
         if (!e->desc_ok) err = ray_error("oom", "column %s: chunk flags", e->path);
-        if (!err && enc_type_float(e->type)) {
-            e->fraw_ok = ray_calloc_raw((size_t)e->n_chunks);
-            if (!e->fraw_ok) err = ray_error("oom", "column %s: chunk flags", e->path);
+        if (!err && e->type != RAY_GUID && e->type != RAY_STR) {
+            e->raw_ok = ray_calloc_raw((size_t)e->n_chunks);
+            if (!e->raw_ok) err = ray_error("oom", "column %s: chunk flags", e->path);
         }
         if (!err) {
             e->dir_vec_ok = ray_calloc_raw((size_t)e->n_chunks * sizeof(uint64_t));
@@ -1086,17 +1086,230 @@ static int dec_fast_dict(ray_enccol_t* e, const ray_enc_desc_t* d, int vlen, con
     return !range_hit || fk_range_exact(d, out, k.T, vlen, bm) ? 1 : 0;
 }
 
-/* Decode a FOR_BP / DELTA_BP vector body of e's type into out: `wide` 0 at
- * the generation-0 width, RAY_I64 / RAY_F64 widened with nulls as NULL_I64 /
- * NULL_F64 (narrow non-SYM types only).  DICT over a FOR_BP code child at
- * the generation-0 width (dec_fast_dict).  1 decoded, 0 declined (out may
- * be partly written). */
+/* ---- CONST / RLE: the runs validated, then filled at the element width ----
+ * A CONST vector is one run.  An RLE vector is nr runs: its values and its
+ * run ends are children at depth 1 (RAW or FOR_BP values of the element
+ * kind; RAW, FOR_BP or DELTA_BP U16 ends), each unpacked for its nr values
+ * only, by the lane kernels above.  Every rule ray_enc_read and dec_ints
+ * apply is checked on the runs before a row is written: the header, the
+ * run count, each child's header, legality, width, base, heads,
+ * placeholders, padding and size, the bytes used, the ends (strictly
+ * ascending, the last at vlen), a run on the sentinel (every row of it in
+ * the bitmap), the SYM ids (domain, statistics, the null count).  Then each
+ * run is filled, at the generation-0 width or widened as the FOR_BP
+ * kernels widen, and the bitmap's rows set to the null.  As there, anything
+ * off declines and the reference path decodes or reports the vector. */
+
+/* nr T-bit values, by lane width. */
+typedef union { uint8_t b[RAY_ENC_VEC]; uint16_t h[RAY_ENC_VEC]; uint32_t s[RAY_ENC_VEC]; uint64_t q[RAY_ENC_VEC]; } fk_vals_t;
+
+static uint64_t fk_val(const fk_vals_t* v, int T, uint32_t i) {
+    switch (T) { case 8: return v->b[i]; case 16: return v->h[i]; case 32: return v->s[i]; default: return v->q[i]; }
+}
+
+/* An RLE child at depth 1: an 8-byte header at p (avail bytes left in the
+ * parent, p 8-aligned), then nr values of T bits into out.  ends: the run
+ * ends slot (U16), where DELTA_BP is legal too.  The bytes used, or -1. */
+static int64_t fk_child(const uint8_t* p, uint64_t avail, uint32_t nr, int T, bool ends, fk_vals_t* out) {
+    if (avail < 8) return -1;
+    const uint8_t enc = p[0], w = p[1];
+    uint16_t rsv; memcpy(&rsv, p + 2, 2);
+    uint32_t bb;  memcpy(&bb, p + 4, 4);
+    if (rsv || (bb & 7) || bb > avail - 8) return -1;
+    const uint8_t* b = p + 8;
+    const uint64_t m = T == 64 ? ~0ull : (1ull << T) - 1;
+    if (enc == RAY_ENC_RAW) {
+        const size_t nb = (size_t)nr * (size_t)T / 8;
+        if (w || bb != (uint64_t)ray_enc_size_raw((int)nr, T) || !all_zero(b + nb, bb - nb)) return -1;
+        memcpy(out, b, nb);
+    } else if (enc == RAY_ENC_FOR_BP) {
+        if (w > T || bb != (uint64_t)ray_enc_size_for(w)) return -1;
+        uint64_t base; memcpy(&base, b, 8);
+        if (base & ~m) return -1;
+        switch (T) {
+        case 8:  (void)fk_for8((const uint8_t*)(b + 8), w, (uint8_t)base, out->b, (int)nr, 0); break;
+        case 16: (void)fk_for16((const uint16_t*)(b + 8), w, (uint16_t)base, out->h, (int)nr, 0); break;
+        case 32: (void)fk_for32((const uint32_t*)(b + 8), w, (uint32_t)base, out->s, (int)nr, 0); break;
+        default: (void)fk_for64((const uint64_t*)(b + 8), w, base, out->q, (int)nr, 0); break;
+        }
+    } else if (enc == RAY_ENC_DELTA_BP && ends) {
+        enum { L = RAY_ENC_VEC / 16 };
+        if (w > 16 || bb != (uint64_t)ray_enc_size_delta(16, w)) return -1;
+        uint64_t dbase; memcpy(&dbase, b, 8);
+        if (dbase & ~m) return -1;
+        uint16_t head[L];
+        for (int l = 0; l < L; l++) {
+            uint64_t x; memcpy(&x, b + 8 + 8 * (size_t)l, 8);
+            if (x & ~m) return -1;                                   /* a head above the type width */
+            head[l] = (uint16_t)x;
+        }
+        const uint16_t* pk = (const uint16_t*)(b + 8 + 8 * (size_t)L);
+        const uint16_t wm = (uint16_t)(w >= 16 ? 0xFFFF : (1u << w) - 1);
+        uint16_t any = 0;
+        for (int l = 0; l < L; l++) any |= pk[l] & wm;                /* row 0 holds zero placeholders */
+        if (any) return -1;
+        (void)fk_dlt16(pk, w, (uint16_t)dbase, head, out->h, (int)nr, 0);
+    } else {
+        return -1;                                                   /* illegal in the slot, or unknown */
+    }
+    return 8 + (int64_t)bb;
+}
+
+/* The runs of a CONST or RLE body of kind T: *nr values, run i ending at
+ * ends[i] (strictly ascending, the last at vlen).  1, or 0 declined. */
+static int fk_runs(uint8_t enc, int vlen, const uint8_t* body, uint64_t avail, int T,
+                   fk_vals_t* vals, fk_vals_t* ends, uint32_t* nr_out) {
+    uint32_t nr;
+    if (enc == RAY_ENC_CONST) {
+        if (avail != (uint64_t)ray_enc_size_raw(1, T) || !all_zero(body + T / 8, (size_t)avail - (size_t)T / 8)) return 0;
+        memcpy(vals, body, (size_t)T / 8);
+        ends->h[0] = (uint16_t)vlen;
+        nr = 1;
+    } else {
+        if (avail < 8) return 0;
+        uint32_t rsv; memcpy(&nr, body, 4); memcpy(&rsv, body + 4, 4);
+        if (rsv || nr == 0 || nr > (uint32_t)vlen) return 0;
+        int64_t a = fk_child(body + 8, avail - 8, nr, T, false, vals);
+        if (a < 0) return 0;
+        int64_t b = fk_child(body + 8 + a, avail - 8 - (uint64_t)a, nr, 16, true, ends);
+        if (b < 0 || (uint64_t)(8 + a + b) != avail) return 0;
+        uint32_t prev = 0, bad = 0;
+        for (uint32_t i = 0; i < nr; i++) { bad |= (uint32_t)(ends->h[i] <= prev); prev = ends->h[i]; }
+        if (bad || prev != (uint32_t)vlen) return 0;                 /* ascending, so every end <= vlen */
+    }
+    *nr_out = nr;
+    return 1;
+}
+
+/* Every row of [lo, hi) in the bitmap. */
+static bool fk_bits_all(const uint8_t* bm, uint32_t lo, uint32_t hi) {
+    for (uint32_t r = lo; r < hi; r++) if (!((bm[r >> 3] >> (r & 7)) & 1)) return false;
+    return true;
+}
+
+/* A CONST / RLE vector of e's type into out (dec_fast's contract).  The
+ * runs and their values are checked first, so a declined vector writes
+ * nothing. */
+static int dec_fast_runs(ray_enccol_t* e, const ray_enc_desc_t* d, int vlen, const uint8_t* body, uint64_t avail,
+                         const uint8_t* bm, int8_t wide, ray_enc_kind_t k, void* out) {
+    const int T = k.T;
+    const bool sym = e->type == RAY_SYM;
+    const uint64_t m = T == 64 ? ~0ull : (1ull << T) - 1;
+    const uint64_t sent = (uint64_t)1 << (T - 1);
+    _Alignas(64) fk_vals_t vals, ends;
+    uint32_t nr;
+    if (!fk_runs(d->encoding, vlen, body, avail, T, &vals, &ends, &nr)) return 0;
+    if (sym) {
+        /* ids below the bound or 0 (the null), the others inside the
+         * vector's statistics; exactly n_nulls rows of id 0 */
+        uint64_t lo, span;
+        fk_stats(d, m, &lo, &span);
+        const uint64_t lim = e->sym_bound == 0 ? 0 : (uint64_t)e->sym_bound - 1 < m ? (uint64_t)e->sym_bound - 1 : m;
+        uint32_t zeros = 0, prev = 0;
+        for (uint32_t i = 0; i < nr; i++) {
+            const uint64_t x = fk_val(&vals, T, i);
+            if (x == 0) zeros += ends.h[i] - prev;
+            else if (x > lim || ((x - lo) & m) > span) return 0;
+            prev = ends.h[i];
+        }
+        if (zeros != (uint32_t)d->n_nulls) return 0;
+    } else if (k.is_signed) {
+        if (d->n_nulls && !bm) return 0;
+        uint32_t prev = 0;
+        for (uint32_t i = 0; i < nr; i++) {                          /* a run on the sentinel: all null */
+            if (fk_val(&vals, T, i) == sent && (!d->n_nulls || !fk_bits_all(bm, prev, ends.h[i]))) return 0;
+            prev = ends.h[i];
+        }
+    }
+#define FK_FILL(OT, V) do { OT* o_ = (OT*)out; uint32_t p_ = 0;                          \
+        for (uint32_t i = 0; i < nr; i++) {                                             \
+            const OT v_ = (OT)(V); const uint32_t e_ = ends.h[i];                       \
+            for (uint32_t r = p_; r < e_; r++) o_[r] = v_;                              \
+            p_ = e_; } } while (0)
+    switch (T * 4 + (wide == RAY_I64 ? 1 : wide == RAY_F64 ? 2 : 0)) {
+    case 8 * 4:      FK_FILL(uint8_t, vals.b[i]); break;
+    case 8 * 4 + 1:  FK_FILL(int64_t, vals.b[i]); break;
+    case 8 * 4 + 2:  FK_FILL(double, vals.b[i]); break;
+    case 16 * 4:     FK_FILL(uint16_t, vals.h[i]); break;
+    case 16 * 4 + 1: FK_FILL(int64_t, (int16_t)vals.h[i]); break;
+    case 16 * 4 + 2: FK_FILL(double, (int16_t)vals.h[i]); break;
+    case 32 * 4:     FK_FILL(uint32_t, vals.s[i]); break;
+    case 32 * 4 + 1: FK_FILL(int64_t, (int32_t)vals.s[i]); break;
+    case 32 * 4 + 2: FK_FILL(double, (int32_t)vals.s[i]); break;
+    case 64 * 4:     FK_FILL(uint64_t, vals.q[i]); break;
+    default: return 0;
+    }
+#undef FK_FILL
+    if (sym || !k.is_signed || !d->n_nulls) return 1;
+    /* the bitmap's rows become the null (a row outside it on the sentinel
+     * was ruled out above; the merge flags one all the same) */
+    if (!wide) return fk_nulls_native(d, T, vlen, bm, true, out);
+    bool bad;
+    if (wide == RAY_F64)
+        bad = fk_mergef((double*)out, vlen, bm, T == 16 ? (double)NULL_I16 : (double)NULL_I32, NULL_F64);
+    else
+        bad = fk_merge64((int64_t*)out, vlen, bm, T == 16 ? (int64_t)NULL_I16 : (int64_t)NULL_I32, NULL_I64);
+    return bad ? 0 : 1;
+}
+
+/* The values of a RAW body without a bitmap (or of an unsigned kind) as
+ * dec_ints holds them: no sentinel (signed), SYM ids in the domain and the
+ * statistics with n_nulls zeros. */
+static bool fk_raw_ok(ray_enccol_t* e, const ray_enc_desc_t* d, int vlen, const uint8_t* body, ray_enc_kind_t k) {
+    const int T = k.T;
+    if (e->type == RAY_SYM) {
+        uint64_t lo, span;
+        fk_stats(d, T == 64 ? ~0ull : (1ull << T) - 1, &lo, &span);
+        switch (T) {
+        case 8:  return fk_sym8(body, vlen, e->sym_bound, d->n_nulls, (uint8_t)lo, (uint8_t)span);
+        case 16: return fk_sym16((const uint16_t*)body, vlen, e->sym_bound, d->n_nulls, (uint16_t)lo, (uint16_t)span);
+        case 32: return fk_sym32((const uint32_t*)body, vlen, e->sym_bound, d->n_nulls, (uint32_t)lo, (uint32_t)span);
+        default: return fk_sym64((const uint64_t*)body, vlen, e->sym_bound, d->n_nulls, lo, span);
+        }
+    }
+    if (!k.is_signed) return true;                                   /* BOOL, U8: no nulls */
+    if (d->n_nulls) return false;                                    /* a bitmap: the merge decides */
+    switch (T) {
+    case 16: return !fk_scan16((const int16_t*)body, vlen, NULL_I16);
+    case 32: return !fk_scan32((const int32_t*)body, vlen, NULL_I32);
+    default: return !fk_scan64((const int64_t*)body, vlen, NULL_I64);
+    }
+}
+
+/* A RAW vector of e's type at the generation-0 width into out: the size,
+ * padding, sentinel (or SYM ids) checked as dec_ints checks them, the
+ * values copied, the bitmap merged. */
+static int dec_fast_raw(ray_enccol_t* e, const ray_enc_desc_t* d, int vlen, const uint8_t* body, uint64_t avail,
+                        const uint8_t* bm, ray_enc_kind_t k, void* out) {
+    const size_t nb = (size_t)vlen * k.T / 8;
+    if (avail != (uint64_t)ray_enc_size_raw(vlen, k.T) || !all_zero(body + nb, (size_t)avail - nb)) return 0;
+    if (!d->n_nulls || e->type == RAY_SYM || !k.is_signed) {
+        if (!fk_raw_ok(e, d, vlen, body, k)) return 0;               /* checked in place, then copied */
+        memcpy(out, body, nb);
+        return 1;
+    }
+    memcpy(out, body, nb);
+    return fk_nulls_native(d, k.T, vlen, bm, true, out);
+}
+
+/* Decode a FOR_BP / DELTA_BP / CONST / RLE vector body of e's type into
+ * out: `wide` 0 at the generation-0 width, RAY_I64 / RAY_F64 widened with
+ * nulls as NULL_I64 / NULL_F64 (narrow non-SYM types only).  DICT over a
+ * FOR_BP code child (dec_fast_dict) and RAW (dec_fast_raw) at the
+ * generation-0 width.  1 decoded, 0 declined (out may be partly written). */
 static int dec_fast(ray_enccol_t* e, const ray_enc_desc_t* d, int vlen,
                     const uint8_t* body, uint64_t avail, const uint8_t* bm, int8_t wide, void* out) {
     const uint8_t enc = d->encoding;
-    if (enc != RAY_ENC_FOR_BP && enc != RAY_ENC_DELTA_BP && enc != RAY_ENC_DICT) return 0;
     ray_enc_kind_t k;
     if (!fk_int_type(e->type) || !ray_enc_kind_of(e->type, e->attrs, &k)) return 0;
+    if (enc == RAY_ENC_CONST || enc == RAY_ENC_RLE || enc == RAY_ENC_RAW) {
+        if (vlen < 1 || vlen > RAY_ENC_VEC || ((uintptr_t)body & 7)) return 0;
+        if (wide && (e->type == RAY_SYM || k.T == 64 || enc == RAY_ENC_RAW)) return 0;
+        if ((uintptr_t)out & ((wide ? 8 : (size_t)k.T / 8) - 1)) return 0;
+        return enc == RAY_ENC_RAW ? dec_fast_raw(e, d, vlen, body, avail, bm, k, out)
+                                  : dec_fast_runs(e, d, vlen, body, avail, bm, wide, k, out);
+    }
+    if (enc != RAY_ENC_FOR_BP && enc != RAY_ENC_DELTA_BP && enc != RAY_ENC_DICT) return 0;
     if (enc == RAY_ENC_DICT) {
         if (wide || e->type == RAY_SYM || vlen < 1 || vlen > RAY_ENC_VEC) return 0;
         if (((uintptr_t)body & 7) || ((uintptr_t)out & ((size_t)k.T / 8 - 1))) return 0;
@@ -1221,20 +1434,38 @@ static bool raw_float_vec_ok(ray_enccol_t* e, int64_t c, int j, const ray_enc_de
     return true;
 }
 
-static bool raw_float_eligible(const ray_enc_desc_t* d) {
+/* RAW integer vector j of chunk c without nulls: the checks dec_ints
+ * makes on it (size, padding, sentinel, SYM ids), without the copy. */
+static bool raw_int_vec_ok(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d) {
+    ray_enc_kind_t k;
+    if (!fk_int_type(e->type) || !ray_enc_kind_of(e->type, e->attrs, &k)) return false;
+    int64_t rows = chunk_rows(e, c);
+    int vlen = (int)(rows - (int64_t)j * RAY_ENC_VEC < RAY_ENC_VEC ? rows - (int64_t)j * RAY_ENC_VEC : RAY_ENC_VEC);
+    const uint8_t* p = NULL; uint64_t avail = 0; const uint8_t* bm = NULL;
+    ray_t* err = payload_parts(e, c, j, d, vlen, &p, &avail, &bm);
+    if (err) { ray_error_free(err); return false; }
+    const size_t nb = (size_t)vlen * k.T / 8;
+    if (bm || ((uintptr_t)p & 7) || avail != (uint64_t)ray_enc_size_raw(vlen, k.T) || !all_zero(p + nb, (size_t)avail - nb))
+        return false;
+    return fk_raw_ok(e, d, vlen, p, k);
+}
+
+static bool raw_view_eligible(const ray_enc_desc_t* d) {
     return d->encoding == RAY_ENC_RAW && d->n_nulls == 0 && !(d->flags & RAY_ENC_DESC_TRAILER);
 }
 
-const void* ray_enccol_raw_float_view(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d) {
-    if (!e->fraw_ok || e->kind != RAY_ENCCOL_SINGLE || !raw_float_eligible(d)) return NULL;
-    if (!atomic_load_explicit(&e->fraw_ok[c], memory_order_acquire)) {
+const void* ray_enccol_raw_view(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d) {
+    if (!e->raw_ok || e->kind != RAY_ENCCOL_SINGLE || !raw_view_eligible(d)) return NULL;
+    if (!atomic_load_explicit(&e->raw_ok[c], memory_order_acquire)) {
         const ray_enc_desc_t* descs;
         ray_t* err = ray_enccol_chunk_descs_ref(e, c, &descs);
         if (err) { ray_error_free(err); return NULL; }
+        const bool flt = enc_type_float(e->type);
         int nv = (int)((chunk_rows(e, c) + RAY_ENC_VEC - 1) / RAY_ENC_VEC);
         for (int v = 0; v < nv; v++)
-            if (raw_float_eligible(&descs[v]) && !raw_float_vec_ok(e, c, v, &descs[v])) return NULL;
-        atomic_store_explicit(&e->fraw_ok[c], 1, memory_order_release);
+            if (raw_view_eligible(&descs[v]) && !(flt ? raw_float_vec_ok(e, c, v, &descs[v]) : raw_int_vec_ok(e, c, v, &descs[v])))
+                return NULL;
+        atomic_store_explicit(&e->raw_ok[c], 1, memory_order_release);
     }
     ray_enc_dirent_t de; dirent_at(e, c, &de);
     return e->base + de.offset + d->payload_off;      /* no bitmap: n_nulls == 0 */

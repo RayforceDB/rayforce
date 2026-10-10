@@ -824,6 +824,569 @@ static test_result_t test_fast_kernel_equal(void) {
     PASS();
 }
 
+/* ---- Task 17a: the CONST, RLE and RAW kernels against the reference decode ---- */
+
+/* One sound hook body: the reference takes it, the fast kernel takes it
+ * with the reference's bytes and writes nothing past vlen, and `want` (the
+ * T-bit pattern of each row, NULL: unchecked) is what the reference holds.
+ * Narrow non-SYM kinds: the widened outputs are served exactly when `wide`
+ * and hold the reference's values, nulls as NULL_I64 / NULL_F64. */
+static test_result_t rk_check(int8_t type, uint8_t attrs, uint8_t enc, uint8_t width, const uint8_t* body,
+                              uint64_t len, int vlen, const uint8_t* bm, int n_nulls, bool wide,
+                              const uint64_t* want, const char* what) {
+    ray_enc_kind_t k; TEST_ASSERT_TRUE(ray_enc_kind_of(type, attrs, &k));
+    const uint8_t* bmp = n_nulls && ray_enc_has_bitmap(type) ? bm : NULL;
+    const uint32_t bound = 1u << 30;
+    static uint8_t ref[RAY_ENC_VEC * 8 + 8], fast[RAY_ENC_VEC * 8 + 8];
+    memset(ref, 0xA5, sizeof ref); memset(fast, 0x5A, sizeof fast);
+    int rr = ray_enccol_test_decode_body(type, attrs, bound, enc, width, n_nulls, bmp, body, len, vlen, false, 0, ref);
+    int fr = ray_enccol_test_decode_body(type, attrs, bound, enc, width, n_nulls, bmp, body, len, vlen, true, 0, fast);
+    TEST_ASSERT_FMT(rr == 1, "%s: reference %d", what, rr);
+    TEST_ASSERT_FMT(fr == 1, "%s: fast kernel %d", what, fr);
+    const size_t esz = (size_t)k.T / 8;
+    TEST_ASSERT_FMT(memcmp(ref, fast, (size_t)vlen * esz) == 0, "%s: fast differs", what);
+    TEST_ASSERT_FMT(fast[(size_t)vlen * esz] == 0x5A, "%s: wrote past the vector", what);
+    for (int i = 0; want && i < vlen; i++) {
+        uint64_t x = 0; memcpy(&x, ref + (size_t)i * esz, esz);
+        TEST_ASSERT_FMT(x == want[i], "%s: row %d holds %llx, want %llx", what, i,
+                        (unsigned long long)x, (unsigned long long)want[i]);
+    }
+    if (type != RAY_SYM && k.T < 64) {
+        static int64_t wi[RAY_ENC_VEC + 1]; static double wf[RAY_ENC_VEC + 1];
+        wi[vlen] = 77; wf[vlen] = 77.0;
+        int ri = ray_enccol_test_decode_body(type, attrs, bound, enc, width, n_nulls, bmp, body, len, vlen, true, RAY_I64, wi);
+        int rf = ray_enccol_test_decode_body(type, attrs, bound, enc, width, n_nulls, bmp, body, len, vlen, true, RAY_F64, wf);
+        TEST_ASSERT_FMT(ri == (wide ? 1 : 0) && rf == ri, "%s: wide %d / %d, want %d", what, ri, rf, wide ? 1 : 0);
+        for (int i = 0; wide && i < vlen; i++) {
+            int64_t x = k.T == 8 ? (int64_t)ref[i] : k.T == 16 ? (int64_t)((int16_t*)ref)[i] : (int64_t)((int32_t*)ref)[i];
+            bool null = bmp && ((bmp[i >> 3] >> (i & 7)) & 1);
+            TEST_ASSERT_FMT(wi[i] == (null ? NULL_I64 : x), "%s: wide i64 row %d", what, i);
+            TEST_ASSERT_FMT(null ? isnan(wf[i]) : wf[i] == (double)x, "%s: wide f64 row %d", what, i);
+        }
+        TEST_ASSERT_FMT(wi[vlen] == 77 && wf[vlen] == 77.0, "%s: wide wrote past the vector", what);
+    }
+    PASS();
+}
+
+/* nr run values of kind k (T-bit patterns), adjacent ones distinct: signed
+ * kinds off the sentinel, SYM ids in [1, 2^30) and inside the id width;
+ * narrow: inside one base + [0, 15]. */
+static void rk_vals(ray_enc_kind_t k, bool sym, int nr, bool narrow, uint64_t* v) {
+    const uint64_t m = k.T == 64 ? ~0ull : (1ull << k.T) - 1;
+    const uint64_t top = sym ? (m < (1ull << 30) - 1 ? m : (1ull << 30) - 1) : m;
+    const uint64_t base = sym ? 1 + rng() % (top - 16) : rng() & m;
+    for (int i = 0; i < nr; i++) {
+        uint64_t x;
+        do {
+            x = narrow ? (base + rng() % 16) & m : rng() & m;
+            if (sym && !narrow) x = 1 + x % top;
+        } while ((k.is_signed && x == fk_sentinel(k.T)) || (i && x == v[i - 1]));
+        v[i] = x;
+    }
+}
+
+/* nr run ends over vlen rows: nr - 1 distinct cuts in [1, vlen), then vlen. */
+static void rk_ends(int vlen, int nr, uint64_t* ends) {
+    static uint8_t cut[RAY_ENC_VEC + 1];
+    memset(cut, 0, sizeof cut);
+    for (int got = 0; got < nr - 1;) {
+        int p = 1 + (int)(rng() % (uint64_t)(vlen - 1));
+        if (!cut[p]) { cut[p] = 1; got++; }
+    }
+    int r = 0;
+    for (int p = 1; p < vlen; p++) if (cut[p]) ends[r++] = (uint64_t)p;
+    ends[r] = (uint64_t)vlen;
+}
+
+/* A child of an RLE body as the writer lays it out (header, then body),
+ * its encoding forced. */
+static bool rk_child(ray_enc_buf_t* b, uint8_t enc, const uint64_t* v, int n, ray_enc_kind_t k) {
+    ray_enc_buf_t c = { 0 }; ray_enc_choice_t ch;
+    bool ok = ray_enc_write_as(enc, v, n, k, NULL, &c, &ch);
+    uint32_t bb = (uint32_t)c.len;
+    uint8_t h[8] = { enc, ok ? ch.width : 0, 0, 0, 0, 0, 0, 0 };
+    memcpy(h + 4, &bb, 4);
+    ok = ok && ray_enc_buf_put(b, h, 8) && ray_enc_buf_put(b, c.p, c.len);
+    ray_enc_buf_free(&c);
+    return ok;
+}
+/* An RLE body of nr runs: the values child venc (RAW / FOR_BP) of kind k,
+ * the ends child eenc (RAW / FOR_BP / DELTA_BP) of U16 run ends.  The
+ * writer emits DELTA_BP for signed kinds; run ends read the same as I16. */
+static bool rk_rle(ray_enc_buf_t* b, ray_enc_kind_t k, const uint64_t* vals, const uint64_t* ends, int nr,
+                   uint8_t venc, uint8_t eenc) {
+    uint32_t h[2] = { (uint32_t)nr, 0 };
+    ray_enc_kind_t ke = { 16, eenc == RAY_ENC_DELTA_BP };
+    return ray_enc_buf_put(b, h, 8) && rk_child(b, venc, vals, nr, k) && rk_child(b, eenc, ends, nr, ke);
+}
+
+/* The rows of nr runs, then the stored rows the reference holds (signed:
+ * the sentinel at a bitmap row; SYM: id 0 is the null itself). */
+static int rk_expand(ray_enc_kind_t k, bool sym, const uint64_t* vals, const uint64_t* ends, int nr,
+                     const uint8_t* bm, uint64_t* rows, uint64_t* want) {
+    int n_nulls = 0;
+    for (int i = 0, p = 0; i < nr; p = (int)ends[i++])
+        for (int r = p; r < (int)ends[i]; r++) {
+            rows[r] = vals[i];
+            bool null = k.is_signed && ((bm[r >> 3] >> (r & 7)) & 1);
+            want[r] = null ? fk_sentinel(k.T) : vals[i];
+            n_nulls += null || (sym && vals[i] == 0);
+        }
+    return n_nulls;
+}
+
+static test_result_t test_runs_kernel_equal(void) {
+    static const struct { int8_t type; uint8_t attrs; } kinds[] = {
+        { RAY_U8, 0 }, { RAY_BOOL, 0 }, { RAY_I16, 0 }, { RAY_I32, 0 }, { RAY_I64, 0 }, { RAY_DATE, 0 },
+        { RAY_TIME, 0 }, { RAY_TIMESTAMP, 0 },
+        { RAY_SYM, RAY_SYM_W8 }, { RAY_SYM, RAY_SYM_W16 }, { RAY_SYM, RAY_SYM_W32 }, { RAY_SYM, RAY_SYM_W64 },
+    };
+    static const int lens[] = { 1024, 1000, 77, 1 };
+    static const int runs[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 31, 32, 33, 63, 64, 65,
+                                100, 127, 128, 129, 255, 256, 257, 500, 511, 512, 513, 767, 1000, 1023, 1024 };
+    /* the children: the writer's choice (0xFF), then each forced pair */
+    static const uint8_t kids[][2] = {
+        { 0xFF, 0xFF }, { RAY_ENC_RAW, RAY_ENC_RAW }, { RAY_ENC_RAW, RAY_ENC_FOR_BP }, { RAY_ENC_RAW, RAY_ENC_DELTA_BP },
+        { RAY_ENC_FOR_BP, RAY_ENC_RAW }, { RAY_ENC_FOR_BP, RAY_ENC_FOR_BP }, { RAY_ENC_FOR_BP, RAY_ENC_DELTA_BP },
+    };
+    static uint64_t vals[RAY_ENC_VEC], ends[RAY_ENC_VEC], rows[RAY_ENC_VEC], want[RAY_ENC_VEC];
+    static uint8_t bm[RAY_ENC_VEC / 8];
+    char what[200];
+    long cases = 0;
+    g_seed = 0x17a;
+    for (size_t ki = 0; ki < sizeof kinds / sizeof kinds[0]; ki++) {
+        const int8_t type = kinds[ki].type; const uint8_t attrs = kinds[ki].attrs;
+        ray_enc_kind_t k; ray_enc_kind_of(type, attrs, &k);
+        const bool sym = type == RAY_SYM, sgn = k.is_signed;
+        const bool wide = !sym && k.T < 64;
+        for (size_t li = 0; li < sizeof lens / sizeof lens[0]; li++) {
+            const int n = lens[li];
+            for (size_t ri = 0; ri < sizeof runs / sizeof runs[0]; ri++) {
+                const int nr = runs[ri];
+                if (nr > n) continue;
+                for (int nulls = 0; nulls < ((sgn || sym) ? 2 : 1); nulls++) {
+                    rk_vals(k, sym, nr, (ri + (size_t)nulls) & 1, vals);
+                    rk_ends(n, nr, ends);
+                    memset(bm, 0, sizeof bm);
+                    if (nulls) {
+                        /* every fifth run null (signed: the sentinel, its rows in
+                         * the bitmap; SYM: id 0), and scattered bitmap rows */
+                        for (int i = 2; i < nr; i += 5) {
+                            vals[i] = sym ? 0 : fk_sentinel(k.T);
+                            for (int r = i ? (int)ends[i - 1] : 0; sgn && r < (int)ends[i]; r++) bm[r >> 3] |= (uint8_t)(1u << (r & 7));
+                        }
+                        for (int r = 3; sgn && r < n; r += 37) bm[r >> 3] |= (uint8_t)(1u << (r & 7));
+                    }
+                    const int n_nulls = rk_expand(k, sym, vals, ends, nr, bm, rows, want);
+                    for (size_t c = 0; c < sizeof kids / sizeof kids[0]; c++) {
+                        ray_enc_buf_t b = { 0 }; ray_enc_choice_t ch;
+                        bool ok = kids[c][0] == 0xFF ? ray_enc_write_as(RAY_ENC_RLE, rows, n, k, NULL, &b, &ch)
+                                                     : rk_rle(&b, k, vals, ends, nr, kids[c][0], kids[c][1]);
+                        TEST_ASSERT_FMT(ok, "type %d: build", type);
+                        snprintf(what, sizeof what, "RLE type %d attrs %d n %d nr %d nulls %d kids %u/%u", type, attrs,
+                                 n, nr, n_nulls, kids[c][0], kids[c][1]);
+                        test_result_t r = rk_check(type, attrs, RAY_ENC_RLE, 0, b.p, b.len, n, bm, n_nulls, wide, want, what);
+                        ray_enc_buf_free(&b);
+                        if (r.status != TEST_PASS) return r;
+                        cases++;
+                    }
+                    if (nr == 1) {
+                        ray_enc_buf_t b = { 0 }; ray_enc_choice_t ch;
+                        TEST_ASSERT_TRUE(ray_enc_write_as(RAY_ENC_CONST, rows, n, k, NULL, &b, &ch));
+                        snprintf(what, sizeof what, "CONST type %d attrs %d n %d nulls %d", type, attrs, n, n_nulls);
+                        test_result_t r = rk_check(type, attrs, RAY_ENC_CONST, 0, b.p, b.len, n, bm, n_nulls, wide, want, what);
+                        ray_enc_buf_free(&b);
+                        if (r.status != TEST_PASS) return r;
+                    }
+                }
+            }
+            /* CONST all null: signed on the sentinel with every row in the
+             * bitmap, SYM id 0 */
+            if (sgn || sym) {
+                for (int i = 0; i < n; i++) { rows[i] = sym ? 0 : fk_sentinel(k.T); want[i] = rows[i]; }
+                memset(bm, 0, sizeof bm);
+                for (int i = 0; sgn && i < n; i++) bm[i >> 3] |= (uint8_t)(1u << (i & 7));
+                ray_enc_buf_t b = { 0 }; ray_enc_choice_t ch;
+                TEST_ASSERT_TRUE(ray_enc_write_as(RAY_ENC_CONST, rows, n, k, NULL, &b, &ch));
+                snprintf(what, sizeof what, "CONST all null type %d attrs %d n %d", type, attrs, n);
+                test_result_t r = rk_check(type, attrs, RAY_ENC_CONST, 0, b.p, b.len, n, bm, n, wide, want, what);
+                ray_enc_buf_free(&b);
+                if (r.status != TEST_PASS) return r;
+            }
+            /* RAW: random rows; with nulls, every seventh row (signed: the
+             * sentinel or any value under the bitmap; SYM: id 0) */
+            for (int nulls = 0; nulls < ((sgn || sym) ? 2 : 1); nulls++) {
+                rk_vals(k, sym, n, false, rows);
+                memset(bm, 0, sizeof bm);
+                int n_nulls = 0;
+                for (int i = 0; i < n; i++) {
+                    if (nulls && i % 7 == 1) {
+                        n_nulls++;
+                        if (sym) rows[i] = 0;
+                        else { bm[i >> 3] |= (uint8_t)(1u << (i & 7)); if (i % 14 == 1) rows[i] = fk_sentinel(k.T); }
+                    }
+                    want[i] = sgn && ((bm[i >> 3] >> (i & 7)) & 1) ? fk_sentinel(k.T) : rows[i];
+                }
+                ray_enc_buf_t b = { 0 }; ray_enc_choice_t ch;
+                TEST_ASSERT_TRUE(ray_enc_write_as(RAY_ENC_RAW, rows, n, k, NULL, &b, &ch));
+                snprintf(what, sizeof what, "RAW type %d attrs %d n %d nulls %d", type, attrs, n, n_nulls);
+                test_result_t r = rk_check(type, attrs, RAY_ENC_RAW, 0, b.p, b.len, n, bm, n_nulls, false, want, what);
+                ray_enc_buf_free(&b);
+                if (r.status != TEST_PASS) return r;
+            }
+        }
+    }
+    /* every run count 1..1024 over a full I16 vector, the writer's children */
+    ray_enc_kind_t k16 = { 16, true };
+    memset(bm, 0, sizeof bm);
+    for (int nr = 1; nr <= RAY_ENC_VEC; nr++) {
+        rk_vals(k16, false, nr, nr & 1, vals);
+        rk_ends(RAY_ENC_VEC, nr, ends);
+        (void)rk_expand(k16, false, vals, ends, nr, bm, rows, want);
+        ray_enc_buf_t b = { 0 }; ray_enc_choice_t ch;
+        TEST_ASSERT_TRUE(ray_enc_write_as(RAY_ENC_RLE, rows, RAY_ENC_VEC, k16, NULL, &b, &ch));
+        snprintf(what, sizeof what, "RLE I16 nr %d", nr);
+        test_result_t r = rk_check(RAY_I16, 0, RAY_ENC_RLE, 0, b.p, b.len, RAY_ENC_VEC, bm, 0, true, want, what);
+        ray_enc_buf_free(&b);
+        if (r.status != TEST_PASS) return r;
+    }
+    TEST_ASSERT_TRUE(cases > 10000);
+    PASS();
+}
+
+/* A corrupt hook body: the fast kernel declines it at every output it
+ * serves, and the reference reports it. */
+static test_result_t rk_declines(int8_t type, uint8_t attrs, uint8_t enc, const uint8_t* body, uint64_t len,
+                                 int vlen, const uint8_t* bm, int n_nulls, const char* what) {
+    ray_enc_kind_t k; TEST_ASSERT_TRUE(ray_enc_kind_of(type, attrs, &k));
+    const uint32_t bound = 1u << 30;
+    static uint8_t out[RAY_ENC_VEC * 8]; static int64_t wi[RAY_ENC_VEC]; static double wf[RAY_ENC_VEC];
+    int fr = ray_enccol_test_decode_body(type, attrs, bound, enc, 0, n_nulls, bm, body, len, vlen, true, 0, out);
+    int rr = ray_enccol_test_decode_body(type, attrs, bound, enc, 0, n_nulls, bm, body, len, vlen, false, 0, out);
+    TEST_ASSERT_FMT(fr == 0 && rr == -1, "%s: fast %d, reference %d", what, fr, rr);
+    if (type != RAY_SYM && k.T < 64) {
+        int ri = ray_enccol_test_decode_body(type, attrs, bound, enc, 0, n_nulls, bm, body, len, vlen, true, RAY_I64, wi);
+        int rf = ray_enccol_test_decode_body(type, attrs, bound, enc, 0, n_nulls, bm, body, len, vlen, true, RAY_F64, wf);
+        TEST_ASSERT_FMT(ri == 0 && rf == 0, "%s: wide %d / %d", what, ri, rf);
+    }
+    PASS();
+}
+
+/* Each rule of the run decode broken once: the kernel declines, the
+ * reference reports (enccorrupt/runs_kernel_twice pins the messages). */
+static test_result_t test_runs_kernel_declines(void) {
+    static uint64_t vals[RAY_ENC_VEC], ends[RAY_ENC_VEC], rows[RAY_ENC_VEC], want[RAY_ENC_VEC];
+    static uint8_t bm[RAY_ENC_VEC / 8];
+    _Alignas(8) static uint8_t buf[8192];
+    const ray_enc_kind_t k16 = { 16, true };
+    test_result_t r;
+#define RK_BAD(TYPE, ATTRS, ENC, LEN, VLEN, BM, NN, WHAT) \
+    if ((r = rk_declines(TYPE, ATTRS, ENC, buf, LEN, VLEN, BM, NN, WHAT)).status != TEST_PASS) return r
+    /* I16, 11 runs of about 100, RAW children: [nr][0] @0, values hdr @8,
+     * body @16 (24 B), ends hdr @40, body @48 (24 B), 72 B */
+    for (int i = 0; i < 11; i++) { vals[i] = (uint64_t)(1000 + 3 * i); ends[i] = (uint64_t)(i < 10 ? 100 * (i + 1) : 1024); }
+    ray_enc_buf_t b = { 0 };
+    TEST_ASSERT_TRUE(rk_rle(&b, k16, vals, ends, 11, RAY_ENC_RAW, RAY_ENC_RAW));
+    TEST_ASSERT_EQ_U(b.len, 72);
+    memset(bm, 0, sizeof bm);
+    (void)rk_expand(k16, false, vals, ends, 11, bm, rows, want);
+    if ((r = rk_check(RAY_I16, 0, RAY_ENC_RLE, 0, b.p, b.len, RAY_ENC_VEC, NULL, 0, true, want, "control")).status != TEST_PASS) return r;
+#define RK_FRESH() memcpy(buf, b.p, b.len)
+    uint32_t u32; uint16_t u16; uint64_t u64;
+    RK_FRESH(); u32 = 1;    memcpy(buf + 4, &u32, 4);   RK_BAD(RAY_I16, 0, RAY_ENC_RLE, 72, 1024, NULL, 0, "reserved word");
+    RK_FRESH(); u32 = 0;    memcpy(buf, &u32, 4);       RK_BAD(RAY_I16, 0, RAY_ENC_RLE, 72, 1024, NULL, 0, "run count 0");
+    RK_FRESH(); u32 = 1025; memcpy(buf, &u32, 4);       RK_BAD(RAY_I16, 0, RAY_ENC_RLE, 72, 1024, NULL, 0, "run count above vlen");
+    RK_FRESH(); u32 = 12;   memcpy(buf, &u32, 4);       RK_BAD(RAY_I16, 0, RAY_ENC_RLE, 72, 1024, NULL, 0, "run count 12 of 11");
+    RK_FRESH(); u32 = 10;   memcpy(buf, &u32, 4);       RK_BAD(RAY_I16, 0, RAY_ENC_RLE, 72, 1024, NULL, 0, "run count 10 of 11");
+    RK_FRESH(); u32 = 11;   memcpy(buf, &u32, 4);       RK_BAD(RAY_I16, 0, RAY_ENC_RLE, 72, 1000, NULL, 0, "runs past vlen 1000");
+    RK_FRESH(); buf[10] = 1;                            RK_BAD(RAY_I16, 0, RAY_ENC_RLE, 72, 1024, NULL, 0, "child reserved");
+    RK_FRESH(); buf[42] = 1;                            RK_BAD(RAY_I16, 0, RAY_ENC_RLE, 72, 1024, NULL, 0, "ends child reserved");
+    RK_FRESH(); u32 = 20;   memcpy(buf + 12, &u32, 4);  RK_BAD(RAY_I16, 0, RAY_ENC_RLE, 72, 1024, NULL, 0, "child size not 8k");
+    RK_FRESH(); u32 = 4096; memcpy(buf + 12, &u32, 4);  RK_BAD(RAY_I16, 0, RAY_ENC_RLE, 72, 1024, NULL, 0, "child overruns");
+    RK_FRESH(); u32 = 32;   memcpy(buf + 44, &u32, 4);  RK_BAD(RAY_I16, 0, RAY_ENC_RLE, 72, 1024, NULL, 0, "ends child overruns");
+    RK_FRESH(); u32 = 16;   memcpy(buf + 12, &u32, 4);  RK_BAD(RAY_I16, 0, RAY_ENC_RLE, 72, 1024, NULL, 0, "values child short");
+    RK_FRESH(); buf[8] = RAY_ENC_RLE;                   RK_BAD(RAY_I16, 0, RAY_ENC_RLE, 72, 1024, NULL, 0, "values child RLE");
+    RK_FRESH(); buf[8] = RAY_ENC_CONST;                 RK_BAD(RAY_I16, 0, RAY_ENC_RLE, 72, 1024, NULL, 0, "values child CONST");
+    RK_FRESH(); buf[8] = RAY_ENC_DELTA_BP;              RK_BAD(RAY_I16, 0, RAY_ENC_RLE, 72, 1024, NULL, 0, "values child DELTA_BP");
+    RK_FRESH(); buf[8] = RAY_ENC_DICT;                  RK_BAD(RAY_I16, 0, RAY_ENC_RLE, 72, 1024, NULL, 0, "values child DICT");
+    RK_FRESH(); buf[40] = RAY_ENC_RLE;                  RK_BAD(RAY_I16, 0, RAY_ENC_RLE, 72, 1024, NULL, 0, "ends child RLE");
+    RK_FRESH(); buf[40] = 9;                            RK_BAD(RAY_I16, 0, RAY_ENC_RLE, 72, 1024, NULL, 0, "ends child unknown");
+    RK_FRESH(); buf[9] = 3;                             RK_BAD(RAY_I16, 0, RAY_ENC_RLE, 72, 1024, NULL, 0, "width on RAW values");
+    RK_FRESH(); buf[41] = 3;                            RK_BAD(RAY_I16, 0, RAY_ENC_RLE, 72, 1024, NULL, 0, "width on RAW ends");
+    RK_FRESH(); buf[16 + 22] = 1;                       RK_BAD(RAY_I16, 0, RAY_ENC_RLE, 72, 1024, NULL, 0, "values padding");
+    RK_FRESH(); buf[48 + 23] = 1;                       RK_BAD(RAY_I16, 0, RAY_ENC_RLE, 72, 1024, NULL, 0, "ends padding");
+    RK_FRESH(); u16 = 150;  memcpy(buf + 48 + 4, &u16, 2);  RK_BAD(RAY_I16, 0, RAY_ENC_RLE, 72, 1024, NULL, 0, "ends descending");
+    RK_FRESH(); u16 = 200;  memcpy(buf + 48 + 4, &u16, 2);  RK_BAD(RAY_I16, 0, RAY_ENC_RLE, 72, 1024, NULL, 0, "ends equal");
+    RK_FRESH(); u16 = 0;    memcpy(buf + 48, &u16, 2);      RK_BAD(RAY_I16, 0, RAY_ENC_RLE, 72, 1024, NULL, 0, "first end 0");
+    RK_FRESH(); u16 = 1023; memcpy(buf + 48 + 20, &u16, 2); RK_BAD(RAY_I16, 0, RAY_ENC_RLE, 72, 1024, NULL, 0, "last end short");
+    RK_FRESH(); u16 = 1025; memcpy(buf + 48 + 20, &u16, 2); RK_BAD(RAY_I16, 0, RAY_ENC_RLE, 72, 1024, NULL, 0, "last end past");
+    RK_FRESH(); u16 = 2000; memcpy(buf + 48 + 10, &u16, 2); RK_BAD(RAY_I16, 0, RAY_ENC_RLE, 72, 1024, NULL, 0, "an end past");
+    RK_FRESH(); u16 = 0x8000; memcpy(buf + 16 + 6, &u16, 2); RK_BAD(RAY_I16, 0, RAY_ENC_RLE, 72, 1024, NULL, 0, "run on the sentinel");
+    /* the sentinel run (rows 300..399) with a bitmap: one row of it outside */
+    memset(bm, 0, sizeof bm);
+    for (int i = 300; i < 400; i++) if (i != 350) bm[i >> 3] |= (uint8_t)(1u << (i & 7));
+    RK_FRESH(); u16 = 0x8000; memcpy(buf + 16 + 6, &u16, 2); RK_BAD(RAY_I16, 0, RAY_ENC_RLE, 72, 1024, bm, 99, "sentinel run, a row outside");
+    bm[350 >> 3] |= (uint8_t)(1u << (350 & 7));               /* all in: sound */
+    for (int i = 0; i < RAY_ENC_VEC; i++) want[i] = i >= 300 && i < 400 ? 0x8000 : want[i];
+    if ((r = rk_check(RAY_I16, 0, RAY_ENC_RLE, 0, buf, 72, RAY_ENC_VEC, bm, 100, true, want, "sentinel run in the bitmap")).status != TEST_PASS) return r;
+    RK_FRESH(); memset(buf + 72, 0, 8);                 RK_BAD(RAY_I16, 0, RAY_ENC_RLE, 80, 1024, NULL, 0, "a word after the body");
+    RK_FRESH();                                         RK_BAD(RAY_I16, 0, RAY_ENC_RLE, 64, 1024, NULL, 0, "a word short");
+    RK_FRESH();                                         RK_BAD(RAY_I16, 0, RAY_ENC_RLE, 4, 1024, NULL, 0, "header short");
+    ray_enc_buf_free(&b);
+    /* FOR_BP values, DELTA_BP ends (nr 300 of about 3 rows) */
+    rk_vals(k16, false, 300, true, vals);
+    rk_ends(RAY_ENC_VEC, 300, ends);
+    memset(bm, 0, sizeof bm);
+    (void)rk_expand(k16, false, vals, ends, 300, bm, rows, want);
+    b = (ray_enc_buf_t){ 0 };
+    TEST_ASSERT_TRUE(rk_rle(&b, k16, vals, ends, 300, RAY_ENC_FOR_BP, RAY_ENC_DELTA_BP));
+    if ((r = rk_check(RAY_I16, 0, RAY_ENC_RLE, 0, b.p, b.len, RAY_ENC_VEC, NULL, 0, true, want, "FOR/DELTA control")).status != TEST_PASS) return r;
+    const size_t vb = 8 + (size_t)ray_enc_size_for(b.p[9]), eh = 8 + vb;   /* the ends child's header */
+    TEST_ASSERT_TRUE(b.p[9] > 0 && b.p[eh] == RAY_ENC_DELTA_BP && b.p[eh + 1] > 0);   /* both widths above 0 */
+    const uint64_t L16 = RAY_ENC_VEC / 16;
+    RK_FRESH(); buf[9] = 17;                            RK_BAD(RAY_I16, 0, RAY_ENC_RLE, b.len, 1024, NULL, 0, "FOR values width above T");
+    RK_FRESH(); u64 = 1ull << 16; memcpy(buf + 16, &u64, 8); RK_BAD(RAY_I16, 0, RAY_ENC_RLE, b.len, 1024, NULL, 0, "FOR values base above T");
+    RK_FRESH(); u64 = 0x8000; memcpy(buf + 16, &u64, 8); RK_BAD(RAY_I16, 0, RAY_ENC_RLE, b.len, 1024, NULL, 0, "FOR values base on the sentinel");
+    RK_FRESH(); buf[9]++;                               RK_BAD(RAY_I16, 0, RAY_ENC_RLE, b.len, 1024, NULL, 0, "FOR values width vs size");
+    RK_FRESH(); buf[eh + 1] = 17;                       RK_BAD(RAY_I16, 0, RAY_ENC_RLE, b.len, 1024, NULL, 0, "DELTA ends width above T");
+    RK_FRESH(); u64 = 1ull << 16; memcpy(buf + eh + 8, &u64, 8); RK_BAD(RAY_I16, 0, RAY_ENC_RLE, b.len, 1024, NULL, 0, "DELTA ends base above T");
+    RK_FRESH(); u64 = 1ull << 16; memcpy(buf + eh + 16 + 8 * 5, &u64, 8); RK_BAD(RAY_I16, 0, RAY_ENC_RLE, b.len, 1024, NULL, 0, "DELTA ends head above T");
+    RK_FRESH(); buf[eh + 16 + 8 * L16 + 2 * 7] |= 1;    RK_BAD(RAY_I16, 0, RAY_ENC_RLE, b.len, 1024, NULL, 0, "DELTA ends placeholder");
+    RK_FRESH(); buf[eh] = RAY_ENC_DELTA_BP; buf[8] = RAY_ENC_DELTA_BP; RK_BAD(RAY_I16, 0, RAY_ENC_RLE, b.len, 1024, NULL, 0, "DELTA values");
+    ray_enc_buf_free(&b);
+    /* the run count bounds the children's reads and writes: a FOR_BP
+     * child's size does not depend on it.  I64 runs (16 lanes) in a body
+     * of exactly its bytes, so an unbounded unpack reads past it and writes
+     * past the 1024 values (ASan) */
+    const ray_enc_kind_t k64 = { 64, true };
+    rk_vals(k64, false, 300, true, vals);
+    rk_ends(RAY_ENC_VEC, 300, ends);
+    b = (ray_enc_buf_t){ 0 };
+    TEST_ASSERT_TRUE(rk_rle(&b, k64, vals, ends, 300, RAY_ENC_FOR_BP, RAY_ENC_FOR_BP));
+    static const uint32_t counts[] = { 1025, 4096, 65535 };
+    for (size_t i = 0; i < sizeof counts / sizeof counts[0]; i++) {
+        uint8_t* exact = malloc(b.len);
+        TEST_ASSERT_NOT_NULL(exact);
+        memcpy(exact, b.p, b.len); memcpy(exact, &counts[i], 4);
+        r = rk_declines(RAY_I64, 0, RAY_ENC_RLE, exact, b.len, RAY_ENC_VEC, NULL, 0, "FOR run count above vlen");
+        free(exact);
+        if (r.status != TEST_PASS) return r;
+    }
+    ray_enc_buf_free(&b);
+    /* CONST I32: 8 B, the value then zero padding */
+    const ray_enc_kind_t k32 = { 32, true };
+    for (int i = 0; i < RAY_ENC_VEC; i++) rows[i] = 7;
+    b = (ray_enc_buf_t){ 0 }; ray_enc_choice_t ch;
+    TEST_ASSERT_TRUE(ray_enc_write_as(RAY_ENC_CONST, rows, RAY_ENC_VEC, k32, NULL, &b, &ch));
+    TEST_ASSERT_EQ_U(b.len, 8);
+    RK_FRESH(); buf[5] = 1;                             RK_BAD(RAY_I32, 0, RAY_ENC_CONST, 8, 1024, NULL, 0, "CONST padding");
+    RK_FRESH(); memset(buf + 8, 0, 8);                  RK_BAD(RAY_I32, 0, RAY_ENC_CONST, 16, 1024, NULL, 0, "CONST long");
+    RK_FRESH();                                         RK_BAD(RAY_I32, 0, RAY_ENC_CONST, 0, 1024, NULL, 0, "CONST empty");
+    RK_FRESH(); u32 = 0x80000000u; memcpy(buf, &u32, 4); RK_BAD(RAY_I32, 0, RAY_ENC_CONST, 8, 1024, NULL, 0, "CONST on the sentinel");
+    memset(bm, 0, sizeof bm);
+    for (int i = 0; i < 1000; i++) bm[i >> 3] |= (uint8_t)(1u << (i & 7));
+    RK_FRESH(); memcpy(buf, &u32, 4);                   RK_BAD(RAY_I32, 0, RAY_ENC_CONST, 8, 1024, bm, 1000, "CONST on the sentinel, rows outside");
+    ray_enc_buf_free(&b);
+    /* SYM: ids outside the domain, the null count */
+    const ray_enc_kind_t ks = { 32, false };
+    for (int i = 0; i < 11; i++) vals[i] = (uint64_t)(5 + i);
+    for (int i = 0; i < 11; i++) ends[i] = (uint64_t)(i < 10 ? 100 * (i + 1) : 1024);
+    b = (ray_enc_buf_t){ 0 };
+    TEST_ASSERT_TRUE(rk_rle(&b, ks, vals, ends, 11, RAY_ENC_RAW, RAY_ENC_RAW));       /* values 44 B -> 48 */
+    memset(bm, 0, sizeof bm);
+    (void)rk_expand(ks, true, vals, ends, 11, bm, rows, want);
+    if ((r = rk_check(RAY_SYM, RAY_SYM_W32, RAY_ENC_RLE, 0, b.p, b.len, RAY_ENC_VEC, NULL, 0, false, want, "SYM control")).status != TEST_PASS) return r;
+    RK_FRESH(); u32 = 1u << 30; memcpy(buf + 16 + 12, &u32, 4); RK_BAD(RAY_SYM, RAY_SYM_W32, RAY_ENC_RLE, b.len, 1024, NULL, 0, "SYM id at the bound");
+    RK_FRESH(); u32 = 0; memcpy(buf + 16 + 12, &u32, 4); RK_BAD(RAY_SYM, RAY_SYM_W32, RAY_ENC_RLE, b.len, 1024, NULL, 0, "SYM id 0, no nulls");
+    RK_FRESH();                                         RK_BAD(RAY_SYM, RAY_SYM_W32, RAY_ENC_RLE, b.len, 1024, NULL, 100, "SYM nulls without id 0");
+    ray_enc_buf_free(&b);
+    /* RAW: I16 over 1023 rows (2 B of padding), SYM W32 */
+    rk_vals(k16, false, 1023, false, rows);
+    b = (ray_enc_buf_t){ 0 };
+    TEST_ASSERT_TRUE(ray_enc_write_as(RAY_ENC_RAW, rows, 1023, k16, NULL, &b, &ch));
+    TEST_ASSERT_EQ_U(b.len, 2048);
+    RK_FRESH(); buf[2047] = 1;                          RK_BAD(RAY_I16, 0, RAY_ENC_RAW, 2048, 1023, NULL, 0, "RAW padding");
+    RK_FRESH();                                         RK_BAD(RAY_I16, 0, RAY_ENC_RAW, 2040, 1023, NULL, 0, "RAW short");
+    RK_FRESH(); memset(buf + 2048, 0, 8);               RK_BAD(RAY_I16, 0, RAY_ENC_RAW, 2056, 1023, NULL, 0, "RAW long");
+    RK_FRESH(); u16 = 0x8000; memcpy(buf + 2 * 600, &u16, 2); RK_BAD(RAY_I16, 0, RAY_ENC_RAW, 2048, 1023, NULL, 0, "RAW sentinel");
+    memset(bm, 0, sizeof bm); bm[0] = 1;
+    RK_FRESH(); memcpy(buf + 2 * 600, &u16, 2);         RK_BAD(RAY_I16, 0, RAY_ENC_RAW, 2048, 1023, bm, 1, "RAW sentinel outside the bitmap");
+    ray_enc_buf_free(&b);
+    for (int i = 0; i < RAY_ENC_VEC; i++) rows[i] = (uint64_t)(1 + i);
+    b = (ray_enc_buf_t){ 0 };
+    TEST_ASSERT_TRUE(ray_enc_write_as(RAY_ENC_RAW, rows, RAY_ENC_VEC, ks, NULL, &b, &ch));
+    RK_FRESH(); u32 = 1u << 30; memcpy(buf + 4 * 9, &u32, 4); RK_BAD(RAY_SYM, RAY_SYM_W32, RAY_ENC_RAW, b.len, 1024, NULL, 0, "RAW SYM id at the bound");
+    RK_FRESH(); u32 = 0; memcpy(buf + 4 * 9, &u32, 4);  RK_BAD(RAY_SYM, RAY_SYM_W32, RAY_ENC_RAW, b.len, 1024, NULL, 0, "RAW SYM id 0, no nulls");
+    RK_FRESH();                                         RK_BAD(RAY_SYM, RAY_SYM_W32, RAY_ENC_RAW, b.len, 1024, NULL, 2, "RAW SYM nulls without id 0");
+    ray_enc_buf_free(&b);
+#undef RK_BAD
+#undef RK_FRESH
+    PASS();
+}
+
+/* Byte mutations of sound CONST / RLE / RAW bodies: whenever the fast
+ * kernel takes a mutated body (natively or widened), the reference takes
+ * it too and holds the same values. */
+static test_result_t rk_sweep(int8_t type, uint8_t attrs, uint8_t enc, const uint8_t* body, uint64_t len, int vlen,
+                              const uint8_t* bm, int n_nulls, long* taken, const char* what) {
+    ray_enc_kind_t k; TEST_ASSERT_TRUE(ray_enc_kind_of(type, attrs, &k));
+    _Alignas(8) static uint8_t buf[8192];
+    static uint8_t ref[RAY_ENC_VEC * 8], fast[RAY_ENC_VEC * 8];
+    static int64_t wi[RAY_ENC_VEC];
+    const uint32_t bound = 1u << 30;
+    const size_t esz = (size_t)k.T / 8;
+    static const uint8_t masks[] = { 0xFF, 0x01, 0x80 };
+    for (uint64_t pos = 0; pos < len; pos++)
+        for (size_t mi = 0; mi < sizeof masks; mi++) {
+            memcpy(buf, body, len);
+            buf[pos] ^= masks[mi];
+            int fr = ray_enccol_test_decode_body(type, attrs, bound, enc, 0, n_nulls, bm, buf, len, vlen, true, 0, fast);
+            int rr = ray_enccol_test_decode_body(type, attrs, bound, enc, 0, n_nulls, bm, buf, len, vlen, false, 0, ref);
+            TEST_ASSERT_FMT(fr != 1 || (rr == 1 && memcmp(ref, fast, (size_t)vlen * esz) == 0),
+                            "%s byte %llu mask %02x: fast %d, reference %d", what, (unsigned long long)pos, masks[mi], fr, rr);
+            *taken += fr == 1;
+            if (type == RAY_SYM || k.T == 64) continue;
+            int wr = ray_enccol_test_decode_body(type, attrs, bound, enc, 0, n_nulls, bm, buf, len, vlen, true, RAY_I64, wi);
+            TEST_ASSERT_FMT(wr != 1 || rr == 1, "%s byte %llu mask %02x: wide %d, reference %d", what,
+                            (unsigned long long)pos, masks[mi], wr, rr);
+            for (int i = 0; wr == 1 && i < vlen; i++) {
+                int64_t x = k.T == 8 ? (int64_t)ref[i] : k.T == 16 ? (int64_t)((int16_t*)ref)[i] : (int64_t)((int32_t*)ref)[i];
+                bool null = bm && ((bm[i >> 3] >> (i & 7)) & 1);
+                TEST_ASSERT_FMT(wi[i] == (null ? NULL_I64 : x), "%s byte %llu: wide row %d", what, (unsigned long long)pos, i);
+            }
+        }
+    PASS();
+}
+
+static test_result_t test_runs_kernel_parity(void) {
+    static uint64_t vals[RAY_ENC_VEC], ends[RAY_ENC_VEC], rows[RAY_ENC_VEC], want[RAY_ENC_VEC];
+    static uint8_t bm[RAY_ENC_VEC / 8];
+    static const struct { int8_t type; uint8_t attrs; uint8_t venc, eenc; int nr; bool nulls; } cs[] = {
+        { RAY_I16, 0, RAY_ENC_RAW, RAY_ENC_RAW, 11, true },
+        { RAY_I32, 0, RAY_ENC_FOR_BP, RAY_ENC_DELTA_BP, 40, false },
+        { RAY_I64, 0, RAY_ENC_RAW, RAY_ENC_FOR_BP, 20, true },
+        { RAY_U8, 0, RAY_ENC_RAW, RAY_ENC_RAW, 9, false },
+        { RAY_SYM, RAY_SYM_W16, RAY_ENC_RAW, RAY_ENC_RAW, 12, true },
+        { RAY_SYM, RAY_SYM_W8, RAY_ENC_FOR_BP, RAY_ENC_RAW, 7, false },
+    };
+    long taken = 0;
+    char what[96];
+    g_seed = 0x5eed17a;
+    for (size_t ci = 0; ci < sizeof cs / sizeof cs[0]; ci++) {
+        ray_enc_kind_t k; ray_enc_kind_of(cs[ci].type, cs[ci].attrs, &k);
+        const bool sym = cs[ci].type == RAY_SYM;
+        rk_vals(k, sym, cs[ci].nr, true, vals);
+        rk_ends(RAY_ENC_VEC, cs[ci].nr, ends);
+        memset(bm, 0, sizeof bm);
+        if (cs[ci].nulls) {
+            vals[2] = sym ? 0 : fk_sentinel(k.T);
+            for (int r = (int)ends[1]; !sym && r < (int)ends[2]; r++) bm[r >> 3] |= (uint8_t)(1u << (r & 7));
+        }
+        const int nn = rk_expand(k, sym, vals, ends, cs[ci].nr, bm, rows, want);
+        const uint8_t* bmp = nn && !sym ? bm : NULL;
+        ray_enc_buf_t b = { 0 };
+        TEST_ASSERT_TRUE(rk_rle(&b, k, vals, ends, cs[ci].nr, cs[ci].venc, cs[ci].eenc));
+        snprintf(what, sizeof what, "RLE type %d", cs[ci].type);
+        test_result_t r = rk_sweep(cs[ci].type, cs[ci].attrs, RAY_ENC_RLE, b.p, b.len, RAY_ENC_VEC, bmp, nn, &taken, what);
+        ray_enc_buf_free(&b);
+        if (r.status != TEST_PASS) return r;
+        /* CONST of the first run's value, RAW of the rows */
+        ray_enc_choice_t ch;
+        for (int i = 0; i < RAY_ENC_VEC; i++) want[i] = vals[0];
+        b = (ray_enc_buf_t){ 0 };
+        TEST_ASSERT_TRUE(ray_enc_write_as(RAY_ENC_CONST, want, RAY_ENC_VEC, k, NULL, &b, &ch));
+        snprintf(what, sizeof what, "CONST type %d", cs[ci].type);
+        r = rk_sweep(cs[ci].type, cs[ci].attrs, RAY_ENC_CONST, b.p, b.len, RAY_ENC_VEC, NULL, 0, &taken, what);
+        ray_enc_buf_free(&b);
+        if (r.status != TEST_PASS) return r;
+        b = (ray_enc_buf_t){ 0 };
+        TEST_ASSERT_TRUE(ray_enc_write_as(RAY_ENC_RAW, rows, 600, k, NULL, &b, &ch));
+        snprintf(what, sizeof what, "RAW type %d", cs[ci].type);
+        int rn = 0;
+        for (int i = 0; i < 600; i++) rn += sym ? rows[i] == 0 : (bm[i >> 3] >> (i & 7)) & 1;
+        r = rk_sweep(cs[ci].type, cs[ci].attrs, RAY_ENC_RAW, b.p, b.len, 600, rn && !sym ? bm : NULL, rn, &taken, what);
+        ray_enc_buf_free(&b);
+        if (r.status != TEST_PASS) return r;
+    }
+    TEST_ASSERT_TRUE(taken > 1000);          /* the kernels took mutated bodies too (values, not rules) */
+    PASS();
+}
+
+/* A RAW integer vector without nulls is read in place: the range read's
+ * data lies in the mapping and holds the generation-0 values, guarded or
+ * not, and counts the vector's bytes as delivered (as its decode would).
+ * With nulls, or any other encoding, it is decoded.  (The writer trains a VALUE_DICT on the first chunk, so signed
+ * kinds hold their RAW vectors in the second.) */
+static test_result_t test_raw_int_view(void) {
+    static const struct { int8_t type; uint8_t attrs; int64_t n; bool nulls; } cs[] = {
+        { RAY_I64, 0, 70001, false }, { RAY_I16, 0, 70000, false }, { RAY_U8, 0, 1500, false },
+        { RAY_SYM, RAY_SYM_W8, 2100, false }, { RAY_TIMESTAMP, 0, 69632, false }, { RAY_I32, 0, 70000, true },
+    };
+    const char* path = ray_test_tmp(ENCCOL_TMP "/rawv");
+    g_seed = 0x4a7;
+    for (size_t ci = 0; ci < sizeof cs / sizeof cs[0]; ci++) {
+        const int8_t type = cs[ci].type;
+        const int64_t n = cs[ci].n;
+        ray_t* v = type == RAY_SYM ? ray_sym_vec_new(cs[ci].attrs, n) : ray_vec_new(type, n);
+        v->len = n;
+        const uint8_t esz = ray_sym_elem_size(type, v->attrs);
+        uint8_t* d = ray_data(v);
+        for (int64_t i = 0; i < n; i++) {
+            uint64_t x = rng();
+            switch (type) {
+            case RAY_U8:  d[i] = (uint8_t)x; break;
+            case RAY_SYM: d[i] = (uint8_t)(1 + x % 255); break;
+            case RAY_I16: { int16_t y = (int16_t)x; if (y == NULL_I16) y = 0; memcpy(d + i * 2, &y, 2); break; }
+            case RAY_I32: { int32_t y = (int32_t)(uint32_t)(x >> 32); if (y == NULL_I32) y = 0;
+                            if (cs[ci].nulls && i % 9 == 0) y = NULL_I32;
+                            memcpy(d + i * 4, &y, 4); break; }
+            default:      { int64_t y = (int64_t)x; if (y == NULL_I64) y = 0; memcpy(d + i * 8, &y, 8); break; }
+            }
+        }
+        if (cs[ci].nulls) v->attrs |= RAY_ATTR_HAS_NULLS;
+        TEST_ASSERT_EQ_I(ray_col_save_gen(v, path, 2), RAY_OK);
+        ray_t* c = ray_col_mmap(path);
+        TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+        ray_enccol_t* e = ray_enccol_of(c);
+        TEST_ASSERT_NOT_NULL(e);
+        int raw = 0;
+        for (int guard = 0; guard < 2; guard++) {
+            ray_col_src_t src;
+            TEST_ASSERT_NULL(ray_col_src_bind(c, &src));
+            src.stats_guard = guard;
+            for (int64_t at = 0; at < n; at += RAY_ENC_VEC) {
+                const ray_enc_desc_t* descs;
+                TEST_ASSERT_NULL(ray_enccol_chunk_descs_ref(e, at / RAY_ENC_CHUNK, &descs));
+                const bool is_raw = descs[at % RAY_ENC_CHUNK / RAY_ENC_VEC].encoding == RAY_ENC_RAW;
+                raw += is_raw;
+                const bool view = is_raw && !cs[ci].nulls;
+                int64_t len = n - at < RAY_ENC_VEC ? n - at : RAY_ENC_VEC;
+                for (int64_t off = 0; off < len; off += len / 2 + 1) {    /* a whole vector and its tail */
+                    ray_col_scratch_t sc; ray_col_scratch_init(&sc);
+                    ray_enc_counters_reset();
+                    ray_col_range_t r;
+                    TEST_ASSERT_NULL(ray_col_range(&src, at + off, len - off, &sc, &r));
+                    TEST_ASSERT_EQ_I(r.n, len - off);
+                    const bool in_map = (const uint8_t*)r.data >= e->base && (const uint8_t*)r.data < e->base + e->size;
+                    TEST_ASSERT_FMT(in_map == view, "type %d at %lld: in the mapping %d", type, (long long)(at + off), in_map);
+                    TEST_ASSERT_TRUE(!view || !r.may_null);
+                    TEST_ASSERT_TRUE(memcmp(r.data, d + (size_t)(at + off) * esz, (size_t)(len - off) * esz) == 0);
+                    TEST_ASSERT_TRUE(type != RAY_SYM || r.dom == e->dom);
+                    ray_col_scratch_free(&sc);
+                    ray_enc_counters_t k; ray_enc_counters_get(&k);
+                    TEST_ASSERT_FMT(k.decoded_bytes == (uint64_t)len * esz, "type %d at %lld: counted %llu",
+                                    type, (long long)(at + off), (unsigned long long)k.decoded_bytes);
+                }
+            }
+            ray_col_src_release(&src);
+        }
+        TEST_ASSERT_FMT(raw / 2 >= 2, "type %d: %d RAW vectors", type, raw / 2);   /* a full one and a tail */
+        ray_release(c);
+        ray_release(v);
+    }
+    PASS();
+}
+
 /* ---- Task 13b: point reads and the DICT kernel against the reference decode ---- */
 
 /* Element i of a generation-0 vector of `type`, widened to int64. */
@@ -2588,6 +3151,10 @@ const test_entry_t enccol_entries[] = {
     { "enccol/decode_rejects_payload", test_decode_rejects_payload, enccol_setup, enccol_teardown },
     { "enccol/dict_once_concurrent",   test_dict_once_concurrent,   enccol_setup, enccol_teardown },
     { "enccol/fast_kernel_equal",      test_fast_kernel_equal,      enccol_setup, enccol_teardown },
+    { "enccol/runs_kernel_equal",      test_runs_kernel_equal,      enccol_setup, enccol_teardown },
+    { "enccol/runs_kernel_declines",   test_runs_kernel_declines,   enccol_setup, enccol_teardown },
+    { "enccol/runs_kernel_parity",     test_runs_kernel_parity,     enccol_setup, enccol_teardown },
+    { "enccol/raw_int_view",           test_raw_int_view,           enccol_setup, enccol_teardown },
     { "enccol/point_read_equal",       test_point_read_equal,       enccol_setup, enccol_teardown },
     { "enccol/dict_kernel_equal",      test_dict_kernel_equal,      enccol_setup, enccol_teardown },
     { "enccol/dict_kernel_rejects",    test_dict_kernel_rejects,    enccol_setup, enccol_teardown },
