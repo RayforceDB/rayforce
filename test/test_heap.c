@@ -2706,7 +2706,30 @@ static test_result_t test_sys_alloc_zero_fill(void) {
  * they are, and so is everything where the platform cannot punch a mapped
  * range (no MADV_REMOVE: macOS) or the spill directory's filesystem cannot
  * (NFS, ext3) — the call says whether it did, and the pages read zero
- * exactly when it says so. */
+ * exactly when it says so.  Whether the spill directory can is asked of it
+ * first (a scratch file there punched with fallocate, which MADV_REMOVE
+ * does on a mapping): where it can, a spilled block's discard must punch. */
+static bool raw_discard_dir_punches(void) {
+#if defined(__linux__) && defined(MADV_REMOVE) && defined(FALLOC_FL_PUNCH_HOLE)
+    /* the spill directory as ray_heap_init takes it */
+    const char* env = getenv("RAY_HEAP_SWAP");
+    if (!(env && *env)) env = getenv("TMPDIR");
+    const char* dir = env && *env ? env : "/tmp";
+    char path[4096];
+    if ((size_t)snprintf(path, sizeof(path), "%s/rf_punch_probe_XXXXXX", dir) >= sizeof(path)) return false;
+    int fd = mkstemp(path);
+    if (fd < 0) return false;
+    unlink(path);
+    long ps = sysconf(_SC_PAGESIZE);
+    off_t pg = ps > 0 ? (off_t)ps : 4096;
+    bool ok = fallocate(fd, 0, 0, 4 * pg) == 0 &&
+              fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, pg, 2 * pg) == 0;
+    close(fd);
+    return ok;
+#else
+    return false;
+#endif
+}
 static test_result_t test_raw_discard(void) {
 #if defined(_WIN32)
     SKIP("file-backed spill is POSIX-only");
@@ -2716,7 +2739,7 @@ static test_result_t test_raw_discard(void) {
     size_t pg = ps > 0 ? (size_t)ps : 4096;
     int64_t previous = ray_heap_anon_watermark();
     int64_t bad = 0;
-    bool spill_punched = false;
+    bool can_punch = raw_discard_dir_punches();
     for (int k = 0; k < 2; k++) {
         bool spill = k == 1;
         ray_heap_direct_cache_drain();
@@ -2739,7 +2762,10 @@ static test_result_t test_raw_discard(void) {
         size_t upto = head + 3 * pg + pg / 2;
         bool punched = ray_raw_discard(p, 0, upto);
         if (punched && !spill) bad++;         /* an anonymous block is never punched */
-        if (spill) spill_punched = punched;
+        if (spill && can_punch && !punched) {   /* the directory punches: so must the discard */
+            fprintf(stderr, "  raw_discard: the spill directory punches a scratch file, the discard did not\n");
+            bad++;
+        }
         for (size_t i = 0; i < big; i += 64)
             if ((p[i] == 0) != (punched && i >= head && i < head + 3 * pg)) { bad++; break; }
         /* the next report takes the page the first one reached into */
@@ -2768,10 +2794,10 @@ static test_result_t test_raw_discard(void) {
     for (size_t i = 0; i < 64 * 1024; i++) if (s[i] != 0x5a) { bad++; break; }
     ray_free_raw(s);
     TEST_ASSERT_EQ_I(bad, 0);
-    /* Everything above held; but where the spill file could not be punched
-     * (no MADV_REMOVE, or a spill directory on NFS or ext3) the pages that
-     * should go were only checked to stay. */
-    if (!spill_punched) SKIP("spill directory cannot punch a mapped range: the zeroing was not checked");
+    /* Everything above held; but where the spill directory cannot punch (no
+     * MADV_REMOVE, or a filesystem such as NFS or ext3: its probe failed)
+     * the pages that should go were only checked to stay. */
+    if (!can_punch) SKIP("spill directory cannot punch a mapped range: the zeroing was not checked");
     PASS();
 }
 
