@@ -13,6 +13,7 @@
 #include "ops/idxop.h"
 #include "core/runtime.h"   /* ray_error_msg: the skeptic probes */
 #include "core/profile.h"   /* ray_profile_now_ns: pq_pool's bounded wait */
+#include "core/crc32.h"     /* ray_crc32: page checksums of the made files */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1965,7 +1966,9 @@ static test_result_t test_pq_sym_grouped_collision_determinism(void) {
  * column snappy-compressed (a greedy LZ over 2-byte offsets). */
 enum { PQX_DICT = 1, PQX_FALLBACK = 2, PQX_SNAPPY = 4, PQX_LATE = 8, PQX_NOSTATS = 16,
        PQX_LIESTATS = 32, PQX_ZSTD = 64, PQX_HUGERAW = 128, PQX_ZERORAW = 256, PQX_BADDICT = 512,
-       PQX_FARDATA = 1024, PQX_INDICT = 2048 };   /* PQX_ZERORAW: total_uncompressed_size 0; PQX_BADDICT: the dictionary page encoded 3 */
+       PQX_FARDATA = 1024, PQX_INDICT = 2048, PQX_CRC = 4096, PQX_CRCFLIP = 8192 };   /* PQX_ZERORAW: total_uncompressed_size 0; PQX_BADDICT: the dictionary page encoded 3 */
+                                             /* PQX_CRC: page checksums; PQX_CRCFLIP: and row group 1's dictionary
+                                              * page with a byte flipped past its checksum (pqx_page, pqx_crc) */
                                              /* PQX_FARDATA: data_page_offset past the file's data; PQX_INDICT:
                                               * data_page_offset one byte into the dictionary page (skeptic round 4:
                                               * the decoder reads a chunk from its dictionary page for
@@ -2012,6 +2015,13 @@ static void pqx_snappy(pq_buf* o, const uint8_t* s, size_t n) {
     }
     pqx_lit(o, s + lit, n - lit);
 }
+/* pqx_page's checksums (PQX_CRC, PQX_CRCFLIP): 0 none; 1 each page's
+ * CRC-32 in its header (PageHeader 4); 2 that, and a dictionary page's
+ * first string has one byte flipped after its checksum was taken (a page
+ * gone bad on disk), the string it then reads kept in pqx_flipped. */
+static int pqx_crc = 0;
+static char pqx_flipped[256];
+static uint32_t pqx_flipped_len = 0;
 /* A page (kind 0 a v1 data page, 2 the dictionary): header and payload,
  * compressed when snappy; *raw adds what total_uncompressed_size counts. */
 static void pqx_page(pq_buf* f, int kind, const pq_buf* body, int64_t count, int enc, bool snappy, int64_t* raw) {
@@ -2023,6 +2033,7 @@ static void pqx_page(pq_buf* f, int kind, const pq_buf* body, int64_t count, int
     pb_i(f, &last, 1, PB_I32, kind);
     pb_i(f, &last, 2, PB_I32, (int64_t)body->n);
     pb_i(f, &last, 3, PB_I32, (int64_t)pay->n);
+    if (pqx_crc) pb_i(f, &last, 4, PB_I32, (int32_t)ray_crc32(0, pay->p, pay->n));
     int l = 0;
     if (kind == 2) {
         pb_field(f, &last, 7, PB_STRUCT);
@@ -2034,7 +2045,15 @@ static void pqx_page(pq_buf* f, int kind, const pq_buf* body, int64_t count, int
     }
     pb_byte(f, 0);
     *raw += (int64_t)(f->n - h0) + (int64_t)body->n;
+    size_t at = f->n;
     pb_bytes(f, pay->p, pay->n);
+    if (pqx_crc == 2 && kind == 2 && !snappy && pay->n > 5 && !f->bad) {
+        uint32_t len; memcpy(&len, pay->p, 4);
+        if (len > 0 && len < sizeof(pqx_flipped) && 4 + (size_t)len <= pay->n) {
+            f->p[at + 4] ^= 0x20;   /* the first string's first byte, its case flipped */
+            memcpy(pqx_flipped, f->p + at + 4, len); pqx_flipped_len = len;
+        }
+    }
     ray_sys_free(z.p);
 }
 static uint32_t pqx_dict_id(const pq_buf* dict, const pq_buf* doff, const char* s, uint32_t len) {
@@ -2064,6 +2083,7 @@ static bool pqx_synth(const char* path, int64_t rows, int64_t groups, int n, con
         for (int64_t c = 0; c < nc; c++) {
             int64_t i = g * nc + c;
             start[i] = (int64_t)f.n; rawt[i] = 0; dio[i] = -1;
+            pqx_crc = 0;
             if (c == 0) {
                 pq_buf v = {0};
                 for (int64_t r = lo; r < hi; r++) { int32_t x = (int32_t)r; pb_bytes(&v, &x, 4); }
@@ -2075,6 +2095,7 @@ static bool pqx_synth(const char* path, int64_t rows, int64_t groups, int n, con
                 continue;
             }
             unsigned fl = flags[c - 1];
+            pqx_crc = !(fl & PQX_CRC) ? 0 : (fl & PQX_CRCFLIP) && g == 1 ? 2 : 1;
             bool snappy = (fl & PQX_SNAPPY) != 0, dicted = (fl & (PQX_DICT | PQX_FALLBACK)) != 0;
             pq_synth_fn fn = fns[c - 1];
             int64_t mid = !dicted ? lo : (fl & PQX_FALLBACK) && hi - lo >= 2 ? lo + (hi - lo) * ((fl & PQX_LATE) ? 7 : 4) / 8 : hi;
@@ -2126,6 +2147,7 @@ static bool pqx_synth(const char* path, int64_t rows, int64_t groups, int n, con
             stored[i] = (int64_t)f.n - start[i];
         }
     }
+    pqx_crc = 0;
     int64_t footer = (int64_t)f.n;
     int last = 0;
     pb_i(&f, &last, 1, PB_I32, 1);
@@ -3088,11 +3110,31 @@ static test_result_t test_pq_symgrp_degenerate_hash(void) {
     PASS();
 #endif
 }
+/* Whether the file at `path` holds the n bytes `s`: 1, 0, -1 when it
+ * cannot be read. */
+static int pq_file_has(const char* path, const char* s, size_t n) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return -1;
+    char buf[65536 + 256];
+    size_t keep = 0, got;
+    int found = 0;
+    while (!found && n && (got = fread(buf + keep, 1, sizeof(buf) - keep, f)) > 0) {
+        size_t have = keep + got;
+        for (size_t i = 0; !found && i + n <= have; i++) found = !memcmp(buf + i, s, n);
+        keep = have < n - 1 ? have : n - 1;   /* a match across the read boundary */
+        memmove(buf, buf + have - keep, keep);
+    }
+    fclose(f);
+    return found;
+}
 /* A dictionary column the reader cannot decode: a codec it does not take
- * (ZSTD, 6), or a dictionary page of an encoding it does not know (3).  The
- * import reports the decoder's own reason, forced direct and as a mixed
- * import whose dictionary column is seeded first (the error then the
- * seeding's, the same words). */
+ * (ZSTD, 6), a dictionary page of an encoding it does not know (3), or one
+ * whose checksum (a file written with page CRCs) its bytes no longer match,
+ * a byte of its first string flipped.  The import reports the decoder's own
+ * reason and the column, forced direct and as a mixed import whose
+ * dictionary column is seeded first (the error then the seeding's, the same
+ * words); nothing is published, and the symbol file the failed import
+ * leaves in its staging directory holds no string of the page gone bad. */
 static test_result_t test_pq_sk_codec_message(void) {
 #if !defined(DEBUG)
     SKIP("the memory the decision assumes is a debug-build knob");
@@ -3115,6 +3157,7 @@ static test_result_t test_pq_sk_codec_message(void) {
     static const struct { unsigned flags; const char* want; } cases[] = {
         {PQX_DICT | PQX_ZSTD, "unsupported compression codec"},
         {PQX_DICT | PQX_BADDICT, "invalid dictionary page"},
+        {PQX_DICT | PQX_CRC | PQX_CRCFLIP, "page checksum mismatch"},
     };
     for (size_t v = 0; v < sizeof(cases) / sizeof(cases[0]); v++) {
         unsigned fl[3] = {cases[v].flags, PQX_DICT, 0};
@@ -3137,10 +3180,18 @@ static test_result_t test_pq_sk_codec_message(void) {
             /* the mixed import fails in its seeding, before its symcol lines:
              * the seeding checks what it interns as the decoder would (no
              * page the pass then refuses is interned first: no symseed line) */
-            if (!failed || !msg || !strstr(msg, cases[v].want) || (!run && !pd)) bad++;
+            if (!failed || !msg || !strstr(msg, cases[v].want) || !strstr(msg, "(column p)") || (!run && !pd)) bad++;
             if (!run && msg) snprintf(first, sizeof(first), "%s", msg);
             if (run && (!msg || strcmp(first, msg) || strstr(trace, "parquet symseed:"))) bad++;
             if (res) { if (RAY_IS_ERR(res)) ray_error_free(res); else ray_release(res); }
+            if (access(dir, F_OK) == 0) { fprintf(stderr, "  sk codec %zu: published\n", v); bad++; }
+            if (cases[v].flags & PQX_CRCFLIP) {
+                char sym[300]; snprintf(sym, sizeof(sym), "%s/.sym", partial);
+                int has = pqx_flipped_len ? pq_file_has(sym, pqx_flipped, pqx_flipped_len) : 1;
+                fprintf(stderr, "  sk codec %zu %s: the staged .sym %s\n", v, run ? "mixed" : "direct",
+                        has < 0 ? "is not there" : has ? "HOLDS the bad page's string" : "holds no string of the bad page");
+                if (has > 0) bad++;
+            }
             pq_remove_native(partial, fnames, 4); pq_remove_native(dir, fnames, 4);
         }
         if (getenv("SK_KEEP")) fprintf(stderr, "  sk codec: kept %s\n", src); else unlink(src);

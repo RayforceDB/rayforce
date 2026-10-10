@@ -812,16 +812,47 @@ static bool pq_dictionary(pq_column* c, pq_schema* s, const uint8_t* payload, si
     size_t width = s->physical == 1 || s->physical == 4 ? 4 : 8;
     return s->physical != 0 && (uint64_t)count*width == n;
 }
+/* The steps of reading a page that the decoder (pq_page) and the seeding
+ * of a grouped import's direct columns (pq_seed_dicts) share, so that the
+ * seeding takes only what the decoder would.  A page at the cursor: its
+ * header's fields into f[10], its sizes checked, its payload taken past
+ * it. */
+static const char* pq_page_take(pq_cur* cur, pq_span* f, int64_t* raw, int64_t* size, const uint8_t** payload) {
+    const uint8_t* start = cur->p;
+    if (!pq_skip(cur,12,0,false)) return "invalid page header";
+    if (!pq_fields((pq_span){start,cur->p,12},f,10)) return "invalid page fields";
+    *raw = pq_get(f[2],-1); *size = pq_get(f[3],-1);
+    if (*raw < 0 || *raw > PQ_MAX_PAGE || *size < 0 || *size > PQ_MAX_PAGE) return "invalid or oversized page (limit 64 MiB)";
+    if (!pq_take(cur,(uint64_t)*size,payload)) return "truncated page";
+    return NULL;
+}
+/* Its checksum, when the header has one: the ordinary CRC-32 over the
+ * compressed page body. */
+static const char* pq_page_crc(const pq_span* f, const uint8_t* payload, int64_t size) {
+    if (!f[4].type) return NULL;
+    int64_t expected;
+    if (!pq_num(f[4],&expected)) return "invalid page checksum";
+    if (ray_crc32(0,payload,(size_t)size) != (uint32_t)expected) return "page checksum mismatch";
+    return NULL;
+}
+/* A dictionary page's header (PLAIN or PLAIN_DICTIONARY values) and its
+ * values into the cursor (pq_dictionary); *count its entries.  False when
+ * either cannot be read: "invalid dictionary page". */
+static bool pq_dict_page(pq_column* c, pq_schema* s, const pq_span* f, const uint8_t* payload, int64_t size, int64_t raw,
+                         int64_t* count) {
+    pq_span h[9];
+    if (!pq_fields(f[7],h,9) || !pq_num(h[1],count)) return false;
+    int64_t encoding = pq_get(h[2],-1);
+    return (encoding == 0 || encoding == 2) && pq_dictionary(c,s,payload,(size_t)size,(size_t)raw,*count);
+}
 static const char* pq_page(pq_column* c, pq_schema* s, int64_t* skip) {
     while (c->chunk.p < c->chunk.end) {
-        const uint8_t* start = c->chunk.p;
-        if (!pq_skip(&c->chunk,12,0,false)) return "invalid page header";
         pq_span f[10];
-        if (!pq_fields((pq_span){start,c->chunk.p,12},f,10)) return "invalid page fields";
-        int64_t kind = pq_get(f[1],-1), raw = pq_get(f[2],-1), size = pq_get(f[3],-1);
-        if (raw < 0 || raw > PQ_MAX_PAGE || size < 0 || size > PQ_MAX_PAGE) return "invalid or oversized page (limit 64 MiB)";
+        int64_t raw, size;
         const uint8_t* payload;
-        if (!pq_take(&c->chunk,(uint64_t)size,&payload)) return "truncated page";
+        const char* perr = pq_page_take(&c->chunk,f,&raw,&size,&payload);
+        if (perr) return perr;
+        int64_t kind = pq_get(f[1],-1);
         if (skip && (kind == 0 || kind == 3)) {
             pq_span h[9]; int64_t count;
             if (!pq_fields(f[kind == 0 ? 5 : 8],h,9) || !pq_num(h[1],&count) ||
@@ -833,19 +864,12 @@ static const char* pq_page(pq_column* c, pq_schema* s, int64_t* skip) {
                 continue;
             }
         }
-        if (f[4].type) {
-            int64_t expected;
-            if (!pq_num(f[4],&expected)) return "invalid page checksum";
-            /* Ordinary CRC-32 over the compressed page body. */
-            if (ray_crc32(0,payload,(size_t)size) != (uint32_t)expected) return "page checksum mismatch";
-        }
+        if ((perr = pq_page_crc(f,payload,size))) return perr;
         if (kind == 1) continue; /* legacy index page */
         const uint8_t* data = NULL; pq_span h[9]; int64_t count, encoding;
         c->bool_bit = 0; c->bool_rle = false; c->page_nulls = 0; c->expected_nulls = -1;
         if (kind == 2) {
-            if (!pq_fields(f[7],h,9) || !pq_num(h[1],&count) ||
-                (pq_get(h[2],-1) != 0 && pq_get(h[2],-1) != 2) ||
-                !pq_dictionary(c,s,payload,(size_t)size,(size_t)raw,count)) return "invalid dictionary page";
+            if (!pq_dict_page(c,s,f,payload,size,raw,&count)) return "invalid dictionary page";
             continue;
         }
         if (kind == 0) {
@@ -2020,23 +2044,20 @@ static const char* pq_seed_dicts(ray_parquet_t* r, const int64_t* order, int64_t
                     ray_vm_advise_willneed(r->map + dict,(size_t)(data > dict && data - dict <= bytes ? data - dict : bytes));
                     continue;
                 }
+                /* the decoder's steps (pq_page): a page gone bad is refused
+                 * before any of its strings is interned */
                 pq_cur cur = {r->map+dict,r->map+dict+bytes,false};
-                const uint8_t* start = cur.p;
-                pq_span f[10], h[4];
-                if (!pq_skip(&cur,12,0,false)) { err = "invalid page header"; break; }
-                if (!pq_fields((pq_span){start,cur.p,12},f,10)) { err = "invalid page fields"; break; }
-                int64_t raw = pq_get(f[2],-1), size = pq_get(f[3],-1);
-                if (raw < 0 || raw > PQ_MAX_PAGE || size < 0 || size > PQ_MAX_PAGE) { err = "invalid or oversized page (limit 64 MiB)"; break; }
+                pq_span f[10];
+                int64_t raw, size, count = 0;
                 const uint8_t* payload;
-                if (!pq_take(&cur,(uint64_t)size,&payload)) { err = "truncated page"; break; }
-                int64_t count;
-                if (pq_get(f[1],-1) != 2 || !pq_fields(f[7],h,4) || !pq_num(h[1],&count) ||
-                    (pq_get(h[2],-1) != 0 && pq_get(h[2],-1) != 2)) { err = "invalid dictionary page"; break; }
+                if ((err = pq_page_take(&cur,f,&raw,&size,&payload))) break;
+                if ((err = pq_page_crc(f,payload,size))) break;
+                if (pq_get(f[1],-1) != 2) { err = "invalid dictionary page"; break; }
                 pq_column col = {0};
                 col.codec = (int)codec;
                 pq_schema sch = r->schema[c];
                 if (!sch.import_domain) err = "symbol column without an import dictionary";
-                else if (!pq_dictionary(&col,&sch,payload,(size_t)size,(size_t)raw,count)) err = "invalid dictionary page";
+                else if (!pq_dict_page(&col,&sch,f,payload,size,raw,&count)) err = "invalid dictionary page";
                 else *entries += count;
                 ray_free_raw(col.dict); ray_free_raw(col.strings); ray_free_raw(col.symbol_ids); ray_free_raw(col.symbols);
             }
