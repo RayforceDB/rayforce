@@ -1664,14 +1664,15 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
         if (fname_len == 6 && memcmp(fname, "concat", 6) == 0) {
             ray_op_t* folded = compile_const_str_expr(g, expr);
             if (folded) return folded;
-            if (n < 2 || n - 1 > 16) return NULL;
-            uint32_t arg_ids[16];
+            /* One node for up to 255 operands, the executor's limit. */
+            if (n < 2 || n - 1 > 255) return NULL;
+            uint32_t arg_ids[255];
             for (int64_t i = 1; i < n; i++) {
                 ray_op_t* a = compile_expr_dag(g, elems[i]);
                 if (!a) return NULL;
                 arg_ids[i - 1] = a->id;
             }
-            ray_op_t* args[16];
+            ray_op_t* args[255];
             for (int64_t i = 0; i < n - 1; i++)
                 args[i] = &g->nodes[arg_ids[i]];
             /* Constant collections keep ordinary concat semantics in a query.
