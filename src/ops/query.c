@@ -11323,6 +11323,10 @@ by_dict_done:
                 if (!fres || RAY_IS_ERR(fres)) { ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return fres ? fres : ray_error("domain", "select: `where:` filter produced no result"); }
                 if (ray_is_lazy(fres)) fres = ray_lazy_materialize(fres);
                 if (!fres || RAY_IS_ERR(fres)) { ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return fres ? fres : ray_error("domain", "select: failed to materialize filtered result"); }
+                /* A filter that keeps every row hands back the input itself, with
+                 * a reference of its own; the exits release eval_tbl only when it
+                 * is another table. */
+                if (fres == tbl) ray_release(fres);
                 eval_tbl = fres;
             } else {
                 ray_graph_free(g); g = NULL;
@@ -13301,6 +13305,7 @@ by_dict_done:
                 if (!fres || RAY_IS_ERR(fres)) { ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return fres ? fres : ray_error("domain", "select: `where:` filter produced no result"); }
                 if (ray_is_lazy(fres)) fres = ray_lazy_materialize(fres);
                 if (!fres || RAY_IS_ERR(fres)) { ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return fres ? fres : ray_error("domain", "select: failed to materialize filtered result"); }
+                if (fres == tbl) ray_release(fres);   /* as eval_tbl above: every row kept */
                 filtered_tbl = fres;
                 /* Rebuild graph on filtered table for GROUP+COUNT */
                 g = ray_graph_new(filtered_tbl);

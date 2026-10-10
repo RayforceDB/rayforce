@@ -73,6 +73,21 @@
 (probe_caught (fn [p] (try (select {by: {k: (+ x 'a)} from: TB}) (fn [e] 0))) 5 1000) -- true
 (probe_caught (fn [p] (try (select {by: {k: (+ 1 'a)} from: TB}) (fn [e] 0))) 5 1000) -- true
 (probe_caught (fn [p] (try (select {c: (count (distinct y)) by: (+ x 'a) from: TB}) (fn [e] 0))) 5 1000) -- true
+;; a where: that keeps every row hands back the input itself, with a
+;; reference the no-output and eval-level groupings never dropped: the
+;; whole input table per call, a nested select's result included
+(set mkw (fn [] (table [x y z s] (list (% (til 1000) 7) (til 1000) (% (til 1000) 3) (as 'STR (% (til 1000) 5))))))
+(probe (fn [p] (count (select {by: x from: (mkw) where: (>= y 0)}))) 5 60) -- true
+(probe (fn [p] (count (select {by: (* x 2) from: (mkw) where: (>= y 0) desc: x take: 2}))) 5 60) -- true
+(probe (fn [p] (count (select {by: [x z] from: (mkw) where: (>= y 0)}))) 5 60) -- true
+(probe (fn [p] (count (select {by: s from: (mkw) where: (>= y 0)}))) 5 60) -- true
+(probe (fn [p] (count (select {by: {k: x} from: (select {from: (mkw) where: (> y 38)}) where: (> y 0)}))) 5 60) -- true
+;; a table kept in a global is not held past the selects over it
+(set Tkw (mkw))
+(set h0 (heapb))
+(map (fn [p] (count (select {by: x from: Tkw where: (>= y 0)}))) (til 10))
+(set Tkw 0)
+(< (- (heapb) h0) -10000) -- true
 ;; try frees the error it catches, and the trace its unwind recorded: a
 ;; raise, a runtime error, a rethrow, a fallback value, in a function
 (probe (fn [p] (try (raise p) (fn [e] 0))) 5 1000) -- true
