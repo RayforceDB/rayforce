@@ -1092,6 +1092,9 @@ void ray_expr_test_eval_range(const ray_expr_t* expr, int64_t start, int64_t end
 /* Test hook: the parted evaluator runs every segment instead of stopping
  * at the first failing one (false restores the stop). */
 void ray_expr_test_parted_all_segments(bool on);
+/* Monotonic count of fused-expression morsels decided from statistics
+ * (zone or directory) without reading their rows.  Tests. */
+int64_t ray_expr_test_zone_skips(void);
 
 /* query.c test hook: counts the (count (select ... where <compare>)) fast
  * path answered since process start. */
@@ -1277,6 +1280,10 @@ int64_t ray_group_perpart_nn_slots(void);
 /* Monotonic count of exec_group_parted's in-place concat groups (the
  * parted columns grouped from their segments, no flatten).  Tests. */
 int64_t ray_group_segstream_runs(void);
+/* Monotonic bytes of null fill the parted group built for ragged
+ * partitions' stand-ins (bounded per query by the group's transient
+ * budget, AGG_COMPACT_BITMAP_BUDGET).  Tests. */
+int64_t ray_group_null_fill_bytes(void);
 /* Monotonic count of per-partition unordered takes answered from the
  * first keys read up front (grp_first_keys_scan).  Tests. */
 int64_t ray_group_firstkeys_runs(void);

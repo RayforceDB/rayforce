@@ -262,15 +262,13 @@ static ray_t* collect_part_dirs(const char* db_root, char*** out_dirs,
 }
 
 /* --------------------------------------------------------------------------
- * missing_seg_fill — `rows` cells of `type`'s null on the heap: the sentinel
- * ray_vec_set_null writes, HAS_NULLS set; the non-nullable BOOL / U8 read
- * 0; SYM cells are id 0, the empty symbol, resolved over the db's domain
- * `dom`; LIST cells are the null object.  It is the segment of a column a
- * ragged partition lacks only where generation 2 cannot hold the type
- * (LIST, or a big-endian host); otherwise it is the fill one chunk of the
- * lazy segment is encoded from (missing_seg).
+ * ray_null_fill — `rows` cells of `type`'s null on the heap (part.h).  It is
+ * the segment of a column a ragged partition lacks only where generation 2
+ * cannot hold the type (LIST, or a big-endian host); otherwise it is the
+ * fill one chunk of the lazy segment is encoded from (missing_seg), and the
+ * group's plain stand-in for that segment (group.c, grp_synth_plain).
  * -------------------------------------------------------------------------- */
-static ray_t* missing_seg_fill(int8_t type, int64_t rows, struct ray_sym_domain_s* dom) {
+ray_t* ray_null_fill(int8_t type, int64_t rows, struct ray_sym_domain_s* dom) {
     if (type == RAY_LIST) {
         ray_t* l = ray_list_new(rows);
         if (!l || RAY_IS_ERR(l)) return l ? l : ray_error("oom", NULL);
@@ -328,7 +326,7 @@ static ray_t* missing_seg_fill(int8_t type, int64_t rows, struct ray_sym_domain_
  * rows of I64, ~18 MB per 100M rows where a heap fill held 800 MB — and the
  * rows decode only when a query reads them, like any encoded segment (its
  * directory answers null presence without a decode).  The image is the file
- * the generation-2 writer writes for missing_seg_fill's vector, so its
+ * the generation-2 writer writes for ray_null_fill's vector, so its
  * materialization is that vector: the same nulls and attrs (HAS_NULLS on
  * every nullable type), SYM over `dom`.  The segment is marked synthetic:
  * generation inheritance treats it as the plain fill it stands for (a save
@@ -340,8 +338,8 @@ static ray_t* missing_seg_fill(int8_t type, int64_t rows, struct ray_sym_domain_
  * -------------------------------------------------------------------------- */
 static ray_t* missing_seg(int8_t type, int64_t rows, struct ray_sym_domain_s* dom, const char* what) {
     if (!ray_enc_gen2_supported() || !ray_encw_type_supported(type))
-        return missing_seg_fill(type, rows, dom);
-    ray_t* fill = missing_seg_fill(type, rows < RAY_ENC_CHUNK ? rows : RAY_ENC_CHUNK, dom);
+        return ray_null_fill(type, rows, dom);
+    ray_t* fill = ray_null_fill(type, rows < RAY_ENC_CHUNK ? rows : RAY_ENC_CHUNK, dom);
     if (!fill || RAY_IS_ERR(fill)) return fill ? fill : ray_error("oom", NULL);
     void* img = NULL; size_t size = 0;
     ray_err_t e = ray_encw_null_image(type, fill->attrs, rows, 0, ray_data(fill), &img, &size);

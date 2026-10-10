@@ -25,6 +25,11 @@ extern bool ray_agg_tablestack;
 #define AGG_FIRSTN_MAX        1024     /* largest take: N the pre-pass serves */
 #define AGG_FIRSTN_PROBE_ROWS 65536    /* prefix budget for the serial scan, at least */
 
+/* The group's transient-state budget: the dense compaction's per-task
+ * bitmaps (agg_engine.c) and the null fills a ragged parted group builds
+ * for one query (group.c, grp_synth_plain) stay within it. */
+#define AGG_COMPACT_BITMAP_BUDGET ((size_t)32 << 20)
+
 /* Read element `i` of integer/temporal/SYM data of `type` widened to int64;
  * a SYM element's width comes from `attrs` (a column's, or a range piece's). */
 static inline int64_t agg_read_key_i64_raw(int8_t type, uint8_t attrs, const void* data, int64_t i) {

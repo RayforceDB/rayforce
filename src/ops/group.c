@@ -33,6 +33,7 @@
 #include "vec/str.h"        /* ray_str_t SSO hash/eq for wide STR group keys */
 #include "ops/idxop.h"      /* RAY_IDX_DICT: group on persisted string codes */
 #include "store/enccol.h"    /* encoded-slot segments, decoded peek */
+#include "store/part.h"      /* ray_null_fill: a ragged stand-in's plain nulls */
 #include "core/runtime.h"   /* __VM — per-thread group-key cardinality hint */
 #include "core/profile.h"
 
@@ -171,6 +172,12 @@ int64_t ray_group_firstkeys_runs(void) {
 static _Atomic(int64_t) ray_group_segstream_runs_ctr = 0;
 int64_t ray_group_segstream_runs(void) {
     return atomic_load_explicit(&ray_group_segstream_runs_ctr, memory_order_relaxed);
+}
+
+/* Bytes of null fill built for ragged partitions' stand-ins (grp_synth_plain). */
+static _Atomic(int64_t) ray_group_null_fill_bytes_ctr = 0;
+int64_t ray_group_null_fill_bytes(void) {
+    return atomic_load_explicit(&ray_group_null_fill_bytes_ctr, memory_order_relaxed);
 }
 
 /* ============================================================================
@@ -10889,46 +10896,50 @@ static int g_group_test_route;   /* defined with ray_group_test_route below */
 
 /* A ragged partition's synthetic all-null segment `sg` (ray_read_parted's
  * stand-in for a column the partition lacks) as a plain vector: its
- * published materialization, or, known all null, a fill of the type's null
- * (never a decode).  NULL: not a synthetic segment, or a type without a
- * fixed width (the caller reads sg as it is); else an owned vector or error. */
-static ray_t* grp_synth_plain(ray_t* sg) {
-    if (!sg || sg->type != RAY_ENCCOL || !ray_enccol_is_synthetic(sg) || ray_enccol_is_parted(sg)) return NULL;
-    ray_t* pk = ray_enccol_decoded_peek(sg);
-    if (pk) { ray_retain(pk); return pk; }
+ * published materialization, or, known all null, ray_null_fill's vector
+ * (what its decode gives, never a decode).  The fill is transient, rows x
+ * width per query, so it is built only while it fits in *budget, the
+ * bytes of fill this query may still build (GRP_NULL_FILL_BUDGET), which it
+ * then spends.  NULL: not a synthetic segment, a type without a fixed width,
+ * or over the budget (the caller reads sg as it is, by range: the piece walk
+ * decodes one vector at a time into its scratch); else an owned vector or
+ * error. */
+#define GRP_NULL_FILL_BUDGET ((int64_t)AGG_COMPACT_BITMAP_BUDGET)
+static int64_t grp_synth_fill_bytes(ray_t* sg) {
+    if (!sg || sg->type != RAY_ENCCOL || !ray_enccol_is_synthetic(sg) || ray_enccol_is_parted(sg)) return -1;
+    if (ray_enccol_decoded_peek(sg)) return 0;
     ray_col_meta_t sm;
-    if (!ray_col_meta_of(sg, &sm)) return NULL;
-    int8_t base = sm.type;
-    switch (base) {
+    if (!ray_col_meta_of(sg, &sm)) return -1;
+    switch (sm.type) {
     case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
     case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: case RAY_F32: case RAY_F64: case RAY_SYM:
         break;
     default:
-        return NULL;
+        return -1;
     }
-    int64_t rows = sm.len;
-    ray_t* f = base == RAY_SYM ? ray_sym_vec_new(sm.attrs & RAY_SYM_W_MASK, rows > 0 ? rows : 1)
-                               : ray_vec_new(base, rows > 0 ? rows : 1);
-    if (!f || RAY_IS_ERR(f)) return f ? f : ray_error("oom", NULL);
-    f->len = rows;
-    void* p = ray_data(f);
-    switch (base) {
-    case RAY_F64: for (int64_t r = 0; r < rows; r++) ((double*)p)[r] = NULL_F64; break;
-    case RAY_F32: for (int64_t r = 0; r < rows; r++) ((float*)p)[r] = NULL_F32; break;
-    case RAY_I64: case RAY_TIMESTAMP: for (int64_t r = 0; r < rows; r++) ((int64_t*)p)[r] = NULL_I64; break;
-    case RAY_I32: case RAY_DATE: case RAY_TIME: for (int64_t r = 0; r < rows; r++) ((int32_t*)p)[r] = NULL_I32; break;
-    case RAY_I16: for (int64_t r = 0; r < rows; r++) ((int16_t*)p)[r] = NULL_I16; break;
-    default:      memset(p, 0, (size_t)rows * ray_sym_elem_size(base, f->attrs)); break;  /* SYM id 0, BOOL/U8 0 */
-    }
-    /* the materialization's attrs: HAS_NULLS on every nullable type */
-    if (base != RAY_BOOL && base != RAY_U8 && rows > 0) f->attrs |= RAY_ATTR_HAS_NULLS;
-    if (base == RAY_SYM) {
-        /* the stand-in's domain: the db's, the one every partition resolves over */
+    return sm.len * (int64_t)ray_sym_elem_size(sm.type, RAY_SYM_W8);
+}
+static ray_t* grp_synth_plain(ray_t* sg, int64_t* budget) {
+    int64_t bytes = grp_synth_fill_bytes(sg);
+    if (bytes < 0 || bytes > *budget) return NULL;
+    ray_t* pk = ray_enccol_decoded_peek(sg);
+    if (pk) { ray_retain(pk); return pk; }
+    ray_col_meta_t sm;
+    if (!ray_col_meta_of(sg, &sm)) return NULL;
+    ray_t* f;
+    if (sm.type == RAY_SYM) {
+        /* a SYM stand-in's domain: the db's, the one every partition resolves over */
         ray_col_src_t ss;
         ray_t* be = ray_col_src_bind(sg, &ss);
-        if (be) { ray_release(f); return be; }
-        if (ss.dom && ss.dom != ray_sym_runtime_domain()) { ray_sym_domain_retain(ss.dom); f->sym_domain = ss.dom; }
+        if (be) return be;
+        f = ray_null_fill(sm.type, sm.len, ss.dom && ss.dom != ray_sym_runtime_domain() ? ss.dom : NULL);
         ray_col_src_release(&ss);
+    } else {
+        f = ray_null_fill(sm.type, sm.len, NULL);
+    }
+    if (f && !RAY_IS_ERR(f)) {
+        *budget -= bytes;
+        atomic_fetch_add_explicit(&ray_group_null_fill_bytes_ctr, bytes, memory_order_relaxed);
     }
     return f;
 }
@@ -10937,15 +10948,25 @@ static ray_t* grp_synth_plain(ray_t* sg) {
  * segments are synthetic stand-ins) as a plain parted wrapper for the
  * in-place group: the plain segments as they are, each stand-in as
  * grp_synth_plain's vector.  The group then reads every segment in place on
- * the plain loops, as a column with no ragged partition does.  NULL: not
- * such a column, or a stand-in of a type grp_synth_plain leaves (the slot
- * is grouped as it is); else an owned wrapper or error. */
-static ray_t* grp_ragged_plain(ray_t* slot) {
+ * the plain loops, as a column with no ragged partition does.  *budget is
+ * the query's remaining fill budget, shared by its columns.  NULL: not such
+ * a column, a stand-in of a type grp_synth_plain leaves, or fills over the
+ * budget (the slot is grouped as it is, by the piece walk); else an owned
+ * wrapper or error. */
+static ray_t* grp_ragged_plain(ray_t* slot, int64_t* budget) {
     if (!slot || slot->type != RAY_ENCCOL || !ray_enccol_is_parted(slot) ||
         !ray_enccol_is_synthetic(slot)) return NULL;
     ray_col_meta_t m;
     if (!ray_col_meta_of(slot, &m) || !RAY_IS_PARTED(m.type)) return NULL;
-    int64_t ns = m.n_segs;
+    int64_t ns = m.n_segs, need = 0;
+    for (int64_t i = 0; i < ns; i++) {                  /* every stand-in fits, or none is filled */
+        ray_t* sg = ray_enccol_seg(slot, i);
+        if (!sg || sg->type != RAY_ENCCOL) continue;
+        int64_t b = grp_synth_fill_bytes(sg);
+        if (b < 0) return NULL;
+        need += b;
+    }
+    if (need > *budget) return NULL;
     ray_t* w = ray_alloc((size_t)(ns > 0 ? ns : 1) * sizeof(ray_t*));
     if (!w || RAY_IS_ERR(w)) return w ? w : ray_error("oom", NULL);
     w->type = m.type;
@@ -10958,7 +10979,7 @@ static ray_t* grp_ragged_plain(ray_t* slot) {
         ray_t* sg = ray_enccol_seg(slot, i);
         if (!sg) continue;
         if (sg->type != RAY_ENCCOL) { ray_retain(sg); segs[i] = sg; continue; }
-        ray_t* f = grp_synth_plain(sg);
+        ray_t* f = grp_synth_plain(sg, budget);
         if (!f || RAY_IS_ERR(f)) { ray_release(w); return f; }   /* NULL: the slot as it is */
         segs[i] = f;
     }
@@ -11331,13 +11352,14 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
     if (group_seg_stream_ok(g, op, ext, parted_tbl, group_limit)) {
         ray_t* in_place = ray_table_new((int64_t)n_keys + (int64_t)n_aggs);
         if (!in_place || RAY_IS_ERR(in_place)) return in_place ? in_place : ray_error("oom", NULL);
+        int64_t fill_budget = GRP_NULL_FILL_BUDGET;
         for (uint32_t i = 0; i < n_keys + n_aggs; i++) {
             ray_op_ext_t* e2 = find_ext(g, i < n_keys ? ext->keys[i] : ext->agg_ins[i - n_keys]);
             if (!e2 || e2->base.opcode != OP_SCAN) continue;               /* a count without input */
             ray_col_meta_t dm;
             if (ray_table_col_meta(in_place, e2->sym, &dm)) continue;      /* already added */
             ray_t* slot = ray_table_slot(parted_tbl, e2->sym);
-            ray_t* plain = grp_ragged_plain(slot);
+            ray_t* plain = grp_ragged_plain(slot, &fill_budget);
             if (plain && RAY_IS_ERR(plain)) { ray_release(in_place); return plain; }
             in_place = ray_table_add_col(in_place, e2->sym, plain ? plain : slot);
             if (plain) ray_release(plain);
@@ -19305,13 +19327,14 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
             if (!sub || RAY_IS_ERR(sub)) goto batch_fail;
 
             int64_t part_nrows = -1;
+            int64_t fill_budget = GRP_NULL_FILL_BUDGET;     /* one sub-table's fills live at a time */
             for (int j = 0; j < n_borrow; j++) {
                 ray_t* seg = ray_table_parted_seg(parted_tbl, borrow_syms[j], p);
                 if (!seg) { pp_release_sub(g, sub); goto batch_fail; }
                 if (part_nrows < 0) part_nrows = seg->len;
                 /* a ragged partition's synthetic segment: its nulls in place */
-                ray_t* fill = grp_synth_plain(seg);
-                if (fill && RAY_IS_ERR(fill)) { ray_error_free(fill); pp_release_sub(g, sub); goto batch_fail; }
+                ray_t* fill = grp_synth_plain(seg, &fill_budget);
+                if (fill && RAY_IS_ERR(fill)) { ret = fill; pp_release_sub(g, sub); goto batch_fail; }
                 if (!fill) ray_retain(seg);
                 sub = ray_table_add_col(sub, borrow_syms[j], fill ? fill : seg);
                 ray_release(fill ? fill : seg);

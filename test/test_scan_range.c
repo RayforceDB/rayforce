@@ -5740,6 +5740,29 @@ static test_result_t test_parted_expr_null_free(void) {
                             gen, qs[i].q, (long long)(ray_group_perpart_nn_slots() - n0), (long long)qs[i].nn);
         }
     }
+    /* Fix round 1: the pre-range-read base (80a28e49) answers this parted
+     * avg over the rows, an empty string a length-0 row: 2.5, 2.5,
+     * 2.4994285714, 2.5005714286, 2.5 (base's (* 1e7 a) as I64:
+     * 25000000 25000000 24994285 25005714 25000000).  Generation 0 and 2
+     * give exactly that value, per partition. */
+    int64_t lsum[5] = { 0 }, lcnt[5] = { 0 };
+    for (int p = 0; p < 3; p++)
+        for (int64_t i = 0; i < 35000; i++) {
+            lsum[i % 5] += i % 4 == 0 ? 0 : i % 3 == 0 ? 6 : 2;
+            lcnt[i % 5]++;
+        }
+    for (int gen = 0; gen <= 2; gen += 2) {
+        sr_evalf_ok("(set T (.db.parted.get \"" SR_TMP "/ne%d\" 't))", gen);
+        int64_t r0 = ray_group_perpart_runs();
+        ray_t* a = sr_eval("(at (select {a: (avg (strlen s)) from: T by: g asc: g}) 'a)");
+        TEST_ASSERT_FMT(ray_group_perpart_runs() > r0, "gen %d: not the per-partition route", gen);
+        TEST_ASSERT_FMT(a && !RAY_IS_ERR(a) && a->type == RAY_F64 && a->len == 5, "gen %d: avg (strlen s)", gen);
+        for (int k = 0; k < 5; k++)
+            TEST_ASSERT_FMT(((double*)ray_data(a))[k] == (double)lsum[k] / (double)lcnt[k],
+                            "gen %d group %d: %.17g, base %.17g", gen, k, ((double*)ray_data(a))[k],
+                            (double)lsum[k] / (double)lcnt[k]);
+        sr_drop(a);
+    }
     PASS();
 }
 
@@ -5853,6 +5876,9 @@ static test_result_t test_strlen_str_gen2_routes(void) {
 static test_result_t test_ragged_gen0_no_decode(void) {
     sr_parted_xy(SR_TMP "/rnd", 0, true, false);
     sr_parted_xy(SR_TMP "/rnf", 0, false, true);
+    /* skips: the stand-in's 70000 rows are 69 morsels, each decided by the
+     * all-null rule (the real partitions' y spans 0..96 in every chunk, so
+     * no other morsel is decided); fill: the group's null fill, 70000 I64 */
     static const char* const q[] = {
         "(count (select {from: T where: (!= y 0)}))",
         "(count (select {from: T where: (== y 5)}))",
@@ -5868,16 +5894,84 @@ static test_result_t test_ragged_gen0_no_decode(void) {
         "(select {s: (sum x) from: T by: y desc: s take: 4})",
         NULL,
     };
+    static const int64_t skips[] = { 69, 69, 69, 69, 69, 69, 0, 69, 0, 0, 0, 0 };
+    static const int64_t fill[]  = { 0, 0, 0, 0, 0, 0, 0, 0, 560000, 560000, 560000, 560000 };
     for (int i = 0; q[i]; i++) {
         sr_eval_ok("(set T (.db.parted.get \"" SR_TMP "/rnf\" 't))");
         ray_t* r0 = sr_eval(q[i]);
         sr_eval_ok("(set T (.db.parted.get \"" SR_TMP "/rnd\" 't))");
         ray_enc_counters_reset();
+        int64_t z0 = ray_expr_test_zone_skips(), f0 = ray_group_null_fill_bytes();
         ray_t* r1 = sr_eval(q[i]);
         ray_enc_counters_t k; ray_enc_counters_get(&k);
         TEST_ASSERT_FMT(sr_same_text(r0, r1), "ragged: %s", q[i]);
         TEST_ASSERT_FMT(k.decoded_bytes == 0 && k.materialized == 0, "%s: %llu bytes decoded, %llu materialized",
                         q[i], (unsigned long long)k.decoded_bytes, (unsigned long long)k.materialized);
+        int64_t dz = ray_expr_test_zone_skips() - z0, df = ray_group_null_fill_bytes() - f0;
+        TEST_ASSERT_FMT(dz == skips[i], "%s: %lld morsels decided from statistics, want %lld", q[i],
+                        (long long)dz, (long long)skips[i]);
+        TEST_ASSERT_FMT(df == fill[i], "%s: %lld bytes of null fill, want %lld", q[i], (long long)df, (long long)fill[i]);
+        sr_drop(r0); sr_drop(r1);
+    }
+    /* Fix round 1: the all-null rules trust only a synthetic stand-in.  The
+     * same nulls saved encoded (the reference's third partition, generation
+     * 2) are decoded, and so validated, though their directory says every
+     * row is null: no morsel is decided by the rule, and the answer is the
+     * same. */
+    sr_parted_xy(SR_TMP "/rne", 4, false, true);
+    for (int i = 0; i < 6; i++) {
+        sr_eval_ok("(set T (.db.parted.get \"" SR_TMP "/rnf\" 't))");
+        ray_t* r0 = sr_eval(q[i]);
+        sr_eval_ok("(set T (.db.parted.get \"" SR_TMP "/rne\" 't))");
+        ray_enc_counters_reset();
+        int64_t z0 = ray_expr_test_zone_skips();
+        ray_t* r1 = sr_eval(q[i]);
+        ray_enc_counters_t k; ray_enc_counters_get(&k);
+        TEST_ASSERT_FMT(sr_same_text(r0, r1), "saved nulls: %s", q[i]);
+        TEST_ASSERT_FMT(ray_expr_test_zone_skips() == z0 && k.decoded_bytes > 0,
+                        "saved nulls %s: %lld morsels decided, %llu bytes decoded", q[i],
+                        (long long)(ray_expr_test_zone_skips() - z0), (unsigned long long)k.decoded_bytes);
+        sr_drop(r0); sr_drop(r1);
+    }
+    PASS();
+}
+
+/* Fix round 1 of Task 17d: the group's null fill for a ragged stand-in is
+ * transient memory of rows x width, so one query builds at most the group's
+ * transient budget (AGG_COMPACT_BITMAP_BUDGET) of it.  A stand-in of more
+ * rows than that holds of I64 is grouped by the piece walk instead: no fill
+ * byte, nothing materialized, the explicit-null reference's answers, on the
+ * in-place group and per partition. */
+static test_result_t test_ragged_fill_bounded(void) {
+    const int64_t big = (int64_t)(AGG_COMPACT_BITMAP_BUDGET / sizeof(int64_t)) + 65536;
+    for (int ref = 0; ref < 2; ref++) {
+        const char* root = ref ? SR_TMP "/rbf" : SR_TMP "/rbd";
+        sr_evalf_ok("(.db.splayed.set \"%s/2024.01.01/t/\" (table [x y] (list (%% (til 70000) 7) (%% (til 70000) 97))) "
+                    "{compress: false})", root);
+        sr_evalf_ok("(.db.splayed.set \"%s/2024.01.02/t/\" %s {compress: false})", root,
+                    ref ? "(table [x y] (list (% (til 4259840) 7) (take [0Nl] 4259840)))"
+                        : "(table [x] (list (% (til 4259840) 7)))");
+    }
+    TEST_ASSERT_FMT(big == 4259840, "budget rows %lld: update the partition size", (long long)big);
+    static const char* const q[] = {
+        "(select {s: (sum y) c: (count y) from: T by: x asc: x})",        /* in place */
+        "(select {s: (sum y) c: (count y) a: (avg y) from: T by: x asc: x})",
+        "(select {c: (count x) s: (sum x) from: T by: y asc: y take: 3})",
+        "(select {s: (sum x) from: T by: y desc: s take: 4})",
+        NULL,
+    };
+    for (int i = 0; q[i]; i++) {
+        sr_eval_ok("(set T (.db.parted.get \"" SR_TMP "/rbf\" 't))");
+        ray_t* r0 = sr_eval(q[i]);
+        sr_eval_ok("(set T (.db.parted.get \"" SR_TMP "/rbd\" 't))");
+        ray_enc_counters_reset();
+        int64_t f0 = ray_group_null_fill_bytes();
+        ray_t* r1 = sr_eval(q[i]);
+        ray_enc_counters_t k; ray_enc_counters_get(&k);
+        TEST_ASSERT_FMT(sr_same_text(r0, r1), "ragged: %s", q[i]);
+        TEST_ASSERT_FMT(ray_group_null_fill_bytes() == f0, "%s: %lld bytes of null fill over the budget", q[i],
+                        (long long)(ray_group_null_fill_bytes() - f0));
+        TEST_ASSERT_FMT(k.materialized == 0, "%s: %llu materialized", q[i], (unsigned long long)k.materialized);
         sr_drop(r0); sr_drop(r1);
     }
     PASS();
@@ -6012,6 +6106,7 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/parted_expr_null_free", test_parted_expr_null_free, srr_setup, srr_teardown },
     { "scanrange/strlen_str_gen2_routes", test_strlen_str_gen2_routes, sr_rt_setup, sr_rt_teardown },
     { "scanrange/ragged_gen0_no_decode", test_ragged_gen0_no_decode, srr_setup, srr_teardown },
+    { "scanrange/ragged_fill_bounded",   test_ragged_fill_bounded,   srr_setup, srr_teardown },
     { "scanrange/const_beside_parted_group", test_const_beside_parted_group, srr_setup, srr_teardown },
     { NULL, NULL, NULL, NULL },
 };

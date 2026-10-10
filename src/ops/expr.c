@@ -1858,14 +1858,22 @@ static void expr_exec_unary(uint8_t opcode, uint8_t null_aware, int8_t dt, void*
     }
 }
 
-/* Encoded register r's rows [start, start + n) inside one directory chunk
- * whose every row is null: fill dst with what the decode and expr_load_*
- * would give (the widened null, or the raw sentinel for a register compiled
- * null-free) and return true, reading no payload.  False: not such a chunk,
- * or a type this does not cover (the range read runs). */
+/* A ragged partition's synthetic stand-in (ray_read_parted's all-null
+ * segment, built in memory): the only source whose directory the all-null
+ * rules below trust.  A chunk of a column saved encoded is decoded, and so
+ * validated, even when its directory says every row is null. */
+static inline bool expr_src_synthetic(const ray_col_src_t* src) {
+    return ray_col_src_encoded(src) && ray_enccol_is_synthetic(src->obj);
+}
+
+/* Encoded register r's rows [start, start + n) inside one chunk of a
+ * synthetic stand-in whose every row is null: fill dst with what the decode
+ * and expr_load_* would give (the widened null, or the raw sentinel for a
+ * register compiled null-free) and return true, reading no payload.  False:
+ * not such a chunk, or a type this does not cover (the range read runs). */
 static bool expr_enc_null_fill(const ray_expr_t* expr, uint8_t r, int64_t start, int64_t n, void* dst) {
     const __typeof__(expr->regs[0])* rg = &expr->regs[r];
-    if ((start >> 16) != ((start + n - 1) >> 16)) return false;
+    if ((start >> 16) != ((start + n - 1) >> 16) || !expr_src_synthetic(rg->src)) return false;
     int8_t ct = rg->col_type, rt = rg->type;
     int64_t raw;
     switch (ct) {
@@ -2053,18 +2061,17 @@ static int zone_cmp_decision(const ray_index_t* ix, int64_t ch,
     return d < 0 ? ZT_MIXED : d;
 }
 
-/* (null cmp_op cval) for a chunk whose every row is null (a ragged
- * partition's synthetic segment, an all-null chunk): every lane loads as
- * NULL_I64, and both the null-aware and the plain i64 kernels give one
- * answer for it, decided by whether cval is itself NULL_I64. */
+/* (null cmp_op cval) for a chunk of a synthetic stand-in whose every row is
+ * null: every lane loads as NULL_I64, which both the null-aware and the
+ * plain i64 kernels rank below every value, so null == c, null > c and
+ * null >= c fail and null != c, null < c and null <= c pass.  A null
+ * constant is left to the kernel. */
 static int zone_all_null_decision(uint16_t cmp_op, int64_t cval) {
-    bool cn = cval == NULL_I64;
+    if (cval == NULL_I64) return ZT_MIXED;
     switch (cmp_op) {
-    case OP_EQ: case OP_GE: return cn ? 1 : 0;
-    case OP_NE: case OP_LT: return cn ? 0 : 1;
-    case OP_LE:             return 1;
-    case OP_GT:             return 0;
-    default:                return ZT_MIXED;
+    case OP_EQ: case OP_GT: case OP_GE: return 0;
+    case OP_NE: case OP_LT: case OP_LE: return 1;
+    default:                            return ZT_MIXED;
     }
 }
 
@@ -2077,7 +2084,7 @@ static int zone_dir_decision(const ray_col_src_t* src, int64_t ch, uint16_t cmp_
     ray_enc_chunk_stat_t st;
     if (!ray_col_src_chunk_stat(src, ch, &st)) return ZT_MIXED;
     bool all_null = (int64_t)st.null_count == st.rows;
-    if (all_null && st.rows > 0) return zone_all_null_decision(cmp_op, cval);
+    if (all_null && st.rows > 0 && expr_src_synthetic(src)) return zone_all_null_decision(cmp_op, cval);
     int d = zone_cmp_core(st.min, st.max, st.has_minmax, st.null_count > 0, all_null, cmp_op, cval);
     return d < 0 ? ZT_MIXED : d;
 }
@@ -2174,6 +2181,9 @@ typedef struct {
                                         * segment's first row, so keys are global */
 } expr_full_ctx_t;
 
+static _Atomic(int64_t) g_expr_zone_skips;      /* test hook */
+int64_t ray_expr_test_zone_skips(void) { return atomic_load_explicit(&g_expr_zone_skips, memory_order_relaxed); }
+
 static void expr_full_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
     (void)worker_id;
     expr_full_ctx_t* c = (expr_full_ctx_t*)ctx;
@@ -2206,6 +2216,7 @@ static void expr_full_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t e
     /* Chunk-zone skip is only possible for a BOOL predicate over a zone-
      * indexed column; compute the gate once, not per morsel. */
     bool zone = expr_zone_eligible(expr);
+    int64_t skips = 0;
 
     /* Fused selection-output mode: resolve this task's builder + its first
      * global segment once.  Task boundaries are morsel-aligned because
@@ -2230,6 +2241,7 @@ static void expr_full_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t e
         if (zone) {
             int d = expr_zone_decide(expr, ms, me);
             if (d >= 0) {  /* whole morsel decided from extrema — skip the read */
+                skips++;
                 if (sb) {
                     /* Emit a uniform ALL (d=1) / NONE (d=0) segment: memset a
                      * scratch bool buffer (unused on this branch — no eval ran)
@@ -2262,6 +2274,7 @@ static void expr_full_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t e
     }
     if (rsc) for (uint8_t r = 0; r < expr->n_regs; r++) ray_col_scratch_free(&rsc[r]);
     scratch_free(scratch_hdr);
+    if (skips) atomic_fetch_add_explicit(&g_expr_zone_skips, skips, memory_order_relaxed);
 }
 
 /* Post-pass for the fused unary path: |INT64_MIN| and -INT64_MIN don't fit in

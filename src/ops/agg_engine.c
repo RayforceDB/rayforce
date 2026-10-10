@@ -754,7 +754,6 @@ static void agg_key_bounds_parallel(ray_t* key, int64_t rows, bool nullable,
  * bounded (AGG_COMPACT_MAX_RANGE codes) are compacted. */
 enum { AGG_COMPACT_MAX_RANGE = 1 << 22,   /* largest per-key remap table (codes) */
        AGG_COMPACT_TRY_SLOTS = 1 << 16 };  /* raw products above this try compaction */
-#define AGG_COMPACT_BITMAP_BUDGET ((size_t)32 << 20)   /* transient per-task bitmaps */
 
 typedef struct {
     const agg_rr_t* krr;     /* the keys; staged ones are read by pieces */
