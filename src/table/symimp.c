@@ -35,6 +35,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <stdlib.h>   /* getenv: whether the counts are kept */
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -101,6 +102,7 @@ struct ray_symimp_s {
                                     * read there; a lookup reads it after
                                     * registering in active[] (si_batch) */
     si_shard_t shards[SI_SHARDS];
+    bool     stats;                /* RAY_CSV_TRACE at create: the counts below are kept */
     _Atomic(int64_t) st[SI_ST_N];  /* ray_symimp_stats, past what lookups read */
 };
 
@@ -129,17 +131,19 @@ static inline bool si_eq(const ray_symimp_t* m, int64_t pos, const char* s, size
     return l == len && (len == 0 || memcmp(r + 4, s, len) == 0);
 }
 
-static int64_t si_find(const ray_symimp_t* m, const si_tab_t* t, uint32_t tag,
-                       const char* s, size_t len, int64_t* st) {
+/* A lookup in shard table t.  st NULL: no counts; si_find is inlined, so a
+ * caller passing NULL as such has none of them in its probe loop. */
+RAY_INLINE int64_t si_find(const ray_symimp_t* m, const si_tab_t* t, uint32_t tag,
+                          const char* s, size_t len, int64_t* st) {
     uint64_t slot = tag & t->mask;
     for (;;) {
         uint64_t e = atomic_load_explicit(&t->e[slot], memory_order_acquire);
-        st[SI_ST_SLOTS]++;
+        if (st) st[SI_ST_SLOTS]++;
         if (!e) return -1;
         if ((uint32_t)(e >> 32) == tag) {
             int64_t pos = (int64_t)(uint32_t)e - 1;
             if (si_eq(m, pos, s, len)) return pos;
-            st[SI_ST_FALSE]++;
+            if (st) st[SI_ST_FALSE]++;
         }
         slot = (slot + 1) & t->mask;
     }
@@ -194,8 +198,7 @@ static int64_t si_add(ray_symimp_t* m, si_shard_t* sh, uint32_t tag, const char*
     if ((uint64_t)(sh->used + 1) * 2 > t->mask + 1) {
         si_tab_t* nt = si_tab_new((t->mask + 1) * 2);
         if (!nt) return -1;
-        st[SI_ST_GROWS]++;
-        st[SI_ST_GROWB] += (int64_t)((t->mask + 1) * sizeof(uint64_t));
+        if (st) { st[SI_ST_GROWS]++; st[SI_ST_GROWB] += (int64_t)((t->mask + 1) * sizeof(uint64_t)); }
         for (uint64_t i = 0; i <= t->mask; i++) {
             uint64_t e = atomic_load_explicit(&t->e[i], memory_order_relaxed);
             if (e) si_put(nt, e);
@@ -212,7 +215,7 @@ static int64_t si_add(ray_symimp_t* m, si_shard_t* sh, uint32_t tag, const char*
     if (len) memcpy(m->map + off + 4, s, len);
     si_put(t, ((uint64_t)tag << 32) | (uint64_t)(pos + 1));
     sh->used++;
-    st[SI_ST_ADDED]++;
+    if (st) st[SI_ST_ADDED]++;
     return pos;
 }
 
@@ -226,6 +229,22 @@ static si_tab_t* si_reclaim(ray_symimp_t* m) {
     m->retired[(e + 1) & 1] = NULL;
     atomic_store_explicit(&m->epoch, e + 1, memory_order_seq_cst);
     return done;
+}
+
+/* The lock-free lookups of a batch's first occurrences; its misses.  st
+ * NULL: no counts (inlined into each call, so that loop has none). */
+RAY_INLINE int64_t si_lookups(const ray_symimp_t* m, int64_t n, const char* const* strs, const size_t* lens,
+                              const uint64_t* hashes, const uint16_t* first, int64_t* out_pos, int64_t* st) {
+    int64_t miss = 0;
+    for (int64_t i = 0; i < n; i++) {
+        if (first[i] != i) continue;
+        const si_shard_t* sh = &m->shards[si_shard_of(hashes[i])];
+        out_pos[i] = si_find(m, atomic_load_explicit(&sh->tab, memory_order_acquire), (uint32_t)hashes[i],
+                             strs[i] ? strs[i] : "", strs[i] ? lens[i] : 0, st);
+        if (st) st[SI_ST_PROBES]++;
+        if (out_pos[i] < 0) miss++;
+    }
+    return miss;
 }
 
 /* Up to SI_BATCH strings.  Equal strings of the batch are looked up once
@@ -274,18 +293,16 @@ static bool si_batch(ray_symimp_t* m, int64_t n, const char* const* strs,
         atomic_fetch_sub_explicit(&m->active[e & 1], 1, memory_order_release);
         return false;
     }
-    for (int64_t i = 0; i < n; i++) {
-        if (first[i] != i) continue;
-        si_shard_t* sh = &m->shards[si_shard_of(hashes[i])];
-        out_pos[i] = si_find(m, atomic_load_explicit(&sh->tab, memory_order_acquire), (uint32_t)hashes[i],
-                             strs[i] ? strs[i] : "", strs[i] ? lens[i] : 0, st);
-        st[SI_ST_PROBES]++;
-        if (out_pos[i] < 0) miss++;
-    }
+    /* the counts only when kept (ray_symimp_stats, RAY_CSV_TRACE at create):
+     * otherwise a lookup touches none of them */
+    int64_t* sp = m->stats ? st : NULL;
+    miss = sp ? si_lookups(m,n,strs,lens,hashes,first,out_pos,st) : si_lookups(m,n,strs,lens,hashes,first,out_pos,NULL);
     atomic_fetch_sub_explicit(&m->active[e & 1], 1, memory_order_release);
-    st[SI_ST_STRINGS] = n;
-    st[SI_ST_DEDUP] = n - st[SI_ST_PROBES];
-    st[SI_ST_HITS] = st[SI_ST_PROBES] - miss;
+    if (sp) {
+        st[SI_ST_STRINGS] = n;
+        st[SI_ST_DEDUP] = n - st[SI_ST_PROBES];
+        st[SI_ST_HITS] = st[SI_ST_PROBES] - miss;
+    }
     bool ok = true;
     si_tab_t* done = NULL;
     if (miss) {
@@ -298,15 +315,15 @@ static bool si_batch(ray_symimp_t* m, int64_t n, const char* const* strs,
             const char* s = strs[i] ? strs[i] : "";
             size_t len = strs[i] ? lens[i] : 0;
             si_shard_t* sh = &m->shards[si_shard_of(hashes[i])];
-            int64_t pos = si_find(m, atomic_load_explicit(&sh->tab, memory_order_relaxed), tag, s, len, st);
-            if (pos < 0) pos = si_add(m, sh, tag, s, len, st);
+            int64_t pos = si_find(m, atomic_load_explicit(&sh->tab, memory_order_relaxed), tag, s, len, sp);
+            if (pos < 0) pos = si_add(m, sh, tag, s, len, sp);
             if (pos < 0) ok = false;
             else out_pos[i] = pos;
         }
         done = si_reclaim(m);
         pthread_mutex_unlock(&m->alock);
     }
-    for (int k = 0; k < SI_ST_N; k++)
+    for (int k = 0; sp && k < SI_ST_N; k++)
         if (st[k]) atomic_fetch_add_explicit(&m->st[k], st[k], memory_order_relaxed);
     for (si_tab_t* t = done; t;) { si_tab_t* nx = t->next; ray_sys_free(t); t = nx; }
     for (int64_t i = 0; ok && i < n; i++) if (first[i] != i) out_pos[i] = out_pos[first[i]];
@@ -424,6 +441,7 @@ ray_symimp_t* ray_symimp_create(const char* path, _Atomic(int64_t)* count) {
     atomic_init(&m->active[1], 0);
     atomic_init(&m->reserved, false);
     for (int k = 0; k < SI_ST_N; k++) atomic_init(&m->st[k], 0);
+    m->stats = getenv("RAY_CSV_TRACE") != NULL;   /* the converters' trace: its only reader */
     m->fd = -1;
     m->count_out = count;
     size_t pl = strlen(path);

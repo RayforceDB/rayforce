@@ -58,8 +58,10 @@ ray_err_t ray_symimp_sync(ray_symimp_t* m, bool durable);
 void ray_symimp_free(ray_symimp_t* m);
 
 /* What the interning did, for the converters' RAY_CSV_TRACE: the counts
- * since the last call (which resets them), then the sizes now.  Counted
- * per batch whether or not anyone reads them. */
+ * since the last call (which resets them), then the sizes now.  The counts
+ * are kept only for a dictionary created under RAY_CSV_TRACE, their only
+ * reader (zero otherwise: the lookups then touch none of them); the sizes
+ * always. */
 typedef struct ray_symimp_stats_s {
     int64_t strings;     /* strings interned */
     int64_t dedup;       /* of them repeats inside their batch */

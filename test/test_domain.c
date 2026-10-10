@@ -1,3 +1,6 @@
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L  /* setenv / unsetenv: the import dictionary's trace flag */
+#endif
 /*
  *   Copyright (c) 2025-2026 Anton Kundenko <singaraiona@gmail.com>
  *   All rights reserved.
@@ -49,6 +52,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <stdlib.h>   /* setenv */
 #include <stdatomic.h>
 
 #define TMP_DOM_SYM_PATH "/tmp/rayforce_test_domain_sym"
@@ -2398,13 +2402,25 @@ static test_result_t test_domain_import_dict_reclaim(void) {
  * single tag matching another string; 64 strings sharing one whole hash all
  * get positions of their own and are found by their bytes.  Every position
  * survives a re-intern, and the 32-bit entry point, which hashes again,
- * finds strings the 64-bit one added under their real hashes. */
+ * finds strings the 64-bit one added under their real hashes.  The counts
+ * are kept for a dictionary made under the converters' trace (RAY_CSV_TRACE
+ * at create, set here for it); one made without it keeps none, its
+ * positions the same. */
+static void imp_trace_env(bool on) {
+#if defined(_WIN32)
+    _putenv_s("RAY_CSV_TRACE", on ? "1" : "");
+#else
+    if (on) setenv("RAY_CSV_TRACE", "1", 1); else unsetenv("RAY_CSV_TRACE");
+#endif
+}
 #define IMP_SPREAD 1024
 #define IMP_SAME   64
 static test_result_t test_domain_import_dict_tags(void) {
     const char* p = TMP_DOM_SYM_PATH "_impt";
     unlink(p);
+    imp_trace_env(true);
     ray_sym_domain_t* dom = ray_sym_domain_create_import(p);
+    imp_trace_env(false);
     if (!dom) SKIP("import dictionary unsupported here");
     enum { N = IMP_SPREAD + IMP_SAME };
     static char bufs[N][32];
@@ -2446,6 +2462,20 @@ static test_result_t test_domain_import_dict_tags(void) {
     TEST_ASSERT_EQ_I(r64, N + 1);
     TEST_ASSERT_EQ_I(r32, r64);
     TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom, real, rl), r64);
+    ray_sym_domain_release(dom);
+    unlink(p);
+    unlink(TMP_DOM_SYM_PATH "_impt.lk");
+    /* made without the trace: the same positions, no counts */
+    dom = ray_sym_domain_create_import(p);
+    TEST_ASSERT_NOT_NULL(dom);
+    TEST_ASSERT_TRUE(ray_sym_domain_intern_batch64(dom, IMP_SPREAD, strs, lens, hs, again));
+    for (int i = IMP_SPREAD; i < N; i++)
+        TEST_ASSERT_TRUE(ray_sym_domain_intern_batch64(dom, 1, strs + i, lens + i, hs + i, again + i));
+    TEST_ASSERT_TRUE(ray_sym_domain_intern_batch64(dom, N, strs, lens, hs, again));
+    for (int i = 0; i < N; i++) TEST_ASSERT_EQ_I(again[i], pos[i]);
+    TEST_ASSERT_TRUE(ray_sym_domain_import_stats(dom, &st));
+    TEST_ASSERT_EQ_I(st.strings + st.probes + st.hits + st.added + st.slots + st.false_tags + st.grows, 0);
+    TEST_ASSERT_EQ_I(st.count, N + 1);
     ray_sym_domain_release(dom);
     unlink(p);
     unlink(TMP_DOM_SYM_PATH "_impt.lk");
