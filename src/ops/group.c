@@ -11988,8 +11988,6 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             g->table = tbl;
             ray_t* vec = exec_node(g, key_op);
             g->table = saved_table;
-            if (vec && !RAY_IS_ERR(vec) && ray_is_lazy(vec))
-                vec = ray_lazy_materialize(vec);
             /* A name bound to a function (`by: sum`) or to null is no value
              * to group on; ray_is_atom counts both as one, and the broadcast
              * below failed on their type. */
