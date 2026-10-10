@@ -50,6 +50,7 @@
 #include "mem/sys.h"
 #include "table/sym.h"
 #include "table/domain.h"
+#include "ops/hash.h"     /* ray_hash_bytes: the import dictionary's full hashes */
 #include "vec/str.h"
 
 #ifndef RAY_OS_WINDOWS
@@ -2075,6 +2076,65 @@ static test_result_t test_stream_sym_chunks(void) {
     PASS();
 }
 
+/* STR chunks into a SYM writer: interned into the writer's domain, a batch
+ * of 8192 at a time.  The same 20000 strings (a few hundred distinct, "",
+ * repeats across batches) into a file domain and into an import dictionary
+ * domain (the direct import's, which keys on all 64 bits of the hash) give
+ * the same positions, first occurrence first; and the import dictionary
+ * then finds every string under its full hash (none added again). */
+static test_result_t test_stream_sym_from_str(void) {
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-stream-str-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    const int64_t n = 20000;
+    ray_t* col = ray_vec_new(RAY_STR, n);
+    TEST_ASSERT_FALSE(!col || RAY_IS_ERR(col));
+    char buf[64];
+    for (int64_t i = 0; i < n; i++) {
+        int len = i % 97 == 0 ? 0 : snprintf(buf, sizeof(buf), "%s-%lld", i % 3 ? "a string past the inline bytes" : "s",
+                                             (long long)((i * 7919) % 300));
+        col = ray_str_vec_append(col, buf, (size_t)len);
+        TEST_ASSERT_FALSE(!col || RAY_IS_ERR(col));
+    }
+    uint32_t* back[2] = {NULL, NULL};
+    char sp[200], path[200];
+    ray_sym_domain_t* dom[2] = {NULL, NULL};
+    for (int k = 0; k < 2; k++) {
+        snprintf(sp, sizeof(sp), "%s/.sym%d", dir, k);
+        dom[k] = k ? ray_sym_domain_create_import(sp) : ray_sym_domain_open_or_create(sp);
+        if (!dom[k]) { TEST_ASSERT_EQ_I(k, 1); break; }   /* no import dictionary here */
+        TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom[k], "", 0), 0);
+        ray_col_stream_t w;
+        TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern(k ? "i" : "f", 1), RAY_SYM, dom[k]), RAY_OK);
+        TEST_ASSERT_EQ_I(ray_col_stream_append(&w, col), RAY_OK);
+        TEST_ASSERT_EQ_I(ray_col_stream_close(&w, false), RAY_OK);
+        back[k] = (uint32_t*)ray_sys_alloc((size_t)n * sizeof(uint32_t));
+        TEST_ASSERT_NOT_NULL(back[k]);
+        ray_t hdr;
+        snprintf(path, sizeof(path), "%s/%s", dir, k ? "i" : "f");
+        TEST_ASSERT_TRUE(stream_sym_read(path, &hdr, back[k], n));
+        TEST_ASSERT_EQ_I(hdr.len, n);
+        TEST_ASSERT_TRUE(hdr.attrs & RAY_ATTR_HAS_NULLS);
+    }
+    int64_t bad = 0;
+    if (dom[1]) {
+        for (int64_t i = 0; i < n; i++) if (back[0][i] != back[1][i]) { bad++; break; }
+        /* every string found again under its full hash, at its position */
+        int64_t before = ray_sym_domain_count(dom[1]);
+        for (int64_t i = 0; i < n && !bad; i++) {
+            size_t len; const char* s = ray_str_vec_get(col, i, &len);
+            uint64_t h = ray_hash_bytes(s, len);
+            int64_t pos = -1;
+            if (!ray_sym_domain_intern_batch64(dom[1], 1, &s, &len, &h, &pos) || pos != (int64_t)back[1][i]) bad++;
+        }
+        if (ray_sym_domain_count(dom[1]) != before) bad++;
+    }
+    for (int k = 0; k < 2; k++) { if (dom[k]) ray_sym_domain_release(dom[k]); ray_sys_free(back[k]); }
+    ray_release(col);
+    (void)ray_test_rm_rf(dir);
+    TEST_ASSERT_EQ_I(bad, 0);
+    if (!dom[1]) SKIP("import dictionary unsupported here: the file domain only");
+    PASS();
+}
 /* A W32 chunk over another symbol file's domain is re-encoded string by
  * string, at the writer's own width as at any other: its positions mean
  * nothing in the writer's domain (the other file holds the same words in
@@ -6998,6 +7058,7 @@ const test_entry_t store_entries[] = {
     { "store/zone_acc_sentinel_without_flag", test_zone_acc_sentinel_without_flag, store_setup, store_teardown },
     { "store/stream_sentinel_has_nulls", test_stream_sentinel_publishes_has_nulls, store_setup, store_teardown },
     { "store/stream_sym_chunks", test_stream_sym_chunks, store_setup, store_teardown },
+    { "store/stream_sym_from_str", test_stream_sym_from_str, store_setup, store_teardown },
     { "store/stream_sym_foreign", test_stream_sym_foreign, store_setup, store_teardown },
     { "store/stream_sym_lut_stale", test_stream_sym_lut_stale, store_setup, store_teardown },
     { "store/stream_index_write_failure", test_stream_index_write_failure_drops_index, store_setup, store_teardown },
