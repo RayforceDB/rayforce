@@ -43,12 +43,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>    /* the lazily read page size and read-ahead step */
 #if defined(RAY_OS_MACOS)
 #include <sys/sysctl.h>   /* sysctlbyname — hw.physicalcpu */
 #endif
 #if defined(RAY_OS_LINUX)
 #include <dirent.h>       /* /sys/block — the read-ahead caps */
-#include <stdatomic.h>
 #endif
 #include "mem/sys.h"
 
@@ -118,11 +118,15 @@ void ray_vm_advise_seq(void* ptr, size_t size) {
     if (ptr) madvise(ptr, size, MADV_SEQUENTIAL);
 }
 
+/* Read once, from whichever thread asks first: the threads that race on it
+ * all store the same value, relaxed. */
 static size_t vm_page_size(void) {
-    static size_t pg = 0;
+    static _Atomic(size_t) cached = 0;
+    size_t pg = atomic_load_explicit(&cached, memory_order_relaxed);
     if (pg == 0) {
         long ps = sysconf(_SC_PAGESIZE);
         pg = (ps > 0) ? (size_t)ps : 4096;
+        atomic_store_explicit(&cached, pg, memory_order_relaxed);
     }
     return pg;
 }
@@ -246,11 +250,7 @@ void ray_vm_release_block(void* blk, size_t bsize, bool hugepage) {
          * read back as zero and the next GC freelist walk crashed on a
          * NULL link (issue #240).  Rounding inward to page-aligned bounds
          * makes the kernel's own rounding a no-op on every platform. */
-        static size_t pg = 0;
-        if (pg == 0) {
-            long ps = sysconf(_SC_PAGESIZE);
-            pg = (ps > 0) ? (size_t)ps : 4096;
-        }
+        size_t pg = vm_page_size();
         uintptr_t s = ((uintptr_t)blk + 32 + (pg - 1)) & ~(uintptr_t)(pg - 1);
         uintptr_t e = ((uintptr_t)blk + bsize) & ~(uintptr_t)(pg - 1);
         if (e > s) ray_vm_release((void*)s, e - s);
