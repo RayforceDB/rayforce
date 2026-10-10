@@ -33,6 +33,14 @@
 (probe (fn [p] (count (select {from: (mk p) where: (> rid 3) asc: v}))) 5 60) -- true
 (probe (fn [p] (count (select {from: (mk p) by: instrument s: (sum v) asc: s}))) 5 60) -- true
 (probe (fn [p] (count (select {from: (mk p) by: instrument s: (sum v) desc: s take: 3}))) 5 60) -- true
+;; a grouped select with a where: and no outputs: the fused filter keeps a
+;; reference to its selection for the count(distinct) scatter, released at
+;; the end of the select, which the no-output branch returns before.  One
+;; selection per call, empty result included.
+(set TW (table [x y] (list (% (til 100) 7) (til 100))))
+(probe (fn [p] (count (select {by: x from: TW where: (> y 38)}))) 5 1000) -- true
+(probe (fn [p] (count (select {by: (* x 2) from: TW where: (> y 38)}))) 5 1000) -- true
+(probe (fn [p] (count (select {by: x from: TW where: (> y 1000)}))) 5 1000) -- true
 ;; the same table reused across calls must not be released twice: the
 ;; result is still right after many calls
 (set T (mk 1))

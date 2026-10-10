@@ -13035,6 +13035,10 @@ by_dict_done:
             /* No explicit aggregations — apply WHERE filter first (if any),
              * then use DAG GROUP+COUNT for fast hash-parallel group boundaries,
              * then gather first-of-group from the filtered table. */
+            /* The fused WHERE above kept a reference to its selection for the
+             * count(distinct) scatter; this branch has no outputs and returns
+             * before the release at the end of the select. */
+            if (saved_selection) { ray_release(saved_selection); saved_selection = NULL; }
             ray_t* filtered_tbl = tbl;
             if (where_expr) {
                 root = ray_optimize(g, root);
