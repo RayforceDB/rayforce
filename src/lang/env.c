@@ -472,13 +472,7 @@ static ray_t* env_lookup_flat_impl(int64_t sym_id, uint8_t* rows, bool in_callee
     return env_global_lookup(sym_id);
 }
 
-static ray_t* env_lookup_flat_rows(int64_t sym_id, uint8_t* rows) {
-    return env_lookup_flat_impl(sym_id, rows, false);
-}
 
-static ray_t* env_lookup_flat(int64_t sym_id) {
-    return env_lookup_flat_rows(sym_id, NULL);
-}
 
 ray_t* ray_env_get_local(int64_t sym_id) {
     if (!__VM) return NULL;
@@ -491,12 +485,23 @@ ray_t* ray_env_get_local(int64_t sym_id) {
     return NULL;
 }
 
+static ray_t* env_get_impl(int64_t sym_id, bool in_callee);
 ray_t* ray_env_get(int64_t sym_id) {
+    return env_get_impl(sym_id, false);
+}
+
+/* ray_env_get for a body being compiled: it is a callee of whatever is on
+ * the scope stack, so an `eval` window there is not its scope. */
+ray_t* ray_env_get_compiled(int64_t sym_id) {
+    return env_get_impl(sym_id, true);
+}
+
+static ray_t* env_get_impl(int64_t sym_id, bool in_callee) {
     /* Flat lookup first — covers every non-dotted name AND every
      * reserved builtin like `.sys.gc` which is bound both flat (for
      * O(1) resolution + prefix enumeration) and inside the `.sys`
      * namespace dict (for REPL introspection). */
-    ray_t* flat = env_lookup_flat(sym_id);
+    ray_t* flat = env_lookup_flat_impl(sym_id, NULL, in_callee);
     if (flat) return flat;
     if (!ray_sym_is_dotted(sym_id)) return NULL;
 
@@ -512,7 +517,7 @@ ray_t* ray_env_get(int64_t sym_id) {
     int n = ray_sym_segs(sym_id, &segs);
     if (n < 2) return NULL;  /* defensive — dotted bit without segments */
 
-    ray_t* v = env_lookup_flat(segs[0]);
+    ray_t* v = env_lookup_flat_impl(segs[0], NULL, in_callee);
     for (int i = 1; v && i < n; i++) {
         v = ray_container_probe_sym(v, segs[i]);
     }

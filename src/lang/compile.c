@@ -600,7 +600,7 @@ static void compile_list(compiler_t *c, ray_t *ast) {
     /* Look up head at compile time to determine call type */
     ray_t *fn = NULL;
     if (head->type == -RAY_SYM && !(head->attrs & ATTR_QUOTED) && !head_local)
-        fn = c->dynamic_globals ? ray_env_get_global(head->i64) : ray_env_get(head->i64);
+        fn = c->dynamic_globals ? ray_env_get_global(head->i64) : ray_env_get_compiled(head->i64);
 
     /* Unrecognized special form: dynamic eval on the entire form.  The
      * special form re-evaluates its argument ASTs via the tree walker,

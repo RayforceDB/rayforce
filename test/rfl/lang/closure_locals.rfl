@@ -203,6 +203,11 @@
 ((fn [pe] (eval (quote (rdi)))) 1) -- 100
 ;; ... while a lambda written in the text captures it
 ((fn [pe] (eval (quote ((fn [] pe))))) 1) -- 1
+;; ... nor when a named function compiles on that first call: the builtins it
+;; bakes are the globals, not the window's locals of those names
+(set rdce (fn [x] (count x)))
+((fn [count] (eval (quote (rdce [1 2 3])))) sum) -- 3
+(rdce [1 2 3]) -- 3
 ;; ... and many such calls leave the scope stack as it was
 (times 200 (gw 1))
 (do (let aw 1) aw) -- 1
