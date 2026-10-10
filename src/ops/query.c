@@ -11157,6 +11157,7 @@ by_dict_done:
                     scratch_free(keycols_hdr);
                     if (eval_tbl != tbl) ray_release(eval_tbl);
                     ray_release(tbl);
+                    if (by_sym_vec_owned) ray_release(by_sym_vec_owned);
                     scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return dres;
                 }
 
@@ -11386,6 +11387,7 @@ by_dict_done:
                         scratch_free(rowbuf_hdr); scratch_free(keyrd_hdr); scratch_free(cntnames_hdr); scratch_free(keycols_hdr);
                         if (eval_tbl != tbl) ray_release(eval_tbl);
                         ray_release(tbl);
+                        if (by_sym_vec_owned) ray_release(by_sym_vec_owned);
                         scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return result;
                     }
                     /* Not a count-only shape — release the pre-take scratch and
@@ -11757,6 +11759,7 @@ by_dict_done:
                 ray_release(groups);
                 if (eval_tbl != tbl) ray_release(eval_tbl);
                 ray_release(tbl);
+                if (by_sym_vec_owned) ray_release(by_sym_vec_owned);
                 if (take_preapplied) {
                     scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return result;
                 }
@@ -12017,6 +12020,7 @@ by_dict_done:
                 }
                 res = apply_sort_take(res, dict_elems, dict_n,
                                       asc_id, desc_id, take_id, NULL);
+                if (by_sym_vec_owned) ray_release(by_sym_vec_owned);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return res;
             }
 
@@ -12056,6 +12060,7 @@ by_dict_done:
                 }
                 if (eval_tbl != tbl) ray_release(eval_tbl);
                 ray_release(tbl);
+                if (by_sym_vec_owned) ray_release(by_sym_vec_owned);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return empty;
             }
 
@@ -12477,6 +12482,7 @@ by_dict_done:
             ray_release(tbl);
             result = apply_sort_take(result, dict_elems, dict_n,
                                      asc_id, desc_id, take_id, NULL);
+            if (by_sym_vec_owned) ray_release(by_sym_vec_owned);
             scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return result;
         }
 
@@ -13192,6 +13198,7 @@ by_dict_done:
                 }
                 if (filtered_tbl != tbl) ray_release(filtered_tbl);
                 ray_release(tbl);
+                if (by_sym_vec_owned) ray_release(by_sym_vec_owned);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return empty;
             }
 
@@ -13247,7 +13254,7 @@ by_dict_done:
                     scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return groups2;
                 }
                 int64_t ng2 = ray_len(groups2) / 2;
-                if (ng2 == 0) { ray_release(groups2); ray_release(computed_key); if (filtered_tbl != tbl) ray_release(filtered_tbl); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_table_new(0); }
+                if (ng2 == 0) { ray_release(groups2); ray_release(computed_key); if (filtered_tbl != tbl) ray_release(filtered_tbl); ray_release(tbl); if (by_sym_vec_owned) ray_release(by_sym_vec_owned); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_table_new(0); }
                 ray_t** gi2 = (ray_t**)ray_data(groups2);
 
                 /* fi2 must sweep EVERY group, not just the first 256 —
@@ -13365,6 +13372,7 @@ by_dict_done:
                 ray_release(tbl);
                 res2 = apply_sort_take(res2, dict_elems, dict_n,
                                        asc_id, desc_id, take_id, NULL);
+                if (by_sym_vec_owned) ray_release(by_sym_vec_owned);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return res2;
             }
 
@@ -13657,6 +13665,7 @@ by_dict_done:
             ray_release(tbl);
             result = apply_sort_take(result, dict_elems, dict_n,
                                      asc_id, desc_id, take_id, NULL);
+            if (by_sym_vec_owned) ray_release(by_sym_vec_owned);
             scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return result;
         }
     } else if (n_out > 0) {

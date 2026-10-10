@@ -41,6 +41,15 @@
 (probe (fn [p] (count (select {by: x from: TW where: (> y 38)}))) 5 1000) -- true
 (probe (fn [p] (count (select {by: (* x 2) from: TW where: (> y 38)}))) 5 1000) -- true
 (probe (fn [p] (count (select {by: x from: TW where: (> y 1000)}))) 5 1000) -- true
+;; a by-dict or a quoted key symbol is rewritten into an owned symbol vector,
+;; released at the end of the select, which the no-output branch and the
+;; eval-level grouping return before.  One vector per call.
+(set TB (table [x y z s] (list (% (til 100) 7) (til 100) (% (til 100) 3) (as 'STR (% (til 100) 7)))))
+(probe (fn [p] (count (select {by: {k: x} from: TB}))) 5 1000) -- true
+(probe (fn [p] (count (select {by: 'x from: TB}))) 5 1000) -- true
+(probe (fn [p] (count (select {by: 'x from: TB where: (> y 38)}))) 5 1000) -- true
+(probe (fn [p] (count (select {by: {a: x b: z} from: TB}))) 5 1000) -- true
+(probe (fn [p] (count (select {v: y by: {k: s} from: TB}))) 5 1000) -- true
 ;; the same table reused across calls must not be released twice: the
 ;; result is still right after many calls
 (set T (mk 1))
