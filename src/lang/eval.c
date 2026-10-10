@@ -324,7 +324,7 @@ ray_t* ray_raise_fn(ray_t* val) {
  * Borrows both `handler` and `err_val`; returns a new owned ref. */
 static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
                                bool query, uint64_t row_args, bool named,
-                               int8_t* out_rows);
+                               int8_t* out_rows, bool may_compile);
 
 ray_t* ray_try_handle(ray_t* handler, ray_t* err_val) {
     if (handler->type == RAY_LAMBDA || handler->type == RAY_UNARY)
@@ -340,7 +340,7 @@ static ray_t* try_handle_rows(ray_t* handler, ray_t* err_val, int8_t fallback_ro
     *rows = -1;
     if (handler->type == RAY_LAMBDA) {
         ray_t* args[1] = { err_val };
-        return call_lambda_impl(handler, args, 1, ray_active_query_table() != NULL, 0, true, rows);
+        return call_lambda_impl(handler, args, 1, ray_active_query_table() != NULL, 0, true, rows, true);
     }
     if (handler->type == RAY_UNARY) return call_fn1(handler, err_val);
     *rows = fallback_rows;
@@ -2325,13 +2325,15 @@ static inline bool lambda_wants_compile(ray_t* lambda) {
 
 static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
                                bool query, uint64_t row_args, bool named,
-                               int8_t* out_rows) {
+                               int8_t* out_rows, bool may_compile) {
     if (out_rows) *out_rows = -1;
     /* A lambda called inside a named helper's body is that body's text. */
     if (query && !named) named = ray_eval_query_helper_literals();
     /* Lazy compilation (see lambda_wants_compile); a closure's captures
-     * become locals of its body (OP_BINDCAPS). */
-    if (lambda_wants_compile(lambda))
+     * become locals of its body (OP_BINDCAPS).  A caller that decided
+     * already for this call (the VM's call opcode) passes may_compile
+     * false, so one call counts once. */
+    if (may_compile && lambda_wants_compile(lambda))
         ray_compile(lambda);
     if (LAMBDA_IS_COMPILED(lambda)) {
         if (!query) return vm_exec(lambda, call_args, argc);
@@ -2414,7 +2416,7 @@ static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
 ray_t* call_lambda(ray_t* lambda, ray_t** call_args, int64_t argc) {
     if (lambda_wants_compile(lambda)) ray_compile(lambda);
     if (LAMBDA_IS_COMPILED(lambda)) return vm_exec(lambda, call_args, argc);
-    return call_lambda_impl(lambda, call_args, argc, false, 0, false, NULL);
+    return call_lambda_impl(lambda, call_args, argc, false, 0, false, NULL, true);
 }
 
 /* ══════════════════════════════════════════
@@ -3005,7 +3007,7 @@ unary_done:
             /* An uncompiled lambda (a closure): interpreted, with the
              * arguments' row provenance when a query is active. */
             bool in_query = ray_active_query_table() != NULL;
-            result = call_lambda_impl(fn_obj, fn_args, n, in_query, args_bits, true, &lambda_rows);
+            result = call_lambda_impl(fn_obj, fn_args, n, in_query, args_bits, true, &lambda_rows, false);
             for (int32_t i = 0; i < n; i++) ray_release(fn_args[i]);
             break;
         }
@@ -4501,7 +4503,7 @@ ray_t* ray_eval(ray_t* obj) {
             }
             bool named = elems[0]->type == -RAY_SYM && !(elems[0]->attrs & ATTR_QUOTED);
             int8_t result_rows = -1;
-            ray_t* result = call_lambda_impl(head, args, argc, query, row_args, named, &result_rows);
+            ray_t* result = call_lambda_impl(head, args, argc, query, row_args, named, &result_rows, true);
             rows = result_rows;
             for (int64_t i = 0; i < argc; i++) ray_release(args[i]);
             ray_release(head);
