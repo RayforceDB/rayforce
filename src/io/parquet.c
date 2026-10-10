@@ -1961,39 +1961,52 @@ static void pq_vocab_bounds(ray_parquet_t* r, const int64_t* order, int64_t from
  * interned in row-group order before its pass (its chunks are dictionary
  * pages and ids only, pq_vocab_bounds' dict_only), so the parallel pass
  * finds every string there and the positions do not depend on the workers.
- * The pages are asked for together first; false on one it cannot read. */
-static bool pq_seed_dicts(ray_parquet_t* r, const int64_t* order, int64_t from, int64_t to, int64_t* entries) {
+ * The pages are asked for together first.  NULL, or the reason a page
+ * cannot be read: the decoder's own, so the import reports what the pass
+ * itself would have. */
+static const char* pq_seed_dicts(ray_parquet_t* r, const int64_t* order, int64_t from, int64_t to, int64_t* entries,
+                                 int64_t* bad_col) {
     pq_span* cols = ray_calloc_raw((size_t)r->ncols*sizeof(*cols));
-    bool ok = cols != NULL;
-    for (int pass = 0; ok && pass < 2; pass++)
-        for (int64_t g = 0; ok && g < r->ngroups; g++) {
+    *bad_col = -1;
+    if (!cols) return "symbol dictionary allocation failed";
+    const char* err = NULL;
+    for (int pass = 0; !err && pass < 2; pass++)
+        for (int64_t g = 0; !err && g < r->ngroups; g++) {
             int64_t rows = 0;
-            ok = pq_group_columns(r,g,cols,&rows,NULL);
-            for (int64_t i = from; ok && i < to; i++) {
+            if (!pq_group_columns(r,g,cols,&rows,NULL)) { err = "invalid row group"; break; }
+            for (int64_t i = from; !err && i < to; i++) {
                 int64_t c = order[i]; pq_span mf[17];
-                if (!pq_fields(cols[c],mf,17)) { ok = false; break; }
+                if (!pq_fields(cols[c],mf,17)) { err = "invalid column metadata"; break; }
                 int64_t dict = pq_get(mf[11],-1), data = pq_get(mf[9],-1), codec = pq_get(mf[4],-1);
                 if (pq_get(mf[6],-1) <= 0) continue;   /* no values */
-                if (dict < 4 || dict >= data || (uint64_t)data > r->data_end || (codec != 0 && codec != 1)) { ok = false; break; }
+                if (codec != 0 && codec != 1) { err = "unsupported compression codec (supported: uncompressed, Snappy)"; break; }
+                if (dict > data) { err = "dictionary follows data"; break; }
+                if (dict < 4 || dict == data || (uint64_t)data > r->data_end) { err = "column chunk outside file data"; break; }
                 if (!pass) { ray_vm_advise_willneed(r->map + dict,(size_t)(data - dict)); continue; }
+                *bad_col = c;   /* the page's errors name the column, as the decoder's do */
                 pq_cur cur = {r->map+dict,r->map+data,false};
                 const uint8_t* start = cur.p;
                 pq_span f[10], h[4];
-                if (!pq_skip(&cur,12,0,false) || !pq_fields((pq_span){start,cur.p,12},f,10) || pq_get(f[1],-1) != 2 ||
-                    !pq_fields(f[7],h,4)) { ok = false; break; }
-                int64_t raw = pq_get(f[2],-1), size = pq_get(f[3],-1), count = pq_get(h[1],-1);
+                if (!pq_skip(&cur,12,0,false)) { err = "invalid page header"; break; }
+                if (!pq_fields((pq_span){start,cur.p,12},f,10)) { err = "invalid page fields"; break; }
+                int64_t raw = pq_get(f[2],-1), size = pq_get(f[3],-1);
+                if (raw < 0 || raw > PQ_MAX_PAGE || size < 0 || size > PQ_MAX_PAGE) { err = "invalid or oversized page (limit 64 MiB)"; break; }
                 const uint8_t* payload;
-                if (raw < 0 || raw > PQ_MAX_PAGE || size < 0 || size > PQ_MAX_PAGE || !pq_take(&cur,(uint64_t)size,&payload)) { ok = false; break; }
+                if (!pq_take(&cur,(uint64_t)size,&payload)) { err = "truncated page"; break; }
+                int64_t count;
+                if (pq_get(f[1],-1) != 2 || !pq_fields(f[7],h,4) || !pq_num(h[1],&count) ||
+                    (pq_get(h[2],-1) != 0 && pq_get(h[2],-1) != 2)) { err = "invalid dictionary page"; break; }
                 pq_column col = {0};
                 col.codec = (int)codec;
                 pq_schema sch = r->schema[c];
-                ok = sch.import_domain && pq_dictionary(&col,&sch,payload,(size_t)size,(size_t)raw,count);
-                if (ok) *entries += count;
+                if (!sch.import_domain) err = "symbol column without an import dictionary";
+                else if (!pq_dictionary(&col,&sch,payload,(size_t)size,(size_t)raw,count)) err = "invalid dictionary page";
+                else { *entries += count; *bad_col = -1; }
                 ray_free_raw(col.dict); ray_free_raw(col.strings); ray_free_raw(col.symbol_ids); ray_free_raw(col.symbols);
             }
         }
     ray_free_raw(cols);
-    return ok;
+    return err;
 }
 
 /* A mapped column chunk is read on first touch, one fault at a time per
@@ -3009,7 +3022,14 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
     } else nd = r->ncols;
     if (seed) {
         int64_t ts = trace ? ray_profile_now_ns() : 0, entries = 0;
-        if (!pq_seed_dicts(r,order,nnum,nd,&entries)) { err = pq_error("symbol dictionary page unreadable or allocation failed"); goto done; }
+        int64_t bad_col;
+        const char* se = pq_seed_dicts(r,order,nnum,nd,&entries,&bad_col);
+        if (se && bad_col >= 0) {
+            ray_t* name = ray_sym_str(r->schema[bad_col].name);
+            err = ray_error("parquet","%s (column %s)",se,name ? ray_str_ptr(name) : "?");
+            goto done;
+        }
+        if (se) { err = pq_error(se); goto done; }
         if (trace) fprintf(stderr,"parquet symseed: cols=%lld groups=%lld entries=%lld ms=%.1f\n",(long long)(nd-nnum),
                            (long long)r->ngroups,(long long)entries,(double)(ray_profile_now_ns()-ts)/1e6);
     }

@@ -845,6 +845,40 @@ static test_result_t test_pool_workers_started(void) {
     PASS();
 }
 
+#if defined(__linux__)
+#include <sys/resource.h>
+#include <sys/wait.h>
+/* Skeptic probe (round 3): a pool whose worker threads cannot be created
+ * (RLIMIT_NPROC below the user's thread count, in a child) fails to come
+ * up and returns — the creator's wait for the workers' start is not
+ * reached for threads that never ran — and a pool of one thread still
+ * comes up after it. */
+static test_result_t test_pool_sk_spawn_fails(void) {
+    fflush(stderr);
+    pid_t pid = fork();
+    TEST_ASSERT_TRUE(pid >= 0);
+    if (!pid) {
+        struct rlimit rl;
+        if (getrlimit(RLIMIT_NPROC, &rl) != 0) _exit(10);
+        rl.rlim_cur = 1;
+        if (setrlimit(RLIMIT_NPROC, &rl) != 0) _exit(11);
+        ray_pool_t pool;
+        ray_err_t e = ray_pool_create(&pool, 16);
+        if (e == RAY_OK) { ray_pool_free(&pool); _exit(12); }   /* not limited (root?) */
+        ray_pool_t one;
+        if (ray_pool_create(&one, 1) != RAY_OK) _exit(0);        /* still refused: fine */
+        ray_pool_free(&one);
+        _exit(0);
+    }
+    int status = 0;
+    TEST_ASSERT_EQ_I(waitpid(pid, &status, 0), pid);
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 12) SKIP("RLIMIT_NPROC not enforced here");
+    TEST_ASSERT_TRUE(WIFEXITED(status));
+    TEST_ASSERT_EQ_I(WEXITSTATUS(status), 0);
+    PASS();
+}
+#endif
+
 /* --------------------------------------------------------------------------
  * Test: ray_pool_free(NULL) is a no-op (covers the early-return guard).
  * -------------------------------------------------------------------------- */
@@ -2353,6 +2387,9 @@ const test_entry_t pool_entries[] = {
     { "pool/total_workers",         test_pool_total_workers,    NULL, NULL },
     { "pool/init_total",            test_pool_init_total,       NULL, NULL },
     { "pool/workers_started",       test_pool_workers_started,  NULL, NULL },
+#if defined(__linux__)
+    { "pool/sk_spawn_fails",        test_pool_sk_spawn_fails,   NULL, NULL },
+#endif
     { "pool/free_null",             test_pool_free_null,        NULL, NULL },
     { "pool/init_idempotent",       test_pool_init_idempotent,  NULL, NULL },
     { "pool/destroy_reinit",        test_pool_destroy_and_reinit, NULL, NULL },
