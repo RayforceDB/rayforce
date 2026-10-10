@@ -2704,7 +2704,9 @@ static test_result_t test_sys_alloc_zero_fill(void) {
  * report that covers it), nothing past the block.  An anonymous block (the
  * direct-block cache keeps it for its next use) and a small one are left as
  * they are, and so is everything where the platform cannot punch a mapped
- * range (no MADV_REMOVE: macOS) — the call says whether it did. */
+ * range (no MADV_REMOVE: macOS) or the spill directory's filesystem cannot
+ * (NFS, ext3) — the call says whether it did, and the pages read zero
+ * exactly when it says so. */
 static test_result_t test_raw_discard(void) {
 #if defined(_WIN32)
     SKIP("file-backed spill is POSIX-only");
@@ -2714,6 +2716,7 @@ static test_result_t test_raw_discard(void) {
     size_t pg = ps > 0 ? (size_t)ps : 4096;
     int64_t previous = ray_heap_anon_watermark();
     int64_t bad = 0;
+    bool spill_punched = false;
     for (int k = 0; k < 2; k++) {
         bool spill = k == 1;
         ray_heap_direct_cache_drain();
@@ -2735,11 +2738,8 @@ static test_result_t test_raw_discard(void) {
         /* three and a half pages past the first page boundary: three go */
         size_t upto = head + 3 * pg + pg / 2;
         bool punched = ray_raw_discard(p, 0, upto);
-#if defined(MADV_REMOVE)
-        if (punched != spill) bad++;          /* where it can, a spilled block's pages go */
-#else
-        if (punched) bad++;
-#endif
+        if (punched && !spill) bad++;         /* an anonymous block is never punched */
+        if (spill) spill_punched = punched;
         for (size_t i = 0; i < big; i += 64)
             if ((p[i] == 0) != (punched && i >= head && i < head + 3 * pg)) { bad++; break; }
         /* the next report takes the page the first one reached into */
@@ -2768,6 +2768,10 @@ static test_result_t test_raw_discard(void) {
     for (size_t i = 0; i < 64 * 1024; i++) if (s[i] != 0x5a) { bad++; break; }
     ray_free_raw(s);
     TEST_ASSERT_EQ_I(bad, 0);
+    /* Everything above held; but where the spill file could not be punched
+     * (no MADV_REMOVE, or a spill directory on NFS or ext3) the pages that
+     * should go were only checked to stay. */
+    if (!spill_punched) SKIP("spill directory cannot punch a mapped range: the zeroing was not checked");
     PASS();
 }
 
