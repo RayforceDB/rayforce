@@ -760,21 +760,33 @@ void ray_compile(ray_t *lambda) {
      * a `let` of a captured name writes the same slot, a capture named
      * like a builtin is the callee, and a window (OP_SCOPE_BEGIN) binds
      * them with the other locals.  `self` is never captured (env.c), so it
-     * is not among them.  OP_LOADCAP takes a one-byte index and a frame holds 256
-     * slots: a closure with more captures than that stays on the tree
-     * walker, which has no such limit. */
+     * is not among them.  One OP_BINDCAPS binds them all; a frame holds
+     * 256 slots, so a closure with more captures than that stays on the
+     * tree walker, which has no such limit. */
     if (!c.error && LAMBDA_CLOSURE(lambda)) {
         ray_t *ckeys = ray_dict_keys(LAMBDA_CLOSURE(lambda));
-        init_sf_syms();
-        for (int64_t i = 0; i < ckeys->len && !c.error; i++) {
-            int64_t id = ray_read_sym(ray_data(ckeys), i, RAY_SYM, ckeys->attrs);
-            if (find_local(&c, id) >= 0) continue;   /* a parameter shadows its capture */
-            int32_t slot = add_local(&c, id);
-            if (slot < 0 || i > 255) { c.error = true; break; }
-            emit(&c, OP_LOADCAP);
-            emit(&c, (uint8_t)i);
-            emit(&c, OP_STOREENV);
-            emit(&c, (uint8_t)slot);
+        ray_t *map = ray_alloc((size_t)ckeys->len * sizeof(int64_t));
+        if (!map || RAY_IS_ERR(map)) { c.error = true; }
+        else {
+            map->type = RAY_I64;
+            map->len  = ckeys->len;
+            int64_t *slots = (int64_t*)ray_data(map);
+            bool any = false;
+            for (int64_t i = 0; i < ckeys->len && !c.error; i++) {
+                int64_t id = ray_read_sym(ray_data(ckeys), i, RAY_SYM, ckeys->attrs);
+                slots[i] = -1;
+                if (find_local(&c, id) >= 0) continue;   /* a parameter shadows its capture */
+                int32_t slot = add_local(&c, id);
+                if (slot < 0) { c.error = true; break; }
+                slots[i] = slot;
+                any = true;
+            }
+            if (!c.error && any) {
+                int32_t idx = add_constant(&c, map);
+                if (idx < 0 || idx > 255) c.error = true;
+                else { emit(&c, OP_BINDCAPS); emit(&c, (uint8_t)idx); }
+            }
+            ray_release(map);
         }
     }
 

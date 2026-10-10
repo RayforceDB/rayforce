@@ -4,12 +4,13 @@
 ;; Same method as the other probes in this directory: warm up, then two equal
 ;; windows of calls; the second must not move `bytes-allocated` by more than a
 ;; few KB.  The conditional on the cell makes the projection row by row, so
-;; each call makes one such lambda per row (400 rows); one leaked flag
-;; vector per lambda is far over the bound.
+;; each call makes one such lambda per row (400 rows), and the lambda
+;; captures `w`, a local that derives from the row, so it carries a flag
+;; vector; one leaked vector per lambda is far over the bound.
 (set T (table [v] (list (as 'STR (map (fn [i] (format "%" i)) (til 400))))))
-(set h (fn [v] (if (nil? v) "" ((fn [a] (concat 'p a)) v))))
+(set h (fn [v] (let w v) (if (nil? v) "" ((fn [a] (concat a w)) v))))
 (set heapb (fn [] (at (.sys.mem) 'bytes-allocated)))
 (set probe (fn [f warm reps] (do (map f (til warm)) (map f (til reps)) (set h0 (heapb)) (map f (til reps)) (< (- (heapb) h0) 4096))))
 (probe (fn [i] (count (select {r: (h v) from: T}))) 5 40) -- true
 ;; the result is still the row-wise join
-(at (select {r: (h v) from: T take: 2}) 'r) -- ["p0" "p1"]
+(at (select {r: (h v) from: T take: 2}) 'r) -- ["00" "11"]

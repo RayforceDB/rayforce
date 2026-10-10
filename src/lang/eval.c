@@ -2329,7 +2329,8 @@ static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
     if (out_rows) *out_rows = -1;
     /* A lambda called inside a named helper's body is that body's text. */
     if (query && !named) named = ray_eval_query_helper_literals();
-    /* Lazy compilation (see lambda_wants_compile). */
+    /* Lazy compilation (see lambda_wants_compile); a closure's captures
+     * become locals of its body (OP_BINDCAPS). */
     if (lambda_wants_compile(lambda))
         ray_compile(lambda);
     if (LAMBDA_IS_COMPILED(lambda)) {
@@ -2551,7 +2552,7 @@ static ray_t* vm_exec_rows(ray_t* lambda, ray_t** call_args, int64_t argc,
         [OP_SCOPE_END]     = &&op_scope_end,
         [OP_TRYH]          = &&op_tryh,
         [OP_FORCE]         = &&op_force,
-        [OP_LOADCAP]       = &&op_loadcap,
+        [OP_BINDCAPS]      = &&op_bindcaps,
         [OP_LOADSELF]      = &&op_loadself,
     };
 
@@ -3172,18 +3173,27 @@ op_tryh: {
     DISPATCH();
 }
 
-op_loadcap: {
-    /* A closure's capture, loaded by the prologue into its local slot.  A
-     * compiled closure was made outside any query (LAMBDA_CAPQ is 0), so
-     * the value is plain data. */
+op_bindcaps: {
+    /* The closure's captures become local slots (the compiled closure's
+     * prologue).  A compiled closure was made outside any query
+     * (LAMBDA_CAPQ is 0), so the values are plain data. */
     uint8_t idx = code[ip++];
+    ray_t *map = cpool[idx];
     ray_t *cap = LAMBDA_CLOSURE(vm.fn);
     ray_t *cvals = cap && cap->type == RAY_DICT ? ray_dict_vals(cap) : NULL;
-    if (!cvals || cvals->type != RAY_LIST || idx >= cvals->len) goto vm_error_name;
-    ray_t *val = ((ray_t**)ray_data(cvals))[idx];
-    if (val) ray_retain(val);
-    else val = make_i64(0);
-    PUSHR(val, 0);
+    if (!cvals || cvals->type != RAY_LIST || !map || map->type != RAY_I64 || map->len > cvals->len)
+        goto vm_error_name;
+    const int64_t *slots = (const int64_t*)ray_data(map);
+    ray_t **vals = (ray_t**)ray_data(cvals);
+    for (int64_t i = 0; i < map->len; i++) {
+        if (slots[i] < 0) continue;
+        ray_t *val = vals[i];
+        if (val) ray_retain(val);
+        else val = make_i64(0);
+        if (LOCAL(slots[i])) ray_release(LOCAL(slots[i]));
+        LOCAL(slots[i]) = val;
+        LROWS(slots[i]) = 0;
+    }
     DISPATCH();
 }
 

@@ -3819,7 +3819,7 @@ static test_result_t test_serde_lambda_roundtrip(void) {
 
 /* ---- serde coverage: a lambda's closure must be SYM keys -> LIST values --- */
 
-/* The compiled capture loads (OP_LOADCAP) read a closure's values as a LIST
+/* The compiled capture binding (OP_BINDCAPS) reads a closure's values as a LIST
  * of ray_t*.  A wire frame whose closure carries a typed value vector instead
  * must be rejected at deserialization, not dereferenced later. */
 static ray_t* make_test_lambda(ray_t* closure) {

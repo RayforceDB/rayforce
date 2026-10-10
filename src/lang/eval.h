@@ -96,9 +96,10 @@ enum {
                        * push handler as a fallback value */
     OP_FORCE,         /* materialize TOS if it is a lazy handle (so a
                        * let-bound local holds a concrete, reusable value) */
-    OP_LOADCAP,       /* push captured value: operand = index into the
-                       * closure (1 byte).  Emitted only by the prologue
-                       * that binds each capture to a local slot */
+    OP_BINDCAPS,      /* bind the closure's captures to local slots:
+                       * cpool[operand] is an I64 vector, capture i -> slot
+                       * (or -1 for a capture a parameter shadows).  The
+                       * prologue of every compiled closure */
     OP_LOADSELF,      /* push the running lambda (bare `self` as a value) */
     OP__COUNT
 };
