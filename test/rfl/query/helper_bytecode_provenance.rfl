@@ -415,3 +415,25 @@ CNT12 -- 6
 ;; and a pure helper passed through a parameter keeps the whole column
 (set kp12 (fn [v] 1 (let g (fn [f] (f v))) (> (g kg10) 0)))
 (at (select {n: (count v) by: (kp12 v) from: T10}) 'n) -- [3 3]
+;; a lambda passed as a value keeps its parameters unknown: a call through
+;; one is an effect whatever a global of that name holds
+(set ap13 (fn [z g13] (g13 z)))
+(set CNT13 0)
+(set eff13 (fn [x] (set CNT13 (+ CNT13 1)) x))
+(set H13 (dict ['a] (list eff13)))
+(set kf13 (fn [v] (fold ap13 (> v 3) (list (at H13 'a)))))
+(select {n: (count v) by: (kf13 v) from: T10})
+CNT13 -- 6
+(set g13 (fn [x] x))
+(set CNT13 0)
+(select {n: (count v) by: (kf13 v) from: T10})
+CNT13 -- 6
+;; a literal nested in a body keeps the enclosing body's parameters
+(set ap213 (fn [g13 z] ((fn [w] (g13 w)) z)))
+(set CNT13 0)
+(select {n: (count v) by: (ap213 (at H13 'a) (> v 3)) from: T10})
+CNT13 -- 6
+;; an argument's name means what it meant where the call was written
+(set hh13 (fn [x] (> (- x (avg x)) 0)))
+(set ap313 (fn [f z] (let hh13 (fn [q] (println "never") q)) (f z)))
+(at (select {n: (count v) by: (ap313 hh13 v) from: T10}) 'n) -- [3 3]

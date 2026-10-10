@@ -2168,9 +2168,14 @@ typedef struct {
     int64_t nbody;
     ray_t*  mentioned; /* the symbols the body mentions (I64 vector) */
     bool    dynamic;   /* the body uses eval or resolve: every capture counts */
+    bool    failed;    /* the body did not compile: its closures stay interpreted */
+    bool    baked;     /* a top-level definition: builtins baked at compile time,
+                        * valid while no function-valued global was rebound */
+    uint64_t fn_gen;   /* ray_env_fn_generation() when it was compiled */
     ray_t*  names;     /* capture names (SYM vector) or NULL */
-    ray_t*  tmpl;      /* the compiled template */
+    ray_t*  tmpl;      /* the compiled template, or NULL when `failed` */
 } closure_tmpl_t;
+enum { CLOSURE_TMPL_MAX_WEIGHT = 65536 };   /* vector elements a cached literal may hold */
 static _Thread_local closure_tmpl_t g_closure_tmpl[CLOSURE_TMPL_SLOTS];
 static _Thread_local uint32_t g_closure_tmpl_next;
 static _Thread_local uint64_t g_closure_tmpl_epoch;
@@ -2246,18 +2251,32 @@ static void closure_share_template(ray_t* lambda) {
     if (g_call_self_sym < 0) g_call_self_sym = ray_sym_intern("self", 4);
     for (int i = 0; i < CLOSURE_TMPL_SLOTS; i++) {
         closure_tmpl_t* e = &g_closure_tmpl[i];
-        if (!e->tmpl || e->params != params || e->nbody != body->len) continue;
+        if ((!e->tmpl && !e->failed) || e->params != params || e->nbody != body->len) continue;
         bool same = true;
         for (int64_t k = 0; k < body->len && same; k++) same = e->body[k] == bn[k];
         if (same && closure_entry_names_match(e, LAMBDA_CLOSURE(lambda))) {
-            closure_share_from(lambda, e->tmpl);
+            if (e->baked && !e->failed && e->fn_gen != ray_env_fn_generation()) {
+                /* A function-valued global was rebound since: the baked
+                 * builtins may be stale.  Compile this literal afresh. */
+                closure_tmpl_drop(e);
+                break;
+            }
+            if (e->failed) LAMBDA_NLOCALS(lambda) = -1;   /* known not to compile */
+            else closure_share_from(lambda, e->tmpl);
             return;
         }
     }
     /* A new literal, or a known one with another capture set. */
     bool dynamic = false;
-    ray_t* mentioned = ray_closure_mentioned_syms(body, &dynamic);
+    int64_t weight = 0;
+    ray_t* mentioned = ray_closure_mentioned_syms(body, &dynamic, &weight);
     if (!mentioned) return;
+    if (weight > CLOSURE_TMPL_MAX_WEIGHT) {
+        /* A literal built around a large constant is not kept: the table
+         * would hold the constant alive after its closures are gone. */
+        ray_release(mentioned);
+        return;
+    }
     ray_t* names = ray_closure_names_from(LAMBDA_CLOSURE(lambda), mentioned, dynamic);
     ray_t* tmpl = ray_alloc(LAMBDA_SLOTS * sizeof(ray_t*));
     if (!tmpl || RAY_IS_ERR(tmpl)) { if (names) ray_release(names); ray_release(mentioned); return; }
@@ -2268,13 +2287,19 @@ static void closure_share_template(ray_t* lambda) {
     ray_retain(params); LAMBDA_PARAMS(tmpl) = params;
     ray_retain(body);   LAMBDA_BODY(tmpl) = body;
     if (LAMBDA_NFO(lambda)) { ray_retain(LAMBDA_NFO(lambda)); LAMBDA_NFO(tmpl) = LAMBDA_NFO(lambda); }
-    if (!ray_compile_with_captures(tmpl, names)) {
-        /* Not compilable this way: the closure stays as it is and compiles,
-         * or not, when it is called. */
+    /* A literal written inside a function is a closure body: its free names
+     * resolve when it runs.  One written at the top level is a definition and
+     * keeps the builtins it names baked, as dev's named lambdas do. */
+    bool closure_body = __VM && __VM->lambda_depth > 0;
+    uint64_t fn_gen = ray_env_fn_generation();
+    bool compiled = ray_compile_with_captures(tmpl, names, closure_body);
+    if (!compiled) {
+        /* Not compilable: the closure stays interpreted, and the entry
+         * remembers that so later closures from the literal skip the
+         * attempt. */
         ray_release(tmpl);
-        if (names) ray_release(names);
-        ray_release(mentioned);
-        return;
+        tmpl = NULL;
+        LAMBDA_NLOCALS(lambda) = -1;
     }
     closure_tmpl_t* e = &g_closure_tmpl[g_closure_tmpl_next++ % CLOSURE_TMPL_SLOTS];
     closure_tmpl_drop(e);
@@ -2283,9 +2308,12 @@ static void closure_share_template(ray_t* lambda) {
     e->nbody = body->len;
     e->mentioned = mentioned;   /* owned */
     e->dynamic = dynamic;
+    e->failed = !compiled;
+    e->baked = !closure_body;
+    e->fn_gen = fn_gen;
     e->names = names;   /* owned, may be NULL */
-    e->tmpl = tmpl;     /* owned */
-    closure_share_from(lambda, tmpl);
+    e->tmpl = tmpl;     /* owned, NULL when failed */
+    if (compiled) closure_share_from(lambda, tmpl);
 }
 
 ray_t* ray_fn(ray_t** args, int64_t n) {
@@ -2472,7 +2500,9 @@ bool ray_eval_query_helper_literals(void) {
  * made by compiled code (OP_MKCLOSURE) is born compiled, sharing its
  * literal's bytecode.  Everything else compiles on its first call. */
 static inline bool lambda_wants_compile(ray_t* lambda) {
-    return !LAMBDA_IS_COMPILED(lambda) && !LAMBDA_CAPQ(lambda);
+    /* NLOCALS -1 marks a body that did not compile: it stays on the tree
+     * walker without another attempt per call. */
+    return !LAMBDA_IS_COMPILED(lambda) && !LAMBDA_CAPQ(lambda) && LAMBDA_NLOCALS(lambda) != -1;
 }
 
 static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
@@ -3136,7 +3166,10 @@ op_callf: {
                 fn_args[0] = ray_lazy_materialize(fn_args[0]); /* consumes owned ref */
                 if (!fn_args[0] || RAY_IS_ERR(fn_args[0])) { result = fn_args[0] ? fn_args[0] : ray_error("type", NULL); fn_args[0] = NULL; break; }
             }
-            result = unary(fn_args[0]);
+            if ((fn_obj->attrs & RAY_FN_ATOMIC) && fn_args[0] && fn_args[0]->type >= 0)
+                result = atomic_map_unary(unary, fn_args[0]);
+            else
+                result = unary(fn_args[0]);
             ray_release(fn_args[0]);
 unary_done:
             break;
@@ -3156,9 +3189,17 @@ unary_done:
                     if (!fn_args[1] || RAY_IS_ERR(fn_args[1])) { result = fn_args[1] ? fn_args[1] : ray_error("type", NULL); ray_release(fn_args[0]); fn_args[0] = NULL; fn_args[1] = NULL; break; }
                 }
             }
-            result = ((ray_binary_fn)(uintptr_t)fn_obj->i64)(fn_args[0], fn_args[1]);
-            ray_release(fn_args[0]);
-            ray_release(fn_args[1]);
+            /* The same path as OP_CALL2: the elementwise map for an atomic
+             * builtin, the query text rule for concat, the row provenance
+             * join.  A closure body reaches here for every builtin it names,
+             * since it resolves them when it runs. */
+            {
+                uint8_t bin_rows = 0;
+                result = vm_call_binary(fn_obj, fn_args[0], fn_args[1],
+                                        (uint8_t)(args_bits & 1), (uint8_t)((args_bits >> 1) & 1), &bin_rows);
+                fn_args[0] = fn_args[1] = NULL;   /* consumed */
+                lambda_rows = bin_rows ? 1 : 0;   /* reported below as the result's flag */
+            }
             break;
         case RAY_VARY:
             if (fn_is_restricted(fn_obj)) { for (int32_t i = 0; i < n; i++) ray_release(fn_args[i]); result = ray_error("access", "restricted"); break; }
@@ -3183,7 +3224,8 @@ unary_done:
             break;
         }
         uint8_t result_rows = fn_obj->type == RAY_LAMBDA ? vrows_from(lambda_rows)
-            : args_any && (fn_obj->type == RAY_UNARY || fn_obj->type == RAY_BINARY || fn_obj->type == RAY_VARY) &&
+            : fn_obj->type == RAY_BINARY ? (uint8_t)(lambda_rows == 1)
+            : args_any && (fn_obj->type == RAY_UNARY || fn_obj->type == RAY_VARY) &&
               vm_fn_rowwise(fn_obj) ? args_any : 0;
         ray_release(fn_obj);
         if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }
@@ -3274,6 +3316,10 @@ op_ret: {
         ray_t *v = vm.ps[--vm.sp];
         if (v) ray_release(v);
     }
+    /* A window (OP_SCOPE_BEGIN) still open in this run belongs to the
+     * frame that returns: a `return` inside its text leaves through here. */
+    while (ray_env_scope_depth() > scope_base)
+        ray_env_pop_scope();
 
     /* Undo protective retain — POP's reference is the caller's ownership */
     if (from_stack) ray_release(result);

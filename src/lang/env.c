@@ -607,6 +607,16 @@ ray_t* ray_env_resolve_rows(int64_t sym_id, uint8_t* rows) {
  * ray_del_fn's contract via ray_env_set(sym, NULL) and also covers the
  * cascade-up case in env_set_dotted where every dict in a dotted path was
  * emptied by the delete. */
+/* Bumped whenever a global that holds a function, or receives one, is
+ * rebound: a compiled body that baked a builtin by name was compiled under
+ * some value of this counter, and a shared template is reused only while
+ * it has not moved (eval.c, the closure template table). */
+static _Atomic uint64_t g_env_fn_generation = 1;
+uint64_t ray_env_fn_generation(void) { return atomic_load_explicit(&g_env_fn_generation, memory_order_relaxed); }
+static inline bool env_is_fn_value(const ray_t* v) {
+    return v && !RAY_IS_ERR(v) && (v->type == RAY_UNARY || v->type == RAY_BINARY || v->type == RAY_VARY || v->type == RAY_LAMBDA);
+}
+
 static ray_err_t env_bind_global_impl(int64_t sym_id, ray_t* val, int is_user) {
     env_lock();
     for (int32_t i = 0; i < g_env.count; i++) {
@@ -622,6 +632,8 @@ static ray_err_t env_bind_global_impl(int64_t sym_id, ray_t* val, int is_user) {
                 env_unlock();
                 return RAY_OK;
             }
+            if (env_is_fn_value(g_env.vals[i]) || env_is_fn_value(val))
+                atomic_fetch_add_explicit(&g_env_fn_generation, 1, memory_order_relaxed);
             if (g_env.vals[i]) ray_release(g_env.vals[i]);
             ray_retain(val);
             g_env.vals[i] = val;
@@ -644,6 +656,7 @@ static ray_err_t env_bind_global_impl(int64_t sym_id, ray_t* val, int is_user) {
         return RAY_ERR_OOM;
     }
     g_env.keys[g_env.count] = sym_id;
+    if (env_is_fn_value(val)) atomic_fetch_add_explicit(&g_env_fn_generation, 1, memory_order_relaxed);
     ray_retain(val);
     g_env.vals[g_env.count] = val;
     g_env.user[g_env.count] = is_user ? 1 : 0;

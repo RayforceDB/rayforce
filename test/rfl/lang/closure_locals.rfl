@@ -174,3 +174,78 @@
 (set pfn (parse "(fn [x] (+ 0 0) (+ x 0))"))
 (set mkev (fn [k] (eval (concat (take pfn 3) (list (parse (concat "(set gev " (concat (format "%" k) ")"))) (at pfn 3))))))
 (list ((mkev 1) 5) gev ((mkev 2) 5) gev ((mkev 1) 5) gev) -- [5 1 5 2 5 1]
+
+;; eval's window opens after its arguments: a return, a let or a call in an
+;; argument belongs to the frame, and the window is gone when the frame is
+(set pw 100)
+(set rdw (fn [] pw))
+(set gw (fn [pw] (eval (if (> pw 0) (return 5) (quote pw)))))
+(list (gw 1) pw (rdw)) -- [5 100 100]
+(set pw 200)
+(list pw (rdw)) -- [200 200]
+(set fw2 (fn [x] (eval (do (let x 10) 0)) x))
+(fw2 1) -- 10
+(set xw 100)
+(set rxw (fn [] xw))
+(set fw3 (fn [x] (eval (rxw))))
+(fw3 1) -- 100
+;; ... and many such calls leave the scope stack as it was
+(times 200 (gw 1))
+(do (let aw 1) aw) -- 1
+;; a closure body resolves the names it does not capture when it runs, so a
+;; global rebound between two closures from one literal is seen by the second
+(set gb sum)
+(set rb [])
+(times 2 (do (set kb (fn [x] (gb x))) (set rb (concat rb (kb [1 2 3]))) (set gb count)))
+rb -- [6 3]
+(set gb count)
+(set mkb2 (fn [] (if false (set 1 2)) (fn [x] (gb x))))
+(set cb1 (do (let gb sum) (mkb2)))
+(set cb2 (mkb2))
+(list (cb1 [1 2 3]) (cb2 [1 2 3]) ((mkb2) [1 2 3])) -- [3 3 3]
+(set gb sum)
+(set mkb3 (fn [] (fn [x] (gb x))))
+(set cb3 (mkb3))
+(set gb count)
+(set cb4 (mkb3))
+(list (cb3 [1 2 3]) (cb4 [1 2 3])) -- [3 3]
+;; a literal built around a large constant is not kept alive by the table
+(set baseL (parse "(fn [x] 0)"))
+(set bigL (fn [i] (eval (concat (take baseL 2) (enlist (concat (parse "(+ x)") (enlist (+ i (til 100000)))))))))
+(set heapL (fn [] (at (.sys.mem) 'bytes-allocated)))
+(set bsL (map bigL (til 4)))
+(set bsL 0)
+(set h0L (do (.sys.gc) (heapL)))
+(set bsL (map bigL (til 300)))
+(set bsL 0)
+(.sys.gc)
+(< (- (heapL) h0L) 4000000) -- true
+;; a literal nested far past the compiler's guards (symbol walk 1024, body
+;; 2048) creates and runs its closure without crashing; the depth stays
+;; within what the sanitizer build's stack releases
+(set baseD (parse "(+ 1 0)"))
+(set wrapD (fn [inner] (concat (take baseD 2) (enlist inner))))
+(set buildD (fn [n] (let a (parse "x")) (times n (let a (wrapD a))) a))
+(set LD (concat (take (parse "(fn [x] 0)") 2) (enlist (buildD 6000))))
+(nil? (try ((eval LD) 1) (fn [e] e))) -- false
+;; closures made from one literal match by capture set in either order
+(set mkd2 (fn [flag k] (if false (set 1 2)) (if flag (let extra2 1)) (fn [] (list k (try extra2 'none)))))
+(set dd3 (mkd2 false 2))
+(set dd4 (mkd2 true 1))
+(list (dd3) (dd4) (dd3) (dd4)) -- (list (list 2 'none) [1 1] (list 2 'none) [1 1])
+;; a closure body resolves builtins when it runs, through the VM's general
+;; call: elementwise arithmetic, aggregates and concat keep their semantics
+(set mkar (fn [k] (fn [v] (* v k))))
+(set far (mkar 2))
+(list (far [1 2 3]) (far 4)) -- (list [2 4 6] 8)
+(set mkav (fn [k] (fn [v] (- v (avg v)))))
+((mkav 0) [1 2 3 4]) -- [-1.5 -0.5 0.5 1.5]
+(set mkcc (fn [k] (fn [v] (concat v k))))
+((mkcc 'z) ['a 'b]) -- ['a 'b 'z]
+(set mkmx (fn [k] (fn [v] (+ (max v) k))))
+((mkmx 1) [3 9 2]) -- 10
+;; a top-level helper keeps elementwise arithmetic on a column
+(set hn2 (fn [v] 1 (* v 2)))
+(hn2 [1 2 3]) -- [2 4 6]
+(set Tar (table [x k] (list [1 2 3 4] [1 1 2 2])))
+(at (update {v: (+ (sum (hn2 (+ x 1))) (count (distinct x))) by: k from: Tar}) 'v) -- [12 12 20 20]

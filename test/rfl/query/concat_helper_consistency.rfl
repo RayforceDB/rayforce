@@ -112,3 +112,9 @@ ticks -- 5
 (at (select {r: ((fn [v] 1 (concat (first v) 'zz)) s) by: x from: TC}) 'r) -- [azz zz czz dzz]
 (set hfirst3 (fn [v] 1 (let f first) (concat (f v) 'zz)))
 (at (select {r: (hfirst3 s) by: x from: TC}) 'r) -- [azz zz czz dzz]
+;; a row-flagged column captured after many unflagged bindings keeps its flag
+(set TF1 (table [s] (list (as 'SYMBOL ["a" "b" "a" "c"]))))
+(set hflag1 (fn [v] (let u1 1) ((fn [a] (concat a 'x)) v)))
+(at (select {r: (hflag1 s) from: TF1}) 'r) -- [ax bx ax cx]
+(set hflag21 (fn [v] (let u1 1) (let u2 1) (let u3 1) (let u4 1) (let u5 1) (let u6 1) (let u7 1) (let u8 1) (let u9 1) (let u10 1) (let u11 1) (let u12 1) (let u13 1) (let u14 1) (let u15 1) (let u16 1) (let u17 1) (let u18 1) (let u19 1) (let u20 1) (let u21 1) ((fn [a] (concat a 'x)) v)))
+(at (select {r: (hflag21 s) from: TF1}) 'r) -- [ax bx ax cx]

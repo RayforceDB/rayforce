@@ -45,17 +45,23 @@ typedef struct {
     struct { int64_t sym_id; int32_t slot; } locals[256];
     int32_t  n_locals;
     int32_t  n_fixed;    /* params: the slots that are always bound */
+    bool     dynamic_globals;  /* a closure body: free names resolve at call
+                                * time (OP_RESOLVE), never a builtin baked at
+                                * compile time, since the template outlives
+                                * any rebinding and any caller's frame */
     int32_t  max_locals;
     bool     error;
     ray_t   *lambda;     /* the lambda being compiled (for 'self' resolution) */
 
     ray_t    *dbg_obj;   /* I64 vector: pairs of [offset, span.id] */
     int32_t  trap_depth;  /* open OP_TRAP frames in current lambda */
+    int32_t  depth;       /* expression nesting; past the guard the lambda is
+                           * left to the tree walker rather than the C stack */
 } compiler_t;
 
 static void compile_expr(compiler_t *c, ray_t *ast);
 static bool compile_fn_template(compiler_t *c, ray_t *ast);
-static bool compile_lambda(ray_t *lambda, ray_t *capnames);
+static bool compile_lambda(ray_t *lambda, ray_t *capnames, bool dynamic_globals);
 
 static bool compiler_init(compiler_t *c) {
     memset(c, 0, sizeof(*c));
@@ -593,7 +599,7 @@ static void compile_list(compiler_t *c, ray_t *ast) {
     /* Look up head at compile time to determine call type */
     ray_t *fn = NULL;
     if (head->type == -RAY_SYM && !(head->attrs & ATTR_QUOTED) && !head_local)
-        fn = ray_env_get(head->i64);
+        fn = c->dynamic_globals ? ray_env_get_global(head->i64) : ray_env_get(head->i64);
 
     /* Unrecognized special form: dynamic eval on the entire form.  The
      * special form re-evaluates its argument ASTs via the tree walker,
@@ -651,14 +657,15 @@ static void compile_list(compiler_t *c, ray_t *ast) {
         dyn_syms_idx = add_constant(c, syms);
         ray_release(syms);
         if (c->error) return;
-        emit_const(c, dyn_syms_idx);
-        emit(c, OP_SCOPE_BEGIN);
     }
 
     /* General function call: compile head, args, then dispatch.
      * If head resolved to a builtin at compile time, emit LOADCONST
-     * instead of RESOLVE to skip the runtime hash lookup. */
-    if (fn && (fn->type == RAY_UNARY || fn->type == RAY_BINARY || fn->type == RAY_VARY)) {
+     * instead of RESOLVE to skip the runtime hash lookup; a closure body
+     * resolves at call time instead (dynamic_globals). */
+    bool baked = fn && !c->dynamic_globals &&
+                 (fn->type == RAY_UNARY || fn->type == RAY_BINARY || fn->type == RAY_VARY);
+    if (baked) {
         int32_t idx = add_constant(c, fn);
         emit_const(c, idx);
     } else {
@@ -672,8 +679,16 @@ static void compile_list(compiler_t *c, ray_t *ast) {
     /* Record call-site span so errors point to the call expression, not the last arg */
     EMIT_DBG(c, ast);
 
+    /* The window opens after the arguments, so their code runs in this
+     * frame (a `let` or a `return` there is the frame's), and closes right
+     * after the call. */
+    if (dyn_syms_idx >= 0) {
+        emit_const(c, dyn_syms_idx);
+        emit(c, OP_SCOPE_BEGIN);
+    }
+
     bool emitted = false;
-    if (fn) {
+    if (fn && (baked || fn->type == RAY_LAMBDA)) {
         switch (fn->type) {
         case RAY_UNARY:
             if (argc == 1) { emit(c, OP_CALL1); emitted = true; }
@@ -706,7 +721,14 @@ static void compile_list(compiler_t *c, ray_t *ast) {
 }
 
 /* ── Compile expression ── */
+static void compile_expr_at(compiler_t *c, ray_t *ast);
 static void compile_expr(compiler_t *c, ray_t *ast) {
+    if (c->error) return;
+    if (++c->depth > 2048) { c->error = true; c->depth--; return; }
+    compile_expr_at(c, ast);
+    c->depth--;
+}
+static void compile_expr_at(compiler_t *c, ray_t *ast) {
     if (c->error) return;
     if (!ast || RAY_IS_ERR(ast)) return;
     EMIT_DBG(c, ast);
@@ -788,8 +810,18 @@ static bool closure_shape_ok(ray_t *closure) {
  * dicts), appended to the I64 vector *out without duplicates.  *dynamic is
  * set when the text mentions `eval` or `resolve`, which can reach a name
  * that is not spelled out. */
+static bool ast_collect_syms_at(ray_t *ast, ray_t **out, bool *dynamic, int depth, int64_t *weight);
 static bool ast_collect_syms(ray_t *ast, ray_t **out, bool *dynamic) {
+    int64_t weight = 0;
+    return ast_collect_syms_at(ast, out, dynamic, 0, &weight);
+}
+/* `weight` accumulates the elements of the vectors the text holds, so a
+ * literal built around a large constant is not kept in a template table;
+ * nesting past 1024 levels is given up on (the literal then has no
+ * template and compiles when called). */
+static bool ast_collect_syms_at(ray_t *ast, ray_t **out, bool *dynamic, int depth, int64_t *weight) {
     if (!ast || !*out) return false;
+    if (depth > 1024) return false;
     if (ast->type == -RAY_SYM) {
         int64_t id = ast->i64;
         if (id == sf_eval || id == sf_resolve) *dynamic = true;
@@ -812,14 +844,17 @@ static bool ast_collect_syms(ray_t *ast, ray_t **out, bool *dynamic) {
     }
     if (ast->type == RAY_LIST) {
         ray_t **elems = (ray_t**)ray_data(ast);
+        *weight += ast->len;
         for (int64_t i = 0; i < ast->len; i++)
-            if (!ast_collect_syms(elems[i], out, dynamic)) return false;
+            if (!ast_collect_syms_at(elems[i], out, dynamic, depth + 1, weight)) return false;
         return true;
     }
     if (ast->type == RAY_DICT) {
         ray_t **slots = (ray_t**)ray_data(ast);
-        return ast_collect_syms(slots[0], out, dynamic) && ast_collect_syms(slots[1], out, dynamic);
+        return ast_collect_syms_at(slots[0], out, dynamic, depth + 1, weight) &&
+               ast_collect_syms_at(slots[1], out, dynamic, depth + 1, weight);
     }
+    if (ast->type > 0 && ast->type != RAY_SYM) *weight += ast->len;   /* a typed vector constant */
     return true;
 }
 
@@ -962,7 +997,7 @@ static bool compile_fn_template_at(compiler_t *c, ray_t *ast) {
     LAMBDA_BODY(tmpl) = body;
     if (c->lambda && LAMBDA_NFO(c->lambda)) { ray_retain(LAMBDA_NFO(c->lambda)); LAMBDA_NFO(tmpl) = LAMBDA_NFO(c->lambda); }
 
-    if (!compile_lambda(tmpl, names->len ? names : NULL)) {
+    if (!compile_lambda(tmpl, names->len ? names : NULL, true)) {
         ray_release(tmpl); ray_release(names); ray_release(slots);
         return false;
     }
@@ -982,12 +1017,13 @@ ray_t *ray_closure_capture_names(ray_t *lambda) { return closure_capture_names(l
 
 /* Every symbol a body mentions (I64 vector, owned by the caller) and whether
  * it uses eval or resolve; NULL on allocation failure. */
-ray_t *ray_closure_mentioned_syms(ray_t *body, bool *dynamic) {
+ray_t *ray_closure_mentioned_syms(ray_t *body, bool *dynamic, int64_t *weight) {
     init_sf_syms();
     ray_t *mentioned = ray_vec_new(RAY_I64, 16);
     if (!mentioned || RAY_IS_ERR(mentioned)) return NULL;
     *dynamic = false;
-    if (!ast_collect_syms(body, &mentioned, dynamic)) { if (mentioned) ray_release(mentioned); return NULL; }
+    *weight = 0;
+    if (!ast_collect_syms_at(body, &mentioned, dynamic, 0, weight)) { if (mentioned) ray_release(mentioned); return NULL; }
     return mentioned;
 }
 
@@ -1011,13 +1047,16 @@ ray_t *ray_closure_names_from(ray_t *closure, ray_t *mentioned, bool dynamic) {
     return names;
 }
 bool ray_closure_shape_ok(ray_t *closure) { return closure_shape_ok(closure); }
-bool ray_compile_with_captures(ray_t *lambda, ray_t *capnames) { return compile_lambda(lambda, capnames); }
+bool ray_compile_with_captures(ray_t *lambda, ray_t *capnames, bool closure_body) { return compile_lambda(lambda, capnames, closure_body); }
 
 void ray_compile(ray_t *lambda) {
     if (LAMBDA_IS_COMPILED(lambda)) return;
     if (!closure_shape_ok(LAMBDA_CLOSURE(lambda))) return;
     ray_t *names = closure_capture_names(lambda);
-    (void)compile_lambda(lambda, names);
+    /* A closure body resolves its free names at call time; a lambda made
+     * with nothing captured keeps the builtins it names baked in. */
+    if (!compile_lambda(lambda, names, LAMBDA_CLOSURE(lambda) != NULL))
+        LAMBDA_NLOCALS(lambda) = -1;   /* remembered: not compilable, no retry per call */
     if (names) ray_release(names);
 }
 
@@ -1025,10 +1064,11 @@ void ray_compile(ray_t *lambda) {
  * ahead of the body by one OP_BINDCAPS.  A parameter shadows a capture of
  * its name.  False when the body cannot be compiled (the lambda stays on
  * the tree walker). */
-static bool compile_lambda(ray_t *lambda, ray_t *capnames) {
+static bool compile_lambda(ray_t *lambda, ray_t *capnames, bool dynamic_globals) {
     compiler_t c;
     if (!compiler_init(&c)) return false;
     c.lambda = lambda;
+    c.dynamic_globals = dynamic_globals;
 
     /* Register params as locals */
     ray_t *params_list = LAMBDA_PARAMS(lambda);

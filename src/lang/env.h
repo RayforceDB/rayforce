@@ -142,6 +142,8 @@ int64_t ray_env_builtin_sym(const ray_t* fn);
 
 /* Local scope stack for lexical binding (let, do, lambda) */
 ray_err_t ray_env_push_scope(void);
+/* Moves whenever a global holding or receiving a function is rebound. */
+uint64_t  ray_env_fn_generation(void);
 void      ray_env_mark_lexical_scope(int32_t below);
 /* A named-call boundary: lookups below it see only `table`'s columns
  * (NULL for none) and then the globals. */

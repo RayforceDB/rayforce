@@ -2191,7 +2191,10 @@ typedef struct {
     int64_t* par_names;           /* the body's parameters, bound to the call's argument text */
     ray_t** par_args;
     int n_pars;
+    const struct key_pure_ctx* caller;   /* where the argument text was written */
 } key_pure_ctx_t;
+struct key_pure_ctx { ray_t* closure; int64_t* let_names; ray_t** let_lits; int n_lets;
+                      int64_t* par_names; ray_t** par_args; int n_pars; const struct key_pure_ctx* caller; };
 
 enum { KEY_PURE_MAX_BIND = 16 };
 
@@ -2255,13 +2258,24 @@ static bool key_bind_params(ray_t* params, ray_t** args, int64_t nargs, key_pure
 }
 
 /* A call of a lambda value: its body with its own captures and parameters. */
-static bool key_lambda_call_pure(ray_t* lam, ray_t** args, int64_t nargs, int depth) {
+static bool key_bind_unknown_params(ray_t* params, key_pure_ctx_t* ctx) {
+    int64_t np = params ? params->len : 0;
+    if (np > KEY_PURE_MAX_BIND || (np > 0 && params->type != RAY_SYM)) return false;
+    for (int64_t i = 0; i < np; i++) { ctx->par_names[i] = ray_read_sym(ray_data(params), i, RAY_SYM, params->attrs); ctx->par_args[i] = NULL; }
+    ctx->n_pars = (int)np;
+    return true;
+}
+
+static bool key_lambda_call_pure(ray_t* lam, ray_t** args, int64_t nargs, int depth, key_pure_ctx_t* caller) {
     ray_t* body = LAMBDA_BODY(lam);
     if (!body || body->type != RAY_LIST) return false;
     int64_t let_names[KEY_PURE_MAX_BIND], par_names[KEY_PURE_MAX_BIND];
     ray_t* let_lits[KEY_PURE_MAX_BIND]; ray_t* par_args[KEY_PURE_MAX_BIND];
-    key_pure_ctx_t ctx = { LAMBDA_CLOSURE(lam), let_names, let_lits, 0, par_names, par_args, 0 };
-    if (args && !key_bind_params(LAMBDA_PARAMS(lam), args, nargs, &ctx)) return false;
+    key_pure_ctx_t ctx = { LAMBDA_CLOSURE(lam), let_names, let_lits, 0, par_names, par_args, 0, (const struct key_pure_ctx*)caller };
+    /* Called: the parameters mean the arguments; passed as a value: its
+     * parameters are unknown values (a call through one is an effect). */
+    if (args ? !key_bind_params(LAMBDA_PARAMS(lam), args, nargs, &ctx)
+             : !key_bind_unknown_params(LAMBDA_PARAMS(lam), &ctx)) return false;
     ray_t** es = ray_data(body);
     for (int64_t i = 0; i < body->len; i++)
         if (!key_expr_pure(es[i], depth + 1, &ctx)) return false;
@@ -2274,18 +2288,21 @@ static bool key_literal_call_pure(ray_t* lit, ray_t** args, int64_t nargs, int d
     ray_t** le = ray_data(lit);
     int64_t let_names[KEY_PURE_MAX_BIND], par_names[KEY_PURE_MAX_BIND];
     ray_t* let_lits[KEY_PURE_MAX_BIND]; ray_t* par_args[KEY_PURE_MAX_BIND];
-    key_pure_ctx_t ctx = { outer->closure, let_names, let_lits, 0, par_names, par_args, 0 };
+    key_pure_ctx_t ctx = { outer->closure, let_names, let_lits, 0, par_names, par_args, 0, (const struct key_pure_ctx*)outer };
     for (int i = 0; i < outer->n_lets && i < KEY_PURE_MAX_BIND; i++) { let_names[i] = outer->let_names[i]; let_lits[i] = outer->let_lits[i]; }
     ctx.n_lets = outer->n_lets < KEY_PURE_MAX_BIND ? outer->n_lets : KEY_PURE_MAX_BIND;
-    if (args) { if (!key_bind_params(le[1], args, nargs, &ctx)) return false; }
-    else {
-        /* Not called here: its parameters are unknown values (a parameter
-         * called inside the body is then an effect). */
-        ray_t* params = le[1];
-        int64_t np = params ? params->len : 0;
-        if (np > KEY_PURE_MAX_BIND || (np > 0 && params->type != RAY_SYM)) return false;
-        for (int64_t i = 0; i < np; i++) { par_names[i] = ray_read_sym(ray_data(params), i, RAY_SYM, params->attrs); par_args[i] = NULL; }
-        ctx.n_pars = (int)np;
+    /* The enclosing body's parameters stay visible inside the literal (its
+     * own, bound below, shadow them: the search runs newest first). */
+    int inherited = outer->n_pars < KEY_PURE_MAX_BIND ? outer->n_pars : KEY_PURE_MAX_BIND;
+    for (int i = 0; i < inherited; i++) { par_names[i] = outer->par_names[i]; par_args[i] = outer->par_args[i]; }
+    ctx.n_pars = inherited;
+    ray_t* params = le[1];
+    int64_t np = params ? params->len : 0;
+    if (np != (args ? nargs : np) || ctx.n_pars + np > KEY_PURE_MAX_BIND || (np > 0 && params->type != RAY_SYM)) return false;
+    for (int64_t i = 0; i < np; i++) {
+        par_names[ctx.n_pars] = ray_read_sym(ray_data(params), i, RAY_SYM, params->attrs);
+        par_args[ctx.n_pars] = args ? args[i] : NULL;   /* unknown when not called here */
+        ctx.n_pars++;
     }
     for (int64_t i = 2; i < lit->len; i++)
         if (!key_expr_pure(le[i], depth + 1, &ctx)) return false;
@@ -2303,12 +2320,13 @@ static bool key_name_pure(int64_t id, ray_t** args, int64_t nargs, int depth, ke
         ray_t* a = ctx->par_args[i];
         if (!a) return !called;                                  /* an unknown value */
         if (a->type == -RAY_SYM && !(a->attrs & ATTR_QUOTED)) {
-            /* The argument names something: follow it, outside this body's
-             * own bindings (the call site is in the enclosing text). */
-            key_pure_ctx_t outer = *ctx; outer.n_pars = 0;
-            return key_name_pure(a->i64, args, nargs, depth + 1, &outer);
+            /* The argument names something: follow it where the call was
+             * written, the caller's context, not this body's bindings. */
+            key_pure_ctx_t top = { NULL, ctx->let_names, ctx->let_lits, 0, ctx->par_names, ctx->par_args, 0, NULL };
+            key_pure_ctx_t* at = ctx->caller ? (key_pure_ctx_t*)ctx->caller : &top;
+            return key_name_pure(a->i64, args, nargs, depth + 1, at);
         }
-        if (key_literal_is_fn(a)) return key_literal_call_pure(a, args, nargs, depth, ctx);
+        if (key_literal_is_fn(a)) return key_literal_call_pure(a, args, nargs, depth, ctx->caller ? (key_pure_ctx_t*)ctx->caller : ctx);
         if (a->type == RAY_LIST && !(a->attrs & ATTR_QUOTED) && a->len > 0) return !called;   /* computed */
         return !called;                                          /* a literal datum */
     }
@@ -2324,7 +2342,7 @@ static bool key_name_pure(int64_t id, ray_t** args, int64_t nargs, int depth, ke
     if (!v) v = ray_env_get_local(id);       /* a parameter or let of a frame in scope */
     if (!v) v = ray_env_get_global(id);
     if (!v) return !called;                  /* an unknown callee is an effect */
-    if (v->type == RAY_LAMBDA) return key_lambda_call_pure(v, args, nargs, depth);
+    if (v->type == RAY_LAMBDA) return key_lambda_call_pure(v, args, nargs, depth, ctx);
     if (v->type == RAY_UNARY || v->type == RAY_BINARY || v->type == RAY_VARY)
         return !key_impure_builtin(v, id);
     return !called;                          /* data: calling it is an error, not an effect */
@@ -10281,7 +10299,7 @@ static ray_t* select_plan_computed_key(ray_t* dict, ray_t* tbl, int64_t* key_nam
              * a repeated run would repeat the effect. */
             int64_t pure_lets[KEY_PURE_MAX_BIND], pure_pars[KEY_PURE_MAX_BIND];
             ray_t* pure_lits[KEY_PURE_MAX_BIND]; ray_t* pure_args[KEY_PURE_MAX_BIND];
-            key_pure_ctx_t pure_ctx = { NULL, pure_lets, pure_lits, 0, pure_pars, pure_args, 0 };
+            key_pure_ctx_t pure_ctx = { NULL, pure_lets, pure_lits, 0, pure_pars, pure_args, 0, NULL };
             bool pure = key_expr_pure(by_expr, 0, &pure_ctx);
             ray_t* keyvec = pure ? eval_expr_whole_column(by_expr, base) : NULL;
             if (!pure) keyvec = eval_expr_per_row(by_expr, base, nrows);
@@ -17071,11 +17089,16 @@ static bool update_dag_err_final(ray_t* out, bool if_refused) {
  * one cell: that is an error (#692).  When both paths fail, the planner's error (a misspelt
  * column: `schema: column 'x' not found`) wins over the interpreter's less
  * specific one.  Owned; a one-element vector is its atom. */
+/* The expression the planner last declined to compile in a grouped update:
+ * the same expression over the next group would be declined again, so the
+ * groups after the first skip the graph and go to the evaluator directly. */
+static _Thread_local ray_t* g_update_dag_declined = NULL;
+
 static ray_t* update_eval_on_impl(ray_t* sub, ray_t* expr, bool expand) {
     ray_t* out = NULL;
     ray_t* cerr = NULL;
     bool if_refused = false;
-    ray_graph_t* g = ray_graph_new(sub);
+    ray_graph_t* g = g_update_dag_declined == expr ? NULL : ray_graph_new(sub);
     if (g) {
         ray_op_t* op = compile_expr_dag(g, expr);
         if (op) {
@@ -17083,6 +17106,7 @@ static ray_t* update_eval_on_impl(ray_t* sub, ray_t* expr, bool expand) {
             out = ray_execute(g, op);
         } else {
             cerr = graph_take_compile_err(g);
+            g_update_dag_declined = expr;
         }
         if_refused = g->if_refused;
         ray_graph_free(g);
@@ -17552,16 +17576,19 @@ ray_t* ray_update(ray_t** args, int64_t n) {
             ray_t* agg_expr = dict_elems[d + 1];
             /* Pure helpers can be expanded once for every group's identical
              * schema. Keep effectful expressions on the per-group path. */
-            bool expand = query_expr_has_helper(agg_expr);
-            if (expand) {
+            /* The expansion is text over the schema, the same for every
+             * group, so it is made once; an opaque helper left in it is
+             * called per group by the evaluator.  Only a pure expansion also
+             * caches its dependency analysis across groups. */
+            bool expand = false;
+            bool pure_expansion = false;
+            if (query_expr_has_helper(agg_expr)) {
                 ray_t* candidate = query_inline_helpers(agg_expr, tbl);
-                if (query_inline_pure(candidate, 0)) {
-                    prepared_expr = candidate;
-                    agg_expr = candidate;
-                    expand = false;
-                } else ray_release(candidate);
+                prepared_expr = candidate;
+                agg_expr = candidate;
+                pure_expansion = query_inline_pure(candidate, 0);
             }
-            bool cache_dependencies = !expand && query_inline_pure(agg_expr, 0);
+            bool cache_dependencies = (prepared_expr ? pure_expansion : query_inline_pure(agg_expr, 0));
 
             /* We need to evaluate the aggregate per group.
              * Build the result column by evaluating the expression on each group's subset. */
