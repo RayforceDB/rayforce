@@ -1920,12 +1920,14 @@ static inline int64_t pq_sat_mul(int64_t a, int64_t b) {
  * dictionary, the encoding stats naming such a page, or no stats at all
  * (unsure: then every data byte may be a string's, a string at least the 4
  * bytes of its length prefix).  An unreadable dictionary header counts the
- * whole chunk so.  Saturating, never negative. */
+ * whole chunk so; a chunk of no size (missing or not positive) is unsure,
+ * unbounded.  Asked only for a chunk of rows (pq_vocab_bounds leaves out
+ * the zero-row groups, as the decoder does).  Saturating, never negative. */
 static int64_t pq_chunk_vocab(ray_parquet_t* r, pq_span* mf, bool* dict_only) {
     int64_t raw = pq_get(mf[6],-1), values = pq_get(mf[5],-1);
     int64_t data = pq_get(mf[9],-1), dict = pq_get(mf[11],-1);
-    *dict_only = raw <= 0;
-    if (raw <= 0) return 0;
+    *dict_only = false;
+    if (raw <= 0) return INT64_MAX;
     if (values < 0 || values > raw) values = raw;
     int64_t draw, entries, rest = raw, bound = 0;
     if (dict > 0 && dict < data && pq_dict_header(r,dict,&draw,&entries)) {
@@ -1939,9 +1941,9 @@ static int64_t pq_chunk_vocab(ray_parquet_t* r, pq_span* mf, bool* dict_only) {
 /* The symbol columns' bounds (pq_chunk_vocab), summed over the row groups,
  * into vocab[c] for the columns order[from, to), and in dict_only[c]
  * whether every chunk's strings are its dictionary page's (the encoding
- * stats say no data page holds values).  The dictionary page headers are
- * asked for all at once first (one small read each, in flight together)
- * and then parsed. */
+ * stats say no data page holds values), zero-row groups left out.  The
+ * dictionary page headers are asked for all at once first (one small read
+ * each, in flight together) and then parsed. */
 static void pq_vocab_bounds(ray_parquet_t* r, const int64_t* order, int64_t from, int64_t to, int64_t* vocab,
                             uint8_t* dict_only) {
     pq_span* cols = ray_calloc_raw((size_t)r->ncols*sizeof(*cols));
@@ -1951,6 +1953,7 @@ static void pq_vocab_bounds(ray_parquet_t* r, const int64_t* order, int64_t from
         for (int64_t g = 0; g < r->ngroups; g++) {
             int64_t rows = 0;
             bool ok = pq_group_columns(r,g,cols,&rows,NULL);
+            if (ok && rows == 0) continue;   /* nothing decoded (pq_start_group), whatever its chunks say */
             for (int64_t i = from; i < to; i++) {
                 int64_t c = order[i]; pq_span mf[17];
                 if (!ok || !pq_fields(cols[c],mf,17)) { if (pass) { vocab[c] = INT64_MAX; dict_only[c] = 0; } continue; }
@@ -1985,11 +1988,11 @@ static const char* pq_seed_dicts(ray_parquet_t* r, const int64_t* order, int64_t
         for (int64_t g = 0; !err && g < r->ngroups; g++) {
             int64_t rows = 0;
             if (!pq_group_columns(r,g,cols,&rows,NULL)) { err = "invalid row group"; break; }
+            if (rows == 0) continue;   /* no rows: pq_vocab_bounds and the decoder skip it too */
             for (int64_t i = from; !err && i < to; i++) {
                 int64_t c = order[i]; pq_span mf[17];
                 if (!pq_fields(cols[c],mf,17)) { err = "invalid column metadata"; break; }
                 int64_t dict = pq_get(mf[11],-1), data = pq_get(mf[9],-1), codec = pq_get(mf[4],-1);
-                if (pq_get(mf[6],-1) <= 0) continue;   /* no values */
                 if (codec != 0 && codec != 1) { err = "unsupported compression codec (supported: uncompressed, Snappy)"; break; }
                 if (dict > data) { err = "dictionary follows data"; break; }
                 if (dict < 4 || dict == data || (uint64_t)data > r->data_end) { err = "column chunk outside file data"; break; }
@@ -3031,9 +3034,11 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
         if (!sgrp) { err = ray_error("oom",NULL); goto done; }
         if (nd == r->ncols) nd = nnum;   /* forced: every symbol column grouped */
     } else nd = r->ncols;
+    int64_t seeded = -1, seed0 = 0;   /* the trace's: the dictionary's count after the seeding, and before */
     if (seed) {
         int64_t ts = trace ? ray_profile_now_ns() : 0, entries = 0;
         int64_t bad_col;
+        seed0 = ray_symimp_count(simp);
         const char* se = pq_seed_dicts(r,order,nnum,nd,&entries,&bad_col);
         if (se && bad_col >= 0) {
             ray_t* name = ray_sym_str(r->schema[bad_col].name);
@@ -3041,6 +3046,7 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
             goto done;
         }
         if (se) { err = pq_error(se); goto done; }
+        seeded = ray_symimp_count(simp);
         if (trace) fprintf(stderr,"parquet symseed: cols=%lld groups=%lld entries=%lld ms=%.1f\n",(long long)(nd-nnum),
                            (long long)r->ngroups,(long long)entries,(double)(ray_profile_now_ns()-ts)/1e6);
     }
@@ -3099,6 +3105,11 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
         if (!err && atomic_load_explicit(&symf.err,memory_order_acquire) != RAY_OK)
             err = ray_error(ray_err_code_str((ray_err_t)atomic_load(&symf.err)),"parquet: cannot flush symbol file");
         if (err) break;
+        /* a seeded column's strings the seeding did not see (stats that
+         * leave out a PLAIN page): their positions are the workers' */
+        if (trace && seeded >= 0 && p < nd && p + work.npass >= nd)
+            fprintf(stderr,"parquet symdirect: cols=%lld seeded=%lld seed_miss=%lld\n",(long long)(nd-nnum),
+                    (long long)(seeded-seed0),(long long)(ray_symimp_count(simp)-seeded));
         if (trace) t1 = ray_profile_now_ns();
         for (int64_t i = 0; i < work.npass; i++) {
             int64_t c = work.pass[i];

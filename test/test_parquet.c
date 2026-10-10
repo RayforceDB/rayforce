@@ -1960,6 +1960,14 @@ enum { PQX_DICT = 1, PQX_FALLBACK = 2, PQX_SNAPPY = 4, PQX_LATE = 8, PQX_NOSTATS
                                               * footer (pages stored as written); PQX_HUGERAW: total_uncompressed_size
                                               * INT64_MAX - 4096 in the footer (the pages as written) */
 static int64_t pqx_rows = 1, pqx_groups = 1;   /* the file the functions describe */
+/* pqx_empty >= 0: that row group has no rows (the others share them), its
+ * chunks written as pyarrow writes a zero-row group's: a dictionary
+ * column's an empty dictionary page and data_page_offset 0 */
+static int64_t pqx_empty = -1;
+static int64_t pqx_lo(int64_t rows, int64_t groups, int64_t g) {
+    if (pqx_empty < 0 || groups < 2) return rows * g / groups;
+    return rows * (g > pqx_empty ? g - 1 : g) / (groups - 1);
+}
 static void pqx_lit(pq_buf* o, const uint8_t* p, size_t n) {
     while (n) {
         size_t k = n < 65536 ? n : 65536;
@@ -2037,7 +2045,7 @@ static bool pqx_synth(const char* path, int64_t rows, int64_t groups, int n, con
     pb_bytes(&f, "PAR1", 4);
     char buf[256];
     for (int64_t g = 0; g < groups; g++) {
-        int64_t lo = rows * g / groups, hi = rows * (g + 1) / groups;
+        int64_t lo = pqx_lo(rows, groups, g), hi = pqx_lo(rows, groups, g + 1);
         for (int64_t c = 0; c < nc; c++) {
             int64_t i = g * nc + c;
             start[i] = (int64_t)f.n; rawt[i] = 0; dio[i] = -1;
@@ -2097,6 +2105,7 @@ static bool pqx_synth(const char* path, int64_t rows, int64_t groups, int n, con
                 pqx_page(&f, 0, &body, b - a, ids ? 8 : 0, snappy, &rawt[i]);
                 ray_sys_free(levels.p); ray_sys_free(values.p); ray_sys_free(body.p);
             }
+            if (g == pqx_empty && dicted) dpo[i] = 0;   /* no data page: pyarrow writes offset 0 */
             if (dict.bad || doff.bad) f.bad = true;
             ray_sys_free(dict.p); ray_sys_free(doff.p);
             stored[i] = (int64_t)f.n - start[i];
@@ -2116,7 +2125,7 @@ static bool pqx_synth(const char* path, int64_t rows, int64_t groups, int n, con
     pb_i(&f, &last, 3, PB_I64, rows);
     pb_field(&f, &last, 4, PB_LIST); pb_list(&f, (int)groups, PB_STRUCT);
     for (int64_t g = 0; g < groups; g++) {
-        int64_t cnt = rows * (g + 1) / groups - rows * g / groups, total = 0;
+        int64_t cnt = pqx_lo(rows, groups, g + 1) - pqx_lo(rows, groups, g), total = 0;
         int l = 0;
         pb_field(&f, &l, 1, PB_LIST); pb_list(&f, (int)nc, PB_STRUCT);
         for (int64_t c = 0; c < nc; c++) {
@@ -2763,6 +2772,9 @@ static int64_t sk_mixed_ram(const char* src, const char* dir, ray_t* types, cons
     double bp = pq_trace_line_num(trace, "parquet symcol: col=p ", "vocab_bytes");
     double bq = pq_trace_line_num(trace, "parquet symcol: col=q ", "vocab_bytes");
     double text = pq_trace_sum(trace, "text_bytes", NULL);
+    /* an unbounded column (a chunk of no size: never direct) sets nothing */
+    if (bp >= 0x1p62) bp = 0;
+    if (bq >= 0x1p62) bq = 0;
     double big = bp > bq ? bp : bq;
     int64_t sram = (int64_t)(big * 64) + 1024;
     fprintf(stderr, "  sk: bounds p %.0f q %.0f text %.0f -> ram %lld\n", bp, bq, text, (long long)sram);
@@ -2820,6 +2832,8 @@ static test_result_t test_pq_sk_mixed_workers(void) {
         bool same = !k || sk_files_same(ref, out, fnames + 1, n);
         fprintf(stderr, "  [%s] p %s q %s u %s%s, %lld symbols (direct %lld)%s\n", what, pd ? "D" : "G", qd ? "D" : "G",
                 v ? "-" : ug ? "G" : "D", seeded ? " seeded" : "", (long long)pq_sym_count(out), (long long)words, same ? "" : ", FILES DIFFER");
+        /* honest dictionaries: the seeding saw every string */
+        if (pq_trace_line_num(trace, "parquet symdirect:", "seed_miss") != 0) bad++;
         if (!pd || !qd || !ug || !seeded || !same || pq_sym_count(out) != words) bad++;
         if (k) pq_remove_native(dir, fnames, n + 1);
     }
@@ -2833,12 +2847,14 @@ static test_result_t test_pq_sk_mixed_workers(void) {
     PASS();
 #endif
 }
-/* Footers that make a chunk look dictionary-only when it is not: 0, encoding
- * stats that leave out its PLAIN pages (a writer's fallback past the
- * dictionary); 1, a total_uncompressed_size of 0 (its dictionary is then
- * neither bounded nor seeded).  q goes direct, and the parallel pass adds
- * strings no seeding put there.  Values right; what the files and the bound
- * do is printed. */
+/* Footers that would make a chunk look dictionary-only when it is not: 1, a
+ * total_uncompressed_size of 0, a chunk of rows of no size: unsure, so q
+ * goes grouped and every run writes one worker's files; 0, encoding stats
+ * that leave out its PLAIN pages (a writer's fallback past the dictionary;
+ * malformed, and only the pages themselves would tell): q goes direct and
+ * seeded, and the trace counts the strings its passes add that the seeding
+ * did not see (seed_miss, their positions the workers').  Values right in
+ * both; whether the files differ is printed. */
 static test_result_t test_pq_sk_lying_stats(void) {
 #if !defined(DEBUG)
     SKIP("the memory the decision assumes is a debug-build knob");
@@ -2882,13 +2898,18 @@ static test_result_t test_pq_sk_lying_stats(void) {
         char what[64]; snprintf(what, sizeof(what), "sk lying %s %d%s", v ? "raw=0" : "stats", runs[k].cores, runs[k].rev ? " rev" : "");
         if (!pqx_check(out, rows, 3, nm, fns, what, NULL)) bad++;
         bool qd = pq_trace_line_has(trace, "parquet symcol: col=q ", " mode=direct");
+        bool pd = pq_trace_line_has(trace, "parquet symcol: col=p ", " mode=direct");
+        double miss = pq_trace_line_num(trace, "parquet symdirect:", "seed_miss");
         bool same = !k || sk_files_same(ref, out, fnames + 1, 3);
         if (!same) differ++;
         char sym[200]; snprintf(sym, sizeof(sym), "%s/.sym", out);
         FILE* f = fopen(sym, "rb"); long size = -1;
         if (f) { fseek(f, 0, SEEK_END); size = ftell(f); fclose(f); }
-        fprintf(stderr, "  [%s] q %s (dict_only %.0f, bound %.0f B), .sym %ld B, %lld symbols%s\n", what, qd ? "direct" : "grouped",
-                donly, bq, size, (long long)pq_sym_count(out), same ? "" : ", FILES DIFFER from one worker's");
+        fprintf(stderr, "  [%s] q %s (dict_only %.0f, bound %.0f B), seed_miss %.0f, .sym %ld B, %lld symbols%s\n", what,
+                qd ? "direct" : "grouped", donly, bq, miss, size, (long long)pq_sym_count(out), same ? "" : ", FILES DIFFER from one worker's");
+        if (!pd || pq_sym_count(out) != words) bad++;
+        if (v && (qd || donly != 0 || bq < 0x1p62 || miss != 0 || !same)) bad++;   /* unsure: unbounded */
+        if (!v && (!qd || miss <= 0)) bad++;
         if (k) pq_remove_native(dir, fnames, 4);
     }
     fprintf(stderr, "  sk lying %s: %d of %d runs differ from one worker's files\n", v ? "raw=0" : "stats", differ,
@@ -2896,6 +2917,78 @@ static test_result_t test_pq_sk_lying_stats(void) {
     pq_remove_native(ref, fnames, 4);
     if (getenv("SK_KEEP")) fprintf(stderr, "  sk lying: kept %s (RAY_PQ_SYM_RAM=%s)\n", src, ramv); else unlink(src);
     }
+    ray_pool_destroy();
+    ray_sys_free(trace);
+    ray_release(types);
+    TEST_ASSERT_EQ_I(bad, 0);
+    PASS();
+#endif
+}
+/* A row group of no rows amid the others, written as pyarrow writes one (a
+ * dictionary column's chunk an empty dictionary page and data_page_offset
+ * 0): nothing to decode, so it neither unbounds a dictionary column nor
+ * stops its seeding.  p and q go direct and seeded, u grouped, on one and
+ * four workers alike. */
+static test_result_t test_pq_symgrp_empty_group(void) {
+#if !defined(DEBUG)
+    SKIP("the memory the decision assumes is a debug-build knob");
+#else
+    pq_sym_env_clear();
+    char src[160], dir[160], ref[160];
+    snprintf(src, sizeof(src), "/tmp/rayforce-pqeg-%d.parquet", (int)getpid());
+    snprintf(dir, sizeof(dir), "/tmp/rayforce-pqeg-%d", (int)getpid());
+    snprintf(ref, sizeof(ref), "/tmp/rayforce-pqeg-%d-ref", (int)getpid());
+    const char* fnames[4] = {"x","p","q","u"};
+    const char* nm[3] = {"p","q","u"};
+    pq_synth_fn fns[3] = {pqx_lowcard, pqx_card100, pqx_unique};
+    unsigned fl[3] = {PQX_DICT | PQX_SNAPPY, PQX_DICT, 0};
+    int64_t tids[4] = {ray_sym_intern("I32", 3), ray_sym_intern("SYM", 3), ray_sym_intern("SYM", 3), ray_sym_intern("SYM", 3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 4);
+    size_t cap = (size_t)1 << 16;
+    char* trace = (char*)ray_sys_alloc(cap);
+    TEST_ASSERT_TRUE(trace != NULL);
+    const int64_t rows = 24000;
+    pqx_empty = 3;
+    bool made = pqx_synth(src, rows, 7, 3, nm, fns, fl);
+    pqx_empty = -1;
+    TEST_ASSERT_TRUE(made);
+    TEST_ASSERT_EQ_I(pq_pool(1), RAY_OK);
+    int64_t words = 0;
+    int64_t sram = sk_mixed_ram(src, dir, types, fnames, 4, trace, cap, &words);
+    double op = pq_trace_line_num(trace, "parquet symcol: col=p ", "dict_only");
+    double oq = pq_trace_line_num(trace, "parquet symcol: col=q ", "dict_only");
+    TEST_ASSERT_TRUE(sram > 0);
+    int bad = 0;
+    if (op != 1 || oq != 1) { fprintf(stderr, "  empty group: dict_only p %.0f q %.0f\n", op, oq); bad++; }
+    char ramv[32]; snprintf(ramv, sizeof(ramv), "%lld", (long long)sram);
+    static const int cores[] = {1, 4};
+    for (size_t k = 0; k < sizeof(cores) / sizeof(cores[0]); k++) {
+        const char* out = k ? dir : ref;
+        TEST_ASSERT_EQ_I(pq_pool(cores[k]), RAY_OK);
+        pq_set_env("RAY_PQ_SYM_RAM", ramv);
+        ray_error_clear();
+        ray_t* res = pq_traced_import(src, out, types, trace, cap);
+        pq_sym_env_clear();
+        bool ok = res && !RAY_IS_ERR(res);
+        if (!ok) fprintf(stderr, "  empty group %d: %s\n", cores[k], ray_error_msg() ? ray_error_msg() : "(no message)");
+        if (res) { if (RAY_IS_ERR(res)) ray_error_free(res); else ray_release(res); }
+        TEST_ASSERT_TRUE(ok);
+        char what[64]; snprintf(what, sizeof(what), "empty group %d", cores[k]);
+        if (!pqx_check(out, rows, 3, nm, fns, what, NULL)) bad++;
+        bool pd = pq_trace_line_has(trace, "parquet symcol: col=p ", " mode=direct");
+        bool qd = pq_trace_line_has(trace, "parquet symcol: col=q ", " mode=direct");
+        bool ug = pq_trace_line_has(trace, "parquet symcol: col=u ", " mode=grouped");
+        bool seeded = strstr(trace, "parquet symseed:") != NULL;
+        double miss = pq_trace_line_num(trace, "parquet symdirect:", "seed_miss");
+        bool same = !k || sk_files_same(ref, out, fnames + 1, 3);
+        fprintf(stderr, "  [%s] p %s q %s u %s%s, seed_miss %.0f, %lld symbols (direct %lld)%s\n", what, pd ? "D" : "G",
+                qd ? "D" : "G", ug ? "G" : "D", seeded ? " seeded" : "", miss, (long long)pq_sym_count(out), (long long)words,
+                same ? "" : ", FILES DIFFER");
+        if (!pd || !qd || !ug || !seeded || miss != 0 || !same || pq_sym_count(out) != words) bad++;
+        if (k) pq_remove_native(dir, fnames, 4);
+    }
+    pq_remove_native(ref, fnames, 4);
+    unlink(src);
     ray_pool_destroy();
     ray_sys_free(trace);
     ray_release(types);
@@ -3028,6 +3121,7 @@ const test_entry_t parquet_entries[] = {
     {"parquet/sk_huge_raw",test_pq_sk_huge_raw,pq_setup,pq_teardown},
     {"parquet/sk_mixed_workers",test_pq_sk_mixed_workers,pq_setup,pq_teardown},
     {"parquet/sk_lying_stats",test_pq_sk_lying_stats,pq_setup,pq_teardown},
+    {"parquet/symgrp_empty_group",test_pq_symgrp_empty_group,pq_setup,pq_teardown},
     {"parquet/sk_codec_message",test_pq_sk_codec_message,pq_setup,pq_teardown},
     {"parquet/small_stack",test_pq_small_stack,NULL,NULL},
     {"parquet/parted_symbols",test_pq_parted_symbols,pq_setup,pq_teardown},
