@@ -1996,12 +1996,23 @@ static const char* pq_seed_dicts(ray_parquet_t* r, const int64_t* order, int64_t
                 int64_t c = order[i]; pq_span mf[17];
                 if (!pq_fields(cols[c],mf,17)) { err = "invalid column metadata"; break; }
                 int64_t dict = pq_get(mf[11],-1), data = pq_get(mf[9],-1), codec = pq_get(mf[4],-1);
+                int64_t bytes = pq_get(mf[7],-1);
                 if (codec != 0 && codec != 1) { err = "unsupported compression codec (supported: uncompressed, Snappy)"; break; }
+                /* the decoder's bounds (pq_start_group): the chunk from its
+                 * dictionary page for total_compressed_size bytes, whatever
+                 * data_page_offset says past it */
                 if (dict > data) { err = "dictionary follows data"; break; }
-                if (dict < 4 || dict == data || (uint64_t)data > r->data_end) { err = "column chunk outside file data"; break; }
-                if (!pass) { ray_vm_advise_willneed(r->map + dict,(size_t)(data - dict)); continue; }
+                if (dict < 4 || bytes < 0 || (uint64_t)dict > r->data_end || (uint64_t)bytes > r->data_end-(uint64_t)dict) {
+                    err = "column chunk outside file data"; break;
+                }
+                if (!pass) {
+                    /* the dictionary page: to the first data page where that
+                     * lies within the chunk, else the chunk */
+                    ray_vm_advise_willneed(r->map + dict,(size_t)(data > dict && data - dict <= bytes ? data - dict : bytes));
+                    continue;
+                }
                 *bad_col = c;   /* the page's errors name the column, as the decoder's do */
-                pq_cur cur = {r->map+dict,r->map+data,false};
+                pq_cur cur = {r->map+dict,r->map+dict+bytes,false};
                 const uint8_t* start = cur.p;
                 pq_span f[10], h[4];
                 if (!pq_skip(&cur,12,0,false)) { err = "invalid page header"; break; }
