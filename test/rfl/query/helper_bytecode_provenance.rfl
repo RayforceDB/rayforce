@@ -384,7 +384,7 @@ CNT9 -- 6
 (grp10 T10 kg10) -- [3 3]
 (set kl10 (fn [v] 1 (let f (fn [x] (- x (avg x)))) (> (f v) 0)))
 (at (select {n: (count v) by: (kl10 v) from: T10}) 'n) -- [3 3]
-(set mkc10 (fn [h] (fn [v] (> (h v) 0))))
+(set mkc10 (fn [hcap10] (fn [v] (> (hcap10 v) 0))))
 (set kc10 (mkc10 (fn [x] (- x (avg x)))))
 (at (select {n: (count v) by: (kc10 v) from: T10}) 'n) -- [3 3]
 (set km10 (fn [v] 1 (> v (mavg 3 v))))

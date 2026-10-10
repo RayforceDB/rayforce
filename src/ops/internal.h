@@ -1826,6 +1826,9 @@ void ray_group_winners(ray_group_winner_fn fn, void* context, const int64_t* row
 
 /* Gather winning group rows, retaining source domains and native types. */
 ray_t* ray_group_gather(ray_t* column, const int64_t* rows, int64_t count);
+/* Keep a grouped key column's "may have nulls" flag only when a key value is
+ * null (vectorised, pool-split scan); see agg_engine.c. */
+void   ray_group_key_settle_nulls(ray_t* kc);
 
 
 /* A scalar `where:` predicate holds for every row or none.  It needs a truth

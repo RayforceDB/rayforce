@@ -15618,6 +15618,9 @@ v2_emit:;
         for (uint32_t k = 0; k < n_keys; k++) {
             if (!key_cols[k]) continue;
             grp_finalize_nulls(key_cols[k]);
+            /* The flag seeded from the source column above is a "may": a
+             * fused where: can have removed every null key row. */
+            ray_group_key_settle_nulls(key_cols[k]);
         }
 
         /* Add key columns to result */

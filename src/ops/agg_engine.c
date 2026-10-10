@@ -687,15 +687,57 @@ static void agg_gather_native_run(void* raw, uint32_t wid, int64_t start, int64_
     if (any_null) atomic_store_explicit(&c->any_null, true, memory_order_relaxed);
 }
 
+typedef struct { const ray_t* v; _Atomic(int) found; } key_null_scan_t;
+
+/* Any null sentinel in [start, end)?  Written as a block-wise OR-reduction
+ * so the compiler vectorises the compare; the block boundary is where the
+ * early exit happens. */
+static bool key_null_in_range(const ray_t* v, int64_t start, int64_t end) {
+    const void* p = ray_data((ray_t*)v);
+    enum { BLOCK = 4096 };
+    for (int64_t s = start; s < end; s += BLOCK) {
+        int64_t e = s + BLOCK < end ? s + BLOCK : end;
+        int any = 0;
+        switch (v->type) {
+            case RAY_F64: { const double* d = p; for (int64_t i = s; i < e; i++) any |= (d[i] != d[i]); break; }
+            case RAY_F32: { const float* d = p; for (int64_t i = s; i < e; i++) any |= (d[i] != d[i]); break; }
+            case RAY_I64: case RAY_TIMESTAMP: { const int64_t* d = p; for (int64_t i = s; i < e; i++) any |= (d[i] == NULL_I64); break; }
+            case RAY_I32: case RAY_DATE: case RAY_TIME: { const int32_t* d = p; for (int64_t i = s; i < e; i++) any |= (d[i] == NULL_I32); break; }
+            case RAY_I16: { const int16_t* d = p; for (int64_t i = s; i < e; i++) any |= (d[i] == NULL_I16); break; }
+            case RAY_GUID: { const uint64_t* d = p; for (int64_t i = s; i < e; i++) any |= (d[2 * i] == 0 && d[2 * i + 1] == 0); break; }
+            default: return false;
+        }
+        if (any) return true;
+    }
+    return false;
+}
+
+static void key_null_scan_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    key_null_scan_t* c = raw;
+    if (atomic_load_explicit(&c->found, memory_order_relaxed)) return;
+    if (key_null_in_range(c->v, start, end)) atomic_store_explicit(&c->found, 1, memory_order_relaxed);
+}
+
 /* A result key column inherits its source column's "may have nulls" flag,
  * but a fused `where:` can remove every null row, and the same query over
  * the filtered table materialized first carries no flag: one result, two
  * spellings on the wire.  For a typed key keep the flag only when a key
- * value is null (the scan reads the flag, so it is set first).  Text keys
- * keep theirs: for them the flag is always "may". */
-static void agg_key_col_settle_nulls(ray_t* kc) {
-    if (!kc || RAY_IS_ERR(kc) || kc->type == RAY_SYM || kc->type == RAY_STR || kc->type == RAY_LIST) return;
-    if ((kc->attrs & RAY_ATTR_HAS_NULLS) && !ray_vec_has_nulls(kc))
+ * value is null: a vectorised sentinel scan, split across the pool for a
+ * large column.  Text keys keep theirs: for them the flag is always "may". */
+void ray_group_key_settle_nulls(ray_t* kc) {
+    if (!kc || RAY_IS_ERR(kc) || !(kc->attrs & RAY_ATTR_HAS_NULLS)) return;
+    switch (kc->type) {
+        case RAY_F64: case RAY_F32: case RAY_I64: case RAY_TIMESTAMP:
+        case RAY_I32: case RAY_DATE: case RAY_TIME: case RAY_I16: case RAY_GUID: break;
+        default: return;
+    }
+    key_null_scan_t c = { kc, 0 };
+    ray_pool_t* pool = ray_pool_get();
+    if (ray_pool_par_dispatch_ok(pool, kc->len, RAY_PARALLEL_THRESHOLD))
+        ray_pool_dispatch(pool, key_null_scan_fn, &c, kc->len);
+    else key_null_scan_fn(&c, 0, 0, kc->len);
+    if (!atomic_load_explicit(&c.found, memory_order_relaxed))
         kc->attrs &= (uint8_t)~RAY_ATTR_HAS_NULLS;
 }
 
@@ -750,7 +792,7 @@ ray_t* ray_group_gather(ray_t* src_col, const int64_t* first_row, int64_t n) {
     bool gathered_null = atomic_load_explicit(&c.any_null, memory_order_relaxed) &&
                          src_col->type != RAY_BOOL && src_col->type != RAY_U8;
     if (gathered_null || ray_vec_may_have_nulls(src_col)) out->attrs |= RAY_ATTR_HAS_NULLS;
-    if (!gathered_null) agg_key_col_settle_nulls(out);
+    if (!gathered_null) ray_group_key_settle_nulls(out);
     return out;
 }
 
@@ -2018,7 +2060,7 @@ static ray_t* agg_dense_finish(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t
             if (kc->type == RAY_SYM) ray_sym_vec_adopt_domain(kc, sym_domain_rep(key_cols[k]));
             agg_dense_key_emit_t emit = {key_plan, occupied_slot, key_part_slots, key_bits, kc, k};
             ray_pool_dispatch(pool, agg_dense_key_emit, &emit, ng);
-            agg_key_col_settle_nulls(kc);
+            ray_group_key_settle_nulls(kc);
         }
         result = ray_table_add_col(result, key_syms[k], kc);
         ray_release(kc);
@@ -4280,7 +4322,7 @@ static ray_t* agg_parts_emit(ray_op_ext_t* ext, agg_desc_t* d,
         ray_release(result); return kerr;
     }
     for (uint32_t k = 0; k < n_keys; k++) {
-        agg_key_col_settle_nulls(kouts[k]);
+        ray_group_key_settle_nulls(kouts[k]);
         result = ray_table_add_col(result, key_syms[k], kouts[k]);
         ray_release(kouts[k]);
     }

@@ -35,3 +35,18 @@
 (set gotk (select {from: TK where: (< a 4) by: [k b] total: (sum p)}))
 (count gotk) -- 11200
 (at (ser (at gotk 'k)) 17) -- 0x00
+;; the legacy wide-key path (an F64 key, alone or beside another key) applies
+;; the same rule; a null key that survives keeps its flag there too
+(set i (til 131073))
+(set TF (table [a k f p] (list (% i 5) (% i 7) (as 'F64 (% i 7)) (as 'F64 i))))
+(set TF (update {k: (if (== a 4) 0N k) f: (if (== a 4) 0Nf f) from: TF}))
+(set RF (do (select {from: TF where: (< a 4)})))
+(set qf (select {from: TF where: (< a 4) by: f s: (sum p)}))
+(at (ser (at qf 'f)) 17) -- 0x00
+(all (== (ser qf) (ser (select {from: RF by: f s: (sum p)})))) -- true
+(set qkf (select {from: TF where: (< a 4) by: [k f] s: (sum p)}))
+(at (ser (at qkf 'k)) 17) -- 0x00
+(at (ser (at qkf 'f)) 17) -- 0x00
+(set qn (select {from: TF where: (< a 5) by: f s: (sum p)}))
+(count qn) -- 8
+(at (ser (at qn 'f)) 17) -- 0x40
