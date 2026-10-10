@@ -776,15 +776,31 @@ ray_err_t ray_col_append_index(const char* path, const void* ix_v,
 #if defined(RAY_OS_LINUX)
 /* Debug builds: RAY_HASH_INJECT names a step of the in-place build to fail
  * there, for the tests — "fs": the filesystem is not one it trusts;
- * "grow", "map": the region cannot be allocated, or mapped; "build": an
- * interrupt as soon as it is mapped; "premarker": the process ends with
- * the region written, before the marker. */
+ * "fs:<hex>": the filesystem's type is taken to be <hex> (a magic number
+ * as fstatfs reports it), so filesystems the tests cannot mount are
+ * classified too; "grow", "map": the region cannot be allocated, or
+ * mapped; "build": an interrupt as soon as it is mapped; "premarker": the
+ * process ends with the region written, before the marker. */
 static bool col_hash_inject(const char* step) {
 #if defined(DEBUG)
     const char* e = getenv("RAY_HASH_INJECT");
     return e && strcmp(e, step) == 0;
 #else
     (void)step;
+    return false;
+#endif
+}
+static bool col_hash_inject_fs_type(unsigned long* type) {
+#if defined(DEBUG)
+    const char* e = getenv("RAY_HASH_INJECT");
+    if (!e || strncmp(e, "fs:", 3) != 0) return false;
+    char* end = NULL;
+    unsigned long t = strtoul(e + 3, &end, 16);
+    if (end == e + 3 || *end) return false;
+    *type = t;
+    return true;
+#else
+    (void)type;
     return false;
 #endif
 }
@@ -795,18 +811,23 @@ static bool col_hash_inject(const char* step) {
  * lost without a word (the fwrite append gets ENOSPC instead).  So the
  * filesystems whose fallocate reserves what the writes use — not
  * copy-on-write ones (ZFS, btrfs, bcachefs: an overwrite takes new space),
- * nor network or user ones (NFS, SMB, Ceph, FUSE: the server decides) —
- * and overlayfs, which hands both the mapping and the fallocate to its
- * upper layer (ext4 or xfs where overlayfs runs containers). */
+ * nor network or user ones (NFS, SMB, Ceph, FUSE: the server decides).
+ * Nor overlayfs: it hands the mapping and the fallocate to its upper layer,
+ * which can be any of those, and fstatfs reports the overlay — its upper
+ * directory, named in the mount options, is often not even reachable from
+ * where the overlay is used (a container). */
 static bool col_fs_reserves(int fd) {
     if (col_hash_inject("fs")) return false;
-    struct statfs sf;
-    if (fstatfs(fd, &sf) != 0) return false;
-    switch ((unsigned long)sf.f_type) {
+    unsigned long type = 0;
+    if (!col_hash_inject_fs_type(&type)) {
+        struct statfs sf;
+        if (fstatfs(fd, &sf) != 0) return false;
+        type = (unsigned long)sf.f_type;
+    }
+    switch (type) {
     case 0xEF53UL:       /* ext4 (an ext2/3 one has no fallocate: refused there) */
     case 0x58465342UL:   /* xfs */
     case 0x01021994UL:   /* tmpfs */
-    case 0x794C7630UL:   /* overlayfs */
         return true;
     default:
         return false;

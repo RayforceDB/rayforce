@@ -142,7 +142,8 @@ ray_err_t ray_col_append_index(const char* path, const void* ix,
  * in-place build does not apply and the caller builds in memory and appends
  * instead: a STR column; a platform or filesystem where the region's blocks
  * cannot be held before the mapping writes them (anything but Linux on
- * ext4, xfs, tmpfs or overlayfs); or a region that could not be allocated
+ * ext4, xfs or tmpfs: overlayfs too, whose upper layer cannot be told);
+ * or a region that could not be allocated
  * or mapped this time.  Any other error is final (RAY_ERR_CANCEL, OOM, an
  * I/O error on the marker, RAY_ERR_CORRUPT for a file already indexed).
  * `trace` is a ray_hash_trace_t* (NULL: none), void as `ix` above. */

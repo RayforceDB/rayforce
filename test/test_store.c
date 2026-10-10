@@ -2506,6 +2506,52 @@ static test_result_t test_col_build_hash_index_untrusted_fs(void) {
     PASS();
 }
 
+/* Which filesystems the in-place build trusts, by the type fstatfs reports
+ * (debug builds stand an injected type in for the real one, so the ones no
+ * test can mount are classified too): ext4, xfs and tmpfs, whose fallocate
+ * holds the blocks; not overlayfs, whose upper layer cannot be told, nor
+ * the copy-on-write, network and user filesystems.  An untrusted one leaves
+ * the file at its payload. */
+static test_result_t test_col_build_hash_index_fs_types(void) {
+#if defined(DEBUG) && defined(RAY_OS_LINUX)
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-hidx-fst-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    if (!store_in_place(dir)) { (void)ray_test_rm_rf(dir); SKIP("no in-place build on this filesystem"); }
+    char p[200]; snprintf(p, sizeof(p), "%s/a", dir);
+    static const struct { const char* inject; bool trusted; } types[] = {
+        { "fs:ef53",     true  },   /* ext2/3/4 */
+        { "fs:58465342", true  },   /* xfs */
+        { "fs:1021994",  true  },   /* tmpfs */
+        { "fs:794c7630", false },   /* overlayfs */
+        { "fs:9123683e", false },   /* btrfs */
+        { "fs:2fc12fc1", false },   /* zfs */
+        { "fs:ca451a4e", false },   /* bcachefs */
+        { "fs:6969",     false },   /* nfs */
+        { "fs:ff534d42", false },   /* cifs */
+        { "fs:fe534d42", false },   /* smb2 */
+        { "fs:65735546", false },   /* fuse */
+        { "fs:c36400",   false },   /* ceph */
+    };
+    ray_t* v = store_hash_col(RAY_I64, 1000, 10, 0);
+    int64_t bad = 0;
+    for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
+        if (ray_col_save_bulk(v, p) != RAY_OK) { bad++; continue; }
+        int64_t payload = store_file_size(p);
+        TEST_ASSERT_EQ_I(setenv("RAY_HASH_INJECT", types[i].inject, 1), 0);
+        ray_err_t e = store_hash_build(p);
+        unsetenv("RAY_HASH_INJECT");
+        if (types[i].trusted ? (e != RAY_OK || store_file_size(p) <= payload)
+                             : (e != RAY_ERR_NYI || store_file_size(p) != payload)) bad++;
+    }
+    ray_release(v);
+    TEST_ASSERT_EQ_I(bad, 0);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+#else
+    SKIP("needs a debug build on Linux");
+#endif
+}
+
 /* A region that cannot be allocated or mapped this time (debug builds
  * inject either) does not cost the column its hash index: the in-place
  * build gives way (NYI, the file at its payload) and ray_splay_hash_column
@@ -6960,6 +7006,7 @@ const test_entry_t store_entries[] = {
     { "store/col_build_hash_index_bytes", test_col_build_hash_index_bytes, store_setup, store_teardown },
     { "store/col_build_hash_index_refusals", test_col_build_hash_index_refusals, store_setup, store_teardown },
     { "store/col_build_hash_index_untrusted_fs", test_col_build_hash_index_untrusted_fs, store_setup, store_teardown },
+    { "store/col_build_hash_index_fs_types", test_col_build_hash_index_fs_types, store_setup, store_teardown },
     { "store/col_build_hash_index_refused", test_col_build_hash_index_refused, store_setup, store_teardown },
     { "store/col_build_hash_index_truncate", test_col_build_hash_index_truncate, store_setup, store_teardown },
     { "store/col_build_hash_index_marker_last", test_col_build_hash_index_marker_last, store_setup, store_teardown },
