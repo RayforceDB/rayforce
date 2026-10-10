@@ -731,8 +731,9 @@ static bool fp_reads_nothing(const fp_cmp_t* c) {
 
 /* Rebind an encoded child to the view of [start, start + n) (one vector),
  * shifted so that row `start` is index 0: rows are passed as [0, n).  The
- * directory gate decides a whole range from its chunk's statistics first
- * (*decided 0 / 1, nothing read); a materialization another consumer
+ * directory gate decides a whole range from its chunk's statistics first,
+ * then from its vector's descriptor (*decided 0 / 1, nothing read); a
+ * materialization another consumer
  * published meanwhile is read in place, never decoded again. */
 static ray_t* fp_bind_view(const fp_cmp_t* c, int64_t start, int64_t n,
                            ray_col_scratch_t* sc, fp_cmp_t* out, int* decided) {
@@ -744,6 +745,14 @@ static ray_t* fp_bind_view(const fp_cmp_t* c, int64_t start, int64_t n,
         if (ray_col_src_chunk_stat(c->src, start / RAY_ENC_CHUNK, &st)) {
             int d = zone_cmp_core(st.min, st.max, st.has_minmax, st.null_count > 0,
                                   (int64_t)st.null_count == st.rows, cmp_op_of(c->op), c->cval);
+            if (d >= 0) { *decided = d; return NULL; }
+        }
+        /* then the vector's descriptor (the window lies in one vector);
+         * answer-only, the window is filled, so no consumer guard */
+        int64_t mn, mx; uint32_t nn;
+        if (start / RAY_ENC_VEC == (start + n - 1) / RAY_ENC_VEC &&
+            ray_col_src_vec_stat(c->src, start / RAY_ENC_VEC, &mn, &mx, &nn)) {
+            int d = zone_cmp_core(mn, mx, true, nn > 0, false, cmp_op_of(c->op), c->cval);
             if (d >= 0) { *decided = d; return NULL; }
         }
     }

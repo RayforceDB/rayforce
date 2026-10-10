@@ -1833,7 +1833,8 @@ static test_result_t test_expr_parted_seg_lengths(void) {
 }
 
 /* The directory gate decides whole chunks: a predicate true for no row of
- * chunks 1-3 decodes only chunk 0's vectors. */
+ * chunks 1-3 reads none of them; inside chunk 0 the vectors' descriptors
+ * decide vectors 1-63 (Task 17b), so only vector 0 is decoded. */
 static test_result_t test_zone_dir_skips(void) {
     ray_t* t = sr_load(2);
     ray_graph_t* g = ray_graph_new(t);
@@ -1844,7 +1845,7 @@ static test_result_t test_zone_dir_skips(void) {
     TEST_ASSERT_EQ_I(ray_rowsel_meta(s)->total_pass, 1000);
     ray_enc_counters_t k; ray_enc_counters_get(&k);
     TEST_ASSERT_EQ_U(k.materialized, 0);
-    TEST_ASSERT_EQ_U(k.decoded_bytes, 64 * 1024 * 8);   /* chunk 0's 64 vectors only */
+    TEST_ASSERT_EQ_U(k.decoded_bytes, 1024 * 8);        /* chunk 0's vector 0 only */
     ray_rowsel_release(s); ray_graph_free(g); ray_release(t);
     /* the count fast path decides chunks the same way */
     sr_eval_ok("(set T (.db.splayed.get \"" SR_G2 "\"))");
@@ -1852,7 +1853,7 @@ static test_result_t test_zone_dir_skips(void) {
     ray_t* c = sr_eval("(count (select {from: T where: (< k 1000)}))");
     TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c) && c->i64 == 1000);
     ray_enc_counters_get(&k);
-    TEST_ASSERT_EQ_U(k.decoded_bytes, 64 * 1024 * 8);
+    TEST_ASSERT_EQ_U(k.decoded_bytes, 1024 * 8);
     sr_drop(c);
     PASS();
 }
@@ -2134,9 +2135,10 @@ static test_result_t test_uses_shared_payload(void) {
 
 /* Review minor 5: compare literals on chunk boundaries of k (= row; chunk 1
  * is rows 65536..131071), through the fused selection, with absolute counts
- * and the vectors decoded: a decided chunk 1 decodes nothing, an undecided
- * one its 64 vectors.  A wrong boundary in zone_cmp_core shows without a
- * generation-0 comparison. */
+ * and the vectors decoded: a decided chunk 1 decodes nothing; in an
+ * undecided one the descriptors decide every vector but the one holding the
+ * literal (Task 17b), so one vector is decoded.  A wrong boundary in
+ * zone_cmp_core shows without a generation-0 comparison. */
 static test_result_t test_zone_dir_boundaries(void) {
     static const struct { uint16_t op; int64_t lit; int64_t rows; bool decoded; } cs[] = {
         { OP_EQ, 65536, 1, true },       { OP_EQ, 131071, 1, true },
@@ -2163,7 +2165,7 @@ static test_result_t test_zone_dir_boundaries(void) {
         ray_enc_counters_t kc; ray_enc_counters_get(&kc);
         TEST_ASSERT_FMT(n == cs[i].rows, "case %zu (op %u, %lld): %lld rows, want %lld", i, cs[i].op,
                         (long long)cs[i].lit, (long long)n, (long long)cs[i].rows);
-        TEST_ASSERT_FMT(kc.decoded_bytes == (cs[i].decoded ? 65536u * 8u : 0u), "case %zu: %llu bytes decoded",
+        TEST_ASSERT_FMT(kc.decoded_bytes == (cs[i].decoded ? 1024u * 8u : 0u), "case %zu: %llu bytes decoded",
                         i, (unsigned long long)kc.decoded_bytes);
         TEST_ASSERT_EQ_U(kc.materialized, 0);
         if (s) ray_rowsel_release(s);
@@ -2253,8 +2255,9 @@ static test_result_t test_fp_range_equal(void) {
 }
 
 /* The directory gate decides whole chunks before a decode: k < 70000
- * passes chunk 0 and fails chunks 2-3 from their extrema, so only chunk
- * 1's 64 vectors are decoded. */
+ * passes chunk 0 and fails chunks 2-3 from their extrema; in chunk 1 the
+ * descriptors decide every vector but vector 68 (rows 69632..70655, Task
+ * 17b), the only one decoded. */
 static ray_op_t* fpp_k_lt(ray_graph_t* g) { return ray_lt(g, ray_scan(g, "k"), ray_const_i64(g, 70000)); }
 static test_result_t test_fp_range_dir_gate(void) {
     test_result_t r;
@@ -2277,7 +2280,7 @@ static test_result_t test_fp_range_dir_gate(void) {
     fp_scratch_free(&sc);
     TEST_ASSERT_EQ_I(pass, 70000);
     ray_enc_counters_t k; ray_enc_counters_get(&k);
-    TEST_ASSERT_EQ_U(k.decoded_bytes, 64 * 1024 * 8);
+    TEST_ASSERT_EQ_U(k.decoded_bytes, 1024 * 8);
     TEST_ASSERT_EQ_U(k.materialized, 0);
     fp_pred_cleanup(&p); ray_graph_free(g); ray_release(t);
     PASS();
@@ -2355,7 +2358,8 @@ static test_result_t test_fp_range_late_materialized(void) {
  * (ordered first: an 8-byte EQ) passes in vector 0 only, so v <= 4000 is
  * read for that one vector (4 KB).  Without the stop v is decoded in every
  * window (nullable v takes the typed compare, which the directory gate does
- * not decide); k decodes chunk 0 only (the gate decides its chunks 1-3). */
+ * not decide); k decodes vector 0 only (the gate decides chunks 1-3, the
+ * descriptors chunk 0's other vectors, Task 17b). */
 static ray_op_t* fpp_k_eq_v(ray_graph_t* g) {
     return ray_and(g, ray_eq(g, ray_scan(g, "k"), ray_const_i64(g, 500)), fpp_v_le(g));
 }
@@ -2381,7 +2385,7 @@ static test_result_t test_fp_range_and_stops(void) {
     }
     fp_scratch_free(&sc);
     ray_enc_counters_t k; ray_enc_counters_get(&k);
-    TEST_ASSERT_EQ_U(k.decoded_bytes, 64 * 1024 * 8 + 1024 * 4);   /* k: chunk 0; v: vector 0 */
+    TEST_ASSERT_EQ_U(k.decoded_bytes, 1024 * 8 + 1024 * 4);        /* k and v: vector 0 */
     TEST_ASSERT_EQ_U(k.materialized, 0);
     fp_pred_cleanup(&p); ray_graph_free(g); ray_release(t);
     PASS();
@@ -3926,6 +3930,60 @@ static test_result_t test_v2_sel_bounds(void) {
     TEST_ASSERT_TRUE(agg_route_stats().dense_plan_available);
     double kdec = sr_col_decodes("k", k0);
     TEST_ASSERT_FMT(kdec < 1.5, "key decoded %.3fx", kdec);
+    PASS();
+}
+
+/* Task 17b: a selection prescan over a mixed key set.  The SYM key is read
+ * exactly first; the staged I64 key k then takes the directory path as a
+ * key set of its own (chunk pruning as above: g has 3 values), or, when the
+ * SYM key's range alone exceeds the dense limit (h: about 13 000 selected
+ * rows over 50 021 ids), is not read for bounds at all.  Route, plan,
+ * slots and answer as generation 0. */
+static test_result_t test_v2_sel_bounds_split(void) {
+    const int64_t n = 10 * 65536 + 1234;
+    ray_t* k = ray_vec_new(RAY_I64, n); k->len = n;
+    int64_t* kd = ray_data(k);
+    for (int64_t i = 0; i < n; i++) kd[i] = 10 + (i * 7919) % 11;
+    kd[0] = -5; kd[65536] = 1000000;                         /* chunks 0 and 1: the extremes, unselected */
+    /* m: every chunk's directory reaches past the selected rows' keys
+     * (rows c * 65536 + 1 and + 2, never selected by v % 50 == 0), so the
+     * directory path would read every chunk */
+    ray_t* mk = ray_vec_new(RAY_I64, n); mk->len = n;
+    int64_t* md = ray_data(mk);
+    for (int64_t i = 0; i < n; i++) md[i] = i % 11;
+    for (int64_t c = 0; c * 65536 + 2 < n; c++) { md[c * 65536 + 1] = -1000 - c; md[c * 65536 + 2] = 1000 + c; }
+    ray_env_set(ray_sym_intern("pk", 2), k); ray_release(k);
+    ray_env_set(ray_sym_intern("pm", 2), mk); ray_release(mk);
+    sr_eval_ok("(set pi (til 656594))");
+    sr_eval_ok("(set SP (table [k m g h v s] (list pk pm (as 'SYM (as 'STR (% pi 3))) "
+               "(as 'SYM (as 'STR (% (* pi 7919) 50021))) pi (!= 0 (% pi 65536)))))");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/sp2/\" SP {compress: true})");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/sp0/\" SP {compress: false})");
+    static const struct { const char* q; bool dense; } qs[] = {
+        { "(select {c: (count v) s: (sum v) from: T where: s by: [g k]})", true },
+        { "(select {c: (count v) s: (sum v) from: T where: s by: [k g]})", true },
+        { "(select {c: (count v) s: (sum v) from: T where: (== 0 (% v 50)) by: [k h]})", false },
+        { "(select {c: (count v) s: (sum v) from: T where: (== 0 (% v 50)) by: [h k]})", false },
+        { "(select {c: (count v) s: (sum v) from: T where: (== 0 (% v 50)) by: [m h]})", false },
+        { "(select {c: (count v) s: (sum v) from: T where: (== 0 (% v 50)) by: [h m]})", false },
+        { NULL, false },
+    };
+    for (int i = 0; qs[i].q; i++) {
+        test_result_t r = sr_same_route("(.db.splayed.get \"" SR_TMP "/sp0/\")", "(.db.splayed.get \"" SR_TMP "/sp2/\")", qs[i].q);
+        if (r.status != TEST_PASS) return r;
+        sr_eval_ok("(set T (.db.splayed.get \"" SR_TMP "/sp2/\"))");
+        const char* key = strstr(qs[i].q, "m h") || strstr(qs[i].q, "h m") ? "m" : "k";
+        uint64_t k0 = sr_col_decoded(key), v0 = sr_col_decoded("v");
+        agg_route_reset();
+        ray_t* res = sr_eval(qs[i].q);
+        TEST_ASSERT_TRUE(res && !RAY_IS_ERR(res));
+        ray_release(res);
+        /* the pass reads k once; a full prescan would read it once more */
+        double kdec = sr_col_decodes(key, k0), vdec = sr_col_decodes("v", v0);
+        TEST_ASSERT_FMT(agg_route_stats().dense_plan_available == qs[i].dense, "%s: dense plan %d", qs[i].q,
+                        (int)agg_route_stats().dense_plan_available);
+        TEST_ASSERT_FMT(kdec < 1.5 && vdec >= 1.0, "%s: k decoded %.4fx, v %.4fx", qs[i].q, kdec, vdec);
+    }
     PASS();
 }
 
@@ -6100,6 +6158,124 @@ static test_result_t test_ragged_fill_bounded(void) {
     PASS();
 }
 
+/* Task 17b: vectors decided from their 1024-row descriptors where the
+ * 64K-row directory leaves the chunk undecided.  a (I16): every fourth
+ * vector runs of 64 rows of 0 and 7 (RLE, statistics [0, 7]), the others
+ * all 0 (CONST); every chunk is [0, 7], so no chunk is decided.  c (I32):
+ * every third vector 5 with one null, the others 9.  The count fast path,
+ * the expression gate and the fused predicate skip (or fill) the decided
+ * vectors and decode only the 49 RLE vectors of a, once each; the answers
+ * are generation 0's. */
+#define VD_N    200000
+#define VD_RLE  49                  /* vectors v % 4 == 1 of 196 */
+static void sr_vd_tables(void) {
+    ray_t* a = ray_vec_new(RAY_I16, VD_N); a->len = VD_N;
+    ray_t* b = ray_vec_new(RAY_I64, VD_N); b->len = VD_N;
+    ray_t* c = ray_vec_new(RAY_I32, VD_N); c->len = VD_N;
+    for (int64_t i = 0; i < VD_N; i++) {
+        const int64_t v = i / RAY_ENC_VEC;
+        ((int16_t*)ray_data(a))[i] = v % 4 == 1 ? (int16_t)((i / 64) % 2 * 7) : 0;
+        ((int64_t*)ray_data(b))[i] = i;
+        ((int32_t*)ray_data(c))[i] = v % 3 == 0 ? (i % RAY_ENC_VEC == 17 ? NULL_I32 : 5) : 9;
+    }
+    c->attrs |= RAY_ATTR_HAS_NULLS;
+    ray_env_set(ray_sym_intern("vda", 3), a); ray_release(a);
+    ray_env_set(ray_sym_intern("vdb", 3), b); ray_release(b);
+    ray_env_set(ray_sym_intern("vdc", 3), c); ray_release(c);
+    sr_eval_ok("(set VD (table [a b c] (list vda vdb vdc)))");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/vd2/\" VD {compress: true})");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/vd0/\" VD {compress: false})");
+}
+static ray_op_t* vd_a_ne0(ray_graph_t* g) { return ray_ne(g, ray_scan(g, "a"), ray_const_i64(g, 0)); }
+static ray_op_t* vd_a_gt3(ray_graph_t* g) { return ray_gt(g, ray_scan(g, "a"), ray_const_i64(g, 3)); }
+static ray_op_t* vd_a_eq0(ray_graph_t* g) { return ray_eq(g, ray_scan(g, "a"), ray_const_i64(g, 0)); }
+static ray_op_t* vd_c_eq5(ray_graph_t* g) { return ray_eq(g, ray_scan(g, "c"), ray_const_i64(g, 5)); }
+static test_result_t test_vec_stat_decide(void) {
+    sr_vd_tables();
+    const char* t0 = "(.db.splayed.get \"" SR_TMP "/vd0/\")";
+    const char* t2 = "(.db.splayed.get \"" SR_TMP "/vd2/\")";
+    const uint64_t rle_bytes = (uint64_t)VD_RLE * RAY_ENC_VEC * 2;
+    /* the count fast path */
+    static const char* const cq[] = {
+        "(count (select {from: T where: (!= a 0)}))", "(count (select {from: T where: (== a 0)}))",
+        "(count (select {from: T where: (> a 3)}))",  "(count (select {from: T where: (<= a 0)}))",
+        "(count (select {from: T where: (< 3 a)}))",  NULL,
+    };
+    for (int i = 0; cq[i]; i++) {
+        test_result_t r = sr_same_on(t0, t2, cq[i], 0);
+        if (r.status != TEST_PASS) return r;
+        sr_evalf_ok("(set T %s)", t2);
+        uint64_t a0 = sr_col_decoded("a"), f0 = ray_query_test_count_fast();
+        ray_t* res = sr_eval(cq[i]);
+        TEST_ASSERT_TRUE(res && !RAY_IS_ERR(res));
+        sr_drop(res);
+        TEST_ASSERT_FMT(ray_query_test_count_fast() - f0 == 1, "%s: not the count fast path", cq[i]);
+        TEST_ASSERT_FMT(sr_col_decoded("a") - a0 == rle_bytes, "%s: %llu bytes of a decoded, want %llu", cq[i],
+                        (unsigned long long)(sr_col_decoded("a") - a0), (unsigned long long)rle_bytes);
+    }
+    /* the expression gate (a select over the predicate) */
+    /* c: the 66 vectors of 5 (the last one 320 rows) hold a null, so they
+     * stay undecided; the 130 vectors of 9 are decided.  (== c 9) is decided
+     * on every vector.  The OR is checked for its answer only. */
+    const uint64_t c5_bytes = 65 * RAY_ENC_VEC * 4 + 320 * 4;
+    static const struct { const char* q; int64_t a, c, skips; } eq[] = {
+        { "(select {s: (sum b) from: T where: (!= a 0)})", 1, 0, 147 },
+        { "(select {s: (sum b) c: (count b) from: T where: (> a 3)})", 1, 0, 147 },
+        { "(select {s: (sum b) from: T where: (== c 5)})", 0, 1, 130 },
+        { "(select {s: (sum b) from: T where: (!= c 9)})", 0, 1, 130 },
+        { "(select {s: (sum b) from: T where: (and (== a 0) (== c 9))})", 1, 0, 147 + 196 },
+        { "(select {s: (sum b) from: T where: (or (> a 3) (== c 5))})", -1, -1, -1 },
+        { NULL, 0, 0, 0 },
+    };
+    for (int i = 0; eq[i].q; i++) {
+        test_result_t r = sr_same_on(t0, t2, eq[i].q, UINT64_MAX);
+        if (r.status != TEST_PASS) return r;
+        sr_evalf_ok("(set T %s)", t2);
+        uint64_t a0 = sr_col_decoded("a"), c0 = sr_col_decoded("c");
+        int64_t z0 = ray_expr_test_zone_skips();
+        ray_t* res = sr_eval(eq[i].q);
+        TEST_ASSERT_TRUE(res && !RAY_IS_ERR(res));
+        sr_drop(res);
+        if (eq[i].skips < 0) continue;
+        uint64_t da = sr_col_decoded("a") - a0, dc = sr_col_decoded("c") - c0;
+        int64_t dz = ray_expr_test_zone_skips() - z0;
+        TEST_ASSERT_FMT(da == (eq[i].a ? rle_bytes : 0) && dc == (eq[i].c ? c5_bytes : 0) && dz == eq[i].skips,
+                        "%s: a %llu, c %llu bytes decoded, %lld morsels decided", eq[i].q,
+                        (unsigned long long)da, (unsigned long long)dc, (long long)dz);
+    }
+    /* the fused predicate, morsel by morsel */
+    ray_op_t* (*const fb[])(ray_graph_t*) = { vd_a_ne0, vd_a_gt3, vd_a_eq0, vd_c_eq5 };
+    ray_t* g0t = sr_eval(t0); ray_t* g2t = sr_eval(t2);
+    for (size_t i = 0; i < sizeof fb / sizeof fb[0]; i++) {
+        ray_graph_t* g0 = ray_graph_new(g0t); ray_graph_t* g2 = ray_graph_new(g2t);
+        fp_pred_t p0, p2;
+        memset(&p0, 0, sizeof p0); memset(&p2, 0, sizeof p2);
+        ray_t* e0 = NULL; ray_t* e2 = NULL;
+        TEST_ASSERT_EQ_I(fp_compile_pred(g0, fb[i](g0), g0t, &p0, &e0), 0);
+        TEST_ASSERT_EQ_I(fp_compile_pred(g2, fb[i](g2), g2t, &p2, &e2), 0);
+        TEST_ASSERT_TRUE(!e0 && !e2 && p2.n_children == 1 && p2.children[0].enc);
+        fp_scratch_t sc; fp_scratch_init(&sc);
+        uint8_t x[RAY_MORSEL_ELEMS], y[RAY_MORSEL_ELEMS];
+        ray_enc_counters_reset();
+        for (int64_t ms = 0; ms < VD_N; ms += RAY_MORSEL_ELEMS) {
+            int64_t me = ms + RAY_MORSEL_ELEMS < VD_N ? ms + RAY_MORSEL_ELEMS : VD_N;
+            fp_eval_pred(&p0, ms, me, x);
+            TEST_ASSERT_NULL(fp_eval_pred_rs(&p2, ms, me, y, &sc));
+            TEST_ASSERT_FMT(memcmp(x, y, (size_t)(me - ms)) == 0, "fused %zu: morsel at %lld", i, (long long)ms);
+        }
+        fp_scratch_free(&sc);
+        ray_enc_counters_t k; ray_enc_counters_get(&k);
+        /* c is nullable: its typed compare reads every vector (no gate) */
+        const uint64_t want = i < 3 ? rle_bytes : (uint64_t)VD_N * 4;
+        TEST_ASSERT_FMT(k.decoded_bytes == want, "fused %zu: %llu bytes decoded, want %llu", i,
+                        (unsigned long long)k.decoded_bytes, (unsigned long long)want);
+        fp_pred_cleanup(&p0); fp_pred_cleanup(&p2);
+        ray_graph_free(g0); ray_graph_free(g2);
+    }
+    sr_drop(g0t); sr_drop(g2t);
+    PASS();
+}
+
 const test_entry_t scanrange_entries[] = {
     { "scanrange/walk_gen0_zero_copy",     test_walk_gen0_zero_copy,     sr_setup,    sr_teardown },
     { "scanrange/walk_gen2_vectors",       test_walk_gen2_vectors,       sr_setup,    sr_teardown },
@@ -6231,6 +6407,8 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/strlen_str_gen2_routes", test_strlen_str_gen2_routes, sr_rt_setup, sr_rt_teardown },
     { "scanrange/ragged_gen0_no_decode", test_ragged_gen0_no_decode, srr_setup, srr_teardown },
     { "scanrange/ragged_fill_bounded",   test_ragged_fill_bounded,   srr_setup, srr_teardown },
+    { "scanrange/vec_stat_decide",       test_vec_stat_decide,       sr_rt_setup, sr_rt_teardown },
+    { "scanrange/v2_sel_bounds_split",   test_v2_sel_bounds_split,   sr_rt_setup, sr_rt_teardown },
     { "scanrange/const_beside_parted_group", test_const_beside_parted_group, srr_setup, srr_teardown },
     { NULL, NULL, NULL, NULL },
 };

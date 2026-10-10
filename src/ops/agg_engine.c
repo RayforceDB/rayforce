@@ -1829,6 +1829,127 @@ static bool agg_sel_bounds_dir(const agg_sel_bounds_ctx_t* bc, int64_t* mins, in
     return ok;
 }
 
+/* Every selected row's key bounds, scanned (bc->tasks tasks over the
+ * selection).  False on OOM (no *err) or a range error (*err owned, the
+ * lowest failure). */
+static bool agg_sel_bounds_scan(agg_sel_bounds_ctx_t* bc, int64_t* mins, int64_t* maxs, ray_t** err) {
+    const agg_rr_t* krr = bc->krr;
+    const uint32_t nk = bc->n_keys, tasks = bc->tasks;
+    for (uint32_t k = 0; k < nk; k++) { mins[k] = INT64_MAX; maxs[k] = INT64_MIN; }
+    ray_t* tb_hdr;
+    bc->task_bounds = (int64_t*)scratch_alloc(&tb_hdr, 2u * (size_t)tasks * nk * sizeof(int64_t));
+    if (!bc->task_bounds) return false;
+    if (krr->staged) {
+        ray_scan_fail_init(krr->fail);
+        for (uint32_t k = 0; k < nk; k++)
+            if (krr->srcs[k]) ray_col_src_advise(krr->srcs[k], 0, ray_rowsel_meta(bc->sel)->nrows);
+    }
+    ray_pool_t* pool = ray_pool_get();
+    if (tasks > 1) ray_pool_dispatch_n(pool, agg_sel_bounds_fn, bc, tasks);
+    else agg_sel_bounds_fn(bc, 0, 0, 1);
+    if (krr->staged && (*err = ray_scan_fail_finish(krr->fail, tasks > 1 ? pool : NULL)) != NULL) {
+        scratch_free(tb_hdr);
+        bc->task_bounds = NULL;
+        return false;
+    }
+    for (uint32_t t = 0; t < tasks; t++)
+        for (uint32_t k = 0; k < nk; k++) {
+            int64_t mn = bc->task_bounds[(2 * (size_t)t) * nk + k];
+            int64_t mx = bc->task_bounds[(2 * (size_t)t + 1) * nk + k];
+            if (mn < mins[k]) mins[k] = mn;
+            if (mx > maxs[k]) maxs[k] = mx;
+        }
+    scratch_free(tb_hdr);
+    bc->task_bounds = NULL;
+    return true;
+}
+
+/* A subset of a bounds context's keys as a context of its own: the same
+ * selection, the keys' sources (pointers, never copies) and plain
+ * pointers, no aggregate input. */
+typedef struct {
+    agg_rr_t       rr;
+    ray_col_src_t* srcs[16];
+    const void*    plain[16];
+    uint8_t        esz[16], attrs[16];
+    int8_t         types[16];
+    bool           nullable[16];
+    int64_t        nulls[16];
+} agg_sel_keys_t;
+static void agg_sel_keys(const agg_sel_bounds_ctx_t* bc, const uint32_t* ks, uint32_t n,
+                         agg_sel_keys_t* o, agg_sel_bounds_ctx_t* sub) {
+    const agg_rr_t* krr = bc->krr;
+    bool staged = false;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint32_t k = ks[i];
+        o->srcs[i] = krr->srcs[k];
+        o->plain[i] = krr->plain[k];
+        o->esz[i] = krr->esz[k];
+        o->attrs[i] = krr->key_attrs[k];
+        o->types[i] = krr->key_types[k];
+        o->nullable[i] = bc->nullable[k];
+        o->nulls[i] = bc->nulls[k];
+        staged |= o->srcs[i] != NULL;
+    }
+    o->rr = (agg_rr_t){ .srcs = o->srcs, .plain = o->plain, .esz = o->esz, .key_types = o->types,
+                        .key_attrs = o->attrs, .n_src = n, .n_keys = n, .n_aggs = 0,
+                        .fail = krr->fail, .staged = staged };
+    *sub = *bc;
+    sub->krr = &o->rr; sub->nullable = o->nullable; sub->nulls = o->nulls; sub->n_keys = n;
+    sub->spans = NULL; sub->task_bounds = NULL;
+}
+
+/* The selected rows' exact key bounds of a staged context whose keys are
+ * read two ways, without scanning what cannot change the plan.  The keys
+ * agg_sel_bounds_dir cannot prune (plain, SYM, parted, without a
+ * directory) are scanned first.  When their ranges alone exceed the dense
+ * limit (or one has no range), the plan is impossible whatever the other
+ * keys hold (every range is at least 1): 2, nothing more read.  Otherwise
+ * the single-file generation-2 non-SYM keys take the directory path, as a
+ * key set of their own: 1, mins / maxs exact for every key, so the plan,
+ * its route and its emit order are the full scan's.  0: not such a key
+ * set (every key one way), or a scan error or cancel (the caller's full
+ * scan then reports the lowest failure). */
+static int agg_sel_bounds_split(const agg_sel_bounds_ctx_t* bc, int64_t* mins, int64_t* maxs) {
+    const agg_rr_t* krr = bc->krr;
+    const uint32_t nk = bc->n_keys;
+    const int64_t nrows = ray_rowsel_meta(bc->sel)->nrows;
+    uint32_t dk[16], ok[16], nd = 0, no = 0;
+    ray_enc_chunk_stat_t st;
+    for (uint32_t k = 0; k < nk; k++) {
+        if (krr->srcs[k] && krr->key_types[k] != RAY_SYM && krr->srcs[k]->len == nrows &&
+            ray_col_src_chunk_stat(krr->srcs[k], 0, &st)) dk[nd++] = k;
+        else ok[no++] = k;
+    }
+    if (nd == 0 || no == 0) return 0;
+    agg_sel_keys_t ko, kd;
+    agg_sel_bounds_ctx_t co, cd;
+    int64_t mn[16], mx[16];
+    agg_sel_keys(bc, ok, no, &ko, &co);
+    ray_t* err = NULL;
+    if (!agg_sel_bounds_scan(&co, mn, mx, &err)) { if (err) ray_error_free(err); return 0; }
+    const int64_t limit = bc->n_sel < (int64_t)UINT32_MAX ? bc->n_sel : (int64_t)UINT32_MAX;
+    int64_t total = 1;
+    for (uint32_t i = 0; i < no; i++) {                 /* agg_dense_range's ranges */
+        int64_t rng;
+        if (mx[i] < mn[i]) {
+            if (!co.nullable[i]) return 2;
+            rng = 1;
+        } else {
+            uint64_t span = (uint64_t)mx[i] - (uint64_t)mn[i];
+            if (span >= (uint64_t)INT64_MAX - (uint64_t)co.nullable[i]) return 2;
+            rng = (int64_t)span + 1 + co.nullable[i];
+        }
+        if (total > limit / rng) return 2;
+        total *= rng;
+    }
+    for (uint32_t i = 0; i < no; i++) { mins[ok[i]] = mn[i]; maxs[ok[i]] = mx[i]; }
+    agg_sel_keys(bc, dk, nd, &kd, &cd);
+    if (!agg_sel_bounds_dir(&cd, mn, mx)) return 0;
+    for (uint32_t i = 0; i < nd; i++) { mins[dk[i]] = mn[i]; maxs[dk[i]] = mx[i]; }
+    return 1;
+}
+
 static bool agg_dense_plan_sel(ray_t** key_cols, const agg_rr_t* krr, uint32_t n_keys, int64_t n_sel,
                                ray_t* sel, const int64_t* sel_prefix,
                                dense_plan_t* out, ray_t** err) {
@@ -1871,30 +1992,15 @@ static bool agg_dense_plan_sel(ray_t** key_cols, const agg_rr_t* krr, uint32_t n
     agg_sel_bounds_ctx_t bc = { .krr = krr,
         .nullable = out->nullable, .nulls = out->nulls, .n_keys = n_keys,
         .sel = sel, .sel_prefix = sel_prefix, .n_sel = n_sel, .tasks = tasks };
-    if (!krr->staged || !agg_sel_bounds_dir(&bc, mins, maxs)) {
-        for (uint32_t k = 0; k < n_keys; k++) { mins[k] = INT64_MAX; maxs[k] = INT64_MIN; }
-        ray_t* tb_hdr;
-        bc.task_bounds = (int64_t*)scratch_alloc(&tb_hdr, 2u * (size_t)tasks * n_keys * sizeof(int64_t));
-        if (!bc.task_bounds) { scratch_free(pre_hdr); return false; }
-        if (krr->staged) {
-            ray_scan_fail_init(krr->fail);
-            for (uint32_t k = 0; k < n_keys; k++)
-                if (krr->srcs[k]) ray_col_src_advise(krr->srcs[k], 0, ray_rowsel_meta(sel)->nrows);
-        }
-        if (tasks > 1) ray_pool_dispatch_n(pool, agg_sel_bounds_fn, &bc, tasks);
-        else agg_sel_bounds_fn(&bc, 0, 0, 1);
-        if (krr->staged && (*err = ray_scan_fail_finish(krr->fail, tasks > 1 ? pool : NULL)) != NULL) {
-            scratch_free(tb_hdr); scratch_free(pre_hdr);
-            return false;
-        }
-        for (uint32_t t = 0; t < tasks; t++)
-            for (uint32_t k = 0; k < n_keys; k++) {
-                int64_t mn = bc.task_bounds[(2 * (size_t)t) * n_keys + k];
-                int64_t mx = bc.task_bounds[(2 * (size_t)t + 1) * n_keys + k];
-                if (mn < mins[k]) mins[k] = mn;
-                if (mx > maxs[k]) maxs[k] = mx;
-            }
-        scratch_free(tb_hdr);
+    /* staged: the directory prunes what it can (every key, or the keys it
+     * serves after the others, agg_sel_bounds_split); else every selected
+     * row is scanned */
+    int split = krr->staged ? agg_sel_bounds_split(&bc, mins, maxs) : 0;
+    if (split == 2) { scratch_free(pre_hdr); return false; }     /* dense is impossible */
+    if (split == 0 && (!krr->staged || !agg_sel_bounds_dir(&bc, mins, maxs)) &&
+        !agg_sel_bounds_scan(&bc, mins, maxs, err)) {
+        scratch_free(pre_hdr);
+        return false;
     }
     for (uint32_t k = 0; k < n_keys; k++) {
         if (!agg_dense_range(out, k, mins[k], maxs[k])) { scratch_free(pre_hdr); return false; }

@@ -169,6 +169,17 @@ uint8_t ray_col_src_esz(const ray_col_src_t* s);
 /* Chunk c's statistics when the source is a single-file generation-2
  * column; false otherwise (plain, parted, slice). */
 bool ray_col_src_chunk_stat(const ray_col_src_t* s, int64_t c, struct ray_enc_chunk_stat_s* out);
+/* Vector v's statistics (rows [v * RAY_ENC_VEC, + RAY_ENC_VEC), the
+ * vector's descriptor, validated with its chunk once per column and nested
+ * inside the chunk's statistics) when the source is a single-file
+ * generation-2 column and the vector carries them: min / max are
+ * logical_T values as ray_enc_chunk_stat_t's, n_nulls the vector's null
+ * count.  False otherwise: not such a source, v outside it, statistics
+ * absent (every row null, or a type without them), or descriptors that
+ * fail validation (the read of the vector then reports them).  For
+ * answer-only decisions (skip or fill a vector); nothing may be sized from
+ * them without stats_guard. */
+bool ray_col_src_vec_stat(const ray_col_src_t* s, int64_t v, int64_t* min, int64_t* max, uint32_t* n_nulls);
 /* The statistics of a parted source, chunk by chunk in row order: fn is
  * called for rows [lo, hi) of every RAY_ENC_CHUNK-row chunk of every
  * segment, with the chunk's directory statistics when the segment is a
@@ -179,8 +190,9 @@ bool ray_col_src_chunk_stat(const ray_col_src_t* s, int64_t c, struct ray_enc_ch
 typedef void (*ray_col_chunk_fn)(void* ctx, int64_t lo, int64_t hi, const struct ray_enc_chunk_stat_s* st);
 bool ray_col_src_parted_chunks(ray_col_src_t* s, void* ctx, ray_col_chunk_fn fn, ray_t** err);
 /* Row `row` of a single-file or parted generation-2 integer source (not
- * SYM) read without decoding its vector (ray_enccol_point_i64: FOR_BP, or
- * DICT over FOR_BP, without nulls; a parted row is its segment's): 1
+ * SYM) read without decoding its vector (ray_enccol_point_i64: FOR_BP,
+ * DICT over FOR_BP, CONST or RLE, without nulls; a parted row is its
+ * segment's): 1
  * served into *out (the value widened to int64), 0 declined (read the row
  * through a cursor, which decodes or reports the vector; always for a
  * plain or materialized source or segment), -1 an owned error in *err.

@@ -150,11 +150,14 @@ ray_t* ray_enccol_decode_into(ray_enccol_t* e, int64_t c, int j, const ray_enc_d
 int    ray_enccol_decode_wide(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d,
                               int8_t wide, void* out, uint64_t* produced);
 /* Row `row` of a single-file integer column (not SYM), read from its packed
- * vector without decoding the vector: a FOR_BP vector, or DICT over a
- * FOR_BP code child, with no nulls.  The chunk's descriptors are validated
- * (once per chunk); the row's body size, base, reserved fields, code (below
- * the dictionary size), the sentinel and the value against the vector's
- * statistics are checked; the other rows of the vector are not read, so a
+ * vector without decoding the vector: a FOR_BP vector, DICT over a FOR_BP
+ * code child, CONST or RLE, with no nulls.  The chunk's descriptors are
+ * validated (once per chunk); the row's body size, base, reserved fields,
+ * code (below the dictionary size), the runs (every check of the run
+ * kernel: headers, children, sizes, padding, ends ascending to the vector
+ * length; the row's run found by binary search, no row expanded), the
+ * sentinel and the value against the vector's statistics are checked; the
+ * other rows of the vector are not read, so a
  * sampler may see a row of a vector the full decode later reports.  1
  * served (*out: the value widened to int64, as the decode would hold it),
  * 0 declined (read the vector by range: it decodes or reports it), -1 an

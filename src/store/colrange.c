@@ -621,6 +621,19 @@ bool ray_col_src_chunk_stat(const ray_col_src_t* s, int64_t c, struct ray_enc_ch
     return true;
 }
 
+bool ray_col_src_vec_stat(const ray_col_src_t* s, int64_t v, int64_t* min, int64_t* max, uint32_t* n_nulls) {
+    if (!ray_col_src_encoded(s)) return false;
+    ray_enccol_t* e = ray_enccol_of(s->obj);
+    if (e->kind != RAY_ENCCOL_SINGLE || e->synthetic || v < 0 || v * RAY_ENC_VEC >= e->len) return false;
+    const ray_enc_desc_t* d;
+    ray_t* err = ray_enccol_chunk_descs_ref(e, v / RAY_ENC_VECS_PER_CHUNK, &d);
+    if (err) { ray_error_free(err); return false; }
+    d += v % RAY_ENC_VECS_PER_CHUNK;
+    if (d->flags & RAY_ENC_STAT_ABSENT) return false;
+    *min = d->min; *max = d->max; *n_nulls = d->n_nulls;
+    return true;
+}
+
 bool ray_col_src_parted_chunks(ray_col_src_t* s, void* ctx, ray_col_chunk_fn fn, ray_t** err) {
     *err = NULL;
     if (!s || !s->obj || !s->parted) return false;

@@ -1570,14 +1570,37 @@ static uint64_t point_field(const uint8_t* pk, int T, int w, int i) {
     return w >= 64 ? v : v & ((1ull << w) - 1);
 }
 
-/* Row i of vector body p (avail bytes, descriptor d) as its T-bit
- * pattern: 1 served; 0 declined when the vector has nulls (the bitmap
- * decides) or the body is not one this read proves (any codec but FOR_BP
- * and DICT over a FOR_BP code child, a size, width, base or reserved field
- * off, a code outside the dictionary, the sentinel), so the vector decode
- * decides; -1 the dictionary's error. */
+/* Row i of a CONST / RLE body: its run's T-bit value into *x, the runs
+ * checked as the run kernel checks them (fk_runs) and the run found by
+ * binary search over the ends.  Out of line: its 16 KB of run buffers stay
+ * off the FOR_BP / DICT point read's frame. */
+static __attribute__((noinline)) bool point_run(uint8_t enc, const uint8_t* p, uint64_t avail, int vlen, int i,
+                                                int T, uint64_t* x) {
+    if (vlen < 1 || vlen > RAY_ENC_VEC || i < 0 || i >= vlen || ((uintptr_t)p & 7)) return false;
+    _Alignas(64) fk_vals_t vals, ends;
+    uint32_t nr;
+    if (!fk_runs(enc, vlen, p, avail, T, &vals, &ends, &nr)) return false;
+    uint32_t lo = 0, hi = nr - 1;                          /* the first run whose end is above i */
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        if (ends.h[mid] > (uint32_t)i) hi = mid; else lo = mid + 1;
+    }
+    *x = fk_val(&vals, T, lo);
+    return true;
+}
+
+/* Row i of vector body p (avail bytes, descriptor d, vlen rows) as its
+ * T-bit pattern: 1 served; 0 declined when the vector has nulls (the
+ * bitmap decides) or the body is not one this read proves (any codec but
+ * FOR_BP, DICT over a FOR_BP code child, CONST and RLE; a size, width,
+ * base or reserved field off, a code outside the dictionary, runs the run
+ * kernel's checks reject, the sentinel), so the vector decode decides; -1
+ * the dictionary's error.  CONST / RLE: the runs are read and checked as
+ * the run kernel reads them (fk_runs: headers, children, sizes, padding,
+ * ends strictly ascending to vlen), then row i's run is found by binary
+ * search over the ends; no row is expanded. */
 static int point_body(ray_enccol_t* e, const ray_enc_desc_t* d, const uint8_t* p, uint64_t avail,
-                      int i, ray_enc_kind_t k, uint64_t* x, ray_t** err) {
+                      int vlen, int i, ray_enc_kind_t k, uint64_t* x, ray_t** err) {
     if (d->n_nulls) return 0;
     const uint64_t m = k.T == 64 ? ~0ull : (1ull << k.T) - 1;
     uint64_t v;
@@ -1602,6 +1625,9 @@ static int point_body(ray_enccol_t* e, const ray_enc_desc_t* d, const uint8_t* p
         if ((*err = enc_dict(e, &dict)) != NULL) return -1;
         if (code >= dict.n) return 0;
         v = dict.v[code] & m;
+    } else if ((d->encoding == RAY_ENC_CONST || d->encoding == RAY_ENC_RLE) && d->width == 0) {
+        if (!point_run(d->encoding, p, avail, vlen, i, k.T, &v)) return 0;
+        v &= m;
     } else {
         return 0;
     }
@@ -1618,9 +1644,9 @@ static bool point_type(const ray_enccol_t* e, ray_enc_kind_t* k) {
  * its logical value, checked against the vector's statistics (and so its
  * chunk's): 1 served, 0 declined, -1 with *err. */
 static int point_read(ray_enccol_t* e, const ray_enc_desc_t* d, const uint8_t* p, uint64_t avail,
-                      int64_t c, int j, int i, ray_enc_kind_t k, int64_t* out, ray_t** err) {
+                      int64_t c, int j, int vlen, int i, ray_enc_kind_t k, int64_t* out, ray_t** err) {
     uint64_t x;
-    int r = point_body(e, d, p, avail, i, k, &x, err);
+    int r = point_body(e, d, p, avail, vlen, i, k, &x, err);
     if (r != 1) return r;
     const int64_t v = ray_enc_logical(x, k);
     if (!(d->flags & RAY_ENC_STAT_ABSENT) && (v < d->min || v > d->max)) {
@@ -1641,7 +1667,9 @@ int ray_enccol_point_i64(ray_enccol_t* e, int64_t row, int64_t* out, ray_t** err
     if ((*err = ray_enccol_chunk_descs_ref(e, c, &descs)) != NULL) return -1;   /* validated once per chunk */
     const ray_enc_desc_t* d = &descs[j];
     ray_enc_dirent_t de; dirent_at(e, c, &de);
-    return point_read(e, d, e->base + de.offset + d->payload_off, d->payload_bytes, c, j, i, k, out, err);
+    const int64_t rows = chunk_rows(e, c);
+    const int vlen = (int)(rows - (int64_t)j * RAY_ENC_VEC < RAY_ENC_VEC ? rows - (int64_t)j * RAY_ENC_VEC : RAY_ENC_VEC);
+    return point_read(e, d, e->base + de.offset + d->payload_off, d->payload_bytes, c, j, vlen, i, k, out, err);
 }
 
 /* A stand-in column of `type` for the body hooks; with a VALUE_DICT of
@@ -1686,7 +1714,7 @@ int ray_enccol_test_point_body_stats(int8_t type, const uint64_t* dict, uint32_t
     for (int i = 0; i < vlen; i++) {
         ray_t* err = NULL;
         int64_t v = 0;
-        res[i] = ok ? (int8_t)point_read(e, &d, body, avail, 0, 0, i, k, &v, &err) : 0;
+        res[i] = ok ? (int8_t)point_read(e, &d, body, avail, 0, 0, vlen, i, k, &v, &err) : 0;
         if (res[i] == 1) out[i] = v;
         if (err) ray_error_free(err);
     }

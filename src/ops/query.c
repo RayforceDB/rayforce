@@ -7907,26 +7907,41 @@ static void count_piece(void* vctx, uint32_t wid, int64_t b, int64_t e, const ra
     pc->local += count_compare_span(pc->c->src->type, p[0].attrs, p[0].data, 0, e - b,
                                     pc->c->rhs, pc->c->op);
 }
+/* The zone gate's comparison for a count op; 0 for none. */
+static uint16_t count_zone_op(count_cmp_op_t op) {
+    switch (op) {
+    case COUNT_CMP_EQ: return OP_EQ;
+    case COUNT_CMP_NE: return OP_NE;
+    case COUNT_CMP_LT: return OP_LT;
+    case COUNT_CMP_LE: return OP_LE;
+    case COUNT_CMP_GT: return OP_GT;
+    case COUNT_CMP_GE: return OP_GE;
+    default:           return 0;
+    }
+}
 /* Chunk ch of the bound source decided from its directory: 1 every row
  * compares true, 0 none, -1 undecided.  The source has no nulls (the fast
  * path declines nullable columns other than SYM, which is never decided
  * here: its ids carry no string order, #738). */
 static int count_chunk_decision(const count_compare_ctx_t* ctx, int64_t ch) {
-    if (!zone_dir_type(ctx->src->type)) return -1;
+    uint16_t op = count_zone_op(ctx->op);
+    if (!op || !zone_dir_type(ctx->src->type)) return -1;
     ray_enc_chunk_stat_t st;
     if (!ray_col_src_chunk_stat(ctx->src, ch, &st)) return -1;
-    uint16_t op;
-    switch (ctx->op) {
-    case COUNT_CMP_EQ: op = OP_EQ; break;
-    case COUNT_CMP_NE: op = OP_NE; break;
-    case COUNT_CMP_LT: op = OP_LT; break;
-    case COUNT_CMP_LE: op = OP_LE; break;
-    case COUNT_CMP_GT: op = OP_GT; break;
-    case COUNT_CMP_GE: op = OP_GE; break;
-    default: return -1;
-    }
     return zone_cmp_core(st.min, st.max, st.has_minmax, false, false, op, ctx->rhs);
 }
+/* Vector v of an undecided chunk decided from its descriptor (the same
+ * rule over the vector's statistics, which nest inside the chunk's): the
+ * count is answer-only, so a decided vector is never read. */
+static int count_vec_decision(const count_compare_ctx_t* ctx, uint16_t op, int64_t v) {
+    int64_t mn, mx; uint32_t nn;
+    if (!ray_col_src_vec_stat(ctx->src, v, &mn, &mx, &nn)) return -1;
+    return zone_cmp_core(mn, mx, true, nn > 0, false, op, ctx->rhs);
+}
+/* Rows [start, end) of a generation-2 source: each chunk decided from the
+ * directory, then each vector of an undecided chunk from its descriptor;
+ * the undecided vectors are read through one task cursor, consecutive ones
+ * in one walk. */
 static void count_compare_enc_task(void* vctx, uint32_t worker_id, int64_t start, int64_t end) {
     count_compare_ctx_t* ctx = (count_compare_ctx_t*)vctx;
     if (ray_scan_fail_skip(ctx->fail, start)) return;
@@ -7934,17 +7949,33 @@ static void count_compare_enc_task(void* vctx, uint32_t worker_id, int64_t start
     ray_col_src_t* srcs[1] = { ctx->src };
     const void* plain[1] = { NULL };
     _Static_assert(RAY_ENC_CHUNK == 1 << 16, "count decisions read 64K-row chunks");
-    for (int64_t b = start; b < end; ) {
+    const uint16_t op = count_zone_op(ctx->op);
+    const bool by_vec = op && zone_dir_type(ctx->src->type);
+    ray_col_cursor_t cur;
+    ray_col_cursor_init(&cur, ctx->src);
+    ray_t* err = NULL;
+    for (int64_t b = start; b < end && !err; ) {
         int64_t e = ((b >> 16) + 1) << 16;                 /* the end of b's chunk */
         if (e > end) e = end;
         int d = count_chunk_decision(ctx, b >> 16);
         if (d == 1) pc.local += e - b;
+        else if (d != 0 && !by_vec) err = ray_col_walk_cur(srcs, plain, 1, &cur, b, e, &pc, worker_id, count_piece);
         else if (d != 0) {
-            ray_t* err = ray_col_walk(srcs, plain, 1, b, e, false, &pc, worker_id, count_piece);
-            if (err) { ray_scan_fail_note(ctx->fail, start, err); return; }
+            int64_t run = -1;                              /* first row of the undecided vectors pending */
+            for (int64_t vb = b, ve; vb < e && !err; vb = ve) {
+                ve = (vb / RAY_ENC_VEC + 1) * RAY_ENC_VEC;
+                if (ve > e) ve = e;
+                int vd = count_vec_decision(ctx, op, vb / RAY_ENC_VEC);
+                if (vd < 0) { if (run < 0) run = vb; continue; }
+                if (run >= 0) { err = ray_col_walk_cur(srcs, plain, 1, &cur, run, vb, &pc, worker_id, count_piece); run = -1; }
+                if (vd == 1) pc.local += ve - vb;
+            }
+            if (!err && run >= 0) err = ray_col_walk_cur(srcs, plain, 1, &cur, run, e, &pc, worker_id, count_piece);
         }
         b = e;
     }
+    ray_col_cursor_free(&cur);
+    if (err) { ray_scan_fail_note(ctx->fail, start, err); return; }
     ctx->counts[worker_id] += pc.local;
 }
 

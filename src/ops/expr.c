@@ -2089,6 +2089,16 @@ static int zone_dir_decision(const ray_col_src_t* src, int64_t ch, uint16_t cmp_
     return d < 0 ? ZT_MIXED : d;
 }
 
+/* The same over vector v of the register's source, from its descriptor:
+ * for a morsel inside one vector of a chunk its directory left undecided.
+ * Answer-only (the morsel is filled, never read), so no consumer guard. */
+static int zone_vec_decision(const ray_col_src_t* src, int64_t v, uint16_t cmp_op, int64_t cval) {
+    int64_t mn, mx; uint32_t nn;
+    if (!ray_col_src_vec_stat(src, v, &mn, &mx, &nn)) return ZT_MIXED;
+    int d = zone_cmp_core(mn, mx, true, nn > 0, false, cmp_op, cval);
+    return d < 0 ? ZT_MIXED : d;
+}
+
 /* Does `col` carry a fresh, integer/temporal chunk-zone index? */
 static inline const ray_index_t* zone_fresh_index(const ray_t* col) {
     if (!col || !(col->attrs & RAY_ATTR_HAS_INDEX) || !col->index) return NULL;
@@ -2133,9 +2143,13 @@ static int expr_zone_decide(const ray_expr_t* expr, int64_t ms, int64_t me) {
             }
             int d = ZT_MIXED;
             if (src_reg >= 0 && expr->regs[src_reg].enc) {
-                /* generation 2: the directory's chunk of 64K rows */
+                /* generation 2: the directory's chunk of 64K rows, then the
+                 * descriptor of the vector the morsel lies in */
                 if (zone_dir_type(expr->regs[src_reg].col_type) && (ms >> 16) == ((me - 1) >> 16))
                     d = zone_dir_decision(expr->regs[src_reg].src, ms >> 16, cmp, cval);
+                if (d == ZT_MIXED && zone_dir_type(expr->regs[src_reg].col_type) &&
+                    ms / RAY_ENC_VEC == (me - 1) / RAY_ENC_VEC)
+                    d = zone_vec_decision(expr->regs[src_reg].src, ms / RAY_ENC_VEC, cmp, cval);
             } else {
                 const ray_index_t* ix = zone_fresh_index(col);
                 if (ix) {
