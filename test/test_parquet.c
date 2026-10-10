@@ -330,7 +330,7 @@ static void pq_set_symmode(const char* v) { pq_set_env("RAY_PQ_SYM_MODE", v); }
 static void pq_sym_env_clear(void) {
     const char* knobs[] = {"RAY_PQ_SYM_MODE","RAY_PQ_SYM_ORDER","RAY_PQ_SYM_GROUPS","RAY_PQ_SYM_WINDOW",
                            "RAY_PQ_SYM_ARENA","RAY_PQ_SYM_HASH_BITS","RAY_PQ_SYM_INJECT","RAY_PQ_PASS_COLS",
-                           "RAY_PQ_SYM_RAM","RAY_PQ_DIRECT_REVERSE"};
+                           "RAY_PQ_SYM_RAM","RAY_PQ_DIRECT_REVERSE","RAY_PQ_SYM_HASH_TOP"};
     for (size_t i = 0; i < sizeof(knobs)/sizeof(knobs[0]); i++) pq_set_env(knobs[i], NULL);
 }
 
@@ -1062,7 +1062,8 @@ static test_result_t test_pq_sym_grouped(void) {
  * byte all share a hash, and the dedupe arena is small enough to start
  * over inside a chunk.  Every candidate is then compared, most mismatch,
  * and each string still gets one position of its own, in every order, on
- * one worker and four; with some of the bits kept the vocabulary is the
+ * one worker and four; with some of the bits kept (the low ones, or the
+ * top ones over several hash groups) the vocabulary is the
  * direct import's. */
 static test_result_t test_pq_sym_grouped_collisions(void) {
 #if !defined(DEBUG)
@@ -1103,12 +1104,24 @@ static test_result_t test_pq_sym_grouped_collisions(void) {
             TEST_ASSERT_TRUE(pq_trace_sum(trace, "collisions", NULL) > 0);
             double recb = pq_trace_sum(trace, "rec_bytes", NULL), wbb = pq_trace_sum(trace, "wb_bytes", NULL);
             TEST_ASSERT_TRUE(o == 0 || o == 3 ? wbb == recb : wbb >= recb);
+            /* the second column's pass takes nothing into its index: the
+             * first's records are there, those its collisions added too */
+            TEST_ASSERT_TRUE(pq_trace_sum(trace, "adopted", NULL) == 0);
             pq_remove_native(dir, names, 3);
-            pq_set_env("RAY_PQ_SYM_HASH_BITS", "6");
-            res = ray_parquet_splayed_typed(mix, dir, types);
+            /* six low bits of the hash kept, or (a run in two) its two top
+             * bits with four hash groups: collisions in every group, not only
+             * the first */
+            bool top = (run & 2) != 0;
+            pq_set_env("RAY_PQ_SYM_HASH_BITS", top ? NULL : "6");
+            pq_set_env("RAY_PQ_SYM_HASH_TOP", top ? "2" : NULL);
+            pq_set_env("RAY_PQ_SYM_GROUPS", top ? "4" : NULL);
+            res = pq_traced_import(mix, dir, types, trace, sizeof(trace));
+            pq_set_env("RAY_PQ_SYM_HASH_TOP", NULL); pq_set_env("RAY_PQ_SYM_GROUPS", NULL);
             TEST_ASSERT_FALSE(RAY_IS_ERR(res)); ray_release(res);
             TEST_ASSERT_TRUE(pq_synth_check(dir, 6000, pq_synth_mixed));
             TEST_ASSERT_EQ_I(pq_sym_count(dir), words);
+            if (top) TEST_ASSERT_TRUE(pq_trace_sum(trace, "collisions", NULL) > 0);
+            TEST_ASSERT_TRUE(pq_trace_sum(trace, "adopted", NULL) == 0);
             pq_remove_native(dir, names, 3);
             ray_pool_destroy();
         }
@@ -1160,10 +1173,19 @@ static test_result_t test_pq_sym_grouped_layout(void) {
         pq_set_env("RAY_PQ_SYM_ORDER", split ? "rows" : "rowsflat");
         pq_set_env("RAY_PQ_SYM_GROUPS", run & 1 ? "64" : NULL);   /* a group table over and over */
         pq_set_symmode("grouped");
-        res = ray_parquet_splayed_typed(src, dir, types);
+        /* a dedupe arena of 100000 bytes a generation: past the 64 KB it
+         * starts with, doubled no further than that */
+        pq_set_env("RAY_PQ_SYM_ARENA", "100000");
+        char trace[8192];
+        res = pq_traced_import(src, dir, types, trace, sizeof(trace));
+        pq_set_env("RAY_PQ_SYM_ARENA", NULL);
         pq_set_symmode(NULL);
         TEST_ASSERT_FALSE(RAY_IS_ERR(res)); ray_release(res);
         TEST_ASSERT_TRUE(pq_synth_check(dir, rows, pq_synth_zipf));
+        int gpasses = 0, workers = run & 1 ? 4 : 1;
+        double arena = pq_trace_sum(trace, "arena_kb", &gpasses);
+        if (arena > gpasses * workers * 98.0 || arena <= gpasses * 64.0) fprintf(stderr, "  layout %d: arenas %.0f KB in %d passes\n", run, arena, gpasses);
+        TEST_ASSERT_TRUE(gpasses == 2 && arena > gpasses * 64.0 && arena <= gpasses * workers * 98.0);
         TEST_ASSERT_EQ_I(pq_sym_count(dir), words);
         /* the column of the first pass (the smaller chunks), the one whose
          * strings hold positions 1 to their count: their first row and
@@ -1313,7 +1335,9 @@ static test_result_t test_pq_sym_mixed_modes(void) {
             double adopted = pq_trace_sum(trace, "adopted", &passes);
             fprintf(stderr, "  %d/%d: s %s, t %s, grouped passes %d, adopted %.0f\n", v, run, s_direct ? "direct" : "grouped",
                     t_grouped ? "grouped" : "direct", passes, adopted);
-            if (run < 3 ? !s_direct || !t_grouped || passes != 1 || adopted != 40 : s_direct || !t_grouped || passes != 2) bad++;
+            /* forced: the second pass adopts nothing, the first's records in its
+             * index already */
+            if (run < 3 ? !s_direct || !t_grouped || passes != 1 || adopted != 40 : s_direct || !t_grouped || passes != 2 || adopted != 0) bad++;
             /* the direct passes' shard tables freed at the first reservation:
              * none through the grouped passes */
             double tabs = pq_trace_sum(trace, "imp_index_kb", NULL);
@@ -2314,6 +2338,104 @@ static test_result_t test_pq_sym_vocab_bound(void) {
     TEST_ASSERT_EQ_I(bad, 0);
     PASS();
 }
+/* A hundred strings, and ten. */
+static const char* pqx_card100(int64_t r, char* buf, uint32_t* len) {
+    *len = (uint32_t)snprintf(buf, 256, "m%03lld", (long long)((r * 13) % 100));
+    return buf;
+}
+static const char* pqx_card10(int64_t r, char* buf, uint32_t* len) {
+    if (r % 17 == 0) return NULL;
+    *len = (uint32_t)snprintf(buf, 256, "w%lld", (long long)((r * 3) % 10));
+    return buf;
+}
+/* The column-by-column decision's caps, with the memory it assumes set from
+ * the columns' bounds (RAY_PQ_SYM_RAM, debug builds): a dictionary column
+ * whose bound is past a sixty-fourth of memory goes grouped though it would
+ * fit the sixteenth the direct ones share; two dictionary columns within
+ * both go direct, the whole import then direct (no grouped pass), their
+ * dictionaries seeded in row-group order: one worker's files the same with
+ * the row groups taken last to first. */
+static test_result_t test_pq_sym_direct_caps(void) {
+#if !defined(DEBUG)
+    SKIP("the memory the decision assumes is a debug-build knob");
+#else
+    pq_sym_env_clear();
+    char src[160], dir[160], ref[160], a[240], b[240];
+    snprintf(src, sizeof(src), "/tmp/rayforce-pqcap-%d.parquet", (int)getpid());
+    snprintf(dir, sizeof(dir), "/tmp/rayforce-pqcap-%d", (int)getpid());
+    snprintf(ref, sizeof(ref), "/tmp/rayforce-pqcap-%d-ref", (int)getpid());
+    const char* fnames[3] = {"x","p","q"};
+    const char* nm[2] = {"p","q"};
+    int64_t tids[3] = {ray_sym_intern("I32", 3), ray_sym_intern("SYM", 3), ray_sym_intern("SYM", 3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 3);
+    size_t cap = (size_t)1 << 16;
+    char* trace = (char*)ray_sys_alloc(cap);
+    TEST_ASSERT_TRUE(trace != NULL);
+    TEST_ASSERT_EQ_I(pq_pool(1), RAY_OK);
+    int bad = 0;
+    for (int k = 0; k < 2; k++) {
+        /* 0: p a hundred strings, q a string a row; 1: p forty, q ten */
+        pq_synth_fn fns[2] = {k ? pqx_lowcard : pqx_card100, k ? pqx_card10 : pqx_highcard};
+        unsigned fl[2] = {PQX_DICT, k ? PQX_DICT : 0};
+        int64_t rows = k ? 40000 : 20000;
+        TEST_ASSERT_TRUE(pqx_synth(src, rows, 2, 2, nm, fns, fl));
+        pq_set_symmode("direct");
+        ray_t* res = pq_traced_import(src, dir, types, trace, cap);
+        pq_sym_env_clear();
+        TEST_ASSERT_FALSE(!res || RAY_IS_ERR(res)); ray_release(res);
+        int64_t words = pq_sym_count(dir);
+        pq_remove_native(dir, fnames, 3);
+        double bp = pq_trace_line_num(trace, "parquet symcol: col=p ", "vocab_bytes");
+        double bq = pq_trace_line_num(trace, "parquet symcol: col=q ", "vocab_bytes");
+        double text = pq_trace_line_num(trace, "parquet symcol: col=p ", "text_bytes") +
+                      pq_trace_line_num(trace, "parquet symcol: col=q ", "text_bytes");
+        /* 0: p's bound a thirty-second of memory; 1: the larger one's a
+         * sixty-fourth (the two within a sixteenth) */
+        double big = bp > bq ? bp : bq;
+        int64_t sram = k ? (int64_t)(big * 64) : (int64_t)(bp * 32);
+        char ramv[32]; snprintf(ramv, sizeof(ramv), "%lld", (long long)sram);
+        if (bp <= 0 || (double)sram / 4 >= text || (!k && bq <= (double)sram / 16)) {
+            fprintf(stderr, "  caps %d: no memory size fits: p %.0f, q %.0f, text %.0f\n", k, bp, bq, text);
+            bad++;
+        }
+        for (int run = 0; run < 2; run++) {
+            const char* out = run ? dir : ref;
+            pq_set_env("RAY_PQ_SYM_RAM", ramv);
+            if (run) pq_set_env("RAY_PQ_DIRECT_REVERSE", "1");
+            res = pq_traced_import(src, out, types, trace, cap);
+            pq_sym_env_clear();
+            TEST_ASSERT_FALSE(!res || RAY_IS_ERR(res)); ray_release(res);
+            TEST_ASSERT_TRUE(pqx_check(out, rows, 2, nm, fns, k ? "caps 1" : "caps 0", NULL));
+            if (pq_sym_count(out) != words) { fprintf(stderr, "  caps %d: %lld symbols, direct %lld\n", k, (long long)pq_sym_count(out), (long long)words); bad++; }
+            bool p_direct = pq_trace_line_has(trace, "parquet symcol: col=p ", " mode=direct");
+            bool q_direct = pq_trace_line_has(trace, "parquet symcol: col=q ", " mode=direct");
+            int passes = 0;
+            (void)pq_trace_sum(trace, "rec_bytes", &passes);
+            bool seeded = strstr(trace, "parquet symseed:") != NULL;
+            fprintf(stderr, "  caps %d/%d: p %s, q %s, %d grouped passes%s\n", k, run, p_direct ? "direct" : "grouped",
+                    q_direct ? "direct" : "grouped", passes, seeded ? ", seeded" : "");
+            if (k ? !p_direct || !q_direct || passes != 0 || !seeded : p_direct || q_direct || passes != 2) bad++;
+        }
+        if (k) {
+            bool same = true;
+            snprintf(a, sizeof(a), "%s/.sym", ref); snprintf(b, sizeof(b), "%s/.sym", dir);
+            if (!pq_same_file(a, b)) same = false;
+            for (int c = 1; c < 3; c++) {
+                snprintf(a, sizeof(a), "%s/%s", ref, fnames[c]); snprintf(b, sizeof(b), "%s/%s", dir, fnames[c]);
+                if (!pq_same_file(a, b)) same = false;
+            }
+            if (!same) { fprintf(stderr, "  caps 1: files differ with the row groups reversed\n"); bad++; }
+        }
+        pq_remove_native(dir, fnames, 3); pq_remove_native(ref, fnames, 3);
+        unlink(src);
+    }
+    ray_pool_destroy();
+    ray_sys_free(trace);
+    ray_release(types);
+    TEST_ASSERT_EQ_I(bad, 0);
+    PASS();
+#endif
+}
 /* A file of no row groups, forced grouped: imported, no rows; a step
  * failing (resolve still runs, over no tasks) reports its error, publishes
  * nothing and keeps no memory, run after run. */
@@ -2632,6 +2754,7 @@ const test_entry_t parquet_entries[] = {
     {"parquet/symgrp_mixed_columns",test_pq_symgrp_mixed_columns,pq_setup,pq_teardown},
     {"parquet/sym_vocab_bound",test_pq_sym_vocab_bound,pq_setup,pq_teardown},
     {"parquet/sym_grouped_empty",test_pq_sym_grouped_empty,pq_setup,pq_teardown},
+    {"parquet/sym_direct_caps",test_pq_sym_direct_caps,pq_setup,pq_teardown},
 #if defined(__linux__)
     {"parquet/chunk_flush_error",test_pq_chunk_flush_error,pq_setup,pq_teardown},
 #endif

@@ -2695,6 +2695,10 @@ static void pq_sym_grouped(pq_direct_work* dw, ray_symgrp_t* g, ray_symimp_t* im
     {
         const char* e = getenv("RAY_PQ_SYM_HASH_BITS");
         if (e && *e) { long b = strtol(e,NULL,10); w.hmask = b <= 0 ? 0 : b >= 64 ? UINT64_MAX : (UINT64_C(1) << b) - 1; }
+        /* or its top bits (the hash groups' and logs' own): collisions in
+         * every group, not only the first */
+        e = getenv("RAY_PQ_SYM_HASH_TOP");
+        if (e && *e) { long b = strtol(e,NULL,10); w.hmask = b <= 0 ? 0 : b >= 64 ? UINT64_MAX : ~((UINT64_C(1) << (64 - b)) - 1); }
         e = getenv("RAY_PQ_SYM_ARENA");
         if (e && *e && strtol(e,NULL,10) > 0) w.acap = strtol(e,NULL,10);
     }
@@ -2763,11 +2767,11 @@ static void pq_sym_grouped(pq_direct_work* dw, ray_symgrp_t* g, ray_symimp_t* im
         for (int64_t i = 0; i < w.nws; i++) arena += w.ws[i].d.acap;
         ray_t* nm = ray_sym_str(r->schema[c].name);
         static const char* orders[] = {"rows","shards","freq","rowsflat"};
-        fprintf(stderr,"parquet symgrp: col=%.*s order=%s groups=%d windows=%lld rows=%lld gens=%lld staged=%lld stage_mb=%.1f arena_mb=%.1f"
+        fprintf(stderr,"parquet symgrp: col=%.*s order=%s groups=%d windows=%lld rows=%lld gens=%lld staged=%lld stage_mb=%.1f arena_mb=%.1f arena_kb=%lld"
                 " owners=%lld again=%lld again_mb=%.1f old=%lld refs=%lld log_loaded=%lld budget_mb=%.0f store_cap_mb=%.0f store_pos=%lld store_spans=%lld store_mb=%.1f"
                 " store_read_mb=%.1f store_kept=%lld deferred=%lld settle_read_mb=%.1f compares=%lld cmp_mb=%.1f collisions=%lld redo=%lld entries=%lld rec_bytes=%lld wb_bytes=%lld adopted=%lld imp_index_kb=%lld\n",
                 (int)ray_str_len(nm),ray_str_ptr(nm),orders[ray_symgrp_order(g)],groups,(long long)st.windows,
-                (long long)atomic_load(&w.rows),(long long)atomic_load(&w.gens),(long long)st.staged,(double)st.stage_bytes/1048576.0,(double)arena/1048576.0,
+                (long long)atomic_load(&w.rows),(long long)atomic_load(&w.gens),(long long)st.staged,(double)st.stage_bytes/1048576.0,(double)arena/1048576.0,(long long)(arena/1024),
                 (long long)st.owners,(long long)st.again,(double)st.again_bytes/1048576.0,(long long)st.old,(long long)st.refs,(long long)st.log_loaded,
                 (double)budget/1048576.0,(double)store/1048576.0,
                 (long long)st.store_pos,(long long)st.store_spans,(double)st.store_bytes/1048576.0,
@@ -3037,7 +3041,11 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
             int64_t budget = wm > 0 ? wm - ray_heap_anon_committed() : (int64_t)1 << 30;
             if (budget < ((int64_t)64 << 20)) budget = (int64_t)64 << 20;
             /* hash groups: a group's index table (~24 B an entry, the
-             * column's rows bounding its new strings) within a quarter */
+             * column's rows bounding its new strings) within a quarter.  The
+             * budget is the memory free when the pass starts, so the groups
+             * are too: under RAY_PQ_SYM_ORDER=shards, which numbers the new
+             * strings group by group, the positions depend on it (the
+             * default order does not) */
             int groups = 1;
             const char* e = getenv("RAY_PQ_SYM_GROUPS");
             if (e && *e && strtol(e,NULL,10) > 0) groups = (int)strtol(e,NULL,10);
