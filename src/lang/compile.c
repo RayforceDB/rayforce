@@ -759,8 +759,8 @@ void ray_compile(ray_t *lambda) {
     /* A closure's captures are locals of its body, bound before it runs:
      * a `let` of a captured name writes the same slot, a capture named
      * like a builtin is the callee, and a window (OP_SCOPE_BEGIN) binds
-     * them with the other locals.  A parameter shadows a capture of its
-     * name.  OP_LOADCAP takes a one-byte index and a frame holds 256
+     * them with the other locals.  `self` is never captured (env.c), so it
+     * is not among them.  OP_LOADCAP takes a one-byte index and a frame holds 256
      * slots: a closure with more captures than that stays on the tree
      * walker, which has no such limit. */
     if (!c.error && LAMBDA_CLOSURE(lambda)) {
@@ -768,7 +768,7 @@ void ray_compile(ray_t *lambda) {
         init_sf_syms();
         for (int64_t i = 0; i < ckeys->len && !c.error; i++) {
             int64_t id = ray_read_sym(ray_data(ckeys), i, RAY_SYM, ckeys->attrs);
-            if (id == sf_self || find_local(&c, id) >= 0) continue;
+            if (find_local(&c, id) >= 0) continue;   /* a parameter shadows its capture */
             int32_t slot = add_local(&c, id);
             if (slot < 0 || i > 255) { c.error = true; break; }
             emit(&c, OP_LOADCAP);

@@ -338,3 +338,5 @@ CNT9 -- 6
 ;; even with nothing to capture: `'p` is the column, so the join is row-wise.
 (set T9 (table [v p] (list ["1" "2" "3"] ['x 'y 'z])))
 (at (select {r: ((fn [a] (concat 'p a)) v) from: T9}) 'r) -- ["x1" "y2" "z3"]
+;; a lambda with nothing to capture at all is still query text
+(at (select {r: ((fn [] (concat 'p "!"))) from: T9}) 'r) -- [x! y! z!]
