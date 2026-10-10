@@ -61,6 +61,12 @@
 (probe_caught (fn [p] (try (select {s: (sum y) by: x from: TB where: (> y 38) take: "a"}) (fn [e] 0))) 5 1000) -- true
 (probe_caught (fn [p] (try (select {r: (+ (sum y) [1 2 3]) by: x from: TB where: (> y 38)}) (fn [e] 0))) 5 1000) -- true
 (probe_caught (fn [p] (try (select {d: (count (distinct z)) by: V100 from: TB where: (> y 38)}) (fn [e] 0))) 5 1000) -- true
+;; the owned by: symbol vector on the error returns of a by-dict or a quoted
+;; key: ray_select_impl releases it, whichever exit the select took
+(probe_caught (fn [p] (try (select {t: (top y 0) by: {k: x} from: TB}) (fn [e] 0))) 5 1000) -- true
+(probe_caught (fn [p] (try (select {s: (sum y) by: {k: x} from: TB take: "a"}) (fn [e] 0))) 5 1000) -- true
+(probe_caught (fn [p] (try (select {r: (+ (sum y) [1 2 3]) by: {k: x} from: TB}) (fn [e] 0))) 5 1000) -- true
+(probe_caught (fn [p] (try (select {t: (top y 0) by: 'x from: TB}) (fn [e] 0))) 5 1000) -- true
 ;; try frees the error it catches, and the trace its unwind recorded: a
 ;; raise, a runtime error, a rethrow, a fallback value, in a function
 (probe (fn [p] (try (raise p) (fn [e] 0))) 5 1000) -- true

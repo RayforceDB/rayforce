@@ -9437,22 +9437,29 @@ static ray_t* select_name_computed_key(ray_t* r, int64_t key_name) {
     return r;
 }
 
-static ray_t* ray_select_body(ray_t** args, int64_t n, bool aliases_resolved,
-                              ray_t** owned_sel);
+/* References the select body owns for its whole run.  It returns from
+ * dozens of places, so it hands them here and ray_select_impl releases them
+ * once, whichever exit the body took. */
+typedef struct {
+    ray_t* selection;   /* the WHERE selection kept past the graph that owns
+                         * it: the count(distinct) scatter reads it */
+    ray_t* by_syms;     /* by: rewritten into an owned symbol vector (a by-dict,
+                         * a quoted key symbol); by_expr points into it */
+} select_owned_t;
 
-/* The select body keeps a reference to its WHERE selection past the graph
- * that owns it (the count(distinct) scatter reads it) and returns from
- * dozens of places; the reference is handed here and released once,
- * whichever exit the body took. */
+static ray_t* ray_select_body(ray_t** args, int64_t n, bool aliases_resolved,
+                              select_owned_t* own);
+
 static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
-    ray_t* owned_sel = NULL;
-    ray_t* r = ray_select_body(args, n, aliases_resolved, &owned_sel);
-    if (owned_sel) ray_release(owned_sel);
+    select_owned_t own = {0};
+    ray_t* r = ray_select_body(args, n, aliases_resolved, &own);
+    if (own.selection) ray_release(own.selection);
+    if (own.by_syms) ray_release(own.by_syms);
     return r;
 }
 
 static ray_t* ray_select_body(ray_t** args, int64_t n, bool aliases_resolved,
-                              ray_t** owned_sel) {
+                              select_owned_t* own) {
     if (n < 1) return ray_error("arity", "select: expects a query dict, got %lld args", (long long)n);
     ray_t* dict = args[0];
     if (!dict || dict->type != RAY_DICT)
@@ -9905,13 +9912,14 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, bool aliases_resolved,
      * column produces the SAME clean "column not found" error as a bare
      * `by: nonexistent` (rather than flowing into ray_elem_size on a literal
      * symbol and tripping UBSan).  The owned name-ref rides in
-     * by_sym_vec_owned and is released with the other owned by-forms at
-     * function exit.  Multi-key (RAY_DICT/list) and dotted by-forms are not
+     * own->by_syms, released by ray_select_impl with the other owned
+     * by-forms.  Multi-key (RAY_DICT/list) and dotted by-forms are not
      * scalar -RAY_SYM literals and are left untouched. */
     if (by_expr && by_expr->type == -RAY_SYM && (by_expr->attrs & ATTR_QUOTED)) {
         ray_t* nref = ray_sym(by_expr->i64);
         if (nref && !RAY_IS_ERR(nref)) {
             by_sym_vec_owned = nref;
+            own->by_syms = nref;
             by_expr = nref;
         } else if (nref) {
             ray_release(nref);
@@ -9921,7 +9929,7 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, bool aliases_resolved,
     /* Selection saved across the path-A graph free for count(distinct
      * col_ref) non-aggs.  Path B leaves this NULL because the
      * materialised filtered_tbl already encodes the selection in row
-     * positions.  Borrowed: the reference is *owned_sel, released by
+     * positions.  Borrowed: the reference is own->selection, released by
      * ray_select_impl. */
     ray_t* saved_selection = NULL;
     ray_t* post_group_where_expr = NULL;
@@ -10022,6 +10030,7 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, bool aliases_resolved,
             }
             ((int64_t*)ray_data(by_sym_vec_owned))[0] = base_key_name;
             by_sym_vec_owned->len = 1;
+            own->by_syms = by_sym_vec_owned;
             by_expr = by_sym_vec_owned;
             dep_key_base_sym = base_key_name;
             n_dep_keys = local_n_dep;
@@ -10117,6 +10126,7 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, bool aliases_resolved,
                 int64_t* sv = (int64_t*)ray_data(by_sym_vec_owned);
                 for (int64_t i = 0; i < nk; i++) sv[i] = d_elems[i * 2]->i64;
                 by_sym_vec_owned->len = nk;
+                own->by_syms = by_sym_vec_owned;
                 by_expr = by_sym_vec_owned;
                 parted_bydict_deferred = true;
                 deferred_bydict = by_dict_ast;
@@ -10373,6 +10383,7 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, bool aliases_resolved,
             ray_release(tbl);
             DICT_VIEW_CLOSE(dv); DICT_VIEW_CLOSE(byv); return fail_err;
         }
+        own->by_syms = by_sym_vec_owned;
         by_expr = by_sym_vec_owned;
     }
 by_dict_done:
@@ -10386,7 +10397,6 @@ by_dict_done:
     ray_graph_t* g = ray_graph_new(tbl);
     if (!g) {
         scratch_free(dep_src_hdr);   /* bridged dep-key collector (dep path only; NULL otherwise) */
-        if (by_sym_vec_owned) ray_release(by_sym_vec_owned);
         ray_release(tbl); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL);
     }
 
@@ -10434,7 +10444,6 @@ by_dict_done:
         (size_t)(nk_max + 2 * aggs_max) * sizeof(uint32_t));
     if (!nonagg_names) {
         scratch_free(dep_src_hdr);
-        if (by_sym_vec_owned) ray_release(by_sym_vec_owned);
         ray_graph_free(g); ray_release(tbl); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL);
     }
     ray_t**  nonagg_exprs     = (ray_t**)(nonagg_names + n_out_max);
@@ -11184,7 +11193,6 @@ by_dict_done:
                     scratch_free(keycols_hdr);
                     if (eval_tbl != tbl) ray_release(eval_tbl);
                     ray_release(tbl);
-                    if (by_sym_vec_owned) ray_release(by_sym_vec_owned);
                     scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return dres;
                 }
 
@@ -11414,7 +11422,6 @@ by_dict_done:
                         scratch_free(rowbuf_hdr); scratch_free(keyrd_hdr); scratch_free(cntnames_hdr); scratch_free(keycols_hdr);
                         if (eval_tbl != tbl) ray_release(eval_tbl);
                         ray_release(tbl);
-                        if (by_sym_vec_owned) ray_release(by_sym_vec_owned);
                         scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return result;
                     }
                     /* Not a count-only shape — release the pre-take scratch and
@@ -11786,7 +11793,6 @@ by_dict_done:
                 ray_release(groups);
                 if (eval_tbl != tbl) ray_release(eval_tbl);
                 ray_release(tbl);
-                if (by_sym_vec_owned) ray_release(by_sym_vec_owned);
                 if (take_preapplied) {
                     scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return result;
                 }
@@ -12047,7 +12053,6 @@ by_dict_done:
                 }
                 res = apply_sort_take(res, dict_elems, dict_n,
                                       asc_id, desc_id, take_id, NULL);
-                if (by_sym_vec_owned) ray_release(by_sym_vec_owned);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return res;
             }
 
@@ -12087,7 +12092,6 @@ by_dict_done:
                 }
                 if (eval_tbl != tbl) ray_release(eval_tbl);
                 ray_release(tbl);
-                if (by_sym_vec_owned) ray_release(by_sym_vec_owned);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return empty;
             }
 
@@ -12509,7 +12513,6 @@ by_dict_done:
             ray_release(tbl);
             result = apply_sort_take(result, dict_elems, dict_n,
                                      asc_id, desc_id, take_id, NULL);
-            if (by_sym_vec_owned) ray_release(by_sym_vec_owned);
             scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return result;
         }
 
@@ -12754,7 +12757,7 @@ by_dict_done:
                 if (g->selection) {
                     saved_selection = g->selection;
                     ray_retain(saved_selection);
-                    *owned_sel = saved_selection;
+                    own->selection = saved_selection;
                 }
             } else {
                 root = ray_optimize(g, root);
@@ -13225,7 +13228,6 @@ by_dict_done:
                 }
                 if (filtered_tbl != tbl) ray_release(filtered_tbl);
                 ray_release(tbl);
-                if (by_sym_vec_owned) ray_release(by_sym_vec_owned);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return empty;
             }
 
@@ -13294,7 +13296,7 @@ by_dict_done:
                     scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return groups2;
                 }
                 int64_t ng2 = ray_len(groups2) / 2;
-                if (ng2 == 0) { ray_release(groups2); ray_release(computed_key); if (filtered_tbl != tbl) ray_release(filtered_tbl); ray_release(tbl); if (by_sym_vec_owned) ray_release(by_sym_vec_owned); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_table_new(0); }
+                if (ng2 == 0) { ray_release(groups2); ray_release(computed_key); if (filtered_tbl != tbl) ray_release(filtered_tbl); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_table_new(0); }
                 ray_t** gi2 = (ray_t**)ray_data(groups2);
 
                 /* fi2 must sweep EVERY group, not just the first 256 —
@@ -13412,7 +13414,6 @@ by_dict_done:
                 ray_release(tbl);
                 res2 = apply_sort_take(res2, dict_elems, dict_n,
                                        asc_id, desc_id, take_id, NULL);
-                if (by_sym_vec_owned) ray_release(by_sym_vec_owned);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return res2;
             }
 
@@ -13705,7 +13706,6 @@ by_dict_done:
             ray_release(tbl);
             result = apply_sort_take(result, dict_elems, dict_n,
                                      asc_id, desc_id, take_id, NULL);
-            if (by_sym_vec_owned) ray_release(by_sym_vec_owned);
             scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return result;
         }
     } else if (n_out > 0) {
@@ -15495,7 +15495,6 @@ by_dict_done:
                                  take_id,
                                  take_pre.kind ? &take_pre : NULL);
 
-    if (by_sym_vec_owned) ray_release(by_sym_vec_owned);
 
     scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return result;
 }
