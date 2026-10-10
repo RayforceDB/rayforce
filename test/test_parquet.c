@@ -3134,7 +3134,10 @@ static int pq_file_has(const char* path, const char* s, size_t n) {
  * reason and the column, forced direct and as a mixed import whose
  * dictionary column is seeded first (the error then the seeding's, the same
  * words); nothing is published, and the symbol file the failed import
- * leaves in its staging directory holds no string of the page gone bad. */
+ * leaves in its staging directory holds no string of the page gone bad,
+ * but row group 0's (the seeding fails at the bad page, row group 1).  And a
+ * dictionary column whose checksums hold imports both ways, the mixed import
+ * seeded, every row and the vocabulary the direct import's. */
 static test_result_t test_pq_sk_codec_message(void) {
 #if !defined(DEBUG)
     SKIP("the memory the decision assumes is a debug-build knob");
@@ -3158,11 +3161,16 @@ static test_result_t test_pq_sk_codec_message(void) {
         {PQX_DICT | PQX_ZSTD, "unsupported compression codec"},
         {PQX_DICT | PQX_BADDICT, "invalid dictionary page"},
         {PQX_DICT | PQX_CRC | PQX_CRCFLIP, "page checksum mismatch"},
+        {PQX_DICT | PQX_CRC, NULL},   /* checksums that hold: imported both ways, the mixed one seeded */
     };
+    /* the first string of row group 0's dictionary of p (row 0 is null) */
+    char g0buf[256]; uint32_t g0len = 0;
+    const char* g0 = pqx_lowcard(1, g0buf, &g0len);
     for (size_t v = 0; v < sizeof(cases) / sizeof(cases[0]); v++) {
         unsigned fl[3] = {cases[v].flags, PQX_DICT, 0};
         TEST_ASSERT_TRUE(pqx_synth(src, 24000, 6, 3, nm, fns, fl));
-        int64_t sram = sk_mixed_ram(src, dir, types, fnames, 4, trace, cap, NULL);
+        int64_t words = -1;
+        int64_t sram = sk_mixed_ram(src, dir, types, fnames, 4, trace, cap, &words);
         pq_remove_native(partial, fnames, 4);
         TEST_ASSERT_TRUE(sram > 0);
         char ramv[32]; snprintf(ramv, sizeof(ramv), "%lld", (long long)sram);
@@ -3175,6 +3183,20 @@ static test_result_t test_pq_sk_codec_message(void) {
             const char* msg = ray_error_msg();
             bool failed = !res || RAY_IS_ERR(res);
             bool pd = pq_trace_line_has(trace, "parquet symcol: col=p ", " mode=direct");
+            if (!cases[v].want) {
+                bool ok = !failed && pqx_check(dir, 24000, 3, nm, fns, run ? "sk codec crc mixed" : "sk codec crc direct", NULL);
+                bool seeded = strstr(trace, "parquet symseed:") != NULL;
+                double entries = pq_trace_line_num(trace, "parquet symseed:", "entries");
+                double miss = pq_trace_line_num(trace, "parquet symdirect:", "seed_miss");
+                fprintf(stderr, "  sk codec %zu %s: %s%s, seeded %.0f entries, seed_miss %.0f, %lld symbols (direct %lld)\n", v,
+                        run ? "mixed" : "direct", ok ? "imported" : "FAILED: ", ok ? "" : msg ? msg : "(no message)",
+                        seeded ? entries : 0.0, miss, (long long)pq_sym_count(dir), (long long)words);
+                if (!ok || !pd || pq_sym_count(dir) != words) bad++;
+                if (run && (!seeded || entries <= 0 || miss != 0)) bad++;
+                if (res) { if (RAY_IS_ERR(res)) ray_error_free(res); else ray_release(res); }
+                pq_remove_native(partial, fnames, 4); pq_remove_native(dir, fnames, 4);
+                continue;
+            }
             fprintf(stderr, "  sk codec %zu %s: %s: %s%s\n", v, run ? "mixed" : "direct", failed ? "failed" : "imported",
                     msg ? msg : "(no message)", run ? "" : pd ? " (p direct)" : " (p grouped)");
             /* the mixed import fails in its seeding, before its symcol lines:
@@ -3191,6 +3213,11 @@ static test_result_t test_pq_sk_codec_message(void) {
                 fprintf(stderr, "  sk codec %zu %s: the staged .sym %s\n", v, run ? "mixed" : "direct",
                         has < 0 ? "is not there" : has ? "HOLDS the bad page's string" : "holds no string of the bad page");
                 if (has > 0) bad++;
+                /* and the seeding failed where the bad page is, row group 1:
+                 * row group 0's dictionaries, good, went in before it */
+                int got0 = run && g0 ? pq_file_has(sym, g0, g0len) : 1;
+                if (run) fprintf(stderr, "  sk codec %zu mixed: row group 0's strings %s\n", v, got0 > 0 ? "seeded" : "NOT seeded");
+                if (got0 <= 0) bad++;
             }
             pq_remove_native(partial, fnames, 4); pq_remove_native(dir, fnames, 4);
         }
