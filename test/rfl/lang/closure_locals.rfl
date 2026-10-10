@@ -226,7 +226,7 @@ rb -- [6 3]
 (set baseD (parse "(+ 1 0)"))
 (set wrapD (fn [inner] (concat (take baseD 2) (enlist inner))))
 (set buildD (fn [n] (let a (parse "x")) (times n (let a (wrapD a))) a))
-(set LD (concat (take (parse "(fn [x] 0)") 2) (enlist (buildD 6000))))
+(set LD (concat (take (parse "(fn [x] 0)") 2) (enlist (buildD 12000))))
 (nil? (try ((eval LD) 1) (fn [e] e))) -- false
 ;; closures made from one literal match by capture set in either order
 (set mkd2 (fn [flag k] (if false (set 1 2)) (if flag (let extra2 1)) (fn [] (list k (try extra2 'none)))))

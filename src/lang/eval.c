@@ -3316,11 +3316,6 @@ op_ret: {
         ray_t *v = vm.ps[--vm.sp];
         if (v) ray_release(v);
     }
-    /* A window (OP_SCOPE_BEGIN) still open in this run belongs to the
-     * frame that returns: a `return` inside its text leaves through here. */
-    while (ray_env_scope_depth() > scope_base)
-        ray_env_pop_scope();
-
     /* Undo protective retain — POP's reference is the caller's ownership */
     if (from_stack) ray_release(result);
 

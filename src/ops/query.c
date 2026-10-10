@@ -17089,16 +17089,16 @@ static bool update_dag_err_final(ray_t* out, bool if_refused) {
  * one cell: that is an error (#692).  When both paths fail, the planner's error (a misspelt
  * column: `schema: column 'x' not found`) wins over the interpreter's less
  * specific one.  Owned; a one-element vector is its atom. */
-/* The expression the planner last declined to compile in a grouped update:
- * the same expression over the next group would be declined again, so the
- * groups after the first skip the graph and go to the evaluator directly. */
-static _Thread_local ray_t* g_update_dag_declined = NULL;
-
-static ray_t* update_eval_on_impl(ray_t* sub, ray_t* expr, bool expand) {
+/* `dag_declined`, when given, belongs to one grouped update: the planner
+ * declining the expression over one group would decline it over the next,
+ * so the groups after the first skip the graph and go to the evaluator
+ * directly.  The ungrouped callers pass NULL and always try the planner,
+ * whose error (a misspelt column) is the one reported. */
+static ray_t* update_eval_on_impl(ray_t* sub, ray_t* expr, bool expand, bool* dag_declined) {
     ray_t* out = NULL;
     ray_t* cerr = NULL;
     bool if_refused = false;
-    ray_graph_t* g = g_update_dag_declined == expr ? NULL : ray_graph_new(sub);
+    ray_graph_t* g = dag_declined && *dag_declined ? NULL : ray_graph_new(sub);
     if (g) {
         ray_op_t* op = compile_expr_dag(g, expr);
         if (op) {
@@ -17106,7 +17106,7 @@ static ray_t* update_eval_on_impl(ray_t* sub, ray_t* expr, bool expand) {
             out = ray_execute(g, op);
         } else {
             cerr = graph_take_compile_err(g);
-            g_update_dag_declined = expr;
+            if (dag_declined) *dag_declined = true;
         }
         if_refused = g->if_refused;
         ray_graph_free(g);
@@ -17158,7 +17158,7 @@ static ray_t* update_eval_on_impl(ray_t* sub, ray_t* expr, bool expand) {
 }
 
 static ray_t* update_eval_on(ray_t* sub, ray_t* expr) {
-    return update_eval_on_impl(sub, expr, true);
+    return update_eval_on_impl(sub, expr, true, NULL);
 }
 
 static bool update_numeric_promo(int8_t ct, int8_t et) {
@@ -17589,6 +17589,7 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                 pure_expansion = query_inline_pure(candidate, 0);
             }
             bool cache_dependencies = (prepared_expr ? pure_expansion : query_inline_pure(agg_expr, 0));
+            bool dag_declined = false;   /* the planner declined this expression for a group */
 
             /* We need to evaluate the aggregate per group.
              * Build the result column by evaluating the expression on each group's subset. */
@@ -17666,7 +17667,7 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                     dependencies.table = sub_tbl;
                     g_query_dependencies = &dependencies;
                 }
-                ray_t* agg_result = update_eval_on_impl(sub_tbl, agg_expr, expand);
+                ray_t* agg_result = update_eval_on_impl(sub_tbl, agg_expr, expand, &dag_declined);
                 g_query_dependencies = prev_dependencies;
                 ray_release(sub_tbl);
 
