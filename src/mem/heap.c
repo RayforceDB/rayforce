@@ -3343,6 +3343,7 @@ static size_t retained_walk(const ray_t* v, ptrset_t* seen) {
             n += retained_walk(LAMBDA_NFO(lam), seen);
             n += retained_walk(LAMBDA_DBG(lam), seen);
             n += retained_walk(LAMBDA_CLOSURE(lam), seen);
+            n += retained_walk(LAMBDA_CAPROWS(lam), seen);
             return n;
         }
         if (ray_atom_owns_obj(v)) n += retained_walk(v->obj, seen);

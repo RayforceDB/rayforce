@@ -697,8 +697,10 @@ static bool objsize_push_children(ray_objsize_walk_t* w, ray_t* v) {
     if (v->type == RAY_LAMBDA) {
         ray_t** slots = (ray_t**)ray_data(v);
         for (int i = 0; i < 4; i++) OBJSIZE_PUSH(slots[i]);
-        OBJSIZE_PUSH(slots[5]);
-        OBJSIZE_PUSH(slots[6]);
+        OBJSIZE_PUSH(LAMBDA_NFO(v));
+        OBJSIZE_PUSH(LAMBDA_DBG(v));
+        OBJSIZE_PUSH(LAMBDA_CLOSURE(v));
+        OBJSIZE_PUSH(LAMBDA_CAPROWS(v));
         return true;
     }
     if (ray_is_atom(v)) {

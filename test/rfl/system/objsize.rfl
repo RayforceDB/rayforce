@@ -13,3 +13,7 @@
 
 ;; The allocator-maintenance builtin remains callable from Rayfall.
 (.sys.gc) -- 0
+
+;; A closure's captured environment is part of the lambda's retained graph.
+(set _objsize_k (til 64))
+(> (.mem.objsize ((fn [k] (fn [v] (+ v k))) _objsize_k)) (.mem.objsize (fn [v] (+ v 1)))) -- true
