@@ -651,7 +651,7 @@ static bool objsize_seen_insert(ray_objsize_walk_t* w, ray_t* p, bool* ok) {
 static size_t objsize_shallow(ray_t* v) {
     if (v->attrs & RAY_ATTR_SLICE) return sizeof(ray_t);
     if (v->type == RAY_LAMBDA)
-        return sizeof(ray_t) + 7 * sizeof(ray_t*);
+        return sizeof(ray_t) + LAMBDA_SLOTS * sizeof(ray_t*);
     if (v->type == RAY_INDEX)
         return sizeof(ray_t) + sizeof(ray_index_t);
     if (RAY_IS_PARTED(v->type))
