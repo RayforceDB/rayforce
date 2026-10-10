@@ -816,6 +816,36 @@ static test_result_t test_pool_init_total(void) {
 }
 
 /* --------------------------------------------------------------------------
+ * Test: a new pool's workers are all started when it is handed out.
+ *
+ * A worker reads the environment as it starts (ray_heap_init's getenv); a
+ * caller's setenv right after the pool is made must not race those reads
+ * (glibc may free the environment array under a getenv).  So every worker
+ * has published its heap by the time ray_pool_init_total returns, pool
+ * after pool.
+ * -------------------------------------------------------------------------- */
+
+static test_result_t test_pool_workers_started(void) {
+    int missing = 0;
+    for (int round = 0; round < 20; round++) {
+        ray_pool_destroy();
+        TEST_ASSERT_EQ_I(ray_pool_init_total(8), RAY_OK);
+        ray_pool_t* pool = ray_pool_get();
+        TEST_ASSERT_NOT_NULL(pool);
+        for (uint32_t i = 0; i < pool->n_workers; i++)
+            if (!atomic_load_explicit(&pool->worker_heaps[i], memory_order_acquire)) missing++;
+#if defined(__linux__) || defined(__APPLE__)
+        setenv("RAY_TEST_POOL_STARTED", round & 1 ? "1" : "0", 1);
+        unsetenv("RAY_TEST_POOL_STARTED");
+#endif
+    }
+    TEST_ASSERT_EQ_I(missing, 0);
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init(0), RAY_OK);
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
  * Test: ray_pool_free(NULL) is a no-op (covers the early-return guard).
  * -------------------------------------------------------------------------- */
 
@@ -2322,6 +2352,7 @@ const test_entry_t pool_entries[] = {
     { "pool/zero_workers",          test_pool_zero_workers,     NULL, NULL },
     { "pool/total_workers",         test_pool_total_workers,    NULL, NULL },
     { "pool/init_total",            test_pool_init_total,       NULL, NULL },
+    { "pool/workers_started",       test_pool_workers_started,  NULL, NULL },
     { "pool/free_null",             test_pool_free_null,        NULL, NULL },
     { "pool/init_idempotent",       test_pool_init_idempotent,  NULL, NULL },
     { "pool/destroy_reinit",        test_pool_destroy_and_reinit, NULL, NULL },

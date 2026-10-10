@@ -22,6 +22,18 @@
 
 static void pq_setup(void) { ray_heap_init(); (void)ray_sym_init(); }
 static void pq_teardown(void) { ray_sym_destroy(); ray_heap_destroy(); }
+/* A pool of `cores` workers, every one of them started.  Its workers read
+ * the environment as they start (ray_heap_init's getenv), and these tests
+ * set and unset variables right after making a pool; ray_pool_init_total
+ * waits for the workers itself, and this does not rely on it. */
+static ray_err_t pq_pool(int cores) {
+    ray_pool_destroy();
+    ray_err_t e = ray_pool_init_total((uint32_t)cores);
+    ray_pool_t* p = ray_pool_get();
+    for (uint32_t i = 0; e == RAY_OK && p && i < p->n_workers; i++)
+        while (!atomic_load_explicit(&p->worker_heaps[i], memory_order_acquire)) RAY_CPU_RELAX();
+    return e;
+}
 #define FIX "test/data/parquet/"
 
 static test_result_t test_pq_snappy(void) {
@@ -264,7 +276,7 @@ static test_result_t test_pq_parallel(void) {
     }
     ray_release(sentinels);
     for (int workers = 1; workers <= 3; workers += 2) {
-        ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(workers),RAY_OK);
+        TEST_ASSERT_EQ_I(pq_pool(workers), RAY_OK);
         ray_parquet_t* r = NULL;
         TEST_ASSERT_NULL(ray_parquet_open(FIX "parallel.parquet",NULL,8192,&r));
         int64_t count = 0; ray_t* retained = NULL;
@@ -547,7 +559,7 @@ static test_result_t test_pq_group_native(void) {
     int64_t tids[] = {ray_sym_intern("I32",3),ray_sym_intern("I64",3),ray_sym_intern("SYM",3)};
     ray_t* types = ray_vec_from_raw(RAY_SYM,tids,3);
     for (int cores = 1; cores <= 8; cores *= 2) {
-        ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(cores),RAY_OK);
+        TEST_ASSERT_EQ_I(pq_pool(cores), RAY_OK);
         /* 0-3: STR or SYM, one pass or column by column; 5 and 7: SYM
          * through the grouped import */
         for (int run = 0; run < 8; run++) {
@@ -618,7 +630,7 @@ static test_result_t test_pq_native_dictionary(void) {
         ray_sym_intern("I64",3),ray_sym_intern("DATE",4),ray_sym_intern("TIMESTAMP",9),ray_sym_intern("F64",3)};
     ray_t* types = ray_vec_from_raw(RAY_SYM,ids,7);
     for (int run = 0; run < 16; run++) {   /* 8-15: the grouped import */
-        ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(run & 2 ? 4 : 1),RAY_OK);
+        TEST_ASSERT_EQ_I(pq_pool(run & 2 ? 4 : 1), RAY_OK);
         char dir[160]; snprintf(dir,sizeof(dir),"/tmp/rayforce-pq-dict-%d-%d",(int)getpid(),run);
         pq_set_layout(run & 4 ? "1" : NULL);
         pq_set_symmode(run & 8 ? "grouped" : NULL);
@@ -648,7 +660,7 @@ static test_result_t test_pq_native_dictionary(void) {
 static test_result_t test_pq_native_edges(void) {
     int64_t ids[] = {ray_sym_intern("I32",3),ray_sym_intern("I64",3),ray_sym_intern("SYM",3)};
     ray_t* types = ray_vec_from_raw(RAY_SYM,ids,3);
-    ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(4),RAY_OK);
+    TEST_ASSERT_EQ_I(pq_pool(4), RAY_OK);
     ray_t* t = ray_parquet_read(FIX "rle-runs.parquet",NULL);
     TEST_ASSERT_FALSE(RAY_IS_ERR(t)); TEST_ASSERT_EQ_I(ray_table_nrows(t),24597);
     for (int i = 0; i < 24597; i++) {
@@ -718,7 +730,7 @@ static test_result_t test_pq_native_edges(void) {
 }
 
 static test_result_t test_pq_parted_symbols(void) {
-    ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(8),RAY_OK);
+    TEST_ASSERT_EQ_I(pq_pool(8), RAY_OK);
     int64_t ids[] = {ray_sym_intern("I32",3),ray_sym_intern("I64",3),ray_sym_intern("SYM",3)};
     ray_t* types = ray_vec_from_raw(RAY_SYM,ids,3);
     char root[160],sym[200],leaf[200];
@@ -785,7 +797,7 @@ static test_result_t test_pq_splayed_inline_indexes(void) {
     const char* names[] = {"x","y"};
     for (int run = 0; run < 4; run++) {
         int cores = run & 1 ? 4 : 1;
-        ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(cores),RAY_OK);
+        TEST_ASSERT_EQ_I(pq_pool(cores), RAY_OK);
         char dir[160]; snprintf(dir,sizeof(dir),"/tmp/rayforce-pq-zones-%d-%d",(int)getpid(),run);
         pq_set_layout(run >= 2 ? "1" : NULL);
         ray_t* result = ray_parquet_splayed_typed(FIX "zones.parquet",dir,NULL);
@@ -842,7 +854,7 @@ static test_result_t test_pq_small_stack(void) {
  * the import must report that chunk's failure, not a later write's, and
  * publish nothing. */
 static test_result_t test_pq_chunk_flush_error(void) {
-    ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(1),RAY_OK);
+    TEST_ASSERT_EQ_I(pq_pool(1), RAY_OK);
     int64_t tids[] = {ray_sym_intern("I32",3),ray_sym_intern("I64",3),ray_sym_intern("SYM",3)};
     ray_t* types = ray_vec_from_raw(RAY_SYM,tids,3);
     char dir[160]; snprintf(dir,sizeof(dir),"/tmp/rayforce-pq-flush-%d",(int)getpid());
@@ -988,7 +1000,7 @@ static test_result_t test_pq_sym_grouped(void) {
         pq_set_env("RAY_PQ_SYM_ORDER", orders[o]);
         snprintf(ref, sizeof(ref), "/tmp/rayforce-pq-sg-%d-%d-1", (int)getpid(), o);
         for (int cores = 1; cores <= 8; cores *= 2) {
-            ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(cores), RAY_OK);
+            TEST_ASSERT_EQ_I(pq_pool(cores), RAY_OK);
             snprintf(dir, sizeof(dir), "/tmp/rayforce-pq-sg-%d-%d-%d", (int)getpid(), o, cores);
             pq_set_symmode("grouped"); pq_set_layout(cores == 2 ? "1" : NULL);
             res = pq_traced_import(src, dir, types, trace, cap);
@@ -1057,7 +1069,7 @@ static test_result_t test_pq_sym_grouped_collisions(void) {
     for (int run = 0; run < 16; run++) {
             int o = run % 4, cores = run & 4 ? 4 : 1;
             pq_set_env("RAY_PQ_SYM_WINDOW", run >= 8 ? "64" : NULL);
-            ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(cores), RAY_OK);
+            TEST_ASSERT_EQ_I(pq_pool(cores), RAY_OK);
             pq_set_env("RAY_PQ_SYM_ORDER", orders[o]);
             pq_set_env("RAY_PQ_SYM_HASH_BITS", "0");
             pq_set_symmode("grouped");
@@ -1124,7 +1136,7 @@ static test_result_t test_pq_sym_grouped_layout(void) {
     pq_set_env("RAY_PQ_SYM_WINDOW", "16384");
     for (int run = 0; run < 4; run++) {
         bool split = run < 2;
-        ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(run & 1 ? 4 : 1), RAY_OK);
+        TEST_ASSERT_EQ_I(pq_pool(run & 1 ? 4 : 1), RAY_OK);
         pq_set_env("RAY_PQ_SYM_ORDER", split ? "rows" : "rowsflat");
         pq_set_env("RAY_PQ_SYM_GROUPS", run & 1 ? "64" : NULL);   /* a group table over and over */
         pq_set_symmode("grouped");
@@ -1228,7 +1240,7 @@ static test_result_t test_pq_sym_mixed_modes(void) {
         pq_synth_t = v ? pq_synth_sparse : pq_synth_highcard; pq_synth_dict = 1u << 1;
         bool made = pq_synth(src, rows, 4, pq_synth_lowcard);
         TEST_ASSERT_TRUE(made);
-        ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(1), RAY_OK);
+        TEST_ASSERT_EQ_I(pq_pool(1), RAY_OK);
         pq_set_symmode("direct");
         ray_t* res = pq_traced_import(src, dir, types, trace, cap);
         pq_set_symmode(NULL);
@@ -1239,7 +1251,7 @@ static test_result_t test_pq_sym_mixed_modes(void) {
         /* the sparse column first by size */
         if (v && !(strstr(trace, "parquet symcol: col=t ") < strstr(trace, "parquet symcol: col=s "))) bad++;
         for (int run = 0; run < 3; run++) {
-            ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(run == 1 ? 4 : 1), RAY_OK);
+            TEST_ASSERT_EQ_I(pq_pool(run == 1 ? 4 : 1), RAY_OK);
             pq_set_env("RAY_PQ_SYM_RAM", v ? "262144" : "1048576");
             pq_set_symmode(run == 2 ? "grouped" : NULL);
             res = pq_traced_import(src, dir, types, trace, cap);
@@ -1290,7 +1302,7 @@ static test_result_t test_pq_sym_grouped_failures(void) {
     int64_t tids[] = {ray_sym_intern("I32",3), ray_sym_intern("SYM",3), ray_sym_intern("SYM",3)};
     ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 3);
     const char* names[] = {"x","s","t"};
-    ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    TEST_ASSERT_EQ_I(pq_pool(4), RAY_OK);
 #if defined(DEBUG)
     const char* steps[] = {"r1","p2","load","reload","r2","write","settle","cancel"};
     for (int i = 0; i < 8; i++) {
@@ -1449,7 +1461,7 @@ static test_result_t test_pq_dict_page_size(void) {
  * it all; eight imports, the bytes allocated after the second and the last. */
 static test_result_t test_pq_import_no_growth(void) {
     pq_sym_env_clear();
-    ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(1), RAY_OK);
+    TEST_ASSERT_EQ_I(pq_pool(1), RAY_OK);
     int64_t tids[] = {ray_sym_intern("I32",3), ray_sym_intern("I64",3), ray_sym_intern("SYM",3)};
     ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 3);
     const char* names[] = {"x","y","s"};
@@ -1582,7 +1594,7 @@ static test_result_t test_pq_sym_grouped_edges(void) {
         snprintf(src, sizeof(src), "/tmp/rayforce-pq-edge-%d-%s.parquet", (int)getpid(), S->name);
         TEST_ASSERT_TRUE(pq_synth(src, S->rows, S->groups, S->fn));
         snprintf(dir, sizeof(dir), "/tmp/rayforce-pq-edge-%d", (int)getpid());
-        ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+        TEST_ASSERT_EQ_I(pq_pool(4), RAY_OK);
         pq_set_symmode("direct");
         ray_t* res = ray_parquet_splayed_typed(src, dir, types);
         pq_set_symmode(NULL);
@@ -1610,7 +1622,7 @@ static test_result_t test_pq_sym_grouped_edges(void) {
                 if (!full && bits && (o != 0 || window)) continue;
                 snprintf(what, sizeof(what), "%s %s cores=%d window=%s bits=%s", S->name, orders[o], cores,
                          window ? window : "-", bits ? bits : "-");
-                ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(cores), RAY_OK);
+                TEST_ASSERT_EQ_I(pq_pool(cores), RAY_OK);
                 snprintf(ref, sizeof(ref), "/tmp/rayforce-pq-edge-%d-ref-%d", (int)getpid(), run & 6);
                 const char* out = cores == 1 ? ref : dir;
                 pq_set_symmode("grouped");
@@ -1680,7 +1692,7 @@ static test_result_t test_pq_sym_grouped_rowgroups(void) {
     int64_t tids[] = {ray_sym_intern("I32",3), ray_sym_intern("SYM",3), ray_sym_intern("SYM",3)};
     ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 3);
     const char* names[] = {"x","s","t"};
-    ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    TEST_ASSERT_EQ_I(pq_pool(4), RAY_OK);
     ray_mem_stats_t st0, st1;
     ray_mem_stats(&st0);
     pq_set_symmode(mode ? mode : "grouped");
@@ -1731,7 +1743,7 @@ static test_result_t test_pq_sym_grouped_fail_leaks(void) {
     int64_t tids[] = {ray_sym_intern("I32",3), ray_sym_intern("SYM",3), ray_sym_intern("SYM",3)};
     ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 3);
     const char* names[] = {"x","s","t"};
-    ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(1), RAY_OK);
+    TEST_ASSERT_EQ_I(pq_pool(1), RAY_OK);
     const char* steps[] = {"r1","p2","load","reload","r2","write","settle","cancel",NULL};
     int bad = 0;
     for (int i = 0; i < 9; i++) {
@@ -1821,7 +1833,7 @@ static test_result_t test_pq_sym_grouped_collision_determinism(void) {
             if (v && i && i != 3) continue;   /* the other variants: one worker and eight */
             int d = i ? 1 : 0;
             snprintf(dir[d], sizeof(dir[d]), "/tmp/rayforce-pq-cdet-%d-%d", (int)getpid(), d);
-            ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(cores[i]), RAY_OK);
+            TEST_ASSERT_EQ_I(pq_pool(cores[i]), RAY_OK);
             pq_set_symmode("grouped");
             pq_set_env("RAY_PQ_SYM_ORDER", v == 2 ? "shards" : "rows");
             pq_set_env("RAY_PQ_SYM_WINDOW", v == 1 ? "1" : NULL);
