@@ -3426,7 +3426,8 @@ static test_result_t test_pq_sk4_data_offset(void) {
 /* The same undecodable dictionary page (encoding 3, PQX_BADDICT) in p, the
  * import forced direct and forced grouped: both fail, and the grouped
  * message should carry the decoder's reason and the column as the direct
- * one does. */
+ * one does.  So too a codec the reader does not take (ZSTD), which the
+ * chunk's checks before its pages refuse. */
 static test_result_t test_pq_sk4_grouped_message(void) {
     pq_sym_env_clear();
     char src[160], dir[160], partial[240];
@@ -3436,13 +3437,15 @@ static test_result_t test_pq_sk4_grouped_message(void) {
     const char* fnames[3] = {"x","p","q"};
     const char* nm[2] = {"p","q"};
     pq_synth_fn fns[2] = {pqx_lowcard, pqx_card100};
-    unsigned fl[2] = {PQX_DICT | PQX_BADDICT, PQX_DICT};
     int64_t tids[3] = {ray_sym_intern("I32", 3), ray_sym_intern("SYM", 3), ray_sym_intern("SYM", 3)};
     ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 3);
-    TEST_ASSERT_TRUE(pqx_synth(src, 12000, 4, 2, nm, fns, fl));
     TEST_ASSERT_EQ_I(pq_pool(2), RAY_OK);
-    char msgs[2][256];
     int bad = 0;
+    static const unsigned cases[] = {PQX_DICT | PQX_BADDICT, PQX_DICT | PQX_ZSTD};
+    for (size_t v = 0; v < sizeof(cases) / sizeof(cases[0]); v++) {
+    unsigned fl[2] = {cases[v], PQX_DICT};
+    TEST_ASSERT_TRUE(pqx_synth(src, 12000, 4, 2, nm, fns, fl));
+    char msgs[2][256];
     for (int run = 0; run < 2; run++) {
         pq_set_symmode(run ? "grouped" : "direct");
         ray_error_clear();
@@ -3451,12 +3454,13 @@ static test_result_t test_pq_sk4_grouped_message(void) {
         bool failed = !res || RAY_IS_ERR(res);
         const char* msg = ray_error_msg();
         snprintf(msgs[run], sizeof(msgs[run]), "%s", msg ? msg : "(no message)");
-        fprintf(stderr, "  [sk4 message %s] %s: %s\n", run ? "grouped" : "direct", failed ? "failed" : "imported", msgs[run]);
-        if (!failed) bad++;
+        fprintf(stderr, "  [sk4 message %zu %s] %s: %s\n", v, run ? "grouped" : "direct", failed ? "failed" : "imported", msgs[run]);
+        if (!failed || !strstr(msgs[run], "(column p)")) bad++;
         if (res) { if (RAY_IS_ERR(res)) ray_error_free(res); else ray_release(res); }
         pq_remove_native(dir, fnames, 3); pq_remove_native(partial, fnames, 3);
     }
     if (strcmp(msgs[0], msgs[1]) != 0) bad++;
+    }
     unlink(src);
     ray_pool_destroy();
     ray_release(types);

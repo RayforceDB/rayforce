@@ -708,7 +708,16 @@ static int64_t pq_group_batch(ray_parquet_t* r, int64_t g) {
     ray_free_raw(cols);
     return batch;
 }
-static const char* pq_start_group(ray_parquet_t* r) {
+/* An error of schema column c (-1: of none), named as the decoder names a
+ * column's: "<reason> (column <name>)". */
+static ray_t* pq_col_error(const ray_parquet_t* r, const char* err, int64_t c) {
+    if (c < 0) return pq_error(err);
+    ray_t* name = ray_sym_str(r->schema[c].name);
+    return ray_error("parquet","%s (column %s)",err,name ? ray_str_ptr(name) : "?");
+}
+/* *bad: the schema column a column's error is of, -1 for the group's own. */
+static const char* pq_start_group(ray_parquet_t* r, int64_t* bad) {
+    *bad = -1;
     pq_span* cols = ray_alloc_raw((size_t)r->ncols*sizeof(*cols));
     if (!cols) return "row group allocation failed";
     pq_span filter_chunk = {0};
@@ -733,6 +742,7 @@ static const char* pq_start_group(ray_parquet_t* r) {
     for (int64_t i = 0; i < r->nselected; i++) {
         pq_column* c = &r->cursors[i]; pq_span mf[17];
         c->metadata = cols[r->selected[i]];
+        *bad = r->selected[i];
         if (!pq_fields(c->metadata,mf,17)) { err = "invalid column metadata"; break; }
         int64_t offset = pq_get(mf[9],-1), dict = pq_get(mf[11],-1), bytes = pq_get(mf[7],-1);
         int64_t codec = pq_get(mf[4],-1);
@@ -748,6 +758,7 @@ static const char* pq_start_group(ray_parquet_t* r) {
         ray_free_raw(c->symbol_ids); c->symbol_ids = NULL;
     }
     if (!err && r->filter_pos >= 0 && !r->filter_nulls) pq_page_intervals(r,filter_chunk);
+    if (!err) *bad = -1;
     ray_free_raw(cols); return err;
 }
 static bool pq_unpack(pq_column* c, const uint8_t* p, size_t n, size_t decoded, bool compressed, const uint8_t** out) {
@@ -1204,8 +1215,9 @@ ray_t* ray_parquet_next(ray_parquet_t* r) {
     for (;;) {
         while (!r->group_left && r->group+1 < r->ngroups) {
             r->group++;
-            err = pq_start_group(r);
-            if (err) { r->failed = true; return pq_error(err); }
+            int64_t bad;
+            err = pq_start_group(r,&bad);
+            if (err) { r->failed = true; return pq_col_error(r,err,bad); }
         }
         if (!r->group_left && r->emitted) return NULL;
         int64_t cap = r->group_batch > 0 ? r->group_batch : r->batch_rows;
@@ -1300,11 +1312,7 @@ fail:
     if (tbl) ray_release(tbl);
     r->failed = true;
     if (ray_interrupted()) return ray_error("cancel","parquet scan interrupted");
-    if (bad_col >= 0) {
-        ray_t* name = ray_sym_str(r->schema[r->selected[bad_col]].name);
-        return ray_error("parquet","%s (column %s)",err,name ? ray_str_ptr(name) : "?");
-    }
-    return pq_error(err);
+    return pq_col_error(r,err,bad_col >= 0 ? r->selected[bad_col] : -1);
 }
 
 /* Optional Rayfall scan settings: {columns: [x y] range: {column: k min: 1 max: 9}}.
@@ -1980,7 +1988,7 @@ static void pq_vocab_bounds(ray_parquet_t* r, const int64_t* order, int64_t from
  * finds every string there and the positions do not depend on the workers.
  * The pages are asked for together first.  NULL, or the reason a page
  * cannot be read: the decoder's own, so the import reports what the pass
- * itself would have. */
+ * itself would have, and in *bad_col the column it is of (-1: none). */
 static const char* pq_seed_dicts(ray_parquet_t* r, const int64_t* order, int64_t from, int64_t to, int64_t* entries,
                                  int64_t* bad_col) {
     pq_span* cols = ray_calloc_raw((size_t)r->ncols*sizeof(*cols));
@@ -1990,10 +1998,11 @@ static const char* pq_seed_dicts(ray_parquet_t* r, const int64_t* order, int64_t
     for (int pass = 0; !err && pass < 2; pass++)
         for (int64_t g = 0; !err && g < r->ngroups; g++) {
             int64_t rows = 0;
-            if (!pq_group_columns(r,g,cols,&rows,NULL)) { err = "invalid row group"; break; }
+            if (!pq_group_columns(r,g,cols,&rows,NULL)) { err = "invalid row group"; *bad_col = -1; break; }
             if (rows == 0) continue;   /* no rows: pq_vocab_bounds and the decoder skip it too */
             for (int64_t i = from; !err && i < to; i++) {
                 int64_t c = order[i]; pq_span mf[17];
+                *bad_col = c;   /* its errors name the column, as the decoder's do */
                 if (!pq_fields(cols[c],mf,17)) { err = "invalid column metadata"; break; }
                 int64_t dict = pq_get(mf[11],-1), data = pq_get(mf[9],-1), codec = pq_get(mf[4],-1);
                 int64_t bytes = pq_get(mf[7],-1);
@@ -2011,7 +2020,6 @@ static const char* pq_seed_dicts(ray_parquet_t* r, const int64_t* order, int64_t
                     ray_vm_advise_willneed(r->map + dict,(size_t)(data > dict && data - dict <= bytes ? data - dict : bytes));
                     continue;
                 }
-                *bad_col = c;   /* the page's errors name the column, as the decoder's do */
                 pq_cur cur = {r->map+dict,r->map+dict+bytes,false};
                 const uint8_t* start = cur.p;
                 pq_span f[10], h[4];
@@ -2029,10 +2037,11 @@ static const char* pq_seed_dicts(ray_parquet_t* r, const int64_t* order, int64_t
                 pq_schema sch = r->schema[c];
                 if (!sch.import_domain) err = "symbol column without an import dictionary";
                 else if (!pq_dictionary(&col,&sch,payload,(size_t)size,(size_t)raw,count)) err = "invalid dictionary page";
-                else { *entries += count; *bad_col = -1; }
+                else *entries += count;
                 ray_free_raw(col.dict); ray_free_raw(col.strings); ray_free_raw(col.symbol_ids); ray_free_raw(col.symbols);
             }
         }
+    if (!err) *bad_col = -1;
     ray_free_raw(cols);
     return err;
 }
@@ -2509,19 +2518,19 @@ static bool pq_g_inject(const char* step) {
 
 /* A grouped task's error: "cancel" once the import is interrupted (the
  * walks stop on it with an error of their own), as the direct import has it. */
-static ray_t* pq_g_error(const char* err) {
-    return ray_interrupted() ? ray_error("cancel","parquet conversion interrupted") : pq_error(err);
+static ray_t* pq_g_error(const ray_parquet_t* r, const char* err, int64_t c) {
+    return ray_interrupted() ? ray_error("cancel","parquet conversion interrupted") : pq_col_error(r,err,c);
 }
 
 /* The chunk's reader, its cursor holding the worker's buffers. */
-static ray_parquet_t* pq_g_reader(pq_gwork* w, int64_t g, uint32_t worker, const char** err) {
+static ray_parquet_t* pq_g_reader(pq_gwork* w, int64_t g, uint32_t worker, const char** err, int64_t* bad) {
     pq_direct_work* dw = w->dw;
     ray_parquet_t* r = pq_group_reader(dw->parent,g,1);
     if (!r) { *err = "row group allocation failed"; return NULL; }
     r->selected[0] = (int32_t)w->c; r->nselected = r->noutput = 1;
     if ((int64_t)worker < dw->nspare) pq_trade_buffers(&r->cursors[0],&dw->spare[worker]);
     r->group++;
-    *err = pq_start_group(r);
+    *err = pq_start_group(r,bad);
     return r;
 }
 static void pq_g_reader_close(pq_gwork* w, ray_parquet_t* r, uint32_t worker) {
@@ -2594,18 +2603,20 @@ static void pq_g1_task(void* ptr, uint32_t worker, int64_t start, int64_t end) {
         pq_gtask k = {.w = w, .t = g, .worker = worker};
         pq_gscratch* ws = pq_g_scratch(w,worker,&k);
         const char* err = NULL;
-        ray_parquet_t* r = pq_g_reader(w,g,worker,&err);
+        int64_t bad = -1;   /* the column, for its decode errors */
+        ray_parquet_t* r = pq_g_reader(w,g,worker,&err,&bad);
         if (!err && !pq_dedup_reset(&k.d,w->acap,w->counts)) err = "symbol dedupe allocation failed";
         if (!err && pq_g_inject("r1")) err = "symbol dedupe allocation failed";
         if (!err && r->group_left) {
             pq_schema schema = r->schema[w->c]; schema.import_domain = NULL;
             err = pq_g_walk(&r->cursors[0],&schema,r->group_left,&k);
+            if (err) bad = w->c;
         }
         if (!err) atomic_fetch_add_explicit(&w->rows,r->group_rows,memory_order_relaxed);
         if (!err && !ray_symgrp_stage(w->g,g,k.d.n,k.d.fp,k.d.cnt ? k.d.cnt+1 : NULL))
             err = "symbol staging allocation failed";
         atomic_fetch_add_explicit(&w->gens,k.d.gens,memory_order_relaxed);
-        if (err && !dw->errors[g]) dw->errors[g] = pq_g_error(err);
+        if (err && !dw->errors[g]) dw->errors[g] = pq_g_error(dw->parent,err,bad);
         pq_g_scratch_back(ws,&k);
         if (r) pq_g_reader_close(w,r,worker);
     }
@@ -2624,7 +2635,8 @@ static void pq_g2_task(void* ptr, uint32_t worker, int64_t start, int64_t end) {
         const char* err = NULL;
         int64_t n = ray_symgrp_task_size(w->g,g);
         k.nres = n;
-        ray_parquet_t* r = pq_g_reader(w,g,worker,&err);
+        int64_t bad = -1;   /* the column, for its decode errors */
+        ray_parquet_t* r = pq_g_reader(w,g,worker,&err,&bad);
         if (ws && ws->rcap < n+1) {
             ray_symgrp_res_t* res = ray_realloc_raw(ws->res,(size_t)(n+1)*sizeof(*res));
             if (res) ws->res = res;
@@ -2668,6 +2680,7 @@ static void pq_g2_task(void* ptr, uint32_t worker, int64_t start, int64_t end) {
         if (!err && r->group_left) {
             pq_schema schema = r->schema[w->c]; schema.import_domain = NULL;
             err = pq_g_walk(&r->cursors[0],&schema,r->group_left,&k);
+            if (err) bad = w->c;
         }
         if (!err && !pq_g_wflush(&k)) err = "symbol file write failed";
         io2 = pq_tio_now(w->trace);
@@ -2681,7 +2694,7 @@ static void pq_g2_task(void* ptr, uint32_t worker, int64_t start, int64_t end) {
         ray_col_stream_abort(&local);   /* frees what an append made; no file of its own */
         if (!err && local.rows != dw->offsets[g+1]-dw->offsets[g]) err = "row group ended before its assigned output range";
         if (local.had_nulls) atomic_store_explicit(&dw->nulls[w->c],1,memory_order_relaxed);
-        if (err && !dw->errors[g]) dw->errors[g] = pq_g_error(err);
+        if (err && !dw->errors[g]) dw->errors[g] = pq_g_error(dw->parent,err,bad);
         ray_symgrp_note(w->g,k.cmp,k.cmpb);
         pq_g_scratch_back(ws,&k);
         if (r) pq_g_reader_close(w,r,worker);
@@ -2764,7 +2777,7 @@ static void pq_sym_grouped(pq_direct_work* dw, ray_symgrp_t* g, ray_symimp_t* im
     if (ray_interrupted()) goto out;
     if (trace) { io1 = pq_io_now(); t1 = ray_profile_now_ns(); }
     /* the verdicts, group by group */
-    if (pq_g_inject("p2") || !ray_symgrp_resolve(g)) { dw->errors[0] = pq_g_error("symbol dictionary allocation or file growth failed"); goto out; }
+    if (pq_g_inject("p2") || !ray_symgrp_resolve(g)) { dw->errors[0] = pq_g_error(dw->parent,"symbol dictionary allocation or file growth failed",-1); goto out; }
     if (trace) { io2 = pq_io_now(); t2 = ray_profile_now_ns(); }
     /* second decode, window by window: the candidates' records of a window
      * (from earlier passes and windows) in half the budget */
@@ -2778,7 +2791,7 @@ static void pq_sym_grouped(pq_direct_work* dw, ray_symgrp_t* g, ray_symimp_t* im
     for (int64_t ta = 0; ta < tasks;) {
         int64_t tb = ray_symgrp_window(g,ta,store);
         pq_tio_t la = pq_tio_now(trace);
-        if (pq_g_inject("load") || !ray_symgrp_load(g,ta,tb)) { dw->errors[ta] = pq_g_error("symbol record load failed"); goto out; }
+        if (pq_g_inject("load") || !ray_symgrp_load(g,ta,tb)) { dw->errors[ta] = pq_g_error(dw->parent,"symbol record load failed",-1); goto out; }
         pq_tio_add(&w,PQ_GS_LOAD,la,pq_tio_now(trace));
         w.ta = ta; w.tb = tb; w.redo = false;
         if (ray_pool_par_dispatch_ok(pool,tb-ta,2)) ray_pool_dispatch_n(pool,pq_g2_task,&w,(uint32_t)(tb-ta));
@@ -2787,7 +2800,7 @@ static void pq_sym_grouped(pq_direct_work* dw, ray_symgrp_t* g, ray_symimp_t* im
         if (ray_interrupted()) goto out;
         int64_t* redo = NULL; int64_t nredo = 0;
         pq_tio_t sa = pq_tio_now(trace);
-        if (pq_g_inject("settle") || !ray_symgrp_settle(g,&redo,&nredo)) { dw->errors[ta] = pq_g_error("symbol comparison failed"); goto out; }
+        if (pq_g_inject("settle") || !ray_symgrp_settle(g,&redo,&nredo)) { dw->errors[ta] = pq_g_error(dw->parent,"symbol comparison failed",-1); goto out; }
         pq_tio_add(&w,PQ_GS_SETTLE,sa,pq_tio_now(trace));
         /* the tasks whose deferred candidates did not match: their codes again */
         w.redo = true;
@@ -3055,12 +3068,7 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
         int64_t bad_col;
         seed0 = ray_symimp_count(simp);
         const char* se = pq_seed_dicts(r,order,nnum,nd,&entries,&bad_col);
-        if (se && bad_col >= 0) {
-            ray_t* name = ray_sym_str(r->schema[bad_col].name);
-            err = ray_error("parquet","%s (column %s)",se,name ? ray_str_ptr(name) : "?");
-            goto done;
-        }
-        if (se) { err = pq_error(se); goto done; }
+        if (se) { err = pq_col_error(r,se,bad_col); goto done; }
         seeded = ray_symimp_count(simp);
         if (trace) fprintf(stderr,"parquet symseed: cols=%lld groups=%lld entries=%lld ms=%.1f\n",(long long)(nd-nnum),
                            (long long)r->ngroups,(long long)entries,(double)(ray_profile_now_ns()-ts)/1e6);
