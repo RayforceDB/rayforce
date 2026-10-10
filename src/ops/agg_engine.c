@@ -4394,13 +4394,27 @@ static inline uint64_t agg_radix_fmix64(uint64_t h) {
  * address no longer waits on the key load -> FNV -> fmix chain, so the
  * scattered stores issue back to back, and the keys go straight from the
  * column into the record with no staging row. */
+/* agg_read_key_i64 for the plain radix loops, the column's attrs read only
+ * by a SYM key (agg_read_key_i64 passes them to the raw reader up front,
+ * and the scatter loop then loads them for every key of every row). */
+RAY_INLINE int64_t agg_radix_key_at(const ray_t* col, const void* data, int64_t row) {
+    switch (col->type) {
+        case RAY_I64: case RAY_TIMESTAMP: return ((const int64_t*)data)[row];
+        case RAY_I32: case RAY_DATE: case RAY_TIME: return ((const int32_t*)data)[row];
+        case RAY_I16: return ((const int16_t*)data)[row];
+        case RAY_U8:  case RAY_BOOL: return ((const uint8_t*)data)[row];
+        case RAY_SYM: return (int64_t)ray_read_sym(data, row, RAY_SYM, col->attrs);
+        default: return 0;  /* the gate admits only the above */
+    }
+}
+
 RAY_INLINE void agg_radix_visit(agg_radix_ctx_t* c, uint32_t* cur,
                                 int64_t r, int64_t pos, bool scatter) {
     uint32_t n_keys = c->n_keys, n_aggs = c->n_aggs;
     if (!scatter) {
         uint64_t h = 1469598103934665603ULL;
         for (uint32_t k = 0; k < n_keys; k++) {
-            int64_t v = agg_read_key_i64(c->key_cols[k], c->key_data[k], r);
+            int64_t v = agg_radix_key_at(c->key_cols[k], c->key_data[k], r);
             h ^= (uint64_t)v; h *= 1099511628211ULL;
         }
         h = agg_radix_fmix64(h);
@@ -4413,7 +4427,7 @@ RAY_INLINE void agg_radix_visit(agg_radix_ctx_t* c, uint32_t* cur,
     char* rec = c->pay + (size_t)(c->part_start[p] + cur[p]++) * c->rec;
     int64_t* kdst = (int64_t*)rec;
     for (uint32_t k = 0; k < n_keys; k++)
-        kdst[k] = agg_read_key_i64(c->key_cols[k], c->key_data[k], r);
+        kdst[k] = agg_radix_key_at(c->key_cols[k], c->key_data[k], r);
     int64_t input_order = pos;
     for (uint32_t a = 0; a < n_aggs; a++) {
         if (c->val_data[a]) {
@@ -4646,12 +4660,18 @@ static void agg_radix_stage_scatter(char* dst, const char* stage, const uint16_t
     #undef STAGE_COPY
 }
 
-/* The staged form of one chunk pass (out of line: the plain loops below
- * stay as compact as they were): pieces of the chunk's rows (R-WALK), or
- * runs of its selected rows (R-SPARSE through the chunk's cursors); a
- * range error is noted keyed by the chunk's first position. */
-static void agg_radix_chunk_staged(agg_radix_ctx_t* c, uint32_t* cur, int64_t start, int64_t end,
-                                   uint32_t wid, bool scatter, agg_curs_t* cs) {
+/* The staged form of one pass over chunk ch (out of line: the plain loops
+ * below stay as compact as they were): pieces of the chunk's rows (R-WALK),
+ * or runs of its selected rows (R-SPARSE), through the task's cursors cs
+ * (the chunks of one task are consecutive); a range error is noted keyed
+ * by the chunk's first position. */
+static void agg_radix_chunk_staged(agg_radix_ctx_t* c, int64_t ch, uint32_t wid, bool scatter,
+                                   agg_curs_t* cs) {
+    int64_t start = ch * c->chunk_rows;
+    int64_t end = start + c->chunk_rows;
+    if (end > c->n_in) end = c->n_in;
+    uint32_t* cur = c->cnt + (size_t)ch * c->n_parts;
+    if (!scatter) memset(cur, 0, (size_t)c->n_parts * sizeof(uint32_t));
     const agg_rr_t* rr = scatter ? c->rr : c->count_rr;   /* pass 1 hashes the keys only */
     agg_body_fn body = scatter ? agg_radix_scatter_rows : agg_radix_count_rows;
     if (!c->sel) {
@@ -4672,20 +4692,18 @@ static void agg_radix_chunk_staged(agg_radix_ctx_t* c, uint32_t* cur, int64_t st
     }
 }
 
-/* Run one pass over chunk `ch`: input positions [start,end) in chunk order
- * (selected-row ordinals in sel mode, decoded to original rows).  RAY_INLINE
- * and `scatter` constant at both call sites, so the count and the scatter
- * loops specialize.  A chunk's count row doubles as its pass-2 write cursors
- * and is touched only by the task running that chunk.  A staged context
- * reads its sources by range (agg_radix_chunk_staged) through the task's
- * cursors cs (the chunks of one task are consecutive). */
-RAY_INLINE void agg_radix_chunk_pass(agg_radix_ctx_t* c, int64_t ch, uint32_t wid, bool scatter, agg_curs_t* cs) {
+/* Run one pass over chunk `ch` of a plain context (whole columns): input
+ * positions [start,end) in chunk order (selected-row ordinals in sel mode,
+ * decoded to original rows).  RAY_INLINE and `scatter` constant at every
+ * call site, so the count and the scatter loops specialize.  A chunk's
+ * count row doubles as its pass-2 write cursors and is touched only by the
+ * task running that chunk.  A staged context runs agg_radix_chunk_staged. */
+RAY_INLINE void agg_radix_chunk_pass(agg_radix_ctx_t* c, int64_t ch, bool scatter) {
     int64_t start = ch * c->chunk_rows;
     int64_t end = start + c->chunk_rows;
     if (end > c->n_in) end = c->n_in;
     uint32_t* cur = c->cnt + (size_t)ch * c->n_parts;
     if (!scatter) memset(cur, 0, (size_t)c->n_parts * sizeof(uint32_t));
-    if (c->rr->staged) { agg_radix_chunk_staged(c, cur, start, end, wid, scatter, cs); return; }
     if (c->sel) {
         int64_t rows[AGG_SEL_CHUNK];
         agg_sel_cursor_t sc;
@@ -4701,7 +4719,6 @@ RAY_INLINE void agg_radix_chunk_pass(agg_radix_ctx_t* c, int64_t ch, uint32_t wi
         agg_radix_visit(c, cur, r, r, scatter);
 }
 
-/* Phase 1, pass 1: count each chunk's rows per partition. */
 /* One cursor set per task call (staged sources), over its consecutive chunks;
  * on OOM the first chunk's failure is noted and the call does nothing. */
 static bool agg_radix_task_curs(agg_radix_ctx_t* c, int64_t ch0, agg_curs_t* cs) {
@@ -4711,13 +4728,33 @@ static bool agg_radix_task_curs(agg_radix_ctx_t* c, int64_t ch0, agg_curs_t* cs)
     return false;
 }
 
-static void agg_radix_count_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
-    agg_radix_ctx_t* c = (agg_radix_ctx_t*)vctx;
+/* One task call of a pass over its consecutive chunks [start,end).  One
+ * body, two instances per pass (`staged` constant): the plain instance is
+ * the whole-column chunk loop and never builds or touches a cursor set, so
+ * its codegen is the pre-range-read one; the staged instance holds one
+ * cursor set across its chunks.  The dispatch picks the instance from the
+ * context (agg_radix_count_fn or _count_staged_fn, and likewise for the
+ * scatter). */
+RAY_INLINE void agg_radix_pass_body(agg_radix_ctx_t* c, uint32_t wid, int64_t start, int64_t end,
+                                    bool scatter, const bool staged) {
+    if (!staged) {
+        for (int64_t ch = start; ch < end; ch++)
+            agg_radix_chunk_pass(c, ch, scatter);
+        return;
+    }
     agg_curs_t cs;
     if (!agg_radix_task_curs(c, start, &cs)) return;
     for (int64_t ch = start; ch < end; ch++)
-        agg_radix_chunk_pass(c, ch, wid, false, &cs);
+        agg_radix_chunk_staged(c, ch, wid, scatter, &cs);
     agg_curs_free(&cs, c->rr);
+}
+
+/* Phase 1, pass 1: count each chunk's rows per partition. */
+static void agg_radix_count_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    agg_radix_pass_body((agg_radix_ctx_t*)vctx, wid, start, end, false, false);
+}
+static void agg_radix_count_staged_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    agg_radix_pass_body((agg_radix_ctx_t*)vctx, wid, start, end, false, true);
 }
 
 /* Phase 1, prefix: for a band of partitions, turn every chunk's count into
@@ -4752,12 +4789,10 @@ static void agg_radix_prefix_fn(void* vctx, uint32_t wid, int64_t start, int64_t
 
 /* Phase 1, pass 2: write each chunk's packed records at their exact slots. */
 static void agg_radix_scatter_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
-    agg_radix_ctx_t* c = (agg_radix_ctx_t*)vctx;
-    agg_curs_t cs;
-    if (!agg_radix_task_curs(c, start, &cs)) return;
-    for (int64_t ch = start; ch < end; ch++)
-        agg_radix_chunk_pass(c, ch, wid, true, &cs);
-    agg_curs_free(&cs, c->rr);
+    agg_radix_pass_body((agg_radix_ctx_t*)vctx, wid, start, end, true, false);
+}
+static void agg_radix_scatter_staged_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    agg_radix_pass_body((agg_radix_ctx_t*)vctx, wid, start, end, true, true);
 }
 
 /* The fused pass over chunk ch (a staged context, chunk-major payload):
@@ -6241,7 +6276,7 @@ static ray_t* exec_group_v2_parallel_radix(
      * selected-row space [0,n_sel); each chunk decodes its selected rows to
      * ORIGINAL indices.  A cancelled dispatch skips chunks and leaves their
      * count rows and ids unset, so nothing past it may run. */
-    ray_pool_dispatch_n(pool, agg_radix_count_fn, &ctx, n_chunks);
+    ray_pool_dispatch_n(pool, ctx.rr->staged ? agg_radix_count_staged_fn : agg_radix_count_fn, &ctx, n_chunks);
     ray_t* ferr = d.staged ? ray_scan_fail_finish(&d.fail, pool) : NULL;
     bool cancelled = pool_cancelled(pool) || ferr;
     if (!cancelled) {
@@ -6256,7 +6291,8 @@ static ray_t* exec_group_v2_parallel_radix(
     if (!cancelled && !oom) {
         for (uint32_t p = 0; p < n_parts; p++) part_start[p + 1] += part_start[p];
         /* Pass 2: every record to its exact slot. */
-        ray_pool_dispatch_n(pool, agg_radix_scatter_fn, &ctx, n_chunks);
+        ray_pool_dispatch_n(pool, ctx.rr->staged ? agg_radix_scatter_staged_fn : agg_radix_scatter_fn,
+                            &ctx, n_chunks);
         if (d.staged) ferr = ray_scan_fail_finish(&d.fail, pool);
         cancelled = pool_cancelled(pool) || ferr;
     }

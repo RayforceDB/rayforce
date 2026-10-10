@@ -10807,11 +10807,13 @@ ray_t* parted_flatten_fixed(ray_t* col, int64_t total) {
     grp_flat_t f = { ray_data(flat), base, w };
     const void* plain[1] = { NULL };                 /* a parted source reads through its cursor */
     ray_col_src_t* srcs[1] = { &s };
-    /* Segments that decode (an encoded or synthetic one) are copied on the
-     * pool; plain segments alone stay one serial memcpy (in parallel, the
-     * fresh output's page faults contend: q18 over generation 0, +6%). */
+    /* A flatten that decodes runs on the pool: an encoded or synthetic
+     * segment with no published materialization (ray_col_src_ready is
+     * NULL; a plain source is its own ready column).  Plain segments, or a
+     * materialization read in place, stay one serial memcpy (in parallel,
+     * the fresh output's page faults contend: q18 over generation 0, +6%). */
     ray_pool_t* pool = ray_pool_get();
-    if (ray_col_src_encoded(&s) && ray_pool_par_dispatch_ok(pool, n, RAY_PARALLEL_THRESHOLD)) {
+    if (!ray_col_src_ready(&s) && ray_pool_par_dispatch_ok(pool, n, RAY_PARALLEL_THRESHOLD)) {
         /* a few block-aligned slices a worker, so claiming balances uneven
          * segments; a cancelled dispatch skips slices: finish says `cancel` */
         uint64_t nt = (uint64_t)ray_pool_total_workers(pool) * 4;
