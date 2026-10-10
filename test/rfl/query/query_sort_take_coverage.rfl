@@ -424,3 +424,23 @@
 (count Rw) -- 10
 (at Rw 'w) -- (concat "wide-unused-string-column-value-over-twelve-bytes-" (as 'STR (til 10)))
 (.sys.exec "rm -rf /tmp/rfl_ckwide")
+;; whatever the number of groups, the peak stays below what flattening the
+;; table costs (the table, then its rows again for the result): one row
+;; number per group, the columns gathered one at a time.  22 columns,
+;; 8 partitions of 5000 rows: Bmw bytes flattened.
+(.sys.exec "rm -rf /tmp/rfl_ckmw")
+(set Nmw 5000)
+(set mkmw (fn [p] (table (concat ['k 'lo] (as 'SYMBOL (map (fn [j] (format "c%" j)) (til 20)))) (concat (list (+ (* p Nmw) (til Nmw)) (% (til Nmw) 10)) (map (fn [j] (as 'I32 (+ j (til Nmw)))) (til 20))))))
+(map (fn [p] (do (.db.splayed.set (format "/tmp/rfl_ckmw/2024.01.0%/t/" (+ p 1)) (mkmw p)) 0)) (til 8))
+(set Pmw (.db.parted.get "/tmp/rfl_ckmw/" 't))
+(set Bmw (* (* 8 Nmw) 96))
+;; 10 groups: well under a flatten
+(set pk0 (at (.sys.mem) 'peak-bytes))
+(count (select {by: lo from: Pmw})) -- 10
+(< (- (at (.sys.mem) 'peak-bytes) pk0) (/ Bmw 4)) -- true
+;; every key unique: the result is the whole table, and little more
+(set pk0 (at (.sys.mem) 'peak-bytes))
+(count (select {by: k from: Pmw})) -- 40000
+(< (- (at (.sys.mem) 'peak-bytes) pk0) (/ (* 3 Bmw) 2)) -- true
+(select {by: k from: Pmw desc: k take: 3}) -- (select {by: k from: (select {from: Pmw where: (>= k 0)}) desc: k take: 3})
+(.sys.exec "rm -rf /tmp/rfl_ckmw")
