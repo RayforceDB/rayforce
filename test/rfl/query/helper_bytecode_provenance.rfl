@@ -389,6 +389,53 @@ CNT9 -- 6
 (at (select {n: (count v) by: (kc10 v) from: T10}) 'n) -- [3 3]
 (set km10 (fn [v] 1 (> v (mavg 3 v))))
 (at (select {n: (count v) by: (km10 v) from: T10}) 'n) -- [1 5]
+;; ... through a let alias of a pure helper, and a map or fold over a list
+;; of pure helpers: the key means what (kg10 v) means
+(set kal10 (fn [v] (let g kg10) (g v)))
+(at (select {n: (count v) by: (kal10 v) from: T10}) 'n) -- [3 3]
+(set kal210 (fn [v] (let g kg10) (let g2 g) (g2 v)))
+(at (select {n: (count v) by: (kal210 v) from: T10}) 'n) -- [3 3]
+(set kmap10 (fn [v] (first (map (fn [f] (f v)) (list kg10)))))
+(at (select {n: (count v) by: (kmap10 v) from: T10}) 'n) -- [3 3]
+(set HL10 (list kg10 kg10))
+(set kmapg10 (fn [v] (last (map (fn [f] (f v)) HL10))))
+(at (select {n: (count v) by: (kmapg10 v) from: T10}) 'n) -- [3 3]
+(set hs10 (fn [x] (- x (avg x))))
+(set kfold10 (fn [v] (> (fold (fn [acc f] (+ acc (f v))) 0 (list hs10 hs10)) 0)))
+(at (select {n: (count v) by: (kfold10 v) from: T10}) 'n) -- [3 3]
+;; ... while an alias, a list or a dict that reaches an effect sends the body
+;; row by row; so does a let that may not have run, or one rebinding the name
+(set CNT11 0)
+(set eff11 (fn [x] (set CNT11 (+ CNT11 1)) x))
+(set kale11 (fn [v] (let g eff11) (g v) (if (< v 4) 0 1)))
+(at (select {n: (count v) by: (kale11 v) from: T10}) 'n) -- [3 3]
+CNT11 -- 6
+(set CNT11 0)
+(set gx11 eff11)
+(set kcl11 (fn [v] (if (> 0 1) (let gx11 kg10) 0) (gx11 v) (if (< v 4) 0 1)))
+(at (select {n: (count v) by: (kcl11 v) from: T10}) 'n) -- [3 3]
+CNT11 -- 6
+(set CNT11 0)
+(set kme11 (fn [v] (first (map (fn [f] (f v)) (list eff11))) (if (< v 4) 0 1)))
+(at (select {n: (count v) by: (kme11 v) from: T10}) 'n) -- [3 3]
+CNT11 -- 6
+(set CNT11 0)
+(set HD11 (dict ['a] (list eff11)))
+(set kmd11 (fn [v] (first (map (fn [f] (f v)) (value HD11))) (if (< v 4) 0 1)))
+(at (select {n: (count v) by: (kmd11 v) from: T10}) 'n) -- [3 3]
+CNT11 -- 6
+(set CNT11 0)
+(set kfa11 (fn [v] (fold (fn [acc f] (acc v)) eff11 (list kg10)) (if (< v 4) 0 1)))
+(at (select {n: (count v) by: (kfa11 v) from: T10}) 'n) -- [3 3]
+CNT11 -- 6
+(set CNT11 0)
+(set kpa11 (fn [g v] (let g eff11) (g v) (if (< v 4) 0 1)))
+(at (select {n: (count v) by: (kpa11 kg10 v) from: T10}) 'n) -- [3 3]
+CNT11 -- 6
+(set CNT11 0)
+(set krl11 (fn [v] (let g kg10) (let g eff11) (g v) (if (< v 4) 0 1)))
+(at (select {n: (count v) by: (krl11 v) from: T10}) 'n) -- [3 3]
+CNT11 -- 6
 ;; a pure body keeps the whole column: the min is the column's minimum
 (set kw10 (fn [v] 1 (- v (min v))))
 (at (select {n: (count v) by: (kw10 v) from: T10}) 'v) -- [0 1 2 3 4 5]
