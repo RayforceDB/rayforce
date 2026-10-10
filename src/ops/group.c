@@ -8875,9 +8875,12 @@ static inline int64_t group_strlen_at_cached(const ray_t* col, int64_t row,
 
 /* SUM/AVG(strlen scan): *out_vec is the STR / SYM column, plain when it is
  * ready, else (an encoded SYM column) its RAY_ENCCOL, which the caller binds
- * and reads by range.  An encoded STR column not materialized declines: its
- * byte lengths are read through the plain column, which the expression
- * path materializes (R-RANDOM).  A failed bind leaves an owned *err. */
+ * and reads by range.  An encoded STR column is read through its plain
+ * column (R-RANDOM), materialized here, so every route reads what it reads
+ * at generation 0: declining left the input to the expression path, whose
+ * strlen makes an empty string a null that AVG skips, where the scalar and
+ * direct-array routes count it as length 0.  A failed bind or
+ * materialization leaves an owned *err. */
 static bool try_strlen_sumavg_input(ray_graph_t* g, ray_t* tbl,
                                     ray_op_t* input_op, ray_t** out_vec, ray_t** err) {
     *err = NULL;
@@ -8896,6 +8899,10 @@ static bool try_strlen_sumavg_input(ray_graph_t* g, ray_t* tbl,
         if (!src || src->parted) return false;
         col = ray_col_src_ready(src);
         if (!col && src->type == RAY_SYM) col = src->obj;     /* staged */
+        if (!col && src->type == RAY_STR) {
+            ray_t* e = ray_col_src_plain(src, &col);   /* random: STR strlen */
+            if (e) { *err = e; return false; }
+        }
     }
     if (!col) return false;
     if (col->type != RAY_ENCCOL && col->type != RAY_STR && col->type != RAY_SYM) return false;

@@ -5743,6 +5743,107 @@ static test_result_t test_parted_expr_null_free(void) {
     PASS();
 }
 
+/* Task 17g: sum / avg of (strlen s) over a generation-2 STR column give
+ * generation 0's answers and the same rows' in memory on every route: the
+ * scalar route, the normal routing (the v2 engine declines a strlen input:
+ * the legacy ladder), the direct array, legacy radix (a wide key), under a
+ * selection, beside a staged SYM strlen, and per partition.  The encoded
+ * STR is read through its plain column (one materialization); declining it
+ * left the input to the expression path, whose strlen makes an empty
+ * string (the STR null) a null that the average skipped, where the scalar
+ * and direct-array routes count it as length 0 (checked against the
+ * reference below).  With the direct array skipped, the legacy ladder's
+ * divisor skips the STR null on every source alike (pre-existing; only the
+ * sources' agreement is checked there).  The lengths differ by group, so a
+ * mixed-up group shows. */
+static int64_t sr_strlen_len(int64_t r) {
+    switch (r % 3) {
+    case 0:  return (r / 3) % 2 ? 0 : 4;
+    case 1:  return r % 5;
+    default: return (r / 7) % 3 == 0 ? 0 : 7;
+    }
+}
+static test_result_t test_strlen_str_gen2_routes(void) {
+    const int64_t n = 70000;
+    static const char abc[] = "abcdefg";
+    ray_t* sv = ray_vec_new(RAY_STR, n); sv->len = 0;
+    int64_t gsum[3] = { 0 }, gcnt[3] = { 0 }, tsum = 0;
+    for (int64_t r = 0; r < n; r++) {
+        int64_t l = sr_strlen_len(r);
+        sv = ray_str_vec_append(sv, abc, (size_t)l);
+        gsum[r % 3] += l; gcnt[r % 3]++; tsum += l;
+    }
+    ray_env_set(ray_sym_intern("slv", 3), sv); ray_release(sv);
+    sr_eval_ok("(set i (til 70000))");
+    sr_eval_ok("(set M (table [g h s y] (list (% i 3) (% (* i 7919) 50021) slv (as 'SYM slv))))");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/sl0/\" M {compress: false})");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/sl2/\" M {compress: true})");
+    const char* t0 = "(.db.splayed.get \"" SR_TMP "/sl0/\")";
+    const char* t2 = "(.db.splayed.get \"" SR_TMP "/sl2/\")";
+    /* the reference itself on the scalar and direct-array routes: an empty
+     * string is a length-0 row */
+    for (int k3 = 0; k3 < 6; k3++) {
+        int gen = k3 % 3;
+        ray_group_test_route(k3 / 3);
+        sr_evalf_ok("(set T %s)", gen == 0 ? "M" : gen == 1 ? t0 : t2);
+        ray_t* a = sr_eval("(at (select {a: (avg (strlen s)) from: T by: g asc: g}) 'a)");
+        TEST_ASSERT_FMT(a && !RAY_IS_ERR(a) && a->type == RAY_F64 && a->len == 3, "route %d source %d: grouped avg", k3 / 3, gen);
+        for (int k = 0; k < 3; k++)
+            TEST_ASSERT_FMT(fabs(((double*)ray_data(a))[k] - (double)gsum[k] / (double)gcnt[k]) < 1e-9,
+                            "route %d source %d group %d: %.17g, want %.17g", k3 / 3, gen, k, ((double*)ray_data(a))[k],
+                            (double)gsum[k] / (double)gcnt[k]);
+        sr_drop(a);
+        ray_t* s = sr_eval("(first (at (select {a: (avg (strlen s)) from: T}) 'a))");
+        ray_group_test_route(0);
+        TEST_ASSERT_FMT(s && !RAY_IS_ERR(s) && s->type == -RAY_F64 &&
+                        fabs(s->f64 - (double)tsum / (double)n) < 1e-9, "source %d: scalar avg", gen);
+        sr_drop(s);
+    }
+    static const struct { const char* q; uint64_t mat; } qs[] = {
+        { "(select {a: (avg (strlen s)) b: (sum (strlen s)) c: (count s) from: T by: g asc: g})", 1 },
+        { "(select {a: (avg (strlen s)) b: (sum (strlen s)) c: (count s) from: T})", 1 },
+        { "(select {a: (avg (strlen s)) from: T where: (> g 0)})", 1 },
+        { "(select {a: (avg (strlen s)) b: (sum (strlen s)) from: T where: (!= g 1) by: g asc: g})", 1 },
+        { "(select {a: (avg (strlen s)) l: (avg (strlen y)) b: (sum (strlen y)) from: T by: g asc: g})", 1 },
+        { "(select {a: (avg (strlen s)) c: (count g) from: T by: h asc: h})", 1 },   /* wide key */
+        { "(select {mn: (min (strlen s)) mx: (max (strlen s)) a: (avg (strlen s)) from: T by: g asc: g})", 1 },
+        { NULL, 0 },
+    };
+    for (int route = 0; route <= 2; route++) {
+        for (int i = 0; qs[i].q; i++) {
+            ray_group_test_route(route);
+            agg_route_reset();
+            test_result_t r = sr_same_on(t0, t2, qs[i].q, qs[i].mat);
+            if (r.status == TEST_PASS) r = sr_same_on("M", t2, qs[i].q, UINT64_MAX);
+            agg_route_stats_t st = agg_route_stats();
+            ray_group_test_route(0);
+            if (r.status != TEST_PASS) return r;
+            if (route) TEST_ASSERT_FMT(st.routes[AGG_ROUTE_LEGACY] > 0, "route %d %s: not the legacy ladder",
+                                       route, qs[i].q);
+        }
+    }
+    /* per partition: three partitions of the same rows */
+    for (int gen = 0; gen <= 2; gen += 2)
+        for (int p = 0; p < 3; p++)
+            sr_evalf_ok("(.db.splayed.set \"" SR_TMP "/slp%d/2024.01.0%d/t/\" M \"" SR_TMP "/slp%d/.sym\" "
+                        "{compress: %s})", gen, p + 1, gen, gen ? "true" : "false");
+    sr_eval_ok("(set M3 (table [g h s y] (list (concat (concat (% i 3) (% i 3)) (% i 3)) "
+               "(concat (concat (at M 'h) (at M 'h)) (at M 'h)) (concat (concat slv slv) slv) "
+               "(concat (concat (at M 'y) (at M 'y)) (at M 'y)))))");
+    for (int gen = 0; gen <= 2; gen += 2) {
+        char tp[256];
+        snprintf(tp, sizeof tp, "(.db.parted.get \"" SR_TMP "/slp%d\" 't)", gen);
+        for (int i = 0; qs[i].q; i++) {
+            int64_t r0 = ray_group_perpart_runs();
+            test_result_t r = sr_same_on("M3", tp, qs[i].q, UINT64_MAX);
+            if (r.status != TEST_PASS) return r;
+            if (strstr(qs[i].q, "by: g"))
+                TEST_ASSERT_FMT(ray_group_perpart_runs() > r0, "gen %d %s: not the per-partition route", gen, qs[i].q);
+        }
+    }
+    PASS();
+}
+
 /* Task 17d: a ragged generation-0 table's synthetic null segment is
  * decided from its statistics, never decoded.  A compare over the column
  * fills its rows from the all-null rule (the predicate and the count of a
@@ -5909,6 +6010,7 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/count_and",          test_count_and,          srr_setup, srr_teardown },
     { "scanrange/parted_nullable_stats", test_parted_nullable_stats, srr_setup, srr_teardown },
     { "scanrange/parted_expr_null_free", test_parted_expr_null_free, srr_setup, srr_teardown },
+    { "scanrange/strlen_str_gen2_routes", test_strlen_str_gen2_routes, sr_rt_setup, sr_rt_teardown },
     { "scanrange/ragged_gen0_no_decode", test_ragged_gen0_no_decode, srr_setup, srr_teardown },
     { "scanrange/const_beside_parted_group", test_const_beside_parted_group, srr_setup, srr_teardown },
     { NULL, NULL, NULL, NULL },
