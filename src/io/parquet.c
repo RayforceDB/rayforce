@@ -11,6 +11,7 @@
 #include "core/pool.h"
 #include "core/crc32.h"
 #include "core/profile.h"
+#include "core/runtime.h"   /* ray_error_msg: a pool task's error message */
 #include "mem/heap.h"
 #include "mem/sys.h"        /* ray_sys_free: the grouped import's redo list */
 #include "table/sym.h"
@@ -1609,12 +1610,44 @@ static ray_t* pq_import_types(ray_parquet_t* r, ray_t* types) {
     }
     return NULL;
 }
+/* An error object carries its code; its message is the raising thread's
+ * (ray_error_msg, thread local).  A pool task that fails on a worker notes
+ * that message here, the lowest failed task's kept, and the thread that
+ * reports the task's error raises it again with it (pq_task_msg_raise):
+ * otherwise only the code reached the caller. */
+typedef struct {
+    _Atomic(bool) busy;   /* a spin lock, taken only on a failure */
+    int64_t task;         /* the lowest failed task noted, INT64_MAX: none */
+    char msg[256];
+} pq_task_msg;
+static void pq_task_msg_reset(pq_task_msg* m) {
+    atomic_init(&m->busy,false); m->task = INT64_MAX; m->msg[0] = 0;
+}
+/* After `task` failed with an error raised on this thread. */
+static void pq_task_msg_note(pq_task_msg* m, int64_t task) {
+    if (!m) return;
+    const char* s = ray_error_msg();
+    while (atomic_exchange_explicit(&m->busy,true,memory_order_acquire)) RAY_CPU_RELAX();
+    if (task < m->task) { m->task = task; snprintf(m->msg,sizeof(m->msg),"%s",s ? s : ""); }
+    atomic_store_explicit(&m->busy,false,memory_order_release);
+}
+/* `task`'s error `e`, reported on this thread, the tasks joined: raised again
+ * with the message noted for it (none when it had none). */
+static ray_t* pq_task_msg_raise(pq_task_msg* m, int64_t task, ray_t* e) {
+    if (!m || !e || !RAY_IS_ERR(e) || m->task != task) return e;
+    char code[8];
+    snprintf(code,sizeof(code),"%s",ray_err_code(e));
+    ray_t* again = m->msg[0] ? ray_error(code,"%s",m->msg) : ray_error(code,NULL);
+    ray_error_free(e);
+    return again;
+}
 typedef struct {
     ray_parquet_t* parent;
     const char *root, *table;
     int64_t *offsets;
     ray_t** errors;
     bool durable;
+    pq_task_msg* emsg;             /* the failed tasks' messages */
 } pq_native_work;
 /* These partitions are private to the import staging directory. Persist the
  * shared vocabulary once after all workers join, before publishing the root.
@@ -1682,8 +1715,9 @@ static void pq_write_group(void* ptr, uint32_t worker, int64_t start, int64_t en
     (void)worker; pq_native_work* w = ptr;
     for (int64_t g = start; g < end; g++) {
         ray_parquet_t* r = pq_group_reader(w->parent,g,w->parent->nselected);
-        if (!r) { w->errors[g] = ray_error("oom",NULL); continue; }
+        if (!r) { w->errors[g] = ray_error("oom",NULL); pq_task_msg_note(w->emsg,g); continue; }
         w->errors[g] = pq_write_reader(r,w->root,w->table,w->offsets[g],w->durable);
+        if (w->errors[g]) pq_task_msg_note(w->emsg,g);
         ray_parquet_close(r);
     }
 }
@@ -1706,14 +1740,16 @@ static ray_t* pq_write_groups(ray_parquet_t* r, const char* root, const char* ta
         *parts += n;
     }
     if (!ng) { *parts = 1; err = pq_write_reader(r,root,table,0,durable); goto done; }
-    pq_native_work work = {r,root,table,offsets,errors,durable};
+    pq_task_msg emsg;
+    pq_task_msg_reset(&emsg);
+    pq_native_work work = {r,root,table,offsets,errors,durable,&emsg};
     ray_pool_t* pool = pq_group_pool(r);
     if (pool) {
         /* dispatch uses a bounded ring; tasks claim groups dynamically. */
         ray_pool_dispatch_n(pool,pq_write_group,&work,(uint32_t)ng);
     } else pq_write_group(&work,0,0,ng);
     for (int64_t g = 0; g < ng; g++) if (errors[g]) {
-        if (!err) err = errors[g]; else ray_error_free(errors[g]);
+        if (!err) err = pq_task_msg_raise(&emsg,g,errors[g]); else ray_error_free(errors[g]);
     }
     if (!err && ray_interrupted()) err = ray_error("cancel","parquet conversion interrupted");
 done:
@@ -1851,6 +1887,7 @@ typedef struct {
     pq_column* spare;              /* [nspare] each worker's buffers between its tasks */
     int64_t nspare;
     bool reverse;                  /* debug: the row groups last to first (RAY_PQ_DIRECT_REVERSE) */
+    pq_task_msg* emsg;             /* the failed tasks' messages (errors[]'s) */
 } pq_direct_work;
 
 /* Trade a task cursor's page, dictionary and symbol buffers with its
@@ -2094,7 +2131,7 @@ static void pq_write_direct_group(void* ptr, uint32_t worker, int64_t start, int
         if (w->reverse) g = w->parent->ngroups-1-g;
         if (w->prefetched) pq_prefetch_chunks(w,g,c);
         ray_parquet_t* r = pq_group_reader(w->parent,g,1);
-        if (!r) { w->errors[task] = ray_error("oom",NULL); continue; }
+        if (!r) { w->errors[task] = ray_error("oom",NULL); goto next; }
         /* A task is one column chunk, so both groups and columns can occupy
          * workers. Narrow schemas still get one task per row group. */
         r->selected[0] = (int32_t)c; r->nselected = r->noutput = 1;
@@ -2107,7 +2144,7 @@ static void pq_write_direct_group(void* ptr, uint32_t worker, int64_t start, int
         if (!local.fp) {
             w->errors[task] = pq_error("cannot open native column");
             if (spare) pq_trade_buffers(&r->cursors[0],spare);
-            ray_parquet_close(r); continue;
+            ray_parquet_close(r); goto next;
         }
         int64_t offset = 32+row*(int64_t)size;
 #ifdef RAY_OS_WINDOWS
@@ -2158,6 +2195,8 @@ static void pq_write_direct_group(void* ptr, uint32_t worker, int64_t start, int
         if (!w->errors[task] && row != w->offsets[g+1]) w->errors[task] = pq_error("row group ended before its assigned output range");
         if (spare) pq_trade_buffers(&r->cursors[0],spare);
         ray_parquet_close(r);
+    next:
+        if (w->errors[task]) pq_task_msg_note(w->emsg,task);
     }
 }
 
@@ -2620,7 +2659,7 @@ static void pq_g1_task(void* ptr, uint32_t worker, int64_t start, int64_t end) {
         if (!err && !ray_symgrp_stage(w->g,g,k.d.n,k.d.fp,k.d.cnt ? k.d.cnt+1 : NULL))
             err = "symbol staging allocation failed";
         atomic_fetch_add_explicit(&w->gens,k.d.gens,memory_order_relaxed);
-        if (err && !dw->errors[g]) dw->errors[g] = pq_g_error(dw->parent,err,bad);
+        if (err && !dw->errors[g]) { dw->errors[g] = pq_g_error(dw->parent,err,bad); pq_task_msg_note(dw->emsg,g); }
         pq_g_scratch_back(ws,&k);
         if (r) pq_g_reader_close(w,r,worker);
     }
@@ -2698,7 +2737,7 @@ static void pq_g2_task(void* ptr, uint32_t worker, int64_t start, int64_t end) {
         ray_col_stream_abort(&local);   /* frees what an append made; no file of its own */
         if (!err && local.rows != dw->offsets[g+1]-dw->offsets[g]) err = "row group ended before its assigned output range";
         if (local.had_nulls) atomic_store_explicit(&dw->nulls[w->c],1,memory_order_relaxed);
-        if (err && !dw->errors[g]) dw->errors[g] = pq_g_error(dw->parent,err,bad);
+        if (err && !dw->errors[g]) { dw->errors[g] = pq_g_error(dw->parent,err,bad); pq_task_msg_note(dw->emsg,g); }
         ray_symgrp_note(w->g,k.cmp,k.cmpb);
         pq_g_scratch_back(ws,&k);
         if (r) pq_g_reader_close(w,r,worker);
@@ -2937,7 +2976,9 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
     bool trace = getenv("RAY_CSV_TRACE") != NULL;   /* the converters' phase trace */
     spare = ray_calloc_raw((size_t)workers*sizeof(*spare));   /* best effort */
     if (spare) nspare = workers;
-    pq_direct_work work = {r,writers,offsets,nulls,locks,errors,NULL,0,lo,hi,NULL,0,0,true,spare,nspare,false};
+    pq_task_msg emsg;   /* the failed tasks' messages, a pass at a time */
+    pq_task_msg_reset(&emsg);
+    pq_direct_work work = {r,writers,offsets,nulls,locks,errors,NULL,0,lo,hi,NULL,0,0,true,spare,nspare,false,&emsg};
     /* Starting each chunk's writeback as it is written spares one pass its
      * final sync; column by column the passes end their files anyway and
      * the extra I/O requests only slow the decode. */
@@ -3110,9 +3151,10 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
         /* errors[0] even with no tasks: a grouped pass over a file of no row
          * groups still runs its steps, and reports there */
         for (int64_t t = 0; t < (tasks > 0 ? tasks : 1); t++) if (errors[t]) {
-            if (!err) err = errors[t]; else ray_error_free(errors[t]);
+            if (!err) err = pq_task_msg_raise(&emsg,t,errors[t]); else ray_error_free(errors[t]);
             errors[t] = NULL;
         }
+        pq_task_msg_reset(&emsg);
         if (!err && ray_interrupted()) err = ray_error("cancel","parquet conversion interrupted");
         if (!err && atomic_load_explicit(&symf.err,memory_order_acquire) != RAY_OK)
             err = ray_error(ray_err_code_str((ray_err_t)atomic_load(&symf.err)),"parquet: cannot flush symbol file");

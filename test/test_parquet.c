@@ -1967,7 +1967,7 @@ static test_result_t test_pq_sym_grouped_collision_determinism(void) {
 enum { PQX_DICT = 1, PQX_FALLBACK = 2, PQX_SNAPPY = 4, PQX_LATE = 8, PQX_NOSTATS = 16,
        PQX_LIESTATS = 32, PQX_ZSTD = 64, PQX_HUGERAW = 128, PQX_ZERORAW = 256, PQX_BADDICT = 512,
        PQX_FARDATA = 1024, PQX_INDICT = 2048, PQX_CRC = 4096, PQX_CRCFLIP = 8192 };   /* PQX_ZERORAW: total_uncompressed_size 0; PQX_BADDICT: the dictionary page encoded 3 */
-                                             /* PQX_CRC: page checksums; PQX_CRCFLIP: and row group 1's dictionary
+                                             /* PQX_CRC: page checksums; PQX_CRCFLIP: and the last row group's dictionary
                                               * page with a byte flipped past its checksum (pqx_page, pqx_crc) */
                                              /* PQX_FARDATA: data_page_offset past the file's data; PQX_INDICT:
                                               * data_page_offset one byte into the dictionary page (skeptic round 4:
@@ -2095,7 +2095,7 @@ static bool pqx_synth(const char* path, int64_t rows, int64_t groups, int n, con
                 continue;
             }
             unsigned fl = flags[c - 1];
-            pqx_crc = !(fl & PQX_CRC) ? 0 : (fl & PQX_CRCFLIP) && g == 1 ? 2 : 1;
+            pqx_crc = !(fl & PQX_CRC) ? 0 : (fl & PQX_CRCFLIP) && g == groups - 1 ? 2 : 1;
             bool snappy = (fl & PQX_SNAPPY) != 0, dicted = (fl & (PQX_DICT | PQX_FALLBACK)) != 0;
             pq_synth_fn fn = fns[c - 1];
             int64_t mid = !dicted ? lo : (fl & PQX_FALLBACK) && hi - lo >= 2 ? lo + (hi - lo) * ((fl & PQX_LATE) ? 7 : 4) / 8 : hi;
@@ -3135,7 +3135,9 @@ static int pq_file_has(const char* path, const char* s, size_t n) {
  * dictionary column is seeded first (the error then the seeding's, the same
  * words); nothing is published, and the symbol file the failed import
  * leaves in its staging directory holds no string of the page gone bad,
- * but row group 0's (the seeding fails at the bad page, row group 1).  And a
+ * but row group 0's (the seeding fails at the bad page, the last row
+ * group's).  The direct import on one worker, two and four: the message
+ * the same whichever worker read the bad page.  And a
  * dictionary column whose checksums hold imports both ways, the mixed import
  * seeded, every row and the vocabulary the direct import's. */
 static test_result_t test_pq_sk_codec_message(void) {
@@ -3175,8 +3177,13 @@ static test_result_t test_pq_sk_codec_message(void) {
         TEST_ASSERT_TRUE(sram > 0);
         char ramv[32]; snprintf(ramv, sizeof(ramv), "%lld", (long long)sram);
         char first[256] = "";
-        for (int run = 0; run < 2; run++) {
-            if (run) pq_set_env("RAY_PQ_SYM_RAM", ramv); else pq_set_symmode("direct");
+        /* direct on one worker, two and four (the bad page read by any of
+         * them), then mixed on two */
+        for (int run = 0; run < 4; run++) {
+            bool mixed = run == 3;
+            int cores = mixed ? 2 : 1 << run;
+            TEST_ASSERT_EQ_I(pq_pool(cores), RAY_OK);
+            if (mixed) pq_set_env("RAY_PQ_SYM_RAM", ramv); else pq_set_symmode("direct");
             ray_error_clear();
             ray_t* res = pq_traced_import(src, dir, types, trace, cap);
             pq_sym_env_clear();
@@ -3184,39 +3191,40 @@ static test_result_t test_pq_sk_codec_message(void) {
             bool failed = !res || RAY_IS_ERR(res);
             bool pd = pq_trace_line_has(trace, "parquet symcol: col=p ", " mode=direct");
             if (!cases[v].want) {
-                bool ok = !failed && pqx_check(dir, 24000, 3, nm, fns, run ? "sk codec crc mixed" : "sk codec crc direct", NULL);
+                bool ok = !failed && pqx_check(dir, 24000, 3, nm, fns, mixed ? "sk codec crc mixed" : "sk codec crc direct", NULL);
                 bool seeded = strstr(trace, "parquet symseed:") != NULL;
                 double entries = pq_trace_line_num(trace, "parquet symseed:", "entries");
                 double miss = pq_trace_line_num(trace, "parquet symdirect:", "seed_miss");
-                fprintf(stderr, "  sk codec %zu %s: %s%s, seeded %.0f entries, seed_miss %.0f, %lld symbols (direct %lld)\n", v,
-                        run ? "mixed" : "direct", ok ? "imported" : "FAILED: ", ok ? "" : msg ? msg : "(no message)",
+                fprintf(stderr, "  sk codec %zu %s %d: %s%s, seeded %.0f entries, seed_miss %.0f, %lld symbols (direct %lld)\n", v,
+                        mixed ? "mixed" : "direct", cores, ok ? "imported" : "FAILED: ", ok ? "" : msg ? msg : "(no message)",
                         seeded ? entries : 0.0, miss, (long long)pq_sym_count(dir), (long long)words);
                 if (!ok || !pd || pq_sym_count(dir) != words) bad++;
-                if (run && (!seeded || entries <= 0 || miss != 0)) bad++;
+                if (mixed && (!seeded || entries <= 0 || miss != 0)) bad++;
                 if (res) { if (RAY_IS_ERR(res)) ray_error_free(res); else ray_release(res); }
                 pq_remove_native(partial, fnames, 4); pq_remove_native(dir, fnames, 4);
                 continue;
             }
-            fprintf(stderr, "  sk codec %zu %s: %s: %s%s\n", v, run ? "mixed" : "direct", failed ? "failed" : "imported",
-                    msg ? msg : "(no message)", run ? "" : pd ? " (p direct)" : " (p grouped)");
+            fprintf(stderr, "  sk codec %zu %s %d: %s: %s%s\n", v, mixed ? "mixed" : "direct", cores, failed ? "failed" : "imported",
+                    msg ? msg : "(no message)", mixed ? "" : pd ? " (p direct)" : " (p grouped)");
             /* the mixed import fails in its seeding, before its symcol lines:
              * the seeding checks what it interns as the decoder would (no
              * page the pass then refuses is interned first: no symseed line) */
-            if (!failed || !msg || !strstr(msg, cases[v].want) || !strstr(msg, "(column p)") || (!run && !pd)) bad++;
+            if (!failed || !msg || !strstr(msg, cases[v].want) || !strstr(msg, "(column p)") || (!mixed && !pd)) bad++;
             if (!run && msg) snprintf(first, sizeof(first), "%s", msg);
-            if (run && (!msg || strcmp(first, msg) || strstr(trace, "parquet symseed:"))) bad++;
+            if (run && (!msg || strcmp(first, msg))) bad++;   /* the same words on any worker, and seeding */
+            if (mixed && strstr(trace, "parquet symseed:")) bad++;
             if (res) { if (RAY_IS_ERR(res)) ray_error_free(res); else ray_release(res); }
             if (access(dir, F_OK) == 0) { fprintf(stderr, "  sk codec %zu: published\n", v); bad++; }
             if (cases[v].flags & PQX_CRCFLIP) {
                 char sym[300]; snprintf(sym, sizeof(sym), "%s/.sym", partial);
                 int has = pqx_flipped_len ? pq_file_has(sym, pqx_flipped, pqx_flipped_len) : 1;
-                fprintf(stderr, "  sk codec %zu %s: the staged .sym %s\n", v, run ? "mixed" : "direct",
+                fprintf(stderr, "  sk codec %zu %s %d: the staged .sym %s\n", v, mixed ? "mixed" : "direct", cores,
                         has < 0 ? "is not there" : has ? "HOLDS the bad page's string" : "holds no string of the bad page");
                 if (has > 0) bad++;
-                /* and the seeding failed where the bad page is, row group 1:
+                /* and the seeding failed where the bad page is, the last row group:
                  * row group 0's dictionaries, good, went in before it */
-                int got0 = run && g0 ? pq_file_has(sym, g0, g0len) : 1;
-                if (run) fprintf(stderr, "  sk codec %zu mixed: row group 0's strings %s\n", v, got0 > 0 ? "seeded" : "NOT seeded");
+                int got0 = mixed && g0 ? pq_file_has(sym, g0, g0len) : 1;
+                if (mixed) fprintf(stderr, "  sk codec %zu mixed: row group 0's strings %s\n", v, got0 > 0 ? "seeded" : "NOT seeded");
                 if (got0 <= 0) bad++;
             }
             pq_remove_native(partial, fnames, 4); pq_remove_native(dir, fnames, 4);
@@ -3507,7 +3515,10 @@ static test_result_t test_pq_sk4_data_offset(void) {
  * import forced direct and forced grouped: both fail, and the grouped
  * message should carry the decoder's reason and the column as the direct
  * one does.  So too a codec the reader does not take (ZSTD), which the
- * chunk's checks before its pages refuse. */
+ * chunk's checks before its pages refuse; and a dictionary page whose
+ * checksum fails, in the last row group only, which a pool worker as likely
+ * as not reads (its message carried to the thread that reports it), the
+ * parted import's row-group tasks too. */
 static test_result_t test_pq_sk4_grouped_message(void) {
     pq_sym_env_clear();
     char src[160], dir[160], partial[240];
@@ -3521,25 +3532,29 @@ static test_result_t test_pq_sk4_grouped_message(void) {
     ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 3);
     TEST_ASSERT_EQ_I(pq_pool(2), RAY_OK);
     int bad = 0;
-    static const unsigned cases[] = {PQX_DICT | PQX_BADDICT, PQX_DICT | PQX_ZSTD};
+    static const unsigned cases[] = {PQX_DICT | PQX_BADDICT, PQX_DICT | PQX_ZSTD, PQX_DICT | PQX_CRC | PQX_CRCFLIP};
     for (size_t v = 0; v < sizeof(cases) / sizeof(cases[0]); v++) {
     unsigned fl[2] = {cases[v], PQX_DICT};
     TEST_ASSERT_TRUE(pqx_synth(src, 12000, 4, 2, nm, fns, fl));
-    char msgs[2][256];
-    for (int run = 0; run < 2; run++) {
-        pq_set_symmode(run ? "grouped" : "direct");
+    char msgs[4][256];
+    static const char* what[4] = {"direct", "grouped", "grouped", "parted"};
+    for (int run = 0; run < 4; run++) {   /* direct, grouped on two workers, grouped on four, parted on four */
+        int cores = run >= 2 ? 4 : 2;
+        TEST_ASSERT_EQ_I(pq_pool(cores), RAY_OK);
+        if (run < 3) pq_set_symmode(run ? "grouped" : "direct");
         ray_error_clear();
-        ray_t* res = ray_parquet_splayed_typed(src, dir, types);
+        ray_t* res = run < 3 ? ray_parquet_splayed_typed(src, dir, types) : ray_parquet_parted_typed(src, dir, "t", types);
         pq_sym_env_clear();
         bool failed = !res || RAY_IS_ERR(res);
         const char* msg = ray_error_msg();
         snprintf(msgs[run], sizeof(msgs[run]), "%s", msg ? msg : "(no message)");
-        fprintf(stderr, "  [sk4 message %zu %s] %s: %s\n", v, run ? "grouped" : "direct", failed ? "failed" : "imported", msgs[run]);
+        fprintf(stderr, "  [sk4 message %zu %s %d] %s: %s\n", v, what[run], cores, failed ? "failed" : "imported", msgs[run]);
         if (!failed || !strstr(msgs[run], "(column p)")) bad++;
         if (res) { if (RAY_IS_ERR(res)) ray_error_free(res); else ray_release(res); }
-        pq_remove_native(dir, fnames, 3); pq_remove_native(partial, fnames, 3);
+        if (run < 3) { pq_remove_native(dir, fnames, 3); pq_remove_native(partial, fnames, 3); }
+        else { (void)ray_test_rm_rf(partial); (void)ray_test_rm_rf(dir); }
     }
-    if (strcmp(msgs[0], msgs[1]) != 0) bad++;
+    for (int run = 1; run < 4; run++) if (strcmp(msgs[0], msgs[run]) != 0) bad++;
     }
     unlink(src);
     ray_pool_destroy();
