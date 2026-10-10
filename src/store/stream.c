@@ -50,23 +50,26 @@ ray_err_t ray_col_stream_open(ray_col_stream_t* w,
     if (!w->fp) return RAY_ERR_IO;
     ray_t zero = {0};
     if (fwrite(&zero, 1, 32, w->fp) != 32) return RAY_ERR_IO;
-    if (type == RAY_SYM) {
-        /* best effort: without the cache every cell probes the domain */
-        w->lut_id  = (int64_t*)ray_alloc_raw((size_t)COL_STREAM_LUT * sizeof(int64_t));
-        w->lut_pos = (uint32_t*)ray_alloc_raw((size_t)COL_STREAM_LUT * sizeof(uint32_t));
-        if (!w->lut_id || !w->lut_pos) {
-            ray_free_raw(w->lut_id); ray_free_raw(w->lut_pos);
-            w->lut_id = NULL; w->lut_pos = NULL;
-        } else {
-            memset(w->lut_id, 0xff, (size_t)COL_STREAM_LUT * sizeof(int64_t));
-        }
-    }
     return RAY_OK;
 }
 
 static void ray_col_stream_drop_lut(ray_col_stream_t* w) {
     ray_free_raw(w->lut_id); ray_free_raw(w->lut_pos);
     w->lut_id = NULL; w->lut_pos = NULL;
+}
+
+/* The runtime id -> position cache, made by the first runtime-domain chunk:
+ * 4 MiB of ids and 2 MiB of positions, each a block one order up with its
+ * header (8 MB and 4 MB, 12 MB committed, the 4 MiB of ids written here).
+ * A writer fed chunks already encoded over its domain never needs it.  Best
+ * effort: without it every cell probes the domain. */
+static bool ray_col_stream_lut(ray_col_stream_t* w) {
+    if (w->lut_id) return true;
+    w->lut_id  = (int64_t*)ray_alloc_raw((size_t)COL_STREAM_LUT * sizeof(int64_t));
+    w->lut_pos = (uint32_t*)ray_alloc_raw((size_t)COL_STREAM_LUT * sizeof(uint32_t));
+    if (!w->lut_id || !w->lut_pos) { ray_col_stream_drop_lut(w); return false; }
+    memset(w->lut_id, 0xff, (size_t)COL_STREAM_LUT * sizeof(int64_t));
+    return true;
 }
 
 ray_err_t ray_col_stream_index_begin(ray_col_stream_t* w, int64_t start_row) {
@@ -110,21 +113,33 @@ ray_err_t ray_col_stream_append(ray_col_stream_t* w,
         /* Import strings directly into the file domain, avoiding a second
          * global runtime dictionary and a runtime-id-to-file-id pass. */
         enum { BATCH = 8192 };
-        const char* strings[BATCH]; size_t lengths[BATCH];
-        uint32_t hashes[BATCH], positions[BATCH]; int64_t ids[BATCH];
+        const char* strings[BATCH]; size_t lengths[BATCH]; int64_t ids[BATCH];
+        /* The batch's hashes, then (they are no longer read once the batch
+         * is interned) the positions written: one array's room on a worker's
+         * stack, as when the hashes were 32 bits wide. */
+        union { uint64_t h64[BATCH]; uint32_t h32[BATCH]; uint32_t pos[BATCH]; } u;
+        /* One hash a string: all 64 bits for an import domain, which keys on
+         * them (ray_sym_domain_intern_batch64, which would otherwise hash
+         * the strings again), the low 32 for the others. */
+        bool wide = ray_sym_domain_import(w->dom) != NULL;
         for (int64_t off = 0; off < n; off += BATCH) {
             if (ray_interrupted()) return RAY_ERR_CANCEL;
             int64_t count = n-off < BATCH ? n-off : BATCH;
-            for (int64_t i = 0; i < count; i++) {
-                strings[i] = ray_str_vec_get(col,off+i,&lengths[i]);
-                hashes[i] = (uint32_t)ray_hash_bytes(strings[i],lengths[i]);
+            for (int64_t i = 0; i < count; i++) strings[i] = ray_str_vec_get(col,off+i,&lengths[i]);
+            bool ok;
+            if (wide) {
+                for (int64_t i = 0; i < count; i++) u.h64[i] = ray_hash_bytes(strings[i],lengths[i]);
+                ok = ray_sym_domain_intern_batch64(w->dom,count,strings,lengths,u.h64,ids);
+            } else {
+                for (int64_t i = 0; i < count; i++) u.h32[i] = (uint32_t)ray_hash_bytes(strings[i],lengths[i]);
+                ok = ray_sym_domain_intern_batch(w->dom,count,strings,lengths,u.h32,ids);
             }
-            if (!ray_sym_domain_intern_batch(w->dom,count,strings,lengths,hashes,ids)) return RAY_ERR_OOM;
+            if (!ok) return RAY_ERR_OOM;
             for (int64_t i = 0; i < count; i++) {
                 if (ids[i] < 0 || (uint64_t)ids[i] >= UINT32_MAX) return RAY_ERR_RANGE;
-                positions[i] = (uint32_t)ids[i]; if (!ids[i]) w->had_nulls = true;
+                u.pos[i] = (uint32_t)ids[i]; if (!ids[i]) w->had_nulls = true;
             }
-            if (fwrite(positions,sizeof(*positions),(size_t)count,w->fp) != (size_t)count) return RAY_ERR_IO;
+            if (fwrite(u.pos,sizeof(*u.pos),(size_t)count,w->fp) != (size_t)count) return RAY_ERR_IO;
         }
     } else if (w->type == RAY_STR) {
         uint64_t bytes = col->str_pool ? (uint64_t)col->str_pool->len : 0;
@@ -150,6 +165,22 @@ ray_err_t ray_col_stream_append(ray_col_stream_t* w,
             if (!w->pool_fp || fwrite(ray_data(col->str_pool),1,(size_t)bytes,w->pool_fp) != bytes) return RAY_ERR_IO;
         }
         w->pool_bytes += bytes;
+    } else if (w->type == RAY_SYM && ray_sym_vec_domain(col) == w->dom &&
+               (col->attrs & RAY_SYM_W_MASK) == RAY_SYM_W32) {
+        /* Already encoded over the target domain at the file's width (a
+         * converter's own symbol decode): the cells are the positions,
+         * written as they are in one request.  HAS_NULLS from a position 0
+         * among them, as the arm below decides it (not from the chunk's
+         * flag); once found, the later chunks are not scanned. */
+        const uint32_t* p = (const uint32_t*)ray_data(col);
+        for (int64_t off = 0; off < n && !w->had_nulls; off += 8192) {
+            int64_t end = n - off < 8192 ? n : off + 8192;
+            uint32_t lo = UINT32_MAX;
+            for (int64_t i = off; i < end; i++) lo = p[i] < lo ? p[i] : lo;
+            if (!lo) w->had_nulls = true;
+        }
+        if (n && fwrite(p, sizeof(uint32_t), (size_t)n, w->fp) != (size_t)n)
+            return RAY_ERR_IO;
     } else if (w->type == RAY_SYM) {
         /* Encode cells as positions in the target symfile's domain:
          * resolve each cell through the chunk vec's own domain and
@@ -159,7 +190,8 @@ ray_err_t ray_col_stream_append(ray_col_stream_t* w,
          * A runtime-domain chunk vec goes through the id -> position
          * cache: only a value's first encounter pays the domain probe. */
         bool direct = ray_sym_vec_domain(col) == w->dom;
-        bool cached = ray_sym_vec_domain(col) == ray_sym_runtime_domain() && w->lut_id;
+        bool cached = !direct && ray_sym_vec_domain(col) == ray_sym_runtime_domain() &&
+                      ray_col_stream_lut(w);
         const void* cd = ray_data(col);
         uint32_t buf[8192];
         for (int64_t off = 0; off < n; ) {

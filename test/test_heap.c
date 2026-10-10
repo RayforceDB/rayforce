@@ -2666,6 +2666,141 @@ static test_result_t test_sys_alloc_watermark(void) {
     PASS();
 }
 
+/* ray_sys_alloc memory reads zero in every byte (mem/sys.h; the import
+ * dictionary's shard tables are not cleared): a small block, a large
+ * anonymous one and a large spilled one, each also right after a block of
+ * its size was written all over and freed. */
+static test_result_t test_sys_alloc_zero_fill(void) {
+#if defined(_WIN32)
+    SKIP("file-backed spill is POSIX-only");
+#endif
+    const size_t sizes[3] = { 8192 + 16, 4u * 1024 * 1024, 4u * 1024 * 1024 };
+    int64_t previous = ray_heap_anon_watermark();
+    int64_t nonzero = 0, wrong_path = 0;
+    for (int k = 0; k < 3; k++) {
+        bool spill = k == 2;
+        ray_heap_direct_cache_drain();
+        int64_t base = ray_heap_anon_committed();
+        ray_heap_set_anon_watermark(base + (spill ? INT64_C(1) << 20 : INT64_C(64) << 20));
+        for (int round = 0; round < 2; round++) {
+            uint64_t* p = (uint64_t*)ray_sys_alloc(sizes[k]);
+            TEST_ASSERT_NOT_NULL(p);
+            if ((ray_heap_anon_committed() == base) != spill) wrong_path++;
+            for (size_t i = 0; i < sizes[k] / 8; i++) if (p[i]) nonzero++;
+            memset(p, 0xa5, sizes[k]);
+            ray_sys_free(p);
+        }
+    }
+    ray_heap_set_anon_watermark(previous);
+    TEST_ASSERT_EQ_I(wrong_path, 0);
+    TEST_ASSERT_EQ_I(nonzero, 0);
+    PASS();
+}
+
+/* ray_raw_discard punches out of a spilled block's file the whole pages
+ * that lie in the range reported — they read zero after — and nothing else:
+ * not the first page (it holds the headers: the block still frees as a
+ * direct block), not a page the range only reaches into (it goes with the
+ * report that covers it), nothing past the block.  An anonymous block (the
+ * direct-block cache keeps it for its next use) and a small one are left as
+ * they are, and so is everything where the platform cannot punch a mapped
+ * range (no MADV_REMOVE: macOS) or the spill directory's filesystem cannot
+ * (NFS, ext3) — the call says whether it did, and the pages read zero
+ * exactly when it says so.  Whether the spill directory can is asked of it
+ * first (a scratch file there punched with fallocate, which MADV_REMOVE
+ * does on a mapping): where it can, a spilled block's discard must punch. */
+static bool raw_discard_dir_punches(void) {
+#if defined(__linux__) && defined(MADV_REMOVE) && defined(FALLOC_FL_PUNCH_HOLE)
+    /* the spill directory as ray_heap_init takes it */
+    const char* env = getenv("RAY_HEAP_SWAP");
+    if (!(env && *env)) env = getenv("TMPDIR");
+    const char* dir = env && *env ? env : "/tmp";
+    char path[4096];
+    if ((size_t)snprintf(path, sizeof(path), "%s/rf_punch_probe_XXXXXX", dir) >= sizeof(path)) return false;
+    int fd = mkstemp(path);
+    if (fd < 0) return false;
+    unlink(path);
+    long ps = sysconf(_SC_PAGESIZE);
+    off_t pg = ps > 0 ? (off_t)ps : 4096;
+    bool ok = fallocate(fd, 0, 0, 4 * pg) == 0 &&
+              fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, pg, 2 * pg) == 0;
+    close(fd);
+    return ok;
+#else
+    return false;
+#endif
+}
+static test_result_t test_raw_discard(void) {
+#if defined(_WIN32)
+    SKIP("file-backed spill is POSIX-only");
+#endif
+    const size_t big = 40u * 1024 * 1024;   /* past the pool order: a direct block */
+    long ps = sysconf(_SC_PAGESIZE);
+    size_t pg = ps > 0 ? (size_t)ps : 4096;
+    int64_t previous = ray_heap_anon_watermark();
+    int64_t bad = 0;
+    bool can_punch = raw_discard_dir_punches();
+    for (int k = 0; k < 2; k++) {
+        bool spill = k == 1;
+        ray_heap_direct_cache_drain();
+        int64_t base = ray_heap_anon_committed();
+        ray_mem_stats_t s0;
+        ray_mem_stats(&s0);
+        ray_heap_set_anon_watermark(base + (spill ? INT64_C(1) << 20 : INT64_C(256) << 20));
+        /* a neighbour mapped first: mappings grow down, so the block maps
+         * right below it and a report past the block's end would reach it */
+        uint8_t* g = (uint8_t*)ray_alloc_raw(big);
+        TEST_ASSERT_NOT_NULL(g);
+        memset(g, 0x77, big);
+        uint8_t* p = (uint8_t*)ray_alloc_raw(big);
+        TEST_ASSERT_NOT_NULL(p);
+        ray_t* v = (ray_t*)(p - 32);
+        if (!ray_is_direct(v) || ray_direct_file_backed(v) != spill) bad++;
+        memset(p, 0xa5, big);
+        size_t head = (size_t)((((uintptr_t)p + pg - 1) & ~(uintptr_t)(pg - 1)) - (uintptr_t)p);
+        /* three and a half pages past the first page boundary: three go */
+        size_t upto = head + 3 * pg + pg / 2;
+        bool punched = ray_raw_discard(p, 0, upto);
+        if (punched && !spill) bad++;         /* an anonymous block is never punched */
+        if (spill && can_punch && !punched) {   /* the directory punches: so must the discard */
+            fprintf(stderr, "  raw_discard: the spill directory punches a scratch file, the discard did not\n");
+            bad++;
+        }
+        for (size_t i = 0; i < big; i += 64)
+            if ((p[i] == 0) != (punched && i >= head && i < head + 3 * pg)) { bad++; break; }
+        /* the next report takes the page the first one reached into */
+        if (ray_raw_discard(p, upto, head + 6 * pg) != punched) bad++;
+        for (size_t i = 0; i < big; i += 64)
+            if ((p[i] == 0) != (punched && i >= head && i < head + 6 * pg)) { bad++; break; }
+        /* a report past the end stops at the block */
+        if (ray_raw_discard(p, head + 6 * pg, big + big / 2) != punched) bad++;
+        for (size_t i = 0; i < big; i += 64)
+            if ((p[i] == 0) != (punched && i >= head)) { bad++; break; }
+        for (size_t i = 0; i < big; i += 64) if (g[i] != 0x77) { bad++; break; }
+        if (v->type != RAY_U8 || v->len != (int64_t)big) bad++;
+        ray_free_raw(p);
+        ray_free_raw(g);
+        ray_heap_direct_cache_drain();
+        if (ray_heap_anon_committed() != base) bad++;
+        ray_mem_stats_t s1;   /* both freed as direct blocks, their mappings gone */
+        ray_mem_stats(&s1);
+        if (s1.direct_bytes != s0.direct_bytes || s1.direct_count != s0.direct_count) bad++;
+    }
+    ray_heap_set_anon_watermark(previous);
+    uint8_t* s = (uint8_t*)ray_alloc_raw(64 * 1024);   /* a buddy block: left alone */
+    TEST_ASSERT_NOT_NULL(s);
+    memset(s, 0x5a, 64 * 1024);
+    if (ray_raw_discard(s, 0, 64 * 1024)) bad++;
+    for (size_t i = 0; i < 64 * 1024; i++) if (s[i] != 0x5a) { bad++; break; }
+    ray_free_raw(s);
+    TEST_ASSERT_EQ_I(bad, 0);
+    /* Everything above held; but where the spill directory cannot punch (no
+     * MADV_REMOVE, or a filesystem such as NFS or ext3: its probe failed)
+     * the pages that should go were only checked to stay. */
+    if (!can_punch) SKIP("spill directory cannot punch a mapped range: the zeroing was not checked");
+    PASS();
+}
+
 /* ---- Statement-boundary relief (ray_heap_relieve) ----------------------
  *
  * The relief works on the calling thread's heap and the parked pool
@@ -3639,6 +3774,8 @@ const test_entry_t heap_entries[] = {
     { "heap/direct_cache_many_entries", test_direct_cache_many_entries, heap_setup, heap_teardown },
     { "heap/direct_cache_replaces_old", test_direct_cache_replaces_old_blocks, heap_setup, heap_teardown },
     { "heap/sys_alloc_watermark", test_sys_alloc_watermark, heap_setup, heap_teardown },
+    { "heap/sys_alloc_zero_fill", test_sys_alloc_zero_fill, heap_setup, heap_teardown },
+    { "heap/raw_discard", test_raw_discard, heap_setup, heap_teardown },
     { "heap/relieve_under_pressure", test_relieve_under_pressure, heap_setup, heap_teardown },
     { "heap/relieve_needs_room",       test_relieve_needs_room,          heap_setup, heap_teardown },
     { "heap/relieve_drains_flushes",   test_relieve_drains_and_flushes,  heap_setup, heap_teardown },

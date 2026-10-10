@@ -163,6 +163,13 @@ void  ray_vm_advise_willneed(void* ptr, size_t size);
  * (Linux sync_file_range WRITE; a no-op elsewhere): a later fsync then
  * finds them on disk. */
 void  ray_file_writeback_start(int fd, int64_t off, int64_t len);
+/* The I/O counters the converters' traces read: bytes read from and
+ * written to storage, written bytes whose writeback was cancelled, read and
+ * write calls, and major faults; of the process, or of the calling thread
+ * (thread true).  Linux reads /proc/self/io (/proc/thread-self/io) and
+ * getrusage; every field reads zero elsewhere, or where they cannot be read. */
+typedef struct { int64_t rd, wr, cwr, syscr, syscw, majflt; } ray_io_counters_t;
+void  ray_io_counters(bool thread, ray_io_counters_t* out);
 void  ray_sleep_ms(int ms);
 /* True when a sample of the pages of [ptr, ptr+size) is resident: a cheap
  * check (a handful of page probes) that a read-ahead would find nothing to

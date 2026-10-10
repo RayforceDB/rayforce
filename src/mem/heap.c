@@ -1937,6 +1937,34 @@ void ray_free_raw(void* p) {
     ray_free((ray_t*)((char*)p - 32));   /* 32 = ray_t header before the data */
 }
 
+bool ray_raw_discard(void* p, size_t from, size_t upto) {
+#if RAY_HEAP_FILE_SPILL && defined(MADV_REMOVE)
+    if (!p || upto <= from) return false;
+    ray_t* v = (ray_t*)((char*)p - 32);
+    /* An anonymous block is below the watermark, and the direct-block
+     * cache keeps it resident for its next use: left alone. */
+    if (!ray_is_direct(v) || !ray_direct_file_backed(v)) return false;
+    size_t room = ray_block_data_bytes(v);
+    if (upto > room) upto = room;
+    long ps = sysconf(_SC_PAGESIZE);
+    uintptr_t pg = ps > 0 ? (uintptr_t)ps : 4096;
+    /* whole pages only, and never the first: it holds the headers */
+    uintptr_t first = ((uintptr_t)p + pg - 1) & ~(pg - 1);
+    uintptr_t lo = ((uintptr_t)p + from) & ~(pg - 1);
+    uintptr_t hi = ((uintptr_t)p + upto) & ~(pg - 1);
+    if (lo < first) lo = first;
+    if (hi <= lo) return false;
+    /* punched out of the spill file: a dirty page is dropped, not written */
+    return madvise((void*)lo, hi - lo, MADV_REMOVE) == 0;
+#else
+    /* No way to punch a mapped range here (macOS has no MADV_REMOVE, and
+     * F_PUNCHHOLE does not say what it does to pages mapped shared): the
+     * pages stay until the block is freed, as before. */
+    (void)p; (void)from; (void)upto;
+    return false;
+#endif
+}
+
 void* ray_realloc_raw(void* p, size_t n) {
     if (!p) return ray_alloc_raw(n);
     ray_t* v = (ray_t*)((char*)p - 32);
@@ -2140,7 +2168,10 @@ static void heap_swap_dir(char* out, size_t cap) {
  * of RAY_SYS_SPILL_MIN bytes or more that would cross the watermark is mapped
  * over a spill file instead (#712), or taken from RAM when no spill file can be
  * made.  The file is unlinked and its descriptor closed at once — the mapping
- * keeps it — so spilled blocks hold no fds.
+ * keeps it — so spilled blocks hold no fds.  Either way the block reads zero
+ * (fresh anonymous memory, or a new file created O_EXCL and preallocated),
+ * which ray_sys_alloc promises its callers (mem/sys.h): it never comes from
+ * the direct-block cache.
  * -------------------------------------------------------------------------- */
 #define RAY_SYS_SPILL_MIN ((size_t)1 << 20)
 

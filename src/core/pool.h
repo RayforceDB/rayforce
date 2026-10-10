@@ -151,6 +151,7 @@ struct ray_pool {
     /* Barrier */
     _Atomic(uint32_t)  pending;       /* decremented by each task completion */
     ray_sem_t           work_ready;    /* workers sleep here */
+    ray_sem_t           started;       /* a signal from each worker once its heap is up */
 
     /* Query cancellation — set by ray_cancel(), checked per-morsel */
     _Atomic(uint32_t)  cancelled;

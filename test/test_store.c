@@ -44,10 +44,13 @@
 #include "core/sock.h"
 #include "core/platform.h"
 #include "core/runtime.h"
+#include "core/pool.h"
 #include "lang/eval.h"
 #include "lang/internal.h"
 #include "mem/sys.h"
 #include "table/sym.h"
+#include "table/domain.h"
+#include "ops/hash.h"     /* ray_hash_bytes: the import dictionary's full hashes */
 #include "vec/str.h"
 
 #ifndef RAY_OS_WINDOWS
@@ -1964,6 +1967,271 @@ static test_result_t test_stream_sentinel_publishes_has_nulls(void) {
     PASS();
 }
 
+/* SYM writer chunks.  A chunk already encoded over the writer's domain (a
+ * converter's own decode) is written as it is, W32 straight and narrower
+ * widths widened, and never makes the runtime id cache; a runtime-domain
+ * chunk makes it and gets its positions through it.  HAS_NULLS follows the
+ * positions written, not a chunk's flag: a flagged chunk without position 0
+ * publishes none, an unflagged one holding it, even in its last cell,
+ * publishes it. */
+static bool stream_sym_read(const char* path, ray_t* hdr, uint32_t* pos, int64_t n) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return false;
+    bool ok = fread(hdr, 1, 32, f) == 32 && (int64_t)fread(pos, 4, (size_t)n, f) == n;
+    fclose(f);
+    return ok;
+}
+static ray_t* stream_sym_chunk(ray_sym_domain_t* dom, int64_t n, uint8_t width) {
+    ray_t* v = ray_sym_vec_new(width, n);
+    if (!v || RAY_IS_ERR(v)) return NULL;
+    v->sym_domain = dom; ray_sym_domain_retain(dom);
+    v->len = n; v->attrs &= (uint8_t)~RAY_ATTR_HAS_NULLS;
+    return v;
+}
+static test_result_t test_stream_sym_chunks(void) {
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-stream-sym-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    char sp[200], path[200]; snprintf(sp, sizeof(sp), "%s/.sym", dir);
+    ray_sym_domain_t* dom = ray_sym_domain_open_or_create(sp);
+    TEST_ASSERT_NOT_NULL(dom);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom, "", 0), 0);
+    enum { K = 5 };
+    const char* words[K] = {"", "alpha", "beta", "a string past the inline bytes", "gamma"};
+    int64_t at[K], id[K];
+    for (int k = 0; k < K; k++) {
+        at[k] = ray_sym_domain_intern(dom, words[k], strlen(words[k]));
+        id[k] = ray_sym_intern(words[k], strlen(words[k]));
+        TEST_ASSERT_TRUE(at[k] >= 0 && id[k] >= 0);
+    }
+    int64_t n = 20000;   /* past the writer's 8192-cell buffer */
+    uint32_t* back = (uint32_t*)ray_sys_alloc((size_t)(3 * n) * sizeof(uint32_t));
+    TEST_ASSERT_NOT_NULL(back);
+    ray_t hdr;
+
+    /* "d": three chunks over the domain, none holding 0: W32 flagged, W32,
+     * then W16 (re-encoded to the file's W32) */
+    ray_t* c1 = stream_sym_chunk(dom, n, RAY_SYM_W32);
+    ray_t* c2 = stream_sym_chunk(dom, n, RAY_SYM_W32);
+    ray_t* c4 = stream_sym_chunk(dom, n, RAY_SYM_W16);
+    TEST_ASSERT_TRUE(c1 && c2 && c4);
+    for (int64_t i = 0; i < n; i++) {
+        ((uint32_t*)ray_data(c1))[i] = (uint32_t)at[1 + i % (K - 1)];
+        ((uint32_t*)ray_data(c2))[i] = (uint32_t)at[1 + (i * 3) % (K - 1)];
+        ((uint16_t*)ray_data(c4))[i] = (uint16_t)at[1 + (i * 5) % (K - 1)];
+    }
+    c1->attrs |= RAY_ATTR_HAS_NULLS;
+    ray_col_stream_t w;
+    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("d", 1), RAY_SYM, dom), RAY_OK);
+    TEST_ASSERT_NULL(w.lut_id);
+    TEST_ASSERT_EQ_I(ray_col_stream_append(&w, c1), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_append(&w, c2), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_append(&w, c4), RAY_OK);
+    TEST_ASSERT_NULL(w.lut_id);
+    TEST_ASSERT_EQ_I(ray_col_stream_close(&w, false), RAY_OK);
+    snprintf(path, sizeof(path), "%s/d", dir);
+    TEST_ASSERT_TRUE(stream_sym_read(path, &hdr, back, 3 * n));
+    TEST_ASSERT_EQ_I(hdr.type, RAY_SYM);
+    TEST_ASSERT_EQ_I(hdr.len, 3 * n);
+    TEST_ASSERT_FALSE(hdr.attrs & RAY_ATTR_HAS_NULLS);
+    TEST_ASSERT_EQ_I(memcmp(back, ray_data(c1), (size_t)n * 4), 0);
+    TEST_ASSERT_EQ_I(memcmp(back + n, ray_data(c2), (size_t)n * 4), 0);
+    int64_t bad = 0;
+    for (int64_t i = 0; i < n; i++)
+        if (back[2 * n + i] != ((uint16_t*)ray_data(c4))[i]) bad++;
+    TEST_ASSERT_EQ_I(bad, 0);
+
+    /* "r": an unflagged chunk over the domain whose only 0 is its last
+     * cell, then two runtime-domain chunks without "" (the cache made,
+     * then hit) */
+    ray_t* c3 = stream_sym_chunk(dom, n, RAY_SYM_W32);
+    ray_t* rt = ray_sym_vec_new(RAY_SYM_W64, n);
+    TEST_ASSERT_TRUE(c3 && rt && !RAY_IS_ERR(rt));
+    rt->len = n;
+    for (int64_t i = 0; i < n; i++) {
+        ((uint32_t*)ray_data(c3))[i] = (uint32_t)at[1 + i % (K - 1)];
+        ((int64_t*)ray_data(rt))[i] = id[1 + (i * 7) % (K - 1)];
+    }
+    ((uint32_t*)ray_data(c3))[n - 1] = 0;
+    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("r", 1), RAY_SYM, dom), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_append(&w, c3), RAY_OK);
+    TEST_ASSERT_NULL(w.lut_id);
+    TEST_ASSERT_EQ_I(ray_col_stream_append(&w, rt), RAY_OK);
+    TEST_ASSERT_NOT_NULL(w.lut_id);
+    TEST_ASSERT_EQ_I(ray_col_stream_append(&w, rt), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_close(&w, false), RAY_OK);
+    TEST_ASSERT_NULL(w.lut_id);
+    snprintf(path, sizeof(path), "%s/r", dir);
+    TEST_ASSERT_TRUE(stream_sym_read(path, &hdr, back, 3 * n));
+    TEST_ASSERT_EQ_I(hdr.len, 3 * n);
+    TEST_ASSERT_TRUE(hdr.attrs & RAY_ATTR_HAS_NULLS);
+    TEST_ASSERT_EQ_I(memcmp(back, ray_data(c3), (size_t)n * 4), 0);
+    for (int64_t i = 0; i < 2 * n; i++)
+        if (back[n + i] != (uint32_t)at[1 + ((i % n) * 7) % (K - 1)]) bad++;
+    TEST_ASSERT_EQ_I(bad, 0);
+
+    ray_release(c1); ray_release(c2); ray_release(c3); ray_release(c4); ray_release(rt);
+    ray_sys_free(back);
+    ray_sym_domain_release(dom);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+}
+
+/* STR chunks into a SYM writer: interned into the writer's domain, a batch
+ * of 8192 at a time.  The same 20000 strings (a few hundred distinct, "",
+ * repeats across batches) into a file domain and into an import dictionary
+ * domain (the direct import's, which keys on all 64 bits of the hash) give
+ * the same positions, first occurrence first; and the import dictionary
+ * then finds every string under its full hash (none added again). */
+static test_result_t test_stream_sym_from_str(void) {
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-stream-str-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    const int64_t n = 20000;
+    ray_t* col = ray_vec_new(RAY_STR, n);
+    TEST_ASSERT_FALSE(!col || RAY_IS_ERR(col));
+    char buf[64];
+    for (int64_t i = 0; i < n; i++) {
+        int len = i % 97 == 0 ? 0 : snprintf(buf, sizeof(buf), "%s-%lld", i % 3 ? "a string past the inline bytes" : "s",
+                                             (long long)((i * 7919) % 300));
+        col = ray_str_vec_append(col, buf, (size_t)len);
+        TEST_ASSERT_FALSE(!col || RAY_IS_ERR(col));
+    }
+    uint32_t* back[2] = {NULL, NULL};
+    char sp[200], path[200];
+    ray_sym_domain_t* dom[2] = {NULL, NULL};
+    for (int k = 0; k < 2; k++) {
+        snprintf(sp, sizeof(sp), "%s/.sym%d", dir, k);
+        dom[k] = k ? ray_sym_domain_create_import(sp) : ray_sym_domain_open_or_create(sp);
+        if (!dom[k]) { TEST_ASSERT_EQ_I(k, 1); break; }   /* no import dictionary here */
+        TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom[k], "", 0), 0);
+        ray_col_stream_t w;
+        TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern(k ? "i" : "f", 1), RAY_SYM, dom[k]), RAY_OK);
+        TEST_ASSERT_EQ_I(ray_col_stream_append(&w, col), RAY_OK);
+        TEST_ASSERT_EQ_I(ray_col_stream_close(&w, false), RAY_OK);
+        back[k] = (uint32_t*)ray_sys_alloc((size_t)n * sizeof(uint32_t));
+        TEST_ASSERT_NOT_NULL(back[k]);
+        ray_t hdr;
+        snprintf(path, sizeof(path), "%s/%s", dir, k ? "i" : "f");
+        TEST_ASSERT_TRUE(stream_sym_read(path, &hdr, back[k], n));
+        TEST_ASSERT_EQ_I(hdr.len, n);
+        TEST_ASSERT_TRUE(hdr.attrs & RAY_ATTR_HAS_NULLS);
+    }
+    int64_t bad = 0;
+    if (dom[1]) {
+        for (int64_t i = 0; i < n; i++) if (back[0][i] != back[1][i]) { bad++; break; }
+        /* every string found again under its full hash, at its position */
+        int64_t before = ray_sym_domain_count(dom[1]);
+        for (int64_t i = 0; i < n && !bad; i++) {
+            size_t len; const char* s = ray_str_vec_get(col, i, &len);
+            uint64_t h = ray_hash_bytes(s, len);
+            int64_t pos = -1;
+            if (!ray_sym_domain_intern_batch64(dom[1], 1, &s, &len, &h, &pos) || pos != (int64_t)back[1][i]) bad++;
+        }
+        if (ray_sym_domain_count(dom[1]) != before) bad++;
+    }
+    for (int k = 0; k < 2; k++) { if (dom[k]) ray_sym_domain_release(dom[k]); ray_sys_free(back[k]); }
+    ray_release(col);
+    (void)ray_test_rm_rf(dir);
+    TEST_ASSERT_EQ_I(bad, 0);
+    if (!dom[1]) SKIP("import dictionary unsupported here: the file domain only");
+    PASS();
+}
+/* A W32 chunk over another symbol file's domain is re-encoded string by
+ * string, at the writer's own width as at any other: its positions mean
+ * nothing in the writer's domain (the other file holds the same words in
+ * another order, and one more). */
+static test_result_t test_stream_sym_foreign(void) {
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-stream-symf-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    char sp[200], sp2[200], path[200];
+    snprintf(sp, sizeof(sp), "%s/.sym", dir); snprintf(sp2, sizeof(sp2), "%s/.sym2", dir);
+    ray_sym_domain_t* dom = ray_sym_domain_open_or_create(sp);
+    ray_sym_domain_t* other = ray_sym_domain_open_or_create(sp2);
+    TEST_ASSERT_TRUE(dom && other);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom, "", 0), 0);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(other, "", 0), 0);
+    enum { K = 5 };
+    const char* words[K] = {"alpha", "beta", "gamma", "a string past the inline bytes", "only in the other"};
+    int64_t at2[K];
+    for (int k = 0; k < K - 1; k++) TEST_ASSERT_TRUE(ray_sym_domain_intern(dom, words[k], strlen(words[k])) > 0);
+    for (int k = K - 1; k >= 0; k--) {
+        at2[k] = ray_sym_domain_intern(other, words[k], strlen(words[k]));
+        TEST_ASSERT_TRUE(at2[k] > 0);
+    }
+    int64_t n = 20000;
+    ray_t* c = stream_sym_chunk(other, n, RAY_SYM_W32);
+    TEST_ASSERT_NOT_NULL(c);
+    for (int64_t i = 0; i < n; i++) ((uint32_t*)ray_data(c))[i] = (uint32_t)at2[(i * 3) % K];
+    ray_col_stream_t w;
+    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("f", 1), RAY_SYM, dom), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_append(&w, c), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_close(&w, false), RAY_OK);
+    int64_t at[K];
+    for (int k = 0; k < K; k++) {
+        at[k] = ray_sym_domain_find(dom, words[k], strlen(words[k]));
+        TEST_ASSERT_TRUE(at[k] > 0);   /* the fifth added by the append */
+    }
+    uint32_t* back = (uint32_t*)ray_sys_alloc((size_t)n * sizeof(uint32_t));
+    TEST_ASSERT_NOT_NULL(back);
+    ray_t hdr;
+    snprintf(path, sizeof(path), "%s/f", dir);
+    TEST_ASSERT_TRUE(stream_sym_read(path, &hdr, back, n));
+    TEST_ASSERT_FALSE(hdr.attrs & RAY_ATTR_HAS_NULLS);
+    int64_t bad = 0;
+    for (int64_t i = 0; i < n; i++) if (back[i] != (uint32_t)at[(i * 3) % K]) bad++;
+    TEST_ASSERT_EQ_I(bad, 0);
+    ray_release(c); ray_sys_free(back);
+    ray_sym_domain_release(dom); ray_sym_domain_release(other);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+}
+
+/* The runtime id cache starts empty whatever its memory held: the blocks it
+ * is carved from were freed full of one runtime id, which must then be
+ * interned on first sight rather than read from a stale slot. */
+static test_result_t test_stream_sym_lut_stale(void) {
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-stream-syml-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    char sp[200], path[200]; snprintf(sp, sizeof(sp), "%s/.sym", dir);
+    ray_sym_domain_t* dom = ray_sym_domain_open_or_create(sp);
+    TEST_ASSERT_NOT_NULL(dom);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom, "", 0), 0);
+    TEST_ASSERT_TRUE(ray_sym_domain_intern(dom, "filler", 6) > 0);
+    int64_t x = ray_sym_intern("a stale runtime id", 18);
+    TEST_ASSERT_TRUE(x > 0);
+    /* blocks of the cache's two sizes (2^19 ids, 2^19 positions), freed full of x */
+    void* blk[8];
+    for (int i = 0; i < 8; i++) {
+        size_t sz = (size_t)1 << (i < 4 ? 22 : 21);
+        blk[i] = ray_alloc_raw(sz);
+        TEST_ASSERT_NOT_NULL(blk[i]);
+        for (size_t j = 0; j < sz / 8; j++) ((int64_t*)blk[i])[j] = x;
+    }
+    for (int i = 7; i >= 0; i--) ray_free_raw(blk[i]);
+    int64_t n = 1000;
+    ray_t* rt = ray_sym_vec_new(RAY_SYM_W64, n);
+    TEST_ASSERT_TRUE(rt && !RAY_IS_ERR(rt));
+    rt->len = n;
+    for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(rt))[i] = x;
+    ray_col_stream_t w;
+    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("l", 1), RAY_SYM, dom), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_append(&w, rt), RAY_OK);
+    TEST_ASSERT_NOT_NULL(w.lut_id);
+    TEST_ASSERT_EQ_I(ray_col_stream_close(&w, false), RAY_OK);
+    int64_t want = ray_sym_domain_find(dom, "a stale runtime id", 18);
+    TEST_ASSERT_EQ_I(want, 2);
+    uint32_t back[1000];
+    ray_t hdr;
+    snprintf(path, sizeof(path), "%s/l", dir);
+    TEST_ASSERT_TRUE(stream_sym_read(path, &hdr, back, n));
+    int64_t bad = 0;
+    for (int64_t i = 0; i < n; i++) if (back[i] != (uint32_t)want) bad++;
+    TEST_ASSERT_EQ_I(bad, 0);
+    ray_release(rt);
+    ray_sym_domain_release(dom);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+}
+
 /* An index region that cannot be written (ENOSPC/EFBIG) is dropped: close
  * cuts the file back to the payload and publishes the column without the
  * index.  Everything runs in the forked child so no FILE* state is shared
@@ -2032,6 +2300,9 @@ static test_result_t test_stream_inline_zone_one_chunk(void) {
     PASS();
 }
 
+static bool store_files_same(const char* a, const char* b);
+static ray_err_t store_hash_append_legacy(const char* path);
+
 /* Unclustered I64 over four chunks: no inline index, the zone is kept and
  * wants_hash set; ray_splay_hash_column then appends a hash. */
 static test_result_t test_stream_hash_candidate(void) {
@@ -2057,7 +2328,531 @@ static test_result_t test_stream_hash_candidate(void) {
     back = ray_col_mmap(path);
     TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
     TEST_ASSERT_EQ_I(ray_index_kind(back), RAY_IDX_HASH);
-    ray_release(back); ray_release(v);
+    ray_release(back);
+    /* the file is the one the in-memory build appended before */
+    char ref[200]; snprintf(ref, sizeof(ref), "%s/ref", dir);
+    TEST_ASSERT_EQ_I(ray_col_save_bulk(v, ref), RAY_OK);
+    TEST_ASSERT_EQ_I(store_hash_append_legacy(ref), RAY_OK);
+    TEST_ASSERT_TRUE(store_files_same(path, ref));
+    ray_release(v);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+}
+
+/* ---- hash index built in place in the column file ---------------------- */
+
+/* n rows of `type` keyed as idx_reg_col in test_index.c: keys spread over
+ * `keys` values, every null_every-th row null.  SYM ids stay below the
+ * interned count (the bare mmap validates them). */
+static ray_t* store_hash_col(int8_t type, int64_t n, int64_t keys, int64_t null_every) {
+    ray_t* v = type == RAY_SYM ? ray_sym_vec_new(RAY_SYM_W32, n > 0 ? n : 1)
+                               : ray_vec_new(type, n > 0 ? n : 1);
+    if (!v || RAY_IS_ERR(v)) return v;
+    v->len = n;
+    void* d = ray_data(v);
+    for (int64_t i = 0; i < n; i++) {
+        int64_t k = (int64_t)(((uint64_t)i * 2654435761ull) % (uint64_t)keys) - keys / 3;
+        switch (type) {
+        case RAY_I32: case RAY_DATE: ((int32_t*)d)[i] = (int32_t)k; break;
+        case RAY_I64: case RAY_TIMESTAMP: ((int64_t*)d)[i] = k * 1000003; break;
+        case RAY_F64: ((double*)d)[i] = (double)k * 0.25; break;
+        case RAY_SYM: ((uint32_t*)d)[i] = (uint32_t)(k + keys / 3 + 1); break;
+        default: break;
+        }
+    }
+    for (int64_t i = 0; null_every && i < n; i += null_every)
+        if (ray_vec_set_null_checked(v, i, true) != RAY_OK) { ray_release(v); return NULL; }
+    return v;
+}
+
+/* Files `a` and `b` hold the same bytes. */
+static bool store_files_same(const char* a, const char* b) {
+    struct stat sa, sb;
+    if (stat(a, &sa) != 0 || stat(b, &sb) != 0 || sa.st_size != sb.st_size) return false;
+    size_t sz = (size_t)sa.st_size;
+    uint8_t* ba = (uint8_t*)ray_alloc_raw(sz ? sz : 1);
+    uint8_t* bb = (uint8_t*)ray_alloc_raw(sz ? sz : 1);
+    FILE* fa = fopen(a, "rb");
+    FILE* fb = fopen(b, "rb");
+    bool ok = ba && bb && fa && fb && fread(ba, 1, sz, fa) == sz &&
+              fread(bb, 1, sz, fb) == sz && memcmp(ba, bb, sz) == 0;
+    if (fa) fclose(fa);
+    if (fb) fclose(fb);
+    ray_free_raw(ba); ray_free_raw(bb);
+    return ok;
+}
+
+/* The hash index appended to index-less column file `path` as before the
+ * in-place build: attached to the mapped column, then copied into the file.
+ * Built under a small budget, so a column of more than one batch takes the
+ * route the in-memory build always took — arrays at the key count, cut to
+ * the groups after — and not the sizes the in-place build computes. */
+static ray_err_t store_hash_append_legacy(const char* path) {
+    ray_t* col = ray_col_mmap(path);
+    if (!col || RAY_IS_ERR(col)) { if (col) ray_error_free(col); return RAY_ERR_IO; }
+    int64_t wm = ray_heap_anon_watermark();
+    ray_heap_set_anon_watermark(INT64_C(4) << 20);
+    ray_t* r = ray_index_attach_hash(&col);
+    ray_heap_set_anon_watermark(wm);
+    ray_err_t err = RAY_ERR_OOM;
+    if (!RAY_IS_ERR(r))
+        err = ray_col_append_index(path, ray_index_payload(col->index), col->len, col->type);
+    else
+        ray_error_free(r);
+    ray_release(col);
+    return err;
+}
+
+/* The same, built in place over the mapped column. */
+static ray_err_t store_hash_build(const char* path) {
+    ray_t* col = ray_col_mmap(path);
+    if (!col || RAY_IS_ERR(col)) { if (col) ray_error_free(col); return RAY_ERR_IO; }
+    ray_err_t err = ray_col_build_hash_index(path, col, NULL);
+    ray_release(col);
+    return err;
+}
+
+static int64_t store_file_size(const char* path) {
+    struct stat st;
+    return stat(path, &st) == 0 ? (int64_t)st.st_size : -1;
+}
+
+/* Does `dir` take the in-place build (Linux, a filesystem whose fallocate
+ * holds the blocks)?  Probed with a small column. */
+static bool store_in_place(const char* dir) {
+    char p[240];
+    snprintf(p, sizeof(p), "%s/.probe", dir);
+    ray_t* v = store_hash_col(RAY_I64, 1000, 10, 0);
+    bool ok = v && !RAY_IS_ERR(v) && ray_col_save_bulk(v, p) == RAY_OK &&
+              store_hash_build(p) == RAY_OK;
+    if (v && !RAY_IS_ERR(v)) ray_release(v);
+    unlink(p);
+    return ok;
+}
+
+/* Built in place, the column file holds exactly the bytes the in-memory
+ * build appended — numeric, temporal, float with nulls, SYM ids, every key
+ * distinct or few — with one batch and with many (the counting pass), and
+ * the index loads and answers.  Where the in-place build does not apply,
+ * the same through ray_splay_hash_column's in-memory route. */
+static test_result_t test_col_build_hash_index_bytes(void) {
+    (void)ray_pool_get();
+    char name[16];
+    for (int i = 0; i < 2000; i++) {   /* SYM ids below the interned count */
+        int l = snprintf(name, sizeof(name), "hx%d", i);
+        TEST_ASSERT_TRUE(ray_sym_intern(name, (size_t)l) >= 0);
+    }
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-hidx-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    bool in_place = store_in_place(dir);
+    char a[200], b[200];
+    snprintf(a, sizeof(a), "%s/a", dir);
+    snprintf(b, sizeof(b), "%s/b", dir);
+    static const struct { int8_t type; int64_t n, keys, null_every; } shapes[] = {
+        { RAY_I64, 200000, 200000, 0 }, { RAY_I64, 300000, 5003, 977 },
+        { RAY_I32, 1000, 10, 0 },       { RAY_TIMESTAMP, 90000, 70001, 0 },
+        { RAY_F64, 100000, 2003, 101 }, { RAY_SYM, 120000, 997, 0 },
+        { RAY_I64, 1, 1, 0 },
+    };
+    int64_t bad = 0;
+    for (int plan = 0; plan < 2; plan++) {
+        if (plan == 1) ray_heap_set_anon_watermark(INT64_C(4) << 20);
+        for (size_t s = 0; s < sizeof(shapes) / sizeof(shapes[0]); s++) {
+            ray_t* v = store_hash_col(shapes[s].type, shapes[s].n, shapes[s].keys, shapes[s].null_every);
+            if (!v || RAY_IS_ERR(v)) { bad++; continue; }
+            if (ray_col_save_bulk(v, a) != RAY_OK || ray_col_save_bulk(v, b) != RAY_OK) bad++;
+            int64_t payload = store_file_size(a);
+            ray_err_t e = in_place ? store_hash_build(a) : ray_splay_hash_column(a, NULL);
+            if (e != RAY_OK || store_hash_append_legacy(b) != RAY_OK) bad++;
+            if (!store_files_same(a, b) || store_file_size(a) <= payload) bad++;
+            ray_t* m = ray_col_mmap(a);
+            if (!m || RAY_IS_ERR(m) || ray_index_kind(m) != RAY_IDX_HASH) bad++;
+            else if ((shapes[s].type == RAY_I64 || shapes[s].type == RAY_TIMESTAMP) && shapes[s].n > 2) {
+                /* row 2's key finds its group, row 2 among its rows */
+                int64_t key = ((int64_t*)ray_data(m))[2];
+                ray_idx_rows_t rows = { NULL, false }; int64_t gn = 0, hit = 0;
+                if (ray_index_hash_group(m, key, &rows, &gn) != 1) bad++;
+                for (int64_t j = 0; j < gn; j++) hit += ray_idx_rows_at(rows, j) == 2;
+                if (hit != 1) bad++;
+            }
+            if (m && !RAY_IS_ERR(m)) ray_release(m); else if (m) ray_error_free(m);
+            ray_release(v);
+        }
+        if (plan == 1) ray_heap_set_anon_watermark(0);
+    }
+    TEST_ASSERT_EQ_I(bad, 0);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+}
+
+/* A file that already carries an index is refused and left as it is; a
+ * STR column is not built in place (the caller takes the in-memory path)
+ * and its file is not touched. */
+static test_result_t test_col_build_hash_index_refusals(void) {
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-hidx-ref-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    char p[200]; snprintf(p, sizeof(p), "%s/a", dir);
+    ray_t* m = NULL;
+    if (store_in_place(dir)) {
+        ray_t* v = store_hash_col(RAY_I64, 100000, 5003, 0);
+        TEST_ASSERT_EQ_I(ray_col_save_bulk(v, p), RAY_OK);
+        TEST_ASSERT_EQ_I(store_hash_build(p), RAY_OK);
+        int64_t indexed = store_file_size(p);
+        TEST_ASSERT_EQ_I(store_hash_build(p), RAY_ERR_CORRUPT);
+        TEST_ASSERT_EQ_I(store_file_size(p), indexed);
+        m = ray_col_mmap(p);
+        TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m));
+        TEST_ASSERT_EQ_I(ray_index_kind(m), RAY_IDX_HASH);
+        ray_release(m);
+        ray_release(v);
+    }
+
+    ray_t* s = ray_vec_new(RAY_STR, 4);
+    s = ray_str_vec_append(s, "alpha", 5);
+    s = ray_str_vec_append(s, "beta", 4);
+    char q[200]; snprintf(q, sizeof(q), "%s/s", dir);
+    TEST_ASSERT_EQ_I(ray_col_save_bulk(s, q), RAY_OK);
+    int64_t plain = store_file_size(q);
+    TEST_ASSERT_EQ_I(store_hash_build(q), RAY_ERR_NYI);
+    TEST_ASSERT_EQ_I(store_file_size(q), plain);
+    /* ray_splay_hash_column takes the in-memory path for it */
+    TEST_ASSERT_EQ_I(ray_splay_hash_column(q, NULL), RAY_OK);
+    m = ray_col_mmap(q);
+    TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m));
+    TEST_ASSERT_EQ_I(ray_index_kind(m), RAY_IDX_HASH);
+    ray_release(m);
+    ray_release(s);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+}
+
+/* On a filesystem the in-place build does not trust (copy-on-write,
+ * network, user — or any platform but Linux) it leaves the file alone, and
+ * ray_splay_hash_column builds the index in memory and appends it: the same
+ * bytes.  Debug builds pretend the filesystem is untrusted. */
+static test_result_t test_col_build_hash_index_untrusted_fs(void) {
+#if defined(RAY_OS_LINUX) && !defined(DEBUG)
+    SKIP("RAY_HASH_INJECT is read by debug builds only");
+#endif
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-hidx-fs-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    char a[200], b[200];
+    snprintf(a, sizeof(a), "%s/a", dir);
+    snprintf(b, sizeof(b), "%s/b", dir);
+#if defined(DEBUG)
+    TEST_ASSERT_EQ_I(setenv("RAY_HASH_INJECT", "fs", 1), 0);
+#endif
+    ray_t* v = store_hash_col(RAY_I64, 300000, 5003, 977);
+    TEST_ASSERT_EQ_I(ray_col_save_bulk(v, a), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save_bulk(v, b), RAY_OK);
+    int64_t payload = store_file_size(a);
+    ray_err_t direct = store_hash_build(a);
+    int64_t after = store_file_size(a);
+    ray_err_t routed = ray_splay_hash_column(a, NULL);
+#if defined(DEBUG)
+    unsetenv("RAY_HASH_INJECT");
+#endif
+    TEST_ASSERT_EQ_I(direct, RAY_ERR_NYI);
+    TEST_ASSERT_EQ_I(after, payload);
+    TEST_ASSERT_EQ_I(routed, RAY_OK);
+    TEST_ASSERT_EQ_I(store_hash_append_legacy(b), RAY_OK);
+    TEST_ASSERT_TRUE(store_files_same(a, b));
+    ray_t* m = ray_col_mmap(a);
+    TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m));
+    TEST_ASSERT_EQ_I(ray_index_kind(m), RAY_IDX_HASH);
+    ray_release(m);
+    ray_release(v);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+}
+
+/* Which filesystems the in-place build trusts, by the type fstatfs reports
+ * (debug builds stand an injected type in for the real one, so the ones no
+ * test can mount are classified too): ext4, xfs and tmpfs, whose fallocate
+ * holds the blocks; not overlayfs, whose upper layer cannot be told, nor
+ * the copy-on-write, network and user filesystems.  An untrusted one leaves
+ * the file at its payload. */
+static test_result_t test_col_build_hash_index_fs_types(void) {
+#if defined(DEBUG) && defined(RAY_OS_LINUX)
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-hidx-fst-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    if (!store_in_place(dir)) { (void)ray_test_rm_rf(dir); SKIP("no in-place build on this filesystem"); }
+    char p[200]; snprintf(p, sizeof(p), "%s/a", dir);
+    static const struct { const char* inject; bool trusted; } types[] = {
+        { "fs:ef53",     true  },   /* ext2/3/4 */
+        { "fs:58465342", true  },   /* xfs */
+        { "fs:1021994",  true  },   /* tmpfs */
+        { "fs:794c7630", false },   /* overlayfs */
+        { "fs:9123683e", false },   /* btrfs */
+        { "fs:2fc12fc1", false },   /* zfs */
+        { "fs:ca451a4e", false },   /* bcachefs */
+        { "fs:6969",     false },   /* nfs */
+        { "fs:ff534d42", false },   /* cifs */
+        { "fs:fe534d42", false },   /* smb2 */
+        { "fs:65735546", false },   /* fuse */
+        { "fs:c36400",   false },   /* ceph */
+    };
+    ray_t* v = store_hash_col(RAY_I64, 1000, 10, 0);
+    int64_t bad = 0;
+    for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
+        if (ray_col_save_bulk(v, p) != RAY_OK) { bad++; continue; }
+        int64_t payload = store_file_size(p);
+        TEST_ASSERT_EQ_I(setenv("RAY_HASH_INJECT", types[i].inject, 1), 0);
+        ray_err_t e = store_hash_build(p);
+        unsetenv("RAY_HASH_INJECT");
+        if (types[i].trusted ? (e != RAY_OK || store_file_size(p) <= payload)
+                             : (e != RAY_ERR_NYI || store_file_size(p) != payload)) bad++;
+    }
+    ray_release(v);
+    TEST_ASSERT_EQ_I(bad, 0);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+#else
+    SKIP("needs a debug build on Linux");
+#endif
+}
+
+/* A region that cannot be allocated or mapped this time (debug builds
+ * inject either) does not cost the column its hash index: the in-place
+ * build gives way (NYI, the file at its payload) and ray_splay_hash_column
+ * and a splayed save build it in memory and append it — the same bytes. */
+static test_result_t test_col_build_hash_index_refused(void) {
+#if defined(DEBUG)
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-hidx-ref2-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    if (!store_in_place(dir)) { (void)ray_test_rm_rf(dir); SKIP("no in-place build on this filesystem"); }
+    char a[200], b[200];
+    snprintf(a, sizeof(a), "%s/a", dir);
+    snprintf(b, sizeof(b), "%s/b", dir);
+    ray_t* v = store_hash_col(RAY_I64, 300000, 5003, 977);
+    static const char* steps[2] = { "grow", "map" };
+    int64_t bad = 0;
+    for (int plan = 0; plan < 2; plan++) {          /* one batch; the counting pass first */
+        if (plan == 1) ray_heap_set_anon_watermark(INT64_C(4) << 20);
+        for (int s = 0; s < 2; s++) {
+            if (ray_col_save_bulk(v, a) != RAY_OK || ray_col_save_bulk(v, b) != RAY_OK) bad++;
+            int64_t payload = store_file_size(a);
+            TEST_ASSERT_EQ_I(setenv("RAY_HASH_INJECT", steps[s], 1), 0);
+            ray_err_t direct = store_hash_build(a);
+            int64_t after = store_file_size(a);
+            ray_err_t routed = ray_splay_hash_column(a, NULL);
+            unsetenv("RAY_HASH_INJECT");
+            if (direct != RAY_ERR_NYI || after != payload || routed != RAY_OK) bad++;
+            if (store_hash_append_legacy(b) != RAY_OK || !store_files_same(a, b)) bad++;
+            ray_t* m = ray_col_mmap(a);
+            if (!m || RAY_IS_ERR(m) || ray_index_kind(m) != RAY_IDX_HASH) bad++;
+            if (m && !RAY_IS_ERR(m)) ray_release(m); else if (m) ray_error_free(m);
+        }
+        if (plan == 1) ray_heap_set_anon_watermark(0);
+    }
+    /* a splayed save under the same refusal still hashes the column */
+    int64_t name = ray_sym_intern("k", 1);
+    ray_t* t = ray_table_new(1);
+    t = ray_table_add_col(t, name, v);
+    char sd[200]; snprintf(sd, sizeof(sd), "%s/t", dir);
+    TEST_ASSERT_EQ_I(setenv("RAY_HASH_INJECT", "map", 1), 0);
+    ray_err_t se = ray_splay_save(t, sd, NULL);
+    unsetenv("RAY_HASH_INJECT");
+    TEST_ASSERT_EQ_I(se, RAY_OK);
+    ray_t* back = ray_read_splayed(sd, NULL);
+    TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
+    if (ray_index_kind(ray_table_get_col(back, name)) != RAY_IDX_HASH) bad++;
+    ray_release(back);
+    ray_release(t);
+    ray_release(v);
+    TEST_ASSERT_EQ_I(bad, 0);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+#else
+    SKIP("RAY_HASH_INJECT is read by debug builds only");
+#endif
+}
+
+/* A build that fails once the region is allocated and mapped (debug
+ * builds raise an interrupt right there) cuts the file back to its payload:
+ * it loads unindexed and builds again after.  One batch and many. */
+static test_result_t test_col_build_hash_index_truncate(void) {
+#if defined(DEBUG)
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-hidx-tr-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    if (!store_in_place(dir)) { (void)ray_test_rm_rf(dir); SKIP("no in-place build on this filesystem"); }
+    char p[200]; snprintf(p, sizeof(p), "%s/a", dir);
+    ray_t* v = store_hash_col(RAY_I64, 300000, 5003, 977);
+    int64_t bad = 0;
+    for (int plan = 0; plan < 2; plan++) {
+        if (plan == 1) ray_heap_set_anon_watermark(INT64_C(4) << 20);
+        if (ray_col_save_bulk(v, p) != RAY_OK) bad++;
+        int64_t payload = store_file_size(p);
+        TEST_ASSERT_EQ_I(setenv("RAY_HASH_INJECT", "build", 1), 0);
+        ray_err_t e = store_hash_build(p);
+        unsetenv("RAY_HASH_INJECT");
+        ray_clear_interrupt();
+        if (e != RAY_ERR_CANCEL || store_file_size(p) != payload) bad++;
+        ray_t* back = ray_col_mmap(p);
+        if (!back || RAY_IS_ERR(back) || (back->attrs & RAY_ATTR_HAS_INDEX) || back->len != 300000) bad++;
+        if (back && !RAY_IS_ERR(back)) ray_release(back); else if (back) ray_error_free(back);
+        if (store_hash_build(p) != RAY_OK) bad++;
+        back = ray_col_mmap(p);
+        if (!back || RAY_IS_ERR(back) || ray_index_kind(back) != RAY_IDX_HASH) bad++;
+        if (back && !RAY_IS_ERR(back)) ray_release(back); else if (back) ray_error_free(back);
+        if (plan == 1) ray_heap_set_anon_watermark(0);
+    }
+    ray_release(v);
+    TEST_ASSERT_EQ_I(bad, 0);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+#else
+    SKIP("RAY_HASH_INJECT is read by debug builds only");
+#endif
+}
+
+/* The marker goes on last: a process that ends with the whole region
+ * written but before the marker (debug builds end it right there, in a
+ * child) leaves a file that does not claim an index.  The column is under
+ * the parallel threshold: the child has no pool workers. */
+static test_result_t test_col_build_hash_index_marker_last(void) {
+#if defined(DEBUG) && defined(RAY_OS_LINUX)
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-hidx-mk-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    if (!store_in_place(dir)) { (void)ray_test_rm_rf(dir); SKIP("no in-place build on this filesystem"); }
+    char p[200], r[200];
+    snprintf(p, sizeof(p), "%s/a", dir);
+    snprintf(r, sizeof(r), "%s/ref", dir);
+    ray_t* v = store_hash_col(RAY_I64, 50000, 997, 0);
+    TEST_ASSERT_EQ_I(ray_col_save_bulk(v, p), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save_bulk(v, r), RAY_OK);
+    int64_t payload = store_file_size(p);
+    TEST_ASSERT_EQ_I(store_hash_build(r), RAY_OK);
+    pid_t pid = fork(); TEST_ASSERT_TRUE(pid >= 0);
+    if (!pid) {
+        if (setenv("RAY_HASH_INJECT", "premarker", 1)) _exit(2);
+        (void)store_hash_build(p);
+        _exit(3);                                  /* not reached: it ends inside */
+    }
+    int status;
+    TEST_ASSERT_EQ_I(waitpid(pid, &status, 0), pid);
+    TEST_ASSERT_TRUE(WIFEXITED(status)); TEST_ASSERT_EQ_I(WEXITSTATUS(status), 86);
+    /* the whole region is there, the header claims nothing */
+    TEST_ASSERT_EQ_I(store_file_size(p), store_file_size(r));
+    TEST_ASSERT_TRUE(store_file_size(p) > payload);
+    uint32_t mp = 0, mr = 0;
+    FILE* f = fopen(p, "rb"); TEST_ASSERT_NOT_NULL(f);
+    TEST_ASSERT_EQ_I((int64_t)fread(&mp, 1, 4, f), 4); fclose(f);
+    f = fopen(r, "rb"); TEST_ASSERT_NOT_NULL(f);
+    TEST_ASSERT_EQ_I((int64_t)fread(&mr, 1, 4, f), 4); fclose(f);
+    TEST_ASSERT_TRUE(mr != 0);          /* the finished file's marker */
+    TEST_ASSERT_TRUE(mp != mr);
+    ray_t* back = ray_col_mmap(p);      /* longer than its payload, unclaimed: refused */
+    TEST_ASSERT_TRUE(back && RAY_IS_ERR(back));
+    ray_error_free(back);
+    ray_release(v);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+#else
+    SKIP("needs a debug build on Linux");
+#endif
+}
+
+/* The region's blocks cannot be allocated past RLIMIT_FSIZE (a full disk
+ * alike): the in-place build says so (NYI: the caller builds in memory),
+ * the file is left at its payload, loads unindexed, and builds once there
+ * is room.  The column is under the parallel threshold: the child has no
+ * pool workers. */
+static test_result_t test_col_build_hash_index_rollback(void) {
+#ifdef RAY_OS_LINUX
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-hidx-rb-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    if (!store_in_place(dir)) { (void)ray_test_rm_rf(dir); SKIP("no in-place build on this filesystem"); }
+    char p[200]; snprintf(p, sizeof(p), "%s/a", dir);
+    int64_t n = 50000;
+    ray_t* v = store_hash_col(RAY_I64, n, 997, 0);
+    TEST_ASSERT_EQ_I(ray_col_save_bulk(v, p), RAY_OK);
+    int64_t payload = store_file_size(p);
+    pid_t pid = fork(); TEST_ASSERT_TRUE(pid >= 0);
+    if (!pid) {
+        struct rlimit limit;
+        if (getrlimit(RLIMIT_FSIZE, &limit)) _exit(2);
+        limit.rlim_cur = (rlim_t)payload + 40;     /* the pad fits, the region doesn't */
+        if (signal(SIGXFSZ, SIG_IGN) == SIG_ERR || setrlimit(RLIMIT_FSIZE, &limit)) _exit(2);
+        _exit(store_hash_build(p) == RAY_ERR_NYI ? 0 : 1);
+    }
+    int status;
+    TEST_ASSERT_EQ_I(waitpid(pid, &status, 0), pid);
+    TEST_ASSERT_TRUE(WIFEXITED(status)); TEST_ASSERT_EQ_I(WEXITSTATUS(status), 0);
+    TEST_ASSERT_EQ_I(store_file_size(p), payload);
+    ray_t* back = ray_col_mmap(p);
+    TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
+    TEST_ASSERT_FALSE(back->attrs & RAY_ATTR_HAS_INDEX);
+    TEST_ASSERT_EQ_I(back->len, n);
+    ray_release(back);
+    TEST_ASSERT_EQ_I(store_hash_build(p), RAY_OK);
+    back = ray_col_mmap(p);
+    TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
+    TEST_ASSERT_EQ_I(ray_index_kind(back), RAY_IDX_HASH);
+    ray_release(back);
+    ray_release(v);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+#else
+    SKIP("requires Linux RLIMIT_FSIZE fault injection");
+#endif
+}
+
+/* Interrupted at points spread over a build under a budget of many
+ * batches — before the region is laid out, while it is filled — the build
+ * reports the cancel and the file is back at its payload, or it completes
+ * with the uninterrupted bytes. */
+static void store_interrupt_after(void* arg) {
+    int64_t ns = *(const int64_t*)arg;
+    struct timespec ts = { (time_t)(ns / 1000000000), (long)(ns % 1000000000) };
+    nanosleep(&ts, NULL);
+    ray_request_interrupt();
+}
+static int64_t store_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+static test_result_t test_col_build_hash_index_interrupt(void) {
+    ray_pool_t* pool = ray_pool_get();
+    if (!pool || ray_pool_total_workers(pool) < 2) SKIP("needs workers");
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-hidx-int-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    if (!store_in_place(dir)) { (void)ray_test_rm_rf(dir); SKIP("no in-place build on this filesystem"); }
+    char p[200], r[200];
+    snprintf(p, sizeof(p), "%s/a", dir);
+    snprintf(r, sizeof(r), "%s/ref", dir);
+    ray_t* v = store_hash_col(RAY_I64, 500000, 70001, 1013);
+    ray_heap_set_anon_watermark(INT64_C(64) << 20);   /* batches of 128K rows */
+    TEST_ASSERT_EQ_I(ray_col_save_bulk(v, r), RAY_OK);
+    int64_t payload = store_file_size(r);
+    atomic_store(&pool->cancelled, 1);
+    TEST_ASSERT_EQ_I(store_hash_build(r), RAY_ERR_CANCEL);
+    atomic_store(&pool->cancelled, 0);
+    TEST_ASSERT_EQ_I(store_file_size(r), payload);
+    int64_t t0 = store_now_ns();
+    TEST_ASSERT_EQ_I(store_hash_build(r), RAY_OK);
+    int64_t took = store_now_ns() - t0;
+    int64_t cancelled = 0, bad = 0;
+    for (int k = 0; k < 8; k++) {
+        if (ray_col_save_bulk(v, p) != RAY_OK) { bad++; continue; }
+        int64_t delay = took * k / 8;
+        ray_thread_t th;
+        TEST_ASSERT_EQ_I(ray_thread_create(&th, store_interrupt_after, &delay), RAY_OK);
+        ray_err_t e = store_hash_build(p);
+        ray_thread_join(th);
+        ray_clear_interrupt();
+        if (e == RAY_OK) { if (!store_files_same(p, r)) bad++; continue; }
+        cancelled++;
+        if (e != RAY_ERR_CANCEL || store_file_size(p) != payload) bad++;
+        ray_t* back = ray_col_mmap(p);
+        if (!back || RAY_IS_ERR(back) || (back->attrs & RAY_ATTR_HAS_INDEX)) bad++;
+        if (back && !RAY_IS_ERR(back)) ray_release(back); else if (back) ray_error_free(back);
+    }
+    ray_heap_set_anon_watermark(0);
+    TEST_ASSERT_EQ_I(bad, 0);
+    TEST_ASSERT_TRUE(cancelled > 0);
+    ray_release(v);
     (void)ray_test_rm_rf(dir);
     PASS();
 }
@@ -6262,9 +7057,22 @@ const test_entry_t store_entries[] = {
     { "store/stream_inline_zone", test_stream_inline_zone, store_setup, store_teardown },
     { "store/zone_acc_sentinel_without_flag", test_zone_acc_sentinel_without_flag, store_setup, store_teardown },
     { "store/stream_sentinel_has_nulls", test_stream_sentinel_publishes_has_nulls, store_setup, store_teardown },
+    { "store/stream_sym_chunks", test_stream_sym_chunks, store_setup, store_teardown },
+    { "store/stream_sym_from_str", test_stream_sym_from_str, store_setup, store_teardown },
+    { "store/stream_sym_foreign", test_stream_sym_foreign, store_setup, store_teardown },
+    { "store/stream_sym_lut_stale", test_stream_sym_lut_stale, store_setup, store_teardown },
     { "store/stream_index_write_failure", test_stream_index_write_failure_drops_index, store_setup, store_teardown },
     { "store/stream_inline_zone_one_chunk", test_stream_inline_zone_one_chunk, store_setup, store_teardown },
     { "store/stream_hash_candidate", test_stream_hash_candidate, store_setup, store_teardown },
+    { "store/col_build_hash_index_bytes", test_col_build_hash_index_bytes, store_setup, store_teardown },
+    { "store/col_build_hash_index_refusals", test_col_build_hash_index_refusals, store_setup, store_teardown },
+    { "store/col_build_hash_index_untrusted_fs", test_col_build_hash_index_untrusted_fs, store_setup, store_teardown },
+    { "store/col_build_hash_index_fs_types", test_col_build_hash_index_fs_types, store_setup, store_teardown },
+    { "store/col_build_hash_index_refused", test_col_build_hash_index_refused, store_setup, store_teardown },
+    { "store/col_build_hash_index_truncate", test_col_build_hash_index_truncate, store_setup, store_teardown },
+    { "store/col_build_hash_index_marker_last", test_col_build_hash_index_marker_last, store_setup, store_teardown },
+    { "store/col_build_hash_index_rollback", test_col_build_hash_index_rollback, store_setup, store_teardown },
+    { "store/col_build_hash_index_interrupt", test_col_build_hash_index_interrupt, store_setup, store_teardown },
     { "store/stream_inline_dict", test_stream_inline_dict, store_setup, store_teardown },
     { "store/stream_hash_wave", test_stream_hash_wave, store_setup, store_teardown },
     { "store/stream_region_bytes", test_stream_region_bytes_match, store_setup, store_teardown },

@@ -32,6 +32,7 @@
 #include "core/poll.h"
 #include "core/platform.h"
 #include "core/timer.h"
+#include "core/profile.h"   /* ray_profile_now_ns: bounded waits */
 #include "mem/heap.h"
 #include "ops/ops.h"
 #include <stdatomic.h>
@@ -425,11 +426,17 @@ static test_result_t test_dispatch_reclaims_worker_blocks(void) {
     ray_err_t err = ray_pool_create(&pool, 3);
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
-    /* ray_pool_create returns before the workers have started; a worker
-     * publishes its heap once it has run ray_heap_init.  Wait for all three
-     * on that published state, so every slot below is a real heap. */
+    /* A worker publishes its heap once it has run ray_heap_init (and
+     * ray_pool_create waits for that).  Wait for all three on that
+     * published state, so every slot below is a real heap; one that never
+     * shows (its heap init failed) fails the test within a bound rather
+     * than hanging it. */
+    int64_t until = ray_profile_now_ns() + (int64_t)30 * 1000000000;
     for (uint32_t w = 0; w < pool.n_workers; w++)
-        while (!atomic_load(&pool.worker_heaps[w])) RAY_CPU_RELAX();
+        while (!atomic_load(&pool.worker_heaps[w])) {
+            if (ray_profile_now_ns() > until) { ray_pool_free(&pool); FAIL("a worker published no heap"); }
+            RAY_CPU_RELAX();
+        }
 
     /* Rounds of "workers allocate, main frees" until a round in which at
      * least one block really came from a worker (main is worker 0 and can
@@ -814,6 +821,79 @@ static test_result_t test_pool_init_total(void) {
     TEST_ASSERT_EQ_I(ray_pool_init(0), RAY_OK);
     PASS();
 }
+
+/* --------------------------------------------------------------------------
+ * Test: a new pool's workers are all started when it is handed out.
+ *
+ * A worker reads the environment as it starts (ray_heap_init's getenv); a
+ * caller's setenv right after the pool is made must not race those reads
+ * (glibc may free the environment array under a getenv).  So every worker
+ * has published its heap by the time ray_pool_init_total returns, pool
+ * after pool.
+ * -------------------------------------------------------------------------- */
+
+static test_result_t test_pool_workers_started(void) {
+    int missing = 0;
+    for (int round = 0; round < 20; round++) {
+        ray_pool_destroy();
+        TEST_ASSERT_EQ_I(ray_pool_init_total(8), RAY_OK);
+        ray_pool_t* pool = ray_pool_get();
+        TEST_ASSERT_NOT_NULL(pool);
+        for (uint32_t i = 0; i < pool->n_workers; i++)
+            if (!atomic_load_explicit(&pool->worker_heaps[i], memory_order_acquire)) missing++;
+#if defined(__linux__) || defined(__APPLE__)
+        setenv("RAY_TEST_POOL_STARTED", round & 1 ? "1" : "0", 1);
+        unsetenv("RAY_TEST_POOL_STARTED");
+#endif
+    }
+    TEST_ASSERT_EQ_I(missing, 0);
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init(0), RAY_OK);
+    PASS();
+}
+
+#if defined(__linux__)
+#include <sys/resource.h>
+#include <sys/wait.h>
+/* Skeptic probe (round 3): a pool whose worker threads cannot be created
+ * (RLIMIT_NPROC below the user's thread count, in a child) fails to come
+ * up and returns — the creator's wait for the workers' start is not
+ * reached for threads that never ran — and a pool of one thread still
+ * comes up after it. */
+static test_result_t test_pool_sk_spawn_fails(void) {
+    /* The child starts pool threads after forking a multi-threaded
+     * process, which ThreadSanitizer refuses. */
+#if defined(__SANITIZE_THREAD__)
+    SKIP("ThreadSanitizer cannot start threads after a multi-threaded fork");
+#elif defined(__has_feature)
+#  if __has_feature(thread_sanitizer)
+    SKIP("ThreadSanitizer cannot start threads after a multi-threaded fork");
+#  endif
+#endif
+    fflush(stderr);
+    pid_t pid = fork();
+    TEST_ASSERT_TRUE(pid >= 0);
+    if (!pid) {
+        struct rlimit rl;
+        if (getrlimit(RLIMIT_NPROC, &rl) != 0) _exit(10);
+        rl.rlim_cur = 1;
+        if (setrlimit(RLIMIT_NPROC, &rl) != 0) _exit(11);
+        ray_pool_t pool;
+        ray_err_t e = ray_pool_create(&pool, 16);
+        if (e == RAY_OK) { ray_pool_free(&pool); _exit(12); }   /* not limited (root?) */
+        ray_pool_t one;
+        if (ray_pool_create(&one, 1) != RAY_OK) _exit(0);        /* still refused: fine */
+        ray_pool_free(&one);
+        _exit(0);
+    }
+    int status = 0;
+    TEST_ASSERT_EQ_I(waitpid(pid, &status, 0), pid);
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 12) SKIP("RLIMIT_NPROC not enforced here");
+    TEST_ASSERT_TRUE(WIFEXITED(status));
+    TEST_ASSERT_EQ_I(WEXITSTATUS(status), 0);
+    PASS();
+}
+#endif
 
 /* --------------------------------------------------------------------------
  * Test: ray_pool_free(NULL) is a no-op (covers the early-return guard).
@@ -2322,6 +2402,10 @@ const test_entry_t pool_entries[] = {
     { "pool/zero_workers",          test_pool_zero_workers,     NULL, NULL },
     { "pool/total_workers",         test_pool_total_workers,    NULL, NULL },
     { "pool/init_total",            test_pool_init_total,       NULL, NULL },
+    { "pool/workers_started",       test_pool_workers_started,  NULL, NULL },
+#if defined(__linux__)
+    { "pool/sk_spawn_fails",        test_pool_sk_spawn_fails,   NULL, NULL },
+#endif
     { "pool/free_null",             test_pool_free_null,        NULL, NULL },
     { "pool/init_idempotent",       test_pool_init_idempotent,  NULL, NULL },
     { "pool/destroy_reinit",        test_pool_destroy_and_reinit, NULL, NULL },
