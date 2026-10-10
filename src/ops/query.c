@@ -905,7 +905,7 @@ static ray_t* apply_sort_take(ray_t* result, ray_t** dict_elems, int64_t dict_n,
                              * intermediates one call later. */
                             return topk;
                         }
-                        if (topk && RAY_IS_ERR(topk)) ray_release(topk);
+                        if (topk && RAY_IS_ERR(topk)) ray_error_free(topk);
                         /* topk == NULL: unsupported config, fall through. */
                     }
                 }
@@ -2086,7 +2086,7 @@ static ray_op_t* compile_where_predicate(ray_graph_t* g, ray_t* tbl,
      * a scalar truth test, which would have kept every row. */
     if (g->compile_err) {
         if (out_err) *out_err = graph_take_compile_err(g);
-        else { ray_release(g->compile_err); g->compile_err = NULL; }
+        else { ray_error_free(g->compile_err); g->compile_err = NULL; }
         return NULL;
     }
 
@@ -9840,7 +9840,7 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, bool aliases_resolved,
                             ray_release(tbl);
                             DICT_VIEW_CLOSE(dv); return res;
                         }
-                        if (res && RAY_IS_ERR(res)) ray_release(res);
+                        if (res && RAY_IS_ERR(res)) ray_error_free(res);
                     }
                     if (n_sort_keys > 0 && k > 0 && k <= FPK_MAX_K && k < ray_table_nrows(tbl)) {
                         ray_t* res = ray_fused_topk_select(tbl, where_expr,
@@ -9854,7 +9854,7 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, bool aliases_resolved,
                             ray_release(tbl);
                             DICT_VIEW_CLOSE(dv); return res;
                         }
-                        if (res && RAY_IS_ERR(res)) ray_release(res);
+                        if (res && RAY_IS_ERR(res)) ray_error_free(res);
                     }
                 } else if (tv) {
                     ray_release(tv);
@@ -19514,7 +19514,7 @@ static bool ukey_grow(ray_index_t* ix, int64_t entries) {
     if (cap < old_cap) cap = old_cap;
     if (cap > UKEY_MAX_CAP) return false;
     ray_t* fresh = ray_vec_new(RAY_I64, (int64_t)cap);
-    if (!fresh || RAY_IS_ERR(fresh)) { if (fresh) ray_release(fresh); return false; }
+    if (!fresh || RAY_IS_ERR(fresh)) { ray_error_free(fresh); return false; }
     fresh->len = (int64_t)cap;
     int64_t* dst = (int64_t*)ray_data(fresh);
     memset(dst, 0, (size_t)cap * sizeof(int64_t));
@@ -22220,7 +22220,7 @@ static ray_t* asof_parted_select_operand(ray_t* arg_ast, ray_t** out_dict) {
     ray_t* from_expr = dict_get(dict, "from");
     if (!from_expr) return NULL;
     ray_t* tbl = ray_eval(from_expr);
-    if (!tbl || RAY_IS_ERR(tbl)) { if (tbl) ray_release(tbl); return NULL; }
+    if (!tbl || RAY_IS_ERR(tbl)) { ray_error_free(tbl); return NULL; }
     if (tbl->type != RAY_TABLE || asof_parted_seg_count(tbl) < 0) {
         ray_release(tbl);
         return NULL;

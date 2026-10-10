@@ -67,6 +67,12 @@
 (probe_caught (fn [p] (try (select {s: (sum y) by: {k: x} from: TB take: "a"}) (fn [e] 0))) 5 1000) -- true
 (probe_caught (fn [p] (try (select {r: (+ (sum y) [1 2 3]) by: {k: x} from: TB}) (fn [e] 0))) 5 1000) -- true
 (probe_caught (fn [p] (try (select {t: (top y 0) by: 'x from: TB}) (fn [e] 0))) 5 1000) -- true
+;; a key the compiler rejects leaves its error on the graph, and freeing the
+;; graph released it as a value, which an error is not: a by-dict value, a
+;; by-dict value with no column, an eval-level computed key
+(probe_caught (fn [p] (try (select {by: {k: (+ x 'a)} from: TB}) (fn [e] 0))) 5 1000) -- true
+(probe_caught (fn [p] (try (select {by: {k: (+ 1 'a)} from: TB}) (fn [e] 0))) 5 1000) -- true
+(probe_caught (fn [p] (try (select {c: (count (distinct y)) by: (+ x 'a) from: TB}) (fn [e] 0))) 5 1000) -- true
 ;; try frees the error it catches, and the trace its unwind recorded: a
 ;; raise, a runtime error, a rethrow, a fallback value, in a function
 (probe (fn [p] (try (raise p) (fn [e] 0))) 5 1000) -- true
