@@ -9437,7 +9437,22 @@ static ray_t* select_name_computed_key(ray_t* r, int64_t key_name) {
     return r;
 }
 
+static ray_t* ray_select_body(ray_t** args, int64_t n, bool aliases_resolved,
+                              ray_t** owned_sel);
+
+/* The select body keeps a reference to its WHERE selection past the graph
+ * that owns it (the count(distinct) scatter reads it) and returns from
+ * dozens of places; the reference is handed here and released once,
+ * whichever exit the body took. */
 static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
+    ray_t* owned_sel = NULL;
+    ray_t* r = ray_select_body(args, n, aliases_resolved, &owned_sel);
+    if (owned_sel) ray_release(owned_sel);
+    return r;
+}
+
+static ray_t* ray_select_body(ray_t** args, int64_t n, bool aliases_resolved,
+                              ray_t** owned_sel) {
     if (n < 1) return ray_error("arity", "select: expects a query dict, got %lld args", (long long)n);
     ray_t* dict = args[0];
     if (!dict || dict->type != RAY_DICT)
@@ -9896,8 +9911,8 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
     /* Selection saved across the path-A graph free for count(distinct
      * col_ref) non-aggs.  Path B leaves this NULL because the
      * materialised filtered_tbl already encodes the selection in row
-     * positions.  Declared here at function scope so the cleanup at
-     * the bottom of ray_select_fn can release it. */
+     * positions.  Borrowed: the reference is *owned_sel, released by
+     * ray_select_impl. */
     ray_t* saved_selection = NULL;
     ray_t* post_group_where_expr = NULL;
     DICT_VIEW_DECL(byv);
@@ -12722,10 +12737,12 @@ by_dict_done:
                 /* Retain a copy of the selection so it survives the
                  * later ray_graph_free.  count(distinct col_ref) needs
                  * this in the n_nonaggs scatter to mask filtered-out
-                 * rows in the row→gid build. */
+                 * rows in the row→gid build.  ray_select_impl releases
+                 * it after the select returns. */
                 if (g->selection) {
                     saved_selection = g->selection;
                     ray_retain(saved_selection);
+                    *owned_sel = saved_selection;
                 }
             } else {
                 root = ray_optimize(g, root);
@@ -13041,10 +13058,6 @@ by_dict_done:
             /* No explicit aggregations — apply WHERE filter first (if any),
              * then use DAG GROUP+COUNT for fast hash-parallel group boundaries,
              * then gather first-of-group from the filtered table. */
-            /* The fused WHERE above kept a reference to its selection for the
-             * count(distinct) scatter; this branch has no outputs and returns
-             * before the release at the end of the select. */
-            if (saved_selection) { ray_release(saved_selection); saved_selection = NULL; }
             ray_t* filtered_tbl = tbl;
             if (where_expr) {
                 root = ray_optimize(g, root);
@@ -15456,7 +15469,6 @@ by_dict_done:
                                  take_pre.kind ? &take_pre : NULL);
 
     if (by_sym_vec_owned) ray_release(by_sym_vec_owned);
-    if (saved_selection) ray_release(saved_selection);
 
     scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return result;
 }

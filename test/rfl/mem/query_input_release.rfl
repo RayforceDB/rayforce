@@ -50,6 +50,17 @@
 (probe (fn [p] (count (select {by: 'x from: TB where: (> y 38)}))) 5 1000) -- true
 (probe (fn [p] (count (select {by: {a: x b: z} from: TB}))) 5 1000) -- true
 (probe (fn [p] (count (select {v: y by: {k: s} from: TB}))) 5 1000) -- true
+;; the same selection on the error returns of a grouped select with a where:
+;; (a rejected aggregate, a bad take:, a failing post-pass, a failing
+;; count(distinct) scatter).  Each call is caught by try; the growth of a
+;; bare caught raise is subtracted, so only the select's own is measured.
+(set grow (fn [f warm reps] (do (map f (til warm)) (map f (til reps)) (set h0 (heapb)) (map f (til reps)) (- (heapb) h0))))
+(set probe_caught (fn [f warm reps] (< (- (grow f warm reps) (grow (fn [p] (try (raise p) (fn [e] 0))) warm reps)) 4096)))
+(set V100 (% (til 100) 5))
+(probe_caught (fn [p] (try (select {t: (top y 0) by: x from: TB where: (> y 38)}) (fn [e] 0))) 5 1000) -- true
+(probe_caught (fn [p] (try (select {s: (sum y) by: x from: TB where: (> y 38) take: "a"}) (fn [e] 0))) 5 1000) -- true
+(probe_caught (fn [p] (try (select {r: (+ (sum y) [1 2 3]) by: x from: TB where: (> y 38)}) (fn [e] 0))) 5 1000) -- true
+(probe_caught (fn [p] (try (select {d: (count (distinct z)) by: V100 from: TB where: (> y 38)}) (fn [e] 0))) 5 1000) -- true
 ;; the same table reused across calls must not be released twice: the
 ;; result is still right after many calls
 (set T (mk 1))
