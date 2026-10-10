@@ -61,6 +61,20 @@
 (probe_caught (fn [p] (try (select {s: (sum y) by: x from: TB where: (> y 38) take: "a"}) (fn [e] 0))) 5 1000) -- true
 (probe_caught (fn [p] (try (select {r: (+ (sum y) [1 2 3]) by: x from: TB where: (> y 38)}) (fn [e] 0))) 5 1000) -- true
 (probe_caught (fn [p] (try (select {d: (count (distinct z)) by: V100 from: TB where: (> y 38)}) (fn [e] 0))) 5 1000) -- true
+;; try frees the error it catches, and the trace its unwind recorded: a
+;; raise, a runtime error, a rethrow, a fallback value, in a function
+(probe (fn [p] (try (raise p) (fn [e] 0))) 5 1000) -- true
+(probe (fn [p] (try (+ p 'a) (fn [e] 0))) 5 1000) -- true
+(probe (fn [p] (try (try (raise p) (fn [e] (raise e))) (fn [e] 0))) 5 1000) -- true
+(probe (fn [p] (try (+ p 'a) 0)) 5 1000) -- true
+;; and at the top level, where try is evaluated rather than compiled
+(times 100 (try (raise 5) (fn [e] 0)))
+(times 100 (try (try (raise 5) (fn [e] (raise e))) (fn [e] 0)))
+(set h0 (heapb))
+(times 1000 (try (raise 5) (fn [e] 0)))
+(times 1000 (try (+ 1 'a) 0))
+(times 1000 (try (try (raise 5) (fn [e] (raise e))) (fn [e] 0)))
+(< (- (heapb) h0) 4096) -- true
 ;; the same table reused across calls must not be released twice: the
 ;; result is still right after many calls
 (set T (mk 1))

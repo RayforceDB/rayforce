@@ -317,6 +317,11 @@ ray_t* ray_try_fn(ray_t* expr, ray_t* handler_expr) {
     ray_t* err_val = __VM->raise_val;
     __VM->raise_val = NULL;
     if (!err_val) err_val = make_i64(0);
+    /* The caught error itself goes no further: errors are not refcounted,
+     * so ray_release would leave it allocated.  Nor does the trace its
+     * unwind recorded. */
+    ray_error_free(result);
+    ray_clear_error_trace();
 
     /* Evaluate handler expression (in the current scope) */
     ray_t* handler = ray_eval(handler_expr);
@@ -3013,20 +3018,20 @@ vm_error_cleanup: {
 
         /* Get error value.  If __VM->raise_val is set, a user (raise x)
          * just ran — its value is the real payload the handler must
-         * see.  vm_err_obj is the generic error-sentinel returned
-         * from ray_raise_fn (or a VM-detected error like arity);
-         * release it if we picked __VM->raise_val.  For VM-only errors,
-         * __VM->raise_val stays NULL and vm_err_obj is used. */
-        ray_t *err_val;
-        if (__VM->raise_val) {
-            if (vm_err_obj) ray_release(vm_err_obj);
-            err_val = __VM->raise_val;
-        } else {
-            err_val = vm_err_obj;
-        }
-        vm_err_obj = NULL;
+         * see.  Otherwise the handler gets 0, as ray_try_fn gives it for
+         * a runtime error.  vm_err_obj, the error itself (the sentinel
+         * ray_raise_fn returns, or a builtin's or the VM's own), goes no
+         * further: errors are not refcounted, so ray_release would leave
+         * it allocated. */
+        ray_t *err_val = __VM->raise_val;
         __VM->raise_val = NULL;
         if (!err_val) err_val = make_i64(0);
+        if (vm_err_obj) {
+            if (RAY_IS_ERR(vm_err_obj)) ray_error_free(vm_err_obj);
+            else ray_release(vm_err_obj);
+        }
+        vm_err_obj = NULL;
+        ray_clear_error_trace();   /* frames an inner call's unwind recorded */
 
         /* Restore context and push error value */
         ray_release(vm.fn);
