@@ -60,6 +60,11 @@ typedef struct {
      * bindings down to here and no further.  A caller's locals are not
      * the body's, whether the body runs compiled or interpreted. */
     uint8_t  lexical;
+    /* A compiled frame's window around `eval` or `resolve`: it binds the
+     * frame's locals for the text being evaluated, and for nothing that
+     * text calls.  A lookup made by compiled code, or from inside a lambda
+     * called under the window, passes it by. */
+    uint8_t  eval_window;
     /* RAY_SCOPE_CALL only: the call was made by name, so the body's text
      * was written outside the query and its literal symbols are literals. */
     uint8_t  named;

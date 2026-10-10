@@ -109,6 +109,9 @@ enum {
     OP_LOADENVG,      /* push local slot (1 byte) or, when the slot is still
                        * empty (a `let` that has not run), the global named
                        * by cpool[2-byte index], as the tree walker would */
+    OP_SCOPE_EVAL,    /* OP_SCOPE_BEGIN for a window around `eval` or
+                       * `resolve`: the frame binds the locals for the
+                       * evaluated text only, not for what it calls */
     OP__COUNT
 };
 

@@ -2751,6 +2751,7 @@ static ray_t* vm_exec_rows(ray_t* lambda, ray_t** call_args, int64_t argc,
         [OP_LOADSELF]      = &&op_loadself,
         [OP_MKCLOSURE]     = &&op_mkclosure,
         [OP_LOADENVG]      = &&op_loadenvg,
+        [OP_SCOPE_EVAL]    = &&op_scope_eval,
     };
 
     /* Arity check before allocating VM state */
@@ -2884,7 +2885,7 @@ op_resolve: {
     uint8_t idx = code[ip++];
     ray_t *name_obj = cpool[idx];
     uint8_t val_rows = 0;   /* set when a query helper reads a source column */
-    ray_t *val = ray_env_resolve_rows(name_obj->i64, &val_rows);
+    ray_t *val = ray_env_resolve_compiled(name_obj->i64, &val_rows);
     if (!val) goto vm_error_name;
     /* env_resolve returns an owned ref (rc >= 1); no extra retain needed.
      * It can also return a real error (e.g. nyi from a parted-target link
@@ -2900,7 +2901,7 @@ op_resolve_w: {
     ip += 2;
     ray_t *name_obj = cpool[idx];
     uint8_t val_rows = 0;
-    ray_t *val = ray_env_resolve_rows(name_obj->i64, &val_rows);
+    ray_t *val = ray_env_resolve_compiled(name_obj->i64, &val_rows);
     if (!val) goto vm_error_name;
     if (RAY_IS_ERR(val)) { vm_err_obj = val; goto vm_error; }
     PUSHR(val, val_rows);
@@ -3532,7 +3533,7 @@ op_loadenvg: {
     }
     ray_t *name_obj = cpool[idx];
     uint8_t val_rows = 0;
-    val = ray_env_resolve_rows(name_obj->i64, &val_rows);
+    val = ray_env_resolve_compiled(name_obj->i64, &val_rows);
     if (!val) goto vm_error_name;
     if (RAY_IS_ERR(val)) { vm_err_obj = val; goto vm_error; }
     PUSHR(val, val_rows);
@@ -3558,10 +3559,12 @@ op_force: {
     DISPATCH();
 }
 
+op_scope_eval:
 op_scope_begin: {
     /* Stack: [.., syms_vec] — materialize the live locals (slot i holds
      * the value of syms[i]) plus self into a fresh scope frame so the
      * OP_CALLD that follows can resolve them via the tree walker. */
+    bool eval_window = code[ip - 1] == OP_SCOPE_EVAL;
     ray_t *syms = POP();
     /* The locals' row provenance travels with the bindings, so the tree
      * walker inside the window sees it as it sees any local's. */
@@ -3570,6 +3573,9 @@ op_scope_begin: {
                                        &vm.ps[vm.fp], &vm.rows[vm.fp], vm.fn);
     ray_release(syms);
     if (err != RAY_OK) goto vm_error_limit;
+    /* An eval window serves the evaluated text: a lambda that text calls
+     * resolves its free names past it (ray_env_resolve_compiled). */
+    if (eval_window) ray_env_mark_eval_window();
     /* A closure's captures sit in local slots (bound by the prologue), so
      * the window binds them with the other locals, and nothing from the
      * caller's frames can stand in for one. */

@@ -189,6 +189,20 @@
 (set rxw (fn [] xw))
 (set fw3 (fn [x] (eval (rxw))))
 (fw3 1) -- 100
+;; the window binds the frame's locals for the evaluated text only: a named
+;; function that text calls sees the global, as it does when called directly
+(set pe 100)
+(set rde (fn [] pe))
+(set rde2 (fn [x] (+ x pe)))
+((fn [pe] (eval (quote (rde)))) 1) -- 100
+((fn [pe] (eval (parse "(rde)"))) 1) -- 100
+((fn [pe] (eval (quote (map rde2 [1 2])))) 1) -- [101 102]
+((fn [pe] (eval (quote (list pe (rde))))) 1) -- [1 100]
+;; ... an interpreted lambda that text calls as well
+(set rdi (fn [] (if false (set 1 2)) pe))
+((fn [pe] (eval (quote (rdi)))) 1) -- 100
+;; ... while a lambda written in the text captures it
+((fn [pe] (eval (quote ((fn [] pe))))) 1) -- 1
 ;; ... and many such calls leave the scope stack as it was
 (times 200 (gw 1))
 (do (let aw 1) aw) -- 1

@@ -162,6 +162,11 @@ int       ray_env_binding_rows(int64_t sym_id);
 /* ray_env_resolve, also reporting through `rows` whether the value is a
  * query source column (or its cell) read through a helper's call frame. */
 ray_t*    ray_env_resolve_rows(int64_t sym_id, uint8_t* rows);
+/* ray_env_resolve_rows for a name compiled code resolves at run time: an
+ * `eval` window on the scope stack belongs to a caller and is passed by. */
+ray_t*    ray_env_resolve_compiled(int64_t sym_id, uint8_t* rows);
+/* Mark the top scope frame as a compiled frame's `eval`/`resolve` window. */
+void      ray_env_mark_eval_window(void);
 ray_err_t ray_env_push_query_scope(void);
 void ray_env_pop_scope(void);
 int32_t   ray_env_scope_depth(void);

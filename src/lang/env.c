@@ -417,8 +417,11 @@ static ray_t* env_call_frame_value(ray_scope_frame_t* f, int64_t sym_id) {
 }
 
 /* `rows`, when given, is set when the value is a query source column (or
- * its cell) read through a helper's call frame. */
-static ray_t* env_lookup_flat_rows(int64_t sym_id, uint8_t* rows) {
+ * its cell) read through a helper's call frame.  `in_callee`: the lookup
+ * is made by compiled code, whose own names are slots, so an `eval`
+ * window on the stack belongs to a caller; the tree walker gets there
+ * once it passes a lambda call's frame (`lexical`). */
+static ray_t* env_lookup_flat_impl(int64_t sym_id, uint8_t* rows, bool in_callee) {
     /* FFI/embedding callers reach this on threads that never bound a VM
      * (cf. ray_env_get_local, already guarded). Such a thread has no
      * local scopes; global bindings must still resolve. */
@@ -429,6 +432,8 @@ static ray_t* env_lookup_flat_rows(int64_t sym_id, uint8_t* rows) {
         bool outer = false;
         for (int32_t d = __VM->scope_depth - 1; d >= 0; d--) {
             ray_scope_frame_t* f = &__VM->scope_stack[d];
+            if (f->lexical) in_callee = true;
+            if (f->eval_window && in_callee) continue;
             for (int32_t i = 0; i < f->count; i++) {
                 if (f->keys[i] != sym_id) continue;
                 if (rows) *rows = outer ? 0 : f->rows[i];
@@ -446,6 +451,10 @@ static ray_t* env_lookup_flat_rows(int64_t sym_id, uint8_t* rows) {
         if (g_env.keys[i] == sym_id) return g_env.vals[i];
     }
     return NULL;
+}
+
+static ray_t* env_lookup_flat_rows(int64_t sym_id, uint8_t* rows) {
+    return env_lookup_flat_impl(sym_id, rows, false);
 }
 
 static ray_t* env_lookup_flat(int64_t sym_id) {
@@ -503,13 +512,24 @@ ray_t* ray_env_resolve(int64_t sym_id) {
     return ray_env_resolve_rows(sym_id, NULL);
 }
 
+static ray_t* env_resolve_impl(int64_t sym_id, uint8_t* rows, bool in_callee);
 ray_t* ray_env_resolve_rows(int64_t sym_id, uint8_t* rows) {
+    return env_resolve_impl(sym_id, rows, false);
+}
+
+/* A name compiled code resolves at run time (OP_RESOLVE): never a binding
+ * of an `eval` window, which belongs to a caller. */
+ray_t* ray_env_resolve_compiled(int64_t sym_id, uint8_t* rows) {
+    return env_resolve_impl(sym_id, rows, true);
+}
+
+static ray_t* env_resolve_impl(int64_t sym_id, uint8_t* rows, bool in_callee) {
     if (rows) *rows = 0;
     /* Flat lookup first — short-circuits dotted reserved builtins
      * (`.sys.gc`, `.os.getenv`, …) that are additionally bound flat
      * alongside their namespace dict.  Non-dotted names take the
      * same path. */
-    ray_t* flat = env_lookup_flat_rows(sym_id, rows);
+    ray_t* flat = env_lookup_flat_impl(sym_id, rows, in_callee);
     if (flat) { ray_retain(flat); return flat; }
     if (!ray_sym_is_dotted(sym_id)) return NULL;
 
@@ -520,7 +540,7 @@ ray_t* ray_env_resolve_rows(int64_t sym_id, uint8_t* rows) {
     /* `v` is either a borrowed env/container pointer (fresh=false) or a
      * fresh temporal-extract result (fresh=true).  When switching between
      * the two we must release the previous fresh value to avoid leaks. */
-    ray_t* v = env_lookup_flat_rows(segs[0], rows);
+    ray_t* v = env_lookup_flat_impl(segs[0], rows, in_callee);
     bool   fresh = false;
 
     for (int i = 1; v && i < n; i++) {
@@ -949,6 +969,7 @@ static ray_err_t env_push_scope(uint8_t kind) {
     f->count = 0;
     f->kind = kind;
     f->lexical = 0;
+    f->eval_window = 0;
     f->rows = f->rows_inline;
     f->named = 0;
     f->table = NULL;
@@ -1011,9 +1032,18 @@ void ray_env_pop_scope(void) {
     f->cap = RAY_FRAME_CAP;
     f->count = 0;
     f->kind = RAY_SCOPE_LEXICAL;
+    f->lexical = 0;
+    f->eval_window = 0;
     f->named = 0;
     f->table = NULL;
     f->table_from = 0;
+}
+
+/* The top frame is a compiled frame's window around `eval` or `resolve`
+ * (see ray_scope_frame_t.eval_window). */
+void ray_env_mark_eval_window(void) {
+    if (__VM && __VM->scope_depth > 0)
+        __VM->scope_stack[__VM->scope_depth - 1].eval_window = 1;
 }
 
 /* Materialize compiled-lambda locals into a fresh scope frame — the

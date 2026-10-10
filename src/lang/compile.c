@@ -684,7 +684,7 @@ static void compile_list(compiler_t *c, ray_t *ast) {
      * after the call. */
     if (dyn_syms_idx >= 0) {
         emit_const(c, dyn_syms_idx);
-        emit(c, OP_SCOPE_BEGIN);
+        emit(c, OP_SCOPE_EVAL);
     }
 
     bool emitted = false;
