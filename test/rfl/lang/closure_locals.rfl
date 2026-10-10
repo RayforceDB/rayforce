@@ -223,6 +223,49 @@ rb -- [6 3]
 (set gb count)
 (set cb4 (mkb3))
 (list (cb3 [1 2 3]) (cb4 [1 2 3])) -- [3 3]
+;; a lambda with no captures bakes the builtins it names on its first call,
+;; not when the literal is evaluated: a rebinding in between is seen
+(set g6 sum)
+(set f6 (fn [x] (g6 x)))
+(set g6 count)
+(f6 [1 2 3]) -- 3
+;; ... through a dict too, whether the dict or its entry is rebound
+(set D6 (dict ['f] (list sum)))
+(set r6 [])
+(times 2 (do (set r6 (concat r6 ((fn [x] (D6.f x)) [1 2 3]))) (set D6 (dict ['f] (list count)))))
+r6 -- [6 3]
+(set D6 (dict ['f] (list sum)))
+(set r6 [])
+(times 2 (do (set r6 (concat r6 ((fn [x] (D6.f x)) [1 2 3]))) (set D6.f count)))
+r6 -- [6 3]
+(set h6 (fn [x] (D6.f x)))
+(set D6.f sum)
+(h6 [1 2 3]) -- 6
+;; and keeps them from then on, as a named function always has
+(set D6.f count)
+(h6 [1 2 3]) -- 6
+(set g6 sum)
+(f6 [1 2 3]) -- 3
+;; a closure body names a builtin it resolves when it runs: rebound to a
+;; lambda, or to a builtin of another arity, the call follows the new value
+(set g7 count)
+(set mk7 (fn [k] (fn [x] (g7 x))))
+(set c7 (mk7 0))
+(c7 [1 2]) -- 2
+(set g7 (fn [v] 42))
+(c7 [1 2]) -- 42
+(set g7 (fn [v] (if false (set 1 2)) 43))
+(c7 [1 2]) -- 43
+(set g7 enlist)
+(c7 [1 2]) -- (enlist [1 2])
+(set g8 +)
+(set mk8 (fn [k] (fn [x y] (g8 x y))))
+(set c8 (mk8 0))
+(c8 1 2) -- 3
+(set g8 (fn [a b] (* a b)))
+(c8 3 4) -- 12
+(set g8 list)
+(c8 3 4) -- [3 4]
 ;; a literal built around a large constant is not kept alive by the table
 (set baseL (parse "(fn [x] 0)"))
 (set bigL (fn [i] (eval (concat (take baseL 2) (enlist (concat (parse "(+ x)") (enlist (+ i (til 100000)))))))))

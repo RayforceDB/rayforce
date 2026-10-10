@@ -2169,9 +2169,6 @@ typedef struct {
     ray_t*  mentioned; /* the symbols the body mentions (I64 vector) */
     bool    dynamic;   /* the body uses eval or resolve: every capture counts */
     bool    failed;    /* the body did not compile: its closures stay interpreted */
-    bool    baked;     /* a top-level definition: builtins baked at compile time,
-                        * valid while no function-valued global was rebound */
-    uint64_t fn_gen;   /* ray_env_fn_generation() when it was compiled */
     ray_t*  names;     /* capture names (SYM vector) or NULL */
     ray_t*  tmpl;      /* the compiled template, or NULL when `failed` */
 } closure_tmpl_t;
@@ -2238,6 +2235,12 @@ static void closure_share_from(ray_t* lambda, ray_t* tmpl) {
 static void closure_share_template(ray_t* lambda) {
     ray_t* body = LAMBDA_BODY(lambda);
     ray_t* params = LAMBDA_PARAMS(lambda);
+    /* A lambda with nothing captured is a definition: it compiles on its
+     * first call and bakes the builtins it names then, so a function
+     * rebound between its evaluation and that call, or a dict it reaches
+     * a function through, is the one it calls.  A shared template would
+     * have baked them when the literal was evaluated. */
+    if (!LAMBDA_CLOSURE(lambda)) return;
     if (!body || body->type != RAY_LIST || body->len == 0 || !params) return;
     if (body->len > CLOSURE_TMPL_MAX_BODY) return;   /* compiles when called */
     if (g_closure_tmpl_epoch != ray_sym_epoch()) {
@@ -2255,12 +2258,6 @@ static void closure_share_template(ray_t* lambda) {
         bool same = true;
         for (int64_t k = 0; k < body->len && same; k++) same = e->body[k] == bn[k];
         if (same && closure_entry_names_match(e, LAMBDA_CLOSURE(lambda))) {
-            if (e->baked && !e->failed && e->fn_gen != ray_env_fn_generation()) {
-                /* A function-valued global was rebound since: the baked
-                 * builtins may be stale.  Compile this literal afresh. */
-                closure_tmpl_drop(e);
-                break;
-            }
             if (e->failed) LAMBDA_NLOCALS(lambda) = -1;   /* known not to compile */
             else closure_share_from(lambda, e->tmpl);
             return;
@@ -2287,12 +2284,10 @@ static void closure_share_template(ray_t* lambda) {
     ray_retain(params); LAMBDA_PARAMS(tmpl) = params;
     ray_retain(body);   LAMBDA_BODY(tmpl) = body;
     if (LAMBDA_NFO(lambda)) { ray_retain(LAMBDA_NFO(lambda)); LAMBDA_NFO(tmpl) = LAMBDA_NFO(lambda); }
-    /* A literal written inside a function is a closure body: its free names
-     * resolve when it runs.  One written at the top level is a definition and
-     * keeps the builtins it names baked, as dev's named lambdas do. */
-    bool closure_body = __VM && __VM->lambda_depth > 0;
-    uint64_t fn_gen = ray_env_fn_generation();
-    bool compiled = ray_compile_with_captures(tmpl, names, closure_body);
+    /* A closure body: its free names resolve when it runs, as the tree
+     * walker resolves them, so one template serves every closure of the
+     * literal whatever is rebound in between. */
+    bool compiled = ray_compile_with_captures(tmpl, names, true);
     if (!compiled) {
         /* Not compilable: the closure stays interpreted, and the entry
          * remembers that so later closures from the literal skip the
@@ -2309,8 +2304,6 @@ static void closure_share_template(ray_t* lambda) {
     e->mentioned = mentioned;   /* owned */
     e->dynamic = dynamic;
     e->failed = !compiled;
-    e->baked = !closure_body;
-    e->fn_gen = fn_gen;
     e->names = names;   /* owned, may be NULL */
     e->tmpl = tmpl;     /* owned, NULL when failed */
     if (compiled) closure_share_from(lambda, tmpl);
