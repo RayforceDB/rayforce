@@ -2759,6 +2759,9 @@ static ray_t* vm_exec_rows(ray_t* lambda, ray_t** call_args, int64_t argc,
         [OP_MKCLOSURE]     = &&op_mkclosure,
         [OP_LOADENVG]      = &&op_loadenvg,
         [OP_SCOPE_EVAL]    = &&op_scope_eval,
+        [OP_CALL1R]        = &&op_call1r,
+        [OP_CALL2R]        = &&op_call2r,
+        [OP_CALLNR]        = &&op_callnr,
     };
 
     /* Arity check before allocating VM state */
@@ -2810,6 +2813,8 @@ static ray_t* vm_exec_rows(ray_t* lambda, ray_t** call_args, int64_t argc,
     ray_t **cpool = (ray_t **)ray_data(LAMBDA_CONSTS(lambda));
     int32_t ip = 0;
     ray_t *vm_err_obj = NULL;
+    uint8_t callf_argc = 0;     /* OP_CALLF's argument count, for the paths that join it */
+    bool call1_tree_null = false;   /* OP_CALL1R: the tree walker's null rule */
 
 #define DISPATCH() goto *dispatch[code[ip++]]
 #define PUSH(v)    do { if (vm.sp >= VM_STACK_SIZE) goto vm_error_limit; vm.rows[vm.sp] = 0; vm.ps[vm.sp++] = (v); } while(0)
@@ -2973,7 +2978,15 @@ op_jmpf: {
     DISPATCH();
 }
 
-op_call1: {
+op_call1r:
+    /* A builtin a closure body resolved when it ran: OP_CALL1 while the
+     * name still holds a unary builtin, the general call otherwise. */
+    if (RAY_UNLIKELY(!vm.ps[vm.sp - 2] || vm.ps[vm.sp - 2]->type != RAY_UNARY)) { callf_argc = 1; goto callf_any; }
+    call1_tree_null = true;
+    goto call1_body;
+op_call1:
+    call1_tree_null = false;
+call1_body: {
     ray_t *arg = POP();
     uint8_t arg_rows = POPPED_ROWS();
     ray_t *fn_obj = POP();
@@ -2998,7 +3011,8 @@ op_call1: {
     }
     RAY_ASSERT_VALUE(arg);
     if (RAY_UNLIKELY(RAY_IS_NULL(arg))) {
-        result = (fn == (ray_unary_fn)ray_nil_fn || fn == (ray_unary_fn)ray_type_fn)
+        result = (fn == (ray_unary_fn)ray_nil_fn || fn == (ray_unary_fn)ray_type_fn ||
+                  (call1_tree_null && fn == (ray_unary_fn)ray_ser_fn))
                  ? fn(arg) : ray_error("type", NULL);
     } else if ((fn_obj->attrs & RAY_FN_ATOMIC) && arg->type >= 0)
         result = atomic_map_unary(fn, arg);
@@ -3009,6 +3023,31 @@ op_call1: {
     ray_release(fn_obj);
     if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }
     PUSHR(result, result_rows);
+    DISPATCH();
+}
+
+op_call2r: {
+    /* OP_CALL2 for a resolved binary builtin, reporting row provenance as
+     * the general call does; the general call when the name holds
+     * anything else. */
+    if (RAY_UNLIKELY(!vm.ps[vm.sp - 3] || vm.ps[vm.sp - 3]->type != RAY_BINARY)) { callf_argc = 2; goto callf_any; }
+    ray_t *right = POP();
+    uint8_t right_rows = POPPED_ROWS();
+    ray_t *left = POP();
+    uint8_t left_rows = POPPED_ROWS();
+    ray_t *fn_obj = POP();
+    if (RAY_UNLIKELY(fn_is_restricted(fn_obj))) {
+        ray_release(left);
+        ray_release(right);
+        ray_release(fn_obj);
+        vm_err_obj = ray_error("access", "restricted");
+        goto vm_error;
+    }
+    uint8_t result_rows = 0;
+    ray_t *result = vm_call_binary(fn_obj, left, right, left_rows == 1, right_rows == 1, &result_rows);
+    ray_release(fn_obj);
+    if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }
+    PUSHR(result, result_rows ? 1 : 0);
     DISPATCH();
 }
 
@@ -3031,6 +3070,15 @@ op_call2: {
     if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }
     PUSHR(result, result_rows);
     DISPATCH();
+}
+
+op_callnr: {
+    /* OP_CALLN for a resolved variadic builtin; the general call when the
+     * name holds anything else. */
+    uint8_t nr = code[ip++];
+    if (RAY_UNLIKELY(nr > 64 || !vm.ps[vm.sp - 1 - nr] || vm.ps[vm.sp - 1 - nr]->type != RAY_VARY)) { callf_argc = nr; goto callf_any; }
+    ip--;
+    goto op_calln;
 }
 
 op_calln: {
@@ -3064,8 +3112,10 @@ op_calln: {
     DISPATCH();
 }
 
-op_callf: {
-    uint8_t n = code[ip++];
+op_callf:
+    callf_argc = code[ip++];
+callf_any: {
+    uint8_t n = callf_argc;
     if (n > 64) goto vm_error;
     ray_t *fn_args[64];
     uint8_t arg_rows[64];

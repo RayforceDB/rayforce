@@ -416,6 +416,28 @@ static ray_t* env_call_frame_value(ray_scope_frame_t* f, int64_t sym_id) {
     return err == RAY_OK ? f->vals[f->count - 1] : NULL;
 }
 
+/* A global by name.  The table is a flat array of some hundreds of names,
+ * builtins first, so a scan per lookup cost a closure body, which
+ * resolves every builtin it names when it runs, more than the builtin's
+ * own work.  A per-thread hint remembers where a name was found; it is
+ * only a hint, checked against the slot it names, so a rebinding, a new
+ * name or a deletion that moves the slots is seen at once. */
+static ray_t* env_global_lookup(int64_t sym_id) {
+    enum { HINT_BITS = 10 };
+    static _Thread_local struct { int64_t sym; int32_t idx; } hint[1 << HINT_BITS];
+    uint32_t h = (uint32_t)(((uint64_t)sym_id * UINT64_C(0x9E3779B97F4A7C15)) >> (64 - HINT_BITS));
+    int32_t i = hint[h].idx;
+    int32_t n = g_env.count;
+    if (hint[h].sym == sym_id && i < n && g_env.keys[i] == sym_id) return g_env.vals[i];
+    for (i = 0; i < n; i++) {
+        if (g_env.keys[i] != sym_id) continue;
+        hint[h].sym = sym_id;
+        hint[h].idx = i;
+        return g_env.vals[i];
+    }
+    return NULL;
+}
+
 /* `rows`, when given, is set when the value is a query source column (or
  * its cell) read through a helper's call frame.  `in_callee`: the lookup
  * is made by compiled code, whose own names are slots, so an `eval`
@@ -447,10 +469,7 @@ static ray_t* env_lookup_flat_impl(int64_t sym_id, uint8_t* rows, bool in_callee
             }
         }
     }
-    for (int32_t i = 0; i < g_env.count; i++) {
-        if (g_env.keys[i] == sym_id) return g_env.vals[i];
-    }
-    return NULL;
+    return env_global_lookup(sym_id);
 }
 
 static ray_t* env_lookup_flat_rows(int64_t sym_id, uint8_t* rows) {
@@ -520,6 +539,12 @@ ray_t* ray_env_resolve_rows(int64_t sym_id, uint8_t* rows) {
 /* A name compiled code resolves at run time (OP_RESOLVE): never a binding
  * of an `eval` window, which belongs to a caller. */
 ray_t* ray_env_resolve_compiled(int64_t sym_id, uint8_t* rows) {
+    /* No scope frame to look through (a body called outside any query or
+     * interpreted frame): the global, if there is one. */
+    if (__VM && __VM->scope_depth == 0) {
+        ray_t* v = env_global_lookup(sym_id);
+        if (v) { if (rows) *rows = 0; ray_retain(v); return v; }
+    }
     return env_resolve_impl(sym_id, rows, true);
 }
 
@@ -893,10 +918,7 @@ static ray_err_t env_set_dotted(int64_t sym_id, ray_t* val,
 
 /* Scope-specific base lookups used by env_set_dotted. */
 ray_t* ray_env_get_global(int64_t sym_id) {
-    for (int32_t i = 0; i < g_env.count; i++) {
-        if (g_env.keys[i] == sym_id) return g_env.vals[i];
-    }
-    return NULL;
+    return env_global_lookup(sym_id);
 }
 
 static ray_t* lookup_top_frame(int64_t sym_id) {

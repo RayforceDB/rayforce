@@ -112,6 +112,10 @@ enum {
     OP_SCOPE_EVAL,    /* OP_SCOPE_BEGIN for a window around `eval` or
                        * `resolve`: the frame binds the locals for the
                        * evaluated text only, not for what it calls */
+    OP_CALL1R,        /* OP_CALL1 / OP_CALL2 / OP_CALLN (argc operand) for a  */
+    OP_CALL2R,        /* builtin a closure body resolves when it runs: the  */
+    OP_CALLNR,        /* fast call while the name holds a builtin of that
+                       * kind, OP_CALLF's general call otherwise */
     OP__COUNT
 };
 
