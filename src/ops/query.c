@@ -15465,11 +15465,21 @@ by_dict_done:
                 if (ray_env_push_query_scope() != RAY_OK) {
                     cerr = ray_error("oom", NULL);
                 } else {
+                    /* One value per group, each derived from the group's
+                     * rows: the flag lets `concat` treat a reduced text cell
+                     * as a cell (a null is empty text, a literal joins it)
+                     * rather than as a collection. */
                     for (int hi = 0; hi < n_hidden_aggs; hi++)
-                        ray_env_set_local(hidden_agg_names[hi],
-                                          ray_table_get_col_idx(result,
-                                                                hbase + hi));
+                        (void)ray_env_set_local_rows(hidden_agg_names[hi],
+                                                     ray_table_get_col_idx(result, hbase + hi), 1);
                     int64_t n_groups = ray_table_nrows(result);
+                    /* The wrappers are query text over the group result:
+                     * `concat` and the other query-aware forms read the
+                     * active table, as they do for a derived output. */
+                    ray_t* prev_aqt = g_active_query_table;
+                    int64_t prev_aqr = g_active_query_row;
+                    g_active_query_table = result;
+                    g_active_query_row = -1;
                     for (int ci = 0; ci < n_compound && !cerr; ci++) {
                         ray_t* v = ray_eval(compound_rw[ci]);
                         if (!v || RAY_IS_ERR(v)) {
@@ -15488,6 +15498,8 @@ by_dict_done:
                             ray_release(v);
                         } else comp_cols[ci] = v;
                     }
+                    g_active_query_table = prev_aqt;
+                    g_active_query_row = prev_aqr;
                     ray_env_pop_scope();
                 }
             }

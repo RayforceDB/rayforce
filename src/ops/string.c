@@ -1408,7 +1408,11 @@ ray_t* exec_replace(ray_graph_t* g, ray_op_t* op) {
 /* Shared text kernel. Consumes one reference to each argument.  A STR
  * vector makes the result STR; `str_out` says a STR atom does too (a cell
  * of a STR column read row by row). */
-static ray_t* concat_text_values(ray_t** args, int n_args, bool str_out) {
+/* `cell_mask` bit a: argument a is a cell of the query's rows (a column's
+ * element, or a text column reduced to one value by first/last/min/max), so
+ * a null there is empty text, as the vector kernel reads a null element; a
+ * null literal operand nulls the row. */
+static ray_t* concat_text_values(ray_t** args, int n_args, bool str_out, uint64_t cell_mask) {
     /* Only atoms broadcast. A one-row vector is still a vector, and an
      * empty vector must never be indexed as if it contained row zero. */
     int64_t nrows = 1;
@@ -1435,8 +1439,9 @@ static ray_t* concat_text_values(ray_t** args, int n_args, bool str_out) {
         /* Check if any arg is null at this row */
         bool any_null = false;
         for (int a = 0; a < n_args; a++) {
-            /* SYM atoms can be null (sym 0); STR/SYM vecs cannot. */
-            if (ray_is_atom(args[a]) && RAY_ATOM_IS_NULL(args[a])) { any_null = true; break; }
+            /* SYM atoms can be null (sym 0); STR/SYM vecs cannot.  A null
+             * cell (cell_mask) reads as empty text below. */
+            if (!((cell_mask >> a) & 1) && ray_is_atom(args[a]) && RAY_ATOM_IS_NULL(args[a])) { any_null = true; break; }
         }
         if (any_null) {
             if (out_str) {
@@ -1561,7 +1566,20 @@ ray_t* exec_concat(ray_graph_t* g, ray_op_t* op) {
         }
     }
 
-    ray_t* result = concat_text_values(args, n_args, false);
+    /* An operand that reduces a text column to one value (first, last, min,
+     * max) is a cell of the rows: a null there is empty text, and a cell of
+     * a STR column makes the result STR, as a STR column itself does. */
+    uint64_t cell_mask = 0;
+    bool str_out = false;
+    for (int i = 0; i < n_args && i < 64; i++) {
+        ray_op_t* child = i < 2 ? op_child(g, op, i) : &g->nodes[trail[i - 2]];
+        if (child && (child->opcode == OP_FIRST || child->opcode == OP_LAST ||
+                      child->opcode == OP_MIN || child->opcode == OP_MAX)) {
+            cell_mask |= (uint64_t)1 << i;
+            if (child->out_type == RAY_STR) str_out = true;
+        }
+    }
+    ray_t* result = concat_text_values(args, n_args, str_out, cell_mask);
     scratch_free(args_hdr);
     return result;
 }
@@ -1611,7 +1629,7 @@ ray_t* ray_concat_text_fn(ray_t* a, ray_t* b, bool str_out, uint8_t rows_mask) {
     ray_t* args[2] = { a, b };
     ray_retain(a);
     ray_retain(b);
-    ray_t* result = concat_text_values(args, 2, str_out);
+    ray_t* result = concat_text_values(args, 2, str_out, rows_mask);
     if (!atoms || !result || RAY_IS_ERR(result)) return result;
     int allocated = 0;
     ray_t* atom = collection_elem(result, 0, &allocated);

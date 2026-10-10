@@ -77,3 +77,38 @@ ticks -- 5
 ;; A whole-column projection expands helpers inside its operands.
 (set sfx (fn [v] (concat v "!")))
 (at (select {v: (concat s (first (sfx s))) from: T}) 'v) -- ['aa! 'ba! 'ca! 'da! 'ea!]
+
+;; ── a text cell reduced from a column is a cell of the rows ───────────────
+;; `(first s)` per group is one value derived from the group's rows: concat
+;; joins it with a literal as it joins the cell itself, and an empty symbol
+;; cell is empty text, not a null literal.  Grouped select and grouped update
+;; agree with the ungrouped projection.
+(set TC (table [x s] (list [1 2 3 4] (as 'SYMBOL ["a" "" "c" "d"]))))
+(at (select {r: (concat s 'zz) from: TC}) 'r) -- [azz zz czz dzz]
+(at (select {r: (concat (first s) 'zz) by: x from: TC}) 'r) -- [azz zz czz dzz]
+(at (select {r: (concat (last s) 'zz) by: x from: TC}) 'r) -- [azz zz czz dzz]
+(at (select {r: (concat 'zz (first s)) by: x from: TC}) 'r) -- [zza zz zzc zzd]
+(at (select {r: (concat (max s) 'zz) by: x from: TC}) 'r) -- [azz zz czz dzz]
+(at (select {r: (concat (first s) 'zz) by: x from: (select {from: TC where: (> x 1)})}) 'r) -- [zz czz dzz]
+(at (update {r: (concat (first s) 'zz) by: x from: TC}) 'r) -- [azz zz czz dzz]
+;; a STR column behaves the same way
+(set TS (table [x s] (list [1 2 3 4] ["a" "" "c" "d"])))
+(at (select {r: (concat (first s) "zz") by: x from: TS}) 'r) -- ["azz" "zz" "czz" "dzz"]
+(at (update {r: (concat (first s) "zz") by: x from: TS}) 'r) -- ["azz" "zz" "czz" "dzz"]
+;; a count is a number: it keeps collection semantics
+(count (select {r: (concat (count s) 'zz) from: TC})) -- 2
+;; a STR cell reduced from a STR column keeps STR output, ungrouped as grouped
+(at (select {r: (concat (first s) "zz") from: TS}) 'r) -- ["azz"]
+;; the same shape inside a lambda written in query text (tree walker) and in a
+;; named helper (bytecode)
+(at (select {r: ((fn [v] (concat (first v) 'zz)) s) by: x from: TC}) 'r) -- [azz zz czz dzz]
+(set hfirst (fn [v] (concat (first v) 'zz)))
+(at (select {r: (hfirst s) by: x from: TC}) 'r) -- [azz zz czz dzz]
+;; and when the helper cannot be inlined (two statements), so the reduction
+;; runs on the VM, on the tree walker (a lambda written in query text), and
+;; through a builtin held in a local (the VM's general call)
+(set hfirst2 (fn [v] 1 (concat (first v) 'zz)))
+(at (select {r: (hfirst2 s) by: x from: TC}) 'r) -- [azz zz czz dzz]
+(at (select {r: ((fn [v] 1 (concat (first v) 'zz)) s) by: x from: TC}) 'r) -- [azz zz czz dzz]
+(set hfirst3 (fn [v] 1 (let f first) (concat (f v) 'zz)))
+(at (select {r: (hfirst3 s) by: x from: TC}) 'r) -- [azz zz czz dzz]
