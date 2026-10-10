@@ -362,3 +362,21 @@
 (select {by: {k: (* x 2)} from: Tckp3 where: (> y 15)}) -- (table [k x y z] (list [6 8 4] [3 4 2] [30 40 20] [7 9 6]))
 (key (select {by: {a: x b: (* y 2)} from: Tckp3 where: (> y 15)})) -- ['a 'b 'x 'y 'z]
 (select {by: {k: (* x 2)} from: Tckp3 where: (> y 15) desc: k take: 2}) -- (table [k x y z] (list [8 6] [4 3] [40 30] [9 7]))
+;; on a parted table every no-output form matches the same select on the
+;; materialised table; each read a parted column as a plain one and failed
+(.sys.exec "rm -rf /tmp/rfl_ckparted")
+(.db.splayed.set "/tmp/rfl_ckparted/2024.01.01/t/" (table [x y s r] (list [3 1 4] [30 10 40] ['c 'a 'd] (list "c-long-string-over-12" "a" "d"))))
+(.db.splayed.set "/tmp/rfl_ckparted/2024.01.02/t/" (table [x y s r] (list [2 3 1 5] [20 31 11 50] ['b 'c 'a 'e] (list "b" "c2" "a2" "e"))))
+(set Pck (.db.parted.get "/tmp/rfl_ckparted/" 't))
+(set Mck (select {from: Pck where: (>= y 0)}))
+(count (select {by: x from: Pck})) -- 5
+(select {by: x from: Pck}) -- (select {by: x from: Mck})
+(select {by: x from: Pck desc: y take: 2}) -- (select {by: x from: Mck desc: y take: 2})
+(select {by: (% x 2) from: Pck asc: x}) -- (select {by: (% x 2) from: Mck asc: x})
+(select {by: s from: Pck}) -- (select {by: s from: Mck})
+(select {by: r from: Pck}) -- (select {by: r from: Mck})
+(select {by: [x s] from: Pck}) -- (select {by: [x s] from: Mck})
+(select {by: {k: (* x 2)} from: Pck}) -- (select {by: {k: (* x 2)} from: Mck})
+(select {by: date from: Pck}) -- (select {by: date from: Mck})
+(select {by: x from: Pck where: (> y 15)}) -- (select {by: x from: Mck where: (> y 15)})
+(.sys.exec "rm -rf /tmp/rfl_ckparted")

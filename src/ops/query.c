@@ -9620,6 +9620,16 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, bool aliases_resolved,
     if (n_out == 0 && !where_expr && !by_expr && !take_expr && !has_sort && !nearest_expr)
         { DICT_VIEW_CLOSE(dv); return tbl; }
 
+    /* A grouped select with no outputs returns the first row of each group,
+     * every column of it, and its paths read plain columns: a parted table
+     * is flattened first.  A where: flattens the rows it keeps itself. */
+    if (n_out == 0 && by_expr && !where_expr && table_has_parted_columns(tbl)) {
+        ray_t* flat = query_materialize_parted_table(tbl);
+        ray_release(tbl);
+        if (!flat || RAY_IS_ERR(flat)) { DICT_VIEW_CLOSE(dv); return flat ? flat : ray_error("oom", NULL); }
+        tbl = flat;
+    }
+
     /* Whole-table aggregates answered from column metadata:
      * `(select {from: T a: (sum c) b: (min d) …})` with no other clause, each
      * output one of count / min / max / sum / avg over a plain column that
