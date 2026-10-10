@@ -687,6 +687,18 @@ static void agg_gather_native_run(void* raw, uint32_t wid, int64_t start, int64_
     if (any_null) atomic_store_explicit(&c->any_null, true, memory_order_relaxed);
 }
 
+/* A result key column inherits its source column's "may have nulls" flag,
+ * but a fused `where:` can remove every null row, and the same query over
+ * the filtered table materialized first carries no flag: one result, two
+ * spellings on the wire.  For a typed key keep the flag only when a key
+ * value is null (the scan reads the flag, so it is set first).  Text keys
+ * keep theirs: for them the flag is always "may". */
+static void agg_key_col_settle_nulls(ray_t* kc) {
+    if (!kc || RAY_IS_ERR(kc) || kc->type == RAY_SYM || kc->type == RAY_STR || kc->type == RAY_LIST) return;
+    if ((kc->attrs & RAY_ATTR_HAS_NULLS) && !ray_vec_has_nulls(kc))
+        kc->attrs &= (uint8_t)~RAY_ATTR_HAS_NULLS;
+}
+
 /* Build a result key column of src_col's type by gathering the first-row cell
  * of each group at native (type-exact) byte width.  For SYM, adopts the source
  * domain so the intern ids resolve correctly.  Caller owns the returned column. */
@@ -735,10 +747,10 @@ ray_t* ray_group_gather(ray_t* src_col, const int64_t* first_row, int64_t n) {
         ray_pool_dispatch(pool, agg_gather_native_run, &c, n);
     else agg_gather_native_run(&c, 0, 0, n);
     if (agg_cancelled()) { ray_release(out); return ray_error("cancel", NULL); }
-    if (ray_vec_may_have_nulls(src_col) ||
-            (atomic_load_explicit(&c.any_null, memory_order_relaxed) &&
-             src_col->type != RAY_BOOL && src_col->type != RAY_U8))
-        out->attrs |= RAY_ATTR_HAS_NULLS;
+    bool gathered_null = atomic_load_explicit(&c.any_null, memory_order_relaxed) &&
+                         src_col->type != RAY_BOOL && src_col->type != RAY_U8;
+    if (gathered_null || ray_vec_may_have_nulls(src_col)) out->attrs |= RAY_ATTR_HAS_NULLS;
+    if (!gathered_null) agg_key_col_settle_nulls(out);
     return out;
 }
 
@@ -2006,6 +2018,7 @@ static ray_t* agg_dense_finish(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t
             if (kc->type == RAY_SYM) ray_sym_vec_adopt_domain(kc, sym_domain_rep(key_cols[k]));
             agg_dense_key_emit_t emit = {key_plan, occupied_slot, key_part_slots, key_bits, kc, k};
             ray_pool_dispatch(pool, agg_dense_key_emit, &emit, ng);
+            agg_key_col_settle_nulls(kc);
         }
         result = ray_table_add_col(result, key_syms[k], kc);
         ray_release(kc);
@@ -4267,6 +4280,7 @@ static ray_t* agg_parts_emit(ray_op_ext_t* ext, agg_desc_t* d,
         ray_release(result); return kerr;
     }
     for (uint32_t k = 0; k < n_keys; k++) {
+        agg_key_col_settle_nulls(kouts[k]);
         result = ray_table_add_col(result, key_syms[k], kouts[k]);
         ray_release(kouts[k]);
     }
