@@ -10702,7 +10702,10 @@ by_dict_done:
     int synth_count_col = 0;  /* 1 if we synthesized OP_COUNT for group boundaries */
     int has_list_agg = 0;     /* 1 if any aggregate emits a LIST column (top/bot) */
 
-    if (where_expr && by_expr && !nearest_expr &&
+    /* Not without outputs: the deferred filter runs on the aggregated
+     * result, which a no-output select does not reach; it filters the rows
+     * first, as for any other key. */
+    if (where_expr && by_expr && !nearest_expr && n_out > 0 &&
         can_defer_single_key_where(by_expr, where_expr, tbl)) {
         post_group_where_expr = where_expr;
         where_expr = NULL;
@@ -13422,6 +13425,8 @@ by_dict_done:
                                                     ray_table_get_col_idx(filtered_tbl, c));
                         }
                         ray_t* ck_vec = ray_eval(by_expr);
+                        if (ck_vec && !RAY_IS_ERR(ck_vec) && ray_is_lazy(ck_vec))
+                            ck_vec = ray_lazy_materialize(ck_vec);
                         ray_env_pop_scope();
                         if (ck_vec && !RAY_IS_ERR(ck_vec) &&
                             (ray_is_vec(ck_vec) || ck_vec->type == RAY_LIST)) {
@@ -13470,6 +13475,8 @@ by_dict_done:
                 }
                 ray_t* computed_key = derived_key_over_sym_domain(by_expr, filtered_tbl, NULL);
                 if (!computed_key) computed_key = ray_eval(by_expr);
+                if (computed_key && !RAY_IS_ERR(computed_key) && ray_is_lazy(computed_key))
+                    computed_key = ray_lazy_materialize(computed_key);   /* `(mmax 2 x)` */
                 ray_env_pop_scope();
                 if (!computed_key || RAY_IS_ERR(computed_key)) {
                     if (filtered_tbl != tbl) ray_release(filtered_tbl);
