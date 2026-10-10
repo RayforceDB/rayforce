@@ -329,7 +329,8 @@ static void pq_set_symmode(const char* v) { pq_set_env("RAY_PQ_SYM_MODE", v); }
  * leave one set). */
 static void pq_sym_env_clear(void) {
     const char* knobs[] = {"RAY_PQ_SYM_MODE","RAY_PQ_SYM_ORDER","RAY_PQ_SYM_GROUPS","RAY_PQ_SYM_WINDOW",
-                           "RAY_PQ_SYM_ARENA","RAY_PQ_SYM_HASH_BITS","RAY_PQ_SYM_INJECT","RAY_PQ_PASS_COLS"};
+                           "RAY_PQ_SYM_ARENA","RAY_PQ_SYM_HASH_BITS","RAY_PQ_SYM_INJECT","RAY_PQ_PASS_COLS",
+                           "RAY_PQ_SYM_RAM","RAY_PQ_DIRECT_REVERSE"};
     for (size_t i = 0; i < sizeof(knobs)/sizeof(knobs[0]); i++) pq_set_env(knobs[i], NULL);
 }
 
@@ -1236,17 +1237,18 @@ static const char* pq_synth_sparse(int64_t r, char* buf, uint32_t* len) {
  * low-cardinality column still goes direct, decoded once, ahead of the
  * grouped one (the sparse one included, smaller as it is), which takes its
  * strings into its index: every row's string and the direct import's
- * vocabulary (none twice), on one worker and four (the direct pass's
- * positions follow the workers, as the direct import's do); the trace
+ * vocabulary (none twice), on one worker and four the same files (the
+ * direct pass's dictionaries seeded in row-group order); the trace
  * tells which column went which way.  Forced grouped, both columns are. */
 static test_result_t test_pq_sym_mixed_modes(void) {
 #if !defined(DEBUG)
     SKIP("the memory the decision assumes is a debug-build knob");
 #else
     pq_sym_env_clear();
-    char src[160], dir[160];
+    char src[160], dir[160], ref[160];
     snprintf(src, sizeof(src), "/tmp/rayforce-pq-mixmode-%d.parquet", (int)getpid());
     snprintf(dir, sizeof(dir), "/tmp/rayforce-pq-mixmode-%d", (int)getpid());
+    snprintf(ref, sizeof(ref), "/tmp/rayforce-pq-mixmode-%d-ref", (int)getpid());
     int64_t rows = 20000;
     int64_t tids[] = {ray_sym_intern("I32",3), ray_sym_intern("SYM",3), ray_sym_intern("SYM",3)};
     ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 3);
@@ -1285,30 +1287,48 @@ static test_result_t test_pq_sym_mixed_modes(void) {
             fprintf(stderr, "  %d: no memory size mixes them: s %.0f, t %.0f, text %.0f\n", v, bs, bt, text);
             bad++;
         }
-        for (int run = 0; run < 3; run++) {
+        for (int run = 0; run < 4; run++) {
+            /* one worker's files kept for four workers' and for one worker's
+             * row groups last to first (a debug knob) */
+            const char* out = run ? dir : ref;
             TEST_ASSERT_EQ_I(pq_pool(run == 1 ? 4 : 1), RAY_OK);
             pq_set_env("RAY_PQ_SYM_RAM", ramv);
-            pq_set_symmode(run == 2 ? "grouped" : NULL);
-            res = pq_traced_import(src, dir, types, trace, cap);
+            pq_set_symmode(run == 3 ? "grouped" : NULL);
+            if (run == 2) pq_set_env("RAY_PQ_DIRECT_REVERSE", "1");
+            res = pq_traced_import(src, out, types, trace, cap);
             pq_sym_env_clear();
             if (!res || RAY_IS_ERR(res)) {
                 fprintf(stderr, "  %d/%d: import failed: %s\n", v, run, res ? ray_err_code(res) : "null");
                 if (res) ray_error_free(res);
-                char partial[200]; snprintf(partial, sizeof(partial), "%s.parquet-partial", dir);
+                char partial[200]; snprintf(partial, sizeof(partial), "%s.parquet-partial", out);
                 pq_remove_native(partial, names, 3);
                 bad++; continue;
             }
             ray_release(res);
-            if (!pq_synth_check(dir, rows, pq_synth_lowcard)) { fprintf(stderr, "  %d/%d: rows differ\n", v, run); bad++; }
-            if (pq_sym_count(dir) != words) { fprintf(stderr, "  %d/%d: %lld symbols, direct %lld\n", v, run, (long long)pq_sym_count(dir), (long long)words); bad++; }
+            if (!pq_synth_check(out, rows, pq_synth_lowcard)) { fprintf(stderr, "  %d/%d: rows differ\n", v, run); bad++; }
+            if (pq_sym_count(out) != words) { fprintf(stderr, "  %d/%d: %lld symbols, direct %lld\n", v, run, (long long)pq_sym_count(out), (long long)words); bad++; }
             bool s_direct = pq_trace_line_has(trace, "parquet symcol: col=s ", " mode=direct");
             bool t_grouped = pq_trace_line_has(trace, "parquet symcol: col=t ", " mode=grouped");
             int passes = 0;
             double adopted = pq_trace_sum(trace, "adopted", &passes);
             fprintf(stderr, "  %d/%d: s %s, t %s, grouped passes %d, adopted %.0f\n", v, run, s_direct ? "direct" : "grouped",
                     t_grouped ? "grouped" : "direct", passes, adopted);
-            if (run < 2 ? !s_direct || !t_grouped || passes != 1 || adopted != 40 : s_direct || !t_grouped || passes != 2) bad++;
-            pq_remove_native(dir, names, 3);
+            if (run < 3 ? !s_direct || !t_grouped || passes != 1 || adopted != 40 : s_direct || !t_grouped || passes != 2) bad++;
+            if (run == 1 || run == 2) {
+                /* the direct pass's positions too: s's dictionaries seeded
+                 * in row-group order */
+                char a[220], b[220];
+                bool same = true;
+                snprintf(a, sizeof(a), "%s/.sym", ref); snprintf(b, sizeof(b), "%s/.sym", dir);
+                if (!pq_same_file(a, b)) same = false;
+                for (int c = 1; c < 3; c++) {
+                    snprintf(a, sizeof(a), "%s/%s", ref, names[c]); snprintf(b, sizeof(b), "%s/%s", dir, names[c]);
+                    if (!pq_same_file(a, b)) same = false;
+                }
+                if (!same) { fprintf(stderr, "  %d/%d: files differ from one worker's\n", v, run); bad++; }
+                if (run == 2) pq_remove_native(ref, names, 3);
+            }
+            if (run) pq_remove_native(dir, names, 3);
         }
         unlink(src);
     }
@@ -2181,7 +2201,9 @@ static const char* pqx_unique(int64_t r, char* buf, uint32_t* len) {
  * writer's PLAIN fallback over the chunk's last eighth of the rows (with
  * the encoding stats, and without them), and PLAIN pages only.  And not a
  * blanket one: a dictionary of forty strings with the stats saying no data
- * page holds values stays small however many rows its ids cover. */
+ * page holds values stays small however many rows its ids cover.  The
+ * trace says which columns are dictionaries and ids only (dict_only), the
+ * only ones a grouped import may still take direct. */
 static const char* pqx_prefixed(int64_t r, char* buf, uint32_t* len) {
     memset(buf, 'P', 190);
     *len = 190 + (uint32_t)snprintf(buf + 190, 60, "%09lld", (long long)(r % 1000));
@@ -2192,6 +2214,12 @@ static const char* pqx_late(int64_t r, char* buf, uint32_t* len) {
     if (at < 7000) { *len = (uint32_t)snprintf(buf, 256, "q%lld", (long long)(r % 10)); return buf; }
     buf[0] = (char)(33 + (r / 8836) % 94); buf[1] = (char)(33 + (r / 94) % 94); buf[2] = (char)(33 + r % 94);
     *len = 3;
+    return buf;
+}
+/* A row in a thousand one of five strings, the rest null. */
+static const char* pqx_sparse_fallback(int64_t r, char* buf, uint32_t* len) {
+    if (r % 1000) return NULL;
+    *len = (uint32_t)snprintf(buf, 256, "z%lld", (long long)((r / 1000) % 5));
     return buf;
 }
 static test_result_t test_pq_sym_vocab_bound(void) {
@@ -2234,8 +2262,49 @@ static test_result_t test_pq_sym_vocab_bound(void) {
          * offset, a hash slot, at least 40 bytes) */
         if (size <= 0 || bound < (double)size + 40.0 * (double)pq_sym_count(dir)) bad++;
         if (cases[k].small && bound > 64 * 1024) bad++;
+        /* dictionary pages and ids only: the stats saying no data page holds values */
+        if (pq_trace_line_num(trace, "parquet symcol: col=p ", "dict_only") != (cases[k].flags & PQX_FALLBACK || !(cases[k].flags & PQX_DICT) ? 0 : 1)) {
+            fprintf(stderr, "  %s: dict_only %.0f\n", cases[k].what, pq_trace_line_num(trace, "parquet symcol: col=p ", "dict_only"));
+            bad++;
+        }
         pq_remove_native(dir, fnames, 2);
     }
+#if defined(DEBUG)
+    /* A column whose chunks hold values in data pages (a fallback, though
+     * nearly all its rows are null and its bound small) next to long unique
+     * strings, with memory such that its bound is within a sixty-fourth and
+     * the text past a quarter: it goes grouped all the same (a direct pass
+     * gives such strings positions in the workers' order), the other too. */
+    {
+        const char* nm2[2] = {"p","q"};
+        const char* fn2names[3] = {"x","p","q"};
+        pq_synth_fn fn2[2] = {pqx_sparse_fallback, pqx_unique};
+        unsigned fl2[2] = {PQX_FALLBACK, 0};
+        int64_t tids3[3] = {ray_sym_intern("I32", 3), ray_sym_intern("SYM", 3), ray_sym_intern("SYM", 3)};
+        ray_t* types3 = ray_vec_from_raw(RAY_SYM, tids3, 3);
+        TEST_ASSERT_TRUE(pqx_synth(src, 20000, 2, 2, nm2, fn2, fl2));
+        pq_set_symmode("direct");
+        ray_t* res = pq_traced_import(src, dir, types3, trace, cap);
+        pq_sym_env_clear();
+        TEST_ASSERT_FALSE(!res || RAY_IS_ERR(res)); ray_release(res);
+        pq_remove_native(dir, fn2names, 3);
+        double bp = pq_trace_line_num(trace, "parquet symcol: col=p ", "vocab_bytes");
+        double text = pq_trace_line_num(trace, "parquet symcol: col=p ", "text_bytes") +
+                      pq_trace_line_num(trace, "parquet symcol: col=q ", "text_bytes");
+        char ramv[32]; snprintf(ramv, sizeof(ramv), "%lld", (long long)(bp * 64));
+        if (bp <= 0 || bp * 64 / 4 >= text) { fprintf(stderr, "  sparse fallback: no memory size fits: p %.0f, text %.0f\n", bp, text); bad++; }
+        pq_set_env("RAY_PQ_SYM_RAM", ramv);
+        res = pq_traced_import(src, dir, types3, trace, cap);
+        pq_sym_env_clear();
+        TEST_ASSERT_FALSE(!res || RAY_IS_ERR(res)); ray_release(res);
+        TEST_ASSERT_TRUE(pqx_check(dir, 20000, 2, nm2, fn2, "sparse fallback", NULL));
+        bool p_grouped = pq_trace_line_has(trace, "parquet symcol: col=p ", " mode=grouped");
+        fprintf(stderr, "  sparse fallback: bound %.0f B, p %s\n", bp, p_grouped ? "grouped" : "direct");
+        if (!p_grouped) bad++;
+        pq_remove_native(dir, fn2names, 3);
+        ray_release(types3);
+    }
+#endif
     ray_sys_free(trace);
     ray_release(types); unlink(src);
     TEST_ASSERT_EQ_I(bad, 0);
@@ -2259,7 +2328,7 @@ static void pqx_modes(const char* trace, int n, const char* const* names, char* 
  * order (the direct ones are imported first), the symbol file the direct
  * import's size (no string twice, none lost), the null flags the direct
  * import's, and every grouped record's writeback started by its window.
- * Forced grouped, the files do not depend on the workers.  Then each
+ * Mixed or forced grouped, the files do not depend on the workers.  Then each
  * injected failure of a mixed import, and repeated imports keeping no
  * memory.  The default run is a subset of the matrix; PQX_FULL=1 runs all
  * of it (PQX_ROWS, PQX_RAM, PQX_TRACE change it; PQX_DET and
@@ -2405,9 +2474,8 @@ static test_result_t test_pq_symgrp_mixed_columns(void) {
             bool forced = run >= 32;
             /* the default run: neither none of the hash nor the small arena
              * with six bits of it (the collision tests have them), a window a
-             * task with four groups forced grouped only, and on four workers
-             * the forced runs only (the ones compared); PQX_FULL=1 all of it */
-            if (!full && (knob >= 2 || (!forced && (knob == 1 || cores > 1)))) continue;
+             * task with four groups forced grouped only; PQX_FULL=1 all of it */
+            if (!full && (knob >= 2 || (!forced && knob == 1))) continue;
             /* the first mixed decision of the sweep, then the last */
             const char* ram_mixed = getenv("PQX_RAM") ? getenv("PQX_RAM") : mixram[run < 16 ? 0 : nmix - 1];
             const char* window = knob & 1 ? "1" : knob == 2 ? "4096" : NULL;
@@ -2458,10 +2526,9 @@ static test_result_t test_pq_symgrp_mixed_columns(void) {
                     snprintf(a, sizeof(a), "%s/%s", ref, fnames[c]); snprintf(b, sizeof(b), "%s/%s", dir, fnames[c]);
                     if (!pq_same_file(a, b)) same = false;
                 }
-                /* a direct pass's positions follow the workers, as the
-                 * direct import's do (PQX_DET=1 shows it): only forced
-                 * grouped is compared */
-                if (!same && forced) { fprintf(stderr, "  [%s] files differ from one worker's\n", what); bad++; }
+                /* the direct passes of a mixed import too: their dictionaries
+                 * are interned in row-group order first (pq_seed_dicts) */
+                if (!same) { fprintf(stderr, "  [%s] files differ from one worker's\n", what); bad++; }
                 pq_remove_native(dir, fnames, N + 1);
                 pq_remove_native(ref, fnames, N + 1);
             }

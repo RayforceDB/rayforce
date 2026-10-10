@@ -1821,6 +1821,7 @@ typedef struct {
     bool writeback;                /* start each written chunk's writeback (one-pass layout) */
     pq_column* spare;              /* [nspare] each worker's buffers between its tasks */
     int64_t nspare;
+    bool reverse;                  /* debug: the row groups last to first (RAY_PQ_DIRECT_REVERSE) */
 } pq_direct_work;
 
 /* Trade a task cursor's page, dictionary and symbol buffers with its
@@ -1909,26 +1910,31 @@ static int pq_value_pages(pq_span stats) {
  * (unsure: then every data byte may be a string's, a string at least the 4
  * bytes of its length prefix).  An unreadable dictionary header counts the
  * whole chunk so. */
-static int64_t pq_chunk_vocab(ray_parquet_t* r, pq_span* mf) {
+static int64_t pq_chunk_vocab(ray_parquet_t* r, pq_span* mf, bool* dict_only) {
     int64_t raw = pq_get(mf[6],-1), values = pq_get(mf[5],-1);
     int64_t data = pq_get(mf[9],-1), dict = pq_get(mf[11],-1);
+    *dict_only = raw <= 0;
     if (raw <= 0) return 0;
     if (values < 0 || values > raw) values = raw;
     int64_t draw, entries, rest = raw, bound = 0;
     if (dict > 0 && dict < data && pq_dict_header(r,dict,&draw,&entries)) {
         bound = draw + PQ_DIRECT_STRING_COST*entries;
-        rest = pq_value_pages(mf[13]) == 0 ? 0 : raw > draw ? raw - draw : raw;
+        *dict_only = pq_value_pages(mf[13]) == 0;
+        rest = *dict_only ? 0 : raw > draw ? raw - draw : raw;
     }
     int64_t n = rest / 4 < values ? rest / 4 : values;
     return bound + rest + PQ_DIRECT_STRING_COST*n;
 }
 /* The symbol columns' bounds (pq_chunk_vocab), summed over the row groups,
- * into vocab[c] for the columns order[from, to).  The dictionary page
- * headers are asked for all at once first (one small read each, in flight
- * together) and then parsed. */
-static void pq_vocab_bounds(ray_parquet_t* r, const int64_t* order, int64_t from, int64_t to, int64_t* vocab) {
+ * into vocab[c] for the columns order[from, to), and in dict_only[c]
+ * whether every chunk's strings are its dictionary page's (the encoding
+ * stats say no data page holds values).  The dictionary page headers are
+ * asked for all at once first (one small read each, in flight together)
+ * and then parsed. */
+static void pq_vocab_bounds(ray_parquet_t* r, const int64_t* order, int64_t from, int64_t to, int64_t* vocab,
+                            uint8_t* dict_only) {
     pq_span* cols = ray_calloc_raw((size_t)r->ncols*sizeof(*cols));
-    for (int64_t i = from; i < to; i++) vocab[order[i]] = cols ? 0 : INT64_MAX;
+    for (int64_t i = from; i < to; i++) { vocab[order[i]] = cols ? 0 : INT64_MAX; dict_only[order[i]] = cols != NULL; }
     if (!cols) return;
     for (int pass = 0; pass < 2; pass++)
         for (int64_t g = 0; g < r->ngroups; g++) {
@@ -1936,18 +1942,58 @@ static void pq_vocab_bounds(ray_parquet_t* r, const int64_t* order, int64_t from
             bool ok = pq_group_columns(r,g,cols,&rows,NULL);
             for (int64_t i = from; i < to; i++) {
                 int64_t c = order[i]; pq_span mf[17];
-                if (!ok || !pq_fields(cols[c],mf,17)) { if (pass) vocab[c] = INT64_MAX; continue; }
+                if (!ok || !pq_fields(cols[c],mf,17)) { if (pass) { vocab[c] = INT64_MAX; dict_only[c] = 0; } continue; }
                 if (!pass) {
                     int64_t dict = pq_get(mf[11],-1);
                     if (dict >= 4 && (uint64_t)dict < r->data_end)
                         ray_vm_advise_willneed(r->map + dict,(size_t)(r->data_end - (uint64_t)dict < 256 ? r->data_end - (uint64_t)dict : 256));
                     continue;
                 }
-                int64_t v = pq_chunk_vocab(r,mf);
+                bool only;
+                int64_t v = pq_chunk_vocab(r,mf,&only);
                 vocab[c] = v > INT64_MAX - vocab[c] ? INT64_MAX : vocab[c] + v;
+                if (!only) dict_only[c] = 0;
             }
         }
     ray_free_raw(cols);
+}
+/* A direct column of a grouped import: the dictionary pages of its chunks
+ * interned in row-group order before its pass (its chunks are dictionary
+ * pages and ids only, pq_vocab_bounds' dict_only), so the parallel pass
+ * finds every string there and the positions do not depend on the workers.
+ * The pages are asked for together first; false on one it cannot read. */
+static bool pq_seed_dicts(ray_parquet_t* r, const int64_t* order, int64_t from, int64_t to, int64_t* entries) {
+    pq_span* cols = ray_calloc_raw((size_t)r->ncols*sizeof(*cols));
+    bool ok = cols != NULL;
+    for (int pass = 0; ok && pass < 2; pass++)
+        for (int64_t g = 0; ok && g < r->ngroups; g++) {
+            int64_t rows = 0;
+            ok = pq_group_columns(r,g,cols,&rows,NULL);
+            for (int64_t i = from; ok && i < to; i++) {
+                int64_t c = order[i]; pq_span mf[17];
+                if (!pq_fields(cols[c],mf,17)) { ok = false; break; }
+                int64_t dict = pq_get(mf[11],-1), data = pq_get(mf[9],-1), codec = pq_get(mf[4],-1);
+                if (pq_get(mf[6],-1) <= 0) continue;   /* no values */
+                if (dict < 4 || dict >= data || (uint64_t)data > r->data_end || (codec != 0 && codec != 1)) { ok = false; break; }
+                if (!pass) { ray_vm_advise_willneed(r->map + dict,(size_t)(data - dict)); continue; }
+                pq_cur cur = {r->map+dict,r->map+data,false};
+                const uint8_t* start = cur.p;
+                pq_span f[10], h[4];
+                if (!pq_skip(&cur,12,0,false) || !pq_fields((pq_span){start,cur.p,12},f,10) || pq_get(f[1],-1) != 2 ||
+                    !pq_fields(f[7],h,4)) { ok = false; break; }
+                int64_t raw = pq_get(f[2],-1), size = pq_get(f[3],-1), count = pq_get(h[1],-1);
+                const uint8_t* payload;
+                if (raw < 0 || raw > PQ_MAX_PAGE || size < 0 || size > PQ_MAX_PAGE || !pq_take(&cur,(uint64_t)size,&payload)) { ok = false; break; }
+                pq_column col = {0};
+                col.codec = (int)codec;
+                pq_schema sch = r->schema[c];
+                ok = sch.import_domain && pq_dictionary(&col,&sch,payload,(size_t)size,(size_t)raw,count);
+                if (ok) *entries += count;
+                ray_free_raw(col.dict); ray_free_raw(col.strings); ray_free_raw(col.symbol_ids); ray_free_raw(col.symbols);
+            }
+        }
+    ray_free_raw(cols);
+    return ok;
 }
 
 /* A mapped column chunk is read on first touch, one fault at a time per
@@ -1977,6 +2023,7 @@ static void pq_write_direct_group(void* ptr, uint32_t worker, int64_t start, int
         /* Row groups outermost within a pass: a worker reads one group's
          * chunks of the pass's columns side by side. */
         int64_t g = task/w->npass, c = w->pass[task%w->npass];
+        if (w->reverse) g = w->parent->ngroups-1-g;
         if (w->prefetched) pq_prefetch_chunks(w,g,c);
         ray_parquet_t* r = pq_group_reader(w->parent,g,1);
         if (!r) { w->errors[task] = ray_error("oom",NULL); continue; }
@@ -2776,6 +2823,7 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
     int64_t* hi = ray_alloc_raw((size_t)(chunks+1)*sizeof(*hi));
     int64_t* bytes = ray_calloc_raw((size_t)r->ncols*sizeof(*bytes));
     int64_t* vocab = ray_calloc_raw((size_t)r->ncols*sizeof(*vocab));   /* pq_vocab_bounds */
+    uint8_t* donly = ray_calloc_raw((size_t)r->ncols);   /* pq_vocab_bounds */
     int64_t* order = ray_alloc_raw((size_t)r->ncols*sizeof(*order));
     _Atomic uint8_t* prefetched = NULL;
     pq_column* spare = NULL;   /* pq_direct_work.spare */
@@ -2786,7 +2834,7 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
     pq_symflush_t symf = {NULL,false,(int)RAY_OK};
     ray_thread_t sym_thread = 0;
     bool sym_running = false;
-    if (!offsets || !nulls || !locks || !errors || !lo || !hi || !bytes || !vocab || !order) { err = ray_error("oom",NULL); goto done; }
+    if (!offsets || !nulls || !locks || !errors || !lo || !hi || !bytes || !vocab || !donly || !order) { err = ray_error("oom",NULL); goto done; }
     for (int64_t c = 0; c < r->ncols; c++) {
         size_t size = writers[c].type == RAY_SYM ? 4 : ray_elem_size(writers[c].type);
         if (r->rows > (INT64_MAX-32)/(int64_t)size) { err = pq_error("native column exceeds file offset range"); goto done; }
@@ -2840,11 +2888,14 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
     bool trace = getenv("RAY_CSV_TRACE") != NULL;   /* the converters' phase trace */
     spare = ray_calloc_raw((size_t)workers*sizeof(*spare));   /* best effort */
     if (spare) nspare = workers;
-    pq_direct_work work = {r,writers,offsets,nulls,locks,errors,NULL,0,lo,hi,NULL,0,0,true,spare,nspare};
+    pq_direct_work work = {r,writers,offsets,nulls,locks,errors,NULL,0,lo,hi,NULL,0,0,true,spare,nspare,false};
     /* Starting each chunk's writeback as it is written spares one pass its
      * final sync; column by column the passes end their files anyway and
      * the extra I/O requests only slow the decode. */
     work.writeback = !colwise;
+#if defined(DEBUG)
+    work.reverse = getenv("RAY_PQ_DIRECT_REVERSE") != NULL;   /* the suite: positions not in task order */
+#endif
     {
         const char* e = getenv("RAY_PQ_PREFETCH");
         work.prefetch = (e && *e) ? strtol(e,NULL,10) : 2;
@@ -2876,11 +2927,18 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
      * columns' vocabularies stay within a sixteenth together.  The direct
      * columns go first (the dictionary's index serves only them), the
      * grouped ones after them, which take the direct ones' strings into
-     * their own index (ray_symgrp_adopt).
+     * their own index (ray_symgrp_adopt).  Only a column whose chunks are
+     * a dictionary page and ids (the encoding stats say so) goes direct so,
+     * its dictionaries interned in row-group order before the passes
+     * (pq_seed_dicts): its positions do not depend on the workers, as the
+     * grouped ones' do not.  The import direct throughout (its text within a
+     * quarter of memory, or RAY_PQ_SYM_MODE=direct) gives positions in the
+     * order its tasks run, as it always has.
      * RAY_PQ_SYM_MODE=direct|grouped decides for every column instead, and
      * RAY_PQ_SYM_ORDER (rows|shards|freq|rowsflat) and RAY_PQ_SYM_GROUPS set
      * the grouped import's order of new positions and hash groups.  Debug
-     * builds: RAY_PQ_SYM_RAM sets the memory these decisions assume. */
+     * builds: RAY_PQ_SYM_RAM sets the memory these decisions assume, and
+     * RAY_PQ_DIRECT_REVERSE runs the direct passes' row groups last to first. */
     pq_sym_mode mode = PQ_SYM_AUTO;
     {
         const char* e = getenv("RAY_PQ_SYM_MODE");
@@ -2897,23 +2955,28 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
     simp = nnum < r->ncols ? ray_sym_domain_import(writers[order[nnum]].dom) : NULL;
     int64_t nd = r->ncols;   /* order[nnum, nd): direct symbol columns, [nd, ncols): grouped */
     bool bounded = false;    /* vocab[] filled (pq_vocab_bounds) */
+    bool seed = false;       /* direct columns of a grouped import: pq_seed_dicts */
     if (mode == PQ_SYM_AUTO && simp) {
         int64_t text = 0;
         for (int64_t i = nnum; i < r->ncols; i++) text = bytes[order[i]] > INT64_MAX - text ? INT64_MAX : text + bytes[order[i]];
         mode = sram > 0 && text > sram / 4 ? PQ_SYM_GROUPED : PQ_SYM_DIRECT;
-        if (mode == PQ_SYM_GROUPED) { pq_vocab_bounds(r,order,nnum,r->ncols,vocab); bounded = true; }
+        if (mode == PQ_SYM_GROUPED) { pq_vocab_bounds(r,order,nnum,r->ncols,vocab,donly); bounded = true; }
         if (mode == PQ_SYM_GROUPED) {
-            /* the direct ones, marked by a negated vocabulary */
+            /* the direct ones (only columns whose chunks are dictionaries and
+             * ids: their dictionaries seeded in row-group order make their
+             * positions the workers' no matter), marked by a negated
+             * vocabulary */
             int64_t sum = 0, ndirect = 0;
             for (;;) {
                 int64_t best = -1;
                 for (int64_t i = nnum; i < r->ncols; i++) {
                     int64_t c = order[i];
-                    if (vocab[c] >= 0 && (best < 0 || vocab[c] < vocab[best])) best = c;
+                    if (vocab[c] >= 0 && donly[c] && (best < 0 || vocab[c] < vocab[best])) best = c;
                 }
                 if (best < 0 || vocab[best] > sram / 64 || vocab[best] > sram / 16 - sum) break;
                 sum += vocab[best]; vocab[best] = -1 - vocab[best]; ndirect++;
             }
+            seed = ndirect > 0;
             if (ndirect == r->ncols - nnum) mode = PQ_SYM_DIRECT;
             else {
                 /* direct first, each part by size as before (a stable split) */
@@ -2939,13 +3002,19 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
         if (!sgrp) { err = ray_error("oom",NULL); goto done; }
         if (nd == r->ncols) nd = nnum;   /* forced: every symbol column grouped */
     } else nd = r->ncols;
-    if (trace && simp && !bounded) pq_vocab_bounds(r,order,nnum,r->ncols,vocab);   /* for the trace */
+    if (seed) {
+        int64_t ts = trace ? ray_profile_now_ns() : 0, entries = 0;
+        if (!pq_seed_dicts(r,order,nnum,nd,&entries)) { err = pq_error("symbol dictionary page unreadable or allocation failed"); goto done; }
+        if (trace) fprintf(stderr,"parquet symseed: cols=%lld groups=%lld entries=%lld ms=%.1f\n",(long long)(nd-nnum),
+                           (long long)r->ngroups,(long long)entries,(double)(ray_profile_now_ns()-ts)/1e6);
+    }
+    if (trace && simp && !bounded) pq_vocab_bounds(r,order,nnum,r->ncols,vocab,donly);   /* for the trace */
     if (trace && simp)
         for (int64_t i = nnum; i < r->ncols; i++) {
             ray_t* nm = ray_sym_str(r->schema[order[i]].name);
-            fprintf(stderr,"parquet symcol: col=%.*s text_mb=%.3f text_bytes=%lld vocab_mb=%.3f vocab_bytes=%lld mode=%s\n",
+            fprintf(stderr,"parquet symcol: col=%.*s text_mb=%.3f text_bytes=%lld vocab_mb=%.3f vocab_bytes=%lld dict_only=%d mode=%s\n",
                     (int)ray_str_len(nm),ray_str_ptr(nm),(double)bytes[order[i]]/1048576.0,(long long)bytes[order[i]],
-                    (double)vocab[order[i]]/1048576.0,(long long)vocab[order[i]],i < nd ? "direct" : "grouped");
+                    (double)vocab[order[i]]/1048576.0,(long long)vocab[order[i]],(int)donly[order[i]],i < nd ? "direct" : "grouped");
         }
     if (!sgrp && nnum < r->ncols && writers[order[nnum]].dom) {
         symf.dom = writers[order[nnum]].dom;
@@ -3042,7 +3111,7 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
 done:
     for (int64_t c = 0; c < r->ncols; c++) r->schema[c].import_domain = NULL;
     ray_free_raw(offsets); ray_free_raw(nulls); ray_free_raw(locks); ray_free_raw(errors);
-    ray_free_raw(lo); ray_free_raw(hi); ray_free_raw(bytes); ray_free_raw(vocab); ray_free_raw(order);
+    ray_free_raw(lo); ray_free_raw(hi); ray_free_raw(bytes); ray_free_raw(vocab); ray_free_raw(donly); ray_free_raw(order);
     if (prefetched) ray_free_raw((void*)prefetched);
     for (int64_t i = 0; i < nspare; i++) {
         ray_free_raw(spare[i].page); ray_free_raw(spare[i].dict); ray_free_raw(spare[i].symbols);
