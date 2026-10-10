@@ -219,3 +219,108 @@
 (set RHolF2 (select {m: (min s) c: (count s) from: THol where: (>= v 100000) by: k}))
 (sum (at RHolF2 'c)) -- 100000
 (at (at (select {m: m from: RHolF2 where: (== k "0")}) 'm) 0) -- "100000"
+
+;; ────────────────────────────────────────────────────────────────────
+;; Computed by: key with no outputs.  The DAG no-agg branch regroups a
+;; computed key (key_sym < 0) at eval level and returned that result
+;; without apply_sort_take, so asc:/desc:/take: were dropped and every
+;; group came back in first-seen order.  Oracles: the same key
+;; materialized as a column (a plain key), and the computed key beside an
+;; output.  The key column keeps its derived name, `x`.
+;; ────────────────────────────────────────────────────────────────────
+(set Tck (table [x y] (list [3 1 4 2 3 1] [30 10 40 20 31 11])))
+(set Tckp (update {k: (* x 2) from: Tck}))
+(select {by: (* x 2) from: Tck desc: x take: 2}) -- (table [x y] (list [8 6] [40 30]))
+(at (select {by: (* x 2) from: Tck desc: x take: 2}) 'x) -- (at (select {c: (count y) by: (* x 2) from: Tck desc: x take: 2}) 'x)
+(at (select {by: (* x 2) from: Tck desc: x take: 2}) 'y) -- (at (select {by: k from: Tckp desc: k take: 2}) 'y)
+;; asc: and desc: alone, on the key and on a source column
+(select {by: (* x 2) from: Tck asc: x}) -- (table [x y] (list [2 4 6 8] [10 20 30 40]))
+(at (select {by: (* x 2) from: Tck desc: y}) 'x) -- [8 6 4 2]
+(at (select {by: (* x 2) from: Tck desc: y}) 'y) -- (at (select {by: k from: Tckp desc: y}) 'y)
+;; take: alone keeps first-seen group order: head, tail, range, more than the groups
+(select {by: (* x 2) from: Tck take: 2}) -- (table [x y] (list [6 2] [30 10]))
+(at (select {by: (* x 2) from: Tck take: -1}) 'y) -- (at (select {by: k from: Tckp take: -1}) 'y)
+(at (select {by: (* x 2) from: Tck take: [1 2]}) 'y) -- (at (select {by: k from: Tckp take: [1 2]}) 'y)
+(at (select {by: (* x 2) from: Tck desc: x take: 10}) 'x) -- [8 6 4 2]
+;; where: filters the rows before the grouping
+(select {by: (* x 2) from: Tck where: (> y 15) asc: x take: 2}) -- (table [x y] (list [4 6] [20 30]))
+;; several rows per group: the first row of each, as for a plain key
+(select {by: (% x 2) from: Tck asc: x}) -- (table [x y] (list [0 1] [40 30]))
+(at (select {by: (% x 2) from: Tck desc: y take: 1}) 'y) -- [40]
+;; a null key sorts as the plain key's null does
+(set Tckn (table [x y] (list [1 0N 3 0N 5] [10 20 30 40 50])))
+(set Tcknp (update {k: (* x 2) from: Tckn}))
+(at (select {by: (* x 2) from: Tckn desc: x}) 'y) -- (at (select {by: k from: Tcknp desc: k}) 'y)
+(at (select {by: (* x 2) from: Tckn asc: x take: 2}) 'y) -- (at (select {by: k from: Tcknp asc: k take: 2}) 'y)
+(at (select {by: (* x 2) from: Tckn asc: x take: 2}) 'y) -- [20 10]
+;; STR and LIST columns are gathered whole.  The branch built every column
+;; with store_typed_elem, which has no STR case: the cells came back empty
+;; or stale, and a sort on them read an unset string pool.
+(set Tcks (table [x r] (list [3 1 4 2 3 1] (list "c-long-string-over-12" "a-long-string-over-12" "d-long-string-over-12" "b-long-string-over-12" "c2" "a2"))))
+(set Tcksp (update {k: (* x 2) from: Tcks}))
+(at (select {by: (* x 2) from: Tcks}) 'r) -- ["c-long-string-over-12" "a-long-string-over-12" "d-long-string-over-12" "b-long-string-over-12"]
+(at (select {by: (* x 2) from: Tcks}) 'r) -- (at (select {by: k from: Tcksp}) 'r)
+(at (select {by: (* x 2) from: Tcks desc: r}) 'r) -- (at (select {by: k from: Tcksp desc: r}) 'r)
+(at (select {by: (* x 2) from: Tcks desc: r}) 'x) -- [8 6 4 2]
+(at (select {by: (* x 2) from: Tcks desc: r take: 2}) 'r) -- (at (select {by: k from: Tcksp desc: r take: 2}) 'r)
+(at (select {by: (* x 2) from: Tcks desc: r take: 2}) 'r) -- ["d-long-string-over-12" "c-long-string-over-12"]
+(set Tckl (table [x l] (list [3 1 4 2] (list [1 2] [3] [4 5 6] [7]))))
+(set Tcklp (update {k: (* x 2) from: Tckl}))
+(at (select {by: (* x 2) from: Tckl}) 'l) -- (at (select {by: k from: Tcklp}) 'l)
+(at (select {by: (* x 2) from: Tckl desc: x take: 2}) 'l) -- (at (select {by: k from: Tcklp desc: k take: 2}) 'l)
+(at (select {by: (* x 2) from: Tckl desc: x take: 2}) 'l) -- (list [4 5 6] [1 2])
+;; a STR computed key, over more rows than one gather chunk
+(set Tckb (table [x r] (list (til 8192) (concat "row-string-over-twelve-" (as 'STR (% (til 8192) 700))))))
+(set Tckbp (update {k: (concat r "!") from: Tckb}))
+(count (select {by: (concat r "!") from: Tckb})) -- 700
+(at (select {by: (concat r "!") from: Tckb desc: r take: 3}) 'r) -- (at (select {by: k from: Tckbp desc: k take: 3}) 'k)
+(at (select {by: (concat r "!") from: Tckb desc: r take: 3}) 'x) -- [99 98 97]
+(at (select {by: (concat r "!") from: Tckb asc: x take: -2}) 'r) -- (at (select {by: k from: Tckbp asc: x take: -2}) 'k)
+;; a dotted key takes the same branch; the by-dict form is the oracle
+(set Tckt (table [ts v] (list [2024.01.02D10:00:00.000000000 2024.01.01D09:00:00.000000000 2024.01.02D11:00:00.000000000 2024.01.03D08:00:00.000000000 2024.01.01D12:00:00.000000000] [1 2 3 4 5])))
+(select {by: ts.date from: Tckt desc: date take: 2}) -- (select {by: {date: ts.date} from: Tckt desc: date take: 2})
+(select {by: ts.date from: Tckt asc: date}) -- (select {by: {date: ts.date} from: Tckt asc: date})
+(select {by: ts.date from: Tckt where: (> v 1) desc: v take: -2}) -- (select {by: {date: ts.date} from: Tckt where: (> v 1) desc: v take: -2})
+(at (select {by: ts.date from: Tckt desc: date take: 2}) 'v) -- [4 1]
+;; a LIST-valued key: ray_is_vec leaves out RAY_LIST, so the key column was
+;; never gathered and the source column it replaces was dropped with it.
+;; The plain LIST key is the oracle.  The identity lambda is a row-aligned
+;; LIST key that the planned grouping and this branch evaluate alike.
+(set Tckk (table [x l] (list [3 1 4 2] (list [1 2] [3] [4 5 6] [3]))))
+(select {by: ((fn [a] a) l) from: Tckk}) -- (select {by: l from: Tckk})
+(at (select {by: ((fn [a] a) l) from: Tckk}) 'l) -- (at (select {c: (count x) by: ((fn [a] a) l) from: Tckk}) 'l)
+(select {by: ((fn [a] a) l) from: Tckk desc: x}) -- (select {by: l from: Tckk desc: x})
+(select {by: ((fn [a] a) l) from: Tckk desc: x take: 2}) -- (select {by: l from: Tckk desc: x take: 2})
+(select {by: ((fn [a] a) l) from: Tckk desc: x take: 2}) -- (table [l x] (list (list [4 5 6] [1 2]) [4 3]))
+(select {by: ((fn [a] a) l) from: Tckk desc: x take: -2}) -- (select {by: l from: Tckk desc: x take: -2})
+(select {by: ((fn [a] a) l) from: Tckk where: (== x 4)}) -- (select {by: l from: Tckk where: (== x 4)})
+(select {by: ((fn [a] a) l) from: Tckk where: (> x 100)}) -- (select {by: l from: Tckk where: (> x 100)})
+;; a key of another length is no row-aligned key: its group rows would index
+;; past the gathered columns.  A LIST key gets past the planned grouping's
+;; own length check, which looks at vectors only.
+(select {by: ((fn [a] (concat a a)) l) from: Tckk desc: x}) !- length
+(select {by: (concat l l) from: Tckk desc: x}) !- length
+;; (concat x 99), bare or in a lambda, passes the planned grouping as a
+;; row-wise string concat and reaches this branch as 5 values
+(select {by: (concat x 99) from: Tckk}) !- length
+(select {by: ((fn [a] (concat a 99)) x) from: Tckk}) !- length
+;; one value is one group, holding the first row
+(select {by: ((fn [a] [7]) x) from: Tcks}) -- (table [x r] (list [7] (list "c-long-string-over-12")))
+;; a name that is no column (a global vector) is grouped by its values, as
+;; the with-output and by-dict forms group it.  The branch took it for a
+;; column and dereferenced the NULL its lookup returned.
+(set Tckg (table [x y] (list [3 1 4 2] [30 10 40 20])))
+(set Vck1 [7])
+(set Vck4 [1 1 2 2])
+(set VckL (list [1] [1] [2] [2]))
+(select {by: Vck1 from: Tckg}) -- (table [Vck1 x y] (list [7] [3] [30]))
+(select {by: Vck4 from: Tckg}) -- (table [Vck4 x y] (list [1 2] [3 4] [30 40]))
+(value (select {by: Vck4 from: Tckg})) -- (value (select {by: {k: Vck4} from: Tckg}))
+(at (select {by: Vck4 from: Tckg}) 'Vck4) -- (first (value (select {c: (count y) by: Vck4 from: Tckg})))
+(select {by: Vck4 from: Tckg desc: y take: 1}) -- (table [Vck4 x y] (list [2] [4] [40]))
+(select {by: Vck1 from: Tckg where: (> y 15)}) -- (table [Vck1 x y] (list [7] [3] [30]))
+(key (select {by: Vck1 from: Tckg where: (> y 100)})) -- ['Vck1 'x 'y]
+(count (select {by: Vck1 from: Tckg where: (> y 100)})) -- 0
+;; a global LIST is no key here, as with an output
+(select {by: VckL from: Tckg}) !- schema
+(select {c: (count y) by: VckL from: Tckg}) !- schema

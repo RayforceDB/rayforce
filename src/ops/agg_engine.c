@@ -696,7 +696,14 @@ ray_t* ray_group_gather(ray_t* src_col, const int64_t* first_row, int64_t n) {
         if (!out || RAY_IS_ERR(out)) return out;
         for (int64_t i = 0; i < n; i++) {
             ray_t* value = first_row[i] < 0 ? NULL : ray_list_get(src_col, first_row[i]);
-            out = ray_list_append(out, value);
+            /* A failed append returns an error and leaves `out`, with the
+             * items it already retained, to the caller. */
+            ray_t* next = ray_list_append(out, value);
+            if (!next || RAY_IS_ERR(next)) {
+                ray_release(out);
+                return next ? next : ray_error("oom", NULL);
+            }
+            out = next;
         }
         return out;
     }

@@ -13035,6 +13035,10 @@ by_dict_done:
             /* No explicit aggregations — apply WHERE filter first (if any),
              * then use DAG GROUP+COUNT for fast hash-parallel group boundaries,
              * then gather first-of-group from the filtered table. */
+            /* The fused WHERE above kept a reference to its selection for the
+             * count(distinct) scatter; this branch has no outputs and returns
+             * before the release at the end of the select. */
+            if (saved_selection) { ray_release(saved_selection); saved_selection = NULL; }
             ray_t* filtered_tbl = tbl;
             if (where_expr) {
                 root = ray_optimize(g, root);
@@ -13085,6 +13089,10 @@ by_dict_done:
                 key_sym = by_expr->i64;
             else if (by_expr->type == RAY_SYM && ray_len(by_expr) == 1)
                 key_sym = ((int64_t*)ray_data(by_expr))[0];
+            /* So must a name that is no column of the table (a global
+             * vector): the grouping above evaluated it as an expression. */
+            if (key_sym >= 0 && !ray_table_get_col(filtered_tbl, key_sym))
+                key_sym = -1;
 
             if (n_groups == 0) {
                 ray_release(grouped);
@@ -13151,7 +13159,8 @@ by_dict_done:
                         }
                         ray_t* ck_vec = ray_eval(by_expr);
                         ray_env_pop_scope();
-                        if (ck_vec && !RAY_IS_ERR(ck_vec) && ray_is_vec(ck_vec)) {
+                        if (ck_vec && !RAY_IS_ERR(ck_vec) &&
+                            (ray_is_vec(ck_vec) || ck_vec->type == RAY_LIST)) {
                             int8_t kt = ck_vec->type;
                             empty_key_vec = (kt == RAY_STR)
                                             ? ray_vec_new(RAY_STR, 0)
@@ -13200,6 +13209,22 @@ by_dict_done:
                     if (filtered_tbl != tbl) ray_release(filtered_tbl);
                     ray_release(tbl);
                     scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return computed_key ? computed_key : ray_error("domain", "select by: failed to evaluate group key expression");
+                }
+                /* A key of another length is no row-aligned key (the DAG
+                 * group's rule; one value is one group): its group rows
+                 * would index past the columns gathered below. */
+                {
+                    int64_t ck_rows = ray_table_nrows(filtered_tbl);
+                    int64_t ck_len = (ray_is_vec(computed_key) || computed_key->type == RAY_LIST)
+                                     ? ray_len(computed_key) : ck_rows;
+                    if (ck_len != ck_rows && ck_len != 1) {
+                        ray_release(computed_key);
+                        if (filtered_tbl != tbl) ray_release(filtered_tbl);
+                        ray_release(tbl);
+                        scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv);
+                        return ray_error("length", "by: key has %lld values for %lld rows",
+                                         (long long)ck_len, (long long)ck_rows);
+                    }
                 }
                 ray_t* groups2_dict = ray_group_indices_fn(computed_key);
                 if (!groups2_dict || RAY_IS_ERR(groups2_dict)) {
@@ -13295,45 +13320,46 @@ by_dict_done:
                     }
                 }
 
+                /* Columns are gathered at the first row of each group by
+                 * ray_group_gather, which builds every column type: STR
+                 * (store_typed_elem has no STR case and left the cells
+                 * unset), LIST, GUID and SYM over its own domain. */
                 ray_t* res2 = ray_table_new(tbl_ncols + 1);
                 /* Key column: computed_key's first-of-group values, which
                  * are the distinct grouping-key values surfaced to the
                  * user.  Using the source column at fi2 indices would lose
                  * the transform (e.g. raw Timestamp instead of its `.ss`). */
-                if (ray_is_vec(computed_key)) {
-                    ray_t* kv = ray_vec_new(computed_key->type, ng2);
-                    if (!RAY_IS_ERR(kv)) {
-                        /* len BEFORE store loop — ray_vec_set_null (called
-                         * by store_typed_elem for null atoms) range-checks
-                         * idx against vec->len and silently no-ops
-                         * otherwise. */
-                        kv->len = ng2;
-                        for (int64_t g2 = 0; g2 < ng2; g2++) {
-                            int a2 = 0;
-                            ray_t* v2 = collection_elem(computed_key, fi2[g2], &a2);
-                            store_typed_elem(kv, g2, v2);
-                            if (a2) ray_release(v2);
-                        }
+                if ((ray_is_vec(computed_key) || computed_key->type == RAY_LIST) && !RAY_IS_ERR(res2)) {
+                    ray_t* kv = ray_group_gather(computed_key, fi2, ng2);
+                    if (!kv || RAY_IS_ERR(kv)) {
+                        ray_release(res2);
+                        res2 = kv ? kv : ray_error("oom", NULL);
+                    } else {
                         res2 = ray_table_add_col(res2, ckey_name, kv);
                         ray_release(kv);
                     }
                 }
-                for (int64_t c = 0; c < tbl_ncols; c++) {
+                for (int64_t c = 0; c < tbl_ncols && !RAY_IS_ERR(res2); c++) {
                     int64_t cn = ray_table_col_name(filtered_tbl, c);
                     /* Avoid duplicating a column name already used by the
                      * key: e.g. `by: Timestamp` (plain, non-dotted) would
                      * collide with the source Timestamp column. */
                     if (cn == ckey_name) continue;
                     ray_t* sc = ray_table_get_col_idx(filtered_tbl, c);
-                    ray_t* dc = ray_vec_new(sc->type, ng2);
-                    dc->len = ng2;    /* see note above — hoisted for null bits */
-                    for (int64_t g2 = 0; g2 < ng2; g2++) { int a2 = 0; ray_t* v2 = collection_elem(sc, fi2[g2], &a2); store_typed_elem(dc, g2, v2); if (a2) ray_release(v2); }
+                    ray_t* dc = ray_group_gather(sc, fi2, ng2);
+                    if (!dc || RAY_IS_ERR(dc)) {
+                        ray_release(res2);
+                        res2 = dc ? dc : ray_error("oom", NULL);
+                        break;
+                    }
                     res2 = ray_table_add_col(res2, cn, dc); ray_release(dc);
                 }
                 if (fi2_hdr) ray_free(fi2_hdr);
                 ray_release(groups2); ray_release(computed_key);
                 if (filtered_tbl != tbl) ray_release(filtered_tbl);
                 ray_release(tbl);
+                res2 = apply_sort_take(res2, dict_elems, dict_n,
+                                       asc_id, desc_id, take_id, NULL);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return res2;
             }
 
