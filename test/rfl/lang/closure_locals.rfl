@@ -168,3 +168,9 @@
 (list (ee1) (ee2)) -- [2 3]
 ;; (made in one expression, so both carry the same source info)
 (do (set ee3 (mk3 3)) (set ee4 (mk3 4)) (ee3) (ee4) (< (- (.mem.objsize (list ee3 ee4)) (.mem.objsize ee3)) 500)) -- true
+;; the shared template belongs to one literal: literals built for eval from
+;; the same parsed pieces, sharing their parameter, first and last nodes but
+;; differing in between, each get their own
+(set pfn (parse "(fn [x] (+ 0 0) (+ x 0))"))
+(set mkev (fn [k] (eval (concat (take pfn 3) (list (parse (concat "(set gev " (concat (format "%" k) ")"))) (at pfn 3))))))
+(list ((mkev 1) 5) gev ((mkev 2) 5) gev ((mkev 1) 5) gev) -- [5 1 5 2 5 1]

@@ -204,6 +204,9 @@ void ray_compile(ray_t* lambda);
 /* The capture names a closure's body can reach (its dict keys the body
  * mentions; all of them under eval/resolve), as a SYM vector or NULL. */
 ray_t* ray_closure_capture_names(ray_t* lambda);
+/* The closure dict shape the compiled capture binding assumes: NULL, or SYM
+ * keys with a LIST of values of the same length. */
+bool   ray_closure_shape_ok(ray_t* closure);
 /* Compile `lambda` with `capnames` bound as locals ahead of the body; false
  * when the body cannot be compiled. */
 bool   ray_compile_with_captures(ray_t* lambda, ray_t* capnames);
