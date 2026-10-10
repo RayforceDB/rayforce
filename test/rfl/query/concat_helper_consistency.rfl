@@ -38,6 +38,39 @@ calls -- 5
 (set tick (fn [v] (do (set ticks (+ ticks 1)) v)))
 (at (select {v: (tick s) e: (reverse x) from: T}) 'v) -- ['a 'b 'c 'd 'e]
 ticks -- 5
+;; A global an inlined helper reads is read when it runs: an effectful helper
+;; in the same expression that sets it between groups, rows or operands is
+;; seen, grouped or not, aggregating or row-wise
+(set TG (table [x k] (list (til 20) (% (til 20) 7))))
+(set G 0)
+(set bump (fn [v] (set G (+ G 100)) 0))
+(set hg (fn [v] (+ (sum v) G)))
+(set hgr (fn [v] (+ v G)))
+(at (update {r: (+ (bump x) (hg x)) by: k from: TG}) 'r) -- [121 224 327 430 533 636 719 121 224 327 430 533 636 719 121 224 327 430 533 636]
+G -- 700
+(set G 0)
+(at (update {r: (+ (bump x) (hgr x)) by: k from: TG}) 'r) -- [100 201 302 403 504 605 706 107 208 309 410 511 612 713 114 215 316 417 518 619]
+(set G 0)
+(at (update {r: (+ (bump x) (hg x)) from: TG}) 'r) -- (take 290 20)
+(set G 0)
+(at (update {r: (+ (bump x) (hg x)) from: TG where: (> x 17)}) 'r) -- [0N 0N 0N 0N 0N 0N 0N 0N 0N 0N 0N 0N 0N 0N 0N 0N 0N 0N 290 290]
+(set G 0)
+(at (select {r: (+ (bump x) (hg x)) by: k from: TG}) 'r) -- [221 324 427 530 633 736 819]
+(set bumpk (fn [v] (set G (first v)) 0))
+(at (update {r: (+ (bumpk k) (hg x)) by: k from: TG}) 'r) -- [21 25 29 33 37 41 25 21 25 29 33 37 41 25 21 25 29 33 37 41]
+;; ... in a grouped select's output over another output, and in a projection
+;; evaluated row by row
+(set G 0)
+(at (select {s: (sum x) r: (+ (bump s) (hgr s)) by: k from: TG}) 'r) -- [121 224 327 430 533 636 719]
+(set G 0)
+(at (select {s: (sum x) r: (+ (hgr s) (bump s)) by: k from: TG}) 'r) -- [21 124 227 330 433 536 619]
+(set G 0)
+(at (select {a: (* x 2) r: (+ (bump a) (hgr x)) from: TG}) 'r) -- (+ (til 20) (* 100 (+ 1 (til 20))))
+(set G 0)
+(at (select {r: (+ (bump x) (hgr x)) e: (reverse x) from: TG}) 'r) -- (+ (til 20) (* 100 (+ 1 (til 20))))
+;; ... and a pure expression, inlined once for every group, reads it as well
+(set G 1000)
+(at (update {r: (hg x) by: k from: TG}) 'r) -- [1021 1024 1027 1030 1033 1036 1019 1021 1024 1027 1030 1033 1036 1019 1021 1024 1027 1030 1033 1036]
 ;; A quoted symbol inside a helper body is the symbol on every path, even
 ;; when a column has that spelling and whatever operator consumes it.
 (set hqt (fn [v] (concat v 't)))

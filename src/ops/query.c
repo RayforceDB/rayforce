@@ -2542,8 +2542,21 @@ static bool query_expr_has_helper(ray_t* expr) {
     return false;
 }
 
+/* Whether evaluating `expr` cannot change what a global reads.  Inlining
+ * puts the value a helper's free global has now into the expansion, which
+ * a query may then evaluate once per group or row; an effect in the same
+ * expression (a helper that sets that global) would run in between and
+ * the expansion would not see it.  Such an expression is evaluated as
+ * written, its helpers called each time, as the tree walker does. */
+static bool query_expr_effect_free(ray_t* expr) {
+    int64_t let_names[KEY_PURE_MAX_BIND], par_names[KEY_PURE_MAX_BIND];
+    ray_t* let_lits[KEY_PURE_MAX_BIND]; ray_t* par_args[KEY_PURE_MAX_BIND];
+    key_pure_ctx_t ctx = { NULL, let_names, let_lits, 0, par_names, par_args, 0, NULL };
+    return key_expr_pure(expr, 0, &ctx);
+}
+
 static ray_t* query_inline_helpers(ray_t* expr, ray_t* tbl) {
-    if (!query_expr_has_helper(expr)) { ray_retain(expr); return expr; }
+    if (!query_expr_has_helper(expr) || !query_expr_effect_free(expr)) { ray_retain(expr); return expr; }
     int budget = 1024;
     ray_t* expanded = query_inline_walk(expr, tbl, NULL, 0, 0, &budget, false, NULL);
     if (!expanded) { ray_retain(expr); expanded = expr; }
@@ -9827,7 +9840,7 @@ static ray_t* select_apply_derived(ray_t* result, ray_t* dict, select_alias_plan
          * that named a source column means its global binding here, and an
          * output alias never captures it. */
         ray_t* expanded = NULL;
-        if (query_expr_has_helper(expr)) {
+        if (query_expr_has_helper(expr) && query_expr_effect_free(expr)) {
             int budget = 1024;
             query_inline_scope_t scope = { .globals_for_source = true };
             expanded = query_inline_walk(expr, source, NULL, 0, 0, &budget, false, &scope);
@@ -15025,8 +15038,9 @@ by_dict_done:
                          * source schema so prior aliases cannot capture free
                          * names; actual arguments still evaluate in tbl. */
                         int inline_budget = 1024;
-                        expanded = query_inline_walk(expr, g->table, NULL, 0, 0,
-                                                     &inline_budget, false, &scope);
+                        expanded = !query_expr_has_helper(expr) || query_expr_effect_free(expr)
+                                 ? query_inline_walk(expr, g->table, NULL, 0, 0, &inline_budget, false, &scope)
+                                 : NULL;
                         if (!expanded) { ray_retain(expr); expanded = expr; }
                         expr = expanded;
                         ray_t* eval_tbl = scope.table;
