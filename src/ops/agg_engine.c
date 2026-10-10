@@ -2380,16 +2380,17 @@ static void agg_dense_phaseA_fn(void* vctx, const agg_view_t* v, uint32_t wid, i
     if (c->n_keys == 1) {
         const void* kd = v->key_data[0];
         int64_t  kmin = c->dp->mins[0];
-        int64_t  kstride = c->dp->strides[0];
-        bool nullable = c->dp->nullable[0];
+        bool nullable = c->dp->nullable[0];   /* one key: its stride is 1 */
         int64_t null = c->dp->nulls[0], null_slot = c->dp->ranges[0] - 1;
         int64_t* fr = loc->first_row;
         uint32_t* cg = cgid;
-        #define DENSE_SLOT1_LAZY(LD)                                            \
+        /* Only the nullable instance tests for the null (a ragged
+         * partition's null segment makes the key nullable); the slot is
+         * v - kmin, a single key's stride being 1. */
+        #define DENSE_SLOT1_LAZY(LD, SLOT)                                      \
             for (int64_t r = start; r < end; r++) {                        \
                 int64_t v = (int64_t)(LD);                               \
-                int64_t slot = nullable && v == null ? null_slot          \
-                    : (v - kmin) * kstride;                               \
+                int64_t slot = (SLOT);                                    \
                 cg[r - start] = (uint32_t)slot;                            \
                 if (agg_dense_first(loc, slot)) {                              \
                     for (uint32_t a = 0; a < c->n_aggs; a++)               \
@@ -2410,7 +2411,8 @@ static void agg_dense_phaseA_fn(void* vctx, const agg_view_t* v, uint32_t wid, i
             if (loc->eager) {                                            \
                 if (!nullable) { DENSE_SLOT1_EAGER(LD, v - kmin); }        \
                 else { DENSE_SLOT1_EAGER(LD, v == null ? null_slot : v - kmin); } \
-            } else { DENSE_SLOT1_LAZY(LD); }                              \
+            } else if (!nullable) { DENSE_SLOT1_LAZY(LD, v - kmin); }     \
+            else { DENSE_SLOT1_LAZY(LD, v == null ? null_slot : v - kmin); } \
         } while (0)
         switch (c->key_cols[0]->type) {
             case RAY_I64: case RAY_TIMESTAMP: DENSE_SLOT1(((const int64_t*)kd)[r - kbase]); break;
