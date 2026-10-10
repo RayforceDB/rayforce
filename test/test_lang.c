@@ -322,6 +322,49 @@ static test_result_t test_closure_sym_walk_guard(void) {
     PASS();
 }
 
+/* A body that does not compile is marked (NLOCALS -1) so it stays on the
+ * tree walker without a compile attempt per call, and a lambda so marked
+ * is never compiled again. */
+static test_result_t test_lambda_compile_failure_mark(void) {
+    ray_t* bad = ray_eval_str("(fn [x] (if false (set 1 2)) (+ x 1))");
+    TEST_ASSERT_NOT_NULL(bad);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(bad));
+    TEST_ASSERT_EQ_I(bad->type, RAY_LAMBDA);
+    /* (Made by interpreted code, it may carry the literal's verdict
+     * already; clear it so ray_compile decides.) */
+    LAMBDA_NLOCALS(bad) = 0;
+    ray_compile(bad);
+    TEST_ASSERT(!LAMBDA_IS_COMPILED(bad), "the body does not compile");
+    TEST_ASSERT_EQ_I(LAMBDA_NLOCALS(bad), -1);
+    ray_t* arg = ray_i64(2);
+    ray_t* args[1] = { arg };
+    for (int i = 0; i < 2; i++) {
+        ray_t* r = call_lambda(bad, args, 1);
+        TEST_ASSERT_NOT_NULL(r);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        TEST_ASSERT_EQ_I(r->i64, 3);
+        ray_release(r);
+        TEST_ASSERT_EQ_I(LAMBDA_NLOCALS(bad), -1);
+    }
+    ray_release(bad);
+
+    /* The mark alone keeps a compilable body interpreted. */
+    ray_t* good = ray_eval_str("(fn [x] (+ x 1))");
+    TEST_ASSERT_NOT_NULL(good);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(good));
+    TEST_ASSERT(!LAMBDA_IS_COMPILED(good), "a definition compiles on its first call");
+    LAMBDA_NLOCALS(good) = -1;
+    ray_t* r = call_lambda(good, args, 1);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->i64, 3);
+    ray_release(r);
+    TEST_ASSERT(!LAMBDA_IS_COMPILED(good), "a lambda marked not compilable is not compiled");
+    ray_release(good);
+    ray_release(arg);
+    PASS();
+}
+
 /* ---- Dummy function for testing ---- */
 static ray_t* dummy_unary(ray_t* x) { return ray_retain(x), x; }
 static ray_t* dummy_binary(ray_t* x, ray_t* y) { (void)y; return ray_retain(x), x; }
@@ -10116,6 +10159,7 @@ const test_entry_t lang_entries[] = {
     { "lang/closure_malformed_capture", test_closure_malformed_capture, lang_setup, lang_teardown },
     { "lang/closure_lazy_capture_vm", test_closure_lazy_capture_vm, lang_setup, lang_teardown },
     { "lang/closure_sym_walk_guard", test_closure_sym_walk_guard, lang_setup, lang_teardown },
+    { "lang/lambda_compile_failure_mark", test_lambda_compile_failure_mark, lang_setup, lang_teardown },
     { "lang/io/read_procfs_zero_size", test_read_procfs_reports_zero_size, lang_setup, lang_teardown },
     { "lang/io/read_unsized_bounded", test_read_unsized_stream_is_bounded, lang_setup, lang_teardown },
     { "lang/io/exec_capture_bounded", test_exec_capture_is_bounded, lang_setup, lang_teardown },

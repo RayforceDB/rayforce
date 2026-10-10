@@ -156,6 +156,15 @@ G -- 700
 (at (select {r: ((fn [v] 1 (concat (first v) 'zz)) s) by: x from: TC}) 'r) -- [azz zz czz dzz]
 (set hfirst3 (fn [v] 1 (let f first) (concat (f v) 'zz)))
 (at (select {r: (hfirst3 s) by: x from: TC}) 'r) -- [azz zz czz dzz]
+;; a binary builtin through that general call keeps its result's row
+;; provenance, so a second concat over it still joins text row by row
+(set hcl3 (fn [v] 1 (let f concat) (f (f v 'a) 'b)))
+(at (select {r: (hcl3 s) from: T}) 'r) -- ['aab 'bab 'cab 'dab 'eab]
+(at (update {r: (hcl3 s) from: T}) 'r) -- ['aab 'bab 'cab 'dab 'eab]
+;; ... as does a closure body's resolved concat
+(set mkcl3 (fn [k] (fn [v] (concat (concat v k) 'b))))
+(set ccl3 (mkcl3 'a))
+(at (select {r: (ccl3 s) from: T}) 'r) -- ['aab 'bab 'cab 'dab 'eab]
 ;; a row-flagged column captured after many unflagged bindings keeps its flag
 (set TF1 (table [s] (list (as 'SYMBOL ["a" "b" "a" "c"]))))
 (set hflag1 (fn [v] (let u1 1) ((fn [a] (concat a 'x)) v)))
