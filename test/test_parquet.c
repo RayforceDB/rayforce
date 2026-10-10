@@ -3134,10 +3134,12 @@ static test_result_t test_pq_sk_codec_message(void) {
             bool pd = pq_trace_line_has(trace, "parquet symcol: col=p ", " mode=direct");
             fprintf(stderr, "  sk codec %zu %s: %s: %s%s\n", v, run ? "mixed" : "direct", failed ? "failed" : "imported",
                     msg ? msg : "(no message)", run ? "" : pd ? " (p direct)" : " (p grouped)");
-            /* the mixed import fails in its seeding, before its symcol lines */
+            /* the mixed import fails in its seeding, before its symcol lines:
+             * the seeding checks what it interns as the decoder would (no
+             * page the pass then refuses is interned first: no symseed line) */
             if (!failed || !msg || !strstr(msg, cases[v].want) || (!run && !pd)) bad++;
             if (!run && msg) snprintf(first, sizeof(first), "%s", msg);
-            if (run && (!msg || strcmp(first, msg))) bad++;
+            if (run && (!msg || strcmp(first, msg) || strstr(trace, "parquet symseed:"))) bad++;
             if (res) { if (RAY_IS_ERR(res)) ray_error_free(res); else ray_release(res); }
             pq_remove_native(partial, fnames, 4); pq_remove_native(dir, fnames, 4);
         }
