@@ -41,6 +41,8 @@
 #include "store/col.h"
 #include "store/serde.h"
 #include "core/pool.h"   /* the batch intern probes on the pool */
+#include "core/platform.h"   /* ray_thread_create: lookups against a reservation */
+#include "core/profile.h"    /* ray_profile_now_ns: their bounded wait */
 #include "ops/hash.h"    /* ray_hash_bytes: batch intern takes prehashed entries */
 #include "mem/sys.h"
 #include "ops/ops.h"   /* RAY_PARTED_BASE (parted-flatten adoption test) */
@@ -2449,12 +2451,161 @@ static test_result_t test_domain_import_dict_tags(void) {
     unlink(TMP_DOM_SYM_PATH "_impt.lk");
     PASS();
 }
+/* The first reservation (ray_symimp_reserve: the grouped import's records)
+ * ends the dictionary's interning: from it on a lookup is refused and no
+ * string is added, and the shard tables go back at once unless a lookup is
+ * in flight (which keeps them to the end).  Serially: the tables go, the
+ * counts and the index bytes read none, the reserved positions follow the
+ * interned ones, and a lookup is refused.  Then rounds of lookup threads
+ * against a reservation the main thread makes once every thread has got a
+ * batch through: 64K strings already there, found batch after batch (eight
+ * chunks, between which a thread holds no table), on one thread and on
+ * four; and on two, the same with one new string a chunk (a lookup of the
+ * chunk then adds it under the lock).  Every batch gets every position
+ * right or is refused; none reads a table freed under it (a reservation
+ * that frees regardless of a lookup in flight, or a lookup that reads the
+ * reservation before it registers, faults here) and none adds a string past
+ * the reservation (as an add that does not check it under the lock does). */
+#define IMPR_N     65536
+#define IMPR_EVERY 8192   /* the new strings' spacing: one a chunk (SI_BATCH) */
+typedef struct {
+    ray_symimp_t* imp;
+    const char* const* strs; const size_t* lens; const uint64_t* hs; const int64_t* want;
+    int fresh;                  /* 0: the known strings; else this thread's tag for its new ones */
+    char (*buf)[32]; const char** fs; size_t* fl; uint64_t* fh;   /* fresh: the batch */
+    int64_t* out;
+    _Atomic(int64_t) found;     /* batches got through */
+    _Atomic(int) done, bad;
+} impr_ctx_t;
+static void impr_lookups(void* raw) {
+    impr_ctx_t* c = (impr_ctx_t*)raw;
+    const char* const* s = c->strs; const size_t* l = c->lens; const uint64_t* h = c->hs;
+    if (c->fresh) {
+        memcpy(c->fs, c->strs, (size_t)IMPR_N * sizeof(char*));
+        memcpy(c->fl, c->lens, (size_t)IMPR_N * sizeof(size_t));
+        memcpy(c->fh, c->hs, (size_t)IMPR_N * sizeof(uint64_t));
+        s = c->fs; l = c->fl; h = c->fh;
+    }
+    for (int64_t k = 0;; k++) {
+        for (int64_t i = 0; c->fresh && i < IMPR_N; i += IMPR_EVERY) {
+            char* b = c->buf[i / IMPR_EVERY];
+            c->fl[i] = (size_t)snprintf(b, 32, "fresh-%d-%lld", c->fresh, (long long)(k * IMPR_N + i));
+            c->fs[i] = b;
+            c->fh[i] = ray_hash_bytes(b, c->fl[i]);
+        }
+        if (!ray_symimp_intern_batch(c->imp, IMPR_N, s, l, h, c->out)) break;
+        for (int64_t i = 0; i < IMPR_N; i++) {
+            bool ok = c->out[i] == c->want[i];
+            if (c->fresh && i % IMPR_EVERY == 0) {
+                uint32_t len = 0;
+                const char* r = ray_symimp_get(c->imp, c->out[i], &len);
+                ok = len == l[i] && !memcmp(r, s[i], len);
+            }
+            if (!ok) { atomic_store(&c->bad, 1); break; }
+        }
+        atomic_fetch_add(&c->found, 1);
+    }
+    atomic_store(&c->done, 1);
+}
+static test_result_t test_domain_import_dict_reserve(void) {
+    const char* p = TMP_DOM_SYM_PATH "_imps";
+    char (*bufs)[32] = (char (*)[32])ray_sys_alloc((size_t)IMPR_N * 32);
+    const char** strs = (const char**)ray_sys_alloc((size_t)IMPR_N * sizeof(char*));
+    size_t* lens = (size_t*)ray_sys_alloc((size_t)IMPR_N * sizeof(size_t));
+    uint64_t* hs = (uint64_t*)ray_sys_alloc((size_t)IMPR_N * sizeof(uint64_t));
+    int64_t* want = (int64_t*)ray_sys_alloc((size_t)IMPR_N * sizeof(int64_t));
+    int64_t* outs = (int64_t*)ray_sys_alloc((size_t)4 * IMPR_N * sizeof(int64_t));
+    char (*fbuf)[32] = (char (*)[32])ray_sys_alloc((size_t)2 * (IMPR_N / IMPR_EVERY) * 32);
+    const char** fs = (const char**)ray_sys_alloc((size_t)2 * IMPR_N * sizeof(char*));
+    size_t* fl = (size_t*)ray_sys_alloc((size_t)2 * IMPR_N * sizeof(size_t));
+    uint64_t* fh = (uint64_t*)ray_sys_alloc((size_t)2 * IMPR_N * sizeof(uint64_t));
+    TEST_ASSERT_TRUE(bufs && strs && lens && hs && want && outs && fbuf && fs && fl && fh);
+    for (int64_t i = 0; i < IMPR_N; i++) {
+        lens[i] = (size_t)imp_str(i, bufs[i]); strs[i] = bufs[i];
+        hs[i] = ray_hash_bytes(strs[i], lens[i]);
+    }
+    /* round 0 serial; 1-8 one thread finding, 9-12 four, 13-16 two adding too */
+    int timeouts = 0, bad = 0;
+    for (int round = 0; round <= 16; round++) {
+        unlink(p);
+        ray_sym_domain_t* dom = ray_sym_domain_create_import(p);
+        if (!dom) {
+            ray_sys_free(bufs); ray_sys_free(strs); ray_sys_free(lens); ray_sys_free(hs); ray_sys_free(want);
+            ray_sys_free(outs); ray_sys_free(fbuf); ray_sys_free(fs); ray_sys_free(fl); ray_sys_free(fh);
+            SKIP("import dictionary unsupported here");
+        }
+        ray_symimp_t* imp = ray_sym_domain_import(dom);
+        TEST_ASSERT_NOT_NULL(imp);
+        TEST_ASSERT_TRUE(ray_symimp_intern_batch(imp, IMPR_N, strs, lens, hs, want));
+        int64_t count = ray_symimp_count(imp), p0 = -1, o0 = -1, again = -1;
+        TEST_ASSERT_EQ_I(count, IMPR_N + 1);   /* "" is position 0 */
+        if (round == 0) {
+            TEST_ASSERT_TRUE(ray_symimp_index_bytes(imp) > 0);
+            TEST_ASSERT_TRUE(ray_symimp_reserve(imp, 2, 16, &p0, &o0));
+            TEST_ASSERT_EQ_I(p0, count);
+            TEST_ASSERT_EQ_I(ray_symimp_count(imp), count + 2);
+            TEST_ASSERT_EQ_I(ray_symimp_index_bytes(imp), 0);
+            ray_symimp_stats_t st;
+            ray_symimp_stats(imp, &st);
+            TEST_ASSERT_EQ_I(st.tab_bytes, 0);
+            TEST_ASSERT_EQ_I(st.count, count + 2);
+            TEST_ASSERT_FALSE(ray_symimp_intern_batch(imp, 1, strs, lens, hs, &again));
+            ray_symimp_put(imp, p0, o0, "res0", 4); ray_symimp_put(imp, p0 + 1, o0 + 8, "res1", 4);
+            TEST_ASSERT_TRUE(ray_symimp_reserve(imp, 1, 8, &p0, &o0));   /* a later one: nothing more to free */
+            TEST_ASSERT_EQ_I(p0, count + 2);
+            ray_symimp_put(imp, p0, o0, "res2", 4);
+        } else {
+            int nt = round <= 8 ? 1 : round <= 12 ? 4 : 2, fresh = round > 12;
+            impr_ctx_t ctx[4];
+            ray_thread_t th[4];
+            int started = 0;
+            for (int t = 0; t < nt; t++) {
+                ctx[t] = (impr_ctx_t){ imp, strs, lens, hs, want, fresh ? t + 1 : 0,
+                                       fbuf + t * (IMPR_N / IMPR_EVERY), fs + (int64_t)t * IMPR_N, fl + (int64_t)t * IMPR_N, fh + (int64_t)t * IMPR_N,
+                                       outs + (int64_t)t * IMPR_N, 0, 0, 0 };
+                if (ray_thread_create(&th[t], impr_lookups, &ctx[t]) == RAY_OK) started++;
+                else break;
+            }
+            /* every thread through a batch (or out), within a bound */
+            int64_t until = ray_profile_now_ns() + (int64_t)30 * 1000000000;
+            for (int t = 0; t < started; t++)
+                while (!atomic_load(&ctx[t].found) && !atomic_load(&ctx[t].done)) {
+                    if (ray_profile_now_ns() > until) { timeouts++; break; }
+                    RAY_CPU_RELAX();
+                }
+            bool reserved = ray_symimp_reserve(imp, 1, 8, &p0, &o0);
+            for (int t = 0; t < started; t++) ray_thread_join(th[t]);
+            TEST_ASSERT_EQ_I(started, nt);
+            TEST_ASSERT_TRUE(reserved);
+            for (int t = 0; t < nt; t++) {
+                if (atomic_load(&ctx[t].bad) || !atomic_load(&ctx[t].found)) bad++;
+            }
+            /* nothing added past the reservation */
+            if (ray_symimp_count(imp) != p0 + 1) {
+                fprintf(stderr, "  reserve round %d: %lld strings, the reservation at %lld\n", round,
+                        (long long)ray_symimp_count(imp), (long long)p0);
+                bad++;
+            }
+            TEST_ASSERT_FALSE(ray_symimp_intern_batch(imp, 1, strs, lens, hs, &again));
+            ray_symimp_put(imp, p0, o0, "res0", 4);
+        }
+        ray_sym_domain_release(dom);
+        unlink(p);
+        unlink(TMP_DOM_SYM_PATH "_imps.lk");
+    }
+    ray_sys_free(bufs); ray_sys_free(strs); ray_sys_free(lens); ray_sys_free(hs); ray_sys_free(want);
+    ray_sys_free(outs); ray_sys_free(fbuf); ray_sys_free(fs); ray_sys_free(fl); ray_sys_free(fh);
+    TEST_ASSERT_EQ_I(timeouts, 0);
+    TEST_ASSERT_EQ_I(bad, 0);
+    PASS();
+}
 const test_entry_t domain_entries[] = {
     { "domain/private", test_domain_private, domain_setup, domain_teardown },
     { "domain/flush_append", test_domain_flush_append, domain_setup, domain_teardown },
     { "domain/import_dict", test_domain_import_dict, domain_setup, domain_teardown },
     { "domain/import_dict_reclaim", test_domain_import_dict_reclaim, domain_setup, domain_teardown },
     { "domain/import_dict_tags", test_domain_import_dict_tags, domain_setup, domain_teardown },
+    { "domain/import_dict_reserve", test_domain_import_dict_reserve, domain_setup, domain_teardown },
     { "domain/runtime_identity",        test_domain_runtime_identity,        domain_setup, domain_teardown },
     { "domain/runtime_delegation",      test_domain_runtime_delegation,      domain_setup, domain_teardown },
     { "domain/vec_new_attach",          test_domain_vec_new_attach,          domain_setup, domain_teardown },

@@ -77,8 +77,9 @@ typedef struct ray_symimp_stats_s {
     int64_t off_bytes;   /* the record offsets */
 } ray_symimp_stats_t;
 void ray_symimp_stats(ray_symimp_t* m, ray_symimp_stats_t* out);
-/* The shard tables' bytes now: none from the first ray_symimp_reserve on,
- * when they are freed (nothing reads them after it). */
+/* The shard tables' bytes now: none from the first ray_symimp_reserve on
+ * (freed then, as nothing reads them after it, unless a lookup was in
+ * flight: kept to ray_symimp_free). */
 int64_t ray_symimp_index_bytes(ray_symimp_t* m);
 
 /* Records placed by the caller (table/symgrp.h, the grouped import), which
@@ -86,8 +87,9 @@ int64_t ray_symimp_index_bytes(ray_symimp_t* m);
  * records from file offset *off0, the file grown (and its blocks allocated)
  * to hold them.  The records are then written with ray_symimp_put, from any
  * thread, each range by one writer.  From the first reserve on,
- * ray_symimp_intern_batch fails: its shard tables miss these records (and
- * are freed then). */
+ * ray_symimp_intern_batch fails and no string is added (a call in flight
+ * may still return what it found): its shard tables miss these records (and
+ * are freed then, unless a lookup is in flight). */
 bool ray_symimp_reserve(ray_symimp_t* m, int64_t n, int64_t bytes, int64_t* pos0, int64_t* off0);
 void ray_symimp_put(ray_symimp_t* m, int64_t pos, int64_t off, const char* s, uint32_t len);
 /* Or written by the caller with ray_symimp_write (pwrite: no page of the

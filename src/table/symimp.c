@@ -95,8 +95,11 @@ struct ray_symimp_s {
     _Atomic(int64_t)  active[2];
     si_tab_t*        retired[2];  /* under alock, by the parity retired in */
     uint64_t* offc[SI_OFF_CHUNKS]; /* record offset of each position */
-    bool     reserved;             /* ray_symimp_reserve used: the shard
-                                    * tables no longer cover every record */
+    _Atomic(bool) reserved;        /* ray_symimp_reserve used: the shard
+                                    * tables no longer cover every record.
+                                    * Set under alock before active[] is
+                                    * read there; a lookup reads it after
+                                    * registering in active[] (si_batch) */
     si_shard_t shards[SI_SHARDS];
     _Atomic(int64_t) st[SI_ST_N];  /* ray_symimp_stats, past what lookups read */
 };
@@ -263,6 +266,14 @@ static bool si_batch(ray_symimp_t* m, int64_t n, const char* const* strs,
         if (atomic_load_explicit(&m->epoch, memory_order_seq_cst) == e) break;
         atomic_fetch_sub_explicit(&m->active[e & 1], 1, memory_order_release);
     }
+    /* Registered, then the reservation read (both seq_cst, as the
+     * reservation's store and its read of active[] are): either the
+     * reservation sees this lookup and keeps the tables, or this lookup
+     * sees the reservation and reads none. */
+    if (atomic_load_explicit(&m->reserved, memory_order_seq_cst)) {
+        atomic_fetch_sub_explicit(&m->active[e & 1], 1, memory_order_release);
+        return false;
+    }
     for (int64_t i = 0; i < n; i++) {
         if (first[i] != i) continue;
         si_shard_t* sh = &m->shards[si_shard_of(hashes[i])];
@@ -279,6 +290,8 @@ static bool si_batch(ray_symimp_t* m, int64_t n, const char* const* strs,
     si_tab_t* done = NULL;
     if (miss) {
         pthread_mutex_lock(&m->alock);
+        /* reserved since the lookups: no string added (the tables may be gone) */
+        if (atomic_load_explicit(&m->reserved, memory_order_relaxed)) ok = false;
         for (int64_t i = 0; i < n && ok; i++) {
             if (first[i] != i || out_pos[i] >= 0) continue;
             uint32_t tag = (uint32_t)hashes[i];
@@ -303,7 +316,8 @@ static bool si_batch(ray_symimp_t* m, int64_t n, const char* const* strs,
 bool ray_symimp_intern_batch(ray_symimp_t* m, int64_t n, const char* const* strs,
                              const size_t* lens, const uint64_t* hashes,
                              int64_t* out_pos) {
-    if (m->reserved) return false;   /* its index misses the reserved records */
+    /* its index misses the reserved records (si_batch checks again, safely) */
+    if (atomic_load_explicit(&m->reserved, memory_order_relaxed)) return false;
     for (int64_t o = 0; o < n; o += SI_BATCH)
         if (!si_batch(m, n - o < SI_BATCH ? n - o : SI_BATCH, strs + o, lens + o, hashes + o, out_pos + o))
             return false;
@@ -325,13 +339,17 @@ bool ray_symimp_reserve(ray_symimp_t* m, int64_t n, int64_t bytes, int64_t* pos0
         ok = si_grow(m, want);
         if (ok) m->fsize = want;
     }
-    if (ok && !m->reserved &&
-        !atomic_load_explicit(&m->active[0], memory_order_acquire) &&
-        !atomic_load_explicit(&m->active[1], memory_order_acquire)) {
+    bool first = ok && !atomic_load_explicit(&m->reserved, memory_order_relaxed);
+    if (first) atomic_store_explicit(&m->reserved, true, memory_order_seq_cst);
+    if (first &&
+        !atomic_load_explicit(&m->active[0], memory_order_seq_cst) &&
+        !atomic_load_explicit(&m->active[1], memory_order_seq_cst)) {
         /* From the first reservation on the shard tables are never read
-         * again (ray_symimp_intern_batch refuses): their memory goes back
-         * now, not when the dictionary is freed, which leaves it to the
-         * grouped passes that follow. */
+         * again (a lookup that registers from now on sees `reserved`, one
+         * registered before is counted above; adds check it under alock):
+         * their memory goes back now, not when the dictionary is freed,
+         * which leaves it to the grouped passes that follow.  A lookup in
+         * flight keeps them to ray_symimp_free. */
         for (int i = 0; i < SI_SHARDS; i++) {
             ray_sys_free(atomic_load_explicit(&m->shards[i].tab, memory_order_relaxed));
             atomic_store_explicit(&m->shards[i].tab, NULL, memory_order_relaxed);
@@ -343,7 +361,6 @@ bool ray_symimp_reserve(ray_symimp_t* m, int64_t n, int64_t bytes, int64_t* pos0
         }
     }
     if (ok) {
-        m->reserved = true;
         *pos0 = m->count; *off0 = m->tail;
         m->count += n; m->tail += bytes;
         atomic_store_explicit(m->count_out, m->count, memory_order_release);
@@ -405,6 +422,7 @@ ray_symimp_t* ray_symimp_create(const char* path, _Atomic(int64_t)* count) {
     atomic_init(&m->epoch, 0);
     atomic_init(&m->active[0], 0);
     atomic_init(&m->active[1], 0);
+    atomic_init(&m->reserved, false);
     for (int k = 0; k < SI_ST_N; k++) atomic_init(&m->st[k], 0);
     m->fd = -1;
     m->count_out = count;
