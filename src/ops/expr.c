@@ -2146,7 +2146,7 @@ static int expr_zone_decide(const ray_expr_t* expr, int64_t ms, int64_t me) {
              * extrema rule covers it.  Unreachable today (the compiler bails
              * a null constant, EXPR_BAIL_CONST), it guards every arm if that
              * bail is ever relaxed. */
-            if (src_reg >= 0 && cval == NULL_I64) src_reg = -1;
+            if (src_reg >= 0 && cval == NULL_I64) { src_reg = -1; col = NULL; }
             if (src_reg >= 0 && expr->regs[src_reg].enc) {
                 /* generation 2: the directory's chunk of 64K rows, then the
                  * descriptor of the vector the morsel lies in */
