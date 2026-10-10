@@ -9437,6 +9437,33 @@ static ray_t* select_name_computed_key(ray_t* r, int64_t key_name) {
     return r;
 }
 
+/* Does the clause value `v` name `s` anywhere: a name, a name list, a
+ * dict's keys or values, nested in a call? */
+static bool clause_names_sym(ray_t* v, int64_t s) {
+    if (!v || RAY_IS_ERR(v)) return false;
+    if (v->type == -RAY_SYM) return v->i64 == s;
+    if (v->type == RAY_SYM) {
+        for (int64_t i = 0; i < v->len; i++) if (sym_cell_runtime_id(v, i) == s) return true;
+        return false;
+    }
+    if (v->type == RAY_DICT)
+        return clause_names_sym(ray_dict_keys(v), s) || clause_names_sym(ray_dict_vals(v), s);
+    if (v->type != RAY_LIST) return false;
+    ray_t** el = (ray_t**)ray_data(v);
+    for (int64_t i = 0; i < v->len; i++) if (clause_names_sym(el[i], s)) return true;
+    return false;
+}
+
+/* May the narrow copy of a parted table add a row-number column named
+ * `row_sym`?  Not when the table has a column of that name, the select
+ * names it anywhere (as a key, an alias, or a value the column would
+ * shadow), or a variable of that name is bound. */
+static bool parted_row_name_free(ray_t* dict, ray_t* tbl, int64_t row_sym) {
+    if (ray_table_get_col(tbl, row_sym)) return false;
+    if (clause_names_sym(dict, row_sym)) return false;
+    return !ray_env_get_lexical_local(row_sym) && !ray_env_get(row_sym);
+}
+
 /* Rows rv[0..n) of a parted table, gathered one column at a time without
  * flattening the table: the rows are marked, a column is compacted to the
  * marked rows (in ascending order) by sel_compact, and when rv is not
@@ -9546,7 +9573,7 @@ static ray_t* select_parted_first_rows(ray_t* dict, ray_t* tbl, bool aliases_res
     ray_t* by_expr = dict_get(dict, "by");
     if (!by_expr) return NULL;
     int64_t row_sym = ray_sym_intern("__row", 5);
-    if (ray_table_get_col(tbl, row_sym)) return NULL;
+    if (!parted_row_name_free(dict, tbl, row_sym)) return NULL;
     /* the key columns the result leads with */
     int64_t nkeys = by_expr->type == RAY_DICT ? ray_dict_len(by_expr)
                   : by_expr->type == RAY_SYM ? ray_len(by_expr) : 1;
@@ -9700,7 +9727,7 @@ static ray_t* select_parted_sorted(ray_t* dict, ray_t* tbl, bool aliases_resolve
     int64_t nc = ray_table_ncols(tbl);
     if (nc <= 0 || nc > 256) return NULL;   /* sel_compact's column limit */
     int64_t row_sym = ray_sym_intern("__row", 5);
-    if (ray_table_get_col(tbl, row_sym)) return NULL;
+    if (!parted_row_name_free(dict, tbl, row_sym)) return NULL;
     ray_t* keys = ray_dict_keys(dict);
     ray_t* vals = ray_dict_vals(dict);
     int64_t nd = ray_dict_len(dict);

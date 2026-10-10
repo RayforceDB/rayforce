@@ -450,3 +450,19 @@
 (select {by: {mm: (% x 2)} from: Mckn}) !- domain
 (select {by: {mm: (% x 2)} from: Pckn}) !- domain
 (.sys.exec "rm -rf /tmp/rfl_ckpkn")
+;; the row-number column the parted paths add is never one the select
+;; names: a by-dict key, a bound variable a key reads, a sort key
+(.sys.exec "rm -rf /tmp/rfl_ckrown")
+(.db.splayed.set "/tmp/rfl_ckrown/2024.01.01/t/" (table [i s] (list [3 1 2 5] [b a b c])))
+(.db.splayed.set "/tmp/rfl_ckrown/2024.01.02/t/" (table [i s] (list [4 0 7] [a c a])))
+(set Prn (.db.parted.get "/tmp/rfl_ckrown/" 't))
+(set Mrn (select {from: Prn where: (>= i 0)}))
+(select {by: {__row: s} from: Prn}) -- (select {by: {__row: s} from: Mrn})
+(count (select {by: {__row: s} from: Prn})) -- 3
+(set __row [1 1 2 2 3 3 3])
+(select {by: {k: __row} from: Prn}) -- (select {by: {k: __row} from: Mrn})
+(count (select {by: {k: __row} from: Prn})) -- 3
+(select {i: i from: Prn desc: i take: 2}) -- (select {i: i from: Mrn desc: i take: 2})
+(select {from: Prn asc: s}) -- (select {from: Mrn asc: s})
+(set __row 0)
+(.sys.exec "rm -rf /tmp/rfl_ckrown")
