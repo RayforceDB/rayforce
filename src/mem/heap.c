@@ -1134,7 +1134,7 @@ static void ray_detach_owned_refs(ray_t* v) {
             LAMBDA_DBG(v) = NULL;
             LAMBDA_CLOSURE(v) = NULL;
             LAMBDA_CAPROWS(v) = NULL;
-            ((ray_t**)ray_data(v))[9] = NULL;   /* capq + call counter */
+            LAMBDA_CAPQ(v) = 0;
             return;
         }
         if (v->type == RAY_LAZY) {

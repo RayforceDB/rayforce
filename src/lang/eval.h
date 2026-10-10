@@ -97,10 +97,18 @@ enum {
     OP_FORCE,         /* materialize TOS if it is a lazy handle (so a
                        * let-bound local holds a concrete, reusable value) */
     OP_BINDCAPS,      /* bind the closure's captures to local slots:
-                       * cpool[operand] is an I64 vector, capture i -> slot
-                       * (or -1 for a capture a parameter shadows).  The
-                       * prologue of every compiled closure */
+                       * cpool[operand] is an I64 vector of (name, slot)
+                       * pairs; each name is looked up in the closure dict
+                       * and its value stored into the slot (a name the dict
+                       * lacks leaves the slot empty).  The prologue of every
+                       * compiled closure */
     OP_LOADSELF,      /* push the running lambda (bare `self` as a value) */
+    OP_MKCLOSURE,     /* pop slots (I64), names (SYM), template (LAMBDA):
+                       * push a closure sharing the template's bytecode,
+                       * capturing the current frame's named slots */
+    OP_LOADENVG,      /* push local slot (1 byte) or, when the slot is still
+                       * empty (a `let` that has not run), the global named
+                       * by cpool[2-byte index], as the tree walker would */
     OP__COUNT
 };
 
@@ -120,8 +128,6 @@ enum {
  *   data[8] = ray_t* caprows      (RAY_U8 row flag per capture, or NULL)
  *   data[9] = uint32_t capq       (serial of the query frame the closure was
  *                                  made under, 0 if none; never serialized)
- *             uint32_t calls      (high half: calls made before compiling;
- *                                  a closure compiles on its second call)
  */
 #define LAMBDA_SLOTS 10
 
@@ -137,7 +143,6 @@ enum {
 #define LAMBDA_CLOSURE(lam)   (((ray_t**)ray_data(lam))[7])
 #define LAMBDA_CAPROWS(lam)   (((ray_t**)ray_data(lam))[8])
 #define LAMBDA_CAPQ(lam)      (*((uint32_t*)&((ray_t**)ray_data(lam))[9]))
-#define LAMBDA_CALLS(lam)     (((uint32_t*)&((ray_t**)ray_data(lam))[9])[1])
 
 #define LAMBDA_IS_COMPILED(lam) ((lam)->attrs & RAY_FN_COMPILED)
 

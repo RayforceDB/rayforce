@@ -82,3 +82,42 @@
 (fa 1) -- 7
 ;; outside any lambda, return is its value
 (return 5) -- 5
+
+;; every call of a closure runs the same compiled body: a let inside do
+;; writes the function's slot on the first call as on the next
+(set mkd (fn [k] (fn [] (let r 0) (do (let r k)) r)))
+(set d1 (mkd 5))
+(list (d1) (d1) (d1)) -- [5 5 5]
+(set mkq (fn [k] (fn [n] (let r 0) (do (let r k)) (if (== n 0) r (+ r (self (- n 1)))))))
+(set rr (mkq 10))
+(list (rr 2) (rr 2) (rr 2)) -- [30 30 30]
+;; a let of a builtin name that did not run leaves the builtin
+(set fc (fn [flag xs] (if flag (let count (fn [v] 42)) 0) (count xs)))
+(fc false [1 2 3]) -- 3
+(fc true [1 2 3]) -- 42
+(fc false [1 2 3]) -- 3
+;; a parameter shadows a capture of its name
+(set sh ((fn [c] (fn [c] (* c 2))) 100))
+(list (sh 1) (sh 1) (sh 1)) -- [2 2 2]
+;; only the captures a body mentions take slots, so recursion depth does not
+;; shrink with the bindings in scope
+(set mk10 (fn [a b c d e f g h i j] (fn [n] (if (== n 0) j (+ 1 (self (- n 1)))))))
+(set f10 (mk10 1 2 3 4 5 6 7 8 9 10))
+(f10 100) -- 110
+(set src50 (raze (list "(fn [" (raze (map (fn [i] (format "a% " i)) (til 50))) "] (fn [n] (if (== n 0) a49 (+ 1 (self (- n 1))))))")))
+(set mk50 (eval (parse src50)))
+(set f50 (eval (parse (raze (list "(mk50 " (raze (map (fn [i] (format "% " i)) (til 50))) ")")))))
+(f50 100) -- 149
+;; a lazy value is materialized when captured, so the closure can run twice
+(set c1 ((fn [v] (fn [] (count v))) (asc [3 1 2])))
+(list (c1) (c1)) -- [3 3]
+;; closures made from one literal share its bytecode: a second one adds only
+;; its own object and captures, not a private compiled body
+(set mkb (fn [k] (fn [v] (let a (+ v k)) (let b (* a 2)) (- b 1))))
+(set b1 (mkb 1))
+(set b2 (mkb 2))
+(list (b1 1) (b2 1)) -- [3 5]
+(< (- (.mem.objsize (list b1 b2)) (.mem.objsize b1)) 600) -- true
+;; a lazy value captured by interpreted code is materialized as well
+(set c2 (do (let v (asc [3 1 2])) (fn [] (count v))))
+(list (c2) (c2)) -- [3 3]

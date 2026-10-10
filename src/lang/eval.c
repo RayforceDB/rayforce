@@ -338,7 +338,7 @@ ray_t* ray_raise_fn(ray_t* val) {
  * Borrows both `handler` and `err_val`; returns a new owned ref. */
 static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
                                bool query, uint64_t row_args, bool named,
-                               int8_t* out_rows, bool may_compile);
+                               int8_t* out_rows);
 
 ray_t* ray_try_handle(ray_t* handler, ray_t* err_val) {
     if (handler->type == RAY_LAMBDA || handler->type == RAY_UNARY)
@@ -354,7 +354,7 @@ static ray_t* try_handle_rows(ray_t* handler, ray_t* err_val, int8_t fallback_ro
     *rows = -1;
     if (handler->type == RAY_LAMBDA) {
         ray_t* args[1] = { err_val };
-        return call_lambda_impl(handler, args, 1, ray_active_query_table() != NULL, 0, true, rows, true);
+        return call_lambda_impl(handler, args, 1, ray_active_query_table() != NULL, 0, true, rows);
     }
     if (handler->type == RAY_UNARY) return call_fn1(handler, err_val);
     *rows = fallback_rows;
@@ -2187,9 +2187,6 @@ ray_t* ray_fn(ray_t** args, int64_t n) {
      * literal rule by running on the tree walker, so it is never compiled.
      * The serial of the query frame marks it. */
     if (!capq) capq = ray_env_query_serial();
-    /* The flags matter only to a lambda that is query text; a closure made
-     * outside any query is plain data and may compile. */
-    if (!capq && caprows) { ray_release(caprows); caprows = NULL; }
 
     /* Create lambda object (layout in eval.h): params, body, bytecode,
      * constants, n_locals, nfo, dbg, closure, capture row flags, query. */
@@ -2326,29 +2323,23 @@ bool ray_eval_query_helper_literals(void) {
 /* Ordinary calls use bytecode; query fallback interprets the retained AST
  * so concat can distinguish column parameters from bound collections. */
 /* Whether a call should compile the lambda first.  A lambda made inside a
- * query (LAMBDA_CAPQ set) is query text and keeps the query's literal rule
- * on the tree walker, so it never compiles.  A closure compiles on its
- * second call: each closure object owns its bytecode, and one made to be
- * called once (a handler, a lambda handed to `map`) would pay to compile a
- * body it runs once.  Other lambdas compile on their first call. */
+ * query (LAMBDA_CAPQ set and no bytecode) is query text and keeps the
+ * query's literal rule on the tree walker, so it never compiles; a closure
+ * made by compiled code (OP_MKCLOSURE) is born compiled, sharing its
+ * literal's bytecode.  Everything else compiles on its first call. */
 static inline bool lambda_wants_compile(ray_t* lambda) {
-    if (LAMBDA_IS_COMPILED(lambda) || LAMBDA_CAPQ(lambda)) return false;
-    if (!LAMBDA_CLOSURE(lambda)) return true;
-    if (LAMBDA_CALLS(lambda) == 0) { LAMBDA_CALLS(lambda) = 1; return false; }
-    return true;
+    return !LAMBDA_IS_COMPILED(lambda) && !LAMBDA_CAPQ(lambda);
 }
 
 static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
                                bool query, uint64_t row_args, bool named,
-                               int8_t* out_rows, bool may_compile) {
+                               int8_t* out_rows) {
     if (out_rows) *out_rows = -1;
     /* A lambda called inside a named helper's body is that body's text. */
     if (query && !named) named = ray_eval_query_helper_literals();
     /* Lazy compilation (see lambda_wants_compile); a closure's captures
-     * become locals of its body (OP_BINDCAPS).  A caller that decided
-     * already for this call (the VM's call opcode) passes may_compile
-     * false, so one call counts once. */
-    if (may_compile && lambda_wants_compile(lambda))
+     * become locals of its body (OP_BINDCAPS). */
+    if (lambda_wants_compile(lambda))
         ray_compile(lambda);
     if (LAMBDA_IS_COMPILED(lambda)) {
         if (!query) return vm_exec(lambda, call_args, argc);
@@ -2441,7 +2432,7 @@ static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
 ray_t* call_lambda(ray_t* lambda, ray_t** call_args, int64_t argc) {
     if (lambda_wants_compile(lambda)) ray_compile(lambda);
     if (LAMBDA_IS_COMPILED(lambda)) return vm_exec(lambda, call_args, argc);
-    return call_lambda_impl(lambda, call_args, argc, false, 0, false, NULL, true);
+    return call_lambda_impl(lambda, call_args, argc, false, 0, false, NULL);
 }
 
 /* ══════════════════════════════════════════
@@ -2581,6 +2572,8 @@ static ray_t* vm_exec_rows(ray_t* lambda, ray_t** call_args, int64_t argc,
         [OP_FORCE]         = &&op_force,
         [OP_BINDCAPS]      = &&op_bindcaps,
         [OP_LOADSELF]      = &&op_loadself,
+        [OP_MKCLOSURE]     = &&op_mkclosure,
+        [OP_LOADENVG]      = &&op_loadenvg,
     };
 
     /* Arity check before allocating VM state */
@@ -3033,7 +3026,7 @@ unary_done:
             /* An uncompiled lambda (a closure): interpreted, with the
              * arguments' row provenance when a query is active. */
             bool in_query = ray_active_query_table() != NULL;
-            result = call_lambda_impl(fn_obj, fn_args, n, in_query, args_bits, true, &lambda_rows, false);
+            result = call_lambda_impl(fn_obj, fn_args, n, in_query, args_bits, true, &lambda_rows);
             for (int32_t i = 0; i < n; i++) ray_release(fn_args[i]);
             break;
         }
@@ -3204,25 +3197,149 @@ op_tryh: {
 
 op_bindcaps: {
     /* The closure's captures become local slots (the compiled closure's
-     * prologue).  A compiled closure was made outside any query
-     * (LAMBDA_CAPQ is 0), so the values are plain data. */
+     * prologue): cpool[idx] holds (name, slot) pairs; each name is looked
+     * up in the closure dict.  A name the dict lacks (a `let` that had not
+     * run when the closure was made) leaves its slot empty, so a read of
+     * it falls back to the global, as on the tree walker.  The capture's
+     * row flag applies while the query frame the closure was made under
+     * is the innermost one. */
     uint8_t idx = code[ip++];
-    ray_t *map = cpool[idx];
+    ray_t *pairs = cpool[idx];
     ray_t *cap = LAMBDA_CLOSURE(vm.fn);
+    ray_t *ckeys = cap && cap->type == RAY_DICT ? ray_dict_keys(cap) : NULL;
     ray_t *cvals = cap && cap->type == RAY_DICT ? ray_dict_vals(cap) : NULL;
-    if (!cvals || cvals->type != RAY_LIST || !map || map->type != RAY_I64 || map->len > cvals->len)
+    if (!pairs || pairs->type != RAY_I64) goto vm_error_name;
+    if (cap && (!ckeys || !cvals || ckeys->type != RAY_SYM || cvals->type != RAY_LIST || ckeys->len != cvals->len))
         goto vm_error_name;
-    const int64_t *slots = (const int64_t*)ray_data(map);
-    ray_t **vals = (ray_t**)ray_data(cvals);
-    for (int64_t i = 0; i < map->len; i++) {
-        if (slots[i] < 0) continue;
-        ray_t *val = vals[i];
-        if (val) ray_retain(val);
-        else val = make_i64(0);
-        if (LOCAL(slots[i])) ray_release(LOCAL(slots[i]));
-        LOCAL(slots[i]) = val;
-        LROWS(slots[i]) = 0;
+    int64_t ncap = ckeys ? ckeys->len : 0;
+    ray_t *flags = LAMBDA_CAPROWS(vm.fn);
+    bool live = flags && flags->len == ncap && LAMBDA_CAPQ(vm.fn) &&
+                LAMBDA_CAPQ(vm.fn) == ray_env_query_serial();
+    const int64_t *pv = (const int64_t*)ray_data(pairs);
+    for (int64_t i = 0, guess = 0; i + 1 < pairs->len; i += 2, guess++) {
+        int64_t name = pv[i], slot = pv[i + 1];
+        int64_t at = -1;
+        if (guess < ncap && ray_read_sym(ray_data(ckeys), guess, RAY_SYM, ckeys->attrs) == name) at = guess;
+        for (int64_t k = 0; at < 0 && k < ncap; k++)
+            if (ray_read_sym(ray_data(ckeys), k, RAY_SYM, ckeys->attrs) == name) at = k;
+        if (LOCAL(slot)) { ray_release(LOCAL(slot)); LOCAL(slot) = NULL; }
+        LROWS(slot) = 0;
+        if (at < 0) continue;
+        ray_t *val = ((ray_t**)ray_data(cvals))[at];
+        if (!val) continue;
+        ray_retain(val);
+        LOCAL(slot) = val;
+        LROWS(slot) = live ? ((uint8_t*)ray_data(flags))[at] : 0;
     }
+    DISPATCH();
+}
+
+op_mkclosure: {
+    /* Stack: [.., template, names, slots].  A closure of the template:
+     * it shares the template's bytecode, constants, debug map and locals
+     * count, and captures the current frame's slots named by `names`, with
+     * their row flags, which apply while the innermost query frame is the
+     * one of now.  A slot still empty (its `let` has not run) is not
+     * captured, as the tree walker would not bind it either; a lazy slot
+     * is materialized first, into the slot too, since a lazy handle is
+     * single-use. */
+    ray_t *slots = POP();
+    ray_t *names = POP();
+    ray_t *tmpl  = POP();
+    if (!tmpl || tmpl->type != RAY_LAMBDA || !names || names->type != RAY_SYM ||
+        !slots || slots->type != RAY_I64 || names->len != slots->len) {
+        ray_release(slots); ray_release(names); ray_release(tmpl);
+        goto vm_error;
+    }
+    int64_t ncap = names->len;
+    ray_t *keys = ray_sym_vec_new(RAY_SYM_W64, ncap > 0 ? ncap : 1);
+    ray_t *vals = ray_list_new(ncap > 0 ? ncap : 1);
+    ray_t *flags = ray_vec_new(RAY_U8, ncap > 0 ? ncap : 1);
+    ray_t *lam = ray_alloc(LAMBDA_SLOTS * sizeof(ray_t*));
+    if (!keys || RAY_IS_ERR(keys) || !vals || RAY_IS_ERR(vals) || !flags || RAY_IS_ERR(flags) || !lam || RAY_IS_ERR(lam)) {
+        if (keys && !RAY_IS_ERR(keys)) ray_release(keys);
+        if (vals && !RAY_IS_ERR(vals)) ray_release(vals);
+        if (flags && !RAY_IS_ERR(flags)) ray_release(flags);
+        if (lam && !RAY_IS_ERR(lam)) { lam->type = -RAY_I64; ray_release(lam); }
+        ray_release(slots); ray_release(names); ray_release(tmpl);
+        vm_err_obj = ray_error("oom", NULL);
+        goto vm_error;
+    }
+    keys->len = 0; flags->len = 0;
+    bool any_flag = false;
+    for (int64_t i = 0; i < ncap; i++) {
+        int64_t slot = ((const int64_t*)ray_data(slots))[i];
+        if (slot < 0 || slot >= n_locals) continue;
+        ray_t *v = LOCAL(slot);
+        if (!v) continue;
+        if (ray_is_lazy(v)) {
+            v = ray_lazy_materialize(v);   /* consumes the slot's ref */
+            LOCAL(slot) = v && !RAY_IS_ERR(v) ? v : NULL;
+            if (!v || RAY_IS_ERR(v)) {
+                ray_release(keys); ray_release(vals); ray_release(flags);
+                lam->type = -RAY_I64; ray_release(lam);
+                ray_release(slots); ray_release(names); ray_release(tmpl);
+                vm_err_obj = v ? v : ray_error("type", NULL);
+                goto vm_error;
+            }
+        }
+        ((int64_t*)ray_data(keys))[keys->len++] = ray_read_sym(ray_data(names), i, RAY_SYM, names->attrs);
+        vals = ray_list_append(vals, v);
+        uint8_t r = LROWS(slot) == 1 ? 1 : 0;
+        ((uint8_t*)ray_data(flags))[flags->len++] = r;
+        if (r) any_flag = true;
+    }
+    lam->type = RAY_LAMBDA;
+    lam->attrs = tmpl->attrs;
+    lam->len = 0;
+    memset(ray_data(lam), 0, LAMBDA_SLOTS * sizeof(ray_t*));
+    ray_retain(LAMBDA_PARAMS(tmpl)); LAMBDA_PARAMS(lam) = LAMBDA_PARAMS(tmpl);
+    ray_retain(LAMBDA_BODY(tmpl));   LAMBDA_BODY(lam)   = LAMBDA_BODY(tmpl);
+    if (LAMBDA_BC(tmpl))     { ray_retain(LAMBDA_BC(tmpl));     LAMBDA_BC(lam)     = LAMBDA_BC(tmpl); }
+    if (LAMBDA_CONSTS(tmpl)) { ray_retain(LAMBDA_CONSTS(tmpl)); LAMBDA_CONSTS(lam) = LAMBDA_CONSTS(tmpl); }
+    if (LAMBDA_NFO(tmpl))    { ray_retain(LAMBDA_NFO(tmpl));    LAMBDA_NFO(lam)    = LAMBDA_NFO(tmpl); }
+    if (LAMBDA_DBG(tmpl))    { ray_retain(LAMBDA_DBG(tmpl));    LAMBDA_DBG(lam)    = LAMBDA_DBG(tmpl); }
+    LAMBDA_NLOCALS(lam) = LAMBDA_NLOCALS(tmpl);
+    if (keys->len > 0) {
+        LAMBDA_CLOSURE(lam) = ray_dict_new(keys, vals);   /* consumes both */
+        if (!LAMBDA_CLOSURE(lam) || RAY_IS_ERR(LAMBDA_CLOSURE(lam))) {
+            LAMBDA_CLOSURE(lam) = NULL; ray_release(flags); ray_release(lam);
+            ray_release(slots); ray_release(names); ray_release(tmpl);
+            vm_err_obj = ray_error("oom", NULL);
+            goto vm_error;
+        }
+    } else { ray_release(keys); ray_release(vals); }
+    if (any_flag) { LAMBDA_CAPROWS(lam) = flags; LAMBDA_CAPQ(lam) = ray_env_query_serial(); }
+    else ray_release(flags);
+    ray_release(slots); ray_release(names); ray_release(tmpl);
+    PUSHR(lam, 0);
+    DISPATCH();
+}
+
+op_loadenvg: {
+    /* A `let` slot that may still be empty: the local when bound, else
+     * the global of that name (a name error when there is none), as the
+     * tree walker resolves a name whose `let` has not run. */
+    uint8_t slot = code[ip++];
+    uint16_t idx = (uint16_t)((code[ip] << 8) | code[ip + 1]);
+    ip += 2;
+    ray_t *val = LOCAL(slot);
+    if (val) {
+        if (ray_is_lazy(val)) {
+            val = ray_lazy_materialize(val);
+            if (!val || RAY_IS_ERR(val)) { vm_err_obj = val ? val : ray_error("type", NULL); LOCAL(slot) = NULL; goto vm_error; }
+            LOCAL(slot) = val;
+        }
+        ray_retain(val);
+        PUSHR(val, LROWS(slot));
+        DISPATCH();
+    }
+    ray_t *name_obj = cpool[idx];
+    uint8_t val_rows = 0;
+    val = ray_env_resolve_rows(name_obj->i64, &val_rows);
+    if (!val) goto vm_error_name;
+    if (RAY_IS_ERR(val)) { vm_err_obj = val; goto vm_error; }
+    PUSHR(val, val_rows);
     DISPATCH();
 }
 
@@ -4547,7 +4664,7 @@ ray_t* ray_eval(ray_t* obj) {
             }
             bool named = elems[0]->type == -RAY_SYM && !(elems[0]->attrs & ATTR_QUOTED);
             int8_t result_rows = -1;
-            ray_t* result = call_lambda_impl(head, args, argc, query, row_args, named, &result_rows, true);
+            ray_t* result = call_lambda_impl(head, args, argc, query, row_args, named, &result_rows);
             rows = result_rows;
             for (int64_t i = 0; i < argc; i++) ray_release(args[i]);
             ray_release(head);

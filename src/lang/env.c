@@ -28,6 +28,7 @@
 #include "table/dict.h"
 #include "ops/temporal.h"
 #include "ops/linkop.h"
+#include "ops/ops.h"       /* ray_is_lazy, ray_lazy_materialize — lazy captures */
 #include "mem/sys.h"
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -239,6 +240,18 @@ ray_t* ray_env_capture_locals_rows(ray_t** flags_out, uint32_t* serial_out) {
             uint8_t r = outer ? 0 : f->rows[i];
             ((uint8_t*)ray_data(flags))[flags->len++] = r;
             if (r) any_flag = true;
+            if (ray_is_lazy(f->vals[i])) {
+                /* A lazy handle is single-use: capture (and keep bound) the
+                 * concrete value, or the closure's second call would read a
+                 * handle its first call consumed. */
+                ray_t* concrete = ray_lazy_materialize(f->vals[i]);   /* consumes the frame's ref */
+                if (!concrete || RAY_IS_ERR(concrete)) {
+                    f->vals[i] = NULL;
+                    ray_release(keys); ray_release(vals); ray_release(flags);
+                    return concrete ? concrete : ray_error("type", NULL);
+                }
+                f->vals[i] = concrete;
+            }
             vals = ray_list_append(vals, f->vals[i]);
             if (!vals || RAY_IS_ERR(vals)) {
                 ray_release(keys); ray_release(flags);

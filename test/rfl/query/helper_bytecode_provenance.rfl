@@ -373,3 +373,33 @@ CNT9 -- 6
 (set ki9 (mki9 7))
 (at (select {n: (count v) by: (ki9 v) from: TB9}) 'v) -- [1 2 3 6]
 CNT9 -- 6
+
+;; ── purity follows the callee wherever it is bound ────────────────────────
+;; A pure helper reached through a parameter, a let, or a capture keeps the
+;; whole-column semantics; only an effect sends the body row by row.
+(set T10 (table [v] (list [1 2 3 4 5 6])))
+(set kg10 (fn [v] 1 (> (- v (avg v)) 0)))
+(at (select {n: (count v) by: (kg10 v) from: T10}) 'n) -- [3 3]
+(set grp10 (fn [t k] (at (select {n: (count v) by: (k v) from: t}) 'n)))
+(grp10 T10 kg10) -- [3 3]
+(set kl10 (fn [v] 1 (let f (fn [x] (- x (avg x)))) (> (f v) 0)))
+(at (select {n: (count v) by: (kl10 v) from: T10}) 'n) -- [3 3]
+(set mkc10 (fn [h] (fn [v] (> (h v) 0))))
+(set kc10 (mkc10 (fn [x] (- x (avg x)))))
+(at (select {n: (count v) by: (kc10 v) from: T10}) 'n) -- [3 3]
+(set km10 (fn [v] 1 (> v (mavg 3 v))))
+(at (select {n: (count v) by: (km10 v) from: T10}) 'n) -- [1 5]
+;; a pure body keeps the whole column: the min is the column's minimum
+(set kw10 (fn [v] 1 (- v (min v))))
+(at (select {n: (count v) by: (kw10 v) from: T10}) 'v) -- [0 1 2 3 4 5]
+;; a computed callee is an effect: the body runs once per row
+(set CNT10 0)
+(set eff10 (fn [x] (set CNT10 (+ CNT10 1)) x))
+(set H10 (dict ['a] (list eff10)))
+(set kdisp10 (fn [v] ((at H10 'a) v) (if (< v 4) 0 1)))
+(at (select {n: (count v) by: (kdisp10 v) from: T10}) 'n) -- [3 3]
+CNT10 -- 6
+;; a swallowed whole-column failure leaves no trace or message behind: a
+;; later uncaught error in a fresh interpreter is reported at its own place
+(write "/tmp/rfl_trace_clear.rfl" "(set TB (table [v] (list [1 2 3 10 20 30]))) (set kneg (fn [v] 1 (if (< v 0) (raise 'negative) (% v 7)))) (select {n: (count v) by: (kneg v) from: TB}) (+ 1 'a)")
+(.sys.exec "./rayforce /tmp/rfl_trace_clear.rfl 2>&1 | grep -c negative | grep -qx 0") -- 0

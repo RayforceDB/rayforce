@@ -191,10 +191,14 @@ static test_result_t test_query_helper_reinit(void) {
  * closure stays on the tree walker, whose capture binding reports a type
  * error, inside and outside a query. */
 static test_result_t test_closure_malformed_capture(void) {
-    ray_t* lam = ray_eval_str("((fn [k] (fn [v] (+ v k))) 1)");
+    /* A closure made by interpreted code (a top-level `do`): not compiled
+     * yet, so the compile gate decides. */
+    ray_t* lam = ray_eval_str("(do (let k 1) (fn [v] (+ v k)))");
     TEST_ASSERT_NOT_NULL(lam);
     TEST_ASSERT_FALSE(RAY_IS_ERR(lam));
     TEST_ASSERT_EQ_I(lam->type, RAY_LAMBDA);
+    TEST_ASSERT(!LAMBDA_IS_COMPILED(lam), "a closure made by the tree walker starts uncompiled");
+    TEST_ASSERT_NOT_NULL(LAMBDA_CLOSURE(lam));
     /* Replace the closure's values with a typed vector of the same length. */
     ray_t* keys = ray_dict_keys(LAMBDA_CLOSURE(lam));
     ray_t* vals = ray_vec_new(RAY_I64, keys->len);
@@ -213,6 +217,28 @@ static test_result_t test_closure_malformed_capture(void) {
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT(RAY_IS_ERR(r), "malformed closure must fail, not be dereferenced");
     TEST_ASSERT(!LAMBDA_IS_COMPILED(lam), "malformed closure must not compile");
+    ray_error_free(r);
+    ray_release(lam);
+
+    /* A closure made by compiled code shares its literal's bytecode from
+     * birth; its capture binding checks the dict's shape at run time. */
+    lam = ray_eval_str("((fn [k] (fn [v] (+ v k))) 1)");
+    TEST_ASSERT_NOT_NULL(lam);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(lam));
+    TEST_ASSERT(LAMBDA_IS_COMPILED(lam), "a closure made by compiled code is born compiled");
+    keys = ray_dict_keys(LAMBDA_CLOSURE(lam));
+    vals = ray_vec_new(RAY_I64, keys->len);
+    TEST_ASSERT_NOT_NULL(vals);
+    for (int64_t i = 0; i < keys->len; i++) ((int64_t*)ray_data(vals))[i] = 0x4141414141414141LL;
+    vals->len = keys->len;
+    ray_retain(keys);
+    bad = ray_dict_new(keys, vals);
+    TEST_ASSERT_NOT_NULL(bad);
+    ray_release(LAMBDA_CLOSURE(lam));
+    LAMBDA_CLOSURE(lam) = bad;
+    r = call_lambda(lam, args, 1);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT(RAY_IS_ERR(r), "a malformed closure dict must fail the capture binding");
     ray_error_free(r);
     ray_release(arg);
     ray_release(lam);

@@ -44,6 +44,7 @@ typedef struct {
 
     struct { int64_t sym_id; int32_t slot; } locals[256];
     int32_t  n_locals;
+    int32_t  n_fixed;    /* params + captures: slots that are always bound */
     int32_t  max_locals;
     bool     error;
     ray_t   *lambda;     /* the lambda being compiled (for 'self' resolution) */
@@ -53,6 +54,8 @@ typedef struct {
 } compiler_t;
 
 static void compile_expr(compiler_t *c, ray_t *ast);
+static bool compile_fn_template(compiler_t *c, ray_t *ast);
+static bool compile_lambda(ray_t *lambda, ray_t *capnames);
 
 static bool compiler_init(compiler_t *c) {
     memset(c, 0, sizeof(*c));
@@ -496,8 +499,12 @@ static void compile_list(compiler_t *c, ray_t *ast) {
             return;
         }
 
-        /* (fn [params] body...) — nested lambda via dynamic eval */
+        /* (fn [params] body...) — a closure template compiled once here
+         * and instantiated per evaluation (OP_MKCLOSURE); the dynamic
+         * eval below is the fallback when the literal cannot compile. */
         if (sym_id == sf_fn && n >= 3) {
+            if (compile_fn_template(c, ast)) return;
+            if (c->error) return;
             if (ast_refs_locals(c, ast)) {
                 ray_t *syms = ray_alloc((size_t)c->n_locals * sizeof(int64_t));
                 if (!syms || RAY_IS_ERR(syms)) { c->error = true; return; }
@@ -687,9 +694,18 @@ static void compile_expr(compiler_t *c, ray_t *ast) {
                 return;
             }
             int32_t slot = find_local(c, ast->i64);
-            if (slot >= 0) {
+            if (slot >= 0 && slot < c->n_fixed) {
                 emit(c, OP_LOADENV);
                 emit(c, (uint8_t)slot);
+            } else if (slot >= 0) {
+                /* A `let` slot may still be empty when its `let` has not
+                 * run; the tree walker then finds the global of that name
+                 * (or raises a name error), so the load falls back to it. */
+                int32_t idx = add_constant(c, ast);
+                emit(c, OP_LOADENVG);
+                emit(c, (uint8_t)slot);
+                emit(c, (uint8_t)(idx >> 8));
+                emit(c, (uint8_t)(idx & 0xFF));
             } else if (ast->i64 == sf_self) {
                 /* `self` as a value is the running lambda, as the tree
                  * walker binds it in every call frame. */
@@ -740,12 +756,175 @@ static bool closure_shape_ok(ray_t *closure) {
     return keys && vals && keys->type == RAY_SYM && vals->type == RAY_LIST && keys->len == vals->len;
 }
 
+/* Every symbol id mentioned anywhere in `ast` (atoms, sym vectors, lists,
+ * dicts), appended to the I64 vector *out without duplicates.  *dynamic is
+ * set when the text mentions `eval` or `resolve`, which can reach a name
+ * that is not spelled out. */
+static bool ast_collect_syms(ray_t *ast, ray_t **out, bool *dynamic) {
+    if (!ast || !*out) return false;
+    if (ast->type == -RAY_SYM) {
+        int64_t id = ast->i64;
+        if (id == sf_eval || id == sf_resolve) *dynamic = true;
+        const int64_t *have = (const int64_t*)ray_data(*out);
+        for (int64_t i = 0; i < (*out)->len; i++) if (have[i] == id) return true;
+        *out = ray_vec_append(*out, &id);
+        return *out && !RAY_IS_ERR(*out);
+    }
+    if (ast->type == RAY_SYM) {
+        for (int64_t i = 0; i < ast->len; i++) {
+            int64_t id = ray_read_sym(ray_data(ast), i, RAY_SYM, ast->attrs);
+            const int64_t *have = (const int64_t*)ray_data(*out);
+            bool seen = false;
+            for (int64_t k = 0; k < (*out)->len; k++) if (have[k] == id) { seen = true; break; }
+            if (seen) continue;
+            *out = ray_vec_append(*out, &id);
+            if (!*out || RAY_IS_ERR(*out)) return false;
+        }
+        return true;
+    }
+    if (ast->type == RAY_LIST) {
+        ray_t **elems = (ray_t**)ray_data(ast);
+        for (int64_t i = 0; i < ast->len; i++)
+            if (!ast_collect_syms(elems[i], out, dynamic)) return false;
+        return true;
+    }
+    if (ast->type == RAY_DICT) {
+        ray_t **slots = (ray_t**)ray_data(ast);
+        return ast_collect_syms(slots[0], out, dynamic) && ast_collect_syms(slots[1], out, dynamic);
+    }
+    return true;
+}
+
+static bool syms_contain(ray_t *syms, int64_t id) {
+    if (!syms) return false;
+    const int64_t *ids = (const int64_t*)ray_data(syms);
+    for (int64_t i = 0; i < syms->len; i++) if (ids[i] == id) return true;
+    return false;
+}
+
+/* The capture names a closure body can reach: the closure dict's keys that
+ * the body mentions (every key when the body uses eval or resolve), never
+ * `self`.  A SYM vector the caller releases, or NULL for none. */
+static ray_t *closure_capture_names(ray_t *lambda) {
+    ray_t *closure = LAMBDA_CLOSURE(lambda);
+    if (!closure) return NULL;
+    ray_t *keys = ray_dict_keys(closure);
+    if (!keys || keys->len == 0) return NULL;
+    init_sf_syms();
+    ray_t *mentioned = ray_vec_new(RAY_I64, 16);
+    if (!mentioned || RAY_IS_ERR(mentioned)) return NULL;
+    bool dynamic = false;
+    bool ok = ast_collect_syms(LAMBDA_BODY(lambda), &mentioned, &dynamic);
+    ray_t *names = ok ? ray_sym_vec_new(RAY_SYM_W64, keys->len) : NULL;
+    if (names && !RAY_IS_ERR(names)) {
+        int64_t *out = (int64_t*)ray_data(names);
+        names->len = 0;
+        for (int64_t i = 0; i < keys->len; i++) {
+            int64_t id = ray_read_sym(ray_data(keys), i, RAY_SYM, keys->attrs);
+            if (id == sf_self) continue;
+            if (dynamic || syms_contain(mentioned, id)) out[names->len++] = id;
+        }
+    }
+    if (mentioned) ray_release(mentioned);
+    if (names && RAY_IS_ERR(names)) names = NULL;
+    return names;
+}
+
+/* A `fn` literal inside a compiled body becomes a template compiled once,
+ * here, against the enclosing locals its body mentions (all of them when
+ * the body uses eval or resolve); OP_MKCLOSURE then makes each closure
+ * share the template's bytecode and capture those slots.  Returns false,
+ * without emitting, when the literal cannot be compiled this way; the
+ * caller then falls back to evaluating the literal through the tree
+ * walker. */
+static bool compile_fn_template(compiler_t *c, ray_t *ast) {
+    ray_t **elems = (ray_t**)ray_data(ast);
+    int64_t n = ray_len(ast);
+    ray_t *params = elems[1];
+    if (!params || params->type != RAY_SYM) return false;
+    for (int64_t i = 0; i < params->len; i++)
+        if (ray_sym_is_reserved(ray_read_sym(ray_data(params), i, RAY_SYM, params->attrs))) return false;
+
+    ray_t *mentioned = ray_vec_new(RAY_I64, 16);
+    if (!mentioned || RAY_IS_ERR(mentioned)) return false;
+    bool dynamic = false, ok = true;
+    for (int64_t i = 2; i < n && ok; i++) ok = ast_collect_syms(elems[i], &mentioned, &dynamic);
+    if (!ok) { ray_release(mentioned); return false; }
+
+    /* Capture names and the enclosing slots they come from, in slot order. */
+    ray_t *names = ray_sym_vec_new(RAY_SYM_W64, c->n_locals > 0 ? c->n_locals : 1);
+    ray_t *slots = ray_vec_new(RAY_I64, c->n_locals > 0 ? c->n_locals : 1);
+    if (!names || RAY_IS_ERR(names) || !slots || RAY_IS_ERR(slots)) {
+        ray_release(mentioned);
+        if (names && !RAY_IS_ERR(names)) ray_release(names);
+        if (slots && !RAY_IS_ERR(slots)) ray_release(slots);
+        return false;
+    }
+    names->len = 0; slots->len = 0;
+    for (int32_t i = 0; i < c->n_locals; i++) {
+        int64_t id = c->locals[i].sym_id;
+        if (id < 0 || id == sf_self) continue;
+        if (!dynamic && !syms_contain(mentioned, id)) continue;
+        bool dup = false;   /* a name rebound to a later slot: keep the latest */
+        for (int64_t k = 0; k < names->len; k++)
+            if (((int64_t*)ray_data(names))[k] == id) { ((int64_t*)ray_data(slots))[k] = c->locals[i].slot; dup = true; break; }
+        if (dup) continue;
+        ((int64_t*)ray_data(names))[names->len++] = id;
+        ((int64_t*)ray_data(slots))[slots->len++] = c->locals[i].slot;
+    }
+    ray_release(mentioned);
+
+    ray_t *body = ray_alloc((size_t)(n - 2) * sizeof(ray_t*));
+    ray_t *tmpl = ray_alloc(LAMBDA_SLOTS * sizeof(ray_t*));
+    if (!body || RAY_IS_ERR(body) || !tmpl || RAY_IS_ERR(tmpl)) {
+        ray_release(names); ray_release(slots);
+        if (body && !RAY_IS_ERR(body)) { body->type = RAY_LIST; body->len = 0; ray_release(body); }
+        if (tmpl && !RAY_IS_ERR(tmpl)) { tmpl->type = RAY_LAMBDA; memset(ray_data(tmpl), 0, LAMBDA_SLOTS * sizeof(ray_t*)); ray_release(tmpl); }
+        return false;
+    }
+    body->type = RAY_LIST;
+    body->len = n - 2;
+    for (int64_t i = 2; i < n; i++) { ray_retain(elems[i]); ((ray_t**)ray_data(body))[i - 2] = elems[i]; }
+    tmpl->type = RAY_LAMBDA;
+    tmpl->attrs = 0;
+    tmpl->len = 0;
+    memset(ray_data(tmpl), 0, LAMBDA_SLOTS * sizeof(ray_t*));
+    ray_retain(params);
+    LAMBDA_PARAMS(tmpl) = params;
+    LAMBDA_BODY(tmpl) = body;
+    if (c->lambda && LAMBDA_NFO(c->lambda)) { ray_retain(LAMBDA_NFO(c->lambda)); LAMBDA_NFO(tmpl) = LAMBDA_NFO(c->lambda); }
+
+    if (!compile_lambda(tmpl, names->len ? names : NULL)) {
+        ray_release(tmpl); ray_release(names); ray_release(slots);
+        return false;
+    }
+    int32_t tidx = add_constant(c, tmpl);
+    int32_t nidx = add_constant(c, names);
+    int32_t sidx = add_constant(c, slots);
+    ray_release(tmpl); ray_release(names); ray_release(slots);
+    if (c->error) return false;
+    emit_const(c, tidx);
+    emit_const(c, nidx);
+    emit_const(c, sidx);
+    emit(c, OP_MKCLOSURE);
+    return true;
+}
+
 void ray_compile(ray_t *lambda) {
     if (LAMBDA_IS_COMPILED(lambda)) return;
     if (!closure_shape_ok(LAMBDA_CLOSURE(lambda))) return;
+    ray_t *names = closure_capture_names(lambda);
+    (void)compile_lambda(lambda, names);
+    if (names) ray_release(names);
+}
 
+/* Compile `lambda` with `capnames` (a SYM vector, or NULL) bound as locals
+ * ahead of the body by one OP_BINDCAPS.  A parameter shadows a capture of
+ * its name.  False when the body cannot be compiled (the lambda stays on
+ * the tree walker). */
+static bool compile_lambda(ray_t *lambda, ray_t *capnames) {
     compiler_t c;
-    if (!compiler_init(&c)) return;
+    if (!compiler_init(&c)) return false;
     c.lambda = lambda;
 
     /* Register params as locals */
@@ -759,36 +938,35 @@ void ray_compile(ray_t *lambda) {
     /* A closure's captures are locals of its body, bound before it runs:
      * a `let` of a captured name writes the same slot, a capture named
      * like a builtin is the callee, and a window (OP_SCOPE_BEGIN) binds
-     * them with the other locals.  `self` is never captured (env.c), so it
-     * is not among them.  One OP_BINDCAPS binds them all; a frame holds
-     * 256 slots, so a closure with more captures than that stays on the
-     * tree walker, which has no such limit. */
-    if (!c.error && LAMBDA_CLOSURE(lambda)) {
-        ray_t *ckeys = ray_dict_keys(LAMBDA_CLOSURE(lambda));
-        ray_t *map = ray_alloc((size_t)ckeys->len * sizeof(int64_t));
-        if (!map || RAY_IS_ERR(map)) { c.error = true; }
+     * them with the other locals.  Only the names the body mentions take a
+     * slot (closure_capture_names / compile_fn_template), so a closure's
+     * recursion depth does not shrink with the bindings in scope.  One
+     * OP_BINDCAPS binds them all, by name, from the closure dict.  A frame
+     * holds 256 slots; a closure needing more stays on the tree walker. */
+    if (!c.error && capnames && capnames->len > 0) {
+        ray_t *pairs = ray_alloc((size_t)capnames->len * 2 * sizeof(int64_t));
+        if (!pairs || RAY_IS_ERR(pairs)) { c.error = true; }
         else {
-            map->type = RAY_I64;
-            map->len  = ckeys->len;
-            int64_t *slots = (int64_t*)ray_data(map);
-            bool any = false;
-            for (int64_t i = 0; i < ckeys->len && !c.error; i++) {
-                int64_t id = ray_read_sym(ray_data(ckeys), i, RAY_SYM, ckeys->attrs);
-                slots[i] = -1;
+            pairs->type = RAY_I64;
+            pairs->len  = 0;
+            int64_t *pv = (int64_t*)ray_data(pairs);
+            for (int64_t i = 0; i < capnames->len && !c.error; i++) {
+                int64_t id = ray_read_sym(ray_data(capnames), i, RAY_SYM, capnames->attrs);
                 if (find_local(&c, id) >= 0) continue;   /* a parameter shadows its capture */
                 int32_t slot = add_local(&c, id);
                 if (slot < 0) { c.error = true; break; }
-                slots[i] = slot;
-                any = true;
+                pv[pairs->len++] = id;
+                pv[pairs->len++] = slot;
             }
-            if (!c.error && any) {
-                int32_t idx = add_constant(&c, map);
+            if (!c.error && pairs->len > 0) {
+                int32_t idx = add_constant(&c, pairs);
                 if (idx < 0 || idx > 255) c.error = true;
                 else { emit(&c, OP_BINDCAPS); emit(&c, (uint8_t)idx); }
             }
-            ray_release(map);
+            ray_release(pairs);
         }
     }
+    c.n_fixed = c.n_locals;
 
     /* Compile body expressions */
     ray_t *body = LAMBDA_BODY(lambda);
@@ -803,19 +981,19 @@ void ray_compile(ray_t *lambda) {
     if (c.error) {
         if (c.dbg_obj) ray_release(c.dbg_obj);
         compiler_destroy(&c);
-        return;
+        return false;
     }
 
     /* Build bytecode vector */
     ray_t *bc = ray_alloc(c.code_len);
-    if (!bc) { compiler_destroy(&c); return; }
+    if (!bc) { compiler_destroy(&c); return false; }
     bc->type = RAY_U8;
     bc->len = c.code_len;
     memcpy(ray_data(bc), c.code, c.code_len);
 
     /* Build constants list */
     ray_t *consts = ray_alloc(c.n_consts * sizeof(ray_t *));
-    if (!consts) { ray_release(bc); compiler_destroy(&c); return; }
+    if (!consts) { ray_release(bc); compiler_destroy(&c); return false; }
     consts->type = RAY_LIST;
     consts->len = c.n_consts;
     ray_t **cpool = (ray_t **)ray_data(consts);
@@ -835,6 +1013,7 @@ void ray_compile(ray_t *lambda) {
     }
 
     compiler_destroy(&c);
+    return true;
 }
 
 ray_span_t ray_bc_dbg_get(ray_t* dbg, int32_t ip) {

@@ -2176,20 +2176,22 @@ static bool query_inline_pure(ray_t* expr, int depth) {
  * `by:` key the planner cannot lower is evaluated over the whole column
  * first and again row by row when that run turns out to have meant one
  * row at a time; a body with an effect would then run it twice, so such a
- * body is evaluated row by row from the start.  Pure: the forms below,
- * the builtins the planner lowers or the fallback inlines, elementwise
- * and aggregate builtins (their attrs), a user function whose body is
- * pure (followed through its global binding, depth-limited), `self`.
- * Everything else, `set` and `eval` first of all, counts as an effect. */
-static bool key_expr_pure(ray_t* expr, int depth);
-static bool key_lambda_pure(ray_t* lam, int depth) {
-    ray_t* body = LAMBDA_BODY(lam);
-    if (!body || body->type != RAY_LIST) return false;
-    ray_t** es = ray_data(body);
-    for (int64_t i = 0; i < body->len; i++)
-        if (!key_expr_pure(es[i], depth + 1)) return false;
-    return true;
-}
+ * body is evaluated row by row from the start.  The decision follows the
+ * callee wherever it is bound: a global helper, a parameter or `let` of an
+ * enclosing frame, a capture of the closure being read, or a lambda literal
+ * bound by a `let` earlier in the same body.  A callee that is computed
+ * (`((at H 'a) v)`) or unknown counts as an effect, as does `set`, `eval`,
+ * a system or I/O builtin and the few builtins that read outside their
+ * arguments; every other builtin is pure. */
+typedef struct {
+    ray_t* closure;               /* captures of the lambda being walked, or NULL */
+    const int64_t* let_names;     /* `let`-bound lambda literals seen so far in this body */
+    ray_t* const* let_lits;
+    int n_lets;
+} key_pure_ctx_t;
+
+static bool key_expr_pure(ray_t* expr, int depth, key_pure_ctx_t* ctx);
+
 static bool key_pure_form(int64_t id) {
     static const char* const forms[] = {
         "let", "if", "do", "cond", "and", "or", "while", "times", "fn", "try",
@@ -2205,37 +2207,81 @@ static bool key_pure_form(int64_t id) {
     for (size_t i = 0; i < NFORMS; i++) if (ids[i] == id) return true;
     return false;
 }
-static bool key_pure_builtin_extra(int64_t id) {
-    /* Pure builtins the inline allowlist leaves out: higher-order verbs
-     * (their function arguments are checked as arguments), collection
-     * and text shaping, and the date parts.  Nothing here reads state
-     * outside its arguments or writes any. */
-    static const char* const pure[] = {
-        "map", "filter", "fold", "scan", "prior", "apply", "map-left", "map-right",
-        "fold-left", "fold-right", "fold-while", "scan-left", "scan-right",
-        "rotate", "cut", "cross", "find", "xrank", "bin", "binr", "split", "str-join",
-        "sym-name", "format", "dict", "table", "cols", "xcol", "xcols", "xkey",
-        "xasc", "xdesc", "top", "bot", "date", "time", "timestamp",
-        "ss", "hh", "yyyy", "mm", "dd", "dow", "doy", "cos-dist", "inner-prod", "l2-dist",
+
+/* A builtin that reads or writes outside its arguments. */
+static bool key_impure_builtin(ray_t* fn, int64_t id) {
+    static const char* const impure[] = {
+        "println", "show", "print", "rand", "guid", "eval", "parse", "resolve", "env", "get",
+        "remove", "timeit", "exit", "ser", "de", "datoms", "assert-fact", "retract-fact",
+        "scan-eav", "pull", "dl-program", "dl-query", "dl-provenance", "hnsw-save", "rc", "meta",
     };
-    enum { NPURE = sizeof pure / sizeof *pure };
-    static _Thread_local int64_t ids[NPURE];
+    enum { NIMPURE = sizeof impure / sizeof *impure };
+    static _Thread_local int64_t ids[NIMPURE];
     static _Thread_local uint64_t epoch;
     if (epoch != ray_sym_epoch() || !epoch) {
-        for (size_t i = 0; i < NPURE; i++) ids[i] = ray_sym_intern(pure[i], strlen(pure[i]));
+        for (size_t i = 0; i < NIMPURE; i++) ids[i] = ray_sym_intern(impure[i], strlen(impure[i]));
         epoch = ray_sym_epoch();
     }
-    for (size_t i = 0; i < NPURE; i++) if (ids[i] == id) return true;
+    if (fn->attrs & (RAY_FN_RESTRICTED | RAY_FN_SPECIAL_FORM)) return true;
+    if (ray_sym_is_dotted(id)) return true;   /* .sys.*, .io.*, ... */
+    for (size_t i = 0; i < NIMPURE; i++) if (ids[i] == id) return true;
     return false;
 }
-static bool key_expr_pure(ray_t* expr, int depth) {
+
+/* Lambda values: every statement of the body, with the lambda's own
+ * captures in scope. */
+static bool key_lambda_pure(ray_t* lam, int depth) {
+    ray_t* body = LAMBDA_BODY(lam);
+    if (!body || body->type != RAY_LIST) return false;
+    int64_t let_names[16]; ray_t* let_lits[16];
+    key_pure_ctx_t ctx = { LAMBDA_CLOSURE(lam), let_names, let_lits, 0 };
+    ray_t** es = ray_data(body);
+    for (int64_t i = 0; i < body->len; i++)
+        if (!key_expr_pure(es[i], depth + 1, &ctx)) return false;
+    return true;
+}
+
+/* A lambda literal: its body, with the literal's enclosing lets in scope. */
+static bool key_literal_pure(ray_t* lit, int depth, key_pure_ctx_t* ctx) {
+    ray_t** es = ray_data(lit);
+    for (int64_t i = 2; i < lit->len; i++)
+        if (!key_expr_pure(es[i], depth + 1, ctx)) return false;
+    return true;
+}
+
+static bool key_literal_is_fn(ray_t* v) {
+    if (!v || v->type != RAY_LIST || v->len < 3) return false;
+    ray_t* h = ((ray_t**)ray_data(v))[0];
+    return h && h->type == -RAY_SYM && !(h->attrs & ATTR_QUOTED) && h->i64 == ray_sym_intern("fn", 2);
+}
+
+/* What a name stands for when it is called or passed: true when it is pure
+ * (a pure lambda, a pure builtin, or plain data), false otherwise. */
+static bool key_name_pure(int64_t id, int depth, key_pure_ctx_t* ctx, bool called) {
+    for (int i = ctx->n_lets - 1; i >= 0; i--)
+        if (ctx->let_names[i] == id) return key_literal_pure(ctx->let_lits[i], depth, ctx);
+    ray_t* v = NULL;
+    if (ctx->closure) {
+        ray_t* keys = ray_dict_keys(ctx->closure);
+        ray_t* vals = ray_dict_vals(ctx->closure);
+        for (int64_t i = 0; keys && vals && i < keys->len; i++)
+            if (ray_read_sym(ray_data(keys), i, RAY_SYM, keys->attrs) == id) { v = ((ray_t**)ray_data(vals))[i]; break; }
+    }
+    if (!v) v = ray_env_get_local(id);       /* a parameter or let of a frame in scope */
+    if (!v) v = ray_env_get_global(id);
+    if (!v) return !called;                  /* an unknown callee is an effect */
+    if (v->type == RAY_LAMBDA) return key_lambda_pure(v, depth);
+    if (v->type == RAY_UNARY || v->type == RAY_BINARY || v->type == RAY_VARY)
+        return !key_impure_builtin(v, id);
+    return !called;                          /* data: calling it is an error, not an effect */
+}
+
+static bool key_expr_pure(ray_t* expr, int depth, key_pure_ctx_t* ctx) {
     if (!expr) return true;
     if (depth > 16) return false;
     if (expr->type == -RAY_SYM) {
         if (expr->attrs & ATTR_QUOTED) return true;
-        /* A helper named as a value may be called by whatever receives it. */
-        ray_t* v = ray_env_get_global(expr->i64);
-        return !(v && v->type == RAY_LAMBDA) || key_lambda_pure(v, depth);
+        return key_name_pure(expr->i64, depth, ctx, false);
     }
     if (expr->type != RAY_LIST || (expr->attrs & ATTR_QUOTED) || !expr->len) return true;
     ray_t** es = ray_data(expr);
@@ -2243,29 +2289,29 @@ static bool key_expr_pure(ray_t* expr, int depth) {
     if (!head) return false;
     int64_t first_arg = 1;
     if (head->type == RAY_LIST) {
-        if (!key_expr_pure(head, depth + 1)) return false;   /* ((fn ..) args) */
+        if (!key_literal_is_fn(head)) return false;          /* a computed callee */
+        if (!key_literal_pure(head, depth, ctx)) return false;
     } else if (head->type == -RAY_SYM && !(head->attrs & ATTR_QUOTED)) {
         int64_t id = head->i64;
         if (key_pure_form(id)) {
             if (id == ray_sym_intern("quote", 5)) return true;
             if (id == ray_sym_intern("fn", 2)) first_arg = 2;   /* the body, not the params */
-        } else {
-            ray_t* fn = ray_env_get_global(id);
-            if (fn && fn->type == RAY_LAMBDA) {
-                if (!key_lambda_pure(fn, depth)) return false;
-            } else if (fn && (fn->attrs & (RAY_FN_RESTRICTED | RAY_FN_SPECIAL_FORM))) {
-                return false;
-            } else if (!(query_inline_pure_builtin(id) || key_pure_builtin_extra(id) ||
-                         (fn && (fn->attrs & (RAY_FN_ATOMIC | RAY_FN_LEFT_ATOMIC |
-                                              RAY_FN_RIGHT_ATOMIC | RAY_FN_AGGR))))) {
-                return false;
+            if (id == ray_sym_intern("let", 3) && expr->len == 3 && es[1] && es[1]->type == -RAY_SYM &&
+                key_literal_is_fn(es[2]) && ctx->n_lets < 16) {
+                if (!key_literal_pure(es[2], depth, ctx)) return false;
+                ((int64_t*)ctx->let_names)[ctx->n_lets] = es[1]->i64;
+                ((ray_t**)ctx->let_lits)[ctx->n_lets] = es[2];
+                ctx->n_lets++;
+                return true;
             }
+        } else if (!key_name_pure(id, depth, ctx, true)) {
+            return false;
         }
     } else {
         return false;
     }
     for (int64_t i = first_arg; i < expr->len; i++)
-        if (!key_expr_pure(es[i], depth + 1)) return false;
+        if (!key_expr_pure(es[i], depth + 1, ctx)) return false;
     return true;
 }
 
@@ -10180,7 +10226,9 @@ static ray_t* select_plan_computed_key(ray_t* dict, ray_t* tbl, int64_t* key_nam
             int32_t conds = __VM->rows_cond;
             /* A body with an effect runs once per row, never whole first:
              * a repeated run would repeat the effect. */
-            bool pure = key_expr_pure(by_expr, 0);
+            int64_t pure_lets[16]; ray_t* pure_lits[16];
+            key_pure_ctx_t pure_ctx = { NULL, pure_lets, pure_lits, 0 };
+            bool pure = key_expr_pure(by_expr, 0, &pure_ctx);
             ray_t* keyvec = pure ? eval_expr_whole_column(by_expr, base) : NULL;
             if (!pure) keyvec = eval_expr_per_row(by_expr, base, nrows);
             else if (__VM->rows_cond != conds || !keyvec || RAY_IS_ERR(keyvec)) {
