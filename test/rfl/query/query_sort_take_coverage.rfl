@@ -253,3 +253,32 @@
 (at (select {by: (* x 2) from: Tckn desc: x}) 'y) -- (at (select {by: k from: Tcknp desc: k}) 'y)
 (at (select {by: (* x 2) from: Tckn asc: x take: 2}) 'y) -- (at (select {by: k from: Tcknp asc: k take: 2}) 'y)
 (at (select {by: (* x 2) from: Tckn asc: x take: 2}) 'y) -- [20 10]
+;; STR and LIST columns are gathered whole.  The branch built every column
+;; with store_typed_elem, which has no STR case: the cells came back empty
+;; or stale, and a sort on them read an unset string pool.
+(set Tcks (table [x r] (list [3 1 4 2 3 1] (list "c-long-string-over-12" "a-long-string-over-12" "d-long-string-over-12" "b-long-string-over-12" "c2" "a2"))))
+(set Tcksp (update {k: (* x 2) from: Tcks}))
+(at (select {by: (* x 2) from: Tcks}) 'r) -- ["c-long-string-over-12" "a-long-string-over-12" "d-long-string-over-12" "b-long-string-over-12"]
+(at (select {by: (* x 2) from: Tcks}) 'r) -- (at (select {by: k from: Tcksp}) 'r)
+(at (select {by: (* x 2) from: Tcks desc: r}) 'r) -- (at (select {by: k from: Tcksp desc: r}) 'r)
+(at (select {by: (* x 2) from: Tcks desc: r}) 'x) -- [8 6 4 2]
+(at (select {by: (* x 2) from: Tcks desc: r take: 2}) 'r) -- (at (select {by: k from: Tcksp desc: r take: 2}) 'r)
+(at (select {by: (* x 2) from: Tcks desc: r take: 2}) 'r) -- ["d-long-string-over-12" "c-long-string-over-12"]
+(set Tckl (table [x l] (list [3 1 4 2] (list [1 2] [3] [4 5 6] [7]))))
+(set Tcklp (update {k: (* x 2) from: Tckl}))
+(at (select {by: (* x 2) from: Tckl}) 'l) -- (at (select {by: k from: Tcklp}) 'l)
+(at (select {by: (* x 2) from: Tckl desc: x take: 2}) 'l) -- (at (select {by: k from: Tcklp desc: k take: 2}) 'l)
+(at (select {by: (* x 2) from: Tckl desc: x take: 2}) 'l) -- (list [4 5 6] [1 2])
+;; a STR computed key, over more rows than one gather chunk
+(set Tckb (table [x r] (list (til 8192) (concat "row-string-over-twelve-" (as 'STR (% (til 8192) 700))))))
+(set Tckbp (update {k: (concat r "!") from: Tckb}))
+(count (select {by: (concat r "!") from: Tckb})) -- 700
+(at (select {by: (concat r "!") from: Tckb desc: r take: 3}) 'r) -- (at (select {by: k from: Tckbp desc: k take: 3}) 'k)
+(at (select {by: (concat r "!") from: Tckb desc: r take: 3}) 'x) -- [99 98 97]
+(at (select {by: (concat r "!") from: Tckb asc: x take: -2}) 'r) -- (at (select {by: k from: Tckbp asc: x take: -2}) 'k)
+;; a dotted key takes the same branch; the by-dict form is the oracle
+(set Tckt (table [ts v] (list [2024.01.02D10:00:00.000000000 2024.01.01D09:00:00.000000000 2024.01.02D11:00:00.000000000 2024.01.03D08:00:00.000000000 2024.01.01D12:00:00.000000000] [1 2 3 4 5])))
+(select {by: ts.date from: Tckt desc: date take: 2}) -- (select {by: {date: ts.date} from: Tckt desc: date take: 2})
+(select {by: ts.date from: Tckt asc: date}) -- (select {by: {date: ts.date} from: Tckt asc: date})
+(select {by: ts.date from: Tckt where: (> v 1) desc: v take: -2}) -- (select {by: {date: ts.date} from: Tckt where: (> v 1) desc: v take: -2})
+(at (select {by: ts.date from: Tckt desc: date take: 2}) 'v) -- [4 1]

@@ -13295,39 +13295,38 @@ by_dict_done:
                     }
                 }
 
+                /* Columns are gathered at the first row of each group by
+                 * ray_group_gather, which builds every column type: STR
+                 * (store_typed_elem has no STR case and left the cells
+                 * unset), LIST, GUID and SYM over its own domain. */
                 ray_t* res2 = ray_table_new(tbl_ncols + 1);
                 /* Key column: computed_key's first-of-group values, which
                  * are the distinct grouping-key values surfaced to the
                  * user.  Using the source column at fi2 indices would lose
                  * the transform (e.g. raw Timestamp instead of its `.ss`). */
-                if (ray_is_vec(computed_key)) {
-                    ray_t* kv = ray_vec_new(computed_key->type, ng2);
-                    if (!RAY_IS_ERR(kv)) {
-                        /* len BEFORE store loop — ray_vec_set_null (called
-                         * by store_typed_elem for null atoms) range-checks
-                         * idx against vec->len and silently no-ops
-                         * otherwise. */
-                        kv->len = ng2;
-                        for (int64_t g2 = 0; g2 < ng2; g2++) {
-                            int a2 = 0;
-                            ray_t* v2 = collection_elem(computed_key, fi2[g2], &a2);
-                            store_typed_elem(kv, g2, v2);
-                            if (a2) ray_release(v2);
-                        }
+                if (ray_is_vec(computed_key) && !RAY_IS_ERR(res2)) {
+                    ray_t* kv = ray_group_gather(computed_key, fi2, ng2);
+                    if (!kv || RAY_IS_ERR(kv)) {
+                        ray_release(res2);
+                        res2 = kv ? kv : ray_error("oom", NULL);
+                    } else {
                         res2 = ray_table_add_col(res2, ckey_name, kv);
                         ray_release(kv);
                     }
                 }
-                for (int64_t c = 0; c < tbl_ncols; c++) {
+                for (int64_t c = 0; c < tbl_ncols && !RAY_IS_ERR(res2); c++) {
                     int64_t cn = ray_table_col_name(filtered_tbl, c);
                     /* Avoid duplicating a column name already used by the
                      * key: e.g. `by: Timestamp` (plain, non-dotted) would
                      * collide with the source Timestamp column. */
                     if (cn == ckey_name) continue;
                     ray_t* sc = ray_table_get_col_idx(filtered_tbl, c);
-                    ray_t* dc = ray_vec_new(sc->type, ng2);
-                    dc->len = ng2;    /* see note above — hoisted for null bits */
-                    for (int64_t g2 = 0; g2 < ng2; g2++) { int a2 = 0; ray_t* v2 = collection_elem(sc, fi2[g2], &a2); store_typed_elem(dc, g2, v2); if (a2) ray_release(v2); }
+                    ray_t* dc = ray_group_gather(sc, fi2, ng2);
+                    if (!dc || RAY_IS_ERR(dc)) {
+                        ray_release(res2);
+                        res2 = dc ? dc : ray_error("oom", NULL);
+                        break;
+                    }
                     res2 = ray_table_add_col(res2, cn, dc); ray_release(dc);
                 }
                 if (fi2_hdr) ray_free(fi2_hdr);
