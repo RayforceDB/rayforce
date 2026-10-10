@@ -2143,6 +2143,13 @@ ray_t* ray_times_fn(ray_t** args, int64_t n) {
 
 /* (fn [params...] body...) — create a lambda object.
  * Stores params list and body expressions in data area. */
+/* Sym ID of "self" for call_lambda's frame.  It belongs to the current sym
+ * table: runtime destroy tears the table down and the next runtime can give
+ * "self" a different ID, so ray_lang_destroy resets it, as ray_compile_reset
+ * does for the compiler's special-form IDs.  A stale ID bound the lambda under
+ * a name that was no longer "self", shadowing whatever variable owned it. */
+static int64_t g_call_self_sym = -1;
+
 /* Closures made by interpreted code (the top level, a lambda that could not
  * compile, a literal inside a special form the compiler hands to the tree
  * walker) share one compiled template per literal and capture set, as
@@ -2159,6 +2166,8 @@ typedef struct {
                        * for eval can share first and last nodes with another
                        * and differ in the middle */
     int64_t nbody;
+    ray_t*  mentioned; /* the symbols the body mentions (I64 vector) */
+    bool    dynamic;   /* the body uses eval or resolve: every capture counts */
     ray_t*  names;     /* capture names (SYM vector) or NULL */
     ray_t*  tmpl;      /* the compiled template */
 } closure_tmpl_t;
@@ -2169,6 +2178,7 @@ static _Thread_local uint64_t g_closure_tmpl_epoch;
 static void closure_tmpl_drop(closure_tmpl_t* e) {
     if (e->params) ray_release(e->params);
     for (int64_t i = 0; i < e->nbody && i < CLOSURE_TMPL_MAX_BODY; i++) if (e->body[i]) ray_release(e->body[i]);
+    if (e->mentioned) ray_release(e->mentioned);
     if (e->names) ray_release(e->names);
     if (e->tmpl) ray_release(e->tmpl);
     memset(e, 0, sizeof *e);
@@ -2190,12 +2200,26 @@ static void closure_tmpl_forget(void) {
     g_closure_tmpl_next = 0;
 }
 
-static bool closure_names_equal(const ray_t* a, const ray_t* b) {
-    int64_t la = a ? a->len : 0, lb = b ? b->len : 0;
-    if (la != lb) return false;
-    for (int64_t i = 0; i < la; i++)
-        if (ray_read_sym(ray_data((ray_t*)a), i, RAY_SYM, a->attrs) != ray_read_sym(ray_data((ray_t*)b), i, RAY_SYM, b->attrs)) return false;
-    return true;
+/* Does `closure`'s capture set, filtered by the entry's mentioned symbols,
+ * spell the entry's names?  Walks the dict keys once, allocating nothing. */
+static bool closure_entry_names_match(const closure_tmpl_t* e, ray_t* closure) {
+    int64_t want = e->names ? e->names->len : 0;
+    if (!closure) return want == 0;
+    ray_t* keys = ray_dict_keys(closure);
+    if (!keys) return want == 0;
+    const int64_t* ment = e->mentioned ? (const int64_t*)ray_data(e->mentioned) : NULL;
+    int64_t nment = e->mentioned ? e->mentioned->len : 0;
+    int64_t at = 0;
+    for (int64_t i = 0; i < keys->len; i++) {
+        int64_t id = ray_read_sym(ray_data(keys), i, RAY_SYM, keys->attrs);
+        if (id == g_call_self_sym) continue;
+        bool counts = e->dynamic;
+        for (int64_t k = 0; !counts && k < nment; k++) counts = ment[k] == id;
+        if (!counts) continue;
+        if (at >= want || ray_read_sym(ray_data(e->names), at, RAY_SYM, e->names->attrs) != id) return false;
+        at++;
+    }
+    return at == want;
 }
 
 static void closure_share_from(ray_t* lambda, ray_t* tmpl) {
@@ -2216,20 +2240,27 @@ static void closure_share_template(ray_t* lambda) {
         g_closure_tmpl_epoch = ray_sym_epoch();
     }
     ray_t** bn = (ray_t**)ray_data(body);
-    ray_t* names = ray_closure_capture_names(lambda);
+    /* The literal's nodes first: a known literal's mentioned symbols are
+     * in its entries, so the capture names cost a pass over the dict keys
+     * rather than a walk of the body. */
+    if (g_call_self_sym < 0) g_call_self_sym = ray_sym_intern("self", 4);
     for (int i = 0; i < CLOSURE_TMPL_SLOTS; i++) {
         closure_tmpl_t* e = &g_closure_tmpl[i];
         if (!e->tmpl || e->params != params || e->nbody != body->len) continue;
         bool same = true;
         for (int64_t k = 0; k < body->len && same; k++) same = e->body[k] == bn[k];
-        if (same && closure_names_equal(e->names, names)) {
+        if (same && closure_entry_names_match(e, LAMBDA_CLOSURE(lambda))) {
             closure_share_from(lambda, e->tmpl);
-            if (names) ray_release(names);
             return;
         }
     }
+    /* A new literal, or a known one with another capture set. */
+    bool dynamic = false;
+    ray_t* mentioned = ray_closure_mentioned_syms(body, &dynamic);
+    if (!mentioned) return;
+    ray_t* names = ray_closure_names_from(LAMBDA_CLOSURE(lambda), mentioned, dynamic);
     ray_t* tmpl = ray_alloc(LAMBDA_SLOTS * sizeof(ray_t*));
-    if (!tmpl || RAY_IS_ERR(tmpl)) { if (names) ray_release(names); return; }
+    if (!tmpl || RAY_IS_ERR(tmpl)) { if (names) ray_release(names); ray_release(mentioned); return; }
     tmpl->type = RAY_LAMBDA;
     tmpl->attrs = 0;
     tmpl->len = 0;
@@ -2242,6 +2273,7 @@ static void closure_share_template(ray_t* lambda) {
          * or not, when it is called. */
         ray_release(tmpl);
         if (names) ray_release(names);
+        ray_release(mentioned);
         return;
     }
     closure_tmpl_t* e = &g_closure_tmpl[g_closure_tmpl_next++ % CLOSURE_TMPL_SLOTS];
@@ -2249,6 +2281,8 @@ static void closure_share_template(ray_t* lambda) {
     ray_retain(params); e->params = params;
     for (int64_t k = 0; k < body->len; k++) { ray_retain(bn[k]); e->body[k] = bn[k]; }
     e->nbody = body->len;
+    e->mentioned = mentioned;   /* owned */
+    e->dynamic = dynamic;
     e->names = names;   /* owned, may be NULL */
     e->tmpl = tmpl;     /* owned */
     closure_share_from(lambda, tmpl);
@@ -2416,12 +2450,6 @@ static ray_t* vm_exec(ray_t* lambda, ray_t** call_args, int64_t argc);
 static ray_t* vm_exec_rows(ray_t* lambda, ray_t** call_args, int64_t argc,
                            uint64_t row_args, uint8_t* out_rows);
 
-/* Sym ID of "self" for call_lambda's frame.  It belongs to the current sym
- * table: runtime destroy tears the table down and the next runtime can give
- * "self" a different ID, so ray_lang_destroy resets it, as ray_compile_reset
- * does for the compiler's special-form IDs.  A stale ID bound the lambda under
- * a name that was no longer "self", shadowing whatever variable owned it. */
-static int64_t g_call_self_sym = -1;
 
 /* Inside a helper called from a query (a call frame above the query's
  * frames).  Literal symbols keep bytecode's meaning in a helper called by

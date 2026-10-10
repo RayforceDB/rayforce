@@ -219,10 +219,18 @@ ray_t* ray_env_capture_locals_rows(ray_t** flags_out, uint32_t* serial_out) {
 
     int64_t* key_ids = (int64_t*)ray_data(keys);
     /* The captures' row provenance, relative to the innermost query: a
-     * binding below that query's frame is plain data for it. */
-    ray_t* flags = ray_vec_new(RAY_U8, capacity);
-    if (!flags || RAY_IS_ERR(flags)) { ray_release(keys); ray_release(vals); return flags ? flags : ray_error("oom", NULL); }
-    flags->len = 0;
+     * binding below that query's frame is plain data for it.  Most
+     * closures are made outside any query, so the flags are gathered in
+     * a small local buffer and become a vector only when one is set. */
+    uint8_t fbuf[256];
+    ray_t* flags = NULL;
+    uint8_t* fl = fbuf;
+    if (capacity > (int64_t)sizeof fbuf) {
+        flags = ray_vec_new(RAY_U8, capacity);
+        if (!flags || RAY_IS_ERR(flags)) { ray_release(keys); ray_release(vals); return flags ? flags : ray_error("oom", NULL); }
+        fl = (uint8_t*)ray_data(flags);
+    }
+    int64_t nflags = 0;
     bool any_flag = false, outer = false;
     if (g_self_sym < 0) g_self_sym = ray_sym_intern("self", 4);
     /* Top-to-bottom flattening preserves ordinary lexical lookup: the first
@@ -238,7 +246,7 @@ ray_t* ray_env_capture_locals_rows(ray_t** flags_out, uint32_t* serial_out) {
             if (seen) continue;
             key_ids[keys->len++] = f->keys[i];
             uint8_t r = outer ? 0 : f->rows[i];
-            ((uint8_t*)ray_data(flags))[flags->len++] = r;
+            fl[nflags++] = r;
             if (r) any_flag = true;
             if (ray_is_lazy(f->vals[i])) {
                 /* A lazy handle is single-use: capture (and keep bound) the
@@ -247,14 +255,14 @@ ray_t* ray_env_capture_locals_rows(ray_t** flags_out, uint32_t* serial_out) {
                 ray_t* concrete = ray_lazy_materialize(f->vals[i]);   /* consumes the frame's ref */
                 if (!concrete || RAY_IS_ERR(concrete)) {
                     f->vals[i] = NULL;
-                    ray_release(keys); ray_release(vals); ray_release(flags);
+                    ray_release(keys); ray_release(vals); if (flags) ray_release(flags);
                     return concrete ? concrete : ray_error("type", NULL);
                 }
                 f->vals[i] = concrete;
             }
             vals = ray_list_append(vals, f->vals[i]);
             if (!vals || RAY_IS_ERR(vals)) {
-                ray_release(keys); ray_release(flags);
+                ray_release(keys); if (flags) ray_release(flags);
                 return vals ? vals : ray_error("oom", NULL);
             }
         }
@@ -264,14 +272,20 @@ ray_t* ray_env_capture_locals_rows(ray_t** flags_out, uint32_t* serial_out) {
     if (keys->len == 0) {
         ray_release(keys);
         ray_release(vals);
-        ray_release(flags);
+        if (flags) ray_release(flags);
         return NULL;
     }
+    if (any_flag && flags_out && !flags) {
+        flags = ray_vec_new(RAY_U8, nflags);
+        if (!flags || RAY_IS_ERR(flags)) { ray_release(keys); ray_release(vals); return flags ? flags : ray_error("oom", NULL); }
+        memcpy(ray_data(flags), fbuf, (size_t)nflags);
+    }
+    if (flags) flags->len = nflags;
     ray_t* capture = ray_dict_new(keys, vals);
     if (capture && !RAY_IS_ERR(capture) && any_flag && flags_out) {
         *flags_out = flags;
         if (serial_out) *serial_out = ray_env_query_serial();
-    } else ray_release(flags);
+    } else if (flags) ray_release(flags);
     return capture;
 }
 

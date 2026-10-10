@@ -979,6 +979,37 @@ static bool compile_fn_template_at(compiler_t *c, ray_t *ast) {
 }
 
 ray_t *ray_closure_capture_names(ray_t *lambda) { return closure_capture_names(lambda); }
+
+/* Every symbol a body mentions (I64 vector, owned by the caller) and whether
+ * it uses eval or resolve; NULL on allocation failure. */
+ray_t *ray_closure_mentioned_syms(ray_t *body, bool *dynamic) {
+    init_sf_syms();
+    ray_t *mentioned = ray_vec_new(RAY_I64, 16);
+    if (!mentioned || RAY_IS_ERR(mentioned)) return NULL;
+    *dynamic = false;
+    if (!ast_collect_syms(body, &mentioned, dynamic)) { if (mentioned) ray_release(mentioned); return NULL; }
+    return mentioned;
+}
+
+/* The capture names for a closure dict given a body's mentioned symbols
+ * (see ray_closure_mentioned_syms): the dict keys the body mentions, every
+ * key when `dynamic`, never `self`.  A SYM vector or NULL for none. */
+ray_t *ray_closure_names_from(ray_t *closure, ray_t *mentioned, bool dynamic) {
+    if (!closure) return NULL;
+    ray_t *keys = ray_dict_keys(closure);
+    if (!keys || keys->len == 0) return NULL;
+    init_sf_syms();
+    ray_t *names = ray_sym_vec_new(RAY_SYM_W64, keys->len);
+    if (!names || RAY_IS_ERR(names)) return NULL;
+    int64_t *out = (int64_t*)ray_data(names);
+    names->len = 0;
+    for (int64_t i = 0; i < keys->len; i++) {
+        int64_t id = ray_read_sym(ray_data(keys), i, RAY_SYM, keys->attrs);
+        if (id == sf_self) continue;
+        if (dynamic || syms_contain(mentioned, id)) out[names->len++] = id;
+    }
+    return names;
+}
 bool ray_closure_shape_ok(ray_t *closure) { return closure_shape_ok(closure); }
 bool ray_compile_with_captures(ray_t *lambda, ray_t *capnames) { return compile_lambda(lambda, capnames); }
 
