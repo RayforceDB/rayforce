@@ -967,9 +967,11 @@ FK_MERGE(fk_merge64, int64_t, uint64_t)
 FK_MERGE(fk_mergef,  double,  uint64_t)
 
 /* SYM ids: below the bound or 0 (the null), the non-null ones inside the
- * vector's statistics [lo, lo + span], and exactly n_nulls zeros. */
+ * vector's statistics [lo, lo + span], and exactly n_nulls zeros.  Out of
+ * line, as the scans above: inlined into dec_fast the check loop stayed
+ * scalar (a third of q34's URL decode). */
 #define FK_SYM(NAME, UT)                                                                \
-static bool NAME(const UT* restrict o, int n, uint64_t bound, int n_nulls, UT lo, UT span) { \
+static __attribute__((noinline)) bool NAME(const UT* restrict o, int n, uint64_t bound, int n_nulls, UT lo, UT span) { \
     UT bad = 0; uint32_t zeros = 0;                                                     \
     /* x is bad when x != 0 and x >= bound, i.e. x > lim */                             \
     const UT lim = bound == 0 ? 0 : bound - 1 > (uint64_t)(UT)~(UT)0 ? (UT)~(UT)0 : (UT)(bound - 1); \
