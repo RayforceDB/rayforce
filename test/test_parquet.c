@@ -1861,6 +1861,601 @@ static test_result_t test_pq_sym_grouped_collision_determinism(void) {
     PASS();
 #endif
 }
+/* ---- several symbol columns of their own make (pqx_synth) -----------------
+ * x, a required INT32 (the row), then n optional BYTE_ARRAY (UTF8) columns,
+ * each from its own function of the row and with its own pages: PQX_DICT a
+ * dictionary page of the chunk's distinct strings and RLE ids; PQX_FALLBACK
+ * the dictionary for the first half of the chunk's rows only and a PLAIN
+ * page for the rest (a writer's fallback); PQX_SNAPPY every page of the
+ * column snappy-compressed (a greedy LZ over 2-byte offsets). */
+enum { PQX_DICT = 1, PQX_FALLBACK = 2, PQX_SNAPPY = 4, PQX_LATE = 8 };   /* PQX_LATE: the fallback after 7/8 of the rows */
+static int64_t pqx_rows = 1, pqx_groups = 1;   /* the file the functions describe */
+static void pqx_lit(pq_buf* o, const uint8_t* p, size_t n) {
+    while (n) {
+        size_t k = n < 65536 ? n : 65536;
+        if (k <= 60) pb_byte(o, (uint8_t)((k - 1) << 2));
+        else if (k <= 256) { pb_byte(o, 60 << 2); pb_byte(o, (uint8_t)(k - 1)); }
+        else { pb_byte(o, 61 << 2); uint16_t x = (uint16_t)(k - 1); pb_bytes(o, &x, 2); }
+        pb_bytes(o, p, k); p += k; n -= k;
+    }
+}
+static void pqx_snappy(pq_buf* o, const uint8_t* s, size_t n) {
+    pb_var(o, n);
+    int32_t tab[4096];
+    for (int i = 0; i < 4096; i++) tab[i] = -1;
+    size_t lit = 0, i = 0;
+    while (i + 4 <= n) {
+        uint32_t v; memcpy(&v, s + i, 4);
+        uint32_t h = (v * 2654435761u) >> 20;
+        int32_t c = tab[h]; tab[h] = (int32_t)i;
+        if (c >= 0 && i - (size_t)c <= 65535 && !memcmp(s + c, s + i, 4)) {
+            pqx_lit(o, s + lit, i - lit);
+            size_t len = 4;
+            while (len < 64 && i + len < n && s[(size_t)c + len] == s[i + len]) len++;
+            pb_byte(o, (uint8_t)(((len - 1) << 2) | 2));
+            uint16_t off = (uint16_t)(i - (size_t)c); pb_bytes(o, &off, 2);
+            i += len; lit = i;
+        } else i++;
+    }
+    pqx_lit(o, s + lit, n - lit);
+}
+/* A page (kind 0 a v1 data page, 2 the dictionary): header and payload,
+ * compressed when snappy; *raw adds what total_uncompressed_size counts. */
+static void pqx_page(pq_buf* f, int kind, const pq_buf* body, int64_t count, int enc, bool snappy, int64_t* raw) {
+    pq_buf z = {0};
+    const pq_buf* pay = body;
+    if (snappy) { pqx_snappy(&z, body->p, body->n); pay = &z; if (z.bad) f->bad = true; }
+    size_t h0 = f->n;
+    int last = 0;
+    pb_i(f, &last, 1, PB_I32, kind);
+    pb_i(f, &last, 2, PB_I32, (int64_t)body->n);
+    pb_i(f, &last, 3, PB_I32, (int64_t)pay->n);
+    int l = 0;
+    if (kind == 2) {
+        pb_field(f, &last, 7, PB_STRUCT);
+        pb_i(f, &l, 1, PB_I32, count); pb_i(f, &l, 2, PB_I32, 0); pb_byte(f, 0);
+    } else {
+        pb_field(f, &last, 5, PB_STRUCT);
+        pb_i(f, &l, 1, PB_I32, count); pb_i(f, &l, 2, PB_I32, enc);
+        pb_i(f, &l, 3, PB_I32, 3); pb_i(f, &l, 4, PB_I32, 3); pb_byte(f, 0);
+    }
+    pb_byte(f, 0);
+    *raw += (int64_t)(f->n - h0) + (int64_t)body->n;
+    pb_bytes(f, pay->p, pay->n);
+    ray_sys_free(z.p);
+}
+static uint32_t pqx_dict_id(const pq_buf* dict, const pq_buf* doff, const char* s, uint32_t len) {
+    uint32_t nd = (uint32_t)(doff->n / 4), id = 0;
+    for (; id < nd; id++) {
+        uint32_t o; memcpy(&o, doff->p + id * 4, 4);
+        uint32_t l; memcpy(&l, dict->p + o, 4);
+        if (l == len && !memcmp(dict->p + o + 4, s, len)) break;
+    }
+    return id;
+}
+static bool pqx_synth(const char* path, int64_t rows, int64_t groups, int n, const char* const* names,
+                      const pq_synth_fn* fns, const unsigned* flags) {
+    pq_buf f = {0};
+    int64_t nc = n + 1, cells = groups * nc;
+    int64_t* start = (int64_t*)ray_sys_alloc((size_t)cells * sizeof(int64_t));
+    int64_t* dpo = (int64_t*)ray_sys_alloc((size_t)cells * sizeof(int64_t));
+    int64_t* dio = (int64_t*)ray_sys_alloc((size_t)cells * sizeof(int64_t));
+    int64_t* stored = (int64_t*)ray_sys_alloc((size_t)cells * sizeof(int64_t));
+    int64_t* rawt = (int64_t*)ray_sys_alloc((size_t)cells * sizeof(int64_t));
+    if (!start || !dpo || !dio || !stored || !rawt) return false;
+    pqx_rows = rows; pqx_groups = groups;
+    pb_bytes(&f, "PAR1", 4);
+    char buf[256];
+    for (int64_t g = 0; g < groups; g++) {
+        int64_t lo = rows * g / groups, hi = rows * (g + 1) / groups;
+        for (int64_t c = 0; c < nc; c++) {
+            int64_t i = g * nc + c;
+            start[i] = (int64_t)f.n; rawt[i] = 0; dio[i] = -1;
+            if (c == 0) {
+                pq_buf v = {0};
+                for (int64_t r = lo; r < hi; r++) { int32_t x = (int32_t)r; pb_bytes(&v, &x, 4); }
+                dpo[i] = (int64_t)f.n;
+                pqx_page(&f, 0, &v, hi - lo, 0, false, &rawt[i]);
+                if (v.bad) f.bad = true;
+                ray_sys_free(v.p);
+                stored[i] = (int64_t)f.n - start[i];
+                continue;
+            }
+            unsigned fl = flags[c - 1];
+            bool snappy = (fl & PQX_SNAPPY) != 0, dicted = (fl & (PQX_DICT | PQX_FALLBACK)) != 0;
+            pq_synth_fn fn = fns[c - 1];
+            int64_t mid = !dicted ? lo : (fl & PQX_FALLBACK) && hi - lo >= 2 ? lo + (hi - lo) * ((fl & PQX_LATE) ? 7 : 4) / 8 : hi;
+            pq_buf dict = {0}, doff = {0};
+            if (dicted) {
+                for (int64_t r = lo; r < mid; r++) {
+                    uint32_t len = 0;
+                    const char* s = fn(r, buf, &len);
+                    if (!s || pqx_dict_id(&dict, &doff, s, len) < doff.n / 4) continue;
+                    uint32_t o = (uint32_t)dict.n; pb_bytes(&doff, &o, 4); pb_bytes(&dict, &len, 4); pb_bytes(&dict, s, len);
+                }
+                dio[i] = (int64_t)f.n;
+                pqx_page(&f, 2, &dict, (int64_t)(doff.n / 4), 0, snappy, &rawt[i]);
+            }
+            dpo[i] = (int64_t)f.n;
+            for (int part = 0; part < 2; part++) {
+                int64_t a = part ? mid : lo, b = part ? hi : mid;
+                if (b <= a) continue;
+                bool ids = part == 0;
+                pq_buf levels = {0}, values = {0}, body = {0};
+                int64_t n8 = (b - a + 7) / 8;
+                uint8_t bits = 0;
+                pb_var(&levels, (uint64_t)(n8 * 2 + 1));
+                uint32_t nd = (uint32_t)(doff.n / 4), bw = 1;
+                while (bw < 32 && ((uint64_t)1 << bw) < nd) bw++;
+                if (ids) pb_byte(&values, (uint8_t)bw);
+                for (int64_t r = a; r < a + n8 * 8; r++) {
+                    uint32_t len = 0;
+                    const char* s = r < b ? fn(r, buf, &len) : NULL;
+                    if (s) {
+                        bits |= (uint8_t)(1u << ((r - a) & 7));
+                        if (!ids) { pb_bytes(&values, &len, 4); pb_bytes(&values, s, len); }
+                        else {
+                            uint32_t id = pqx_dict_id(&dict, &doff, s, len);
+                            pb_var(&values, 2); pb_bytes(&values, &id, (bw + 7) / 8);
+                        }
+                    }
+                    if (((r - a) & 7) == 7) { pb_byte(&levels, bits); bits = 0; }
+                }
+                uint32_t ln = (uint32_t)levels.n;
+                pb_bytes(&body, &ln, 4); pb_bytes(&body, levels.p, levels.n); pb_bytes(&body, values.p, values.n);
+                if (levels.bad || values.bad || body.bad) f.bad = true;
+                pqx_page(&f, 0, &body, b - a, ids ? 8 : 0, snappy, &rawt[i]);
+                ray_sys_free(levels.p); ray_sys_free(values.p); ray_sys_free(body.p);
+            }
+            if (dict.bad || doff.bad) f.bad = true;
+            ray_sys_free(dict.p); ray_sys_free(doff.p);
+            stored[i] = (int64_t)f.n - start[i];
+        }
+    }
+    int64_t footer = (int64_t)f.n;
+    int last = 0;
+    pb_i(&f, &last, 1, PB_I32, 1);
+    pb_field(&f, &last, 2, PB_LIST); pb_list(&f, (int)nc + 1, PB_STRUCT);
+    { int l = 0; pb_i(&f, &l, 3, PB_I32, 0); pb_field(&f, &l, 4, PB_BIN); pb_bin(&f, "schema", 6); pb_i(&f, &l, 5, PB_I32, nc); pb_byte(&f, 0); }
+    { int l = 0; pb_i(&f, &l, 1, PB_I32, 1); pb_i(&f, &l, 3, PB_I32, 0); pb_field(&f, &l, 4, PB_BIN); pb_bin(&f, "x", 1); pb_byte(&f, 0); }
+    for (int c = 0; c < n; c++) {
+        int l = 0;
+        pb_i(&f, &l, 1, PB_I32, 6); pb_i(&f, &l, 3, PB_I32, 1);
+        pb_field(&f, &l, 4, PB_BIN); pb_bin(&f, names[c], strlen(names[c])); pb_i(&f, &l, 6, PB_I32, 0); pb_byte(&f, 0);
+    }
+    pb_i(&f, &last, 3, PB_I64, rows);
+    pb_field(&f, &last, 4, PB_LIST); pb_list(&f, (int)groups, PB_STRUCT);
+    for (int64_t g = 0; g < groups; g++) {
+        int64_t cnt = rows * (g + 1) / groups - rows * g / groups, total = 0;
+        int l = 0;
+        pb_field(&f, &l, 1, PB_LIST); pb_list(&f, (int)nc, PB_STRUCT);
+        for (int64_t c = 0; c < nc; c++) {
+            int64_t i = g * nc + c;
+            const char* nm = c ? names[c - 1] : "x";
+            int lc = 0, lm = 0;
+            pb_i(&f, &lc, 2, PB_I64, start[i]);
+            pb_field(&f, &lc, 3, PB_STRUCT);
+            pb_i(&f, &lm, 1, PB_I32, c ? 6 : 1);
+            if (dio[i] >= 0) { pb_field(&f, &lm, 2, PB_LIST); pb_list(&f, 3, PB_I32); pb_zz(&f, 0); pb_zz(&f, 3); pb_zz(&f, 8); }
+            else { pb_field(&f, &lm, 2, PB_LIST); pb_list(&f, 2, PB_I32); pb_zz(&f, 0); pb_zz(&f, 3); }
+            pb_field(&f, &lm, 3, PB_LIST); pb_list(&f, 1, PB_BIN); pb_bin(&f, nm, strlen(nm));
+            pb_i(&f, &lm, 4, PB_I32, c && (flags[c - 1] & PQX_SNAPPY) ? 1 : 0);
+            pb_i(&f, &lm, 5, PB_I64, cnt);
+            pb_i(&f, &lm, 6, PB_I64, rawt[i]);
+            pb_i(&f, &lm, 7, PB_I64, stored[i]);
+            pb_i(&f, &lm, 9, PB_I64, dpo[i]);
+            if (dio[i] >= 0) pb_i(&f, &lm, 11, PB_I64, dio[i]);
+            pb_byte(&f, 0);
+            pb_byte(&f, 0);
+            total += stored[i];
+        }
+        pb_i(&f, &l, 2, PB_I64, total);
+        pb_i(&f, &l, 3, PB_I64, cnt);
+        pb_byte(&f, 0);
+    }
+    pb_field(&f, &last, 6, PB_BIN); pb_bin(&f, "rayforce test", 13);
+    pb_byte(&f, 0);
+    uint32_t flen = (uint32_t)(f.n - (size_t)footer);
+    pb_bytes(&f, &flen, 4); pb_bytes(&f, "PAR1", 4);
+    bool ok = !f.bad;
+    FILE* out = ok ? fopen(path, "wb") : NULL;
+    ok = out && fwrite(f.p, 1, f.n, out) == f.n;
+    if (out && fclose(out)) ok = false;
+    ray_sys_free(f.p);
+    ray_sys_free(start); ray_sys_free(dpo); ray_sys_free(dio); ray_sys_free(stored); ray_sys_free(rawt);
+    return ok;
+}
+/* An import of a pqx_synth file: its columns in the file's order, x the
+ * row, every symbol row the function's string (a null and "" both the empty
+ * symbol), the first difference told; nulls[c] gets column c's null flag. */
+static bool pqx_check(const char* dir, int64_t rows, int n, const char* const* names, const pq_synth_fn* fns,
+                      const char* what, int* nulls) {
+    char sym[200]; snprintf(sym, sizeof(sym), "%s/.sym", dir);
+    ray_t* t = ray_read_splayed(dir, sym);
+    if (!t || RAY_IS_ERR(t)) { fprintf(stderr, "  [%s] read failed\n", what); if (t) ray_error_free(t); return false; }
+    bool ok = ray_table_nrows(t) == rows && ray_table_ncols(t) == n + 1;
+    if (!ok) fprintf(stderr, "  [%s] shape %lldx%lld\n", what, (long long)ray_table_nrows(t), (long long)ray_table_ncols(t));
+    for (int c = 0; ok && c <= n; c++) {
+        const char* nm = c ? names[c - 1] : "x";
+        if (ray_table_col_name(t, c) != ray_sym_intern(nm, strlen(nm))) { fprintf(stderr, "  [%s] column %d is not %s\n", what, c, nm); ok = false; }
+    }
+    for (int64_t r = 0; ok && r < rows; r++)
+        if (((int32_t*)ray_data(ray_table_get_col_idx(t, 0)))[r] != r) { fprintf(stderr, "  [%s] x row %lld\n", what, (long long)r); ok = false; }
+    char buf[256];
+    for (int c = 1; ok && c <= n; c++) {
+        ray_t* s = ray_table_get_col_idx(t, c);
+        if (nulls) nulls[c - 1] = (s->attrs & RAY_ATTR_HAS_NULLS) != 0;
+        for (int64_t r = 0; ok && r < rows; r++) {
+            uint32_t len = 0;
+            const char* want = fns[c - 1](r, buf, &len);
+            if (!want) len = 0;
+            ray_t* text = ray_sym_vec_cell(s, r);
+            ok = text && ray_str_len(text) == len && (!len || !memcmp(ray_str_ptr(text), want, len));
+            if (!ok) fprintf(stderr, "  [%s] col %s row %lld: want %.*s, got %.*s\n", what, names[c - 1], (long long)r,
+                             (int)len, want ? want : "", text ? (int)ray_str_len(text) : 0, text ? ray_str_ptr(text) : "");
+        }
+    }
+    ray_release(t);
+    return ok;
+}
+/* The columns of the mixed-column test: a low-cardinality one (dictionary,
+ * snappy, long strings of one prefix), a high-cardinality one (PLAIN) that
+ * repeats the first's every fifth row, one whose writer fell back to PLAIN
+ * mid-chunk and that repeats the second's strings (unique ones too), a hot
+ * key whose dictionary grows row group by row group and that meets the
+ * first's strings, and long unique strings snappy compresses well; nulls
+ * and "" in several. */
+static const char* pqx_lowcard(int64_t r, char* buf, uint32_t* len) {
+    if (r % 31 == 0) return NULL;
+    if (r % 37 == 0) { *len = 0; return buf; }
+    *len = (uint32_t)snprintf(buf, 256, "k%02lld-one-prefix-for-the-compressor", (long long)((r * 7) % 40));
+    return buf;
+}
+static const char* pqx_highcard(int64_t r, char* buf, uint32_t* len) {
+    if (r % 5 == 0) return pqx_lowcard(r + 1, buf, len);
+    if (r % 41 == 0) { *len = 0; return buf; }
+    if (r % 43 == 0) return NULL;
+    *len = (uint32_t)snprintf(buf, 256, "u%06lld-high", (long long)r);
+    return buf;
+}
+static const char* pqx_fallback(int64_t r, char* buf, uint32_t* len) {
+    if (r % 4 == 0) return pqx_highcard(r + 7, buf, len);
+    if (r % 53 == 0) return NULL;
+    *len = (uint32_t)snprintf(buf, 256, "m%04lld", (long long)((r * 13) % 1500));
+    return buf;
+}
+static const char* pqx_hot(int64_t r, char* buf, uint32_t* len) {
+    int64_t g = r * pqx_groups / pqx_rows;
+    if (r % 9 == 0) return pqx_lowcard(r, buf, len);
+    if (r % 10 < 7) { *len = (uint32_t)snprintf(buf, 256, "HOT"); return buf; }
+    *len = (uint32_t)snprintf(buf, 256, "d%lld", (long long)(r % (5 + 60 * g)));
+    return buf;
+}
+static const char* pqx_unique(int64_t r, char* buf, uint32_t* len) {
+    int n = snprintf(buf, 256, "e%08lld", (long long)r);
+    memset(buf + n, 'z', 80);
+    *len = (uint32_t)n + 80;
+    return buf;
+}
+/* PQX_VOCAB=1 (the mixed-column test runs only this): the footer's
+ * vocabulary bound (the trace's vocab_mb) against the symbol file the
+ * direct import writes, for a snappy dictionary of long strings that share
+ * a prefix and for a writer's PLAIN fallback over the chunk's last rows. */
+static const char* pqx_prefixed(int64_t r, char* buf, uint32_t* len) {
+    memset(buf, 'P', 190);
+    *len = 190 + (uint32_t)snprintf(buf + 190, 60, "%09lld", (long long)(r % 1000));
+    return buf;
+}
+static const char* pqx_late(int64_t r, char* buf, uint32_t* len) {
+    int64_t at = r % 80000;   /* the row in its row group */
+    if (at < 70000) { *len = (uint32_t)snprintf(buf, 256, "q%lld", (long long)(r % 10)); return buf; }
+    buf[0] = (char)(33 + (r / 8836) % 94); buf[1] = (char)(33 + (r / 94) % 94); buf[2] = (char)(33 + r % 94);
+    *len = 3;
+    return buf;
+}
+static void pqx_vocab_probe(void) {
+    const char* nm[1] = {"p"};
+    const char* fnames[2] = {"x","p"};
+    char src[160], dir[160], sym[200];
+    snprintf(src, sizeof(src), "/tmp/rayforce-pqv-%d.parquet", (int)getpid());
+    snprintf(dir, sizeof(dir), "/tmp/rayforce-pqv-%d", (int)getpid());
+    snprintf(sym, sizeof(sym), "%s/.sym", dir);
+    int64_t tids[2] = {ray_sym_intern("I32", 3), ray_sym_intern("SYM", 3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 2);
+    size_t cap = (size_t)1 << 16;
+    char* trace = (char*)ray_sys_alloc(cap);
+    for (int k = 0; k < 2 && trace; k++) {
+        pq_synth_fn fn[1] = {k ? pqx_late : pqx_prefixed};
+        unsigned fl[1] = {k ? PQX_FALLBACK | PQX_LATE : PQX_DICT | PQX_SNAPPY};
+        if (!pqx_synth(src, k ? 160000 : 200000, 2, 1, nm, fn, fl)) { fprintf(stderr, "  vocab probe: synth failed\n"); break; }
+        pq_set_env("RAY_PQ_SYM_RAM", "1073741824");
+        pq_set_symmode("direct");
+        ray_t* res = pq_traced_import(src, dir, types, trace, cap);
+        pq_sym_env_clear();
+        if (!res || RAY_IS_ERR(res)) { fprintf(stderr, "  vocab probe: import failed\n"); if (res) ray_error_free(res); break; }
+        ray_release(res);
+        FILE* f = fopen(sym, "rb");
+        long size = -1;
+        if (f) { fseek(f, 0, SEEK_END); size = ftell(f); fclose(f); }
+        const char* line = strstr(trace, "parquet symcol:");
+        const char* e = line ? strchr(line, '\n') : NULL;
+        fprintf(stderr, "  vocab probe %s: %.*s | .sym %ld bytes, %lld symbols\n", k ? "late PLAIN fallback" : "snappy dictionary",
+                line ? (int)(e ? e - line : (long)strlen(line)) : 0, line ? line : "", size, (long long)pq_sym_count(dir));
+        pq_remove_native(dir, fnames, 2);
+    }
+    ray_sys_free(trace);
+    ray_release(types); unlink(src);
+}
+/* Which way each symbol column went, from the trace's symcol lines: 'D' or
+ * 'G' in the file's column order, '?' when the trace does not say. */
+static void pqx_modes(const char* trace, int n, const char* const* names, char* out) {
+    for (int c = 0; c < n; c++) {
+        char line[64]; snprintf(line, sizeof(line), "parquet symcol: col=%s ", names[c]);
+        out[c] = pq_trace_line_has(trace, line, " mode=direct") ? 'D' : pq_trace_line_has(trace, line, " mode=grouped") ? 'G' : '?';
+    }
+    out[n] = 0;
+}
+/* Direct and grouped columns side by side: five symbol columns (pqx_*)
+ * whose strings meet across columns, imported with the memory the decision
+ * assumes swept (RAY_PQ_SYM_RAM, debug builds) so that different sets go
+ * direct, then with every order of new positions, hash groups, windows, a
+ * small dedupe arena, none of the hash and column by column, on one worker
+ * and four.  Every row as the function has it, the columns in the file's
+ * order (the direct ones are imported first), the symbol file the direct
+ * import's size (no string twice, none lost), the null flags the direct
+ * import's, and every grouped record's writeback started by its window.
+ * Forced grouped, the files do not depend on the workers.  Then each
+ * injected failure of a mixed import, and repeated imports keeping no
+ * memory.  The default run is a subset of the matrix; PQX_FULL=1 runs all
+ * of it (PQX_ROWS, PQX_RAM, PQX_TRACE change it; PQX_DET, PQX_VOCAB and
+ * PQX_EMPTY run probes of their own instead). */
+static test_result_t test_pq_symgrp_mixed_columns(void) {
+#if !defined(DEBUG)
+    SKIP("the memory the decision assumes is a debug-build knob");
+#else
+    pq_sym_env_clear();
+    if (getenv("PQX_VOCAB")) { pqx_vocab_probe(); PASS(); }
+    if (getenv("PQX_EMPTY")) {
+        /* a file of no row groups, forced grouped, a step failing */
+        const char* nm[1] = {"p"};
+        const char* fn2[2] = {"x","p"};
+        pq_synth_fn fn[1] = {pqx_unique};
+        unsigned fl[1] = {0};
+        char src[160], dir[160];
+        snprintf(src, sizeof(src), "/tmp/rayforce-pqe-%d.parquet", (int)getpid());
+        snprintf(dir, sizeof(dir), "/tmp/rayforce-pqe-%d", (int)getpid());
+        TEST_ASSERT_TRUE(pqx_synth(src, 0, 0, 1, nm, fn, fl));
+        int64_t tids[2] = {ray_sym_intern("I32", 3), ray_sym_intern("SYM", 3)};
+        ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 2);
+        const char* steps[] = {NULL, "p2"};
+        for (int i = 0; i < 2; i++) {
+            ray_mem_stats_t s0, s1; ray_mem_stats(&s0);
+            pq_set_symmode("grouped");
+            pq_set_env("RAY_PQ_SYM_INJECT", steps[i]);
+            ray_t* res = ray_parquet_splayed_typed(src, dir, types);
+            pq_sym_env_clear();
+            bool failed = !res || RAY_IS_ERR(res);
+            fprintf(stderr, "  empty file, inject %s: %s\n", steps[i] ? steps[i] : "none",
+                    failed ? (res ? ray_err_code(res) : "null") : "imported");
+            if (res) { if (RAY_IS_ERR(res)) ray_error_free(res); else ray_release(res); }
+            char partial[240]; snprintf(partial, sizeof(partial), "%s.parquet-partial", dir);
+            pq_remove_native(partial, fn2, 2); pq_remove_native(dir, fn2, 2);
+            ray_mem_stats(&s1);
+            fprintf(stderr, "  empty file, inject %s: heap %+lld B\n", steps[i] ? steps[i] : "none",
+                    (long long)s1.bytes_allocated - (long long)s0.bytes_allocated);
+        }
+        ray_release(types); unlink(src);
+        PASS();
+    }
+    enum { N = 5 };
+    const char* names[N] = {"b","a","e","d","c"};
+    const pq_synth_fn fns[N] = {pqx_highcard, pqx_lowcard, pqx_unique, pqx_hot, pqx_fallback};
+    const unsigned flags[N] = {0, PQX_DICT | PQX_SNAPPY, PQX_SNAPPY, PQX_DICT | PQX_SNAPPY, PQX_FALLBACK};
+    const char* fnames[N + 1] = {"x","b","a","e","d","c"};
+    const int64_t rows = getenv("PQX_ROWS") ? atoll(getenv("PQX_ROWS")) : 3000, groups = 6;
+    char src[160], dir[160], ref[160], what[200], a[240], b[240];
+    snprintf(src, sizeof(src), "/tmp/rayforce-pqx-%d.parquet", (int)getpid());
+    snprintf(dir, sizeof(dir), "/tmp/rayforce-pqx-%d", (int)getpid());
+    snprintf(ref, sizeof(ref), "/tmp/rayforce-pqx-%d-ref", (int)getpid());
+    TEST_ASSERT_TRUE(pqx_synth(src, rows, groups, N, names, fns, flags));
+    int64_t tids[N + 1];
+    tids[0] = ray_sym_intern("I32", 3);
+    for (int c = 1; c <= N; c++) tids[c] = ray_sym_intern("SYM", 3);
+    ray_t* types = ray_vec_from_raw(RAY_SYM, tids, N + 1);
+    size_t cap = (size_t)1 << 16;
+    char* trace = (char*)ray_sys_alloc(cap);
+    TEST_ASSERT_TRUE(trace != NULL);
+    int bad = 0;
+    /* the direct import: the vocabulary's size and the null flags */
+    TEST_ASSERT_EQ_I(pq_pool(1), RAY_OK);
+    pq_set_symmode("direct");
+    ray_t* res = ray_parquet_splayed_typed(src, dir, types);
+    pq_sym_env_clear();
+    TEST_ASSERT_FALSE(!res || RAY_IS_ERR(res)); ray_release(res);
+    int dn[N] = {0}, gn[N] = {0};
+    TEST_ASSERT_TRUE(pqx_check(dir, rows, N, names, fns, "direct", dn));
+    int64_t words = pq_sym_count(dir);
+    pq_remove_native(dir, fnames, N + 1);
+    /* PQX_DET=1: whether the direct import's files depend on the workers
+     * (one worker against four, three times), printed only */
+    for (int k = 0; getenv("PQX_DET") && k < 3; k++) {
+        for (int cores = 1; cores <= 4; cores += 3) {
+            TEST_ASSERT_EQ_I(pq_pool(cores), RAY_OK);
+            pq_set_symmode("direct");
+            res = ray_parquet_splayed_typed(src, cores == 1 ? ref : dir, types);
+            pq_sym_env_clear();
+            TEST_ASSERT_FALSE(!res || RAY_IS_ERR(res)); ray_release(res);
+        }
+        bool same = true;
+        snprintf(a, sizeof(a), "%s/.sym", ref); snprintf(b, sizeof(b), "%s/.sym", dir);
+        if (!pq_same_file(a, b)) same = false;
+        for (int c = 1; c <= N; c++) {
+            snprintf(a, sizeof(a), "%s/%s", ref, fnames[c]); snprintf(b, sizeof(b), "%s/%s", dir, fnames[c]);
+            if (!pq_same_file(a, b)) same = false;
+        }
+        fprintf(stderr, "  mixed_columns: direct import, 1 vs 4 workers, try %d: files %s\n", k, same ? "the same" : "differ");
+        pq_remove_native(dir, fnames, N + 1); pq_remove_native(ref, fnames, N + 1);
+    }
+    /* the decision swept: a set of columns direct, the rest grouped (a pool
+     * a worker count) */
+    char seen[16][N + 1], mixram[16][32];
+    int nmix = 0;
+    int nseen = 0, mixed = 0;
+    /* the default run sweeps on one worker; PQX_FULL=1 on one and four */
+    bool full = getenv("PQX_FULL") != NULL;
+    for (int cores = 1; cores <= (full ? 4 : 1); cores += 3) {
+        TEST_ASSERT_EQ_I(pq_pool(cores), RAY_OK);
+        for (int k = 0; k < 14; k++) {
+            char ram[32]; snprintf(ram, sizeof(ram), "%lld", (long long)((int64_t)16384 << k));
+            pq_set_env("RAY_PQ_SYM_RAM", ram);
+            res = pq_traced_import(src, dir, types, trace, cap);
+            pq_sym_env_clear();
+            char modes[N + 1]; pqx_modes(trace, N, names, modes);
+            if (getenv("PQX_TRACE") && k == 0 && cores == 1) fprintf(stderr, "%s", trace);
+            snprintf(what, sizeof(what), "ram=%s cores=%d modes=%s", ram, cores, modes);
+            if (!res || RAY_IS_ERR(res)) {
+                fprintf(stderr, "  [%s] import failed: %s\n", what, res ? ray_err_code(res) : "null");
+                if (res) ray_error_free(res);
+                char partial[240]; snprintf(partial, sizeof(partial), "%s.parquet-partial", dir);
+                pq_remove_native(partial, fnames, N + 1);
+                bad++; continue;
+            }
+            ray_release(res);
+            if (!pqx_check(dir, rows, N, names, fns, what, gn)) bad++;
+            if (pq_sym_count(dir) != words) { fprintf(stderr, "  [%s] symbols %lld, direct %lld\n", what, (long long)pq_sym_count(dir), (long long)words); bad++; }
+            if (memcmp(gn, dn, sizeof(dn))) { fprintf(stderr, "  [%s] null flags differ from the direct import's\n", what); bad++; }
+            int nd = 0, ng = 0;
+            for (int c = 0; c < N; c++) { nd += modes[c] == 'D'; ng += modes[c] == 'G'; }
+            if (nd && ng) mixed++;
+            bool known = false;
+            for (int s = 0; s < nseen; s++) if (!strcmp(seen[s], modes)) known = true;
+            if (!known && nseen < 16) {
+                memcpy(seen[nseen++], modes, N + 1);
+                fprintf(stderr, "  mixed_columns: ram=%s modes %s (b a e d c)\n", ram, modes);
+                if (nd && ng && nmix < 16) snprintf(mixram[nmix++], sizeof(mixram[0]), "%s", ram);
+            }
+            pq_remove_native(dir, fnames, N + 1);
+        }
+    }
+    if (mixed < (full ? 4 : 2) || nseen < 3 || !nmix) { fprintf(stderr, "  mixed_columns: %d mixed imports, %d decisions\n", mixed, nseen); bad++; }
+    if (!nmix) snprintf(mixram[nmix++], sizeof(mixram[0]), "%s", "1048576");
+    /* a mixed decision with every knob of the grouped import, and forced
+     * grouped: one worker's files, then four workers' the same bytes */
+    const char* orders[] = {"rows","shards","freq","rowsflat"};
+    for (int cores = 1; cores <= 4; cores += 3) {
+        TEST_ASSERT_EQ_I(pq_pool(cores), RAY_OK);
+        for (int run = 0; run < 48; run++) {
+            int o = run % 4, knob = (run / 4) % 4;
+            bool forced = run >= 32;
+            /* the default run: not the small arena with six bits of the hash,
+             * none of the hash in "rows" only, a window per task with four
+             * groups forced grouped only, and on four workers the forced
+             * runs only (the ones compared); PQX_FULL=1 all of it */
+            if (!full && (knob == 3 || (knob == 2 && o) || (!forced && (knob == 1 || cores > 1)))) continue;
+            /* the first mixed decision of the sweep, then the last */
+            const char* ram_mixed = getenv("PQX_RAM") ? getenv("PQX_RAM") : mixram[run < 16 ? 0 : nmix - 1];
+            const char* window = knob & 1 ? "1" : knob == 2 ? "4096" : NULL;
+            const char* bits = knob == 2 ? "0" : knob == 3 ? "6" : NULL;
+            const char* groupsv = knob & 1 ? "4" : NULL;
+            const char* arena = knob == 3 ? "200" : NULL;
+            /* one worker's files kept, a run each, for four workers' */
+            snprintf(ref, sizeof(ref), "/tmp/rayforce-pqx-%d-ref-%d", (int)getpid(), run);
+            const char* out = cores == 1 ? ref : dir;
+            pq_set_env("RAY_PQ_SYM_RAM", ram_mixed);
+            if (forced) pq_set_symmode("grouped");
+            if (o == 1) pq_set_layout("1");   /* column by column, the direct ones too */
+            pq_set_env("RAY_PQ_SYM_ORDER", orders[o]);
+            pq_set_env("RAY_PQ_SYM_WINDOW", window);
+            pq_set_env("RAY_PQ_SYM_HASH_BITS", bits);
+            pq_set_env("RAY_PQ_SYM_GROUPS", groupsv);
+            pq_set_env("RAY_PQ_SYM_ARENA", arena);
+            res = pq_traced_import(src, out, types, trace, cap);
+            pq_sym_env_clear();
+            char modes[N + 1]; pqx_modes(trace, N, names, modes);
+            snprintf(what, sizeof(what), "%s %s window=%s bits=%s groups=%s arena=%s cores=%d modes=%s", forced ? "forced" : "auto",
+                     orders[o], window ? window : "-", bits ? bits : "-", groupsv ? groupsv : "-", arena ? arena : "-", cores, modes);
+            if (!res || RAY_IS_ERR(res)) {
+                fprintf(stderr, "  [%s] import failed: %s\n", what, res ? ray_err_code(res) : "null");
+                if (res) ray_error_free(res);
+                char partial[240]; snprintf(partial, sizeof(partial), "%s.parquet-partial", out);
+                pq_remove_native(partial, fnames, N + 1);
+                bad++; continue;
+            }
+            ray_release(res);
+            if (!forced && (!strchr(modes, 'D') || !strchr(modes, 'G'))) { fprintf(stderr, "  [%s] not a mixed decision\n", what); bad++; }
+            /* every record's writeback started by its window: exactly the
+             * records' bytes where a window's records lie side by side */
+            int gpasses = 0;
+            double recb = pq_trace_sum(trace, "rec_bytes", &gpasses), wbb = pq_trace_sum(trace, "wb_bytes", NULL);
+            if (gpasses < 2 || !(o == 0 || o == 3 ? wbb == recb : wbb >= recb)) {
+                fprintf(stderr, "  [%s] %d grouped passes, rec_bytes %.0f, wb_bytes %.0f\n", what, gpasses, recb, wbb);
+                bad++;
+            }
+            if (!pqx_check(out, rows, N, names, fns, what, gn)) bad++;
+            if (pq_sym_count(out) != words) { fprintf(stderr, "  [%s] symbols %lld, direct %lld\n", what, (long long)pq_sym_count(out), (long long)words); bad++; }
+            if (memcmp(gn, dn, sizeof(dn))) { fprintf(stderr, "  [%s] null flags differ from the direct import's\n", what); bad++; }
+            if (cores > 1) {
+                bool same = true;
+                snprintf(a, sizeof(a), "%s/.sym", ref); snprintf(b, sizeof(b), "%s/.sym", dir);
+                if (!pq_same_file(a, b)) same = false;
+                for (int c = 1; c <= N; c++) {
+                    snprintf(a, sizeof(a), "%s/%s", ref, fnames[c]); snprintf(b, sizeof(b), "%s/%s", dir, fnames[c]);
+                    if (!pq_same_file(a, b)) same = false;
+                }
+                /* a direct pass's positions follow the workers, as the
+                 * direct import's do (PQX_DET=1 shows it): only forced
+                 * grouped is compared */
+                if (!same && forced) { fprintf(stderr, "  [%s] files differ from one worker's\n", what); bad++; }
+                pq_remove_native(dir, fnames, N + 1);
+                pq_remove_native(ref, fnames, N + 1);
+            }
+        }
+    }
+    /* a mixed decision failing in each step of its grouped passes (a direct
+     * pass before them): an error, nothing published, and on one worker no
+     * memory kept, run after run (the heap's and the system allocator's
+     * bytes after the second run and the last: the third, the fifth with
+     * PQX_FULL=1); then the import itself as many times */
+    const char* steps[] = {"r1","p2","load","reload","r2","write","settle","cancel",NULL};
+    char partial[240]; snprintf(partial, sizeof(partial), "%s.parquet-partial", dir);
+    TEST_ASSERT_EQ_I(pq_pool(1), RAY_OK);
+    for (int i = 0; i < 9; i++) {
+        size_t base = 0, sbase = 0;
+        int runs = full ? 5 : 3;   /* the memory compared after the second and the last */
+        for (int k = 0; k < runs; k++) {
+            pq_set_env("RAY_PQ_SYM_RAM", mixram[nmix - 1]);
+            pq_set_env("RAY_PQ_SYM_WINDOW", "1");
+            pq_set_env("RAY_PQ_SYM_INJECT", steps[i]);
+            res = ray_parquet_splayed_typed(src, dir, types);
+            pq_sym_env_clear();
+            bool failed = !res || RAY_IS_ERR(res);
+            bool cancel = failed && res && !strcmp(ray_err_code(res), "cancel");
+            if (res) { if (RAY_IS_ERR(res)) ray_error_free(res); else ray_release(res); }
+            ray_clear_interrupt();
+            bool published = access(dir, F_OK) == 0;
+            if (failed != (steps[i] != NULL) || (steps[i] && published) || cancel != (i == 7)) {
+                fprintf(stderr, "  mixed_columns: inject %s: failed=%d cancel=%d published=%d\n", steps[i] ? steps[i] : "none",
+                        failed, cancel, published);
+                bad++;
+            }
+            pq_remove_native(partial, fnames, N + 1);
+            pq_remove_native(dir, fnames, N + 1);
+            ray_mem_stats_t st; ray_mem_stats(&st);
+            if (k == 1) { base = st.bytes_allocated; sbase = st.sys_current; }
+            if (k == runs - 1 && (st.bytes_allocated > base + 512 || st.sys_current > sbase + (8u << 10))) {
+                fprintf(stderr, "  mixed_columns: inject %s: heap %+lld B sys %+lld B\n", steps[i] ? steps[i] : "none",
+                        (long long)st.bytes_allocated - (long long)base, (long long)st.sys_current - (long long)sbase);
+                bad++;
+            }
+        }
+    }
+    ray_pool_destroy();
+    ray_sys_free(trace);
+    ray_release(types); unlink(src);
+    TEST_ASSERT_EQ_I(bad, 0);
+    PASS();
+#endif
+}
 const test_entry_t parquet_entries[] = {
     {"parquet/small_stack",test_pq_small_stack,NULL,NULL},
     {"parquet/parted_symbols",test_pq_parted_symbols,pq_setup,pq_teardown},
@@ -1886,6 +2481,7 @@ const test_entry_t parquet_entries[] = {
     {"parquet/symgrp_edges",test_pq_sym_grouped_edges,pq_setup,pq_teardown},
     {"parquet/symgrp_fail_leaks",test_pq_sym_grouped_fail_leaks,pq_setup,pq_teardown},
     {"parquet/symgrp_rowgroups",test_pq_sym_grouped_rowgroups,pq_setup,pq_teardown},
+    {"parquet/symgrp_mixed_columns",test_pq_symgrp_mixed_columns,pq_setup,pq_teardown},
 #if defined(__linux__)
     {"parquet/chunk_flush_error",test_pq_chunk_flush_error,pq_setup,pq_teardown},
 #endif
