@@ -113,7 +113,12 @@ typedef struct {
     uint32_t ts_tasks;              /* last table-stack run: phase-1 tasks */
     uint32_t ts_scatter_tasks;      /* ...of which switched to raw scatter */
     uint64_t ts_tables;             /* ...tables created across all tasks */
+    uint8_t radix_phase1;           /* last radix run's phase 1: AGG_RADIX_P1_* */
 } agg_route_stats_t;
+/* Phase 1 of a radix run: plain or staged two passes, the fused pass
+ * staging whole records (sel mode), or the fused pass staging only the
+ * sources it decodes (plain columns read in place by its scatter). */
+enum { AGG_RADIX_P1_TWO_PASS = 1, AGG_RADIX_P1_FUSED_RECORDS, AGG_RADIX_P1_FUSED_COMPACT };
 void agg_route_reset(void);
 void agg_route_note_key_domain(void);
 agg_route_stats_t agg_route_stats(void);

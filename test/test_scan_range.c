@@ -5188,6 +5188,69 @@ static test_result_t test_v2_radix_record_order(void) {
     PASS();
 }
 
+/* Task 17i: the fused pass stages only the sources it decodes; a plain
+ * column and the positions are read in place by its scatter.  RC: 300000
+ * rows, k a wide encoded I64, s an encoded SYM, g an I16, m, v and f encoded; the
+ * computed key (+ m 1) and inputs (* v 3), (* f 2.0) are plain, and so
+ * are g and s once their materializations are published (`at`), as the
+ * keys of every width the scatter widens in place.  Each shape answers
+ * byte for byte (.csv.write) as generation 0 at 2 and 4 workers, splayed
+ * and on three partitions, on the radix route with the compact fused
+ * phase 1 (whole records under a where: sel mode); on partitions the
+ * route is checked for the shape without a plain column or a where (a
+ * computed column takes the per-partition route there, a where the two
+ * passes). */
+static test_result_t test_v2_radix_compact_staging(void) {
+    sr_eval_ok("(set jc (til 300000))");
+    sr_eval_ok("(set RC (table [s k m g v f] (list (as 'SYMBOL (map (fn [j] (format \"w%\" (% j 70))) jc)) "
+               "(* (% (* jc 7919) 600011) 1000003) (% jc 5) (as 'I16 (- (% jc 9) 4)) jc (/ (as 'F64 jc) 9.0))))");
+    for (int gen = 0; gen <= 2; gen += 2) {
+        sr_evalf_ok("(.db.splayed.set \"" SR_TMP "/rc%d/\" RC {compress: %s})", gen, gen ? "true" : "false");
+        for (int p = 0; p < 3; p++)
+            sr_evalf_ok("(.db.splayed.set \"" SR_TMP "/rcp%d/2024.01.0%d/t/\" (take (drop RC %d) 100000) {compress: %s})",
+                        gen, p + 1, p * 100000, gen ? "true" : "false");
+    }
+    static const struct { const char* q; uint8_t p1; bool parted_route; bool pub; } qs[] = {
+        { "(select {c: (count v) a: (sum f) x: (sum (* v 3)) from: T by: {k: k j: (+ m 1)}})", AGG_RADIX_P1_FUSED_COMPACT, false, false },
+        { "(select {x: (sum (* v 3)) y: (sum (* f 2.0)) mx: (max v) from: T by: {s: s k: k}})", AGG_RADIX_P1_FUSED_COMPACT, false, false },
+        { "(select {c: (count v) a: (sum f) mx: (max v) from: T by: {s: s k: k}})", AGG_RADIX_P1_FUSED_COMPACT, true, false },
+        { "(select {c: (count v) a: (sum f) y: (sum g) from: T by: {g: g k: k s: s}})", AGG_RADIX_P1_FUSED_COMPACT, false, true },
+        { "(select {c: (count v) a: (sum f) from: T where: (> v 1000) by: {s: s k: k}})", AGG_RADIX_P1_FUSED_RECORDS, false, false },
+    };
+    static const char* const t0[] = { "(.db.splayed.get \"" SR_TMP "/rc0/\")", "(.db.parted.get \"" SR_TMP "/rcp0\" 't)" };
+    static const char* const t2[] = { "(.db.splayed.get \"" SR_TMP "/rc2/\")", "(.db.parted.get \"" SR_TMP "/rcp2\" 't)" };
+    static const int workers[] = { 2, 4 };
+    char path[512];
+    snprintf(path, sizeof path, "%s/rc.csv", sr_root());
+    for (int w = 0; w < 2; w++) {
+        ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(workers[w]), RAY_OK);
+        for (size_t i = 0; i < sizeof qs / sizeof qs[0]; i++)
+            for (int l = 0; l < (qs[i].pub ? 1 : 2); l++) {
+                char* b[2] = { NULL, NULL };
+                size_t n[2] = { 0, 0 };
+                agg_route_stats_t st = { 0 };
+                for (int gen = 0; gen < 2; gen++) {
+                    sr_evalf_ok("(set T %s)", gen ? t2[l] : t0[l]);
+                    if (qs[i].pub) { sr_eval_ok("(set z (+ (at T 'g) 0))"); sr_eval_ok("(set z (first (at T 's)))"); }
+                    agg_route_reset();
+                    bool ok = sr_csv_of(qs[i].q, path, &b[gen], &n[gen]);
+                    st = agg_route_stats();
+                    if (!ok) { free(b[0]); free(b[1]); FAIL("csv"); }
+                }
+                bool same = n[0] == n[1] && n[0] > 0 && memcmp(b[0], b[1], n[0]) == 0;
+                free(b[0]); free(b[1]);
+                TEST_ASSERT_FMT(same, "%s (%s, %d workers): generation 0 and 2 differ (%zu / %zu bytes)", qs[i].q,
+                                l ? "parted" : "splayed", workers[w], n[0], n[1]);
+                if (l && !qs[i].parted_route) continue;
+                TEST_ASSERT_FMT(st.routes[AGG_ROUTE_V2_RADIX] == 1 && st.radix_phase1 == qs[i].p1,
+                                "%s (%s, %d workers): radix %llu, phase 1 %u, want %u", qs[i].q,
+                                l ? "parted" : "splayed", workers[w],
+                                (unsigned long long)st.routes[AGG_ROUTE_V2_RADIX], st.radix_phase1, qs[i].p1);
+            }
+    }
+    PASS();
+}
+
 /* The parted directory consumer (design (b)): a parted key's dense bounds
  * come from its segments' statistics, so its passes read under the guard,
  * which checks every segment against its own chunks.  Three partitions of
@@ -6508,6 +6571,7 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/v2_radix_decode_once", test_v2_radix_decode_once, sr_rt_setup, srr_pool_teardown },
     { "scanrange/v2_radix_answers",   test_v2_radix_answers,   sr_rt_setup, srr_pool_teardown },
     { "scanrange/v2_radix_record_order", test_v2_radix_record_order, sr_rt_setup, srr_pool_teardown },
+    { "scanrange/v2_radix_compact_staging", test_v2_radix_compact_staging, sr_rt_setup, srr_pool_teardown },
     { "scanrange/v2_forged_parted_segment", test_v2_forged_parted_segment, sr_rt_setup, srr_teardown },
     { "scanrange/idx_info_table",     test_idx_info_table,     srr_setup, srr_teardown },
     { "scanrange/idx_info_report",    test_idx_info_report,    srr_setup, srr_teardown },

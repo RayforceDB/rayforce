@@ -2465,10 +2465,11 @@ static char* ae_csv(const char* q, size_t* n) {
 /* q17's shape on the v2 radix route: two wide keys, a count and an F64
  * sum, 1.2M rows (2048 partitions: a run wants 16384-row chunks, 2
  * blocks).  The last-level cache is set for 2 workers so a worker's
- * staging share holds (0.75 * llc / 2 - 4 * 2048) / 34 records: about
- * 10800 (one block fits, half a run: the fused pass on 8192-row chunks,
- * the keys decode once per run, within 5% for the vectors a chunk starts
- * inside), then about 5300 (under a block, under half a run: the two
+ * staging share holds (0.75 * llc / 2 - 4 * 2048) / 26 rows (the staged
+ * k, m and f, 8 bytes each, and a partition id): about 14100 (one block
+ * fits, half a run: the fused pass on 8192-row chunks, the keys decode
+ * once per run, within 5% for the vectors a chunk starts inside), then
+ * about 6900 (under a block, under half a run: the two
  * passes, the keys decode twice; whole chunks are
  * scanrange/v2_radix_decode_once's).  Every answer is generation 0's
  * byte for byte (the F64 sum's bits follow the records' order inside a
@@ -2516,9 +2517,9 @@ static test_result_t test_radix_fused_capped_decode_once(void) {
 
 /* The below-half side of the fused cap: 4.2M rows (4096 partitions, so a
  * run wants 32768-row chunks, 4 blocks) over 2 workers, the last-level
- * cache set so a worker's staging share holds about 10000 to 13000
- * records (24- to 32-byte records: (0.75 * llc / 2 - 4 * 4096) / (rec +
- * 2)).  The cap rounds down to one block, which holds a quarter of a run:
+ * cache set so a worker's staging share holds about 13700 rows ((0.75 *
+ * llc / 2 - 4 * 4096) / 18: the staged k and m, 8 bytes each, and a
+ * partition id).  The cap rounds down to one block, which holds a quarter of a run:
  * the two passes, the keys decode twice (fused on one-block chunks, they
  * would decode once).  The answer is the in-memory table's. */
 static test_result_t test_radix_fused_capped_below_half(void) {
@@ -2534,7 +2535,7 @@ static test_result_t test_radix_fused_capped_below_half(void) {
     ae_eval_ok("(set T (.db.splayed.get \"" AE_TMP "/r2/\"))");
     ae_drop(ae_eval(q));                                  /* binds and loads once: the pin is per run */
     uint64_t fk, fm, k0 = ae_dec("k", &fk), m0 = ae_dec("m", &fm);
-    ray_cache_llc_set_for_test(950000);
+    ray_cache_llc_set_for_test(700000);
     agg_route_reset();
     size_t n = 0;
     char* b = ae_csv(q, &n);

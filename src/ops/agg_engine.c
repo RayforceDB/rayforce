@@ -4303,6 +4303,21 @@ static void agg_key_emit_fn(void* vctx, uint32_t wid, int64_t start, int64_t end
     agg_key_emit_range((const agg_key_emit_ctx_t*)vctx, start, end);
 }
 
+/* A record field of a compact fused context (agg_radix_ctx_t.cf): where
+ * the scatter takes it from.  A staged source's field is copied into the
+ * task's staged row at soff; a plain source's (a column read in place) is
+ * read by the scatter at its row, as the two passes' scatter reads it. */
+enum { AGG_CF_STAGED, AGG_CF_KEY_I64, AGG_CF_KEY_I32, AGG_CF_KEY_I16, AGG_CF_KEY_U8,
+       AGG_CF_KEY_U16, AGG_CF_KEY_U32, AGG_CF_VAL };
+typedef struct {
+    const char* plain;      /* plain fields: the column's row 0 */
+    uint32_t    off;        /* the field's offset in the record */
+    uint32_t    soff;       /* staged fields: the offset in the staged row */
+    uint8_t     w;          /* bytes in the record (keys: 8) */
+    uint8_t     esz;        /* plain fields: the column's element width */
+    uint8_t     kind;       /* AGG_CF_* */
+} agg_radix_cf_t;
+
 typedef struct {
     ray_t**             key_cols;
     const void**        key_data;
@@ -4367,6 +4382,16 @@ typedef struct {
     uint32_t*           runs;       /* fused: [n_parts][n_chunks] (offset inside the
                                      * chunk, length) of each partition's run, the
                                      * count matrix transposed for phase 2 */
+    /* Compact staging (fused, not sel mode): a task stages only the staged
+     * sources' fields (srec bytes a row: keys widened, inputs at their
+     * widths) and the scatter builds each record from them, the plain
+     * columns read in place and the position.  cf[f] is field f: the
+     * keys (cf[k] is key k's), then the inputs present (n_cf in all).  Not
+     * compact: a task stages whole records. */
+    bool                compact;
+    size_t              srec;
+    uint32_t            n_cf;
+    const agg_radix_cf_t* cf;
 } agg_radix_ctx_t;
 
 /* Avalanche finalizer shared by the radix scatter (partition selection) and
@@ -4624,12 +4649,18 @@ static void agg_radix_stage_block(agg_radix_stage_t* t, const agg_view_t* v, int
         for (int64_t i = 0; i < n; i++) { int64_t pos = b + i; memcpy(rp + (size_t)i * rec, &pos, 8); }
     }
 }
+static void agg_radix_stage_block_c(agg_radix_stage_t* t, const agg_view_t* v, int64_t b, int64_t e);
 static void agg_radix_stage_rows(void* raw, const agg_view_t* v, uint32_t wid, int64_t b, int64_t e) {
     (void)wid;
     agg_radix_stage_t* t = raw;
     if (t->rows) {
         for (int64_t i = b; i < e; i++)
             agg_radix_stage_view(t->c, v, t->cur, t->stage, t->spid, t->chunk0, t->rows[i], t->pos0 + i);
+        return;
+    }
+    if (t->c->compact) {
+        for (int64_t r = b; r < e; r += RAY_ENC_VEC)
+            agg_radix_stage_block_c(t, v, r, e - r < RAY_ENC_VEC ? e : r + RAY_ENC_VEC);
         return;
     }
     for (int64_t r = b; r < e; r += RAY_ENC_VEC)
@@ -4658,6 +4689,137 @@ static void agg_radix_stage_scatter(char* dst, const char* stage, const uint16_t
             break;
     }
     #undef STAGE_COPY
+}
+
+/* agg_radix_stage_block of a compact context: rows [b, e) of a piece,
+ * hashed over every key (plain ones read in place through the view), the
+ * staged sources' fields copied into the staged rows (srec bytes each),
+ * the partitions and counts recorded.  The plain fields and the positions
+ * are left to agg_radix_scatter_compact. */
+static void agg_radix_stage_block_c(agg_radix_stage_t* t, const agg_view_t* v, int64_t b, int64_t e) {
+    agg_radix_ctx_t* c = t->c;
+    const size_t srec = c->srec;
+    const int64_t i0 = b - v->base;
+    const int64_t n = e - b;
+    char* out = t->stage + (size_t)(b - t->chunk0) * srec;
+    uint16_t* spid = t->spid + (b - t->chunk0);
+    uint64_t h[RAY_ENC_VEC];
+    for (int64_t i = 0; i < n; i++) h[i] = 1469598103934665603ULL;
+    for (uint32_t k = 0; k < c->n_keys; k++) {
+        const void* kd = v->key_data[k];
+        const agg_radix_cf_t* f = &c->cf[k];
+        char* kp = out + f->soff;
+        if (f->kind == AGG_CF_STAGED) {
+            #define STAGE_KEY(T) do { const T* src = (const T*)kd + i0;                \
+                for (int64_t i = 0; i < n; i++) {                                      \
+                    int64_t val = (int64_t)src[i];                                     \
+                    memcpy(kp + (size_t)i * srec, &val, 8);                            \
+                    h[i] = (h[i] ^ (uint64_t)val) * 1099511628211ULL;                  \
+                } } while (0)
+            switch (c->key_cols[k]->type) {
+                case RAY_I64: case RAY_TIMESTAMP: STAGE_KEY(int64_t); break;
+                case RAY_I32: case RAY_DATE: case RAY_TIME: STAGE_KEY(int32_t); break;
+                case RAY_I16: STAGE_KEY(int16_t); break;
+                case RAY_U8: case RAY_BOOL: STAGE_KEY(uint8_t); break;
+                case RAY_SYM:
+                    switch (v->key_attrs[k] & RAY_SYM_W_MASK) {
+                        case RAY_SYM_W8: STAGE_KEY(uint8_t); break;
+                        case RAY_SYM_W16: STAGE_KEY(uint16_t); break;
+                        case RAY_SYM_W32: STAGE_KEY(uint32_t); break;
+                        default: STAGE_KEY(int64_t); break;
+                    }
+                    break;
+                default: for (int64_t i = 0; i < n; i++) { memset(kp + (size_t)i * srec, 0, 8); h[i] *= 1099511628211ULL; }
+            }
+            #undef STAGE_KEY
+            continue;
+        }
+        #define HASH_KEY(T) do { const T* src = (const T*)kd + i0;                     \
+            for (int64_t i = 0; i < n; i++)                                            \
+                h[i] = (h[i] ^ (uint64_t)(int64_t)src[i]) * 1099511628211ULL; } while (0)
+        switch (f->kind) {
+            case AGG_CF_KEY_I64: HASH_KEY(int64_t); break;
+            case AGG_CF_KEY_I32: HASH_KEY(int32_t); break;
+            case AGG_CF_KEY_I16: HASH_KEY(int16_t); break;
+            case AGG_CF_KEY_U8:  HASH_KEY(uint8_t); break;
+            case AGG_CF_KEY_U16: HASH_KEY(uint16_t); break;
+            case AGG_CF_KEY_U32: HASH_KEY(uint32_t); break;
+            default: for (int64_t i = 0; i < n; i++) h[i] *= 1099511628211ULL;
+        }
+        #undef HASH_KEY
+    }
+    const uint32_t mask = c->n_parts - 1;
+    uint32_t* cur = t->cur;
+    for (int64_t i = 0; i < n; i++) {
+        uint32_t p = (uint32_t)(agg_radix_fmix64(h[i]) & mask);
+        spid[i] = (uint16_t)p;
+        cur[p]++;
+    }
+    /* the staged inputs, in field order after the keys */
+    uint32_t fi = c->n_keys;
+    for (uint32_t a = 0; a < c->n_aggs; a++) {
+        for (int y = 0; y < 2; y++) {
+            const void* vd = y ? v->val2_data[a] : v->val_data[a];
+            const void* id = y ? c->val2_data[a] : c->val_data[a];
+            if (!id) continue;
+            const agg_radix_cf_t* f = &c->cf[fi++];
+            if (f->kind != AGG_CF_STAGED) continue;
+            const char* sp = (const char*)vd + (size_t)i0 * f->w;
+            char* dp = out + f->soff;
+            switch (f->w) {
+                case 1: for (int64_t i = 0; i < n; i++) memcpy(dp + (size_t)i * srec, sp + i, 1); break;
+                case 2: for (int64_t i = 0; i < n; i++) memcpy(dp + (size_t)i * srec, sp + 2 * i, 2); break;
+                case 4: for (int64_t i = 0; i < n; i++) memcpy(dp + (size_t)i * srec, sp + 4 * i, 4); break;
+                case 8: for (int64_t i = 0; i < n; i++) memcpy(dp + (size_t)i * srec, sp + 8 * i, 8); break;
+                default: for (int64_t i = 0; i < n; i++) memcpy(dp + (size_t)i * srec, sp + (size_t)i * f->w, f->w);
+            }
+        }
+    }
+}
+
+/* The scatter of a compact chunk: n staged rows (positions pos0 ..) to
+ * their slots at wcur (offsets inside the chunk's record range at dst),
+ * each record built as the two passes' scatter builds it: the staged
+ * fields from the staged row, the plain ones read in place at the row,
+ * the position. */
+static void agg_radix_scatter_compact(const agg_radix_ctx_t* c, char* dst, const char* stage,
+                                      const uint16_t* spid, uint32_t* wcur, int64_t pos0, int64_t n) {
+    const size_t rec = c->rec, srec = c->srec;
+    const uint32_t nf = c->n_cf;
+    const agg_radix_cf_t* cf = c->cf;
+    const size_t row_off = c->row_off;
+    const bool needs_row = c->needs_row;
+    for (int64_t i = 0; i < n; i++) {
+        char* d = dst + (size_t)wcur[spid[i]]++ * rec;
+        const char* sr = stage + (size_t)i * srec;
+        const int64_t r = pos0 + i;
+        for (uint32_t fi = 0; fi < nf; fi++) {
+            const agg_radix_cf_t* f = &cf[fi];
+            int64_t kv;
+            switch (f->kind) {
+                case AGG_CF_STAGED:
+                    switch (f->w) {
+                        case 1: memcpy(d + f->off, sr + f->soff, 1); break;
+                        case 2: memcpy(d + f->off, sr + f->soff, 2); break;
+                        case 4: memcpy(d + f->off, sr + f->soff, 4); break;
+                        case 8: memcpy(d + f->off, sr + f->soff, 8); break;
+                        default: memcpy(d + f->off, sr + f->soff, f->w);
+                    }
+                    continue;
+                case AGG_CF_KEY_I64: kv = ((const int64_t*)f->plain)[r]; break;
+                case AGG_CF_KEY_I32: kv = ((const int32_t*)f->plain)[r]; break;
+                case AGG_CF_KEY_I16: kv = ((const int16_t*)f->plain)[r]; break;
+                case AGG_CF_KEY_U8:  kv = ((const uint8_t*)f->plain)[r]; break;
+                case AGG_CF_KEY_U16: kv = ((const uint16_t*)f->plain)[r]; break;
+                case AGG_CF_KEY_U32: kv = ((const uint32_t*)f->plain)[r]; break;
+                default:
+                    memcpy(d + f->off, f->plain + (size_t)r * f->esz, f->esz);
+                    continue;
+            }
+            memcpy(d + f->off, &kv, 8);
+        }
+        if (needs_row) memcpy(d + row_off, &r, sizeof r);
+    }
 }
 
 /* The staged form of one pass over chunk ch (out of line: the plain loops
@@ -4831,7 +4993,10 @@ static void agg_radix_chunk_fused(agg_radix_ctx_t* c, int64_t ch, uint32_t wid, 
         cur[p] = wcur[p] = run;
         run += n;
     }
-    agg_radix_stage_scatter(c->pay + (size_t)start * c->rec, stage, spid, wcur, end - start, c->rec);
+    if (c->compact)
+        agg_radix_scatter_compact(c, c->pay + (size_t)start * c->rec, stage, spid, wcur, start, end - start);
+    else
+        agg_radix_stage_scatter(c->pay + (size_t)start * c->rec, stage, spid, wcur, end - start, c->rec);
 }
 
 /* Phase 1 of a fused context: one task call's consecutive chunks (a few
@@ -4848,7 +5013,7 @@ static void agg_radix_fused_fn(void* vctx, uint32_t wid, int64_t g0, int64_t g1)
     if (start >= end) return;
     agg_curs_t cs;
     if (!agg_radix_task_curs(c, start, &cs)) return;
-    char* stage = ray_alloc_raw((size_t)c->chunk_rows * c->rec);
+    char* stage = ray_alloc_raw((size_t)c->chunk_rows * (c->compact ? (c->srec ? c->srec : 1) : c->rec));
     uint16_t* spid = ray_alloc_raw((size_t)c->chunk_rows * sizeof(uint16_t));
     uint32_t* wcur = ray_alloc_raw((size_t)c->n_parts * sizeof(uint32_t));
     if (!stage || !spid || !wcur)
@@ -6088,9 +6253,11 @@ static ray_t* exec_group_v2_parallel_radix(
      * only phases 1-2 read them, freed once phase 2 joins. */
     ray_t* off_hdr;
     size_t* val_off = (size_t*)scratch_calloc(&off_hdr,
-        2u * (size_t)(n_aggs ? n_aggs : 1) * sizeof(size_t));
+        2u * (size_t)(n_aggs ? n_aggs : 1) * sizeof(size_t) +
+        ((size_t)n_keys + 2u * n_aggs) * sizeof(agg_radix_cf_t));
     if (!val_off) { agg_desc_free(&d); return ray_error("oom", NULL); }
     size_t* val2_off = val_off + n_aggs;
+    agg_radix_cf_t* cf = (agg_radix_cf_t*)(val_off + 2u * (n_aggs ? n_aggs : 1));
     size_t rec_cur = (size_t)n_keys * 8;
     for (uint32_t a = 0; a < n_aggs; a++) {
         if (val_data[a])  { val_off[a]  = rec_cur; rec_cur += val_esz[a]; }
@@ -6098,6 +6265,48 @@ static ray_t* exec_group_v2_parallel_radix(
     }
     size_t row_off = rec_cur; if (needs_row) rec_cur += 8;
     size_t rec = (rec_cur + 7u) & ~(size_t)7u;   /* 8-align records */
+    /* The compact staging of a fused pass (not sel mode: the scatter reads
+     * the plain columns at the chunk's own rows): the record's fields in
+     * order, a staged source's in the staged row, a plain one read in
+     * place. */
+    bool compact = d.staged && !sel;
+    size_t srec = 0;
+    uint32_t n_cf = 0;
+    for (uint32_t i = 0; compact && i < d.rr.n_src; i++) {
+        bool key = i < n_keys;
+        bool y = !key && i >= n_keys + n_aggs;
+        uint32_t a = key ? 0 : y ? i - n_keys - n_aggs : i - n_keys;
+        if (!key && !(y ? val2_data[a] : val_data[a])) continue;     /* no input (COUNT) */
+        agg_radix_cf_t* f = &cf[n_cf++];
+        memset(f, 0, sizeof *f);
+        f->off = (uint32_t)(key ? (size_t)i * 8 : y ? val2_off[a] : val_off[a]);
+        f->w = key ? 8 : y ? val2_esz[a] : val_esz[a];
+        if (d.rr.srcs[i]) {
+            f->kind = AGG_CF_STAGED;
+            f->soff = (uint32_t)srec;
+            srec += f->w;
+            continue;
+        }
+        f->plain = d.rr.plain[i];
+        f->esz = d.rr.esz[i];
+        if (!f->plain) { compact = false; break; }
+        if (!key) { f->kind = AGG_CF_VAL; continue; }
+        switch (d.rr.key_types[i]) {
+            case RAY_I64: case RAY_TIMESTAMP: f->kind = AGG_CF_KEY_I64; break;
+            case RAY_I32: case RAY_DATE: case RAY_TIME: f->kind = AGG_CF_KEY_I32; break;
+            case RAY_I16: f->kind = AGG_CF_KEY_I16; break;
+            case RAY_U8: case RAY_BOOL: f->kind = AGG_CF_KEY_U8; break;
+            case RAY_SYM:
+                switch (d.rr.key_attrs[i] & RAY_SYM_W_MASK) {
+                    case RAY_SYM_W8:  f->kind = AGG_CF_KEY_U8; break;
+                    case RAY_SYM_W16: f->kind = AGG_CF_KEY_U16; break;
+                    case RAY_SYM_W32: f->kind = AGG_CF_KEY_U32; break;
+                    default:          f->kind = AGG_CF_KEY_I64; break;
+                }
+                break;
+            default: compact = false; break;                         /* the gate admits only the above */
+        }
+    }
 
     int64_t n_in = sel ? n_sel : nrows;
     if (n_in < 0) n_in = 0;
@@ -6139,10 +6348,12 @@ static ray_t* exec_group_v2_parallel_radix(
         if (want_rows < RAY_COL_BLOCK_ROWS) want_rows = RAY_COL_BLOCK_ROWS;
         uint64_t llc_bytes = ray_cache_llc_bytes();
         double cache_budget = (llc_bytes ? (double)llc_bytes : 32.0 * 1048576.0) * 0.75;
-        /* a worker's staging: the records and the partition ids of a
-         * chunk (rec + 2 bytes a row) and the partitions' write cursors */
+        /* a worker's staging: a chunk's staged rows (compact: the staged
+         * sources' fields, srec bytes; else whole records, rec) and
+         * partition ids (2 bytes a row), and the partitions' write cursors */
         double per_worker = cache_budget / (double)nw - (double)n_parts * sizeof(uint32_t);
-        int64_t cap = per_worker > 0 ? (int64_t)(per_worker / ((double)rec + sizeof(uint16_t))) : 0;
+        double staged_row = (double)(compact ? srec : rec) + sizeof(uint16_t);
+        int64_t cap = per_worker > 0 ? (int64_t)(per_worker / staged_row) : 0;
         /* Staging over its share keeps the fused pass on smaller chunks:
          * the largest block multiple under the cap, while that still holds
          * half the records a run wants (4 a partition on average; q17's
@@ -6201,7 +6412,10 @@ static ray_t* exec_group_v2_parallel_radix(
         .sel = sel, .sel_prefix = sel_prefix,
         .val_off = val_off, .val2_off = val2_off,
         .rr = &d.rr, .whole = &d.whole,
+        .compact = fused && compact, .srec = srec, .n_cf = n_cf, .cf = cf,
     };
+    route_stats.radix_phase1 = !fused ? AGG_RADIX_P1_TWO_PASS
+                             : ctx.compact ? AGG_RADIX_P1_FUSED_COMPACT : AGG_RADIX_P1_FUSED_RECORDS;
     atomic_init(&ctx.part_overflow, 0);
     agg_desc_advise(&d, nrows);
     /* Pass 1 of the two passes reads the keys alone: an input is read once,
