@@ -861,6 +861,15 @@ static test_result_t test_pool_workers_started(void) {
  * reached for threads that never ran — and a pool of one thread still
  * comes up after it. */
 static test_result_t test_pool_sk_spawn_fails(void) {
+    /* The child starts pool threads after forking a multi-threaded
+     * process, which ThreadSanitizer refuses. */
+#if defined(__SANITIZE_THREAD__)
+    SKIP("ThreadSanitizer cannot start threads after a multi-threaded fork");
+#elif defined(__has_feature)
+#  if __has_feature(thread_sanitizer)
+    SKIP("ThreadSanitizer cannot start threads after a multi-threaded fork");
+#  endif
+#endif
     fflush(stderr);
     pid_t pid = fork();
     TEST_ASSERT_TRUE(pid >= 0);
