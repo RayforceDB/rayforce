@@ -711,7 +711,10 @@ bool ray_symgrp_adopt(ray_symgrp_t* g, uint64_t hmask) {
     if (count <= from) { if (count > g->known) g->known = count; return true; }
     sg_ra_t ra = {0};
     int64_t spans = 0, read = 0;
-    bool ok = sg_ra_add(&ra, ray_symimp_offset(g->imp, from), ray_symimp_offset(g->imp, count - 1) + 4, &spans) &&
+    /* to the end of the last record's bytes, as the other spans run */
+    uint32_t last = 0;
+    (void)ray_symimp_get(g->imp, count - 1, &last);
+    bool ok = sg_ra_add(&ra, ray_symimp_offset(g->imp, from), ray_symimp_offset(g->imp, count - 1) + 4 + last, &spans) &&
               sg_ra_end(&ra);
     for (int64_t pos = from; ok && pos < count; pos++) {
         sg_ra_at(g->imp, &ra, ray_symimp_offset(g->imp, pos), &read);
