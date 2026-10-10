@@ -375,10 +375,20 @@ static bool agg_walk(const agg_rr_t* rr, void* ctx, agg_body_fn body,
 }
 
 /* One cursor per staged source, created by a task at its start and freed
- * at its end (R-SPARSE: each touched vector is decoded once per task). */
-enum { AGG_CURS_STACK = 8 };
+ * at its end (R-SPARSE: each touched vector is decoded once per task).  Up
+ * to AGG_CURS_STACK cursors live in the set, on the task's stack, and the
+ * first AGG_CURS_LENT encoded sources decode into fixed vectors lent from
+ * the set, so a worker's first decode takes nothing from its heap (a fresh
+ * worker heap maps and faults in a whole pool on its first allocation:
+ * ClickBench q8 on partitions, first run).  Two, not one per cursor: the
+ * set's frame is probed page by page on every task's first entry, and
+ * eight lent vectors (128 KB) measured q8's generation-0 first run 3%
+ * slower.  Declared without an initializer (the fixed vectors are not to
+ * be zeroed): set cur = NULL before any path that may free it. */
+enum { AGG_CURS_STACK = 8, AGG_CURS_LENT = 4 };
 typedef struct {
     ray_col_cursor_t  st[AGG_CURS_STACK];
+    ray_col_fixed_t   fx[AGG_CURS_LENT];
     ray_col_cursor_t* cur;
 } agg_curs_t;
 
@@ -386,8 +396,14 @@ static bool agg_curs_init(agg_curs_t* cs, const agg_rr_t* rr) {
     cs->cur = rr->n_src <= AGG_CURS_STACK ? cs->st
             : ray_calloc_raw((size_t)rr->n_src * sizeof(ray_col_cursor_t));
     if (!cs->cur) return false;
-    for (uint32_t i = 0; i < rr->n_src; i++)
-        if (rr->srcs[i]) ray_col_cursor_init(&cs->cur[i], rr->srcs[i]);
+    uint32_t lent = 0;
+    for (uint32_t i = 0; i < rr->n_src; i++) {
+        if (!rr->srcs[i]) continue;
+        if (lent < AGG_CURS_LENT && ray_col_src_encoded(rr->srcs[i]))
+            ray_col_cursor_init_lent(&cs->cur[i], rr->srcs[i], &cs->fx[lent++]);
+        else
+            ray_col_cursor_init(&cs->cur[i], rr->srcs[i]);
+    }
     return true;
 }
 
@@ -1710,7 +1726,7 @@ static void agg_sel_bounds_fn(void* raw, uint32_t wid, int64_t start, int64_t en
         agg_sel_cursor_t cur;
         agg_sel_cursor_init(&cur, c->sel, c->sel_prefix, begin, limit);
         agg_sel_bounds_run_t t = { c, rows, mins, maxs };
-        agg_curs_t cs = { .cur = NULL };
+        agg_curs_t cs; cs.cur = NULL;
         if (krr->staged) {
             if (ray_scan_fail_skip(krr->fail, begin)) continue;
             if (!agg_curs_init(&cs, krr)) { ray_scan_fail_note(krr->fail, begin, ray_error("oom", NULL)); continue; }
@@ -2445,7 +2461,7 @@ static void agg_dense_phaseA_sel(agg_dense_ctx_t* c, uint32_t wid, int64_t start
     agg_sel_scratch_t sc;
     if (!agg_sel_scratch_init(&sc, c->n_aggs)) { loc->oom = 1; return; }
     const agg_rr_t* rr = c->rr;
-    agg_curs_t cs = { .cur = NULL };
+    agg_curs_t cs; cs.cur = NULL;
     if (rr->staged) {
         if (ray_scan_fail_skip(rr->fail, start)) { agg_sel_scratch_free(&sc); return; }
         if (!agg_curs_init(&cs, rr)) { loc->oom = 1; agg_sel_scratch_free(&sc); return; }
@@ -3449,7 +3465,7 @@ static void agg_dense_shared_block(void* raw, const agg_view_t* v, uint32_t wid,
 static void agg_dense_shared_rows(void* raw, uint32_t wid, int64_t start, int64_t end) {
     agg_dense_shared_ctx_t* c = raw;
     const agg_desc_t* d = c->desc;
-    agg_curs_t cs = { .cur = NULL };
+    agg_curs_t cs; cs.cur = NULL;
     if (d->staged && !agg_curs_init(&cs, &d->rr)) { ray_scan_fail_note(d->rr.fail, start, ray_error("oom", NULL)); return; }
     for (int64_t begin = start; begin < end && !agg_cancelled(); begin += 8192) {
         int64_t limit = end - begin < 8192 ? end : begin + 8192;
@@ -3551,7 +3567,7 @@ static ray_t* exec_group_v2_parallel_dense(
     char* cursor = (char*)(((uintptr_t)locals + metadata_bytes + 63) & ~(uintptr_t)63);
     /* The eager-initialization samples read a staged key through cursors
      * (R-SPARSE: strided single rows, ascending). */
-    agg_curs_t scs = { .cur = NULL };
+    agg_curs_t scs; scs.cur = NULL;
     ray_t* serr = NULL;
     if (d.staged && !sel && n_keys == 1 && !agg_curs_init(&scs, &d.rr)) serr = ray_error("oom", NULL);
     for (uint32_t w = 0; w < nw && !serr; w++) {
@@ -3951,7 +3967,7 @@ static void agg_sh_phaseA_fn(void* vctx, uint32_t wid, int64_t start, int64_t en
         uint32_t sgid[AGG_SEL_CHUNK];
         agg_sel_scratch_t sc;
         if (!agg_sel_scratch_init(&sc, c->n_aggs)) { sh->oom = 1; return; }
-        agg_curs_t cs = { .cur = NULL };
+        agg_curs_t cs; cs.cur = NULL;
         if (rr->staged) {
             if (ray_scan_fail_skip(rr->fail, start)) { agg_sel_scratch_free(&sc); return; }
             if (!agg_curs_init(&cs, rr)) { sh->oom = 1; agg_sel_scratch_free(&sc); return; }
@@ -3970,7 +3986,7 @@ static void agg_sh_phaseA_fn(void* vctx, uint32_t wid, int64_t start, int64_t en
         return;
     }
 
-    agg_curs_t tc = { .cur = NULL };
+    agg_curs_t tc; tc.cur = NULL;
     if (rr->staged && !agg_curs_init(&tc, rr)) { sh->oom = 1; return; }
     for (int64_t cs = start; cs < end && !sh->oom; cs += AGG_SH_CHUNK) {
         int64_t ce = cs + AGG_SH_CHUNK; if (ce > end) ce = end;
@@ -7004,7 +7020,7 @@ static void agg_ts_phase1_fn(void* vctx, uint32_t wid, int64_t start, int64_t en
             int64_t rows[AGG_SEL_CHUNK];
             agg_sel_scratch_t sc;
             if (!agg_sel_scratch_init(&sc, c->n_aggs)) { ts->oom = 1; continue; }
-            agg_curs_t cs = { .cur = NULL };
+            agg_curs_t cs; cs.cur = NULL;
             if (rr->staged && !agg_curs_init(&cs, rr)) { ts->oom = 1; agg_sel_scratch_free(&sc); continue; }
             agg_sel_cursor_t cur;
             agg_sel_cursor_init(&cur, c->sel, c->sel_prefix, lo, hi);
@@ -7016,7 +7032,7 @@ static void agg_ts_phase1_fn(void* vctx, uint32_t wid, int64_t start, int64_t en
             agg_curs_free(&cs, rr);
             agg_sel_scratch_free(&sc);
         } else {
-            agg_curs_t tc = { .cur = NULL };
+            agg_curs_t tc; tc.cur = NULL;
             if (rr->staged && !agg_curs_init(&tc, rr)) { ts->oom = 1; continue; }
             for (int64_t cs = lo; cs < hi && !ts->oom; cs += AGG_TS_CHUNK) {
                 int64_t ce = cs + AGG_TS_CHUNK; if (ce > hi) ce = hi;
@@ -7316,7 +7332,7 @@ static void agg_ts_sample_fn(void* vctx, uint32_t wid, int64_t start, int64_t en
         int64_t n = 0;
         /* staged keys: strided single rows, ascending, through this task's
          * cursors (R-SPARSE) */
-        agg_curs_t cs = { .cur = NULL };
+        agg_curs_t cs; cs.cur = NULL;
         ray_t* err = NULL;
         if (rr->staged && !agg_curs_init(&cs, rr)) err = ray_error("oom", NULL);
         for (int64_t j = 0; j < AGG_TS_SAMPLE_PER && !err; j++) {
@@ -7391,7 +7407,7 @@ static bool agg_ts_precheck_declines(const agg_rr_t* krr, uint32_t n_keys, int64
         keys = (int64_t*)scratch_alloc(&pk_hdr, nk * sizeof(int64_t));
         if (!keys) return false;
     }
-    agg_curs_t cs = { .cur = NULL };
+    agg_curs_t cs; cs.cur = NULL;
     if (krr->staged && !agg_curs_init(&cs, krr)) { scratch_free(pk_hdr); return false; }
     memset(phs, 0, sizeof(phs));
     /* Stride AGG_TS_PRE_SAMPLE2 positions over the ORIGINAL rows (a selected
@@ -8238,7 +8254,7 @@ static bool agg_shared_sample(ray_graph_t* g, ray_op_ext_t* ext, ray_t* tbl,
     if (!states) { agg_desc_free(&d); return false; }
     /* Staged sources: strided single rows, ascending, through cursors
      * (R-SPARSE). */
-    agg_curs_t cs = { .cur = NULL };
+    agg_curs_t cs; cs.cur = NULL;
     if (d.staged && !agg_curs_init(&cs, &d.rr)) { ray_free_raw(states); agg_desc_free(&d); return false; }
     char* previous = states + SAMPLES * vo->block;
     int16_t map[CAP]; int64_t values[SAMPLES];
@@ -9181,7 +9197,7 @@ static ray_t* exec_group_v2_run_keys(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
          * selections keep their existing exact selected-range planning. */
         if (dense_par_ok && !sel && ext->n_keys == 1) {
             /* a staged key: strided single rows through a cursor (R-SPARSE) */
-            agg_curs_t tcs = { .cur = NULL };
+            agg_curs_t tcs; tcs.cur = NULL;
             ray_t* terr = NULL;
             if (ks->rr.staged && !agg_curs_init(&tcs, &ks->rr)) terr = ray_error("oom", NULL);
             double touched_slots = 0;

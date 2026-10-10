@@ -1345,6 +1345,20 @@ static test_result_t test_count_fast_lent_scratch(void) {
     PASS();
 }
 
+/* ...and a group's tasks decode their first two encoded sources into
+ * fixed vectors lent from their cursor sets (ClickBench q8's shape, and
+ * a key beside an input): no fixed vector from the heap, the answers
+ * generation 0's. */
+static test_result_t test_group_lent_scratch(void) {
+    ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    uint64_t a0 = ray_col_test_fixed_allocs();
+    SR_SAME("(select {g: g c: (count g) from: T where: (!= g 3) by: g desc: c take: 10})", UINT64_MAX);
+    SR_SAME("(select {s: (sum u) from: T by: g})", UINT64_MAX);
+    TEST_ASSERT_FMT(ray_col_test_fixed_allocs() == a0, "%llu fixed vectors from the heap",
+                    (unsigned long long)(ray_col_test_fixed_allocs() - a0));
+    PASS();
+}
+
 /* The fast path's SYM compare, on an in-memory (runtime-domain) table and
  * over a file domain at both generations, with nulls and an absent
  * literal: EQ / NE take the fast path and equal the general path (`and
@@ -6486,6 +6500,7 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/expr_error",             test_expr_error,             srr_setup, srr_teardown },
     { "scanrange/count_fast_path",        test_count_fast_path,        srr_setup, srr_teardown },
     { "scanrange/count_fast_lent_scratch", test_count_fast_lent_scratch, srr_setup, srr_teardown },
+    { "scanrange/group_lent_scratch", test_group_lent_scratch, srr_setup, srr_pool_teardown },
     { "scanrange/count_fast_sym_nulls",   test_count_fast_sym_nulls,   sr_rt_setup, sr_rt_teardown },
     { "scanrange/expr_reuses_materialized", test_expr_reuses_materialized, srr_setup, srr_teardown },
     { "scanrange/expr_error_sites",       test_expr_error_sites,       srr_setup, srr_teardown },
