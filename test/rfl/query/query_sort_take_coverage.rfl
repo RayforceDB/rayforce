@@ -417,6 +417,10 @@
 (select {x: y r: r from: Pck desc: x}) -- (select {x: y r: r from: Mck desc: x})
 (select {x: y y: x from: Pck desc: y}) -- (select {x: y y: x from: Mck desc: y})
 (select {x: y z: x y: y from: Pck desc: y}) -- (select {x: y z: x y: y from: Mck desc: y})
+;; with take: too (the per-partition top-k sorted each partition on the
+;; column and merged them on the output of that name)
+(select {x: y r: r from: Pck desc: x take: 3}) -- (select {x: y r: r from: Mck desc: x take: 3})
+(select {x: y y: x from: Pck desc: y take: 2}) -- (select {x: y y: x from: Mck desc: y take: 2})
 ;; it groups on the columns the clauses name and gathers the others at the
 ;; rows kept: a sort key only in desc:/asc:, a by-dict value's column, the
 ;; partition key sorted, every row its own group, a key from a global

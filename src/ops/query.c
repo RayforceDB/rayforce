@@ -23028,8 +23028,9 @@ static ray_t* try_stream_parted_order_by(
  *      pure per-row gather, so per-partition evaluation is row-preserving.  An
  *      aggregate/expression output would collapse per segment (one row per
  *      partition) and diverge from flat, so it declines.
- *   5. Every sort key resolves to an output column (its alias), so the
- *      candidate table carries the sort column for the final merge. */
+ *   5. Every sort key is an output carrying that column under its own name
+ *      (`k: k`), so the candidate table carries the sort column for the
+ *      final merge, and the merge sorts on what each segment sorted on. */
 static ray_t* try_stream_parted_order_by_topk(
     ray_t* dict, ray_t* tbl, ray_t** dict_elems, int64_t dict_n,
     int64_t from_id, int64_t where_id, int64_t by_id, int64_t take_id,
@@ -23074,8 +23075,9 @@ static ray_t* try_stream_parted_order_by_topk(
         if (!ray_table_get_col(tbl, v->i64)) return NULL;
     }
 
-    /* Every sort key must appear as an output alias (dict key of an output
-     * column), so the candidate table carries the sort column. */
+    /* Every sort key must be an output of that column under its name: the
+     * segments sort on the column, the merge on the output (`{x: y asc: x}`
+     * declines). */
     for (int64_t i = 0; i + 1 < dict_n; i += 2) {
         int64_t kid = dict_elems[i]->i64;
         if (kid != asc_id && kid != desc_id) continue;
@@ -23093,7 +23095,10 @@ static ray_t* try_stream_parted_order_by_topk(
                 if (okid == from_id || okid == where_id || okid == by_id ||
                     okid == take_id || okid == asc_id || okid == desc_id ||
                     okid == nearest_id) continue;
-                if (okid == sk) found = true;
+                if (okid == sk) {
+                    if (dict_elems[j + 1]->i64 != sk) return NULL;
+                    found = true;
+                }
             }
             if (!found) return NULL;
         }
