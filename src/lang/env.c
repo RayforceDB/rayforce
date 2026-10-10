@@ -692,7 +692,7 @@ static ray_err_t env_bind_local(int64_t sym_id, ray_t* val) {
 }
 
 ray_err_t ray_env_set_local_rows(int64_t sym_id, ray_t* val, uint8_t rows) {
-    if (ray_sym_is_dotted(sym_id) || __VM->scope_depth <= 0) return ray_env_set_local(sym_id, val);
+    if (!__VM || ray_sym_is_dotted(sym_id) || __VM->scope_depth <= 0) return ray_env_set_local(sym_id, val);
     if (ray_sym_is_reserved(sym_id) && !ray_sym_is_ipc_hook(sym_id)) return RAY_ERR_RESERVED;
     return env_frame_bind_rows(&__VM->scope_stack[__VM->scope_depth - 1], sym_id, val, rows);
 }

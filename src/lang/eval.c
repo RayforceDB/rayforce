@@ -3163,8 +3163,8 @@ op_loadcap: {
      * with while the query frame it was made under is the innermost one. */
     uint8_t idx = code[ip++];
     ray_t *cap = LAMBDA_CLOSURE(vm.fn);
-    ray_t *cvals = cap ? ray_dict_vals(cap) : NULL;
-    if (!cvals || idx >= cvals->len) goto vm_error_name;
+    ray_t *cvals = cap && cap->type == RAY_DICT ? ray_dict_vals(cap) : NULL;
+    if (!cvals || cvals->type != RAY_LIST || idx >= cvals->len) goto vm_error_name;
     ray_t *val = ((ray_t**)ray_data(cvals))[idx];
     uint8_t val_rows = 0;
     ray_t *flags = LAMBDA_CAPROWS(vm.fn);
@@ -3204,11 +3204,12 @@ op_scope_begin: {
     if (err != RAY_OK) goto vm_error_limit;
     /* The closure's own captures are locals of the window too, so a lambda
      * created inside it captures them in turn. */
-    if (LAMBDA_CLOSURE(vm.fn)) {
+    if (LAMBDA_CLOSURE(vm.fn) && LAMBDA_CLOSURE(vm.fn)->type == RAY_DICT) {
         ray_t *ck = ray_dict_keys(LAMBDA_CLOSURE(vm.fn));
         ray_t *cv = ray_dict_vals(LAMBDA_CLOSURE(vm.fn));
         ray_t *cf = LAMBDA_CAPROWS(vm.fn);
         bool live = cf && LAMBDA_CAPQ(vm.fn) && LAMBDA_CAPQ(vm.fn) == ray_env_query_serial();
+        if (!ck || !cv || ck->type != RAY_SYM || cv->type != RAY_LIST) ck = NULL;   /* shape checked at compile */
         for (int64_t i = 0; ck && cv && i < ck->len && i < cv->len; i++) {
             int64_t sym = ray_read_sym(ray_data(ck), i, RAY_SYM, ck->attrs);
             if (ray_env_get_local(sym)) continue;   /* a local shadows a capture */

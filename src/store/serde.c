@@ -1150,11 +1150,13 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len) {
                 ray_release(body);
                 return closure;
             }
-            if (closure->type != RAY_DICT) {
+            ray_t* ck = closure->type == RAY_DICT ? ray_dict_keys(closure) : NULL;
+            ray_t* cv = closure->type == RAY_DICT ? ray_dict_vals(closure) : NULL;
+            if (!ck || !cv || ck->type != RAY_SYM || cv->type != RAY_LIST || ck->len != cv->len) {
                 ray_release(params);
                 ray_release(body);
                 ray_release(closure);
-                return ray_error("type", "deserialize lambda: closure must be a dict");
+                return ray_error("type", "deserialize lambda: closure must be a dict of SYM keys to a LIST of values");
             }
         }
 

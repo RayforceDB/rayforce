@@ -184,6 +184,41 @@ static test_result_t test_query_helper_reinit(void) {
     PASS();
 }
 
+
+/* ---- Test: a closure whose capture values are not a LIST never compiles ----
+ * A deserialized lambda may carry a dict with a typed value vector; the
+ * compiled capture load would read its payload as pointers.  Such a
+ * closure stays on the tree walker, whose capture binding reports a type
+ * error, inside and outside a query. */
+static test_result_t test_closure_malformed_capture(void) {
+    ray_t* lam = ray_eval_str("((fn [k] (fn [v] (+ v k))) 1)");
+    TEST_ASSERT_NOT_NULL(lam);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(lam));
+    TEST_ASSERT_EQ_I(lam->type, RAY_LAMBDA);
+    /* Replace the closure's values with a typed vector of the same length. */
+    ray_t* keys = ray_dict_keys(LAMBDA_CLOSURE(lam));
+    ray_t* vals = ray_vec_new(RAY_I64, keys->len);
+    TEST_ASSERT_NOT_NULL(vals);
+    for (int64_t i = 0; i < keys->len; i++) ((int64_t*)ray_data(vals))[i] = 0x4141414141414141LL;
+    vals->len = keys->len;
+    ray_retain(keys);
+    ray_t* bad = ray_dict_new(keys, vals);
+    TEST_ASSERT_NOT_NULL(bad);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(bad));
+    ray_release(LAMBDA_CLOSURE(lam));
+    LAMBDA_CLOSURE(lam) = bad;
+    ray_t* arg = ray_i64(2);
+    ray_t* args[1] = { arg };
+    ray_t* r = call_lambda(lam, args, 1);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT(RAY_IS_ERR(r), "malformed closure must fail, not be dereferenced");
+    TEST_ASSERT(!LAMBDA_IS_COMPILED(lam), "malformed closure must not compile");
+    ray_error_free(r);
+    ray_release(arg);
+    ray_release(lam);
+    PASS();
+}
+
 /* ---- Dummy function for testing ---- */
 static ray_t* dummy_unary(ray_t* x) { return ray_retain(x), x; }
 static ray_t* dummy_binary(ray_t* x, ray_t* y) { (void)y; return ray_retain(x), x; }
@@ -9975,6 +10010,7 @@ const test_entry_t lang_entries[] = {
 
     { "lang/zone_sym_diagnostic", test_eval_zone_sym_diagnostic, lang_setup, lang_teardown },
     { "lang/query_helper_reinit", test_query_helper_reinit, lang_setup, lang_teardown },
+    { "lang/closure_malformed_capture", test_closure_malformed_capture, lang_setup, lang_teardown },
     { "lang/io/read_procfs_zero_size", test_read_procfs_reports_zero_size, lang_setup, lang_teardown },
     { "lang/io/read_unsized_bounded", test_read_unsized_stream_is_bounded, lang_setup, lang_teardown },
     { "lang/io/exec_capture_bounded", test_exec_capture_is_bounded, lang_setup, lang_teardown },

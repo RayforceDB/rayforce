@@ -244,7 +244,9 @@ static void init_sf_syms(void) {
  * the env, where a tree-walk local would shadow a global.  Conservative
  * by construction — descends lists, dicts, and sym vectors. */
 static bool ast_refs_locals(compiler_t *c, ray_t *ast);
-/* Index of `id` among the compiled lambda's captures, or -1. */
+/* Index of `id` among the compiled lambda's captures, or -1.  OP_LOADCAP
+ * takes a one-byte index, so a capture past the 255th resolves as a name
+ * through the ordinary path instead. */
 static int32_t find_capture(compiler_t *c, int64_t id) {
     if (!c->lambda || !LAMBDA_CLOSURE(c->lambda)) return -1;
     ray_t* keys = ray_dict_keys(LAMBDA_CLOSURE(c->lambda));
@@ -733,8 +735,21 @@ static void compile_expr(compiler_t *c, ray_t *ast) {
 }
 
 /* ── Public API ── */
+/* A closure compiles only when its captures have the shape the compiled
+ * loads assume: SYM keys and a LIST of values of the same length.  Anything
+ * else (a deserialized closure with a typed value vector, say) stays on the
+ * tree walker, whose capture binding reports the type error. */
+static bool closure_shape_ok(ray_t *closure) {
+    if (!closure) return true;
+    if (closure->type != RAY_DICT) return false;
+    ray_t *keys = ray_dict_keys(closure);
+    ray_t *vals = ray_dict_vals(closure);
+    return keys && vals && keys->type == RAY_SYM && vals->type == RAY_LIST && keys->len == vals->len;
+}
+
 void ray_compile(ray_t *lambda) {
     if (LAMBDA_IS_COMPILED(lambda)) return;
+    if (!closure_shape_ok(LAMBDA_CLOSURE(lambda))) return;
 
     compiler_t c;
     if (!compiler_init(&c)) return;
