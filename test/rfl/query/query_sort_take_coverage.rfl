@@ -353,3 +353,12 @@
 (count (select {by: Acka from: Tckg where: (> y 100)})) -- 0
 (select {by: sum from: Tckg}) !- domain
 (select {c: (count y) by: sum from: Tckg}) !- domain
+;; a computed by-dict key with a where: and no outputs keeps every column, in
+;; the table's order: the prefilter narrowed the table to the columns the
+;; clauses name, which are all an output-less select returns
+(set Tckp3 (table [x y z] (list [3 1 4 2] [30 10 40 20] [7 8 9 6])))
+(set Tckp3k (update {k: (* x 2) from: Tckp3}))
+(select {by: {k: (* x 2)} from: Tckp3 where: (> y 15)}) -- (select {by: k from: Tckp3k where: (> y 15)})
+(select {by: {k: (* x 2)} from: Tckp3 where: (> y 15)}) -- (table [k x y z] (list [6 8 4] [3 4 2] [30 40 20] [7 9 6]))
+(key (select {by: {a: x b: (* y 2)} from: Tckp3 where: (> y 15)})) -- ['a 'b 'x 'y 'z]
+(select {by: {k: (* x 2)} from: Tckp3 where: (> y 15) desc: k take: 2}) -- (table [k x y z] (list [8 6] [4 3] [40 30] [9 7]))

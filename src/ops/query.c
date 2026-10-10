@@ -10218,7 +10218,9 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, bool aliases_resolved,
                 n_keep = collect_col_refs_set(dict_elems[i + 1], tbl,
                                               keep_syms, (int)ncols_max, n_keep);
             }
-            int can_project = (n_keep > 0 && n_keep < ncols_max);
+            /* A select with no outputs returns every column of the table,
+             * in its order: there is nothing to narrow. */
+            int can_project = (n_out > 0 && n_keep > 0 && n_keep < ncols_max);
             ray_t* narrow_tbl = NULL;
             if (can_project) {
                 narrow_tbl = project_table_cols(tbl, keep_syms, n_keep);
