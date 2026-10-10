@@ -2559,7 +2559,10 @@ static ray_t* vm_exec_rows(ray_t* lambda, ray_t** call_args, int64_t argc,
     ray_t *vm_block = ray_alloc(sizeof(ray_exec_t));
     if (!vm_block || RAY_IS_ERR(vm_block)) return ray_error("oom", NULL);
     ray_exec_t *vmp = (ray_exec_t *)ray_data(vm_block);
-    memset(vmp, 0, sizeof(ray_exec_t));
+    /* Only the header needs clearing: every stack, return and trap slot is
+     * written before it is read, and the locals are set below.  Zeroing
+     * the whole block cost more than a small call's body. */
+    vmp->sp = 0; vmp->fp = 0; vmp->rp = 0; vmp->tp = 0; vmp->fn = NULL;
 
 #define vm (*vmp)
 
@@ -2570,12 +2573,16 @@ static ray_t* vm_exec_rows(ray_t* lambda, ray_t** call_args, int64_t argc,
     vm.fp = 0;
     vm.sp = n_locals;
 
-    /* Bind parameters into local slots */
+    /* Bind parameters into local slots; the other locals start empty */
     int64_t param_count = ray_len(LAMBDA_PARAMS(lambda));
     for (int64_t i = 0; i < param_count && i < argc; i++) {
         ray_retain(call_args[i]);
         vm.ps[i] = call_args[i];
-        if (i < 64) vm.rows[i] = (uint8_t)((row_args >> i) & 1);
+        vm.rows[i] = i < 64 ? (uint8_t)((row_args >> i) & 1) : 0;
+    }
+    for (int32_t i = (int32_t)(param_count < argc ? param_count : argc); i < n_locals; i++) {
+        vm.ps[i] = NULL;
+        vm.rows[i] = 0;
     }
 
     uint8_t *code = (uint8_t *)ray_data(LAMBDA_BC(lambda));
