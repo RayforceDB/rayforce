@@ -113,32 +113,33 @@ ray_err_t ray_col_stream_append(ray_col_stream_t* w,
         /* Import strings directly into the file domain, avoiding a second
          * global runtime dictionary and a runtime-id-to-file-id pass. */
         enum { BATCH = 8192 };
-        const char* strings[BATCH]; size_t lengths[BATCH];
-        uint64_t hashes[BATCH]; uint32_t positions[BATCH]; int64_t ids[BATCH];
-        /* One hash a string, all 64 bits: an import domain keys on them
-         * (ray_sym_domain_intern_batch64, which would otherwise hash the
-         * strings again), the others on the low 32, a batch in one call. */
+        const char* strings[BATCH]; size_t lengths[BATCH]; int64_t ids[BATCH];
+        /* The batch's hashes, then (they are no longer read once the batch
+         * is interned) the positions written: one array's room on a worker's
+         * stack, as when the hashes were 32 bits wide. */
+        union { uint64_t h64[BATCH]; uint32_t h32[BATCH]; uint32_t pos[BATCH]; } u;
+        /* One hash a string: all 64 bits for an import domain, which keys on
+         * them (ray_sym_domain_intern_batch64, which would otherwise hash
+         * the strings again), the low 32 for the others. */
         bool wide = ray_sym_domain_import(w->dom) != NULL;
         for (int64_t off = 0; off < n; off += BATCH) {
             if (ray_interrupted()) return RAY_ERR_CANCEL;
             int64_t count = n-off < BATCH ? n-off : BATCH;
-            for (int64_t i = 0; i < count; i++) {
-                strings[i] = ray_str_vec_get(col,off+i,&lengths[i]);
-                hashes[i] = ray_hash_bytes(strings[i],lengths[i]);
-            }
+            for (int64_t i = 0; i < count; i++) strings[i] = ray_str_vec_get(col,off+i,&lengths[i]);
             bool ok;
-            if (wide) ok = ray_sym_domain_intern_batch64(w->dom,count,strings,lengths,hashes,ids);
-            else {
-                uint32_t* h32 = positions;   /* unused until the positions are written */
-                for (int64_t i = 0; i < count; i++) h32[i] = (uint32_t)hashes[i];
-                ok = ray_sym_domain_intern_batch(w->dom,count,strings,lengths,h32,ids);
+            if (wide) {
+                for (int64_t i = 0; i < count; i++) u.h64[i] = ray_hash_bytes(strings[i],lengths[i]);
+                ok = ray_sym_domain_intern_batch64(w->dom,count,strings,lengths,u.h64,ids);
+            } else {
+                for (int64_t i = 0; i < count; i++) u.h32[i] = (uint32_t)ray_hash_bytes(strings[i],lengths[i]);
+                ok = ray_sym_domain_intern_batch(w->dom,count,strings,lengths,u.h32,ids);
             }
             if (!ok) return RAY_ERR_OOM;
             for (int64_t i = 0; i < count; i++) {
                 if (ids[i] < 0 || (uint64_t)ids[i] >= UINT32_MAX) return RAY_ERR_RANGE;
-                positions[i] = (uint32_t)ids[i]; if (!ids[i]) w->had_nulls = true;
+                u.pos[i] = (uint32_t)ids[i]; if (!ids[i]) w->had_nulls = true;
             }
-            if (fwrite(positions,sizeof(*positions),(size_t)count,w->fp) != (size_t)count) return RAY_ERR_IO;
+            if (fwrite(u.pos,sizeof(*u.pos),(size_t)count,w->fp) != (size_t)count) return RAY_ERR_IO;
         }
     } else if (w->type == RAY_STR) {
         uint64_t bytes = col->str_pool ? (uint64_t)col->str_pool->len : 0;
