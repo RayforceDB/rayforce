@@ -325,6 +325,23 @@ bool ray_symimp_reserve(ray_symimp_t* m, int64_t n, int64_t bytes, int64_t* pos0
         ok = si_grow(m, want);
         if (ok) m->fsize = want;
     }
+    if (ok && !m->reserved &&
+        !atomic_load_explicit(&m->active[0], memory_order_acquire) &&
+        !atomic_load_explicit(&m->active[1], memory_order_acquire)) {
+        /* From the first reservation on the shard tables are never read
+         * again (ray_symimp_intern_batch refuses): their memory goes back
+         * now, not when the dictionary is freed, which leaves it to the
+         * grouped passes that follow. */
+        for (int i = 0; i < SI_SHARDS; i++) {
+            ray_sys_free(atomic_load_explicit(&m->shards[i].tab, memory_order_relaxed));
+            atomic_store_explicit(&m->shards[i].tab, NULL, memory_order_relaxed);
+            m->shards[i].used = 0;
+        }
+        for (int k = 0; k < 2; k++) {
+            for (si_tab_t* t = m->retired[k]; t;) { si_tab_t* nx = t->next; ray_sys_free(t); t = nx; }
+            m->retired[k] = NULL;
+        }
+    }
     if (ok) {
         m->reserved = true;
         *pos0 = m->count; *off0 = m->tail;
@@ -472,11 +489,22 @@ void ray_symimp_stats(ray_symimp_t* m, ray_symimp_stats_t* out) {
     out->rec_bytes = m->tail;
     for (int i = 0; i < SI_SHARDS; i++) {
         const si_tab_t* t = atomic_load_explicit(&m->shards[i].tab, memory_order_relaxed);
-        out->tab_bytes += (int64_t)(sizeof(si_tab_t) + (t->mask + 1) * sizeof(uint64_t));
+        if (t) out->tab_bytes += (int64_t)(sizeof(si_tab_t) + (t->mask + 1) * sizeof(uint64_t));
     }
     for (int c = 0; c < SI_OFF_CHUNKS; c++)
         if (m->offc[c]) out->off_bytes += (int64_t)(((size_t)1 << SI_OFF_LOG) * sizeof(uint64_t));
     pthread_mutex_unlock(&m->alock);
+}
+
+int64_t ray_symimp_index_bytes(ray_symimp_t* m) {
+    int64_t bytes = 0;
+    pthread_mutex_lock(&m->alock);
+    for (int i = 0; i < SI_SHARDS; i++) {
+        const si_tab_t* t = atomic_load_explicit(&m->shards[i].tab, memory_order_relaxed);
+        if (t) bytes += (int64_t)(sizeof(si_tab_t) + (t->mask + 1) * sizeof(uint64_t));
+    }
+    pthread_mutex_unlock(&m->alock);
+    return bytes;
 }
 
 void ray_symimp_free(ray_symimp_t* m) {
@@ -503,6 +531,7 @@ bool ray_symimp_intern_batch(ray_symimp_t* m, int64_t n, const char* const* strs
 }
 ray_err_t ray_symimp_sync(ray_symimp_t* m, bool durable) { (void)m; (void)durable; return RAY_ERR_IO; }
 void ray_symimp_free(ray_symimp_t* m) { (void)m; }
+int64_t ray_symimp_index_bytes(ray_symimp_t* m) { (void)m; return 0; }
 void ray_symimp_stats(ray_symimp_t* m, ray_symimp_stats_t* out) { (void)m; *out = (ray_symimp_stats_t){0}; }
 bool ray_symimp_reserve(ray_symimp_t* m, int64_t n, int64_t bytes, int64_t* pos0, int64_t* off0) {
     (void)m; (void)n; (void)bytes; (void)pos0; (void)off0; return false;

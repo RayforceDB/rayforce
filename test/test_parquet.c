@@ -1314,6 +1314,10 @@ static test_result_t test_pq_sym_mixed_modes(void) {
             fprintf(stderr, "  %d/%d: s %s, t %s, grouped passes %d, adopted %.0f\n", v, run, s_direct ? "direct" : "grouped",
                     t_grouped ? "grouped" : "direct", passes, adopted);
             if (run < 3 ? !s_direct || !t_grouped || passes != 1 || adopted != 40 : s_direct || !t_grouped || passes != 2) bad++;
+            /* the direct passes' shard tables freed at the first reservation:
+             * none through the grouped passes */
+            double tabs = pq_trace_sum(trace, "imp_index_kb", NULL);
+            if (tabs != 0) { fprintf(stderr, "  %d/%d: the import dictionary's shard tables kept, %.0f KB\n", v, run, tabs); bad++; }
             if (run == 1 || run == 2) {
                 /* the direct pass's positions too: s's dictionaries seeded
                  * in row-group order */

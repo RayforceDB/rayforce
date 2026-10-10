@@ -2765,7 +2765,7 @@ static void pq_sym_grouped(pq_direct_work* dw, ray_symgrp_t* g, ray_symimp_t* im
         static const char* orders[] = {"rows","shards","freq","rowsflat"};
         fprintf(stderr,"parquet symgrp: col=%.*s order=%s groups=%d windows=%lld rows=%lld gens=%lld staged=%lld stage_mb=%.1f arena_mb=%.1f"
                 " owners=%lld again=%lld again_mb=%.1f old=%lld refs=%lld log_loaded=%lld budget_mb=%.0f store_cap_mb=%.0f store_pos=%lld store_spans=%lld store_mb=%.1f"
-                " store_read_mb=%.1f store_kept=%lld deferred=%lld settle_read_mb=%.1f compares=%lld cmp_mb=%.1f collisions=%lld redo=%lld entries=%lld rec_bytes=%lld wb_bytes=%lld adopted=%lld\n",
+                " store_read_mb=%.1f store_kept=%lld deferred=%lld settle_read_mb=%.1f compares=%lld cmp_mb=%.1f collisions=%lld redo=%lld entries=%lld rec_bytes=%lld wb_bytes=%lld adopted=%lld imp_index_kb=%lld\n",
                 (int)ray_str_len(nm),ray_str_ptr(nm),orders[ray_symgrp_order(g)],groups,(long long)st.windows,
                 (long long)atomic_load(&w.rows),(long long)atomic_load(&w.gens),(long long)st.staged,(double)st.stage_bytes/1048576.0,(double)arena/1048576.0,
                 (long long)st.owners,(long long)st.again,(double)st.again_bytes/1048576.0,(long long)st.old,(long long)st.refs,(long long)st.log_loaded,
@@ -2774,7 +2774,8 @@ static void pq_sym_grouped(pq_direct_work* dw, ray_symgrp_t* g, ray_symimp_t* im
                 (double)st.store_read/1048576.0,(long long)st.store_kept,
                 (long long)st.deferred,(double)st.settle_read/1048576.0,(long long)st.compares,(double)st.cmp_bytes/1048576.0,
                 (long long)st.collisions,(long long)st.redo,(long long)ray_symgrp_entries(g),
-                (long long)st.rec_bytes,(long long)st.wb_bytes,(long long)st.adopted);
+                (long long)st.rec_bytes,(long long)st.wb_bytes,(long long)st.adopted,
+                (long long)(ray_symimp_index_bytes(imp)/1024));
         fprintf(stderr,"parquet symgrp io:");
         pq_io_print("decode1",io0,io1,t0,t1);
         pq_io_print("resolve",io1,io2,t1,t2);
