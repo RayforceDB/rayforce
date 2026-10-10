@@ -155,3 +155,16 @@
 (set wrap (fn [inner] (concat (take base 2) (enlist inner))))
 (set build (fn [n] (let a (parse "k")) (times n (let a (wrap a))) a))
 (nil? ((eval (concat (take (parse "(fn [k] 0)") 2) (enlist (build 2000)))) 7)) -- false
+;; closures made by interpreted code share a template per literal and capture
+;; set too: two capture sets from one literal each keep their own values, and
+;; a second closure from the same literal adds no private bytecode
+(set mkd (fn [flag k] (if false (set 1 2)) (if flag (let extra 1)) (fn [] (list k (try extra 'none)))))
+(set dd1 (mkd true 1))
+(set dd2 (mkd false 2))
+(list (dd1) (dd2) (dd1) (dd2)) -- (list [1 1] (list 2 'none) [1 1] (list 2 'none))
+(set mk3 (fn [k] (if false (set 1 2)) (fn [] (+ k 1))))
+(set ee1 (mk3 1))
+(set ee2 (mk3 2))
+(list (ee1) (ee2)) -- [2 3]
+;; (made in one expression, so both carry the same source info)
+(do (set ee3 (mk3 3)) (set ee4 (mk3 4)) (ee3) (ee4) (< (- (.mem.objsize (list ee3 ee4)) (.mem.objsize ee3)) 500)) -- true

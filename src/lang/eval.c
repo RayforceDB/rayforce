@@ -2143,6 +2143,107 @@ ray_t* ray_times_fn(ray_t** args, int64_t n) {
 
 /* (fn [params...] body...) — create a lambda object.
  * Stores params list and body expressions in data area. */
+/* Closures made by interpreted code (the top level, a lambda that could not
+ * compile, a literal inside a special form the compiler hands to the tree
+ * walker) share one compiled template per literal and capture set, as
+ * closures made by compiled code share theirs (OP_MKCLOSURE): the body's
+ * bytecode depends only on which captured names it mentions.  The entry
+ * retains the literal's parameter and body nodes, so their addresses stay
+ * its own while it lives; a literal is matched by them and by its capture
+ * names.  A lambda that is query text (LAMBDA_CAPQ) stays interpreted and
+ * never comes here. */
+typedef struct {
+    ray_t*  params;    /* the literal's parameter node */
+    ray_t*  body0;     /* its first body node */
+    ray_t*  bodyn;     /* its last body node */
+    int64_t nbody;
+    ray_t*  names;     /* capture names (SYM vector) or NULL */
+    ray_t*  tmpl;      /* the compiled template */
+} closure_tmpl_t;
+enum { CLOSURE_TMPL_SLOTS = 256 };
+static _Thread_local closure_tmpl_t g_closure_tmpl[CLOSURE_TMPL_SLOTS];
+static _Thread_local uint32_t g_closure_tmpl_next;
+static _Thread_local uint64_t g_closure_tmpl_epoch;
+
+static void closure_tmpl_drop(closure_tmpl_t* e) {
+    if (e->params) ray_release(e->params);
+    if (e->body0) ray_release(e->body0);
+    if (e->bodyn) ray_release(e->bodyn);
+    if (e->names) ray_release(e->names);
+    if (e->tmpl) ray_release(e->tmpl);
+    memset(e, 0, sizeof *e);
+}
+
+/* The runtime is going away with everything the entries retain. */
+static void closure_tmpl_reset(void) {
+    for (int i = 0; i < CLOSURE_TMPL_SLOTS; i++) closure_tmpl_drop(&g_closure_tmpl[i]);
+    g_closure_tmpl_next = 0;
+    g_closure_tmpl_epoch = 0;
+}
+
+static bool closure_names_equal(const ray_t* a, const ray_t* b) {
+    int64_t la = a ? a->len : 0, lb = b ? b->len : 0;
+    if (la != lb) return false;
+    for (int64_t i = 0; i < la; i++)
+        if (ray_read_sym(ray_data((ray_t*)a), i, RAY_SYM, a->attrs) != ray_read_sym(ray_data((ray_t*)b), i, RAY_SYM, b->attrs)) return false;
+    return true;
+}
+
+static void closure_share_from(ray_t* lambda, ray_t* tmpl) {
+    if (LAMBDA_BC(tmpl))     { ray_retain(LAMBDA_BC(tmpl));     LAMBDA_BC(lambda)     = LAMBDA_BC(tmpl); }
+    if (LAMBDA_CONSTS(tmpl)) { ray_retain(LAMBDA_CONSTS(tmpl)); LAMBDA_CONSTS(lambda) = LAMBDA_CONSTS(tmpl); }
+    if (LAMBDA_DBG(tmpl))    { ray_retain(LAMBDA_DBG(tmpl));    LAMBDA_DBG(lambda)    = LAMBDA_DBG(tmpl); }
+    LAMBDA_NLOCALS(lambda) = LAMBDA_NLOCALS(tmpl);
+    lambda->attrs |= RAY_FN_COMPILED;
+}
+
+static void closure_share_template(ray_t* lambda) {
+    ray_t* body = LAMBDA_BODY(lambda);
+    ray_t* params = LAMBDA_PARAMS(lambda);
+    if (!body || body->type != RAY_LIST || body->len == 0 || !params) return;
+    if (g_closure_tmpl_epoch != ray_sym_epoch()) {
+        for (int i = 0; i < CLOSURE_TMPL_SLOTS; i++) closure_tmpl_drop(&g_closure_tmpl[i]);
+        g_closure_tmpl_epoch = ray_sym_epoch();
+    }
+    ray_t* body0 = ((ray_t**)ray_data(body))[0];
+    ray_t* bodyn = ((ray_t**)ray_data(body))[body->len - 1];
+    ray_t* names = ray_closure_capture_names(lambda);
+    for (int i = 0; i < CLOSURE_TMPL_SLOTS; i++) {
+        closure_tmpl_t* e = &g_closure_tmpl[i];
+        if (e->tmpl && e->params == params && e->body0 == body0 && e->bodyn == bodyn &&
+            e->nbody == body->len && closure_names_equal(e->names, names)) {
+            closure_share_from(lambda, e->tmpl);
+            if (names) ray_release(names);
+            return;
+        }
+    }
+    ray_t* tmpl = ray_alloc(LAMBDA_SLOTS * sizeof(ray_t*));
+    if (!tmpl || RAY_IS_ERR(tmpl)) { if (names) ray_release(names); return; }
+    tmpl->type = RAY_LAMBDA;
+    tmpl->attrs = 0;
+    tmpl->len = 0;
+    memset(ray_data(tmpl), 0, LAMBDA_SLOTS * sizeof(ray_t*));
+    ray_retain(params); LAMBDA_PARAMS(tmpl) = params;
+    ray_retain(body);   LAMBDA_BODY(tmpl) = body;
+    if (LAMBDA_NFO(lambda)) { ray_retain(LAMBDA_NFO(lambda)); LAMBDA_NFO(tmpl) = LAMBDA_NFO(lambda); }
+    if (!ray_compile_with_captures(tmpl, names)) {
+        /* Not compilable this way: the closure stays as it is and compiles,
+         * or not, when it is called. */
+        ray_release(tmpl);
+        if (names) ray_release(names);
+        return;
+    }
+    closure_tmpl_t* e = &g_closure_tmpl[g_closure_tmpl_next++ % CLOSURE_TMPL_SLOTS];
+    closure_tmpl_drop(e);
+    ray_retain(params); e->params = params;
+    ray_retain(body0);  e->body0 = body0;
+    ray_retain(bodyn);  e->bodyn = bodyn;
+    e->nbody = body->len;
+    e->names = names;   /* owned, may be NULL */
+    e->tmpl = tmpl;     /* owned */
+    closure_share_from(lambda, tmpl);
+}
+
 ray_t* ray_fn(ray_t** args, int64_t n) {
     if (n < 2) return ray_error("domain", "fn: expected at least 2 args (params body), got %lld", (long long)n);
     /* args[0] = param vector (list of name symbols), args[1..n-1] = body exprs */
@@ -2234,6 +2335,13 @@ ray_t* ray_fn(ray_t** args, int64_t n) {
     }
     LAMBDA_DBG(lambda) = NULL;
     LAMBDA_CLOSURE(lambda) = closure;
+
+    /* Share the literal's compiled template unless the lambda is query text
+     * or has a closure the compiler cannot bind (see ray_compile). */
+    if (!capq && (!closure || (closure->type == RAY_DICT && ray_dict_keys(closure) &&
+                               ray_dict_vals(closure) && ray_dict_keys(closure)->type == RAY_SYM &&
+                               ray_dict_vals(closure)->type == RAY_LIST)))
+        closure_share_template(lambda);
 
     return lambda;
 }
@@ -4214,6 +4322,7 @@ ray_err_t ray_lang_init(void) {
 
 void ray_lang_destroy(void) {
     if (__VM && __VM->raise_val) { ray_release(__VM->raise_val); __VM->raise_val = NULL; }
+    closure_tmpl_reset();
     /* Reset global Datalog rule storage */
     ray_dl_reset_rules();
     ray_env_destroy();

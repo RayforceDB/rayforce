@@ -978,6 +978,9 @@ static bool compile_fn_template_at(compiler_t *c, ray_t *ast) {
     return true;
 }
 
+ray_t *ray_closure_capture_names(ray_t *lambda) { return closure_capture_names(lambda); }
+bool ray_compile_with_captures(ray_t *lambda, ray_t *capnames) { return compile_lambda(lambda, capnames); }
+
 void ray_compile(ray_t *lambda) {
     if (LAMBDA_IS_COMPILED(lambda)) return;
     if (!closure_shape_ok(LAMBDA_CLOSURE(lambda))) return;

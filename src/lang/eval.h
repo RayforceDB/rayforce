@@ -201,6 +201,12 @@ ray_t* ray_eval_str(const char* source);
 
 /* Compile a lambda's body to bytecode. Called lazily on first invocation. */
 void ray_compile(ray_t* lambda);
+/* The capture names a closure's body can reach (its dict keys the body
+ * mentions; all of them under eval/resolve), as a SYM vector or NULL. */
+ray_t* ray_closure_capture_names(ray_t* lambda);
+/* Compile `lambda` with `capnames` bound as locals ahead of the body; false
+ * when the body cannot be compiled. */
+bool   ray_compile_with_captures(ray_t* lambda, ray_t* capnames);
 
 /* Reset compiler cached state (call from ray_lang_destroy). */
 void ray_compile_reset(void);

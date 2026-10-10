@@ -191,14 +191,20 @@ static test_result_t test_query_helper_reinit(void) {
  * closure stays on the tree walker, whose capture binding reports a type
  * error, inside and outside a query. */
 static test_result_t test_closure_malformed_capture(void) {
-    /* A closure made by interpreted code (a top-level `do`): not compiled
-     * yet, so the compile gate decides. */
+    /* A closure as the deserializer hands it back: no bytecode yet, so the
+     * compile gate decides.  (A closure made by interpreted code shares
+     * its literal's template at birth; strip that to get the shape.) */
     ray_t* lam = ray_eval_str("(do (let k 1) (fn [v] (+ v k)))");
     TEST_ASSERT_NOT_NULL(lam);
     TEST_ASSERT_FALSE(RAY_IS_ERR(lam));
     TEST_ASSERT_EQ_I(lam->type, RAY_LAMBDA);
-    TEST_ASSERT(!LAMBDA_IS_COMPILED(lam), "a closure made by the tree walker starts uncompiled");
     TEST_ASSERT_NOT_NULL(LAMBDA_CLOSURE(lam));
+    if (LAMBDA_BC(lam)) { ray_release(LAMBDA_BC(lam)); LAMBDA_BC(lam) = NULL; }
+    if (LAMBDA_CONSTS(lam)) { ray_release(LAMBDA_CONSTS(lam)); LAMBDA_CONSTS(lam) = NULL; }
+    if (LAMBDA_DBG(lam)) { ray_release(LAMBDA_DBG(lam)); LAMBDA_DBG(lam) = NULL; }
+    LAMBDA_NLOCALS(lam) = 0;
+    lam->attrs &= (uint8_t)~RAY_FN_COMPILED;
+    TEST_ASSERT(!LAMBDA_IS_COMPILED(lam), "the closure is uncompiled before the call");
     /* Replace the closure's values with a typed vector of the same length. */
     ray_t* keys = ray_dict_keys(LAMBDA_CLOSURE(lam));
     ray_t* vals = ray_vec_new(RAY_I64, keys->len);
