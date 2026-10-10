@@ -1843,13 +1843,8 @@ static void pq_trade_buffers(pq_column* c, pq_column* spare) {
 
 /* Byte range of every column chunk — from its dictionary page (or first
  * data page) for total_compressed bytes — and each column's uncompressed
- * total.  `col_vocab` (may be NULL): each column's distinct strings'
- * bytes, bounded from the footer alone: a chunk's dictionary page (its
- * stored bytes), or the whole chunk where it has none or holds more than
- * the dictionary's ids could take (at most 4 bytes and a level a value:
- * the writer fell back to PLAIN pages).  False when a row group's metadata
- * cannot be read. */
-static bool pq_chunk_ranges(ray_parquet_t* r, int64_t* lo, int64_t* hi, int64_t* col_bytes, int64_t* col_vocab) {
+ * total.  False when a row group's metadata cannot be read. */
+static bool pq_chunk_ranges(ray_parquet_t* r, int64_t* lo, int64_t* hi, int64_t* col_bytes) {
     pq_span* cols = ray_calloc_raw((size_t)r->ncols*sizeof(*cols));
     bool ok = cols != NULL;
     for (int64_t g = 0; ok && g < r->ngroups; g++) {
@@ -1862,18 +1857,97 @@ static bool pq_chunk_ranges(ray_parquet_t* r, int64_t* lo, int64_t* hi, int64_t*
             int64_t data = pq_get(mf[9],-1), dict = pq_get(mf[11],-1), bytes = pq_get(mf[7],-1);
             int64_t raw = pq_get(mf[6],-1), start = dict > 0 && dict < data ? dict : data;
             if (raw > 0) col_bytes[c] = raw > INT64_MAX - col_bytes[c] ? INT64_MAX : col_bytes[c] + raw;
-            if (col_vocab && raw > 0) {
-                int64_t values = pq_get(mf[5],-1), v = raw;
-                if (dict > 0 && dict < data && values >= 0 && values < INT64_MAX/8 && raw - (data-dict) <= values*5 + 4096)
-                    v = data-dict < raw ? data-dict : raw;
-                col_vocab[c] = v > INT64_MAX - col_vocab[c] ? INT64_MAX : col_vocab[c] + v;
-            }
             if (start < 0 || bytes < 0 || start > (int64_t)r->size || bytes > (int64_t)r->size - start) continue;
             lo[i] = start; hi[i] = start + bytes;
         }
     }
     ray_free_raw(cols);
     return ok;
+}
+
+/* What the direct import holds a distinct string by, beyond its bytes: its
+ * record's offset, its slot in the shard tables at their load factor, the
+ * tables' doubling. */
+#define PQ_DIRECT_STRING_COST 48
+/* A chunk's dictionary page header: its decoded bytes (every entry's
+ * length prefix and bytes) and its entries.  False when it cannot be read
+ * here. */
+static bool pq_dict_header(ray_parquet_t* r, int64_t dict, int64_t* raw, int64_t* entries) {
+    if (dict < 4 || (uint64_t)dict >= r->data_end) return false;
+    pq_cur c = {r->map+dict,r->map+r->data_end,false};
+    const uint8_t* start = c.p;
+    if (!pq_skip(&c,12,0,false)) return false;
+    pq_span f[10], h[4];
+    if (!pq_fields((pq_span){start,c.p,12},f,10) || pq_get(f[1],-1) != 2 || !pq_fields(f[7],h,4)) return false;
+    *raw = pq_get(f[2],-1); *entries = pq_get(h[1],-1);
+    return *raw >= 0 && *entries >= 0;
+}
+/* From a chunk's encoding stats (ColumnMetaData 13): 1 when one of its data
+ * pages is not dictionary-encoded (a writer's PLAIN fallback, or another
+ * encoding of the values themselves), 0 when none is, -1 when there are no
+ * stats or they cannot be read. */
+static int pq_value_pages(pq_span stats) {
+    if (stats.type != 9) return -1;
+    pq_cur c = {stats.p,stats.end,false};
+    uint8_t et; uint64_t n = pq_list(&c,&et);
+    if (c.bad || et != 12) return -1;
+    int any = 0;
+    for (uint64_t i = 0; i < n; i++) {
+        pq_span e, f[4];
+        if (!pq_element(&c,et,&e) || !pq_fields(e,f,4)) return -1;
+        int64_t kind = pq_get(f[1],-1), enc = pq_get(f[2],-1), count = pq_get(f[3],-1);
+        if (kind < 0 || enc < 0) return -1;
+        if ((kind == 0 || kind == 3) && enc != 2 && enc != 8 && count != 0) any = 1;
+    }
+    return any;
+}
+/* An upper bound on the memory the direct import would hold for a symbol
+ * chunk's distinct strings: their bytes and PQ_DIRECT_STRING_COST each.  A
+ * dictionary page counts its decoded bytes and entries (from its header);
+ * the data pages count only when they may hold the values themselves: no
+ * dictionary, the encoding stats naming such a page, or no stats at all
+ * (unsure: then every data byte may be a string's, a string at least the 4
+ * bytes of its length prefix).  An unreadable dictionary header counts the
+ * whole chunk so. */
+static int64_t pq_chunk_vocab(ray_parquet_t* r, pq_span* mf) {
+    int64_t raw = pq_get(mf[6],-1), values = pq_get(mf[5],-1);
+    int64_t data = pq_get(mf[9],-1), dict = pq_get(mf[11],-1);
+    if (raw <= 0) return 0;
+    if (values < 0 || values > raw) values = raw;
+    int64_t draw, entries, rest = raw, bound = 0;
+    if (dict > 0 && dict < data && pq_dict_header(r,dict,&draw,&entries)) {
+        bound = draw + PQ_DIRECT_STRING_COST*entries;
+        rest = pq_value_pages(mf[13]) == 0 ? 0 : raw > draw ? raw - draw : raw;
+    }
+    int64_t n = rest / 4 < values ? rest / 4 : values;
+    return bound + rest + PQ_DIRECT_STRING_COST*n;
+}
+/* The symbol columns' bounds (pq_chunk_vocab), summed over the row groups,
+ * into vocab[c] for the columns order[from, to).  The dictionary page
+ * headers are asked for all at once first (one small read each, in flight
+ * together) and then parsed. */
+static void pq_vocab_bounds(ray_parquet_t* r, const int64_t* order, int64_t from, int64_t to, int64_t* vocab) {
+    pq_span* cols = ray_calloc_raw((size_t)r->ncols*sizeof(*cols));
+    for (int64_t i = from; i < to; i++) vocab[order[i]] = cols ? 0 : INT64_MAX;
+    if (!cols) return;
+    for (int pass = 0; pass < 2; pass++)
+        for (int64_t g = 0; g < r->ngroups; g++) {
+            int64_t rows = 0;
+            bool ok = pq_group_columns(r,g,cols,&rows,NULL);
+            for (int64_t i = from; i < to; i++) {
+                int64_t c = order[i]; pq_span mf[17];
+                if (!ok || !pq_fields(cols[c],mf,17)) { if (pass) vocab[c] = INT64_MAX; continue; }
+                if (!pass) {
+                    int64_t dict = pq_get(mf[11],-1);
+                    if (dict >= 4 && (uint64_t)dict < r->data_end)
+                        ray_vm_advise_willneed(r->map + dict,(size_t)(r->data_end - (uint64_t)dict < 256 ? r->data_end - (uint64_t)dict : 256));
+                    continue;
+                }
+                int64_t v = pq_chunk_vocab(r,mf);
+                vocab[c] = v > INT64_MAX - vocab[c] ? INT64_MAX : vocab[c] + v;
+            }
+        }
+    ray_free_raw(cols);
 }
 
 /* A mapped column chunk is read on first touch, one fault at a time per
@@ -2701,7 +2775,7 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
     int64_t* lo = ray_alloc_raw((size_t)(chunks+1)*sizeof(*lo));
     int64_t* hi = ray_alloc_raw((size_t)(chunks+1)*sizeof(*hi));
     int64_t* bytes = ray_calloc_raw((size_t)r->ncols*sizeof(*bytes));
-    int64_t* vocab = ray_calloc_raw((size_t)r->ncols*sizeof(*vocab));   /* pq_chunk_ranges */
+    int64_t* vocab = ray_calloc_raw((size_t)r->ncols*sizeof(*vocab));   /* pq_vocab_bounds */
     int64_t* order = ray_alloc_raw((size_t)r->ncols*sizeof(*order));
     _Atomic uint8_t* prefetched = NULL;
     pq_column* spare = NULL;   /* pq_direct_work.spare */
@@ -2725,7 +2799,7 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
         if (!pq_fields(r->groups[g],fields,8)) { err = pq_error("invalid row group"); goto done; }
         offsets[g+1] = offsets[g]+pq_get(fields[3],0);
     }
-    bool ranges = pq_chunk_ranges(r,lo,hi,bytes,vocab);
+    bool ranges = pq_chunk_ranges(r,lo,hi,bytes);
     /* numeric columns in schema order, then symbol columns by size */
     int64_t nnum = 0, n = 0;
     for (int64_t c = 0; c < r->ncols; c++) if (writers[c].type != RAY_SYM) order[n++] = c;
@@ -2796,12 +2870,13 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
      * dictionary) unless their strings would make it too big to probe at
      * random: then grouped (table/symgrp.h), column by column.  Decided from
      * their chunks' uncompressed bytes against a quarter of memory, and
-     * then column by column: a column whose vocabulary (pq_chunk_ranges'
-     * bound) is a small share of memory still goes direct, decoded once,
-     * smallest first while those columns' vocabularies stay within a
-     * sixteenth together.  The direct columns go first (the dictionary's
-     * index serves only them), the grouped ones after them, which take
-     * the direct ones' strings into their own index (ray_symgrp_adopt).
+     * then column by column: a column whose vocabulary (pq_vocab_bounds:
+     * what the direct import would hold for it, at most) is a small share
+     * of memory still goes direct, decoded once, smallest first while those
+     * columns' vocabularies stay within a sixteenth together.  The direct
+     * columns go first (the dictionary's index serves only them), the
+     * grouped ones after them, which take the direct ones' strings into
+     * their own index (ray_symgrp_adopt).
      * RAY_PQ_SYM_MODE=direct|grouped decides for every column instead, and
      * RAY_PQ_SYM_ORDER (rows|shards|freq|rowsflat) and RAY_PQ_SYM_GROUPS set
      * the grouped import's order of new positions and hash groups.  Debug
@@ -2821,10 +2896,12 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
 #endif
     simp = nnum < r->ncols ? ray_sym_domain_import(writers[order[nnum]].dom) : NULL;
     int64_t nd = r->ncols;   /* order[nnum, nd): direct symbol columns, [nd, ncols): grouped */
+    bool bounded = false;    /* vocab[] filled (pq_vocab_bounds) */
     if (mode == PQ_SYM_AUTO && simp) {
         int64_t text = 0;
         for (int64_t i = nnum; i < r->ncols; i++) text = bytes[order[i]] > INT64_MAX - text ? INT64_MAX : text + bytes[order[i]];
         mode = sram > 0 && text > sram / 4 ? PQ_SYM_GROUPED : PQ_SYM_DIRECT;
+        if (mode == PQ_SYM_GROUPED) { pq_vocab_bounds(r,order,nnum,r->ncols,vocab); bounded = true; }
         if (mode == PQ_SYM_GROUPED) {
             /* the direct ones, marked by a negated vocabulary */
             int64_t sum = 0, ndirect = 0;
@@ -2862,12 +2939,13 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
         if (!sgrp) { err = ray_error("oom",NULL); goto done; }
         if (nd == r->ncols) nd = nnum;   /* forced: every symbol column grouped */
     } else nd = r->ncols;
+    if (trace && simp && !bounded) pq_vocab_bounds(r,order,nnum,r->ncols,vocab);   /* for the trace */
     if (trace && simp)
         for (int64_t i = nnum; i < r->ncols; i++) {
             ray_t* nm = ray_sym_str(r->schema[order[i]].name);
-            fprintf(stderr,"parquet symcol: col=%.*s text_mb=%.3f vocab_mb=%.3f mode=%s\n",
-                    (int)ray_str_len(nm),ray_str_ptr(nm),(double)bytes[order[i]]/1048576.0,
-                    (double)vocab[order[i]]/1048576.0,i < nd ? "direct" : "grouped");
+            fprintf(stderr,"parquet symcol: col=%.*s text_mb=%.3f text_bytes=%lld vocab_mb=%.3f vocab_bytes=%lld mode=%s\n",
+                    (int)ray_str_len(nm),ray_str_ptr(nm),(double)bytes[order[i]]/1048576.0,(long long)bytes[order[i]],
+                    (double)vocab[order[i]]/1048576.0,(long long)vocab[order[i]],i < nd ? "direct" : "grouped");
         }
     if (!sgrp && nnum < r->ncols && writers[order[nnum]].dom) {
         symf.dom = writers[order[nnum]].dom;

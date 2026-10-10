@@ -370,6 +370,14 @@ static void pb_list(pq_buf* b, int n, int type) {
     if (n < 15) pb_byte(b, (uint8_t)((n << 4) | type));
     else { pb_byte(b, (uint8_t)(0xf0 | type)); pb_var(b, (uint64_t)n); }
 }
+/* ColumnMetaData 13, a chunk's encoding stats: a dictionary page, data
+ * pages of dictionary ids, data pages of PLAIN values, as given. */
+static void pb_enc_stats(pq_buf* f, int* last, bool dict, bool ids, bool plain) {
+    pb_field(f, last, 13, PB_LIST); pb_list(f, (int)dict + (int)ids + (int)plain, PB_STRUCT);
+    if (dict) { int l = 0; pb_i(f, &l, 1, PB_I32, 2); pb_i(f, &l, 2, PB_I32, 0); pb_i(f, &l, 3, PB_I32, 1); pb_byte(f, 0); }
+    if (ids) { int l = 0; pb_i(f, &l, 1, PB_I32, 0); pb_i(f, &l, 2, PB_I32, 8); pb_i(f, &l, 3, PB_I32, 1); pb_byte(f, 0); }
+    if (plain) { int l = 0; pb_i(f, &l, 1, PB_I32, 0); pb_i(f, &l, 2, PB_I32, 0); pb_i(f, &l, 3, PB_I32, 1); pb_byte(f, 0); }
+}
 /* Columns x, s (fn of the row) and t (fn of the row + rows / 2: a
  * vocabulary that meets s's, for the second column's pass).  A test may set
  * pq_synth_t, column t's own function of the row, and pq_synth_dict, the
@@ -497,6 +505,7 @@ static bool pq_synth(const char* path, int64_t rows, int64_t groups, pq_synth_fn
             pb_i(&f, &lm, 7, PB_I64, sz[i]);
             pb_i(&f, &lm, 9, PB_I64, dat[i] >= 0 ? dat[i] : at[i]);
             if (dat[i] >= 0) pb_i(&f, &lm, 11, PB_I64, at[i]);
+            if (dat[i] >= 0) pb_enc_stats(&f, &lm, true, true, false);
             pb_byte(&f, 0);   /* meta */
             pb_byte(&f, 0);   /* column chunk */
             total += sz[i];
@@ -952,6 +961,16 @@ static bool pq_trace_line_has(const char* buf, const char* line, const char* tok
     const char* q = strstr(p, token);
     return q && (!e || q < e);
 }
+/* A field of the trace's first line starting with `line` (" key=value"),
+ * -1 when there is none. */
+static double pq_trace_line_num(const char* buf, const char* line, const char* key) {
+    const char* p = strstr(buf, line);
+    if (!p) return -1;
+    const char* e = strchr(p, '\n');
+    char pat[64]; snprintf(pat, sizeof(pat), " %s=", key);
+    const char* q = strstr(p, pat);
+    return q && (!e || q < e) ? strtod(q + strlen(pat), NULL) : -1;
+}
 /* The entries of an import's symbol file (its header count). */
 static int64_t pq_sym_count(const char* dir) {
     char path[200]; snprintf(path, sizeof(path), "%s/.sym", dir);
@@ -1228,7 +1247,7 @@ static test_result_t test_pq_sym_mixed_modes(void) {
     char src[160], dir[160];
     snprintf(src, sizeof(src), "/tmp/rayforce-pq-mixmode-%d.parquet", (int)getpid());
     snprintf(dir, sizeof(dir), "/tmp/rayforce-pq-mixmode-%d", (int)getpid());
-    const int64_t rows = 20000;
+    int64_t rows = 20000;
     int64_t tids[] = {ray_sym_intern("I32",3), ray_sym_intern("SYM",3), ray_sym_intern("SYM",3)};
     ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 3);
     const char* names[] = {"x","s","t"};
@@ -1238,7 +1257,10 @@ static test_result_t test_pq_sym_mixed_modes(void) {
     int bad = 0;
     for (int v = 0; v < 2; v++) {
         pq_synth_t = v ? pq_synth_sparse : pq_synth_highcard; pq_synth_dict = 1u << 1;
-        bool made = pq_synth(src, rows, 4, pq_synth_lowcard);
+        /* the sparse variant twice the rows in half the row groups: its text
+         * past a quarter of memory with s's bound in a sixty-fourth */
+        rows = v ? 40000 : 20000;
+        bool made = pq_synth(src, rows, v ? 2 : 4, pq_synth_lowcard);
         TEST_ASSERT_TRUE(made);
         TEST_ASSERT_EQ_I(pq_pool(1), RAY_OK);
         pq_set_symmode("direct");
@@ -1250,9 +1272,22 @@ static test_result_t test_pq_sym_mixed_modes(void) {
         pq_remove_native(dir, names, 3);
         /* the sparse column first by size */
         if (v && !(strstr(trace, "parquet symcol: col=t ") < strstr(trace, "parquet symcol: col=s "))) bad++;
+        /* the memory the decision assumes: s's bound just within its
+         * sixty-fourth, the symbol text past its quarter, t's bound past
+         * its sixty-fourth (the footer's bounds, from the trace) */
+        double bs = pq_trace_line_num(trace, "parquet symcol: col=s ", "vocab_bytes");
+        double bt = pq_trace_line_num(trace, "parquet symcol: col=t ", "vocab_bytes");
+        double text = pq_trace_line_num(trace, "parquet symcol: col=s ", "text_bytes") +
+                      pq_trace_line_num(trace, "parquet symcol: col=t ", "text_bytes");
+        int64_t sram = (int64_t)bs * 64;
+        char ramv[32]; snprintf(ramv, sizeof(ramv), "%lld", (long long)sram);
+        if (bs <= 0 || sram / 4 >= text || bt <= sram / 64) {
+            fprintf(stderr, "  %d: no memory size mixes them: s %.0f, t %.0f, text %.0f\n", v, bs, bt, text);
+            bad++;
+        }
         for (int run = 0; run < 3; run++) {
             TEST_ASSERT_EQ_I(pq_pool(run == 1 ? 4 : 1), RAY_OK);
-            pq_set_env("RAY_PQ_SYM_RAM", v ? "262144" : "1048576");
+            pq_set_env("RAY_PQ_SYM_RAM", ramv);
             pq_set_symmode(run == 2 ? "grouped" : NULL);
             res = pq_traced_import(src, dir, types, trace, cap);
             pq_sym_env_clear();
@@ -1868,7 +1903,7 @@ static test_result_t test_pq_sym_grouped_collision_determinism(void) {
  * the dictionary for the first half of the chunk's rows only and a PLAIN
  * page for the rest (a writer's fallback); PQX_SNAPPY every page of the
  * column snappy-compressed (a greedy LZ over 2-byte offsets). */
-enum { PQX_DICT = 1, PQX_FALLBACK = 2, PQX_SNAPPY = 4, PQX_LATE = 8 };   /* PQX_LATE: the fallback after 7/8 of the rows */
+enum { PQX_DICT = 1, PQX_FALLBACK = 2, PQX_SNAPPY = 4, PQX_LATE = 8, PQX_NOSTATS = 16 };   /* PQX_LATE: the fallback after 7/8 of the rows; PQX_NOSTATS: no encoding stats */
 static int64_t pqx_rows = 1, pqx_groups = 1;   /* the file the functions describe */
 static void pqx_lit(pq_buf* o, const uint8_t* p, size_t n) {
     while (n) {
@@ -2045,6 +2080,8 @@ static bool pqx_synth(const char* path, int64_t rows, int64_t groups, int n, con
             pb_i(&f, &lm, 7, PB_I64, stored[i]);
             pb_i(&f, &lm, 9, PB_I64, dpo[i]);
             if (dio[i] >= 0) pb_i(&f, &lm, 11, PB_I64, dio[i]);
+            if (c && !(flags[c - 1] & PQX_NOSTATS))
+                pb_enc_stats(&f, &lm, dio[i] >= 0, dio[i] >= 0, !(flags[c - 1] & PQX_DICT) || (flags[c - 1] & PQX_FALLBACK));
             pb_byte(&f, 0);
             pb_byte(&f, 0);
             total += stored[i];
@@ -2137,23 +2174,28 @@ static const char* pqx_unique(int64_t r, char* buf, uint32_t* len) {
     *len = (uint32_t)n + 80;
     return buf;
 }
-/* PQX_VOCAB=1 (the mixed-column test runs only this): the footer's
- * vocabulary bound (the trace's vocab_mb) against the symbol file the
- * direct import writes, for a snappy dictionary of long strings that share
- * a prefix and for a writer's PLAIN fallback over the chunk's last rows. */
+/* The footer's bound on what the direct import holds for a column
+ * (pq_vocab_bounds, the trace's vocab_bytes) is an upper bound: at least
+ * the symbol file the direct import writes, for a snappy dictionary of long
+ * strings that share a prefix (its stored bytes far below its strings'), a
+ * writer's PLAIN fallback over the chunk's last eighth of the rows (with
+ * the encoding stats, and without them), and PLAIN pages only.  And not a
+ * blanket one: a dictionary of forty strings with the stats saying no data
+ * page holds values stays small however many rows its ids cover. */
 static const char* pqx_prefixed(int64_t r, char* buf, uint32_t* len) {
     memset(buf, 'P', 190);
     *len = 190 + (uint32_t)snprintf(buf + 190, 60, "%09lld", (long long)(r % 1000));
     return buf;
 }
 static const char* pqx_late(int64_t r, char* buf, uint32_t* len) {
-    int64_t at = r % 80000;   /* the row in its row group */
-    if (at < 70000) { *len = (uint32_t)snprintf(buf, 256, "q%lld", (long long)(r % 10)); return buf; }
+    int64_t at = r % 8000;   /* the row in its row group of 8000 */
+    if (at < 7000) { *len = (uint32_t)snprintf(buf, 256, "q%lld", (long long)(r % 10)); return buf; }
     buf[0] = (char)(33 + (r / 8836) % 94); buf[1] = (char)(33 + (r / 94) % 94); buf[2] = (char)(33 + r % 94);
     *len = 3;
     return buf;
 }
-static void pqx_vocab_probe(void) {
+static test_result_t test_pq_sym_vocab_bound(void) {
+    pq_sym_env_clear();
     const char* nm[1] = {"p"};
     const char* fnames[2] = {"x","p"};
     char src[160], dir[160], sym[200];
@@ -2164,27 +2206,40 @@ static void pqx_vocab_probe(void) {
     ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 2);
     size_t cap = (size_t)1 << 16;
     char* trace = (char*)ray_sys_alloc(cap);
-    for (int k = 0; k < 2 && trace; k++) {
-        pq_synth_fn fn[1] = {k ? pqx_late : pqx_prefixed};
-        unsigned fl[1] = {k ? PQX_FALLBACK | PQX_LATE : PQX_DICT | PQX_SNAPPY};
-        if (!pqx_synth(src, k ? 160000 : 200000, 2, 1, nm, fn, fl)) { fprintf(stderr, "  vocab probe: synth failed\n"); break; }
-        pq_set_env("RAY_PQ_SYM_RAM", "1073741824");
+    TEST_ASSERT_TRUE(trace != NULL);
+    TEST_ASSERT_EQ_I(pq_pool(2), RAY_OK);
+    static const struct { const char* what; pq_synth_fn fn; unsigned flags; int64_t rows; bool small; } cases[] = {
+        {"snappy dictionary", pqx_prefixed, PQX_DICT | PQX_SNAPPY, 20000, false},
+        {"late PLAIN fallback", pqx_late, PQX_FALLBACK | PQX_LATE, 16000, false},
+        {"late PLAIN fallback, no stats", pqx_late, PQX_FALLBACK | PQX_LATE | PQX_NOSTATS, 16000, false},
+        {"PLAIN", pqx_late, 0, 16000, false},
+        {"forty strings", pqx_lowcard, PQX_DICT, 40000, true},
+    };
+    int bad = 0;
+    for (size_t k = 0; k < sizeof(cases) / sizeof(cases[0]); k++) {
+        pq_synth_fn fn[1] = {cases[k].fn};
+        unsigned fl[1] = {cases[k].flags};
+        TEST_ASSERT_TRUE(pqx_synth(src, cases[k].rows, 2, 1, nm, fn, fl));
         pq_set_symmode("direct");
         ray_t* res = pq_traced_import(src, dir, types, trace, cap);
         pq_sym_env_clear();
-        if (!res || RAY_IS_ERR(res)) { fprintf(stderr, "  vocab probe: import failed\n"); if (res) ray_error_free(res); break; }
-        ray_release(res);
+        TEST_ASSERT_FALSE(!res || RAY_IS_ERR(res)); ray_release(res);
+        TEST_ASSERT_TRUE(pqx_check(dir, cases[k].rows, 1, nm, fn, cases[k].what, NULL));
         FILE* f = fopen(sym, "rb");
         long size = -1;
         if (f) { fseek(f, 0, SEEK_END); size = ftell(f); fclose(f); }
-        const char* line = strstr(trace, "parquet symcol:");
-        const char* e = line ? strchr(line, '\n') : NULL;
-        fprintf(stderr, "  vocab probe %s: %.*s | .sym %ld bytes, %lld symbols\n", k ? "late PLAIN fallback" : "snappy dictionary",
-                line ? (int)(e ? e - line : (long)strlen(line)) : 0, line ? line : "", size, (long long)pq_sym_count(dir));
+        double bound = pq_trace_sum(trace, "vocab_bytes", NULL);
+        fprintf(stderr, "  %s: bound %.0f B, .sym %ld B, %lld symbols\n", cases[k].what, bound, size, (long long)pq_sym_count(dir));
+        /* the records' bytes and the direct import's own per string (an
+         * offset, a hash slot, at least 40 bytes) */
+        if (size <= 0 || bound < (double)size + 40.0 * (double)pq_sym_count(dir)) bad++;
+        if (cases[k].small && bound > 64 * 1024) bad++;
         pq_remove_native(dir, fnames, 2);
     }
     ray_sys_free(trace);
     ray_release(types); unlink(src);
+    TEST_ASSERT_EQ_I(bad, 0);
+    PASS();
 }
 /* Which way each symbol column went, from the trace's symcol lines: 'D' or
  * 'G' in the file's column order, '?' when the trace does not say. */
@@ -2207,14 +2262,13 @@ static void pqx_modes(const char* trace, int n, const char* const* names, char* 
  * Forced grouped, the files do not depend on the workers.  Then each
  * injected failure of a mixed import, and repeated imports keeping no
  * memory.  The default run is a subset of the matrix; PQX_FULL=1 runs all
- * of it (PQX_ROWS, PQX_RAM, PQX_TRACE change it; PQX_DET, PQX_VOCAB and
+ * of it (PQX_ROWS, PQX_RAM, PQX_TRACE change it; PQX_DET and
  * PQX_EMPTY run probes of their own instead). */
 static test_result_t test_pq_symgrp_mixed_columns(void) {
 #if !defined(DEBUG)
     SKIP("the memory the decision assumes is a debug-build knob");
 #else
     pq_sym_env_clear();
-    if (getenv("PQX_VOCAB")) { pqx_vocab_probe(); PASS(); }
     if (getenv("PQX_EMPTY")) {
         /* a file of no row groups, forced grouped, a step failing */
         const char* nm[1] = {"p"};
@@ -2252,7 +2306,8 @@ static test_result_t test_pq_symgrp_mixed_columns(void) {
     const pq_synth_fn fns[N] = {pqx_highcard, pqx_lowcard, pqx_unique, pqx_hot, pqx_fallback};
     const unsigned flags[N] = {0, PQX_DICT | PQX_SNAPPY, PQX_SNAPPY, PQX_DICT | PQX_SNAPPY, PQX_FALLBACK};
     const char* fnames[N + 1] = {"x","b","a","e","d","c"};
-    const int64_t rows = getenv("PQX_ROWS") ? atoll(getenv("PQX_ROWS")) : 3000, groups = 6;
+    const int64_t rows = getenv("PQX_ROWS") ? atoll(getenv("PQX_ROWS")) : 6000;
+    const int64_t groups = getenv("PQX_GROUPS") ? atoll(getenv("PQX_GROUPS")) : 3;
     char src[160], dir[160], ref[160], what[200], a[240], b[240];
     snprintf(src, sizeof(src), "/tmp/rayforce-pqx-%d.parquet", (int)getpid());
     snprintf(dir, sizeof(dir), "/tmp/rayforce-pqx-%d", (int)getpid());
@@ -2305,8 +2360,9 @@ static test_result_t test_pq_symgrp_mixed_columns(void) {
     bool full = getenv("PQX_FULL") != NULL;
     for (int cores = 1; cores <= (full ? 4 : 1); cores += 3) {
         TEST_ASSERT_EQ_I(pq_pool(cores), RAY_OK);
-        for (int k = 0; k < 14; k++) {
-            char ram[32]; snprintf(ram, sizeof(ram), "%lld", (long long)((int64_t)16384 << k));
+        for (int k = 0; k < 28; k++) {   /* half powers of two from 16 KB */
+            int64_t m = (int64_t)16384 << (k / 2);
+            char ram[32]; snprintf(ram, sizeof(ram), "%lld", (long long)(k & 1 ? m * 181 / 128 : m));
             pq_set_env("RAY_PQ_SYM_RAM", ram);
             res = pq_traced_import(src, dir, types, trace, cap);
             pq_sym_env_clear();
@@ -2347,11 +2403,11 @@ static test_result_t test_pq_symgrp_mixed_columns(void) {
         for (int run = 0; run < 48; run++) {
             int o = run % 4, knob = (run / 4) % 4;
             bool forced = run >= 32;
-            /* the default run: not the small arena with six bits of the hash,
-             * none of the hash in "rows" only, a window per task with four
-             * groups forced grouped only, and on four workers the forced
-             * runs only (the ones compared); PQX_FULL=1 all of it */
-            if (!full && (knob == 3 || (knob == 2 && o) || (!forced && (knob == 1 || cores > 1)))) continue;
+            /* the default run: neither none of the hash nor the small arena
+             * with six bits of it (the collision tests have them), a window a
+             * task with four groups forced grouped only, and on four workers
+             * the forced runs only (the ones compared); PQX_FULL=1 all of it */
+            if (!full && (knob >= 2 || (!forced && (knob == 1 || cores > 1)))) continue;
             /* the first mixed decision of the sweep, then the last */
             const char* ram_mixed = getenv("PQX_RAM") ? getenv("PQX_RAM") : mixram[run < 16 ? 0 : nmix - 1];
             const char* window = knob & 1 ? "1" : knob == 2 ? "4096" : NULL;
@@ -2482,6 +2538,7 @@ const test_entry_t parquet_entries[] = {
     {"parquet/symgrp_fail_leaks",test_pq_sym_grouped_fail_leaks,pq_setup,pq_teardown},
     {"parquet/symgrp_rowgroups",test_pq_sym_grouped_rowgroups,pq_setup,pq_teardown},
     {"parquet/symgrp_mixed_columns",test_pq_symgrp_mixed_columns,pq_setup,pq_teardown},
+    {"parquet/sym_vocab_bound",test_pq_sym_vocab_bound,pq_setup,pq_teardown},
 #if defined(__linux__)
     {"parquet/chunk_flush_error",test_pq_chunk_flush_error,pq_setup,pq_teardown},
 #endif
