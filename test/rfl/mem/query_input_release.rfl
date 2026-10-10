@@ -102,6 +102,16 @@
 (times 1000 (try (+ 1 'a) 0))
 (times 1000 (try (try (raise 5) (fn [e] (raise e))) (fn [e] 0)))
 (< (- (heapb) h0) 4096) -- true
+;; an error raised inside nested calls leaves a trace of their frames, which
+;; the top-level try clears with the error.  Measured within one statement:
+;; the runner clears the trace between statements.
+(set fe1 (fn [x] (+ x 'a)))
+(set fe2 (fn [x] (fe1 x)))
+(times 100 (try (fe2 1) (fn [e] 0)))
+(do (set h0 (heapb)) (times 1000 (try (fe2 1) (fn [e] 0))) (< (- (heapb) h0) 4096)) -- true
+;; an operand error the asof-join planner meets is freed before it falls back
+(set qtr (table [Sym Time Bid] (list [x x x] [10:00:00.000 10:00:02.000 10:00:04.000] [99.0 100.5 101.5])))
+(probe_caught (fn [p] (try (asof-join [Sym Time] (select {from: nosuchtbl}) qtr) (fn [e] 0))) 5 1000) -- true
 ;; the same table reused across calls must not be released twice: the
 ;; result is still right after many calls
 (set T (mk 1))

@@ -388,6 +388,7 @@
 (select {by: {k: (% y 20)} from: Pck}) -- (select {by: {k: (% y 20)} from: Mck})
 (select {by: date from: Pck desc: date}) -- (select {by: date from: Mck desc: date})
 (select {by: y from: Pck}) -- (select {by: y from: Mck})
+(select {by: y from: Pck desc: y}) -- (select {by: y from: Mck desc: y})
 (set Vck7 [1 1 2 2 3 3 3])
 (select {by: Vck7 from: Pck}) -- (select {by: Vck7 from: Mck})
 (select {by: x from: Pck take: [1 2]}) -- (select {by: x from: Mck take: [1 2]})
