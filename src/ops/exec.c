@@ -4879,6 +4879,18 @@ static ray_t* flatten_parted_col(ray_t* col) {
     return flat;
 }
 
+/* The keep-set a select published for this ray_execute's filter
+ * finalization (__VM->filt_keep: the columns its group reads),
+ * or none (keep every column).  Depth-gated so a nested subquery's own
+ * finalization does not consume it. */
+static void exec_filt_keep(const int64_t** keep, int* keep_n) {
+    *keep = NULL; *keep_n = 0;
+    if (__VM && __VM->filt_keep && __VM->filt_keep_n > 0
+        && __VM->eval_depth == __VM->filt_depth) {
+        *keep = __VM->filt_keep; *keep_n = __VM->filt_keep_n;
+    }
+}
+
 static ray_t* ray_execute_inner(ray_graph_t* g, ray_op_t* root) {
     ray_enc_note_exec_start();
     if (!g || !root) return ray_error("nyi", NULL);
@@ -4937,15 +4949,11 @@ static ray_t* ray_execute_inner(ray_graph_t* g, ray_op_t* root) {
         if (memo_armed) exec_memo_end(g);
         if (g->selection && result && !RAY_IS_ERR(result)
             && result->type == RAY_TABLE) {
-            /* Projection-aware compaction: a select publishes the keys-only
-             * keep-set of its distinct downstream via __VM->filt_keep before
-             * this ray_execute; gather only those columns.  Depth-gated so a
-             * nested subquery's own finalization does not consume it. */
+            /* Projection-aware compaction: a select publishes the columns
+             * its group reads via __VM->filt_keep before this
+             * ray_execute; gather only those columns. */
             const int64_t* keep = NULL; int keep_n = 0;
-            if (__VM && __VM->filt_keep && __VM->filt_keep_n > 0
-                && __VM->eval_depth == __VM->filt_depth) {
-                keep = __VM->filt_keep; keep_n = __VM->filt_keep_n;
-            }
+            exec_filt_keep(&keep, &keep_n);
             ray_t* compacted = sel_compact(g, result, g->selection, keep, keep_n);
             ray_release(result);
             ray_release(g->selection);
@@ -4970,11 +4978,19 @@ static ray_t* ray_execute_inner(ray_graph_t* g, ray_op_t* root) {
                 }
             }
             if (any_parted) {
+                /* the same keep-set as the partial filter's sel_compact */
+                const int64_t* keep = NULL; int keep_n = 0;
+                exec_filt_keep(&keep, &keep_n);
                 ray_t* out = ray_table_new(ncols);
                 for (int64_t c = 0; out && !RAY_IS_ERR(out) && c < ncols; c++) {
+                    int64_t name = ray_table_col_name(result, c);
+                    if (keep_n > 0) {
+                        bool kept = false;
+                        for (int j = 0; j < keep_n && !kept; j++) kept = keep[j] == name;
+                        if (!kept) continue;
+                    }
                     ray_t* col = ray_table_col_idx(result, c);
                     if (col && RAY_IS_ERR(col)) { ray_release(out); ray_release(result); return col; }
-                    int64_t name = ray_table_col_name(result, c);
                     if (col && (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON)) {
                         ray_t* flat = flatten_parted_col(col);
                         PARTED_FLAT_DCHECK(result, flat);
@@ -5048,7 +5064,9 @@ static ray_t* ray_execute_inner(ray_graph_t* g, ray_op_t* root) {
         /* Compact lazy selection for this segment */
         if (g->selection && partial && !RAY_IS_ERR(partial)
             && partial->type == RAY_TABLE) {
-            ray_t* compacted = sel_compact(g, partial, g->selection, NULL, 0);
+            const int64_t* keep = NULL; int keep_n = 0;
+            exec_filt_keep(&keep, &keep_n);
+            ray_t* compacted = sel_compact(g, partial, g->selection, keep, keep_n);
             ray_release(partial);
             ray_release(g->selection);
             g->selection = NULL;

@@ -5436,6 +5436,55 @@ static test_result_t test_no_materialization_parted(void) {
     return r;
 }
 
+/* Task 17e (#769): a parted select that groups after a where: gathers the
+ * selected rows of the columns its by: and outputs read, not of every
+ * column.  The ClickBench q11, q14 and q23 shapes (a count(distinct)
+ * output, so the where: runs as its own filter: the materialize path) and
+ * q12 (an implicit group under an outer projection: the eval-level group)
+ * over the parted battery tables materialize exactly their own columns on
+ * generation 2, one per partition (three), the where:-only columns read in
+ * place by the filter.  Shapes whose reads cannot be named keep every
+ * column and answer as before: a lambda output, the implicit-all group
+ * (first of every column), a computed key; and an all-pass filter, a
+ * filter that passes nothing, and a nested group whose consumer names
+ * columns answer as generation 0. */
+static test_result_t test_parted_eval_group_keep(void) {
+    sr_np_tables();
+    static const sr_gap_t own[] = {
+        /* q11: key s, distinct h; v in the where: only */
+        { "(select {s: s u: (count (distinct h)) from: T where: (> v 3) by: s desc: u take: 10})", 6 },
+        /* q12: the inner implicit group feeds an outer that reads g, s, h */
+        { "(select {c: (count h) from: (select {from: T where: (!= u 0) by: {g: g s: s h: h}}) "
+          "by: {g: g s: s} desc: c take: 10})", 9 },
+        /* q14: key g, distinct k; u in the where: only */
+        { "(select {g: g u: (count (distinct k)) from: T where: (!= u 0) by: g desc: u take: 10})", 6 },
+        /* q23: four outputs over s, h, k; g and v in the where: only */
+        { "(select {s: s u: (count h) t: (count k) c: (count s) d: (count (distinct h)) from: T "
+          "where: (and (!= g 1) (> v 3)) by: s desc: c take: 10})", 9 },
+        /* an all-pass filter flattens the same columns */
+        { "(select {g: g u: (count (distinct k)) m: (max d) from: T where: (>= u 0) by: g})", 9 },
+        { NULL, 0 },
+    };
+    for (int i = 0; own[i].q; i++) {
+        test_result_t r = sr_same_on(SR_NP0, SR_NP2, own[i].q, own[i].mat);
+        if (r.status != TEST_PASS) return r;
+    }
+    static const char* const all[] = {
+        "(select {s: s u: (count (distinct h)) w: ((fn [x] (count x)) k) from: T where: (> v 3) by: s})",
+        "(select {from: T where: (> v 3) by: [g s]})",
+        "(select {from: T where: (> v 3) by: g})",
+        "(select {u: (count (distinct h)) from: T where: (> v 3) by: (% k 3)})",
+        "(select {g: g u: (count (distinct k)) from: T where: (> u 250) by: g})",
+        "(select {m: (max u) from: (select {from: T where: (> v 3) by: {g: g s: s}}) by: g})",
+        NULL,
+    };
+    for (int i = 0; all[i]; i++) {
+        test_result_t r = sr_same_on(SR_NP0, SR_NP2, all[i], UINT64_MAX);
+        if (r.status != TEST_PASS) return r;
+    }
+    PASS();
+}
+
 /* Gap 5 (Task 15b): a count over a conjunctive filter is answered from the
  * selection, gathering no column, on splayed and parted tables of either
  * generation.  Each count equals the row count of the select the shortcut
@@ -6101,6 +6150,7 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/idx_info_report",    test_idx_info_report,    srr_setup, srr_teardown },
     { "scanrange/no_materialization", test_no_materialization, srr_setup, srr_teardown },
     { "scanrange/no_materialization_parted", test_no_materialization_parted, srr_setup, srr_teardown },
+    { "scanrange/parted_eval_group_keep", test_parted_eval_group_keep, srr_setup, srr_teardown },
     { "scanrange/count_and",          test_count_and,          srr_setup, srr_teardown },
     { "scanrange/parted_nullable_stats", test_parted_nullable_stats, srr_setup, srr_teardown },
     { "scanrange/parted_expr_null_free", test_parted_expr_null_free, srr_setup, srr_teardown },

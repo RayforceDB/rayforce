@@ -8729,6 +8729,82 @@ static int filt_compact_keep(ray_t* dict, ray_t* by_expr, ray_t* tbl,
     return n;
 }
 
+/* The bound eval_group_keep's set can never exceed: every column of `tbl`
+ * plus the published proj_keep entries (which need not be columns). */
+static int64_t eval_group_keep_cap(ray_t* tbl) {
+    ray_vm_t* vm = __VM;
+    return ray_table_ncols(tbl) + (vm ? vm->proj_keep_n : 0) + 1;
+}
+
+/* Filter-compaction keep-set for a grouped select whose where: runs as its
+ * own filter before the group (#769): every eval-level group but the one
+ * filt_compact_keep serves, and the DAG group's materialize path (a
+ * count(distinct) output over a parted table).  The group reads the
+ * filtered table through its by: and its outputs only — take:, asc: and
+ * desc: order and cut the grouped result — so the filter need only gather
+ * the columns those expressions name: the by-keys, the column refs of
+ * every output expression
+ * (collect_col_refs_set), and the outer select's proj_keep.  An output
+ * whose reads cannot be named (a lambda, a local, a quoted name, eval —
+ * expr_reads_named_columns_only) keeps every column, and so does the
+ * implicit-all group (no outputs: first of every column) unless a
+ * projection hint at this depth says which of its columns the consumer
+ * reads, as filt_compact_keep does.  Returns the deduped keep count, or 0
+ * (carry all).  `max` is eval_group_keep_cap(tbl): keys and refs are
+ * deduped columns of `tbl`, so the bound is never reached. */
+static bool eval_group_keep_ok(ray_t* e, ray_t* tbl) {
+    if (e && e->type == RAY_DICT) {                  /* a by-dict: its values */
+        ray_t* vals = ray_dict_vals(e);
+        if (!vals || vals->type != RAY_LIST) return false;
+        ray_t** v = (ray_t**)ray_data(vals);
+        for (int64_t i = 0; i < ray_len(vals); i++)
+            if (!expr_reads_named_columns_only(v[i], tbl)) return false;
+        return true;
+    }
+    return expr_reads_named_columns_only(e, tbl);
+}
+
+static int eval_group_keep(ray_t* dict, ray_t* by_expr, ray_t* tbl, int64_t n_out,
+                           int64_t from_id, int64_t where_id, int64_t by_id,
+                           int64_t take_id, int64_t asc_id, int64_t desc_id,
+                           int64_t* out, int max) {
+    ray_vm_t* vm = __VM;
+    bool hint = vm && vm->proj_active && vm->eval_depth == vm->proj_depth + 1;
+    if (n_out == 0 && !hint) return 0;               /* first of every column */
+    int n = 0;
+    if (by_expr && by_expr->type == RAY_SYM) {       /* by: [k1 k2 …] */
+        int64_t nk = ray_len(by_expr);
+        for (int64_t k = 0; k < nk; k++) {
+            int64_t s = sym_cell_runtime_id(by_expr, k);
+            if (!tbl_has_col(tbl, s)) return 0;      /* a key made later: carry all */
+            bool dup = false;
+            for (int j = 0; j < n; j++) if (out[j] == s) { dup = true; break; }
+            if (!dup && n < max) out[n++] = s;
+        }
+    } else {
+        if (!eval_group_keep_ok(by_expr, tbl)) return 0;
+        n = collect_col_refs_set(by_expr, tbl, out, max, n);
+    }
+    DICT_VIEW_DECL(pv);
+    DICT_VIEW_OPEN(dict, pv);
+    if (DICT_VIEW_OVERFLOW(pv)) { DICT_VIEW_CLOSE(pv); return 0; }
+    for (int64_t i = 0; i + 1 < pv_n; i += 2) {
+        int64_t kid = pv[i]->i64;
+        if (kid == from_id || kid == where_id || kid == by_id ||
+            kid == take_id || kid == asc_id || kid == desc_id) continue;
+        if (!eval_group_keep_ok(pv[i + 1], tbl)) { DICT_VIEW_CLOSE(pv); return 0; }
+        n = collect_col_refs_set(pv[i + 1], tbl, out, max, n);
+    }
+    DICT_VIEW_CLOSE(pv);  /* pv dead past the clause scan */
+    for (int j = 0; hint && j < vm->proj_keep_n; j++) {
+        int64_t s = vm->proj_keep[j];
+        bool dup = false;
+        for (int q = 0; q < n; q++) if (out[q] == s) { dup = true; break; }
+        if (!dup && n < max) out[n++] = s;
+    }
+    return n;
+}
+
 /* Materialize pure temporal arithmetic with the unit-aware evaluator once,
  * then let the normal typed GROUP pipeline reduce that column. The expression
  * DAG's raw integer arithmetic remains guarded for mixed temporal units. */
@@ -11686,14 +11762,16 @@ by_dict_done:
             ray_t* eval_tbl = tbl;
             if (where_expr) {
                 root = ray_optimize(g, root);
-                /* Projection-aware compaction: when this WHERE filter feeds only
-                 * the keys-only multi-key DISTINCT path under an active outer
-                 * projection hint, publish the keys∪proj_keep keep-set so the
-                 * filter finalization (ray_execute_inner) gathers just those
-                 * columns.  Scoped to this ray_execute via save/restore. */
-                /* keep-set = by-keys ∪ proj_keep; carve exactly that many
-                 * int64 (union ≤ nk + proj_keep_n) so the write never
-                 * truncates a group key or a proj_keep entry. */
+                /* Projection-aware compaction: publish the columns the group
+                 * reads so the filter finalization (ray_execute_inner) gathers
+                 * just those — keys ∪ proj_keep when this WHERE feeds only the
+                 * keys-only multi-key DISTINCT path under an active outer
+                 * projection hint (filt_compact_keep), else the columns the
+                 * by: and the outputs name (eval_group_keep).  Scoped to this
+                 * ray_execute via save/restore. */
+                /* The carve covers both sets: nk + proj_keep_n for the first,
+                 * every column + proj_keep_n for the second, so the write
+                 * never truncates a group key or a referenced column. */
                 ray_vm_t* fvm = __VM;
                 ray_t*   filt_hdr = NULL;
                 int64_t* filt_buf = NULL;
@@ -11702,12 +11780,20 @@ by_dict_done:
                 int32_t        sv_fd = fvm ? fvm->filt_depth  : 0;
                 if (fvm) {
                     int64_t filt_cap = (by_expr ? ray_len(by_expr) : 0) + fvm->proj_keep_n;
-                    if (filt_cap < 1) filt_cap = 1;
+                    int64_t eg_cap = eval_group_keep_cap(tbl);
+                    if (filt_cap < eg_cap) filt_cap = eg_cap;
                     filt_buf = (int64_t*)scratch_alloc(&filt_hdr, (size_t)filt_cap * sizeof(int64_t));
                     if (filt_buf) {
                         int fk_n = filt_compact_keep(dict, by_expr, tbl,
                                                      from_id, where_id, by_id,
                                                      filt_buf, (int)filt_cap);
+                        /* every other eval-level group: the columns its by:
+                         * and outputs name (#769) */
+                        if (fk_n == 0)
+                            fk_n = eval_group_keep(dict, by_expr, tbl, n_out,
+                                                   from_id, where_id, by_id,
+                                                   take_id, asc_id, desc_id,
+                                                   filt_buf, (int)filt_cap);
                         if (fk_n > 0) {
                             fvm->filt_keep = filt_buf; fvm->filt_keep_n = fk_n;
                             fvm->filt_depth = fvm->eval_depth;
@@ -13408,7 +13494,33 @@ by_dict_done:
                 }
             } else {
                 root = ray_optimize(g, root);
+                /* The group over the filtered table reads only the columns
+                 * its by: and outputs name: publish them so the filter
+                 * finalization gathers just those (#769: a parted
+                 * count(distinct) group copied every column).  Scoped to
+                 * this ray_execute via save/restore. */
+                ray_vm_t* fvm = __VM;
+                ray_t*   filt_hdr = NULL;
+                const int64_t* sv_fk = fvm ? fvm->filt_keep   : NULL;
+                int            sv_fn = fvm ? fvm->filt_keep_n : 0;
+                int32_t        sv_fd = fvm ? fvm->filt_depth  : 0;
+                if (fvm) {
+                    int64_t filt_cap = eval_group_keep_cap(tbl);
+                    int64_t* filt_buf = (int64_t*)scratch_alloc(&filt_hdr, (size_t)filt_cap * sizeof(int64_t));
+                    int fk_n = filt_buf
+                        ? eval_group_keep(dict, parted_bydict_deferred ? deferred_bydict : by_expr,
+                                          tbl, n_out, from_id, where_id, by_id,
+                                          take_id, asc_id, desc_id, filt_buf, (int)filt_cap)
+                        : 0;
+                    if (fk_n > 0) {
+                        fvm->filt_keep = filt_buf; fvm->filt_keep_n = fk_n;
+                        fvm->filt_depth = fvm->eval_depth;
+                    }
+                }
                 ray_t* fres = ray_execute(g, root);
+                if (fvm) { fvm->filt_keep = sv_fk; fvm->filt_keep_n = sv_fn;
+                           fvm->filt_depth = sv_fd; }
+                scratch_free(filt_hdr);   /* filt_buf dead past the restore */
                 ray_graph_free(g); g = NULL;
                 if (!fres || RAY_IS_ERR(fres)) { ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return fres ? fres : ray_error("domain", "select: `where:` filter produced no result"); }
                 if (ray_is_lazy(fres)) fres = ray_lazy_materialize(fres);
