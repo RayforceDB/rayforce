@@ -21,6 +21,14 @@
 #include "ops/rowsel.h"      /* ray_rowsel_from_pred, ray_rowsel_release */
 #include "core/pool.h"
 #include "table/sym.h"
+#include "core/runtime.h"
+#include "core/platform.h"
+#include "lang/eval.h"
+#include "store/enccol.h"
+#include "store/encfmt.h"
+#include "store/splay.h"
+#include "table/table.h"
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -2381,6 +2389,224 @@ static test_result_t test_avg_exact_i128_engines(void) {
     return res;
 }
 
+/* ---- Task 17c: the fused radix chunk cap, the parallel parted flatten ----
+ * Runtime fixtures over stores saved under the process's own tmp root. */
+#define AE_TMP "/tmp/rayforce_aeroutes"
+static ray_runtime_t* g_ae_rt;
+static void ae_rt_setup(void) {
+    g_ae_rt = ray_runtime_create(0, NULL);
+    (void)ray_test_rm_rf(ray_test_tmp(AE_TMP)); (void)ray_test_mkdir_p(ray_test_tmp(AE_TMP));
+}
+static void ae_rt_teardown(void) {
+    ray_cache_llc_set_for_test(0);
+    ray_cancel_reset();
+    ray_pool_destroy(); (void)ray_pool_init_total(0);
+    ray_test_hooks_off();
+    (void)ray_test_rm_rf(ray_test_tmp(AE_TMP));
+    ray_runtime_destroy(g_ae_rt);
+}
+static ray_t* ae_eval(const char* src) { return ray_eval_str(ray_test_tmp(src)); }
+static void ae_drop(ray_t* o) { if (!o) return; if (RAY_IS_ERR(o)) ray_error_free(o); else ray_release(o); }
+static void ae_eval_ok(const char* src) {
+    ray_t* r = ae_eval(src);
+    if (r && RAY_IS_ERR(r)) { fprintf(stderr, "ae_eval_ok: %s: %s\n", src, ray_error_msg()); ray_error_free(r); abort(); }
+    if (r) ray_release(r);
+}
+static void ae_evalf_ok(const char* fmt, ...) {
+    char buf[2048];
+    va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof buf, fmt, ap); va_end(ap);
+    ae_eval_ok(buf);
+}
+/* Bytes decoded so far of column `name` of table t (summed over a parted
+ * column's encoded segments); *full: its generation-0 bytes. */
+static uint64_t ae_col_dec(ray_t* t, const char* name, uint64_t* full) {
+    ray_t* ec = ray_table_get_col_enc(t, ray_sym_intern(name, strlen(name)));
+    uint64_t r = 0;
+    *full = 0;
+    if (!ec) return 0;
+    ray_enccol_t* e = ray_enccol_of(ec);
+    if (e->kind == RAY_ENCCOL_SINGLE) {
+        *full = (uint64_t)e->len * ray_enccol_esz(e);
+        return atomic_load(&e->decoded_bytes);
+    }
+    for (int64_t i = 0; e->wrapper && i < e->wrapper->len; i++) {
+        ray_t* sg = ray_enccol_seg(ec, i);
+        if (!sg || sg->type != RAY_ENCCOL) continue;
+        ray_enccol_t* se = ray_enccol_of(sg);
+        r += atomic_load(&se->decoded_bytes);
+        *full += (uint64_t)se->len * ray_enccol_esz(se);
+    }
+    return r;
+}
+static uint64_t ae_dec(const char* name, uint64_t* full) {
+    ray_t* t = ae_eval("T");
+    uint64_t r = ae_col_dec(t, name, full);
+    ae_drop(t);
+    return r;
+}
+/* q's answer as .csv.write bytes (malloc'd; NULL on a failure). */
+static char* ae_csv(const char* q, size_t* n) {
+    char path[512], e[1024];
+    snprintf(path, sizeof path, "%s/a.csv", ray_test_tmp(AE_TMP));
+    snprintf(e, sizeof e, "(.csv.write %s \"%s\")", q, path);
+    ray_t* r = ae_eval(e);
+    bool ok = r && !RAY_IS_ERR(r);
+    ae_drop(r);
+    FILE* f = ok ? fopen(path, "rb") : NULL;
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END); long len = ftell(f); fseek(f, 0, SEEK_SET);
+    char* b = malloc((size_t)len + 1);
+    *n = b ? fread(b, 1, (size_t)len, f) : 0;
+    fclose(f);
+    if (b && *n != (size_t)len) { free(b); b = NULL; }
+    return b;
+}
+
+/* q17's shape on the v2 radix route: two wide keys, a count and an F64
+ * sum, 1.2M rows (2048 partitions: a run wants 16384-row chunks, 2
+ * blocks).  The last-level cache is set for 2 workers so a worker's
+ * staging share holds (0.75 * llc / 2 - 4 * 2048) / 34 records: about
+ * 10800 (one block fits, half a run: the fused pass on 8192-row chunks,
+ * the keys decode once per run, within 5% for the vectors a chunk starts
+ * inside), then about 5300 (under a block, under half a run: the two
+ * passes, the keys decode twice; whole chunks are
+ * scanrange/v2_radix_decode_once's).  Every answer is generation 0's
+ * byte for byte (the F64 sum's bits follow the records' order inside a
+ * partition). */
+static test_result_t test_radix_fused_capped_decode_once(void) {
+    ae_eval_ok("(set j (til 1200000))");
+    ae_eval_ok("(set R (table [k m f] (list (* (% (* j 7919) 300007) 1000003) (* (% j 13) 1000033) "
+                "(/ (as 'F64 j) 7.0))))");
+    ae_eval_ok("(.db.splayed.set \"" AE_TMP "/r0/\" R {compress: false})");
+    ae_eval_ok("(.db.splayed.set \"" AE_TMP "/r2/\" R {compress: true})");
+    ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(2), RAY_OK);
+    static const char* const q = "(select {c: (count f) a: (sum f) from: T by: {k: k m: m}})";
+    static const struct { uint64_t llc; double lo, hi; const char* what; } cs[] = {
+        { 1000000, 1.0, 1.05, "fused, one-block chunks at half a run" },
+        { 500000,  2.0, 2.2,  "two passes under half a run" },
+    };
+    ae_eval_ok("(set T (.db.splayed.get \"" AE_TMP "/r0/\"))");
+    size_t nref = 0;
+    char* ref = ae_csv(q, &nref);
+    TEST_ASSERT_TRUE(ref != NULL && nref > 0);
+    ae_eval_ok("(set T (.db.splayed.get \"" AE_TMP "/r2/\"))");
+    ae_drop(ae_eval(q));                                  /* binds and loads once: the pin is per run */
+    for (size_t i = 0; i < sizeof cs / sizeof cs[0]; i++) {
+        uint64_t fk, fm, k0 = ae_dec("k", &fk), m0 = ae_dec("m", &fm);
+        ray_cache_llc_set_for_test(cs[i].llc);
+        agg_route_reset();
+        size_t n = 0;
+        char* b = ae_csv(q, &n);
+        agg_route_stats_t st = agg_route_stats();
+        ray_cache_llc_set_for_test(0);
+        double xk = (double)(ae_dec("k", &fk) - k0) / (double)fk, xm = (double)(ae_dec("m", &fm) - m0) / (double)fm;
+        bool same = b && n == nref && memcmp(b, ref, n) == 0;
+        free(b);
+        if (!same || st.routes[AGG_ROUTE_V2_RADIX] != 1 || !(xk >= cs[i].lo && xk <= cs[i].hi) ||
+            !(xm >= cs[i].lo && xm <= cs[i].hi)) {
+            free(ref);
+            TEST_ASSERT_FMT(same, "%s: generation 2 differs from generation 0", cs[i].what);
+            TEST_ASSERT_FMT(false, "%s: radix %llu, k decoded %.4fx, m %.4fx", cs[i].what,
+                            (unsigned long long)st.routes[AGG_ROUTE_V2_RADIX], xk, xm);
+        }
+    }
+    free(ref);
+    PASS();
+}
+
+/* Chunk c's directory entry of column col in partition part of a parted
+ * store: a reserved byte set (the read is `corrupt`); *path: the column. */
+static void ae_parted_bad(const char* root, int part, const char* col, int64_t c, char* path, size_t cap) {
+    char rel[512], dir[512];
+    snprintf(rel, sizeof rel, "%s/2024.01.0%d/t/", root, part);
+    if (ray_splay_resolve_dir(ray_test_tmp(rel), dir, sizeof dir) != RAY_OK) abort();
+    size_t dl = strlen(dir);
+    snprintf(path, cap, "%s%s%s", dir, (dl && dir[dl - 1] == '/') ? "" : "/", col);
+    ray_enc_dirent_t de; memset(&de, 0, sizeof de);
+    FILE* f = fopen(path, "r+b");
+    if (!f) abort();
+    if (fseek(f, (long)(RAY_ENC_DIR_OFF + (uint64_t)c * sizeof de), SEEK_SET) != 0 ||
+        fread(&de, sizeof de, 1, f) != 1 || !de.offset) abort();
+    if (fseek(f, (long)de.offset + 6, SEEK_SET) == 0) fputc(1, f);
+    fclose(f);
+}
+static ray_t* ae_flatten(ray_t* t, const char* col, int64_t total) {
+    return parted_flatten_fixed(ray_table_slot(t, ray_sym_intern(col, strlen(col))), total);
+}
+
+/* parted_flatten_fixed on the pool (4 workers), three partitions of
+ * 200000 rows: an I64 column, a SYM one and an F64 one with nulls flatten
+ * byte for byte as generation 0's (whose plain segments stay one serial
+ * copy), each generation-2 column decoding once (within 5%: a slice's
+ * first vector); q18's shape (first-n over the segment-streamed table,
+ * which flattens its keys) answers as generation 0.  A cancelled
+ * generation-2 flatten is `cancel`; with partition 1 corrupt late
+ * (chunk 1, rows 65536..) and partition 3 early (chunk 0, rows 400000..)
+ * the answer is partition 1's, every run (failures keyed by global rows,
+ * not by slices' order). */
+static test_result_t test_parted_flatten_parallel(void) {
+    ae_eval_ok("(set j (til 600000))");
+    ae_eval_ok("(set P (table [u s f] (list (* (% (* j 7919) 50021) 1000003) "
+                "(as 'SYMBOL (map (fn [x] (format \"w%\" (% x 300))) (% (* j 31) 9973))) "
+                "(map (fn [x] (if (== 0 (% x 97)) 0Nf (/ (as 'F64 x) 3.0))) j))))");
+    for (int gen = 0; gen <= 2; gen += 2)
+        for (int p = 0; p < 3; p++)
+            ae_evalf_ok("(.db.splayed.set \"" AE_TMP "/p%d/2024.01.0%d/t/\" (take (drop P %d) 200000) {compress: %s})",
+                        gen, p + 1, p * 200000, gen ? "true" : "false");
+    ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    ray_t* t0 = ae_eval("(.db.parted.get \"" AE_TMP "/p0\" 't)");
+    ray_t* t2 = ae_eval("(.db.parted.get \"" AE_TMP "/p2\" 't)");
+    TEST_ASSERT_TRUE(t0 && !RAY_IS_ERR(t0) && t2 && !RAY_IS_ERR(t2));
+    static const char* const cols[] = { "u", "s", "f" };
+    for (int c = 0; c < 3; c++) {
+        uint64_t full, d0 = ae_col_dec(t2, cols[c], &full);
+        ray_t* a = ae_flatten(t0, cols[c], 600000);
+        ray_t* b = ae_flatten(t2, cols[c], 600000);
+        double x = (double)(ae_col_dec(t2, cols[c], &full) - d0) / (double)(full ? full : 1);
+        bool ok = a && !RAY_IS_ERR(a) && b && !RAY_IS_ERR(b) && a->type == b->type && a->len == 600000 &&
+                  b->len == 600000 && a->attrs == b->attrs &&
+                  memcmp(ray_data(a), ray_data(b), (size_t)600000 * ray_sym_elem_size(a->type, a->attrs)) == 0;
+        ae_drop(a); ae_drop(b);
+        if (!ok || !(x >= 1.0 && x <= 1.05)) { ae_drop(t0); ae_drop(t2); }
+        TEST_ASSERT_FMT(ok, "%s: the flat copies differ", cols[c]);
+        TEST_ASSERT_FMT(x >= 1.0 && x <= 1.05, "%s: decoded %.4fx", cols[c], x);
+    }
+    static const char* const q = "(select {c: (count f) from: T by: {u: u s: s} take: 10})";
+    ae_eval_ok("(set T (.db.parted.get \"" AE_TMP "/p0\" 't))");
+    size_t n0 = 0, n2 = 0;
+    char* a0 = ae_csv(q, &n0);
+    ae_eval_ok("(set T (.db.parted.get \"" AE_TMP "/p2\" 't))");
+    char* a2 = ae_csv(q, &n2);
+    bool same = a0 && a2 && n0 == n2 && n0 > 0 && memcmp(a0, a2, n0) == 0;
+    free(a0); free(a2);
+    if (!same) { ae_drop(t0); ae_drop(t2); }
+    TEST_ASSERT_FMT(same, "%s: generation 2 differs from generation 0", q);
+
+    ray_cancel();                                         /* the pool skips every slice */
+    ray_t* v = ae_flatten(t2, "u", 600000);
+    ray_cancel_reset();
+    bool cancelled = v && RAY_IS_ERR(v) && strcmp(ray_err_code(v), "cancel") == 0;
+    ae_drop(v);
+    ae_drop(t0); ae_drop(t2);
+    TEST_ASSERT_TRUE(cancelled);
+
+    char p1[600], p3[600];
+    ae_parted_bad(AE_TMP "/p2", 3, "u", 0, p3, sizeof p3);
+    ae_parted_bad(AE_TMP "/p2", 1, "u", 1, p1, sizeof p1);
+    for (int i = 0; i < 8; i++) {
+        ray_t* t = ae_eval("(.db.parted.get \"" AE_TMP "/p2\" 't)");
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        ray_error_clear();
+        v = ae_flatten(t, "u", 600000);
+        bool corrupt = v && RAY_IS_ERR(v) && strcmp(ray_err_code(v), "corrupt") == 0;
+        bool first = corrupt && strstr(ray_error_msg(), p1) != NULL;
+        ae_drop(v); ae_drop(t);
+        TEST_ASSERT_FMT(corrupt, "run %d: not corrupt", i);
+        TEST_ASSERT_FMT(first, "run %d: not %s: %s", i, p1, ray_error_msg());
+    }
+    PASS();
+}
+
 const test_entry_t agg_engine_entries[] = {
     { "pearson_old_engine_r_vs_r2",  test_pearson_old_engine_r_vs_r2, NULL, NULL },
     { "diff_group_pearson_1k",       test_diff_group_pearson_1k,    NULL, NULL },
@@ -2459,5 +2685,7 @@ const test_entry_t agg_engine_entries[] = {
     { "group_keys_multi",            test_group_keys_multi,            NULL, NULL },
     { "agg_run_one_i64",             test_agg_run_one_i64,             NULL, NULL },
     { "avg_exact_i128_engines",      test_avg_exact_i128_engines,      NULL, NULL },
+    { "radix_fused_capped_decode_once", test_radix_fused_capped_decode_once, ae_rt_setup, ae_rt_teardown },
+    { "parted_flatten_parallel",     test_parted_flatten_parallel,     ae_rt_setup, ae_rt_teardown },
     { NULL, NULL, NULL, NULL },
 };

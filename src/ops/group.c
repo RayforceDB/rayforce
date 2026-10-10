@@ -10736,6 +10736,27 @@ static void grp_flat_piece(void* ctx, uint32_t wid, int64_t b, int64_t e, const 
                       RAY_SYM, f->out_attrs);
 }
 
+/* parted_flatten_fixed on the pool: task i walks its own slice of the
+ * rows (one cursor set, so a vector a slice starts inside decodes once a
+ * slice) into the shared flat vector; a range error is noted keyed by the
+ * slice's first row. */
+typedef struct {
+    ray_col_src_t*   src;
+    grp_flat_t*      f;
+    int64_t          n, slice;
+    ray_scan_fail_t* fail;
+} grp_flat_par_t;
+static void grp_flat_par_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
+    (void)end;
+    grp_flat_par_t* c = (grp_flat_par_t*)ctx;
+    int64_t lo = start * c->slice, hi = lo + c->slice < c->n ? lo + c->slice : c->n;
+    if (lo >= hi || ray_scan_fail_skip(c->fail, lo)) return;
+    const void* plain[1] = { NULL };
+    ray_col_src_t* srcs[1] = { c->src };
+    ray_t* err = ray_col_walk(srcs, plain, 1, lo, hi, false, c->f, wid, grp_flat_piece);
+    if (err) ray_scan_fail_note(c->fail, lo, err);
+}
+
 /* Over a parted column's segment headers (never decodes): the widest SYM
  * width and whether any segment holds nulls. */
 static void parted_seg_scan(ray_t* col, int64_t n_segs, uint8_t* width, bool* nulls) {
@@ -10786,7 +10807,24 @@ ray_t* parted_flatten_fixed(ray_t* col, int64_t total) {
     grp_flat_t f = { ray_data(flat), base, w };
     const void* plain[1] = { NULL };                 /* a parted source reads through its cursor */
     ray_col_src_t* srcs[1] = { &s };
-    err = n > 0 ? ray_col_walk(srcs, plain, 1, 0, n, false, &f, 0, grp_flat_piece) : NULL;
+    /* Segments that decode (an encoded or synthetic one) are copied on the
+     * pool; plain segments alone stay one serial memcpy (in parallel, the
+     * fresh output's page faults contend: q18 over generation 0, +6%). */
+    ray_pool_t* pool = ray_pool_get();
+    if (ray_col_src_encoded(&s) && ray_pool_par_dispatch_ok(pool, n, RAY_PARALLEL_THRESHOLD)) {
+        /* a few block-aligned slices a worker, so claiming balances uneven
+         * segments; a cancelled dispatch skips slices: finish says `cancel` */
+        uint64_t nt = (uint64_t)ray_pool_total_workers(pool) * 4;
+        if (nt > RAY_POOL_INIT_TASKS) nt = RAY_POOL_INIT_TASKS;
+        int64_t slice = (int64_t)(((uint64_t)n + nt - 1) / nt);
+        slice = (slice + RAY_COL_BLOCK_ROWS - 1) / RAY_COL_BLOCK_ROWS * RAY_COL_BLOCK_ROWS;
+        ray_scan_fail_t fail;
+        ray_scan_fail_init(&fail);
+        grp_flat_par_t pc = { .src = &s, .f = &f, .n = n, .slice = slice, .fail = &fail };
+        ray_pool_dispatch_n(pool, grp_flat_par_fn, &pc, (uint32_t)((n + slice - 1) / slice));
+        err = ray_scan_fail_finish(&fail, pool);
+    } else
+        err = n > 0 ? ray_col_walk(srcs, plain, 1, 0, n, false, &f, 0, grp_flat_piece) : NULL;
     ray_col_src_release(&s);
     if (err) { ray_release(flat); return err; }
     flat->len = total;

@@ -6002,10 +6002,21 @@ static ray_t* exec_group_v2_parallel_radix(
          * chunk (rec + 2 bytes a row) and the partitions' write cursors */
         double per_worker = cache_budget / (double)nw - (double)n_parts * sizeof(uint32_t);
         int64_t cap = per_worker > 0 ? (int64_t)(per_worker / ((double)rec + sizeof(uint16_t))) : 0;
-        if (fused && chunk_rows > want_rows) {
-            if (want_rows > cap) fused = false;
-            else chunk_rows = want_rows;
-        } else if (fused && chunk_rows > cap) fused = false;
+        /* Staging over its share keeps the fused pass on smaller chunks:
+         * the largest block multiple under the cap, while that still holds
+         * half the records a run wants (4 a partition on average; q17's
+         * two keys: 3 of 4 blocks, decoded once).  Below half the short
+         * runs cost more than the second decode (TS2m: 40-byte records
+         * over 8192 partitions, a quarter). */
+        if (fused) {
+            int64_t target = chunk_rows > want_rows ? want_rows : chunk_rows;
+            if (target > cap) {
+                int64_t capped = cap / RAY_COL_BLOCK_ROWS * RAY_COL_BLOCK_ROWS;
+                if (capped >= RAY_COL_BLOCK_ROWS && 2 * capped >= want_rows) target = capped;
+                else fused = false;
+            }
+            if (fused) chunk_rows = target;
+        }
         /* the count matrix and the runs (twice its size) live together
          * until the runs are written */
         uint64_t nch = ((uint64_t)n_in + (uint64_t)chunk_rows - 1) / (uint64_t)chunk_rows;
