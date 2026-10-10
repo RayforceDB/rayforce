@@ -142,6 +142,8 @@ Recursive lambdas use `self` to refer to the enclosing function:
 55
 ```
 
+`self` is also a value: `(map self node)` recurses over a nested list. Inside a closure it is the closure itself, not the function that made it.
+
 ## Error Handling: try / raise
 
 `raise` throws an error with an arbitrary value. `try` catches it and passes the value to a handler function:
@@ -181,6 +183,8 @@ Nested lambdas capture visible lexical bindings when they are created:
 ‣ (add7 5)
 12
 ```
+
+Inside the closure its captures are locals: a `let` of `x` rebinds it for that call only, and a capture named like a builtin is the callee. See [Lambdas & the VM](syntax.md#lambdas--the-vm) for how closures compile.
 
 ## Early Return: return
 

@@ -387,6 +387,8 @@ User-defined functions are created with `fn`. Lambdas compile lazily to bytecode
 
 The VM supports trap frames for `try`/`raise` error handling, ensuring exceptions unwind cleanly through compiled code.
 
+A lambda made inside another function is a closure over the locals visible where it was made. Its captures are locals of its own body: a `let` of a captured name rebinds it for that call, a capture (or a parameter or `let`) named like a builtin or a special form is the callee, `self` inside a closure is the closure itself, and a caller's local of the same name never stands in for a capture. A closure compiles on its second call, so one made to be called once (a handler, a lambda handed to `map`) runs on the tree-walking interpreter and keeps no bytecode. A closure with more captures than a bytecode frame has slots (256) stays on the tree walker, as does a lambda written inside a query, which keeps the query's rule for quoted symbols.
+
 ## Select & Update
 
 The `select` and `update` builtins bridge to the Rayforce DAG executor. They accept a dictionary of options:

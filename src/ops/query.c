@@ -2170,6 +2170,103 @@ static bool query_inline_pure(ray_t* expr, int depth) {
     return true;
 }
 
+/* Whether evaluating `expr` can have an effect the program observes.  A
+ * `by:` key the planner cannot lower is evaluated over the whole column
+ * first and again row by row when that run turns out to have meant one
+ * row at a time; a body with an effect would then run it twice, so such a
+ * body is evaluated row by row from the start.  Pure: the forms below,
+ * the builtins the planner lowers or the fallback inlines, elementwise
+ * and aggregate builtins (their attrs), a user function whose body is
+ * pure (followed through its global binding, depth-limited), `self`.
+ * Everything else, `set` and `eval` first of all, counts as an effect. */
+static bool key_expr_pure(ray_t* expr, int depth);
+static bool key_lambda_pure(ray_t* lam, int depth) {
+    ray_t* body = LAMBDA_BODY(lam);
+    if (!body || body->type != RAY_LIST) return false;
+    ray_t** es = ray_data(body);
+    for (int64_t i = 0; i < body->len; i++)
+        if (!key_expr_pure(es[i], depth + 1)) return false;
+    return true;
+}
+static bool key_pure_form(int64_t id) {
+    static const char* const forms[] = {
+        "let", "if", "do", "cond", "and", "or", "while", "times", "fn", "try",
+        "raise", "return", "quote", "self",
+    };
+    enum { NFORMS = sizeof forms / sizeof *forms };
+    static _Thread_local int64_t ids[NFORMS];
+    static _Thread_local uint64_t epoch;
+    if (epoch != ray_sym_epoch() || !epoch) {
+        for (size_t i = 0; i < NFORMS; i++) ids[i] = ray_sym_intern(forms[i], strlen(forms[i]));
+        epoch = ray_sym_epoch();
+    }
+    for (size_t i = 0; i < NFORMS; i++) if (ids[i] == id) return true;
+    return false;
+}
+static bool key_pure_builtin_extra(int64_t id) {
+    /* Pure builtins the inline allowlist leaves out: higher-order verbs
+     * (their function arguments are checked as arguments), collection
+     * and text shaping, and the date parts.  Nothing here reads state
+     * outside its arguments or writes any. */
+    static const char* const pure[] = {
+        "map", "filter", "fold", "scan", "prior", "apply", "map-left", "map-right",
+        "fold-left", "fold-right", "fold-while", "scan-left", "scan-right",
+        "rotate", "cut", "cross", "find", "xrank", "bin", "binr", "split", "str-join",
+        "sym-name", "format", "dict", "table", "cols", "xcol", "xcols", "xkey",
+        "xasc", "xdesc", "top", "bot", "date", "time", "timestamp",
+        "ss", "hh", "yyyy", "mm", "dd", "dow", "doy", "cos-dist", "inner-prod", "l2-dist",
+    };
+    enum { NPURE = sizeof pure / sizeof *pure };
+    static _Thread_local int64_t ids[NPURE];
+    static _Thread_local uint64_t epoch;
+    if (epoch != ray_sym_epoch() || !epoch) {
+        for (size_t i = 0; i < NPURE; i++) ids[i] = ray_sym_intern(pure[i], strlen(pure[i]));
+        epoch = ray_sym_epoch();
+    }
+    for (size_t i = 0; i < NPURE; i++) if (ids[i] == id) return true;
+    return false;
+}
+static bool key_expr_pure(ray_t* expr, int depth) {
+    if (!expr) return true;
+    if (depth > 16) return false;
+    if (expr->type == -RAY_SYM) {
+        if (expr->attrs & ATTR_QUOTED) return true;
+        /* A helper named as a value may be called by whatever receives it. */
+        ray_t* v = ray_env_get_global(expr->i64);
+        return !(v && v->type == RAY_LAMBDA) || key_lambda_pure(v, depth);
+    }
+    if (expr->type != RAY_LIST || (expr->attrs & ATTR_QUOTED) || !expr->len) return true;
+    ray_t** es = ray_data(expr);
+    ray_t* head = es[0];
+    if (!head) return false;
+    int64_t first_arg = 1;
+    if (head->type == RAY_LIST) {
+        if (!key_expr_pure(head, depth + 1)) return false;   /* ((fn ..) args) */
+    } else if (head->type == -RAY_SYM && !(head->attrs & ATTR_QUOTED)) {
+        int64_t id = head->i64;
+        if (key_pure_form(id)) {
+            if (id == ray_sym_intern("quote", 5)) return true;
+            if (id == ray_sym_intern("fn", 2)) first_arg = 2;   /* the body, not the params */
+        } else {
+            ray_t* fn = ray_env_get_global(id);
+            if (fn && fn->type == RAY_LAMBDA) {
+                if (!key_lambda_pure(fn, depth)) return false;
+            } else if (fn && (fn->attrs & (RAY_FN_RESTRICTED | RAY_FN_SPECIAL_FORM))) {
+                return false;
+            } else if (!(query_inline_pure_builtin(id) || key_pure_builtin_extra(id) ||
+                         (fn && (fn->attrs & (RAY_FN_ATOMIC | RAY_FN_LEFT_ATOMIC |
+                                              RAY_FN_RIGHT_ATOMIC | RAY_FN_AGGR))))) {
+                return false;
+            }
+        }
+    } else {
+        return false;
+    }
+    for (int64_t i = first_arg; i < expr->len; i++)
+        if (!key_expr_pure(es[i], depth + 1)) return false;
+    return true;
+}
+
 static ray_t* query_quote_value(ray_t* value) {
     ray_t* quoted = ray_list_new(2);
     if (!quoted || RAY_IS_ERR(quoted)) {
@@ -10077,11 +10174,22 @@ static ray_t* select_plan_computed_key(ray_t* dict, ray_t* tbl, int64_t* key_nam
              * output with a condition is. */
             int64_t nrows = ray_table_nrows(base);
             int32_t conds = __VM->rows_cond;
-            ray_t* keyvec = eval_expr_whole_column(by_expr, base);
-            if (__VM->rows_cond != conds || !keyvec || RAY_IS_ERR(keyvec)) {
+            /* A body with an effect runs once per row, never whole first:
+             * a repeated run would repeat the effect. */
+            bool pure = key_expr_pure(by_expr, 0);
+            ray_t* keyvec = pure ? eval_expr_whole_column(by_expr, base) : NULL;
+            if (!pure) keyvec = eval_expr_per_row(by_expr, base, nrows);
+            else if (__VM->rows_cond != conds || !keyvec || RAY_IS_ERR(keyvec)) {
                 /* Also when the whole-column run failed: a body written for
-                 * one row may not accept a column at all. */
-                if (keyvec && RAY_IS_ERR(keyvec)) ray_error_free(keyvec);
+                 * one row may not accept a column at all.  The failure is
+                 * swallowed whole: its `raise` payload and trace go with it,
+                 * or the next `try` anywhere would receive them. */
+                if (keyvec && RAY_IS_ERR(keyvec)) {
+                    ray_error_free(keyvec);
+                    if (__VM->raise_val) { ray_release(__VM->raise_val); __VM->raise_val = NULL; }
+                    ray_clear_error_trace();
+                    __VM->err.msg[0] = '\0';
+                }
                 else if (keyvec) ray_release(keyvec);
                 keyvec = eval_expr_per_row(by_expr, base, nrows);
             }

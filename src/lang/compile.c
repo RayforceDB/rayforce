@@ -244,22 +244,11 @@ static void init_sf_syms(void) {
  * the env, where a tree-walk local would shadow a global.  Conservative
  * by construction — descends lists, dicts, and sym vectors. */
 static bool ast_refs_locals(compiler_t *c, ray_t *ast);
-/* Index of `id` among the compiled lambda's captures, or -1.  OP_LOADCAP
- * takes a one-byte index, so a capture past the 255th resolves as a name
- * through the ordinary path instead. */
-static int32_t find_capture(compiler_t *c, int64_t id) {
-    if (!c->lambda || !LAMBDA_CLOSURE(c->lambda)) return -1;
-    ray_t* keys = ray_dict_keys(LAMBDA_CLOSURE(c->lambda));
-    if (!keys || keys->type != RAY_SYM) return -1;
-    for (int64_t i = 0; i < keys->len && i < 256; i++)
-        if (ray_read_sym(ray_data(keys), i, RAY_SYM, keys->attrs) == id) return (int32_t)i;
-    return -1;
-}
 static bool sym_is_local_ref(compiler_t *c, int64_t id) {
     if (id == sf_self || id == sf_eval || id == sf_resolve) return true;
     for (int32_t i = c->n_locals - 1; i >= 0; i--)
-        if (c->locals[i].sym_id == id) return true;
-    return find_capture(c, id) >= 0;   /* a capture is a local of the closure */
+        if (c->locals[i].sym_id == id) return true;   /* params, lets, captures */
+    return false;
 }
 static bool ast_refs_locals(compiler_t *c, ray_t *ast) {
     if (!ast) return false;
@@ -296,8 +285,14 @@ static void compile_list(compiler_t *c, ray_t *ast) {
 
     init_sf_syms();
 
+    /* A local (parameter, let or capture) named like a special form or a
+     * builtin is the callee, as it is on the tree walker, where the name
+     * resolves through the scope frames first. */
+    bool head_local = head->type == -RAY_SYM && !(head->attrs & ATTR_QUOTED) &&
+                      find_local(c, head->i64) >= 0;
+
     /* Check for special forms by name (name ref = unflagged default) */
-    if (head->type == -RAY_SYM && !(head->attrs & ATTR_QUOTED)) {
+    if (head->type == -RAY_SYM && !(head->attrs & ATTR_QUOTED) && !head_local) {
         int64_t sym_id = head->i64;
 
         /* (set name value) — bind in the global env.  Compile the value
@@ -577,7 +572,7 @@ static void compile_list(compiler_t *c, ray_t *ast) {
     }
 
     /* Self-recursive call: emit OP_CALLS (lean frame reuse, no fn object) */
-    if (head->type == -RAY_SYM && !(head->attrs & ATTR_QUOTED) &&
+    if (head->type == -RAY_SYM && !(head->attrs & ATTR_QUOTED) && !head_local &&
         head->i64 == sf_self) {
         int64_t argc = n - 1;
         if (argc > 64) { c->error = true; return; }
@@ -590,7 +585,7 @@ static void compile_list(compiler_t *c, ray_t *ast) {
 
     /* Look up head at compile time to determine call type */
     ray_t *fn = NULL;
-    if (head->type == -RAY_SYM && !(head->attrs & ATTR_QUOTED))
+    if (head->type == -RAY_SYM && !(head->attrs & ATTR_QUOTED) && !head_local)
         fn = ray_env_get(head->i64);
 
     /* Unrecognized special form: dynamic eval on the entire form.  The
@@ -692,15 +687,13 @@ static void compile_expr(compiler_t *c, ray_t *ast) {
                 return;
             }
             int32_t slot = find_local(c, ast->i64);
-            int32_t cap = slot >= 0 ? -1 : find_capture(c, ast->i64);
             if (slot >= 0) {
                 emit(c, OP_LOADENV);
                 emit(c, (uint8_t)slot);
-            } else if (cap >= 0) {
-                /* A closure's capture is a fixed value: load it directly,
-                 * with the row flag it carries for the query it was made in. */
-                emit(c, OP_LOADCAP);
-                emit(c, (uint8_t)cap);
+            } else if (ast->i64 == sf_self) {
+                /* `self` as a value is the running lambda, as the tree
+                 * walker binds it in every call frame. */
+                emit(c, OP_LOADSELF);
             } else {
                 int32_t idx = add_constant(c, ast);
                 if (idx < 256) {
@@ -761,6 +754,28 @@ void ray_compile(ray_t *lambda) {
     int64_t *param_ids = (int64_t*)ray_data(params_list);
     for (int64_t i = 0; i < param_count; i++) {
         if (add_local(&c, param_ids[i]) < 0) { c.error = true; break; }
+    }
+
+    /* A closure's captures are locals of its body, bound before it runs:
+     * a `let` of a captured name writes the same slot, a capture named
+     * like a builtin is the callee, and a window (OP_SCOPE_BEGIN) binds
+     * them with the other locals.  A parameter shadows a capture of its
+     * name.  OP_LOADCAP takes a one-byte index and a frame holds 256
+     * slots: a closure with more captures than that stays on the tree
+     * walker, which has no such limit. */
+    if (!c.error && LAMBDA_CLOSURE(lambda)) {
+        ray_t *ckeys = ray_dict_keys(LAMBDA_CLOSURE(lambda));
+        init_sf_syms();
+        for (int64_t i = 0; i < ckeys->len && !c.error; i++) {
+            int64_t id = ray_read_sym(ray_data(ckeys), i, RAY_SYM, ckeys->attrs);
+            if (id == sf_self || find_local(&c, id) >= 0) continue;
+            int32_t slot = add_local(&c, id);
+            if (slot < 0 || i > 255) { c.error = true; break; }
+            emit(&c, OP_LOADCAP);
+            emit(&c, (uint8_t)i);
+            emit(&c, OP_STOREENV);
+            emit(&c, (uint8_t)slot);
+        }
     }
 
     /* Compile body expressions */

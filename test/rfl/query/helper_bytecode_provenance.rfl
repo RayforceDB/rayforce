@@ -305,3 +305,36 @@ OUT6 -- [3 3 3 3 3 3]
 ;; A compiled try with a fallback value keeps that value's provenance.
 (set hf (fn [v] 1 (concat (try (+ v 's) v) "!")))
 (at (select {r: (hf s) e: (reverse x) from: T}) 'r) -- ['a! 'b! 'c!]
+
+;; ── a whole-column key run that fails is swallowed whole ──────────────────
+;; Its `raise` payload and trace go with it: the next `try` anywhere gets its
+;; own error, not the key's.
+(set TB9 (table [v g] (list [1 2 3 10 20 30] ['a 'a 'b 'b 'c 'c])))
+(set kneg (fn [v] 1 (if (< v 0) (raise 'negative) (% v 7))))
+(at (select {n: (count v) by: (kneg v) from: TB9}) 'v) -- [1 2 3 6]
+(try (+ 1 'a) (fn [e] e)) -- 0
+
+;; ── a key body with an effect runs once per row ───────────────────────────
+;; It is never evaluated whole first, so the effect is not repeated.
+(set CNT9 0)
+(set kc9 (fn [v] (set CNT9 (+ CNT9 1)) (if (< v 5) 0 1)))
+(at (select {n: (count v) by: (kc9 v) from: TB9}) 'n) -- [3 3]
+CNT9 -- 6
+(set CNT9 0)
+(set kp9 (fn [v] (set CNT9 (+ CNT9 1)) (% v 7)))
+(at (select {n: (count v) by: (kp9 v) from: TB9}) 'v) -- [1 2 3 6]
+CNT9 -- 6
+;; a pure body with a scalar condition keeps the column whole
+(set hmin9 (fn [v] (if (> (min v) 0) (- v 1) v)))
+(at (select {n: (count v) by: (hmin9 v) from: TB9}) 'v) -- [0 1 2 9 19 29]
+
+;; ── a vector condition in a compiled key sends it row by row ──────────────
+;; `kfill9` is a global helper with no captures, so it runs as bytecode; the
+;; VM's conditional counts the vector test, as the tree walker's does.
+(set kfill9 (fn [v] (let w (fill 0 v)) (if (< w 3) v (* v 10))))
+(at (select {n: (count v) by: (kfill9 v) from: TB9}) 'v) -- [1 2 30 100 200 300]
+
+;; ── a lambda written in query text keeps the query's literal rule ─────────
+;; even with nothing to capture: `'p` is the column, so the join is row-wise.
+(set T9 (table [v p] (list ["1" "2" "3"] ['x 'y 'z])))
+(at (select {r: ((fn [a] (concat 'p a)) v) from: T9}) 'r) -- ["x1" "y2" "z3"]

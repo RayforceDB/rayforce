@@ -97,8 +97,9 @@ enum {
     OP_FORCE,         /* materialize TOS if it is a lazy handle (so a
                        * let-bound local holds a concrete, reusable value) */
     OP_LOADCAP,       /* push captured value: operand = index into the
-                       * closure (1 byte); carries the capture's row flag
-                       * while the query it was made under is innermost */
+                       * closure (1 byte).  Emitted only by the prologue
+                       * that binds each capture to a local slot */
+    OP_LOADSELF,      /* push the running lambda (bare `self` as a value) */
     OP__COUNT
 };
 
@@ -118,6 +119,8 @@ enum {
  *   data[8] = ray_t* caprows      (RAY_U8 row flag per capture, or NULL)
  *   data[9] = uint32_t capq       (serial of the query frame the closure was
  *                                  made under, 0 if none; never serialized)
+ *             uint32_t calls      (high half: calls made before compiling;
+ *                                  a closure compiles on its second call)
  */
 #define LAMBDA_SLOTS 10
 
@@ -133,6 +136,7 @@ enum {
 #define LAMBDA_CLOSURE(lam)   (((ray_t**)ray_data(lam))[7])
 #define LAMBDA_CAPROWS(lam)   (((ray_t**)ray_data(lam))[8])
 #define LAMBDA_CAPQ(lam)      (*((uint32_t*)&((ray_t**)ray_data(lam))[9]))
+#define LAMBDA_CALLS(lam)     (((uint32_t*)&((ray_t**)ray_data(lam))[9])[1])
 
 #define LAMBDA_IS_COMPILED(lam) ((lam)->attrs & RAY_FN_COMPILED)
 

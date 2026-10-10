@@ -1,0 +1,67 @@
+;; closure_locals.rfl — a compiled closure resolves names as the tree walker
+;; does.  Its captures are locals of its body (bound before the body runs), so
+;; a `let` of a captured name rebinds it for that call, a capture named like a
+;; builtin is the callee, `self` is the closure itself, and a caller's local
+;; of the same name never stands in for a capture.  A closure compiles on its
+;; second call, so every shape is called twice.
+
+;; a let of a captured name writes the capture's slot
+(set mk (fn [c] (fn [] (times 3 (let c (+ c 1))) c)))
+(set m1 (mk 0))
+(m1) -- 3
+(m1) -- 3
+(set mk2 (fn [c] (fn [flag] (if flag (let c 5) 0) c)))
+(set m2 (mk2 7))
+(m2 false) -- 7
+(m2 false) -- 7
+(m2 true) -- 5
+(m2 false) -- 7
+(set mkw (fn [c] (fn [] (let n 0) (while (and (< c 3) (< n 1000)) (let c (+ c 1)) (let n (+ n 1))) (list c n))))
+(set mw (mkw 0))
+(mw) -- [3 3]
+(mw) -- [3 3]
+
+;; a capture named like a builtin is the callee
+(set mkc (fn [count] (fn [x] (count x))))
+(set cc (mkc (fn [v] 42)))
+(cc [1 2 3]) -- 42
+(cc [1 2 3]) -- 42
+(set mkf (fn [first] (fn [xs] (first xs))))
+(set ff (mkf last))
+(ff [1 2 3]) -- 3
+(ff [1 2 3]) -- 3
+;; so is a parameter or a let of that name, in any compiled lambda
+(set pc (fn [count x] (count x)))
+(pc (fn [v] 42) [1 2 3]) -- 42
+(pc (fn [v] 42) [1 2 3]) -- 42
+(set lc (fn [x] (let count (fn [v] 7)) (count x)))
+(lc [1 2]) -- 7
+(lc [1 2]) -- 7
+
+;; self inside a closure is the closure, not its maker
+(set mkwalk (fn [k] (fn [node] (if (== (type node) 'LIST) (sum (map self node)) (* node k)))))
+(set wk (mkwalk 10))
+(wk (list 1 (list 2 3) 4)) -- 100
+(wk (list 1 (list 2 3) 4)) -- 100
+;; and a bare self is the running lambda in any compiled body
+(set walk (fn [node] (if (== (type node) 'LIST) (sum (map self node)) (* node 10))))
+(walk (list 1 (list 2 3) 4)) -- 100
+(walk (list 1 (list 2 3) 4)) -- 100
+
+;; a caller's local of the same name does not reach into the closure's windows
+(set g3 ((fn [c] (fn [] (map (fn [z] (+ z c)) [1 2]))) 10))
+(do (let c 99) (g3)) -- [11 12]
+(do (let c 99) (g3)) -- [11 12]
+(set T (table [x] (list [1 2 3 4 5 6])))
+(set q3 ((fn [c] (fn [] (count (select {from: T where: (> x c)})))) 4))
+(do (let c 0) (q3)) -- 2
+(do (let c 0) (q3)) -- 2
+
+;; more captures than a frame has slots: the closure stays on the tree walker
+;; and still sees every capture, never a global of the same name
+(set a299 -1)
+(set src (raze (concat (concat (enlist "(fn [] ") (map (fn [i] (concat (concat "(let a" (format "%" i)) (concat (concat " " (format "%" i)) ") "))) (til 300))) (enlist "(fn [] (+ a0 a299)))"))))
+(set big (eval (parse src)))
+(set bc (big))
+(bc) -- 299
+(bc) -- 299

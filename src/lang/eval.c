@@ -2172,6 +2172,9 @@ ray_t* ray_fn(ray_t** args, int64_t n) {
      * literal rule by running on the tree walker, so it is never compiled.
      * The serial of the query frame marks it. */
     if (!capq) capq = ray_env_query_serial();
+    /* The flags matter only to a lambda that is query text; a closure made
+     * outside any query is plain data and may compile. */
+    if (!capq && caprows) { ray_release(caprows); caprows = NULL; }
 
     /* Create lambda object (layout in eval.h): params, body, bytecode,
      * constants, n_locals, nfo, dbg, closure, capture row flags, query. */
@@ -2307,17 +2310,27 @@ bool ray_eval_query_helper_literals(void) {
 
 /* Ordinary calls use bytecode; query fallback interprets the retained AST
  * so concat can distinguish column parameters from bound collections. */
+/* Whether a call should compile the lambda first.  A lambda made inside a
+ * query (LAMBDA_CAPQ set) is query text and keeps the query's literal rule
+ * on the tree walker, so it never compiles.  A closure compiles on its
+ * second call: each closure object owns its bytecode, and one made to be
+ * called once (a handler, a lambda handed to `map`) would pay to compile a
+ * body it runs once.  Other lambdas compile on their first call. */
+static inline bool lambda_wants_compile(ray_t* lambda) {
+    if (LAMBDA_IS_COMPILED(lambda) || LAMBDA_CAPQ(lambda)) return false;
+    if (!LAMBDA_CLOSURE(lambda)) return true;
+    if (LAMBDA_CALLS(lambda) == 0) { LAMBDA_CALLS(lambda) = 1; return false; }
+    return true;
+}
+
 static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
                                bool query, uint64_t row_args, bool named,
                                int8_t* out_rows) {
     if (out_rows) *out_rows = -1;
     /* A lambda called inside a named helper's body is that body's text. */
     if (query && !named) named = ray_eval_query_helper_literals();
-    /* Lazy compilation on first call; a closure compiles too, its captures
-     * loaded as fixed values (OP_LOADCAP).  A lambda made inside a query
-     * (LAMBDA_CAPQ set) is query text and keeps the query's literal rule on
-     * the tree walker. */
-    if (!LAMBDA_IS_COMPILED(lambda) && !LAMBDA_CAPQ(lambda))
+    /* Lazy compilation (see lambda_wants_compile). */
+    if (lambda_wants_compile(lambda))
         ray_compile(lambda);
     if (LAMBDA_IS_COMPILED(lambda)) {
         if (!query) return vm_exec(lambda, call_args, argc);
@@ -2398,7 +2411,7 @@ static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
 }
 
 ray_t* call_lambda(ray_t* lambda, ray_t** call_args, int64_t argc) {
-    if (!LAMBDA_IS_COMPILED(lambda) && !LAMBDA_CAPQ(lambda)) ray_compile(lambda);
+    if (lambda_wants_compile(lambda)) ray_compile(lambda);
     if (LAMBDA_IS_COMPILED(lambda)) return vm_exec(lambda, call_args, argc);
     return call_lambda_impl(lambda, call_args, argc, false, 0, false, NULL);
 }
@@ -2539,6 +2552,7 @@ static ray_t* vm_exec_rows(ray_t* lambda, ray_t** call_args, int64_t argc,
         [OP_TRYH]          = &&op_tryh,
         [OP_FORCE]         = &&op_force,
         [OP_LOADCAP]       = &&op_loadcap,
+        [OP_LOADSELF]      = &&op_loadself,
     };
 
     /* Arity check before allocating VM state */
@@ -2861,7 +2875,7 @@ op_callf: {
     /* Compiled lambda: push frame, switch to callee bytecode.  A lambda
      * made inside a query stays on the tree walker (see call_lambda_impl). */
     if (fn_obj->type == RAY_LAMBDA) {
-        if (!LAMBDA_IS_COMPILED(fn_obj) && !LAMBDA_CAPQ(fn_obj))
+        if (lambda_wants_compile(fn_obj))
             ray_compile(fn_obj);
 
         if (LAMBDA_IS_COMPILED(fn_obj)) {
@@ -3159,21 +3173,23 @@ op_tryh: {
 }
 
 op_loadcap: {
-    /* A closure's capture: a fixed value, with the row flag it was made
-     * with while the query frame it was made under is the innermost one. */
+    /* A closure's capture, loaded by the prologue into its local slot.  A
+     * compiled closure was made outside any query (LAMBDA_CAPQ is 0), so
+     * the value is plain data. */
     uint8_t idx = code[ip++];
     ray_t *cap = LAMBDA_CLOSURE(vm.fn);
     ray_t *cvals = cap && cap->type == RAY_DICT ? ray_dict_vals(cap) : NULL;
     if (!cvals || cvals->type != RAY_LIST || idx >= cvals->len) goto vm_error_name;
     ray_t *val = ((ray_t**)ray_data(cvals))[idx];
-    uint8_t val_rows = 0;
-    ray_t *flags = LAMBDA_CAPROWS(vm.fn);
-    if (flags && idx < flags->len && LAMBDA_CAPQ(vm.fn) &&
-        LAMBDA_CAPQ(vm.fn) == ray_env_query_serial())
-        val_rows = ((uint8_t*)ray_data(flags))[idx];
     if (val) ray_retain(val);
     else val = make_i64(0);
-    PUSHR(val, val_rows);
+    PUSHR(val, 0);
+    DISPATCH();
+}
+
+op_loadself: {
+    ray_retain(vm.fn);
+    PUSHR(vm.fn, 0);
     DISPATCH();
 }
 
@@ -3202,21 +3218,9 @@ op_scope_begin: {
                                        &vm.ps[vm.fp], &vm.rows[vm.fp], vm.fn);
     ray_release(syms);
     if (err != RAY_OK) goto vm_error_limit;
-    /* The closure's own captures are locals of the window too, so a lambda
-     * created inside it captures them in turn. */
-    if (LAMBDA_CLOSURE(vm.fn) && LAMBDA_CLOSURE(vm.fn)->type == RAY_DICT) {
-        ray_t *ck = ray_dict_keys(LAMBDA_CLOSURE(vm.fn));
-        ray_t *cv = ray_dict_vals(LAMBDA_CLOSURE(vm.fn));
-        ray_t *cf = LAMBDA_CAPROWS(vm.fn);
-        bool live = cf && LAMBDA_CAPQ(vm.fn) && LAMBDA_CAPQ(vm.fn) == ray_env_query_serial();
-        if (!ck || !cv || ck->type != RAY_SYM || cv->type != RAY_LIST) ck = NULL;   /* shape checked at compile */
-        for (int64_t i = 0; ck && cv && i < ck->len && i < cv->len; i++) {
-            int64_t sym = ray_read_sym(ray_data(ck), i, RAY_SYM, ck->attrs);
-            if (ray_env_get_local(sym)) continue;   /* a local shadows a capture */
-            ray_t *v = ((ray_t**)ray_data(cv))[i];
-            if (v) (void)ray_env_set_local_rows(sym, v, live && i < cf->len ? ((uint8_t*)ray_data(cf))[i] : 0);
-        }
-    }
+    /* A closure's captures sit in local slots (bound by the prologue), so
+     * the window binds them with the other locals, and nothing from the
+     * caller's frames can stand in for one. */
     DISPATCH();
 }
 

@@ -194,6 +194,11 @@ ray_t* ray_env_capture_locals(void) {
     return ray_env_capture_locals_rows(NULL, NULL);
 }
 
+/* Cached `self` sym id for ray_env_scope_bind and the capture below —
+ * interned once per sym table generation; invalidated alongside the hook
+ * syms (env_reset_cached_syms). */
+static int64_t g_self_sym = -1;
+
 ray_t* ray_env_capture_locals_rows(ray_t** flags_out, uint32_t* serial_out) {
     if (flags_out) *flags_out = NULL;
     if (serial_out) *serial_out = 0;
@@ -218,12 +223,14 @@ ray_t* ray_env_capture_locals_rows(ray_t** flags_out, uint32_t* serial_out) {
     if (!flags || RAY_IS_ERR(flags)) { ray_release(keys); ray_release(vals); return flags ? flags : ray_error("oom", NULL); }
     flags->len = 0;
     bool any_flag = false, outer = false;
+    if (g_self_sym < 0) g_self_sym = ray_sym_intern("self", 4);
     /* Top-to-bottom flattening preserves ordinary lexical lookup: the first
-     * occurrence of a name is the value visible at closure creation. */
+     * occurrence of a name is the value visible at closure creation.  `self`
+     * is never captured: inside the closure it is the closure itself. */
     for (int32_t d = __VM->scope_depth - 1; d >= 0; d--) {
         ray_scope_frame_t* f = &__VM->scope_stack[d];
         for (int32_t i = 0; i < f->count; i++) {
-            if (!f->vals[i]) continue;
+            if (!f->vals[i] || f->keys[i] == g_self_sym) continue;
             bool seen = false;
             for (int64_t k = 0; k < keys->len; k++)
                 if (key_ids[k] == f->keys[i]) { seen = true; break; }
@@ -298,9 +305,7 @@ ray_err_t ray_env_push_capture(ray_t* capture, ray_t* flags, uint32_t serial) {
 static int64_t g_ipc_hook_syms[5] = {0};
 static bool    g_ipc_hook_syms_ready = false;
 
-/* Cached `self` sym id for ray_env_scope_bind — interned once per sym
- * table generation; invalidated alongside the hook syms below. */
-static int64_t g_self_sym = -1;
+/* g_self_sym: see its declaration above ray_env_capture_locals_rows. */
 
 static void ipc_hook_syms_ensure(void) {
     if (g_ipc_hook_syms_ready) return;
