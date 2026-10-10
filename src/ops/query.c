@@ -9721,8 +9721,8 @@ static ray_t* select_parted_first_rows(ray_t* dict, ray_t* tbl, bool aliases_res
  * sorted (and taken) as asked; the rows that leaves are gathered from the
  * partitions -- every column when the select has no outputs, else the
  * columns its outputs name.  Outputs must be bare columns, and each sort
- * key a column the result carries under its own name.  NULL when the shape
- * is not handled here (the caller flattens the table). */
+ * key a column of the table.  NULL when the shape is not handled here
+ * (the caller flattens the table). */
 static ray_t* select_parted_sorted(ray_t* dict, ray_t* tbl, bool aliases_resolved) {
     int64_t nc = ray_table_ncols(tbl);
     if (nc <= 0 || nc > 256) return NULL;   /* sel_compact's column limit */
@@ -9753,8 +9753,19 @@ static ray_t* select_parted_sorted(ray_t* dict, ray_t* tbl, bool aliases_resolve
                  !ray_table_get_col(tbl, v->i64)) ok = false;   /* a bare column */
         else n_out++;
     }
-    /* Sort keys: columns of the table the result carries under their own
-     * names -- every column without outputs, else an output naming it. */
+    /* An output naming another output's alias reads that output, not the
+     * column (`{x: y z: x}`): left to the flat path. */
+    for (int64_t i = 0; i < nd && ok; i++) {
+        int64_t kid = sym_cell_runtime_id(keys, i);
+        if (kid == id_from || kid == id_take || kid == id_asc || kid == id_desc) continue;
+        int64_t src = ((ray_t**)ray_data(vals))[i]->i64;
+        for (int64_t j = 0; j < nd && ok; j++)
+            if (j != i && sym_cell_runtime_id(keys, j) == src && src != id_from &&
+                src != id_take && src != id_asc && src != id_desc &&
+                ((ray_t**)ray_data(vals))[j]->i64 != src) ok = false;
+    }
+    /* Sort keys: columns of the table, read as columns whatever the outputs
+     * are named, as the flat sort reads them. */
     for (int64_t i = 0; i < nd && ok; i++) {
         int64_t kid = sym_cell_runtime_id(keys, i);
         if (kid != id_asc && kid != id_desc) continue;
@@ -9766,15 +9777,6 @@ static ray_t* select_parted_sorted(ray_t* dict, ray_t* tbl, bool aliases_resolve
             int64_t c = -1;
             for (int64_t s = 0; s < nc && c < 0; s++) if (ray_table_col_name(tbl, s) == sk) c = s;
             if (c < 0) { ok = false; break; }
-            if (n_out > 0) {
-                bool carried = false;
-                for (int64_t o = 0; o < nd && !carried; o++) {
-                    int64_t okid = sym_cell_runtime_id(keys, o);
-                    ray_t* ov = ((ray_t**)ray_data(vals))[o];
-                    if (okid == sk && ov && ov->type == -RAY_SYM && ov->i64 == sk) carried = true;
-                }
-                if (!carried) { ok = false; break; }
-            }
             real[c] = 1;
         }
     }

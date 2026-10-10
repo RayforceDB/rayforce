@@ -407,6 +407,16 @@
 (select {from: Pck desc: 'y}) -- (select {from: Mck desc: 'y})
 (select {x: x from: Pck desc: x}) -- (select {x: x from: Mck desc: x})
 (select {y: y from: Pck desc: x}) -- (select {y: y from: Mck desc: x})
+;; sort keys no output carries, or carried under another name: the sort
+;; reads them as columns whatever the outputs are named, as the flat one
+;; does; an output naming another output reads that output
+(select {y: y s: s from: Pck desc: x take: 2}) -- (select {y: y s: s from: Mck desc: x take: 2})
+(select {s: s from: Pck asc: [y x] take: -2}) -- (select {s: s from: Mck asc: [y x] take: -2})
+(select {z: x r: r from: Pck asc: x}) -- (select {z: x r: r from: Mck asc: x})
+(select {date: date y: y from: Pck desc: y take: 3}) -- (select {date: date y: y from: Mck desc: y take: 3})
+(select {x: y r: r from: Pck desc: x}) -- (select {x: y r: r from: Mck desc: x})
+(select {x: y y: x from: Pck desc: y}) -- (select {x: y y: x from: Mck desc: y})
+(select {x: y z: x y: y from: Pck desc: y}) -- (select {x: y z: x y: y from: Mck desc: y})
 ;; it groups on the columns the clauses name and gathers the others at the
 ;; rows kept: a sort key only in desc:/asc:, a by-dict value's column, the
 ;; partition key sorted, every row its own group, a key from a global

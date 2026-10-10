@@ -35,6 +35,10 @@
 (set pk0 (at (.sys.mem) 'peak-bytes))
 (at (select {from: Pmw desc: k take: 3}) 'k) -- [39999 39998 39997]
 (< (- (at (.sys.mem) 'peak-bytes) pk0) (/ Bmw 4)) -- true
+;; the same with outputs that leave the sort key out
+(set pk0 (at (.sys.mem) 'peak-bytes))
+(at (select {k: k c3: c3 from: Pmw desc: c5 take: 3}) 'k) -- [4999 9999 14999]
+(< (- (at (.sys.mem) 'peak-bytes) pk0) (/ Bmw 4)) -- true
 ;; 10 groups: well under a flatten
 (set pk0 (at (.sys.mem) 'peak-bytes))
 (count (select {by: lo from: Pmw})) -- 10
