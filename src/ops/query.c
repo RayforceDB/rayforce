@@ -9437,6 +9437,99 @@ static ray_t* select_name_computed_key(ray_t* r, int64_t key_name) {
     return r;
 }
 
+/* Rows rv[0..n) of a parted table, gathered one column at a time without
+ * flattening the table: the rows are marked, a column is compacted to the
+ * marked rows (in ascending order) by sel_compact, and when rv is not
+ * ascending each row is put in its place by its rank among the marked
+ * ones.  Every row marked: the column flattened, ranked by row number. */
+typedef struct {
+    ray_t*   tbl;
+    ray_t*   sel;        /* the marked rows; NULL when every row is marked */
+    ray_t*   perm_hdr;
+    int64_t* perm;       /* rank of each row; NULL when rv ascends */
+    int64_t  n;
+} parted_rows_t;
+
+/* NULL, or the error; parted_rows_close either way. */
+static ray_t* parted_rows_open(parted_rows_t* pr, ray_t* tbl, const int64_t* rv, int64_t n) {
+    memset(pr, 0, sizeof(*pr));
+    pr->tbl = tbl;
+    pr->n = n;
+    int64_t nrows = ray_table_nrows(tbl);
+    bool ascending = true;
+    for (int64_t i = 1; i < n && ascending; i++) if (rv[i] <= rv[i - 1]) ascending = false;
+    ray_t* mask = ray_vec_new(RAY_BOOL, nrows);
+    if (!mask || RAY_IS_ERR(mask)) return mask ? mask : ray_error("oom", NULL);
+    mask->len = nrows;
+    uint8_t* mk = (uint8_t*)ray_data(mask);
+    if (nrows > 0) memset(mk, 0, (size_t)nrows);
+    for (int64_t i = 0; i < n; i++) {
+        if (rv[i] < 0 || rv[i] >= nrows) {
+            ray_release(mask);
+            return ray_error("domain", "select: lost the rows of a parted table");
+        }
+        mk[rv[i]] = 1;
+    }
+    int64_t nsel = 0;
+    for (int64_t r = 0; r < nrows; r++) nsel += mk[r];
+    ray_t* err = NULL;
+    if (nsel != nrows) {
+        pr->sel = ray_rowsel_from_pred(mask);
+        if (!pr->sel) err = ray_error("oom", NULL);
+    }
+    if (!err && !ascending) {
+        pr->perm = (int64_t*)scratch_alloc(&pr->perm_hdr, (size_t)n * sizeof(int64_t));
+        ray_t* asc_hdr = NULL;
+        int64_t* asc_rows = pr->sel ? (int64_t*)scratch_alloc(&asc_hdr, (size_t)(nsel > 0 ? nsel : 1) * sizeof(int64_t)) : NULL;
+        if (!pr->perm || (pr->sel && !asc_rows)) err = ray_error("oom", NULL);
+        else if (!pr->sel) {
+            for (int64_t i = 0; i < n; i++) pr->perm[i] = rv[i];   /* every row: rank = row */
+        } else {
+            int64_t j = 0;
+            for (int64_t r = 0; r < nrows; r++) if (mk[r]) asc_rows[j++] = r;
+            for (int64_t i = 0; i < n; i++) {
+                int64_t lo = 0, hi = nsel - 1;
+                while (lo < hi) {
+                    int64_t mid = lo + (hi - lo) / 2;
+                    if (asc_rows[mid] < rv[i]) lo = mid + 1; else hi = mid;
+                }
+                pr->perm[i] = lo;
+            }
+        }
+        scratch_free(asc_hdr);
+    }
+    ray_release(mask);
+    return err;
+}
+
+/* Column `c` of the table at the rows, owned. */
+static ray_t* parted_rows_gather(parted_rows_t* pr, int64_t c) {
+    ray_t* v;
+    if (!pr->sel) {
+        v = query_materialize_parted_col(ray_table_get_col_idx(pr->tbl, c));
+    } else {
+        int64_t cn = ray_table_col_name(pr->tbl, c);
+        ray_t* one = sel_compact(NULL, pr->tbl, pr->sel, &cn, 1);
+        v = (one && !RAY_IS_ERR(one)) ? ray_table_get_col(one, cn) : one;
+        if (v && !RAY_IS_ERR(v)) ray_retain(v);
+        if (one && !RAY_IS_ERR(one)) ray_release(one);
+    }
+    if (v && !RAY_IS_ERR(v) && pr->perm) {
+        ray_t* placed = ray_group_gather(v, pr->perm, pr->n);
+        ray_release(v);
+        v = placed;
+    }
+    return v ? v : ray_error("domain", "select: lost a column of a parted table");
+}
+
+static void parted_rows_close(parted_rows_t* pr) {
+    if (pr->sel) ray_rowsel_release(pr->sel);
+    scratch_free(pr->perm_hdr);
+    pr->sel = NULL;
+    pr->perm_hdr = NULL;
+    pr->perm = NULL;
+}
+
 /* A grouped select with no outputs returns the first row of each group,
  * every column of it; its paths read plain columns.  Over a parted table
  * this groups a narrow copy instead of the flattened table: the columns
@@ -9561,55 +9654,8 @@ static ray_t* select_parted_first_rows(ray_t* dict, ray_t* tbl, bool aliases_res
     if (!rows || rows->type != RAY_I64) { ray_release(res); scratch_free(buf_hdr); return NULL; }
     int64_t n = rows->len;
     const int64_t* rv = (const int64_t*)ray_data(rows);
-    bool ascending = true;
-    for (int64_t i = 1; i < n && ascending; i++) if (rv[i] <= rv[i - 1]) ascending = false;
-
-    /* The rows kept, marked; a selection of them unless every row is kept.
-     * Out of order, each one's rank among the marked rows places it. */
-    ray_t* mask = ray_vec_new(RAY_BOOL, nrows);
-    if (!mask || RAY_IS_ERR(mask)) { ray_release(res); scratch_free(buf_hdr); return mask ? mask : ray_error("oom", NULL); }
-    mask->len = nrows;
-    uint8_t* mk = (uint8_t*)ray_data(mask);
-    if (nrows > 0) memset(mk, 0, (size_t)nrows);
-    for (int64_t i = 0; i < n; i++) {
-        if (rv[i] < 0 || rv[i] >= nrows) {
-            ray_release(mask); ray_release(res); scratch_free(buf_hdr);
-            return ray_error("domain", "select by: lost the rows of a parted table");
-        }
-        mk[rv[i]] = 1;
-    }
-    int64_t nsel = 0;
-    for (int64_t r = 0; r < nrows; r++) nsel += mk[r];
-    ray_t* sel = NULL;
-    ray_t* perm_hdr = NULL;
-    int64_t* perm = NULL;
-    ray_t* err = NULL;
-    if (nsel != nrows) {
-        sel = ray_rowsel_from_pred(mask);
-        if (!sel) err = ray_error("oom", NULL);
-    }
-    if (!err && !ascending) {
-        perm = (int64_t*)scratch_alloc(&perm_hdr, (size_t)n * sizeof(int64_t));
-        ray_t* asc_hdr = NULL;
-        int64_t* asc_rows = sel ? (int64_t*)scratch_alloc(&asc_hdr, (size_t)(nsel > 0 ? nsel : 1) * sizeof(int64_t)) : NULL;
-        if (!perm || (sel && !asc_rows)) err = ray_error("oom", NULL);
-        else if (!sel) {
-            for (int64_t i = 0; i < n; i++) perm[i] = rv[i];   /* every row: rank = row */
-        } else {
-            int64_t j = 0;
-            for (int64_t r = 0; r < nrows; r++) if (mk[r]) asc_rows[j++] = r;
-            for (int64_t i = 0; i < n; i++) {
-                int64_t lo = 0, hi = nsel - 1;
-                while (lo < hi) {
-                    int64_t mid = lo + (hi - lo) / 2;
-                    if (asc_rows[mid] < rv[i]) lo = mid + 1; else hi = mid;
-                }
-                perm[i] = lo;
-            }
-        }
-        scratch_free(asc_hdr);
-    }
-    ray_release(mask);
+    parted_rows_t pr;
+    ray_t* err = parted_rows_open(&pr, tbl, rv, n);
 
     /* The result: the key columns, then the source's columns no key
      * replaces, in its order -- a real one from res, any other gathered. */
@@ -9626,29 +9672,173 @@ static ray_t* select_parted_first_rows(ray_t* dict, ray_t* tbl, bool aliases_res
         for (int64_t k = 0; k < nkeys; k++) if (ray_table_col_name(res, k) == cn) is_key = true;
         if (is_key) continue;
         ray_t* v;
-        if (real[c]) {
+        if (real[c]) {   /* res rows are in place already */
             v = ray_table_get_col(res, cn);
             if (v) ray_retain(v);
-        } else if (!sel) {
-            v = query_materialize_parted_col(ray_table_get_col_idx(tbl, c));
+            else v = ray_error("domain", "select by: lost a column of a parted table");
         } else {
-            ray_t* one = sel_compact(NULL, tbl, sel, &cn, 1);
-            v = (one && !RAY_IS_ERR(one)) ? ray_table_get_col(one, cn) : one;
-            if (v && !RAY_IS_ERR(v)) ray_retain(v);
-            if (one && !RAY_IS_ERR(one)) ray_release(one);
+            v = parted_rows_gather(&pr, c);
         }
-        if (!real[c] && v && !RAY_IS_ERR(v) && !ascending) {   /* res rows are placed already */
-            ray_t* placed = ray_group_gather(v, perm, n);
-            ray_release(v);
-            v = placed;
-        }
-        if (!v || RAY_IS_ERR(v)) { ray_release(out); out = v ? v : ray_error("domain", "select by: lost a column of a parted table"); break; }
+        if (RAY_IS_ERR(v)) { ray_release(out); out = v; break; }
         out = ray_table_add_col(out, cn, v);
         ray_release(v);
     }
-    if (sel) ray_rowsel_release(sel);
+    parted_rows_close(&pr);
     ray_release(res);
-    scratch_free(perm_hdr);
+    scratch_free(buf_hdr);
+    return out ? out : ray_error("oom", NULL);
+}
+
+/* A sorted select without by: over a parted table that neither streaming
+ * path takes: the sort keys, flattened, and one row-number column are
+ * sorted (and taken) as asked; the rows that leaves are gathered from the
+ * partitions -- every column when the select has no outputs, else the
+ * columns its outputs name.  Outputs must be bare columns, and each sort
+ * key a column the result carries under its own name.  NULL when the shape
+ * is not handled here (the caller flattens the table). */
+static ray_t* select_parted_sorted(ray_t* dict, ray_t* tbl, bool aliases_resolved) {
+    int64_t nc = ray_table_ncols(tbl);
+    if (nc <= 0 || nc > 256) return NULL;   /* sel_compact's column limit */
+    int64_t row_sym = ray_sym_intern("__row", 5);
+    if (ray_table_get_col(tbl, row_sym)) return NULL;
+    ray_t* keys = ray_dict_keys(dict);
+    ray_t* vals = ray_dict_vals(dict);
+    int64_t nd = ray_dict_len(dict);
+    if (!keys || keys->type != RAY_SYM || !vals || vals->type != RAY_LIST) return NULL;
+    int64_t id_from = ray_sym_intern("from", 4), id_where = ray_sym_intern("where", 5),
+            id_by = ray_sym_intern("by", 2), id_take = ray_sym_intern("take", 4),
+            id_asc = ray_sym_intern("asc", 3), id_desc = ray_sym_intern("desc", 4),
+            id_nearest = ray_sym_intern("nearest", 7);
+
+    ray_t* buf_hdr = NULL;
+    uint8_t* real = (uint8_t*)scratch_alloc(&buf_hdr, (size_t)nc);
+    if (!real) return ray_error("oom", NULL);
+    memset(real, 0, (size_t)nc);
+    int64_t n_out = 0, n_clause = 0;
+    bool ok = true;
+    for (int64_t i = 0; i < nd && ok; i++) {
+        int64_t kid = sym_cell_runtime_id(keys, i);
+        ray_t* v = ((ray_t**)ray_data(vals))[i];
+        if (kid == id_where || kid == id_by || kid == id_nearest) ok = false;
+        else if (kid == id_from) continue;
+        else if (kid == id_take || kid == id_asc || kid == id_desc) n_clause++;
+        else if (!v || v->type != -RAY_SYM || (v->attrs & ATTR_QUOTED) ||
+                 !ray_table_get_col(tbl, v->i64)) ok = false;   /* a bare column */
+        else n_out++;
+    }
+    /* Sort keys: columns of the table the result carries under their own
+     * names -- every column without outputs, else an output naming it. */
+    for (int64_t i = 0; i < nd && ok; i++) {
+        int64_t kid = sym_cell_runtime_id(keys, i);
+        if (kid != id_asc && kid != id_desc) continue;
+        ray_t* v = ((ray_t**)ray_data(vals))[i];
+        int64_t nk = v && v->type == -RAY_SYM ? 1 : (v && v->type == RAY_SYM ? ray_len(v) : -1);
+        if (nk < 1) { ok = false; break; }
+        for (int64_t j = 0; j < nk && ok; j++) {
+            int64_t sk = v->type == -RAY_SYM ? v->i64 : sym_cell_runtime_id(v, j);
+            int64_t c = -1;
+            for (int64_t s = 0; s < nc && c < 0; s++) if (ray_table_col_name(tbl, s) == sk) c = s;
+            if (c < 0) { ok = false; break; }
+            if (n_out > 0) {
+                bool carried = false;
+                for (int64_t o = 0; o < nd && !carried; o++) {
+                    int64_t okid = sym_cell_runtime_id(keys, o);
+                    ray_t* ov = ((ray_t**)ray_data(vals))[o];
+                    if (okid == sk && ov && ov->type == -RAY_SYM && ov->i64 == sk) carried = true;
+                }
+                if (!carried) { ok = false; break; }
+            }
+            real[c] = 1;
+        }
+    }
+    if (!ok) { scratch_free(buf_hdr); return NULL; }
+
+    /* The narrow table: the sort keys, then the row number. */
+    int64_t nrows = ray_table_nrows(tbl);
+    ray_t* narrow = ray_table_new(nc + 1);
+    for (int64_t c = 0; c < nc && narrow && !RAY_IS_ERR(narrow); c++) {
+        if (!real[c]) continue;
+        ray_t* v = query_materialize_parted_col(ray_table_get_col_idx(tbl, c));
+        if (!v || RAY_IS_ERR(v)) { ray_release(narrow); narrow = v ? v : ray_error("oom", NULL); break; }
+        narrow = ray_table_add_col(narrow, ray_table_col_name(tbl, c), v);
+        ray_release(v);
+    }
+    if (narrow && !RAY_IS_ERR(narrow)) {
+        ray_t* rownum = ray_vec_new(RAY_I64, nrows);
+        if (!rownum || RAY_IS_ERR(rownum)) {
+            ray_release(narrow);
+            narrow = rownum ? rownum : ray_error("oom", NULL);
+        } else {
+            rownum->len = nrows;
+            for (int64_t r = 0; r < nrows; r++) ((int64_t*)ray_data(rownum))[r] = r;
+            narrow = ray_table_add_col(narrow, row_sym, rownum);
+            ray_release(rownum);
+        }
+    }
+    if (!narrow || RAY_IS_ERR(narrow)) { scratch_free(buf_hdr); return narrow ? narrow : ray_error("oom", NULL); }
+
+    /* The sort over it: from:, then asc:/desc:/take: in the query's order. */
+    ray_t* ck = ray_vec_new(RAY_SYM, n_clause + 1);
+    ray_t* cv = ray_list_new((int32_t)(n_clause + 1));
+    if (ck && !RAY_IS_ERR(ck) && cv && !RAY_IS_ERR(cv)) {
+        ((int64_t*)ray_data(ck))[0] = id_from;
+        ck->len = 1;
+        cv = ray_list_append(cv, narrow);
+        for (int64_t i = 0; i < nd && cv && !RAY_IS_ERR(cv); i++) {
+            int64_t kid = sym_cell_runtime_id(keys, i);
+            if (kid != id_take && kid != id_asc && kid != id_desc) continue;
+            ((int64_t*)ray_data(ck))[ck->len++] = kid;
+            cv = ray_list_append(cv, ((ray_t**)ray_data(vals))[i]);
+        }
+    }
+    ray_release(narrow);
+    ray_t* engine = (ck && !RAY_IS_ERR(ck) && cv && !RAY_IS_ERR(cv)) ? ray_dict_new(ck, cv) : NULL;
+    if (!engine || RAY_IS_ERR(engine)) {
+        if (!engine) {
+            if (ck && !RAY_IS_ERR(ck)) ray_release(ck);
+            if (cv && !RAY_IS_ERR(cv)) ray_release(cv);
+        }
+        scratch_free(buf_hdr);
+        return engine ? engine : ray_error("oom", NULL);
+    }
+    ray_t* res = ray_select_impl(&engine, 1, aliases_resolved);
+    ray_release(engine);
+    if (res && !RAY_IS_ERR(res) && ray_is_lazy(res)) res = ray_lazy_materialize(res);
+    if (!res || RAY_IS_ERR(res) || res->type != RAY_TABLE) { scratch_free(buf_hdr); return res ? res : ray_error("oom", NULL); }
+    int64_t rc = ray_table_ncols(res);
+    ray_t* rows = rc > 0 && ray_table_col_name(res, rc - 1) == row_sym ? ray_table_get_col_idx(res, rc - 1) : NULL;
+    if (!rows || rows->type != RAY_I64) { ray_release(res); scratch_free(buf_hdr); return NULL; }
+
+    parted_rows_t pr;
+    ray_t* err = parted_rows_open(&pr, tbl, (const int64_t*)ray_data(rows), rows->len);
+    ray_t* out = err ? err : ray_table_new(n_out > 0 ? n_out : nc);
+    /* every column of the table, or each output under its name */
+    for (int64_t i = 0; i < (n_out > 0 ? nd : nc) && out && !RAY_IS_ERR(out); i++) {
+        int64_t name, src;
+        if (n_out > 0) {
+            int64_t kid = sym_cell_runtime_id(keys, i);
+            if (kid == id_from || kid == id_take || kid == id_asc || kid == id_desc) continue;
+            name = kid;
+            src = ((ray_t**)ray_data(vals))[i]->i64;
+        } else {
+            name = src = ray_table_col_name(tbl, i);
+        }
+        int64_t c = -1;
+        for (int64_t s = 0; s < nc && c < 0; s++) if (ray_table_col_name(tbl, s) == src) c = s;
+        ray_t* v;
+        if (c >= 0 && real[c]) {   /* the sort rows are in place already */
+            v = ray_table_get_col(res, src);
+            if (v) ray_retain(v);
+            else v = ray_error("domain", "select: lost a column of a parted table");
+        } else {
+            v = c >= 0 ? parted_rows_gather(&pr, c) : ray_error("domain", "select: lost a column of a parted table");
+        }
+        if (RAY_IS_ERR(v)) { ray_release(out); out = v; break; }
+        out = ray_table_add_col(out, name, v);
+        ray_release(v);
+    }
+    parted_rows_close(&pr);
+    ray_release(res);
     scratch_free(buf_hdr);
     return out ? out : ray_error("oom", NULL);
 }
@@ -9909,6 +10099,19 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, bool aliases_resolved,
             DICT_VIEW_CLOSE(dv);
             return streamed;
         }
+    }
+
+    /* Any other sort without by: over a parted table: the flat sort below
+     * reads plain columns.  Sort the keys and gather the rows kept
+     * (select_parted_sorted); a shape it does not take flattens the table.
+     * A where: flattens the rows it keeps itself. */
+    if (has_sort && !by_expr && !where_expr && !nearest_expr && table_has_parted_columns(tbl)) {
+        ray_t* sorted = select_parted_sorted(dict, tbl, aliases_resolved);
+        if (sorted) { ray_release(tbl); DICT_VIEW_CLOSE(dv); return sorted; }
+        ray_t* flat = query_materialize_parted_table(tbl);
+        ray_release(tbl);
+        if (!flat || RAY_IS_ERR(flat)) { DICT_VIEW_CLOSE(dv); return flat ? flat : ray_error("oom", NULL); }
+        tbl = flat;
     }
 
     /* Fused filter + top-K: shape `(select {col1: c1 col2: c2 …

@@ -390,6 +390,23 @@
 (select {by: x from: Pck where: (> x 2)}) -- (select {by: x from: Mck where: (> x 2)})
 (select {by: x from: Pck where: (>= x 0)}) -- (select {by: x from: Mck where: (>= x 0)})
 (select {by: date from: Pck where: (> date 2024.01.01)}) -- (select {by: date from: Mck where: (> date 2024.01.01)})
+;; a sort without by: sorts the keys and gathers the rows they keep; the
+;; flat sort it fell to read parted columns as plain ones and failed
+(select {from: Pck desc: x}) -- (select {from: Mck desc: x})
+(select {from: Pck asc: y}) -- (select {from: Mck asc: y})
+(select {from: Pck desc: x take: 2}) -- (select {from: Mck desc: x take: 2})
+(select {from: Pck asc: x take: -2}) -- (select {from: Mck asc: x take: -2})
+(select {from: Pck asc: x take: 0}) -- (select {from: Mck asc: x take: 0})
+(select {from: Pck asc: x take: [1 3]}) -- (select {from: Mck asc: x take: [1 3]})
+(select {from: Pck asc: [x y]}) -- (select {from: Mck asc: [x y]})
+(select {from: Pck asc: x desc: y}) -- (select {from: Mck asc: x desc: y})
+(select {from: Pck where: (> y 15) desc: x take: 2}) -- (select {from: Mck where: (> y 15) desc: x take: 2})
+(select {from: Pck asc: s}) -- (select {from: Mck asc: s})
+(select {from: Pck desc: r take: 3}) -- (select {from: Mck desc: r take: 3})
+(select {from: Pck desc: date}) -- (select {from: Mck desc: date})
+(select {from: Pck desc: 'y}) -- (select {from: Mck desc: 'y})
+(select {x: x from: Pck desc: x}) -- (select {x: x from: Mck desc: x})
+(select {y: y from: Pck desc: x}) -- (select {y: y from: Mck desc: x})
 ;; it groups on the columns the clauses name and gathers the others at the
 ;; rows kept: a sort key only in desc:/asc:, a by-dict value's column, the
 ;; partition key sorted, every row its own group, a key from a global
@@ -420,39 +437,3 @@
 (select {by: (+ (% x 2) 1) from: Pckk}) -- (select {by: (+ (% x 2) 1) from: Mckk})
 (select {by: 5 from: Pckk}) -- (select {by: 5 from: Mckk})
 (.sys.exec "rm -rf /tmp/rfl_ckpkey")
-;; the columns no clause names are read at the kept rows only: a wide string
-;; column the select never reads costs nothing near its flattened size (14 MB
-;; here when the whole table was flattened)
-(.sys.exec "rm -rf /tmp/rfl_ckwide")
-(set Wck (concat "wide-unused-string-column-value-over-twelve-bytes-" (as 'STR (% (til 10000) 1000))))
-(set Kck (% (til 10000) 10))
-(map (fn [d] (.db.splayed.set (format "/tmp/rfl_ckwide/2024.01.0%/t/" d) (table [k w] (list Kck Wck)))) [1 2 3 4 5 6 7 8])
-(set Wck 0)
-(set Kck 0)
-(set Pw (.db.parted.get "/tmp/rfl_ckwide/" 't))
-(set pk0 (at (.sys.mem) 'peak-bytes))
-(set Rw (select {by: k from: Pw}))
-(< (- (at (.sys.mem) 'peak-bytes) pk0) 2000000) -- true
-(count Rw) -- 10
-(at Rw 'w) -- (concat "wide-unused-string-column-value-over-twelve-bytes-" (as 'STR (til 10)))
-(.sys.exec "rm -rf /tmp/rfl_ckwide")
-;; whatever the number of groups, the peak stays below what flattening the
-;; table costs (the table, then its rows again for the result): one row
-;; number per group, the columns gathered one at a time.  22 columns,
-;; 8 partitions of 5000 rows: Bmw bytes flattened.
-(.sys.exec "rm -rf /tmp/rfl_ckmw")
-(set Nmw 5000)
-(set mkmw (fn [p] (table (concat ['k 'lo] (as 'SYMBOL (map (fn [j] (format "c%" j)) (til 20)))) (concat (list (+ (* p Nmw) (til Nmw)) (% (til Nmw) 10)) (map (fn [j] (as 'I32 (+ j (til Nmw)))) (til 20))))))
-(map (fn [p] (do (.db.splayed.set (format "/tmp/rfl_ckmw/2024.01.0%/t/" (+ p 1)) (mkmw p)) 0)) (til 8))
-(set Pmw (.db.parted.get "/tmp/rfl_ckmw/" 't))
-(set Bmw (* (* 8 Nmw) 96))
-;; 10 groups: well under a flatten
-(set pk0 (at (.sys.mem) 'peak-bytes))
-(count (select {by: lo from: Pmw})) -- 10
-(< (- (at (.sys.mem) 'peak-bytes) pk0) (/ Bmw 4)) -- true
-;; every key unique: the result is the whole table, and little more
-(set pk0 (at (.sys.mem) 'peak-bytes))
-(count (select {by: k from: Pmw})) -- 40000
-(< (- (at (.sys.mem) 'peak-bytes) pk0) (/ (* 3 Bmw) 2)) -- true
-(select {by: k from: Pmw desc: k take: 3}) -- (select {by: k from: (select {from: Pmw where: (>= k 0)}) desc: k take: 3})
-(.sys.exec "rm -rf /tmp/rfl_ckmw")

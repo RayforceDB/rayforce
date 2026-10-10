@@ -193,8 +193,8 @@
 ;; ══════════════════════════════════════════════════════════════════════════
 ;; REVIEW MINOR (i) — the PRE-SORTED CONCAT path (no take:) still DECLINES
 ;; cleanly for a 1-row partition with an UNDECIDABLE (F64) key: the base-type
-;; gate rejects F64, delta 0, and the flat path surfaces the loud `type` error
-;; (unmaterialisable lazy sort over parted) — never a silent wrong answer.
+;; gate rejects F64, delta 0, and the general parted sort answers (it fell to
+;; the flat sort, which failed with `type` on the parted columns).
 ;; ══════════════════════════════════════════════════════════════════════════
 (.sys.exec "rm -rf /tmp/rfl_tkf")
 (set F1 (table [x Seq] (list (as 'F64 [1.5]) [0])))
@@ -203,7 +203,7 @@
 (.db.splayed.set "/tmp/rfl_tkf/2024.01.02/t/" F2)
 (set Pf (.db.parted.get "/tmp/rfl_tkf/" 't))
 (set BF (at (.sys.mem) 'sort-perpart-runs))
-(select {x: x Seq: Seq from: Pf asc: x}) !- type
+(select {x: x Seq: Seq from: Pf asc: x}) -- (select {x: x Seq: Seq from: (select {from: Pf where: (>= Seq 0)}) asc: x})
 (set AF (at (.sys.mem) 'sort-perpart-runs))
 (- AF BF) -- 0
 ;; …but WITH take:, the top-k path DOES handle an F64 key (broader eligibility):
