@@ -430,6 +430,34 @@ p2 2 072 366 907 B (2.32x).  Peak RSS over all 43 queries: g0 5 109 200 kB,
 g2 8 101 948 kB, p0 14 864 816 kB, p2 15 743 720 kB.
 Answers: identical on every arm (0 mismatches, 0 order differences).
 
+### Gate noise floor (A/A evidence, P2 gate)
+
+A/A = the base binary against itself under the gate protocol (five
+alternated rounds, minimum-round warm).  Measured on the 10M store:
+
+| class | queries | b/a | abs gap | round-median spread |
+|---|---|---|---|---|
+| statistics answers | splayed q1, q4, q5, q6, q7 (0.2-1.4 us) | 0.94-1.02 | <= 0.02 us | up to +36% (q6 0.43-0.56 us) |
+| ~0.02 ms | q30 (18.7 us) | 1.009 | 0.16 us | 18.7-33.6 us |
+| ~1 ms | q25, q27, q20, q2 (0.86-1.15 ms) | 1.002-1.041 | <= 35 us | up to 1.07 ms vs 0.86 min |
+| >= 4 ms | parted q2, q8, q20, q39, q41, q42, q43, q18; splayed q3, q18, q39, q41, q42 | 0.984-1.011 | n/a | n/a |
+
+Gate rule (p2_summary.py): a per-query clause passes at ratio <= its bound
+(1.05 warm, 1.10 first and cold), or when both medians are < 1 ms and the
+gap is <= 0.05 ms (about 1.4x the largest sub-ms A/A gap, 35 us; it does not
+hide the real q25/q27 regression of +0.14-0.19 ms).  Geometric means cover
+only queries whose base median is >= 1 ms; the excluded queries are
+printed (`below_1ms_excluded_from_gmean`), because a +-6% ratio wobble on
+0.2 us answers moves a gmean and means nothing.  Above 4 ms A/A stays within
++-1.1%, so 1.05 keeps a 4x margin.
+
+Query classes are taken from the materialization the run measured (the
+`mat` rows), not a fixed list: q5, q20, q36 do not materialize, q18 and q39
+do.  The plan's pre-run SCAN_ONLY list is kept as a cross-check and its
+disagreements are printed.  Expected P3 deferrals are a data table
+(`P3_DEFERRALS`) in p2_summary.py; the output has GATE (strict), GATE
+(P3-exempt) and the exempt list with each exempted query's measured numbers.
+
 ### arm A: splayed g0 vs g2 (ms; ratio = g2/g0)
 
 | q | warm_a | warm_b | wr | first_a | first_b | fr | 3run_a | 3run_b | tr | cold_a | cold_b | cr | materialized | answers |
