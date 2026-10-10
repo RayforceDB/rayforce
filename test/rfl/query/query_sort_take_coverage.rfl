@@ -282,3 +282,27 @@
 (select {by: ts.date from: Tckt asc: date}) -- (select {by: {date: ts.date} from: Tckt asc: date})
 (select {by: ts.date from: Tckt where: (> v 1) desc: v take: -2}) -- (select {by: {date: ts.date} from: Tckt where: (> v 1) desc: v take: -2})
 (at (select {by: ts.date from: Tckt desc: date take: 2}) 'v) -- [4 1]
+;; a LIST-valued key: ray_is_vec leaves out RAY_LIST, so the key column was
+;; never gathered and the source column it replaces was dropped with it.
+;; The plain LIST key is the oracle.  The identity lambda is a row-aligned
+;; LIST key that the planned grouping and this branch evaluate alike.
+(set Tckk (table [x l] (list [3 1 4 2] (list [1 2] [3] [4 5 6] [3]))))
+(select {by: ((fn [a] a) l) from: Tckk}) -- (select {by: l from: Tckk})
+(at (select {by: ((fn [a] a) l) from: Tckk}) 'l) -- (at (select {c: (count x) by: ((fn [a] a) l) from: Tckk}) 'l)
+(select {by: ((fn [a] a) l) from: Tckk desc: x}) -- (select {by: l from: Tckk desc: x})
+(select {by: ((fn [a] a) l) from: Tckk desc: x take: 2}) -- (select {by: l from: Tckk desc: x take: 2})
+(select {by: ((fn [a] a) l) from: Tckk desc: x take: 2}) -- (table [l x] (list (list [4 5 6] [1 2]) [4 3]))
+(select {by: ((fn [a] a) l) from: Tckk desc: x take: -2}) -- (select {by: l from: Tckk desc: x take: -2})
+(select {by: ((fn [a] a) l) from: Tckk where: (== x 4)}) -- (select {by: l from: Tckk where: (== x 4)})
+(select {by: ((fn [a] a) l) from: Tckk where: (> x 100)}) -- (select {by: l from: Tckk where: (> x 100)})
+;; a key of another length is no row-aligned key: its group rows would index
+;; past the gathered columns.  A LIST key gets past the planned grouping's
+;; own length check, which looks at vectors only.
+(select {by: ((fn [a] (concat a a)) l) from: Tckk desc: x}) !- length
+(select {by: (concat l l) from: Tckk desc: x}) !- length
+;; (concat x 99), bare or in a lambda, passes the planned grouping as a
+;; row-wise string concat and reaches this branch as 5 values
+(select {by: (concat x 99) from: Tckk}) !- length
+(select {by: ((fn [a] (concat a 99)) x) from: Tckk}) !- length
+;; one value is one group, holding the first row
+(select {by: ((fn [a] [7]) x) from: Tcks}) -- (table [x r] (list [7] (list "c-long-string-over-12")))

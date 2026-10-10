@@ -13151,7 +13151,8 @@ by_dict_done:
                         }
                         ray_t* ck_vec = ray_eval(by_expr);
                         ray_env_pop_scope();
-                        if (ck_vec && !RAY_IS_ERR(ck_vec) && ray_is_vec(ck_vec)) {
+                        if (ck_vec && !RAY_IS_ERR(ck_vec) &&
+                            (ray_is_vec(ck_vec) || ck_vec->type == RAY_LIST)) {
                             int8_t kt = ck_vec->type;
                             empty_key_vec = (kt == RAY_STR)
                                             ? ray_vec_new(RAY_STR, 0)
@@ -13200,6 +13201,22 @@ by_dict_done:
                     if (filtered_tbl != tbl) ray_release(filtered_tbl);
                     ray_release(tbl);
                     scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return computed_key ? computed_key : ray_error("domain", "select by: failed to evaluate group key expression");
+                }
+                /* A key of another length is no row-aligned key (the DAG
+                 * group's rule; one value is one group): its group rows
+                 * would index past the columns gathered below. */
+                {
+                    int64_t ck_rows = ray_table_nrows(filtered_tbl);
+                    int64_t ck_len = (ray_is_vec(computed_key) || computed_key->type == RAY_LIST)
+                                     ? ray_len(computed_key) : ck_rows;
+                    if (ck_len != ck_rows && ck_len != 1) {
+                        ray_release(computed_key);
+                        if (filtered_tbl != tbl) ray_release(filtered_tbl);
+                        ray_release(tbl);
+                        scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv);
+                        return ray_error("length", "by: key has %lld values for %lld rows",
+                                         (long long)ck_len, (long long)ck_rows);
+                    }
                 }
                 ray_t* groups2_dict = ray_group_indices_fn(computed_key);
                 if (!groups2_dict || RAY_IS_ERR(groups2_dict)) {
@@ -13304,7 +13321,7 @@ by_dict_done:
                  * are the distinct grouping-key values surfaced to the
                  * user.  Using the source column at fi2 indices would lose
                  * the transform (e.g. raw Timestamp instead of its `.ss`). */
-                if (ray_is_vec(computed_key) && !RAY_IS_ERR(res2)) {
+                if ((ray_is_vec(computed_key) || computed_key->type == RAY_LIST) && !RAY_IS_ERR(res2)) {
                     ray_t* kv = ray_group_gather(computed_key, fi2, ng2);
                     if (!kv || RAY_IS_ERR(kv)) {
                         ray_release(res2);
