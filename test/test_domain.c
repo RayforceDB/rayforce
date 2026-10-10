@@ -2599,6 +2599,83 @@ static test_result_t test_domain_import_dict_reserve(void) {
     TEST_ASSERT_EQ_I(bad, 0);
     PASS();
 }
+/* Skeptic probe (pqio round 4).  Rounds of the reservation against lookups
+ * in flight (two threads finding the 64K strings batch after batch), as in
+ * import_dict_reserve: how often the reservation kept the shard tables (a
+ * lookup was in flight, so ray_symimp_index_bytes still reads them right
+ * after it), and that a kept set goes back with the dictionary: the
+ * committed memory (ray_heap_anon_committed, which every ray_sys_alloc
+ * counts) the same after a round as before it.  The tables are 1024
+ * mappings of 12 KB each: a kept set never freed shows as 12 MB. */
+static test_result_t test_domain_sk4_reserve_kept_freed(void) {
+    const char* p = TMP_DOM_SYM_PATH "_imk";
+    char (*bufs)[32] = (char (*)[32])ray_sys_alloc((size_t)IMPR_N * 32);
+    const char** strs = (const char**)ray_sys_alloc((size_t)IMPR_N * sizeof(char*));
+    size_t* lens = (size_t*)ray_sys_alloc((size_t)IMPR_N * sizeof(size_t));
+    uint64_t* hs = (uint64_t*)ray_sys_alloc((size_t)IMPR_N * sizeof(uint64_t));
+    int64_t* want = (int64_t*)ray_sys_alloc((size_t)IMPR_N * sizeof(int64_t));
+    int64_t* outs = (int64_t*)ray_sys_alloc((size_t)2 * IMPR_N * sizeof(int64_t));
+    TEST_ASSERT_TRUE(bufs && strs && lens && hs && want && outs);
+    for (int64_t i = 0; i < IMPR_N; i++) {
+        lens[i] = (size_t)imp_str(i, bufs[i]); strs[i] = bufs[i];
+        hs[i] = ray_hash_bytes(strs[i], lens[i]);
+    }
+    int kept = 0, freed = 0, leaks = 0, timeouts = 0, bad = 0, measured = 0;
+    for (int round = 0; round < 17; round++) {
+        unlink(p);
+        int64_t c0 = ray_heap_anon_committed();
+        ray_sym_domain_t* dom = ray_sym_domain_create_import(p);
+        if (!dom) {
+            ray_sys_free(bufs); ray_sys_free(strs); ray_sys_free(lens); ray_sys_free(hs); ray_sys_free(want); ray_sys_free(outs);
+            SKIP("import dictionary unsupported here");
+        }
+        ray_symimp_t* imp = ray_sym_domain_import(dom);
+        TEST_ASSERT_NOT_NULL(imp);
+        TEST_ASSERT_TRUE(ray_symimp_intern_batch(imp, IMPR_N, strs, lens, hs, want));
+        impr_ctx_t ctx[2];
+        ray_thread_t th[2];
+        int started = 0;
+        for (int t = 0; t < 2; t++) {
+            ctx[t] = (impr_ctx_t){ imp, strs, lens, hs, want, 0, NULL, NULL, NULL, NULL, outs + (int64_t)t * IMPR_N, 0, 0, 0 };
+            if (ray_thread_create(&th[t], impr_lookups, &ctx[t]) == RAY_OK) started++;
+            else break;
+        }
+        int64_t until = ray_profile_now_ns() + (int64_t)30 * 1000000000;
+        for (int t = 0; t < started; t++)
+            while (!atomic_load(&ctx[t].found) && !atomic_load(&ctx[t].done)) {
+                if (ray_profile_now_ns() > until) { timeouts++; break; }
+                RAY_CPU_RELAX();
+            }
+        int64_t p0 = -1, o0 = -1;
+        bool reserved = ray_symimp_reserve(imp, 1, 8, &p0, &o0);
+        int64_t ib = ray_symimp_index_bytes(imp);
+        for (int t = 0; t < started; t++) ray_thread_join(th[t]);
+        TEST_ASSERT_EQ_I(started, 2);
+        TEST_ASSERT_TRUE(reserved);
+        for (int t = 0; t < 2; t++) if (atomic_load(&ctx[t].bad) || !atomic_load(&ctx[t].found)) bad++;
+        if (ib > 0) kept++; else freed++;
+        ray_symimp_put(imp, p0, o0, "res0", 4);
+        ray_sym_domain_release(dom);
+        unlink(p);
+        unlink(TMP_DOM_SYM_PATH "_imk.lk");
+        int64_t c1 = ray_heap_anon_committed();
+        if (round > 0) {   /* the first warms whatever stays */
+            measured++;
+            if (c1 - c0 >= ((int64_t)8 << 20)) {
+                leaks++;
+                fprintf(stderr, "  sk4 reserve round %d (%s): %lld bytes more committed after the dictionary went\n", round,
+                        ib > 0 ? "kept" : "freed", (long long)(c1 - c0));
+            }
+        }
+    }
+    fprintf(stderr, "  sk4 reserve: tables kept (a lookup in flight) in %d rounds, freed at once in %d; %d of %d measured rounds leaked\n",
+            kept, freed, leaks, measured);
+    ray_sys_free(bufs); ray_sys_free(strs); ray_sys_free(lens); ray_sys_free(hs); ray_sys_free(want); ray_sys_free(outs);
+    TEST_ASSERT_EQ_I(timeouts, 0);
+    TEST_ASSERT_EQ_I(bad, 0);
+    TEST_ASSERT_EQ_I(leaks, 0);
+    PASS();
+}
 const test_entry_t domain_entries[] = {
     { "domain/private", test_domain_private, domain_setup, domain_teardown },
     { "domain/flush_append", test_domain_flush_append, domain_setup, domain_teardown },
@@ -2606,6 +2683,7 @@ const test_entry_t domain_entries[] = {
     { "domain/import_dict_reclaim", test_domain_import_dict_reclaim, domain_setup, domain_teardown },
     { "domain/import_dict_tags", test_domain_import_dict_tags, domain_setup, domain_teardown },
     { "domain/import_dict_reserve", test_domain_import_dict_reserve, domain_setup, domain_teardown },
+    { "domain/sk4_reserve_kept_freed", test_domain_sk4_reserve_kept_freed, domain_setup, domain_teardown },
     { "domain/runtime_identity",        test_domain_runtime_identity,        domain_setup, domain_teardown },
     { "domain/runtime_delegation",      test_domain_runtime_delegation,      domain_setup, domain_teardown },
     { "domain/vec_new_attach",          test_domain_vec_new_attach,          domain_setup, domain_teardown },

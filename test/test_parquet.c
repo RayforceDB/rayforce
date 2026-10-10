@@ -1964,7 +1964,12 @@ static test_result_t test_pq_sym_grouped_collision_determinism(void) {
  * page for the rest (a writer's fallback); PQX_SNAPPY every page of the
  * column snappy-compressed (a greedy LZ over 2-byte offsets). */
 enum { PQX_DICT = 1, PQX_FALLBACK = 2, PQX_SNAPPY = 4, PQX_LATE = 8, PQX_NOSTATS = 16,
-       PQX_LIESTATS = 32, PQX_ZSTD = 64, PQX_HUGERAW = 128, PQX_ZERORAW = 256, PQX_BADDICT = 512 };   /* PQX_ZERORAW: total_uncompressed_size 0; PQX_BADDICT: the dictionary page encoded 3 */
+       PQX_LIESTATS = 32, PQX_ZSTD = 64, PQX_HUGERAW = 128, PQX_ZERORAW = 256, PQX_BADDICT = 512,
+       PQX_FARDATA = 1024, PQX_INDICT = 2048 };   /* PQX_ZERORAW: total_uncompressed_size 0; PQX_BADDICT: the dictionary page encoded 3 */
+                                             /* PQX_FARDATA: data_page_offset past the file's data; PQX_INDICT:
+                                              * data_page_offset one byte into the dictionary page (skeptic round 4:
+                                              * the decoder reads a chunk from its dictionary page for
+                                              * total_compressed_size bytes and never uses it) */
                                              /* PQX_LATE: the fallback after 7/8 of the rows; PQX_NOSTATS: no encoding stats;
                                               * PQX_LIESTATS: stats that leave out the PLAIN pages; PQX_ZSTD: codec 6 in the
                                               * footer (pages stored as written); PQX_HUGERAW: total_uncompressed_size
@@ -2153,7 +2158,8 @@ static bool pqx_synth(const char* path, int64_t rows, int64_t groups, int n, con
             pb_i(&f, &lm, 6, PB_I64, c && (flags[c - 1] & PQX_HUGERAW) ? INT64_MAX - 4096
                                      : c && (flags[c - 1] & PQX_ZERORAW) ? 0 : rawt[i]);
             pb_i(&f, &lm, 7, PB_I64, stored[i]);
-            pb_i(&f, &lm, 9, PB_I64, dpo[i]);
+            pb_i(&f, &lm, 9, PB_I64, c && (flags[c - 1] & PQX_FARDATA) && dio[i] >= 0 ? footer + 4096
+                                     : c && (flags[c - 1] & PQX_INDICT) && dio[i] >= 0 ? dio[i] + 1 : dpo[i]);
             if (dio[i] >= 0) pb_i(&f, &lm, 11, PB_I64, dio[i]);
             if (c && !(flags[c - 1] & PQX_NOSTATS))
                 pb_enc_stats(&f, &lm, dio[i] >= 0, dio[i] >= 0,
@@ -3189,7 +3195,265 @@ static test_result_t test_pq_sk_huge_raw(void) {
     PASS();
 #endif
 }
+/* Skeptic probes (pqio round 4).  A column whose chunks have no size
+ * (total_uncompressed_size 0: unsure, unbounded by pq_chunk_vocab) beside a
+ * small honest dictionary column, in a file whose sized text is within a
+ * quarter of the memory assumed.  The unsure column should go grouped, as
+ * the per-column rule has it, whatever the other columns' text: 0, q a
+ * dictionary of a hundred strings, 16 MB assumed; 1 and 2, q PLAIN unique
+ * 88-byte strings (100,000 rows, 8.8 MB of them), 1 MB assumed, with its
+ * sizes honest (1: the control, grouped) and of no size (2). */
+static test_result_t test_pq_sk4_unsure_small_text(void) {
+#if !defined(DEBUG)
+    SKIP("the memory the decision assumes is a debug-build knob");
+#else
+    pq_sym_env_clear();
+    char src[160], dir[160];
+    snprintf(src, sizeof(src), "/tmp/rayforce-sk4u-%d.parquet", (int)getpid());
+    snprintf(dir, sizeof(dir), "/tmp/rayforce-sk4u-%d", (int)getpid());
+    const char* fnames[3] = {"x","p","q"};
+    const char* nm[2] = {"p","q"};
+    int64_t tids[3] = {ray_sym_intern("I32", 3), ray_sym_intern("SYM", 3), ray_sym_intern("SYM", 3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 3);
+    size_t cap = (size_t)1 << 16;
+    char* trace = (char*)ray_sys_alloc(cap);
+    TEST_ASSERT_TRUE(trace != NULL);
+    TEST_ASSERT_EQ_I(pq_pool(2), RAY_OK);
+    int bad = 0;
+    for (int v = 0; v < 3; v++) {
+        pq_synth_fn fns[2] = {pqx_lowcard, v ? pqx_unique : pqx_card100};
+        unsigned fl[2] = {PQX_DICT | PQX_SNAPPY, v == 0 ? PQX_DICT | PQX_ZERORAW : v == 1 ? 0u : (unsigned)PQX_ZERORAW};
+        const int64_t rows = v ? 100000 : 24000;
+        const char* ram = v ? "1048576" : "16777216";
+        TEST_ASSERT_TRUE(pqx_synth(src, rows, 6, 2, nm, fns, fl));
+        pq_set_env("RAY_PQ_SYM_RAM", ram);
+        ray_t* res = pq_traced_import(src, dir, types, trace, cap);
+        pq_sym_env_clear();
+        bool ok = res && !RAY_IS_ERR(res);
+        if (res) { if (RAY_IS_ERR(res)) ray_error_free(res); else ray_release(res); }
+        char what[32]; snprintf(what, sizeof(what), "sk4 unsure %d", v);
+        if (!ok || !pqx_check(dir, rows, 2, nm, fns, what, NULL)) bad++;
+        bool qg = pq_trace_line_has(trace, "parquet symcol: col=q ", " mode=grouped");
+        double vq = pq_trace_line_num(trace, "parquet symcol: col=q ", "vocab_bytes");
+        double dq = pq_trace_line_num(trace, "parquet symcol: col=q ", "dict_only");
+        double tq = pq_trace_line_num(trace, "parquet symcol: col=q ", "text_bytes");
+        double text = pq_trace_sum(trace, "text_bytes", NULL);
+        double tab = pq_trace_line_num(trace, "parquet symimp:", "tab_mb");
+        double rec = pq_trace_line_num(trace, "parquet symimp:", "rec_mb");
+        fprintf(stderr, "  [%s] text %.0f B (q %.0f) of %s B assumed, q vocab %.3g B dict_only %.0f: q %s;"
+                " import dictionary tab_mb %.1f rec_mb %.1f\n", what, text, tq, ram, vq, dq,
+                qg ? "grouped" : "DIRECT", tab, rec);
+        if (!qg) bad++;
+        pq_remove_native(dir, fnames, 3);
+        if (v == 2 && getenv("SK_KEEP")) fprintf(stderr, "  sk4 unsure: kept %s\n", src); else unlink(src);
+    }
+    ray_pool_destroy();
+    ray_sys_free(trace);
+    ray_release(types);
+    TEST_ASSERT_EQ_I(bad, 0);
+    PASS();
+#endif
+}
+/* A mixed import (p, q direct and seeded, u grouped) and an all-direct one
+ * (no u) over a file with a zero-row group (pyarrow's layout) and a row
+ * group whose q chunk holds nulls only (an empty dictionary page, ids of no
+ * value): on 1, 2, 4 and 8 workers, the direct passes reversed on 1, 4 and
+ * 8; every run the same files as one worker's, every row right, the
+ * seeding seeing every string. */
+static int64_t sk4_null_lo = 0, sk4_null_hi = 0;
+static const char* sk4_nullgrp(int64_t r, char* buf, uint32_t* len) {
+    if (r >= sk4_null_lo && r < sk4_null_hi) return NULL;
+    return pqx_card100(r, buf, len);
+}
+static test_result_t test_pq_sk4_null_group_workers(void) {
+#if !defined(DEBUG)
+    SKIP("the memory the decision assumes is a debug-build knob");
+#else
+    pq_sym_env_clear();
+    char src[160], dir[160], ref[160];
+    snprintf(src, sizeof(src), "/tmp/rayforce-sk4n-%d.parquet", (int)getpid());
+    snprintf(dir, sizeof(dir), "/tmp/rayforce-sk4n-%d", (int)getpid());
+    snprintf(ref, sizeof(ref), "/tmp/rayforce-sk4n-%d-ref", (int)getpid());
+    const char* fnames[4] = {"x","p","q","u"};
+    const char* nm[3] = {"p","q","u"};
+    pq_synth_fn fns[3] = {pqx_lowcard, sk4_nullgrp, pqx_unique};
+    unsigned fl[3] = {PQX_DICT | PQX_SNAPPY, PQX_DICT, 0};
+    int64_t tids[4] = {ray_sym_intern("I32", 3), ray_sym_intern("SYM", 3), ray_sym_intern("SYM", 3), ray_sym_intern("SYM", 3)};
+    size_t cap = (size_t)1 << 16;
+    char* trace = (char*)ray_sys_alloc(cap);
+    TEST_ASSERT_TRUE(trace != NULL);
+    int bad = 0;
+    for (int v = 0; v < 2; v++) {
+        int n = v ? 2 : 3;
+        const int64_t rows = v ? 240000 : 24000;
+        /* seven row groups, the fourth (3) of no rows: group 2 is rows [2/6, 3/6) */
+        sk4_null_lo = rows * 2 / 6; sk4_null_hi = rows * 3 / 6;
+        ray_t* types = ray_vec_from_raw(RAY_SYM, tids, n + 1);
+        pqx_empty = 3;
+        bool made = pqx_synth(src, rows, 7, n, nm, fns, fl);
+        pqx_empty = -1;
+        TEST_ASSERT_TRUE(made);
+        TEST_ASSERT_EQ_I(pq_pool(1), RAY_OK);
+        int64_t words = 0;
+        int64_t sram = sk_mixed_ram(src, dir, types, fnames, n + 1, trace, cap, &words);
+        TEST_ASSERT_TRUE(sram > 0);
+        char ramv[32]; snprintf(ramv, sizeof(ramv), "%lld", (long long)sram);
+        static const struct { int cores; bool rev; } runs[] = {{1,false},{2,false},{4,false},{8,false},{1,true},{4,true},{8,true}};
+        for (size_t k = 0; k < sizeof(runs) / sizeof(runs[0]); k++) {
+            const char* out = k ? dir : ref;
+            TEST_ASSERT_EQ_I(pq_pool(runs[k].cores), RAY_OK);
+            pq_set_env("RAY_PQ_SYM_RAM", ramv);
+            if (runs[k].rev) pq_set_env("RAY_PQ_DIRECT_REVERSE", "1");
+            ray_t* res = pq_traced_import(src, out, types, trace, cap);
+            pq_sym_env_clear();
+            bool ok = res && !RAY_IS_ERR(res);
+            if (!ok) fprintf(stderr, "  sk4 null group: %s\n", ray_error_msg() ? ray_error_msg() : "(no message)");
+            if (res) { if (RAY_IS_ERR(res)) ray_error_free(res); else ray_release(res); }
+            TEST_ASSERT_TRUE(ok);
+            char what[64]; snprintf(what, sizeof(what), "sk4 null group %s %d%s", v ? "all-direct" : "mixed", runs[k].cores, runs[k].rev ? " rev" : "");
+            int nulls[3] = {0, 0, 0};
+            if (!pqx_check(out, rows, n, nm, fns, what, nulls)) bad++;
+            bool pd = pq_trace_line_has(trace, "parquet symcol: col=p ", " mode=direct");
+            bool qd = pq_trace_line_has(trace, "parquet symcol: col=q ", " mode=direct");
+            bool ug = v || pq_trace_line_has(trace, "parquet symcol: col=u ", " mode=grouped");
+            bool seeded = strstr(trace, "parquet symseed:") != NULL;
+            double miss = pq_trace_line_num(trace, "parquet symdirect:", "seed_miss");
+            bool same = !k || sk_files_same(ref, out, fnames + 1, n);
+            /* the grouped pass's first reservation gave the shard tables back
+             * (no lookup in flight there): the trace's index bytes are none */
+            double ikb = v ? 0 : pq_trace_line_num(trace, "parquet symgrp:", "imp_index_kb");
+            fprintf(stderr, "  [%s] p %s q %s u %s%s, seed_miss %.0f, q nulls %d, imp_index_kb %.0f, %lld symbols (direct %lld)%s\n", what,
+                    pd ? "D" : "G", qd ? "D" : "G", v ? "-" : ug ? "G" : "D", seeded ? " seeded" : "", miss, nulls[1], ikb,
+                    (long long)pq_sym_count(out), (long long)words, same ? "" : ", FILES DIFFER");
+            if (!pd || !qd || !ug || !seeded || miss != 0 || !same || !nulls[1] || ikb != 0 || pq_sym_count(out) != words) bad++;
+            if (k) pq_remove_native(dir, fnames, n + 1);
+        }
+        pq_remove_native(ref, fnames, n + 1);
+        unlink(src);
+        ray_release(types);
+    }
+    ray_pool_destroy();
+    ray_sys_free(trace);
+    TEST_ASSERT_EQ_I(bad, 0);
+    PASS();
+#endif
+}
+/* A dictionary column (p) whose data_page_offset does not point at its
+ * first data page: past the file's data (0), one byte into its dictionary
+ * page (1).  The decoder reads a chunk from its dictionary page for
+ * total_compressed_size bytes and never uses that offset, so the forced
+ * direct import takes the file.  The mixed import (p direct and seeded, u
+ * grouped) should take it too, or fail as the decoder would. */
+static test_result_t test_pq_sk4_data_offset(void) {
+#if !defined(DEBUG)
+    SKIP("the memory the decision assumes is a debug-build knob");
+#else
+    pq_sym_env_clear();
+    char src[160], dir[160], partial[240];
+    snprintf(src, sizeof(src), "/tmp/rayforce-sk4d-%d.parquet", (int)getpid());
+    snprintf(dir, sizeof(dir), "/tmp/rayforce-sk4d-%d", (int)getpid());
+    snprintf(partial, sizeof(partial), "%s.parquet-partial", dir);
+    const char* fnames[4] = {"x","p","q","u"};
+    const char* nm[3] = {"p","q","u"};
+    pq_synth_fn fns[3] = {pqx_lowcard, pqx_card100, pqx_unique};
+    int64_t tids[4] = {ray_sym_intern("I32", 3), ray_sym_intern("SYM", 3), ray_sym_intern("SYM", 3), ray_sym_intern("SYM", 3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 4);
+    size_t cap = (size_t)1 << 16;
+    char* trace = (char*)ray_sys_alloc(cap);
+    TEST_ASSERT_TRUE(trace != NULL);
+    TEST_ASSERT_EQ_I(pq_pool(2), RAY_OK);
+    int bad = 0;
+    for (int v = 0; v < 2; v++) {
+        unsigned fl[3] = {PQX_DICT | (v ? (unsigned)PQX_INDICT : (unsigned)PQX_FARDATA), PQX_DICT, 0};
+        const int64_t rows = 24000;
+        TEST_ASSERT_TRUE(pqx_synth(src, rows, 6, 3, nm, fns, fl));
+        /* forced direct: no seeding */
+        pq_set_symmode("direct");
+        ray_error_clear();
+        ray_t* res = pq_traced_import(src, dir, types, trace, cap);
+        pq_sym_env_clear();
+        bool dok = res && !RAY_IS_ERR(res);
+        char dmsg[256]; snprintf(dmsg, sizeof(dmsg), "%s", dok ? "imported" : ray_error_msg() ? ray_error_msg() : "(no message)");
+        if (res) { if (RAY_IS_ERR(res)) ray_error_free(res); else ray_release(res); }
+        if (dok && !pqx_check(dir, rows, 3, nm, fns, "sk4 data offset direct", NULL)) dok = false;
+        double bp = pq_trace_line_num(trace, "parquet symcol: col=p ", "vocab_bytes");
+        double bq = pq_trace_line_num(trace, "parquet symcol: col=q ", "vocab_bytes");
+        double text = pq_trace_sum(trace, "text_bytes", NULL);
+        pq_remove_native(dir, fnames, 4); pq_remove_native(partial, fnames, 4);
+        /* the memory that makes p and q direct and the import grouped (sk_mixed_ram) */
+        double big = bp > bq ? bp : bq;
+        int64_t sram = (int64_t)(big * 64) + 1024;
+        char ramv[32]; snprintf(ramv, sizeof(ramv), "%lld", (long long)sram);
+        pq_set_env("RAY_PQ_SYM_RAM", ramv);
+        ray_error_clear();
+        res = pq_traced_import(src, dir, types, trace, cap);
+        pq_sym_env_clear();
+        bool mok = res && !RAY_IS_ERR(res);
+        char mmsg[256]; snprintf(mmsg, sizeof(mmsg), "%s", mok ? "imported" : ray_error_msg() ? ray_error_msg() : "(no message)");
+        if (res) { if (RAY_IS_ERR(res)) ray_error_free(res); else ray_release(res); }
+        bool seeded = strstr(trace, "parquet symseed:") != NULL;
+        fprintf(stderr, "  [sk4 data offset %s] text %.0f ram %lld; direct: %s; mixed%s: %s\n", v ? "in dict" : "past data", text,
+                (long long)sram, dmsg, seeded ? " (seeded)" : "", mmsg);
+        if (dok && !mok) bad++;
+        pq_remove_native(dir, fnames, 4); pq_remove_native(partial, fnames, 4);
+        if (getenv("SK_KEEP")) {
+            char kept[200]; snprintf(kept, sizeof(kept), "/tmp/rayforce-sk4d-%d-%d.parquet", (int)getpid(), v);
+            if (rename(src, kept) == 0) fprintf(stderr, "  sk4 data offset: kept %s (RAY_PQ_SYM_RAM=%s)\n", kept, ramv);
+        }
+    }
+    unlink(src);
+    ray_pool_destroy();
+    ray_sys_free(trace);
+    ray_release(types);
+    TEST_ASSERT_EQ_I(bad, 0);
+    PASS();
+#endif
+}
+/* The same undecodable dictionary page (encoding 3, PQX_BADDICT) in p, the
+ * import forced direct and forced grouped: both fail, and the grouped
+ * message should carry the decoder's reason and the column as the direct
+ * one does. */
+static test_result_t test_pq_sk4_grouped_message(void) {
+    pq_sym_env_clear();
+    char src[160], dir[160], partial[240];
+    snprintf(src, sizeof(src), "/tmp/rayforce-sk4g-%d.parquet", (int)getpid());
+    snprintf(dir, sizeof(dir), "/tmp/rayforce-sk4g-%d", (int)getpid());
+    snprintf(partial, sizeof(partial), "%s.parquet-partial", dir);
+    const char* fnames[3] = {"x","p","q"};
+    const char* nm[2] = {"p","q"};
+    pq_synth_fn fns[2] = {pqx_lowcard, pqx_card100};
+    unsigned fl[2] = {PQX_DICT | PQX_BADDICT, PQX_DICT};
+    int64_t tids[3] = {ray_sym_intern("I32", 3), ray_sym_intern("SYM", 3), ray_sym_intern("SYM", 3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 3);
+    TEST_ASSERT_TRUE(pqx_synth(src, 12000, 4, 2, nm, fns, fl));
+    TEST_ASSERT_EQ_I(pq_pool(2), RAY_OK);
+    char msgs[2][256];
+    int bad = 0;
+    for (int run = 0; run < 2; run++) {
+        pq_set_symmode(run ? "grouped" : "direct");
+        ray_error_clear();
+        ray_t* res = ray_parquet_splayed_typed(src, dir, types);
+        pq_sym_env_clear();
+        bool failed = !res || RAY_IS_ERR(res);
+        const char* msg = ray_error_msg();
+        snprintf(msgs[run], sizeof(msgs[run]), "%s", msg ? msg : "(no message)");
+        fprintf(stderr, "  [sk4 message %s] %s: %s\n", run ? "grouped" : "direct", failed ? "failed" : "imported", msgs[run]);
+        if (!failed) bad++;
+        if (res) { if (RAY_IS_ERR(res)) ray_error_free(res); else ray_release(res); }
+        pq_remove_native(dir, fnames, 3); pq_remove_native(partial, fnames, 3);
+    }
+    if (strcmp(msgs[0], msgs[1]) != 0) bad++;
+    unlink(src);
+    ray_pool_destroy();
+    ray_release(types);
+    TEST_ASSERT_EQ_I(bad, 0);
+    PASS();
+}
 const test_entry_t parquet_entries[] = {
+    {"parquet/sk4_grouped_message",test_pq_sk4_grouped_message,pq_setup,pq_teardown},
+    {"parquet/sk4_unsure_small_text",test_pq_sk4_unsure_small_text,pq_setup,pq_teardown},
+    {"parquet/sk4_data_offset",test_pq_sk4_data_offset,pq_setup,pq_teardown},
+    {"parquet/sk4_null_group_workers",test_pq_sk4_null_group_workers,pq_setup,pq_teardown},
     {"parquet/sk_huge_raw",test_pq_sk_huge_raw,pq_setup,pq_teardown},
     {"parquet/sk_mixed_workers",test_pq_sk_mixed_workers,pq_setup,pq_teardown},
     {"parquet/sk_lying_stats",test_pq_sk_lying_stats,pq_setup,pq_teardown},
