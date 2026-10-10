@@ -184,7 +184,7 @@ Nested lambdas capture visible lexical bindings when they are created:
 12
 ```
 
-Inside the closure its captures are locals: a `let` of `x` rebinds it for that call only, and a capture named like a builtin is the callee. See [Lambdas & the VM](syntax.md#lambdas--the-vm) for how closures compile.
+Inside the closure its captures are locals: a `let` of `x` rebinds it for that call only, and a capture named like a builtin is the callee. See [Lambdas & the VM](syntax.md#lambdas-the-vm) for how closures compile.
 
 ## Early Return: return
 

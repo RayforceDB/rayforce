@@ -220,14 +220,19 @@ rb -- [6 3]
 (set bsL 0)
 (.sys.gc)
 (< (- (heapL) h0L) 4000000) -- true
-;; a literal nested far past the compiler's guards (symbol walk 1024, body
-;; 2048) creates and runs its closure without crashing; the depth stays
-;; within what the sanitizer build's stack releases
-(set baseD (parse "(+ 1 0)"))
-(set wrapD (fn [inner] (concat (take baseD 2) (enlist inner))))
-(set buildD (fn [n] (let a (parse "x")) (times n (let a (wrapD a))) a))
-(set LD (concat (take (parse "(fn [x] 0)") 2) (enlist (buildD 12000))))
-(nil? (try ((eval LD) 1) (fn [e] e))) -- false
+;; a body nested past the compiler's depth guard (2048 levels) is left to the
+;; tree walker instead of recursing further down the C stack. a chain of
+;; nested if's shows which engine ran: the compiled body runs it as jumps and
+;; returns the parameter, the tree walker recurses per level and stops at its
+;; depth limit (512). 2500 is past the guard yet within the bytecode jump
+;; range, so the shape pins the guard; the depths stay well within what
+;; every platform's sanitizer build builds and releases
+(set wrapI (fn [inner] (concat (take (parse "(if true 0)") 2) (enlist inner))))
+(set buildI (fn [n] (let a (parse "x")) (times n (let a (wrapI a))) a))
+(set mkI (fn [n] (eval (concat (take (parse "(fn [x] 0)") 2) (enlist (buildI n))))))
+((mkI 600) 1) -- 1
+((mkI 1500) 1) -- 1
+((mkI 2500) 1) !- limit
 ;; closures made from one literal match by capture set in either order
 (set mkd2 (fn [flag k] (if false (set 1 2)) (if flag (let extra2 1)) (fn [] (list k (try extra2 'none)))))
 (set dd3 (mkd2 false 2))
