@@ -1844,7 +1844,9 @@ static void pq_trade_buffers(pq_column* c, pq_column* spare) {
 
 /* Byte range of every column chunk — from its dictionary page (or first
  * data page) for total_compressed bytes — and each column's uncompressed
- * total.  False when a row group's metadata cannot be read. */
+ * total, INT64_MAX when a chunk of rows has no size (missing or not
+ * positive: its text unbounded, so an import of it is not taken for small).
+ * False when a row group's metadata cannot be read. */
 static bool pq_chunk_ranges(ray_parquet_t* r, int64_t* lo, int64_t* hi, int64_t* col_bytes) {
     pq_span* cols = ray_calloc_raw((size_t)r->ncols*sizeof(*cols));
     bool ok = cols != NULL;
@@ -1858,6 +1860,7 @@ static bool pq_chunk_ranges(ray_parquet_t* r, int64_t* lo, int64_t* hi, int64_t*
             int64_t data = pq_get(mf[9],-1), dict = pq_get(mf[11],-1), bytes = pq_get(mf[7],-1);
             int64_t raw = pq_get(mf[6],-1), start = dict > 0 && dict < data ? dict : data;
             if (raw > 0) col_bytes[c] = raw > INT64_MAX - col_bytes[c] ? INT64_MAX : col_bytes[c] + raw;
+            else if (rows > 0) col_bytes[c] = INT64_MAX;   /* rows of no size: unbounded (pq_chunk_vocab's unsure) */
             if (start < 0 || bytes < 0 || start > (int64_t)r->size || bytes > (int64_t)r->size - start) continue;
             lo[i] = start; hi[i] = start + bytes;
         }
@@ -2953,7 +2956,8 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
     /* The symbol columns go direct (each string probes the import
      * dictionary) unless their strings would make it too big to probe at
      * random: then grouped (table/symgrp.h), column by column.  Decided from
-     * their chunks' uncompressed bytes against a quarter of memory, and
+     * their chunks' uncompressed bytes against a quarter of memory (a chunk
+     * of no size counting as unbounded: pq_chunk_ranges), and
      * then column by column: a column whose vocabulary (pq_vocab_bounds:
      * what the direct import would hold for it, at most) is a small share
      * of memory still goes direct, decoded once, smallest first while those

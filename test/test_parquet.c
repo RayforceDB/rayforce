@@ -2944,7 +2944,7 @@ static test_result_t test_pq_sk_lying_stats(void) {
  * dictionary column's chunk an empty dictionary page and data_page_offset
  * 0): nothing to decode, so it neither unbounds a dictionary column nor
  * stops its seeding.  p and q go direct and seeded, u grouped, on one and
- * four workers alike. */
+ * four workers alike; and a small file of the same make goes direct. */
 static test_result_t test_pq_symgrp_empty_group(void) {
 #if !defined(DEBUG)
     SKIP("the memory the decision assumes is a debug-build knob");
@@ -3004,6 +3004,20 @@ static test_result_t test_pq_symgrp_empty_group(void) {
         if (k) pq_remove_native(dir, fnames, 4);
     }
     pq_remove_native(ref, fnames, 4);
+    /* nor does its chunk of u, PLAIN and of no size (no page), make a small
+     * file's text unbounded: the import goes direct throughout */
+    pqx_empty = 3;
+    made = pqx_synth(src, 2400, 7, 3, nm, fns, fl);
+    pqx_empty = -1;
+    TEST_ASSERT_TRUE(made);
+    pq_set_env("RAY_PQ_SYM_RAM", "16777216");
+    ray_t* res = pq_traced_import(src, dir, types, trace, cap);
+    pq_sym_env_clear();
+    TEST_ASSERT_FALSE(!res || RAY_IS_ERR(res)); ray_release(res);
+    if (!pqx_check(dir, 2400, 3, nm, fns, "empty group, small", NULL)) bad++;
+    bool ud = pq_trace_line_has(trace, "parquet symcol: col=u ", " mode=direct");
+    if (!ud || strstr(trace, "parquet symseed:")) { fprintf(stderr, "  empty group, small: u %s\n", ud ? "direct, seeded" : "grouped"); bad++; }
+    pq_remove_native(dir, fnames, 4);
     unlink(src);
     ray_pool_destroy();
     ray_sys_free(trace);
