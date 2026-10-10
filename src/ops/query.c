@@ -13334,6 +13334,8 @@ by_dict_done:
                 ray_release(groups2); ray_release(computed_key);
                 if (filtered_tbl != tbl) ray_release(filtered_tbl);
                 ray_release(tbl);
+                res2 = apply_sort_take(res2, dict_elems, dict_n,
+                                       asc_id, desc_id, take_id, NULL);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return res2;
             }
 

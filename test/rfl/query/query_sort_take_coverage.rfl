@@ -219,3 +219,37 @@
 (set RHolF2 (select {m: (min s) c: (count s) from: THol where: (>= v 100000) by: k}))
 (sum (at RHolF2 'c)) -- 100000
 (at (at (select {m: m from: RHolF2 where: (== k "0")}) 'm) 0) -- "100000"
+
+;; ────────────────────────────────────────────────────────────────────
+;; Computed by: key with no outputs.  The DAG no-agg branch regroups a
+;; computed key (key_sym < 0) at eval level and returned that result
+;; without apply_sort_take, so asc:/desc:/take: were dropped and every
+;; group came back in first-seen order.  Oracles: the same key
+;; materialized as a column (a plain key), and the computed key beside an
+;; output.  The key column keeps its derived name, `x`.
+;; ────────────────────────────────────────────────────────────────────
+(set Tck (table [x y] (list [3 1 4 2 3 1] [30 10 40 20 31 11])))
+(set Tckp (update {k: (* x 2) from: Tck}))
+(select {by: (* x 2) from: Tck desc: x take: 2}) -- (table [x y] (list [8 6] [40 30]))
+(at (select {by: (* x 2) from: Tck desc: x take: 2}) 'x) -- (at (select {c: (count y) by: (* x 2) from: Tck desc: x take: 2}) 'x)
+(at (select {by: (* x 2) from: Tck desc: x take: 2}) 'y) -- (at (select {by: k from: Tckp desc: k take: 2}) 'y)
+;; asc: and desc: alone, on the key and on a source column
+(select {by: (* x 2) from: Tck asc: x}) -- (table [x y] (list [2 4 6 8] [10 20 30 40]))
+(at (select {by: (* x 2) from: Tck desc: y}) 'x) -- [8 6 4 2]
+(at (select {by: (* x 2) from: Tck desc: y}) 'y) -- (at (select {by: k from: Tckp desc: y}) 'y)
+;; take: alone keeps first-seen group order: head, tail, range, more than the groups
+(select {by: (* x 2) from: Tck take: 2}) -- (table [x y] (list [6 2] [30 10]))
+(at (select {by: (* x 2) from: Tck take: -1}) 'y) -- (at (select {by: k from: Tckp take: -1}) 'y)
+(at (select {by: (* x 2) from: Tck take: [1 2]}) 'y) -- (at (select {by: k from: Tckp take: [1 2]}) 'y)
+(at (select {by: (* x 2) from: Tck desc: x take: 10}) 'x) -- [8 6 4 2]
+;; where: filters the rows before the grouping
+(select {by: (* x 2) from: Tck where: (> y 15) asc: x take: 2}) -- (table [x y] (list [4 6] [20 30]))
+;; several rows per group: the first row of each, as for a plain key
+(select {by: (% x 2) from: Tck asc: x}) -- (table [x y] (list [0 1] [40 30]))
+(at (select {by: (% x 2) from: Tck desc: y take: 1}) 'y) -- [40]
+;; a null key sorts as the plain key's null does
+(set Tckn (table [x y] (list [1 0N 3 0N 5] [10 20 30 40 50])))
+(set Tcknp (update {k: (* x 2) from: Tckn}))
+(at (select {by: (* x 2) from: Tckn desc: x}) 'y) -- (at (select {by: k from: Tcknp desc: k}) 'y)
+(at (select {by: (* x 2) from: Tckn asc: x take: 2}) 'y) -- (at (select {by: k from: Tcknp asc: k take: 2}) 'y)
+(at (select {by: (* x 2) from: Tckn asc: x take: 2}) 'y) -- [20 10]
