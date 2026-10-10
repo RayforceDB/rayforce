@@ -2310,6 +2310,59 @@ static test_result_t test_pq_sym_vocab_bound(void) {
     TEST_ASSERT_EQ_I(bad, 0);
     PASS();
 }
+/* A file of no row groups, forced grouped: imported, no rows; a step
+ * failing (resolve still runs, over no tasks) reports its error, publishes
+ * nothing and keeps no memory, run after run. */
+static test_result_t test_pq_sym_grouped_empty(void) {
+#if !defined(DEBUG)
+    SKIP("failure injection is a debug-build knob");
+#else
+    pq_sym_env_clear();
+    const char* nm[1] = {"p"};
+    const char* fn2[2] = {"x","p"};
+    pq_synth_fn fn[1] = {pqx_unique};
+    unsigned fl[1] = {0};
+    char src[160], dir[160], partial[240];
+    snprintf(src, sizeof(src), "/tmp/rayforce-pqe-%d.parquet", (int)getpid());
+    snprintf(dir, sizeof(dir), "/tmp/rayforce-pqe-%d", (int)getpid());
+    snprintf(partial, sizeof(partial), "%s.parquet-partial", dir);
+    TEST_ASSERT_TRUE(pqx_synth(src, 0, 0, 1, nm, fn, fl));
+    int64_t tids[2] = {ray_sym_intern("I32", 3), ray_sym_intern("SYM", 3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 2);
+    TEST_ASSERT_EQ_I(pq_pool(1), RAY_OK);
+    const char* steps[] = {NULL, "p2"};
+    int bad = 0;
+    for (int i = 0; i < 2; i++) {
+        size_t base = 0;
+        for (int k = 0; k < 4; k++) {
+            pq_set_symmode("grouped");
+            pq_set_env("RAY_PQ_SYM_INJECT", steps[i]);
+            ray_t* res = ray_parquet_splayed_typed(src, dir, types);
+            pq_sym_env_clear();
+            bool failed = !res || RAY_IS_ERR(res);
+            bool published = access(dir, F_OK) == 0;
+            if (failed != (steps[i] != NULL) || published == failed || (!failed && res->i64 != 0)) {
+                fprintf(stderr, "  empty file, inject %s: %s, %s\n", steps[i] ? steps[i] : "none",
+                        failed ? (res ? ray_err_code(res) : "null") : "imported", published ? "published" : "nothing published");
+                bad++;
+            }
+            if (res) { if (RAY_IS_ERR(res)) ray_error_free(res); else ray_release(res); }
+            pq_remove_native(partial, fn2, 2); pq_remove_native(dir, fn2, 2);
+            ray_mem_stats_t st; ray_mem_stats(&st);
+            if (k == 1) base = st.bytes_allocated;
+            if (k == 3 && st.bytes_allocated > base) {
+                fprintf(stderr, "  empty file, inject %s: heap %+lld B\n", steps[i] ? steps[i] : "none",
+                        (long long)st.bytes_allocated - (long long)base);
+                bad++;
+            }
+        }
+    }
+    ray_pool_destroy();
+    ray_release(types); unlink(src);
+    TEST_ASSERT_EQ_I(bad, 0);
+    PASS();
+#endif
+}
 /* Which way each symbol column went, from the trace's symcol lines: 'D' or
  * 'G' in the file's column order, '?' when the trace does not say. */
 static void pqx_modes(const char* trace, int n, const char* const* names, char* out) {
@@ -2331,45 +2384,13 @@ static void pqx_modes(const char* trace, int n, const char* const* names, char* 
  * Mixed or forced grouped, the files do not depend on the workers.  Then each
  * injected failure of a mixed import, and repeated imports keeping no
  * memory.  The default run is a subset of the matrix; PQX_FULL=1 runs all
- * of it (PQX_ROWS, PQX_RAM, PQX_TRACE change it; PQX_DET and
- * PQX_EMPTY run probes of their own instead). */
+ * of it (PQX_ROWS, PQX_GROUPS, PQX_RAM, PQX_TRACE change it; PQX_DET runs a
+ * probe of its own instead). */
 static test_result_t test_pq_symgrp_mixed_columns(void) {
 #if !defined(DEBUG)
     SKIP("the memory the decision assumes is a debug-build knob");
 #else
     pq_sym_env_clear();
-    if (getenv("PQX_EMPTY")) {
-        /* a file of no row groups, forced grouped, a step failing */
-        const char* nm[1] = {"p"};
-        const char* fn2[2] = {"x","p"};
-        pq_synth_fn fn[1] = {pqx_unique};
-        unsigned fl[1] = {0};
-        char src[160], dir[160];
-        snprintf(src, sizeof(src), "/tmp/rayforce-pqe-%d.parquet", (int)getpid());
-        snprintf(dir, sizeof(dir), "/tmp/rayforce-pqe-%d", (int)getpid());
-        TEST_ASSERT_TRUE(pqx_synth(src, 0, 0, 1, nm, fn, fl));
-        int64_t tids[2] = {ray_sym_intern("I32", 3), ray_sym_intern("SYM", 3)};
-        ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 2);
-        const char* steps[] = {NULL, "p2"};
-        for (int i = 0; i < 2; i++) {
-            ray_mem_stats_t s0, s1; ray_mem_stats(&s0);
-            pq_set_symmode("grouped");
-            pq_set_env("RAY_PQ_SYM_INJECT", steps[i]);
-            ray_t* res = ray_parquet_splayed_typed(src, dir, types);
-            pq_sym_env_clear();
-            bool failed = !res || RAY_IS_ERR(res);
-            fprintf(stderr, "  empty file, inject %s: %s\n", steps[i] ? steps[i] : "none",
-                    failed ? (res ? ray_err_code(res) : "null") : "imported");
-            if (res) { if (RAY_IS_ERR(res)) ray_error_free(res); else ray_release(res); }
-            char partial[240]; snprintf(partial, sizeof(partial), "%s.parquet-partial", dir);
-            pq_remove_native(partial, fn2, 2); pq_remove_native(dir, fn2, 2);
-            ray_mem_stats(&s1);
-            fprintf(stderr, "  empty file, inject %s: heap %+lld B\n", steps[i] ? steps[i] : "none",
-                    (long long)s1.bytes_allocated - (long long)s0.bytes_allocated);
-        }
-        ray_release(types); unlink(src);
-        PASS();
-    }
     enum { N = 5 };
     const char* names[N] = {"b","a","e","d","c"};
     const pq_synth_fn fns[N] = {pqx_highcard, pqx_lowcard, pqx_unique, pqx_hot, pqx_fallback};
@@ -2606,6 +2627,7 @@ const test_entry_t parquet_entries[] = {
     {"parquet/symgrp_rowgroups",test_pq_sym_grouped_rowgroups,pq_setup,pq_teardown},
     {"parquet/symgrp_mixed_columns",test_pq_symgrp_mixed_columns,pq_setup,pq_teardown},
     {"parquet/sym_vocab_bound",test_pq_sym_vocab_bound,pq_setup,pq_teardown},
+    {"parquet/sym_grouped_empty",test_pq_sym_grouped_empty,pq_setup,pq_teardown},
 #if defined(__linux__)
     {"parquet/chunk_flush_error",test_pq_chunk_flush_error,pq_setup,pq_teardown},
 #endif

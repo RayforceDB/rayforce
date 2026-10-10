@@ -3049,7 +3049,9 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
             if (ray_pool_par_dispatch_ok(pool,tasks,2)) ray_pool_dispatch_n(pool,pq_write_direct_group,&work,(uint32_t)tasks);
             else pq_write_direct_group(&work,0,0,tasks);
         }
-        for (int64_t t = 0; t < tasks; t++) if (errors[t]) {
+        /* errors[0] even with no tasks: a grouped pass over a file of no row
+         * groups still runs its steps, and reports there */
+        for (int64_t t = 0; t < (tasks > 0 ? tasks : 1); t++) if (errors[t]) {
             if (!err) err = errors[t]; else ray_error_free(errors[t]);
             errors[t] = NULL;
         }
