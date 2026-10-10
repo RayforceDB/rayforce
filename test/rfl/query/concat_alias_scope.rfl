@@ -1,0 +1,48 @@
+(set T (table [x k s t] (list [1 2 3 4 5] [0 0 1 1 2] ['a 'b 'c 'd 'e] (list "p" "q" "r" "s" "t"))))
+(set suffix "!")
+(set sfxg (fn [v] (concat v suffix)))
+;; Aliases supply actual arguments without capturing the helper's free names.
+(at (select {a: t suffix: (upper s) e: (reverse x) v: (sfxg a) from: T}) 'v) -- ["p!" "q!" "r!" "s!" "t!"]
+(at (select {suffix: (first s) a: (first t) v: (sfxg a) by: k from: T asc: k}) 'v) -- ["p!" "r!" "t!"]
+;; A missing global remains an error even when an alias has that name.
+(set ha (fn [v] (concat v aa)))
+(select {aa: (upper s) e: (reverse x) v: (ha s) from: T}) !- name
+(set hb (fn [v] (+ v bb)))
+(select {bb: (* x 10) e: (reverse x) v: (hb x) from: T}) !- name
+;; A nested helper resolves its own free name, not its caller's formal.
+(set label 'G)
+(set inner (fn [v] (concat v label)))
+(set outer (fn [v label] (inner v)))
+(at (select {v: (outer s 'L) e: (reverse x) from: T}) 'v) -- ['aG 'bG 'cG 'dG 'eG]
+;; Collection helpers keep the same whole-column semantics as inline concat.
+(set sv ['p 'q 'r 's 't])
+(set hsv (fn [v] (concat v sv)))
+(at (select {v: (hsv s) from: T}) 'v) -- ['a 'b 'c 'd 'e 'p 'q 'r 's 't]
+(at (select {v: (hsv s) e: (enlist 7) from: T}) 'v) -- ['a 'b 'c 'd 'e 'p 'q 'r 's 't]
+(set two (fn [a b] (concat a b)))
+(set L3 ['u 'v 'w])
+(at (select {v: (two s L3) from: T}) 'v) -- ['a 'b 'c 'd 'e 'u 'v 'w]
+(at (select {n: (count (two s L3)) by: k from: T asc: k}) 'n) -- [5 5 4]
+(update {v: (two s L3) from: T}) !- length
+;; A quoted suffix in a helper is not a reference to the source column x.
+(set hq (fn [v] (concat v 'x)))
+(at (update {v: (hq s) from: T}) 'v) -- ['ax 'bx 'cx 'dx 'ex]
+(at (select {from: T where: (in (hq s) ['ax 'cx])}) 'x) -- [1 3]
+(at (select {n: (+ (count (hq s)) (count (distinct x))) by: k from: T asc: k}) 'n) -- [4 4 2]
+(set hqs (fn [v] (concat v 's)))
+(at (select {v: (hqs s) from: T}) 'v) -- ['as 'bs 'cs 'ds 'es]
+(at (update {v: (hqs s) from: T}) 'v) -- ['as 'bs 'cs 'ds 'es]
+;; Text casts inherit the row dependency of their input even without DAG lowering.
+(at (select {v: (concat (as 'SYM x) "!") from: T}) 'v) -- ['1! '2! '3! '4! '5!]
+(at (update {v: (concat (as 'SYM x) "!") from: T}) 'v) -- ['1! '2! '3! '4! '5!]
+(at (select {n: (+ (count (concat (as 'SYM x) "!")) (count (distinct x))) by: k from: T asc: k}) 'n) -- [4 4 2]
+(at (select {n: (count (hsv s)) by: k from: T asc: k}) 'n) -- [7 7 6]
+(at (select {n: (+ (count (hsv s)) (count (distinct x))) by: k from: T asc: k}) 'n) -- [9 9 7]
+;; A replaced source column remains visible to a helper's free reference;
+;; the helper's actual argument still sees the output alias.
+(set TS (table [s suffix] (list ['a 'b] ['x 'y])))
+(at (select {suffix: (upper s) v: (sfxg s) from: TS}) 'v) -- ['ax 'by]
+(at (select {suffix: (upper s) v: (sfxg s) e: (reverse s) from: TS}) 'v) -- ['ax 'by]
+(at (select {suffix: (upper s) v: (sfxg suffix) e: (reverse s) from: TS}) 'v) -- ['Ax 'By]
+(at (select {suffix: (upper s) v: (sfxg s) e: (reverse s) from: TS where: (== s 'b)}) 'v) -- ['by]
+(at (select {__query_source_0: s suffix: (upper s) v: (sfxg s) e: (reverse s) from: TS}) 'v) -- ['ax 'by]

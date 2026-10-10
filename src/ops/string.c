@@ -27,6 +27,7 @@
 #include "ops/rowsel.h"
 #include "core/pool.h"
 #include "lang/format.h"   /* ray_type_name (error context) */
+#include "lang/env.h"
 #include "lang/internal.h" /* ray_like_fn (list-of-strings delegate) */
 
 /* ============================================================================
@@ -1404,6 +1405,132 @@ ray_t* exec_replace(ray_graph_t* g, ray_op_t* op) {
     return result;
 }
 
+/* Shared text kernel. Consumes one reference to each argument.  A STR
+ * vector makes the result STR; `str_out` says a STR atom does too (a cell
+ * of a STR column read row by row). */
+/* `cells[a]` (one flag per argument, or NULL for none): argument a is a
+ * cell of the query's rows (a column's element, or a text column reduced to
+ * one value by first/last/min/max), so a null there is empty text, as the
+ * vector kernel reads a null element; a null literal operand nulls the row. */
+static ray_t* concat_text_values(ray_t** args, int n_args, bool str_out, const uint8_t* cells) {
+    /* Only atoms broadcast. A one-row vector is still a vector, and an
+     * empty vector must never be indexed as if it contained row zero. */
+    int64_t nrows = 1;
+    bool out_str = str_out, has_vector = false;
+    for (int a = 0; a < n_args; a++) {
+        if (args[a]->type == RAY_STR) out_str = true;
+        if (ray_is_atom(args[a])) continue;
+        if (has_vector && args[a]->len != nrows) {
+            for (int i = 0; i < n_args; i++) ray_release(args[i]);
+            return ray_error("length", "concat: text columns must have equal lengths");
+        }
+        nrows = args[a]->len;
+        has_vector = true;
+    }
+    ray_t* result = ray_vec_new(out_str ? RAY_STR : RAY_SYM, nrows);
+    if (!result || RAY_IS_ERR(result)) {
+        for (int i = 0; i < n_args; i++) ray_release(args[i]);
+        return result;
+    }
+    if (!out_str) result->len = nrows;
+    int64_t* dst = out_str ? NULL : (int64_t*)ray_data(result);
+
+    for (int64_t r = 0; r < nrows; r++) {
+        /* Check if any arg is null at this row */
+        bool any_null = false;
+        for (int a = 0; a < n_args; a++) {
+            /* SYM atoms can be null (sym 0); STR/SYM vecs cannot.  A null
+             * cell (cells[a]) reads as empty text below. */
+            if (!(cells && cells[a]) && ray_is_atom(args[a]) && RAY_ATOM_IS_NULL(args[a])) { any_null = true; break; }
+        }
+        if (any_null) {
+            if (out_str) {
+                result = ray_str_vec_append(result, "", 0);
+                if (RAY_IS_ERR(result)) break;
+                ray_vec_set_null(result, result->len - 1, true);
+            } else {
+                dst[r] = 0;
+                ray_vec_set_null(result, r, true);
+            }
+            continue;
+        }
+        /* Pre-scan to compute total concat length for this row */
+        size_t total = 0;
+        for (int a = 0; a < n_args; a++) {
+            int8_t t = args[a]->type;
+            if (t == RAY_STR) {
+                const ray_str_t* elems; const char* p;
+                str_resolve(args[a], &elems, &p);
+                int64_t ar = r;
+                total += elems[ar].len;
+            } else if (RAY_IS_SYM(t)) {
+                const char* sp; size_t sl;
+                int64_t ar = r;
+                sym_elem(args[a], ar, &sp, &sl);
+                total += sl;
+            } else if (t == -RAY_STR) {
+                total += ray_str_len(args[a]);
+            } else if (t == -RAY_SYM) {
+                /* A symbol literal or a scalar such as (first s): RAY_IS_SYM
+                 * matches SYM vectors only, so its text was left out and
+                 * (concat 'ab 'cd) came back null. */
+                ray_t* st = ray_sym_str(args[a]->i64);
+                if (st) total += ray_str_len(st);
+            }
+        }
+        char sbuf[8192];
+        char* buf = sbuf;
+        ray_t* dyn_hdr = NULL;
+        size_t buf_cap = sizeof(sbuf);
+        if (total >= sizeof(sbuf)) {
+            buf = (char*)scratch_alloc(&dyn_hdr, total + 1);
+            if (!buf) {
+                ray_release(result);
+                for (int i = 0; i < n_args; i++) ray_release(args[i]);
+                return ray_error("oom", NULL);
+            }
+            buf_cap = total + 1;
+        }
+        size_t bi = 0;
+        for (int a = 0; a < n_args; a++) {
+            int8_t t = args[a]->type;
+            if (t == RAY_STR) {
+                const ray_str_t* elems; const char* pool;
+                str_resolve(args[a], &elems, &pool);
+                int64_t ar = r;
+                const char* sp = ray_str_t_ptr(&elems[ar], pool);
+                size_t sl = elems[ar].len;
+                if (bi + sl < buf_cap) { memcpy(buf + bi, sp, sl); bi += sl; }
+            } else if (RAY_IS_SYM(t)) {
+                const char* sp; size_t sl;
+                int64_t ar = r;
+                sym_elem(args[a], ar, &sp, &sl);
+                if (bi + sl < buf_cap) { memcpy(buf + bi, sp, sl); bi += sl; }
+            } else if (t == -RAY_STR) {
+                const char* sp = ray_str_ptr(args[a]);
+                size_t sl = ray_str_len(args[a]);
+                if (sp && bi + sl < buf_cap) { memcpy(buf + bi, sp, sl); bi += sl; }
+            } else if (t == -RAY_SYM) {
+                ray_t* st = ray_sym_str(args[a]->i64);
+                const char* sp = st ? ray_str_ptr(st) : NULL;
+                size_t sl = st ? ray_str_len(st) : 0;
+                if (sp && bi + sl < buf_cap) { memcpy(buf + bi, sp, sl); bi += sl; }
+            }
+        }
+        if (out_str) {
+            ray_t* prev = result;
+            result = ray_str_vec_append(result, buf, bi);
+            if (RAY_IS_ERR(result)) { ray_release(prev); scratch_free(dyn_hdr); break; }
+        } else {
+            buf[bi] = '\0';
+            dst[r] = ray_sym_intern(buf, bi);
+        }
+        scratch_free(dyn_hdr);
+    }
+    for (int i = 0; i < n_args; i++) ray_release(args[i]);
+    return result;
+}
+
 /* CONCAT(a, b, ...) */
 ray_t* exec_concat(ray_graph_t* g, ray_op_t* op) {
     ray_op_ext_t* ext = find_ext(g, op->id);
@@ -1439,117 +1566,76 @@ ray_t* exec_concat(ray_graph_t* g, ray_op_t* op) {
         }
     }
 
-    /* Derive nrows from first vector arg (scalar args have byte-length in len) */
-    int64_t nrows = 1;
-    bool out_str = false;
-    for (int a = 0; a < n_args; a++) {
-        int8_t at = args[a]->type;
-        if (at == RAY_STR) { out_str = true; if (nrows == 1) nrows = args[a]->len; }
-        if (RAY_IS_SYM(at)) { if (nrows == 1) nrows = args[a]->len; }
-        if (!ray_is_atom(args[a]) && nrows == 1) { nrows = args[a]->len; }
+    /* An operand that reduces a text column to one value (first, last, min,
+     * max) is a cell of the rows: a null there is empty text, and a cell of
+     * a STR column makes the result STR, as a STR column itself does.  One
+     * flag per operand, at every position (up to 255 of them). */
+    uint8_t cells[256] = { 0 };
+    bool str_out = false;
+    for (int i = 0; i < n_args; i++) {
+        ray_op_t* child = i < 2 ? op_child(g, op, i) : &g->nodes[trail[i - 2]];
+        if (child && (child->opcode == OP_FIRST || child->opcode == OP_LAST ||
+                      child->opcode == OP_MIN || child->opcode == OP_MAX)) {
+            cells[i] = 1;
+            if (child->out_type == RAY_STR) str_out = true;
+        }
     }
-    ray_t* result = ray_vec_new(out_str ? RAY_STR : RAY_SYM, nrows);
-    if (!result || RAY_IS_ERR(result)) {
-        for (int i = 0; i < n_args; i++) ray_release(args[i]);
-        scratch_free(args_hdr);
-        return result;
-    }
-    if (!out_str) result->len = nrows;
-    int64_t* dst = out_str ? NULL : (int64_t*)ray_data(result);
-
-    for (int64_t r = 0; r < nrows; r++) {
-        /* Check if any arg is null at this row */
-        bool any_null = false;
-        for (int a = 0; a < n_args; a++) {
-            /* SYM atoms can be null (sym 0); STR/SYM vecs cannot. */
-            if (ray_is_atom(args[a]) && RAY_ATOM_IS_NULL(args[a])) { any_null = true; break; }
-        }
-        if (any_null) {
-            if (out_str) {
-                result = ray_str_vec_append(result, "", 0);
-                if (RAY_IS_ERR(result)) break;
-                ray_vec_set_null(result, result->len - 1, true);
-            } else {
-                dst[r] = 0;
-                ray_vec_set_null(result, r, true);
-            }
-            continue;
-        }
-        /* Pre-scan to compute total concat length for this row */
-        size_t total = 0;
-        for (int a = 0; a < n_args; a++) {
-            int8_t t = args[a]->type;
-            if (t == RAY_STR) {
-                const ray_str_t* elems; const char* p;
-                str_resolve(args[a], &elems, &p);
-                int64_t ar = ray_is_atom(args[a]) ? 0 : (r < args[a]->len ? r : 0);
-                total += elems[ar].len;
-            } else if (RAY_IS_SYM(t)) {
-                const char* sp; size_t sl;
-                int64_t ar = ray_is_atom(args[a]) ? 0 : (r < args[a]->len ? r : 0);
-                sym_elem(args[a], ar, &sp, &sl);
-                total += sl;
-            } else if (t == -RAY_STR) {
-                total += ray_str_len(args[a]);
-            } else if (t == -RAY_SYM) {
-                /* A symbol literal or a scalar such as (first s): RAY_IS_SYM
-                 * matches SYM vectors only, so its text was left out and
-                 * (concat 'ab 'cd) came back null. */
-                ray_t* st = ray_sym_str(args[a]->i64);
-                if (st) total += ray_str_len(st);
-            }
-        }
-        char sbuf[8192];
-        char* buf = sbuf;
-        ray_t* dyn_hdr = NULL;
-        size_t buf_cap = sizeof(sbuf);
-        if (total >= sizeof(sbuf)) {
-            buf = (char*)scratch_alloc(&dyn_hdr, total + 1);
-            if (!buf) {
-                ray_release(result);
-                for (int i = 0; i < n_args; i++) ray_release(args[i]);
-                scratch_free(args_hdr);
-                return ray_error("oom", NULL);
-            }
-            buf_cap = total + 1;
-        }
-        size_t bi = 0;
-        for (int a = 0; a < n_args; a++) {
-            int8_t t = args[a]->type;
-            if (t == RAY_STR) {
-                const ray_str_t* elems; const char* pool;
-                str_resolve(args[a], &elems, &pool);
-                int64_t ar = ray_is_atom(args[a]) ? 0 : (r < args[a]->len ? r : 0);
-                const char* sp = ray_str_t_ptr(&elems[ar], pool);
-                size_t sl = elems[ar].len;
-                if (bi + sl < buf_cap) { memcpy(buf + bi, sp, sl); bi += sl; }
-            } else if (RAY_IS_SYM(t)) {
-                const char* sp; size_t sl;
-                int64_t ar = ray_is_atom(args[a]) ? 0 : (r < args[a]->len ? r : 0);
-                sym_elem(args[a], ar, &sp, &sl);
-                if (bi + sl < buf_cap) { memcpy(buf + bi, sp, sl); bi += sl; }
-            } else if (t == -RAY_STR) {
-                const char* sp = ray_str_ptr(args[a]);
-                size_t sl = ray_str_len(args[a]);
-                if (sp && bi + sl < buf_cap) { memcpy(buf + bi, sp, sl); bi += sl; }
-            } else if (t == -RAY_SYM) {
-                ray_t* st = ray_sym_str(args[a]->i64);
-                const char* sp = st ? ray_str_ptr(st) : NULL;
-                size_t sl = st ? ray_str_len(st) : 0;
-                if (sp && bi + sl < buf_cap) { memcpy(buf + bi, sp, sl); bi += sl; }
-            }
-        }
-        if (out_str) {
-            ray_t* prev = result;
-            result = ray_str_vec_append(result, buf, bi);
-            if (RAY_IS_ERR(result)) { ray_release(prev); scratch_free(dyn_hdr); break; }
-        } else {
-            buf[bi] = '\0';
-            dst[r] = ray_sym_intern(buf, bi);
-        }
-        scratch_free(dyn_hdr);
-    }
-    for (int i = 0; i < n_args; i++) ray_release(args[i]);
+    ray_t* result = concat_text_values(args, n_args, str_out, cells);
     scratch_free(args_hdr);
     return result;
+}
+
+/* Query fallback uses the same text kernel after checking argument syntax.
+ * Ordinary builtin calls retain collection semantics. */
+ray_t* ray_concat_text_fn(ray_t* a, ray_t* b, bool str_out, uint8_t rows_mask) {
+    bool atoms = ray_is_atom(a) && ray_is_atom(b);
+    /* A null cell of a column is empty text, as the vector kernel reads a
+     * null element; a null literal operand follows the kernel's null rule. */
+    bool a_null = RAY_ATOM_IS_NULL(a), b_null = RAY_ATOM_IS_NULL(b);
+    /* Two STR literals join as strings, as the planner folds them; a STR
+     * cell beside a null literal follows the kernel's null rule. */
+    if (a->type == -RAY_STR && b->type == -RAY_STR && (rows_mask == 0 || (!a_null && !b_null)))
+        return ray_concat_fn(a, b);
+    if (atoms && (a->type == -RAY_SYM || a->type == -RAY_STR) &&
+        (b->type == -RAY_SYM || b->type == -RAY_STR) &&
+        (!a_null || (rows_mask & 1)) && (!b_null || (rows_mask & 2))) {
+        /* Two cells, the row-by-row case: build the atom directly rather
+         * than a one-row vector that is unpacked again. */
+        ray_t* sa = a->type == -RAY_SYM && !a_null ? ray_sym_str(a->i64) : NULL;
+        ray_t* sb = b->type == -RAY_SYM && !b_null ? ray_sym_str(b->i64) : NULL;
+        if ((a->type == -RAY_SYM && !a_null && !sa) || (b->type == -RAY_SYM && !b_null && !sb)) {
+            if (sa) ray_release(sa);
+            if (sb) ray_release(sb);
+            return ray_error("oom", NULL);
+        }
+        const char* pa = a_null ? "" : sa ? ray_str_ptr(sa) : ray_str_ptr(a);
+        const char* pb = b_null ? "" : sb ? ray_str_ptr(sb) : ray_str_ptr(b);
+        size_t la = a_null ? 0 : sa ? ray_str_len(sa) : ray_str_len(a);
+        size_t lb = b_null ? 0 : sb ? ray_str_len(sb) : ray_str_len(b);
+        char small[256];
+        ray_t* hdr = NULL;
+        char* buf = la + lb <= sizeof small ? small : (char*)scratch_calloc(&hdr, la + lb + 1);
+        ray_t* out;
+        if (!buf) out = ray_error("oom", NULL);
+        else {
+            memcpy(buf, pa, la);
+            memcpy(buf + la, pb, lb);
+            out = str_out ? ray_str(buf, la + lb) : ray_sym(ray_sym_intern(buf, la + lb));
+        }
+        if (hdr) scratch_free(hdr);
+        if (sa) ray_release(sa);
+        if (sb) ray_release(sb);
+        return out;
+    }
+    ray_t* args[2] = { a, b };
+    uint8_t cells[2] = { (uint8_t)(rows_mask & 1), (uint8_t)((rows_mask >> 1) & 1) };
+    ray_retain(a);
+    ray_retain(b);
+    ray_t* result = concat_text_values(args, 2, str_out, cells);
+    if (!atoms || !result || RAY_IS_ERR(result)) return result;
+    int allocated = 0;
+    ray_t* atom = collection_elem(result, 0, &allocated);
+    if (atom && !allocated) ray_retain(atom);
+    ray_release(result);
+    return atom;
 }

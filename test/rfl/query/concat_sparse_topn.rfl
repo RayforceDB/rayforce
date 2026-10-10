@@ -1,0 +1,4 @@
+;; Sparse keys reach the top-N emission path; dense keys do not.
+(set V (as 'SYM (list "a" "bb" "ccc" "dddd" "eeeee" "ffffff" "g")))
+(set TN (table [k y s] (list (* 1000003 (% (* (til 20000) 7919) 2000)) (% (* (til 20000) 15485863) 99991) (at V (% (* (til 20000) 31) 7)))))
+(at (select {a: (max (strlen (concat s "!"))) c: (max y) by: k from: TN desc: c take: 3}) 'c) -- [99985 99979 99973]

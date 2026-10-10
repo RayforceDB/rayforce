@@ -157,6 +157,141 @@ static void lang_teardown(void) {
     ray_runtime_destroy(__RUNTIME);
 }
 
+
+/* ---- Test: query helper row provenance survives a runtime re-init ----
+ * The row-wise builtin tables and the per-object verdict cache behind the
+ * bytecode provenance flags are keyed on the symbol-table epoch; a stale
+ * entry would silently turn text concat into a collection append. */
+static test_result_t test_query_helper_reinit(void) {
+    for (int round = 0; round < 2; round++) {
+        if (round) {
+            ray_runtime_destroy(__RUNTIME);
+            ray_runtime_create(0, NULL);
+            /* Shift user symbol ids before the helpers are defined again. */
+            ray_t* shift = ray_eval_str("(set shifted (list 'zz0 'zz1 'zz2 'zz3 'zz4 'zz5 'zz6 'zz7))");
+            if (shift && !RAY_IS_ERR(shift)) ray_release(shift); else if (shift) ray_error_free(shift);
+        }
+        ray_t* setup = ray_eval_str("(do (set T (table [x s] (list [1 2 3] ['a 'b 'c])))"
+                                    " (set hup (fn [v] 1 (concat (upper v) \"!\")))"
+                                    " (set hif (fn [v] 1 (if (> 1 0) (concat v \"?\") v))) 1)");
+        TEST_ASSERT_NOT_NULL(setup);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+        ray_release(setup);
+        ASSERT_EQ("(at (update {r: (hup s) from: T}) 'r)", "['A! 'B! 'C!]");
+        ASSERT_EQ("(at (update {r: (hif s) from: T}) 'r)", "['a? 'b? 'c?]");
+        ASSERT_EQ("(at (select {from: T where: (in (hup s) ['A! 'C!])}) 'x)", "[1 3]");
+    }
+    PASS();
+}
+
+
+/* ---- Test: a closure whose capture values are not a LIST never compiles ----
+ * A deserialized lambda may carry a dict with a typed value vector; the
+ * compiled capture load would read its payload as pointers.  Such a
+ * closure stays on the tree walker, whose capture binding reports a type
+ * error, inside and outside a query. */
+static test_result_t test_closure_malformed_capture(void) {
+    /* A closure as the deserializer hands it back: no bytecode yet, so the
+     * compile gate decides.  (A closure made by interpreted code shares
+     * its literal's template at birth; strip that to get the shape.) */
+    ray_t* lam = ray_eval_str("(do (let k 1) (fn [v] (+ v k)))");
+    TEST_ASSERT_NOT_NULL(lam);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(lam));
+    TEST_ASSERT_EQ_I(lam->type, RAY_LAMBDA);
+    TEST_ASSERT_NOT_NULL(LAMBDA_CLOSURE(lam));
+    if (LAMBDA_BC(lam)) { ray_release(LAMBDA_BC(lam)); LAMBDA_BC(lam) = NULL; }
+    if (LAMBDA_CONSTS(lam)) { ray_release(LAMBDA_CONSTS(lam)); LAMBDA_CONSTS(lam) = NULL; }
+    if (LAMBDA_DBG(lam)) { ray_release(LAMBDA_DBG(lam)); LAMBDA_DBG(lam) = NULL; }
+    LAMBDA_NLOCALS(lam) = 0;
+    lam->attrs &= (uint8_t)~RAY_FN_COMPILED;
+    TEST_ASSERT(!LAMBDA_IS_COMPILED(lam), "the closure is uncompiled before the call");
+    /* Replace the closure's values with a typed vector of the same length. */
+    ray_t* keys = ray_dict_keys(LAMBDA_CLOSURE(lam));
+    ray_t* vals = ray_vec_new(RAY_I64, keys->len);
+    TEST_ASSERT_NOT_NULL(vals);
+    for (int64_t i = 0; i < keys->len; i++) ((int64_t*)ray_data(vals))[i] = 0x4141414141414141LL;
+    vals->len = keys->len;
+    ray_retain(keys);
+    ray_t* bad = ray_dict_new(keys, vals);
+    TEST_ASSERT_NOT_NULL(bad);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(bad));
+    ray_release(LAMBDA_CLOSURE(lam));
+    LAMBDA_CLOSURE(lam) = bad;
+    ray_t* arg = ray_i64(2);
+    ray_t* args[1] = { arg };
+    ray_t* r = call_lambda(lam, args, 1);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT(RAY_IS_ERR(r), "malformed closure must fail, not be dereferenced");
+    TEST_ASSERT(!LAMBDA_IS_COMPILED(lam), "malformed closure must not compile");
+    ray_error_free(r);
+    ray_release(lam);
+
+    /* A closure made by compiled code shares its literal's bytecode from
+     * birth; its capture binding checks the dict's shape at run time. */
+    lam = ray_eval_str("((fn [k] (fn [v] (+ v k))) 1)");
+    TEST_ASSERT_NOT_NULL(lam);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(lam));
+    TEST_ASSERT(LAMBDA_IS_COMPILED(lam), "a closure made by compiled code is born compiled");
+    keys = ray_dict_keys(LAMBDA_CLOSURE(lam));
+    vals = ray_vec_new(RAY_I64, keys->len);
+    TEST_ASSERT_NOT_NULL(vals);
+    for (int64_t i = 0; i < keys->len; i++) ((int64_t*)ray_data(vals))[i] = 0x4141414141414141LL;
+    vals->len = keys->len;
+    ray_retain(keys);
+    bad = ray_dict_new(keys, vals);
+    TEST_ASSERT_NOT_NULL(bad);
+    ray_release(LAMBDA_CLOSURE(lam));
+    LAMBDA_CLOSURE(lam) = bad;
+    r = call_lambda(lam, args, 1);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT(RAY_IS_ERR(r), "a malformed closure dict must fail the capture binding");
+    ray_error_free(r);
+    ray_release(arg);
+    ray_release(lam);
+    PASS();
+}
+
+/* A lazy handle passed through the C API to a compiled closure maker reaches
+ * the maker's parameter slot unmaterialized (Rayfall call sites materialize
+ * lazy arguments, call_lambda does not).  The closure must capture the
+ * concrete value: a lazy handle is single-use, and a dict holding the
+ * handle would fail the closure's second call. */
+static test_result_t test_closure_lazy_capture_vm(void) {
+    ray_t* mk = ray_eval_str("(fn [v] (fn [] (at v 0)))");
+    TEST_ASSERT_NOT_NULL(mk);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(mk));
+    /* A lazy handle over a constant vector, as a deferred DAG result is. */
+    ray_t* vec = ray_eval_str("[1 2 3]");
+    TEST_ASSERT_NOT_NULL(vec);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+    ray_graph_t* g = ray_graph_new(NULL);
+    TEST_ASSERT_NOT_NULL(g);
+    ray_t* lazy = ray_lazy_wrap(g, ray_graph_input_vec(g, vec));
+    TEST_ASSERT_NOT_NULL(lazy);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(lazy));
+    TEST_ASSERT(ray_is_lazy(lazy), "the argument must be a lazy handle");
+    ray_t* args[1] = { lazy };
+    ray_t* clo = call_lambda(mk, args, 1);
+    TEST_ASSERT_NOT_NULL(clo);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(clo));
+    TEST_ASSERT_EQ_I(clo->type, RAY_LAMBDA);
+    TEST_ASSERT(LAMBDA_IS_COMPILED(mk), "the maker compiles on its first call");
+    TEST_ASSERT(LAMBDA_IS_COMPILED(clo), "a closure made by compiled code is born compiled");
+    for (int i = 0; i < 3; i++) {
+        ray_t* r = call_lambda(clo, NULL, 0);
+        TEST_ASSERT_NOT_NULL(r);
+        TEST_ASSERT_FMT(!RAY_IS_ERR(r), "call %d of a closure over a lazy capture failed: %s", i + 1, ray_err_code(r));
+        TEST_ASSERT_EQ_I(r->type, -RAY_I64);
+        TEST_ASSERT_EQ_I(r->i64, 1);
+        ray_release(r);
+    }
+    ray_release(clo);
+    ray_release(lazy);
+    ray_release(vec);
+    ray_release(mk);
+    PASS();
+}
+
 /* ---- Dummy function for testing ---- */
 static ray_t* dummy_unary(ray_t* x) { return ray_retain(x), x; }
 static ray_t* dummy_binary(ray_t* x, ray_t* y) { (void)y; return ray_retain(x), x; }
@@ -892,6 +1027,15 @@ static test_result_t test_eval_select_where_in_guid_nulls(void) {
     TEST_ASSERT_EQ_I(ray_table_nrows(result), 1);
 
     ray_release(result);
+    /* GUID producers can emit payload nulls without HAS_NULLS.
+     * The inline distinct probe forces evaluator membership. */
+    col->attrs &= (uint8_t)~RAY_ATTR_HAS_NULLS;
+    ray_t* bound = ray_eval_str("(set Pg (at t 'g))");
+    TEST_ASSERT_NOT_NULL(bound);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(bound));
+    ray_release(bound);
+    ASSERT_EQ("(count (select {from: t where: (in g (distinct Pg))}))", "1");
+    ASSERT_EQ("(count (select {from: t where: (not-in g (distinct (list probe)))}))", "1");
     ray_release(table);
     PASS();
 }
@@ -1557,6 +1701,17 @@ static test_result_t test_eval_pivot_multi_index(void) {
         else TEST_ASSERT_TRUE(false);
     }
     TEST_ASSERT_TRUE(seen_A10 && seen_A20 && seen_B10 && seen_B20);
+    ray_release(r);
+    PASS();
+}
+
+static test_result_t test_eval_zone_sym_diagnostic(void) {
+    ray_t* r = ray_eval_str("(.idx.zone ['a 'b])");
+    TEST_ASSERT(r && RAY_IS_ERR(r), "SYM zone index remains unsupported");
+    TEST_ASSERT_STR_EQ(ray_err_code(r), "nyi");
+    TEST_ASSERT_NOT_NULL(ray_error_msg());
+    TEST_ASSERT_STR_EQ(ray_error_msg(),
+                      "zone: only numeric/temporal vectors supported (got type 12)");
     ray_release(r);
     PASS();
 }
@@ -9926,6 +10081,10 @@ const test_entry_t lang_entries[] = {
     { "lang/temporal/extract_epoch",            test_temporal_extract_epoch,            lang_setup, lang_teardown },
     { "lang/temporal/date_trunc_month_case",    test_temporal_date_trunc_month_case,    lang_setup, lang_teardown },
 
+    { "lang/zone_sym_diagnostic", test_eval_zone_sym_diagnostic, lang_setup, lang_teardown },
+    { "lang/query_helper_reinit", test_query_helper_reinit, lang_setup, lang_teardown },
+    { "lang/closure_malformed_capture", test_closure_malformed_capture, lang_setup, lang_teardown },
+    { "lang/closure_lazy_capture_vm", test_closure_lazy_capture_vm, lang_setup, lang_teardown },
     { "lang/io/read_procfs_zero_size", test_read_procfs_reports_zero_size, lang_setup, lang_teardown },
     { "lang/io/read_unsized_bounded", test_read_unsized_stream_is_bounded, lang_setup, lang_teardown },
     { "lang/io/exec_capture_bounded", test_exec_capture_is_bounded, lang_setup, lang_teardown },

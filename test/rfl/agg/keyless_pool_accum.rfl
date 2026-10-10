@@ -47,3 +47,13 @@
 (== (at (at B 'a7) 0) (max n)) -- true
 (== (at (at B 'a10) 0) (avg f)) -- true
 (< (abs (- (at (at B 'a13) 0) (stddev a))) 1e-9) -- true
+;; float partials belong to fixed chunks of the rows, folded in chunk order,
+;; not to whichever worker claimed the rows: sums whose partials overflow
+;; (p) or cancel (c) give one answer on every call, here and in the vector
+;; reductions
+(set PB (table [p c] (list (take [1.7976931348623157e308 -1.7976931348623157e308 3.2] 131073) (take [1e16 1.0 -1e16] 131073))))
+(set PBF (fn [] (ser (list (sum (at PB 'p)) (sum (at PB 'c)) (avg (at PB 'p)) (var (+ (at PB 'c) 0.0)) (select {from: PB s: (sum p)}) (select {from: PB s: (sum p) a: (avg p)}) (select {from: PB s: (sum c) v: (var c) mx: (max p)}) (select {from: PB s: (sum p) a: (avg c) where: (> c 0)})))))
+(set PB0 (PBF))
+(set PBN 0)
+(times 8 (if (all (== PB0 (PBF))) (set PBN (+ PBN 1))))
+PBN -- 8

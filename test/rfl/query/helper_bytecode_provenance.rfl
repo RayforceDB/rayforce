@@ -1,0 +1,439 @@
+(set T (table [x s] (list [1 2 3] ['a 'b 'c])))
+(set TS (table [x s suffix] (list [1 2 3] ['a 'b 'c] ['p 'q 'r])))
+;; A helper called from a query fallback runs as bytecode: return, lazy
+;; arguments read twice, deep recursion and error locations behave as they
+;; do outside a query.
+(set h (fn [v] (return (* v 2)) 0))
+(at (select {v: (h x) from: T}) 'v) -- [2 4 6]
+(at (update {v: (h x) from: T}) 'v) -- [2 4 6]
+(at (select {from: T where: (in (h x) [2 6])}) 'x) -- [1 3]
+(set hloop (fn [v] (let i 0) (while (< i 10) (let i (+ i 1)) (if (== i 4) (return (+ v i)))) -1))
+(at (select {v: (hloop x) from: T}) 'v) -- [5 6 7]
+(set d (fn [v] 1 (+ v v)))
+(at (select {r: (d (sum x)) from: T}) 'r) -- [12]
+(at (update {r: (d (max x)) from: T}) 'r) -- [6 6 6]
+(at (select {r: ((fn [v] 1 (if (> v 0) v 0)) (first x)) from: T}) 'r) -- [1]
+(set rd (fn [n] (if (== n 0) 0 (+ 1 (self (- n 1))))))
+(at (select {v: (+ x (rd 100)) from: T}) 'v) -- [101 102 103]
+(set bad (fn [v] 1 (+ v 's)))
+(select {v: (bad x) from: T}) !- type
+;; Row provenance follows values through locals, nested calls and results:
+;; a column argument keeps text concat, a bound vector stays a collection.
+(set hlet (fn [v] (let w (upper v)) (concat w "!")))
+(at (update {r: (hlet s) from: T}) 'r) -- ['A! 'B! 'C!]
+(at (select {from: T where: (in (hlet s) ['A! 'C!])}) 'x) -- [1 3]
+(at (select {n: (count (hlet s)) by: x from: T asc: x}) 'n) -- [1 1 1]
+(set hnest (fn [a b c] 1 (concat a (concat b c))))
+(at (update {r: (hnest s "!" "?") from: T}) 'r) -- ['a!? 'b!? 'c!?]
+(set sub1 (fn [v] 1 (concat v "!")))
+(set hsub (fn [v] 1 (sub1 (substr v 0 1))))
+(at (update {r: (hsub s) from: T}) 'r) -- ['a! 'b! 'c!]
+(set mb (fn [v] 1 (concat v 'zz)))
+(at (select {n: (+ (count (mb s)) (count (distinct x))) by: x from: T asc: x}) 'n) -- [2 2 2]
+(set L ['u 'v])
+(set mbtwo (fn [a b] 1 (concat a b)))
+(update {v: (mbtwo s L) from: T}) !- length
+;; A free name that is a source column is the row's cell, with provenance,
+;; exactly as the single-statement form the planner inlines; an output
+;; alias never captures it, and a missing global stays an error.
+(set hcol (fn [v] 1 (concat v s)))
+(at (select {v: (hcol s) from: T}) 'v) -- ['aa 'bb 'cc]
+(at (select {v: ((fn [v] (concat v s)) s) from: T}) 'v) -- ['aa 'bb 'cc]
+(at (select {from: T where: (in (hcol s) ['aa 'cc])}) 'x) -- [1 3]
+(set hclo (fn [v] 1 ((fn [w] (concat w s)) v)))
+(at (select {v: (hclo s) from: T}) 'v) -- ['aa 'bb 'cc]
+(set suffix "!")
+(set mbg (fn [v] 1 (concat v suffix)))
+(at (select {v: (mbg s) from: TS}) 'v) -- ['ap 'bq 'cr]
+(at (select {suffix: (upper s) e: (reverse x) v: (mbg s) from: TS}) 'v) -- ['ap 'bq 'cr]
+(at (select {suffix: (upper s) e: (reverse x) v: (mbg s) from: T}) 'v) -- ['a! 'b! 'c!]
+(set ha (fn [v] 1 (concat v aa)))
+(select {aa: (upper s) e: (reverse x) v: (ha s) from: T}) !- name
+;; Outside a query nothing changes.
+(mb ['a 'b]) -- ['a 'b 'zz]
+(h 5) -- 10
+(hcol 'q) !- name
+;; At the query level, an opaque helper given row data yields row data.
+(set id (fn [v] 1 v))
+(at (select {v: (concat (id s) "!") e: (reverse x) from: T}) 'v) -- ['a! 'b! 'c!]
+(at (update {v: (mb (id s)) from: T}) 'v) -- ['azz 'bzz 'czz]
+(at (select {from: T where: (in (concat (id s) "!") ['a! 'c!])}) 'x) -- [1 3]
+(at (select {n: (count (concat (id s) "!")) by: x from: T asc: x}) 'n) -- [1 1 1]
+(at (select {v: (concat s (id L)) from: T}) 'v) -- ['a 'b 'c 'u 'v]
+;; A source column shadows a global helper of the same name inside a helper
+;; body, on the planned path and in fallbacks alike.
+(set s (fn [v] v))
+(set hs (fn [v] 1 (s v)))
+(select {v: (hs x) from: T}) !- type
+(select {v: ((fn [v] (s v)) x) from: T}) !- name
+(set TN (table [x q] (list [1 2 3] [4 5 6])))
+(at (select {v: (hs x) from: TN}) 'v) -- [1 2 3]
+;; A lambda written inline in the query that reaches the runtime (several
+;; statements, so the planner does not substitute it) is still query text:
+;; its literals follow the column rule, which bytecode constants could not.
+(at (select {v: ((fn [v] 1 (concat v 's)) s) e: (reverse x) from: T}) 'v) -- ['aa 'bb 'cc]
+(at (update {v: ((fn [v] 1 (concat v 's)) s) from: T}) 'v) -- ['aa 'bb 'cc]
+(at (select {o: ((fn [v] 1 'x) s) e: (reverse x) from: T}) 'o) -- [1 2 3]
+;; A free source column keeps its provenance on every read, not only the
+;; first, through concat and through a row-wise builtin.
+(set h2 (fn [v] 1 (concat (concat s v) s)))
+(at (select {v: (h2 s) from: T}) 'v) -- ['aaa 'bbb 'ccc]
+(at (update {v: (h2 s) from: T}) 'v) -- ['aaa 'bbb 'ccc]
+(at (select {from: T where: (in (h2 s) ['aaa 'ccc])}) 'x) -- [1 3]
+(set h3 (fn [v] 1 (concat (upper s) s)))
+(at (update {v: (h3 x) from: T}) 'v) -- ['Aa 'Bb 'Cc]
+(at (select {n: (count (h3 x)) by: x from: T asc: x}) 'n) -- [1 1 1]
+;; Per group, a free source column is the group's rows, like a parameter.
+(set h4 (fn [v] 1 (count s)))
+(at (select {n: (first (h4 x)) by: x from: T asc: x}) 'n) -- [1 1 1]
+(at (update {n: (first (h4 x)) by: x from: T}) 'n) -- [1 1 1]
+;; An opaque helper can be the group key: it is evaluated once over the
+;; table and grouped as a hidden column named after its column argument.
+(key (select {n: (count x) by: (mb s) from: T})) -- ['s 'n]
+(at (select {n: (count x) by: (mb s) from: T asc: s}) 's) -- ['azz 'bzz 'czz]
+(at (select {n: (sum x) by: (hlet s) from: T desc: n}) 'n) -- [3 2 1]
+(at (select {n: (sum x) by: (hlet s) from: T where: (> x 1) asc: s}) 's) -- ['B! 'C!]
+(count (select {n: (count x) by: (mb s) from: T desc: n take: 2})) -- 2
+;; Without row data among the operands, concat inside any function keeps
+;; collection semantics, whatever called it.
+(set cc (fn [acc y] (concat acc y)))
+(at (select {v: (fold cc ['p 'q 'r]) from: T}) 'v) -- (list ['p 'q 'r] ['p 'q 'r] ['p 'q 'r])
+(set two (fn [] 1 (concat 'a 'b)))
+(at (update {n: (+ x (count (two))) from: T}) 'n) -- [3 4 5]
+(set gx (fn [a] (concat a 'x)))
+(at (update {v: (map gx s) from: T}) 'v) -- (list ['a 'x] ['b 'x] ['c 'x])
+;; Only deterministic, effect-free builtins are inlined: a random input is
+;; computed once, an effectful argument runs once per row, a raise raises.
+(set gg (fn [g] (== g g)))
+(at (select {v: (gg (first (guid 1))) e: x from: T}) 'v) -- [true true true]
+(set dup (fn [g] (count (distinct (concat g g)))))
+(at (select {v: (dup (guid 3)) e: (reverse x) from: T}) 'v) -- [3 3 3]
+(set CNT 0)
+(set eff (fn [v] (set CNT (+ CNT 1)) v))
+(set ign (fn [a b] a))
+(at (select {v: (ign s (map eff ['p])) from: T}) 'v) -- ['a 'b 'c]
+CNT -- 3
+(select {v: (ign s (raise 'boom)) from: T}) !- domain
+;; A caller's locals never reach a helper, grouped or not; a nested query
+;; inside a helper leaves the enclosing group's rows in place.
+(set TY (table [k x y s] (list [0 0 1 1 2] [1 2 3 4 5] [10 20 30 40 50] ['a 'b 'c 'd 'e])))
+(set cs (fn [v] 1 (count s)))
+(set fs (fn [v] 1 (first s)))
+((fn [t] (let s 'LOCAL) (at (select {r: (fs x) by: k from: t asc: k}) 'r)) TY) -- ['a 'c 'e]
+((fn [t] (let s (til 7)) (at (select {r: (cs x) by: k from: t asc: k}) 'r)) TY) -- [2 2 1]
+(set nq (fn [v] 1 (let q (select {r: (cs x) by: k from: TY})) (count s)))
+(at (select {n: (nq x) by: k from: TY asc: k}) 'n) -- [2 2 1]
+;; Reordering a column keeps its rows, in a helper as in the query.
+(set rv (fn [v] 1 (concat v (reverse v))))
+(at (update {v: (rv s) from: TY}) 'v) -- ['ae 'bd 'cc 'db 'ea]
+;; A bound vector returned by a helper is not row data.
+(set L3 ['p 'q 'r])
+(set k3 (fn [v] 1 L3))
+(select {v: (concat (k3 s) "!") from: T}) !- type
+;; Provenance through a cast or a bucket bound with let, and through a
+;; conditional form over a let local.
+(set hx (fn [v] 1 (let w (as 'SYM v)) (concat w "!")))
+(at (select {from: T where: (in (hx s) ['a! 'c!])}) 'x) -- [1 3]
+(set hb (fn [v] 1 (let w (xbar v 2)) (+ w 0)))
+(at (select {n: (sum (hb x)) by: x from: T asc: x}) 'n) -- [0 2 2]
+(set hw (fn [v] 1 (let w v) (or false (in (concat w "!") ['a! 'c!]))))
+(at (select {from: T where: (hw s)}) 'x) -- [1 3]
+;; Every grouped result keeps the requested output order.
+(key (select {n: (+ (count s) 1) m: (sum x) by: k from: TY})) -- ['k 'n 'm]
+;; A nested query's result is a new value, not the outer query's row data;
+;; a let local in an interpreted lambda and a try handler's value keep the
+;; provenance of what they hold.
+(set U (table [w y] (list ['p 'q 'r] [1 2 3])))
+(set id1 (fn [z] 1 z))
+(at (select {v: (concat (at (select {w: (id1 w) from: U}) 'w) 'zz) from: T}) 'v) -- ['p 'q 'r 'zz]
+(at (select {from: T where: (in (at (select {w: (id1 w) from: U}) 'w) ['p])}) 'x) -- [1]
+(at (select {r: ((fn [v] (let w v) (concat w "!")) s) from: T}) 'r) -- ['a! 'b! 'c!]
+(set ht (fn [v] (try (+ v 's) (fn [e] v))))
+(at (update {r: (concat (ht s) "!") from: T}) 'r) -- ['a! 'b! 'c!]
+(at (select {from: T where: (in (concat (ht s) "!") ['a! 'c!])}) 'x) -- [1 3]
+;; A null operand follows the kernel's null rule row by row too.
+(set T4 (table [x s] (list [1 2 3 4] (as 'SYM ["a" "" "c" "d"]))))
+(at (select {r: (concat s "") e: (reverse x) from: T4}) 'r) -- (as 'SYM ["" "" "" ""])
+;; An opaque by: key sees the rows where: keeps, is named like a planned
+;; key, and a body with a condition over one value runs row by row.
+(set TB (table [v g] (list [1 2 3 10 20 30] ['a 'a 'b 'b 'c 'c])))
+(set ha (fn [v] 1 (> v (avg v))))
+(at (select {n: (count v) by: (ha v) from: TB where: (< v 5)}) 'n) -- [2 1]
+(at (select {n: (count v) by: (ha v) from: TB where: (< v 5)}) 'v) -- [false true]
+(at (select {n: (count (distinct g)) by: (ha v) from: TB where: (< v 5)}) 'n) -- [1 1]
+(set dbl (fn [v] 1 (* v 2)))
+(key (select {n: (count (distinct x)) by: (dbl x) from: T})) -- ['x 'n]
+(set hif (fn [v] 1 (if (> v 2) (* v 10) v)))
+(at (select {n: (count x) by: (hif x) from: (table [x] (list [1 2 3 4]))}) 'x) -- [1 2 30 40]
+;; Provenance is relative to the innermost query: a nested query inside a
+;; helper does not take the caller's row value as its own row data.
+(set hn (fn [v] 1 (at (select {r: (concat w v) from: U}) 'r)))
+(set OUT 0)
+(set gset (fn [v] 1 (set OUT (hn v)) 0))
+(update {r: (gset s) from: T})
+OUT -- ['p 'q 'r 'a 'b 'c]
+;; A let, a sequence or a loop in an opaque key's body keeps the key whole;
+;; only a condition over one value makes it row by row, and a helper bound
+;; with let is looked through as a global one is.
+(set hlet2 (fn [v] (let m (min v)) (- v m)))
+(at (select {n: (count v) by: (hlet2 v) from: TB}) 'v) -- [0 1 2 9 19 29]
+(at (select {n: (count v) by: (hlet2 v) from: TB where: (> v 2)}) 'v) -- [0 7 17 27]
+((fn [t] (let h (fn [v] 1 (if (> v 2) (* v 10) v))) (at (select {n: (count x) by: (h x) from: t}) 'x)) (table [x] (list [1 2 3 4]))) -- [1 2 30 40]
+;; A null cell is empty text row by row, as the vector kernel reads it; a
+;; null literal still nulls the row.
+(at (select {r: (concat s 'zz) e: (reverse x) from: T4}) 'r) -- ['azz 'zz 'czz 'dzz]
+;; A lambda inside a named closure's body is that body's text: its quoted
+;; symbols are symbols.  set keeps its value's provenance; so does a try
+;; handler's value used inside the helper.
+(set mk (fn [a] (fn [b] ((fn [z] (concat z (concat 'x a))) b))))
+(set cl (mk 'k))
+(at (select {r: (cl s) e: (reverse x) from: T}) 'r) -- (list ['a 'x 'k] ['b 'x 'k] ['c 'x 'k])
+(at (select {r: ((fn [v] (concat (set G v) "!")) s) e: (reverse x) from: T}) 'r) -- ['a! 'b! 'c!]
+(set hy (fn [v] 1 (concat (try (+ v 's) (fn [e] v)) "!")))
+(at (select {r: (hy s) e: (reverse x) from: T}) 'r) -- ['a! 'b! 'c!]
+(at (select {r: ((fn [v] 1 (concat (ht v) "!")) s) e: (reverse x) from: T}) 'r) -- ['a! 'b! 'c!]
+(key (select {by: (dbl x) from: T})) -- ['x 's]
+;; A closure created inside a query while several row bindings are live:
+;; its capture holds every binding plus their provenance.
+(set TC (table [x s] (list [1 2 3 4] ['a 'b 'c 'd])))
+(at (select {v: ((fn [a] (let b 1) (let c 2) (let d 3) ((fn [z] (concat z (if (> b 0) "!" "?"))) a)) s) e: (reverse x) from: TC}) 'v) -- ['a! 'b! 'c! 'd!]
+(at (select {v: ((fn [a] (let b 1) (let c 2) (let d 3) (let e 4) (let f 5) (let g 6) (let h 7) (let i 8) (let j 9) (let k 10) (let l 11) ((fn [z] (concat z (if (> l 0) "!" "?"))) a)) s) e: (reverse x) from: TC}) 'v) -- ['a! 'b! 'c! 'd!]
+;; A filtered COUNT over a nullable column counts the kept rows, with or
+;; without a computed input.
+(set TN (table [k x s] (list [0 0 1 1 2] [1 2 3 4 5] (as 'SYM ["a" "" "c" "" "e"]))))
+(at (select {n: (count s) by: k from: TN where: (> x 1) asc: k}) 'n) -- [1 2 1]
+(at (select {n: (count (upper s)) by: k from: TN where: (> x 1) asc: k}) 'n) -- [1 2 1]
+;; A closure created directly in a per-row expression with exactly four
+;; live cells (no call frame in between): the capture must have room for
+;; its provenance entry.
+(set T4C (table [a b c d] (list ['p 'q] ['r 's] ['t 'u] ['v 'w])))
+(at (select {v: (at (map (fn [z] (concat z "!")) (list a b c d)) 0) e: (reverse a) from: T4C}) 'v) -- ['p! 'q!]
+;; A closure stores no provenance. Called while the frames it captured from
+;; are live, its captures take the provenance their bindings have now,
+;; relative to the innermost query; an escaped closure's captures are data.
+(set hc (fn [v] 1 (let f (fn [z] (concat z v))) (at (select {q: (f w) from: U}) 'q)))
+(set OUT2 0)
+(update {r: ((fn [v] 1 (set OUT2 (hc v)) 0) s) from: T})
+OUT2 -- (list ['p 'a 'b 'c] ['q 'a 'b 'c] ['r 'a 'b 'c])
+(set hy2 (fn [v] 1 (at (select {r: (concat w (try (+ v 's) (fn [e] v))) from: U}) 'r)))
+(set OUT3 0)
+(update {r: ((fn [v] 1 (set OUT3 (hy2 v)) 0) s) from: T})
+OUT3 -- ['p 'q 'r 'a 'b 'c]
+(set hc2 (fn [v] 1 (let f (fn [z] z)) (at (select {q: (concat w (f v)) from: U}) 'q)))
+(set OUT4 0)
+(update {r: ((fn [v] 1 (set OUT4 (hc2 v)) 0) s) from: T})
+OUT4 -- ['p 'q 'r 'a 'b 'c]
+;; The opaque-key gate: and/or work elementwise, a global helper's body
+;; resolves names globally, and an if over an aggregate condition is one
+;; value for the whole column.
+(set hand (fn [v] 1 (and (> v (avg v)) (< v 25))))
+(at (select {n: (count v) by: (hand v) from: TB}) 'v) -- [false true]
+(set hmin (fn [v] (- v (min v))))
+(set hg (fn [v] 1 (hmin v)))
+((fn [t] (let hmin (fn [v] (if (> v 2) (* v 10) v))) (at (select {n: (count v) by: (hg v) from: t}) 'v)) TB) -- [0 1 2 9 19 29]
+(set hifl (fn [v] (let m (if (> (count v) 0) (min v) 0)) (- v m)))
+(at (select {n: (count v) by: (hifl v) from: TB}) 'v) -- [0 1 2 9 19 29]
+(at (select {n: (count v) by: ((fn [v] (let m (min v)) (- v m)) v) from: TB}) 'v) -- [0 1 2 9 19 29]
+;; A null STR literal nulls the row on both paths; a null cell in a compiled
+;; helper is empty text; return ends the lambda with its value (so the
+;; concat around it never runs) and passes the value's provenance through.
+(set TS2 (table [x t] (list [1 2] (list "a" "b"))))
+(at (select {r: (concat t "") e: (reverse x) from: TS2}) 'r) -- (as 'STR ["" ""])
+(set hz (fn [v] 1 (concat v 'zz)))
+(at (select {r: (hz s) e: (reverse x) from: T4}) 'r) -- ['azz 'zz 'czz 'dzz]
+(at (select {r: ((fn [v] 1 (concat (return v) "!")) s) e: (reverse x) from: T}) 'r) -- ['a 'b 'c]
+(at (select {r: ((fn [v] 1 (return (concat v "!")) 'never) s) e: (reverse x) from: T}) 'r) -- ['a! 'b! 'c!]
+;; A closure's capture flags live in the query frame it was made under and
+;; apply only while that frame is the innermost query; identity of the
+;; captured object never matters, nor which compiled frame calls it.
+(set mk2 (fn [c] (fn [z] (concat z c))))
+(set E2 (mk2 (at T 's)))
+(set hk (fn [v] (take (count (first (map E2 ['p]))) (count v))))
+(at (update {r: (hk s) from: T}) 'r) -- [4 4 4]
+(set hd3 (fn [v] (let d (at T 's)) (try (+ d 's) (fn [e] (count (concat 'p d))))))
+(at (update {r: (hd3 s) from: T}) 'r) -- [4 4 4]
+(set G (fn [f u] 1 (take (count (first (map f ['p]))) (count u))))
+(set H (fn [v] 1 (let f (fn [z] (concat z v))) (at (update {q: (G f s) from: T}) 'q)))
+(at (update {r: (H s) from: T}) 'r) -- [4 4 4]
+(set hr (fn [v f d] 1 (if (== d 0) (hr ['x 'y] (fn [z] (concat z v)) 1) (take (count (first (map f ['p]))) 3))))
+(set hr2 (fn [v d] 1 (let f (fn [z] (concat z v))) (if (== d 0) (hr2 ['x 'y] 1) 0) (take (count (first (map f ['p]))) 3)))
+(at (update {r: (hr s 0 0) from: T}) 'r) -- [3 3 3]
+(at (update {r: (hr2 s 0) from: T}) 'r) -- [3 3 3]
+;; A closure made in a compiled helper and called through another function.
+(set h1 (fn [v] 1 (let f (fn [z] (concat z v))) (count (first (map (fn [g] (g 'p)) (list f))))))
+(at (update {r: (h1 s) from: T}) 'r) -- [3 3 3]
+;; The opaque key is evaluated whole; only a conditional that actually
+;; tested a vector derived from the rows makes it run row by row.
+(set N0 0)
+(set clampz (fn [m] (if (> m 0) m 0)))
+(at (select {n: (count v) by: ((fn [v] 1 (if (> (count v) N0) (- v (min v)) v)) v) from: TB}) 'v) -- [0 1 2 9 19 29]
+(at (select {n: (count v) by: ((fn [v] (let m (min v)) (if (> m 0) (- v m) v)) v) from: TB}) 'v) -- [0 1 2 9 19 29]
+(at (select {n: (count v) by: ((fn [v] 1 (- v (clampz (min v)))) v) from: TB}) 'v) -- [0 1 2 9 19 29]
+(at (select {n: (count v) by: ((fn [v] 1 (if (in 10 v) (- v (min v)) v)) v) from: TB}) 'v) -- [0 1 2 9 19 29]
+(at (select {n: (count v) by: ((fn [v] 1 (if (== (type v) 'I64) (- v (min v)) v)) v) from: TB}) 'v) -- [0 1 2 9 19 29]
+;; Two STR literals join as strings on both paths; a try fallback value
+;; keeps its provenance like a handler's result.
+(set TS3 (table [x t] (list [1 2 3] (list "a" "" "c"))))
+(at (select {r: (concat "" "x") e: (reverse x) from: TS3}) 'r) -- (list "x" "x" "x")
+(at (select {r: ((fn [v] (concat (try (+ v 's) v) "!")) s) e: (reverse x) from: T}) 'r) -- ['a! 'b! 'c!]
+;; A closure's capture flags live on the closure with the serial of the
+;; query frame it was made under; no record is keyed by address, so a dead
+;; closure's address cannot lend its flags, and lookups are constant time.
+(set LX ['x 'y])
+(set mkf (fn [v] 1 (let f (fn [z] (concat z v))) (count (first (map f ['p])))))
+(set hsix (fn [v] 1 (set OUT6 (map (fn [i] (if (== 0 (% i 2)) (mkf v) (mkf LX))) (til 6))) 0))
+(update {r: (hsix s) from: T})
+OUT6 -- [3 3 3 3 3 3]
+;; A conditional that tests any vector during the whole-column run of an
+;; opaque key sends it row by row, whatever produced the vector; so does a
+;; whole-column run that fails.
+(at (select {n: (count v) by: ((fn [v] 1 (if (> (fill 0 v) 2) (* v 10) v)) v) from: TB}) 'v) -- [1 2 30 100 200 300]
+(set gt2 ((fn [t] (fn [w] (> w t))) 2))
+(at (select {n: (count v) by: ((fn [v] 1 (if (gt2 v) (* v 10) v)) v) from: TB}) 'v) -- [1 2 30 100 200 300]
+(at (select {n: (count v) by: ((fn [v] 1 (if (> v 2) (count (til v)) v)) v) from: TB}) 'v) -- [1 2 3 10 20 30]
+(at (select {n: (count v) by: ((fn [v] 1 (eval (list 'if (list '> v 2) (list '* v 10) v))) v) from: TB}) 'v) -- [1 2 30 100 200 300]
+;; Closures compile, with their captures loaded as fixed values: a
+;; recursive closure called from a compiled helper keeps bytecode's depth,
+;; and a closure passed through another function keeps its environment,
+;; inside and outside a query.
+(set rr (((fn [a] (fn [b] (fn [n] (if (== n 0) 0 (+ 1 (self (- n 1))))))) 1) 2))
+(set callr (fn [n] 1 (rr n)))
+(callr 50) -- 50
+((fn [g] (g 'p)) (fn [z] (concat z 'q))) -- ['p 'q]
+(set mkadd (fn [k] (fn [v] (+ v k))))
+((mkadd 1) 2) -- 3
+(set outer2 (fn [a] (fn [b] ((fn [z] (concat z (concat 'x a))) b))))
+((outer2 'k) 'q) -- ['q 'x 'k]
+;; A compiled try with a fallback value keeps that value's provenance.
+(set hf (fn [v] 1 (concat (try (+ v 's) v) "!")))
+(at (select {r: (hf s) e: (reverse x) from: T}) 'r) -- ['a! 'b! 'c!]
+
+;; ── a whole-column key run that fails is swallowed whole ──────────────────
+;; Its `raise` payload and trace go with it: the next `try` anywhere gets its
+;; own error, not the key's.
+(set TB9 (table [v g] (list [1 2 3 10 20 30] ['a 'a 'b 'b 'c 'c])))
+(set kneg (fn [v] 1 (if (< v 0) (raise 'negative) (% v 7))))
+(at (select {n: (count v) by: (kneg v) from: TB9}) 'v) -- [1 2 3 6]
+(try (+ 1 'a) (fn [e] e)) -- 0
+
+;; ── a key body with an effect runs once per row ───────────────────────────
+;; It is never evaluated whole first, so the effect is not repeated.
+(set CNT9 0)
+(set kc9 (fn [v] (set CNT9 (+ CNT9 1)) (if (< v 5) 0 1)))
+(at (select {n: (count v) by: (kc9 v) from: TB9}) 'n) -- [3 3]
+CNT9 -- 6
+(set CNT9 0)
+(set kp9 (fn [v] (set CNT9 (+ CNT9 1)) (% v 7)))
+(at (select {n: (count v) by: (kp9 v) from: TB9}) 'v) -- [1 2 3 6]
+CNT9 -- 6
+;; a pure body with a scalar condition keeps the column whole
+(set hmin9 (fn [v] (if (> (min v) 0) (- v 1) v)))
+(at (select {n: (count v) by: (hmin9 v) from: TB9}) 'v) -- [0 1 2 9 19 29]
+
+;; ── a vector condition in a compiled key sends it row by row ──────────────
+;; `kfill9` is a global helper with no captures, so it runs as bytecode; the
+;; VM's conditional counts the vector test, as the tree walker's does.
+(set kfill9 (fn [v] (let w (fill 0 v)) (if (< w 3) v (* v 10))))
+(at (select {n: (count v) by: (kfill9 v) from: TB9}) 'v) -- [1 2 30 100 200 300]
+
+;; ── a lambda written in query text keeps the query's literal rule ─────────
+;; even with nothing to capture: `'p` is the column, so the join is row-wise.
+(set T9 (table [v p] (list ["1" "2" "3"] ['x 'y 'z])))
+(at (select {r: ((fn [a] (concat 'p a)) v) from: T9}) 'r) -- ["x1" "y2" "z3"]
+;; a lambda with nothing to capture at all is still query text
+(at (select {r: ((fn [] (concat 'p "!"))) from: T9}) 'r) -- [x! y! z!]
+;; return ends a lambda written in query text, which stays interpreted
+(at (select {r: ((fn [a] (return (concat a "!")) a) v) from: T9}) 'r) -- ["1!" "2!" "3!"]
+
+;; ── a closure is never inlined into a query ───────────────────────────────
+;; Its body reads its captures; inlined, a captured name would read a source
+;; column or a global of that name.  Whether the closure has run before (it
+;; compiles on its second call) must not matter.
+(set mk9 (fn [s] (fn [v] (concat v s))))
+(set f9 (mk9 "!"))
+(set TC9 (table [name s] (list ["a" "b"] ["x" "y"])))
+(at (select {r: (f9 name) e: (reverse s) from: TC9}) 'r) -- ["a!" "b!"]
+(at (select {r: (f9 name) from: TC9}) 'r) -- ["a!" "b!"]
+(count (select {from: TC9 where: (== (f9 name) "a!")})) -- 1
+(f9 "q") -- "q!"
+(f9 "q") -- "q!"
+(at (select {r: (f9 name) e: (reverse s) from: TC9}) 'r) -- ["a!" "b!"]
+(at (select {r: (f9 name) from: TC9}) 'r) -- ["a!" "b!"]
+(set G9 "g")
+(set mkg9 (fn [G9] (fn [v] (concat v G9))))
+(set fg9 (mkg9 "!"))
+(at (select {r: (fg9 name) e: (reverse s) from: TC9}) 'r) -- ["a!" "b!"]
+(at (select {r: (fg9 name) from: TC9}) 'r) -- ["a!" "b!"]
+;; a closure can be the key too, pure or not; its capture is never a column
+(set mkk9 (fn [c] (fn [v] (% v c))))
+(set kk9 (mkk9 7))
+(at (select {n: (count v) by: (kk9 v) from: TB9}) 'v) -- [1 2 3 6]
+(set CNT9 0)
+(set mki9 (fn [c] (fn [v] (set CNT9 (+ CNT9 1)) (% v c))))
+(set ki9 (mki9 7))
+(at (select {n: (count v) by: (ki9 v) from: TB9}) 'v) -- [1 2 3 6]
+CNT9 -- 6
+
+;; ── purity follows the callee wherever it is bound ────────────────────────
+;; A pure helper reached through a parameter, a let, or a capture keeps the
+;; whole-column semantics; only an effect sends the body row by row.
+(set T10 (table [v] (list [1 2 3 4 5 6])))
+(set kg10 (fn [v] 1 (> (- v (avg v)) 0)))
+(at (select {n: (count v) by: (kg10 v) from: T10}) 'n) -- [3 3]
+(set grp10 (fn [t k] (at (select {n: (count v) by: (k v) from: t}) 'n)))
+(grp10 T10 kg10) -- [3 3]
+(set kl10 (fn [v] 1 (let f (fn [x] (- x (avg x)))) (> (f v) 0)))
+(at (select {n: (count v) by: (kl10 v) from: T10}) 'n) -- [3 3]
+(set mkc10 (fn [hcap10] (fn [v] (> (hcap10 v) 0))))
+(set kc10 (mkc10 (fn [x] (- x (avg x)))))
+(at (select {n: (count v) by: (kc10 v) from: T10}) 'n) -- [3 3]
+(set km10 (fn [v] 1 (> v (mavg 3 v))))
+(at (select {n: (count v) by: (km10 v) from: T10}) 'n) -- [1 5]
+;; a pure body keeps the whole column: the min is the column's minimum
+(set kw10 (fn [v] 1 (- v (min v))))
+(at (select {n: (count v) by: (kw10 v) from: T10}) 'v) -- [0 1 2 3 4 5]
+;; a computed callee is an effect: the body runs once per row
+(set CNT10 0)
+(set eff10 (fn [x] (set CNT10 (+ CNT10 1)) x))
+(set H10 (dict ['a] (list eff10)))
+(set kdisp10 (fn [v] ((at H10 'a) v) (if (< v 4) 0 1)))
+(at (select {n: (count v) by: (kdisp10 v) from: T10}) 'n) -- [3 3]
+CNT10 -- 6
+;; a swallowed whole-column failure leaves no trace or message behind: a
+;; later uncaught error in a fresh interpreter is reported at its own place
+(write "/tmp/rfl_trace_clear.rfl" "(set TB (table [v] (list [1 2 3 10 20 30]))) (set kneg (fn [v] 1 (if (< v 0) (raise 'negative) (% v 7)))) (select {n: (count v) by: (kneg v) from: TB}) (+ 1 'a)")
+(.sys.exec "./rayforce /tmp/rfl_trace_clear.rfl 2>&1 | grep -c negative | grep -qx 0") -- 0
+;; an effect reached through a parameter counts: the parameter means the
+;; argument it is bound to, not a global or let of the same name
+(set CNT12 0)
+(set eff12 (fn [x] (set CNT12 (+ CNT12 1)) x))
+(set H12 (dict ['a] (list eff12)))
+(set h12 (fn [x] x))
+(set ky12 (fn [v] 1 (let g (fn [h12] (h12 v))) (g (at H12 'a)) (if (< v 4) 0 1)))
+(at (select {n: (count v) by: (ky12 v) from: T10}) 'n) -- [3 3]
+CNT12 -- 6
+;; and a pure helper passed through a parameter keeps the whole column
+(set kp12 (fn [v] 1 (let g (fn [f] (f v))) (> (g kg10) 0)))
+(at (select {n: (count v) by: (kp12 v) from: T10}) 'n) -- [3 3]
+;; a lambda passed as a value keeps its parameters unknown: a call through
+;; one is an effect whatever a global of that name holds
+(set ap13 (fn [z g13] (g13 z)))
+(set CNT13 0)
+(set eff13 (fn [x] (set CNT13 (+ CNT13 1)) x))
+(set H13 (dict ['a] (list eff13)))
+(set kf13 (fn [v] (fold ap13 (> v 3) (list (at H13 'a)))))
+(select {n: (count v) by: (kf13 v) from: T10})
+CNT13 -- 6
+(set g13 (fn [x] x))
+(set CNT13 0)
+(select {n: (count v) by: (kf13 v) from: T10})
+CNT13 -- 6
+;; a literal nested in a body keeps the enclosing body's parameters
+(set ap213 (fn [g13 z] ((fn [w] (g13 w)) z)))
+(set CNT13 0)
+(select {n: (count v) by: (ap213 (at H13 'a) (> v 3)) from: T10})
+CNT13 -- 6
+;; an argument's name means what it meant where the call was written
+(set hh13 (fn [x] (> (- x (avg x)) 0)))
+(set ap313 (fn [f z] (let hh13 (fn [q] (println "never") q)) (f z)))
+(at (select {n: (count v) by: (ap313 hh13 v) from: T10}) 'n) -- [3 3]

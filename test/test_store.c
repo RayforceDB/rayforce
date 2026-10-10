@@ -3769,13 +3769,13 @@ static test_result_t test_serde_lambda_roundtrip(void) {
     ray_t* body = ray_i64(42);
     TEST_ASSERT_NOT_NULL(body);
 
-    /* Allocate lambda with 7 pointer slots (same layout as eval.c) */
-    ray_t* lambda = ray_alloc(7 * sizeof(ray_t*));
+    /* Allocate the lambda with its full slot layout (same as eval.c) */
+    ray_t* lambda = ray_alloc(LAMBDA_SLOTS * sizeof(ray_t*));
     TEST_ASSERT_NOT_NULL(lambda); TEST_ASSERT_FALSE(RAY_IS_ERR(lambda));
     lambda->type  = RAY_LAMBDA;
     lambda->attrs = RAY_FN_COMPILED;
     lambda->len   = 0;
-    memset(ray_data(lambda), 0, 7 * sizeof(ray_t*));
+    memset(ray_data(lambda), 0, LAMBDA_SLOTS * sizeof(ray_t*));
     ((ray_t**)ray_data(lambda))[0] = params;
     ((ray_t**)ray_data(lambda))[1] = body;
 
@@ -3814,6 +3814,88 @@ static test_result_t test_serde_lambda_roundtrip(void) {
     TEST_ASSERT_NULL(bslots[3]);
 
     ray_release(b); ray_release(w); ray_release(lambda);
+    PASS();
+}
+
+/* ---- serde coverage: a lambda's closure must be SYM keys -> LIST values --- */
+
+/* The compiled capture binding (OP_BINDCAPS) reads a closure's values as a LIST
+ * of ray_t*.  A wire frame whose closure carries a typed value vector instead
+ * must be rejected at deserialization, not dereferenced later. */
+static ray_t* make_test_lambda(ray_t* closure) {
+    int64_t x_id = ray_sym_intern("x", 1);
+    ray_t* params = ray_vec_new(RAY_SYM, 1);
+    if (!params || RAY_IS_ERR(params)) return params;
+    params->len = 1;
+    ((int64_t*)ray_data(params))[0] = x_id;
+    ray_t* lambda = ray_alloc(LAMBDA_SLOTS * sizeof(ray_t*));
+    if (!lambda || RAY_IS_ERR(lambda)) { ray_release(params); return lambda; }
+    lambda->type  = RAY_LAMBDA;
+    lambda->attrs = 0;
+    lambda->len   = 0;
+    memset(ray_data(lambda), 0, LAMBDA_SLOTS * sizeof(ray_t*));
+    LAMBDA_PARAMS(lambda)  = params;
+    LAMBDA_BODY(lambda)    = ray_i64(42);
+    LAMBDA_CLOSURE(lambda) = closure;
+    return lambda;
+}
+
+static test_result_t test_serde_lambda_malformed_closure(void) {
+    int64_t k_id = ray_sym_intern("k", 1);
+
+    /* Control: a closure of SYM keys -> LIST values round-trips. */
+    ray_t* keys = ray_vec_new(RAY_SYM, 1);
+    TEST_ASSERT_NOT_NULL(keys); TEST_ASSERT_FALSE(RAY_IS_ERR(keys));
+    keys->len = 1;
+    ((int64_t*)ray_data(keys))[0] = k_id;
+    ray_t* vals = ray_list_new(1);
+    TEST_ASSERT_NOT_NULL(vals); TEST_ASSERT_FALSE(RAY_IS_ERR(vals));
+    ((ray_t**)ray_data(vals))[0] = ray_i64(7);
+    vals->len = 1;
+    ray_t* good = make_test_lambda(ray_dict_new(keys, vals));
+    TEST_ASSERT_NOT_NULL(good); TEST_ASSERT_FALSE(RAY_IS_ERR(good));
+    ray_t* w = ray_ser(good);
+    TEST_ASSERT_NOT_NULL(w); TEST_ASSERT_FALSE(RAY_IS_ERR(w));
+    ray_t* back = ray_de(w);
+    TEST_ASSERT_NOT_NULL(back); TEST_ASSERT_FALSE(RAY_IS_ERR(back));
+    TEST_ASSERT_EQ_I(back->type, RAY_LAMBDA);
+    TEST_ASSERT_NOT_NULL(LAMBDA_CLOSURE(back));
+    TEST_ASSERT_EQ_I(ray_dict_vals(LAMBDA_CLOSURE(back))->type, RAY_LIST);
+    ray_release(back); ray_release(w); ray_release(good);
+
+    /* A closure whose values are a typed vector is refused. */
+    keys = ray_vec_new(RAY_SYM, 1);
+    TEST_ASSERT_NOT_NULL(keys); TEST_ASSERT_FALSE(RAY_IS_ERR(keys));
+    keys->len = 1;
+    ((int64_t*)ray_data(keys))[0] = k_id;
+    ray_t* ivals = ray_vec_new(RAY_I64, 1);
+    TEST_ASSERT_NOT_NULL(ivals); TEST_ASSERT_FALSE(RAY_IS_ERR(ivals));
+    ((int64_t*)ray_data(ivals))[0] = 0x4141414141414141LL;
+    ivals->len = 1;
+    ray_t* bad = make_test_lambda(ray_dict_new(keys, ivals));
+    TEST_ASSERT_NOT_NULL(bad); TEST_ASSERT_FALSE(RAY_IS_ERR(bad));
+    w = ray_ser(bad);
+    TEST_ASSERT_NOT_NULL(w); TEST_ASSERT_FALSE(RAY_IS_ERR(w));
+    back = ray_de(w);
+    TEST_ASSERT_NOT_NULL(back);
+    TEST_ASSERT(RAY_IS_ERR(back), "typed closure values must be rejected by the deserializer");
+    ray_error_free(back);
+    ray_release(w); ray_release(bad);
+
+    /* A closure that is not a dict at all is refused too. */
+    ray_t* notdict = ray_vec_new(RAY_I64, 1);
+    TEST_ASSERT_NOT_NULL(notdict); TEST_ASSERT_FALSE(RAY_IS_ERR(notdict));
+    ((int64_t*)ray_data(notdict))[0] = 1;
+    notdict->len = 1;
+    bad = make_test_lambda(notdict);
+    TEST_ASSERT_NOT_NULL(bad); TEST_ASSERT_FALSE(RAY_IS_ERR(bad));
+    w = ray_ser(bad);
+    TEST_ASSERT_NOT_NULL(w); TEST_ASSERT_FALSE(RAY_IS_ERR(w));
+    back = ray_de(w);
+    TEST_ASSERT_NOT_NULL(back);
+    TEST_ASSERT(RAY_IS_ERR(back), "a non-dict closure must be rejected by the deserializer");
+    ray_error_free(back);
+    ray_release(w); ray_release(bad);
     PASS();
 }
 
@@ -6299,6 +6381,7 @@ const test_entry_t store_entries[] = {
     { "store/serde_large_null_vec",       test_serde_large_null_vec,       store_setup, store_teardown },
     { "store/serde_f32_atom",             test_serde_f32_atom_and_edge_cases, store_setup, store_teardown },
     { "store/serde_lambda_roundtrip",     test_serde_lambda_roundtrip,     store_setup, store_teardown },
+    { "store/serde_lambda_malformed_closure", test_serde_lambda_malformed_closure, store_setup, store_teardown },
     { "store/serde_save_serde_error",     test_serde_save_serde_error,     store_setup, store_teardown },
     { "store/serde_de_raw_default",       test_serde_de_raw_default_and_errors, store_setup, store_teardown },
     { "store/serde_table_dict_de_errors", test_serde_table_dict_de_errors, store_setup, store_teardown },

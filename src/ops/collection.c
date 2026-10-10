@@ -24,6 +24,7 @@
 /*  Collection / higher-order builtins — extracted from eval.c  */
 
 #include "lang/internal.h"
+#include "lang/env.h"
 #include "core/types.h"
 #include "core/pool.h"
 #include "ops/hash.h"
@@ -1618,6 +1619,88 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
     }
     if (_bx) ray_release(_bx);
     return make_bool(0);
+}
+
+/* Interpreter membership inside queries follows the plan's null-row rule.
+ * Keep ray_in_fn itself context-free: collection operations and the GUID
+ * plan fallback call it directly and apply their own semantics. */
+static ray_t* membership_not(ray_t* r) {
+    if (r->type != RAY_LIST) return ray_not_fn(r);
+    ray_t* out = ray_list_new(r->len);
+    if (!out || RAY_IS_ERR(out)) return out;
+    for (int64_t i = 0; i < r->len; i++) {
+        ray_t* item = membership_not(((ray_t**)ray_data(r))[i]);
+        if (!item || RAY_IS_ERR(item)) { ray_release(out); return item; }
+        out = ray_list_append(out, item);
+        ray_release(item);
+        if (!out || RAY_IS_ERR(out)) return out;
+    }
+    return out;
+}
+
+static ray_t* eval_membership(ray_t* val, ray_t* vec, bool negate) {
+    bool query = ray_env_query_scope_above(0);
+    if (query && (RAY_IS_PARTED(val->type) || val->type == RAY_MAPCOMMON)) {
+        ray_t* flat = val->type == RAY_MAPCOMMON ? materialize_mapcommon(val)
+                                                : parted_to_flat_vec(val);
+        if (!flat || RAY_IS_ERR(flat)) return flat ? flat : ray_error("oom", NULL);
+        ray_t* r = eval_membership(flat, vec, negate);
+        ray_release(flat);
+        return r;
+    }
+    if (query && (RAY_IS_PARTED(vec->type) || vec->type == RAY_MAPCOMMON)) {
+        ray_t* flat = vec->type == RAY_MAPCOMMON ? materialize_mapcommon(vec)
+                                                : parted_to_flat_vec(vec);
+        if (!flat || RAY_IS_ERR(flat)) return flat ? flat : ray_error("oom", NULL);
+        ray_t* r = eval_membership(val, flat, negate);
+        ray_release(flat);
+        return r;
+    }
+    /* The typed kernel already excludes null rows and parallelizes both
+     * membership and negation. LIST probes need the general comparator. */
+    if (query && ray_is_vec(val) && (ray_is_vec(vec) || ray_is_atom(vec))) {
+        ray_t* fast = ray_in_vec_exec(val, vec, negate);
+        if (fast) return fast;
+    }
+    if (query && !ray_is_atom(val) && ray_len(val) == 0)
+        return ray_vec_new(RAY_BOOL, 0);
+    ray_t* r = ray_in_fn(val, vec);
+    if (!r || RAY_IS_ERR(r)) return r;
+    if (query && ray_is_atom(val) && RAY_ATOM_IS_NULL(val)) {
+        ray_release(r);
+        return make_bool(0);
+    }
+    if (r->type == RAY_BOOL) {
+        uint8_t* out = (uint8_t*)ray_data(r);
+        for (int64_t i = 0; i < r->len; i++) {
+            if (negate) out[i] = (uint8_t)!out[i];
+            if (query && !ray_is_atom(val)) {
+                static const uint8_t zero_guid[16] = {0};
+                bool is_null = val->type == RAY_GUID
+                    ? memcmp((const uint8_t*)ray_data(val) + i * 16, zero_guid, 16) == 0
+                    : val->type == RAY_LIST
+                    ? RAY_ATOM_IS_NULL(((ray_t**)ray_data(val))[i])
+                    : ray_vec_is_null(val, i);
+                if (is_null) out[i] = 0;
+            }
+        }
+        return r;
+    }
+    if (negate) {
+        ray_t* out = membership_not(r);
+        ray_release(r);
+        return out;
+    }
+    return r;
+}
+
+ray_t* ray_in_eval_fn(ray_t* val, ray_t* vec) {
+    if (!ray_env_query_scope_above(0)) return ray_in_fn(val, vec);
+    return eval_membership(val, vec, false);
+}
+
+ray_t* ray_not_in_fn(ray_t* val, ray_t* vec) {
+    return eval_membership(val, vec, true);
 }
 
 /* Helper: convert a boxed list result back to a typed vector if the original was typed */

@@ -1,0 +1,17 @@
+;; PR #744 concat helper / per-group fallback. Release build, -c 8.
+;; Two million rows, one million two-row groups; first timing is warmup.
+(set n 2000000)
+(set i (til n))
+(set T (table [x k s t] (list i (% i 1000000) (take ['ab 'cd] n) (take ["a" "b"] n))))
+(set sfx (fn [v] (concat v "!")))
+(println "str-helper-projection")
+(map (fn [_] (println (timeit (select {v: (sfx t) from: T})))) (til 4))
+(println "computed-text-group-fallback")
+(map (fn [_] (println (timeit (select {n: (+ (count (concat (upper s) "!")) (count (distinct x))) by: k from: T})))) (til 4))
+;; Small inputs expose planning overhead. Timings cover 10,000 queries.
+(set i (til 10))
+(set T (table [x k s] (list i (% i 3) (take ['a 'b] 10))))
+(set sfq (fn [v] (concat v "?")))
+(println "tiny-two-helper-group-fallback-10000")
+(map (fn [_] (println (timeit (times 10000 (select {n: (+ (+ (count (sfx s)) (count (sfq s))) (count (distinct x))) by: k from: T}))))) (til 6))
+(exit 0)

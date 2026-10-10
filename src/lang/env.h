@@ -43,6 +43,8 @@ static inline const char* ray_fn_name(const ray_t* fn) {
 ray_err_t ray_env_init(void);
 void     ray_env_destroy(void);
 ray_t*    ray_env_get(int64_t sym_id);
+/* Borrowed flat global binding, ignoring local/query frames. */
+ray_t*    ray_env_get_global(int64_t sym_id);
 ray_t*    ray_env_get_local(int64_t sym_id);
 
 /* User-facing binder.  Refuses any name starting with `.` — that root is
@@ -140,6 +142,26 @@ int64_t ray_env_builtin_sym(const ray_t* fn);
 
 /* Local scope stack for lexical binding (let, do, lambda) */
 ray_err_t ray_env_push_scope(void);
+/* Moves whenever a global holding or receiving a function is rebound. */
+uint64_t  ray_env_fn_generation(void);
+void      ray_env_mark_lexical_scope(int32_t below);
+/* A named-call boundary: lookups below it see only `table`'s columns
+ * (NULL for none) and then the globals. */
+ray_err_t ray_env_push_call_scope(ray_t* table, bool named);
+/* Turn the top frame into a call boundary (its current bindings stay
+ * ordinary locals; source columns bind above them). */
+void      ray_env_mark_call_scope(ray_t* table, bool named);
+/* True inside a helper called from a query (a call frame above the
+ * query's frames); `named` reports whether it was called by name. */
+bool      ray_env_in_query_helper(bool* named);
+/* Bind a local with a row-provenance flag (0 no, 1 rows, 2 unknown). */
+ray_err_t ray_env_set_local_rows(int64_t sym_id, ray_t* val, uint8_t rows);
+/* Provenance flag of the binding `sym_id` resolves to, or -1 if unbound. */
+int       ray_env_binding_rows(int64_t sym_id);
+
+/* ray_env_resolve, also reporting through `rows` whether the value is a
+ * query source column (or its cell) read through a helper's call frame. */
+ray_t*    ray_env_resolve_rows(int64_t sym_id, uint8_t* rows);
 ray_err_t ray_env_push_query_scope(void);
 void ray_env_pop_scope(void);
 int32_t   ray_env_scope_depth(void);
@@ -149,9 +171,16 @@ bool      ray_env_query_scope_above(int32_t depth);
 ray_err_t ray_env_set_local(int64_t sym_id, ray_t* val);
 ray_t*    ray_env_get_lexical_local(int64_t sym_id);
 bool      ray_env_has_lexical_local(int64_t sym_id);
+int32_t   ray_env_lexical_scope_depth(int64_t sym_id);
 ray_err_t ray_env_set_query_local(int64_t sym_id, ray_t* val);
 ray_t*    ray_env_capture_locals(void);
-ray_err_t ray_env_push_capture(ray_t* capture);
+/* The same, also returning the captures' row flags (RAY_U8, owned, NULL
+ * when none is set) and the serial of the innermost query frame (0 if
+ * none): the flags are meaningful only under that frame. */
+ray_t*    ray_env_capture_locals_rows(ray_t** flags, uint32_t* serial);
+ray_err_t ray_env_push_capture(ray_t* capture, ray_t* flags, uint32_t serial);
+/* Serial of the innermost query frame, 0 outside queries. */
+uint32_t  ray_env_query_serial(void);
 
 /* Compiled-lambda local materialization (OP_SCOPE_BEGIN / OP_SCOPE_END).
  * bind: push a fresh frame and bind syms[i] -> slots[i] (NULL slots —
@@ -161,7 +190,7 @@ ray_err_t ray_env_push_capture(ray_t* capture);
  * sync: write the frame's (possibly let-updated) values back into the
  * slots, then pop the frame. */
 ray_err_t ray_env_scope_bind(const int64_t* syms, int32_t n, ray_t** slots,
-                             ray_t* self_obj);
+                             const uint8_t* rows, ray_t* self_obj);
 void      ray_env_scope_sync(const int64_t* syms, int32_t n, ray_t** slots);
 
 #endif /* RAY_ENV_H */
