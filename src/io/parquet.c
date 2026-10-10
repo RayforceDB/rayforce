@@ -1442,13 +1442,45 @@ static ray_t* pq_append_table(ray_t** vectors, ray_t* batch, int64_t ncols) {
     }
     return NULL;
 }
+/* An error object carries its code; its message is the raising thread's
+ * (ray_error_msg, thread local).  A pool task that fails on a worker notes
+ * that message here, the lowest failed task's kept, and the thread that
+ * reports the task's error raises it again with it (pq_task_msg_raise):
+ * otherwise only the code reached the caller. */
+typedef struct {
+    _Atomic(bool) busy;   /* a spin lock, taken only on a failure */
+    int64_t task;         /* the lowest failed task noted, INT64_MAX: none */
+    char msg[256];
+} pq_task_msg;
+static void pq_task_msg_reset(pq_task_msg* m) {
+    atomic_init(&m->busy,false); m->task = INT64_MAX; m->msg[0] = 0;
+}
+/* After `task` failed with an error raised on this thread. */
+static void pq_task_msg_note(pq_task_msg* m, int64_t task) {
+    if (!m) return;
+    const char* s = ray_error_msg();
+    while (atomic_exchange_explicit(&m->busy,true,memory_order_acquire)) RAY_CPU_RELAX();
+    if (task < m->task) { m->task = task; snprintf(m->msg,sizeof(m->msg),"%s",s ? s : ""); }
+    atomic_store_explicit(&m->busy,false,memory_order_release);
+}
+/* `task`'s error `e`, reported on this thread, the tasks joined: raised again
+ * with the message noted for it (none when it had none). */
+static ray_t* pq_task_msg_raise(pq_task_msg* m, int64_t task, ray_t* e) {
+    if (!m || !e || !RAY_IS_ERR(e) || m->task != task) return e;
+    char code[8];
+    snprintf(code,sizeof(code),"%s",ray_err_code(e));
+    ray_t* again = m->msg[0] ? ray_error(code,"%s",m->msg) : ray_error(code,NULL);
+    ray_error_free(e);
+    return again;
+}
 static ray_t* pq_materialize(ray_parquet_t* r);
-typedef struct { ray_parquet_t* parent; int64_t first; ray_t** tables; } pq_read_work;
+typedef struct { ray_parquet_t* parent; int64_t first; ray_t** tables; pq_task_msg* emsg; } pq_read_work;
 static void pq_read_group(void* ptr, uint32_t worker, int64_t start, int64_t end) {
     (void)worker; pq_read_work* w = ptr;
     for (int64_t i = start; i < end; i++) {
         ray_parquet_t* r = pq_group_reader(w->parent,w->first+i,w->parent->nselected);
         w->tables[i] = r ? pq_materialize(r) : ray_error("oom",NULL);
+        if (w->tables[i] && RAY_IS_ERR(w->tables[i])) pq_task_msg_note(w->emsg,i);
     }
 }
 static ray_t* pq_materialize(ray_parquet_t* r) {
@@ -1473,19 +1505,22 @@ static ray_t* pq_materialize(ray_parquet_t* r) {
         if (width > RAY_POOL_INIT_TASKS) width = RAY_POOL_INIT_TASKS;
         ray_t** tables = ray_calloc_raw((size_t)width*sizeof(*tables));
         if (!tables) { err = ray_error("oom",NULL); goto done; }
+        pq_task_msg emsg;   /* the failed groups' messages, a wave at a time */
         for (int64_t first = 0; first < r->ngroups && !err; first += width) {
             uint32_t n = r->ngroups-first < width ? (uint32_t)(r->ngroups-first) : width;
             memset(tables,0,(size_t)n*sizeof(*tables));
-            pq_read_work work = {r,first,tables};
+            pq_task_msg_reset(&emsg);
+            pq_read_work work = {r,first,tables,&emsg};
             ray_pool_dispatch_n(pool,pq_read_group,&work,n);
             for (uint32_t i = 0; i < n; i++) {
                 ray_t* batch = tables[i];
                 if (!err) {
                     if (!batch) err = ray_error("cancel","parquet scan interrupted");
-                    else if (RAY_IS_ERR(batch)) { err = batch; batch = NULL; }
+                    else if (RAY_IS_ERR(batch)) { err = pq_task_msg_raise(&emsg,i,batch); batch = NULL; }
                     else err = pq_append_table(vectors,batch,r->noutput);
                 }
-                if (batch) ray_release(batch);
+                /* an error past the one reported: freed (release leaves errors) */
+                if (batch) { if (RAY_IS_ERR(batch)) ray_error_free(batch); else ray_release(batch); }
             }
         }
         ray_free_raw(tables);
@@ -1609,37 +1644,6 @@ static ray_t* pq_import_types(ray_parquet_t* r, ray_t* types) {
         }
     }
     return NULL;
-}
-/* An error object carries its code; its message is the raising thread's
- * (ray_error_msg, thread local).  A pool task that fails on a worker notes
- * that message here, the lowest failed task's kept, and the thread that
- * reports the task's error raises it again with it (pq_task_msg_raise):
- * otherwise only the code reached the caller. */
-typedef struct {
-    _Atomic(bool) busy;   /* a spin lock, taken only on a failure */
-    int64_t task;         /* the lowest failed task noted, INT64_MAX: none */
-    char msg[256];
-} pq_task_msg;
-static void pq_task_msg_reset(pq_task_msg* m) {
-    atomic_init(&m->busy,false); m->task = INT64_MAX; m->msg[0] = 0;
-}
-/* After `task` failed with an error raised on this thread. */
-static void pq_task_msg_note(pq_task_msg* m, int64_t task) {
-    if (!m) return;
-    const char* s = ray_error_msg();
-    while (atomic_exchange_explicit(&m->busy,true,memory_order_acquire)) RAY_CPU_RELAX();
-    if (task < m->task) { m->task = task; snprintf(m->msg,sizeof(m->msg),"%s",s ? s : ""); }
-    atomic_store_explicit(&m->busy,false,memory_order_release);
-}
-/* `task`'s error `e`, reported on this thread, the tasks joined: raised again
- * with the message noted for it (none when it had none). */
-static ray_t* pq_task_msg_raise(pq_task_msg* m, int64_t task, ray_t* e) {
-    if (!m || !e || !RAY_IS_ERR(e) || m->task != task) return e;
-    char code[8];
-    snprintf(code,sizeof(code),"%s",ray_err_code(e));
-    ray_t* again = m->msg[0] ? ray_error(code,"%s",m->msg) : ray_error(code,NULL);
-    ray_error_free(e);
-    return again;
 }
 typedef struct {
     ray_parquet_t* parent;
@@ -3621,6 +3625,7 @@ typedef struct {
     const uint32_t* gids;
     const pq_predicate* predicates;
     ray_t** errors;
+    pq_task_msg* emsg;             /* the failed groups' messages */
 } pq_aggregate_work;
 static void pq_aggregate_group(void* ptr, uint32_t worker, int64_t start, int64_t end) {
     (void)worker; pq_aggregate_work* w = ptr;
@@ -3628,13 +3633,14 @@ static void pq_aggregate_group(void* ptr, uint32_t worker, int64_t start, int64_
         ray_parquet_t* r = pq_group_reader(w->parent,w->first+i,w->parent->nselected);
         pq_aggregate* aggs = ray_calloc_raw((size_t)w->n*sizeof(*aggs));
         w->states[i] = aggs;
-        if (!r || !aggs) { w->errors[i] = ray_error("oom",NULL); ray_parquet_close(r); continue; }
+        if (!r || !aggs) { w->errors[i] = ray_error("oom",NULL); pq_task_msg_note(w->emsg,i); ray_parquet_close(r); continue; }
         for (int64_t a = 0; a < w->n; a++) {
             aggs[a] = w->templates[a]; aggs[a].state = ray_alloc_raw(aggs[a].kernel->state_size);
             if (!aggs[a].state) { w->errors[i] = ray_error("oom",NULL); break; }
             aggs[a].kernel->init(aggs[a].state);
         }
         if (!w->errors[i]) w->errors[i] = pq_accumulate(r,aggs,w->n,w->gids,w->predicates,w->np);
+        if (w->errors[i]) pq_task_msg_note(w->emsg,i);
         ray_parquet_close(r);
     }
 }
@@ -3648,13 +3654,15 @@ static ray_t* pq_aggregate_groups(ray_parquet_t* r, pq_aggregate* aggs, int64_t 
     ray_t** errors = ray_calloc_raw((size_t)width*sizeof(*errors));
     ray_t* err = NULL;
     if (!states || !errors) { err = ray_error("oom",NULL); goto done; }
+    pq_task_msg emsg;   /* the failed groups' messages, a wave at a time */
     for (int64_t first = 0; first < r->ngroups && !err; first += width) {
         uint32_t count = r->ngroups-first < width ? (uint32_t)(r->ngroups-first) : width;
         memset(states,0,(size_t)count*sizeof(*states)); memset(errors,0,(size_t)count*sizeof(*errors));
-        pq_aggregate_work work = {r,first,n,np,aggs,states,gids,predicates,errors};
+        pq_task_msg_reset(&emsg);
+        pq_aggregate_work work = {r,first,n,np,aggs,states,gids,predicates,errors,&emsg};
         ray_pool_dispatch_n(pool,pq_aggregate_group,&work,count);
         for (uint32_t i = 0; i < count; i++) {
-            if (errors[i]) { if (!err) err = errors[i]; else ray_error_free(errors[i]); }
+            if (errors[i]) { if (!err) err = pq_task_msg_raise(&emsg,i,errors[i]); else ray_error_free(errors[i]); }
             if (!states[i]) { if (!err) err = ray_error("cancel","parquet scan interrupted"); continue; }
             for (int64_t a = 0; a < n; a++) {
                 if (!err) aggs[a].kernel->merge(aggs[a].state,states[i][a].state,NULL);

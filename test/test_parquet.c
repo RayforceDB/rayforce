@@ -2018,7 +2018,11 @@ static void pqx_snappy(pq_buf* o, const uint8_t* s, size_t n) {
 /* pqx_page's checksums (PQX_CRC, PQX_CRCFLIP): 0 none; 1 each page's
  * CRC-32 in its header (PageHeader 4); 2 that, and a dictionary page's
  * first string has one byte flipped after its checksum was taken (a page
- * gone bad on disk), the string it then reads kept in pqx_flipped. */
+ * gone bad on disk), the string it then reads kept in pqx_flipped; 3 that,
+ * and a data page's last byte flipped so.  pqx_xflip: the x column's pages,
+ * -2 (the default) without checksums, -1 with them, g >= 0 with them and
+ * row group g's flipped. */
+static int64_t pqx_xflip = -2;
 static int pqx_crc = 0;
 static char pqx_flipped[256];
 static uint32_t pqx_flipped_len = 0;
@@ -2047,6 +2051,7 @@ static void pqx_page(pq_buf* f, int kind, const pq_buf* body, int64_t count, int
     *raw += (int64_t)(f->n - h0) + (int64_t)body->n;
     size_t at = f->n;
     pb_bytes(f, pay->p, pay->n);
+    if (pqx_crc == 3 && kind == 0 && pay->n > 0 && !f->bad) f->p[at + pay->n - 1] ^= 0x20;
     if (pqx_crc == 2 && kind == 2 && !snappy && pay->n > 5 && !f->bad) {
         uint32_t len; memcpy(&len, pay->p, 4);
         if (len > 0 && len < sizeof(pqx_flipped) && 4 + (size_t)len <= pay->n) {
@@ -2088,6 +2093,7 @@ static bool pqx_synth(const char* path, int64_t rows, int64_t groups, int n, con
                 pq_buf v = {0};
                 for (int64_t r = lo; r < hi; r++) { int32_t x = (int32_t)r; pb_bytes(&v, &x, 4); }
                 dpo[i] = (int64_t)f.n;
+                pqx_crc = pqx_xflip == -2 ? 0 : pqx_xflip == g ? 3 : 1;
                 pqx_page(&f, 0, &v, hi - lo, 0, false, &rawt[i]);
                 if (v.bad) f.bad = true;
                 ray_sys_free(v.p);
@@ -3562,8 +3568,51 @@ static test_result_t test_pq_sk4_grouped_message(void) {
     TEST_ASSERT_EQ_I(bad, 0);
     PASS();
 }
+/* A page gone bad (a checksum that fails) in x's chunk of the last row
+ * group only, which a pool worker as likely as not reads: the reader
+ * (.parquet.read), a scan's projection and its streamed aggregate report
+ * the decoder's reason and the column on two workers and four, as on one
+ * (the worker's message carried to the thread that reports the error). */
+static void pq_lang_setup(void) { ray_runtime_create(0, NULL); }
+static void pq_lang_teardown(void) { ray_runtime_destroy(__RUNTIME); }
+static test_result_t test_pq_worker_messages(void) {
+    char src[160];
+    snprintf(src, sizeof(src), "/tmp/rayforce-pqwm-%d.parquet", (int)getpid());
+    const char* nm[1] = {"p"};
+    pq_synth_fn fns[1] = {pqx_lowcard};
+    unsigned fl[1] = {PQX_DICT};
+    pqx_xflip = 3;
+    bool made = pqx_synth(src, 12000, 4, 1, nm, fns, fl);
+    pqx_xflip = -2;
+    TEST_ASSERT_TRUE(made);
+    char scan[400], agg[400];
+    snprintf(scan, sizeof(scan), "(select {from: (.parquet.scan \"%s\") x: x})", src);
+    snprintf(agg, sizeof(agg), "(select {from: (.parquet.scan \"%s\") s: (sum x)})", src);
+    static const char* what[3] = {"read", "scan", "aggregate"};
+    const char* want = "page checksum mismatch (column x)";
+    int bad = 0;
+    static const int cores[] = {1, 2, 4};
+    for (size_t k = 0; k < sizeof(cores) / sizeof(cores[0]); k++) {
+        TEST_ASSERT_EQ_I(pq_pool(cores[k]), RAY_OK);
+        for (int path = 0; path < 3; path++) {
+            ray_error_clear();
+            ray_t* res = path == 0 ? ray_parquet_read(src, NULL) : ray_eval_str(path == 1 ? scan : agg);
+            const char* msg = ray_error_msg();
+            bool failed = !res || RAY_IS_ERR(res);
+            fprintf(stderr, "  [worker message %s %d] %s: %s\n", what[path], cores[k], failed ? "failed" : "read",
+                    msg ? msg : "(no message)");
+            if (!failed || !msg || !strstr(msg, want)) bad++;
+            if (res) { if (RAY_IS_ERR(res)) ray_error_free(res); else ray_release(res); }
+        }
+    }
+    ray_pool_destroy();
+    unlink(src);
+    TEST_ASSERT_EQ_I(bad, 0);
+    PASS();
+}
 const test_entry_t parquet_entries[] = {
     {"parquet/sk4_grouped_message",test_pq_sk4_grouped_message,pq_setup,pq_teardown},
+    {"parquet/worker_messages",test_pq_worker_messages,pq_lang_setup,pq_lang_teardown},
     {"parquet/sk4_unsure_small_text",test_pq_sk4_unsure_small_text,pq_setup,pq_teardown},
     {"parquet/sk4_data_offset",test_pq_sk4_data_offset,pq_setup,pq_teardown},
     {"parquet/sk4_null_group_workers",test_pq_sk4_null_group_workers,pq_setup,pq_teardown},
