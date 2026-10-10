@@ -130,6 +130,10 @@ typedef struct {
     /* ── cold: error paths only */
     ray_t           *trace;      /* error trace list (owned) */
     ray_t           *raise_val;  /* pending (raise x) value (owned) */
+    ray_t           *return_val; /* pending (return x) value (owned) */
+    int32_t          lambda_depth; /* lambda bodies running on this thread
+                                    * (tree-walked calls and VM runs); a
+                                    * `return` outside any is its value */
     ray_err_info_t   err;
     /* ── big: lexical scope stack, own cache lines */
     ray_scope_frame_t scope_stack[RAY_SCOPE_CAP];

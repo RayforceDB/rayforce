@@ -502,7 +502,7 @@ spills exactly as it did before.
 | `fn` | variadic, special | Create lambda function | `(fn [x] (* x x))` |
 | `try` | binary, special | Error handling (expr handler-or-fallback) | `(try (/ 1 0) (fn [e] 0))` |
 | `raise` | unary | Throw an error | `(raise "bad input")` |
-| `return` | variadic | Early return from compiled lambda (0 args → null) | `(return 42)` |
+| `return` | variadic | Early return from the enclosing lambda (0 args → null) | `(return 42)` |
 | `quote` | variadic, special | Return argument unevaluated; a bare name becomes a literal symbol (`(quote x)` ≡ `'x`) | `(quote (+ 1 2))` → `(+ 1 2)` |
 | `resolve` | variadic, special | Resolve a symbol in current scope | `(resolve 'x)` |
 

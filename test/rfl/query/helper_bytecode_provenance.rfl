@@ -235,12 +235,14 @@ OUT4 -- ['p 'q 'r 'a 'b 'c]
 (at (select {n: (count v) by: (hifl v) from: TB}) 'v) -- [0 1 2 9 19 29]
 (at (select {n: (count v) by: ((fn [v] (let m (min v)) (- v m)) v) from: TB}) 'v) -- [0 1 2 9 19 29]
 ;; A null STR literal nulls the row on both paths; a null cell in a compiled
-;; helper is empty text; return passes provenance through.
+;; helper is empty text; return ends the lambda with its value (so the
+;; concat around it never runs) and passes the value's provenance through.
 (set TS2 (table [x t] (list [1 2] (list "a" "b"))))
 (at (select {r: (concat t "") e: (reverse x) from: TS2}) 'r) -- (as 'STR ["" ""])
 (set hz (fn [v] 1 (concat v 'zz)))
 (at (select {r: (hz s) e: (reverse x) from: T4}) 'r) -- ['azz 'zz 'czz 'dzz]
-(at (select {r: ((fn [v] 1 (concat (return v) "!")) s) e: (reverse x) from: T}) 'r) -- ['a! 'b! 'c!]
+(at (select {r: ((fn [v] 1 (concat (return v) "!")) s) e: (reverse x) from: T}) 'r) -- ['a 'b 'c]
+(at (select {r: ((fn [v] 1 (return (concat v "!")) 'never) s) e: (reverse x) from: T}) 'r) -- ['a! 'b! 'c!]
 ;; A closure's capture flags live in the query frame it was made under and
 ;; apply only while that frame is the innermost query; identity of the
 ;; captured object never matters, nor which compiled frame calls it.
@@ -340,3 +342,5 @@ CNT9 -- 6
 (at (select {r: ((fn [a] (concat 'p a)) v) from: T9}) 'r) -- ["x1" "y2" "z3"]
 ;; a lambda with nothing to capture at all is still query text
 (at (select {r: ((fn [] (concat 'p "!"))) from: T9}) 'r) -- [x! y! z!]
+;; return ends a lambda written in query text, which stays interpreted
+(at (select {r: ((fn [a] (return (concat a "!")) a) v) from: T9}) 'r) -- ["1!" "2!" "3!"]

@@ -188,7 +188,7 @@ Inside the closure its captures are locals: a `let` of `x` rebinds it for that c
 
 ## Early Return: return
 
-`return` exits the innermost enclosing compiled lambda early with the given value:
+`return` exits the innermost enclosing lambda early with the given value, whether it runs as bytecode or on the tree-walking interpreter:
 
 ```lisp
 ‣ (set f (fn [x] (if (< x 0) (return -1) (+ x 1))))

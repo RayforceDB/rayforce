@@ -430,6 +430,7 @@ void ray_runtime_destroy(ray_runtime_t* rt) {
     for (int32_t i = 0; i < rt->n_vms; i++) {
         ray_vm_t* vm = rt->vms[i];
         if (vm->raise_val) ray_release(vm->raise_val);
+        if (vm->return_val) ray_release(vm->return_val);
         if (vm->trace) { ray_release(vm->trace); vm->trace = NULL; }
         ray_sys_free(vm);
     }

@@ -65,3 +65,20 @@
 (set bc (big))
 (bc) -- 299
 (bc) -- 299
+
+;; return ends the body on the first (interpreted) call as on the compiled one
+(set mkr (fn [a] (fn [x] (return (+ a x)) 0)))
+(set fr (mkr 1))
+(fr 1) -- 2
+(fr 1) -- 2
+;; a return inside try is not an error the handler sees
+(set mkt (fn [a] (fn [x] (try (return (+ a x)) (fn [e] 'caught)) 0)))
+(set ft (mkt 1))
+(ft 1) -- 2
+(ft 1) -- 2
+;; a return inside a special form the compiler hands to the tree walker
+(set fa (fn [x] (and (return 7) x) 0))
+(fa 1) -- 7
+(fa 1) -- 7
+;; outside any lambda, return is its value
+(return 5) -- 5

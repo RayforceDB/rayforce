@@ -303,6 +303,20 @@ static ray_t* try_sum_affine_expr(ray_t* expr, int* handled) {
  * (__VM->raise_val) — it must survive the unwind across any number of
  * bytecode invocations on this thread's stack. */
 
+/* The marker ray_return_fn raises: an error whose code is "return".  The
+ * value travels in __VM->return_val; ray_take_return turns both back into
+ * the value at a lambda's call boundary. */
+static inline bool is_return_marker(ray_t* e) {
+    return e && RAY_IS_ERR(e) && e->slen == 6 && memcmp(e->sdata, "return", 6) == 0;
+}
+static ray_t* ray_take_return(ray_t* marker) {
+    ray_error_free(marker);
+    ray_t* val = __VM->return_val;
+    __VM->return_val = NULL;
+    if (!val) { val = RAY_NULL_OBJ; ray_retain(val); }
+    return val;
+}
+
 /* (raise value) — raise an error with the given value */
 ray_t* ray_raise_fn(ray_t* val) {
     if (__VM->raise_val) ray_release(__VM->raise_val);
@@ -355,6 +369,7 @@ static ray_t* try_handle_rows(ray_t* handler, ray_t* err_val, int8_t fallback_ro
 ray_t* ray_try_fn(ray_t* expr, ray_t* handler_expr) {
     ray_t* result = ray_eval(expr);
     if (!RAY_IS_ERR(result)) return result;
+    if (is_return_marker(result)) return result;   /* a `return` is not an error */
 
     /* Get error value (set by raise, or default for runtime errors) */
     ray_t* err_val = __VM->raise_val;
@@ -2397,15 +2412,25 @@ static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
     int64_t body_count = ray_len(body);
     ray_t** body_exprs = (ray_t**)ray_data(body);
     ray_t* result = NULL;
+    __VM->lambda_depth++;
     for (int64_t i = 0; i < body_count; i++) {
         if (result) ray_release(result);
         result = ray_eval(body_exprs[i]);
         if (RAY_IS_ERR(result)) {
+            if (is_return_marker(result)) {
+                /* (return x) somewhere in this statement: the body ends here
+                 * with x, as it does when compiled. */
+                result = ray_take_return(result);
+                g_eval_rows = -1;
+                break;
+            }
+            __VM->lambda_depth--;
             ray_env_pop_scope();
             if (has_closure) ray_env_pop_scope();
             return result;
         }
     }
+    __VM->lambda_depth--;
     if (out_rows) *out_rows = g_eval_rows;   /* the body's last value's provenance */
 
     ray_env_pop_scope();
@@ -2580,6 +2605,7 @@ static ray_t* vm_exec_rows(ray_t* lambda, ray_t** call_args, int64_t argc,
      * written before it is read, and the locals are set below.  Zeroing
      * the whole block cost more than a small call's body. */
     vmp->sp = 0; vmp->fp = 0; vmp->rp = 0; vmp->tp = 0; vmp->fn = NULL;
+    __VM->lambda_depth++;
 
 #define vm (*vmp)
 
@@ -3116,6 +3142,7 @@ op_ret: {
         /* Top-level return */
         if (out_rows) *out_rows = result_rows;
         ray_release(vm.fn);
+        __VM->lambda_depth--;
 #undef vm
         ray_free(vm_block);
         return result;  /* caller owns the POP'd reference */
@@ -3276,6 +3303,22 @@ vm_error:
     vm_err_detail = NULL;
 
 vm_error_cleanup: {
+    /* A `return` evaluated by the tree walker inside this frame (a window
+     * around a special form) arrives as the return marker: it is this
+     * frame's return, not an error.  Traps armed in this frame and the
+     * window's scope frames go with it. */
+    if (vm_err_obj && is_return_marker(vm_err_obj)) {
+        ray_t *rv = ray_take_return(vm_err_obj);
+        vm_err_obj = NULL;
+        while (vm.tp > 0 && vm.ts[vm.tp - 1].rp >= vm.rp) {
+            vm.tp--;
+            ray_release(vm.ts[vm.tp].fn);
+        }
+        while (ray_env_scope_depth() > scope_base)
+            ray_env_pop_scope();
+        PUSHR(rv, 0);
+        goto op_ret;
+    }
     /* Check for trap frame */
     if (vm.tp > 0) {
         vm.tp--;
@@ -3348,6 +3391,7 @@ vm_error_cleanup: {
         if (vm.rs[i].fn) ray_release(vm.rs[i].fn);
     for (int32_t i = 0; i < vm.tp; i++)
         ray_release(vm.ts[i].fn);
+    __VM->lambda_depth--;
 #undef vm
     ray_free(vm_block);
     if (vm_err_obj)
