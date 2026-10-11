@@ -2355,13 +2355,72 @@ static test_result_t test_card_estimate(void) {
      * far below the half million) */
     c[0] = ray_eval_str("(* (< cr 32000) (+ 1 (div cr 32)))");
     TEST_ASSERT_EQ_I(agg_group_card_estimate(c, 1, N), 1001);
-    ray_release(c[0]);
-    c[0] = ray_eval_str("(as 'SYM (* (< cr 32000) (+ 1 (div cr 32))))");
+    /* the same key as a tuple beside a 2-value column: 2,002 tuples, which
+     * the tuple's Chao1 overstates as the key's was and the product of the
+     * two spans caps */
+    c[1] = c[0];
+    c[0] = ray_eval_str("(% cr 2)");
+    TEST_ASSERT_TRUE(agg_group_card_sample(c, 2, 2, N, est, &kp, &ka));
+    TEST_ASSERT_EQ_I(est[0], 2);
+    TEST_ASSERT_EQ_I(est[1], 1001);
+    TEST_ASSERT_EQ_I(kp, 2002);
+    TEST_ASSERT_EQ_I(ka, 2002);
+    ray_release(c[0]); ray_release(c[1]);
+    /* the same key as symbols new to the process, so their codes are
+     * contiguous: the span of the sampled codes caps it at the 1,001 as
+     * well, and a symbol interned afterwards (the domain is process-wide)
+     * leaves the estimate where it was */
+    c[0] = ray_eval_str("(as 'SYM (+ 9000000 (* (< cr 32000) (+ 1 (div cr 32)))))");
+    TEST_ASSERT_EQ_I(agg_group_card_estimate(c, 1, N), 1001);
     {
         int64_t dom = ray_sym_domain_count(ray_sym_vec_domain(c[0]));
-        int64_t sym = agg_group_card_estimate(c, 1, N);
-        TEST_ASSERT_FMT(sym >= 1001 && sym <= dom && sym < 500000,
-                        "SYM key: %lld of a %lld-symbol domain", (long long)sym, (long long)dom);
+        ray_t* later = ray_eval_str("'interned_after_the_key_column");
+        ray_release(later);
+        TEST_ASSERT_TRUE(ray_sym_domain_count(ray_sym_vec_domain(c[0])) > dom);
+    }
+    TEST_ASSERT_EQ_I(agg_group_card_estimate(c, 1, N), 1001);
+    ray_release(c[0]);
+
+    /* keys that repeat with the row number: a period equal to the stride,
+     * which a fixed offset would read as one value */
+    c[0] = ray_eval_str("(% cr 32)");
+    TEST_ASSERT_EQ_I(agg_group_card_estimate(c, 1, N), 32);
+    ray_release(c[0]);
+    /* composites of periods 1,000 and 1,009 or 1,013 over 10 M rows, one
+     * row sampled per window of 305: 1,009,000 or 1,013,000 groups, each
+     * on ten rows, and beside a 50-value X (which 1,000 absorbs) as many
+     * (key, value) tuples as groups.  An offset nearly linear in the window
+     * index keeps the sampled rows a progression and these keys at a nearly
+     * fixed phase: the first pair's tuples with X read as ten million (no
+     * tuple seen twice, the Chao1 at the cap), the second pair's groups as
+     * a tenth of them (too many seen twice).  The hashed offset's
+     * collisions are a random sample's, and the Chao1 lands within a fifth
+     * of the count. */
+    setup = ray_eval_str("(set c10 (til 10000000))");
+    TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+    ray_release(setup);
+    c[0] = ray_eval_str("(% c10 1000)");
+    c[1] = ray_eval_str("(% c10 1009)");
+    c[2] = ray_eval_str("(% c10 50)");
+    TEST_ASSERT_TRUE(agg_group_card_sample(c, 3, 2, 10000000, est, &kp, &ka));
+    TEST_ASSERT_EQ_I(est[0], 1000);
+    TEST_ASSERT_EQ_I(est[1], 1009);
+    TEST_ASSERT_EQ_I(est[2], 50);
+    TEST_ASSERT_FMT(kp >= 800000 && kp <= 1009000, "1,000 x 1,009 groups: %lld", (long long)kp);
+    TEST_ASSERT_FMT(ka >= 800000 && ka <= 1250000, "1,000 x 1,009 x 50 tuples: %lld", (long long)ka);
+    ray_release(c[1]);
+    c[1] = ray_eval_str("(% c10 1013)");
+    TEST_ASSERT_TRUE(agg_group_card_sample(c, 3, 2, 10000000, est, &kp, &ka));
+    TEST_ASSERT_EQ_I(est[1], 1013);
+    TEST_ASSERT_FMT(kp >= 800000 && kp <= 1013000, "1,000 x 1,013 groups: %lld", (long long)kp);
+    TEST_ASSERT_FMT(ka >= 800000 && ka <= 1250000, "1,000 x 1,013 x 50 tuples: %lld", (long long)ka);
+    ray_release(c[0]); ray_release(c[1]); ray_release(c[2]);
+    /* a key that is a progression in the row number — (i x 7919) mod N, a
+     * permutation of the rows — is all distinct, and reads so */
+    c[0] = ray_eval_str("(% (* cr 7919) 1048576)");
+    {
+        int64_t all = agg_group_card_estimate(c, 1, N);
+        TEST_ASSERT_FMT(all >= 900000 && all <= N, "a permutation of the rows: %lld", (long long)all);
     }
     ray_release(c[0]);
 

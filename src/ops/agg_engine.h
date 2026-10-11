@@ -226,10 +226,10 @@ bool agg_dense_plan(ray_t** key_cols, uint32_t n_keys,
  * values seen once and twice, so a key the sample cannot exhaust — a
  * million values, or one value on most rows and a million on the rest — is
  * estimated near its size, while a key of 45 values stays 45.  The
- * estimate is capped at the span of the sampled values for an integer or
- * temporal key, and at the domain's count for a SYM key (codes of a shared
- * domain interleave, so a span would overstate a 5-value key by orders of
- * magnitude).  col_est[k] (when given) receives column k's estimate;
+ * estimate is capped at the span of the sampled values — the codes of a
+ * SYM key, fixed once interned, where the process-wide domain's count
+ * would move the estimate with every symbol interned afterwards.
+ * col_est[k] (when given) receives column k's estimate;
  * prefix_est the estimate for the tuple of the first n_prefix columns (the
  * groups a composite key forms, which the product of its columns' estimates
  * overstates when one column follows from another); all_est the estimate

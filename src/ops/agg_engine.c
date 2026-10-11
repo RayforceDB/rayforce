@@ -504,10 +504,9 @@ static bool agg_dense_plan_compact(ray_t** key_cols, uint32_t n_keys, int64_t nr
  * over the input (every row below that; the strided reads miss the cache,
  * and 32,768 of them over three columns cost half a millisecond at 10 M
  * rows with the prefetch below), one row from each window of `stride` rows
- * at a hashed offset — a fixed position would read a key whose period
- * divides the stride, five values cycling under a stride of 305, as one
- * value — and each column's values go
- * through a small open-addressing set that counts how often each was seen.
+ * at an offset hashed from the window's index (agg_est_row), and each
+ * column's values go through a small open-addressing set that counts how
+ * often each was seen.
  * Blocks of adjacent rows would be cheaper to read but blind to clustered
  * keys: a run of four rows per value shows a block one value per four rows,
  * while a stride past the run length shows every sample distinct.  The
@@ -517,8 +516,10 @@ static bool agg_dense_plan_compact(ray_t** key_cols, uint32_t n_keys, int64_t nr
  * values has no singletons and stays 45; a skewed key, one value on nine
  * rows in ten and a million on the rest, shows thousands of singletons and
  * few pairs and lands near the million.  Each key's estimate is capped at
- * what it could hold: the span of its sampled values for an integer or
- * temporal key, the domain's count for a SYM key.
+ * what it could hold, the span of its sampled values — its codes for a SYM
+ * key, which are fixed once interned (the process-wide domain's count
+ * bounds them too, but grows with every symbol interned afterwards, and
+ * the estimate with it).
  *
  * The same pass hashes the tuple of the first n_prefix columns and the
  * tuple of all of them into two more sets, for the groups a composite key
@@ -535,6 +536,23 @@ static bool agg_dense_plan_compact(ray_t** key_cols, uint32_t n_keys, int64_t nr
  * alone would overstate a key of few groups; the stride is exact there.) */
 enum { AGG_EST_SAMPLE = 1 << 15, AGG_EST_PREFETCH = 16,
        AGG_EST_BLOCK = 256, AGG_EST_BLOCKS = AGG_EST_SAMPLE / AGG_EST_BLOCK };
+
+/* The row sampled from window i of `stride` rows: an offset into the window
+ * hashed from i by the splitmix64 finaliser.  A fixed offset reads a key
+ * whose period divides the stride — five values cycling under a stride of
+ * 305 — as one value.  An offset nearly linear in i, the high bits of i
+ * times the golden ratio, keeps the sampled rows an arithmetic progression
+ * and a key with a period near the stride at a nearly fixed phase: a
+ * composite of (% i 1000) and (% i 1009) at 10 M rows read as ten million
+ * tuples under it, one of 1000 and 1013 as a tenth of its groups.  The
+ * finaliser's offsets make the collisions those of a random sample. */
+static inline int64_t agg_est_row(int64_t i, int64_t stride) {
+    uint64_t h = (uint64_t)i * 0x9E3779B97F4A7C15ULL;
+    h = (h ^ (h >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    h = (h ^ (h >> 27)) * 0x94D049BB133111EBULL;
+    h ^= h >> 31;
+    return i * stride + (int64_t)(h % (uint64_t)stride);
+}
 
 /* A sampled key value as int64: the integer itself (a null is its sentinel,
  * one more value), a SYM's code. */
@@ -652,10 +670,7 @@ bool agg_group_card_sample(ray_t** cols, uint32_t n, uint32_t n_prefix, int64_t 
         switch (c->type) {
         case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8:
         case RAY_BOOL: case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP:
-            cap[k] = 0;   /* the span of the sampled values, below */
-            break;
         case RAY_SYM:
-            cap[k] = ray_sym_domain_count(ray_sym_vec_domain(c));
             break;
         default:
             return false;
@@ -683,13 +698,11 @@ bool agg_group_card_sample(ray_t** cols, uint32_t n, uint32_t n_prefix, int64_t 
     int64_t lo[16], hi[16], prev[16];
     for (uint32_t k = 0; k < n; k++) { lo[k] = INT64_MAX; hi[k] = INT64_MIN; prev[k] = INT64_MIN; }
     bool sorted = true;   /* the sampled prefix tuples never decrease */
-#define AGG_EST_ROW(i) \
-    ((i) * stride + (int64_t)((((uint64_t)(i) * 0x9E3779B97F4A7C15ULL) >> 33) % (uint64_t)stride))
     for (int64_t i = 0; i < sample; i++) {
-        const int64_t r = AGG_EST_ROW(i);
+        const int64_t r = agg_est_row(i, stride);
         if (i + AGG_EST_PREFETCH < sample) {
             /* the strided reads miss the cache; keep several in flight */
-            const size_t rp = (size_t)AGG_EST_ROW(i + AGG_EST_PREFETCH);
+            const size_t rp = (size_t)agg_est_row(i + AGG_EST_PREFETCH, stride);
             for (uint32_t k = 0; k < n; k++)
                 __builtin_prefetch((const char*)data[k] + rp * esz[k]);
         }
@@ -715,14 +728,11 @@ bool agg_group_card_sample(ray_t** cols, uint32_t n, uint32_t n_prefix, int64_t 
             agg_est_set_add(&sets[n + 1], mask, (int64_t)ha);
         }
     }
-#undef AGG_EST_ROW
     const bool sampled = sample < nrows;
     for (uint32_t k = 0; k < n; k++) {
-        if (cols[k]->type != RAY_SYM) {
-            /* the span of the sampled values bounds what the key can hold */
-            uint64_t span = (uint64_t)hi[k] - (uint64_t)lo[k];
-            cap[k] = span < (uint64_t)INT64_MAX - 1 ? (int64_t)span + 1 : 0;
-        }
+        /* the span of the sampled values (codes) bounds what the key can hold */
+        uint64_t span = (uint64_t)hi[k] - (uint64_t)lo[k];
+        cap[k] = span < (uint64_t)INT64_MAX - 1 ? (int64_t)span + 1 : 0;
         int64_t est = agg_est_chao1(&sets[k], sampled, cap[k]);
         if (col_est) col_est[k] = est;
     }
