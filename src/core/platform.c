@@ -48,6 +48,7 @@
 #endif
 #if defined(RAY_OS_LINUX)
 #include <dirent.h>       /* /sys/block — the read-ahead caps */
+#include <errno.h>        /* EINTR — read_small */
 #include <stdatomic.h>
 #endif
 #include "mem/sys.h"
@@ -219,6 +220,29 @@ bool ray_vm_resident(const void* ptr, size_t size) {
         if (mincore((void*)(a + at * pg), pg, &v) != 0 || !(v & 1)) return false;
     }
     return true;
+}
+
+size_t ray_vm_resident_end(const void* ptr, size_t size) {
+    size_t pg = vm_page_size();
+#if defined(RAY_OS_MACOS)
+    char vec[4096];
+#else
+    unsigned char vec[4096];
+#endif
+    uintptr_t a = (uintptr_t)ptr & ~(uintptr_t)(pg - 1);
+    size_t pages = ((uintptr_t)ptr + size - a + pg - 1) / pg;
+    for (size_t top = pages; top > 0; ) {
+        size_t k = top < sizeof(vec) ? top : sizeof(vec);
+        size_t at = top - k;
+        if (mincore((void*)(a + at * pg), k * pg, vec) != 0) return size;
+        for (size_t i = k; i-- > 0; )
+            if (vec[i] & 1) {
+                size_t end = (at + i + 1) * pg - ((uintptr_t)ptr - a);
+                return end < size ? end : size;
+            }
+        top = at;
+    }
+    return 0;
 }
 
 void ray_vm_release(void* ptr, size_t size) {
@@ -507,8 +531,10 @@ static int64_t cgroup_read_limit(const char* path) {
     return (int64_t)v;
 }
 
-/* Smallest limit found in `root`/`cgpath`/`file` and every ancestor. */
-static int64_t cgroup_walk_limit(const char* root, const char* cgpath, const char* file) {
+/* Smallest limit found in `root`/`cgpath`/`file` and every ancestor; the
+ * directory that sets it into at[512] when at is not NULL. */
+static int64_t cgroup_walk_limit(const char* root, const char* cgpath, const char* file,
+                                 char* at) {
     char dir[512];
     if (snprintf(dir, sizeof(dir), "%s%s", root, cgpath) >= (int)sizeof(dir)) return 0;
     size_t rootlen = strlen(root);
@@ -517,7 +543,10 @@ static int64_t cgroup_walk_limit(const char* root, const char* cgpath, const cha
         char path[640];
         snprintf(path, sizeof(path), "%s/%s", dir, file);
         int64_t v = cgroup_read_limit(path);
-        if (v > 0 && (limit == 0 || v < limit)) limit = v;
+        if (v > 0 && (limit == 0 || v < limit)) {
+            limit = v;
+            if (at) memcpy(at, dir, sizeof(dir));
+        }
         if (strlen(dir) <= rootlen) break;              /* mount root checked */
         char* slash = strrchr(dir, '/');
         if (!slash || (size_t)(slash - dir) < rootlen) break;
@@ -537,7 +566,9 @@ static bool cgroup_has_memory(const char* ctrls) {
     return false;
 }
 
-int64_t ray_os_cgroup_mem_limit(void) {
+/* The smallest limit, and into dir[n] (when not NULL) the directory of the
+ * cgroup that sets it — at most 511 bytes, as the walk's own. */
+static int64_t cgroup_mem_limit(char* dir, size_t n) {
     FILE* f = fopen("/proc/self/cgroup", "r");
     if (!f) return 0;
     int64_t limit = 0;
@@ -552,20 +583,110 @@ int64_t ray_os_cgroup_mem_limit(void) {
         char* cgpath = c2 + 1;
         cgpath[strcspn(cgpath, "\n")] = 0;
         if (strcmp(cgpath, "/") == 0) cgpath[0] = 0;
+        char at[512];
         int64_t v;
         if (*ctrls == 0)
-            v = cgroup_walk_limit("/sys/fs/cgroup", cgpath, "memory.max");
+            v = cgroup_walk_limit("/sys/fs/cgroup", cgpath, "memory.max", at);
         else if (cgroup_has_memory(ctrls))
-            v = cgroup_walk_limit("/sys/fs/cgroup/memory", cgpath, "memory.limit_in_bytes");
+            v = cgroup_walk_limit("/sys/fs/cgroup/memory", cgpath, "memory.limit_in_bytes", at);
         else
             continue;
-        if (v > 0 && (limit == 0 || v < limit)) limit = v;
+        if (v > 0 && (limit == 0 || v < limit)) {
+            limit = v;
+            if (dir && snprintf(dir, n, "%s", at) >= (int)n) dir[0] = 0;
+        }
     }
     fclose(f);
     return limit;
 }
+
+int64_t ray_os_cgroup_mem_limit(void) {
+    return cgroup_mem_limit(NULL, 0);
+}
+
+bool ray_os_cgroup_mem_dir(char* buf, size_t n) {
+    if (n) buf[0] = 0;
+    return n && cgroup_mem_limit(buf, n) > 0 && buf[0];
+}
+
+/* A small kernel file into buf[n], NUL-terminated; its length, or -1.  No
+ * stdio: the readers below run on allocation paths, where libc's FILE and
+ * its buffer are not to be had. */
+static ssize_t read_small(const char* path, char* buf, size_t n) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    size_t got = 0;
+    while (got + 1 < n) {
+        ssize_t r = read(fd, buf + got, n - 1 - got);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) break;
+        got += (size_t)r;
+    }
+    close(fd);
+    buf[got] = 0;
+    return (ssize_t)got;
+}
+
+/* The number after `key` that starts a line of buf ("key value", or
+ * "key: value kB" as in /proc/meminfo); -1 when there is none. */
+static int64_t stat_field(const char* buf, const char* key) {
+    size_t k = strlen(key);
+    for (const char* p = buf; p && *p; p = strchr(p, '\n'), p = p ? p + 1 : NULL) {
+        if (strncmp(p, key, k) != 0 || (p[k] != ' ' && p[k] != ':')) continue;
+        char* end = NULL;
+        long long v = strtoll(p + k + 1 + (p[k] == ':'), &end, 10);
+        return end && end != p + k + 1 + (p[k] == ':') ? (int64_t)v : -1;
+    }
+    return -1;
+}
+
+bool ray_os_mem_used(const char* cg, int64_t* used) {
+    char buf[8192], path[600];
+    int64_t cur, clean;
+    if (cg && *cg) {
+        /* v2: memory.current less the clean page cache of memory.stat's
+         * "file" (tmpfs included, hence less "shmem") and less reclaimable
+         * slab, as for the machine below (a kernel without the field counts
+         * it as in use); v1: the same from memory.usage_in_bytes and the
+         * hierarchical total_* counters, which give no slab — v1 counts it
+         * as in use. */
+        snprintf(path, sizeof(path), "%s/memory.current", cg);
+        bool v2 = read_small(path, buf, 64) > 0;
+        if (!v2) {
+            snprintf(path, sizeof(path), "%s/memory.usage_in_bytes", cg);
+            if (read_small(path, buf, 64) <= 0) return false;
+        }
+        cur = strtoll(buf, NULL, 10);
+        snprintf(path, sizeof(path), "%s/memory.stat", cg);
+        if (read_small(path, buf, sizeof(buf)) <= 0) return false;
+        int64_t cache = stat_field(buf, v2 ? "file" : "total_cache");
+        int64_t shmem = stat_field(buf, v2 ? "shmem" : "total_shmem");
+        int64_t d = stat_field(buf, v2 ? "file_dirty" : "total_dirty");
+        int64_t wb = stat_field(buf, v2 ? "file_writeback" : "total_writeback");
+        if (cur <= 0 || cache < 0 || shmem < 0 || d < 0 || wb < 0) return false;
+        clean = cache - shmem - d - wb;
+        int64_t slab = v2 ? stat_field(buf, "slab_reclaimable") : 0;
+        if (slab > 0) cur -= slab;
+    } else {
+        /* The machine: all but free memory, clean page cache and reclaimable
+         * slab — the cgroup's measure, in /proc/meminfo's terms (kB). */
+        if (read_small("/proc/meminfo", buf, sizeof(buf)) <= 0) return false;
+        int64_t total = stat_field(buf, "MemTotal"), free = stat_field(buf, "MemFree");
+        int64_t buffers = stat_field(buf, "Buffers"), cached = stat_field(buf, "Cached");
+        int64_t shmem = stat_field(buf, "Shmem"), slab = stat_field(buf, "SReclaimable");
+        int64_t d = stat_field(buf, "Dirty"), wb = stat_field(buf, "Writeback");
+        if (total <= 0 || free < 0 || buffers < 0 || cached < 0 || shmem < 0 || slab < 0
+            || d < 0 || wb < 0) return false;
+        cur = (total - free - slab) << 10;
+        clean = (buffers + cached - shmem - d - wb) << 10;
+    }
+    *used = cur - (clean > 0 ? clean : 0);
+    return true;
+}
 #else
 int64_t ray_os_cgroup_mem_limit(void) { return 0; }
+bool    ray_os_cgroup_mem_dir(char* buf, size_t n) { if (n) buf[0] = 0; return false; }
+bool    ray_os_mem_used(const char* cg, int64_t* used) { (void)cg; (void)used; return false; }
 #endif
 
 static uint64_t cache_llc_probe(void) {
@@ -770,6 +891,7 @@ void ray_sleep_ms(int ms) { Sleep((DWORD)ms); }
 /* No cheap residency query here: report "not resident" so a read-ahead is
  * still requested (PrefetchVirtualMemory skips resident pages itself). */
 bool ray_vm_resident(const void* ptr, size_t size) { (void)ptr; (void)size; return false; }
+size_t ray_vm_resident_end(const void* ptr, size_t size) { (void)ptr; return size; }
 
 void ray_vm_release(void* ptr, size_t size) {
     if (!ptr) return;
@@ -855,6 +977,8 @@ uint32_t ray_physical_core_count(void) {
 }
 
 int64_t ray_os_cgroup_mem_limit(void) { return 0; }
+bool    ray_os_cgroup_mem_dir(char* buf, size_t n) { if (n) buf[0] = 0; return false; }
+bool    ray_os_mem_used(const char* cg, int64_t* used) { (void)cg; (void)used; return false; }
 
 /* Sum of every level-3 cache instance reported by the processor topology
  * (each SYSTEM_LOGICAL_PROCESSOR_INFORMATION cache record is one instance).
@@ -990,6 +1114,7 @@ void ray_vm_advise_willneed(void* ptr, size_t size) { (void)ptr; (void)size; }
 void ray_file_writeback_start(int fd, int64_t off, int64_t len) { (void)fd; (void)off; (void)len; }
 void ray_sleep_ms(int ms)                          { (void)ms; }
 bool ray_vm_resident(const void* ptr, size_t size)  { (void)ptr; (void)size; return true; }
+size_t ray_vm_resident_end(const void* ptr, size_t size) { (void)ptr; return size; }
 void ray_vm_release(void* ptr, size_t size)         { (void)ptr; (void)size; }
 
 void ray_vm_release_block(void* blk, size_t bsize, bool hugepage) {
@@ -1022,6 +1147,8 @@ ray_err_t ray_thread_join(ray_thread_t t) {
 
 uint32_t ray_thread_count(void) { return 1; }
 int64_t ray_os_cgroup_mem_limit(void) { return 0; }
+bool    ray_os_cgroup_mem_dir(char* buf, size_t n) { if (n) buf[0] = 0; return false; }
+bool    ray_os_mem_used(const char* cg, int64_t* used) { (void)cg; (void)used; return false; }
 static uint64_t cache_llc_probe(void) { return 0; }
 
 /* Semaphore — counter-only.  Single-threaded so wait never blocks (the

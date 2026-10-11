@@ -276,9 +276,11 @@ int64_t ray_heap_decay(void);
  * for the next pool under the anon watermark, drain the direct-block cache
  * and release the pages of free blocks — unless the last relief was
  * followed by a spill all the same.  Otherwise, near the watermark, park
- * empty pools.  Empty spill pools are parked too, their files, mappings and
- * pages kept for the next spill, and unmapped when the relief acts, from
- * every heap but for a heap's last pool, or at the decay threshold.
+ * empty pools.  Empty spill pools are parked too, their files and mappings
+ * kept for the next spill but their pages discarded, a dirty one unwritten
+ * (where the platform cannot discard them, unmapped instead), and unmapped
+ * when the relief acts, from every heap but for a heap's last pool, or at
+ * the decay threshold.
  * No-op inside parallel work and without file spill (Windows). */
 int64_t ray_heap_relieve(void);
 
@@ -286,6 +288,11 @@ int64_t ray_heap_relieve(void);
  * once on first use, so this exists to let a test drive the policy without
  * re-exec — not as a runtime knob. */
 void ray_heap_set_decay_ms(int64_t ms);
+
+/* Whether an empty parked spill pool's pages are discarded at the boundary
+ * (true) or the pool is unmapped, as where the platform cannot discard
+ * them (false).  Policy; it exists for tests, as ray_heap_set_decay_ms. */
+void ray_heap_set_spill_discard(bool on);
 
 /* --------------------------------------------------------------------------
  * Constants
@@ -443,6 +450,9 @@ typedef struct {
     uint8_t  hugepage;     /* 1 = THP hint issued (Linux); 0 otherwise */
     uint8_t  parked    : 1;  /* empty, its blocks off the freelists
                               * (heap_park_empty_pools) */
+    uint8_t  discarded : 1;  /* parked spill pool whose pages were discarded
+                              * since it was last in use
+                              * (heap_spill_pools_discard) */
 } ray_pool_entry_t;
 
 /* --------------------------------------------------------------------------

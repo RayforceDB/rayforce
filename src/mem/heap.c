@@ -33,6 +33,7 @@
 #include "core/platform.h"
 #include "core/timer.h"   /* ray_time_now_ms — idle-decay clock */
 #include "core/pool.h"    /* ray_pool_each_worker_heap — maintenance targets */
+#include "core/runtime.h" /* ray_sys_mem_used — a cgroup's statistics flushed */
 #include "table/sym.h"
 #include "table/domain.h"
 #include "lang/eval.h"
@@ -417,12 +418,24 @@ static bool heap_anon_would_exceed(size_t bytes) {
 }
 
 /* A boundary far from the watermark visits the heaps for the spill pools
- * alone (ray_heap_relieve) — to park the empty ones and age them — so at
- * most this often: a stream of small statements (a server's) would
- * otherwise walk every worker heap each time, 13-14 µs a statement at 16
- * workers.  A new watermark visits at the next boundary. */
+ * alone (ray_heap_relieve) — to park the empty ones, discard their pages and
+ * age them — so at most this often: a stream of small statements (a
+ * server's) would otherwise walk every worker heap each time, 13-14 µs a
+ * statement at 16 workers.  A new watermark visits at the next boundary. */
 #define RAY_FAR_VISIT_MS 100
 static _Atomic(int64_t) g_far_visit_ms = INT64_MIN / 2;
+
+/* After spill pages are dropped — a parked pool's discarded
+ * (heap_spill_discard), or the pool unmapped — the RAM in use is read
+ * (ray_sys_mem_used) for what reading does: a read of memory.stat flushes a
+ * cgroup's statistics, which the kernel updates lazily and holds writers to,
+ * and the dirty pages just dropped would otherwise throttle the next writes
+ * as if they were still there (measured: a 64 MB spill right after dropping
+ * 137 MB of dirty pages, 1.2 s instead of 0.1 s, 900 MB cgroup). */
+static void heap_mem_refresh(void) {
+    int64_t used;
+    (void)ray_sys_mem_used(&used);
+}
 
 int64_t ray_heap_anon_committed(void) {
     return atomic_load_explicit(&g_anon_committed, memory_order_relaxed);
@@ -2681,7 +2694,8 @@ static int64_t heap_reclaim_empty_pools(ray_heap_t* h, unsigned mode) {
  * its blocks are off the freelists: nothing is cut from it until the heap
  * has no free block left of the order it needs (heap_unpark, on the
  * allocation slow path before a new pool is mapped), and heap_make_room can
- * still unmap it for a large block, an anonymous one.
+ * still unmap it for a large block, an anonymous one.  A spill one has its
+ * pages discarded at the boundary that parks it (heap_spill_pools_discard).
  * The heap's last unparked pool stays on the lists.  Parks the empty pools
  * `mode` admits; the pool header keeps when (`now`, ms) the pool was parked
  * (heap_spill_pools_age). */
@@ -2710,6 +2724,7 @@ static bool heap_unpark(ray_heap_t* h, bool spill) {
         for (uint8_t o = pe->pool_order; o > RAY_ORDER_MIN; o--)
             heap_insert_block(h, (ray_t*)(pb + BSIZEOF(o - 1)), (uint8_t)(o - 1));
         pe->parked = 0;
+        pe->discarded = 0;   /* its pages are in use again */
         h->parked--;
         return true;
     }
@@ -2892,10 +2907,73 @@ static int64_t heap_release_free_pages(ray_heap_t* h) {
     return released;
 }
 
+/* Whether a parked spill pool's pages are discarded (heap_spill_discard) —
+ * or the pool unmapped, as where the platform cannot discard them.  Policy:
+ * the setter (ray_heap_set_spill_discard) is for tests. */
+static _Atomic(bool) g_spill_discard = true;
+
+void ray_heap_set_spill_discard(bool on) {
+    atomic_store_explicit(&g_spill_discard, on, memory_order_relaxed);
+}
+
+/* Discard the pages of parked spill pool pe — dead data — and keep its file
+ * and its mapping for the next statement that spills: from the pool's
+ * second page to the end of its last page in RAM (ray_vm_resident_end: as
+ * far as its use reached), the range is punched out of the file, each dirty
+ * page with it, unwritten, and its memory free; then reserved again
+ * (heap_preallocate), so a later store still finds its disk block.  The
+ * first page — the pool header and the free headers of the cascade's
+ * smallest blocks — stays as it is; the other cascade blocks' headers are
+ * written anew when the pool is taken back (heap_unpark), and nothing reads
+ * a parked pool's blocks before that.  Returns 1 if pages were punched, 0
+ * if none past the first page were in RAM, and -1 where it cannot be done —
+ * no way to punch a mapped range on this platform (macOS: F_PUNCHHOLE does
+ * not say what it does to pages mapped shared), or the file system or the
+ * disk refused: the pool is to be unmapped then. */
+static int heap_spill_discard(const ray_pool_entry_t* pe) {
+#if RAY_HEAP_FILE_SPILL && defined(__linux__) && defined(FALLOC_FL_PUNCH_HOLE)
+    if (!atomic_load_explicit(&g_spill_discard, memory_order_relaxed)) return -1;
+    long ps = sysconf(_SC_PAGESIZE);
+    size_t pg = ps > 0 ? (size_t)ps : 4096;
+    size_t end = ray_vm_resident_end(pe->base, BSIZEOF(pe->pool_order));
+    if (end <= pg) return 0;
+    off_t off = (off_t)pg, len = (off_t)(end - pg);
+    if (fallocate(pe->swap_fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, off, len) != 0
+        || heap_preallocate(pe->swap_fd, off, len) != 0)
+        return -1;
+    return 1;
+#else
+    (void)pe;
+    return -1;
+#endif
+}
+
+/* Discard the pages of h's parked spill pools not discarded since they were
+ * last in use — those parked at this boundary — or unmap a pool whose pages
+ * cannot be (the boundary that parked it left h another pool, unparked).
+ * Returns whether pages were dropped: the boundary then reads the RAM in use
+ * anew (heap_mem_refresh). */
+static bool heap_spill_pools_discard(ray_heap_t* h) {
+    bool dropped = false;
+    for (uint32_t p = h->pool_count; h->parked && p-- > 0; ) {
+        ray_pool_entry_t* pe = &h->pools[p];
+        if (!pe->parked || !pe->backed || pe->discarded) continue;
+        int got = heap_spill_discard(pe);
+        if (got < 0) {
+            (void)heap_pool_unmap(h, p);
+            dropped = true;
+            continue;
+        }
+        pe->discarded = 1;
+        dropped |= got > 0;
+    }
+    return dropped;
+}
+
 /* A parked spill pool that no statement has taken back for the idle decay's
  * threshold is unmapped, its file closed — but not h's last pool: the decay
  * pool by pool, for a process never idle that long — a server — which would
- * otherwise keep the files and their pages for good.  A negative
+ * otherwise keep the files, their disk blocks reserved, for good.  A negative
  * threshold — the decay disabled — is never reached, as unsigned.  `now` as
  * for heap_park_empty_pools. */
 static void heap_spill_pools_age(ray_heap_t* h, uint32_t now) {
@@ -3108,23 +3186,25 @@ static void heap_relieve_measure(ray_heap_t* h, void* ctx) {
     if (h != ray_tl_heap) m->room_other += room;
 }
 
-typedef struct { int64_t released; uint32_t now; bool near, act; } relieve_visit_t;
+typedef struct { int64_t released; uint32_t now; bool near, act, dropped; } relieve_visit_t;
 
 /* If the relief acts (act), a heap gives back its empty spill pools, and a
  * heap that did not spill a pool its empty anonymous ones too and the pages
  * of its other free blocks — one that did keeps those: it ran out of its
- * own.  What stays empty is parked, and a spill pool long unused is
- * unmapped.  The heap has been looked at: what it spilled is known now.
- * Far from the watermark (!near) the visit is only for the spill pools: it
- * parks the empty ones it finds on the freelists as they are, without a
- * drain or a slab flush — a pool with a block still in either waits for a
- * later visit, and the next statement keeps its slab cache. */
+ * own.  What stays empty is parked, a parked spill pool's pages are
+ * discarded, and a spill pool long unused is unmapped.  The heap has been
+ * looked at: what it spilled is known now.  Far from the watermark (!near)
+ * the visit is only for the spill pools: it parks the empty ones it finds on
+ * the freelists as they are, without a drain or a slab flush — a pool with
+ * a block still in either waits for a later visit, and the next statement
+ * keeps its slab cache. */
 static void heap_relieve_visit(ray_heap_t* h, void* ctx) {
     relieve_visit_t* v = ctx;
     if (v->near) {
         heap_drain_foreign(h);
         heap_flush_slabs(h);
     }
+    int64_t spills = atomic_load_explicit(&g_spill_pools, memory_order_relaxed);
     heap_spill_pools_age(h, v->now);
     if (v->act) {
         (void)heap_reclaim_empty_pools(h, h->spilled ? RAY_RECLAIM_SPILL
@@ -3133,6 +3213,8 @@ static void heap_relieve_visit(ray_heap_t* h, void* ctx) {
     }
     heap_park_empty_pools(h, v->near ? RAY_RECLAIM_ANON | RAY_RECLAIM_SPILL
                                      : RAY_RECLAIM_SPILL, v->now);
+    v->dropped |= heap_spill_pools_discard(h);
+    v->dropped |= atomic_load_explicit(&g_spill_pools, memory_order_relaxed) != spills;
     h->spilled = 0;
 }
 
@@ -3183,12 +3265,19 @@ static _Atomic(bool)    g_relieve_other  = false;   /* the last relief took othe
  * takes them back without a fault, and its large blocks can still have them
  * (heap_make_room).
  *
- * An empty spill pool is parked like the rest, its file, its mapping and its
- * pages kept for the next statement that spills.  When the relief acts, the
- * empty spill pools go with the anonymous ones, from every heap the relief
- * visits, the spilling one's too, and a parked spill pool unused for the
- * idle decay's threshold goes too (heap_spill_pools_age), so a server that
- * is never idle does not keep its file for good.  The boundary
+ * An empty spill pool is parked like the rest, its file and its mapping
+ * kept for the next statement that spills, but its pages — dead data — are
+ * discarded at the boundary that parks it (heap_spill_pools_discard): a
+ * dirty one is dropped unwritten, which the kernel would otherwise write
+ * back for nothing, and its memory is free; the next statement that spills
+ * takes the pool back, its pages zero-filled anew.  Where pages cannot be
+ * discarded the pool is unmapped instead.
+ * When the relief acts, the empty spill pools go with the anonymous ones,
+ * from every heap the relief visits, the spilling one's too, and a parked
+ * spill pool unused for the idle decay's threshold goes too
+ * (heap_spill_pools_age), so a server that is never idle does not keep its
+ * file for good.  After spill pages are dropped, the RAM in use is read,
+ * which flushes a cgroup's statistics (heap_mem_refresh).  The boundary
  * visits the heaps while any spill pool is mapped — far from the watermark
  * at most every RAY_FAR_VISIT_MS, and only for the spill pools.
  *
@@ -3196,7 +3285,9 @@ static _Atomic(bool)    g_relieve_other  = false;   /* the last relief took othe
  * drain and a slab flush per heap, a few header reads per possibly-empty
  * pool, one freelist walk where a pool may be empty — run only on a spill or
  * near the watermark (far from it, while a spill pool is mapped: the header
- * reads and the walk).
+ * reads and the walk).  A spill pool parked at this boundary costs a
+ * mincore, a hole punched and the range reserved again; one parked before,
+ * nothing.
  *
  * Only this thread's heap and the parked workers' are visited
  * (heap_each_quiescent).  Without file spill (Windows) the watermark does not
@@ -3247,7 +3338,7 @@ int64_t ray_heap_relieve(void) {
             return 0;
         atomic_store_explicit(&g_far_visit_ms, now, memory_order_relaxed);
     }
-    relieve_visit_t v = { 0, (uint32_t)now, near, false };
+    relieve_visit_t v = { 0, (uint32_t)now, near, false, false };
     if (relieve) {
         relieve_measure_t m = { direct_cache_bytes(), 0 };
         heap_each_quiescent(heap_relieve_measure, &m);
@@ -3261,6 +3352,7 @@ int64_t ray_heap_relieve(void) {
         }
     }
     heap_each_quiescent(heap_relieve_visit, &v);
+    if (v.dropped) heap_mem_refresh();
     return v.released;
 }
 

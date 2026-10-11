@@ -286,7 +286,10 @@ static ray_runtime_t* runtime_create_impl(const char* sym_path,
     rt->ram_limit = rt->total_ram;
     {
         int64_t cg = ray_os_cgroup_mem_limit();
-        if (cg > 0 && cg < rt->ram_limit) rt->ram_limit = cg;
+        if (cg > 0 && cg < rt->ram_limit) {
+            rt->ram_limit = cg;
+            ray_os_cgroup_mem_dir(rt->mem_cg, sizeof(rt->mem_cg));
+        }
     }
 
     /* __RUNTIME must be visible before ray_sym_load so the sym-load size
@@ -385,6 +388,10 @@ int64_t ray_sys_total_ram(void) {
 
 int64_t ray_sys_ram_limit(void) {
     return __RUNTIME ? __RUNTIME->ram_limit : 0;
+}
+
+bool ray_sys_mem_used(int64_t* used) {
+    return __RUNTIME && ray_os_mem_used(__RUNTIME->mem_cg, used);
 }
 
 int8_t ray_obj_type(ray_t* v) {

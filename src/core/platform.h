@@ -168,6 +168,10 @@ void  ray_sleep_ms(int ms);
  * check (a handful of page probes) that a read-ahead would find nothing to
  * read.  Where residency cannot be queried it reports false. */
 bool  ray_vm_resident(const void* ptr, size_t size);
+/* How far into [ptr, ptr+size) pages are in RAM: to the end of the last
+ * resident page (mincore), 0 if none; size where residency cannot be
+ * queried. */
+size_t ray_vm_resident_end(const void* ptr, size_t size);
 void  ray_vm_release(void* ptr, size_t size);
 /* Release physical pages for a free block.  When hugepage is true, only the
  * 2MB-aligned interior is released so a partial MADV_DONTNEED does not
@@ -197,6 +201,17 @@ uint64_t ray_cache_llc_bytes(void);
  * the process's cgroup and its ancestors.  0 when none is set, or on
  * platforms without cgroups. */
 int64_t ray_os_cgroup_mem_limit(void);
+/* The directory of the cgroup that sets that limit, into buf[n]; false when
+ * no limit is set, or on platforms without cgroups. */
+bool    ray_os_cgroup_mem_dir(char* buf, size_t n);
+/* RAM in use, read from the kernel's own counters with open/read (no stdio),
+ * into *used: all but free memory, clean page cache and reclaimable slab —
+ * what the kernel cannot take back without writing or swapping — of the
+ * cgroup in `cg`, a directory from ray_os_cgroup_mem_dir (v2 memory.current
+ * and memory.stat, v1 memory.usage_in_bytes and memory.stat), when given,
+ * else of the machine (/proc/meminfo).  false when it cannot be read (and on
+ * platforms without these files). */
+bool    ray_os_mem_used(const char* cg, int64_t* used);
 #ifdef DEBUG
 /* Pin ray_cache_llc_bytes to `bytes` (0 = probe again). */
 void ray_cache_llc_set_for_test(uint64_t bytes);
