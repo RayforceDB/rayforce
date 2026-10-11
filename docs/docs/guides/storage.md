@@ -92,7 +92,7 @@ ray_t* ray_col_load(const char* path);
 ray_t* ray_col_mmap(const char* path);
 ```
 
-The file format is compact: a header with type and length, followed by the raw element data. For string columns (`RAY_STR`), the pool data is written after the element array.
+The file format is compact: a header with type and length, followed by the raw element data. For string columns (`RAY_STR`), the pool data is written after the element array, and each pooled string's descriptor stores its content hash so that mapping the column does not reread the pool. See [Storage: Columnar Files](../storage/index.md#columnar-files) for the layout.
 
 The difference between `ray_col_load` and `ray_col_mmap`:
 
@@ -139,7 +139,7 @@ ray_t* ray_read_parted(const char* db_root,
                        const char* table_name);
 ```
 
-From Rayfall, load a partitioned table with `(.db.parted.get "db" 'trades)`; list a root's tables with `(.db.parted.tables "db")`.
+From Rayfall, load a partitioned table with `(.db.parted.get "db" 'trades)`; list a root's tables with `(.db.parted.tables "db")`. On the same thread, retaining the earlier view lets the next mount reuse unchanged partitions. The cache holds at most 1024 partition tables per thread. GC and the next mount release entries with no remaining column users; after dropping a view, `(.sys.gc)` releases its cached mappings and LIST payloads.
 
 Expected directory layout:
 

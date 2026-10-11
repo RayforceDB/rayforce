@@ -29,6 +29,7 @@
 #include "part.h"
 #include "core/runtime.h"
 #include "mem/sys.h"
+#include "mem/heap.h"
 #include "ops/ops.h"
 #include "store/splay.h"
 #include "table/sym.h"
@@ -258,6 +259,286 @@ static ray_t* collect_part_dirs(const char* db_root, char*** out_dirs,
 }
 
 /* --------------------------------------------------------------------------
+ * Partition reuse across mounts
+ *
+ * ray_read_parted used to open every partition of the table from scratch
+ * on every call.  A process that follows a database another process
+ * appends to has to call it again to see a new or replaced partition, and
+ * at a few microseconds per column file an unchanged root of twenty
+ * thousand files cost a tenth of a second per call before any row was
+ * read.  Loaded partition tables are therefore kept here, keyed by the
+ * partition's table path, and reused while the generation directory they
+ * were read from and every file in it are the ones on disk.
+ *
+ * Identity includes the resolved generation, device, inode, size, mtime
+ * and ctime of every schema/column file.  Symbol columns must also use
+ * the domain opened for this mount (in particular, a missing .sym must
+ * not be hidden by reuse).
+ *
+ * Ownership is thread-local: ray_t reference counts are not atomic on
+ * ordinary callers.  Each thread keeps at most RAY_PART_CACHE_MAX tables;
+ * oldest entries are evicted first.  GC and the next mount discard entries
+ * whose columns have no users outside the cache.  Heap abandon/destroy
+ * releases the rest before the heap changes owner or is unmapped.
+ * -------------------------------------------------------------------------- */
+
+typedef struct {
+    uint64_t dev;
+    uint64_t ino;
+    uint64_t size;
+    int64_t  mtime_s;
+    int64_t  mtime_ns;
+    int64_t  ctime_s;
+    int64_t  ctime_ns;
+} part_file_sig_t;
+
+typedef struct part_cache_entry_s {
+    char*            key;       /* "<root>/<partition>/<table>" as mounted */
+    char*            resolved;  /* generation directory the table came from */
+    ray_t*           tbl;       /* the loaded splayed table; one ref held here */
+    part_file_sig_t* sigs;      /* [0] = .d, then one per column in table order */
+    int64_t          nsigs;
+    uint64_t         seq;       /* the last mount that touched this entry */
+    struct part_cache_entry_s* next;
+} part_cache_entry_t;
+
+#define RAY_PART_CACHE_MAX 1024
+static RAY_TLS part_cache_entry_t* g_part_cache;
+static RAY_TLS uint64_t g_part_seq;
+static RAY_TLS size_t g_part_count;
+
+static bool part_file_sig(const char* path, part_file_sig_t* out) {
+    struct stat st;
+    if (stat(path, &st) != 0) return false;
+    out->dev  = (uint64_t)st.st_dev;
+    out->ino  = (uint64_t)st.st_ino;
+    out->size = (uint64_t)st.st_size;
+#if defined(__APPLE__)
+    out->mtime_s  = (int64_t)st.st_mtimespec.tv_sec;
+    out->mtime_ns = (int64_t)st.st_mtimespec.tv_nsec;
+    out->ctime_s = (int64_t)st.st_ctimespec.tv_sec;
+    out->ctime_ns = (int64_t)st.st_ctimespec.tv_nsec;
+#elif defined(RAY_OS_WINDOWS)
+    out->mtime_s  = (int64_t)st.st_mtime;
+    out->mtime_ns = 0;
+    out->ctime_s = (int64_t)st.st_ctime;
+    out->ctime_ns = 0;
+#else
+    out->mtime_s  = (int64_t)st.st_mtim.tv_sec;
+    out->mtime_ns = (int64_t)st.st_mtim.tv_nsec;
+    out->ctime_s = (int64_t)st.st_ctim.tv_sec;
+    out->ctime_ns = (int64_t)st.st_ctim.tv_nsec;
+#endif
+    return true;
+}
+
+static bool part_sig_eq(const part_file_sig_t* a, const part_file_sig_t* b) {
+    return a->dev == b->dev && a->ino == b->ino && a->size == b->size &&
+           a->mtime_s == b->mtime_s && a->mtime_ns == b->mtime_ns &&
+           a->ctime_s == b->ctime_s && a->ctime_ns == b->ctime_ns;
+}
+
+/* Path of signature slot i: the schema file, then the table's columns. */
+static bool part_sig_path(const char* resolved, ray_t* tbl, int64_t i,
+                          char* out, size_t out_sz) {
+    int n;
+    if (i == 0) {
+        n = snprintf(out, out_sz, "%s/.d", resolved);
+    } else {
+        ray_t* name = ray_sym_str(ray_table_col_name(tbl, i - 1));
+        if (!name || RAY_IS_ERR(name)) return false;
+        n = snprintf(out, out_sz, "%s/%.*s", resolved,
+                     (int)ray_str_len(name), ray_str_ptr(name));
+    }
+    return n > 0 && (size_t)n < out_sz;
+}
+
+static bool part_sigs_take(const char* resolved, ray_t* tbl,
+                           part_file_sig_t* sigs, int64_t n) {
+    char path[1100];
+    for (int64_t i = 0; i < n; i++) {
+        if (!part_sig_path(resolved, tbl, i, path, sizeof(path))) return false;
+        if (!part_file_sig(path, &sigs[i])) return false;
+    }
+    return true;
+}
+
+/* Every file the entry was taken from is still the same file. */
+static bool part_entry_current(const part_cache_entry_t* e) {
+    char path[1100];
+    part_file_sig_t now;
+    for (int64_t i = 0; i < e->nsigs; i++) {
+        if (!part_sig_path(e->resolved, e->tbl, i, path, sizeof(path))) return false;
+        if (!part_file_sig(path, &now)) return false;
+        if (!part_sig_eq(&now, &e->sigs[i])) return false;
+    }
+    return true;
+}
+
+static char* part_strdup(const char* s) {
+    size_t n = strlen(s) + 1;
+    char* d = (char*)ray_sys_alloc(n);
+    if (d) memcpy(d, s, n);
+    return d;
+}
+
+static void part_entry_free(part_cache_entry_t* e) {
+    if (!e) return;
+    if (e->tbl) ray_release(e->tbl);
+    ray_sys_free(e->key);
+    ray_sys_free(e->resolved);
+    ray_sys_free(e->sigs);
+    ray_sys_free(e);
+}
+
+/* Describe a freshly loaded partition.  NULL when it cannot be described
+ * (a path too long, a file already gone): the load is still returned to
+ * the caller, it just is not kept. */
+static part_cache_entry_t* part_entry_new(const char* key, const char* resolved,
+                                          ray_t* tbl) {
+    int64_t n = 1 + ray_table_ncols(tbl);
+    part_cache_entry_t* e = (part_cache_entry_t*)ray_sys_alloc(sizeof(*e));
+    if (!e) return NULL;
+    memset(e, 0, sizeof(*e));
+    e->key      = part_strdup(key);
+    e->resolved = part_strdup(resolved);
+    e->sigs     = (part_file_sig_t*)ray_sys_alloc((size_t)n * sizeof(part_file_sig_t));
+    e->nsigs    = n;
+    if (!e->key || !e->resolved || !e->sigs ||
+        !part_sigs_take(resolved, tbl, e->sigs, n)) {
+        part_entry_free(e);
+        return NULL;
+    }
+    e->tbl = tbl;
+    ray_retain(tbl);
+    return e;
+}
+
+/* Only the owning thread visits or releases its cached objects. */
+static void part_cache_drop(bool (*keep)(const part_cache_entry_t*, const void*),
+                            const void* ctx) {
+    for (part_cache_entry_t** pp = &g_part_cache; *pp; ) {
+        part_cache_entry_t* e = *pp;
+        if (keep(e, ctx)) { pp = &e->next; continue; }
+        *pp = e->next;
+        g_part_count--;
+        part_entry_free(e);
+    }
+}
+
+static bool part_keep_used(const part_cache_entry_t* e, const void* ctx) {
+    (void)ctx;
+    if (ray_atomic_load(&e->tbl->rc) > 1) return true;
+    for (int64_t i = 0; i < ray_table_ncols(e->tbl); i++) {
+        ray_t* col = ray_table_get_col_idx(e->tbl, i);
+        if (col && ray_atomic_load(&col->rc) > 1) return true;
+    }
+    return false;
+}
+
+void ray_parted_cache_prune(void) {
+    part_cache_drop(part_keep_used, NULL);
+}
+
+static bool part_domain_matches(ray_t* tbl, struct ray_sym_domain_s* dom) {
+    for (int64_t i = 0; i < ray_table_ncols(tbl); i++) {
+        ray_t* col = ray_table_get_col_idx(tbl, i);
+        if (col && col->type == RAY_SYM && ray_sym_vec_domain(col) != dom)
+            return false;
+    }
+    return true;
+}
+
+/* Open one partition's table for mount `seq`: the kept table when the
+ * partition is unchanged, otherwise a fresh load that replaces whatever
+ * was kept for this path.  Errors come back exactly as from
+ * ray_read_splayed_dom. */
+static ray_t* part_open(const char* path, struct ray_sym_domain_s* dom,
+                        uint64_t seq, bool* reused) {
+    *reused = false;
+    char resolved[1024];
+    if (ray_splay_resolve_dir(path, resolved, sizeof(resolved)) != RAY_OK)
+        return ray_read_splayed_dom(path, dom);   /* the loader reports it */
+
+    for (part_cache_entry_t* e = g_part_cache; e; e = e->next) {
+        if (strcmp(e->key, path) != 0) continue;
+        if (strcmp(e->resolved, resolved) == 0 &&
+            part_domain_matches(e->tbl, dom) && part_entry_current(e)) {
+            e->seq = seq;
+            ray_t* tbl = e->tbl;
+            ray_retain(tbl);
+            *reused = true;
+            return tbl;
+        }
+        break;   /* changed: replaced below once the fresh load succeeds */
+    }
+
+    ray_t* tbl = ray_read_splayed_dom(path, dom);
+    if (!tbl || RAY_IS_ERR(tbl)) return tbl;
+
+    /* Keep it only if the generation did not move during the load; the
+     * table and the signature must describe the same directory. */
+    char now[1024];
+    if (ray_splay_resolve_dir(path, now, sizeof(now)) != RAY_OK ||
+        strcmp(now, resolved) != 0)
+        return tbl;
+    part_cache_entry_t* fresh = part_entry_new(path, resolved, tbl);
+    if (!fresh) return tbl;
+
+    for (part_cache_entry_t** pp = &g_part_cache; *pp; pp = &(*pp)->next) {
+        if (strcmp((*pp)->key, path) == 0) {
+            part_cache_entry_t* old = *pp;
+            *pp = old->next;
+            g_part_count--;
+            part_entry_free(old);
+            break;
+        }
+    }
+    fresh->seq = seq;
+    fresh->next = g_part_cache;
+    g_part_cache = fresh;
+    if (++g_part_count > RAY_PART_CACHE_MAX) {
+        part_cache_entry_t** oldest = &g_part_cache;
+        for (part_cache_entry_t** pp = &g_part_cache; *pp; pp = &(*pp)->next)
+            if ((*pp)->seq <= (*oldest)->seq) oldest = pp;
+        part_cache_entry_t* dead = *oldest;
+        *oldest = dead->next;
+        g_part_count--;
+        part_entry_free(dead);
+    }
+    return tbl;
+}
+
+/* After a complete mount of <db_root>/<table_name>: drop the entries of
+ * that table the mount did not touch — partitions that are gone. */
+typedef struct { const char* root; const char* table; uint64_t seq; } part_sweep_t;
+static bool part_keep_touched(const part_cache_entry_t* e, const void* ctx) {
+    const part_sweep_t* s = (const part_sweep_t*)ctx;
+    size_t rl = strlen(s->root), tl = strlen(s->table), kl = strlen(e->key);
+    /* "<db_root>/<one directory>/<table_name>" */
+    bool ours = kl > rl + tl + 2 &&
+                strncmp(e->key, s->root, rl) == 0 && e->key[rl] == '/' &&
+                strcmp(e->key + kl - tl, s->table) == 0 &&
+                e->key[kl - tl - 1] == '/' &&
+                memchr(e->key + rl + 1, '/', kl - tl - rl - 2) == NULL;
+    return !ours || e->seq == s->seq;
+}
+static void part_cache_sweep(const char* db_root, const char* table_name,
+                             uint64_t seq) {
+    part_sweep_t s = { db_root, table_name, seq };
+    part_cache_drop(part_keep_touched, &s);
+}
+
+static bool part_keep_none(const part_cache_entry_t* e, const void* ctx) {
+    (void)e; (void)ctx;
+    return false;
+}
+
+void ray_parted_cache_clear(void) {
+    part_cache_drop(part_keep_none, NULL);
+}
+
+/* --------------------------------------------------------------------------
  * ray_read_parted — zero-copy open of a partitioned table
  *
  * Builds parted columns (RAY_PARTED_BASE + base_type) where each segment
@@ -276,6 +557,9 @@ ray_t* ray_read_parted(const char* db_root, const char* table_name) {
         strstr(table_name, "..") || table_name[0] == '.')
         return ray_error("io", NULL);
 
+    /* Release unused domains before opening a possibly rebuilt root. */
+    ray_parted_cache_prune();
+
     /* Build sym_path. */
     char sym_path[1024];
     int sn = snprintf(sym_path, sizeof(sym_path), "%s/.sym", db_root);
@@ -288,14 +572,17 @@ ray_t* ray_read_parted(const char* db_root, const char* table_name) {
      * RAY_SYM columns never produce a symfile, so a missing root-level
      * symfile is normal — the loud "sym" error fires only if a SYM
      * column is actually encountered (store/col.c). */
+    uint64_t seq = ++g_part_seq;
     struct ray_sym_domain_s* dom = NULL;
     struct stat sym_st;
     if (stat(sym_path, &sym_st) == 0) {
         dom = ray_sym_domain_open(sym_path);
-        if (!dom)
+        if (!dom) {
+            part_cache_sweep(db_root, table_name, seq);
             return ray_error("corrupt",
                 "symfile %s: unreadable or invalid (bad magic, torn record, "
                 "or missing \"\" at position 0)", sym_path);
+        }
     }
 
     /* Scan db_root for partition directories (the ".sym" dotfile is skipped);
@@ -309,15 +596,16 @@ ray_t* ray_read_parted(const char* db_root, const char* table_name) {
             fprintf(stderr, "parted.get: collect dirs failed err=%s\n",
                     ray_err_code(collect_err));
         if (dom) ray_sym_domain_release(dom);
+        part_cache_sweep(db_root, table_name, seq);
         return collect_err;
     }
-    if (trace)
-        fprintf(stderr, "parted.get: parts=%" PRId64 "\n", part_count);
+    int64_t reused_n = 0;
 
     /* No partitions: there is no named table to read.  Unlike
      * .db.parted.tables (which lists nothing), reading data from an empty
      * or non-parted root is a genuine error. */
     if (part_count <= 0) {
+        part_cache_sweep(db_root, table_name, seq);
         if (dom) ray_sym_domain_release(dom);
         return ray_error("io", "parted %s: no partition directories", db_root);
     }
@@ -346,8 +634,11 @@ ray_t* ray_read_parted(const char* db_root, const char* table_name) {
         }
         /* Resolve the generation before refreshing the shared symbol domain.
          * ray_read_splayed_dom reopens the cached domain by path, so symbols
-         * appended by a concurrent publisher are visible before columns load. */
-        part_tables[p] = ray_read_splayed_dom(path, dom);
+         * appended by a concurrent publisher are visible before columns load.
+         * An unchanged partition comes back from the previous mount. */
+        bool reused = false;
+        part_tables[p] = part_open(path, dom, seq, &reused);
+        if (reused) reused_n++;
         if (!part_tables[p] || RAY_IS_ERR(part_tables[p])) {
             if (trace)
                 fprintf(stderr, "parted.get: splayed load failed part=%" PRId64 " path=%s err=%s\n",
@@ -362,6 +653,12 @@ ray_t* ray_read_parted(const char* db_root, const char* table_name) {
             goto fail_tables;
         }
     }
+
+    /* Every partition is open: forget the ones this root no longer has. */
+    part_cache_sweep(db_root, table_name, seq);
+    if (trace)
+        fprintf(stderr, "parted.get: parts=%" PRId64 " reused=%" PRId64 "\n",
+                part_count, reused_n);
 
     /* Get schema from first partition */
     int64_t ncols = ray_table_ncols(part_tables[0]);

@@ -115,7 +115,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: TSan concurrency suites
         run: |
-          for f in pool heap parallel stress; do
+          for f in pool heap parallel stress store/parted_concurrent_mounts; do
             echo "::group::tsan -f $f"
             make tsan-test TSAN_FILTER=$f || exit 1
             echo "::endgroup::"
