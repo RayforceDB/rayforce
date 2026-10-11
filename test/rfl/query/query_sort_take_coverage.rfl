@@ -331,11 +331,22 @@
 (select {c: (count x) by: (+ nosuch 1) from: Trk}) !- schema
 (select {c: (count x) by: (reverse nosuch) from: Trk where: (> x 1)}) !- schema
 (select {c: (count x) by: (nosuchfn x) from: Trk}) !- name
-;; a name the key binds itself, by let or set in a do, is no column
+;; a name the key binds itself, by let or set in a do, is no column; a key
+;; that binds names is left to the evaluator, which reports any unknown one
 (value (select {c: (count x) by: (do (let qk x) (reverse qk)) from: Trk})) -- (value (select {c: (count x) by: (reverse x) from: Trk}))
 (at (select {c: (count x) by: (do (set qkg x) (reverse qkg)) from: Trk}) (quote c)) -- [2 2 1 1]
-(select {c: (count x) by: (do (let qk x) (reverse nosuch)) from: Trk}) !- schema
-(select {c: (count x) by: (do (reverse qk2) (let qk2 x)) from: Trk}) !- schema
+(select {c: (count x) by: (do (let qk x) (reverse nosuch)) from: Trk}) !- name
+(select {c: (count x) by: (do (reverse qk2) (let qk2 x)) from: Trk}) !- name
+;; a name bound inside nested forms, by set or let in a do, an if, or
+;; through a binder called by another name, is the evaluator's to resolve:
+;; the unknown-column check never refuses such a key
+(set fnest (fn [a] (let b a) (reverse b)))
+;; (a key with an effect runs row by row: each row's key is its x)
+(at (select {by: (fnest (do (do (set qn1 x)) qn1)) from: Trk}) 'x) -- (at (select {by: x from: Trk}) 'x)
+(count (select {by: (reverse (if true (set qn2 x) (set qn2 s))) from: Trk})) -- (count (select {by: (reverse x) from: Trk}))
+(count (select {by: (reverse (do (do (do (set qn3 x))) (do (do qn3)))) from: Trk})) -- (count (select {by: (reverse x) from: Trk}))
+(set setalias set)
+(count (select {by: (reverse (do (setalias qn4 x) qn4)) from: Trk})) -- (count (select {by: (reverse x) from: Trk}))
 ;; text concat is still planned, and groups the same
 (at (select {c: (count x) by: (concat s "z") from: Trk}) 'c) -- [3 2 1]
 ;; one value is one group, holding the first row
@@ -581,6 +592,18 @@
 (set hr (fn [] __row))
 (select {by: {k: (hr)} from: Prn}) -- (select {by: {k: (hr)} from: Mrn})
 (count (select {by: {k: (hr)} from: Prn})) -- 3
+;; a builtin that evaluates a name, called by another name, is code too:
+;; it reads the variable, as on the flat table, not the row number
+(set getv resolve)
+(set rname '__row)
+(select {by: {k: (getv rname)} from: Prn}) -- (select {by: {k: (getv rname)} from: Mrn})
+(count (select {by: {k: (getv rname)} from: Prn})) -- 3
+(set getq 'resolve)
+(select {by: {k: (getq rname)} from: Prn}) -- (select {by: {k: (getq rname)} from: Mrn})
+(set evq eval)
+(set paq parse)
+(select {by: {k: (evq (paq "__row"))} from: Prn}) -- (select {by: {k: (evq (paq "__row"))} from: Mrn})
+(count (select {by: {k: (evq (paq "__row"))} from: Prn})) -- 3
 (select {i: i from: Prn desc: i take: 2}) -- (select {i: i from: Mrn desc: i take: 2})
 (select {from: Prn asc: s}) -- (select {from: Mrn asc: s})
 (set __row 0)

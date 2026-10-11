@@ -10259,45 +10259,69 @@ static ray_t* select_dict_with_from(ray_t* dict, ray_t* tbl) {
 
 static ray_t* sym_binding(int64_t s);
 
-/* `(let n v)` or `(set n v)`: the name it binds, or -1. */
-static int64_t key_binding_form(ray_t* e) {
-    if (!e || e->type != RAY_LIST || e->len != 3) return -1;
+/* Is `b` a builtin registered under one of `names`?  A builtin carries the
+ * name it was registered under, whatever name a clause calls it by. */
+static bool builtin_named(const ray_t* b, const char* const* names, size_t n) {
+    if (!b || b->type <= RAY_LAMBDA || b->type > RAY_VARY) return false;
+    const char* own = ray_fn_name(b);
+    for (size_t i = 0; i < n; i++) if (strcmp(own, names[i]) == 0) return true;
+    return false;
+}
+
+/* A builtin that runs code its clause does not show: a lambda literal, or
+ * text or a name evaluated at run time. */
+static bool builtin_runs_code(const ray_t* b) {
+    static const char* const code[] = { "fn", "eval", "parse", "resolve", "load", "value" };
+    return builtin_named(b, code, sizeof code / sizeof code[0]);
+}
+
+/* Does name `s` name a column of `tbl` (a dotted name: its head)? */
+static bool sym_names_col(ray_t* tbl, int64_t s) {
+    if (!tbl) return false;
+    if (ray_table_get_col(tbl, s)) return true;
+    if (!ray_sym_is_dotted(s)) return false;
+    const int64_t* segs;
+    return ray_sym_segs(s, &segs) >= 1 && ray_table_get_col(tbl, segs[0]);
+}
+
+static bool clause_runs_code_in(ray_t* v, ray_t* tbl, bool containers);
+
+/* Does key `e` name, anywhere, a builtin that binds a name or quotes its
+ * argument (let, set, quote), however it is called? */
+static bool key_names_binder(ray_t* e, ray_t* tbl) {
+    static const char* const binders[] = { "let", "set", "quote" };
+    if (!e) return false;
+    if (e->type == -RAY_SYM)
+        return !sym_names_col(tbl, e->i64) &&
+               builtin_named(sym_binding(e->i64), binders, sizeof binders / sizeof binders[0]);
+    if (e->type != RAY_LIST) return false;
     ray_t** el = (ray_t**)ray_data(e);
-    if (!select_sym_is(el[0], "let", 3) && !select_sym_is(el[0], "set", 3)) return -1;
-    return el[1]->type == -RAY_SYM && !(el[1]->attrs & ATTR_QUOTED) ? el[1]->i64 : -1;
+    for (int64_t i = 0; i < e->len; i++) if (key_names_binder(el[i], tbl)) return true;
+    return false;
 }
 
 /* The first free name in key `e` that is no column of `tbl` and no bound
- * name, or -1.  A lambda written in the key is skipped: its names resolve
- * when it runs.  A let or set binds its name for the forms after it (the
- * rest of a `do`). */
-static int64_t key_unknown_name(ray_t* e, ray_t* tbl, int64_t* bound, int nbound) {
+ * name, or -1.  Only asked of a key that runs no code and binds no name
+ * (key_names_binder, clause_runs_code_in): a name such a form binds, in any
+ * nesting, is the evaluator's to resolve, and this check exists only to
+ * pick the error code, never to refuse a key the evaluator accepts. */
+static int64_t key_unknown_name(ray_t* e, ray_t* tbl) {
     if (!e) return -1;
     if (e->type == -RAY_SYM) {
-        if (e->attrs & ATTR_QUOTED) return -1;
-        if (ray_table_get_col(tbl, e->i64)) return -1;
-        if (ray_sym_is_dotted(e->i64)) {
-            const int64_t* segs;
-            if (ray_sym_segs(e->i64, &segs) >= 1 && ray_table_get_col(tbl, segs[0])) return -1;
-        }
-        for (int i = 0; i < nbound; i++) if (bound[i] == e->i64) return -1;
+        if ((e->attrs & ATTR_QUOTED) || sym_names_col(tbl, e->i64)) return -1;
         return sym_binding(e->i64) ? -1 : e->i64;
     }
     if (e->type != RAY_LIST || e->len < 1) return -1;
     ray_t** el = (ray_t**)ray_data(e);
-    if (select_sym_is(el[0], "fn", 2) || select_sym_is(el[0], "quote", 5)) return -1;
-    if (key_binding_form(e) >= 0) return key_unknown_name(el[2], tbl, bound, nbound);
     /* a named head is a function, whose own error stands */
     for (int64_t i = el[0]->type == -RAY_SYM ? 1 : 0; i < e->len; i++) {
-        int64_t m = key_unknown_name(el[i], tbl, bound, nbound);
+        int64_t m = key_unknown_name(el[i], tbl);
         if (m >= 0) return m;
-        int64_t b = key_binding_form(el[i]);
-        if (b >= 0 && nbound < 32) bound[nbound++] = b;
     }
     return -1;
 }
 
-static bool parted_clauses_plain(ray_t* dict);
+static bool parted_clauses_plain(ray_t* dict, ray_t* tbl);
 
 /* The columns of a parted table a select reads, flattened: every column a
  * clause names, in the table's order; the whole table when a clause runs
@@ -10307,7 +10331,7 @@ static ray_t* parted_flatten_read_cols(ray_t* dict, ray_t* tbl) {
     ray_t* keys = ray_dict_keys(dict);
     ray_t* vals = ray_dict_vals(dict);
     if (nc <= 0 || nc > 256 || !keys || keys->type != RAY_SYM || !vals || vals->type != RAY_LIST ||
-        !parted_clauses_plain(dict))
+        !parted_clauses_plain(dict, tbl))
         return query_materialize_parted_table(tbl);
     int64_t id_from = ray_sym_intern("from", 4);
     int64_t refs[256];
@@ -10377,8 +10401,8 @@ static ray_t* select_plan_computed_key(ray_t* dict, ray_t* tbl, int64_t* key_nam
         if (g) ray_graph_free(g);
         if (!lowered) {
             /* An unknown column reads as schema, as in a key that lowers. */
-            int64_t kb[32];
-            int64_t miss = key_unknown_name(by_expr, tbl, kb, 0);
+            int64_t miss = key_names_binder(by_expr, tbl) || clause_runs_code_in(by_expr, tbl, true)
+                           ? -1 : key_unknown_name(by_expr, tbl);
             if (miss >= 0) {
                 ray_t* mn = ray_sym_str(miss);
                 return mn ? ray_error("schema", "column '%.*s' not found", (int)ray_str_len(mn), ray_str_ptr(mn))
@@ -10603,65 +10627,65 @@ static ray_t* sym_binding(int64_t s) {
     return b ? b : ray_env_get(s);
 }
 
-/* Is a name bound to `b` code a clause runs: a lambda, a name of one (a
- * call through it calls the lambda), or (unquoted, when `containers`) a
- * container that may hold lambdas? */
+/* Is a name bound to `b` code a clause runs: a lambda or a code-running
+ * builtin (builtin_runs_code), however named; a name of one (a call through
+ * it calls it); or (unquoted, when `containers`) a container that may hold
+ * lambdas? */
 static bool sym_binding_runs_code(ray_t* b, bool quoted, bool containers) {
     if (!b) return false;
-    if (b->type == RAY_LAMBDA) return true;
+    if (b->type == RAY_LAMBDA || builtin_runs_code(b)) return true;
     if (b->type == -RAY_SYM) {
         ray_t* to = sym_binding(b->i64);
-        return to && to->type == RAY_LAMBDA;
+        return to && (to->type == RAY_LAMBDA || builtin_runs_code(to));
     }
     return containers && !quoted && (b->type == RAY_LIST || b->type == RAY_DICT || b->type == RAY_TABLE);
 }
 
 /* Does the clause value `v` run code whose column reads it does not show:
- * a lambda (written in place, or a name -- plain, quoted or a dotted path
- * -- bound to one or to its name), a call whose callee is computed, text or
- * a name evaluated at run time (eval, parse, resolve, load, value), and,
- * when `containers`, a name bound to a container that may hold lambdas? */
-static bool clause_runs_code_in(ray_t* v, bool containers) {
+ * a name -- plain, quoted or a dotted path -- bound to a lambda, to a
+ * lambda literal's form, or to a builtin that evaluates text or a name at
+ * run time, whatever it is called (and through one name hop); a call whose
+ * callee is computed; and, when `containers`, a name bound to a container
+ * that may hold lambdas?  A name of a column of `tbl` is the column. */
+static bool clause_runs_code_in(ray_t* v, ray_t* tbl, bool containers) {
     if (!v || RAY_IS_ERR(v)) return false;
     if (v->type == RAY_LAMBDA) return true;
-    if (v->type == -RAY_SYM)   /* a dotted path too: ray_env_get walks it */
+    if (v->type == -RAY_SYM) {   /* a dotted path too: ray_env_get walks it */
+        if (!(v->attrs & ATTR_QUOTED) && sym_names_col(tbl, v->i64)) return false;
         return sym_binding_runs_code(sym_binding(v->i64), (v->attrs & ATTR_QUOTED) != 0, containers);
+    }
     if (v->type == RAY_DICT) {   /* each value on its own: the values list is no call */
         ray_t* dv = ray_dict_vals(v);
-        if (!dv || dv->type != RAY_LIST) return clause_runs_code_in(dv, containers);
+        if (!dv || dv->type != RAY_LIST) return clause_runs_code_in(dv, tbl, containers);
         for (int64_t i = 0; i < dv->len; i++)
-            if (clause_runs_code_in(((ray_t**)ray_data(dv))[i], containers)) return true;
+            if (clause_runs_code_in(((ray_t**)ray_data(dv))[i], tbl, containers)) return true;
         return false;
     }
     if (v->type != RAY_LIST) return false;
     ray_t** el = (ray_t**)ray_data(v);
-    if (v->len > 0 && (el[0]->type == RAY_LIST ||
-                       select_sym_is(el[0], "fn", 2) || select_sym_is(el[0], "eval", 4) ||
-                       select_sym_is(el[0], "parse", 5) || select_sym_is(el[0], "resolve", 7) ||
-                       select_sym_is(el[0], "load", 4) || select_sym_is(el[0], "value", 5)))
-        return true;
-    for (int64_t i = 0; i < v->len; i++) if (clause_runs_code_in(el[i], containers)) return true;
+    if (v->len > 0 && el[0]->type == RAY_LIST) return true;
+    for (int64_t i = 0; i < v->len; i++) if (clause_runs_code_in(el[i], tbl, containers)) return true;
     return false;
 }
 
 /* Does any clause but from: run code whose column reads it does not show
  * (clause_runs_code_in)?  NULL dict counts as code. */
-static bool clauses_run_code(ray_t* dict, bool containers) {
+static bool clauses_run_code(ray_t* dict, ray_t* tbl, bool containers) {
     ray_t* keys = ray_dict_keys(dict);
     ray_t* vals = ray_dict_vals(dict);
     if (!keys || keys->type != RAY_SYM || !vals || vals->type != RAY_LIST) return true;
     int64_t id_from = ray_sym_intern("from", 4);
     for (int64_t i = 0; i < ray_dict_len(dict); i++)
         if (sym_cell_runtime_id(keys, i) != id_from &&
-            clause_runs_code_in(((ray_t**)ray_data(vals))[i], containers)) return true;
+            clause_runs_code_in(((ray_t**)ray_data(vals))[i], tbl, containers)) return true;
     return false;
 }
 
 /* Can the narrow copy of a parted table answer this select: every column
  * a clause reads is written in it (no code that reads columns unseen, a
  * container of lambdas included). */
-static bool parted_clauses_plain(ray_t* dict) {
-    return !clauses_run_code(dict, true);
+static bool parted_clauses_plain(ray_t* dict, ray_t* tbl) {
+    return !clauses_run_code(dict, tbl, true);
 }
 
 /* Do the clauses name every column they read, as far as narrowing a flat
@@ -10669,8 +10693,8 @@ static bool parted_clauses_plain(ray_t* dict) {
  * or text evaluated at run time.  Names bound to containers are taken as
  * data: a config dict or a list a where: reads must not cost the
  * projection. */
-static bool clauses_name_their_columns(ray_t* dict) {
-    return !clauses_run_code(dict, false);
+static bool clauses_name_their_columns(ray_t* dict, ray_t* tbl) {
+    return !clauses_run_code(dict, tbl, false);
 }
 
 /* Rows rv[0..n) of a parted table, gathered one column at a time without
@@ -10782,7 +10806,7 @@ static ray_t* select_parted_first_rows(ray_t* dict, ray_t* tbl, bool aliases_res
     ray_t* by_expr = dict_get(dict, "by");
     if (!by_expr) return NULL;
     int64_t row_sym = ray_sym_intern("__row", 5);
-    if (!parted_row_name_free(dict, tbl, row_sym) || !parted_clauses_plain(dict)) return NULL;
+    if (!parted_row_name_free(dict, tbl, row_sym) || !parted_clauses_plain(dict, tbl)) return NULL;
     /* the key columns the result leads with */
     int64_t nkeys = by_expr->type == RAY_DICT ? ray_dict_len(by_expr)
                   : by_expr->type == RAY_SYM ? ray_len(by_expr) : 1;
@@ -10936,7 +10960,7 @@ static ray_t* select_parted_sorted(ray_t* dict, ray_t* tbl, bool aliases_resolve
     int64_t nc = ray_table_ncols(tbl);
     if (nc <= 0 || nc > 256) return NULL;   /* sel_compact's column limit */
     int64_t row_sym = ray_sym_intern("__row", 5);
-    if (!parted_row_name_free(dict, tbl, row_sym) || !parted_clauses_plain(dict)) return NULL;
+    if (!parted_row_name_free(dict, tbl, row_sym) || !parted_clauses_plain(dict, tbl)) return NULL;
     ray_t* keys = ray_dict_keys(dict);
     ray_t* vals = ray_dict_vals(dict);
     int64_t nd = ray_dict_len(dict);
@@ -11919,7 +11943,7 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, bool aliases_resolved,
              * runs code (a helper) that reads columns the clauses do not
              * name. */
             int can_project = (n_out > 0 && n_keep > 0 && n_keep < ncols_max &&
-                               clauses_name_their_columns(dict));
+                               clauses_name_their_columns(dict, tbl));
             ray_t* narrow_tbl = NULL;
             if (can_project) {
                 narrow_tbl = project_table_cols(tbl, keep_syms, n_keep);
