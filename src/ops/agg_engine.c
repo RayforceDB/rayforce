@@ -498,39 +498,80 @@ static bool agg_dense_plan_compact(ray_t** key_cols, uint32_t n_keys, int64_t nr
     return true;
 }
 
-/* An estimate of the groups a key tuple forms — see agg_engine.h.  The
- * sample is 64 blocks of 1,024 rows spread evenly over the input (every row
- * below 65,536), read with the typed bounds loop above; a SYM key's codes
- * go through a small open-addressing set. */
-enum { AGG_EST_BLOCKS = 64, AGG_EST_BLOCK = 1024,
-       AGG_EST_SET_CAP = 1 << 18 };   /* > 2 x the sample: short probes */
+/* An estimate of the groups a key tuple forms — see agg_engine.h.
+ *
+ * Each key is sampled at a fixed stride, AGG_EST_SAMPLE rows over the input
+ * (every row below that), and its values go through a small open-addressing
+ * set that counts how often each was seen.  Blocks of adjacent rows would
+ * be cheaper to read but blind to clustered keys: a run of four rows per
+ * value shows a block one value per four rows, while a stride past the run
+ * length shows every sample distinct.  The distinct count of the sample is
+ * then raised by the Chao1 species estimator, d + f1 (f1 - 1) / 2 (f2 + 1)
+ * — f1 and f2 the values seen once and twice — which answers for the
+ * values the sample missed: a key of 45 values has no singletons and stays
+ * 45; a skewed key, one value on nine rows in ten and a million on the
+ * rest, shows thousands of singletons and few pairs and lands near the
+ * million.  Each key's estimate is capped at what it could hold: the span
+ * of its sampled values for an integer or temporal key, the domain's
+ * count for a SYM key. */
+enum { AGG_EST_SAMPLE = 1 << 16 };
 
-static int64_t agg_sym_distinct_sampled(ray_t* key, int64_t nrows,
-                                        int64_t* sampled_out) {
-    int64_t* set = ray_alloc_raw((size_t)AGG_EST_SET_CAP * sizeof(int64_t));
-    if (!set) return -1;
-    memset(set, 0xFF, (size_t)AGG_EST_SET_CAP * sizeof(int64_t));   /* -1: empty */
+/* A sampled key value as int64: the integer itself (a null is its sentinel,
+ * one more value), a SYM's code. */
+static inline int64_t agg_est_read(const void* d, int8_t t, uint8_t attrs, int64_t r) {
+    switch (t) {
+    case RAY_I64: case RAY_TIMESTAMP: return ((const int64_t*)d)[r];
+    case RAY_I32: case RAY_DATE: case RAY_TIME: return ((const int32_t*)d)[r];
+    case RAY_I16: return ((const int16_t*)d)[r];
+    case RAY_U8: case RAY_BOOL: return ((const uint8_t*)d)[r];
+    default: return ray_read_sym(d, r, t, attrs);
+    }
+}
+
+/* The Chao1 estimate of a key's distinct values from a strided sample,
+ * capped at `cap` when that is positive.  -1 on OOM. */
+static int64_t agg_key_card_sampled(ray_t* key, int64_t nrows, int64_t cap_hint) {
+    int64_t sample = nrows < AGG_EST_SAMPLE ? nrows : AGG_EST_SAMPLE;
+    int64_t stride = nrows / sample;
+    uint64_t slots = 64;
+    while (slots < (uint64_t)sample * 2) slots <<= 1;
+    uint8_t* mem = ray_alloc_raw((size_t)slots * (sizeof(int64_t) + 1));
+    if (!mem) return -1;
+    int64_t* vals = (int64_t*)mem;
+    uint8_t* seen = mem + slots * sizeof(int64_t);
+    memset(seen, 0, (size_t)slots);
+    const uint64_t mask = slots - 1;
     const void* data = ray_data(key);
-    int64_t n = 0, sampled = 0;
-    int nb = nrows <= (int64_t)AGG_EST_BLOCKS * AGG_EST_BLOCK ? 1 : AGG_EST_BLOCKS;
-    for (int b = 0; b < nb; b++) {
-        int64_t lo = nb == 1 ? 0 : nrows / nb * b;
-        int64_t hi = nb == 1 ? nrows : lo + AGG_EST_BLOCK;
-        if (hi > nrows) hi = nrows;
-        for (int64_t r = lo; r < hi; r++) {
-            int64_t code = ray_read_sym(data, r, key->type, key->attrs);
-            uint64_t h = ((uint64_t)code * 0x9E3779B97F4A7C15ULL) >> 46;
-            for (;;) {
-                if (set[h] == -1) { set[h] = code; n++; break; }
-                if (set[h] == code) break;
-                h = (h + 1) & (AGG_EST_SET_CAP - 1);
+    int64_t d = 0, f1 = 0, f2 = 0, lo = INT64_MAX, hi = INT64_MIN;
+    for (int64_t i = 0; i < sample; i++) {
+        int64_t v = agg_est_read(data, key->type, key->attrs, i * stride);
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+        uint64_t h = ((uint64_t)v * 0x9E3779B97F4A7C15ULL) >> 20 & mask;
+        for (;; h = (h + 1) & mask) {
+            if (seen[h] == 0) { vals[h] = v; seen[h] = 1; d++; f1++; break; }
+            if (vals[h] == v) {
+                if (seen[h] == 1) { seen[h] = 2; f1--; f2++; }
+                else if (seen[h] == 2) { seen[h] = 3; f2--; }
+                break;
             }
         }
-        sampled += hi - lo;
     }
-    ray_free_raw(set);
-    *sampled_out = sampled;
-    return n;
+    ray_free_raw(mem);
+    int64_t est = d;
+    if (sample < nrows && f1 > 1) {
+        /* f1 <= 65,536: the product is far from overflowing */
+        int64_t add = f1 * (f1 - 1) / (2 * (f2 + 1));
+        est = add > INT64_MAX - est ? INT64_MAX : est + add;
+    }
+    if (key->type != RAY_SYM) {
+        /* the span of the sampled values bounds what the key can hold */
+        uint64_t span = (uint64_t)hi - (uint64_t)lo;
+        if (span < (uint64_t)INT64_MAX - 1 && (int64_t)span + 1 < est) est = (int64_t)span + 1;
+    } else if (cap_hint > 0 && cap_hint < est) {
+        est = cap_hint;
+    }
+    return est < 1 ? 1 : est;
 }
 
 int64_t agg_group_card_estimate(ray_t** key_cols, uint32_t n_keys, int64_t nrows) {
@@ -538,46 +579,19 @@ int64_t agg_group_card_estimate(ray_t** key_cols, uint32_t n_keys, int64_t nrows
     int64_t total = 1;
     for (uint32_t k = 0; k < n_keys; k++) {
         ray_t* kc = key_cols[k];
-        int64_t est;
+        int64_t cap = 0;
         switch (kc->type) {
         case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8:
-        case RAY_BOOL: case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: {
-            bool nullable = ray_vec_may_have_nulls(kc);
-            int64_t null = agg_key_null(kc->type);
-            int64_t mn = INT64_MAX, mx = INT64_MIN;
-            int nb = nrows <= (int64_t)AGG_EST_BLOCKS * AGG_EST_BLOCK ? 1 : AGG_EST_BLOCKS;
-            for (int b = 0; b < nb; b++) {
-                int64_t lo = nb == 1 ? 0 : nrows / nb * b;
-                int64_t hi = nb == 1 ? nrows : lo + AGG_EST_BLOCK;
-                if (hi > nrows) hi = nrows;
-                int64_t l, h;
-                agg_key_bounds(kc, lo, hi, nullable, null, &l, &h);
-                if (l < mn) mn = l;
-                if (h > mx) mx = h;
-            }
-            if (mx < mn) { est = 1; break; }            /* nulls only */
-            uint64_t span = (uint64_t)mx - (uint64_t)mn;
-            if (span >= (uint64_t)INT64_MAX - 2) return -1;
-            est = (int64_t)span + 1 + (nullable ? 1 : 0);
+        case RAY_BOOL: case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP:
             break;
-        }
-        case RAY_SYM: {
-            int64_t sampled = 0;
-            int64_t n = agg_sym_distinct_sampled(kc, nrows, &sampled);
-            if (n < 0) return -1;
-            est = n;
-            if (sampled < nrows && n * 4 >= sampled * 3) {
-                /* nearly every sampled row distinct: the vocabulary is far
-                 * larger than the sample — its domain bounds it */
-                int64_t dc = ray_sym_domain_count(ray_sym_vec_domain(kc));
-                if (dc > est) est = dc;
-            }
+        case RAY_SYM:
+            cap = ray_sym_domain_count(ray_sym_vec_domain(kc));
             break;
-        }
         default:
             return -1;
         }
-        if (est <= 0) est = 1;
+        int64_t est = agg_key_card_sampled(kc, nrows, cap);
+        if (est < 0) return -1;
         if (total > INT64_MAX / est) return -1;
         total *= est;
     }

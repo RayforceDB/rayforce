@@ -61,6 +61,18 @@
 (at (select {from: T where: (!= k1 'a) by: [k1 k2] n: (count (distinct id)) asc: [k1 k2]}) 'n) -- (at Ow 'n)
 (at (select {from: T by: {a: k1 b: k2} n: (count (distinct id)) asc: [a b]}) 'n) -- (at O 'n)
 (key (select {from: T by: {a: k1 b: k2} n: (count (distinct id))})) -- ['a 'b 'n]
+;; a by-dict names its keys on every route: the rewrite (v: 7 values beside
+;; 45 groups, a dense composite) emits the aliases as the scatter does — a
+;; planner choice may not change the result's names — with the count
+;; renamed beside them, under desc:/take:, and for one key under where:
+(key (select {from: T by: {a: k1 b: k2} n: (count (distinct v))})) -- ['a 'b 'n]
+(at (select {from: T by: {a: k1 b: k2} n: (count (distinct v)) asc: [a b]}) 'n) -- (at (select {from: T by: [k1 k2] n: (count (distinct v)) asc: [k1 k2]}) 'n)
+(key (select {from: T by: {a: k1 b: k2} n: (count (distinct v)) desc: n take: 3})) -- ['a 'b 'n]
+(key (select {from: T by: {g: k1} where: (!= k1 'a) n: (count (distinct v))})) -- ['g 'n]
+(at (select {from: T by: {g: k1} where: (!= k1 'a) n: (count (distinct v)) asc: g}) 'g) -- ['b 'c 'd 'e]
+;; an alias naming another input column is rejected the same way on every route
+(select {from: T by: {k2: k1} n: (count (distinct v))}) !- domain
+(select {from: T by: {k2: k1 k1: k2} n: (count (distinct v))}) !- domain
 (at (select {from: T by: [k1 k2] n: (count (distinct v)) asc: [k1 k2]}) 'n) -- (at (select {from: T by: [k1 k2] one: 1 n: (count (distinct v)) asc: [k1 k2]}) 'n)
 (at (select {from: T by: [k1 k2] n: (count (distinct id)) desc: n take: 3}) 'n) -- (at (select {from: O desc: n take: 3}) 'n)
 ;; an aggregate over an `if` under where: — the v2 engine takes it through
@@ -69,3 +81,16 @@
 (at (select {from: T where: (< v 3) by: k1 bad: (sum (if (== st 'bad) 1 0)) asc: k1}) 'bad) -- (at (select {from: (select {from: T where: (< v 3) k1: k1 b: (if (== st 'bad) 1 0)}) by: k1 bad: (sum b) asc: k1}) 'bad)
 ;; one key, the shape that always worked
 (at (select {from: T by: k1 n: (count (distinct id)) bad: (sum (if (== st 'bad) 1 0)) asc: k1}) 'bad) -- (at (select {from: T by: k1 bad: (sum (if (== st 'bad) 1 0)) asc: k1}) 'bad)
+
+;; 60 K groups under where: — the composite probe applies the selection, and
+;; past 50 K groups the distinct counts come from the global-hash kernel,
+;; which reads the probe's row→group map alone.  Every group has four rows,
+;; one in each quarter of the table; the filter keeps the first, so a probe
+;; ignoring it would count every group's two distinct ids instead of one.
+(set W (table [k1 k2 i id] (list (% (til 240000) 300) (div (% (til 240000) 60000) 300) (til 240000) (% (div (til 240000) 60000) 2))))
+(set Wr (select {from: W where: (< i 60000) by: [k1 k2] n: (count (distinct id)) c: (count i)}))
+(count Wr) -- 60000
+(sum (at Wr 'c)) -- 60000
+(sum (at Wr 'n)) -- 60000
+(sum (at (select {from: W where: (< i 120000) by: [k1 k2] n: (count (distinct id)) c: (count i)}) 'n)) -- 120000
+(sum (at (select {from: W by: [k1 k2] n: (count (distinct id)) c: (count i)}) 'n)) -- 120000

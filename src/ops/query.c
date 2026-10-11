@@ -6130,16 +6130,17 @@ static ray_t* query_materialize_parted_col(ray_t* col) {
  * a radix grouping that materializes and orders every (K, X) tuple — 1.8 GB
  * and 3x the time of the slice dedup at 10 M rows with 45 groups of 3 M
  * distinct values — unless the groups are so many that the scatter's own
- * machinery is the slower one, or so few that its per-group dedup leaves
- * most workers idle.  The group and value counts are sampled estimates
- * (agg_group_card_estimate), a fraction of a millisecond at any size. */
+ * machinery is the slower one.  Few groups do not favour the rewrite: at 2
+ * to 9 groups of 3 M to 6 M values on 28 workers the slice dedup took the
+ * same time or less and 40% of the memory, and the issue's 45 groups on 46
+ * workers would otherwise have taken the rewrite at 3x the time.  The group
+ * and value counts are sampled estimates (agg_group_card_estimate), a
+ * fraction of a millisecond at any size; a skewed or clustered key the
+ * sample cannot exhaust estimates high, towards the rewrite. */
 static bool cd_two_pass_preferred(ray_t** K_cols, int n_K, ray_t* X_col,
                                   int64_t nrows) {
     int64_t k_est = agg_group_card_estimate(K_cols, (uint32_t)n_K, nrows);
     if (k_est < 0 || k_est > nrows) return true;   /* K unbounded: many groups */
-    ray_pool_t* pool = ray_pool_get();
-    int64_t workers = pool ? (int64_t)ray_pool_total_workers(pool) : 1;
-    if (k_est <= workers) return true;    /* fewer groups than workers */
     if (k_est > CD_SCATTER_MAX_GROUPS) return true;
     int64_t x_est = agg_group_card_estimate(&X_col, 1, nrows);
     if (x_est < 1) return false;          /* X unbounded: (K, X) is radix */
@@ -6185,16 +6186,23 @@ static ray_t* try_count_distinct_v2_rewrite(
      * to the general per-group path, seven times slower than the dict form
      * of the same query. */
     int64_t K_syms[15];  /* leave room for X in the composite */
+    int64_t K_alias[15]; /* the output name of each key: the dict's name,
+                          * else the source column's (the other paths emit
+                          * the alias, so the rewrite must too — a planner
+                          * choice may not change the result's names) */
     int n_K = 0;
     if (by_expr && by_expr->type == -RAY_SYM &&
         !(by_expr->attrs & ATTR_QUOTED)) {
-        K_syms[n_K++] = by_expr->i64;
+        K_alias[n_K] = K_syms[n_K] = by_expr->i64; n_K++;
     } else if (by_expr && by_expr->type == RAY_SYM && ray_is_vec(by_expr) &&
                !(by_expr->attrs & ATTR_QUOTED)) {
         int64_t n = ray_len(by_expr);
         if (n == 0 || n > 15) return NULL;
-        for (int64_t i = 0; i < n; i++)
-            K_syms[n_K++] = ray_read_sym(ray_data(by_expr), i, by_expr->type, by_expr->attrs);
+        for (int64_t i = 0; i < n; i++) {
+            K_alias[n_K] = K_syms[n_K] =
+                ray_read_sym(ray_data(by_expr), i, by_expr->type, by_expr->attrs);
+            n_K++;
+        }
     } else if (by_expr && by_expr->type == RAY_DICT) {
         DICT_VIEW_DECL(byv);
         DICT_VIEW_OPEN(by_expr, byv);
@@ -6202,17 +6210,31 @@ static ray_t* try_count_distinct_v2_rewrite(
         int64_t pairs = byv_n / 2;
         if (pairs == 0 || pairs > 15) { DICT_VIEW_CLOSE(byv); return NULL; }
         for (int64_t i = 0; i < pairs; i++) {
+            ray_t* a = byv[i * 2];
             ray_t* v = byv[i * 2 + 1];
-            if (!v || v->type != -RAY_SYM || (v->attrs & ATTR_QUOTED)) {
+            if (!a || a->type != -RAY_SYM ||
+                !v || v->type != -RAY_SYM || (v->attrs & ATTR_QUOTED)) {
                 DICT_VIEW_CLOSE(byv);
                 return NULL;  /* non-column-ref value — out of scope */
             }
-            K_syms[n_K++] = v->i64;
+            /* an alias naming another input column is rejected by the
+             * by-dict materialization; let it report that */
+            if (a->i64 != v->i64 && ray_table_get_col(tbl, a->i64)) {
+                DICT_VIEW_CLOSE(byv);
+                return NULL;
+            }
+            K_syms[n_K] = v->i64; K_alias[n_K] = a->i64; n_K++;
         }
         DICT_VIEW_CLOSE(byv);
     } else {
         return NULL;
     }
+    /* An alias that repeats a name, or names the count output, would leave
+     * the result with two columns of one name; the other paths handle such
+     * a by: and keep it. */
+    for (int j = 0; j < n_K; j++)
+        for (int i = 0; i < j; i++)
+            if (K_alias[i] == K_alias[j] || K_syms[i] == K_syms[j]) return NULL;
 
     /* Walk the dict — accept exactly one `(count (distinct col_ref))`
      * agg and an optional identity key projection.  Any other agg /
@@ -6273,6 +6295,7 @@ static ray_t* try_count_distinct_v2_rewrite(
     }
     if (n_cd != 1 || n_other > 0) return NULL;
     if (cd_X_sym < 0 || cd_c_sym < 0) return NULL;
+    for (int j = 0; j < n_K; j++) if (K_alias[j] == cd_c_sym) return NULL;
 
     /* desc/asc must target the count output column. */
     if (desc_col_sym >= 0 && desc_col_sym != cd_c_sym) return NULL;
@@ -6482,7 +6505,9 @@ static ray_t* try_count_distinct_v2_rewrite(
      * alias.  The outer pass counts a key column, so ray_group names
      * the agg output "<K1>_count" — the result has the n_K key columns
      * plus this one count column.  The count column is the one whose
-     * name matches none of the K syms. */
+     * name matches none of the K syms.  A by-dict's key columns then
+     * take their aliases (`{a: k1 b: k2}` → a, b), as every other grouping
+     * path names them. */
     {
         int64_t nc = ray_table_ncols(result);
         for (int64_t ci = 0; ci < nc; ci++) {
@@ -6494,6 +6519,16 @@ static ray_t* try_count_distinct_v2_rewrite(
                 break;
             }
         }
+        int64_t key_ci[15];   /* positions first, then the renames: an
+                               * alias may repeat another key's source name */
+        for (int j = 0; j < n_K; j++) {
+            key_ci[j] = -1;
+            for (int64_t ci = 0; ci < nc; ci++)
+                if (ray_table_col_name(result, ci) == K_syms[j]) { key_ci[j] = ci; break; }
+        }
+        for (int j = 0; j < n_K; j++)
+            if (key_ci[j] >= 0 && K_alias[j] != K_syms[j])
+                ray_table_set_col_name(result, key_ci[j], K_alias[j]);
     }
     /* Apply the user's desc:/asc:/take: clauses on the dedup'd, counted
      * output.  The emit_filter trims to top-N during the outer pass but
@@ -6807,11 +6842,19 @@ static inline int64_t key_read_i64(const void* d, int64_t idx,
     case RAY_TIME:      return ((const int32_t*)d)[idx];
     case RAY_I64:
     case RAY_TIMESTAMP: return ((const int64_t*)d)[idx];
+    /* F32/F64: the bits, with -0.0 canonicalised to +0.0 the way the
+     * grouping reads its keys (group_key_f64_bits, #407).  The group result
+     * holds +0.0 for the merged zero group; a row carrying -0.0 read raw
+     * would miss it and be dropped from every per-group kernel (#760).
+     * Bit-level, as there: release builds use -fno-signed-zeros, under
+     * which a value compare against 0.0 folds to a no-op. */
     case RAY_F32: { uint32_t u;
         memcpy(&u, &((const float*)d)[idx], 4);
+        if (u == 0x80000000u) u = 0;
         return (int64_t)u; }
     case RAY_F64: { int64_t u;
         memcpy(&u, &((const double*)d)[idx], 8);
+        if (u == INT64_MIN) u = 0;
         return u; }
     /* SYM: raw index — callers compare cells of the source column
      * against cells of a group-key column DERIVED from it (same
@@ -14969,11 +15012,13 @@ by_dict_done:
                     case RAY_I16:  (dst) = ((const int16_t* )_d)[idx]; break;  \
                     case RAY_I32:  (dst) = ((const int32_t* )_d)[idx]; break;  \
                     case RAY_I64:  (dst) = ((const int64_t* )_d)[idx]; break;  \
-                    case RAY_F32: { uint32_t _u;                               \
-                        memcpy(&_u, &((const float*)_d)[idx], 4);              \
+                    case RAY_F32: { uint32_t _u;  /* -0.0 -> +0.0, as   */ \
+                        memcpy(&_u, &((const float*)_d)[idx], 4); /* key_read_i64 */ \
+                        if (_u == 0x80000000u) _u = 0;                         \
                         (dst) = (int64_t)_u; break; }                          \
                     case RAY_F64: { int64_t _u;                                \
                         memcpy(&_u, &((const double*)_d)[idx], 8);             \
+                        if (_u == INT64_MIN) _u = 0;                           \
                         (dst) = _u; break; }                                   \
                     case RAY_DATE: case RAY_TIME:                              \
                         (dst) = ((const int32_t*)_d)[idx]; break;              \
