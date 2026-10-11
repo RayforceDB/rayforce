@@ -29,10 +29,11 @@
 /* Partitioned table */
 ray_t*    ray_read_parted(const char* db_root, const char* table_name);
 
-/* Drop every partition table ray_read_parted keeps for reuse across mounts
- * (see "Partition reuse across mounts" in part.c).  Runtime shutdown calls
- * it before the heap and symbol table go away. */
+/* Release this thread's cached partitions.  GC prunes those whose columns
+ * have no external references; heap abandon/destroy and runtime shutdown
+ * clear everything before the owning heap or symbol table goes away. */
 void      ray_parted_cache_clear(void);
+void      ray_parted_cache_prune(void);
 
 /* Enumerate the table names under a parted db root — the splayed-table
  * subdirectories (those with a `.d` schema) of the first partition.

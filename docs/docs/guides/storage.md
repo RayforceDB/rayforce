@@ -139,7 +139,7 @@ ray_t* ray_read_parted(const char* db_root,
                        const char* table_name);
 ```
 
-From Rayfall, load a partitioned table with `(.db.parted.get "db" 'trades)`; list a root's tables with `(.db.parted.tables "db")`. Loading the same root again reuses the partitions whose files did not change and loads only the new or replaced ones, so following a growing database with repeated calls costs the new partitions, not the whole root.
+From Rayfall, load a partitioned table with `(.db.parted.get "db" 'trades)`; list a root's tables with `(.db.parted.tables "db")`. On the same thread, retaining the earlier view lets the next mount reuse unchanged partitions. The cache holds at most 1024 partition tables per thread. GC and the next mount release entries with no remaining column users; after dropping a view, `(.sys.gc)` releases its cached mappings and LIST payloads.
 
 Expected directory layout:
 

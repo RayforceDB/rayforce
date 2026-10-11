@@ -38,6 +38,7 @@
 #include "lang/eval.h"
 #include "store/hnsw.h"
 #include "store/csr.h"
+#include "store/part.h"
 #include "ops/idxop.h"
 #include <string.h>
 #include <stdlib.h>     /* getenv */
@@ -2305,6 +2306,7 @@ void ray_heap_abandon(void) {
      * it, or the next ray_eval_str on the adopting thread would release a
      * trace this thread already handed on. */
     ray_clear_error_trace();
+    ray_parted_cache_clear();
 
     /* Take back whatever was freed to us while we ran, so the heap is
      * handed on with its memory on its freelists rather than on a list the
@@ -2325,21 +2327,6 @@ void ray_heap_abandon(void) {
  * this heap — process shutdown after the worker pool is joined, or a
  * single-threaded test.  A thread that merely exits must call
  * ray_heap_abandon instead; see the comment on that function. */
-#define RAY_HEAP_TEARDOWN_MAX 4
-static ray_heap_teardown_fn g_heap_teardown[RAY_HEAP_TEARDOWN_MAX];
-
-bool ray_heap_on_teardown(ray_heap_teardown_fn fn) {
-    if (!fn) return false;
-    bool ok = false;
-    ray_registry_lock();
-    for (int i = 0; i < RAY_HEAP_TEARDOWN_MAX; i++) {
-        if (g_heap_teardown[i] == fn) { ok = true; break; }
-        if (!g_heap_teardown[i]) { g_heap_teardown[i] = fn; ok = true; break; }
-    }
-    ray_registry_unlock();
-    return ok;
-}
-
 void ray_heap_destroy(void) {
     ray_heap_t* h = ray_tl_heap;
     if (!h) return;
@@ -2349,15 +2336,7 @@ void ray_heap_destroy(void) {
      * memory is still mapped; once the for-loop below munmap's the
      * pools, dereferencing g_error_trace becomes UB. */
     ray_clear_error_trace();
-
-    /* Process-global holders of this heap's objects release them now, for
-     * the same reason (see ray_heap_on_teardown).  The table is read
-     * without the registry lock: functions are only ever added, and a
-     * callback may itself free blocks into this heap. */
-    for (int i = 0; i < RAY_HEAP_TEARDOWN_MAX; i++) {
-        ray_heap_teardown_fn fn = g_heap_teardown[i];
-        if (fn) fn(h->id);
-    }
+    ray_parted_cache_clear();
 
     /* FILE sym-domain string atoms used to live on the per-thread buddy
      * heap, requiring a drop here so the process-global cache never handed
@@ -2618,6 +2597,7 @@ static void heap_reclaim_oversized(ray_heap_t* h, void* ctx) {
 }
 
 void ray_heap_gc(void) {
+    ray_parted_cache_prune();
     ray_heap_t* h = ray_tl_heap;
     if (!h) return;
 #ifdef DEBUG

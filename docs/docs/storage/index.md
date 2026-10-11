@@ -194,7 +194,9 @@ ray_t* trades = ray_read_parted("db", "trades");
 !!! note "Rayfall builtin"
     Use `.db.parted.get` from Rayfall to load partitioned tables: `(.db.parted.get "db" 'trades)`. See the [Rayfall Storage Builtins](#rayfall-storage) section below.
 
-Mounting the same root again reuses every partition whose files are unchanged. The loader keeps each partition's table keyed by its path, together with the generation directory it was read from and the identity, size and modification time of its schema and column files. On the next call a partition that still matches is returned by reference, a changed one is loaded afresh, and one that is gone is dropped. A process that follows a database another process appends to therefore pays for the new partition only, instead of for every column file of every partition. The kept partitions are released when the runtime shuts down.
+Mounting the same root again on the same thread reuses unchanged partitions while the earlier view is held. Cache entries record the resolved generation directory and the device, inode, size, modification time and change time of the schema and every column file. A changed partition is loaded afresh; a disappeared partition is dropped. Symbol columns must match the root's current domain, so a missing `.sym` is still an error.
+
+The cache holds at most 1024 partition tables per thread. GC and the next mount discard entries whose columns have no external references; heap abandonment, heap teardown and runtime shutdown clear the thread's entries. To release a dropped view's mappings and copied LIST values immediately, call `(.sys.gc)`. C callers can also use `ray_parted_cache_clear()` from `store/part.h` to clear their thread's cache.
 
 !!! warning "`update` over a partitioned table materializes in memory"
     `update` on a partitioned table flattens the whole table into memory first — the parted/`MAPCOMMON` columns cannot be mutated in place — so the result is an ordinary in-memory table. It is **not** written back to the store: re-reading the root returns the original values, and the returned table loses its parted / memory-mapped identity.
