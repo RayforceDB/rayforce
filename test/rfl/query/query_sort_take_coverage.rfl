@@ -347,6 +347,13 @@
 (count (select {by: (reverse (do (do (do (set qn3 x))) (do (do qn3)))) from: Trk})) -- (count (select {by: (reverse x) from: Trk}))
 (set setalias set)
 (count (select {by: (reverse (do (setalias qn4 x) qn4)) from: Trk})) -- (count (select {by: (reverse x) from: Trk}))
+;; a binder reached through a lambda parameter, or placed in a built key as
+;; the builtin itself, binds too
+(set runb (fn [x] (select {by: (reverse (do (x qb s) qb)) from: Trk})))
+(count (runb set)) -- (count (select {by: s from: Trk}))
+(set syk (fn [n] (as 'SYMBOL n)))
+(set Kset (list (syk "reverse") (list (syk "do") (list set (syk "qo") (syk "x")) (syk "qo"))))
+(count (eval (list select (dict [from by] (list Trk Kset))))) -- 4
 ;; text concat is still planned, and groups the same
 (at (select {c: (count x) by: (concat s "z") from: Trk}) 'c) -- [3 2 1]
 ;; one value is one group, holding the first row
@@ -499,6 +506,10 @@
 (select {x: y r: r from: Pck desc: x}) -- (select {x: y r: r from: Mck desc: x})
 (select {x: y y: x from: Pck desc: y}) -- (select {x: y y: x from: Mck desc: y})
 (select {x: y z: x y: y from: Pck desc: y}) -- (select {x: y z: x y: y from: Mck desc: y})
+;; an output named after a lambda parameter reads the parameter, not the
+;; column it hides
+(set runs (fn [tbl x] (select {y: y x: x from: tbl desc: y})))
+(runs Pck 7) -- (runs Mck 7)
 ;; with take: too (the per-partition top-k sorted each partition on the
 ;; column and merged them on the output of that name)
 (select {x: y r: r from: Pck desc: x take: 3}) -- (select {x: y r: r from: Mck desc: x take: 3})
@@ -604,6 +615,16 @@
 (set paq parse)
 (select {by: {k: (evq (paq "__row"))} from: Prn}) -- (select {by: {k: (evq (paq "__row"))} from: Mrn})
 (count (select {by: {k: (evq (paq "__row"))} from: Prn})) -- 3
+;; the builtin itself placed in a built query is code as well
+(set Erow (list resolve (syk "rname")))
+(set Qrp (dict [from by] (list Prn (dict [k] (list Erow)))))
+(set Qrm (dict [from by] (list Mrn (dict [k] (list Erow)))))
+(eval (list select Qrp)) -- (eval (list select Qrm))
+(count (eval (list select Qrp))) -- 3
+;; a lambda parameter hides the column of its name: the helper passed in it
+;; reads a column (s) the clauses do not name
+(set runl (fn [tbl i] (select {by: {k: (i)} from: tbl})))
+(runl Prn (fn [] s)) -- (runl Mrn (fn [] s))
 (select {i: i from: Prn desc: i take: 2}) -- (select {i: i from: Mrn desc: i take: 2})
 (select {from: Prn asc: s}) -- (select {from: Mrn asc: s})
 (set __row 0)

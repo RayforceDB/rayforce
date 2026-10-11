@@ -10275,13 +10275,20 @@ static bool builtin_runs_code(const ray_t* b) {
     return builtin_named(b, code, sizeof code / sizeof code[0]);
 }
 
-/* Does name `s` name a column of `tbl` (a dotted name: its head)? */
+/* Does name `s` read a column of `tbl` (a dotted name: by its head)?  As
+ * the evaluator resolves it: a lexical local of that name (a parameter, a
+ * let) comes first and hides the column; the column comes before a
+ * global. */
 static bool sym_names_col(ray_t* tbl, int64_t s) {
     if (!tbl) return false;
-    if (ray_table_get_col(tbl, s)) return true;
-    if (!ray_sym_is_dotted(s)) return false;
-    const int64_t* segs;
-    return ray_sym_segs(s, &segs) >= 1 && ray_table_get_col(tbl, segs[0]);
+    int64_t head = s;
+    if (ray_sym_is_dotted(s)) {
+        const int64_t* segs;
+        if (ray_sym_segs(s, &segs) < 1) return false;
+        head = segs[0];
+    }
+    if (ray_env_get_lexical_local(head)) return false;
+    return ray_table_get_col(tbl, head) != NULL;
 }
 
 static bool clause_runs_code_in(ray_t* v, ray_t* tbl, bool containers);
@@ -10291,6 +10298,7 @@ static bool clause_runs_code_in(ray_t* v, ray_t* tbl, bool containers);
 static bool key_names_binder(ray_t* e, ray_t* tbl) {
     static const char* const binders[] = { "let", "set", "quote" };
     if (!e) return false;
+    if (builtin_named(e, binders, sizeof binders / sizeof binders[0])) return true;   /* an object in the AST */
     if (e->type == -RAY_SYM)
         return !sym_names_col(tbl, e->i64) &&
                builtin_named(sym_binding(e->i64), binders, sizeof binders / sizeof binders[0]);
@@ -10649,7 +10657,7 @@ static bool sym_binding_runs_code(ray_t* b, bool quoted, bool containers) {
  * that may hold lambdas?  A name of a column of `tbl` is the column. */
 static bool clause_runs_code_in(ray_t* v, ray_t* tbl, bool containers) {
     if (!v || RAY_IS_ERR(v)) return false;
-    if (v->type == RAY_LAMBDA) return true;
+    if (v->type == RAY_LAMBDA || builtin_runs_code(v)) return true;   /* an object in the AST */
     if (v->type == -RAY_SYM) {   /* a dotted path too: ray_env_get walks it */
         if (!(v->attrs & ATTR_QUOTED) && sym_names_col(tbl, v->i64)) return false;
         return sym_binding_runs_code(sym_binding(v->i64), (v->attrs & ATTR_QUOTED) != 0, containers);
@@ -10983,7 +10991,7 @@ static ray_t* select_parted_sorted(ray_t* dict, ray_t* tbl, bool aliases_resolve
         else if (kid == id_from) continue;
         else if (kid == id_take || kid == id_asc || kid == id_desc) n_clause++;
         else if (!v || v->type != -RAY_SYM || (v->attrs & ATTR_QUOTED) ||
-                 !ray_table_get_col(tbl, v->i64)) ok = false;   /* a bare column */
+                 !sym_names_col(tbl, v->i64)) ok = false;   /* a bare column, no local */
         else n_out++;
     }
     /* An output naming another output's alias reads that output, not the
