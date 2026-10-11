@@ -3995,6 +3995,7 @@ static test_result_t test_relieve_spill_last_pool(void) {
     PASS();
 }
 
+#if defined(__linux__)
 /* The files of the cgroup read since the last call: inotify events. */
 static int relieve_reads(int fd) {
     int n = 0;
@@ -4004,6 +4005,7 @@ static int relieve_reads(int fd) {
             n++;
     return n;
 }
+#endif
 
 /* A cgroup's memory.stat is read — which flushes its statistics — only
  * after spill pages are dropped, a parked pool's discarded or a pool
