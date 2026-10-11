@@ -6512,9 +6512,10 @@ static ray_t* parted_symbol_part(const char* value) {
     return tbl;
 }
 
-/* Recreating a root after drop + GC must not find a dictionary pinned by
- * an earlier mount. Cover both equal-size and differently sized symbols. */
-static test_result_t test_parted_rebuilt_symbols(void) {
+/* Recreating a root after dropping its view must not find a dictionary
+ * pinned only by the cache, with or without explicit GC before the write.
+ * Cover both equal-size and differently sized symbols. */
+static test_result_t parted_rebuilt_symbols(bool collect) {
     const char* values[] = { "aa", "xx", "longer" };
     for (int i = 0; i < 3; i++) {
         (void)ray_test_rm_rf(TMP_PARTED_ROOT);
@@ -6530,15 +6531,23 @@ static test_result_t test_parted_rebuilt_symbols(void) {
         TEST_ASSERT_EQ_U(ray_str_len(value), strlen(values[i]));
         TEST_ASSERT_TRUE(memcmp(ray_str_ptr(value), values[i], strlen(values[i])) == 0);
         ray_release(view);
-        ray_heap_gc();
+        if (collect) ray_heap_gc();
     }
     (void)ray_test_rm_rf(TMP_PARTED_ROOT);
     PASS();
 }
 
+static test_result_t test_parted_rebuilt_symbols(void) {
+    return parted_rebuilt_symbols(true);
+}
+
+static test_result_t test_parted_rebuilt_write_without_gc(void) {
+    return parted_rebuilt_symbols(false);
+}
+
 /* A filesystem publisher can replace the root without a GC call in the
- * reader. The next mount must drop unused cached domains before opening it. */
-static test_result_t test_parted_rebuilt_without_gc(void) {
+ * reader. Both parted and splayed reads must discard unused cached domains. */
+static test_result_t parted_rebuilt_read_without_gc(bool parted) {
     (void)ray_test_rm_rf(TMP_PARTED_ROOT);
     (void)ray_test_rm_rf(TMP_PARTED_ROOT "_next");
     ray_t* a = parted_symbol_part("aa");
@@ -6552,9 +6561,11 @@ static test_result_t test_parted_rebuilt_without_gc(void) {
     ray_release(old);
     (void)ray_test_rm_rf(TMP_PARTED_ROOT);
     TEST_ASSERT_EQ_I(rename(TMP_PARTED_ROOT "_next", TMP_PARTED_ROOT), 0);
-    ray_t* fresh = ray_read_parted(TMP_PARTED_ROOT, "t");
+    ray_t* fresh = parted ? ray_read_parted(TMP_PARTED_ROOT, "t")
+                          : ray_read_splayed(TMP_PARTED_ROOT "/1/t", TMP_PARTED_ROOT "/.sym");
     TEST_ASSERT_TRUE(fresh && !RAY_IS_ERR(fresh));
-    ray_t* seg = ((ray_t**)ray_data(ray_table_get_col_idx(fresh, 1)))[0];
+    ray_t* seg = ray_table_get_col_idx(fresh, parted ? 1 : 0);
+    if (parted) seg = ((ray_t**)ray_data(seg))[0];
     int64_t pos = ray_read_sym(ray_data(seg), 0, seg->type, seg->attrs);
     ray_t* value = ray_sym_domain_str(ray_sym_vec_domain(seg), pos);
     TEST_ASSERT_EQ_U(ray_str_len(value), 2);
@@ -6563,6 +6574,14 @@ static test_result_t test_parted_rebuilt_without_gc(void) {
     ray_heap_gc();
     (void)ray_test_rm_rf(TMP_PARTED_ROOT);
     PASS();
+}
+
+static test_result_t test_parted_rebuilt_without_gc(void) {
+    return parted_rebuilt_read_without_gc(true);
+}
+
+static test_result_t test_parted_rebuilt_splayed_without_gc(void) {
+    return parted_rebuilt_read_without_gc(false);
 }
 
 static test_result_t test_parted_missing_symfile(void) {
@@ -7633,6 +7652,8 @@ const test_entry_t store_entries[] = {
     { "store/stream_str_hash_persisted", test_stream_str_hash_persisted, store_setup, store_teardown },
     { "store/parted_cache_limit", test_parted_cache_limit, store_setup, store_teardown },
     { "store/parted_cache_gc", test_parted_cache_gc, store_setup, store_teardown },
+    { "store/parted_rebuilt_write_without_gc", test_parted_rebuilt_write_without_gc, store_setup, store_teardown },
+    { "store/parted_rebuilt_splayed_without_gc", test_parted_rebuilt_splayed_without_gc, store_setup, store_teardown },
     { "store/parted_rebuilt_without_gc", test_parted_rebuilt_without_gc, store_setup, store_teardown },
     { "store/parted_rebuilt_symbols", test_parted_rebuilt_symbols, store_setup, store_teardown },
     { "store/parted_missing_symfile", test_parted_missing_symfile, store_setup, store_teardown },

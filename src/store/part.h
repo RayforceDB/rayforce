@@ -29,8 +29,8 @@
 /* Partitioned table */
 ray_t*    ray_read_parted(const char* db_root, const char* table_name);
 
-/* Release this thread's cached partitions.  GC prunes those whose columns
- * have no external references; heap abandon/destroy and runtime shutdown
+/* Release this thread's cached partitions.  GC and symbol-domain opens
+ * prune those whose columns have no external references; heap abandon/destroy and runtime shutdown
  * clear everything before the owning heap or symbol table goes away. */
 void      ray_parted_cache_clear(void);
 void      ray_parted_cache_prune(void);

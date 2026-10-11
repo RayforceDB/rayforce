@@ -58,7 +58,7 @@ Signature: `(.db.parted.get "db_root" 'tbl_name)`. The table name **must** be a 
 
 Calling it again on the same thread reuses unchanged partitions while the earlier view is still held. The loader checks the resolved generation directory and each schema/column file's device, inode, size, modification time and change time. New or changed partitions are loaded afresh; disappeared partitions are dropped. An earlier view keeps its rows when a writer publishes a replacement generation.
 
-Each thread caches at most 1024 partition tables, evicting the least recently mounted entries first. GC (including `(.sys.gc)`) and the next mount release cached tables whose columns have no remaining users. Dropping a view and running GC therefore releases its mappings and copied LIST payloads, even if the database directory was deleted. Thread heap teardown and runtime shutdown clear the cache.
+Each thread caches at most 1024 partition tables, evicting the least recently mounted entries first. GC (including `(.sys.gc)`), symbol-domain opens and the next mount release cached tables whose columns have no remaining users. Dropping a view and running GC therefore releases its mappings and copied LIST payloads, even if the database directory was deleted. Thread heap teardown and runtime shutdown clear the cache.
 
 Returns a single logical table assembled from every partition directory under `db_root/tbl_name/`. The result carries a virtual `MAPCOMMON` partition column derived from directory names, and every data column is a `RAY_PARTED_*` view over the segment files. Partition pruning kicks in automatically for `select` predicates on the virtual column.
 
