@@ -677,7 +677,10 @@ static bool heap_add_pool(ray_heap_t* h, uint8_t order) {
                  h->swap_path, (int)getpid(), (unsigned)h->id,
                  (unsigned long long)cnt);
 
-        swap_fd = open(swap_path, O_RDWR | O_CREAT | O_EXCL, 0600);
+        /* Close-on-exec, as every spill file: a child of .sys.exec would
+         * otherwise hold the unlinked file — its pages, dirty ones written
+         * back — for as long as it runs, past the pool's unmapping. */
+        swap_fd = open(swap_path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
         if (swap_fd < 0) {
             ray_sys_free(swap_path);
             swap_path = NULL;
@@ -1307,7 +1310,7 @@ static void* heap_direct_map_file(ray_heap_t* h, size_t map_size,
     snprintf(path, need, "%sraydirect_%d_%u_%llu.dat", h->swap_path,
              (int)getpid(), (unsigned)h->id, (unsigned long long)cnt);
 
-    int fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
+    int fd = open(path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     if (fd < 0) { ray_sys_free(path); return NULL; }
 
     /* Reserve real disk blocks up front so later stores can't SIGBUS on a
@@ -2209,7 +2212,7 @@ static void* heap_sys_map_file(size_t size) {
     snprintf(path + plen, sizeof(path) - plen, "raysys_%d_%llu.dat", (int)getpid(),
              (unsigned long long)atomic_fetch_add_explicit(&sys_swap_counter, 1,
                                                            memory_order_relaxed));
-    int fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
+    int fd = open(path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     if (fd < 0) return NULL;
     void* p = NULL;
     if (heap_preallocate(fd, 0, (off_t)size) == 0) {

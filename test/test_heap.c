@@ -3164,6 +3164,50 @@ static test_result_t test_relieve_spill_pools(void) {
 }
 
 
+/* The open spill files of this process, or of a child it starts (popen, as
+ * .sys.exec): `who` is "$PPID" — popen's shell is our child — or "self". */
+static int relieve_spill_fds(const char* who) {
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd),
+             "ls -l /proc/%s/fd 2>/dev/null | grep -cE 'rayheap_|raydirect_'", who);
+    FILE* f = popen(cmd, "r");
+    if (!f) return -1;
+    int n = -1;
+    if (fscanf(f, "%d", &n) != 1) n = -1;
+    pclose(f);
+    return n;
+}
+
+/* Every spill file is close-on-exec: a child the process starts (.sys.exec)
+ * holds none of the files of its spill pools or spilled large blocks, which
+ * would keep them — and their dirty pages, written back — past their
+ * unmapping, for as long as the child runs. */
+static test_result_t test_relieve_spill_cloexec(void) {
+#if !defined(__linux__)
+    SKIP("/proc/<pid>/fd is Linux-only");
+#else
+    relieve_env_t e;
+    relieve_env_begin(&e);
+    ray_heap_t* h = relieve_heap_new(&e);
+    if (!h) { relieve_env_end(&e, NULL, NULL); SKIP("no fresh heap"); }
+    ray_t* a = ray_alloc(RELIEVE_HALF);
+    ray_heap_set_anon_watermark(ray_heap_anon_committed());
+    ray_t* s = ray_alloc(RELIEVE_HALF);            /* a spill pool */
+    ray_t* d = ray_alloc((size_t)48 << 20);         /* a spilled large block */
+    bool spilled = s && relieve_pool_is_backed(h, s) && d && ray_direct_file_backed(d);
+    int ours = relieve_spill_fds("$PPID");
+    int child = relieve_spill_fds("self");
+    if (d) ray_free(d);
+    if (s) ray_free(s);
+    if (a) ray_free(a);
+    relieve_env_end(&e, h, NULL);
+    if (!spilled) SKIP("no spill file");
+    if (ours < 0 || child < 0) SKIP("no shell to look with");
+    TEST_ASSERT(ours >= 2, "the pool's and the block's files are open here");
+    TEST_ASSERT_EQ_I(child, 0);
+    PASS();
+#endif
+}
 
 /* An idle process gives back pages through the decay — but a spill pool's
  * pages are page cache that releasing does not free, so the decay unmaps
@@ -4921,6 +4965,7 @@ const test_entry_t heap_entries[] = {
     { "heap/relieve_many_pools",       test_relieve_many_pools,          heap_setup, heap_teardown },
     { "heap/relieve_inflight_free",    test_relieve_inflight_free,       heap_setup, heap_teardown },
     { "heap/relieve_spill_pools",      test_relieve_spill_pools,         heap_setup, heap_teardown },
+    { "heap/relieve_spill_cloexec",    test_relieve_spill_cloexec,       heap_setup, heap_teardown },
     { "heap/relieve_spill_age",        test_relieve_spill_age,           heap_setup, heap_teardown },
     { "heap/relieve_far_visit",        test_relieve_far_visit,           heap_setup, heap_teardown },
     { "heap/relieve_spill_not_room",   test_relieve_spill_not_room,      heap_setup, heap_teardown },
