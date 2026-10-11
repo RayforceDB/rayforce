@@ -1356,6 +1356,11 @@ static test_result_t test_group_lent_scratch(void) {
     SR_SAME("(select {s: (sum u) from: T by: g})", UINT64_MAX);
     TEST_ASSERT_FMT(ray_col_test_fixed_allocs() == a0, "%llu fixed vectors from the heap",
                     (unsigned long long)(ray_col_test_fixed_allocs() - a0));
+    /* Fix round 1: six encoded sources in one set (a key, five inputs):
+     * the first two are lent, the rest take their vectors from the heap,
+     * and no cursor is lent past the set's vectors (ASan). */
+    SR_SAME("(select {a: (sum u) b: (sum v) c: (max f) d: (min k) e: (sum h) from: T by: g})", UINT64_MAX);
+    TEST_ASSERT_FMT(ray_col_test_fixed_allocs() > a0, "six encoded sources, no fixed vector from the heap");
     PASS();
 }
 
@@ -5216,20 +5221,31 @@ static test_result_t test_v2_radix_record_order(void) {
  * passes). */
 static test_result_t test_v2_radix_compact_staging(void) {
     sr_eval_ok("(set jc (til 300000))");
-    sr_eval_ok("(set RC (table [s k m g v f] (list (as 'SYMBOL (map (fn [j] (format \"w%\" (% j 70))) jc)) "
-               "(* (% (* jc 7919) 600011) 1000003) (% jc 5) (as 'I16 (- (% jc 9) 4)) jc (/ (as 'F64 jc) 9.0))))");
+    sr_eval_ok("(set RC (table [s k m g v f w x y z] (list (as 'SYMBOL (map (fn [j] (format \"w%\" (% j 70))) jc)) "
+               "(* (% (* jc 7919) 600011) 1000003) (% jc 5) (as 'I16 (- (% jc 9) 4)) jc (/ (as 'F64 jc) 9.0) "
+               "(* (% jc 40000) 1000003) (/ (as 'F64 (% (* jc 31) 1009)) 7.0) "
+               "(as 'I32 (- (% (* jc 13) 2003) 1000)) (as 'I16 (- (% (* jc 17) 401) 200)))))");
     for (int gen = 0; gen <= 2; gen += 2) {
         sr_evalf_ok("(.db.splayed.set \"" SR_TMP "/rc%d/\" RC {compress: %s})", gen, gen ? "true" : "false");
         for (int p = 0; p < 3; p++)
             sr_evalf_ok("(.db.splayed.set \"" SR_TMP "/rcp%d/2024.01.0%d/t/\" (take (drop RC %d) 100000) {compress: %s})",
                         gen, p + 1, p * 100000, gen ? "true" : "false");
     }
-    static const struct { const char* q; uint8_t p1; bool parted_route; bool pub; } qs[] = {
-        { "(select {c: (count v) a: (sum f) x: (sum (* v 3)) from: T by: {k: k j: (+ m 1)}})", AGG_RADIX_P1_FUSED_COMPACT, false, false },
-        { "(select {x: (sum (* v 3)) y: (sum (* f 2.0)) mx: (max v) from: T by: {s: s k: k}})", AGG_RADIX_P1_FUSED_COMPACT, false, false },
-        { "(select {c: (count v) a: (sum f) mx: (max v) from: T by: {s: s k: k}})", AGG_RADIX_P1_FUSED_COMPACT, true, false },
-        { "(select {c: (count v) a: (sum f) y: (sum g) from: T by: {g: g k: k s: s}})", AGG_RADIX_P1_FUSED_COMPACT, false, true },
-        { "(select {c: (count v) a: (sum f) from: T where: (> v 1000) by: {s: s k: k}})", AGG_RADIX_P1_FUSED_RECORDS, false, false },
+    static const struct { const char* q; uint8_t p1; bool parted_route; bool pub; bool splayed_only; } qs[] = {
+        { "(select {c: (count v) a: (sum f) x: (sum (* v 3)) from: T by: {k: k j: (+ m 1)}})", AGG_RADIX_P1_FUSED_COMPACT, false, false, false },
+        { "(select {x: (sum (* v 3)) y: (sum (* f 2.0)) mx: (max v) from: T by: {s: s k: k}})", AGG_RADIX_P1_FUSED_COMPACT, false, false, false },
+        { "(select {c: (count v) a: (sum f) mx: (max v) from: T by: {s: s k: k}})", AGG_RADIX_P1_FUSED_COMPACT, true, false, false },
+        { "(select {c: (count v) a: (sum f) y: (sum g) from: T by: {g: g k: k s: s}})", AGG_RADIX_P1_FUSED_COMPACT, false, true, false },
+        { "(select {c: (count v) a: (sum f) from: T where: (> v 1000) by: {s: s k: k}})", AGG_RADIX_P1_FUSED_RECORDS, false, false, false },
+        /* Fix round 1: two-input aggregates first, in the middle and last,
+         * beside inputs of other widths (F64 x, I32 y, I16 z): each input
+         * staged at its own field (the record's order).  Splayed only: a
+         * parted table's two-input aggregates are wrong on generation 0
+         * itself (and on the base), a separate defect. */
+        { "(select {c: (pearson_corr x y) s: (sum z) mx: (max z) from: T by: w})", AGG_RADIX_P1_FUSED_COMPACT, false, false, true },
+        { "(select {s: (sum z) c: (wsum y x) mx: (max y) from: T by: w})", AGG_RADIX_P1_FUSED_COMPACT, false, false, true },
+        { "(select {s: (sum z) a: (sum y) c: (cov z y) from: T by: w})", AGG_RADIX_P1_FUSED_COMPACT, false, false, true },
+        { "(select {a: (wavg z x) b: (scov y z) c: (sum x) d: (pearson_corr x z) from: T by: {w: w s: s}})", AGG_RADIX_P1_FUSED_COMPACT, false, false, true },
     };
     static const char* const t0[] = { "(.db.splayed.get \"" SR_TMP "/rc0/\")", "(.db.parted.get \"" SR_TMP "/rcp0\" 't)" };
     static const char* const t2[] = { "(.db.splayed.get \"" SR_TMP "/rc2/\")", "(.db.parted.get \"" SR_TMP "/rcp2\" 't)" };
@@ -5239,7 +5255,7 @@ static test_result_t test_v2_radix_compact_staging(void) {
     for (int w = 0; w < 2; w++) {
         ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(workers[w]), RAY_OK);
         for (size_t i = 0; i < sizeof qs / sizeof qs[0]; i++)
-            for (int l = 0; l < (qs[i].pub ? 1 : 2); l++) {
+            for (int l = 0; l < (qs[i].pub || qs[i].splayed_only ? 1 : 2); l++) {
                 char* b[2] = { NULL, NULL };
                 size_t n[2] = { 0, 0 };
                 agg_route_stats_t st = { 0 };
@@ -5435,6 +5451,52 @@ static test_result_t test_idx_info_report(void) {
     TEST_ASSERT_TRUE(ii_err("(.idx.info [1 2 3] 'k)", "type", "table"));
     TEST_ASSERT_TRUE(ii_err("(.idx.info T \"k\")", "type", "symbol"));
     TEST_ASSERT_TRUE(ii_err("(.idx.info T 'nope)", "domain", "no such column"));
+    PASS();
+}
+
+/* Fix round 1: ray_col_range_into over a guarded source declines, so a
+ * stats-guarded consumer reads by range, which checks each vector.  The
+ * forged parted table of v2_forged_parted_segment (partition 2's chunk 0
+ * maximum lowered to 999; its rows start at 70000): unguarded, that
+ * segment's first vector is delivered straight (the control); guarded,
+ * nothing is delivered and the range read of the same rows is `corrupt`
+ * naming the segment's file, twice. */
+static test_result_t test_v2_range_into_guarded(void) {
+    sr_forged_parted(SR_TMP "/fg", 2);
+    char dir[512], path[600];
+    if (ray_splay_resolve_dir(ray_test_tmp(SR_TMP "/fg/2024.01.02/t/"), dir, sizeof dir) != RAY_OK) FAIL("resolve");
+    size_t dl = strlen(dir);
+    snprintf(path, sizeof path, "%s%sk", dir, (dl && dir[dl - 1] == '/') ? "" : "/");
+    if (!sr_forge_max(path, 0, 999)) FAIL("forge");
+    ray_t* t = sr_eval("(.db.parted.get \"" SR_TMP "/fg\" 't)");
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    int64_t* dst = malloc(1024 * sizeof(int64_t));
+    for (int guard = 0; guard < 2; guard++)
+        for (int rep = 0; rep < (guard ? 2 : 1); rep++) {
+            ray_col_src_t src;
+            ray_t* err = ray_col_src_bind(ray_table_slot(t, ray_sym_intern("k", 1)), &src);
+            TEST_ASSERT_TRUE(err == NULL);
+            src.stats_guard = guard;
+            ray_col_scratch_t sc;
+            ray_col_scratch_init(&sc);
+            int64_t got = -1;
+            err = ray_col_range_into(&src, 70000, 1024, &sc, 0, dst, &got);
+            bool into_ok = err == NULL && got == (guard ? 0 : 1024);
+            if (err) ray_error_free(err);
+            ray_error_clear();
+            ray_col_range_t v;
+            ray_t* rerr = guard ? ray_col_range(&src, 70000, 1024, &sc, &v) : NULL;
+            bool corrupt = !guard || (rerr && RAY_IS_ERR(rerr) && strcmp(ray_err_code(rerr), "corrupt") == 0 &&
+                                      ray_error_msg() && strstr(ray_error_msg(), path));
+            if (rerr) ray_error_free(rerr);
+            ray_col_scratch_free(&sc);
+            ray_col_src_release(&src);
+            if (!into_ok || !corrupt) { free(dst); sr_drop(t); }
+            TEST_ASSERT_FMT(into_ok, "guard %d: delivered %lld, want %d", guard, (long long)got, guard ? 0 : 1024);
+            TEST_ASSERT_FMT(corrupt, "guarded range read (read %d): not corrupt naming %s", rep + 1, path);
+        }
+    free(dst);
+    sr_drop(t);
     PASS();
 }
 
@@ -6588,6 +6650,7 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/v2_radix_record_order", test_v2_radix_record_order, sr_rt_setup, srr_pool_teardown },
     { "scanrange/v2_radix_compact_staging", test_v2_radix_compact_staging, sr_rt_setup, srr_pool_teardown },
     { "scanrange/v2_forged_parted_segment", test_v2_forged_parted_segment, sr_rt_setup, srr_teardown },
+    { "scanrange/v2_range_into_guarded", test_v2_range_into_guarded, sr_rt_setup, srr_teardown },
     { "scanrange/idx_info_table",     test_idx_info_table,     srr_setup, srr_teardown },
     { "scanrange/idx_info_report",    test_idx_info_report,    srr_setup, srr_teardown },
     { "scanrange/no_materialization", test_no_materialization, srr_setup, srr_teardown },

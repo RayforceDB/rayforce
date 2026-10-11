@@ -385,7 +385,7 @@ static bool agg_walk(const agg_rr_t* rr, void* ctx, agg_body_fn body,
  * eight lent vectors (128 KB) measured q8's generation-0 first run 3%
  * slower.  Declared without an initializer (the fixed vectors are not to
  * be zeroed): set cur = NULL before any path that may free it. */
-enum { AGG_CURS_STACK = 8, AGG_CURS_LENT = 4 };
+enum { AGG_CURS_STACK = 8, AGG_CURS_LENT = 2 };
 typedef struct {
     ray_col_cursor_t  st[AGG_CURS_STACK];
     ray_col_fixed_t   fx[AGG_CURS_LENT];
@@ -4329,6 +4329,8 @@ typedef struct {
     const char* plain;      /* plain fields: the column's row 0 */
     uint32_t    off;        /* the field's offset in the record */
     uint32_t    soff;       /* staged fields: the offset in the staged row */
+    uint32_t    agg;        /* inputs: the aggregate whose input this is */
+    uint8_t     y;          /* inputs: 1 for the y side of a binary aggregate */
     uint8_t     w;          /* bytes in the record (keys: 8) */
     uint8_t     esz;        /* plain fields: the column's element width */
     uint8_t     kind;       /* AGG_CF_* */
@@ -4401,9 +4403,10 @@ typedef struct {
     /* Compact staging (fused, not sel mode): a task stages only the staged
      * sources' fields (srec bytes a row: keys widened, inputs at their
      * widths) and the scatter builds each record from them, the plain
-     * columns read in place and the position.  cf[f] is field f: the
-     * keys (cf[k] is key k's), then the inputs present (n_cf in all).  Not
-     * compact: a task stages whole records. */
+     * columns read in place and the position.  cf[f] is field f in the
+     * record's order: the keys (cf[k] is key k's), then the inputs present,
+     * each aggregate's x then its y (n_cf in all).  Not compact: a task
+     * stages whole records. */
     bool                compact;
     size_t              srec;
     uint32_t            n_cf;
@@ -4771,24 +4774,19 @@ static void agg_radix_stage_block_c(agg_radix_stage_t* t, const agg_view_t* v, i
         spid[i] = (uint16_t)p;
         cur[p]++;
     }
-    /* the staged inputs, in field order after the keys */
-    uint32_t fi = c->n_keys;
-    for (uint32_t a = 0; a < c->n_aggs; a++) {
-        for (int y = 0; y < 2; y++) {
-            const void* vd = y ? v->val2_data[a] : v->val_data[a];
-            const void* id = y ? c->val2_data[a] : c->val_data[a];
-            if (!id) continue;
-            const agg_radix_cf_t* f = &c->cf[fi++];
-            if (f->kind != AGG_CF_STAGED) continue;
-            const char* sp = (const char*)vd + (size_t)i0 * f->w;
-            char* dp = out + f->soff;
-            switch (f->w) {
-                case 1: for (int64_t i = 0; i < n; i++) memcpy(dp + (size_t)i * srec, sp + i, 1); break;
-                case 2: for (int64_t i = 0; i < n; i++) memcpy(dp + (size_t)i * srec, sp + 2 * i, 2); break;
-                case 4: for (int64_t i = 0; i < n; i++) memcpy(dp + (size_t)i * srec, sp + 4 * i, 4); break;
-                case 8: for (int64_t i = 0; i < n; i++) memcpy(dp + (size_t)i * srec, sp + 8 * i, 8); break;
-                default: for (int64_t i = 0; i < n; i++) memcpy(dp + (size_t)i * srec, sp + (size_t)i * f->w, f->w);
-            }
+    /* the staged inputs: each field names its aggregate and side */
+    for (uint32_t fi = c->n_keys; fi < c->n_cf; fi++) {
+        const agg_radix_cf_t* f = &c->cf[fi];
+        if (f->kind != AGG_CF_STAGED) continue;
+        const void* vd = f->y ? v->val2_data[f->agg] : v->val_data[f->agg];
+        const char* sp = (const char*)vd + (size_t)i0 * f->w;
+        char* dp = out + f->soff;
+        switch (f->w) {
+            case 1: for (int64_t i = 0; i < n; i++) memcpy(dp + (size_t)i * srec, sp + i, 1); break;
+            case 2: for (int64_t i = 0; i < n; i++) memcpy(dp + (size_t)i * srec, sp + 2 * i, 2); break;
+            case 4: for (int64_t i = 0; i < n; i++) memcpy(dp + (size_t)i * srec, sp + 4 * i, 4); break;
+            case 8: for (int64_t i = 0; i < n; i++) memcpy(dp + (size_t)i * srec, sp + 8 * i, 8); break;
+            default: for (int64_t i = 0; i < n; i++) memcpy(dp + (size_t)i * srec, sp + (size_t)i * f->w, f->w);
         }
     }
 }
@@ -6283,18 +6281,24 @@ static ray_t* exec_group_v2_parallel_radix(
     size_t rec = (rec_cur + 7u) & ~(size_t)7u;   /* 8-align records */
     /* The compact staging of a fused pass (not sel mode: the scatter reads
      * the plain columns at the chunk's own rows): the record's fields in
-     * order, a staged source's in the staged row, a plain one read in
-     * place. */
+     * the record's order (the keys, then each aggregate's x and y, as
+     * val_off / val2_off lay them out), a staged source's in the staged
+     * row, a plain one read in place.  Field j walks source i: the keys
+     * are sources 0 .. n_keys, aggregate a's x n_keys + a, its y
+     * n_keys + n_aggs + a. */
     bool compact = d.staged && !sel;
     size_t srec = 0;
     uint32_t n_cf = 0;
-    for (uint32_t i = 0; compact && i < d.rr.n_src; i++) {
-        bool key = i < n_keys;
-        bool y = !key && i >= n_keys + n_aggs;
-        uint32_t a = key ? 0 : y ? i - n_keys - n_aggs : i - n_keys;
+    for (uint32_t j = 0; compact && j < n_keys + 2u * n_aggs; j++) {
+        bool key = j < n_keys;
+        uint32_t a = key ? 0 : (j - n_keys) / 2;
+        bool y = !key && ((j - n_keys) & 1);
+        uint32_t i = key ? j : y ? n_keys + n_aggs + a : n_keys + a;
         if (!key && !(y ? val2_data[a] : val_data[a])) continue;     /* no input (COUNT) */
         agg_radix_cf_t* f = &cf[n_cf++];
         memset(f, 0, sizeof *f);
+        f->agg = a;
+        f->y = y;
         f->off = (uint32_t)(key ? (size_t)i * 8 : y ? val2_off[a] : val_off[a]);
         f->w = key ? 8 : y ? val2_esz[a] : val_esz[a];
         if (d.rr.srcs[i]) {

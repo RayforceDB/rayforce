@@ -139,9 +139,9 @@ ray_t* ray_col_range_wide(ray_col_src_t* src, int64_t start, int64_t n, ray_col_
  * when it ends inside [start, start + n) and is not STR or GUID (SYM: of
  * the width in `attrs`): *got = its rows (a RAW vector: with the RAW
  * vectors after it inside the range, copied at once).  Else *got = 0 and nothing is
- * read: read the rows with ray_col_range or a cursor.  The consumer guard
- * checks it as a range read's vector.  dst may hold a partial vector on
- * an error.  NULL or an owned error. */
+ * read: read the rows with ray_col_range or a cursor.  A guarded source
+ * (stats_guard) always declines: its range reads check each vector.  dst
+ * may hold a partial vector on an error.  NULL or an owned error. */
 ray_t* ray_col_range_into(ray_col_src_t* src, int64_t start, int64_t n, ray_col_scratch_t* sc,
                           uint8_t attrs, void* dst, int64_t* got);
 /* Test hook: ray_col_range_into's deliveries and the rows they held

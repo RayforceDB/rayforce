@@ -389,6 +389,7 @@ ray_t* ray_col_range_into(ray_col_src_t* src, int64_t start, int64_t n, ray_col_
                           uint8_t attrs, void* dst, int64_t* got) {
     *got = 0;
     if (!src || start < 0 || n <= 0 || start >= src->len) return NULL;
+    if (src->stats_guard) return NULL;             /* guarded: the range read checks each vector */
     ray_enccol_t* e;
     int64_t local;
     ray_t* err;
@@ -407,9 +408,6 @@ ray_t* ray_col_range_into(ray_col_src_t* src, int64_t start, int64_t n, ray_col_
     if (!pv) {
         uint64_t nb = 0;
         if ((err = ray_enccol_decode_into(e, c, j, &descs[j], dst, NULL, 0, 0, &nb)) != NULL) return err;
-        /* the consumer guard, as over a range read's vector */
-        if (src->stats_guard && (err = ray_enccol_check_dir(e, c, j, dst, (int)vlen, descs[j].n_nulls > 0)) != NULL)
-            return err;
         scratch_count(sc, e, nb);
         *got = vlen;
         atomic_fetch_add_explicit(&g_into_calls, 1, memory_order_relaxed);
@@ -433,12 +431,6 @@ ray_t* ray_col_range_into(ray_col_src_t* src, int64_t start, int64_t n, ray_col_
         rows += l2;
     }
     memcpy(dst, pv, (size_t)rows * esz);
-    for (int64_t r = 0; src->stats_guard && r < rows; r += RAY_ENC_VEC) {   /* the consumer guard, vector by vector */
-        int64_t v2 = (local + r) / RAY_ENC_VEC;
-        err = ray_enccol_check_dir(e, v2 / RAY_ENC_VECS_PER_CHUNK, (int)(v2 % RAY_ENC_VECS_PER_CHUNK),
-                                   (const char*)dst + (size_t)r * esz, (int)ray_enc_vec_len(e->len, v2), false);
-        if (err) return err;
-    }
     if (e->type != RAY_F64 && e->type != RAY_F32) scratch_count(sc, e, (uint64_t)rows * esz);
     *got = rows;
     atomic_fetch_add_explicit(&g_into_calls, 1, memory_order_relaxed);

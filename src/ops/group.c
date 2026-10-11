@@ -10750,7 +10750,7 @@ typedef struct {
  * encoded segment decoded straight into place (ray_col_range_into), any
  * other rows through one cursor (decoding into its lent vector) and
  * copied.  NULL or an owned error. */
-static ray_t* grp_flat_rows(ray_col_src_t* src, grp_flat_t* f, int64_t lo, int64_t hi) {
+static ray_t* grp_flat_rows(ray_col_src_t* src, grp_flat_t* f, uint32_t wid, int64_t lo, int64_t hi) {
     const uint8_t esz = ray_sym_elem_size(f->base, f->out_attrs);
     ray_col_fixed_t fixed;
     ray_col_cursor_t cur;
@@ -10766,7 +10766,7 @@ static ray_t* grp_flat_rows(ray_col_src_t* src, grp_flat_t* f, int64_t lo, int64
         int64_t e = v->start + v->n < hi ? v->start + v->n : hi;
         ray_col_piece_t p = { .data = (const char*)v->data + (size_t)(r - v->start) * ray_sym_elem_size(v->type, v->attrs),
                               .attrs = v->attrs };
-        grp_flat_piece(f, 0, r, e, &p);
+        grp_flat_piece(f, wid, r, e, &p);
         r = e;
     }
     ray_col_cursor_free(&cur);
@@ -10774,11 +10774,11 @@ static ray_t* grp_flat_rows(ray_col_src_t* src, grp_flat_t* f, int64_t lo, int64
 }
 
 static void grp_flat_par_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
-    (void)end; (void)wid;
+    (void)end;
     grp_flat_par_t* c = (grp_flat_par_t*)ctx;
     int64_t lo = start * c->slice, hi = lo + c->slice < c->n ? lo + c->slice : c->n;
     if (lo >= hi || ray_scan_fail_skip(c->fail, lo)) return;
-    ray_t* err = grp_flat_rows(c->src, c->f, lo, hi);
+    ray_t* err = grp_flat_rows(c->src, c->f, wid, lo, hi);
     if (err) ray_scan_fail_note(c->fail, lo, err);
 }
 

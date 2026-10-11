@@ -2698,6 +2698,93 @@ static test_result_t test_parted_flatten_in_place(void) {
     PASS();
 }
 
+/* Fix round 1: ray_col_range_into's bounds, each pinned by a call into
+ * a buffer of exactly n elements (ASan) and by the parallel flatten.
+ * Three partitions of 200001 / 199999 / 200000 rows: r wide random I64
+ * (RAW vectors), s a SYM whose first segment holds 100 symbols (W8) and
+ * the others 1000 (W16).
+ * - Another SYM width declines: segment 0 into a W16 output delivers
+ *   nothing (at W8 it delivers its first vector), and the flatten of s
+ *   (W16) equals generation 0's byte for byte.
+ * - A vector longer than the range declines: 500 or 1023 rows from a
+ *   vector's first row deliver nothing.
+ * - A RAW run (chunk 1's vectors are RAW, laid end to end) stops at the
+ *   vector that would cross the range's end: 3 vectors and 100 rows
+ *   deliver 3 vectors, in partition 2 (vectors offset by 200001) as in
+ *   partition 1.
+ * - A flatten to fewer rows than the column (its last slice ends inside a
+ *   vector) equals generation 0's. */
+static test_result_t test_parted_flatten_into_bounds(void) {
+    static const int64_t rows[3] = { 200001, 199999, 200000 };
+    for (int gen = 0; gen <= 2; gen += 2)
+        for (int p = 0, at = 0; p < 3; at += (int)rows[p], p++) {
+            ae_evalf_ok("(set j (+ %d (til %lld)))", at, (long long)rows[p]);
+            ae_evalf_ok("(.db.splayed.set \"" AE_TMP "/b%d/2024.01.0%d/t/\" (table [r s] (list "
+                        "(* (%% (* j 7919) 600011) -6148914691236517205) "
+                        "(as 'SYMBOL (map (fn [x] (format \"w%%\" x)) (%% (* j 31) %d))))) {compress: %s})",
+                        gen, p + 1, p ? 1000 : 100, gen ? "true" : "false");
+        }
+    ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    ray_t* t0 = ae_eval("(.db.parted.get \"" AE_TMP "/b0\" 't)");
+    ray_t* t2 = ae_eval("(.db.parted.get \"" AE_TMP "/b2\" 't)");
+    TEST_ASSERT_TRUE(t0 && !RAY_IS_ERR(t0) && t2 && !RAY_IS_ERR(t2));
+    ray_t* sc2 = ray_table_slot(t2, ray_sym_intern("s", 1));
+    ray_col_meta_t m0, m1;
+    bool widths = ray_col_meta_of(ray_enccol_seg(sc2, 0), &m0) && ray_col_meta_of(ray_enccol_seg(sc2, 1), &m1) &&
+                  (m0.attrs & RAY_SYM_W_MASK) == RAY_SYM_W8 && (m1.attrs & RAY_SYM_W_MASK) == RAY_SYM_W16;
+    if (!widths) { ae_drop(t0); ae_drop(t2); }
+    TEST_ASSERT_FMT(widths, "s: segment widths %u / %u, want W8 / W16", m0.attrs & RAY_SYM_W_MASK, m1.attrs & RAY_SYM_W_MASK);
+
+    /* the direct calls, each into a buffer of exactly n elements */
+    struct { const char* col; int64_t start, n; uint8_t attrs; int64_t want; } calls[] = {
+        { "s", 0, 4096, RAY_SYM_W16, 0 },          /* another width */
+        { "s", 0, 4096, RAY_SYM_W8, 4096 },        /* its own: the control (a RAW run) */
+        { "r", 0, 500, 0, 0 },                     /* vector longer than the range */
+        { "r", 1024, 1023, 0, 0 },
+        { "r", 65536, 500, 0, 0 },                 /* a RAW one (chunk 1's vectors are) */
+        { "r", 65536, 3 * 1024 + 100, 0, 3 * 1024 },   /* RAW run stops before the crossing vector */
+        { "r", 200001 + 65536, 2 * 1024 + 5, 0, 2 * 1024 },
+    };
+    for (size_t i = 0; i < sizeof calls / sizeof calls[0]; i++) {
+        ray_col_src_t src;
+        ray_t* err = ray_col_src_bind(ray_table_slot(t2, ray_sym_intern(calls[i].col, 1)), &src);
+        TEST_ASSERT_TRUE(err == NULL);
+        ray_col_cursor_t cur;
+        ray_col_cursor_init(&cur, &src);
+        size_t esz = calls[i].col[0] == 's' ? (calls[i].attrs == RAY_SYM_W8 ? 1 : 2) : 8;
+        void* dst = malloc((size_t)calls[i].n * esz);
+        int64_t got = -1;
+        err = ray_col_range_into(&src, calls[i].start, calls[i].n, &cur.sc, calls[i].attrs, dst, &got);
+        free(dst);
+        ray_col_cursor_free(&cur);
+        ray_col_src_release(&src);
+        bool ok = err == NULL && got == calls[i].want;
+        if (err) ray_error_free(err);
+        if (!ok) { ae_drop(t0); ae_drop(t2); }
+        TEST_ASSERT_FMT(ok, "%s at %lld for %lld (width %u): delivered %lld, want %lld", calls[i].col,
+                        (long long)calls[i].start, (long long)calls[i].n, calls[i].attrs,
+                        (long long)got, (long long)calls[i].want);
+    }
+
+    /* the flatten: whole, and to fewer rows than the column */
+    static const struct { const char* col; int64_t total; } fl[] = {
+        { "s", 600000 }, { "r", 600000 }, { "r", 600000 - 500 }, { "s", 600000 - 1500 },
+    };
+    for (size_t i = 0; i < sizeof fl / sizeof fl[0]; i++) {
+        ray_t* a = ae_flatten(t0, fl[i].col, fl[i].total);
+        ray_t* b = ae_flatten(t2, fl[i].col, fl[i].total);
+        bool ok = a && !RAY_IS_ERR(a) && b && !RAY_IS_ERR(b) && a->type == b->type && a->len == fl[i].total &&
+                  b->len == fl[i].total && a->attrs == b->attrs &&
+                  (fl[i].col[0] != 's' || (b->attrs & RAY_SYM_W_MASK) == RAY_SYM_W16) &&
+                  memcmp(ray_data(a), ray_data(b), (size_t)fl[i].total * ray_sym_elem_size(a->type, a->attrs)) == 0;
+        ae_drop(a); ae_drop(b);
+        if (!ok) { ae_drop(t0); ae_drop(t2); }
+        TEST_ASSERT_FMT(ok, "%s to %lld rows: the flat copies differ", fl[i].col, (long long)fl[i].total);
+    }
+    ae_drop(t0); ae_drop(t2);
+    PASS();
+}
+
 /* The lowest failure of a parallel flatten, by global row, when time
  * order says otherwise.  4 workers over 2^20 rows of u: slices of 65536
  * rows.  Partition 2 (rows 61440..131071) is corrupt in chunk 1, its last
@@ -2814,5 +2901,6 @@ const test_entry_t agg_engine_entries[] = {
     { "parted_flatten_parallel",     test_parted_flatten_parallel,     ae_rt_setup, ae_rt_teardown },
     { "parted_flatten_lowest_failure", test_parted_flatten_lowest_failure, ae_rt_setup, ae_rt_teardown },
     { "parted_flatten_in_place",     test_parted_flatten_in_place,     ae_rt_setup, ae_rt_teardown },
+    { "parted_flatten_into_bounds",  test_parted_flatten_into_bounds,  ae_rt_setup, ae_rt_teardown },
     { NULL, NULL, NULL, NULL },
 };
