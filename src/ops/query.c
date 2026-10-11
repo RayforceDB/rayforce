@@ -8935,6 +8935,53 @@ static ray_t* select_alias_map_list(ray_t* expr, int64_t from, select_alias_map_
     return out;
 }
 
+/* ── where: is alias-blind to a by-dict's keys ───────────────────────────
+ * The eager by-dict path adds each alias as a column of the table the rest
+ * of the select is compiled over.  A literal symbol naming a from-table
+ * column resolves to that column (B3 Part 2), so `{a: k1} where: (!= k1 'a)`
+ * read `'a` as the new alias column and compared k1 with itself — no rows —
+ * while the two-pass distinct-count rewrite and the deferred parted route,
+ * which add no column, kept the symbol.  where: names source columns only
+ * (like by: and the sort keys), so before the aliases are added every
+ * literal in it that names an alias the table does not already hold is
+ * wrapped in `(quote …)`, which the compiler folds to the symbol (the
+ * literal_col_ref contract: Part 2 unwraps the tick atom, not a quote call).
+ * The wrapped atom keeps the shape ray_quote_fn gives it.  `sub` returns an
+ * owned expression; `changed` says whether any literal was wrapped. */
+typedef struct {
+    ray_t** d_elems;   /* the by-dict's [key value] pairs */
+    int64_t nk;
+    ray_t*  tbl;
+    bool    changed;
+} where_shield_ctx_t;
+
+static ray_t* select_where_shield_alias_literals(ray_t* e, void* vctx) {
+    where_shield_ctx_t* c = (where_shield_ctx_t*)vctx;
+    if (!e) return NULL;
+    if (e->type == -RAY_SYM) {
+        if (!(e->attrs & ATTR_QUOTED)) { ray_retain(e); return e; }
+        bool names_alias = false;
+        for (int64_t i = 0; i < c->nk && !names_alias; i++) {
+            ray_t* k = c->d_elems[i * 2];
+            names_alias = k && k->type == -RAY_SYM && k->i64 == e->i64 &&
+                          !ray_table_get_col(c->tbl, k->i64);
+        }
+        if (!names_alias) { ray_retain(e); return e; }
+        ray_t* head = ray_sym(ray_sym_intern("quote", 5));
+        ray_t* wrap = head && !RAY_IS_ERR(head) ? ray_list_new(2) : NULL;
+        if (wrap && !RAY_IS_ERR(wrap)) wrap = ray_list_append(wrap, head);
+        if (wrap && !RAY_IS_ERR(wrap)) wrap = ray_list_append(wrap, e);
+        if (head && !RAY_IS_ERR(head)) ray_release(head);
+        if (!wrap || RAY_IS_ERR(wrap)) return wrap ? wrap : ray_error("oom", NULL);
+        c->changed = true;
+        return wrap;
+    }
+    if (e->type != RAY_LIST || e->len < 1) { ray_retain(e); return e; }
+    ray_t** el = (ray_t**)ray_data(e);
+    if (select_sym_is(el[0], "quote", 5)) { ray_retain(e); return e; }
+    return select_alias_map_list(e, 0, select_where_shield_alias_literals, c);
+}
+
 /* ── Eval-fallback pre-reduction of aggregates ────────────────────────────
  * A projection that mixes a row column with an aggregate in one expression
  * (`(+ i (max i))`, `(if (> i (avg i)) 1 0)`) is scattered per row by the
@@ -10598,6 +10645,38 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
             ray_release(tbl);
             tbl = filtered;
             where_expr = NULL;
+        }
+
+        /* A literal in where: naming an alias about to become a column is
+         * wrapped first (select_where_shield_alias_literals); the select
+         * then runs again over the rewritten dict, as the materialized
+         * fallback does. */
+        if (where_expr) {
+            where_shield_ctx_t wsc = { d_elems, nk, tbl, false };
+            ray_t* shielded = select_where_shield_alias_literals(where_expr, &wsc);
+            if (!shielded || RAY_IS_ERR(shielded)) {
+                ray_release(tbl);
+                DICT_VIEW_CLOSE(dv); DICT_VIEW_CLOSE(byv);
+                return shielded ? shielded : ray_error("oom", NULL);
+            }
+            if (wsc.changed) {
+                ray_t* wkey = ray_sym(where_id);
+                ray_t* rewritten = NULL;
+                if (wkey && !RAY_IS_ERR(wkey)) {
+                    rewritten = dict; ray_retain(rewritten);
+                    rewritten = ray_dict_upsert(rewritten, wkey, shielded);
+                    ray_release(wkey);
+                }
+                ray_release(shielded);
+                ray_release(tbl);
+                DICT_VIEW_CLOSE(dv); DICT_VIEW_CLOSE(byv);
+                if (!rewritten || RAY_IS_ERR(rewritten))
+                    return rewritten ? rewritten : ray_error("oom", NULL);
+                ray_t* r = ray_select_impl(&rewritten, 1, aliases_resolved);
+                ray_release(rewritten);
+                return r;
+            }
+            ray_release(shielded);
         }
 
         ray_env_push_query_scope();

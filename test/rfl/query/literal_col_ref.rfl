@@ -83,3 +83,26 @@
 (count (select {from: T2 where: (== s 'a)})) -- 2
 ;; and-chained predicate operand also folds (no longer "not supported")
 (count (select {from: T2 where: (and (== s (quote a)) (== s 'a))})) -- 2
+
+;; ── where: is alias-blind to a by-dict's keys ───────────────────────────
+;; The eager by-dict path adds each alias as a column of the table the rest
+;; of the select is compiled over, so a literal in where: naming an alias
+;; resolved to that new column: `{a: k1} where: (!= k1 'a)` compared k1 with
+;; itself and kept no rows, while the same select with a distinct count (the
+;; two-pass rewrite adds no column) kept the symbol.  where: names source
+;; columns only; a literal naming an alias stays the symbol on every route.
+(set Tal (table [k1 k2 v] (list (take ['a 'b 'c 'd 'e] 100) (take ['p 'q 'r] 100) (til 100))))
+(count (select {from: Tal by: {a: k1} where: (!= k1 'a) n: (count v)})) -- 4
+(count (select {from: Tal by: {a: k1} where: (== k1 'a) n: (count v)})) -- 1
+(at (select {from: Tal by: {a: k1} where: (== k1 'a) n: (count v)}) 'n) -- [20]
+(count (select {from: Tal by: {a: k1} where: (!= k1 'a) n: (sum v) asc: a})) -- 4
+(count (select {from: Tal by: {a: k1} where: (!= k1 'a) n: (count v) desc: n take: 2})) -- 2
+(count (select {from: Tal by: {p: k2} where: (!= k2 'p) n: (count v)})) -- 2
+(count (select {from: Tal by: {a: k1 b: k2} where: (and (!= k1 'a) (!= k2 'b)) n: (sum v)})) -- 12
+;; the same select with a distinct count agrees (the rewrite route)
+(at (select {from: Tal by: {a: k1} where: (!= k1 'a) n: (count (distinct v)) asc: a}) 'a) -- ['b 'c 'd 'e]
+;; a vector literal was never captured; a literal naming a source column still is
+(count (select {from: Tal by: {a: k1} where: (in k1 ['a 'b]) n: (count v)})) -- 2
+(count (select {from: Tal by: {a: k1} where: (> 'v 49) n: (count v)})) -- 5
+;; a trivial self-alias keeps the column rule: {k1: k1} adds nothing
+(count (select {from: Tal by: {k1: k1} where: (!= k1 'a) n: (count v)})) -- 4
