@@ -43,12 +43,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>    /* the lazily read page size and read-ahead step */
 #if defined(RAY_OS_MACOS)
 #include <sys/sysctl.h>   /* sysctlbyname — hw.physicalcpu */
 #endif
 #if defined(RAY_OS_LINUX)
 #include <dirent.h>       /* /sys/block — the read-ahead caps */
-#include <stdatomic.h>
+#include <sys/resource.h> /* getrusage: ray_io_counters */
+#if !defined(RUSAGE_THREAD)
+#define RUSAGE_THREAD 1
+#endif
 #endif
 #include "mem/sys.h"
 
@@ -118,11 +122,15 @@ void ray_vm_advise_seq(void* ptr, size_t size) {
     if (ptr) madvise(ptr, size, MADV_SEQUENTIAL);
 }
 
+/* Read once, from whichever thread asks first: the threads that race on it
+ * all store the same value, relaxed. */
 static size_t vm_page_size(void) {
-    static size_t pg = 0;
+    static _Atomic(size_t) cached = 0;
+    size_t pg = atomic_load_explicit(&cached, memory_order_relaxed);
     if (pg == 0) {
         long ps = sysconf(_SC_PAGESIZE);
         pg = (ps > 0) ? (size_t)ps : 4096;
+        atomic_store_explicit(&cached, pg, memory_order_relaxed);
     }
     return pg;
 }
@@ -246,11 +254,7 @@ void ray_vm_release_block(void* blk, size_t bsize, bool hugepage) {
          * read back as zero and the next GC freelist walk crashed on a
          * NULL link (issue #240).  Rounding inward to page-aligned bounds
          * makes the kernel's own rounding a no-op on every platform. */
-        static size_t pg = 0;
-        if (pg == 0) {
-            long ps = sysconf(_SC_PAGESIZE);
-            pg = (ps > 0) ? (size_t)ps : 4096;
-        }
+        size_t pg = vm_page_size();
         uintptr_t s = ((uintptr_t)blk + 32 + (pg - 1)) & ~(uintptr_t)(pg - 1);
         uintptr_t e = ((uintptr_t)blk + bsize) & ~(uintptr_t)(pg - 1);
         if (e > s) ray_vm_release((void*)s, e - s);
@@ -938,6 +942,8 @@ void* ray_vm_alloc(size_t size) {
          * Round up to a 64KB WASM page. */
         size_t aligned = (size + 65535u) & ~(size_t)65535u;
         p = aligned_alloc(65536, aligned);
+        /* zero-filled, as a fresh mapping is (ray_sys_alloc's contract) */
+        if (p) memset(p, 0, aligned);
     }
     if (p) ray_sys_track_add((int64_t)size);
     return p;
@@ -1057,4 +1063,28 @@ uint64_t ray_cache_llc_bytes(void) {
     if (g_llc_for_test) return g_llc_for_test;
 #endif
     return cache_llc_probe();
+}
+
+/* ---- I/O counters for the traces ----------------------------------------- */
+void ray_io_counters(bool thread, ray_io_counters_t* out) {
+    *out = (ray_io_counters_t){0};
+#if defined(RAY_OS_LINUX)
+    struct rusage ru;
+    if (getrusage(thread ? RUSAGE_THREAD : RUSAGE_SELF, &ru) == 0) out->majflt = ru.ru_majflt;
+    FILE* f = fopen(thread ? "/proc/thread-self/io" : "/proc/self/io", "r");
+    if (f) {
+        char line[128];
+        while (fgets(line, sizeof(line), f)) {
+            long long v;
+            if (sscanf(line, "read_bytes: %lld", &v) == 1) out->rd = v;
+            else if (sscanf(line, "write_bytes: %lld", &v) == 1) out->wr = v;
+            else if (sscanf(line, "cancelled_write_bytes: %lld", &v) == 1) out->cwr = v;
+            else if (sscanf(line, "syscr: %lld", &v) == 1) out->syscr = v;
+            else if (sscanf(line, "syscw: %lld", &v) == 1) out->syscw = v;
+        }
+        fclose(f);
+    }
+#else
+    (void)thread;
+#endif
 }
