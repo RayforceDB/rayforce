@@ -348,11 +348,32 @@ static _Atomic(int64_t) g_anon_committed = 0;
 static _Atomic(int64_t) g_anon_watermark = 0;   /* 0 = the default (heap_anon_watermark) */
 static _Atomic(int64_t) g_anon_peak      = 0;   /* high-water of g_anon_committed */
 
+/* What has been mapped, for ray_heap_relieve to learn what a statement did:
+ * the number of anonymous mappings and the bytes of the direct and sys blocks
+ * among them — sys blocks too small to spill (RAY_SYS_SPILL_MIN) left out —
+ * and the number of mappings that went past RAM — a pool, direct or sys
+ * block mapped over a spill file (the watermark's call, or a refused
+ * anonymous mapping), or taken from RAM past the watermark because no spill
+ * file could be made. */
+static _Atomic(int64_t) g_anon_maps   = 0;
+static _Atomic(int64_t) g_anon_large  = 0;
+static _Atomic(int64_t) g_anon_spills = 0;
+static _Atomic(int64_t) g_anon_stmt_peak = 0;   /* high-water since the last boundary */
+static _Atomic(int64_t) g_spill_pools = 0;      /* spill pools mapped, all heaps */
+
+static void heap_anon_spilled(void) {
+    atomic_fetch_add_explicit(&g_anon_spills, 1, memory_order_relaxed);
+}
+
 /* Commit `bytes` of anonymous (RAM-resident) footprint and advance the peak
  * high-water.  Called from the anon-commit sites (pools, direct blocks, sys
  * blocks); file-backed spill mappings never call this (they must not count
- * toward the RAM watermark). */
-static void heap_anon_commit(int64_t bytes) {
+ * toward the RAM watermark).  `mapped`: a mapping ray_heap_relieve counts —
+ * a pool, a direct block, a sys block that could spill; `large`: one of the
+ * last two. */
+static void heap_anon_commit(int64_t bytes, bool mapped, bool large) {
+    if (mapped) atomic_fetch_add_explicit(&g_anon_maps, 1, memory_order_relaxed);
+    if (large) atomic_fetch_add_explicit(&g_anon_large, bytes, memory_order_relaxed);
     int64_t nv = atomic_fetch_add_explicit(&g_anon_committed, bytes,
                                             memory_order_relaxed) + bytes;
     int64_t pk = atomic_load_explicit(&g_anon_peak, memory_order_relaxed);
@@ -362,6 +383,11 @@ static void heap_anon_commit(int64_t bytes) {
                                                    memory_order_relaxed)) {
         /* pk reloaded with the current value on failure; retry. */
     }
+    pk = atomic_load_explicit(&g_anon_stmt_peak, memory_order_relaxed);
+    while (nv > pk &&
+           !atomic_compare_exchange_weak_explicit(&g_anon_stmt_peak, &pk, nv,
+                                                   memory_order_relaxed,
+                                                   memory_order_relaxed)) {}
 }
 
 /* Threshold above which anon allocations spill to disk.  Default keeps our
@@ -390,6 +416,14 @@ static bool heap_anon_would_exceed(size_t bytes) {
     return cur + (int64_t)bytes > wm;
 }
 
+/* A boundary far from the watermark visits the heaps for the spill pools
+ * alone (ray_heap_relieve) — to park the empty ones and age them — so at
+ * most this often: a stream of small statements (a server's) would
+ * otherwise walk every worker heap each time, 13-14 µs a statement at 16
+ * workers.  A new watermark visits at the next boundary. */
+#define RAY_FAR_VISIT_MS 100
+static _Atomic(int64_t) g_far_visit_ms = INT64_MIN / 2;
+
 int64_t ray_heap_anon_committed(void) {
     return atomic_load_explicit(&g_anon_committed, memory_order_relaxed);
 }
@@ -403,9 +437,11 @@ int64_t ray_heap_mem_budget(void) {
     int64_t wm = atomic_load_explicit(&g_anon_watermark, memory_order_relaxed);
     return wm > 0 ? wm : ray_sys_ram_limit();
 }
+/* A new budget: the next boundary visits the heaps. */
 void ray_heap_set_anon_watermark(int64_t bytes) {
     atomic_store_explicit(&g_anon_watermark, bytes < 0 ? 0 : bytes,
                           memory_order_relaxed);
+    atomic_store_explicit(&g_far_visit_ms, INT64_MIN / 2, memory_order_relaxed);
 }
 
 ray_heap_t* ray_heap_registry[RAY_HEAP_REGISTRY_SIZE];
@@ -492,6 +528,11 @@ uint8_t ray_order_for_size(size_t data_size) {
  * -------------------------------------------------------------------------- */
 
 static bool heap_add_pool(ray_heap_t* h, uint8_t order);
+static bool heap_unpark(ray_heap_t* h, bool spill);
+static void heap_unpark_all(ray_heap_t* h);
+static bool heap_make_room(size_t bytes);
+static int64_t heap_decay_threshold_ms(void);
+static void heap_abandon_spill(ray_heap_t* h);
 
 /* --------------------------------------------------------------------------
  * Freelist operations (circular sentinel via fl_prev/fl_next)
@@ -759,16 +800,24 @@ static bool heap_add_pool(ray_heap_t* h, uint8_t order) {
     }
 
     /* --- Track pool --- */
-    h->pools[h->pool_count].base       = mem;
-    h->pools[h->pool_count].pool_order = pool_order;
-    h->pools[h->pool_count].backed     = (swap_fd >= 0) ? 1 : 0;
-    h->pools[h->pool_count].hugepage   = pool_hugepage;
-    h->pools[h->pool_count].swap_fd    = swap_fd;
-    h->pools[h->pool_count].swap_path  = swap_path;  /* NULL when not backed */
+    h->pools[h->pool_count] = (ray_pool_entry_t){
+        .base       = mem,
+        .pool_order = pool_order,
+        .backed     = (swap_fd >= 0) ? 1 : 0,
+        .hugepage   = pool_hugepage,
+        .swap_fd    = swap_fd,
+        .swap_path  = swap_path,  /* NULL when not backed */
+    };
     h->pool_count++;
 
     if (swap_fd < 0)   /* anonymous pool: counts toward the RAM watermark */
-        heap_anon_commit((int64_t)pool_size);
+        heap_anon_commit((int64_t)pool_size, true, false);
+    else
+        atomic_fetch_add_explicit(&g_spill_pools, 1, memory_order_relaxed);
+    if (over || swap_fd >= 0) {
+        heap_anon_spilled();
+        h->spilled = 1;
+    }
 
     return true;
 }
@@ -1461,13 +1510,9 @@ static ray_t* heap_alloc_direct(ray_heap_t* h, size_t data_size) {
          * SUCCEEDS, then kills us at fault time — so a fallback-on-failure alone
          * would not catch it.)  Otherwise use anonymous RAM, and fall back to a
          * spill file only if the kernel refuses the mapping.
-         * Under pressure, drain the reuse cache before deciding — its resident
-         * pages are the first thing to give back. */
-        bool force_file = heap_anon_would_exceed(map_size);
-        if (force_file) {
-            direct_cache_drain();
-            force_file = heap_anon_would_exceed(map_size);
-        }
+         * Under pressure, give back what is free before deciding
+         * (heap_make_room). */
+        bool force_file = heap_anon_would_exceed(map_size) && heap_make_room(map_size);
         if (!force_file)
             base = ray_vm_alloc(map_size);   /* anon RW, page-aligned, counted */
         if (!base) {
@@ -1478,7 +1523,9 @@ static ray_t* heap_alloc_direct(ray_heap_t* h, size_t data_size) {
             if (!base) return NULL;
         }
         if (swap_fd < 0)   /* anonymous: counts toward the RAM watermark */
-            heap_anon_commit((int64_t)map_size);
+            heap_anon_commit((int64_t)map_size, true, true);
+        if (force_file || swap_fd >= 0)
+            heap_anon_spilled();
     }
 
     ray_direct_hdr_t* hdr = (ray_direct_hdr_t*)base;
@@ -1572,6 +1619,11 @@ ray_t* ray_alloc(size_t data_size) {
              * the invariant — no pool is ever added without a drain first. */
             heap_drain_foreign(h);
             candidates = h->avail & (UINT64_MAX << order);
+            /* Then a pool the heap parked (heap_park_empty_pools), an
+             * anonymous one first. */
+            if (candidates == 0 && h->parked
+                && (heap_unpark(h, false) || heap_unpark(h, true)))
+                candidates = h->avail & (UINT64_MAX << order);
             if (candidates == 0) {
                 if (!heap_add_pool(h, order)) return NULL;
                 candidates = h->avail & (UINT64_MAX << order);
@@ -2174,25 +2226,24 @@ static void* heap_sys_map_file(size_t size) {
 void* ray_heap_sys_map(size_t size, bool* spilled) {
     *spilled = false;
     void* p = NULL;
+    bool big = size >= RAY_SYS_SPILL_MIN;   /* could spill, so ray_heap_relieve counts it */
 #if RAY_HEAP_FILE_SPILL
-    bool big = size >= RAY_SYS_SPILL_MIN;
-    bool to_file = big && heap_anon_would_exceed(size);
-    if (to_file) {
-        direct_cache_drain();
-        to_file = heap_anon_would_exceed(size);
-    }
+    bool to_file = big && heap_anon_would_exceed(size) && heap_make_room(size);
     if (!to_file) p = ray_vm_alloc(size);
     if (!p && big) {
         p = heap_sys_map_file(size);
-        if (p) { *spilled = true; return p; }
+        if (p) { *spilled = true; heap_anon_spilled(); return p; }
     }
     /* No spill file (no writable spill directory, disk full): RAM rather
      * than failing — callers of ray_sys_alloc grow core tables with it. */
-    if (!p && to_file) p = ray_vm_alloc(size);
+    if (!p && to_file) {
+        p = ray_vm_alloc(size);
+        if (p) heap_anon_spilled();
+    }
 #else
     p = ray_vm_alloc(size);
 #endif
-    if (p) heap_anon_commit((int64_t)size);
+    if (p) heap_anon_commit((int64_t)size, big, big);
     return p;
 }
 
@@ -2314,6 +2365,7 @@ void ray_heap_abandon(void) {
      * handed on with its memory on its freelists rather than on a list the
      * adopter has to notice. */
     heap_drain_foreign(h);
+    heap_abandon_spill(h);
 
     ray_registry_lock();
     h->idle_next = g_heap_idle;
@@ -2375,6 +2427,7 @@ void ray_heap_destroy(void) {
                         (uintptr_t)h->pools[i].base + BSIZEOF(h->pools[i].pool_order));
         ray_vm_free(hdr->vm_base, BSIZEOF(h->pools[i].pool_order));
         if (h->pools[i].backed) {
+            atomic_fetch_sub_explicit(&g_spill_pools, 1, memory_order_relaxed);
             if (h->pools[i].swap_fd >= 0) close(h->pools[i].swap_fd);
             if (h->pools[i].swap_path) {
                 unlink(h->pools[i].swap_path);
@@ -2439,16 +2492,17 @@ static void dfd_validate_freelists(void) {
 #define RAY_RELEASE_MIN_ORDER  13
 
 /* Which pools a reclaim may unmap: oversized ones (gc pass 4), spill ones
- * (the idle decay — releasing a spill block's pages frees nothing, see
- * heap_release_free_pages), or every pool (ray_heap_relieve). */
+ * (the idle decay, an abandoned heap, a relief that acts — releasing a
+ * spill block's pages frees nothing, see heap_release_free_pages), or
+ * anonymous ones (heap_make_room, ray_heap_relieve). */
 #define RAY_RECLAIM_OVERSIZED  1u
 #define RAY_RECLAIM_SPILL      2u
-#define RAY_RECLAIM_ALL        (RAY_RECLAIM_OVERSIZED | RAY_RECLAIM_SPILL | 4u)
+#define RAY_RECLAIM_ANON       4u
 
 static bool heap_reclaim_admits(const ray_pool_entry_t* pe, unsigned mode) {
-    return mode == RAY_RECLAIM_ALL
-        || ((mode & RAY_RECLAIM_OVERSIZED) && pe->pool_order > RAY_HEAP_POOL_ORDER)
-        || ((mode & RAY_RECLAIM_SPILL) && pe->backed);
+    return ((mode & RAY_RECLAIM_OVERSIZED) && pe->pool_order > RAY_HEAP_POOL_ORDER)
+        || ((mode & RAY_RECLAIM_SPILL) && pe->backed)
+        || ((mode & RAY_RECLAIM_ANON) && !pe->backed);
 }
 
 /* The pools of h that `mode` admits and that may be entirely free, into
@@ -2462,14 +2516,16 @@ static bool heap_reclaim_admits(const ray_pool_entry_t* pe, unsigned mode) {
  * offset is always the start of a block, never inside one, since only a
  * block starting at the pool header could span it.  A filter, not the test:
  * a block another thread is freeing into h right now reads rc 0 too, before
- * it is on any list of h's.  heap_reclaim_empty_pools confirms. */
+ * it is on any list of h's.  heap_find_empty_pools confirms.  A parked
+ * pool is not a candidate: it is empty by construction, and its blocks are
+ * on no list. */
 static uint32_t heap_empty_pool_candidates(ray_heap_t* h, unsigned mode,
                                            uint32_t* out) {
     if (h->pool_count <= 1) return 0;
     if (!(h->avail & (UINT64_MAX << (RAY_HEAP_POOL_ORDER - 1)))) return 0;
     uint32_t n = 0;
     for (uint32_t p = 0; p < h->pool_count; p++) {
-        if (!heap_reclaim_admits(&h->pools[p], mode)) continue;
+        if (h->pools[p].parked || !heap_reclaim_admits(&h->pools[p], mode)) continue;
         uintptr_t pb = (uintptr_t)h->pools[p].base;
         int k = h->pools[p].pool_order - 1;
         for (; k >= RAY_ORDER_MIN; k--) {
@@ -2481,12 +2537,12 @@ static uint32_t heap_empty_pool_candidates(ray_heap_t* h, unsigned mode,
     return n;
 }
 
-/* Unmap the pools of h that `mode` admits and whose bytes are all free,
- * keeping h's last pool; returns the anonymous bytes unmapped.  The caller
- * vouches that h is quiescent — its own heap, or a parked worker's with
- * ray_parallel_flag clear — and has drained h's foreign list and flushed its
- * slab cache; a block in either is not on a freelist, so its pool is not
- * empty as far as this goes.
+/* Set empty[p] for each unparked pool p of h that `mode` admits and whose
+ * bytes are all free; returns how many.  empty[] has h->pool_count entries,
+ * zeroed by the caller.  The caller vouches that h is quiescent — its own
+ * heap, or a parked worker's with ray_parallel_flag clear — and has drained
+ * h's foreign list and flushed its slab cache; a block in either is not on a
+ * freelist, so its pool is not empty as far as this goes.
  *
  * Emptiness is "every byte of the pool but its header is on h's freelists".
  * A block of h's that is live, or queued anywhere, is by construction not
@@ -2497,8 +2553,8 @@ static uint32_t heap_empty_pool_candidates(ray_heap_t* h, unsigned mode,
  * fragmented heap of a few hundred MB.  The walk only runs when the
  * candidate filter above found something, and an empty pool's blocks are
  * the cascade, so they come off the lists by offset rather than by a second
- * walk. */
-static int64_t heap_reclaim_empty_pools(ray_heap_t* h, unsigned mode) {
+ * walk (heap_pool_unlist). */
+static uint32_t heap_find_empty_pools(ray_heap_t* h, unsigned mode, uint8_t* empty) {
     uint32_t cand[RAY_MAX_POOLS];
     uint32_t n = heap_empty_pool_candidates(h, mode, cand);
     if (n == 0) return 0;
@@ -2534,13 +2590,72 @@ static int64_t heap_reclaim_empty_pools(ray_heap_t* h, unsigned mode) {
         }
     }
 
-    uint8_t empty[RAY_MAX_POOLS];
-    memset(empty, 0, h->pool_count);
+    uint32_t found = 0;
     for (uint32_t i = 0; i < n; i++) {
         uint8_t po = h->pools[cand[i]].pool_order;
-        if (free_bytes[i] == BSIZEOF(po) - BSIZEOF(RAY_ORDER_MIN))
+        if (free_bytes[i] == BSIZEOF(po) - BSIZEOF(RAY_ORDER_MIN)) {
             empty[cand[i]] = 1;
+            found++;
+        }
     }
+    return found;
+}
+
+/* Take empty pool p's blocks — the cascade heap_add_pool cut it into — off
+ * h's freelists. */
+static void heap_pool_unlist(ray_heap_t* h, uint32_t p) {
+    uintptr_t pb = (uintptr_t)h->pools[p].base;
+    for (uint8_t k = RAY_ORDER_MIN; k < h->pools[p].pool_order; k++) {
+        fl_remove((ray_t*)(pb + BSIZEOF(k)));
+        if (fl_empty(&h->freelist[k]))
+            h->avail &= ~(1ULL << k);
+    }
+}
+
+/* Unmap pool p of h, empty and off the freelists — unlisted, or parked — and
+ * drop its entry, the last one moving into p; returns the anonymous bytes
+ * unmapped. */
+static int64_t heap_pool_unmap(ray_heap_t* h, uint32_t p) {
+    ray_pool_entry_t* pe = &h->pools[p];
+    uint8_t po = pe->pool_order;
+    uintptr_t pb = (uintptr_t)pe->base;
+    int64_t anon = 0;
+    if (pe->parked) h->parked--;
+
+    dfd_purge_range(pb, pb + BSIZEOF(po));
+    ray_vm_free(((ray_pool_hdr_t*)pb)->vm_base, BSIZEOF(po));
+    /* File-backed pools also need their fd closed and tempfile
+     * unlinked, mirroring the heap_destroy path.  Unmapping drops the
+     * unlinked file's pages without writing them back. */
+    if (pe->backed) {
+        atomic_fetch_sub_explicit(&g_spill_pools, 1, memory_order_relaxed);
+        if (pe->swap_fd >= 0) close(pe->swap_fd);
+        if (pe->swap_path) {
+            unlink(pe->swap_path);
+            ray_sys_free(pe->swap_path);
+        }
+    } else {
+        atomic_fetch_sub_explicit(&g_anon_committed,
+            (int64_t)BSIZEOF(po), memory_order_relaxed);
+        anon = (int64_t)BSIZEOF(po);
+    }
+    h->pools[p] = h->pools[--h->pool_count];
+    return anon;
+}
+
+/* Unmap the pools of h that `mode` admits and whose bytes are all free,
+ * parked ones included, keeping h's last pool; returns the anonymous bytes
+ * unmapped.  Same conditions as heap_find_empty_pools. */
+static int64_t heap_reclaim_empty_pools(ray_heap_t* h, unsigned mode) {
+    uint8_t empty[RAY_MAX_POOLS];
+    memset(empty, 0, h->pool_count);
+    uint32_t n = heap_find_empty_pools(h, mode, empty);
+    for (uint32_t p = 0; h->parked && p < h->pool_count; p++)
+        if (h->pools[p].parked && heap_reclaim_admits(&h->pools[p], mode)) {
+            empty[p] = 1;
+            n++;
+        }
+    if (n == 0) return 0;
 
     /* Highest index first: unmapping pool p moves the last entry into p, and
      * every entry above p has been dealt with by then. */
@@ -2548,37 +2663,70 @@ static int64_t heap_reclaim_empty_pools(ray_heap_t* h, unsigned mode) {
     for (uint32_t p = h->pool_count; p-- > 0; ) {
         if (!empty[p]) continue;
         if (h->pool_count <= 1) break;   /* a heap keeps its last pool */
-
-        ray_pool_entry_t* pe = &h->pools[p];
-        uint8_t po = pe->pool_order;
-        uintptr_t pb = (uintptr_t)pe->base;
-        for (uint8_t k = RAY_ORDER_MIN; k < po; k++) {
-            ray_t* blk = (ray_t*)(pb + BSIZEOF(k));
-            fl_remove(blk);
-            dfd_remove(blk);
-            if (fl_empty(&h->freelist[k]))
-                h->avail &= ~(1ULL << k);
-        }
-
-        dfd_purge_range(pb, pb + BSIZEOF(po));
-        ray_vm_free(((ray_pool_hdr_t*)pb)->vm_base, BSIZEOF(po));
-        /* File-backed pools also need their fd closed and tempfile
-         * unlinked, mirroring the heap_destroy path.  Unmapping drops the
-         * unlinked file's pages without writing them back. */
-        if (pe->backed) {
-            if (pe->swap_fd >= 0) close(pe->swap_fd);
-            if (pe->swap_path) {
-                unlink(pe->swap_path);
-                ray_sys_free(pe->swap_path);
-            }
-        } else {
-            atomic_fetch_sub_explicit(&g_anon_committed,
-                (int64_t)BSIZEOF(po), memory_order_relaxed);
-            anon += (int64_t)BSIZEOF(po);
-        }
-        h->pools[p] = h->pools[--h->pool_count];
+        if (!h->pools[p].parked) heap_pool_unlist(h, p);
+        anon += heap_pool_unmap(h, p);
     }
     return anon;
+}
+
+/* Parking.  An empty pool kept for the next statement does not stay empty
+ * through it: every pool holds one free block of each small order (the
+ * cascade), so the first small allocations — the statement's own parsing
+ * and environment — take a block from each in turn, and by the time the
+ * statement wants a large block that the empty pools could make room for,
+ * none of them is empty.  A parked pool keeps its mapping and its pages but
+ * its blocks are off the freelists: nothing is cut from it until the heap
+ * has no free block left of the order it needs (heap_unpark, on the
+ * allocation slow path before a new pool is mapped), and heap_make_room can
+ * still unmap it for a large block, an anonymous one.
+ * The heap's last unparked pool stays on the lists.  Parks the empty pools
+ * `mode` admits; the pool header keeps when (`now`, ms) the pool was parked
+ * (heap_spill_pools_age). */
+static void heap_park_empty_pools(ray_heap_t* h, unsigned mode, uint32_t now) {
+    uint8_t empty[RAY_MAX_POOLS];
+    memset(empty, 0, h->pool_count);
+    if (heap_find_empty_pools(h, mode, empty) == 0)
+        return;
+    for (uint32_t p = h->pool_count; p-- > 0; ) {
+        if (!empty[p]) continue;
+        if (h->pool_count - h->parked <= 1) break;
+        heap_pool_unlist(h, p);
+        h->pools[p].parked = 1;
+        ((ray_pool_hdr_t*)h->pools[p].base)->parked_ms = now;
+        h->parked++;
+    }
+}
+
+/* Put one parked pool's blocks back on the freelists — a spill one if
+ * `spill`, else an anonymous one; false if h has none. */
+static bool heap_unpark(ray_heap_t* h, bool spill) {
+    for (uint32_t p = h->pool_count; p-- > 0; ) {
+        ray_pool_entry_t* pe = &h->pools[p];
+        if (!pe->parked || pe->backed != spill) continue;
+        uintptr_t pb = (uintptr_t)pe->base;
+        for (uint8_t o = pe->pool_order; o > RAY_ORDER_MIN; o--)
+            heap_insert_block(h, (ray_t*)(pb + BSIZEOF(o - 1)), (uint8_t)(o - 1));
+        pe->parked = 0;
+        h->parked--;
+        return true;
+    }
+    return false;
+}
+
+static void heap_unpark_all(ray_heap_t* h) {
+    while (h->parked && (heap_unpark(h, false) || heap_unpark(h, true))) {}
+}
+
+/* An abandoned heap is visited by no boundary (heap_each_quiescent), so its
+ * empty spill pools would never age (heap_spill_pools_age): they go as its
+ * thread leaves it, which still owns it then. */
+static void heap_abandon_spill(ray_heap_t* h) {
+    for (uint32_t p = 0; p < h->pool_count; p++)
+        if (h->pools[p].backed) {
+            heap_flush_slabs(h);
+            (void)heap_reclaim_empty_pools(h, RAY_RECLAIM_SPILL);
+            return;
+        }
 }
 
 /* The heaps a maintenance point may work on from this thread: its own, and
@@ -2741,11 +2889,53 @@ static int64_t heap_release_free_pages(ray_heap_t* h) {
     return released;
 }
 
+/* A parked spill pool that no statement has taken back for the idle decay's
+ * threshold is unmapped, its file closed — but not h's last pool: the decay
+ * pool by pool, for a process never idle that long — a server — which would
+ * otherwise keep the files and their pages for good.  A negative
+ * threshold — the decay disabled — is never reached, as unsigned.  `now` as
+ * for heap_park_empty_pools. */
+static void heap_spill_pools_age(ray_heap_t* h, uint32_t now) {
+    int64_t thr = heap_decay_threshold_ms();
+    for (uint32_t p = h->pool_count; h->parked && h->pool_count > 1 && p-- > 0; ) {
+        const ray_pool_entry_t* pe = &h->pools[p];
+        if (pe->parked && pe->backed
+            && now - ((const ray_pool_hdr_t*)pe->base)->parked_ms >= (uint64_t)thr)
+            (void)heap_pool_unmap(h, p);
+    }
+}
+
+/* A direct or sys block of `bytes` is about to cross the watermark.  Before
+ * it goes to a spill file, give back what the calling thread holds free: the
+ * direct-block cache, then its own heap's empty anonymous pools — parked
+ * ones above all (heap_park_empty_pools) — which no block of that size is
+ * ever cut from.  A statement that freed its pool temporaries and goes on to
+ * large blocks would otherwise spill those while the pools sit empty and
+ * counted, and no rule at the boundary can tell that the next statement
+ * wants large blocks rather than its pools back.  Only the caller's heap:
+ * any other, a worker's included, may be allocating right now.  Returns
+ * whether `bytes` still crosses the watermark. */
+static bool heap_make_room(size_t bytes) {
+    direct_cache_drain();
+    if (!heap_anon_would_exceed(bytes)) return false;
+#if RAY_HEAP_FILE_SPILL
+    ray_heap_t* h = ray_tl_heap;
+    if (!h) return true;
+    heap_drain_foreign(h);
+    heap_flush_slabs(h);
+    int64_t got = heap_reclaim_empty_pools(h, RAY_RECLAIM_ANON);
+    return got == 0 || heap_anon_would_exceed(bytes);
+#else
+    return true;   /* past the watermark the block comes from RAM all the same */
+#endif
+}
+
 void ray_heap_release_pages(void) {
     /* Explicit release: callers asking for pages back get them NOW —
      * no aging — but still skip blocks already released. */
     ray_heap_t* h = ray_tl_heap;
     if (!h) return;
+    heap_unpark_all(h);
     (void)heap_release_free_pages(h);
 }
 
@@ -2861,9 +3051,11 @@ int64_t ray_heap_decay_due_ms(void) {
 static void heap_decay_sweep(ray_heap_t* h, void* ctx) {
     /* Blocks freed to h by another thread, and h's own slab cache, are not
      * on a freelist and would be invisible to the walk below — in a server
-     * that is where most of the free bytes are. */
+     * that is where most of the free bytes are.  Nor are the blocks of a
+     * parked pool. */
     heap_drain_foreign(h);
     heap_flush_slabs(h);
+    heap_unpark_all(h);
     (void)heap_reclaim_empty_pools(h, RAY_RECLAIM_SPILL);
     *(int64_t*)ctx += heap_release_free_pages(h);
 }
@@ -2882,53 +3074,132 @@ int64_t ray_heap_decay(void) {
     return released;
 }
 
-/* The anonymous bytes heap_relieve_apply would unmap from h, as far as the
- * candidate filter can tell. */
+/* What a relief would hand back, as far as the candidate filter can tell:
+ * the anonymous bytes of the heaps that did not spill a pool (room; of other
+ * threads' heaps, room_other). */
+typedef struct { int64_t room, room_other; } relieve_measure_t;
+
 static void heap_relieve_measure(ray_heap_t* h, void* ctx) {
+    relieve_measure_t* m = ctx;
     heap_drain_foreign(h);
     heap_flush_slabs(h);
+    if (h->spilled) return;
     uint32_t cand[RAY_MAX_POOLS];
-    uint32_t n = heap_empty_pool_candidates(h, RAY_RECLAIM_ALL, cand);
+    uint32_t n = heap_empty_pool_candidates(h, RAY_RECLAIM_ANON, cand);
+    uint8_t empty[RAY_MAX_POOLS];
+    memset(empty, 0, h->pool_count);
+    for (uint32_t i = 0; i < n; i++) empty[cand[i]] = 1;
+    int64_t room = 0;
+    uint32_t gone = 0;   /* pools the reclaim would take */
+    for (uint32_t p = 0; p < h->pool_count; p++) {
+        const ray_pool_entry_t* pe = &h->pools[p];
+        if ((empty[p] || pe->parked) && !pe->backed) {
+            room += (int64_t)BSIZEOF(pe->pool_order);
+            gone++;
+        }
+    }
     /* With every pool empty, the reclaim keeps the first. */
-    for (uint32_t i = (n == h->pool_count) ? 1 : 0; i < n; i++)
-        if (!h->pools[cand[i]].backed)
-            *(int64_t*)ctx += (int64_t)BSIZEOF(h->pools[cand[i]].pool_order);
+    if (gone && gone == h->pool_count)
+        room -= (int64_t)BSIZEOF(h->pools[0].pool_order);
+    m->room += room;
+    if (h != ray_tl_heap) m->room_other += room;
 }
 
-static void heap_relieve_apply(ray_heap_t* h, void* ctx) {
-    (void)heap_reclaim_empty_pools(h, RAY_RECLAIM_ALL);
-    *(int64_t*)ctx += heap_release_free_pages(h);
+typedef struct { int64_t released; uint32_t now; bool near, act; } relieve_visit_t;
+
+/* If the relief acts (act), a heap gives back its empty spill pools, and a
+ * heap that did not spill a pool its empty anonymous ones too and the pages
+ * of its other free blocks — one that did keeps those: it ran out of its
+ * own.  What stays empty is parked, and a spill pool long unused is
+ * unmapped.  The heap has been looked at: what it spilled is known now.
+ * Far from the watermark (!near) the visit is only for the spill pools: it
+ * parks the empty ones it finds on the freelists as they are, without a
+ * drain or a slab flush — a pool with a block still in either waits for a
+ * later visit, and the next statement keeps its slab cache. */
+static void heap_relieve_visit(ray_heap_t* h, void* ctx) {
+    relieve_visit_t* v = ctx;
+    if (v->near) {
+        heap_drain_foreign(h);
+        heap_flush_slabs(h);
+    }
+    heap_spill_pools_age(h, v->now);
+    if (v->act) {
+        (void)heap_reclaim_empty_pools(h, h->spilled ? RAY_RECLAIM_SPILL
+                                                     : RAY_RECLAIM_SPILL | RAY_RECLAIM_ANON);
+        if (!h->spilled) v->released += heap_release_free_pages(h);
+    }
+    heap_park_empty_pools(h, v->near ? RAY_RECLAIM_ANON | RAY_RECLAIM_SPILL
+                                     : RAY_RECLAIM_SPILL, v->now);
+    h->spilled = 0;
 }
 
-/* Statement boundary under memory pressure.  A free block keeps its pages
- * and a standard pool stays mapped, so the next query reuses them without
- * faulting (see the idle decay above).  Where memory is short that turns
- * against the next query: what the previous one left resident starves the
- * page cache, and since a kept pool still counts toward the watermark, the
- * next query's new memory goes to spill files.  A repeated heavy query then
- * ran an order of magnitude slower than its first run.
+/* What the boundaries since the last relief have shown (ray_heap_relieve). */
+enum {
+    RELIEF_NONE,      /* nothing against relieving */
+    RELIEF_JUST,      /* the last relief has not been put to the test yet */
+    RELIEF_FUTILE,    /* the statement after it spilled all the same */
+};
+static _Atomic(int)     g_relieve_state  = RELIEF_NONE;
+static _Atomic(int64_t) g_relieve_wm     = 0;   /* the watermark of the last relief */
+static _Atomic(int64_t) g_relieve_maps   = 0;   /* g_anon_maps at the last boundary */
+static _Atomic(int64_t) g_relieve_large  = 0;   /* g_anon_large at the last boundary */
+static _Atomic(int64_t) g_relieve_spills = 0;   /* g_anon_spills at the last boundary */
+static _Atomic(bool)    g_relieve_other  = false;   /* the last relief took others' pools */
+
+/* Statement boundary.  A free block keeps its pages and a standard pool
+ * stays mapped, so the next query reuses them without faulting (see the idle
+ * decay above).  Where memory is short that can turn against the next query:
+ * a kept pool still counts toward the watermark, so memory the next query
+ * wants in another form — a large block, or a pool of another heap — goes to
+ * spill files instead.  A repeated heavy query then ran far slower than its
+ * first run.  Handing back at every boundary near the watermark was no
+ * answer either: the next statement maps and faults it straight back
+ * (#750).  So the boundary acts on evidence, not on the footprint alone.
  *
- * So once the next pool would no longer fit under the watermark, a boundary
- * hands back what the statement left free: empty pools are unmapped — an
- * anon one leaves the watermark count, a spill one takes its dirty page
- * cache with it — the direct-block cache is drained, and the pages of the
- * remaining free blocks are released.  But only when that brings the next
- * pool back under the watermark.  When live data holds the footprint past
- * it (more data than the limit, a process that started above -m) the next
- * query's memory spills whatever is given back, and giving it back anyway
- * only makes every statement map and fault it all again — kept, its pools
- * and pages are at least reused.  Finding out costs a drain and a slab
- * flush per heap and a few header reads per possibly-empty pool
- * (heap_empty_pool_candidates), so a boundary under steady pressure stays
- * cheap.  Below the watermark the kept memory is what a repeated query
- * reuses, so nothing changes there either.
+ * The evidence is a spill: a mapping of the statement that just ended went
+ * past RAM (g_anon_spills).  Then a heap that spilled a pool ran out of its
+ * own, so its empty pools are its working set and stay, parked; the empty
+ * anonymous pools of the heaps that did not are memory the spilling one
+ * could not reach.  Those are unmapped — the relief — when that hands back
+ * at least a pool and brings the next pool under the watermark; the
+ * direct-block cache goes with them, and the pages of those heaps' other
+ * free blocks.
+ *
+ * A relief can be futile: when the next statement that maps anything spills
+ * again although it took the room for pools only, the room went back to the
+ * same kind of memory it came from — more relief only refaults it.  No relief
+ * then until a statement maps without spilling, or the watermark moves.  A
+ * statement that maps nothing says nothing either way.  The other way round,
+ * when the statement after a relief that took other threads' pools does not
+ * spill but puts large blocks in that room and runs up to the watermark, it
+ * needed the relief, and a repeat of it will again (a heavy query run again
+ * and again): its boundary relieves as a spill's would.
+ *
+ * Without the evidence, near the watermark (the next pool would not fit),
+ * the empty pools are parked (heap_park_empty_pools): the next statement
+ * takes them back without a fault, and its large blocks can still have them
+ * (heap_make_room).
+ *
+ * An empty spill pool is parked like the rest, its file, its mapping and its
+ * pages kept for the next statement that spills.  When the relief acts, the
+ * empty spill pools go with the anonymous ones, from every heap the relief
+ * visits, the spilling one's too, and a parked spill pool unused for the
+ * idle decay's threshold goes too (heap_spill_pools_age), so a server that
+ * is never idle does not keep its file for good.  The boundary
+ * visits the heaps while any spill pool is mapped — far from the watermark
+ * at most every RAY_FAR_VISIT_MS, and only for the spill pools.
+ *
+ * Every check is a relaxed load or a counter comparison; the walks — a
+ * drain and a slab flush per heap, a few header reads per possibly-empty
+ * pool, one freelist walk where a pool may be empty — run only on a spill or
+ * near the watermark (far from it, while a spill pool is mapped: the header
+ * reads and the walk).
  *
  * Only this thread's heap and the parked workers' are visited
  * (heap_each_quiescent).  Without file spill (Windows) the watermark does not
  * decide where memory goes — past it a pool comes from RAM all the same — so
  * there is nothing to win, and the memory is left to the idle decay.
- * Returns the number of blocks whose pages were released, 0 when nothing was
- * done. */
+ * Returns the number of blocks whose pages were released. */
 int64_t ray_heap_relieve(void) {
     if (!RAY_HEAP_FILE_SPILL) return 0;
     if (atomic_load_explicit(&ray_parallel_flag, memory_order_relaxed) != 0)
@@ -2936,21 +3207,66 @@ int64_t ray_heap_relieve(void) {
     const int64_t pool = (int64_t)BSIZEOF(RAY_HEAP_POOL_ORDER);
     int64_t wm = heap_anon_watermark();
     int64_t committed = atomic_load_explicit(&g_anon_committed, memory_order_relaxed);
-    if (wm <= 0 || committed + pool <= wm) return 0;
 
-    int64_t room = direct_cache_bytes();
-    heap_each_quiescent(heap_relieve_measure, &room);
-    if (committed - room + pool > wm) return 0;
+    /* What the statement that just ended did, and what that says of the
+     * last relief. */
+    int64_t maps   = atomic_load_explicit(&g_anon_maps, memory_order_relaxed);
+    int64_t large  = atomic_load_explicit(&g_anon_large, memory_order_relaxed);
+    int64_t spills = atomic_load_explicit(&g_anon_spills, memory_order_relaxed);
+    int64_t peak   = atomic_exchange_explicit(&g_anon_stmt_peak, committed,
+                                              memory_order_relaxed);
+    bool spilled = atomic_exchange_explicit(&g_relieve_spills, spills,
+                                            memory_order_relaxed) != spills;
+    bool mapped = atomic_exchange_explicit(&g_relieve_maps, maps,
+                                           memory_order_relaxed) != maps || spilled;
+    large -= atomic_exchange_explicit(&g_relieve_large, large, memory_order_relaxed);
+    bool needed = false;
+    int state = atomic_load_explicit(&g_relieve_state, memory_order_relaxed);
+    if (wm != atomic_load_explicit(&g_relieve_wm, memory_order_relaxed))
+        state = RELIEF_NONE;
+    else if (mapped && state == RELIEF_JUST) {
+        needed = large >= pool && peak + pool > wm
+              && atomic_load_explicit(&g_relieve_other, memory_order_relaxed);
+        state = (spilled && large < pool) ? RELIEF_FUTILE : RELIEF_NONE;
+    } else if (mapped && state == RELIEF_FUTILE && !spilled)
+        state = RELIEF_NONE;
+    atomic_store_explicit(&g_relieve_state, state, memory_order_relaxed);
+    if (wm <= 0) return 0;
 
-    int64_t released = 0;
-    direct_cache_drain();
-    heap_each_quiescent(heap_relieve_apply, &released);
-    return released;
+    bool relieve = (spilled || needed) && state == RELIEF_NONE;
+    bool near = relieve || spilled || committed + pool > wm;
+    if (!near && atomic_load_explicit(&g_spill_pools, memory_order_relaxed) == 0)
+        return 0;
+    int64_t now = ray_time_now_ms();
+    if (!near) {
+        if (now - atomic_load_explicit(&g_far_visit_ms, memory_order_relaxed)
+            < RAY_FAR_VISIT_MS)
+            return 0;
+        atomic_store_explicit(&g_far_visit_ms, now, memory_order_relaxed);
+    }
+    relieve_visit_t v = { 0, (uint32_t)now, near, false };
+    if (relieve) {
+        relieve_measure_t m = { direct_cache_bytes(), 0 };
+        heap_each_quiescent(heap_relieve_measure, &m);
+        v.act = m.room >= pool && committed - m.room + pool <= wm;
+        if (v.act) {
+            direct_cache_drain();
+            atomic_store_explicit(&g_relieve_wm, wm, memory_order_relaxed);
+            atomic_store_explicit(&g_relieve_state, RELIEF_JUST, memory_order_relaxed);
+            atomic_store_explicit(&g_relieve_other, m.room_other >= pool,
+                                  memory_order_relaxed);
+        }
+    }
+    heap_each_quiescent(heap_relieve_visit, &v);
+    return v.released;
 }
 
 void ray_heap_merge(ray_heap_t* src) {
     ray_heap_t* dst = ray_tl_heap;
     if (!dst || !src) return;
+    /* A parked pool's blocks are on no list; the freelist splice below
+     * carries only listed ones. */
+    heap_unpark_all(src);
 
     /* Merge stats: dst inherits src's outstanding allocations so that
      * future local frees of those blocks correctly decrement dst. */

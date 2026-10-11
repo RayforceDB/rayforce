@@ -270,11 +270,16 @@ void ray_heap_release_pages(void);
 void    ray_heap_note_activity(void);
 int64_t ray_heap_decay_due_ms(void);
 int64_t ray_heap_decay(void);
-/* At a statement boundary: when the next pool would not fit under the anon
- * watermark and handing back what is free would make it fit, unmap empty
- * pools, drain the direct-block cache and release the pages of free blocks
- * now rather than at the idle decay.  No-op otherwise, inside parallel work,
- * and without file spill (Windows). */
+/* At a statement boundary: after a statement that spilled (or one that,
+ * right after such a relief, needed its room for large blocks), unmap the
+ * empty pools of the heaps that did not spill a pool when that makes room
+ * for the next pool under the anon watermark, drain the direct-block cache
+ * and release the pages of free blocks — unless the last relief was
+ * followed by a spill all the same.  Otherwise, near the watermark, park
+ * empty pools.  Empty spill pools are parked too, their files, mappings and
+ * pages kept for the next spill, and unmapped when the relief acts, from
+ * every heap but for a heap's last pool, or at the decay threshold.
+ * No-op inside parallel work and without file spill (Windows). */
 int64_t ray_heap_relieve(void);
 
 /* Set the threshold directly; negative disables.  The environment is read
@@ -375,7 +380,8 @@ void    ray_heap_direct_cache_drain(void);
 typedef struct {
     uint16_t heap_id;     /* owning heap ID (for cross-thread free) */
     uint8_t  pool_order;  /* pool's top order */
-    uint8_t  _pad[5];
+    uint8_t  _pad;
+    uint32_t parked_ms;   /* when it was last parked, ms, wrapping (heap_park_empty_pools) */
     void*    vm_base;     /* original mmap base (for ray_vm_free on Windows) */
 } ray_pool_hdr_t;
 
@@ -435,7 +441,8 @@ typedef struct {
     uint8_t  pool_order;   /* pool order for munmap sizing */
     uint8_t  backed;       /* 0 = anon mmap, 1 = file-backed swap */
     uint8_t  hugepage;     /* 1 = THP hint issued (Linux); 0 otherwise */
-    uint8_t  _pad[1];
+    uint8_t  parked    : 1;  /* empty, its blocks off the freelists
+                              * (heap_park_empty_pools) */
 } ray_pool_entry_t;
 
 /* --------------------------------------------------------------------------
@@ -552,6 +559,8 @@ typedef struct ray_heap {
     ray_mem_stats_t  stats;
     uint32_t        pool_count;                  /* number of tracked pools */
     uint32_t        last_pool_idx;               /* MRU pool index for warm-first ray_free */
+    uint32_t        parked;                      /* pools parked among them */
+    uint32_t        spilled;                     /* a pool spilled since a boundary looked */
     ray_pool_entry_t pools[RAY_MAX_POOLS];         /* pool tracking for destroy/merge */
     struct ray_heap* pending_next;                /* link for pending-merge LIFO queue */
     struct ray_heap* idle_next;                   /* link for the abandoned-heap LIFO */
