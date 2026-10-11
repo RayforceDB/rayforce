@@ -147,14 +147,30 @@
 (probe (fn [p] (try (+ p 'a) (fn [e] 0))) 5 1000) -- true
 (probe (fn [p] (try (try (raise p) (fn [e] (raise e))) (fn [e] 0))) 5 1000) -- true
 (probe (fn [p] (try (+ p 'a) 0)) 5 1000) -- true
-;; and at the top level, where try is evaluated rather than compiled
+;; and at the top level, where try is evaluated rather than compiled.  A
+;; handler written as a literal is a new literal in each statement, which
+;; the closure template cache keeps (up to 256 of them, a bounded cost per
+;; statement): a statement is run 1000 and then 4000 times, and the two
+;; must cost the same.
 (times 100 (try (raise 5) (fn [e] 0)))
-(times 100 (try (try (raise 5) (fn [e] (raise e))) (fn [e] 0)))
 (set h0 (heapb))
 (times 1000 (try (raise 5) (fn [e] 0)))
+(set d1 (- (heapb) h0))
+(set h0 (heapb))
+(times 4000 (try (raise 5) (fn [e] 0)))
+(< (- (- (heapb) h0) d1) 1024) -- true
+(set h0 (heapb))
 (times 1000 (try (+ 1 'a) 0))
+(set d1 (- (heapb) h0))
+(set h0 (heapb))
+(times 4000 (try (+ 1 'a) 0))
+(< (- (- (heapb) h0) d1) 1024) -- true
+(set h0 (heapb))
 (times 1000 (try (try (raise 5) (fn [e] (raise e))) (fn [e] 0)))
-(< (- (heapb) h0) 4096) -- true
+(set d1 (- (heapb) h0))
+(set h0 (heapb))
+(times 4000 (try (try (raise 5) (fn [e] (raise e))) (fn [e] 0)))
+(< (- (- (heapb) h0) d1) 1024) -- true
 ;; an error raised inside nested calls leaves a trace of their frames, which
 ;; the top-level try clears with the error.  Measured within one statement:
 ;; the runner clears the trace between statements.
