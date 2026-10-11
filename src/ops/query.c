@@ -9464,22 +9464,35 @@ static bool parted_row_name_free(ray_t* dict, ray_t* tbl, int64_t row_sym) {
     return !clause_names_sym(dict, row_sym);
 }
 
+/* What a name is bound to, local before global; NULL when unbound. */
+static ray_t* sym_binding(int64_t s) {
+    ray_t* b = ray_env_get_lexical_local(s);
+    return b ? b : ray_env_get(s);
+}
+
+/* Is a name bound to `b` code a clause runs: a lambda, a name of one (a
+ * call through it calls the lambda), or (unquoted) a container that may
+ * hold lambdas? */
+static bool sym_binding_runs_code(ray_t* b, bool quoted) {
+    if (!b) return false;
+    if (b->type == RAY_LAMBDA) return true;
+    if (b->type == -RAY_SYM) {
+        ray_t* to = sym_binding(b->i64);
+        return to && to->type == RAY_LAMBDA;
+    }
+    return !quoted && (b->type == RAY_LIST || b->type == RAY_DICT || b->type == RAY_TABLE);
+}
+
 /* Does the clause value `v` run code whose column reads it does not show:
- * a lambda (written in place, or a name bound to one, quoted or not), a
- * call whose callee is computed, a name bound to a container that may hold
- * lambdas, or text or a name evaluated at run time (eval, parse, resolve,
- * load, value)? */
+ * a lambda (written in place, or a name -- plain, quoted or a dotted path
+ * -- bound to one or to its name), a call whose callee is computed, a name
+ * bound to a container that may hold lambdas, or text or a name evaluated
+ * at run time (eval, parse, resolve, load, value)? */
 static bool clause_runs_code(ray_t* v) {
     if (!v || RAY_IS_ERR(v)) return false;
     if (v->type == RAY_LAMBDA) return true;
-    if (v->type == -RAY_SYM) {
-        ray_t* b = ray_env_get_lexical_local(v->i64);
-        if (!b) b = ray_env_get(v->i64);
-        if (!b) return false;
-        if (b->type == RAY_LAMBDA) return true;
-        return !(v->attrs & ATTR_QUOTED) &&
-               (b->type == RAY_LIST || b->type == RAY_DICT || b->type == RAY_TABLE);
-    }
+    if (v->type == -RAY_SYM)   /* a dotted path too: ray_env_get walks it */
+        return sym_binding_runs_code(sym_binding(v->i64), (v->attrs & ATTR_QUOTED) != 0);
     if (v->type == RAY_DICT) {   /* each value on its own: the values list is no call */
         ray_t* dv = ray_dict_vals(v);
         if (!dv || dv->type != RAY_LIST) return clause_runs_code(dv);

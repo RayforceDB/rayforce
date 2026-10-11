@@ -504,6 +504,17 @@
 (select {by: {k: ('hy 0)} from: Prn}) -- (select {by: {k: ('hy 0)} from: Mrn})
 (select {by: {k: ((first Ly) 0)} from: Prn}) -- (select {by: {k: ((first Ly) 0)} from: Mrn})
 (select {by: {k: (first (map (first Ly) [0]))} from: Prn}) -- (select {by: {k: (first (map (first Ly) [0]))} from: Mrn})
+;; or by a dotted name into a dict of helper names ({f: hy} holds the name)
+(set Dl {f: hy})
+(select {by: {k: (Dl.f 0)} from: Prn}) -- (select {by: {k: (Dl.f 0)} from: Mrn})
+(count (select {by: {k: (Dl.f 0)} from: Prn})) -- 7
+(set hz (fn [] __row))
+(set Dz {g: hz})
+(select {by: {k: (Dz.g)} from: Mrn}) !- name
+(select {by: {k: (Dz.g)} from: Prn}) !- name
+;; or by a name bound to the helper's name
+(set gy 'hy)
+(select {by: {k: (gy 0)} from: Prn}) -- (select {by: {k: (gy 0)} from: Mrn})
 (set __row [1 1 2 2 3 3 3])
 (select {by: {k: __row} from: Prn}) -- (select {by: {k: __row} from: Mrn})
 (count (select {by: {k: __row} from: Prn})) -- 3
