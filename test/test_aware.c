@@ -27,6 +27,7 @@
 #include "ops/ops.h"
 #include "ops/internal.h"
 #include "ops/rowsel.h"
+#include "ops/fused_topk.h"
 #include "table/sym.h"
 #include "table/table.h"
 #include "core/runtime.h"
@@ -971,6 +972,230 @@ static test_result_t test_eval_float_const(void) {
     PASS();
 }
 
+/* ---- Task 3: fused filters on encoded leaves ---- */
+
+/* Fused selection over <name>0 and <name>2: equal rowsels; the generation-2
+ * run materializes nothing and decodes exactly `want_decoded` bytes
+ * (-1: do not check). */
+static test_result_t aw_sel_same(const char* name, ray_op_t* (*build)(ray_graph_t*), int64_t want_decoded) {
+    ray_t* blk[2] = { NULL, NULL }; bool all[2] = { false, false };
+    for (int gen = 0; gen <= 2; gen += 2) {
+        ray_t* t = aw_load(name, gen);
+        TEST_ASSERT_NOT_NULL(t);
+        ray_graph_t* g = ray_graph_new(t);
+        ray_op_t* pred = build(g);
+        ray_enc_counters_reset();
+        blk[gen / 2] = exec_pred_to_selection(g, pred, ray_table_nrows(t), &all[gen / 2]);
+        TEST_ASSERT_FMT(!(blk[gen / 2] && RAY_IS_ERR(blk[gen / 2])), "%s gen %d: %s", name, gen, ray_error_msg());
+        TEST_ASSERT_TRUE(blk[gen / 2] || all[gen / 2]);
+        if (gen == 2) {
+            ray_enc_counters_t k; ray_enc_counters_get(&k);
+            TEST_ASSERT_EQ_U(k.materialized, 0);
+            if (want_decoded >= 0)
+                TEST_ASSERT_FMT(k.decoded_bytes == (uint64_t)want_decoded, "%s: decoded %llu, want %lld",
+                                name, (unsigned long long)k.decoded_bytes, (long long)want_decoded);
+        }
+        ray_graph_free(g); ray_release(t);
+    }
+    TEST_ASSERT_EQ_I(all[0], all[1]);
+    if (blk[0]) {
+        ray_rowsel_t* a = ray_rowsel_meta(blk[0]); ray_rowsel_t* b = ray_rowsel_meta(blk[1]);
+        TEST_ASSERT_EQ_I(a->total_pass, b->total_pass);
+        TEST_ASSERT_TRUE(memcmp(ray_rowsel_flags(blk[0]), ray_rowsel_flags(blk[1]), a->n_segs) == 0);
+        uint32_t nidx = ray_rowsel_offsets(blk[0])[a->n_segs];
+        TEST_ASSERT_TRUE(memcmp(ray_rowsel_idx(blk[0]), ray_rowsel_idx(blk[1]), (size_t)nidx * 2) == 0);
+        ray_rowsel_release(blk[0]); ray_rowsel_release(blk[1]);
+    }
+    PASS();
+}
+static ray_op_t* ap_x_eq7(ray_graph_t* g)  { return ray_eq(g, ray_scan(g, "x"), ray_const_i64(g, 7)); }
+static ray_op_t* ap_x_gt10(ray_graph_t* g) { return ray_gt(g, ray_scan(g, "x"), ray_const_i64(g, 10)); }
+static ray_op_t* ap_x_lt1000(ray_graph_t* g) { return ray_lt(g, ray_scan(g, "x"), ray_const_i64(g, 1000)); }
+static ray_op_t* ap_band(ray_graph_t* g) {
+    return ray_and(g, ray_ge(g, ray_scan(g, "x"), ray_const_i64(g, -5)), ray_le(g, ray_scan(g, "x"), ray_const_i64(g, 12)));
+}
+static ray_op_t* ap_f_gt(ray_graph_t* g) { return ray_gt(g, ray_scan(g, "f"), ray_const_f64(g, 0.0)); }
+
+static test_result_t test_filter_encoded_leaves(void) {
+    const char* tbl = "(table [x] (list (as 'I32 (map (fn [j] (if (== 0 (% j 9)) 0N (- (% j 50) 20))) (til 70000)))))";
+    test_result_t r;
+    static const int enc[] = { RAY_ENC_FOR_BP, RAY_ENC_RLE, RAY_ENC_DICT };
+    static const char* nm[] = { "lf", "lr", "ld" };
+    for (int i = 0; i < 3; i++) {
+        aw_save(nm[i], tbl, enc[i]);
+        TEST_ASSERT_EQ_I(aw_vec_enc(nm[i], "x", 0), enc[i]);
+        if ((r = aw_sel_same(nm[i], ap_x_eq7, 0)).status != TEST_PASS) return r;   /* codes answer: no decode */
+        if ((r = aw_sel_same(nm[i], ap_band, 0)).status != TEST_PASS) return r;
+    }
+    /* RAW: no evaluator; every vector holds 7 and other values, so none is
+     * decided and every one decodes: all 70000 rows x 4 bytes */
+    aw_save("lw", tbl, RAY_ENC_RAW);
+    if ((r = aw_sel_same("lw", ap_x_eq7, 70000 * 4)).status != TEST_PASS) return r;
+    PASS();
+}
+
+/* Vector-level decisions: x = row; a predicate true for rows 0..999 decides
+ * every vector from its descriptor except vector 0 (rows 0..1023), which the
+ * FOR_BP leaf answers without a decode.  The descriptor half passes at HEAD
+ * (17b); vector 0's leaf is this task's. */
+static test_result_t test_filter_vector_decisions(void) {
+    aw_save("vd1", "(table [x] (list (til 70000)))", RAY_ENC_FOR_BP);
+    return aw_sel_same("vd1", ap_x_lt1000, 0);
+}
+
+/* Review focus 1: nullable CONST vectors and null masking.  x is constant
+ * per vector (vector index) with every 5th row null. */
+static test_result_t test_filter_nulls_masked(void) {
+    aw_save("nm", "(table [x] (list (as 'I32 (map (fn [j] (if (== 0 (% j 5)) 0N (div j 1024))) (til 70000)))))", RAY_ENC_CONST);
+    test_result_t r;
+    if ((r = aw_sel_same("nm", ap_x_lt1000, 0)).status != TEST_PASS) return r;   /* value < c and null < c: every vector ALL */
+    if ((r = aw_sel_same("nm", ap_x_gt10, 0)).status != TEST_PASS) return r;     /* passing vectors are MIX (nulls fail >) */
+    PASS();
+}
+
+/* Mixed generations: x generation 2 (a leaf), y generation 0 (a plain
+ * register in the same program).  The generation-0 save of the pair is the
+ * reference. */
+static ray_op_t* ap_mixed(ray_graph_t* g) {
+    return ray_and(g, ray_eq(g, ray_scan(g, "x"), ray_const_i64(g, 7)), ray_gt(g, ray_scan(g, "y"), ray_const_i64(g, 300)));
+}
+static test_result_t test_filter_mixed_generations(void) {
+    aw_eval_ok("(set W (table [x y] (list (as 'I32 (- (% (til 70000) 50) 20)) (% (* (til 70000) 7) 1000))))");
+    aw_eval_ok("(.db.splayed.set \"" AW_TMP "/mx0/\" W {compress: false})");
+    /* generation 2 for x only: save compressed, then put y back as generation 0 */
+    aw_eval_ok("(.db.splayed.set \"" AW_TMP "/mx2/\" W {compress: true})");
+    char dir[512];
+    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(ray_test_tmp(AW_TMP "/mx2"), dir, sizeof dir), RAY_OK);
+    char ypath[600]; snprintf(ypath, sizeof ypath, "%s/y", dir);
+    ray_t* y0 = aw_eval("(at W 'y)");
+    TEST_ASSERT_TRUE(y0 && !RAY_IS_ERR(y0));
+    TEST_ASSERT_EQ_I(ray_col_save_gen(y0, ypath, 0), RAY_OK);
+    ray_release(y0);
+    ray_t* t = aw_load("mx", 2);
+    TEST_ASSERT_NOT_NULL(t);
+    ray_col_meta_t mx, my;
+    TEST_ASSERT_TRUE(ray_table_col_meta(t, ray_sym_intern("x", 1), &mx) && mx.enc);
+    TEST_ASSERT_TRUE(ray_table_col_meta(t, ray_sym_intern("y", 1), &my) && !my.enc);
+    ray_release(t);
+    return aw_sel_same("mx", ap_mixed, -1);
+}
+
+/* A parted table: the plan is built per segment. */
+static test_result_t test_filter_parted_leaves(void) {
+    for (int gen = 0; gen <= 2; gen += 2)
+        for (int p = 0; p < 2; p++) {
+            char q[600];
+            snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/pl%d/2024.01.0%d/t/\" "
+                     "(table [x] (list (as 'I32 (- (%% (til 70000) 50) 20)))) {compress: %s})",
+                     gen, p + 1, gen ? "true" : "false");
+            aw_eval_ok(q);
+        }
+    ray_t* a = aw_eval("(count (select {from: (.db.parted.get \"" AW_TMP "/pl0\" 't) where: (== x 7)}))");
+    ray_enc_counters_reset();
+    ray_t* b = aw_eval("(count (select {from: (.db.parted.get \"" AW_TMP "/pl2\" 't) where: (== x 7)}))");
+    ray_enc_counters_t k; ray_enc_counters_get(&k);
+    TEST_ASSERT_TRUE(a && b && !RAY_IS_ERR(a) && !RAY_IS_ERR(b));
+    TEST_ASSERT_EQ_I(a->i64, b->i64);
+    TEST_ASSERT_EQ_U(k.materialized, 0);
+    TEST_ASSERT_EQ_U(k.decoded_bytes, 0);        /* leaves on the encoded segments */
+    ray_release(a); ray_release(b);
+    PASS();
+}
+
+/* Floats: chunk and vector decisions with both zeros; CONST float vectors
+ * (-0.0 and 0.0, vectors 0-3) answered by the CONST decision; the RAW
+ * vectors of j > 0 are decided all-pass by their descriptors (> 0.0). */
+static test_result_t test_filter_floats(void) {
+    aw_save("fl", "(table [f] (list (map (fn [j] (if (< j 2048) -0.0 (if (< j 4096) 0.0 (as 'F64 j)))) (til 70000))))", -1);
+    return aw_sel_same("fl", ap_f_gt, 0);
+}
+
+/* D8: the fused top-k predicate.  x nullable (the leaf fixtures): the sort
+ * key x is materialized once, so the predicate reads it in place and adds
+ * no decode.  x without nulls beside a sort key k: the predicate leaf is
+ * answered on x's views, so x decodes nothing at all. */
+static test_result_t test_fused_pred_leaves(void) {
+    const char* tbl = "(table [x] (list (as 'I32 (map (fn [j] (if (== 0 (% j 9)) 0N (- (% j 50) 20))) (til 70000)))))";
+    const char* tbk = "(table [x k] (list (as 'I32 (- (% (til 70000) 50) 20)) (% (* (til 70000) 7) 200)))";
+    static const int enc[] = { RAY_ENC_FOR_BP, RAY_ENC_RLE, RAY_ENC_DICT };
+    static const char* nm[] = { "lf", "lr", "ld" };
+    static const char* nk[] = { "kf", "kr", "kd" };
+    for (int i = 0; i < 3; i++) {
+        aw_save(nm[i], tbl, enc[i]);
+        uint64_t ran, dec;
+        ray_fused_topk_counters_reset();
+        test_result_t r = aw_same(nm[i], "(select {x: x from: T where: (== x 7) desc: x take: 3})", 1);
+        if (r.status != TEST_PASS) return r;
+        ray_fused_topk_counters(&ran, &dec);
+        TEST_ASSERT_EQ_U(ran, 2);                                /* both generations take the fused top-k */
+        TEST_ASSERT_EQ_U(aw_col_decoded("x"), 70000 * 4);        /* the sort key's materialization only */
+
+        aw_save(nk[i], tbk, enc[i]);
+        TEST_ASSERT_EQ_I(aw_vec_enc(nk[i], "x", 0), enc[i]);
+        ray_fused_topk_counters_reset();
+        r = aw_same(nk[i], "(select {k: k from: T where: (== x 7) desc: k take: 3})", 1);
+        if (r.status != TEST_PASS) return r;
+        ray_fused_topk_counters(&ran, &dec);
+        TEST_ASSERT_EQ_U(ran, 2);
+        TEST_ASSERT_EQ_U(aw_col_decoded("x"), 0);                /* the leaf reads x's views */
+        ray_fused_topk_counters_reset();
+        r = aw_same(nk[i], "(select {k: k from: T where: (> x 25) take: 5})", 1);   /* the fused take (k: the output gather, Task 6) */
+        if (r.status != TEST_PASS) return r;
+        ray_fused_topk_counters(&ran, &dec);
+        TEST_ASSERT_EQ_U(ran, 2);
+        TEST_ASSERT_EQ_U(aw_col_decoded("x"), 0);
+        /* from the end: windows end at the table's last row, so they lie
+         * inside a vector (the leaf's whole-vector answer is cut) */
+        ray_fused_topk_counters_reset();
+        r = aw_same(nk[i], "(select {k: k from: T where: (> x 25) take: -1500})", 1);
+        if (r.status != TEST_PASS) return r;
+        ray_fused_topk_counters(&ran, &dec);
+        TEST_ASSERT_EQ_U(ran, 2);
+        TEST_ASSERT_EQ_U(aw_col_decoded("x"), 0);
+    }
+    PASS();
+}
+
+/* Every operator, both operand orders, constants below, inside and above
+ * the I16 range and the values, on a nullable I16 column under each
+ * encoding with a view (FOR_BP, RLE, DICT, CONST per vector): the leaf
+ * answers equal generation 0's and nothing decodes. */
+static uint16_t g_lop; static int64_t g_lc; static bool g_lsw;
+static ray_op_t* ap_leaf_op(ray_graph_t* g) {
+    ray_op_t* x = ray_scan(g, "x"); ray_op_t* c = ray_const_i64(g, g_lc);
+    ray_op_t* a = g_lsw ? c : x; ray_op_t* b = g_lsw ? x : c;
+    switch (g_lop) {
+    case OP_EQ: return ray_eq(g, a, b); case OP_NE: return ray_ne(g, a, b);
+    case OP_LT: return ray_lt(g, a, b); case OP_LE: return ray_le(g, a, b);
+    case OP_GT: return ray_gt(g, a, b); default:    return ray_ge(g, a, b);
+    }
+}
+static test_result_t test_filter_leaf_ops(void) {
+    const char* tbl = "(table [x] (list (as 'I16 (map (fn [j] (if (== 0 (% j 7)) 0N (- (% j 50) 20))) (til 9000)))))";
+    const char* tbc = "(table [x] (list (as 'I16 (map (fn [j] (if (== 0 (% j 7)) 0N (- (div j 1024) 4))) (til 9000)))))";
+    static const int enc[] = { RAY_ENC_FOR_BP, RAY_ENC_RLE, RAY_ENC_DICT, RAY_ENC_CONST };
+    static const int64_t cs[] = { -100000, -32768, -21, -20, 3, 29, 30, 32767, 100000 };
+    static const uint16_t ops[] = { OP_EQ, OP_NE, OP_LT, OP_LE, OP_GT, OP_GE };
+    for (int e = 0; e < 4; e++) {
+        aw_save("lo", e == 3 ? tbc : tbl, enc[e]);
+        TEST_ASSERT_EQ_I(aw_vec_enc("lo", "x", 1), enc[e]);
+        for (int o = 0; o < 6; o++)
+            for (size_t ci = 0; ci < sizeof cs / sizeof cs[0]; ci++)
+                for (int sw = 0; sw < 2; sw++) {
+                    g_lop = ops[o]; g_lc = cs[ci]; g_lsw = sw;
+                    test_result_t r = aw_sel_same("lo", ap_leaf_op, 0);
+                    if (r.status != TEST_PASS) {
+                        fprintf(stderr, "enc %d op %u c %lld swapped %d\n", enc[e], ops[o], (long long)cs[ci], sw);
+                        return r;
+                    }
+                }
+        char rm[256];
+        snprintf(rm, sizeof rm, "%s/lo0", aw_root()); (void)ray_test_rm_rf(rm);
+        snprintf(rm, sizeof rm, "%s/lo2", aw_root()); (void)ray_test_rm_rf(rm);
+    }
+    PASS();
+}
+
 const test_entry_t aware_entries[] = {
     { "aware/vview_encodings", test_vview_encodings, aw_setup, aw_teardown },
     { "aware/vview_near_top",  test_vview_near_top,  aw_setup, aw_teardown },
@@ -983,5 +1208,13 @@ const test_entry_t aware_entries[] = {
     { "aware/eval_gen0",        test_eval_gen0,        aw_setup, aw_teardown },
     { "aware/eval_sym",         test_eval_sym,         aw_setup, aw_teardown },
     { "aware/eval_float_const", test_eval_float_const, aw_setup, aw_teardown },
+    { "aware/filter_encoded_leaves",   test_filter_encoded_leaves,   aw_setup, aw_teardown },
+    { "aware/filter_vector_decisions", test_filter_vector_decisions, aw_setup, aw_teardown },
+    { "aware/filter_nulls_masked",     test_filter_nulls_masked,     aw_setup, aw_teardown },
+    { "aware/filter_floats",           test_filter_floats,           aw_setup, aw_teardown },
+    { "aware/filter_mixed_generations", test_filter_mixed_generations, aw_setup, aw_teardown },
+    { "aware/filter_parted_leaves",    test_filter_parted_leaves,    aw_setup, aw_teardown },
+    { "aware/fused_pred_leaves",       test_fused_pred_leaves,       aw_setup, aw_teardown },
+    { "aware/filter_leaf_ops",         test_filter_leaf_ops,         aw_setup, aw_teardown },
     { NULL, NULL, NULL, NULL },
 };

@@ -44,6 +44,7 @@
 #include "lang/eval.h"        /* ATTR_QUOTED */
 #include "store/enc.h"        /* RAY_ENC_VEC: the range-read vector */
 #include "store/enccol.h"     /* ray_enc_chunk_stat_t: the directory gate */
+#include "store/enceval.h"    /* encoded leaves: ray_enc_eval_cmp */
 #include "vec/str.h"          /* ray_str_t_ptr: STR through a view */
 
 #include <assert.h>
@@ -729,14 +730,28 @@ static bool fp_reads_nothing(const fp_cmp_t* c) {
     return c->fold || (c->col_type == RAY_SYM && !c->cval_in_dict);
 }
 
+/* A child answered on its vector's view (store/enceval.h): a plain
+ * integer / temporal compare, or SYM equality with a constant of the
+ * domain.  A non-typed child has no nulls (fp_src_supported_op), and SYM
+ * nulls are in band, so no null mask is applied. */
+static bool fp_view_leaf(const fp_cmp_t* c) {
+    if (c->typed_compare || c->fold != FP_FOLD_NONE || c->op > FP_GE) return false;
+    if (c->col_type == RAY_SYM) return (c->op == FP_EQ || c->op == FP_NE) && c->cval_in_dict;
+    return zone_dir_type(c->col_type);
+}
+
 /* Rebind an encoded child to the view of [start, start + n) (one vector),
  * shifted so that row `start` is index 0: rows are passed as [0, n).  The
  * directory gate decides a whole range from its chunk's statistics first,
  * then from its vector's descriptor (*decided 0 / 1, nothing read); a
  * materialization another consumer
- * published meanwhile is read in place, never decoded again. */
+ * published meanwhile is read in place, never decoded again.  Otherwise a
+ * leaf (fp_view_leaf) is evaluated on the vector's view into dst[0, n)
+ * (*decided 2, nothing decoded); a vector without a view is read by
+ * range. */
 static ray_t* fp_bind_view(const fp_cmp_t* c, int64_t start, int64_t n,
-                           ray_col_scratch_t* sc, fp_cmp_t* out, int* decided) {
+                           ray_col_scratch_t* sc, ray_enc_vview_t* vb, uint8_t* dst,
+                           fp_cmp_t* out, int* decided) {
     *out = *c;
     *decided = -1;
     if (!c->typed_compare && zone_dir_type(c->col_type) && c->op <= FP_GE &&
@@ -766,6 +781,23 @@ static ray_t* fp_bind_view(const fp_cmp_t* c, int64_t start, int64_t n,
                       ? (const char*)ray_data(own->str_pool) : NULL;
         out->col_obj = NULL;                       /* rows are view-relative */
         return NULL;
+    }
+    if (!rd && fp_view_leaf(c)) {
+        ray_t* verr = NULL;
+        int vr = ray_col_src_vview(c->src, start / RAY_ENC_VEC, vb, &verr);
+        if (vr < 0) return verr;
+        int64_t off = start % RAY_ENC_VEC;
+        /* a bitmap with nulls cannot occur here (a non-typed child is
+         * null-free); were it present, the range read answers exactly */
+        if (vr > 0 && !vb->nullmap && off + n <= vb->n) {
+            uint8_t whole[RAY_ENC_VEC];                /* a window inside the vector */
+            uint8_t* o = off == 0 && n == vb->n ? dst : whole;
+            if (ray_enc_eval_cmp(vb, cmp_op_of(c->op), c->cval, 0, o)) {
+                if (o != dst) memcpy(dst, whole + off, (size_t)n);
+                *decided = 2;
+                return NULL;
+            }
+        }
     }
     ray_col_range_t v;
     ray_t* e = ray_col_range(c->src, start, n, sc, &v);
@@ -801,10 +833,10 @@ ray_t* fp_eval_pred_rs(const fp_pred_t* p, int64_t start, int64_t end,
         uint8_t* dst = i == 0 ? bits : tmp;
         if (c->enc && !fp_reads_nothing(c)) {
             fp_cmp_t local; int decided;
-            ray_t* e = fp_bind_view(c, start, n, &s->sc[i], &local, &decided);
+            ray_t* e = fp_bind_view(c, start, n, &s->sc[i], &s->vb, dst, &local, &decided);
             if (e) return e;
-            if (decided >= 0) memset(dst, decided, (size_t)n);
-            else fp_eval_cmp(&local, 0, n, dst);
+            if (decided == 0 || decided == 1) memset(dst, decided, (size_t)n);
+            else if (decided < 0) fp_eval_cmp(&local, 0, n, dst);   /* 2: written on the view */
         } else if (c->enc) {
             fp_eval_cmp(c, 0, n, dst);            /* reads no column */
         } else {

@@ -157,12 +157,31 @@ typedef struct { bool member; uint16_t op; int64_t c; const int64_t* set; int ns
 static inline int run_pred(const run_pred_t* p, int64_t x) {
     return p->member ? in_set(p->set, p->nset, x) : cmp_one(x, p->op, p->c);
 }
+/* ray_enc_logical, inlined for the per-run loop */
+static inline int64_t logical_of(uint64_t bits, ray_enc_kind_t k) {
+    if (k.T == 64) return (int64_t)bits;
+    const uint64_t m = (1ull << k.T) - 1;
+    bits &= m;
+    return k.is_signed && (bits >> (k.T - 1)) & 1 ? (int64_t)(bits | ~m) : (int64_t)bits;
+}
+/* bits[i, e) = b in 8-byte stores (runs are often a few rows: a memset
+ * call per run costs more than the run).  A store may reach past e, never
+ * past n: the next run, which starts at e, overwrites those bytes. */
+static inline void fill_run(uint8_t* bits, uint32_t i, uint32_t e, uint32_t n, uint8_t b) {
+    const uint64_t pat = 0x0101010101010101ull * b;
+    for (; i + 8 <= e; i += 8) memcpy(bits + i, &pat, 8);
+    if (i < e) {
+        if (i + 8 <= n) memcpy(bits + i, &pat, 8);
+        else for (; i < e; i++) bits[i] = b;
+    }
+}
 static void eval_runs(const ray_enc_vview_t* v, const run_pred_t* p, uint8_t* bits) {
     uint32_t i = 0;
     for (uint32_t r = 0; r < v->n_runs; r++) {
-        const uint8_t b = (uint8_t)run_pred(p, ray_enc_logical(lane(&v->run_vals, v->k.T, r), v->k));
-        memset(bits + i, b, (size_t)(v->run_ends.h[r] - i));
-        i = v->run_ends.h[r];
+        const uint8_t b = (uint8_t)run_pred(p, logical_of(lane(&v->run_vals, v->k.T, r), v->k));
+        const uint32_t e = v->run_ends.h[r];
+        fill_run(bits, i, e, (uint32_t)v->n, b);
+        i = e;
     }
 }
 

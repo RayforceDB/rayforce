@@ -29,6 +29,7 @@
 #include "ops/colbind.h"
 #include "ops/idxop.h"      /* RAY_IDX_CHUNK_ZONE per-morsel zone-skip */
 #include "store/enccol.h"    /* ray_enccol_seg: encoded parted segments */
+#include "store/enceval.h"   /* encoded leaves: ray_enc_eval_cmp, ray_enc_const_decision */
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -1858,6 +1859,7 @@ static void expr_exec_unary(uint8_t opcode, uint8_t null_aware, int8_t dt, void*
     }
 }
 
+
 /* A ragged partition's synthetic stand-in (ray_read_parted's all-null
  * segment, built in memory): the only source whose directory the all-null
  * rules below trust.  A chunk of a column saved encoded is decoded, and so
@@ -1898,97 +1900,133 @@ static bool expr_enc_null_fill(const ray_expr_t* expr, uint8_t r, int64_t start,
     return true;
 }
 
+/* Load register r for morsel rows [start, start + n) into *rptr: a scan
+ * register's values (in place when its native type matches, else
+ * converted into scratch[r]; an encoded one by range, at most one vector
+ * per read), a constant broadcast into scratch[r], or scratch[r] for a
+ * scratch register.  NULL, or an owned error when a range read fails. */
+RAY_INLINE ray_t* expr_load_reg(const ray_expr_t* expr, uint8_t r, void** scratch,
+                                ray_col_scratch_t* rsc, int64_t start, int64_t n, void** rptr) {
+    int8_t rt = expr->regs[r].type;
+    int8_t ct = expr->regs[r].col_type;
+    switch (expr->regs[r].kind) {
+        case REG_SCAN: {
+            /* Direct pointer if native type matches, else convert.
+             * Nullable F64/I64 columns may take the direct path: their
+             * sentinels (NaN / NULL_I64) are already canonical in place.
+             * Narrow types always go through expr_load_* for sentinel
+             * normalization. */
+            uint8_t ca = expr->regs[r].col_attrs;
+            bool hn = expr->regs[r].nullable;
+            bool direct = (rt == RAY_F64 && ct == RAY_F64) ||
+                          (rt == RAY_I64 && (ct == RAY_I64 || ct == RAY_TIMESTAMP)) ||
+                          (rt == RAY_I64 && ct == RAY_SYM && (ca & RAY_SYM_W_MASK) == RAY_SYM_W64);
+            if (expr->regs[r].enc) {
+                /* generation 2: at most one vector per range read; a
+                 * morsel that straddles a vector boundary is assembled
+                 * piece by piece into this register's scratch */
+                int64_t at = 0;
+                *rptr = scratch[r];
+                /* a morsel inside an all-null directory chunk (a ragged
+                 * partition's synthetic segment) loads as the nulls the
+                 * decode would give, without decoding */
+                if (expr_enc_null_fill(expr, r, start, n, scratch[r])) return NULL;
+                /* a narrow integer register over one whole vector is
+                 * widened straight from the packed values into the
+                 * register (no range scratch, no expr_load pass) */
+                if (!direct && (rt == RAY_I64 || rt == RAY_F64) &&
+                    (ct == RAY_BOOL || ct == RAY_U8 || ct == RAY_I16 || ct == RAY_I32 ||
+                     ct == RAY_DATE || ct == RAY_TIME)) {
+                    ray_t* e = ray_col_range_wide(expr->regs[r].src, start, n, &rsc[r], rt, scratch[r], &at);
+                    if (e) return e;
+                }
+                while (at < n) {
+                    ray_col_range_t v;
+                    ray_t* e = ray_col_range(expr->regs[r].src, start + at, n - at, &rsc[r], &v);
+                    if (e) return e;
+                    if (v.n <= 0) return ray_error("corrupt", "fused scan: short range read");
+                    if (at == 0 && v.n == n && direct) { *rptr = (void*)v.data; break; }
+                    if (direct)
+                        memcpy((char*)scratch[r] + at * 8, v.data, (size_t)v.n * 8);
+                    else if (rt == RAY_F64)
+                        expr_load_f64((double*)scratch[r] + at, v.data, ct, v.attrs, hn, 0, v.n);
+                    else
+                        expr_load_i64((int64_t*)scratch[r] + at, v.data, ct, v.attrs, hn, 0, v.n);
+                    at += v.n;
+                }
+            } else if (direct) {
+                *rptr = (char*)expr->regs[r].data + (size_t)start * 8;
+            } else {
+                *rptr = scratch[r];
+                if (rt == RAY_F64)
+                    expr_load_f64(scratch[r], expr->regs[r].data, ct, ca, hn, start, n);
+                else
+                    expr_load_i64(scratch[r], expr->regs[r].data, ct, ca, hn, start, n);
+            }
+        }
+            break;
+        case REG_CONST:
+            *rptr = scratch[r];
+            if (rt == RAY_F64) {
+                double v = expr->regs[r].const_f64;
+                double* d = (double*)scratch[r];
+                for (int64_t j = 0; j < n; j++) d[j] = v;
+            } else {
+                int64_t v = expr->regs[r].const_i64;
+                int64_t* d = (int64_t*)scratch[r];
+                for (int64_t j = 0; j < n; j++) d[j] = v;
+            }
+            break;
+        default: /* REG_SCRATCH */
+            *rptr = scratch[r];
+            break;
+    }
+    return NULL;
+}
+
+static int expr_leaf_on_view(const ray_expr_t* expr, const expr_enc_plan_t* p, uint8_t i,
+                             ray_enc_vview_t* vbuf, void** scratch, void** rptrs,
+                             int64_t start, int64_t n, ray_t** err);
+
 /* Evaluate compiled expression for morsel [start, end).
  * scratch: array of EXPR_MAX_REGS buffers, each EXPR_MORSEL*8 bytes.
  * rsc: one range scratch per register index, NULL when no register is
- * encoded.  Returns pointer to output data (morsel-relative indexing);
- * NULL with an owned *err when a range read fails. */
-static void* expr_eval_morsel(const ray_expr_t* expr, void** scratch,
-                              ray_col_scratch_t* rsc, int64_t start, int64_t end,
+ * encoded.  plan (NULL: none, every register is loaded): the encoded
+ * leaves, answered on the vector's view (vbuf) where it has one; a
+ * register the plan does not load is loaded only when a leaf falls back
+ * to its kernel.  Returns pointer to output data (morsel-relative
+ * indexing); NULL with an owned *err when a range read fails.  Kept one
+ * copy (noclone) and the kernels' only caller, so the compiler inlines
+ * them here as it always has (generation 0's codegen). */
+__attribute__((noinline, noclone)) static void* expr_eval_morsel(const ray_expr_t* expr, const expr_enc_plan_t* plan, ray_enc_vview_t* vbuf,
+                              void** scratch, ray_col_scratch_t* rsc, int64_t start, int64_t end,
                               ray_t** err) {
     int64_t n = end - start;
     if (n <= 0) return NULL;
 
     void* rptrs[EXPR_MAX_REGS];
+    bool loaded[EXPR_MAX_REGS];
     for (uint8_t r = 0; r < expr->n_regs; r++) {
-        int8_t rt = expr->regs[r].type;
-        int8_t ct = expr->regs[r].col_type;
-        switch (expr->regs[r].kind) {
-            case REG_SCAN: {
-                /* Direct pointer if native type matches, else convert.
-                 * Nullable F64/I64 columns may take the direct path: their
-                 * sentinels (NaN / NULL_I64) are already canonical in place.
-                 * Narrow types always go through expr_load_* for sentinel
-                 * normalization. */
-                uint8_t ca = expr->regs[r].col_attrs;
-                bool hn = expr->regs[r].nullable;
-                bool direct = (rt == RAY_F64 && ct == RAY_F64) ||
-                              (rt == RAY_I64 && (ct == RAY_I64 || ct == RAY_TIMESTAMP)) ||
-                              (rt == RAY_I64 && ct == RAY_SYM && (ca & RAY_SYM_W_MASK) == RAY_SYM_W64);
-                if (expr->regs[r].enc) {
-                    /* generation 2: at most one vector per range read; a
-                     * morsel that straddles a vector boundary is assembled
-                     * piece by piece into this register's scratch */
-                    int64_t at = 0;
-                    rptrs[r] = scratch[r];
-                    /* a morsel inside an all-null directory chunk (a ragged
-                     * partition's synthetic segment) loads as the nulls the
-                     * decode would give, without decoding */
-                    if (expr_enc_null_fill(expr, r, start, n, scratch[r])) continue;
-                    /* a narrow integer register over one whole vector is
-                     * widened straight from the packed values into the
-                     * register (no range scratch, no expr_load pass) */
-                    if (!direct && (rt == RAY_I64 || rt == RAY_F64) &&
-                        (ct == RAY_BOOL || ct == RAY_U8 || ct == RAY_I16 || ct == RAY_I32 ||
-                         ct == RAY_DATE || ct == RAY_TIME)) {
-                        ray_t* e = ray_col_range_wide(expr->regs[r].src, start, n, &rsc[r], rt, scratch[r], &at);
-                        if (e) { *err = e; return NULL; }
-                    }
-                    while (at < n) {
-                        ray_col_range_t v;
-                        ray_t* e = ray_col_range(expr->regs[r].src, start + at, n - at, &rsc[r], &v);
-                        if (e) { *err = e; return NULL; }
-                        if (v.n <= 0) { *err = ray_error("corrupt", "fused scan: short range read"); return NULL; }
-                        if (at == 0 && v.n == n && direct) { rptrs[r] = (void*)v.data; break; }
-                        if (direct)
-                            memcpy((char*)scratch[r] + at * 8, v.data, (size_t)v.n * 8);
-                        else if (rt == RAY_F64)
-                            expr_load_f64((double*)scratch[r] + at, v.data, ct, v.attrs, hn, 0, v.n);
-                        else
-                            expr_load_i64((int64_t*)scratch[r] + at, v.data, ct, v.attrs, hn, 0, v.n);
-                        at += v.n;
-                    }
-                } else if (direct) {
-                    rptrs[r] = (char*)expr->regs[r].data + (size_t)start * 8;
-                } else {
-                    rptrs[r] = scratch[r];
-                    if (rt == RAY_F64)
-                        expr_load_f64(scratch[r], expr->regs[r].data, ct, ca, hn, start, n);
-                    else
-                        expr_load_i64(scratch[r], expr->regs[r].data, ct, ca, hn, start, n);
-                }
-            }
-                break;
-            case REG_CONST:
-                rptrs[r] = scratch[r];
-                if (rt == RAY_F64) {
-                    double v = expr->regs[r].const_f64;
-                    double* d = (double*)scratch[r];
-                    for (int64_t j = 0; j < n; j++) d[j] = v;
-                } else {
-                    int64_t v = expr->regs[r].const_i64;
-                    int64_t* d = (int64_t*)scratch[r];
-                    for (int64_t j = 0; j < n; j++) d[j] = v;
-                }
-                break;
-            default: /* REG_SCRATCH */
-                rptrs[r] = scratch[r];
-                break;
-        }
+        if (plan && !plan->load_reg[r]) { rptrs[r] = scratch[r]; loaded[r] = false; continue; }
+        loaded[r] = true;
+        ray_t* e = expr_load_reg(expr, r, scratch, rsc, start, n, &rptrs[r]);
+        if (e) { *err = e; return NULL; }
     }
 
     for (uint8_t i = 0; i < expr->n_ins; i++) {
         const expr_ins_t* ins = &expr->ins[i];
+        if (plan && plan->leaf_of_ins[i] >= 0) {
+            int lv = expr_leaf_on_view(expr, plan, i, vbuf, scratch, rptrs, start, n, err);
+            if (lv < 0) return NULL;
+            if (lv > 0) continue;
+            /* no view or no evaluator: load the register (once) and run the kernel */
+            uint8_t lr = plan->leaf[plan->leaf_of_ins[i]].reg;
+            if (!loaded[lr]) {
+                ray_t* e = expr_load_reg(expr, lr, scratch, rsc, start, n, &rptrs[lr]);
+                if (e) { *err = e; return NULL; }
+                loaded[lr] = true;
+            }
+        }
         int8_t dt = expr->regs[ins->dst].type;
         if (ins->src2 != 0xFF) {
             expr_exec_binary(ins->opcode, ins->null_aware, dt, rptrs[ins->dst],
@@ -2099,6 +2137,29 @@ static int zone_vec_decision(const ray_col_src_t* src, int64_t v, uint16_t cmp_o
     return d < 0 ? ZT_MIXED : d;
 }
 
+/* The float arm of the two decisions above: an F32 / F64 register against
+ * an F64 constant, from the double extrema (bit patterns) of the chunk's
+ * directory and then of the vector's descriptor.  A chunk whose every row
+ * is null is left to the kernel (zone_cmp_core_f64), synthetic or not. */
+static inline bool zone_f64_type(int8_t t) { return t == RAY_F32 || t == RAY_F64; }
+static int zone_dir_decision_f64(const ray_col_src_t* src, int64_t ch, uint16_t cmp_op, double cval) {
+    ray_enc_chunk_stat_t st;
+    if (!ray_col_src_chunk_stat(src, ch, &st)) return ZT_MIXED;
+    double mn, mx;
+    memcpy(&mn, &st.min, 8); memcpy(&mx, &st.max, 8);
+    int d = zone_cmp_core_f64(mn, mx, st.has_minmax, st.null_count > 0,
+                              (int64_t)st.null_count == st.rows, cmp_op, cval);
+    return d < 0 ? ZT_MIXED : d;
+}
+static int zone_vec_decision_f64(const ray_col_src_t* src, int64_t v, uint16_t cmp_op, double cval) {
+    int64_t bmn, bmx; uint32_t nn;
+    if (!ray_col_src_vec_stat(src, v, &bmn, &bmx, &nn)) return ZT_MIXED;
+    double mn, mx;
+    memcpy(&mn, &bmn, 8); memcpy(&mx, &bmx, 8);
+    int d = zone_cmp_core_f64(mn, mx, true, nn > 0, false, cmp_op, cval);
+    return d < 0 ? ZT_MIXED : d;
+}
+
 /* Does `col` carry a fresh, integer/temporal chunk-zone index? */
 static inline const ray_index_t* zone_fresh_index(const ray_t* col) {
     if (!col || !(col->attrs & RAY_ATTR_HAS_INDEX) || !col->index) return NULL;
@@ -2115,7 +2176,7 @@ static bool expr_zone_eligible(const ray_expr_t* expr) {
     if (expr->out_type != RAY_BOOL) return false;
     for (uint8_t r = 0; r < expr->n_regs; r++)
         if (expr->regs[r].kind == REG_SCAN &&
-            (expr->regs[r].enc ? zone_dir_type(expr->regs[r].col_type)
+            (expr->regs[r].enc ? zone_dir_type(expr->regs[r].col_type) || zone_f64_type(expr->regs[r].col_type)
                                : zone_fresh_index(expr->regs[r].col_obj) != NULL))
             return true;
     return false;
@@ -2142,6 +2203,24 @@ static int expr_zone_decide(const ray_expr_t* expr, int64_t ms, int64_t me) {
                 cmp = zone_swap_op(op);
             }
             int d = ZT_MIXED;
+            /* the float arm: an encoded F32 / F64 register against an F64
+             * constant (generation-0 float registers have no zone: their
+             * chunk-zone index is never is_f64-admitted).  A NaN constant
+             * (the null) is left to the kernel. */
+            int fr = -1; double fc = 0; uint16_t fcmp = op;
+            if (expr->regs[a].kind == REG_SCAN && expr->regs[a].enc && zone_f64_type(expr->regs[a].col_type) &&
+                expr->regs[a].type == RAY_F64 && expr->regs[b].kind == REG_CONST && expr->regs[b].type == RAY_F64) {
+                fr = a; fc = expr->regs[b].const_f64;
+            } else if (expr->regs[b].kind == REG_SCAN && expr->regs[b].enc && zone_f64_type(expr->regs[b].col_type) &&
+                       expr->regs[b].type == RAY_F64 && expr->regs[a].kind == REG_CONST && expr->regs[a].type == RAY_F64) {
+                fr = b; fc = expr->regs[a].const_f64; fcmp = zone_swap_op(op);
+            }
+            if (fr >= 0 && fc == fc) {
+                if ((ms >> 16) == ((me - 1) >> 16))
+                    d = zone_dir_decision_f64(expr->regs[fr].src, ms >> 16, fcmp, fc);
+                if (d == ZT_MIXED && ms / RAY_ENC_VEC == (me - 1) / RAY_ENC_VEC)
+                    d = zone_vec_decision_f64(expr->regs[fr].src, ms / RAY_ENC_VEC, fcmp, fc);
+            }
             /* A null constant is left to the kernel, before any arm: no
              * extrema rule covers it.  Unreachable today (the compiler bails
              * a null constant, EXPR_BAIL_CONST), it guards every arm if that
@@ -2177,6 +2256,124 @@ static int expr_zone_decide(const ray_expr_t* expr, int64_t ms, int64_t me) {
     return (res == 0 || res == 1) ? res : -1;
 }
 
+/* ── Encoded leaves of a fused BOOL program ──────────────────────────────
+ *
+ * A comparison of an encoded single-file scan register with a constant of
+ * the same lane type is a leaf: per morsel (one vector) it is answered on
+ * the vector's view (store/enceval.h: CONST one test, RLE one per run,
+ * FOR_BP on the packed residuals, DICT a code interval) with the null mask,
+ * and its register is never decoded unless some non-leaf instruction reads
+ * it as a value, or the vector has no view.  An integer column against a
+ * float constant is not a leaf (the F64 lanes compare in double: no
+ * constant is narrowed), nor is an ordered compare on SYM (#738). */
+
+/* The lane value the register load gives a null row: the canonical
+ * sentinel for a nullable register, else the raw in-band sentinel widened
+ * (expr_load_i64 without has_nulls).  F64 lanes: NaN either way. */
+static int64_t leaf_null_lane_i64(int8_t ct, bool nullable) {
+    if (nullable) return NULL_I64;
+    switch (ct) {
+    case RAY_I32: case RAY_DATE: case RAY_TIME: return (int64_t)NULL_I32;
+    case RAY_I16:                               return (int64_t)NULL_I16;
+    default:                                    return NULL_I64;
+    }
+}
+
+/* One-lane null_result of a leaf: run the leaf's own kernel, through the
+ * morsel evaluator, on one row whose scan lane holds a null row's value
+ * against the constant (a three-register program of two constants). */
+static uint8_t leaf_null_result(const ray_expr_t* expr, const expr_ins_t* in, uint8_t scan_reg) {
+    uint8_t other = in->src1 == scan_reg ? in->src2 : in->src1;
+    ray_expr_t one;
+    memset(&one, 0, sizeof one);
+    one.n_regs = 3; one.n_ins = 1; one.n_scratch = 1; one.out_reg = 2; one.out_type = RAY_BOOL;
+    one.regs[0].kind = REG_CONST; one.regs[0].type = expr->regs[scan_reg].type;   /* RAY_I64 or RAY_F64 lanes */
+    one.regs[0].const_i64 = leaf_null_lane_i64(expr->regs[scan_reg].col_type, expr->regs[scan_reg].nullable);
+    one.regs[0].const_f64 = NULL_F64;
+    one.regs[1].kind = REG_CONST; one.regs[1].type = expr->regs[other].type;
+    one.regs[1].const_i64 = expr->regs[other].const_i64; one.regs[1].const_f64 = expr->regs[other].const_f64;
+    one.regs[2].kind = REG_SCRATCH; one.regs[2].type = RAY_BOOL;
+    one.ins[0] = (expr_ins_t){ .opcode = in->opcode, .dst = 2, .src1 = in->src1 == scan_reg ? 0 : 1,
+                               .src2 = in->src1 == scan_reg ? 1 : 0, .null_aware = in->null_aware };
+    int64_t lanes[3] = { 0, 0, 0 };
+    void* sc[3] = { &lanes[0], &lanes[1], &lanes[2] };
+    ray_t* err = NULL;
+    const uint8_t* out = (const uint8_t*)expr_eval_morsel(&one, NULL, NULL, sc, NULL, 0, 1, &err);
+    if (err) ray_error_free(err);                   /* constants only: no read */
+    return out ? out[0] : 0;
+}
+
+/* Can encoded scan register r against a constant of its own lane type be
+ * a leaf?  I64 lanes over an integer, temporal or SYM column (SYM under
+ * EQ / NE only), F64 lanes over an F32 / F64 column. */
+static bool leaf_reg_ok(const ray_expr_t* expr, uint8_t r, uint16_t op) {
+    int8_t ct = expr->regs[r].col_type;
+    if (expr->regs[r].type == RAY_F64) return zone_f64_type(ct);
+    if (expr->regs[r].type != RAY_I64) return false;
+    if (ct == RAY_SYM) return op == OP_EQ || op == OP_NE;    /* never order ids (#738) */
+    return zone_dir_type(ct);
+}
+
+static void expr_enc_plan_build(const ray_expr_t* expr, expr_enc_plan_t* p) {
+    memset(p, 0, sizeof *p);
+    memset(p->leaf_of_ins, -1, sizeof p->leaf_of_ins);
+    for (uint8_t r = 0; r < expr->n_regs; r++)
+        p->load_reg[r] = !(expr->regs[r].kind == REG_SCAN && expr->regs[r].enc);
+    if (expr->out_type != RAY_BOOL) {
+        for (uint8_t r = 0; r < expr->n_regs; r++) p->load_reg[r] = true;
+        return;
+    }
+    for (uint8_t i = 0; i < expr->n_ins; i++) {
+        const expr_ins_t* in = &expr->ins[i];
+        uint8_t a = in->src1, b = in->src2;
+        bool ea = expr->regs[a].kind == REG_SCAN && expr->regs[a].enc;
+        bool eb = b != 0xFF && expr->regs[b].kind == REG_SCAN && expr->regs[b].enc;
+        int sreg = -1, creg = -1;
+        if (in->opcode >= OP_EQ && in->opcode <= OP_GE && b != 0xFF) {
+            if (ea && expr->regs[b].kind == REG_CONST && expr->regs[b].type == expr->regs[a].type) { sreg = a; creg = b; }
+            else if (eb && expr->regs[a].kind == REG_CONST && expr->regs[a].type == expr->regs[b].type) { sreg = b; creg = a; }
+        }
+        uint16_t op = sreg == a ? in->opcode : zone_swap_op(in->opcode);
+        if (sreg >= 0 && !leaf_reg_ok(expr, (uint8_t)sreg, op)) sreg = -1;
+        if (sreg >= 0) {
+            expr_enc_leaf_t* l = &p->leaf[p->n_leaves];
+            l->ins = i; l->reg = (uint8_t)sreg; l->op = op;
+            l->is_f64 = expr->regs[sreg].type == RAY_F64;
+            l->ci = expr->regs[creg].const_i64; l->cf = expr->regs[creg].const_f64;
+            l->null_result = leaf_null_result(expr, in, (uint8_t)sreg);
+            p->leaf_of_ins[i] = (int8_t)p->n_leaves++;
+        } else {
+            if (ea) p->load_reg[a] = true;                 /* read as a value */
+            if (eb) p->load_reg[b] = true;
+        }
+    }
+}
+
+/* Leaf instruction i over morsel [ms, ms + n) (one vector:
+ * RAY_MORSEL_ELEMS == RAY_ENC_VEC), on the vector's view: 1 answered into
+ * the instruction's register (a CONST decision, or the encoded evaluator
+ * with the null mask), 0 no view or no evaluator (the caller loads the
+ * register and runs the kernel), -1 an owned *err (the view's validation,
+ * as the decode would report it). */
+_Static_assert(RAY_MORSEL_ELEMS == RAY_ENC_VEC, "a fused morsel is one vector");
+static int expr_leaf_on_view(const ray_expr_t* expr, const expr_enc_plan_t* p, uint8_t i,
+                             ray_enc_vview_t* vbuf, void** scratch, void** rptrs,
+                             int64_t ms, int64_t n, ray_t** err) {
+    const expr_ins_t* in = &expr->ins[i];
+    const expr_enc_leaf_t* l = &p->leaf[p->leaf_of_ins[i]];
+    if (ms % RAY_ENC_VEC) return 0;
+    int vr = ray_col_src_vview(expr->regs[l->reg].src, ms / RAY_ENC_VEC, vbuf, err);
+    if (vr <= 0) return vr;
+    if (n != vbuf->n) return 0;
+    uint8_t* out = (uint8_t*)scratch[in->dst];
+    int cd = l->is_f64 ? ray_enc_const_decision_f64(vbuf, l->op, l->cf, l->null_result)
+                       : ray_enc_const_decision(vbuf, l->op, l->ci, l->null_result);
+    if (cd >= 0) memset(out, cd, (size_t)n);
+    else if (l->is_f64 || !ray_enc_eval_cmp(vbuf, l->op, l->ci, l->null_result, out)) return 0;
+    rptrs[in->dst] = out;
+    return 1;
+}
+
 /* Context for parallel full-vector expression evaluation.
  *
  * Two output modes:
@@ -2198,6 +2395,8 @@ typedef struct {
     ray_scan_fail_t*  fail;            /* range-read failures, keyed by task start */
     int64_t           key_base;        /* added to every failure key: a parted
                                         * segment's first row, so keys are global */
+    const expr_enc_plan_t* plan;       /* encoded leaves (NULL or none: every
+                                        * register is loaded, generation 0's loop) */
 } expr_full_ctx_t;
 
 static _Atomic(int64_t) g_expr_zone_skips;      /* test hook */
@@ -2236,6 +2435,9 @@ static void expr_full_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t e
      * indexed column; compute the gate once, not per morsel. */
     bool zone = expr_zone_eligible(expr);
     int64_t skips = 0;
+    /* encoded leaves: one vector view on this task's stack (never the heap) */
+    const expr_enc_plan_t* plan = c->plan && c->plan->n_leaves ? c->plan : NULL;
+    ray_enc_vview_t vbuf;
 
     /* Fused selection-output mode: resolve this task's builder + its first
      * global segment once.  Task boundaries are morsel-aligned because
@@ -2277,7 +2479,7 @@ static void expr_full_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t e
         void* result = NULL;
         if (!failed) {
             ray_t* err = NULL;
-            result = expr_eval_morsel(expr, scratch, rsc, ms, me, &err);
+            result = expr_eval_morsel(expr, plan, plan ? &vbuf : NULL, scratch, rsc, ms, me, &err);
             if (err) { ray_scan_fail_note(c->fail, key, err); failed = true; result = NULL; }
         }
         if (sb) {
@@ -2438,12 +2640,17 @@ static ray_t* expr_eval_full_parted(const ray_expr_t* expr, int64_t nrows) {
             }
         }
         if (seg_ok) {
+            /* the segment's leaves: its registers are encoded only after
+             * the rebinding, and read this segment's own descriptors */
+            expr_enc_plan_t plan;
+            expr_enc_plan_build(&seg_expr, &plan);
             expr_full_ctx_t ctx = {
                 .expr = &seg_expr,
                 .out_data = (char*)ray_data(out) + global_off * esz,
                 .out_type = expr->out_type,
                 .fail = &fail,
                 .key_base = global_off,
+                .plan = &plan,
             };
             if (pool && seg_len >= RAY_PARALLEL_THRESHOLD) {
                 ray_pool_dispatch(pool, expr_full_fn, &ctx, seg_len);
@@ -2479,8 +2686,11 @@ ray_t* expr_eval_full(const ray_expr_t* expr, int64_t nrows) {
     out->len = nrows;
 
     ray_scan_fail_t fail; ray_scan_fail_init(&fail);
+    expr_enc_plan_t plan;
+    expr_enc_plan_build(expr, &plan);
     expr_full_ctx_t ctx = {
         .expr = expr, .out_data = ray_data(out), .out_type = expr->out_type, .fail = &fail,
+        .plan = &plan,
     };
     for (uint8_t r = 0; r < expr->n_regs; r++)
         if (expr->regs[r].kind == REG_SCAN && expr->regs[r].enc)
@@ -2510,7 +2720,7 @@ void ray_expr_test_eval_range(const ray_expr_t* expr, int64_t start, int64_t end
     void* scratch[EXPR_MAX_REGS];
     ray_col_scratch_t rsc[EXPR_MAX_REGS];
     for (uint8_t r = 0; r < expr->n_regs; r++) { scratch[r] = mem + (size_t)r * EXPR_MORSEL * 8; ray_col_scratch_init(&rsc[r]); }
-    void* res = expr_eval_morsel(expr, scratch, rsc, start, end, err);
+    void* res = expr_eval_morsel(expr, NULL, NULL, scratch, rsc, start, end, err);
     if (res && !*err) memcpy(out, res, (size_t)(end - start));
     for (uint8_t r = 0; r < expr->n_regs; r++) ray_col_scratch_free(&rsc[r]);
     scratch_free(hdr);
@@ -2707,6 +2917,8 @@ ray_t* exec_pred_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
     if (!builders) return NULL;
 
     ray_scan_fail_t fail; ray_scan_fail_init(&fail);
+    expr_enc_plan_t plan;
+    expr_enc_plan_build(&ex, &plan);
     expr_full_ctx_t ctx = {
         .expr           = &ex,
         .out_data       = NULL,
@@ -2714,6 +2926,7 @@ ray_t* exec_pred_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
         .sel_builders   = builders,
         .n_sel_builders = n_builders,
         .fail           = &fail,
+        .plan           = &plan,
     };
     for (uint8_t r = 0; r < ex.n_regs; r++)
         if (ex.regs[r].kind == REG_SCAN && ex.regs[r].enc)

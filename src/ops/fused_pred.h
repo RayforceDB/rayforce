@@ -25,6 +25,7 @@
 #define RAY_OPS_FUSED_PRED_H
 
 #include "store/colrange.h"
+#include "store/enccol.h"   /* ray_enc_vview_t */
 #include "rayforce.h"
 #include "ops/internal.h"
 #include "ops/glob.h"
@@ -110,9 +111,14 @@ void fp_eval_cmp(const fp_cmp_t* p, int64_t start, int64_t end, uint8_t* bits);
  * No child may be encoded (fp_eval_pred_rs reads those). */
 void fp_eval_pred(const fp_pred_t* p, int64_t start, int64_t end, uint8_t* bits);
 
-/* Per-task range-read scratch, one per child.  Allocate it per task, free
- * it inside the same task (a scratch holds its column until freed). */
-typedef struct { ray_col_scratch_t sc[FP_PRED_MAX_CHILDREN]; } fp_scratch_t;
+/* Per-task range-read scratch, one per child, and one vector view for the
+ * encoded leaves (about 21 KB: the task holds it on its stack).  Allocate
+ * it per task, free it inside the same task (a scratch holds its column
+ * until freed). */
+typedef struct {
+    ray_col_scratch_t sc[FP_PRED_MAX_CHILDREN];
+    ray_enc_vview_t   vb;
+} fp_scratch_t;
 void   fp_scratch_init(fp_scratch_t* s);
 void   fp_scratch_free(fp_scratch_t* s);
 /* fp_eval_pred over [start, end) (end - start <= RAY_MORSEL_ELEMS) with

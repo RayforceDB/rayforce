@@ -866,6 +866,26 @@ typedef struct {
     expr_ins_t ins[EXPR_MAX_INS];
 } ray_expr_t;
 
+/* Encoded leaves of a fused BOOL program (expr.c, expr_enc_plan_build): a
+ * comparison of an encoded single-file scan register with a constant of
+ * the same lane type, evaluated on the vector's view instead of its
+ * decoded values. */
+typedef struct {
+    uint8_t  ins;          /* the compare instruction */
+    uint8_t  reg;          /* its encoded scan register */
+    uint16_t op;           /* normalized: the column on the left */
+    bool     is_f64;       /* F64 lanes: the scan register and the constant are both F64 */
+    int64_t  ci;           /* the constant, I64 lanes */
+    double   cf;           /* the constant, F64 lanes */
+    uint8_t  null_result;  /* the leaf kernel's result on the lane's null sentinel */
+} expr_enc_leaf_t;
+typedef struct {
+    uint8_t         n_leaves;
+    int8_t          leaf_of_ins[EXPR_MAX_INS];
+    bool            load_reg[EXPR_MAX_REGS];   /* some non-leaf instruction reads the register */
+    expr_enc_leaf_t leaf[EXPR_MAX_INS];
+} expr_enc_plan_t;
+
 /* ══════════════════════════════════════════
  * Shared gather types — used by filter.c, exec.c (sort, join)
  * ══════════════════════════════════════════ */
@@ -920,6 +940,42 @@ static inline bool zone_dir_type(int8_t t) {
 static inline int zone_cmp_core(int64_t cmin, int64_t cmax, bool has_minmax, bool has_nulls,
                                 bool all_null, uint16_t cmp_op, int64_t cval) {
     if (all_null || !has_minmax || cmin > cmax) return -1;   /* leave to the kernel */
+    switch (cmp_op) {
+    case OP_EQ:
+        if (cval < cmin || cval > cmax)                 return 0;
+        if (!has_nulls && cmin == cmax)                 return 1;
+        break;
+    case OP_NE:
+        if (!has_nulls && (cval < cmin || cval > cmax)) return 1;
+        if (!has_nulls && cmin == cmax && cval == cmin) return 0;
+        break;
+    case OP_LT:
+        if (!has_nulls && cmin >= cval)                 return 0;
+        if (!has_nulls && cmax <  cval)                 return 1;
+        break;
+    case OP_LE:
+        if (!has_nulls && cmin >  cval)                 return 0;
+        if (!has_nulls && cmax <= cval)                 return 1;
+        break;
+    case OP_GT:
+        if (cmax <= cval)                               return 0;
+        if (!has_nulls && cmin >  cval)                 return 1;
+        break;
+    case OP_GE:
+        if (cmax <  cval)                               return 0;
+        if (!has_nulls && cmin >= cval)                 return 1;
+        break;
+    default: break;
+    }
+    return -1;
+}
+
+/* zone_cmp_core over double extrema (F32 / F64 directory and descriptor
+ * statistics, NaN excluded as the null): the same table under the
+ * predicate comparator, where -0.0 == +0.0 as plain C comparison gives. */
+static inline int zone_cmp_core_f64(double cmin, double cmax, bool has_minmax, bool has_nulls,
+                                    bool all_null, uint16_t cmp_op, double cval) {
+    if (all_null || !has_minmax || !(cmin <= cmax) || cval != cval) return -1;   /* leave to the kernel */
     switch (cmp_op) {
     case OP_EQ:
         if (cval < cmin || cval > cmax)                 return 0;

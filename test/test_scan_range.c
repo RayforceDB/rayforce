@@ -1869,9 +1869,12 @@ static test_result_t test_expr_parted_seg_lengths(void) {
 
 /* The directory gate decides whole chunks: a predicate true for no row of
  * chunks 1-3 reads none of them; inside chunk 0 the vectors' descriptors
- * decide vectors 1-63 (Task 17b), so only vector 0 is decoded. */
+ * decide vectors 1-63 (Task 17b), so only vector 0 is read.  k = row is
+ * DELTA_BP, which has no view (P3 Task 3: a viewed vector would be
+ * answered as an encoded leaf, decoding nothing), so vector 0 decodes. */
 static test_result_t test_zone_dir_skips(void) {
     ray_t* t = sr_load(2);
+    TEST_ASSERT_NOT_NULL(t);
     ray_graph_t* g = ray_graph_new(t);
     ray_enc_counters_reset();
     bool all = false;
@@ -1883,7 +1886,21 @@ static test_result_t test_zone_dir_skips(void) {
     TEST_ASSERT_EQ_U(ray_enccol_test_desc_validations() - dv0, 1);
     ray_enc_counters_t k; ray_enc_counters_get(&k);
     TEST_ASSERT_EQ_U(k.materialized, 0);
-    TEST_ASSERT_EQ_U(k.decoded_bytes, 1024 * 8);        /* chunk 0's vector 0 only */
+    TEST_ASSERT_EQ_U(k.decoded_bytes, 1024 * 8);        /* chunk 0's vector 0 only (DELTA_BP: no view) */
+    /* why vector 0 decodes: DELTA_BP, which the view declines (checked
+     * after the descriptor-validation pin, which this read would satisfy) */
+    {
+        ray_t* ek = ray_table_get_col_enc(t, ray_sym_intern("k", 1));
+        TEST_ASSERT_NOT_NULL(ek);
+        const ray_enc_desc_t* d;
+        ray_t* derr = ray_enccol_chunk_descs_ref(ray_enccol_of(ek), 0, &d);
+        TEST_ASSERT_TRUE(derr == NULL);
+        TEST_ASSERT_EQ_I(d[0].encoding, RAY_ENC_DELTA_BP);
+        ray_enc_vview_t* vb = malloc(sizeof *vb);
+        ray_t* verr = NULL;
+        TEST_ASSERT_EQ_I(ray_enccol_vview(ray_enccol_of(ek), 0, vb, &verr), 0);   /* declined: read by range */
+        free(vb);
+    }
     ray_rowsel_release(s); ray_graph_free(g); ray_release(t);
     /* the count fast path decides chunks the same way */
     sr_eval_ok("(set T (.db.splayed.get \"" SR_G2 "\"))");
@@ -6327,7 +6344,10 @@ static test_result_t test_ragged_gen0_no_decode(void) {
         ray_t* r1 = sr_eval(q[i]);
         ray_enc_counters_t k; ray_enc_counters_get(&k);
         TEST_ASSERT_FMT(sr_same_text(r0, r1), "saved nulls: %s", q[i]);
-        TEST_ASSERT_FMT(ray_expr_test_zone_skips() == z0 && k.decoded_bytes > 0,
+        /* P3 Task 3: the predicate's vectors are viewed instead of decoded
+         * (an encoded leaf); a view makes every check that decode would, so
+         * the pin is that the all-null rule decided no morsel */
+        TEST_ASSERT_FMT(ray_expr_test_zone_skips() == z0,
                         "saved nulls %s: %lld morsels decided, %llu bytes decoded", q[i],
                         (long long)(ray_expr_test_zone_skips() - z0), (unsigned long long)k.decoded_bytes);
         sr_drop(r0); sr_drop(r1);
@@ -6467,14 +6487,17 @@ static test_result_t test_vec_stat_decide(void) {
     /* the expression gate (a select over the predicate) */
     /* c: the 66 vectors of 5 (the last one 320 rows) hold a null, so they
      * stay undecided; the 130 vectors of 9 are decided.  (== c 9) is decided
-     * on every vector.  The OR is checked for its answer only. */
+     * on every vector.  The OR is checked for its answer only.  P3 Task 3:
+     * the undecided vectors (a's RLE runs, c's nullable CONST 5) are
+     * answered as encoded leaves on their views, so neither decodes (the
+     * a / c flags below now pin 0 bytes; c5_bytes stays for the record). */
     const uint64_t c5_bytes = 65 * RAY_ENC_VEC * 4 + 320 * 4;
     static const struct { const char* q; int64_t a, c, skips; } eq[] = {
-        { "(select {s: (sum b) from: T where: (!= a 0)})", 1, 0, 147 },
-        { "(select {s: (sum b) c: (count b) from: T where: (> a 3)})", 1, 0, 147 },
-        { "(select {s: (sum b) from: T where: (== c 5)})", 0, 1, 130 },
-        { "(select {s: (sum b) from: T where: (!= c 9)})", 0, 1, 130 },
-        { "(select {s: (sum b) from: T where: (and (== a 0) (== c 9))})", 1, 0, 147 + 196 },
+        { "(select {s: (sum b) from: T where: (!= a 0)})", 0, 0, 147 },
+        { "(select {s: (sum b) c: (count b) from: T where: (> a 3)})", 0, 0, 147 },
+        { "(select {s: (sum b) from: T where: (== c 5)})", 0, 0, 130 },
+        { "(select {s: (sum b) from: T where: (!= c 9)})", 0, 0, 130 },
+        { "(select {s: (sum b) from: T where: (and (== a 0) (== c 9))})", 0, 0, 147 + 196 },
         { "(select {s: (sum b) from: T where: (or (> a 3) (== c 5))})", -1, -1, -1 },
         { NULL, 0, 0, 0 },
     };
@@ -6516,8 +6539,9 @@ static test_result_t test_vec_stat_decide(void) {
         }
         fp_scratch_free(&sc);
         ray_enc_counters_t k; ray_enc_counters_get(&k);
-        /* c is nullable: its typed compare reads every vector (no gate) */
-        const uint64_t want = i < 3 ? rle_bytes : (uint64_t)VD_N * 4;
+        /* c is nullable: its typed compare reads every vector (no gate);
+         * a's RLE vectors are answered on their views (P3 Task 3) */
+        const uint64_t want = i < 3 ? 0 : (uint64_t)VD_N * 4;
         TEST_ASSERT_FMT(k.decoded_bytes == want, "fused %zu: %llu bytes decoded, want %llu", i,
                         (unsigned long long)k.decoded_bytes, (unsigned long long)want);
         fp_pred_cleanup(&p0); fp_pred_cleanup(&p2);
