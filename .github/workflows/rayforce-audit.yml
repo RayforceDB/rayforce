@@ -98,25 +98,26 @@ jobs:
           claude_status=${PIPESTATUS[0]}
           set -e
 
-          if [ "${claude_status}" -eq 124 ]; then
-            cat > audit-output/rayforce-audit.md <<'EOF_TIMEOUT'
-          ## Rayforce targeted audit timed out
+          # Never publish raw provider errors as an audit report.
+          AUDIT_COMMAND_STATUS="$claude_status" python3 - <<'RAYFORCE_REPORT_PY'
+          import os
+          from pathlib import Path
 
-          The required Rayforce audit gate exceeded its 12 minute CI budget before producing a final verdict. This is a gate infrastructure failure, not a PASS.
-
-          RAYFORCE_AUDIT_VERDICT: FAIL
-          EOF_TIMEOUT
-          elif [ "${claude_status}" -ne 0 ]; then
-            if [ ! -s audit-output/rayforce-audit.md ]; then
-              cat > audit-output/rayforce-audit.md <<'EOF_ERROR'
-          ## Rayforce targeted audit failed before producing a report
-
-          The Claude audit command exited non-zero before producing a final verdict. Open the check logs for details.
-
-          RAYFORCE_AUDIT_VERDICT: FAIL
-          EOF_ERROR
-            fi
-          fi
+          report = Path("audit-output/rayforce-audit.md")
+          text = report.read_text(errors="replace") if report.exists() else ""
+          lines = text.rstrip().splitlines()
+          final_verdict = lines[-1] if lines else ""
+          command_failed = os.environ.get("AUDIT_COMMAND_STATUS", "0") != "0"
+          if command_failed or final_verdict not in (
+              "RAYFORCE_AUDIT_VERDICT: PASS", "RAYFORCE_AUDIT_VERDICT: FAIL"
+          ):
+              report.parent.mkdir(parents=True, exist_ok=True)
+              report.write_text(
+                  "<!-- rayforce-audit-unavailable -->\n"
+                  "The audit service is temporarily unavailable. Please retry later.\n\n"
+                  "RAYFORCE_AUDIT_VERDICT: FAIL\n"
+              )
+          RAYFORCE_REPORT_PY
 
           tail -n 1 audit-output/rayforce-audit.md | grep -q '^RAYFORCE_AUDIT_VERDICT: PASS$'
 
@@ -135,9 +136,13 @@ jobs:
 
           {
             echo "$marker"
-            echo "## Rayforce targeted audit failed"
-            echo
-            echo "This PR did not pass the required Rayforce audit gate. Fix the blocking findings below and push an update; the audit will rerun automatically."
+            if grep -qF "<!-- rayforce-audit-unavailable -->" "$report"; then
+              echo "## Rayforce audit service unavailable"
+            else
+              echo "## Rayforce targeted audit failed"
+              echo
+              echo "This PR did not pass the required Rayforce audit gate. Fix the blocking findings below and push an update; the audit will rerun automatically."
+            fi
             echo
             if [ -s "$report" ]; then
               sed -n '1,220p' "$report"

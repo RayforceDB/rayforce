@@ -74,16 +74,29 @@ jobs:
             --repo "$REPO" \
             --name rayforce-audit-report \
             --dir audit-output; then
-            cat > "$report" <<EOF_REPORT
-          ## Rayforce targeted audit did not publish a report
-
-          The Rayforce audit workflow completed with conclusion: ${RUN_CONCLUSION}.
-
-          Open the workflow run for logs: ${RUN_URL}
-
-          RAYFORCE_AUDIT_VERDICT: FAIL
-          EOF_REPORT
+            rm -f "$report"
           fi
+
+          # Also protect comments from raw errors in older workflow artifacts.
+          python3 - <<'RAYFORCE_REPORT_PY'
+          import os
+          from pathlib import Path
+
+          report = Path("audit-output/rayforce-audit.md")
+          text = report.read_text(errors="replace") if report.exists() else ""
+          lines = text.rstrip().splitlines()
+          final_verdict = lines[-1] if lines else ""
+          command_failed = os.environ.get("AUDIT_COMMAND_STATUS", "0") != "0"
+          if command_failed or final_verdict not in (
+              "RAYFORCE_AUDIT_VERDICT: PASS", "RAYFORCE_AUDIT_VERDICT: FAIL"
+          ):
+              report.parent.mkdir(parents=True, exist_ok=True)
+              report.write_text(
+                  "<!-- rayforce-audit-unavailable -->\n"
+                  "The audit service is temporarily unavailable. Please retry later.\n\n"
+                  "RAYFORCE_AUDIT_VERDICT: FAIL\n"
+              )
+          RAYFORCE_REPORT_PY
 
           verdict="UNKNOWN"
           if [ -s "$report" ]; then
@@ -113,9 +126,13 @@ jobs:
 
           {
             echo "$marker"
-            echo "## Rayforce targeted audit failed"
-            echo
-            echo "This PR did not pass the required Rayforce audit gate. Fix the blocking findings below and push an update; the audit will rerun automatically."
+            if grep -qF "<!-- rayforce-audit-unavailable -->" "$report"; then
+              echo "## Rayforce audit service unavailable"
+            else
+              echo "## Rayforce targeted audit failed"
+              echo
+              echo "This PR did not pass the required Rayforce audit gate. Fix the blocking findings below and push an update; the audit will rerun automatically."
+            fi
             echo
             echo "Workflow run: ${RUN_URL}"
             echo
