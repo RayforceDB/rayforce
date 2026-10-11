@@ -1077,7 +1077,7 @@ static test_result_t test_filter_mixed_generations(void) {
     TEST_ASSERT_TRUE(ray_table_col_meta(t, ray_sym_intern("x", 1), &mx) && mx.enc);
     TEST_ASSERT_TRUE(ray_table_col_meta(t, ray_sym_intern("y", 1), &my) && !my.enc);
     ray_release(t);
-    return aw_sel_same("mx", ap_mixed, -1);
+    return aw_sel_same("mx", ap_mixed, 0);   /* x: leaves; y: generation 0, read in place */
 }
 
 /* A parted table: the plan is built per segment. */
@@ -1102,12 +1102,22 @@ static test_result_t test_filter_parted_leaves(void) {
     PASS();
 }
 
-/* Floats: chunk and vector decisions with both zeros; CONST float vectors
- * (-0.0 and 0.0, vectors 0-3) answered by the CONST decision; the RAW
- * vectors of j > 0 are decided all-pass by their descriptors (> 0.0). */
+/* Floats: f is -0.0 in vectors 0-1, +0.0 in vectors 2-3, null in vector 4
+ * (rows 4096..5119), then j.  Vectors 0-3 are CONST and decided by their
+ * descriptors (-0.0 == +0.0: max <= 0.0 fails > 0.0); vector 4 is an
+ * all-null CONST vector without statistics, which only the float leaf
+ * answers (ray_enc_const_decision_f64: every row null_result, 0 for >,
+ * 1 for <); the RAW vectors of j are decided by their descriptors and
+ * chunk 1 by its directory.  Nothing decodes. */
+static ray_op_t* ap_f_lt(ray_graph_t* g) { return ray_lt(g, ray_scan(g, "f"), ray_const_f64(g, 1e12)); }
 static test_result_t test_filter_floats(void) {
-    aw_save("fl", "(table [f] (list (map (fn [j] (if (< j 2048) -0.0 (if (< j 4096) 0.0 (as 'F64 j)))) (til 70000))))", -1);
-    return aw_sel_same("fl", ap_f_gt, 0);
+    aw_save("fl", "(table [f] (list (as 'F64 (map (fn [j] (if (< j 2048) -0.0 (if (< j 4096) 0.0 (if (< j 5120) 0Nf (as 'F64 j))))) "
+                  "(til 70000)))))", -1);
+    TEST_ASSERT_EQ_I(aw_vec_enc("fl", "f", 1), RAY_ENC_CONST);
+    TEST_ASSERT_EQ_I(aw_vec_enc("fl", "f", 4), RAY_ENC_CONST);
+    test_result_t r;
+    if ((r = aw_sel_same("fl", ap_f_gt, 0)).status != TEST_PASS) return r;
+    return aw_sel_same("fl", ap_f_lt, 0);
 }
 
 /* D8: the fused top-k predicate.  x nullable (the leaf fixtures): the sort

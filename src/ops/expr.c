@@ -1859,7 +1859,6 @@ static void expr_exec_unary(uint8_t opcode, uint8_t null_aware, int8_t dt, void*
     }
 }
 
-
 /* A ragged partition's synthetic stand-in (ray_read_parted's all-null
  * segment, built in memory): the only source whose directory the all-null
  * rules below trust.  A chunk of a column saved encoded is decoded, and so
@@ -1998,7 +1997,13 @@ static int expr_leaf_on_view(const ray_expr_t* expr, const expr_enc_plan_t* p, u
  * indexing); NULL with an owned *err when a range read fails.  Kept one
  * copy (noclone) and the kernels' only caller, so the compiler inlines
  * them here as it always has (generation 0's codegen). */
-__attribute__((noinline, noclone)) static void* expr_eval_morsel(const ray_expr_t* expr, const expr_enc_plan_t* plan, ray_enc_vview_t* vbuf,
+/* noclone is GCC-only (clang rejects the attribute) */
+#if defined(__GNUC__) && !defined(__clang__)
+#define EXPR_ONE_COPY __attribute__((noinline, noclone))
+#else
+#define EXPR_ONE_COPY __attribute__((noinline))
+#endif
+EXPR_ONE_COPY static void* expr_eval_morsel(const ray_expr_t* expr, const expr_enc_plan_t* plan, ray_enc_vview_t* vbuf,
                               void** scratch, ray_col_scratch_t* rsc, int64_t start, int64_t end,
                               ray_t** err) {
     int64_t n = end - start;
@@ -2314,14 +2319,19 @@ static bool leaf_reg_ok(const ray_expr_t* expr, uint8_t r, uint16_t op) {
     return zone_dir_type(ct);
 }
 
-static void expr_enc_plan_build(const ray_expr_t* expr, expr_enc_plan_t* p) {
+/* The plan of an expression, or NULL when no register is encoded (a
+ * generation-0 program: nothing to plan). */
+static const expr_enc_plan_t* expr_enc_plan_build(const ray_expr_t* expr, expr_enc_plan_t* p) {
+    bool any = false;
+    for (uint8_t r = 0; r < expr->n_regs; r++) any |= expr->regs[r].kind == REG_SCAN && expr->regs[r].enc;
+    if (!any) return NULL;
     memset(p, 0, sizeof *p);
     memset(p->leaf_of_ins, -1, sizeof p->leaf_of_ins);
     for (uint8_t r = 0; r < expr->n_regs; r++)
         p->load_reg[r] = !(expr->regs[r].kind == REG_SCAN && expr->regs[r].enc);
     if (expr->out_type != RAY_BOOL) {
         for (uint8_t r = 0; r < expr->n_regs; r++) p->load_reg[r] = true;
-        return;
+        return p;
     }
     for (uint8_t i = 0; i < expr->n_ins; i++) {
         const expr_ins_t* in = &expr->ins[i];
@@ -2347,6 +2357,7 @@ static void expr_enc_plan_build(const ray_expr_t* expr, expr_enc_plan_t* p) {
             if (eb) p->load_reg[b] = true;
         }
     }
+    return p;
 }
 
 /* Leaf instruction i over morsel [ms, ms + n) (one vector:
@@ -2643,14 +2654,13 @@ static ray_t* expr_eval_full_parted(const ray_expr_t* expr, int64_t nrows) {
             /* the segment's leaves: its registers are encoded only after
              * the rebinding, and read this segment's own descriptors */
             expr_enc_plan_t plan;
-            expr_enc_plan_build(&seg_expr, &plan);
             expr_full_ctx_t ctx = {
                 .expr = &seg_expr,
                 .out_data = (char*)ray_data(out) + global_off * esz,
                 .out_type = expr->out_type,
                 .fail = &fail,
                 .key_base = global_off,
-                .plan = &plan,
+                .plan = expr_enc_plan_build(&seg_expr, &plan),
             };
             if (pool && seg_len >= RAY_PARALLEL_THRESHOLD) {
                 ray_pool_dispatch(pool, expr_full_fn, &ctx, seg_len);
@@ -2687,10 +2697,9 @@ ray_t* expr_eval_full(const ray_expr_t* expr, int64_t nrows) {
 
     ray_scan_fail_t fail; ray_scan_fail_init(&fail);
     expr_enc_plan_t plan;
-    expr_enc_plan_build(expr, &plan);
     expr_full_ctx_t ctx = {
         .expr = expr, .out_data = ray_data(out), .out_type = expr->out_type, .fail = &fail,
-        .plan = &plan,
+        .plan = expr_enc_plan_build(expr, &plan),
     };
     for (uint8_t r = 0; r < expr->n_regs; r++)
         if (expr->regs[r].kind == REG_SCAN && expr->regs[r].enc)
@@ -2918,7 +2927,6 @@ ray_t* exec_pred_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
 
     ray_scan_fail_t fail; ray_scan_fail_init(&fail);
     expr_enc_plan_t plan;
-    expr_enc_plan_build(&ex, &plan);
     expr_full_ctx_t ctx = {
         .expr           = &ex,
         .out_data       = NULL,
@@ -2926,7 +2934,7 @@ ray_t* exec_pred_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
         .sel_builders   = builders,
         .n_sel_builders = n_builders,
         .fail           = &fail,
-        .plan           = &plan,
+        .plan           = expr_enc_plan_build(&ex, &plan),
     };
     for (uint8_t r = 0; r < ex.n_regs; r++)
         if (ex.regs[r].kind == REG_SCAN && ex.regs[r].enc)

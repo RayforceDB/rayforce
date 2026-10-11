@@ -6344,12 +6344,14 @@ static test_result_t test_ragged_gen0_no_decode(void) {
         ray_t* r1 = sr_eval(q[i]);
         ray_enc_counters_t k; ray_enc_counters_get(&k);
         TEST_ASSERT_FMT(sr_same_text(r0, r1), "saved nulls: %s", q[i]);
-        /* P3 Task 3: the predicate's vectors are viewed instead of decoded
-         * (an encoded leaf); a view makes every check that decode would, so
-         * the pin is that the all-null rule decided no morsel */
-        TEST_ASSERT_FMT(ray_expr_test_zone_skips() == z0,
-                        "saved nulls %s: %lld morsels decided, %llu bytes decoded", q[i],
-                        (long long)(ray_expr_test_zone_skips() - z0), (unsigned long long)k.decoded_bytes);
+        /* P3 Task 3: the all-null rule decides no morsel; the predicate's
+         * vectors are viewed instead of decoded (an encoded leaf), and a
+         * view makes every check that decode would: nothing is decoded or
+         * materialized */
+        TEST_ASSERT_FMT(ray_expr_test_zone_skips() == z0 && k.decoded_bytes == 0 && k.materialized == 0,
+                        "saved nulls %s: %lld morsels decided, %llu bytes decoded, %llu materialized", q[i],
+                        (long long)(ray_expr_test_zone_skips() - z0), (unsigned long long)k.decoded_bytes,
+                        (unsigned long long)k.materialized);
         sr_drop(r0); sr_drop(r1);
     }
     PASS();
