@@ -3356,6 +3356,12 @@ int64_t ray_heap_relieve(void) {
         }
     }
     heap_each_quiescent(heap_relieve_visit, &v);
+    /* The next statement's peak starts from the footprint this boundary
+     * leaves, not the one it found: what the relief handed back is no part
+     * of it (its peak decides whether it needed a relief). */
+    atomic_store_explicit(&g_anon_stmt_peak,
+                          atomic_load_explicit(&g_anon_committed, memory_order_relaxed),
+                          memory_order_relaxed);
     if (v.dropped) ray_sys_mem_flush();
     return v.released;
 }
