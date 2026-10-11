@@ -18,6 +18,7 @@
 #include "lang/env.h"
 #include "table/sym.h"
 #include <math.h>
+#include <stdlib.h>
 
 static ray_runtime_t* contract_runtime;
 static uint32_t contract_cores;
@@ -2360,7 +2361,7 @@ static test_result_t test_card_estimate(void) {
      * two spans caps */
     c[1] = c[0];
     c[0] = ray_eval_str("(% cr 2)");
-    TEST_ASSERT_TRUE(agg_group_card_sample(c, 2, 2, N, est, &kp, &ka));
+    TEST_ASSERT_TRUE(agg_group_card_sample(c, 2, 2, NULL, N, 0, est, &kp, NULL, &ka));
     TEST_ASSERT_EQ_I(est[0], 2);
     TEST_ASSERT_EQ_I(est[1], 1001);
     TEST_ASSERT_EQ_I(kp, 2002);
@@ -2402,7 +2403,7 @@ static test_result_t test_card_estimate(void) {
     c[0] = ray_eval_str("(% c10 1000)");
     c[1] = ray_eval_str("(% c10 1009)");
     c[2] = ray_eval_str("(% c10 50)");
-    TEST_ASSERT_TRUE(agg_group_card_sample(c, 3, 2, 10000000, est, &kp, &ka));
+    TEST_ASSERT_TRUE(agg_group_card_sample(c, 3, 2, NULL, 10000000, 0, est, &kp, NULL, &ka));
     TEST_ASSERT_EQ_I(est[0], 1000);
     TEST_ASSERT_EQ_I(est[1], 1009);
     TEST_ASSERT_EQ_I(est[2], 50);
@@ -2410,7 +2411,7 @@ static test_result_t test_card_estimate(void) {
     TEST_ASSERT_FMT(ka >= 800000 && ka <= 1250000, "1,000 x 1,009 x 50 tuples: %lld", (long long)ka);
     ray_release(c[1]);
     c[1] = ray_eval_str("(% c10 1013)");
-    TEST_ASSERT_TRUE(agg_group_card_sample(c, 3, 2, 10000000, est, &kp, &ka));
+    TEST_ASSERT_TRUE(agg_group_card_sample(c, 3, 2, NULL, 10000000, 0, est, &kp, NULL, &ka));
     TEST_ASSERT_EQ_I(est[1], 1013);
     TEST_ASSERT_FMT(kp >= 800000 && kp <= 1013000, "1,000 x 1,013 groups: %lld", (long long)kp);
     TEST_ASSERT_FMT(ka >= 800000 && ka <= 1250000, "1,000 x 1,013 x 50 tuples: %lld", (long long)ka);
@@ -2428,7 +2429,7 @@ static test_result_t test_card_estimate(void) {
      * of the columns says 1,024 groups, the tuple 256 */
     c[0] = ray_eval_str("(div (% (div cr 4096) 256) 64)");
     c[1] = ray_eval_str("(% (div cr 4096) 256)");
-    TEST_ASSERT_TRUE(agg_group_card_sample(c, 2, 2, N, est, &kp, &ka));
+    TEST_ASSERT_TRUE(agg_group_card_sample(c, 2, 2, NULL, N, 0, est, &kp, NULL, &ka));
     TEST_ASSERT_EQ_I(est[0], 4);
     TEST_ASSERT_EQ_I(est[1], 256);
     TEST_ASSERT_EQ_I(agg_group_card_estimate(c, 2, N), 1024);
@@ -2443,7 +2444,7 @@ static test_result_t test_card_estimate(void) {
     c[0] = ray_eval_str("(div cr 8192)");
     c[1] = ray_eval_str("(div cr 8)");
     c[2] = ray_eval_str("(% cr 2)");
-    TEST_ASSERT_TRUE(agg_group_card_sample(c, 3, 2, N, est, &kp, &ka));
+    TEST_ASSERT_TRUE(agg_group_card_sample(c, 3, 2, NULL, N, 0, est, &kp, NULL, &ka));
     TEST_ASSERT_FMT(est[1] >= 131070 && est[1] <= 131072, "runs of 8: span %lld", (long long)est[1]);
     TEST_ASSERT_FMT(kp >= 120000 && kp <= 145000, "sorted prefix: %lld groups", (long long)kp);
     TEST_ASSERT_FMT(ka >= 240000 && ka <= 290000, "sorted prefix: %lld tuples", (long long)ka);
@@ -2451,14 +2452,68 @@ static test_result_t test_card_estimate(void) {
      * (one run each) do not override it */
     ray_release(c[0]);
     c[0] = ray_eval_str("(div cr 32768)");
-    TEST_ASSERT_TRUE(agg_group_card_sample(c, 2, 1, N, est, &kp, NULL));
+    TEST_ASSERT_TRUE(agg_group_card_sample(c, 2, 1, NULL, N, 0, est, &kp, NULL, NULL));
     TEST_ASSERT_EQ_I(est[0], 32);
     TEST_ASSERT_EQ_I(kp, 32);
     ray_release(c[0]); ray_release(c[1]); ray_release(c[2]);
 
+    /* the largest group's rows: 45 equal groups, and a key whose first
+     * value holds half the rows (2000 / (1 + j), j cycling through 2000) */
+    int64_t kmax = 0;
+    c[0] = ray_eval_str("(% cr 45)");
+    TEST_ASSERT_TRUE(agg_group_card_sample(c, 1, 1, NULL, N, 0, est, &kp, &kmax, NULL));
+    TEST_ASSERT_FMT(kmax >= N / 45 - N / 450 && kmax <= N / 45 + N / 450,
+                    "45 equal groups: the largest holds %lld rows", (long long)kmax);
+    ray_release(c[0]);
+    c[0] = ray_eval_str("(div 2000 (+ 1 (% cr 2000)))");
+    TEST_ASSERT_TRUE(agg_group_card_sample(c, 1, 1, NULL, N, 0, est, &kp, &kmax, NULL));
+    TEST_ASSERT_FMT(kmax >= N / 2 - N / 40 && kmax <= N / 2 + N / 40,
+                    "a value on half the rows: the largest group holds %lld rows", (long long)kmax);
+    ray_release(c[0]);
+
+    /* a selection's rows: a key that is 0 on 88 rows in 100 and one of
+     * 1,000 values on the rest.  Over the table the zero is the
+     * largest group by far; over the rows a `where:` keeps, the 1,000
+     * groups are equal and the Chao1 sees them exactly. */
+    c[0] = ray_eval_str("(* (>= (% cr 100) 88) (+ 1 (% (div cr 100) 1000)))");
+    {
+        const int64_t* kd = (const int64_t*)ray_data(c[0]);
+        int64_t* sel = malloc((size_t)N * sizeof(int64_t));
+        TEST_ASSERT_NOT_NULL(sel);
+        int64_t nsel = 0;
+        for (int64_t i = 0; i < N; i++) if (kd[i] != 0) sel[nsel++] = i;
+        TEST_ASSERT_TRUE(nsel > N / 10 && nsel < N / 8);
+        TEST_ASSERT_TRUE(agg_group_card_sample(c, 1, 1, NULL, N, 0, est, &kp, &kmax, NULL));
+        TEST_ASSERT_FMT(kmax > N * 4 / 5, "over the table: the zero holds %lld rows", (long long)kmax);
+        TEST_ASSERT_TRUE(agg_group_card_sample(c, 1, 1, sel, nsel, 0, est, &kp, &kmax, NULL));
+        TEST_ASSERT_EQ_I(est[0], 1000);
+        TEST_ASSERT_EQ_I(kp, 1000);
+        TEST_ASSERT_FMT(kmax < nsel / 500, "over the selection: the largest group holds %lld of %lld rows",
+                        (long long)kmax, (long long)nsel);
+        free(sel);
+    }
+    ray_release(c[0]);
+
+    /* a list sampled from a larger population: 2,048 rows of `cr`, one per
+     * 512, describe the million rows they were drawn from — every one a
+     * singleton, and the Chao1 reaches for the population's span — and
+     * only themselves without the population */
+    {
+        int64_t* sel = malloc(2048 * sizeof(int64_t));
+        TEST_ASSERT_NOT_NULL(sel);
+        for (int64_t i = 0; i < 2048; i++) sel[i] = i * 512;
+        c[0] = ray_eval_str("cr");
+        TEST_ASSERT_TRUE(agg_group_card_sample(c, 1, 1, sel, 2048, N, est, NULL, NULL, NULL));
+        TEST_ASSERT_FMT(est[0] > N / 2 && est[0] <= N, "2,048 of a million rows: %lld", (long long)est[0]);
+        TEST_ASSERT_TRUE(agg_group_card_sample(c, 1, 1, sel, 2048, 0, est, NULL, NULL, NULL));
+        TEST_ASSERT_EQ_I(est[0], 2048);
+        ray_release(c[0]);
+        free(sel);
+    }
+
     /* a key type the estimate does not cover */
     c[0] = ray_eval_str("(as 'F64 cr)");
-    TEST_ASSERT_FALSE(agg_group_card_sample(c, 1, 1, N, est, NULL, NULL));
+    TEST_ASSERT_FALSE(agg_group_card_sample(c, 1, 1, NULL, N, 0, est, NULL, NULL, NULL));
     TEST_ASSERT_EQ_I(agg_group_card_estimate(c, 1, N), -1);
     ray_release(c[0]);
     PASS();
@@ -2478,18 +2533,18 @@ static test_result_t test_cd_route(void) {
     /* dense: 45 groups x 100 values pack within the rows */
     k[0] = ray_eval_str("(% cr 45)");
     x = ray_eval_str("(% cr 100)");
-    TEST_ASSERT_TRUE(ray_cd_two_pass_preferred(k, 1, x, N));
+    TEST_ASSERT_TRUE(ray_cd_two_pass_preferred(k, 1, x, NULL, N, 0, 28));
     ray_release(x);
     /* 45 groups x a million values: the (K, X) pass would be radix */
     x = ray_eval_str("cr");
-    TEST_ASSERT_FALSE(ray_cd_two_pass_preferred(k, 1, x, N));
+    TEST_ASSERT_FALSE(ray_cd_two_pass_preferred(k, 1, x, NULL, N, 0, 28));
     ray_release(k[0]); ray_release(x);
 
     /* 100,000 groups, below the scatter's 256 K: the slices, though the
      * (K, X) tuples (X determines K) would dedup to a fifth of the rows */
     k[0] = ray_eval_str("(% cr 100000)");
     x = ray_eval_str("(% cr 200000)");
-    TEST_ASSERT_FALSE(ray_cd_two_pass_preferred(k, 1, x, N));
+    TEST_ASSERT_FALSE(ray_cd_two_pass_preferred(k, 1, x, NULL, N, 0, 28));
     ray_release(k[0]); ray_release(x);
 
     /* 524,288 groups of 19 rows over 10 M rows, within the band: the
@@ -2500,18 +2555,18 @@ static test_result_t test_cd_route(void) {
     ray_release(setup);
     k[0] = ray_eval_str("(% c10 524288)");
     x = ray_eval_str("(% c10 262144)");
-    TEST_ASSERT_TRUE(ray_cd_two_pass_preferred(k, 1, x, 10000000));
+    TEST_ASSERT_TRUE(ray_cd_two_pass_preferred(k, 1, x, NULL, 10000000, 0, 28));
     ray_release(x);
     x = ray_eval_str("c10");
-    TEST_ASSERT_FALSE(ray_cd_two_pass_preferred(k, 1, x, 10000000));
+    TEST_ASSERT_FALSE(ray_cd_two_pass_preferred(k, 1, x, NULL, 10000000, 0, 28));
     ray_release(k[0]); ray_release(x);
     /* the same two over a sorted key, read through the blocks */
     k[0] = ray_eval_str("(div c10 19)");
     x = ray_eval_str("(div c10 38)");
-    TEST_ASSERT_TRUE(ray_cd_two_pass_preferred(k, 1, x, 10000000));
+    TEST_ASSERT_TRUE(ray_cd_two_pass_preferred(k, 1, x, NULL, 10000000, 0, 28));
     ray_release(x);
     x = ray_eval_str("c10");
-    TEST_ASSERT_FALSE(ray_cd_two_pass_preferred(k, 1, x, 10000000));
+    TEST_ASSERT_FALSE(ray_cd_two_pass_preferred(k, 1, x, NULL, 10000000, 0, 28));
     ray_release(k[0]); ray_release(x);
     /* a composite of periods 1,000 and 1,009 — 1,009,000 groups, within
      * the band, whose tuples beside a 50-value X are the groups: the
@@ -2520,7 +2575,7 @@ static test_result_t test_cd_route(void) {
     k[0] = ray_eval_str("(% c10 1000)");
     k[1] = ray_eval_str("(% c10 1009)");
     x = ray_eval_str("(% c10 50)");
-    TEST_ASSERT_TRUE(ray_cd_two_pass_preferred(k, 2, x, 10000000));
+    TEST_ASSERT_TRUE(ray_cd_two_pass_preferred(k, 2, x, NULL, 10000000, 0, 28));
     ray_release(k[0]); ray_release(k[1]); ray_release(x);
 
     /* past a million groups: the rewrite whatever the tuples */
@@ -2529,18 +2584,47 @@ static test_result_t test_cd_route(void) {
     ray_release(setup);
     k[0] = ray_eval_str("c2");
     x = ray_eval_str("(% c2 2)");
-    TEST_ASSERT_TRUE(ray_cd_two_pass_preferred(k, 1, x, 2 * N));
+    TEST_ASSERT_TRUE(ray_cd_two_pass_preferred(k, 1, x, NULL, 2 * N, 0, 28));
+    ray_release(k[0]); ray_release(x);
+
+    /* a dominant group: a key whose first value holds half the rows beside
+     * a million-value X takes the rewrite on 28 workers (the slice dedup
+     * would run that group on one), the slices on 2 (no parallel edge to
+     * lose); 2,000 equal groups take the slices */
+    k[0] = ray_eval_str("(div 2000 (+ 1 (% cr 2000)))");
+    x = ray_eval_str("cr");
+    TEST_ASSERT_TRUE(ray_cd_two_pass_preferred(k, 1, x, NULL, N, 0, 28));
+    TEST_ASSERT_FALSE(ray_cd_two_pass_preferred(k, 1, x, NULL, N, 0, 2));
+    ray_release(k[0]);
+    k[0] = ray_eval_str("(% cr 2000)");
+    TEST_ASSERT_FALSE(ray_cd_two_pass_preferred(k, 1, x, NULL, N, 0, 28));
+    ray_release(k[0]);
+    /* the same key behind a `where:` that drops its dominant value: over
+     * the table the zero on 88 rows in 100 reads as a dominant group and
+     * takes the rewrite; over the rows the selection keeps, 1,000 equal
+     * groups take the slices */
+    k[0] = ray_eval_str("(* (>= (% cr 100) 88) (+ 1 (% (div cr 100) 1000)))");
+    TEST_ASSERT_TRUE(ray_cd_two_pass_preferred(k, 1, x, NULL, N, 0, 28));
+    {
+        const int64_t* kd = (const int64_t*)ray_data(k[0]);
+        int64_t* sel = malloc((size_t)N * sizeof(int64_t));
+        TEST_ASSERT_NOT_NULL(sel);
+        int64_t nsel = 0;
+        for (int64_t i = 0; i < N; i++) if (kd[i] != 0) sel[nsel++] = i;
+        TEST_ASSERT_FALSE(ray_cd_two_pass_preferred(k, 1, x, sel, nsel, 0, 28));
+        free(sel);
+    }
     ray_release(k[0]); ray_release(x);
 
     /* a key the estimate does not cover takes the rewrite; a value it does
      * not cover the slices */
     k[0] = ray_eval_str("(as 'F64 cr)");
     x = ray_eval_str("(% cr 100)");
-    TEST_ASSERT_TRUE(ray_cd_two_pass_preferred(k, 1, x, N));
+    TEST_ASSERT_TRUE(ray_cd_two_pass_preferred(k, 1, x, NULL, N, 0, 28));
     ray_release(k[0]); ray_release(x);
     k[0] = ray_eval_str("(% cr 45)");
     x = ray_eval_str("(as 'F64 cr)");
-    TEST_ASSERT_FALSE(ray_cd_two_pass_preferred(k, 1, x, N));
+    TEST_ASSERT_FALSE(ray_cd_two_pass_preferred(k, 1, x, NULL, N, 0, 28));
     ray_release(k[0]); ray_release(x);
     PASS();
 }

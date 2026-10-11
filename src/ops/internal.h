@@ -662,6 +662,15 @@ ray_op_t* graph_alloc_node(ray_graph_t* g);
  * predicate without going through the full select planner. */
 ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr);
 
+/* The rows a `where:` keeps, sampled for the distinct-count route gate
+ * (query.c; exposed for the contract tests): the table rows surviving the
+ * predicate among CD_GATE_WHERE_SAMPLE sampled ones in *rows, *nrows of
+ * them, *population the rows the whole predicate would keep.  NULL (the
+ * outputs then describe the whole table) when the predicate names no
+ * column the gather covers or keeps every sampled row. */
+ray_t* query_cd_gate_where_rows(ray_t* tbl, ray_t* where_expr, int64_t n_table,
+                                const int64_t** rows, int64_t* nrows, int64_t* population);
+
 /* Pointer to trailing bytes after an ext node. */
 #define EXT_TRAIL(ext) ((char*)((ext) + 1))
 
