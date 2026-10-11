@@ -580,6 +580,15 @@ CNT11 -- 6
 (set myshow11 show)
 (set kms11 (fn [v] (myshow11 'once) (> (- v (avg v)) 0)))
 (at (select {n: (count v) by: (kms11 v) from: T10}) 'n) -- [6]
+;; quote set globally to a function makes (quote v) a call through it, while
+;; do, if, let and the other forms the compiler wires in stay the forms
+(set qsave quote)
+(set quote (at D11 'a))
+(set kqg11 (fn [v] (quote v) (kg10 v)))
+(set CNT11 0)
+(at (select {n: (count v) by: (kqg11 v) from: T10}) 'n) -- [6]
+CNT11 -- 6
+(set quote qsave)
 ;; ... while a literal fallback value of try keeps the whole column
 (set khv11 (fn [v] (let t (try (raise "x") 'none)) (kg10 v)))
 (at (select {n: (count v) by: (khv11 v) from: T10}) 'n) -- [3 3]

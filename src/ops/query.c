@@ -2295,9 +2295,30 @@ static bool key_name_bound(int64_t id, const key_pure_ctx_t* ctx) {
     return ray_env_get_local(id) != NULL;
 }
 
+/* Whether a head spelled like a special form is the form where it is
+ * written: not bound by the walk, a capture or a frame.  The compiler
+ * takes do, fn, if, let, return, times, try, while and self as the forms
+ * whatever their global binding; any other form name (quote, cond, and,
+ * or, raise) it resolves, so one set globally to anything but a builtin
+ * makes the call a call: (set quote f) then (quote x). */
+static bool key_is_form_here(int64_t id, const key_pure_ctx_t* ctx) {
+    if (key_name_bound(id, ctx)) return false;
+    static const char* const wired[] = { "do", "fn", "if", "let", "return", "times", "try", "while", "self" };
+    enum { NWIRED = sizeof wired / sizeof *wired };
+    static _Thread_local int64_t ids[NWIRED];
+    static _Thread_local uint64_t epoch;
+    if (epoch != ray_sym_epoch() || !epoch) {
+        for (size_t i = 0; i < NWIRED; i++) ids[i] = ray_sym_intern(wired[i], strlen(wired[i]));
+        epoch = ray_sym_epoch();
+    }
+    for (size_t i = 0; i < NWIRED; i++) if (ids[i] == id) return true;
+    ray_t* g = ray_env_get_global(id);
+    return !g || g->type == RAY_UNARY || g->type == RAY_BINARY || g->type == RAY_VARY;
+}
+
 /* A lambda literal, `fn` being the special form where it is written. */
 static bool key_lit_fn(ray_t* v, const key_pure_ctx_t* ctx) {
-    return key_literal_is_fn(v) && !key_name_bound(ray_sym_intern("fn", 2), ctx);
+    return key_literal_is_fn(v) && key_is_form_here(ray_sym_intern("fn", 2), ctx);
 }
 
 /* Bind a callee's parameter names (a SYM vector, or `[]` parsed as an
@@ -2622,7 +2643,7 @@ static bool key_collect_lets(ray_t* expr, int64_t* names, int* nn, int depth, co
     ray_t** es = ray_data(expr);
     if (es[0] && es[0]->type == -RAY_SYM && !(es[0]->attrs & ATTR_QUOTED)) {
         int64_t id = es[0]->i64;
-        if ((id == ray_sym_intern("fn", 2) || id == ray_sym_intern("quote", 5)) && !key_name_bound(id, ctx)) return true;
+        if ((id == ray_sym_intern("fn", 2) || id == ray_sym_intern("quote", 5)) && key_is_form_here(id, ctx)) return true;
         if (id == ray_sym_intern("let", 3) && expr->len == 3 && es[1] && es[1]->type == -RAY_SYM) {
             bool seen = false;
             for (int i = 0; i < *nn && !seen; i++) seen = names[i] == es[1]->i64;
@@ -2654,7 +2675,7 @@ static bool key_expr_pure(ray_t* expr, int depth, key_pure_ctx_t* ctx) {
         if (!key_literal_call_pure(head, es + 1, expr->len - 1, depth, ctx)) return false;
     } else if (head->type == -RAY_SYM && !(head->attrs & ATTR_QUOTED)) {
         int64_t id = head->i64;
-        if (key_pure_form(id) && !key_name_bound(id, ctx)) {
+        if (key_pure_form(id) && key_is_form_here(id, ctx)) {
             if (id == ray_sym_intern("quote", 5)) return true;
             if (id == ray_sym_intern("fn", 2)) return key_literal_call_pure(expr, NULL, 0, depth, ctx);
             if (id == ray_sym_intern("let", 3) && expr->len == 3 && es[1] && es[1]->type == -RAY_SYM &&
@@ -2682,7 +2703,7 @@ static bool key_expr_pure(ray_t* expr, int depth, key_pure_ctx_t* ctx) {
     /* After its first operand a conditional or loop form's operands may
      * not run: a `let` there is conditional.  In a try body a raise can
      * skip any `let`, so the whole form is. */
-    bool is_form = head->type == -RAY_SYM && key_pure_form(head->i64) && !key_name_bound(head->i64, ctx);
+    bool is_form = head->type == -RAY_SYM && key_pure_form(head->i64) && key_is_form_here(head->i64, ctx);
     bool is_try = is_form && head->i64 == ray_sym_intern("try", 3);
     bool is_loop = is_form && (head->i64 == ray_sym_intern("while", 5) || head->i64 == ray_sym_intern("times", 5));
     bool branches = is_form &&
