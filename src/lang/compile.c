@@ -693,8 +693,8 @@ static void compile_list(compiler_t *c, ray_t *ast) {
         /* A closure body resolved the callee above (OP_RESOLVE); while
          * the name holds a builtin of the kind it holds now, the call
          * takes the fast path, and the general call otherwise. */
-        if (fn->type == RAY_UNARY && argc == 1)      { emit(c, OP_CALL1R); emitted = true; }
-        else if (fn->type == RAY_BINARY && argc == 2) { emit(c, OP_CALL2R); emitted = true; }
+        if (fn->type == RAY_UNARY && argc == 1)      { emit(c, OP_CALL1R); emit(c, 1); emitted = true; }
+        else if (fn->type == RAY_BINARY && argc == 2) { emit(c, OP_CALL2R); emit(c, 2); emitted = true; }
         else if (fn->type == RAY_VARY)                { emit(c, OP_CALLNR); emit(c, (uint8_t)argc); emitted = true; }
     }
     if (!emitted && fn && (baked || fn->type == RAY_LAMBDA)) {
