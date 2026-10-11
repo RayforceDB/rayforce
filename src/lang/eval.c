@@ -3095,12 +3095,31 @@ op_call1: {
     DISPATCH();
 }
 
-op_call2r:
-    /* OP_CALL2 for a resolved binary builtin (the same rows in and out as
-     * a baked call); the general call when the name holds anything else. */
+op_call2r: {
+    /* OP_CALL2 for a resolved binary builtin, with the same rows in and
+     * out as a baked call; the general call when the name holds anything
+     * else. */
     if (RAY_UNLIKELY(!vm.ps[vm.sp - 3] || vm.ps[vm.sp - 3]->type != RAY_BINARY)) goto op_callf;
     ip++;
-    goto op_call2;
+    ray_t *right = POP();
+    uint8_t right_rows = POPPED_ROWS();
+    ray_t *left = POP();
+    uint8_t left_rows = POPPED_ROWS();
+    ray_t *fn_obj = POP();
+    if (RAY_UNLIKELY(fn_is_restricted(fn_obj))) {
+        ray_release(left);
+        ray_release(right);
+        ray_release(fn_obj);
+        vm_err_obj = ray_error("access", "restricted");
+        goto vm_error;
+    }
+    uint8_t result_rows = 0;
+    ray_t *result = vm_call_binary(fn_obj, left, right, left_rows, right_rows, &result_rows);
+    ray_release(fn_obj);
+    if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }
+    PUSHR(result, result_rows);
+    DISPATCH();
+}
 
 op_call2: {
     ray_t *right = POP();
