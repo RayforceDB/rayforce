@@ -10259,9 +10259,18 @@ static ray_t* select_dict_with_from(ray_t* dict, ray_t* tbl) {
 
 static ray_t* sym_binding(int64_t s);
 
+/* `(let n v)` or `(set n v)`: the name it binds, or -1. */
+static int64_t key_binding_form(ray_t* e) {
+    if (!e || e->type != RAY_LIST || e->len != 3) return -1;
+    ray_t** el = (ray_t**)ray_data(e);
+    if (!select_sym_is(el[0], "let", 3) && !select_sym_is(el[0], "set", 3)) return -1;
+    return el[1]->type == -RAY_SYM && !(el[1]->attrs & ATTR_QUOTED) ? el[1]->i64 : -1;
+}
+
 /* The first free name in key `e` that is no column of `tbl` and no bound
  * name, or -1.  A lambda written in the key is skipped: its names resolve
- * when it runs.  A let binds its name for its body. */
+ * when it runs.  A let or set binds its name for the forms after it (the
+ * rest of a `do`). */
 static int64_t key_unknown_name(ray_t* e, ray_t* tbl, int64_t* bound, int nbound) {
     if (!e) return -1;
     if (e->type == -RAY_SYM) {
@@ -10277,16 +10286,13 @@ static int64_t key_unknown_name(ray_t* e, ray_t* tbl, int64_t* bound, int nbound
     if (e->type != RAY_LIST || e->len < 1) return -1;
     ray_t** el = (ray_t**)ray_data(e);
     if (select_sym_is(el[0], "fn", 2) || select_sym_is(el[0], "quote", 5)) return -1;
-    if (select_sym_is(el[0], "let", 3) && e->len == 4 && el[1]->type == -RAY_SYM) {
-        int64_t m = key_unknown_name(el[2], tbl, bound, nbound);
-        if (m >= 0 || nbound >= 32) return m;
-        bound[nbound] = el[1]->i64;
-        return key_unknown_name(el[3], tbl, bound, nbound + 1);
-    }
+    if (key_binding_form(e) >= 0) return key_unknown_name(el[2], tbl, bound, nbound);
     /* a named head is a function, whose own error stands */
     for (int64_t i = el[0]->type == -RAY_SYM ? 1 : 0; i < e->len; i++) {
         int64_t m = key_unknown_name(el[i], tbl, bound, nbound);
         if (m >= 0) return m;
+        int64_t b = key_binding_form(el[i]);
+        if (b >= 0 && nbound < 32) bound[nbound++] = b;
     }
     return -1;
 }
