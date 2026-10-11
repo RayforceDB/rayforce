@@ -2322,7 +2322,91 @@ static test_result_t test_select_read_ahead_sparse_filter(void) {
 }
 #endif
 
+/* The planner's sampled cardinality estimates (agg_group_card_sample,
+ * agg_group_card_estimate; #760).  1,048,576 rows are sampled one row per
+ * window of 32, so a value filling one such window is a sampled singleton. */
+static test_result_t test_card_estimate(void) {
+    const int64_t N = 1048576;
+    ray_t* setup = ray_eval_str("(set cr (til 1048576))");
+    TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+    ray_release(setup);
+    ray_t* c[3];
+    int64_t est[3], kp = 0, ka = 0;
+
+    /* every row distinct: the sample holds singletons only; the Chao1
+     * correction raises its count (the sample size without it) past the
+     * span, which caps the estimate at the rows */
+    c[0] = ray_eval_str("cr");
+    {
+        int64_t all = agg_group_card_estimate(c, 1, N);   /* the sampled span: a window short of N at each end */
+        TEST_ASSERT_FMT(all >= N - 64 && all <= N, "every row distinct: %lld", (long long)all);
+    }
+    ray_release(c[0]);
+
+    /* 45 values: no singletons, the count itself */
+    c[0] = ray_eval_str("(% cr 45)");
+    TEST_ASSERT_EQ_I(agg_group_card_estimate(c, 1, N), 45);
+    ray_release(c[0]);
+
+    /* 1,000 values on one window of 32 rows each and one value elsewhere:
+     * Chao1 reads the 1,000 sampled singletons as half a million values;
+     * the span caps an integer key at the 1,001 it can hold, the domain's
+     * count a SYM key (the process-wide domain here, so at least 1,001 and
+     * far below the half million) */
+    c[0] = ray_eval_str("(* (< cr 32000) (+ 1 (div cr 32)))");
+    TEST_ASSERT_EQ_I(agg_group_card_estimate(c, 1, N), 1001);
+    ray_release(c[0]);
+    c[0] = ray_eval_str("(as 'SYM (* (< cr 32000) (+ 1 (div cr 32))))");
+    {
+        int64_t dom = ray_sym_domain_count(ray_sym_vec_domain(c[0]));
+        int64_t sym = agg_group_card_estimate(c, 1, N);
+        TEST_ASSERT_FMT(sym >= 1001 && sym <= dom && sym < 500000,
+                        "SYM key: %lld of a %lld-symbol domain", (long long)sym, (long long)dom);
+    }
+    ray_release(c[0]);
+
+    /* a composite whose first column follows from the second: the product
+     * of the columns says 1,024 groups, the tuple 256 */
+    c[0] = ray_eval_str("(div (% (div cr 4096) 256) 64)");
+    c[1] = ray_eval_str("(% (div cr 4096) 256)");
+    TEST_ASSERT_TRUE(agg_group_card_sample(c, 2, 2, N, est, &kp, &ka));
+    TEST_ASSERT_EQ_I(est[0], 4);
+    TEST_ASSERT_EQ_I(est[1], 256);
+    TEST_ASSERT_EQ_I(agg_group_card_estimate(c, 2, N), 1024);
+    TEST_ASSERT_EQ_I(kp, 256);
+    TEST_ASSERT_EQ_I(ka, 256);
+    ray_release(c[0]); ray_release(c[1]);
+
+    /* a sorted composite in runs of 8 rows, below the stride: the stride
+     * sees every sample distinct and its Chao1 saturates at the rows; the
+     * blocks of adjacent rows read the runs — 131,072 groups — and, with a
+     * value alternating within each run, 262,144 (key, value) tuples */
+    c[0] = ray_eval_str("(div cr 8192)");
+    c[1] = ray_eval_str("(div cr 8)");
+    c[2] = ray_eval_str("(% cr 2)");
+    TEST_ASSERT_TRUE(agg_group_card_sample(c, 3, 2, N, est, &kp, &ka));
+    TEST_ASSERT_FMT(est[1] >= 131070 && est[1] <= 131072, "runs of 8: span %lld", (long long)est[1]);
+    TEST_ASSERT_FMT(kp >= 120000 && kp <= 145000, "sorted prefix: %lld groups", (long long)kp);
+    TEST_ASSERT_FMT(ka >= 240000 && ka <= 290000, "sorted prefix: %lld tuples", (long long)ka);
+    /* 32 sorted groups of 32,768 rows: the stride is exact, and the blocks
+     * (one run each) do not override it */
+    ray_release(c[0]);
+    c[0] = ray_eval_str("(div cr 32768)");
+    TEST_ASSERT_TRUE(agg_group_card_sample(c, 2, 1, N, est, &kp, NULL));
+    TEST_ASSERT_EQ_I(est[0], 32);
+    TEST_ASSERT_EQ_I(kp, 32);
+    ray_release(c[0]); ray_release(c[1]); ray_release(c[2]);
+
+    /* a key type the estimate does not cover */
+    c[0] = ray_eval_str("(as 'F64 cr)");
+    TEST_ASSERT_FALSE(agg_group_card_sample(c, 1, 1, N, est, NULL, NULL));
+    TEST_ASSERT_EQ_I(agg_group_card_estimate(c, 1, N), -1);
+    ray_release(c[0]);
+    PASS();
+}
+
 const test_entry_t agg_contract_entries[] = {
+    { "agg_contract/card_estimate", test_card_estimate, contract_setup, contract_teardown },
     { "agg_contract/empty_inference_errors", test_empty_inference_errors, contract_setup, contract_teardown },
     { "agg_contract/nth_bounds", test_nth_bounds, contract_setup, contract_teardown },
     { "agg_contract/native_binary_output", test_native_binary_output, contract_setup, contract_teardown },

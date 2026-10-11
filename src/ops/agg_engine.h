@@ -219,10 +219,9 @@ bool agg_dense_plan(ray_t** key_cols, uint32_t n_keys,
                     const agg_vtable_t** vts, uint32_t n_aggs,
                     int64_t nrows, dense_plan_t* out);
 
-/* An estimate of the groups the key tuple (key_cols) forms, for a planner
- * choosing between strategies before any grouping runs
- * (try_count_distinct_v2_rewrite): the product of per-key estimates, each
- * from a strided sample of 65,536 rows (every row below that).  A key's
+/* Cardinality estimates for a planner choosing between strategies before
+ * any grouping runs (try_count_distinct_v2_rewrite), from one strided
+ * sample of 32,768 rows over `cols` (every row below that).  A column's
  * distinct values in the sample are raised by the Chao1 estimator from the
  * values seen once and twice, so a key the sample cannot exhaust — a
  * million values, or one value on most rows and a million on the rest — is
@@ -230,9 +229,23 @@ bool agg_dense_plan(ray_t** key_cols, uint32_t n_keys,
  * estimate is capped at the span of the sampled values for an integer or
  * temporal key, and at the domain's count for a SYM key (codes of a shared
  * domain interleave, so a span would overstate a 5-value key by orders of
- * magnitude).  An estimate, never a bound: a planner weighs it against
- * thresholds with slack.  -1 when a key is not a dense key type, the input
- * is empty, or the product overflows. */
+ * magnitude).  col_est[k] (when given) receives column k's estimate;
+ * prefix_est the estimate for the tuple of the first n_prefix columns (the
+ * groups a composite key forms, which the product of its columns' estimates
+ * overstates when one column follows from another); all_est the estimate
+ * for the tuple of all n columns (the tuples a (key, value) grouping would
+ * keep).  A tuple is capped at the product of its columns' caps and at
+ * nrows; a sorted prefix, which a stride reads as all distinct, is read
+ * through blocks of adjacent rows as well.  Estimates, never bounds: a
+ * planner weighs them against thresholds with slack.  false — with the
+ * outputs unset — when a column is not a dense key type (integer, temporal,
+ * SYM), n is 0 or above 16, the input is empty, or memory runs out. */
+bool agg_group_card_sample(ray_t** cols, uint32_t n, uint32_t n_prefix, int64_t nrows,
+                           int64_t* col_est, int64_t* prefix_est, int64_t* all_est);
+
+/* The product of the per-key estimates above for key_cols: the packed key
+ * space a direct-index grouping would hold.  -1 when a key is not a dense
+ * key type, the input is empty, or the product overflows. */
 int64_t agg_group_card_estimate(ray_t** key_cols, uint32_t n_keys, int64_t nrows);
 
 /* Result column name for a plain-column-input aggregate: input column name

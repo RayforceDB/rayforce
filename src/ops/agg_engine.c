@@ -500,21 +500,41 @@ static bool agg_dense_plan_compact(ray_t** key_cols, uint32_t n_keys, int64_t nr
 
 /* An estimate of the groups a key tuple forms — see agg_engine.h.
  *
- * Each key is sampled at a fixed stride, AGG_EST_SAMPLE rows over the input
- * (every row below that), and its values go through a small open-addressing
- * set that counts how often each was seen.  Blocks of adjacent rows would
- * be cheaper to read but blind to clustered keys: a run of four rows per
- * value shows a block one value per four rows, while a stride past the run
- * length shows every sample distinct.  The distinct count of the sample is
- * then raised by the Chao1 species estimator, d + f1 (f1 - 1) / 2 (f2 + 1)
- * — f1 and f2 the values seen once and twice — which answers for the
- * values the sample missed: a key of 45 values has no singletons and stays
- * 45; a skewed key, one value on nine rows in ten and a million on the
- * rest, shows thousands of singletons and few pairs and lands near the
- * million.  Each key's estimate is capped at what it could hold: the span
- * of its sampled values for an integer or temporal key, the domain's
- * count for a SYM key. */
-enum { AGG_EST_SAMPLE = 1 << 16 };
+ * The columns are sampled together at a fixed stride, AGG_EST_SAMPLE rows
+ * over the input (every row below that; the strided reads miss the cache,
+ * and 32,768 of them over three columns cost half a millisecond at 10 M
+ * rows with the prefetch below), one row from each window of `stride` rows
+ * at a hashed offset — a fixed position would read a key whose period
+ * divides the stride, five values cycling under a stride of 305, as one
+ * value — and each column's values go
+ * through a small open-addressing set that counts how often each was seen.
+ * Blocks of adjacent rows would be cheaper to read but blind to clustered
+ * keys: a run of four rows per value shows a block one value per four rows,
+ * while a stride past the run length shows every sample distinct.  The
+ * distinct count of the sample is then raised by the Chao1 species
+ * estimator, d + f1 (f1 - 1) / 2 (f2 + 1) — f1 and f2 the values seen once
+ * and twice — which answers for the values the sample missed: a key of 45
+ * values has no singletons and stays 45; a skewed key, one value on nine
+ * rows in ten and a million on the rest, shows thousands of singletons and
+ * few pairs and lands near the million.  Each key's estimate is capped at
+ * what it could hold: the span of its sampled values for an integer or
+ * temporal key, the domain's count for a SYM key.
+ *
+ * The same pass hashes the tuple of the first n_prefix columns and the
+ * tuple of all of them into two more sets, for the groups a composite key
+ * forms (its columns' product overstates a city beside its country by the
+ * number of countries) and for the tuples a (key, value) grouping would
+ * keep.  A tuple holds at most the product of its columns' caps, and at
+ * most one value per row.  A sorted prefix defeats the stride: every
+ * sample is a different tuple once the run length is below the stride, and
+ * the Chao1 saturates at the cap.  The sample notices — its prefix tuples
+ * never decrease — and reads AGG_EST_BLOCKS blocks of AGG_EST_BLOCK adjacent
+ * rows as well, which see the runs: the groups are the rows over the mean
+ * run length, the tuples the distinct ones per block; the lower of the two
+ * readings stands.  (A run longer than a block reads as a block, so blocks
+ * alone would overstate a key of few groups; the stride is exact there.) */
+enum { AGG_EST_SAMPLE = 1 << 15, AGG_EST_PREFETCH = 16,
+       AGG_EST_BLOCK = 256, AGG_EST_BLOCKS = AGG_EST_SAMPLE / AGG_EST_BLOCK };
 
 /* A sampled key value as int64: the integer itself (a null is its sentinel,
  * one more value), a SYM's code. */
@@ -528,72 +548,209 @@ static inline int64_t agg_est_read(const void* d, int8_t t, uint8_t attrs, int64
     }
 }
 
-/* The Chao1 estimate of a key's distinct values from a strided sample,
- * capped at `cap` when that is positive.  -1 on OOM. */
-static int64_t agg_key_card_sampled(ray_t* key, int64_t nrows, int64_t cap_hint) {
-    int64_t sample = nrows < AGG_EST_SAMPLE ? nrows : AGG_EST_SAMPLE;
-    int64_t stride = nrows / sample;
-    uint64_t slots = 64;
-    while (slots < (uint64_t)sample * 2) slots <<= 1;
-    uint8_t* mem = ray_alloc_raw((size_t)slots * (sizeof(int64_t) + 1));
-    if (!mem) return -1;
-    int64_t* vals = (int64_t*)mem;
-    uint8_t* seen = mem + slots * sizeof(int64_t);
-    memset(seen, 0, (size_t)slots);
-    const uint64_t mask = slots - 1;
-    const void* data = ray_data(key);
-    int64_t d = 0, f1 = 0, f2 = 0, lo = INT64_MAX, hi = INT64_MIN;
-    for (int64_t i = 0; i < sample; i++) {
-        int64_t v = agg_est_read(data, key->type, key->attrs, i * stride);
-        if (v < lo) lo = v;
-        if (v > hi) hi = v;
-        uint64_t h = ((uint64_t)v * 0x9E3779B97F4A7C15ULL) >> 20 & mask;
-        for (;; h = (h + 1) & mask) {
-            if (seen[h] == 0) { vals[h] = v; seen[h] = 1; d++; f1++; break; }
-            if (vals[h] == v) {
-                if (seen[h] == 1) { seen[h] = 2; f1--; f2++; }
-                else if (seen[h] == 2) { seen[h] = 3; f2--; }
-                break;
-            }
+/* Fold one column's value into a tuple hash (order-sensitive). */
+static inline uint64_t agg_est_mix(uint64_t h, int64_t v) {
+    h ^= (uint64_t)v * 0x9E3779B97F4A7C15ULL;
+    h *= 0xBF58476D1CE4E5B9ULL;
+    return h ^ (h >> 31);
+}
+
+/* An open-addressing set of sampled values with how often each was seen
+ * (once, twice, more), kept as the Chao1 inputs d, f1, f2. */
+typedef struct {
+    int64_t* vals;
+    uint8_t* seen;
+    int64_t  d, f1, f2;
+} agg_est_set_t;
+
+static inline void agg_est_set_add(agg_est_set_t* s, uint64_t mask, int64_t v) {
+    uint64_t h = ((uint64_t)v * 0x9E3779B97F4A7C15ULL) >> 20 & mask;
+    for (;; h = (h + 1) & mask) {
+        if (s->seen[h] == 0) { s->vals[h] = v; s->seen[h] = 1; s->d++; s->f1++; return; }
+        if (s->vals[h] == v) {
+            if (s->seen[h] == 1) { s->seen[h] = 2; s->f1--; s->f2++; }
+            else if (s->seen[h] == 2) { s->seen[h] = 3; s->f2--; }
+            return;
         }
     }
-    ray_free_raw(mem);
-    int64_t est = d;
-    if (sample < nrows && f1 > 1) {
-        /* f1 <= 65,536: the product is far from overflowing */
-        int64_t add = f1 * (f1 - 1) / (2 * (f2 + 1));
+}
+
+/* The Chao1 estimate from a set's counts (the distinct count itself when
+ * the sample is the whole input), capped at `cap` when that is positive;
+ * never below 1. */
+static int64_t agg_est_chao1(const agg_est_set_t* s, bool sampled, int64_t cap) {
+    int64_t est = s->d;
+    if (sampled && s->f1 > 1) {
+        /* f1 <= AGG_EST_SAMPLE: the product is far from overflowing */
+        int64_t add = s->f1 * (s->f1 - 1) / (2 * (s->f2 + 1));
         est = add > INT64_MAX - est ? INT64_MAX : est + add;
     }
-    if (key->type != RAY_SYM) {
-        /* the span of the sampled values bounds what the key can hold */
-        uint64_t span = (uint64_t)hi - (uint64_t)lo;
-        if (span < (uint64_t)INT64_MAX - 1 && (int64_t)span + 1 < est) est = (int64_t)span + 1;
-    } else if (cap_hint > 0 && cap_hint < est) {
-        est = cap_hint;
-    }
+    if (cap > 0 && cap < est) est = cap;
     return est < 1 ? 1 : est;
 }
 
-int64_t agg_group_card_estimate(ray_t** key_cols, uint32_t n_keys, int64_t nrows) {
-    if (n_keys < 1 || n_keys > 16 || nrows <= 0) return -1;
-    int64_t total = 1;
-    for (uint32_t k = 0; k < n_keys; k++) {
-        ray_t* kc = key_cols[k];
-        int64_t cap = 0;
-        switch (kc->type) {
+/* What a tuple of columns 0..n can hold: the product of their caps (a
+ * column without one, or a product past nrows, is nrows) and nrows. */
+static int64_t agg_est_tuple_cap(const int64_t* cap, uint32_t n, int64_t nrows) {
+    int64_t prod = 1;
+    for (uint32_t k = 0; k < n; k++) {
+        if (cap[k] <= 0 || prod > nrows / cap[k]) return nrows;
+        prod *= cap[k];
+    }
+    return prod < nrows ? prod : nrows;
+}
+
+/* Blocks of adjacent rows over a sorted prefix: the groups as rows over the
+ * mean run length of the prefix tuple, the (prefix, rest) tuples as the
+ * distinct ones per block scaled to the input.  false when the input is too
+ * short for the blocks (the stride is then exact anyway). */
+static bool agg_est_blocks(ray_t** cols, uint32_t n, uint32_t n_prefix, int64_t nrows,
+                           int64_t* prefix_est, int64_t* all_est) {
+    enum { SLOTS = AGG_EST_BLOCK * 4 };
+    if (nrows < (int64_t)AGG_EST_BLOCK * 4) return false;
+    int64_t nblk = AGG_EST_BLOCKS;
+    if (nblk * AGG_EST_BLOCK > nrows) nblk = nrows / AGG_EST_BLOCK;
+    const int64_t gap = nrows / nblk;
+    int64_t vals[SLOTS];
+    uint8_t seen[SLOTS];
+    agg_est_set_t set = { vals, seen, 0, 0, 0 };
+    int64_t runs = 0, rows = 0, distinct = 0;
+    for (int64_t b = 0; b < nblk; b++) {
+        const int64_t start = b * gap;
+        memset(seen, 0, sizeof seen);
+        set.d = set.f1 = set.f2 = 0;
+        uint64_t hp_prev = 0;
+        for (int64_t r = start; r < start + AGG_EST_BLOCK; r++) {
+            uint64_t hp = 0, ha = 0;
+            for (uint32_t k = 0; k < n; k++) {
+                ha = agg_est_mix(ha, agg_est_read(ray_data(cols[k]), cols[k]->type,
+                                                  cols[k]->attrs, r));
+                if (k + 1 == n_prefix) hp = ha;
+            }
+            if (r == start || hp != hp_prev) runs++;
+            hp_prev = hp;
+            agg_est_set_add(&set, SLOTS - 1, (int64_t)ha);
+        }
+        distinct += set.d;
+        rows += AGG_EST_BLOCK;
+    }
+    *prefix_est = (int64_t)((double)nrows * (double)runs / (double)rows);
+    *all_est    = (int64_t)((double)nrows * (double)distinct / (double)rows);
+    if (*prefix_est < 1) *prefix_est = 1;
+    if (*all_est < 1) *all_est = 1;
+    return true;
+}
+
+bool agg_group_card_sample(ray_t** cols, uint32_t n, uint32_t n_prefix, int64_t nrows,
+                           int64_t* col_est, int64_t* prefix_est, int64_t* all_est) {
+    if (n < 1 || n > 16 || n_prefix < 1 || n_prefix > n || nrows <= 0) return false;
+    int64_t     cap[16];
+    const void* data[16];
+    size_t      esz[16];
+    for (uint32_t k = 0; k < n; k++) {
+        ray_t* c = cols[k];
+        switch (c->type) {
         case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8:
         case RAY_BOOL: case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP:
+            cap[k] = 0;   /* the span of the sampled values, below */
             break;
         case RAY_SYM:
-            cap = ray_sym_domain_count(ray_sym_vec_domain(kc));
+            cap[k] = ray_sym_domain_count(ray_sym_vec_domain(c));
             break;
         default:
-            return -1;
+            return false;
         }
-        int64_t est = agg_key_card_sampled(kc, nrows, cap);
-        if (est < 1) return -1;   /* -1 on OOM; never 0 (static analysis) */
-        if (total > INT64_MAX / est) return -1;
-        total *= est;
+        data[k] = ray_data(c);
+        esz[k]  = col_esz(c);
+    }
+    const bool    tuples = prefix_est || all_est;
+    const int64_t sample = nrows < AGG_EST_SAMPLE ? nrows : AGG_EST_SAMPLE;
+    const int64_t stride = nrows / sample;
+    uint64_t slots = 64;
+    while (slots < (uint64_t)sample * 2) slots <<= 1;
+    const uint32_t nsets = n + (tuples ? 2 : 0);
+    const size_t   set_bytes = (size_t)slots * (sizeof(int64_t) + 1);
+    uint8_t* mem = ray_alloc_raw(set_bytes * nsets);
+    if (!mem) return false;
+    agg_est_set_t sets[18];
+    for (uint32_t i = 0; i < nsets; i++) {
+        sets[i].vals = (int64_t*)(mem + (size_t)i * set_bytes);
+        sets[i].seen = mem + (size_t)i * set_bytes + (size_t)slots * sizeof(int64_t);
+        memset(sets[i].seen, 0, (size_t)slots);
+        sets[i].d = sets[i].f1 = sets[i].f2 = 0;
+    }
+    const uint64_t mask = slots - 1;
+    int64_t lo[16], hi[16], prev[16];
+    for (uint32_t k = 0; k < n; k++) { lo[k] = INT64_MAX; hi[k] = INT64_MIN; prev[k] = INT64_MIN; }
+    bool sorted = true;   /* the sampled prefix tuples never decrease */
+#define AGG_EST_ROW(i) \
+    ((i) * stride + (int64_t)((((uint64_t)(i) * 0x9E3779B97F4A7C15ULL) >> 33) % (uint64_t)stride))
+    for (int64_t i = 0; i < sample; i++) {
+        const int64_t r = AGG_EST_ROW(i);
+        if (i + AGG_EST_PREFETCH < sample) {
+            /* the strided reads miss the cache; keep several in flight */
+            const size_t rp = (size_t)AGG_EST_ROW(i + AGG_EST_PREFETCH);
+            for (uint32_t k = 0; k < n; k++)
+                __builtin_prefetch((const char*)data[k] + rp * esz[k]);
+        }
+        uint64_t hp = 0, ha = 0;
+        int cmp = 0;   /* the prefix tuple against the previous sample's */
+        for (uint32_t k = 0; k < n; k++) {
+            const int64_t v = agg_est_read(data[k], cols[k]->type, cols[k]->attrs, r);
+            if (v < lo[k]) lo[k] = v;
+            if (v > hi[k]) hi[k] = v;
+            agg_est_set_add(&sets[k], mask, v);
+            if (tuples) {
+                ha = agg_est_mix(ha, v);
+                if (k < n_prefix) {
+                    hp = ha;
+                    if (cmp == 0 && v != prev[k]) cmp = v < prev[k] ? -1 : 1;
+                    prev[k] = v;
+                }
+            }
+        }
+        if (tuples) {
+            if (cmp < 0) sorted = false;
+            agg_est_set_add(&sets[n], mask, (int64_t)hp);
+            agg_est_set_add(&sets[n + 1], mask, (int64_t)ha);
+        }
+    }
+#undef AGG_EST_ROW
+    const bool sampled = sample < nrows;
+    for (uint32_t k = 0; k < n; k++) {
+        if (cols[k]->type != RAY_SYM) {
+            /* the span of the sampled values bounds what the key can hold */
+            uint64_t span = (uint64_t)hi[k] - (uint64_t)lo[k];
+            cap[k] = span < (uint64_t)INT64_MAX - 1 ? (int64_t)span + 1 : 0;
+        }
+        int64_t est = agg_est_chao1(&sets[k], sampled, cap[k]);
+        if (col_est) col_est[k] = est;
+    }
+    if (tuples) {
+        int64_t kp = agg_est_chao1(&sets[n], sampled, agg_est_tuple_cap(cap, n_prefix, nrows));
+        int64_t ka = agg_est_chao1(&sets[n + 1], sampled, agg_est_tuple_cap(cap, n, nrows));
+        int64_t bp, ba;
+        if (sorted && sampled && agg_est_blocks(cols, n, n_prefix, nrows, &bp, &ba)) {
+            if (bp < kp) kp = bp;
+            if (ba < ka) ka = ba;
+        }
+        if (prefix_est) *prefix_est = kp;
+        if (all_est) *all_est = ka;
+    }
+    ray_free_raw(mem);
+    return true;
+}
+
+int64_t agg_group_card_estimate(ray_t** key_cols, uint32_t n_keys, int64_t nrows) {
+    int64_t est[16];
+    if (n_keys < 1 || n_keys > 16 ||
+        !agg_group_card_sample(key_cols, n_keys, n_keys, nrows, est, NULL, NULL))
+        return -1;
+    int64_t total = 1;
+    for (uint32_t k = 0; k < n_keys; k++) {
+        if (est[k] < 1) return -1;   /* never below 1 (static analysis) */
+        if (total > INT64_MAX / est[k]) return -1;
+        total *= est[k];
     }
     return total;
 }
