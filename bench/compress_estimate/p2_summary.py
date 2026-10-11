@@ -38,25 +38,23 @@ FLOOR_MS, FLOOR_GAP_MS = 1.0, 0.05
 # GATE (P3-exempt) skips exactly these (query, arm, metric) clauses.
 P3_DEFERRALS = [
     # (query, arms, metric, max_ratio, reason).  One row per arm, so each arm
-    # has its own cap.  max_ratio is about 1.5x the ratio measured on the gate
-    # re-run (HEAD a09a54eb); above it the exemption lapses and the clause
+    # has its own cap.  max_ratio is about 1.5x the ratio measured on the final
+    # gate run (HEAD df637f04); above it the exemption lapses and the clause
     # fails, so a regression of a deferred query still shows.  For rss the
     # ratio is the arm's peak-RSS ratio (informational, not gated).  Rows whose
-    # clause passed on the re-run were removed.
-    ("q2",  "A",  "warm",  1.63, "run-level compute (count over RLE runs)"),
-    ("q8",  "A",  "warm",  2.14, "run-level compute (group over RLE runs)"),
-    ("q8",  "B",  "warm",  1.59, "run-level compute (group over RLE runs)"),
-    ("q18", "A",  "first", 2.97, "row-list gather (first-n keys published, P3 path 2)"),
-    ("q18", "B",  "warm",  1.63, "row-list gather (parted first-n compact build, P3)"),
-    ("q39", "A",  "first", 3.60, "selection gather (P3 path 2)"),
-    ("q39", "B",  "first", 2.25, "selection gather (P3 path 2)"),
-    ("q39", "A",  "cold",  3.23, "selection gather reads whole columns cold (P3)"),
+    # clause passed on the final run were removed.
+    ("q8",  "A",  "warm",  2.13, "run-level compute (group over RLE runs)"),
+    ("q8",  "A",  "first", 1.74, "run-level compute (group over RLE runs, first run)"),
+    ("q18", "A",  "first", 2.94, "row-list gather (first-n keys published, P3 path 2)"),
+    ("q39", "A",  "first", 3.23, "selection gather (P3 path 2)"),
+    ("q39", "B",  "first", 2.20, "selection gather (P3 path 2)"),
+    ("q39", "A",  "cold",  3.20, "selection gather reads whole columns cold (P3)"),
     ("q42", "A",  "warm",  2.50, "point gathers of the selected keys (P3)"),
-    ("q42", "B",  "warm",  1.86, "point gathers of the selected keys (P3)"),
-    ("q24", "A",  "rss",   2.4,  "top-k output gather RSS"),
-    ("q25", "A",  "rss",   2.4,  "top-k output gather RSS"),
-    ("q26", "A",  "rss",   2.4,  "top-k output gather RSS"),
-    ("q27", "A",  "rss",   2.4,  "top-k output gather RSS"),
+    ("q42", "B",  "warm",  1.87, "point gathers of the selected keys (P3)"),
+    ("q24", "A",  "rss",   2.37, "top-k output gather RSS"),
+    ("q25", "A",  "rss",   2.37, "top-k output gather RSS"),
+    ("q26", "A",  "rss",   2.37, "top-k output gather RSS"),
+    ("q27", "A",  "rss",   2.37, "top-k output gather RSS"),
 ]
 PI_SPLAYED_FIRST_TOTAL = 2.99    # RESULTS.md "PI index policy": gen-2 first-run total 7 740 vs 2 586 ms
 ARMS = {"A": ("g0", "g2", "splayed g0 vs g2"), "B": ("p0", "p2", "parted p0 vs p2"),
