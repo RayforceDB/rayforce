@@ -7056,9 +7056,9 @@ static ray_t* try_count_distinct_v2_rewrite(
     } else {
         return NULL;
     }
-    /* An alias that repeats a name, or names the count output, would leave
-     * the result with two columns of one name; the other paths handle such
-     * a by: and keep it. */
+    /* An alias that repeats a name is the by-dict's error; the other paths
+     * raise it.  (An alias equal to the count's name is kept: every route
+     * emits the key under it first and the count under it second.) */
     for (int j = 0; j < n_K; j++)
         for (int i = 0; i < j; i++)
             if (K_alias[i] == K_alias[j] || K_syms[i] == K_syms[j]) return NULL;
@@ -7122,7 +7122,6 @@ static ray_t* try_count_distinct_v2_rewrite(
     }
     if (n_cd != 1 || n_other > 0) return NULL;
     if (cd_X_sym < 0 || cd_c_sym < 0) return NULL;
-    for (int j = 0; j < n_K; j++) if (K_alias[j] == cd_c_sym) return NULL;
 
     /* desc/asc must target the count output column. */
     if (desc_col_sym >= 0 && desc_col_sym != cd_c_sym) return NULL;
@@ -7207,7 +7206,7 @@ static ray_t* try_count_distinct_v2_rewrite(
                 }
                 ray_t* out = ray_table_new(2);
                 if (out && !RAY_IS_ERR(out))
-                    out = ray_table_add_col(out, K_syms[0], kv);
+                    out = ray_table_add_col(out, K_alias[0], kv);
                 if (out && !RAY_IS_ERR(out))
                     out = ray_table_add_col(out, cd_c_sym, fu);
                 ray_release(kv);
@@ -11659,13 +11658,20 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
                 return shielded ? shielded : ray_error("oom", NULL);
             }
             if (wsc.changed) {
+                /* The re-run takes the table `from:` already evaluated to,
+                 * not the `from:` expression: evaluating that again would
+                 * run its side effects twice. */
                 ray_t* wkey = ray_sym(where_id);
+                ray_t* fkey = ray_sym(from_id);
                 ray_t* rewritten = NULL;
-                if (wkey && !RAY_IS_ERR(wkey)) {
+                if (wkey && !RAY_IS_ERR(wkey) && fkey && !RAY_IS_ERR(fkey)) {
                     rewritten = dict; ray_retain(rewritten);
                     rewritten = ray_dict_upsert(rewritten, wkey, shielded);
-                    ray_release(wkey);
+                    if (rewritten && !RAY_IS_ERR(rewritten))
+                        rewritten = ray_dict_upsert(rewritten, fkey, tbl);
                 }
+                if (wkey && !RAY_IS_ERR(wkey)) ray_release(wkey);
+                if (fkey && !RAY_IS_ERR(fkey)) ray_release(fkey);
                 ray_release(shielded);
                 ray_release(tbl);
                 DICT_VIEW_CLOSE(dv); DICT_VIEW_CLOSE(byv);

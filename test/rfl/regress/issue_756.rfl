@@ -70,6 +70,21 @@
 (key (select {from: T by: {a: k1 b: k2} n: (count (distinct v)) desc: n take: 3})) -- ['a 'b 'n]
 (key (select {from: T by: {g: k1} where: (!= k1 'a) n: (count (distinct v))})) -- ['g 'n]
 (at (select {from: T by: {g: k1} where: (!= k1 'a) n: (count (distinct v)) asc: g}) 'g) -- ['b 'c 'd 'e]
+;; the fused single-key kernel (262 144 rows and up, with workers) names the
+;; key by its alias as the other routes do
+(set Tb (table [k1 k2 x] (list (as 'SYM (% (til 300000) 7)) (% (til 300000) 3) (% (til 300000) 1000))))
+(key (select {from: Tb by: {g: k1} n: (count (distinct x)) desc: n take: 2})) -- ['g 'n]
+(key (select {from: Tb by: {g: k1} n: (count (distinct x))})) -- ['g 'n]
+(at (select {from: Tb by: {g: k1} n: (count (distinct x)) asc: g}) 'n) -- (at (select {from: Tb by: k1 n: (count (distinct x)) asc: k1}) 'n)
+;; a duplicate alias is the by-dict's error on every route; an alias equal to
+;; the count's name yields the same two columns on every route — the key
+;; under it first, the count second
+(select {from: Tb by: {g: k1 g: k2} n: (count (distinct x))}) !- domain
+(select {from: Tb by: {g: k1 g: k1} n: (count (distinct x))}) !- domain
+(key (select {from: Tb by: {n: k1} n: (count (distinct x))})) -- ['n 'n]
+(at (value (select {from: Tb by: {n: k1} n: (count (distinct x))})) 1) -- (take [1000] 7)
+(key (select {from: Tb by: {n: k1 h: k2} n: (count (distinct x))})) -- ['n 'h 'n]
+(at (value (select {from: Tb by: {n: k1 h: k2} n: (count (distinct x))})) 2) -- (take [1000] 21)
 ;; an alias naming another input column is rejected the same way on every route
 (select {from: T by: {k2: k1} n: (count (distinct v))}) !- domain
 (select {from: T by: {k2: k1 k1: k2} n: (count (distinct v))}) !- domain

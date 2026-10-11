@@ -106,3 +106,8 @@
 (count (select {from: Tal by: {a: k1} where: (> 'v 49) n: (count v)})) -- 5
 ;; a trivial self-alias keeps the column rule: {k1: k1} adds nothing
 (count (select {from: Tal by: {k1: k1} where: (!= k1 'a) n: (count v)})) -- 4
+;; the re-run takes the table from: evaluated to, not the from: expression:
+;; its side effects run once
+(set Cfrom 0)
+(count (select {from: (do (set Cfrom (+ Cfrom 1)) Tal) by: {a: k1} where: (!= k1 'a) n: (count v)})) -- 4
+Cfrom -- 1
