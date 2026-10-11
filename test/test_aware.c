@@ -37,6 +37,8 @@
 #include "store/encw.h"
 #include "store/enccol.h"
 #include "store/colrange.h"
+#include "store/enceval.h"
+#include "lang/env.h"
 #include "store/splay.h"
 #include "store/part.h"
 #include "vec/str.h"
@@ -635,10 +637,280 @@ static test_result_t test_vview_source(void) {
     PASS();
 }
 
+/* ---- Encoded comparison and membership evaluators (store/enceval.h) ---- */
+
+static int aw_ref_cmp(int64_t x, uint16_t op, int64_t c) {
+    switch (op) {
+    case OP_EQ: return x == c; case OP_NE: return x != c;
+    case OP_LT: return x < c;  case OP_LE: return x <= c;
+    case OP_GT: return x > c;  case OP_GE: return x >= c;
+    default: return 0;
+    }
+}
+/* null_result as the fused kernels give it: a null ranks below every value. */
+static uint8_t aw_null_result(uint16_t op) { return op == OP_NE || op == OP_LT || op == OP_LE; }
+
+static test_result_t aw_eval_all(const char* name, int enc, const int64_t* consts, int nc) {
+    ray_t* t = aw_load(name, 2);
+    TEST_ASSERT_NOT_NULL(t);
+    ray_enccol_t* e = ray_enccol_of(ray_table_get_col_enc(t, ray_sym_intern("x", 1)));
+    ray_enc_vview_t vb, *v = &vb;                 /* a scan task's stack view */
+    ray_t* verr = NULL;
+    int64_t vals[RAY_ENC_VEC]; uint8_t bits[RAY_ENC_VEC];
+    static const uint16_t ops[] = { OP_EQ, OP_NE, OP_LT, OP_LE, OP_GT, OP_GE };
+    ray_enc_counters_reset();
+    for (int64_t vec = 0; vec < ray_enc_nvecs(e->len); vec++) {
+        TEST_ASSERT_EQ_I(ray_enccol_vview(e, vec, v, &verr), 1);
+        TEST_ASSERT_EQ_I(v->enc, enc);
+        aw_view_values(v, vals);
+        for (int oi = 0; oi < 6; oi++) for (int ci = 0; ci < nc; ci++) {
+            uint8_t nr = aw_null_result(ops[oi]);
+            TEST_ASSERT_TRUE(ray_enc_eval_cmp(v, ops[oi], consts[ci], nr, bits));
+            for (int i = 0; i < v->n; i++) {
+                bool isnull = v->nullmap && ((v->nullmap[i >> 3] >> (i & 7)) & 1);
+                int want = isnull ? nr : aw_ref_cmp(vals[i], ops[oi], consts[ci]);
+                TEST_ASSERT_FMT(bits[i] == want, "%s vec %lld op %u c %lld row %d", name,
+                                (long long)vec, ops[oi], (long long)consts[ci], i);
+            }
+        }
+    }
+    ray_enc_counters_t k; ray_enc_counters_get(&k);
+    TEST_ASSERT_EQ_U(k.decoded_bytes, 0);         /* answered from the views, nothing decoded */
+    TEST_ASSERT_EQ_U(k.materialized, 0);
+    ray_release(t);
+    PASS();
+}
+
+static test_result_t test_eval_encodings(void) {
+    const char* tbl = "(table [x] (list (as 'I32 (map (fn [j] (if (== 0 (% j 9)) 0N (- (% j 50) 20))) (til 3000)))))";
+    static const int64_t cs[] = { -100, -21, -20, -1, 0, 7, 29, 30, 1000 };
+    test_result_t r;
+    aw_save("ef", tbl, RAY_ENC_FOR_BP); if ((r = aw_eval_all("ef", RAY_ENC_FOR_BP, cs, 9)).status != TEST_PASS) return r;
+    aw_save("er", tbl, RAY_ENC_RLE);    if ((r = aw_eval_all("er", RAY_ENC_RLE, cs, 9)).status != TEST_PASS) return r;
+    aw_save("ed", tbl, RAY_ENC_DICT);   if ((r = aw_eval_all("ed", RAY_ENC_DICT, cs, 9)).status != TEST_PASS) return r;
+    aw_save("ec", "(table [x] (list (as 'I32 (map (fn [j] (if (== 0 (% j 9)) 0N 7)) (til 3000)))))", RAY_ENC_CONST);
+    if ((r = aw_eval_all("ec", RAY_ENC_CONST, cs, 9)).status != TEST_PASS) return r;
+    /* I64 at the domain edges, residuals at 64 bits */
+    static const int64_t c64[] = { INT64_MIN + 1, -9223372036854775806LL, -1, 0, 9223372036854775806LL, INT64_MAX };
+    aw_save("e64", "(table [x] (list (as 'I64 (map (fn [j] (if (== 0 (% j 3)) -9223372036854775807 (if (== 1 (% j 3)) 9223372036854775807 0))) (til 3000)))))",
+            RAY_ENC_FOR_BP);
+    if ((r = aw_eval_all("e64", RAY_ENC_FOR_BP, c64, 6)).status != TEST_PASS) return r;
+    PASS();
+}
+
+/* Review focus 2: signedness and the domain edges. */
+static test_result_t test_eval_for_edges(void) {
+    static const int64_t c16[] = { -32768, -32767, -151, -150, -129, -128, 0, 127, 128, 149, 150, 32767 };
+    test_result_t r;
+    aw_save("e16", "(table [x] (list (as 'I16 (- (% (til 3000) 300) 150))))", RAY_ENC_FOR_BP);
+    if ((r = aw_eval_all("e16", RAY_ENC_FOR_BP, c16, 12)).status != TEST_PASS) return r;
+    static const int64_t cu8[] = { -1, 0, 1, 99, 100, 126, 127, 128, 129, 159, 160, 255, 256 };
+    aw_save("eu8", "(table [x] (list (as 'U8 (+ 100 (% (til 3000) 60)))))", RAY_ENC_FOR_BP);   /* 100..159 crosses 127/128 */
+    if ((r = aw_eval_all("eu8", RAY_ENC_FOR_BP, cu8, 13)).status != TEST_PASS) return r;
+    static const int64_t c32[] = { -2147483647LL, -1000001, -1000000, -999999, -999994, -999993, 0, 2147483647LL };
+    aw_save("e32", "(table [x] (list (as 'I32 (- (% (til 3000) 7) 1000000))))", RAY_ENC_FOR_BP);
+    if ((r = aw_eval_all("e32", RAY_ENC_FOR_BP, c32, 8)).status != TEST_PASS) return r;
+    PASS();
+}
+
+/* Review focus 1: a nullable CONST vector. */
+static test_result_t test_eval_const_nulls(void) {
+    aw_save("cn", "(table [x] (list (as 'I32 (map (fn [j] (if (== 0 (% j 5)) 0N 10)) (til 1024)))))", RAY_ENC_CONST);
+    ray_t* t = aw_load("cn", 2);
+    TEST_ASSERT_NOT_NULL(t);
+    ray_enccol_t* e = ray_enccol_of(ray_table_get_col_enc(t, ray_sym_intern("x", 1)));
+    ray_enc_vview_t vb, *v = &vb;                 /* a scan task's stack view */
+    ray_t* verr = NULL;
+    TEST_ASSERT_EQ_I(ray_enccol_vview(e, 0, v, &verr), 1);
+    TEST_ASSERT_EQ_I(v->enc, RAY_ENC_CONST);
+    TEST_ASSERT_EQ_I(ray_enc_const_decision(v, OP_LT, 20, 1), 1);    /* 10 < 20 and null < 20: ALL */
+    TEST_ASSERT_EQ_I(ray_enc_const_decision(v, OP_GT, 5, 0), -1);    /* 10 > 5, nulls fail: MIX */
+    TEST_ASSERT_EQ_I(ray_enc_const_decision(v, OP_EQ, 3, 0), 0);     /* nothing passes: NONE */
+    TEST_ASSERT_EQ_I(ray_enc_const_decision(v, OP_NE, 3, 1), 1);     /* 10 != 3 and null != 3: ALL */
+    TEST_ASSERT_EQ_I(ray_enc_const_decision(v, OP_GE, 20, 1), -1);   /* 10 fails, nulls pass: MIX */
+    TEST_ASSERT_EQ_I(ray_enc_const_decision_f64(v, OP_LT, 20.0, 1), -1);   /* not a float view */
+    ray_release(t);
+    /* every row null: every row is null_result */
+    aw_save("ca", "(table [x] (list (as 'I32 (map (fn [j] 0N) (til 1024)))))", RAY_ENC_CONST);
+    t = aw_load("ca", 2);
+    TEST_ASSERT_NOT_NULL(t);
+    e = ray_enccol_of(ray_table_get_col_enc(t, ray_sym_intern("x", 1)));
+    TEST_ASSERT_EQ_I(ray_enccol_vview(e, 0, v, &verr), 1);
+    TEST_ASSERT_EQ_I(v->enc, RAY_ENC_CONST);
+    TEST_ASSERT_EQ_I(ray_enc_const_decision(v, OP_GT, 5, 0), 0);
+    TEST_ASSERT_EQ_I(ray_enc_const_decision(v, OP_LT, 5, 1), 1);
+    ray_release(t);
+    /* no nulls: decided whole either way */
+    aw_save("cv", "(table [x] (list (as 'I32 (map (fn [j] 10) (til 1024)))))", RAY_ENC_CONST);
+    t = aw_load("cv", 2);
+    TEST_ASSERT_NOT_NULL(t);
+    e = ray_enccol_of(ray_table_get_col_enc(t, ray_sym_intern("x", 1)));
+    TEST_ASSERT_EQ_I(ray_enccol_vview(e, 0, v, &verr), 1);
+    TEST_ASSERT_EQ_I(ray_enc_const_decision(v, OP_GT, 5, 0), 1);
+    TEST_ASSERT_EQ_I(ray_enc_const_decision(v, OP_LT, 5, 1), 0);
+    ray_release(t);
+    PASS();
+}
+
+static test_result_t test_eval_in(void) {
+    aw_save("ei", "(table [x] (list (as 'I32 (map (fn [j] (if (== 0 (% j 11)) 0N (% j 40))) (til 3000)))))", RAY_ENC_DICT);
+    aw_save("eiF", "(table [x] (list (as 'I32 (map (fn [j] (if (== 0 (% j 11)) 0N (% j 40))) (til 3000)))))", RAY_ENC_FOR_BP);
+    aw_save("eiR", "(table [x] (list (as 'I32 (map (fn [j] (if (== 0 (% j 11)) 0N (% j 40))) (til 3000)))))", RAY_ENC_RLE);
+    aw_save("eiC", "(table [x] (list (as 'I32 (map (fn [j] (if (== 0 (% j 11)) 0N 17)) (til 3000)))))", RAY_ENC_CONST);
+    static const char* names[] = { "ei", "eiF", "eiR", "eiC" };
+    static const int encs[] = { RAY_ENC_DICT, RAY_ENC_FOR_BP, RAY_ENC_RLE, RAY_ENC_CONST };
+    static const int64_t set[] = { -5, 3, 17, 39, 41 };
+    for (int s = 0; s < 4; s++) {
+        ray_t* t = aw_load(names[s], 2);
+        TEST_ASSERT_NOT_NULL(t);
+        ray_enccol_t* e = ray_enccol_of(ray_table_get_col_enc(t, ray_sym_intern("x", 1)));
+        ray_enc_vview_t vb, *v = &vb;             /* a scan task's stack view */
+        ray_t* verr = NULL;
+        int64_t vals[RAY_ENC_VEC]; uint8_t bits[RAY_ENC_VEC];
+        for (int64_t vec = 0; vec < 3; vec++) {
+            TEST_ASSERT_EQ_I(ray_enccol_vview(e, vec, v, &verr), 1);
+            TEST_ASSERT_EQ_I(v->enc, encs[s]);
+            aw_view_values(v, vals);
+            for (uint8_t nr = 0; nr < 2; nr++) {
+                TEST_ASSERT_TRUE(ray_enc_eval_in(v, set, 5, nr, bits));
+                for (int i = 0; i < v->n; i++) {
+                    bool isnull = v->nullmap && ((v->nullmap[i >> 3] >> (i & 7)) & 1);
+                    int want = isnull ? nr : (vals[i] == 3 || vals[i] == 17 || vals[i] == 39);
+                    TEST_ASSERT_FMT(bits[i] == want, "%s vec %lld row %d", names[s], (long long)vec, i);
+                }
+                TEST_ASSERT_TRUE(ray_enc_eval_in(v, set, 0, nr, bits));   /* the empty set */
+                for (int i = 0; i < v->n; i++) {
+                    bool isnull = v->nullmap && ((v->nullmap[i >> 3] >> (i & 7)) & 1);
+                    TEST_ASSERT_EQ_I(bits[i], isnull ? nr : 0);
+                }
+            }
+        }
+        ray_release(t);
+    }
+    PASS();
+}
+
+/* SYM: ids compare as unsigned, == / != / in only; an ordered operator
+ * declines (never order ids, #738). */
+static test_result_t test_eval_sym(void) {
+    static const int encs[] = { RAY_ENC_FOR_BP, RAY_ENC_RLE, RAY_ENC_CONST };
+    static const char* tbls[] = {
+        "(table [x] (list (as 'SYM (map (fn [j] (if (== 0 (% j 7)) (as 'SYM \"\") (at ['a 'b 'c 'd 'e] (% j 5)))) (til 3000)))))",
+        "(table [x] (list (as 'SYM (map (fn [j] (if (== 0 (% (div j 100) 7)) (as 'SYM \"\") (at ['a 'b 'c 'd 'e] (% (div j 100) 5)))) (til 3000)))))",
+        "(table [x] (list (take ['b] 3000)))",
+    };
+    static const uint16_t ord[] = { OP_LT, OP_LE, OP_GT, OP_GE };
+    for (int s = 0; s < 3; s++) {
+        char nm[8]; snprintf(nm, sizeof nm, "es%d", s);
+        aw_save(nm, tbls[s], encs[s]);
+        ray_t* t = aw_load(nm, 2);
+        TEST_ASSERT_NOT_NULL(t);
+        ray_enccol_t* e = ray_enccol_of(ray_table_get_col_enc(t, ray_sym_intern("x", 1)));
+        TEST_ASSERT_EQ_I(e->type, RAY_SYM);
+        ray_enc_vview_t vb, *v = &vb;
+        ray_t* verr = NULL;
+        int64_t vals[RAY_ENC_VEC]; uint8_t bits[RAY_ENC_VEC];
+        for (int64_t vec = 0; vec < ray_enc_nvecs(e->len); vec++) {
+            TEST_ASSERT_EQ_I(ray_enccol_vview(e, vec, v, &verr), 1);
+            TEST_ASSERT_EQ_I(v->enc, encs[s]);
+            aw_view_values(v, vals);
+            for (int o = 0; o < 4; o++) TEST_ASSERT_FALSE(ray_enc_eval_cmp(v, ord[o], vals[0], 0, bits));
+            /* constants: every id of the vector, "" (id 0) and an id past the bound */
+            int64_t cs[RAY_ENC_VEC + 2]; int nc = 0;
+            cs[nc++] = 0; cs[nc++] = (int64_t)e->sym_bound + 5;
+            for (int i = 0; i < v->n && nc < 8; i++) { bool dup = false; for (int q = 0; q < nc; q++) dup |= cs[q] == vals[i]; if (!dup) cs[nc++] = vals[i]; }
+            for (int ci = 0; ci < nc; ci++) for (int o = 0; o < 2; o++) {
+                const uint16_t op = o ? OP_NE : OP_EQ;
+                TEST_ASSERT_TRUE(ray_enc_eval_cmp(v, op, cs[ci], 0, bits));
+                for (int i = 0; i < v->n; i++) TEST_ASSERT_EQ_I(bits[i], aw_ref_cmp(vals[i], op, cs[ci]));
+            }
+            int64_t set[8]; int ns = 0;                 /* sorted, distinct */
+            for (int ci = 0; ci < nc; ci += 2) set[ns++] = cs[ci];
+            for (int a = 1; a < ns; a++) for (int b = a; b > 0 && set[b - 1] > set[b]; b--) { int64_t x = set[b]; set[b] = set[b - 1]; set[b - 1] = x; }
+            TEST_ASSERT_TRUE(ray_enc_eval_in(v, set, ns, 0, bits));
+            for (int i = 0; i < v->n; i++) {
+                int want = 0; for (int q = 0; q < ns; q++) want |= vals[i] == set[q];
+                TEST_ASSERT_EQ_I(bits[i], want);
+            }
+        }
+        ray_release(t);
+    }
+    PASS();
+}
+
+/* ray_enc_const_decision_f64 on CONST -0.0, +0.0 and nullable 1.5 vectors
+ * (F64 and F32) against both zero literals under all six operators: the
+ * answer equals the generation-0 comparison's over the vector's rows
+ * (1 all pass, 0 none, -1 mixed). */
+static ray_t* aw_fvec(int8_t type, double x, int null_every) {
+    ray_t* v = ray_vec_new(type, 1024); v->len = 1024;
+    for (int i = 0; i < 1024; i++) {
+        if (type == RAY_F64) ((double*)ray_data(v))[i] = x; else ((float*)ray_data(v))[i] = (float)x;
+    }
+    if (null_every) for (int i = 0; i < 1024; i += null_every) ray_vec_set_null(v, i, true);
+    return v;
+}
+static test_result_t test_eval_float_const(void) {
+    static const uint16_t ops[] = { OP_EQ, OP_NE, OP_LT, OP_LE, OP_GT, OP_GE };
+    static const char* opname[] = { "==", "!=", "<", "<=", ">", ">=" };
+    static const double xs[] = { -0.0, 0.0, 1.5 };
+    static const int nulls[] = { 0, 0, 5 };
+    static const int8_t types[] = { RAY_F64, RAY_F32 };
+    static const double cs[] = { -0.0, 0.0 };
+    static const char* clit[] = { "-0.0", "0.0" };
+    for (int ti = 0; ti < 2; ti++) for (int xi = 0; xi < 3; xi++) {
+        ray_t* col = aw_fvec(types[ti], xs[xi], nulls[xi]);
+        ray_t* tb = ray_table_new(1);
+        tb = ray_table_add_col(tb, ray_sym_intern("x", 1), col); ray_release(col);
+        TEST_ASSERT_TRUE(tb && !RAY_IS_ERR(tb));
+        TEST_ASSERT_EQ_I(ray_env_set(ray_sym_intern("WF", 2), tb), RAY_OK);
+        ray_release(tb);
+        aw_save("fc", "WF", RAY_ENC_CONST);
+        ray_t* t = aw_load("fc", 2);
+        TEST_ASSERT_NOT_NULL(t);
+        ray_enccol_t* e = ray_enccol_of(ray_table_get_col_enc(t, ray_sym_intern("x", 1)));
+        ray_enc_vview_t vb, *v = &vb;
+        ray_t* verr = NULL;
+        TEST_ASSERT_EQ_I(ray_enccol_vview(e, 0, v, &verr), 1);
+        TEST_ASSERT_EQ_I(v->enc, RAY_ENC_CONST);
+        if (xi == 0) TEST_ASSERT_EQ_U(v->cbits, types[ti] == RAY_F64 ? 0x8000000000000000ull : 0x80000000ull);
+        uint8_t bits[RAY_ENC_VEC];
+        TEST_ASSERT_FALSE(ray_enc_eval_cmp(v, OP_EQ, 0, 0, bits));       /* floats: no integer evaluator */
+        TEST_ASSERT_EQ_I(ray_enc_const_decision(v, OP_EQ, 0, 0), -1);
+        for (int oi = 0; oi < 6; oi++) for (int ci = 0; ci < 2; ci++) {
+            char q[256];
+            snprintf(q, sizeof q, "(%s (at (.db.splayed.get \"" AW_TMP "/fc0/\") 'x) %s)", opname[oi], clit[ci]);
+            ray_t* r = aw_eval(q);
+            TEST_ASSERT_FMT(r && !RAY_IS_ERR(r) && r->type == RAY_BOOL && r->len == 1024, "%s", q);
+            const uint8_t* rb = (const uint8_t*)ray_data(r);
+            int all = 1, none = 1; uint8_t nr = aw_null_result(ops[oi]);
+            for (int i = 0; i < 1024; i++) {
+                all &= rb[i] != 0; none &= rb[i] == 0;
+                if (nulls[xi] && i % nulls[xi] == 0) TEST_ASSERT_EQ_I(rb[i], nr);   /* a null ranks below */
+            }
+            ray_release(r);
+            int want = all ? 1 : none ? 0 : -1;
+            TEST_ASSERT_FMT(ray_enc_const_decision_f64(v, ops[oi], cs[ci], nr) == want,
+                            "type %d x %g %s %s", types[ti], xs[xi], opname[oi], clit[ci]);
+        }
+        ray_release(t);
+        char rm[256];
+        snprintf(rm, sizeof rm, "%s/fc0", aw_root()); (void)ray_test_rm_rf(rm);
+        snprintf(rm, sizeof rm, "%s/fc2", aw_root()); (void)ray_test_rm_rf(rm);
+    }
+    PASS();
+}
+
 const test_entry_t aware_entries[] = {
     { "aware/vview_encodings", test_vview_encodings, aw_setup, aw_teardown },
     { "aware/vview_near_top",  test_vview_near_top,  aw_setup, aw_teardown },
     { "aware/vview_declines",  test_vview_declines,  aw_setup, aw_teardown },
     { "aware/vview_source",    test_vview_source,    aw_setup, aw_teardown },
+    { "aware/eval_encodings",   test_eval_encodings,   aw_setup, aw_teardown },
+    { "aware/eval_for_edges",   test_eval_for_edges,   aw_setup, aw_teardown },
+    { "aware/eval_const_nulls", test_eval_const_nulls, aw_setup, aw_teardown },
+    { "aware/eval_in",          test_eval_in,          aw_setup, aw_teardown },
+    { "aware/eval_sym",         test_eval_sym,         aw_setup, aw_teardown },
+    { "aware/eval_float_const", test_eval_float_const, aw_setup, aw_teardown },
     { NULL, NULL, NULL, NULL },
 };
