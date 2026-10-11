@@ -300,10 +300,15 @@
 ;; own length check, which looks at vectors only.
 (select {by: ((fn [a] (concat a a)) l) from: Tckk desc: x}) !- length
 (select {by: (concat l l) from: Tckk desc: x}) !- length
-;; (concat x 99), bare or in a lambda, passes the planned grouping as a
-;; row-wise string concat and reaches this branch as 5 values
+;; (concat x 99), bare or in a lambda, is a collection of 5 values: the
+;; whole-column key evaluation refuses it
 (select {by: (concat x 99) from: Tckk}) !- length
 (select {by: ((fn [a] (concat a 99)) x) from: Tckk}) !- length
+;; a concat of collections is no text: the planner leaves it to the whole
+;; column, where an aligned one groups as the column it equals
+(set Eck (take [1] 0))
+(value (select {c: (count x) by: (concat x Eck) from: Tckk})) -- (value (select {c: (count x) by: x from: Tckk}))
+(at (select {by: (concat x Eck) from: Tckk desc: x}) (quote x)) -- (at (select {by: x from: Tckk desc: x}) (quote x))
 ;; one value is one group, holding the first row
 (select {by: ((fn [a] [7]) x) from: Tcks}) -- (table [x r] (list [7] (list "c-long-string-over-12")))
 ;; a name that is no column (a global vector) is grouped by its values, as
