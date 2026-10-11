@@ -12,7 +12,7 @@
 (set O (left-join [k1 k2] (select {from: T by: [k1 k2] n: (count (distinct id)) asc: [k1 k2]}) (select {from: T by: [k1 k2] bad: (sum (if (== st 'bad) 1 0))})))
 (set A (select {from: T by: [k1 k2] n: (count (distinct id)) bad: (sum (if (== st 'bad) 1 0)) asc: [k1 k2]}))
 (count A) -- 45
-(key A) -- ['k1 'k2 'bad 'n]
+(key A) -- ['k1 'k2 'n 'bad]
 (at A 'k1) -- (at O 'k1)
 (at A 'k2) -- (at O 'k2)
 (at A 'n) -- (at O 'n)
