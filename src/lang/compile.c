@@ -58,6 +58,10 @@ typedef struct {
     int32_t  trap_depth;  /* open OP_TRAP frames in current lambda */
     int32_t  depth;       /* expression nesting; past the guard the lambda is
                            * left to the tree walker rather than the C stack */
+    ray_t   *deps;        /* when set (an I64 vector): every call head looked
+                           * up at compile time and the builtin it named (0
+                           * for anything else), the bindings the bytecode
+                           * depends on (ray_compile_definition) */
 } compiler_t;
 
 static void compile_expr(compiler_t *c, ray_t *ast);
@@ -88,6 +92,7 @@ static void compiler_destroy(compiler_t *c) {
         if (c->consts[i]) ray_release(c->consts[i]);
     ray_release(c->consts_obj);
     ray_release(c->code_obj);
+    if (c->deps) { ray_release(c->deps); c->deps = NULL; }
 }
 
 /* ── Debug info helpers ── */
@@ -596,8 +601,20 @@ static void compile_list(compiler_t *c, ray_t *ast) {
 
     /* Look up head at compile time to determine call type */
     ray_t *fn = NULL;
-    if (head->type == -RAY_SYM && !(head->attrs & ATTR_QUOTED) && !head_local)
+    if (head->type == -RAY_SYM && !(head->attrs & ATTR_QUOTED) && !head_local) {
         fn = c->dynamic_globals ? ray_env_get_global(head->i64) : ray_env_get_compiled(head->i64);
+        if (c->deps && !c->dynamic_globals) {
+            /* Only a builtin shapes the code (baked, a special form, the
+             * call opcode); any other value is called through OP_CALLF. */
+            bool builtin = fn && (fn->type == RAY_UNARY || fn->type == RAY_BINARY || fn->type == RAY_VARY);
+            int64_t pair[2] = { head->i64, builtin ? (int64_t)(uintptr_t)fn : 0 };
+            for (int k = 0; k < 2 && !c->error; k++) {
+                c->deps = ray_vec_append(c->deps, &pair[k]);
+                if (!c->deps || RAY_IS_ERR(c->deps)) { c->deps = NULL; c->error = true; }
+            }
+            if (c->error) return;
+        }
+    }
 
     /* Unrecognized special form: dynamic eval on the entire form.  The
      * special form re-evaluates its argument ASTs via the tree walker,
@@ -1132,11 +1149,36 @@ void ray_compile(ray_t *lambda) {
  * ahead of the body by one OP_BINDCAPS.  A parameter shadows a capture of
  * its name.  False when the body cannot be compiled (the lambda stays on
  * the tree walker). */
+static bool compile_lambda_deps(ray_t *lambda, ray_t *capnames, bool dynamic_globals, ray_t **deps);
 static bool compile_lambda(ray_t *lambda, ray_t *capnames, bool dynamic_globals) {
+    return compile_lambda_deps(lambda, capnames, dynamic_globals, NULL);
+}
+
+/* Compile a lambda with nothing captured, as ray_compile does, and hand
+ * back in *deps (an I64 vector the caller releases) the call heads its
+ * code was shaped by: pairs of a symbol and the builtin it named then, or
+ * 0.  Code compiled for the same text while every pair still holds is
+ * the code a fresh compile would produce.  False when it does not
+ * compile (the lambda is then marked, as ray_compile marks it). */
+bool ray_compile_definition(ray_t *lambda, ray_t **deps) {
+    *deps = NULL;
+    if (LAMBDA_IS_COMPILED(lambda) || LAMBDA_CLOSURE(lambda)) return false;
+    if (!compile_lambda_deps(lambda, NULL, false, deps)) {
+        LAMBDA_NLOCALS(lambda) = -1;
+        return false;
+    }
+    return true;
+}
+
+static bool compile_lambda_deps(ray_t *lambda, ray_t *capnames, bool dynamic_globals, ray_t **deps) {
     compiler_t c;
     if (!compiler_init(&c)) return false;
     c.lambda = lambda;
     c.dynamic_globals = dynamic_globals;
+    if (deps) {
+        c.deps = ray_vec_new(RAY_I64, 16);
+        if (!c.deps || RAY_IS_ERR(c.deps)) { c.deps = NULL; compiler_destroy(&c); return false; }
+    }
 
     /* Register params as locals */
     ray_t *params_list = LAMBDA_PARAMS(lambda);
@@ -1226,6 +1268,7 @@ static bool compile_lambda(ray_t *lambda, ray_t *capnames, bool dynamic_globals)
         /* dbg_obj is now owned by the lambda, don't release it */
     }
 
+    if (deps) { *deps = c.deps; c.deps = NULL; }
     compiler_destroy(&c);
     return true;
 }

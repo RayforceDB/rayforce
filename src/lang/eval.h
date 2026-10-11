@@ -210,6 +210,9 @@ ray_t* ray_eval_str(const char* source);
 
 /* Compile a lambda's body to bytecode. Called lazily on first invocation. */
 void ray_compile(ray_t* lambda);
+/* ray_compile for a lambda with nothing captured, also handing back the
+ * bindings its code depends on (see compile.c). */
+bool ray_compile_definition(ray_t* lambda, ray_t** deps);
 /* The capture names a closure's body can reach (its dict keys the body
  * mentions; all of them under eval/resolve), as a SYM vector or NULL. */
 ray_t* ray_closure_capture_names(ray_t* lambda);

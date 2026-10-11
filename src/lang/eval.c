@@ -2172,6 +2172,10 @@ typedef struct {
     ray_t*  names;     /* capture names (SYM vector) or NULL */
     ray_t*  tmpl;      /* the compiled template, or NULL when `failed` */
     int64_t bytes;     /* what the literal's text holds (ray_closure_mentioned_syms) */
+    ray_t*  deps;      /* a definition's entry (nothing captured, builtins
+                        * baked on its first call): the call heads its code
+                        * depends on (ray_compile_definition); NULL for a
+                        * closure's */
 } closure_tmpl_t;
 /* The entries keep their literals' text alive after every closure made
  * from them is gone, so the table is bounded by bytes: a literal holding
@@ -2190,6 +2194,7 @@ static void closure_tmpl_drop(closure_tmpl_t* e) {
     if (e->mentioned) ray_release(e->mentioned);
     if (e->names) ray_release(e->names);
     if (e->tmpl) ray_release(e->tmpl);
+    if (e->deps) ray_release(e->deps);
     memset(e, 0, sizeof *e);
 }
 
@@ -2263,7 +2268,7 @@ static void closure_share_template(ray_t* lambda) {
     if (g_call_self_sym < 0) g_call_self_sym = ray_sym_intern("self", 4);
     for (int i = 0; i < CLOSURE_TMPL_SLOTS; i++) {
         closure_tmpl_t* e = &g_closure_tmpl[i];
-        if ((!e->tmpl && !e->failed) || e->params != params || e->nbody != body->len) continue;
+        if ((!e->tmpl && !e->failed) || e->deps || e->params != params || e->nbody != body->len) continue;
         bool same = true;
         for (int64_t k = 0; k < body->len && same; k++) same = e->body[k] == bn[k];
         if (same && closure_entry_names_match(e, LAMBDA_CLOSURE(lambda))) {
@@ -2321,6 +2326,72 @@ static void closure_share_template(ray_t* lambda) {
     e->names = names;   /* owned, may be NULL */
     e->tmpl = tmpl;     /* owned, NULL when failed */
     if (compiled) closure_share_from(lambda, tmpl);
+}
+
+/* A lambda with nothing captured compiles on its first call and bakes the
+ * builtins it names then.  Another lambda of the same literal reuses that
+ * bytecode when, at its own first call, every call head the code was
+ * shaped by still names the builtin it named (or still names none):
+ * compiling afresh would produce the same code.  The table bounds what
+ * it keeps as for closures. */
+static bool definition_deps_hold(ray_t* deps) {
+    const int64_t* d = (const int64_t*)ray_data(deps);
+    for (int64_t i = 0; i + 1 < deps->len; i += 2) {
+        ray_t* fn = ray_env_get_compiled(d[i]);
+        bool builtin = fn && (fn->type == RAY_UNARY || fn->type == RAY_BINARY || fn->type == RAY_VARY);
+        if ((builtin ? (int64_t)(uintptr_t)fn : 0) != d[i + 1]) return false;
+    }
+    return true;
+}
+
+static void definition_compile(ray_t* lambda) {
+    ray_t* body = LAMBDA_BODY(lambda);
+    ray_t* params = LAMBDA_PARAMS(lambda);
+    if (!body || body->type != RAY_LIST || body->len == 0 || !params ||
+        body->len > CLOSURE_TMPL_MAX_BODY) { ray_compile(lambda); return; }
+    if (g_closure_tmpl_epoch != ray_sym_epoch()) {
+        if (g_closure_tmpl_epoch) closure_tmpl_forget();
+        g_closure_tmpl_epoch = ray_sym_epoch();
+    }
+    ray_t** bn = (ray_t**)ray_data(body);
+    for (int i = 0; i < CLOSURE_TMPL_SLOTS; i++) {
+        closure_tmpl_t* e = &g_closure_tmpl[i];
+        if (!e->deps || e->params != params || e->nbody != body->len) continue;
+        bool same = true;
+        for (int64_t k = 0; k < body->len && same; k++) same = e->body[k] == bn[k];
+        if (!same) continue;
+        if (definition_deps_hold(e->deps)) { closure_share_from(lambda, e->tmpl); return; }
+        closure_tmpl_drop(e);   /* a head was rebound: this literal compiles afresh */
+        break;
+    }
+    bool dynamic = false;
+    int64_t weight = 0;
+    ray_t* mentioned = ray_closure_mentioned_syms(body, &dynamic, &weight);
+    if (!mentioned || weight > CLOSURE_TMPL_MAX_BYTES) {
+        if (mentioned) ray_release(mentioned);
+        ray_compile(lambda);
+        return;
+    }
+    ray_t* deps = NULL;
+    if (!ray_compile_definition(lambda, &deps)) { ray_release(mentioned); return; }
+    closure_tmpl_t* e = &g_closure_tmpl[g_closure_tmpl_next++ % CLOSURE_TMPL_SLOTS];
+    closure_tmpl_drop(e);
+    for (uint32_t k = 0; k < CLOSURE_TMPL_SLOTS && g_closure_tmpl_bytes + weight > CLOSURE_TMPL_BUDGET; k++)
+        closure_tmpl_drop(&g_closure_tmpl[(g_closure_tmpl_next + k) % CLOSURE_TMPL_SLOTS]);
+    ray_retain(params); e->params = params;
+    for (int64_t k = 0; k < body->len; k++) { ray_retain(bn[k]); e->body[k] = bn[k]; }
+    e->nbody = body->len;
+    e->mentioned = mentioned;   /* owned */
+    e->bytes = weight;
+    g_closure_tmpl_bytes += weight;
+    ray_retain(lambda); e->tmpl = lambda;   /* its bytecode is the template's */
+    e->deps = deps;             /* owned */
+}
+
+/* Compile a lambda on its first call (see lambda_wants_compile). */
+static void lambda_compile(ray_t* lambda) {
+    if (LAMBDA_CLOSURE(lambda)) ray_compile(lambda);
+    else definition_compile(lambda);
 }
 
 ray_t* ray_fn(ray_t** args, int64_t n) {
@@ -2521,7 +2592,7 @@ static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
     /* Lazy compilation (see lambda_wants_compile); a closure's captures
      * become locals of its body (OP_BINDCAPS). */
     if (lambda_wants_compile(lambda))
-        ray_compile(lambda);
+        lambda_compile(lambda);
     if (LAMBDA_IS_COMPILED(lambda)) {
         if (!query) return vm_exec(lambda, call_args, argc);
         /* Row provenance rides on the VM stack.  The call frame hides the
@@ -2614,7 +2685,7 @@ static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
 }
 
 ray_t* call_lambda(ray_t* lambda, ray_t** call_args, int64_t argc) {
-    if (lambda_wants_compile(lambda)) ray_compile(lambda);
+    if (lambda_wants_compile(lambda)) lambda_compile(lambda);
     if (LAMBDA_IS_COMPILED(lambda)) return vm_exec(lambda, call_args, argc);
     return call_lambda_impl(lambda, call_args, argc, false, 0, false, NULL);
 }
@@ -3129,7 +3200,7 @@ op_callf: {
      * made inside a query stays on the tree walker (see call_lambda_impl). */
     if (fn_obj->type == RAY_LAMBDA) {
         if (lambda_wants_compile(fn_obj))
-            ray_compile(fn_obj);
+            lambda_compile(fn_obj);
 
         if (LAMBDA_IS_COMPILED(fn_obj)) {
             /* All checks before any VM state mutation.
