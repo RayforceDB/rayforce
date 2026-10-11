@@ -140,6 +140,43 @@ int main(void) {
 }
 ```
 
+## Embedding
+
+`make lib` builds the engine as a static library, `librayforce.a`, with no
+dependencies beyond libc, libm and pthreads.
+
+To minimise the linked size, compile the library objects with
+`-ffunction-sections -fdata-sections` (added to `RELEASE_CFLAGS`, the
+release flag list in the Makefile) and pass `-Wl,--gc-sections` on your
+final link, so the linker discards everything your code never reaches.
+A DAG-route client such as [`examples/analytics.c`](examples/analytics.c)
+never touches the Rayfall parser, compiler, REPL or IPC server, and
+section GC drops that whole surface:
+
+```sh
+make lib RELEASE_CFLAGS="-fPIC -Wall -Wextra -Werror -Wstrict-prototypes \
+  -Wno-unused-parameter -std=c17 -O3 -march=native -funroll-loops \
+  -fomit-frame-pointer -fno-math-errno -falign-functions=64 \
+  -fassociative-math -ffp-contract=fast -fno-signed-zeros \
+  -fno-trapping-math -ffunction-sections -fdata-sections"
+cc -O2 -Iinclude -Isrc examples/analytics.c librayforce.a \
+   -lm -lpthread -Wl,--gc-sections -o analytics
+```
+
+The Makefile's `RELEASE_CFLAGS` is the source of truth; the two section
+flags are the only addition.
+
+A checkout at the time of writing links `analytics.c` to a 3.46 MB
+stripped binary, from a 9.36 MB archive; sizes move with the tree, so
+this is just one measurement, not a bound.
+
+Memory follows a consumed-argument convention, documented per function in
+the headers: arguments marked `consumes` (`ray_dict_new` "consumes both")
+are released by the call on every path, the error path included; returns
+marked `borrowed` stay owned by the container. Values are COW, managed
+with `ray_retain`/`ray_release`; error objects are owned and freed with
+`ray_error_free`.
+
 ## How It Works
 
 **Build** — Construct a lazy DAG: scans, filters, joins, aggregations, window
