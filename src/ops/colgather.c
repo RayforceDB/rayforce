@@ -24,11 +24,10 @@
 #include "ops/colgather.h"
 #include "ops/internal.h"     /* parted_sym_width */
 #include "ops/rowsel.h"
-#include "mem/heap.h"         /* ray_scratch_realloc, ray_block_data_bytes */
 #include "table/domain.h"    /* ray_sym_domain_retain */
 #include "table/sym.h"
 #include "vec/str.h"
-#include "vec/vec.h"
+#include "vec/vec.h"           /* ray_str_pool_reserve, ray_raw_is_null */
 #include <string.h>
 
 /* The result under construction: the output vector (len set, cells filled
@@ -62,29 +61,18 @@ static void acc_abort(gather_acc_t* a) {
     a->out = a->pool = NULL;
 }
 
-/* Copy len bytes into the result's pool: their offset in *off.  `range`
- * when the pool would cross UINT32_MAX, as for any STR pool. */
+/* Copy len bytes into the result's pool: their offset in *off.  The pool
+ * is created and grown as ray_str_vec_append's (ray_str_pool_reserve);
+ * `range` when it would cross UINT32_MAX, as for any STR pool. */
 static ray_t* acc_pool_put(gather_acc_t* a, const char* p, uint32_t len, uint32_t* off) {
-    if (!a->pool) {
-        a->pool = ray_alloc(len < 256 ? 256 : (size_t)len * 2);
-        if (!a->pool || RAY_IS_ERR(a->pool)) { a->pool = NULL; return ray_error("oom", NULL); }
-        a->pool->type = RAY_U8;
-        a->pool->len = 0;
-    }
-    uint64_t used = (uint64_t)a->pool->len;
-    if ((uint64_t)len > UINT32_MAX - used)
+    int64_t at;
+    ray_err_t pe = ray_str_pool_reserve(&a->pool, len, &at);
+    if (pe == RAY_ERR_RANGE)
         return ray_error("range", "gather: STR pool exceeds %lld bytes", (long long)UINT32_MAX);
-    size_t cap = ray_block_data_bytes(a->pool), need = (size_t)used + len;
-    if (need > cap) {
-        size_t ncap = cap ? cap : 256;
-        while (ncap < need) ncap *= 2;
-        ray_t* np = ray_scratch_realloc(a->pool, ncap);
-        if (!np || RAY_IS_ERR(np)) return ray_error("oom", NULL);
-        a->pool = np;
-    }
-    memcpy((char*)ray_data(a->pool) + used, p, len);
-    a->pool->len = (int64_t)need;
-    *off = (uint32_t)used;
+    if (pe != RAY_OK) return ray_error("oom", NULL);
+    memcpy((char*)ray_data(a->pool) + at, p, len);
+    a->pool->len = at + (int64_t)len;
+    *off = (uint32_t)at;
     return NULL;
 }
 
@@ -116,6 +104,10 @@ static ray_t* acc_put(gather_acc_t* a, const ray_col_range_t* v, int64_t i, int6
                 if (err) return err;
                 memcpy(e.prefix, p, 4);
                 e.pool_off = off;
+                /* a nonzero cached hash is the content hash (every builder
+                 * and loader keeps it so, col.c / enccol.c): reused, else
+                 * computed as ray_str_vec_append computes it */
+                e.hash32 = s->hash32;
                 e.hash32 = ray_str_t_hash32(&e, (const char*)ray_data(a->pool));
             }
             d[pos + k] = e;
@@ -259,6 +251,17 @@ ray_t* ray_col_gather_sel(ray_col_src_t* src, ray_t* sel, ray_t** out) {
         if (f == RAY_SEL_NONE) continue;                 /* the vector is never read */
         int64_t lo = s * RAY_MORSEL_ELEMS;
         int64_t hi = lo + RAY_MORSEL_ELEMS < src->len ? lo + RAY_MORSEL_ELEMS : src->len;
+        /* the rows this segment adds, checked before any is written */
+        int64_t add = f == RAY_SEL_ALL ? hi - lo : (int64_t)offs[s + 1] - (int64_t)offs[s];
+        if (add < 0 || add > n - pos) {
+            err = ray_error("corrupt", "gather: selection holds more rows than its %lld", (long long)n);
+            break;
+        }
+        if (f != RAY_SEL_ALL)
+            for (uint32_t k = offs[s]; k < offs[s + 1] && !err; k++)
+                if (idx[k] >= hi - lo)
+                    err = ray_error("corrupt", "gather: selection row %lld past its segment", (long long)(lo + idx[k]));
+        if (err) break;
         if (f == RAY_SEL_ALL) {
             /* a segment may span two views (a parted segment boundary) */
             for (int64_t r = lo; r < hi && !err; ) {

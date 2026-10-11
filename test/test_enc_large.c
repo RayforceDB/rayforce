@@ -131,7 +131,7 @@ static test_result_t test_gather_pool_range(void) {
     ray_t* t = ray_read_parted(ray_test_tmp(LG_TMP "/gp"), "t");
     TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
     ray_col_src_t s; TEST_ASSERT_NULL(ray_table_col_src(t, ray_sym_intern("s", 1), &s));
-    int64_t* ids = malloc(4200 * sizeof *ids);
+    static int64_t ids[4200];                             /* static: no leak on an assertion */
     for (int i = 0; i < 4200; i++) ids[i] = i;
     /* the source publishes its segment offsets on its first read (owned by
      * the source, freed at its release): one row first, so the baseline
@@ -147,7 +147,7 @@ static test_result_t test_gather_pool_range(void) {
     ray_error_free(e);
     ray_mem_stats(&m1);
     TEST_ASSERT_EQ_U(m1.bytes_allocated, m0.bytes_allocated);
-    free(ids); ray_col_src_release(&s); ray_release(t);
+    ray_col_src_release(&s); ray_release(t);
     PASS();
 }
 

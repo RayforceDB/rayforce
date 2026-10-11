@@ -1670,26 +1670,70 @@ static test_result_t aw_vec_same(ray_t* a, ray_t* b, const char* what) {
     }
     PASS();
 }
+/* A gather result against its generation-0 reference (`at`): type, length,
+ * HAS_NULLS, SYM width, values (STR by bytes; SYM by raw id and domain when
+ * both resolve over one symfile, else by symbol). */
+static test_result_t aw_gather_ref(ray_t* got, ray_t* ref, bool one_symfile, const char* what) {
+    /* a parted SYM `at` widens to W64; the contract's width is the widest
+     * segment's (parted_sym_width), pinned by gather_rows_contract */
+    uint8_t wm = (ref->type == RAY_SYM && (ref->attrs & RAY_SYM_W_MASK) == RAY_SYM_W64) ? 0 : RAY_SYM_W_MASK;
+    TEST_ASSERT_FMT(got->len == ref->len && got->type == ref->type &&
+                    (got->attrs & (RAY_ATTR_HAS_NULLS | wm)) == (ref->attrs & (RAY_ATTR_HAS_NULLS | wm)),
+                    "%s: type %d/%d len %lld/%lld attrs %x/%x", what, got->type, ref->type,
+                    (long long)got->len, (long long)ref->len, got->attrs, ref->attrs);
+    for (int64_t i = 0; i < ref->len; i++) {
+        if (ref->type == RAY_STR) {
+            size_t la = 0, lb = 0;
+            const char* pa = ray_str_vec_get(got, i, &la);
+            const char* pb = ray_str_vec_get(ref, i, &lb);
+            TEST_ASSERT_FMT(la == lb && (la == 0 || memcmp(pa, pb, la) == 0), "%s[%lld]", what, (long long)i);
+        } else if (ref->type == RAY_SYM && !one_symfile) {
+            ray_t* sa = ray_sym_domain_str(ray_sym_vec_domain(got), ray_read_sym(ray_data(got), i, RAY_SYM, got->attrs));
+            ray_t* sb = ray_sym_domain_str(ray_sym_vec_domain(ref), ray_read_sym(ray_data(ref), i, RAY_SYM, ref->attrs));
+            TEST_ASSERT_FMT(sa && sb && ray_str_len(sa) == ray_str_len(sb) &&
+                            memcmp(ray_str_ptr(sa), ray_str_ptr(sb), ray_str_len(sa)) == 0, "%s[%lld]: symbol", what, (long long)i);
+        } else {
+            size_t esz = ray_sym_elem_size(ref->type, ref->attrs);
+            TEST_ASSERT_FMT(memcmp((char*)ray_data(got) + i * esz, (char*)ray_data(ref) + i * esz, esz) == 0,
+                            "%s[%lld]", what, (long long)i);
+        }
+    }
+    if (ref->type == RAY_SYM && one_symfile) TEST_ASSERT_TRUE(ray_sym_vec_domain(got) == ray_sym_vec_domain(ref));
+    PASS();
+}
+#define AW_GATHER_REF(g, r, one, w) do { test_result_t r_ = aw_gather_ref((g), (r), (one), (w)); if (r_.status != TEST_PASS) return r_; } while (0)
+
 static test_result_t test_gather_gen0_parity(void) {
-    aw_save("gz", "(table [i f s y d] (list "
+    /* (as 'F32 ...) evaluates only on a select's compiled path (I16 / F32
+     * casts); TIMESTAMP and GUID columns are built outside it */
+    aw_save("gz", "(select {i: i f: f s: s y: y d: d h: (as 'I16 i) g: (as 'F32 f) ts: ts from: "
+            "(table [i f s y d ts] (list "
             "(map (fn [j] (if (== 0 (% j 7)) 0Nl (* j 3))) (til 5000)) "
             "(map (fn [j] (if (== 0 (% j 11)) 0Nf (* j 0.5))) (til 5000)) "
             "(map (fn [j] (if (== 0 (% j 5)) \"\" (if (== 0 (% j 2)) \"short\" (format \"a pooled string of row %\" j)))) (til 5000)) "
             "(as 'SYMBOL (map (fn [j] (if (== 0 (% j 13)) \"\" (format \"k%\" (% j 300)))) (til 5000))) "
-            "(as 'DATE (til 5000))))", -1);
-    ray_t* t0 = aw_load("gz", 0); ray_t* t2 = aw_load("gz", 2);
+            "(as 'DATE (til 5000)) "
+            "(as 'TIMESTAMP (map (fn [j] (if (== 0 (% j 9)) 0Nl (* j 1000))) (til 5000)))))})", -1);
+    aw_save("gu", "(table [u] (list (take (as 'GUID (list \"00000000-0000-0000-0000-000000000001\" "
+            "\"00000000-0000-0000-0000-0000000000a2\" \"\" \"10000000-0000-0000-0000-000000000003\")) 5000)))", -1);
+    for (int tb = 0; tb < 2; tb++) {
+    const char* tn = tb ? "gu" : "gz";
+    ray_t* t0 = aw_load(tn, 0); ray_t* t2 = aw_load(tn, 2);
     TEST_ASSERT_TRUE(t0 && t2);
     static const int64_t ids[] = { 4999, 0, 7, 2048, 7, 13, 1100, 3, 4096, 2047, 35, 0 };
     ray_t* pred = ray_vec_new(RAY_BOOL, 5000); pred->len = 5000;
     for (int64_t r = 0; r < 5000; r++) ((uint8_t*)ray_data(pred))[r] = (r < 1024) || (r % 3 == 0 && r > 3000);
     ray_t* sel = ray_rowsel_from_pred(pred);
     TEST_ASSERT_NOT_NULL(sel);
-    static const char* cols[] = { "i", "f", "s", "y", "d" };
-    for (int c = 0; c < 5; c++) {
+    static const char* cols[2][8] = { { "i", "f", "s", "y", "d", "h", "g", "ts" }, { "u" } };
+    for (int c = 0; c < (tb ? 1 : 8); c++) {
+        const char* cn = cols[tb][c];
         ray_t* out[2][2];
+        int64_t nm = ray_sym_intern(cn, strlen(cn));
         for (int gen = 0; gen < 2; gen++) {
             ray_col_src_t s;
-            TEST_ASSERT_NULL(ray_table_col_src(gen ? t2 : t0, ray_sym_intern(cols[c], 1), &s));
+            TEST_ASSERT_NULL(ray_table_col_src(gen ? t2 : t0, nm, &s));
+            TEST_ASSERT_FMT(s.type == ray_table_get_col(t0, nm)->type, "%s", cn);
             TEST_ASSERT_NULL(ray_col_gather_rows(&s, ids, 12, &out[gen][0]));
             TEST_ASSERT_NULL(ray_col_gather_sel(&s, sel, &out[gen][1]));
             ray_col_src_release(&s);
@@ -1697,38 +1741,21 @@ static test_result_t test_gather_gen0_parity(void) {
         /* the reference: today's generation-0 index gather, `at` */
         char q[512];
         for (int w = 0; w < 2; w++) {
-            snprintf(q, sizeof q, "(at (at (.db.splayed.get \"" AW_TMP "/gz0/\") '%s) %s)", cols[c],
+            snprintf(q, sizeof q, "(at (at (.db.splayed.get \"" AW_TMP "/%s0/\") '%s) %s)", tn, cn,
                      w ? "(where (or (< (til 5000) 1024) (and (> (til 5000) 3000) (== 0 (% (til 5000) 3)))))"
                        : "[4999 0 7 2048 7 13 1100 3 4096 2047 35 0]");
             ray_t* ref = aw_eval(q);
             TEST_ASSERT_FMT(ref && !RAY_IS_ERR(ref), "%s: %s", q, ray_error_msg());
-            for (int gen = 0; gen < 2; gen++) {
-                TEST_ASSERT_FMT(out[gen][w]->len == ref->len && out[gen][w]->type == ref->type &&
-                                (out[gen][w]->attrs & (RAY_ATTR_HAS_NULLS | RAY_SYM_W_MASK)) ==
-                                (ref->attrs & (RAY_ATTR_HAS_NULLS | RAY_SYM_W_MASK)),
-                                "%s gen %d: len %lld/%lld attrs %x/%x", cols[c], gen, (long long)out[gen][w]->len,
-                                (long long)ref->len, out[gen][w]->attrs, ref->attrs);
-                for (int64_t i = 0; i < ref->len; i++) {
-                    if (ref->type == RAY_STR) {
-                        size_t la = 0, lb = 0;
-                        const char* pa = ray_str_vec_get(out[gen][w], i, &la);
-                        const char* pb = ray_str_vec_get(ref, i, &lb);
-                        TEST_ASSERT_FMT(la == lb && (la == 0 || memcmp(pa, pb, la) == 0), "%s[%lld]", cols[c], (long long)i);
-                    } else if (ref->type != RAY_SYM || gen == 0) {
-                        size_t esz = ray_sym_elem_size(ref->type, ref->attrs);
-                        TEST_ASSERT_FMT(memcmp((char*)ray_data(out[gen][w]) + i * esz, (char*)ray_data(ref) + i * esz, esz) == 0,
-                                        "%s[%lld] gen %d", cols[c], (long long)i, gen);
-                    }
-                }
-                if (ref->type == RAY_SYM && gen == 0)      /* generation 2: by symbol, below */
-                    TEST_ASSERT_TRUE(ray_sym_vec_domain(out[gen][w]) == ray_sym_vec_domain(ref));
-            }
+            AW_GATHER_REF(out[0][w], ref, true, cn);
+            AW_GATHER_REF(out[1][w], ref, false, cn);    /* <name>2 has its own symfile */
             ray_release(ref);
-            test_result_t r = aw_vec_same(out[0][w], out[1][w], cols[c]);
+            test_result_t r = aw_vec_same(out[0][w], out[1][w], cn);
             if (r.status != TEST_PASS) return r;
             ray_release(out[0][w]); ray_release(out[1][w]);
         }
     }
+    ray_rowsel_release(sel); ray_release(pred);
+    if (tb) { ray_release(t0); ray_release(t2); continue; }
     ray_t* e = NULL;
     ray_col_src_t s; TEST_ASSERT_NULL(ray_table_col_src(t2, ray_sym_intern("i", 1), &s));
     static const int64_t bad[] = { 1, 5000 };
@@ -1736,7 +1763,162 @@ static test_result_t test_gather_gen0_parity(void) {
     TEST_ASSERT_TRUE(err && RAY_IS_ERR(err) && e == NULL);
     TEST_ASSERT_STR_EQ(ray_err_code(err), "range");
     ray_error_free(err); ray_col_src_release(&s);
-    ray_rowsel_release(sel); ray_release(pred); ray_release(t0); ray_release(t2);
+    ray_release(t0); ray_release(t2);
+    }
+    PASS();
+}
+
+/* Important 1 (review): the in-order row list.  Sorted ids with repeats and
+ * runs crossing a vector boundary (1023..1025) and a partition boundary
+ * (2999..3001), both partitions generation 2, against generation 0's `at`
+ * over an all-generation-0 copy; each touched vector decoded once. */
+static test_result_t test_gather_rows_sorted(void) {
+    for (int gen = 0; gen < 3; gen += 2)
+        for (int p = 0; p < 2; p++) {
+            char q[700];
+            snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/gr%d/2024.01.0%d/t/\" "
+                     "(table [s v y] (list (map (fn [j] (format \"a long pooled string number %%\" (+ j %d))) (til 3000)) "
+                     "(+ %d (til 3000)) (as 'SYMBOL (map (fn [j] (format \"y%%\" (%% j %d))) (til 3000))))) "
+                     "\"" AW_TMP "/gr%d/.sym\" {compress: %s})", gen, p + 1, p * 3000, p * 3000, p ? 400 : 30,
+                     gen, gen ? "true" : "false");
+            aw_eval_ok(q);
+        }
+    ray_t* t = aw_eval("(.db.parted.get \"" AW_TMP "/gr2\" 't)");
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    static const int64_t ids[] = { 0, 1, 2, 2, 1023, 1024, 1025, 2999, 3000, 3001, 3001, 5999 };
+    static const char* cols[] = { "s", "v", "y" };
+    ray_enc_counters_reset();
+    for (int c = 0; c < 3; c++) {
+        ray_col_src_t s;
+        TEST_ASSERT_NULL(ray_table_col_src(t, ray_sym_intern(cols[c], 1), &s));
+        ray_t* got = NULL;
+        TEST_ASSERT_NULL(ray_col_gather_rows(&s, ids, 12, &got));
+        ray_col_src_release(&s);
+        char q[300];
+        snprintf(q, sizeof q, "(at (at (.db.parted.get \"" AW_TMP "/gr0\" 't) '%s) [0 1 2 2 1023 1024 1025 2999 3000 3001 3001 5999])", cols[c]);
+        ray_t* ref = aw_eval(q);
+        TEST_ASSERT_FMT(ref && !RAY_IS_ERR(ref), "%s: %s", q, ray_error_msg());
+        AW_GATHER_REF(got, ref, false, cols[c]);
+        ray_release(ref); ray_release(got);
+    }
+    ray_enc_counters_t k; ray_enc_counters_get(&k);
+    TEST_ASSERT_EQ_U(k.materialized, 0);
+    /* v: partition 1 vectors 0, 1, 2 (952 rows); partition 2 vectors 0, 2 */
+    ray_t* venc = ray_table_get_col_enc(t, ray_sym_intern("v", 1));
+    TEST_ASSERT_NOT_NULL(venc);
+    TEST_ASSERT_EQ_U(atomic_load(&ray_enccol_of(ray_enccol_seg(venc, 0))->decoded_bytes), (1024 + 1024 + 952) * 8);
+    TEST_ASSERT_EQ_U(atomic_load(&ray_enccol_of(ray_enccol_seg(venc, 1))->decoded_bytes), (1024 + 952) * 8);
+    ray_release(t);
+    PASS();
+}
+
+/* Minor 5 (review): empty requests and all-null columns.  n = 0 and an
+ * empty selection read nothing and give empty vectors; an all-empty STR
+ * column (no pool) and an all-"" SYM column (a CONST-0 vector) give
+ * generation 0's nulls and HAS_NULLS.  A rowsel whose segments hold more
+ * rows than its total_pass is `corrupt` before any row past it is written. */
+static test_result_t test_gather_empty_and_nulls(void) {
+    aw_save("ge", "(table [e y v] (list (map (fn [j] \"\") (til 3000)) (as 'SYMBOL (map (fn [j] \"\") (til 3000))) (til 3000)))", -1);
+    TEST_ASSERT_EQ_I(aw_vec_enc("ge", "y", 1), RAY_ENC_CONST);
+    ray_t* t0 = aw_load("ge", 0); ray_t* t2 = aw_load("ge", 2);
+    TEST_ASSERT_TRUE(t0 && t2);
+    ray_t* pred = ray_vec_new(RAY_BOOL, 3000); pred->len = 3000;
+    memset(ray_data(pred), 0, 3000);
+    ray_t* none = ray_rowsel_from_pred(pred);
+    TEST_ASSERT_NOT_NULL(none);
+    for (int64_t r = 0; r < 3000; r++) ((uint8_t*)ray_data(pred))[r] = r % 4 == 1;
+    ray_t* sel = ray_rowsel_from_pred(pred);
+    static const int64_t ids[] = { 2999, 5, 1500, 5 };
+    static const char* cols[] = { "e", "y", "v" };
+    for (int c = 0; c < 3; c++) {
+        ray_col_src_t s;
+        TEST_ASSERT_NULL(ray_table_col_src(t2, ray_sym_intern(cols[c], 1), &s));
+        ray_enc_counters_reset();
+        ray_t* a = NULL; ray_t* b = NULL;
+        TEST_ASSERT_NULL(ray_col_gather_rows(&s, ids, 0, &a));
+        TEST_ASSERT_NULL(ray_col_gather_sel(&s, none, &b));
+        ray_enc_counters_t k; ray_enc_counters_get(&k);
+        TEST_ASSERT_EQ_U(k.decoded_bytes, 0);
+        for (int w = 0; w < 2; w++) {
+            ray_t* o = w ? b : a;
+            TEST_ASSERT_FMT(o->len == 0 && o->type == s.type && !(o->attrs & RAY_ATTR_HAS_NULLS) &&
+                            (o->type != RAY_STR || !o->str_pool),
+                            "%s %d: len %lld type %d/%d attrs %x pool %p", cols[c], w, (long long)o->len, o->type, s.type,
+                            o->attrs, (void*)o->str_pool);
+            ray_release(o);
+        }
+        if (c < 2) {                                      /* all null */
+            ray_t* g[2] = { NULL, NULL };
+            TEST_ASSERT_NULL(ray_col_gather_rows(&s, ids, 4, &g[0]));
+            TEST_ASSERT_NULL(ray_col_gather_sel(&s, sel, &g[1]));
+            for (int w = 0; w < 2; w++) {
+                char q[300];
+                snprintf(q, sizeof q, "(at (at (.db.splayed.get \"" AW_TMP "/ge0/\") '%s) %s)", cols[c],
+                         w ? "(where (== 1 (% (til 3000) 4)))" : "[2999 5 1500 5]");
+                ray_t* ref = aw_eval(q);
+                TEST_ASSERT_FMT(ref && !RAY_IS_ERR(ref), "%s: %s", q, ray_error_msg());
+                AW_GATHER_REF(g[w], ref, false, cols[c]);
+                TEST_ASSERT_TRUE((g[w]->attrs & RAY_ATTR_HAS_NULLS) && (g[w]->type != RAY_STR || !g[w]->str_pool));
+                ray_release(ref); ray_release(g[w]);
+            }
+        }
+        if (c == 2) {                                     /* Minor 2: a rowsel holding more rows than it says */
+            int64_t tp = ray_rowsel_meta(sel)->total_pass;
+            ray_rowsel_meta(sel)->total_pass = 1;          /* a one-row output, 750 rows in the segments */
+            ray_t* o = NULL;
+            ray_t* err = ray_col_gather_sel(&s, sel, &o);
+            ray_rowsel_meta(sel)->total_pass = tp;
+            TEST_ASSERT_TRUE(err && RAY_IS_ERR(err) && o == NULL);
+            TEST_ASSERT_STR_EQ(ray_err_code(err), "corrupt");
+            /* refused by the per-segment bound, before the write (the end
+             * check alone would report it after writing past the output) */
+            TEST_ASSERT_FMT(strstr(ray_error_msg(), "more rows than") != NULL, "%s", ray_error_msg());
+            ray_error_free(err);
+        }
+        ray_col_src_release(&s);
+    }
+    ray_rowsel_release(none); ray_rowsel_release(sel); ray_release(pred); ray_release(t0); ray_release(t2);
+    PASS();
+}
+
+/* Minor 5 (review): a ragged parted source.  Partition 2 lacks w, so the
+ * load gives it a synthetic all-null segment; the gather across both
+ * equals generation 0's `at` over an explicit-null copy. */
+static test_result_t test_gather_ragged(void) {
+    static const char* roots[] = { "gw", "gn" };
+    for (int r = 0; r < 2; r++)
+        for (int p = 0; p < 2; p++) {
+            char q[600];
+            const char* tbl = p == 0 ? "(table [x w] (list (til 3000) (* 2 (til 3000))))"
+                            : r == 0 ? "(table [x] (list (til 3000)))"
+                                     : "(table [x w] (list (til 3000) (take [0Nl] 3000)))";
+            snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/%s/2024.01.0%d/t/\" %s {compress: %s})",
+                     roots[r], p + 1, tbl, r == 0 ? "true" : "false");
+            aw_eval_ok(q);
+        }
+    ray_t* t = aw_eval("(.db.parted.get \"" AW_TMP "/gw\" 't)");
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    static const int64_t ids[] = { 5999, 1, 3000, 2999, 4500, 1 };
+    ray_t* pred = ray_vec_new(RAY_BOOL, 6000); pred->len = 6000;
+    for (int64_t r = 0; r < 6000; r++) ((uint8_t*)ray_data(pred))[r] = r % 5 == 0 || (r > 2000 && r < 4100);
+    ray_t* sel = ray_rowsel_from_pred(pred);
+    ray_col_src_t s;
+    TEST_ASSERT_NULL(ray_table_col_src(t, ray_sym_intern("w", 1), &s));
+    ray_t* g[2] = { NULL, NULL };
+    TEST_ASSERT_NULL(ray_col_gather_rows(&s, ids, 6, &g[0]));
+    TEST_ASSERT_NULL(ray_col_gather_sel(&s, sel, &g[1]));
+    ray_col_src_release(&s);
+    ray_release(t);
+    for (int w = 0; w < 2; w++) {
+        ray_t* ref = aw_eval(w ? "(at (at (.db.parted.get \"" AW_TMP "/gn\" 't) 'w) "
+                                 "(where (or (== 0 (% (til 6000) 5)) (and (> (til 6000) 2000) (< (til 6000) 4100)))))"
+                               : "(at (at (.db.parted.get \"" AW_TMP "/gn\" 't) 'w) [5999 1 3000 2999 4500 1])");
+        TEST_ASSERT_FMT(ref && !RAY_IS_ERR(ref), "ragged ref %d: %s", w, ray_error_msg());
+        AW_GATHER_REF(g[w], ref, true, "w");
+        TEST_ASSERT_TRUE(g[w]->attrs & RAY_ATTR_HAS_NULLS);
+        ray_release(ref); ray_release(g[w]);
+    }
+    ray_rowsel_release(sel); ray_release(pred);
     PASS();
 }
 
@@ -1768,5 +1950,8 @@ const test_entry_t aware_entries[] = {
     { "aware/gather_sel_skips_none", test_gather_sel_skips_none, aw_setup, aw_teardown },
     { "aware/gather_sel_parted",     test_gather_sel_parted,     aw_setup, aw_teardown },
     { "aware/gather_gen0_parity",    test_gather_gen0_parity,    aw_setup, aw_teardown },
+    { "aware/gather_rows_sorted",    test_gather_rows_sorted,    aw_setup, aw_teardown },
+    { "aware/gather_empty_and_nulls", test_gather_empty_and_nulls, aw_setup, aw_teardown },
+    { "aware/gather_ragged",         test_gather_ragged,         aw_setup, aw_teardown },
     { NULL, NULL, NULL, NULL },
 };
