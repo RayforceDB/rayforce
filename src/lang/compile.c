@@ -836,51 +836,53 @@ static bool ast_collect_syms(ray_t *ast, ray_t **out, bool *dynamic) {
     return ast_collect_syms_at(ast, out, dynamic, 0, &weight);
 }
 /* The bytes a value spliced into text holds whole: a table's columns, a
- * lambda's parameters, body and captures, recursively; shared children
- * count each time they are reached (an overestimate), and the count stops
- * once it passes `cap`. */
-static int64_t ast_node_bytes(ray_t *v);
-static int64_t ast_value_bytes(ray_t *v, int depth, int64_t cap) {
+ * lambda's parameters, body and captures, recursively.  Shared children
+ * count each time they are reached (an overestimate), so the walk stops as
+ * soon as the count passes `cap`, the room left under the template bound:
+ * the work is bounded by the bound, whatever the value's shape, and so is
+ * the depth, since every level adds a header. */
+static int64_t ast_node_bytes(ray_t *v, int64_t cap);
+static int64_t ast_value_bytes(ray_t *v, int64_t cap) {
     if (!v || RAY_IS_ERR(v)) return 0;
-    if (depth > 64) return cap + 1;
+    if (cap < 0) return 1;
     int64_t b;
     if (v->type == RAY_LAMBDA) {
         b = (int64_t)(sizeof(ray_t) + LAMBDA_SLOTS * sizeof(ray_t*));
         ray_t *parts[4] = { LAMBDA_PARAMS(v), LAMBDA_BODY(v), LAMBDA_CLOSURE(v), LAMBDA_CAPROWS(v) };
-        for (int i = 0; i < 4 && b <= cap; i++) b += ast_value_bytes(parts[i], depth + 1, cap);
+        for (int i = 0; i < 4 && b <= cap; i++) b += ast_value_bytes(parts[i], cap - b);
         return b;
     }
     if (v->type == RAY_TABLE || v->type == RAY_DICT) {
         ray_t **slots = (ray_t**)ray_data(v);
         b = (int64_t)ray_block_size(v);
-        for (int i = 0; i < 2 && b <= cap; i++) b += ast_value_bytes(slots[i], depth + 1, cap);
+        for (int i = 0; i < 2 && b <= cap; i++) b += ast_value_bytes(slots[i], cap - b);
         return b;
     }
     if (v->type == RAY_LIST && !(v->attrs & RAY_ATTR_SLICE)) {
         ray_t **elems = (ray_t**)ray_data(v);
         b = (int64_t)ray_block_size(v);
-        for (int64_t i = 0; i < v->len && b <= cap; i++) b += ast_value_bytes(elems[i], depth + 1, cap);
+        for (int64_t i = 0; i < v->len && b <= cap; i++) b += ast_value_bytes(elems[i], cap - b);
         return b;
     }
-    return ast_node_bytes(v);
+    return ast_node_bytes(v, cap);
 }
 
 /* The bytes a text node holds: its header and payload, a string atom's
  * or a string vector's characters, and the whole parent of a slice.  A
  * table or a lambda in the text is a constant the walk does not enter:
  * it counts whole (ast_value_bytes). */
-static int64_t ast_node_bytes(ray_t *v) {
+static int64_t ast_node_bytes(ray_t *v, int64_t cap) {
     if (v->type == RAY_TABLE || v->type == RAY_LAMBDA)
-        return ast_value_bytes(v, 0, (int64_t)1 << 40);
+        return ast_value_bytes(v, cap);
     if (ray_is_atom(v)) {
         int64_t b = (int64_t)ray_block_size(v);
         if (v->type == -RAY_STR && !((v->slen >= 1 && v->slen <= 7) || (v->slen == 0 && !v->obj)) && v->obj)
-            b += ast_node_bytes(v->obj);
+            b += ast_node_bytes(v->obj, cap);
         else if (v->type == -RAY_GUID && v->obj)
-            b += ast_node_bytes(v->obj);
+            b += ast_node_bytes(v->obj, cap);
         return b;
     }
-    if ((v->attrs & RAY_ATTR_SLICE) && v->slice_parent) return ast_node_bytes(v->slice_parent);
+    if ((v->attrs & RAY_ATTR_SLICE) && v->slice_parent) return ast_node_bytes(v->slice_parent, cap);
     int64_t b = (int64_t)ray_block_size(v);
     if (v->type == RAY_STR && v->str_pool) b += (int64_t)ray_block_size(v->str_pool);
     return b;
@@ -893,7 +895,8 @@ static int64_t ast_node_bytes(ray_t *v) {
 static bool ast_collect_syms_at(ray_t *ast, ray_t **out, bool *dynamic, int depth, int64_t *weight) {
     if (!ast || !*out) return false;
     if (depth > 1024) return false;
-    *weight += ast_node_bytes(ast);
+    /* Past the template bound the exact weight does not matter. */
+    *weight += ast_node_bytes(ast, RAY_CLOSURE_TMPL_MAX_BYTES - *weight);
     if (ast->type == -RAY_SYM) {
         int64_t id = ast->i64;
         if (id == sf_eval || id == sf_resolve) *dynamic = true;

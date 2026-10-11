@@ -389,6 +389,15 @@ r6 -- [6 3]
 (< (heldL mkLm) 2000000) -- true
 (< (heldL mkSl) 2000000) -- true
 (< (heldL mkSv) 2000000) -- true
+;; the count stops at the bound, so its work is bounded too: a table whose
+;; cells share one list, or hold a list shared 2^30 times over, costs the
+;; literal's first call next to nothing
+(set dagL (fn [n] (let L (list 1)) (times n (let L (list L L))) L))
+(set fdag (spliceL (table [a] (list (list (dagL 30))))))
+(< (timeit (fdag 1)) 1000) -- true
+(set cellL (map (fn [i] (if (== 0 (% i 2)) i (format "%" i))) (til 2000)))
+(set fcell (spliceL (table [c] (list (map (fn [i] cellL) (til 20000))))))
+(< (timeit (fcell 1)) 1000) -- true
 ;; a body nested past the compiler's depth guard (2048 levels) is left to the
 ;; tree walker instead of recursing further down the C stack. a chain of
 ;; nested if's shows which engine ran: the compiled body runs it as jumps and

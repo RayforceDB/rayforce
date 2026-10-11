@@ -2181,7 +2181,7 @@ typedef struct {
  * from them is gone, so the table is bounded by bytes: a literal holding
  * more than CLOSURE_TMPL_MAX_BYTES is not kept, and older entries make
  * room once the table holds CLOSURE_TMPL_BUDGET. */
-enum { CLOSURE_TMPL_MAX_BYTES = 64 * 1024, CLOSURE_TMPL_BUDGET = 1024 * 1024 };
+enum { CLOSURE_TMPL_MAX_BYTES = RAY_CLOSURE_TMPL_MAX_BYTES, CLOSURE_TMPL_BUDGET = 1024 * 1024 };
 static _Thread_local closure_tmpl_t g_closure_tmpl[CLOSURE_TMPL_SLOTS];
 static _Thread_local uint32_t g_closure_tmpl_next;
 static _Thread_local uint64_t g_closure_tmpl_epoch;

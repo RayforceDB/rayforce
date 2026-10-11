@@ -213,6 +213,9 @@ void ray_compile(ray_t* lambda);
 /* ray_compile for a lambda with nothing captured, also handing back the
  * bindings its code depends on (see compile.c). */
 bool ray_compile_definition(ray_t* lambda, ray_t** deps);
+/* The most bytes a literal's text may hold for the template table to keep
+ * it (eval.c), and where the compiler's weight count may stop. */
+#define RAY_CLOSURE_TMPL_MAX_BYTES ((int64_t)64 * 1024)
 /* The capture names a closure's body can reach (its dict keys the body
  * mentions; all of them under eval/resolve), as a SYM vector or NULL. */
 ray_t* ray_closure_capture_names(ray_t* lambda);
