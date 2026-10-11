@@ -10991,7 +10991,8 @@ static ray_t* select_parted_sorted(ray_t* dict, ray_t* tbl, bool aliases_resolve
         else if (kid == id_from) continue;
         else if (kid == id_take || kid == id_asc || kid == id_desc) n_clause++;
         else if (!v || v->type != -RAY_SYM || (v->attrs & ATTR_QUOTED) ||
-                 !sym_names_col(tbl, v->i64)) ok = false;   /* a bare column, no local */
+                 !ray_table_get_col(tbl, v->i64) || !sym_names_col(tbl, v->i64))
+            ok = false;   /* a stored column the name reads (no local hides it) */
         else n_out++;
     }
     /* An output naming another output's alias reads that output, not the

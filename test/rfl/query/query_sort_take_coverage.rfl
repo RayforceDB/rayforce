@@ -510,6 +510,11 @@
 ;; column it hides
 (set runs (fn [tbl x] (select {y: y x: x from: tbl desc: y})))
 (runs Pck 7) -- (runs Mck 7)
+;; a dotted output (a field of the partition date) is no stored column: the
+;; flat sort answers it
+(select {month: date.mm from: Pck desc: x}) -- (select {month: date.mm from: Mck desc: x})
+(select {day: date.dd from: Pck asc: y}) -- (select {day: date.dd from: Mck asc: y})
+(select {month: date.mm y: y from: Pck desc: y take: 2}) -- (select {month: date.mm y: y from: Mck desc: y take: 2})
 ;; with take: too (the per-partition top-k sorted each partition on the
 ;; column and merged them on the output of that name)
 (select {x: y r: r from: Pck desc: x take: 3}) -- (select {x: y r: r from: Mck desc: x take: 3})
