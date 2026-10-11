@@ -3342,7 +3342,7 @@ static test_result_t test_relieve_spill_fallback(void) {
 static int relieve_spill_fds(const char* who) {
     char cmd[128];
     snprintf(cmd, sizeof(cmd),
-             "ls -l /proc/%s/fd 2>/dev/null | grep -cE 'rayheap_|raydirect_'", who);
+             "ls -l /proc/%s/fd 2>/dev/null | grep -cE 'rayheap_|raydirect_|raysys_'", who);
     FILE* f = popen(cmd, "r");
     if (!f) return -1;
     int n = -1;
@@ -3352,9 +3352,11 @@ static int relieve_spill_fds(const char* who) {
 }
 
 /* Every spill file is close-on-exec: a child the process starts (.sys.exec)
- * holds none of the files of its spill pools or spilled large blocks, which
- * would keep them — and their dirty pages, written back — past their
- * unmapping, for as long as the child runs. */
+ * holds none of the files of its spill pools or spilled large or off-heap
+ * blocks, which would keep them — and their dirty pages, written back —
+ * past their unmapping, for as long as the child runs.  (An off-heap
+ * block's file is closed as soon as it is mapped: only a fork racing that
+ * window could inherit it.) */
 static test_result_t test_relieve_spill_cloexec(void) {
 #if !defined(__linux__)
     SKIP("/proc/<pid>/fd is Linux-only");
@@ -3367,14 +3369,18 @@ static test_result_t test_relieve_spill_cloexec(void) {
     ray_heap_set_anon_watermark(ray_heap_anon_committed());
     ray_t* s = ray_alloc(RELIEVE_HALF);            /* a spill pool */
     ray_t* d = ray_alloc((size_t)48 << 20);         /* a spilled large block */
+    int64_t c0 = ray_heap_anon_committed();
+    void* sb = ray_sys_alloc((size_t)48 << 20);     /* a spilled off-heap block */
+    bool sys = sb && ray_heap_anon_committed() == c0;
     bool spilled = s && relieve_pool_is_backed(h, s) && d && ray_direct_file_backed(d);
     int ours = relieve_spill_fds("$PPID");
     int child = relieve_spill_fds("self");
+    if (sb) ray_sys_free(sb);
     if (d) ray_free(d);
     if (s) ray_free(s);
     if (a) ray_free(a);
     relieve_env_end(&e, h, NULL);
-    if (!spilled) SKIP("no spill file");
+    if (!spilled || !sys) SKIP("no spill file");
     if (ours < 0 || child < 0) SKIP("no shell to look with");
     TEST_ASSERT(ours >= 2, "the pool's and the block's files are open here");
     TEST_ASSERT_EQ_I(child, 0);
