@@ -503,6 +503,33 @@ CNT11 -- 6
 (set CNT11 0)
 (at (select {n: (count v) by: (ktd11 v) from: T10}) 'n) -- [6]
 CNT11 -- 6
+;; every builtin that calls an argument, at every position it calls, under
+;; any name bound to it: fold-left, scan-left, fold-while's step, try's handler
+(set eff211 (fn [a x] (set CNT11 (+ CNT11 1)) x))
+(set D211 (dict ['b] (list eff211)))
+(set khf11 (fn [v] (let t (fold-left (at D211 'b) 0 (enlist v))) (kg10 v)))
+(set CNT11 0)
+(at (select {n: (count v) by: (khf11 v) from: T10}) 'n) -- [6]
+CNT11 -- 6
+(set khs11 (fn [v] (let t (scan-left (at D211 'b) (list v v))) (kg10 v)))
+(set CNT11 0)
+(at (select {n: (count v) by: (khs11 v) from: T10}) 'n) -- [6]
+CNT11 -- 6
+(set khw11 (fn [v] (let t (fold-while (fn [a] true) (at D211 'b) 0 (enlist v))) (kg10 v)))
+(set CNT11 0)
+(at (select {n: (count v) by: (khw11 v) from: T10}) 'n) -- [6]
+CNT11 -- 6
+(set kha11 (fn [v] (let m map) (let t (m (at D11 'a) (enlist v))) (kg10 v)))
+(set CNT11 0)
+(at (select {n: (count v) by: (kha11 v) from: T10}) 'n) -- [6]
+CNT11 -- 6
+(set kht11 (fn [v] (let t (try (raise "x") (at D11 'a))) (kg10 v)))
+(set CNT11 0)
+(at (select {n: (count v) by: (kht11 v) from: T10}) 'n) -- [6]
+CNT11 -- 6
+;; ... while a literal fallback value of try keeps the whole column
+(set khv11 (fn [v] (let t (try (raise "x") 'none)) (kg10 v)))
+(at (select {n: (count v) by: (khv11 v) from: T10}) 'n) -- [3 3]
 ;; ... while a pure function value keeps the whole column, a dict's included
 (set kpm11 (fn [v] (> (first (map kg10 (enlist v))) 0)))
 (at (select {n: (count v) by: (kpm11 v) from: T10}) 'n) -- [3 3]

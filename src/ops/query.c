@@ -2322,18 +2322,6 @@ static bool key_literal_call_pure(ray_t* lit, ray_t** args, int64_t nargs, int d
  * value: a binding the walk made (parameter or `let`), a capture, a binding
  * of a frame in scope, a global.  True when pure: a pure lambda, a pure
  * builtin, or plain data. */
-/* Whether `id` is bound by the walk, a capture or a scope frame, so that
- * it does not mean the global of that name. */
-static bool key_name_shadowed(int64_t id, const key_pure_ctx_t* ctx) {
-    for (int i = 0; i < ctx->n; i++) if (ctx->binds[i].name == id) return true;
-    if (ctx->closure) {
-        ray_t* keys = ray_dict_keys(ctx->closure);
-        for (int64_t i = 0; keys && i < keys->len; i++)
-            if (ray_read_sym(ray_data(keys), i, RAY_SYM, keys->attrs) == id) return true;
-    }
-    return ray_env_get_local(id) != NULL;
-}
-
 static bool key_name_pure(int64_t id, ray_t** args, int64_t nargs, int depth, const key_pure_ctx_t* ctx) {
     bool called = args != NULL;
     if (depth > 16) return false;
@@ -2445,37 +2433,78 @@ static bool key_arg_callables_pure(ray_t* e, int depth, const key_pure_ctx_t* ct
     return true;
 }
 
-/* `(map f xs ...)`, `(fold f init xs)` and the like with a lambda literal f:
- * the builtin calls f with elements of its other arguments (fold and scan
- * pass their accumulator first).  When those arguments' callables are all
- * pure, so are f's parameters.  Returns 1 pure, 0 effect, -1 not this
- * shape (the caller walks it as any call). */
-static int key_higher_order_pure(int64_t id, ray_t** es, int64_t n, int depth, key_pure_ctx_t* ctx) {
-    static const char* const hof[] = {
-        "map", "pmap", "fold", "scan", "prior", "apply", "fold-while", "fold-right",
-        "scan-right", "map-left", "map-right",
-    };
-    enum { NHOF = sizeof hof / sizeof *hof };
-    static _Thread_local int64_t hof_ids[NHOF];
-    static _Thread_local uint64_t epoch;
-    if (epoch != ray_sym_epoch() || !epoch) {
-        for (size_t i = 0; i < NHOF; i++) hof_ids[i] = ray_sym_intern(hof[i], strlen(hof[i]));
-        epoch = ray_sym_epoch();
+/* The builtins that call a function argument, by the C function behind
+ * them, so every name bound to one is covered: the argument positions
+ * each calls (bit i: argument i), and whether the literal shortcut below
+ * applies (map, pmap: elements; fold, scan: accumulator first). */
+enum { HOF_ELEMS = 1, HOF_ACC = 2 };
+static const struct { void* fn; uint8_t calls; uint8_t shortcut; } key_hof_table[] = {
+    { (void*)ray_map_fn,        1, HOF_ELEMS }, { (void*)ray_pmap_fn,       1, HOF_ELEMS },
+    { (void*)ray_fold_fn,       1, HOF_ACC },   { (void*)ray_scan_fn,       1, HOF_ACC },
+    { (void*)ray_fold_left_fn,  1, 0 },         { (void*)ray_fold_right_fn, 1, 0 },
+    { (void*)ray_fold_while_fn, 3, 0 },         { (void*)ray_scan_left_fn,  1, 0 },
+    { (void*)ray_scan_right_fn, 1, 0 },         { (void*)ray_prior_fn,      1, 0 },
+    { (void*)ray_apply_fn,      1, 0 },         { (void*)ray_map_left_fn,   1, 0 },
+    { (void*)ray_map_right_fn,  1, 0 },
+};
+enum { KEY_HOF_N = sizeof key_hof_table / sizeof *key_hof_table };
+
+/* The builtins a call head can mean, as key_name_pure resolves it (a
+ * `let` alias, a parameter bound to a name, a capture, a frame, a global,
+ * a dict through a dotted name), up to `max`; a `let` in a branch adds
+ * what the name meant before it.  Anything else it can mean adds nothing:
+ * a lambda is walked as a call, an unknown value is already an effect. */
+static int key_head_builtins(int64_t id, const key_pure_ctx_t* ctx, ray_t** out, int n, int max, int depth) {
+    if (depth > 16 || n >= max) return n;
+    for (int i = ctx->n - 1; i >= 0; i--) {
+        const key_bind_t* b = &ctx->binds[i];
+        if (b->name != id) continue;
+        key_pure_ctx_t at = key_bind_view(b);
+        if ((b->kind == KB_ALIAS || b->kind == KB_ARG) && b->val && b->val->type == -RAY_SYM &&
+            !(b->val->attrs & ATTR_QUOTED))
+            n = key_head_builtins(b->val->i64, &at, out, n, max, depth + 1);
+        if (!b->cond) return n;
     }
-    size_t k = 0;
-    while (k < NHOF && hof_ids[k] != id) k++;
-    if (k == NHOF || n < 2) return -1;
-    /* A local, a parameter or a capture of that name is what is called. */
-    if (key_name_shadowed(id, ctx)) return -1;
-    ray_t* fn = ray_env_get_global(id);
-    if (!fn || fn->type != RAY_VARY) return -1;      /* rebound by the program */
-    /* The builtin calls its first argument.  Anything but a literal must
-     * be known pure where it comes from (a name bound to a pure lambda or
-     * builtin): a function computed out of data (a list, a dict, a table
-     * cell) is a callee the walk cannot see. */
-    if (!key_literal_is_fn(es[1])) return key_arg_callables_pure(es[1], depth + 1, ctx) ? -1 : 0;
-    bool acc = k == 2 || k == 3;                      /* fold, scan: accumulator first */
-    if (k > 3 || n < 3) return -1;                    /* the shortcut: map, pmap, fold, scan */
+    ray_t* v = NULL;
+    if (ctx->closure) {
+        ray_t* keys = ray_dict_keys(ctx->closure);
+        ray_t* vals = ray_dict_vals(ctx->closure);
+        for (int64_t i = 0; keys && vals && i < keys->len; i++)
+            if (ray_read_sym(ray_data(keys), i, RAY_SYM, keys->attrs) == id) { v = ((ray_t**)ray_data(vals))[i]; break; }
+    }
+    if (!v) v = ray_env_get_local(id);
+    if (!v) v = ray_env_get_global(id);
+    if (!v && ray_sym_is_dotted(id)) v = ray_env_get(id);
+    if (v && (v->type == RAY_UNARY || v->type == RAY_BINARY || v->type == RAY_VARY) && n < max) out[n++] = v;
+    return n;
+}
+
+/* A call of a builtin that calls some of its arguments: each argument it
+ * calls must be a literal or known pure where it comes from (a name bound
+ * to a pure lambda or builtin); a function computed out of data (a list,
+ * a dict, a table cell) is a callee the walk cannot see.  `(map f xs ...)`
+ * and `(fold f init xs)` with a lambda literal f whose other arguments'
+ * callables are all pure: f's parameters are pure too.  Returns 1 pure,
+ * 0 effect, -1 walk it as any call. */
+static int key_higher_order_pure(int64_t id, ray_t** es, int64_t n, int depth, key_pure_ctx_t* ctx) {
+    ray_t* cand[4];
+    int nc = key_head_builtins(id, ctx, cand, 0, 4, 0);
+    int shortcut = -1;   /* the one candidate's shortcut kind, when there is one */
+    bool any = false;
+    for (int c = 0; c < nc; c++) {
+        int k = 0;
+        while (k < KEY_HOF_N && key_hof_table[k].fn != (void*)(uintptr_t)cand[c]->i64) k++;
+        if (k == KEY_HOF_N) { shortcut = -2; continue; }
+        any = true;
+        for (int64_t a = 0; a + 1 < n && a < 8; a++) {
+            if (!(key_hof_table[k].calls & (1u << a))) continue;
+            ray_t* arg = es[a + 1];
+            if (!key_literal_is_fn(arg) && !key_arg_callables_pure(arg, depth + 1, ctx)) return 0;
+        }
+        shortcut = shortcut == -1 ? key_hof_table[k].shortcut : -2;
+    }
+    if (!any || nc != 1 || shortcut <= 0 || n < 3 || !key_literal_is_fn(es[1])) return -1;
+    bool acc = shortcut == HOF_ACC;
     for (int64_t i = 2; i < n; i++)
         if (!key_arg_callables_pure(es[i], depth + 1, ctx)) return -1;
     ray_t** le = ray_data(es[1]);
@@ -2571,6 +2600,16 @@ static bool key_expr_pure(ray_t* expr, int depth, key_pure_ctx_t* ctx) {
          head->i64 == ray_sym_intern("and", 3) || head->i64 == ray_sym_intern("or", 2) ||
          is_loop || is_try);
     int64_t cond_from = is_try ? first_arg : first_arg + 1;
+    /* try calls its handler when it is a function: anything but a literal
+     * function, a literal fallback value or a name known pure is a callee
+     * the walk cannot see. */
+    if (is_try && expr->len >= 3) {
+        ray_t* h = es[2];
+        bool literal = h && (key_literal_is_fn(h) ||
+                             (h->type == -RAY_SYM && (h->attrs & ATTR_QUOTED)) ||
+                             (h->type != RAY_LIST && h->type != -RAY_SYM));
+        if (!literal && !key_arg_callables_pure(h, depth + 1, ctx)) return false;
+    }
     /* A loop runs its body again: a `let` there reaches the calls before
      * it in the next iteration, and the code after the loop.  Every name
      * the loop rebinds is marked first, so a call through it is an effect. */
