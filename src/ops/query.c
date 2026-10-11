@@ -1419,6 +1419,16 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
         ray_t** elems = (ray_t**)ray_data(expr);
         ray_t* head = elems[0];
 
+        /* A head bound as a value where the text is (a formal of a lambda
+         * inlined here, a local of the frame the query runs in) is a call
+         * through that value, however it is spelled (quote, if, count):
+         * the planner cannot lower it, and the evaluator calls it. */
+        if (head && head->type == -RAY_SYM && !(head->attrs & ATTR_QUOTED) &&
+            (cexpr_env_lookup(g, head->i64) ||
+             (g->cexpr_helper_depth > 0 ? ray_env_get_lexical_local_callee(head->i64)
+                                        : ray_env_get_lexical_local(head->i64))))
+            return NULL;
+
         /* Lambda invocation: `((fn [formals] body) a1 a2 …)`.
          * β-reduce at the DAG-node level — compile each actual
          * arg into its own op (in the current env), push the
@@ -2151,6 +2161,8 @@ static bool query_inline_pure_builtin(int64_t id) {
     ray_t* fn = ray_env_get(id);
     if (!fn) return id == pure_ids[0];                 /* quote is a form */
     if (fn->type == RAY_LAMBDA) return false;          /* shadowed by a user helper */
+    /* The builtin of that name, not another one bound to it. */
+    if (ray_env_builtin_sym(fn) != id) return false;
     return !(fn->attrs & RAY_FN_RESTRICTED);
 }
 
@@ -2247,6 +2259,10 @@ static bool key_impure_builtin(ray_t* fn, int64_t id) {
         epoch = ray_sym_epoch();
     }
     if (fn->attrs & (RAY_FN_RESTRICTED | RAY_FN_SPECIAL_FORM)) return true;
+    /* The builtin's own name, not the one it was reached by: println bound
+     * to another name is still println. */
+    int64_t own = ray_env_builtin_sym(fn);
+    if (own >= 0) id = own;
     if (ray_sym_is_dotted(id)) return true;   /* .sys.*, .io.*, ... */
     for (size_t i = 0; i < NIMPURE; i++) if (ids[i] == id) return true;
     return false;
@@ -2263,6 +2279,25 @@ static key_pure_ctx_t key_bind_view(const key_bind_t* b) {
     key_pure_ctx_t v = { NULL, NULL, 0, 0 };
     if (b->at) { v.closure = b->at->closure; v.binds = b->at->binds; v.n = b->at_n; }
     return v;
+}
+
+/* Whether `id` is bound by the walk, a capture or a scope frame: then a
+ * call spelled like a special form (if, do, let, fn, quote, try, ...) or
+ * a builtin is a call through that binding, as it is on the tree walker
+ * and in compiled code. */
+static bool key_name_bound(int64_t id, const key_pure_ctx_t* ctx) {
+    for (int i = 0; i < ctx->n; i++) if (ctx->binds[i].name == id) return true;
+    if (ctx->closure) {
+        ray_t* keys = ray_dict_keys(ctx->closure);
+        for (int64_t i = 0; keys && i < keys->len; i++)
+            if (ray_read_sym(ray_data(keys), i, RAY_SYM, keys->attrs) == id) return true;
+    }
+    return ray_env_get_local(id) != NULL;
+}
+
+/* A lambda literal, `fn` being the special form where it is written. */
+static bool key_lit_fn(ray_t* v, const key_pure_ctx_t* ctx) {
+    return key_literal_is_fn(v) && !key_name_bound(ray_sym_intern("fn", 2), ctx);
 }
 
 /* Bind a callee's parameter names (a SYM vector, or `[]` parsed as an
@@ -2347,7 +2382,7 @@ static bool key_name_pure(int64_t id, ray_t** args, int64_t nargs, int depth, co
         /* The argument names something: follow it where the call was
          * written, not in this body's bindings. */
         if (a->type == -RAY_SYM && !(a->attrs & ATTR_QUOTED)) return key_name_pure(a->i64, args, nargs, depth + 1, &at);
-        if (key_literal_is_fn(a)) return key_literal_call_pure(a, args, nargs, depth, &at);
+        if (key_lit_fn(a, &at)) return key_literal_call_pure(a, args, nargs, depth, &at);
         return !called;                                          /* computed, or a literal datum */
     }
     ray_t* v = NULL;
@@ -2419,6 +2454,38 @@ static bool key_value_callables_pure(ray_t* v, int depth, const key_pure_ctx_t* 
     return ray_is_atom(v) || ray_is_vec(v);
 }
 
+/* The one builtin a head means, as key_name_pure resolves it, or NULL
+ * when it can mean anything else: a lambda, data, an unknown value, two
+ * builtins (a `let` in a branch), nothing. */
+static ray_t* key_head_unique_builtin(int64_t id, const key_pure_ctx_t* ctx, int depth) {
+    if (depth > 16) return NULL;
+    ray_t* found = NULL;
+    for (int i = ctx->n - 1; i >= 0; i--) {
+        const key_bind_t* b = &ctx->binds[i];
+        if (b->name != id) continue;
+        if (!((b->kind == KB_ALIAS || b->kind == KB_ARG) && b->val && b->val->type == -RAY_SYM &&
+              !(b->val->attrs & ATTR_QUOTED))) return NULL;
+        key_pure_ctx_t at = key_bind_view(b);
+        ray_t* r = key_head_unique_builtin(b->val->i64, &at, depth + 1);
+        if (!r || (found && r != found)) return NULL;
+        found = r;
+        if (!b->cond) return found;
+    }
+    ray_t* v = NULL;
+    if (ctx->closure) {
+        ray_t* keys = ray_dict_keys(ctx->closure);
+        ray_t* vals = ray_dict_vals(ctx->closure);
+        for (int64_t i = 0; keys && vals && i < keys->len; i++)
+            if (ray_read_sym(ray_data(keys), i, RAY_SYM, keys->attrs) == id) { v = ((ray_t**)ray_data(vals))[i]; break; }
+    }
+    if (!v) v = ray_env_get_local(id);
+    if (!v) v = ray_env_get_global(id);
+    if (!v && ray_sym_is_dotted(id)) v = ray_env_get(id);
+    if (!v || !(v->type == RAY_UNARY || v->type == RAY_BINARY || v->type == RAY_VARY)) return NULL;
+    if (found && v != found) return NULL;
+    return v;
+}
+
 /* Argument text whose value's every callable is known to be pure (see
  * key_value_callables_pure): such data, a name bound to it, a pure lambda
  * literal, or a `list`/`enlist` of such arguments.  Anything computed is
@@ -2432,10 +2499,14 @@ static bool key_arg_callables_pure(ray_t* e, int depth, const key_pure_ctx_t* ct
             const key_bind_t* b = &ctx->binds[i];
             if (b->name != id) continue;
             key_pure_ctx_t at = key_bind_view(b);
-            if (b->kind == KB_PURE) return true;
-            if (b->kind == KB_LIT) return key_literal_call_pure(b->val, NULL, 0, depth, &at);
-            if (b->kind == KB_ALIAS || (b->kind == KB_ARG && b->val)) return key_arg_callables_pure(b->val, depth + 1, &at);
-            return false;   /* unknown, or rebound in a loop */
+            bool pure = b->kind == KB_PURE ? true
+                      : b->kind == KB_LIT ? key_literal_call_pure(b->val, NULL, 0, depth, &at)
+                      : (b->kind == KB_ALIAS || (b->kind == KB_ARG && b->val))
+                        ? key_arg_callables_pure(b->val, depth + 1, &at)
+                      : false;   /* unknown, or rebound in a loop */
+            /* A `let` in a branch may not have run: what the name meant
+             * before it must be pure as well, as key_name_pure requires. */
+            if (!pure || !b->cond) return pure;
         }
         ray_t* v = NULL;
         if (ctx->closure) {
@@ -2451,10 +2522,14 @@ static bool key_arg_callables_pure(ray_t* e, int depth, const key_pure_ctx_t* ct
     }
     if (e->type != RAY_LIST) return e->type != RAY_SYM && (ray_is_atom(e) || ray_is_vec(e));
     if (e->attrs & ATTR_QUOTED || !e->len) return false;
-    if (key_literal_is_fn(e)) return key_literal_call_pure(e, NULL, 0, depth, ctx);
+    if (key_lit_fn(e, ctx)) return key_literal_call_pure(e, NULL, 0, depth, ctx);
     ray_t** es = ray_data(e);
     if (!es[0] || es[0]->type != -RAY_SYM || (es[0]->attrs & ATTR_QUOTED)) return false;
-    if (es[0]->i64 != ray_sym_intern("list", 4) && es[0]->i64 != ray_sym_intern("enlist", 6)) return false;
+    /* The list constructors, by what the head means, not how it is spelled:
+     * a local list or enlist is a call through it. */
+    ray_t* h = key_head_unique_builtin(es[0]->i64, ctx, 0);
+    if (!h || (h->i64 != (int64_t)(uintptr_t)ray_list_fn && h->i64 != (int64_t)(uintptr_t)ray_enlist_fn))
+        return false;
     for (int64_t i = 1; i < e->len; i++)
         if (!key_arg_callables_pure(es[i], depth + 1, ctx)) return false;
     return true;
@@ -2510,11 +2585,11 @@ static int key_higher_order_pure(int64_t id, ray_t** es, int64_t n, int depth, k
         for (int64_t a = 0; a + 1 < n && a < 8; a++) {
             if (!(key_hof_table[k].calls & (1u << a))) continue;
             ray_t* arg = es[a + 1];
-            if (!key_literal_is_fn(arg) && !key_arg_callables_pure(arg, depth + 1, ctx)) return 0;
+            if (!key_lit_fn(arg, ctx) && !key_arg_callables_pure(arg, depth + 1, ctx)) return 0;
         }
         shortcut = shortcut == -1 ? key_hof_table[k].shortcut : -2;
     }
-    if (!any || nc != 1 || shortcut <= 0 || n < 3 || !key_literal_is_fn(es[1])) return -1;
+    if (!any || nc != 1 || shortcut <= 0 || n < 3 || !key_lit_fn(es[1], ctx)) return -1;
     bool acc = shortcut == HOF_ACC;
     for (int64_t i = 2; i < n; i++)
         if (!key_arg_callables_pure(es[i], depth + 1, ctx)) return -1;
@@ -2531,19 +2606,23 @@ static int key_higher_order_pure(int64_t id, ray_t** es, int64_t n, int depth, k
                                         acc && i == 0 ? KB_UNKNOWN : KB_PURE, NULL, NULL, 0, false };
     for (int64_t i = 2; i < es[1]->len; i++)
         if (!key_expr_pure(le[i], depth + 1, &lctx)) return 0;
+    /* The shortcut replaces the walk of the call's arguments: evaluating
+     * them must be pure too. */
+    for (int64_t i = 2; i < n; i++)
+        if (!key_expr_pure(es[i], depth + 1, ctx)) return 0;
     return 1;
 }
 
 /* The names `let` binds anywhere in `expr`, outside lambda literals and
  * quoted text, added to names[*nn] once each.  False when there are more
  * than the walk can bind or the text is too deep. */
-static bool key_collect_lets(ray_t* expr, int64_t* names, int* nn, int depth) {
+static bool key_collect_lets(ray_t* expr, int64_t* names, int* nn, int depth, const key_pure_ctx_t* ctx) {
     if (!expr || expr->type != RAY_LIST || (expr->attrs & ATTR_QUOTED) || !expr->len) return true;
     if (depth > 32) return false;
     ray_t** es = ray_data(expr);
     if (es[0] && es[0]->type == -RAY_SYM && !(es[0]->attrs & ATTR_QUOTED)) {
         int64_t id = es[0]->i64;
-        if (id == ray_sym_intern("fn", 2) || id == ray_sym_intern("quote", 5)) return true;
+        if ((id == ray_sym_intern("fn", 2) || id == ray_sym_intern("quote", 5)) && !key_name_bound(id, ctx)) return true;
         if (id == ray_sym_intern("let", 3) && expr->len == 3 && es[1] && es[1]->type == -RAY_SYM) {
             bool seen = false;
             for (int i = 0; i < *nn && !seen; i++) seen = names[i] == es[1]->i64;
@@ -2554,7 +2633,7 @@ static bool key_collect_lets(ray_t* expr, int64_t* names, int* nn, int depth) {
         }
     }
     for (int64_t i = 0; i < expr->len; i++)
-        if (!key_collect_lets(es[i], names, nn, depth + 1)) return false;
+        if (!key_collect_lets(es[i], names, nn, depth + 1, ctx)) return false;
     return true;
 }
 
@@ -2571,11 +2650,11 @@ static bool key_expr_pure(ray_t* expr, int depth, key_pure_ctx_t* ctx) {
     if (!head) return false;
     int64_t first_arg = 1;
     if (head->type == RAY_LIST) {
-        if (!key_literal_is_fn(head)) return false;          /* a computed callee */
+        if (!key_lit_fn(head, ctx)) return false;            /* a computed callee */
         if (!key_literal_call_pure(head, es + 1, expr->len - 1, depth, ctx)) return false;
     } else if (head->type == -RAY_SYM && !(head->attrs & ATTR_QUOTED)) {
         int64_t id = head->i64;
-        if (key_pure_form(id)) {
+        if (key_pure_form(id) && !key_name_bound(id, ctx)) {
             if (id == ray_sym_intern("quote", 5)) return true;
             if (id == ray_sym_intern("fn", 2)) return key_literal_call_pure(expr, NULL, 0, depth, ctx);
             if (id == ray_sym_intern("let", 3) && expr->len == 3 && es[1] && es[1]->type == -RAY_SYM &&
@@ -2585,7 +2664,7 @@ static bool key_expr_pure(ray_t* expr, int depth, key_pure_ctx_t* ctx) {
                 if (ctx->n >= KEY_PURE_MAX_BIND) return false;
                 ray_t* val = es[2];
                 uint8_t kind = KB_UNKNOWN;
-                if (key_literal_is_fn(val)) kind = KB_LIT;    /* checked where it is called */
+                if (key_lit_fn(val, ctx)) kind = KB_LIT;      /* checked where it is called */
                 else if (val && val->type == -RAY_SYM && !(val->attrs & ATTR_QUOTED)) kind = KB_ALIAS;
                 if (kind != KB_LIT && !key_expr_pure(val, depth + 1, ctx)) return false;
                 ctx->binds[ctx->n] = (key_bind_t){ es[1]->i64, kind, kind == KB_UNKNOWN ? NULL : val, ctx, ctx->n, ctx->cond > 0 };
@@ -2603,7 +2682,7 @@ static bool key_expr_pure(ray_t* expr, int depth, key_pure_ctx_t* ctx) {
     /* After its first operand a conditional or loop form's operands may
      * not run: a `let` there is conditional.  In a try body a raise can
      * skip any `let`, so the whole form is. */
-    bool is_form = head->type == -RAY_SYM && key_pure_form(head->i64);
+    bool is_form = head->type == -RAY_SYM && key_pure_form(head->i64) && !key_name_bound(head->i64, ctx);
     bool is_try = is_form && head->i64 == ray_sym_intern("try", 3);
     bool is_loop = is_form && (head->i64 == ray_sym_intern("while", 5) || head->i64 == ray_sym_intern("times", 5));
     bool branches = is_form &&
@@ -2620,7 +2699,7 @@ static bool key_expr_pure(ray_t* expr, int depth, key_pure_ctx_t* ctx) {
             /* A lambda object spliced into the text is called as it is. */
             if (!key_lambda_call_pure(h, NULL, 0, depth + 1, ctx)) return false;
         } else {
-            bool literal = h && (key_literal_is_fn(h) ||
+            bool literal = h && (key_lit_fn(h, ctx) ||
                                  (h->type == -RAY_SYM && (h->attrs & ATTR_QUOTED)) ||
                                  (h->type != RAY_LIST && h->type != -RAY_SYM));
             if (!literal && !key_arg_callables_pure(h, depth + 1, ctx)) return false;
@@ -2633,7 +2712,7 @@ static bool key_expr_pure(ray_t* expr, int depth, key_pure_ctx_t* ctx) {
         int64_t names[KEY_PURE_MAX_BIND];
         int nn = 0;
         for (int64_t i = first_arg; i < expr->len; i++)
-            if (!key_collect_lets(es[i], names, &nn, 0)) return false;
+            if (!key_collect_lets(es[i], names, &nn, 0, ctx)) return false;
         if (ctx->n + nn > KEY_PURE_MAX_BIND) return false;
         for (int i = 0; i < nn; i++)
             ctx->binds[ctx->n++] = (key_bind_t){ names[i], KB_LOOP, NULL, NULL, 0, true };
@@ -2727,6 +2806,11 @@ static ray_t* query_inline_walk(ray_t* expr, ray_t* tbl,
     }
     ray_t** es = ray_data(expr);
     int64_t fn_id = ray_sym_intern("fn", 2);
+    /* A call through a formal of the body being expanded (named quote, if
+     * or count as well): the expansion cannot hold it, the helper is
+     * called instead. */
+    if (es[0]->type == -RAY_SYM && !(es[0]->attrs & ATTR_QUOTED))
+        for (int i = nb - 1; i >= 0; i--) if (bindings[i].name == es[0]->i64) return NULL;
     if (es[0]->type == -RAY_SYM &&
         (es[0]->i64 == fn_id || es[0]->i64 == ray_sym_intern("let", 3) ||
          es[0]->i64 == ray_sym_intern("quote", 5))) {

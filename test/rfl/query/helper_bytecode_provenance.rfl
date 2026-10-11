@@ -543,6 +543,43 @@ CNT11 -- 6
 (set CNT11 0)
 (at (select {n: (count v) by: (ktl11 v) from: T10}) 'n) -- [6]
 CNT11 -- 6
+;; a name means its binding, not its spelling: a local list or enlist is a
+;; call through it, and a `let` in a branch keeps what the name meant before
+(set kls11 (fn [v] (let list (fn [x] (set CNT11 (+ CNT11 1)) (enlist x))) (map (fn [x] x) (list 1)) (kg10 v)))
+(set CNT11 0)
+(at (select {n: (count v) by: (kls11 v) from: T10}) 'n) -- [6]
+CNT11 -- 6
+(set kle11 (fn [v] (let enlist (fn [x] (set CNT11 (+ CNT11 1)) (list x x))) (map (fn [x] x) (enlist 1)) (kg10 v)))
+(set CNT11 0)
+(at (select {n: (count v) by: (kle11 v) from: T10}) 'n) -- [6]
+CNT11 -- 6
+(set kcb11 (fn [v] (let f (fn [x] (set CNT11 (+ CNT11 1)) x)) (if false (let f (fn [x] x))) (map (fn [g] (g 1)) (list f)) (kg10 v)))
+(set CNT11 0)
+(at (select {n: (count v) by: (kcb11 v) from: T10}) 'n) -- [6]
+CNT11 -- 6
+(set kcc11 (fn [v] (let f (at D11 'a)) (if false (let f (fn [x] x))) (map (fn [g] (g 1)) (list f)) (kg10 v)))
+(set CNT11 0)
+(at (select {n: (count v) by: (kcc11 v) from: T10}) 'n) -- [6]
+CNT11 -- 6
+;; a local list that is pure itself but hands back an effectful function
+(set klp11 (fn [v] (let list (fn [x] (enlist (at D11 'a)))) (map (fn [g] (g 1)) (list 1)) (kg10 v)))
+(set CNT11 0)
+(at (select {n: (count v) by: (klp11 v) from: T10}) 'n) -- [6]
+CNT11 -- 6
+;; ... so is a parameter spelled like a special form, and an `fn` that is a
+;; parameter does not make a lambda literal
+(set kif11 (fn [v if] (if v) (kg10 v)))
+(set CNT11 0)
+(at (select {n: (count v) by: (kif11 v (at D11 'a)) from: T10}) 'n) -- [6]
+CNT11 -- 6
+(set kfn11 (fn [v fn] (let g (fn 1 v)) (kg10 v)))
+(set CNT11 0)
+(at (select {n: (count v) by: (kfn11 v (at D211 'b)) from: T10}) 'n) -- [6]
+CNT11 -- 6
+;; ... and an effectful builtin bound to another name is still effectful
+(set myshow11 show)
+(set kms11 (fn [v] (myshow11 'once) (> (- v (avg v)) 0)))
+(at (select {n: (count v) by: (kms11 v) from: T10}) 'n) -- [6]
 ;; ... while a literal fallback value of try keeps the whole column
 (set khv11 (fn [v] (let t (try (raise "x") 'none)) (kg10 v)))
 (at (select {n: (count v) by: (khv11 v) from: T10}) 'n) -- [3 3]

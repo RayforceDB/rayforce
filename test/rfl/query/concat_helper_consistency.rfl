@@ -98,6 +98,18 @@ G -- 700
 ;; ... and a pure expression, inlined once for every group, reads it as well
 (set G 1000)
 (at (update {r: (hg x) by: k from: TG}) 'r) -- [1021 1024 1027 1030 1033 1036 1019 1021 1024 1027 1030 1033 1036 1019 1021 1024 1027 1030 1033 1036]
+;; A helper's parameter spelled like a special form is called, on the planned
+;; path and when the helper is expanded; so is a caller's local of that name
+(set TQ (table [v] (list [1 2 3])))
+(set hq (fn [quote x] (quote x)))
+(at (select {r: (hq neg v) from: TQ}) 'r) -- [-1 -2 -3]
+(set hiff (fn [if x] (if x)))
+(at (select {r: (hiff neg v) from: TQ}) 'r) -- [-1 -2 -3]
+(at ((fn [quote] (select {r: (quote v) from: TQ})) neg) 'r) -- [-1 -2 -3]
+;; a helper's free name is the global, not a caller's local of that name
+(set hrv (fn [v] (reverse v)))
+(set hrv2 (fn [v] 1 (reverse v)))
+(at ((fn [reverse] (select {r: (hrv v) e: (reverse v) from: TQ})) neg) 'r) -- (at ((fn [reverse] (select {r: (hrv2 v) from: TQ})) neg) 'r)
 ;; A quoted symbol inside a helper body is the symbol on every path, even
 ;; when a column has that spelling and whatever operator consumes it.
 (set hqt (fn [v] (concat v 't)))
