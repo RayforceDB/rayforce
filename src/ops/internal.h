@@ -47,6 +47,10 @@
 #include <string.h>
 #include <math.h>
 
+/* True if every leaf is constant or reduced to a scalar. */
+bool op_tree_is_scalar(ray_graph_t* g, uint32_t id);
+bool op_tree_is_atom(ray_graph_t* g, uint32_t id);
+
 /* Borrow only while the symbol table stays read-only through the dispatch
  * barrier. Workers compare or copy source-domain codes without interning.
  * File-domain lookup keeps its own publication/lifetime contract. */
@@ -1822,6 +1826,9 @@ void ray_group_winners(ray_group_winner_fn fn, void* context, const int64_t* row
 
 /* Gather winning group rows, retaining source domains and native types. */
 ray_t* ray_group_gather(ray_t* column, const int64_t* rows, int64_t count);
+/* Keep a grouped key column's "may have nulls" flag only when a key value is
+ * null (vectorised, pool-split scan); see agg_engine.c. */
+void   ray_group_key_settle_nulls(ray_t* kc);
 
 
 /* A scalar `where:` predicate holds for every row or none.  It needs a truth

@@ -1637,11 +1637,14 @@ static inline bool group_has_keys(ray_graph_t* g, ray_op_t* group_op) {
 
 /* True when every leaf of the op tree under `id` is a constant or, with
  * `reduced`, sits under a reduction. */
-static bool op_tree_leaves(ray_graph_t* g, uint32_t id, bool reduced, int depth) {
+static bool op_tree_leaves(ray_graph_t* g, uint32_t id, bool reduced, bool atoms_only, int depth) {
     if (id >= g->node_count || depth > 64) return false;
     ray_op_t* n = &g->nodes[id];
     switch (n->opcode) {
-    case OP_CONST: return true;
+    case OP_CONST: {
+        ray_op_ext_t* x = find_ext(g, id);
+        return !atoms_only || (x && x->literal && ray_is_atom(x->literal));
+    }
     case OP_SCAN:  return false;
     case OP_SUM: case OP_PROD: case OP_ALL: case OP_ANY:
     case OP_MIN: case OP_MAX:
@@ -1653,10 +1656,17 @@ static bool op_tree_leaves(ray_graph_t* g, uint32_t id, bool reduced, int depth)
     }
     if (n->arity == 0) return false;
     for (uint32_t i = 0; i < n->arity && i < 2; i++)
-        if (!op_tree_leaves(g, n->in_id[i], reduced, depth + 1)) return false;
+        if (!op_tree_leaves(g, n->in_id[i], reduced, atoms_only, depth + 1)) return false;
     if (n->opcode == OP_IF) {           /* the else branch rides in the ext */
         ray_op_ext_t* x = find_ext(g, id);
-        if (!x || !op_tree_leaves(g, x->third_in, reduced, depth + 1)) return false;
+        if (!x || !op_tree_leaves(g, x->third_in, reduced, atoms_only, depth + 1)) return false;
+    }
+    if (n->opcode == OP_CONCAT) {
+        ray_op_ext_t* x = find_ext(g, id);
+        if (!x) return false;
+        uint32_t* extra = (uint32_t*)(x + 1);
+        for (int64_t i = 2; i < x->sym; i++)
+            if (!op_tree_leaves(g, extra[i - 2], reduced, atoms_only, depth + 1)) return false;
     }
     return true;
 }
@@ -1665,14 +1675,19 @@ static bool op_tree_leaves(ray_graph_t* g, uint32_t id, bool reduced, int depth)
  * leaf is a constant or sits under a reduction.  Tells a scalar-only SELECT
  * column (`(+ (sum x) 0)`) from a one-row one, which the column lengths
  * cannot on a one-row table (#675). */
-static bool op_tree_is_scalar(ray_graph_t* g, uint32_t id) {
-    return op_tree_leaves(g, id, true, 0);
+bool op_tree_is_scalar(ray_graph_t* g, uint32_t id) {
+    return op_tree_leaves(g, id, true, false, 0);
+}
+
+/* As above, but vector constants do not count as scalar atoms. */
+bool op_tree_is_atom(ray_graph_t* g, uint32_t id) {
+    return op_tree_leaves(g, id, true, true, 0);
 }
 
 /* True when the op tree under `id` reads no column at all, not even under a
  * reduction: a literal, or an expression over literals. */
 static bool op_tree_is_const(ray_graph_t* g, uint32_t id) {
-    return op_tree_leaves(g, id, false, 0);
+    return op_tree_leaves(g, id, false, false, 0);
 }
 
 /* Execute a pushed-down filter interposed as a GROUP's inputs[0]
@@ -3745,6 +3760,19 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
             int64_t nr_in = ray_table_nrows(input);
             if (result && !RAY_IS_ERR(result)) {
                 int64_t rc = ray_table_ncols(result);
+                /* A collection projection may change the row count. Use
+                 * its length for scalar broadcasting; unequal non-scalar
+                 * lengths are rejected below, independently of column order. */
+                int64_t broadcast_len = nr_in;
+                bool has_collection = false;
+                for (int64_t c = 0; c < rc; c++) {
+                    ray_t* cv = ray_table_get_col_idx(result, c);
+                    if (!cv || cv->type < 0) continue;
+                    int64_t len = ray_parted_nrows(cv);
+                    if (len == 1) continue;
+                    if (!has_collection) broadcast_len = len;
+                    has_collection = true;
+                }
                 bool has_full = false;
                 if (nr_in != 1) {
                     for (int64_t c = 0; c < rc; c++) {
@@ -3768,6 +3796,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                         if (!op_tree_is_const(g, columns[c])) all_const = false;
                     has_full = all_const;
                 }
+                if (has_collection) has_full = true;
                 /* Every column a scalar: the reductions inside them already
                  * walked the where: selection (exec_reduction), so the
                  * one-row result is final.  Left installed, the selection
@@ -3778,11 +3807,14 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     g->selection = NULL;
                 }
                 /* A LIST here is an atom enlist has no vector for (F32). */
-                for (int64_t c = 0; nr_in != 1 && has_full && c < rc; c++) {
+                for (int64_t c = 0; broadcast_len != 1 && has_full && c < rc; c++) {
                     ray_t* cv = ray_table_get_col_idx(result, c);
                     if (!cv || cv->type < 0 || RAY_IS_PARTED(cv->type) ||
                         cv->type == RAY_MAPCOMMON || cv->len != 1) continue;
-                    ray_t* n_obj = make_i64(nr_in);
+                    /* One input row does not turn a row-aligned expression
+                     * into a scalar. Only constants/reductions may expand. */
+                    if (nr_in == 1 && !op_tree_is_scalar(g, columns[c])) continue;
+                    ray_t* n_obj = make_i64(broadcast_len);
                     ray_t* wide = n_obj ? ray_take_fn(cv, n_obj) : ray_error("oom", NULL);
                     if (n_obj) ray_release(n_obj);
                     if (!wide || RAY_IS_ERR(wide)) {
@@ -3793,6 +3825,24 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     }
                     ray_table_set_col_idx(result, c, wide);
                     ray_release(wide);
+                }
+                /* Length-changing constant projections must not silently
+                 * truncate or pad the other columns during materialization. */
+                ray_t* shape_err = ray_table_validate_rectangular(result, "select");
+                if (shape_err) {
+                    ray_release(result);
+                    g->table = saved_table;
+                    ray_release(input);
+                    return shape_err;
+                }
+                if (g->selection && ray_table_nrows(result) != nr_in) {
+                    ray_t* err = ray_error("length",
+                        "select: collection projection has %lld rows; where requires %lld input-aligned rows",
+                        (long long)ray_table_nrows(result), (long long)nr_in);
+                    ray_release(result);
+                    g->table = saved_table;
+                    ray_release(input);
+                    return err;
                 }
             }
 

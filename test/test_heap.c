@@ -1426,7 +1426,7 @@ static test_result_t test_alloc_copy_dict_block(void) {
  * Test: exercise ray_release_owned_refs LAMBDA branch by building a
  * properly-sized LAMBDA block and releasing it. */
 
-#include "lang/eval.h"   /* LAMBDA_NFO, LAMBDA_DBG */
+#include "lang/eval.h"   /* LAMBDA_SLOTS, LAMBDA_NFO, LAMBDA_DBG */
 
 static test_result_t test_release_lambda_owned_refs(void) {
     /* Lambda data layout: 7 ray_t* slots.
@@ -1435,11 +1435,12 @@ static test_result_t test_release_lambda_owned_refs(void) {
      * data[5]    = NFO  (ray_t*)
      * data[6]    = DBG  (ray_t*)
      *
-     * Alloc enough for 7 pointers.  ray_alloc_copy treats lambda as atom
+     * Alloc the full LAMBDA_SLOTS layout (the heap walks every pointer
+     * slot on free).  ray_alloc_copy treats lambda as atom
      * (data_size=0) so we can't use it here.  Instead: alloc, set type,
      * give children rc=2 so they survive one release, then ray_free(lam)
      * which calls ray_release_owned_refs → LAMBDA branch. */
-    size_t lam_data = 7 * sizeof(ray_t*);
+    size_t lam_data = LAMBDA_SLOTS * sizeof(ray_t*);
     ray_t* lam = ray_alloc(lam_data);
     TEST_ASSERT_NOT_NULL(lam);
     lam->type = RAY_LAMBDA;
@@ -1933,7 +1934,7 @@ static test_result_t test_retain_owned_refs_lambda_null_slots(void) {
     /* LAMBDA branch (L611-619): mix of NULL and live child slots exercises
      * both sides of the `slots[i] && !RAY_IS_ERR(slots[i])` guard and the
      * `if (LAMBDA_NFO/DBG)` NULL guards. */
-    size_t lam_data = 7 * sizeof(ray_t*);
+    size_t lam_data = LAMBDA_SLOTS * sizeof(ray_t*);
     ray_t* lam = ray_alloc(lam_data);
     TEST_ASSERT_NOT_NULL(lam);
     lam->type = RAY_LAMBDA;

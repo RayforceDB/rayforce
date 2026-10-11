@@ -55,6 +55,30 @@
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
+
+/* Row provenance of the value the most recent ray_eval returned: 1 derived
+ * from the active query's rows (a query frame's column binding, a helper's
+ * source column, a row-wise builtin over one, a compiled helper's result),
+ * 0 not, -1 unknown (an interpreted closure's result).  Read by the caller
+ * right after the ray_eval that produced it. */
+static _Thread_local int8_t g_eval_rows = -1;
+
+/* Tri-state combination: a row operand makes the result rows; otherwise an
+ * unknown operand makes it unknown. */
+static inline int8_t rows_join(int8_t a, int8_t b) {
+    if (a == 1 || b == 1) return 1;
+    if (a < 0 || b < 0) return -1;
+    return 0;
+}
+/* The VM's encoding of the same: 0 no, 1 rows, 2 unknown. */
+static inline uint8_t vrows_join(uint8_t a, uint8_t b) {
+    if (a == 1 || b == 1) return 1;
+    if (a == 2 || b == 2) return 2;
+    return 0;
+}
+static inline uint8_t vrows_from(int8_t r) { return r < 0 ? 2 : (uint8_t)r; }
+static inline int8_t  vrows_to(uint8_t r)  { return r == 2 ? -1 : (int8_t)r; }
+
 #include <math.h>
 #include <signal.h>
 #include <time.h>
@@ -279,6 +303,20 @@ static ray_t* try_sum_affine_expr(ray_t* expr, int* handled) {
  * (__VM->raise_val) — it must survive the unwind across any number of
  * bytecode invocations on this thread's stack. */
 
+/* The marker ray_return_fn raises: an error whose code is "return".  The
+ * value travels in __VM->return_val; ray_take_return turns both back into
+ * the value at a lambda's call boundary. */
+static inline bool is_return_marker(ray_t* e) {
+    return e && RAY_IS_ERR(e) && e->slen == 6 && memcmp(e->sdata, "return", 6) == 0;
+}
+static ray_t* ray_take_return(ray_t* marker) {
+    ray_error_free(marker);
+    ray_t* val = __VM->return_val;
+    __VM->return_val = NULL;
+    if (!val) { val = RAY_NULL_OBJ; ray_retain(val); }
+    return val;
+}
+
 /* (raise value) — raise an error with the given value */
 ray_t* ray_raise_fn(ray_t* val) {
     if (__VM->raise_val) ray_release(__VM->raise_val);
@@ -298,11 +336,30 @@ ray_t* ray_raise_fn(ray_t* val) {
  *     ((fn [data] (try (raise "x") data)) 123)  ->  123
  *
  * Borrows both `handler` and `err_val`; returns a new owned ref. */
+static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
+                               bool query, uint64_t row_args, bool named,
+                               int8_t* out_rows);
+
 ray_t* ray_try_handle(ray_t* handler, ray_t* err_val) {
     if (handler->type == RAY_LAMBDA || handler->type == RAY_UNARY)
         return call_fn1(handler, err_val);   /* borrows err_val */
     ray_retain(handler);
     return handler;                          /* fallback value */
+}
+
+/* ray_try_handle that also reports the handler value's row provenance:
+ * a lambda handler's result flag, -1 (unknown) for a builtin, and
+ * `fallback_rows` for a plain fallback value. */
+static ray_t* try_handle_rows(ray_t* handler, ray_t* err_val, int8_t fallback_rows, int8_t* rows) {
+    *rows = -1;
+    if (handler->type == RAY_LAMBDA) {
+        ray_t* args[1] = { err_val };
+        return call_lambda_impl(handler, args, 1, ray_active_query_table() != NULL, 0, true, rows);
+    }
+    if (handler->type == RAY_UNARY) return call_fn1(handler, err_val);
+    *rows = fallback_rows;
+    ray_retain(handler);
+    return handler;
 }
 
 /* (try expr handler) — evaluate expr; on error, dispatch the (evaluated)
@@ -312,6 +369,7 @@ ray_t* ray_try_handle(ray_t* handler, ray_t* err_val) {
 ray_t* ray_try_fn(ray_t* expr, ray_t* handler_expr) {
     ray_t* result = ray_eval(expr);
     if (!RAY_IS_ERR(result)) return result;
+    if (is_return_marker(result)) return result;   /* a `return` is not an error */
 
     /* Get error value (set by raise, or default for runtime errors) */
     ray_t* err_val = __VM->raise_val;
@@ -325,9 +383,13 @@ ray_t* ray_try_fn(ray_t* expr, ray_t* handler_expr) {
         return handler;
     }
 
-    ray_t* handler_result = ray_try_handle(handler, err_val);
+    /* A lambda handler reports its result's provenance; a fallback value
+     * keeps the one its expression had (g_eval_rows after evaluating it). */
+    int8_t handler_rows = -1;
+    ray_t* handler_result = try_handle_rows(handler, err_val, g_eval_rows, &handler_rows);
     ray_release(err_val);
     ray_release(handler);
+    g_eval_rows = handler_rows;
     return handler_result;
 }
 
@@ -1912,11 +1974,12 @@ ray_t* ray_let_fn(ray_t* name_obj, ray_t* val_expr) {
         return ray_error("type", "let: name must be a symbol, got %s", ray_type_name(name_obj->type));
     ray_t* val = ray_eval(val_expr);
     if (RAY_IS_ERR(val)) return val;
+    uint8_t rows = vrows_from(g_eval_rows);   /* the local keeps its value's provenance */
     /* Materialize lazy handles before binding */
     if (ray_is_lazy(val))
         val = ray_lazy_materialize(val);
     if (RAY_IS_ERR(val)) return val;
-    ray_err_t err = ray_env_set_local(name_obj->i64, val);
+    ray_err_t err = ray_env_set_local_rows(name_obj->i64, val, rows);
     if (err != RAY_OK) { ray_release(val); return ray_error(ray_err_code_str(err), NULL); }
     return val;
 }
@@ -1926,6 +1989,9 @@ ray_t* ray_cond_fn(ray_t** args, int64_t n) {
     if (n < 2) return ray_error("domain", "if: expected at least 2 args (cond then), got %lld", (long long)n);
     ray_t* cond = ray_eval(args[0]);
     if (RAY_IS_ERR(cond)) return cond;
+    /* A vector condition tested whole: the expression may have needed
+     * row-by-row evaluation (see the opaque by: key). */
+    if (!ray_is_atom(cond)) __VM->rows_cond++;
     /* Materialize lazy handles before testing truthiness */
     if (ray_is_lazy(cond))
         cond = ray_lazy_materialize(cond);
@@ -2077,6 +2143,179 @@ ray_t* ray_times_fn(ray_t** args, int64_t n) {
 
 /* (fn [params...] body...) — create a lambda object.
  * Stores params list and body expressions in data area. */
+/* Sym ID of "self" for call_lambda's frame.  It belongs to the current sym
+ * table: runtime destroy tears the table down and the next runtime can give
+ * "self" a different ID, so ray_lang_destroy resets it, as ray_compile_reset
+ * does for the compiler's special-form IDs.  A stale ID bound the lambda under
+ * a name that was no longer "self", shadowing whatever variable owned it. */
+static int64_t g_call_self_sym = -1;
+
+/* Closures made by interpreted code (the top level, a lambda that could not
+ * compile, a literal inside a special form the compiler hands to the tree
+ * walker) share one compiled template per literal and capture set, as
+ * closures made by compiled code share theirs (OP_MKCLOSURE): the body's
+ * bytecode depends only on which captured names it mentions.  The entry
+ * retains the literal's parameter and body nodes, so their addresses stay
+ * its own while it lives; a literal is matched by them and by its capture
+ * names.  A lambda that is query text (LAMBDA_CAPQ) stays interpreted and
+ * never comes here. */
+enum { CLOSURE_TMPL_SLOTS = 256, CLOSURE_TMPL_MAX_BODY = 8 };
+typedef struct {
+    ray_t*  params;    /* the literal's parameter node */
+    ray_t*  body[CLOSURE_TMPL_MAX_BODY];   /* every body node: a literal built
+                       * for eval can share first and last nodes with another
+                       * and differ in the middle */
+    int64_t nbody;
+    ray_t*  mentioned; /* the symbols the body mentions (I64 vector) */
+    bool    dynamic;   /* the body uses eval or resolve: every capture counts */
+    bool    failed;    /* the body did not compile: its closures stay interpreted */
+    bool    baked;     /* a top-level definition: builtins baked at compile time,
+                        * valid while no function-valued global was rebound */
+    uint64_t fn_gen;   /* ray_env_fn_generation() when it was compiled */
+    ray_t*  names;     /* capture names (SYM vector) or NULL */
+    ray_t*  tmpl;      /* the compiled template, or NULL when `failed` */
+} closure_tmpl_t;
+enum { CLOSURE_TMPL_MAX_WEIGHT = 65536 };   /* vector elements a cached literal may hold */
+static _Thread_local closure_tmpl_t g_closure_tmpl[CLOSURE_TMPL_SLOTS];
+static _Thread_local uint32_t g_closure_tmpl_next;
+static _Thread_local uint64_t g_closure_tmpl_epoch;
+
+static void closure_tmpl_drop(closure_tmpl_t* e) {
+    if (e->params) ray_release(e->params);
+    for (int64_t i = 0; i < e->nbody && i < CLOSURE_TMPL_MAX_BODY; i++) if (e->body[i]) ray_release(e->body[i]);
+    if (e->mentioned) ray_release(e->mentioned);
+    if (e->names) ray_release(e->names);
+    if (e->tmpl) ray_release(e->tmpl);
+    memset(e, 0, sizeof *e);
+}
+
+/* The runtime is going away with everything the entries retain: release
+ * them (called by the thread destroying it, before the heap goes). */
+static void closure_tmpl_reset(void) {
+    for (int i = 0; i < CLOSURE_TMPL_SLOTS; i++) closure_tmpl_drop(&g_closure_tmpl[i]);
+    g_closure_tmpl_next = 0;
+    g_closure_tmpl_epoch = 0;
+}
+
+/* Another thread's table after the runtime it filled it under was
+ * destroyed and a new one created: its objects are gone with that
+ * runtime's heap, so the entries are forgotten, not released. */
+static void closure_tmpl_forget(void) {
+    memset(g_closure_tmpl, 0, sizeof g_closure_tmpl);
+    g_closure_tmpl_next = 0;
+}
+
+/* Does `closure`'s capture set, filtered by the entry's mentioned symbols,
+ * spell the entry's names?  Walks the dict keys once, allocating nothing. */
+static bool closure_entry_names_match(const closure_tmpl_t* e, ray_t* closure) {
+    int64_t want = e->names ? e->names->len : 0;
+    if (!closure) return want == 0;
+    ray_t* keys = ray_dict_keys(closure);
+    if (!keys) return want == 0;
+    const int64_t* ment = e->mentioned ? (const int64_t*)ray_data(e->mentioned) : NULL;
+    int64_t nment = e->mentioned ? e->mentioned->len : 0;
+    int64_t at = 0;
+    for (int64_t i = 0; i < keys->len; i++) {
+        int64_t id = ray_read_sym(ray_data(keys), i, RAY_SYM, keys->attrs);
+        if (id == g_call_self_sym) continue;
+        bool counts = e->dynamic;
+        for (int64_t k = 0; !counts && k < nment; k++) counts = ment[k] == id;
+        if (!counts) continue;
+        if (at >= want || ray_read_sym(ray_data(e->names), at, RAY_SYM, e->names->attrs) != id) return false;
+        at++;
+    }
+    return at == want;
+}
+
+static void closure_share_from(ray_t* lambda, ray_t* tmpl) {
+    if (LAMBDA_BC(tmpl))     { ray_retain(LAMBDA_BC(tmpl));     LAMBDA_BC(lambda)     = LAMBDA_BC(tmpl); }
+    if (LAMBDA_CONSTS(tmpl)) { ray_retain(LAMBDA_CONSTS(tmpl)); LAMBDA_CONSTS(lambda) = LAMBDA_CONSTS(tmpl); }
+    if (LAMBDA_DBG(tmpl))    { ray_retain(LAMBDA_DBG(tmpl));    LAMBDA_DBG(lambda)    = LAMBDA_DBG(tmpl); }
+    LAMBDA_NLOCALS(lambda) = LAMBDA_NLOCALS(tmpl);
+    lambda->attrs |= RAY_FN_COMPILED;
+}
+
+static void closure_share_template(ray_t* lambda) {
+    ray_t* body = LAMBDA_BODY(lambda);
+    ray_t* params = LAMBDA_PARAMS(lambda);
+    if (!body || body->type != RAY_LIST || body->len == 0 || !params) return;
+    if (body->len > CLOSURE_TMPL_MAX_BODY) return;   /* compiles when called */
+    if (g_closure_tmpl_epoch != ray_sym_epoch()) {
+        if (g_closure_tmpl_epoch) closure_tmpl_forget();
+        g_closure_tmpl_epoch = ray_sym_epoch();
+    }
+    ray_t** bn = (ray_t**)ray_data(body);
+    /* The literal's nodes first: a known literal's mentioned symbols are
+     * in its entries, so the capture names cost a pass over the dict keys
+     * rather than a walk of the body. */
+    if (g_call_self_sym < 0) g_call_self_sym = ray_sym_intern("self", 4);
+    for (int i = 0; i < CLOSURE_TMPL_SLOTS; i++) {
+        closure_tmpl_t* e = &g_closure_tmpl[i];
+        if ((!e->tmpl && !e->failed) || e->params != params || e->nbody != body->len) continue;
+        bool same = true;
+        for (int64_t k = 0; k < body->len && same; k++) same = e->body[k] == bn[k];
+        if (same && closure_entry_names_match(e, LAMBDA_CLOSURE(lambda))) {
+            if (e->baked && !e->failed && e->fn_gen != ray_env_fn_generation()) {
+                /* A function-valued global was rebound since: the baked
+                 * builtins may be stale.  Compile this literal afresh. */
+                closure_tmpl_drop(e);
+                break;
+            }
+            if (e->failed) LAMBDA_NLOCALS(lambda) = -1;   /* known not to compile */
+            else closure_share_from(lambda, e->tmpl);
+            return;
+        }
+    }
+    /* A new literal, or a known one with another capture set. */
+    bool dynamic = false;
+    int64_t weight = 0;
+    ray_t* mentioned = ray_closure_mentioned_syms(body, &dynamic, &weight);
+    if (!mentioned) return;
+    if (weight > CLOSURE_TMPL_MAX_WEIGHT) {
+        /* A literal built around a large constant is not kept: the table
+         * would hold the constant alive after its closures are gone. */
+        ray_release(mentioned);
+        return;
+    }
+    ray_t* names = ray_closure_names_from(LAMBDA_CLOSURE(lambda), mentioned, dynamic);
+    ray_t* tmpl = ray_alloc(LAMBDA_SLOTS * sizeof(ray_t*));
+    if (!tmpl || RAY_IS_ERR(tmpl)) { if (names) ray_release(names); ray_release(mentioned); return; }
+    tmpl->type = RAY_LAMBDA;
+    tmpl->attrs = 0;
+    tmpl->len = 0;
+    memset(ray_data(tmpl), 0, LAMBDA_SLOTS * sizeof(ray_t*));
+    ray_retain(params); LAMBDA_PARAMS(tmpl) = params;
+    ray_retain(body);   LAMBDA_BODY(tmpl) = body;
+    if (LAMBDA_NFO(lambda)) { ray_retain(LAMBDA_NFO(lambda)); LAMBDA_NFO(tmpl) = LAMBDA_NFO(lambda); }
+    /* A literal written inside a function is a closure body: its free names
+     * resolve when it runs.  One written at the top level is a definition and
+     * keeps the builtins it names baked, as dev's named lambdas do. */
+    bool closure_body = __VM && __VM->lambda_depth > 0;
+    uint64_t fn_gen = ray_env_fn_generation();
+    bool compiled = ray_compile_with_captures(tmpl, names, closure_body);
+    if (!compiled) {
+        /* Not compilable: the closure stays interpreted, and the entry
+         * remembers that so later closures from the literal skip the
+         * attempt. */
+        ray_release(tmpl);
+        tmpl = NULL;
+        LAMBDA_NLOCALS(lambda) = -1;
+    }
+    closure_tmpl_t* e = &g_closure_tmpl[g_closure_tmpl_next++ % CLOSURE_TMPL_SLOTS];
+    closure_tmpl_drop(e);
+    ray_retain(params); e->params = params;
+    for (int64_t k = 0; k < body->len; k++) { ray_retain(bn[k]); e->body[k] = bn[k]; }
+    e->nbody = body->len;
+    e->mentioned = mentioned;   /* owned */
+    e->dynamic = dynamic;
+    e->failed = !compiled;
+    e->baked = !closure_body;
+    e->fn_gen = fn_gen;
+    e->names = names;   /* owned, may be NULL */
+    e->tmpl = tmpl;     /* owned, NULL when failed */
+    if (compiled) closure_share_from(lambda, tmpl);
+}
+
 ray_t* ray_fn(ray_t** args, int64_t n) {
     if (n < 2) return ray_error("domain", "fn: expected at least 2 args (params body), got %lld", (long long)n);
     /* args[0] = param vector (list of name symbols), args[1..n-1] = body exprs */
@@ -2113,18 +2352,25 @@ ray_t* ray_fn(ray_t** args, int64_t n) {
         }
     }
 
-    ray_t* closure = ray_env_capture_locals();
+    ray_t* caprows = NULL;
+    uint32_t capq = 0;
+    ray_t* closure = ray_env_capture_locals_rows(&caprows, &capq);
     if (closure && RAY_IS_ERR(closure)) return closure;
+    /* A lambda made inside a query is query text: it keeps the query's
+     * literal rule by running on the tree walker, so it is never compiled.
+     * The serial of the query frame marks it. */
+    if (!capq) capq = ray_env_query_serial();
 
-    /* Create lambda object with space for 8 slots:
-     * [0] params, [1] body, [2] bytecode, [3] constants, [4] n_locals,
-     * [5] nfo (source location), [6] dbg (debug metadata), [7] closure. */
-    ray_t* lambda = ray_alloc(8 * sizeof(ray_t*));
-    if (!lambda) { ray_release(closure); return ray_error("oom", NULL); }
+    /* Create lambda object (layout in eval.h): params, body, bytecode,
+     * constants, n_locals, nfo, dbg, closure, capture row flags, query. */
+    ray_t* lambda = ray_alloc(LAMBDA_SLOTS * sizeof(ray_t*));
+    if (!lambda) { ray_release(closure); if (caprows) ray_release(caprows); return ray_error("oom", NULL); }
     lambda->type = RAY_LAMBDA;
     lambda->attrs = 0;
     lambda->len = 0;
-    memset(ray_data(lambda), 0, 8 * sizeof(ray_t*));
+    memset(ray_data(lambda), 0, LAMBDA_SLOTS * sizeof(ray_t*));
+    LAMBDA_CAPROWS(lambda) = caprows;   /* owned */
+    LAMBDA_CAPQ(lambda) = capq;
 
     /* Store params list */
     ray_retain(params_list);
@@ -2161,6 +2407,11 @@ ray_t* ray_fn(ray_t** args, int64_t n) {
     }
     LAMBDA_DBG(lambda) = NULL;
     LAMBDA_CLOSURE(lambda) = closure;
+
+    /* Share the literal's compiled template unless the lambda is query text
+     * or has a closure the compiler cannot bind (the compiler's own gate). */
+    if (!capq && ray_closure_shape_ok(closure))
+        closure_share_template(lambda);
 
     return lambda;
 }
@@ -2224,24 +2475,58 @@ static void add_eval_error_frame(ray_t* nfo, ray_t* node) {
 
 /* Execute compiled bytecode for a lambda. */
 static ray_t* vm_exec(ray_t* lambda, ray_t** call_args, int64_t argc);
+static ray_t* vm_exec_rows(ray_t* lambda, ray_t** call_args, int64_t argc,
+                           uint64_t row_args, uint8_t* out_rows);
 
-/* Sym ID of "self" for call_lambda's frame.  It belongs to the current sym
- * table: runtime destroy tears the table down and the next runtime can give
- * "self" a different ID, so ray_lang_destroy resets it, as ray_compile_reset
- * does for the compiler's special-form IDs.  A stale ID bound the lambda under
- * a name that was no longer "self", shadowing whatever variable owned it. */
-static int64_t g_call_self_sym = -1;
 
-/* Call a lambda: compile on first call, then execute bytecode. */
-ray_t* call_lambda(ray_t* lambda, ray_t** call_args, int64_t argc) {
-    /* Lazy compilation on first call */
-    if (!LAMBDA_CLOSURE(lambda) && !LAMBDA_IS_COMPILED(lambda)) {
+/* Inside a helper called from a query (a call frame above the query's
+ * frames).  Literal symbols keep bytecode's meaning in a helper called by
+ * name; a lambda written inline in the query is query text and follows the
+ * column rule. */
+bool ray_eval_query_helper_active(void) {
+    return ray_env_in_query_helper(NULL);
+}
+
+bool ray_eval_query_helper_literals(void) {
+    bool named = false;
+    return ray_env_in_query_helper(&named) && named;
+}
+
+/* Ordinary calls use bytecode; query fallback interprets the retained AST
+ * so concat can distinguish column parameters from bound collections. */
+/* Whether a call should compile the lambda first.  A lambda made inside a
+ * query (LAMBDA_CAPQ set and no bytecode) is query text and keeps the
+ * query's literal rule on the tree walker, so it never compiles; a closure
+ * made by compiled code (OP_MKCLOSURE) is born compiled, sharing its
+ * literal's bytecode.  Everything else compiles on its first call. */
+static inline bool lambda_wants_compile(ray_t* lambda) {
+    /* NLOCALS -1 marks a body that did not compile: it stays on the tree
+     * walker without another attempt per call. */
+    return !LAMBDA_IS_COMPILED(lambda) && !LAMBDA_CAPQ(lambda) && LAMBDA_NLOCALS(lambda) != -1;
+}
+
+static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
+                               bool query, uint64_t row_args, bool named,
+                               int8_t* out_rows) {
+    if (out_rows) *out_rows = -1;
+    /* A lambda called inside a named helper's body is that body's text. */
+    if (query && !named) named = ray_eval_query_helper_literals();
+    /* Lazy compilation (see lambda_wants_compile); a closure's captures
+     * become locals of its body (OP_BINDCAPS). */
+    if (lambda_wants_compile(lambda))
         ray_compile(lambda);
-    }
-
-    /* If compilation succeeded, run bytecode; otherwise fall back to tree-walk */
     if (LAMBDA_IS_COMPILED(lambda)) {
-        return vm_exec(lambda, call_args, argc);
+        if (!query) return vm_exec(lambda, call_args, argc);
+        /* Row provenance rides on the VM stack.  The call frame hides the
+         * query's aliases and locals; source columns stay visible through
+         * its table, then the globals, as in a body the planner inlines. */
+        if (ray_env_push_call_scope(ray_query_helper_table(), named) != RAY_OK)
+            return ray_error("oom", NULL);
+        uint8_t result_rows = 0;
+        ray_t* result = vm_exec_rows(lambda, call_args, argc, row_args, &result_rows);
+        ray_env_pop_scope();
+        if (out_rows) *out_rows = vrows_to(result_rows);
+        return result;
     }
 
     /* Fallback: tree-walking interpreter */
@@ -2254,12 +2539,19 @@ ray_t* call_lambda(ray_t* lambda, ray_t** call_args, int64_t argc) {
         return ray_error("arity", "expected %" PRId64 " args, got %" PRId64, param_count, argc);
 
     bool has_closure = LAMBDA_CLOSURE(lambda) != NULL;
-    if (has_closure && ray_env_push_capture(LAMBDA_CLOSURE(lambda)) != RAY_OK)
+    if (has_closure && ray_env_push_capture(LAMBDA_CLOSURE(lambda), LAMBDA_CAPROWS(lambda),
+                                            LAMBDA_CAPQ(lambda)) != RAY_OK)
         return ray_error("oom", NULL);
+    if (query && has_closure) ray_env_mark_call_scope(ray_query_helper_table(), named);
     if (ray_env_push_scope() != RAY_OK) {
         if (has_closure) ray_env_pop_scope();
         return ray_error("oom", NULL);
     }
+    /* Closures made inside the body capture down to this call's frames
+     * (its captures and parameters), never the caller's locals. */
+    ray_env_mark_lexical_scope(has_closure ? 1 : 0);
+
+    if (query && !has_closure) ray_env_mark_call_scope(ray_query_helper_table(), named);
 
     /* Bind 'self' to the current lambda for recursion */
     if (g_call_self_sym < 0) g_call_self_sym = ray_sym_intern("self", 4);
@@ -2267,25 +2559,57 @@ ray_t* call_lambda(ray_t* lambda, ray_t** call_args, int64_t argc) {
 
     int64_t* param_ids = (int64_t*)ray_data(params_list);
     for (int64_t i = 0; i < param_count && i < argc; i++) {
-        (void)ray_env_set_local(param_ids[i], call_args[i]);
+        ray_t* arg = call_args[i];
+        if (arg && ray_is_lazy(arg)) {
+            /* A lazy handle is single-use: bind the concrete value, as the
+             * bytecode VM does when it loads a lazy parameter. */
+            ray_retain(arg);
+            arg = ray_lazy_materialize(arg);
+            if (!arg || RAY_IS_ERR(arg)) {
+                ray_env_pop_scope();
+                if (has_closure) ray_env_pop_scope();
+                return arg ? arg : ray_error("type", NULL);
+            }
+        }
+        /* Parameters carry the arguments' row provenance into the body. */
+        uint8_t rows = query && i < 64 ? (uint8_t)((row_args >> i) & 1) : 0;
+        (void)ray_env_set_local_rows(param_ids[i], arg, rows);
+        if (arg != call_args[i]) ray_release(arg);
     }
 
     int64_t body_count = ray_len(body);
     ray_t** body_exprs = (ray_t**)ray_data(body);
     ray_t* result = NULL;
+    __VM->lambda_depth++;
     for (int64_t i = 0; i < body_count; i++) {
         if (result) ray_release(result);
         result = ray_eval(body_exprs[i]);
         if (RAY_IS_ERR(result)) {
+            if (is_return_marker(result)) {
+                /* (return x) somewhere in this statement: the body ends here
+                 * with x, as it does when compiled. */
+                result = ray_take_return(result);
+                g_eval_rows = -1;
+                break;
+            }
+            __VM->lambda_depth--;
             ray_env_pop_scope();
             if (has_closure) ray_env_pop_scope();
             return result;
         }
     }
+    __VM->lambda_depth--;
+    if (out_rows) *out_rows = g_eval_rows;   /* the body's last value's provenance */
 
     ray_env_pop_scope();
     if (has_closure) ray_env_pop_scope();
     return result;
+}
+
+ray_t* call_lambda(ray_t* lambda, ray_t** call_args, int64_t argc) {
+    if (lambda_wants_compile(lambda)) ray_compile(lambda);
+    if (LAMBDA_IS_COMPILED(lambda)) return vm_exec(lambda, call_args, argc);
+    return call_lambda_impl(lambda, call_args, argc, false, 0, false, NULL);
 }
 
 /* ══════════════════════════════════════════
@@ -2301,6 +2625,101 @@ ray_t* call_lambda(ray_t* lambda, ray_t** call_args, int64_t argc) {
  * allocates a private ray_exec_t per invocation and leaves __VM alone. */
 
 static ray_t* vm_exec(ray_t* lambda, ray_t** call_args, int64_t argc) {
+    return vm_exec_rows(lambda, call_args, argc, 0, NULL);
+}
+
+/* Whether a builtin keeps row provenance: the planner lowers it row by
+ * row, so its result over a column-derived operand is column-derived.
+ * Cached by object for one symbol-table epoch: the builtin objects live
+ * as long as the runtime, and a re-init frees and reallocates them. */
+static bool vm_fn_rowwise(const ray_t* fn_obj) {
+    static _Thread_local struct { const ray_t* fn; bool rowwise; } cache[64];
+    static _Thread_local uint64_t epoch;
+    if (epoch != ray_sym_epoch() || !epoch) {
+        memset(cache, 0, sizeof cache);
+        epoch = ray_sym_epoch();
+    }
+    size_t h = ((uintptr_t)fn_obj >> 4) & 63;
+    if (cache[h].fn == fn_obj) return cache[h].rowwise;
+    const char* name = ray_fn_name(fn_obj);
+    bool rowwise = ray_query_rowwise_builtin(ray_sym_intern(name, strlen(name)));
+    cache[h].fn = fn_obj;
+    cache[h].rowwise = rowwise;
+    return rowwise;
+}
+
+/* Control forms return one of their operands, so the operand's provenance
+ * is the form's; every other special form builds a new value. */
+static bool form_inherits_rows(const ray_t* head) {
+    static const char* const forms[] = { "if", "do", "let", "set", "and", "or", "try" };
+    const char* name = ray_fn_name(head);
+    for (size_t i = 0; i < sizeof forms / sizeof *forms; i++)
+        if (strcmp(name, forms[i]) == 0) return true;
+    return false;
+}
+
+static bool vm_text_value(const ray_t* v) {
+    return v->type == RAY_SYM || v->type == RAY_STR || v->type == -RAY_SYM || v->type == -RAY_STR;
+}
+
+/* A binary builtin applied by compiled code.  Consumes `left` and `right`;
+ * `left_rows`/`right_rows` are their row-provenance flags and `*out_rows`
+ * receives the result's.  Returns an owned result or error. */
+static ray_t* vm_call_binary(ray_t* fn_obj, ray_t* left, ray_t* right,
+                             uint8_t left_rows, uint8_t right_rows, uint8_t* out_rows) {
+    ray_binary_fn fn = (ray_binary_fn)(uintptr_t)fn_obj->i64;
+    ray_t *result;
+    *out_rows = 0;
+    /* Materialise lazy args for non-lazy-aware fns; ray_lazy_materialize
+     * consumes the owned ref it is given. */
+    if (!(fn_obj->attrs & RAY_FN_LAZY_AWARE)) {
+        if (left && ray_is_lazy(left)) {
+            left = ray_lazy_materialize(left);
+            if (!left || RAY_IS_ERR(left)) { ray_release(right); return left ? left : ray_error("type", NULL); }
+        }
+        if (right && ray_is_lazy(right)) {
+            right = ray_lazy_materialize(right);
+            if (!right || RAY_IS_ERR(right)) { ray_release(left); return right ? right : ray_error("type", NULL); }
+        }
+    }
+    RAY_ASSERT_VALUE(left); RAY_ASSERT_VALUE(right);
+    if (RAY_UNLIKELY(RAY_IS_NULL(left) || RAY_IS_NULL(right))) {
+        result = (fn == (ray_binary_fn)ray_eq_fn || fn == (ray_binary_fn)ray_neq_fn)
+                 ? fn(left, right) : ray_error("type", NULL);
+    } else if (fn == ray_concat_fn && (left_rows == 1 || right_rows == 1) &&
+               vm_text_value(left) && vm_text_value(right) &&
+               (left_rows == 1 || ray_is_atom(left)) && (right_rows == 1 || ray_is_atom(right))) {
+        /* Query text concat: a column's cells joined row by row, as the
+         * planner does for the query's own expressions.  Without row data
+         * among the operands, a call inside a function keeps ordinary
+         * collection semantics; a bound vector never has row provenance. */
+        result = ray_concat_text_fn(left, right,
+                                    (left->type == -RAY_STR && left_rows == 1) ||
+                                    (right->type == -RAY_STR && right_rows == 1),
+                                    (uint8_t)((left_rows == 1 ? 1 : 0) | (right_rows == 1 ? 2 : 0)));
+        *out_rows = 1;
+    /* Fast path: atoms have negative type — skip collection check entirely.
+     * Only call is_collection when at least one arg has type >= 0 (vector/list). */
+    } else {
+        uint8_t joined = vrows_join(left_rows, right_rows);
+        if ((fn_obj->attrs & RAY_FN_ATOMIC) && (left->type >= 0 || right->type >= 0))
+            result = atomic_map_binary_op(fn, RAY_FN_OPCODE(fn_obj), left, right);
+        else
+            result = fn(left, right);
+        *out_rows = joined && vm_fn_rowwise(fn_obj) ? joined : 0;
+    }
+    ray_release(left);
+    ray_release(right);
+    return result;
+}
+
+/* `row_args` bit i: parameter i is derived from the rows of the active
+ * query.  The flag rides on vm.rows beside every stack slot: loads and
+ * stores copy it, a builtin the planner lowers row by row keeps it,
+ * anything else clears it, and `concat` consults it to choose between
+ * text and collection semantics.  `out_rows` receives the result's flag. */
+static ray_t* vm_exec_rows(ray_t* lambda, ray_t** call_args, int64_t argc,
+                           uint64_t row_args, uint8_t* out_rows) {
     /* Computed goto dispatch table */
     static void *dispatch[OP__COUNT] = {
         [OP_RET]        = &&op_ret,
@@ -2328,6 +2747,10 @@ static ray_t* vm_exec(ray_t* lambda, ray_t** call_args, int64_t argc) {
         [OP_SCOPE_END]     = &&op_scope_end,
         [OP_TRYH]          = &&op_tryh,
         [OP_FORCE]         = &&op_force,
+        [OP_BINDCAPS]      = &&op_bindcaps,
+        [OP_LOADSELF]      = &&op_loadself,
+        [OP_MKCLOSURE]     = &&op_mkclosure,
+        [OP_LOADENVG]      = &&op_loadenvg,
     };
 
     /* Arity check before allocating VM state */
@@ -2348,7 +2771,11 @@ static ray_t* vm_exec(ray_t* lambda, ray_t** call_args, int64_t argc) {
     ray_t *vm_block = ray_alloc(sizeof(ray_exec_t));
     if (!vm_block || RAY_IS_ERR(vm_block)) return ray_error("oom", NULL);
     ray_exec_t *vmp = (ray_exec_t *)ray_data(vm_block);
-    memset(vmp, 0, sizeof(ray_exec_t));
+    /* Only the header needs clearing: every stack, return and trap slot is
+     * written before it is read, and the locals are set below.  Zeroing
+     * the whole block cost more than a small call's body. */
+    vmp->sp = 0; vmp->fp = 0; vmp->rp = 0; vmp->tp = 0; vmp->fn = NULL;
+    __VM->lambda_depth++;
 
 #define vm (*vmp)
 
@@ -2359,11 +2786,16 @@ static ray_t* vm_exec(ray_t* lambda, ray_t** call_args, int64_t argc) {
     vm.fp = 0;
     vm.sp = n_locals;
 
-    /* Bind parameters into local slots */
+    /* Bind parameters into local slots; the other locals start empty */
     int64_t param_count = ray_len(LAMBDA_PARAMS(lambda));
     for (int64_t i = 0; i < param_count && i < argc; i++) {
         ray_retain(call_args[i]);
         vm.ps[i] = call_args[i];
+        vm.rows[i] = i < 64 ? (uint8_t)((row_args >> i) & 1) : 0;
+    }
+    for (int32_t i = (int32_t)(param_count < argc ? param_count : argc); i < n_locals; i++) {
+        vm.ps[i] = NULL;
+        vm.rows[i] = 0;
     }
 
     uint8_t *code = (uint8_t *)ray_data(LAMBDA_BC(lambda));
@@ -2372,10 +2804,13 @@ static ray_t* vm_exec(ray_t* lambda, ray_t** call_args, int64_t argc) {
     ray_t *vm_err_obj = NULL;
 
 #define DISPATCH() goto *dispatch[code[ip++]]
-#define PUSH(v)    do { if (vm.sp >= VM_STACK_SIZE) goto vm_error_limit; vm.ps[vm.sp++] = (v); } while(0)
+#define PUSH(v)    do { if (vm.sp >= VM_STACK_SIZE) goto vm_error_limit; vm.rows[vm.sp] = 0; vm.ps[vm.sp++] = (v); } while(0)
+#define PUSHR(v,r) do { if (vm.sp >= VM_STACK_SIZE) goto vm_error_limit; vm.rows[vm.sp] = (uint8_t)(r); vm.ps[vm.sp++] = (v); } while(0)
 #define POP()      (vm.ps[--vm.sp])
+#define POPPED_ROWS() (vm.rows[vm.sp])   /* flag of the value POP() just returned */
 #define PEEK()     (vm.ps[vm.sp - 1])
 #define LOCAL(s)   (vm.ps[vm.fp + (s)])
+#define LROWS(s)   (vm.rows[vm.fp + (s)])
 
     DISPATCH();
 
@@ -2416,15 +2851,17 @@ op_loadenv: {
     }
     if (val) ray_retain(val);
     else val = make_i64(0);
-    PUSH(val);
+    PUSHR(val, LROWS(slot));
     DISPATCH();
 }
 
 op_storeenv: {
     uint8_t slot = code[ip++];
     ray_t *val = POP();
+    uint8_t val_rows = POPPED_ROWS();
     if (LOCAL(slot)) ray_release(LOCAL(slot));
     LOCAL(slot) = val;
+    LROWS(slot) = val_rows;
     DISPATCH();
 }
 
@@ -2439,21 +2876,22 @@ op_pop: {
 op_dup: {
     ray_t *val = PEEK();
     ray_retain(val);
-    PUSH(val);
+    PUSHR(val, vm.rows[vm.sp - 1]);
     DISPATCH();
 }
 
 op_resolve: {
     uint8_t idx = code[ip++];
     ray_t *name_obj = cpool[idx];
-    ray_t *val = ray_env_resolve(name_obj->i64);
+    uint8_t val_rows = 0;   /* set when a query helper reads a source column */
+    ray_t *val = ray_env_resolve_rows(name_obj->i64, &val_rows);
     if (!val) goto vm_error_name;
     /* env_resolve returns an owned ref (rc >= 1); no extra retain needed.
      * It can also return a real error (e.g. nyi from a parted-target link
      * deref inside the dotted walker) — surface that as a VM error rather
      * than pushing it onto the stack as if it were a normal value. */
     if (RAY_IS_ERR(val)) { vm_err_obj = val; goto vm_error; }
-    PUSH(val);
+    PUSHR(val, val_rows);
     DISPATCH();
 }
 
@@ -2461,10 +2899,11 @@ op_resolve_w: {
     uint16_t idx = (uint16_t)((code[ip] << 8) | code[ip + 1]);
     ip += 2;
     ray_t *name_obj = cpool[idx];
-    ray_t *val = ray_env_resolve(name_obj->i64);
+    uint8_t val_rows = 0;
+    ray_t *val = ray_env_resolve_rows(name_obj->i64, &val_rows);
     if (!val) goto vm_error_name;
     if (RAY_IS_ERR(val)) { vm_err_obj = val; goto vm_error; }
-    PUSH(val);
+    PUSHR(val, val_rows);
     DISPATCH();
 }
 
@@ -2519,6 +2958,7 @@ op_jmpf: {
     int16_t offset = (int16_t)((code[ip] << 8) | code[ip + 1]);
     ip += 2;
     ray_t *cond = POP();
+    if (cond && !ray_is_atom(cond)) __VM->rows_cond++;   /* a vector tested whole */
     int truthy = is_truthy(cond);
     ray_release(cond);
     if (!truthy) ip += offset;
@@ -2527,6 +2967,7 @@ op_jmpf: {
 
 op_call1: {
     ray_t *arg = POP();
+    uint8_t arg_rows = POPPED_ROWS();
     ray_t *fn_obj = POP();
     if (RAY_UNLIKELY(fn_is_restricted(fn_obj))) {
         ray_release(arg);
@@ -2555,16 +2996,19 @@ op_call1: {
         result = atomic_map_unary(fn, arg);
     else
         result = fn(arg);
+    uint8_t result_rows = arg_rows && vm_fn_rowwise(fn_obj) ? arg_rows : 0;
     ray_release(arg);
     ray_release(fn_obj);
     if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }
-    PUSH(result);
+    PUSHR(result, result_rows);
     DISPATCH();
 }
 
 op_call2: {
     ray_t *right = POP();
+    uint8_t right_rows = POPPED_ROWS();
     ray_t *left = POP();
+    uint8_t left_rows = POPPED_ROWS();
     ray_t *fn_obj = POP();
     if (RAY_UNLIKELY(fn_is_restricted(fn_obj))) {
         ray_release(left);
@@ -2573,44 +3017,11 @@ op_call2: {
         vm_err_obj = ray_error("access", "restricted");
         goto vm_error;
     }
-    ray_binary_fn fn = (ray_binary_fn)(uintptr_t)fn_obj->i64;
-    ray_t *result;
-    /* Materialise lazy args for non-lazy-aware fns.
-     * left/right are owned refs (POPped from VM stack); ray_lazy_materialize
-     * consumes them internally — no extra ray_release needed after the call. */
-    if (!(fn_obj->attrs & RAY_FN_LAZY_AWARE)) {
-        if (left && ray_is_lazy(left)) {
-            left = ray_lazy_materialize(left); /* consumes owned ref */
-            if (!left || RAY_IS_ERR(left)) {
-                ray_release(right); ray_release(fn_obj);
-                vm_err_obj = left ? left : ray_error("type", NULL);
-                goto vm_error;
-            }
-        }
-        if (right && ray_is_lazy(right)) {
-            right = ray_lazy_materialize(right); /* consumes owned ref */
-            if (!right || RAY_IS_ERR(right)) {
-                ray_release(left); ray_release(fn_obj);
-                vm_err_obj = right ? right : ray_error("type", NULL);
-                goto vm_error;
-            }
-        }
-    }
-    RAY_ASSERT_VALUE(left); RAY_ASSERT_VALUE(right);
-    if (RAY_UNLIKELY(RAY_IS_NULL(left) || RAY_IS_NULL(right))) {
-        result = (fn == (ray_binary_fn)ray_eq_fn || fn == (ray_binary_fn)ray_neq_fn)
-                 ? fn(left, right) : ray_error("type", NULL);
-    /* Fast path: atoms have negative type — skip collection check entirely.
-     * Only call is_collection when at least one arg has type >= 0 (vector/list). */
-    } else if ((fn_obj->attrs & RAY_FN_ATOMIC) && (left->type >= 0 || right->type >= 0))
-        result = atomic_map_binary_op(fn, RAY_FN_OPCODE(fn_obj), left, right);
-    else
-        result = fn(left, right);
-    ray_release(left);
-    ray_release(right);
+    uint8_t result_rows = 0;
+    ray_t *result = vm_call_binary(fn_obj, left, right, left_rows, right_rows, &result_rows);
     ray_release(fn_obj);
     if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }
-    PUSH(result);
+    PUSHR(result, result_rows);
     DISPATCH();
 }
 
@@ -2618,8 +3029,11 @@ op_calln: {
     uint8_t n = code[ip++];
     if (n > 64) goto vm_error;
     ray_t *fn_args[64];
-    for (int32_t i = n - 1; i >= 0; i--)
+    uint8_t args_rows = 0;
+    for (int32_t i = n - 1; i >= 0; i--) {
         fn_args[i] = POP();
+        args_rows = vrows_join(args_rows, POPPED_ROWS());
+    }
     ray_t *fn_obj = POP();
     if (RAY_UNLIKELY(fn_is_restricted(fn_obj))) {
         for (int32_t i = 0; i < n; i++) ray_release(fn_args[i]);
@@ -2633,11 +3047,12 @@ op_calln: {
         if (err) { ray_release(fn_obj); vm_err_obj = err; goto vm_error; }
     }
     ray_t *result = fn(fn_args, n);
+    uint8_t result_rows = args_rows && vm_fn_rowwise(fn_obj) ? args_rows : 0;
     for (int32_t i = 0; i < n; i++)
         ray_release(fn_args[i]);
     ray_release(fn_obj);
     if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }
-    PUSH(result);
+    PUSHR(result, result_rows);
     DISPATCH();
 }
 
@@ -2645,13 +3060,21 @@ op_callf: {
     uint8_t n = code[ip++];
     if (n > 64) goto vm_error;
     ray_t *fn_args[64];
-    for (int32_t i = n - 1; i >= 0; i--)
+    uint8_t arg_rows[64];
+    uint8_t args_any = 0;
+    uint64_t args_bits = 0;
+    for (int32_t i = n - 1; i >= 0; i--) {
         fn_args[i] = POP();
+        arg_rows[i] = POPPED_ROWS();
+        args_any = vrows_join(args_any, arg_rows[i]);
+        if (arg_rows[i] == 1) args_bits |= UINT64_C(1) << i;
+    }
     ray_t *fn_obj = POP();
 
-    /* Compiled lambda: push frame, switch to callee bytecode */
+    /* Compiled lambda: push frame, switch to callee bytecode.  A lambda
+     * made inside a query stays on the tree walker (see call_lambda_impl). */
     if (fn_obj->type == RAY_LAMBDA) {
-        if (!LAMBDA_IS_COMPILED(fn_obj))
+        if (lambda_wants_compile(fn_obj))
             ray_compile(fn_obj);
 
         if (LAMBDA_IS_COMPILED(fn_obj)) {
@@ -2685,10 +3108,14 @@ op_callf: {
 
             /* Bind parameters */
             int64_t bind = pcnt < n ? pcnt : n;
-            for (int64_t i = 0; i < bind; i++)
+            for (int64_t i = 0; i < bind; i++) {
                 LOCAL(i) = fn_args[i];  /* transfer ownership from args */
-            for (int32_t i = (int32_t)bind; i < callee_locals; i++)
+                LROWS(i) = arg_rows[i];
+            }
+            for (int32_t i = (int32_t)bind; i < callee_locals; i++) {
                 LOCAL(i) = NULL;
+                LROWS(i) = 0;
+            }
             for (int64_t i = bind; i < n; i++)
                 ray_release(fn_args[i]);  /* excess args */
 
@@ -2706,6 +3133,7 @@ op_callf: {
     /* Non-lambda or uncompiled: dispatch by type */
     {
         ray_t *result;
+        int8_t lambda_rows = -1;
         switch (fn_obj->type) {
         case RAY_UNARY:
             if (fn_is_restricted(fn_obj)) { for (int32_t i = 0; i < n; i++) ray_release(fn_args[i]); result = ray_error("access", "restricted"); break; }
@@ -2738,7 +3166,10 @@ op_callf: {
                 fn_args[0] = ray_lazy_materialize(fn_args[0]); /* consumes owned ref */
                 if (!fn_args[0] || RAY_IS_ERR(fn_args[0])) { result = fn_args[0] ? fn_args[0] : ray_error("type", NULL); fn_args[0] = NULL; break; }
             }
-            result = unary(fn_args[0]);
+            if ((fn_obj->attrs & RAY_FN_ATOMIC) && fn_args[0] && fn_args[0]->type >= 0)
+                result = atomic_map_unary(unary, fn_args[0]);
+            else
+                result = unary(fn_args[0]);
             ray_release(fn_args[0]);
 unary_done:
             break;
@@ -2758,9 +3189,17 @@ unary_done:
                     if (!fn_args[1] || RAY_IS_ERR(fn_args[1])) { result = fn_args[1] ? fn_args[1] : ray_error("type", NULL); ray_release(fn_args[0]); fn_args[0] = NULL; fn_args[1] = NULL; break; }
                 }
             }
-            result = ((ray_binary_fn)(uintptr_t)fn_obj->i64)(fn_args[0], fn_args[1]);
-            ray_release(fn_args[0]);
-            ray_release(fn_args[1]);
+            /* The same path as OP_CALL2: the elementwise map for an atomic
+             * builtin, the query text rule for concat, the row provenance
+             * join.  A closure body reaches here for every builtin it names,
+             * since it resolves them when it runs. */
+            {
+                uint8_t bin_rows = 0;
+                result = vm_call_binary(fn_obj, fn_args[0], fn_args[1],
+                                        (uint8_t)(args_bits & 1), (uint8_t)((args_bits >> 1) & 1), &bin_rows);
+                fn_args[0] = fn_args[1] = NULL;   /* consumed */
+                lambda_rows = bin_rows ? 1 : 0;   /* reported below as the result's flag */
+            }
             break;
         case RAY_VARY:
             if (fn_is_restricted(fn_obj)) { for (int32_t i = 0; i < n; i++) ray_release(fn_args[i]); result = ray_error("access", "restricted"); break; }
@@ -2771,18 +3210,26 @@ unary_done:
             result = ((ray_vary_fn)(uintptr_t)fn_obj->i64)(fn_args, n);
             for (int32_t i = 0; i < n; i++) ray_release(fn_args[i]);
             break;
-        case RAY_LAMBDA:
-            result = call_lambda(fn_obj, fn_args, n);
+        case RAY_LAMBDA: {
+            /* An uncompiled lambda (a closure): interpreted, with the
+             * arguments' row provenance when a query is active. */
+            bool in_query = ray_active_query_table() != NULL;
+            result = call_lambda_impl(fn_obj, fn_args, n, in_query, args_bits, true, &lambda_rows);
             for (int32_t i = 0; i < n; i++) ray_release(fn_args[i]);
             break;
+        }
         default:
             for (int32_t i = 0; i < n; i++) ray_release(fn_args[i]);
             result = ray_error("type", "apply: head is not callable, got %s", ray_type_name(fn_obj->type));
             break;
         }
+        uint8_t result_rows = fn_obj->type == RAY_LAMBDA ? vrows_from(lambda_rows)
+            : fn_obj->type == RAY_BINARY ? (uint8_t)(lambda_rows == 1)
+            : args_any && (fn_obj->type == RAY_UNARY || fn_obj->type == RAY_VARY) &&
+              vm_fn_rowwise(fn_obj) ? args_any : 0;
         ray_release(fn_obj);
         if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }
-        PUSH(result);
+        PUSHR(result, result_rows);
         DISPATCH();
     }
 }
@@ -2805,8 +3252,10 @@ op_calls: {
     vm.fp = vm.sp - argc;
 
     /* Extend stack for extra locals beyond params (let bindings etc.) */
-    for (int32_t i = argc; i < n_locals; i++)
+    for (int32_t i = argc; i < n_locals; i++) {
+        vm.rows[vm.sp] = 0;
         vm.ps[vm.sp++] = NULL;
+    }
 
     ip = 0;
     DISPATCH();
@@ -2821,7 +3270,7 @@ op_calld: {
         ray_t *result = ray_eval(ast);
         ray_release(ast);
         if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }
-        PUSH(result);
+        PUSHR(result, vrows_from(g_eval_rows));
         DISPATCH();
     }
     /* n>0: build call list and eval */
@@ -2846,15 +3295,17 @@ op_calld: {
     ray_t *result = ray_eval(call_list);
     ray_release(call_list);
     if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }
-    PUSH(result);
+    PUSHR(result, vrows_from(g_eval_rows));
     DISPATCH();
 }
 
 op_ret: {
     ray_t *result;
+    uint8_t result_rows = 0;
     bool from_stack = (vm.sp > vm.fp + n_locals);
     if (from_stack) {
         result = POP();
+        result_rows = POPPED_ROWS();
         ray_retain(result);  /* prevent free during cleanup if aliased in locals */
     } else {
         result = RAY_NULL_OBJ;
@@ -2865,13 +3316,14 @@ op_ret: {
         ray_t *v = vm.ps[--vm.sp];
         if (v) ray_release(v);
     }
-
     /* Undo protective retain — POP's reference is the caller's ownership */
     if (from_stack) ray_release(result);
 
     if (vm.rp == 0) {
         /* Top-level return */
+        if (out_rows) *out_rows = result_rows;
         ray_release(vm.fn);
+        __VM->lambda_depth--;
 #undef vm
         ray_free(vm_block);
         return result;  /* caller owns the POP'd reference */
@@ -2891,7 +3343,7 @@ op_ret: {
         n_locals = LAMBDA_NLOCALS(vm.fn);
     }
     /* Self-call (fn==NULL): vm.fn/code/cpool/n_locals are already correct */
-    PUSH(result);
+    PUSHR(result, result_rows);
     DISPATCH();
 }
 
@@ -2921,11 +3373,170 @@ op_tryh: {
      * is invoked with the error; any other value is the fallback result. */
     ray_t* err_val = POP();
     ray_t* handler = POP();
-    ray_t* result  = ray_try_handle(handler, err_val);  /* borrows both */
+    uint8_t handler_rows = POPPED_ROWS();
+    int8_t result_rows = -1;
+    ray_t* result = try_handle_rows(handler, err_val, vrows_to(handler_rows), &result_rows);  /* borrows both */
     ray_release(err_val);
     ray_release(handler);
     if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }
-    PUSH(result);
+    PUSHR(result, vrows_from(result_rows));
+    DISPATCH();
+}
+
+op_bindcaps: {
+    /* The closure's captures become local slots (the compiled closure's
+     * prologue): cpool[idx] holds (name, slot) pairs; each name is looked
+     * up in the closure dict.  A name the dict lacks (a `let` that had not
+     * run when the closure was made) leaves its slot empty, so a read of
+     * it falls back to the global, as on the tree walker.  The capture's
+     * row flag applies while the query frame the closure was made under
+     * is the innermost one. */
+    uint8_t idx = code[ip++];
+    ray_t *pairs = cpool[idx];
+    ray_t *cap = LAMBDA_CLOSURE(vm.fn);
+    ray_t *ckeys = cap && cap->type == RAY_DICT ? ray_dict_keys(cap) : NULL;
+    ray_t *cvals = cap && cap->type == RAY_DICT ? ray_dict_vals(cap) : NULL;
+    if (!pairs || pairs->type != RAY_I64) goto vm_error_name;
+    if (cap && (!ckeys || !cvals || ckeys->type != RAY_SYM || cvals->type != RAY_LIST || ckeys->len != cvals->len))
+        goto vm_error_name;
+    int64_t ncap = ckeys ? ckeys->len : 0;
+    ray_t *flags = LAMBDA_CAPROWS(vm.fn);
+    bool live = flags && flags->len == ncap && LAMBDA_CAPQ(vm.fn) &&
+                LAMBDA_CAPQ(vm.fn) == ray_env_query_serial();
+    const int64_t *pv = (const int64_t*)ray_data(pairs);
+    for (int64_t i = 0, guess = 0; i + 1 < pairs->len; i += 2, guess++) {
+        int64_t name = pv[i], slot = pv[i + 1];
+        int64_t at = -1;
+        if (guess < ncap && ray_read_sym(ray_data(ckeys), guess, RAY_SYM, ckeys->attrs) == name) at = guess;
+        for (int64_t k = 0; at < 0 && k < ncap; k++)
+            if (ray_read_sym(ray_data(ckeys), k, RAY_SYM, ckeys->attrs) == name) at = k;
+        if (LOCAL(slot)) { ray_release(LOCAL(slot)); LOCAL(slot) = NULL; }
+        LROWS(slot) = 0;
+        if (at < 0) continue;
+        ray_t *val = ((ray_t**)ray_data(cvals))[at];
+        if (!val) continue;
+        ray_retain(val);
+        LOCAL(slot) = val;
+        LROWS(slot) = live ? ((uint8_t*)ray_data(flags))[at] : 0;
+    }
+    DISPATCH();
+}
+
+op_mkclosure: {
+    /* Stack: [.., template, names, slots].  A closure of the template:
+     * it shares the template's bytecode, constants, debug map and locals
+     * count, and captures the current frame's slots named by `names`, with
+     * their row flags, which apply while the innermost query frame is the
+     * one of now.  A slot still empty (its `let` has not run) is not
+     * captured, as the tree walker would not bind it either; a lazy slot
+     * is materialized first, into the slot too: a lazy handle is single-use
+     * (materializing frees its graph in place), and the dict would hold a
+     * dead handle after the closure's first call.  Rayfall text does not
+     * reach here with one (call sites materialize lazy arguments), but a
+     * caller of the C API can. */
+    ray_t *slots = POP();
+    ray_t *names = POP();
+    ray_t *tmpl  = POP();
+    if (!tmpl || tmpl->type != RAY_LAMBDA || !names || names->type != RAY_SYM ||
+        !slots || slots->type != RAY_I64 || names->len != slots->len) {
+        ray_release(slots); ray_release(names); ray_release(tmpl);
+        goto vm_error;
+    }
+    int64_t ncap = names->len;
+    ray_t *keys = ray_sym_vec_new(RAY_SYM_W64, ncap > 0 ? ncap : 1);
+    ray_t *vals = ray_list_new(ncap > 0 ? ncap : 1);
+    ray_t *flags = ray_vec_new(RAY_U8, ncap > 0 ? ncap : 1);
+    ray_t *lam = ray_alloc(LAMBDA_SLOTS * sizeof(ray_t*));
+    if (!keys || RAY_IS_ERR(keys) || !vals || RAY_IS_ERR(vals) || !flags || RAY_IS_ERR(flags) || !lam || RAY_IS_ERR(lam)) {
+        if (keys && !RAY_IS_ERR(keys)) ray_release(keys);
+        if (vals && !RAY_IS_ERR(vals)) ray_release(vals);
+        if (flags && !RAY_IS_ERR(flags)) ray_release(flags);
+        if (lam && !RAY_IS_ERR(lam)) { lam->type = -RAY_I64; ray_release(lam); }
+        ray_release(slots); ray_release(names); ray_release(tmpl);
+        vm_err_obj = ray_error("oom", NULL);
+        goto vm_error;
+    }
+    keys->len = 0; flags->len = 0;
+    bool any_flag = false;
+    for (int64_t i = 0; i < ncap; i++) {
+        int64_t slot = ((const int64_t*)ray_data(slots))[i];
+        if (slot < 0 || slot >= n_locals) continue;
+        ray_t *v = LOCAL(slot);
+        if (!v) continue;
+        if (ray_is_lazy(v)) {
+            v = ray_lazy_materialize(v);   /* consumes the slot's ref */
+            LOCAL(slot) = v && !RAY_IS_ERR(v) ? v : NULL;
+            if (!v || RAY_IS_ERR(v)) {
+                ray_release(keys); ray_release(vals); ray_release(flags);
+                lam->type = -RAY_I64; ray_release(lam);
+                ray_release(slots); ray_release(names); ray_release(tmpl);
+                vm_err_obj = v ? v : ray_error("type", NULL);
+                goto vm_error;
+            }
+        }
+        ((int64_t*)ray_data(keys))[keys->len++] = ray_read_sym(ray_data(names), i, RAY_SYM, names->attrs);
+        vals = ray_list_append(vals, v);
+        uint8_t r = LROWS(slot) == 1 ? 1 : 0;
+        ((uint8_t*)ray_data(flags))[flags->len++] = r;
+        if (r) any_flag = true;
+    }
+    lam->type = RAY_LAMBDA;
+    lam->attrs = tmpl->attrs;
+    lam->len = 0;
+    memset(ray_data(lam), 0, LAMBDA_SLOTS * sizeof(ray_t*));
+    ray_retain(LAMBDA_PARAMS(tmpl)); LAMBDA_PARAMS(lam) = LAMBDA_PARAMS(tmpl);
+    ray_retain(LAMBDA_BODY(tmpl));   LAMBDA_BODY(lam)   = LAMBDA_BODY(tmpl);
+    if (LAMBDA_BC(tmpl))     { ray_retain(LAMBDA_BC(tmpl));     LAMBDA_BC(lam)     = LAMBDA_BC(tmpl); }
+    if (LAMBDA_CONSTS(tmpl)) { ray_retain(LAMBDA_CONSTS(tmpl)); LAMBDA_CONSTS(lam) = LAMBDA_CONSTS(tmpl); }
+    if (LAMBDA_NFO(tmpl))    { ray_retain(LAMBDA_NFO(tmpl));    LAMBDA_NFO(lam)    = LAMBDA_NFO(tmpl); }
+    if (LAMBDA_DBG(tmpl))    { ray_retain(LAMBDA_DBG(tmpl));    LAMBDA_DBG(lam)    = LAMBDA_DBG(tmpl); }
+    LAMBDA_NLOCALS(lam) = LAMBDA_NLOCALS(tmpl);
+    if (keys->len > 0) {
+        LAMBDA_CLOSURE(lam) = ray_dict_new(keys, vals);   /* consumes both */
+        if (!LAMBDA_CLOSURE(lam) || RAY_IS_ERR(LAMBDA_CLOSURE(lam))) {
+            LAMBDA_CLOSURE(lam) = NULL; ray_release(flags); ray_release(lam);
+            ray_release(slots); ray_release(names); ray_release(tmpl);
+            vm_err_obj = ray_error("oom", NULL);
+            goto vm_error;
+        }
+    } else { ray_release(keys); ray_release(vals); }
+    if (any_flag) { LAMBDA_CAPROWS(lam) = flags; LAMBDA_CAPQ(lam) = ray_env_query_serial(); }
+    else ray_release(flags);
+    ray_release(slots); ray_release(names); ray_release(tmpl);
+    PUSHR(lam, 0);
+    DISPATCH();
+}
+
+op_loadenvg: {
+    /* A `let` slot that may still be empty: the local when bound, else
+     * the global of that name (a name error when there is none), as the
+     * tree walker resolves a name whose `let` has not run. */
+    uint8_t slot = code[ip++];
+    uint16_t idx = (uint16_t)((code[ip] << 8) | code[ip + 1]);
+    ip += 2;
+    ray_t *val = LOCAL(slot);
+    if (val) {
+        if (ray_is_lazy(val)) {
+            val = ray_lazy_materialize(val);
+            if (!val || RAY_IS_ERR(val)) { vm_err_obj = val ? val : ray_error("type", NULL); LOCAL(slot) = NULL; goto vm_error; }
+            LOCAL(slot) = val;
+        }
+        ray_retain(val);
+        PUSHR(val, LROWS(slot));
+        DISPATCH();
+    }
+    ray_t *name_obj = cpool[idx];
+    uint8_t val_rows = 0;
+    val = ray_env_resolve_rows(name_obj->i64, &val_rows);
+    if (!val) goto vm_error_name;
+    if (RAY_IS_ERR(val)) { vm_err_obj = val; goto vm_error; }
+    PUSHR(val, val_rows);
+    DISPATCH();
+}
+
+op_loadself: {
+    ray_retain(vm.fn);
+    PUSHR(vm.fn, 0);
     DISPATCH();
 }
 
@@ -2933,11 +3544,12 @@ op_force: {
     /* Materialize a lazy TOS so a let-bound local holds a concrete,
      * reusable value (a lazy handle is single-use). */
     ray_t* v = POP();
+    uint8_t v_rows = POPPED_ROWS();
     if (v && ray_is_lazy(v)) {
         v = ray_lazy_materialize(v);   /* consumes; concrete or error */
         if (!v || RAY_IS_ERR(v)) { vm_err_obj = v ? v : ray_error("type", NULL); goto vm_error; }
     }
-    PUSH(v);
+    PUSHR(v, v_rows);
     DISPATCH();
 }
 
@@ -2946,11 +3558,16 @@ op_scope_begin: {
      * the value of syms[i]) plus self into a fresh scope frame so the
      * OP_CALLD that follows can resolve them via the tree walker. */
     ray_t *syms = POP();
+    /* The locals' row provenance travels with the bindings, so the tree
+     * walker inside the window sees it as it sees any local's. */
     ray_err_t err = ray_env_scope_bind((const int64_t*)ray_data(syms),
                                        (int32_t)syms->len,
-                                       &vm.ps[vm.fp], vm.fn);
+                                       &vm.ps[vm.fp], &vm.rows[vm.fp], vm.fn);
     ray_release(syms);
     if (err != RAY_OK) goto vm_error_limit;
+    /* A closure's captures sit in local slots (bound by the prologue), so
+     * the window binds them with the other locals, and nothing from the
+     * caller's frames can stand in for one. */
     DISPATCH();
 }
 
@@ -2958,8 +3575,14 @@ op_scope_end: {
     /* Stack: [.., calld_result, syms_vec] — sync the frame back into the
      * slots and pop it; the dynamic eval's result stays on the stack. */
     ray_t *syms = POP();
+    /* A local rebound inside the window has unknown provenance: clear its
+     * flag, as for any value the VM did not derive itself. */
+    ray_t *before[256];   /* a frame has at most 256 slots (compile.c add_local) */
+    int64_t nsync = syms->len < 256 ? syms->len : 256;
+    for (int64_t i = 0; i < nsync; i++) before[i] = LOCAL(i);
     ray_env_scope_sync((const int64_t*)ray_data(syms),
                        (int32_t)syms->len, &vm.ps[vm.fp]);
+    for (int64_t i = 0; i < nsync; i++) if (LOCAL(i) != before[i]) LROWS(i) = 2;
     ray_release(syms);
     DISPATCH();
 }
@@ -2988,6 +3611,22 @@ vm_error:
     vm_err_detail = NULL;
 
 vm_error_cleanup: {
+    /* A `return` evaluated by the tree walker inside this frame (a window
+     * around a special form) arrives as the return marker: it is this
+     * frame's return, not an error.  Traps armed in this frame and the
+     * window's scope frames go with it. */
+    if (vm_err_obj && is_return_marker(vm_err_obj)) {
+        ray_t *rv = ray_take_return(vm_err_obj);
+        vm_err_obj = NULL;
+        while (vm.tp > 0 && vm.ts[vm.tp - 1].rp >= vm.rp) {
+            vm.tp--;
+            ray_release(vm.ts[vm.tp].fn);
+        }
+        while (ray_env_scope_depth() > scope_base)
+            ray_env_pop_scope();
+        PUSHR(rv, 0);
+        goto op_ret;
+    }
     /* Check for trap frame */
     if (vm.tp > 0) {
         vm.tp--;
@@ -3060,6 +3699,7 @@ vm_error_cleanup: {
         if (vm.rs[i].fn) ray_release(vm.rs[i].fn);
     for (int32_t i = 0; i < vm.tp; i++)
         ray_release(vm.ts[i].fn);
+    __VM->lambda_depth--;
 #undef vm
     ray_free(vm_block);
     if (vm_err_obj)
@@ -3071,9 +3711,12 @@ vm_error_cleanup: {
 
 #undef DISPATCH
 #undef PUSH
+#undef PUSHR
 #undef POP
+#undef POPPED_ROWS
 #undef PEEK
 #undef LOCAL
+#undef LROWS
 #undef vm
 }
 
@@ -3350,7 +3993,8 @@ static void ray_register_builtins(void) {
 
     /* Collection operations */
     register_unary("distinct", RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_distinct_fn);
-    register_binary("in",      RAY_FN_NONE, ray_in_fn);
+    register_binary("in",      RAY_FN_NONE, ray_in_eval_fn);
+    register_binary("not-in",  RAY_FN_NONE, ray_not_in_fn);
     register_binary("except",  RAY_FN_NONE, ray_except_fn);
     register_binary("union",   RAY_FN_NONE, ray_union_fn);
     register_binary("sect",    RAY_FN_NONE, ray_sect_fn);
@@ -3755,6 +4399,7 @@ ray_err_t ray_lang_init(void) {
 
 void ray_lang_destroy(void) {
     if (__VM && __VM->raise_val) { ray_release(__VM->raise_val); __VM->raise_val = NULL; }
+    closure_tmpl_reset();
     /* Reset global Datalog rule storage */
     ray_dl_reset_rules();
     ray_env_destroy();
@@ -3822,6 +4467,7 @@ ray_t* ray_eval(ray_t* obj) {
     }
 
     ray_t* ret;
+    int8_t rows = -1;   /* provenance of ret; published as g_eval_rows at out: */
 
     /* Direct-builtin profiling span: opened just before the head-dispatch
      * switch below (for UNARY/BINARY/VARY builtins), closed at `out:`.
@@ -3849,7 +4495,8 @@ ray_t* ray_eval(ray_t* obj) {
                 if (name_str) ray_release(name_str);
             }
 
-            ray_t* val = ray_env_resolve(obj->i64);
+            uint8_t val_rows = 0;   /* a query's column binding, or a helper's */
+            ray_t* val = ray_env_resolve_rows(obj->i64, &val_rows);
             if (!val) {
                 ray_t* ns = ray_sym_str(obj->i64);
                 if (ns) {
@@ -3866,6 +4513,7 @@ ray_t* ray_eval(ray_t* obj) {
              * it directly rather than treating it as a found value. */
             if (RAY_IS_ERR(val)) { ret = val; goto out; }
             /* env_resolve hands back an owned ref; no extra retain. */
+            rows = vrows_to(val_rows);
             ret = val; goto out;
         }
         /* Literal symbol (ATTR_QUOTED set).  Inside a query, a literal that
@@ -3873,24 +4521,27 @@ ray_t* ray_eval(ray_t* obj) {
          * consult ONLY the active query table's column set — never the env
          * scope chain — so a literal never captures a lambda/let local, and
          * the rule fires only while a query is active (ray_active_query_table
-         * is NULL otherwise).  A literal naming no column returns itself. */
-        if (obj->type == -RAY_SYM) {
+         * is NULL otherwise).  A literal naming no column returns itself.
+         * Named helper bodies keep bytecode's literal semantics; an inline
+         * lambda is query text, and a nested query re-enables its own
+         * column-name interpretation. */
+        if (obj->type == -RAY_SYM && !ray_eval_query_helper_literals()) {
             /* The column — or, during a per-row evaluation, its cell in the
              * current row (ray_active_query_literal). */
             ray_t* v = ray_active_query_literal(obj->i64);
-            if (v) { ret = v; goto out; }
+            if (v) { ret = v; rows = 1; goto out; }
         }
         ray_retain(obj);
-        ret = obj; goto out;
+        ret = obj; rows = 0; goto out;
     }
 
     /* Non-list vectors (incl. RAY_DICT/RAY_TABLE): return themselves —
      * dict literals are self-evaluating; values stay unevaluated.  Use
      * the (dict ...) builtin for evaluated construction. */
-    if (obj->type != RAY_LIST) { ray_retain(obj); ret = obj; goto out; }
+    if (obj->type != RAY_LIST) { ray_retain(obj); ret = obj; rows = 0; goto out; }
 
     /* Empty list */
-    if (ray_len(obj) == 0) { ray_retain(obj); ret = obj; goto out; }
+    if (ray_len(obj) == 0) { ray_retain(obj); ret = obj; rows = 0; goto out; }
 
     /* List: evaluate first element, dispatch by type */
     ray_t** elems = (ray_t**)ray_data(obj);
@@ -3977,10 +4628,15 @@ ray_t* ray_eval(ray_t* obj) {
             if (fn_is_restricted(head)) { ray_release(head); ret = ray_error("access", "restricted"); goto out; }
             ray_unary_fn fn = (ray_unary_fn)(uintptr_t)head->i64;
             ray_binary_fn fn2 = unary_binary_overload(fn);
+            /* Row provenance follows a builtin the planner lowers row by row. */
+            bool rowwise = ray_active_query_table() && vm_fn_rowwise(head);
             if (n == 3 && fn2) {
                 ray_t* left = ray_eval(elems[1]);
+                int8_t left_rows = g_eval_rows;
                 if (!left || RAY_IS_ERR(left)) { ray_release(head); ret = left ? left : ray_error("type", NULL); goto out; }
                 ray_t* right = ray_eval(elems[2]);
+                int8_t right_rows = g_eval_rows;
+                rows = rowwise ? rows_join(left_rows, right_rows) : 0;
                 ray_release(head);
                 if (!right || RAY_IS_ERR(right)) { ray_release(left); ret = right ? right : ray_error("type", NULL); goto out; }
                 if (ray_is_lazy(left)) {
@@ -4005,7 +4661,7 @@ ray_t* ray_eval(ray_t* obj) {
                 if (handled) {
                     ray_release(head);
                     ret = fast ? fast : ray_error("type", NULL);
-                    goto out;
+                    rows = 0; goto out;
                 }
             }
             if (fn == (ray_unary_fn)ray_count_fn) {
@@ -4014,10 +4670,11 @@ ray_t* ray_eval(ray_t* obj) {
                 if (handled) {
                     ray_release(head);
                     ret = fast ? fast : ray_error("type", NULL);
-                    goto out;
+                    rows = 0; goto out;
                 }
             }
             ray_t* arg = ray_eval(elems[1]);
+            rows = rowwise ? g_eval_rows : 0;
             ray_release(head);
             if (arg && RAY_IS_ERR(arg)) { ret = arg; goto out; }
             /* Materialise lazy arg for non-lazy-aware fns.
@@ -4046,15 +4703,21 @@ ray_t* ray_eval(ray_t* obj) {
             ray_binary_fn fn = (ray_binary_fn)(uintptr_t)head->i64;
             uint8_t fn_attrs = head->attrs;
             if (fn_attrs & RAY_FN_SPECIAL_FORM) {
+                bool inherits = form_inherits_rows(head);
                 ray_release(head);
-                ret = fn(elems[1], elems[2]); goto out;
+                ret = fn(elems[1], elems[2]);
+                rows = inherits ? g_eval_rows : 0;
+                goto out;
             }
+            bool rowwise = ray_active_query_table() && vm_fn_rowwise(head);
             ray_t* left = ray_eval(elems[1]);
+            int8_t left_rows = g_eval_rows;
             if (left && RAY_IS_ERR(left)) {
                 ray_release(head);
                 ret = left; goto out;
             }
             ray_t* right = ray_eval(elems[2]);
+            int8_t right_rows = g_eval_rows;
             if (right && RAY_IS_ERR(right)) {
                 ray_release(head); if (left) ray_release(left);
                 ret = right; goto out;
@@ -4097,8 +4760,34 @@ ray_t* ray_eval(ray_t* obj) {
             uint16_t fn_opcode = RAY_FN_OPCODE(head);
             ray_release(head);
             ray_t* result;
+            rows = rowwise ? rows_join(left_rows, right_rows) : 0;
             if ((fn_attrs & RAY_FN_ATOMIC) && (is_collection(left) || is_collection(right)))
                 result = atomic_map_binary_op(fn, fn_opcode, left, right);
+            else if (fn == ray_concat_fn && ray_active_query_table() &&
+                     (left->type == RAY_SYM || left->type == RAY_STR ||
+                      left->type == -RAY_SYM || left->type == -RAY_STR) &&
+                     (right->type == RAY_SYM || right->type == RAY_STR ||
+                      right->type == -RAY_SYM || right->type == -RAY_STR)) {
+                /* Row by row, a column's cell is an atom: it still carries
+                 * the column's row provenance, and a STR cell its type.  An
+                 * interpreted helper's result has unknown provenance; its
+                 * syntax decides.  In the query's own expression two scalar
+                 * text operands join; inside a function a call without row
+                 * data among its operands keeps collection semantics. */
+                bool lr = left_rows >= 0 ? left_rows > 0 : ray_query_expr_reads_rows(elems[1]);
+                bool rr = right_rows >= 0 ? right_rows > 0 : ray_query_expr_reads_rows(elems[2]);
+                bool scalar_ok = !ray_eval_query_helper_active() || lr || rr;
+                if (scalar_ok && (ray_is_atom(left) || lr) && (ray_is_atom(right) || rr)) {
+                    result = ray_concat_text_fn(left, right,
+                                                (left->type == -RAY_STR && lr) ||
+                                                (right->type == -RAY_STR && rr),
+                                                (uint8_t)((lr ? 1 : 0) | (rr ? 2 : 0)));
+                    rows = lr || rr;
+                } else {
+                    result = fn(left, right);
+                    rows = 0;
+                }
+            }
             else
                 result = fn(left, right);
             ray_release(left);
@@ -4109,14 +4798,21 @@ ray_t* ray_eval(ray_t* obj) {
             if (fn_is_restricted(head)) { ray_release(head); ret = ray_error("access", "restricted"); goto out; }
             ray_vary_fn fn = (ray_vary_fn)(uintptr_t)head->i64;
             if (head->attrs & RAY_FN_SPECIAL_FORM) {
+                /* A control form returns one of its operands; any other
+                 * form (a query, a table op) builds a new value. */
+                bool inherits = form_inherits_rows(head);
                 ray_release(head);
-                ret = fn(elems + 1, n - 1); goto out;
+                ret = fn(elems + 1, n - 1);
+                rows = inherits ? g_eval_rows : 0;
+                goto out;
             }
             int64_t argc = n - 1;
             if (argc > 64) { ray_release(head); ret = ray_error("domain", "call: too many args, max 64, got %lld", (long long)argc); goto out; }
             ray_t* args[64];
+            int8_t any_rows = 0;
             for (int64_t i = 0; i < argc; i++) {
                 args[i] = ray_eval(elems[i + 1]);
+                any_rows = rows_join(any_rows, g_eval_rows);
                 if (!args[i] || RAY_IS_ERR(args[i])) {
                     ray_t* err = (!args[i]) ? ray_error("type", NULL) : args[i];
                     for (int64_t j = 0; j < i; j++) ray_release(args[j]);
@@ -4124,6 +4820,8 @@ ray_t* ray_eval(ray_t* obj) {
                     ret = err; goto out;
                 }
             }
+            rows = fn == ray_return_fn ? any_rows
+                 : any_rows && ray_active_query_table() && vm_fn_rowwise(head) ? any_rows : 0;
             if (!(head->attrs & RAY_FN_LAZY_AWARE)) {
                 ray_t* err = materialize_owned_args(args, argc);
                 if (err) { ray_release(head); ret = err; goto out; }
@@ -4137,8 +4835,10 @@ ray_t* ray_eval(ray_t* obj) {
             int64_t argc = n - 1;
             if (argc > 64) { ray_release(head); ret = ray_error("domain", "call: too many args, max 64, got %lld", (long long)argc); goto out; }
             ray_t* args[64];
+            int8_t arg_rows[64];
             for (int64_t i = 0; i < argc; i++) {
                 args[i] = ray_eval(elems[i + 1]);
+                arg_rows[i] = g_eval_rows;
                 if (!args[i] || RAY_IS_ERR(args[i])) {
                     ray_t* err = (!args[i]) ? ray_error("type", NULL) : args[i];
                     for (int64_t j = 0; j < i; j++) ray_release(args[j]);
@@ -4146,7 +4846,18 @@ ray_t* ray_eval(ray_t* obj) {
                     ret = err; goto out;
                 }
             }
-            ray_t* result = call_lambda(head, args, argc);
+            bool query = ray_active_query_table() != NULL;
+            uint64_t row_args = 0;
+            /* The arguments' evaluation says whether they are row data; only
+             * an interpreted helper's result needs the syntactic analysis. */
+            if (query) for (int64_t i = 0; i < argc; i++) {
+                bool r = arg_rows[i] >= 0 ? arg_rows[i] > 0 : ray_query_expr_reads_rows(elems[i + 1]);
+                if (r) row_args |= UINT64_C(1) << i;
+            }
+            bool named = elems[0]->type == -RAY_SYM && !(elems[0]->attrs & ATTR_QUOTED);
+            int8_t result_rows = -1;
+            ray_t* result = call_lambda_impl(head, args, argc, query, row_args, named, &result_rows);
+            rows = result_rows;
             for (int64_t i = 0; i < argc; i++) ray_release(args[i]);
             ray_release(head);
             if (RAY_IS_ERR(result))
@@ -4186,6 +4897,7 @@ out:
             }
         }
     }
+    g_eval_rows = rows;
     __VM->eval_depth--;
     /* End-of-top-level-expression cleanup hook. Every path that
      * entered ray_eval — REPL, IPC, ray_eval_str, file mode — exits

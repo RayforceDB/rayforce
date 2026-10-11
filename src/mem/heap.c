@@ -881,6 +881,7 @@ static void ray_release_owned_refs(ray_t* v) {
             if (LAMBDA_NFO(v)) ray_release(LAMBDA_NFO(v));
             if (LAMBDA_DBG(v)) ray_release(LAMBDA_DBG(v));
             if (LAMBDA_CLOSURE(v)) ray_release(LAMBDA_CLOSURE(v));
+            if (LAMBDA_CAPROWS(v)) ray_release(LAMBDA_CAPROWS(v));
             return;
         }
         if (v->type == RAY_LAZY) {
@@ -1014,6 +1015,7 @@ bool ray_retain_owned_refs(ray_t* v) {
             if (LAMBDA_NFO(v)) ray_retain(LAMBDA_NFO(v));
             if (LAMBDA_DBG(v)) ray_retain(LAMBDA_DBG(v));
             if (LAMBDA_CLOSURE(v)) ray_retain(LAMBDA_CLOSURE(v));
+            if (LAMBDA_CAPROWS(v)) ray_retain(LAMBDA_CAPROWS(v));
             return true;
         }
         /* Lazy handles own their graph uniquely — no retain on copy */
@@ -1131,6 +1133,8 @@ static void ray_detach_owned_refs(ray_t* v) {
             LAMBDA_NFO(v) = NULL;
             LAMBDA_DBG(v) = NULL;
             LAMBDA_CLOSURE(v) = NULL;
+            LAMBDA_CAPROWS(v) = NULL;
+            LAMBDA_CAPQ(v) = 0;
             return;
         }
         if (v->type == RAY_LAZY) {
@@ -3339,6 +3343,7 @@ static size_t retained_walk(const ray_t* v, ptrset_t* seen) {
             n += retained_walk(LAMBDA_NFO(lam), seen);
             n += retained_walk(LAMBDA_DBG(lam), seen);
             n += retained_walk(LAMBDA_CLOSURE(lam), seen);
+            n += retained_walk(LAMBDA_CAPROWS(lam), seen);
             return n;
         }
         if (ray_atom_owns_obj(v)) n += retained_walk(v->obj, seen);

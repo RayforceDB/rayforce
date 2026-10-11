@@ -96,6 +96,19 @@ enum {
                        * push handler as a fallback value */
     OP_FORCE,         /* materialize TOS if it is a lazy handle (so a
                        * let-bound local holds a concrete, reusable value) */
+    OP_BINDCAPS,      /* bind the closure's captures to local slots:
+                       * cpool[operand] is an I64 vector of (name, slot)
+                       * pairs; each name is looked up in the closure dict
+                       * and its value stored into the slot (a name the dict
+                       * lacks leaves the slot empty).  The prologue of every
+                       * compiled closure */
+    OP_LOADSELF,      /* push the running lambda (bare `self` as a value) */
+    OP_MKCLOSURE,     /* pop slots (I64), names (SYM), template (LAMBDA):
+                       * push a closure sharing the template's bytecode,
+                       * capturing the current frame's named slots */
+    OP_LOADENVG,      /* push local slot (1 byte) or, when the slot is still
+                       * empty (a `let` that has not run), the global named
+                       * by cpool[2-byte index], as the tree walker would */
     OP__COUNT
 };
 
@@ -112,7 +125,11 @@ enum {
  *   data[5] = ray_t* nfo          (source location info, NULL if absent)
  *   data[6] = ray_t* dbg          (debug metadata, NULL if absent)
  *   data[7] = ray_t* closure      (captured lexical locals, NULL if empty)
+ *   data[8] = ray_t* caprows      (RAY_U8 row flag per capture, or NULL)
+ *   data[9] = uint32_t capq       (serial of the query frame the closure was
+ *                                  made under, 0 if none; never serialized)
  */
+#define LAMBDA_SLOTS 10
 
 #define RAY_FN_COMPILED  0x40   /* lambda has been compiled to bytecode */
 
@@ -124,6 +141,8 @@ enum {
 #define LAMBDA_NFO(lam)       (((ray_t**)ray_data(lam))[5])
 #define LAMBDA_DBG(lam)       (((ray_t**)ray_data(lam))[6])
 #define LAMBDA_CLOSURE(lam)   (((ray_t**)ray_data(lam))[7])
+#define LAMBDA_CAPROWS(lam)   (((ray_t**)ray_data(lam))[8])
+#define LAMBDA_CAPQ(lam)      (*((uint32_t*)&((ray_t**)ray_data(lam))[9]))
 
 #define LAMBDA_IS_COMPILED(lam) ((lam)->attrs & RAY_FN_COMPILED)
 
@@ -163,6 +182,7 @@ typedef struct {
     ray_t    *fn;                    /* current lambda */
     int32_t  tp;                    /* trap stack pointer */
     ray_t    *ps[VM_STACK_SIZE];     /* program stack */
+    uint8_t  rows[VM_STACK_SIZE];    /* ps[i] is derived from query rows */
     vm_ctx_t rs[VM_STACK_SIZE];     /* return stack */
     vm_trap_t ts[VM_TRAP_SIZE];     /* trap frames */
 } ray_exec_t;
@@ -181,6 +201,17 @@ ray_t* ray_eval_str(const char* source);
 
 /* Compile a lambda's body to bytecode. Called lazily on first invocation. */
 void ray_compile(ray_t* lambda);
+/* The capture names a closure's body can reach (its dict keys the body
+ * mentions; all of them under eval/resolve), as a SYM vector or NULL. */
+ray_t* ray_closure_capture_names(ray_t* lambda);
+ray_t* ray_closure_mentioned_syms(ray_t* body, bool* dynamic, int64_t* weight);
+ray_t* ray_closure_names_from(ray_t* closure, ray_t* mentioned, bool dynamic);
+/* The closure dict shape the compiled capture binding assumes: NULL, or SYM
+ * keys with a LIST of values of the same length. */
+bool   ray_closure_shape_ok(ray_t* closure);
+/* Compile `lambda` with `capnames` bound as locals ahead of the body; false
+ * when the body cannot be compiled. */
+bool   ray_compile_with_captures(ray_t* lambda, ray_t* capnames, bool closure_body);
 
 /* Reset compiler cached state (call from ray_lang_destroy). */
 void ray_compile_reset(void);
@@ -277,6 +308,13 @@ ray_t* ray_apply_fn(ray_t** args, int64_t n);
 /* Collection */
 ray_t* ray_distinct_fn(ray_t* x);
 ray_t* ray_in_fn(ray_t* val, ray_t* vec);
+ray_t* ray_in_eval_fn(ray_t* val, ray_t* vec);
+/* Query text concat; str_out: a STR atom operand is a STR column's cell.
+ * rows_mask bit 0 / bit 1: a / b is a column's cell, so a null one is the
+ * empty text the vector kernel sees, not the null literal that nulls the
+ * result. */
+ray_t* ray_concat_text_fn(ray_t* a, ray_t* b, bool str_out, uint8_t rows_mask);
+ray_t* ray_not_in_fn(ray_t* val, ray_t* vec);
 ray_t* ray_except_fn(ray_t* vec1, ray_t* vec2);
 ray_t* ray_union_fn(ray_t* vec1, ray_t* vec2);
 ray_t* ray_sect_fn(ray_t* vec1, ray_t* vec2);
@@ -371,5 +409,8 @@ ray_t* ray_fn(ray_t** args, int64_t n);
 ray_t* ray_raise_fn(ray_t* val);
 ray_t* ray_try_fn(ray_t* expr, ray_t* handler_expr);
 
+
+bool ray_eval_query_helper_active(void);
+bool ray_eval_query_helper_literals(void);
 
 #endif /* RAY_EVAL_H */

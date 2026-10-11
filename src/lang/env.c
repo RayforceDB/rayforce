@@ -28,6 +28,7 @@
 #include "table/dict.h"
 #include "ops/temporal.h"
 #include "ops/linkop.h"
+#include "ops/ops.h"       /* ray_is_lazy, ray_lazy_materialize — lazy captures */
 #include "mem/sys.h"
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -140,15 +141,36 @@ int64_t ray_env_builtin_sym(const ray_t* fn) {
  * an inner query can bind a same-named column over an outer query column.
  * Query-local callers push a query frame before probing, so scanning every
  * frame still excludes the binding currently being installed. */
+/* A query helper's call frame binds source columns on demand above
+ * `table_from`; those are the query's columns, not lexical locals. */
+static int32_t env_frame_lexical_count(const ray_scope_frame_t* f) {
+    return f->kind == RAY_SCOPE_CALL && f->table ? f->table_from : f->count;
+}
+
 ray_t* ray_env_get_lexical_local(int64_t sym_id) {
     if (!__VM) return NULL;
     for (int32_t d = __VM->scope_depth - 1; d >= 0; d--) {
         ray_scope_frame_t* f = &__VM->scope_stack[d];
         if (f->kind == RAY_SCOPE_QUERY) continue;
-        for (int32_t i = 0; i < f->count; i++)
+        int32_t n = env_frame_lexical_count(f);
+        for (int32_t i = 0; i < n; i++)
             if (f->keys[i] == sym_id) return f->vals[i];
+        if (f->kind == RAY_SCOPE_CALL) break;
     }
     return NULL;
+}
+
+int32_t ray_env_lexical_scope_depth(int64_t sym_id) {
+    if (!__VM) return -1;
+    for (int32_t d = __VM->scope_depth - 1; d >= 0; d--) {
+        ray_scope_frame_t* f = &__VM->scope_stack[d];
+        if (f->kind == RAY_SCOPE_QUERY) continue;
+        int32_t n = env_frame_lexical_count(f);
+        for (int32_t i = 0; i < n; i++)
+            if (f->keys[i] == sym_id) return d + 1;
+        if (f->kind == RAY_SCOPE_CALL) break;
+    }
+    return -1;
 }
 
 bool ray_env_has_lexical_local(int64_t sym_id) {
@@ -157,10 +179,30 @@ bool ray_env_has_lexical_local(int64_t sym_id) {
 
 ray_err_t ray_env_set_query_local(int64_t sym_id, ray_t* val) {
     return ray_env_has_lexical_local(sym_id) ? RAY_OK
-                                              : ray_env_set_local(sym_id, val);
+                                              : ray_env_set_local_rows(sym_id, val, 1);
+}
+
+static _Thread_local uint32_t g_query_serial;
+
+uint32_t ray_env_query_serial(void) {
+    if (!__VM) return 0;
+    for (int32_t d = __VM->scope_depth - 1; d >= 0; d--)
+        if (__VM->scope_stack[d].kind == RAY_SCOPE_QUERY) return __VM->scope_stack[d].serial;
+    return 0;
 }
 
 ray_t* ray_env_capture_locals(void) {
+    return ray_env_capture_locals_rows(NULL, NULL);
+}
+
+/* Cached `self` sym id for ray_env_scope_bind and the capture below —
+ * interned once per sym table generation; invalidated alongside the hook
+ * syms (env_reset_cached_syms). */
+static int64_t g_self_sym = -1;
+
+ray_t* ray_env_capture_locals_rows(ray_t** flags_out, uint32_t* serial_out) {
+    if (flags_out) *flags_out = NULL;
+    if (serial_out) *serial_out = 0;
     if (!__VM || __VM->scope_depth == 0) return NULL;
     int64_t capacity = 0;
     for (int32_t d = 0; d < __VM->scope_depth; d++)
@@ -176,33 +218,80 @@ ray_t* ray_env_capture_locals(void) {
     }
 
     int64_t* key_ids = (int64_t*)ray_data(keys);
+    /* The captures' row provenance, relative to the innermost query: a
+     * binding below that query's frame is plain data for it.  Most
+     * closures are made outside any query, so the flags are gathered in
+     * a small local buffer and become a vector only when one is set. */
+    uint8_t fbuf[256];
+    ray_t* flags = NULL;
+    uint8_t* fl = fbuf;
+    if (capacity > (int64_t)sizeof fbuf) {
+        flags = ray_vec_new(RAY_U8, capacity);
+        if (!flags || RAY_IS_ERR(flags)) { ray_release(keys); ray_release(vals); return flags ? flags : ray_error("oom", NULL); }
+        fl = (uint8_t*)ray_data(flags);
+    }
+    int64_t nflags = 0;
+    bool any_flag = false, outer = false;
+    if (g_self_sym < 0) g_self_sym = ray_sym_intern("self", 4);
     /* Top-to-bottom flattening preserves ordinary lexical lookup: the first
-     * occurrence of a name is the value visible at closure creation. */
+     * occurrence of a name is the value visible at closure creation.  `self`
+     * is never captured: inside the closure it is the closure itself. */
     for (int32_t d = __VM->scope_depth - 1; d >= 0; d--) {
         ray_scope_frame_t* f = &__VM->scope_stack[d];
         for (int32_t i = 0; i < f->count; i++) {
-            if (!f->vals[i]) continue;
+            if (!f->vals[i] || f->keys[i] == g_self_sym) continue;
             bool seen = false;
             for (int64_t k = 0; k < keys->len; k++)
                 if (key_ids[k] == f->keys[i]) { seen = true; break; }
             if (seen) continue;
             key_ids[keys->len++] = f->keys[i];
+            uint8_t r = outer ? 0 : f->rows[i];
+            fl[nflags++] = r;
+            if (r) any_flag = true;
+            if (ray_is_lazy(f->vals[i])) {
+                /* A lazy handle is single-use: capture (and keep bound) the
+                 * concrete value, or the closure's second call would read a
+                 * handle its first call consumed. */
+                ray_t* concrete = ray_lazy_materialize(f->vals[i]);   /* consumes the frame's ref */
+                if (!concrete || RAY_IS_ERR(concrete)) {
+                    f->vals[i] = NULL;
+                    ray_release(keys); ray_release(vals); if (flags) ray_release(flags);
+                    return concrete ? concrete : ray_error("type", NULL);
+                }
+                f->vals[i] = concrete;
+            }
             vals = ray_list_append(vals, f->vals[i]);
             if (!vals || RAY_IS_ERR(vals)) {
-                ray_release(keys);
+                ray_release(keys); if (flags) ray_release(flags);
                 return vals ? vals : ray_error("oom", NULL);
             }
         }
+        if (f->kind == RAY_SCOPE_QUERY) outer = true;
+        if (f->kind == RAY_SCOPE_CALL || f->lexical) break;
     }
     if (keys->len == 0) {
         ray_release(keys);
         ray_release(vals);
+        if (flags) ray_release(flags);
         return NULL;
     }
-    return ray_dict_new(keys, vals);
+    if (any_flag && flags_out && !flags) {
+        flags = ray_vec_new(RAY_U8, nflags);
+        if (!flags || RAY_IS_ERR(flags)) { ray_release(keys); ray_release(vals); return flags ? flags : ray_error("oom", NULL); }
+        memcpy(ray_data(flags), fbuf, (size_t)nflags);
+    }
+    if (flags) flags->len = nflags;
+    ray_t* capture = ray_dict_new(keys, vals);
+    if (capture && !RAY_IS_ERR(capture) && any_flag && flags_out) {
+        *flags_out = flags;
+        if (serial_out) *serial_out = ray_env_query_serial();
+    } else if (flags) ray_release(flags);
+    return capture;
 }
 
-ray_err_t ray_env_push_capture(ray_t* capture) {
+
+
+ray_err_t ray_env_push_capture(ray_t* capture, ray_t* flags, uint32_t serial) {
     if (ray_env_push_scope() != RAY_OK) return RAY_ERR_OOM;
     if (!capture) return RAY_OK;
     if (capture->type != RAY_DICT) {
@@ -217,9 +306,14 @@ ray_err_t ray_env_push_capture(ray_t* capture) {
         return RAY_ERR_TYPE;
     }
     ray_t** value_items = (ray_t**)ray_data(vals);
+    /* The captures' row flags apply only while the query frame the closure
+     * was made under is the innermost query; anywhere else they are data. */
+    const uint8_t* fl = flags && flags->type == RAY_U8 && flags->len == keys->len &&
+                        serial && serial == ray_env_query_serial()
+                      ? (const uint8_t*)ray_data(flags) : NULL;
     for (int64_t i = 0; i < keys->len; i++) {
         int64_t sym = ray_read_sym(ray_data(keys), i, RAY_SYM, keys->attrs);
-        ray_err_t err = ray_env_set_local(sym, value_items[i]);
+        ray_err_t err = ray_env_set_local_rows(sym, value_items[i], fl ? fl[i] : 0);
         if (err != RAY_OK) {
             ray_env_pop_scope();
             return err;
@@ -238,9 +332,7 @@ ray_err_t ray_env_push_capture(ray_t* capture) {
 static int64_t g_ipc_hook_syms[5] = {0};
 static bool    g_ipc_hook_syms_ready = false;
 
-/* Cached `self` sym id for ray_env_scope_bind — interned once per sym
- * table generation; invalidated alongside the hook syms below. */
-static int64_t g_self_sym = -1;
+/* g_self_sym: see its declaration above ray_env_capture_locals_rows. */
 
 static void ipc_hook_syms_ensure(void) {
     if (g_ipc_hook_syms_ready) return;
@@ -300,15 +392,53 @@ void ray_env_destroy(void) {
 /* Flat (non-dotted) lookup — scope stack top-down, then global env.
  * Returns NULL if not bound.  Always used as the head-segment resolver
  * for dotted paths, and as the fast path for plain names. */
-static ray_t* env_lookup_flat(int64_t sym_id) {
+static ray_err_t env_frame_bind(ray_scope_frame_t* f, int64_t sym_id, ray_t* val);
+static ray_err_t env_frame_bind_rows(ray_scope_frame_t* f, int64_t sym_id, ray_t* val, uint8_t rows);
+ray_t* ray_query_helper_value(int64_t sym);   /* ops/query.c */
+
+/* A lookup that reaches a query helper's call frame: a free name that is
+ * a source column binds, on first use, to what the query's own expressions
+ * see for it (the column, or the current row's cell); the frame owns that
+ * binding for the call, so a source column shadows a global of the same
+ * name here as it does in a body the planner inlines.  Any other name
+ * falls through to the globals.  The frame grows past RAY_FRAME_CAP on
+ * demand; only an allocation failure leaves the name unbound. */
+static ray_t* env_call_frame_value(ray_scope_frame_t* f, int64_t sym_id) {
+    if (!f->table) return NULL;
+    /* The query decides what the column means here: the row's cell, the
+     * group's rows or the whole column.  Nothing below the frame is read,
+     * so a caller's locals stay hidden. */
+    ray_t* v = ray_query_helper_value(sym_id);
+    if (!v) return NULL;
+    if (RAY_IS_ERR(v)) { ray_error_free(v); return NULL; }
+    ray_err_t err = env_frame_bind_rows(f, sym_id, v, 1);
+    ray_release(v);
+    return err == RAY_OK ? f->vals[f->count - 1] : NULL;
+}
+
+/* `rows`, when given, is set when the value is a query source column (or
+ * its cell) read through a helper's call frame. */
+static ray_t* env_lookup_flat_rows(int64_t sym_id, uint8_t* rows) {
     /* FFI/embedding callers reach this on threads that never bound a VM
      * (cf. ray_env_get_local, already guarded). Such a thread has no
      * local scopes; global bindings must still resolve. */
     if (__VM) {
+        /* Provenance is relative to the innermost query: a binding below
+         * that query's frame belongs to an outer context and is plain data
+         * for the inner one. */
+        bool outer = false;
         for (int32_t d = __VM->scope_depth - 1; d >= 0; d--) {
             ray_scope_frame_t* f = &__VM->scope_stack[d];
             for (int32_t i = 0; i < f->count; i++) {
-                if (f->keys[i] == sym_id) return f->vals[i];
+                if (f->keys[i] != sym_id) continue;
+                if (rows) *rows = outer ? 0 : f->rows[i];
+                return f->vals[i];
+            }
+            if (f->kind == RAY_SCOPE_QUERY) outer = true;
+            if (f->kind == RAY_SCOPE_CALL) {
+                ray_t* v = env_call_frame_value(f, sym_id);
+                if (v) { if (rows) *rows = outer ? 0 : 1; return v; }
+                break;
             }
         }
     }
@@ -318,12 +448,17 @@ static ray_t* env_lookup_flat(int64_t sym_id) {
     return NULL;
 }
 
+static ray_t* env_lookup_flat(int64_t sym_id) {
+    return env_lookup_flat_rows(sym_id, NULL);
+}
+
 ray_t* ray_env_get_local(int64_t sym_id) {
     if (!__VM) return NULL;
     for (int32_t d = __VM->scope_depth - 1; d >= 0; d--) {
         ray_scope_frame_t* f = &__VM->scope_stack[d];
         for (int32_t i = 0; i < f->count; i++)
             if (f->keys[i] == sym_id) return f->vals[i];
+        if (f->kind == RAY_SCOPE_CALL) break;
     }
     return NULL;
 }
@@ -365,11 +500,16 @@ ray_t* ray_env_get(int64_t sym_id) {
  * fresh result.  Those fresh allocations are exactly why this function
  * has a different retain contract from ray_env_get. */
 ray_t* ray_env_resolve(int64_t sym_id) {
+    return ray_env_resolve_rows(sym_id, NULL);
+}
+
+ray_t* ray_env_resolve_rows(int64_t sym_id, uint8_t* rows) {
+    if (rows) *rows = 0;
     /* Flat lookup first — short-circuits dotted reserved builtins
      * (`.sys.gc`, `.os.getenv`, …) that are additionally bound flat
      * alongside their namespace dict.  Non-dotted names take the
      * same path. */
-    ray_t* flat = env_lookup_flat(sym_id);
+    ray_t* flat = env_lookup_flat_rows(sym_id, rows);
     if (flat) { ray_retain(flat); return flat; }
     if (!ray_sym_is_dotted(sym_id)) return NULL;
 
@@ -380,7 +520,7 @@ ray_t* ray_env_resolve(int64_t sym_id) {
     /* `v` is either a borrowed env/container pointer (fresh=false) or a
      * fresh temporal-extract result (fresh=true).  When switching between
      * the two we must release the previous fresh value to avoid leaks. */
-    ray_t* v = env_lookup_flat(segs[0]);
+    ray_t* v = env_lookup_flat_rows(segs[0], rows);
     bool   fresh = false;
 
     for (int i = 1; v && i < n; i++) {
@@ -429,6 +569,7 @@ ray_t* ray_env_resolve(int64_t sym_id) {
                     break;
                 }
             }
+            if (f->kind == RAY_SCOPE_CALL) break;
         }
         if (!fn) {
             for (int32_t k = 0; k < g_env.count; k++) {
@@ -466,6 +607,16 @@ ray_t* ray_env_resolve(int64_t sym_id) {
  * ray_del_fn's contract via ray_env_set(sym, NULL) and also covers the
  * cascade-up case in env_set_dotted where every dict in a dotted path was
  * emptied by the delete. */
+/* Bumped whenever a global that holds a function, or receives one, is
+ * rebound: a compiled body that baked a builtin by name was compiled under
+ * some value of this counter, and a shared template is reused only while
+ * it has not moved (eval.c, the closure template table). */
+static _Atomic uint64_t g_env_fn_generation = 1;
+uint64_t ray_env_fn_generation(void) { return atomic_load_explicit(&g_env_fn_generation, memory_order_relaxed); }
+static inline bool env_is_fn_value(const ray_t* v) {
+    return v && !RAY_IS_ERR(v) && (v->type == RAY_UNARY || v->type == RAY_BINARY || v->type == RAY_VARY || v->type == RAY_LAMBDA);
+}
+
 static ray_err_t env_bind_global_impl(int64_t sym_id, ray_t* val, int is_user) {
     env_lock();
     for (int32_t i = 0; i < g_env.count; i++) {
@@ -481,6 +632,8 @@ static ray_err_t env_bind_global_impl(int64_t sym_id, ray_t* val, int is_user) {
                 env_unlock();
                 return RAY_OK;
             }
+            if (env_is_fn_value(g_env.vals[i]) || env_is_fn_value(val))
+                atomic_fetch_add_explicit(&g_env_fn_generation, 1, memory_order_relaxed);
             if (g_env.vals[i]) ray_release(g_env.vals[i]);
             ray_retain(val);
             g_env.vals[i] = val;
@@ -503,6 +656,7 @@ static ray_err_t env_bind_global_impl(int64_t sym_id, ray_t* val, int is_user) {
         return RAY_ERR_OOM;
     }
     g_env.keys[g_env.count] = sym_id;
+    if (env_is_fn_value(val)) atomic_fetch_add_explicit(&g_env_fn_generation, 1, memory_order_relaxed);
     ray_retain(val);
     g_env.vals[g_env.count] = val;
     g_env.user[g_env.count] = is_user ? 1 : 0;
@@ -523,8 +677,7 @@ static ray_err_t env_bind_global_user(int64_t sym_id, ray_t* val) {
     return env_bind_global_impl(sym_id, val, 1);
 }
 
-static ray_err_t env_bind_local(int64_t sym_id, ray_t* val) {
-    ray_scope_frame_t* f = &__VM->scope_stack[__VM->scope_depth - 1];
+static ray_err_t env_frame_bind_rows(ray_scope_frame_t* f, int64_t sym_id, ray_t* val, uint8_t rows) {
     for (int32_t i = 0; i < f->count; i++) {
         if (f->keys[i] == sym_id) {
             if (val == NULL) {
@@ -532,6 +685,7 @@ static ray_err_t env_bind_local(int64_t sym_id, ray_t* val) {
                 for (int32_t j = i; j + 1 < f->count; j++) {
                     f->keys[j] = f->keys[j + 1];
                     f->vals[j] = f->vals[j + 1];
+                    f->rows[j] = f->rows[j + 1];
                 }
                 f->count--;
                 return RAY_OK;
@@ -539,6 +693,7 @@ static ray_err_t env_bind_local(int64_t sym_id, ray_t* val) {
             if (f->vals[i]) ray_release(f->vals[i]);
             ray_retain(val);
             f->vals[i] = val;
+            f->rows[i] = rows;
             return RAY_OK;
         }
     }
@@ -547,24 +702,74 @@ static ray_err_t env_bind_local(int64_t sym_id, ray_t* val) {
         int32_t new_cap = f->cap * 2;
         int64_t* nk = (int64_t*)ray_sys_alloc(sizeof(int64_t) * (size_t)new_cap);
         ray_t**  nv = (ray_t**)ray_sys_alloc(sizeof(ray_t*)  * (size_t)new_cap);
-        if (!nk || !nv) {
+        uint8_t* nr = (uint8_t*)ray_sys_alloc((size_t)new_cap);
+        if (!nk || !nv || !nr) {
             if (nk) ray_sys_free(nk);
             if (nv) ray_sys_free(nv);
+            if (nr) ray_sys_free(nr);
             return RAY_ERR_OOM;
         }
         memcpy(nk, f->keys, sizeof(int64_t) * (size_t)f->count);
         memcpy(nv, f->vals, sizeof(ray_t*)  * (size_t)f->count);
+        memcpy(nr, f->rows, (size_t)f->count);
         if (f->keys != f->keys_inline) ray_sys_free(f->keys);
         if (f->vals != f->vals_inline) ray_sys_free(f->vals);
+        if (f->rows != f->rows_inline) ray_sys_free(f->rows);
         f->keys = nk;
         f->vals = nv;
+        f->rows = nr;
         f->cap = new_cap;
     }
     f->keys[f->count] = sym_id;
     ray_retain(val);
     f->vals[f->count] = val;
+    f->rows[f->count] = rows;
     f->count++;
     return RAY_OK;
+}
+
+static ray_err_t env_frame_bind(ray_scope_frame_t* f, int64_t sym_id, ray_t* val) {
+    return env_frame_bind_rows(f, sym_id, val, 0);
+}
+
+static ray_err_t env_bind_local(int64_t sym_id, ray_t* val) {
+    return env_frame_bind(&__VM->scope_stack[__VM->scope_depth - 1], sym_id, val);
+}
+
+ray_err_t ray_env_set_local_rows(int64_t sym_id, ray_t* val, uint8_t rows) {
+    if (!__VM || ray_sym_is_dotted(sym_id) || __VM->scope_depth <= 0) return ray_env_set_local(sym_id, val);
+    if (ray_sym_is_reserved(sym_id) && !ray_sym_is_ipc_hook(sym_id)) return RAY_ERR_RESERVED;
+    return env_frame_bind_rows(&__VM->scope_stack[__VM->scope_depth - 1], sym_id, val, rows);
+}
+
+/* The provenance flag of the binding a plain name resolves to (query and
+ * call frames included, globals excluded), or -1 when it is not bound. */
+int ray_env_binding_rows(int64_t sym_id) {
+    if (!__VM) return -1;
+    bool outer = false;
+    for (int32_t d = __VM->scope_depth - 1; d >= 0; d--) {
+        ray_scope_frame_t* f = &__VM->scope_stack[d];
+        for (int32_t i = 0; i < f->count; i++)
+            if (f->keys[i] == sym_id) return outer ? 0 : f->rows[i];
+        if (f->kind == RAY_SCOPE_QUERY) outer = true;
+        if (f->kind == RAY_SCOPE_CALL) break;
+    }
+    return -1;
+}
+
+/* Inside a helper called from a query: a call frame is met before any
+ * query frame.  A nested query's own frame ends the helper's reach. */
+bool ray_env_in_query_helper(bool* named) {
+    if (!__VM) return false;
+    for (int32_t d = __VM->scope_depth - 1; d >= 0; d--) {
+        ray_scope_frame_t* f = &__VM->scope_stack[d];
+        if (f->kind == RAY_SCOPE_QUERY) return false;
+        if (f->kind == RAY_SCOPE_CALL && f->table) {
+            if (named) *named = f->named != 0;
+            return true;
+        }
+    }
+    return false;
 }
 
 /* Dotted-path write.  base_lookup(head_sym) returns the current binding in
@@ -680,7 +885,7 @@ static ray_err_t env_set_dotted(int64_t sym_id, ray_t* val,
 }
 
 /* Scope-specific base lookups used by env_set_dotted. */
-static ray_t* lookup_global(int64_t sym_id) {
+ray_t* ray_env_get_global(int64_t sym_id) {
     for (int32_t i = 0; i < g_env.count; i++) {
         if (g_env.keys[i] == sym_id) return g_env.vals[i];
     }
@@ -711,7 +916,7 @@ bool ray_sym_is_reserved(int64_t sym_id) {
 
 ray_err_t ray_env_bind(int64_t sym_id, ray_t* val) {
     if (ray_sym_is_dotted(sym_id)) {
-        return env_set_dotted(sym_id, val, lookup_global, env_bind_global);
+        return env_set_dotted(sym_id, val, ray_env_get_global, env_bind_global);
     }
     return env_bind_global(sym_id, val);
 }
@@ -731,7 +936,7 @@ ray_err_t ray_env_set(int64_t sym_id, ray_t* val) {
      * flip, env_bind_global would also be reached via ray_env_bind below
      * and the slot would carry user=0 — leaving it out of <base>.qdb. */
     if (ray_sym_is_dotted(sym_id))
-        return env_set_dotted(sym_id, val, lookup_global, env_bind_global_user);
+        return env_set_dotted(sym_id, val, ray_env_get_global, env_bind_global_user);
     return env_bind_global_user(sym_id, val);
 }
 
@@ -743,8 +948,42 @@ static ray_err_t env_push_scope(uint8_t kind) {
     f->cap = RAY_FRAME_CAP;
     f->count = 0;
     f->kind = kind;
+    f->lexical = 0;
+    f->rows = f->rows_inline;
+    f->named = 0;
+    f->table = NULL;
+    f->table_from = 0;
+    f->serial = 0;
+    if (kind == RAY_SCOPE_QUERY) {
+        if (++g_query_serial == 0) ++g_query_serial;   /* never 0 */
+        f->serial = g_query_serial;
+    }
     __VM->scope_depth++;
     return RAY_OK;
+}
+
+ray_err_t ray_env_push_call_scope(ray_t* table, bool named) {
+    ray_err_t err = env_push_scope(RAY_SCOPE_CALL);
+    if (err != RAY_OK) return err;
+    ray_env_mark_call_scope(table, named);
+    return RAY_OK;
+}
+
+void ray_env_mark_call_scope(ray_t* table, bool named) {
+    ray_scope_frame_t* f = &__VM->scope_stack[__VM->scope_depth - 1];
+    f->kind = RAY_SCOPE_CALL;
+    f->named = named;
+    f->table = table;
+    f->table_from = f->count;
+}
+
+
+/* Mark the frame `below` levels under the top one as a lexical boundary
+ * for closure capture (see ray_scope_frame_t.lexical). */
+void ray_env_mark_lexical_scope(int32_t below) {
+    if (!__VM) return;
+    int32_t d = __VM->scope_depth - 1 - below;
+    if (d >= 0) __VM->scope_stack[d].lexical = 1;
 }
 
 ray_err_t ray_env_push_scope(void) {
@@ -764,11 +1003,17 @@ void ray_env_pop_scope(void) {
     }
     if (f->keys != f->keys_inline) ray_sys_free(f->keys);
     if (f->vals != f->vals_inline) ray_sys_free(f->vals);
+    if (f->rows != f->rows_inline) ray_sys_free(f->rows);
+    f->serial = 0;
     f->keys = f->keys_inline;
     f->vals = f->vals_inline;
+    f->rows = f->rows_inline;
     f->cap = RAY_FRAME_CAP;
     f->count = 0;
     f->kind = RAY_SCOPE_LEXICAL;
+    f->named = 0;
+    f->table = NULL;
+    f->table_from = 0;
 }
 
 /* Materialize compiled-lambda locals into a fresh scope frame — the
@@ -779,7 +1024,7 @@ void ray_env_pop_scope(void) {
  * let-locals whose initializer hasn't executed yet: in the tree walker
  * they wouldn't be bound at this point either, so they're skipped. */
 ray_err_t ray_env_scope_bind(const int64_t* syms, int32_t n, ray_t** slots,
-                             ray_t* self_obj) {
+                             const uint8_t* rows, ray_t* self_obj) {
     ray_err_t err = ray_env_push_scope();
     if (err != RAY_OK) return err;
     if (self_obj) {
@@ -788,7 +1033,7 @@ ray_err_t ray_env_scope_bind(const int64_t* syms, int32_t n, ray_t** slots,
     }
     for (int32_t i = 0; i < n; i++) {
         if (!slots[i]) continue;
-        ray_err_t e = ray_env_set_local(syms[i], slots[i]);
+        ray_err_t e = ray_env_set_local_rows(syms[i], slots[i], rows ? rows[i] : 0);
         if (e != RAY_OK && e != RAY_ERR_RESERVED) {
             ray_env_pop_scope();
             return e;

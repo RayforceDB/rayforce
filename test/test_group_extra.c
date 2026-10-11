@@ -48,6 +48,7 @@
 #include "ops/internal.h"
 #include "ops/hll.h"
 #include "ops/cdfuse.h"
+#include "ops/rowsel.h"
 #include "table/sym.h"
 #include <math.h>
 #include <stdlib.h>
@@ -263,15 +264,9 @@ static test_result_t test_scalar_prod_i64_parallel(void) {
  * Triggers scalar_accum_row FIRST branch (L1729-1732) and LAST (L1733-1734)
  * and the OP_FIRST / OP_LAST merge paths (group.c L2698-2703).
  *
- * In the n_keys=0 parallel path, task ranges are assigned dynamically —
- * worker_id=0 (main thread) does not guarantee processing row 0.  The
- * merge checks m->count[0]==0 to pick FIRST from another worker, but
- * worker 0 always has count>0, so the merge for FIRST/LAST is unreliable
- * when row 0 is processed by a background worker.
- *
- * To make the assertions deterministic regardless of scheduling, we use a
- * constant column (all values = 42).  FIRST and LAST both return 42 no
- * matter which worker processes which row.
+ * A constant column (all values = 42): FIRST and LAST both return 42.
+ * Distinct values, nulls spanning whole chunks and every pool size are
+ * covered by reduction_bits_any_pool below.
  * -------------------------------------------------------------------------- */
 static test_result_t test_scalar_first_last_parallel(void) {
     ray_heap_init();
@@ -820,6 +815,279 @@ static test_result_t test_reduction_var_i64_parallel(void) {
     ray_sym_destroy();
     ray_heap_destroy();
     PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test 12b: keyless reductions give the same bits at any pool size, run
+ * after run
+ *
+ * Pooled keyless reductions — exec_reduction and exec_group's n_keys==0
+ * scan — kept one accumulator per worker.  Under dynamic dispatch the rows
+ * a worker claimed changed from run to run, so a float sum associated
+ * differently on every call: on values whose partial sums overflow or
+ * cancel, (sum p) came out 3.2, 0 or 0Nf.  Partials now belong to chunks
+ * whose shape depends on the row count alone and fold in chunk order, so
+ * every pool size, the serial one included, gives the same bits.  The
+ * keyless scan's FIRST/LAST follow the same chunk order (they used to force
+ * a serial scan), so their values are checked as well.
+ *
+ * Columns:
+ *   p  MAX, -MAX, 3.2 repeating          partial sums overflow
+ *   c  1e16, 1, -1e16 repeating          partial sums cancel
+ *   a  2^53, then 1s                     a 1 is lost next to 2^53, not
+ *                                        next to other 1s: the sum moves
+ *                                        with every split of the rows
+ *   z  +0 / -0 on even rows, i on odd    min is a signed-zero tie
+ *   w  -z                                max is a signed-zero tie
+ *   f  null on the first and last RD_EDGE rows (several chunks), i + 0.5
+ *   q  I64 3i + 1, no nulls (FIRST/LAST without non-null counters)
+ * -------------------------------------------------------------------------- */
+#define RD_N    131073      /* 17 chunks of 8192 rows */
+#define RD_WIDE 8400001     /* past 1024 chunks: 16384-row chunks */
+#define RD_EDGE 20000
+#define RD_MAX  64
+
+static ray_t* rd_add_f64(ray_t* tbl, const char* name, int64_t n) {
+    static const double pp[3] = { DBL_MAX, -DBL_MAX, 3.2 };
+    static const double cc[3] = { 1e16, 1.0, -1e16 };
+    ray_t* v = ray_vec_new(RAY_F64, n);
+    if (!v || RAY_IS_ERR(v)) return NULL;
+    v->len = n;
+    double* d = (double*)ray_data(v);
+    for (int64_t i = 0; i < n; i++) {
+        double zi = (i & 1) ? (double)i : ((i & 2) ? -0.0 : 0.0);
+        switch (name[0]) {
+        case 'p': d[i] = pp[i % 3]; break;
+        case 'c': d[i] = cc[i % 3]; break;
+        case 'a': d[i] = i ? 1.0 : 9007199254740992.0; break;
+        case 'z': d[i] = zi; break;
+        case 'w': d[i] = -zi; break;
+        default:  d[i] = (i < RD_EDGE || i >= n - RD_EDGE) ? NAN : (double)i + 0.5; break;
+        }
+    }
+    if (name[0] == 'f') v->attrs |= RAY_ATTR_HAS_NULLS;
+    tbl = ray_table_add_col(tbl, ray_sym_intern(name, 1), v);
+    ray_release(v);
+    return tbl;
+}
+
+/* p, c and a; unless narrow, also z, w, f and q */
+static ray_t* rd_make_table(int64_t n, bool narrow) {
+    ray_t* tbl = ray_table_new(7);
+    const char* cols[] = { "p", "c", "a", "z", "w", "f" };
+    for (int c = 0; c < (narrow ? 3 : 6) && tbl; c++) tbl = rd_add_f64(tbl, cols[c], n);
+    if (narrow || !tbl) return tbl;
+    ray_t* q = ray_vec_new(RAY_I64, n);
+    if (!q || RAY_IS_ERR(q)) return NULL;
+    q->len = n;
+    for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(q))[i] = 3 * i + 1;
+    tbl = ray_table_add_col(tbl, ray_sym_intern("q", 1), q);
+    ray_release(q);
+    return tbl;
+}
+
+/* Rows a where: keeps — drops every fifth row and every fourth 8192-row
+ * stretch whole. */
+static bool rd_pass(int64_t i) { return i % 5 != 2 && (i / 8192) % 4 != 1; }
+
+static ray_t* rd_make_sel(int64_t n) {
+    ray_t* pred = ray_vec_new(RAY_BOOL, n);
+    if (!pred || RAY_IS_ERR(pred)) return NULL;
+    pred->len = n;
+    for (int64_t i = 0; i < n; i++) ((uint8_t*)ray_data(pred))[i] = rd_pass(i);
+    ray_t* sel = ray_rowsel_from_pred(pred);
+    ray_release(pred);
+    return sel;
+}
+
+/* (op col), through the DAG; with sel, exec_reduction under that where: */
+static ray_t* rd_reduce(ray_t* tbl, const char* col, uint16_t opc, ray_t* sel) {
+    ray_graph_t* g = ray_graph_new(tbl);
+    if (!g) return NULL;
+    ray_op_t* in = ray_scan(g, col);
+    ray_op_t* op = opc == OP_SUM ? ray_sum(g, in) : opc == OP_AVG ? ray_avg(g, in)
+                 : opc == OP_VAR_POP ? ray_var_pop(g, in) : opc == OP_MIN ? ray_min_op(g, in)
+                 : opc == OP_MAX ? ray_max_op(g, in) : opc == OP_FIRST ? ray_first(g, in)
+                 : ray_last(g, in);
+    ray_t* out;
+    if (sel) {
+        g->selection = sel;
+        out = exec_reduction(g, op, ray_table_get_col(tbl, ray_sym_intern(col, 1)));
+        g->selection = NULL;
+    } else {
+        out = ray_execute(g, op);
+    }
+    if (out && !RAY_IS_ERR(out) && ray_is_lazy(out)) out = ray_lazy_materialize(out);
+    ray_graph_free(g);
+    return out;
+}
+
+/* select {a0:(op0 col0) a1:(op1 col1) ...} with no by:, optionally under sel */
+static ray_t* rd_keyless(ray_t* tbl, const char* cols, const uint16_t* ops,
+                         uint32_t n_aggs, ray_t* sel) {
+    ray_graph_t* g = ray_graph_new(tbl);
+    if (!g) return NULL;
+    ray_op_t* ins[8];
+    uint16_t o[8];
+    for (uint32_t a = 0; a < n_aggs; a++) {
+        char name[2] = { cols[a], 0 };
+        ins[a] = ray_scan(g, name);
+        o[a] = ops[a];
+    }
+    ray_op_t* grp = ray_group(g, NULL, 0, o, ins, n_aggs);
+    ray_t* out;
+    if (sel) {
+        g->selection = sel;
+        out = exec_group(g, grp, tbl, 0);
+        g->selection = NULL;
+    } else {
+        out = ray_execute(g, grp);
+    }
+    if (out && !RAY_IS_ERR(out) && ray_is_lazy(out)) out = ray_lazy_materialize(out);
+    ray_graph_free(g);
+    return out;
+}
+
+/* Append the bits of an atom, or of every cell of a 1-row table, to out;
+ * the new count, or -1 for an error result. */
+static int rd_put(ray_t* r, uint64_t* out, int k) {
+    if (k < 0 || !r || RAY_IS_ERR(r)) return -1;
+    if (r->type == RAY_TABLE) {
+        int64_t nc = ray_table_ncols(r);
+        if (ray_table_nrows(r) != 1 || k + nc > RD_MAX) { ray_release(r); return -1; }
+        for (int64_t c = 0; c < nc; c++)
+            memcpy(&out[k++], ray_data(ray_table_get_col_idx(r, c)), sizeof(uint64_t));
+    } else {
+        if (k >= RD_MAX) { ray_release(r); return -1; }
+        memcpy(&out[k++], &r->i64, sizeof(uint64_t));
+    }
+    ray_release(r);
+    return k;
+}
+
+static double rd_f64(uint64_t bits) { double d; memcpy(&d, &bits, sizeof d); return d; }
+
+/* Every reduction under test, in a fixed order, into out[0 .. *n_out);
+ * the order-defined ones (first/last, signed-zero extrema) are checked
+ * against their values. */
+static test_result_t rd_collect(ray_t* tbl, ray_t* sel, int64_t n, bool narrow,
+                                uint64_t* out, int* n_out) {
+    static const uint16_t sums[] = { OP_SUM, OP_AVG, OP_VAR_POP };
+    int k = 0;
+    if (narrow) {   /* the single-pass kernels only: big inputs */
+        k = rd_put(rd_reduce(tbl, "p", OP_SUM, NULL), out, k);
+        k = rd_put(rd_reduce(tbl, "a", OP_SUM, NULL), out, k);
+        k = rd_put(rd_reduce(tbl, "c", OP_AVG, NULL), out, k);
+        k = rd_put(rd_keyless(tbl, "a", (const uint16_t[]){ OP_SUM }, 1, NULL), out, k);
+        k = rd_put(rd_reduce(tbl, "a", OP_SUM, sel), out, k);
+        TEST_ASSERT(k > 0, "keyless reduction failed");
+        *n_out = k;
+        PASS();
+    }
+    for (int c = 0; c < 3; c++)
+        for (int o = 0; o < 3; o++)
+            k = rd_put(rd_reduce(tbl, c == 0 ? "p" : c == 1 ? "c" : "a", sums[o], NULL), out, k);
+    k = rd_put(rd_keyless(tbl, "p", (const uint16_t[]){ OP_SUM }, 1, NULL), out, k);
+    k = rd_put(rd_keyless(tbl, "a", (const uint16_t[]){ OP_SUM }, 1, NULL), out, k);
+    k = rd_put(rd_keyless(tbl, "ccaa", (const uint16_t[]){ OP_SUM, OP_VAR_POP, OP_SUM, OP_AVG }, 4, NULL), out, k);
+    k = rd_put(rd_reduce(tbl, "c", OP_SUM, sel), out, k);
+    k = rd_put(rd_reduce(tbl, "a", OP_SUM, sel), out, k);
+    k = rd_put(rd_keyless(tbl, "pca", (const uint16_t[]){ OP_SUM, OP_SUM, OP_VAR_POP }, 3, sel), out, k);
+    TEST_ASSERT(k > 0, "keyless reduction failed");
+
+    int kv = k;   /* order-defined results start here */
+    static const uint16_t ord[] = { OP_MIN, OP_MAX, OP_FIRST, OP_LAST, OP_FIRST, OP_LAST };
+    static const char ord_cols[] = "zwffqq";
+    for (int o = 0; o < 6; o++) {
+        char col[2] = { ord_cols[o], 0 };
+        k = rd_put(rd_reduce(tbl, col, ord[o], NULL), out, k);
+    }
+    k = rd_put(rd_keyless(tbl, ord_cols, ord, 6, NULL), out, k);
+    k = rd_put(rd_keyless(tbl, "qqp", (const uint16_t[]){ OP_FIRST, OP_LAST, OP_SUM }, 3, NULL), out, k);
+    k = rd_put(rd_keyless(tbl, "zffp", (const uint16_t[]){ OP_MIN, OP_FIRST, OP_LAST, OP_SUM }, 4, sel), out, k);
+    TEST_ASSERT(k > 0, "keyless reduction failed");
+
+    int64_t f_first = RD_EDGE, f_last = n - RD_EDGE - 1;
+    int64_t s_first = f_first, s_last = f_last;
+    while (!rd_pass(s_first)) s_first++;
+    while (!rd_pass(s_last)) s_last--;
+    for (int set = 0; set < 2; set++) {   /* the vector forms, then the keyless scan */
+        const uint64_t* v = out + kv + 6 * set;
+        TEST_ASSERT_FMT(rd_f64(v[0]) == 0.0 && rd_f64(v[1]) == 0.0,
+                        "set %d: min/max of a signed-zero tie gave %g / %g",
+                        set, rd_f64(v[0]), rd_f64(v[1]));
+        TEST_ASSERT_FMT(rd_f64(v[2]) == (double)f_first + 0.5 && rd_f64(v[3]) == (double)f_last + 0.5,
+                        "set %d: first/last f gave %.1f / %.1f", set, rd_f64(v[2]), rd_f64(v[3]));
+        TEST_ASSERT_FMT((int64_t)v[4] == 1 && (int64_t)v[5] == 3 * (n - 1) + 1,
+                        "set %d: first/last q gave %lld / %lld",
+                        set, (long long)v[4], (long long)v[5]);
+    }
+    const uint64_t* v = out + kv + 12;
+    TEST_ASSERT_FMT((int64_t)v[0] == 1 && (int64_t)v[1] == 3 * (n - 1) + 1,
+                    "keyless first/last q (no non-null counters) gave %lld / %lld",
+                    (long long)v[0], (long long)v[1]);
+    v = out + kv + 15;
+    TEST_ASSERT_FMT(rd_f64(v[0]) == 0.0, "selected min z gave %g", rd_f64(v[0]));
+    TEST_ASSERT_FMT(rd_f64(v[1]) == (double)s_first + 0.5 && rd_f64(v[2]) == (double)s_last + 0.5,
+                    "selected first/last f gave %.1f / %.1f, expected %.1f / %.1f",
+                    rd_f64(v[1]), rd_f64(v[2]), (double)s_first + 0.5, (double)s_last + 0.5);
+    *n_out = k;
+    PASS();
+}
+
+static test_result_t rd_check_pools(int64_t n, bool narrow, const uint32_t* pools,
+                                    int n_pools, int reps) {
+    ray_heap_init();
+    (void)ray_sym_init();
+    uint32_t cores = ray_pool_total_workers(ray_pool_get());
+    ray_t* tbl = rd_make_table(n, narrow);
+    ray_t* sel = rd_make_sel(n);
+    test_result_t res = { TEST_PASS, NULL };
+    if (!tbl || RAY_IS_ERR(tbl) || !sel) res = (test_result_t){ TEST_FAIL, "fixture" };
+    uint64_t ref[RD_MAX], got[RD_MAX];
+    int n_ref = 0, n_got = 0;
+    for (int p = 0; p < n_pools && res.status == TEST_PASS; p++) {
+        ray_pool_destroy();
+        ray_pool_init_total(pools[p]);
+        for (int rep = 0; rep < reps && res.status == TEST_PASS; rep++) {
+            bool first_run = p == 0 && rep == 0;
+            res = rd_collect(tbl, sel, n, narrow, first_run ? ref : got,
+                             first_run ? &n_ref : &n_got);
+            if (res.status != TEST_PASS || first_run) continue;
+            for (int i = 0; i < n_ref; i++) {
+                if (n_got == n_ref && got[i] == ref[i]) continue;
+                snprintf(ray_test_fail_buf, sizeof ray_test_fail_buf,
+                         "%lld rows, pool %u run %d: result %d is %016llx (%.17g), "
+                         "pool %u run 0 gave %016llx (%.17g)",
+                         (long long)n, pools[p], rep, i, (unsigned long long)got[i],
+                         rd_f64(got[i]), pools[0], (unsigned long long)ref[i], rd_f64(ref[i]));
+                res = (test_result_t){ TEST_FAIL, ray_test_fail_buf };
+                break;
+            }
+        }
+    }
+    ray_pool_destroy();
+    ray_pool_init_total(cores);
+    if (sel) ray_rowsel_release(sel);
+    if (tbl && !RAY_IS_ERR(tbl)) ray_release(tbl);
+    /* The wide columns' freed mappings would otherwise sit in the direct
+     * reuse cache and serve later tests' size-matched requests. */
+    ray_heap_direct_cache_drain();
+    ray_sym_destroy();
+    ray_heap_destroy();
+    return res;
+}
+
+static test_result_t test_reduction_bits_any_pool(void) {
+    static const uint32_t pools[] = { 1, 2, 5, 8 };
+    return rd_check_pools(RD_N, false, pools, 4, 2);
+}
+
+/* The same past 1024 chunks, where each chunk spans several 8192-row
+ * blocks. */
+static test_result_t test_reduction_bits_wide_chunks(void) {
+    static const uint32_t pools[] = { 1, 5 };
+    return rd_check_pools(RD_WIDE, true, pools, 2, 2);
 }
 
 /* --------------------------------------------------------------------------
@@ -2747,6 +3015,8 @@ const test_entry_t group_extra_entries[] = {
     { "group_extra/count_distinct_small_types",    test_count_distinct_small_types,    NULL, NULL },
     { "group_extra/reduction_prod_parallel",       test_reduction_prod_parallel,       NULL, NULL },
     { "group_extra/reduction_var_i64_parallel",    test_reduction_var_i64_parallel,    NULL, NULL },
+    { "group_extra/reduction_bits_any_pool",       test_reduction_bits_any_pool,       NULL, NULL },
+    { "group_extra/reduction_bits_wide_chunks",    test_reduction_bits_wide_chunks,    NULL, NULL },
     { "group_extra/count_distinct_parallel_types", test_count_distinct_parallel_types, NULL, NULL },
     { "group_extra/count_distinct_per_group_parallel", test_count_distinct_per_group_parallel, NULL, NULL },
     { "group_extra/i16_group_top_count_emit_filter", test_i16_group_top_count_emit_filter, NULL, NULL },

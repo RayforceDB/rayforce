@@ -3022,6 +3022,39 @@ static test_result_t test_exec_str_replace(void) {
     PASS();
 }
 
+/* The low-level text kernel accepts equal-length vectors only, including
+ * empty vectors. Query collection concat is routed elsewhere. */
+static test_result_t test_exec_str_concat_lengths(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+    const int lens[] = { 0, 1, 3 };
+    for (int ai = 0; ai < 3; ai++) for (int bi = 0; bi < 3; bi++) {
+        ray_t* a = ray_vec_new(RAY_STR, lens[ai]);
+        ray_t* b = ray_vec_new(RAY_STR, lens[bi]);
+        for (int i = 0; i < lens[ai]; i++) a = ray_str_vec_append(a, "abcdefghijklmnop", 16);
+        for (int i = 0; i < lens[bi]; i++) b = ray_str_vec_append(b, "qrstuvwxyz", 10);
+        ray_graph_t* g = ray_graph_new(NULL);
+        ray_op_t* args[2] = { ray_const_vec(g, a), ray_const_vec(g, b) };
+        ray_op_t* op = ray_concat(g, args, 2);
+        ray_t* result = ray_execute(g, op);
+        TEST_ASSERT_NOT_NULL(result);
+        if (lens[ai] == lens[bi]) {
+            TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+            TEST_ASSERT_EQ_I(result->len, lens[ai]);
+            ray_release(result);
+        } else {
+            TEST_ASSERT_TRUE(RAY_IS_ERR(result));
+            TEST_ASSERT_TRUE(strcmp(ray_err_code(result), "length") == 0);
+            ray_error_free(result);
+        }
+        ray_graph_free(g);
+        ray_release(a); ray_release(b);
+    }
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 static test_result_t test_exec_str_concat(void) {
     ray_heap_init();
     (void)ray_sym_init();
@@ -17599,6 +17632,7 @@ const test_entry_t exec_entries[] = {
     { "exec/str_substr", test_exec_str_substr, NULL, NULL },
     { "exec/str_replace", test_exec_str_replace, NULL, NULL },
     { "exec/str_concat", test_exec_str_concat, NULL, NULL },
+    { "exec/str_concat_lengths", test_exec_str_concat_lengths, NULL, NULL },
     { "exec/str_if", test_exec_str_if, NULL, NULL },
     { "exec/str_if_scalar", test_exec_str_if_scalar, NULL, NULL },
     { "exec/str_eq_len1_broadcast", test_exec_str_eq_len1_broadcast, NULL, NULL },
