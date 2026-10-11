@@ -2322,41 +2322,6 @@ static bool key_literal_call_pure(ray_t* lit, ray_t** args, int64_t nargs, int d
  * value: a binding the walk made (parameter or `let`), a capture, a binding
  * of a frame in scope, a global.  True when pure: a pure lambda, a pure
  * builtin, or plain data. */
-/* Whether a data value holds no function with an effect: every lambda in
- * a list or a dict's values is pure, and so is every global a symbol
- * there names (one hop: the symbol may be looked up and called).  Past
- * `*budget` elements it is not known. */
-static bool key_container_pure(ray_t* v, int depth, int* budget, const key_pure_ctx_t* ctx) {
-    if (!v || RAY_IS_ERR(v)) return true;
-    if (depth > 16 || --*budget < 0) return false;
-    if (v->type == RAY_LAMBDA) return key_lambda_call_pure(v, NULL, 0, depth, ctx);
-    if (v->type == RAY_UNARY || v->type == RAY_BINARY || v->type == RAY_VARY) {
-        int64_t id = ray_env_builtin_sym(v);
-        return id >= 0 && !key_impure_builtin(v, id);
-    }
-    if (v->type == RAY_DICT) return key_container_pure(ray_dict_vals(v), depth + 1, budget, ctx);
-    if (v->type == RAY_LIST) {
-        ray_t** es = ray_data(v);
-        for (int64_t i = 0; i < v->len; i++)
-            if (!key_container_pure(es[i], depth + 1, budget, ctx)) return false;
-        return true;
-    }
-    if (v->type == -RAY_SYM || v->type == RAY_SYM) {
-        int64_t n = v->type == RAY_SYM ? v->len : 1;
-        if (n > *budget) return false;
-        *budget -= (int)n;
-        for (int64_t i = 0; i < n; i++) {
-            int64_t id = v->type == RAY_SYM ? ray_read_sym(ray_data(v), i, RAY_SYM, v->attrs) : v->i64;
-            ray_t* g = ray_env_get_global(id);
-            if (!g) continue;
-            if (g->type == RAY_LAMBDA && !key_lambda_call_pure(g, NULL, 0, depth + 1, ctx)) return false;
-            if ((g->type == RAY_UNARY || g->type == RAY_BINARY || g->type == RAY_VARY) && key_impure_builtin(g, id)) return false;
-        }
-        return true;
-    }
-    return true;   /* atoms, typed vectors, tables: data */
-}
-
 /* Whether `id` is bound by the walk, a capture or a scope frame, so that
  * it does not mean the global of that name. */
 static bool key_name_shadowed(int64_t id, const key_pure_ctx_t* ctx) {
@@ -2411,10 +2376,11 @@ static bool key_name_pure(int64_t id, ray_t** args, int64_t nargs, int depth, co
     if (v->type == RAY_LAMBDA) return key_lambda_call_pure(v, args, nargs, depth, ctx);
     if (v->type == RAY_UNARY || v->type == RAY_BINARY || v->type == RAY_VARY)
         return !key_impure_builtin(v, id);
-    if (called) return false;                /* data: calling it is an error, not an effect */
-    /* A container is a value the body may take a function out of. */
-    int budget = 4096;
-    return key_container_pure(v, depth + 1, &budget, ctx);
+    /* Data: calling it is an error, not an effect.  Reading it is pure,
+     * whatever it holds; a function taken out of it is caught where it is
+     * called, as a computed callee or a computed function argument of a
+     * builtin that calls it (key_higher_order_pure). */
+    return !called;
 }
 
 /* A value whose every callable is pure: a pure lambda or builtin, data
@@ -2503,9 +2469,11 @@ static int key_higher_order_pure(int64_t id, ray_t** es, int64_t n, int depth, k
     if (key_name_shadowed(id, ctx)) return -1;
     ray_t* fn = ray_env_get_global(id);
     if (!fn || fn->type != RAY_VARY) return -1;      /* rebound by the program */
-    /* A function value is walked as any argument is: a lambda's body, a
-     * builtin's purity, a container's functions. */
-    if (!key_literal_is_fn(es[1])) return -1;
+    /* The builtin calls its first argument.  Anything but a literal must
+     * be known pure where it comes from (a name bound to a pure lambda or
+     * builtin): a function computed out of data (a list, a dict, a table
+     * cell) is a callee the walk cannot see. */
+    if (!key_literal_is_fn(es[1])) return key_arg_callables_pure(es[1], depth + 1, ctx) ? -1 : 0;
     bool acc = k == 2 || k == 3;                      /* fold, scan: accumulator first */
     if (k > 3 || n < 3) return -1;                    /* the shortcut: map, pmap, fold, scan */
     for (int64_t i = 2; i < n; i++)

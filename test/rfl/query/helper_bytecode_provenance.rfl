@@ -482,6 +482,27 @@ CNT11 -- 6
 (set kgl11 (fn [v] (let t (map (fn [f] (f v)) L11)) (kg10 v)))
 (at (select {n: (count v) by: (kgl11 v) from: T10}) 'n) -- [6]
 CNT11 -- 6
+;; data a key only reads is pure whatever it holds, however large: a list of
+;; strings, a dict of symbols, a symbol vector naming an effectful global
+(set LS11 (map (fn [i] (format "x%" i)) (til 5000)))
+(set DB11 (dict (as 'SYMBOL (map (fn [i] (format "s%" i)) (til 5000))) (as 'SYMBOL (map (fn [i] (format "t%" i)) (til 5000)))))
+(set SB11 ['eff11 'a 'b])
+(set krd11 (fn [v] 1 (> (- v (avg v)) (+ (- (count LS11) 5000) (+ (- (count DB11) 5000) (- (count SB11) 3))))))
+(set CNT11 0)
+(at (select {n: (count v) by: (krd11 v) from: T10}) 'n) -- [3 3]
+CNT11 -- 0
+;; ... while a function a builtin calls, taken out of a table cell, a list
+;; cell or a dict cell, is a callee the walk cannot see: an effect
+(set TF11 (update {f: (list eff11 eff11) from: (table [a] (list [1 2]))}))
+(set ktf11 (fn [v] (let t (map (first (at TF11 'f)) (enlist v))) (kg10 v)))
+(set CNT11 0)
+(at (select {n: (count v) by: (ktf11 v) from: T10}) 'n) -- [6]
+CNT11 -- 6
+(set TD11 (table [f] (list (list (dict ['a] (list eff11)) (dict ['a] (list eff11))))))
+(set ktd11 (fn [v] (let t (map (at (first (at TD11 'f)) 'a) (enlist v))) (kg10 v)))
+(set CNT11 0)
+(at (select {n: (count v) by: (ktd11 v) from: T10}) 'n) -- [6]
+CNT11 -- 6
 ;; ... while a pure function value keeps the whole column, a dict's included
 (set kpm11 (fn [v] (> (first (map kg10 (enlist v))) 0)))
 (at (select {n: (count v) by: (kpm11 v) from: T10}) 'n) -- [3 3]

@@ -82,6 +82,9 @@ G -- 700
 (at (update {r: (+ (first (map DG.b (enlist x))) (hg x)) by: k from: TG}) 'r) -- [121 224 327 430 533 636 719 121 224 327 430 533 636 719 121 224 327 430 533 636]
 (set G 0)
 (at (update {r: (+ (first (map (at DG 'b) (enlist x))) (hg x)) by: k from: TG}) 'r) -- [121 224 327 430 533 636 719 121 224 327 430 533 636 719 121 224 327 430 533 636]
+(set G 0)
+(set TGf (update {f: (list bump) from: (table [a] (list [1]))}))
+(at (update {r: (+ (first (map (first (at TGf 'f)) (enlist x))) (hg x)) by: k from: TG}) 'r) -- [121 224 327 430 533 636 719 121 224 327 430 533 636 719 121 224 327 430 533 636]
 ;; ... and a pure expression, inlined once for every group, reads it as well
 (set G 1000)
 (at (update {r: (hg x) by: k from: TG}) 'r) -- [1021 1024 1027 1030 1033 1036 1019 1021 1024 1027 1030 1033 1036 1019 1021 1024 1027 1030 1033 1036]
