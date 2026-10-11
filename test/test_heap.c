@@ -2753,6 +2753,7 @@ static void relieve_env_begin(relieve_env_t* e) {
     ray_heap_set_anon_watermark(INT64_C(1) << 40);
 }
 
+#if defined(__linux__)
 static void relieve_write(const char* path, const char* text) {
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (fd < 0) return;
@@ -2760,6 +2761,7 @@ static void relieve_write(const char* path, const char* text) {
     (void)n;
     close(fd);
 }
+#endif
 
 #if defined(__linux__)
 /* A cgroup directory of the test's own, with a memory.stat, where the
