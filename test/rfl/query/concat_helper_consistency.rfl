@@ -179,6 +179,13 @@ G -- 700
 (set mkcl3 (fn [k] (fn [v] (concat (concat v k) 'b))))
 (set ccl3 (mkcl3 'a))
 (at (select {r: (ccl3 s) from: T}) 'r) -- ['aab 'bab 'cab 'dab 'eab]
+;; a local an eval rebound has unknown provenance: a row-wise builtin over it
+;; does not make it row data, in a closure body as in a named helper
+(set mkcl4 (fn [k] (fn [v] (let w 0) (eval (quote (let w v))) (concat (as 'SYM w) k))))
+(set ccl4 (mkcl4 'z))
+(set hcl4 (fn [v] (let w 0) (eval (quote (let w v))) (concat (as 'SYM w) 'z)))
+(at (select {r: (ccl4 s) from: T}) 'r) -- (at (select {r: (hcl4 s) from: T}) 'r)
+(at (select {r: (ccl4 s) from: T}) 'r) -- (list ['a 'z] ['b 'z] ['c 'z] ['d 'z] ['e 'z])
 ;; a row-flagged column captured after many unflagged bindings keeps its flag
 (set TF1 (table [s] (list (as 'SYMBOL ["a" "b" "a" "c"]))))
 (set hflag1 (fn [v] (let u1 1) ((fn [a] (concat a 'x)) v)))
