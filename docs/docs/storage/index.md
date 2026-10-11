@@ -196,7 +196,7 @@ ray_t* trades = ray_read_parted("db", "trades");
 
 Mounting the same root again on the same thread reuses unchanged partitions while the earlier view is held. Cache entries record the resolved generation directory and the device, inode, size, modification time and change time of the schema and every column file. A changed partition is loaded afresh; a disappeared partition is dropped. Symbol columns must match the root's current domain, so a missing `.sym` is still an error.
 
-The cache holds at most 1024 partition tables per thread. GC and the next mount discard entries whose columns have no external references; heap abandonment, heap teardown and runtime shutdown clear the thread's entries. To release a dropped view's mappings and copied LIST values immediately, call `(.sys.gc)`. C callers can also use `ray_parted_cache_clear()` from `store/part.h` to clear their thread's cache.
+The cache holds at most 1024 partition tables per thread. GC, symbol-domain opens and the next mount discard entries whose columns have no external references; heap abandonment, heap teardown and runtime shutdown clear the thread's entries. To release a dropped view's mappings and copied LIST values immediately, call `(.sys.gc)`. C callers can also use `ray_parted_cache_clear()` from `store/part.h` to clear their thread's cache.
 
 !!! warning "`update` over a partitioned table materializes in memory"
     `update` on a partitioned table flattens the whole table into memory first — the parted/`MAPCOMMON` columns cannot be mutated in place — so the result is an ordinary in-memory table. It is **not** written back to the store: re-reading the root returns the original values, and the returned table loses its parted / memory-mapped identity.

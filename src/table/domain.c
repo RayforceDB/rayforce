@@ -62,6 +62,7 @@
 #include "mem/heap.h"
 #include "mem/sys.h"   /* domain buffers are process-global → mmap-backed, not buddy */
 #include "mem/arena.h"   /* ray_arena_t / ray_arena_str — domain atom storage */
+#include "store/part.h"     /* discard unused partition-owned FILE domains */
 #include "store/fileio.h"   /* flock + tmp/rename protocol for flush */
 #include "ops/hash.h"       /* ray_hash_bytes (same hash family as g_sym) */
 #include "core/pool.h"      /* batch intern: parallel read-only probe */
@@ -589,6 +590,12 @@ static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
 
 static ray_sym_domain_t* dom_open_impl(const char* path, bool create) {
     if (!path) return NULL;
+
+    /* A script or IPC caller may drop a parted view without running GC.
+     * Do not let its cache-only domain survive into a splayed read/write
+     * of a rebuilt root. Prune before taking g_dom_lock: releasing the
+     * cached SYM columns takes that lock itself. Live views keep their refs. */
+    ray_parted_cache_prune();
 
     char* rpath = dom_resolve_path(path);
     if (!rpath) return NULL;
