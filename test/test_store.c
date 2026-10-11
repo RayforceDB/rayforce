@@ -6606,11 +6606,8 @@ static test_result_t test_parted_restored_mtime(void) {
     struct stat st;
     TEST_ASSERT_EQ_I(stat(path, &st), 0);
     struct timespec times[2];
-#ifdef __APPLE__
-    times[0] = st.st_atimespec; times[1] = st.st_mtimespec;
-#else
+    /* _POSIX_C_SOURCE=200809L selects these names on macOS as well. */
     times[0] = st.st_atim; times[1] = st.st_mtim;
-#endif
     /* Let ctime advance even on filesystems with coarse clocks. */
     struct timespec pause = {1, 0};
     nanosleep(&pause, NULL);
