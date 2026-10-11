@@ -32,8 +32,14 @@
 #include "store/col.h"
 #include "store/enccol.h"
 #include "store/stream.h"
+#include "store/splay.h"
+#include "store/part.h"
+#include "store/colrange.h"
+#include "ops/colgather.h"
 #include "vec/str.h"
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -106,9 +112,49 @@ static test_result_t test_stream_crossing_last_row(void) {
     PASS();
 }
 
+/* A row-list gather whose result pool would cross UINT32_MAX fails with
+ * `range` and frees its partial result (allocator accounting at baseline).
+ * Two generation-2 partitions of 2100 strings of 1 MiB each (2.05 GiB of
+ * pool per partition, within one column's limit; 4.1 GiB gathered). */
+static test_result_t test_gather_pool_range(void) {
+    static char big[1 << 20]; memset(big, 'q', sizeof big);
+    for (int p = 0; p < 2; p++) {
+        ray_t* v = ray_vec_new(RAY_STR, 0);
+        for (int i = 0; i < 2100; i++) { big[0] = (char)('a' + i % 26); v = ray_str_vec_append(v, big, sizeof big); }
+        ray_t* t = ray_table_new(1);
+        t = ray_table_add_col(t, ray_sym_intern("s", 1), v); ray_release(v);
+        char dir[256]; snprintf(dir, sizeof dir, LG_TMP "/gp/2024.01.0%d/t", p + 1);
+        char symp[256]; snprintf(symp, sizeof symp, "%s", ray_test_tmp(LG_TMP "/gp/.sym"));
+        TEST_ASSERT_EQ_I(ray_splay_save_mode(t, ray_test_tmp(dir), symp, RAY_COMPRESS_ON), RAY_OK);
+        ray_release(t);
+    }
+    ray_t* t = ray_read_parted(ray_test_tmp(LG_TMP "/gp"), "t");
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    ray_col_src_t s; TEST_ASSERT_NULL(ray_table_col_src(t, ray_sym_intern("s", 1), &s));
+    int64_t* ids = malloc(4200 * sizeof *ids);
+    for (int i = 0; i < 4200; i++) ids[i] = i;
+    /* the source publishes its segment offsets on its first read (owned by
+     * the source, freed at its release): one row first, so the baseline
+     * holds them */
+    ray_t* out = NULL;
+    TEST_ASSERT_NULL(ray_col_gather_rows(&s, ids, 1, &out));
+    ray_release(out); out = NULL;
+    ray_mem_stats_t m0, m1; ray_mem_stats(&m0);
+    ray_t* e = ray_col_gather_rows(&s, ids, 4200, &out);
+    TEST_ASSERT_TRUE(e && RAY_IS_ERR(e));
+    TEST_ASSERT_STR_EQ(ray_err_code(e), "range");
+    TEST_ASSERT_NULL(out);
+    ray_error_free(e);
+    ray_mem_stats(&m1);
+    TEST_ASSERT_EQ_U(m1.bytes_allocated, m0.bytes_allocated);
+    free(ids); ray_col_src_release(&s); ray_release(t);
+    PASS();
+}
+
 const test_entry_t large_entries[] = {
     { "large/pool_exact_limit",         test_pool_exact_limit,         lg_setup, lg_teardown },
     { "large/pool_one_byte_over",       test_pool_one_byte_over,       lg_setup, lg_teardown },
     { "large/stream_crossing_last_row", test_stream_crossing_last_row, lg_setup, lg_teardown },
+    { "large/gather_pool_range",        test_gather_pool_range,        lg_setup, lg_teardown },
     { NULL, NULL, NULL, NULL },
 };

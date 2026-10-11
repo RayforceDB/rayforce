@@ -1,0 +1,287 @@
+/*
+ *   Copyright (c) 2025-2026 Anton Kundenko <singaraiona@gmail.com>
+ *   All rights reserved.
+
+ *   Permission is hereby granted, free of charge, to any person obtaining a copy
+ *   of this software and associated documentation files (the "Software"), to deal
+ *   in the Software without restriction, including without limitation the rights
+ *   to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ *   copies of the Software, and to permit persons to whom the Software is
+ *   furnished to do so, subject to the following conditions:
+
+ *   The above copyright notice and this permission notice shall be included in all
+ *   copies or substantial portions of the Software.
+
+ *   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ *   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ *   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ *   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ *   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ *   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ *   SOFTWARE.
+ */
+
+#include "ops/colgather.h"
+#include "ops/internal.h"     /* parted_sym_width */
+#include "ops/rowsel.h"
+#include "mem/heap.h"         /* ray_scratch_realloc, ray_block_data_bytes */
+#include "table/domain.h"    /* ray_sym_domain_retain */
+#include "table/sym.h"
+#include "vec/str.h"
+#include "vec/vec.h"
+#include <string.h>
+
+/* The result under construction: the output vector (len set, cells filled
+ * by position) and, for STR, the pool built for it (a RAY_U8 block grown
+ * as ray_str_vec_append grows one, attached at the finish). */
+typedef struct {
+    ray_t*  out;
+    ray_t*  pool;
+    uint8_t ow;          /* SYM: the output's width class */
+} gather_acc_t;
+
+static ray_t* acc_open(gather_acc_t* a, const ray_col_src_t* src, int64_t n) {
+    memset(a, 0, sizeof *a);
+    if (src->type == RAY_LIST) return ray_error("nyi", "gather: LIST source");
+    if (src->type == RAY_SYM)
+        /* a parted source's own width is not authoritative (segments may
+         * differ): the widest segment's, as agg_src_standin sizes it */
+        a->ow = src->parted ? parted_sym_width(src->obj) : (uint8_t)(src->attrs & RAY_SYM_W_MASK);
+    ray_t* v = src->type == RAY_SYM ? ray_sym_vec_new(a->ow, n > 0 ? n : 1) : ray_vec_new(src->type, n > 0 ? n : 1);
+    if (!v || RAY_IS_ERR(v)) return v ? v : ray_error("oom", NULL);
+    v->len = n;
+    a->out = v;
+    return NULL;
+}
+
+/* The partial result, its pool and nothing else: the domain is retained
+ * only at the finish. */
+static void acc_abort(gather_acc_t* a) {
+    if (a->out) ray_release(a->out);
+    if (a->pool) ray_release(a->pool);
+    a->out = a->pool = NULL;
+}
+
+/* Copy len bytes into the result's pool: their offset in *off.  `range`
+ * when the pool would cross UINT32_MAX, as for any STR pool. */
+static ray_t* acc_pool_put(gather_acc_t* a, const char* p, uint32_t len, uint32_t* off) {
+    if (!a->pool) {
+        a->pool = ray_alloc(len < 256 ? 256 : (size_t)len * 2);
+        if (!a->pool || RAY_IS_ERR(a->pool)) { a->pool = NULL; return ray_error("oom", NULL); }
+        a->pool->type = RAY_U8;
+        a->pool->len = 0;
+    }
+    uint64_t used = (uint64_t)a->pool->len;
+    if ((uint64_t)len > UINT32_MAX - used)
+        return ray_error("range", "gather: STR pool exceeds %lld bytes", (long long)UINT32_MAX);
+    size_t cap = ray_block_data_bytes(a->pool), need = (size_t)used + len;
+    if (need > cap) {
+        size_t ncap = cap ? cap : 256;
+        while (ncap < need) ncap *= 2;
+        ray_t* np = ray_scratch_realloc(a->pool, ncap);
+        if (!np || RAY_IS_ERR(np)) return ray_error("oom", NULL);
+        a->pool = np;
+    }
+    memcpy((char*)ray_data(a->pool) + used, p, len);
+    a->pool->len = (int64_t)need;
+    *off = (uint32_t)used;
+    return NULL;
+}
+
+/* Elements [i, i + cnt) of view `v` to output positions [pos, pos + cnt),
+ * as generation 0's gather leaves them: STR descriptors rebuilt over the
+ * result's pool (as ray_str_vec_append builds them), SYM ids written as
+ * logical values at the output width, nulls under the view's may_null as
+ * ray_vec_set_null writes them (SYM and STR nulls are in-band and always
+ * tested, as ray_vec_may_have_nulls has it). */
+static ray_t* acc_put(gather_acc_t* a, const ray_col_range_t* v, int64_t i, int64_t pos, int64_t cnt) {
+    ray_t* o = a->out;
+    if (v->type == RAY_STR) {
+        const ray_str_t* sv = (const ray_str_t*)v->data;
+        ray_str_t* d = (ray_str_t*)ray_data(o);
+        for (int64_t k = 0; k < cnt; k++) {
+            const ray_str_t* s = &sv[i + k];
+            ray_str_t e;
+            memset(&e, 0, sizeof e);
+            e.len = s->len;
+            if (s->len == 0) {
+                o->attrs |= RAY_ATTR_HAS_NULLS;
+            } else if (ray_str_is_inline(s)) {
+                memcpy(e.data, s->data, s->len);
+            } else {
+                /* the view's pool lives until the next read: copy now */
+                const char* p = v->str_pool + s->pool_off;
+                uint32_t off;
+                ray_t* err = acc_pool_put(a, p, s->len, &off);
+                if (err) return err;
+                memcpy(e.prefix, p, 4);
+                e.pool_off = off;
+                e.hash32 = ray_str_t_hash32(&e, (const char*)ray_data(a->pool));
+            }
+            d[pos + k] = e;
+        }
+        return NULL;
+    }
+    if (v->type == RAY_SYM) {
+        uint8_t vw = v->attrs & RAY_SYM_W_MASK;
+        void* d = ray_data(o);
+        if (vw == a->ow) {
+            uint8_t esz = ray_sym_elem_size(RAY_SYM, v->attrs);
+            memcpy((char*)d + (size_t)pos * esz, (const char*)v->data + (size_t)i * esz, (size_t)cnt * esz);
+        }
+        uint64_t lim = a->ow == RAY_SYM_W8 ? UINT8_MAX : a->ow == RAY_SYM_W16 ? UINT16_MAX
+                     : a->ow == RAY_SYM_W32 ? UINT32_MAX : UINT64_MAX;
+        for (int64_t k = 0; k < cnt; k++) {
+            uint64_t id = (uint64_t)ray_read_sym(v->data, i + k, RAY_SYM, v->attrs);
+            if (id == 0) o->attrs |= RAY_ATTR_HAS_NULLS;
+            if (vw == a->ow) continue;
+            if (id > lim)    /* the width scan said every segment fits */
+                return ray_error("corrupt", "gather: symbol id %llu above its width class", (unsigned long long)id);
+            ray_write_sym(d, pos + k, id, RAY_SYM, o->attrs);
+        }
+        return NULL;
+    }
+    uint8_t esz = ray_sym_elem_size(v->type, v->attrs);
+    memcpy((char*)ray_data(o) + (size_t)pos * esz, (const char*)v->data + (size_t)i * esz, (size_t)cnt * esz);
+    if (v->may_null)
+        for (int64_t k = 0; k < cnt; k++)
+            if (ray_raw_is_null(v->type, v->attrs, v->data, i + k)) ray_vec_set_null(o, pos + k, true);
+    return NULL;
+}
+
+static ray_t* acc_finish(gather_acc_t* a, const ray_col_src_t* src, ray_t** out) {
+    ray_t* o = a->out;
+    if (a->pool) { o->str_pool = a->pool; a->pool = NULL; }   /* the result's own pool */
+    if (src->type == RAY_SYM && src->dom && src->dom != ray_sym_runtime_domain()) {
+        ray_sym_domain_retain(src->dom);                     /* the agg_src_standin pattern */
+        o->sym_domain = src->dom;
+    }
+    a->out = NULL;
+    *out = o;
+    return NULL;
+}
+
+/* Positions 0..n) ordered by ids[pos], stable (repeated ids keep their
+ * input order): an LSD radix sort, 11-bit digits over the bits of
+ * max_id.  Ids are checked to lie in [0, max_id] by the caller. */
+#define GATHER_RADIX_BITS 11
+static ray_t* gather_order(const int64_t* ids, int64_t n, int64_t max_id, int64_t** out) {
+    int64_t* ord = (int64_t*)ray_alloc_raw((size_t)n * sizeof(int64_t));
+    int64_t* tmp = (int64_t*)ray_alloc_raw((size_t)n * sizeof(int64_t));
+    if (!ord || !tmp) { ray_free_raw(ord); ray_free_raw(tmp); return ray_error("oom", "gather order"); }
+    for (int64_t k = 0; k < n; k++) ord[k] = k;
+    int bits = 0;
+    while (bits < 63 && ((uint64_t)max_id >> bits) != 0) bits++;
+    int64_t cnt[1 << GATHER_RADIX_BITS];
+    for (int sh = 0; sh < bits; sh += GATHER_RADIX_BITS) {
+        memset(cnt, 0, sizeof cnt);
+        for (int64_t k = 0; k < n; k++) cnt[((uint64_t)ids[k] >> sh) & ((1u << GATHER_RADIX_BITS) - 1)]++;
+        int64_t sum = 0;
+        for (int d = 0; d < (1 << GATHER_RADIX_BITS); d++) { int64_t c = cnt[d]; cnt[d] = sum; sum += c; }
+        for (int64_t k = 0; k < n; k++) {
+            int64_t p = ord[k];
+            tmp[cnt[((uint64_t)ids[p] >> sh) & ((1u << GATHER_RADIX_BITS) - 1)]++] = p;
+        }
+        int64_t* sw = ord; ord = tmp; tmp = sw;
+    }
+    ray_free_raw(tmp);
+    *out = ord;
+    return NULL;
+}
+
+ray_t* ray_col_gather_rows(ray_col_src_t* src, const int64_t* ids, int64_t n, ray_t** out) {
+    *out = NULL;
+    if (n < 0) return ray_error("range", "gather: %lld rows", (long long)n);
+    bool sorted = true;
+    for (int64_t k = 0; k < n; k++) {
+        if (ids[k] < 0 || ids[k] >= src->len)
+            return ray_error("range", "gather: row %lld of %lld", (long long)ids[k], (long long)src->len);
+        if (k && ids[k] < ids[k - 1]) sorted = false;
+    }
+    gather_acc_t a;
+    ray_t* err = acc_open(&a, src, n);
+    if (err) return err;
+    /* the decode schedule: positions in id order, so the cursor keeps its
+     * view while the ids stay inside it and each touched vector (segment
+     * local for a parted source) is range-read once; each value still goes
+     * to its own output position */
+    int64_t* ord = NULL;
+    if (!sorted && (err = gather_order(ids, n, src->len - 1, &ord)) != NULL) { acc_abort(&a); return err; }
+    ray_col_fixed_t fixed;                       /* the decode vector on the stack (P2 17i) */
+    ray_col_cursor_t cur;
+    ray_col_cursor_init_lent(&cur, src, &fixed);
+    for (int64_t k = 0; k < n && !err; ) {
+        int64_t pos = ord ? ord[k] : k, r = ids[pos];
+        const ray_col_range_t* v;
+        if ((err = ray_col_cursor_at(&cur, r, &v)) != NULL) break;
+        int64_t end = v->start + v->n;
+        if (!ord) {                              /* in order: consecutive ids are one copy */
+            while (k < n && ids[k] < end && !err) {
+                int64_t j = k + 1;
+                while (j < n && ids[j] == ids[j - 1] + 1 && ids[j] < end) j++;
+                err = acc_put(&a, v, ids[k] - v->start, k, j - k);
+                k = j;
+            }
+            continue;
+        }
+        for (; k < n && !err; k++) {
+            pos = ord[k];
+            r = ids[pos];
+            if (r >= end) break;
+            err = acc_put(&a, v, r - v->start, pos, 1);
+        }
+    }
+    ray_col_cursor_free(&cur);
+    ray_free_raw(ord);
+    if (err) { acc_abort(&a); return err; }
+    return acc_finish(&a, src, out);
+}
+
+ray_t* ray_col_gather_sel(ray_col_src_t* src, ray_t* sel, ray_t** out) {
+    *out = NULL;
+    ray_rowsel_t* m = sel ? ray_rowsel_meta(sel) : NULL;
+    if (m && m->nrows != src->len)
+        return ray_error("length", "gather: selection of %lld rows over %lld", (long long)m->nrows, (long long)src->len);
+    int64_t n = m ? m->total_pass : src->len;
+    gather_acc_t a;
+    ray_t* err = acc_open(&a, src, n);
+    if (err) return err;
+    ray_col_fixed_t fixed;                       /* the decode vector on the stack (P2 17i) */
+    ray_col_cursor_t cur;
+    ray_col_cursor_init_lent(&cur, src, &fixed);
+    int64_t nseg = m ? (int64_t)m->n_segs : (src->len + RAY_MORSEL_ELEMS - 1) / RAY_MORSEL_ELEMS;
+    const uint8_t* flags = sel ? ray_rowsel_flags(sel) : NULL;
+    const uint32_t* offs = sel ? ray_rowsel_offsets(sel) : NULL;
+    const uint16_t* idx = sel ? ray_rowsel_idx(sel) : NULL;
+    int64_t pos = 0;
+    for (int64_t s = 0; s < nseg && !err; s++) {
+        uint8_t f = flags ? flags[s] : RAY_SEL_ALL;
+        if (f == RAY_SEL_NONE) continue;                 /* the vector is never read */
+        int64_t lo = s * RAY_MORSEL_ELEMS;
+        int64_t hi = lo + RAY_MORSEL_ELEMS < src->len ? lo + RAY_MORSEL_ELEMS : src->len;
+        if (f == RAY_SEL_ALL) {
+            /* a segment may span two views (a parted segment boundary) */
+            for (int64_t r = lo; r < hi && !err; ) {
+                const ray_col_range_t* v;
+                if ((err = ray_col_cursor_at(&cur, r, &v)) != NULL) break;
+                int64_t end = v->start + v->n < hi ? v->start + v->n : hi;
+                err = acc_put(&a, v, r - v->start, pos, end - r);
+                pos += end - r;
+                r = end;
+            }
+            continue;
+        }
+        for (uint32_t k = offs[s]; k < offs[s + 1] && !err; ) {
+            const ray_col_range_t* v;
+            if ((err = ray_col_cursor_at(&cur, lo + idx[k], &v)) != NULL) break;
+            int64_t end = v->start + v->n;
+            for (; k < offs[s + 1] && lo + idx[k] < end && !err; k++)
+                err = acc_put(&a, v, lo + idx[k] - v->start, pos++, 1);
+        }
+    }
+    ray_col_cursor_free(&cur);
+    if (!err && pos != n)
+        err = ray_error("corrupt", "gather: selection holds %lld rows, says %lld", (long long)pos, (long long)n);
+    if (err) { acc_abort(&a); return err; }
+    return acc_finish(&a, src, out);
+}
