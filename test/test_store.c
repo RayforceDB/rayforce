@@ -6606,8 +6606,15 @@ static test_result_t test_parted_restored_mtime(void) {
     struct stat st;
     TEST_ASSERT_EQ_I(stat(path, &st), 0);
     struct timespec times[2];
-    /* _POSIX_C_SOURCE=200809L selects these names on macOS as well. */
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+    /* Darwin's POSIX namespace exposes seconds/nanoseconds separately. */
+    times[0] = (struct timespec){ st.st_atime, st.st_atimensec };
+    times[1] = (struct timespec){ st.st_mtime, st.st_mtimensec };
+#elif defined(__APPLE__)
+    times[0] = st.st_atimespec; times[1] = st.st_mtimespec;
+#else
     times[0] = st.st_atim; times[1] = st.st_mtim;
+#endif
     /* Let ctime advance even on filesystems with coarse clocks. */
     struct timespec pause = {1, 0};
     nanosleep(&pause, NULL);
