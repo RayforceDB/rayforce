@@ -7375,7 +7375,10 @@ ray_t* query_cd_gate_where_rows(ray_t* tbl, ray_t* where_expr, int64_t n_table,
     }
     for (int i = 0; i < n_ref && st; i++) {
         ray_t* c = ray_table_get_col(tbl, syms[i]);
-        ray_t* g = ray_vec_new(c->type, n_s);
+        /* a SYM column at its own code width: ray_vec_new would make a
+         * 64-bit one, and the copy below is by the source's width */
+        ray_t* g = c->type == RAY_SYM ? ray_sym_vec_new(c->attrs & RAY_SYM_W_MASK, n_s)
+                                      : ray_vec_new(c->type, n_s);
         if (!g || RAY_IS_ERR(g)) { if (g) ray_release(g); ray_release(st); st = NULL; break; }
         g->len = n_s;
         /* the sampled rows miss the cache: typed loads with reads kept in
@@ -7412,6 +7415,8 @@ ray_t* query_cd_gate_where_rows(ray_t* tbl, ray_t* where_expr, int64_t n_table,
         ray_op_t* pred = compile_expr_dag(gs, where_expr);
         ray_op_t* froot = pred ? ray_filter(gs, ray_const_table(gs, st), pred) : NULL;
         if (froot) froot = ray_optimize(gs, froot);
+        /* the filter returns its input (the sampled table) retained, with
+         * the selection installed on the graph */
         ray_t* fres = froot ? exec_node(gs, froot) : NULL;
         if (fres && !RAY_IS_ERR(fres) && gs->selection) {
             const int64_t kept = ray_rowsel_meta(gs->selection)->total_pass;
@@ -7426,7 +7431,7 @@ ray_t* query_cd_gate_where_rows(ray_t* tbl, ray_t* where_expr, int64_t n_table,
             } else if (out_hdr) { scratch_free(out_hdr); out_hdr = NULL; }
             if (ind) ray_release(ind);
         }
-        if (fres && RAY_IS_ERR(fres)) ray_error_free(fres);
+        if (fres) { if (RAY_IS_ERR(fres)) ray_error_free(fres); else ray_release(fres); }
         ray_graph_free(gs);
     }
     ray_release(st);
@@ -7743,6 +7748,7 @@ static ray_t* try_count_distinct_v2_rewrite(
             ray_graph_free(g_in);
             return (fres && RAY_IS_ERR(fres)) ? fres : NULL;
         }
+        ray_release(fres);   /* the filter returns `tbl` retained; the selection is on the graph */
     }
     ray_op_t* inner = ray_group(g_in, keys_in, n_K + 1,
                                 agg_ops_in, agg_ins_in, 1);

@@ -2665,7 +2665,59 @@ static test_result_t test_cd_route(void) {
         w = ray_eval_str("(quote (>= k 0))");
         TEST_ASSERT_NULL(query_cd_gate_where_rows(tw, w, N, &rows, &nrows, &pop));
         TEST_ASSERT_EQ_I(nrows, N);
+        /* the sampled table and its filter leave nothing behind: eight
+         * rounds hold no more memory than none */
+        ray_release(w);
+        w = ray_eval_str("(quote (!= k 0))");
+        {
+            ray_mem_trace_t mt;
+            TEST_ASSERT_TRUE(ray_mem_trace_begin());
+            for (int round = 0; round < 8; round++) {
+                ray_t* h = query_cd_gate_where_rows(tw, w, N, &rows, &nrows, &pop);
+                if (h) scratch_free(h);
+            }
+            ray_mem_trace_end(&mt);
+            TEST_ASSERT_FMT(mt.net_bytes < (1 << 20), "eight gate samples retain %lld bytes", (long long)mt.net_bytes);
+        }
         ray_release(w); ray_release(kc); ray_release(xc); ray_release(tw);
+    }
+    /* the same key as a SYM column of narrow codes, as a mapped table's
+     * columns are (an in-memory one is 64-bit): the same codes written at
+     * 32 bits over the same domain.  The gather keeps the source's width —
+     * a 64-bit vector took the narrow codes as bytes of garbage — and the
+     * survivors are the rows whose integer twin is nonzero. */
+    {
+        ray_t* k64 = ray_eval_str("(as 'SYM (* (>= (% cr 100) 88) (+ 1 (% (div cr 100) 1000))))");
+        ray_t* ki  = ray_eval_str("(* (>= (% cr 100) 88) (+ 1 (% (div cr 100) 1000)))");
+        ray_t* xc  = ray_eval_str("cr");
+        TEST_ASSERT_NOT_NULL(k64); TEST_ASSERT_NOT_NULL(ki); TEST_ASSERT_NOT_NULL(xc);
+        TEST_ASSERT_EQ_I(k64->type, RAY_SYM);
+        ray_t* k32 = ray_sym_vec_new(RAY_SYM_W32, N);
+        TEST_ASSERT_NOT_NULL(k32); TEST_ASSERT_FALSE(RAY_IS_ERR(k32));
+        k32->len = N;
+        for (int64_t i = 0; i < N; i++)
+            ray_write_sym(ray_data(k32), i, (uint64_t)ray_read_sym(ray_data(k64), i, RAY_SYM, k64->attrs),
+                          RAY_SYM, k32->attrs);
+        ray_sym_vec_adopt_domain(k32, k64);
+        TEST_ASSERT_EQ_I(k32->attrs & RAY_SYM_W_MASK, RAY_SYM_W32);
+        ray_t* ts = ray_table_new(0);
+        TEST_ASSERT_NOT_NULL(ts); TEST_ASSERT_FALSE(RAY_IS_ERR(ts));
+        ts = ray_table_add_col(ts, ray_sym_intern("k", 1), k32);
+        ts = ray_table_add_col(ts, ray_sym_intern("x", 1), xc);
+        TEST_ASSERT_NOT_NULL(ts); TEST_ASSERT_FALSE(RAY_IS_ERR(ts));
+        ray_t* w = ray_eval_str("(quote (!= k \"0\"))");
+        TEST_ASSERT_NOT_NULL(w);
+        const int64_t* rows = NULL;
+        int64_t nrows = 0, pop = 0;
+        ray_t* hdr = query_cd_gate_where_rows(ts, w, N, &rows, &nrows, &pop);
+        TEST_ASSERT_NOT_NULL(hdr);
+        TEST_ASSERT_FMT(nrows > 262144 / 10 && nrows < 262144 / 7, "narrow SYM survivors: %lld", (long long)nrows);
+        const int64_t* kd = (const int64_t*)ray_data(ki);
+        int64_t zeros = 0;
+        for (int64_t j = 0; j < nrows; j++) if (kd[rows[j]] == 0) zeros++;
+        TEST_ASSERT_EQ_I(zeros, 0);
+        scratch_free(hdr);
+        ray_release(w); ray_release(ts); ray_release(k32); ray_release(xc); ray_release(ki); ray_release(k64);
     }
 
     /* a key the estimate does not cover takes the rewrite; a value it does
