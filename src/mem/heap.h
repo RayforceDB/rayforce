@@ -271,17 +271,35 @@ void ray_heap_release_pages(void);
 void    ray_heap_note_activity(void);
 int64_t ray_heap_decay_due_ms(void);
 int64_t ray_heap_decay(void);
-/* At a statement boundary: when the next pool would not fit under the anon
- * watermark and handing back what is free would make it fit, unmap empty
- * pools, drain the direct-block cache and release the pages of free blocks
- * now rather than at the idle decay.  No-op otherwise, inside parallel work,
- * and without file spill (Windows). */
+/* At a statement boundary: after a statement that spilled (or one that,
+ * right after such a relief, needed its room for large blocks), unmap the
+ * empty pools of the heaps that did not spill a pool when that makes room
+ * for the next pool under the anon watermark, drain the direct-block cache
+ * and release the pages of free blocks — unless the last relief was
+ * followed by a spill all the same.  Otherwise, near the watermark, park
+ * empty pools.  Empty spill pools are parked too, their files and mappings
+ * kept for the next spill but their pages discarded, a dirty one unwritten
+ * (where the platform cannot discard them, unmapped instead), and unmapped
+ * when the relief acts, from every heap but for a heap's last pool, or at
+ * the decay threshold.
+ * No-op inside parallel work and without file spill (Windows). */
 int64_t ray_heap_relieve(void);
 
 /* Set the threshold directly; negative disables.  The environment is read
  * once on first use, so this exists to let a test drive the policy without
  * re-exec — not as a runtime knob. */
 void ray_heap_set_decay_ms(int64_t ms);
+
+/* Whether an empty parked spill pool's pages are discarded at the boundary
+ * (true) or the pool is unmapped, as where the platform cannot discard
+ * them (false).  Policy; it exists for tests, as ray_heap_set_decay_ms. */
+bool ray_heap_set_spill_discard(bool on);   /* returns the setting it replaced */
+/* Whether a parked spill pool's pages are discarded here and now: the
+ * platform can punch a mapped range, and the setting allows it. */
+bool ray_heap_spill_discards(void);
+/* How many parked spill pools a boundary has set out to discard so far —
+ * each once per use (ray_heap_relieve).  For tests. */
+int64_t ray_heap_spill_discard_count(void);
 
 /* --------------------------------------------------------------------------
  * Constants
@@ -338,6 +356,15 @@ static inline bool ray_direct_file_backed(const ray_t* v) {
     return ((const ray_direct_hdr_t*)((const char*)v - RAY_DIRECT_HDR))->swap_fd >= 0;
 }
 
+/* Bytes [0, upto) of ray_alloc_raw block `p` are not read again, and [0,
+ * from) of them were reported before.  When `p` is spilled (a direct block
+ * over a spill file), the whole pages among them are punched out of the
+ * file now: a dirty one is never written back, and the page cache it held
+ * is free for what comes next.  They read zero after.  A no-op for every
+ * other block, and where the platform cannot punch a mapped range.  True
+ * when pages were punched out. */
+bool ray_raw_discard(void* p, size_t from, size_t upto);
+
 /* Anonymous (RAM-resident, OOM-killable) pool, direct and sys bytes currently
  * committed.  Allocations that would push this past the anon watermark
  * (default: ray_sys_ram_limit — physical RAM, or the container's cgroup
@@ -376,7 +403,8 @@ void    ray_heap_direct_cache_drain(void);
 typedef struct {
     uint16_t heap_id;     /* owning heap ID (for cross-thread free) */
     uint8_t  pool_order;  /* pool's top order */
-    uint8_t  _pad[5];
+    uint8_t  _pad;
+    uint32_t parked_ms;   /* when it was last parked, ms, wrapping (heap_park_empty_pools) */
     void*    vm_base;     /* original mmap base (for ray_vm_free on Windows) */
 } ray_pool_hdr_t;
 
@@ -436,7 +464,11 @@ typedef struct {
     uint8_t  pool_order;   /* pool order for munmap sizing */
     uint8_t  backed;       /* 0 = anon mmap, 1 = file-backed swap */
     uint8_t  hugepage;     /* 1 = THP hint issued (Linux); 0 otherwise */
-    uint8_t  _pad[1];
+    uint8_t  parked    : 1;  /* empty, its blocks off the freelists
+                              * (heap_park_empty_pools) */
+    uint8_t  discarded : 1;  /* parked spill pool whose pages were discarded
+                              * since it was last in use
+                              * (heap_spill_pools_discard) */
 } ray_pool_entry_t;
 
 /* --------------------------------------------------------------------------
@@ -553,6 +585,8 @@ typedef struct ray_heap {
     ray_mem_stats_t  stats;
     uint32_t        pool_count;                  /* number of tracked pools */
     uint32_t        last_pool_idx;               /* MRU pool index for warm-first ray_free */
+    uint32_t        parked;                      /* pools parked among them */
+    uint32_t        spilled;                     /* a pool spilled since a boundary looked */
     ray_pool_entry_t pools[RAY_MAX_POOLS];         /* pool tracking for destroy/merge */
     struct ray_heap* pending_next;                /* link for pending-merge LIFO queue */
     struct ray_heap* idle_next;                   /* link for the abandoned-heap LIFO */
