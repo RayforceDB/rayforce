@@ -906,7 +906,9 @@ static test_result_t test_eval_sym(void) {
  * answer equals the generation-0 comparison's over the vector's rows
  * (1 all pass, 0 none, -1 mixed). */
 static ray_t* aw_fvec(int8_t type, double x, int null_every) {
-    ray_t* v = ray_vec_new(type, 1024); v->len = 1024;
+    ray_t* v = ray_vec_new(type, 1024);
+    if (!v || RAY_IS_ERR(v)) return NULL;
+    v->len = 1024;
     for (int i = 0; i < 1024; i++) {
         if (type == RAY_F64) ((double*)ray_data(v))[i] = x; else ((float*)ray_data(v))[i] = (float)x;
     }
