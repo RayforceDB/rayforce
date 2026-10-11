@@ -47,6 +47,10 @@
 (set pk0 (at (.sys.mem) 'peak-bytes))
 (count (select {by: {kk: (+ lo 1)} from: Pmw})) -- 10
 (< (- (at (.sys.mem) 'peak-bytes) pk0) (/ Bmw 4)) -- true
+;; a key the planner cannot lower flattens only the columns the select reads
+(set pk0 (at (.sys.mem) 'peak-bytes))
+(count (select {c: (count k) by: (reverse lo) from: Pmw})) -- 10
+(< (- (at (.sys.mem) 'peak-bytes) pk0) (/ Bmw 4)) -- true
 ;; every key unique: the result is the whole table, and little more
 (set pk0 (at (.sys.mem) 'peak-bytes))
 (count (select {by: k from: Pmw})) -- 40000

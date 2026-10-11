@@ -10233,6 +10233,72 @@ ray_t* ray_select(ray_t** args, int64_t n) {
 /* The hidden name a bare computed by: key is grouped under (#707). */
 #define SELECT_COMPUTED_KEY "__by_key"
 
+/* The select dict with `from:` set to `tbl` (owned; `tbl` retained). */
+static ray_t* select_dict_with_from(ray_t* dict, ray_t* tbl) {
+    ray_t* keys = ray_dict_keys(dict);
+    ray_t* vals = ray_dict_vals(dict);
+    if (!keys || keys->type != RAY_SYM || !vals || vals->type != RAY_LIST)
+        return ray_error("domain", "select: a clause dict");
+    int64_t nd = ray_dict_len(dict);
+    int64_t id_from = ray_sym_intern("from", 4);
+    ray_t* ck = ray_vec_new(RAY_SYM, nd);
+    ray_t* cv = ray_list_new((int32_t)nd);
+    if (!ck || RAY_IS_ERR(ck) || !cv || RAY_IS_ERR(cv)) {
+        if (ck && !RAY_IS_ERR(ck)) ray_release(ck);
+        if (cv && !RAY_IS_ERR(cv)) ray_release(cv);
+        return ray_error("oom", NULL);
+    }
+    for (int64_t i = 0; i < nd && cv && !RAY_IS_ERR(cv); i++) {
+        int64_t kid = sym_cell_runtime_id(keys, i);
+        ((int64_t*)ray_data(ck))[ck->len++] = kid;
+        cv = ray_list_append(cv, kid == id_from ? tbl : ((ray_t**)ray_data(vals))[i]);
+    }
+    if (!cv || RAY_IS_ERR(cv)) { ray_release(ck); return cv ? cv : ray_error("oom", NULL); }
+    return ray_dict_new(ck, cv);
+}
+
+static bool parted_clauses_plain(ray_t* dict);
+
+/* The columns of a parted table a select reads, flattened: every column a
+ * clause names, in the table's order; the whole table when a clause runs
+ * code whose column reads it does not show, or names no column. */
+static ray_t* parted_flatten_read_cols(ray_t* dict, ray_t* tbl) {
+    int64_t nc = ray_table_ncols(tbl);
+    ray_t* keys = ray_dict_keys(dict);
+    ray_t* vals = ray_dict_vals(dict);
+    if (nc <= 0 || nc > 256 || !keys || keys->type != RAY_SYM || !vals || vals->type != RAY_LIST ||
+        !parted_clauses_plain(dict))
+        return query_materialize_parted_table(tbl);
+    int64_t id_from = ray_sym_intern("from", 4);
+    int64_t refs[256];
+    int nref = 0;
+    for (int64_t i = 0; i < ray_dict_len(dict); i++) {
+        if (sym_cell_runtime_id(keys, i) == id_from) continue;
+        ray_t* v = ((ray_t**)ray_data(vals))[i];
+        int64_t nsym = v && v->type == -RAY_SYM ? 1 : (v && v->type == RAY_SYM ? v->len : 0);
+        for (int64_t j = 0; j < nsym; j++) {   /* a sort key, quoted or not */
+            int64_t s = v->type == -RAY_SYM ? v->i64 : sym_cell_runtime_id(v, j);
+            bool seen = false;
+            for (int r = 0; r < nref; r++) seen |= refs[r] == s;
+            if (!seen && nref < 256 && ray_table_get_col(tbl, s)) refs[nref++] = s;
+        }
+        if (nsym == 0) nref = collect_col_refs_set(v, tbl, refs, 256, nref);
+    }
+    if (nref == 0) return query_materialize_parted_table(tbl);
+    ray_t* out = ray_table_new(nref);
+    for (int64_t c = 0; c < nc && out && !RAY_IS_ERR(out); c++) {
+        int64_t cn = ray_table_col_name(tbl, c);
+        bool want = false;
+        for (int r = 0; r < nref; r++) want |= refs[r] == cn;
+        if (!want) continue;
+        ray_t* v = query_materialize_parted_col(ray_table_get_col_idx(tbl, c));
+        if (!v || RAY_IS_ERR(v)) { ray_release(out); return v ? v : ray_error("oom", NULL); }
+        out = ray_table_add_col(out, cn, v);
+        ray_release(v);
+    }
+    return out ? out : ray_error("oom", NULL);
+}
+
 /* A bare computed by: key (`by: (% v 3)`) groups on the DAG path only beside
  * plain aggregates.  Any other output (a `distinct` aggregate, a row
  * expression) would send it to the eval-level grouping, which is slower
@@ -10290,6 +10356,25 @@ static ray_t* select_plan_computed_key(ray_t* dict, ray_t* tbl, int64_t* key_nam
                 ray_release(base);
                 base = filtered;
                 where_applied = true;
+            }
+            /* Over a parted table the key reads whole columns, not the
+             * partitions: with no output, the first-rows path groups a
+             * flattened narrow copy (select_parted_first_rows); otherwise
+             * the columns the select reads are flattened here.  A where:
+             * has flattened the rows it keeps already. */
+            if (!where_applied && table_has_parted_columns(base)) {
+                bool any_out = false;
+                for (int64_t i = 0; i < nd && !any_out; i++) {
+                    int64_t kid = sym_cell_runtime_id(keys, i);
+                    bool rsv = false;
+                    for (int r = 0; r < 7; r++) rsv |= kid == rid[r];
+                    any_out = !rsv;
+                }
+                if (!any_out) { ray_release(base); return NULL; }
+                ray_t* flat = parted_flatten_read_cols(dict, base);
+                ray_release(base);
+                if (!flat || RAY_IS_ERR(flat)) return flat ? flat : ray_error("oom", NULL);
+                base = flat;
             }
             /* The key sees the whole column.  If a conditional inside it
              * tested a vector derived from the rows, the body meant one
@@ -11131,9 +11216,18 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, bool aliases_resolved,
         ray_t* first = select_parted_first_rows(dict, tbl, aliases_resolved);
         if (first) { ray_release(tbl); DICT_VIEW_CLOSE(dv); return first; }
         ray_t* flat = query_materialize_parted_table(tbl);
+        if (!flat || RAY_IS_ERR(flat)) { ray_release(tbl); DICT_VIEW_CLOSE(dv); return flat ? flat : ray_error("oom", NULL); }
+        /* The select runs again over the flattened table, from the start:
+         * a key the planner cannot lower is evaluated over its columns
+         * there (select_plan_computed_key), as over any flat table. */
+        ray_t* fd = select_dict_with_from(dict, flat);
+        ray_release(flat);
         ray_release(tbl);
-        if (!flat || RAY_IS_ERR(flat)) { DICT_VIEW_CLOSE(dv); return flat ? flat : ray_error("oom", NULL); }
-        tbl = flat;
+        DICT_VIEW_CLOSE(dv);
+        if (!fd || RAY_IS_ERR(fd)) return fd ? fd : ray_error("oom", NULL);
+        ray_t* r = ray_select_impl(&fd, 1, true);
+        ray_release(fd);
+        return r;
     }
 
     /* Whole-table aggregates answered from column metadata:
