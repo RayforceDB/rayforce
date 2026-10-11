@@ -591,7 +591,7 @@ int64_t agg_group_card_estimate(ray_t** key_cols, uint32_t n_keys, int64_t nrows
             return -1;
         }
         int64_t est = agg_key_card_sampled(kc, nrows, cap);
-        if (est < 0) return -1;
+        if (est < 1) return -1;   /* -1 on OOM; never 0 (static analysis) */
         if (total > INT64_MAX / est) return -1;
         total *= est;
     }
