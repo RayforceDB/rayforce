@@ -109,6 +109,15 @@ enum {
     OP_LOADENVG,      /* push local slot (1 byte) or, when the slot is still
                        * empty (a `let` that has not run), the global named
                        * by cpool[2-byte index], as the tree walker would */
+    OP_SCOPE_EVAL,    /* OP_SCOPE_BEGIN for the windows compiled code opens
+                       * around text it hands to the tree walker (eval, a
+                       * dynamic special form, a fn literal): the frame
+                       * binds the locals for that text only, not for what
+                       * it calls, and ends its scope */
+    OP_CALL1R,        /* OP_CALL1 / OP_CALL2 / OP_CALLN, each with an argc   */
+    OP_CALL2R,        /* operand, for a builtin a closure body resolves when */
+    OP_CALLNR,        /* it runs: the fast call while the name holds a builtin
+                       * of that kind, OP_CALLF's general call otherwise */
     OP__COUNT
 };
 
@@ -201,6 +210,12 @@ ray_t* ray_eval_str(const char* source);
 
 /* Compile a lambda's body to bytecode. Called lazily on first invocation. */
 void ray_compile(ray_t* lambda);
+/* ray_compile for a lambda with nothing captured, also handing back the
+ * bindings its code depends on (see compile.c). */
+bool ray_compile_definition(ray_t* lambda, ray_t** deps);
+/* The most bytes a literal's text may hold for the template table to keep
+ * it (eval.c), and where the compiler's weight count may stop. */
+#define RAY_CLOSURE_TMPL_MAX_BYTES ((int64_t)64 * 1024)
 /* The capture names a closure's body can reach (its dict keys the body
  * mentions; all of them under eval/resolve), as a SYM vector or NULL. */
 ray_t* ray_closure_capture_names(ray_t* lambda);

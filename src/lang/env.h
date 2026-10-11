@@ -142,8 +142,6 @@ int64_t ray_env_builtin_sym(const ray_t* fn);
 
 /* Local scope stack for lexical binding (let, do, lambda) */
 ray_err_t ray_env_push_scope(void);
-/* Moves whenever a global holding or receiving a function is rebound. */
-uint64_t  ray_env_fn_generation(void);
 void      ray_env_mark_lexical_scope(int32_t below);
 /* A named-call boundary: lookups below it see only `table`'s columns
  * (NULL for none) and then the globals. */
@@ -162,6 +160,25 @@ int       ray_env_binding_rows(int64_t sym_id);
 /* ray_env_resolve, also reporting through `rows` whether the value is a
  * query source column (or its cell) read through a helper's call frame. */
 ray_t*    ray_env_resolve_rows(int64_t sym_id, uint8_t* rows);
+/* ray_env_resolve_rows for a name compiled code resolves at run time: an
+ * `eval` window on the scope stack belongs to a caller and is passed by. */
+ray_t*    ray_env_resolve_compiled(int64_t sym_id, uint8_t* rows);
+/* ray_env_resolve_compiled's per-thread answers, valid while this thread's
+ * frame epoch and the global epoch are those they were cached under; the
+ * VM reads them inline before calling it. */
+#define RAY_RESOLVE_CACHE_BITS 8
+typedef struct { int64_t sym; uint64_t fe, ge; ray_t* val; uint8_t rows; } ray_resolve_cache_t;
+extern _Thread_local uint64_t g_frame_epoch;
+extern _Atomic uint64_t g_global_epoch;
+extern _Thread_local ray_resolve_cache_t g_resolve_cache[1 << RAY_RESOLVE_CACHE_BITS];
+static inline uint32_t ray_resolve_cache_slot(int64_t sym_id) {
+    return (uint32_t)(((uint64_t)sym_id * UINT64_C(0x9E3779B97F4A7C15)) >> (64 - RAY_RESOLVE_CACHE_BITS));
+}
+/* ray_env_get for the compiler: an `eval` window on the scope stack belongs
+ * to a caller of the body being compiled and is passed by. */
+ray_t*    ray_env_get_compiled(int64_t sym_id);
+/* Mark the top scope frame as a compiled frame's `eval`/`resolve` window. */
+void      ray_env_mark_eval_window(void);
 ray_err_t ray_env_push_query_scope(void);
 void ray_env_pop_scope(void);
 int32_t   ray_env_scope_depth(void);
@@ -170,6 +187,9 @@ int32_t   ray_env_scope_depth(void);
 bool      ray_env_query_scope_above(int32_t depth);
 ray_err_t ray_env_set_local(int64_t sym_id, ray_t* val);
 ray_t*    ray_env_get_lexical_local(int64_t sym_id);
+/* The same for a body an `eval` window's text calls: every window is
+ * passed by (see ray_scope_frame_t.eval_window). */
+ray_t*    ray_env_get_lexical_local_callee(int64_t sym_id);
 bool      ray_env_has_lexical_local(int64_t sym_id);
 int32_t   ray_env_lexical_scope_depth(int64_t sym_id);
 ray_err_t ray_env_set_query_local(int64_t sym_id, ray_t* val);
