@@ -4444,11 +4444,13 @@ static test_result_t test_relieve_visit_drains(void) {
 }
 
 /* Pool-worker tasks: each worker keeps one half-pool block live, then takes
- * another and frees it, leaving its heap an empty pool that is not its last. */
+ * `empty` more (one when 0, at most 4) and frees them, leaving its heap that
+ * many empty pools, none of them its last. */
 #define RELIEVE_WORKERS 64
 typedef struct {
     _Atomic(int) ran[RELIEVE_WORKERS];
     ray_t*       keep[RELIEVE_WORKERS];
+    int          empty;
 } relieve_workers_t;
 
 static void relieve_worker_task(void* raw, uint32_t wid, int64_t start, int64_t end) {
@@ -4456,9 +4458,20 @@ static void relieve_worker_task(void* raw, uint32_t wid, int64_t start, int64_t 
     relieve_workers_t* w = raw;
     if (wid == 0 || wid >= RELIEVE_WORKERS) return;   /* the dispatching thread */
     if (!w->keep[wid]) w->keep[wid] = ray_alloc(RELIEVE_HALF);
-    ray_t* b = ray_alloc(RELIEVE_HALF);
-    if (b) { memset(ray_data(b), 1, 4096); ray_free(b); }
+    ray_t* b[4] = {0};
+    int n = w->empty < 1 ? 1 : w->empty > 4 ? 4 : w->empty;
+    for (int i = 0; i < n; i++)
+        if ((b[i] = ray_alloc(RELIEVE_HALF))) memset(ray_data(b[i]), 1, 4096);
+    for (int i = 0; i < n; i++) if (b[i]) ray_free(b[i]);
     atomic_store_explicit(&w->ran[wid], 1, memory_order_relaxed);
+}
+
+/* The empty pools each worker is to keep for at least `pools` in all,
+ * whatever the number of workers. */
+static int relieve_worker_share(int pools) {
+    ray_pool_t* pool = ray_pool_get();
+    int n = pool ? (int)pool->n_workers : 0;
+    return n > 0 ? (pools + n - 1) / n : 1;
 }
 
 /* Dispatch until every worker has run a task; false without workers. */
@@ -4684,13 +4697,16 @@ static test_result_t test_relieve_needed_baseline(void) {
 #endif
     static relieve_workers_t w;
     memset(&w, 0, sizeof w);
+    w.empty = relieve_worker_share(2);          /* room for the light statement */
     relieve_env_t e;
     relieve_env_begin(&e);
     ray_heap_t* h = relieve_heap_new(&e);
     if (!h) { relieve_env_end(&e, NULL, NULL); SKIP("no fresh heap"); }
 
-    /* x holds this heap's pool; each worker keeps a block and has one
-     * empty pool. */
+    /* x holds this heap's pool; each worker keeps a block, and the workers
+     * have two empty pools or more between them, so the relief below leaves
+     * a light statement — a 40 MB block and a pool — clear of the watermark
+     * by more than a pool. */
     ray_t* x = ray_alloc(RELIEVE_HALF);
     bool workers = x && relieve_worker_pool(&w);
     relieve_spill_elsewhere(&e);
