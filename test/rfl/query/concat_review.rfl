@@ -1,0 +1,55 @@
+(set T (table [x k] (list [1 2 3] [0 0 1])))
+(set T2 (table [x] (list [1 2])))
+;; Constant text collections keep ordinary concat semantics in both orders.
+(at (select {v: (concat ['a 'b] "!") from: T2}) 'v) !- type
+(at (select {v: (concat "!" ['a 'b]) from: T2}) 'v) !- type
+(at (select {v: (concat ['a 'b] '!) from: T2}) 'v) -- ['a 'b '!]
+(set L ['a 'b])
+(at (select {v: (concat L "!") from: T2}) 'v) !- type
+;; Both typed vectors still concatenate as collections.
+(at (select {v: (concat ['a] ['b]) from: T2}) 'v) -- ['a 'b]
+;; A grouped aggregate evaluates collection concat on each complete group.
+(at (select {n: (count (concat x [4])) by: k from: T asc: k}) 'n) -- [3 2]
+(at (select {n: (sum (concat x [4])) by: k from: T asc: k}) 'n) -- [7 7]
+(set S (table [s k] (list ['a 'b 'c] [0 0 1])))
+(at (select {n: (count (concat s "!")) by: k from: S asc: k}) 'n) -- [2 1]
+;; Length-changing projections cannot truncate or pad other columns.
+(select {v: (concat 1 2) w: x from: T}) !- domain
+(select {w: x v: (concat 1 2) from: T}) !- domain
+(select {v: (concat [1 2 3] [4]) w: x from: T}) !- domain
+(at (select {v: (concat 1 2) from: T}) 'v) -- [1 2]
+(at (select {v: (concat 1 2) w: x from: T2}) 'w) -- [1 2]
+
+;; Multiple hidden text aggregates must reserve every DAG aggregate slot.
+(set A (table [x k s] (list [1 2 3 4 5] [0 0 1 2 2] ['a 'b 'c 'd 'e])))
+(at (select {n: (+ (count (concat s "!")) (count (concat s "?"))) by: k from: A asc: k}) 'n) -- [4 2 4]
+(at (select {n: (+ (sum x) (count (concat s "?"))) by: k from: A asc: k}) 'n) -- [5 4 11]
+(at (select {n: (- (max x) (count (concat s "!"))) by: k from: A asc: k}) 'n) -- [0 2 3]
+(at (select {n: (+ (count (concat s "!")) (count (concat s "?"))) by: k from: (select {from: A where: (> x 1)}) asc: k}) 'n) -- [2 2 4]
+;; Scalars broadcast to the collection projection's length, in either order.
+(at (select {a: [1 2] b: 5 from: T}) 'b) -- [5 5]
+(at (select {a: (concat 1 2) b: 5 from: T}) 'b) -- [5 5]
+(at (select {b: 5 a: (concat 1 2) from: T}) 'b) -- [5 5]
+
+;; take: limits a rectangular projection; it cannot repair ragged columns.
+(select {b: x a: [1 2] from: T take: 2}) !- domain
+;; Top-N and nested count filters must agree with the planner's agg slots.
+(at (select {a: (count (concat s "!")) b: (sum x) by: k from: A desc: b take: 1}) 'k) -- [2]
+(at (select {from: (select {a: (count (concat s "!")) b: (count x) by: k from: A}) where: (> b 1) asc: k}) 'k) -- [0 2]
+
+(set B (table [x k s] (list [1 2 3 4 5] [0 0 1 2 2] ['longlong 'longlong 'c 'd 'e])))
+(at (select {a: (sum (strlen (concat s "!"))) b: (sum x) by: k from: B desc: b take: 1}) 'k) -- [2]
+(at (select {a: (sum (strlen (concat s "!"))) b: (sum x) by: k from: B desc: a take: 1}) 'k) -- [0]
+
+;; An aggregate scalar, not just a literal, broadcasts to a collection.
+(at (select {a: (concat 1 2) b: (sum x) from: T}) 'b) -- [6 6]
+(at (select {b: (sum x) a: (concat 1 2) from: T}) 'b) -- [6 6]
+;; A one-row input column is still a column, not a broadcast scalar.
+(set O (table [x] (list [7])))
+(select {a: [1 2] b: x from: O}) !- domain
+(select {b: x a: [1 2] from: O}) !- domain
+(select {a: [1 2] b: (+ x 0) from: O}) !- domain
+(at (select {a: [1 2] b: (sum x) from: O}) 'b) -- [7 7]
+;; A deferred WHERE selection requires input-aligned collection projections.
+(select {a: [1 2] b: 5 from: T where: (> x 1)}) !- length
+(select {a: (concat 1 2) b: (sum x) from: T where: (> x 1)}) !- length

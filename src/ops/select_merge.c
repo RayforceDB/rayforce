@@ -370,6 +370,11 @@ static ray_t* merge_pair(ray_t* outer, ray_t* inner) {
     for (int clause = 5; clause <= 6; clause++) {
         ray_t* sort = merge_get(outer, clause);
         if (!sort) continue;
+        /* The flat planner cannot sort this computed/renamed projection yet. Keep
+         * the inner result materialized so its sort key is a stored column. */
+        for (int i = 0; i < s.n; i++)
+            if (s.cols[i].name == sort->i64 &&
+                !merge_identity(s.cols[i].expr, sort->i64)) goto decline;
         bool visible = !nout && !s.projected && ray_table_get_col(tbl, sort->i64);
         for (int i = 0; i < nout; i++) visible |= outputs[i] == sort->i64;
         if (!nout) for (int i = 0; i < s.n; i++) visible |= s.cols[i].name == sort->i64;
