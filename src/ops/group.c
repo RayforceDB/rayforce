@@ -4519,15 +4519,18 @@ bool ght_compute_layout(ght_layout_t* out, uint32_t n_keys, uint32_t n_aggs,
             }
         }
         /* Packed-tuple eligibility: every key is a plain fixed-width integer
-         * lane.  This is a WHITELIST of exactly the types read_col_i64
-         * decodes deliberately, not a `!= RAY_F64` blacklist: read_col_i64's
+         * lane.  This is a WHITELIST of exactly the integer types
+         * read_col_i64 decodes, not a `!= RAY_F64` blacklist: read_col_i64's
          * `default` arm reads ONE BYTE, so an un-enumerated fixed-width type
-         * (RAY_F32 is the live example) would be silently mis-loaded, and a
-         * packed layout would then hash those wrong bits as the key identity.
-         * F64 is excluded by the same rule (read_col_i64 does not decode it),
-         * which additionally keeps the packed lanes clear of the -0.0
-         * canonicalisation the F64 key builders apply (group_key_f64_bits,
-         * #407) — see ght_layout_t.packed_key.
+         * would be silently mis-loaded, and a packed layout would then hash
+         * those wrong bits as the key identity.  F64 is excluded because
+         * read_col_i64 does not decode it, which additionally keeps the
+         * packed lanes clear of the -0.0 canonicalisation the F64 key
+         * builders apply (group_key_f64_bits, #407) — see
+         * ght_layout_t.packed_key.  F32 stays off the list for the same
+         * reason: read_col_i64 does decode it (since #760, canonicalising
+         * -0.0 at the read), so the generic builders below group it
+         * correctly, but a packed region is meant to be raw bit identity.
          * GUID/STR are excluded by any_wide_key.  n_keys == 0 is not a
          * tuple. */
         if (n_keys >= 1 && !out->any_wide_key) {
