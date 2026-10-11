@@ -10258,15 +10258,14 @@ static ray_t* select_plan_computed_key(ray_t* dict, ray_t* tbl, int64_t* key_nam
     int64_t nd = ray_dict_len(dict);
     int64_t hidden = ray_sym_intern(SELECT_COMPUTED_KEY, strlen(SELECT_COMPUTED_KEY));
     int64_t kname = derived_key_name(by_expr);
-    /* A key the planner cannot lower (an opaque helper: several statements,
-     * a closure, recursion; a concat of collections, which the planner
-     * keeps for text) is evaluated once over the whole table, where its
-     * column arguments keep their rows, and grouped as a hidden column
-     * named after the expression. */
+    /* A key the planner cannot lower (an opaque helper, a concat of
+     * collections, which the planner keeps for text, a builtin it has no
+     * kernel for: reverse, asc, til) is evaluated once over the whole
+     * table, where its column arguments keep their rows, and grouped as a
+     * hidden column named after the expression. */
     ray_t* keyed = NULL;        /* the (filtered) source plus the evaluated key column */
     bool where_applied = false;
-    if ((query_expr_has_helper(by_expr) || expr_contains_call_named(by_expr, "concat", 6)) &&
-        !ray_table_get_col(tbl, hidden)) {
+    if (!ray_table_get_col(tbl, hidden)) {
         ray_graph_t* g = ray_graph_new(tbl);
         bool lowered = g && compile_expr_dag(g, by_expr) != NULL;
         if (g) ray_graph_free(g);

@@ -309,6 +309,23 @@
 (set Eck (take [1] 0))
 (value (select {c: (count x) by: (concat x Eck) from: Tckk})) -- (value (select {c: (count x) by: x from: Tckk}))
 (at (select {by: (concat x Eck) from: Tckk desc: x}) (quote x)) -- (at (select {by: x from: Tckk desc: x}) (quote x))
+;; any key the planner cannot lower is evaluated over the whole column, as
+;; its lambda form and its materialised vector are: with and without
+;; outputs, sorted and taken, filtered; a misaligned one is refused
+(set Trk (table [x s] (list [3 1 4 2 3 1] [a b a c b a])))
+(set Krev (reverse (at Trk 'x)))
+(value (select {c: (count x) by: (reverse x) from: Trk})) -- (value (select {c: (count x) by: ((fn [a] (reverse a)) x) from: Trk}))
+(at (select {c: (count x) by: (reverse x) from: Trk}) 'c) -- (at (select {c: (count x) by: {k: Krev} from: Trk}) 'c)
+(select {by: (reverse x) from: Trk}) -- (select {by: ((fn [a] (reverse a)) x) from: Trk})
+(select {by: (asc x) from: Trk desc: x take: 2}) -- (select {by: ((fn [a] (asc a)) x) from: Trk desc: x take: 2})
+(select {c: (count x) by: (asc x) from: Trk desc: c take: 2}) -- (select {c: (count x) by: ((fn [a] (asc a)) x) from: Trk desc: c take: 2})
+(at (select {by: (til (count x)) from: Trk where: (> x 1)}) (quote key)) -- (at (select {by: ((fn [a] (til (count a))) x) from: Trk where: (> x 1)}) (quote x))
+(at (select {by: (til (count x)) from: Trk where: (> x 1)}) (quote s)) -- (at (select {by: ((fn [a] (til (count a))) x) from: Trk where: (> x 1)}) (quote s))
+(select {c: (count x) by: (reverse x) from: Trk where: (> x 1)}) -- (select {c: (count x) by: ((fn [a] (reverse a)) x) from: Trk where: (> x 1)})
+(select {by: (distinct x) from: Trk}) !- length
+(select {c: (count x) by: (distinct x) from: Trk}) !- length
+;; text concat is still planned, and groups the same
+(at (select {c: (count x) by: (concat s "z") from: Trk}) 'c) -- [3 2 1]
 ;; one value is one group, holding the first row
 (select {by: ((fn [a] [7]) x) from: Tcks}) -- (table [x r] (list [7] (list "c-long-string-over-12")))
 ;; a name that is no column (a global vector) is grouped by its values, as
