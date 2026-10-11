@@ -204,14 +204,12 @@ int64_t ray_os_cgroup_mem_limit(void);
 /* The directory of the cgroup that sets that limit, into buf[n]; false when
  * no limit is set, or on platforms without cgroups. */
 bool    ray_os_cgroup_mem_dir(char* buf, size_t n);
-/* RAM in use, read from the kernel's own counters with open/read (no stdio),
- * into *used: all but free memory, clean page cache and reclaimable slab —
- * what the kernel cannot take back without writing or swapping — of the
- * cgroup in `cg`, a directory from ray_os_cgroup_mem_dir (v2 memory.current
- * and memory.stat, v1 memory.usage_in_bytes and memory.stat), when given,
- * else of the machine (/proc/meminfo).  false when it cannot be read (and on
- * platforms without these files). */
-bool    ray_os_mem_used(const char* cg, int64_t* used);
+/* Read the memory.stat of cgroup `cg` (a directory from
+ * ray_os_cgroup_mem_dir), for what reading does: the kernel updates a
+ * cgroup's statistics lazily and flushes them when the file is read.  With
+ * open/read, no stdio.  false when there is no such file (and on platforms
+ * without cgroups). */
+bool    ray_os_cgroup_stat_flush(const char* cg);
 #ifdef DEBUG
 /* Pin ray_cache_llc_bytes to `bytes` (0 = probe again). */
 void ray_cache_llc_set_for_test(uint64_t bytes);

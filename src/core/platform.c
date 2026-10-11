@@ -48,7 +48,7 @@
 #endif
 #if defined(RAY_OS_LINUX)
 #include <dirent.h>       /* /sys/block — the read-ahead caps */
-#include <errno.h>        /* EINTR — read_small */
+#include <errno.h>        /* EINTR — ray_os_cgroup_stat_flush */
 #include <stdatomic.h>
 #endif
 #include "mem/sys.h"
@@ -609,84 +609,21 @@ bool ray_os_cgroup_mem_dir(char* buf, size_t n) {
     return n && cgroup_mem_limit(buf, n) > 0 && buf[0];
 }
 
-/* A small kernel file into buf[n], NUL-terminated; its length, or -1.  No
- * stdio: the readers below run on allocation paths, where libc's FILE and
- * its buffer are not to be had. */
-static ssize_t read_small(const char* path, char* buf, size_t n) {
+bool ray_os_cgroup_stat_flush(const char* cg) {
+    char path[600], buf[256];
+    if (!cg || !*cg) return false;
+    snprintf(path, sizeof(path), "%s/memory.stat", cg);
     int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return -1;
-    size_t got = 0;
-    while (got + 1 < n) {
-        ssize_t r = read(fd, buf + got, n - 1 - got);
-        if (r < 0 && errno == EINTR) continue;
-        if (r <= 0) break;
-        got += (size_t)r;
-    }
+    if (fd < 0) return false;
+    ssize_t r;
+    do r = read(fd, buf, sizeof(buf)); while (r < 0 && errno == EINTR);
     close(fd);
-    buf[got] = 0;
-    return (ssize_t)got;
-}
-
-/* The number after `key` that starts a line of buf ("key value", or
- * "key: value kB" as in /proc/meminfo); -1 when there is none. */
-static int64_t stat_field(const char* buf, const char* key) {
-    size_t k = strlen(key);
-    for (const char* p = buf; p && *p; p = strchr(p, '\n'), p = p ? p + 1 : NULL) {
-        if (strncmp(p, key, k) != 0 || (p[k] != ' ' && p[k] != ':')) continue;
-        char* end = NULL;
-        long long v = strtoll(p + k + 1 + (p[k] == ':'), &end, 10);
-        return end && end != p + k + 1 + (p[k] == ':') ? (int64_t)v : -1;
-    }
-    return -1;
-}
-
-bool ray_os_mem_used(const char* cg, int64_t* used) {
-    char buf[8192], path[600];
-    int64_t cur, clean;
-    if (cg && *cg) {
-        /* v2: memory.current less the clean page cache of memory.stat's
-         * "file" (tmpfs included, hence less "shmem") and less reclaimable
-         * slab, as for the machine below (a kernel without the field counts
-         * it as in use); v1: the same from memory.usage_in_bytes and the
-         * hierarchical total_* counters, which give no slab — v1 counts it
-         * as in use. */
-        snprintf(path, sizeof(path), "%s/memory.current", cg);
-        bool v2 = read_small(path, buf, 64) > 0;
-        if (!v2) {
-            snprintf(path, sizeof(path), "%s/memory.usage_in_bytes", cg);
-            if (read_small(path, buf, 64) <= 0) return false;
-        }
-        cur = strtoll(buf, NULL, 10);
-        snprintf(path, sizeof(path), "%s/memory.stat", cg);
-        if (read_small(path, buf, sizeof(buf)) <= 0) return false;
-        int64_t cache = stat_field(buf, v2 ? "file" : "total_cache");
-        int64_t shmem = stat_field(buf, v2 ? "shmem" : "total_shmem");
-        int64_t d = stat_field(buf, v2 ? "file_dirty" : "total_dirty");
-        int64_t wb = stat_field(buf, v2 ? "file_writeback" : "total_writeback");
-        if (cur <= 0 || cache < 0 || shmem < 0 || d < 0 || wb < 0) return false;
-        clean = cache - shmem - d - wb;
-        int64_t slab = v2 ? stat_field(buf, "slab_reclaimable") : 0;
-        if (slab > 0) cur -= slab;
-    } else {
-        /* The machine: all but free memory, clean page cache and reclaimable
-         * slab — the cgroup's measure, in /proc/meminfo's terms (kB). */
-        if (read_small("/proc/meminfo", buf, sizeof(buf)) <= 0) return false;
-        int64_t total = stat_field(buf, "MemTotal"), free = stat_field(buf, "MemFree");
-        int64_t buffers = stat_field(buf, "Buffers"), cached = stat_field(buf, "Cached");
-        int64_t shmem = stat_field(buf, "Shmem"), slab = stat_field(buf, "SReclaimable");
-        int64_t d = stat_field(buf, "Dirty"), wb = stat_field(buf, "Writeback");
-        if (total <= 0 || free < 0 || buffers < 0 || cached < 0 || shmem < 0 || slab < 0
-            || d < 0 || wb < 0) return false;
-        cur = (total - free - slab) << 10;
-        clean = (buffers + cached - shmem - d - wb) << 10;
-    }
-    *used = cur - (clean > 0 ? clean : 0);
-    return true;
+    return r > 0;
 }
 #else
 int64_t ray_os_cgroup_mem_limit(void) { return 0; }
 bool    ray_os_cgroup_mem_dir(char* buf, size_t n) { if (n) buf[0] = 0; return false; }
-bool    ray_os_mem_used(const char* cg, int64_t* used) { (void)cg; (void)used; return false; }
+bool    ray_os_cgroup_stat_flush(const char* cg) { (void)cg; return false; }
 #endif
 
 static uint64_t cache_llc_probe(void) {
@@ -978,7 +915,7 @@ uint32_t ray_physical_core_count(void) {
 
 int64_t ray_os_cgroup_mem_limit(void) { return 0; }
 bool    ray_os_cgroup_mem_dir(char* buf, size_t n) { if (n) buf[0] = 0; return false; }
-bool    ray_os_mem_used(const char* cg, int64_t* used) { (void)cg; (void)used; return false; }
+bool    ray_os_cgroup_stat_flush(const char* cg) { (void)cg; return false; }
 
 /* Sum of every level-3 cache instance reported by the processor topology
  * (each SYSTEM_LOGICAL_PROCESSOR_INFORMATION cache record is one instance).
@@ -1148,7 +1085,7 @@ ray_err_t ray_thread_join(ray_thread_t t) {
 uint32_t ray_thread_count(void) { return 1; }
 int64_t ray_os_cgroup_mem_limit(void) { return 0; }
 bool    ray_os_cgroup_mem_dir(char* buf, size_t n) { if (n) buf[0] = 0; return false; }
-bool    ray_os_mem_used(const char* cg, int64_t* used) { (void)cg; (void)used; return false; }
+bool    ray_os_cgroup_stat_flush(const char* cg) { (void)cg; return false; }
 static uint64_t cache_llc_probe(void) { return 0; }
 
 /* Semaphore — counter-only.  Single-threaded so wait never blocks (the

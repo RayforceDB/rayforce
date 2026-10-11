@@ -33,7 +33,7 @@
 #include "core/platform.h"
 #include "core/timer.h"   /* ray_time_now_ms — idle-decay clock */
 #include "core/pool.h"    /* ray_pool_each_worker_heap — maintenance targets */
-#include "core/runtime.h" /* ray_sys_mem_used — a cgroup's statistics flushed */
+#include "core/runtime.h" /* ray_sys_mem_flush — a cgroup's statistics flushed */
 #include "table/sym.h"
 #include "table/domain.h"
 #include "lang/eval.h"
@@ -424,18 +424,6 @@ static bool heap_anon_would_exceed(size_t bytes) {
  * statement at 16 workers.  A new watermark visits at the next boundary. */
 #define RAY_FAR_VISIT_MS 100
 static _Atomic(int64_t) g_far_visit_ms = INT64_MIN / 2;
-
-/* After spill pages are dropped — a parked pool's discarded
- * (heap_spill_discard), or the pool unmapped — the RAM in use is read
- * (ray_sys_mem_used) for what reading does: a read of memory.stat flushes a
- * cgroup's statistics, which the kernel updates lazily and holds writers to,
- * and the dirty pages just dropped would otherwise throttle the next writes
- * as if they were still there (measured: a 64 MB spill right after dropping
- * 137 MB of dirty pages, 1.2 s instead of 0.1 s, 900 MB cgroup). */
-static void heap_mem_refresh(void) {
-    int64_t used;
-    (void)ray_sys_mem_used(&used);
-}
 
 int64_t ray_heap_anon_committed(void) {
     return atomic_load_explicit(&g_anon_committed, memory_order_relaxed);
@@ -2951,8 +2939,8 @@ static int heap_spill_discard(const ray_pool_entry_t* pe) {
 /* Discard the pages of h's parked spill pools not discarded since they were
  * last in use — those parked at this boundary — or unmap a pool whose pages
  * cannot be (the boundary that parked it left h another pool, unparked).
- * Returns whether pages were dropped: the boundary then reads the RAM in use
- * anew (heap_mem_refresh). */
+ * Returns whether pages were dropped: the boundary then flushes the
+ * cgroup's statistics (ray_sys_mem_flush). */
 static bool heap_spill_pools_discard(ray_heap_t* h) {
     bool dropped = false;
     for (uint32_t p = h->pool_count; h->parked && p-- > 0; ) {
@@ -3276,8 +3264,12 @@ static _Atomic(bool)    g_relieve_other  = false;   /* the last relief took othe
  * from every heap the relief visits, the spilling one's too, and a parked
  * spill pool unused for the idle decay's threshold goes too
  * (heap_spill_pools_age), so a server that is never idle does not keep its
- * file for good.  After spill pages are dropped, the RAM in use is read,
- * which flushes a cgroup's statistics (heap_mem_refresh).  The boundary
+ * file for good.  After spill pages are dropped, the limiting cgroup's
+ * statistics are flushed (ray_sys_mem_flush): the kernel updates them
+ * lazily and holds writers to them, and the dirty pages just dropped would
+ * otherwise throttle the next writes as if they were still there (measured:
+ * a 64 MB spill right after dropping 137 MB of dirty pages, 1.2 s instead of
+ * 0.1 s, 900 MB cgroup).  The boundary
  * visits the heaps while any spill pool is mapped — far from the watermark
  * at most every RAY_FAR_VISIT_MS, and only for the spill pools.
  *
@@ -3352,7 +3344,7 @@ int64_t ray_heap_relieve(void) {
         }
     }
     heap_each_quiescent(heap_relieve_visit, &v);
-    if (v.dropped) heap_mem_refresh();
+    if (v.dropped) ray_sys_mem_flush();
     return v.released;
 }
 

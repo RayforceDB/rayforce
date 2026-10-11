@@ -21,7 +21,7 @@
  *   SOFTWARE.
  */
 
-/* pwrite, ftruncate: POSIX beyond C17. */
+/* open, mkdir, getpid: POSIX beyond C17. */
 #if !defined(_GNU_SOURCE) && !defined(_WIN32)
 #define _GNU_SOURCE
 #endif
@@ -137,77 +137,30 @@ static void plat_unlink(const char* dir, const char* name) {
     snprintf(path, sizeof(path), "%s/%s", dir, name);
     unlink(path);
 }
-/* /proc/meminfo's `key`, kB, or -1. */
-static int64_t plat_meminfo(const char* key) {
-    FILE* f = fopen("/proc/meminfo", "r");
-    if (!f) return -1;
-    char line[256];
-    int64_t v = -1;
-    size_t k = strlen(key);
-    while (v < 0 && fgets(line, sizeof(line), f))
-        if (strncmp(line, key, k) == 0 && line[k] == ':') v = strtoll(line + k + 1, NULL, 10);
-    fclose(f);
-    return v;
-}
 #endif
 
 /* The cgroup directory goes with the limit: there is one exactly when a
- * limit is in force, and the RAM in use reads from it.  The RAM in use is all
- * but free memory, clean page cache and reclaimable slab, dirty pages
- * included: from memory.current and memory.stat under cgroup v2, from
- * memory.usage_in_bytes and the hierarchical total_* counters of memory.stat
- * under v1 (here in a directory of the test's own), and from /proc/meminfo
- * for the machine. */
-static test_result_t test_cgroup_mem_used(void) {
+ * limit is in force.  Its memory.stat is read for what reading does — the
+ * kernel flushes the cgroup's statistics — here in a directory of the
+ * test's own too, and a directory without the file reads nothing. */
+static test_result_t test_cgroup_stat_flush(void) {
     char dir[512];
     bool has = ray_os_cgroup_mem_dir(dir, sizeof(dir));
     TEST_ASSERT(has == (ray_os_cgroup_mem_limit() > 0), "a cgroup directory exactly with a limit");
-    int64_t used = -1;
-    if (has) TEST_ASSERT(ray_os_mem_used(dir, &used) && used > 0, "and it reads");
+    if (has) TEST_ASSERT(ray_os_cgroup_stat_flush(dir), "and its statistics read");
+    TEST_ASSERT(!ray_os_cgroup_stat_flush(NULL) && !ray_os_cgroup_stat_flush(""),
+                "no cgroup: nothing read");
 #ifdef RAY_OS_LINUX
     char tmp[64];
     snprintf(tmp, sizeof(tmp), "/tmp/rayforce_cg_%d", (int)getpid());
     TEST_ASSERT(mkdir(tmp, 0700) == 0, "a cgroup directory of our own");
-    plat_write(tmp, "memory.current", "1000000000\n");
-    plat_write(tmp, "memory.stat", "anon 600000000\nfile 300000000\nkernel 100000000\n"
-               "shmem 50000000\nfile_mapped 0\nfile_dirty 40000000\nfile_writeback 10000000\n"
-               "inactive_anon 1\nactive_anon 1\ninactive_file 150000000\nactive_file 100000000\n"
-               "slab_reclaimable 30000000\n");
-    int64_t u2 = -1;
-    bool v2 = ray_os_mem_used(tmp, &u2);
-    plat_write(tmp, "memory.stat", "anon 600000000\nfile 300000000\nshmem 50000000\n"
-               "file_writeback 10000000\ninactive_file 150000000\nactive_file 100000000\n");
-    bool partial = ray_os_mem_used(tmp, &used);   /* no file_dirty */
-    plat_unlink(tmp, "memory.current");
-    plat_write(tmp, "memory.usage_in_bytes", "2000000000\n");
-    plat_write(tmp, "memory.stat", "cache 1\nrss 1\nshmem 1\ndirty 1\nwriteback 1\n"
-               "inactive_file 1\nactive_file 1\n"
-               "total_cache 500000000\ntotal_rss 1300000000\ntotal_shmem 100000000\n"
-               "total_dirty 60000000\ntotal_writeback 20000000\n"
-               "total_inactive_file 250000000\ntotal_active_file 150000000\n");
-    int64_t u1 = -1;
-    bool v1 = ray_os_mem_used(tmp, &u1);
-    plat_unlink(tmp, "memory.usage_in_bytes");
+    bool none = !ray_os_cgroup_stat_flush(tmp);
+    plat_write(tmp, "memory.stat", "anon 1\nfile 2\n");
+    bool read = ray_os_cgroup_stat_flush(tmp);
     plat_unlink(tmp, "memory.stat");
     rmdir(tmp);
-    TEST_ASSERT(v2 && u2 == 770000000,
-                "v2: current less the clean file cache and reclaimable slab");
-    TEST_ASSERT(!partial, "a field missing: no reading");
-    TEST_ASSERT(v1 && u1 == 1680000000, "v1: usage less the clean total cache");
-
-    int64_t total = plat_meminfo("MemTotal"), freek = plat_meminfo("MemFree");
-    int64_t buffers = plat_meminfo("Buffers"), cached = plat_meminfo("Cached");
-    int64_t shmem = plat_meminfo("Shmem"), slab = plat_meminfo("SReclaimable");
-    int64_t d = plat_meminfo("Dirty"), wb = plat_meminfo("Writeback");
-    bool host = ray_os_mem_used(NULL, &used);
-    int64_t want = (total - freek - slab - (buffers + cached - shmem - d - wb)) << 10;
-    int64_t off = used - want;
-    const int64_t slack = INT64_C(256) << 20;
-    TEST_ASSERT(host && total > 0, "the machine's use reads");
-    TEST_ASSERT(off > -slack && off < slack,
-                "the machine: all but free memory, clean page cache and reclaimable slab");
-#else
-    TEST_ASSERT(!has && !ray_os_mem_used(NULL, &used), "no cgroups, no use read");
+    TEST_ASSERT(none, "no memory.stat: nothing read");
+    TEST_ASSERT(read, "its memory.stat read");
 #endif
     PASS();
 }
@@ -220,7 +173,7 @@ const test_entry_t platform_entries[] = {
     { "platform/thread_count", test_thread_count, NULL, NULL },
     { "platform/thread_create_join", test_thread_create_join, NULL, NULL },
     { "platform/cgroup_mem_limit", test_cgroup_mem_limit, NULL, NULL },
-    { "platform/cgroup_mem_used", test_cgroup_mem_used, NULL, NULL },
+    { "platform/cgroup_stat_flush", test_cgroup_stat_flush, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
 

@@ -390,8 +390,8 @@ int64_t ray_sys_ram_limit(void) {
     return __RUNTIME ? __RUNTIME->ram_limit : 0;
 }
 
-bool ray_sys_mem_used(int64_t* used) {
-    return __RUNTIME && ray_os_mem_used(__RUNTIME->mem_cg, used);
+void ray_sys_mem_flush(void) {
+    if (__RUNTIME && __RUNTIME->mem_cg[0]) (void)ray_os_cgroup_stat_flush(__RUNTIME->mem_cg);
 }
 
 int8_t ray_obj_type(ray_t* v) {

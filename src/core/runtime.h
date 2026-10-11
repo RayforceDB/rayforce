@@ -166,10 +166,9 @@ extern _Thread_local ray_vm_t *__VM;
 ray_runtime_t* ray_runtime_create(int argc, char** argv);
 void           ray_runtime_destroy(ray_runtime_t* rt);
 
-/* RAM in use against ray_sys_ram_limit (ray_os_mem_used), into *used: the
- * limiting cgroup's, else the machine's.  false when it cannot be read or
- * there is no runtime. */
-bool ray_sys_mem_used(int64_t* used);
+/* Flush the statistics of the cgroup that limits the process
+ * (ray_os_cgroup_stat_flush); nothing outside a limiting cgroup. */
+void ray_sys_mem_flush(void);
 
 /* Main event-loop accessors.  The host (main.c) registers the poll it
  * created; runtime-level builtins read it back through these to avoid

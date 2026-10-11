@@ -2690,8 +2690,8 @@ typedef struct {
     int         n;
     int64_t     wm;            /* the watermark to restore */
     ray_runtime_t* rt;         /* the runtime to restore (heap tests run without) */
-    ray_runtime_t  saved;      /* and its RAM limit and cgroup directory */
-    char        cg[64];        /* the cgroup directory relieve_ram fakes */
+    ray_runtime_t  saved;      /* and its cgroup directory */
+    char        cg[64];        /* the cgroup directory relieve_cgroup fakes */
 } relieve_env_t;
 
 /* Make a new heap with no pools current, or return NULL.  ray_heap_init
@@ -2740,7 +2740,7 @@ static void relieve_env_begin(relieve_env_t* e) {
     e->base = ray_tl_heap;
     e->n = 0;
     e->wm = ray_heap_anon_watermark();
-    static ray_runtime_t bare;                 /* RAM limit 0: memory never short */
+    static ray_runtime_t bare;                 /* no cgroup directory */
     e->rt = __RUNTIME;
     if (!__RUNTIME) __RUNTIME = &bare;
     e->saved = *__RUNTIME;
@@ -2761,26 +2761,17 @@ static void relieve_write(const char* path, const char* text) {
     close(fd);
 }
 
-/* A cgroup of `lim` bytes, `used` of them in use and no file page among
- * them (memory.current, memory.stat), in a directory of the test's own,
- * where the runtime is pointed (ray_sys_mem_used).  The watermark is set
- * again so the reading is not the cached one.  relieve_ram_ok, or
+/* A cgroup directory of the test's own, with a memory.stat, where the
+ * runtime is pointed (ray_sys_mem_flush).  relieve_cgroup_ok, or
  * relieve_env_end, puts the runtime back. */
-static void relieve_ram(relieve_env_t* e, int64_t lim, int64_t used) {
+static void relieve_cgroup(relieve_env_t* e) {
 #if !defined(_WIN32)
-    char path[128], text[256];
+    char path[128];
     mkdir(e->cg, 0700);
-    snprintf(path, sizeof(path), "%s/memory.current", e->cg);
-    snprintf(text, sizeof(text), "%lld\n", (long long)used);
-    relieve_write(path, text);
     snprintf(path, sizeof(path), "%s/memory.stat", e->cg);
-    snprintf(text, sizeof(text), "anon %lld\nfile 0\nshmem 0\nfile_dirty 0\n"
-             "file_writeback 0\n", (long long)used);
-    relieve_write(path, text);
+    relieve_write(path, "anon 1\nfile 0\n");
 #endif
-    __RUNTIME->ram_limit = lim;
     snprintf(__RUNTIME->mem_cg, sizeof(__RUNTIME->mem_cg), "%s", e->cg);
-    ray_heap_set_anon_watermark(ray_heap_anon_watermark());
 }
 /* A boundary far from the watermark that visits the heaps: one does at most
  * every so often (ray_heap_relieve), or at the first after the watermark is
@@ -2789,16 +2780,12 @@ static void relieve_far(void) {
     ray_heap_set_anon_watermark(ray_heap_anon_watermark());
     ray_heap_relieve();
 }
-static void relieve_ram_ok(relieve_env_t* e) {
-    __RUNTIME->ram_limit = e->saved.ram_limit;
+static void relieve_cgroup_ok(relieve_env_t* e) {
     memcpy(__RUNTIME->mem_cg, e->saved.mem_cg, sizeof(e->saved.mem_cg));
-    ray_heap_set_anon_watermark(ray_heap_anon_watermark());
 }
-static void relieve_ram_clean(relieve_env_t* e) {
+static void relieve_cgroup_clean(relieve_env_t* e) {
 #if !defined(_WIN32)
     char path[128];
-    snprintf(path, sizeof(path), "%s/memory.current", e->cg);
-    unlink(path);
     snprintf(path, sizeof(path), "%s/memory.stat", e->cg);
     unlink(path);
     rmdir(e->cg);
@@ -2815,8 +2802,8 @@ static void relieve_env_end(relieve_env_t* e, ray_heap_t* h1, ray_heap_t* h2) {
         ray_heap_abandon();
     }
     ray_tl_heap = e->base;
-    relieve_ram_ok(e);
-    relieve_ram_clean(e);
+    relieve_cgroup_ok(e);
+    relieve_cgroup_clean(e);
     ray_heap_set_anon_watermark(e->wm);
     __RUNTIME = e->rt;
 }
@@ -3977,13 +3964,12 @@ static int relieve_reads(int fd) {
     return n;
 }
 
-/* The RAM in use is read only after spill pages are dropped — a parked
- * pool's discarded, or a pool unmapped — for what the read does: it flushes
- * a cgroup's statistics.  No file of the cgroup is opened at a boundary that
- * drops nothing, nor before a large block. */
+/* A cgroup's memory.stat is read — which flushes its statistics — only
+ * after spill pages are dropped, a parked pool's discarded or a pool
+ * unmapped: not at a boundary that drops nothing, nor before a large block. */
 static test_result_t test_relieve_spill_reads(void) {
 #if !defined(__linux__)
-    SKIP("the RAM in use is read on Linux only");
+    SKIP("cgroup statistics are flushed on Linux only");
 #else
     relieve_env_t e;
     relieve_env_begin(&e);
@@ -3996,11 +3982,11 @@ static test_result_t test_relieve_spill_reads(void) {
         SKIP("blocks or spill file unavailable");
     }
     ray_heap_set_anon_watermark(INT64_C(1) << 40);
-    relieve_ram(&e, INT64_C(2) << 30, INT64_C(1) << 30);
+    relieve_cgroup(&e);
     int fd = inotify_init1(IN_NONBLOCK);
     bool watch = fd >= 0 && inotify_add_watch(fd, e.cg, IN_ACCESS) >= 0;
 
-    /* The spill pools' pages discarded: read (both files). */
+    /* The spill pools' pages dropped: memory.stat read. */
     ray_heap_relieve();
     int dropped = relieve_reads(fd);
 
@@ -4022,9 +4008,9 @@ static test_result_t test_relieve_spill_reads(void) {
 
     relieve_env_end(&e, h, NULL);
     if (!watch) SKIP("inotify unavailable");
-    TEST_ASSERT(dropped == 2, "pages discarded: the boundary read the cgroup");
+    TEST_ASSERT(dropped == 1, "pages dropped: the boundary read the cgroup's memory.stat");
     TEST_ASSERT(none == 0, "nothing dropped: nothing read");
-    if (used) TEST_ASSERT(again == 2, "used and emptied again: read again");
+    if (used) TEST_ASSERT(again == 1, "used and emptied again: read again");
     PASS();
 #endif
 }
