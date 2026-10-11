@@ -64,3 +64,13 @@
 ;; (when the planner declines silently — a temporal operand — there is no
 ;; planner error and the interpreter's `name` error stands, as in select)
 (update {x: (+ nosuch ts) from: t}) !- name
+;; under by: as well, including after an output of the same update, or an
+;; earlier update, whose expression the planner declined: the planner is
+;; asked again for every expression of every call
+(set hw5 (fn [m] (let a 0) (times 10 (let a (+ a m))) a))
+(update {x: (+ nosuch 1) by: k from: t}) !- schema
+(update {a: (hw5 (count i)) x: (+ nosuch 1) by: k from: t}) !- schema
+(at (update {a: (hw5 (count i)) by: k from: t}) 'a) -- [20 20 30 30 30]
+(update {x: (+ nosuch 1) by: k from: t}) !- schema
+(times 20 (eval (parse "(update {a: (hw5 (count i)) by: k from: t})")))
+(eval (parse "(update {x: (+ nosuch 1) by: k from: t})")) !- schema

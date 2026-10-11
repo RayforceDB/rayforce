@@ -17,6 +17,78 @@
 (set heapb (fn [] (at (.sys.mem) 'bytes-allocated)))
 (set probe (fn [f warm reps] (do (map f (til warm)) (map f (til reps)) (set h0 (heapb)) (map f (til reps)) (< (- (heapb) h0) 4096))))
 
+;; Peak memory of selects over a parted table, measured first in this file:
+;; the peak counter starts with the file, so nothing larger run before hides
+;; a query's own peak.  A grouped select with no outputs, or a sort without
+;; by:, reads the columns its clauses name and gathers the others at the rows
+;; it keeps; whatever the number of groups or rows kept, its peak stays
+;; below what flattening the table costs (the table, then its rows again for
+;; the result).
+;; 22 columns, 8 partitions of 5000 rows: Bmw bytes flattened.
+(.sys.exec "rm -rf /tmp/rfl_ckmw")
+(set Nmw 5000)
+(set mkmw (fn [p] (table (concat ['k 'lo] (as 'SYMBOL (map (fn [j] (format "c%" j)) (til 20)))) (concat (list (+ (* p Nmw) (til Nmw)) (% (til Nmw) 10)) (map (fn [j] (as 'I32 (+ j (til Nmw)))) (til 20))))))
+(map (fn [p] (do (.db.splayed.set (format "/tmp/rfl_ckmw/2024.01.0%/t/" (+ p 1)) (mkmw p)) 0)) (til 8))
+(set Pmw (.db.parted.get "/tmp/rfl_ckmw/" 't))
+(set Bmw (* (* 8 Nmw) 96))
+;; a sort without by: taking 3 rows reads the key and those 3 rows only
+(set pk0 (at (.sys.mem) 'peak-bytes))
+(at (select {from: Pmw desc: k take: 3}) 'k) -- [39999 39998 39997]
+(< (- (at (.sys.mem) 'peak-bytes) pk0) (/ Bmw 4)) -- true
+;; the same with outputs that leave the sort key out
+(set pk0 (at (.sys.mem) 'peak-bytes))
+(at (select {k: k c3: c3 from: Pmw desc: c5 take: 3}) 'k) -- [4999 9999 14999]
+(< (- (at (.sys.mem) 'peak-bytes) pk0) (/ Bmw 4)) -- true
+;; 10 groups: well under a flatten
+(set pk0 (at (.sys.mem) 'peak-bytes))
+(count (select {by: lo from: Pmw})) -- 10
+(< (- (at (.sys.mem) 'peak-bytes) pk0) (/ Bmw 4)) -- true
+;; the same keyed by a by-dict of a builtin call
+(set pk0 (at (.sys.mem) 'peak-bytes))
+(count (select {by: {kk: (+ lo 1)} from: Pmw})) -- 10
+(< (- (at (.sys.mem) 'peak-bytes) pk0) (/ Bmw 4)) -- true
+;; a key the planner cannot lower flattens only the columns the select reads
+(set pk0 (at (.sys.mem) 'peak-bytes))
+(count (select {c: (count k) by: (reverse lo) from: Pmw})) -- 10
+(< (- (at (.sys.mem) 'peak-bytes) pk0) (/ Bmw 4)) -- true
+;; as a by-dict value too
+(set pk0 (at (.sys.mem) 'peak-bytes))
+(count (select {c: (count k) by: {kk: (reverse lo)} from: Pmw})) -- 10
+(< (- (at (.sys.mem) 'peak-bytes) pk0) (/ Bmw 4)) -- true
+;; every key unique: the result is the whole table, and little more
+(set pk0 (at (.sys.mem) 'peak-bytes))
+(count (select {by: k from: Pmw})) -- 40000
+(< (- (at (.sys.mem) 'peak-bytes) pk0) (/ (* 3 Bmw) 2)) -- true
+(select {by: k from: Pmw desc: k take: 3}) -- (select {by: k from: (select {from: Pmw where: (>= k 0)}) desc: k take: 3})
+(.sys.exec "rm -rf /tmp/rfl_ckmw")
+;; A wide string column the select never reads costs nothing near its
+;; flattened size (14 MB here when the whole table was flattened).
+(.sys.exec "rm -rf /tmp/rfl_ckwide")
+(set Wck (concat "wide-unused-string-column-value-over-twelve-bytes-" (as 'STR (% (til 10000) 1000))))
+(set Kck (% (til 10000) 10))
+(map (fn [d] (do (.db.splayed.set (format "/tmp/rfl_ckwide/2024.01.0%/t/" d) (table [k w] (list Kck Wck))) 0)) [1 2 3 4 5 6 7 8])
+(set Wck 0)
+(set Kck 0)
+(set Pw (.db.parted.get "/tmp/rfl_ckwide/" 't))
+(set pk0 (at (.sys.mem) 'peak-bytes))
+(set Rw (select {by: k from: Pw}))
+(< (- (at (.sys.mem) 'peak-bytes) pk0) 1000000) -- true
+(count Rw) -- 10
+(at Rw 'w) -- (concat "wide-unused-string-column-value-over-twelve-bytes-" (as 'STR (til 10)))
+(.sys.exec "rm -rf /tmp/rfl_ckwide")
+;; A where: before a computed key filters only the columns the clauses
+;; read, also when it reads a config dict: 22 columns, 60000 rows (Bfw
+;; bytes), nearly every row kept; filtering every column costs Bfw again.
+(set Nfw 60000)
+(set FWq (table (as 'SYMBOL (map (fn [j] (format "c%" j)) (til 22))) (map (fn [j] (+ j (til Nfw))) (til 22))))
+(set Bfw (* (* 22 Nfw) 8))
+(set cfgq {lim: 100})
+(set pk0 (at (.sys.mem) 'peak-bytes))
+(count (select {n: (count c0) by: {g: (% c0 7)} from: FWq where: (> c1 (at cfgq 'lim))})) -- 7
+(< (- (at (.sys.mem) 'peak-bytes) pk0) (/ Bfw 2)) -- true
+(set FWq 0)
+
+
 ;; partitioned + ordered, trailing frame (the shape of the report)
 (probe (fn [p] (count (window {from: (mk p) part: [instrument] order: [rid] frame: 2 funcs: {prev: (first v) n: (count v)}}))) 5 60) -- true
 ;; no part/order: the whole table is one partition
@@ -33,6 +105,110 @@
 (probe (fn [p] (count (select {from: (mk p) where: (> rid 3) asc: v}))) 5 60) -- true
 (probe (fn [p] (count (select {from: (mk p) by: instrument s: (sum v) asc: s}))) 5 60) -- true
 (probe (fn [p] (count (select {from: (mk p) by: instrument s: (sum v) desc: s take: 3}))) 5 60) -- true
+;; a grouped select with a where: and no outputs: the fused filter keeps a
+;; reference to its selection for the count(distinct) scatter, released at
+;; the end of the select, which the no-output branch returns before.  One
+;; selection per call, empty result included.
+(set TW (table [x y] (list (% (til 100) 7) (til 100))))
+(probe (fn [p] (count (select {by: x from: TW where: (> y 38)}))) 5 1000) -- true
+(probe (fn [p] (count (select {by: (* x 2) from: TW where: (> y 38)}))) 5 1000) -- true
+(probe (fn [p] (count (select {by: x from: TW where: (> y 1000)}))) 5 1000) -- true
+;; a by-dict or a quoted key symbol is rewritten into an owned symbol vector,
+;; released at the end of the select, which the no-output branch and the
+;; eval-level grouping return before.  One vector per call.
+(set TB (table [x y z s] (list (% (til 100) 7) (til 100) (% (til 100) 3) (as 'STR (% (til 100) 7)))))
+(probe (fn [p] (count (select {by: {k: x} from: TB}))) 5 1000) -- true
+(probe (fn [p] (count (select {by: 'x from: TB}))) 5 1000) -- true
+(probe (fn [p] (count (select {by: 'x from: TB where: (> y 38)}))) 5 1000) -- true
+(probe (fn [p] (count (select {by: {a: x b: z} from: TB}))) 5 1000) -- true
+(probe (fn [p] (count (select {v: y by: {k: s} from: TB}))) 5 1000) -- true
+;; the same selection on the error returns of a grouped select with a where:
+;; (a rejected aggregate, a bad take:, a failing post-pass, a failing
+;; count(distinct) scatter).  Each call is caught by try; the growth of a
+;; bare caught raise is subtracted, so only the select's own is measured.
+(set grow (fn [f warm reps] (do (map f (til warm)) (map f (til reps)) (set h0 (heapb)) (map f (til reps)) (- (heapb) h0))))
+(set probe_caught (fn [f warm reps] (< (- (grow f warm reps) (grow (fn [p] (try (raise p) (fn [e] 0))) warm reps)) 4096)))
+(set V100 (% (til 100) 5))
+(probe_caught (fn [p] (try (select {t: (top y 0) by: x from: TB where: (> y 38)}) (fn [e] 0))) 5 1000) -- true
+(probe_caught (fn [p] (try (select {s: (sum y) by: x from: TB where: (> y 38) take: "a"}) (fn [e] 0))) 5 1000) -- true
+(probe_caught (fn [p] (try (select {r: (+ (sum y) [1 2 3]) by: x from: TB where: (> y 38)}) (fn [e] 0))) 5 1000) -- true
+(probe_caught (fn [p] (try (select {d: (count (distinct z)) by: V100 from: TB where: (> y 38)}) (fn [e] 0))) 5 1000) -- true
+;; the owned by: symbol vector on the error returns of a by-dict or a quoted
+;; key: ray_select_impl releases it, whichever exit the select took
+(probe_caught (fn [p] (try (select {t: (top y 0) by: {k: x} from: TB}) (fn [e] 0))) 5 1000) -- true
+(probe_caught (fn [p] (try (select {s: (sum y) by: {k: x} from: TB take: "a"}) (fn [e] 0))) 5 1000) -- true
+(probe_caught (fn [p] (try (select {r: (+ (sum y) [1 2 3]) by: {k: x} from: TB}) (fn [e] 0))) 5 1000) -- true
+(probe_caught (fn [p] (try (select {t: (top y 0) by: 'x from: TB}) (fn [e] 0))) 5 1000) -- true
+;; a key the compiler rejects leaves its error on the graph, and freeing the
+;; graph released it as a value, which an error is not: a by-dict value, a
+;; by-dict value with no column, an eval-level computed key
+(probe_caught (fn [p] (try (select {by: {k: (+ x 'a)} from: TB}) (fn [e] 0))) 5 1000) -- true
+(probe_caught (fn [p] (try (select {by: {k: (+ 1 'a)} from: TB}) (fn [e] 0))) 5 1000) -- true
+(probe_caught (fn [p] (try (select {c: (count (distinct y)) by: (+ x 'a) from: TB}) (fn [e] 0))) 5 1000) -- true
+;; a where: that keeps every row hands back the input itself, with a
+;; reference the no-output and eval-level groupings never dropped: the
+;; whole input table per call, a nested select's result included
+(set mkw (fn [] (table [x y z s] (list (% (til 1000) 7) (til 1000) (% (til 1000) 3) (as 'STR (% (til 1000) 5))))))
+(probe (fn [p] (count (select {by: x from: (mkw) where: (>= y 0)}))) 5 60) -- true
+(probe (fn [p] (count (select {by: (* x 2) from: (mkw) where: (>= y 0) desc: x take: 2}))) 5 60) -- true
+(probe (fn [p] (count (select {by: [x z] from: (mkw) where: (>= y 0)}))) 5 60) -- true
+(probe (fn [p] (count (select {by: s from: (mkw) where: (>= y 0)}))) 5 60) -- true
+(probe (fn [p] (count (select {by: {k: x} from: (select {from: (mkw) where: (> y 38)}) where: (> y 0)}))) 5 60) -- true
+;; a table kept in a global is not held past the selects over it
+(set Tkw (mkw))
+(set h0 (heapb))
+(map (fn [p] (count (select {by: x from: Tkw where: (>= y 0)}))) (til 10))
+(set Tkw 0)
+(< (- (heapb) h0) -10000) -- true
+;; try frees the error it catches, and the trace its unwind recorded: a
+;; raise, a runtime error, a rethrow, a fallback value, in a function
+(probe (fn [p] (try (raise p) (fn [e] 0))) 5 1000) -- true
+(probe (fn [p] (try (+ p 'a) (fn [e] 0))) 5 1000) -- true
+(probe (fn [p] (try (try (raise p) (fn [e] (raise e))) (fn [e] 0))) 5 1000) -- true
+(probe (fn [p] (try (+ p 'a) 0)) 5 1000) -- true
+;; and at the top level, where try is evaluated rather than compiled.  A
+;; handler written as a literal is a new literal in each statement, which
+;; the closure template cache keeps (up to 256 of them, a bounded cost per
+;; statement): a statement is run 1000 and then 4000 times, and the two
+;; must cost the same.
+(times 100 (try (raise 5) (fn [e] 0)))
+(set h0 (heapb))
+(times 1000 (try (raise 5) (fn [e] 0)))
+(set d1 (- (heapb) h0))
+(set h0 (heapb))
+(times 4000 (try (raise 5) (fn [e] 0)))
+(< (- (- (heapb) h0) d1) 1024) -- true
+(set h0 (heapb))
+(times 1000 (try (+ 1 'a) 0))
+(set d1 (- (heapb) h0))
+(set h0 (heapb))
+(times 4000 (try (+ 1 'a) 0))
+(< (- (- (heapb) h0) d1) 1024) -- true
+(set h0 (heapb))
+(times 1000 (try (try (raise 5) (fn [e] (raise e))) (fn [e] 0)))
+(set d1 (- (heapb) h0))
+(set h0 (heapb))
+(times 4000 (try (try (raise 5) (fn [e] (raise e))) (fn [e] 0)))
+(< (- (- (heapb) h0) d1) 1024) -- true
+;; an error raised inside nested calls leaves a trace of their frames, which
+;; the top-level try clears with the error.  Measured within one statement:
+;; the runner clears the trace between statements.
+(set fe1 (fn [x] (+ x 'a)))
+(set fe2 (fn [x] (fe1 x)))
+(times 100 (try (fe2 1) (fn [e] 0)))
+(do (set h0 (heapb)) (times 1000 (try (fe2 1) (fn [e] 0))) (< (- (heapb) h0) 4096)) -- true
+;; an operand error the asof-join planner meets is freed before it falls back
+(set qtr (table [Sym Time Bid] (list [x x x] [10:00:00.000 10:00:02.000 10:00:04.000] [99.0 100.5 101.5])))
+(probe_caught (fn [p] (try (asof-join [Sym Time] (select {from: nosuchtbl}) qtr) (fn [e] 0))) 5 1000) -- true
+;; a sort without by: over a parted table: no growth per call (it failed,
+;; and each failure left 64 B behind)
+(.sys.exec "rm -rf /tmp/rfl_ckmemps")
+(.db.splayed.set "/tmp/rfl_ckmemps/2024.01.01/t/" (table [x y] (list [3 1 4] [30 10 40])))
+(.db.splayed.set "/tmp/rfl_ckmemps/2024.01.02/t/" (table [x y] (list [2 3 1 5] [20 31 11 50])))
+(set Pps (.db.parted.get "/tmp/rfl_ckmemps/" 't))
+(probe_caught (fn [p] (try (count (select {from: Pps desc: x})) (fn [e] 0))) 5 300) -- true
+(probe_caught (fn [p] (try (count (select {from: Pps desc: x take: 2})) (fn [e] 0))) 5 300) -- true
+(.sys.exec "rm -rf /tmp/rfl_ckmemps")
 ;; the same table reused across calls must not be released twice: the
 ;; result is still right after many calls
 (set T (mk 1))

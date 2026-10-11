@@ -25,6 +25,7 @@
 #include "lang/env.h"
 #include "lang/nfo.h"
 #include "table/sym.h"   /* ray_read_sym — capture names */
+#include "core/block.h"  /* ray_block_size — a literal's weight */
 #include <stdbool.h>
 #include <string.h>
 
@@ -57,6 +58,10 @@ typedef struct {
     int32_t  trap_depth;  /* open OP_TRAP frames in current lambda */
     int32_t  depth;       /* expression nesting; past the guard the lambda is
                            * left to the tree walker rather than the C stack */
+    ray_t   *deps;        /* when set (an I64 vector): every call head looked
+                           * up at compile time and the builtin it named (0
+                           * for anything else), the bindings the bytecode
+                           * depends on (ray_compile_definition) */
 } compiler_t;
 
 static void compile_expr(compiler_t *c, ray_t *ast);
@@ -87,6 +92,7 @@ static void compiler_destroy(compiler_t *c) {
         if (c->consts[i]) ray_release(c->consts[i]);
     ray_release(c->consts_obj);
     ray_release(c->code_obj);
+    if (c->deps) { ray_release(c->deps); c->deps = NULL; }
 }
 
 /* ── Debug info helpers ── */
@@ -511,31 +517,28 @@ static void compile_list(compiler_t *c, ray_t *ast) {
         if (sym_id == sf_fn && n >= 3) {
             if (compile_fn_template(c, ast)) return;
             if (c->error) return;
-            if (ast_refs_locals(c, ast)) {
-                ray_t *syms = ray_alloc((size_t)c->n_locals * sizeof(int64_t));
-                if (!syms || RAY_IS_ERR(syms)) { c->error = true; return; }
-                syms->type = RAY_I64;
-                syms->len = c->n_locals;
-                int64_t *ids = (int64_t*)ray_data(syms);
-                for (int32_t i = 0; i < c->n_locals; i++)
-                    ids[i] = c->locals[i].sym_id;
-                int32_t syms_idx = add_constant(c, syms);
-                ray_release(syms);
-                if (c->error) return;
-                emit_const(c, syms_idx);
-                emit(c, OP_SCOPE_BEGIN);
-                int32_t idx = add_constant(c, ast);
-                emit_const(c, idx);
-                emit(c, OP_CALLD);
-                emit(c, 0);
-                emit_const(c, syms_idx);
-                emit(c, OP_SCOPE_END);
-                return;
-            }
+            /* The literal captures the window, which binds the locals it
+             * mentions and nothing a caller of this frame had in scope. */
+            bool refs = ast_refs_locals(c, ast);
+            int32_t nsyms = refs ? c->n_locals : 0;
+            ray_t *syms = ray_alloc((size_t)(nsyms > 0 ? nsyms : 1) * sizeof(int64_t));
+            if (!syms || RAY_IS_ERR(syms)) { c->error = true; return; }
+            syms->type = RAY_I64;
+            syms->len = nsyms;
+            int64_t *ids = (int64_t*)ray_data(syms);
+            for (int32_t i = 0; i < nsyms; i++)
+                ids[i] = c->locals[i].sym_id;
+            int32_t syms_idx = add_constant(c, syms);
+            ray_release(syms);
+            if (c->error) return;
+            emit_const(c, syms_idx);
+            emit(c, OP_SCOPE_EVAL);
             int32_t idx = add_constant(c, ast);
             emit_const(c, idx);
             emit(c, OP_CALLD);
             emit(c, 0);
+            emit_const(c, syms_idx);
+            emit(c, OP_SCOPE_END);
             return;
         }
 
@@ -598,8 +601,20 @@ static void compile_list(compiler_t *c, ray_t *ast) {
 
     /* Look up head at compile time to determine call type */
     ray_t *fn = NULL;
-    if (head->type == -RAY_SYM && !(head->attrs & ATTR_QUOTED) && !head_local)
-        fn = c->dynamic_globals ? ray_env_get_global(head->i64) : ray_env_get(head->i64);
+    if (head->type == -RAY_SYM && !(head->attrs & ATTR_QUOTED) && !head_local) {
+        fn = c->dynamic_globals ? ray_env_get_global(head->i64) : ray_env_get_compiled(head->i64);
+        if (c->deps && !c->dynamic_globals) {
+            /* Only a builtin shapes the code (baked, a special form, the
+             * call opcode); any other value is called through OP_CALLF. */
+            bool builtin = fn && (fn->type == RAY_UNARY || fn->type == RAY_BINARY || fn->type == RAY_VARY);
+            int64_t pair[2] = { head->i64, builtin ? (int64_t)(uintptr_t)fn : 0 };
+            for (int k = 0; k < 2 && !c->error; k++) {
+                c->deps = ray_vec_append(c->deps, &pair[k]);
+                if (!c->deps || RAY_IS_ERR(c->deps)) { c->deps = NULL; c->error = true; }
+            }
+            if (c->error) return;
+        }
+    }
 
     /* Unrecognized special form: dynamic eval on the entire form.  The
      * special form re-evaluates its argument ASTs via the tree walker,
@@ -608,30 +623,25 @@ static void compile_list(compiler_t *c, ray_t *ast) {
      * at this point (plus self) into a scope frame around the eval,
      * and sync any let-updates back into the slots afterwards. */
     if (fn && (fn->attrs & RAY_FN_SPECIAL_FORM)) {
-        /* Fast path: a form that mentions no local (the common
-         * globals-only case) needs no materialization — emit the bare
-         * dynamic eval exactly as before. */
-        if (!ast_refs_locals(c, ast)) {
-            int32_t idx = add_constant(c, ast);
-            emit_const(c, idx);
-            emit(c, OP_CALLD);
-            emit(c, 0);
-            return;
-        }
-
-        ray_t *syms = ray_alloc((size_t)c->n_locals * sizeof(int64_t));
+        /* The window binds the locals the form mentions (none in the
+         * common globals-only case) and marks where the text's scope
+         * ends: a function the text calls, or a window of whoever called
+         * this frame, sees none of them (OP_SCOPE_EVAL). */
+        bool refs = ast_refs_locals(c, ast);
+        int32_t nsyms = refs ? c->n_locals : 0;
+        ray_t *syms = ray_alloc((size_t)(nsyms > 0 ? nsyms : 1) * sizeof(int64_t));
         if (!syms || RAY_IS_ERR(syms)) { c->error = true; return; }
         syms->type = RAY_I64;
-        syms->len  = c->n_locals;
+        syms->len  = nsyms;
         int64_t *ids = (int64_t*)ray_data(syms);
-        for (int32_t i = 0; i < c->n_locals; i++)
+        for (int32_t i = 0; i < nsyms; i++)
             ids[i] = c->locals[i].sym_id;   /* slot i <-> ids[i] */
         int32_t syms_idx = add_constant(c, syms);
         ray_release(syms);
         if (c->error) return;
 
         emit_const(c, syms_idx);
-        emit(c, OP_SCOPE_BEGIN);
+        emit(c, OP_SCOPE_EVAL);
         int32_t idx = add_constant(c, ast);
         emit_const(c, idx);
         emit(c, OP_CALLD);
@@ -647,8 +657,10 @@ static void compile_list(compiler_t *c, ray_t *ast) {
      * included, the way a dynamic special form does. */
     int32_t dyn_syms_idx = -1;
     if (head->type == -RAY_SYM && !(head->attrs & ATTR_QUOTED) && !head_local &&
-        (head->i64 == sf_eval || head->i64 == sf_resolve) && c->n_locals > 0) {
-        ray_t *syms = ray_alloc((size_t)c->n_locals * sizeof(int64_t));
+        (head->i64 == sf_eval || head->i64 == sf_resolve)) {
+        /* With no locals too: the window still marks where the text's
+         * scope ends, so a caller's window below it stays hidden. */
+        ray_t *syms = ray_alloc((size_t)(c->n_locals > 0 ? c->n_locals : 1) * sizeof(int64_t));
         if (!syms || RAY_IS_ERR(syms)) { c->error = true; return; }
         syms->type = RAY_I64;
         syms->len  = c->n_locals;
@@ -684,11 +696,19 @@ static void compile_list(compiler_t *c, ray_t *ast) {
      * after the call. */
     if (dyn_syms_idx >= 0) {
         emit_const(c, dyn_syms_idx);
-        emit(c, OP_SCOPE_BEGIN);
+        emit(c, OP_SCOPE_EVAL);
     }
 
     bool emitted = false;
-    if (fn && (baked || fn->type == RAY_LAMBDA)) {
+    if (fn && !baked && c->dynamic_globals) {
+        /* A closure body resolved the callee above (OP_RESOLVE); while
+         * the name holds a builtin of the kind it holds now, the call
+         * takes the fast path, and the general call otherwise. */
+        if (fn->type == RAY_UNARY && argc == 1)      { emit(c, OP_CALL1R); emit(c, 1); emitted = true; }
+        else if (fn->type == RAY_BINARY && argc == 2) { emit(c, OP_CALL2R); emit(c, 2); emitted = true; }
+        else if (fn->type == RAY_VARY)                { emit(c, OP_CALLNR); emit(c, (uint8_t)argc); emitted = true; }
+    }
+    if (!emitted && fn && (baked || fn->type == RAY_LAMBDA)) {
         switch (fn->type) {
         case RAY_UNARY:
             if (argc == 1) { emit(c, OP_CALL1); emitted = true; }
@@ -810,18 +830,87 @@ static bool closure_shape_ok(ray_t *closure) {
  * dicts), appended to the I64 vector *out without duplicates.  *dynamic is
  * set when the text mentions `eval` or `resolve`, which can reach a name
  * that is not spelled out. */
-static bool ast_collect_syms_at(ray_t *ast, ray_t **out, bool *dynamic, int depth, int64_t *weight);
+static bool ast_collect_syms_at(ray_t *ast, ray_t **out, bool *dynamic, int depth, int64_t *weight,
+                                bool stop, int64_t *nodes);
+/* The nodes a walk for a closure's names visits at most.  A large constant
+ * is one node however many bytes it holds; only text shared over and over
+ * (a list nested in itself 2^22 times, say) reaches the budget, and the
+ * caller then treats the names as unknown and binds every capture. */
+enum { AST_NAME_NODES = 1 << 16 };
+
+/* Every name `ast` mentions, for a closure's capture set. */
 static bool ast_collect_syms(ray_t *ast, ray_t **out, bool *dynamic) {
-    int64_t weight = 0;
-    return ast_collect_syms_at(ast, out, dynamic, 0, &weight);
+    int64_t weight = 0, nodes = AST_NAME_NODES;
+    return ast_collect_syms_at(ast, out, dynamic, 0, &weight, false, &nodes);
 }
-/* `weight` accumulates the elements of the vectors the text holds, so a
- * literal built around a large constant is not kept in a template table;
- * nesting past 1024 levels is given up on (the literal then has no
- * template and compiles when called). */
-static bool ast_collect_syms_at(ray_t *ast, ray_t **out, bool *dynamic, int depth, int64_t *weight) {
+
+/* The bytes a value spliced into text holds whole: a table's columns, a
+ * lambda's parameters, body and captures, recursively.  Shared children
+ * count each time they are reached (an overestimate), so the walk stops as
+ * soon as the count passes `cap`, the room left under the template bound:
+ * the work is bounded by the bound, whatever the value's shape, and so is
+ * the depth, since every level adds a header. */
+static int64_t ast_node_bytes(ray_t *v, int64_t cap);
+static int64_t ast_value_bytes(ray_t *v, int64_t cap) {
+    if (!v || RAY_IS_ERR(v)) return 0;
+    if (cap < 0) return 1;
+    int64_t b;
+    if (v->type == RAY_LAMBDA) {
+        b = (int64_t)(sizeof(ray_t) + LAMBDA_SLOTS * sizeof(ray_t*));
+        ray_t *parts[4] = { LAMBDA_PARAMS(v), LAMBDA_BODY(v), LAMBDA_CLOSURE(v), LAMBDA_CAPROWS(v) };
+        for (int i = 0; i < 4 && b <= cap; i++) b += ast_value_bytes(parts[i], cap - b);
+        return b;
+    }
+    if (v->type == RAY_TABLE || v->type == RAY_DICT) {
+        ray_t **slots = (ray_t**)ray_data(v);
+        b = (int64_t)ray_block_size(v);
+        for (int i = 0; i < 2 && b <= cap; i++) b += ast_value_bytes(slots[i], cap - b);
+        return b;
+    }
+    if (v->type == RAY_LIST && !(v->attrs & RAY_ATTR_SLICE)) {
+        ray_t **elems = (ray_t**)ray_data(v);
+        b = (int64_t)ray_block_size(v);
+        for (int64_t i = 0; i < v->len && b <= cap; i++) b += ast_value_bytes(elems[i], cap - b);
+        return b;
+    }
+    return ast_node_bytes(v, cap);
+}
+
+/* The bytes a text node holds: its header and payload, a string atom's
+ * or a string vector's characters, and the whole parent of a slice.  A
+ * table or a lambda in the text is a constant the walk does not enter:
+ * it counts whole (ast_value_bytes). */
+static int64_t ast_node_bytes(ray_t *v, int64_t cap) {
+    if (v->type == RAY_TABLE || v->type == RAY_LAMBDA)
+        return ast_value_bytes(v, cap);
+    if (ray_is_atom(v)) {
+        int64_t b = (int64_t)ray_block_size(v);
+        if (v->type == -RAY_STR && !((v->slen >= 1 && v->slen <= 7) || (v->slen == 0 && !v->obj)) && v->obj)
+            b += ast_node_bytes(v->obj, cap);
+        else if (v->type == -RAY_GUID && v->obj)
+            b += ast_node_bytes(v->obj, cap);
+        return b;
+    }
+    if ((v->attrs & RAY_ATTR_SLICE) && v->slice_parent) return ast_node_bytes(v->slice_parent, cap);
+    int64_t b = (int64_t)ray_block_size(v);
+    if (v->type == RAY_STR && v->str_pool) b += (int64_t)ray_block_size(v->str_pool);
+    return b;
+}
+
+/* `weight` accumulates the bytes the text holds (ast_node_bytes of every
+ * node), so a literal built around a large constant, a long string
+ * included, is not kept in a template table; nesting past 1024 levels is
+ * given up on (the literal then has no template and compiles when called). */
+/* `stop`: the walk serves only the template table, which will not keep a
+ * literal past its bound, so it gives up (false) once the weight passes it. */
+static bool ast_collect_syms_at(ray_t *ast, ray_t **out, bool *dynamic, int depth, int64_t *weight,
+                                bool stop, int64_t *nodes) {
     if (!ast || !*out) return false;
     if (depth > 1024) return false;
+    if (nodes && --*nodes < 0) return false;
+    /* Past the template bound the exact weight does not matter. */
+    *weight += ast_node_bytes(ast, RAY_CLOSURE_TMPL_MAX_BYTES - *weight);
+    if (stop && *weight > RAY_CLOSURE_TMPL_MAX_BYTES) return false;
     if (ast->type == -RAY_SYM) {
         int64_t id = ast->i64;
         if (id == sf_eval || id == sf_resolve) *dynamic = true;
@@ -844,17 +933,15 @@ static bool ast_collect_syms_at(ray_t *ast, ray_t **out, bool *dynamic, int dept
     }
     if (ast->type == RAY_LIST) {
         ray_t **elems = (ray_t**)ray_data(ast);
-        *weight += ast->len;
         for (int64_t i = 0; i < ast->len; i++)
-            if (!ast_collect_syms_at(elems[i], out, dynamic, depth + 1, weight)) return false;
+            if (!ast_collect_syms_at(elems[i], out, dynamic, depth + 1, weight, stop, nodes)) return false;
         return true;
     }
     if (ast->type == RAY_DICT) {
         ray_t **slots = (ray_t**)ray_data(ast);
-        return ast_collect_syms_at(slots[0], out, dynamic, depth + 1, weight) &&
-               ast_collect_syms_at(slots[1], out, dynamic, depth + 1, weight);
+        return ast_collect_syms_at(slots[0], out, dynamic, depth + 1, weight, stop, nodes) &&
+               ast_collect_syms_at(slots[1], out, dynamic, depth + 1, weight, stop, nodes);
     }
-    if (ast->type > 0 && ast->type != RAY_SYM) *weight += ast->len;   /* a typed vector constant */
     return true;
 }
 
@@ -867,18 +954,24 @@ static bool syms_contain(ray_t *syms, int64_t id) {
 
 /* The capture names a closure body can reach: the closure dict's keys that
  * the body mentions (every key when the body uses eval or resolve), never
- * `self`.  A SYM vector the caller releases, or NULL for none. */
-static ray_t *closure_capture_names(ray_t *lambda) {
+ * `self`.  A SYM vector the caller releases, or NULL for none.  *failed is
+ * set when the body could not be walked (nesting past the walk's guard,
+ * more nodes than AST_NAME_NODES, or an allocation failure): NULL
+ * then means "unknown", not "none", and the
+ * body must not be compiled without its captures. */
+static ray_t *closure_capture_names(ray_t *lambda, bool *failed) {
+    *failed = false;
     ray_t *closure = LAMBDA_CLOSURE(lambda);
     if (!closure) return NULL;
     ray_t *keys = ray_dict_keys(closure);
     if (!keys || keys->len == 0) return NULL;
     init_sf_syms();
     ray_t *mentioned = ray_vec_new(RAY_I64, 16);
-    if (!mentioned || RAY_IS_ERR(mentioned)) return NULL;
+    if (!mentioned || RAY_IS_ERR(mentioned)) { *failed = true; return NULL; }
     bool dynamic = false;
     bool ok = ast_collect_syms(LAMBDA_BODY(lambda), &mentioned, &dynamic);
     ray_t *names = ok ? ray_sym_vec_new(RAY_SYM_W64, keys->len) : NULL;
+    if (!names || RAY_IS_ERR(names)) *failed = true;
     if (names && !RAY_IS_ERR(names)) {
         int64_t *out = (int64_t*)ray_data(names);
         names->len = 0;
@@ -949,7 +1042,9 @@ static bool compile_fn_template_at(compiler_t *c, ray_t *ast) {
     ray_t *mentioned = ray_vec_new(RAY_I64, 16);
     if (!mentioned || RAY_IS_ERR(mentioned)) { if (own_params) ray_release(params); return false; }
     bool dynamic = false, ok = true;
-    for (int64_t i = 2; i < n && ok; i++) ok = ast_collect_syms(elems[i], &mentioned, &dynamic);
+    int64_t tweight = 0, tnodes = AST_NAME_NODES;
+    for (int64_t i = 2; i < n && ok; i++)
+        ok = ast_collect_syms_at(elems[i], &mentioned, &dynamic, 0, &tweight, false, &tnodes);
     if (!ok) { ray_release(mentioned); if (own_params) ray_release(params); return false; }
 
     /* Capture names and the enclosing slots they come from, in slot order. */
@@ -1013,17 +1108,19 @@ static bool compile_fn_template_at(compiler_t *c, ray_t *ast) {
     return true;
 }
 
-ray_t *ray_closure_capture_names(ray_t *lambda) { return closure_capture_names(lambda); }
+ray_t *ray_closure_capture_names(ray_t *lambda) { bool failed; return closure_capture_names(lambda, &failed); }
 
 /* Every symbol a body mentions (I64 vector, owned by the caller) and whether
- * it uses eval or resolve; NULL on allocation failure. */
+ * it uses eval or resolve; NULL on allocation failure, nesting past the
+ * walk's guard, or a weight past RAY_CLOSURE_TMPL_MAX_BYTES (the walk
+ * stops there: the template table would not keep the literal). */
 ray_t *ray_closure_mentioned_syms(ray_t *body, bool *dynamic, int64_t *weight) {
     init_sf_syms();
     ray_t *mentioned = ray_vec_new(RAY_I64, 16);
     if (!mentioned || RAY_IS_ERR(mentioned)) return NULL;
     *dynamic = false;
     *weight = 0;
-    if (!ast_collect_syms_at(body, &mentioned, dynamic, 0, weight)) { if (mentioned) ray_release(mentioned); return NULL; }
+    if (!ast_collect_syms_at(body, &mentioned, dynamic, 0, weight, true, NULL)) { if (mentioned) ray_release(mentioned); return NULL; }
     return mentioned;
 }
 
@@ -1052,7 +1149,17 @@ bool ray_compile_with_captures(ray_t *lambda, ray_t *capnames, bool closure_body
 void ray_compile(ray_t *lambda) {
     if (LAMBDA_IS_COMPILED(lambda)) return;
     if (!closure_shape_ok(LAMBDA_CLOSURE(lambda))) return;
-    ray_t *names = closure_capture_names(lambda);
+    bool walk_failed = false;
+    ray_t *names = closure_capture_names(lambda, &walk_failed);
+    /* A body the walk gave up on mentions captures it cannot list: bind
+     * every capture, as for a body that uses eval, or compiled without
+     * them its captured names would resolve as globals.  When that does
+     * not compile either (more captures than a frame holds), the body
+     * stays on the tree walker. */
+    if (walk_failed) {
+        names = ray_closure_names_from(LAMBDA_CLOSURE(lambda), NULL, true);
+        if (!names) { LAMBDA_NLOCALS(lambda) = -1; return; }
+    }
     /* A closure body resolves its free names at call time; a lambda made
      * with nothing captured keeps the builtins it names baked in. */
     if (!compile_lambda(lambda, names, LAMBDA_CLOSURE(lambda) != NULL))
@@ -1064,11 +1171,36 @@ void ray_compile(ray_t *lambda) {
  * ahead of the body by one OP_BINDCAPS.  A parameter shadows a capture of
  * its name.  False when the body cannot be compiled (the lambda stays on
  * the tree walker). */
+static bool compile_lambda_deps(ray_t *lambda, ray_t *capnames, bool dynamic_globals, ray_t **deps);
 static bool compile_lambda(ray_t *lambda, ray_t *capnames, bool dynamic_globals) {
+    return compile_lambda_deps(lambda, capnames, dynamic_globals, NULL);
+}
+
+/* Compile a lambda with nothing captured, as ray_compile does, and hand
+ * back in *deps (an I64 vector the caller releases) the call heads its
+ * code was shaped by: pairs of a symbol and the builtin it named then, or
+ * 0.  Code compiled for the same text while every pair still holds is
+ * the code a fresh compile would produce.  False when it does not
+ * compile (the lambda is then marked, as ray_compile marks it). */
+bool ray_compile_definition(ray_t *lambda, ray_t **deps) {
+    *deps = NULL;
+    if (LAMBDA_IS_COMPILED(lambda) || LAMBDA_CLOSURE(lambda)) return false;
+    if (!compile_lambda_deps(lambda, NULL, false, deps)) {
+        LAMBDA_NLOCALS(lambda) = -1;
+        return false;
+    }
+    return true;
+}
+
+static bool compile_lambda_deps(ray_t *lambda, ray_t *capnames, bool dynamic_globals, ray_t **deps) {
     compiler_t c;
     if (!compiler_init(&c)) return false;
     c.lambda = lambda;
     c.dynamic_globals = dynamic_globals;
+    if (deps) {
+        c.deps = ray_vec_new(RAY_I64, 16);
+        if (!c.deps || RAY_IS_ERR(c.deps)) { c.deps = NULL; compiler_destroy(&c); return false; }
+    }
 
     /* Register params as locals */
     ray_t *params_list = LAMBDA_PARAMS(lambda);
@@ -1084,7 +1216,7 @@ static bool compile_lambda(ray_t *lambda, ray_t *capnames, bool dynamic_globals)
 
     /* A closure's captures are locals of its body, bound before it runs:
      * a `let` of a captured name writes the same slot, a capture named
-     * like a builtin is the callee, and a window (OP_SCOPE_BEGIN) binds
+     * like a builtin is the callee, and a window (OP_SCOPE_EVAL) binds
      * them with the other locals.  Only the names the body mentions take a
      * slot (closure_capture_names / compile_fn_template), so a closure's
      * recursion depth does not shrink with the bindings in scope.  One
@@ -1158,6 +1290,7 @@ static bool compile_lambda(ray_t *lambda, ray_t *capnames, bool dynamic_globals)
         /* dbg_obj is now owned by the lambda, don't release it */
     }
 
+    if (deps) { *deps = c.deps; c.deps = NULL; }
     compiler_destroy(&c);
     return true;
 }

@@ -38,6 +38,78 @@ calls -- 5
 (set tick (fn [v] (do (set ticks (+ ticks 1)) v)))
 (at (select {v: (tick s) e: (reverse x) from: T}) 'v) -- ['a 'b 'c 'd 'e]
 ticks -- 5
+;; A global an inlined helper reads is read when it runs: an effectful helper
+;; in the same expression that sets it between groups, rows or operands is
+;; seen, grouped or not, aggregating or row-wise
+(set TG (table [x k] (list (til 20) (% (til 20) 7))))
+(set G 0)
+(set bump (fn [v] (set G (+ G 100)) 0))
+(set hg (fn [v] (+ (sum v) G)))
+(set hgr (fn [v] (+ v G)))
+(at (update {r: (+ (bump x) (hg x)) by: k from: TG}) 'r) -- [121 224 327 430 533 636 719 121 224 327 430 533 636 719 121 224 327 430 533 636]
+G -- 700
+(set G 0)
+(at (update {r: (+ (bump x) (hgr x)) by: k from: TG}) 'r) -- [100 201 302 403 504 605 706 107 208 309 410 511 612 713 114 215 316 417 518 619]
+(set G 0)
+(at (update {r: (+ (bump x) (hg x)) from: TG}) 'r) -- (take 290 20)
+(set G 0)
+(at (update {r: (+ (bump x) (hg x)) from: TG where: (> x 17)}) 'r) -- [0N 0N 0N 0N 0N 0N 0N 0N 0N 0N 0N 0N 0N 0N 0N 0N 0N 0N 290 290]
+(set G 0)
+(at (select {r: (+ (bump x) (hg x)) by: k from: TG}) 'r) -- [221 324 427 530 633 736 819]
+(set bumpk (fn [v] (set G (first v)) 0))
+(at (update {r: (+ (bumpk k) (hg x)) by: k from: TG}) 'r) -- [21 25 29 33 37 41 25 21 25 29 33 37 41 25 21 25 29 33 37 41]
+;; ... in a grouped select's output over another output, and in a projection
+;; evaluated row by row
+(set G 0)
+(at (select {s: (sum x) r: (+ (bump s) (hgr s)) by: k from: TG}) 'r) -- [121 224 327 430 533 636 719]
+(set G 0)
+(at (select {s: (sum x) r: (+ (hgr s) (bump s)) by: k from: TG}) 'r) -- [21 124 227 330 433 536 619]
+(set G 0)
+(at (select {a: (* x 2) r: (+ (bump a) (hgr x)) from: TG}) 'r) -- (+ (til 20) (* 100 (+ 1 (til 20))))
+(set G 0)
+(at (select {r: (+ (bump x) (hgr x)) e: (reverse x) from: TG}) 'r) -- (+ (til 20) (* 100 (+ 1 (til 20))))
+;; ... and so is an effect the expression reaches through a let in a loop, a
+;; let after a raise, or a function value a builtin calls
+(set pidG (fn [x] x))
+(set G 0)
+(set bumpL (fn [v] (let g pidG) (times 2 (do (g v) (let g (fn [y] (bump y))))) 0))
+(at (update {r: (+ (bumpL x) (hg x)) by: k from: TG}) 'r) -- [121 224 327 430 533 636 719 121 224 327 430 533 636 719 121 224 327 430 533 636]
+(set G 0)
+(set bumpT (fn [v] (let g (fn [y] (bump y))) (try (do (raise "x") (let g pidG)) (fn [e] 0)) (g v) 0))
+(at (update {r: (+ (bumpT x) (hg x)) by: k from: TG}) 'r) -- [121 224 327 430 533 636 719 121 224 327 430 533 636 719 121 224 327 430 533 636]
+(set G 0)
+(set DG (dict ['b] (list bump)))
+(at (update {r: (+ (first (map DG.b (enlist x))) (hg x)) by: k from: TG}) 'r) -- [121 224 327 430 533 636 719 121 224 327 430 533 636 719 121 224 327 430 533 636]
+(set G 0)
+(at (update {r: (+ (first (map (at DG 'b) (enlist x))) (hg x)) by: k from: TG}) 'r) -- [121 224 327 430 533 636 719 121 224 327 430 533 636 719 121 224 327 430 533 636]
+(set G 0)
+(set TGf (update {f: (list bump) from: (table [a] (list [1]))}))
+(at (update {r: (+ (first (map (first (at TGf 'f)) (enlist x))) (hg x)) by: k from: TG}) 'r) -- [121 224 327 430 533 636 719 121 224 327 430 533 636 719 121 224 327 430 533 636]
+(set G 0)
+(set bump2G (fn [a v] (set G (+ G 100)) 0))
+(set DG2 (dict ['g] (list bump2G)))
+(at (update {r: (+ (fold-left (at DG2 'g) 0 (enlist x)) (hg x)) by: k from: TG}) 'r) -- [121 224 327 430 533 636 719 121 224 327 430 533 636 719 121 224 327 430 533 636]
+(set G 0)
+(set DGh (dict ['h] (list bump)))
+(at (update {r: (+ (try (raise "x") (at DGh 'h)) (hg x)) by: k from: TG}) 'r) -- [121 224 327 430 533 636 719 121 224 327 430 533 636 719 121 224 327 430 533 636]
+(set G 0)
+(set DGm (dict ['g] (list bump)))
+(at (update {r: (+ (first (first (map (fn [f] (f (at DGm 'g) (enlist x))) (list map)))) (hg x)) by: k from: TG}) 'r) -- [121 224 327 430 533 636 719 121 224 327 430 533 636 719 121 224 327 430 533 636]
+;; ... and a pure expression, inlined once for every group, reads it as well
+(set G 1000)
+(at (update {r: (hg x) by: k from: TG}) 'r) -- [1021 1024 1027 1030 1033 1036 1019 1021 1024 1027 1030 1033 1036 1019 1021 1024 1027 1030 1033 1036]
+;; A helper's parameter spelled like a special form is called, on the planned
+;; path and when the helper is expanded; so is a caller's local of that name
+(set TQ (table [v] (list [1 2 3])))
+(set hq (fn [quote x] (quote x)))
+(at (select {r: (hq neg v) from: TQ}) 'r) -- [-1 -2 -3]
+(set hiff (fn [if x] (if x)))
+(at (select {r: (hiff neg v) from: TQ}) 'r) -- [-1 -2 -3]
+(at ((fn [quote] (select {r: (quote v) from: TQ})) neg) 'r) -- [-1 -2 -3]
+;; a helper's free name is the global, not a caller's local of that name
+(set hrv (fn [v] (reverse v)))
+(set hrv2 (fn [v] 1 (reverse v)))
+(at ((fn [reverse] (select {r: (hrv v) e: (reverse v) from: TQ})) neg) 'r) -- (at ((fn [reverse] (select {r: (hrv2 v) from: TQ})) neg) 'r)
 ;; A quoted symbol inside a helper body is the symbol on every path, even
 ;; when a column has that spelling and whatever operator consumes it.
 (set hqt (fn [v] (concat v 't)))
@@ -123,6 +195,22 @@ ticks -- 5
 (at (select {r: ((fn [v] 1 (concat (first v) 'zz)) s) by: x from: TC}) 'r) -- [azz zz czz dzz]
 (set hfirst3 (fn [v] 1 (let f first) (concat (f v) 'zz)))
 (at (select {r: (hfirst3 s) by: x from: TC}) 'r) -- [azz zz czz dzz]
+;; a binary builtin through that general call keeps its result's row
+;; provenance, so a second concat over it still joins text row by row
+(set hcl3 (fn [v] 1 (let f concat) (f (f v 'a) 'b)))
+(at (select {r: (hcl3 s) from: T}) 'r) -- ['aab 'bab 'cab 'dab 'eab]
+(at (update {r: (hcl3 s) from: T}) 'r) -- ['aab 'bab 'cab 'dab 'eab]
+;; ... as does a closure body's resolved concat
+(set mkcl3 (fn [k] (fn [v] (concat (concat v k) 'b))))
+(set ccl3 (mkcl3 'a))
+(at (select {r: (ccl3 s) from: T}) 'r) -- ['aab 'bab 'cab 'dab 'eab]
+;; a local an eval rebound has unknown provenance: a row-wise builtin over it
+;; does not make it row data, in a closure body as in a named helper
+(set mkcl4 (fn [k] (fn [v] (let w 0) (eval (quote (let w v))) (concat (as 'SYM w) k))))
+(set ccl4 (mkcl4 'z))
+(set hcl4 (fn [v] (let w 0) (eval (quote (let w v))) (concat (as 'SYM w) 'z)))
+(at (select {r: (ccl4 s) from: T}) 'r) -- (at (select {r: (hcl4 s) from: T}) 'r)
+(at (select {r: (ccl4 s) from: T}) 'r) -- (list ['a 'z] ['b 'z] ['c 'z] ['d 'z] ['e 'z])
 ;; a row-flagged column captured after many unflagged bindings keeps its flag
 (set TF1 (table [s] (list (as 'SYMBOL ["a" "b" "a" "c"]))))
 (set hflag1 (fn [v] (let u1 1) ((fn [a] (concat a 'x)) v)))

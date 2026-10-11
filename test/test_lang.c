@@ -292,6 +292,104 @@ static test_result_t test_closure_lazy_capture_vm(void) {
     PASS();
 }
 
+/* The symbol walk behind a closure's capture names stops at 1024 levels
+ * of nesting rather than following the text down the C stack; the closure
+ * compiler then binds every capture (closure_locals.rfl pins that). */
+static test_result_t test_closure_sym_walk_guard(void) {
+    ray_t* mk = ray_eval_str("(do (set nestw (fn [n] (let a (parse \"kw\")) (times n (let a (list a))) a)) 0)");
+    TEST_ASSERT_NOT_NULL(mk);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(mk));
+    ray_release(mk);
+    int depths[2] = { 1000, 1100 };
+    for (int i = 0; i < 2; i++) {
+        char src[64];
+        snprintf(src, sizeof src, "(nestw %d)", depths[i]);
+        ray_t* ast = ray_eval_str(src);
+        TEST_ASSERT_NOT_NULL(ast);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(ast));
+        bool dynamic = false;
+        int64_t weight = 0;
+        ray_t* ment = ray_closure_mentioned_syms(ast, &dynamic, &weight);
+        if (i == 0) {
+            TEST_ASSERT(ment != NULL, "a body within the guard is walked");
+            TEST_ASSERT_EQ_I(ment->len, 1);
+            ray_release(ment);
+        } else {
+            TEST_ASSERT(ment == NULL, "a body past the guard is given up on");
+        }
+        ray_release(ast);
+    }
+    PASS();
+}
+
+/* A body that does not compile is marked (NLOCALS -1) so it stays on the
+ * tree walker without a compile attempt per call, and a lambda so marked
+ * is never compiled again. */
+static test_result_t test_lambda_compile_failure_mark(void) {
+    ray_t* bad = ray_eval_str("(fn [x] (if false (set 1 2)) (+ x 1))");
+    TEST_ASSERT_NOT_NULL(bad);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(bad));
+    TEST_ASSERT_EQ_I(bad->type, RAY_LAMBDA);
+    /* (Made by interpreted code, it may carry the literal's verdict
+     * already; clear it so ray_compile decides.) */
+    LAMBDA_NLOCALS(bad) = 0;
+    ray_compile(bad);
+    TEST_ASSERT(!LAMBDA_IS_COMPILED(bad), "the body does not compile");
+    TEST_ASSERT_EQ_I(LAMBDA_NLOCALS(bad), -1);
+    ray_t* arg = ray_i64(2);
+    ray_t* args[1] = { arg };
+    for (int i = 0; i < 2; i++) {
+        ray_t* r = call_lambda(bad, args, 1);
+        TEST_ASSERT_NOT_NULL(r);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        TEST_ASSERT_EQ_I(r->i64, 3);
+        ray_release(r);
+        TEST_ASSERT_EQ_I(LAMBDA_NLOCALS(bad), -1);
+    }
+    ray_release(bad);
+
+    /* The mark alone keeps a compilable body interpreted. */
+    ray_t* good = ray_eval_str("(fn [x] (+ x 1))");
+    TEST_ASSERT_NOT_NULL(good);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(good));
+    TEST_ASSERT(!LAMBDA_IS_COMPILED(good), "a definition compiles on its first call");
+    LAMBDA_NLOCALS(good) = -1;
+    ray_t* r = call_lambda(good, args, 1);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->i64, 3);
+    ray_release(r);
+    TEST_ASSERT(!LAMBDA_IS_COMPILED(good), "a lambda marked not compilable is not compiled");
+    ray_release(good);
+    ray_release(arg);
+    PASS();
+}
+
+/* A closure whose text is heavy (a 66 KB string constant) but small in
+ * nodes still binds only the captures its body mentions: one slot for v7,
+ * not one per binding in scope. */
+static test_result_t test_closure_heavy_literal_captures(void) {
+    static char src[200 * 24 + 70000 + 256];
+    size_t cap = sizeof src;
+    size_t n = (size_t)snprintf(src, cap, "(do (set mkHv (fn [] (if false (set 1 2))");
+    for (int i = 0; i < 200; i++) n += (size_t)snprintf(src + n, cap - n, " (let v%d %d)", i, i);
+    n += (size_t)snprintf(src + n, cap - n, " (fn [x] (+ x (+ v7 (count \"");
+    for (int i = 0; i < 66000; i++) src[n++] = 'a';
+    n += (size_t)snprintf(src + n, cap - n, "\")))))) (set cHv (mkHv)) (cHv 1))");
+    ray_t* r = ray_eval_str(src);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->i64, 66008);
+    ray_release(r);
+    ray_t* c = ray_eval_str("cHv");
+    TEST_ASSERT_NOT_NULL(c);
+    TEST_ASSERT_EQ_I(c->type, RAY_LAMBDA);
+    TEST_ASSERT(LAMBDA_IS_COMPILED(c), "the closure compiles");
+    TEST_ASSERT(LAMBDA_NLOCALS(c) <= 4, "only the mentioned capture takes a slot");
+    ray_release(c);
+    PASS();
+}
+
 /* ---- Dummy function for testing ---- */
 static ray_t* dummy_unary(ray_t* x) { return ray_retain(x), x; }
 static ray_t* dummy_binary(ray_t* x, ray_t* y) { (void)y; return ray_retain(x), x; }
@@ -2478,6 +2576,28 @@ static test_result_t test_eval_select_by_nonagg_colref_vs_const(void) {
     TEST_ASSERT((a[0]) == (20.0), "double == failed");
     TEST_ASSERT((b[0]) == (40.0), "double == failed");
     ray_release(r3);
+    PASS();
+}
+
+/* ---- Test: a by: key that is no value ----
+ * A name bound to a function or to null is refused, with or without an
+ * output, by what it is: the refusal of a function once caught null too
+ * and called it a function. */
+static test_result_t test_eval_select_by_key_not_a_value(void) {
+    static const char* const cases[][2] = {
+        { "(select {by: sum from: (table [x y] (list [3 1] [30 10]))})", "function" },
+        { "(select {c: (count y) by: sum from: (table [x y] (list [3 1] [30 10]))})", "function" },
+        { "(do (set Nk (println \"\")) (select {by: Nk from: (table [x y] (list [3 1] [30 10]))}))", "null" },
+        { "(do (set Nk (println \"\")) (select {c: (count y) by: Nk from: (table [x y] (list [3 1] [30 10]))}))", "null" },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        ray_t* r = ray_eval_str(cases[i][0]);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+        TEST_ASSERT_STR_EQ(ray_err_code(r), "domain");
+        const char* msg = ray_error_msg();
+        TEST_ASSERT_FMT(msg && strstr(msg, cases[i][1]), "case %zu: %s", i, msg ? msg : "(none)");
+        ray_error_free(r);
+    }
     PASS();
 }
 
@@ -9772,6 +9892,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/select_by_str_nonagg_list_col", test_eval_select_by_str_nonagg_list_col, lang_setup, lang_teardown },
     { "lang/eval/select_by_nonagg_broadcast", test_eval_select_by_nonagg_broadcast, lang_setup, lang_teardown },
     { "lang/eval/select_by_nonagg_colref_vs_const", test_eval_select_by_nonagg_colref_vs_const, lang_setup, lang_teardown },
+    { "lang/eval/select_by_key_not_a_value", test_eval_select_by_key_not_a_value, lang_setup, lang_teardown },
     { "lang/eval/select_by_nonagg_with_agg_subexpr", test_eval_select_by_nonagg_with_agg_subexpr, lang_setup, lang_teardown },
     { "lang/eval/select_by_nonagg_sort_take", test_eval_select_by_nonagg_sort_take, lang_setup, lang_teardown },
     { "lang/eval/select_by_take_clamps", test_eval_select_by_take_clamps, lang_setup, lang_teardown },
@@ -10085,6 +10206,9 @@ const test_entry_t lang_entries[] = {
     { "lang/query_helper_reinit", test_query_helper_reinit, lang_setup, lang_teardown },
     { "lang/closure_malformed_capture", test_closure_malformed_capture, lang_setup, lang_teardown },
     { "lang/closure_lazy_capture_vm", test_closure_lazy_capture_vm, lang_setup, lang_teardown },
+    { "lang/closure_sym_walk_guard", test_closure_sym_walk_guard, lang_setup, lang_teardown },
+    { "lang/lambda_compile_failure_mark", test_lambda_compile_failure_mark, lang_setup, lang_teardown },
+    { "lang/closure_heavy_literal_captures", test_closure_heavy_literal_captures, lang_setup, lang_teardown },
     { "lang/io/read_procfs_zero_size", test_read_procfs_reports_zero_size, lang_setup, lang_teardown },
     { "lang/io/read_unsized_bounded", test_read_unsized_stream_is_bounded, lang_setup, lang_teardown },
     { "lang/io/exec_capture_bounded", test_exec_capture_is_bounded, lang_setup, lang_teardown },

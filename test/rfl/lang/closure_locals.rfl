@@ -189,6 +189,72 @@
 (set rxw (fn [] xw))
 (set fw3 (fn [x] (eval (rxw))))
 (fw3 1) -- 100
+;; the window binds the frame's locals for the evaluated text only: a named
+;; function that text calls sees the global, as it does when called directly
+(set pe 100)
+(set rde (fn [] pe))
+(set rde2 (fn [x] (+ x pe)))
+((fn [pe] (eval (quote (rde)))) 1) -- 100
+((fn [pe] (eval (parse "(rde)"))) 1) -- 100
+((fn [pe] (eval (quote (map rde2 [1 2])))) 1) -- [101 102]
+((fn [pe] (eval (quote (list pe (rde))))) 1) -- [1 100]
+;; ... an interpreted lambda that text calls as well
+(set rdi (fn [] (if false (set 1 2)) pe))
+((fn [pe] (eval (quote (rdi)))) 1) -- 100
+;; ... while a lambda written in the text captures it
+((fn [pe] (eval (quote ((fn [] pe))))) 1) -- 1
+;; ... nor when a named function compiles on that first call: the builtins it
+;; bakes are the globals, not the window's locals of those names
+(set rdce (fn [x] (count x)))
+((fn [count] (eval (quote (rdce [1 2 3])))) sum) -- 3
+(rdce [1 2 3]) -- 3
+;; ... however deep: a window ends the text's scope, so text a callee hands
+;; to the tree walker (eval, resolve, a query, a fn literal) never reaches a
+;; window further down, whether or not the callee has locals of its own
+(set pn 100)
+(set Tn (table [x] (list [1 2 3])))
+(set bn0 (fn [] (eval (quote (+ pn 0)))))
+((fn [pn] (eval (quote (bn0)))) 1) -- 100
+(set bn1 (fn [q] (eval (quote (+ q pn)))))
+((fn [pn] (eval (quote (bn1 0)))) 1) -- 100
+(set bn2 (fn [q] (resolve 'pn)))
+((fn [pn] (eval (quote (bn2 0)))) 1) -- 100
+(set bnq (fn [] (at (select {r: (+ x pn) from: Tn}) 'r)))
+((fn [pn] (eval (quote (bnq)))) 1) -- [101 102 103]
+(set bnf (fn [] (fn [] (if false (set 1 2)) pn)))
+((fn [pn] (eval (quote ((bnf))))) 1) -- 100
+;; ... through every load a callee's body makes: a name past 256 constants,
+;; and a let slot read before its let ran
+(set bnw (fn [] 1000 1001 1002 1003 1004 1005 1006 1007 1008 1009 1010 1011 1012 1013 1014 1015 1016 1017 1018 1019 1020 1021 1022 1023 1024 1025 1026 1027 1028 1029 1030 1031 1032 1033 1034 1035 1036 1037 1038 1039 1040 1041 1042 1043 1044 1045 1046 1047 1048 1049 1050 1051 1052 1053 1054 1055 1056 1057 1058 1059 1060 1061 1062 1063 1064 1065 1066 1067 1068 1069 1070 1071 1072 1073 1074 1075 1076 1077 1078 1079 1080 1081 1082 1083 1084 1085 1086 1087 1088 1089 1090 1091 1092 1093 1094 1095 1096 1097 1098 1099 1100 1101 1102 1103 1104 1105 1106 1107 1108 1109 1110 1111 1112 1113 1114 1115 1116 1117 1118 1119 1120 1121 1122 1123 1124 1125 1126 1127 1128 1129 1130 1131 1132 1133 1134 1135 1136 1137 1138 1139 1140 1141 1142 1143 1144 1145 1146 1147 1148 1149 1150 1151 1152 1153 1154 1155 1156 1157 1158 1159 1160 1161 1162 1163 1164 1165 1166 1167 1168 1169 1170 1171 1172 1173 1174 1175 1176 1177 1178 1179 1180 1181 1182 1183 1184 1185 1186 1187 1188 1189 1190 1191 1192 1193 1194 1195 1196 1197 1198 1199 1200 1201 1202 1203 1204 1205 1206 1207 1208 1209 1210 1211 1212 1213 1214 1215 1216 1217 1218 1219 1220 1221 1222 1223 1224 1225 1226 1227 1228 1229 1230 1231 1232 1233 1234 1235 1236 1237 1238 1239 1240 1241 1242 1243 1244 1245 1246 1247 1248 1249 1250 1251 1252 1253 1254 1255 1256 1257 1258 1259 1260 1261 1262 1263 1264 1265 1266 1267 1268 1269 1270 1271 1272 1273 1274 1275 1276 1277 1278 1279 1280 1281 1282 1283 1284 1285 1286 1287 1288 1289 1290 1291 1292 1293 1294 1295 1296 1297 1298 1299 pn))
+((fn [pn] (eval (quote (bnw)))) 1) -- 100
+(set bnl (fn [x] (if (> x 5) (let pn 0) 0) pn))
+((fn [pn] (eval (quote (bnl 1)))) 1) -- 100
+;; ... and through a helper a query in the text inlines, while the query
+;; text itself sees the window
+(set hpn (fn [v] (+ v pn)))
+(at ((fn [pn] (eval (quote (select {r: (hpn x) from: Tn})))) 1) 'r) -- [101 102 103]
+(at ((fn [pn] (eval (quote (update {r: (hpn x) from: Tn})))) 1) 'r) -- [101 102 103]
+(set hpc (fn [v] (if (> v 0) (+ v pn) 0)))
+(at ((fn [pn] (eval (quote (select {r: (hpc x) from: Tn})))) 1) 'r) -- [101 102 103]
+(at ((fn [pn] (eval (quote (select {r: (+ x pn) from: Tn})))) 1) 'r) -- [2 3 4]
+(set inn (fn [v] (+ v 100)))
+(set hpi (fn [v] (inn v)))
+(at ((fn [inn] (eval (quote (select {r: (hpi x) from: Tn})))) (fn [v] 0)) 'r) -- [101 102 103]
+;; ... and (quote x) where quote is a parameter, a capture, a let or a nested
+;; parameter is a call: x is captured
+(set incq (fn [v] (+ v 1)))
+(set mkq1 (fn [quote x] (fn [] (quote x))))
+((mkq1 incq 41)) -- 42
+(set mkq2 (fn [q x] (fn [] (let quote q) (quote x))))
+((mkq2 incq 41)) -- 42
+(set mkq3 (fn [x] (fn [quote] (quote x))))
+((mkq3 41) incq) -- 42
+(set mkq4 (fn [quote x] (if false (set 1 2)) (fn [] (quote x))))
+((mkq4 incq 41)) -- 42
+((fn [x] ((fn [] (quote x)))) 41) -- 'x
+;; quoted text names nothing a closure captures for, but eval reaches it all
+(((fn [kq] (fn [] (eval (quote (+ kq 0))))) 7)) -- 7
+(((fn [kq] (fn [] (list (quote kq) (eval (quote (+ kq 1)))))) 7)) -- (list 'kq 8)
 ;; ... and many such calls leave the scope stack as it was
 (times 200 (gw 1))
 (do (let aw 1) aw) -- 1
@@ -209,6 +275,112 @@ rb -- [6 3]
 (set gb count)
 (set cb4 (mkb3))
 (list (cb3 [1 2 3]) (cb4 [1 2 3])) -- [3 3]
+;; a lambda with no captures bakes the builtins it names on its first call,
+;; not when the literal is evaluated: a rebinding in between is seen
+(set g6 sum)
+(set f6 (fn [x] (g6 x)))
+(set g6 count)
+(f6 [1 2 3]) -- 3
+;; ... through a dict too, whether the dict or its entry is rebound
+(set D6 (dict ['f] (list sum)))
+(set r6 [])
+(times 2 (do (set r6 (concat r6 ((fn [x] (D6.f x)) [1 2 3]))) (set D6 (dict ['f] (list count)))))
+r6 -- [6 3]
+(set D6 (dict ['f] (list sum)))
+(set r6 [])
+(times 2 (do (set r6 (concat r6 ((fn [x] (D6.f x)) [1 2 3]))) (set D6.f count)))
+r6 -- [6 3]
+(set h6 (fn [x] (D6.f x)))
+(set D6.f sum)
+(h6 [1 2 3]) -- 6
+;; lambdas of one literal with nothing captured share the bytecode compiled
+;; at the first one's first call while the builtins it baked are unchanged
+(set qlit (list))
+(times 2 (set qlit (concat qlit (enlist (fn [x] (let a (+ x 1)) (let b (* a 2)) (- b 1))))))
+(list ((first qlit) 1) ((last qlit) 1)) -- [3 3]
+(< (- (.mem.objsize qlit) (.mem.objsize (first qlit))) 600) -- true
+;; a closure of the same literal is not a definition: it resolves its builtins
+;; when it runs, never through the bytecode a definition of that text baked
+(set litD (parse "(fn [x] (gD x))"))
+(set gD sum)
+(set fD (eval litD))
+(fD [1 2 3]) -- 6
+(set gD count)
+(set cD ((fn [y] (eval litD)) 0))
+(cD [1 2 3]) -- 3
+;; and keeps them from then on, as a named function always has
+(set D6.f count)
+(h6 [1 2 3]) -- 6
+(set g6 sum)
+(f6 [1 2 3]) -- 3
+;; a closure body names a builtin it resolves when it runs: rebound to a
+;; lambda, or to a builtin of another arity, the call follows the new value
+(set g7 count)
+(set mk7 (fn [k] (fn [x] (g7 x))))
+(set c7 (mk7 0))
+(c7 [1 2]) -- 2
+(set g7 (fn [v] 42))
+(c7 [1 2]) -- 42
+(set g7 (fn [v] (if false (set 1 2)) 43))
+(c7 [1 2]) -- 43
+(set g7 enlist)
+(c7 [1 2]) -- (enlist [1 2])
+(set g8 +)
+(set mk8 (fn [k] (fn [x y] (g8 x y))))
+(set c8 (mk8 0))
+(c8 1 2) -- 3
+(set g8 (fn [a b] (* a b)))
+(c8 3 4) -- 12
+(set g8 list)
+(c8 3 4) -- [3 4]
+;; a closure body finds the global it names however the global table moves:
+;; deleting an earlier global shifts the later ones, a deleted name is a name
+;; error, a new binding of it is found again, and a caller's local of that
+;; name, outside any compiled frame, stands in as it does on the tree walker
+(set gm1 count)
+(set gm2 sum)
+(set mkm (fn [k] (fn [x] (gm2 x))))
+(set cm9 (mkm 0))
+(cm9 [1 2 3]) -- 6
+(del gm1)
+(cm9 [1 2 3]) -- 6
+(del gm2)
+(cm9 [1 2 3]) !- name
+(set gm2 count)
+(cm9 [1 2 3]) -- 3
+(set gm2 sum)
+(cm9 [1 2 3]) -- 6
+(do (let gm2 (fn [v] 99)) (cm9 [1 2 3])) -- 99
+(cm9 [1 2 3]) -- 6
+;; ... and a call whose callee kind changes between calls takes the general
+;; call: a unary builtin, a variadic one, a lambda; data is not callable
+(set gk1 count)
+(set mkk (fn [k] (fn [x] (gk1 x))))
+(set ck9 (mkk 0))
+(list (ck9 [1 2]) (do (set gk1 enlist) (ck9 [1 2])) (do (set gk1 (fn [v] 7)) (ck9 [1 2]))) -- (list 2 (enlist [1 2]) 7)
+(set gk1 [10 20 30])
+(ck9 1) !- type
+(set gk2 +)
+(set mkk2 (fn [k] (fn [x y] (gk2 x y))))
+(set ck29 (mkk2 0))
+(list (ck29 1 2) (do (set gk2 -) (ck29 1 2)) (do (set gk2 list) (ck29 1 2)) (do (set gk2 (fn [a b] 5)) (ck29 1 2))) -- (list 3 -1 [1 2] 5)
+(set gk3 list)
+(set mkk3 (fn [k] (fn [x y z] (gk3 x y z))))
+(set ck39 (mkk3 0))
+(list (ck39 1 2 3) (do (set gk3 (fn [a b c] (+ a (+ b c)))) (ck39 1 2 3))) -- (list [1 2 3] 6)
+;; ... ser takes the generic null there too, as on the tree walker
+(set mks (fn [k] (fn [x] (ser x))))
+(== (type ((mks 0) null)) 'NULL) -- false
+;; ... between any two calls: a caller's let rebound in the same frame, a global
+;; set and set back
+(set gc1 sum)
+(set mkgc (fn [k] (fn [x] (gc1 x))))
+(set cgc (mkgc 0))
+(set rgc (fn [] (if false (set 1 2)) (let gc1 sum) (let a (cgc [1 2 3])) (let gc1 count) (list a (cgc [1 2 3]))))
+(rgc) -- [6 3]
+(list (cgc [1 2 3]) (do (set gc1 count) (cgc [1 2 3])) (do (set gc1 sum) (cgc [1 2 3]))) -- [6 3 6]
+(set rgc2 (fn [] (if false (set 1 2)) (let a (cgc [1 2 3])) (do (let gc1 count) (cgc [1 2 3]))))
+(rgc2) -- 3
 ;; a literal built around a large constant is not kept alive by the table
 (set baseL (parse "(fn [x] 0)"))
 (set bigL (fn [i] (eval (concat (take baseL 2) (enlist (concat (parse "(+ x)") (enlist (+ i (til 100000)))))))))
@@ -220,6 +392,46 @@ rb -- [6 3]
 (set bsL 0)
 (.sys.gc)
 (< (- (heapL) h0L) 4000000) -- true
+;; ... literals each just under the per-literal bound share one budget
+(set bigM (fn [i] (eval (concat (take baseL 2) (enlist (concat (parse "(+ x)") (enlist (+ i (til 7000)))))))))
+(set bsL (map bigM (til 4)))
+(set bsL 0)
+(set h0L (do (.sys.gc) (heapL)))
+(set bsL (map bigM (til 300)))
+(set bsL 0)
+(.sys.gc)
+(< (- (heapL) h0L) 4000000) -- true
+;; ... and a long string counts by its bytes
+(set bigS (fn [i] (eval (concat (take baseL 2) (enlist (concat (parse "(+ (count x))") (enlist (format "%" (+ i (til 20000))))))))))
+(set bsL (map bigS (til 4)))
+(set bsL 0)
+(set h0L (do (.sys.gc) (heapL)))
+(set bsL (map bigS (til 300)))
+(set bsL 0)
+(.sys.gc)
+(< (- (heapL) h0L) 4000000) -- true
+;; ... and so do a table, a lambda with its captures, a slice's parent and a
+;; string vector's characters, spliced into the text as constants
+(set spliceL (fn [c] (eval (concat (take baseL 2) (enlist (concat (parse "(+ (count x))") (enlist (concat (parse "(count)") (enlist c)))))))))
+(set mkTb (fn [i] (spliceL (table [a] (list (+ i (til 50000)))))))
+(set mkLm (fn [i] (let c (+ i (til 50000))) (spliceL (list (fn [] c)))))
+(set mkSl (fn [i] (spliceL (take (dict (take ['a 'b] (+ i 50000)) (til (+ i 50000))) [0 2]))))
+(set SVl (as 'STR (map (fn [i] (format "a long string, number %, padded out to a length well past the inline size" i)) (til 1500))))
+(set mkSv (fn [i] (spliceL (concat SVl (as 'STR (list (format "%" i)))))))
+(set heldL (fn [mk] (set bsL (map mk (til 4))) (set bsL 0) (.sys.gc) (let h (heapL)) (set bsL (map mk (til 300))) (set bsL 0) (.sys.gc) (- (heapL) h)))
+(< (heldL mkTb) 2000000) -- true
+(< (heldL mkLm) 2000000) -- true
+(< (heldL mkSl) 2000000) -- true
+(< (heldL mkSv) 2000000) -- true
+;; the count stops at the bound, so its work is bounded too: a table whose
+;; cells share one list, or hold a list shared 2^30 times over, costs the
+;; literal's first call next to nothing
+(set dagL (fn [n] (let L (list 1)) (times n (let L (list L L))) L))
+(set fdag (spliceL (table [a] (list (list (dagL 30))))))
+(< (timeit (fdag 1)) 1000) -- true
+(set cellL (map (fn [i] (if (== 0 (% i 2)) i (format "%" i))) (til 2000)))
+(set fcell (spliceL (table [c] (list (map (fn [i] cellL) (til 20000))))))
+(< (timeit (fcell 1)) 1000) -- true
 ;; a body nested past the compiler's depth guard (2048 levels) is left to the
 ;; tree walker instead of recursing further down the C stack. a chain of
 ;; nested if's shows which engine ran: the compiled body runs it as jumps and
@@ -233,6 +445,18 @@ rb -- [6 3]
 ((mkI 600) 1) -- 1
 ((mkI 1500) 1) -- 1
 ((mkI 2500) 1) !- limit
+;; a closure body nested past the capture walk's guard (1024 levels) keeps its
+;; captures: it compiles with every capture bound, never with a captured name
+;; resolved as a global (the global kd here); past the compiler's own guard
+;; it is left to the tree walker, which stops at its depth limit
+(set wrapK (fn [inner] (concat (take (parse "(if true 0)") 2) (enlist inner))))
+(set buildK (fn [n] (let a (parse "(+ kd x)")) (times n (let a (wrapK a))) a))
+(set mkK (fn [n] (eval (concat (take (parse "(fn [kd] 0)") 2) (enlist (concat (take (parse "(fn [x] 0)") 2) (enlist (buildK n))))))))
+(set kd 5000)
+(((mkK 600) 100) 1) -- 101
+(((mkK 1100) 100) 1) -- 101
+(((mkK 2000) 100) 1) -- 101
+(((mkK 2500) 100) 1) !- limit
 ;; closures made from one literal match by capture set in either order
 (set mkd2 (fn [flag k] (if false (set 1 2)) (if flag (let extra2 1)) (fn [] (list k (try extra2 'none)))))
 (set dd3 (mkd2 false 2))
@@ -249,8 +473,35 @@ rb -- [6 3]
 ((mkcc 'z) ['a 'b]) -- ['a 'b 'z]
 (set mkmx (fn [k] (fn [v] (+ (max v) k))))
 ((mkmx 1) [3 9 2]) -- 10
+;; ... and the generic null rule for a unary builtin: only nil?, type and ser
+;; take the null, any other raises a type error, as on the tree walker
+(set mkn (fn [k] (fn [v] (count v))))
+((mkn 0) null) !- type
+((mkn 0) null) !- type
+(set mkn2 (fn [k] (fn [v] (list (nil? v) (type v)))))
+((mkn2 0) null) -- (list true 'null)
+(set dn (dict ['a 'b] (list 1 null)))
+(set mkn3 (fn [k] (fn [key0] (first (at dn key0)))))
+((mkn3 0) 'b) !- type
+((mkn3 0) 'a) -- 1
 ;; a top-level helper keeps elementwise arithmetic on a column
 (set hn2 (fn [v] 1 (* v 2)))
 (hn2 [1 2 3]) -- [2 4 6]
 (set Tar (table [x k] (list [1 2 3 4] [1 1 2 2])))
 (at (update {v: (+ (sum (hn2 (+ x 1))) (count (distinct x))) by: k from: Tar}) 'v) -- [12 12 20 20]
+;; quote set globally to a function: (quote x) in a closure body is a call
+;; through it, so x is captured, whoever made the closure and however often
+;; it is called (the builtin binding is restored after)
+(set qsave quote)
+(set quote (fn [x] (* x 100)))
+(quote 2) -- 200
+(set mkqg (fn [x] (fn [] (quote x))))
+((mkqg 3)) -- 300
+(set mkqgi (fn [x] (if false (set 1 2)) (fn [] (quote x))))
+((mkqgi 3)) -- 300
+(set cqg (mkqg 4))
+(list (cqg) (cqg)) -- [400 400]
+(set mkqg2 (fn [x y] (fn [] (+ y (quote x)))))
+((mkqg2 3 1)) -- 301
+(set quote qsave)
+(quote x) -- 'x

@@ -49,6 +49,12 @@
 #else
 #include <unistd.h>
 #endif
+#if defined(RAY_OS_LINUX)
+#include <fcntl.h>      /* fallocate: the in-place hash region */
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/vfs.h>    /* fstatfs: the filesystems it is built in place on */
+#endif
 
 /* --------------------------------------------------------------------------
  * validate_sym_bounds -- check all indices in a RAY_SYM column are < sym_count
@@ -765,6 +771,148 @@ ray_err_t ray_col_append_index(const char* path, const void* ix_v,
     if (payload_end) (void)ray_col_truncate(f, payload_end);
     fclose(f);
     return err;
+}
+
+#if defined(RAY_OS_LINUX)
+/* Debug builds: RAY_HASH_INJECT names a step of the in-place build to fail
+ * there, for the tests — "fs": the filesystem is not one it trusts;
+ * "fs:<hex>": the filesystem's type is taken to be <hex> (a magic number
+ * as fstatfs reports it), so filesystems the tests cannot mount are
+ * classified too; "grow", "map": the region cannot be allocated, or
+ * mapped; "build": an interrupt as soon as it is mapped; "premarker": the
+ * process ends with the region written, before the marker. */
+static bool col_hash_inject(const char* step) {
+#if defined(DEBUG)
+    const char* e = getenv("RAY_HASH_INJECT");
+    return e && strcmp(e, step) == 0;
+#else
+    (void)step;
+    return false;
+#endif
+}
+static bool col_hash_inject_fs_type(unsigned long* type) {
+#if defined(DEBUG)
+    const char* e = getenv("RAY_HASH_INJECT");
+    if (!e || strncmp(e, "fs:", 3) != 0) return false;
+    char* end = NULL;
+    unsigned long t = strtoul(e + 3, &end, 16);
+    if (end == e + 3 || *end) return false;
+    *type = t;
+    return true;
+#else
+    (void)type;
+    return false;
+#endif
+}
+
+/* Writing the region through a shared mapping is safe only where the
+ * blocks it lands on are held before the first write: a write fault that
+ * needs a block on a full disk is a SIGBUS, and a writeback that fails is
+ * lost without a word (the fwrite append gets ENOSPC instead).  So the
+ * filesystems whose fallocate reserves what the writes use — not
+ * copy-on-write ones (ZFS, btrfs, bcachefs: an overwrite takes new space),
+ * nor network or user ones (NFS, SMB, Ceph, FUSE: the server decides).
+ * Nor overlayfs: it hands the mapping and the fallocate to its upper layer,
+ * which can be any of those, and fstatfs reports the overlay — its upper
+ * directory, named in the mount options, is often not even reachable from
+ * where the overlay is used (a container). */
+static bool col_fs_reserves(int fd) {
+    if (col_hash_inject("fs")) return false;
+    unsigned long type = 0;
+    if (!col_hash_inject_fs_type(&type)) {
+        struct statfs sf;
+        if (fstatfs(fd, &sf) != 0) return false;
+        type = (unsigned long)sf.f_type;
+    }
+    switch (type) {
+    case 0xEF53UL:       /* ext4 (an ext2/3 one has no fallocate: refused there) */
+    case 0x58465342UL:   /* xfs */
+    case 0x01021994UL:   /* tmpfs */
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* A column file's index region, mapped writable for a build in place. */
+typedef struct {
+    int      fd;
+    int64_t  payload_end;   /* the file's length before: the column payload */
+    int64_t  region_off;    /* where the region starts: the payload, 32-aligned */
+    uint8_t* map;           /* the mapping, from the page holding region_off */
+    size_t   map_len;
+    bool     refused;       /* the region could not be allocated or mapped */
+} col_region_t;
+
+/* ray_index_region_fn: `bytes` of region at region_off, zero-filled, its
+ * blocks allocated first — a full disk fails here, not as a fault on a write
+ * through the mapping.  NULL (refused) when either cannot be done. */
+static uint8_t* col_region_map(void* raw, int64_t bytes) {
+    col_region_t* r = (col_region_t*)raw;
+    if (r->map || bytes <= 0) return NULL;
+    int64_t end = r->region_off + bytes;
+    if (col_hash_inject("grow") ||
+        fallocate(r->fd, 0, (off_t)r->payload_end, (off_t)(end - r->payload_end)) != 0) {
+        r->refused = true;
+        return NULL;
+    }
+    long ps = sysconf(_SC_PAGESIZE);
+    int64_t pg = ps > 0 ? (int64_t)ps : 4096;
+    int64_t moff = r->region_off & ~(pg - 1);
+    void* p = col_hash_inject("map") ? MAP_FAILED
+            : mmap(NULL, (size_t)(end - moff), PROT_READ | PROT_WRITE, MAP_SHARED,
+                   r->fd, (off_t)moff);
+    if (p == MAP_FAILED) { r->refused = true; return NULL; }
+    r->map = (uint8_t*)p;
+    r->map_len = (size_t)(end - moff);
+    if (col_hash_inject("build")) ray_request_interrupt();
+    return r->map + (r->region_off - moff);
+}
+#endif
+
+ray_err_t ray_col_build_hash_index(const char* path, ray_t* col, void* trace) {
+#if !defined(RAY_OS_LINUX)
+    /* Elsewhere the blocks a mapped write lands on cannot be held up front
+     * (macOS: APFS is copy-on-write) — the caller builds in memory. */
+    (void)path; (void)col; (void)trace;
+    return RAY_ERR_NYI;
+#else
+    if (!path || !col || RAY_IS_ERR(col)) return RAY_ERR_DOMAIN;
+    if (col->type == RAY_STR) return RAY_ERR_NYI;
+    ray_hash_trace_t* tr = (ray_hash_trace_t*)trace;
+    int fd = open(path, O_RDWR | O_CLOEXEC);
+    if (fd < 0) return RAY_ERR_IO;
+    uint32_t mg = 0;
+    struct stat st;
+    if (pread(fd, &mg, 4, 0) != 4 || fstat(fd, &st) != 0 || st.st_size < 32) {
+        close(fd);
+        return RAY_ERR_IO;
+    }
+    if (mg == COL_IDX_AUX_MAGIC) { close(fd); return RAY_ERR_CORRUPT; }   /* indexed already */
+    if (!col_fs_reserves(fd)) { close(fd); return RAY_ERR_NYI; }
+    col_region_t r = { .fd = fd, .payload_end = (int64_t)st.st_size,
+                       .region_off = ((int64_t)st.st_size + 31) & ~(int64_t)31 };
+    ray_err_t err = ray_index_hash_build_region(col, col_region_map, &r, tr);
+    ray_hash_mark_t tm = tr ? ray_hash_trace_mark() : (ray_hash_mark_t){0};
+    /* the pages stay in the page cache, dirty: the writeback is the kernel's */
+    if (r.map) munmap(r.map, r.map_len);
+    if (err == RAY_OK) {
+        if (col_hash_inject("premarker")) _exit(86);
+        /* the region is in the file before the marker claims it */
+        mg = COL_IDX_AUX_MAGIC;
+        if (pwrite(fd, &mg, 4, 0) != 4) err = RAY_ERR_IO;
+    }
+    /* Without the marker the loader requires the exact payload length.
+     * Best effort, as in ray_col_append_index. */
+    if (err != RAY_OK) (void)!ftruncate(fd, (off_t)r.payload_end);
+    /* A region that could not be allocated or mapped is no reason to go
+     * without the index: the caller builds it in memory and appends it,
+     * where a full disk is an ENOSPC like any other write. */
+    if (err == RAY_ERR_IO && r.refused) err = RAY_ERR_NYI;
+    if (close(fd) != 0 && err == RAY_OK) err = RAY_ERR_IO;
+    if (tr) ray_hash_trace_add(tr, RAY_HXT_APPEND, tm, 0);
+    return err;
+#endif
 }
 
 /* Does the payload hold the type's null sentinel anywhere?  Sequential
