@@ -296,6 +296,9 @@ bool ray_heap_set_spill_discard(bool on);   /* returns the setting it replaced *
 /* Whether a parked spill pool's pages are discarded here and now: the
  * platform can punch a mapped range, and the setting allows it. */
 bool ray_heap_spill_discards(void);
+/* How many parked spill pools a boundary has set out to discard so far —
+ * each once per use (ray_heap_relieve).  For tests. */
+int64_t ray_heap_spill_discard_count(void);
 
 /* --------------------------------------------------------------------------
  * Constants

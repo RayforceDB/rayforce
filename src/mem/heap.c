@@ -2899,6 +2899,7 @@ static int64_t heap_release_free_pages(ray_heap_t* h) {
  * or the pool unmapped, as where the platform cannot discard them.  Policy:
  * the setter (ray_heap_set_spill_discard) is for tests. */
 static _Atomic(bool) g_spill_discard = true;
+static _Atomic(int64_t) g_spill_discard_calls = 0;   /* ray_heap_spill_discard_count */
 
 bool ray_heap_set_spill_discard(bool on) {
     return atomic_exchange_explicit(&g_spill_discard, on, memory_order_relaxed);
@@ -2938,20 +2939,25 @@ static int heap_spill_discard(const ray_pool_entry_t* pe) {
 #endif
 }
 
+int64_t ray_heap_spill_discard_count(void) {
+    return atomic_load_explicit(&g_spill_discard_calls, memory_order_relaxed);
+}
+
+bool ray_heap_spill_discards(void) {
+    return heap_spill_discard(NULL) == 0;
+}
+
 /* Discard the pages of h's parked spill pools not discarded since they were
  * last in use — those parked at this boundary — or unmap a pool whose pages
  * cannot be (the boundary that parked it left h another pool, unparked).
  * Returns whether pages were dropped: the boundary then flushes the
  * cgroup's statistics (ray_sys_mem_flush). */
-bool ray_heap_spill_discards(void) {
-    return heap_spill_discard(NULL) == 0;
-}
-
 static bool heap_spill_pools_discard(ray_heap_t* h) {
     bool dropped = false;
     for (uint32_t p = h->pool_count; h->parked && p-- > 0; ) {
         ray_pool_entry_t* pe = &h->pools[p];
         if (!pe->parked || !pe->backed || pe->discarded) continue;
+        atomic_fetch_add_explicit(&g_spill_discard_calls, 1, memory_order_relaxed);
         int got = heap_spill_discard(pe);
         if (got < 0) {
             (void)heap_pool_unmap(h, p);

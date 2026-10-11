@@ -3265,6 +3265,9 @@ static test_result_t test_relieve_spill_discard(void) {
     ray_heap_set_anon_watermark(INT64_C(1) << 40);
     ray_heap_relieve();                          /* its own spill: no relief */
     int64_t cw = c0 >= 0 ? relieve_cancelled() - c0 : -1;
+    int64_t n1 = ray_heap_spill_discard_count();
+    relieve_far();                               /* the pool still parked */
+    bool once = ray_heap_spill_discard_count() == n1;
     int i2 = probe ? heap_find_pool(h, probe) : -1;
     bool kept = i2 >= 0 && h->pools[i2].parked && h->pools[i2].backed
              && h->pool_count == 4;
@@ -3298,6 +3301,7 @@ static test_result_t test_relieve_spill_discard(void) {
     TEST_ASSERT(reserved, "its file keeps its disk blocks");
     TEST_ASSERT(live, "the spill pool in use kept its data");
     TEST_ASSERT(due > 0, "an idle event loop does not wake for the parked pool");
+    TEST_ASSERT(once, "discarded once: a later boundary left it alone");
     TEST_ASSERT(reused, "taken back, it served a block, no pool mapped");
     PASS();
 #endif
