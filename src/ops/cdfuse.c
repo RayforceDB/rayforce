@@ -55,6 +55,7 @@
 #include "ops/hash.h"      /* ray_hash_i64 */
 #include "ops/cdfuse.h"
 #include "ops/agg_engine.h" /* agg_group_card_sample — the route gate */
+#include "ops/hll.h"        /* ray_count_distinct_approx — the gate's group count check */
 #include "table/sym.h"     /* RAY_IS_SYM */
 #include "store/col.h"    /* ray_col_cold — sampled-row read-ahead */
 
@@ -822,6 +823,26 @@ ray_t* ray_cd_fused(ray_t* key_col, ray_t* val_col, int64_t nrows) {
  * remains — else over the table; half a millisecond at 10 M rows.  A
  * skewed or clustered key the sample cannot exhaust estimates high,
  * towards the rewrite. */
+/* The sampled count of the groups is a lower bound for a key the sample
+ * reads mostly as singletons — six million search phrases over thirteen
+ * million rows, most on one row and a few on thousands, read as a few
+ * hundred thousand (the Chao1 takes the phrases seen twice for the whole
+ * tail's repeats).  Before the slices are chosen on such a count, the key
+ * columns are counted approximately in full (ray_count_distinct_approx,
+ * parallel, a few milliseconds at 100 M rows): a column past the many-groups
+ * mark makes the tuple past it.  Over the whole table, not the selection —
+ * an upper bound that errs towards the rewrite. */
+static bool cd_many_groups_in_full(ray_t** K_cols, int n_K) {
+    for (int j = 0; j < n_K; j++) {
+        ray_t* c = ray_count_distinct_approx(K_cols[j]);
+        if (!c) return false;
+        bool many = !RAY_IS_ERR(c) && c->type == -RAY_I64 && c->i64 > CD_SCATTER_MANY_GROUPS;
+        if (RAY_IS_ERR(c)) ray_error_free(c); else ray_release(c);
+        if (many) return true;
+    }
+    return false;
+}
+
 bool ray_cd_two_pass_preferred(ray_t** K_cols, int n_K, ray_t* X_col,
                                const int64_t* rows, int64_t nrows, int64_t population,
                                int64_t workers) {
@@ -845,6 +866,10 @@ bool ray_cd_two_pass_preferred(ray_t** K_cols, int n_K, ray_t* X_col,
     /* a dominant group: the scatter would dedup it on one worker */
     if (workers > 1 && k_max > nrows / workers * CD_SCATTER_SKEW) return true;
     if (k_card > CD_SCATTER_MANY_GROUPS) return true;
+    /* the slices on a count the sample cannot vouch for (more sampled
+     * singletons than the Chao1's repeats explain: any count past the
+     * sample's size): a full approximate count may say many groups */
+    if (k_card > AGG_EST_SAMPLE_ROWS && cd_many_groups_in_full(K_cols, n_K)) return true;
     if (k_card <= CD_SCATTER_MAX_GROUPS) return false;
     /* a radix (K, X) pass over 256 K to 1 M groups: the rewrite wins when
      * that pass dedups, the scatter when the tuples are nearly the rows */

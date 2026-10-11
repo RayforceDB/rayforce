@@ -2616,6 +2616,58 @@ static test_result_t test_cd_route(void) {
     }
     ray_release(k[0]); ray_release(x);
 
+    /* a heavy-tailed key: a value of its own on every even row (five
+     * million values) and one of 50,000 values, each on 100 rows, on the
+     * odd ones.  The sample reads the even rows as singletons and the odd
+     * ones as the repeats of the whole tail, and its Chao1 lands around
+     * 100,000 — under the 256 K floor; the full approximate count says
+     * five million, and the rewrite is the route */
+    k[0] = ray_eval_str("(+ (* (== (% c10 2) 0) (+ 20000000 c10)) (* (== (% c10 2) 1) (% (div c10 2) 50000)))");
+    x = ray_eval_str("c10");
+    {
+        int64_t kc = 0;
+        TEST_ASSERT_TRUE(agg_group_card_sample(k, 1, 1, NULL, 10000000, 0, NULL, &kc, NULL, NULL));
+        TEST_ASSERT_FMT(kc > 32768 && kc < 1000000, "a heavy tail reads as %lld groups", (long long)kc);
+    }
+    TEST_ASSERT_TRUE(ray_cd_two_pass_preferred(k, 1, x, NULL, 10000000, 0, 28));
+    ray_release(k[0]); ray_release(x);
+
+    /* the rows a `where:` keeps, sampled (query_cd_gate_where_rows): the
+     * key above as a table column behind `(!= k 0)`.  Of 262,144 sampled
+     * rows, 12 in 100 survive, every survivor has a nonzero key, and the
+     * population scales to the table's 12%; the gate over them takes the
+     * slices (1,000 equal groups), over the whole table the rewrite (the
+     * zero's share).  A predicate keeping every row samples nothing. */
+    setup = ray_eval_str("(set Tw (table [k x] (list (* (>= (% cr 100) 88) (+ 1 (% (div cr 100) 1000))) cr)))");
+    TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+    ray_release(setup);
+    {
+        ray_t* tw = ray_eval_str("Tw");
+        ray_t* w  = ray_eval_str("(quote (!= k 0))");
+        ray_t* kc = ray_eval_str("(at Tw 'k)");
+        ray_t* xc = ray_eval_str("(at Tw 'x)");
+        TEST_ASSERT_NOT_NULL(tw); TEST_ASSERT_NOT_NULL(w); TEST_ASSERT_NOT_NULL(kc); TEST_ASSERT_NOT_NULL(xc);
+        const int64_t* rows = NULL;
+        int64_t nrows = 0, pop = 0;
+        ray_t* hdr = query_cd_gate_where_rows(tw, w, N, &rows, &nrows, &pop);
+        TEST_ASSERT_NOT_NULL(hdr);
+        TEST_ASSERT_FMT(nrows > 262144 / 10 && nrows < 262144 / 7, "sampled survivors: %lld", (long long)nrows);
+        TEST_ASSERT_FMT(pop > N / 10 && pop < N / 7, "scaled population: %lld", (long long)pop);
+        const int64_t* kd = (const int64_t*)ray_data(kc);
+        int64_t zeros = 0;
+        for (int64_t j = 0; j < nrows; j++) if (kd[rows[j]] == 0) zeros++;
+        TEST_ASSERT_EQ_I(zeros, 0);
+        k[0] = kc;
+        TEST_ASSERT_FALSE(ray_cd_two_pass_preferred(k, 1, xc, rows, nrows, pop, 28));
+        TEST_ASSERT_TRUE(ray_cd_two_pass_preferred(k, 1, xc, NULL, N, 0, 28));
+        scratch_free(hdr);
+        ray_release(w);
+        w = ray_eval_str("(quote (>= k 0))");
+        TEST_ASSERT_NULL(query_cd_gate_where_rows(tw, w, N, &rows, &nrows, &pop));
+        TEST_ASSERT_EQ_I(nrows, N);
+        ray_release(w); ray_release(kc); ray_release(xc); ray_release(tw);
+    }
+
     /* a key the estimate does not cover takes the rewrite; a value it does
      * not cover the slices */
     k[0] = ray_eval_str("(as 'F64 cr)");

@@ -55,7 +55,10 @@ ray_t* ray_cd_fused(ray_t* key_col, ray_t* val_col, int64_t nrows);
  * workers' shares of the rows (the slice dedup is serial over a group),
  * past a million groups, and between 256 K and a million groups when the
  * (K, X) tuples dedup below three quarters of the rows; the slices
- * otherwise. */
+ * otherwise.  A sampled group count the slices would rely on is confirmed
+ * by an approximate distinct count over the whole key column (a key the
+ * sample reads as singletons may hold far more values than the Chao1
+ * says): past a million there, the rewrite. */
 bool ray_cd_two_pass_preferred(ray_t** K_cols, int n_K, ray_t* X_col,
                                const int64_t* rows, int64_t nrows, int64_t population,
                                int64_t workers);
