@@ -2795,7 +2795,12 @@ static ray_t* vm_call_binary(ray_t* fn_obj, ray_t* left, ray_t* right,
  * query.  The flag rides on vm.rows beside every stack slot: loads and
  * stores copy it, a builtin the planner lowers row by row keeps it,
  * anything else clears it, and `concat` consults it to choose between
- * text and collection semantics.  `out_rows` receives the result's flag. */
+ * text and collection semantics.  `out_rows` receives the result's flag.
+ *
+ * The dispatch loop starts on a page boundary: where its handlers fall
+ * relative to fetch and branch-predictor boundaries moved its speed by up
+ * to 10% whenever code in an unrelated object grew or shrank. */
+__attribute__((aligned(4096)))
 static ray_t* vm_exec_rows(ray_t* lambda, ray_t** call_args, int64_t argc,
                            uint64_t row_args, uint8_t* out_rows) {
     /* Computed goto dispatch table */
