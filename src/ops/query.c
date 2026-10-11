@@ -9480,7 +9480,13 @@ static bool clause_runs_code(ray_t* v) {
         return !(v->attrs & ATTR_QUOTED) &&
                (b->type == RAY_LIST || b->type == RAY_DICT || b->type == RAY_TABLE);
     }
-    if (v->type == RAY_DICT) return clause_runs_code(ray_dict_vals(v));
+    if (v->type == RAY_DICT) {   /* each value on its own: the values list is no call */
+        ray_t* dv = ray_dict_vals(v);
+        if (!dv || dv->type != RAY_LIST) return clause_runs_code(dv);
+        for (int64_t i = 0; i < dv->len; i++)
+            if (clause_runs_code(((ray_t**)ray_data(dv))[i])) return true;
+        return false;
+    }
     if (v->type != RAY_LIST) return false;
     ray_t** el = (ray_t**)ray_data(v);
     if (v->len > 0 && (el[0]->type == RAY_LIST ||
