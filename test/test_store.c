@@ -6584,6 +6584,41 @@ static test_result_t test_parted_rebuilt_splayed_without_gc(void) {
     return parted_rebuilt_read_without_gc(false);
 }
 
+/* Opening an unrelated domain must preserve partitions held by a live view. */
+static test_result_t test_parted_live_domain_open(void) {
+    (void)ray_test_rm_rf(TMP_PARTED_ROOT);
+    (void)ray_test_rm_rf(TMP_PARTED_ROOT "_next");
+    ray_t* a = parted_symbol_part("aa");
+    ray_t* b = parted_symbol_part("xx");
+    TEST_ASSERT_EQ_I(ray_splay_save(a, TMP_PARTED_ROOT "/1/t",
+                                    TMP_PARTED_ROOT "/.sym"), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_save(b, TMP_PARTED_ROOT "_next/1/t",
+                                    TMP_PARTED_ROOT "_next/.sym"), RAY_OK);
+    ray_t* view = ray_read_parted(TMP_PARTED_ROOT, "t");
+    TEST_ASSERT_TRUE(view && !RAY_IS_ERR(view));
+    ray_t* seg = ((ray_t**)ray_data(ray_table_get_col_idx(view, 1)))[0];
+    TEST_ASSERT_EQ_I(ray_atomic_load(&seg->rc), 2);
+
+    ray_t* other = ray_read_splayed(TMP_PARTED_ROOT "_next/1/t",
+                                    TMP_PARTED_ROOT "_next/.sym");
+    TEST_ASSERT_TRUE(other && !RAY_IS_ERR(other));
+    TEST_ASSERT_EQ_I(ray_atomic_load(&seg->rc), 2);
+    ray_t* remount = ray_read_parted(TMP_PARTED_ROOT, "t");
+    TEST_ASSERT_TRUE(remount && !RAY_IS_ERR(remount));
+    TEST_ASSERT_EQ_PTR(((ray_t**)ray_data(ray_table_get_col_idx(remount, 1)))[0], seg);
+    int64_t pos = ray_read_sym(ray_data(seg), 0, seg->type, seg->attrs);
+    ray_t* value = ray_sym_domain_str(ray_sym_vec_domain(seg), pos);
+    TEST_ASSERT_EQ_U(ray_str_len(value), 2);
+    TEST_ASSERT_TRUE(memcmp(ray_str_ptr(value), "aa", 2) == 0);
+
+    ray_release(remount); ray_release(other); ray_release(view);
+    ray_release(a); ray_release(b);
+    ray_parted_cache_clear();
+    (void)ray_test_rm_rf(TMP_PARTED_ROOT);
+    (void)ray_test_rm_rf(TMP_PARTED_ROOT "_next");
+    PASS();
+}
+
 static test_result_t test_parted_missing_symfile(void) {
     (void)ray_test_rm_rf(TMP_PARTED_ROOT);
     ray_t* src = parted_symbol_part("aa");
@@ -7652,6 +7687,7 @@ const test_entry_t store_entries[] = {
     { "store/stream_str_hash_persisted", test_stream_str_hash_persisted, store_setup, store_teardown },
     { "store/parted_cache_limit", test_parted_cache_limit, store_setup, store_teardown },
     { "store/parted_cache_gc", test_parted_cache_gc, store_setup, store_teardown },
+    { "store/parted_live_domain_open", test_parted_live_domain_open, store_setup, store_teardown },
     { "store/parted_rebuilt_write_without_gc", test_parted_rebuilt_write_without_gc, store_setup, store_teardown },
     { "store/parted_rebuilt_splayed_without_gc", test_parted_rebuilt_splayed_without_gc, store_setup, store_teardown },
     { "store/parted_rebuilt_without_gc", test_parted_rebuilt_without_gc, store_setup, store_teardown },

@@ -278,8 +278,9 @@ static ray_t* collect_part_dirs(const char* db_root, char*** out_dirs,
  * Ownership is thread-local: ray_t reference counts are not atomic on
  * ordinary callers.  Each thread keeps at most RAY_PART_CACHE_MAX tables;
  * oldest entries are evicted first.  GC, symbol-domain opens and the next
- * mount discard entries whose columns have no users outside the cache.  Heap abandon/destroy
- * releases the rest before the heap changes owner or is unmapped.
+ * mount discard entries whose columns have no users outside the cache.
+ * Heap abandon/destroy releases the rest before the heap changes owner
+ * or is unmapped.
  * -------------------------------------------------------------------------- */
 
 typedef struct {
