@@ -527,6 +527,22 @@ CNT11 -- 6
 (set CNT11 0)
 (at (select {n: (count v) by: (kht11 v) from: T10}) 'n) -- [6]
 CNT11 -- 6
+;; a builtin that calls its arguments is not a known-pure value: map handed
+;; to map, or as fold's element, then called with a computed function
+(set kmm211 (fn [v] (let t (map (fn [f] (f (at D11 'a) (enlist v))) (list map))) (kg10 v)))
+(set CNT11 0)
+(at (select {n: (count v) by: (kmm211 v) from: T10}) 'n) -- [6]
+CNT11 -- 6
+(set kfm211 (fn [v] (let t (fold (fn [acc f] (f (at D11 'a) (enlist v))) 0 (list map))) (kg10 v)))
+(set CNT11 0)
+(at (select {n: (count v) by: (kfm211 v) from: T10}) 'n) -- [6]
+CNT11 -- 6
+;; a lambda object spliced in as try's handler is called as it is
+(set trl11 (concat (parse "(try (raise 'x))") (enlist eff11)))
+(set ktl11 (eval (concat (take (parse "(fn [v] 0)") 2) (list (concat (parse "(let t)") (enlist trl11)) (parse "(kg10 v)")))))
+(set CNT11 0)
+(at (select {n: (count v) by: (ktl11 v) from: T10}) 'n) -- [6]
+CNT11 -- 6
 ;; ... while a literal fallback value of try keeps the whole column
 (set khv11 (fn [v] (let t (try (raise "x") 'none)) (kg10 v)))
 (at (select {n: (count v) by: (khv11 v) from: T10}) 'n) -- [3 3]

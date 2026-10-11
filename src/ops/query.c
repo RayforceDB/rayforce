@@ -2371,6 +2371,28 @@ static bool key_name_pure(int64_t id, ray_t** args, int64_t nargs, int depth, co
     return !called;
 }
 
+/* The builtins that call a function argument, by the C function behind
+ * them, so every name bound to one is covered: the argument positions
+ * each calls (bit i: argument i), and whether the literal shortcut below
+ * applies (map, pmap: elements; fold, scan: accumulator first). */
+enum { HOF_ELEMS = 1, HOF_ACC = 2 };
+static const struct { void* fn; uint8_t calls; uint8_t shortcut; } key_hof_table[] = {
+    { (void*)ray_map_fn,        1, HOF_ELEMS }, { (void*)ray_pmap_fn,       1, HOF_ELEMS },
+    { (void*)ray_fold_fn,       1, HOF_ACC },   { (void*)ray_scan_fn,       1, HOF_ACC },
+    { (void*)ray_fold_left_fn,  1, 0 },         { (void*)ray_fold_right_fn, 1, 0 },
+    { (void*)ray_fold_while_fn, 3, 0 },         { (void*)ray_scan_left_fn,  1, 0 },
+    { (void*)ray_scan_right_fn, 1, 0 },         { (void*)ray_prior_fn,      1, 0 },
+    { (void*)ray_apply_fn,      1, 0 },         { (void*)ray_map_left_fn,   1, 0 },
+    { (void*)ray_map_right_fn,  1, 0 },
+};
+enum { KEY_HOF_N = sizeof key_hof_table / sizeof *key_hof_table };
+
+static bool key_hof_builtin(const ray_t* fn) {
+    for (int k = 0; k < KEY_HOF_N; k++)
+        if (key_hof_table[k].fn == (void*)(uintptr_t)fn->i64) return true;
+    return false;
+}
+
 /* A value whose every callable is pure: a pure lambda or builtin, data
  * that holds no function (an atom or a typed vector other than symbols,
  * which name globals), or a list of such values. */
@@ -2378,6 +2400,11 @@ static bool key_value_callables_pure(ray_t* v, int depth, const key_pure_ctx_t* 
     if (!v || depth > 16) return false;
     if (v->type == RAY_LAMBDA) return key_lambda_call_pure(v, NULL, 0, depth, ctx);
     if (v->type == RAY_UNARY || v->type == RAY_BINARY || v->type == RAY_VARY) {
+        /* A builtin that calls its arguments is pure only for arguments
+         * the walk sees: as a value whose calls it cannot see, it is not
+         * known pure (map passed to map, then called with a computed
+         * function). */
+        if (key_hof_builtin(v)) return false;
         int64_t id = ray_env_builtin_sym(v);
         return id >= 0 && !key_impure_builtin(v, id);
     }
@@ -2432,22 +2459,6 @@ static bool key_arg_callables_pure(ray_t* e, int depth, const key_pure_ctx_t* ct
         if (!key_arg_callables_pure(es[i], depth + 1, ctx)) return false;
     return true;
 }
-
-/* The builtins that call a function argument, by the C function behind
- * them, so every name bound to one is covered: the argument positions
- * each calls (bit i: argument i), and whether the literal shortcut below
- * applies (map, pmap: elements; fold, scan: accumulator first). */
-enum { HOF_ELEMS = 1, HOF_ACC = 2 };
-static const struct { void* fn; uint8_t calls; uint8_t shortcut; } key_hof_table[] = {
-    { (void*)ray_map_fn,        1, HOF_ELEMS }, { (void*)ray_pmap_fn,       1, HOF_ELEMS },
-    { (void*)ray_fold_fn,       1, HOF_ACC },   { (void*)ray_scan_fn,       1, HOF_ACC },
-    { (void*)ray_fold_left_fn,  1, 0 },         { (void*)ray_fold_right_fn, 1, 0 },
-    { (void*)ray_fold_while_fn, 3, 0 },         { (void*)ray_scan_left_fn,  1, 0 },
-    { (void*)ray_scan_right_fn, 1, 0 },         { (void*)ray_prior_fn,      1, 0 },
-    { (void*)ray_apply_fn,      1, 0 },         { (void*)ray_map_left_fn,   1, 0 },
-    { (void*)ray_map_right_fn,  1, 0 },
-};
-enum { KEY_HOF_N = sizeof key_hof_table / sizeof *key_hof_table };
 
 /* The builtins a call head can mean, as key_name_pure resolves it (a
  * `let` alias, a parameter bound to a name, a capture, a frame, a global,
@@ -2605,10 +2616,15 @@ static bool key_expr_pure(ray_t* expr, int depth, key_pure_ctx_t* ctx) {
      * the walk cannot see. */
     if (is_try && expr->len >= 3) {
         ray_t* h = es[2];
-        bool literal = h && (key_literal_is_fn(h) ||
-                             (h->type == -RAY_SYM && (h->attrs & ATTR_QUOTED)) ||
-                             (h->type != RAY_LIST && h->type != -RAY_SYM));
-        if (!literal && !key_arg_callables_pure(h, depth + 1, ctx)) return false;
+        if (h && h->type == RAY_LAMBDA) {
+            /* A lambda object spliced into the text is called as it is. */
+            if (!key_lambda_call_pure(h, NULL, 0, depth + 1, ctx)) return false;
+        } else {
+            bool literal = h && (key_literal_is_fn(h) ||
+                                 (h->type == -RAY_SYM && (h->attrs & ATTR_QUOTED)) ||
+                                 (h->type != RAY_LIST && h->type != -RAY_SYM));
+            if (!literal && !key_arg_callables_pure(h, depth + 1, ctx)) return false;
+        }
     }
     /* A loop runs its body again: a `let` there reaches the calls before
      * it in the next iteration, and the code after the loop.  Every name
