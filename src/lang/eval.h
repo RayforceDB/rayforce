@@ -109,9 +109,11 @@ enum {
     OP_LOADENVG,      /* push local slot (1 byte) or, when the slot is still
                        * empty (a `let` that has not run), the global named
                        * by cpool[2-byte index], as the tree walker would */
-    OP_SCOPE_EVAL,    /* OP_SCOPE_BEGIN for a window around `eval` or
-                       * `resolve`: the frame binds the locals for the
-                       * evaluated text only, not for what it calls */
+    OP_SCOPE_EVAL,    /* OP_SCOPE_BEGIN for the windows compiled code opens
+                       * around text it hands to the tree walker (eval, a
+                       * dynamic special form, a fn literal): the frame
+                       * binds the locals for that text only, not for what
+                       * it calls, and ends its scope */
     OP_CALL1R,        /* OP_CALL1 / OP_CALL2 / OP_CALLN, each with an argc   */
     OP_CALL2R,        /* operand, for a builtin a closure body resolves when */
     OP_CALLNR,        /* it runs: the fast call while the name holds a builtin

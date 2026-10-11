@@ -147,17 +147,31 @@ static int32_t env_frame_lexical_count(const ray_scope_frame_t* f) {
     return f->kind == RAY_SCOPE_CALL && f->table ? f->table_from : f->count;
 }
 
-ray_t* ray_env_get_lexical_local(int64_t sym_id) {
+/* `in_callee`: the name is looked up for code a compiled frame's text
+ * calls (a helper body the planner inlines), so no eval window is its
+ * scope; otherwise the nearest window is, and none below it. */
+static ray_t* env_lexical_local_impl(int64_t sym_id, bool in_callee) {
     if (!__VM) return NULL;
     for (int32_t d = __VM->scope_depth - 1; d >= 0; d--) {
         ray_scope_frame_t* f = &__VM->scope_stack[d];
         if (f->kind == RAY_SCOPE_QUERY) continue;
+        if (f->lexical) in_callee = true;
+        if (f->eval_window && in_callee) continue;
         int32_t n = env_frame_lexical_count(f);
         for (int32_t i = 0; i < n; i++)
             if (f->keys[i] == sym_id) return f->vals[i];
+        if (f->eval_window) in_callee = true;
         if (f->kind == RAY_SCOPE_CALL) break;
     }
     return NULL;
+}
+
+ray_t* ray_env_get_lexical_local(int64_t sym_id) {
+    return env_lexical_local_impl(sym_id, false);
+}
+
+ray_t* ray_env_get_lexical_local_callee(int64_t sym_id) {
+    return env_lexical_local_impl(sym_id, true);
 }
 
 int32_t ray_env_lexical_scope_depth(int64_t sym_id) {
@@ -267,7 +281,9 @@ ray_t* ray_env_capture_locals_rows(ray_t** flags_out, uint32_t* serial_out) {
             }
         }
         if (f->kind == RAY_SCOPE_QUERY) outer = true;
-        if (f->kind == RAY_SCOPE_CALL || f->lexical) break;
+        /* An eval window is the evaluated text's scope: what lies below it
+         * belongs to the caller of the code that evaluated the text. */
+        if (f->kind == RAY_SCOPE_CALL || f->lexical || f->eval_window) break;
     }
     if (keys->len == 0) {
         ray_release(keys);
@@ -461,6 +477,9 @@ static ray_t* env_lookup_flat_impl(int64_t sym_id, uint8_t* rows, bool in_callee
                 if (rows) *rows = outer ? 0 : f->rows[i];
                 return f->vals[i];
             }
+            /* The text's own window is the one nearest it; a window below
+             * belongs to whoever called the code that evaluated it. */
+            if (f->eval_window) in_callee = true;
             if (f->kind == RAY_SCOPE_QUERY) outer = true;
             if (f->kind == RAY_SCOPE_CALL) {
                 ray_t* v = env_call_frame_value(f, sym_id);
@@ -1046,8 +1065,6 @@ void ray_env_pop_scope(void) {
     f->cap = RAY_FRAME_CAP;
     f->count = 0;
     f->kind = RAY_SCOPE_LEXICAL;
-    f->lexical = 0;
-    f->eval_window = 0;
     f->named = 0;
     f->table = NULL;
     f->table_from = 0;

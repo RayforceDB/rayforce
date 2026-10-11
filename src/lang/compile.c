@@ -512,31 +512,28 @@ static void compile_list(compiler_t *c, ray_t *ast) {
         if (sym_id == sf_fn && n >= 3) {
             if (compile_fn_template(c, ast)) return;
             if (c->error) return;
-            if (ast_refs_locals(c, ast)) {
-                ray_t *syms = ray_alloc((size_t)c->n_locals * sizeof(int64_t));
-                if (!syms || RAY_IS_ERR(syms)) { c->error = true; return; }
-                syms->type = RAY_I64;
-                syms->len = c->n_locals;
-                int64_t *ids = (int64_t*)ray_data(syms);
-                for (int32_t i = 0; i < c->n_locals; i++)
-                    ids[i] = c->locals[i].sym_id;
-                int32_t syms_idx = add_constant(c, syms);
-                ray_release(syms);
-                if (c->error) return;
-                emit_const(c, syms_idx);
-                emit(c, OP_SCOPE_BEGIN);
-                int32_t idx = add_constant(c, ast);
-                emit_const(c, idx);
-                emit(c, OP_CALLD);
-                emit(c, 0);
-                emit_const(c, syms_idx);
-                emit(c, OP_SCOPE_END);
-                return;
-            }
+            /* The literal captures the window, which binds the locals it
+             * mentions and nothing a caller of this frame had in scope. */
+            bool refs = ast_refs_locals(c, ast);
+            int32_t nsyms = refs ? c->n_locals : 0;
+            ray_t *syms = ray_alloc((size_t)(nsyms > 0 ? nsyms : 1) * sizeof(int64_t));
+            if (!syms || RAY_IS_ERR(syms)) { c->error = true; return; }
+            syms->type = RAY_I64;
+            syms->len = nsyms;
+            int64_t *ids = (int64_t*)ray_data(syms);
+            for (int32_t i = 0; i < nsyms; i++)
+                ids[i] = c->locals[i].sym_id;
+            int32_t syms_idx = add_constant(c, syms);
+            ray_release(syms);
+            if (c->error) return;
+            emit_const(c, syms_idx);
+            emit(c, OP_SCOPE_EVAL);
             int32_t idx = add_constant(c, ast);
             emit_const(c, idx);
             emit(c, OP_CALLD);
             emit(c, 0);
+            emit_const(c, syms_idx);
+            emit(c, OP_SCOPE_END);
             return;
         }
 
@@ -609,30 +606,25 @@ static void compile_list(compiler_t *c, ray_t *ast) {
      * at this point (plus self) into a scope frame around the eval,
      * and sync any let-updates back into the slots afterwards. */
     if (fn && (fn->attrs & RAY_FN_SPECIAL_FORM)) {
-        /* Fast path: a form that mentions no local (the common
-         * globals-only case) needs no materialization — emit the bare
-         * dynamic eval exactly as before. */
-        if (!ast_refs_locals(c, ast)) {
-            int32_t idx = add_constant(c, ast);
-            emit_const(c, idx);
-            emit(c, OP_CALLD);
-            emit(c, 0);
-            return;
-        }
-
-        ray_t *syms = ray_alloc((size_t)c->n_locals * sizeof(int64_t));
+        /* The window binds the locals the form mentions (none in the
+         * common globals-only case) and marks where the text's scope
+         * ends: a function the text calls, or a window of whoever called
+         * this frame, sees none of them (OP_SCOPE_EVAL). */
+        bool refs = ast_refs_locals(c, ast);
+        int32_t nsyms = refs ? c->n_locals : 0;
+        ray_t *syms = ray_alloc((size_t)(nsyms > 0 ? nsyms : 1) * sizeof(int64_t));
         if (!syms || RAY_IS_ERR(syms)) { c->error = true; return; }
         syms->type = RAY_I64;
-        syms->len  = c->n_locals;
+        syms->len  = nsyms;
         int64_t *ids = (int64_t*)ray_data(syms);
-        for (int32_t i = 0; i < c->n_locals; i++)
+        for (int32_t i = 0; i < nsyms; i++)
             ids[i] = c->locals[i].sym_id;   /* slot i <-> ids[i] */
         int32_t syms_idx = add_constant(c, syms);
         ray_release(syms);
         if (c->error) return;
 
         emit_const(c, syms_idx);
-        emit(c, OP_SCOPE_BEGIN);
+        emit(c, OP_SCOPE_EVAL);
         int32_t idx = add_constant(c, ast);
         emit_const(c, idx);
         emit(c, OP_CALLD);
@@ -648,8 +640,10 @@ static void compile_list(compiler_t *c, ray_t *ast) {
      * included, the way a dynamic special form does. */
     int32_t dyn_syms_idx = -1;
     if (head->type == -RAY_SYM && !(head->attrs & ATTR_QUOTED) && !head_local &&
-        (head->i64 == sf_eval || head->i64 == sf_resolve) && c->n_locals > 0) {
-        ray_t *syms = ray_alloc((size_t)c->n_locals * sizeof(int64_t));
+        (head->i64 == sf_eval || head->i64 == sf_resolve)) {
+        /* With no locals too: the window still marks where the text's
+         * scope ends, so a caller's window below it stays hidden. */
+        ray_t *syms = ray_alloc((size_t)(c->n_locals > 0 ? c->n_locals : 1) * sizeof(int64_t));
         if (!syms || RAY_IS_ERR(syms)) { c->error = true; return; }
         syms->type = RAY_I64;
         syms->len  = c->n_locals;
@@ -1124,7 +1118,7 @@ static bool compile_lambda(ray_t *lambda, ray_t *capnames, bool dynamic_globals)
 
     /* A closure's captures are locals of its body, bound before it runs:
      * a `let` of a captured name writes the same slot, a capture named
-     * like a builtin is the callee, and a window (OP_SCOPE_BEGIN) binds
+     * like a builtin is the callee, and a window (OP_SCOPE_EVAL) binds
      * them with the other locals.  Only the names the body mentions take a
      * slot (closure_capture_names / compile_fn_template), so a closure's
      * recursion depth does not shrink with the bindings in scope.  One

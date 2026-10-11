@@ -1278,7 +1278,8 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
         if (bound) return bound;
         ray_op_t* alias = sel_alias_lookup(g, expr->i64);
         if (alias) return alias;
-        ray_t* local = ray_env_get_lexical_local(expr->i64);
+        ray_t* local = g->cexpr_helper_depth > 0 ? ray_env_get_lexical_local_callee(expr->i64)
+                                                 : ray_env_get_lexical_local(expr->i64);
         if (local) {
             if (ray_is_atom(local)) return ray_const_atom(g, local);
             if (ray_is_vec(local))  return ray_const_vec(g, local);
@@ -1334,7 +1335,10 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
         /* Global env: atom literals / typed vectors compile as
          * const nodes.  Lambdas only make sense as call heads
          * and are handled in the list branch below. */
-        ray_t* gv = ray_env_get(expr->i64);
+        /* Inside a helper's body a free name is the helper's: an `eval`
+         * window of whoever evaluated the query is not its scope. */
+        ray_t* gv = g->cexpr_helper_depth > 0 ? ray_env_get_compiled(expr->i64)
+                                              : ray_env_get(expr->i64);
         if (gv) {
             if (ray_is_atom(gv)) return ray_const_atom(g, gv);
             if (ray_is_vec(gv))  return ray_const_vec(g, gv);
@@ -1479,7 +1483,8 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
             cexpr_env_lookup(g, head->i64) == NULL &&
             !(g->table && g->table->type == RAY_TABLE &&
               ray_table_get_col(g->table, head->i64))) {
-            ray_t* gv = ray_env_get(head->i64);
+            ray_t* gv = g->cexpr_helper_depth > 0 ? ray_env_get_compiled(head->i64)
+                                                  : ray_env_get(head->i64);
             /* Not a closure: its captures are not in the planner's scope,
              * and a captured name would resolve to a column or a global. */
             if (gv && gv->type == RAY_LAMBDA && !LAMBDA_CLOSURE(gv)) {

@@ -176,6 +176,9 @@ int32_t   ray_env_scope_depth(void);
 bool      ray_env_query_scope_above(int32_t depth);
 ray_err_t ray_env_set_local(int64_t sym_id, ray_t* val);
 ray_t*    ray_env_get_lexical_local(int64_t sym_id);
+/* The same for a body an `eval` window's text calls: every window is
+ * passed by (see ray_scope_frame_t.eval_window). */
+ray_t*    ray_env_get_lexical_local_callee(int64_t sym_id);
 bool      ray_env_has_lexical_local(int64_t sym_id);
 int32_t   ray_env_lexical_scope_depth(int64_t sym_id);
 ray_err_t ray_env_set_query_local(int64_t sym_id, ray_t* val);
