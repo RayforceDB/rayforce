@@ -22,6 +22,7 @@
  */
 
 #include "store/enceval.h"
+#include <math.h>
 #include <string.h>
 
 static inline int cmp_one(int64_t x, uint16_t op, int64_t c) {
@@ -46,6 +47,7 @@ static inline uint64_t lane(const ray_enc_lanes_t* l, int T, uint32_t i) {
     switch (T) { case 8: return l->b[i]; case 16: return l->h[i]; case 32: return l->s[i]; default: return l->q[i]; }
 }
 static inline bool is_float(int8_t t) { return t == RAY_F32 || t == RAY_F64; }
+static inline bool is_cmp_op(uint16_t op) { return op >= OP_EQ && op <= OP_GE; }
 
 void ray_enc_mask_nulls(const ray_enc_vview_t* v, uint8_t nr, uint8_t* bits) {
     if (!v->nullmap) return;
@@ -54,7 +56,7 @@ void ray_enc_mask_nulls(const ray_enc_vview_t* v, uint8_t nr, uint8_t* bits) {
 }
 
 int ray_enc_const_decision(const ray_enc_vview_t* v, uint16_t op, int64_t c, uint8_t nr) {
-    if (v->enc != RAY_ENC_CONST || is_float(v->type)) return -1;
+    if (v->enc != RAY_ENC_CONST || is_float(v->type) || !is_cmp_op(op)) return -1;
     if (v->type == RAY_SYM && op != OP_EQ && op != OP_NE) return -1;   /* never order ids (#738) */
     if (v->nullmap && v->n_nulls == v->n) return nr;          /* all null: every row is null_result */
     int r = cmp_one(ray_enc_logical(v->cbits, v->k), op, c);
@@ -63,7 +65,8 @@ int ray_enc_const_decision(const ray_enc_vview_t* v, uint16_t op, int64_t c, uin
 }
 
 int ray_enc_const_decision_f64(const ray_enc_vview_t* v, uint16_t op, double c, uint8_t nr) {
-    if (v->enc != RAY_ENC_CONST || !is_float(v->type)) return -1;
+    if (v->enc != RAY_ENC_CONST || !is_float(v->type) || !is_cmp_op(op)) return -1;
+    if (isnan(c)) return -1;                                  /* a NaN constant is the null constant: decline */
     if (v->nullmap && v->n_nulls == v->n) return nr;
     double x;
     if (v->type == RAY_F64) memcpy(&x, &v->cbits, 8);
@@ -90,8 +93,11 @@ int ray_enc_const_decision_f64(const ray_enc_vview_t* v, uint16_t op, double c, 
 
 static void eval_for(const ray_enc_vview_t* v, uint16_t op, int64_t c, uint8_t* bits) {
     const uint64_t umax = v->width >= 64 ? ~0ull : ((1ull << v->width) - 1);
-    __int128 t = (__int128)c - (__int128)ray_enc_logical(v->base, v->k);
-    if (v->k.T == 64 && !v->k.is_signed) t = (__int128)(uint64_t)c - (__int128)v->base;   /* zero-extended */
+    /* one formula for every kind: the only unsigned 64-bit kind is SYM W64,
+     * whose ids (and so its base) are below 2^32, where logical(base) is
+     * the base itself; a negative c then lands in t < 0, which is right
+     * for EQ / NE, the only operators SYM reaches */
+    const __int128 t = (__int128)c - (__int128)ray_enc_logical(v->base, v->k);
     if (t < 0 || t > (__int128)umax) {
         memset(bits, cmp_one(t < 0 ? 1 : -1, op, 0), (size_t)v->n);   /* x > c, or x < c, for every row */
         return;
@@ -139,11 +145,22 @@ static void eval_dict(const ray_enc_vview_t* v, uint16_t op, int64_t c, uint8_t*
         bits[i] = (uint8_t)((v->codes[i] - lo < span) ^ neg);   /* unsigned: one compare */
 }
 
-/* CONST and RLE: each run's value decides its rows. */
-static void eval_runs(const ray_enc_vview_t* v, uint16_t op, int64_t c, uint8_t* bits) {
+/* x in set: the set sorted ascending, distinct */
+static bool in_set(const int64_t* set, int nset, int64_t x) {
+    int lo = 0, hi = nset;
+    while (lo < hi) { int mid = lo + (hi - lo) / 2; if (set[mid] < x) lo = mid + 1; else hi = mid; }
+    return lo < nset && set[lo] == x;
+}
+/* RLE: each run's value decides its rows (CONST takes one memset), under
+ * a comparison or a membership. */
+typedef struct { bool member; uint16_t op; int64_t c; const int64_t* set; int nset; } run_pred_t;
+static inline int run_pred(const run_pred_t* p, int64_t x) {
+    return p->member ? in_set(p->set, p->nset, x) : cmp_one(x, p->op, p->c);
+}
+static void eval_runs(const ray_enc_vview_t* v, const run_pred_t* p, uint8_t* bits) {
     uint32_t i = 0;
     for (uint32_t r = 0; r < v->n_runs; r++) {
-        const uint8_t b = (uint8_t)cmp_one(ray_enc_logical(lane(&v->run_vals, v->k.T, r), v->k), op, c);
+        const uint8_t b = (uint8_t)run_pred(p, ray_enc_logical(lane(&v->run_vals, v->k.T, r), v->k));
         memset(bits + i, b, (size_t)(v->run_ends.h[r] - i));
         i = v->run_ends.h[r];
     }
@@ -151,25 +168,19 @@ static void eval_runs(const ray_enc_vview_t* v, uint16_t op, int64_t c, uint8_t*
 
 bool ray_enc_eval_cmp(const ray_enc_vview_t* v, uint16_t op, int64_t c, uint8_t nr, uint8_t* bits) {
     if (is_float(v->type)) return false;                              /* floats: ray_enc_const_decision_f64 */
-    if (op < OP_EQ || op > OP_GE) return false;
+    if (!is_cmp_op(op)) return false;
     if (v->type == RAY_SYM && op != OP_EQ && op != OP_NE) return false;   /* never order ids (#738) */
     switch (v->enc) {
     case RAY_ENC_CONST:
         memset(bits, cmp_one(ray_enc_logical(v->cbits, v->k), op, c), (size_t)v->n);
         break;
     case RAY_ENC_FOR_BP: eval_for(v, op, c, bits); break;
-    case RAY_ENC_RLE:    eval_runs(v, op, c, bits); break;
+    case RAY_ENC_RLE:    eval_runs(v, &(run_pred_t){ false, op, c, NULL, 0 }, bits); break;
     case RAY_ENC_DICT:   eval_dict(v, op, c, bits); break;
     default: return false;
     }
     ray_enc_mask_nulls(v, nr, bits);
     return true;
-}
-
-static bool in_set(const int64_t* set, int nset, int64_t x) {
-    int lo = 0, hi = nset;
-    while (lo < hi) { int mid = lo + (hi - lo) / 2; if (set[mid] < x) lo = mid + 1; else hi = mid; }
-    return lo < nset && set[lo] == x;
 }
 
 bool ray_enc_eval_in(const ray_enc_vview_t* v, const int64_t* set, int nset, uint8_t nr, uint8_t* bits) {
@@ -179,15 +190,7 @@ bool ray_enc_eval_in(const ray_enc_vview_t* v, const int64_t* set, int nset, uin
     case RAY_ENC_CONST:
         memset(bits, in_set(set, nset, ray_enc_logical(v->cbits, v->k)), (size_t)v->n);
         break;
-    case RAY_ENC_RLE: {
-        uint32_t i = 0;
-        for (uint32_t r = 0; r < v->n_runs; r++) {
-            memset(bits + i, in_set(set, nset, ray_enc_logical(lane(&v->run_vals, v->k.T, r), v->k)),
-                   (size_t)(v->run_ends.h[r] - i));
-            i = v->run_ends.h[r];
-        }
-        break;
-    }
+    case RAY_ENC_RLE: eval_runs(v, &(run_pred_t){ true, 0, 0, set, nset }, bits); break;
     case RAY_ENC_DICT: {
         /* the codes of the set's members: a bitmap over dict_n <= 2^16 codes (8 KB) */
         uint64_t pass[(1u << 16) / 64];

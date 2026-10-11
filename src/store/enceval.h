@@ -35,6 +35,12 @@
  * never ordering ids (#738).  Every buffer is the caller's or on the stack. */
 
 /* Comparison operators: OP_EQ .. OP_GE of src/ops/ops.h. */
+/* `c` and the members of `set` are integer constants in the column's
+ * logical domain (a SYM constant is an id of the column's domain).  A
+ * caller holding a float literal against an integer column never
+ * truncates it into c (generation 0 compares those in double): it
+ * declines and decodes.  A null constant is the caller's to fold too.
+ * An operator outside OP_EQ .. OP_GE declines (false / -1). */
 /* (x op c) over a viewed vector into bits[0..n), integer kinds (every
  * encoding P1 writes for integer, temporal, BOOL, U8 and SYM), with null
  * masking: rows whose bitmap bit is set get `null_result`.  False when
@@ -50,7 +56,8 @@ void ray_enc_mask_nulls(const ray_enc_vview_t* v, uint8_t null_result, uint8_t* 
  * result (the value's result equals null_result, or no nulls), else -1. */
 int  ray_enc_const_decision(const ray_enc_vview_t* v, uint16_t op, int64_t c, uint8_t null_result);
 /* The same for a float CONST view (F32 / F64 cbits) under the predicate
- * comparator (-0.0 == +0.0); -1 for any other view. */
+ * comparator (-0.0 == +0.0); -1 for any other view and for a NaN c
+ * (generation 0 reads a NaN literal as the null constant). */
 int  ray_enc_const_decision_f64(const ray_enc_vview_t* v, uint16_t op, double c, uint8_t null_result);
 
 #endif /* RAY_ENCEVAL_H */
