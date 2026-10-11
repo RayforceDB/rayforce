@@ -4731,6 +4731,63 @@ static test_result_t test_relieve_needed_baseline(void) {
     PASS();
 }
 
+/* A statement is judged by its peak, not by the footprint it ends with:
+ * right after a relief that took the workers' pools, one that ran a large
+ * block up near the watermark and freed it before its boundary needed that
+ * relief — a repeat will run up there again — though it ends far below. */
+static test_result_t test_relieve_needed_peak(void) {
+#if defined(_WIN32)
+    SKIP("file-backed spill is POSIX-only");
+#endif
+    static relieve_workers_t w;
+    memset(&w, 0, sizeof w);
+    relieve_env_t e;
+    relieve_env_begin(&e);
+    ray_heap_t* h = relieve_heap_new(&e);
+    if (!h) { relieve_env_end(&e, NULL, NULL); SKIP("no fresh heap"); }
+
+    /* x holds this heap's pool; each worker keeps a block and has one
+     * empty pool. */
+    ray_t* x = ray_alloc(RELIEVE_HALF);
+    bool workers = x && relieve_worker_pool(&w);
+    relieve_spill_elsewhere(&e);
+    ray_heap_relieve();
+    workers = workers && relieve_worker_pool(&w);
+    int64_t c0 = ray_heap_anon_committed();
+
+    /* A large block spills: the relief takes the workers' empty pools. */
+    ray_heap_set_anon_watermark(c0 + 40 * RELIEVE_MB);
+    ray_t* d = workers ? ray_alloc((size_t)48 << 20) : NULL;
+    bool spilled = d && ray_direct_file_backed(d);
+    if (d) ray_free(d);
+    ray_heap_relieve();
+    int64_t after = ray_heap_anon_committed();
+    int64_t room = c0 - after;                   /* the workers' pools taken */
+
+    /* The next statement peaks with a block of room + 24 MB — a pool short
+     * of the watermark — frees it, and ends with one more pool here. */
+    d = room >= 24 * RELIEVE_MB ? ray_alloc((size_t)(room + 24 * RELIEVE_MB)) : NULL;
+    bool peaked = d && !ray_direct_file_backed(d);
+    if (d) ray_free(d);
+    ray_heap_direct_cache_drain();
+    ray_t* y = ray_alloc(RELIEVE_HALF);
+    if (y) ray_free(y);
+    int64_t end = ray_heap_anon_committed();
+    bool low = h->pool_count == 2 && end + RELIEVE_POOL <= ray_heap_anon_watermark();
+    ray_heap_relieve();
+    bool relieved = h->pool_count == 1;
+
+    for (int i = 0; i < RELIEVE_WORKERS; i++) if (w.keep[i]) ray_free(w.keep[i]);
+    if (x) ray_free(x);
+    relieve_env_end(&e, h, NULL);
+    if (!workers) SKIP("no pool worker");
+    if (!spilled) SKIP("no spill file");
+    TEST_ASSERT(room >= 24 * RELIEVE_MB, "a spill relieved the workers' empty pools");
+    TEST_ASSERT(peaked && low, "a block in RAM up near the watermark, freed: the end far below");
+    TEST_ASSERT(relieved, "judged by its peak, it needed the relief: the empty pool went");
+    PASS();
+}
+
 /* A parked pool is off the freelists: the small allocations of the next
  * statement are cut from the heap's other pools and leave it whole, and the
  * heap takes it back before it maps a new pool.  The heap's last pool stays
@@ -5349,6 +5406,7 @@ const test_entry_t heap_entries[] = {
     { "heap/relieve_spill_disk_last",  test_relieve_spill_disk_last,     heap_setup, heap_teardown },
     { "heap/relieve_needed",           test_relieve_needed,              heap_setup, heap_teardown },
     { "heap/relieve_needed_baseline",  test_relieve_needed_baseline,     heap_setup, heap_teardown },
+    { "heap/relieve_needed_peak",      test_relieve_needed_peak,         heap_setup, heap_teardown },
     { "heap/relieve_park",             test_relieve_park,                heap_setup, heap_teardown },
     { "heap/direct_cache_concurrent", test_direct_cache_concurrent_replacement, heap_setup, heap_teardown },
     { "heap/anon_watermark_spill",     test_anon_watermark_spill,              heap_setup, heap_teardown },
