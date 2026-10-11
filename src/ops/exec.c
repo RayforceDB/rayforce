@@ -3220,9 +3220,11 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
             ray_op_ext_t* ext = find_ext(g, op->id);
             int64_t n = ext ? ext->sym : 10;
 
-            /* Fused sort+limit: detect SORT child → only gather N rows */
+            /* Fused sort+limit: detect SORT child → only gather N rows.  Not
+             * for N = 0: exec_sort reads a 0 limit as none (every row); the
+             * plain HEAD below trims the sort to no rows. */
             ray_op_t* child_op = op_child(g, op, 0);
-            if (child_op && child_op->opcode == OP_SORT) {
+            if (child_op && child_op->opcode == OP_SORT && n > 0) {
                 ray_t* sort_input = exec_node(g, op_child(g, child_op, 0));
                 if (!sort_input || RAY_IS_ERR(sort_input)) return sort_input;
                 ray_t* tbl = (sort_input->type == RAY_TABLE) ? sort_input : g->table;

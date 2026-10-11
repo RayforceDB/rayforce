@@ -43,12 +43,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>    /* the lazily read page size and read-ahead step */
 #if defined(RAY_OS_MACOS)
 #include <sys/sysctl.h>   /* sysctlbyname — hw.physicalcpu */
 #endif
 #if defined(RAY_OS_LINUX)
 #include <dirent.h>       /* /sys/block — the read-ahead caps */
+#include <errno.h>        /* EINTR — ray_os_cgroup_stat_flush */
 #include <stdatomic.h>
+#include <sys/resource.h> /* getrusage: ray_io_counters */
+#if !defined(RUSAGE_THREAD)
+#define RUSAGE_THREAD 1
+#endif
 #endif
 #include "mem/sys.h"
 
@@ -118,11 +124,15 @@ void ray_vm_advise_seq(void* ptr, size_t size) {
     if (ptr) madvise(ptr, size, MADV_SEQUENTIAL);
 }
 
+/* Read once, from whichever thread asks first: the threads that race on it
+ * all store the same value, relaxed. */
 static size_t vm_page_size(void) {
-    static size_t pg = 0;
+    static _Atomic(size_t) cached = 0;
+    size_t pg = atomic_load_explicit(&cached, memory_order_relaxed);
     if (pg == 0) {
         long ps = sysconf(_SC_PAGESIZE);
         pg = (ps > 0) ? (size_t)ps : 4096;
+        atomic_store_explicit(&cached, pg, memory_order_relaxed);
     }
     return pg;
 }
@@ -221,6 +231,29 @@ bool ray_vm_resident(const void* ptr, size_t size) {
     return true;
 }
 
+size_t ray_vm_resident_end(const void* ptr, size_t size) {
+    size_t pg = vm_page_size();
+#if defined(RAY_OS_MACOS)
+    char vec[4096];
+#else
+    unsigned char vec[4096];
+#endif
+    uintptr_t a = (uintptr_t)ptr & ~(uintptr_t)(pg - 1);
+    size_t pages = ((uintptr_t)ptr + size - a + pg - 1) / pg;
+    for (size_t top = pages; top > 0; ) {
+        size_t k = top < sizeof(vec) ? top : sizeof(vec);
+        size_t at = top - k;
+        if (mincore((void*)(a + at * pg), k * pg, vec) != 0) return size;
+        for (size_t i = k; i-- > 0; )
+            if (vec[i] & 1) {
+                size_t end = (at + i + 1) * pg - ((uintptr_t)ptr - a);
+                return end < size ? end : size;
+            }
+        top = at;
+    }
+    return 0;
+}
+
 void ray_vm_release(void* ptr, size_t size) {
     if (!ptr) return;
 #if defined(RAY_OS_MACOS)
@@ -246,11 +279,7 @@ void ray_vm_release_block(void* blk, size_t bsize, bool hugepage) {
          * read back as zero and the next GC freelist walk crashed on a
          * NULL link (issue #240).  Rounding inward to page-aligned bounds
          * makes the kernel's own rounding a no-op on every platform. */
-        static size_t pg = 0;
-        if (pg == 0) {
-            long ps = sysconf(_SC_PAGESIZE);
-            pg = (ps > 0) ? (size_t)ps : 4096;
-        }
+        size_t pg = vm_page_size();
         uintptr_t s = ((uintptr_t)blk + 32 + (pg - 1)) & ~(uintptr_t)(pg - 1);
         uintptr_t e = ((uintptr_t)blk + bsize) & ~(uintptr_t)(pg - 1);
         if (e > s) ray_vm_release((void*)s, e - s);
@@ -507,8 +536,10 @@ static int64_t cgroup_read_limit(const char* path) {
     return (int64_t)v;
 }
 
-/* Smallest limit found in `root`/`cgpath`/`file` and every ancestor. */
-static int64_t cgroup_walk_limit(const char* root, const char* cgpath, const char* file) {
+/* Smallest limit found in `root`/`cgpath`/`file` and every ancestor; the
+ * directory that sets it into at[512] when at is not NULL. */
+static int64_t cgroup_walk_limit(const char* root, const char* cgpath, const char* file,
+                                 char* at) {
     char dir[512];
     if (snprintf(dir, sizeof(dir), "%s%s", root, cgpath) >= (int)sizeof(dir)) return 0;
     size_t rootlen = strlen(root);
@@ -517,7 +548,10 @@ static int64_t cgroup_walk_limit(const char* root, const char* cgpath, const cha
         char path[640];
         snprintf(path, sizeof(path), "%s/%s", dir, file);
         int64_t v = cgroup_read_limit(path);
-        if (v > 0 && (limit == 0 || v < limit)) limit = v;
+        if (v > 0 && (limit == 0 || v < limit)) {
+            limit = v;
+            if (at) memcpy(at, dir, sizeof(dir));
+        }
         if (strlen(dir) <= rootlen) break;              /* mount root checked */
         char* slash = strrchr(dir, '/');
         if (!slash || (size_t)(slash - dir) < rootlen) break;
@@ -537,7 +571,9 @@ static bool cgroup_has_memory(const char* ctrls) {
     return false;
 }
 
-int64_t ray_os_cgroup_mem_limit(void) {
+/* The smallest limit, and into dir[n] (when not NULL) the directory of the
+ * cgroup that sets it — at most 511 bytes, as the walk's own. */
+static int64_t cgroup_mem_limit(char* dir, size_t n) {
     FILE* f = fopen("/proc/self/cgroup", "r");
     if (!f) return 0;
     int64_t limit = 0;
@@ -552,20 +588,47 @@ int64_t ray_os_cgroup_mem_limit(void) {
         char* cgpath = c2 + 1;
         cgpath[strcspn(cgpath, "\n")] = 0;
         if (strcmp(cgpath, "/") == 0) cgpath[0] = 0;
+        char at[512];
         int64_t v;
         if (*ctrls == 0)
-            v = cgroup_walk_limit("/sys/fs/cgroup", cgpath, "memory.max");
+            v = cgroup_walk_limit("/sys/fs/cgroup", cgpath, "memory.max", at);
         else if (cgroup_has_memory(ctrls))
-            v = cgroup_walk_limit("/sys/fs/cgroup/memory", cgpath, "memory.limit_in_bytes");
+            v = cgroup_walk_limit("/sys/fs/cgroup/memory", cgpath, "memory.limit_in_bytes", at);
         else
             continue;
-        if (v > 0 && (limit == 0 || v < limit)) limit = v;
+        if (v > 0 && (limit == 0 || v < limit)) {
+            limit = v;
+            if (dir && snprintf(dir, n, "%s", at) >= (int)n) dir[0] = 0;
+        }
     }
     fclose(f);
     return limit;
 }
+
+int64_t ray_os_cgroup_mem_limit(void) {
+    return cgroup_mem_limit(NULL, 0);
+}
+
+bool ray_os_cgroup_mem_dir(char* buf, size_t n) {
+    if (n) buf[0] = 0;
+    return n && cgroup_mem_limit(buf, n) > 0 && buf[0];
+}
+
+bool ray_os_cgroup_stat_flush(const char* cg) {
+    char path[600], buf[256];
+    if (!cg || !*cg) return false;
+    snprintf(path, sizeof(path), "%s/memory.stat", cg);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    ssize_t r;
+    do r = read(fd, buf, sizeof(buf)); while (r < 0 && errno == EINTR);
+    close(fd);
+    return r > 0;
+}
 #else
 int64_t ray_os_cgroup_mem_limit(void) { return 0; }
+bool    ray_os_cgroup_mem_dir(char* buf, size_t n) { if (n) buf[0] = 0; return false; }
+bool    ray_os_cgroup_stat_flush(const char* cg) { (void)cg; return false; }
 #endif
 
 static uint64_t cache_llc_probe(void) {
@@ -770,6 +833,7 @@ void ray_sleep_ms(int ms) { Sleep((DWORD)ms); }
 /* No cheap residency query here: report "not resident" so a read-ahead is
  * still requested (PrefetchVirtualMemory skips resident pages itself). */
 bool ray_vm_resident(const void* ptr, size_t size) { (void)ptr; (void)size; return false; }
+size_t ray_vm_resident_end(const void* ptr, size_t size) { (void)ptr; return size; }
 
 void ray_vm_release(void* ptr, size_t size) {
     if (!ptr) return;
@@ -855,6 +919,8 @@ uint32_t ray_physical_core_count(void) {
 }
 
 int64_t ray_os_cgroup_mem_limit(void) { return 0; }
+bool    ray_os_cgroup_mem_dir(char* buf, size_t n) { if (n) buf[0] = 0; return false; }
+bool    ray_os_cgroup_stat_flush(const char* cg) { (void)cg; return false; }
 
 /* Sum of every level-3 cache instance reported by the processor topology
  * (each SYSTEM_LOGICAL_PROCESSOR_INFORMATION cache record is one instance).
@@ -938,6 +1004,8 @@ void* ray_vm_alloc(size_t size) {
          * Round up to a 64KB WASM page. */
         size_t aligned = (size + 65535u) & ~(size_t)65535u;
         p = aligned_alloc(65536, aligned);
+        /* zero-filled, as a fresh mapping is (ray_sys_alloc's contract) */
+        if (p) memset(p, 0, aligned);
     }
     if (p) ray_sys_track_add((int64_t)size);
     return p;
@@ -990,6 +1058,7 @@ void ray_vm_advise_willneed(void* ptr, size_t size) { (void)ptr; (void)size; }
 void ray_file_writeback_start(int fd, int64_t off, int64_t len) { (void)fd; (void)off; (void)len; }
 void ray_sleep_ms(int ms)                          { (void)ms; }
 bool ray_vm_resident(const void* ptr, size_t size)  { (void)ptr; (void)size; return true; }
+size_t ray_vm_resident_end(const void* ptr, size_t size) { (void)ptr; return size; }
 void ray_vm_release(void* ptr, size_t size)         { (void)ptr; (void)size; }
 
 void ray_vm_release_block(void* blk, size_t bsize, bool hugepage) {
@@ -1022,6 +1091,8 @@ ray_err_t ray_thread_join(ray_thread_t t) {
 
 uint32_t ray_thread_count(void) { return 1; }
 int64_t ray_os_cgroup_mem_limit(void) { return 0; }
+bool    ray_os_cgroup_mem_dir(char* buf, size_t n) { if (n) buf[0] = 0; return false; }
+bool    ray_os_cgroup_stat_flush(const char* cg) { (void)cg; return false; }
 static uint64_t cache_llc_probe(void) { return 0; }
 
 /* Semaphore — counter-only.  Single-threaded so wait never blocks (the
@@ -1057,4 +1128,28 @@ uint64_t ray_cache_llc_bytes(void) {
     if (g_llc_for_test) return g_llc_for_test;
 #endif
     return cache_llc_probe();
+}
+
+/* ---- I/O counters for the traces ----------------------------------------- */
+void ray_io_counters(bool thread, ray_io_counters_t* out) {
+    *out = (ray_io_counters_t){0};
+#if defined(RAY_OS_LINUX)
+    struct rusage ru;
+    if (getrusage(thread ? RUSAGE_THREAD : RUSAGE_SELF, &ru) == 0) out->majflt = ru.ru_majflt;
+    FILE* f = fopen(thread ? "/proc/thread-self/io" : "/proc/self/io", "r");
+    if (f) {
+        char line[128];
+        while (fgets(line, sizeof(line), f)) {
+            long long v;
+            if (sscanf(line, "read_bytes: %lld", &v) == 1) out->rd = v;
+            else if (sscanf(line, "write_bytes: %lld", &v) == 1) out->wr = v;
+            else if (sscanf(line, "cancelled_write_bytes: %lld", &v) == 1) out->cwr = v;
+            else if (sscanf(line, "syscr: %lld", &v) == 1) out->syscr = v;
+            else if (sscanf(line, "syscw: %lld", &v) == 1) out->syscw = v;
+        }
+        fclose(f);
+    }
+#else
+    (void)thread;
+#endif
 }

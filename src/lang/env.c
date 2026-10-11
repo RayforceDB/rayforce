@@ -104,6 +104,16 @@ static struct {
     int32_t count;
 } g_env;
 
+/* What a name compiled code resolves stays the same while neither moves:
+ * the frame epoch (this thread's scope frames: a push, a pop, a binding,
+ * a frame's kind or flags) and the global epoch (any global written).
+ * ray_env_resolve_compiled caches its answers under the pair. */
+_Thread_local uint64_t g_frame_epoch = 1;
+_Atomic uint64_t g_global_epoch = 1;
+_Thread_local ray_resolve_cache_t g_resolve_cache[1 << RAY_RESOLVE_CACHE_BITS];
+static inline void env_frames_moved(void) { g_frame_epoch++; }
+static inline void env_globals_moved(void) { atomic_fetch_add_explicit(&g_global_epoch, 1, memory_order_relaxed); }
+
 /* ---- Local scope stack ---- */
 
 /* The scope stack lives on the per-thread VM (core/runtime.h) — one
@@ -147,17 +157,31 @@ static int32_t env_frame_lexical_count(const ray_scope_frame_t* f) {
     return f->kind == RAY_SCOPE_CALL && f->table ? f->table_from : f->count;
 }
 
-ray_t* ray_env_get_lexical_local(int64_t sym_id) {
+/* `in_callee`: the name is looked up for code a compiled frame's text
+ * calls (a helper body the planner inlines), so no eval window is its
+ * scope; otherwise the nearest window is, and none below it. */
+static ray_t* env_lexical_local_impl(int64_t sym_id, bool in_callee) {
     if (!__VM) return NULL;
     for (int32_t d = __VM->scope_depth - 1; d >= 0; d--) {
         ray_scope_frame_t* f = &__VM->scope_stack[d];
         if (f->kind == RAY_SCOPE_QUERY) continue;
+        if (f->lexical) in_callee = true;
+        if (f->eval_window && in_callee) continue;
         int32_t n = env_frame_lexical_count(f);
         for (int32_t i = 0; i < n; i++)
             if (f->keys[i] == sym_id) return f->vals[i];
+        if (f->eval_window) in_callee = true;
         if (f->kind == RAY_SCOPE_CALL) break;
     }
     return NULL;
+}
+
+ray_t* ray_env_get_lexical_local(int64_t sym_id) {
+    return env_lexical_local_impl(sym_id, false);
+}
+
+ray_t* ray_env_get_lexical_local_callee(int64_t sym_id) {
+    return env_lexical_local_impl(sym_id, true);
 }
 
 int32_t ray_env_lexical_scope_depth(int64_t sym_id) {
@@ -252,6 +276,7 @@ ray_t* ray_env_capture_locals_rows(ray_t** flags_out, uint32_t* serial_out) {
                 /* A lazy handle is single-use: capture (and keep bound) the
                  * concrete value, or the closure's second call would read a
                  * handle its first call consumed. */
+                env_frames_moved();
                 ray_t* concrete = ray_lazy_materialize(f->vals[i]);   /* consumes the frame's ref */
                 if (!concrete || RAY_IS_ERR(concrete)) {
                     f->vals[i] = NULL;
@@ -267,7 +292,9 @@ ray_t* ray_env_capture_locals_rows(ray_t** flags_out, uint32_t* serial_out) {
             }
         }
         if (f->kind == RAY_SCOPE_QUERY) outer = true;
-        if (f->kind == RAY_SCOPE_CALL || f->lexical) break;
+        /* An eval window is the evaluated text's scope: what lies below it
+         * belongs to the caller of the code that evaluated the text. */
+        if (f->kind == RAY_SCOPE_CALL || f->lexical || f->eval_window) break;
     }
     if (keys->len == 0) {
         ray_release(keys);
@@ -358,6 +385,7 @@ int64_t ray_sym_ipc_hook(int idx) {
 }
 
 ray_err_t ray_env_init(void) {
+    env_globals_moved();
     memset(&g_env, 0, sizeof(g_env));
     __VM->scope_depth = 0;
     /* The IPC hook sym IDs are interned lazily on first probe via
@@ -374,6 +402,7 @@ ray_err_t ray_env_init(void) {
 }
 
 void ray_env_destroy(void) {
+    env_globals_moved();
     /* Pop any remaining scopes */
     while (__VM->scope_depth > 0) ray_env_pop_scope();
     for (int32_t i = 0; i < g_env.count; i++) {
@@ -416,9 +445,34 @@ static ray_t* env_call_frame_value(ray_scope_frame_t* f, int64_t sym_id) {
     return err == RAY_OK ? f->vals[f->count - 1] : NULL;
 }
 
+/* A global by name.  The table is a flat array of some hundreds of names,
+ * builtins first, so a scan per lookup cost a closure body, which
+ * resolves every builtin it names when it runs, more than the builtin's
+ * own work.  A per-thread hint remembers where a name was found; it is
+ * only a hint, checked against the slot it names, so a rebinding, a new
+ * name or a deletion that moves the slots is seen at once. */
+static ray_t* env_global_lookup(int64_t sym_id) {
+    enum { HINT_BITS = 10 };
+    static _Thread_local struct { int64_t sym; int32_t idx; } hint[1 << HINT_BITS];
+    uint32_t h = (uint32_t)(((uint64_t)sym_id * UINT64_C(0x9E3779B97F4A7C15)) >> (64 - HINT_BITS));
+    int32_t i = hint[h].idx;
+    int32_t n = g_env.count;
+    if (hint[h].sym == sym_id && i < n && g_env.keys[i] == sym_id) return g_env.vals[i];
+    for (i = 0; i < n; i++) {
+        if (g_env.keys[i] != sym_id) continue;
+        hint[h].sym = sym_id;
+        hint[h].idx = i;
+        return g_env.vals[i];
+    }
+    return NULL;
+}
+
 /* `rows`, when given, is set when the value is a query source column (or
- * its cell) read through a helper's call frame. */
-static ray_t* env_lookup_flat_rows(int64_t sym_id, uint8_t* rows) {
+ * its cell) read through a helper's call frame.  `in_callee`: the lookup
+ * is made by compiled code, whose own names are slots, so an `eval`
+ * window on the stack belongs to a caller; the tree walker gets there
+ * once it passes a lambda call's frame (`lexical`). */
+static ray_t* env_lookup_flat_impl(int64_t sym_id, uint8_t* rows, bool in_callee) {
     /* FFI/embedding callers reach this on threads that never bound a VM
      * (cf. ray_env_get_local, already guarded). Such a thread has no
      * local scopes; global bindings must still resolve. */
@@ -429,11 +483,16 @@ static ray_t* env_lookup_flat_rows(int64_t sym_id, uint8_t* rows) {
         bool outer = false;
         for (int32_t d = __VM->scope_depth - 1; d >= 0; d--) {
             ray_scope_frame_t* f = &__VM->scope_stack[d];
+            if (f->lexical) in_callee = true;
+            if (f->eval_window && in_callee) continue;
             for (int32_t i = 0; i < f->count; i++) {
                 if (f->keys[i] != sym_id) continue;
                 if (rows) *rows = outer ? 0 : f->rows[i];
                 return f->vals[i];
             }
+            /* The text's own window is the one nearest it; a window below
+             * belongs to whoever called the code that evaluated it. */
+            if (f->eval_window) in_callee = true;
             if (f->kind == RAY_SCOPE_QUERY) outer = true;
             if (f->kind == RAY_SCOPE_CALL) {
                 ray_t* v = env_call_frame_value(f, sym_id);
@@ -442,15 +501,10 @@ static ray_t* env_lookup_flat_rows(int64_t sym_id, uint8_t* rows) {
             }
         }
     }
-    for (int32_t i = 0; i < g_env.count; i++) {
-        if (g_env.keys[i] == sym_id) return g_env.vals[i];
-    }
-    return NULL;
+    return env_global_lookup(sym_id);
 }
 
-static ray_t* env_lookup_flat(int64_t sym_id) {
-    return env_lookup_flat_rows(sym_id, NULL);
-}
+
 
 ray_t* ray_env_get_local(int64_t sym_id) {
     if (!__VM) return NULL;
@@ -463,12 +517,23 @@ ray_t* ray_env_get_local(int64_t sym_id) {
     return NULL;
 }
 
+static ray_t* env_get_impl(int64_t sym_id, bool in_callee);
 ray_t* ray_env_get(int64_t sym_id) {
+    return env_get_impl(sym_id, false);
+}
+
+/* ray_env_get for a body being compiled: it is a callee of whatever is on
+ * the scope stack, so an `eval` window there is not its scope. */
+ray_t* ray_env_get_compiled(int64_t sym_id) {
+    return env_get_impl(sym_id, true);
+}
+
+static ray_t* env_get_impl(int64_t sym_id, bool in_callee) {
     /* Flat lookup first — covers every non-dotted name AND every
      * reserved builtin like `.sys.gc` which is bound both flat (for
      * O(1) resolution + prefix enumeration) and inside the `.sys`
      * namespace dict (for REPL introspection). */
-    ray_t* flat = env_lookup_flat(sym_id);
+    ray_t* flat = env_lookup_flat_impl(sym_id, NULL, in_callee);
     if (flat) return flat;
     if (!ray_sym_is_dotted(sym_id)) return NULL;
 
@@ -484,7 +549,7 @@ ray_t* ray_env_get(int64_t sym_id) {
     int n = ray_sym_segs(sym_id, &segs);
     if (n < 2) return NULL;  /* defensive — dotted bit without segments */
 
-    ray_t* v = env_lookup_flat(segs[0]);
+    ray_t* v = env_lookup_flat_impl(segs[0], NULL, in_callee);
     for (int i = 1; v && i < n; i++) {
         v = ray_container_probe_sym(v, segs[i]);
     }
@@ -503,13 +568,66 @@ ray_t* ray_env_resolve(int64_t sym_id) {
     return ray_env_resolve_rows(sym_id, NULL);
 }
 
+static ray_t* env_resolve_impl(int64_t sym_id, uint8_t* rows, bool in_callee);
 ray_t* ray_env_resolve_rows(int64_t sym_id, uint8_t* rows) {
+    return env_resolve_impl(sym_id, rows, false);
+}
+
+/* A name compiled code resolves at run time (OP_RESOLVE): never a binding
+ * of an `eval` window, which belongs to a caller. */
+ray_t* ray_env_resolve_compiled(int64_t sym_id, uint8_t* rows) {
+    /* A name resolved under the same frame and global epochs resolves to
+     * the same binding: the frames and globals it was read from have not
+     * moved, so the value is still the one they hold (and alive). */
+    ray_resolve_cache_t* rc = g_resolve_cache;
+    uint32_t h = ray_resolve_cache_slot(sym_id);
+    uint64_t ge = atomic_load_explicit(&g_global_epoch, memory_order_relaxed);
+    if (rc[h].sym == sym_id && rc[h].fe == g_frame_epoch && rc[h].ge == ge && rc[h].val) {
+        if (rows) *rows = rc[h].rows;
+        ray_retain(rc[h].val);
+        return rc[h].val;
+    }
+    /* Only plain frames to look through (a body called outside any query,
+     * from the top level or interpreted code): their bindings, eval windows
+     * passed by, then the global, without the general walk's query and
+     * call-frame cases.  Anything else takes the general walk. */
+    if (__VM) {
+        bool plain = true;
+        for (int32_t d = __VM->scope_depth - 1; d >= 0 && plain; d--) {
+            ray_scope_frame_t* f = &__VM->scope_stack[d];
+            if (f->kind != RAY_SCOPE_LEXICAL) { plain = false; break; }
+            if (f->eval_window) continue;
+            for (int32_t i = 0; i < f->count; i++) {
+                if (f->keys[i] != sym_id) continue;
+                if (rows) *rows = f->rows[i];
+                if (f->vals[i]) {
+                    ray_retain(f->vals[i]);
+                    rc[h].sym = sym_id; rc[h].fe = g_frame_epoch; rc[h].ge = ge;
+                    rc[h].val = f->vals[i]; rc[h].rows = f->rows[i];
+                }
+                return f->vals[i];
+            }
+        }
+        if (plain) {
+            ray_t* v = env_global_lookup(sym_id);
+            if (v) {
+                if (rows) *rows = 0;
+                ray_retain(v);
+                rc[h].sym = sym_id; rc[h].fe = g_frame_epoch; rc[h].ge = ge; rc[h].val = v; rc[h].rows = 0;
+                return v;
+            }
+        }
+    }
+    return env_resolve_impl(sym_id, rows, true);
+}
+
+static ray_t* env_resolve_impl(int64_t sym_id, uint8_t* rows, bool in_callee) {
     if (rows) *rows = 0;
     /* Flat lookup first — short-circuits dotted reserved builtins
      * (`.sys.gc`, `.os.getenv`, …) that are additionally bound flat
      * alongside their namespace dict.  Non-dotted names take the
      * same path. */
-    ray_t* flat = env_lookup_flat_rows(sym_id, rows);
+    ray_t* flat = env_lookup_flat_impl(sym_id, rows, in_callee);
     if (flat) { ray_retain(flat); return flat; }
     if (!ray_sym_is_dotted(sym_id)) return NULL;
 
@@ -520,7 +638,7 @@ ray_t* ray_env_resolve_rows(int64_t sym_id, uint8_t* rows) {
     /* `v` is either a borrowed env/container pointer (fresh=false) or a
      * fresh temporal-extract result (fresh=true).  When switching between
      * the two we must release the previous fresh value to avoid leaks. */
-    ray_t* v = env_lookup_flat_rows(segs[0], rows);
+    ray_t* v = env_lookup_flat_impl(segs[0], rows, in_callee);
     bool   fresh = false;
 
     for (int i = 1; v && i < n; i++) {
@@ -607,17 +725,8 @@ ray_t* ray_env_resolve_rows(int64_t sym_id, uint8_t* rows) {
  * ray_del_fn's contract via ray_env_set(sym, NULL) and also covers the
  * cascade-up case in env_set_dotted where every dict in a dotted path was
  * emptied by the delete. */
-/* Bumped whenever a global that holds a function, or receives one, is
- * rebound: a compiled body that baked a builtin by name was compiled under
- * some value of this counter, and a shared template is reused only while
- * it has not moved (eval.c, the closure template table). */
-static _Atomic uint64_t g_env_fn_generation = 1;
-uint64_t ray_env_fn_generation(void) { return atomic_load_explicit(&g_env_fn_generation, memory_order_relaxed); }
-static inline bool env_is_fn_value(const ray_t* v) {
-    return v && !RAY_IS_ERR(v) && (v->type == RAY_UNARY || v->type == RAY_BINARY || v->type == RAY_VARY || v->type == RAY_LAMBDA);
-}
-
 static ray_err_t env_bind_global_impl(int64_t sym_id, ray_t* val, int is_user) {
+    env_globals_moved();
     env_lock();
     for (int32_t i = 0; i < g_env.count; i++) {
         if (g_env.keys[i] == sym_id) {
@@ -632,8 +741,6 @@ static ray_err_t env_bind_global_impl(int64_t sym_id, ray_t* val, int is_user) {
                 env_unlock();
                 return RAY_OK;
             }
-            if (env_is_fn_value(g_env.vals[i]) || env_is_fn_value(val))
-                atomic_fetch_add_explicit(&g_env_fn_generation, 1, memory_order_relaxed);
             if (g_env.vals[i]) ray_release(g_env.vals[i]);
             ray_retain(val);
             g_env.vals[i] = val;
@@ -656,7 +763,6 @@ static ray_err_t env_bind_global_impl(int64_t sym_id, ray_t* val, int is_user) {
         return RAY_ERR_OOM;
     }
     g_env.keys[g_env.count] = sym_id;
-    if (env_is_fn_value(val)) atomic_fetch_add_explicit(&g_env_fn_generation, 1, memory_order_relaxed);
     ray_retain(val);
     g_env.vals[g_env.count] = val;
     g_env.user[g_env.count] = is_user ? 1 : 0;
@@ -678,6 +784,7 @@ static ray_err_t env_bind_global_user(int64_t sym_id, ray_t* val) {
 }
 
 static ray_err_t env_frame_bind_rows(ray_scope_frame_t* f, int64_t sym_id, ray_t* val, uint8_t rows) {
+    env_frames_moved();
     for (int32_t i = 0; i < f->count; i++) {
         if (f->keys[i] == sym_id) {
             if (val == NULL) {
@@ -886,10 +993,7 @@ static ray_err_t env_set_dotted(int64_t sym_id, ray_t* val,
 
 /* Scope-specific base lookups used by env_set_dotted. */
 ray_t* ray_env_get_global(int64_t sym_id) {
-    for (int32_t i = 0; i < g_env.count; i++) {
-        if (g_env.keys[i] == sym_id) return g_env.vals[i];
-    }
-    return NULL;
+    return env_global_lookup(sym_id);
 }
 
 static ray_t* lookup_top_frame(int64_t sym_id) {
@@ -949,6 +1053,7 @@ static ray_err_t env_push_scope(uint8_t kind) {
     f->count = 0;
     f->kind = kind;
     f->lexical = 0;
+    f->eval_window = 0;
     f->rows = f->rows_inline;
     f->named = 0;
     f->table = NULL;
@@ -970,6 +1075,7 @@ ray_err_t ray_env_push_call_scope(ray_t* table, bool named) {
 }
 
 void ray_env_mark_call_scope(ray_t* table, bool named) {
+    env_frames_moved();
     ray_scope_frame_t* f = &__VM->scope_stack[__VM->scope_depth - 1];
     f->kind = RAY_SCOPE_CALL;
     f->named = named;
@@ -982,6 +1088,7 @@ void ray_env_mark_call_scope(ray_t* table, bool named) {
  * for closure capture (see ray_scope_frame_t.lexical). */
 void ray_env_mark_lexical_scope(int32_t below) {
     if (!__VM) return;
+    env_frames_moved();
     int32_t d = __VM->scope_depth - 1 - below;
     if (d >= 0) __VM->scope_stack[d].lexical = 1;
 }
@@ -996,6 +1103,7 @@ ray_err_t ray_env_push_query_scope(void) {
 
 void ray_env_pop_scope(void) {
     if (__VM->scope_depth <= 0) return;
+    env_frames_moved();
     __VM->scope_depth--;
     ray_scope_frame_t* f = &__VM->scope_stack[__VM->scope_depth];
     for (int32_t i = 0; i < f->count; i++) {
@@ -1014,6 +1122,14 @@ void ray_env_pop_scope(void) {
     f->named = 0;
     f->table = NULL;
     f->table_from = 0;
+}
+
+/* The top frame is a compiled frame's window around `eval` or `resolve`
+ * (see ray_scope_frame_t.eval_window). */
+void ray_env_mark_eval_window(void) {
+    env_frames_moved();
+    if (__VM && __VM->scope_depth > 0)
+        __VM->scope_stack[__VM->scope_depth - 1].eval_window = 1;
 }
 
 /* Materialize compiled-lambda locals into a fresh scope frame — the

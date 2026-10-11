@@ -11809,6 +11809,13 @@ dyn_dense_done:
     return NULL;
 }
 
+/* The error for a by: key that is no value: a function or null.  Out of
+ * line and cold: exec_group_run is hot, and the error is rare. */
+static __attribute__((noinline, cold)) ray_t* group_key_not_value(int8_t t) {
+    return ray_error("domain", t != RAY_NULL ? "by: the key is a function, not a value"
+                                             : "by: the key is null, not a value");
+}
+
 static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                   int64_t group_limit) {
     if (!tbl || RAY_IS_ERR(tbl)) return tbl;
@@ -12072,7 +12079,11 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 bool scalar = ray_is_atom(vec) || (ray_is_vec(vec) && vec->len == 1 && tn != 1);
                 if (scalar) {
                     ray_t* wide;
-                    if (vec->type == -RAY_STR) {
+                    if ((vec->type >= RAY_LAMBDA && vec->type <= RAY_VARY) || vec->type == RAY_NULL) {
+                        /* A name bound to a function (`by: sum`) or to null:
+                         * no value to group on, though ray_is_atom counts it. */
+                        wide = group_key_not_value(vec->type);
+                    } else if (vec->type == -RAY_STR) {
                         wide = broadcast_scalar(vec, tn);
                     } else {
                         ray_t* n_obj = make_i64(tn);
