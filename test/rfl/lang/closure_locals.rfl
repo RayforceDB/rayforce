@@ -240,6 +240,18 @@
 (set inn (fn [v] (+ v 100)))
 (set hpi (fn [v] (inn v)))
 (at ((fn [inn] (eval (quote (select {r: (hpi x) from: Tn})))) (fn [v] 0)) 'r) -- [101 102 103]
+;; ... and (quote x) where quote is a parameter, a capture, a let or a nested
+;; parameter is a call: x is captured
+(set incq (fn [v] (+ v 1)))
+(set mkq1 (fn [quote x] (fn [] (quote x))))
+((mkq1 incq 41)) -- 42
+(set mkq2 (fn [q x] (fn [] (let quote q) (quote x))))
+((mkq2 incq 41)) -- 42
+(set mkq3 (fn [x] (fn [quote] (quote x))))
+((mkq3 41) incq) -- 42
+(set mkq4 (fn [quote x] (if false (set 1 2)) (fn [] (quote x))))
+((mkq4 incq 41)) -- 42
+((fn [x] ((fn [] (quote x)))) 41) -- 'x
 ;; quoted text names nothing a closure captures for, but eval reaches it all
 (((fn [kq] (fn [] (eval (quote (+ kq 0))))) 7)) -- 7
 (((fn [kq] (fn [] (list (quote kq) (eval (quote (+ kq 1)))))) 7)) -- (list 'kq 8)

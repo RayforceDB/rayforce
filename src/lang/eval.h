@@ -219,7 +219,10 @@ bool ray_compile_definition(ray_t* lambda, ray_t** deps);
 /* The capture names a closure's body can reach (its dict keys the body
  * mentions; all of them under eval/resolve), as a SYM vector or NULL. */
 ray_t* ray_closure_capture_names(ray_t* lambda);
-ray_t* ray_closure_mentioned_syms(ray_t* body, bool* dynamic, int64_t* weight);
+ray_t* ray_closure_mentioned_syms(ray_t* body, bool quote_bound, bool* dynamic, int64_t* weight);
+/* Whether a parameter or a capture of `lambda` is named quote, so that a
+ * call spelled (quote x) in its body may be a call through it. */
+bool   ray_lambda_binds_quote(ray_t* lambda);
 ray_t* ray_closure_names_from(ray_t* closure, ray_t* mentioned, bool dynamic);
 /* The closure dict shape the compiled capture binding assumes: NULL, or SYM
  * keys with a LIST of values of the same length. */
