@@ -1102,8 +1102,8 @@ static int dec_fast_dict(ray_enccol_t* e, const ray_enc_desc_t* d, int vlen, con
  * kernels widen, and the bitmap's rows set to the null.  As there, anything
  * off declines and the reference path decodes or reports the vector. */
 
-/* nr T-bit values, by lane width. */
-typedef union { uint8_t b[RAY_ENC_VEC]; uint16_t h[RAY_ENC_VEC]; uint32_t s[RAY_ENC_VEC]; uint64_t q[RAY_ENC_VEC]; } fk_vals_t;
+/* nr T-bit values, by lane width (the view's lane buffer, enccol.h). */
+typedef ray_enc_lanes_t fk_vals_t;
 
 static uint64_t fk_val(const fk_vals_t* v, int T, uint32_t i) {
     switch (T) { case 8: return v->b[i]; case 16: return v->h[i]; case 32: return v->s[i]; default: return v->q[i]; }
@@ -1189,6 +1189,41 @@ static bool fk_bits_all(const uint8_t* bm, uint32_t lo, uint32_t hi) {
     return true;
 }
 
+/* The value rules of nr runs (fk_runs' output) of an integer kind, shared
+ * by the run decode and the view so they cannot drift: SYM ids below the
+ * bound or 0 (the null), the others inside the vector's statistics, and
+ * exactly n_nulls rows of id 0; a signed kind's run on the sentinel wholly
+ * inside the bitmap.  Inlined, so the decode's code is what it was. */
+static inline __attribute__((always_inline)) bool fk_runs_ok(const ray_enccol_t* e, const ray_enc_desc_t* d,
+                                                             const uint8_t* bm, ray_enc_kind_t k,
+                                                             const fk_vals_t* vals, const fk_vals_t* ends, uint32_t nr) {
+    const int T = k.T;
+    const uint64_t m = T == 64 ? ~0ull : (1ull << T) - 1;
+    if (e->type == RAY_SYM) {
+        uint64_t lo, span;
+        fk_stats(d, m, &lo, &span);
+        const uint64_t lim = e->sym_bound == 0 ? 0 : (uint64_t)e->sym_bound - 1 < m ? (uint64_t)e->sym_bound - 1 : m;
+        uint32_t zeros = 0, prev = 0;
+        for (uint32_t i = 0; i < nr; i++) {
+            const uint64_t x = fk_val(vals, T, i);
+            if (x == 0) zeros += ends->h[i] - prev;
+            else if (x > lim || ((x - lo) & m) > span) return false;
+            prev = ends->h[i];
+        }
+        return zeros == (uint32_t)d->n_nulls;
+    }
+    if (k.is_signed) {
+        const uint64_t sent = (uint64_t)1 << (T - 1);
+        if (d->n_nulls && !bm) return false;
+        uint32_t prev = 0;
+        for (uint32_t i = 0; i < nr; i++) {                          /* a run on the sentinel: all null */
+            if (fk_val(vals, T, i) == sent && (!d->n_nulls || !fk_bits_all(bm, prev, ends->h[i]))) return false;
+            prev = ends->h[i];
+        }
+    }
+    return true;
+}
+
 /* A CONST / RLE vector of e's type into out (dec_fast's contract).  The
  * runs and their values are checked first, so a declined vector writes
  * nothing. */
@@ -1196,33 +1231,10 @@ static int dec_fast_runs(ray_enccol_t* e, const ray_enc_desc_t* d, int vlen, con
                          const uint8_t* bm, int8_t wide, ray_enc_kind_t k, void* out) {
     const int T = k.T;
     const bool sym = e->type == RAY_SYM;
-    const uint64_t m = T == 64 ? ~0ull : (1ull << T) - 1;
-    const uint64_t sent = (uint64_t)1 << (T - 1);
     _Alignas(64) fk_vals_t vals, ends;
     uint32_t nr;
     if (!fk_runs(d->encoding, vlen, body, avail, T, &vals, &ends, &nr)) return 0;
-    if (sym) {
-        /* ids below the bound or 0 (the null), the others inside the
-         * vector's statistics; exactly n_nulls rows of id 0 */
-        uint64_t lo, span;
-        fk_stats(d, m, &lo, &span);
-        const uint64_t lim = e->sym_bound == 0 ? 0 : (uint64_t)e->sym_bound - 1 < m ? (uint64_t)e->sym_bound - 1 : m;
-        uint32_t zeros = 0, prev = 0;
-        for (uint32_t i = 0; i < nr; i++) {
-            const uint64_t x = fk_val(&vals, T, i);
-            if (x == 0) zeros += ends.h[i] - prev;
-            else if (x > lim || ((x - lo) & m) > span) return 0;
-            prev = ends.h[i];
-        }
-        if (zeros != (uint32_t)d->n_nulls) return 0;
-    } else if (k.is_signed) {
-        if (d->n_nulls && !bm) return 0;
-        uint32_t prev = 0;
-        for (uint32_t i = 0; i < nr; i++) {                          /* a run on the sentinel: all null */
-            if (fk_val(&vals, T, i) == sent && (!d->n_nulls || !fk_bits_all(bm, prev, ends.h[i]))) return 0;
-            prev = ends.h[i];
-        }
-    }
+    if (!fk_runs_ok(e, d, bm, k, &vals, &ends, nr)) return 0;
 #define FK_FILL(OT, V) do { OT* o_ = (OT*)out; uint32_t p_ = 0;                          \
         for (uint32_t i = 0; i < nr; i++) {                                             \
             const OT v_ = (OT)(V); const uint32_t e_ = ends.h[i];                       \
@@ -1672,6 +1684,185 @@ int ray_enccol_point_i64(ray_enccol_t* e, int64_t row, int64_t* out, ray_t** err
     const int64_t rows = chunk_rows(e, c);
     const int vlen = (int)(rows - (int64_t)j * RAY_ENC_VEC < RAY_ENC_VEC ? rows - (int64_t)j * RAY_ENC_VEC : RAY_ENC_VEC);
     return point_read(e, d, e->base + de.offset + d->payload_off, d->payload_bytes, c, j, vlen, i, k, out, err);
+}
+
+/* ---- Encoded vector views: a body validated, never expanded ----
+ * A view is built only after every check the vector's decode makes has
+ * passed, through the fast kernels' own validators (fk_runs, fk_runs_ok,
+ * the FOR_BP and DICT rules of dec_fast / dec_fast_dict, fk_sym*), so an
+ * aware path never answers from a vector that decode calls `corrupt`.  On
+ * anything off it declines and the caller's range read decodes or reports
+ * the vector, keeping its exact error. */
+
+void ray_enccol_unpack_resid(const ray_enc_vview_t* v, void* out) {
+    switch (v->k.T) {
+    case 8:  (void)fk_for8 ((const uint8_t*) v->packed, v->width, 0, (uint8_t*) out, v->n, 0); break;
+    case 16: (void)fk_for16((const uint16_t*)v->packed, v->width, 0, (uint16_t*)out, v->n, 0); break;
+    case 32: (void)fk_for32((const uint32_t*)v->packed, v->width, 0, (uint32_t*)out, v->n, 0); break;
+    default: (void)fk_for64((const uint64_t*)v->packed, v->width, 0, (uint64_t*)out, v->n, 0); break;
+    }
+}
+
+/* True when no non-null row of the residuals res (lanes at width T) is
+ * hitv, the sentinel's residual. */
+static bool vview_no_hit(const ray_enc_vview_t* v, const ray_enc_lanes_t* res, uint64_t hitv) {
+    for (int i = 0; i < v->n; i++)
+        if (fk_val(res, v->k.T, (uint32_t)i) == hitv && !(v->nullmap && ((v->nullmap[i >> 3] >> (i & 7)) & 1)))
+            return false;
+    return true;
+}
+
+/* A SYM FOR_BP view's ids (base added, mod 2^T) into ids, checked as
+ * dec_fast's FOR_BP arm checks them: below the bound or 0, the non-null
+ * ones inside the vector's statistics, exactly n_nulls zeros. */
+static bool vview_sym_ids_ok(const ray_enccol_t* e, const ray_enc_desc_t* d, const ray_enc_vview_t* v,
+                             ray_enc_lanes_t* ids) {
+    const int T = v->k.T, n = v->n, w = v->width;
+    uint64_t lo, span;
+    fk_stats(d, T == 64 ? ~0ull : (1ull << T) - 1, &lo, &span);
+    switch (T) {
+    case 8:
+        (void)fk_for8((const uint8_t*)v->packed, w, (uint8_t)v->base, ids->b, n, 0);
+        return fk_sym8(ids->b, n, e->sym_bound, d->n_nulls, (uint8_t)lo, (uint8_t)span);
+    case 16:
+        (void)fk_for16((const uint16_t*)v->packed, w, (uint16_t)v->base, ids->h, n, 0);
+        return fk_sym16(ids->h, n, e->sym_bound, d->n_nulls, (uint16_t)lo, (uint16_t)span);
+    case 32:
+        (void)fk_for32((const uint32_t*)v->packed, w, (uint32_t)v->base, ids->s, n, 0);
+        return fk_sym32(ids->s, n, e->sym_bound, d->n_nulls, (uint32_t)lo, (uint32_t)span);
+    default:
+        (void)fk_for64((const uint64_t*)v->packed, w, v->base, ids->q, n, 0);
+        return fk_sym64(ids->q, n, e->sym_bound, d->n_nulls, lo, span);
+    }
+}
+
+/* dec_fast_dict's checks without the gather: the U32 FOR_BP code child's
+ * header, size and base; the codes (unpacked into v->codes) below the
+ * dictionary size; every non-null row's value inside the vector's
+ * statistics, which over the strictly ascending dictionary is a code
+ * interval [clo, chi] (two binary searches); no non-null row on the
+ * sentinel, which only entry 0 can hold (the type's least value). */
+static bool vview_dict_codes(const ray_enc_desc_t* d, const uint8_t* body, uint64_t avail, const uint8_t* bm,
+                             const ray_enc_dict_t* dict, ray_enc_vview_t* v) {
+    const int w = body[1];
+    uint16_t rsv; memcpy(&rsv, body + 2, 2);
+    uint32_t bb; memcpy(&bb, body + 4, 4);
+    if (rsv || w > 32 || (uint64_t)bb + 8 != avail || bb != (uint64_t)ray_enc_size_for(w)) return false;
+    uint64_t base; memcpy(&base, body + 8, 8);
+    if (base >> 32) return false;
+    if (d->n_nulls && !bm) return false;
+    (void)fk_for32((const uint32_t*)(body + 16), w, (uint32_t)base, v->codes, v->n, 0);
+    const ray_enc_kind_t k = v->k;
+    const uint32_t n = dict->n;                              /* a validated dictionary is not empty */
+    uint32_t clo = 0, chi_x = n;                             /* non-null codes in [clo, chi_x) */
+    if (!(d->flags & RAY_ENC_STAT_ABSENT)) {
+        uint32_t a = 0, b = n;                               /* the first entry >= min */
+        while (a < b) { uint32_t mid = a + (b - a) / 2; if (ray_enc_logical(dict->v[mid], k) < d->min) a = mid + 1; else b = mid; }
+        clo = a;
+        a = 0; b = n;                                        /* the first entry > max */
+        while (a < b) { uint32_t mid = a + (b - a) / 2; if (ray_enc_logical(dict->v[mid], k) <= d->max) a = mid + 1; else b = mid; }
+        chi_x = a;
+    }
+    const uint64_t sent = (uint64_t)1 << (k.T - 1);
+    if (clo == 0 && dict->v[0] == sent) clo = 1;             /* the sentinel's code */
+    const bool none = clo >= chi_x;                          /* no non-null row may exist */
+    const uint32_t lim = n - 1, span = none ? 0 : chi_x - 1 - clo;
+    uint32_t bad = 0;
+    for (int i = 0; i < v->n; i++) {
+        const uint32_t c = v->codes[i];
+        const uint32_t nul = bm ? (uint32_t)((bm[i >> 3] >> (i & 7)) & 1) : 0;
+        bad |= (uint32_t)(c > lim) | ((nul ^ 1u) & (uint32_t)(none | (c - clo > span)));
+    }
+    return !bad;
+}
+
+/* A float CONST body (no trailer): dec_floats' checks.  The 8-byte body
+ * with zero padding (fk_runs' CONST arm at T bits), then, when a row is
+ * not null, the value not a NaN and inside the vector's statistics. */
+static bool vview_float_const(const ray_enc_desc_t* d, const uint8_t* body, uint64_t avail, ray_enc_vview_t* v) {
+    const int T = v->k.T;
+    if (!fk_runs(RAY_ENC_CONST, v->n, body, avail, T, &v->run_vals, &v->run_ends, &v->n_runs)) return false;
+    v->cbits = T == 32 ? v->run_vals.s[0] : v->run_vals.q[0];
+    if (d->n_nulls == v->n) return true;                     /* every row null: the value is never read */
+    double x;
+    if (T == 32) { float f; memcpy(&f, &v->run_vals.s[0], 4); x = f; } else memcpy(&x, &v->run_vals.q[0], 8);
+    if (x != x) return false;                                /* a NaN outside the bitmap */
+    if (!(d->flags & RAY_ENC_STAT_ABSENT)) {
+        double smin, smax; memcpy(&smin, &d->min, 8); memcpy(&smax, &d->max, 8);
+        if (x < smin || x > smax) return false;
+    }
+    return true;
+}
+
+int ray_enccol_vview(ray_enccol_t* e, int64_t vec, ray_enc_vview_t* v, ray_t** err) {
+    *err = NULL;
+    if (vec < 0 || vec >= ray_enc_nvecs(e->len) || e->kind != RAY_ENCCOL_SINGLE || e->synthetic) return 0;
+    const int64_t c = vec / RAY_ENC_VECS_PER_CHUNK;
+    const int j = (int)(vec % RAY_ENC_VECS_PER_CHUNK);
+    const ray_enc_desc_t* descs;
+    if ((*err = ray_enccol_chunk_descs_ref(e, c, &descs)) != NULL) return -1;   /* validated once per chunk */
+    const ray_enc_desc_t* d = &descs[j];
+    const int n = ray_enc_vec_len(e->len, vec);
+    const bool fl = enc_type_float(e->type);
+    if (d->flags & RAY_ENC_DESC_TRAILER) return 0;
+    if (fl) {
+        if (d->encoding != RAY_ENC_CONST) return 0;
+        v->k = (ray_enc_kind_t){ (uint8_t)(e->type == RAY_F32 ? 32 : 64), false };
+    } else {
+        if (!fk_int_type(e->type) || !ray_enc_kind_of(e->type, e->attrs, &v->k)) return 0;
+        if (d->encoding != RAY_ENC_CONST && d->encoding != RAY_ENC_FOR_BP &&
+            d->encoding != RAY_ENC_RLE && d->encoding != RAY_ENC_DICT) return 0;
+    }
+    const uint8_t* body; uint64_t avail; const uint8_t* bm;
+    if ((*err = payload_parts(e, c, j, d, n, &body, &avail, &bm)) != NULL) return -1;
+    if (((uintptr_t)body & 7) || n < 1 || n > RAY_ENC_VEC) return 0;
+    v->enc = d->encoding; v->n = n; v->n_nulls = d->n_nulls; v->nullmap = bm; v->type = e->type;
+    v->cbits = 0; v->base = 0; v->width = 0; v->packed = NULL;
+    v->n_runs = 0; v->dict = NULL; v->dict_n = 0;
+    if (fl) return d->width == 0 && vview_float_const(d, body, avail, v) ? 1 : 0;
+    const int T = v->k.T;
+    const uint64_t m = T == 64 ? ~0ull : (1ull << T) - 1;
+    const bool sym = e->type == RAY_SYM;
+    switch (d->encoding) {
+    case RAY_ENC_CONST: case RAY_ENC_RLE:
+        if (d->width) return 0;
+        if (!fk_runs(d->encoding, n, body, avail, T, &v->run_vals, &v->run_ends, &v->n_runs)) return 0;
+        if (!fk_runs_ok(e, d, bm, v->k, &v->run_vals, &v->run_ends, v->n_runs)) return 0;
+        if (d->encoding == RAY_ENC_CONST) v->cbits = fk_val(&v->run_vals, T, 0);
+        return 1;
+    case RAY_ENC_FOR_BP: {
+        const int w = d->width;
+        if (w > T || avail != (uint64_t)ray_enc_size_for(w)) return 0;
+        uint64_t base; memcpy(&base, body, 8);
+        if (base & ~m) return 0;
+        v->base = base; v->width = w; v->packed = body + 8;
+        /* no wrap: logical(base) + (2^w - 1) stays at or below the kind's
+         * largest value, so the residuals compare in logical order.  The
+         * writer's base is the vector minimum: a sound file always passes. */
+        const uint64_t umax = w >= 64 ? ~0ull : (1ull << w) - 1;
+        const uint64_t room = v->k.is_signed ? (uint64_t)(int64_t)(m >> 1) - (uint64_t)ray_enc_logical(base, v->k)
+                                             : m - base;
+        if (umax > room) return 0;
+        _Alignas(64) ray_enc_lanes_t lanes;                  /* one unpack, on the stack */
+        if (sym) return vview_sym_ids_ok(e, d, v, &lanes) ? 1 : 0;
+        if (!v->k.is_signed) return 1;                       /* BOOL, U8: no nulls */
+        if (d->n_nulls && !bm) return 0;
+        const uint64_t sent = (uint64_t)1 << (T - 1), hitv = (sent - base) & m;
+        if (hitv > umax) return 1;                           /* no residual can be the sentinel */
+        ray_enccol_unpack_resid(v, &lanes);
+        return vview_no_hit(v, &lanes, hitv) ? 1 : 0;
+    }
+    case RAY_ENC_DICT: {
+        if (d->width || !v->k.is_signed || sym || avail < 16 || body[0] != RAY_ENC_FOR_BP) return 0;
+        ray_enc_dict_t dict;
+        if ((*err = enc_dict(e, &dict)) != NULL) return -1;  /* validated once per column */
+        if (!vview_dict_codes(d, body, avail, bm, &dict, v)) return 0;
+        v->dict = dict.v; v->dict_n = dict.n;
+        return 1;
+    }
+    default:
+        return 0;
+    }
 }
 
 /* A stand-in column of `type` for the body hooks; with a VALUE_DICT of

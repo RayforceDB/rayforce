@@ -164,6 +164,55 @@ int    ray_enccol_decode_wide(ray_enccol_t* e, int64_t c, int j, const ray_enc_d
  * owned error in *err (descriptors, dictionary, or the value outside its
  * statistics: `corrupt`). */
 int    ray_enccol_point_i64(ray_enccol_t* e, int64_t row, int64_t* out, ray_t** err);
+
+/* RAY_ENC_VEC lane values at the kind's width T (the fast kernels' own
+ * buffer: enccol.c's fk_vals_t is a typedef of this). */
+typedef union {
+    uint8_t  b[RAY_ENC_VEC]; uint16_t h[RAY_ENC_VEC];
+    uint32_t s[RAY_ENC_VEC]; uint64_t q[RAY_ENC_VEC];
+} ray_enc_lanes_t;
+
+/* A parsed, validated top-level vector body; never expanded to values.
+ * About 21 KB: a scan task keeps one on its stack (never the heap).
+ * Floats (CONST only): k.T is the bit width (32 / 64), unsigned, and cbits
+ * the value's F32 / F64 bit pattern. */
+typedef struct ray_enc_vview_s {
+    uint8_t         enc;        /* RAY_ENC_CONST, _FOR_BP, _RLE or _DICT (a view exists only for these) */
+    int             n, n_nulls;
+    const uint8_t*  nullmap;    /* the 128-byte bitmap (bitmap types with nulls), else NULL */
+    ray_enc_kind_t  k;
+    int8_t          type;
+    uint64_t        cbits;      /* CONST: the value's T-bit pattern */
+    uint64_t        base;       /* FOR_BP: the T-bit base */
+    int             width;      /* FOR_BP */
+    const uint8_t*  packed;     /* FOR_BP: the packed lanes in the mapping */
+    uint32_t        n_runs;     /* RLE (CONST: 1) */
+    ray_enc_lanes_t run_vals;   /* RLE / CONST: run values at width T */
+    ray_enc_lanes_t run_ends;   /* RLE / CONST: .h[r] exclusive, strictly ascending, last == n */
+    uint32_t        codes[RAY_ENC_VEC];   /* DICT */
+    const uint64_t* dict;       /* DICT: VALUE_DICT entries (T-bit patterns, strictly ascending) */
+    uint32_t        dict_n;
+} ray_enc_vview_t;
+
+/* Column-global vector `vec` of a single-file column as a view.  1: a
+ * view, after every check the vector's decode makes (the payload split
+ * and bitmap; body sizes, headers and padding; run ends; the sentinel
+ * outside the bitmap; SYM ids against the bound, the statistics and the
+ * null count; DICT codes below the dictionary size with their values
+ * inside the statistics; float CONST: no NaN outside the bitmap, the value
+ * inside the statistics), and a FOR_BP body proven not to wrap (its
+ * residuals then compare in logical order); 0: declined (RAW, DELTA_BP,
+ * floats other than CONST, a trailer, a DICT code child other than FOR_BP,
+ * a body that could wrap, or anything decode would reject): read the
+ * vector by range, which decodes or reports it; -1: an owned error in
+ * *err (the descriptors', the payload split's or the VALUE_DICT's
+ * validation, as the decode would report it).  Never counts decoded
+ * bytes.  A declined view may be partly written; the caller ignores it. */
+int  ray_enccol_vview(ray_enccol_t* e, int64_t vec, ray_enc_vview_t* out, ray_t** err);
+
+/* The FOR_BP residuals of a view (no base added) at width T into out
+ * (n elements of T bits), through the lane kernels (fk_forT, base 0). */
+void ray_enccol_unpack_resid(const ray_enc_vview_t* v, void* out);
 /* A reference on the column's payload (the RAY_ENCCOL headers share it). */
 void   ray_enccol_ref(ray_enccol_t* e);
 void   ray_enccol_unref(ray_enccol_t* e);

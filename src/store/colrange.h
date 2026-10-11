@@ -31,6 +31,7 @@
 
 struct ray_sym_domain_s;
 struct ray_enc_chunk_stat_s;   /* store/enccol.h */
+struct ray_enc_vview_s;        /* store/enccol.h */
 
 /* A bound column source: the object a scan reads ranges of.  Binding
  * retains the object (and a non-runtime SYM domain) and never decodes.
@@ -210,6 +211,11 @@ bool ray_col_src_chunk_stat(const ray_col_src_t* s, int64_t c, struct ray_enc_ch
  * answer-only decisions (skip or fill a vector); nothing may be sized from
  * them without stats_guard. */
 bool ray_col_src_vec_stat(const ray_col_src_t* s, int64_t v, int64_t* min, int64_t* max, uint32_t* n_nulls);
+/* Vector v of a single-file generation-2 source (not synthetic, not
+ * materialized) as a view: ray_enccol_vview's 1 / 0 / -1.  0 for any
+ * other source (read it by range; a published materialization is read in
+ * place). */
+int  ray_col_src_vview(const ray_col_src_t* s, int64_t v, struct ray_enc_vview_s* out, ray_t** err);
 /* The statistics of a parted source, chunk by chunk in row order: fn is
  * called for rows [lo, hi) of every RAY_ENC_CHUNK-row chunk of every
  * segment, with the chunk's directory statistics when the segment is a
