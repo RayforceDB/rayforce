@@ -240,6 +240,9 @@
 (set inn (fn [v] (+ v 100)))
 (set hpi (fn [v] (inn v)))
 (at ((fn [inn] (eval (quote (select {r: (hpi x) from: Tn})))) (fn [v] 0)) 'r) -- [101 102 103]
+;; quoted text names nothing a closure captures for, but eval reaches it all
+(((fn [kq] (fn [] (eval (quote (+ kq 0))))) 7)) -- 7
+(((fn [kq] (fn [] (list (quote kq) (eval (quote (+ kq 1)))))) 7)) -- (list 'kq 8)
 ;; ... and many such calls leave the scope stack as it was
 (times 200 (gw 1))
 (do (let aw 1) aw) -- 1
