@@ -818,9 +818,43 @@ static bool ast_collect_syms(ray_t *ast, ray_t **out, bool *dynamic) {
     int64_t weight = 0;
     return ast_collect_syms_at(ast, out, dynamic, 0, &weight);
 }
+/* The bytes a value spliced into text holds whole: a table's columns, a
+ * lambda's parameters, body and captures, recursively; shared children
+ * count each time they are reached (an overestimate), and the count stops
+ * once it passes `cap`. */
+static int64_t ast_node_bytes(ray_t *v);
+static int64_t ast_value_bytes(ray_t *v, int depth, int64_t cap) {
+    if (!v || RAY_IS_ERR(v)) return 0;
+    if (depth > 64) return cap + 1;
+    int64_t b;
+    if (v->type == RAY_LAMBDA) {
+        b = (int64_t)(sizeof(ray_t) + LAMBDA_SLOTS * sizeof(ray_t*));
+        ray_t *parts[4] = { LAMBDA_PARAMS(v), LAMBDA_BODY(v), LAMBDA_CLOSURE(v), LAMBDA_CAPROWS(v) };
+        for (int i = 0; i < 4 && b <= cap; i++) b += ast_value_bytes(parts[i], depth + 1, cap);
+        return b;
+    }
+    if (v->type == RAY_TABLE || v->type == RAY_DICT) {
+        ray_t **slots = (ray_t**)ray_data(v);
+        b = (int64_t)ray_block_size(v);
+        for (int i = 0; i < 2 && b <= cap; i++) b += ast_value_bytes(slots[i], depth + 1, cap);
+        return b;
+    }
+    if (v->type == RAY_LIST && !(v->attrs & RAY_ATTR_SLICE)) {
+        ray_t **elems = (ray_t**)ray_data(v);
+        b = (int64_t)ray_block_size(v);
+        for (int64_t i = 0; i < v->len && b <= cap; i++) b += ast_value_bytes(elems[i], depth + 1, cap);
+        return b;
+    }
+    return ast_node_bytes(v);
+}
+
 /* The bytes a text node holds: its header and payload, a string atom's
- * or a string vector's characters, and the whole parent of a slice. */
+ * or a string vector's characters, and the whole parent of a slice.  A
+ * table or a lambda in the text is a constant the walk does not enter:
+ * it counts whole (ast_value_bytes). */
 static int64_t ast_node_bytes(ray_t *v) {
+    if (v->type == RAY_TABLE || v->type == RAY_LAMBDA)
+        return ast_value_bytes(v, 0, (int64_t)1 << 40);
     if (ray_is_atom(v)) {
         int64_t b = (int64_t)ray_block_size(v);
         if (v->type == -RAY_STR && !((v->slen >= 1 && v->slen <= 7) || (v->slen == 0 && !v->obj)) && v->obj)

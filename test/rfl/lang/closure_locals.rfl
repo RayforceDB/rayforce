@@ -370,6 +370,19 @@ r6 -- [6 3]
 (set bsL 0)
 (.sys.gc)
 (< (- (heapL) h0L) 4000000) -- true
+;; ... and so do a table, a lambda with its captures, a slice's parent and a
+;; string vector's characters, spliced into the text as constants
+(set spliceL (fn [c] (eval (concat (take baseL 2) (enlist (concat (parse "(+ (count x))") (enlist (concat (parse "(count)") (enlist c)))))))))
+(set mkTb (fn [i] (spliceL (table [a] (list (+ i (til 50000)))))))
+(set mkLm (fn [i] (let c (+ i (til 50000))) (spliceL (list (fn [] c)))))
+(set mkSl (fn [i] (spliceL (take (dict (take ['a 'b] (+ i 50000)) (til (+ i 50000))) [0 2]))))
+(set SVl (as 'STR (map (fn [i] (format "a long string, number %, padded out to a length well past the inline size" i)) (til 1500))))
+(set mkSv (fn [i] (spliceL (concat SVl (as 'STR (list (format "%" i)))))))
+(set heldL (fn [mk] (set bsL (map mk (til 4))) (set bsL 0) (.sys.gc) (let h (heapL)) (set bsL (map mk (til 300))) (set bsL 0) (.sys.gc) (- (heapL) h)))
+(< (heldL mkTb) 2000000) -- true
+(< (heldL mkLm) 2000000) -- true
+(< (heldL mkSl) 2000000) -- true
+(< (heldL mkSv) 2000000) -- true
 ;; a body nested past the compiler's depth guard (2048 levels) is left to the
 ;; tree walker instead of recursing further down the C stack. a chain of
 ;; nested if's shows which engine ran: the compiled body runs it as jumps and
