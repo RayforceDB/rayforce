@@ -348,6 +348,104 @@ ray_t* ray_col_range_wide(ray_col_src_t* src, int64_t start, int64_t n, ray_col_
     return NULL;
 }
 
+/* The vector starting at row `start` of a generation-2 vector source:
+ * the single file (or a parted source's segment) and the vector's local
+ * position; false when row `start` is not such a vector's first row. */
+static bool into_vec(ray_col_src_t* s, int64_t start, ray_enccol_t** ep, int64_t* local, ray_t** err) {
+    ray_t* obj = s->obj;
+    *err = NULL;
+    if (!obj || obj->type != RAY_ENCCOL || ray_enccol_decoded_peek(obj)) return false;   /* published: read in place */
+    ray_enccol_t* e = ray_enccol_of(obj);
+    if (e->kind != RAY_ENCCOL_SINGLE) {
+        const int64_t* off = NULL;
+        ray_t* w = e->wrapper;
+        if ((*err = src_seg_off(s, w, &off)) != NULL) return false;
+        int64_t ns = w->len;
+        if (ns <= 0 || start >= off[ns]) return false;
+        int64_t lo = 0, hi = ns - 1;                     /* the last i with off[i] <= start */
+        while (lo < hi) {
+            int64_t mid = lo + (hi - lo + 1) / 2;
+            if (off[mid] <= start) lo = mid; else hi = mid - 1;
+        }
+        ray_t* sg = ((ray_t**)ray_data(w))[lo];
+        if (!sg || sg->type != RAY_ENCCOL) return false;
+        e = ray_enccol_of(sg);
+        if (e->kind != RAY_ENCCOL_SINGLE) return false;
+        start -= off[lo];
+    }
+    if (start % RAY_ENC_VEC || start >= e->len) return false;
+    *ep = e;
+    *local = start;
+    return true;
+}
+
+static _Atomic(uint64_t) g_into_calls, g_into_rows;   /* test hook */
+void ray_col_test_into(uint64_t* calls, uint64_t* rows) {
+    *calls = atomic_load(&g_into_calls);
+    *rows = atomic_load(&g_into_rows);
+}
+
+ray_t* ray_col_range_into(ray_col_src_t* src, int64_t start, int64_t n, ray_col_scratch_t* sc,
+                          uint8_t attrs, void* dst, int64_t* got) {
+    *got = 0;
+    if (!src || start < 0 || n <= 0 || start >= src->len) return NULL;
+    ray_enccol_t* e;
+    int64_t local;
+    ray_t* err;
+    if (!into_vec(src, start, &e, &local, &err)) return err;
+    if (e->type == RAY_STR || e->type == RAY_GUID) return NULL;
+    if (e->type == RAY_SYM && ((e->attrs ^ attrs) & RAY_SYM_W_MASK)) return NULL;   /* another width: widen by range */
+    int64_t vec = local / RAY_ENC_VEC;
+    int64_t vlen = ray_enc_vec_len(e->len, vec);
+    if (vlen > n) return NULL;
+    int64_t c = vec / RAY_ENC_VECS_PER_CHUNK;
+    int j = (int)(vec % RAY_ENC_VECS_PER_CHUNK);
+    const ray_enc_desc_t* descs;
+    if ((err = ray_enccol_chunk_descs_ref(e, c, &descs)) != NULL) return err;
+    const size_t esz = ray_enccol_esz(e);
+    const char* pv = ray_enccol_raw_view(e, c, j, &descs[j]);
+    if (!pv) {
+        uint64_t nb = 0;
+        if ((err = ray_enccol_decode_into(e, c, j, &descs[j], dst, NULL, 0, 0, &nb)) != NULL) return err;
+        /* the consumer guard, as over a range read's vector */
+        if (src->stats_guard && (err = ray_enccol_check_dir(e, c, j, dst, (int)vlen, descs[j].n_nulls > 0)) != NULL)
+            return err;
+        scratch_count(sc, e, nb);
+        *got = vlen;
+        atomic_fetch_add_explicit(&g_into_calls, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_into_rows, (uint64_t)vlen, memory_order_relaxed);
+        return NULL;
+    }
+    /* RAW vectors are their own decode (as range_enc reads them): the run
+     * of them whose payloads lie end to end in the mapping is one copy (a
+     * large copy streams; a vector at a time took twice a plain segment's
+     * copy, ClickBench q32's WatchID on partitions) */
+    int64_t rows = vlen;
+    while (rows < n && local + rows < e->len) {
+        int64_t v2 = (local + rows) / RAY_ENC_VEC, l2 = ray_enc_vec_len(e->len, v2);
+        if (rows + l2 > n) break;
+        int64_t c2 = v2 / RAY_ENC_VECS_PER_CHUNK;
+        int j2 = (int)(v2 % RAY_ENC_VECS_PER_CHUNK);
+        const ray_enc_desc_t* d2;
+        ray_t* e2 = ray_enccol_chunk_descs_ref(e, c2, &d2);
+        if (e2) { ray_error_free(e2); break; }          /* the vector's own read reports it */
+        if (ray_enccol_raw_view(e, c2, j2, &d2[j2]) != pv + (size_t)rows * esz) break;
+        rows += l2;
+    }
+    memcpy(dst, pv, (size_t)rows * esz);
+    for (int64_t r = 0; src->stats_guard && r < rows; r += RAY_ENC_VEC) {   /* the consumer guard, vector by vector */
+        int64_t v2 = (local + r) / RAY_ENC_VEC;
+        err = ray_enccol_check_dir(e, v2 / RAY_ENC_VECS_PER_CHUNK, (int)(v2 % RAY_ENC_VECS_PER_CHUNK),
+                                   (const char*)dst + (size_t)r * esz, (int)ray_enc_vec_len(e->len, v2), false);
+        if (err) return err;
+    }
+    if (e->type != RAY_F64 && e->type != RAY_F32) scratch_count(sc, e, (uint64_t)rows * esz);
+    *got = rows;
+    atomic_fetch_add_explicit(&g_into_calls, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_into_rows, (uint64_t)rows, memory_order_relaxed);
+    return NULL;
+}
+
 ray_t* ray_col_src_plain(ray_col_src_t* s, ray_t** out) {
     *out = NULL;
     if (!s || !s->obj) return ray_error("type", "source not bound");

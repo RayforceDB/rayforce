@@ -133,6 +133,21 @@ ray_t* ray_col_range(ray_col_src_t* src, int64_t start, int64_t n,
 ray_t* ray_col_range_wide(ray_col_src_t* src, int64_t start, int64_t n, ray_col_scratch_t* scratch,
                           int8_t wide, void* dst, int64_t* got);
 
+/* The vector of a generation-2 source (single file, or a parted source's
+ * encoded segment, neither with a published materialization) that starts
+ * at row `start`, decoded straight into dst at the generation-0 width,
+ * when it ends inside [start, start + n) and is not STR or GUID (SYM: of
+ * the width in `attrs`): *got = its rows (a RAW vector: with the RAW
+ * vectors after it inside the range, copied at once).  Else *got = 0 and nothing is
+ * read: read the rows with ray_col_range or a cursor.  The consumer guard
+ * checks it as a range read's vector.  dst may hold a partial vector on
+ * an error.  NULL or an owned error. */
+ray_t* ray_col_range_into(ray_col_src_t* src, int64_t start, int64_t n, ray_col_scratch_t* sc,
+                          uint8_t attrs, void* dst, int64_t* got);
+/* Test hook: ray_col_range_into's deliveries and the rows they held
+ * since process start. */
+void ray_col_test_into(uint64_t* calls, uint64_t* rows);
+
 /* Test hook: vectors ray_col_range_wide decoded since process start
  * (counted when their scratch is freed). */
 uint64_t ray_col_test_wide_hits(void);

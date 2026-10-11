@@ -2653,6 +2653,51 @@ static test_result_t test_parted_flatten_parallel(void) {
     PASS();
 }
 
+/* Task 17i: a parallel flatten decodes each whole vector of an encoded
+ * segment straight into the flat vector, and copies a run of RAW vectors
+ * lying end to end at once.  Three partitions of 200001, 199999 and
+ * 200000 rows (segments end inside vectors): r wide random I64 (RAW
+ * vectors), k an RLE-ish I32 with nulls, s a SYM; each flattens byte for
+ * byte as generation 0's, the whole vectors arriving straight (all rows
+ * but the slices' cut vectors), r's RAW runs in under half as many copies
+ * as its vectors (a run ends at a chunk, a slice or a non-RAW vector). */
+static test_result_t test_parted_flatten_in_place(void) {
+    ae_eval_ok("(set j (til 600000))");
+    ae_eval_ok("(set P (table [r k s] (list (* (% (* j 7919) 600011) -6148914691236517205) "
+                "(as 'I32 (map (fn [x] (if (== 0 (% x 1001)) 0N (/ x 37))) j)) "
+                "(as 'SYMBOL (map (fn [x] (format \"w%\" (% x 300))) (% (* j 31) 9973))))))");
+    static const int64_t rows[3] = { 200001, 199999, 200000 };
+    for (int gen = 0; gen <= 2; gen += 2)
+        for (int p = 0, at = 0; p < 3; at += (int)rows[p], p++)
+            ae_evalf_ok("(.db.splayed.set \"" AE_TMP "/f%d/2024.01.0%d/t/\" (take (drop P %d) %lld) {compress: %s})",
+                        gen, p + 1, at, (long long)rows[p], gen ? "true" : "false");
+    ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    ray_t* t0 = ae_eval("(.db.parted.get \"" AE_TMP "/f0\" 't)");
+    ray_t* t2 = ae_eval("(.db.parted.get \"" AE_TMP "/f2\" 't)");
+    TEST_ASSERT_TRUE(t0 && !RAY_IS_ERR(t0) && t2 && !RAY_IS_ERR(t2));
+    static const char* const cols[] = { "r", "k", "s" };
+    for (int c = 0; c < 3; c++) {
+        uint64_t c0, r0, c1, r1;
+        ray_col_test_into(&c0, &r0);
+        ray_t* a = ae_flatten(t0, cols[c], 600000);
+        ray_t* b = ae_flatten(t2, cols[c], 600000);
+        ray_col_test_into(&c1, &r1);
+        bool ok = a && !RAY_IS_ERR(a) && b && !RAY_IS_ERR(b) && a->type == b->type && a->len == 600000 &&
+                  b->len == 600000 && a->attrs == b->attrs &&
+                  memcmp(ray_data(a), ray_data(b), (size_t)600000 * ray_sym_elem_size(a->type, a->attrs)) == 0;
+        ae_drop(a); ae_drop(b);
+        /* 16 slices of 40960 rows: at most two cut vectors each, read by the cursor */
+        bool straight = r1 - r0 >= 600000 - 16 * 2 * 1024;
+        bool runs = c != 0 || (c1 - c0) * 2 < 600000 / 1024;
+        if (!ok || !straight || !runs) { ae_drop(t0); ae_drop(t2); }
+        TEST_ASSERT_FMT(ok, "%s: the flat copies differ", cols[c]);
+        TEST_ASSERT_FMT(straight, "%s: %llu rows decoded in place", cols[c], (unsigned long long)(r1 - r0));
+        TEST_ASSERT_FMT(runs, "%s: %llu copies for %d vectors", cols[c], (unsigned long long)(c1 - c0), 600000 / 1024);
+    }
+    ae_drop(t0); ae_drop(t2);
+    PASS();
+}
+
 /* The lowest failure of a parallel flatten, by global row, when time
  * order says otherwise.  4 workers over 2^20 rows of u: slices of 65536
  * rows.  Partition 2 (rows 61440..131071) is corrupt in chunk 1, its last
@@ -2768,5 +2813,6 @@ const test_entry_t agg_engine_entries[] = {
     { "radix_fused_capped_below_half", test_radix_fused_capped_below_half, ae_rt_setup, ae_rt_teardown },
     { "parted_flatten_parallel",     test_parted_flatten_parallel,     ae_rt_setup, ae_rt_teardown },
     { "parted_flatten_lowest_failure", test_parted_flatten_lowest_failure, ae_rt_setup, ae_rt_teardown },
+    { "parted_flatten_in_place",     test_parted_flatten_in_place,     ae_rt_setup, ae_rt_teardown },
     { NULL, NULL, NULL, NULL },
 };
