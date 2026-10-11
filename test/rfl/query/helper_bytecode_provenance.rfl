@@ -436,6 +436,60 @@ CNT11 -- 6
 (set krl11 (fn [v] (let g kg10) (let g eff11) (g v) (if (< v 4) 0 1)))
 (at (select {n: (count v) by: (krl11 v) from: T10}) 'n) -- [3 3]
 CNT11 -- 6
+;; a let in a loop reaches the next iteration's calls, whatever the name held
+;; before; a let in a try body may be skipped by a raise
+(set pid11 (fn [x] x))
+(set CNT11 0)
+(set klp11 (fn [v] (let g pid11) (times 2 (do (let t (g v)) (let g (fn [x] (set CNT11 (+ CNT11 1)) x)))) (kg10 v)))
+(at (select {n: (count v) by: (klp11 v) from: T10}) 'n) -- [6]
+CNT11 -- 6
+(set CNT11 0)
+(set kwh11 (fn [v] (let g pid11) (let i 0) (while (< i 2) (do (let t (g v)) (let g (fn [x] (eff11 x))) (let i (+ i 1)))) (kg10 v)))
+(at (select {n: (count v) by: (kwh11 v) from: T10}) 'n) -- [6]
+CNT11 -- 6
+(set CNT11 0)
+(set klt11 (fn [v] (let g (fn [x] x)) (times 2 (do (let t (g v)) (let g (fn [x] (eff11 x))))) (kg10 v)))
+(at (select {n: (count v) by: (klt11 v) from: T10}) 'n) -- [6]
+CNT11 -- 6
+(set CNT11 0)
+(set ktr11 (fn [v] (let g (fn [x] (eff11 x))) (try (do (raise "x") (let g pid11)) (fn [e] 0)) (let t (g v)) (kg10 v)))
+(at (select {n: (count v) by: (ktr11 v) from: T10}) 'n) -- [6]
+CNT11 -- 6
+;; a local, parameter or capture named map is what is called, not the builtin
+(set CNT11 0)
+(set kmm11 (fn [v] (let map (fn [f xs] (set CNT11 (+ CNT11 1)) xs)) (let t (map (fn [y] y) [1 2])) (kg10 v)))
+(at (select {n: (count v) by: (kmm11 v) from: T10}) 'n) -- [6]
+CNT11 -- 6
+(set CNT11 0)
+(set mm11 (fn [f xs] (set CNT11 (+ CNT11 1)) xs))
+(set mkmm11 (fn [map] (fn [v] (let t (map (fn [y] y) [1 2])) (kg10 v))))
+(set kmc11 (mkmm11 mm11))
+(at (select {n: (count v) by: (kmc11 v) from: T10}) 'n) -- [6]
+CNT11 -- 6
+;; a function a builtin calls, reached through a dict, a list or a computed
+;; value, counts as called
+(set CNT11 0)
+(set D11 (dict ['a] (list eff11)))
+(set L11 (list eff11))
+(set kda11 (fn [v] (let t (map D11.a (enlist v))) (kg10 v)))
+(at (select {n: (count v) by: (kda11 v) from: T10}) 'n) -- [6]
+CNT11 -- 6
+(set CNT11 0)
+(set kdb11 (fn [v] (let t (map (at D11 'a) (enlist v))) (kg10 v)))
+(at (select {n: (count v) by: (kdb11 v) from: T10}) 'n) -- [6]
+CNT11 -- 6
+(set CNT11 0)
+(set kgl11 (fn [v] (let t (map (fn [f] (f v)) L11)) (kg10 v)))
+(at (select {n: (count v) by: (kgl11 v) from: T10}) 'n) -- [6]
+CNT11 -- 6
+;; ... while a pure function value keeps the whole column, a dict's included
+(set kpm11 (fn [v] (> (first (map kg10 (enlist v))) 0)))
+(at (select {n: (count v) by: (kpm11 v) from: T10}) 'n) -- [3 3]
+(set DP11 (dict ['f] (list kg10)))
+(set kdp11 (fn [v] (DP11.f v)))
+(at (select {n: (count v) by: (kdp11 v) from: T10}) 'n) -- [3 3]
+(set kdq11 (fn [v] (first (map (fn [g] (g v)) (list DP11.f)))))
+(at (select {n: (count v) by: (kdq11 v) from: T10}) 'n) -- [3 3]
 ;; a pure body keeps the whole column: the min is the column's minimum
 (set kw10 (fn [v] 1 (- v (min v))))
 (at (select {n: (count v) by: (kw10 v) from: T10}) 'v) -- [0 1 2 3 4 5]

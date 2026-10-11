@@ -2190,7 +2190,7 @@ static bool query_inline_pure(ray_t* expr, int depth) {
  * computed value, resolved with the bindings in scope at the `let`; and a
  * literal a builtin calls with elements of arguments the walk has seen are
  * pure callables binds its parameters to those. */
-enum { KB_ARG, KB_LIT, KB_ALIAS, KB_UNKNOWN, KB_PURE };
+enum { KB_ARG, KB_LIT, KB_ALIAS, KB_UNKNOWN, KB_PURE, KB_LOOP };
 struct key_pure_ctx;
 typedef struct {
     int64_t name;
@@ -2317,6 +2317,53 @@ static bool key_literal_call_pure(ray_t* lit, ray_t** args, int64_t nargs, int d
  * value: a binding the walk made (parameter or `let`), a capture, a binding
  * of a frame in scope, a global.  True when pure: a pure lambda, a pure
  * builtin, or plain data. */
+/* Whether a data value holds no function with an effect: every lambda in
+ * a list or a dict's values is pure, and so is every global a symbol
+ * there names (one hop: the symbol may be looked up and called).  Past
+ * `*budget` elements it is not known. */
+static bool key_container_pure(ray_t* v, int depth, int* budget, const key_pure_ctx_t* ctx) {
+    if (!v || RAY_IS_ERR(v)) return true;
+    if (depth > 16 || --*budget < 0) return false;
+    if (v->type == RAY_LAMBDA) return key_lambda_call_pure(v, NULL, 0, depth, ctx);
+    if (v->type == RAY_UNARY || v->type == RAY_BINARY || v->type == RAY_VARY) {
+        int64_t id = ray_env_builtin_sym(v);
+        return id >= 0 && !key_impure_builtin(v, id);
+    }
+    if (v->type == RAY_DICT) return key_container_pure(ray_dict_vals(v), depth + 1, budget, ctx);
+    if (v->type == RAY_LIST) {
+        ray_t** es = ray_data(v);
+        for (int64_t i = 0; i < v->len; i++)
+            if (!key_container_pure(es[i], depth + 1, budget, ctx)) return false;
+        return true;
+    }
+    if (v->type == -RAY_SYM || v->type == RAY_SYM) {
+        int64_t n = v->type == RAY_SYM ? v->len : 1;
+        if (n > *budget) return false;
+        *budget -= (int)n;
+        for (int64_t i = 0; i < n; i++) {
+            int64_t id = v->type == RAY_SYM ? ray_read_sym(ray_data(v), i, RAY_SYM, v->attrs) : v->i64;
+            ray_t* g = ray_env_get_global(id);
+            if (!g) continue;
+            if (g->type == RAY_LAMBDA && !key_lambda_call_pure(g, NULL, 0, depth + 1, ctx)) return false;
+            if ((g->type == RAY_UNARY || g->type == RAY_BINARY || g->type == RAY_VARY) && key_impure_builtin(g, id)) return false;
+        }
+        return true;
+    }
+    return true;   /* atoms, typed vectors, tables: data */
+}
+
+/* Whether `id` is bound by the walk, a capture or a scope frame, so that
+ * it does not mean the global of that name. */
+static bool key_name_shadowed(int64_t id, const key_pure_ctx_t* ctx) {
+    for (int i = 0; i < ctx->n; i++) if (ctx->binds[i].name == id) return true;
+    if (ctx->closure) {
+        ray_t* keys = ray_dict_keys(ctx->closure);
+        for (int64_t i = 0; keys && i < keys->len; i++)
+            if (ray_read_sym(ray_data(keys), i, RAY_SYM, keys->attrs) == id) return true;
+    }
+    return ray_env_get_local(id) != NULL;
+}
+
 static bool key_name_pure(int64_t id, ray_t** args, int64_t nargs, int depth, const key_pure_ctx_t* ctx) {
     bool called = args != NULL;
     if (depth > 16) return false;
@@ -2325,6 +2372,9 @@ static bool key_name_pure(int64_t id, ray_t** args, int64_t nargs, int depth, co
         if (b->name != id) continue;
         key_pure_ctx_t at = key_bind_view(b);
         if (b->kind == KB_PURE) return true;
+        /* Rebound by a `let` in a loop: a later iteration, or the code
+         * after the loop, may see any of its values. */
+        if (b->kind == KB_LOOP) { if (called) return false; continue; }
         if (b->kind != KB_ARG) {
             bool pure = b->kind == KB_UNKNOWN ? !called
                       : b->kind == KB_ALIAS   ? key_name_pure(b->val->i64, args, nargs, depth + 1, &at)
@@ -2351,11 +2401,15 @@ static bool key_name_pure(int64_t id, ray_t** args, int64_t nargs, int depth, co
     }
     if (!v) v = ray_env_get_local(id);       /* a parameter or let of a frame in scope */
     if (!v) v = ray_env_get_global(id);
+    if (!v && ray_sym_is_dotted(id)) v = ray_env_get(id);   /* D.f: through the dict */
     if (!v) return !called;                  /* an unknown callee is an effect */
     if (v->type == RAY_LAMBDA) return key_lambda_call_pure(v, args, nargs, depth, ctx);
     if (v->type == RAY_UNARY || v->type == RAY_BINARY || v->type == RAY_VARY)
         return !key_impure_builtin(v, id);
-    return !called;                          /* data: calling it is an error, not an effect */
+    if (called) return false;                /* data: calling it is an error, not an effect */
+    /* A container is a value the body may take a function out of. */
+    int budget = 4096;
+    return key_container_pure(v, depth + 1, &budget, ctx);
 }
 
 /* A value whose every callable is pure: a pure lambda or builtin, data
@@ -2395,7 +2449,7 @@ static bool key_arg_callables_pure(ray_t* e, int depth, const key_pure_ctx_t* ct
             if (b->kind == KB_PURE) return true;
             if (b->kind == KB_LIT) return key_literal_call_pure(b->val, NULL, 0, depth, &at);
             if (b->kind == KB_ALIAS || (b->kind == KB_ARG && b->val)) return key_arg_callables_pure(b->val, depth + 1, &at);
-            return false;
+            return false;   /* unknown, or rebound in a loop */
         }
         ray_t* v = NULL;
         if (ctx->closure) {
@@ -2406,6 +2460,7 @@ static bool key_arg_callables_pure(ray_t* e, int depth, const key_pure_ctx_t* ct
         }
         if (!v) v = ray_env_get_local(id);
         if (!v) v = ray_env_get_global(id);
+        if (!v && ray_sym_is_dotted(id)) v = ray_env_get(id);
         return key_value_callables_pure(v, depth + 1, ctx);
     }
     if (e->type != RAY_LIST) return e->type != RAY_SYM && (ray_is_atom(e) || ray_is_vec(e));
@@ -2425,11 +2480,29 @@ static bool key_arg_callables_pure(ray_t* e, int depth, const key_pure_ctx_t* ct
  * pure, so are f's parameters.  Returns 1 pure, 0 effect, -1 not this
  * shape (the caller walks it as any call). */
 static int key_higher_order_pure(int64_t id, ray_t** es, int64_t n, int depth, key_pure_ctx_t* ctx) {
-    bool acc = id == ray_sym_intern("fold", 4) || id == ray_sym_intern("scan", 4);
-    if (!acc && id != ray_sym_intern("map", 3) && id != ray_sym_intern("pmap", 4)) return -1;
-    if (n < 3 || !key_literal_is_fn(es[1])) return -1;
+    static const char* const hof[] = {
+        "map", "pmap", "fold", "scan", "prior", "apply", "fold-while", "fold-right",
+        "scan-right", "map-left", "map-right",
+    };
+    enum { NHOF = sizeof hof / sizeof *hof };
+    static _Thread_local int64_t hof_ids[NHOF];
+    static _Thread_local uint64_t epoch;
+    if (epoch != ray_sym_epoch() || !epoch) {
+        for (size_t i = 0; i < NHOF; i++) hof_ids[i] = ray_sym_intern(hof[i], strlen(hof[i]));
+        epoch = ray_sym_epoch();
+    }
+    size_t k = 0;
+    while (k < NHOF && hof_ids[k] != id) k++;
+    if (k == NHOF || n < 2) return -1;
+    /* A local, a parameter or a capture of that name is what is called. */
+    if (key_name_shadowed(id, ctx)) return -1;
     ray_t* fn = ray_env_get_global(id);
     if (!fn || fn->type != RAY_VARY) return -1;      /* rebound by the program */
+    /* A function value is walked as any argument is: a lambda's body, a
+     * builtin's purity, a container's functions. */
+    if (!key_literal_is_fn(es[1])) return -1;
+    bool acc = k == 2 || k == 3;                      /* fold, scan: accumulator first */
+    if (k > 3 || n < 3) return -1;                    /* the shortcut: map, pmap, fold, scan */
     for (int64_t i = 2; i < n; i++)
         if (!key_arg_callables_pure(es[i], depth + 1, ctx)) return -1;
     ray_t** le = ray_data(es[1]);
@@ -2446,6 +2519,30 @@ static int key_higher_order_pure(int64_t id, ray_t** es, int64_t n, int depth, k
     for (int64_t i = 2; i < es[1]->len; i++)
         if (!key_expr_pure(le[i], depth + 1, &lctx)) return 0;
     return 1;
+}
+
+/* The names `let` binds anywhere in `expr`, outside lambda literals and
+ * quoted text, added to names[*nn] once each.  False when there are more
+ * than the walk can bind or the text is too deep. */
+static bool key_collect_lets(ray_t* expr, int64_t* names, int* nn, int depth) {
+    if (!expr || expr->type != RAY_LIST || (expr->attrs & ATTR_QUOTED) || !expr->len) return true;
+    if (depth > 32) return false;
+    ray_t** es = ray_data(expr);
+    if (es[0] && es[0]->type == -RAY_SYM && !(es[0]->attrs & ATTR_QUOTED)) {
+        int64_t id = es[0]->i64;
+        if (id == ray_sym_intern("fn", 2) || id == ray_sym_intern("quote", 5)) return true;
+        if (id == ray_sym_intern("let", 3) && expr->len == 3 && es[1] && es[1]->type == -RAY_SYM) {
+            bool seen = false;
+            for (int i = 0; i < *nn && !seen; i++) seen = names[i] == es[1]->i64;
+            if (!seen) {
+                if (*nn >= KEY_PURE_MAX_BIND) return false;
+                names[(*nn)++] = es[1]->i64;
+            }
+        }
+    }
+    for (int64_t i = 0; i < expr->len; i++)
+        if (!key_collect_lets(es[i], names, nn, depth + 1)) return false;
+    return true;
 }
 
 static bool key_expr_pure(ray_t* expr, int depth, key_pure_ctx_t* ctx) {
@@ -2491,18 +2588,35 @@ static bool key_expr_pure(ray_t* expr, int depth, key_pure_ctx_t* ctx) {
         return false;
     }
     /* After its first operand a conditional or loop form's operands may
-     * not run: a `let` there is conditional. */
-    bool branches = head->type == -RAY_SYM && key_pure_form(head->i64) &&
+     * not run: a `let` there is conditional.  In a try body a raise can
+     * skip any `let`, so the whole form is. */
+    bool is_form = head->type == -RAY_SYM && key_pure_form(head->i64);
+    bool is_try = is_form && head->i64 == ray_sym_intern("try", 3);
+    bool is_loop = is_form && (head->i64 == ray_sym_intern("while", 5) || head->i64 == ray_sym_intern("times", 5));
+    bool branches = is_form &&
         (head->i64 == ray_sym_intern("if", 2) || head->i64 == ray_sym_intern("cond", 4) ||
          head->i64 == ray_sym_intern("and", 3) || head->i64 == ray_sym_intern("or", 2) ||
-         head->i64 == ray_sym_intern("while", 5) || head->i64 == ray_sym_intern("times", 5) ||
-         head->i64 == ray_sym_intern("try", 3));
-    for (int64_t i = first_arg; i < expr->len; i++) {
-        if (branches && i == first_arg + 1) ctx->cond++;
-        bool ok = key_expr_pure(es[i], depth + 1, ctx);
-        if (!ok) { if (branches && i > first_arg) ctx->cond--; return false; }
+         is_loop || is_try);
+    int64_t cond_from = is_try ? first_arg : first_arg + 1;
+    /* A loop runs its body again: a `let` there reaches the calls before
+     * it in the next iteration, and the code after the loop.  Every name
+     * the loop rebinds is marked first, so a call through it is an effect. */
+    if (is_loop) {
+        int64_t names[KEY_PURE_MAX_BIND];
+        int nn = 0;
+        for (int64_t i = first_arg; i < expr->len; i++)
+            if (!key_collect_lets(es[i], names, &nn, 0)) return false;
+        if (ctx->n + nn > KEY_PURE_MAX_BIND) return false;
+        for (int i = 0; i < nn; i++)
+            ctx->binds[ctx->n++] = (key_bind_t){ names[i], KB_LOOP, NULL, NULL, 0, true };
     }
-    if (branches && expr->len > first_arg + 1) ctx->cond--;
+    bool in_cond = false;
+    for (int64_t i = first_arg; i < expr->len; i++) {
+        if (branches && i == cond_from) { ctx->cond++; in_cond = true; }
+        bool ok = key_expr_pure(es[i], depth + 1, ctx);
+        if (!ok) { if (in_cond) ctx->cond--; return false; }
+    }
+    if (in_cond) ctx->cond--;
     return true;
 }
 

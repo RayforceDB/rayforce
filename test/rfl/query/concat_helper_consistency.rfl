@@ -68,6 +68,20 @@ G -- 700
 (at (select {a: (* x 2) r: (+ (bump a) (hgr x)) from: TG}) 'r) -- (+ (til 20) (* 100 (+ 1 (til 20))))
 (set G 0)
 (at (select {r: (+ (bump x) (hgr x)) e: (reverse x) from: TG}) 'r) -- (+ (til 20) (* 100 (+ 1 (til 20))))
+;; ... and so is an effect the expression reaches through a let in a loop, a
+;; let after a raise, or a function value a builtin calls
+(set pidG (fn [x] x))
+(set G 0)
+(set bumpL (fn [v] (let g pidG) (times 2 (do (g v) (let g (fn [y] (bump y))))) 0))
+(at (update {r: (+ (bumpL x) (hg x)) by: k from: TG}) 'r) -- [121 224 327 430 533 636 719 121 224 327 430 533 636 719 121 224 327 430 533 636]
+(set G 0)
+(set bumpT (fn [v] (let g (fn [y] (bump y))) (try (do (raise "x") (let g pidG)) (fn [e] 0)) (g v) 0))
+(at (update {r: (+ (bumpT x) (hg x)) by: k from: TG}) 'r) -- [121 224 327 430 533 636 719 121 224 327 430 533 636 719 121 224 327 430 533 636]
+(set G 0)
+(set DG (dict ['b] (list bump)))
+(at (update {r: (+ (first (map DG.b (enlist x))) (hg x)) by: k from: TG}) 'r) -- [121 224 327 430 533 636 719 121 224 327 430 533 636 719 121 224 327 430 533 636]
+(set G 0)
+(at (update {r: (+ (first (map (at DG 'b) (enlist x))) (hg x)) by: k from: TG}) 'r) -- [121 224 327 430 533 636 719 121 224 327 430 533 636 719 121 224 327 430 533 636]
 ;; ... and a pure expression, inlined once for every group, reads it as well
 (set G 1000)
 (at (update {r: (hg x) by: k from: TG}) 'r) -- [1021 1024 1027 1030 1033 1036 1019 1021 1024 1027 1030 1033 1036 1019 1021 1024 1027 1030 1033 1036]
