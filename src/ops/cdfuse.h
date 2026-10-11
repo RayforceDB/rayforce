@@ -44,4 +44,14 @@
  * canonical bit encodings; callers restore the source logical type. */
 ray_t* ray_cd_fused(ray_t* key_col, ray_t* val_col, int64_t nrows);
 
+/* The route for a `(count (distinct X))` grouped by K_cols[0..n_K) over
+ * nrows rows (#756): true for the two-pass rewrite — group by (K, X), then
+ * count per K — false for grouping by K and counting distinct X over each
+ * group's slice.  Decided from sampled cardinality estimates
+ * (agg_group_card_sample): the rewrite where its (K, X) grouping is dense,
+ * past a million groups, and between 256 K and a million groups when the
+ * (K, X) tuples dedup below three quarters of the rows; the slices
+ * otherwise. */
+bool ray_cd_two_pass_preferred(ray_t** K_cols, int n_K, ray_t* X_col, int64_t nrows);
+
 #endif /* RAY_OPS_CDFUSE_H */

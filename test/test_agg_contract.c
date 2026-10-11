@@ -2464,8 +2464,90 @@ static test_result_t test_card_estimate(void) {
     PASS();
 }
 
+/* The route gate for a grouped distinct count (ray_cd_two_pass_preferred,
+ * #756): the two-pass rewrite (true) against the slice dedup (false), from
+ * the estimates above over 1,048,576 rows.  Each case turns on one rule. */
+static test_result_t test_cd_route(void) {
+    const int64_t N = 1048576;
+    ray_t* setup = ray_eval_str("(set cr (til 1048576))");
+    TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+    ray_release(setup);
+    ray_t* k[2];
+    ray_t* x;
+
+    /* dense: 45 groups x 100 values pack within the rows */
+    k[0] = ray_eval_str("(% cr 45)");
+    x = ray_eval_str("(% cr 100)");
+    TEST_ASSERT_TRUE(ray_cd_two_pass_preferred(k, 1, x, N));
+    ray_release(x);
+    /* 45 groups x a million values: the (K, X) pass would be radix */
+    x = ray_eval_str("cr");
+    TEST_ASSERT_FALSE(ray_cd_two_pass_preferred(k, 1, x, N));
+    ray_release(k[0]); ray_release(x);
+
+    /* 100,000 groups, below the scatter's 256 K: the slices, though the
+     * (K, X) tuples (X determines K) would dedup to a fifth of the rows */
+    k[0] = ray_eval_str("(% cr 100000)");
+    x = ray_eval_str("(% cr 200000)");
+    TEST_ASSERT_FALSE(ray_cd_two_pass_preferred(k, 1, x, N));
+    ray_release(k[0]); ray_release(x);
+
+    /* 524,288 groups of 19 rows over 10 M rows, within the band: the
+     * tuples decide — a twentieth of the rows (K determines X) take the
+     * rewrite, every row distinct the slices */
+    setup = ray_eval_str("(set c10 (til 10000000))");
+    TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+    ray_release(setup);
+    k[0] = ray_eval_str("(% c10 524288)");
+    x = ray_eval_str("(% c10 262144)");
+    TEST_ASSERT_TRUE(ray_cd_two_pass_preferred(k, 1, x, 10000000));
+    ray_release(x);
+    x = ray_eval_str("c10");
+    TEST_ASSERT_FALSE(ray_cd_two_pass_preferred(k, 1, x, 10000000));
+    ray_release(k[0]); ray_release(x);
+    /* the same two over a sorted key, read through the blocks */
+    k[0] = ray_eval_str("(div c10 19)");
+    x = ray_eval_str("(div c10 38)");
+    TEST_ASSERT_TRUE(ray_cd_two_pass_preferred(k, 1, x, 10000000));
+    ray_release(x);
+    x = ray_eval_str("c10");
+    TEST_ASSERT_FALSE(ray_cd_two_pass_preferred(k, 1, x, 10000000));
+    ray_release(k[0]); ray_release(x);
+    /* a composite of periods 1,000 and 1,009 — 1,009,000 groups, within
+     * the band, whose tuples beside a 50-value X are the groups: the
+     * rewrite (the usual test data, which a sample at a fixed phase of the
+     * keys misread; see test_card_estimate) */
+    k[0] = ray_eval_str("(% c10 1000)");
+    k[1] = ray_eval_str("(% c10 1009)");
+    x = ray_eval_str("(% c10 50)");
+    TEST_ASSERT_TRUE(ray_cd_two_pass_preferred(k, 2, x, 10000000));
+    ray_release(k[0]); ray_release(k[1]); ray_release(x);
+
+    /* past a million groups: the rewrite whatever the tuples */
+    setup = ray_eval_str("(set c2 (til 2097152))");
+    TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+    ray_release(setup);
+    k[0] = ray_eval_str("c2");
+    x = ray_eval_str("(% c2 2)");
+    TEST_ASSERT_TRUE(ray_cd_two_pass_preferred(k, 1, x, 2 * N));
+    ray_release(k[0]); ray_release(x);
+
+    /* a key the estimate does not cover takes the rewrite; a value it does
+     * not cover the slices */
+    k[0] = ray_eval_str("(as 'F64 cr)");
+    x = ray_eval_str("(% cr 100)");
+    TEST_ASSERT_TRUE(ray_cd_two_pass_preferred(k, 1, x, N));
+    ray_release(k[0]); ray_release(x);
+    k[0] = ray_eval_str("(% cr 45)");
+    x = ray_eval_str("(as 'F64 cr)");
+    TEST_ASSERT_FALSE(ray_cd_two_pass_preferred(k, 1, x, N));
+    ray_release(k[0]); ray_release(x);
+    PASS();
+}
+
 const test_entry_t agg_contract_entries[] = {
     { "agg_contract/card_estimate", test_card_estimate, contract_setup, contract_teardown },
+    { "agg_contract/cd_route", test_cd_route, contract_setup, contract_teardown },
     { "agg_contract/empty_inference_errors", test_empty_inference_errors, contract_setup, contract_teardown },
     { "agg_contract/nth_bounds", test_nth_bounds, contract_setup, contract_teardown },
     { "agg_contract/native_binary_output", test_native_binary_output, contract_setup, contract_teardown },
