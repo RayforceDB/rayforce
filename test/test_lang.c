@@ -309,7 +309,7 @@ static test_result_t test_closure_sym_walk_guard(void) {
         TEST_ASSERT_FALSE(RAY_IS_ERR(ast));
         bool dynamic = false;
         int64_t weight = 0;
-        ray_t* ment = ray_closure_mentioned_syms(ast, false, &dynamic, &weight);
+        ray_t* ment = ray_closure_mentioned_syms(ast, &dynamic, &weight);
         if (i == 0) {
             TEST_ASSERT(ment != NULL, "a body within the guard is walked");
             TEST_ASSERT_EQ_I(ment->len, 1);

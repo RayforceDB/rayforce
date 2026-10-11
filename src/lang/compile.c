@@ -232,7 +232,7 @@ static void emit_jump_back(compiler_t *c, int32_t target) {
 
 /* Cached sym IDs for special forms */
 static _Thread_local int64_t sf_set = -1, sf_let = -1, sf_if = -1, sf_do = -1, sf_while = -1, sf_times = -1, sf_fn = -1, sf_self = -1, sf_try = -1, sf_return = -1, sf_null = -1;
-static _Thread_local int64_t sf_eval = -1, sf_resolve = -1, sf_quote = -1;
+static _Thread_local int64_t sf_eval = -1, sf_resolve = -1;
 
 static void init_sf_syms(void) {
     if (sf_set >= 0) return;
@@ -249,7 +249,6 @@ static void init_sf_syms(void) {
     sf_null   = ray_sym_intern("null", 4);
     sf_eval    = ray_sym_intern("eval", 4);
     sf_resolve = ray_sym_intern("resolve", 7);
-    sf_quote   = ray_sym_intern("quote", 5);
 }
 
 /* Does `ast` mention any of the current locals — or `self`, or a
@@ -831,51 +830,16 @@ static bool closure_shape_ok(ray_t *closure) {
  * dicts), appended to the I64 vector *out without duplicates.  *dynamic is
  * set when the text mentions `eval` or `resolve`, which can reach a name
  * that is not spelled out. */
-static bool ast_collect_syms_at(ray_t *ast, ray_t **out, bool *dynamic, int depth, int64_t *weight,
-                                bool stop, bool skip_quote, bool *skipped);
-static bool syms_contain(ray_t *syms, int64_t id);
-
-/* The symbols `n` text nodes mention (see ast_collect_syms_at).  Quoted
- * text names nothing while `quote` is the special form, so its contents
- * are weighed but not walked; `quote_bound` (a parameter or capture of
- * the lambda is named quote) or the name appearing anywhere else in the
- * text (a parameter, a `let`, a value: it may be a local where it is
- * called) makes the walk take every node instead. */
-static bool ast_collect_names(ray_t **nodes, int64_t n, ray_t **out, bool *dynamic, int64_t *weight,
-                              bool stop, bool quote_bound) {
-    bool skipped = false;
-    bool ok = true;
-    for (int64_t i = 0; i < n && ok; i++)
-        ok = ast_collect_syms_at(nodes[i], out, dynamic, 0, weight, stop, !quote_bound, &skipped);
-    if (!ok || !skipped || !syms_contain(*out, sf_quote)) return ok;
-    (*out)->len = 0;
-    *dynamic = false;
-    *weight = 0;
-    for (int64_t i = 0; i < n && ok; i++)
-        ok = ast_collect_syms_at(nodes[i], out, dynamic, 0, weight, stop, false, &skipped);
-    return ok;
-}
-
-static bool ast_collect_syms(ray_t *ast, ray_t **out, bool *dynamic, bool quote_bound) {
+static bool ast_collect_syms_at(ray_t *ast, ray_t **out, bool *dynamic, int depth, int64_t *weight, bool stop);
+/* Every name `ast` mentions, for a closure's capture set.  The walk stops
+ * once the text weighs more than the template bound: the caller then
+ * treats the names as unknown and binds every capture, so a heavy
+ * constant (a list shared 2^22 times over, say) costs a bounded walk. */
+static bool ast_collect_syms(ray_t *ast, ray_t **out, bool *dynamic) {
     int64_t weight = 0;
-    ray_t *nodes[1] = { ast };
-    return ast_collect_names(nodes, 1, out, dynamic, &weight, false, quote_bound);
+    return ast_collect_syms_at(ast, out, dynamic, 0, &weight, true);
 }
 
-/* A symbol vector (a parameter list) or a dict's keys naming quote. */
-static bool syms_name_quote(ray_t *syms) {
-    if (!syms || syms->type != RAY_SYM) return false;
-    for (int64_t i = 0; i < syms->len; i++)
-        if (ray_read_sym(ray_data(syms), i, RAY_SYM, syms->attrs) == sf_quote) return true;
-    return false;
-}
-
-bool ray_lambda_binds_quote(ray_t *lambda) {
-    init_sf_syms();
-    ray_t *closure = LAMBDA_CLOSURE(lambda);
-    return syms_name_quote(LAMBDA_PARAMS(lambda)) ||
-           (closure && closure->type == RAY_DICT && syms_name_quote(ray_dict_keys(closure)));
-}
 /* The bytes a value spliced into text holds whole: a table's columns, a
  * lambda's parameters, body and captures, recursively.  Shared children
  * count each time they are reached (an overestimate), so the walk stops as
@@ -935,8 +899,7 @@ static int64_t ast_node_bytes(ray_t *v, int64_t cap) {
  * given up on (the literal then has no template and compiles when called). */
 /* `stop`: the walk serves only the template table, which will not keep a
  * literal past its bound, so it gives up (false) once the weight passes it. */
-static bool ast_collect_syms_at(ray_t *ast, ray_t **out, bool *dynamic, int depth, int64_t *weight,
-                                bool stop, bool skip_quote, bool *skipped) {
+static bool ast_collect_syms_at(ray_t *ast, ray_t **out, bool *dynamic, int depth, int64_t *weight, bool stop) {
     if (!ast || !*out) return false;
     if (depth > 1024) return false;
     /* Past the template bound the exact weight does not matter. */
@@ -964,23 +927,14 @@ static bool ast_collect_syms_at(ray_t *ast, ray_t **out, bool *dynamic, int dept
     }
     if (ast->type == RAY_LIST) {
         ray_t **elems = (ray_t**)ray_data(ast);
-        /* Quoted text names nothing the body reaches (only eval or resolve
-         * could, and either makes every capture count): weigh it, bounded,
-         * without walking it for names. */
-        if (skip_quote && ast->len == 2 && elems[0] && elems[0]->type == -RAY_SYM &&
-            !(elems[0]->attrs & ATTR_QUOTED) && elems[0]->i64 == sf_quote) {
-            *skipped = true;
-            *weight += ast_value_bytes(elems[1], RAY_CLOSURE_TMPL_MAX_BYTES - *weight);
-            return !(stop && *weight > RAY_CLOSURE_TMPL_MAX_BYTES);
-        }
         for (int64_t i = 0; i < ast->len; i++)
-            if (!ast_collect_syms_at(elems[i], out, dynamic, depth + 1, weight, stop, skip_quote, skipped)) return false;
+            if (!ast_collect_syms_at(elems[i], out, dynamic, depth + 1, weight, stop)) return false;
         return true;
     }
     if (ast->type == RAY_DICT) {
         ray_t **slots = (ray_t**)ray_data(ast);
-        return ast_collect_syms_at(slots[0], out, dynamic, depth + 1, weight, stop, skip_quote, skipped) &&
-               ast_collect_syms_at(slots[1], out, dynamic, depth + 1, weight, stop, skip_quote, skipped);
+        return ast_collect_syms_at(slots[0], out, dynamic, depth + 1, weight, stop) &&
+               ast_collect_syms_at(slots[1], out, dynamic, depth + 1, weight, stop);
     }
     return true;
 }
@@ -995,8 +949,9 @@ static bool syms_contain(ray_t *syms, int64_t id) {
 /* The capture names a closure body can reach: the closure dict's keys that
  * the body mentions (every key when the body uses eval or resolve), never
  * `self`.  A SYM vector the caller releases, or NULL for none.  *failed is
- * set when the body could not be walked (nesting past the walk's guard, or
- * an allocation failure): NULL then means "unknown", not "none", and the
+ * set when the body could not be walked (nesting past the walk's guard,
+ * text heavier than the template bound, or an allocation failure): NULL
+ * then means "unknown", not "none", and the
  * body must not be compiled without its captures. */
 static ray_t *closure_capture_names(ray_t *lambda, bool *failed) {
     *failed = false;
@@ -1008,7 +963,7 @@ static ray_t *closure_capture_names(ray_t *lambda, bool *failed) {
     ray_t *mentioned = ray_vec_new(RAY_I64, 16);
     if (!mentioned || RAY_IS_ERR(mentioned)) { *failed = true; return NULL; }
     bool dynamic = false;
-    bool ok = ast_collect_syms(LAMBDA_BODY(lambda), &mentioned, &dynamic, ray_lambda_binds_quote(lambda));
+    bool ok = ast_collect_syms(LAMBDA_BODY(lambda), &mentioned, &dynamic);
     ray_t *names = ok ? ray_sym_vec_new(RAY_SYM_W64, keys->len) : NULL;
     if (!names || RAY_IS_ERR(names)) *failed = true;
     if (names && !RAY_IS_ERR(names)) {
@@ -1081,11 +1036,9 @@ static bool compile_fn_template_at(compiler_t *c, ray_t *ast) {
     ray_t *mentioned = ray_vec_new(RAY_I64, 16);
     if (!mentioned || RAY_IS_ERR(mentioned)) { if (own_params) ray_release(params); return false; }
     bool dynamic = false, ok = true;
-    /* `quote` as a parameter of the literal, or a local it can capture. */
-    bool quote_bound = syms_name_quote(params);
-    for (int32_t i = 0; i < c->n_locals && !quote_bound; i++) quote_bound = c->locals[i].sym_id == sf_quote;
     int64_t tweight = 0;
-    ok = ast_collect_names(elems + 2, n - 2, &mentioned, &dynamic, &tweight, false, quote_bound);
+    for (int64_t i = 2; i < n && ok; i++)
+        ok = ast_collect_syms_at(elems[i], &mentioned, &dynamic, 0, &tweight, true);
     if (!ok) { ray_release(mentioned); if (own_params) ray_release(params); return false; }
 
     /* Capture names and the enclosing slots they come from, in slot order. */
@@ -1155,14 +1108,13 @@ ray_t *ray_closure_capture_names(ray_t *lambda) { bool failed; return closure_ca
  * it uses eval or resolve; NULL on allocation failure, nesting past the
  * walk's guard, or a weight past RAY_CLOSURE_TMPL_MAX_BYTES (the walk
  * stops there: the template table would not keep the literal). */
-ray_t *ray_closure_mentioned_syms(ray_t *body, bool quote_bound, bool *dynamic, int64_t *weight) {
+ray_t *ray_closure_mentioned_syms(ray_t *body, bool *dynamic, int64_t *weight) {
     init_sf_syms();
     ray_t *mentioned = ray_vec_new(RAY_I64, 16);
     if (!mentioned || RAY_IS_ERR(mentioned)) return NULL;
     *dynamic = false;
     *weight = 0;
-    ray_t *nodes[1] = { body };
-    if (!ast_collect_names(nodes, 1, &mentioned, dynamic, weight, true, quote_bound)) { if (mentioned) ray_release(mentioned); return NULL; }
+    if (!ast_collect_syms_at(body, &mentioned, dynamic, 0, weight, true)) { if (mentioned) ray_release(mentioned); return NULL; }
     return mentioned;
 }
 
@@ -1355,5 +1307,5 @@ ray_span_t ray_bc_dbg_get(ray_t* dbg, int32_t ip) {
 
 void ray_compile_reset(void) {
     sf_set = sf_let = sf_if = sf_do = sf_fn = sf_self = sf_try = sf_return = sf_null = -1;
-    sf_eval = sf_resolve = sf_quote = -1;
+    sf_eval = sf_resolve = -1;
 }

@@ -479,3 +479,19 @@ r6 -- [6 3]
 (hn2 [1 2 3]) -- [2 4 6]
 (set Tar (table [x k] (list [1 2 3 4] [1 1 2 2])))
 (at (update {v: (+ (sum (hn2 (+ x 1))) (count (distinct x))) by: k from: Tar}) 'v) -- [12 12 20 20]
+;; quote set globally to a function: (quote x) in a closure body is a call
+;; through it, so x is captured, whoever made the closure and however often
+;; it is called (the builtin binding is restored after)
+(set qsave quote)
+(set quote (fn [x] (* x 100)))
+(quote 2) -- 200
+(set mkqg (fn [x] (fn [] (quote x))))
+((mkqg 3)) -- 300
+(set mkqgi (fn [x] (if false (set 1 2)) (fn [] (quote x))))
+((mkqgi 3)) -- 300
+(set cqg (mkqg 4))
+(list (cqg) (cqg)) -- [400 400]
+(set mkqg2 (fn [x y] (fn [] (+ y (quote x)))))
+((mkqg2 3 1)) -- 301
+(set quote qsave)
+(quote x) -- 'x

@@ -2280,7 +2280,7 @@ static void closure_share_template(ray_t* lambda) {
     /* A new literal, or a known one with another capture set. */
     bool dynamic = false;
     int64_t weight = 0;
-    ray_t* mentioned = ray_closure_mentioned_syms(body, ray_lambda_binds_quote(lambda), &dynamic, &weight);
+    ray_t* mentioned = ray_closure_mentioned_syms(body, &dynamic, &weight);
     if (!mentioned) return;
     if (weight > CLOSURE_TMPL_MAX_BYTES) {
         /* A literal built around a large constant is not kept: the table
@@ -2366,7 +2366,7 @@ static void definition_compile(ray_t* lambda) {
     }
     bool dynamic = false;
     int64_t weight = 0;
-    ray_t* mentioned = ray_closure_mentioned_syms(body, ray_lambda_binds_quote(lambda), &dynamic, &weight);
+    ray_t* mentioned = ray_closure_mentioned_syms(body, &dynamic, &weight);
     if (!mentioned || weight > CLOSURE_TMPL_MAX_BYTES) {
         if (mentioned) ray_release(mentioned);
         ray_compile(lambda);
