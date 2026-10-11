@@ -21,6 +21,10 @@
  *   SOFTWARE.
  */
 
+/* open, mkdir, getpid: POSIX beyond C17. */
+#if !defined(_GNU_SOURCE) && !defined(_WIN32)
+#define _GNU_SOURCE
+#endif
 #include "test.h"
 #include <rayforce.h>
 #include <rayforce.h>
@@ -28,6 +32,11 @@
 #include "mem/heap.h"
 #include <stdatomic.h>
 #include <string.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 /* ---- test_vm_alloc_free ------------------------------------------------ */
 
@@ -113,6 +122,49 @@ static test_result_t test_cgroup_mem_limit(void) {
     PASS();
 }
 
+#ifdef RAY_OS_LINUX
+static void plat_write(const char* dir, const char* name, const char* text) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s/%s", dir, name);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return;
+    ssize_t n = write(fd, text, strlen(text));
+    (void)n;
+    close(fd);
+}
+static void plat_unlink(const char* dir, const char* name) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s/%s", dir, name);
+    unlink(path);
+}
+#endif
+
+/* The cgroup directory goes with the limit: there is one exactly when a
+ * limit is in force.  Its memory.stat is read for what reading does — the
+ * kernel flushes the cgroup's statistics — here in a directory of the
+ * test's own too, and a directory without the file reads nothing. */
+static test_result_t test_cgroup_stat_flush(void) {
+    char dir[512];
+    bool has = ray_os_cgroup_mem_dir(dir, sizeof(dir));
+    TEST_ASSERT(has == (ray_os_cgroup_mem_limit() > 0), "a cgroup directory exactly with a limit");
+    if (has) TEST_ASSERT(ray_os_cgroup_stat_flush(dir), "and its statistics read");
+    TEST_ASSERT(!ray_os_cgroup_stat_flush(NULL) && !ray_os_cgroup_stat_flush(""),
+                "no cgroup: nothing read");
+#ifdef RAY_OS_LINUX
+    char tmp[64];
+    snprintf(tmp, sizeof(tmp), "/tmp/rayforce_cg_%d", (int)getpid());
+    TEST_ASSERT(mkdir(tmp, 0700) == 0, "a cgroup directory of our own");
+    bool none = !ray_os_cgroup_stat_flush(tmp);
+    plat_write(tmp, "memory.stat", "anon 1\nfile 2\n");
+    bool read = ray_os_cgroup_stat_flush(tmp);
+    plat_unlink(tmp, "memory.stat");
+    rmdir(tmp);
+    TEST_ASSERT(none, "no memory.stat: nothing read");
+    TEST_ASSERT(read, "its memory.stat read");
+#endif
+    PASS();
+}
+
 /* ---- Suite definition -------------------------------------------------- */
 
 const test_entry_t platform_entries[] = {
@@ -121,6 +173,7 @@ const test_entry_t platform_entries[] = {
     { "platform/thread_count", test_thread_count, NULL, NULL },
     { "platform/thread_create_join", test_thread_create_join, NULL, NULL },
     { "platform/cgroup_mem_limit", test_cgroup_mem_limit, NULL, NULL },
+    { "platform/cgroup_stat_flush", test_cgroup_stat_flush, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
 

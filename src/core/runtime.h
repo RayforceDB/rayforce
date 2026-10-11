@@ -158,6 +158,7 @@ typedef struct ray_runtime_s {
     int32_t          n_vms;
     int64_t          total_ram;    /* total physical RAM, bytes */
     int64_t          ram_limit;    /* min(total_ram, cgroup limit) — default anon watermark */
+    char             mem_cg[512];  /* limiting cgroup's directory; "" = the machine */
     void            *poll;         /* opaque ray_poll_t* — see ray_runtime_(set|get)_poll */
     void            *sys_args;     /* opaque ray_t* dict — see ray_runtime_(set|get)_sys_args */
 } ray_runtime_t;
@@ -169,6 +170,10 @@ extern _Thread_local ray_vm_t *__VM;
 /* Lifecycle */
 ray_runtime_t* ray_runtime_create(int argc, char** argv);
 void           ray_runtime_destroy(ray_runtime_t* rt);
+
+/* Flush the statistics of the cgroup that limits the process
+ * (ray_os_cgroup_stat_flush); nothing outside a limiting cgroup. */
+void ray_sys_mem_flush(void);
 
 /* Main event-loop accessors.  The host (main.c) registers the poll it
  * created; runtime-level builtins read it back through these to avoid
