@@ -324,6 +324,13 @@
 (select {c: (count x) by: (reverse x) from: Trk where: (> x 1)}) -- (select {c: (count x) by: ((fn [a] (reverse a)) x) from: Trk where: (> x 1)})
 (select {by: (distinct x) from: Trk}) !- length
 (select {c: (count x) by: (distinct x) from: Trk}) !- length
+;; an unknown column reads as schema, lowered or not; an unknown function
+;; stays a name error
+(select {c: (count x) by: (reverse nosuch) from: Trk}) !- schema
+(select {by: (reverse nosuch) from: Trk}) !- schema
+(select {c: (count x) by: (+ nosuch 1) from: Trk}) !- schema
+(select {c: (count x) by: (reverse nosuch) from: Trk where: (> x 1)}) !- schema
+(select {c: (count x) by: (nosuchfn x) from: Trk}) !- name
 ;; text concat is still planned, and groups the same
 (at (select {c: (count x) by: (concat s "z") from: Trk}) 'c) -- [3 2 1]
 ;; one value is one group, holding the first row

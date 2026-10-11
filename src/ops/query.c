@@ -10257,6 +10257,40 @@ static ray_t* select_dict_with_from(ray_t* dict, ray_t* tbl) {
     return ray_dict_new(ck, cv);
 }
 
+static ray_t* sym_binding(int64_t s);
+
+/* The first free name in key `e` that is no column of `tbl` and no bound
+ * name, or -1.  A lambda written in the key is skipped: its names resolve
+ * when it runs.  A let binds its name for its body. */
+static int64_t key_unknown_name(ray_t* e, ray_t* tbl, int64_t* bound, int nbound) {
+    if (!e) return -1;
+    if (e->type == -RAY_SYM) {
+        if (e->attrs & ATTR_QUOTED) return -1;
+        if (ray_table_get_col(tbl, e->i64)) return -1;
+        if (ray_sym_is_dotted(e->i64)) {
+            const int64_t* segs;
+            if (ray_sym_segs(e->i64, &segs) >= 1 && ray_table_get_col(tbl, segs[0])) return -1;
+        }
+        for (int i = 0; i < nbound; i++) if (bound[i] == e->i64) return -1;
+        return sym_binding(e->i64) ? -1 : e->i64;
+    }
+    if (e->type != RAY_LIST || e->len < 1) return -1;
+    ray_t** el = (ray_t**)ray_data(e);
+    if (select_sym_is(el[0], "fn", 2) || select_sym_is(el[0], "quote", 5)) return -1;
+    if (select_sym_is(el[0], "let", 3) && e->len == 4 && el[1]->type == -RAY_SYM) {
+        int64_t m = key_unknown_name(el[2], tbl, bound, nbound);
+        if (m >= 0 || nbound >= 32) return m;
+        bound[nbound] = el[1]->i64;
+        return key_unknown_name(el[3], tbl, bound, nbound + 1);
+    }
+    /* a named head is a function, whose own error stands */
+    for (int64_t i = el[0]->type == -RAY_SYM ? 1 : 0; i < e->len; i++) {
+        int64_t m = key_unknown_name(el[i], tbl, bound, nbound);
+        if (m >= 0) return m;
+    }
+    return -1;
+}
+
 static bool parted_clauses_plain(ray_t* dict);
 
 /* The columns of a parted table a select reads, flattened: every column a
@@ -10336,6 +10370,14 @@ static ray_t* select_plan_computed_key(ray_t* dict, ray_t* tbl, int64_t* key_nam
         bool lowered = g && compile_expr_dag(g, by_expr) != NULL;
         if (g) ray_graph_free(g);
         if (!lowered) {
+            /* An unknown column reads as schema, as in a key that lowers. */
+            int64_t kb[32];
+            int64_t miss = key_unknown_name(by_expr, tbl, kb, 0);
+            if (miss >= 0) {
+                ray_t* mn = ray_sym_str(miss);
+                return mn ? ray_error("schema", "column '%.*s' not found", (int)ray_str_len(mn), ray_str_ptr(mn))
+                          : ray_error("schema", "column not found");
+            }
             /* The key sees only the rows `where:` keeps, as a planned key
              * does, so a helper never runs on rows the filter removes. */
             ray_t* where_expr = dict_get(dict, "where");
