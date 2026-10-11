@@ -2761,6 +2761,7 @@ static void relieve_write(const char* path, const char* text) {
     close(fd);
 }
 
+#if defined(__linux__)
 /* A cgroup directory of the test's own, with a memory.stat, where the
  * runtime is pointed (ray_sys_mem_flush).  relieve_cgroup_ok, or
  * relieve_env_end, puts the runtime back. */
@@ -2773,6 +2774,7 @@ static void relieve_cgroup(relieve_env_t* e) {
 #endif
     snprintf(__RUNTIME->mem_cg, sizeof(__RUNTIME->mem_cg), "%s", e->cg);
 }
+#endif
 /* A boundary far from the watermark that visits the heaps: one does at most
  * every so often (ray_heap_relieve), or at the first after the watermark is
  * set, as here. */
@@ -3211,6 +3213,7 @@ static test_result_t test_relieve_spill_pools(void) {
     PASS();
 }
 
+#if defined(__linux__)
 /* This thread's cancelled_write_bytes (/proc/thread-self/io): dirty pages it
  * dropped from the page cache unwritten; -1 where it cannot be read. */
 static int64_t relieve_cancelled(void) {
@@ -3228,6 +3231,7 @@ static int64_t relieve_cancelled(void) {
     return -1;
 #endif
 }
+#endif
 
 /* An empty spill pool parked at a boundary keeps its file and its mapping
  * for the next statement that spills, but its pages — dead data — are
@@ -3337,6 +3341,7 @@ static test_result_t test_relieve_spill_fallback(void) {
     PASS();
 }
 
+#if defined(__linux__)
 /* The open spill files of this process, or of a child it starts (popen, as
  * .sys.exec): `who` is "$PPID" — popen's shell is our child — or "self". */
 static int relieve_spill_fds(const char* who) {
@@ -3350,6 +3355,7 @@ static int relieve_spill_fds(const char* who) {
     pclose(f);
     return n;
 }
+#endif
 
 /* Every spill file is close-on-exec: a child the process starts (.sys.exec)
  * holds none of the files of its spill pools or spilled large or off-heap
