@@ -1268,6 +1268,14 @@ static ray_op_t* ap_s_notin_empty(ray_graph_t* g) {
     ray_t* set = aw_sym_set(g_sin_empty, 2);
     ray_op_t* o = ray_not_in(g, ray_scan(g, "s"), ray_const_vec(g, set)); ray_release(set); return o;
 }
+/* every member absent from the file domain: an empty probe, so no verdict
+ * LUT is built and the nullable column takes exec_in's null-checked loop
+ * (id-0 rows pass neither `in` nor `not in`) */
+static const char* const g_sin_none[] = { "zz-absent", "zz-absent2" };
+static ray_op_t* ap_s_notin_none(ray_graph_t* g) {
+    ray_t* set = aw_sym_set(g_sin_none, 2);
+    ray_op_t* o = ray_not_in(g, ray_scan(g, "s"), ray_const_vec(g, set)); ray_release(set); return o;
+}
 static ray_op_t* ap_s_notin_far(ray_graph_t* g) {
     ray_t* set = aw_sym_set(g_sin_far, 2);
     ray_op_t* o = ray_not_in(g, ray_scan(g, "s"), ray_const_vec(g, set)); ray_release(set); return o;
@@ -1333,10 +1341,10 @@ static test_result_t test_sym_membership(void) {
     if ((r = aw_sel_same("sy", ap_s_shared, -1)).status != TEST_PASS) return r;
     /* the answers by construction (raw-id semantics: "" == "" holds and
      * "" != c holds for every other c) */
-    int64_t n7 = 0, ne = 0, n2 = 0, n5 = 0;
+    int64_t n7 = 0, ne = 0, n2 = 0;
     for (int64_t j = 0; j < 200000; j++) {
         int v = aw_sy_val(j);
-        n7 += v == 7; ne += v < 0; n2 += v == 2; n5 += v == 5;
+        n7 += v == 7; ne += v < 0; n2 += v == 2;
     }
     /* the short last vector (rows 199680..199999, chunk 3, with "" rows)
      * is RAW: no view, so a predicate its statistics leave open decodes
@@ -1355,7 +1363,6 @@ static test_result_t test_sym_membership(void) {
         TEST_ASSERT_EQ_I(aw_sel_count("sy", gen, ap_s_sym_left, NULL), 200000 - n2);
         TEST_ASSERT_EQ_I(aw_sel_count("sy", gen, ap_s_shared, NULL), 200000 - ne);
     }
-    (void)n5;
     /* the same answers through the unfused executor (generation 0) and
      * through rayfall on both generations, STR and SYM literals */
     static const char* const qs[] = {
@@ -1377,8 +1384,13 @@ static test_result_t test_sym_membership(void) {
                         got && !RAY_IS_ERR(got) ? (long long)got->i64 : -1LL, (long long)want);
         ray_release(got);
     }
-    /* ordered compares on SYM still decode and order strings (#738): the
-     * fused compiler keeps EXPR_BAIL_SYM_DOMAIN */
+    /* ordered compares on a file-domain SYM column keep
+     * EXPR_BAIL_SYM_DOMAIN (the fused program never orders ids).  This pins
+     * only the bail and generation 0 == generation 2 == the unfused
+     * executor: on this branch the unfused executor still orders file-domain
+     * SYM by raw file ids (the #738 fix is on dev), so the pinned count is
+     * not the string-order count.  Revisit (a by-construction string-order
+     * oracle) when dev's #738 is merged. */
     {
         ray_t* t = aw_load("sy", 0);
         ray_graph_t* g = ray_graph_new(t);
@@ -1417,7 +1429,7 @@ static test_result_t test_sym_membership(void) {
  * without "" rows); the rest is answered on the views' ids.  Generation 0
  * (the unchanged in-place kernel) is the reference. */
 static test_result_t test_sym_in_bounds(void) {
-    aw_save("sy", "(table [s] (list (as 'SYMBOL (map (fn [j] (if (and (>= j 65536) (== 0 (% j 3))) \"\" "
+    aw_save("sb", "(table [s] (list (as 'SYMBOL (map (fn [j] (if (and (>= j 65536) (== 0 (% j 3))) \"\" "
                   "(format \"w%\" (+ (* 4 (div j 65536)) (% j 4))))) (til 200000)))))", -1);
     test_result_t r;
     /* decoded bytes: only the RAW tail vector (320 W8 ids, with "" rows)
@@ -1428,10 +1440,21 @@ static test_result_t test_sym_in_bounds(void) {
     ray_op_t* (*const shapes[])(ray_graph_t*) = { ap_s_in, ap_s_notin, ap_s_in_empty, ap_s_notin_empty, ap_s_notin_far };
     static const int64_t dec[] = { 0, 320, 0, 320, 320 };
     for (size_t i = 0; i < sizeof shapes / sizeof shapes[0]; i++)
-        if ((r = aw_sel_same("sy", shapes[i], dec[i])).status != TEST_PASS) { fprintf(stderr, "shape %zu\n", i); return r; }
+        if ((r = aw_sel_same("sb", shapes[i], dec[i])).status != TEST_PASS) { fprintf(stderr, "shape %zu\n", i); return r; }
     int64_t nin = 0;
     for (int64_t j = 0; j < 200000; j++) { int v = aw_sy_val(j); nin += v == 7 || v == 1; }
-    TEST_ASSERT_EQ_I(aw_sel_count("sy", 2, ap_s_in, NULL), nin);
+    TEST_ASSERT_EQ_I(aw_sel_count("sb", 2, ap_s_in, NULL), nin);
+    /* the view gate (sym_view_ok false): without a LUT the null-checked
+     * loop answers id-0 rows 0 under `not in`, which a view's
+     * (0 in set) ^ negate would not, so every vector holding "" is read by
+     * range instead: chunks 1 and 2 whole (128 x 1024 W8 ids) and chunk 3
+     * (3392 ids); chunk 0, without "", is decided from its statistics */
+    if ((r = aw_sel_same("sb", ap_s_notin_none, 128 * 1024 + 3392)).status != TEST_PASS) return r;
+    {
+        int64_t want = 0;
+        for (int64_t j = 0; j < 200000; j++) want += aw_sy_val(j) >= 0;
+        TEST_ASSERT_EQ_I(aw_sel_count("sb", 2, ap_s_notin_none, NULL), want);
+    }
     /* integers: a nullable I32 column, sets inside and outside the bounds */
     aw_save("ib", "(table [x] (list (as 'I32 (map (fn [j] (if (and (>= j 65536) (== 0 (% j 7))) 0N (+ (div j 1000) (% j 3)))) (til 140000)))))", -1);
     static const int64_t sets[][3] = { { 5, 70, 9000 }, { -4, 1000, 2000 }, { 66, 67, 68 } };
@@ -1443,6 +1466,53 @@ static test_result_t test_sym_in_bounds(void) {
                 return r;
             }
         }
+    PASS();
+}
+
+/* Float membership bounds: the probe as doubles (NaN members match
+ * nothing, -0.0 equals +0.0), no view evaluator (a float vector is read).
+ * f: -0.0 in vector 0, null every 13th row in chunk 1, else the row; g the
+ * same as F32; x an I32 column against a float set (the widened integer
+ * bounds).  Generation 0 (the unchanged kernel) is the reference. */
+static const double* g_fset; static int g_fnset; static int g_fneg; static const char* g_fcol;
+static ray_op_t* ap_f_in(ray_graph_t* g) {
+    ray_t* set = ray_vec_new(RAY_F64, g_fnset); set->len = g_fnset;
+    for (int i = 0; i < g_fnset; i++) ((double*)ray_data(set))[i] = g_fset[i];
+    ray_op_t* c = ray_const_vec(g, set); ray_release(set);
+    return g_fneg ? ray_not_in(g, ray_scan(g, g_fcol), c) : ray_in(g, ray_scan(g, g_fcol), c);
+}
+static test_result_t test_float_in_bounds(void) {
+    aw_save("fb", "(select {f: f g: (as 'F32 f) x: x from: (table [f x] (list "
+                  "(as 'F64 (map (fn [j] (if (< j 1024) -0.0 (if (and (>= j 65536) (< j 131072) (== 0 (% j 13))) 0Nf (as 'F64 j)))) (til 140000))) "
+                  "(as 'I32 (div (til 140000) 1000))))})", -1);
+    static const double s_zero[] = { 0.0, 1e9, NAN };   /* +0.0 matches vector 0's -0.0 */
+    static const double s_12[] = { 12.0 };              /* row 12 is -0.0: matches nothing */
+    static const double s_x[] = { 5.0, 70.5, 139.0 };
+    static const char* const cols[] = { "f", "g" };
+    test_result_t r;
+    for (int ci = 0; ci < 2; ci++) {
+        g_fcol = cols[ci];
+        const size_t esz = ci == 0 ? 8 : 4;
+        /* `in` +0.0: only vector 0 (bounds [-0.0, -0.0] hold +0.0) is read */
+        g_fset = s_zero; g_fnset = 3; g_fneg = 0;
+        if ((r = aw_sel_same("fb", ap_f_in, (int64_t)(1024 * esz))).status != TEST_PASS) return r;
+        TEST_ASSERT_EQ_I(aw_sel_count("fb", 2, ap_f_in, NULL), 1024);
+        /* `not in` +0.0: vector 0 read; chunk 1's vectors all hold a null
+         * (every 13th row), so they are read; the rest decided */
+        g_fneg = 1;
+        if ((r = aw_sel_same("fb", ap_f_in, (int64_t)((1024 + 64 * 1024) * esz))).status != TEST_PASS) return r;
+        /* 12.0: no range holds it; `in` reads nothing, `not in` only the
+         * null-bearing chunk 1 */
+        g_fset = s_12; g_fnset = 1; g_fneg = 0;
+        if ((r = aw_sel_same("fb", ap_f_in, 0)).status != TEST_PASS) return r;
+        TEST_ASSERT_EQ_I(aw_sel_count("fb", 2, ap_f_in, NULL), 0);
+        g_fneg = 1;
+        if ((r = aw_sel_same("fb", ap_f_in, (int64_t)(64 * 1024 * esz))).status != TEST_PASS) return r;
+    }
+    /* an integer column against a float set */
+    g_fcol = "x"; g_fset = s_x; g_fnset = 3;
+    for (g_fneg = 0; g_fneg < 2; g_fneg++)
+        if ((r = aw_sel_same("fb", ap_f_in, -1)).status != TEST_PASS) return r;
     PASS();
 }
 
@@ -1482,5 +1552,6 @@ const test_entry_t aware_entries[] = {
     { "aware/sym_membership", test_sym_membership, aw_setup, aw_teardown },
     { "aware/sym_in_bounds",  test_sym_in_bounds,  aw_setup, aw_teardown },
     { "aware/sym_fused_gen0", test_sym_fused_gen0, aw_setup, aw_teardown },
+    { "aware/float_in_bounds", test_float_in_bounds, aw_setup, aw_teardown },
     { NULL, NULL, NULL, NULL },
 };

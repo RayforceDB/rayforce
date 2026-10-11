@@ -784,8 +784,9 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
      * arithmetic — reads the lane as a value and keeps the proof. */
     uint8_t sym_cmp_safe[nc];
     memset(sym_cmp_safe, 1, nc * sizeof(uint8_t));
-    /* Which nodes are consumed only by EQ / NE against a non-null STR or
-     * SYM constant: a file-domain SYM column read so compares on its own
+    /* Which nodes are consumed only by EQ / NE against a STR constant
+     * ("" included: id 0) or a non-null SYM one: a file-domain SYM column
+     * read so compares on its own
      * ids once the constant is translated into its domain (below, at the
      * compare).  An ordered consumer keeps EXPR_BAIL_SYM_DOMAIN: ids are
      * never ordered (#738 / #768). */

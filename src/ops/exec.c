@@ -1660,6 +1660,15 @@ typedef struct {
     bool             has_zero;
     bool             negate;
     bool             sym_view_ok;      /* SYM: a view's id-0 rows answer as the kernel's */
+    /* The float twin (a float column or set: the kernel compares doubles
+     * with ==, so -0.0 matches +0.0 and a NaN matches nothing): the probe
+     * as doubles, sorted, NaN dropped (fkeys == NULL: no float bounds);
+     * col_float: the statistics are F32 / F64 bit patterns, else integer
+     * values widened to double (monotone, so a value's double stays inside
+     * the widened [min, max]). */
+    const double*    fkeys;
+    int              nfkeys;
+    bool             col_float;
 } in_sel_rfill_ctx_t;
 
 /* The membership rule over a range from its statistics (min / max over its
@@ -1678,12 +1687,44 @@ static int in_bounds_decide(const in_sel_rfill_ctx_t* c, int64_t mn, int64_t mx,
     return nn == 0 ? 1 : -1;
 }
 
+/* in_bounds_decide over double bounds (the float twin's probe).  A NaN
+ * bound is undecided; -0.0 and +0.0 compare equal, as in the kernel. */
+static int in_bounds_decide_f(const in_sel_rfill_ctx_t* c, double mn, double mx, bool has_mm, int64_t nn) {
+    if (!has_mm || !(mn <= mx)) return -1;
+    int lo = 0, hi = c->nfkeys;
+    while (lo < hi) { int mid = lo + (hi - lo) / 2; if (c->fkeys[mid] < mn) lo = mid + 1; else hi = mid; }
+    if (lo < c->nfkeys && c->fkeys[lo] <= mx) return -1;
+    if (!c->negate) return 0;
+    return nn == 0 ? 1 : -1;
+}
+static inline double in_stat_f(const in_sel_rfill_ctx_t* c, int64_t v) {
+    if (!c->col_float) return (double)v;
+    double d; memcpy(&d, &v, 8);
+    return d;
+}
+
 /* Morsel [start, start + n) answered without a range read: from the chunk's
  * directory, then the vector's descriptor, then the vector's view
  * (ray_enc_eval_in on ids / values, inverted for `not in` with null rows
  * cleared).  1 answered into out, 0 read it, -1 an owned *err (the view's
  * validation, as the decode would report it). */
 static int in_sel_bounds(const in_sel_rfill_ctx_t* c, int64_t start, int64_t n, uint8_t* out, ray_t** err) {
+    if (c->fkeys) {                                     /* floats: bounds only, no view evaluator */
+        int d = -1;
+        if ((start >> 16) == ((start + n - 1) >> 16)) {
+            ray_enc_chunk_stat_t st;
+            if (ray_col_src_chunk_stat(c->src, start >> 16, &st))
+                d = in_bounds_decide_f(c, in_stat_f(c, st.min), in_stat_f(c, st.max), st.has_minmax,
+                                       (int64_t)st.null_count);
+        }
+        if (d < 0 && start / RAY_ENC_VEC == (start + n - 1) / RAY_ENC_VEC) {
+            int64_t mn, mx; uint32_t nn;
+            if (ray_col_src_vec_stat(c->src, start / RAY_ENC_VEC, &mn, &mx, &nn))
+                d = in_bounds_decide_f(c, in_stat_f(c, mn), in_stat_f(c, mx), true, nn);
+        }
+        if (d >= 0) { memset(out, d, (size_t)n); return 1; }
+        return 0;
+    }
     if (!c->keys) return 0;
     int d = -1;
     if ((start >> 16) == ((start + n - 1) >> 16)) {
@@ -1712,6 +1753,11 @@ static int in_sel_bounds(const in_sel_rfill_ctx_t* c, int64_t start, int64_t n, 
 
 static int in_key_cmp(const void* a, const void* b) {
     int64_t x = *(const int64_t*)a, y = *(const int64_t*)b;
+    return (x > y) - (x < y);
+}
+
+static int in_fkey_cmp(const void* a, const void* b) {
+    double x = *(const double*)a, y = *(const double*)b;
     return (x > y) - (x < y);
 }
 
@@ -1795,7 +1841,7 @@ ray_t* exec_in_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
         ray_col_src_advise(src, 0, nrows);
         in_sel_rfill_ctx_t fctx = { .ic = &ic, .src = src, .fail = &fail, .negate = negate };
         /* membership bounds: the probe values sorted once (integer and SYM
-         * columns; a float column or set keeps the read) */
+         * columns as int64; a float column or set as doubles) */
         int64_t kstack[32];
         int64_t* keys = NULL;
         if (!ic.use_double && ic.sv_len <= INT32_MAX) {
@@ -1815,8 +1861,23 @@ ray_t* exec_in_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
                 fctx.sym_view_ok = ic.symlut || !ic.col_has_nulls;
             }
         }
+        double fstack[32];
+        double* fkeys = NULL;
+        if (ic.use_double && ic.sv_len <= INT32_MAX) {
+            fkeys = ic.sv_len <= 32 ? fstack : (double*)ray_alloc_raw((size_t)ic.sv_len * sizeof(double));
+            if (fkeys) {
+                int64_t nk = 0;
+                for (int64_t j = 0; j < ic.sv_len; j++)
+                    if (ic.svf[j] == ic.svf[j]) fkeys[nk++] = ic.svf[j];   /* a NaN member matches nothing */
+                qsort(fkeys, (size_t)nk, sizeof(double), in_fkey_cmp);
+                fctx.fkeys = fkeys;
+                fctx.nfkeys = (int)nk;
+                fctx.col_float = src->type == RAY_F32 || src->type == RAY_F64;
+            }
+        }
         sel = pred_sel_drive(nrows, in_sel_rfill, &fctx, &fail, all_pass);
         if (keys && keys != kstack) ray_free_raw(keys);
+        if (fkeys && fkeys != fstack) ray_free_raw(fkeys);
     }
 
     if (sv_hdr) ray_free(sv_hdr);
