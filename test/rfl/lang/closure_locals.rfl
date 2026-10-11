@@ -371,6 +371,16 @@ r6 -- [6 3]
 ;; ... ser takes the generic null there too, as on the tree walker
 (set mks (fn [k] (fn [x] (ser x))))
 (== (type ((mks 0) null)) 'NULL) -- false
+;; ... between any two calls: a caller's let rebound in the same frame, a global
+;; set and set back
+(set gc1 sum)
+(set mkgc (fn [k] (fn [x] (gc1 x))))
+(set cgc (mkgc 0))
+(set rgc (fn [] (if false (set 1 2)) (let gc1 sum) (let a (cgc [1 2 3])) (let gc1 count) (list a (cgc [1 2 3]))))
+(rgc) -- [6 3]
+(list (cgc [1 2 3]) (do (set gc1 count) (cgc [1 2 3])) (do (set gc1 sum) (cgc [1 2 3]))) -- [6 3 6]
+(set rgc2 (fn [] (if false (set 1 2)) (let a (cgc [1 2 3])) (do (let gc1 count) (cgc [1 2 3]))))
+(rgc2) -- 3
 ;; a literal built around a large constant is not kept alive by the table
 (set baseL (parse "(fn [x] 0)"))
 (set bigL (fn [i] (eval (concat (take baseL 2) (enlist (concat (parse "(+ x)") (enlist (+ i (til 100000)))))))))

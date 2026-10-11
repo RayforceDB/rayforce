@@ -104,6 +104,15 @@ static struct {
     int32_t count;
 } g_env;
 
+/* What a name compiled code resolves stays the same while neither moves:
+ * the frame epoch (this thread's scope frames: a push, a pop, a binding,
+ * a frame's kind or flags) and the global epoch (any global written).
+ * ray_env_resolve_compiled caches its answers under the pair. */
+static _Thread_local uint64_t g_frame_epoch = 1;
+static _Atomic uint64_t g_global_epoch = 1;
+static inline void env_frames_moved(void) { g_frame_epoch++; }
+static inline void env_globals_moved(void) { atomic_fetch_add_explicit(&g_global_epoch, 1, memory_order_relaxed); }
+
 /* ---- Local scope stack ---- */
 
 /* The scope stack lives on the per-thread VM (core/runtime.h) — one
@@ -266,6 +275,7 @@ ray_t* ray_env_capture_locals_rows(ray_t** flags_out, uint32_t* serial_out) {
                 /* A lazy handle is single-use: capture (and keep bound) the
                  * concrete value, or the closure's second call would read a
                  * handle its first call consumed. */
+                env_frames_moved();
                 ray_t* concrete = ray_lazy_materialize(f->vals[i]);   /* consumes the frame's ref */
                 if (!concrete || RAY_IS_ERR(concrete)) {
                     f->vals[i] = NULL;
@@ -374,6 +384,7 @@ int64_t ray_sym_ipc_hook(int idx) {
 }
 
 ray_err_t ray_env_init(void) {
+    env_globals_moved();
     memset(&g_env, 0, sizeof(g_env));
     __VM->scope_depth = 0;
     /* The IPC hook sym IDs are interned lazily on first probe via
@@ -390,6 +401,7 @@ ray_err_t ray_env_init(void) {
 }
 
 void ray_env_destroy(void) {
+    env_globals_moved();
     /* Pop any remaining scopes */
     while (__VM->scope_depth > 0) ray_env_pop_scope();
     for (int32_t i = 0; i < g_env.count; i++) {
@@ -563,11 +575,48 @@ ray_t* ray_env_resolve_rows(int64_t sym_id, uint8_t* rows) {
 /* A name compiled code resolves at run time (OP_RESOLVE): never a binding
  * of an `eval` window, which belongs to a caller. */
 ray_t* ray_env_resolve_compiled(int64_t sym_id, uint8_t* rows) {
-    /* No scope frame to look through (a body called outside any query or
-     * interpreted frame): the global, if there is one. */
-    if (__VM && __VM->scope_depth == 0) {
-        ray_t* v = env_global_lookup(sym_id);
-        if (v) { if (rows) *rows = 0; ray_retain(v); return v; }
+    /* A name resolved under the same frame and global epochs resolves to
+     * the same binding: the frames and globals it was read from have not
+     * moved, so the value is still the one they hold (and alive). */
+    enum { RC_BITS = 8 };
+    static _Thread_local struct { int64_t sym; uint64_t fe, ge; ray_t* val; uint8_t rows; } rc[1 << RC_BITS];
+    uint32_t h = (uint32_t)(((uint64_t)sym_id * UINT64_C(0x9E3779B97F4A7C15)) >> (64 - RC_BITS));
+    uint64_t ge = atomic_load_explicit(&g_global_epoch, memory_order_relaxed);
+    if (rc[h].sym == sym_id && rc[h].fe == g_frame_epoch && rc[h].ge == ge && rc[h].val) {
+        if (rows) *rows = rc[h].rows;
+        ray_retain(rc[h].val);
+        return rc[h].val;
+    }
+    /* Only plain frames to look through (a body called outside any query,
+     * from the top level or interpreted code): their bindings, eval windows
+     * passed by, then the global, without the general walk's query and
+     * call-frame cases.  Anything else takes the general walk. */
+    if (__VM) {
+        bool plain = true;
+        for (int32_t d = __VM->scope_depth - 1; d >= 0 && plain; d--) {
+            ray_scope_frame_t* f = &__VM->scope_stack[d];
+            if (f->kind != RAY_SCOPE_LEXICAL) { plain = false; break; }
+            if (f->eval_window) continue;
+            for (int32_t i = 0; i < f->count; i++) {
+                if (f->keys[i] != sym_id) continue;
+                if (rows) *rows = f->rows[i];
+                if (f->vals[i]) {
+                    ray_retain(f->vals[i]);
+                    rc[h].sym = sym_id; rc[h].fe = g_frame_epoch; rc[h].ge = ge;
+                    rc[h].val = f->vals[i]; rc[h].rows = f->rows[i];
+                }
+                return f->vals[i];
+            }
+        }
+        if (plain) {
+            ray_t* v = env_global_lookup(sym_id);
+            if (v) {
+                if (rows) *rows = 0;
+                ray_retain(v);
+                rc[h].sym = sym_id; rc[h].fe = g_frame_epoch; rc[h].ge = ge; rc[h].val = v; rc[h].rows = 0;
+                return v;
+            }
+        }
     }
     return env_resolve_impl(sym_id, rows, true);
 }
@@ -677,6 +726,7 @@ static ray_t* env_resolve_impl(int64_t sym_id, uint8_t* rows, bool in_callee) {
  * cascade-up case in env_set_dotted where every dict in a dotted path was
  * emptied by the delete. */
 static ray_err_t env_bind_global_impl(int64_t sym_id, ray_t* val, int is_user) {
+    env_globals_moved();
     env_lock();
     for (int32_t i = 0; i < g_env.count; i++) {
         if (g_env.keys[i] == sym_id) {
@@ -734,6 +784,7 @@ static ray_err_t env_bind_global_user(int64_t sym_id, ray_t* val) {
 }
 
 static ray_err_t env_frame_bind_rows(ray_scope_frame_t* f, int64_t sym_id, ray_t* val, uint8_t rows) {
+    env_frames_moved();
     for (int32_t i = 0; i < f->count; i++) {
         if (f->keys[i] == sym_id) {
             if (val == NULL) {
@@ -1024,6 +1075,7 @@ ray_err_t ray_env_push_call_scope(ray_t* table, bool named) {
 }
 
 void ray_env_mark_call_scope(ray_t* table, bool named) {
+    env_frames_moved();
     ray_scope_frame_t* f = &__VM->scope_stack[__VM->scope_depth - 1];
     f->kind = RAY_SCOPE_CALL;
     f->named = named;
@@ -1036,6 +1088,7 @@ void ray_env_mark_call_scope(ray_t* table, bool named) {
  * for closure capture (see ray_scope_frame_t.lexical). */
 void ray_env_mark_lexical_scope(int32_t below) {
     if (!__VM) return;
+    env_frames_moved();
     int32_t d = __VM->scope_depth - 1 - below;
     if (d >= 0) __VM->scope_stack[d].lexical = 1;
 }
@@ -1050,6 +1103,7 @@ ray_err_t ray_env_push_query_scope(void) {
 
 void ray_env_pop_scope(void) {
     if (__VM->scope_depth <= 0) return;
+    env_frames_moved();
     __VM->scope_depth--;
     ray_scope_frame_t* f = &__VM->scope_stack[__VM->scope_depth];
     for (int32_t i = 0; i < f->count; i++) {
@@ -1073,6 +1127,7 @@ void ray_env_pop_scope(void) {
 /* The top frame is a compiled frame's window around `eval` or `resolve`
  * (see ray_scope_frame_t.eval_window). */
 void ray_env_mark_eval_window(void) {
+    env_frames_moved();
     if (__VM && __VM->scope_depth > 0)
         __VM->scope_stack[__VM->scope_depth - 1].eval_window = 1;
 }
