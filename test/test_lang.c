@@ -365,6 +365,31 @@ static test_result_t test_lambda_compile_failure_mark(void) {
     PASS();
 }
 
+/* A closure whose text is heavy (a 66 KB string constant) but small in
+ * nodes still binds only the captures its body mentions: one slot for v7,
+ * not one per binding in scope. */
+static test_result_t test_closure_heavy_literal_captures(void) {
+    static char src[200 * 24 + 70000 + 256];
+    size_t cap = sizeof src;
+    size_t n = (size_t)snprintf(src, cap, "(do (set mkHv (fn [] (if false (set 1 2))");
+    for (int i = 0; i < 200; i++) n += (size_t)snprintf(src + n, cap - n, " (let v%d %d)", i, i);
+    n += (size_t)snprintf(src + n, cap - n, " (fn [x] (+ x (+ v7 (count \"");
+    for (int i = 0; i < 66000; i++) src[n++] = 'a';
+    n += (size_t)snprintf(src + n, cap - n, "\")))))) (set cHv (mkHv)) (cHv 1))");
+    ray_t* r = ray_eval_str(src);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->i64, 66008);
+    ray_release(r);
+    ray_t* c = ray_eval_str("cHv");
+    TEST_ASSERT_NOT_NULL(c);
+    TEST_ASSERT_EQ_I(c->type, RAY_LAMBDA);
+    TEST_ASSERT(LAMBDA_IS_COMPILED(c), "the closure compiles");
+    TEST_ASSERT(LAMBDA_NLOCALS(c) <= 4, "only the mentioned capture takes a slot");
+    ray_release(c);
+    PASS();
+}
+
 /* ---- Dummy function for testing ---- */
 static ray_t* dummy_unary(ray_t* x) { return ray_retain(x), x; }
 static ray_t* dummy_binary(ray_t* x, ray_t* y) { (void)y; return ray_retain(x), x; }
@@ -10160,6 +10185,7 @@ const test_entry_t lang_entries[] = {
     { "lang/closure_lazy_capture_vm", test_closure_lazy_capture_vm, lang_setup, lang_teardown },
     { "lang/closure_sym_walk_guard", test_closure_sym_walk_guard, lang_setup, lang_teardown },
     { "lang/lambda_compile_failure_mark", test_lambda_compile_failure_mark, lang_setup, lang_teardown },
+    { "lang/closure_heavy_literal_captures", test_closure_heavy_literal_captures, lang_setup, lang_teardown },
     { "lang/io/read_procfs_zero_size", test_read_procfs_reports_zero_size, lang_setup, lang_teardown },
     { "lang/io/read_unsized_bounded", test_read_unsized_stream_is_bounded, lang_setup, lang_teardown },
     { "lang/io/exec_capture_bounded", test_exec_capture_is_bounded, lang_setup, lang_teardown },

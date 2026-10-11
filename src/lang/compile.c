@@ -830,14 +830,18 @@ static bool closure_shape_ok(ray_t *closure) {
  * dicts), appended to the I64 vector *out without duplicates.  *dynamic is
  * set when the text mentions `eval` or `resolve`, which can reach a name
  * that is not spelled out. */
-static bool ast_collect_syms_at(ray_t *ast, ray_t **out, bool *dynamic, int depth, int64_t *weight, bool stop);
-/* Every name `ast` mentions, for a closure's capture set.  The walk stops
- * once the text weighs more than the template bound: the caller then
- * treats the names as unknown and binds every capture, so a heavy
- * constant (a list shared 2^22 times over, say) costs a bounded walk. */
+static bool ast_collect_syms_at(ray_t *ast, ray_t **out, bool *dynamic, int depth, int64_t *weight,
+                                bool stop, int64_t *nodes);
+/* The nodes a walk for a closure's names visits at most.  A large constant
+ * is one node however many bytes it holds; only text shared over and over
+ * (a list nested in itself 2^22 times, say) reaches the budget, and the
+ * caller then treats the names as unknown and binds every capture. */
+enum { AST_NAME_NODES = 1 << 16 };
+
+/* Every name `ast` mentions, for a closure's capture set. */
 static bool ast_collect_syms(ray_t *ast, ray_t **out, bool *dynamic) {
-    int64_t weight = 0;
-    return ast_collect_syms_at(ast, out, dynamic, 0, &weight, true);
+    int64_t weight = 0, nodes = AST_NAME_NODES;
+    return ast_collect_syms_at(ast, out, dynamic, 0, &weight, false, &nodes);
 }
 
 /* The bytes a value spliced into text holds whole: a table's columns, a
@@ -899,9 +903,11 @@ static int64_t ast_node_bytes(ray_t *v, int64_t cap) {
  * given up on (the literal then has no template and compiles when called). */
 /* `stop`: the walk serves only the template table, which will not keep a
  * literal past its bound, so it gives up (false) once the weight passes it. */
-static bool ast_collect_syms_at(ray_t *ast, ray_t **out, bool *dynamic, int depth, int64_t *weight, bool stop) {
+static bool ast_collect_syms_at(ray_t *ast, ray_t **out, bool *dynamic, int depth, int64_t *weight,
+                                bool stop, int64_t *nodes) {
     if (!ast || !*out) return false;
     if (depth > 1024) return false;
+    if (nodes && --*nodes < 0) return false;
     /* Past the template bound the exact weight does not matter. */
     *weight += ast_node_bytes(ast, RAY_CLOSURE_TMPL_MAX_BYTES - *weight);
     if (stop && *weight > RAY_CLOSURE_TMPL_MAX_BYTES) return false;
@@ -928,13 +934,13 @@ static bool ast_collect_syms_at(ray_t *ast, ray_t **out, bool *dynamic, int dept
     if (ast->type == RAY_LIST) {
         ray_t **elems = (ray_t**)ray_data(ast);
         for (int64_t i = 0; i < ast->len; i++)
-            if (!ast_collect_syms_at(elems[i], out, dynamic, depth + 1, weight, stop)) return false;
+            if (!ast_collect_syms_at(elems[i], out, dynamic, depth + 1, weight, stop, nodes)) return false;
         return true;
     }
     if (ast->type == RAY_DICT) {
         ray_t **slots = (ray_t**)ray_data(ast);
-        return ast_collect_syms_at(slots[0], out, dynamic, depth + 1, weight, stop) &&
-               ast_collect_syms_at(slots[1], out, dynamic, depth + 1, weight, stop);
+        return ast_collect_syms_at(slots[0], out, dynamic, depth + 1, weight, stop, nodes) &&
+               ast_collect_syms_at(slots[1], out, dynamic, depth + 1, weight, stop, nodes);
     }
     return true;
 }
@@ -950,7 +956,7 @@ static bool syms_contain(ray_t *syms, int64_t id) {
  * the body mentions (every key when the body uses eval or resolve), never
  * `self`.  A SYM vector the caller releases, or NULL for none.  *failed is
  * set when the body could not be walked (nesting past the walk's guard,
- * text heavier than the template bound, or an allocation failure): NULL
+ * more nodes than AST_NAME_NODES, or an allocation failure): NULL
  * then means "unknown", not "none", and the
  * body must not be compiled without its captures. */
 static ray_t *closure_capture_names(ray_t *lambda, bool *failed) {
@@ -1036,9 +1042,9 @@ static bool compile_fn_template_at(compiler_t *c, ray_t *ast) {
     ray_t *mentioned = ray_vec_new(RAY_I64, 16);
     if (!mentioned || RAY_IS_ERR(mentioned)) { if (own_params) ray_release(params); return false; }
     bool dynamic = false, ok = true;
-    int64_t tweight = 0;
+    int64_t tweight = 0, tnodes = AST_NAME_NODES;
     for (int64_t i = 2; i < n && ok; i++)
-        ok = ast_collect_syms_at(elems[i], &mentioned, &dynamic, 0, &tweight, true);
+        ok = ast_collect_syms_at(elems[i], &mentioned, &dynamic, 0, &tweight, false, &tnodes);
     if (!ok) { ray_release(mentioned); if (own_params) ray_release(params); return false; }
 
     /* Capture names and the enclosing slots they come from, in slot order. */
@@ -1114,7 +1120,7 @@ ray_t *ray_closure_mentioned_syms(ray_t *body, bool *dynamic, int64_t *weight) {
     if (!mentioned || RAY_IS_ERR(mentioned)) return NULL;
     *dynamic = false;
     *weight = 0;
-    if (!ast_collect_syms_at(body, &mentioned, dynamic, 0, weight, true)) { if (mentioned) ray_release(mentioned); return NULL; }
+    if (!ast_collect_syms_at(body, &mentioned, dynamic, 0, weight, true, NULL)) { if (mentioned) ray_release(mentioned); return NULL; }
     return mentioned;
 }
 
