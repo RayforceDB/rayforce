@@ -51,6 +51,10 @@
 (set pk0 (at (.sys.mem) 'peak-bytes))
 (count (select {c: (count k) by: (reverse lo) from: Pmw})) -- 10
 (< (- (at (.sys.mem) 'peak-bytes) pk0) (/ Bmw 4)) -- true
+;; as a by-dict value too
+(set pk0 (at (.sys.mem) 'peak-bytes))
+(count (select {c: (count k) by: {kk: (reverse lo)} from: Pmw})) -- 10
+(< (- (at (.sys.mem) 'peak-bytes) pk0) (/ Bmw 4)) -- true
 ;; every key unique: the result is the whole table, and little more
 (set pk0 (at (.sys.mem) 'peak-bytes))
 (count (select {by: k from: Pmw})) -- 40000

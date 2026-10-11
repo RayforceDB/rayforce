@@ -11760,7 +11760,13 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, bool aliases_resolved,
                 if (ray_table_get_col(tbl, k->i64) && !trivial_self) {
                     defer_ok = false; break;   /* alias shadows an input column */
                 }
-                if (v && v->type == RAY_LIST) continue;  /* computed expr */
+                if (v && v->type == RAY_LIST) {   /* computed expr: one the planner lowers */
+                    ray_graph_t* pg = ray_graph_new(tbl);
+                    bool lowers = pg && compile_expr_dag(pg, v) != NULL;
+                    if (pg) ray_graph_free(pg);
+                    if (!lowers) defer_ok = false;
+                    continue;
+                }
                 if (v && v->type == -RAY_SYM && !(v->attrs & ATTR_QUOTED)) {
                     ray_t* src = ray_table_get_col(tbl, v->i64);
                     if (!src ||
@@ -11893,8 +11899,11 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, bool aliases_resolved,
                                               keep_syms, (int)ncols_max, n_keep);
             }
             /* A select with no outputs returns every column of the table,
-             * in its order: there is nothing to narrow. */
-            int can_project = (n_out > 0 && n_keep > 0 && n_keep < ncols_max);
+             * in its order: there is nothing to narrow.  Nor when a clause
+             * runs code (a helper) that reads columns the clauses do not
+             * name. */
+            int can_project = (n_out > 0 && n_keep > 0 && n_keep < ncols_max &&
+                               parted_clauses_plain(dict));
             ray_t* narrow_tbl = NULL;
             if (can_project) {
                 narrow_tbl = project_table_cols(tbl, keep_syms, n_keep);
@@ -11950,6 +11959,32 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, bool aliases_resolved,
             ray_release(tbl);
             tbl = filtered;
             where_expr = NULL;
+        }
+
+        /* A by-dict value the planner cannot lower (a helper, a builtin
+         * with no kernel) is evaluated below over whole columns: over a
+         * parted table, flatten the columns the select reads first (the
+         * whole table with no output, or when a clause runs code whose
+         * reads are unseen). */
+        if (table_has_parted_columns(tbl)) {
+            bool unlowered = false;
+            for (int64_t i = 0; i < nk && !unlowered; i++) {
+                ray_t* v = d_elems[i * 2 + 1];
+                if (!v || v->type != RAY_LIST) continue;
+                ray_graph_t* pg = ray_graph_new(tbl);
+                unlowered = !pg || compile_expr_dag(pg, v) == NULL;
+                if (pg) ray_graph_free(pg);
+            }
+            if (unlowered) {
+                ray_t* flat = n_out > 0 ? parted_flatten_read_cols(dict, tbl)
+                                        : query_materialize_parted_table(tbl);
+                ray_release(tbl);
+                if (!flat || RAY_IS_ERR(flat)) {
+                    DICT_VIEW_CLOSE(dv); DICT_VIEW_CLOSE(byv);
+                    return flat ? flat : ray_error("oom", NULL);
+                }
+                tbl = flat;
+            }
         }
 
         ray_env_push_query_scope();

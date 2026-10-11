@@ -437,6 +437,18 @@
 (select {by: (reverse x) from: Pck desc: y take: 2}) -- (select {by: (reverse x) from: Mck desc: y take: 2})
 (select {by: (fkp) from: Pck asc: r}) -- (select {by: (fkp) from: Mck asc: r})
 (select {c: (count y) by: (distinct x) from: Pck}) !- length
+;; and as a by-dict value: a helper or a builtin with no kernel, beside
+;; outputs, sorted, filtered, with a second key, with no output
+(select {c: (count y) by: {k: (fkp)} from: Pck}) -- (select {c: (count y) by: {k: (fkp)} from: Mck})
+(select {c: (count y) by: {k: (reverse x)} from: Pck}) -- (select {c: (count y) by: {k: (reverse x)} from: Mck})
+(select {sy: (sum y) by: {k: (fkp)} from: Pck desc: sy take: 2}) -- (select {sy: (sum y) by: {k: (fkp)} from: Mck desc: sy take: 2})
+(select {c: (count y) by: {k: (fkp)} from: Pck where: (> y 15)}) -- (select {c: (count y) by: {k: (fkp)} from: Mck where: (> y 15)})
+(select {c: (count y) by: {k: (fkp) ks: s} from: Pck}) -- (select {c: (count y) by: {k: (fkp) ks: s} from: Mck})
+(select {by: {k: (fkp)} from: Pck}) -- (select {by: {k: (fkp)} from: Mck})
+;; a where: before a computed key keeps every column when a helper reads
+;; one the clauses do not name (x here)
+(set Tnw (table [x y z] (list [3 1 4 2 3] [10 20 30 40 50] [1 1 1 1 1])))
+(select {c: (count y) by: {k: (fkp)} from: Tnw where: (> y 15)}) -- (select {c: (count y) by: {k: (% x 2)} from: Tnw where: (> y 15)})
 ;; a sort without by: sorts the keys and gathers the rows they keep; the
 ;; flat sort it fell to read parted columns as plain ones and failed
 (select {from: Pck desc: x}) -- (select {from: Mck desc: x})
