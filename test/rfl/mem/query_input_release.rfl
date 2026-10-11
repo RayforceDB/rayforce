@@ -76,6 +76,17 @@
 (count Rw) -- 10
 (at Rw 'w) -- (concat "wide-unused-string-column-value-over-twelve-bytes-" (as 'STR (til 10)))
 (.sys.exec "rm -rf /tmp/rfl_ckwide")
+;; A where: before a computed key filters only the columns the clauses
+;; read, also when it reads a config dict: 22 columns, 60000 rows (Bfw
+;; bytes), nearly every row kept; filtering every column costs Bfw again.
+(set Nfw 60000)
+(set FWq (table (as 'SYMBOL (map (fn [j] (format "c%" j)) (til 22))) (map (fn [j] (+ j (til Nfw))) (til 22))))
+(set Bfw (* (* 22 Nfw) 8))
+(set cfgq {lim: 100})
+(set pk0 (at (.sys.mem) 'peak-bytes))
+(count (select {n: (count c0) by: {g: (% c0 7)} from: FWq where: (> c1 (at cfgq 'lim))})) -- 7
+(< (- (at (.sys.mem) 'peak-bytes) pk0) (/ Bfw 2)) -- true
+(set FWq 0)
 
 
 ;; partitioned + ordered, trailing frame (the shape of the report)

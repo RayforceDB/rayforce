@@ -10604,33 +10604,33 @@ static ray_t* sym_binding(int64_t s) {
 }
 
 /* Is a name bound to `b` code a clause runs: a lambda, a name of one (a
- * call through it calls the lambda), or (unquoted) a container that may
- * hold lambdas? */
-static bool sym_binding_runs_code(ray_t* b, bool quoted) {
+ * call through it calls the lambda), or (unquoted, when `containers`) a
+ * container that may hold lambdas? */
+static bool sym_binding_runs_code(ray_t* b, bool quoted, bool containers) {
     if (!b) return false;
     if (b->type == RAY_LAMBDA) return true;
     if (b->type == -RAY_SYM) {
         ray_t* to = sym_binding(b->i64);
         return to && to->type == RAY_LAMBDA;
     }
-    return !quoted && (b->type == RAY_LIST || b->type == RAY_DICT || b->type == RAY_TABLE);
+    return containers && !quoted && (b->type == RAY_LIST || b->type == RAY_DICT || b->type == RAY_TABLE);
 }
 
 /* Does the clause value `v` run code whose column reads it does not show:
  * a lambda (written in place, or a name -- plain, quoted or a dotted path
- * -- bound to one or to its name), a call whose callee is computed, a name
- * bound to a container that may hold lambdas, or text or a name evaluated
- * at run time (eval, parse, resolve, load, value)? */
-static bool clause_runs_code(ray_t* v) {
+ * -- bound to one or to its name), a call whose callee is computed, text or
+ * a name evaluated at run time (eval, parse, resolve, load, value), and,
+ * when `containers`, a name bound to a container that may hold lambdas? */
+static bool clause_runs_code_in(ray_t* v, bool containers) {
     if (!v || RAY_IS_ERR(v)) return false;
     if (v->type == RAY_LAMBDA) return true;
     if (v->type == -RAY_SYM)   /* a dotted path too: ray_env_get walks it */
-        return sym_binding_runs_code(sym_binding(v->i64), (v->attrs & ATTR_QUOTED) != 0);
+        return sym_binding_runs_code(sym_binding(v->i64), (v->attrs & ATTR_QUOTED) != 0, containers);
     if (v->type == RAY_DICT) {   /* each value on its own: the values list is no call */
         ray_t* dv = ray_dict_vals(v);
-        if (!dv || dv->type != RAY_LIST) return clause_runs_code(dv);
+        if (!dv || dv->type != RAY_LIST) return clause_runs_code_in(dv, containers);
         for (int64_t i = 0; i < dv->len; i++)
-            if (clause_runs_code(((ray_t**)ray_data(dv))[i])) return true;
+            if (clause_runs_code_in(((ray_t**)ray_data(dv))[i], containers)) return true;
         return false;
     }
     if (v->type != RAY_LIST) return false;
@@ -10640,21 +10640,37 @@ static bool clause_runs_code(ray_t* v) {
                        select_sym_is(el[0], "parse", 5) || select_sym_is(el[0], "resolve", 7) ||
                        select_sym_is(el[0], "load", 4) || select_sym_is(el[0], "value", 5)))
         return true;
-    for (int64_t i = 0; i < v->len; i++) if (clause_runs_code(el[i])) return true;
+    for (int64_t i = 0; i < v->len; i++) if (clause_runs_code_in(el[i], containers)) return true;
+    return false;
+}
+
+/* Does any clause but from: run code whose column reads it does not show
+ * (clause_runs_code_in)?  NULL dict counts as code. */
+static bool clauses_run_code(ray_t* dict, bool containers) {
+    ray_t* keys = ray_dict_keys(dict);
+    ray_t* vals = ray_dict_vals(dict);
+    if (!keys || keys->type != RAY_SYM || !vals || vals->type != RAY_LIST) return true;
+    int64_t id_from = ray_sym_intern("from", 4);
+    for (int64_t i = 0; i < ray_dict_len(dict); i++)
+        if (sym_cell_runtime_id(keys, i) != id_from &&
+            clause_runs_code_in(((ray_t**)ray_data(vals))[i], containers)) return true;
     return false;
 }
 
 /* Can the narrow copy of a parted table answer this select: every column
- * a clause reads is written in it (no code that reads columns unseen). */
+ * a clause reads is written in it (no code that reads columns unseen, a
+ * container of lambdas included). */
 static bool parted_clauses_plain(ray_t* dict) {
-    ray_t* keys = ray_dict_keys(dict);
-    ray_t* vals = ray_dict_vals(dict);
-    if (!keys || keys->type != RAY_SYM || !vals || vals->type != RAY_LIST) return false;
-    int64_t id_from = ray_sym_intern("from", 4);
-    for (int64_t i = 0; i < ray_dict_len(dict); i++)
-        if (sym_cell_runtime_id(keys, i) != id_from &&
-            clause_runs_code(((ray_t**)ray_data(vals))[i])) return false;
-    return true;
+    return !clauses_run_code(dict, true);
+}
+
+/* Do the clauses name every column they read, as far as narrowing a flat
+ * table before a filter needs: no lambda, call through a computed callee,
+ * or text evaluated at run time.  Names bound to containers are taken as
+ * data: a config dict or a list a where: reads must not cost the
+ * projection. */
+static bool clauses_name_their_columns(ray_t* dict) {
+    return !clauses_run_code(dict, false);
 }
 
 /* Rows rv[0..n) of a parted table, gathered one column at a time without
@@ -11903,7 +11919,7 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, bool aliases_resolved,
              * runs code (a helper) that reads columns the clauses do not
              * name. */
             int can_project = (n_out > 0 && n_keep > 0 && n_keep < ncols_max &&
-                               parted_clauses_plain(dict));
+                               clauses_name_their_columns(dict));
             ray_t* narrow_tbl = NULL;
             if (can_project) {
                 narrow_tbl = project_table_cols(tbl, keep_syms, n_keep);
