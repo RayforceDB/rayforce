@@ -2975,6 +2975,17 @@ op_resolve: {
     uint8_t idx = code[ip++];
     ray_t *name_obj = cpool[idx];
     uint8_t val_rows = 0;   /* set when a query helper reads a source column */
+    {
+        /* The answer cached for this name while nothing it was read from
+         * has moved (ray_env_resolve_compiled). */
+        ray_resolve_cache_t *e = &g_resolve_cache[ray_resolve_cache_slot(name_obj->i64)];
+        if (e->sym == name_obj->i64 && e->fe == g_frame_epoch && e->val &&
+            e->ge == atomic_load_explicit(&g_global_epoch, memory_order_relaxed)) {
+            ray_retain(e->val);
+            PUSHR(e->val, e->rows);
+            DISPATCH();
+        }
+    }
     ray_t *val = ray_env_resolve_compiled(name_obj->i64, &val_rows);
     if (!val) goto vm_error_name;
     /* env_resolve returns an owned ref (rc >= 1); no extra retain needed.

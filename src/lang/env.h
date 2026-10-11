@@ -163,6 +163,17 @@ ray_t*    ray_env_resolve_rows(int64_t sym_id, uint8_t* rows);
 /* ray_env_resolve_rows for a name compiled code resolves at run time: an
  * `eval` window on the scope stack belongs to a caller and is passed by. */
 ray_t*    ray_env_resolve_compiled(int64_t sym_id, uint8_t* rows);
+/* ray_env_resolve_compiled's per-thread answers, valid while this thread's
+ * frame epoch and the global epoch are those they were cached under; the
+ * VM reads them inline before calling it. */
+#define RAY_RESOLVE_CACHE_BITS 8
+typedef struct { int64_t sym; uint64_t fe, ge; ray_t* val; uint8_t rows; } ray_resolve_cache_t;
+extern _Thread_local uint64_t g_frame_epoch;
+extern _Atomic uint64_t g_global_epoch;
+extern _Thread_local ray_resolve_cache_t g_resolve_cache[1 << RAY_RESOLVE_CACHE_BITS];
+static inline uint32_t ray_resolve_cache_slot(int64_t sym_id) {
+    return (uint32_t)(((uint64_t)sym_id * UINT64_C(0x9E3779B97F4A7C15)) >> (64 - RAY_RESOLVE_CACHE_BITS));
+}
 /* ray_env_get for the compiler: an `eval` window on the scope stack belongs
  * to a caller of the body being compiled and is passed by. */
 ray_t*    ray_env_get_compiled(int64_t sym_id);

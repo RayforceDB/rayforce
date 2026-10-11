@@ -108,8 +108,9 @@ static struct {
  * the frame epoch (this thread's scope frames: a push, a pop, a binding,
  * a frame's kind or flags) and the global epoch (any global written).
  * ray_env_resolve_compiled caches its answers under the pair. */
-static _Thread_local uint64_t g_frame_epoch = 1;
-static _Atomic uint64_t g_global_epoch = 1;
+_Thread_local uint64_t g_frame_epoch = 1;
+_Atomic uint64_t g_global_epoch = 1;
+_Thread_local ray_resolve_cache_t g_resolve_cache[1 << RAY_RESOLVE_CACHE_BITS];
 static inline void env_frames_moved(void) { g_frame_epoch++; }
 static inline void env_globals_moved(void) { atomic_fetch_add_explicit(&g_global_epoch, 1, memory_order_relaxed); }
 
@@ -578,9 +579,8 @@ ray_t* ray_env_resolve_compiled(int64_t sym_id, uint8_t* rows) {
     /* A name resolved under the same frame and global epochs resolves to
      * the same binding: the frames and globals it was read from have not
      * moved, so the value is still the one they hold (and alive). */
-    enum { RC_BITS = 8 };
-    static _Thread_local struct { int64_t sym; uint64_t fe, ge; ray_t* val; uint8_t rows; } rc[1 << RC_BITS];
-    uint32_t h = (uint32_t)(((uint64_t)sym_id * UINT64_C(0x9E3779B97F4A7C15)) >> (64 - RC_BITS));
+    ray_resolve_cache_t* rc = g_resolve_cache;
+    uint32_t h = ray_resolve_cache_slot(sym_id);
     uint64_t ge = atomic_load_explicit(&g_global_epoch, memory_order_relaxed);
     if (rc[h].sym == sym_id && rc[h].fe == g_frame_epoch && rc[h].ge == ge && rc[h].val) {
         if (rows) *rows = rc[h].rows;
