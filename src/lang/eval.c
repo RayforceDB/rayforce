@@ -2798,9 +2798,13 @@ static ray_t* vm_call_binary(ray_t* fn_obj, ray_t* left, ray_t* right,
  * text and collection semantics.  `out_rows` receives the result's flag.
  *
  * The dispatch loop starts on a page boundary: where its handlers fall
- * relative to fetch and branch-predictor boundaries moved its speed by up
- * to 10% whenever code in an unrelated object grew or shrank. */
+ * relative to fetch and branch-predictor boundaries moved its speed when
+ * code in an unrelated object grew or shrank.  How much depends on the
+ * machine: on one box an 896-byte shift cost 5-10% on VM-bound loops; a
+ * second measurement saw under 2% on the same loops and 4-6% on others. */
+#if defined(__GNUC__) || defined(__clang__)
 __attribute__((aligned(4096)))
+#endif
 static ray_t* vm_exec_rows(ray_t* lambda, ray_t** call_args, int64_t argc,
                            uint64_t row_args, uint8_t* out_rows) {
     /* Computed goto dispatch table */
