@@ -987,7 +987,7 @@ static test_result_t aw_sel_same(const char* name, ray_op_t* (*build)(ray_graph_
         ray_enc_counters_reset();
         blk[gen / 2] = exec_pred_to_selection(g, pred, ray_table_nrows(t), &all[gen / 2]);
         TEST_ASSERT_FMT(!(blk[gen / 2] && RAY_IS_ERR(blk[gen / 2])), "%s gen %d: %s", name, gen, ray_error_msg());
-        TEST_ASSERT_TRUE(blk[gen / 2] || all[gen / 2]);
+        TEST_ASSERT_FMT(blk[gen / 2] || all[gen / 2], "%s gen %d: the fused path declined", name, gen);
         if (gen == 2) {
             ray_enc_counters_t k; ray_enc_counters_get(&k);
             TEST_ASSERT_EQ_U(k.materialized, 0);
@@ -1206,6 +1206,259 @@ static test_result_t test_filter_leaf_ops(void) {
     PASS();
 }
 
+/* ---- Task 4: SYM equality and membership on ids ---- */
+
+static ray_op_t* ap_s_eq(ray_graph_t* g) {
+    ray_t* lit = ray_str("w7", 2);
+    ray_op_t* o = ray_eq(g, ray_scan(g, "s"), ray_const_atom(g, lit)); ray_release(lit); return o;
+}
+static ray_op_t* ap_s_ne_empty(ray_graph_t* g) {
+    ray_t* lit = ray_str("", 0);
+    ray_op_t* o = ray_ne(g, ray_scan(g, "s"), ray_const_atom(g, lit)); ray_release(lit); return o;
+}
+static ray_op_t* ap_s_eq_absent(ray_graph_t* g) {
+    ray_t* lit = ray_str("not-a-symbol", 12);
+    ray_op_t* o = ray_eq(g, ray_scan(g, "s"), ray_const_atom(g, lit)); ray_release(lit); return o;
+}
+static ray_op_t* ap_s_ne_absent(ray_graph_t* g) {
+    ray_t* lit = ray_str("not-a-symbol", 12);
+    ray_op_t* o = ray_ne(g, ray_scan(g, "s"), ray_const_atom(g, lit)); ray_release(lit); return o;
+}
+static ray_op_t* ap_s_eq_empty(ray_graph_t* g) {
+    ray_t* lit = ray_str("", 0);
+    ray_op_t* o = ray_eq(g, ray_scan(g, "s"), ray_const_atom(g, lit)); ray_release(lit); return o;
+}
+static ray_op_t* ap_s_lt(ray_graph_t* g) {
+    ray_t* lit = ray_str("w5", 2);
+    ray_op_t* o = ray_lt(g, ray_scan(g, "s"), ray_const_atom(g, lit)); ray_release(lit); return o;
+}
+/* the constant on the left, as a SYM atom (a runtime id, translated too) */
+static ray_op_t* ap_s_sym_left(ray_graph_t* g) {
+    ray_t* lit = ray_sym(ray_sym_intern("w2", 2));
+    ray_op_t* o = ray_ne(g, ray_const_atom(g, lit), ray_scan(g, "s")); ray_release(lit); return o;
+}
+/* one constant node feeding two compares */
+static ray_op_t* ap_s_shared(ray_graph_t* g) {
+    ray_t* lit = ray_str("w5", 2);
+    ray_op_t* c = ray_const_atom(g, lit); ray_release(lit);
+    return ray_or(g, ray_eq(g, ray_scan(g, "s"), c), ray_and(g, ray_ne(g, ray_scan(g, "s"), c),
+                                                             ray_ne(g, ray_scan(g, "s"), ray_const_str(g, "", 0))));
+}
+static ray_t* aw_sym_set(const char* const* xs, int n) {
+    ray_t* set = ray_vec_new(RAY_SYM, n); set->len = n;
+    for (int i = 0; i < n; i++) ((int64_t*)ray_data(set))[i] = ray_sym_intern(xs[i], strlen(xs[i]));
+    return set;
+}
+static const char* const g_sin_w7[] = { "w7", "w1", "zz-absent" };
+static const char* const g_sin_empty[] = { "w7", "" };
+static const char* const g_sin_far[] = { "w13", "w15" };
+static ray_op_t* ap_s_in(ray_graph_t* g) {
+    ray_t* set = aw_sym_set(g_sin_w7, 3);
+    ray_op_t* o = ray_in(g, ray_scan(g, "s"), ray_const_vec(g, set)); ray_release(set); return o;
+}
+static ray_op_t* ap_s_notin(ray_graph_t* g) {
+    ray_t* set = aw_sym_set(g_sin_w7, 3);
+    ray_op_t* o = ray_not_in(g, ray_scan(g, "s"), ray_const_vec(g, set)); ray_release(set); return o;
+}
+static ray_op_t* ap_s_in_empty(ray_graph_t* g) {
+    ray_t* set = aw_sym_set(g_sin_empty, 2);
+    ray_op_t* o = ray_in(g, ray_scan(g, "s"), ray_const_vec(g, set)); ray_release(set); return o;
+}
+static ray_op_t* ap_s_notin_empty(ray_graph_t* g) {
+    ray_t* set = aw_sym_set(g_sin_empty, 2);
+    ray_op_t* o = ray_not_in(g, ray_scan(g, "s"), ray_const_vec(g, set)); ray_release(set); return o;
+}
+static ray_op_t* ap_s_notin_far(ray_graph_t* g) {
+    ray_t* set = aw_sym_set(g_sin_far, 2);
+    ray_op_t* o = ray_not_in(g, ray_scan(g, "s"), ray_const_vec(g, set)); ray_release(set); return o;
+}
+
+static const int64_t* g_iset; static int g_ineg;
+static ray_op_t* ap_x_in(ray_graph_t* g) {
+    ray_t* set = ray_vec_new(RAY_I32, 3); set->len = 3;
+    for (int i = 0; i < 3; i++) ((int32_t*)ray_data(set))[i] = (int32_t)g_iset[i];
+    ray_op_t* c = ray_const_vec(g, set); ray_release(set);
+    return g_ineg ? ray_not_in(g, ray_scan(g, "x"), c) : ray_in(g, ray_scan(g, "x"), c);
+}
+
+/* The symbol index of row j of the "sy" fixture: -1 for "" (id 0). */
+static int aw_sy_val(int64_t j) {
+    if (j >= 65536 && j % 3 == 0) return -1;
+    return (int)(4 * (j / 65536) + j % 4);
+}
+/* Fused selection of <name><gen>: its pass count, the decoded bytes and
+ * materializations in *k; -1 when the fused path declines. */
+static int64_t aw_sel_count(const char* name, int gen, ray_op_t* (*build)(ray_graph_t*), ray_enc_counters_t* k) {
+    ray_t* t = aw_load(name, gen);
+    if (!t) return -2;
+    ray_graph_t* g = ray_graph_new(t);
+    ray_enc_counters_reset();
+    bool all = false;
+    ray_t* s = exec_pred_to_selection(g, build(g), ray_table_nrows(t), &all);
+    if (k) ray_enc_counters_get(k);
+    int64_t n = s && !RAY_IS_ERR(s) ? ray_rowsel_meta(s)->total_pass : all ? ray_table_nrows(t) : -1;
+    if (s && RAY_IS_ERR(s)) { ray_error_free(s); n = -3; }
+    else if (s) ray_rowsel_release(s);
+    ray_graph_free(g); ray_release(t);
+    return n;
+}
+/* The count of rayfall `q` (table as T) on <name>0 through the unfused
+ * executor: the reference every fused answer is held to. */
+static int64_t aw_unfused_count(const char* name, const char* q) {
+    char buf[512];
+    snprintf(buf, sizeof buf, "(set T (.db.splayed.get \"" AW_TMP "/%s0/\"))", name);
+    aw_eval_ok(buf);
+    ray_expr_disable = true;
+    ray_t* r = ray_eval_str(ray_test_tmp(q));
+    ray_expr_disable = false;
+    int64_t n = r && !RAY_IS_ERR(r) ? r->i64 : -1;
+    if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+    return n;
+}
+
+static test_result_t test_sym_membership(void) {
+    /* s clustered: each chunk holds 4 distinct symbols, empty strings (null) in chunks 1-3 */
+    aw_save("sy", "(table [s] (list (as 'SYMBOL (map (fn [j] (if (and (>= j 65536) (== 0 (% j 3))) \"\" "
+                  "(format \"w%\" (+ (* 4 (div j 65536)) (% j 4))))) (til 200000)))))", -1);
+    test_result_t r;
+    if ((r = aw_sel_same("sy", ap_s_eq, -1)).status != TEST_PASS) return r;
+    if ((r = aw_sel_same("sy", ap_s_ne_empty, -1)).status != TEST_PASS) return r;
+    if ((r = aw_sel_same("sy", ap_s_eq_absent, 0)).status != TEST_PASS) return r;
+    if ((r = aw_sel_same("sy", ap_s_ne_absent, 0)).status != TEST_PASS) return r;
+    /* "" (id 0): chunk 0 has no "" rows (== "" all-fail there, from the
+     * null count), chunks 1-3 have some (decided per vector by n_nulls or
+     * evaluated on ids) */
+    if ((r = aw_sel_same("sy", ap_s_eq_empty, -1)).status != TEST_PASS) return r;
+    if ((r = aw_sel_same("sy", ap_s_sym_left, -1)).status != TEST_PASS) return r;
+    if ((r = aw_sel_same("sy", ap_s_shared, -1)).status != TEST_PASS) return r;
+    /* the answers by construction (raw-id semantics: "" == "" holds and
+     * "" != c holds for every other c) */
+    int64_t n7 = 0, ne = 0, n2 = 0, n5 = 0;
+    for (int64_t j = 0; j < 200000; j++) {
+        int v = aw_sy_val(j);
+        n7 += v == 7; ne += v < 0; n2 += v == 2; n5 += v == 5;
+    }
+    /* the short last vector (rows 199680..199999, chunk 3, with "" rows)
+     * is RAW: no view, so a predicate its statistics leave open decodes
+     * exactly its 320 W8 ids; every other vector is answered on ids */
+    TEST_ASSERT_EQ_I(aw_vec_enc("sy", "s", 195), RAY_ENC_RAW);
+    ray_enc_counters_t k;
+    for (int gen = 0; gen <= 2; gen += 2) {
+        TEST_ASSERT_EQ_I(aw_sel_count("sy", gen, ap_s_eq, &k), n7);
+        if (gen) { TEST_ASSERT_EQ_U(k.decoded_bytes, 0); TEST_ASSERT_EQ_U(k.materialized, 0); }
+        TEST_ASSERT_EQ_I(aw_sel_count("sy", gen, ap_s_ne_empty, &k), 200000 - ne);
+        if (gen) { TEST_ASSERT_EQ_U(k.decoded_bytes, 320); TEST_ASSERT_EQ_U(k.materialized, 0); }
+        TEST_ASSERT_EQ_I(aw_sel_count("sy", gen, ap_s_eq_empty, &k), ne);
+        if (gen) TEST_ASSERT_EQ_U(k.decoded_bytes, 320);
+        TEST_ASSERT_EQ_I(aw_sel_count("sy", gen, ap_s_eq_absent, NULL), 0);
+        TEST_ASSERT_EQ_I(aw_sel_count("sy", gen, ap_s_ne_absent, NULL), 200000);
+        TEST_ASSERT_EQ_I(aw_sel_count("sy", gen, ap_s_sym_left, NULL), 200000 - n2);
+        TEST_ASSERT_EQ_I(aw_sel_count("sy", gen, ap_s_shared, NULL), 200000 - ne);
+    }
+    (void)n5;
+    /* the same answers through the unfused executor (generation 0) and
+     * through rayfall on both generations, STR and SYM literals */
+    static const char* const qs[] = {
+        "(count (select {from: T where: (== s \"w7\")}))",
+        "(count (select {from: T where: (== s 'w7)}))",
+        "(count (select {from: T where: (!= s \"\")}))",
+        "(count (select {from: T where: (== s \"\")}))",
+        "(count (select {from: T where: (== s \"not-a-symbol\")}))",
+        "(count (select {from: T where: (!= s \"not-a-symbol\")}))",
+        "(count (select {from: T where: (!= s 'w2)}))",
+        "(count (select {from: T where: (or (== s 'w5) (== s 'w9))}))",
+    };
+    for (size_t i = 0; i < sizeof qs / sizeof qs[0]; i++) {
+        int64_t want = aw_unfused_count("sy", qs[i]);
+        TEST_ASSERT_FMT(want >= 0, "%s: unfused", qs[i]);
+        AW_SAME("sy", qs[i], 0);
+        ray_t* got = aw_eval(qs[i]);                          /* T: generation 2 (aw_same) */
+        TEST_ASSERT_FMT(got && !RAY_IS_ERR(got) && got->i64 == want, "%s: %lld, unfused %lld", qs[i],
+                        got && !RAY_IS_ERR(got) ? (long long)got->i64 : -1LL, (long long)want);
+        ray_release(got);
+    }
+    /* ordered compares on SYM still decode and order strings (#738): the
+     * fused compiler keeps EXPR_BAIL_SYM_DOMAIN */
+    {
+        ray_t* t = aw_load("sy", 0);
+        ray_graph_t* g = ray_graph_new(t);
+        ray_expr_t ex; ray_t* cerr = NULL;
+        uint64_t before = ray_expr_bail_counts[EXPR_BAIL_SYM_DOMAIN];
+        TEST_ASSERT_FALSE(expr_compile(g, t, ap_s_lt(g), &ex, &cerr));
+        TEST_ASSERT_NULL(cerr);
+        TEST_ASSERT_EQ_U(ray_expr_bail_counts[EXPR_BAIL_SYM_DOMAIN], before + 1);
+        ray_graph_free(g); ray_release(t);
+    }
+    int64_t wlt = aw_unfused_count("sy", "(count (select {from: T where: (< s 'w5)}))");
+    AW_SAME("sy", "(count (select {from: T where: (< s 'w5)}))", 1);
+    {
+        ray_t* got = aw_eval("(count (select {from: T where: (< s 'w5)}))");
+        TEST_ASSERT_TRUE(got && !RAY_IS_ERR(got));
+        TEST_ASSERT_EQ_I(got->i64, wlt);
+        ray_release(got);
+    }
+    /* w7 lives only in chunk 1: chunks 0, 2 and 3 are decided from their id
+     * bounds without a decode, chunk 1's vectors are answered on ids */
+    ray_t* t = aw_load("sy", 2);
+    ray_graph_t* g = ray_graph_new(t);
+    ray_enc_counters_reset();
+    bool all = false;
+    ray_t* s = exec_pred_to_selection(g, ap_s_eq(g), ray_table_nrows(t), &all);
+    TEST_ASSERT_TRUE(s && !RAY_IS_ERR(s));
+    ray_enc_counters_get(&k);
+    TEST_ASSERT_EQ_U(k.decoded_bytes, 0);
+    TEST_ASSERT_EQ_U(k.materialized, 0);
+    ray_rowsel_release(s); ray_graph_free(g); ray_release(t);
+    PASS();
+}
+
+/* `in` / `not in` by membership bounds: a set none of whose ids lies in a
+ * chunk's or vector's [min, max] decides it without a read (`not in` only
+ * without "" rows); the rest is answered on the views' ids.  Generation 0
+ * (the unchanged in-place kernel) is the reference. */
+static test_result_t test_sym_in_bounds(void) {
+    aw_save("sy", "(table [s] (list (as 'SYMBOL (map (fn [j] (if (and (>= j 65536) (== 0 (% j 3))) \"\" "
+                  "(format \"w%\" (+ (* 4 (div j 65536)) (% j 4))))) (til 200000)))))", -1);
+    test_result_t r;
+    /* decoded bytes: only the RAW tail vector (320 W8 ids, with "" rows)
+     * when its chunk's bounds leave it open.  `in` decides chunk 3 from its
+     * ids (a "" member of a SYM set is a null element, dropped from the
+     * probe as exec_in does, so it matches no row); the `not in` shapes
+     * cannot (chunk 3 holds "" rows) */
+    ray_op_t* (*const shapes[])(ray_graph_t*) = { ap_s_in, ap_s_notin, ap_s_in_empty, ap_s_notin_empty, ap_s_notin_far };
+    static const int64_t dec[] = { 0, 320, 0, 320, 320 };
+    for (size_t i = 0; i < sizeof shapes / sizeof shapes[0]; i++)
+        if ((r = aw_sel_same("sy", shapes[i], dec[i])).status != TEST_PASS) { fprintf(stderr, "shape %zu\n", i); return r; }
+    int64_t nin = 0;
+    for (int64_t j = 0; j < 200000; j++) { int v = aw_sy_val(j); nin += v == 7 || v == 1; }
+    TEST_ASSERT_EQ_I(aw_sel_count("sy", 2, ap_s_in, NULL), nin);
+    /* integers: a nullable I32 column, sets inside and outside the bounds */
+    aw_save("ib", "(table [x] (list (as 'I32 (map (fn [j] (if (and (>= j 65536) (== 0 (% j 7))) 0N (+ (div j 1000) (% j 3)))) (til 140000)))))", -1);
+    static const int64_t sets[][3] = { { 5, 70, 9000 }, { -4, 1000, 2000 }, { 66, 67, 68 } };
+    for (int si = 0; si < 3; si++)
+        for (int neg = 0; neg < 2; neg++) {
+            g_iset = sets[si]; g_ineg = neg;
+            if ((r = aw_sel_same("ib", ap_x_in, 0)).status != TEST_PASS) {
+                fprintf(stderr, "set %d negate %d\n", si, neg);
+                return r;
+            }
+        }
+    PASS();
+}
+
+/* The same shapes route through the fused path on generation 0 now. */
+static test_result_t test_sym_fused_gen0(void) {
+    aw_save("sz", "(table [s] (list (as 'SYMBOL (map (fn [j] (format \"w%\" (% j 5))) (til 10000)))))", -1);
+    ray_t* t = aw_load("sz", 0);
+    ray_graph_t* g = ray_graph_new(t);
+    ray_expr_t ex;
+    ray_t* cerr = NULL;
+    TEST_ASSERT_TRUE(expr_compile(g, t, ap_s_eq(g), &ex, &cerr));   /* no EXPR_BAIL_SYM_DOMAIN */
+    TEST_ASSERT_NULL(cerr);
+    ray_graph_free(g); ray_release(t);
+    PASS();
+}
+
 const test_entry_t aware_entries[] = {
     { "aware/vview_encodings", test_vview_encodings, aw_setup, aw_teardown },
     { "aware/vview_near_top",  test_vview_near_top,  aw_setup, aw_teardown },
@@ -1226,5 +1479,8 @@ const test_entry_t aware_entries[] = {
     { "aware/filter_parted_leaves",    test_filter_parted_leaves,    aw_setup, aw_teardown },
     { "aware/fused_pred_leaves",       test_fused_pred_leaves,       aw_setup, aw_teardown },
     { "aware/filter_leaf_ops",         test_filter_leaf_ops,         aw_setup, aw_teardown },
+    { "aware/sym_membership", test_sym_membership, aw_setup, aw_teardown },
+    { "aware/sym_in_bounds",  test_sym_in_bounds,  aw_setup, aw_teardown },
+    { "aware/sym_fused_gen0", test_sym_fused_gen0, aw_setup, aw_teardown },
     { NULL, NULL, NULL, NULL },
 };

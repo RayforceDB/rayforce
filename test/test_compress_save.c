@@ -3021,14 +3021,20 @@ static test_result_t test_expr_compile_bound(void) {
         TEST_ASSERT_TRUE(nullable[gi][1]);
         TEST_ASSERT_FALSE(nullable[gi][2]);
 
-        /* SYM columns read from files resolve over the file's domain: both generations
-         * bail on the bound source's domain (the fused program reads raw ids) */
+        /* SYM columns read from files resolve over the file's domain: both
+         * generations bail on the bound source's domain when the fused
+         * program would read the raw ids as values; EQ / NE against a
+         * constant compiles, the constant translated into the domain (P3
+         * Task 4) */
         uint64_t nb = ray_expr_bail_counts[EXPR_BAIL_SYM_DOMAIN];
         ray_op_t* dx = ray_isnull(gr, ray_scan(gr, "x"));
         TEST_ASSERT_FALSE(expr_compile(gr, t, dx, &ex, &err));
         TEST_ASSERT_NULL(err);
         ray_op_t* dy = ray_eq(gr, ray_scan(gr, "y"), ray_const_str(gr, "yb", 2));
-        TEST_ASSERT_FALSE(expr_compile(gr, t, dy, &ex, &err));
+        TEST_ASSERT_TRUE(expr_compile(gr, t, dy, &ex, &err));
+        TEST_ASSERT_NULL(err);
+        ray_op_t* dw = ray_lt(gr, ray_scan(gr, "y"), ray_const_str(gr, "yb", 2));
+        TEST_ASSERT_FALSE(expr_compile(gr, t, dw, &ex, &err));
         TEST_ASSERT_NULL(err);
         TEST_ASSERT_EQ_U(ray_expr_bail_counts[EXPR_BAIL_SYM_DOMAIN], nb + 2);
         ray_t *e1 = NULL;

@@ -5935,12 +5935,11 @@ static test_result_t test_count_and(void) {
         test_result_t r = sr_count_and_on(t0, t2, splayed[i], 0);
         if (r.status != TEST_PASS) return r;
     }
-    /* A file-domain SYM compare is not scan-only (the plan's Decision): the
-     * fused program bails on the column's domain and the domain-aware
-     * executor reads every conjunct's column whole.  Answers only, pinned
-     * at that count. */
+    /* A file-domain SYM equality is scan-only since P3 Task 4: the fused
+     * program compares the column's own ids against the constant
+     * translated into its domain, so nothing is materialized. */
     static const sr_gap_t sym[] = {
-        { "(and (== s 'c) (> k 1000))", 1 },
+        { "(and (== s 'c) (> k 1000))", 0 },
         { NULL, 0 },
     };
     for (int i = 0; sym[i].q; i++) {
@@ -5967,8 +5966,9 @@ static test_result_t test_count_and(void) {
         test_result_t r = sr_count_and_on(SR_NP0, SR_NP2, parted[i], 0);
         if (r.status != TEST_PASS) return r;
     }
+    /* parted: the same, per encoded segment (one domain for every segment) */
     static const sr_gap_t sym_parted[] = {
-        { "(and (== s 'c) (> k 1000))", 3 },
+        { "(and (== s 'c) (> k 1000))", 0 },
         { NULL, 0 },
     };
     for (int i = 0; sym_parted[i].q; i++) {

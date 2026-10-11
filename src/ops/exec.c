@@ -27,6 +27,7 @@
 #include "lang/format.h"    /* ray_type_name (error context) */
 #include "ops/rowsel.h"
 #include "store/enccol.h"
+#include "store/enceval.h"
 #include "table/table.h"
 #include "ops/fused_group.h"
 #include "ops/idxop.h"
@@ -1651,11 +1652,76 @@ typedef struct {
     in_worker_ctx_t* ic;
     ray_col_src_t*   src;
     ray_scan_fail_t* fail;
+    /* Membership bounds (integer and SYM columns): the probe values, sorted
+     * ascending and distinct (keys == NULL: no bounds, every morsel read),
+     * and whether "" (SYM id 0) is one of them. */
+    const int64_t*   keys;
+    int              nkeys;
+    bool             has_zero;
+    bool             negate;
+    bool             sym_view_ok;      /* SYM: a view's id-0 rows answer as the kernel's */
 } in_sel_rfill_ctx_t;
+
+/* The membership rule over a range from its statistics (min / max over its
+ * non-null values, SYM ids nonzero; nn its null rows): when no probe value
+ * lies in [min, max], `in` passes no row (a null row passes neither) and
+ * `not in` passes every row, but only without nulls (a null row is not
+ * selected by `not in` here).  A SYM "" member is decided by the null
+ * count: any id-0 row leaves the range undecided.  1 / 0 / -1. */
+static int in_bounds_decide(const in_sel_rfill_ctx_t* c, int64_t mn, int64_t mx, bool has_mm, int64_t nn) {
+    if (!has_mm || mn > mx) return -1;
+    if (c->has_zero && nn > 0) return -1;
+    int lo = 0, hi = c->nkeys;
+    while (lo < hi) { int mid = lo + (hi - lo) / 2; if (c->keys[mid] < mn) lo = mid + 1; else hi = mid; }
+    if (lo < c->nkeys && c->keys[lo] <= mx) return -1;
+    if (!c->negate) return 0;
+    return nn == 0 ? 1 : -1;
+}
+
+/* Morsel [start, start + n) answered without a range read: from the chunk's
+ * directory, then the vector's descriptor, then the vector's view
+ * (ray_enc_eval_in on ids / values, inverted for `not in` with null rows
+ * cleared).  1 answered into out, 0 read it, -1 an owned *err (the view's
+ * validation, as the decode would report it). */
+static int in_sel_bounds(const in_sel_rfill_ctx_t* c, int64_t start, int64_t n, uint8_t* out, ray_t** err) {
+    if (!c->keys) return 0;
+    int d = -1;
+    if ((start >> 16) == ((start + n - 1) >> 16)) {
+        ray_enc_chunk_stat_t st;
+        if (ray_col_src_chunk_stat(c->src, start >> 16, &st))
+            d = in_bounds_decide(c, st.min, st.max, st.has_minmax, (int64_t)st.null_count);
+    }
+    if (d < 0 && start / RAY_ENC_VEC == (start + n - 1) / RAY_ENC_VEC) {
+        int64_t mn, mx; uint32_t nn;
+        if (ray_col_src_vec_stat(c->src, start / RAY_ENC_VEC, &mn, &mx, &nn))
+            d = in_bounds_decide(c, mn, mx, true, nn);
+    }
+    if (d >= 0) { memset(out, d, (size_t)n); return 1; }
+    if (start % RAY_ENC_VEC) return 0;
+    ray_enc_vview_t v;                                  /* on this task's stack */
+    int vr = ray_col_src_vview(c->src, start / RAY_ENC_VEC, &v, err);
+    if (vr <= 0 || v.n != n) return vr < 0 ? -1 : 0;
+    if (v.type == RAY_SYM && !c->sym_view_ok && v.n_nulls > 0) return 0;
+    if (!ray_enc_eval_in(&v, c->keys, c->nkeys, 0, out)) return 0;
+    if (c->negate) {
+        for (int64_t i = 0; i < n; i++) out[i] ^= 1;
+        ray_enc_mask_nulls(&v, 0, out);
+    }
+    return 1;
+}
+
+static int in_key_cmp(const void* a, const void* b) {
+    int64_t x = *(const int64_t*)a, y = *(const int64_t*)b;
+    return (x > y) - (x < y);
+}
 
 static void in_sel_rfill(void* vctx, ray_col_scratch_t* sc, int64_t start, int64_t n, uint8_t* out) {
     in_sel_rfill_ctx_t* c = (in_sel_rfill_ctx_t*)vctx;
     if (ray_scan_fail_skip(c->fail, start)) { memset(out, 0, (size_t)n); return; }
+    ray_t* berr = NULL;
+    int b = in_sel_bounds(c, start, n, out, &berr);
+    if (b > 0) return;
+    if (b < 0) { ray_scan_fail_note(c->fail, start, berr); memset(out, 0, (size_t)n); return; }
     int64_t at = 0;
     while (at < n) {
         ray_col_range_t v;
@@ -1727,8 +1793,30 @@ ray_t* exec_in_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
                                      &ic, &sv_hdr, &lut_hdr) != IN_CTX_OK)
             return NULL;  /* STR / GUID / OOM → bool-path fallback */
         ray_col_src_advise(src, 0, nrows);
-        in_sel_rfill_ctx_t fctx = { &ic, src, &fail };
+        in_sel_rfill_ctx_t fctx = { .ic = &ic, .src = src, .fail = &fail, .negate = negate };
+        /* membership bounds: the probe values sorted once (integer and SYM
+         * columns; a float column or set keeps the read) */
+        int64_t kstack[32];
+        int64_t* keys = NULL;
+        if (!ic.use_double && ic.sv_len <= INT32_MAX) {
+            keys = ic.sv_len <= 32 ? kstack : (int64_t*)ray_alloc_raw((size_t)ic.sv_len * sizeof(int64_t));
+            if (keys) {
+                if (ic.sv_len) memcpy(keys, ic.svi, (size_t)ic.sv_len * sizeof(int64_t));
+                qsort(keys, (size_t)ic.sv_len, sizeof(int64_t), in_key_cmp);
+                int64_t nk = 0;
+                for (int64_t j = 0; j < ic.sv_len; j++)
+                    if (nk == 0 || keys[nk - 1] != keys[j]) keys[nk++] = keys[j];
+                fctx.keys = keys;
+                fctx.nkeys = (int)nk;
+                fctx.has_zero = src->type == RAY_SYM && nk > 0 && keys[0] == 0;
+                /* a SYM view's id-0 rows answer (0 in set) ^ negate, as the
+                 * verdict LUT and the unchecked loop do; the null-checked
+                 * loop passes them as 0, so it takes views without them */
+                fctx.sym_view_ok = ic.symlut || !ic.col_has_nulls;
+            }
+        }
         sel = pred_sel_drive(nrows, in_sel_rfill, &fctx, &fail, all_pass);
+        if (keys && keys != kstack) ray_free_raw(keys);
     }
 
     if (sv_hdr) ray_free(sv_hdr);

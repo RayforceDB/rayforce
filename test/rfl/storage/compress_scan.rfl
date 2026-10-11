@@ -35,12 +35,12 @@
 (at (.idx.info A 'k) 'materialized) -- false
 ;; a filtered group-by over fewer survivors than the parallel threshold
 ;; gathers its key and input (the v2 compact fallback, a Task 15 gap); its
-;; SYM equality predicate reads the column whole (exec_node OP_SCAN in the
-;; pre-executed filter: the gate's "file-domain SYM compare" class)
+;; SYM equality predicate compares the column's ids on the fused path (P3
+;; Task 4), so s itself is not materialized
 (at (select {c: (count k) from: A where: (== s 'y) by: g}) 'c) -- (at (select {c: (count k) from: B where: (== s 'y) by: g}) 'c)
 (at (.idx.info A 'g) 'materialized) -- true
 (at (.idx.info A 'k) 'materialized) -- true
-(at (.idx.info A 's) 'materialized) -- true
+(at (.idx.info A 's) 'materialized) -- false
 (at (select {m: (max f) from: A where: (< k 1000)}) 'm) -- (at (select {m: (max f) from: B where: (< k 1000)}) 'm)
 (at (select {k: k from: A where: (> v 100) desc: k take: 3}) 'k) -- (at (select {k: k from: B where: (> v 100) desc: k take: 3}) 'k)
 (at (.idx.info A 'v) 'materialized) -- false

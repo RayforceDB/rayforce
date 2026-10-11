@@ -970,6 +970,29 @@ static inline int zone_cmp_core(int64_t cmin, int64_t cmax, bool has_minmax, boo
     return -1;
 }
 
+/* The SYM membership rule: (ids == c) or (ids != c) over a range whose
+ * statistics exclude id 0 ("", the in-band null): min / max over the
+ * nonzero ids (has_minmax false when every row is id 0), n_nulls the id-0
+ * rows of `rows`.  1 all-pass, 0 all-fail, -1 undecided.  c is an id of
+ * the column's domain, or -1 for a string absent from it (EQ all-fail, NE
+ * all-pass, without statistics).  c == 0 is decided by the null count
+ * alone, a nonzero c by [min, max].  EQ / NE only: ids are never ordered
+ * (#738); any other operator is undecided. */
+static inline int zone_sym_decision(int64_t cmin, int64_t cmax, bool has_minmax, int64_t n_nulls,
+                                    int64_t rows, uint16_t op, int64_t c) {
+    if (op != OP_EQ && op != OP_NE) return -1;
+    int eq = -1;
+    if (c < 0) eq = 0;
+    else if (rows <= 0) eq = -1;
+    else if (c == 0) eq = n_nulls == 0 ? 0 : n_nulls == rows ? 1 : -1;
+    else if (n_nulls == rows) eq = 0;
+    else if (!has_minmax || cmin > cmax) eq = -1;
+    else if (c < cmin || c > cmax) eq = 0;
+    else if (cmin == cmax && n_nulls == 0) eq = 1;
+    if (eq < 0) return -1;
+    return op == OP_EQ ? eq : 1 - eq;
+}
+
 /* zone_cmp_core over double extrema (F32 / F64 directory and descriptor
  * statistics, NaN excluded as the null): the same table under the
  * predicate comparator, where -0.0 == +0.0 as plain C comparison gives. */

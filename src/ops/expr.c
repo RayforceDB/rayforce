@@ -727,6 +727,37 @@ static bool expr_null_capable(uint8_t op, int8_t dt, int8_t t1) {
     return false;
 }
 
+/* The bytes of a STR literal constant node ("" included) or of a non-null
+ * SYM one, or false. */
+static bool expr_sym_lit_bytes(ray_graph_t* g, ray_op_t* n, const char** s, size_t* len) {
+    if (!n || n->opcode != OP_CONST) return false;
+    ray_op_ext_t* ext = find_ext(g, n->id);
+    ray_t* lit = ext ? ext->literal : NULL;
+    if (!lit) return false;
+    if (lit->type == -RAY_STR) { *s = ray_str_ptr(lit); *len = ray_str_len(lit); return true; }   /* "" included */
+    if (lit->type == -RAY_SYM && !RAY_ATOM_IS_NULL(lit)) {
+        ray_t* str = ray_sym_str(lit->i64);        /* borrowed from the intern table */
+        if (!str) return false;
+        *s = ray_str_ptr(str); *len = ray_str_len(str);
+        return true;
+    }
+    return false;
+}
+static bool expr_sym_lit(ray_graph_t* g, ray_op_t* n) {
+    const char* s; size_t len;
+    return expr_sym_lit_bytes(g, n, &s, &len);
+}
+/* A STR / SYM literal as an id of a file-domain source: "" is id 0 in
+ * every domain; a string absent from the domain is the impossible id -1
+ * (EQ all-false; NE true for every row, id 0 included, as null != c). */
+static bool expr_sym_lit_in(ray_graph_t* g, ray_op_t* n, const ray_col_src_t* src, int64_t* id) {
+    const char* s; size_t len;
+    if (!expr_sym_lit_bytes(g, n, &s, &len)) return false;
+    int64_t x = len == 0 ? 0 : ray_col_src_sym_find(src, s, len);
+    *id = x < 0 ? -1 : x;
+    return true;
+}
+
 /* Compile expression DAG into flat instruction array.
  * Returns true on success. Only compiles element-wise subtrees. */
 bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, ray_t** err) {
@@ -753,6 +784,20 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
      * arithmetic — reads the lane as a value and keeps the proof. */
     uint8_t sym_cmp_safe[nc];
     memset(sym_cmp_safe, 1, nc * sizeof(uint8_t));
+    /* Which nodes are consumed only by EQ / NE against a non-null STR or
+     * SYM constant: a file-domain SYM column read so compares on its own
+     * ids once the constant is translated into its domain (below, at the
+     * compare).  An ordered consumer keeps EXPR_BAIL_SYM_DOMAIN: ids are
+     * never ordered (#738 / #768). */
+    uint8_t sym_eq_only[nc];
+    memset(sym_eq_only, 1, nc * sizeof(uint8_t));
+    /* Per register: the bound file-domain SYM source of a scan register
+     * admitted by sym_eq_only; a STR constant absent from the global
+     * intern table (usable only once re-translated into such a domain). */
+    ray_col_src_t* fd_src[EXPR_MAX_REGS];
+    bool           const_unres[EXPR_MAX_REGS];
+    memset(fd_src, 0, sizeof fd_src);
+    memset(const_unres, 0, sizeof const_unres);
     {
         uint8_t  seen[nc];
         uint32_t stk[nc];
@@ -762,6 +807,7 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
         while (ssp > 0) {
             ray_op_t* n = &g->nodes[stk[--ssp]];
             bool cmp = n->arity == 2 && n->opcode >= OP_EQ && n->opcode <= OP_GE;
+            bool eqne = n->arity == 2 && (n->opcode == OP_EQ || n->opcode == OP_NE);
             for (int i = 0; i < n->arity; i++) {
                 ray_op_t* ch = op_child(g, n, i);
                 if (!ch || ch->id >= nc) continue;
@@ -780,6 +826,7 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
                     }
                 }
                 if (!safe) sym_cmp_safe[ch->id] = 0;
+                if (!(eqne && expr_sym_lit(g, op_child(g, n, 1 - i)))) sym_eq_only[ch->id] = 0;
                 if (!seen[ch->id]) { seen[ch->id] = 1; stk[ssp++] = ch->id; }
             }
         }
@@ -859,8 +906,11 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
                  * runtime-domain columns.  FILE-domain columns bail to
                  * the non-fused executor, which is domain-aware.  No-op
                  * pre-flip (every domain is the runtime singleton). */
-                if (elem == RAY_SYM && src->dom != ray_sym_runtime_domain())
-                    EXPR_BAIL(EXPR_BAIL_SYM_DOMAIN);
+                if (elem == RAY_SYM && src->dom != ray_sym_runtime_domain()) {
+                    if (node->id >= nc || !sym_eq_only[node->id])
+                        EXPR_BAIL(EXPR_BAIL_SYM_DOMAIN);
+                    fd_src[r] = src;                   /* EQ / NE on ids: constants re-translated */
+                }
                 /* Determine whether any lane in this column may be null.
                  * A generation-2 source answers from its directory.  A
                  * generation-0 source keeps the per-segment scan (the
@@ -951,9 +1001,16 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
             } else if (node->opcode == OP_CONST) {
                 ray_op_ext_t* ext = find_ext(g, node->id);
                 if (!ext || !ext->literal) EXPR_BAIL(EXPR_BAIL_CONST);
-                if (RAY_ATOM_IS_NULL(ext->literal)) EXPR_BAIL(EXPR_BAIL_CONST); /* null constants need the null-aware path */
                 double cf; int64_t ci; bool is_f64;
-                if (!atom_to_numeric(ext->literal, &cf, &ci, &is_f64)) {
+                if (RAY_ATOM_IS_NULL(ext->literal)) {
+                    /* null constants need the null-aware path, except "":
+                     * id 0 of a file-domain SYM compare, which reads its own
+                     * re-translation (the check after the walk bails any
+                     * other reader) */
+                    if (ext->literal->type != -RAY_STR) EXPR_BAIL(EXPR_BAIL_CONST);
+                    const_unres[r] = true;
+                    ci = 0; cf = 0; is_f64 = false;
+                } else if (!atom_to_numeric(ext->literal, &cf, &ci, &is_f64)) {
                     /* Try resolving string constant to symbol intern ID —
                      * enables fused evaluation of SYM column comparisons
                      * (e.g. id2 = 'id080' compiles to integer EQ). */
@@ -961,7 +1018,10 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
                         const char* s = ray_str_ptr(ext->literal);
                         size_t slen = ray_str_len(ext->literal);
                         int64_t sid = ray_sym_find(s, slen);
-                        if (sid < 0) EXPR_BAIL(EXPR_BAIL_CONST);
+                        /* absent from the intern table: only a file-domain
+                         * compare may read it, which re-translates it (the
+                         * check after the walk bails any other reader) */
+                        if (sid < 0) { const_unres[r] = true; sid = -1; }
                         ci = sid;
                         cf = (double)sid;
                         is_f64 = false;
@@ -1049,6 +1109,28 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
                     }
                 }
 #undef EXPR_PROMOTE
+                /* EQ / NE of a file-domain SYM scan with a constant: the
+                 * constant in the column's domain, in a register of this
+                 * instruction's own (a shared constant register may feed a
+                 * runtime-domain compare elsewhere). */
+                if ((op == OP_EQ || op == OP_NE) && s2 != 0xFF &&
+                    (fd_src[s1] || fd_src[s2])) {
+                    bool left = fd_src[s1] != NULL;
+                    ray_op_t* cn = op_child(g, node, left ? 1 : 0);
+                    uint8_t cs = left ? s2 : s1;
+                    if (out->regs[cs].kind != REG_CONST) EXPR_BAIL(EXPR_BAIL_SYM_DOMAIN);
+                    int64_t fid;
+                    if (!expr_sym_lit_in(g, cn, left ? fd_src[s1] : fd_src[s2], &fid))
+                        EXPR_BAIL(EXPR_BAIL_CONST);
+                    uint8_t nr = out->n_regs;
+                    if (nr >= EXPR_MAX_REGS) EXPR_BAIL(EXPR_BAIL_REGS);
+                    out->regs[nr].kind = REG_CONST;
+                    out->regs[nr].type = RAY_I64;
+                    out->regs[nr].const_i64 = fid;
+                    out->regs[nr].const_f64 = (double)fid;
+                    out->n_regs++;
+                    if (left) s2 = nr; else s1 = nr;
+                }
                 r = out->n_regs; /* re-read after possible CAST inserts */
                 if (r >= EXPR_MAX_REGS) EXPR_BAIL(EXPR_BAIL_REGS);
 
@@ -1134,6 +1216,12 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
     }
 
     if (out->n_regs == 0 || out->n_ins == 0) EXPR_BAIL(EXPR_BAIL_OTHER);
+    /* a STR constant the intern table lacks is read only through its
+     * file-domain re-translations */
+    for (uint8_t i = 0; i < out->n_ins; i++)
+        if (const_unres[out->ins[i].src1] ||
+            (out->ins[i].src2 != 0xFF && const_unres[out->ins[i].src2]))
+            EXPR_BAIL(EXPR_BAIL_CONST);
     out->out_reg = out->n_regs - 1;
     out->out_type = out->regs[out->out_reg].type;
 
@@ -2142,6 +2230,28 @@ static int zone_vec_decision(const ray_col_src_t* src, int64_t v, uint16_t cmp_o
     return d < 0 ? ZT_MIXED : d;
 }
 
+/* The SYM arm of the two decisions above (zone_sym_decision): EQ / NE of
+ * a SYM register against an id of its domain (-1: absent, decided without
+ * statistics).  A chunk whose every row is id 0 is decided from its
+ * directory only for a synthetic stand-in, as zone_dir_decision does; a
+ * saved one is left to its vectors, whose views validate it. */
+static int zone_sym_dir_decision(const ray_col_src_t* src, int64_t ch, uint16_t cmp_op, int64_t cval) {
+    if (cval < 0) return zone_sym_decision(0, 0, false, 0, 1, cmp_op, cval);
+    ray_enc_chunk_stat_t st;
+    if (!ray_col_src_chunk_stat(src, ch, &st)) return ZT_MIXED;
+    if ((int64_t)st.null_count == st.rows && !expr_src_synthetic(src)) return ZT_MIXED;
+    int d = zone_sym_decision(st.min, st.max, st.has_minmax, (int64_t)st.null_count, st.rows, cmp_op, cval);
+    return d < 0 ? ZT_MIXED : d;
+}
+static int zone_sym_vec_decision(const ray_col_src_t* src, int64_t v, uint16_t cmp_op, int64_t cval) {
+    int64_t mn, mx; uint32_t nn;
+    if (!ray_col_src_vec_stat(src, v, &mn, &mx, &nn)) return ZT_MIXED;
+    int64_t rows = src->len - v * RAY_ENC_VEC;              /* the last vector may be short */
+    if (rows > RAY_ENC_VEC) rows = RAY_ENC_VEC;
+    int d = zone_sym_decision(mn, mx, true, nn, rows, cmp_op, cval);
+    return d < 0 ? ZT_MIXED : d;
+}
+
 /* The float arm of the two decisions above: an F32 / F64 register against
  * an F64 constant, from the double extrema (bit patterns) of the chunk's
  * directory and then of the vector's descriptor.  A chunk whose every row
@@ -2181,7 +2291,8 @@ static bool expr_zone_eligible(const ray_expr_t* expr) {
     if (expr->out_type != RAY_BOOL) return false;
     for (uint8_t r = 0; r < expr->n_regs; r++)
         if (expr->regs[r].kind == REG_SCAN &&
-            (expr->regs[r].enc ? zone_dir_type(expr->regs[r].col_type) || zone_f64_type(expr->regs[r].col_type)
+            (expr->regs[r].enc ? zone_dir_type(expr->regs[r].col_type) || zone_f64_type(expr->regs[r].col_type) ||
+                                 expr->regs[r].col_type == RAY_SYM
                                : zone_fresh_index(expr->regs[r].col_obj) != NULL))
             return true;
     return false;
@@ -2231,7 +2342,14 @@ static int expr_zone_decide(const ray_expr_t* expr, int64_t ms, int64_t me) {
              * a null constant, EXPR_BAIL_CONST), it guards every arm if that
              * bail is ever relaxed. */
             if (src_reg >= 0 && cval == NULL_I64) { src_reg = -1; col = NULL; }
-            if (src_reg >= 0 && expr->regs[src_reg].enc) {
+            if (src_reg >= 0 && expr->regs[src_reg].enc && expr->regs[src_reg].col_type == RAY_SYM) {
+                /* SYM: the membership rule on ids, EQ / NE only */
+                const ray_col_src_t* ss = expr->regs[src_reg].src;
+                if ((ms >> 16) == ((me - 1) >> 16))
+                    d = zone_sym_dir_decision(ss, ms >> 16, cmp, cval);
+                if (d == ZT_MIXED && ms / RAY_ENC_VEC == (me - 1) / RAY_ENC_VEC)
+                    d = zone_sym_vec_decision(ss, ms / RAY_ENC_VEC, cmp, cval);
+            } else if (src_reg >= 0 && expr->regs[src_reg].enc) {
                 /* generation 2: the directory's chunk of 64K rows, then the
                  * descriptor of the vector the morsel lies in */
                 if (zone_dir_type(expr->regs[src_reg].col_type) && (ms >> 16) == ((me - 1) >> 16))
