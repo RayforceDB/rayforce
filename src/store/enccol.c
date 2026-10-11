@@ -1193,7 +1193,8 @@ static bool fk_bits_all(const uint8_t* bm, uint32_t lo, uint32_t hi) {
  * by the run decode and the view so they cannot drift: SYM ids below the
  * bound or 0 (the null), the others inside the vector's statistics, and
  * exactly n_nulls rows of id 0; a signed kind's run on the sentinel wholly
- * inside the bitmap.  Inlined, so the decode's code is what it was. */
+ * inside the bitmap.  Inlined; the decode is behaviour-identical (its
+ * register allocation differs slightly). */
 static inline __attribute__((always_inline)) bool fk_runs_ok(const ray_enccol_t* e, const ray_enc_desc_t* d,
                                                              const uint8_t* bm, ray_enc_kind_t k,
                                                              const fk_vals_t* vals, const fk_vals_t* ends, uint32_t nr) {
@@ -1712,6 +1713,31 @@ static bool vview_no_hit(const ray_enc_vview_t* v, const ray_enc_lanes_t* res, u
     return true;
 }
 
+/* The largest / smallest of n lanes at width T (out of line loops, so
+ * they vectorise). */
+#define VV_RED(NAME, UT, OP) static __attribute__((noinline)) UT NAME(const UT* restrict a, int n, UT x) { \
+        for (int i = 0; i < n; i++) { x = a[i] OP x ? a[i] : x; }                     \
+        return x; }
+VV_RED(vv_max8,  uint8_t,  >) VV_RED(vv_max16, uint16_t, >) VV_RED(vv_max32, uint32_t, >) VV_RED(vv_max64, uint64_t, >)
+VV_RED(vv_min8,  uint8_t,  <) VV_RED(vv_min16, uint16_t, <) VV_RED(vv_min32, uint32_t, <) VV_RED(vv_min64, uint64_t, <)
+#undef VV_RED
+static uint64_t vview_lanes_max(const ray_enc_lanes_t* l, int T, int n) {
+    switch (T) {
+    case 8:  return vv_max8(l->b, n, 0);
+    case 16: return vv_max16(l->h, n, 0);
+    case 32: return vv_max32(l->s, n, 0);
+    default: return vv_max64(l->q, n, 0);
+    }
+}
+static uint64_t vview_lanes_min(const ray_enc_lanes_t* l, int T, int n) {
+    switch (T) {
+    case 8:  return vv_min8(l->b, n, UINT8_MAX);
+    case 16: return vv_min16(l->h, n, UINT16_MAX);
+    case 32: return vv_min32(l->s, n, UINT32_MAX);
+    default: return vv_min64(l->q, n, UINT64_MAX);
+    }
+}
+
 /* A SYM FOR_BP view's ids (base added, mod 2^T) into ids, checked as
  * dec_fast's FOR_BP arm checks them: below the bound or 0, the non-null
  * ones inside the vector's statistics, exactly n_nulls zeros. */
@@ -1836,21 +1862,30 @@ int ray_enccol_vview(ray_enccol_t* e, int64_t vec, ray_enc_vview_t* v, ray_t** e
         uint64_t base; memcpy(&base, body, 8);
         if (base & ~m) return 0;
         v->base = base; v->width = w; v->packed = body + 8;
-        /* no wrap: logical(base) + (2^w - 1) stays at or below the kind's
-         * largest value, so the residuals compare in logical order.  The
-         * writer's base is the vector minimum: a sound file always passes. */
+        /* no wrap: logical(base) + every residual stays at or below the
+         * kind's largest value, so the residuals compare in logical order.
+         * Fast accept: base + (2^w - 1) cannot wrap.  Otherwise the actual
+         * residuals decide (exact, from the body, never the statistics):
+         * the writer's base is the vector minimum and its largest residual
+         * max - min, so a sound file always passes. */
         const uint64_t umax = w >= 64 ? ~0ull : (1ull << w) - 1;
         const uint64_t room = v->k.is_signed ? (uint64_t)(int64_t)(m >> 1) - (uint64_t)ray_enc_logical(base, v->k)
                                              : m - base;
-        if (umax > room) return 0;
+        const bool may_wrap = umax > room;
         _Alignas(64) ray_enc_lanes_t lanes;                  /* one unpack, on the stack */
-        if (sym) return vview_sym_ids_ok(e, d, v, &lanes) ? 1 : 0;
-        if (!v->k.is_signed) return 1;                       /* BOOL, U8: no nulls */
-        if (d->n_nulls && !bm) return 0;
+        if (sym) {
+            /* ids are base + residual mod 2^T: a residual wrapped exactly
+             * when its id fell below the base */
+            if (!vview_sym_ids_ok(e, d, v, &lanes)) return 0;
+            return !may_wrap || vview_lanes_min(&lanes, T, v->n) >= base ? 1 : 0;
+        }
         const uint64_t sent = (uint64_t)1 << (T - 1), hitv = (sent - base) & m;
-        if (hitv > umax) return 1;                           /* no residual can be the sentinel */
+        const bool can_hit = v->k.is_signed && hitv <= umax;
+        if (v->k.is_signed && d->n_nulls && !bm) return 0;
+        if (!may_wrap && !can_hit) return 1;                 /* BOOL, U8 have no nulls; no residual is the sentinel */
         ray_enccol_unpack_resid(v, &lanes);
-        return vview_no_hit(v, &lanes, hitv) ? 1 : 0;
+        if (may_wrap && vview_lanes_max(&lanes, T, v->n) > room) return 0;
+        return !can_hit || vview_no_hit(v, &lanes, hitv) ? 1 : 0;
     }
     case RAY_ENC_DICT: {
         if (d->width || !v->k.is_signed || sym || avail < 16 || body[0] != RAY_ENC_FOR_BP) return 0;

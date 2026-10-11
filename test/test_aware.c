@@ -238,6 +238,51 @@ static test_result_t test_vview_encodings(void) {
     PASS();
 }
 
+/* FOR_BP vectors of column `col` of <name>2 whose worst case base +
+ * (2^w - 1) passes the kind's largest value (the no-wrap check then reads
+ * the actual residuals), or -1. */
+static int64_t aw_near_top(const char* name, const char* col) {
+    ray_t* t = aw_load(name, 2);
+    ray_t* encv = t ? ray_table_get_col_enc(t, ray_sym_intern(col, strlen(col))) : NULL;
+    if (!encv) { if (t) ray_release(t); return -1; }
+    ray_enccol_t* e = ray_enccol_of(encv);
+    ray_enc_vview_t v;
+    int64_t hits = 0;
+    for (int64_t vec = 0; vec < ray_enc_nvecs(e->len); vec++) {
+        ray_t* err = NULL;
+        if (ray_enccol_vview(e, vec, &v, &err) != 1 || v.enc != RAY_ENC_FOR_BP) { if (err) ray_error_free(err); continue; }
+        const uint64_t m = v.k.T == 64 ? ~0ull : (1ull << v.k.T) - 1;
+        const uint64_t umax = v.width >= 64 ? ~0ull : (1ull << v.width) - 1;
+        const uint64_t room = v.k.is_signed ? (uint64_t)(int64_t)(m >> 1) - (uint64_t)ray_enc_logical(v.base, v.k) : m - v.base;
+        hits += umax > room;
+    }
+    ray_release(t);
+    return hits;
+}
+
+/* Sound FOR_BP vectors near the top of their kind: the writer's base is
+ * the minimum, so base + (2^w - 1) may pass the largest value while every
+ * actual residual stays inside it.  Each vouches and equals the decode. */
+static test_result_t test_vview_near_top(void) {
+    static const struct { const char* name; const char* col; const char* tbl; } fx[] = {
+        { "nu", "x", "(table [x] (list (as 'U8 (map (fn [j] (+ 200 (% j 56))) (til 3000)))))" },
+        { "n16", "x", "(table [x] (list (as 'I16 (map (fn [j] (if (== 0 (% j 9)) 0N (- 32767 (% j 48)))) (til 3000)))))" },
+        { "n32", "x", "(table [x] (list (as 'I32 (map (fn [j] (if (== 0 (% j 9)) 0N (- 2147483647 (% j 48)))) (til 3000)))))" },
+        { "n64", "x", "(table [x] (list (map (fn [j] (if (== 0 (% j 9)) 0N (- 9223372036854775807 (% j 48)))) (til 3000))))" },
+        /* T = 64, w = 64: the least and the largest non-null value */
+        { "nw", "x", "(table [x] (list (map (fn [j] (if (== 0 (% j 2)) -9223372036854775807 9223372036854775807)) (til 3000))))" },
+        /* SYM W8: ids 1..250 in the first vector (the domain), 130..250 after */
+        { "ns", "s", "(table [s] (list (as 'SYMBOL (map (fn [j] (format \"a%\" (if (< j 1024) (% j 250) (+ 129 (% j 121))))) (til 4000)))))" },
+    };
+    for (size_t i = 0; i < sizeof fx / sizeof fx[0]; i++) {
+        aw_save(fx[i].name, fx[i].tbl, RAY_ENC_FOR_BP);
+        test_result_t r = aw_check_view(fx[i].name, fx[i].col, RAY_ENC_FOR_BP);
+        if (r.status != TEST_PASS) return r;
+        TEST_ASSERT_FMT(aw_near_top(fx[i].name, fx[i].col) > 0, "%s: no vector near the top", fx[i].name);
+    }
+    PASS();
+}
+
 /* ---- Declines: single-column files patched in place (the P2 corrupt-test
  * pattern of test_enc_corrupt.c: the directory at byte 96, 64 bytes per
  * chunk; 48-byte descriptors; payloads after the descriptor area) ---- */
@@ -277,17 +322,19 @@ static bool dv_save(ray_t* v, int enc, const char* p) {
     return e == RAY_OK && img_load(p);
 }
 /* A SYM W8 column of n ids with saved count 200 (ids 200 and up are outside the domain). */
-static bool dv_save_sym(const uint8_t* ids, int n, int enc, const char* p) {
+static bool dv_save_sym_n(const uint8_t* ids, int n, int enc, uint32_t count, const char* p) {
     FILE* f = fopen(p, "wb+");
     if (!f) return false;
     ray_encw_t w;
     ray_encw_test_force(enc);
-    bool ok = ray_encw_begin(&w, f, RAY_SYM, RAY_SYM_W8, n, 200, 0, 0) == RAY_OK &&
+    bool ok = ray_encw_begin(&w, f, RAY_SYM, RAY_SYM_W8, n, count, 0, 0) == RAY_OK &&
               ray_encw_chunk(&w, ids, NULL, n) == RAY_OK && ray_encw_finish(&w) == RAY_OK;
     ray_encw_test_force(-1);
     ray_encw_free(&w); fclose(f);
     return ok && img_load(p);
 }
+
+static bool dv_save_sym(const uint8_t* ids, int n, int enc, const char* p) { return dv_save_sym_n(ids, n, enc, 200, p); }
 
 static bool msg_has(const char* needle) {
     const char* m = ray_error_msg();
@@ -450,6 +497,10 @@ static test_result_t test_vview_declines(void) {
     W64(payload_at(0), 1ull << 32);                               DV(p, 0, "FOR_BP base above the type width");
     DV_SAVE(dv_hash(RAY_I32, 5000, 0), RAY_ENC_FOR_BP, p);
     W64(payload_at(0), 1ull << 31);                               DV(p, 0, "sentinel outside the bitmap");
+    /* the body size against the width: the descriptor's width one lower */
+    DV_SAVE(dv_hash(RAY_I32, 5000, 0), RAY_ENC_FOR_BP, p);
+    TEST_ASSERT_EQ_I(g_img[desc_at(0) + 1], 6);
+    W8(desc_at(0) + 1, 5);                                        DV(p, 0, "bytes after the codec body");
     DV_SAVE(dv_hash(RAY_I16, 5000, 10), RAY_ENC_FOR_BP, p); NEED_ENC(0, RAY_ENC_FOR_BP); DV(p, 1, NULL);
     W64(payload_at(0) + 128, 1ull << 15);                         DV(p, 0, "sentinel outside the bitmap");
     DV_SAVE(dv_hash(RAY_U8, 0, 0), RAY_ENC_FOR_BP, p); NEED_ENC(0, RAY_ENC_FOR_BP); DV(p, 1, NULL);
@@ -495,6 +546,16 @@ static test_result_t test_vview_declines(void) {
         DV_SAVE_SYM(ids, 1024, RAY_ENC_FOR_BP, p); W64(payload_at(0), 0); DV(p, 0, "SYM null count");
         DV_SAVE_SYM(ids, 1024, RAY_ENC_FOR_BP, p);
         W64(desc_at(0) + 40, 114);                                DV(p, 0, "value outside its statistics");
+        /* a wrapping SYM body every other rule accepts: ids 1 and 51 (base
+         * 1, w 6) with the base forged to 230 decode to 230 and 24 (mod
+         * 256), inside a domain of 250 and statistics widened to [24, 230];
+         * the decode gives them, the view declines */
+        for (int i = 0; i < 1024; i++) ids[i] = (uint8_t)(i % 2 ? 51 : 1);
+        TEST_ASSERT_TRUE(dv_save_sym_n(ids, 1024, RAY_ENC_FOR_BP, 250, p)); NEED_ENC(0, RAY_ENC_FOR_BP); DV(p, 1, NULL);
+        TEST_ASSERT_EQ_I(g_img[desc_at(0) + 1], 6);
+        W64(payload_at(0), 230);
+        W64(desc_at(0) + 32, 24); W64(desc_at(0) + 40, 230); W64(DIR(0) + 16, 24); W64(DIR(0) + 24, 230);
+        DV(p, 0, NULL);
     }
 
     /* DICT: a code past the dictionary, a value outside the statistics, a
@@ -516,6 +577,11 @@ static test_result_t test_vview_declines(void) {
         TEST_ASSERT_EQ_I(g_img[at + 16] & 3, 0);
         g_img[at + 16] |= 3;                                      DV(p, 0, "DICT code outside the dictionary");
     }
+    /* the code child's header: reserved bits, width above 32, body size, base above 32 bits */
+    DV_SAVE(dv_dict(), RAY_ENC_DICT, p); W16(payload_at(0) + 2, 1);           DV(p, 0, "child header reserved bytes not zero");
+    DV_SAVE(dv_dict(), RAY_ENC_DICT, p); W8(payload_at(0) + 1, 33);           DV(p, 0, "FOR_BP width above the type width");
+    DV_SAVE(dv_dict(), RAY_ENC_DICT, p); W32(payload_at(0) + 4, (uint32_t)rd64(payload_at(0) + 4) + 8); DV(p, 0, "child body overruns its parent");
+    DV_SAVE(dv_dict(), RAY_ENC_DICT, p); W64(payload_at(0) + 8, 1ull << 32);  DV(p, 0, "FOR_BP base above the type width");
     DV_SAVE(dv_dict(), RAY_ENC_DICT, p);
     W64(desc_at(0) + 32, 12);                                     DV(p, 0, "value outside its statistics");
     DV_SAVE(dv_dict(), RAY_ENC_DICT, p);
@@ -571,6 +637,7 @@ static test_result_t test_vview_source(void) {
 
 const test_entry_t aware_entries[] = {
     { "aware/vview_encodings", test_vview_encodings, aw_setup, aw_teardown },
+    { "aware/vview_near_top",  test_vview_near_top,  aw_setup, aw_teardown },
     { "aware/vview_declines",  test_vview_declines,  aw_setup, aw_teardown },
     { "aware/vview_source",    test_vview_source,    aw_setup, aw_teardown },
     { NULL, NULL, NULL, NULL },

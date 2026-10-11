@@ -743,9 +743,7 @@ bool ray_col_src_vec_stat(const ray_col_src_t* s, int64_t v, int64_t* min, int64
 int ray_col_src_vview(const ray_col_src_t* s, int64_t v, ray_enc_vview_t* out, ray_t** err) {
     *err = NULL;
     if (!ray_col_src_encoded(s) || ray_enccol_decoded_peek(s->obj)) return 0;   /* read it in place */
-    ray_enccol_t* e = ray_enccol_of(s->obj);
-    if (e->kind != RAY_ENCCOL_SINGLE || e->synthetic) return 0;
-    return ray_enccol_vview(e, v, out, err);
+    return ray_enccol_vview(ray_enccol_of(s->obj), v, out, err);   /* declines parted and synthetic */
 }
 
 bool ray_col_src_parted_chunks(ray_col_src_t* s, void* ctx, ray_col_chunk_fn fn, ray_t** err) {

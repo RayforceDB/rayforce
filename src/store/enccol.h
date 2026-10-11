@@ -200,8 +200,10 @@ typedef struct ray_enc_vview_s {
  * outside the bitmap; SYM ids against the bound, the statistics and the
  * null count; DICT codes below the dictionary size with their values
  * inside the statistics; float CONST: no NaN outside the bitmap, the value
- * inside the statistics), and a FOR_BP body proven not to wrap (its
- * residuals then compare in logical order); 0: declined (RAW, DELTA_BP,
+ * inside the statistics), and a FOR_BP body whose residuals do not wrap
+ * (base + each residual at most the kind's largest value, checked on the
+ * actual residuals: a writer's base is the minimum, so a sound vector
+ * passes; its residuals then compare in logical order); 0: declined (RAW, DELTA_BP,
  * floats other than CONST, a trailer, a DICT code child other than FOR_BP,
  * a body that could wrap, or anything decode would reject): read the
  * vector by range, which decodes or reports it; -1: an owned error in
@@ -211,7 +213,9 @@ typedef struct ray_enc_vview_s {
 int  ray_enccol_vview(ray_enccol_t* e, int64_t vec, ray_enc_vview_t* out, ray_t** err);
 
 /* The FOR_BP residuals of a view (no base added) at width T into out
- * (n elements of T bits), through the lane kernels (fk_forT, base 0). */
+ * (n elements of T bits), through the lane kernels (fk_forT, base 0).
+ * FOR_BP views only (any other view has packed NULL); out is aligned to
+ * T / 8 bytes and holds n elements. */
 void ray_enccol_unpack_resid(const ray_enc_vview_t* v, void* out);
 /* A reference on the column's payload (the RAY_ENCCOL headers share it). */
 void   ray_enccol_ref(ray_enccol_t* e);
