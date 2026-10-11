@@ -3191,8 +3191,10 @@ static test_result_t test_relieve_spill_pools(void) {
     ray_heap_set_anon_watermark(INT64_C(1) << 40);
     ray_t* rc = ray_gc_fn(NULL, 0);
     if (rc) ray_release(rc);
-    bool kept = h->pool_count == 4 && relieve_backed_pools(h) == 2
-             && relieve_parked(h) == 3;
+    bool disc = ray_heap_spill_discards();
+    bool kept = disc ? h->pool_count == 4 && relieve_backed_pools(h) == 2
+                     : h->pool_count == 2 && relieve_backed_pools(h) == 0;
+    kept = kept && relieve_parked(h) == (disc ? 3 : 1);
     int res = relieve_resident(probe);
 
     /* A spill elsewhere: the relief acts, and the empty pools go. */
@@ -3202,8 +3204,9 @@ static test_result_t test_relieve_spill_pools(void) {
 
     relieve_env_end(&e, h, NULL);
     if (!spill) SKIP("no spill file");
-    TEST_ASSERT(kept, "(.sys.gc) kept all four pools, three parked");
-    if (relieve_mincore()) TEST_ASSERT(res == 0, "the spill pool's pages were discarded");
+    TEST_ASSERT(kept, disc ? "(.sys.gc) kept all four pools, three parked"
+                     : "(.sys.gc) without discard: unmapped the spill pools, one anonymous parked");
+    if (disc && relieve_mincore()) TEST_ASSERT(res == 0, "the spill pool's pages were discarded");
     TEST_ASSERT(gone, "a relief that acted unmapped the spill pools with the anonymous ones, but the last");
     PASS();
 }
@@ -3316,13 +3319,16 @@ static test_result_t test_relieve_spill_fallback(void) {
         relieve_env_end(&e, h, NULL);
         SKIP("blocks or spill file unavailable");
     }
-    ray_heap_set_spill_discard(false);
+    bool was = ray_heap_set_spill_discard(false);
+    bool off = !ray_heap_spill_discards();
     ray_heap_set_anon_watermark(INT64_C(1) << 40);
     ray_heap_relieve();                          /* its own spill: no relief */
-    ray_heap_set_spill_discard(true);
+    (void)ray_heap_set_spill_discard(was);
     bool unmapped = h->pool_count == 2 && relieve_backed_pools(h) == 0
                  && relieve_parked(h) == 1;
     relieve_env_end(&e, h, NULL);
+    TEST_ASSERT(was, "discarding is on by default");
+    TEST_ASSERT(off, "and off once the setting says so");
     TEST_ASSERT(unmapped, "both spill pools unmapped, the anonymous ones kept, one parked");
     PASS();
 }
@@ -3759,6 +3765,12 @@ static test_result_t test_relieve_spill_age(void) {
     ray_heap_relieve();                          /* sees the spill: parks */
     int i1 = heap_find_pool(h, probe);
     bool parked = i1 >= 0 && h->pools[i1].parked && relieve_parked(h) == 3;
+    if (!ray_heap_spill_discards()) {           /* the empty spill pools unmapped */
+        bool unmapped = h->pool_count == 2 && relieve_backed_pools(h) == 0;
+        relieve_env_end(&e, h, NULL);
+        TEST_ASSERT(unmapped, "no discard: the empty spill pools were unmapped");
+        PASS();
+    }
 
     /* s1 and the parked anonymous pool parked an hour before s2; the decay
      * disabled: all stay. */
@@ -3825,6 +3837,12 @@ static test_result_t test_relieve_far_visit(void) {
     }
     ray_heap_set_anon_watermark(INT64_C(1) << 40);
     ray_heap_relieve();                          /* sees the spill: parks */
+    if (!ray_heap_spill_discards()) {           /* the empty spill pools unmapped */
+        bool unmapped = h->pool_count == 2 && relieve_backed_pools(h) == 0;
+        relieve_env_end(&e, h, NULL);
+        TEST_ASSERT(unmapped, "no discard: the empty spill pools were unmapped");
+        PASS();
+    }
     int64_t t0 = ray_time_now_ms();
     relieve_far();                               /* a visit */
     ray_heap_set_decay_ms(0);
@@ -3861,6 +3879,13 @@ static test_result_t test_relieve_spill_not_room(void) {
     ray_heap_set_anon_watermark(INT64_C(1) << 40);
     ray_heap_relieve();                          /* this heap's spill: parked */
     bool parked = relieve_parked(h) == 1;
+    if (layout && !ray_heap_spill_discards()) {   /* the empty spill pool unmapped */
+        bool unmapped = h->pool_count == 1 && relieve_backed_pools(h) == 0;
+        ray_free(x);
+        relieve_env_end(&e, h, NULL);
+        TEST_ASSERT(unmapped, "no discard: the empty spill pool was unmapped");
+        PASS();
+    }
 
     int64_t c0 = ray_heap_anon_committed();
     ray_t* d = ray_alloc((size_t)40 << 20);
@@ -3926,6 +3951,12 @@ static test_result_t test_relieve_spill_last_pool(void) {
     }
     ray_heap_set_anon_watermark(INT64_C(1) << 40);
     ray_heap_relieve();                          /* three parked, one not */
+    if (!ray_heap_spill_discards()) {           /* the empty spill pools unmapped */
+        bool unmapped = h->pool_count == 2 && relieve_backed_pools(h) == 0;
+        relieve_env_end(&e, h, NULL);
+        TEST_ASSERT(unmapped, "no discard: the empty spill pools were unmapped");
+        PASS();
+    }
     ray_heap_set_anon_watermark(ray_heap_anon_committed() + 24 * RELIEVE_MB);
     ray_t* d = ray_alloc((size_t)48 << 20);
     bool spill_only = d && h->pool_count == 2 && relieve_parked(h) == 2;
@@ -4068,13 +4099,16 @@ static test_result_t test_relieve_futile(void) {
     if (y1) ray_free(y1);
     if (y2) ray_free(y2);
     ray_heap_relieve();
-    bool futile = h->pool_count == 3 && relieve_backed_pools(h) == 1
-               && relieve_parked(h) == 2;
+    bool disc = ray_heap_spill_discards();     /* else the spill pool unmapped */
+    bool futile = h->pool_count == (disc ? 3u : 2u)
+               && relieve_backed_pools(h) == (disc ? 1 : 0)
+               && relieve_parked(h) == (disc ? 2 : 1);
 
     /* A spill elsewhere: still no relief. */
     spill = relieve_spill_elsewhere(&e) && spill;
     ray_heap_relieve();
-    bool held = h->pool_count == 3 && relieve_backed_pools(h) == 1;
+    bool held = h->pool_count == (disc ? 3u : 2u)
+             && relieve_backed_pools(h) == (disc ? 1 : 0);
 
     /* A statement maps without spilling; the next spill relieves. */
     void* s = ray_sys_alloc((size_t)2 << 20);
@@ -4109,8 +4143,9 @@ static test_result_t test_relieve_futile(void) {
     if (z2) ray_free(z2);
     if (z3) ray_free(z3);
     ray_heap_relieve();
-    futile2 = futile2 && h->pool_count == 4 && relieve_backed_pools(h) == 2
-              && relieve_parked(h) == 3;
+    futile2 = futile2 && h->pool_count == (disc ? 4u : 2u)
+              && relieve_backed_pools(h) == (disc ? 2 : 0)
+              && relieve_parked(h) == (disc ? 3 : 1);
     ray_heap_set_anon_watermark(wm + RELIEVE_MB);
     spill = relieve_spill_elsewhere(&e) && spill;
     ray_heap_relieve();
@@ -5104,6 +5139,22 @@ static test_result_t test_footprint_index_and_direct(void) {
     PASS();
 }
 
+/* Run test t with parked spill pools unmapped rather than their pages
+ * discarded — as where a mapped range cannot be punched (macOS) — so that
+ * path runs on every platform. */
+static test_result_t relieve_unmapping(test_func_t t) {
+    bool was = ray_heap_set_spill_discard(false);
+    test_result_t r = t();
+    (void)ray_heap_set_spill_discard(was);
+    return r;
+}
+static test_result_t test_relieve_spill_pools_unmap(void)    { return relieve_unmapping(test_relieve_spill_pools); }
+static test_result_t test_relieve_spill_age_unmap(void)      { return relieve_unmapping(test_relieve_spill_age); }
+static test_result_t test_relieve_far_visit_unmap(void)      { return relieve_unmapping(test_relieve_far_visit); }
+static test_result_t test_relieve_spill_not_room_unmap(void) { return relieve_unmapping(test_relieve_spill_not_room); }
+static test_result_t test_relieve_spill_last_pool_unmap(void) { return relieve_unmapping(test_relieve_spill_last_pool); }
+static test_result_t test_relieve_futile_unmap(void)         { return relieve_unmapping(test_relieve_futile); }
+
 /* ---- Suite definition -------------------------------------------------- */
 
 const test_entry_t heap_entries[] = {
@@ -5189,14 +5240,19 @@ const test_entry_t heap_entries[] = {
     { "heap/relieve_many_pools",       test_relieve_many_pools,          heap_setup, heap_teardown },
     { "heap/relieve_inflight_free",    test_relieve_inflight_free,       heap_setup, heap_teardown },
     { "heap/relieve_spill_pools",      test_relieve_spill_pools,         heap_setup, heap_teardown },
+    { "heap/relieve_spill_pools_unmap", test_relieve_spill_pools_unmap, heap_setup, heap_teardown },
     { "heap/relieve_spill_discard",    test_relieve_spill_discard,       heap_setup, heap_teardown },
     { "heap/relieve_spill_fallback",   test_relieve_spill_fallback,      heap_setup, heap_teardown },
     { "heap/relieve_spill_cloexec",    test_relieve_spill_cloexec,       heap_setup, heap_teardown },
     { "heap/relieve_spill_age",        test_relieve_spill_age,           heap_setup, heap_teardown },
+    { "heap/relieve_spill_age_unmap", test_relieve_spill_age_unmap, heap_setup, heap_teardown },
     { "heap/relieve_far_visit",        test_relieve_far_visit,           heap_setup, heap_teardown },
+    { "heap/relieve_far_visit_unmap", test_relieve_far_visit_unmap, heap_setup, heap_teardown },
     { "heap/relieve_spill_not_room",   test_relieve_spill_not_room,      heap_setup, heap_teardown },
+    { "heap/relieve_spill_not_room_unmap", test_relieve_spill_not_room_unmap, heap_setup, heap_teardown },
     { "heap/relieve_abandon_spill",    test_relieve_abandon_spill,       heap_setup, heap_teardown },
     { "heap/relieve_spill_last_pool",  test_relieve_spill_last_pool,     heap_setup, heap_teardown },
+    { "heap/relieve_spill_last_pool_unmap", test_relieve_spill_last_pool_unmap, heap_setup, heap_teardown },
     { "heap/relieve_no_spill_file",    test_relieve_no_spill_file,       heap_setup, heap_teardown },
     { "heap/relieve_last_pool",        test_relieve_last_pool,           heap_setup, heap_teardown },
     { "heap/decay_unmaps_spill_pools", test_decay_unmaps_spill_pools,    heap_setup, heap_teardown },
@@ -5204,6 +5260,7 @@ const test_entry_t heap_entries[] = {
     { "heap/relieve_steady_state",     test_relieve_steady_state,        heap_setup, heap_teardown },
     { "heap/relieve_needs_spill",      test_relieve_needs_spill,         heap_setup, heap_teardown },
     { "heap/relieve_futile",           test_relieve_futile,              heap_setup, heap_teardown },
+    { "heap/relieve_futile_unmap", test_relieve_futile_unmap, heap_setup, heap_teardown },
     { "heap/relieve_spill_parks",      test_relieve_spill_parks,         heap_setup, heap_teardown },
     { "heap/relieve_spill_only",       test_relieve_spill_only,          heap_setup, heap_teardown },
     { "heap/relieve_make_room",        test_relieve_make_room,           heap_setup, heap_teardown },

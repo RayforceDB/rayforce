@@ -2900,8 +2900,8 @@ static int64_t heap_release_free_pages(ray_heap_t* h) {
  * the setter (ray_heap_set_spill_discard) is for tests. */
 static _Atomic(bool) g_spill_discard = true;
 
-void ray_heap_set_spill_discard(bool on) {
-    atomic_store_explicit(&g_spill_discard, on, memory_order_relaxed);
+bool ray_heap_set_spill_discard(bool on) {
+    return atomic_exchange_explicit(&g_spill_discard, on, memory_order_relaxed);
 }
 
 /* Discard the pages of parked spill pool pe — dead data — and keep its file
@@ -2917,10 +2917,12 @@ void ray_heap_set_spill_discard(bool on) {
  * if none past the first page were in RAM, and -1 where it cannot be done —
  * no way to punch a mapped range on this platform (macOS: F_PUNCHHOLE does
  * not say what it does to pages mapped shared), or the file system or the
- * disk refused: the pool is to be unmapped then. */
+ * disk refused: the pool is to be unmapped then.  With pe NULL, 0 where
+ * pages would be discarded, -1 where not (ray_heap_spill_discards). */
 static int heap_spill_discard(const ray_pool_entry_t* pe) {
 #if RAY_HEAP_FILE_SPILL && defined(__linux__) && defined(FALLOC_FL_PUNCH_HOLE)
     if (!atomic_load_explicit(&g_spill_discard, memory_order_relaxed)) return -1;
+    if (!pe) return 0;
     long ps = sysconf(_SC_PAGESIZE);
     size_t pg = ps > 0 ? (size_t)ps : 4096;
     size_t end = ray_vm_resident_end(pe->base, BSIZEOF(pe->pool_order));
@@ -2941,6 +2943,10 @@ static int heap_spill_discard(const ray_pool_entry_t* pe) {
  * cannot be (the boundary that parked it left h another pool, unparked).
  * Returns whether pages were dropped: the boundary then flushes the
  * cgroup's statistics (ray_sys_mem_flush). */
+bool ray_heap_spill_discards(void) {
+    return heap_spill_discard(NULL) == 0;
+}
+
 static bool heap_spill_pools_discard(ray_heap_t* h) {
     bool dropped = false;
     for (uint32_t p = h->pool_count; h->parked && p-- > 0; ) {

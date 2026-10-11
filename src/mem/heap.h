@@ -292,7 +292,10 @@ void ray_heap_set_decay_ms(int64_t ms);
 /* Whether an empty parked spill pool's pages are discarded at the boundary
  * (true) or the pool is unmapped, as where the platform cannot discard
  * them (false).  Policy; it exists for tests, as ray_heap_set_decay_ms. */
-void ray_heap_set_spill_discard(bool on);
+bool ray_heap_set_spill_discard(bool on);   /* returns the setting it replaced */
+/* Whether a parked spill pool's pages are discarded here and now: the
+ * platform can punch a mapped range, and the setting allows it. */
+bool ray_heap_spill_discards(void);
 
 /* --------------------------------------------------------------------------
  * Constants
