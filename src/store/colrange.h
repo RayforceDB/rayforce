@@ -246,11 +246,13 @@ int  ray_col_src_points_i64(ray_col_src_t* s, const int64_t* rows, int64_t n, in
  * for any other row, which a cursor reads.  For a caller choosing between
  * point reads and one decode by how many of a vector's rows it needs. */
 bool ray_col_src_vec_span(ray_col_src_t* s, int64_t row, int64_t* lo, int64_t* hi);
-/* Open decision D2: a vector's requested rows are point-read when there
- * are at most this many of them (1/16 of a vector, RAY_ENC_VEC =
- * RAY_MORSEL_ELEMS values): a point read unpacks one lane or
- * binary-searches the runs, a decode writes the whole vector.  A
- * structural ratio, not a knob. */
+/* Open decision D2 (ruled per codec at the measured crossovers of a
+ * batched point read against one decode): a vector's requested rows are
+ * point-read when there are at most RAY_ENC_VEC / 32 of them in a FOR_BP
+ * vector, RAY_ENC_VEC / 16 in an RLE or CONST one; any other codec
+ * declines (ray_enccol_points_i64 decides).  RAY_COL_POINT_ROWS is the
+ * largest of them, the most rows a caller hands one call (RAY_ENC_VEC =
+ * RAY_MORSEL_ELEMS values).  Structural ratios, not knobs. */
 #define RAY_COL_POINT_ROWS (RAY_MORSEL_ELEMS / 16)
 /* One sequential read-ahead hint for rows [lo, hi): plain mmapped
  * columns hint their element bytes, generation 2 the chunk bytes from the

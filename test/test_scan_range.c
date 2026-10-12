@@ -6559,7 +6559,12 @@ static test_result_t test_vec_stat_decide(void) {
         { "(select {s: (sum b) c: (count b) from: T where: (> a 3)})", 0, 0, 147 },
         { "(select {s: (sum b) from: T where: (== c 5)})", 0, 0, 130 },
         { "(select {s: (sum b) from: T where: (!= c 9)})", 0, 0, 130 },
-        { "(select {s: (sum b) from: T where: (and (== a 0) (== c 9))})", 0, 0, 147 + 196 },
+        /* (== c 9) first (196 decided); then (== a 0) refines its selection
+         * on the segments it keeps, answered by the encoded leaves on their
+         * views, which count no zone decision (P3 Task 6b: a chained filter
+         * over an encoded column evaluates only the kept segments; before,
+         * it was evaluated over every morsel, 147 decided) */
+        { "(select {s: (sum b) from: T where: (and (== a 0) (== c 9))})", 0, 0, 196 },
         { "(select {s: (sum b) from: T where: (or (> a 3) (== c 5))})", -1, -1, -1 },
         { NULL, 0, 0, 0 },
     };

@@ -168,8 +168,10 @@ int    ray_enccol_point_i64(ray_enccol_t* e, int64_t row, int64_t* out, ray_t** 
  * rows of one vector, its body read once (CONST / RLE: the runs parsed
  * once, not once per row).  1: every row served into out (each value
  * checked against the vector's statistics, `corrupt` otherwise); 0:
- * declined (as ray_enccol_point_i64, or rows outside one vector or not
- * ascending), out partly written; -1: an owned error in *err. */
+ * declined (as ray_enccol_point_i64; above open decision D2's limit for
+ * the codec, RAY_ENC_VEC / 32 rows of a FOR_BP vector, RAY_ENC_VEC / 16
+ * of an RLE or CONST one; any other codec; or rows outside one vector or
+ * not ascending), out partly written; -1: an owned error in *err. */
 int    ray_enccol_points_i64(ray_enccol_t* e, const int64_t* rows, int64_t n, int64_t base, int64_t* out, ray_t** err);
 
 /* RAY_ENC_VEC lane values at the kind's width T (the fast kernels' own

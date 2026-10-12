@@ -2209,6 +2209,46 @@ static test_result_t test_gather_sel_parallel(void) {
     PASS();
 }
 
+/* P3 Task 6b fix round 1: a long ascending row list (repeats included) is
+ * gathered by pool tasks over position ranges (grows_par), each with its
+ * own cursor; STR pools merge in position order.  Every type equals the
+ * generation-0 reference and the generation-0 source's own gather. */
+static test_result_t test_gather_rows_parallel(void) {
+    aw_save("gr", "(table [i s y h] (list "
+            "(map (fn [j] (if (== 0 (% j 7)) 0Nl (* j 3))) (til 300000)) "
+            "(map (fn [j] (if (== 0 (% j 5)) \"\" (if (== 0 (% j 2)) \"short\" (format \"a pooled string of row %\" j)))) (til 300000)) "
+            "(as 'SYMBOL (map (fn [j] (if (== 0 (% j 13)) \"\" (format \"k%\" (% j 300)))) (til 300000))) "
+            "(% (til 300000) 251)))", -1);
+    ray_t* t0 = aw_load("gr", 0); ray_t* t2 = aw_load("gr", 2);
+    TEST_ASSERT_TRUE(t0 && t2);
+    const int64_t n = 2 * 100000;
+    ray_t* idv = ray_vec_new(RAY_I64, n); idv->len = n;
+    int64_t* ids = (int64_t*)ray_data(idv);
+    for (int64_t k = 0; k < n; k++) ids[k] = (k / 2) * 3;        /* every third row, twice */
+    TEST_ASSERT_TRUE(n >= RAY_PARALLEL_THRESHOLD);
+    static const char* cols[] = { "i", "s", "y", "h" };
+    for (int c = 0; c < 4; c++) {
+        int64_t nm = ray_sym_intern(cols[c], 1);
+        ray_t* out[2];
+        for (int gen = 0; gen < 2; gen++) {
+            ray_col_src_t sr;
+            TEST_ASSERT_NULL(ray_table_col_src(gen ? t2 : t0, nm, &sr));
+            TEST_ASSERT_NULL(ray_col_gather_rows(&sr, ids, n, &out[gen]));
+            ray_col_src_release(&sr);
+        }
+        ray_t* ref = ray_at_fn(ray_table_col(t0, nm), idv);
+        TEST_ASSERT_TRUE(ref && !RAY_IS_ERR(ref));
+        AW_GATHER_REF(out[0], ref, true, cols[c]);
+        AW_GATHER_REF(out[1], ref, false, cols[c]);
+        ray_release(ref);
+        test_result_t r = aw_vec_same(out[0], out[1], cols[c]);
+        if (r.status != TEST_PASS) return r;
+        ray_release(out[0]); ray_release(out[1]);
+    }
+    ray_release(idv); ray_release(t0); ray_release(t2);
+    PASS();
+}
+
 /* Fix round 1: tasks in the middle of a parallel selection gather fail.
  * Chunks 2 and 4 of i (five chunks) have a corrupted descriptor; every
  * row is selected.  The answer is chunk 2's error whatever the schedule
@@ -2269,6 +2309,26 @@ static test_result_t test_gather_sel_task_error(void) {
         ray_error_free(e);
         ray_mem_stats(&m1);
         TEST_ASSERT_EQ_U(m1.bytes_allocated, m0.bytes_allocated);       /* nothing left behind */
+        /* the same rows as an ascending row list (P3 Task 6b: pool tasks
+         * over position ranges, grows_par): t merges, i fails at chunk 2 */
+        int64_t* ids = (int64_t*)ray_alloc_raw(200000 * sizeof(int64_t));
+        TEST_ASSERT_NOT_NULL(ids);
+        int64_t nid = 0;
+        for (int64_t r = 0; r < 300000; r++) if (r % 3 != 1) ids[nid++] = r;
+        TEST_ASSERT_NULL(ray_col_gather_rows(&st, ids, nid, &ok));
+        TEST_ASSERT_EQ_I(ok->len, nid);
+        ray_release(ok);
+        ray_mem_stats(&m0);
+        g = NULL;
+        ray_error_clear();
+        e = ray_col_gather_rows(&si, ids, nid, &g);
+        TEST_ASSERT_TRUE(e && RAY_IS_ERR(e) && !g);
+        TEST_ASSERT_STR_EQ(ray_err_code(e), "corrupt");
+        TEST_ASSERT_FMT(strcmp(ray_error_msg(), want) == 0, "rows round %d: %s, want %s", round, ray_error_msg(), want);
+        ray_error_free(e);
+        ray_mem_stats(&m1);
+        TEST_ASSERT_EQ_U(m1.bytes_allocated, m0.bytes_allocated);
+        ray_free_raw(ids);
         ray_col_src_release(&si); ray_col_src_release(&st);
         ray_rowsel_release(sel); ray_release(pred); ray_release(t);
     }
@@ -2680,21 +2740,28 @@ static test_result_t test_sparse_key_points(void) {
  * declined read (DELTA_BP, a vector with nulls) decodes every touched
  * vector.  Ids sorted, reversed and repeated; values equal generation 0's. */
 static test_result_t test_gather_points(void) {
-    static const struct { const char* name; const char* x; int enc; bool point; } cs[] = {
-        { "pf", "(% (* (til 70000) 7919) 1000)", RAY_ENC_FOR_BP, true },
-        { "pr", "(div (til 70000) 5)", RAY_ENC_RLE, true },
-        { "pd", "(* 1000003 (% (til 70000) 5))", RAY_ENC_DICT, true },
-        { "pe", "(% (* (til 70000) 7919) 1000)", RAY_ENC_DELTA_BP, false },
-        { "pn", "(map (fn [j] (if (== 0 (% j 100)) 0N (% (* j 7919) 1000))) (til 70000))", RAY_ENC_FOR_BP, false },
+    /* lim: the codec's D2 limit (RAY_ENC_VEC / 32 packed lanes,
+     * RAY_ENC_VEC / 16 runs); 0: the codec declines */
+    static const struct { const char* name; const char* x; int enc; int64_t lim; } cs[] = {
+        { "pf", "(% (* (til 70000) 7919) 1000)", RAY_ENC_FOR_BP, RAY_ENC_VEC / 32 },
+        { "pr", "(div (til 70000) 5)", RAY_ENC_RLE, RAY_ENC_VEC / 16 },
+        { "pd", "(* 1000003 (% (til 70000) 5))", RAY_ENC_DICT, 0 },
+        { "pe", "(% (* (til 70000) 7919) 1000)", RAY_ENC_DELTA_BP, 0 },
+        { "pn", "(map (fn [j] (if (== 0 (% j 100)) 0N (% (* j 7919) 1000))) (til 70000))", RAY_ENC_FOR_BP, 0 },
     };
-    int64_t ids[64 + 65 + 2];
-    int64_t n = 0;
-    for (int64_t i = 0; i < 64; i++) ids[n++] = 2 * i;              /* vector 0: 64 rows */
-    for (int64_t i = 0; i <= 64; i++) ids[n++] = 1024 + i;          /* vector 1: 65 rows */
-    ids[n++] = 5 * 1024 + 7; ids[n++] = 5 * 1024 + 7;              /* vector 5: one row, twice */
-    int64_t rev[sizeof ids / sizeof ids[0]];
-    for (int64_t i = 0; i < n; i++) rev[i] = ids[n - 1 - i];
     for (size_t c = 0; c < sizeof cs / sizeof cs[0]; c++) {
+        /* vector 0: lim rows (point-read when lim > 0), vector 1: lim + 1
+         * rows (decoded), vector 5: one row, twice; a declining codec uses
+         * the RLE limit's counts */
+        const int64_t L = cs[c].lim ? cs[c].lim : RAY_ENC_VEC / 16;
+        int64_t ids[RAY_ENC_VEC / 16 * 2 + 3];
+        int64_t n = 0;
+        for (int64_t i = 0; i < L; i++) ids[n++] = 2 * i;
+        for (int64_t i = 0; i <= L; i++) ids[n++] = 1024 + i;
+        ids[n++] = 5 * 1024 + 7; ids[n++] = 5 * 1024 + 7;
+        int64_t rev[sizeof ids / sizeof ids[0]];
+        for (int64_t i = 0; i < n; i++) rev[i] = ids[n - 1 - i];
+        const bool point = cs[c].lim > 0;
         char tq[256];
         snprintf(tq, sizeof tq, "(table [x] (list %s))", cs[c].x);
         aw_save(cs[c].name, tq, cs[c].enc);
@@ -2706,7 +2773,7 @@ static test_result_t test_gather_points(void) {
         const int64_t* rv = (const int64_t*)ray_data(ref);
         ray_t* encv = ray_table_get_col_enc(t2, ray_sym_intern("x", 1));
         TEST_ASSERT_NOT_NULL(encv);
-        const uint64_t want = (cs[c].point ? 1 : 3) * 1024 * 8;   /* vector 1, or vectors 0, 1 and 5 */
+        const uint64_t want = (point ? 1 : 3) * 1024 * 8;   /* vector 1, or vectors 0, 1 and 5 */
         for (int pass = 0; pass < 3; pass++) {
             ray_col_src_t s;
             TEST_ASSERT_NULL(ray_table_col_src(t2, ray_sym_intern("x", 1), &s));
@@ -2821,21 +2888,22 @@ static test_result_t test_firstn_runs(void) {
 }
 
 /* The parallel strategies' selection reads (agg_idx_walk) with few rows
- * per vector: every 25th row of 2M (41 per vector, above the parallel
- * threshold) grouped by two I32 keys read at those rows by point reads
- * into the walk's sparse views, and by the dense plan's bounds: neither
- * key decodes a vector. */
+ * per vector: every 40th row of 3M (25 or 26 per vector, under both
+ * codecs' D2 limits; above the parallel threshold) grouped by two I32
+ * keys read at those rows by point reads into the walk's sparse views,
+ * by the table-stack sampler and by the dense plan's bounds: neither key
+ * decodes a vector. */
 static test_result_t test_sparse_walk_points(void) {
-    aw_save("sw", "(table [a b v] (list (as 'I32 (% (* (div (til 2000000) 7) 7919) 1000)) (as 'I32 (% (div (til 2000000) 50000) 7)) "
-                  "(til 2000000)))", -1);
-    for (int64_t v = 0; v < 1950; v += 397) {
+    aw_save("sw", "(table [a b v] (list (as 'I32 (% (* (div (til 3000000) 7) 7919) 1000)) (as 'I32 (% (div (til 3000000) 50000) 7)) "
+                  "(til 3000000)))", -1);
+    for (int64_t v = 0; v < 2900; v += 397) {
         int ea = aw_vec_enc("sw", "a", v), eb = aw_vec_enc("sw", "b", v);
         TEST_ASSERT_FMT(ea == RAY_ENC_RLE || ea == RAY_ENC_FOR_BP, "a vector %lld: %d", (long long)v, ea);
         TEST_ASSERT_FMT(eb == RAY_ENC_RLE || eb == RAY_ENC_CONST, "b vector %lld: %d", (long long)v, eb);
     }
     static const char* const qs[] = {
-        "(select {n: (count a) from: T where: (== 0 (% v 25)) by: {a: a b: b} desc: n take: 10})",
-        "(select {n: (count a) s: (sum v) from: T where: (== 0 (% v 25)) by: a})",
+        "(select {n: (count a) from: T where: (== 0 (% v 40)) by: {a: a b: b} desc: n take: 10})",
+        "(select {n: (count a) s: (sum v) from: T where: (== 0 (% v 40)) by: a})",
         NULL,
     };
     for (int i = 0; qs[i]; i++) {
@@ -2894,6 +2962,63 @@ static test_result_t test_firstn_sel(void) {
     PASS();
 }
 
+/* q42's filter: a chained where: over generation-2 predicate columns is
+ * refined on the segments the selection keeps, through the encoded leaves
+ * (exec_pred_refine_selection), so no predicate value is gathered: p,
+ * r and the nullable q (every vector RLE) decode nothing; answers equal
+ * generation 0's, nulls failing their compare. */
+static test_result_t test_refine_on_views(void) {
+    aw_save("rv", "(table [c p r q g v] (list (div (til 300000) 3000) (% (* (til 300000) 7) 13) (div (til 300000) 300) "
+                  "(map (fn [j] (if (== 0 (% j 11)) 0N (% j 6))) (til 300000)) (% (til 300000) 5) (til 300000)))", RAY_ENC_RLE);
+    static const char* const qs[] = {
+        "(select {n: (count v) s: (sum v) from: T where: (and (== c 62) (== p 3)) by: g})",
+        "(select {n: (count v) from: T where: (and (>= c 40) (<= c 41) (> r 405) (< p 9)) by: g})",
+        "(select {n: (count v) from: T where: (and (== c 7) (> q 2)) by: g})",
+        "(select {n: (count v) from: T where: (and (== c 7) (== p 100)) by: g})",
+        NULL,
+    };
+    for (int64_t v = 0; v < 290; v += 37) {
+        TEST_ASSERT_EQ_I(aw_vec_enc("rv", "r", v), RAY_ENC_RLE);
+        TEST_ASSERT_EQ_I(aw_vec_enc("rv", "p", v), RAY_ENC_RLE);
+    }
+    for (int i = 0; qs[i]; i++) {
+        AW_SAME("rv", qs[i], 0);
+        TEST_ASSERT_FMT(aw_col_decoded("p") == 0 && aw_col_decoded("r") == 0 && aw_col_decoded("q") == 0,
+                        "%s: p %llu r %llu q %llu", qs[i], (unsigned long long)aw_col_decoded("p"),
+                        (unsigned long long)aw_col_decoded("r"), (unsigned long long)aw_col_decoded("q"));
+    }
+    PASS();
+}
+
+/* Equality on runs: answered on the vectors' run views, a run scan
+ * deciding a vector whose runs never hold the constant without per-run
+ * fills (enceval's runs_hold).  I64 runs with RAW values (h: spread
+ * hashes) and I16 runs with packed ones (s); the constant held in some
+ * vectors, in none, outside the I16 range; == and !=, run twice.  Answers
+ * equal generation 0's and nothing decodes. */
+static test_result_t test_eq_runs_lack(void) {
+    aw_save("rl", "(table [h s v] (list (* 1000000007 (% (* (div (til 70000) 3) 7919) 100003)) "
+                  "(as 'I16 (% (div (til 70000) 5) 300)) (til 70000)))", RAY_ENC_RLE);
+    TEST_ASSERT_EQ_I(aw_vec_enc("rl", "h", 3), RAY_ENC_RLE);
+    TEST_ASSERT_EQ_I(aw_vec_enc("rl", "s", 3), RAY_ENC_RLE);
+    static const char* const qs[] = {
+        "(select {n: (count v) s: (sum v) from: T where: (== h 7919000055433)})",      /* j div 3 = 1 */
+        "(select {n: (count v) from: T where: (== h 5)})",
+        "(select {n: (count v) s: (sum v) from: T where: (!= h 7919000055433)})",
+        "(select {n: (count v) s: (sum v) from: T where: (== s 17)})",
+        "(select {n: (count v) from: T where: (== s 100000)})",
+        "(select {n: (count v) from: T where: (!= s 100000)})",
+        NULL,
+    };
+    for (int rep = 0; rep < 2; rep++)
+        for (int i = 0; qs[i]; i++) {
+            AW_SAME("rl", qs[i], 0);
+            TEST_ASSERT_FMT(aw_col_decoded("h") == 0 && aw_col_decoded("s") == 0, "%s: h %llu s %llu", qs[i],
+                            (unsigned long long)aw_col_decoded("h"), (unsigned long long)aw_col_decoded("s"));
+        }
+    PASS();
+}
+
 const test_entry_t aware_entries[] = {
     { "aware/vview_encodings", test_vview_encodings, aw_setup, aw_teardown },
     { "aware/vview_near_top",  test_vview_near_top,  aw_setup, aw_teardown },
@@ -2943,5 +3068,8 @@ const test_entry_t aware_entries[] = {
     { "aware/firstn_runs",        test_firstn_runs,        aw_setup, aw_teardown },
     { "aware/firstn_sel",         test_firstn_sel,         aw_setup, aw_teardown },
     { "aware/sparse_walk_points", test_sparse_walk_points, aw_setup, aw_teardown },
+    { "aware/refine_on_views",    test_refine_on_views,    aw_setup, aw_teardown },
+    { "aware/eq_on_runs",         test_eq_runs_lack,       aw_setup, aw_teardown },
+    { "aware/gather_rows_parallel", test_gather_rows_parallel, aw_setup, aw_teardown },
     { NULL, NULL, NULL, NULL },
 };

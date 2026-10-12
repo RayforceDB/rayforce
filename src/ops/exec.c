@@ -22,6 +22,7 @@
  */
 
 #include "ops/internal.h"
+#include "ops/colgather.h"   /* ray_col_gather_slot: the refinement over encoded columns */
 #include "ops/colbind.h"
 #include "lang/internal.h"  /* sym_domain_rep (sym-domain Phase 2) */
 #include "lang/format.h"    /* ray_type_name (error context) */
@@ -2735,6 +2736,32 @@ static ray_t* scan_table_of(ray_graph_t* g, ray_op_ext_t* ext) {
     return g->table;
 }
 
+/* A chained filter's refinement over a generation-2 predicate column: the
+ * predicate is evaluated on the segments the selection keeps, through the
+ * fused path's encoded leaves (views and vector statistics), and ANDed with
+ * the selection (exec_pred_refine_selection), so no predicate value is
+ * gathered.  input (the selection replaced), an owned error (input
+ * released), or NULL: not such a predicate, or unsupported (the caller's
+ * gather runs).  Out of line: exec_node_inner keeps its code. */
+static __attribute__((noinline)) ray_t* exec_filter_refine_enc(ray_graph_t* g, ray_op_t* op, ray_t* input) {
+    ray_op_t* pred_root = op_child(g, op, 1);
+    int64_t ks[32];
+    bool has_expr = false;
+    uint32_t roots[1] = { pred_root->id };
+    int nks = collect_scan_syms(g, roots, 1, ks, 32, &has_expr);
+    bool enc = false;
+    for (int i = 0; i < nks && !enc; i++)
+        enc = ray_col_gather_slot(ray_table_get_col_enc(input, ks[i])) != NULL;
+    if (!enc) return NULL;
+    bool ap = false;
+    ray_t* rs = exec_pred_refine_selection(g, pred_root, g->selection, &ap);
+    if (rs && RAY_IS_ERR(rs)) { ray_release(input); return rs; }
+    if (!rs && !ap) return NULL;
+    ray_release(g->selection);
+    g->selection = rs;                 /* NULL: every row passes */
+    return input;
+}
+
 static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
     if (!op) return ray_error("nyi", NULL);
 
@@ -3540,6 +3567,13 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
              * survivors — O(survivors).  Any ineligibility (non-scalar
              * predicate shape, OOM, unexpected result) falls through to
              * the full-width path unchanged. */
+            /* Over a generation-2 predicate column the refinement reads no
+             * gathered values (exec_filter_refine_enc); generation 0 keeps
+             * the gather below. */
+            if (input->type == RAY_TABLE && g->selection && input == g->table) {
+                ray_t* rs = exec_filter_refine_enc(g, op, input);
+                if (rs) return rs;             /* input (refined), or an owned error */
+            }
             if (input->type == RAY_TABLE && g->selection) {
                 ray_rowsel_t* smeta = ray_rowsel_meta(g->selection);
                 int64_t fr_nrows = ray_table_nrows(input);

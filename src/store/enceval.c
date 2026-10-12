@@ -185,6 +185,31 @@ static void eval_runs(const ray_enc_vview_t* v, const run_pred_t* p, uint8_t* bi
     }
 }
 
+/* Some run of v holds the logical value c: its T-bit pattern compared
+ * against the run values, one pass (no per-run fill), for equality's
+ * all-fail case.  A value outside the kind's range is held by none. */
+#define RUNS_HOLD(UT, F) do { const UT x_ = (UT)pat; bool hit_ = false;               \
+        for (uint32_t r = 0; r < v->n_runs; r++) hit_ |= v->run_vals.F[r] == x_;      \
+        return hit_; } while (0)
+static bool runs_hold(const ray_enc_vview_t* v, int64_t c) {
+    const int T = v->k.T;
+    if (T < 64) {
+        const int64_t lo = v->k.is_signed ? -((int64_t)1 << (T - 1)) : 0;
+        const int64_t hi = v->k.is_signed ? ((int64_t)1 << (T - 1)) - 1 : (int64_t)((1ull << T) - 1);
+        if (c < lo || c > hi) return false;
+    } else if (!v->k.is_signed && c < 0) {
+        return false;
+    }
+    const uint64_t pat = T == 64 ? (uint64_t)c : (uint64_t)c & ((1ull << T) - 1);
+    switch (T) {
+    case 8:  RUNS_HOLD(uint8_t, b);
+    case 16: RUNS_HOLD(uint16_t, h);
+    case 32: RUNS_HOLD(uint32_t, s);
+    default: RUNS_HOLD(uint64_t, q);
+    }
+}
+#undef RUNS_HOLD
+
 bool ray_enc_eval_cmp(const ray_enc_vview_t* v, uint16_t op, int64_t c, uint8_t nr, uint8_t* bits) {
     if (is_float(v->type)) return false;                              /* floats: ray_enc_const_decision_f64 */
     if (!is_cmp_op(op)) return false;
@@ -194,7 +219,10 @@ bool ray_enc_eval_cmp(const ray_enc_vview_t* v, uint16_t op, int64_t c, uint8_t 
         memset(bits, cmp_one(ray_enc_logical(v->cbits, v->k), op, c), (size_t)v->n);
         break;
     case RAY_ENC_FOR_BP: eval_for(v, op, c, bits); break;
-    case RAY_ENC_RLE:    eval_runs(v, &(run_pred_t){ false, op, c, NULL, 0 }, bits); break;
+    case RAY_ENC_RLE:
+        if ((op == OP_EQ || op == OP_NE) && !runs_hold(v, c)) memset(bits, op == OP_NE, (size_t)v->n);
+        else eval_runs(v, &(run_pred_t){ false, op, c, NULL, 0 }, bits);
+        break;
     case RAY_ENC_DICT:   eval_dict(v, op, c, bits); break;
     default: return false;
     }

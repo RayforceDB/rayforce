@@ -1206,6 +1206,11 @@ int64_t  ray_query_test_count_compare(int8_t type, const void* data, int64_t n, 
  *                              returns it (no fallback). */
 ray_t* exec_pred_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
                               bool* all_pass);
+/* exec_pred_to_selection of `pred` ANDed with the existing selection `sel`
+ * (borrowed): only the segments sel keeps are evaluated, with the fused
+ * path's encoded leaves.  The same tri-state return (a block, NULL with
+ * *all_pass, NULL unsupported) or an owned error. */
+ray_t* exec_pred_refine_selection(ray_graph_t* g, ray_op_t* pred, ray_t* sel, bool* all_pass);
 
 /* Per-morsel "fill this morsel's bool" callback used by pred_sel_drive.
  * Writes out[0..n) (1=selected, 0=not) for the kernel's verdict on global

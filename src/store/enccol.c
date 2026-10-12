@@ -1216,6 +1216,16 @@ static inline __attribute__((always_inline)) bool fk_runs_ok(const ray_enccol_t*
     if (k.is_signed) {
         const uint64_t sent = (uint64_t)1 << (T - 1);
         if (d->n_nulls && !bm) return false;
+        /* one branch-free pass at the lane width finds whether any run is on
+         * the sentinel; only then are the runs walked with the bitmap */
+        bool any = false;
+        switch (T) {
+        case 8:  for (uint32_t i = 0; i < nr; i++) any |= vals->b[i] == (uint8_t)sent; break;
+        case 16: for (uint32_t i = 0; i < nr; i++) any |= vals->h[i] == (uint16_t)sent; break;
+        case 32: for (uint32_t i = 0; i < nr; i++) any |= vals->s[i] == (uint32_t)sent; break;
+        default: for (uint32_t i = 0; i < nr; i++) any |= vals->q[i] == sent; break;
+        }
+        if (!any) return true;
         uint32_t prev = 0;
         for (uint32_t i = 0; i < nr; i++) {                          /* a run on the sentinel: all null */
             if (fk_val(vals, T, i) == sent && (!d->n_nulls || !fk_bits_all(bm, prev, ends->h[i]))) return false;
@@ -1236,10 +1246,18 @@ static int dec_fast_runs(ray_enccol_t* e, const ray_enc_desc_t* d, int vlen, con
     uint32_t nr;
     if (!fk_runs(d->encoding, vlen, body, avail, T, &vals, &ends, &nr)) return 0;
     if (!fk_runs_ok(e, d, bm, k, &vals, &ends, nr)) return 0;
+    /* A run of at most 8 rows away from the vector's end is filled with
+     * one fixed 8-element store: the rows it writes past the run's end
+     * belong to the runs after it, which are filled later and wholly, so
+     * every row ends up holding its own run's value; nothing is written
+     * past vlen. */
 #define FK_FILL(OT, V) do { OT* o_ = (OT*)out; uint32_t p_ = 0;                          \
         for (uint32_t i = 0; i < nr; i++) {                                             \
             const OT v_ = (OT)(V); const uint32_t e_ = ends.h[i];                       \
-            for (uint32_t r = p_; r < e_; r++) o_[r] = v_;                              \
+            if (e_ - p_ <= 8 && p_ + 8 <= (uint32_t)vlen)                               \
+                for (uint32_t z = 0; z < 8; z++) o_[p_ + z] = v_;                       \
+            else                                                                        \
+                for (uint32_t r = p_; r < e_; r++) o_[r] = v_;                          \
             p_ = e_; } } while (0)
     switch (T * 4 + (wide == RAY_I64 ? 1 : wide == RAY_F64 ? 2 : 0)) {
     case 8 * 4:      FK_FILL(uint8_t, vals.b[i]); break;
@@ -1736,9 +1754,13 @@ int ray_enccol_points_i64(ray_enccol_t* e, const int64_t* rows, int64_t n, int64
     if (d->n_nulls) return 0;
     ray_enc_dirent_t de; dirent_at(e, c, &de);
     const uint8_t* p = e->base + de.offset + d->payload_off;
+    /* open decision D2, per codec at the measured crossovers: runs up to
+     * RAY_ENC_VEC / 16 rows, packed lanes up to RAY_ENC_VEC / 32, any other
+     * codec declines (its decode is the cheaper read) */
     if ((d->encoding == RAY_ENC_CONST || d->encoding == RAY_ENC_RLE) && d->width == 0)
-        return points_runs(e, d, p, d->payload_bytes, c, j, vlen, rows, n, base + vs, k, out, err);
-    if (d->encoding == RAY_ENC_FOR_BP) {
+        return n <= RAY_ENC_VEC / 16 ? points_runs(e, d, p, d->payload_bytes, c, j, vlen, rows, n, base + vs, k, out, err) : 0;
+    if (d->encoding != RAY_ENC_FOR_BP || n > RAY_ENC_VEC / 32) return 0;
+    {
         /* point_body's FOR_BP checks once, then point_field's lane
          * arithmetic per row with the power-of-two divisions as shifts */
         const int w = d->width, T = k.T;
@@ -1786,11 +1808,6 @@ int ray_enccol_points_i64(ray_enccol_t* e, const int64_t* rows, int64_t n, int64
 #undef FOR_POINTS
         return 1;
     }
-    for (int64_t q = 0; q < n; q++) {
-        int r = point_read(e, d, p, d->payload_bytes, c, j, vlen, (int)(rows[q] - base - vs), k, &out[q], err);
-        if (r != 1) return r;
-    }
-    return 1;
 }
 
 /* ---- Encoded vector views: a body validated, never expanded ----

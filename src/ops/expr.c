@@ -3074,6 +3074,156 @@ ray_t* exec_pred_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
     return block;
 }
 
+/* exec_pred_to_selection restricted to an existing selection: a chained
+ * filter's refinement over generation-2 columns.  Only the segments `sel`
+ * keeps are evaluated, through the same encoded leaves and zone decisions
+ * as the fused selection path (vectors read as views, decided by their
+ * statistics, never decoded where a leaf serves them); each segment's
+ * bools are ANDed with the selection's own rows and emitted.  Its own
+ * instance: expr_full_fn, generation 0's loop, keeps its code. */
+/* One MIX segment of the refinement: the selection's rows ix[0, cnt) that
+ * pass (res NULL: every one), appended to the builder as
+ * rowsel_emit_segment would classify the ANDed bools, without scanning
+ * the segment's n bools. */
+static void refine_emit_mix(rowsel_builder_t* b, uint32_t seg, const uint16_t* ix, uint32_t cnt,
+                            const uint8_t* res, int64_t n) {
+    b->seg_off[seg] = b->idx_len;
+    if (b->idx_len + cnt > b->idx_cap) {
+        uint32_t newcap = b->idx_cap ? b->idx_cap : 8u;
+        while (newcap < b->idx_len + cnt) newcap *= 2u;
+        b->idx = (uint16_t*)ray_realloc_raw(b->idx, (size_t)newcap * sizeof(uint16_t));
+        b->idx_cap = newcap;
+    }
+    uint32_t pc = 0;
+    for (uint32_t k = 0; k < cnt; k++)
+        if (ix[k] < n && (!res || res[ix[k]])) b->idx[b->idx_len + pc++] = ix[k];
+    b->total_pass += pc;
+    if (pc == 0) b->seg_flags[seg] = RAY_SEL_NONE;
+    else if ((int64_t)pc == n) b->seg_flags[seg] = RAY_SEL_ALL;   /* ALL contributes nothing to idx[] */
+    else { b->seg_flags[seg] = RAY_SEL_MIX; b->idx_len += pc; }
+    b->seg_off[seg + 1] = b->idx_len;
+}
+
+typedef struct {
+    const ray_expr_t*      expr;
+    const expr_enc_plan_t* plan;
+    const uint8_t*         flags;
+    const uint32_t*        offs;
+    const uint16_t*        idx;
+    rowsel_builder_t*      sel_builders;   /* one per task */
+    uint32_t               n_sel_builders;
+    int64_t                nrows, n_segs;
+    ray_scan_fail_t*       fail;
+} expr_refine_ctx_t;
+
+static void expr_refine_task(expr_refine_ctx_t* c, uint32_t t) {
+    const ray_expr_t* expr = c->expr;
+    const int64_t s0 = c->n_segs * t / c->n_sel_builders, s1 = c->n_segs * (t + 1) / c->n_sel_builders;
+    const int64_t start = s0 * RAY_MORSEL_ELEMS;
+    const int64_t end = s1 * RAY_MORSEL_ELEMS < c->nrows ? s1 * RAY_MORSEL_ELEMS : c->nrows;
+    rowsel_builder_t* sb = &c->sel_builders[t];
+    const uint32_t base_seg = (uint32_t)s0;
+    if (s0 >= s1) return;
+    if (ray_scan_fail_skip(c->fail, start)) {
+        for (int64_t seg = s0; seg < s1; seg++) {      /* the builder still covers its segments */
+            const uint32_t ls = (uint32_t)(seg - s0);
+            sb->seg_off[ls] = sb->idx_len; sb->seg_flags[ls] = RAY_SEL_NONE; sb->seg_off[ls + 1] = sb->idx_len;
+        }
+        return;
+    }
+    ray_t* scratch_hdr = NULL;
+    char* scratch_mem = (char*)scratch_alloc(&scratch_hdr,
+                            (size_t)(expr->n_regs ? expr->n_regs : 1) * EXPR_MORSEL * 8);
+    bool failed = false;
+    if (!scratch_mem) { ray_scan_fail_note(c->fail, start, ray_error("oom", "fused expression scratch")); failed = true; }
+    void* scratch[EXPR_MAX_REGS];
+    for (uint8_t r = 0; r < expr->n_regs && scratch_mem; r++) scratch[r] = scratch_mem + (size_t)r * EXPR_MORSEL * 8;
+    ray_col_scratch_t rsc_arr[EXPR_MAX_REGS];
+    ray_col_scratch_t* rsc = NULL;
+    for (uint8_t r = 0; r < expr->n_regs; r++)
+        if (expr->regs[r].kind == REG_SCAN && expr->regs[r].enc) { rsc = rsc_arr; break; }
+    if (rsc) for (uint8_t r = 0; r < expr->n_regs; r++) ray_col_scratch_init(&rsc[r]);
+    const expr_enc_plan_t* plan = c->plan && c->plan->n_leaves ? c->plan : NULL;
+    ray_enc_vview_t vbuf;
+    uint8_t out[EXPR_MORSEL];
+    for (int64_t ms = start; ms < end; ms += EXPR_MORSEL) {
+        int64_t me = ms + EXPR_MORSEL < end ? ms + EXPR_MORSEL : end;
+        const int64_t n = me - ms;
+        const uint32_t seg = (uint32_t)(ms / RAY_MORSEL_ELEMS);
+        const uint8_t f = c->flags[seg];
+        if (f == RAY_SEL_NONE || failed) {
+            /* rowsel_emit_segment's NONE outcome without scanning n bools */
+            const uint32_t ls = seg - base_seg;
+            sb->seg_off[ls] = sb->idx_len;
+            sb->seg_flags[ls] = RAY_SEL_NONE;
+            sb->seg_off[ls + 1] = sb->idx_len;
+            continue;
+        }
+        const uint8_t* res = NULL;
+        int d = -1;   /* the leaves decide whole vectors on their views */
+        if (d < 0) {
+            ray_t* err = NULL;
+            res = (const uint8_t*)expr_eval_morsel(expr, plan, plan ? &vbuf : NULL, scratch, rsc, ms, me, &err);
+            if (err) { ray_scan_fail_note(c->fail, start, err); failed = true; d = 0; }
+        }
+        const uint32_t ls = seg - base_seg;
+        if (f == RAY_SEL_MIX) {
+            /* d 1: every selected row passes (res NULL); d 0: none does */
+            refine_emit_mix(sb, ls, c->idx + c->offs[seg], d == 0 ? 0 : c->offs[seg + 1] - c->offs[seg],
+                            d == 1 ? NULL : res, n);
+            continue;
+        }
+        if (d == 1) { memset(out, 1, (size_t)n); res = out; }
+        else if (d == 0) { memset(out, 0, (size_t)n); res = out; }
+        rowsel_emit_segment(sb, ls, res, n);
+    }
+    if (rsc) for (uint8_t r = 0; r < expr->n_regs; r++) ray_col_scratch_free(&rsc[r]);
+    scratch_free(scratch_hdr);
+}
+
+static void expr_refine_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
+    (void)worker_id;
+    for (int64_t t = start; t < end; t++) expr_refine_task((expr_refine_ctx_t*)ctx, (uint32_t)t);
+}
+
+ray_t* exec_pred_refine_selection(ray_graph_t* g, ray_op_t* pred, ray_t* sel, bool* all_pass) {
+    *all_pass = false;
+    if (!g || !g->table || !pred || !sel) return NULL;
+    ray_rowsel_t* m = ray_rowsel_meta(sel);
+    const int64_t nrows = m->nrows;
+    if (nrows <= 0 || nrows != ray_table_nrows(g->table)) return NULL;
+    ray_expr_t ex;
+    ray_t* cerr = NULL;
+    if (!expr_compile(g, g->table, pred, &ex, &cerr)) return cerr;   /* NULL: unsupported */
+    if (ex.out_type != RAY_BOOL || ex.has_parted) return NULL;
+    /* tasks over contiguous segment ranges, one builder each: four per
+     * worker (as the first-n pass splits its segments), so a sparse
+     * selection allocates few builders */
+    ray_pool_t* pool = ray_pool_get();
+    const int64_t n_segs = (nrows + RAY_MORSEL_ELEMS - 1) / RAY_MORSEL_ELEMS;
+    const bool parallel = ray_pool_par_dispatch_ok(pool, nrows, RAY_PARALLEL_THRESHOLD);
+    int64_t ntask = parallel ? (int64_t)ray_pool_total_workers(pool) * 4 : 1;
+    if (ntask > n_segs) ntask = n_segs;
+    const uint32_t n_builders = (uint32_t)(ntask > 0 ? ntask : 1);
+    rowsel_builder_t* builders = (rowsel_builder_t*)ray_alloc_raw((size_t)n_builders * sizeof(rowsel_builder_t));
+    if (!builders) return NULL;
+    for (uint32_t t = 0; t < n_builders; t++)
+        rowsel_builder_init(&builders[t], (uint32_t)(n_segs * (t + 1) / n_builders - n_segs * t / n_builders));
+    ray_scan_fail_t fail; ray_scan_fail_init(&fail);
+    expr_enc_plan_t plan;
+    expr_refine_ctx_t ctx = { .expr = &ex, .plan = expr_enc_plan_build(&ex, &plan),
+        .flags = ray_rowsel_flags(sel), .offs = ray_rowsel_offsets(sel), .idx = ray_rowsel_idx(sel),
+        .sel_builders = builders, .n_sel_builders = n_builders, .nrows = nrows, .n_segs = n_segs, .fail = &fail };
+    if (n_builders > 1) ray_pool_dispatch_n(pool, expr_refine_fn, &ctx, n_builders);
+    else expr_refine_fn(&ctx, 0, 0, 1);
+    bool ap = false;
+    ray_t* block = pred_sel_builders_finish(builders, n_builders, nrows, &ap);
+    ray_t* ferr = ray_scan_fail_finish(&fail, parallel ? pool : NULL);
+    if (ferr) { if (block) ray_rowsel_release(block); return ferr; }
+    *all_pass = ap;
+    return block;
+}
+
 /* ============================================================================
  * Null bitmap propagation for element-wise ops
  * ============================================================================ */
