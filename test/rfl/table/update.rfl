@@ -99,6 +99,16 @@ t -- (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0]))
 ;; Partial updates MUST include the key column(s) — otherwise the match/insert
 ;; logic would dereference a null-filled key and segfault.
 (set t (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0])))(upsert t 1 (table [Name Value] (list [charlie] [30.0]))) !- value
+;; A dict row is a partial row too, exactly as the one-row table above: it
+;; used to require every column and refused this with a bare `value`.  A new
+;; key null-fills the columns it leaves out; a matched key keeps them.
+(set t (table [ID Name Value] (list [1] [alice] [10.0])))(upsert t 1 (dict [ID Value] (list 2 20.0))) -- (table [ID Name Value] (list [1 2] [alice '] [10.0 20.0]))
+(set t (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0])))(upsert t 1 (dict [Value ID] (list 25.0 2))) -- (table [ID Name Value] (list [1 2] [alice bob] [10.0 25.0]))
+(set t (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0])))(upsert 't 'ID (dict [ID Value] (list [2 3] [25.0 30.0])))t -- (table [ID Name Value] (list [1 2 3] [alice bob '] [10.0 25.0 30.0]))
+(set t (table [k s n] (list [a b] (list "p" "qq") [1 2])))(get (upsert t 1 (dict [k n] (list 'e 50))) 's) -- ["p" "qq" ""]
+;; ... and must still carry the key column(s)
+(set t (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0])))(upsert t 1 (dict [Name Value] (list 'charlie 30.0))) !- value
+(set t (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0])))(upsert t 2 (dict [ID Value] (list 2 30.0))) !- value
 ;; Zero-row payloads are a no-op regardless of schema (restore pre-existing behavior
 ;; — rejecting an empty partial payload for missing key columns would break callers
 ;; that build up upserts unconditionally and may pass empty batches).

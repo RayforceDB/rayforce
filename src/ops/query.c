@@ -22704,25 +22704,37 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
         }
         int64_t n_pairs = dkeys->len;
 
-        /* Schema-strictness: every column name must appear exactly once
-         * on each side.  Mirrors the table-payload path. */
-        if (n_pairs != ncols) {
-            ray_release(tbl); ray_release(key_sym); ray_release(row);
-            return ray_error("value", NULL);
-        }
-        for (int64_t c = 0; c < ncols; c++) {
-            int64_t cn = ray_table_col_name(tbl, c);
+        /* Schema-strictness, as for a table payload: a dict row is a
+         * partial row too.  Every dict key must name exactly one target
+         * column and appear once; columns it leaves out are null-filled,
+         * as insert fills them.  Requiring every column refused a dict
+         * that a one-row table with the same columns upserts. */
+        for (int64_t d = 0; d < n_pairs; d++) {
+            /* dict-key cell vs runtime column NAME id (see insert) */
+            int64_t dk = sym_cell_runtime_id(dkeys, d);
             int64_t tbl_matches = 0, dict_matches = 0;
             for (int64_t i = 0; i < ncols; i++)
-                if (ray_table_col_name(tbl, i) == cn) tbl_matches++;
-            for (int64_t d = 0; d < n_pairs; d++) {
-                /* dict-key cell vs runtime column NAME id (see insert) */
-                int64_t dk = sym_cell_runtime_id(dkeys, d);
-                if (dk == cn) dict_matches++;
-            }
+                if (ray_table_col_name(tbl, i) == dk) tbl_matches++;
+            for (int64_t e = 0; e < n_pairs; e++)
+                if (sym_cell_runtime_id(dkeys, e) == dk) dict_matches++;
             if (tbl_matches != 1 || dict_matches != 1) {
                 ray_release(tbl); ray_release(key_sym); ray_release(row);
-                return ray_error("value", NULL);
+                return ray_error("value", "upsert: dict row key must name one target column, once");
+            }
+        }
+        /* The key column(s) must be present: the match below reads them. */
+        int64_t n_key_cols = key_sym->type == -RAY_SYM ? 1
+                           : key_sym->type == -RAY_I64 ? key_sym->i64 : 0;
+        if (n_key_cols > ncols) n_key_cols = 0;  /* range is checked below */
+        for (int64_t k = 0; k < n_key_cols; k++) {
+            int64_t kn = key_sym->type == -RAY_SYM ? key_sym->i64
+                                                   : ray_table_col_name(tbl, k);
+            int found = 0;
+            for (int64_t d = 0; d < n_pairs && !found; d++)
+                found = sym_cell_runtime_id(dkeys, d) == kn;
+            if (!found) {
+                ray_release(tbl); ray_release(key_sym); ray_release(row);
+                return ray_error("value", "upsert: dict row is missing a key column");
             }
         }
 
@@ -22812,7 +22824,8 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
             ray_t** sr = (ray_t**)ray_data(single_row);
             for (int64_t c = 0; c < ncols; c++) {
                 int alloc = 0;
-                sr[c] = collection_elem(row_elems[c], r, &alloc);
+                /* A column a dict row left out stays a NULL slot. */
+                sr[c] = row_elems[c] ? collection_elem(row_elems[c], r, &alloc) : NULL;
                 if (!alloc && sr[c]) ray_retain(sr[c]);
             }
             /* Upsert single row into current table */
