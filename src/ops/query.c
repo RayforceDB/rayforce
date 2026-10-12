@@ -710,6 +710,73 @@ static bool table_is_parted(ray_t* tbl) {
  * name), an atom take with K << nrows, and the result is a flat table
  * with no LIST columns, dispatch to ray_topk_table — bounded-heap
  * selection in O(n log K) instead of full sort + gather. */
+/* The sort keys a select names in asc:/desc: — a symbol atom or a symbol
+ * vector each.  Calls fn(name, ctx) per key; stops early on nonzero. */
+static int select_for_each_sort_key(ray_t** dict_elems, int64_t dict_n,
+                                    int64_t asc_id, int64_t desc_id,
+                                    int (*fn)(int64_t, void*), void* ctx) {
+    for (int64_t i = 0; i + 1 < dict_n; i += 2) {
+        int64_t kid = dict_elems[i]->i64;
+        if (kid != asc_id && kid != desc_id) continue;
+        ray_t* v = dict_elems[i + 1];
+        if (v->type == -RAY_SYM) {
+            if (fn(v->i64, ctx)) return 1;
+        } else if (v->type == RAY_SYM) {
+            for (int64_t k = 0; k < v->len; k++)
+                if (fn(((int64_t*)ray_data(v))[k], ctx)) return 1;
+        }
+    }
+    return 0;
+}
+
+typedef struct { ray_t* result; ray_t* src; int64_t rows; int64_t added; } carry_ctx_t;
+
+static int carry_one_sort_key(int64_t name, void* p) {
+    carry_ctx_t* c = (carry_ctx_t*)p;
+    if (ray_table_get_col(c->result, name)) return 0;   /* output already */
+    ray_t* col = ray_table_get_col(c->src, name);
+    if (!col || col->type < 0 || RAY_IS_PARTED(col->type) ||
+        col->type == RAY_MAPCOMMON || ray_len(col) != c->rows)
+        return 0;                                       /* not a row column */
+    ray_retain(col);
+    ray_t* r = ray_table_add_col(c->result, name, col);
+    ray_release(col);
+    c->result = r;
+    if (!r || RAY_IS_ERR(r)) return 1;
+    c->added++;
+    return 0;
+}
+
+/* Append each asc:/desc: key that names a full-length source column but no
+ * output column to `result`; *added counts them (they are the tail). */
+static ray_t* select_fallback_carry_sort_keys(ray_t* result, ray_t* src,
+                                              ray_t** dict_elems, int64_t dict_n,
+                                              int64_t asc_id, int64_t desc_id,
+                                              int64_t* added) {
+    *added = 0;
+    if (!src || RAY_IS_ERR(src) || src->type != RAY_TABLE ||
+        result->type != RAY_TABLE)
+        return result;
+    carry_ctx_t c = { result, src, ray_table_nrows(result), 0 };
+    select_for_each_sort_key(dict_elems, dict_n, asc_id, desc_id,
+                             carry_one_sort_key, &c);
+    *added = c.added;
+    return c.result;
+}
+
+/* Drop the last `n` columns of a table (the carried sort keys). */
+static ray_t* select_fallback_drop_tail_cols(ray_t* tbl, int64_t n) {
+    if (!tbl || RAY_IS_ERR(tbl) || tbl->type != RAY_TABLE) return tbl;
+    int64_t keep = ray_table_ncols(tbl) - n;
+    if (keep < 0) keep = 0;
+    ray_t* out = ray_table_new(keep);
+    for (int64_t c = 0; c < keep && out && !RAY_IS_ERR(out); c++)
+        out = ray_table_add_col(out, ray_table_col_name(tbl, c),
+                                ray_table_get_col_idx(tbl, c));
+    ray_release(tbl);
+    return out ? out : ray_error("oom", NULL);
+}
+
 /* Decoded take: value the CALLER already evaluated (grouped DAG path: it
  * evaluates take: once to decide the HEAD pushdown).  Passing the DECODED form
  * rather than the ray_t keeps it a stack value with no ownership to leak on the
@@ -3591,6 +3658,17 @@ static int is_group_dag_agg_expr_dag_safe(ray_t* expr, ray_t* tbl) {
         if (ray_len(expr) < 3) return 1;
         if (expr_contains_temporal_arith(elems[2], tbl))
             return 0;
+    }
+    /* An argument the DAG has no node for — (in s (list ...)) — is left to
+     * the per-group evaluation instead of failing the whole select with
+     * "failed to compile aggregation argument".  Compilation only inspects
+     * types and literals; it runs no user expression. */
+    if (agg_arg && agg_arg->type == RAY_LIST) {
+        ray_graph_t* g = ray_graph_new(tbl);
+        if (!g) return 1;
+        ray_op_t* op_in = compile_expr_dag(g, agg_arg);
+        ray_graph_free(g);
+        if (!op_in) return 0;
     }
     return 1;
 }
@@ -16360,11 +16438,21 @@ by_dict_done:
                 }
                 result = select_fallback_finish_columns(result, scalar_cols,
                                                           out_len >= 0 ? out_len : bcast_len);
+                /* A sort key the projections do not output (`desc: n` over
+                 * `{c: ...}`) is a source column; the DAG sorts before it
+                 * projects, so it can read one.  Carry such a key into the
+                 * result for the sort and drop it after. */
+                int64_t carried = 0;
+                if (has_sort && result && !RAY_IS_ERR(result))
+                    result = select_fallback_carry_sort_keys(result, tbl, dict_elems, dict_n,
+                                                             asc_id, desc_id, &carried);
                 if (nearest_handle_owned) ray_release(nearest_handle_owned);
                 if (nearest_query_owned)  ray_free_raw(nearest_query_owned);
                 ray_graph_free(g); ray_release(tbl);
                 result = apply_sort_take(result, dict_elems, dict_n,
                                          asc_id, desc_id, take_id, NULL);
+                if (carried && result && !RAY_IS_ERR(result))
+                    result = select_fallback_drop_tail_cols(result, carried);
                 scratch_free(colops_hdr);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return result;
             } else {

@@ -187,12 +187,13 @@
 ;; `(first (asc col_expr))` where col_expr = (+ v 1) (not a name ref)
 ;; → col_expr->type == RAY_LIST, not -RAY_SYM → return false at 1858.
 ;; dep_candidate optimization not applied → falls back to per-group eval.
-;; (+ v 1) is not compilable as an agg DAG node → domain error.
+;; (+ v 1) is not compilable as an agg DAG node → evaluated per group
+;; (it raised "failed to compile aggregation argument").
 ;; ────────────────────────────────────────────────────────────────────
 (set T1858 (table [k v] (list ['a 'a 'b 'b] [1 2 3 4])))
 ;; (first (asc (+ v 1))): inner col_expr = (+ v 1) is LIST → line 1858
-;; simplify_agg_idiom returns false → compilation fails → domain error
-(select {m: (first (asc (+ v 1))) by: k from: T1858}) !- domain
+;; simplify_agg_idiom returns false → the aggregate runs per group
+(select {m: (first (asc (+ v 1))) by: k from: T1858}) -- (table [k m] (list [a b] [2 4]))
 
 (set TLimLazy (table [s v] (list (take ['a 'b 'c] 120) (til 120))))
 (count (select {s: s from: TLimLazy where: (!= s 'c) take: 20})) -- 20

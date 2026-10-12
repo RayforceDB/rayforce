@@ -258,11 +258,24 @@
 (at (select {c: (in s "qq") d: (in s (list "x")) from: TS}) 'c) -- [false true false false]
 (at (select {c: (in s (list "qq")) from: TS where: (> n 1)}) 'c) -- [true false false]
 (at (update {c: (in s (list "qq")) from: TS}) 'c) -- [false true false false]
-;; Known bugs found alongside, not fixed here — a symbol column fails the
-;; same way, so they are not about strings:
-;; (at (select {c: (in s (list "qq")) from: TS desc: n}) 'c) -- [false false true false]   ;; xfail BUG: a projection the compiler declines, with desc:/asc:, errors nyi (also (in y (list 'qq)) and (reverse n))
-;; (at (select {c: (sum (in s (list "qq"))) from: TS by: (> n 2)}) 'c) -- [1 0]   ;; xfail BUG: by: aggregate over in with a LIST set errors "failed to compile aggregation argument" (a vector set works)
-;; (at (select {c: (in 's (list 's)) from: TS}) 'c) -- [true]   ;; xfail BUG: a quoted symbol that names a column reads the column
+;; A projection the compiler declines still sorts by a column it does not
+;; output — the key is carried for the sort (it raised nyi) ...
+(at (select {c: (in s (list "qq")) from: TS desc: n}) 'c) -- [false false true false]
+(at (select {c: (in s (list "qq")) from: TS asc: n take: 2}) 'c) -- [false true]
+(at (select {c: (in s (list "qq")) from: TS where: (> n 1) desc: n}) 'c) -- [false false true]
+(at (select {c: (reverse n) from: TS desc: n}) 'c) -- [1 2 3 4]
+(key (select {c: (in s (list "qq")) from: TS desc: [s n]})) -- ['c]
+;; ... and a by: aggregate over such an argument is evaluated per group (it
+;; raised "failed to compile aggregation argument")
+(set TG (table [s g n] (list ["p" "qq" "zz" "" "qq"] [1 1 2 2 2] [1 2 3 4 5])))
+(at (select {c: (sum (in s (list "qq"))) from: TG by: g}) 'c) -- [1 1]
+(at (select {c: (sum (in s (list "qq"))) m: (max n) from: TG by: g}) 'm) -- [2 5]
+(at (select {c: (count (in s (list "qq" "zz"))) from: TG by: g where: (> n 1)}) 'c) -- [1 3]
+
+;; Known bugs found alongside, not fixed here:
+;; (at (select {c: (sum (in s (list "qq"))) from: TG by: (> n 2)}) 'c) -- [1 1]   ;; xfail BUG: an aggregate evaluated per group needs a column group key; a computed key errors "could not resolve scalar group key symbol" (also (sum (reverse n)))
+;; Name resolution inside a query (planned binder work), not `in` itself:
+;; (at (select {c: (in 's (list 's)) from: TS}) 'c) -- [true]   ;; xfail BUG: a quoted symbol that names a column reads the column, here and in (== y 'y) or {c: 'y}
 ;; (do (set in concat) (at (select {c: (in s "!") from: TS}) 'c)) -- ["p!" "qq!" "zz!" "!"]   ;; xfail BUG: select still compiles a rebound `in` as membership
 
 ;; a column of another type against a string set matches no row, as bare
