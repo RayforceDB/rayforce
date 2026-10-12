@@ -26,6 +26,7 @@
 #include "mem/heap.h"
 #include "mem/sys.h"
 #include "table/sym.h"
+#include "store/part.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -457,6 +458,7 @@ void ray_runtime_destroy(ray_runtime_t* rt) {
     g_ray_profile.n = 0;
     g_ray_profile_last.n = 0;
 
+    ray_parted_cache_clear();
     ray_sym_destroy();
     ray_heap_destroy();
 

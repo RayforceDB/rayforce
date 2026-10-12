@@ -213,6 +213,7 @@ typedef struct ray_dispatch  ray_dispatch_t;
 
 void     ray_heap_init(void);
 void     ray_heap_destroy(void);
+
 /* Detach the calling thread from its heap WITHOUT tearing the heap down:
  * the heap stays registered with its pools intact and is handed to the next
  * thread that calls ray_heap_init().

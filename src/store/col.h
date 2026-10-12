@@ -74,6 +74,21 @@ static inline ray_err_t ray_col_check_format(const ray_t* header) {
     return header->order == RAY_COL_FORMAT_MAJOR ? RAY_OK : RAY_ERR_VERSION;
 }
 
+/* STR column files: a writer that stored every pooled descriptor's content
+ * hash (ray_str_t.hash32) says so by putting this value in the header's
+ * `rc` field, which is otherwise 0 on disk for STR (RAY_SYM uses it for
+ * the saved dictionary count).  A reader that sees the mark takes the
+ * descriptors as written; without it (files from before the hash cache,
+ * whose final four descriptor bytes are padding) the loaders recompute the
+ * hashes and repair them in the private mapping.  Mapping a marked file
+ * therefore costs no pass over the pool and leaves the descriptor pages
+ * shared with the page cache. */
+#define RAY_COL_STR_HASHED      ((uint32_t)0x48534148)  /* "HASH" */
+
+static inline void ray_col_stamp_str_hashed(ray_t* header) {
+    header->rc = RAY_COL_STR_HASHED;
+}
+
 /* Column file I/O.
  *
  * The bare save/load/mmap entry points keep PROCESS-LOCAL semantics for

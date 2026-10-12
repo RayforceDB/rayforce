@@ -50,6 +50,7 @@
 #include "mem/sys.h"
 #include "table/sym.h"
 #include "table/domain.h"
+#include <fcntl.h>
 #include "ops/hash.h"     /* ray_hash_bytes: the import dictionary's full hashes */
 #include "vec/str.h"
 
@@ -82,6 +83,7 @@ static void store_setup(void) {
 }
 
 static void store_teardown(void) {
+    ray_parted_cache_clear();
     ray_sym_destroy();
     ray_heap_destroy();
 }
@@ -6210,6 +6212,10 @@ static test_result_t test_col_str_legacy_hash_repair(void) {
         TEST_ASSERT_EQ_U(fwrite(&garbage[i], 1, sizeof(garbage[i]), f),
                          sizeof(garbage[i]));
     }
+    /* A legacy writer also left the header's rc at 0: no hash mark. */
+    uint32_t legacy_rc = 0;
+    TEST_ASSERT_EQ_I(fseek(f, (long)offsetof(ray_t, rc), SEEK_SET), 0);
+    TEST_ASSERT_EQ_U(fwrite(&legacy_rc, 1, sizeof(legacy_rc), f), sizeof(legacy_rc));
     TEST_ASSERT_EQ_I(fclose(f), 0);
 
     ray_t* loaded = ray_col_load(TMP_COL_PATH);
@@ -6257,6 +6263,576 @@ static test_result_t test_col_str_legacy_hash_repair(void) {
     TEST_ASSERT_EQ_U(persisted, garbage[0]);
 
     ray_release(vec);
+    unlink(TMP_COL_PATH);
+    PASS();
+}
+
+/* ---- test_col_str_hash_persisted --------------------------------------- */
+/* A current writer stores every pooled descriptor's content hash and marks
+ * the header, so the loaders take the descriptors as written: no pass over
+ * the pool, no write into the private mapping.  Hashes the column has not
+ * cached yet are computed on save. */
+static test_result_t test_col_str_hash_persisted(void) {
+    const char* same = "persisted-pooled-string-value";
+    const char* other = "another-pooled-string-value";
+    ray_t* vec = ray_vec_new(RAY_STR, 3);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+    vec = ray_str_vec_append(vec, same, strlen(same));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+    vec = ray_str_vec_append(vec, same, strlen(same));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+    vec = ray_str_vec_append(vec, other, strlen(other));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+    ray_str_t* vd = (ray_str_t*)ray_data(vec);
+    const char* vpool = (const char*)ray_data(vec->str_pool);
+    uint32_t expect[3];
+    for (int i = 0; i < 3; i++) {
+        expect[i] = ray_str_t_hash32(&vd[i], vpool);
+        vd[i].hash32 = 0;   /* lazy state: the writer must fill it */
+    }
+    TEST_ASSERT_EQ_I(ray_col_save(vec, TMP_COL_PATH), RAY_OK);
+
+    /* On disk: the mark in rc, the hash in every pooled descriptor. */
+    FILE* f = fopen(TMP_COL_PATH, "r+b");
+    TEST_ASSERT_NOT_NULL(f);
+    uint32_t disk_rc = 0;
+    TEST_ASSERT_EQ_I(fseek(f, (long)offsetof(ray_t, rc), SEEK_SET), 0);
+    TEST_ASSERT_EQ_U(fread(&disk_rc, 1, sizeof(disk_rc), f), sizeof(disk_rc));
+    TEST_ASSERT_EQ_U(disk_rc, RAY_COL_STR_HASHED);
+    for (int i = 0; i < 3; i++) {
+        uint32_t stored = 0;
+        TEST_ASSERT_EQ_I(fseek(f, 32L + (long)i * 16L + 12L, SEEK_SET), 0);
+        TEST_ASSERT_EQ_U(fread(&stored, 1, sizeof(stored), f), sizeof(stored));
+        TEST_ASSERT_EQ_U(stored, expect[i]);
+    }
+    /* Forge one stored hash.  A marked file is taken as written, which is
+     * only observable this way: the loaders must not recompute it. */
+    const uint32_t forged = 0x5A5A5A5Au;
+    TEST_ASSERT_EQ_I(fseek(f, 32L + 2L * 16L + 12L, SEEK_SET), 0);
+    TEST_ASSERT_EQ_U(fwrite(&forged, 1, sizeof(forged), f), sizeof(forged));
+    TEST_ASSERT_EQ_I(fclose(f), 0);
+
+    ray_t* mapped = ray_col_mmap(TMP_COL_PATH);
+    TEST_ASSERT_NOT_NULL(mapped);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(mapped));
+    ray_str_t* md = (ray_str_t*)ray_data(mapped);
+    TEST_ASSERT_EQ_U(md[0].hash32, expect[0]);
+    TEST_ASSERT_EQ_U(md[1].hash32, expect[1]);
+    TEST_ASSERT_EQ_U(md[2].hash32, forged);
+    ray_release(mapped);
+
+    ray_t* loaded = ray_col_load(TMP_COL_PATH);
+    TEST_ASSERT_NOT_NULL(loaded);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    ray_str_t* ld = (ray_str_t*)ray_data(loaded);
+    TEST_ASSERT_EQ_U(ld[0].hash32, expect[0]);
+    TEST_ASSERT_EQ_U(ld[2].hash32, forged);
+    ray_release(loaded);
+
+    ray_release(vec);
+    unlink(TMP_COL_PATH);
+    PASS();
+}
+
+/* ---- test_stream_str_hash_persisted ------------------------------------- */
+/* The streaming writer (CSV and parquet imports) stores the same hashes and
+ * the same mark as ray_col_save, including for a column whose in-memory
+ * hashes were never computed. */
+static test_result_t test_stream_str_hash_persisted(void) {
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-stream-strhash-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    const char* s0 = "streamed-pooled-string-value";
+    const char* s1 = "short";
+    const char* s2 = "second-streamed-pooled-value";
+    ray_t* v = ray_vec_new(RAY_STR, 3);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    v = ray_str_vec_append(v, s0, strlen(s0));
+    v = ray_str_vec_append(v, s1, strlen(s1));
+    v = ray_str_vec_append(v, s2, strlen(s2));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    ray_str_t* vd = (ray_str_t*)ray_data(v);
+    const char* vpool = (const char*)ray_data(v->str_pool);
+    uint32_t expect[3];
+    for (int i = 0; i < 3; i++) {
+        expect[i] = ray_str_t_hash32(&vd[i], vpool);
+        if (!ray_str_is_inline(&vd[i])) vd[i].hash32 = 0;
+    }
+    ray_col_stream_t w;
+    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("s", 1), RAY_STR, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_append(&w, v), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_close(&w, false), RAY_OK);
+
+    char path[200]; snprintf(path, sizeof(path), "%s/s", dir);
+    FILE* f = fopen(path, "rb");
+    TEST_ASSERT_NOT_NULL(f);
+    uint32_t disk_rc = 0;
+    TEST_ASSERT_EQ_I(fseek(f, (long)offsetof(ray_t, rc), SEEK_SET), 0);
+    TEST_ASSERT_EQ_U(fread(&disk_rc, 1, sizeof(disk_rc), f), sizeof(disk_rc));
+    TEST_ASSERT_EQ_U(disk_rc, RAY_COL_STR_HASHED);
+    TEST_ASSERT_EQ_I(fclose(f), 0);
+
+    ray_t* back = ray_col_mmap(path);
+    TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
+    ray_str_t* bd = (ray_str_t*)ray_data(back);
+    const char* bpool = (const char*)ray_data(back->str_pool);
+    TEST_ASSERT_EQ_U(bd[0].hash32, expect[0]);
+    TEST_ASSERT_EQ_U(bd[2].hash32, expect[2]);
+    TEST_ASSERT_TRUE(ray_str_is_inline(&bd[1]));
+    TEST_ASSERT_EQ_U(ray_str_t_hash32(&bd[1], bpool), expect[1]);
+    /* And the stored value is the content hash of the bytes on disk. */
+    TEST_ASSERT_EQ_U(bd[0].hash32, (uint32_t)ray_str_t_hash(&bd[0], bpool));
+    ray_release(back); ray_release(v);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+}
+
+/* ---- test_parted_remount_reuse ------------------------------------------ */
+/* A second ray_read_parted of the same root returns the very same segment
+ * vectors for partitions whose files did not change, loads a replaced
+ * partition afresh, and ray_parted_cache_clear forgets everything. */
+#define TMP_PARTED_ROOT "/tmp/rayforce_test_parted_remount"
+static ray_t* parted_remount_part(int64_t base) {
+    int64_t raw[3] = { base, base + 1, base + 2 };
+    ray_t* v = ray_vec_from_raw(RAY_I64, raw, 3);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("v", 1), v);
+    ray_release(v);
+    return tbl;
+}
+static test_result_t test_parted_remount_reuse(void) {
+    (void)ray_test_rm_rf(TMP_PARTED_ROOT);
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(TMP_PARTED_ROOT "/2024.01.01"), 0);
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(TMP_PARTED_ROOT "/2024.01.02"), 0);
+    ray_t* a = parted_remount_part(10);
+    ray_t* b = parted_remount_part(20);
+    TEST_ASSERT_EQ_I(ray_splay_save(a, TMP_PARTED_ROOT "/2024.01.01/t", NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_save(b, TMP_PARTED_ROOT "/2024.01.02/t", NULL), RAY_OK);
+
+    ray_t* m1 = ray_read_parted(TMP_PARTED_ROOT, "t");
+    TEST_ASSERT_TRUE(m1 && !RAY_IS_ERR(m1));
+    ray_t** s1 = (ray_t**)ray_data(ray_table_get_col_idx(m1, 1));
+    ray_t* m2 = ray_read_parted(TMP_PARTED_ROOT, "t");
+    TEST_ASSERT_TRUE(m2 && !RAY_IS_ERR(m2));
+    ray_t** s2 = (ray_t**)ray_data(ray_table_get_col_idx(m2, 1));
+    /* Unchanged root: both partitions are the same mapped vectors. */
+    TEST_ASSERT_EQ_PTR(s1[0], s2[0]);
+    TEST_ASSERT_EQ_PTR(s1[1], s2[1]);
+    TEST_ASSERT_TRUE(ray_atomic_load(&s1[0]->rc) >= 3);   /* two results + the cache */
+
+    /* Replace the second partition: a fresh vector there, the first kept. */
+    ray_t* c = parted_remount_part(30);
+    TEST_ASSERT_EQ_I(ray_splay_save(c, TMP_PARTED_ROOT "/2024.01.02/t", NULL), RAY_OK);
+    ray_t* m3 = ray_read_parted(TMP_PARTED_ROOT, "t");
+    TEST_ASSERT_TRUE(m3 && !RAY_IS_ERR(m3));
+    ray_t** s3 = (ray_t**)ray_data(ray_table_get_col_idx(m3, 1));
+    TEST_ASSERT_EQ_PTR(s3[0], s1[0]);
+    TEST_ASSERT_TRUE(s3[1] != s1[1]);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(s3[1]))[0], 30);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(s1[1]))[0], 20);   /* the old view keeps its rows */
+
+    /* Forgotten: the next mount maps everything again. */
+    ray_parted_cache_clear();
+    ray_t* m4 = ray_read_parted(TMP_PARTED_ROOT, "t");
+    TEST_ASSERT_TRUE(m4 && !RAY_IS_ERR(m4));
+    ray_t** s4 = (ray_t**)ray_data(ray_table_get_col_idx(m4, 1));
+    TEST_ASSERT_TRUE(s4[0] != s1[0]);
+    TEST_ASSERT_EQ_I(ray_table_nrows(m4), 6);
+
+    ray_release(m1); ray_release(m2); ray_release(m3); ray_release(m4);
+    ray_release(a); ray_release(b); ray_release(c);
+    ray_parted_cache_clear();
+    (void)ray_test_rm_rf(TMP_PARTED_ROOT);
+    PASS();
+}
+
+#ifdef RAY_OS_LINUX
+/* Check the mappings themselves: the legacy numeric-column unmap path
+ * rounds its accounting subtraction up to a page, unlike the map charge. */
+static int parted_mapping_count(void) {
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (!f) return -1;
+    int count = 0;
+    char line[4096];
+    while (fgets(line, sizeof(line), f))
+        if (strstr(line, TMP_PARTED_ROOT)) count++;
+    fclose(f);
+    return count;
+}
+#endif
+
+/* A dropped LIST view must release its copied payload and mapped columns
+ * on GC, including when the directory has already disappeared. */
+static test_result_t test_parted_cache_gc(void) {
+    (void)ray_test_rm_rf(TMP_PARTED_ROOT);
+    ray_t* items = ray_list_new(16384);
+    for (int i = 0; i < 16384; i++) {
+        ray_t* item = ray_i64(i);
+        items = ray_list_append(items, item);
+        ray_release(item);
+    }
+    ray_t* src = ray_table_new(2);
+    src = ray_table_add_col(src, ray_sym_intern("v", 1), items);
+    ray_release(items);
+    ray_t* nums = ray_vec_new(RAY_I64, 16384);
+    nums->len = 16384;
+    memset(ray_data(nums), 0, 16384 * sizeof(int64_t));
+    src = ray_table_add_col(src, ray_sym_intern("n", 1), nums);
+    ray_release(nums);
+    TEST_ASSERT_EQ_I(ray_splay_save(src, TMP_PARTED_ROOT "/1/t", NULL), RAY_OK);
+    ray_mem_stats_t before, mounted, after;
+    ray_mem_stats(&before);
+    ray_t* view = ray_read_parted(TMP_PARTED_ROOT, "t");
+    TEST_ASSERT_TRUE(view && !RAY_IS_ERR(view));
+    ray_t* seg = ((ray_t**)ray_data(ray_table_get_col_idx(view, 1)))[0];
+    ray_heap_gc();
+    TEST_ASSERT_EQ_U(ray_atomic_load(&seg->rc), 2); /* live views keep reuse */
+    ray_mem_stats(&mounted);
+#ifdef RAY_OS_LINUX
+    TEST_ASSERT_TRUE(parted_mapping_count() > 0);
+#endif
+    TEST_ASSERT_TRUE(mounted.bytes_allocated > before.bytes_allocated + 500000);
+    ray_release(view);
+    (void)ray_test_rm_rf(TMP_PARTED_ROOT);
+    ray_heap_gc();
+    ray_mem_stats(&after);
+    TEST_ASSERT_TRUE(after.bytes_allocated <= before.bytes_allocated + 4096);
+#ifdef RAY_OS_LINUX
+    TEST_ASSERT_EQ_I(parted_mapping_count(), 0);
+#endif
+    ray_release(src);
+    PASS();
+}
+
+static ray_t* parted_symbol_part(const char* value) {
+    int64_t id = ray_sym_intern(value, strlen(value));
+    ray_t* col = ray_vec_from_raw(RAY_SYM, &id, 1);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("s", 1), col);
+    ray_release(col);
+    return tbl;
+}
+
+/* Recreating a root after dropping its view must not find a dictionary
+ * pinned only by the cache, with or without explicit GC before the write.
+ * Cover both equal-size and differently sized symbols. */
+static test_result_t parted_rebuilt_symbols(bool collect) {
+    const char* values[] = { "aa", "xx", "longer" };
+    for (int i = 0; i < 3; i++) {
+        (void)ray_test_rm_rf(TMP_PARTED_ROOT);
+        ray_t* src = parted_symbol_part(values[i]);
+        TEST_ASSERT_EQ_I(ray_splay_save(src, TMP_PARTED_ROOT "/1/t",
+                                        TMP_PARTED_ROOT "/.sym"), RAY_OK);
+        ray_release(src);
+        ray_t* view = ray_read_parted(TMP_PARTED_ROOT, "t");
+        TEST_ASSERT_TRUE(view && !RAY_IS_ERR(view));
+        ray_t* seg = ((ray_t**)ray_data(ray_table_get_col_idx(view, 1)))[0];
+        int64_t pos = ray_read_sym(ray_data(seg), 0, seg->type, seg->attrs);
+        ray_t* value = ray_sym_domain_str(ray_sym_vec_domain(seg), pos);
+        TEST_ASSERT_EQ_U(ray_str_len(value), strlen(values[i]));
+        TEST_ASSERT_TRUE(memcmp(ray_str_ptr(value), values[i], strlen(values[i])) == 0);
+        ray_release(view);
+        if (collect) ray_heap_gc();
+    }
+    (void)ray_test_rm_rf(TMP_PARTED_ROOT);
+    PASS();
+}
+
+static test_result_t test_parted_rebuilt_symbols(void) {
+    return parted_rebuilt_symbols(true);
+}
+
+static test_result_t test_parted_rebuilt_write_without_gc(void) {
+    return parted_rebuilt_symbols(false);
+}
+
+/* A filesystem publisher can replace the root without a GC call in the
+ * reader. Both parted and splayed reads must discard unused cached domains. */
+static test_result_t parted_rebuilt_read_without_gc(bool parted) {
+    (void)ray_test_rm_rf(TMP_PARTED_ROOT);
+    (void)ray_test_rm_rf(TMP_PARTED_ROOT "_next");
+    ray_t* a = parted_symbol_part("aa");
+    ray_t* b = parted_symbol_part("xx");
+    TEST_ASSERT_EQ_I(ray_splay_save(a, TMP_PARTED_ROOT "/1/t",
+                                    TMP_PARTED_ROOT "/.sym"), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_save(b, TMP_PARTED_ROOT "_next/1/t",
+                                    TMP_PARTED_ROOT "_next/.sym"), RAY_OK);
+    ray_t* old = ray_read_parted(TMP_PARTED_ROOT, "t");
+    TEST_ASSERT_TRUE(old && !RAY_IS_ERR(old));
+    ray_release(old);
+    (void)ray_test_rm_rf(TMP_PARTED_ROOT);
+    TEST_ASSERT_EQ_I(rename(TMP_PARTED_ROOT "_next", TMP_PARTED_ROOT), 0);
+    ray_t* fresh = parted ? ray_read_parted(TMP_PARTED_ROOT, "t")
+                          : ray_read_splayed(TMP_PARTED_ROOT "/1/t", TMP_PARTED_ROOT "/.sym");
+    TEST_ASSERT_TRUE(fresh && !RAY_IS_ERR(fresh));
+    ray_t* seg = ray_table_get_col_idx(fresh, parted ? 1 : 0);
+    if (parted) seg = ((ray_t**)ray_data(seg))[0];
+    int64_t pos = ray_read_sym(ray_data(seg), 0, seg->type, seg->attrs);
+    ray_t* value = ray_sym_domain_str(ray_sym_vec_domain(seg), pos);
+    TEST_ASSERT_EQ_U(ray_str_len(value), 2);
+    TEST_ASSERT_TRUE(memcmp(ray_str_ptr(value), "xx", 2) == 0);
+    ray_release(fresh); ray_release(a); ray_release(b);
+    ray_heap_gc();
+    (void)ray_test_rm_rf(TMP_PARTED_ROOT);
+    PASS();
+}
+
+static test_result_t test_parted_rebuilt_without_gc(void) {
+    return parted_rebuilt_read_without_gc(true);
+}
+
+static test_result_t test_parted_rebuilt_splayed_without_gc(void) {
+    return parted_rebuilt_read_without_gc(false);
+}
+
+/* Opening an unrelated domain must preserve partitions held by a live view. */
+static test_result_t test_parted_live_domain_open(void) {
+    (void)ray_test_rm_rf(TMP_PARTED_ROOT);
+    (void)ray_test_rm_rf(TMP_PARTED_ROOT "_next");
+    ray_t* a = parted_symbol_part("aa");
+    ray_t* b = parted_symbol_part("xx");
+    TEST_ASSERT_EQ_I(ray_splay_save(a, TMP_PARTED_ROOT "/1/t",
+                                    TMP_PARTED_ROOT "/.sym"), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_save(b, TMP_PARTED_ROOT "_next/1/t",
+                                    TMP_PARTED_ROOT "_next/.sym"), RAY_OK);
+    ray_t* view = ray_read_parted(TMP_PARTED_ROOT, "t");
+    TEST_ASSERT_TRUE(view && !RAY_IS_ERR(view));
+    ray_t* seg = ((ray_t**)ray_data(ray_table_get_col_idx(view, 1)))[0];
+    TEST_ASSERT_EQ_I(ray_atomic_load(&seg->rc), 2);
+
+    ray_t* other = ray_read_splayed(TMP_PARTED_ROOT "_next/1/t",
+                                    TMP_PARTED_ROOT "_next/.sym");
+    TEST_ASSERT_TRUE(other && !RAY_IS_ERR(other));
+    TEST_ASSERT_EQ_I(ray_atomic_load(&seg->rc), 2);
+    ray_t* remount = ray_read_parted(TMP_PARTED_ROOT, "t");
+    TEST_ASSERT_TRUE(remount && !RAY_IS_ERR(remount));
+    TEST_ASSERT_EQ_PTR(((ray_t**)ray_data(ray_table_get_col_idx(remount, 1)))[0], seg);
+    int64_t pos = ray_read_sym(ray_data(seg), 0, seg->type, seg->attrs);
+    ray_t* value = ray_sym_domain_str(ray_sym_vec_domain(seg), pos);
+    TEST_ASSERT_EQ_U(ray_str_len(value), 2);
+    TEST_ASSERT_TRUE(memcmp(ray_str_ptr(value), "aa", 2) == 0);
+
+    ray_release(remount); ray_release(other); ray_release(view);
+    ray_release(a); ray_release(b);
+    ray_parted_cache_clear();
+    (void)ray_test_rm_rf(TMP_PARTED_ROOT);
+    (void)ray_test_rm_rf(TMP_PARTED_ROOT "_next");
+    PASS();
+}
+
+static test_result_t test_parted_missing_symfile(void) {
+    (void)ray_test_rm_rf(TMP_PARTED_ROOT);
+    ray_t* src = parted_symbol_part("aa");
+    TEST_ASSERT_EQ_I(ray_splay_save(src, TMP_PARTED_ROOT "/1/t",
+                                    TMP_PARTED_ROOT "/.sym"), RAY_OK);
+    ray_release(src);
+    ray_t* view = ray_read_parted(TMP_PARTED_ROOT, "t");
+    TEST_ASSERT_TRUE(view && !RAY_IS_ERR(view));
+    TEST_ASSERT_EQ_I(unlink(TMP_PARTED_ROOT "/.sym"), 0);
+    ray_t* missing = ray_read_parted(TMP_PARTED_ROOT, "t");
+    TEST_ASSERT_ERR_CODE_MSG(missing, "sym", "no symfile resolved");
+    ray_error_free(missing);
+    ray_release(view);
+    ray_parted_cache_clear();
+    (void)ray_test_rm_rf(TMP_PARTED_ROOT);
+    PASS();
+}
+
+/* Same inode, size and mtime: a copied LIST payload must still reload.
+ * Numeric mmap payloads alone cannot detect a bad cache hit here because
+ * an in-place write is already visible through the old mapping. */
+static test_result_t test_parted_restored_mtime(void) {
+#ifdef RAY_OS_WINDOWS
+    SKIP("nanosecond timestamp restoration requires POSIX");
+#else
+    (void)ray_test_rm_rf(TMP_PARTED_ROOT);
+    ray_t* items = ray_list_new(1);
+    ray_t* value = ray_i64(10);
+    items = ray_list_append(items, value);
+    ray_release(value);
+    ray_t* src = ray_table_new(1);
+    src = ray_table_add_col(src, ray_sym_intern("v", 1), items);
+    ray_release(items);
+    TEST_ASSERT_EQ_I(ray_splay_save(src, TMP_PARTED_ROOT "/1/t", NULL), RAY_OK);
+    ray_t* m1 = ray_read_parted(TMP_PARTED_ROOT, "t");
+    TEST_ASSERT_TRUE(m1 && !RAY_IS_ERR(m1));
+    ray_t* s1 = ((ray_t**)ray_data(ray_table_get_col_idx(m1, 1)))[0];
+    const char* path = TMP_PARTED_ROOT "/1/t/v";
+    struct stat st;
+    TEST_ASSERT_EQ_I(stat(path, &st), 0);
+    struct timespec times[2];
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+    /* Darwin's POSIX namespace exposes seconds/nanoseconds separately. */
+    times[0] = (struct timespec){ st.st_atime, st.st_atimensec };
+    times[1] = (struct timespec){ st.st_mtime, st.st_mtimensec };
+#elif defined(__APPLE__)
+    times[0] = st.st_atimespec; times[1] = st.st_mtimespec;
+#else
+    times[0] = st.st_atim; times[1] = st.st_mtim;
+#endif
+    /* Let ctime advance even on filesystems with coarse clocks. */
+    struct timespec pause = {1, 0};
+    nanosleep(&pause, NULL);
+    FILE* f = fopen(path, "r+b");
+    TEST_ASSERT_NOT_NULL(f);
+    TEST_ASSERT_EQ_I(fseek(f, -8, SEEK_END), 0);
+    int64_t changed = 99;
+    TEST_ASSERT_EQ_U(fwrite(&changed, 1, 8, f), 8);
+    TEST_ASSERT_EQ_I(fclose(f), 0);
+    TEST_ASSERT_EQ_I(utimensat(AT_FDCWD, path, times, 0), 0);
+    ray_t* m2 = ray_read_parted(TMP_PARTED_ROOT, "t");
+    TEST_ASSERT_TRUE(m2 && !RAY_IS_ERR(m2));
+    ray_t* s2 = ((ray_t**)ray_data(ray_table_get_col_idx(m2, 1)))[0];
+    TEST_ASSERT_TRUE(s1 != s2);
+    TEST_ASSERT_EQ_I(((ray_t**)ray_data(s1))[0]->i64, 10);
+    TEST_ASSERT_EQ_I(((ray_t**)ray_data(s2))[0]->i64, 99);
+    ray_release(m1); ray_release(m2); ray_release(src);
+    ray_parted_cache_clear();
+    (void)ray_test_rm_rf(TMP_PARTED_ROOT);
+    PASS();
+#endif
+}
+
+/* Both generations remain intact: their file signatures cannot substitute
+ * for comparing the resolved directory. Also prove the sweep drops refs. */
+static test_result_t test_parted_generation_and_sweep(void) {
+    (void)ray_test_rm_rf(TMP_PARTED_ROOT);
+    ray_t* a = parted_remount_part(10);
+    ray_t* b = parted_remount_part(20);
+    TEST_ASSERT_EQ_I(ray_splay_save(a, TMP_PARTED_ROOT "/1/t", NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_save(b, TMP_PARTED_ROOT "/2/t", NULL), RAY_OK);
+    ray_t* m1 = ray_read_parted(TMP_PARTED_ROOT, "t");
+    TEST_ASSERT_TRUE(m1 && !RAY_IS_ERR(m1));
+    ray_t** s1 = (ray_t**)ray_data(ray_table_get_col_idx(m1, 1));
+    TEST_ASSERT_EQ_I(ray_splay_save(b, TMP_PARTED_ROOT "/1/t/.generations/g-1", NULL), RAY_OK);
+    FILE* f = fopen(TMP_PARTED_ROOT "/1/t/.current", "wb");
+    TEST_ASSERT_NOT_NULL(f);
+    TEST_ASSERT_TRUE(fputs(".generations/g-1\n", f) >= 0);
+    TEST_ASSERT_EQ_I(fclose(f), 0);
+    (void)ray_test_rm_rf(TMP_PARTED_ROOT "/2");
+    ray_t* m2 = ray_read_parted(TMP_PARTED_ROOT, "t");
+    TEST_ASSERT_TRUE(m2 && !RAY_IS_ERR(m2));
+    ray_t* s2 = ((ray_t**)ray_data(ray_table_get_col_idx(m2, 1)))[0];
+    TEST_ASSERT_TRUE(s1[0] != s2);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(s2))[0], 20);
+    TEST_ASSERT_EQ_U(ray_atomic_load(&s1[1]->rc), 1); /* deleted partition swept */
+    (void)ray_test_rm_rf(TMP_PARTED_ROOT);
+    ray_t* missing = ray_read_parted(TMP_PARTED_ROOT, "t");
+    TEST_ASSERT_TRUE(RAY_IS_ERR(missing));
+    ray_error_free(missing);
+    TEST_ASSERT_EQ_U(ray_atomic_load(&s2->rc), 1); /* failed mount sweeps too */
+    ray_release(m1); ray_release(m2); ray_release(a); ray_release(b);
+    PASS();
+}
+
+/* The limit applies across roots/tables even when every view remains live.
+ * Eviction only drops the cache's reference, so the oldest view still reads. */
+static test_result_t test_parted_cache_limit(void) {
+    (void)ray_test_rm_rf(TMP_PARTED_ROOT);
+    ray_t* src = parted_remount_part(10);
+    ray_t* views[1025];
+    for (int i = 0; i < 1025; i++) {
+        char path[128], name[24];
+        snprintf(name, sizeof(name), "t%d", i);
+        snprintf(path, sizeof(path), "%s/1/%s", TMP_PARTED_ROOT, name);
+        TEST_ASSERT_EQ_I(ray_splay_save_bulk(src, path, NULL), RAY_OK);
+        views[i] = ray_read_parted(TMP_PARTED_ROOT, name);
+        TEST_ASSERT_TRUE(views[i] && !RAY_IS_ERR(views[i]));
+    }
+    ray_t* first = ((ray_t**)ray_data(ray_table_get_col_idx(views[0], 1)))[0];
+    ray_t* last = ((ray_t**)ray_data(ray_table_get_col_idx(views[1024], 1)))[0];
+    TEST_ASSERT_EQ_U(ray_atomic_load(&first->rc), 1);
+    TEST_ASSERT_EQ_U(ray_atomic_load(&last->rc), 2);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(first))[0], 10);
+    for (int i = 0; i < 1025; i++) ray_release(views[i]);
+    ray_heap_gc();
+    ray_release(src);
+    (void)ray_test_rm_rf(TMP_PARTED_ROOT);
+    PASS();
+}
+
+typedef struct { atomic_int* ready; atomic_bool* go; bool ok; } parted_thread_t;
+static void parted_mount_thread(void* arg) {
+    parted_thread_t* ctx = arg;
+    ray_heap_init();
+    atomic_fetch_add(ctx->ready, 1);
+    while (!atomic_load(ctx->go)) ray_sleep_ms(1);
+    ctx->ok = true;
+    for (int i = 0; i < 100 && ctx->ok; i++) {
+        ray_t* a = ray_read_parted(TMP_PARTED_ROOT, "t");
+        ray_t* b = ray_read_parted(TMP_PARTED_ROOT, "t");
+        ctx->ok = a && b && !RAY_IS_ERR(a) && !RAY_IS_ERR(b);
+        if (ctx->ok) {
+            ray_t* sa = ((ray_t**)ray_data(ray_table_get_col_idx(a, 1)))[0];
+            ray_t* sb = ((ray_t**)ray_data(ray_table_get_col_idx(b, 1)))[0];
+            ctx->ok = sa == sb && ((int64_t*)ray_data(sa))[0] == 10;
+        }
+        if (i % 3 == 1) ray_parted_cache_clear();
+        ray_release(a); ray_release(b);
+    }
+    /* Must release this thread's cache even if its heap is adopted later. */
+    ray_heap_abandon();
+}
+
+static test_result_t test_parted_concurrent_mounts(void) {
+    (void)ray_test_rm_rf(TMP_PARTED_ROOT);
+    ray_t* src = parted_remount_part(10);
+    TEST_ASSERT_EQ_I(ray_splay_save(src, TMP_PARTED_ROOT "/1/t", NULL), RAY_OK);
+    atomic_int ready = 0;
+    atomic_bool go = false;
+    parted_thread_t ctx[4];
+    ray_thread_t threads[4];
+    for (int i = 0; i < 4; i++) {
+        ctx[i] = (parted_thread_t){ &ready, &go, false };
+        TEST_ASSERT_EQ_I(ray_thread_create(&threads[i], parted_mount_thread, &ctx[i]), RAY_OK);
+    }
+    while (atomic_load(&ready) < 4) ray_sleep_ms(1);
+    atomic_store(&go, true);
+    for (int i = 0; i < 4; i++) TEST_ASSERT_EQ_I(ray_thread_join(threads[i]), RAY_OK);
+    for (int i = 0; i < 4; i++) TEST_ASSERT_TRUE(ctx[i].ok);
+#ifdef RAY_OS_LINUX
+    TEST_ASSERT_EQ_I(parted_mapping_count(), 0);
+#endif
+    ray_release(src);
+    (void)ray_test_rm_rf(TMP_PARTED_ROOT);
+    PASS();
+}
+
+/* Nested files have no persisted-hash marker. Garbage hash bytes must be
+ * reset by their loader, while inline strings keep their payload bytes. */
+static test_result_t test_col_nested_str_hash_reset(void) {
+    ray_t* v = ray_vec_new(RAY_STR, 2);
+    v = ray_str_vec_append(v, "nested-pooled-string-value", 25);
+    v = ray_str_vec_append(v, "inline", 6);
+    ((ray_str_t*)ray_data(v))[0].hash32 = 0x12345678;
+    ray_t* list = ray_list_new(1);
+    list = ray_list_append(list, v);
+    TEST_ASSERT_EQ_I(ray_col_save(list, TMP_COL_PATH), RAY_OK);
+    ray_t* back = ray_col_load(TMP_COL_PATH);
+    TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
+    ray_t* nested = ((ray_t**)ray_data(back))[0];
+    ray_str_t* desc = (ray_str_t*)ray_data(nested);
+    TEST_ASSERT_EQ_U(desc[0].hash32, 0);
+    size_t len = 0;
+    const char* str = ray_str_vec_get(nested, 1, &len);
+    TEST_ASSERT_EQ_U(len, 6);
+    TEST_ASSERT_TRUE(memcmp(str, "inline", 6) == 0);
+    ray_release(back); ray_release(list); ray_release(v);
+    unlink(TMP_COL_PATH);
+    PASS();
+}
+
+static test_result_t test_col_save_str_bounds(void) {
+    ray_t* v = ray_vec_new(RAY_STR, 1);
+    v = ray_str_vec_append(v, "pooled-string-out-of-bounds", 26);
+    ray_str_t* desc = (ray_str_t*)ray_data(v);
+    uint32_t old_off = desc[0].pool_off;
+    desc[0].pool_off = UINT32_MAX;
+    TEST_ASSERT_EQ_I(ray_col_save(v, TMP_COL_PATH), RAY_ERR_CORRUPT);
+    desc[0].pool_off = old_off;
+    desc[0].len = UINT32_MAX;
+    TEST_ASSERT_EQ_I(ray_col_save(v, TMP_COL_PATH), RAY_ERR_CORRUPT);
+    desc[0].len = 26;
+    ray_release(v);
     unlink(TMP_COL_PATH);
     PASS();
 }
@@ -7107,6 +7683,22 @@ const test_entry_t store_entries[] = {
     { "store/col_sym_w64_neg_index", test_col_sym_w64_negative_index, store_setup, store_teardown },
     { "store/col_str_pool_roundtrip", test_col_str_pool_roundtrip, store_setup, store_teardown },
     { "store/col_str_legacy_hash_repair", test_col_str_legacy_hash_repair, store_setup, store_teardown },
+    { "store/col_str_hash_persisted", test_col_str_hash_persisted, store_setup, store_teardown },
+    { "store/stream_str_hash_persisted", test_stream_str_hash_persisted, store_setup, store_teardown },
+    { "store/parted_cache_limit", test_parted_cache_limit, store_setup, store_teardown },
+    { "store/parted_cache_gc", test_parted_cache_gc, store_setup, store_teardown },
+    { "store/parted_live_domain_open", test_parted_live_domain_open, store_setup, store_teardown },
+    { "store/parted_rebuilt_write_without_gc", test_parted_rebuilt_write_without_gc, store_setup, store_teardown },
+    { "store/parted_rebuilt_splayed_without_gc", test_parted_rebuilt_splayed_without_gc, store_setup, store_teardown },
+    { "store/parted_rebuilt_without_gc", test_parted_rebuilt_without_gc, store_setup, store_teardown },
+    { "store/parted_rebuilt_symbols", test_parted_rebuilt_symbols, store_setup, store_teardown },
+    { "store/parted_missing_symfile", test_parted_missing_symfile, store_setup, store_teardown },
+    { "store/parted_restored_mtime", test_parted_restored_mtime, store_setup, store_teardown },
+    { "store/parted_generation_and_sweep", test_parted_generation_and_sweep, store_setup, store_teardown },
+    { "store/parted_concurrent_mounts", test_parted_concurrent_mounts, store_setup, store_teardown },
+    { "store/col_nested_str_hash_reset", test_col_nested_str_hash_reset, store_setup, store_teardown },
+    { "store/col_save_str_bounds", test_col_save_str_bounds, store_setup, store_teardown },
+    { "store/parted_remount_reuse", test_parted_remount_reuse, store_setup, store_teardown },
     { "store/col_format_version_roundtrip", test_col_format_version_roundtrip, store_setup, store_teardown },
     { "store/col_format_bad_version", test_col_format_bad_version, store_setup, store_teardown },
     { "store/col_str_empty_roundtrip", test_col_str_empty_roundtrip, store_setup, store_teardown },
