@@ -313,6 +313,37 @@
 (find [1 0Nl] 0Ni) -- 1
 (find ['a '] ') -- 1
 
+;; ... nested under another verb too: a string cell bound for one row is
+;; one value, so (in cell set) is one verdict wherever it sits
+(at (select {c: (not (in s (list "qq"))) from: TS}) 'c) -- [true false true true]
+(at (select {c: (and (in s (list "qq")) (> n 1)) from: TS}) 'c) -- [false true false false]
+(at (select {c: (if (in s (list "qq")) 1 0) from: TS}) 'c) -- [0 1 0 0]
+(at (select {c: ((fn [x] (in x (list "qq"))) s) from: TS}) 'c) -- [false true false false]
+(at (select {c: (in s (list "qq" 'zz 1)) from: TS}) 'c) -- [false true false false]
+;; a set the compiler cannot take as a constant (an element computed at run
+;; time) is evaluated row by row, and each string cell still answers once
+(at (select {c: (not (in s (list "qq" (concat "z" "z")))) from: TS}) 'c) -- [true false false true]
+(at (select {c: (if (in s (list (concat "q" "q"))) 1 0) from: TS}) 'c) -- [0 1 0 0]
+;; the mark that makes a cell one value lasts for its row only: a cell the
+;; projection hands back inside a list or a dict is a plain string after
+(set TQ (table [s n] (list ["qq" "ab"] [1 2])))
+(set RQ (select {c: (list s) from: TQ}))
+(in (first (first (at RQ 'c))) "q") -- [true true]
+(set RQ2 (select {c: (dict [k] (list s)) from: TQ}))
+(in (at (first (at RQ2 'c)) 'k) (list "q")) -- [true true]
+;; a lone string literal in a query still answers per character, per row
+(at (select {c: (in "ab" (list "a" "b")) from: TS take: 1}) 'c) -- (list [true true])
+;; a set held in a global list is read by the evaluator, not taken for a column
+(set SETL (list "qq" "zz"))
+(at (select {from: TS where: (in s SETL)}) 'n) -- [2 3]
+(at (select {c: (in s SETL) from: TS}) 'c) -- [false true true false]
+(set SETY (list 'qq 'zz))
+(set TYS (table [y n] (list ['p 'qq 'zz] [1 2 3])))
+(at (select {from: TYS where: (in y SETY)}) 'n) -- [2 3]
+;; a LIST column's cell may be a vector: no verdict per row, a clean error
+(set TLS (table [l n] (list (list ["a" "b"] "a" ["c"]) [1 2 3])))
+(select {from: TLS where: (in l ["a"])}) !- nyi
+
 ;; a column of another type against a string set matches no row, as bare
 (set TY (table [y n] (list ['p 'qq] [1 2])))
 (in ['p 'qq] ["qq"]) -- [false false]
