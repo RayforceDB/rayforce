@@ -57,7 +57,8 @@ DEBUG_CFLAGS   = -fPIC $(WARNS) -std=$(STD) -g -O0 -march=$(RAY_MARCH) -DDEBUG \
   -fno-omit-frame-pointer
 RELEASE_CFLAGS = -fPIC $(WARNS) -std=$(STD) -O3 -march=$(RAY_MARCH) \
   -funroll-loops -fomit-frame-pointer -fno-math-errno -falign-functions=64 \
-  -fassociative-math -ffp-contract=fast -fno-signed-zeros -fno-trapping-math
+  -fassociative-math -ffp-contract=fast -fno-signed-zeros -fno-trapping-math \
+  -ffunction-sections -fdata-sections
 # -falign-functions=64: start every function on a cache line.  The default
 #   16-byte alignment makes hot leaf functions' cost depend on where unrelated
 #   edits elsewhere in the same translation unit happen to push them —
