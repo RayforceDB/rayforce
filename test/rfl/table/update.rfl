@@ -109,6 +109,31 @@ t -- (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0]))
 ;; ... and must still carry the key column(s)
 (set t (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0])))(upsert t 1 (dict [Name Value] (list 'charlie 30.0))) !- value
 (set t (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0])))(upsert t 2 (dict [ID Value] (list 2 30.0))) !- value
+;; A left-out LIST column boxes the null object.  It was a C NULL cell,
+;; and reading it aborted ("value-null must be RAY_NULL_OBJ") — through a
+;; one-row table or an insert dict before, and a dict upsert now too.
+(set t (table [k i l] (list [a b] [1 2] (list [1 2] "w"))))(nil? (at (at (upsert t 'k (dict [k i] (list 'c 30))) 'l) 2)) -- true
+(set t (table [k i l] (list [a b] [1 2] (list [1 2] "w"))))(nil? (at (at (upsert t 'k (dict [k i] (list [c e] [30 40]))) 'l) 3)) -- true
+(set t (table [k i l] (list [a b] [1 2] (list [1 2] "w"))))(nil? (at (at (upsert t 'k (table [k i] (list [c] [30]))) 'l) 2)) -- true
+(set t (table [k i l] (list [a b] [1 2] (list [1 2] "w"))))(upsert 't 'k (dict [k i] (list 'c 30)))(nil? (at (at t 'l) 2)) -- true
+(set t (table [k i l] (list [a b] [1 2] (list [1 2] "w"))))(nil? (at (at (insert t (dict [k i] (list 'c 30))) 'l) 2)) -- true
+(set t (table [k i l] (list [a b] [1 2] (list [1 2] "w"))))(insert 't (dict [k i] (list 'c 30)))(nil? (at (at t 'l) 2)) -- true
+;; A mapped target checks multi-row value lengths as an in-memory one does;
+;; it read past the shorter vector and appended whatever followed it.
+(.sys.exec "rm -rf rf_upsert_map") -- 0
+(.db.splayed.set "rf_upsert_map/" (table [k n] (list [a b] [1 2])))
+(set m (.db.splayed.get "rf_upsert_map/"))
+(get (upsert m 'k (dict [k n] (list [c d] [3 4]))) 'n) -- [1 2 3 4]
+(upsert m 'k (dict [k n] (list [c d e] [3 4]))) !- length
+(upsert m 'k (list [c d e] [3 4])) !- length
+(upsert m 'k (list [c d] 3)) !- type
+(set m 0)
+(.sys.exec "rm -rf rf_upsert_map") -- 0
+;; Known bugs found alongside, not fixed here (a list column on a mapped
+;; target, and saving a null list cell):
+;; (.db.splayed.set "rf_upsert_ml/" (table [k n l] (list [a b] [1 2] (list [1] [2 3]))))
+;; (get (upsert (.db.splayed.get "rf_upsert_ml/") 'k (list 'b 5 [9])) 'l) -- (list [1] [9])   ;; xfail BUG: a matched key on a mapped table with a LIST column errors "vec_new: type must be a positive concrete vector type, got LIST" (in memory it works)
+;; (count (.db.splayed.set "rf_upsert_nl/" (table [k l] (list [a b] (list [1 2] null))))) -- 2   ;; xfail BUG: a LIST column holding a null cell cannot be saved splayed (nyi); ser/de round-trips it
 ;; Zero-row payloads are a no-op regardless of schema (restore pre-existing behavior
 ;; — rejecting an empty partial payload for missing key columns would break callers
 ;; that build up upserts unconditionally and may pass empty batches).

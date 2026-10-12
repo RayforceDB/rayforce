@@ -18043,7 +18043,9 @@ static ray_t* append_boxed_table_col(ray_t* orig_col, ray_t* payload,
             if (cells[r]) ray_retain(cells[r]);
         }
     } else {
-        dst[orig_col->len] = payload;
+        /* A row that leaves this column out boxes the null object: a C
+         * NULL cell is not a value, and reading one aborts. */
+        dst[orig_col->len] = payload ? payload : RAY_NULL_OBJ;
         if (payload) ray_retain(payload);
     }
     out->len = orig_col->len + tail;
@@ -21253,7 +21255,7 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
             if (ct == RAY_LIST) {
                 /* Boxed column: a table payload supplies a LIST whose cells
                  * are rows and is spliced; any other row shape boxes its
-                 * payload (or a NULL slot) as one cell — the same contract
+                 * payload (or the null object) as one cell — the same contract
                  * as append_boxed_table_col, minus the copy. */
                 if (tbl_row_list) {
                     if (!pay || RAY_IS_ERR(pay) || pay->type != RAY_LIST) {
@@ -21268,7 +21270,8 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
                         }
                     }
                 } else {
-                    res = ray_list_append(col, pay);
+                    /* a left-out column boxes the null object, as above */
+                    res = ray_list_append(col, pay ? pay : RAY_NULL_OBJ);
                 }
             } else if (!pay) {
                 ray_t* null_atom = ray_typed_null(-ct);
@@ -21908,7 +21911,7 @@ static ray_t* upsert_write_cell(ray_t** slots, int64_t c, int64_t row, ray_t* ce
     return NULL;
 }
 
-/* Append one row; a NULL cell lands as the column's null (a NULL slot
+/* Append one row; a NULL cell lands as the column's null (the null object
  * for a boxed column), mirroring the legacy insert arm. */
 static ray_t* upsert_append_row(ray_t** slots, int64_t ncols, ray_t** cells) {
     for (int64_t c = 0; c < ncols; c++) {
@@ -21916,7 +21919,7 @@ static ray_t* upsert_append_row(ray_t** slots, int64_t ncols, ray_t** cells) {
         ray_t* cell = cells[c];
         ray_t* res;
         if (col->type == RAY_LIST) {
-            res = ray_list_append(col, cell);
+            res = ray_list_append(col, cell ? cell : RAY_NULL_OBJ);
         } else if (!cell) {
             ray_t* na = ray_typed_null(-col->type);
             res = append_atom_to_col(col, na);
@@ -22813,6 +22816,25 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
     }
     if (ray_is_vec(key_elem) || key_elem->type == RAY_LIST) {
         int64_t new_nrows = ray_len(key_elem);
+        /* The same shape checks upsert_apply makes before it reads a cell:
+         * a target it declines (mapped, sliced, narrow symbols) came here
+         * and read past a shorter value vector into whatever followed it. */
+        for (int64_t c = 0; c < ncols; c++) {
+            ray_t* sc = row_elems[c];
+            ray_t* err = NULL;
+            if (!sc) continue;
+            if (!is_collection(sc))
+                err = ray_error("type", "upsert: multi-row value for column %lld must be a list or vector, got %s",
+                                (long long)c, ray_type_name(sc->type));
+            else if (ray_len(sc) != new_nrows)
+                err = ray_error("length", "upsert: column %lld has %lld values, key has %lld",
+                                (long long)c, (long long)ray_len(sc), (long long)new_nrows);
+            if (err) {
+                scratch_free(kci_hdr);
+                ray_release(tbl); ray_release(key_sym); ray_release(row);
+                return err;
+            }
+        }
         ray_t* cur_tbl = tbl;
         ray_retain(cur_tbl);
         for (int64_t r = 0; r < new_nrows; r++) {
