@@ -1,0 +1,4 @@
+;; CLI flags that require values must fail as option errors, not as attempts
+;; to open the flag token as a script path.
+
+(.sys.exec "for opt in -p --port -c --cores -t --timeit -Q --querylog -f --file -m --mem -u -U -l -L; do ./rayforce $opt </dev/null >/tmp/rfl_cli_missing_arg.out 2>&1; rc=$?; grep -Fq \"error: option $opt requires an argument\" /tmp/rfl_cli_missing_arg.out || exit 10; [ $rc -eq 2 ] || exit 11; done") -- 0
