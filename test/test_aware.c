@@ -3531,6 +3531,52 @@ static test_result_t test_unaligned_grain(void) {
     PASS();
 }
 
+/* ray_pool_dispatch clamped to a ring whose growth fails (#792; shrunk to a
+ * few slots so the clamp runs at test sizes): fused where: filters
+ * (pred_sel_drive and the expression selection, whose rowsel builders are
+ * per grain), the scalar route and the other grain users answer as
+ * unclamped. */
+static test_result_t test_pool_clamp(void) {
+    static test_result_t (*const fns[])(void) = {
+        test_scalar_route_mixed, test_eq_runs_lack, test_filter_encoded_leaves, test_scalar_route_stats,
+    };
+    static const uint32_t caps[] = { 7, 3 };
+    for (size_t c = 0; c < sizeof caps / sizeof *caps; c++)
+        for (size_t i = 0; i < sizeof fns / sizeof *fns; i++) {
+            (void)ray_test_rm_rf(aw_root()); (void)ray_test_mkdir_p(aw_root());
+            ray_pool_test_ring_fail(caps[c]);
+            g_aw_unaligned = true;
+            test_result_t r = fns[i]();
+            g_aw_unaligned = false;
+            ray_pool_test_ring_fail(0);
+            if (r.status != TEST_PASS) return r;
+        }
+    /* generation-0 callers of the grain: fused where (pred_sel_drive and the
+     * expression selection), count distinct by group (cdpg_*), and the sort's
+     * sortedness estimate, on an in-memory table */
+    aw_eval_ok("(set M (table [k g x] (list (til 300000) (% (* (til 300000) 7919) 97) (% (* (til 300000) 31) 1009))))");
+    static const char* const qs[] = {
+        "(select {c: (count k) s: (sum x) from: M where: (< x 500)})",
+        "(select {c: (count k) from: M where: (and (> x 100) (< g 50))})",
+        "(select {u: (count (distinct x)) by: g from: M})",
+        "(take (select {k: k x: x from: M asc: x}) 20)",
+        "(take (select {k: k from: M where: (== (% x 3) 0) desc: k}) 5)",
+        NULL,
+    };
+    for (int i = 0; qs[i]; i++) {
+        ray_t* a = ray_eval_str(qs[i]);
+        ray_pool_test_ring_fail(3);
+        ray_t* b = ray_eval_str(qs[i]);
+        ray_pool_test_ring_fail(0);
+        TEST_ASSERT_FMT(a && b && !RAY_IS_ERR(a) && !RAY_IS_ERR(b), "%s", qs[i]);
+        ray_t* fa = ray_fmt(a, 0); ray_t* fb = ray_fmt(b, 0);
+        TEST_ASSERT_FMT(ray_str_len(fa) == ray_str_len(fb) && memcmp(ray_str_ptr(fa), ray_str_ptr(fb), ray_str_len(fa)) == 0,
+                        "%s: clamped dispatch differs", qs[i]);
+        ray_release(fa); ray_release(fb); ray_release(a); ray_release(b);
+    }
+    PASS();
+}
+
 const test_entry_t aware_entries[] = {
     { "aware/vview_encodings", test_vview_encodings, aw_setup, aw_teardown },
     { "aware/vview_near_top",  test_vview_near_top,  aw_setup, aw_teardown },
@@ -3596,5 +3642,6 @@ const test_entry_t aware_entries[] = {
     { "aware/scalar_route_time",   test_scalar_route_time,   aw_setup, aw_teardown },
     { "aware/scalar_route_float_inf", test_scalar_route_float_inf, aw_setup, aw_teardown },
     { "aware/unaligned_grain",     test_unaligned_grain,     aw_setup, aw_teardown },
+    { "aware/pool_clamp",          test_pool_clamp,          aw_setup, aw_teardown },
     { NULL, NULL, NULL, NULL },
 };

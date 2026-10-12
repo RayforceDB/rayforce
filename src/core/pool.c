@@ -556,6 +556,12 @@ void ray_pool_free(ray_pool_t* pool) {
 /* M2: Caller (ray_execute) must reset pool->cancelled before dispatching.
  * The cancelled flag is per-query state; failing to clear it causes all
  * subsequent dispatches to skip task execution. */
+/* Test hook (ray_pool_test_ring_fail): ring growth fails (as when its
+ * ray_sys_realloc returns NULL) and the ring holds `cap` tasks, so a
+ * dispatch of more tasks takes the clamp below at test sizes; 0 off. */
+static _Atomic(uint32_t) g_pool_test_cap;
+void ray_pool_test_ring_fail(uint32_t cap) { atomic_store_explicit(&g_pool_test_cap, cap, memory_order_relaxed); }
+
 void ray_pool_dispatch(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
                       int64_t total_elems) {
     if (total_elems <= 0) return;
@@ -573,12 +579,13 @@ void ray_pool_dispatch(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
      * (no task pending).  Workers read tasks[]/task_cap only after acquiring
      * the new task_limit (store-release), which orders the growth before any
      * claim — so a late worker never reads a stale tasks pointer or task_cap. */
+    uint32_t test_cap = atomic_load_explicit(&g_pool_test_cap, memory_order_relaxed);
     if (n_tasks > pool->task_cap) {
         uint32_t new_cap = pool->task_cap;
         while (new_cap < n_tasks && new_cap < MAX_RING_CAP) new_cap *= 2;
         if (new_cap > pool->task_cap) {
-            ray_pool_task_t* new_tasks = (ray_pool_task_t*)ray_sys_realloc(
-                pool->tasks, new_cap * sizeof(ray_pool_task_t));
+            ray_pool_task_t* new_tasks = RAY_UNLIKELY(test_cap) ? NULL   /* the hook: realloc fails */
+                : (ray_pool_task_t*)ray_sys_realloc(pool->tasks, new_cap * sizeof(ray_pool_task_t));
             if (new_tasks) {
                 pool->tasks = new_tasks;
                 pool->task_cap = new_cap;
@@ -586,10 +593,16 @@ void ray_pool_dispatch(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
         }
     }
 
-    /* Clamp n_tasks to task_cap to prevent ring overflow */
-    if (n_tasks > pool->task_cap) {
-        n_tasks = pool->task_cap;
-        grain = (total_elems + n_tasks - 1) / n_tasks;
+    /* Clamp n_tasks to task_cap to prevent ring overflow.  The wider grain
+     * stays a whole multiple of TASK_GRAIN, so every task still starts on a
+     * TASK_GRAIN (morsel, vector) boundary: callers slot per-task state by
+     * start / TASK_GRAIN-aligned grain (pred_sel_drive's rowsel builders) or
+     * read whole vectors per task. */
+    uint32_t cap = test_cap && test_cap < pool->task_cap ? test_cap : pool->task_cap;
+    if (n_tasks > cap) {
+        int64_t per = (total_elems + cap - 1) / cap;
+        grain = (per + TASK_GRAIN - 1) / TASK_GRAIN * TASK_GRAIN;
+        n_tasks = (uint32_t)((total_elems + grain - 1) / grain);   /* <= cap */
     }
 
     /* Carve a fresh window [base, base+n_tasks) off the monotonic high-water

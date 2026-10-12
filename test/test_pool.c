@@ -1032,16 +1032,18 @@ static test_result_t test_dispatch_max_ring_cap_clamp(void) {
 
     pool_count_ctx_t ctx = {0};
     /* TASK_GRAIN = 8 * 1024 = 8192.  70000 * 8192 = 573_440_000 elements,
-     * which would naively want 70000 tasks. After clamp → 65536 tasks with
-     * a slightly larger grain so total_elems is still fully covered. */
+     * which would naively want 70000 tasks.  After the clamp the grain is
+     * the smallest whole multiple of TASK_GRAIN that fits 65536 tasks
+     * (2 x 8192: task starts stay grain-aligned, #792), so 35000 tasks
+     * cover total_elems. */
     int64_t grain = 8192;
     int64_t total = 70000LL * grain;
     ray_pool_dispatch(&pool, pool_count_fn, &ctx, total);
 
     /* Ring should grow to MAX_RING_CAP and stop there */
     TEST_ASSERT_EQ_U(pool.task_cap, 65536u);
-    /* Calls clamped to MAX_RING_CAP */
-    TEST_ASSERT_EQ_I(atomic_load(&ctx.calls), 65536);
+    /* Calls clamped below MAX_RING_CAP, at a TASK_GRAIN-multiple grain */
+    TEST_ASSERT_EQ_I(atomic_load(&ctx.calls), 35000);
     /* All elements covered (grain rebalanced) */
     TEST_ASSERT_EQ_I(atomic_load(&ctx.elem_sum), total);
 

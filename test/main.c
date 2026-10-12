@@ -35,6 +35,7 @@
 
 #include "test.h"
 #include "ops/agg_engine.h"   /* --census: agg_route_stats */
+#include "core/pool.h"         /* ray_pool_test_ring_fail */
 #include "test_rfl.h"
 
 #include <stdio.h>
@@ -933,6 +934,7 @@ void ray_test_hooks_off(void) {
     ray_expr_test_parted_all_segments(false);
     ray_group_test_route(0);
     ray_group_test_scalar_grain(0);
+    ray_pool_test_ring_fail(0);
     agg_test_force_smallhash(false);
     ray_clear_interrupt();
 }

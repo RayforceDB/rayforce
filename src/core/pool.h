@@ -174,8 +174,19 @@ void ray_pool_free(ray_pool_t* pool);
  * (see ray_fused_take_select in fused_topk.c for the pattern). */
 
 /* Dispatch fn over [0, total_elems) partitioned into morsel-sized tasks.
- * Blocks until all tasks complete. Main thread participates as worker 0. */
+ * Blocks until all tasks complete. Main thread participates as worker 0.
+ * Contract: task starts are multiples of the requested grain (TASK_GRAIN,
+ * RAY_DISPATCH_MORSELS morsels).  When the tasks outnumber the ring (above
+ * RAY_POOL_MAX_TASKS, or a ring whose growth failed) a task covers several
+ * grains, still starting on a grain boundary: a caller keeping per-grain
+ * state walks its task grain by grain. */
 void ray_pool_dispatch(ray_pool_t* pool, ray_pool_fn fn, void* ctx, int64_t total_elems);
+/* Test hook (C tests only): ray_pool_dispatch's ring growth fails (its
+ * realloc returns NULL) and the ring holds at most `cap` tasks, so the clamp
+ * runs at test sizes as it does above task_cap * TASK_GRAIN elements when
+ * the realloc fails, or above RAY_POOL_MAX_TASKS tasks; 0 off.  Disarmed by
+ * ray_test_hooks_off. */
+void ray_pool_test_ring_fail(uint32_t cap);
 
 /* Dispatch exactly n_tasks tasks, each with range [i, i+1).
  * Used for partition-parallel workloads where each task is one partition. */

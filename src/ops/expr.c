@@ -2532,7 +2532,7 @@ typedef struct {
 static _Atomic(int64_t) g_expr_zone_skips;      /* test hook */
 int64_t ray_expr_test_zone_skips(void) { return atomic_load_explicit(&g_expr_zone_skips, memory_order_relaxed); }
 
-static void expr_full_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
+static void expr_full_block(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
     (void)worker_id;
     expr_full_ctx_t* c = (expr_full_ctx_t*)ctx;
     const ray_expr_t* expr = c->expr;
@@ -2626,6 +2626,20 @@ static void expr_full_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t e
     if (rsc) for (uint8_t r = 0; r < expr->n_regs; r++) ray_col_scratch_free(&rsc[r]);
     scratch_free(scratch_hdr);
     if (skips) atomic_fetch_add_explicit(&g_expr_zone_skips, skips, memory_order_relaxed);
+}
+
+/* A dispatched task of expr_eval_full: in fused selection mode one rowsel
+ * builder per TASK_GRAIN block (see pred_sel_worker: a clamped dispatch
+ * hands out tasks of several blocks). */
+static void expr_full_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
+    const expr_full_ctx_t* c = (const expr_full_ctx_t*)ctx;
+    const int64_t grain = (int64_t)RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS;
+    if (!c->sel_builders || c->n_sel_builders <= 1 || end - start <= grain) {
+        expr_full_block(ctx, worker_id, start, end);
+        return;
+    }
+    for (int64_t b = start; b < end; b += grain)
+        expr_full_block(ctx, worker_id, b, b + grain < end ? b + grain : end);
 }
 
 /* Post-pass for the fused unary path: |INT64_MIN| and -INT64_MIN don't fit in
@@ -2876,10 +2890,11 @@ void ray_expr_test_eval_range(const ray_expr_t* expr, int64_t start, int64_t end
  * single builder over all segments (serial).  ray_pool_dispatch carves task i
  * as [i*grain, min((i+1)*grain, nrows)); grain is morsel-aligned so each task
  * owns a contiguous run of whole segments.  On return *parallel and *n_builders
- * describe the dispatch geometry.  Returns NULL when the table needs more tasks
- * than the ring holds (pool clamps n_tasks to RAY_POOL_MAX_TASKS and re-derives
- * a non-morsel-aligned grain, which would trip the worker's `start % grain == 0`
- * assert) or on OOM — caller falls back to the bool path. */
+ * describe the dispatch geometry.  A clamped dispatch (a ring that cannot
+ * grow) hands out tasks of several grains, still grain-aligned; the workers
+ * (expr_full_fn, pred_sel_worker) then fill one builder per grain.  Returns
+ * NULL when the table needs more builders than RAY_POOL_MAX_TASKS, or on
+ * OOM — caller falls back to the bool path. */
 static rowsel_builder_t* pred_sel_builders_alloc(int64_t nrows, ray_pool_t* pool,
                                                  bool* parallel,
                                                  uint32_t* n_builders_out) {
@@ -2946,8 +2961,8 @@ typedef struct {
     ray_scan_fail_t*  fail;           /* NULL: the fill cannot fail */
 } pred_sel_drive_ctx_t;
 
-static void pred_sel_worker(void* vctx, uint32_t worker_id,
-                            int64_t start, int64_t end) {
+static void pred_sel_block(void* vctx, uint32_t worker_id,
+                           int64_t start, int64_t end) {
     (void)worker_id;
     pred_sel_drive_ctx_t* c = (pred_sel_drive_ctx_t*)vctx;
     /* a lower task already failed: this one cannot change the answer (a
@@ -2980,6 +2995,19 @@ static void pred_sel_worker(void* vctx, uint32_t worker_id,
     }
     ray_col_scratch_free(&sc);
     scratch_free(scratch_hdr);
+}
+
+/* A dispatched task of the fused selection: one rowsel builder per
+ * TASK_GRAIN block.  ray_pool_dispatch keeps task starts at multiples of
+ * the grain it was asked for, but a clamped dispatch (a ring that cannot
+ * grow) hands out wider tasks: those run block by block, each into its own
+ * builder. */
+static void pred_sel_worker(void* vctx, uint32_t worker_id, int64_t start, int64_t end) {
+    const pred_sel_drive_ctx_t* c = (const pred_sel_drive_ctx_t*)vctx;
+    const int64_t grain = (int64_t)RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS;
+    if (c->n_sel_builders <= 1 || end - start <= grain) { pred_sel_block(vctx, worker_id, start, end); return; }
+    for (int64_t b = start; b < end; b += grain)
+        pred_sel_block(vctx, worker_id, b, b + grain < end ? b + grain : end);
 }
 
 ray_t* pred_sel_drive(int64_t nrows, pred_sel_fill_fn fill, void* fill_ctx,

@@ -1680,18 +1680,18 @@ typedef struct {
     int64_t         n_groups;
     uint64_t        p_mask;          /* P - 1, P = number of partitions */
     /* Pass 1 outputs / pass 2 inputs.  Per-task counters: each worker
-     * writes to its own slice of hist[task_id * P] / cursor[task_id * P]
-     * so there's no atomic contention.  task_id is derived from `start`
-     * via the dispatch grain (matches ray_pool_dispatch's tasking).
+     * writes to its own slice of hist[blk * P] / cursor[blk * P] (blk: the
+     * row's grain block, each owned by one task) so there's no atomic
+     * contention.
      *
      * Earlier comment claimed P=64 atomic-cursor contention was
      * negligible — it isn't.  Q11's parallel speedup was 1.2× (not 28×)
      * because the per-row atomic_fetch_add on cursor[h & p_mask] in
      * cdpg_scat_fn serialised through the partition cache lines. */
-    int64_t         grain;           /* task grain (matches pool dispatch) */
-    int64_t         n_tasks;         /* number of tasks in the dispatch */
-    int64_t*        hist;            /* [n_tasks * P] — per-task counts */
-    int64_t*        cursor;          /* [n_tasks * P] — per-task scat cursor */
+    int64_t         grain;           /* counter block (the pool's requested grain) */
+    int64_t         n_tasks;         /* number of counter blocks */
+    int64_t*        hist;            /* [n_tasks * P] — per-block counts */
+    int64_t*        cursor;          /* [n_tasks * P] — per-block scat cursor */
     int64_t*        part_off;        /* P + 1, prefix offsets */
     /* Pass 2 outputs */
     int64_t*        gids_out;        /* total_pass entries */
@@ -1717,18 +1717,21 @@ static void cdpg_hist_fn(void* ctx_, uint32_t worker_id,
     (void)worker_id;
     cdpg_ctx_t* x = (cdpg_ctx_t*)ctx_;
     uint64_t p_mask = x->p_mask;
-    /* Per-task private hist slot — task_id is derived from `start` so
-     * scat_fn computes the SAME task_id and reads cursor[task_id*P+p]
-     * we wrote here.  No atomics: each task owns its row. */
-    int64_t task_id = start / x->grain;
-    int64_t* my_hist = &x->hist[task_id * (p_mask + 1)];
-    for (int64_t r = start; r < end; r++) {
-        int64_t gid = x->row_gid[r];
-        if (gid < 0 || gid >= x->n_groups) continue;
-        /* Partition by gid (not gid×val) so the dedup pass can write to
-         * odata[gid] without atomics. */
-        uint64_t h = CDPG_PART_HASH(gid + 1);
-        my_hist[h & p_mask]++;
+    /* Per-block private hist slot — scat_fn computes the SAME block and
+     * reads cursor[blk*P+p] for the counts written here.  No atomics: each
+     * block is one task's. */
+    for (int64_t b = start; b < end; ) {
+        int64_t blk = b / x->grain, be = (blk + 1) * x->grain < end ? (blk + 1) * x->grain : end;
+        int64_t* my_hist = &x->hist[blk * (int64_t)(p_mask + 1)];
+        for (int64_t r = b; r < be; r++) {
+            int64_t gid = x->row_gid[r];
+            if (gid < 0 || gid >= x->n_groups) continue;
+            /* Partition by gid (not gid×val) so the dedup pass can write to
+             * odata[gid] without atomics. */
+            uint64_t h = CDPG_PART_HASH(gid + 1);
+            my_hist[h & p_mask]++;
+        }
+        b = be;
     }
 }
 
@@ -1741,17 +1744,20 @@ static void cdpg_scat_fn(void* ctx_, uint32_t worker_id,
     /* Each task uses its private cursor — pre-computed by the
      * orchestrator from per-task hist counts so writes are guaranteed
      * non-overlapping across tasks within the same partition. */
-    int64_t task_id = start / x->grain;
-    int64_t* my_cur = &x->cursor[task_id * (p_mask + 1)];
-    for (int64_t r = start; r < end; r++) {
-        int64_t gid = x->row_gid[r];
-        if (gid < 0 || gid >= x->n_groups) continue;
-        int64_t val = cdpg_read(x->base, r, x->in_type, esz);
-        int64_t gid_p1 = gid + 1;
-        uint64_t h = CDPG_PART_HASH(gid_p1);
-        int64_t pos = my_cur[h & p_mask]++;
-        x->gids_out[pos] = gid_p1;
-        x->vals_out[pos] = val;
+    for (int64_t b = start; b < end; ) {
+        int64_t blk = b / x->grain, be = (blk + 1) * x->grain < end ? (blk + 1) * x->grain : end;
+        int64_t* my_cur = &x->cursor[blk * (int64_t)(p_mask + 1)];
+        for (int64_t r = b; r < be; r++) {
+            int64_t gid = x->row_gid[r];
+            if (gid < 0 || gid >= x->n_groups) continue;
+            int64_t val = cdpg_read(x->base, r, x->in_type, esz);
+            int64_t gid_p1 = gid + 1;
+            uint64_t h = CDPG_PART_HASH(gid_p1);
+            int64_t pos = my_cur[h & p_mask]++;
+            x->gids_out[pos] = gid_p1;
+            x->vals_out[pos] = val;
+        }
+        b = be;
     }
 }
 
@@ -1845,16 +1851,12 @@ static ray_t* count_distinct_per_group_parallel(
 
     if (P > 256) return NULL;
 
-    /* Match ray_pool_dispatch's task layout so task_id derived from
-     * `start / grain` inside the worker fn matches the row range the
-     * dispatch hands out.  Mirrors pool.c's TASK_GRAIN (8 morsels of
-     * 1024 rows each) and MAX_RING_CAP (65536) clamping logic. */
+    /* Counters per block of the pool's requested grain, not per task: a
+     * task (any width ray_pool_dispatch hands out, a clamped one included)
+     * walks its rows block by block, so the two passes agree whatever their
+     * dispatches' geometry. */
     int64_t grain = (int64_t)RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS;
     int64_t n_tasks = (n_rows + grain - 1) / grain;
-    if (n_tasks > 65536) {
-        n_tasks = 65536;
-        grain = (n_rows + n_tasks - 1) / n_tasks;
-    }
     ctx.grain   = grain;
     ctx.n_tasks = n_tasks;
 

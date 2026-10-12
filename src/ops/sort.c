@@ -252,6 +252,12 @@ static void sortedness_fn(void* arg, uint32_t wid, int64_t start, int64_t end) {
     for (int64_t i = start + 1; i < end; i++) {
         if (keys[i] < keys[i - 1]) unsorted++;
     }
+    /* a clamped dispatch's task spans several grains: the caller counts
+     * every grain boundary pair, so this task's inner ones are taken back */
+    const int64_t grain = RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS;
+    if (RAY_UNLIKELY(end - start > grain))
+        for (int64_t b = (start / grain + 1) * grain; b < end; b += grain)
+            if (keys[b] < keys[b - 1]) unsorted--;
     c->pw_unsorted[wid] += unsorted;
 }
 
