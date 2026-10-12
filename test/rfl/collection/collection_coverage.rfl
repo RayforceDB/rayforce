@@ -230,8 +230,17 @@
 ;; ══════════════════════════════════════
 ;; 24. in — empty collection val (line 848)
 ;; ══════════════════════════════════════
-(in [] [1 2 3]) -- (list)
+(type (in [] [1 2 3])) -- 'B8
 (count (in [] [1 2 3])) -- 0
+;; An empty left operand answers B8 like every other shape, so `where`
+;; over it is empty instead of raising (#785).
+(type (in (take [1 2] 0) [1 2 3])) -- 'B8
+(type (in (take (guid 2) 0) (guid 2))) -- 'B8
+(type (in (take [a b] 0) [a c])) -- 'B8
+(type (in (take ["a"] 0) ["a" "b"])) -- 'B8
+(type (not-in (take [1 2] 0) [1 2 3])) -- 'B8
+(where (in (take [1 2] 0) [1 2 3])) -- []
+(count (where (in (take [1 2] 0) [1 2 3]))) -- 0
 
 ;; ══════════════════════════════════════
 ;; 25. find — vec with nulls (lines 1662-1664)

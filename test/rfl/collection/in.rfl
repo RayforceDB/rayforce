@@ -81,7 +81,8 @@
 ;; Test with equal lengths
 (in [1h 2h 3h] [3h 2h 1h]) -- [true true true]
 ;; Test with empty arrays
-(in (list) [1h 2h]) -- (list)
+(in (list) [1h 2h]) -- []
+(type (in (list) [1h 2h])) -- 'B8
 
 ;; ========== TEXT (SYM/STR) NULL SEMANTICS (#593) ==========
 ;; `in` admits the typed verdict-LUT kernel unless BOTH sides carry a null:

@@ -442,10 +442,11 @@ static void pool_trace_dump(const ray_pool_t* pool) {
             (unsigned long long)(atomic_load_explicit(&pool->win_state, memory_order_relaxed) / 2),
             (unsigned long long)(own + stolen), (unsigned long long)own,
             (unsigned long long)stolen, (unsigned long long)steals);
-    fprintf(stderr, "pool: scan read-ahead %llu KiB per column, requested %llu MiB in %llu ranges\n",
+    fprintf(stderr, "pool: scan read-ahead %llu KiB per column, requested %llu MiB in %llu ranges, %llu MiB asked for in all\n",
             (unsigned long long)(pool->scan_bytes >> 10),
             (unsigned long long)(atomic_load_explicit(&pool_scan_req_bytes, memory_order_relaxed) >> 20),
-            (unsigned long long)atomic_load_explicit(&pool_scan_req_ranges, memory_order_relaxed));
+            (unsigned long long)atomic_load_explicit(&pool_scan_req_ranges, memory_order_relaxed),
+            (unsigned long long)(ray_vm_willneed_bytes() >> 20));
     for (uint32_t w = 0; w < W; w++) {
         const ray_pool_slot_t* s = &pool->slots[w];
         fprintf(stderr, "pool:  w%-3u own %12llu  stolen %12llu  steals %8llu\n", w,

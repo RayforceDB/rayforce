@@ -67,8 +67,9 @@ void  ray_heap_sys_unmap(void* p, size_t size, bool spilled);
  *
  * The low-level VM wrappers (ray_vm_alloc / _aligned / _free / _map_file /
  * _unmap_file) and the one raw-mmap site (heap swap fallback) call these so
- * every mapping is counted exactly once.  Bytes are the mapped length; add and
- * sub must balance (same length in as out).
+ * every mapping is counted exactly once.  Bytes are the mapped length (file
+ * mappings in whole 4 KiB pages); add and sub must balance (same length in as
+ * out, or the same once rounded to a page).
  * -------------------------------------------------------------------------- */
 void  ray_sys_track_add(int64_t bytes);       /* committed RAM +  */
 void  ray_sys_track_sub(int64_t bytes);       /* committed RAM -  */

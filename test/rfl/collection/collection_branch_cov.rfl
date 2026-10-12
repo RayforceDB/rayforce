@@ -311,7 +311,8 @@
 (in "xy" (list "x" "z")) -- [true false]
 
 ;; Empty collection val (line 925-927)
-(in (as 'I64 (list)) [1 2 3]) -- (list)
+(in (as 'I64 (list)) [1 2 3]) -- []
+(type (in (as 'I64 (list)) [1 2 3])) -- 'B8
 
 ;; Typed vec val vs typed vec: hashset path (lines 933-950)
 (in [1 2 3] [2 3 4]) -- [false true true]

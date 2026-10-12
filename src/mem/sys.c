@@ -64,8 +64,16 @@ static inline void track_bump(_Atomic(int64_t)* cur_c, _Atomic(int64_t)* peak_c,
 
 void ray_sys_track_add(int64_t bytes)      { track_bump(&g_sys_current, &g_sys_peak,        bytes);  }
 void ray_sys_track_sub(int64_t bytes)      { track_bump(&g_sys_current, &g_sys_peak,       -bytes);  }
-void ray_sys_track_file_add(int64_t bytes) { track_bump(&g_sys_mapped,  &g_sys_mapped_peak,  bytes); }
-void ray_sys_track_file_sub(int64_t bytes) { track_bump(&g_sys_mapped,  &g_sys_mapped_peak, -bytes); }
+/* A file mapping is counted in whole pages on both sides.  Mapping knows
+ * the file's exact length, but a free often re-derives it from the header
+ * and rounds to a page (heap.c, mmod 1), so counting raw bytes on the way
+ * in let every column read leave its page tail behind as a negative drift
+ * (#786). */
+static inline int64_t file_pages(int64_t bytes) {
+    return (bytes + 4095) & ~(int64_t)4095;
+}
+void ray_sys_track_file_add(int64_t bytes) { track_bump(&g_sys_mapped,  &g_sys_mapped_peak,  file_pages(bytes)); }
+void ray_sys_track_file_sub(int64_t bytes) { track_bump(&g_sys_mapped,  &g_sys_mapped_peak, -file_pages(bytes)); }
 
 static inline size_t page_round(size_t n) {
     return (n + 4095) & ~(size_t)4095;
