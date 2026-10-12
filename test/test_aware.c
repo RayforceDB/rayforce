@@ -3557,6 +3557,7 @@ static test_result_t test_pool_clamp(void) {
     aw_eval_ok("(set M (table [k g x] (list (til 300000) (% (* (til 300000) 7919) 97) (% (* (til 300000) 31) 1009))))");
     static const char* const qs[] = {
         "(select {c: (count k) s: (sum x) from: M where: (< x 500)})",
+        "(select {c: (count k) s: (sum x) from: M where: (in x [1 2 3 500 777])})",   /* pred_sel_worker */
         "(select {c: (count k) from: M where: (and (> x 100) (< g 50))})",
         "(select {u: (count (distinct x)) by: g from: M})",
         "(take (select {k: k x: x from: M asc: x}) 20)",

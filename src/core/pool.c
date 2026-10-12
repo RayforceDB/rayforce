@@ -576,6 +576,9 @@ static void pool_geometry(ray_pool_t* pool, int64_t* total_elems, int64_t* grain
     if (RAY_UNLIKELY(*total_elems > INT64_MAX - g + 1))
         *total_elems = INT64_MAX - g + 1;
     int64_t total = *total_elems;
+    /* Limits (as before this helper): n_tasks is uint32, so totals of
+     * 2^32 * grain elements or more (about 3.5e13 at the 8192-row grain)
+     * are out of range, and a widened grain near INT64_MAX is not guarded. */
     uint32_t n_tasks = (uint32_t)((total + g - 1) / g);
 
     /* conc-L6: Ring growth is safe without synchronization because dispatch is
