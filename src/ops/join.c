@@ -645,6 +645,18 @@ static ray_t* join_gather_col_serial(ray_t* src, const int64_t* idx,
     return out;
 }
 
+/* The class of a key column's null: numeric types share one (atom_eq's
+ * rule, as 1 equals 1i), every other type is its own. */
+static inline int8_t join_null_class(int8_t t) {
+    switch (t) {
+    case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8: case RAY_BOOL:
+    case RAY_F64: case RAY_F32:
+        return RAY_I64;
+    default:
+        return t;
+    }
+}
+
 /* Key equality helper — shared by count + fill phases */
 static inline bool join_keys_eq(ray_t* const* l_vecs, ray_t* const* r_vecs, uint32_t n_keys,
                                  int64_t l, int64_t r, bool nullfree) {
@@ -654,22 +666,22 @@ static inline bool join_keys_eq(ray_t* const* l_vecs, ray_t* const* r_vecs, uint
         if (!lc || !rc) return false;
         /* null == null, null != non-null.  This is the rule the rest of the
          * runtime already applies to key columns: collection.c's hashset
-         * folds every null into one bucket (so `distinct` keeps exactly one
-         * null and `in` matches null against null), group.c folds them into
-         * one group, and atom_eq answers 1 for two nulls.  Joins used to
-         * reject a null outright, which made `anti-join [c] X X` non-empty
-         * whenever c held a null and made left-join miss a null-keyed match.
-         * As-of join keeps its own documented NULLs-never-match rule; it
-         * does not route through here. */
+         * keeps one null per class (so `distinct` keeps one null of a type
+         * and `in` matches null against null), group.c folds a column's
+         * nulls into one group, and atom_eq answers 1 for two nulls of one
+         * class.  Joins used to reject a null outright, which made
+         * `anti-join [c] X X` non-empty whenever c held a null and made
+         * left-join miss a null-keyed match.  As-of join keeps its own
+         * documented NULLs-never-match rule; it does not route through
+         * here. */
         bool l_null = !nullfree && ray_vec_is_null(lc, l);
         bool r_null = !nullfree && ray_vec_is_null(rc, r);
         if (l_null || r_null) {
             if (l_null != r_null) return false;
-            /* No looser than the value arms below: they pair STR only with
-             * STR and GUID only with GUID, so two nulls of those types are
-             * equal only to their own kind. */
-            if ((lc->type == RAY_STR)  != (rc->type == RAY_STR))  return false;
-            if ((lc->type == RAY_GUID) != (rc->type == RAY_GUID)) return false;
+            /* Two nulls are equal where two values of their types can be
+             * (atom_eq): the same type, or both numeric — a symbol null is
+             * not an integer null, a date null is not either. */
+            if (join_null_class(lc->type) != join_null_class(rc->type)) return false;
             continue;
         }
         if (lc->type == RAY_STR || rc->type == RAY_STR) {

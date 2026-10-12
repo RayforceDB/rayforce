@@ -182,8 +182,10 @@
 (in [2000.01.01D00:00:00.000000000 0Np] [2000.01.01]) -- [false false]
 (in [00:00:00.001] [2000.01.01D00:00:00.000000001]) -- [false]
 
-;; same with nulls on both sides: only null equals null
-(in [2000.01.01 0Nd] [0Ni 0i]) -- [false true]
+;; same with nulls on both sides: a date null is not an int null, as a
+;; date is never an int (rayforce 1 answered the same)
+(in [2000.01.01 0Nd] [0Ni 0i]) -- [false false]
+(in [2000.01.01 0Nd] [0Nd]) -- [false true]
 
 ;; same-type temporal still matches, with or without nulls
 (in [2000.01.01 0Nd 2000.01.03] [2000.01.03]) -- [false false true]
@@ -273,10 +275,43 @@
 (at (select {c: (count (in s (list "qq" "zz"))) from: TG by: g where: (> n 1)}) 'c) -- [1 3]
 
 ;; Known bugs found alongside, not fixed here:
-;; (at (select {c: (sum (in s (list "qq"))) from: TG by: (> n 2)}) 'c) -- [1 1]   ;; xfail BUG: an aggregate evaluated per group needs a column group key; a computed key errors "could not resolve scalar group key symbol" (also (sum (reverse n)))
+;; (at (select {c: (sum (in s (list "qq"))) from: TG by: (> n 2)}) 'c) -- [1 1]   ;; xfail BUG: an aggregate evaluated per group needs one column group key; a computed or multi-column key errors "could not resolve scalar group key symbol" (also (sum (reverse n)))
 ;; Name resolution inside a query (planned binder work), not `in` itself:
 ;; (at (select {c: (in 's (list 's)) from: TS}) 'c) -- [true]   ;; xfail BUG: a quoted symbol that names a column reads the column, here and in (== y 'y) or {c: 'y}
 ;; (do (set in concat) (at (select {c: (in s "!") from: TS}) 'c)) -- ["p!" "qq!" "zz!" "!"]   ;; xfail BUG: select still compiles a rebound `in` as membership
+
+;; ========== NULLS OF DIFFERENT TYPES ==========
+;; Two nulls are equal where two values of their types can be: the same
+;; type, or both numeric (0Nl and 0Ni, as 1 and 1i).  A symbol null, the
+;; empty string, an integer null, a date null and the untyped null are
+;; different values, as 'a, "a", 1 and a date are — rayforce 1 answered so.
+;; Every null used to equal every other one, and distinct collapsed them.
+(in [' 'a] "") -- [false false]
+(in [0Nl 1] "") -- [false false]
+(in ['a '] [""]) -- [false false]
+(in [0Nl 1] [""]) -- [false false]
+(in (list 0Nl ') (list "")) -- [false false]
+(in (list null 1) [0Nl]) -- [false false]
+(in "" ['a ']) -- false
+(in 0Nd [0Nl]) -- false
+;; within a type, and across numeric widths, null still matches null
+(in [' 'a] [']) -- [true false]
+(in [0Nl 1] [0Nl]) -- [true false]
+(in [0Nl 1] [0Ni]) -- [true false]
+(in [0Nl] [0Nf]) -- [true]
+(in ' ['a ']) -- true
+(in ["" "a"] [""]) -- [true false]
+(count (distinct (list ' "" 0Nl null))) -- 4
+(count (distinct (list 0Nl 0Ni ' '))) -- 2
+(count (except (list ' "" 0Nl) (list ""))) -- 2
+(count (sect (list ' "" 0Nl) (list 0Ni))) -- 1
+;; find follows the same rule
+(find ['a '] "") -- 0Nl
+(find ["a" ""] ') -- 0Nl
+(find [2024.01.01 0Nd] 0Nl) -- 0Nl
+(find [2024.01.01 0Nd] 0Nd) -- 1
+(find [1 0Nl] 0Ni) -- 1
+(find ['a '] ') -- 1
 
 ;; a column of another type against a string set matches no row, as bare
 (set TY (table [y n] (list ['p 'qq] [1 2])))

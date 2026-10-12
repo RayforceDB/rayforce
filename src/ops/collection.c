@@ -52,6 +52,7 @@
  * ══════════════════════════════════════════ */
 
 #define HS_EMPTY ((int64_t)-1)
+#define HS_NULL_CLASSES 32
 
 typedef struct hashset_t {
     int64_t* slots;        /* cap entries; -1 = empty, else row index */
@@ -59,8 +60,11 @@ typedef struct hashset_t {
     int64_t  cap;          /* power of 2 */
     int64_t  mask;         /* cap - 1 */
     int64_t  count;        /* live entries (excl. null bucket) */
-    int      null_seen;    /* 1 if any null has been recorded */
-    int64_t  null_idx;     /* row index of first null encountered */
+    /* First null row of each null class (hs_null_class): nulls equal one
+     * another only within a class, as atom_eq has it. */
+    int      n_null;
+    int8_t   null_cls[HS_NULL_CLASSES];
+    int64_t  null_at[HS_NULL_CLASSES];
     /* Cached typed-vec data pointers to avoid re-derefs in hot loops. */
     ray_t*   src;          /* source vec or list */
     int8_t   src_type;     /* ray_t.type */
@@ -243,6 +247,25 @@ static inline int hs_row_is_null(ray_t* src, int64_t i, void* data) {
     return ray_vec_may_have_nulls(src) && ray_vec_is_null(src, i);
 }
 
+/* The class of a null row: two nulls are equal when two values of their
+ * types can be — the same type, or both numeric (atom_eq).  A LIST cell
+ * carries its own type; a missing cell is the untyped null. */
+static int8_t hs_null_class(ray_t* src, int64_t i, void* data) {
+    int8_t t = src->type;
+    if (t == RAY_LIST) {
+        ray_t* e = ((ray_t**)data)[i];
+        if (!e) return RAY_NULL;
+        t = e->type < 0 ? (int8_t)-e->type : e->type;
+    }
+    switch (t) {
+    case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8: case RAY_BOOL:
+    case RAY_F64: case RAY_F32:
+        return RAY_I64;
+    default:
+        return t;
+    }
+}
+
 static bool hashset_init(hashset_t* hs, ray_t* src, int64_t hint) {
     int64_t cap = 16;
     /* Cap target: 2× hint to keep load factor under 0.5. */
@@ -254,8 +277,7 @@ static bool hashset_init(hashset_t* hs, ray_t* src, int64_t hint) {
     hs->cap = cap;
     hs->mask = cap - 1;
     hs->count = 0;
-    hs->null_seen = 0;
-    hs->null_idx = HS_EMPTY;
+    hs->n_null = 0;
     hs->src = src;
     hs->src_type = src ? src->type : 0;
     hs->src_has_nulls = src ? ray_vec_may_have_nulls(src) : false;
@@ -343,8 +365,12 @@ hashset_scan(hashset_t* hs, ray_t* probe_src, int64_t probe_i,
 
 static int64_t hashset_find_xrow(hashset_t* hs, ray_t* probe_src, int64_t probe_i,
                                   int8_t probe_type, void* probe_data) {
-    if (hs_row_is_null(probe_src, probe_i, probe_data))
-        return hs->null_seen ? hs->null_idx : HS_EMPTY;
+    if (hs_row_is_null(probe_src, probe_i, probe_data)) {
+        int8_t c = hs_null_class(probe_src, probe_i, probe_data);
+        for (int k = 0; k < hs->n_null; k++)
+            if (hs->null_cls[k] == c) return hs->null_at[k];
+        return HS_EMPTY;
+    }
     /* sym-domain Phase 2: SYM-vec vs SYM-vec probes across DIFFERENT
      * domains cannot compare (or hash) raw ids.  Re-express the probe
      * cell in the build side's domain once, then run the standard raw
@@ -459,9 +485,12 @@ static void distinct_sort_indices(ray_t* src, int64_t* idx, int64_t count) {
  * the set silently keeps the previous capacity (caller proceeds). */
 static bool hashset_insert(hashset_t* hs, int64_t i) {
     if (hs_row_is_null(hs->src, i, hs->src_data)) {
-        if (hs->null_seen) return false;
-        hs->null_seen = 1;
-        hs->null_idx = i;
+        int8_t c = hs_null_class(hs->src, i, hs->src_data);
+        for (int k = 0; k < hs->n_null; k++)
+            if (hs->null_cls[k] == c) return false;
+        if (hs->n_null == HS_NULL_CLASSES) return false;  /* cannot happen */
+        hs->null_cls[hs->n_null] = c;
+        hs->null_at[hs->n_null++] = i;
         return true;
     }
     if (hs->count * 2 >= hs->cap) {
@@ -1057,7 +1086,12 @@ ray_t* ray_apply_fn(ray_t** args, int64_t n) {
 int atom_eq(ray_t* a, ray_t* b) {
     int a_null = RAY_ATOM_IS_NULL(a);
     int b_null = RAY_ATOM_IS_NULL(b);
-    if (a_null && b_null) return 1;
+    /* Two nulls are equal where two values of their types can be: the same
+     * type, or both numeric.  A symbol null, the empty string and an integer
+     * null are different values, as 'a, "a" and 1 are — treating every null
+     * as one collapsed (distinct (list ' "" 0Nl)) to a single cell. */
+    if (a_null && b_null)
+        return a->type == b->type || (is_numeric(a) && is_numeric(b));
     if (a_null || b_null) return 0;
     if (a->type != b->type) {
         if (is_numeric(a) && is_numeric(b))
@@ -1631,10 +1665,9 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
         bool val_null = RAY_ATOM_IS_NULL(val);
         if (has_nulls) {
             for (int64_t i = 0; i < len; i++) {
-                if (ray_vec_is_null(vec, i)) {
-                    if (val_null) return make_bool(1);
-                    continue;
-                }
+                /* A null row matches only a null of its class (atom_eq):
+                 * the untyped null or a symbol null is not 0Nl. */
+                if (ray_vec_is_null(vec, i) && !val_null) continue;
                 int alloc = 0;
                 ray_t* elem = collection_elem(vec, i, &alloc);
                 int eq = atom_eq(val, elem);
@@ -2889,11 +2922,9 @@ ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
 
         if (has_nulls) {
             for (int64_t i = 0; i < len; i++) {
-                if (ray_vec_is_null(vec, i)) {
-                    if (val_null) return make_i64(i);
-                    continue;
-                }
-                if (val_null) continue;
+                /* A null row matches only a null of its class (atom_eq),
+                 * as in `in`: 0Nl is not found among dates. */
+                if (ray_vec_is_null(vec, i) != val_null) continue;
                 int alloc = 0;
                 ray_t* elem = collection_elem(vec, i, &alloc);
                 int eq = atom_eq(elem, val);
