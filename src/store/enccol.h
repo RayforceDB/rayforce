@@ -227,6 +227,10 @@ int  ray_enccol_vview(ray_enccol_t* e, int64_t vec, ray_enc_vview_t* out, ray_t*
  * FOR_BP views only (any other view has packed NULL); out is aligned to
  * T / 8 bytes and holds n elements. */
 void ray_enccol_unpack_resid(const ray_enc_vview_t* v, void* out);
+/* The residuals of a FOR_BP view comparing true (op: OP_EQ .. OP_GE, at
+ * the lane width, unsigned) against t, unpacked and compared in one pass
+ * of the lane kernels without storing them (perf fix 6's count). */
+uint32_t ray_enccol_count_resid(const ray_enc_vview_t* v, uint16_t op, uint64_t t);
 /* A reference on the column's payload (the RAY_ENCCOL headers share it). */
 void   ray_enccol_ref(ray_enccol_t* e);
 void   ray_enccol_unref(ray_enccol_t* e);
@@ -377,6 +381,10 @@ void ray_enccol_byte_range(const ray_enccol_t* e, int64_t lo, int64_t hi,
  * that passed is recorded and not scanned again (a failure is not).  NULL,
  * or `corrupt` naming the column. */
 ray_t* ray_enccol_check_dir(ray_enccol_t* e, int64_t c, int j, const void* data, int vlen, bool may_null);
+/* ray_enccol_check_dir's rule on the vector's value range [mn, mx] (its
+ * non-null values' minimum and maximum, from a view), recorded the same
+ * way. */
+ray_t* ray_enccol_check_dir_range(ray_enccol_t* e, int64_t c, int j, int64_t mn, int64_t mx);
 /* Vector j of chunk c already passed ray_enccol_check_dir. */
 bool   ray_enccol_dir_vec_ok(const ray_enccol_t* e, int64_t c, int j);
 /* The same over every chunk of the column's published materialization,

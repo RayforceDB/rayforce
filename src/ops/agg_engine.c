@@ -14,6 +14,7 @@
 #include "core/platform.h" /* ray_cache_llc_bytes — replicated slab bound */
 #include "store/enc.h"      /* RAY_ENC_CHUNK: directory statistics per chunk */
 #include "store/enccol.h"   /* ray_enc_chunk_stat_t */
+#include "store/enceval.h"  /* ray_enc_runs: COUNT groups on key runs */
 #include <stdlib.h>
 #include <math.h>
 #include <string.h>
@@ -1804,17 +1805,59 @@ static void agg_sel_bounds_fold(const agg_sel_bounds_ctx_t* c, uint32_t k, uint8
     *mnp = mn; *mxp = mx;
 }
 
+/* Run r's logical value of a CONST / RLE view (ray_enc_runs' value),
+ * inlined for the merges below, which walk a view's runs against sorted
+ * rows directly (one compare per run that holds none of them). */
+static inline int64_t agg_run_value(const ray_enc_vview_t* v, uint32_t r) {
+    const ray_enc_kind_t k = v->k;
+    uint64_t b;
+    switch (k.T) {
+    case 8:  b = v->run_vals.b[r]; break;
+    case 16: b = v->run_vals.h[r]; break;
+    case 32: b = v->run_vals.s[r]; break;
+    default: return (int64_t)v->run_vals.q[r];
+    }
+    const uint64_t m = (1ull << k.T) - 1;
+    return k.is_signed && (b >> (k.T - 1)) & 1 ? (int64_t)(b | ~m) : (int64_t)b;
+}
+/* The first run of v ending after local row x. */
+static inline uint32_t agg_run_at(const ray_enc_vview_t* v, int64_t x) {
+    uint32_t l = 0, h = v->n_runs;
+    while (l < h) { uint32_t mid = l + (h - l) / 2; if ((int64_t)v->run_ends.h[mid] <= x) l = mid + 1; else h = mid; }
+    return l;
+}
+
+/* The bounds over a run view: the runs holding some of the ascending rows
+ * rows[i, j) (inside the view's vector, row 0 at vlo) fold their value, a
+ * null skipped as the per-row fold skips it. */
+static void agg_sel_bounds_runs(const ray_enc_vview_t* v, const int64_t* rows, int64_t i, int64_t j, int64_t vlo,
+                                bool nullable, int64_t null, int64_t* mnp, int64_t* mxp) {
+    int64_t mn = *mnp, mx = *mxp;
+    for (uint32_t r = agg_run_at(v, rows[i] - vlo); r < v->n_runs && i < j; r++) {
+        const int64_t e = vlo + v->run_ends.h[r];
+        if (rows[i] >= e) continue;                     /* none of the rows in this run */
+        const int64_t x = agg_run_value(v, r);
+        if (!(nullable && x == null)) { if (x < mn) mn = x; if (x > mx) mx = x; }
+        int64_t h = j;                                  /* past the run's rows */
+        while (i < h) { int64_t mid = i + (h - i) / 2; if (rows[mid] < e) i = mid + 1; else h = mid; }
+    }
+    *mnp = mn; *mxp = mx;
+}
+
 /* agg_sel_bounds_rows of a staged context over the ascending rows[0, cn),
- * key by key: a plain key in place; a staged key's vector holding at most
- * RAY_COL_POINT_ROWS of the rows point-read (open decision D2: no vector
- * decoded), any other vector, or one whose read declines, through the
- * key's cursor view.  A point-served value is never null and lies inside
- * its vector's statistics, so nests inside its chunk's (the guard's rule).
- * NULL or an owned error. */
+ * key by key: a plain key in place; a staged key's CONST / RLE vector
+ * (ray_col_src_runview) on its runs (P3 Task 3b: no vector decoded); a
+ * vector holding at most RAY_COL_POINT_ROWS of the rows point-read (open
+ * decision D2: no vector decoded), any other vector, or one whose read
+ * declines, through the key's cursor view.  A point-served value is never
+ * null and lies inside its vector's statistics, so nests inside its
+ * chunk's (the guard's rule); a run view under the guard checks its run
+ * values against the chunk's statistics.  NULL or an owned error. */
 static __attribute__((noinline)) ray_t* agg_sel_bounds_staged(agg_sel_bounds_run_t* t, agg_curs_t* cs, int64_t cn) {
     const agg_sel_bounds_ctx_t* c = t->c;
     const agg_rr_t* krr = c->krr;
     const int64_t* rows = t->rows;
+    ray_enc_vview_t view;                               /* a key vector's runs: on the task's stack */
     for (uint32_t k = 0; k < c->n_keys; k++) {
         ray_col_src_t* src = krr->srcs[k];
         if (!src) {
@@ -1822,8 +1865,23 @@ static __attribute__((noinline)) ray_t* agg_sel_bounds_staged(agg_sel_bounds_run
             continue;
         }
         const bool point = krr->key_types[k] != RAY_SYM && ray_col_src_encoded(src);
+        const bool runs = ray_col_src_encoded(src) && krr->key_types[k] != RAY_F32 && krr->key_types[k] != RAY_F64;
         for (int64_t i = 0; i < cn; ) {
             int64_t vlo, vhi;
+            if (runs) {
+                /* a CONST / RLE vector: the runs holding the rows fold their
+                 * values, nothing decoded */
+                ray_t* err = NULL;
+                int vr = ray_col_src_runview(src, rows[i], &view, &vlo, &vhi, &err);
+                if (vr < 0) return err;
+                if (vr > 0) {
+                    int64_t j = i + 1;
+                    while (j < cn && rows[j] < vhi) j++;
+                    agg_sel_bounds_runs(&view, rows, i, j, vlo, c->nullable[k], c->nulls[k], &t->mins[k], &t->maxs[k]);
+                    i = j;
+                    continue;
+                }
+            }
             if (point && ray_col_src_vec_span(src, rows[i], &vlo, &vhi)) {
                 int64_t j = i + 1;
                 while (j < cn && j - i <= RAY_COL_POINT_ROWS && rows[j] < vhi) j++;
@@ -2330,6 +2388,7 @@ typedef struct {
     uint32_t            n_tasks;
     const agg_rr_t*     rr;       /* sources; staged ones are read by range */
     const agg_view_t*   whole;
+    bool                runs;     /* COUNT only over one staged key: its run views add to the slots */
 } agg_dense_ctx_t;
 
 /* Each task owns a slice of one query allocation. Only the bitmap is
@@ -2799,6 +2858,174 @@ static void agg_dense_phaseA_fn(void* vctx, const agg_view_t* v, uint32_t wid, i
     }
 }
 
+/* Phase A on the key's runs (ctx->runs: every aggregate COUNT, one
+ * staged key).  A CONST / RLE key vector without bitmap nulls
+ * (ray_col_src_runview) adds each run's rows to its slot: the run's length
+ * inside the task's rows, or the number of the selection's rows inside the
+ * run; the slot is the per-row body's (agg_dense_component_raw: one key,
+ * never compacted), the first row the run's first counted row.  Every
+ * other vector is read and counted per row by the bodies above, as before
+ * (D6).  Under stats_guard the run view checks the run values against
+ * their chunk's statistics as a range read does; a slot outside the slab
+ * is `corrupt` all the same.  Exact for any rows a task holds: nothing
+ * depends on the task cut. */
+typedef struct {
+    agg_dense_ctx_t*   c;
+    agg_dense_local_t* loc;
+    int64_t            vlo;          /* source row of the view's row 0 */
+    int64_t            r0, r1;       /* dense rows [r0, r1); idx == NULL */
+    const uint16_t*    idx;          /* else rows ibase + idx[ii, ni), ascending */
+    int64_t            ibase, ii, ni;
+    bool               bad;          /* a run value outside the plan */
+} agg_dense_runs_t;
+
+static inline void agg_dense_run_add(agg_dense_runs_t* t, int64_t value, int64_t first, int64_t cnt) {
+    const agg_dense_ctx_t* c = t->c;
+    agg_dense_local_t* loc = t->loc;
+    const int64_t slot = agg_dense_component_raw(c->dp, 0, value);
+    if (slot < 0 || slot >= loc->slots) { t->bad = true; return; }
+    int64_t* fr = loc->first_row;
+    char* st = loc->states + (size_t)slot * c->block;
+    if (loc->eager) { if (first < fr[slot]) fr[slot] = first; }
+    else if (agg_dense_first(loc, slot)) {
+        for (uint32_t a = 0; a < c->n_aggs; a++) c->vts[a]->init(st + c->off[a]);
+        fr[slot] = first;
+    } else if (first < fr[slot]) fr[slot] = first;
+    for (uint32_t a = 0; a < c->n_aggs; a++) {          /* COUNT's state: one int64_t count */
+        int64_t n; memcpy(&n, st + c->off[a], sizeof n);
+        n += cnt;
+        memcpy(st + c->off[a], &n, sizeof n);
+    }
+}
+/* ray_enc_runs callback: the run's rows inside dense rows [r0, r1) */
+static void agg_dense_run_rows(void* raw, int64_t value, int32_t lo, int32_t hi) {
+    agg_dense_runs_t* t = raw;
+    int64_t a = t->vlo + lo, b = t->vlo + hi;
+    if (a < t->r0) a = t->r0;
+    if (b > t->r1) b = t->r1;
+    if (a < b) agg_dense_run_add(t, value, a, b - a);
+}
+/* The selection's rows ibase + idx[ii, ni) inside the view's vector,
+ * merged with its runs: each run holding some adds their count. */
+static void agg_dense_runs_idx(agg_dense_runs_t* t, const ray_enc_vview_t* v) {
+    const uint16_t* idx = t->idx;
+    const int64_t ni = t->ni, off = t->vlo - t->ibase;  /* local run end e <=> index e + off */
+    int64_t i = t->ii;
+    for (uint32_t r = agg_run_at(v, idx[i] - off); r < v->n_runs && i < ni && !t->bad; r++) {
+        const int64_t e = (int64_t)v->run_ends.h[r] + off;
+        if (idx[i] >= e) continue;                       /* none of the rows in this run */
+        const int64_t f = i;
+        while (i < ni && idx[i] < e) i++;
+        agg_dense_run_add(t, agg_run_value(v, r), t->ibase + idx[f], i - f);
+    }
+    t->ii = i;
+}
+static ray_t* agg_dense_runs_bad(void) {
+    return ray_error("corrupt", "group: a key run outside its dense plan");
+}
+
+/* Sel mode on runs: the task's selected rows [start, end) segment by
+ * segment (ALL: a dense row range; MIX: the segment's indices). */
+static __attribute__((noinline)) void agg_dense_runs_sel(agg_dense_ctx_t* c, uint32_t wid, int64_t start, int64_t end) {
+    agg_dense_local_t* loc = &c->locals[wid];
+    if (loc->oom || end <= start) return;
+    const agg_rr_t* rr = c->rr;
+    ray_col_src_t* src = rr->srcs[0];
+    if (ray_scan_fail_skip(rr->fail, start)) return;
+    int64_t rows[AGG_SEL_CHUNK];
+    uint32_t gid[AGG_SEL_CHUNK];
+    agg_sel_scratch_t sc;
+    if (!agg_sel_scratch_init(&sc, c->n_aggs)) { loc->oom = 1; return; }
+    agg_curs_t cs; cs.cur = NULL;
+    if (!agg_curs_init(&cs, rr)) { loc->oom = 1; agg_sel_scratch_free(&sc); return; }
+    agg_dense_sel_run_t pr = { c, loc, rows, gid, &sc };
+    agg_dense_runs_t t = { .c = c, .loc = loc };
+    ray_enc_vview_t view;                               /* the task's key view: on its stack */
+    int64_t vlo = -1, vhi = -1, nb = 0;                 /* the view's (or declined) rows; buffered rows */
+    int vr = 0;
+    bool stop = false;                                  /* cancelled */
+    ray_t* err = NULL;
+    const ray_rowsel_t* m = ray_rowsel_meta(c->sel);
+    const uint8_t* flags = ray_rowsel_flags(c->sel);
+    const uint32_t* offs = ray_rowsel_offsets(c->sel);
+    const uint16_t* idx = ray_rowsel_idx(c->sel);
+    const int64_t* pre = c->sel_prefix;
+    uint32_t s = 0, hs = m->n_segs;                     /* the segment holding selected row `start` */
+    while (s < hs) { uint32_t mid = s + (hs - s) / 2; if (pre[mid + 1] <= start) s = mid + 1; else hs = mid; }
+    for (; s < m->n_segs && pre[s] < end && !err && !stop && !loc->oom; s++) {
+        if (flags[s] == RAY_SEL_NONE) continue;
+        const int64_t seg_sel = pre[s + 1] - pre[s];
+        const int64_t p0 = start > pre[s] ? start - pre[s] : 0;
+        const int64_t p1 = end - pre[s] < seg_sel ? end - pre[s] : seg_sel;
+        const int64_t base = (int64_t)s * RAY_MORSEL_ELEMS;
+        const bool all = flags[s] == RAY_SEL_ALL;
+        const uint16_t* si = idx + offs[s];
+        for (int64_t q = p0; q < p1 && !err; ) {
+            const int64_t r = all ? base + q : base + si[q];
+            if (r < vlo || r >= vhi) {
+                if ((stop = agg_cancelled())) break;
+                vr = ray_col_src_runview(src, r, &view, &vlo, &vhi, &err);
+                if (vr < 0) break;
+            }
+            /* the positions [q, qe) of this segment inside [vlo, vhi) */
+            int64_t qe;
+            if (all) qe = vhi - base < p1 ? vhi - base : p1;
+            else { qe = q + 1; while (qe < p1 && base + si[qe] < vhi) qe++; }
+            if (vr > 0) {
+                t.vlo = vlo;
+                if (all) { t.idx = NULL; t.r0 = base + q; t.r1 = base + qe; }
+                else { t.idx = si; t.ibase = base; t.ii = q; t.ni = qe; }
+                if (all) (void)ray_enc_runs(&view, &t, agg_dense_run_rows);
+                else agg_dense_runs_idx(&t, &view);
+                if (t.bad) { err = agg_dense_runs_bad(); break; }
+            } else {
+                for (int64_t i = q; i < qe && !err; i++) {
+                    rows[nb++] = all ? base + i : base + si[i];
+                    if (nb == AGG_SEL_CHUNK) { err = agg_idx_walk(rr, &cs, rows, 0, nb, &pr, agg_dense_sel_rows, wid); nb = 0; }
+                }
+            }
+            q = qe;
+        }
+    }
+    if (nb > 0) {                                       /* the lower rows' read reports first */
+        ray_t* ferr = loc->oom ? NULL : agg_idx_walk(rr, &cs, rows, 0, nb, &pr, agg_dense_sel_rows, wid);
+        if (ferr) { if (err) ray_error_free(err); err = ferr; }
+    }
+    if (err) ray_scan_fail_note(rr->fail, start, err);
+    agg_curs_free(&cs, rr);
+    agg_sel_scratch_free(&sc);
+}
+
+/* Row mode on runs: rows [begin, limit), a key run view at a time; a
+ * declined vector (or plain segment) is walked by the per-row body. */
+static __attribute__((noinline)) void agg_dense_runs_rows(agg_dense_ctx_t* c, uint32_t task, int64_t begin, int64_t limit) {
+    const agg_rr_t* rr = c->rr;
+    if (ray_scan_fail_skip(rr->fail, begin)) return;
+    agg_curs_t cs;
+    if (!agg_curs_init(&cs, rr)) { ray_scan_fail_note(rr->fail, begin, ray_error("oom", NULL)); return; }
+    agg_dense_runs_t t = { .c = c, .loc = &c->locals[task] };
+    ray_enc_vview_t view;                               /* the task's key view: on its stack */
+    for (int64_t r = begin; r < limit && !agg_cancelled() && !c->locals[task].oom; ) {
+        int64_t vlo, vhi;
+        ray_t* err = NULL;
+        int vr = ray_col_src_runview(rr->srcs[0], r, &view, &vlo, &vhi, &err);
+        if (vr < 0) { ray_scan_fail_note(rr->fail, begin, err); break; }
+        const int64_t re = vhi < limit ? vhi : limit;
+        if (vr > 0) {
+            t.vlo = vlo; t.idx = NULL; t.r0 = r; t.r1 = re;
+            (void)ray_enc_runs(&view, &t, agg_dense_run_rows);
+            if (t.bad) { ray_scan_fail_note(rr->fail, begin, agg_dense_runs_bad()); break; }
+        } else {
+            bool ok = true;
+            for (int64_t b = r; b < re && ok; b += 8192)
+                ok = agg_walk_cs(rr, &cs, c, agg_dense_phaseA_fn, task, b, re - b < 8192 ? re : b + 8192, begin);
+            if (!ok) break;
+        }
+        r = re;
+    }
+    agg_curs_free(&cs, rr);
+}
+
 /* One slab per logical task, independent of the physical worker executing it.
  * A large pool can run a memory-bounded number of dense tasks safely.  Each
  * 8192-row sub-block runs over the whole columns, or by pieces when a source
@@ -2834,6 +3061,30 @@ static void agg_dense_task_fn(void* raw, uint32_t wid, int64_t start, int64_t en
                 agg_curs_free(&cs, c->rr);
             }
         }
+        if (loc->eager) for (int64_t s = 0; s < loc->slots; s++)
+            if (loc->first_row[s] != INT64_MAX)
+                loc->occupied[s / 64] |= UINT64_C(1) << (s % 64);
+    }
+}
+
+/* agg_dense_task_fn for ctx->runs (the slab's set-up and occupancy as
+ * there), its own instance so the plain one keeps its code. */
+static void agg_dense_task_runs_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    agg_dense_ctx_t* c = raw;
+    int64_t chunk = c->task_rows / c->n_tasks;
+    for (int64_t task = start; task < end; task++) {
+        agg_dense_local_t* loc = &c->locals[task];
+        agg_dense_local_init(loc, loc->slots, c->block);
+        if (loc->eager) for (int64_t s = 0; s < loc->slots; s++) {
+            loc->first_row[s] = INT64_MAX;
+            for (uint32_t a = 0; a < c->n_aggs; a++)
+                c->vts[a]->init(loc->states + (size_t)s * c->block + c->off[a]);
+        }
+        int64_t begin = chunk * task;
+        int64_t limit = task + 1 == c->n_tasks ? c->task_rows : chunk * (task + 1);
+        if (c->sel) agg_dense_runs_sel(c, (uint32_t)task, begin, limit);
+        else agg_dense_runs_rows(c, (uint32_t)task, begin, limit);
         if (loc->eager) for (int64_t s = 0; s < loc->slots; s++)
             if (loc->first_row[s] != INT64_MAX)
                 loc->occupied[s / 64] |= UINT64_C(1) << (s % 64);
@@ -3719,6 +3970,24 @@ failed:
     return ferr ? ferr : ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
 }
 
+/* The dense phase A may count on the key's runs (agg_dense_runs_*): one
+ * staged generation-2 integer or SYM key, a raw-range plan, every
+ * aggregate COUNT (D6: the count adds a run's rows; any other aggregate
+ * needs its rows' values). */
+static bool agg_dense_runs_ok(const agg_rr_t* rr, const dense_plan_t* dp, const agg_vtable_t** vts,
+                              uint32_t n_keys, uint32_t n_aggs) {
+    if (n_keys != 1 || !rr->staged || !rr->srcs[0] || !ray_col_src_encoded(rr->srcs[0]) || dp->compacted) return false;
+    switch (rr->key_types[0]) {
+    case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8: case RAY_BOOL:
+    case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: case RAY_SYM: break;
+    default: return false;
+    }
+    const agg_vtable_t* cnt = agg_resolve(OP_COUNT, RAY_I64);
+    for (uint32_t a = 0; a < n_aggs; a++)
+        if (vts[a] != cnt || vts[a]->state_size != sizeof(int64_t)) return false;
+    return true;
+}
+
 static ray_t* exec_group_v2_parallel_dense(
         ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         ray_t** key_cols, int64_t* key_syms, ray_op_ext_t* ext, int64_t nrows,
@@ -3822,11 +4091,12 @@ static ray_t* exec_group_v2_parallel_dense(
                 .val_data = val_data, .val_types = val_types, .val_hasnull = val_hasnull, .val_esz = val_esz,
                 .val2_data = val2_data, .val2_types = val2_types, .val2_hasnull = val2_hasnull, .val2_esz = val2_esz },
         .rr = &d.rr, .whole = &d.whole,
+        .runs = agg_dense_runs_ok(&d.rr, dp, vts, n_keys, n_aggs),
     };
     /* Sel mode dispatches over the SELECTED-row space [0,n_sel); each worker
      * range maps to a segment span via sel_prefix.  Non-sel dispatches over rows. */
     agg_desc_advise(&d, nrows);
-    ray_pool_dispatch_n(pool, agg_dense_task_fn, &ctx, nw);
+    ray_pool_dispatch_n(pool, ctx.runs ? agg_dense_task_runs_fn : agg_dense_task_fn, &ctx, nw);
     ray_profile_tick("dense: accumulated rows");
 
     ray_t* ferr = d.staged ? ray_scan_fail_finish(&d.fail, pool) : NULL;

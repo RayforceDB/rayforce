@@ -1827,6 +1827,53 @@ void ray_enccol_unpack_resid(const ray_enc_vview_t* v, void* out) {
     }
 }
 
+/* Fused unpack-and-compare (perf fix 6): rows of n packed fields that
+ * compare true (unsigned, at the lane width) against t, never storing
+ * the fields.  FK_FOR's row walk with the store replaced by a count. */
+#define FK_CNT_ROW(UT, CMP, V) do { for (int l = 0; l < nl; l++) { const UT v_ = (V); acc += (uint32_t)(v_ CMP t); } } while (0)
+#define FK_CNT(NAME, UT, PT, TB, CMP)                                                  \
+static uint32_t NAME(const UT* restrict in, int w, UT t, int n) {                       \
+    enum { L = RAY_ENC_VEC / TB };                                                      \
+    const UT m = w >= TB ? (UT)~(UT)0 : (UT)(((PT)1 << w) - 1);                         \
+    uint32_t acc = 0;                                                                   \
+    for (int r = 0, bit = 0; r * L < n; r++, bit += w) {                                \
+        const int k = bit / TB, off = bit % TB;                                         \
+        const unsigned sr = (unsigned)off & (TB - 1), sl = (unsigned)(TB - off) & (TB - 1); \
+        const int nl = n - r * L < L ? n - r * L : L;                                   \
+        const UT* a = in + (size_t)k * L;                                               \
+        if (w == 0) FK_CNT_ROW(UT, CMP, (UT)0);                                         \
+        else if (off + w > TB) FK_CNT_ROW(UT, CMP, FK_FIELD2(UT, PT, L, a, l, sr, sl, m)); \
+        else FK_CNT_ROW(UT, CMP, FK_FIELD1(UT, PT, a, l, sr, m));                       \
+    }                                                                                   \
+    return acc;                                                                         \
+}
+#define FK_CNT_OPS(T, UT, PT) FK_CNT(fk_cnt##T##_eq, UT, PT, T, ==) FK_CNT(fk_cnt##T##_ne, UT, PT, T, !=) \
+    FK_CNT(fk_cnt##T##_lt, UT, PT, T, <) FK_CNT(fk_cnt##T##_le, UT, PT, T, <=)                           \
+    FK_CNT(fk_cnt##T##_gt, UT, PT, T, >) FK_CNT(fk_cnt##T##_ge, UT, PT, T, >=)
+FK_CNT_OPS(8, uint8_t, unsigned)
+FK_CNT_OPS(16, uint16_t, unsigned)
+FK_CNT_OPS(32, uint32_t, unsigned)
+FK_CNT_OPS(64, uint64_t, uint64_t)
+#define FK_CNT_CALL(T, UT) switch (op) {                                                 \
+    case OP_EQ: return fk_cnt##T##_eq((const UT*)v->packed, v->width, (UT)t, v->n);     \
+    case OP_NE: return fk_cnt##T##_ne((const UT*)v->packed, v->width, (UT)t, v->n);     \
+    case OP_LT: return fk_cnt##T##_lt((const UT*)v->packed, v->width, (UT)t, v->n);     \
+    case OP_LE: return fk_cnt##T##_le((const UT*)v->packed, v->width, (UT)t, v->n);     \
+    case OP_GT: return fk_cnt##T##_gt((const UT*)v->packed, v->width, (UT)t, v->n);     \
+    default:    return fk_cnt##T##_ge((const UT*)v->packed, v->width, (UT)t, v->n); }
+uint32_t ray_enccol_count_resid(const ray_enc_vview_t* v, uint16_t op, uint64_t t) {
+    switch (v->k.T) {
+    case 8:  FK_CNT_CALL(8, uint8_t);
+    case 16: FK_CNT_CALL(16, uint16_t);
+    case 32: FK_CNT_CALL(32, uint32_t);
+    default: FK_CNT_CALL(64, uint64_t);
+    }
+}
+#undef FK_CNT_CALL
+#undef FK_CNT_OPS
+#undef FK_CNT
+#undef FK_CNT_ROW
+
 /* True when no non-null row of the residuals res (lanes at width T) is
  * hitv, the sentinel's residual. */
 static bool vview_no_hit(const ray_enc_vview_t* v, const ray_enc_lanes_t* res, uint64_t hitv) {
@@ -2781,6 +2828,17 @@ ray_t* ray_enccol_check_dir(ray_enccol_t* e, int64_t c, int j, const void* data,
     ray_enc_dirent_t de; dirent_at(e, c, &de);
     if ((de.flags & RAY_ENC_STAT_ABSENT) ||                /* no statistics: nothing sized from them */
         dir_range_ok(e->type, data, vlen, may_null && !(e->type == RAY_BOOL || e->type == RAY_U8), de.min, de.max)) {
+        if (e->dir_vec_ok) atomic_fetch_or_explicit(&e->dir_vec_ok[c], bit, memory_order_release);
+        return NULL;
+    }
+    return ray_error("corrupt", "column %s: chunk %lld vector %d value outside the chunk's statistics",
+                     e->path, (long long)c, j);
+}
+
+ray_t* ray_enccol_check_dir_range(ray_enccol_t* e, int64_t c, int j, int64_t mn, int64_t mx) {
+    const uint64_t bit = UINT64_C(1) << j;
+    ray_enc_dirent_t de; dirent_at(e, c, &de);
+    if ((de.flags & RAY_ENC_STAT_ABSENT) || (mn >= de.min && mx <= de.max)) {
         if (e->dir_vec_ok) atomic_fetch_or_explicit(&e->dir_vec_ok[c], bit, memory_order_release);
         return NULL;
     }

@@ -68,4 +68,27 @@ int  ray_enc_const_decision_f64(const ray_enc_vview_t* v, uint16_t op, double c,
  * does a BOOL / U8 view holding nulls (their kernels count every row). */
 bool ray_enc_vec_sum(const ray_enc_vview_t* v, int64_t* hi, uint64_t* lo, int64_t* n_nonnull);
 
+/* Rows of a viewed vector without bitmap nulls (SYM: ids, EQ / NE only)
+ * that compare true against c: CONST n or 0, RLE the lengths of the
+ * passing runs, FOR_BP a count over the packed residuals (fix 6), DICT a
+ * count of codes in the interval.  False when the view carries a bitmap
+ * with nulls or has no rule (a float view, an operator outside OP_EQ ..
+ * OP_GE): read the vector and count it as today.  c is in the column's
+ * logical domain, as for ray_enc_eval_cmp. */
+bool ray_enc_count_cmp(const ray_enc_vview_t* v, uint16_t op, int64_t c, int64_t* count);
+/* The runs of a CONST / RLE view as (logical value, first row, end row)
+ * triples through fn, in row order; false for any other view.  A SYM
+ * value is its id, a BOOL / U8 one unsigned, the others signed: the value
+ * the vector's decode holds at those rows (a bitmap null row reads as the
+ * run's stored value: a caller that must see nulls declines a view with
+ * a nullmap). */
+typedef void (*ray_enc_run_fn)(void* ctx, int64_t value, int32_t lo, int32_t hi);
+bool ray_enc_runs(const ray_enc_vview_t* v, void* ctx, ray_enc_run_fn fn);
+
+/* The [min, max] of the logical values of a CONST, RLE, FOR_BP or DICT
+ * view, nulls not excluded (a caller declines a view with a bitmap): one
+ * pass over the runs, residuals or codes (FOR_BP: its residuals unpacked
+ * in u by ray_enccol_unpack_resid; u unused otherwise). */
+void ray_enc_view_range(const ray_enc_vview_t* v, const ray_enc_lanes_t* u, int64_t* mn, int64_t* mx);
+
 #endif /* RAY_ENCEVAL_H */

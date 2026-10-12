@@ -26,6 +26,7 @@
 #include "core/pool.h"
 #include "store/col.h"
 #include "store/enccol.h"
+#include "store/enceval.h"
 #include "table/sym.h"
 #include "table/domain.h"
 #include "table/table.h"
@@ -828,6 +829,58 @@ bool ray_col_src_vec_span(ray_col_src_t* s, int64_t row, int64_t* lo, int64_t* h
     *lo = s0 + ((row - s0) & ~(int64_t)(RAY_ENC_VEC - 1));
     *hi = *lo + RAY_ENC_VEC < s1 ? *lo + RAY_ENC_VEC : s1;
     return true;
+}
+
+int ray_col_src_runview(ray_col_src_t* s, int64_t row, ray_enc_vview_t* out, int64_t* lo, int64_t* hi, ray_t** err) {
+    *err = NULL;
+    *lo = row; *hi = row + 1;
+    if (!s || !s->obj || row < 0 || row >= s->len) return 0;
+    int64_t s0 = 0, s1 = s->len;                           /* the rows that read alike: source, segment */
+    ray_enccol_t* e = NULL;
+    if (ray_col_src_encoded(s) && !ray_enccol_decoded_peek(s->obj)) {
+        ray_enccol_t* ce = ray_enccol_of(s->obj);
+        if (ce->kind == RAY_ENCCOL_SINGLE) e = ce;
+        else {
+            ray_t* w = parted_wrapper(s->obj);
+            const int64_t* off;
+            if (!w || w->len <= 0) return 0;
+            ray_t* oerr = src_seg_off(s, w, &off);
+            if (oerr) { ray_error_free(oerr); return 0; }  /* the cursor reports it */
+            int64_t a = 0, b = w->len - 1;                 /* the last i with off[i] <= row */
+            while (a < b) {
+                int64_t mid = a + (b - a + 1) / 2;
+                if (off[mid] <= row) a = mid; else b = mid - 1;
+            }
+            s0 = off[a]; s1 = off[a + 1];
+            ray_t* sg = ((ray_t**)ray_data(w))[a];
+            if (sg && sg->type == RAY_ENCCOL && !ray_enccol_decoded_peek(sg) &&
+                ray_enccol_of(sg)->kind == RAY_ENCCOL_SINGLE)
+                e = ray_enccol_of(sg);
+        }
+    }
+    if (!e || e->synthetic) { *lo = s0; *hi = s1; return 0; }   /* a plain or stand-in segment: read alike */
+    const int64_t vec = (row - s0) / RAY_ENC_VEC;
+    const int64_t c = vec / RAY_ENC_VECS_PER_CHUNK;
+    const int j = (int)(vec % RAY_ENC_VECS_PER_CHUNK);
+    *lo = s0 + vec * RAY_ENC_VEC;
+    *hi = *lo + RAY_ENC_VEC < s1 ? *lo + RAY_ENC_VEC : s1;
+    const ray_enc_desc_t* d;
+    if ((*err = ray_enccol_chunk_descs_ref(e, c, &d)) != NULL) return -1;   /* validated once per chunk */
+    const uint8_t enc = d[j].encoding;
+    if ((enc != RAY_ENC_RLE && enc != RAY_ENC_CONST) || e->type == RAY_F32 || e->type == RAY_F64)
+        return 0;                                             /* no other codec builds a view */
+    int r = ray_enccol_vview(e, vec, out, err);
+    if (r <= 0) return r;
+    if (out->enc != enc || out->nullmap || out->n != *hi - *lo) return 0;
+    if (s->stats_guard && e->type != RAY_SYM && !ray_enccol_dir_vec_ok(e, c, j)) {
+        /* the range read's guard on the vector's values, which are its run
+         * values: their [min, max] inside the chunk's directory statistics
+         * (a vector that passed is recorded, as a range read records it) */
+        int64_t mn, mx;
+        ray_enc_view_range(out, NULL, &mn, &mx);
+        if ((*err = ray_enccol_check_dir_range(e, c, j, mn, mx)) != NULL) return -1;
+    }
+    return 1;
 }
 
 /* One read-ahead span: page-aligned start, bytes. */

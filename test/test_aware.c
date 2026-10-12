@@ -3509,6 +3509,234 @@ static test_result_t test_scalar_route_parted_stats(void) {
     PASS();
 }
 
+/* q2's shape: count over a column of CONST and RLE vectors with no nulls;
+ * the count is answered from the runs, no byte decoded; FOR_BP vectors
+ * count on their packed residuals, DICT vectors on their codes, SYM RLE
+ * vectors on their ids (== / != only; an absent symbol matches nothing;
+ * the "" literal is the null atom, which the fast path declines). */
+static test_result_t test_count_on_runs(void) {
+    /* a: CONST 0 in 3 of 4 vectors, RLE [0 7 0] in the fourth (the
+     * AdvEngineID shape); b: FOR_BP 0..49 */
+    aw_save("cr", "(table [a b] (list (as 'I16 (map (fn [j] (if (and (== 3 (% (div j 1024) 4)) (> (% j 1024) 100) (< (% j 1024) 300)) 7 0)) (til 200000))) "
+                  "(as 'I32 (% (til 200000) 50))))", -1);
+    static const char* const q[] = {
+        "(count (select {from: T where: (!= a 0)}))",
+        "(count (select {from: T where: (== a 7)}))",
+        "(count (select {from: T where: (> b 20)}))",
+        "(count (select {from: T where: (== b 7)}))",
+        "(count (select {from: T where: (< a 7)}))",
+        "(count (select {from: T where: (>= b 49)}))",
+        "(count (select {from: T where: (<= b -1)}))",
+        "(count (select {from: T where: (!= b 50)}))",
+        "(count (select {from: T where: (< b 13)}))",
+        "(count (select {from: T where: (<= b 13)}))",
+        "(count (select {from: T where: (!= b 13)}))",
+        "(count (select {from: T where: (>= b 0)}))",
+        "(count (select {from: T where: (< 30 b)}))",
+        NULL,
+    };
+    uint64_t f0 = ray_query_test_count_fast();
+    for (int i = 0; q[i]; i++) {
+        test_result_t r = aw_reduce("cr", q[i], 0);     /* equal answers, 0 decoded bytes */
+        if (r.status != TEST_PASS) return r;
+    }
+    TEST_ASSERT_TRUE(ray_query_test_count_fast() > f0);   /* the fast path ran */
+    TEST_ASSERT_EQ_I(aw_vec_enc("cr", "a", 3), RAY_ENC_RLE);
+    TEST_ASSERT_EQ_I(aw_vec_enc("cr", "b", 3), RAY_ENC_FOR_BP);
+    /* DICT (forced): 37 wide values, every operator around and on them */
+    aw_save("cd", "(table [d] (list (* 1000003 (- (% (* (til 200000) 7) 37) 18))))", RAY_ENC_DICT);
+    TEST_ASSERT_EQ_I(aw_vec_enc("cd", "d", 5), RAY_ENC_DICT);
+    static const char* const dq[] = {
+        "(count (select {from: T where: (== d 3000009)}))", "(count (select {from: T where: (!= d 3000009)}))",
+        "(count (select {from: T where: (< d 3000009)}))",  "(count (select {from: T where: (<= d 3000009)}))",
+        "(count (select {from: T where: (> d 3000010)}))",  "(count (select {from: T where: (>= d -18000054)}))",
+        "(count (select {from: T where: (== d 5)}))",       "(count (select {from: T where: (!= d 5)}))",
+        NULL,
+    };
+    for (int i = 0; dq[i]; i++) {
+        test_result_t r = aw_reduce("cd", dq[i], 0);
+        if (r.status != TEST_PASS) return r;
+    }
+    /* SYM: runs of 300 rows over 7 symbols and "" */
+    aw_save("cs", "(table [s] (list (as 'SYMBOL (map (fn [j] (if (== 3 (% (div j 300) 8)) \"\" (format \"s%\" (% (div j 300) 7)))) (til 200000)))))", -1);
+    static const char* const sq[] = {
+        "(count (select {from: T where: (== s 's3)}))", "(count (select {from: T where: (!= s 's3)}))",
+        "(count (select {from: T where: (== s 'zz)}))", "(count (select {from: T where: (!= s 'zz)}))",
+        NULL,
+    };
+    for (int i = 0; sq[i]; i++) {
+        test_result_t r = aw_reduce("cs", sq[i], 0);
+        if (r.status != TEST_PASS) return r;
+    }
+    PASS();
+}
+
+/* q8's shape: a COUNT group by the same key under its own != 0 filter.
+ * The RLE vectors' runs add to their slots (and fold the selection
+ * bounds); nothing decoded.  Also unfiltered (no selection), a selection
+ * that cuts runs (MIX segments), COUNT beside a group of no count (the
+ * per-row path), a SYM key, and a parted table, every partition
+ * generation 2 or one generation 0, ragged (a partition without the key:
+ * an I16 stand-in is all null, a U8 one zeros). */
+static test_result_t test_group_count_on_runs(void) {
+    /* the RLE vectors' runs hold over 65536 selected rows: the parallel
+     * dense route (below the threshold the selection is compacted) */
+    aw_save("gr", "(table [a] (list (as 'I16 (map (fn [j] (if (and (== 3 (% (div j 1024) 4)) (> (% j 1024) 100) (< (% j 1024) 900)) (+ 1 (% (div j 4096) 5)) 0)) (til 400000)))))", -1);
+    test_result_t r = aw_reduce("gr", "(select {a: a c: (count a) from: T where: (!= a 0) by: a desc: c take: 10})", 0);
+    if (r.status != TEST_PASS) return r;
+    TEST_ASSERT_TRUE(g_aw_unaligned || agg_route_stats().dense_strategy == AGG_DENSE_TASK_LOCAL);
+    if ((r = aw_reduce("gr", "(select {c: (count a) from: T by: a})", 0)).status != TEST_PASS) return r;
+    if ((r = aw_reduce("gr", "(select {c: (count a) from: T where: (!= a 3) by: a})", 0)).status != TEST_PASS) return r;
+    /* a selection that cuts runs (MIX segments): rows of the run where
+     * a second predicate fails */
+    aw_save("gm", "(table [a k] (list (as 'I16 (map (fn [j] (if (and (> (% j 1024) 100) (< (% j 1024) 900)) (+ 1 (% (div j 1024) 5)) 0)) (til 300000))) (til 300000)))", -1);
+    if ((r = aw_reduce("gm", "(select {a: a c: (count a) from: T where: (and (!= a 0) (!= 0 (% k 3))) by: a desc: c take: 10})", -1)).status != TEST_PASS) return r;
+    if (!g_aw_unaligned) TEST_ASSERT_FMT(aw_col_decoded("a") == 0, "gm: a decoded %llu", (unsigned long long)aw_col_decoded("a"));
+    if ((r = aw_reduce("gm", "(select {c: (count k) d: (count a) from: T where: (< (% k 7) 4) by: a})", -1)).status != TEST_PASS) return r;
+    if (!g_aw_unaligned) TEST_ASSERT_FMT(aw_col_decoded("a") == 0, "gm 2: a decoded %llu", (unsigned long long)aw_col_decoded("a"));
+    /* not COUNT only: the per-row path, same answers */
+    if ((r = aw_reduce("gm", "(select {c: (count a) s: (sum k) from: T where: (!= a 0) by: a})", -1)).status != TEST_PASS) return r;
+    /* packed keys (every vector FOR_BP, or DICT): no run view, so each
+     * vector is decoded and counted per row, as before (D6); the same
+     * answers, nothing materialized */
+    static const struct { const char* name; int enc; } pk[] = { { "gp", RAY_ENC_FOR_BP }, { "gd", RAY_ENC_DICT } };
+    for (int i = 0; i < 2; i++) {
+        aw_save(pk[i].name, "(table [a v] (list (as 'I32 (- (* 100 (% (* (til 300000) 7) 13)) 600)) (% (til 300000) 7)))", pk[i].enc);
+        TEST_ASSERT_EQ_I(aw_vec_enc(pk[i].name, "a", 7), pk[i].enc);
+        if ((r = aw_reduce(pk[i].name, "(select {a: a c: (count a) from: T where: (!= a 0) by: a desc: c take: 10})", -1)).status != TEST_PASS) return r;
+        if ((r = aw_reduce(pk[i].name, "(select {c: (count a) from: T by: a})", -1)).status != TEST_PASS) return r;
+        if ((r = aw_reduce(pk[i].name, "(select {c: (count a) from: T where: (!= v 0) by: a})", -1)).status != TEST_PASS) return r;
+    }
+    /* a SYM key in runs, "" (id 0) among them */
+    aw_save("gs", "(table [s] (list (as 'SYMBOL (map (fn [j] (if (== 3 (% (div j 300) 8)) \"\" (format \"s%\" (% (div j 300) 7)))) (til 300000)))))", -1);
+    if ((r = aw_reduce("gs", "(select {c: (count s) from: T by: s})", -1)).status != TEST_PASS) return r;
+    if ((r = aw_reduce("gs", "(select {c: (count s) from: T where: (!= s 's2) by: s desc: c take: 3})", -1)).status != TEST_PASS) return r;
+    /* parted: g (every partition generation 2), m (partition 2 generation
+     * 0), d (I16, partition 3 without a: all-null stand-in), u (U8,
+     * partition 3 without a: zeros) */
+    static const struct { const char* root; const char* ty; int gen0, ragged; } pt[] = {
+        { "pg", "I16", -1, -1 }, { "pm", "I16", 1, -1 }, { "pd", "I16", -1, 2 }, { "pu", "U8", -1, 2 },
+    };
+    for (int t = 0; t < 4; t++)
+        for (int gen = 0; gen <= 2; gen += 2)
+            for (int p = 0; p < 3; p++) {
+                char q[1200];
+                const bool g2 = gen == 2 && p != pt[t].gen0;
+                if (p == pt[t].ragged)
+                    snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/%s%d/2024.01.0%d/t/\" (table [k] (list (til 70000))) {compress: %s})",
+                             pt[t].root, gen, p + 1, g2 ? "true" : "false");
+                else
+                    snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/%s%d/2024.01.0%d/t/\" "
+                             "(table [k a] (list (til 100000) (as '%s (map (fn [j] (if (and (> (%% j 1024) 100) (< (%% j 1024) 900)) (+ 1 (%% (div j 1024) 5)) 0)) (+ (til 100000) %d))))) "
+                             "{compress: %s})", pt[t].root, gen, p + 1, pt[t].ty, p * 777, g2 ? "true" : "false");
+                aw_eval_ok(q);
+            }
+    static const char* const pq[] = {
+        "(select {a: a c: (count a) from: T where: (!= a 0) by: a desc: c take: 10})",
+        "(select {c: (count a) from: T by: a})",
+        NULL,
+    };
+    for (int t = 0; t < 4; t++)
+        for (int i = 0; pq[i]; i++) {
+            char b[512];
+            ray_t* out[2];
+            for (int gen = 0; gen <= 2; gen += 2) {
+                snprintf(b, sizeof b, "(set T (.db.parted.get \"" AW_TMP "/%s%d\" 't))", pt[t].root, gen);
+                aw_eval_ok(b);
+                ray_enc_counters_reset();
+                out[gen / 2] = ray_eval_str(pq[i]);
+                TEST_ASSERT_FMT(out[gen / 2] && !RAY_IS_ERR(out[gen / 2]), "%s %s: %s", pt[t].root, pq[i], ray_error_msg());
+            }
+            ray_enc_counters_t k; ray_enc_counters_get(&k);
+            TEST_ASSERT_EQ_U(k.materialized, 0);
+            if (!g_aw_unaligned && pt[t].ragged < 0)      /* a stand-in segment is read (decoded) per row */
+                TEST_ASSERT_FMT(aw_parted_col_decoded("T", "a") == 0, "%s %s: a decoded %llu", pt[t].root, pq[i],
+                                (unsigned long long)aw_parted_col_decoded("T", "a"));
+            ray_t* fa = ray_fmt(out[0], 0); ray_t* fb = ray_fmt(out[1], 0);
+            TEST_ASSERT_FMT(ray_str_len(fa) == ray_str_len(fb) && memcmp(ray_str_ptr(fa), ray_str_ptr(fb), ray_str_len(fa)) == 0,
+                            "%s %s differs", pt[t].root, pq[i]);
+            ray_release(fa); ray_release(fb); ray_release(out[0]); ray_release(out[1]);
+        }
+    PASS();
+}
+
+/* Chunk c's directory maximum and every vector descriptor's statistics
+ * above x capped at x (test_scan_range.c's sr_forge_cap): the statistics
+ * still nest and validate, and the values above x lie outside them. */
+static bool aw_forge_cap(const char* path, int64_t c, int64_t x) {
+    FILE* f = fopen(path, "r+b"); if (!f) return false;
+    ray_enc_dirent_t de;
+    long doff = (long)(RAY_ENC_DIR_OFF + (uint64_t)c * sizeof de);
+    bool ok = fseek(f, doff, SEEK_SET) == 0 && fread(&de, sizeof de, 1, f) == 1 && !(de.flags & RAY_ENC_STAT_ABSENT);
+    if (ok) {
+        de.max = x;
+        if (de.min > x) de.min = x;
+        ok = fseek(f, doff, SEEK_SET) == 0 && fwrite(&de, sizeof de, 1, f) == 1;
+    }
+    for (int j = 0; ok && j < RAY_ENC_VECS_PER_CHUNK; j++) {
+        ray_enc_desc_t d;
+        long off = (long)(de.offset + (uint64_t)j * sizeof d);
+        ok = fseek(f, off, SEEK_SET) == 0 && fread(&d, sizeof d, 1, f) == 1;
+        if (!ok || (d.encoding == 0 && d.payload_bytes == 0)) break;     /* past the last vector */
+        if (d.flags & RAY_ENC_STAT_ABSENT || d.max <= x) continue;
+        d.max = x;
+        if (d.min > x) d.min = x;
+        ok = fseek(f, off, SEEK_SET) == 0 && fwrite(&d, sizeof d, 1, f) == 1;
+    }
+    return fclose(f) == 0 && ok;
+}
+
+/* A forged dirent maximum under a guarded dense slab: corrupt, no
+ * sanitizer report (P2 13b pattern: lower chunk 3's directory and
+ * descriptor max below the run values).  a holds runs of 64 rows over
+ * 100..500 (step 100), in chunk 3 over 100..900; chunk 3's statistics
+ * are capped at 500, so the dense plan (the selection bounds, which skip
+ * chunks inside the bounds found, and the directory prescan) ends at 500
+ * and the runs of 600..900 lie outside it.  Each query reports `corrupt`
+ * naming a, twice; unforged, the answers are generation 0's and the RLE
+ * a decodes nothing. */
+static test_result_t test_group_runs_forged(void) {
+    const char* tbl = "(table [a v] (list (as 'I32 (map (fn [j] (* 100 (+ 1 (% (div j 64) (if (== 3 (div j 65536)) 9 5))))) (til 327680))) (% (til 327680) 7)))";
+    /* the runs (the encoder's RLE), then the same values FOR_BP, read and
+     * counted per row under the range read's own guard */
+    static const int encs[] = { -1, RAY_ENC_FOR_BP };
+    for (int e = 0; e < 2; e++) {
+    aw_eval_ok("(set T 0)");                            /* the last round's table, released */
+    (void)ray_test_rm_rf(aw_root()); (void)ray_test_mkdir_p(aw_root());
+    aw_save("gf", tbl, encs[e]);
+    static const char* const qs[] = {
+        "(select {a: a c: (count a) from: T where: (> v 0) by: a})",
+        "(select {c: (count a) from: T by: a})",
+        NULL,
+    };
+    for (int i = 0; qs[i]; i++) {
+        test_result_t r = aw_reduce("gf", qs[i], -1);
+        if (r.status != TEST_PASS) return r;
+        if (!g_aw_unaligned && e == 0) TEST_ASSERT_FMT(aw_col_decoded("a") == 0, "%s: a decoded %llu", qs[i], (unsigned long long)aw_col_decoded("a"));
+    }
+    TEST_ASSERT_EQ_I(aw_vec_enc("gf", "a", 3 * RAY_ENC_VECS_PER_CHUNK + 5), e ? encs[e] : RAY_ENC_RLE);
+    char q[1024], dir[512], path[600];
+    snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/gfb/\" %s {compress: true})", tbl);
+    ray_encw_test_force(encs[e]);
+    aw_eval_ok(q);
+    ray_encw_test_force(-1);
+    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(ray_test_tmp(AW_TMP "/gfb/"), dir, sizeof dir), RAY_OK);
+    snprintf(path, sizeof path, "%s/a", dir);
+    TEST_ASSERT_TRUE(aw_forge_cap(path, 3, 500));
+    for (int i = 0; qs[i]; i++)
+        for (int rep = 0; rep < 2; rep++) {
+            aw_eval_ok("(set T (.db.splayed.get \"" AW_TMP "/gfb/\"))");
+            ray_error_clear();
+            ray_t* res = ray_eval_str(qs[i]);
+            TEST_ASSERT_FMT(res && RAY_IS_ERR(res), "%s (read %d): answered", qs[i], rep + 1);
+            TEST_ASSERT_FMT(strcmp(ray_err_code(res), "corrupt") == 0 && ray_error_msg() && strstr(ray_error_msg(), path),
+                            "%s (read %d): %s \"%s\"", qs[i], rep + 1, ray_err_code(res), ray_error_msg() ? ray_error_msg() : "");
+            ray_error_free(res);
+        }
+    }
+    PASS();
+}
+
 /* The scalar chunk route cut into tasks that are no multiple of a vector or
  * a chunk (the grain ray_pool_dispatch re-derives when it clamps to its
  * ring): every answer still equals generation 0's. */
@@ -3539,6 +3767,7 @@ static test_result_t test_unaligned_grain(void) {
 static test_result_t test_pool_clamp(void) {
     static test_result_t (*const fns[])(void) = {
         test_scalar_route_mixed, test_eq_runs_lack, test_filter_encoded_leaves, test_scalar_route_stats,
+        test_count_on_runs, test_group_count_on_runs, test_group_runs_forged,
     };
     static const uint32_t caps[] = { 7, 3 };
     for (size_t c = 0; c < sizeof caps / sizeof *caps; c++)
@@ -3661,5 +3890,8 @@ const test_entry_t aware_entries[] = {
     { "aware/scalar_route_float_inf", test_scalar_route_float_inf, aw_setup, aw_teardown },
     { "aware/unaligned_grain",     test_unaligned_grain,     aw_setup, aw_teardown },
     { "aware/pool_clamp",          test_pool_clamp,          aw_setup, aw_teardown },
+    { "aware/count_on_runs",       test_count_on_runs,       aw_setup, aw_teardown },
+    { "aware/group_count_on_runs", test_group_count_on_runs, aw_setup, aw_teardown },
+    { "aware/group_runs_forged",   test_group_runs_forged,   aw_setup, aw_teardown },
     { NULL, NULL, NULL, NULL },
 };

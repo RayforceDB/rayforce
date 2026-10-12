@@ -1514,13 +1514,13 @@ static test_result_t test_decoded_bytes_pinned(void) {
     TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
     ray_release(r);
     ray_enc_counters_t k; ray_enc_counters_get(&k);
-    TEST_ASSERT_EQ_U(k.decoded_bytes, 200000 * 2);
+    TEST_ASSERT_EQ_U(k.decoded_bytes, 0);                                    /* P3 Task 3b: counted on its views */
     TEST_ASSERT_EQ_U(k.materialized, 0);
     ray_t* t = sr_eval("T");
     ray_t* eg = ray_table_get_col_enc(t, ray_sym_intern("g", 1));
     TEST_ASSERT_NOT_NULL(eg);
     uint64_t col0 = atomic_load(&ray_enccol_of(eg)->decoded_bytes);
-    TEST_ASSERT_EQ_U(col0, 200000 * 2);                                      /* per column too */
+    TEST_ASSERT_EQ_U(col0, 0);                                               /* per column too */
     ray_enc_counters_reset();
     r = sr_eval("(select {z: (+ k v) from: T})");                           /* fused: I64 and nullable I32 registers */
     TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
@@ -1903,7 +1903,8 @@ static test_result_t test_zone_dir_skips(void) {
         free(vb);
     }
     ray_rowsel_release(s); ray_graph_free(g); ray_release(t);
-    /* the count fast path decides chunks the same way */
+    /* the count fast path decides chunks the same way; vector 0 (DELTA_BP)
+     * has no view, so it is read (P3 Task 3b counts viewed vectors only) */
     sr_eval_ok("(set T (.db.splayed.get \"" SR_G2 "\"))");
     ray_enc_counters_reset();
     dv0 = ray_enccol_test_desc_validations();
@@ -4112,9 +4113,12 @@ static test_result_t test_v2_sel_bounds_boundary(void) {
         ray_release(res);
         /* the compact fallback gathers the five vectors of the selected
          * rows of k (P3 Task 6; before, it read all 200000 I64); the bounds
-         * prescan adds the same five vectors, or nothing when the other
-         * keys already rule the plan out */
-        const uint64_t want = 5 * RAY_ENC_VEC * 8 + (qs[i].k_bounds ? 5 * RAY_ENC_VEC * 8 : 0);
+         * prescan, when it reads k (k_bounds), reads its CONST vectors on
+         * their runs (P3 Task 3b; before, it decoded the five vectors once
+         * more), all but bn's vector 0, whose null (row 7) gives it a
+         * bitmap: no run view, so it is decoded */
+        const bool nullk = strcmp(qs[i].t, "bn") == 0;
+        const uint64_t want = 5 * RAY_ENC_VEC * 8 + (qs[i].k_bounds && nullk ? RAY_ENC_VEC * 8 : 0);
         TEST_ASSERT_FMT(sr_col_decoded("k") - k0 == want, "%s: %llu bytes of k decoded, want %llu", qs[i].q,
                         (unsigned long long)(sr_col_decoded("k") - k0), (unsigned long long)want);
     }
@@ -6601,7 +6605,8 @@ static test_result_t test_ragged_fill_bounded(void) {
  * all 0 (CONST); every chunk is [0, 7], so no chunk is decided.  c (I32):
  * every third vector 5 with one null, the others 9.  The count fast path,
  * the expression gate and the fused predicate skip (or fill) the decided
- * vectors and decode only the 49 RLE vectors of a, once each; the answers
+ * vectors and decode only the 49 RLE vectors of a, once each (P3: the
+ * count fast path counts them on their runs, decoding none); the answers
  * are generation 0's. */
 #define VD_N    200000
 #define VD_RLE  49                  /* vectors v % 4 == 1 of 196 */
@@ -6647,8 +6652,9 @@ static test_result_t test_vec_stat_decide(void) {
         TEST_ASSERT_TRUE(res && !RAY_IS_ERR(res));
         sr_drop(res);
         TEST_ASSERT_FMT(ray_query_test_count_fast() - f0 == 1, "%s: not the count fast path", cq[i]);
-        TEST_ASSERT_FMT(sr_col_decoded("a") - a0 == rle_bytes, "%s: %llu bytes of a decoded, want %llu", cq[i],
-                        (unsigned long long)(sr_col_decoded("a") - a0), (unsigned long long)rle_bytes);
+        /* P3 Task 3b: the undecided RLE vectors count on their runs */
+        TEST_ASSERT_FMT(sr_col_decoded("a") - a0 == 0, "%s: %llu bytes of a decoded, want 0", cq[i],
+                        (unsigned long long)(sr_col_decoded("a") - a0));
     }
     /* the expression gate (a select over the predicate) */
     /* c: the 66 vectors of 5 (the last one 320 rows) hold a null, so they

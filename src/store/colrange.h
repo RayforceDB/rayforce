@@ -251,6 +251,21 @@ int  ray_col_src_points_i64(ray_col_src_t* s, const int64_t* rows, int64_t n, in
  * for any other row, which a cursor reads.  For a caller choosing between
  * point reads and one decode by how many of a vector's rows it needs. */
 bool ray_col_src_vec_span(ray_col_src_t* s, int64_t row, int64_t* lo, int64_t* hi);
+/* The vector holding row `row` as a run view: a single-file generation-2
+ * integer or SYM source, or a parted source's single-file encoded segment
+ * (segment-local vectors), neither materialized, whose descriptor says
+ * CONST or RLE (no other codec builds a view) and which ray_enccol_vview
+ * vouches for, without a bitmap of nulls (SYM nulls are in-band ids, run
+ * values like the others).  Under stats_guard the run values, which are
+ * the vector's values, are checked as a range read checks them: their
+ * [min, max] inside the chunk's directory statistics
+ * (ray_enccol_check_dir_range), `corrupt` naming the column otherwise.
+ * *lo / *hi are set in every case to rows of the source holding row and
+ * read alike: the vector, or a plain, materialized or stand-in segment
+ * (the source) whole.  1: the view of the vector [*lo, *hi); 0 declined
+ * (read the rows through a cursor, which decodes or reports the vector);
+ * -1 an owned *err (the descriptors', the payload's or the guard's). */
+int  ray_col_src_runview(ray_col_src_t* s, int64_t row, struct ray_enc_vview_s* out, int64_t* lo, int64_t* hi, ray_t** err);
 /* Open decision D2 (ruled per codec at the measured crossovers of a
  * batched point read against one decode): a vector's requested rows are
  * point-read when there are at most RAY_ENC_VEC / 32 of them in a FOR_BP

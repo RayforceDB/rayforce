@@ -49,6 +49,7 @@
 #include "table/domain.h"
 #include "table/dict.h"
 #include "store/enccol.h"    /* ray_enccol_adopt_domain — empty columns of encoded SYM */
+#include "store/enceval.h"   /* ray_enc_count_cmp — the count fast path on views */
 #include "mem/heap.h"
 
 #include <string.h>
@@ -7940,8 +7941,11 @@ static int count_vec_decision(const count_compare_ctx_t* ctx, uint16_t op, int64
 }
 /* Rows [start, end) of a generation-2 source: each chunk decided from the
  * directory, then each vector of an undecided chunk from its descriptor;
- * the undecided vectors are read through one task cursor, consecutive ones
- * in one walk. */
+ * an undecided vector the task holds whole is counted on its view
+ * (ray_enc_count_cmp: runs, packed residuals, codes; nothing decoded);
+ * the rest are read through one task cursor, consecutive ones in one
+ * walk.  A vector at a task edge is always read: no answer depends on
+ * where the pool cuts the rows. */
 static void count_compare_enc_task(void* vctx, uint32_t worker_id, int64_t start, int64_t end) {
     count_compare_ctx_t* ctx = (count_compare_ctx_t*)vctx;
     if (ray_scan_fail_skip(ctx->fail, start)) return;
@@ -7951,7 +7955,11 @@ static void count_compare_enc_task(void* vctx, uint32_t worker_id, int64_t start
     _Static_assert(RAY_ENC_CHUNK == 1 << 16, "count decisions read 64K-row chunks");
     const uint16_t op = count_zone_op(ctx->op);
     const bool by_vec = op && zone_dir_type(ctx->src->type);
+    /* SYM: no statistics decision (ids carry no string order, #738, and
+     * "" is decided by the null count alone), but == / != count on views */
+    const bool by_view = by_vec || (op && ctx->src->type == RAY_SYM);
     ray_col_fixed_t fixed;                                 /* the task's decode vector: no worker heap */
+    ray_enc_vview_t view;                                  /* the task's vector view: on its stack too */
     ray_col_cursor_t cur;
     ray_col_cursor_init_lent(&cur, ctx->src, &fixed);
     ray_t* err = NULL;
@@ -7960,13 +7968,29 @@ static void count_compare_enc_task(void* vctx, uint32_t worker_id, int64_t start
         if (e > end) e = end;
         int d = count_chunk_decision(ctx, b >> 16);
         if (d == 1) pc.local += e - b;
-        else if (d != 0 && !by_vec) err = ray_col_walk_cur(srcs, plain, 1, &cur, b, e, &pc, worker_id, count_piece);
+        else if (d != 0 && !by_view) err = ray_col_walk_cur(srcs, plain, 1, &cur, b, e, &pc, worker_id, count_piece);
         else if (d != 0) {
             int64_t run = -1;                              /* first row of the undecided vectors pending */
             for (int64_t vb = b, ve; vb < e && !err; vb = ve) {
                 ve = (vb / RAY_ENC_VEC + 1) * RAY_ENC_VEC;
                 if (ve > e) ve = e;
-                int vd = count_vec_decision(ctx, op, vb / RAY_ENC_VEC);
+                int vd = by_vec ? count_vec_decision(ctx, op, vb / RAY_ENC_VEC) : -1;
+                if (vd < 0 && vb % RAY_ENC_VEC == 0 &&
+                    ve - vb == (ctx->src->len - vb < RAY_ENC_VEC ? ctx->src->len - vb : RAY_ENC_VEC)) {
+                    /* the whole vector inside the task: its view may answer */
+                    int64_t n;
+                    int vr = ray_col_src_vview(ctx->src, vb / RAY_ENC_VEC, &view, &err);
+                    if (vr < 0) {                          /* the lower rows' read reports first */
+                        ray_t* werr = run >= 0 ? ray_col_walk_cur(srcs, plain, 1, &cur, run, vb, &pc, worker_id, count_piece) : NULL;
+                        if (werr) { ray_error_free(err); err = werr; }
+                        break;
+                    }
+                    if (vr > 0 && view.n == ve - vb && ray_enc_count_cmp(&view, op, ctx->rhs, &n)) {
+                        if (run >= 0) { err = ray_col_walk_cur(srcs, plain, 1, &cur, run, vb, &pc, worker_id, count_piece); run = -1; }
+                        pc.local += n;
+                        continue;
+                    }
+                }
                 if (vd < 0) { if (run < 0) run = vb; continue; }
                 if (run >= 0) { err = ray_col_walk_cur(srcs, plain, 1, &cur, run, vb, &pc, worker_id, count_piece); run = -1; }
                 if (vd == 1) pc.local += ve - vb;

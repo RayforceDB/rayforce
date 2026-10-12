@@ -319,3 +319,99 @@ bool ray_enc_vec_sum(const ray_enc_vview_t* v, int64_t* hi, uint64_t* lo, int64_
     *nn = n_nonnull;
     return true;
 }
+
+/* Counts (the count fast path): the evaluators' rules, summed instead of
+ * written out.  A view with a bitmap declines (its nulls would need the
+ * mask); SYM ids count == / != only, never ordered (#738). */
+/* FOR_BP: eval_for's threshold t = c - logical(base) over the residuals
+ * (no wrap, the view's guarantee); t outside [0, umax] decides every row.
+ * The residuals are compared as the lane kernels unpack them, never
+ * stored (ray_enccol_count_resid: measured 12-16% faster than unpacking
+ * into a lane buffer and counting it). */
+static int64_t count_for(const ray_enc_vview_t* v, uint16_t op, int64_t c) {
+    const uint64_t umax = v->width >= 64 ? ~0ull : ((1ull << v->width) - 1);
+    const __int128 t = (__int128)c - (__int128)ray_enc_logical(v->base, v->k);
+    if (t < 0 || t > (__int128)umax) return cmp_one(t < 0 ? 1 : -1, op, 0) ? v->n : 0;
+    return ray_enccol_count_resid(v, op, (uint64_t)t);
+}
+
+bool ray_enc_count_cmp(const ray_enc_vview_t* v, uint16_t op, int64_t c, int64_t* count) {
+    if (v->nullmap || is_float(v->type) || !is_cmp_op(op)) return false;
+    if (v->type == RAY_SYM && op != OP_EQ && op != OP_NE) return false;   /* never order ids (#738) */
+    int64_t n = 0;
+    switch (v->enc) {
+    case RAY_ENC_CONST:
+        n = cmp_one(ray_enc_logical(v->cbits, v->k), op, c) ? v->n : 0;
+        break;
+    case RAY_ENC_RLE: {
+        uint32_t prev = 0;
+        for (uint32_t r = 0; r < v->n_runs; r++) {
+            const uint32_t e = v->run_ends.h[r];
+            if (cmp_one(logical_of(lane(&v->run_vals, v->k.T, r), v->k), op, c)) n += e - prev;
+            prev = e;
+        }
+        break;
+    }
+    case RAY_ENC_FOR_BP: n = count_for(v, op, c); break;
+    case RAY_ENC_DICT: {
+        const uint32_t lb = lower_bound(v, c), ub = upper_bound(v, c);
+        uint32_t lo = 0, hi = 0;
+        switch (op) {
+        case OP_EQ: case OP_NE: lo = lb; hi = ub; break;
+        case OP_LT: hi = lb; break;
+        case OP_LE: hi = ub; break;
+        case OP_GT: lo = ub; hi = v->dict_n; break;
+        default:    lo = lb; hi = v->dict_n; break;        /* OP_GE */
+        }
+        const uint32_t span = hi - lo;
+        uint32_t a = 0;
+        for (int i = 0; i < v->n; i++) a += v->codes[i] - lo < span;   /* unsigned: one compare */
+        n = op == OP_NE ? v->n - (int64_t)a : (int64_t)a;
+        break;
+    }
+    default: return false;
+    }
+    *count = n;
+    return true;
+}
+
+bool ray_enc_runs(const ray_enc_vview_t* v, void* ctx, ray_enc_run_fn fn) {
+    if ((v->enc != RAY_ENC_CONST && v->enc != RAY_ENC_RLE) || is_float(v->type)) return false;
+    uint32_t prev = 0;
+    for (uint32_t r = 0; r < v->n_runs; r++) {
+        const uint32_t e = v->run_ends.h[r];
+        fn(ctx, logical_of(lane(&v->run_vals, v->k.T, r), v->k), (int32_t)prev, (int32_t)e);
+        prev = e;
+    }
+    return true;
+}
+
+#define VR_LOOP(ARR, N) do { for (int q_ = 0; q_ < (N); q_++) { if ((ARR)[q_] < lo_) lo_ = (ARR)[q_]; if ((ARR)[q_] > hi_) hi_ = (ARR)[q_]; } } while (0)
+void ray_enc_view_range(const ray_enc_vview_t* v, const ray_enc_lanes_t* u, int64_t* mn, int64_t* mx) {
+    if (v->enc == RAY_ENC_CONST || v->enc == RAY_ENC_RLE) {
+        int64_t a = INT64_MAX, b = INT64_MIN;
+        for (uint32_t q = 0; q < v->n_runs; q++) {
+            const int64_t x = logical_of(lane(&v->run_vals, v->k.T, q), v->k);
+            if (x < a) a = x;
+            if (x > b) b = x;
+        }
+        *mn = a; *mx = b;
+    } else if (v->enc == RAY_ENC_FOR_BP) {
+        /* no wrap (the view's guarantee): base + the extreme residuals are
+         * the extreme values */
+        uint64_t lo_ = UINT64_MAX, hi_ = 0;
+        switch (v->k.T) {
+        case 8:  VR_LOOP(u->b, v->n); break;
+        case 16: VR_LOOP(u->h, v->n); break;
+        case 32: VR_LOOP(u->s, v->n); break;
+        default: VR_LOOP(u->q, v->n); break;
+        }
+        const uint64_t lb = (uint64_t)ray_enc_logical(v->base, v->k);
+        *mn = (int64_t)(lb + lo_); *mx = (int64_t)(lb + hi_);
+    } else {                                                  /* DICT: entries ascending in native order */
+        uint32_t lo_ = UINT32_MAX, hi_ = 0;
+        VR_LOOP(v->codes, v->n);
+        *mn = logical_of(v->dict[lo_], v->k); *mx = logical_of(v->dict[hi_], v->k);
+    }
+}
+#undef VR_LOOP
