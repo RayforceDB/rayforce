@@ -12,10 +12,7 @@
 ;;   * left-join filled a null payload for a left row whose null key DID have a
 ;;     match on the right, instead of returning that match.
 ;;
-;; null == null is the rule the rest of the runtime already applies to key
-;; columns: `distinct` keeps exactly one null (test/rfl/null/distinct.rfl),
-;; group-by folds nulls into a single group, and `in`/atom_eq answer true for
-;; two nulls of one class -- the same type, or both numeric (collection.c).
+;; null == null, between key types a join compares at all (pinned below).
 ;; As-of join is the ONE documented exception and is unchanged -- pinned at
 ;; the bottom.
 
@@ -87,15 +84,16 @@
 (at (anti-join [k] NKPROBE NKBIG) 'p)  -- [3]
 (count (anti-join [k] NKBIG NKBIG))    -- 0
 
-;; ── Nulls of different classes are different keys, as in `in`: a symbol
-;;    null is not an integer null, a date null is not an integer null.  They
-;;    used to pair, while numeric nulls of different widths still do. ─────
-(set NKX (table [k a] (list ['a ' 'b] [1 2 3])))
-(set NKY (table [k y] (list [0Nl 1] [10 20])))
-(count (inner-join [k] NKX NKY)) -- 0
-(set NKD (table [k a] (list [2024.01.01 0Nd] [1 2])))
-(count (inner-join [k] NKD NKY)) -- 0
-(at (left-join [k] NKD NKY) 'y) -- [0Nl 0Nl]
+;; ── Two nulls pair where two values of their key types are compared.  A
+;;    join reads every key that is not a string or a guid as a raw integer,
+;;    so a timestamp 5 meets an integer 5 — and their nulls meet too: a join
+;;    must not match the values yet refuse the nulls.  Numeric nulls of
+;;    different widths pair as well. ───────────────────────────────────────
+(set NKY (table [k y] (list [0Nl 5] [10 20])))
+(set NKT (table [k a] (list (as 'TIMESTAMP [0 5]) [1 2])))
+(at (left-join [k] NKT NKY) 'y) -- [0Nl 20]
+(set NKT2 (table [k a] (list [2024.01.01D00:00:00.000000000 0Np] [1 2])))
+(at (left-join [k] NKT2 NKY) 'y) -- [0Nl 10]
 (set NKI (table [k y] (list [0Ni 7i] [30 40])))
 (set NKL2 (table [k a] (list [0Nl 7] [1 2])))
 (at (left-join [k] NKL2 NKI) 'y) -- [30 40]
