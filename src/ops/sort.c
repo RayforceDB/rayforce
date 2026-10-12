@@ -3371,18 +3371,13 @@ static ray_t* topk_gather_rows(ray_t* tbl, ray_t* idx, int64_t k) {
         int64_t name = ray_table_col_name(tbl, c);
         ray_t* dst = NULL;
         /* a generation-2 slot: the K rows' vectors, decoded by range */
-        ray_t* enc = ray_table_get_col_enc_idx(tbl, c);
-        if (enc && !(enc->attrs & RAY_ATTR_SLICE)) {
-            ray_col_src_t s;
-            ray_t* err = ray_col_src_bind(enc, &s);
-            if (!err) {
-                err = ray_col_gather_rows(&s, idx_data, k, &dst);
-                ray_col_src_release(&s);
-            }
+        ray_t* enc = ray_col_gather_slot(ray_table_get_col_enc_idx(tbl, c));
+        if (enc) {
+            ray_t* err = ray_col_gather_enc(enc, NULL, true, idx_data, k, &dst);
             if (err) { ray_release(idx); ray_release(result); return err; }
             result = ray_table_add_col(result, name, dst);
             ray_release(dst);
-            if (RAY_IS_ERR(result)) { ray_release(idx); return result; }
+            if (!result || RAY_IS_ERR(result)) { ray_release(idx); return result ? result : ray_error("oom", NULL); }
             continue;
         }
         ray_t* src = ray_table_col_idx(tbl, c);

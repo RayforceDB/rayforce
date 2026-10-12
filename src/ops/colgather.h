@@ -46,6 +46,14 @@
  * segments; a failure is the lowest-row one (the scan-fail envelope), a
  * cancelled dispatch `cancel`.  NULL with *out set, or an owned error. */
 ray_t* ray_col_gather_sel(ray_col_src_t* src, ray_t* sel, ray_t** out);
+/* The operators' entry for one table slot.  ray_col_gather_slot: the
+ * RAY_ENCCOL a row gather reads by range (slot from ray_table_get_col_enc /
+ * _idx), or NULL for none or a slice of an encoded column, which a source
+ * does not bind: the caller keeps its plain gather.  ray_col_gather_enc:
+ * that slot bound, gathered under `sel` (by_rows false) or at ids[0..n)
+ * (by_rows true), released.  NULL with *out set, or an owned error. */
+ray_t* ray_col_gather_slot(ray_t* enc);
+ray_t* ray_col_gather_enc(ray_t* enc, ray_t* sel, bool by_rows, const int64_t* ids, int64_t n, ray_t** out);
 /* Test hook: selection gathers run as several pool tasks since process
  * start (a selection of at least RAY_PARALLEL_THRESHOLD rows with a
  * pool: each task gathers its segments into the output range the

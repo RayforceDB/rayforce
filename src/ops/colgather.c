@@ -29,6 +29,7 @@
 #include "table/sym.h"
 #include "vec/str.h"
 #include "vec/vec.h"           /* ray_str_pool_reserve, ray_raw_is_null */
+#include <assert.h>
 #include <stdatomic.h>
 #include <string.h>
 
@@ -278,10 +279,10 @@ ray_t* ray_col_gather_rows(ray_col_src_t* src, const int64_t* ids, int64_t n, ra
         int64_t end = v->start + v->n;
         if (!ord) {                              /* in order: the view's ids are one copy */
             int64_t j = k + 1;
-            while (j < n && ids[j] < end) j++;
-            err = ids[j - 1] - ids[k] == j - 1 - k   /* one run, no repeats */
-                ? acc_put(&a, v, ids[k] - v->start, k, j - k)
-                : acc_put_list(&a, v, -v->start, NULL, ids + k, j - k, k);
+            bool run = true;                     /* every step +1: one run, no repeats */
+            for (; j < n && ids[j] < end; j++) run = run && ids[j] == ids[j - 1] + 1;
+            err = run ? acc_put(&a, v, ids[k] - v->start, k, j - k)
+                      : acc_put_list(&a, v, -v->start, NULL, ids + k, j - k, k);
             k = j;
             continue;
         }
@@ -337,7 +338,9 @@ static ray_t* gsel_range(const gsel_in_t* in, gather_acc_t* a, ray_col_cursor_t*
             if ((err = ray_col_cursor_at(cur, lo + in->idx[k], &v)) != NULL) break;
             int64_t end = v->start + v->n;
             uint32_t j = k + 1;
-            while (j < k1 && lo + in->idx[j] < end) j++;
+            /* a rowsel's indices ascend inside a segment (engine-built),
+             * so a view's run never starts before the view */
+            while (j < k1 && lo + in->idx[j] < end) { assert(in->idx[j] > in->idx[j - 1]); j++; }
             err = acc_put_list(a, v, lo - v->start, in->idx + k, NULL, j - k, pos);
             pos += j - k;
             k = j;
@@ -382,7 +385,8 @@ static ray_t* gsel_merge_pools(gather_acc_t* acc, int64_t ntask, const int64_t* 
     for (int64_t t = 0; t < ntask; t++)
         if (acc[t].pool) { total += acc[t].pool->len; users++; if (first < 0) first = t; }
     if (!users) return NULL;
-    if (users == 1 && first == 0) { a->pool = acc[0].pool; acc[0].pool = NULL; return NULL; }
+    /* one pool: adopted as is (nothing before it, nothing to move) */
+    if (users == 1) { a->pool = acc[first].pool; acc[first].pool = NULL; return NULL; }
     int64_t at;
     ray_err_t pe = ray_str_pool_reserve(&a->pool, (size_t)total, &at);
     if (pe == RAY_ERR_RANGE)
@@ -473,4 +477,18 @@ ray_t* ray_col_gather_sel(ray_col_src_t* src, ray_t* sel, ray_t** out) {
     ray_free_raw(acc);
     if (err) { acc_abort(&a); return err; }
     return acc_finish(&a, src, out);
+}
+
+ray_t* ray_col_gather_slot(ray_t* enc) {
+    return (enc && enc->type == RAY_ENCCOL && !(enc->attrs & RAY_ATTR_SLICE)) ? enc : NULL;
+}
+
+ray_t* ray_col_gather_enc(ray_t* enc, ray_t* sel, bool by_rows, const int64_t* ids, int64_t n, ray_t** out) {
+    *out = NULL;
+    ray_col_src_t s;
+    ray_t* err = ray_col_src_bind(enc, &s);
+    if (err) return err;
+    err = by_rows ? ray_col_gather_rows(&s, ids, n, out) : ray_col_gather_sel(&s, sel, out);
+    ray_col_src_release(&s);
+    return err;
 }

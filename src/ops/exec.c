@@ -2269,6 +2269,8 @@ static int collect_scan_syms(ray_graph_t* g, const uint32_t* roots, int nroots,
  * the test over every row, which reads the column whole.  Generation 0
  * keeps the full-width path (0: not admitted). */
 static ray_t* scan_table_of(ray_graph_t* g, ray_op_ext_t* ext);
+static _Atomic(uint64_t) g_refine_in;
+uint64_t ray_exec_test_refine_in(void) { return atomic_load(&g_refine_in); }
 static int refine_in_keep(ray_graph_t* g, ray_op_t* pred, ray_t* tbl, int64_t* keep) {
     if (!pred || (pred->opcode != OP_IN && pred->opcode != OP_NOT_IN)) return 0;
     ray_op_t* c0 = op_child(g, pred, 0);
@@ -2281,6 +2283,7 @@ static int refine_in_keep(ray_graph_t* g, ray_op_t* pred, ray_t* tbl, int64_t* k
     int8_t bt = RAY_IS_PARTED(m.type) ? (int8_t)RAY_PARTED_BASETYPE(m.type) : m.type;
     if (bt == RAY_SYM || bt == RAY_LIST) return 0;
     keep[0] = x->sym;
+    atomic_fetch_add(&g_refine_in, 1);
     return 1;
 }
 

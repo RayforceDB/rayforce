@@ -1175,6 +1175,9 @@ void ray_expr_test_parted_all_segments(bool on);
  * (zone or directory) without reading their rows.  Tests. */
 int64_t ray_expr_test_zone_skips(void);
 
+/* exec.c test hook: membership tests the sparse filter refinement took
+ * (refine_in_keep) since process start. */
+uint64_t ray_exec_test_refine_in(void);
 /* query.c test hook: counts the (count (select ... where <compare>)) fast
  * path answered since process start. */
 uint64_t ray_query_test_count_fast(void);

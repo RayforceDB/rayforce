@@ -9428,17 +9428,12 @@ static ray_t* agg_build_compact(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
          * copy (agg_seg_flat_run), so a segment-streamed table never reaches
          * a compact gather. */
         ray_t* gcol = NULL;
-        ray_t* enc = ray_table_get_col_enc(tbl, want[i]);
-        if (enc && !(enc->attrs & RAY_ATTR_SLICE)) {
+        ray_t* enc = ray_col_gather_slot(ray_table_get_col_enc(tbl, want[i]));
+        if (enc) {
             /* generation 2: the survivors' vectors, decoded by range (idx
              * ascending); the gather's result is as fresh as gather_by_idx's */
             assert(!ray_enccol_is_parted(enc));
-            ray_col_src_t s;
-            ray_t* err = ray_col_src_bind(enc, &s);
-            if (!err) {
-                err = ray_col_gather_rows(&s, idx, n_sel, &gcol);
-                ray_col_src_release(&s);
-            }
+            ray_t* err = ray_col_gather_enc(enc, NULL, true, idx, n_sel, &gcol);
             if (err) { ray_release(compact); scratch_free(want_hdr); return err; }
             compact = ray_table_add_col(compact, want[i], gcol);
             ray_release(gcol);

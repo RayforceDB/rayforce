@@ -43,6 +43,7 @@
 #include "store/splay.h"
 #include "store/part.h"
 #include "ops/colgather.h"
+#include "core/pool.h"      /* ray_cancel */
 #include "vec/str.h"
 #include <math.h>
 #include <stdio.h>
@@ -1808,6 +1809,29 @@ static test_result_t test_gather_rows_sorted(void) {
     TEST_ASSERT_NOT_NULL(venc);
     TEST_ASSERT_EQ_U(atomic_load(&ray_enccol_of(ray_enccol_seg(venc, 0))->decoded_bytes), (1024 + 1024 + 952) * 8);
     TEST_ASSERT_EQ_U(atomic_load(&ray_enccol_of(ray_enccol_seg(venc, 1))->decoded_bytes), (1024 + 952) * 8);
+    /* Task 6 fix round 2: sorted ids whose repeats balance a gap ({0,0,2}:
+     * its endpoints span two steps as a run would), all repeats, and a
+     * repeat inside a run are value lists, never one copy */
+    static const struct { int64_t ids[6]; int n; const char* lit; } rs[] = {
+        { { 0, 0, 2 }, 3, "[0 0 2]" },
+        { { 1, 1, 1 }, 3, "[1 1 1]" },
+        { { 3, 4, 4, 5, 7 }, 5, "[3 4 4 5 7]" },
+        { { 3000, 3000, 3002 }, 3, "[3000 3000 3002]" },
+    };
+    for (size_t i = 0; i < sizeof rs / sizeof rs[0]; i++)
+        for (int c = 0; c < 3; c++) {
+            ray_col_src_t s;
+            TEST_ASSERT_NULL(ray_table_col_src(t, ray_sym_intern(cols[c], 1), &s));
+            ray_t* got = NULL;
+            TEST_ASSERT_NULL(ray_col_gather_rows(&s, rs[i].ids, rs[i].n, &got));
+            ray_col_src_release(&s);
+            char q[300];
+            snprintf(q, sizeof q, "(at (at (.db.parted.get \"" AW_TMP "/gr0\" 't) '%s) %s)", cols[c], rs[i].lit);
+            ray_t* ref = aw_eval(q);
+            TEST_ASSERT_FMT(ref && !RAY_IS_ERR(ref), "%s: %s", q, ray_error_msg());
+            AW_GATHER_REF(got, ref, false, rs[i].lit);
+            ray_release(ref); ray_release(got);
+        }
     ray_release(t);
     PASS();
 }
@@ -2009,6 +2033,9 @@ static test_result_t test_gather_operators(void) {
     AW_CSV_SAME(t0, t2, "(select {k: k t: t from: T where: (== g 3) take: 7})", 0);
     AW_CSV_SAME(t0, t2, "(select {k: k v: v s: s t: t from: T where: (> v 100) desc: k take: 5})", 1);
     AW_CSV_SAME(t0, t2, "(select {k: k s: s t: t from: T where: (< v 50) take: -6})", 0);
+    /* no row passes: the empty table with every column's type */
+    AW_CSV_SAME(t0, t2, "(select {from: T where: (< k 0)})", 0);
+    AW_CSV_SAME(t0, t2, "(select {k: k s: s t: t from: T where: (and (< k 100) (> v 1000))})", 0);
     PASS();
 }
 
@@ -2254,6 +2281,65 @@ static ray_t* aw_refine_in_run(ray_t* t, const char* col, bool neg, ray_t* set, 
     return r;
 }
 
+/* Fix round 2: the parallel gather's other exits.  i holds one null, at
+ * row 250001 (a late task's segment only): HAS_NULLS is set and the value
+ * is null, equal to generation 0's `at`.  Under ray_cancel() the pool
+ * skips the tasks: both the I64 and the pooled STR gather answer `cancel`,
+ * with no output and nothing left allocated. */
+static test_result_t test_gather_sel_late_null_cancel(void) {
+    aw_save("gl", "(table [i t u] (list (map (fn [j] (if (== j 250001) 0Nl j)) (til 300000)) "
+                  "(map (fn [j] (format \"a pooled string of row %\" j)) (til 300000)) "
+                  "(map (fn [j] (if (> j 295000) (format \"a late pooled string %\" j) \"s\")) (til 300000))))", -1);
+    ray_t* t0 = aw_load("gl", 0); ray_t* t2 = aw_load("gl", 2);
+    TEST_ASSERT_TRUE(t0 && t2);
+    ray_t* pred = ray_vec_new(RAY_BOOL, 300000); pred->len = 300000;
+    for (int64_t r = 0; r < 300000; r++) ((uint8_t*)ray_data(pred))[r] = r % 3 != 1;
+    ray_t* sel = ray_rowsel_from_pred(pred);
+    TEST_ASSERT_NOT_NULL(sel);
+    ray_col_src_t s;
+    TEST_ASSERT_NULL(ray_table_col_src(t2, ray_sym_intern("i", 1), &s));
+    uint64_t p0 = ray_col_test_gather_par();
+    ray_t* got = NULL;
+    TEST_ASSERT_NULL(ray_col_gather_sel(&s, sel, &got));
+    TEST_ASSERT_EQ_U(ray_col_test_gather_par(), p0 + 1);
+    ray_col_src_release(&s);
+    TEST_ASSERT_TRUE(got->attrs & RAY_ATTR_HAS_NULLS);
+    int64_t at = 0;
+    for (int64_t r = 0; r < 250001; r++) at += r % 3 != 1;
+    TEST_ASSERT_TRUE(ray_vec_is_null(got, at));
+    ray_t* ref = aw_eval("(at (at (.db.splayed.get \"" AW_TMP "/gl0/\") 'i) (where (!= 1 (% (til 300000) 3))))");
+    TEST_ASSERT_TRUE(ref && !RAY_IS_ERR(ref));
+    AW_GATHER_REF(got, ref, true, "i");
+    ray_release(ref); ray_release(got);
+    /* u is pooled only in the last task's rows (295001-299999): its pool, adopted */
+    TEST_ASSERT_NULL(ray_table_col_src(t2, ray_sym_intern("u", 1), &s));
+    TEST_ASSERT_NULL(ray_col_gather_sel(&s, sel, &got));
+    ray_col_src_release(&s);
+    ref = aw_eval("(at (at (.db.splayed.get \"" AW_TMP "/gl0/\") 'u) (where (!= 1 (% (til 300000) 3))))");
+    TEST_ASSERT_TRUE(ref && !RAY_IS_ERR(ref));
+    AW_GATHER_REF(got, ref, true, "u");
+    ray_release(ref); ray_release(got);
+    static const char* cols[] = { "i", "t" };
+    for (int c = 0; c < 2; c++) {
+        TEST_ASSERT_NULL(ray_table_col_src(t2, ray_sym_intern(cols[c], 1), &s));
+        ray_mem_stats_t m0, m1; ray_mem_stats(&m0);
+        p0 = ray_col_test_gather_par();
+        ray_t* g = NULL;
+        ray_cancel();
+        ray_t* e = ray_col_gather_sel(&s, sel, &g);
+        ray_cancel_reset();
+        TEST_ASSERT_EQ_U(ray_col_test_gather_par(), p0 + 1);
+        TEST_ASSERT_FMT(e && RAY_IS_ERR(e) && !g, "%s: not an error", cols[c]);
+        TEST_ASSERT_STR_EQ(ray_err_code(e), "cancel");
+        ray_error_free(e);
+        ray_mem_stats(&m1);
+        TEST_ASSERT_EQ_U(m1.bytes_allocated, m0.bytes_allocated);
+        ray_col_src_release(&s);
+    }
+    ray_rowsel_release(sel); ray_release(pred); ray_release(t0); ray_release(t2);
+    PASS();
+}
+
 /* Fix round 1 (q41's TraficSourceID): a later conjunct `in` / `not in`
  * over a selective first one is answered by the refinement on the
  * survivors' gathered values, so the column is not materialized; nullable
@@ -2274,15 +2360,61 @@ static test_result_t test_refine_in(void) {
     for (int i = 0; i < 4; i++) {
         ray_t* set = aw_eval(cs[i].set);
         TEST_ASSERT_TRUE(set && !RAY_IS_ERR(set));
-        uint64_t m0 = 0, m2 = 0;
+        uint64_t m0 = 0, m2 = 0, h0 = ray_exec_test_refine_in();
         ray_t* r0 = aw_refine_in_run(t0, cs[i].col, cs[i].neg, set, &m0);
+        TEST_ASSERT_EQ_U(ray_exec_test_refine_in(), h0);                 /* generation 0 keeps its route */
         ray_t* r2 = aw_refine_in_run(t2, cs[i].col, cs[i].neg, set, &m2);
+        TEST_ASSERT_EQ_U(ray_exec_test_refine_in(), h0 + 1);             /* the refinement answered it */
         TEST_ASSERT_TRUE(r0 && r2 && !RAY_IS_ERR(r0) && !RAY_IS_ERR(r2) && r0->type == RAY_TABLE);
         TEST_ASSERT_FMT(m2 == 0, "%s %d: %llu materializations", cs[i].col, cs[i].neg, (unsigned long long)m2);
         TEST_ASSERT_TRUE(ray_table_nrows(r0) > 0 && ray_table_nrows(r0) < 3000);
         ray_t* fa = ray_fmt(r0, 0); ray_t* fb = ray_fmt(r2, 0);
         TEST_ASSERT_FMT(ray_str_len(fa) == ray_str_len(fb) && memcmp(ray_str_ptr(fa), ray_str_ptr(fb), ray_str_len(fa)) == 0,
                         "%s %d differs", cs[i].col, cs[i].neg);
+        ray_release(fa); ray_release(fb); ray_release(r0); ray_release(r2); ray_release(set);
+    }
+    /* SYM `in` is not admitted (exec_in does not translate the file
+     * domain): as a later conjunct it keeps the full-width path, which
+     * reads s whole (1 materialization, pinned: a SYM refinement would need
+     * the constant translated into the column's domain first, Task 4's
+     * ray_col_src_sym_find); as a first conjunct Task 4's fused leaf
+     * answers it on ids (sym_membership) */
+    {
+        ray_t* set = aw_eval("['a 'c 'zz]");
+        TEST_ASSERT_TRUE(set && !RAY_IS_ERR(set));
+        uint64_t m0 = 0, m2 = 0, h0 = ray_exec_test_refine_in();
+        ray_t* r0 = aw_refine_in_run(t0, "s", false, set, &m0);
+        ray_t* r2 = aw_refine_in_run(t2, "s", false, set, &m2);
+        TEST_ASSERT_EQ_U(ray_exec_test_refine_in(), h0);
+        TEST_ASSERT_TRUE(r0 && r2 && !RAY_IS_ERR(r0) && !RAY_IS_ERR(r2));
+        TEST_ASSERT_TRUE(ray_table_nrows(r0) > 0);
+        ray_t* fa = ray_fmt(r0, 0); ray_t* fb = ray_fmt(r2, 0);
+        TEST_ASSERT_TRUE(ray_str_len(fa) == ray_str_len(fb) && memcmp(ray_str_ptr(fa), ray_str_ptr(fb), ray_str_len(fa)) == 0);
+        ray_release(fa); ray_release(fb); ray_release(r0); ray_release(r2); ray_release(set);
+        AW_SAME("ri", "(select {c: (count k) by: g from: T where: (and (== g 3) (in s ['a 'c 'zz]))})", 1);
+    }
+    ray_release(t0); ray_release(t2);
+    /* F64 members: NaN nulls, -0.0 against +0.0, through exec_in on the
+     * survivors, equal to generation 0 */
+    aw_save("rf", "(table [k f] (list (til 200000) (map (fn [j] (if (== 0 (% j 10)) 0Nf (if (== 0 (% j 7)) -0.0 (* 0.5 (% j 9))))) (til 200000))))", -1);
+    t0 = aw_load("rf", 0); t2 = aw_load("rf", 2);
+    TEST_ASSERT_TRUE(t0 && t2);
+    static const struct { bool neg; const char* set; } fs[] = {
+        { false, "[0.0 2.5 0Nf]" }, { true, "[0.0 2.5]" }, { false, "[-0.0 4.0]" }, { true, "[0Nf 1.0]" },
+    };
+    for (int i = 0; i < 4; i++) {
+        ray_t* set = aw_eval(fs[i].set);
+        TEST_ASSERT_TRUE(set && !RAY_IS_ERR(set) && set->type == RAY_F64);
+        uint64_t m0 = 0, m2 = 0, h0 = ray_exec_test_refine_in();
+        ray_t* r0 = aw_refine_in_run(t0, "f", fs[i].neg, set, &m0);
+        ray_t* r2 = aw_refine_in_run(t2, "f", fs[i].neg, set, &m2);
+        TEST_ASSERT_EQ_U(ray_exec_test_refine_in(), h0 + 1);
+        TEST_ASSERT_TRUE(r0 && r2 && !RAY_IS_ERR(r0) && !RAY_IS_ERR(r2));
+        TEST_ASSERT_FMT(m2 == 0, "f %s: %llu materializations", fs[i].set, (unsigned long long)m2);
+        TEST_ASSERT_TRUE(ray_table_nrows(r0) > 0);
+        ray_t* fa = ray_fmt(r0, 0); ray_t* fb = ray_fmt(r2, 0);
+        TEST_ASSERT_FMT(ray_str_len(fa) == ray_str_len(fb) && memcmp(ray_str_ptr(fa), ray_str_ptr(fb), ray_str_len(fa)) == 0,
+                        "f %s differs", fs[i].set);
         ray_release(fa); ray_release(fb); ray_release(r0); ray_release(r2); ray_release(set);
     }
     ray_release(t0); ray_release(t2);
@@ -2407,6 +2539,32 @@ static test_result_t test_gather_filter_ops(void) {
         TEST_ASSERT_FMT(same, "gen %d: %.*s", gen, (int)ray_str_len(fg), ray_str_ptr(fg));
         ray_release(fg); ray_release(fw); ray_release(got); ray_release(want);
     }
+    /* no row passes the operators: empty tables equal to generation 0's */
+    for (int big = 0; big < 2; big++) {
+        ray_t* tz[2];
+        for (int gen = 0; gen < 2; gen++) {
+            tz[gen] = aw_load(big ? "fo" : "fs", gen ? 2 : 0);
+            TEST_ASSERT_NOT_NULL(tz[gen]);
+        }
+        int64_t n = ray_table_nrows(tz[0]);
+        ray_t* zp = ray_vec_new(RAY_BOOL, n); zp->len = n;
+        memset(ray_data(zp), 0, (size_t)n);
+        for (int op = 0; op < 2; op++) {
+            ray_t* res[2];
+            for (int gen = 0; gen < 2; gen++) {
+                ray_enc_counters_reset();
+                res[gen] = op ? exec_filter_head(tz[gen], zp, 5) : exec_filter(NULL, NULL, tz[gen], zp);
+                TEST_ASSERT_TRUE(res[gen] && !RAY_IS_ERR(res[gen]) && ray_table_nrows(res[gen]) == 0);
+                ray_enc_counters_t k; ray_enc_counters_get(&k);
+                if (gen) TEST_ASSERT_EQ_U(k.materialized, 0);
+            }
+            r = aw_csv_eq("no row passes", op, res[0], res[1]);
+            if (r.status == TEST_PASS) r = aw_widths_same("no row passes", res[0], res[1]);
+            ray_release(res[0]); ray_release(res[1]);
+            if (r.status != TEST_PASS) return r;
+        }
+        ray_release(zp); ray_release(tz[0]); ray_release(tz[1]);
+    }
     PASS();
 }
 
@@ -2451,5 +2609,6 @@ const test_entry_t aware_entries[] = {
     { "aware/gather_sel_parallel", test_gather_sel_parallel, aw_setup, aw_teardown },
     { "aware/gather_sel_task_error", test_gather_sel_task_error, aw_setup, aw_teardown },
     { "aware/refine_in",         test_refine_in,         aw_setup, aw_teardown },
+    { "aware/gather_sel_late_null_cancel", test_gather_sel_late_null_cancel, aw_setup, aw_teardown },
     { NULL, NULL, NULL, NULL },
 };
