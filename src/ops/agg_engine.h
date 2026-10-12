@@ -128,6 +128,9 @@ void agg_route_reason(agg_v2_reason_t reason);
  * small hash (their allocation-failure fallback) in place of the table
  * stack and the radix scatter.  Disarmed by ray_test_hooks_off. */
 void agg_test_force_smallhash(bool on);
+/* Test hook: dense plans over a selection that the row probe proved
+ * impossible (agg_sel_bounds_impossible) since process start. */
+uint64_t ray_agg_test_sel_probe_hits(void);
 
 /* True iff the v2 engine fully supports this group node over this table.
  * Conservative: any uncertainty → false → caller uses the existing engine. */

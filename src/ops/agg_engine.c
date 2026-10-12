@@ -2121,6 +2121,8 @@ static int agg_sel_bounds_split(const agg_sel_bounds_ctx_t* bc, int64_t* mins, i
  * True: impossible.  False: undecided (a read error or OOM included; the
  * exact scan reports it). */
 #define AGG_SEL_PROBE_ROWS (RAY_MORSEL_ELEMS / 16)
+static _Atomic(uint64_t) g_sel_probe_hits;   /* test hook: plans the probe proved impossible */
+uint64_t ray_agg_test_sel_probe_hits(void) { return atomic_load_explicit(&g_sel_probe_hits, memory_order_relaxed); }
 static bool agg_sel_bounds_impossible(const agg_sel_bounds_ctx_t* bc) {
     const agg_rr_t* krr = bc->krr;
     const uint32_t nk = bc->n_keys;
@@ -2209,7 +2211,11 @@ static bool agg_dense_plan_sel(ray_t** key_cols, const agg_rr_t* krr, uint32_t n
     /* staged: the directory prunes what it can (every key, or the keys it
      * serves after the others, agg_sel_bounds_split); else every selected
      * row is scanned */
-    if (krr->staged && agg_sel_bounds_impossible(&bc)) { scratch_free(pre_hdr); return false; }
+    if (krr->staged && agg_sel_bounds_impossible(&bc)) {
+        atomic_fetch_add_explicit(&g_sel_probe_hits, 1, memory_order_relaxed);
+        scratch_free(pre_hdr);
+        return false;
+    }
     int split = krr->staged ? agg_sel_bounds_split(&bc, mins, maxs) : 0;
     if (split == 2) { scratch_free(pre_hdr); return false; }     /* dense is impossible */
     if (split == 0 && (!krr->staged || !agg_sel_bounds_dir(&bc, mins, maxs)) &&
@@ -9179,8 +9185,11 @@ static ray_t* agg_firstn_kr_open(const agg_rr_t* rr, agg_curs_t* cs, uint32_t k,
     }
     const ray_col_range_t* v;
     if ((err = ray_col_cursor_at(&cs->cur[k], b, &v)) != NULL) return err;
-    if (v->start != b || v->start + v->n < b + len) return ray_error("nyi", "first-n: a segment across views");
-    kr->data = v->data; kr->attrs = v->attrs;
+    kr->data = NULL;                   /* the segment across views (a published materialization
+                                        * read from an earlier row): the caller walks it */
+    if (v->start > b || v->start + v->n < b + len) return NULL;
+    kr->data = (const char*)v->data + (size_t)(b - v->start) * ray_sym_elem_size(v->type, v->attrs);
+    kr->attrs = v->attrs;
     return NULL;
 }
 
@@ -9193,6 +9202,9 @@ static ray_t* agg_firstn_kr_open(const agg_rr_t* rr, agg_curs_t* cs, uint32_t k,
  * its whole tuple is in the set (agg_firstn_probe), as in the plain pass;
  * matches go out in row order.  1 served, 0 no key is a run view (the
  * caller walks the segment), -1 with *err. */
+/* One or two keys (the driving key and the other one), their views on
+ * the task's stack (vv[AGG_CURS_LENT]). */
+_Static_assert(AGG_CURS_LENT >= 2, "agg_firstn_runs keeps two run views");
 static int agg_firstn_runs(agg_firstn_piece_t* t, agg_curs_t* cs, ray_enc_vview_t* vv, int64_t seg, int64_t len,
                            ray_t** err) {
     const agg_firstn_ctx_t* c = t->c;
@@ -9232,6 +9244,7 @@ static int agg_firstn_runs(agg_firstn_piece_t* t, agg_curs_t* cs, ray_enc_vview_
         }
         if (!o_open) {
             if ((*err = agg_firstn_kr_open(rr, cs, ok, seg, len, &vv[1], &o)) != NULL) return -1;
+            if (!o.runs && !o.data) return 0;   /* nothing emitted yet: the caller walks the segment */
             o_open = true;
         }
         /* the run's rows, in order: every row, or the selected ones */
@@ -9269,9 +9282,9 @@ static int agg_firstn_runs(agg_firstn_piece_t* t, agg_curs_t* cs, ray_enc_vview_
 }
 
 /* agg_firstn_task over staged keys: its segments walked through one cursor
- * set (ray_col_walk_cur), a range error noted keyed by its first row.  Up
- * to AGG_CURS_LENT keys, a segment whose keys are all run views is served
- * on runs (agg_firstn_runs, the views on the task's stack). */
+ * set (ray_col_walk_cur), a range error noted keyed by its first row.  With
+ * one or two keys, a segment driven by a key on runs is served on runs
+ * (agg_firstn_runs, the views on the task's stack). */
 static void agg_firstn_task_staged(agg_firstn_ctx_t* c, uint32_t t) {
     int64_t s0 = (int64_t)c->n_segs * t / c->tasks;
     int64_t s1 = (int64_t)c->n_segs * (t + 1) / c->tasks;
@@ -9297,7 +9310,7 @@ static void agg_firstn_task_staged(agg_firstn_ctx_t* c, uint32_t t) {
             pc.j = mix ? (int64_t)of[seg] : 0;
             pc.j_end = mix ? (int64_t)of[seg + 1] : 0;
             ray_t* err = NULL;
-            int ru = rr->n_keys <= AGG_CURS_LENT ? agg_firstn_runs(&pc, &cs, vv, seg, len, &err) : 0;
+            int ru = rr->n_keys <= 2 ? agg_firstn_runs(&pc, &cs, vv, seg, len, &err) : 0;
             if (ru < 0) { ray_scan_fail_note(rr->fail, key, err); break; }
             if (ru > 0) continue;
             err = ray_col_walk_cur(rr->srcs, rr->plain, rr->n_src, cs.cur, b, b + len, &pc, 0, agg_firstn_piece);

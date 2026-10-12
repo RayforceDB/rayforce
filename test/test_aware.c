@@ -2679,6 +2679,42 @@ static void aw_firstn_parted_tables(void) {
 }
 static test_result_t test_firstn_parted(void) {
     aw_firstn_parted_tables();
+    /* a mixed root: partition 1 generation 0, partition 2 generation 2 */
+    for (int p = 0; p < 2; p++) {
+        char q[900];
+        snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/fpm/2024.01.0%d/t/\" "
+                 "(table [h s v] (list (%% (* (+ (til 150000) %d) 7919) 100003) "
+                 "(as 'SYMBOL (map (fn [j] (format \"p%%\" (%% (+ j %d) 97))) (til 150000))) (+ (til 150000) %d))) "
+                 "\"" AW_TMP "/fpm/.sym\" {compress: %s})",
+                 p + 1, p * 150000, p * 150000, p * 150000, p ? "true" : "false");
+        aw_eval_ok(q);
+    }
+    /* the mixed root, and the declines over a segment-streamed table (too
+     * few groups: 97 symbols for a take of 200; heavy: 3 of 97 groups
+     * hold a share above 1/64), each answered as generation 0 */
+    static const char* const ds[] = {
+        "(select {c: (count h) from: T by: {h: h s: s} take: 10})",
+        "(select {c: (count h) s: (sum v) from: T by: s take: 200})",
+        "(select {c: (count h) s: (sum v) from: T by: s take: 3})",
+        NULL,
+    };
+    static const char* const roots[] = { "fpm", "fp2", "fp2" };
+    for (int i = 0; ds[i]; i++) {
+        ray_t* out[2];
+        for (int gen = 0; gen < 2; gen++) {
+            char b[256];
+            snprintf(b, sizeof b, "(set T (.db.parted.get \"" AW_TMP "/%s\" 't))", gen ? roots[i] : "fp0");
+            aw_eval_ok(b);
+            ray_enc_counters_reset();
+            out[gen] = aw_eval(ds[i]);
+            TEST_ASSERT_FMT(out[gen] && !RAY_IS_ERR(out[gen]), "%s gen %d: %s", ds[i], gen, ray_error_msg());
+            if (gen) { ray_enc_counters_t k; ray_enc_counters_get(&k); TEST_ASSERT_EQ_U(k.materialized, 0); }
+        }
+        ray_t* fa = ray_fmt(out[0], 0); ray_t* fb = ray_fmt(out[1], 0);
+        TEST_ASSERT_FMT(ray_str_len(fa) == ray_str_len(fb) && memcmp(ray_str_ptr(fa), ray_str_ptr(fb), ray_str_len(fa)) == 0,
+                        "%s (%s) differs", ds[i], roots[i]);
+        ray_release(fa); ray_release(fb); ray_release(out[0]); ray_release(out[1]);
+    }
     static const char* const qs[] = {
         "(select {c: (count h) from: T by: {h: h s: s} take: 10})",
         "(select {c: (count h) s: (sum v) from: T by: h take: 25})",
@@ -2894,8 +2930,8 @@ static test_result_t test_firstn_runs(void) {
  * by the table-stack sampler and by the dense plan's bounds: neither key
  * decodes a vector. */
 static test_result_t test_sparse_walk_points(void) {
-    aw_save("sw", "(table [a b v] (list (as 'I32 (% (* (div (til 3000000) 7) 7919) 1000)) (as 'I32 (% (div (til 3000000) 50000) 7)) "
-                  "(til 3000000)))", -1);
+    aw_save("sw", "(table [a b v w] (list (as 'I32 (% (* (div (til 3000000) 7) 7919) 1000)) (as 'I32 (% (div (til 3000000) 50000) 7)) "
+                  "(til 3000000) (% (* (til 3000000) 7919) 3000017)))", -1);
     for (int64_t v = 0; v < 2900; v += 397) {
         int ea = aw_vec_enc("sw", "a", v), eb = aw_vec_enc("sw", "b", v);
         TEST_ASSERT_FMT(ea == RAY_ENC_RLE || ea == RAY_ENC_FOR_BP, "a vector %lld: %d", (long long)v, ea);
@@ -2911,6 +2947,17 @@ static test_result_t test_sparse_walk_points(void) {
         TEST_ASSERT_FMT(aw_col_decoded("a") == 0 && aw_col_decoded("b") == 0, "%s: a %llu b %llu", qs[i],
                         (unsigned long long)aw_col_decoded("a"), (unsigned long long)aw_col_decoded("b"));
     }
+    /* the dense plan's row probe (agg_sel_bounds_impossible): by {a w},
+     * w spread (FOR_BP, point-read), so 64 probed rows already span more
+     * slots than the 75000 selected rows; the plan is declined before any
+     * bounds scan, the answer is generation 0's, and the plan of {a b}
+     * (it fits) is not */
+    uint64_t p0 = ray_agg_test_sel_probe_hits();
+    AW_SAME("sw", "(select {n: (count a) from: T where: (== 0 (% v 40)) by: {a: a w: w} desc: n take: 5})", 0);
+    TEST_ASSERT_FMT(ray_agg_test_sel_probe_hits() == p0 + 1, "probe hits %llu", (unsigned long long)(ray_agg_test_sel_probe_hits() - p0));
+    p0 = ray_agg_test_sel_probe_hits();
+    AW_SAME("sw", qs[0], 0);
+    TEST_ASSERT_EQ_U(ray_agg_test_sel_probe_hits(), p0);
     PASS();
 }
 

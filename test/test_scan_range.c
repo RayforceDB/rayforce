@@ -4196,6 +4196,94 @@ static test_result_t test_v2_forged_consumers(void) {
     PASS();
 }
 
+/* Chunk c's directory maximum and every vector descriptor's statistics
+ * above x capped at x (a minimum above x lowered to x too, so a CONST
+ * vector's [v, v] becomes [x, x]): the statistics still nest and
+ * validate, and the values above x lie outside them.  False on an I/O
+ * error. */
+static bool sr_forge_cap(const char* path, int64_t c, int64_t x) {
+    FILE* f = fopen(path, "r+b"); if (!f) return false;
+    ray_enc_dirent_t de;
+    long doff = (long)(RAY_ENC_DIR_OFF + (uint64_t)c * sizeof de);
+    bool ok = fseek(f, doff, SEEK_SET) == 0 && fread(&de, sizeof de, 1, f) == 1 && !(de.flags & RAY_ENC_STAT_ABSENT);
+    if (ok) {
+        de.max = x;
+        if (de.min > x) de.min = x;
+        ok = fseek(f, doff, SEEK_SET) == 0 && fwrite(&de, sizeof de, 1, f) == 1;
+    }
+    for (int j = 0; ok && j < RAY_ENC_VECS_PER_CHUNK; j++) {
+        ray_enc_desc_t d;
+        long off = (long)(de.offset + (uint64_t)j * sizeof d);
+        ok = fseek(f, off, SEEK_SET) == 0 && fread(&d, sizeof d, 1, f) == 1;
+        if (!ok || (d.encoding == 0 && d.payload_bytes == 0)) break;     /* past the last vector */
+        if (d.flags & RAY_ENC_STAT_ABSENT || d.max <= x) continue;
+        d.max = x;
+        if (d.min > x) d.min = x;
+        ok = fseek(f, off, SEEK_SET) == 0 && fwrite(&d, sizeof d, 1, f) == 1;
+    }
+    return fclose(f) == 0 && ok;
+}
+
+/* P3 Task 6b fix round 2: the run arm of the batched point read
+ * (points_runs) under forged statistics.  k is an RLE key (runs of 5) and
+ * a CONST one (one value per vector); chunk 3 holds values up to 5000 /
+ * 4000 + 63, its statistics capped at 999.  A filter keeping every 97th
+ * row reads k at about 10 rows per vector: point reads in the selection
+ * bounds and the compact gather.  Each read reports `corrupt` naming k,
+ * twice, with no sanitizer report; unpatched, the answers are generation
+ * 0's and k decodes nothing. */
+static test_result_t test_v2_forged_run_points(void) {
+    sr_eval_ok("(set ja (til 196608))");
+    sr_eval_ok("(set jb (+ 196608 (til 65536)))");
+    static const struct { const char* name; const char* k; int enc; } cs[] = {
+        { "fr", "(concat (% (* (div ja 5) 7) 1000) (% (* (div jb 5) 7) 5001))", RAY_ENC_RLE },
+        { "fk", "(concat (% (div ja 1024) 1000) (+ 4000 (% (div jb 1024) 64)))", -1 },
+    };
+    static const char* const qs[] = {
+        "(select {c: (count v) from: T where: (== 0 (% v 97)) by: k})",
+        "(select {c: (count v) s: (sum v) from: T where: (== 0 (% v 97)) by: k desc: c take: 5})",
+        NULL,
+    };
+    for (size_t i = 0; i < sizeof cs / sizeof cs[0]; i++) {
+        sr_evalf_ok("(set FQ (table [k v] (list %s (til 262144))))", cs[i].k);
+        sr_evalf_ok("(.db.splayed.set \"" SR_TMP "/%s0/\" FQ {compress: false})", cs[i].name);
+        ray_encw_test_force(cs[i].enc);
+        sr_evalf_ok("(.db.splayed.set \"" SR_TMP "/%s2/\" FQ {compress: true})", cs[i].name);
+        sr_evalf_ok("(.db.splayed.set \"" SR_TMP "/%sb/\" FQ {compress: true})", cs[i].name);
+        ray_encw_test_force(-1);
+        char t0[256], t2[256], tb[256], rel[256], dir[512], path[600];
+        snprintf(t0, sizeof t0, "(.db.splayed.get \"" SR_TMP "/%s0/\")", cs[i].name);
+        snprintf(t2, sizeof t2, "(.db.splayed.get \"" SR_TMP "/%s2/\")", cs[i].name);
+        snprintf(tb, sizeof tb, "(.db.splayed.get \"" SR_TMP "/%sb/\")", cs[i].name);
+        /* every vector of k in chunk 3 is the arm's codec */
+        {
+            ray_t* t = sr_eval(t2);
+            ray_t* ec = ray_table_get_col_enc(t, ray_sym_intern("k", 1));
+            TEST_ASSERT_NOT_NULL(ec);
+            const ray_enc_desc_t* d;
+            TEST_ASSERT_NULL(ray_enccol_chunk_descs_ref(ray_enccol_of(ec), 3, &d));
+            for (int j = 0; j < RAY_ENC_VECS_PER_CHUNK; j++)
+                TEST_ASSERT_FMT(d[j].encoding == (i ? RAY_ENC_CONST : RAY_ENC_RLE), "%s vector %d: %d", cs[i].name, j, d[j].encoding);
+            sr_drop(t);
+        }
+        for (int q = 0; qs[q]; q++) {
+            test_result_t r = sr_same_on(t0, t2, qs[q], 0);
+            if (r.status != TEST_PASS) return r;
+            TEST_ASSERT_FMT(sr_col_decoded("k") == 0, "%s %s: %llu bytes of k decoded", cs[i].name, qs[q],
+                            (unsigned long long)sr_col_decoded("k"));
+        }
+        snprintf(rel, sizeof rel, SR_TMP "/%sb/", cs[i].name);
+        if (ray_splay_resolve_dir(ray_test_tmp(rel), dir, sizeof dir) != RAY_OK) FAIL("resolve");
+        snprintf(path, sizeof path, "%s/k", dir);
+        if (!sr_forge_cap(path, 3, 999)) FAIL("forge");
+        for (int q = 0; qs[q]; q++) {
+            test_result_t r = sr_corrupt_twice(tb, qs[q], path);
+            if (r.status != TEST_PASS) return r;
+        }
+    }
+    PASS();
+}
+
 /* P3 Task 6b: point reads under a guard.  A selective filter (every 97th
  * row: a few rows per vector) groups by k, whose selected rows are
  * point-read (FOR_BP, no nulls) by the dense plan's selection bounds and
@@ -6735,6 +6823,7 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/v2_forged_dir_max",  test_v2_forged_dir_max,  srr_setup, srr_teardown },
     { "scanrange/v2_forged_consumers", test_v2_forged_consumers, srr_setup, srr_teardown },
     { "scanrange/v2_forged_points",    test_v2_forged_points,    srr_setup, srr_teardown },
+    { "scanrange/v2_forged_run_points", test_v2_forged_run_points, srr_setup, srr_teardown },
     { "scanrange/v2_forged_serial_dense", test_v2_forged_serial_dense, srr_setup, srr_teardown },
     { "scanrange/v2_sel_key_types",   test_v2_sel_key_types,   srr_setup, srr_teardown },
     { "scanrange/v2_radix_decode_once", test_v2_radix_decode_once, sr_rt_setup, srr_pool_teardown },

@@ -3085,23 +3085,31 @@ ray_t* exec_pred_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
  * pass (res NULL: every one), appended to the builder as
  * rowsel_emit_segment would classify the ANDed bools, without scanning
  * the segment's n bools. */
-static void refine_emit_mix(rowsel_builder_t* b, uint32_t seg, const uint16_t* ix, uint32_t cnt,
-                            const uint8_t* res, int64_t n) {
+static ray_t* refine_emit_mix(rowsel_builder_t* b, uint32_t seg, const uint16_t* ix, uint32_t cnt,
+                              const uint8_t* res, int64_t n) {
     b->seg_off[seg] = b->idx_len;
+    b->seg_flags[seg] = RAY_SEL_NONE;
+    b->seg_off[seg + 1] = b->idx_len;
     if (b->idx_len + cnt > b->idx_cap) {
         uint32_t newcap = b->idx_cap ? b->idx_cap : 8u;
         while (newcap < b->idx_len + cnt) newcap *= 2u;
-        b->idx = (uint16_t*)ray_realloc_raw(b->idx, (size_t)newcap * sizeof(uint16_t));
+        uint16_t* ni = (uint16_t*)ray_realloc_raw(b->idx, (size_t)newcap * sizeof(uint16_t));
+        if (!ni) return ray_error("oom", "refinement selection");
+        b->idx = ni;
         b->idx_cap = newcap;
     }
     uint32_t pc = 0;
-    for (uint32_t k = 0; k < cnt; k++)
-        if (ix[k] < n && (!res || res[ix[k]])) b->idx[b->idx_len + pc++] = ix[k];
+    for (uint32_t k = 0; k < cnt; k++) {
+        if (ix[k] >= n)                 /* as gsel_range reports it */
+            return ray_error("corrupt", "refinement: selection row %u past its segment", (unsigned)ix[k]);
+        if (!res || res[ix[k]]) b->idx[b->idx_len + pc++] = ix[k];
+    }
     b->total_pass += pc;
     if (pc == 0) b->seg_flags[seg] = RAY_SEL_NONE;
     else if ((int64_t)pc == n) b->seg_flags[seg] = RAY_SEL_ALL;   /* ALL contributes nothing to idx[] */
     else { b->seg_flags[seg] = RAY_SEL_MIX; b->idx_len += pc; }
     b->seg_off[seg + 1] = b->idx_len;
+    return NULL;
 }
 
 typedef struct {
@@ -3145,7 +3153,6 @@ static void expr_refine_task(expr_refine_ctx_t* c, uint32_t t) {
     if (rsc) for (uint8_t r = 0; r < expr->n_regs; r++) ray_col_scratch_init(&rsc[r]);
     const expr_enc_plan_t* plan = c->plan && c->plan->n_leaves ? c->plan : NULL;
     ray_enc_vview_t vbuf;
-    uint8_t out[EXPR_MORSEL];
     for (int64_t ms = start; ms < end; ms += EXPR_MORSEL) {
         int64_t me = ms + EXPR_MORSEL < end ? ms + EXPR_MORSEL : end;
         const int64_t n = me - ms;
@@ -3160,21 +3167,25 @@ static void expr_refine_task(expr_refine_ctx_t* c, uint32_t t) {
             continue;
         }
         const uint8_t* res = NULL;
-        int d = -1;   /* the leaves decide whole vectors on their views */
-        if (d < 0) {
-            ray_t* err = NULL;
-            res = (const uint8_t*)expr_eval_morsel(expr, plan, plan ? &vbuf : NULL, scratch, rsc, ms, me, &err);
-            if (err) { ray_scan_fail_note(c->fail, start, err); failed = true; d = 0; }
-        }
+        /* the leaves decide whole vectors on their views; a failed or empty
+         * evaluation passes no row (as expr_full_fn emits it) */
+        ray_t* err = NULL;
+        res = (const uint8_t*)expr_eval_morsel(expr, plan, plan ? &vbuf : NULL, scratch, rsc, ms, me, &err);
+        if (err) { ray_scan_fail_note(c->fail, start, err); failed = true; res = NULL; }
         const uint32_t ls = seg - base_seg;
-        if (f == RAY_SEL_MIX) {
-            /* d 1: every selected row passes (res NULL); d 0: none does */
-            refine_emit_mix(sb, ls, c->idx + c->offs[seg], d == 0 ? 0 : c->offs[seg + 1] - c->offs[seg],
-                            d == 1 ? NULL : res, n);
+        if (!res) {
+            sb->seg_off[ls] = sb->idx_len;
+            sb->seg_flags[ls] = RAY_SEL_NONE;
+            sb->seg_off[ls + 1] = sb->idx_len;
             continue;
         }
-        if (d == 1) { memset(out, 1, (size_t)n); res = out; }
-        else if (d == 0) { memset(out, 0, (size_t)n); res = out; }
+        if (f == RAY_SEL_MIX) {
+            if ((err = refine_emit_mix(sb, ls, c->idx + c->offs[seg], c->offs[seg + 1] - c->offs[seg], res, n)) != NULL) {
+                ray_scan_fail_note(c->fail, start, err);
+                failed = true;
+            }
+            continue;
+        }
         rowsel_emit_segment(sb, ls, res, n);
     }
     if (rsc) for (uint8_t r = 0; r < expr->n_regs; r++) ray_col_scratch_free(&rsc[r]);
