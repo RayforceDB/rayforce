@@ -316,9 +316,11 @@
 ;; Typed vec val vs typed vec: hashset path (lines 933-950)
 (in [1 2 3] [2 3 4]) -- [false true true]
 
-;; Non-scalar results from in (lines 978-997): STR vec in STR atom
-;; Each char-check returns a bool vec → results are non-scalar → LIST collect
-(in (list "ab" "cd") "abcd") -- (list [true true] [true true])
+;; Non-scalar results from in: nested lists answer a bool vec each, so
+;; the results are collected as a LIST.  (A string element is one whole
+;; value and answers a single bool.)
+(in (list (list 1 2) (list 3)) [1]) -- (list [true false] [false])
+(in (list "ab" "cd") "abcd") -- [false false]
 
 ;; val_null in vec with nulls → true (line 1007)
 (in 0Nl (concat [0Nl 1 2] [])) -- true

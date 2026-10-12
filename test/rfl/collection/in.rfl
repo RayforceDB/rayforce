@@ -53,10 +53,8 @@
 (in 'a' (list "iu" "asd" 'a')) -- [true]
 (in "asd" (list "iu" "asd")) -- [false false false]
 (in "asd" (list 'd' "asd")) -- [false false true]
-(in (list "asd") (list "iu" "asd")) -- (list [false false false])
-;;(list true);
-(in (list "asd" "iu") "asd") -- (list [true true true] [false false])
-;;(list false false);
+(in (list "asd") (list "iu" "asd")) -- [true]
+(in (list "asd" "iu") "asd") -- [true false]
 (set l (guid 2)) (in l l) -- [true true]
 (set l (guid 2)) (in (first l) l) -- true
 (set l (guid 2)) (in l (first l)) -- [true false]
@@ -217,3 +215,68 @@
 ;; a large set of narrow ints against a narrow column
 (sum (in (as 'I32 (til 1000)) (as 'I32 (* 3 (til 100))))) -- 100
 (sum (in (as 'I16 (til 1000)) (as 'I16 (* 3 (til 100))))) -- 100
+
+;; ========== STRING COLUMNS ==========
+;; A string element of a collection is one whole value.  Against a list of
+;; strings or a string atom each element answered per character — a list of
+;; per-character vectors that `where` refused — and inside a query the
+;; executor refused any string column with nyi.  A lone string atom on the
+;; left still answers per character, as above.
+(in ["p" "qq"] (list "qq" "zz")) -- [false true]
+(in ["p" "qq"] "qq") -- [false true]
+(in ["p" "qq" ""] (list "qq" 1 'zz)) -- [false true false]
+(not-in ["p" "qq"] (list "qq" "zz")) -- [true false]
+(in (list "ab" "c") "c") -- [false true]
+(in (list "ab" 1) (list "ab" 1)) -- [true true]
+(in (list (list "ab") "c") "c") -- (list [false] true)
+;; a bool answer first and a vector answer later still collect as a list —
+;; each later answer was read as a bool, so a vector stood in by its length
+(in (list "c" ["x" "x"]) "c") -- (list true [false false])
+(not-in (list "c" ["x" "x"]) "c") -- (list false [true true])
+(in (list "zz" (list "c")) "c") -- (list false [true])
+(in (list 1 (list 1 2)) 1) -- (list true [true false])
+(in (list 1 2 (list 3 1)) [1]) -- (list true false [false true])
+(in "ab" (list "a" "b" "c")) -- [true true]
+
+(set TS (table [s n] (list ["p" "qq" "zz" ""] [1 2 3 4])))
+(at (select {from: TS where: (in s ["qq" "zz"])}) 'n) -- [2 3]
+(at (select {from: TS where: (in s (list "qq" "zz"))}) 'n) -- [2 3]
+(at (select {from: TS where: (in s "qq")}) 'n) -- [2]
+;; the empty string is the string null: it matches nothing, even itself,
+;; and not-in leaves it out too, as for every other column type
+(at (select {from: TS where: (not-in s ["qq" "zz"])}) 'n) -- [1]
+(at (select {from: TS where: (in s ["qq" ""])}) 'n) -- [2]
+(at (select {from: TS where: (in s (take ["a"] 0))}) 'n) -- []
+;; a string atom against the column is one verdict for every row
+(count (select {from: TS where: (in "qq" s)})) -- 4
+(count (select {from: TS where: (in "xx" s)})) -- 0
+(at (select {from: TS by: (in s ["qq"]) c: (count n)}) 'c) -- [3 1]
+;; a projection answers one verdict per row too, and does not drag the
+;; projections beside it into per-character answers
+(at (select {c: (in s (list "qq" "zz")) from: TS}) 'c) -- [false true true false]
+(at (select {c: (not-in s (list "qq")) from: TS}) 'c) -- [true false true false]
+(at (select {c: (in s "qq") d: (in s (list "x")) from: TS}) 'c) -- [false true false false]
+(at (select {c: (in s (list "qq")) from: TS where: (> n 1)}) 'c) -- [true false false]
+(at (update {c: (in s (list "qq")) from: TS}) 'c) -- [false true false false]
+;; Known bugs found alongside, not fixed here — a symbol column fails the
+;; same way, so they are not about strings:
+;; (at (select {c: (in s (list "qq")) from: TS desc: n}) 'c) -- [false false true false]   ;; xfail BUG: a projection the compiler declines, with desc:/asc:, errors nyi (also (in y (list 'qq)) and (reverse n))
+;; (at (select {c: (sum (in s (list "qq"))) from: TS by: (> n 2)}) 'c) -- [1 0]   ;; xfail BUG: by: aggregate over in with a LIST set errors "failed to compile aggregation argument" (a vector set works)
+;; (at (select {c: (in 's (list 's)) from: TS}) 'c) -- [true]   ;; xfail BUG: a quoted symbol that names a column reads the column
+;; (do (set in concat) (at (select {c: (in s "!") from: TS}) 'c)) -- ["p!" "qq!" "zz!" "!"]   ;; xfail BUG: select still compiles a rebound `in` as membership
+
+;; a column of another type against a string set matches no row, as bare
+(set TY (table [y n] (list ['p 'qq] [1 2])))
+(in ['p 'qq] ["qq"]) -- [false false]
+(count (select {from: TY where: (in y ["qq"])})) -- 0
+(count (select {from: TY where: (not-in y ["qq"])})) -- 2
+(count (select {from: TY where: (in n ["qq"])})) -- 0
+
+;; a mapped (splayed) string column answers the same
+(.sys.exec "rm -rf rf_in_str") -- 0
+(.db.splayed.set "rf_in_str/" TS)
+(set TM (.db.splayed.get "rf_in_str/"))
+(at (select {from: TM where: (in s ["qq" "zz"])}) 'n) -- [2 3]
+(at (select {from: TM where: (in s (list "zz"))}) 'n) -- [3]
+(set TM 0)
+(.sys.exec "rm -rf rf_in_str") -- 0

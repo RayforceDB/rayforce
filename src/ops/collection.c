@@ -1369,6 +1369,23 @@ ray_t* ray_distinct_fn(ray_t* x) {
 }
 
 /* (in val vec) — check membership */
+/* One element of a collection left operand.  A string element is one whole
+ * value: the lone-string arms of ray_in_fn answer per character, which is
+ * right for a string atom on its own but not for a row of a collection —
+ * (in ["p" "qq"] (list "qq" "zz")) answered [[false] [false false]].  A
+ * string set (vector) already compares whole strings in ray_in_fn. */
+static ray_t* in_row(ray_t* elem, ray_t* vec) {
+    if (elem->type == -RAY_STR && ray_is_atom(vec))
+        return make_bool(atom_eq(elem, vec) ? 1 : 0);
+    if (elem->type == -RAY_STR && vec->type == RAY_LIST) {
+        ray_t** set = (ray_t**)ray_data(vec);
+        for (int64_t j = 0; j < ray_len(vec); j++)
+            if (atom_eq(elem, set[j])) return make_bool(1);
+        return make_bool(0);
+    }
+    return ray_in_fn(elem, vec);
+}
+
 ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
     if (ray_is_lazy(val)) val = ray_lazy_materialize(val);
     if (ray_is_lazy(vec)) vec = ray_lazy_materialize(vec);
@@ -1536,7 +1553,7 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
         int alloc0 = 0;
         ray_t* e0 = collection_elem(val, 0, &alloc0);
         if (RAY_IS_ERR(e0)) return e0;
-        ray_t* r0 = ray_in_fn(e0, vec);
+        ray_t* r0 = in_row(e0, vec);
         if (alloc0) ray_release(e0);
         if (RAY_IS_ERR(r0)) return r0;
         if (ray_is_atom(r0) && r0->type == -RAY_BOOL) {
@@ -1551,9 +1568,37 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
                 int alloc = 0;
                 ray_t* elem = collection_elem(val, i, &alloc);
                 if (RAY_IS_ERR(elem)) { ray_release(result); return elem; }
-                ray_t* r = ray_in_fn(elem, vec);
+                ray_t* r = in_row(elem, vec);
                 if (alloc) ray_release(elem);
                 if (RAY_IS_ERR(r)) { ray_release(result); return r; }
+                if (!(ray_is_atom(r) && r->type == -RAY_BOOL)) {
+                    /* A later element answered with a vector: the result
+                     * is a list after all.  Box the verdicts so far and
+                     * keep collecting — reading this answer's b8 stored
+                     * the low byte of its length as the verdict. */
+                    ray_t* lst = ray_list_new(vlen);
+                    for (int64_t k = 0; k < i && lst && !RAY_IS_ERR(lst); k++) {
+                        ray_t* b = make_bool(out[k]);
+                        lst = ray_list_append(lst, b);
+                        ray_release(b);
+                    }
+                    ray_release(result);
+                    if (lst && !RAY_IS_ERR(lst)) lst = ray_list_append(lst, r);
+                    ray_release(r);
+                    if (!lst || RAY_IS_ERR(lst)) return lst ? lst : ray_error("oom", NULL);
+                    for (int64_t k = i + 1; k < vlen; k++) {
+                        int ak = 0;
+                        ray_t* ek = collection_elem(val, k, &ak);
+                        if (RAY_IS_ERR(ek)) { ray_release(lst); return ek; }
+                        ray_t* rk = in_row(ek, vec);
+                        if (ak) ray_release(ek);
+                        if (RAY_IS_ERR(rk)) { ray_release(lst); return rk; }
+                        lst = ray_list_append(lst, rk);
+                        ray_release(rk);
+                        if (RAY_IS_ERR(lst)) return lst;
+                    }
+                    return lst;
+                }
                 out[i] = r->b8;
                 ray_release(r);
             }
@@ -1569,7 +1614,7 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
                 int alloc = 0;
                 ray_t* elem = collection_elem(val, i, &alloc);
                 if (RAY_IS_ERR(elem)) { ray_release(result); return elem; }
-                ray_t* r = ray_in_fn(elem, vec);
+                ray_t* r = in_row(elem, vec);
                 if (alloc) ray_release(elem);
                 if (RAY_IS_ERR(r)) { ray_release(result); return r; }
                 result = ray_list_append(result, r);

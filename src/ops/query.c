@@ -3427,6 +3427,23 @@ static int is_whole_column_projection(ray_t* expr, ray_t* tbl) {
         ray_graph_free(g);
         return whole;
     }
+    if ((l == 2 && memcmp(p, "in", 2) == 0) ||
+        (l == 6 && memcmp(p, "not-in", 6) == 0)) {
+        /* A string column's cell is a lone string atom, which `in` answers
+         * per character; the column answers one verdict per row.  So
+         * membership of a string column is evaluated once over the whole
+         * column, as where, by and update already evaluate it — per row,
+         * (in s (list "qq")) came back as a list of per-character vectors. */
+        if (ray_len(expr) != 3) return 0;
+        ray_t* a = ((ray_t**)ray_data(expr))[1];
+        if (!a || a->type != -RAY_SYM || (a->attrs & ATTR_QUOTED)) return 0;
+        if (ray_env_has_lexical_local(a->i64)) return 0;
+        ray_t* col = ray_table_get_col(tbl, a->i64);
+        if (!col) return 0;
+        int8_t ct = col->type;
+        if (RAY_IS_PARTED(ct)) ct = (int8_t)RAY_PARTED_BASETYPE(ct);
+        return ct == RAY_STR;
+    }
     if (l == 6 && memcmp(p, "enlist", 6) == 0) {
         /* Only a single scalar value can stand for a broadcast column.
          * Column arguments, vector constants and multi-argument enlist
