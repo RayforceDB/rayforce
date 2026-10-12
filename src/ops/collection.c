@@ -1441,8 +1441,9 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
     if (is_collection(val) && !ray_is_atom(val)) {
         int64_t vlen = ray_len(val);
         if (vlen == 0) {
-            /* Empty collection → return empty list */
-            return ray_list_new(0);
+            /* No needles: an empty B8, the shape every other left operand
+             * answers — `where` over it must not raise (#785). */
+            return ray_vec_new(RAY_BOOL, 0);
         }
         /* Hash-based fast path: both sides are typed vecs of compatible
          * shape and the result is a row-aligned bool vec.  Build a
