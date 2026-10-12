@@ -570,9 +570,8 @@ static ray_enccol_t* zone_dir_col(ray_t* encv) {
 /* Whether the directory of a column of type t answers opcode: the types and
  * operations the zone's aggs would. */
 static bool dir_op_ok(int8_t t, uint16_t opcode) {
-    bool fl = t == RAY_F32 || t == RAY_F64;
     bool int_sum_type = t == RAY_I64 || t == RAY_I32 || t == RAY_I16 || t == RAY_U8;   /* ray_sum_fn / ray_avg_fn */
-    if (opcode == OP_SUM || opcode == OP_AVG) return int_sum_type && !fl && ray_encw_type_summable(t);
+    if (opcode == OP_SUM || opcode == OP_AVG) return int_sum_type && ray_encw_type_summable(t);
     if (opcode == OP_MIN || opcode == OP_MAX) return ray_zone_acc_supported(t);   /* enc_attach_index */
     return false;
 }
@@ -586,6 +585,8 @@ static ray_t* dir_answer(ray_enccol_t* e, uint16_t opcode) {
     /* the directory carries the high words (3 * n): the exact total */
     ray_enc_col_totals_t z;
     ray_enccol_dir_totals(e, &z);
+    /* a chunk with non-null rows but no statistics is read, not skipped */
+    if ((opcode == OP_MIN || opcode == OP_MAX) && z.mm_partial) return NULL;
     switch (opcode) {
     case OP_SUM:
         return make_i64((int64_t)z.sum_wrapped);                            /* ray_zone_int_sum */
@@ -625,6 +626,7 @@ bool ray_dir_seg_totals(ray_t* segv, uint16_t opcode, void* totals_out) {
     ray_enccol_t* e = dir_col(segv);
     if (!e || !dir_op_ok(e->type, opcode) || e->type == RAY_F32 || e->type == RAY_F64) return false;
     ray_enccol_dir_totals(e, out);
+    if ((opcode == OP_MIN || opcode == OP_MAX) && out->mm_partial) return false;
     return true;
 }
 

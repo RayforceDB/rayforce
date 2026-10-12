@@ -4551,7 +4551,9 @@ static ray_t* reduce_src_parted(ray_col_src_t* src, uint16_t opcode, reduce_acc_
             ray_enccol_t* e = sg && sg->type == RAY_ENCCOL ? ray_enccol_of(sg) : NULL;
             if (sl <= 0) empty = true;
             else if (e && e->kind == RAY_ENCCOL_SINGLE && e->len == sl && e->type == t) {
-                if (e->synthetic) empty = true;         /* all null: no rows, no extremes */
+                /* a nullable stand-in is all null: no rows, no extremes; a BOOL / U8 one is
+                 * non-null zeros (ray_null_fill) and is read like a plain segment */
+                if (e->synthetic) empty = t != RAY_BOOL && t != RAY_U8;
                 else dir = ray_dir_seg_totals(sg, opcode, &z);
             }
         }

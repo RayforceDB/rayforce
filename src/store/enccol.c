@@ -2836,6 +2836,7 @@ void ray_enccol_dir_totals(ray_enccol_t* e, ray_enc_col_totals_t* out) {
     out->sum_wrapped = 0; out->sum_hi = 0; out->sum_lo = 0; out->nonnull = 0;
     out->min_i = INT64_MAX; out->max_i = INT64_MIN;
     out->min_f = INFINITY;  out->max_f = -INFINITY;
+    out->mm_partial = false;
     for (int64_t c = 0; c < e->n_chunks; c++) {
         ray_enc_dirent_t de;
         dirent_at(e, c, &de);
@@ -2844,7 +2845,10 @@ void ray_enccol_dir_totals(ray_enccol_t* e, ray_enc_col_totals_t* out) {
         out->sum_hi += (int64_t)de.sum_hi + (l < de.sum_lo ? 1 : 0);
         out->sum_lo = l;
         out->nonnull += chunk_rows(e, c) - (int64_t)de.null_count;
-        if (de.flags & RAY_ENC_STAT_ABSENT) continue;
+        if (de.flags & RAY_ENC_STAT_ABSENT) {
+            if ((int64_t)de.null_count < chunk_rows(e, c)) out->mm_partial = true;
+            continue;
+        }
         if (fl) {
             double mn = dbl_of(de.min), mx = dbl_of(de.max);
             if (mn < out->min_f) out->min_f = mn;

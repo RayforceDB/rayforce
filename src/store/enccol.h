@@ -49,6 +49,7 @@ typedef struct {
     int64_t  nonnull;
     int64_t  min_i, max_i;
     double   min_f, max_f;
+    bool     mm_partial;   /* a chunk with non-null rows carries no min / max: the extremes are incomplete */
 } ray_enc_col_totals_t;
 
 typedef struct ray_enccol_s {
