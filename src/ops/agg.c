@@ -550,26 +550,40 @@ static ray_t* colref_answer(ray_t* x, uint16_t op, bool* done) {
  * summable types, mins / maxs with absent chunks at the empty extrema.
  * These read the same entries and return what ray_sum_fn, ray_avg_fn,
  * ray_min_fn and ray_max_fn return from that zone. */
-static ray_enccol_t* zone_dir_col(ray_t* encv) {
+/* A single-file, stored (not synthetic) generation-2 column: it has a
+ * directory whether or not it records an index. */
+static ray_enccol_t* dir_col(ray_t* encv) {
     if (!encv || encv->type != RAY_ENCCOL) return NULL;
     ray_enccol_t* e = ray_enccol_of(encv);
-    if (!e || e->kind != RAY_ENCCOL_SINGLE || e->synthetic || e->hdr.index_kind != RAY_IDX_CHUNK_ZONE)
-        return NULL;
+    if (!e || e->kind != RAY_ENCCOL_SINGLE || e->synthetic) return NULL;
     return e;
 }
 
-ray_t* ray_zone_dir_answer(ray_t* encv, uint16_t opcode) {
-    ray_enccol_t* e = zone_dir_col(encv);
+/* The same, recording CHUNK_ZONE: generation 0 answers from the zone only
+ * where one is recorded (finding C3), and planning-time answers
+ * (select_agg_dir_answer) keep that gate so they never widen. */
+static ray_enccol_t* zone_dir_col(ray_t* encv) {
+    ray_enccol_t* e = dir_col(encv);
+    return e && e->hdr.index_kind == RAY_IDX_CHUNK_ZONE ? e : NULL;
+}
+
+/* Whether the directory of a column of type t answers opcode: the types and
+ * operations the zone's aggs would. */
+static bool dir_op_ok(int8_t t, uint16_t opcode) {
+    bool fl = t == RAY_F32 || t == RAY_F64;
+    bool int_sum_type = t == RAY_I64 || t == RAY_I32 || t == RAY_I16 || t == RAY_U8;   /* ray_sum_fn / ray_avg_fn */
+    if (opcode == OP_SUM || opcode == OP_AVG) return int_sum_type && !fl && ray_encw_type_summable(t);
+    if (opcode == OP_MIN || opcode == OP_MAX) return ray_zone_acc_supported(t);   /* enc_attach_index */
+    return false;
+}
+
+static ray_t* dir_answer(ray_enccol_t* e, uint16_t opcode) {
     if (!e) return NULL;
     int8_t t = e->type;
     bool fl = t == RAY_F32 || t == RAY_F64;
-    /* zone_aggs: present only for the summable, non-float types */
-    bool have_aggs = !fl && ray_encw_type_summable(t);
-    bool int_sum_type = t == RAY_I64 || t == RAY_I32 || t == RAY_I16 || t == RAY_U8;   /* ray_sum_fn / ray_avg_fn */
-    if ((opcode == OP_SUM || opcode == OP_AVG) && !(int_sum_type && have_aggs)) return NULL;
-    if ((opcode == OP_MIN || opcode == OP_MAX) && !ray_zone_acc_supported(t)) return NULL;   /* enc_attach_index */
-    if (opcode != OP_SUM && opcode != OP_AVG && opcode != OP_MIN && opcode != OP_MAX) return NULL;
-    /* the synthesized aggs carry the high words (3 * n): the exact total */
+    bool have_aggs = !fl && ray_encw_type_summable(t);   /* zone_aggs: the summable, non-float types */
+    if (!dir_op_ok(t, opcode)) return NULL;
+    /* the directory carries the high words (3 * n): the exact total */
     ray_enc_col_totals_t z;
     ray_enccol_dir_totals(e, &z);
     switch (opcode) {
@@ -581,13 +595,13 @@ ray_t* ray_zone_dir_answer(ray_t* encv, uint16_t opcode) {
     default: {
         bool mx = opcode == OP_MAX;
         if (fl) {
-            /* absent chunks sit at the synthesized +/-inf and never win */
+            /* absent chunks sit at +/-inf and never win */
             double m = mx ? z.max_f : z.min_f;
             if (m == (mx ? -INFINITY : INFINITY)) return ray_typed_null(-RAY_F64);
             return make_f64(m);
         }
         int64_t m = mx ? z.max_i : z.min_i;
-        /* all-null by the non-null counts when the zone has them */
+        /* all-null by the non-null counts when the directory has sums */
         if (have_aggs ? z.nonnull == 0 : m == (mx ? INT64_MIN : INT64_MAX)) return ray_typed_null(-t);
         switch (t) {
         case RAY_BOOL:      return ray_bool((bool)m);
@@ -601,6 +615,17 @@ ray_t* ray_zone_dir_answer(ray_t* encv, uint16_t opcode) {
         }
     }
     }
+}
+
+ray_t* ray_zone_dir_answer(ray_t* encv, uint16_t opcode) { return dir_answer(zone_dir_col(encv), opcode); }
+ray_t* ray_dir_answer(ray_t* encv, uint16_t opcode) { return dir_answer(dir_col(encv), opcode); }
+
+bool ray_dir_seg_totals(ray_t* segv, uint16_t opcode, void* totals_out) {
+    ray_enc_col_totals_t* out = totals_out;
+    ray_enccol_t* e = dir_col(segv);
+    if (!e || !dir_op_ok(e->type, opcode) || e->type == RAY_F32 || e->type == RAY_F64) return false;
+    ray_enccol_dir_totals(e, out);
+    return true;
 }
 
 bool ray_zone_dir_int_sum128(ray_t* encv, int64_t* hi, uint64_t* lo, int64_t* nn) {

@@ -4601,7 +4601,11 @@ static test_result_t test_scalar_agg_planning_zoned(void) {
 static test_result_t test_dag_presence_without_decode(void) {
     ray_t* t = ex_table(3000, true);
     TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
-    static const char* const forms[] = { "a", "(+ a 1)", "(sum a)", "'a", "(neg a)", NULL };
+    /* (sum a) is not here: a whole-column reduction of a stored column is
+     * answered from its directory without reading a vector (P3 Task 7), as a
+     * column with a recorded zone always was, so a damaged descriptor is not
+     * met; the sum of an expression over it decodes */
+    static const char* const forms[] = { "a", "(+ a 1)", "(sum (+ a 1))", "'a", "(neg a)", NULL };
     for (int i = 0; forms[i]; i++) {
         ray_graph_t* g = ray_graph_new(t);
         ray_t* e = ray_parse(forms[i]);

@@ -769,6 +769,17 @@ bool ray_col_src_parted_chunks(ray_col_src_t* s, void* ctx, ray_col_chunk_fn fn,
     return true;
 }
 
+bool ray_col_src_parted_segs(ray_col_src_t* s, int64_t* n, ray_t*** segs, const int64_t** off, ray_t** err) {
+    *err = NULL;
+    if (!s || !s->obj || !s->parted) return false;
+    ray_t* w = parted_wrapper(s->obj);
+    if (!w) return false;
+    if ((*err = src_seg_off(s, w, off)) != NULL) return false;
+    *n = w->len;
+    *segs = (ray_t**)ray_data(w);
+    return true;
+}
+
 /* The single-file encoded column holding row `row` of a generation-2
  * source, not materialized: the column itself, or the row's parted segment
  * when that is one (*seg0 its first row); NULL for anything else, read by

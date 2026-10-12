@@ -225,6 +225,11 @@ int  ray_col_src_vview(const ray_col_src_t* s, int64_t v, struct ray_enc_vview_s
  * reads then check every segment's values against its own chunks'. */
 typedef void (*ray_col_chunk_fn)(void* ctx, int64_t lo, int64_t hi, const struct ray_enc_chunk_stat_s* st);
 bool ray_col_src_parted_chunks(ray_col_src_t* s, void* ctx, ray_col_chunk_fn fn, ray_t** err);
+/* The segments of a parted source: *n of them in row order (borrowed
+ * RAY_ENCCOL or plain vectors, NULL for a missing one), segment i holding
+ * rows [off[i], off[i + 1]).  False when the source is not parted, or with
+ * an owned *err (OOM).  Publishes the segment offsets on first use. */
+bool ray_col_src_parted_segs(ray_col_src_t* s, int64_t* n, ray_t*** segs, const int64_t** off, ray_t** err);
 /* Row `row` of a single-file or parted generation-2 integer source (not
  * SYM) read without decoding its vector (ray_enccol_point_i64: FOR_BP,
  * DICT over FOR_BP, CONST or RLE, without nulls; a parted row is its

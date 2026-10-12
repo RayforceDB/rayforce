@@ -446,6 +446,17 @@ ray_t* ray_zone_dir_answer(ray_t* encv, uint16_t opcode);
  * and non-null count from the directory; false when the zone the
  * materialization would synthesize carries no integer sums. */
 bool ray_zone_dir_int_sum128(ray_t* encv, int64_t* hi, uint64_t* lo, int64_t* nn);
+/* ray_zone_dir_answer's answer for every single-file stored generation-2
+ * column, with or without a recorded zone: the execution-time reduction
+ * (ray_reduce_src) takes it.  Planning-time answers stay on
+ * ray_zone_dir_answer, so they do not widen past generation 0's. */
+ray_t* ray_dir_answer(ray_t* encv, uint16_t opcode);
+/* The directory totals (a ray_enc_col_totals_t, store/enccol.h) of one
+ * parted segment for an integer or temporal SUM / AVG / MIN / MAX: true
+ * when the segment is a single-file stored generation-2 column the
+ * directory answers `opcode` for, false for a plain, synthetic or float
+ * segment (the caller reduces its rows). */
+bool ray_dir_seg_totals(ray_t* segv, uint16_t opcode, void* totals_out);
 
 /* Build a RAY_IDX_DICT (codes + distinct values) for STR vector `v` WITHOUT
  * attaching it — standalone RAY_INDEX object (caller releases / attaches).

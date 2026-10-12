@@ -3066,6 +3066,109 @@ static test_result_t test_eq_runs_lack(void) {
     PASS();
 }
 
+/* Review focus 5: sums at the I64 extremes with nulls, from the directory,
+ * on a column without a recorded CHUNK_ZONE (the C3 gate does not cover it). */
+static test_result_t test_sum_extremes(void) {
+    /* the converter records a CHUNK_ZONE for a plain column of this size; a
+     * plain ZONE already on it stands in, so the column has none to answer from */
+    aw_save("sx", "(table [x] (list (.idx.zone (as 'I64 (map (fn [j] (if (== 0 (% j 7)) 0N (if (== 0 (% j 2)) 9223372036854775807 -9223372036854775807))) (til 200000))))))", -1);
+    test_result_t r;
+    if ((r = aw_reduce("sx", "(sum (at T 'x))", 0)).status != TEST_PASS) return r;
+    ray_t* ix = ray_eval_str(ray_test_tmp("(at (.idx.info T 'x) 'index)"));
+    TEST_ASSERT_TRUE(ix && !RAY_IS_ERR(ix) && ix->type == -RAY_SYM &&
+                     ix->i64 == ray_sym_intern("zone", 4));   /* not chunk_zone: no recorded CHUNK_ZONE */
+    ray_release(ix);
+    if ((r = aw_reduce("sx", "(avg (at T 'x))", 0)).status != TEST_PASS) return r;
+    if ((r = aw_reduce("sx", "(count (at T 'x))", 0)).status != TEST_PASS) return r;
+    if ((r = aw_reduce("sx", "(min (at T 'x))", 0)).status != TEST_PASS) return r;
+    if ((r = aw_reduce("sx", "(max (at T 'x))", 0)).status != TEST_PASS) return r;
+    /* planning-time answers keep generation 0's CHUNK_ZONE gate (D5): this one decodes, equal */
+    if ((r = aw_reduce("sx", "(select {s: (sum x) a: (avg x) mx: (max x) from: T})", -1)).status != TEST_PASS) return r;
+    PASS();
+}
+
+/* Parted: two generation-2 partitions and one generation-0 partition. */
+static test_result_t test_sum_parted_dir(void) {
+    for (int p = 0; p < 3; p++) {
+        char q[600];
+        snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/sp/2024.01.0%d/t/\" "
+                 "(table [x] (list (as 'I32 (map (fn [j] (if (== 0 (%% j 11)) 0N (- j 50000))) (til 90000))))) {compress: %s})",
+                 p + 1, p == 1 ? "false" : "true");
+        aw_eval_ok(q);
+        snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/sq/2024.01.0%d/t/\" "
+                 "(table [x] (list (as 'I32 (map (fn [j] (if (== 0 (%% j 11)) 0N (- j 50000))) (til 90000))))) {compress: false})", p + 1);
+        aw_eval_ok(q);
+    }
+    static const char* const aggs[] = { "sum", "avg", "min", "max", "count", NULL };
+    for (int i = 0; aggs[i]; i++) {
+        char a[300], b[300];
+        snprintf(a, sizeof a, "(%s (at (.db.parted.get \"" AW_TMP "/sq\" 't) 'x))", aggs[i]);
+        snprintf(b, sizeof b, "(%s (at (.db.parted.get \"" AW_TMP "/sp\" 't) 'x))", aggs[i]);
+        ray_t* x = aw_eval(a);
+        ray_enc_counters_reset();
+        ray_t* y = aw_eval(b);
+        ray_enc_counters_t k; ray_enc_counters_get(&k);
+        TEST_ASSERT_TRUE(x && y && !RAY_IS_ERR(x) && !RAY_IS_ERR(y));
+        ray_t* fx = ray_fmt(x, 0); ray_t* fy = ray_fmt(y, 0);
+        TEST_ASSERT_FMT(ray_str_len(fx) == ray_str_len(fy) && memcmp(ray_str_ptr(fx), ray_str_ptr(fy), ray_str_len(fx)) == 0, "%s", aggs[i]);
+        TEST_ASSERT_EQ_U(k.materialized, 0);
+        TEST_ASSERT_EQ_U(k.decoded_bytes, 0);   /* the generation-0 partition is read in place */
+        ray_release(fx); ray_release(fy); ray_release(x); ray_release(y);
+    }
+    PASS();
+}
+
+/* A ragged parted table: partition 2 lacks the column (a synthetic all-null
+ * segment), 1 and 3 are generation 2, 4 generation 0.  Results equal the
+ * all-generation-0 table's, and the encoded segments decode nothing. */
+static test_result_t test_sum_parted_ragged(void) {
+    static const char* roots[] = { "rw", "rn" };
+    for (int r = 0; r < 2; r++)
+        for (int p = 0; p < 4; p++) {
+            char q[700];
+            snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/%s/2024.01.0%d/t/\" %s {compress: %s})",
+                     roots[r], p + 1,
+                     p == 1 ? "(table [y] (list (til 3000)))"
+                            : "(table [y x] (list (til 80000) (map (fn [j] (if (== 0 (% j 13)) 0N (- j 70000))) (til 80000))))",
+                     r == 0 && p != 3 ? "true" : "false");
+            aw_eval_ok(q);
+        }
+    static const char* const aggs[] = { "sum", "avg", "min", "max", NULL };
+    for (int i = 0; aggs[i]; i++) {
+        char a[300], b[300];
+        snprintf(a, sizeof a, "(%s (at (.db.parted.get \"" AW_TMP "/rn\" 't) 'x))", aggs[i]);
+        snprintf(b, sizeof b, "(%s (at (.db.parted.get \"" AW_TMP "/rw\" 't) 'x))", aggs[i]);
+        ray_t* x = aw_eval(a);
+        ray_enc_counters_reset();
+        ray_t* y = aw_eval(b);
+        ray_enc_counters_t k; ray_enc_counters_get(&k);
+        TEST_ASSERT_TRUE(x && y && !RAY_IS_ERR(x) && !RAY_IS_ERR(y));
+        ray_t* fx = ray_fmt(x, 0); ray_t* fy = ray_fmt(y, 0);
+        TEST_ASSERT_FMT(ray_str_len(fx) == ray_str_len(fy) && memcmp(ray_str_ptr(fx), ray_str_ptr(fy), ray_str_len(fx)) == 0, "%s", aggs[i]);
+        TEST_ASSERT_EQ_U(k.materialized, 0);
+        TEST_ASSERT_EQ_U(k.decoded_bytes, 0);
+        ray_release(fx); ray_release(fy); ray_release(x); ray_release(y);
+    }
+    PASS();
+}
+
+/* Float sums decode and stay bit-identical, -0.0 included; float min /
+ * max from statistics only under D4. */
+static test_result_t test_float_sum_decoded(void) {
+    aw_save("fs", "(table [f] (list (map (fn [j] (if (< j 1024) -0.0 (* 0.1 j))) (til 3000))))", -1);
+    test_result_t r;
+    if ((r = aw_reduce("fs", "(sum (at T 'f))", -1)).status != TEST_PASS) return r;
+    if ((r = aw_reduce("fs", "(avg (at T 'f))", -1)).status != TEST_PASS) return r;
+    aw_save("fz", "(table [f] (list (take [-0.0] 2048)))", -1);
+    if ((r = aw_reduce("fz", "(sum (at T 'f))", -1)).status != TEST_PASS) return r;   /* the sign of zero */
+    if ((r = aw_reduce("fs", "(min (at T 'f))", -1)).status != TEST_PASS) return r;   /* 0 under D4 */
+    if ((r = aw_reduce("fs", "(max (at T 'f))", -1)).status != TEST_PASS) return r;
+    aw_save("fm", "(table [f] (list (map (fn [j] (if (== 0 (% j 2)) -0.0 0.0)) (til 3000))))", -1);
+    if ((r = aw_reduce("fm", "(min (at T 'f))", -1)).status != TEST_PASS) return r;   /* which zero: the first */
+    if ((r = aw_reduce("fm", "(max (at T 'f))", -1)).status != TEST_PASS) return r;
+    PASS();
+}
+
 const test_entry_t aware_entries[] = {
     { "aware/vview_encodings", test_vview_encodings, aw_setup, aw_teardown },
     { "aware/vview_near_top",  test_vview_near_top,  aw_setup, aw_teardown },
@@ -3118,5 +3221,9 @@ const test_entry_t aware_entries[] = {
     { "aware/refine_on_views",    test_refine_on_views,    aw_setup, aw_teardown },
     { "aware/eq_on_runs",         test_eq_runs_lack,       aw_setup, aw_teardown },
     { "aware/gather_rows_parallel", test_gather_rows_parallel, aw_setup, aw_teardown },
+    { "aware/sum_extremes",      test_sum_extremes,      aw_setup, aw_teardown },
+    { "aware/sum_parted_dir",    test_sum_parted_dir,    aw_setup, aw_teardown },
+    { "aware/sum_parted_ragged", test_sum_parted_ragged, aw_setup, aw_teardown },
+    { "aware/float_sum_decoded", test_float_sum_decoded, aw_setup, aw_teardown },
     { NULL, NULL, NULL, NULL },
 };

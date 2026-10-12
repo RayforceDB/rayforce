@@ -4412,6 +4412,7 @@ typedef struct {
     reduce_acc_t*   accs;        /* one per worker */
     bool            has_nulls;
     uint16_t        opcode;
+    int64_t         lo;          /* first row of the walked range (a parted segment's) */
     ray_scan_fail_t fail;
 } par_reduce_src_ctx_t;
 
@@ -4426,7 +4427,7 @@ static void par_reduce_src_fn(void* ctx, uint32_t wid, int64_t start, int64_t en
     if (ray_scan_fail_skip(&c->fail, start)) return;
     ray_col_src_t* srcs[1] = { c->src };
     const void* plain[1] = { c->base };
-    ray_t* err = ray_col_walk(srcs, plain, 1, start, end, false, c, wid, reduce_piece);
+    ray_t* err = ray_col_walk(srcs, plain, 1, c->lo + start, c->lo + end, false, c, wid, reduce_piece);
     if (err) ray_scan_fail_note(&c->fail, start, err);
 }
 
@@ -4501,6 +4502,80 @@ static ray_t* reduce_src_edge(ray_col_src_t* src, bool last, bool skip_nulls) {
     return out ? out : ray_typed_null(-t);
 }
 
+/* Reduce rows [lo, lo + n) of the source by range reads into *out
+ * (overwritten): worker 0 is the base, the rest merged in order
+ * (exec_reduction).  NULL or an owned error. */
+static ray_t* reduce_src_walk(ray_col_src_t* src, int64_t lo, int64_t n, uint16_t opcode, reduce_acc_t* out) {
+    int8_t t = src->type;
+    ray_pool_t* pool = ray_pool_get();
+    uint32_t nw = (pool && n >= RAY_PARALLEL_THRESHOLD) ? ray_pool_total_workers(pool) : 1;
+    ray_t* accs_hdr;
+    reduce_acc_t* accs = (reduce_acc_t*)scratch_calloc(&accs_hdr, nw * sizeof(reduce_acc_t));
+    if (!accs) return ray_error("oom", NULL);
+    for (uint32_t i = 0; i < nw; i++) reduce_acc_init(&accs[i]);
+    par_reduce_src_ctx_t ctx = { .src = src, .base = ray_col_src_base(src), .accs = accs,
+                                 .has_nulls = src->may_null, .opcode = opcode, .lo = lo };
+    ray_scan_fail_init(&ctx.fail);
+    if (n > 0) ray_col_src_advise(src, lo, lo + n);
+    if (nw > 1) ray_pool_dispatch(pool, par_reduce_src_fn, &ctx, n);
+    else if (n > 0) par_reduce_src_fn(&ctx, 0, 0, n);
+    ray_t* err = ray_scan_fail_finish(&ctx.fail, nw > 1 ? pool : NULL);
+    if (err) { scratch_free(accs_hdr); return err; }
+    *out = accs[0];
+    for (uint32_t i = 1; i < nw; i++) reduce_merge(out, &accs[i], t, NULL, opcode);
+    scratch_free(accs_hdr);
+    return NULL;
+}
+
+/* A parted source's integer or temporal SUM / AVG / MIN / MAX into *merged:
+ * every single-file stored generation-2 segment from its directory totals
+ * (what reduce_range would accumulate over its rows), every synthetic
+ * all-null segment as no rows, and each run of other segments by range
+ * reads; folded in segment order.  *done false when the source has no
+ * segment table to walk (the caller reads the whole source).  NULL or an
+ * owned error. */
+static ray_t* reduce_src_parted(ray_col_src_t* src, uint16_t opcode, reduce_acc_t* merged, bool* done) {
+    int8_t t = src->type;
+    int64_t n;
+    ray_t** segs;
+    const int64_t* off;
+    ray_t* err = NULL;
+    if (!ray_col_src_parted_segs(src, &n, &segs, &off, &err)) return err;
+    int64_t run = -1;                                   /* first row of the pending plain run */
+    for (int64_t i = 0; i <= n; i++) {
+        ray_enc_col_totals_t z;
+        bool dir = false, empty = false;
+        if (i < n) {
+            ray_t* sg = segs[i];
+            int64_t sl = off[i + 1] - off[i];
+            ray_enccol_t* e = sg && sg->type == RAY_ENCCOL ? ray_enccol_of(sg) : NULL;
+            if (sl <= 0) empty = true;
+            else if (e && e->kind == RAY_ENCCOL_SINGLE && e->len == sl && e->type == t) {
+                if (e->synthetic) empty = true;         /* all null: no rows, no extremes */
+                else dir = ray_dir_seg_totals(sg, opcode, &z);
+            }
+        }
+        if (i < n && !dir && !empty) { if (run < 0) run = off[i]; continue; }
+        if (run >= 0) {                                 /* flush the plain run before this segment */
+            reduce_acc_t acc;
+            if ((err = reduce_src_walk(src, run, off[i] - run, opcode, &acc)) != NULL) return err;
+            reduce_merge(merged, &acc, t, NULL, opcode);
+            run = -1;
+        }
+        if (dir) {
+            reduce_acc_t acc;
+            reduce_acc_init(&acc);
+            acc.sum_i = (int64_t)z.sum_wrapped;
+            acc.sum_hi = z.sum_hi;
+            acc.cnt = z.nonnull;
+            if (z.nonnull > 0) { acc.min_i = z.min_i; acc.max_i = z.max_i; }
+            reduce_merge(merged, &acc, t, NULL, opcode);
+        }
+    }
+    *done = true;
+    return NULL;
+}
+
 ray_t* ray_reduce_src(ray_col_src_t* src, uint16_t opcode, int8_t out_type) {
     int8_t t = src->type;
     int64_t len = src->len;
@@ -4525,7 +4600,7 @@ ray_t* ray_reduce_src(ray_col_src_t* src, uint16_t opcode, int8_t out_type) {
     bool mm_ok = t == RAY_F32 ? out_type == RAY_F64 : (out_type == 0 || out_type == t);
     bool dir_ok = opcode == OP_SUM || opcode == OP_AVG ||
                   ((opcode == OP_MIN || opcode == OP_MAX) && mm_ok);
-    ray_t* dir = dir_ok ? ray_zone_dir_answer(src->obj, opcode) : NULL;
+    ray_t* dir = dir_ok ? ray_dir_answer(src->obj, opcode) : NULL;
     if (dir && fl && dir->type == -RAY_F64 && !RAY_ATOM_IS_NULL(dir) && !(fabs(dir->f64) <= DBL_MAX)) {
         ray_release(dir);
         dir = NULL;
@@ -4533,26 +4608,21 @@ ray_t* ray_reduce_src(ray_col_src_t* src, uint16_t opcode, int8_t out_type) {
     if (dir) return dir;
     if (opcode == OP_FIRST || opcode == OP_LAST)
         return reduce_src_edge(src, opcode == OP_LAST, true);
-    ray_pool_t* pool = ray_pool_get();
-    uint32_t nw = (pool && len >= RAY_PARALLEL_THRESHOLD) ? ray_pool_total_workers(pool) : 1;
-    ray_t* accs_hdr;
-    reduce_acc_t* accs = (reduce_acc_t*)scratch_calloc(&accs_hdr, nw * sizeof(reduce_acc_t));
-    if (!accs) return ray_error("oom", NULL);
-    for (uint32_t i = 0; i < nw; i++) reduce_acc_init(&accs[i]);
-    par_reduce_src_ctx_t ctx = { .src = src, .base = ray_col_src_base(src), .accs = accs,
-                                 .has_nulls = src->may_null, .opcode = opcode };
-    ray_scan_fail_init(&ctx.fail);
-    if (len > 0) ray_col_src_advise(src, 0, len);
-    if (nw > 1) ray_pool_dispatch(pool, par_reduce_src_fn, &ctx, len);
-    else if (len > 0) par_reduce_src_fn(&ctx, 0, 0, len);
-    ray_t* err = ray_scan_fail_finish(&ctx.fail, nw > 1 ? pool : NULL);
-    if (err) { scratch_free(accs_hdr); return err; }
-    /* worker 0 is the base, the rest merged in order (exec_reduction) */
-    reduce_acc_t merged = accs[0];
-    for (uint32_t i = 1; i < nw; i++) reduce_merge(&merged, &accs[i], t, NULL, opcode);
-    ray_t* res = reduce_result(opcode, out_type, t, &merged, len, NULL);
-    scratch_free(accs_hdr);
-    return res;
+    reduce_acc_t merged;
+    reduce_acc_init(&merged);
+    ray_t* err;
+    if (dir_ok && !fl && src->parted && ray_col_src_encoded(src)) {
+        /* integer and temporal SUM / AVG / MIN / MAX of a parted source:
+         * each encoded segment from its directory, the rest by range reads */
+        bool done = false;
+        err = reduce_src_parted(src, opcode, &merged, &done);
+        if (err) return err;
+        if (!done) err = reduce_src_walk(src, 0, len, opcode, &merged);
+    } else {
+        err = reduce_src_walk(src, 0, len, opcode, &merged);
+    }
+    if (err) return err;
+    return reduce_result(opcode, out_type, t, &merged, len, NULL);
 }
 
 ray_t* exec_reduction_src(ray_graph_t* g, ray_op_t* op, ray_col_src_t* src) {
