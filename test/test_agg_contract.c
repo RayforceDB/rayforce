@@ -2347,12 +2347,13 @@ static test_result_t test_cd_gate_read_ahead(void) {
     (void)ray_test_rm_rf(PFS_ROOT);
     enum { FAULTS_MAX = 64 };
 
-    /* w: 16 MB (4,096 pages); k, x: 32 MB each */
+    /* w: 16 MB (4,096 pages); k, x, t: 32 MB each; t is the row number,
+     * sorted, with the chunk-zone index a splayed column carries */
     enum { N = 4194304 };
     ray_t* r = ray_eval_str(
         "(set pfs_i (til 4194304))"
-        "(set pfs_t (table [w k x] (list (as 'I32 (% pfs_i 977)) (% pfs_i 1000)"
-        " (% (* pfs_i 7919) 2000003))))"
+        "(set pfs_t (table [w k x t] (list (as 'I32 (% pfs_i 977)) (% pfs_i 1000)"
+        " (% (* pfs_i 7919) 2000003) pfs_i)))"
         "(.db.splayed.set \"" PFS_DIR "\" pfs_t)"
         "(set pfs_m (.db.splayed.get \"" PFS_DIR "\"))");
     TEST_ASSERT_NOT_NULL(r);
@@ -2383,11 +2384,50 @@ static test_result_t test_cd_gate_read_ahead(void) {
                     (unsigned long long)b_where, (unsigned long long)N * 4);
     TEST_ASSERT_FMT(f_where <= FAULTS_MAX, "where sample: %ld major faults", f_where);
 
-    /* the estimate over the survivors: a tenth of the rows, 50 to a page
-     * of k and x — the columns are asked for whole */
+    /* a slice of the sorted column: the zone gate rules out every chunk
+     * but the two (64 K rows each) the window falls in, so the sample is
+     * their rows — every survivor, the population exact — and reads a
+     * sixteenth of t at most, not the column */
+    ray_t* pred_t = ray_eval_str("(quote (and (>= t 2000000) (< t 2040000)))");
+    TEST_ASSERT_TRUE(pred_t && !RAY_IS_ERR(pred_t) && !pfs_col_resident("t"));
+    const int64_t* rows_t = NULL;
+    int64_t nrows_t = 0, pop_t = 0;
+    f0 = cd_major_faults();
+    b0 = ray_vm_willneed_bytes();
+    ray_t* hdr_t = query_cd_gate_where_rows(m, pred_t, N, &rows_t, &nrows_t, &pop_t);
+    long f_slice = cd_major_faults() - f0;
+    uint64_t b_slice = ray_vm_willneed_bytes() - b0;
+    TEST_ASSERT_NOT_NULL(hdr_t);
+    TEST_ASSERT_FMT(nrows_t == 40000 && pop_t == 40000, "slice sample keeps %lld for %lld",
+                    (long long)nrows_t, (long long)pop_t);
+    TEST_ASSERT_FMT(b_slice >= (uint64_t)40000 * 8 && b_slice <= (uint64_t)N * 8 / 16,
+                    "slice sample asked for %llu bytes of t's %llu", (unsigned long long)b_slice,
+                    (unsigned long long)N * 8);
+    TEST_ASSERT_FMT(f_slice <= FAULTS_MAX, "slice sample: %ld major faults", f_slice);
+    scratch_free(hdr_t);
+    ray_release(pred_t);
+
+    /* the estimate over a contiguous slice, 1% of the rows: the span the
+     * sampled rows cover is asked for — a row per page and more there —
+     * not the columns whole */
     TEST_ASSERT_TRUE(!pfs_col_resident("k") && !pfs_col_resident("x"));
     ray_t* cols[2] = { k, x };
     int64_t est[2], kp = 0, kmax = 0, ka = 0;
+    enum { SLICE = N / 100 };
+    int64_t* slice = malloc((size_t)SLICE * sizeof(int64_t));
+    TEST_ASSERT_NOT_NULL(slice);
+    for (int64_t i = 0; i < SLICE; i++) slice[i] = N / 2 + i;
+    b0 = ray_vm_willneed_bytes();
+    TEST_ASSERT_TRUE(agg_group_card_sample(cols, 2, 1, slice, SLICE, 0, est, &kp, &kmax, &ka));
+    uint64_t b_span = ray_vm_willneed_bytes() - b0;
+    free(slice);
+    /* the span runs from the first sampled row to the last, a window short */
+    TEST_ASSERT_FMT(b_span >= (uint64_t)SLICE * 16 * 9 / 10 && b_span <= (uint64_t)SLICE * 16 * 4,
+                    "slice estimate asked for %llu bytes, the slice of k and x is %llu",
+                    (unsigned long long)b_span, (unsigned long long)SLICE * 16);
+
+    /* the estimate over the survivors: a tenth of the rows, 50 to a page
+     * of k and x — the columns are asked for whole */
     f0 = cd_major_faults();
     b0 = ray_vm_willneed_bytes();
     TEST_ASSERT_TRUE(agg_group_card_sample(cols, 2, 1, rows, nrows, pop, est, &kp, &kmax, &ka));
@@ -2395,7 +2435,8 @@ static test_result_t test_cd_gate_read_ahead(void) {
     uint64_t b_est = ray_vm_willneed_bytes() - b0;
     scratch_free(hdr);
     TEST_ASSERT_FMT(est[0] >= 900 && est[0] <= 1100, "k estimate %lld", (long long)est[0]);
-    TEST_ASSERT_FMT(b_est >= (uint64_t)N * 16, "estimate asked for %llu bytes, k and x are %llu",
+    /* the span from the first sampled row to the last: the columns but a few rows */
+    TEST_ASSERT_FMT(b_est >= (uint64_t)N * 16 * 15 / 16, "estimate asked for %llu bytes, k and x are %llu",
                     (unsigned long long)b_est, (unsigned long long)N * 16);
     TEST_ASSERT_FMT(f_est <= FAULTS_MAX, "estimate: %ld major faults", f_est);
     ray_release(pred);
@@ -2405,15 +2446,15 @@ static test_result_t test_cd_gate_read_ahead(void) {
     (void)ray_test_rm_rf(PFS_ROOT);
 
     /* The gate over a selection sparser than a row per page: the pages of
-     * the sampled rows alone are asked for.  k3 (136 MB, 33,203 pages;
-     * a million values) over 33,000 rows, two to every other page:
-     * 32,768 of them are sampled, read as distinct, and the estimate
-     * stands at the span, a million — past the sample's reach and short
-     * of the many-groups mark — so the count is confirmed in full, over
-     * the half of the column the estimate never touched. */
-    enum { N3 = 17000000, SEL3 = 33000 };
+     * the sampled rows alone are asked for.  k3 (272 MB, 66,406 pages; a
+     * million values) over 33,000 rows, one to every other page: 32,768
+     * of them are sampled, read as distinct, and the estimate stands at
+     * the span, a million — past the sample's reach and short of the
+     * many-groups mark — so the count is confirmed in full, over the half
+     * of the column the estimate never touched. */
+    enum { N3 = 34000000, SEL3 = 33000 };
     r = ray_eval_str(
-        "(set pfs_j (til 17000000))"
+        "(set pfs_j (til 34000000))"
         "(set pfs_t (table [k3 x3] (list (% (* pfs_j 7919) 1000000) (as 'U8 (% pfs_j 200)))))"
         "(set pfs_j 0)"
         "(.db.splayed.set \"" PFS_DIR "\" pfs_t)"
@@ -2430,7 +2471,7 @@ static test_result_t test_cd_gate_read_ahead(void) {
     TEST_ASSERT_TRUE(k3 && x3 && k3->mmod == 1 && (size_t)k3->len * 8 / 4096 > (size_t)SEL3);
     int64_t* sel = malloc((size_t)SEL3 * sizeof(int64_t));
     TEST_ASSERT_NOT_NULL(sel);
-    for (int64_t i = 0; i < SEL3; i++) sel[i] = (i / 2) * 1024 + (i & 1);
+    for (int64_t i = 0; i < SEL3; i++) sel[i] = i * 1030;
     f0 = cd_major_faults();
     b0 = ray_vm_willneed_bytes();
     bool two_pass = ray_cd_two_pass_preferred(&k3, 1, x3, sel, SEL3, 0, 4);
@@ -2440,7 +2481,7 @@ static test_result_t test_cd_gate_read_ahead(void) {
     TEST_ASSERT_FALSE(two_pass);   /* a million groups counted, not many: the slices */
     /* the sampled rows' pages of k3 (one each) for the estimate, and k3
      * whole for the count; x3 besides */
-    const uint64_t b_need = (uint64_t)N3 * 8 + (uint64_t)(SEL3 / 2) * 4096;
+    const uint64_t b_need = (uint64_t)N3 * 8 + (uint64_t)SEL3 * 4096;
     TEST_ASSERT_FMT(b_gate >= b_need, "gate asked for %llu bytes, needs %llu",
                     (unsigned long long)b_gate, (unsigned long long)b_need);
     TEST_ASSERT_FMT(f_gate <= FAULTS_MAX, "gate: %ld major faults", f_gate);

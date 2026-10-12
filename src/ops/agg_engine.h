@@ -255,7 +255,8 @@ bool agg_group_card_sample(ray_t** cols, uint32_t n, uint32_t n_prefix,
 /* The rows the estimator samples (every row below that). */
 #define AGG_EST_SAMPLE_ROWS (1 << 15)
 
-/* The row the estimator samples from window i of `stride` rows: an offset
+/* The row the estimator samples from window i of the `sample` equal ones
+ * the rows are cut into (nrows / sample rows each, fractional): an offset
  * into the window hashed from i by the splitmix64 finaliser.  A fixed
  * offset reads a key whose period divides the stride — five values
  * cycling under a stride of 305 — as one value.  An offset nearly linear
@@ -266,12 +267,20 @@ bool agg_group_card_sample(ray_t** cols, uint32_t n, uint32_t n_prefix,
  * tenth of its groups.  The finaliser's offsets make the collisions those
  * of a random sample.  Shared with a planner sampling rows for a predicate
  * (query.c). */
-static inline int64_t agg_est_sample_row(int64_t i, int64_t stride) {
+static inline int64_t agg_est_sample_row(int64_t i, int64_t sample, int64_t nrows) {
+    /* window i of `sample` equal ones over the rows, [lo, hi): a whole
+     * stride would leave the rows past sample * (nrows / sample) unread,
+     * the last fifth of 41,943 rows under a sample of 32,768 */
+    const int64_t lo = (int64_t)((double)i * (double)nrows / (double)sample);
+    int64_t hi = (int64_t)((double)(i + 1) * (double)nrows / (double)sample);
+    if (hi > nrows) hi = nrows;
+    const int64_t w = hi - lo;
+    if (w <= 1) return lo;
     uint64_t h = (uint64_t)i * 0x9E3779B97F4A7C15ULL;
     h = (h ^ (h >> 30)) * 0xBF58476D1CE4E5B9ULL;
     h = (h ^ (h >> 27)) * 0x94D049BB133111EBULL;
     h ^= h >> 31;
-    return i * stride + (int64_t)(h % (uint64_t)stride);
+    return lo + (int64_t)(h % (uint64_t)w);
 }
 
 /* The product of the per-key estimates above for key_cols: the packed key

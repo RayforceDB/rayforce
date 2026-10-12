@@ -2046,11 +2046,14 @@ void ray_col_want_row(ray_t* col, int64_t row) {
 /* A run of pages to request, and the pool task that requests a range of
  * such runs (col_want_runs_fn). */
 typedef struct { uintptr_t a; size_t bytes; } col_want_run_t;
+typedef struct { const col_want_run_t* runs; size_t nr, per; } col_want_ctx_t;
 
+/* Task `start` of a dispatch_n: runs [start * per, (start + 1) * per). */
 static void col_want_runs_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
-    (void)wid;
-    const col_want_run_t* runs = raw;
-    for (int64_t i = start; i < end; i++) ray_vm_advise_willneed((void*)runs[i].a, runs[i].bytes);
+    (void)wid; (void)end;
+    const col_want_ctx_t* c = raw;
+    size_t a = (size_t)start * c->per, b = a + c->per < c->nr ? a + c->per : c->nr;
+    for (size_t i = a; i < b; i++) ray_vm_advise_willneed((void*)c->runs[i].a, c->runs[i].bytes);
 }
 
 void ray_col_want_rows(ray_t* col, const int64_t* idx, int64_t n) {
@@ -2121,15 +2124,22 @@ void ray_col_want_rows(ray_t* col, const int64_t* idx, int64_t n) {
     ray_free_raw(mark);
     if (!runs) return;
     /* Many short runs — a sparse sample of a large column, a page apiece —
-     * are requested over the pool's threads: one request costs a few
+     * are requested over the pool's threads, a task per 256 of them
+     * (ray_pool_dispatch_n: the plain dispatch cuts at 8,192 elements, and
+     * thousands of runs would stay on one task): one request costs a few
      * microseconds of the kernel's, and 30,000 of them on this thread
      * 100 ms.  Few, or long, each through ray_pool_want, which splits a
      * long range over the threads itself. */
+    enum { RUNS_PER_TASK = 256 };
     ray_pool_t* pool = ray_pool_get();
-    if (nr >= 256 && ray_pool_par_dispatch_ok(pool, (int64_t)nr, 256))
-        ray_pool_dispatch(pool, col_want_runs_fn, runs, (int64_t)nr);
-    else
+    if (nr >= 2 * RUNS_PER_TASK && ray_pool_par_dispatch_ok(pool, (int64_t)nr, 2 * RUNS_PER_TASK)) {
+        size_t tasks = (nr + RUNS_PER_TASK - 1) / RUNS_PER_TASK;
+        if (tasks > RAY_POOL_INIT_TASKS) tasks = RAY_POOL_INIT_TASKS;
+        col_want_ctx_t ctx = { runs, nr, (nr + tasks - 1) / tasks };
+        ray_pool_dispatch_n(pool, col_want_runs_fn, &ctx, (uint32_t)tasks);
+    } else {
         for (size_t i = 0; i < nr; i++) ray_pool_want((void*)runs[i].a, runs[i].bytes);
+    }
     ray_free_raw(runs);
 }
 

@@ -689,7 +689,6 @@ bool agg_group_card_sample(ray_t** cols, uint32_t n, uint32_t n_prefix,
     }
     const bool    tuples = prefix_est || prefix_max || all_est;
     const int64_t sample = nrows < AGG_EST_SAMPLE ? nrows : AGG_EST_SAMPLE;
-    const int64_t stride = nrows / sample;
     uint64_t slots = 64;
     while (slots < (uint64_t)sample * 2) slots <<= 1;
     const uint32_t nsets = n + (tuples ? 2 : 0);
@@ -702,20 +701,32 @@ bool agg_group_card_sample(ray_t** cols, uint32_t n, uint32_t n_prefix,
      * column not in memory waited on its own page fault, on this thread —
      * a quarter second and more per column at 100 M rows, where the pass
      * costs a millisecond in memory.  The pages asked for are those the
-     * sampled rows fall on (ray_col_want_rows), or the column whole when
-     * the rows the estimate describes fall on every page of it — a row per
-     * page or more: the select reads it whole then, and its stream runs
-     * while this pass waits on the first of them; a sample's pages alone,
-     * 30,000 reads of one page each, took twice as long as the stream. */
+     * sampled rows fall on (ray_col_want_rows), or the rows between the
+     * first and last sampled as one range when the rows the estimate
+     * describes fall on every page of that span — a row per page or more:
+     * the select reads the span whole then, and its stream runs while this
+     * pass waits on the first of them; a sample's pages alone, 30,000
+     * reads of one page each, took twice as long as the stream.  The span,
+     * not the column: a selection over a slice of a time-ordered table
+     * asks for its slice (a 1% window asked for the columns whole before,
+     * 90 MB read for 2 needed at 4 M rows). */
     int64_t* pos = (int64_t*)(mem + set_bytes * nsets);
     for (int64_t i = 0; i < sample; i++) {
-        const int64_t ri = agg_est_sample_row(i, stride);
+        const int64_t ri = agg_est_sample_row(i, sample, nrows);
         pos[i] = rows ? rows[ri] : ri;
     }
+    int64_t lo_r = pos[0], hi_r = pos[0];
+    for (int64_t i = 1; i < sample; i++) {
+        if (pos[i] < lo_r) lo_r = pos[i];
+        if (pos[i] > hi_r) hi_r = pos[i];
+    }
     for (uint32_t k = 0; k < n; k++) {
-        const size_t bytes = (size_t)cols[k]->len * esz[k];
-        if (pop >= (int64_t)(bytes >> 12)) {
-            if (ray_pool_scan_on() && ray_col_cold(cols[k])) ray_pool_want(ray_data(cols[k]), bytes);
+        const size_t span = (size_t)(hi_r - lo_r + 1) * esz[k];
+        if (pop >= (int64_t)(span >> 12)) {
+            if (cols[k]->mmod == 1 && ray_pool_scan_on()) {
+                const uint8_t* p = (const uint8_t*)data[k] + (size_t)lo_r * esz[k];
+                if (!ray_vm_resident(p, span)) ray_pool_want(p, span);
+            }
         } else {
             ray_col_want_rows(cols[k], pos, sample);
         }

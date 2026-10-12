@@ -7323,168 +7323,6 @@ static ray_t* query_materialize_parted_col(ray_t* col) {
 static int collect_col_refs_set(ray_t* expr, ray_t* tbl,
                                 int64_t* out_syms, int max_out, int n);
 
-/* The rows a `where:` keeps, for the route gate below — sampled, not
- * evaluated in full: CD_GATE_WHERE_SAMPLE rows of the table are read at the
- * estimator's hashed stride (agg_est_sample_row), the columns the predicate
- * names gathered from them into a table of that many rows, and the
- * predicate run over it as the select would run it.  The survivors' table
- * rows come back in *rows (nrows of them), with *population the rows the
- * whole predicate would keep, scaled from the sample; the estimates over
- * them describe the filtered table.  Running the predicate over the whole
- * table instead cost 18 ms of a 90 ms select at 100 M rows when the gate
- * then chose the slices, whose path evaluates it again; this costs a few,
- * the gather over the pool's threads.  The pages the sampled rows fall on
- * are asked for ahead of the reads (ray_col_want_rows — at this stride
- * about every page of a mapped column, requested through the pool as the
- * select's own scan would): read as they were met, a column not in memory
- * waited on a page fault per sampled row, on this thread, 0.8 s and more
- * of a half-second select at 100 M rows.
- * NULL — the gate then estimates over the whole table — when the predicate
- * names no column, names one the gather does not cover (text, nested,
- * parted), keeps every sampled row, or memory runs out.  The returned
- * block owns the row list; scratch_free it after the gate. */
-enum { CD_GATE_WHERE_SAMPLE = AGG_EST_SAMPLE_ROWS * 8 };
-
-/* The sampled rows of the predicate's columns gathered over a range of the
- * sample: a task of the pool, the columns in turn. */
-typedef struct {
-    const void* const* src;
-    void* const*       dst;
-    const uint8_t*     esz;
-    const int64_t*     idx;
-    int                n;
-} cd_gate_gather_ctx_t;
-
-static void cd_gate_gather_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
-    (void)wid;
-    const cd_gate_gather_ctx_t* c = raw;
-    const int64_t* idx = c->idx;
-    enum { AHEAD = 16 };
-    for (int j = 0; j < c->n; j++) {
-        /* the sampled rows miss the cache: typed loads with reads kept in
-         * flight (a byte-wise copy serialised them, 25 ms for the 262,144) */
-        switch (c->esz[j]) {
-#define CD_GATE_GATHER(T) do {                                                      \
-            const T* sp = (const T*)c->src[j]; T* dp = (T*)c->dst[j];                 \
-            for (int64_t r = start; r < end; r++) {                                   \
-                if (r + AHEAD < end) __builtin_prefetch(sp + idx[r + AHEAD]);         \
-                dp[r] = sp[idx[r]];                                                   \
-            }                                                                         \
-        } while (0)
-        case 1: CD_GATE_GATHER(uint8_t); break;
-        case 2: CD_GATE_GATHER(uint16_t); break;
-        case 4: CD_GATE_GATHER(uint32_t); break;
-        default: CD_GATE_GATHER(uint64_t); break;
-#undef CD_GATE_GATHER
-        }
-    }
-}
-
-ray_t* query_cd_gate_where_rows(ray_t* tbl, ray_t* where_expr, int64_t n_table,
-                                const int64_t** rows, int64_t* nrows, int64_t* population) {
-    *rows = NULL; *nrows = n_table; *population = 0;
-    if (n_table <= 0) return NULL;
-    int64_t ncols_max = ray_table_ncols(tbl);
-    if (ncols_max < 1) return NULL;
-    ray_t* syms_hdr = NULL;
-    int64_t* syms = (int64_t*)scratch_alloc(&syms_hdr, (size_t)ncols_max * sizeof(int64_t));
-    if (!syms) return NULL;
-    int n_ref = collect_col_refs_set(where_expr, tbl, syms, (int)ncols_max, 0);
-    for (int i = 0; i < n_ref; i++) {
-        ray_t* c = ray_table_get_col(tbl, syms[i]);
-        if (!c || RAY_IS_ERR(c) || RAY_IS_PARTED(c->type) || c->type == RAY_MAPCOMMON ||
-            c->len < n_table) { n_ref = 0; break; }
-        switch (c->type) {
-        case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8: case RAY_BOOL:
-        case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: case RAY_F64: case RAY_F32:
-        case RAY_SYM: break;
-        default: n_ref = 0; break;
-        }
-        if (n_ref == 0) break;
-    }
-    if (n_ref <= 0) { scratch_free(syms_hdr); return NULL; }
-
-    const int64_t n_s = n_table < CD_GATE_WHERE_SAMPLE ? n_table : CD_GATE_WHERE_SAMPLE;
-    const int64_t stride = n_table / n_s;
-    ray_t* idx_hdr = NULL;
-    int64_t* idx = (int64_t*)scratch_alloc(&idx_hdr, (size_t)n_s * sizeof(int64_t));
-    if (!idx) { scratch_free(syms_hdr); return NULL; }
-    for (int64_t i = 0; i < n_s; i++) idx[i] = agg_est_sample_row(i, stride);
-
-    /* The gathered columns, made first; then the rows gathered into them
-     * over the pool's threads. */
-    ray_t* gv_hdr = NULL;
-    uint8_t* gv_mem = (uint8_t*)scratch_alloc(&gv_hdr, (size_t)n_ref * (sizeof(ray_t*) + sizeof(void*) * 2 + 1));
-    if (!gv_mem) { scratch_free(idx_hdr); scratch_free(syms_hdr); return NULL; }
-    ray_t**      gv  = (ray_t**)gv_mem;
-    const void** src = (const void**)(gv_mem + (size_t)n_ref * sizeof(ray_t*));
-    void**       dst = (void**)(gv_mem + (size_t)n_ref * (sizeof(ray_t*) + sizeof(void*)));
-    uint8_t*     esz = gv_mem + (size_t)n_ref * (sizeof(ray_t*) + sizeof(void*) * 2);
-    int n_g = 0;
-    for (int i = 0; i < n_ref; i++) {
-        ray_t* c = ray_table_get_col(tbl, syms[i]);
-        /* the pages the sampled rows fall on, asked for ahead of the reads */
-        ray_col_want_rows(c, idx, n_s);
-        /* a SYM column at its own code width: ray_vec_new would make a
-         * 64-bit one, and the copy below is by the source's width */
-        ray_t* g = c->type == RAY_SYM ? ray_sym_vec_new(c->attrs & RAY_SYM_W_MASK, n_s)
-                                      : ray_vec_new(c->type, n_s);
-        if (!g || RAY_IS_ERR(g)) { if (g) ray_release(g); break; }
-        g->len = n_s;
-        g->attrs |= c->attrs & RAY_ATTR_HAS_NULLS;
-        if (c->type == RAY_SYM) ray_sym_vec_adopt_domain(g, c);
-        gv[n_g] = g; src[n_g] = ray_data(c); dst[n_g] = ray_data(g); esz[n_g] = col_esz(c);
-        n_g++;
-    }
-    ray_t* st = n_g == n_ref ? ray_table_new(0) : NULL;
-    if (st && RAY_IS_ERR(st)) { ray_error_free(st); st = NULL; }
-    if (st) {
-        cd_gate_gather_ctx_t ctx = { src, dst, esz, idx, n_g };
-        ray_pool_t* pool = ray_pool_get();
-        if (ray_pool_par_dispatch_ok(pool, n_s, AGG_EST_SAMPLE_ROWS))
-            ray_pool_dispatch(pool, cd_gate_gather_fn, &ctx, n_s);
-        else
-            cd_gate_gather_fn(&ctx, 0, 0, n_s);
-        for (int i = 0; i < n_g && st; i++) {
-            /* add_col releases the table on an error and returns the error */
-            st = ray_table_add_col(st, syms[i], gv[i]);
-            if (st && RAY_IS_ERR(st)) { ray_error_free(st); st = NULL; }
-        }
-    }
-    for (int i = 0; i < n_g; i++) ray_release(gv[i]);
-    scratch_free(gv_hdr);
-    scratch_free(syms_hdr);
-    if (!st) { scratch_free(idx_hdr); return NULL; }
-
-    ray_t* out_hdr = NULL;
-    ray_graph_t* gs = ray_graph_new(st);
-    if (gs) {
-        ray_op_t* pred = compile_expr_dag(gs, where_expr);
-        ray_op_t* froot = pred ? ray_filter(gs, ray_const_table(gs, st), pred) : NULL;
-        if (froot) froot = ray_optimize(gs, froot);
-        /* the filter returns its input (the sampled table) retained, with
-         * the selection installed on the graph */
-        ray_t* fres = froot ? exec_node(gs, froot) : NULL;
-        if (fres && !RAY_IS_ERR(fres) && gs->selection) {
-            const int64_t kept = ray_rowsel_meta(gs->selection)->total_pass;
-            ray_t* ind = kept > 0 ? ray_rowsel_to_indices(gs->selection) : NULL;
-            int64_t* out = (int64_t*)scratch_alloc(&out_hdr, (size_t)(kept > 0 ? kept : 1) * sizeof(int64_t));
-            if (out && (ind || kept == 0)) {
-                const int64_t* ii = ind ? (const int64_t*)ray_data(ind) : NULL;
-                for (int64_t j = 0; j < kept; j++) out[j] = idx[ii[j]];
-                *rows = out; *nrows = kept;
-                *population = (int64_t)((double)n_table * (double)kept / (double)n_s);
-                if (kept > 0 && *population < kept) *population = kept;
-            } else if (out_hdr) { scratch_free(out_hdr); out_hdr = NULL; }
-            if (ind) ray_release(ind);
-        }
-        if (fres) { if (RAY_IS_ERR(fres)) ray_error_free(fres); else ray_release(fres); }
-        ray_graph_free(gs);
-    }
-    ray_release(st);
-    scratch_free(idx_hdr);
-    return out_hdr;
-}
 
 /* Planner rewrite for `(select {K: K c: (count (distinct X)) from: T
  * [where: W] by: K [desc: c take: N]})`.
@@ -10973,6 +10811,213 @@ static void scan_gate_where(select_scan_t* ss, ray_t* e, ray_t* tbl, int depth) 
         }
     }
     scan_gate_conjunct(ss, e, tbl);
+}
+
+/* The rows a `where:` keeps, for the route gate below — sampled, not
+ * evaluated in full: CD_GATE_WHERE_SAMPLE rows of the table are read at the
+ * estimator's hashed stride (agg_est_sample_row), the columns the predicate
+ * names gathered from them into a table of that many rows, and the
+ * predicate run over it as the select would run it.  The survivors' table
+ * rows come back in *rows (nrows of them), with *population the rows the
+ * whole predicate would keep, scaled from the sample; the estimates over
+ * them describe the filtered table.  Running the predicate over the whole
+ * table instead cost 18 ms of a 90 ms select at 100 M rows when the gate
+ * then chose the slices, whose path evaluates it again; this costs a few,
+ * the gather over the pool's threads.  The pages the sampled rows fall on
+ * are asked for ahead of the reads (ray_col_want_rows — at this stride
+ * about every page of a mapped column, requested through the pool as the
+ * select's own scan would): read as they were met, a column not in memory
+ * waited on a page fault per sampled row, on this thread, 0.8 s and more
+ * of a half-second select at 100 M rows.
+ * The sample is drawn from the chunks the select's own zone gate lets
+ * through (scan_gate_where: a conjunct over an integer or temporal column
+ * with a chunk-zone index): a filter on a slice of a time-ordered column
+ * reads the pages of its chunks, not every page of the column, and the
+ * key and value columns are then asked for over that slice too.
+ * NULL — the gate then estimates over the whole table — when the predicate
+ * names no column, names one the gather does not cover (text, nested,
+ * parted), keeps every sampled row, or memory runs out.  The returned
+ * block owns the row list; scratch_free it after the gate. */
+enum { CD_GATE_WHERE_SAMPLE = AGG_EST_SAMPLE_ROWS * 8 };
+
+/* The sampled rows of the predicate's columns gathered over a range of the
+ * sample: a task of the pool, the columns in turn. */
+typedef struct {
+    const void* const* src;
+    void* const*       dst;
+    const uint8_t*     esz;
+    const int64_t*     idx;
+    int                n;
+} cd_gate_gather_ctx_t;
+
+static void cd_gate_gather_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    const cd_gate_gather_ctx_t* c = raw;
+    const int64_t* idx = c->idx;
+    enum { AHEAD = 16 };
+    for (int j = 0; j < c->n; j++) {
+        /* the sampled rows miss the cache: typed loads with reads kept in
+         * flight (a byte-wise copy serialised them, 25 ms for the 262,144) */
+        switch (c->esz[j]) {
+#define CD_GATE_GATHER(T) do {                                                      \
+            const T* sp = (const T*)c->src[j]; T* dp = (T*)c->dst[j];                 \
+            for (int64_t r = start; r < end; r++) {                                   \
+                if (r + AHEAD < end) __builtin_prefetch(sp + idx[r + AHEAD]);         \
+                dp[r] = sp[idx[r]];                                                   \
+            }                                                                         \
+        } while (0)
+        case 1: CD_GATE_GATHER(uint8_t); break;
+        case 2: CD_GATE_GATHER(uint16_t); break;
+        case 4: CD_GATE_GATHER(uint32_t); break;
+        default: CD_GATE_GATHER(uint64_t); break;
+#undef CD_GATE_GATHER
+        }
+    }
+}
+
+ray_t* query_cd_gate_where_rows(ray_t* tbl, ray_t* where_expr, int64_t n_table,
+                                const int64_t** rows, int64_t* nrows, int64_t* population) {
+    *rows = NULL; *nrows = n_table; *population = 0;
+    if (n_table <= 0) return NULL;
+    int64_t ncols_max = ray_table_ncols(tbl);
+    if (ncols_max < 1) return NULL;
+    ray_t* syms_hdr = NULL;
+    int64_t* syms = (int64_t*)scratch_alloc(&syms_hdr, (size_t)ncols_max * sizeof(int64_t));
+    if (!syms) return NULL;
+    int n_ref = collect_col_refs_set(where_expr, tbl, syms, (int)ncols_max, 0);
+    for (int i = 0; i < n_ref; i++) {
+        ray_t* c = ray_table_get_col(tbl, syms[i]);
+        if (!c || RAY_IS_ERR(c) || RAY_IS_PARTED(c->type) || c->type == RAY_MAPCOMMON ||
+            c->len < n_table) { n_ref = 0; break; }
+        switch (c->type) {
+        case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8: case RAY_BOOL:
+        case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: case RAY_F64: case RAY_F32:
+        case RAY_SYM: break;
+        default: n_ref = 0; break;
+        }
+        if (n_ref == 0) break;
+    }
+    if (n_ref <= 0) { scratch_free(syms_hdr); return NULL; }
+
+    /* The chunks the zone gate lets through, and the rows they hold (P):
+     * the sample is drawn from those rows. */
+    select_scan_t ss;
+    memset(&ss, 0, sizeof ss);
+    ss.scan.rows = n_table;
+    scan_gate_where(&ss, where_expr, tbl, 0);
+    int64_t   P = n_table, n_pass = 0;
+    uint32_t* pass = NULL;
+    ray_t*    pass_hdr = NULL;
+    const uint8_t lg = ss.scan.gate_log2;
+    if (ss.scan.gate) {
+        const int64_t nch = (n_table + ((int64_t)1 << lg) - 1) >> lg;
+        pass = (uint32_t*)scratch_alloc(&pass_hdr, (size_t)nch * sizeof(uint32_t));
+        if (!pass) { scratch_free(ss.gate_hdr); scratch_free(syms_hdr); return NULL; }
+        for (int64_t ch = 0; ch < nch; ch++)
+            if ((ss.scan.gate[ch >> 6] >> (ch & 63)) & 1) pass[n_pass++] = (uint32_t)ch;
+        if (n_pass == nch) {
+            scratch_free(pass_hdr); pass = NULL;   /* nothing ruled out */
+        } else {
+            P = n_pass << lg;
+            if (n_pass > 0 && pass[n_pass - 1] == (uint32_t)(nch - 1))
+                P -= (nch << lg) - n_table;        /* the last chunk is short */
+        }
+    }
+    if (ss.gate_hdr) scratch_free(ss.gate_hdr);
+    if (P <= 0) {
+        /* no chunk can hold a survivor: the predicate keeps nothing */
+        if (pass_hdr) scratch_free(pass_hdr);
+        scratch_free(syms_hdr);
+        ray_t* out_hdr = NULL;
+        int64_t* out = (int64_t*)scratch_alloc(&out_hdr, sizeof(int64_t));
+        if (!out) return NULL;
+        *rows = out; *nrows = 0; *population = 0;
+        return out_hdr;
+    }
+    const int64_t n_s = P < CD_GATE_WHERE_SAMPLE ? P : CD_GATE_WHERE_SAMPLE;
+    ray_t* idx_hdr = NULL;
+    int64_t* idx = (int64_t*)scratch_alloc(&idx_hdr, (size_t)n_s * sizeof(int64_t));
+    if (!idx) { if (pass_hdr) scratch_free(pass_hdr); scratch_free(syms_hdr); return NULL; }
+    const int64_t cmask = ((int64_t)1 << lg) - 1;
+    for (int64_t i = 0; i < n_s; i++) {
+        const int64_t j = agg_est_sample_row(i, n_s, P);   /* among the rows let through */
+        idx[i] = pass ? (((int64_t)pass[j >> lg] << lg) | (j & cmask)) : j;
+    }
+    if (pass_hdr) scratch_free(pass_hdr);
+
+    /* The gathered columns, made first; then the rows gathered into them
+     * over the pool's threads. */
+    ray_t* gv_hdr = NULL;
+    uint8_t* gv_mem = (uint8_t*)scratch_alloc(&gv_hdr, (size_t)n_ref * (sizeof(ray_t*) + sizeof(void*) * 2 + 1));
+    if (!gv_mem) { scratch_free(idx_hdr); scratch_free(syms_hdr); return NULL; }
+    ray_t**      gv  = (ray_t**)gv_mem;
+    const void** src = (const void**)(gv_mem + (size_t)n_ref * sizeof(ray_t*));
+    void**       dst = (void**)(gv_mem + (size_t)n_ref * (sizeof(ray_t*) + sizeof(void*)));
+    uint8_t*     esz = gv_mem + (size_t)n_ref * (sizeof(ray_t*) + sizeof(void*) * 2);
+    int n_g = 0;
+    for (int i = 0; i < n_ref; i++) {
+        ray_t* c = ray_table_get_col(tbl, syms[i]);
+        /* the pages the sampled rows fall on, asked for ahead of the reads */
+        ray_col_want_rows(c, idx, n_s);
+        /* a SYM column at its own code width: ray_vec_new would make a
+         * 64-bit one, and the copy below is by the source's width */
+        ray_t* g = c->type == RAY_SYM ? ray_sym_vec_new(c->attrs & RAY_SYM_W_MASK, n_s)
+                                      : ray_vec_new(c->type, n_s);
+        if (!g || RAY_IS_ERR(g)) { if (g) ray_release(g); break; }
+        g->len = n_s;
+        g->attrs |= c->attrs & RAY_ATTR_HAS_NULLS;
+        if (c->type == RAY_SYM) ray_sym_vec_adopt_domain(g, c);
+        gv[n_g] = g; src[n_g] = ray_data(c); dst[n_g] = ray_data(g); esz[n_g] = col_esz(c);
+        n_g++;
+    }
+    ray_t* st = n_g == n_ref ? ray_table_new(0) : NULL;
+    if (st && RAY_IS_ERR(st)) { ray_error_free(st); st = NULL; }
+    if (st) {
+        cd_gate_gather_ctx_t ctx = { src, dst, esz, idx, n_g };
+        ray_pool_t* pool = ray_pool_get();
+        if (ray_pool_par_dispatch_ok(pool, n_s, AGG_EST_SAMPLE_ROWS))
+            ray_pool_dispatch(pool, cd_gate_gather_fn, &ctx, n_s);
+        else
+            cd_gate_gather_fn(&ctx, 0, 0, n_s);
+        for (int i = 0; i < n_g && st; i++) {
+            /* add_col releases the table on an error and returns the error */
+            st = ray_table_add_col(st, syms[i], gv[i]);
+            if (st && RAY_IS_ERR(st)) { ray_error_free(st); st = NULL; }
+        }
+    }
+    for (int i = 0; i < n_g; i++) ray_release(gv[i]);
+    scratch_free(gv_hdr);
+    scratch_free(syms_hdr);
+    if (!st) { scratch_free(idx_hdr); return NULL; }
+
+    ray_t* out_hdr = NULL;
+    ray_graph_t* gs = ray_graph_new(st);
+    if (gs) {
+        ray_op_t* pred = compile_expr_dag(gs, where_expr);
+        ray_op_t* froot = pred ? ray_filter(gs, ray_const_table(gs, st), pred) : NULL;
+        if (froot) froot = ray_optimize(gs, froot);
+        /* the filter returns its input (the sampled table) retained, with
+         * the selection installed on the graph */
+        ray_t* fres = froot ? exec_node(gs, froot) : NULL;
+        if (fres && !RAY_IS_ERR(fres) && gs->selection) {
+            const int64_t kept = ray_rowsel_meta(gs->selection)->total_pass;
+            ray_t* ind = kept > 0 ? ray_rowsel_to_indices(gs->selection) : NULL;
+            int64_t* out = (int64_t*)scratch_alloc(&out_hdr, (size_t)(kept > 0 ? kept : 1) * sizeof(int64_t));
+            if (out && (ind || kept == 0)) {
+                const int64_t* ii = ind ? (const int64_t*)ray_data(ind) : NULL;
+                for (int64_t j = 0; j < kept; j++) out[j] = idx[ii[j]];
+                *rows = out; *nrows = kept;
+                *population = (int64_t)((double)P * (double)kept / (double)n_s);
+                if (kept > 0 && *population < kept) *population = kept;
+            } else if (out_hdr) { scratch_free(out_hdr); out_hdr = NULL; }
+            if (ind) ray_release(ind);
+        }
+        if (fres) { if (RAY_IS_ERR(fres)) ray_error_free(fres); else ray_release(fres); }
+        ray_graph_free(gs);
+    }
+    ray_release(st);
+    scratch_free(idx_hdr);
+    return out_hdr;
 }
 
 /* A column is registered unless it is cached (exec_scan_add_col samples the
