@@ -3220,11 +3220,221 @@ static test_result_t test_float_sum_decoded(void) {
     if ((r = aw_f64_bits("fs", "(avg (at T 'f))", -1)).status != TEST_PASS) return r;
     aw_save("fz", "(table [f] (list (take [-0.0] 2048)))", -1);
     if ((r = aw_f64_bits("fz", "(sum (at T 'f))", -1)).status != TEST_PASS) return r;   /* the sign of zero */
+    {   /* the literal is a negative zero (the stored value and the D4 min carry the
+         * sign), so the bit compares pin the sign; the sum is +0.0 on both
+         * generations: the kernel starts from +0.0 and +0.0 + -0.0 is +0.0 */
+        ray_t* z0 = ray_eval_str("(first (at T 'f))");
+        ray_t* zm = ray_eval_str("(min (at T 'f))");
+        ray_t* zs = ray_eval_str("(sum (at T 'f))");
+        TEST_ASSERT_TRUE(z0 && !RAY_IS_ERR(z0) && z0->type == -RAY_F64 && z0->f64 == 0.0 && signbit(z0->f64));
+        TEST_ASSERT_TRUE(zm && !RAY_IS_ERR(zm) && zm->type == -RAY_F64 && zm->f64 == 0.0 && signbit(zm->f64));
+        TEST_ASSERT_TRUE(zs && !RAY_IS_ERR(zs) && zs->type == -RAY_F64 && zs->f64 == 0.0 && !signbit(zs->f64));
+        ray_release(z0); ray_release(zm); ray_release(zs);
+    }
     if ((r = aw_f64_bits("fs", "(min (at T 'f))", 0)).status != TEST_PASS) return r;    /* -0.0 under D4 */
     if ((r = aw_f64_bits("fs", "(max (at T 'f))", 0)).status != TEST_PASS) return r;
     aw_save("fm", "(table [f] (list (map (fn [j] (if (== 0 (% j 2)) -0.0 0.0)) (til 3000))))", -1);
     if ((r = aw_f64_bits("fm", "(min (at T 'f))", 0)).status != TEST_PASS) return r;    /* which zero: the first */
     if ((r = aw_f64_bits("fm", "(max (at T 'f))", 0)).status != TEST_PASS) return r;
+    PASS();
+}
+
+/* Fully selected vectors are answered from their encoding; the selection
+ * (< k 1500) keeps vector 0 whole (ALL) and part of vector 1 (MIX), and no
+ * chunk is fully selected, so the chunk path cannot answer. */
+static test_result_t test_sum_encoded_vectors(void) {
+    const char* q = "(select {s: (sum x) a: (avg x) from: T where: (< k 1500)})";
+    static const struct { const char* name; const char* x; int force; int x_enc; uint64_t want; } cs[] = {
+        { "sf", "(map (fn [j] (if (== 0 (% j 9)) 0N (- (% j 50) 20))) (til 200000))", RAY_ENC_FOR_BP, RAY_ENC_FOR_BP, 1024 * 4 },
+        { "sc", "(map (fn [j] (if (== 0 (% j 9)) 0N (div j 1024))) (til 200000))",    -1,             RAY_ENC_CONST,  1024 * 4 },
+        { "sr", "(div (til 200000) 100)",                                             RAY_ENC_RLE,    RAY_ENC_RLE,    1024 * 4 },
+        { "sn", "(map (fn [j] (if (== 0 (% j 9)) 0N (div j 100))) (til 200000))",     RAY_ENC_RLE,    RAY_ENC_RLE,    2 * 1024 * 4 },  /* nullable RLE decodes */
+    };
+    for (int i = 0; i < 4; i++) {
+        char tbl[512];
+        snprintf(tbl, sizeof tbl, "(table [k x] (list (til 200000) (as 'I32 %s)))", cs[i].x);
+        aw_save(cs[i].name, tbl, cs[i].force);
+        TEST_ASSERT_EQ_I(aw_vec_enc(cs[i].name, "x", 0), cs[i].x_enc);
+        test_result_t r = aw_same(cs[i].name, q, 0);
+        if (r.status != TEST_PASS) return r;
+        TEST_ASSERT_FMT(aw_col_decoded("x") == cs[i].want, "%s: x decoded %llu, want %llu", cs[i].name,
+                        (unsigned long long)aw_col_decoded("x"), (unsigned long long)cs[i].want);
+    }
+    PASS();
+}
+
+/* With a selection: ALL segments from vectors, MIX segments decoded. */
+static test_result_t test_agg_under_selection(void) {
+    aw_save("as", "(table [k x] (list (til 200000) (as 'I32 (map (fn [j] (if (== 0 (% j 9)) 0N (% j 50))) (til 200000)))))", -1);
+    test_result_t r;
+    if ((r = aw_reduce("as", "(select {s: (sum x) a: (avg x) c: (count x) from: T where: (< k 65536)})", -1)).status != TEST_PASS) return r;
+    if ((r = aw_reduce("as", "(select {s: (sum x) c: (count x) from: T where: (< k 1500)})", -1)).status != TEST_PASS) return r;
+    if ((r = aw_reduce("as", "(select {m: (max x) from: T where: (== x 3)})", -1)).status != TEST_PASS) return r;
+    PASS();
+}
+
+static test_result_t test_scalar_route_stats(void) {
+    aw_save("sq", "(table [k g x f] (list (til 200000) (as 'I16 (% (til 200000) 7)) "
+                  "(as 'I32 (map (fn [j] (if (== 0 (% j 9)) 0N (% j 50))) (til 200000))) (* 0.5 (til 200000))))", -1);
+    test_result_t r;
+    if ((r = aw_reduce("sq", "(select {s: (sum x) c: (count k) a: (avg x) from: T where: (< k 131072)})", 0)).status != TEST_PASS) return r;
+    if ((r = aw_reduce("sq", "(select {mn: (min x) mx: (max k) from: T where: (>= k 65536)})", 0)).status != TEST_PASS) return r;
+    if ((r = aw_reduce("sq", "(select {s: (sum f) from: T where: (< k 131072)})", -1)).status != TEST_PASS) return r;   /* floats: P2's RAW float view (uncounted) or a decode, never statistics */
+    if ((r = aw_reduce("sq", "(select {s: (sum x) from: T where: (== g 3)})", -1)).status != TEST_PASS) return r;            /* MIX everywhere */
+    PASS();
+}
+
+/* Several inputs of one select, each by its own rule under one selection:
+ * integer sums and extremes from statistics, a float extreme from
+ * statistics (D4), a float sum and a SYM extreme decoded (they keep P2's
+ * dispatch), BOOL / U8 inputs as non-null values, the I64 extremes with a
+ * total beyond INT64_MAX, an all-null chunk, and selections that cut
+ * chunks and vectors at odd rows.  Every answer equals generation 0. */
+static test_result_t test_scalar_route_mixed(void) {
+    aw_save("sm", "(table [k x y b u f d s n] (list (til 300000) "
+                  "(as 'I32 (map (fn [j] (if (== 0 (% j 9)) 0N (- (% j 50) 20))) (til 300000))) "
+                  "(map (fn [j] (if (== 0 (% j 5)) 0N 9223372036854775807)) (til 300000)) "
+                  "(== 0 (% (til 300000) 3)) (as 'U8 (% (til 300000) 251)) "
+                  "(map (fn [j] (if (== 0 (% j 7)) 0N (- (* 0.25 j) 1000.0))) (til 300000)) "
+                  "(as 'DATE (+ 7000 (div (til 300000) 1000))) "
+                  "(as 'SYM (map (fn [j] (if (== 0 (% j 4)) \"b\" \"a\")) (til 300000))) "
+                  "(as 'I16 (map (fn [j] (if (and (>= j 65536) (< j 131072)) 0N (% j 300))) (til 300000)))))", -1);
+    static const char* const qs[] = {
+        "(select {s: (sum x) a: (avg x) mn: (min x) mx: (max x) c: (count x) from: T where: (< k 196608)})",
+        "(select {s: (sum y) a: (avg y) mx: (max y) from: T where: (>= k 70000)})",
+        "(select {s: (sum b) a: (avg b) mn: (min b) mx: (max u) su: (sum u) au: (avg u) from: T where: (< k 131072)})",
+        "(select {mn: (min f) mx: (max f) mx2: (max d) mn2: (min d) from: T where: (< k 196608)})",
+        "(select {s: (sum n) a: (avg n) mn: (min n) mx: (max n) c: (count n) from: T where: (< k 196608)})",
+        "(select {s: (sum x) a: (avg x) mn: (min x) mx: (max x) c: (count x) from: T where: (< k 200000)})",
+        "(select {s: (sum x) mn: (min n) mx: (max f) from: T where: (and (>= k 1000) (< k 250001))})",
+        "(select {s: (sum x) a: (avg x) mx: (max n) from: T where: (== (% k 3) 1)})",
+        "(select {s: (sum x) sf: (sum f) from: T where: (< k 131072)})",
+        "(select {s: (sum x) ms: (min s) from: T where: (< k 131072)})",
+        "(select {s: (sum x) mx: (max y) a: (avg n) from: T})",
+        "(select {s: (sum x) c: (count k) from: T where: (> k 400000)})",
+        NULL,
+    };
+    for (int i = 0; qs[i]; i++) {
+        test_result_t r = aw_reduce("sm", qs[i], -1);
+        if (r.status != TEST_PASS) return r;
+    }
+    /* whole chunks from the directory and vectors from statistics: nothing decodes */
+    test_result_t r;
+    if ((r = aw_reduce("sm", qs[0], 0)).status != TEST_PASS) return r;
+    if ((r = aw_reduce("sm", qs[3], 0)).status != TEST_PASS) return r;
+    if ((r = aw_reduce("sm", qs[4], 0)).status != TEST_PASS) return r;
+    PASS();
+}
+
+/* A ragged parted table under a selection: partition 2 lacks the column (a
+ * synthetic stand-in), 1 and 3 are generation 2, 4 generation 0.  A
+ * nullable stand-in is all null; a BOOL / U8 one is non-null zeros
+ * (ray_null_fill), so min is 0 and avg counts its rows.  Results equal the
+ * all-generation-0 table's, and the selected select form equals the scalar
+ * form over the selected rows. */
+static test_result_t test_scalar_route_parted(void) {
+    static const struct { const char* name; const char* col; bool nullable; } ty[] = {
+        { "i32",  "(as 'I32 (map (fn [j] (if (== 0 (% j 13)) 0N (- j 70000))) (til 80000)))", true },
+        { "u8",   "(as 'U8 (+ 1 (% (til 80000) 200)))", false },
+        { "bool", "(>= (til 80000) 0)", false },
+    };
+    static const char* roots[] = { "rw", "rn" };
+    static const char* const aggs[] = { "sum", "avg", "min", "max", "count", NULL };
+    static const char* const wh[] = { "(>= y 0)", "(< y 70000)", "(>= y 65536)", "(== (% y 5) 2)", NULL };
+    for (int t = 0; t < 3; t++) {
+        (void)ray_test_rm_rf(aw_root()); (void)ray_test_mkdir_p(aw_root());
+        for (int r = 0; r < 2; r++)
+            for (int p = 0; p < 4; p++) {
+                char q[900];
+                snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/%s/2024.01.0%d/t/\" %s%s%s {compress: %s})",
+                         roots[r], p + 1,
+                         p == 1 ? "(table [y] (list (til 3000)))" : "(table [y x] (list (til 80000) ",
+                         p == 1 ? "" : ty[t].col, p == 1 ? "" : "))",
+                         r == 0 && p != 3 ? "true" : "false");
+                aw_eval_ok(q);
+            }
+        aw_eval_ok("(set TW (.db.parted.get \"" AW_TMP "/rw\" 't))");
+        aw_eval_ok("(set TN (.db.parted.get \"" AW_TMP "/rn\" 't))");
+        for (int w = 0; wh[w]; w++)
+            for (int i = 0; aggs[i]; i++) {
+                char a[400], b[400], c[400];
+                snprintf(a, sizeof a, "(first (at (select {m: (%s x) from: TN where: %s}) 'm))", aggs[i], wh[w]);
+                snprintf(b, sizeof b, "(first (at (select {m: (%s x) from: TW where: %s}) 'm))", aggs[i], wh[w]);
+                snprintf(c, sizeof c, "(%s (at (select {x: x from: TW where: %s}) 'x))", aggs[i], wh[w]);
+                ray_t* x = aw_eval(a);
+                ray_enc_counters_reset();
+                ray_t* y = aw_eval(b);
+                ray_enc_counters_t k; ray_enc_counters_get(&k);
+                ray_t* z = aw_eval(c);
+                TEST_ASSERT_FMT(x && y && z && !RAY_IS_ERR(x) && !RAY_IS_ERR(y) && !RAY_IS_ERR(z), "%s %s %s", ty[t].name, aggs[i], wh[w]);
+                ray_t* fx = ray_fmt(x, 0); ray_t* fy = ray_fmt(y, 0); ray_t* fz = ray_fmt(z, 0);
+                TEST_ASSERT_FMT(ray_str_len(fx) == ray_str_len(fy) && memcmp(ray_str_ptr(fx), ray_str_ptr(fy), ray_str_len(fx)) == 0,
+                                "%s %s %s: gen 0 vs mixed", ty[t].name, aggs[i], wh[w]);
+                TEST_ASSERT_FMT(ray_str_len(fz) == ray_str_len(fy) && memcmp(ray_str_ptr(fz), ray_str_ptr(fy), ray_str_len(fz)) == 0,
+                                "%s %s %s: select vs scalar", ty[t].name, aggs[i], wh[w]);
+                TEST_ASSERT_EQ_U(k.materialized, 0);
+                ray_release(fx); ray_release(fy); ray_release(fz); ray_release(x); ray_release(y); ray_release(z);
+            }
+    }
+    PASS();
+}
+
+/* Bytes decoded from column `col` of the parted table named `tbl` (each
+ * generation-2 segment's own counter). */
+static uint64_t aw_parted_col_decoded(const char* tbl, const char* col) {
+    ray_t* t = ray_eval_str(tbl);
+    ray_t* encv = t && !RAY_IS_ERR(t) ? ray_table_get_col_enc(t, ray_sym_intern(col, strlen(col))) : NULL;
+    uint64_t b = 0;
+    ray_enccol_t* e = encv && encv->type == RAY_ENCCOL ? ray_enccol_of(encv) : NULL;
+    if (e && e->kind == RAY_ENCCOL_PARTED && e->wrapper) {
+        ray_t** segs = (ray_t**)ray_data(e->wrapper);
+        for (int64_t i = 0; i < e->wrapper->len; i++)
+            if (segs[i] && segs[i]->type == RAY_ENCCOL) b += atomic_load(&ray_enccol_of(segs[i])->decoded_bytes);
+    }
+    if (t && !RAY_IS_ERR(t)) ray_release(t);
+    return b;
+}
+
+/* Parted, every partition generation 2 (each runs the route on its own
+ * rows): whole chunks under the selection answer from the directory and
+ * whole vectors from their statistics, so the aggregate input decodes
+ * nothing; a partly selected vector is read. */
+static test_result_t test_scalar_route_parted_stats(void) {
+    for (int r = 0; r < 2; r++)
+        for (int p = 0; p < 3; p++) {
+            char q[700];
+            snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/%s/2024.01.0%d/t/\" "
+                     "(table [y x] (list (til 70001) (as 'I32 (map (fn [j] (if (== 0 (%% j 11)) 0N (- (%% j 50) 20))) (til 70001))))) {compress: %s})",
+                     r ? "pn" : "pw", p + 1, r ? "false" : "true");
+            aw_eval_ok(q);
+        }
+    aw_eval_ok("(set TW (.db.parted.get \"" AW_TMP "/pw\" 't))");
+    aw_eval_ok("(set TN (.db.parted.get \"" AW_TMP "/pn\" 't))");
+    static const char* const qs[] = {
+        "(select {s: (sum x) mn: (min x) mx: (max x) c: (count x) from: %s where: (< y 65536)})",
+        "(select {s: (sum x) mn: (min x) mx: (max x) c: (count x) from: %s where: (>= y 2048)})",
+        "(select {s: (sum x) mx: (max x) from: %s where: (== (%% y 4) 1)})",
+        /* a nullable avg counts its non-nulls per partition through an
+         * indicator expression (#767), evaluated over every row: equal only */
+        "(select {s: (sum x) a: (avg x) from: %s where: (< y 65536)})",
+        NULL,
+    };
+    for (int i = 0; qs[i]; i++) {
+        char a[400], b[400];
+        snprintf(a, sizeof a, qs[i], "TN");
+        snprintf(b, sizeof b, qs[i], "TW");
+        ray_t* x = aw_eval(a);
+        ray_enc_counters_reset();
+        ray_t* y = aw_eval(b);
+        ray_enc_counters_t k; ray_enc_counters_get(&k);
+        TEST_ASSERT_FMT(x && y && !RAY_IS_ERR(x) && !RAY_IS_ERR(y), "%s", b);
+        ray_t* fx = ray_fmt(x, 0); ray_t* fy = ray_fmt(y, 0);
+        TEST_ASSERT_FMT(ray_str_len(fx) == ray_str_len(fy) && memcmp(ray_str_ptr(fx), ray_str_ptr(fy), ray_str_len(fx)) == 0, "%s", b);
+        TEST_ASSERT_EQ_U(k.materialized, 0);
+        if (i < 2) TEST_ASSERT_FMT(aw_parted_col_decoded("TW", "x") == 0, "%s: x decoded %llu", b,
+                                   (unsigned long long)aw_parted_col_decoded("TW", "x"));
+        ray_release(fx); ray_release(fy); ray_release(x); ray_release(y);
+    }
     PASS();
 }
 
@@ -3284,5 +3494,11 @@ const test_entry_t aware_entries[] = {
     { "aware/sum_parted_dir",    test_sum_parted_dir,    aw_setup, aw_teardown },
     { "aware/sum_parted_ragged", test_sum_parted_ragged, aw_setup, aw_teardown },
     { "aware/float_sum_decoded", test_float_sum_decoded, aw_setup, aw_teardown },
+    { "aware/sum_encoded_vectors", test_sum_encoded_vectors, aw_setup, aw_teardown },
+    { "aware/agg_under_selection", test_agg_under_selection, aw_setup, aw_teardown },
+    { "aware/scalar_route_stats",  test_scalar_route_stats,  aw_setup, aw_teardown },
+    { "aware/scalar_route_mixed",  test_scalar_route_mixed,  aw_setup, aw_teardown },
+    { "aware/scalar_route_parted", test_scalar_route_parted, aw_setup, aw_teardown },
+    { "aware/scalar_route_parted_stats", test_scalar_route_parted_stats, aw_setup, aw_teardown },
     { NULL, NULL, NULL, NULL },
 };

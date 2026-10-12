@@ -420,7 +420,9 @@ static test_result_t test_failed_decode_propagates(void) {
         "(insert 't (list 1 2))", "(insert t (list 1 2))",
         "(update {b: 1 from: 't where: (== a 5)})", "(update {b: a from: t})",
         "(delete {from: 't where: (== b 5)})", "(delete {from: t where: (== b 5)})",
-        "(select {s: (sum a) from: t})", "(select {from: t where: (> a 5)})",
+        /* a whole-chunk sum answers from the directory (the damaged descriptor is
+         * never read, the accepted residual); a partly selected chunk reads it */
+        "(select {s: (sum a) from: t where: (> b 100)})", "(select {from: t where: (> a 5)})",
     };
     for (size_t i = 0; i < sizeof verbs / sizeof *verbs; i++) {
         ray_error_clear();
@@ -3966,7 +3968,7 @@ static test_result_t test_group_sites_parted(void) {
 
 static test_result_t test_group_sites_parted_failed_decode(void) {
     static const struct { const char* key; uint16_t op; const char* c1; const char* what; } cases[] = {
-        { "date", OP_SUM, "a", "per-partition" },
+        { "date", OP_FIRST, "a", "per-partition" },   /* a SUM answers from the directory */
         { "a",    OP_SUM, "b", "concat fallback key" },
         { "date", OP_SUM, "b", "per-partition (healthy column)" },
     };
@@ -4759,7 +4761,7 @@ static test_result_t test_query_helpers_failed_decode(void) {
         { "(select {s: (sum a3) by: b from: bad desc: s take: 2})", "a3" },
         { "(select {c: (count a4) from: bad where: (== a4 3)})",    "a4" },
         { "(select {x: (+ a5 1) from: bad})",                       "a5" },
-        { "(select {m: (max a6) from: bad})",                       "a6" },  /* metadata declines: execution reads */
+        { "(select {m: (max a6) from: bad where: (> b 10)})",       "a6" },  /* metadata declines: execution reads (a partly selected chunk) */
         { "(select {s: (sum b) by: (+ a7 1) from: bad})",           "a7" },  /* computed-key plan */
         { "(select {x: (+ a8 b) by: k from: bad})",                 "a8" },  /* grouped row-wise output */
         { NULL, NULL },
@@ -4790,7 +4792,7 @@ static test_result_t test_select_sites_failed_decode(void) {
         { "(select {s: (sum a3) by: k from: bad desc: s take: 2})",          "a3" },
         { "(select {c: (count b) from: bad where: (== a4 3)})",              "a4" },
         { "(select {x: (+ a5 1) from: bad})",                                "a5" },
-        { "(select {m: (max a6) from: bad})",                                "a6" },
+        { "(select {m: (max a6) from: bad where: (> b 10)})",                "a6" },
         { "(select {s: (sum b) by: (+ a7 1) from: bad})",                    "a7" },
         { "(select {x: a8 from: bad where: (> b 10) asc: a8 take: 3})",      "a8" },
         { "(select {f: (first a9) by: k from: bad})",                        "a9" },
@@ -5380,7 +5382,7 @@ static test_result_t test_select_parted_prunes_failure(void) {
     sp_bind(t);
     ray_release(t);
     static const char* const hit[] = {
-        "(select {s: (sum a) from: t where: (<= date 2024.01.02)})",
+        "(select {s: (sum (* a 2)) from: t where: (<= date 2024.01.02)})",   /* (sum a): the directory answers */
         "(select {from: t where: (in date [2024.01.01])})",
         "(select {c: (count a) from: t by: b where: (!= date 2024.01.03)})",
         NULL,

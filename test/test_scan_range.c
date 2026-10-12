@@ -3185,7 +3185,10 @@ static test_result_t test_scalar_route_error(void) {
     char path[600];
     static const struct { const char* col; const char* q; } cs[] = {
         { "f", "(select {s: (sum f) c: (count k) from: B where: (> g 0)})" },   /* generic loop */
-        { "k", "(select {s: (sum (+ k 1)) from: B})" },                        /* tight i64 kernel */
+        /* a whole-column I64 sum answers from the directory and never reads
+         * the damaged chunk (the accepted residual, as for a zone); the chunk
+         * route reads it by rows under a selection that keeps some of it */
+        { "k", "(select {s: (sum (+ k 1)) m: (min k) from: B where: (> g 0)})" },
         { "k", "(select {s: (sum (+ k 1)) a: (avg (+ k 1)) from: B where: (> g 0)})" },
     };
     for (size_t c = 0; c < sizeof cs / sizeof cs[0]; c++) {

@@ -264,3 +264,59 @@ bool ray_enc_eval_in(const ray_enc_vview_t* v, const int64_t* set, int nset, uin
     ray_enc_mask_nulls(v, nr, bits);
     return true;
 }
+
+/* CONST: n_nonnull * logical(value) (0 when every row is null); FOR_BP:
+ * n_nonnull * logical(base) + the non-null residuals (no wrap, the view's
+ * guarantee; the writer fills null slots with the base, and the residual
+ * sum skips them all the same); RLE without nulls: logical(value) * run
+ * length per run. */
+bool ray_enc_vec_sum(const ray_enc_vview_t* v, int64_t* hi, uint64_t* lo, int64_t* nn) {
+    switch (v->type) {
+    case RAY_I16: case RAY_I32: case RAY_I64: case RAY_TIME: break;
+    case RAY_BOOL: case RAY_U8: if (v->n_nulls) return false; break;
+    default: return false;
+    }
+    __int128 s = 0;
+    const int64_t n_nonnull = (int64_t)v->n - v->n_nulls;
+    switch (v->enc) {
+    case RAY_ENC_CONST:
+        if (n_nonnull) s = (__int128)n_nonnull * ray_enc_logical(v->cbits, v->k);
+        break;
+    case RAY_ENC_FOR_BP: {
+        _Alignas(64) ray_enc_lanes_t u;                      /* the residuals, on the stack */
+        ray_enccol_unpack_resid(v, &u);
+        const uint8_t* nm = v->n_nulls ? v->nullmap : NULL;
+        if (v->n_nulls && !nm) return false;
+        __int128 r = 0;
+        if (v->k.T == 64) {
+            if (nm) { for (int i = 0; i < v->n; i++) if (!((nm[i >> 3] >> (i & 7)) & 1)) r += u.q[i]; }
+            else    { for (int i = 0; i < v->n; i++) r += u.q[i]; }
+        } else {
+            /* at most 1024 residuals below 2^32: the 64-bit total cannot wrap */
+            uint64_t r64 = 0;
+            for (int i = 0; i < v->n; i++) {
+                uint64_t x = lane(&u, v->k.T, (uint32_t)i);
+                if (nm) x &= (uint64_t)((nm[i >> 3] >> (i & 7)) & 1) - 1;   /* a null row adds 0 */
+                r64 += x;
+            }
+            r = r64;
+        }
+        s = (__int128)n_nonnull * ray_enc_logical(v->base, v->k) + r;
+        break;
+    }
+    case RAY_ENC_RLE: {
+        if (v->n_nulls) return false;                        /* nullable RLE decodes */
+        uint32_t prev = 0;
+        for (uint32_t r = 0; r < v->n_runs; r++) {
+            s += (__int128)ray_enc_logical(lane(&v->run_vals, v->k.T, r), v->k) * (int64_t)(v->run_ends.h[r] - prev);
+            prev = v->run_ends.h[r];
+        }
+        break;
+    }
+    default: return false;
+    }
+    *hi = (int64_t)(s >> 64);
+    *lo = (uint64_t)s;
+    *nn = n_nonnull;
+    return true;
+}

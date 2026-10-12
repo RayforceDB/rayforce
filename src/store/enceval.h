@@ -60,4 +60,12 @@ int  ray_enc_const_decision(const ray_enc_vview_t* v, uint16_t op, int64_t c, ui
  * (generation 0 reads a NaN literal as the null constant). */
 int  ray_enc_const_decision_f64(const ray_enc_vview_t* v, uint16_t op, double c, uint8_t null_result);
 
+/* Exact 128-bit sum of the non-null logical values of a fully selected
+ * integer vector, and its non-null count.  False when the encoding has no
+ * sum rule (DICT, nullable RLE; RAW and DELTA_BP have no view): decode.
+ * Integer types summed as ray_encw_type_summable lists them (BOOL, U8,
+ * I16, I32, I64, TIME): floats, DATE, TIMESTAMP and SYM decline, and so
+ * does a BOOL / U8 view holding nulls (their kernels count every row). */
+bool ray_enc_vec_sum(const ray_enc_vview_t* v, int64_t* hi, uint64_t* lo, int64_t* n_nonnull);
+
 #endif /* RAY_ENCEVAL_H */
