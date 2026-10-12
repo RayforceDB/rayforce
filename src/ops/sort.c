@@ -26,6 +26,7 @@
 #include "ops/ops.h"
 #include "ops/idxop.h"
 #include "mem/sys.h"
+#include "ops/colgather.h"   /* generation-2 top-K gathers */
 
 /* --------------------------------------------------------------------------
  * Sort comparator: compare two row indices across all sort keys.
@@ -3367,11 +3368,26 @@ static ray_t* topk_gather_rows(ray_t* tbl, ray_t* idx, int64_t k) {
     ray_t* result = ray_table_new(ncols);
     if (!result || RAY_IS_ERR(result)) { ray_release(idx); return result; }
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* src = ray_table_col_idx(tbl, c);
         int64_t name = ray_table_col_name(tbl, c);
+        ray_t* dst = NULL;
+        /* a generation-2 slot: the K rows' vectors, decoded by range */
+        ray_t* enc = ray_table_get_col_enc_idx(tbl, c);
+        if (enc && !(enc->attrs & RAY_ATTR_SLICE)) {
+            ray_col_src_t s;
+            ray_t* err = ray_col_src_bind(enc, &s);
+            if (!err) {
+                err = ray_col_gather_rows(&s, idx_data, k, &dst);
+                ray_col_src_release(&s);
+            }
+            if (err) { ray_release(idx); ray_release(result); return err; }
+            result = ray_table_add_col(result, name, dst);
+            ray_release(dst);
+            if (RAY_IS_ERR(result)) { ray_release(idx); return result; }
+            continue;
+        }
+        ray_t* src = ray_table_col_idx(tbl, c);
         if (src && RAY_IS_ERR(src)) { ray_release(idx); ray_release(result); return src; }
         if (!src) continue;
-        ray_t* dst;
         if (src->type == RAY_LIST) {
             dst = ray_list_new(k);
             if (!dst || RAY_IS_ERR(dst)) {

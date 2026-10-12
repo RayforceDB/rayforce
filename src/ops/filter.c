@@ -24,6 +24,7 @@
 #include "ops/internal.h"
 #include "ops/rowsel.h"
 #include "lang/internal.h"  /* sym_domain_rep (sym-domain Phase 2) */
+#include "ops/colgather.h"
 
 /* ============================================================================
  * Filter execution — extracted from exec.c
@@ -66,6 +67,31 @@ static void parted_gather_col(ray_t* parted_col, const int64_t* match_idx,
             ray_vec_is_null(segs[seg], local_row))
             ray_vec_set_null(dst_col, i, true);
     }
+}
+
+/* The RAY_ENCCOL of table slot c that a row gather reads by range, or
+ * NULL: a plain slot (and a slice of an encoded one, which a source does
+ * not bind) keeps the plain gather. */
+static ray_t* filter_enc_slot(ray_t* tbl, int64_t c) {
+    ray_t* enc = ray_table_get_col_enc_idx(tbl, c);
+    return (enc && !(enc->attrs & RAY_ATTR_SLICE)) ? enc : NULL;
+}
+
+/* Rows of a generation-2 slot kept by rowsel `sel` (by_rows false; NULL:
+ * every row) or at ids[0..n) (by_rows true), under the gather output
+ * contract: the result owns its STR pool, retains its SYM domain and
+ * carries its nulls, so the plain gather's fix-ups do not apply.  Only the
+ * vectors holding the rows are decoded; nothing is materialized.  NULL
+ * with *out set, or an owned error. */
+static ray_t* filter_enc_gather(ray_t* enc, ray_t* sel, bool by_rows, const int64_t* ids,
+                                int64_t n, ray_t** out) {
+    *out = NULL;
+    ray_col_src_t s;
+    ray_t* err = ray_col_src_bind(enc, &s);
+    if (err) return err;
+    err = by_rows ? ray_col_gather_rows(&s, ids, n, out) : ray_col_gather_sel(&s, sel, out);
+    ray_col_src_release(&s);
+    return err;
 }
 
 /* Filter a single vector by boolean predicate. */
@@ -216,14 +242,38 @@ static ray_t* exec_filter_seq(ray_t* input, ray_t* pred, int64_t ncols,
                              int64_t pass_count) {
     ray_t* tbl = ray_table_new(ncols);
     if (!tbl || RAY_IS_ERR(tbl)) return tbl;
+    /* Generation-2 slots gather under the predicate's selection, built
+     * once on the first such slot (NULL when every row passes). */
+    ray_t* sel = NULL;
+    bool sel_built = false;
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* col = ray_table_col_idx(input, c);
-        if (col && RAY_IS_ERR(col)) { ray_release(tbl); return col; }
-        if (!col) continue;
         int64_t name_id = ray_table_col_name(input, c);
+        ray_t* enc = filter_enc_slot(input, c);
+        if (enc) {
+            if (!sel_built) {
+                if (pred->len != ray_table_nrows(input)) {
+                    int64_t il = ray_table_nrows(input), pl = pred->len;
+                    ray_release(tbl);
+                    return ray_error("length", "filter: predicate length must match input, got %lld and %lld",
+                                     (long long)il, (long long)pl);
+                }
+                sel = ray_rowsel_from_pred(pred);
+                sel_built = true;
+                if (!sel && pass_count != pred->len) { ray_release(tbl); return ray_error("oom", NULL); }
+            }
+            ray_t* gc = NULL;
+            ray_t* ge = filter_enc_gather(enc, sel, false, NULL, 0, &gc);
+            if (ge) { if (sel) ray_rowsel_release(sel); ray_release(tbl); return ge; }
+            tbl = ray_table_add_col(tbl, name_id, gc);
+            ray_release(gc);
+            continue;
+        }
+        ray_t* col = ray_table_col_idx(input, c);
+        if (col && RAY_IS_ERR(col)) { if (sel) ray_rowsel_release(sel); ray_release(tbl); return col; }
+        if (!col) continue;
         if (col->type == RAY_MAPCOMMON) {
             ray_t* mc_filt = materialize_mapcommon_filter(col, pred, pass_count);
-            if (!mc_filt || RAY_IS_ERR(mc_filt)) { ray_release(tbl); return mc_filt; }
+            if (!mc_filt || RAY_IS_ERR(mc_filt)) { if (sel) ray_rowsel_release(sel); ray_release(tbl); return mc_filt; }
             tbl = ray_table_add_col(tbl, name_id, mc_filt);
             ray_release(mc_filt);
             continue;
@@ -233,10 +283,11 @@ static ray_t* exec_filter_seq(ray_t* input, ray_t* pred, int64_t ncols,
             filtered = exec_filter_parted_vec(col, pred, pass_count);
         else
             filtered = exec_filter_vec(col, pred, pass_count);
-        if (!filtered || RAY_IS_ERR(filtered)) { ray_release(tbl); return filtered; }
+        if (!filtered || RAY_IS_ERR(filtered)) { if (sel) ray_rowsel_release(sel); ray_release(tbl); return filtered; }
         tbl = ray_table_add_col(tbl, name_id, filtered);
         ray_release(filtered);
     }
+    if (sel) ray_rowsel_release(sel);
     return tbl;
 }
 
@@ -483,8 +534,24 @@ ray_t* exec_filter(ray_graph_t* g, ray_op_t* op, ray_t* input, ray_t* pred) {
 
     bool has_parted_cols = false;
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* col = ray_table_col_idx(input, c);
         col_names[c] = ray_table_col_name(input, c);
+        /* A generation-2 slot gathers at match_idx (ascending, so its
+         * bucketing is one pass) into its finished column; src_cols[c]
+         * stays NULL, so every pass below skips it. */
+        ray_t* enc = filter_enc_slot(input, c);
+        if (enc) {
+            src_cols[c] = NULL;
+            ray_t* ge = filter_enc_gather(enc, NULL, true, match_idx, pass_count, &new_cols[c]);
+            if (ge) {
+                for (int64_t k = 0; k < c; k++)
+                    if (new_cols[k]) ray_release(new_cols[k]);
+                scratch_free(idx_hdr);
+                ray_release(tbl);
+                return ge;
+            }
+            continue;
+        }
+        ray_t* col = ray_table_col_idx(input, c);
         src_cols[c] = col;
         if (col && RAY_IS_ERR(col)) {
             for (int64_t k = 0; k < c; k++)
@@ -587,6 +654,7 @@ ray_t* exec_filter(ray_graph_t* g, ray_op_t* op, ray_t* input, ray_t* pred) {
         for (int64_t c = 0; c < ncols; c++) {
             if (!new_cols[c]) continue;
             ray_t* col = src_cols[c];
+            if (!col) continue;                              /* generation 2: gathered above */
             if (col && col->type == RAY_MAPCOMMON) continue; /* already materialized */
             if (col && col->type == RAY_LIST) continue; /* gathered above with retain */
             int64_t ci = mgctx.ncols;
@@ -635,6 +703,10 @@ ray_t* exec_filter(ray_graph_t* g, ray_op_t* op, ray_t* input, ray_t* pred) {
             }
         } else {
             col_propagate_str_pool(new_cols[c], col);
+            /* the flat gathers above copy values only (parted columns carry
+             * their null bits in parted_gather_col / _str_rows) */
+            if (ray_vec_may_have_nulls(col))
+                col_propagate_nulls_gather(new_cols[c], col, match_idx, pass_count);
         }
         if (new_cols[c]->type == RAY_SYM)
             ray_sym_vec_adopt_domain(new_cols[c], sym_domain_rep(col));
@@ -728,8 +800,18 @@ ray_t* exec_filter_head(ray_t* input, ray_t* pred, int64_t limit) {
     if (!tbl || RAY_IS_ERR(tbl)) { scratch_free(idx_hdr); return tbl; }
 
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* col = ray_table_col_idx(input, c);
         int64_t name_id = ray_table_col_name(input, c);
+        /* a generation-2 slot: the head's rows, gathered by range */
+        ray_t* enc = filter_enc_slot(input, c);
+        if (enc) {
+            ray_t* gc = NULL;
+            ray_t* ge = filter_enc_gather(enc, NULL, true, match_idx, found, &gc);
+            if (ge) { scratch_free(idx_hdr); ray_release(tbl); return ge; }
+            tbl = ray_table_add_col(tbl, name_id, gc);
+            ray_release(gc);
+            continue;
+        }
+        ray_t* col = ray_table_col_idx(input, c);
         if (col && RAY_IS_ERR(col)) { scratch_free(idx_hdr); ray_release(tbl); return col; }
         if (!col) continue;
         if (col->type == RAY_MAPCOMMON) {
@@ -811,6 +893,10 @@ ray_t* exec_filter_head(ray_t* input, ray_t* pred, int64_t limit) {
                         continue;  /* NULL segment — zero-fill from memset */
                     parted_copy_cells(dst, out_type, out_attrs, j,
                                       segs[cur_seg], r - seg_start, 1);
+                    /* the null bit travels with the cell (parted_gather_col) */
+                    if (ray_vec_may_have_nulls(segs[cur_seg]) &&
+                        ray_vec_is_null(segs[cur_seg], r - seg_start))
+                        ray_vec_set_null(new_col, j, true);
                 }
             }
         } else {
@@ -818,6 +904,7 @@ ray_t* exec_filter_head(ray_t* input, ray_t* pred, int64_t limit) {
             for (int64_t j = 0; j < found; j++)
                 memcpy(dst + j * esz, src + match_idx[j] * esz, esz);
             col_propagate_str_pool(new_col, col);
+            col_propagate_nulls_gather(new_col, col, match_idx, found);
         }
         /* SYM gather copied cell ids verbatim — resolve over the source
          * column's domain (flat → col itself; parted → first SYM seg). */
@@ -1039,6 +1126,22 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
         if (use_keep && !sel_compact_keep(col_names[c], keep_syms, keep_n)) {
             new_cols[c] = NULL; continue;
         }
+        /* A generation-2 slot (single file or parted) gathers under the
+         * selection into its finished column; src_cols[c] stays NULL, so
+         * the batch gather, the LIST and parted passes and the fix-ups
+         * below skip it. */
+        ray_t* enc = filter_enc_slot(tbl, c);
+        if (enc) {
+            ray_t* ge = filter_enc_gather(enc, sel, false, NULL, 0, &new_cols[c]);
+            if (ge) {
+                for (int64_t k = 0; k < c; k++)
+                    if (new_cols[k]) ray_release(new_cols[k]);
+                scratch_free(idx_hdr);
+                ray_release(out);
+                return ge;
+            }
+            continue;
+        }
         ray_t* col = ray_table_col_idx(tbl, c);
         if (col && RAY_IS_ERR(col)) {
             for (int64_t k = 0; k < c; k++)
@@ -1162,6 +1265,7 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
         for (int64_t c = 0; c < ncols; c++) {
             if (!new_cols[c]) continue;
             ray_t* col = src_cols[c];
+            if (!col) continue;                   /* generation 2: gathered above */
             if (col->type == RAY_LIST) continue;  /* gathered above with retain */
             /* RAY_MAPCOMMON is not skipped here: the pre-alloc loop above already
              * materialized it to a flat new_cols[c], so col_esz returns 0 and the
@@ -1212,7 +1316,7 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
         /* SYM gathers above copied cell ids verbatim — resolve over the
          * source column's domain (flat → scol; parted → first SYM seg;
          * MAPCOMMON → keys vec, all via sym_domain_rep). */
-        if (new_cols[c]->type == RAY_SYM)
+        if (scol && new_cols[c]->type == RAY_SYM)   /* a gathered slot (scol NULL) holds its domain */
             ray_sym_vec_adopt_domain(new_cols[c], sym_domain_rep(scol));
         out = ray_table_add_col(out, col_names[c], new_cols[c]);
         ray_release(new_cols[c]);

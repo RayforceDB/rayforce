@@ -5,6 +5,7 @@
 #include "ops/hash.h"     /* ray_hash_bytes — wide (STR) group-key hashing */
 #include "ops/internal.h"  /* col_vec_new, col_esz */
 #include "ops/colbind.h"
+#include "ops/colgather.h"  /* generation-2 compact gathers */
 #include "ops/rowsel.h"    /* ray_rowsel_meta, ray_rowsel_to_indices */
 #include "lang/internal.h" /* sym_domain_rep */
 #include "table/domain.h"
@@ -9426,11 +9427,29 @@ static ray_t* agg_build_compact(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
          * (group_seg_stream_ok) and its first-N pre-pass runs over the flat
          * copy (agg_seg_flat_run), so a segment-streamed table never reaches
          * a compact gather. */
+        ray_t* gcol = NULL;
+        ray_t* enc = ray_table_get_col_enc(tbl, want[i]);
+        if (enc && !(enc->attrs & RAY_ATTR_SLICE)) {
+            /* generation 2: the survivors' vectors, decoded by range (idx
+             * ascending); the gather's result is as fresh as gather_by_idx's */
+            assert(!ray_enccol_is_parted(enc));
+            ray_col_src_t s;
+            ray_t* err = ray_col_src_bind(enc, &s);
+            if (!err) {
+                err = ray_col_gather_rows(&s, idx, n_sel, &gcol);
+                ray_col_src_release(&s);
+            }
+            if (err) { ray_release(compact); scratch_free(want_hdr); return err; }
+            compact = ray_table_add_col(compact, want[i], gcol);
+            ray_release(gcol);
+            if (!compact || RAY_IS_ERR(compact)) { scratch_free(want_hdr); return compact ? compact : ray_error("oom", NULL); }
+            continue;
+        }
         ray_t* src = ray_table_col(tbl, want[i]);
         if (src && RAY_IS_ERR(src)) { ray_release(compact); scratch_free(want_hdr); return src; }
         if (!src) { ray_release(compact); scratch_free(want_hdr); return ray_error("nyi", NULL); }
         assert(!RAY_IS_PARTED(src->type));
-        ray_t* gcol = gather_by_idx(src, idx, n_sel);   /* fresh, no alias */
+        gcol = gather_by_idx(src, idx, n_sel);   /* fresh, no alias */
         if (!gcol || RAY_IS_ERR(gcol)) {
             ray_release(compact); scratch_free(want_hdr);
             return gcol ? gcol : ray_error("oom", NULL);

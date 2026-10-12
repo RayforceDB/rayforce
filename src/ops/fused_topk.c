@@ -46,6 +46,7 @@
 #include "ops/fused_group.h"   /* ray_fused_group_supported */
 #include "ops/internal.h"
 #include "ops/colbind.h"
+#include "ops/colgather.h"   /* generation-2 output gathers */
 #include "lang/internal.h"
 #include "core/pool.h"
 #include "ops/idxop.h"      /* chunk-zone extrema: skip chunks that cannot enter the top-K */
@@ -736,10 +737,17 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
         ray_col_src_t* ssrc = ray_graph_bind_col(g, tbl, cs, &gerr);
         if (gerr) { build_ok = 0; break; }
         if (!ssrc) { build_ok = 0; break; }
-        ray_t* src = NULL;
-        gerr = ray_col_src_plain(ssrc, &src);   /* random: top-k gather (P3) */
-        if (gerr) { build_ok = 0; break; }
-        ray_t* col = gather_by_idx(src, global_idx, global_n);
+        ray_t* col = NULL;
+        if (ray_col_src_encoded(ssrc)) {
+            /* generation 2: the output rows' vectors, decoded by range */
+            gerr = ray_col_gather_rows(ssrc, global_idx, global_n, &col);
+            if (gerr) { build_ok = 0; break; }
+        } else {
+            ray_t* src = NULL;
+            gerr = ray_col_src_plain(ssrc, &src);   /* ready-only */
+            if (gerr) { build_ok = 0; break; }
+            col = gather_by_idx(src, global_idx, global_n);
+        }
         if (!col || RAY_IS_ERR(col)) { build_ok = 0; break; }
         result = ray_table_add_col(result, alias, col);
         ray_release(col);
@@ -995,10 +1003,17 @@ ray_t* ray_fused_take_select(ray_t* tbl,
         ray_col_src_t* ssrc = ray_graph_bind_col(g, tbl, cs, &gerr);
         if (gerr) { build_ok = 0; break; }
         if (!ssrc) { build_ok = 0; break; }
-        ray_t* src = NULL;
-        gerr = ray_col_src_plain(ssrc, &src);   /* random: top-k gather (P3) */
-        if (gerr) { build_ok = 0; break; }
-        ray_t* col = gather_by_idx(src, out, out_n);
+        ray_t* col = NULL;
+        if (ray_col_src_encoded(ssrc)) {
+            /* generation 2: the output rows' vectors, decoded by range */
+            gerr = ray_col_gather_rows(ssrc, out, out_n, &col);
+            if (gerr) { build_ok = 0; break; }
+        } else {
+            ray_t* src = NULL;
+            gerr = ray_col_src_plain(ssrc, &src);   /* ready-only */
+            if (gerr) { build_ok = 0; break; }
+            col = gather_by_idx(src, out, out_n);
+        }
         if (!col || RAY_IS_ERR(col)) { build_ok = 0; break; }
         result = ray_table_add_col(result, alias, col);
         ray_release(col);

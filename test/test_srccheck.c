@@ -182,7 +182,7 @@ static test_result_t test_tmp_paths_per_process(void) {
  * names one of the audited classes (Task 15's table), so a new site cannot
  * pass under an invented or misspelled reason. */
 static const char* const plain_classes[] = {
-    "index probe", "sort", "top-k sort key", "top-k gather (P3)", "selection gather (P3)",
+    "index probe", "sort", "top-k sort key",
     "holistic aggregate", "wide key", "indexed v2 strategy", "first-n", "slice group",
     "STR strlen", "join", "datalog", "pivot", "window", "user value",
     "unstage: scalar holistic or wide input", "unstage: v2 whole-column strategy",
@@ -253,7 +253,10 @@ static test_result_t test_plain_requests_marked(void) {
 static test_result_t test_plain_marker_forms(void) {
     TEST_ASSERT_TRUE(plain_marker_ok("x = ray_col_src_plain(s, &c);   /* ready-only */"));
     TEST_ASSERT_TRUE(plain_marker_ok("x = ray_col_src_plain(s, &c);   /* random: wide key */"));
-    TEST_ASSERT_TRUE(plain_marker_ok("x = ray_col_src_plain(s, &c);   /* random: top-k gather (P3) */"));
+    TEST_ASSERT_TRUE(plain_marker_ok("x = ray_col_src_plain(s, &c);   /* random: top-k sort key */"));
+    /* the P3 gather classes are gone: those sites gather by range now */
+    TEST_ASSERT_FALSE(plain_marker_ok("x = ray_col_src_plain(s, &c);   /* random: top-k gather (P3) */"));
+    TEST_ASSERT_FALSE(plain_marker_ok("x = ray_col_src_plain(s, &c);   /* random: selection gather (P3) */"));
     TEST_ASSERT_FALSE(plain_marker_ok("x = ray_col_src_plain(s, &c);"));
     TEST_ASSERT_FALSE(plain_marker_ok("x = ray_col_src_plain(s, &c);   /* random: */"));
     TEST_ASSERT_FALSE(plain_marker_ok("x = ray_col_src_plain(s, &c);   /* random: wide keys */"));

@@ -3469,11 +3469,11 @@ static test_result_t test_filter_absent_symbol(void) {
     TEST_ASSERT_EQ_U(c2.materialized, 0);
     TEST_ASSERT_EQ_I(fq_filter_rows("as", 0, "s", beta, &c0), 750);
     TEST_ASSERT_EQ_I(fq_filter_rows("as", 2, "s", beta, &c2), 750);
-    TEST_ASSERT_TRUE(c2.materialized >= 1);                /* the scan binds s; the result gather reads the rest */
+    TEST_ASSERT_EQ_U(c2.materialized, 0);                  /* the scan reads s by range; the result gathers by range (P3 Task 6) */
     int64_t v0 = fq_filter_rows("as", 0, "v", four, &c0);
     int64_t v2 = fq_filter_rows("as", 2, "v", four, &c2);
     TEST_ASSERT_TRUE(v0 > 0 && v0 == v2);
-    TEST_ASSERT_TRUE(c2.materialized <= 5);                /* no index: each column decodes at most once */
+    TEST_ASSERT_EQ_U(c2.materialized, 0);                  /* no index: the scan and the result gather read by range */
     ray_release(none); ray_release(beta); ray_release(four);
     PASS();
 }
@@ -4966,17 +4966,17 @@ static test_result_t test_select_decodes_referenced_only(void) {
     static const struct { const char* q; uint64_t cols; } qs[] = {
         { "(select {c: (count v) from: u2 where: (> v 100)})",                0 },  /* P2 Task 10: the scalar route range-reads */
         { "(select {s: (sum v) from: u2 where: (== k 3)})",                   0 },  /* P2: k's consult reads the directory; Task 10: v by range */
-        { "(select {from: u2 where: (== k 3)})",                              6 },  /* every column is output */
+        { "(select {from: u2 where: (== k 3)})",                              0 },  /* every column is output: gathered by range (P3 Task 6) */
         { "(select {s: (sum v) by: k from: u2})",                             0 },  /* P2 Task 13: v2 reads by range */
         { "(select {s: (sum v) c: (max w) by: [k m] from: u2})",              0 },  /* P2 Task 13 */
-        { "(select {s: (sum v) by: k from: u2 where: (> w 5)})",              2 },  /* P2: w's consult reads the directory */
+        { "(select {s: (sum v) by: k from: u2 where: (> w 5)})",              0 },  /* P2: w's consult reads the directory; P3 Task 6: the compact gathers by range */
         { "(select {s: (sum v) by: k from: u2 desc: s take: 2})",             0 },  /* P2 Task 13 */
         { "(select {d: (med v) e: (first w) from: u2})",                      1 },  /* P2 Task 10: med reads plain v, first w by range */
         { "(select {d: (avg v) e: (dev w) from: u2 where: (< x 1000)})",      0 },  /* P2: x's consult reads the directory; Task 10: v, w by range */
         { "(select {k: k v: v from: u2 take: 5})",                            2 },
-        { "(select {k: k v: v from: u2 where: (> w 5) take: 5})",             2 },  /* P2: the take scan range-reads w */
+        { "(select {k: k v: v from: u2 where: (> w 5) take: 5})",             0 },  /* P2: the take scan range-reads w; P3 Task 6: k, v gathered */
         { "(select {v: v from: u2 desc: v take: 3})",                         1 },
-        { "(select {v: v x: x from: u2 where: (> w 5) asc: x take: 4})",      2 },  /* P2: the top-k scan range-reads w */
+        { "(select {v: v x: x from: u2 where: (> w 5) asc: x take: 4})",      1 },  /* P2: the top-k scan range-reads w; the sort key x only (P3 Task 6) */
         { "(select {z: (+ v x) from: u2 where: (> w 5)})",                    0 },  /* P2: a fused side range-reads; w's consult reads the directory */
         { NULL, 0 },
     };
@@ -5125,18 +5125,19 @@ static bool sp_same(ray_t* x, ray_t* y) {
 /* A select over a parted generation-2 table decodes only the surviving
  * partitions' referenced columns: the where on the partition key prunes
  * before any column is fetched.  Before this change the four shapes
- * materialized 6, 2, 6 and 3 segment columns. */
+ * materialized 6, 2, 6 and 3 segment columns; since P3 Task 6 the
+ * surviving rows are gathered by range and only a sort key materializes. */
 static test_result_t test_select_parted_prunes_fetch(void) {
     ray_t* t = pdb_make(ray_test_tmp(CS_TMP "/sp"), 7, false);
     ray_t* t0 = pdb_make(ray_test_tmp(CS_TMP "/sp0"), 0, false);
     TEST_ASSERT_TRUE(t && t0);
     ray_release(t);
     static const struct { const char* q; uint64_t cols; int64_t rows; } qs[] = {
-        { "(select {from: t where: (== date 2024.01.02)})",                      2, 3000 },  /* a and b of 01.02 */
+        { "(select {from: t where: (== date 2024.01.02)})",                      0, 3000 },  /* a and b of 01.02, gathered by range (P3 Task 6) */
         { "(select {s: (sum a) from: t where: (== date 2024.01.02)})",           0, 1 },     /* P2 Task 10: the scalar route range-reads a of 01.02 */
         { "(select {c: (count a) from: t by: b where: (== date 2024.01.02)})",   0, 3000 },  /* P2 Task 14: the parted group reads a and b of 01.02 by range */
-        { "(select {a: a from: t where: (<= date 2024.01.02) take: 10})",        2, 10 },    /* a of 01.01 and 01.02 */
-        { "(select {a: a from: t where: (<= date 2024.01.02) asc: b})",          4, 6000 },  /* a and b of 01.01, 01.02 */
+        { "(select {a: a from: t where: (<= date 2024.01.02) take: 10})",        0, 10 },    /* a of 01.01 and 01.02, gathered by range */
+        { "(select {a: a from: t where: (<= date 2024.01.02) asc: b})",          2, 6000 },  /* the sort key b of 01.01, 01.02; a gathered */
         { "(select {c: (count a) from: t where: (> date 2024.01.03)})",          0, 1 },     /* the stand-in alone */
         { NULL, 0, 0 },
     };

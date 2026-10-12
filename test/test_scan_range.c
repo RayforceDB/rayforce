@@ -2517,13 +2517,13 @@ static test_result_t sr_fused_same(const char* q, uint64_t want_mat) {
 #define SR_FUSED_SAME(q, m) do { test_result_t r_ = sr_fused_same((q), (m)); if (r_.status != TEST_PASS) return r_; } while (0)
 
 /* Top-k: results equal generation 0; the materializations are exactly the
- * sort keys plus the projected columns (gathers by row list arrive in P3). */
+ * sort keys: the projected columns are gathered by row list (P3 Task 6). */
 static test_result_t test_topk_materializes_keys(void) {
     SR_FUSED_SAME("(select {k: k from: T where: (> v 1000) desc: k take: 5})", 1);            /* k: key and output */
     SR_FUSED_SAME("(select {g: g k: k from: T where: (> v 1000) asc: [g k] take: 7})", 2);    /* two keys */
-    SR_FUSED_SAME("(select {f: f from: T where: (== g 3) desc: k take: 3})", 2);              /* key k, projected f */
-    SR_FUSED_SAME("(select {k: k from: T where: (< v 50) take: 4})", 1);                      /* take scan: projected k */
-    SR_FUSED_SAME("(select {k: k from: T where: (< v 50) take: -4})", 1);                     /* take from the end */
+    SR_FUSED_SAME("(select {f: f from: T where: (== g 3) desc: k take: 3})", 1);              /* key k; f gathered */
+    SR_FUSED_SAME("(select {k: k from: T where: (< v 50) take: 4})", 0);                      /* take scan: k gathered */
+    SR_FUSED_SAME("(select {k: k from: T where: (< v 50) take: -4})", 0);                     /* take from the end */
     PASS();
 }
 
@@ -4093,10 +4093,11 @@ static test_result_t test_v2_sel_bounds_boundary(void) {
         ray_t* res = sr_eval(qs[i].q);
         TEST_ASSERT_TRUE(res && !RAY_IS_ERR(res));
         ray_release(res);
-        /* the pass reads all of k (200000 I64); the bounds prescan adds the
-         * five vectors of the selected rows, or nothing when the other keys
-         * already rule the plan out */
-        const uint64_t want = 200000 * 8 + (qs[i].k_bounds ? 5 * RAY_ENC_VEC * 8 : 0);
+        /* the compact fallback gathers the five vectors of the selected
+         * rows of k (P3 Task 6; before, it read all 200000 I64); the bounds
+         * prescan adds the same five vectors, or nothing when the other
+         * keys already rule the plan out */
+        const uint64_t want = 5 * RAY_ENC_VEC * 8 + (qs[i].k_bounds ? 5 * RAY_ENC_VEC * 8 : 0);
         TEST_ASSERT_FMT(sr_col_decoded("k") - k0 == want, "%s: %llu bytes of k decoded, want %llu", qs[i].q,
                         (unsigned long long)(sr_col_decoded("k") - k0), (unsigned long long)want);
     }
@@ -5584,7 +5585,7 @@ static test_result_t test_v2_forged_parted_segment(void) {
  * operators, key widths and clauses: k and h stand for the I64 columns
  * (WatchID, UserID), v for the nullable I32 (ClientIP), g and u for the
  * narrow integers, d for EventDate and s for the SYM columns.  q18 and q39
- * are pinned in sr_gaps instead (they still materialize). */
+ * are pinned in sr_gaps instead (q18 still materializes until Task 6b). */
 #define SR_Q18 "(select {c: (count h) from: T by: {h: h s: s} take: 10})"
 #define SR_Q35 "(select {one: 1 s: s c: (count s) from: T by: s desc: c take: 10})"
 #define SR_Q39 "(take (select {s: s p: (count s) from: T where: (and (== g 3) (>= d 100) (<= d 400) " \
@@ -5634,13 +5635,14 @@ static const sr_gap_t sr_gaps[] = {
      * (agg_first_n_run), whose keys unstage (agg_keys_unstage, first-n) */
     { SR_Q18, 2 },
     /* q39: the conjunction's later filter refines a selective first one by
-     * gathering its predicate column (exec_node OP_FILTER -> sel_compact),
+     * compacting its predicate column (exec_node OP_FILTER -> sel_compact),
      * and the v2 group over fewer survivors than the parallel threshold
-     * gathers its key (AGG_RUN_COMPACT_FALLBACK -> agg_build_compact) */
-    { SR_Q39, 2 },
+     * compacts its key (AGG_RUN_COMPACT_FALLBACK -> agg_build_compact):
+     * both gather by range since P3 Task 6 */
+    { SR_Q39, 0 },
     /* the v2 compact fallback alone: a filtered group-by under the parallel
-     * threshold gathers its key and input (agg_build_compact) */
-    { SR_COMPACT_GROUP, 2 },
+     * threshold gathers its key and input by range (agg_build_compact) */
+    { SR_COMPACT_GROUP, 0 },
     /* a conjunctive where: is counted off its selection (Task 15b) */
     { SR_AND_COUNT, 0 },
     { NULL, 0 },
@@ -5651,9 +5653,10 @@ static const sr_gap_t sr_gaps[] = {
 static const sr_gap_t sr_gaps_parted[] = {
     /* q18 takes the flat-copy run (agg_seg_flat_run) and gathers nothing */
     { SR_Q18, 0 },
-    /* q39: the filter refinement and the compact fallback, per segment */
-    { SR_Q39, 6 },
-    { SR_COMPACT_GROUP, 2 },
+    /* q39: the filter refinement and the compact fallback, per segment,
+     * gather by range (P3 Task 6) */
+    { SR_Q39, 0 },
+    { SR_COMPACT_GROUP, 0 },
     /* counted off the selection per segment, as on the splayed table */
     { SR_AND_COUNT, 0 },
     { NULL, 0 },
@@ -5665,8 +5668,8 @@ static const sr_gap_t sr_gaps_parted[] = {
  * the known gaps at their pinned counts, and the row-returning filter: both
  * ray_execute of a bare FILTER (the API caller, Task 5) and a language
  * select that returns the filtered table compact the selection through
- * sel_compact, gathering every column (selection gather, P3); counting the
- * same filter gathers none (the first shape). */
+ * sel_compact, which gathers every column by range (P3 Task 6): nothing
+ * materializes, as when counting the same filter (the first shape). */
 static test_result_t test_no_materialization(void) {
     static const char* const shapes[] = {
         "(count (select {from: T where: (!= g 0)}))",
@@ -5718,9 +5721,9 @@ static test_result_t test_no_materialization(void) {
         ray_release(t);
     }
     TEST_ASSERT_EQ_I(rows[0], rows[1]);
-    TEST_ASSERT_FMT(mat[0] == 10, "ray_execute of a bare FILTER: %llu materializations, want 10 (every column)",
+    TEST_ASSERT_FMT(mat[0] == 0, "ray_execute of a bare FILTER: %llu materializations, want 0",
                     (unsigned long long)mat[0]);
-    TEST_ASSERT_FMT(mat[1] == 10, "select of the same filter: %llu materializations, want 10 (every column)",
+    TEST_ASSERT_FMT(mat[1] == 0, "select of the same filter: %llu materializations, want 0",
                     (unsigned long long)mat[1]);
     PASS();
 }
@@ -5767,8 +5770,9 @@ static test_result_t test_no_materialization_parted(void) {
  * column.  The ClickBench q11, q14 and q23 shapes (a count(distinct)
  * output, so the where: runs as its own filter: the materialize path) and
  * q12 (an implicit group under an outer projection: the eval-level group)
- * over the parted battery tables materialize exactly their own columns on
- * generation 2, one per partition (three), the where:-only columns read in
+ * over the parted battery tables gather exactly their own columns on
+ * generation 2, by range since P3 Task 6 (nothing materializes, and the
+ * columns they never read decode nothing), the where:-only columns read in
  * place by the filter.  Shapes whose reads cannot be named keep every
  * column and answer as before: a lambda output, the implicit-all group
  * (first of every column), a computed key; and an all-pass filter, a
@@ -5776,24 +5780,32 @@ static test_result_t test_no_materialization_parted(void) {
  * columns answer as generation 0. */
 static test_result_t test_parted_eval_group_keep(void) {
     sr_np_tables();
-    static const sr_gap_t own[] = {
+    /* each shape's materializations, and the columns it never reads: they
+     * decode nothing, so the keep set still narrows the compaction */
+    static const struct { const char* q; uint64_t mat; const char* unread; } own[] = {
         /* q11: key s, distinct h; v in the where: only */
-        { "(select {s: s u: (count (distinct h)) from: T where: (> v 3) by: s desc: u take: 10})", 6 },
+        { "(select {s: s u: (count (distinct h)) from: T where: (> v 3) by: s desc: u take: 10})", 0, "kgdbu" },
         /* q12: the inner implicit group feeds an outer that reads g, s, h */
         { "(select {c: (count h) from: (select {from: T where: (!= u 0) by: {g: g s: s h: h}}) "
-          "by: {g: g s: s} desc: c take: 10})", 9 },
+          "by: {g: g s: s} desc: c take: 10})", 0, "kvdb" },
         /* q14: key g, distinct k; u in the where: only */
-        { "(select {g: g u: (count (distinct k)) from: T where: (!= u 0) by: g desc: u take: 10})", 6 },
+        { "(select {g: g u: (count (distinct k)) from: T where: (!= u 0) by: g desc: u take: 10})", 0, "vdsbh" },
         /* q23: four outputs over s, h, k; g and v in the where: only */
         { "(select {s: s u: (count h) t: (count k) c: (count s) d: (count (distinct h)) from: T "
-          "where: (and (!= g 1) (> v 3)) by: s desc: c take: 10})", 9 },
+          "where: (and (!= g 1) (> v 3)) by: s desc: c take: 10})", 0, "dbu" },
         /* an all-pass filter flattens the same columns */
-        { "(select {g: g u: (count (distinct k)) m: (max d) from: T where: (>= u 0) by: g})", 9 },
-        { NULL, 0 },
+        { "(select {g: g u: (count (distinct k)) m: (max d) from: T where: (>= u 0) by: g})", 9, "" },
+        { NULL, 0, NULL },
     };
     for (int i = 0; own[i].q; i++) {
         test_result_t r = sr_same_on(SR_NP0, SR_NP2, own[i].q, own[i].mat);
         if (r.status != TEST_PASS) return r;
+        for (const char* c = own[i].unread; *c; c++) {     /* T: the generation-2 table */
+            char nm[2] = { *c, 0 };
+            uint64_t full = 0, dec = sr_col_dec_any(nm, &full);
+            TEST_ASSERT_FMT(full > 0 && dec == 0, "%s: unread column %s decoded %llu bytes", own[i].q, nm,
+                            (unsigned long long)dec);
+        }
     }
     static const char* const all[] = {
         "(select {s: s u: (count (distinct h)) w: ((fn [x] (count x)) k) from: T where: (> v 3) by: s})",
@@ -6000,11 +6012,12 @@ static test_result_t test_const_beside_parted_group(void) {
         { "(select {one: 1 c: (count k) from: T where: (!= u 0) by: s})",
           "(select {c: (count k) from: T where: (!= u 0) by: s})",
           "(all (== (at R 'one) (take 1 5)))", 0 },
-        /* no group: the compact fallback gathers the key and input (a P3
-         * gap, sr_gaps' SR_COMPACT_GROUP), with or without the constant */
+        /* no group: the compact fallback gathers the key and input by
+         * range (sr_gaps' SR_COMPACT_GROUP, P3 Task 6), with or without the
+         * constant */
         { "(select {one: 1 c: (count k) from: T where: (== g 9) by: s})",
           "(select {c: (count k) from: T where: (== g 9) by: s})",
-          "(and (== (type (at R 'one)) 'I64) (== 0 (count (at R 'one))))", 2 },
+          "(and (== (type (at R 'one)) 'I64) (== 0 (count (at R 'one))))", 0 },
         { "(select {c: (sum v) one: 1 from: T by: k desc: c take: 5})",
           "(select {c: (sum v) from: T by: k desc: c take: 5})",
           "(all (== (at R 'one) (take 1 5)))", 0 },

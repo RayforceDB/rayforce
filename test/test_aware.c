@@ -1150,7 +1150,7 @@ static test_result_t test_fused_pred_leaves(void) {
         TEST_ASSERT_EQ_U(ran, 2);
         TEST_ASSERT_EQ_U(aw_col_decoded("x"), 0);                /* the leaf reads x's views */
         ray_fused_topk_counters_reset();
-        r = aw_same(nk[i], "(select {k: k from: T where: (> x 25) take: 5})", 1);   /* the fused take (k: the output gather, Task 6) */
+        r = aw_same(nk[i], "(select {k: k from: T where: (> x 25) take: 5})", 0);   /* the fused take (k: gathered by range, Task 6) */
         if (r.status != TEST_PASS) return r;
         ray_fused_topk_counters(&ran, &dec);
         TEST_ASSERT_EQ_U(ran, 2);
@@ -1158,7 +1158,7 @@ static test_result_t test_fused_pred_leaves(void) {
         /* from the end: windows end at the table's last row, so they lie
          * inside a vector (the leaf's whole-vector answer is cut) */
         ray_fused_topk_counters_reset();
-        r = aw_same(nk[i], "(select {k: k from: T where: (> x 25) take: -1500})", 1);
+        r = aw_same(nk[i], "(select {k: k from: T where: (> x 25) take: -1500})", 0);
         if (r.status != TEST_PASS) return r;
         ray_fused_topk_counters(&ran, &dec);
         TEST_ASSERT_EQ_U(ran, 2);
@@ -1922,6 +1922,320 @@ static test_result_t test_gather_ragged(void) {
     PASS();
 }
 
+/* ---- Task 6: gathers in the operators ---------------------------------- */
+
+/* aw_same / AW_SAME: Task 1. */
+static const char* AW_WIDE =
+    "(table [k g v s t] (list (til 200000) (as 'I16 (% (til 200000) 7)) "
+    "(as 'I32 (map (fn [j] (if (== 0 (% j 10)) 0N j)) (til 200000))) "
+    "(take ['a 'b 'c] 200000) (map (fn [j] (format \"text value %\" (% j 333))) (til 200000))))";
+
+/* q's answer as .csv.write bytes of table expression q over T (malloc'd;
+ * NULL on a failure). */
+static char* aw_csv(const char* q, const char* tag, size_t* len) {
+    char path[600], e[2048];
+    snprintf(path, sizeof path, "%s/%s.csv", aw_root(), tag);
+    snprintf(e, sizeof e, "(.csv.write %s \"%s\")", q, path);
+    ray_t* r = ray_eval_str(e);
+    if (!r || RAY_IS_ERR(r)) { if (r) ray_error_free(r); return NULL; }
+    ray_release(r);
+    FILE* f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    char* b = malloc((size_t)n + 1);
+    if (b && fread(b, 1, (size_t)n, f) != (size_t)n) { free(b); b = NULL; }
+    fclose(f);
+    *len = (size_t)n;
+    return b;
+}
+
+/* Result tables a (generation 0) and b (generation 2) of `what`: the same
+ * column types and every SYM column at the same width. */
+static test_result_t aw_widths_same(const char* what, ray_t* a, ray_t* b) {
+    TEST_ASSERT_EQ_I(ray_table_ncols(a), ray_table_ncols(b));
+    for (int64_t c = 0; c < ray_table_ncols(a); c++) {
+        ray_t* x = ray_table_col_idx(a, c);
+        ray_t* y = ray_table_col_idx(b, c);
+        TEST_ASSERT_TRUE(x && y && !RAY_IS_ERR(x) && !RAY_IS_ERR(y));
+        TEST_ASSERT_EQ_I(x->type, y->type);
+        if (x->type == RAY_SYM)
+            TEST_ASSERT_FMT((x->attrs & RAY_SYM_W_MASK) == (y->attrs & RAY_SYM_W_MASK), "%s: SYM width %d vs %d",
+                            what, x->attrs & RAY_SYM_W_MASK, y->attrs & RAY_SYM_W_MASK);
+    }
+    PASS();
+}
+
+/* `q` over the generation-0 and generation-2 tables tbl0 / tbl2 (Rayfall
+ * expressions, loaded as T): byte-equal .csv.write answers, exactly
+ * want_mat materializations on generation 2, and every SYM column of the
+ * two results at the same width. */
+static test_result_t aw_csv_same(const char* tbl0, const char* tbl2, const char* q, uint64_t want_mat) {
+    char buf[1024]; char* csv[2]; size_t len[2]; ray_t* res[2];
+    for (int gen = 0; gen < 2; gen++) {
+        snprintf(buf, sizeof buf, "(set T %s)", gen ? tbl2 : tbl0);
+        aw_eval_ok(buf);
+        ray_enc_counters_reset();
+        res[gen] = ray_eval_str(ray_test_tmp(q));
+        TEST_ASSERT_FMT(res[gen] && !RAY_IS_ERR(res[gen]) && res[gen]->type == RAY_TABLE, "%s gen %d: %s",
+                        q, gen, ray_error_msg());
+        if (gen) {
+            ray_enc_counters_t k; ray_enc_counters_get(&k);
+            TEST_ASSERT_FMT(k.materialized == want_mat, "%s: %llu materializations, want %llu", q,
+                            (unsigned long long)k.materialized, (unsigned long long)want_mat);
+        }
+        ray_env_set(ray_sym_intern("R", 1), res[gen]);
+        csv[gen] = aw_csv("R", gen ? "r2" : "r0", &len[gen]);
+    }
+    bool same = csv[0] && csv[1] && len[0] == len[1] && memcmp(csv[0], csv[1], len[0]) == 0;
+    free(csv[0]); free(csv[1]);
+    TEST_ASSERT_FMT(same, "%s: csv differs", q);
+    aw_eval_ok("(set R 0)");
+    test_result_t r = aw_widths_same(q, res[0], res[1]);
+    ray_release(res[0]); ray_release(res[1]);
+    return r;
+}
+#define AW_CSV_SAME(a, b, q, m) do { test_result_t r_ = aw_csv_same((a), (b), (q), (m)); if (r_.status != TEST_PASS) return r_; } while (0)
+
+static test_result_t test_gather_operators(void) {
+    aw_save("go", AW_WIDE, -1);
+    AW_SAME("go", "(select {from: T where: (< k 100)})", 0);                        /* selection gather, every column */
+    AW_SAME("go", "(select {k: k t: t from: T where: (== g 3) take: 7})", 0);         /* take: filter head */
+    AW_SAME("go", "(select {k: k v: v t: t from: T where: (> v 100) desc: k take: 5})", 1);   /* top-k: only the key k */
+    AW_SAME("go", "(select {t: t from: T where: (> v 100) asc: [g k] take: 4})", 2);           /* two sort keys */
+    /* the same answers byte for byte through .csv.write */
+    const char* t0 = "(.db.splayed.get \"" AW_TMP "/go0/\")";
+    const char* t2 = "(.db.splayed.get \"" AW_TMP "/go2/\")";
+    AW_CSV_SAME(t0, t2, "(select {from: T where: (< k 100)})", 0);
+    AW_CSV_SAME(t0, t2, "(select {k: k t: t from: T where: (== g 3) take: 7})", 0);
+    AW_CSV_SAME(t0, t2, "(select {k: k v: v s: s t: t from: T where: (> v 100) desc: k take: 5})", 1);
+    AW_CSV_SAME(t0, t2, "(select {k: k s: s t: t from: T where: (< v 50) take: -6})", 0);
+    PASS();
+}
+
+/* SR_COMPACT_GROUP's shape: a filtered group under the parallel threshold
+ * gathers its key and input through agg_build_compact. */
+static test_result_t test_gather_compact_group(void) {
+    aw_save("gc", AW_WIDE, -1);
+    AW_SAME("gc", "(select {c: (count k) from: T where: (< k 1000) by: g})", 0);
+    AW_SAME("gc", "(select {c: (count k) m: (max v) from: T where: (< k 1000) by: s})", 0);
+    PASS();
+}
+
+/* q39's shape: a conjunction whose first conjunct passes <= 25% of the
+ * rows; the later conjuncts refine its selection, compacting their
+ * predicate columns (sel_compact). */
+static test_result_t test_gather_refine(void) {
+    aw_save("gr", AW_WIDE, -1);
+    AW_SAME("gr", "(select {c: (count k) from: T where: (and (< k 30000) (> v 100) (!= g 0))})", 0);
+    AW_SAME("gr", "(select {k: k t: t from: T where: (and (< k 30000) (> v 100) (!= g 0))})", 0);
+    AW_SAME("gr", "(take (select {s: s p: (count s) from: T where: (and (< k 30000) (== g 3) (> v 100)) "
+                  "by: s desc: p take: 2}) -1)", 0);
+    PASS();
+}
+
+/* LIST cells beside generation-2 columns: gathered by a selection, the
+ * result read after the source table is released (ASan); then a partial
+ * failure (k's chunk-0 descriptors corrupted, so its gather fails after p
+ * and l were gathered) releases every retained cell and the partial
+ * columns once. */
+static test_result_t test_gather_list_cells(void) {
+    aw_eval_ok("(set W (table [p l k] (list (til 3000) (map (fn [j] (list j (* 2 j))) (til 3000)) (til 3000))))");
+    aw_eval_ok("(.db.splayed.set \"" AW_TMP "/li2/\" W {compress: true})");
+    aw_eval_ok("(set T (.db.splayed.get \"" AW_TMP "/li2/\"))");
+    ray_t* r = aw_eval("(select {p: p l: l k: k from: T where: (< p 10)})");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    aw_eval_ok("(set T 0)");                              /* the source table is gone */
+    ray_t* fr = ray_fmt(r, 0);
+    ray_t* want = aw_eval("(select {p: p l: l k: k from: W where: (< p 10)})");
+    ray_t* fw = ray_fmt(want, 0);
+    TEST_ASSERT_TRUE(ray_str_len(fr) == ray_str_len(fw) && memcmp(ray_str_ptr(fr), ray_str_ptr(fw), ray_str_len(fr)) == 0);
+    ray_release(fr); ray_release(fw); ray_release(r); ray_release(want);
+    /* corrupt k: reserved byte 6 of chunk 0's first descriptor */
+    char dir[512], kpath[600];
+    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(ray_test_tmp(AW_TMP "/li2"), dir, sizeof dir), RAY_OK);
+    snprintf(kpath, sizeof kpath, "%s/k", dir);
+    uint64_t off = 0;
+    FILE* fh = fopen(kpath, "r+b"); TEST_ASSERT_NOT_NULL(fh);
+    fseek(fh, 96, SEEK_SET); TEST_ASSERT_EQ_I(fread(&off, 8, 1, fh), 1);
+    fseek(fh, (long)off + 6, SEEK_SET); fputc(1, fh); fclose(fh);
+    aw_eval_ok("(set T (.db.splayed.get \"" AW_TMP "/li2/\"))");
+    ray_mem_stats_t m0, m1; ray_mem_stats(&m0);
+    ray_t* e = aw_eval("(select {p: p l: l k: k from: T where: (< p 10)})");
+    TEST_ASSERT_TRUE(e && RAY_IS_ERR(e));
+    TEST_ASSERT_STR_EQ(ray_err_code(e), "corrupt");
+    ray_error_free(e);
+    ray_mem_stats(&m1);
+    TEST_ASSERT_EQ_U(m1.bytes_allocated, m0.bytes_allocated);   /* partial result released */
+    PASS();
+}
+
+/* An index row list: only the indexed column materializes. */
+static test_result_t test_gather_index_rows(void) {
+    aw_eval_ok("(set W (table [h v t] (list (.idx.hash (% (* (til 100000) 7919) 1000003)) (til 100000) "
+               "(map (fn [j] (format \"r%\" j)) (til 100000)))))");
+    aw_eval_ok("(.db.splayed.set \"" AW_TMP "/ix0/\" W {compress: false})");
+    aw_eval_ok("(.db.splayed.set \"" AW_TMP "/ix2/\" W {compress: true})");
+    AW_SAME("ix", "(select {v: v t: t from: T where: (== h 7919)})", 0);
+    PASS();
+}
+
+/* Parted SYM outputs: partition 1 holds 3 symbols (W8), partition 2 adds
+ * 400 (W16).  Every row-returning route (selection compaction, filter
+ * head, filter refinement, the sequential filter) answers byte for byte as
+ * generation 0 and at generation 0's width (the widest segment's), with
+ * nothing materialized. */
+static void aw_gather_parted_sym_tables(void) {
+    for (int gen = 0; gen <= 2; gen += 2) {
+        char q[900];
+        snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/ps%d/2024.01.01/t/\" "
+                 "(table [k s v] (list (til 70000) (take ['a 'b 'c] 70000) (as 'I32 (%% (til 70000) 50)))) "
+                 "\"" AW_TMP "/ps%d/.sym\" {compress: %s})", gen, gen, gen ? "true" : "false");
+        aw_eval_ok(q);
+        snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/ps%d/2024.01.02/t/\" "
+                 "(table [k s v] (list (+ 70000 (til 70000)) (as 'SYMBOL (map (fn [j] (format \"w%%\" (%% j 400))) (til 70000))) "
+                 "(as 'I32 (%% (til 70000) 50)))) \"" AW_TMP "/ps%d/.sym\" {compress: %s})", gen, gen, gen ? "true" : "false");
+        aw_eval_ok(q);
+    }
+}
+static test_result_t test_gather_parted_sym(void) {
+    aw_gather_parted_sym_tables();
+    const char* t0 = "(.db.parted.get \"" AW_TMP "/ps0\" 't)";
+    const char* t2 = "(.db.parted.get \"" AW_TMP "/ps2\" 't)";
+    static const char* const qs[] = {
+        "(select {k: k s: s from: T where: (or (< k 20) (> k 139990))})",
+        "(select {k: k s: s from: T where: (> k 69990) take: 20})",
+        "(select {k: k s: s from: T where: (and (> k 69000) (== v 7) (< k 71000))})",
+        "(select {from: T where: (== v 7)})",
+        NULL,
+    };
+    for (int i = 0; qs[i]; i++) AW_CSV_SAME(t0, t2, qs[i], 0);
+    /* the parted output's width is the widest segment's */
+    aw_eval_ok("(set T (.db.parted.get \"" AW_TMP "/ps2\" 't))");
+    ray_t* r = aw_eval("(select {s: s from: T where: (or (< k 3) (> k 139997))})");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    ray_t* s = ray_table_col_idx(r, 0);
+    TEST_ASSERT_TRUE(s && s->type == RAY_SYM);
+    TEST_ASSERT_EQ_I(s->attrs & RAY_SYM_W_MASK, RAY_SYM_W16);
+    ray_release(r);
+    PASS();
+}
+
+/* The operators called directly on generation-0 and generation-2 copies
+ * of one table: exec_filter (its parallel gather over 200000 rows and the
+ * parted arm over 140000; its sequential arm under the parallel
+ * threshold), exec_filter_head and the sort top-K (topk_gather_rows, the
+ * key passed as a plain vector).  Generation 2 answers byte for byte
+ * (.csv.write) as generation 0's operator, with SYM at the same width and
+ * nothing materialized; the filters also equal generation 0's selection
+ * compaction of the same rows (the language route, sel_compact), so a null
+ * bit lost by a flat or parted gather shows here: exec_filter's flat
+ * gathers and exec_filter_head's flat and parted ones copied values
+ * without their null bits before P3 Task 6. */
+static test_result_t aw_csv_eq(const char* what, int op, ray_t* a, ray_t* b) {
+    char* csv[2]; size_t len[2];
+    ray_t* r[2] = { a, b };
+    for (int i = 0; i < 2; i++) {
+        ray_env_set(ray_sym_intern("R", 1), r[i]);
+        csv[i] = aw_csv("R", i ? "o2" : "o0", &len[i]);
+    }
+    aw_eval_ok("(set R 0)");
+    bool same = csv[0] && csv[1] && len[0] == len[1] && memcmp(csv[0], csv[1], len[0]) == 0;
+    free(csv[0]); free(csv[1]);
+    TEST_ASSERT_FMT(same, "%s op %d: csv differs", what, op);
+    PASS();
+}
+static test_result_t aw_ops_same(const char* tbl0, const char* tbl2, bool topk) {
+    char buf[1024];
+    ray_t* t[2];
+    for (int gen = 0; gen < 2; gen++) {
+        snprintf(buf, sizeof buf, "%s", gen ? tbl2 : tbl0);
+        t[gen] = aw_eval(buf);
+        TEST_ASSERT_FMT(t[gen] && !RAY_IS_ERR(t[gen]), "%s: %s", buf, ray_error_msg());
+    }
+    int64_t n = ray_table_nrows(t[0]);
+    ray_t* pred = ray_vec_new(RAY_BOOL, n); pred->len = n;
+    ray_t* head = ray_vec_new(RAY_BOOL, n); head->len = n;        /* the first 7 passing rows */
+    int64_t kept = 0;
+    for (int64_t r = 0; r < n; r++) {
+        uint8_t b = r < 5 || r % 97 == 3 || r > n - 3;
+        ((uint8_t*)ray_data(pred))[r] = b;
+        ((uint8_t*)ray_data(head))[r] = b && kept < 7;
+        kept += b;
+    }
+    ray_t* key = ray_table_col(t[0], ray_sym_intern("k", 1));       /* generation 0's, a plain vector */
+    TEST_ASSERT_TRUE(key && !RAY_IS_ERR(key));
+    for (int op = 0; op < (topk ? 3 : 2); op++) {
+        ray_t* res[2];
+        for (int gen = 0; gen < 2; gen++) {
+            ray_enc_counters_reset();
+            res[gen] = op == 0 ? exec_filter(NULL, NULL, t[gen], pred)
+                     : op == 1 ? exec_filter_head(t[gen], pred, 7)
+                               : ray_topk_table(t[gen], key, 1, 0, 6);
+            ray_enc_counters_t k; ray_enc_counters_get(&k);
+            if (gen) TEST_ASSERT_FMT(k.materialized == 0, "%s op %d: %llu materializations", tbl2, op,
+                                     (unsigned long long)k.materialized);
+            TEST_ASSERT_FMT(res[gen] && !RAY_IS_ERR(res[gen]) && res[gen]->type == RAY_TABLE, "%s op %d gen %d: %s",
+                            tbl2, op, gen, ray_error_msg());
+        }
+        test_result_t r = aw_csv_eq(tbl2, op, res[0], res[1]);
+        if (r.status == TEST_PASS && op < 2) {
+            ray_t* sel = ray_rowsel_from_pred(op ? head : pred);
+            TEST_ASSERT_NOT_NULL(sel);
+            ray_t* ref = sel_compact(NULL, t[0], sel, NULL, 0);
+            ray_rowsel_release(sel);
+            TEST_ASSERT_TRUE(ref && !RAY_IS_ERR(ref));
+            r = aw_csv_eq("selection compaction", op, ref, res[1]);
+            ray_release(ref);
+        }
+        if (r.status == TEST_PASS)
+            TEST_ASSERT_EQ_I(ray_table_nrows(res[1]), op == 0 ? kept : op == 1 ? 7 : 6);
+        if (r.status == TEST_PASS) r = aw_widths_same(tbl2, res[0], res[1]);
+        ray_release(res[0]); ray_release(res[1]);
+        if (r.status != TEST_PASS) return r;
+    }
+    ray_release(pred); ray_release(head); ray_release(t[0]); ray_release(t[1]);
+    PASS();
+}
+
+static test_result_t test_gather_filter_ops(void) {
+    aw_save("fo", AW_WIDE, -1);
+    test_result_t r = aw_ops_same("(.db.splayed.get \"" AW_TMP "/fo0/\")", "(.db.splayed.get \"" AW_TMP "/fo2/\")", true);
+    if (r.status != TEST_PASS) return r;
+    aw_save("fs", "(table [k g v s t] (list (til 3000) (as 'I16 (% (til 3000) 7)) "
+                  "(as 'I32 (map (fn [j] (if (== 0 (% j 10)) 0N j)) (til 3000))) "
+                  "(as 'SYMBOL (map (fn [j] (format \"y%\" (% j 300))) (til 3000))) "
+                  "(map (fn [j] (format \"a longer text value %\" (% j 333))) (til 3000))))", -1);
+    r = aw_ops_same("(.db.splayed.get \"" AW_TMP "/fs0/\")", "(.db.splayed.get \"" AW_TMP "/fs2/\")", true);
+    if (r.status != TEST_PASS) return r;
+    aw_gather_parted_sym_tables();
+    r = aw_ops_same("(.db.parted.get \"" AW_TMP "/ps0\" 't)", "(.db.parted.get \"" AW_TMP "/ps2\" 't)", false);
+    if (r.status != TEST_PASS) return r;
+    /* the language route to exec_filter_head (a parted take under a where:
+     * on the partition key): the null at row 0 stays null on both
+     * generations (generation 0 printed -9223372036854775808 before) */
+    for (int gen = 0; gen <= 2; gen += 2)
+        for (int p = 0; p < 2; p++) {
+            char q[600];
+            snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/hn%d/2024.01.0%d/t/\" "
+                     "(table [a b] (list (as 'I64 [0N 1 2 0N 4]) (as 'I32 [5 0N 7 8 9]))) {compress: %s})",
+                     gen, p + 1, gen ? "true" : "false");
+            aw_eval_ok(q);
+        }
+    for (int gen = 0; gen <= 2; gen += 2) {
+        char q[600];
+        snprintf(q, sizeof q, "(set T (.db.parted.get \"" AW_TMP "/hn%d\" 't))", gen);
+        aw_eval_ok(q);
+        ray_t* got = aw_eval("(select {from: T where: (not (== date 2024.01.02)) take: 3})");
+        ray_t* want = aw_eval("(table [date a b] (list (take 2024.01.01 3) (as 'I64 [0N 1 2]) (as 'I32 [5 0N 7])))");
+        TEST_ASSERT_TRUE(got && want && !RAY_IS_ERR(got) && !RAY_IS_ERR(want));
+        ray_t* fg = ray_fmt(got, 0); ray_t* fw = ray_fmt(want, 0);
+        bool same = ray_str_len(fg) == ray_str_len(fw) && memcmp(ray_str_ptr(fg), ray_str_ptr(fw), ray_str_len(fg)) == 0;
+        TEST_ASSERT_FMT(same, "gen %d: %.*s", gen, (int)ray_str_len(fg), ray_str_ptr(fg));
+        ray_release(fg); ray_release(fw); ray_release(got); ray_release(want);
+    }
+    PASS();
+}
+
 const test_entry_t aware_entries[] = {
     { "aware/vview_encodings", test_vview_encodings, aw_setup, aw_teardown },
     { "aware/vview_near_top",  test_vview_near_top,  aw_setup, aw_teardown },
@@ -1953,5 +2267,12 @@ const test_entry_t aware_entries[] = {
     { "aware/gather_rows_sorted",    test_gather_rows_sorted,    aw_setup, aw_teardown },
     { "aware/gather_empty_and_nulls", test_gather_empty_and_nulls, aw_setup, aw_teardown },
     { "aware/gather_ragged",         test_gather_ragged,         aw_setup, aw_teardown },
+    { "aware/gather_operators",  test_gather_operators,  aw_setup, aw_teardown },
+    { "aware/gather_index_rows", test_gather_index_rows, aw_setup, aw_teardown },
+    { "aware/gather_list_cells", test_gather_list_cells, aw_setup, aw_teardown },
+    { "aware/gather_compact_group", test_gather_compact_group, aw_setup, aw_teardown },
+    { "aware/gather_refine",     test_gather_refine,     aw_setup, aw_teardown },
+    { "aware/gather_parted_sym", test_gather_parted_sym, aw_setup, aw_teardown },
+    { "aware/gather_filter_ops", test_gather_filter_ops, aw_setup, aw_teardown },
     { NULL, NULL, NULL, NULL },
 };
