@@ -834,7 +834,13 @@ ray_t* ray_cd_fused(ray_t* key_col, ray_t* val_col, int64_t nrows) {
  * an upper bound that errs towards the rewrite. */
 static bool cd_many_groups_in_full(ray_t** K_cols, int n_K) {
     for (int j = 0; j < n_K; j++) {
-        ray_t* c = ray_count_distinct_approx(K_cols[j]);
+        ray_t* k = K_cols[j];
+        /* the count reads the column whole, a chunk per thread: a mapped
+         * column not in memory is asked for ahead as one range, else each
+         * thread waits on its chunk's pages in turn */
+        if (ray_pool_scan_on() && ray_col_cold(k))
+            ray_pool_want(ray_data(k), (size_t)k->len * col_esz(k));
+        ray_t* c = ray_count_distinct_approx(k);
         if (!c) return false;
         bool many = !RAY_IS_ERR(c) && c->type == -RAY_I64 && c->i64 > CD_SCATTER_MANY_GROUPS;
         if (RAY_IS_ERR(c)) ray_error_free(c); else ray_release(c);

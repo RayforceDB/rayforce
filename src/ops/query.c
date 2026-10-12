@@ -38,6 +38,7 @@
 #include "core/runtime.h"     /* __VM — per-thread query/eval context */
 #include "ops/rowsel.h"
 #include "store/col.h"      /* ray_col_want_rows — group-gather read-ahead */
+#include "core/pool.h"      /* ray_pool_dispatch — the route gate's sampled gather */
 #include "ops/fused_group.h"
 #include "ops/fused_topk.h"
 #include "ops/hll.h"
@@ -7331,12 +7332,54 @@ static int collect_col_refs_set(ray_t* expr, ray_t* tbl,
  * whole predicate would keep, scaled from the sample; the estimates over
  * them describe the filtered table.  Running the predicate over the whole
  * table instead cost 18 ms of a 90 ms select at 100 M rows when the gate
- * then chose the slices, whose path evaluates it again; this costs a few.
+ * then chose the slices, whose path evaluates it again; this costs a few,
+ * the gather over the pool's threads.  The pages the sampled rows fall on
+ * are asked for ahead of the reads (ray_col_want_rows — at this stride
+ * about every page of a mapped column, requested through the pool as the
+ * select's own scan would): read as they were met, a column not in memory
+ * waited on a page fault per sampled row, on this thread, 0.8 s and more
+ * of a half-second select at 100 M rows.
  * NULL — the gate then estimates over the whole table — when the predicate
  * names no column, names one the gather does not cover (text, nested,
  * parted), keeps every sampled row, or memory runs out.  The returned
  * block owns the row list; scratch_free it after the gate. */
 enum { CD_GATE_WHERE_SAMPLE = AGG_EST_SAMPLE_ROWS * 8 };
+
+/* The sampled rows of the predicate's columns gathered over a range of the
+ * sample: a task of the pool, the columns in turn. */
+typedef struct {
+    const void* const* src;
+    void* const*       dst;
+    const uint8_t*     esz;
+    const int64_t*     idx;
+    int                n;
+} cd_gate_gather_ctx_t;
+
+static void cd_gate_gather_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    const cd_gate_gather_ctx_t* c = raw;
+    const int64_t* idx = c->idx;
+    enum { AHEAD = 16 };
+    for (int j = 0; j < c->n; j++) {
+        /* the sampled rows miss the cache: typed loads with reads kept in
+         * flight (a byte-wise copy serialised them, 25 ms for the 262,144) */
+        switch (c->esz[j]) {
+#define CD_GATE_GATHER(T) do {                                                      \
+            const T* sp = (const T*)c->src[j]; T* dp = (T*)c->dst[j];                 \
+            for (int64_t r = start; r < end; r++) {                                   \
+                if (r + AHEAD < end) __builtin_prefetch(sp + idx[r + AHEAD]);         \
+                dp[r] = sp[idx[r]];                                                   \
+            }                                                                         \
+        } while (0)
+        case 1: CD_GATE_GATHER(uint8_t); break;
+        case 2: CD_GATE_GATHER(uint16_t); break;
+        case 4: CD_GATE_GATHER(uint32_t); break;
+        default: CD_GATE_GATHER(uint64_t); break;
+#undef CD_GATE_GATHER
+        }
+    }
+}
+
 ray_t* query_cd_gate_where_rows(ray_t* tbl, ray_t* where_expr, int64_t n_table,
                                 const int64_t** rows, int64_t* nrows, int64_t* population) {
     *rows = NULL; *nrows = n_table; *population = 0;
@@ -7368,44 +7411,48 @@ ray_t* query_cd_gate_where_rows(ray_t* tbl, ray_t* where_expr, int64_t n_table,
     if (!idx) { scratch_free(syms_hdr); return NULL; }
     for (int64_t i = 0; i < n_s; i++) idx[i] = agg_est_sample_row(i, stride);
 
-    ray_t* st = ray_table_new(0);
-    if (!st || RAY_IS_ERR(st)) {
-        if (st) ray_release(st);
-        scratch_free(idx_hdr); scratch_free(syms_hdr); return NULL;
-    }
-    for (int i = 0; i < n_ref && st; i++) {
+    /* The gathered columns, made first; then the rows gathered into them
+     * over the pool's threads. */
+    ray_t* gv_hdr = NULL;
+    uint8_t* gv_mem = (uint8_t*)scratch_alloc(&gv_hdr, (size_t)n_ref * (sizeof(ray_t*) + sizeof(void*) * 2 + 1));
+    if (!gv_mem) { scratch_free(idx_hdr); scratch_free(syms_hdr); return NULL; }
+    ray_t**      gv  = (ray_t**)gv_mem;
+    const void** src = (const void**)(gv_mem + (size_t)n_ref * sizeof(ray_t*));
+    void**       dst = (void**)(gv_mem + (size_t)n_ref * (sizeof(ray_t*) + sizeof(void*)));
+    uint8_t*     esz = gv_mem + (size_t)n_ref * (sizeof(ray_t*) + sizeof(void*) * 2);
+    int n_g = 0;
+    for (int i = 0; i < n_ref; i++) {
         ray_t* c = ray_table_get_col(tbl, syms[i]);
+        /* the pages the sampled rows fall on, asked for ahead of the reads */
+        ray_col_want_rows(c, idx, n_s);
         /* a SYM column at its own code width: ray_vec_new would make a
          * 64-bit one, and the copy below is by the source's width */
         ray_t* g = c->type == RAY_SYM ? ray_sym_vec_new(c->attrs & RAY_SYM_W_MASK, n_s)
                                       : ray_vec_new(c->type, n_s);
-        if (!g || RAY_IS_ERR(g)) { if (g) ray_release(g); ray_release(st); st = NULL; break; }
+        if (!g || RAY_IS_ERR(g)) { if (g) ray_release(g); break; }
         g->len = n_s;
-        /* the sampled rows miss the cache: typed loads with reads kept in
-         * flight (a byte-wise copy serialised them, 25 ms for the 262,144) */
-        const void* src = ray_data(c);
-        void* dst = ray_data(g);
-        enum { AHEAD = 16 };
-        switch (col_esz(c)) {
-#define CD_GATE_GATHER(T) do {                                                      \
-            const T* sp = (const T*)src; T* dp = (T*)dst;                             \
-            for (int64_t r = 0; r < n_s; r++) {                                       \
-                if (r + AHEAD < n_s) __builtin_prefetch(sp + idx[r + AHEAD]);         \
-                dp[r] = sp[idx[r]];                                                   \
-            }                                                                         \
-        } while (0)
-        case 1: CD_GATE_GATHER(uint8_t); break;
-        case 2: CD_GATE_GATHER(uint16_t); break;
-        case 4: CD_GATE_GATHER(uint32_t); break;
-        default: CD_GATE_GATHER(uint64_t); break;
-#undef CD_GATE_GATHER
-        }
         g->attrs |= c->attrs & RAY_ATTR_HAS_NULLS;
         if (c->type == RAY_SYM) ray_sym_vec_adopt_domain(g, c);
-        st = ray_table_add_col(st, syms[i], g);
-        ray_release(g);
-        if (st && RAY_IS_ERR(st)) { ray_release(st); st = NULL; }
+        gv[n_g] = g; src[n_g] = ray_data(c); dst[n_g] = ray_data(g); esz[n_g] = col_esz(c);
+        n_g++;
     }
+    ray_t* st = n_g == n_ref ? ray_table_new(0) : NULL;
+    if (st && RAY_IS_ERR(st)) { ray_error_free(st); st = NULL; }
+    if (st) {
+        cd_gate_gather_ctx_t ctx = { src, dst, esz, idx, n_g };
+        ray_pool_t* pool = ray_pool_get();
+        if (ray_pool_par_dispatch_ok(pool, n_s, AGG_EST_SAMPLE_ROWS))
+            ray_pool_dispatch(pool, cd_gate_gather_fn, &ctx, n_s);
+        else
+            cd_gate_gather_fn(&ctx, 0, 0, n_s);
+        for (int i = 0; i < n_g && st; i++) {
+            /* add_col releases the table on an error and returns the error */
+            st = ray_table_add_col(st, syms[i], gv[i]);
+            if (st && RAY_IS_ERR(st)) { ray_error_free(st); st = NULL; }
+        }
+    }
+    for (int i = 0; i < n_g; i++) ray_release(gv[i]);
+    scratch_free(gv_hdr);
     scratch_free(syms_hdr);
     if (!st) { scratch_free(idx_hdr); return NULL; }
 

@@ -2165,6 +2165,7 @@ static test_result_t test_first_n_take(void) {
 #include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/resource.h>
 
 /* --------------------------------------------------------------------------
  * Selects over a mapped table whose pages were evicted: the scan read-ahead
@@ -2316,6 +2317,135 @@ static test_result_t test_select_read_ahead_sparse_filter(void) {
                         "case %zu: column w %s after the query", c,
                         resident ? "read whole" : "not read whole");
     }
+    r = ray_eval_str("(set pfs_m 0)");
+    if (r) ray_release(r);
+    (void)ray_test_rm_rf(PFS_ROOT);
+    PASS();
+}
+
+/* The route gate of a distinct count (#760) samples before the select
+ * runs: the rows a where: keeps (query_cd_gate_where_rows), the key and
+ * value columns at them (agg_group_card_sample), and a key column whole
+ * when the sample leaves its count open (ray_cd_two_pass_preferred).  Over
+ * a mapped table whose pages were evicted each page read is asked for
+ * ahead, in parallel, as the select's own scan asks for its — the bytes
+ * asked for (ray_vm_willneed_bytes) cover what the step reads, and its
+ * major faults stay near zero where a fault per page read would be
+ * thousands.  (The faults alone would not tell: the kernel's own
+ * read-ahead follows a sweep of pages in order, and most of its faults
+ * are then minor.)  A step's columns are its own: pages a step faulted in
+ * stay mapped and cannot be evicted for the next. */
+static long cd_major_faults(void) {
+    struct rusage u;
+    getrusage(RUSAGE_SELF, &u);
+    return u.ru_majflt;
+}
+
+static test_result_t test_cd_gate_read_ahead(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    (void)ray_test_rm_rf(PFS_ROOT);
+    enum { FAULTS_MAX = 64 };
+
+    /* w: 16 MB (4,096 pages); k, x: 32 MB each */
+    enum { N = 4194304 };
+    ray_t* r = ray_eval_str(
+        "(set pfs_i (til 4194304))"
+        "(set pfs_t (table [w k x] (list (as 'I32 (% pfs_i 977)) (% pfs_i 1000)"
+        " (% (* pfs_i 7919) 2000003))))"
+        "(.db.splayed.set \"" PFS_DIR "\" pfs_t)"
+        "(set pfs_m (.db.splayed.get \"" PFS_DIR "\"))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    if (!pfs_evict() || pfs_col_resident("w")) {
+        (void)ray_test_rm_rf(PFS_ROOT);
+        SKIP("page cache eviction has no effect here");
+    }
+    ray_t* m = ray_eval_str("pfs_m");
+    ray_t* pred = ray_eval_str("(quote (< w 100))");
+    TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m) && pred && !RAY_IS_ERR(pred));
+    ray_t* k = ray_table_get_col(m, ray_sym_intern("k", 1));
+    ray_t* x = ray_table_get_col(m, ray_sym_intern("x", 1));
+    TEST_ASSERT_TRUE(k && x && k->mmod == 1 && x->mmod == 1);
+
+    /* the where: sample — 262,144 rows of w, 64 to a page: every page */
+    const int64_t* rows = NULL;
+    int64_t nrows = 0, pop = 0;
+    long f0 = cd_major_faults();
+    uint64_t b0 = ray_vm_willneed_bytes();
+    ray_t* hdr = query_cd_gate_where_rows(m, pred, N, &rows, &nrows, &pop);
+    long f_where = cd_major_faults() - f0;
+    uint64_t b_where = ray_vm_willneed_bytes() - b0;
+    TEST_ASSERT_NOT_NULL(hdr);
+    TEST_ASSERT_FMT(nrows > 24000 && nrows < 30000, "where sample keeps %lld of 262,144", (long long)nrows);
+    TEST_ASSERT_FMT(b_where >= (uint64_t)N * 4, "where sample asked for %llu bytes, w is %llu",
+                    (unsigned long long)b_where, (unsigned long long)N * 4);
+    TEST_ASSERT_FMT(f_where <= FAULTS_MAX, "where sample: %ld major faults", f_where);
+
+    /* the estimate over the survivors: a tenth of the rows, 50 to a page
+     * of k and x — the columns are asked for whole */
+    TEST_ASSERT_TRUE(!pfs_col_resident("k") && !pfs_col_resident("x"));
+    ray_t* cols[2] = { k, x };
+    int64_t est[2], kp = 0, kmax = 0, ka = 0;
+    f0 = cd_major_faults();
+    b0 = ray_vm_willneed_bytes();
+    TEST_ASSERT_TRUE(agg_group_card_sample(cols, 2, 1, rows, nrows, pop, est, &kp, &kmax, &ka));
+    long f_est = cd_major_faults() - f0;
+    uint64_t b_est = ray_vm_willneed_bytes() - b0;
+    scratch_free(hdr);
+    TEST_ASSERT_FMT(est[0] >= 900 && est[0] <= 1100, "k estimate %lld", (long long)est[0]);
+    TEST_ASSERT_FMT(b_est >= (uint64_t)N * 16, "estimate asked for %llu bytes, k and x are %llu",
+                    (unsigned long long)b_est, (unsigned long long)N * 16);
+    TEST_ASSERT_FMT(f_est <= FAULTS_MAX, "estimate: %ld major faults", f_est);
+    ray_release(pred);
+    ray_release(m);
+    r = ray_eval_str("(set pfs_m 0)");
+    if (r) ray_release(r);
+    (void)ray_test_rm_rf(PFS_ROOT);
+
+    /* The gate over a selection sparser than a row per page: the pages of
+     * the sampled rows alone are asked for.  k3 (136 MB, 33,203 pages;
+     * a million values) over 33,000 rows, two to every other page:
+     * 32,768 of them are sampled, read as distinct, and the estimate
+     * stands at the span, a million — past the sample's reach and short
+     * of the many-groups mark — so the count is confirmed in full, over
+     * the half of the column the estimate never touched. */
+    enum { N3 = 17000000, SEL3 = 33000 };
+    r = ray_eval_str(
+        "(set pfs_j (til 17000000))"
+        "(set pfs_t (table [k3 x3] (list (% (* pfs_j 7919) 1000000) (as 'U8 (% pfs_j 200)))))"
+        "(set pfs_j 0)"
+        "(.db.splayed.set \"" PFS_DIR "\" pfs_t)"
+        "(set pfs_t 0)"
+        "(set pfs_m (.db.splayed.get \"" PFS_DIR "\"))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    TEST_ASSERT_TRUE(pfs_evict() && !pfs_col_resident("k3"));
+    m = ray_eval_str("pfs_m");
+    TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m));
+    ray_t* k3 = ray_table_get_col(m, ray_sym_intern("k3", 2));
+    ray_t* x3 = ray_table_get_col(m, ray_sym_intern("x3", 2));
+    TEST_ASSERT_TRUE(k3 && x3 && k3->mmod == 1 && (size_t)k3->len * 8 / 4096 > (size_t)SEL3);
+    int64_t* sel = malloc((size_t)SEL3 * sizeof(int64_t));
+    TEST_ASSERT_NOT_NULL(sel);
+    for (int64_t i = 0; i < SEL3; i++) sel[i] = (i / 2) * 1024 + (i & 1);
+    f0 = cd_major_faults();
+    b0 = ray_vm_willneed_bytes();
+    bool two_pass = ray_cd_two_pass_preferred(&k3, 1, x3, sel, SEL3, 0, 4);
+    long f_gate = cd_major_faults() - f0;
+    uint64_t b_gate = ray_vm_willneed_bytes() - b0;
+    free(sel);
+    TEST_ASSERT_FALSE(two_pass);   /* a million groups counted, not many: the slices */
+    /* the sampled rows' pages of k3 (one each) for the estimate, and k3
+     * whole for the count; x3 besides */
+    const uint64_t b_need = (uint64_t)N3 * 8 + (uint64_t)(SEL3 / 2) * 4096;
+    TEST_ASSERT_FMT(b_gate >= b_need, "gate asked for %llu bytes, needs %llu",
+                    (unsigned long long)b_gate, (unsigned long long)b_need);
+    TEST_ASSERT_FMT(f_gate <= FAULTS_MAX, "gate: %ld major faults", f_gate);
+
+    ray_release(m);
     r = ray_eval_str("(set pfs_m 0)");
     if (r) ray_release(r);
     (void)ray_test_rm_rf(PFS_ROOT);
@@ -2773,6 +2903,7 @@ const test_entry_t agg_contract_entries[] = {
 #if defined(__linux__)
     { "agg_contract/select_read_ahead_mapped", test_select_read_ahead_mapped, contract_setup, contract_teardown },
     { "agg_contract/select_read_ahead_sparse_filter", test_select_read_ahead_sparse_filter, contract_setup, contract_teardown },
+    { "agg_contract/cd_gate_read_ahead", test_cd_gate_read_ahead, contract_setup, contract_teardown },
 #endif
     { NULL, NULL, NULL, NULL },
 };

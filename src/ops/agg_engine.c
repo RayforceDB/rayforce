@@ -9,6 +9,7 @@
 #include "table/domain.h"
 #include "table/sym.h"    /* ray_read_sym */
 #include "store/col.h"    /* ray_col_cold — sampled-row read-ahead */
+#include "core/pool.h"     /* ray_pool_want — a column asked for whole */
 #include "core/platform.h" /* ray_cache_llc_bytes — replicated slab bound */
 #include <stdlib.h>
 #include <math.h>
@@ -506,7 +507,8 @@ static bool agg_dense_plan_compact(ray_t** key_cols, uint32_t n_keys, int64_t nr
  * device column, on nine rows in ten) hides the groups and the shares of
  * what remains — (every row below that; the strided reads miss the cache,
  * and 32,768 of them over three columns cost half a millisecond at 10 M
- * rows with the prefetch below), one row from each window of `stride` rows
+ * rows with the prefetch below; the pages of a mapped column are asked
+ * for ahead of them, ray_col_want_rows), one row from each window of `stride` rows
  * at an offset hashed from the window's index (agg_est_row), and each
  * column's values go through a small open-addressing set that counts how
  * often each was seen.
@@ -616,31 +618,38 @@ static int64_t agg_est_tuple_cap(const int64_t* cap, uint32_t n, int64_t nrows) 
  * distinct ones per block scaled to the input.  false when the input is too
  * short for the blocks (the stride is then exact anyway). */
 static bool agg_est_blocks(ray_t** cols, uint32_t n, uint32_t n_prefix,
-                           const int64_t* rows, int64_t nrows,
+                           const int64_t* rows, int64_t nrows, int64_t* pos,
                            int64_t* prefix_est, int64_t* all_est) {
     enum { SLOTS = AGG_EST_BLOCK * 4 };
     if (nrows < (int64_t)AGG_EST_BLOCK * 4) return false;
     int64_t nblk = AGG_EST_BLOCKS;
     if (nblk * AGG_EST_BLOCK > nrows) nblk = nrows / AGG_EST_BLOCK;
     const int64_t gap = nrows / nblk;
+    /* the blocks' rows listed first (`pos` holds AGG_EST_SAMPLE), so the
+     * pages of a mapped column are asked for ahead of the reads, as the
+     * strided sample's are */
+    int64_t np = 0;
+    for (int64_t b = 0; b < nblk; b++)
+        for (int64_t i = b * gap; i < b * gap + AGG_EST_BLOCK; i++) pos[np++] = rows ? rows[i] : i;
+    for (uint32_t k = 0; k < n; k++) ray_col_want_rows(cols[k], pos, np);
     int64_t  vals[SLOTS];
     uint16_t cnt[SLOTS];
     agg_est_set_t set = { vals, cnt, 0, 0, 0, 0 };
     int64_t runs = 0, read = 0, distinct = 0;
+    np = 0;
     for (int64_t b = 0; b < nblk; b++) {
-        const int64_t start = b * gap;
         memset(cnt, 0, sizeof cnt);
         set.d = set.f1 = set.f2 = set.max = 0;
         uint64_t hp_prev = 0;
-        for (int64_t i = start; i < start + AGG_EST_BLOCK; i++) {
-            const int64_t r = rows ? rows[i] : i;
+        for (int64_t i = 0; i < AGG_EST_BLOCK; i++) {
+            const int64_t r = pos[np++];
             uint64_t hp = 0, ha = 0;
             for (uint32_t k = 0; k < n; k++) {
                 ha = agg_est_mix(ha, agg_est_read(ray_data(cols[k]), cols[k]->type,
                                                   cols[k]->attrs, r));
                 if (k + 1 == n_prefix) hp = ha;
             }
-            if (i == start || hp != hp_prev) runs++;
+            if (i == 0 || hp != hp_prev) runs++;
             hp_prev = hp;
             agg_est_set_add(&set, SLOTS - 1, (int64_t)ha);
         }
@@ -685,8 +694,32 @@ bool agg_group_card_sample(ray_t** cols, uint32_t n, uint32_t n_prefix,
     while (slots < (uint64_t)sample * 2) slots <<= 1;
     const uint32_t nsets = n + (tuples ? 2 : 0);
     const size_t   set_bytes = (size_t)slots * (sizeof(int64_t) + sizeof(uint16_t));
-    uint8_t* mem = ray_alloc_raw(set_bytes * nsets);
+    uint8_t* mem = ray_alloc_raw(set_bytes * nsets + (size_t)AGG_EST_SAMPLE * sizeof(int64_t));
     if (!mem) return false;
+    /* The rows the pass reads, listed first: the pages of a mapped column
+     * are asked for ahead of the reads, through the pool, as the select's
+     * own scan asks for its.  Read as they were met, each strided row of a
+     * column not in memory waited on its own page fault, on this thread —
+     * a quarter second and more per column at 100 M rows, where the pass
+     * costs a millisecond in memory.  The pages asked for are those the
+     * sampled rows fall on (ray_col_want_rows), or the column whole when
+     * the rows the estimate describes fall on every page of it — a row per
+     * page or more: the select reads it whole then, and its stream runs
+     * while this pass waits on the first of them; a sample's pages alone,
+     * 30,000 reads of one page each, took twice as long as the stream. */
+    int64_t* pos = (int64_t*)(mem + set_bytes * nsets);
+    for (int64_t i = 0; i < sample; i++) {
+        const int64_t ri = agg_est_sample_row(i, stride);
+        pos[i] = rows ? rows[ri] : ri;
+    }
+    for (uint32_t k = 0; k < n; k++) {
+        const size_t bytes = (size_t)cols[k]->len * esz[k];
+        if (pop >= (int64_t)(bytes >> 12)) {
+            if (ray_pool_scan_on() && ray_col_cold(cols[k])) ray_pool_want(ray_data(cols[k]), bytes);
+        } else {
+            ray_col_want_rows(cols[k], pos, sample);
+        }
+    }
     agg_est_set_t sets[18];
     for (uint32_t i = 0; i < nsets; i++) {
         sets[i].vals = (int64_t*)(mem + (size_t)i * set_bytes);
@@ -699,12 +732,10 @@ bool agg_group_card_sample(ray_t** cols, uint32_t n, uint32_t n_prefix,
     for (uint32_t k = 0; k < n; k++) { lo[k] = INT64_MAX; hi[k] = INT64_MIN; prev[k] = INT64_MIN; }
     bool sorted = true;   /* the sampled prefix tuples never decrease */
     for (int64_t i = 0; i < sample; i++) {
-        const int64_t ri = agg_est_sample_row(i, stride);
-        const int64_t r  = rows ? rows[ri] : ri;
+        const int64_t r = pos[i];
         if (i + AGG_EST_PREFETCH < sample) {
             /* the strided reads miss the cache; keep several in flight */
-            const int64_t pi = agg_est_sample_row(i + AGG_EST_PREFETCH, stride);
-            const size_t  rp = (size_t)(rows ? rows[pi] : pi);
+            const size_t rp = (size_t)pos[i + AGG_EST_PREFETCH];
             for (uint32_t k = 0; k < n; k++)
                 __builtin_prefetch((const char*)data[k] + rp * esz[k]);
         }
@@ -744,7 +775,7 @@ bool agg_group_card_sample(ray_t** cols, uint32_t n, uint32_t n_prefix,
         int64_t bp, ba;
         /* adjacent entries of a sampled list are not adjacent rows */
         if (sorted && sampled && pop == nrows &&
-            agg_est_blocks(cols, n, n_prefix, rows, nrows, &bp, &ba)) {
+            agg_est_blocks(cols, n, n_prefix, rows, nrows, pos, &bp, &ba)) {
             if (bp < kp) kp = bp;
             if (ba < ka) ka = ba;
         }
