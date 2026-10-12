@@ -1266,7 +1266,17 @@ static ray_t* exec_in_general_fallback(ray_t* col, ray_t* set, bool negate) {
         r = out;
     }
 
-    if (r->type == RAY_BOOL) {
+    /* The caller indexes the answer as one bool per row; anything else is
+     * not a membership verdict for this column. */
+    if (r->type != RAY_BOOL || r->len != (ray_is_atom(col) ? 1 : ray_len(input))) {
+        int8_t rt = r->type;
+        ray_release(r);
+        if (owns_input) ray_release(input);
+        return ray_error("type", "in: membership of a %s column answered %s, not a bool per row",
+                         ray_type_name(ray_is_atom(col) ? (int8_t)-col->type : input->type),
+                         ray_type_name(rt));
+    }
+    {
         uint8_t* b = (uint8_t*)ray_data(r);
         if (negate)
             for (int64_t i = 0; i < r->len; i++) b[i] = (uint8_t)!b[i];
@@ -1305,6 +1315,9 @@ static bool in_has_general_fallback(ray_t* col, ray_t* set) {
     if (RAY_IS_PARTED(st)) st = (int8_t)RAY_PARTED_BASETYPE(st);
     if (ct == RAY_GUID || st == RAY_GUID) return true;
     if (ct != RAY_STR && st != RAY_STR) return false;
+    /* Only a column of cells answers one verdict per row: a LIST column's
+     * cell may be a vector, and its answer a list no mask can use. */
+    if (!ray_is_atom(col) && !(ct >= RAY_BOOL && ct <= RAY_STR)) return false;
     if (ct == RAY_STR && ray_is_atom(col))
         return !ray_is_atom(set) && st != RAY_LIST;
     return true;
