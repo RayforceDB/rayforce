@@ -54,6 +54,8 @@
 #include "ops/internal.h"  /* scratch_*, read_col_i64 */
 #include "ops/hash.h"      /* ray_hash_i64 */
 #include "ops/cdfuse.h"
+#include "ops/agg_engine.h" /* agg_group_card_sample — the route gate */
+#include "ops/hll.h"        /* ray_count_distinct_approx — the gate's group count check */
 #include "table/sym.h"     /* RAY_IS_SYM */
 #include "store/col.h"    /* ray_col_cold — sampled-row read-ahead */
 
@@ -772,4 +774,117 @@ ray_t* ray_cd_fused(ray_t* key_col, ray_t* val_col, int64_t nrows) {
         return NULL;
     }
     return tbl;
+}
+
+/* The scatter path serves a distinct count beside the group by K: the
+ * post-group row→group map and a per-group dedup over the slices (the
+ * global-hash kernel past 50 K groups).  Up to CD_SCATTER_MAX_GROUPS groups
+ * it is the route whenever the rewrite's (K, X) grouping would not be
+ * dense; past CD_SCATTER_MANY_GROUPS its map and kernel fall behind the
+ * rewrite's radix grouping whatever that grouping dedups; between the two
+ * the tuple count decides. */
+#define CD_SCATTER_MAX_GROUPS  (256 * 1024)
+#define CD_SCATTER_MANY_GROUPS (1024 * 1024)
+
+/* The scatter's per-group dedup is serial over a group: its critical path
+ * is the largest group's rows, where the rewrite's (K, X) pass spreads
+ * every row over the workers.  The rewrite is the route once the largest
+ * group holds more than this many workers' shares of the rows: at 28
+ * workers a key whose largest value held half the rows took 180 ms on the
+ * scatter against 136 on the rewrite, one holding 8% of them 107 against
+ * 138, uniform groups 89 against 140 (12 M rows surviving a filter over
+ * 100 M; the issue's 45 groups hold 2% each). */
+#define CD_SCATTER_SKEW 8
+
+/* Whether the two-pass rewrite (group by (K, X), then count per K; query.c)
+ * beats grouping by K and counting distinct X over each group's slice — the
+ * path a `(count (distinct X))` takes beside other aggregates, and the one
+ * the planner falls back to when this returns false (#756).
+ *
+ * The rewrite wins when its (K, X) grouping is dense: the packed key space
+ * — the product of the keys' spans and X's — fits the row count, so the
+ * dedup is a direct-index pass.  Past that it is a radix grouping that
+ * materializes and orders every (K, X) tuple — 1.8 GB and 3x the time of
+ * the slice dedup at 10 M rows with 45 groups of 3 M distinct values —
+ * unless the groups are so many that the scatter's own machinery is the
+ * slower one: at 2 M and 5 M groups the rewrite took 1.3x to 2x less time,
+ * at 750 K groups whose (K, X) tuples were as many as the rows the scatter
+ * took 1.3x less time and 1.9x less memory, and at 750 K groups whose
+ * tuples were a sixth of the rows the rewrite took 1.3x less time; below
+ * 256 K groups the scatter is the route (#756).  Few groups do not favour
+ * the rewrite: at 2 to 9 groups of 3 M to 6 M values on 28 workers the
+ * slice dedup took the same time or less and 40% of the memory, and the
+ * issue's 45 groups on 46 workers would otherwise have taken the rewrite at
+ * 3x the time.  A group holding many workers' shares of the rows takes
+ * the rewrite (CD_SCATTER_SKEW).  The group, value and tuple counts and
+ * the largest group's rows are sampled estimates (agg_group_card_sample)
+ * over the `nrows` rows of `rows` when a `where:` selected them — a filter
+ * that drops a dominant value hides the groups and the shares of what
+ * remains — else over the table; half a millisecond at 10 M rows.  A
+ * skewed or clustered key the sample cannot exhaust estimates high,
+ * towards the rewrite. */
+/* The sampled count of the groups is a lower bound for a key the sample
+ * reads mostly as singletons — six million search phrases over thirteen
+ * million rows, most on one row and a few on thousands, read as a few
+ * hundred thousand (the Chao1 takes the phrases seen twice for the whole
+ * tail's repeats).  Before the slices are chosen on such a count, the key
+ * columns are counted approximately in full (ray_count_distinct_approx,
+ * parallel, a few milliseconds at 100 M rows): a column past the many-groups
+ * mark makes the tuple past it.  Over the whole table, not the selection —
+ * an upper bound that errs towards the rewrite. */
+static bool cd_many_groups_in_full(ray_t** K_cols, int n_K) {
+    for (int j = 0; j < n_K; j++) {
+        ray_t* k = K_cols[j];
+        /* the count reads the column whole, a chunk per thread: a mapped
+         * column not in memory is asked for ahead as one range, else each
+         * thread waits on its chunk's pages in turn */
+        if (ray_pool_scan_on() && ray_col_cold(k))
+            ray_pool_want(ray_data(k), (size_t)k->len * col_esz(k));
+        ray_t* c = ray_count_distinct_approx(k);
+        if (!c) return false;
+        bool many = !RAY_IS_ERR(c) && c->type == -RAY_I64 && c->i64 > CD_SCATTER_MANY_GROUPS;
+        if (RAY_IS_ERR(c)) ray_error_free(c); else ray_release(c);
+        if (many) return true;
+    }
+    return false;
+}
+
+bool ray_cd_two_pass_preferred(ray_t** K_cols, int n_K, ray_t* X_col,
+                               const int64_t* rows, int64_t nrows, int64_t population,
+                               int64_t workers) {
+    if (n_K < 1 || n_K > 15) return true;
+    const int64_t pop = population > nrows ? population : nrows;
+    int64_t k_est[15], k_card = 0, k_max = 0, x_est = 0, t_est = 0;
+    if (!agg_group_card_sample(K_cols, (uint32_t)n_K, (uint32_t)n_K, rows, nrows, population,
+                               k_est, &k_card, &k_max, NULL))
+        return true;                      /* K unbounded (a key the estimate does not cover) */
+    if (!agg_group_card_sample(&X_col, 1, 1, rows, nrows, population, &x_est, NULL, NULL, NULL))
+        return false;                     /* X unbounded: (K, X) is radix; the slices dedup */
+    const int64_t nrows_list = nrows;
+    nrows = pop;                          /* the rows the estimates describe */
+    /* the packed (K, X) key space: the keys' spans times X's */
+    int64_t k_span = 1;
+    for (int j = 0; j < n_K; j++) {
+        if (k_span > nrows / k_est[j]) { k_span = nrows + 1; break; }
+        k_span *= k_est[j];
+    }
+    if (k_span <= nrows / x_est) return true;        /* dense: a direct-index dedup */
+    /* a dominant group: the scatter would dedup it on one worker */
+    if (workers > 1 && k_max > nrows / workers * CD_SCATTER_SKEW) return true;
+    if (k_card > CD_SCATTER_MANY_GROUPS) return true;
+    /* the slices on a count the sample cannot vouch for (more sampled
+     * singletons than the Chao1's repeats explain: any count past the
+     * sample's size): a full approximate count may say many groups */
+    if (k_card > AGG_EST_SAMPLE_ROWS && cd_many_groups_in_full(K_cols, n_K)) return true;
+    if (k_card <= CD_SCATTER_MAX_GROUPS) return false;
+    /* a radix (K, X) pass over 256 K to 1 M groups: the rewrite wins when
+     * that pass dedups, the scatter when the tuples are nearly the rows */
+    ray_t* cols[16];
+    for (int j = 0; j < n_K; j++) cols[j] = K_cols[j];
+    cols[n_K] = X_col;
+    if (!agg_group_card_sample(cols, (uint32_t)n_K + 1, (uint32_t)n_K, rows,
+                               population > 0 ? nrows_list : nrows, population,
+                               NULL, NULL, NULL, &t_est))
+        return true;
+    return t_est < nrows - nrows / 4;
 }
