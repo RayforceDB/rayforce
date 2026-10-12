@@ -101,6 +101,21 @@ ray_sym_domain_t* ray_sym_domain_open(const char* path);
  * open-or-create entry point. */
 ray_sym_domain_t* ray_sym_domain_open_or_create(const char* path);
 
+/* A fresh symbol file at `path` that one converter builds alone, the
+ * strings appended straight into the mapped file (see table/symimp.h):
+ * intern, intern_batch, count, flush / flush_append (append: header and
+ * writeback; durable: cut and sync) and release only.  Not cached by path.
+ * NULL where unsupported or on failure; the caller then uses
+ * ray_sym_domain_open_or_create. */
+ray_sym_domain_t* ray_sym_domain_create_import(const char* path);
+/* Such a domain's interning counts (RAY_CSV_TRACE), as ray_symimp_stats
+ * gives them (table/symimp.h).  False for any other domain. */
+struct ray_symimp_stats_s;
+bool ray_sym_domain_import_stats(ray_sym_domain_t* dom, struct ray_symimp_stats_s* out);
+/* Such a domain's import dictionary (for the grouped import,
+ * table/symgrp.h); NULL for any other domain. */
+struct ray_symimp_s* ray_sym_domain_import(ray_sym_domain_t* dom);
+
 /* New private, refcounted in-memory dictionary. Supports the same concurrent
  * append and resolution operations as FILE domains, without a cache entry or
  * backing file. Attached vectors keep it alive. flush returns RAY_ERR_DOMAIN. */
@@ -181,6 +196,12 @@ int64_t ray_sym_domain_intern(ray_sym_domain_t* dom, const char* str, size_t len
 bool ray_sym_domain_intern_batch(ray_sym_domain_t* dom, int64_t n,
                                  const char* const* strs, const size_t* lens,
                                  const uint32_t* hashes, int64_t* out_pos);
+/* The same with hashes[i] = ray_hash_bytes of strs[i], all 64 bits: the
+ * import dictionary keys on them (the 32-bit entry point hashes its strings
+ * again for it); the other domains take their low 32 bits. */
+bool ray_sym_domain_intern_batch64(ray_sym_domain_t* dom, int64_t n,
+                                   const char* const* strs, const size_t* lens,
+                                   const uint64_t* hashes, int64_t* out_pos);
 
 /* Number of entries in the domain. */
 int64_t ray_sym_domain_count(ray_sym_domain_t* dom);
@@ -195,6 +216,16 @@ const char* ray_sym_domain_path(ray_sym_domain_t* dom);
  * nothing new was interned.  RUNTIME: RAY_OK (the global table owns its
  * own persistence). */
 ray_err_t ray_sym_domain_flush(ray_sym_domain_t* dom, bool durable);
+
+/* Append the entries interned since the last flush to the symfile in place
+ * (header count rewritten after the records), instead of rewriting the
+ * whole file through a tmp + rename.  For a symfile one writer builds
+ * alone, such as a converter's staging domain, flushed as it grows so the
+ * last flush writes only the tail.  Same `.lk` lock as
+ * ray_sym_domain_flush; the file must still have the persisted size.
+ * `durable` also syncs the file and its directory, even when nothing new
+ * was interned. */
+ray_err_t ray_sym_domain_flush_append(ray_sym_domain_t* dom, bool durable);
 
 /* RAY_SYM_AUDIT=1 support (cached at ray_sym_init): when set,
  * ray_sym_vec_cell cross-checks every resolution and aborts with full

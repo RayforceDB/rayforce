@@ -26,6 +26,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdbool.h>
 
 /* --------------------------------------------------------------------------
  * System-level mmap allocator for infrastructure that can't use the buddy
@@ -38,10 +39,21 @@
  * so ray_sys_free() needs no size argument.
  * -------------------------------------------------------------------------- */
 
+/* Page-granular allocations off the per-thread heaps.  They count toward
+ * the heap's anonymous watermark, and large ones spill to a file past it
+ * (ray_heap_sys_map / ray_heap_sys_unmap, defined in mem/heap.c).
+ *
+ * ray_sys_alloc returns zero-filled memory, and callers rely on it (the
+ * import dictionary's shard tables are not cleared): every block is a fresh
+ * mapping, anonymous or over a new preallocated spill file, never one taken
+ * from a cache of freed blocks.  A cache added here must zero what it hands
+ * out.  ray_sys_realloc keeps no such promise for the bytes it adds. */
 void* ray_sys_alloc(size_t size);
 void* ray_sys_realloc(void* ptr, size_t new_size);
 void  ray_sys_free(void* ptr);
 char* ray_sys_strdup(const char* s);
+void* ray_heap_sys_map(size_t size, bool* spilled);
+void  ray_heap_sys_unmap(void* p, size_t size, bool spilled);
 
 /* --------------------------------------------------------------------------
  * Global memory accounting.  Two counters give the true runtime picture:
@@ -55,8 +67,9 @@ char* ray_sys_strdup(const char* s);
  *
  * The low-level VM wrappers (ray_vm_alloc / _aligned / _free / _map_file /
  * _unmap_file) and the one raw-mmap site (heap swap fallback) call these so
- * every mapping is counted exactly once.  Bytes are the mapped length; add and
- * sub must balance (same length in as out).
+ * every mapping is counted exactly once.  Bytes are the mapped length (file
+ * mappings in whole 4 KiB pages); add and sub must balance (same length in as
+ * out, or the same once rounded to a page).
  * -------------------------------------------------------------------------- */
 void  ray_sys_track_add(int64_t bytes);       /* committed RAM +  */
 void  ray_sys_track_sub(int64_t bytes);       /* committed RAM -  */

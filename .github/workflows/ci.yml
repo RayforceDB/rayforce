@@ -82,6 +82,13 @@ jobs:
           scripts/fuzz-seed-frames.sh || true
       - name: Fuzz smoke
         run: make fuzz-smoke
+      - name: Nested select differential fuzz (serial and parallel)
+        run: |
+          # Start each mode from committed seeds. Replaying the growing cache
+          # can exhaust the short run before it reaches any mutations.
+          corpus_root=$(mktemp -d "$RUNNER_TEMP/select-merge.XXXXXX")
+          make fuzz-select_merge FUZZ_RUNTIME=60 FUZZ_CORPUS_ROOT="$corpus_root/serial"
+          RAY_FUZZ_CORES=4 make fuzz-select_merge FUZZ_RUNTIME=60 FUZZ_CORPUS_ROOT="$corpus_root/parallel"
       - name: Upload crash artifacts
         if: failure()
         uses: actions/upload-artifact@v4
@@ -108,7 +115,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: TSan concurrency suites
         run: |
-          for f in pool heap parallel stress; do
+          for f in pool heap parallel stress store/parted_concurrent_mounts; do
             echo "::group::tsan -f $f"
             make tsan-test TSAN_FILTER=$f || exit 1
             echo "::endgroup::"

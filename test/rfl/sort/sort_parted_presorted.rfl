@@ -71,13 +71,11 @@
 
 ;; ── NOTE on the decline path ────────────────────────────────────────────────
 ;; When ANY eligibility gate fails, the streaming path declines (perpart delta
-;; 0) and falls through to the flat flatten+sort path.  That flat path is a
-;; PRE-EXISTING lazy-sort-over-parted limitation: `(select {asc:… from: PARTED})`
-;; is unmaterialisable in the eager path and surfaces a LOUD `type` error rather
-;; than a silently per-partition-sorted (wrong) result — the exact contract the
-;; asof fallback documents (asof_clause_fallback §C: "loud error ≫ silent wrong
-;; answer").  The negatives below therefore assert that an ineligible shape
-;; DECLINES (delta 0) AND surfaces that loud error — never a silent bad answer.
+;; 0) and the general parted sort answers instead: it sorts the key columns
+;; and gathers the rows they keep from the partitions (it used to fall to the
+;; flat sort, which read parted columns as plain ones and failed with `type`).
+;; The negatives below therefore assert that an ineligible shape DECLINES
+;; (delta 0) AND matches the same select over the materialised table.
 
 ;; ══════════════════════════════════════════════════════════════════════════
 ;; NEGATIVE (a) — a partition NOT internally sorted on the key → DECLINE.
@@ -90,8 +88,8 @@
 (.db.splayed.set "/tmp/rfl_spu/2024.01.02/t/" U2)
 (set Pu (.db.parted.get "/tmp/rfl_spu/" 't))
 (set Bu (at (.sys.mem) 'sort-perpart-runs))
-;; DECLINED (unsorted partition) → flat path surfaces the loud pre-existing error.
-(select {Sym: Sym Time: Time Seq: Seq from: Pu asc: Time}) !- type
+;; DECLINED (unsorted partition) → the general parted sort, as the flat oracle.
+(select {Sym: Sym Time: Time Seq: Seq from: Pu asc: Time}) -- (select {Sym: Sym Time: Time Seq: Seq from: (select {from: Pu where: (>= Seq 0)}) asc: Time})
 (set Au (at (.sys.mem) 'sort-perpart-runs))
 (- Au Bu) -- 0
 
@@ -107,8 +105,8 @@
 (.db.splayed.set "/tmp/rfl_spo/2024.01.02/t/" O2)
 (set Po (.db.parted.get "/tmp/rfl_spo/" 't))
 (set Bo (at (.sys.mem) 'sort-perpart-runs))
-;; DECLINED (overlapping ranges) → flat path surfaces the loud pre-existing error.
-(select {Sym: Sym Time: Time Seq: Seq from: Po asc: Time}) !- type
+;; DECLINED (overlapping ranges) → the general parted sort, as the flat oracle.
+(select {Sym: Sym Time: Time Seq: Seq from: Po asc: Time}) -- (select {Sym: Sym Time: Time Seq: Seq from: (select {from: Po where: (>= Seq 0)}) asc: Time})
 (set Ao (at (.sys.mem) 'sort-perpart-runs))
 (- Ao Bo) -- 0
 
@@ -117,10 +115,10 @@
 ;; sortedness check runs in the requested (descending) direction and FAILS on
 ;; ascending data → DECLINE.  (Documented choice: desc streams only when
 ;; partitions are physically stored descending; ascending-stored + desc
-;; declines — no reverse/re-sort — and surfaces the loud flat-path error.)
+;; declines — no reverse/re-sort — and the general parted sort answers.)
 ;; ══════════════════════════════════════════════════════════════════════════
 (set Bd (at (.sys.mem) 'sort-perpart-runs))
-(select {Sym: Sym Time: Time Seq: Seq from: Pp desc: Time}) !- type
+(select {Sym: Sym Time: Time Seq: Seq from: Pp desc: Time}) -- (select {Sym: Sym Time: Time Seq: Seq from: (select {from: Pp where: (>= Seq 0)}) desc: Time})
 (set Ad (at (.sys.mem) 'sort-perpart-runs))
 (- Ad Bd) -- 0
 
@@ -135,8 +133,8 @@
 ;;   path.  Pp (from the single-key POSITIVE case above) is reused unchanged.
 ;; ══════════════════════════════════════════════════════════════════════════
 (set Bg (at (.sys.mem) 'sort-perpart-runs))
-;; DECLINED (aggregate output) → flat path surfaces the same loud pre-existing
-;; error as the other declines above (observed: `nyi`, not `type`).
+;; DECLINED (aggregate output) → an aggregate under a sort without by: is
+;; refused, as it is over a flat table (`nyi`).
 (select {Tot: (sum Seq) from: Pp asc: Time}) !- nyi
 (set Ag (at (.sys.mem) 'sort-perpart-runs))
 (- Ag Bg) -- 0

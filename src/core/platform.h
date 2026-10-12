@@ -156,6 +156,33 @@ void* ray_vm_map_file(const char* path, size_t* out_size);
 void* ray_vm_map_fd_ro(int fd, size_t size);
 void  ray_vm_unmap_file(void* ptr, size_t size);
 void  ray_vm_advise_seq(void* ptr, size_t size);
+/* Ask the kernel to start reading [ptr, ptr+size) of a file mapping now,
+ * asynchronously, so a later access finds it resident.  Best effort. */
+void  ray_vm_advise_willneed(void* ptr, size_t size);
+/* Bytes asked for so far by ray_vm_advise_willneed, process-wide: the
+ * pool's trace summary, and tests of readers that must ask before they
+ * read a mapped column they sample. */
+uint64_t ray_vm_willneed_bytes(void);
+/* Start writing back bytes [off, off+len) of open file `fd` without waiting
+ * (Linux sync_file_range WRITE; a no-op elsewhere): a later fsync then
+ * finds them on disk. */
+void  ray_file_writeback_start(int fd, int64_t off, int64_t len);
+/* The I/O counters the converters' traces read: bytes read from and
+ * written to storage, written bytes whose writeback was cancelled, read and
+ * write calls, and major faults; of the process, or of the calling thread
+ * (thread true).  Linux reads /proc/self/io (/proc/thread-self/io) and
+ * getrusage; every field reads zero elsewhere, or where they cannot be read. */
+typedef struct { int64_t rd, wr, cwr, syscr, syscw, majflt; } ray_io_counters_t;
+void  ray_io_counters(bool thread, ray_io_counters_t* out);
+void  ray_sleep_ms(int ms);
+/* True when a sample of the pages of [ptr, ptr+size) is resident: a cheap
+ * check (a handful of page probes) that a read-ahead would find nothing to
+ * read.  Where residency cannot be queried it reports false. */
+bool  ray_vm_resident(const void* ptr, size_t size);
+/* How far into [ptr, ptr+size) pages are in RAM: to the end of the last
+ * resident page (mincore), 0 if none; size where residency cannot be
+ * queried. */
+size_t ray_vm_resident_end(const void* ptr, size_t size);
 void  ray_vm_release(void* ptr, size_t size);
 /* Release physical pages for a free block.  When hugepage is true, only the
  * 2MB-aligned interior is released so a partial MADV_DONTNEED does not
@@ -185,6 +212,15 @@ uint64_t ray_cache_llc_bytes(void);
  * the process's cgroup and its ancestors.  0 when none is set, or on
  * platforms without cgroups. */
 int64_t ray_os_cgroup_mem_limit(void);
+/* The directory of the cgroup that sets that limit, into buf[n]; false when
+ * no limit is set, or on platforms without cgroups. */
+bool    ray_os_cgroup_mem_dir(char* buf, size_t n);
+/* Read the memory.stat of cgroup `cg` (a directory from
+ * ray_os_cgroup_mem_dir), for what reading does: the kernel updates a
+ * cgroup's statistics lazily and flushes them when the file is read.  With
+ * open/read, no stdio.  false when there is no such file (and on platforms
+ * without cgroups). */
+bool    ray_os_cgroup_stat_flush(const char* cg);
 #ifdef DEBUG
 /* Pin ray_cache_llc_bytes to `bytes` (0 = probe again). */
 void ray_cache_llc_set_for_test(uint64_t bytes);

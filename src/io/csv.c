@@ -1244,11 +1244,7 @@ static int64_t build_row_offsets_window(const char* buf, size_t buf_size,
         /* Readahead hint for the window about to be scanned: the scanner's
          * tasks fault the pages in parallel, which a cold file serves best
          * when the kernel already streams the range. */
-        {
-            size_t ps = (size_t)sysconf(_SC_PAGESIZE);
-            size_t a = data_offset & ~(ps - 1);
-            madvise((void*)(buf + a), end - a, MADV_WILLNEED);
-        }
+        ray_vm_advise_willneed((void*)(buf + data_offset), end - data_offset);
         int64_t* offs = NULL; ray_t* hdr = NULL;
         int64_t n = build_row_offsets_par(buf, end, data_offset, 0, 0,
                                           data_has_quotes, &offs, &hdr);

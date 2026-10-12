@@ -187,12 +187,13 @@
 ;; `(first (asc col_expr))` where col_expr = (+ v 1) (not a name ref)
 ;; → col_expr->type == RAY_LIST, not -RAY_SYM → return false at 1858.
 ;; dep_candidate optimization not applied → falls back to per-group eval.
-;; (+ v 1) is not compilable as an agg DAG node → domain error.
+;; (+ v 1) is not compilable as an agg DAG node → evaluated per group
+;; (it raised "failed to compile aggregation argument").
 ;; ────────────────────────────────────────────────────────────────────
 (set T1858 (table [k v] (list ['a 'a 'b 'b] [1 2 3 4])))
 ;; (first (asc (+ v 1))): inner col_expr = (+ v 1) is LIST → line 1858
-;; simplify_agg_idiom returns false → compilation fails → domain error
-(select {m: (first (asc (+ v 1))) by: k from: T1858}) !- domain
+;; simplify_agg_idiom returns false → the aggregate runs per group
+(select {m: (first (asc (+ v 1))) by: k from: T1858}) -- (table [k m] (list [a b] [2 4]))
 
 (set TLimLazy (table [s v] (list (take ['a 'b 'c] 120) (til 120))))
 (count (select {s: s from: TLimLazy where: (!= s 'c) take: 20})) -- 20
@@ -219,3 +220,418 @@
 (set RHolF2 (select {m: (min s) c: (count s) from: THol where: (>= v 100000) by: k}))
 (sum (at RHolF2 'c)) -- 100000
 (at (at (select {m: m from: RHolF2 where: (== k "0")}) 'm) 0) -- "100000"
+
+;; ────────────────────────────────────────────────────────────────────
+;; Computed by: key with no outputs.  The DAG no-agg branch regroups a
+;; computed key (key_sym < 0) at eval level and returned that result
+;; without apply_sort_take, so asc:/desc:/take: were dropped and every
+;; group came back in first-seen order.  Oracles: the same key
+;; materialized as a column (a plain key), and the computed key beside an
+;; output.  The key column keeps its derived name, `x`.
+;; ────────────────────────────────────────────────────────────────────
+(set Tck (table [x y] (list [3 1 4 2 3 1] [30 10 40 20 31 11])))
+(set Tckp (update {k: (* x 2) from: Tck}))
+(select {by: (* x 2) from: Tck desc: x take: 2}) -- (table [x y] (list [8 6] [40 30]))
+(at (select {by: (* x 2) from: Tck desc: x take: 2}) 'x) -- (at (select {c: (count y) by: (* x 2) from: Tck desc: x take: 2}) 'x)
+(at (select {by: (* x 2) from: Tck desc: x take: 2}) 'y) -- (at (select {by: k from: Tckp desc: k take: 2}) 'y)
+;; asc: and desc: alone, on the key and on a source column
+(select {by: (* x 2) from: Tck asc: x}) -- (table [x y] (list [2 4 6 8] [10 20 30 40]))
+(at (select {by: (* x 2) from: Tck desc: y}) 'x) -- [8 6 4 2]
+(at (select {by: (* x 2) from: Tck desc: y}) 'y) -- (at (select {by: k from: Tckp desc: y}) 'y)
+;; take: alone keeps first-seen group order: head, tail, range, more than the groups
+(select {by: (* x 2) from: Tck take: 2}) -- (table [x y] (list [6 2] [30 10]))
+(at (select {by: (* x 2) from: Tck take: -1}) 'y) -- (at (select {by: k from: Tckp take: -1}) 'y)
+(at (select {by: (* x 2) from: Tck take: [1 2]}) 'y) -- (at (select {by: k from: Tckp take: [1 2]}) 'y)
+(at (select {by: (* x 2) from: Tck desc: x take: 10}) 'x) -- [8 6 4 2]
+;; where: filters the rows before the grouping
+(select {by: (* x 2) from: Tck where: (> y 15) asc: x take: 2}) -- (table [x y] (list [4 6] [20 30]))
+;; several rows per group: the first row of each, as for a plain key
+(select {by: (% x 2) from: Tck asc: x}) -- (table [x y] (list [0 1] [40 30]))
+(at (select {by: (% x 2) from: Tck desc: y take: 1}) 'y) -- [40]
+;; a null key sorts as the plain key's null does
+(set Tckn (table [x y] (list [1 0N 3 0N 5] [10 20 30 40 50])))
+(set Tcknp (update {k: (* x 2) from: Tckn}))
+(at (select {by: (* x 2) from: Tckn desc: x}) 'y) -- (at (select {by: k from: Tcknp desc: k}) 'y)
+(at (select {by: (* x 2) from: Tckn asc: x take: 2}) 'y) -- (at (select {by: k from: Tcknp asc: k take: 2}) 'y)
+(at (select {by: (* x 2) from: Tckn asc: x take: 2}) 'y) -- [20 10]
+;; STR and LIST columns are gathered whole.  The branch built every column
+;; with store_typed_elem, which has no STR case: the cells came back empty
+;; or stale, and a sort on them read an unset string pool.
+(set Tcks (table [x r] (list [3 1 4 2 3 1] (list "c-long-string-over-12" "a-long-string-over-12" "d-long-string-over-12" "b-long-string-over-12" "c2" "a2"))))
+(set Tcksp (update {k: (* x 2) from: Tcks}))
+(at (select {by: (* x 2) from: Tcks}) 'r) -- ["c-long-string-over-12" "a-long-string-over-12" "d-long-string-over-12" "b-long-string-over-12"]
+(at (select {by: (* x 2) from: Tcks}) 'r) -- (at (select {by: k from: Tcksp}) 'r)
+(at (select {by: (* x 2) from: Tcks desc: r}) 'r) -- (at (select {by: k from: Tcksp desc: r}) 'r)
+(at (select {by: (* x 2) from: Tcks desc: r}) 'x) -- [8 6 4 2]
+(at (select {by: (* x 2) from: Tcks desc: r take: 2}) 'r) -- (at (select {by: k from: Tcksp desc: r take: 2}) 'r)
+(at (select {by: (* x 2) from: Tcks desc: r take: 2}) 'r) -- ["d-long-string-over-12" "c-long-string-over-12"]
+(set Tckl (table [x l] (list [3 1 4 2] (list [1 2] [3] [4 5 6] [7]))))
+(set Tcklp (update {k: (* x 2) from: Tckl}))
+(at (select {by: (* x 2) from: Tckl}) 'l) -- (at (select {by: k from: Tcklp}) 'l)
+(at (select {by: (* x 2) from: Tckl desc: x take: 2}) 'l) -- (at (select {by: k from: Tcklp desc: k take: 2}) 'l)
+(at (select {by: (* x 2) from: Tckl desc: x take: 2}) 'l) -- (list [4 5 6] [1 2])
+;; a STR computed key, over more rows than one gather chunk
+(set Tckb (table [x r] (list (til 8192) (concat "row-string-over-twelve-" (as 'STR (% (til 8192) 700))))))
+(set Tckbp (update {k: (concat r "!") from: Tckb}))
+(count (select {by: (concat r "!") from: Tckb})) -- 700
+(at (select {by: (concat r "!") from: Tckb desc: r take: 3}) 'r) -- (at (select {by: k from: Tckbp desc: k take: 3}) 'k)
+(at (select {by: (concat r "!") from: Tckb desc: r take: 3}) 'x) -- [99 98 97]
+(at (select {by: (concat r "!") from: Tckb asc: x take: -2}) 'r) -- (at (select {by: k from: Tckbp asc: x take: -2}) 'k)
+;; a dotted key takes the same branch; the by-dict form is the oracle
+(set Tckt (table [ts v] (list [2024.01.02D10:00:00.000000000 2024.01.01D09:00:00.000000000 2024.01.02D11:00:00.000000000 2024.01.03D08:00:00.000000000 2024.01.01D12:00:00.000000000] [1 2 3 4 5])))
+(select {by: ts.date from: Tckt desc: date take: 2}) -- (select {by: {date: ts.date} from: Tckt desc: date take: 2})
+(select {by: ts.date from: Tckt asc: date}) -- (select {by: {date: ts.date} from: Tckt asc: date})
+(select {by: ts.date from: Tckt where: (> v 1) desc: v take: -2}) -- (select {by: {date: ts.date} from: Tckt where: (> v 1) desc: v take: -2})
+(at (select {by: ts.date from: Tckt desc: date take: 2}) 'v) -- [4 1]
+;; a LIST-valued key: ray_is_vec leaves out RAY_LIST, so the key column was
+;; never gathered and the source column it replaces was dropped with it.
+;; The plain LIST key is the oracle.  The identity lambda is a row-aligned
+;; LIST key that the planned grouping and this branch evaluate alike.
+(set Tckk (table [x l] (list [3 1 4 2] (list [1 2] [3] [4 5 6] [3]))))
+(select {by: ((fn [a] a) l) from: Tckk}) -- (select {by: l from: Tckk})
+(at (select {by: ((fn [a] a) l) from: Tckk}) 'l) -- (at (select {c: (count x) by: ((fn [a] a) l) from: Tckk}) 'l)
+(select {by: ((fn [a] a) l) from: Tckk desc: x}) -- (select {by: l from: Tckk desc: x})
+(select {by: ((fn [a] a) l) from: Tckk desc: x take: 2}) -- (select {by: l from: Tckk desc: x take: 2})
+(select {by: ((fn [a] a) l) from: Tckk desc: x take: 2}) -- (table [l x] (list (list [4 5 6] [1 2]) [4 3]))
+(select {by: ((fn [a] a) l) from: Tckk desc: x take: -2}) -- (select {by: l from: Tckk desc: x take: -2})
+(select {by: ((fn [a] a) l) from: Tckk where: (== x 4)}) -- (select {by: l from: Tckk where: (== x 4)})
+(select {by: ((fn [a] a) l) from: Tckk where: (> x 100)}) -- (select {by: l from: Tckk where: (> x 100)})
+;; a key of another length is no row-aligned key: its group rows would index
+;; past the gathered columns.  A LIST key gets past the planned grouping's
+;; own length check, which looks at vectors only.
+(select {by: ((fn [a] (concat a a)) l) from: Tckk desc: x}) !- length
+(select {by: (concat l l) from: Tckk desc: x}) !- length
+;; (concat x 99), bare or in a lambda, is a collection of 5 values: the
+;; whole-column key evaluation refuses it
+(select {by: (concat x 99) from: Tckk}) !- length
+(select {by: ((fn [a] (concat a 99)) x) from: Tckk}) !- length
+;; a concat of collections is no text: the planner leaves it to the whole
+;; column, where an aligned one groups as the column it equals
+(set Eck (take [1] 0))
+(value (select {c: (count x) by: (concat x Eck) from: Tckk})) -- (value (select {c: (count x) by: x from: Tckk}))
+(at (select {by: (concat x Eck) from: Tckk desc: x}) (quote x)) -- (at (select {by: x from: Tckk desc: x}) (quote x))
+;; any key the planner cannot lower is evaluated over the whole column, as
+;; its lambda form and its materialised vector are: with and without
+;; outputs, sorted and taken, filtered; a misaligned one is refused
+(set Trk (table [x s] (list [3 1 4 2 3 1] [a b a c b a])))
+(set Krev (reverse (at Trk 'x)))
+(value (select {c: (count x) by: (reverse x) from: Trk})) -- (value (select {c: (count x) by: ((fn [a] (reverse a)) x) from: Trk}))
+(at (select {c: (count x) by: (reverse x) from: Trk}) 'c) -- (at (select {c: (count x) by: {k: Krev} from: Trk}) 'c)
+(select {by: (reverse x) from: Trk}) -- (select {by: ((fn [a] (reverse a)) x) from: Trk})
+(select {by: (asc x) from: Trk desc: x take: 2}) -- (select {by: ((fn [a] (asc a)) x) from: Trk desc: x take: 2})
+(select {c: (count x) by: (asc x) from: Trk desc: c take: 2}) -- (select {c: (count x) by: ((fn [a] (asc a)) x) from: Trk desc: c take: 2})
+(at (select {by: (til (count x)) from: Trk where: (> x 1)}) (quote key)) -- (at (select {by: ((fn [a] (til (count a))) x) from: Trk where: (> x 1)}) (quote x))
+(at (select {by: (til (count x)) from: Trk where: (> x 1)}) (quote s)) -- (at (select {by: ((fn [a] (til (count a))) x) from: Trk where: (> x 1)}) (quote s))
+(select {c: (count x) by: (reverse x) from: Trk where: (> x 1)}) -- (select {c: (count x) by: ((fn [a] (reverse a)) x) from: Trk where: (> x 1)})
+(select {by: (distinct x) from: Trk}) !- length
+(select {c: (count x) by: (distinct x) from: Trk}) !- length
+;; an unknown column reads as schema, lowered or not; an unknown function
+;; stays a name error
+(select {c: (count x) by: (reverse nosuch) from: Trk}) !- schema
+(select {by: (reverse nosuch) from: Trk}) !- schema
+(select {c: (count x) by: (+ nosuch 1) from: Trk}) !- schema
+(select {c: (count x) by: (reverse nosuch) from: Trk where: (> x 1)}) !- schema
+(select {c: (count x) by: (nosuchfn x) from: Trk}) !- name
+;; a name the key binds itself, by let or set in a do, is no column; a key
+;; that binds names is left to the evaluator, which reports any unknown one
+(value (select {c: (count x) by: (do (let qk x) (reverse qk)) from: Trk})) -- (value (select {c: (count x) by: (reverse x) from: Trk}))
+(at (select {c: (count x) by: (do (set qkg x) (reverse qkg)) from: Trk}) (quote c)) -- [2 2 1 1]
+(select {c: (count x) by: (do (let qk x) (reverse nosuch)) from: Trk}) !- name
+(select {c: (count x) by: (do (reverse qk2) (let qk2 x)) from: Trk}) !- name
+;; a name bound inside nested forms, by set or let in a do, an if, or
+;; through a binder called by another name, is the evaluator's to resolve:
+;; the unknown-column check never refuses such a key
+(set fnest (fn [a] (let b a) (reverse b)))
+;; (a key with an effect runs row by row: each row's key is its x)
+(at (select {by: (fnest (do (do (set qn1 x)) qn1)) from: Trk}) 'x) -- (at (select {by: x from: Trk}) 'x)
+(count (select {by: (reverse (if true (set qn2 x) (set qn2 s))) from: Trk})) -- (count (select {by: (reverse x) from: Trk}))
+(count (select {by: (reverse (do (do (do (set qn3 x))) (do (do qn3)))) from: Trk})) -- (count (select {by: (reverse x) from: Trk}))
+(set setalias set)
+(count (select {by: (reverse (do (setalias qn4 x) qn4)) from: Trk})) -- (count (select {by: (reverse x) from: Trk}))
+;; a binder reached through a lambda parameter, or placed in a built key as
+;; the builtin itself, binds too
+(set runb (fn [x] (select {by: (reverse (do (x qb s) qb)) from: Trk})))
+(count (runb set)) -- (count (select {by: s from: Trk}))
+(set syk (fn [n] (as 'SYMBOL n)))
+(set Kset (list (syk "reverse") (list (syk "do") (list set (syk "qo") (syk "x")) (syk "qo"))))
+(count (eval (list select (dict [from by] (list Trk Kset))))) -- 4
+;; text concat is still planned, and groups the same
+(at (select {c: (count x) by: (concat s "z") from: Trk}) 'c) -- [3 2 1]
+;; one value is one group, holding the first row
+(select {by: ((fn [a] [7]) x) from: Tcks}) -- (table [x r] (list [7] (list "c-long-string-over-12")))
+;; a name that is no column (a global vector) is grouped by its values, as
+;; the with-output and by-dict forms group it.  The branch took it for a
+;; column and dereferenced the NULL its lookup returned.
+(set Tckg (table [x y] (list [3 1 4 2] [30 10 40 20])))
+(set Vck1 [7])
+(set Vck4 [1 1 2 2])
+(set VckL (list [1] [1] [2] [2]))
+(select {by: Vck1 from: Tckg}) -- (table [Vck1 x y] (list [7] [3] [30]))
+(select {by: Vck4 from: Tckg}) -- (table [Vck4 x y] (list [1 2] [3 4] [30 40]))
+(value (select {by: Vck4 from: Tckg})) -- (value (select {by: {k: Vck4} from: Tckg}))
+(at (select {by: Vck4 from: Tckg}) 'Vck4) -- (first (value (select {c: (count y) by: Vck4 from: Tckg})))
+(select {by: Vck4 from: Tckg desc: y take: 1}) -- (table [Vck4 x y] (list [2] [4] [40]))
+(select {by: Vck1 from: Tckg where: (> y 15)}) -- (table [Vck1 x y] (list [7] [3] [30]))
+(key (select {by: Vck1 from: Tckg where: (> y 100)})) -- ['Vck1 'x 'y]
+(count (select {by: Vck1 from: Tckg where: (> y 100)})) -- 0
+;; a global LIST is no key here, as with an output
+(select {by: VckL from: Tckg}) !- schema
+(select {c: (count y) by: VckL from: Tckg}) !- schema
+;; a local that shadows a column: the grouping groups by the local, as the
+;; with-output form does, and names its key column after no column.  The
+;; branch looked the key up by the column's name and read unset group keys.
+(set Tcksh (table [x y] (list [3 1 4 2] [30 10 40 20])))
+(set Tcksl (table [k s l] (list [1 2 3 4] (list "aa" "bb" "cc" "dd") (list [1] [2] [3] [4]))))
+((fn [y] (select {by: y from: Tcksh})) [10 10 30 30]) -- (table [y x] (list [10 30] [3 4]))
+((fn [y] (at (select {by: y from: Tcksh}) 'y)) [10 10 30 30]) -- ((fn [y] (first (value (select {c: (first x) by: y from: Tcksh})))) [10 10 30 30])
+((fn [y] (at (select {by: y from: Tcksh}) 'x)) [10 10 30 30]) -- ((fn [y] (at (select {c: (first x) by: y from: Tcksh}) 'c)) [10 10 30 30])
+((fn [k] (select {by: k from: Tcksl})) [9 9 9 9]) -- (table [k s l] (list [9] (list "aa") (list [1])))
+((fn [] (let y [10 10 30 30]) (select {by: y from: Tcksh}))) -- (table [y x] (list [10 30] [3 4]))
+((fn [y] (select {by: y from: Tcksh desc: y})) [10 10 30 30]) -- (table [y x] (list [30 10] [4 3]))
+((fn [y] (select {by: y from: Tcksh where: (> x 0)})) [10 10 30 30]) -- (table [y x] (list [10 30] [3 4]))
+;; xfail: a where: that drops rows refuses the local (4 values for 3 rows),
+;; where the with-output form filters the local too: [10 30] [3 4]
+;; ((fn [y] (select {by: y from: Tcksh where: (> x 1)})) [10 10 30 30]) -- (table [y x] (list [10 30] [3 4]))
+;; a name bound to one value is one group, as the with-output form groups
+;; it; the branch handed the atom to a grouping that takes vectors only.
+;; A name bound to a function is no key.
+(set Acka 5)
+(set Acks "abc")
+(select {by: Acka from: Tckg}) -- (table [Acka x y] (list [5] [3] [30]))
+(at (select {by: Acka from: Tckg}) 'Acka) -- (first (value (select {c: (first x) by: Acka from: Tckg})))
+(at (select {by: Acka from: Tckg}) 'x) -- (at (select {c: (first x) by: Acka from: Tckg}) 'c)
+(select {by: Acks from: Tckg where: (> x 3)}) -- (table [Acks x y] (list (list "abc") [4] [40]))
+((fn [] (let F 2.5) (select {by: F from: Tckg}))) -- (table [F x y] (list [2.5] [3] [30]))
+(type (at (select {by: Acka from: Tckg where: (> y 100)}) 'Acka)) -- 'I64
+(count (select {by: Acka from: Tckg where: (> y 100)})) -- 0
+(select {by: sum from: Tckg}) !- domain
+(select {c: (count y) by: sum from: Tckg}) !- domain
+;; a key that evaluates lazily (a moving window) is materialised first
+(set Tcklz (update {k: (mmax 2 x) from: Tckg}))
+(at (select {by: (mmax 2 x) from: Tckg}) (quote x)) -- (at (select {by: k from: Tcklz}) (quote k))
+(at (select {by: (mmax 2 x) from: Tckg}) (quote y)) -- (at (select {by: k from: Tcklz}) (quote y))
+(at (select {by: (mmax 2 x) from: Tckg desc: x}) (quote y)) -- (at (select {by: k from: Tcklz desc: k}) (quote y))
+(type (at (select {by: (mmax 2 x) from: Tckg where: (> y 100)}) (quote x))) -- (quote I64)
+;; a computed by-dict key with a where: and no outputs keeps every column, in
+;; the table's order: the prefilter narrowed the table to the columns the
+;; clauses name, which are all an output-less select returns
+(set Tckp3 (table [x y z] (list [3 1 4 2] [30 10 40 20] [7 8 9 6])))
+(set Tckp3k (update {k: (* x 2) from: Tckp3}))
+(select {by: {k: (* x 2)} from: Tckp3 where: (> y 15)}) -- (select {by: k from: Tckp3k where: (> y 15)})
+(select {by: {k: (* x 2)} from: Tckp3 where: (> y 15)}) -- (table [k x y z] (list [6 8 4] [3 4 2] [30 40 20] [7 9 6]))
+(key (select {by: {a: x b: (* y 2)} from: Tckp3 where: (> y 15)})) -- ['a 'b 'x 'y 'z]
+(select {by: {k: (* x 2)} from: Tckp3 where: (> y 15) desc: k take: 2}) -- (table [k x y z] (list [8 6] [4 3] [40 30] [9 7]))
+;; on a parted table every no-output form matches the same select on the
+;; materialised table; each read a parted column as a plain one and failed
+(.sys.exec "rm -rf /tmp/rfl_ckparted")
+(.db.splayed.set "/tmp/rfl_ckparted/2024.01.01/t/" (table [x y s r] (list [3 1 4] [30 10 40] ['c 'a 'd] (list "c-long-string-over-12" "a" "d"))))
+(.db.splayed.set "/tmp/rfl_ckparted/2024.01.02/t/" (table [x y s r] (list [2 3 1 5] [20 31 11 50] ['b 'c 'a 'e] (list "b" "c2" "a2" "e"))))
+(set Pck (.db.parted.get "/tmp/rfl_ckparted/" 't))
+(set Mck (select {from: Pck where: (>= y 0)}))
+(count (select {by: x from: Pck})) -- 5
+(select {by: x from: Pck}) -- (select {by: x from: Mck})
+(select {by: x from: Pck desc: y take: 2}) -- (select {by: x from: Mck desc: y take: 2})
+(select {by: (% x 2) from: Pck asc: x}) -- (select {by: (% x 2) from: Mck asc: x})
+(select {by: s from: Pck}) -- (select {by: s from: Mck})
+(select {by: r from: Pck}) -- (select {by: r from: Mck})
+(select {by: [x s] from: Pck}) -- (select {by: [x s] from: Mck})
+(select {by: {k: (* x 2)} from: Pck}) -- (select {by: {k: (* x 2)} from: Mck})
+(select {by: date from: Pck}) -- (select {by: date from: Mck})
+(select {by: x from: Pck where: (> y 15)}) -- (select {by: x from: Mck where: (> y 15)})
+;; a where: on the key column itself: kept on the row path, which flattens
+;; the rows it keeps (deferred, it left the no-output paths a parted key)
+(select {by: x from: Pck where: (> x 2)}) -- (select {by: x from: Mck where: (> x 2)})
+(select {by: x from: Pck where: (>= x 0)}) -- (select {by: x from: Mck where: (>= x 0)})
+(select {by: date from: Pck where: (> date 2024.01.01)}) -- (select {by: date from: Mck where: (> date 2024.01.01)})
+;; a key the planner cannot lower reads whole columns of a parted table, as
+;; of the flat one: a helper, a builtin with no kernel; with and without
+;; outputs, sorted and taken, filtered
+(set fkp (fn [] (% x 2)))
+(select {by: (fkp) from: Pck}) -- (select {by: (fkp) from: Mck})
+(select {c: (count y) by: (fkp) from: Pck}) -- (select {c: (count y) by: (fkp) from: Mck})
+(select {by: (reverse x) from: Pck}) -- (select {by: (reverse x) from: Mck})
+(select {c: (count y) by: (reverse x) from: Pck}) -- (select {c: (count y) by: (reverse x) from: Mck})
+(select {s: (sum y) by: (reverse x) from: Pck desc: s take: 2}) -- (select {s: (sum y) by: (reverse x) from: Mck desc: s take: 2})
+(select {c: (count y) by: (reverse x) from: Pck where: (> y 15)}) -- (select {c: (count y) by: (reverse x) from: Mck where: (> y 15)})
+(select {by: (reverse x) from: Pck desc: y take: 2}) -- (select {by: (reverse x) from: Mck desc: y take: 2})
+(select {by: (fkp) from: Pck asc: r}) -- (select {by: (fkp) from: Mck asc: r})
+(select {c: (count y) by: (distinct x) from: Pck}) !- length
+;; and as a by-dict value: a helper or a builtin with no kernel, beside
+;; outputs, sorted, filtered, with a second key, with no output
+(select {c: (count y) by: {k: (fkp)} from: Pck}) -- (select {c: (count y) by: {k: (fkp)} from: Mck})
+(select {c: (count y) by: {k: (reverse x)} from: Pck}) -- (select {c: (count y) by: {k: (reverse x)} from: Mck})
+(select {sy: (sum y) by: {k: (fkp)} from: Pck desc: sy take: 2}) -- (select {sy: (sum y) by: {k: (fkp)} from: Mck desc: sy take: 2})
+(select {c: (count y) by: {k: (fkp)} from: Pck where: (> y 15)}) -- (select {c: (count y) by: {k: (fkp)} from: Mck where: (> y 15)})
+(select {c: (count y) by: {k: (fkp) ks: s} from: Pck}) -- (select {c: (count y) by: {k: (fkp) ks: s} from: Mck})
+(select {by: {k: (fkp)} from: Pck}) -- (select {by: {k: (fkp)} from: Mck})
+;; a where: before a computed key keeps every column when a helper reads
+;; one the clauses do not name (x here)
+(set Tnw (table [x y z] (list [3 1 4 2 3] [10 20 30 40 50] [1 1 1 1 1])))
+(select {c: (count y) by: {k: (fkp)} from: Tnw where: (> y 15)}) -- (select {c: (count y) by: {k: (% x 2)} from: Tnw where: (> y 15)})
+;; a sort without by: sorts the keys and gathers the rows they keep; the
+;; flat sort it fell to read parted columns as plain ones and failed
+(select {from: Pck desc: x}) -- (select {from: Mck desc: x})
+(select {from: Pck asc: y}) -- (select {from: Mck asc: y})
+(select {from: Pck desc: x take: 2}) -- (select {from: Mck desc: x take: 2})
+(select {from: Pck asc: x take: -2}) -- (select {from: Mck asc: x take: -2})
+;; take: 0 with a sort keeps no row, on every path (the flat sort fused
+;; with its take read 0 as no limit and kept every row)
+(select {from: Pck asc: x take: 0}) -- (select {from: Mck asc: x take: 0})
+(count (select {from: Mck asc: x take: 0})) -- 0
+(count (select {from: Pck asc: x take: 0})) -- 0
+(count (select {from: Mck desc: x take: 0})) -- 0
+(count (select {x: x from: Mck asc: x take: 0})) -- 0
+(count (select {x: x from: Pck asc: x take: 0})) -- 0
+(count (select {y: y from: Pck desc: x take: 0})) -- 0
+(count (select {from: Mck asc: [x y] take: 0})) -- 0
+(count (select {from: Mck where: (> y 15) asc: x take: 0})) -- 0
+(count (select {from: Pck where: (> y 15) asc: x take: 0})) -- 0
+(key (select {x: x from: Mck asc: x take: 0})) -- [x]
+(select {from: Pck asc: x take: [1 3]}) -- (select {from: Mck asc: x take: [1 3]})
+(select {from: Pck asc: [x y]}) -- (select {from: Mck asc: [x y]})
+(select {from: Pck asc: x desc: y}) -- (select {from: Mck asc: x desc: y})
+(select {from: Pck where: (> y 15) desc: x take: 2}) -- (select {from: Mck where: (> y 15) desc: x take: 2})
+(select {from: Pck asc: s}) -- (select {from: Mck asc: s})
+(select {from: Pck desc: r take: 3}) -- (select {from: Mck desc: r take: 3})
+(select {from: Pck desc: date}) -- (select {from: Mck desc: date})
+(select {from: Pck desc: 'y}) -- (select {from: Mck desc: 'y})
+(select {x: x from: Pck desc: x}) -- (select {x: x from: Mck desc: x})
+(select {y: y from: Pck desc: x}) -- (select {y: y from: Mck desc: x})
+;; sort keys no output carries, or carried under another name: the sort
+;; reads them as columns whatever the outputs are named, as the flat one
+;; does; an output naming another output reads that output
+(select {y: y s: s from: Pck desc: x take: 2}) -- (select {y: y s: s from: Mck desc: x take: 2})
+(select {s: s from: Pck asc: [y x] take: -2}) -- (select {s: s from: Mck asc: [y x] take: -2})
+(select {z: x r: r from: Pck asc: x}) -- (select {z: x r: r from: Mck asc: x})
+(select {date: date y: y from: Pck desc: y take: 3}) -- (select {date: date y: y from: Mck desc: y take: 3})
+(select {x: y r: r from: Pck desc: x}) -- (select {x: y r: r from: Mck desc: x})
+(select {x: y y: x from: Pck desc: y}) -- (select {x: y y: x from: Mck desc: y})
+(select {x: y z: x y: y from: Pck desc: y}) -- (select {x: y z: x y: y from: Mck desc: y})
+;; an output named after a lambda parameter reads the parameter, not the
+;; column it hides
+(set runs (fn [tbl x] (select {y: y x: x from: tbl desc: y})))
+(runs Pck 7) -- (runs Mck 7)
+;; a dotted output (a field of the partition date) is no stored column: the
+;; flat sort answers it
+(select {month: date.mm from: Pck desc: x}) -- (select {month: date.mm from: Mck desc: x})
+(select {day: date.dd from: Pck asc: y}) -- (select {day: date.dd from: Mck asc: y})
+(select {month: date.mm y: y from: Pck desc: y take: 2}) -- (select {month: date.mm y: y from: Mck desc: y take: 2})
+;; with take: too (the per-partition top-k sorted each partition on the
+;; column and merged them on the output of that name)
+(select {x: y r: r from: Pck desc: x take: 3}) -- (select {x: y r: r from: Mck desc: x take: 3})
+(select {x: y y: x from: Pck desc: y take: 2}) -- (select {x: y y: x from: Mck desc: y take: 2})
+;; it groups on the columns the clauses name and gathers the others at the
+;; rows kept: a sort key only in desc:/asc:, a by-dict value's column, the
+;; partition key sorted, every row its own group, a key from a global
+(select {by: x from: Pck desc: r take: 3}) -- (select {by: x from: Mck desc: r take: 3})
+(select {by: x from: Pck asc: s}) -- (select {by: x from: Mck asc: s})
+(select {by: {k: y} from: Pck}) -- (select {by: {k: y} from: Mck})
+(select {by: {k: (% y 20)} from: Pck}) -- (select {by: {k: (% y 20)} from: Mck})
+(select {by: date from: Pck desc: date}) -- (select {by: date from: Mck desc: date})
+(select {by: y from: Pck}) -- (select {by: y from: Mck})
+(select {by: y from: Pck desc: y}) -- (select {by: y from: Mck desc: y})
+(set Vck7 [1 1 2 2 3 3 3])
+(select {by: Vck7 from: Pck}) -- (select {by: Vck7 from: Mck})
+(select {by: x from: Pck take: [1 2]}) -- (select {by: x from: Mck take: [1 2]})
+;; a quoted symbol naming the key or the sort column is that column too
+(select {by: 's from: Pck}) -- (select {by: 's from: Mck})
+(select {by: 'r from: Pck}) -- (select {by: 'r from: Mck})
+(select {by: 'date from: Pck}) -- (select {by: 'date from: Mck})
+(select {by: s from: Pck desc: 'y}) -- (select {by: s from: Mck desc: 'y})
+(select {by: s from: Pck asc: 'r take: 2}) -- (select {by: s from: Mck asc: 'r take: 2})
+(.sys.exec "rm -rf /tmp/rfl_ckparted")
+;; a column named as a computed key is (`key`): the key replaces it in the
+;; result, as on the flattened table
+(.sys.exec "rm -rf /tmp/rfl_ckpkey")
+(.db.splayed.set "/tmp/rfl_ckpkey/2024.01.01/t/" (table [x key] (list [3 1 4] [7 8 9])))
+(.db.splayed.set "/tmp/rfl_ckpkey/2024.01.02/t/" (table [x key] (list [2 3 1 5] [6 5 4 3])))
+(set Pckk (.db.parted.get "/tmp/rfl_ckpkey/" 't))
+(set Mckk (select {from: Pckk where: (>= x 0)}))
+(select {by: (+ (% x 2) 1) from: Pckk}) -- (select {by: (+ (% x 2) 1) from: Mckk})
+(select {by: 5 from: Pckk}) -- (select {by: 5 from: Mckk})
+(.sys.exec "rm -rf /tmp/rfl_ckpkey")
+;; columns a key's naming checks read are grouped on for real: a dotted
+;; key's tail names a column (mm), so the key takes the full name; a
+;; by-dict alias that names a column is refused
+(.sys.exec "rm -rf /tmp/rfl_ckpkn")
+(.db.splayed.set "/tmp/rfl_ckpkn/2024.01.01/t/" (table [x mm dd] (list [0 1 2] [7 8 9] [5 5 6])))
+(.db.splayed.set "/tmp/rfl_ckpkn/2024.02.02/t/" (table [x mm dd] (list [10 11 12] [7 8 9] [5 5 6])))
+(set Pckn (.db.parted.get "/tmp/rfl_ckpkn/" 't))
+(set Mckn (select {from: Pckn where: (>= x 0)}))
+(select {by: date.mm from: Pckn}) -- (select {by: date.mm from: Mckn})
+(select {by: date.dd from: Pckn}) -- (select {by: date.dd from: Mckn})
+(select {by: {mm: (% x 2)} from: Mckn}) !- domain
+(select {by: {mm: (% x 2)} from: Pckn}) !- domain
+(.sys.exec "rm -rf /tmp/rfl_ckpkn")
+;; the row-number column the parted paths add is never one the select
+;; names: a by-dict key, a bound variable a key reads, a sort key
+(.sys.exec "rm -rf /tmp/rfl_ckrown")
+(.db.splayed.set "/tmp/rfl_ckrown/2024.01.01/t/" (table [i s] (list [3 1 2 5] [b a b c])))
+(.db.splayed.set "/tmp/rfl_ckrown/2024.01.02/t/" (table [i s] (list [4 0 7] [a c a])))
+(set Prn (.db.parted.get "/tmp/rfl_ckrown/" 't))
+(set Mrn (select {from: Prn where: (>= i 0)}))
+(select {by: {__row: s} from: Prn}) -- (select {by: {__row: s} from: Mrn})
+(count (select {by: {__row: s} from: Prn})) -- 3
+;; nor one a select reads unseen: a helper that reads a column by name, or
+;; a name made at run time (the column a helper or eval reads is not in
+;; the clauses, so the narrow copy would miss it or offer the row number)
+(set hx (fn [] i))
+(select {by: {k: (hx)} from: Prn}) -- (select {by: {k: (hx)} from: Mrn})
+(set hr2 (fn [] __row))
+(select {by: {k: (hr2)} from: Mrn}) !- name
+(select {by: {k: (hr2)} from: Prn}) !- name
+(select {by: {k: (eval (parse "__row"))} from: Mrn}) !- name
+(select {by: {k: (eval (parse "__row"))} from: Prn}) !- name
+(select {by: {k: (eval (as 'SYMBOL "__row"))} from: Mrn}) !- name
+(select {by: {k: (eval (as 'SYMBOL "__row"))} from: Prn}) !- name
+;; the helper called by a quoted name, through a computed callee, or out of
+;; a list
+(set hy (fn [x] i))
+(set Ly (list hy))
+(select {by: {k: ('hy 0)} from: Prn}) -- (select {by: {k: ('hy 0)} from: Mrn})
+(select {by: {k: ((first Ly) 0)} from: Prn}) -- (select {by: {k: ((first Ly) 0)} from: Mrn})
+(select {by: {k: (first (map (first Ly) [0]))} from: Prn}) -- (select {by: {k: (first (map (first Ly) [0]))} from: Mrn})
+;; or by a dotted name into a dict of helper names ({f: hy} holds the name)
+(set Dl {f: hy})
+(select {by: {k: (Dl.f 0)} from: Prn}) -- (select {by: {k: (Dl.f 0)} from: Mrn})
+(count (select {by: {k: (Dl.f 0)} from: Prn})) -- 7
+(set hz (fn [] __row))
+(set Dz {g: hz})
+(select {by: {k: (Dz.g)} from: Mrn}) !- name
+(select {by: {k: (Dz.g)} from: Prn}) !- name
+;; or by a name bound to the helper's name
+(set gy 'hy)
+(select {by: {k: (gy 0)} from: Prn}) -- (select {by: {k: (gy 0)} from: Mrn})
+(set __row [1 1 2 2 3 3 3])
+(select {by: {k: __row} from: Prn}) -- (select {by: {k: __row} from: Mrn})
+(count (select {by: {k: __row} from: Prn})) -- 3
+;; a helper reading the bound __row reads the variable, as on the flat table
+(set hr (fn [] __row))
+(select {by: {k: (hr)} from: Prn}) -- (select {by: {k: (hr)} from: Mrn})
+(count (select {by: {k: (hr)} from: Prn})) -- 3
+;; a builtin that evaluates a name, called by another name, is code too:
+;; it reads the variable, as on the flat table, not the row number
+(set getv resolve)
+(set rname '__row)
+(select {by: {k: (getv rname)} from: Prn}) -- (select {by: {k: (getv rname)} from: Mrn})
+(count (select {by: {k: (getv rname)} from: Prn})) -- 3
+(set getq 'resolve)
+(select {by: {k: (getq rname)} from: Prn}) -- (select {by: {k: (getq rname)} from: Mrn})
+(set evq eval)
+(set paq parse)
+(select {by: {k: (evq (paq "__row"))} from: Prn}) -- (select {by: {k: (evq (paq "__row"))} from: Mrn})
+(count (select {by: {k: (evq (paq "__row"))} from: Prn})) -- 3
+;; the builtin itself placed in a built query is code as well
+(set Erow (list resolve (syk "rname")))
+(set Qrp (dict [from by] (list Prn (dict [k] (list Erow)))))
+(set Qrm (dict [from by] (list Mrn (dict [k] (list Erow)))))
+(eval (list select Qrp)) -- (eval (list select Qrm))
+(count (eval (list select Qrp))) -- 3
+;; a lambda parameter hides the column of its name: the helper passed in it
+;; reads a column (s) the clauses do not name
+(set runl (fn [tbl i] (select {by: {k: (i)} from: tbl})))
+(runl Prn (fn [] s)) -- (runl Mrn (fn [] s))
+(select {i: i from: Prn desc: i take: 2}) -- (select {i: i from: Mrn desc: i take: 2})
+(select {from: Prn asc: s}) -- (select {from: Mrn asc: s})
+(set __row 0)
+(.sys.exec "rm -rf /tmp/rfl_ckrown")

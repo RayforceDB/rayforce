@@ -360,6 +360,7 @@ static bool hook_vm_bind(hook_vm_t* hv) {
 static void hook_vm_unbind(hook_vm_t* hv) {
     if (!hv->owned) return;
     if (hv->owned->raise_val) ray_release(hv->owned->raise_val);
+    if (hv->owned->return_val) ray_release(hv->owned->return_val);
     if (hv->owned->trace) ray_release(hv->owned->trace);
     __VM = NULL;
     ray_free_raw(hv->owned);
@@ -1171,6 +1172,7 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
      * one between two requests.  Stamping on frame arrival instead would
      * make the measured gap the request's own duration. */
     ray_heap_note_activity();
+    ray_heap_relieve();
 
     return NULL;
 }

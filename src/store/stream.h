@@ -28,7 +28,9 @@ typedef struct {
     /* runtime id -> domain position, direct-mapped: the chunk vecs are
      * runtime-domain and a column's values repeat across rows and chunks,
      * so a value is interned into the symfile's domain (a locked probe) the
-     * first time it is met and looked up here after. */
+     * first time it is met and looked up here after.  Made by the first
+     * runtime-domain chunk: NULL while every chunk is already encoded over
+     * `dom` (a converter's own symbol decode) and needs no translation. */
     int64_t*  lut_id;    /* [COL_STREAM_LUT] runtime id per slot, -1 empty */
     uint32_t* lut_pos;   /* [COL_STREAM_LUT] position per slot */
     ray_zone_acc_t* zone;   /* numeric / temporal: the running chunk zone */
@@ -71,6 +73,11 @@ ray_err_t ray_col_stream_close_all(ray_col_stream_t* w, int64_t n, bool durable,
  * sized from the RAM budget); a single one builds with the parallel
  * builder.  Best effort: a failed build leaves the column with its zone. */
 void ray_col_stream_hash_all(ray_col_stream_t* w, int64_t n, int64_t* col_ns);
+/* Build the hash index of one closed writer whose zone asked for one, right
+ * away and with the whole pool, while its file is still in the page cache;
+ * the zone is released and a later ray_col_stream_hash_all skips the
+ * writer.  Best effort, as there.  Call outside any pool dispatch. */
+void ray_col_stream_hash_one(ray_col_stream_t* w);
 /* Hash builds in flight at once: clamp(ram_limit / 4 / (58 B * max(rows, 1)),
  * 1, candidates).  Pure; `candidates` >= 1 expected. */
 int64_t ray_col_stream_hash_wave(int64_t ram_limit, int64_t rows, int64_t candidates);

@@ -12,11 +12,9 @@
 ;;   * left-join filled a null payload for a left row whose null key DID have a
 ;;     match on the right, instead of returning that match.
 ;;
-;; null == null is the rule the rest of the runtime already applies to key
-;; columns: `distinct` keeps exactly one null (test/rfl/null/distinct.rfl),
-;; group-by folds nulls into a single group, and `in`/atom_eq answer true for
-;; two nulls (collection.c).  As-of join is the ONE documented exception and is
-;; unchanged -- pinned at the bottom.
+;; null == null, between key types a join compares at all (pinned below).
+;; As-of join is the ONE documented exception and is unchanged -- pinned at
+;; the bottom.
 
 ;; ── The reported reproduction ─────────────────────────────────────────────
 ;; A left-join miss produces a null V; anti-joining the result against ITSELF
@@ -86,6 +84,20 @@
 (at (anti-join [k] NKPROBE NKBIG) 'p)  -- [3]
 (count (anti-join [k] NKBIG NKBIG))    -- 0
 
+;; ── Two nulls pair where two values of their key types are compared.  A
+;;    join reads every key that is not a string or a guid as a raw integer,
+;;    so a timestamp 5 meets an integer 5 — and their nulls meet too: a join
+;;    must not match the values yet refuse the nulls.  Numeric nulls of
+;;    different widths pair as well. ───────────────────────────────────────
+(set NKY (table [k y] (list [0Nl 5] [10 20])))
+(set NKT (table [k a] (list (as 'TIMESTAMP [0 5]) [1 2])))
+(at (left-join [k] NKT NKY) 'y) -- [0Nl 20]
+(set NKT2 (table [k a] (list [2024.01.01D00:00:00.000000000 0Np] [1 2])))
+(at (left-join [k] NKT2 NKY) 'y) -- [0Nl 10]
+(set NKI (table [k y] (list [0Ni 7i] [30 40])))
+(set NKL2 (table [k a] (list [0Nl 7] [1 2])))
+(at (left-join [k] NKL2 NKI) 'y) -- [30 40]
+
 ;; ── As-of join is the documented exception and is NOT changed.  Its merge
 ;;    walk skips null-keyed right rows and lets null-keyed left rows fall
 ;;    through to the left-outer null fill; it never routes through
@@ -93,3 +105,6 @@
 (set NKAT (table [S Time Price] (list (as 'SYM ["" "b"]) [10:00:01.000 10:00:01.000] (as 'F64 [1.0 2.0]))))
 (set NKAQ (table [S Time Bid] (list (as 'SYM ["" "b"]) [10:00:00.000 10:00:00.000] (as 'F64 [99.0 88.0]))))
 (at (asof-join [S Time] NKAT NKAQ) 'Bid) -- (as 'F64 [0Nf 88.0])
+
+;; Known bug found alongside, not fixed here (rayforce 1 answered [0 40 10 20 30]):
+;; (at (left-join [k] (table [k x] (list (list [9] 'b "s" 7 'a) [1 2 3 4 5])) (table [k y] (list (list [9] "s" 7 'a 'b) [0 10 20 30 40]))) 'y) -- [0 40 10 20 30]   ;; xfail BUG: a LIST key column is compared and hashed by cell pointer, not value, so rows pair wrongly

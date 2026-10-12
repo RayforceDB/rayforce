@@ -83,16 +83,20 @@
 
 ;; ════════════════════════════════════════════════════════════════════════════
 ;; §C  asc:  — sort is whole-rowset → MUST fall back (delta 0), MUST NOT stream.
-;;     `(select {asc:… from: PARTED})` is itself unmaterialisable in the eager
-;;     path (a PRE-EXISTING lazy-sort-over-parted limitation), so the flat
-;;     fallback surfaces that error LOUDLY rather than silently streaming a
-;;     per-day-sorted (wrong) result.  A loud error ≫ a silent wrong answer.
-;;     Before the fix this would instead STREAM (delta > 0) and return a value.
+;;     The flat fallback sorts the whole parted quote table (it used to fail
+;;     with `type` there: the flat sort read parted columns as plain ones) and
+;;     equals the flat oracle.  Before the fix this would instead STREAM
+;;     (delta > 0), sorting each day on its own.
 ;; ════════════════════════════════════════════════════════════════════════════
+(set ORac (asof-join [Sym Time] Tall (select {asc: Bid from: Qall})))
 (set Bac (at (.sys.mem) 'asof-perpart-runs))
-(asof-join [Sym Time] (select {Sym: Sym Time: Time Price: Price from: Pt}) (select {asc: Bid from: Pq})) !- type
+(set RSac (asof-join [Sym Time] (select {Sym: Sym Time: Time Price: Price from: Pt}) (select {asc: Bid from: Pq})))
 (set Aac (at (.sys.mem) 'asof-perpart-runs))
 (- Aac Bac) -- 0
+(count RSac) -- (count ORac)
+(at RSac 'Bid) -- (at ORac 'Bid)
+(at RSac 'Price) -- (at ORac 'Price)
+(at RSac 'Bid) -- (as 'F64 [100.0])
 
 ;; ════════════════════════════════════════════════════════════════════════════
 ;; §D  where:  — row-preserving → STILL STREAMS (delta > 0), and stays correct.

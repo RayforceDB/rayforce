@@ -697,9 +697,9 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out) {
     /* Issue #533: which nodes may skip the SYM null proof.  A null SYM is
      * id 0, below every real intern id, and the fallback ranks a null SYM
      * below everything in all six comparisons (null == null, null != x,
-     * null < x hold; null == x, x < null do not).  Raw id compares in the
-     * fused lane produce the same table, so a SYM column whose every
-     * consumer in this subtree is EQ..GE against a non-null constant (a
+     * null < x hold; null == x, x < null do not). Raw id equality compares
+     * preserve this; ordered compares bail below to lexical LUTs. A SYM
+     * column whose every consumer is EQ..GE against a non-null constant (a
      * null literal bails at OP_CONST) or another SYM scan needs no O(n)
      * ray_vec_has_nulls walk.  Any other consumer — ISNULL, CAST,
      * arithmetic — reads the lane as a value and keeps the proof. */
@@ -904,6 +904,14 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out) {
                 int8_t t2 = (s2 != 0xFF) ? out->regs[s2].type : t1;
                 uint16_t op = node->opcode;
                 int8_t ot;
+
+                /* SYM lanes contain intern ids, not lexical ranks. Route
+                 * ordering through the used-id lookup/rank executor;
+                 * equality can keep using the fused integer kernels. */
+                if ((op == OP_LT || op == OP_LE || op == OP_GT || op == OP_GE) &&
+                    (op_child(g, node, 0)->out_type == RAY_SYM ||
+                     (s2 != 0xFF && op_child(g, node, 1)->out_type == RAY_SYM)))
+                    EXPR_BAIL(EXPR_BAIL_OTHER);
 
                 /* Determine output type */
                 if (op == OP_CAST)
@@ -3239,9 +3247,9 @@ static void binary_range(ray_op_t* op, int8_t out_type,
         } else if (l_esz == 4) {
             /* SYM W32 stores unsigned IDs; for EQ/NE the unsigned compare
              * gives the same result as the signed compare against r_i64
-             * (truncated to 32-bit).  For ordering ops we keep the signed
-             * compare (matches the previous generic-path semantics for
-             * I32/DATE/TIME). */
+             * (truncated to 32-bit). Ordered SYM/SYM and SYM/STR
+             * comparisons go to exec_sym_order; the raw ordered arm is
+             * retained for mixed SYM/numeric DAG operands. */
             if (RAY_IS_SYM(lhs->type)) {
                 if (opc == OP_EQ || opc == OP_NE) {
                     const uint32_t* d = (const uint32_t*)lbase;
@@ -3738,6 +3746,14 @@ ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* 
     } else if (!l_scalar && r_scalar) {
         len = lhs->len;
     }
+
+    int8_t lt = lhs->type < 0 ? (int8_t)-lhs->type : lhs->type;
+    int8_t rt = rhs->type < 0 ? (int8_t)-rhs->type : rhs->type;
+    if ((op->opcode == OP_LT || op->opcode == OP_LE ||
+         op->opcode == OP_GT || op->opcode == OP_GE) &&
+        ((lt == RAY_SYM && (rt == RAY_SYM || rt == RAY_STR)) ||
+         (rt == RAY_SYM && lt == RAY_STR)))
+        return exec_sym_order(op->opcode, lhs, rhs, l_scalar, r_scalar);
 
     if (op->opcode == OP_POW) {
         int8_t lt = ew_value_base_type(lhs);

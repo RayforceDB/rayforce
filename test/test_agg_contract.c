@@ -1,6 +1,9 @@
 /* Scalar/grouped semantic contracts, independent of optimized admission.
  * Baseline census: docs/aggregation-type-census.csv. Extend this table when
  * language semantics change; adding a vtable alone must not change it. */
+#if defined(__linux__) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L   /* posix_fadvise, fdatasync */
+#endif
 #include "test.h"
 #include "test_rfl.h"
 #include "ops/agg_engine.h"
@@ -13,7 +16,9 @@
 #include "ops/internal.h"
 #include "lang/internal.h"
 #include "lang/env.h"
+#include "table/sym.h"
 #include <math.h>
+#include <stdlib.h>
 
 static ray_runtime_t* contract_runtime;
 static uint32_t contract_cores;
@@ -2156,7 +2161,752 @@ static test_result_t test_first_n_take(void) {
     PASS();
 }
 
+#if defined(__linux__)
+#include <dirent.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/resource.h>
+
+/* --------------------------------------------------------------------------
+ * Selects over a mapped table whose pages were evicted: the scan read-ahead
+ * registers the columns (select level, zone gate from the filter) and the
+ * grouping kernels report their rows, so every route below reads ahead.
+ * Results must equal the same selects over the in-memory table.
+ * -------------------------------------------------------------------------- */
+#define PFS_ROOT "/tmp/rayforce_test_pf_select"
+#define PFS_DIR  PFS_ROOT "/t/"
+
+static bool pfs_evict(void) {
+    DIR* d = opendir(PFS_DIR);
+    if (!d) return false;
+    bool ok = true;
+    char path[512];
+    for (struct dirent* e; (e = readdir(d)); ) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        snprintf(path, sizeof path, "%s%s", PFS_DIR, e->d_name);
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) continue;
+        if (fdatasync(fd) != 0 || posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) != 0) ok = false;
+        close(fd);
+    }
+    closedir(d);
+    return ok;
+}
+
+static bool pfs_col_resident(const char* name) {
+    ray_t* m = ray_eval_str("pfs_m");
+    if (!m || RAY_IS_ERR(m)) { if (m) ray_error_free(m); return true; }
+    ray_t* col = ray_table_get_col(m, ray_sym_intern(name, strlen(name)));
+    bool res = !col || col->mmod != 1 ||
+               ray_vm_resident(ray_data(col), (size_t)col->len * ray_sym_elem_size(col->type, col->attrs));
+    ray_release(m);
+    return res;
+}
+
+static test_result_t test_select_read_ahead_mapped(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    (void)ray_test_rm_rf(PFS_ROOT);
+    ray_t* r = ray_eval_str(
+        "(set pfs_i (til 400000))"
+        "(set pfs_t (table [k d g u v] (list (div pfs_i 1000) (+ 2013.07.01 (div pfs_i 50000))"
+        " (as 'I16 (% pfs_i 50)) (% (* pfs_i 7919) 1000003) (as 'I32 (% pfs_i 977)))))"
+        "(.db.splayed.set \"" PFS_DIR "\" pfs_t)"
+        "(set pfs_m (.db.splayed.get \"" PFS_DIR "\"))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    if (!pfs_evict() || pfs_col_resident("u")) {
+        (void)ray_test_rm_rf(PFS_ROOT);
+        SKIP("page cache eviction has no effect here");
+    }
+
+    /* X is the table: the mapped one first, then the in-memory oracle. */
+    static const struct { const char* q; agg_route_t route; } cases[] = {
+        { "(select {from:X by:g c:(count v) s:(sum v) where:(and (== k 123) (within d [2013.07.03 2013.07.05])) asc:g})", AGG_ROUTE_NONE },
+        { "(select {from:X c:(count v) s:(sum u) where:(> k 390)})", AGG_ROUTE_NONE },
+        { "(select {from:X by:g s:(sum v) asc:g})", AGG_ROUTE_V2_DENSE },
+        { "(select {from:(select {from:X by:u c:(count v)}) n:(count c) s:(sum c)})", AGG_ROUTE_V2_RADIX },
+        { "(select {from:X by:g n:(count (distinct u)) asc:g})", AGG_ROUTE_NONE },
+        { "(select {from:X by:[u g] c:(count v) take:3})", AGG_ROUTE_NONE },
+        { "(select {from:X s:(sum (+ u v)) where:(> v 5)})", AGG_ROUTE_NONE },
+        { "(select {from:X where:(> v 970) asc:u take:5})", AGG_ROUTE_NONE },
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        char qm[512], qt[512];
+        const char* x = strstr(cases[c].q, "X");
+        snprintf(qm, sizeof qm, "%.*spfs_m%s", (int)(x - cases[c].q), cases[c].q, x + 1);
+        snprintf(qt, sizeof qt, "%.*spfs_t%s", (int)(x - cases[c].q), cases[c].q, x + 1);
+        TEST_ASSERT_TRUE(pfs_evict());
+        agg_route_reset();
+        ray_t* got = ray_eval_str(qm);
+        agg_route_stats_t stats = agg_route_stats();
+        ray_t* want = ray_eval_str(qt);
+        bool ok = got && !RAY_IS_ERR(got) && want && !RAY_IS_ERR(want);
+        if (ok) {
+            ray_t* fg = ray_fmt(got, 0);
+            ray_t* fw = ray_fmt(want, 0);
+            ok = fg && fw && ray_str_len(fg) == ray_str_len(fw) &&
+                 memcmp(ray_str_ptr(fg), ray_str_ptr(fw), ray_str_len(fw)) == 0;
+            if (fg) ray_release(fg);
+            if (fw) ray_release(fw);
+        }
+        if (got) { if (RAY_IS_ERR(got)) ray_error_free(got); else ray_release(got); }
+        if (want) { if (RAY_IS_ERR(want)) ray_error_free(want); else ray_release(want); }
+        TEST_ASSERT_FMT(ok, "case %zu: mapped result differs from the in-memory one", c);
+        if (cases[c].route != AGG_ROUTE_NONE)
+            TEST_ASSERT_FMT(stats.routes[cases[c].route] >= 1,
+                            "case %zu: expected route %d", c, (int)cases[c].route);
+    }
+    r = ray_eval_str("(set pfs_m 0)");
+    if (r) ray_release(r);
+    (void)ray_test_rm_rf(PFS_ROOT);
+    PASS();
+}
+
+/* A filter the zone indexes say nothing about (an expression) may keep a
+ * handful of rows.  The columns read only after it are then requested for
+ * the pages those rows fall on, not whole — judged on the final selection
+ * of an `and`, not its first conjunct; when it keeps most rows they are
+ * read whole.  Results match the in-memory table either way. */
+static test_result_t test_select_read_ahead_sparse_filter(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    (void)ray_test_rm_rf(PFS_ROOT);
+    ray_t* r = ray_eval_str(
+        "(set pfs_i (til 400000))"
+        "(set pfs_t (table [u w s] (list (% (* pfs_i 7919) 1000003) (* pfs_i 3)"
+        " (as 'SYM (map (fn [k] (format \"s%\" (% k 10000))) pfs_i)))))"
+        "(.db.splayed.set \"" PFS_DIR "\" pfs_t)"
+        "(set pfs_m (.db.splayed.get \"" PFS_DIR "\"))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    if (!pfs_evict() || pfs_col_resident("w")) {
+        (void)ray_test_rm_rf(PFS_ROOT);
+        SKIP("page cache eviction has no effect here");
+    }
+    static const struct { const char* q; bool whole; } cases[] = {
+        { "(select {from:X s:(sum w) c:(count w) where:(== (% u 100000) 42)})", false },
+        /* an `and` runs as a chain of filters, the cheap dense one first */
+        { "(select {from:X s:(sum w) c:(count w) where:(and (like s \"s1234\") (!= s \"s1\"))})", false },
+        { "(select {from:X s:(sum w) c:(count w) where:(> (% u 10) 2)})", true },
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        char qm[256], qt[256];
+        const char* x = strstr(cases[c].q, "X");
+        snprintf(qm, sizeof qm, "%.*spfs_m%s", (int)(x - cases[c].q), cases[c].q, x + 1);
+        snprintf(qt, sizeof qt, "%.*spfs_t%s", (int)(x - cases[c].q), cases[c].q, x + 1);
+        TEST_ASSERT_TRUE(pfs_evict());
+        ray_t* got = ray_eval_str(qm);
+        bool resident = pfs_col_resident("w");
+        ray_t* want = ray_eval_str(qt);
+        bool ok = got && !RAY_IS_ERR(got) && want && !RAY_IS_ERR(want);
+        if (ok) {
+            ray_t* fg = ray_fmt(got, 0);
+            ray_t* fw = ray_fmt(want, 0);
+            ok = fg && fw && ray_str_len(fg) == ray_str_len(fw) &&
+                 memcmp(ray_str_ptr(fg), ray_str_ptr(fw), ray_str_len(fw)) == 0;
+            if (fg) ray_release(fg);
+            if (fw) ray_release(fw);
+        }
+        if (got) { if (RAY_IS_ERR(got)) ray_error_free(got); else ray_release(got); }
+        if (want) { if (RAY_IS_ERR(want)) ray_error_free(want); else ray_release(want); }
+        TEST_ASSERT_FMT(ok, "case %zu: mapped result differs from the in-memory one", c);
+        TEST_ASSERT_FMT(resident == cases[c].whole,
+                        "case %zu: column w %s after the query", c,
+                        resident ? "read whole" : "not read whole");
+    }
+    r = ray_eval_str("(set pfs_m 0)");
+    if (r) ray_release(r);
+    (void)ray_test_rm_rf(PFS_ROOT);
+    PASS();
+}
+
+/* The route gate of a distinct count (#760) samples before the select
+ * runs: the rows a where: keeps (query_cd_gate_where_rows), the key and
+ * value columns at them (agg_group_card_sample), and a key column whole
+ * when the sample leaves its count open (ray_cd_two_pass_preferred).  Over
+ * a mapped table whose pages were evicted each page read is asked for
+ * ahead, in parallel, as the select's own scan asks for its — the bytes
+ * asked for (ray_vm_willneed_bytes) cover what the step reads, and its
+ * major faults stay near zero where a fault per page read would be
+ * thousands.  (The faults alone would not tell: the kernel's own
+ * read-ahead follows a sweep of pages in order, and most of its faults
+ * are then minor.)  A step's columns are its own: pages a step faulted in
+ * stay mapped and cannot be evicted for the next. */
+static long cd_major_faults(void) {
+    struct rusage u;
+    getrusage(RUSAGE_SELF, &u);
+    return u.ru_majflt;
+}
+
+static test_result_t test_cd_gate_read_ahead(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    (void)ray_test_rm_rf(PFS_ROOT);
+    enum { FAULTS_MAX = 64 };
+
+    /* w: 16 MB (4,096 pages); k, x, t: 32 MB each; t is the row number,
+     * sorted, with the chunk-zone index a splayed column carries */
+    enum { N = 4194304 };
+    ray_t* r = ray_eval_str(
+        "(set pfs_i (til 4194304))"
+        "(set pfs_t (table [w k x t] (list (as 'I32 (% pfs_i 977)) (% pfs_i 1000)"
+        " (% (* pfs_i 7919) 2000003) pfs_i)))"
+        "(.db.splayed.set \"" PFS_DIR "\" pfs_t)"
+        "(set pfs_m (.db.splayed.get \"" PFS_DIR "\"))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    if (!pfs_evict() || pfs_col_resident("w")) {
+        (void)ray_test_rm_rf(PFS_ROOT);
+        SKIP("page cache eviction has no effect here");
+    }
+    ray_t* m = ray_eval_str("pfs_m");
+    ray_t* pred = ray_eval_str("(quote (< w 100))");
+    TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m) && pred && !RAY_IS_ERR(pred));
+    ray_t* k = ray_table_get_col(m, ray_sym_intern("k", 1));
+    ray_t* x = ray_table_get_col(m, ray_sym_intern("x", 1));
+    TEST_ASSERT_TRUE(k && x && k->mmod == 1 && x->mmod == 1);
+
+    /* the where: sample — 262,144 rows of w, 64 to a page: every page */
+    const int64_t* rows = NULL;
+    int64_t nrows = 0, pop = 0;
+    long f0 = cd_major_faults();
+    uint64_t b0 = ray_vm_willneed_bytes();
+    ray_t* hdr = query_cd_gate_where_rows(m, pred, N, &rows, &nrows, &pop);
+    long f_where = cd_major_faults() - f0;
+    uint64_t b_where = ray_vm_willneed_bytes() - b0;
+    TEST_ASSERT_NOT_NULL(hdr);
+    TEST_ASSERT_FMT(nrows > 24000 && nrows < 30000, "where sample keeps %lld of 262,144", (long long)nrows);
+    TEST_ASSERT_FMT(b_where >= (uint64_t)N * 4, "where sample asked for %llu bytes, w is %llu",
+                    (unsigned long long)b_where, (unsigned long long)N * 4);
+    TEST_ASSERT_FMT(f_where <= FAULTS_MAX, "where sample: %ld major faults", f_where);
+
+    /* a slice of the sorted column: the zone gate rules out every chunk
+     * but the two (64 K rows each) the window falls in, so the sample is
+     * their rows — every survivor, the population exact — and reads a
+     * sixteenth of t at most, not the column */
+    ray_t* pred_t = ray_eval_str("(quote (and (>= t 2000000) (< t 2040000)))");
+    TEST_ASSERT_TRUE(pred_t && !RAY_IS_ERR(pred_t) && !pfs_col_resident("t"));
+    const int64_t* rows_t = NULL;
+    int64_t nrows_t = 0, pop_t = 0;
+    f0 = cd_major_faults();
+    b0 = ray_vm_willneed_bytes();
+    ray_t* hdr_t = query_cd_gate_where_rows(m, pred_t, N, &rows_t, &nrows_t, &pop_t);
+    long f_slice = cd_major_faults() - f0;
+    uint64_t b_slice = ray_vm_willneed_bytes() - b0;
+    TEST_ASSERT_NOT_NULL(hdr_t);
+    TEST_ASSERT_FMT(nrows_t == 40000 && pop_t == 40000, "slice sample keeps %lld for %lld",
+                    (long long)nrows_t, (long long)pop_t);
+    TEST_ASSERT_FMT(b_slice >= (uint64_t)40000 * 8 && b_slice <= (uint64_t)N * 8 / 16,
+                    "slice sample asked for %llu bytes of t's %llu", (unsigned long long)b_slice,
+                    (unsigned long long)N * 8);
+    TEST_ASSERT_FMT(f_slice <= FAULTS_MAX, "slice sample: %ld major faults", f_slice);
+    scratch_free(hdr_t);
+    ray_release(pred_t);
+
+    /* the estimate over a contiguous slice, 1% of the rows: the span the
+     * sampled rows cover is asked for — a row per page and more there —
+     * not the columns whole */
+    TEST_ASSERT_TRUE(!pfs_col_resident("k") && !pfs_col_resident("x"));
+    ray_t* cols[2] = { k, x };
+    int64_t est[2], kp = 0, kmax = 0, ka = 0;
+    enum { SLICE = N / 100 };
+    int64_t* slice = malloc((size_t)SLICE * sizeof(int64_t));
+    TEST_ASSERT_NOT_NULL(slice);
+    for (int64_t i = 0; i < SLICE; i++) slice[i] = N / 2 + i;
+    b0 = ray_vm_willneed_bytes();
+    TEST_ASSERT_TRUE(agg_group_card_sample(cols, 2, 1, slice, SLICE, 0, est, &kp, &kmax, &ka));
+    uint64_t b_span = ray_vm_willneed_bytes() - b0;
+    free(slice);
+    /* the span runs from the first sampled row to the last, a window short */
+    TEST_ASSERT_FMT(b_span >= (uint64_t)SLICE * 16 * 9 / 10 && b_span <= (uint64_t)SLICE * 16 * 4,
+                    "slice estimate asked for %llu bytes, the slice of k and x is %llu",
+                    (unsigned long long)b_span, (unsigned long long)SLICE * 16);
+
+    /* the estimate over the survivors: a tenth of the rows, 50 to a page
+     * of k and x — the columns are asked for whole */
+    f0 = cd_major_faults();
+    b0 = ray_vm_willneed_bytes();
+    TEST_ASSERT_TRUE(agg_group_card_sample(cols, 2, 1, rows, nrows, pop, est, &kp, &kmax, &ka));
+    long f_est = cd_major_faults() - f0;
+    uint64_t b_est = ray_vm_willneed_bytes() - b0;
+    scratch_free(hdr);
+    TEST_ASSERT_FMT(est[0] >= 900 && est[0] <= 1100, "k estimate %lld", (long long)est[0]);
+    /* the span from the first sampled row to the last: the columns but a few rows */
+    TEST_ASSERT_FMT(b_est >= (uint64_t)N * 16 * 15 / 16, "estimate asked for %llu bytes, k and x are %llu",
+                    (unsigned long long)b_est, (unsigned long long)N * 16);
+    TEST_ASSERT_FMT(f_est <= FAULTS_MAX, "estimate: %ld major faults", f_est);
+    ray_release(pred);
+    ray_release(m);
+    r = ray_eval_str("(set pfs_m 0)");
+    if (r) ray_release(r);
+    (void)ray_test_rm_rf(PFS_ROOT);
+
+    /* The gate over a selection sparser than a row per page: the pages of
+     * the sampled rows alone are asked for.  k3 (272 MB, 66,406 pages; a
+     * million values) over 33,000 rows, one to every other page: 32,768
+     * of them are sampled, read as distinct, and the estimate stands at
+     * the span, a million — past the sample's reach and short of the
+     * many-groups mark — so the count is confirmed in full, over the half
+     * of the column the estimate never touched. */
+    enum { N3 = 34000000, SEL3 = 33000 };
+    r = ray_eval_str(
+        "(set pfs_j (til 34000000))"
+        "(set pfs_t (table [k3 x3] (list (% (* pfs_j 7919) 1000000) (as 'U8 (% pfs_j 200)))))"
+        "(set pfs_j 0)"
+        "(.db.splayed.set \"" PFS_DIR "\" pfs_t)"
+        "(set pfs_t 0)"
+        "(set pfs_m (.db.splayed.get \"" PFS_DIR "\"))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    TEST_ASSERT_TRUE(pfs_evict() && !pfs_col_resident("k3"));
+    m = ray_eval_str("pfs_m");
+    TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m));
+    ray_t* k3 = ray_table_get_col(m, ray_sym_intern("k3", 2));
+    ray_t* x3 = ray_table_get_col(m, ray_sym_intern("x3", 2));
+    TEST_ASSERT_TRUE(k3 && x3 && k3->mmod == 1 && (size_t)k3->len * 8 / 4096 > (size_t)SEL3);
+    int64_t* sel = malloc((size_t)SEL3 * sizeof(int64_t));
+    TEST_ASSERT_NOT_NULL(sel);
+    for (int64_t i = 0; i < SEL3; i++) sel[i] = i * 1030;
+    f0 = cd_major_faults();
+    b0 = ray_vm_willneed_bytes();
+    bool two_pass = ray_cd_two_pass_preferred(&k3, 1, x3, sel, SEL3, 0, 4);
+    long f_gate = cd_major_faults() - f0;
+    uint64_t b_gate = ray_vm_willneed_bytes() - b0;
+    free(sel);
+    TEST_ASSERT_FALSE(two_pass);   /* a million groups counted, not many: the slices */
+    /* the sampled rows' pages of k3 (one each) for the estimate, and k3
+     * whole for the count; x3 besides */
+    const uint64_t b_need = (uint64_t)N3 * 8 + (uint64_t)SEL3 * 4096;
+    TEST_ASSERT_FMT(b_gate >= b_need, "gate asked for %llu bytes, needs %llu",
+                    (unsigned long long)b_gate, (unsigned long long)b_need);
+    TEST_ASSERT_FMT(f_gate <= FAULTS_MAX, "gate: %ld major faults", f_gate);
+
+    ray_release(m);
+    r = ray_eval_str("(set pfs_m 0)");
+    if (r) ray_release(r);
+    (void)ray_test_rm_rf(PFS_ROOT);
+    PASS();
+}
+#endif
+
+/* The planner's sampled cardinality estimates (agg_group_card_sample,
+ * agg_group_card_estimate; #760).  1,048,576 rows are sampled one row per
+ * window of 32, so a value filling one such window is a sampled singleton. */
+static test_result_t test_card_estimate(void) {
+    const int64_t N = 1048576;
+    ray_t* setup = ray_eval_str("(set cr (til 1048576))");
+    TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+    ray_release(setup);
+    ray_t* c[3];
+    int64_t est[3], kp = 0, ka = 0;
+
+    /* every row distinct: the sample holds singletons only; the Chao1
+     * correction raises its count (the sample size without it) past the
+     * span, which caps the estimate at the rows */
+    c[0] = ray_eval_str("cr");
+    {
+        int64_t all = agg_group_card_estimate(c, 1, N);   /* the sampled span: a window short of N at each end */
+        TEST_ASSERT_FMT(all >= N - 64 && all <= N, "every row distinct: %lld", (long long)all);
+    }
+    ray_release(c[0]);
+
+    /* 45 values: no singletons, the count itself */
+    c[0] = ray_eval_str("(% cr 45)");
+    TEST_ASSERT_EQ_I(agg_group_card_estimate(c, 1, N), 45);
+    ray_release(c[0]);
+
+    /* 1,000 values on one window of 32 rows each and one value elsewhere:
+     * Chao1 reads the 1,000 sampled singletons as half a million values;
+     * the span caps an integer key at the 1,001 it can hold, the domain's
+     * count a SYM key (the process-wide domain here, so at least 1,001 and
+     * far below the half million) */
+    c[0] = ray_eval_str("(* (< cr 32000) (+ 1 (div cr 32)))");
+    TEST_ASSERT_EQ_I(agg_group_card_estimate(c, 1, N), 1001);
+    /* the same key as a tuple beside a 2-value column: 2,002 tuples, which
+     * the tuple's Chao1 overstates as the key's was and the product of the
+     * two spans caps */
+    c[1] = c[0];
+    c[0] = ray_eval_str("(% cr 2)");
+    TEST_ASSERT_TRUE(agg_group_card_sample(c, 2, 2, NULL, N, 0, est, &kp, NULL, &ka));
+    TEST_ASSERT_EQ_I(est[0], 2);
+    TEST_ASSERT_EQ_I(est[1], 1001);
+    TEST_ASSERT_EQ_I(kp, 2002);
+    TEST_ASSERT_EQ_I(ka, 2002);
+    ray_release(c[0]); ray_release(c[1]);
+    /* the same key as symbols new to the process, so their codes are
+     * contiguous: the span of the sampled codes caps it at the 1,001 as
+     * well, and a symbol interned afterwards (the domain is process-wide)
+     * leaves the estimate where it was */
+    c[0] = ray_eval_str("(as 'SYM (+ 9000000 (* (< cr 32000) (+ 1 (div cr 32)))))");
+    TEST_ASSERT_EQ_I(agg_group_card_estimate(c, 1, N), 1001);
+    {
+        int64_t dom = ray_sym_domain_count(ray_sym_vec_domain(c[0]));
+        ray_t* later = ray_eval_str("'interned_after_the_key_column");
+        ray_release(later);
+        TEST_ASSERT_TRUE(ray_sym_domain_count(ray_sym_vec_domain(c[0])) > dom);
+    }
+    TEST_ASSERT_EQ_I(agg_group_card_estimate(c, 1, N), 1001);
+    ray_release(c[0]);
+
+    /* keys that repeat with the row number: a period equal to the stride,
+     * which a fixed offset would read as one value */
+    c[0] = ray_eval_str("(% cr 32)");
+    TEST_ASSERT_EQ_I(agg_group_card_estimate(c, 1, N), 32);
+    ray_release(c[0]);
+    /* composites of periods 1,000 and 1,009 or 1,013 over 10 M rows, one
+     * row sampled per window of 305: 1,009,000 or 1,013,000 groups, each
+     * on ten rows, and beside a 50-value X (which 1,000 absorbs) as many
+     * (key, value) tuples as groups.  An offset nearly linear in the window
+     * index keeps the sampled rows a progression and these keys at a nearly
+     * fixed phase: the first pair's tuples with X read as ten million (no
+     * tuple seen twice, the Chao1 at the cap), the second pair's groups as
+     * a tenth of them (too many seen twice).  The hashed offset's
+     * collisions are a random sample's, and the Chao1 lands within a fifth
+     * of the count. */
+    setup = ray_eval_str("(set c10 (til 10000000))");
+    TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+    ray_release(setup);
+    c[0] = ray_eval_str("(% c10 1000)");
+    c[1] = ray_eval_str("(% c10 1009)");
+    c[2] = ray_eval_str("(% c10 50)");
+    TEST_ASSERT_TRUE(agg_group_card_sample(c, 3, 2, NULL, 10000000, 0, est, &kp, NULL, &ka));
+    TEST_ASSERT_EQ_I(est[0], 1000);
+    TEST_ASSERT_EQ_I(est[1], 1009);
+    TEST_ASSERT_EQ_I(est[2], 50);
+    TEST_ASSERT_FMT(kp >= 800000 && kp <= 1009000, "1,000 x 1,009 groups: %lld", (long long)kp);
+    TEST_ASSERT_FMT(ka >= 800000 && ka <= 1250000, "1,000 x 1,009 x 50 tuples: %lld", (long long)ka);
+    ray_release(c[1]);
+    c[1] = ray_eval_str("(% c10 1013)");
+    TEST_ASSERT_TRUE(agg_group_card_sample(c, 3, 2, NULL, 10000000, 0, est, &kp, NULL, &ka));
+    TEST_ASSERT_EQ_I(est[1], 1013);
+    TEST_ASSERT_FMT(kp >= 800000 && kp <= 1013000, "1,000 x 1,013 groups: %lld", (long long)kp);
+    TEST_ASSERT_FMT(ka >= 800000 && ka <= 1250000, "1,000 x 1,013 x 50 tuples: %lld", (long long)ka);
+    ray_release(c[0]); ray_release(c[1]); ray_release(c[2]);
+    /* a key that is a progression in the row number — (i x 7919) mod N, a
+     * permutation of the rows — is all distinct, and reads so */
+    c[0] = ray_eval_str("(% (* cr 7919) 1048576)");
+    {
+        int64_t all = agg_group_card_estimate(c, 1, N);
+        TEST_ASSERT_FMT(all >= 900000 && all <= N, "a permutation of the rows: %lld", (long long)all);
+    }
+    ray_release(c[0]);
+
+    /* a composite whose first column follows from the second: the product
+     * of the columns says 1,024 groups, the tuple 256 */
+    c[0] = ray_eval_str("(div (% (div cr 4096) 256) 64)");
+    c[1] = ray_eval_str("(% (div cr 4096) 256)");
+    TEST_ASSERT_TRUE(agg_group_card_sample(c, 2, 2, NULL, N, 0, est, &kp, NULL, &ka));
+    TEST_ASSERT_EQ_I(est[0], 4);
+    TEST_ASSERT_EQ_I(est[1], 256);
+    TEST_ASSERT_EQ_I(agg_group_card_estimate(c, 2, N), 1024);
+    TEST_ASSERT_EQ_I(kp, 256);
+    TEST_ASSERT_EQ_I(ka, 256);
+    ray_release(c[0]); ray_release(c[1]);
+
+    /* a sorted composite in runs of 8 rows, below the stride: the stride
+     * sees every sample distinct and its Chao1 saturates at the rows; the
+     * blocks of adjacent rows read the runs — 131,072 groups — and, with a
+     * value alternating within each run, 262,144 (key, value) tuples */
+    c[0] = ray_eval_str("(div cr 8192)");
+    c[1] = ray_eval_str("(div cr 8)");
+    c[2] = ray_eval_str("(% cr 2)");
+    TEST_ASSERT_TRUE(agg_group_card_sample(c, 3, 2, NULL, N, 0, est, &kp, NULL, &ka));
+    TEST_ASSERT_FMT(est[1] >= 131070 && est[1] <= 131072, "runs of 8: span %lld", (long long)est[1]);
+    TEST_ASSERT_FMT(kp >= 120000 && kp <= 145000, "sorted prefix: %lld groups", (long long)kp);
+    TEST_ASSERT_FMT(ka >= 240000 && ka <= 290000, "sorted prefix: %lld tuples", (long long)ka);
+    /* 32 sorted groups of 32,768 rows: the stride is exact, and the blocks
+     * (one run each) do not override it */
+    ray_release(c[0]);
+    c[0] = ray_eval_str("(div cr 32768)");
+    TEST_ASSERT_TRUE(agg_group_card_sample(c, 2, 1, NULL, N, 0, est, &kp, NULL, NULL));
+    TEST_ASSERT_EQ_I(est[0], 32);
+    TEST_ASSERT_EQ_I(kp, 32);
+    ray_release(c[0]); ray_release(c[1]); ray_release(c[2]);
+
+    /* the largest group's rows: 45 equal groups, and a key whose first
+     * value holds half the rows (2000 / (1 + j), j cycling through 2000) */
+    int64_t kmax = 0;
+    c[0] = ray_eval_str("(% cr 45)");
+    TEST_ASSERT_TRUE(agg_group_card_sample(c, 1, 1, NULL, N, 0, est, &kp, &kmax, NULL));
+    TEST_ASSERT_FMT(kmax >= N / 45 - N / 450 && kmax <= N / 45 + N / 450,
+                    "45 equal groups: the largest holds %lld rows", (long long)kmax);
+    ray_release(c[0]);
+    c[0] = ray_eval_str("(div 2000 (+ 1 (% cr 2000)))");
+    TEST_ASSERT_TRUE(agg_group_card_sample(c, 1, 1, NULL, N, 0, est, &kp, &kmax, NULL));
+    TEST_ASSERT_FMT(kmax >= N / 2 - N / 40 && kmax <= N / 2 + N / 40,
+                    "a value on half the rows: the largest group holds %lld rows", (long long)kmax);
+    ray_release(c[0]);
+
+    /* a selection's rows: a key that is 0 on 88 rows in 100 and one of
+     * 1,000 values on the rest.  Over the table the zero is the
+     * largest group by far; over the rows a `where:` keeps, the 1,000
+     * groups are equal and the Chao1 sees them exactly. */
+    c[0] = ray_eval_str("(* (>= (% cr 100) 88) (+ 1 (% (div cr 100) 1000)))");
+    {
+        const int64_t* kd = (const int64_t*)ray_data(c[0]);
+        int64_t* sel = malloc((size_t)N * sizeof(int64_t));
+        TEST_ASSERT_NOT_NULL(sel);
+        int64_t nsel = 0;
+        for (int64_t i = 0; i < N; i++) if (kd[i] != 0) sel[nsel++] = i;
+        TEST_ASSERT_TRUE(nsel > N / 10 && nsel < N / 8);
+        TEST_ASSERT_TRUE(agg_group_card_sample(c, 1, 1, NULL, N, 0, est, &kp, &kmax, NULL));
+        TEST_ASSERT_FMT(kmax > N * 4 / 5, "over the table: the zero holds %lld rows", (long long)kmax);
+        TEST_ASSERT_TRUE(agg_group_card_sample(c, 1, 1, sel, nsel, 0, est, &kp, &kmax, NULL));
+        TEST_ASSERT_EQ_I(est[0], 1000);
+        TEST_ASSERT_EQ_I(kp, 1000);
+        TEST_ASSERT_FMT(kmax < nsel / 500, "over the selection: the largest group holds %lld of %lld rows",
+                        (long long)kmax, (long long)nsel);
+        free(sel);
+    }
+    ray_release(c[0]);
+
+    /* a list sampled from a larger population: 2,048 rows of `cr`, one per
+     * 512, describe the million rows they were drawn from — every one a
+     * singleton, and the Chao1 reaches for the population's span — and
+     * only themselves without the population */
+    {
+        int64_t* sel = malloc(2048 * sizeof(int64_t));
+        TEST_ASSERT_NOT_NULL(sel);
+        for (int64_t i = 0; i < 2048; i++) sel[i] = i * 512;
+        c[0] = ray_eval_str("cr");
+        TEST_ASSERT_TRUE(agg_group_card_sample(c, 1, 1, sel, 2048, N, est, NULL, NULL, NULL));
+        TEST_ASSERT_FMT(est[0] > N / 2 && est[0] <= N, "2,048 of a million rows: %lld", (long long)est[0]);
+        TEST_ASSERT_TRUE(agg_group_card_sample(c, 1, 1, sel, 2048, 0, est, NULL, NULL, NULL));
+        TEST_ASSERT_EQ_I(est[0], 2048);
+        ray_release(c[0]);
+        free(sel);
+    }
+
+    /* a key type the estimate does not cover */
+    c[0] = ray_eval_str("(as 'F64 cr)");
+    TEST_ASSERT_FALSE(agg_group_card_sample(c, 1, 1, NULL, N, 0, est, NULL, NULL, NULL));
+    TEST_ASSERT_EQ_I(agg_group_card_estimate(c, 1, N), -1);
+    ray_release(c[0]);
+    PASS();
+}
+
+/* The route gate for a grouped distinct count (ray_cd_two_pass_preferred,
+ * #756): the two-pass rewrite (true) against the slice dedup (false), from
+ * the estimates above over 1,048,576 rows.  Each case turns on one rule. */
+static test_result_t test_cd_route(void) {
+    const int64_t N = 1048576;
+    ray_t* setup = ray_eval_str("(set cr (til 1048576))");
+    TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+    ray_release(setup);
+    ray_t* k[2];
+    ray_t* x;
+
+    /* dense: 45 groups x 100 values pack within the rows */
+    k[0] = ray_eval_str("(% cr 45)");
+    x = ray_eval_str("(% cr 100)");
+    TEST_ASSERT_TRUE(ray_cd_two_pass_preferred(k, 1, x, NULL, N, 0, 28));
+    ray_release(x);
+    /* 45 groups x a million values: the (K, X) pass would be radix */
+    x = ray_eval_str("cr");
+    TEST_ASSERT_FALSE(ray_cd_two_pass_preferred(k, 1, x, NULL, N, 0, 28));
+    ray_release(k[0]); ray_release(x);
+
+    /* 100,000 groups, below the scatter's 256 K: the slices, though the
+     * (K, X) tuples (X determines K) would dedup to a fifth of the rows */
+    k[0] = ray_eval_str("(% cr 100000)");
+    x = ray_eval_str("(% cr 200000)");
+    TEST_ASSERT_FALSE(ray_cd_two_pass_preferred(k, 1, x, NULL, N, 0, 28));
+    ray_release(k[0]); ray_release(x);
+
+    /* 524,288 groups of 19 rows over 10 M rows, within the band: the
+     * tuples decide — a twentieth of the rows (K determines X) take the
+     * rewrite, every row distinct the slices */
+    setup = ray_eval_str("(set c10 (til 10000000))");
+    TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+    ray_release(setup);
+    k[0] = ray_eval_str("(% c10 524288)");
+    x = ray_eval_str("(% c10 262144)");
+    TEST_ASSERT_TRUE(ray_cd_two_pass_preferred(k, 1, x, NULL, 10000000, 0, 28));
+    ray_release(x);
+    x = ray_eval_str("c10");
+    TEST_ASSERT_FALSE(ray_cd_two_pass_preferred(k, 1, x, NULL, 10000000, 0, 28));
+    ray_release(k[0]); ray_release(x);
+    /* the same two over a sorted key, read through the blocks */
+    k[0] = ray_eval_str("(div c10 19)");
+    x = ray_eval_str("(div c10 38)");
+    TEST_ASSERT_TRUE(ray_cd_two_pass_preferred(k, 1, x, NULL, 10000000, 0, 28));
+    ray_release(x);
+    x = ray_eval_str("c10");
+    TEST_ASSERT_FALSE(ray_cd_two_pass_preferred(k, 1, x, NULL, 10000000, 0, 28));
+    ray_release(k[0]); ray_release(x);
+    /* a composite of periods 1,000 and 1,009 — 1,009,000 groups, within
+     * the band, whose tuples beside a 50-value X are the groups: the
+     * rewrite (the usual test data, which a sample at a fixed phase of the
+     * keys misread; see test_card_estimate) */
+    k[0] = ray_eval_str("(% c10 1000)");
+    k[1] = ray_eval_str("(% c10 1009)");
+    x = ray_eval_str("(% c10 50)");
+    TEST_ASSERT_TRUE(ray_cd_two_pass_preferred(k, 2, x, NULL, 10000000, 0, 28));
+    ray_release(k[0]); ray_release(k[1]); ray_release(x);
+
+    /* past a million groups: the rewrite whatever the tuples */
+    setup = ray_eval_str("(set c2 (til 2097152))");
+    TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+    ray_release(setup);
+    k[0] = ray_eval_str("c2");
+    x = ray_eval_str("(% c2 2)");
+    TEST_ASSERT_TRUE(ray_cd_two_pass_preferred(k, 1, x, NULL, 2 * N, 0, 28));
+    ray_release(k[0]); ray_release(x);
+
+    /* a dominant group: a key whose first value holds half the rows beside
+     * a million-value X takes the rewrite on 28 workers (the slice dedup
+     * would run that group on one), the slices on 2 (no parallel edge to
+     * lose); 2,000 equal groups take the slices */
+    k[0] = ray_eval_str("(div 2000 (+ 1 (% cr 2000)))");
+    x = ray_eval_str("cr");
+    TEST_ASSERT_TRUE(ray_cd_two_pass_preferred(k, 1, x, NULL, N, 0, 28));
+    TEST_ASSERT_FALSE(ray_cd_two_pass_preferred(k, 1, x, NULL, N, 0, 2));
+    ray_release(k[0]);
+    k[0] = ray_eval_str("(% cr 2000)");
+    TEST_ASSERT_FALSE(ray_cd_two_pass_preferred(k, 1, x, NULL, N, 0, 28));
+    ray_release(k[0]);
+    /* the same key behind a `where:` that drops its dominant value: over
+     * the table the zero on 88 rows in 100 reads as a dominant group and
+     * takes the rewrite; over the rows the selection keeps, 1,000 equal
+     * groups take the slices */
+    k[0] = ray_eval_str("(* (>= (% cr 100) 88) (+ 1 (% (div cr 100) 1000)))");
+    TEST_ASSERT_TRUE(ray_cd_two_pass_preferred(k, 1, x, NULL, N, 0, 28));
+    {
+        const int64_t* kd = (const int64_t*)ray_data(k[0]);
+        int64_t* sel = malloc((size_t)N * sizeof(int64_t));
+        TEST_ASSERT_NOT_NULL(sel);
+        int64_t nsel = 0;
+        for (int64_t i = 0; i < N; i++) if (kd[i] != 0) sel[nsel++] = i;
+        TEST_ASSERT_FALSE(ray_cd_two_pass_preferred(k, 1, x, sel, nsel, 0, 28));
+        free(sel);
+    }
+    ray_release(k[0]); ray_release(x);
+
+    /* a heavy-tailed key: a value of its own on every even row (five
+     * million values) and one of 50,000 values, each on 100 rows, on the
+     * odd ones.  The sample reads the even rows as singletons and the odd
+     * ones as the repeats of the whole tail, and its Chao1 lands around
+     * 100,000 — under the 256 K floor; the full approximate count says
+     * five million, and the rewrite is the route */
+    k[0] = ray_eval_str("(+ (* (== (% c10 2) 0) (+ 20000000 c10)) (* (== (% c10 2) 1) (% (div c10 2) 50000)))");
+    x = ray_eval_str("c10");
+    {
+        int64_t kc = 0;
+        TEST_ASSERT_TRUE(agg_group_card_sample(k, 1, 1, NULL, 10000000, 0, NULL, &kc, NULL, NULL));
+        TEST_ASSERT_FMT(kc > 32768 && kc < 1000000, "a heavy tail reads as %lld groups", (long long)kc);
+    }
+    TEST_ASSERT_TRUE(ray_cd_two_pass_preferred(k, 1, x, NULL, 10000000, 0, 28));
+    ray_release(k[0]); ray_release(x);
+
+    /* the rows a `where:` keeps, sampled (query_cd_gate_where_rows): the
+     * key above as a table column behind `(!= k 0)`.  Of 262,144 sampled
+     * rows, 12 in 100 survive, every survivor has a nonzero key, and the
+     * population scales to the table's 12%; the gate over them takes the
+     * slices (1,000 equal groups), over the whole table the rewrite (the
+     * zero's share).  A predicate keeping every row samples nothing. */
+    setup = ray_eval_str("(set Tw (table [k x] (list (* (>= (% cr 100) 88) (+ 1 (% (div cr 100) 1000))) cr)))");
+    TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+    ray_release(setup);
+    {
+        ray_t* tw = ray_eval_str("Tw");
+        ray_t* w  = ray_eval_str("(quote (!= k 0))");
+        ray_t* kc = ray_eval_str("(at Tw 'k)");
+        ray_t* xc = ray_eval_str("(at Tw 'x)");
+        TEST_ASSERT_NOT_NULL(tw); TEST_ASSERT_NOT_NULL(w); TEST_ASSERT_NOT_NULL(kc); TEST_ASSERT_NOT_NULL(xc);
+        const int64_t* rows = NULL;
+        int64_t nrows = 0, pop = 0;
+        ray_t* hdr = query_cd_gate_where_rows(tw, w, N, &rows, &nrows, &pop);
+        TEST_ASSERT_NOT_NULL(hdr);
+        TEST_ASSERT_FMT(nrows > 262144 / 10 && nrows < 262144 / 7, "sampled survivors: %lld", (long long)nrows);
+        TEST_ASSERT_FMT(pop > N / 10 && pop < N / 7, "scaled population: %lld", (long long)pop);
+        const int64_t* kd = (const int64_t*)ray_data(kc);
+        int64_t zeros = 0;
+        for (int64_t j = 0; j < nrows; j++) if (kd[rows[j]] == 0) zeros++;
+        TEST_ASSERT_EQ_I(zeros, 0);
+        k[0] = kc;
+        TEST_ASSERT_FALSE(ray_cd_two_pass_preferred(k, 1, xc, rows, nrows, pop, 28));
+        TEST_ASSERT_TRUE(ray_cd_two_pass_preferred(k, 1, xc, NULL, N, 0, 28));
+        scratch_free(hdr);
+        ray_release(w);
+        w = ray_eval_str("(quote (>= k 0))");
+        TEST_ASSERT_NULL(query_cd_gate_where_rows(tw, w, N, &rows, &nrows, &pop));
+        TEST_ASSERT_EQ_I(nrows, N);
+        /* the sampled table and its filter leave nothing behind: eight
+         * rounds hold no more memory than none */
+        ray_release(w);
+        w = ray_eval_str("(quote (!= k 0))");
+        {
+            ray_mem_trace_t mt;
+            TEST_ASSERT_TRUE(ray_mem_trace_begin());
+            for (int round = 0; round < 8; round++) {
+                ray_t* h = query_cd_gate_where_rows(tw, w, N, &rows, &nrows, &pop);
+                if (h) scratch_free(h);
+            }
+            ray_mem_trace_end(&mt);
+            TEST_ASSERT_FMT(mt.net_bytes < (1 << 20), "eight gate samples retain %lld bytes", (long long)mt.net_bytes);
+        }
+        ray_release(w); ray_release(kc); ray_release(xc); ray_release(tw);
+    }
+    /* the same key as a SYM column of narrow codes, as a mapped table's
+     * columns are (an in-memory one is 64-bit): the same codes written at
+     * 32 bits over the same domain.  The gather keeps the source's width —
+     * a 64-bit vector took the narrow codes as bytes of garbage — and the
+     * survivors are the rows whose integer twin is nonzero. */
+    {
+        ray_t* k64 = ray_eval_str("(as 'SYM (* (>= (% cr 100) 88) (+ 1 (% (div cr 100) 1000))))");
+        ray_t* ki  = ray_eval_str("(* (>= (% cr 100) 88) (+ 1 (% (div cr 100) 1000)))");
+        ray_t* xc  = ray_eval_str("cr");
+        TEST_ASSERT_NOT_NULL(k64); TEST_ASSERT_NOT_NULL(ki); TEST_ASSERT_NOT_NULL(xc);
+        TEST_ASSERT_EQ_I(k64->type, RAY_SYM);
+        ray_t* k32 = ray_sym_vec_new(RAY_SYM_W32, N);
+        TEST_ASSERT_NOT_NULL(k32); TEST_ASSERT_FALSE(RAY_IS_ERR(k32));
+        k32->len = N;
+        for (int64_t i = 0; i < N; i++)
+            ray_write_sym(ray_data(k32), i, (uint64_t)ray_read_sym(ray_data(k64), i, RAY_SYM, k64->attrs),
+                          RAY_SYM, k32->attrs);
+        ray_sym_vec_adopt_domain(k32, k64);
+        TEST_ASSERT_EQ_I(k32->attrs & RAY_SYM_W_MASK, RAY_SYM_W32);
+        ray_t* ts = ray_table_new(0);
+        TEST_ASSERT_NOT_NULL(ts); TEST_ASSERT_FALSE(RAY_IS_ERR(ts));
+        ts = ray_table_add_col(ts, ray_sym_intern("k", 1), k32);
+        ts = ray_table_add_col(ts, ray_sym_intern("x", 1), xc);
+        TEST_ASSERT_NOT_NULL(ts); TEST_ASSERT_FALSE(RAY_IS_ERR(ts));
+        ray_t* w = ray_eval_str("(quote (!= k \"0\"))");
+        TEST_ASSERT_NOT_NULL(w);
+        const int64_t* rows = NULL;
+        int64_t nrows = 0, pop = 0;
+        ray_t* hdr = query_cd_gate_where_rows(ts, w, N, &rows, &nrows, &pop);
+        TEST_ASSERT_NOT_NULL(hdr);
+        TEST_ASSERT_FMT(nrows > 262144 / 10 && nrows < 262144 / 7, "narrow SYM survivors: %lld", (long long)nrows);
+        const int64_t* kd = (const int64_t*)ray_data(ki);
+        int64_t zeros = 0;
+        for (int64_t j = 0; j < nrows; j++) if (kd[rows[j]] == 0) zeros++;
+        TEST_ASSERT_EQ_I(zeros, 0);
+        scratch_free(hdr);
+        ray_release(w); ray_release(ts); ray_release(k32); ray_release(xc); ray_release(ki); ray_release(k64);
+    }
+
+    /* a key the estimate does not cover takes the rewrite; a value it does
+     * not cover the slices */
+    k[0] = ray_eval_str("(as 'F64 cr)");
+    x = ray_eval_str("(% cr 100)");
+    TEST_ASSERT_TRUE(ray_cd_two_pass_preferred(k, 1, x, NULL, N, 0, 28));
+    ray_release(k[0]); ray_release(x);
+    k[0] = ray_eval_str("(% cr 45)");
+    x = ray_eval_str("(as 'F64 cr)");
+    TEST_ASSERT_FALSE(ray_cd_two_pass_preferred(k, 1, x, NULL, N, 0, 28));
+    ray_release(k[0]); ray_release(x);
+    PASS();
+}
+
 const test_entry_t agg_contract_entries[] = {
+    { "agg_contract/card_estimate", test_card_estimate, contract_setup, contract_teardown },
+    { "agg_contract/cd_route", test_cd_route, contract_setup, contract_teardown },
     { "agg_contract/empty_inference_errors", test_empty_inference_errors, contract_setup, contract_teardown },
     { "agg_contract/nth_bounds", test_nth_bounds, contract_setup, contract_teardown },
     { "agg_contract/native_binary_output", test_native_binary_output, contract_setup, contract_teardown },
@@ -2191,5 +2941,10 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/parallel_native_gather", test_parallel_native_gather, contract_setup, contract_teardown },
     { "agg_contract/parallel_dominant_consumers", test_parallel_dominant_consumers, contract_setup, contract_teardown },
     { "agg_contract/cancelled_group", test_cancelled_group, contract_setup, contract_teardown },
+#if defined(__linux__)
+    { "agg_contract/select_read_ahead_mapped", test_select_read_ahead_mapped, contract_setup, contract_teardown },
+    { "agg_contract/select_read_ahead_sparse_filter", test_select_read_ahead_sparse_filter, contract_setup, contract_teardown },
+    { "agg_contract/cd_gate_read_ahead", test_cd_gate_read_ahead, contract_setup, contract_teardown },
+#endif
     { NULL, NULL, NULL, NULL },
 };

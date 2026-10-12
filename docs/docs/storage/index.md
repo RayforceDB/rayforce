@@ -17,8 +17,16 @@ The header carries a single-byte format generation. The current generation is `0
  * Bytes  0-31:   ray_t header (type, attrs, len, etc.)
  * Bytes 32-N:    element data (len * elem_size bytes)
  *                nulls use type-correct sentinels in this payload
+ *
+ * String columns (RAY_STR) continue:
+ * Bytes 32-N:    16-byte descriptors; a string longer than 12 bytes
+ *                lives in the pool and its descriptor carries the
+ *                pool offset and a 32-bit content hash
+ * Bytes N+1..:   32-byte pool header, then the pool bytes
  */
 ```
+
+A string column file written by the current engine stores the content hash of every pooled string in its descriptor and marks the header to say so. Loading or mapping such a file checks descriptor bounds only: no string bytes are read and no descriptor page is written, so the mapping stays shared with the page cache. Files written before the hash was stored carry padding in that field; the loaders detect the missing mark, recompute the hashes and repair them in the private mapping, without touching the file.
 
 ### C API
 
@@ -87,12 +95,15 @@ same table serialize on `.write.lock`; readers resolve the manifest once and
 continue using that generation. The symbol vocabulary stays at its original
 location and grows append-only.
 
-Publication keeps the selected generation and one previous generation, then
-removes older staged directories best-effort. A failed unpublished generation is
-removed immediately where the platform allows it; on Windows an open mapped file
-can defer that cleanup until a later publish. At the first manifest publish,
-the legacy root `.d` is retired so older binaries fail loudly instead of reading
-obsolete root files.
+Publication keeps only the selected generation and removes the others
+best-effort, so a replaced table holds one copy of itself on disk. A reader that
+resolved a generation removed before it opened every file resolves the manifest
+again and reads the selected one; a table already loaded stays readable. A
+failed unpublished generation is removed immediately where the platform allows
+it; on Windows an open mapped file can defer that cleanup until a later publish.
+At the first manifest publish, the legacy root `.d` is retired so older binaries
+fail loudly, and the column files it named are removed from the table
+directory; nothing else there is touched.
 
 The `.write.lock` writer lock is local-filesystem coordination. Do not rely on
 it for NFS-backed shared writers.
@@ -182,6 +193,10 @@ ray_t* trades = ray_read_parted("db", "trades");
 
 !!! note "Rayfall builtin"
     Use `.db.parted.get` from Rayfall to load partitioned tables: `(.db.parted.get "db" 'trades)`. See the [Rayfall Storage Builtins](#rayfall-storage) section below.
+
+Mounting the same root again on the same thread reuses unchanged partitions while the earlier view is held. Cache entries record the resolved generation directory and the device, inode, size, modification time and change time of the schema and every column file. A changed partition is loaded afresh; a disappeared partition is dropped. Symbol columns must match the root's current domain, so a missing `.sym` is still an error.
+
+The cache holds at most 1024 partition tables per thread. GC, symbol-domain opens and the next mount discard entries whose columns have no external references; heap abandonment, heap teardown and runtime shutdown clear the thread's entries. To release a dropped view's mappings and copied LIST values immediately, call `(.sys.gc)`. C callers can also use `ray_parted_cache_clear()` from `store/part.h` to clear their thread's cache.
 
 !!! warning "`update` over a partitioned table materializes in memory"
     `update` on a partitioned table flattens the whole table into memory first — the parted/`MAPCOMMON` columns cannot be mutated in place — so the result is an ordinary in-memory table. It is **not** written back to the store: re-reading the root returns the original values, and the returned table loses its parted / memory-mapped identity.

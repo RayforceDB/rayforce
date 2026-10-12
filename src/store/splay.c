@@ -281,6 +281,15 @@ static bool splay_generation_is_current(const ray_splay_write_t* write) {
            active && strcmp(current, write->dir) == 0;
 }
 
+/* The first write of a table is made in its directory; its columns are the
+ * table until the first publish.  From then on readers resolve .current, so
+ * the root schema is renamed out of the way (older binaries then fail loudly
+ * instead of reading obsolete files) and the columns it names are removed,
+ * with their .link sidecars.  Only what the schema names goes: the root also
+ * holds the symfile, the lock file, the generations and, for a table written
+ * into a database root, the partitions.  .legacy.d goes last, once every
+ * file it names is gone, so a cleanup cut short is finished by the next
+ * publish. */
 static void splay_retire_legacy_schema(const char* root) {
     char schema[1024], retired[1024];
     int n = snprintf(schema, sizeof(schema), "%s/.d", root);
@@ -288,14 +297,54 @@ static void splay_retire_legacy_schema(const char* root) {
     if (n < 0 || (size_t)n >= sizeof(schema) ||
         m < 0 || (size_t)m >= sizeof(retired))
         return;
-    if (access(schema, F_OK) != 0) return;
-    (void)unlink(retired);
-    if (rename(schema, retired) != 0)
-        (void)unlink(schema);
+    if (access(schema, F_OK) == 0) {
+        (void)unlink(retired);
+        if (rename(schema, retired) != 0) {
+            (void)unlink(schema);
+            return;
+        }
+    }
+    if (access(retired, F_OK) != 0) return;
+
+    ray_t* names = ray_col_load(retired);
+    if (!names || RAY_IS_ERR(names)) {
+        if (names) ray_error_free(names);
+        return;
+    }
+    bool all_gone = names->type == RAY_STR;
+    for (int64_t c = 0; all_gone && c < names->len; c++) {
+        size_t len = 0;
+        const char* name = ray_str_vec_get(names, c, &len);
+        if (!name || !splay_col_name_safe(name, len)) {
+            all_gone = false;
+            break;
+        }
+        static const char* const suffix[] = {"", ".link"};
+        for (size_t k = 0; k < sizeof(suffix) / sizeof(suffix[0]); k++) {
+            char path[1100];
+            int pn = snprintf(path, sizeof(path), "%s/%.*s%s", root,
+                              (int)len, name, suffix[k]);
+            if (pn < 0 || (size_t)pn >= sizeof(path)) { all_gone = false; break; }
+            struct stat st;
+#ifdef RAY_OS_WINDOWS
+            if (stat(path, &st) != 0) continue;
+#else
+            if (lstat(path, &st) != 0) continue;
+#endif
+            if (S_ISDIR(st.st_mode)) continue;  /* not a column file */
+            if (unlink(path) != 0) all_gone = false;
+        }
+    }
+    ray_release(names);
+    if (all_gone) (void)unlink(retired);
 }
 
-static void splay_prune_generations(const char* root, const char* current,
-                                    const char* previous) {
+/* Every generation but the selected one goes.  A reader that resolved an
+ * older one and has not opened all its files yet finds one missing, resolves
+ * again and reads the selected generation (see splay_load_impl); files it
+ * already mapped stay readable until unmapped.  Removal is best-effort: where
+ * an open file cannot be deleted (Windows), the next publish tries again. */
+static void splay_prune_generations(const char* root, const char* current) {
     char generations[1024];
     int n = snprintf(generations, sizeof(generations), "%s/.generations", root);
     if (n < 0 || (size_t)n >= sizeof(generations)) return;
@@ -312,9 +361,7 @@ static void splay_prune_generations(const char* root, const char* current,
         if (rn < 0 || (size_t)rn >= sizeof(rel) ||
             fn < 0 || (size_t)fn >= sizeof(full))
             continue;
-        if ((current && strcmp(rel, current) == 0) ||
-            (previous && strcmp(full, previous) == 0))
-            continue;
+        if (current && strcmp(rel, current) == 0) continue;
         splay_remove_tree_best_effort(full);
     }
     closedir(d);
@@ -686,12 +733,7 @@ static void splay_remove_created(const ray_splay_write_t* write, bool unlink_loc
 
 ray_err_t ray_splay_write_finish(ray_splay_write_t* write, ray_err_t result,
                                   bool durable) {
-    char previous[1024];
-    bool had_previous = false;
     if (result == RAY_OK && write->staged) {
-        if (splay_current_dir(write->root, previous, sizeof(previous),
-                              &had_previous) != RAY_OK)
-            had_previous = false;
         /* ray_file_sync_dir syncs the PARENT of its argument. */
         char schema[1100];
         snprintf(schema, sizeof(schema), "%s/.d", write->dir);
@@ -702,8 +744,7 @@ ray_err_t ray_splay_write_finish(ray_splay_write_t* write, ray_err_t result,
             result = splay_publish_generation(write->root, write->generation, durable);
         if (result == RAY_OK) {
             splay_retire_legacy_schema(write->root);
-            splay_prune_generations(write->root, write->generation,
-                                    had_previous ? previous : NULL);
+            splay_prune_generations(write->root, write->generation);
         }
     }
     if (result != RAY_OK && write->staged && write->dir[0] &&
@@ -1013,14 +1054,51 @@ static ray_t* splay_load_dom_impl(const char* dir, ray_sym_domain_t* dom,
     return tbl;
 }
 
+/* Only the selected generation is kept, so one a reader resolved can be
+ * removed before the reader has opened all its files.  A read that fails is
+ * tried again while the table keeps resolving to a different generation;
+ * a failure on the generation still selected is the table's own.  Each retry
+ * follows a completed publish, so the reader is not counted out: a reader
+ * that is slow to open its files (many columns, slow storage, a busy CPU)
+ * would otherwise fail after a fixed number of saves.  It gives up once the
+ * table has kept changing under it for SPLAY_RESOLVE_WAIT_NS (after at
+ * least SPLAY_RESOLVE_ATTEMPTS attempts), or when interrupted. */
+#define SPLAY_RESOLVE_WAIT_NS  (INT64_C(60) * 1000000000)
+#define SPLAY_RESOLVE_ATTEMPTS 8
+
+static bool splay_moved_on(const char* dir, const char* resolved) {
+    char again[1024];
+    return ray_splay_resolve_dir(dir, again, sizeof(again)) == RAY_OK &&
+           strcmp(again, resolved) != 0;
+}
+
+/* Whether a read of `resolved` that failed (attempt `attempt` of a loop
+ * started at `t0`) is tried again: 1 yes; 0 no, the failure is the table's
+ * own; -1 interrupted; -2 the table kept changing for too long. */
+static int splay_retry(const char* dir, const char* resolved, int attempt, int64_t t0) {
+    if (!resolved[0] || !splay_moved_on(dir, resolved)) return 0;
+    if (ray_interrupted()) return -1;
+    if (attempt >= SPLAY_RESOLVE_ATTEMPTS &&
+        ray_profile_now_ns() - t0 >= SPLAY_RESOLVE_WAIT_NS) return -2;
+    return 1;
+}
+
+/* The error a reader that stopped retrying (splay_retry < 0) returns in
+ * place of its last attempt's, which only reflects the race. */
+static ray_t* splay_retry_error(int why, const char* dir, ray_t* last) {
+    if (last && RAY_IS_ERR(last)) ray_error_free(last);
+    if (why == -1) return ray_error("cancel", "interrupted");
+    return ray_error("io", "splayed %s: the table kept changing while it was read", dir);
+}
+
 /* Resolve sym_path to a FILE domain.  Missing file → NULL domain with
  * RAY_OK (only an error if a SYM column is later encountered — the
  * symbol-free-table exemption must hold for reads too); existing but
  * unopenable/invalid file → loud error. */
-static ray_t* splay_load_impl(const char* dir, const char* sym_path,
-                              bool use_mmap) {
-    char resolved[1024];
-    ray_err_t err = ray_splay_resolve_dir(dir, resolved, sizeof(resolved));
+static ray_t* splay_load_once(const char* dir, const char* sym_path,
+                              bool use_mmap, char* resolved, size_t resolved_sz,
+                              ray_sym_domain_t** held) {
+    ray_err_t err = ray_splay_resolve_dir(dir, resolved, resolved_sz);
     if (err != RAY_OK)
         return ray_error(ray_err_code_str(err), "cannot resolve splayed generation");
     /* Resolve first: a newly published generation can reference symbols
@@ -1031,19 +1109,81 @@ static ray_t* splay_load_impl(const char* dir, const char* sym_path,
         struct stat st;
         if (stat(sym_path, &st) == 0) {
             dom = ray_sym_domain_open(sym_path);
+            /* The previous attempt's domain stays open until here, so a
+             * retry extends it instead of reading the symfile again. */
+            if (*held) { ray_sym_domain_release(*held); *held = NULL; }
             if (!dom)
                 return ray_error("corrupt",
                     "symfile %s: unreadable or invalid (bad magic, torn "
                     "record, or missing \"\" at position 0)", sym_path);
         }
     }
+    /* An earlier attempt's domain not replaced above (no symfile this
+     * time) is let go here, before *held is overwritten. */
+    if (*held) ray_sym_domain_release(*held);
     ray_t* tbl = splay_load_dom_impl(resolved, dom, use_mmap);
-    if (dom) ray_sym_domain_release(dom); /* columns hold their own refs */
+    *held = dom;   /* released by the caller; columns hold their own refs */
     return tbl;
+}
+
+static ray_t* splay_load_impl(const char* dir, const char* sym_path,
+                              bool use_mmap) {
+    char resolved[1024];
+    ray_sym_domain_t* held = NULL;
+    int64_t t0 = ray_profile_now_ns();
+    ray_t* tbl;
+    for (int attempt = 1;; attempt++) {
+        resolved[0] = '\0';
+        tbl = splay_load_once(dir, sym_path, use_mmap, resolved, sizeof(resolved), &held);
+        if (tbl && !RAY_IS_ERR(tbl)) break;
+        int why = splay_retry(dir, resolved, attempt, t0);
+        if (why < 0) { tbl = splay_retry_error(why, dir, tbl); break; }
+        if (!why) break;
+        ray_error_free(tbl);
+    }
+    if (held) ray_sym_domain_release(held);
+    return tbl;
+}
+
+bool ray_splay_has_schema(const char* dir) {
+    char resolved[1024], schema[1100];
+    int64_t t0 = ray_profile_now_ns();
+    for (int attempt = 1;; attempt++) {
+        if (ray_splay_resolve_dir(dir, resolved, sizeof(resolved)) != RAY_OK)
+            return false;
+        int n = snprintf(schema, sizeof(schema), "%s/.d", resolved);
+        if (n < 0 || (size_t)n >= sizeof(schema)) return false;
+        struct stat st;
+        if (stat(schema, &st) == 0) return S_ISREG(st.st_mode);
+        if (splay_retry(dir, resolved, attempt, t0) != 1) return false;
+    }
 }
 
 ray_t* ray_splay_load(const char* dir, const char* sym_path) {
     return splay_load_impl(dir, sym_path, false);
+}
+
+/* `dir`/<name of column c> into out[cap]; false when it does not fit. */
+static bool splay_col_path(const char* dir, ray_t* tbl, int64_t c, char* out, size_t cap) {
+    ray_t* nstr = ray_sym_str(ray_table_col_name(tbl, c));
+    if (!nstr || RAY_IS_ERR(nstr)) return false;
+    int n = snprintf(out, cap, "%s/%.*s", dir, (int)ray_str_len(nstr), ray_str_ptr(nstr));
+    return n > 0 && (size_t)n < cap;
+}
+
+/* Hash-index `col` and append the index to its index-less file `path`:
+ * built in place in the file (no copy of the column, the arrays written
+ * once), or where that does not apply, attached to a copy and appended. */
+static ray_err_t splay_hash_append(const char* path, ray_t* col) {
+    ray_err_t err = ray_col_build_hash_index(path, col, NULL);
+    if (err != RAY_ERR_NYI) return err;
+    ray_t* hi = ray_idx_hash_fn(col);
+    if (!hi || RAY_IS_ERR(hi)) { if (hi) ray_error_free(hi); return RAY_ERR_OOM; }
+    err = (hi->attrs & RAY_ATTR_HAS_INDEX)
+        ? ray_col_append_index(path, ray_index_payload(hi->index), hi->len, hi->type)
+        : RAY_ERR_IO;
+    ray_release(hi);
+    return err;
 }
 
 /* Build + persist accelerator indexes for a freshly-streamed splayed store.
@@ -1087,14 +1227,7 @@ static void splay_build_index_col(const char* dir, ray_t* tbl, int64_t c, ray_t*
                 if (n > 0 && n < (int)sizeof(path)) {
                     ray_t* fc = ray_col_load(path);  /* file-local codes */
                     if (fc && !RAY_IS_ERR(fc)) {
-                        ray_t* fi = ray_idx_hash_fn(fc);  /* hash over file-local */
-                        if (fi && !RAY_IS_ERR(fi)) {
-                            (void)ray_col_append_index(path,
-                                ray_index_payload(fi->index), fi->len, RAY_SYM);
-                            ray_release(fi);
-                        } else if (fi) {
-                            ray_error_free(fi);
-                        }
+                        (void)splay_hash_append(path, fc);  /* hash over file-local */
                         ray_release(fc);
                     } else if (fc) {
                         ray_error_free(fc);
@@ -1149,23 +1282,12 @@ static void splay_build_index_col(const char* dir, ray_t* tbl, int64_t c, ray_t*
                 *deferred = idx;
                 return;
             }
-            ray_t* hi = ray_idx_hash_fn(col);
-            if (hi && !RAY_IS_ERR(hi) && (hi->attrs & RAY_ATTR_HAS_INDEX)) {
+            char hpath[1100];
+            if (splay_col_path(dir, tbl, c, hpath, sizeof(hpath)) &&
+                splay_hash_append(hpath, col) == RAY_OK) {
                 ray_release(idx);          /* zone sacrificed for the hash */
-                idx = NULL;
-                ray_t* nstr = ray_sym_str(ray_table_col_name(tbl, c));
-                if (nstr && !RAY_IS_ERR(nstr)) {
-                    char path[1100];
-                    int n = snprintf(path, sizeof(path), "%s/%.*s", dir,
-                                     (int)ray_str_len(nstr), ray_str_ptr(nstr));
-                    if (n > 0 && n < (int)sizeof(path))
-                        (void)ray_col_append_index(path,
-                            ray_index_payload(hi->index), hi->len, hi->type);
-                }
-                ray_release(hi);
                 return;
             }
-            if (hi) { if (RAY_IS_ERR(hi)) ray_error_free(hi); else ray_release(hi); }
             /* Hash build failed — fall through and persist the zone. */
         }
 
@@ -1238,11 +1360,22 @@ void ray_splay_build_indexes(const char* dir, ray_t* tbl) {
         memset(deferred, 0, (size_t)nc * 2 * sizeof(ray_t*));
         splay_index_ctx_t ctx = { .dir = dir, .tbl = tbl, .deferred = deferred, .hashed = deferred + nc };
         ray_pool_dispatch_n(pool, splay_build_index_task, &ctx, (uint32_t)nc);
-        /* Hash builds one after another (each parallel inside), then the
-         * writes of all deferred columns together. */
+        /* Hash builds one after another (each parallel inside), each into
+         * its file; where that cannot be done in place, built in memory and
+         * written with the zones of the other deferred columns. */
         for (int64_t c = 0; c < nc; c++) {
             if (!deferred[c]) continue;
-            ray_t* hi = ray_idx_hash_fn(ray_table_get_col_idx(tbl, c));
+            ray_t* col = ray_table_get_col_idx(tbl, c);
+            char path[1100];
+            ray_err_t e = splay_col_path(dir, tbl, c, path, sizeof(path))
+                        ? ray_col_build_hash_index(path, col, NULL) : RAY_ERR_IO;
+            if (e == RAY_OK) {               /* the zone is sacrificed for the hash */
+                ray_release(deferred[c]);
+                deferred[c] = NULL;
+                continue;
+            }
+            if (e != RAY_ERR_NYI) continue;   /* the zone, then */
+            ray_t* hi = ray_idx_hash_fn(col);
             if (hi && !RAY_IS_ERR(hi) && (hi->attrs & RAY_ATTR_HAS_INDEX)) ctx.hashed[c] = hi;
             else if (hi) { if (RAY_IS_ERR(hi)) ray_error_free(hi); else ray_release(hi); }
         }
@@ -1257,9 +1390,9 @@ ray_t* ray_read_splayed(const char* dir, const char* sym_path) {
     return splay_load_impl(dir, sym_path, true);
 }
 
-ray_t* ray_read_splayed_dom(const char* dir, struct ray_sym_domain_s* dom) {
-    char resolved[1024];
-    ray_err_t err = ray_splay_resolve_dir(dir, resolved, sizeof(resolved));
+static ray_t* splay_read_dom_once(const char* dir, ray_sym_domain_t* dom,
+                                  char* resolved, size_t resolved_sz) {
+    ray_err_t err = ray_splay_resolve_dir(dir, resolved, resolved_sz);
     if (err != RAY_OK)
         return ray_error(ray_err_code_str(err), "cannot resolve splayed generation");
     ray_sym_domain_t* fresh = NULL;
@@ -1274,28 +1407,63 @@ ray_t* ray_read_splayed_dom(const char* dir, struct ray_sym_domain_s* dom) {
     return tbl;
 }
 
+ray_t* ray_read_splayed_dom(const char* dir, struct ray_sym_domain_s* dom) {
+    char resolved[1024];
+    int64_t t0 = ray_profile_now_ns();
+    for (int attempt = 1;; attempt++) {
+        resolved[0] = '\0';
+        ray_t* tbl = splay_read_dom_once(dir, dom, resolved, sizeof(resolved));
+        if (tbl && !RAY_IS_ERR(tbl)) return tbl;
+        int why = splay_retry(dir, resolved, attempt, t0);
+        if (why < 0) return splay_retry_error(why, dir, tbl);
+        if (!why) return tbl;
+        ray_error_free(tbl);
+    }
+}
+
 ray_err_t ray_splay_hash_column(const char* path, ray_t* zone) {
     if (!path) return RAY_ERR_DOMAIN;
     bool trace = getenv("RAY_CSV_TRACE") != NULL;   /* the converters' phase trace */
     int64_t t0 = trace ? ray_profile_now_ns() : 0;
     ray_t* col = ray_col_mmap(path);
     if (!col || RAY_IS_ERR(col)) { if (col) ray_error_free(col); return RAY_ERR_IO; }
-    ray_err_t err = RAY_ERR_IO;
     int64_t t1 = trace ? ray_profile_now_ns() : 0;
-    ray_t* hi = ray_idx_hash_fn(col);
-    int64_t t2 = trace ? ray_profile_now_ns() : 0;
-    if (hi && !RAY_IS_ERR(hi) && (hi->attrs & RAY_ATTR_HAS_INDEX)) {
-        err = ray_col_append_index(path, ray_index_payload(hi->index), hi->len, hi->type);
-        if (trace) {
-            const ray_index_t* hx = ray_index_payload(hi->index);
-            fprintf(stderr, "splayed hash: file=%s rows=%" PRId64 " keys=%" PRId64 " groups=%" PRId64
-                            " mmap=%.1fms build=%.1fms write=%.1fms\n",
-                    path, hi->len, hx->u.hash.n_keys, hx->u.hash.n_groups,
-                    (double)(t1 - t0) / 1e6, (double)(t2 - t1) / 1e6, (double)(ray_profile_now_ns() - t2) / 1e6);
+    ray_hash_trace_t ht;
+    memset(&ht, 0, sizeof(ht));
+    /* The build reads the column front to back, twice, and not again:
+     * larger read-ahead, and its pages are the first to go under pressure
+     * rather than the build's own. */
+    if (col->len > 0)   /* from the header: madvise wants the mapping's page */
+        ray_vm_advise_seq(col, 32 + (size_t)col->len * ray_sym_elem_size(col->type, col->attrs));
+    /* Built over the mapping, straight into the file: the arrays are
+     * written once, where they end up, and the column is not copied. */
+    ray_err_t err = ray_col_build_hash_index(path, col, trace ? &ht : NULL);
+    if (err == RAY_ERR_NYI) {
+        /* No in-place build here: attached in memory, then appended.  The
+         * mapping is the column's only reference, so the attach builds on it
+         * rather than on a copy. */
+        ray_t* r = ray_index_attach_hash(&col);
+        if (!RAY_IS_ERR(r) && (col->attrs & RAY_ATTR_HAS_INDEX)) {
+            const ray_index_t* hx = ray_index_payload(col->index);
+            ht.n_keys = hx->u.hash.n_keys;
+            ht.n_groups = hx->u.hash.n_groups;
+            ray_hash_mark_t tm = trace ? ray_hash_trace_mark() : (ray_hash_mark_t){0};
+            err = ray_col_append_index(path, hx, col->len, col->type);
+            /* the region is read from the built arrays and written to the file */
+            if (trace) ray_hash_trace_add(&ht, RAY_HXT_APPEND, tm, 2 * ray_index_inline_size(hx));
+        } else {
+            if (RAY_IS_ERR(r)) ray_error_free(r);
+            err = RAY_ERR_IO;
         }
-        ray_release(hi);
-    } else if (hi) {
-        if (RAY_IS_ERR(hi)) ray_error_free(hi); else ray_release(hi);
+    }
+    int64_t t2 = trace ? ray_profile_now_ns() : 0;
+    if (trace && err == RAY_OK) {
+        fprintf(stderr, "splayed hash: file=%s rows=%" PRId64 " keys=%" PRId64 " groups=%" PRId64
+                        " mmap=%.1fms build=%.1fms write=%.1fms\n",
+                path, col->len, ht.n_keys, ht.n_groups, (double)(t1 - t0) / 1e6,
+                (double)(t2 - t1 - ht.ns[RAY_HXT_APPEND]) / 1e6, (double)ht.ns[RAY_HXT_APPEND] / 1e6);
+        ray_hash_trace_print(stderr, "splayed hash io", &ht,
+                             col->len * (int64_t)ray_sym_elem_size(col->type, col->attrs));
     }
     if (err != RAY_OK && zone)
         err = ray_col_append_index(path, ray_index_payload(zone), col->len, col->type);

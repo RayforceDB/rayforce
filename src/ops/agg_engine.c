@@ -8,6 +8,8 @@
 #include "lang/internal.h" /* sym_domain_rep */
 #include "table/domain.h"
 #include "table/sym.h"    /* ray_read_sym */
+#include "store/col.h"    /* ray_col_cold — sampled-row read-ahead */
+#include "core/pool.h"     /* ray_pool_want — a column asked for whole */
 #include "core/platform.h" /* ray_cache_llc_bytes — replicated slab bound */
 #include <stdlib.h>
 #include <math.h>
@@ -316,8 +318,19 @@ static void agg_key_bounds_fn(void* raw, uint32_t wid, int64_t start, int64_t en
     for (int64_t task = start; task < end; task++) {
         int64_t begin = c->rows / c->tasks * task;
         int64_t limit = task + 1 == c->tasks ? c->rows : c->rows / c->tasks * (task + 1);
-        agg_key_bounds(c->key, begin, limit, c->nullable, c->null,
-                       &c->bounds[task * 2], &c->bounds[task * 2 + 1]);
+        /* Often the first read of the key: read ahead block by block.  The
+         * key is the one column read, so it is requested from the first
+         * block on. */
+        int64_t lo = INT64_MAX, hi = INT64_MIN;
+        for (int64_t b = begin; b < limit; b += 65536) {
+            int64_t e = limit - b > 65536 ? b + 65536 : limit, l, h;
+            ray_pool_scan_col_at(ray_data(c->key), c->rows, b, limit);
+            agg_key_bounds(c->key, b, e, c->nullable, c->null, &l, &h);
+            if (l < lo) lo = l;
+            if (h > hi) hi = h;
+        }
+        c->bounds[task * 2] = lo;
+        c->bounds[task * 2 + 1] = hi;
     }
 }
 static void agg_key_bounds_parallel(ray_t* key, int64_t rows, bool nullable,
@@ -484,6 +497,321 @@ static bool agg_dense_plan_compact(ray_t** key_cols, uint32_t n_keys, int64_t nr
     }
     ray_free_raw(bits); ray_free_raw(task_bits);
     return true;
+}
+
+/* An estimate of the groups a key tuple forms — see agg_engine.h.
+ *
+ * The columns are sampled together at a fixed stride, AGG_EST_SAMPLE rows
+ * over the input — the rows of `rows` when given, a selection's survivors,
+ * since a filter that drops a dominant key value (the empty model of a
+ * device column, on nine rows in ten) hides the groups and the shares of
+ * what remains — (every row below that; the strided reads miss the cache,
+ * and 32,768 of them over three columns cost half a millisecond at 10 M
+ * rows with the prefetch below; the pages of a mapped column are asked
+ * for ahead of them, ray_col_want_rows), one row from each window of `stride` rows
+ * at an offset hashed from the window's index (agg_est_row), and each
+ * column's values go through a small open-addressing set that counts how
+ * often each was seen.
+ * Blocks of adjacent rows would be cheaper to read but blind to clustered
+ * keys: a run of four rows per value shows a block one value per four rows,
+ * while a stride past the run length shows every sample distinct.  The
+ * distinct count of the sample is then raised by the Chao1 species
+ * estimator, d + f1 (f1 - 1) / 2 (f2 + 1) — f1 and f2 the values seen once
+ * and twice — which answers for the values the sample missed: a key of 45
+ * values has no singletons and stays 45; a skewed key, one value on nine
+ * rows in ten and a million on the rest, shows thousands of singletons and
+ * few pairs and lands near the million.  Each key's estimate is capped at
+ * what it could hold, the span of its sampled values — its codes for a SYM
+ * key, which are fixed once interned (the process-wide domain's count
+ * bounds them too, but grows with every symbol interned afterwards, and
+ * the estimate with it).
+ *
+ * The same pass hashes the tuple of the first n_prefix columns and the
+ * tuple of all of them into two more sets, for the groups a composite key
+ * forms (its columns' product overstates a city beside its country by the
+ * number of countries) and for the tuples a (key, value) grouping would
+ * keep.  A tuple holds at most the product of its columns' caps, and at
+ * most one value per row.  A sorted prefix defeats the stride: every
+ * sample is a different tuple once the run length is below the stride, and
+ * the Chao1 saturates at the cap.  The sample notices — its prefix tuples
+ * never decrease — and reads AGG_EST_BLOCKS blocks of AGG_EST_BLOCK adjacent
+ * rows as well, which see the runs: the groups are the rows over the mean
+ * run length, the tuples the distinct ones per block; the lower of the two
+ * readings stands.  (A run longer than a block reads as a block, so blocks
+ * alone would overstate a key of few groups; the stride is exact there.) */
+enum { AGG_EST_SAMPLE = AGG_EST_SAMPLE_ROWS, AGG_EST_PREFETCH = 16,
+       AGG_EST_BLOCK = 256, AGG_EST_BLOCKS = AGG_EST_SAMPLE / AGG_EST_BLOCK };
+
+/* A sampled key value as int64: the integer itself (a null is its sentinel,
+ * one more value), a SYM's code. */
+static inline int64_t agg_est_read(const void* d, int8_t t, uint8_t attrs, int64_t r) {
+    switch (t) {
+    case RAY_I64: case RAY_TIMESTAMP: return ((const int64_t*)d)[r];
+    case RAY_I32: case RAY_DATE: case RAY_TIME: return ((const int32_t*)d)[r];
+    case RAY_I16: return ((const int16_t*)d)[r];
+    case RAY_U8: case RAY_BOOL: return ((const uint8_t*)d)[r];
+    default: return ray_read_sym(d, r, t, attrs);
+    }
+}
+
+/* Fold one column's value into a tuple hash (order-sensitive). */
+static inline uint64_t agg_est_mix(uint64_t h, int64_t v) {
+    h ^= (uint64_t)v * 0x9E3779B97F4A7C15ULL;
+    h *= 0xBF58476D1CE4E5B9ULL;
+    return h ^ (h >> 31);
+}
+
+/* An open-addressing set of sampled values with how often each was seen,
+ * kept as the Chao1 inputs d, f1, f2 and the count of the most frequent
+ * (the share of the largest group).  A count is at most the sample. */
+typedef struct {
+    int64_t*  vals;
+    uint16_t* cnt;
+    int64_t   d, f1, f2, max;
+} agg_est_set_t;
+
+static inline void agg_est_set_add(agg_est_set_t* s, uint64_t mask, int64_t v) {
+    uint64_t h = ((uint64_t)v * 0x9E3779B97F4A7C15ULL) >> 20 & mask;
+    for (;; h = (h + 1) & mask) {
+        if (s->cnt[h] == 0) {
+            s->vals[h] = v; s->cnt[h] = 1; s->d++; s->f1++;
+            if (s->max < 1) s->max = 1;
+            return;
+        }
+        if (s->vals[h] == v) {
+            uint16_t c = ++s->cnt[h];
+            if (c == 2) { s->f1--; s->f2++; }
+            else if (c == 3) s->f2--;
+            if (c > s->max) s->max = c;
+            return;
+        }
+    }
+}
+
+/* The Chao1 estimate from a set's counts (the distinct count itself when
+ * the sample is the whole input), capped at `cap` when that is positive;
+ * never below 1. */
+static int64_t agg_est_chao1(const agg_est_set_t* s, bool sampled, int64_t cap) {
+    int64_t est = s->d;
+    if (sampled && s->f1 > 1) {
+        /* f1 <= AGG_EST_SAMPLE: the product is far from overflowing */
+        int64_t add = s->f1 * (s->f1 - 1) / (2 * (s->f2 + 1));
+        est = add > INT64_MAX - est ? INT64_MAX : est + add;
+    }
+    if (cap > 0 && cap < est) est = cap;
+    return est < 1 ? 1 : est;
+}
+
+/* What a tuple of columns 0..n can hold: the product of their caps (a
+ * column without one, or a product past nrows, is nrows) and nrows. */
+static int64_t agg_est_tuple_cap(const int64_t* cap, uint32_t n, int64_t nrows) {
+    int64_t prod = 1;
+    for (uint32_t k = 0; k < n; k++) {
+        if (cap[k] <= 0 || prod > nrows / cap[k]) return nrows;
+        prod *= cap[k];
+    }
+    return prod < nrows ? prod : nrows;
+}
+
+/* Blocks of adjacent rows over a sorted prefix: the groups as rows over the
+ * mean run length of the prefix tuple, the (prefix, rest) tuples as the
+ * distinct ones per block scaled to the input.  false when the input is too
+ * short for the blocks (the stride is then exact anyway). */
+static bool agg_est_blocks(ray_t** cols, uint32_t n, uint32_t n_prefix,
+                           const int64_t* rows, int64_t nrows, int64_t* pos,
+                           int64_t* prefix_est, int64_t* all_est) {
+    enum { SLOTS = AGG_EST_BLOCK * 4 };
+    if (nrows < (int64_t)AGG_EST_BLOCK * 4) return false;
+    int64_t nblk = AGG_EST_BLOCKS;
+    if (nblk * AGG_EST_BLOCK > nrows) nblk = nrows / AGG_EST_BLOCK;
+    const int64_t gap = nrows / nblk;
+    /* the blocks' rows listed first (`pos` holds AGG_EST_SAMPLE), so the
+     * pages of a mapped column are asked for ahead of the reads, as the
+     * strided sample's are */
+    int64_t np = 0;
+    for (int64_t b = 0; b < nblk; b++)
+        for (int64_t i = b * gap; i < b * gap + AGG_EST_BLOCK; i++) pos[np++] = rows ? rows[i] : i;
+    for (uint32_t k = 0; k < n; k++) ray_col_want_rows(cols[k], pos, np);
+    int64_t  vals[SLOTS];
+    uint16_t cnt[SLOTS];
+    agg_est_set_t set = { vals, cnt, 0, 0, 0, 0 };
+    int64_t runs = 0, read = 0, distinct = 0;
+    np = 0;
+    for (int64_t b = 0; b < nblk; b++) {
+        memset(cnt, 0, sizeof cnt);
+        set.d = set.f1 = set.f2 = set.max = 0;
+        uint64_t hp_prev = 0;
+        for (int64_t i = 0; i < AGG_EST_BLOCK; i++) {
+            const int64_t r = pos[np++];
+            uint64_t hp = 0, ha = 0;
+            for (uint32_t k = 0; k < n; k++) {
+                ha = agg_est_mix(ha, agg_est_read(ray_data(cols[k]), cols[k]->type,
+                                                  cols[k]->attrs, r));
+                if (k + 1 == n_prefix) hp = ha;
+            }
+            if (i == 0 || hp != hp_prev) runs++;
+            hp_prev = hp;
+            agg_est_set_add(&set, SLOTS - 1, (int64_t)ha);
+        }
+        distinct += set.d;
+        read += AGG_EST_BLOCK;
+    }
+    *prefix_est = (int64_t)((double)nrows * (double)runs / (double)read);
+    *all_est    = (int64_t)((double)nrows * (double)distinct / (double)read);
+    if (*prefix_est < 1) *prefix_est = 1;
+    if (*all_est < 1) *all_est = 1;
+    return true;
+}
+
+bool agg_group_card_sample(ray_t** cols, uint32_t n, uint32_t n_prefix,
+                           const int64_t* rows, int64_t nrows, int64_t population,
+                           int64_t* col_est, int64_t* prefix_est, int64_t* prefix_max,
+                           int64_t* all_est) {
+    if (n < 1 || n > 16 || n_prefix < 1 || n_prefix > n || nrows <= 0) return false;
+    /* the rows the estimates describe: the list itself, or the population
+     * it was sampled from */
+    const int64_t pop = population > nrows ? population : nrows;
+    int64_t     cap[16];
+    const void* data[16];
+    size_t      esz[16];
+    for (uint32_t k = 0; k < n; k++) {
+        ray_t* c = cols[k];
+        switch (c->type) {
+        case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8:
+        case RAY_BOOL: case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP:
+        case RAY_SYM:
+            break;
+        default:
+            return false;
+        }
+        data[k] = ray_data(c);
+        esz[k]  = col_esz(c);
+    }
+    const bool    tuples = prefix_est || prefix_max || all_est;
+    const int64_t sample = nrows < AGG_EST_SAMPLE ? nrows : AGG_EST_SAMPLE;
+    uint64_t slots = 64;
+    while (slots < (uint64_t)sample * 2) slots <<= 1;
+    const uint32_t nsets = n + (tuples ? 2 : 0);
+    const size_t   set_bytes = (size_t)slots * (sizeof(int64_t) + sizeof(uint16_t));
+    uint8_t* mem = ray_alloc_raw(set_bytes * nsets + (size_t)AGG_EST_SAMPLE * sizeof(int64_t));
+    if (!mem) return false;
+    /* The rows the pass reads, listed first: the pages of a mapped column
+     * are asked for ahead of the reads, through the pool, as the select's
+     * own scan asks for its.  Read as they were met, each strided row of a
+     * column not in memory waited on its own page fault, on this thread —
+     * a quarter second and more per column at 100 M rows, where the pass
+     * costs a millisecond in memory.  The pages asked for are those the
+     * sampled rows fall on (ray_col_want_rows), or the rows between the
+     * first and last sampled as one range when the rows the estimate
+     * describes fall on every page of that span — a row per page or more:
+     * the select reads the span whole then, and its stream runs while this
+     * pass waits on the first of them; a sample's pages alone, 30,000
+     * reads of one page each, took twice as long as the stream.  The span,
+     * not the column: a selection over a slice of a time-ordered table
+     * asks for its slice (a 1% window asked for the columns whole before,
+     * 90 MB read for 2 needed at 4 M rows). */
+    int64_t* pos = (int64_t*)(mem + set_bytes * nsets);
+    for (int64_t i = 0; i < sample; i++) {
+        const int64_t ri = agg_est_sample_row(i, sample, nrows);
+        pos[i] = rows ? rows[ri] : ri;
+    }
+    int64_t lo_r = pos[0], hi_r = pos[0];
+    for (int64_t i = 1; i < sample; i++) {
+        if (pos[i] < lo_r) lo_r = pos[i];
+        if (pos[i] > hi_r) hi_r = pos[i];
+    }
+    for (uint32_t k = 0; k < n; k++) {
+        const size_t span = (size_t)(hi_r - lo_r + 1) * esz[k];
+        if (pop >= (int64_t)(span >> 12)) {
+            if (cols[k]->mmod == 1 && ray_pool_scan_on()) {
+                const uint8_t* p = (const uint8_t*)data[k] + (size_t)lo_r * esz[k];
+                if (!ray_vm_resident(p, span)) ray_pool_want(p, span);
+            }
+        } else {
+            ray_col_want_rows(cols[k], pos, sample);
+        }
+    }
+    agg_est_set_t sets[18];
+    for (uint32_t i = 0; i < nsets; i++) {
+        sets[i].vals = (int64_t*)(mem + (size_t)i * set_bytes);
+        sets[i].cnt  = (uint16_t*)(mem + (size_t)i * set_bytes + (size_t)slots * sizeof(int64_t));
+        memset(sets[i].cnt, 0, (size_t)slots * sizeof(uint16_t));
+        sets[i].d = sets[i].f1 = sets[i].f2 = sets[i].max = 0;
+    }
+    const uint64_t mask = slots - 1;
+    int64_t lo[16], hi[16], prev[16];
+    for (uint32_t k = 0; k < n; k++) { lo[k] = INT64_MAX; hi[k] = INT64_MIN; prev[k] = INT64_MIN; }
+    bool sorted = true;   /* the sampled prefix tuples never decrease */
+    for (int64_t i = 0; i < sample; i++) {
+        const int64_t r = pos[i];
+        if (i + AGG_EST_PREFETCH < sample) {
+            /* the strided reads miss the cache; keep several in flight */
+            const size_t rp = (size_t)pos[i + AGG_EST_PREFETCH];
+            for (uint32_t k = 0; k < n; k++)
+                __builtin_prefetch((const char*)data[k] + rp * esz[k]);
+        }
+        uint64_t hp = 0, ha = 0;
+        int cmp = 0;   /* the prefix tuple against the previous sample's */
+        for (uint32_t k = 0; k < n; k++) {
+            const int64_t v = agg_est_read(data[k], cols[k]->type, cols[k]->attrs, r);
+            if (v < lo[k]) lo[k] = v;
+            if (v > hi[k]) hi[k] = v;
+            agg_est_set_add(&sets[k], mask, v);
+            if (tuples) {
+                ha = agg_est_mix(ha, v);
+                if (k < n_prefix) {
+                    hp = ha;
+                    if (cmp == 0 && v != prev[k]) cmp = v < prev[k] ? -1 : 1;
+                    prev[k] = v;
+                }
+            }
+        }
+        if (tuples) {
+            if (cmp < 0) sorted = false;
+            agg_est_set_add(&sets[n], mask, (int64_t)hp);
+            agg_est_set_add(&sets[n + 1], mask, (int64_t)ha);
+        }
+    }
+    const bool sampled = sample < pop;
+    for (uint32_t k = 0; k < n; k++) {
+        /* the span of the sampled values (codes) bounds what the key can hold */
+        uint64_t span = (uint64_t)hi[k] - (uint64_t)lo[k];
+        cap[k] = span < (uint64_t)INT64_MAX - 1 ? (int64_t)span + 1 : 0;
+        int64_t est = agg_est_chao1(&sets[k], sampled, cap[k]);
+        if (col_est) col_est[k] = est;
+    }
+    if (tuples) {
+        int64_t kp = agg_est_chao1(&sets[n], sampled, agg_est_tuple_cap(cap, n_prefix, pop));
+        int64_t ka = agg_est_chao1(&sets[n + 1], sampled, agg_est_tuple_cap(cap, n, pop));
+        int64_t bp, ba;
+        /* adjacent entries of a sampled list are not adjacent rows */
+        if (sorted && sampled && pop == nrows &&
+            agg_est_blocks(cols, n, n_prefix, rows, nrows, pos, &bp, &ba)) {
+            if (bp < kp) kp = bp;
+            if (ba < ka) ka = ba;
+        }
+        if (prefix_est) *prefix_est = kp;
+        if (all_est) *all_est = ka;
+        /* the largest group's rows: its share of the sample over the population */
+        if (prefix_max) *prefix_max = sets[n].max * (pop / sample) +
+                                      sets[n].max * (pop % sample) / sample;
+    }
+    ray_free_raw(mem);
+    return true;
+}
+
+int64_t agg_group_card_estimate(ray_t** key_cols, uint32_t n_keys, int64_t nrows) {
+    int64_t est[16];
+    if (n_keys < 1 || n_keys > 16 ||
+        !agg_group_card_sample(key_cols, n_keys, n_keys, NULL, nrows, 0, est, NULL, NULL, NULL))
+        return -1;
+    int64_t total = 1;
+    for (uint32_t k = 0; k < n_keys; k++) {
+        if (est[k] < 1) return -1;   /* never below 1 (static analysis) */
+        if (total > INT64_MAX / est[k]) return -1;
+        total *= est[k];
+    }
+    return total;
 }
 
 bool agg_dense_plan(ray_t** key_cols, uint32_t n_keys,
@@ -675,6 +1003,60 @@ static void agg_gather_native_run(void* raw, uint32_t wid, int64_t start, int64_
     if (any_null) atomic_store_explicit(&c->any_null, true, memory_order_relaxed);
 }
 
+typedef struct { const ray_t* v; _Atomic(int) found; } key_null_scan_t;
+
+/* Any null sentinel in [start, end)?  Written as a block-wise OR-reduction
+ * so the compiler vectorises the compare; the block boundary is where the
+ * early exit happens. */
+static bool key_null_in_range(const ray_t* v, int64_t start, int64_t end) {
+    const void* p = ray_data((ray_t*)v);
+    enum { BLOCK = 4096 };
+    for (int64_t s = start; s < end; s += BLOCK) {
+        int64_t e = s + BLOCK < end ? s + BLOCK : end;
+        int any = 0;
+        switch (v->type) {
+            case RAY_F64: { const double* d = p; for (int64_t i = s; i < e; i++) any |= (d[i] != d[i]); break; }
+            case RAY_F32: { const float* d = p; for (int64_t i = s; i < e; i++) any |= (d[i] != d[i]); break; }
+            case RAY_I64: case RAY_TIMESTAMP: { const int64_t* d = p; for (int64_t i = s; i < e; i++) any |= (d[i] == NULL_I64); break; }
+            case RAY_I32: case RAY_DATE: case RAY_TIME: { const int32_t* d = p; for (int64_t i = s; i < e; i++) any |= (d[i] == NULL_I32); break; }
+            case RAY_I16: { const int16_t* d = p; for (int64_t i = s; i < e; i++) any |= (d[i] == NULL_I16); break; }
+            case RAY_GUID: { const uint64_t* d = p; for (int64_t i = s; i < e; i++) any |= (d[2 * i] == 0 && d[2 * i + 1] == 0); break; }
+            default: return false;
+        }
+        if (any) return true;
+    }
+    return false;
+}
+
+static void key_null_scan_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    key_null_scan_t* c = raw;
+    if (atomic_load_explicit(&c->found, memory_order_relaxed)) return;
+    if (key_null_in_range(c->v, start, end)) atomic_store_explicit(&c->found, 1, memory_order_relaxed);
+}
+
+/* A result key column inherits its source column's "may have nulls" flag,
+ * but a fused `where:` can remove every null row, and the same query over
+ * the filtered table materialized first carries no flag: one result, two
+ * spellings on the wire.  For a typed key keep the flag only when a key
+ * value is null: a vectorised sentinel scan, split across the pool for a
+ * large column.  Text keys keep theirs: for them the flag is always "may". */
+void ray_group_key_settle_nulls(ray_t* kc) {
+    if (!kc || RAY_IS_ERR(kc) || !(kc->attrs & RAY_ATTR_HAS_NULLS)) return;
+    switch (kc->type) {
+        case RAY_F64: case RAY_F32: case RAY_I64: case RAY_TIMESTAMP:
+        case RAY_I32: case RAY_DATE: case RAY_TIME: case RAY_I16: case RAY_GUID: break;
+        default: return;
+    }
+    key_null_scan_t c = { kc, 0 };
+    ray_pool_t* pool = ray_pool_get();
+    if (ray_pool_par_dispatch_ok(pool, kc->len, RAY_PARALLEL_THRESHOLD))
+        ray_pool_dispatch(pool, key_null_scan_fn, &c, kc->len);
+    else key_null_scan_fn(&c, 0, 0, kc->len);
+    if (!atomic_load_explicit(&c.found, memory_order_relaxed))
+        kc->attrs &= (uint8_t)~RAY_ATTR_HAS_NULLS;
+}
+
 /* Build a result key column of src_col's type by gathering the first-row cell
  * of each group at native (type-exact) byte width.  For SYM, adopts the source
  * domain so the intern ids resolve correctly.  Caller owns the returned column. */
@@ -684,7 +1066,14 @@ ray_t* ray_group_gather(ray_t* src_col, const int64_t* first_row, int64_t n) {
         if (!out || RAY_IS_ERR(out)) return out;
         for (int64_t i = 0; i < n; i++) {
             ray_t* value = first_row[i] < 0 ? NULL : ray_list_get(src_col, first_row[i]);
-            out = ray_list_append(out, value);
+            /* A failed append returns an error and leaves `out`, with the
+             * items it already retained, to the caller. */
+            ray_t* next = ray_list_append(out, value);
+            if (!next || RAY_IS_ERR(next)) {
+                ray_release(out);
+                return next ? next : ray_error("oom", NULL);
+            }
+            out = next;
         }
         return out;
     }
@@ -723,10 +1112,10 @@ ray_t* ray_group_gather(ray_t* src_col, const int64_t* first_row, int64_t n) {
         ray_pool_dispatch(pool, agg_gather_native_run, &c, n);
     else agg_gather_native_run(&c, 0, 0, n);
     if (agg_cancelled()) { ray_release(out); return ray_error("cancel", NULL); }
-    if (ray_vec_may_have_nulls(src_col) ||
-            (atomic_load_explicit(&c.any_null, memory_order_relaxed) &&
-             src_col->type != RAY_BOOL && src_col->type != RAY_U8))
-        out->attrs |= RAY_ATTR_HAS_NULLS;
+    bool gathered_null = atomic_load_explicit(&c.any_null, memory_order_relaxed) &&
+                         src_col->type != RAY_BOOL && src_col->type != RAY_U8;
+    if (gathered_null || ray_vec_may_have_nulls(src_col)) out->attrs |= RAY_ATTR_HAS_NULLS;
+    if (!gathered_null) ray_group_key_settle_nulls(out);
     return out;
 }
 
@@ -807,6 +1196,7 @@ typedef struct {
     const int64_t*  prefix;     /* per-segment selected-count prefix */
     int64_t         nrows;
     uint32_t        n_segs;
+    int64_t         row_end;    /* past the segment of the range's last selected row */
     /* iteration state */
     int64_t         remaining;  /* selected rows left in this worker's range */
     uint32_t        seg;        /* current segment */
@@ -826,6 +1216,7 @@ static void agg_sel_cursor_init(agg_sel_cursor_t* c, ray_t* sel,
     c->nrows   = m->nrows;
     c->n_segs  = m->n_segs;
     c->remaining = sel_end - sel_start;
+    c->row_end = c->nrows;
     if (c->remaining <= 0) { c->seg = c->n_segs; c->seg_pos = 0; return; }
     /* Find the segment containing the sel_start'th selected row: largest s with
      * prefix[s] <= sel_start.  Linear-then-skip is fine (n_segs small), but the
@@ -838,6 +1229,13 @@ static void agg_sel_cursor_init(agg_sel_cursor_t* c, ray_t* sel,
     }
     c->seg = lo;
     c->seg_pos = sel_start - prefix[lo];   /* intra-segment selected offset */
+    /* And the one holding the last: the rows read ahead end there. */
+    for (hi = c->n_segs; lo < hi; ) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        if (prefix[mid + 1] <= sel_end - 1) lo = mid + 1;
+        else hi = mid;
+    }
+    if ((int64_t)(lo + 1) * RAY_MORSEL_ELEMS < c->nrows) c->row_end = (int64_t)(lo + 1) * RAY_MORSEL_ELEMS;
 }
 
 /* Decode the next chunk of original row indices into rows[] (cap AGG_SEL_CHUNK);
@@ -868,6 +1266,10 @@ static int64_t agg_sel_cursor_next(agg_sel_cursor_t* c, int64_t* rows) {
             if (c->seg_pos >= seg_sel) { c->seg++; c->seg_pos = 0; }
         }
     }
+    /* A pass over the selection reads these rows next, in order: often the
+     * first read of its aggregate inputs (scan read-ahead; the filter's
+     * zones keep the chunks it rules out from being requested). */
+    if (n) ray_pool_scan_at(c->nrows, rows[0], c->row_end);
     return n;
 }
 
@@ -1711,8 +2113,10 @@ static void agg_dense_task_fn(void* raw, uint32_t wid, int64_t start, int64_t en
         int64_t begin = chunk * task;
         int64_t limit = task + 1 == c->n_tasks ? c->task_rows : chunk * (task + 1);
         if (c->sel) agg_dense_phaseA_fn(c, (uint32_t)task, begin, limit);
-        else for (int64_t row = begin; row < limit && !agg_cancelled(); row += 8192)
+        else for (int64_t row = begin; row < limit && !agg_cancelled(); row += 8192) {
+            ray_pool_scan_at(c->task_rows, row, limit);
             agg_dense_phaseA_fn(c, (uint32_t)task, row, limit - row < 8192 ? limit : row + 8192);
+        }
         if (loc->eager) for (int64_t s = 0; s < loc->slots; s++)
             if (loc->first_row[s] != INT64_MAX)
                 loc->occupied[s / 64] |= UINT64_C(1) << (s % 64);
@@ -1979,6 +2383,7 @@ static ray_t* agg_dense_finish(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t
             if (kc->type == RAY_SYM) ray_sym_vec_adopt_domain(kc, sym_domain_rep(key_cols[k]));
             agg_dense_key_emit_t emit = {key_plan, occupied_slot, key_part_slots, key_bits, kc, k};
             ray_pool_dispatch(pool, agg_dense_key_emit, &emit, ng);
+            ray_group_key_settle_nulls(kc);
         }
         result = ray_table_add_col(result, key_syms[k], kc);
         ray_release(kc);
@@ -2040,6 +2445,7 @@ typedef struct {
     const dense_plan_t* plan;
     agg_valdesc_t values;
     int64_t rows, part_slots;
+    int64_t in_rows;               /* rows of the input selected_rows index */
     uint32_t sources, parts, bits, n_tasks;
     agg_dense_partition_task_t* tasks;
     uint64_t* counts;
@@ -2054,52 +2460,67 @@ typedef struct {
     _Atomic(bool) failed;
 } agg_dense_partition_ctx_t;
 
+/* Slots and partition counts of input positions [begin, limit). */
+static void agg_dense_partition_count_rows(agg_dense_partition_ctx_t* c, uint64_t* count,
+                                           int64_t begin, int64_t limit) {
+    const void* data = ray_data(c->key);
+    if (c->plan->n_keys > 1) {
+        #define PART_SLOT_MULTI(COMPONENT)                                 \
+            for (int64_t r = begin; r < limit; r++) {                    \
+                int64_t source = c->selected_rows ? c->selected_rows[r] : r; \
+                int64_t slot = 0;                                        \
+                for (uint32_t k = 0; k < c->plan->n_keys; k++)           \
+                    slot += COMPONENT(c->plan, k, agg_read_key_i64(c->keys[k], c->key_data[k], source)) * c->plan->strides[k]; \
+                c->gids[r] = (uint32_t)slot;                             \
+                count[slot & (c->parts - 1)]++;                          \
+            }
+        if (c->plan->compacted) { PART_SLOT_MULTI(agg_dense_component); }
+        else { PART_SLOT_MULTI(agg_dense_component_raw); }
+        #undef PART_SLOT_MULTI
+        return;
+    }
+    #define PART_COUNT(T) do { \
+        const T* p = data; \
+        for (int64_t r = begin; r < limit; r++) { \
+            uint32_t slot = (uint32_t)agg_dense_component_raw(c->plan, 0, (int64_t)p[c->selected_rows ? c->selected_rows[r] : r]); \
+            c->gids[r] = slot; \
+            count[slot & (c->parts - 1)]++; \
+        } \
+    } while (0)
+    switch (c->key->type) {
+        case RAY_I64: case RAY_TIMESTAMP: PART_COUNT(int64_t); break;
+        case RAY_I32: case RAY_DATE: case RAY_TIME: PART_COUNT(int32_t); break;
+        case RAY_I16: PART_COUNT(int16_t); break;
+        case RAY_U8: case RAY_BOOL: PART_COUNT(uint8_t); break;
+        case RAY_SYM:
+            switch (c->key->attrs & RAY_SYM_W_MASK) {
+                case RAY_SYM_W8: PART_COUNT(uint8_t); break;
+                case RAY_SYM_W16: PART_COUNT(uint16_t); break;
+                case RAY_SYM_W32: PART_COUNT(uint32_t); break;
+                default: PART_COUNT(int64_t); break;
+            }
+            break;
+    }
+    #undef PART_COUNT
+}
+
 static void agg_dense_partition_count(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
     agg_dense_partition_ctx_t* c = raw;
-    const void* data = ray_data(c->key);
     for (int64_t task = start; task < end; task++) {
         int64_t begin = c->rows / c->sources * task;
         int64_t limit = task + 1 == c->sources ? c->rows : c->rows / c->sources * (task + 1);
         uint64_t* count = c->counts + task * c->parts;
-        if (c->plan->n_keys > 1) {
-            #define PART_SLOT_MULTI(COMPONENT)                                 \
-                for (int64_t r = begin; r < limit; r++) {                    \
-                    int64_t source = c->selected_rows ? c->selected_rows[r] : r; \
-                    int64_t slot = 0;                                        \
-                    for (uint32_t k = 0; k < c->plan->n_keys; k++)           \
-                        slot += COMPONENT(c->plan, k, agg_read_key_i64(c->keys[k], c->key_data[k], source)) * c->plan->strides[k]; \
-                    c->gids[r] = (uint32_t)slot;                             \
-                    count[slot & (c->parts - 1)]++;                          \
-                }
-            if (c->plan->compacted) { PART_SLOT_MULTI(agg_dense_component); }
-            else { PART_SLOT_MULTI(agg_dense_component_raw); }
-            #undef PART_SLOT_MULTI
-            continue;
+        if (begin >= limit) continue;
+        /* This pass is the first read of the keys: keep the rows past each
+         * block requested from storage (scan read-ahead), from the input
+         * row the block starts at — selected rows come in order. */
+        const int64_t* sel = c->selected_rows;
+        int64_t stop = sel ? sel[limit - 1] + 1 : limit;
+        for (int64_t b = begin; b < limit; b += 8192) {
+            ray_pool_scan_at(c->in_rows, sel ? sel[b] : b, stop);
+            agg_dense_partition_count_rows(c, count, b, limit - b > 8192 ? b + 8192 : limit);
         }
-        #define PART_COUNT(T) do { \
-            const T* p = data; \
-            for (int64_t r = begin; r < limit; r++) { \
-                uint32_t slot = (uint32_t)agg_dense_component_raw(c->plan, 0, (int64_t)p[c->selected_rows ? c->selected_rows[r] : r]); \
-                c->gids[r] = slot; \
-                count[slot & (c->parts - 1)]++; \
-            } \
-        } while (0)
-        switch (c->key->type) {
-            case RAY_I64: case RAY_TIMESTAMP: PART_COUNT(int64_t); break;
-            case RAY_I32: case RAY_DATE: case RAY_TIME: PART_COUNT(int32_t); break;
-            case RAY_I16: PART_COUNT(int16_t); break;
-            case RAY_U8: case RAY_BOOL: PART_COUNT(uint8_t); break;
-            case RAY_SYM:
-                switch (c->key->attrs & RAY_SYM_W_MASK) {
-                    case RAY_SYM_W8: PART_COUNT(uint8_t); break;
-                    case RAY_SYM_W16: PART_COUNT(uint16_t); break;
-                    case RAY_SYM_W32: PART_COUNT(uint32_t); break;
-                    default: PART_COUNT(int64_t); break;
-                }
-                break;
-        }
-        #undef PART_COUNT
     }
 }
 
@@ -2126,6 +2547,58 @@ static void agg_dense_partition_field(agg_dense_partition_ctx_t* c, const void* 
     #undef SCATTER_FIELD
 }
 
+/* Records of input positions [begin, limit), written at `cursor`. */
+static void agg_dense_partition_scatter_rows(agg_dense_partition_ctx_t* c, uint64_t* cursor,
+                                             int64_t begin, int64_t limit) {
+    const agg_valdesc_t* vd = &c->values;
+    if (vd->n_aggs == 1 && vd->val_data[0] && !vd->val2_data[0]) {
+        #define SCATTER_UNARY(W) do { \
+            for (int64_t r = begin; r < limit; r++) { \
+                uint32_t slot = c->gids[r]; \
+                uint32_t gid = slot >> c->bits, part = slot & (c->parts - 1); \
+                char* dst = c->payload + cursor[part]++ * (4 + (W)); \
+                memcpy(dst, &gid, 4); \
+                memcpy(dst + 4, (const char*)vd->val_data[0] + (size_t)(c->selected_rows ? c->selected_rows[r] : r) * (W), (W)); \
+            } \
+        } while (0)
+        switch (vd->val_esz[0]) {
+            case 1: SCATTER_UNARY(1); break;
+            case 2: SCATTER_UNARY(2); break;
+            case 4: SCATTER_UNARY(4); break;
+            case 8: SCATTER_UNARY(8); break;
+        }
+        #undef SCATTER_UNARY
+        return;
+    }
+    /* Complete nearby records before advancing through a source
+     * range. Whole-column passes repeatedly read/write the same large
+     * output buffer when several input fields share each record. */
+    int64_t chunk_rows = (64 * 1024) / c->record_size;
+    if (chunk_rows > AGG_SEL_CHUNK) chunk_rows = AGG_SEL_CHUNK;
+    if (chunk_rows < 1) chunk_rows = 1;
+    uint64_t chunk_starts[RAY_POOL_INIT_TASKS / 2];
+    for (int64_t chunk = begin; chunk < limit; chunk += chunk_rows) {
+        int64_t chunk_end = limit - chunk < chunk_rows ? limit : chunk + chunk_rows;
+        memcpy(chunk_starts, cursor, c->parts * sizeof(*cursor));
+        for (int64_t r = chunk; r < chunk_end; r++) {
+            uint32_t slot = c->gids[r], part = slot & (c->parts - 1), gid = slot >> c->bits;
+            char* dst = c->payload + cursor[part]++ * c->record_size;
+            memcpy(dst, &gid, 4);
+        }
+        size_t emitted = sizeof(uint32_t);
+        for (uint32_t a = 0; a < vd->n_aggs; a++) {
+            if (vd->val_data[a] && c->value_offsets[a] >= emitted) {
+                agg_dense_partition_field(c, vd->val_data[a], vd->val_esz[a], c->value_offsets[a], chunk_starts, chunk, chunk_end);
+                emitted = c->value_offsets[a] + vd->val_esz[a];
+            }
+            if (vd->val2_data[a] && c->value2_offsets[a] >= emitted) {
+                agg_dense_partition_field(c, vd->val2_data[a], vd->val2_esz[a], c->value2_offsets[a], chunk_starts, chunk, chunk_end);
+                emitted = c->value2_offsets[a] + vd->val2_esz[a];
+            }
+        }
+    }
+}
+
 static void agg_dense_partition_scatter(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
     agg_dense_partition_ctx_t* c = raw;
@@ -2136,52 +2609,14 @@ static void agg_dense_partition_scatter(void* raw, uint32_t wid, int64_t start, 
         uint64_t cursor[RAY_POOL_INIT_TASKS / 2];
         assert(c->parts <= RAY_POOL_INIT_TASKS / 2);
         memcpy(cursor, starts, c->parts * sizeof(*cursor));
-        const agg_valdesc_t* vd = &c->values;
-        if (vd->n_aggs == 1 && vd->val_data[0] && !vd->val2_data[0]) {
-            #define SCATTER_UNARY(W) do { \
-                for (int64_t r = begin; r < limit; r++) { \
-                    uint32_t slot = c->gids[r]; \
-                    uint32_t gid = slot >> c->bits, part = slot & (c->parts - 1); \
-                    char* dst = c->payload + cursor[part]++ * (4 + (W)); \
-                    memcpy(dst, &gid, 4); \
-                    memcpy(dst + 4, (const char*)vd->val_data[0] + (size_t)(c->selected_rows ? c->selected_rows[r] : r) * (W), (W)); \
-                } \
-            } while (0)
-            switch (vd->val_esz[0]) {
-                case 1: SCATTER_UNARY(1); break;
-                case 2: SCATTER_UNARY(2); break;
-                case 4: SCATTER_UNARY(4); break;
-                case 8: SCATTER_UNARY(8); break;
-            }
-            #undef SCATTER_UNARY
-        } else {
-            /* Complete nearby records before advancing through a source
-             * range. Whole-column passes repeatedly read/write the same large
-             * output buffer when several input fields share each record. */
-            int64_t chunk_rows = (64 * 1024) / c->record_size;
-            if (chunk_rows > AGG_SEL_CHUNK) chunk_rows = AGG_SEL_CHUNK;
-            if (chunk_rows < 1) chunk_rows = 1;
-            uint64_t chunk_starts[RAY_POOL_INIT_TASKS / 2];
-            for (int64_t chunk = begin; chunk < limit; chunk += chunk_rows) {
-                int64_t chunk_end = limit - chunk < chunk_rows ? limit : chunk + chunk_rows;
-                memcpy(chunk_starts, cursor, c->parts * sizeof(*cursor));
-                for (int64_t r = chunk; r < chunk_end; r++) {
-                    uint32_t slot = c->gids[r], part = slot & (c->parts - 1), gid = slot >> c->bits;
-                    char* dst = c->payload + cursor[part]++ * c->record_size;
-                    memcpy(dst, &gid, 4);
-                }
-                size_t emitted = sizeof(uint32_t);
-                for (uint32_t a = 0; a < vd->n_aggs; a++) {
-                    if (vd->val_data[a] && c->value_offsets[a] >= emitted) {
-                        agg_dense_partition_field(c, vd->val_data[a], vd->val_esz[a], c->value_offsets[a], chunk_starts, chunk, chunk_end);
-                        emitted = c->value_offsets[a] + vd->val_esz[a];
-                    }
-                    if (vd->val2_data[a] && c->value2_offsets[a] >= emitted) {
-                        agg_dense_partition_field(c, vd->val2_data[a], vd->val2_esz[a], c->value2_offsets[a], chunk_starts, chunk, chunk_end);
-                        emitted = c->value2_offsets[a] + vd->val2_esz[a];
-                    }
-                }
-            }
+        if (begin >= limit) continue;
+        /* The first read of the aggregate inputs: keep the rows past each
+         * block requested, as in the count pass. */
+        const int64_t* sel = c->selected_rows;
+        int64_t stop = sel ? sel[limit - 1] + 1 : limit;
+        for (int64_t b = begin; b < limit; b += 8192) {
+            ray_pool_scan_at(c->in_rows, sel ? sel[b] : b, stop);
+            agg_dense_partition_scatter_rows(c, cursor, b, limit - b > 8192 ? b + 8192 : limit);
         }
     }
 }
@@ -2332,6 +2767,7 @@ static ray_t* agg_dense_partitioned(ray_t** key_cols, int64_t* key_syms, ray_op_
     agg_dense_partition_ctx_t c = {
         .key = key_cols[0], .keys = key_cols, .key_data = d->key_data,
         .plan = plan, .rows = rows, .part_slots = part_slots,
+        .in_rows = selection ? ray_rowsel_meta(selection)->nrows : rows,
         .sources = sources, .parts = parts, .bits = bits, .failed = false,
         .values = { .n_aggs = ext->n_aggs, .vts = vo->vts, .off = vo->off, .block = vo->block,
             .val_data = d->val_data, .val_types = d->val_types, .val_hasnull = d->val_hasnull, .val_esz = d->val_esz,
@@ -3285,8 +3721,15 @@ RAY_INLINE void agg_radix_chunk_pass(agg_radix_ctx_t* c, int64_t ch, bool scatte
                 agg_radix_visit(c, cur, rows[i], pos++, scatter);
         return;
     }
-    for (int64_t r = start; r < end; r++)
-        agg_radix_visit(c, cur, r, r, scatter);
+    /* Keep the next rows requested from storage, block by block (scan
+     * read-ahead): the count pass is the first read of the key columns, the
+     * scatter pass the first of the aggregate columns. */
+    for (int64_t b = start; b < end; b += 8192) {
+        int64_t e = end - b > 8192 ? b + 8192 : end;
+        ray_pool_scan_at(c->n_in, b, end);
+        for (int64_t r = b; r < e; r++)
+            agg_radix_visit(c, cur, r, r, scatter);
+    }
 }
 
 /* Phase 1, pass 1: count each chunk's rows per partition. */
@@ -4202,6 +4645,7 @@ static ray_t* agg_parts_emit(ray_op_ext_t* ext, agg_desc_t* d,
         ray_release(result); return kerr;
     }
     for (uint32_t k = 0; k < n_keys; k++) {
+        ray_group_key_settle_nulls(kouts[k]);
         result = ray_table_add_col(result, key_syms[k], kouts[k]);
         ray_release(kouts[k]);
     }
@@ -5232,6 +5676,13 @@ static bool agg_ts_precheck_declines(ray_t** key_cols, uint32_t n_keys, int64_t 
     const int64_t ratio = AGG_TS_PRE_SAMPLE2 / AGG_TS_PRE_SAMPLE;
     int64_t pstep = nrows / AGG_TS_PRE_SAMPLE2;
     if (pstep < 1) pstep = 1;
+    if (!sel)
+        for (uint32_t k = 0; k < n_keys; k++)
+            if (ray_col_cold(key_cols[k]))
+                for (int64_t i = 0; i < AGG_TS_PRE_SAMPLE2; i++) {
+                    int64_t pos = i * pstep + (int64_t)(ray_hash_i64(i + 7919) % (uint64_t)pstep);
+                    if (pos < nrows) ray_col_want_row(key_cols[k], pos);
+                }
     int64_t d = 0, n = 0;
     bool declined = false;
     for (int64_t phase = 0; phase < ratio && !declined; phase++) {
@@ -5311,6 +5762,12 @@ static double agg_ts_estimate(ray_pool_t* pool, ray_t** key_cols, const void** k
         .sel = sel, .sel_prefix = sel_prefix,
         .hs = hs, .cnt = cnt, .keys = keys, .n = ns,
     };
+    if (!sel)
+        for (uint32_t k = 0; k < n_keys; k++)
+            if (ray_col_cold(key_cols[k]))
+                for (int64_t i = 0; i < AGG_TS_SAMPLE; i++)
+                    ray_col_want_row(key_cols[k],
+                        i * ctx.step + (int64_t)(ray_hash_i64(i) % (uint64_t)ctx.step));
     if (ray_pool_par_dispatch_ok(pool, AGG_TS_SAMPLE, 1))
         ray_pool_dispatch_n(pool, agg_ts_sample_fn, &ctx, AGG_TS_SAMPLE_TASKS);
     else
@@ -5978,6 +6435,10 @@ static ray_t* agg_indexed_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         ray_t* src = ie ? ray_table_get_col(tbl, ie->sym) : NULL;
         int64_t param = ext->agg_k ? ext->agg_k[a] : 0;
         ray_t* col = NULL;
+        /* The kernels below read src at every row, group by group, so at
+         * scattered rows: a cold mapped column is requested first, whole
+         * (scan read-ahead). */
+        if (src && ray_pool_scan_on()) ray_col_want_rows(src, rows, nrows);
         if (kind == OP_MEDIAN) col = ray_median_per_group_buf(src, rows, offsets, counts, ng);
         else if (kind == OP_QUANTILE) {
             double q = 0.5; if (ext->agg_k) memcpy(&q, &param, sizeof(q));
@@ -6051,6 +6512,9 @@ static bool agg_shared_sample(ray_graph_t* g, ray_op_ext_t* ext, ray_t* tbl,
     uint32_t gid = 0;
     int groups = 0, unchanged = 0;
     int64_t step = rows / SAMPLES;
+    if (ray_col_cold(keys[0]))
+        for (int i = 0; i < SAMPLES; i++)
+            ray_col_want_row(keys[0], i * step + (int64_t)(ray_hash_i64(i) % (uint64_t)step));
     for (int i = 0; i < SAMPLES; i++) {
         uint64_t jitter = ray_hash_i64(i);
         int64_t row = i * step + jitter % step;
@@ -6343,6 +6807,7 @@ static void agg_firstn_task(agg_firstn_ctx_t* c, uint32_t t) {
         if (fl && fl[seg] == RAY_SEL_NONE) continue;
         int64_t b = seg * RAY_MORSEL_ELEMS;
         int64_t len = c->nrows - b < RAY_MORSEL_ELEMS ? c->nrows - b : RAY_MORSEL_ELEMS;
+        if (!(seg & 7)) ray_pool_scan_at(c->nrows, b, s1 * RAY_MORSEL_ELEMS);
         for (int64_t i = 0; i < len; i++) hb[i] = AGG_FIRSTN_SEED;
         for (uint32_t k = 0; k < n_keys; k++)
             agg_firstn_hash_block(hb, c->key_cols[k], c->key_data[k], b, len);
@@ -6474,6 +6939,9 @@ static ray_t* agg_first_n_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t 
     {
         int64_t samples = nrows < AGG_FIRSTN_SAMPLES ? nrows : AGG_FIRSTN_SAMPLES;
         int64_t step = nrows / samples, hits = 0;
+        for (uint32_t k = 0; k < n_keys; k++)
+            if (ray_col_cold(key_cols[k]))
+                for (int64_t i = 0; i < samples; i++) ray_col_want_row(key_cols[k], i * step);
         for (int64_t i = 0; i < samples; i++) {
             for (uint32_t k = 0; k < n_keys; k++)
                 kv[k] = agg_read_key_i64(key_cols[k], key_data[k], i * step);
@@ -6701,7 +7169,7 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
          * this is data-derived and independent of cache or RAM size. */
         uint32_t dense_workers = ray_pool_total_workers(pool);
         double scatter_budget = (double)eff_n * 2 * (8.0 * (ext->n_keys + ext->n_aggs + 1));
-        int64_t watermark = ray_heap_anon_watermark();
+        int64_t watermark = ray_heap_mem_budget();
         double dense_budget = scatter_budget;
         if (dense_budget > (double)SIZE_MAX) dense_budget = (double)SIZE_MAX;
         if (watermark > 0 && dense_budget > (double)watermark / 4) dense_budget = (double)watermark / 4;
@@ -6805,6 +7273,15 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         if (dense_par_ok && !sel && ext->n_keys == 1) {
             const void* data = ray_data(key_cols[0]);
             double touched_slots = 0;
+            if (ray_col_cold(key_cols[0]))
+                for (uint32_t w = 0; w < dense_workers; w++) {
+                    int64_t start = nrows / dense_workers * w;
+                    int64_t end = w + 1 == dense_workers ? nrows : nrows / dense_workers * (w + 1);
+                    int64_t samples = end - start < 1024 ? end - start : 1024;
+                    for (int64_t i = 0; i < samples; i++)
+                        ray_col_want_row(key_cols[0],
+                            start + i * ((end - start - 1) / (samples > 1 ? samples - 1 : 1)));
+                }
             for (uint32_t w = 0; w < dense_workers; w++) {
                 int64_t start = nrows / dense_workers * w;
                 int64_t end = w + 1 == dense_workers ? nrows : nrows / dense_workers * (w + 1);
@@ -6969,7 +7446,7 @@ static ray_t* agg_build_compact(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         if (!seen) want[n_want++] = s;
     }
     for (uint32_t a = 0; a < ext->n_aggs; a++) {
-        if (ext->agg_ops[a] == OP_COUNT && !(ext->agg_ins && ext->agg_ins[a] != RAY_OP_NONE))
+        if (ext->agg_ops[a] == OP_COUNT)
             continue;                       /* COUNT needs no typed input */
         ray_op_t* ins[2] = { ext->agg_ins ? op_node(g, ext->agg_ins[a]) : NULL,
                              ext->agg_ins2 ? op_node(g, ext->agg_ins2[a]) : NULL };

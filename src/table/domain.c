@@ -62,10 +62,12 @@
 #include "mem/heap.h"
 #include "mem/sys.h"   /* domain buffers are process-global → mmap-backed, not buddy */
 #include "mem/arena.h"   /* ray_arena_t / ray_arena_str — domain atom storage */
+#include "store/part.h"     /* discard unused partition-owned FILE domains */
 #include "store/fileio.h"   /* flock + tmp/rename protocol for flush */
 #include "ops/hash.h"       /* ray_hash_bytes (same hash family as g_sym) */
 #include "core/pool.h"      /* batch intern: parallel read-only probe */
 #include "sym.h"            /* ray_sym_intern_prehashed (runtime fallback) */
+#include "symimp.h"         /* DOM_IMPORT */
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -89,6 +91,9 @@
 typedef enum {
     DOM_RUNTIME = 0,
     DOM_FILE    = 1,
+    /* A symbol file one converter builds alone (ray_symimp_t): intern,
+     * count, flush and release only. */
+    DOM_IMPORT  = 2,
 } dom_kind_t;
 
 /* ---- per-domain string-atom arena ----------------------------------------
@@ -191,6 +196,8 @@ struct ray_sym_domain_s {
     int32_t   batch_inflight;
 
     dom_retired_t* retired; /* replaced atom arrays + old LUTs */
+
+    struct ray_symimp_s* imp; /* DOM_IMPORT: the import dictionary */
 
     struct ray_sym_domain_s* next; /* cache chain */
 };
@@ -340,6 +347,7 @@ static bool dom_publish_raw_snap(ray_sym_domain_t* d) {
 /* Free a FILE domain after the last reference dropped.  Caller has
  * already unlinked it from the cache. */
 static void dom_destroy(ray_sym_domain_t* d) {
+    if (d->imp) ray_symimp_free(d->imp);
     /* Atoms are RAY_ATTR_ARENA — never refcounted, never individually freed.
      * The arena bulk-frees them; we only free the pointer ARRAY here. */
     ray_t** atoms = atomic_load_explicit(&d->atoms, memory_order_relaxed);
@@ -583,6 +591,12 @@ static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
 static ray_sym_domain_t* dom_open_impl(const char* path, bool create) {
     if (!path) return NULL;
 
+    /* A script or IPC caller may drop a parted view without running GC.
+     * Do not let its cache-only domain survive into a splayed read/write
+     * of a rebuilt root. Prune before taking g_dom_lock: releasing the
+     * cached SYM columns takes that lock itself. Live views keep their refs. */
+    ray_parted_cache_prune();
+
     char* rpath = dom_resolve_path(path);
     if (!rpath) return NULL;
 
@@ -685,6 +699,31 @@ ray_sym_domain_t* ray_sym_domain_open_or_create(const char* path) {
     return dom_open_impl(path, true);
 }
 
+ray_sym_domain_t* ray_sym_domain_create_import(const char* path) {
+    if (!path) return NULL;
+    ray_sym_domain_t* d = (ray_sym_domain_t*)ray_sys_alloc(sizeof(*d));
+    if (!d) return NULL;
+    memset(d, 0, sizeof(*d));
+    d->kind = DOM_IMPORT;
+    d->rc = 1;
+    size_t pl = strlen(path);
+    d->path = (char*)ray_sys_alloc(pl + 1);
+    if (d->path) memcpy(d->path, path, pl + 1);
+    if (d->path) d->imp = ray_symimp_create(path, &d->count);
+    if (!d->imp) { ray_sys_free(d->path); ray_sys_free(d); return NULL; }
+    return d;
+}
+
+bool ray_sym_domain_import_stats(ray_sym_domain_t* dom, struct ray_symimp_stats_s* out) {
+    if (!dom || dom->kind != DOM_IMPORT) return false;
+    ray_symimp_stats(dom->imp, out);
+    return true;
+}
+
+struct ray_symimp_s* ray_sym_domain_import(ray_sym_domain_t* dom) {
+    return dom && dom->kind == DOM_IMPORT ? dom->imp : NULL;
+}
+
 ray_sym_domain_t* ray_sym_domain_new(void) {
     ray_sym_domain_t* d = ray_sys_alloc(sizeof(*d));
     if (!d) return NULL;
@@ -724,6 +763,7 @@ void ray_sym_domain_release(ray_sym_domain_t* dom) {
 ray_t* ray_sym_domain_str(ray_sym_domain_t* dom, int64_t pos) {
     if (!dom) return NULL;
     if (dom->kind == DOM_RUNTIME) return ray_sym_str(pos);
+    if (dom->kind == DOM_IMPORT) return NULL;
 
     /* Lock-free fast path: acquire the published count, then the array, then
      * the slot.  Appends release-publish the count after the slot write;
@@ -745,7 +785,7 @@ ray_t* ray_sym_domain_str(ray_sym_domain_t* dom, int64_t pos) {
 }
 
 bool ray_sym_domain_raw_pin(ray_sym_domain_t* dom, ray_sym_domain_raw_t* out) {
-    if (!dom || !out || dom->kind == DOM_RUNTIME) return false;
+    if (!dom || !out || dom->kind != DOM_FILE) return false;
     dom_raw_snap_t* snap = atomic_load_explicit(&dom->raw_snap, memory_order_acquire);
     if (!snap) return false;
     out->map = snap->map;
@@ -763,6 +803,9 @@ static const int64_t g_empty_lut[1] = { -1 };
 
 const int64_t* ray_sym_domain_runtime_lut(ray_sym_domain_t* dom) {
     if (!dom || dom->kind == DOM_RUNTIME) return NULL;
+    /* never asked for: an import's columns are read back through the
+     * file domain, after the import dictionary is gone */
+    if (dom->kind == DOM_IMPORT) return NULL;
 
     int64_t* lut = atomic_load_explicit(&dom->runtime_lut, memory_order_acquire);
     if (lut) return lut;
@@ -867,6 +910,7 @@ static int64_t dom_probe_locked(ray_sym_domain_t* d, uint32_t h,
 int64_t ray_sym_domain_find(ray_sym_domain_t* dom, const char* str, size_t len) {
     if (!dom || !str) return -1;
     if (dom->kind == DOM_RUNTIME) return ray_sym_find(str, len);
+    if (dom->kind == DOM_IMPORT) return -1;
 
     if (atomic_load_explicit(&dom->count, memory_order_acquire) == 0)
         return -1;
@@ -961,6 +1005,11 @@ static int64_t dom_append_locked(ray_sym_domain_t* d, uint32_t h,
 int64_t ray_sym_domain_intern(ray_sym_domain_t* dom, const char* str, size_t len) {
     if (!dom || !str) return -1;
     if (dom->kind == DOM_RUNTIME) return ray_sym_intern(str, len);
+    if (dom->kind == DOM_IMPORT) {
+        uint64_t h = ray_hash_bytes(str, len);
+        int64_t pos = -1;
+        return ray_symimp_intern_batch(dom->imp, 1, &str, &len, &h, &pos) ? pos : -1;
+    }
 
     dom_lock();
     if (!dom->buckets && !dom_build_index_locked(dom, 1)) {
@@ -1158,6 +1207,19 @@ bool ray_sym_domain_intern_batch(ray_sym_domain_t* dom, int64_t n,
                                  const uint32_t* hashes, int64_t* out_pos) {
     if (!dom || n < 0) return false;
     if (n == 0) return true;
+    if (dom->kind == DOM_IMPORT) {
+        /* The import dictionary keys on all 64 bits of the hash, which a
+         * caller of this entry point has dropped: hashed again here
+         * (ray_sym_domain_intern_batch64 is the path that keeps them). */
+        uint64_t h64[1024];
+        for (int64_t o = 0; o < n; o += 1024) {
+            int64_t k = n - o < 1024 ? n - o : 1024;
+            for (int64_t i = 0; i < k; i++)
+                h64[i] = strs[o + i] ? ray_hash_bytes(strs[o + i], lens[o + i]) : ray_hash_bytes("", 0);
+            if (!ray_symimp_intern_batch(dom->imp, k, strs + o, lens + o, h64, out_pos + o)) return false;
+        }
+        return true;
+    }
     if (dom->kind == DOM_RUNTIME) {
         for (int64_t i = 0; i < n; i++) {
             int64_t id = ray_sym_intern_prehashed(hashes[i], strs[i], lens[i]);
@@ -1381,6 +1443,23 @@ bool ray_sym_domain_intern_batch(ray_sym_domain_t* dom, int64_t n,
     return ok;
 }
 
+bool ray_sym_domain_intern_batch64(ray_sym_domain_t* dom, int64_t n,
+                                   const char* const* strs, const size_t* lens,
+                                   const uint64_t* hashes, int64_t* out_pos) {
+    if (!dom || n < 0) return false;
+    if (dom->kind == DOM_IMPORT)
+        return n == 0 || ray_symimp_intern_batch(dom->imp, n, strs, lens, hashes, out_pos);
+    /* the other domains key on the low 32 bits; in slices of 4096, which
+     * still take the parallel probe */
+    uint32_t h32[4096];
+    for (int64_t o = 0; o < n; o += 4096) {
+        int64_t k = n - o < 4096 ? n - o : 4096;
+        for (int64_t i = 0; i < k; i++) h32[i] = (uint32_t)hashes[o + i];
+        if (!ray_sym_domain_intern_batch(dom, k, strs + o, lens + o, h32, out_pos + o)) return false;
+    }
+    return true;
+}
+
 int64_t ray_sym_domain_count(ray_sym_domain_t* dom) {
     if (!dom) return 0;
     if (dom->kind == DOM_RUNTIME) return (int64_t)ray_sym_count();
@@ -1397,6 +1476,7 @@ const char* ray_sym_domain_path(ray_sym_domain_t* dom) {
 ray_err_t ray_sym_domain_flush(ray_sym_domain_t* dom, bool durable) {
     if (!dom) return RAY_ERR_TYPE;
     if (dom->kind == DOM_RUNTIME) return RAY_OK; /* sym.c owns its own files */
+    if (dom->kind == DOM_IMPORT) return ray_symimp_sync(dom->imp, durable);
     if (!dom->path) return RAY_ERR_DOMAIN;
 
     dom_lock();
@@ -1542,6 +1622,116 @@ ray_err_t ray_sym_domain_flush(ray_sym_domain_t* dom, bool durable) {
 
 fail_tmp:
     remove(tmp_path);
+    ray_file_unlock(lock_fd);
+    ray_file_close(lock_fd);
+    return err;
+}
+
+static bool dom_fseek(FILE* f, int64_t off) {
+#ifdef RAY_OS_WINDOWS
+    return _fseeki64(f, off, SEEK_SET) == 0;
+#else
+    return fseeko(f, (off_t)off, SEEK_SET) == 0;
+#endif
+}
+
+ray_err_t ray_sym_domain_flush_append(ray_sym_domain_t* dom, bool durable) {
+    if (!dom) return RAY_ERR_TYPE;
+    if (dom->kind == DOM_RUNTIME) return RAY_OK;
+    if (dom->kind == DOM_IMPORT) return ray_symimp_sync(dom->imp, durable);
+    if (!dom->path) return RAY_ERR_DOMAIN;
+
+    dom_lock();
+    int64_t count = atomic_load_explicit(&dom->count, memory_order_relaxed);
+    int64_t disk_count = dom->disk_count;
+    size_t  disk_size  = dom->disk_size;
+    /* Only the entries past the persisted prefix are written: materialize
+     * those under the lock (arena-owned, they stay valid after it). */
+    for (int64_t i = disk_count; i < count; i++) {
+        if (!dom_atom_at_locked(dom, i)) { dom_unlock(); return RAY_ERR_OOM; }
+    }
+    ray_t** atoms = atomic_load_explicit(&dom->atoms, memory_order_relaxed);
+    dom_unlock();
+    if (count == disk_count && !durable) return RAY_OK;
+
+    char lock_path[1024];
+    if (snprintf(lock_path, sizeof(lock_path), "%s.lk", dom->path) >= (int)sizeof(lock_path))
+        return RAY_ERR_IO;
+    ray_fd_t lock_fd = ray_file_open(lock_path,
+                                     RAY_OPEN_READ | RAY_OPEN_WRITE | RAY_OPEN_CREATE);
+    if (lock_fd == RAY_FD_INVALID) return RAY_ERR_IO;
+    ray_err_t err = ray_file_lock_ex(lock_fd);
+    if (err != RAY_OK) { ray_file_close(lock_fd); return err; }
+
+    /* The file must still be the persisted size: anything else is another
+     * writer. */
+    struct stat st;
+    bool exists = stat(dom->path, &st) == 0;
+    if (disk_count == 0 ? (exists && st.st_size > 0)
+                        : (!exists || (size_t)st.st_size != disk_size)) {
+        ray_file_unlock(lock_fd);
+        ray_file_close(lock_fd);
+        return RAY_ERR_CORRUPT;
+    }
+    FILE* f = fopen(dom->path, disk_count == 0 ? "wb+" : "rb+");
+    if (!f) { ray_file_unlock(lock_fd); ray_file_close(lock_fd); return RAY_ERR_IO; }
+    size_t size = disk_size;
+    uint32_t magic = DOMAIN_STRL_MAGIC;
+    if (disk_count == 0) {
+        int64_t zero = 0;
+        if (fwrite(&magic, 4, 1, f) != 1 || fwrite(&zero, 8, 1, f) != 1) err = RAY_ERR_IO;
+        size = 12;
+    } else if (!dom_fseek(f, (int64_t)disk_size)) {
+        err = RAY_ERR_IO;
+    }
+    enum { FLUSH_BUF = 1u << 20 };
+    uint8_t* wb = err == RAY_OK ? (uint8_t*)ray_sys_alloc(FLUSH_BUF) : NULL;
+    size_t wn = 0;
+    if (err == RAY_OK && !wb) err = RAY_ERR_OOM;
+    for (int64_t i = disk_count; err == RAY_OK && i < count; i++) {
+        ray_t* s = atoms[i];
+        size_t slen = ray_str_len(s);
+        if (slen > UINT32_MAX) { err = RAY_ERR_RANGE; break; }
+        uint32_t len32 = (uint32_t)slen;
+        if (wn + 4 + slen > FLUSH_BUF) {
+            if (wn && fwrite(wb, 1, wn, f) != wn) { err = RAY_ERR_IO; break; }
+            wn = 0;
+        }
+        if (4 + slen > FLUSH_BUF) {
+            if (fwrite(&len32, 4, 1, f) != 1 || fwrite(ray_str_ptr(s), 1, slen, f) != slen) {
+                err = RAY_ERR_IO;
+                break;
+            }
+        } else {
+            memcpy(wb + wn, &len32, 4);
+            if (slen) memcpy(wb + wn + 4, ray_str_ptr(s), slen);
+            wn += 4 + slen;
+        }
+        size += 4 + slen;
+    }
+    if (err == RAY_OK && wn && fwrite(wb, 1, wn, f) != wn) err = RAY_ERR_IO;
+    ray_sys_free(wb);
+    /* the count goes in last, once the records it covers are written */
+    if (err == RAY_OK && (fflush(f) != 0 || !dom_fseek(f, 4) ||
+                          fwrite(&count, 8, 1, f) != 1 || fflush(f) != 0))
+        err = RAY_ERR_IO;
+    /* start writing the new records back now, so a later durable flush
+     * waits for little */
+    if (err == RAY_OK && !durable)
+        ray_file_writeback_start(fileno(f), (int64_t)disk_size, (int64_t)(size - disk_size));
+    if (fclose(f) != 0 && err == RAY_OK) err = RAY_ERR_IO;
+    if (err == RAY_OK && durable) {
+        ray_fd_t fd = ray_file_open(dom->path, RAY_OPEN_READ | RAY_OPEN_WRITE);
+        if (fd == RAY_FD_INVALID) err = RAY_ERR_IO;
+        else { err = ray_file_sync(fd); ray_file_close(fd); }
+        if (err == RAY_OK) err = ray_file_sync_dir(dom->path);
+    }
+    if (err == RAY_OK) {
+        dom_lock();
+        dom->disk_count = count;
+        dom->disk_size = size;
+        dom_unlock();
+    }
     ray_file_unlock(lock_fd);
     ray_file_close(lock_fd);
     return err;

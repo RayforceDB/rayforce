@@ -47,6 +47,10 @@
 #include <string.h>
 #include <math.h>
 
+/* True if every leaf is constant or reduced to a scalar. */
+bool op_tree_is_scalar(ray_graph_t* g, uint32_t id);
+bool op_tree_is_atom(ray_graph_t* g, uint32_t id);
+
 /* Borrow only while the symbol table stays read-only through the dispatch
  * barrier. Workers compare or copy source-domain codes without interning.
  * File-domain lookup keeps its own publication/lifetime contract. */
@@ -192,6 +196,18 @@ static inline int64_t read_col_i64(const void* data, int64_t row,
         return (int64_t)((const int32_t*)data)[row];
     case RAY_I16:
         return (int64_t)((const int16_t*)data)[row];
+    case RAY_F32: {
+        /* The 4-byte lane's bits, zero-extended, with -0.0 canonicalised
+         * to +0.0 the way the F64 group-key readers do (group_key_f64_bits,
+         * #407): a group hash table stores and compares these bits, so the
+         * two zeros must read alike.  Bit-level, as there, because release
+         * builds use -fno-signed-zeros.  Before this arm F32 fell to the
+         * one-byte default below, and a multi-core group by an F32 key
+         * hashed a byte of each value as the key (#760). */
+        uint32_t u; memcpy(&u, (const float*)data + row, 4);
+        if (u == 0x80000000u) u = 0;
+        return (int64_t)u;
+    }
     default: /* RAY_BOOL, RAY_U8 */
         return (int64_t)((const uint8_t*)data)[row];
     }
@@ -208,6 +224,9 @@ static inline void write_col_i64(void* data, int64_t row, int64_t val,
         ((int32_t*)data)[row] = (int32_t)val; return;
     case RAY_I16:
         ((int16_t*)data)[row] = (int16_t)val; return;
+    case RAY_F32: {
+        uint32_t u = (uint32_t)val; memcpy((float*)data + row, &u, 4); return;
+    }
     default: /* RAY_BOOL, RAY_U8 */
         ((uint8_t*)data)[row] = (uint8_t)val; return;
     }
@@ -643,6 +662,15 @@ ray_op_t* graph_alloc_node(ray_graph_t* g);
  * predicate without going through the full select planner. */
 ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr);
 
+/* The rows a `where:` keeps, sampled for the distinct-count route gate
+ * (query.c; exposed for the contract tests): the table rows surviving the
+ * predicate among CD_GATE_WHERE_SAMPLE sampled ones in *rows, *nrows of
+ * them, *population the rows the whole predicate would keep.  NULL (the
+ * outputs then describe the whole table) when the predicate names no
+ * column the gather covers or keeps every sampled row. */
+ray_t* query_cd_gate_where_rows(ray_t* tbl, ray_t* where_expr, int64_t n_table,
+                                const int64_t** rows, int64_t* nrows, int64_t* population);
+
 /* Pointer to trailing bytes after an ext node. */
 #define EXT_TRAIL(ext) ((char*)((ext) + 1))
 
@@ -990,6 +1018,17 @@ void partitioned_gather(ray_pool_t* pool, const int64_t* idx, int64_t n,
                         const uint8_t* esz, int64_t ncols);
 
 /* ── filter.c ── */
+/* Scan read-ahead registration (ray_pool_scan_set).  exec_scan_add_col adds
+ * `col` when it is a mapped fixed-width vector of the registration's length
+ * (the first such column sets it, resident or not) whose pages are not
+ * already resident, so a warm query registers nothing to read. */
+void exec_scan_init(ray_pool_scan_t* s);
+void exec_scan_add_col(ray_pool_scan_t* s, ray_t* col);
+/* The running select's filter produced selection `sel` (NULL: every row
+ * kept, or a compacted table of `kept` rows): request the columns its
+ * registration held back for it (query.c). */
+void ray_select_scan_filtered(ray_t* sel, int64_t kept);
+
 ray_t* exec_filter(ray_graph_t* g, ray_op_t* op, ray_t* input, ray_t* pred);
 ray_t* exec_filter_head(ray_t* input, ray_t* pred, int64_t limit);
 /* The one `where:` rule (see filter.c): consumes `pred`, returns an owned
@@ -1046,6 +1085,8 @@ ray_t* exec_in_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
                             bool* all_pass);
 ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input);
 ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* rhs);
+ray_t* exec_sym_order(uint16_t opcode, ray_t* lhs, ray_t* rhs,
+                      bool l_scalar, bool r_scalar);
 
 /* ── sort_exec.c ── */
 int sort_cmp(const sort_cmp_ctx_t* ctx, int64_t a, int64_t b);
@@ -1809,6 +1850,9 @@ void ray_group_winners(ray_group_winner_fn fn, void* context, const int64_t* row
 
 /* Gather winning group rows, retaining source domains and native types. */
 ray_t* ray_group_gather(ray_t* column, const int64_t* rows, int64_t count);
+/* Keep a grouped key column's "may have nulls" flag only when a key value is
+ * null (vectorised, pool-split scan); see agg_engine.c. */
+void   ray_group_key_settle_nulls(ray_t* kc);
 
 
 /* A scalar `where:` predicate holds for every row or none.  It needs a truth
@@ -1823,5 +1867,8 @@ static inline bool ray_pred_atom_type_ok(int8_t t) {
         return false;
     }
 }
+
+/* Owned merged query dict, or NULL when nested select composition is unsafe. */
+ray_t* ray_select_merge_plan(ray_t* dict);
 
 #endif /* RAY_EXEC_INTERNAL_H */

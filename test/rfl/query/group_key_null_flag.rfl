@@ -1,0 +1,61 @@
+;; group_key_null_flag.rfl — a grouped select whose `where:` removes every
+;; null key row must not flag the key column as holding nulls.
+;;
+;; The parallel dense grouping path (large inputs) emits the key column from
+;; slot codes and inherited the source column's "may have nulls" flag; the
+;; same query over the filtered table materialized first carried no flag, so
+;; the two spelled one result differently on the wire (found by the nested
+;; select differential fuzzer).  Byte 17 of a serialized vector is its attrs.
+(set T0 (table [a k p] (list [1 2 1] [1 0N 1] [10.3 5.1 8.4])))
+(set T (take T0 131073))
+(set got (select {from: T where: (== a 1) by: k total: (sum p)}))
+(set want (select {from: (do (select {from: T where: (== a 1) k: k p: p})) by: k total: (sum p)}))
+(count got) -- 1
+(at (ser (at got 'k)) 17) -- 0x00
+(all (== (ser got) (ser want))) -- true
+;; a null key that survives the filter keeps the flag
+(set got2 (select {from: T where: (> p 5.0) by: k total: (sum p)}))
+(at got2 'k) -- [1 0Nl]
+(at (ser (at got2 'k)) 17) -- 0x40
+(at (select {from: (take T0 300) where: (> p 5.0) by: k total: (sum p)}) 'k) -- [1 0Nl]
+;; the dense strategy that writes keys from slot codes (many distinct keys
+;; relative to the rows, so the slot slab outweighs the row traffic even
+;; with the two workers the harness runs) applies the same rule
+(set i (til 131073))
+(set TD (table [a k p] (list (% i 5) (as 'I64 (% i 60000)) (as 'F64 i))))
+(set TD (update {k: (if (== a 4) 0N k) from: TD}))
+(set gotd (select {from: TD where: (< a 4) by: k total: (sum p)}))
+(count gotd) -- 48000
+(at (ser (at gotd 'k)) 17) -- 0x00
+(all (== (ser gotd) (ser (select {from: (do (select {from: TD where: (< a 4) k: k p: p})) by: k total: (sum p)})))) -- true
+;; and so does the composite-key path over many slots
+(set i (til 1000000))
+(set TK (table [a k b p] (list (% i 5) (as 'I64 (% i 2000)) (as 'I64 (% (div i 7) 500)) (as 'F64 i))))
+(set TK (update {k: (if (== a 4) 0N k) from: TK}))
+(set gotk (select {from: TK where: (< a 4) by: [k b] total: (sum p)}))
+(count gotk) -- 11200
+(at (ser (at gotk 'k)) 17) -- 0x00
+;; the legacy wide-key path (an F64 key, alone or beside another key) applies
+;; the same rule; a null key that survives keeps its flag there too
+(set i (til 131073))
+(set TF (table [a k f p] (list (% i 5) (% i 7) (as 'F64 (% i 7)) (as 'F64 i))))
+(set TF (update {k: (if (== a 4) 0N k) f: (if (== a 4) 0Nf f) from: TF}))
+(set RF (do (select {from: TF where: (< a 4)})))
+(set qf (select {from: TF where: (< a 4) by: f s: (sum p)}))
+(at (ser (at qf 'f)) 17) -- 0x00
+(all (== (ser qf) (ser (select {from: RF by: f s: (sum p)})))) -- true
+(set qkf (select {from: TF where: (< a 4) by: [k f] s: (sum p)}))
+(at (ser (at qkf 'k)) 17) -- 0x00
+(at (ser (at qkf 'f)) 17) -- 0x00
+(set qn (select {from: TF where: (< a 5) by: f s: (sum p)}))
+(count qn) -- 8
+(at (ser (at qn 'f)) 17) -- 0x40
+;; a single null key landing on the last slot of a scan block (4095 non-null
+;; keys, then the null) keeps the flag; the null rows are chosen by the
+;; quotient so that every residue still occurs
+(set i (til 131073))
+(set TB (table [a k p] (list (% i 5) (as 'I64 (% i 4095)) (as 'F64 i))))
+(set TB (update {k: (if (== (% (div i 4095) 7) 0) 0N k) from: TB}))
+(set gotb (select {from: TB by: k total: (sum p)}))
+(count gotb) -- 4096
+(at (ser (at gotb 'k)) 17) -- 0x40

@@ -874,23 +874,25 @@ static void eval_and_print(ray_term_t* term, const char* input,
 
     ray_qlog_end(&qc, input, strlen(input), result);
 
+    /* An interrupted statement still ends here: whatever it built before the
+     * ^C is free now and goes back at the boundary below like any other. */
     if (ray_term_interrupted()) {
         ray_term_clear_interrupt();
         ray_eval_clear_interrupt();
         fprintf(stdout, "\n^C\n");
         fflush(stdout);
         if (result && !RAY_IS_ERR(result)) ray_release(result);
-        return;
+    } else {
+        if (result) {
+            repl_print_result(stdout, result, use_color);
+            fflush(stdout);
+            if (!RAY_IS_ERR(result)) ray_release(result);
+        }
+        if (profiling) profile_print(use_color);
     }
 
-    if (result) {
-        repl_print_result(stdout, result, use_color);
-        fflush(stdout);
-        if (!RAY_IS_ERR(result)) ray_release(result);
-    }
-
-    if (profiling) profile_print(use_color);
     ray_heap_gc();
+    ray_heap_relieve();
     /* Statement boundary.  Check BEFORE stamping: the clock still holds the
      * end of the previous statement, so what we measure is the gap between
      * statements — the time the process actually sat idle.  Stamping first
@@ -1530,5 +1532,9 @@ int ray_repl_run_file(const char* path) {
      * exists to avoid. */
     ray_heap_note_activity();
     ray_heap_gc();
+    /* The script's own temporaries — a load, say, before it hands over to a
+     * server's poll loop — go back here under memory pressure, as after a
+     * REPL statement. */
+    ray_heap_relieve();
     return rc;
 }
