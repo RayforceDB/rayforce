@@ -17931,6 +17931,10 @@ static int8_t typeless_col_type(ray_t* payload) {
  * appending to an existing column (for insert/upsert). */
 static ray_t* append_atom_to_col(ray_t* col_vec, ray_t* atom) {
     if (RAY_ATOM_IS_NULL(atom)) {
+        /* A string column's null is the empty string, a pool payload like
+         * any other: it cannot be appended as a fixed-width zero cell. */
+        if (col_vec->type == RAY_STR)
+            return ray_str_vec_append(col_vec, "", 0);
         int64_t idx = col_vec->len;
         uint8_t zero[16] = {0};
         col_vec = ray_vec_append(col_vec, zero);
