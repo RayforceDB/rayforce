@@ -54,6 +54,9 @@
 /* Written as "/tmp/..." in the sources; every use goes through
  * ray_test_tmp (a per-process root), so concurrent suites never share it. */
 #define AW_TMP "/tmp/rayforce_aware"
+/* Set while a test runs under ray_group_test_scalar_grain: answers are checked, the
+ * decoded-byte counts (which then include task-edge vectors) are not. */
+static bool g_aw_unaligned;
 static const char* aw_root(void) { return ray_test_tmp(AW_TMP); }
 static ray_runtime_t* g_awrt;
 static uint8_t* g_img; static size_t g_len;
@@ -141,7 +144,7 @@ __attribute__((unused)) static test_result_t aw_reduce(const char* name, const c
     test_result_t r = aw_same(name, q, 0);
     if (r.status != TEST_PASS) return r;
     ray_enc_counters_t k; ray_enc_counters_get(&k);
-    if (want_decoded >= 0)
+    if (want_decoded >= 0 && !g_aw_unaligned)
         TEST_ASSERT_FMT(k.decoded_bytes == (uint64_t)want_decoded, "%s: decoded %llu, want %lld", q,
                         (unsigned long long)k.decoded_bytes, (long long)want_decoded);
     PASS();
@@ -3060,7 +3063,7 @@ static test_result_t test_eq_runs_lack(void) {
     for (int rep = 0; rep < 2; rep++)
         for (int i = 0; qs[i]; i++) {
             AW_SAME("rl", qs[i], 0);
-            TEST_ASSERT_FMT(aw_col_decoded("h") == 0 && aw_col_decoded("s") == 0, "%s: h %llu s %llu", qs[i],
+            TEST_ASSERT_FMT(g_aw_unaligned || (aw_col_decoded("h") == 0 && aw_col_decoded("s") == 0), "%s: h %llu s %llu", qs[i],
                             (unsigned long long)aw_col_decoded("h"), (unsigned long long)aw_col_decoded("s"));
         }
     PASS();
@@ -3257,7 +3260,7 @@ static test_result_t test_sum_encoded_vectors(void) {
         TEST_ASSERT_EQ_I(aw_vec_enc(cs[i].name, "x", 0), cs[i].x_enc);
         test_result_t r = aw_same(cs[i].name, q, 0);
         if (r.status != TEST_PASS) return r;
-        TEST_ASSERT_FMT(aw_col_decoded("x") == cs[i].want, "%s: x decoded %llu, want %llu", cs[i].name,
+        TEST_ASSERT_FMT(g_aw_unaligned || aw_col_decoded("x") == cs[i].want, "%s: x decoded %llu, want %llu", cs[i].name,
                         (unsigned long long)aw_col_decoded("x"), (unsigned long long)cs[i].want);
     }
     PASS();
@@ -3323,6 +3326,74 @@ static test_result_t test_scalar_route_mixed(void) {
     if ((r = aw_reduce("sm", qs[0], 0)).status != TEST_PASS) return r;
     if ((r = aw_reduce("sm", qs[3], 0)).status != TEST_PASS) return r;
     if ((r = aw_reduce("sm", qs[4], 0)).status != TEST_PASS) return r;
+    PASS();
+}
+
+/* TIME sums and extremes and TIMESTAMP extremes under selections: whole
+ * chunks from the directory, whole vectors (the partial last vector of the
+ * partial last chunk included, (>= k 199680)) from their views and
+ * descriptors, every answer generation 0's. */
+static test_result_t test_scalar_route_time(void) {
+    static const struct { const char* name; int force; } fs[] = {
+        { "tf", RAY_ENC_FOR_BP }, { "tr", RAY_ENC_RLE }, { "tm", -1 },
+    };
+    for (int f = 0; f < 3; f++) {
+        aw_save(fs[f].name, "(table [k t c p] (list (til 200000) "
+                "(as 'TIME (map (fn [j] (if (== 0 (% j 13)) 0N (* 1000 (- (div j 3) 30000)))) (til 200000))) "
+                "(as 'TIME (* 1000 (div (til 200000) 1024))) "
+                "(as 'TIMESTAMP (map (fn [j] (if (== 0 (% j 17)) 0N (* 1000000007 (- j 90000)))) (til 200000)))))",
+                fs[f].force);
+        static const char* const qs[] = {
+            "(select {s: (sum t) a: (avg t) mn: (min t) mx: (max t) sc: (sum c) mc: (max c) pn: (min p) px: (max p) from: T where: (< k 131072)})",
+            "(select {s: (sum t) a: (avg t) mn: (min t) mx: (max t) sc: (sum c) ac: (avg c) pn: (min p) px: (max p) from: T where: (>= k 199680)})",
+            "(select {s: (sum t) mx: (max p) sc: (sum c) from: T where: (>= k 197000)})",
+            "(select {s: (sum t) mn: (min p) from: T where: (== (% k 5) 0)})",
+            NULL,
+        };
+        for (int i = 0; qs[i]; i++) {
+            test_result_t r = aw_reduce(fs[f].name, qs[i], -1);
+            if (r.status != TEST_PASS) return r;
+        }
+        /* the partial last vector [199680, 200000) answers at vector level */
+        if (fs[f].force == RAY_ENC_FOR_BP) {
+            test_result_t r = aw_reduce(fs[f].name, qs[1], 0);
+            if (r.status != TEST_PASS) return r;
+        }
+    }
+    PASS();
+}
+
+/* Infinite float extremes: generation 0's strict compares from +/-DBL_MAX
+ * never take +inf as a min or -inf as a max (an all-+inf min is DBL_MAX).
+ * The statistics hold the infinities; the route reads a non-finite one
+ * (D4: finite only), and its fold's same strict compares would agree. */
+static test_result_t test_scalar_route_float_inf(void) {
+    const int64_t n = 200000;
+    ray_t* k = ray_vec_new(RAY_I64, n);
+    ray_t* f = ray_vec_new(RAY_F64, n);
+    TEST_ASSERT_TRUE(k && f && !RAY_IS_ERR(k) && !RAY_IS_ERR(f));
+    k->len = f->len = n;
+    for (int64_t i = 0; i < n; i++) {
+        ((int64_t*)ray_data(k))[i] = i;
+        ((double*)ray_data(f))[i] = i < 70000 ? INFINITY : i < 140000 ? -INFINITY : 0.25 * (double)i;
+    }
+    ray_t* tb = ray_table_new(2);
+    tb = ray_table_add_col(tb, ray_sym_intern("k", 1), k); ray_release(k);
+    tb = ray_table_add_col(tb, ray_sym_intern("f", 1), f); ray_release(f);
+    TEST_ASSERT_EQ_I(ray_env_set(ray_sym_intern("W", 1), tb), RAY_OK);
+    ray_release(tb);
+    aw_eval_ok("(.db.splayed.set \"" AW_TMP "/fi0/\" W {compress: false})");
+    aw_eval_ok("(.db.splayed.set \"" AW_TMP "/fi2/\" W {compress: true})");
+    static const char* const qs[] = {
+        "(select {mn: (min f) mx: (max f) from: T where: (< k 65536)})",
+        "(select {mn: (min f) mx: (max f) from: T where: (and (>= k 65536) (< k 196608))})",
+        "(select {mn: (min f) mx: (max f) from: T where: (>= k 1024)})",
+        NULL,
+    };
+    for (int i = 0; qs[i]; i++) {
+        test_result_t r = aw_reduce("fi", qs[i], -1);
+        if (r.status != TEST_PASS) return r;
+    }
     PASS();
 }
 
@@ -3431,10 +3502,32 @@ static test_result_t test_scalar_route_parted_stats(void) {
         ray_t* fx = ray_fmt(x, 0); ray_t* fy = ray_fmt(y, 0);
         TEST_ASSERT_FMT(ray_str_len(fx) == ray_str_len(fy) && memcmp(ray_str_ptr(fx), ray_str_ptr(fy), ray_str_len(fx)) == 0, "%s", b);
         TEST_ASSERT_EQ_U(k.materialized, 0);
-        if (i < 2) TEST_ASSERT_FMT(aw_parted_col_decoded("TW", "x") == 0, "%s: x decoded %llu", b,
+        if (i < 2 && !g_aw_unaligned) TEST_ASSERT_FMT(aw_parted_col_decoded("TW", "x") == 0, "%s: x decoded %llu", b,
                                    (unsigned long long)aw_parted_col_decoded("TW", "x"));
         ray_release(fx); ray_release(fy); ray_release(x); ray_release(y);
     }
+    PASS();
+}
+
+/* The scalar chunk route cut into tasks that are no multiple of a vector or
+ * a chunk (the grain ray_pool_dispatch re-derives when it clamps to its
+ * ring): every answer still equals generation 0's. */
+static test_result_t test_unaligned_grain(void) {
+    static test_result_t (*const fns[])(void) = {
+        test_scalar_route_mixed, test_eq_runs_lack, test_scalar_route_parted_stats, test_scalar_route_time,
+    };
+    static const int64_t grains[] = { 5000, 70001 };    /* inside a chunk, across chunks */
+    for (size_t g = 0; g < sizeof grains / sizeof *grains; g++)
+        for (size_t i = 0; i < sizeof fns / sizeof *fns; i++) {
+            if (g > 0 && i > 1) break;                       /* the second cut: two shapes */
+            (void)ray_test_rm_rf(aw_root()); (void)ray_test_mkdir_p(aw_root());
+            ray_group_test_scalar_grain(grains[g]);
+            g_aw_unaligned = true;
+            test_result_t r = fns[i]();
+            g_aw_unaligned = false;
+            ray_group_test_scalar_grain(0);
+            if (r.status != TEST_PASS) return r;
+        }
     PASS();
 }
 
@@ -3500,5 +3593,8 @@ const test_entry_t aware_entries[] = {
     { "aware/scalar_route_mixed",  test_scalar_route_mixed,  aw_setup, aw_teardown },
     { "aware/scalar_route_parted", test_scalar_route_parted, aw_setup, aw_teardown },
     { "aware/scalar_route_parted_stats", test_scalar_route_parted_stats, aw_setup, aw_teardown },
+    { "aware/scalar_route_time",   test_scalar_route_time,   aw_setup, aw_teardown },
+    { "aware/scalar_route_float_inf", test_scalar_route_float_inf, aw_setup, aw_teardown },
+    { "aware/unaligned_grain",     test_unaligned_grain,     aw_setup, aw_teardown },
     { NULL, NULL, NULL, NULL },
 };

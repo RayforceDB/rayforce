@@ -3208,6 +3208,19 @@ static test_result_t test_scalar_route_error(void) {
     test_result_t t = sr_same_on("(.db.splayed.get \"" SR_G0 "\")", "(.db.splayed.get \"" SR_TMP "/bad/\")",
                                  "(select {s: (sum (+ k 1)) m: (max k) from: T where: (< k 100000)})", 0);
     if (t.status != TEST_PASS) return t;
+    /* the tight i64 kernel (scalar_sum_i64_fn): a staged TIMESTAMP avg, no
+     * statistics rule (TIMESTAMP avg decodes), no selection, no nulls */
+    sr_eval_ok("(set S (table [k p] (list i (as 'TIMESTAMP (* 1000 i)))))");
+    sr_make_bad("p", path, sizeof path);
+    for (int i = 0; i < 2; i++) {
+        sr_eval_ok("(set B (.db.splayed.get \"" SR_TMP "/bad/\"))");
+        ray_error_clear();
+        ray_t* r = sr_eval("(select {a: (avg p) from: B})");
+        TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "timestamp avg: no error");
+        TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
+        TEST_ASSERT_TRUE(strstr(ray_error_msg(), path) != NULL);
+        ray_error_free(r);
+    }
     PASS();
 }
 

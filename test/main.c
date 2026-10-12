@@ -932,6 +932,7 @@ void ray_test_hooks_off(void) {
     ray_idx_lazy_test_fail_build(NULL);
     ray_expr_test_parted_all_segments(false);
     ray_group_test_route(0);
+    ray_group_test_scalar_grain(0);
     agg_test_force_smallhash(false);
     ray_clear_interrupt();
 }

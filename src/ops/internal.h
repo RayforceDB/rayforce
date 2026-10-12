@@ -1289,6 +1289,11 @@ ray_t* ray_reduce_src(ray_col_src_t* src, uint16_t opcode, int8_t out_type);
  * radix); 3 also skip the slice-group probe.  Disarmed by
  * ray_test_hooks_off. */
 void ray_group_test_route(int route);
+/* Test hook (C tests only): the scalar route's chunk walk (scalar_chunk_fn)
+ * runs serially in tasks of `rows` rows, any cut (as ray_pool_dispatch's
+ * grain after its ring clamp); 0 dispatches as usual.  Disarmed by
+ * ray_test_hooks_off. */
+void ray_group_test_scalar_grain(int64_t rows);
 /* Test hook (C tests only): the scalar route's F64 lane sum of d[0, n) at
  * absolute row row0, as one block (*whole) and as pieces cut at cuts[]
  * through the staged piece function (*cut). */

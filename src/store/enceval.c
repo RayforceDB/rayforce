@@ -286,7 +286,6 @@ bool ray_enc_vec_sum(const ray_enc_vview_t* v, int64_t* hi, uint64_t* lo, int64_
         _Alignas(64) ray_enc_lanes_t u;                      /* the residuals, on the stack */
         ray_enccol_unpack_resid(v, &u);
         const uint8_t* nm = v->n_nulls ? v->nullmap : NULL;
-        if (v->n_nulls && !nm) return false;
         __int128 r = 0;
         if (v->k.T == 64) {
             if (nm) { for (int i = 0; i < v->n; i++) if (!((nm[i >> 3] >> (i & 7)) & 1)) r += u.q[i]; }
