@@ -5,13 +5,17 @@
 (at (select {v: (in s (concat 'a 1)) from: T}) 'v) -- [true false true]
 (at (select {v: (not-in s (concat 'a 1)) from: T}) 'v) -- [false true false]
 
-;; Nested results retain their shape under negation, including in WHERE errors.
-(not-in ["ab" "c"] "a") -- (list [false true] [true])
-(in ["ab" "c"] "a") -- (list [true false] [false])
+;; Nested results retain their shape under negation.
 (not-in (list (list 1 2) (list 3)) [1]) -- (list [false true] [true])
-(set S (table [ss] (list ["ab" "c"])))
-(select {from: S where: (in ss (list "" "a"))}) !- type
-(select {from: S where: (not-in ss (list "" "a"))}) !- type
+(in (list (list 1 2) (list 3)) [1]) -- (list [true false] [false])
+
+;; A string element of a collection is one whole value, so a string column
+;; answers one verdict per row and filters like any other column.
+(not-in ["ab" "c"] "a") -- [true true]
+(in ["ab" "c" "a"] "a") -- [false false true]
+(set S (table [ss] (list ["ab" "c" "a"])))
+(at (select {from: S where: (in ss (list "" "a"))}) 'ss) -- ["a"]
+(at (select {from: S where: (not-in ss (list "" "a"))}) 'ss) -- ["ab" "c"]
 
 ;; Empty evaluator membership must produce an empty BOOL predicate.
 (set E (table [s x] (list (as 'SYM (list)) (til 0))))

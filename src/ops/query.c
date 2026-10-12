@@ -711,6 +711,73 @@ static bool table_is_parted(ray_t* tbl) {
  * name), an atom take with K << nrows, and the result is a flat table
  * with no LIST columns, dispatch to ray_topk_table — bounded-heap
  * selection in O(n log K) instead of full sort + gather. */
+/* The sort keys a select names in asc:/desc: — a symbol atom or a symbol
+ * vector each.  Calls fn(name, ctx) per key; stops early on nonzero. */
+static int select_for_each_sort_key(ray_t** dict_elems, int64_t dict_n,
+                                    int64_t asc_id, int64_t desc_id,
+                                    int (*fn)(int64_t, void*), void* ctx) {
+    for (int64_t i = 0; i + 1 < dict_n; i += 2) {
+        int64_t kid = dict_elems[i]->i64;
+        if (kid != asc_id && kid != desc_id) continue;
+        ray_t* v = dict_elems[i + 1];
+        if (v->type == -RAY_SYM) {
+            if (fn(v->i64, ctx)) return 1;
+        } else if (v->type == RAY_SYM) {
+            for (int64_t k = 0; k < v->len; k++)
+                if (fn(((int64_t*)ray_data(v))[k], ctx)) return 1;
+        }
+    }
+    return 0;
+}
+
+typedef struct { ray_t* result; ray_t* src; int64_t rows; int64_t added; } carry_ctx_t;
+
+static int carry_one_sort_key(int64_t name, void* p) {
+    carry_ctx_t* c = (carry_ctx_t*)p;
+    if (ray_table_get_col(c->result, name)) return 0;   /* output already */
+    ray_t* col = ray_table_get_col(c->src, name);
+    if (!col || col->type < 0 || RAY_IS_PARTED(col->type) ||
+        col->type == RAY_MAPCOMMON || ray_len(col) != c->rows)
+        return 0;                                       /* not a row column */
+    ray_retain(col);
+    ray_t* r = ray_table_add_col(c->result, name, col);
+    ray_release(col);
+    c->result = r;
+    if (!r || RAY_IS_ERR(r)) return 1;
+    c->added++;
+    return 0;
+}
+
+/* Append each asc:/desc: key that names a full-length source column but no
+ * output column to `result`; *added counts them (they are the tail). */
+static ray_t* select_fallback_carry_sort_keys(ray_t* result, ray_t* src,
+                                              ray_t** dict_elems, int64_t dict_n,
+                                              int64_t asc_id, int64_t desc_id,
+                                              int64_t* added) {
+    *added = 0;
+    if (!src || RAY_IS_ERR(src) || src->type != RAY_TABLE ||
+        result->type != RAY_TABLE)
+        return result;
+    carry_ctx_t c = { result, src, ray_table_nrows(result), 0 };
+    select_for_each_sort_key(dict_elems, dict_n, asc_id, desc_id,
+                             carry_one_sort_key, &c);
+    *added = c.added;
+    return c.result;
+}
+
+/* Drop the last `n` columns of a table (the carried sort keys). */
+static ray_t* select_fallback_drop_tail_cols(ray_t* tbl, int64_t n) {
+    if (!tbl || RAY_IS_ERR(tbl) || tbl->type != RAY_TABLE) return tbl;
+    int64_t keep = ray_table_ncols(tbl) - n;
+    if (keep < 0) keep = 0;
+    ray_t* out = ray_table_new(keep);
+    for (int64_t c = 0; c < keep && out && !RAY_IS_ERR(out); c++)
+        out = ray_table_add_col(out, ray_table_col_name(tbl, c),
+                                ray_table_get_col_idx(tbl, c));
+    ray_release(tbl);
+    return out ? out : ray_error("oom", NULL);
+}
+
 /* Decoded take: value the CALLER already evaluated (grouped DAG path: it
  * evaluates take: once to decide the HEAD pushdown).  Passing the DECODED form
  * rather than the ray_t keeps it a stack value with no ownership to leak on the
@@ -1248,6 +1315,77 @@ bool ray_query_rowwise_builtin(int64_t id) {
 }
 
 /* Compile a Rayfall AST expression into a DAG node */
+static bool builtin_named(const ray_t* b, const char* const* names, size_t n);
+
+/* The set of `(in col set)` over a string column, when it is a list of
+ * strings — a literal (list "a" "b"), or a name bound to such a list — as
+ * the string vector it spells, so the membership compiles and probes one
+ * hash set instead of declining to the per-row evaluator.  Elements that are
+ * not strings are dropped: no string row equals them.  NULL when `set` is
+ * not such a list: a call, an element computed at run time, `list` rebound,
+ * or a name that is a column, a formal or something other than a list. */
+static ray_t* in_str_set_const(ray_graph_t* g, ray_t* set) {
+    if (!set) return NULL;
+    ray_t** e;
+    int64_t from, n;
+    if (set->type == -RAY_SYM && !(set->attrs & ATTR_QUOTED)) {
+        int64_t id = set->i64;
+        if (cexpr_env_lookup(g, id) || sel_alias_lookup(g, id)) return NULL;
+        ray_t* v = g->cexpr_helper_depth > 0 ? ray_env_get_lexical_local_callee(id)
+                                             : ray_env_get_lexical_local(id);
+        if (!v) {
+            if (g->table && g->table->type == RAY_TABLE && ray_table_get_col(g->table, id))
+                return NULL;
+            v = g->cexpr_helper_depth > 0 ? ray_env_get_compiled(id) : ray_env_get(id);
+        }
+        if (!v || v->type != RAY_LIST) return NULL;
+        e = (ray_t**)ray_data(v);
+        from = 0;
+        n = ray_len(v);
+        for (int64_t i = 0; i < n; i++)
+            if (!e[i] || !ray_is_atom(e[i])) return NULL;
+    } else {
+        if (set->type != RAY_LIST || ray_len(set) < 2) return NULL;
+        e = (ray_t**)ray_data(set);
+        ray_t* head = e[0];
+        if (!head || head->type != -RAY_SYM || (head->attrs & ATTR_QUOTED)) return NULL;
+        if (cexpr_env_lookup(g, head->i64)) return NULL;
+        ray_t* b = g->cexpr_helper_depth > 0 ? ray_env_get_lexical_local_callee(head->i64)
+                                             : ray_env_get_lexical_local(head->i64);
+        if (!b) b = ray_env_get(head->i64);
+        static const char* const list_fn[] = { "list" };
+        if (!builtin_named(b, list_fn, 1)) return NULL;
+        from = 1;
+        n = ray_len(set);
+        for (int64_t i = 1; i < n; i++) {
+            ray_t* a = e[i];
+            if (!a || !ray_is_atom(a)) return NULL;
+            if (a->type == -RAY_SYM && !(a->attrs & ATTR_QUOTED)) return NULL;  /* a name */
+        }
+    }
+    ray_t* v = ray_vec_new(RAY_STR, n - from);
+    for (int64_t i = from; i < n && v && !RAY_IS_ERR(v); i++)
+        if (e[i]->type == -RAY_STR)
+            v = ray_str_vec_append(v, ray_str_ptr(e[i]), ray_str_len(e[i]));
+    return v ? v : ray_error("oom", NULL);
+}
+
+/* Is `set` a name that reaches a global value no const node can hold (a
+ * list, a dict) — not a formal, an alias, a local or a column? */
+static bool in_set_names_global_value(ray_graph_t* g, ray_t* set) {
+    if (!set || set->type != -RAY_SYM || (set->attrs & ATTR_QUOTED)) return false;
+    int64_t id = set->i64;
+    if (ray_sym_is_dotted(id)) return false;
+    if (cexpr_env_lookup(g, id) || sel_alias_lookup(g, id)) return false;
+    if (g->cexpr_helper_depth > 0 ? ray_env_get_lexical_local_callee(id)
+                                  : ray_env_get_lexical_local(id))
+        return false;
+    if (g->table && g->table->type == RAY_TABLE && ray_table_get_col(g->table, id))
+        return false;
+    ray_t* v = g->cexpr_helper_depth > 0 ? ray_env_get_compiled(id) : ray_env_get(id);
+    return v && !ray_is_atom(v) && !ray_is_vec(v);
+}
+
 ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
     if (!expr) return NULL;
 
@@ -2017,7 +2155,21 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
                 ray_op_t* left = compile_expr_dag(g, elems[1]);
                 if (!left) return NULL;
                 uint32_t left_id = left->id;
-                ray_op_t* right = compile_expr_dag(g, elems[2]);
+                ray_op_t* right = NULL;
+                if ((ctor == ray_in || ctor == ray_not_in) &&
+                    left->opcode != OP_CONST && left->out_type == RAY_STR) {
+                    ray_t* sv = in_str_set_const(g, elems[2]);
+                    if (sv && RAY_IS_ERR(sv)) { ray_error_free(sv); return NULL; }
+                    if (sv) { right = ray_const_vec(g, sv); ray_release(sv); if (!right) return NULL; }
+                }
+                /* A set held in a global list (or another value no const
+                 * node holds) is the evaluator's to read: compiled, the
+                 * name became a scan of a column that is not there, and
+                 * `(in y S)` failed with "column 'S' not found". */
+                if (!right && (ctor == ray_in || ctor == ray_not_in) &&
+                    in_set_names_global_value(g, elems[2]))
+                    return NULL;
+                if (!right) right = compile_expr_dag(g, elems[2]);
                 if (!right) return NULL;
                 left = &g->nodes[left_id];
                 if ((ctor == ray_and || ctor == ray_or) &&
@@ -3599,6 +3751,17 @@ static int is_group_dag_agg_expr_dag_safe(ray_t* expr, ray_t* tbl) {
         if (ray_len(expr) < 3) return 1;
         if (expr_contains_temporal_arith(elems[2], tbl))
             return 0;
+    }
+    /* An argument the DAG has no node for — (in s (list ...)) — is left to
+     * the per-group evaluation instead of failing the whole select with
+     * "failed to compile aggregation argument".  Compilation only inspects
+     * types and literals; it runs no user expression. */
+    if (agg_arg && agg_arg->type == RAY_LIST) {
+        ray_graph_t* g = ray_graph_new(tbl);
+        if (!g) return 1;
+        ray_op_t* op_in = compile_expr_dag(g, agg_arg);
+        ray_graph_free(g);
+        if (!op_in) return 0;
     }
     return 1;
 }
@@ -6563,10 +6726,15 @@ static ray_t* eval_expr_per_row_impl(ray_t* expr, ray_t* tbl, int64_t nrows) {
     if (ncols_max < 1) ncols_max = 1;
     ray_t* refs_hdr = NULL;
     int64_t* col_syms = (int64_t*)scratch_alloc(&refs_hdr,
-            (size_t)ncols_max * (sizeof(int64_t) + sizeof(ray_t*)));
+            (size_t)ncols_max * (sizeof(int64_t) + 2 * sizeof(ray_t*)));
     if (!col_syms) return ray_error("oom", NULL);
     int n_cols = collect_col_refs(expr, tbl, col_syms, (int)ncols_max, 0);
     ray_t** cols = (ray_t**)(col_syms + ncols_max);
+    /* The string cells marked for this row (RAY_ATTR_STR_CELL): the mark is
+     * cleared once the row is evaluated, so a cell the expression hands
+     * back inside a list or a dict leaves as a plain string. */
+    ray_t** marked = cols + ncols_max;
+    int n_marked = 0;
     for (int i = 0; i < n_cols; i++)
         cols[i] = ray_table_get_col(tbl, col_syms[i]);
 
@@ -6600,12 +6768,36 @@ static ray_t* eval_expr_per_row_impl(ray_t* expr, ray_t* tbl, int64_t nrows) {
                 scratch_free(refs_hdr);
                 return arg ? arg : ray_error("domain", "select: failed to read column cell for per-row eval");
             }
+            /* A string cell is one value of its column, not a lone string
+             * literal: mark it so `in` answers it with one verdict
+             * (RAY_ATTR_STR_CELL).  A cell read out of a LIST column is
+             * shared with it, so the mark goes on a copy. */
+            if (arg->type == -RAY_STR) {
+                if (!allocated) {
+                    ray_t* own = ray_str(ray_str_ptr(arg), ray_str_len(arg));
+                    if (!own || RAY_IS_ERR(own)) {
+                        g_active_query_table = _aqt; g_active_query_row = _aqr; g_active_query_row_tbl = _aqrt; g_active_query_row_depth = _aqrd;
+                        ray_env_pop_scope();
+                        if (result) ray_release(result);
+                        scratch_free(refs_hdr);
+                        return own ? own : ray_error("oom", NULL);
+                    }
+                    arg = own;
+                    allocated = 1;
+                }
+                arg->attrs |= RAY_ATTR_STR_CELL;
+                marked[n_marked++] = arg;
+            }
             ray_env_set_query_local(col_syms[i], arg);
             if (allocated) ray_release(arg);
         }
 
         g_active_query_row = row;
         ray_t* cell = ray_eval(expr);
+        /* The query scope still holds each marked cell, so the pointers
+         * are live here. */
+        for (int k = 0; k < n_marked; k++) marked[k]->attrs &= (uint8_t)~RAY_ATTR_STR_CELL;
+        n_marked = 0;
         if (!cell || RAY_IS_ERR(cell)) {
             g_active_query_table = _aqt; g_active_query_row = _aqr; g_active_query_row_tbl = _aqrt; g_active_query_row_depth = _aqrd;
             ray_env_pop_scope();
@@ -16969,11 +17161,21 @@ by_dict_done:
                 }
                 result = select_fallback_finish_columns(result, scalar_cols,
                                                           out_len >= 0 ? out_len : bcast_len);
+                /* A sort key the projections do not output (`desc: n` over
+                 * `{c: ...}`) is a source column; the DAG sorts before it
+                 * projects, so it can read one.  Carry such a key into the
+                 * result for the sort and drop it after. */
+                int64_t carried = 0;
+                if (has_sort && result && !RAY_IS_ERR(result))
+                    result = select_fallback_carry_sort_keys(result, tbl, dict_elems, dict_n,
+                                                             asc_id, desc_id, &carried);
                 if (nearest_handle_owned) ray_release(nearest_handle_owned);
                 if (nearest_query_owned)  ray_free_raw(nearest_query_owned);
                 ray_graph_free(g); ray_release(tbl);
                 result = apply_sort_take(result, dict_elems, dict_n,
                                          asc_id, desc_id, take_id, NULL);
+                if (carried && result && !RAY_IS_ERR(result))
+                    result = select_fallback_drop_tail_cols(result, carried);
                 scratch_free(colops_hdr);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return result;
             } else {
@@ -18561,6 +18763,10 @@ static int8_t typeless_col_type(ray_t* payload) {
  * appending to an existing column (for insert/upsert). */
 static ray_t* append_atom_to_col(ray_t* col_vec, ray_t* atom) {
     if (RAY_ATOM_IS_NULL(atom)) {
+        /* A string column's null is the empty string, a pool payload like
+         * any other: it cannot be appended as a fixed-width zero cell. */
+        if (col_vec->type == RAY_STR)
+            return ray_str_vec_append(col_vec, "", 0);
         int64_t idx = col_vec->len;
         uint8_t zero[16] = {0};
         col_vec = ray_vec_append(col_vec, zero);
@@ -18669,7 +18875,9 @@ static ray_t* append_boxed_table_col(ray_t* orig_col, ray_t* payload,
             if (cells[r]) ray_retain(cells[r]);
         }
     } else {
-        dst[orig_col->len] = payload;
+        /* A row that leaves this column out boxes the null object: a C
+         * NULL cell is not a value, and reading one aborts. */
+        dst[orig_col->len] = payload ? payload : RAY_NULL_OBJ;
         if (payload) ray_retain(payload);
     }
     out->len = orig_col->len + tail;
@@ -21879,7 +22087,7 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
             if (ct == RAY_LIST) {
                 /* Boxed column: a table payload supplies a LIST whose cells
                  * are rows and is spliced; any other row shape boxes its
-                 * payload (or a NULL slot) as one cell — the same contract
+                 * payload (or the null object) as one cell — the same contract
                  * as append_boxed_table_col, minus the copy. */
                 if (tbl_row_list) {
                     if (!pay || RAY_IS_ERR(pay) || pay->type != RAY_LIST) {
@@ -21894,7 +22102,8 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
                         }
                     }
                 } else {
-                    res = ray_list_append(col, pay);
+                    /* a left-out column boxes the null object, as above */
+                    res = ray_list_append(col, pay ? pay : RAY_NULL_OBJ);
                 }
             } else if (!pay) {
                 ray_t* null_atom = ray_typed_null(-ct);
@@ -22534,7 +22743,7 @@ static ray_t* upsert_write_cell(ray_t** slots, int64_t c, int64_t row, ray_t* ce
     return NULL;
 }
 
-/* Append one row; a NULL cell lands as the column's null (a NULL slot
+/* Append one row; a NULL cell lands as the column's null (the null object
  * for a boxed column), mirroring the legacy insert arm. */
 static ray_t* upsert_append_row(ray_t** slots, int64_t ncols, ray_t** cells) {
     for (int64_t c = 0; c < ncols; c++) {
@@ -22542,7 +22751,7 @@ static ray_t* upsert_append_row(ray_t** slots, int64_t ncols, ray_t** cells) {
         ray_t* cell = cells[c];
         ray_t* res;
         if (col->type == RAY_LIST) {
-            res = ray_list_append(col, cell);
+            res = ray_list_append(col, cell ? cell : RAY_NULL_OBJ);
         } else if (!cell) {
             ray_t* na = ray_typed_null(-col->type);
             res = append_atom_to_col(col, na);
@@ -22870,6 +23079,24 @@ out:
  * `tbl` is borrowed.  Returns the result (the binding's symbol, or a
  * fresh table) or an error, and sets *handled; returns NULL with
  * *handled false when a gate misses and the legacy arms should run. */
+/* A multi-row payload's columns (NULL = left out) against `m` key values:
+ * each must be a list or vector of exactly m cells.  NULL on yes, the error
+ * otherwise.  Both multi-row writers ask this before they read a cell; a
+ * writer that skipped it read past a shorter value vector. */
+static ray_t* upsert_check_multirow(ray_t** cols, int64_t ncols, int64_t m) {
+    for (int64_t c = 0; c < ncols; c++) {
+        ray_t* sc = cols[c];
+        if (!sc) continue;
+        if (!is_collection(sc))
+            return ray_error("type", "upsert: multi-row value for column %lld must be a list or vector, got %s",
+                             (long long)c, ray_type_name(sc->type));
+        if (ray_len(sc) != m)
+            return ray_error("length", "upsert: column %lld has %lld values, key has %lld",
+                             (long long)c, (long long)ray_len(sc), (long long)m);
+    }
+    return NULL;
+}
+
 static ray_t* upsert_apply(ray_t* tbl, int64_t inplace_sym,
                            const int64_t* kci, int64_t nk,
                            ray_t** src_cols, ray_t** atoms, int64_t m,
@@ -22927,19 +23154,10 @@ static ray_t* upsert_apply(ray_t* tbl, int64_t inplace_sym,
     if (vec_path) {
         /* typed payload vectors are read in place */
     } else if (src_cols) {
+        err = upsert_check_multirow(src_cols, ncols, m);
         for (int64_t c = 0; c < ncols && !err; c++) {
             ray_t* sc = src_cols[c];
             if (!sc) continue;
-            if (!is_collection(sc)) {
-                err = ray_error("type", "upsert: multi-row value for column %lld must be a list or vector, got %s",
-                                (long long)c, ray_type_name(sc->type));
-                break;
-            }
-            if (ray_len(sc) != m) {
-                err = ray_error("length", "upsert: column %lld has %lld values, key has %lld",
-                                (long long)c, (long long)ray_len(sc), (long long)m);
-                break;
-            }
             for (int64_t r = 0; r < m; r++) {
                 int alloc = 0;
                 ray_t* e = collection_elem(sc, r, &alloc);
@@ -23330,25 +23548,22 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
         }
         int64_t n_pairs = dkeys->len;
 
-        /* Schema-strictness: every column name must appear exactly once
-         * on each side.  Mirrors the table-payload path. */
-        if (n_pairs != ncols) {
-            ray_release(tbl); ray_release(key_sym); ray_release(row);
-            return ray_error("value", NULL);
-        }
-        for (int64_t c = 0; c < ncols; c++) {
-            int64_t cn = ray_table_col_name(tbl, c);
+        /* Schema-strictness, as for a table payload: a dict row is a
+         * partial row too.  Every dict key must name exactly one target
+         * column and appear once; columns it leaves out are null-filled,
+         * as insert fills them.  Requiring every column refused a dict
+         * that a one-row table with the same columns upserts. */
+        for (int64_t d = 0; d < n_pairs; d++) {
+            /* dict-key cell vs runtime column NAME id (see insert) */
+            int64_t dk = sym_cell_runtime_id(dkeys, d);
             int64_t tbl_matches = 0, dict_matches = 0;
             for (int64_t i = 0; i < ncols; i++)
-                if (ray_table_col_name(tbl, i) == cn) tbl_matches++;
-            for (int64_t d = 0; d < n_pairs; d++) {
-                /* dict-key cell vs runtime column NAME id (see insert) */
-                int64_t dk = sym_cell_runtime_id(dkeys, d);
-                if (dk == cn) dict_matches++;
-            }
+                if (ray_table_col_name(tbl, i) == dk) tbl_matches++;
+            for (int64_t e = 0; e < n_pairs; e++)
+                if (sym_cell_runtime_id(dkeys, e) == dk) dict_matches++;
             if (tbl_matches != 1 || dict_matches != 1) {
                 ray_release(tbl); ray_release(key_sym); ray_release(row);
-                return ray_error("value", NULL);
+                return ray_error("value", "upsert: dict row key must name one target column, once");
             }
         }
 
@@ -23410,9 +23625,18 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
         return ray_error("type", "upsert: key must be a symbol or integer, got %s", ray_type_name(ks_t));
     }
 
+    /* Every key column must carry a value: a dict row (or a row a table
+     * payload left a column out of) may not, and the match reads them. */
+    for (int64_t k = 0; k < n_key_cols; k++) {
+        if (!row_elems[key_col_indices[k]]) {
+            scratch_free(kci_hdr);
+            ray_release(tbl); ray_release(key_sym); ray_release(row);
+            return ray_error("value", "upsert: row is missing a key column");
+        }
+    }
+
     /* Multi-row upsert: if row values are vectors, iterate row-by-row */
     ray_t* key_elem = row_elems[key_col_indices[0]];
-    if (!key_elem) { scratch_free(kci_hdr); ray_release(tbl); ray_release(key_sym); ray_release(row); return ray_error("domain", "upsert: key value missing"); }
     {
         bool multi = ray_is_vec(key_elem) || key_elem->type == RAY_LIST;
         bool fast_handled = false;
@@ -23427,6 +23651,14 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
     }
     if (ray_is_vec(key_elem) || key_elem->type == RAY_LIST) {
         int64_t new_nrows = ray_len(key_elem);
+        /* A target upsert_apply declines (mapped, sliced, narrow symbols)
+         * comes here: the same shape check before any cell is read. */
+        ray_t* shape_err = upsert_check_multirow(row_elems, ncols, new_nrows);
+        if (shape_err) {
+            scratch_free(kci_hdr);
+            ray_release(tbl); ray_release(key_sym); ray_release(row);
+            return shape_err;
+        }
         ray_t* cur_tbl = tbl;
         ray_retain(cur_tbl);
         for (int64_t r = 0; r < new_nrows; r++) {
@@ -23438,7 +23670,8 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
             ray_t** sr = (ray_t**)ray_data(single_row);
             for (int64_t c = 0; c < ncols; c++) {
                 int alloc = 0;
-                sr[c] = collection_elem(row_elems[c], r, &alloc);
+                /* A column a dict row left out stays a NULL slot. */
+                sr[c] = row_elems[c] ? collection_elem(row_elems[c], r, &alloc) : NULL;
                 if (!alloc && sr[c]) ray_retain(sr[c]);
             }
             /* Upsert single row into current table */

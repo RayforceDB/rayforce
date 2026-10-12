@@ -97,3 +97,22 @@
 (map (fn [i] (insert 'big (table [a b] (list (til 100) (as 'F64 (til 100)))))) (til 50))
 (count big) -- 5000
 (sum (get big 'a)) -- 247500
+
+;; ── an empty string is a string column's null: one appended cell ────────
+;; A null atom was appended as a fixed-width zero cell, which a string
+;; column (pool payloads) refused: `vec_append: str vectors use
+;; ray_str_vec_append`.  In place, rebuilt, functional, and a dict row that
+;; leaves the string column out all append the empty string.
+(set ts (table [s n] (list ["p" "qq"] [1 2])))
+(insert 'ts (list "" 3)) -- 'ts
+(get ts 's) -- ["p" "qq" ""]
+(get ts 'n) -- [1 2 3]
+(insert 'ts (list "x" 4)) -- 'ts
+(get ts 's) -- ["p" "qq" "" "x"]
+(get (insert ts (list "" 5)) 's) -- ["p" "qq" "" "x" ""]
+(set tsr ts)
+(insert 'ts (list "" 6)) -- 'ts
+(count ts) -- 5
+(count tsr) -- 4
+(get (insert ts (dict [n] (list 7))) 's) -- ["p" "qq" "" "x" "" ""]
+(count (select {from: ts where: (in s ["" "x"])})) -- 1

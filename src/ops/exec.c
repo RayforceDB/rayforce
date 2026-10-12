@@ -1231,12 +1231,13 @@ ray_t* ray_in_vec_exec(ray_t* col, ray_t* set, bool negate) {
 
 static ray_t* flatten_parted_col(ray_t* col);
 
-/* GUID membership fallback: the typed `in` kernel bails on guid operands
- * (16-byte cells it can't compare), so route them through the general
- * ray_in_fn path, which builds a guid-aware hashset.  `col` is a materialized
- * column vector, so ray_in_fn returns a fresh RAY_BOOL vector we own and may
- * invert in place for not-in. */
-static ray_t* exec_in_guid_fallback(ray_t* col, ray_t* set, bool negate) {
+/* General membership fallback: the typed `in` kernel bails on guid operands
+ * (16-byte cells it can't compare) and on string columns (variable-length
+ * cells), so route them through the general ray_in_fn path, which builds a
+ * guid- and string-aware hashset.  `col` is a materialized column vector, so
+ * ray_in_fn returns a fresh RAY_BOOL vector we own and may invert in place
+ * for not-in. */
+static ray_t* exec_in_general_fallback(ray_t* col, ray_t* set, bool negate) {
     ray_t* input = col;
     bool owns_input = false;
     if (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON) {
@@ -1265,7 +1266,17 @@ static ray_t* exec_in_guid_fallback(ray_t* col, ray_t* set, bool negate) {
         r = out;
     }
 
-    if (r->type == RAY_BOOL) {
+    /* The caller indexes the answer as one bool per row; anything else is
+     * not a membership verdict for this column. */
+    if (r->type != RAY_BOOL || r->len != (ray_is_atom(col) ? 1 : ray_len(input))) {
+        int8_t rt = r->type;
+        ray_release(r);
+        if (owns_input) ray_release(input);
+        return ray_error("type", "in: membership of a %s column answered %s, not a bool per row",
+                         ray_type_name(ray_is_atom(col) ? (int8_t)-col->type : input->type),
+                         ray_type_name(rt));
+    }
+    {
         uint8_t* b = (uint8_t*)ray_data(r);
         if (negate)
             for (int64_t i = 0; i < r->len; i++) b[i] = (uint8_t)!b[i];
@@ -1281,7 +1292,7 @@ static ray_t* exec_in_guid_fallback(ray_t* col, ray_t* set, bool negate) {
             const uint8_t* data = (const uint8_t*)ray_data(input);
             for (int64_t i = 0; i < r->len; i++)
                 if (memcmp(data + i * 16, null_guid, 16) == 0) b[i] = 0;
-        } else if (ray_vec_may_have_nulls(col)) {
+        } else if (ray_vec_may_have_nulls(input)) {
             for (int64_t i = 0; i < r->len; i++)
                 if (ray_vec_is_null(input, i)) b[i] = 0;
         }
@@ -1290,13 +1301,26 @@ static ray_t* exec_in_guid_fallback(ray_t* col, ray_t* set, bool negate) {
     return r;
 }
 
-/* True when either operand is a guid column/atom (parted base included). */
-static bool in_is_guid(ray_t* col, ray_t* set) {
+/* True when the typed kernel's refusal is a shape the general path answers:
+ * a guid on either side, or a string on either side (parted base included)
+ * — a string column, or any column against a string set, which matches no
+ * row of another type exactly as the bare `in` does.  A string ATOM subject
+ * has one verdict only against a column of cells; against a lone string or
+ * a list, ray_in_fn answers it per character, which is not a row verdict,
+ * so those shapes stay out. */
+static bool in_has_general_fallback(ray_t* col, ray_t* set) {
     int8_t ct = ray_is_atom(col) ? (int8_t)(-col->type) : col->type;
     int8_t st = ray_is_atom(set) ? (int8_t)(-set->type) : set->type;
     if (RAY_IS_PARTED(ct)) ct = (int8_t)RAY_PARTED_BASETYPE(ct);
     if (RAY_IS_PARTED(st)) st = (int8_t)RAY_PARTED_BASETYPE(st);
-    return ct == RAY_GUID || st == RAY_GUID;
+    if (ct == RAY_GUID || st == RAY_GUID) return true;
+    if (ct != RAY_STR && st != RAY_STR) return false;
+    /* Only a column of cells answers one verdict per row: a LIST column's
+     * cell may be a vector, and its answer a list no mask can use. */
+    if (!ray_is_atom(col) && !(ct >= RAY_BOOL && ct <= RAY_STR)) return false;
+    if (ct == RAY_STR && ray_is_atom(col))
+        return !ray_is_atom(set) && st != RAY_LIST;
+    return true;
 }
 
 static ray_t* exec_in(ray_graph_t* g, ray_op_t* op, ray_t* col, ray_t* set) {
@@ -1328,8 +1352,8 @@ static ray_t* exec_in(ray_graph_t* g, ray_op_t* op, ray_t* col, ray_t* set) {
                                              svf_stack, svi_stack,
                                              &in_ctx, &sv_hdr, &lut_hdr);
     if (st == IN_CTX_UNSUPPORTED) {
-        if (in_is_guid(col, set))
-            return exec_in_guid_fallback(col, set, negate);
+        if (in_has_general_fallback(col, set))
+            return exec_in_general_fallback(col, set, negate);
         return ray_error("nyi", "OP_IN on RAY_STR not yet implemented");
     }
     if (st == IN_CTX_OOM)

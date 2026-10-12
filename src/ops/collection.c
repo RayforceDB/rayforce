@@ -52,6 +52,7 @@
  * ══════════════════════════════════════════ */
 
 #define HS_EMPTY ((int64_t)-1)
+#define HS_NULL_CLASSES 32
 
 typedef struct hashset_t {
     int64_t* slots;        /* cap entries; -1 = empty, else row index */
@@ -59,8 +60,11 @@ typedef struct hashset_t {
     int64_t  cap;          /* power of 2 */
     int64_t  mask;         /* cap - 1 */
     int64_t  count;        /* live entries (excl. null bucket) */
-    int      null_seen;    /* 1 if any null has been recorded */
-    int64_t  null_idx;     /* row index of first null encountered */
+    /* First null row of each null class (hs_null_class): nulls equal one
+     * another only within a class, as atom_eq has it. */
+    int      n_null;
+    int8_t   null_cls[HS_NULL_CLASSES];
+    int64_t  null_at[HS_NULL_CLASSES];
     /* Cached typed-vec data pointers to avoid re-derefs in hot loops. */
     ray_t*   src;          /* source vec or list */
     int8_t   src_type;     /* ray_t.type */
@@ -243,6 +247,15 @@ static inline int hs_row_is_null(ray_t* src, int64_t i, void* data) {
     return ray_vec_may_have_nulls(src) && ray_vec_is_null(src, i);
 }
 
+/* The class of a null row: two nulls are equal when two values of their
+ * types can be — the same type, or both numeric (atom_eq).  A LIST cell
+ * carries its own type; a missing cell is the untyped null. */
+static int8_t hs_null_class(ray_t* src, int64_t i, void* data) {
+    if (src->type != RAY_LIST) return ray_null_class(src->type);
+    ray_t* e = ((ray_t**)data)[i];
+    return e ? ray_null_class(e->type) : RAY_NULL;
+}
+
 static bool hashset_init(hashset_t* hs, ray_t* src, int64_t hint) {
     int64_t cap = 16;
     /* Cap target: 2× hint to keep load factor under 0.5. */
@@ -254,8 +267,7 @@ static bool hashset_init(hashset_t* hs, ray_t* src, int64_t hint) {
     hs->cap = cap;
     hs->mask = cap - 1;
     hs->count = 0;
-    hs->null_seen = 0;
-    hs->null_idx = HS_EMPTY;
+    hs->n_null = 0;
     hs->src = src;
     hs->src_type = src ? src->type : 0;
     hs->src_has_nulls = src ? ray_vec_may_have_nulls(src) : false;
@@ -343,8 +355,12 @@ hashset_scan(hashset_t* hs, ray_t* probe_src, int64_t probe_i,
 
 static int64_t hashset_find_xrow(hashset_t* hs, ray_t* probe_src, int64_t probe_i,
                                   int8_t probe_type, void* probe_data) {
-    if (hs_row_is_null(probe_src, probe_i, probe_data))
-        return hs->null_seen ? hs->null_idx : HS_EMPTY;
+    if (hs_row_is_null(probe_src, probe_i, probe_data)) {
+        int8_t c = hs_null_class(probe_src, probe_i, probe_data);
+        for (int k = 0; k < hs->n_null; k++)
+            if (hs->null_cls[k] == c) return hs->null_at[k];
+        return HS_EMPTY;
+    }
     /* sym-domain Phase 2: SYM-vec vs SYM-vec probes across DIFFERENT
      * domains cannot compare (or hash) raw ids.  Re-express the probe
      * cell in the build side's domain once, then run the standard raw
@@ -459,9 +475,12 @@ static void distinct_sort_indices(ray_t* src, int64_t* idx, int64_t count) {
  * the set silently keeps the previous capacity (caller proceeds). */
 static bool hashset_insert(hashset_t* hs, int64_t i) {
     if (hs_row_is_null(hs->src, i, hs->src_data)) {
-        if (hs->null_seen) return false;
-        hs->null_seen = 1;
-        hs->null_idx = i;
+        int8_t c = hs_null_class(hs->src, i, hs->src_data);
+        for (int k = 0; k < hs->n_null; k++)
+            if (hs->null_cls[k] == c) return false;
+        if (hs->n_null == HS_NULL_CLASSES) return false;  /* cannot happen */
+        hs->null_cls[hs->n_null] = c;
+        hs->null_at[hs->n_null++] = i;
         return true;
     }
     if (hs->count * 2 >= hs->cap) {
@@ -1057,7 +1076,12 @@ ray_t* ray_apply_fn(ray_t** args, int64_t n) {
 int atom_eq(ray_t* a, ray_t* b) {
     int a_null = RAY_ATOM_IS_NULL(a);
     int b_null = RAY_ATOM_IS_NULL(b);
-    if (a_null && b_null) return 1;
+    /* Two nulls are equal where two values of their types can be: the same
+     * type, or both numeric.  A symbol null, the empty string and an integer
+     * null are different values, as 'a, "a" and 1 are — treating every null
+     * as one collapsed (distinct (list ' "" 0Nl)) to a single cell. */
+    if (a_null && b_null)
+        return ray_null_class(a->type) == ray_null_class(b->type);
     if (a_null || b_null) return 0;
     if (a->type != b->type) {
         if (is_numeric(a) && is_numeric(b))
@@ -1369,6 +1393,23 @@ ray_t* ray_distinct_fn(ray_t* x) {
 }
 
 /* (in val vec) — check membership */
+/* One element of a collection left operand.  A string element is one whole
+ * value: the lone-string arms of ray_in_fn answer per character, which is
+ * right for a string atom on its own but not for a row of a collection —
+ * (in ["p" "qq"] (list "qq" "zz")) answered [[false] [false false]].  A
+ * string set (vector) already compares whole strings in ray_in_fn. */
+static ray_t* in_row(ray_t* elem, ray_t* vec) {
+    if (elem->type == -RAY_STR && ray_is_atom(vec))
+        return make_bool(atom_eq(elem, vec) ? 1 : 0);
+    if (elem->type == -RAY_STR && vec->type == RAY_LIST) {
+        ray_t** set = (ray_t**)ray_data(vec);
+        for (int64_t j = 0; j < ray_len(vec); j++)
+            if (atom_eq(elem, set[j])) return make_bool(1);
+        return make_bool(0);
+    }
+    return ray_in_fn(elem, vec);
+}
+
 ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
     if (ray_is_lazy(val)) val = ray_lazy_materialize(val);
     if (ray_is_lazy(vec)) vec = ray_lazy_materialize(vec);
@@ -1396,6 +1437,11 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
         if (flat_vec) ray_release(flat_vec);
         return r;
     }
+    /* A string column's cell, bound for one row of a query, is one value:
+     * the per-character arms below are for a lone string literal. */
+    if (val->type == -RAY_STR && (val->attrs & RAY_ATTR_STR_CELL) &&
+        (ray_is_atom(vec) || vec->type == RAY_LIST))
+        return in_row(val, vec);
     /* STR in STR: for each char of val, check membership in vec string */
     if (ray_is_atom(val) && (-val->type) == RAY_STR && ray_is_atom(vec) && (-vec->type) == RAY_STR) {
         const char* vp = ray_str_ptr(val);
@@ -1444,6 +1490,28 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
             /* No needles: an empty B8, the shape every other left operand
              * answers — `where` over it must not raise (#785). */
             return ray_vec_new(RAY_BOOL, 0);
+        }
+        /* A string vector against a string atom or a list: its rows can only
+         * equal the set's string elements, so the set is the string vector
+         * of those and the hash-set path below answers — one probe per row
+         * instead of a boxed cell and a scan of the set per row. */
+        if (val->type == RAY_STR && (vec->type == -RAY_STR || vec->type == RAY_LIST)) {
+            ray_t* sv;
+            if (vec->type == -RAY_STR) {
+                sv = ray_vec_new(RAY_STR, 1);
+                if (sv && !RAY_IS_ERR(sv))
+                    sv = ray_str_vec_append(sv, ray_str_ptr(vec), ray_str_len(vec));
+            } else {
+                ray_t** el = (ray_t**)ray_data(vec);
+                sv = ray_vec_new(RAY_STR, ray_len(vec));
+                for (int64_t j = 0; j < ray_len(vec) && sv && !RAY_IS_ERR(sv); j++)
+                    if (el[j] && el[j]->type == -RAY_STR)
+                        sv = ray_str_vec_append(sv, ray_str_ptr(el[j]), ray_str_len(el[j]));
+            }
+            if (!sv || RAY_IS_ERR(sv)) return sv ? sv : ray_error("oom", NULL);
+            ray_t* r = ray_in_fn(val, sv);
+            ray_release(sv);
+            return r;
         }
         /* Hash-based fast path: both sides are typed vecs of compatible
          * shape and the result is a row-aligned bool vec.  Build a
@@ -1533,52 +1601,53 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
             hashset_destroy(&hs);
             return result;
         }
-        /* Probe first element to check if result is scalar or vector */
-        int alloc0 = 0;
-        ray_t* e0 = collection_elem(val, 0, &alloc0);
-        if (RAY_IS_ERR(e0)) return e0;
-        ray_t* r0 = ray_in_fn(e0, vec);
-        if (alloc0) ray_release(e0);
-        if (RAY_IS_ERR(r0)) return r0;
-        if (ray_is_atom(r0) && r0->type == -RAY_BOOL) {
-            /* All results are scalar bools — use typed bool vector */
-            ray_t* result = ray_vec_new(RAY_BOOL, vlen);
-            if (RAY_IS_ERR(result)) { ray_release(r0); return result; }
-            result->len = vlen;
-            bool* out = (bool*)ray_data(result);
-            out[0] = r0->b8;
-            ray_release(r0);
-            for (int64_t i = 1; i < vlen; i++) {
-                int alloc = 0;
-                ray_t* elem = collection_elem(val, i, &alloc);
-                if (RAY_IS_ERR(elem)) { ray_release(result); return elem; }
-                ray_t* r = ray_in_fn(elem, vec);
-                if (alloc) ray_release(elem);
-                if (RAY_IS_ERR(r)) { ray_release(result); return r; }
-                out[i] = r->b8;
+        /* One verdict per element: a bool vector while every answer is a
+         * bool, a list from the first answer that is not (a nested element
+         * answers a vector).  The verdicts so far are boxed into the list
+         * and collection carries on there. */
+        ray_t* result = ray_vec_new(RAY_BOOL, vlen);
+        if (!result || RAY_IS_ERR(result)) return result ? result : ray_error("oom", NULL);
+        result->len = vlen;
+        int64_t i = 0;
+        for (; i < vlen; i++) {
+            int alloc = 0;
+            ray_t* elem = collection_elem(val, i, &alloc);
+            if (RAY_IS_ERR(elem)) { ray_release(result); return elem; }
+            ray_t* r = in_row(elem, vec);
+            if (alloc) ray_release(elem);
+            if (RAY_IS_ERR(r)) { ray_release(result); return r; }
+            if (!(ray_is_atom(r) && r->type == -RAY_BOOL)) {
+                bool* out = (bool*)ray_data(result);
+                ray_t* lst = ray_list_new(vlen);
+                for (int64_t k = 0; k < i && lst && !RAY_IS_ERR(lst); k++) {
+                    ray_t* b = make_bool(out[k]);
+                    lst = ray_list_append(lst, b);
+                    ray_release(b);
+                }
+                ray_release(result);
+                if (lst && !RAY_IS_ERR(lst)) lst = ray_list_append(lst, r);
                 ray_release(r);
+                if (!lst || RAY_IS_ERR(lst)) return lst ? lst : ray_error("oom", NULL);
+                result = lst;
+                i++;
+                break;
             }
-            return result;
-        } else {
-            /* Results are non-scalar — collect as list */
-            ray_t* result = ray_list_new(vlen);
-            if (RAY_IS_ERR(result)) { ray_release(r0); return result; }
-            result = ray_list_append(result, r0);
-            ray_release(r0);
-            if (RAY_IS_ERR(result)) return result;
-            for (int64_t i = 1; i < vlen; i++) {
-                int alloc = 0;
-                ray_t* elem = collection_elem(val, i, &alloc);
-                if (RAY_IS_ERR(elem)) { ray_release(result); return elem; }
-                ray_t* r = ray_in_fn(elem, vec);
-                if (alloc) ray_release(elem);
-                if (RAY_IS_ERR(r)) { ray_release(result); return r; }
-                result = ray_list_append(result, r);
-                ray_release(r);
-                if (RAY_IS_ERR(result)) return result;
-            }
-            return result;
+            ((bool*)ray_data(result))[i] = r->b8;
+            ray_release(r);
         }
+        if (result->type == RAY_BOOL) return result;
+        for (; i < vlen; i++) {
+            int alloc = 0;
+            ray_t* elem = collection_elem(val, i, &alloc);
+            if (RAY_IS_ERR(elem)) { ray_release(result); return elem; }
+            ray_t* r = in_row(elem, vec);
+            if (alloc) ray_release(elem);
+            if (RAY_IS_ERR(r)) { ray_release(result); return r; }
+            result = ray_list_append(result, r);
+            ray_release(r);
+            if (RAY_IS_ERR(result)) return result;
+        }
+        return result;
     }
     /* Typed vector: search without boxing */
     if (ray_is_vec(vec) && ray_is_atom(val)) {
@@ -1587,10 +1656,10 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
         bool val_null = RAY_ATOM_IS_NULL(val);
         if (has_nulls) {
             for (int64_t i = 0; i < len; i++) {
-                if (ray_vec_is_null(vec, i)) {
-                    if (val_null) return make_bool(1);
-                    continue;
-                }
+                /* Only a null row can match a null needle, and only a null
+                 * of its class (atom_eq): the untyped null or a symbol null
+                 * is not 0Nl.  A non-null needle skips the null rows. */
+                if (ray_vec_is_null(vec, i) != val_null) continue;
                 int alloc = 0;
                 ray_t* elem = collection_elem(vec, i, &alloc);
                 int eq = atom_eq(val, elem);
@@ -2845,11 +2914,9 @@ ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
 
         if (has_nulls) {
             for (int64_t i = 0; i < len; i++) {
-                if (ray_vec_is_null(vec, i)) {
-                    if (val_null) return make_i64(i);
-                    continue;
-                }
-                if (val_null) continue;
+                /* A null row matches only a null of its class (atom_eq),
+                 * as in `in`: 0Nl is not found among dates. */
+                if (ray_vec_is_null(vec, i) != val_null) continue;
                 int alloc = 0;
                 ray_t* elem = collection_elem(vec, i, &alloc);
                 int eq = atom_eq(elem, val);

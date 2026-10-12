@@ -52,6 +52,7 @@
  *
  *   Bits 0x01-0x03  RAY_SYM vectors:  sym index width (RAY_SYM_W8/W16/W32/W64)
  *   Bits 0x01-0x10  function objects (RAY_UNARY/BINARY/VARY): RAY_FN_* flags
+ *   Bit  0x01       -RAY_STR atoms:  RAY_ATTR_STR_CELL (a string column's cell bound for a row)
  *   Bit  0x02       -RAY_I64 atoms:  RAY_ATTR_GRAPH (ray_rel_t* CSR handle in .i64)
  *   Bit  0x04       -RAY_I64 atoms:  RAY_ATTR_HNSW (HNSW handle in .i64)
  *   Bit  0x08       vectors:         RAY_ATTR_HAS_INDEX (index ray_t* in aux[0..7])
@@ -86,6 +87,11 @@
  * (.graph.free h) explicitly; the heap finalizer also frees the underlying
  * ray_rel_t when the atom's rc drops to zero so rebindings/scope-exit
  * never leak the graph. */
+/* RAY_ATTR_STR_CELL (-RAY_STR atoms): the atom is one cell of a string
+ * column, bound by a query that evaluates an expression row by row.  `in`
+ * answers it as one value, as it answers a string element of a collection,
+ * not character by character as it answers a lone string literal. */
+#define RAY_ATTR_STR_CELL     0x01
 #define RAY_ATTR_GRAPH        0x02
 
 /* I64 atom carries an owning ray_hnsw_t* in its .i64 slot.
