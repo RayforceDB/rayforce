@@ -2261,6 +2261,29 @@ static int collect_scan_syms(ray_graph_t* g, const uint32_t* roots, int nroots,
     return n;
 }
 
+/* The sparse refinement's keep set for a membership test the element-wise
+ * walk declines: `in` / `not in` of one generation-2 column (not SYM: its
+ * ids resolve over the file's domain, which exec_in does not translate)
+ * against a constant set.  The refinement then gathers that column's
+ * survivors by range and runs exec_in over them, instead of evaluating
+ * the test over every row, which reads the column whole.  Generation 0
+ * keeps the full-width path (0: not admitted). */
+static ray_t* scan_table_of(ray_graph_t* g, ray_op_ext_t* ext);
+static int refine_in_keep(ray_graph_t* g, ray_op_t* pred, ray_t* tbl, int64_t* keep) {
+    if (!pred || (pred->opcode != OP_IN && pred->opcode != OP_NOT_IN)) return 0;
+    ray_op_t* c0 = op_child(g, pred, 0);
+    ray_op_t* c1 = op_child(g, pred, 1);
+    if (!c0 || !c1 || c0->opcode != OP_SCAN || c1->opcode != OP_CONST) return 0;
+    ray_op_ext_t* x = find_ext(g, c0->id);
+    if (!x || scan_table_of(g, x) != tbl) return 0;
+    ray_col_meta_t m;
+    if (!ray_table_col_meta(tbl, x->sym, &m) || !m.enc) return 0;
+    int8_t bt = RAY_IS_PARTED(m.type) ? (int8_t)RAY_PARTED_BASETYPE(m.type) : m.type;
+    if (bt == RAY_SYM || bt == RAY_LIST) return 0;
+    keep[0] = x->sym;
+    return 1;
+}
+
 /* collect_scan_syms over a GROUP's key + agg-input subtrees. */
 static int group_input_scan_syms(ray_graph_t* g, ray_op_ext_t* gx,
                                  int64_t* syms, int max, bool* has_expr) {
@@ -3525,6 +3548,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     uint32_t roots[1] = { pred_root->id };
                     int nkeep = collect_scan_syms(g, roots, 1, keep, 32,
                                                   &has_expr);
+                    if (nkeep <= 0) nkeep = refine_in_keep(g, pred_root, input, keep);
                     if (nkeep > 0) {
                         ray_t* sub = sel_compact(g, input, g->selection,
                                                  keep, nkeep);

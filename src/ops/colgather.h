@@ -42,8 +42,15 @@
 
 /* Rows of `src` kept by rowsel `sel` (NULL: every row), in row order, as a
  * new plain vector.  Only vectors whose segment is not RAY_SEL_NONE are
- * read.  NULL with *out set, or an owned error. */
+ * read.  A large selection is gathered by pool tasks over consecutive
+ * segments; a failure is the lowest-row one (the scan-fail envelope), a
+ * cancelled dispatch `cancel`.  NULL with *out set, or an owned error. */
 ray_t* ray_col_gather_sel(ray_col_src_t* src, ray_t* sel, ray_t** out);
+/* Test hook: selection gathers run as several pool tasks since process
+ * start (a selection of at least RAY_PARALLEL_THRESHOLD rows with a
+ * pool: each task gathers its segments into the output range the
+ * selection's counts give it, STR pools appended in row order). */
+uint64_t ray_col_test_gather_par(void);
 /* Rows ids[0..n) of `src`, in that order, repeats included, as a new plain
  * vector.  Ids are bucketed by vector; each touched vector is range-read
  * once and its values scattered to their output positions. */

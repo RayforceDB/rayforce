@@ -24,19 +24,29 @@
 #include "ops/colgather.h"
 #include "ops/internal.h"     /* parted_sym_width */
 #include "ops/rowsel.h"
+#include "core/pool.h"         /* the parallel selection gather */
 #include "table/domain.h"    /* ray_sym_domain_retain */
 #include "table/sym.h"
 #include "vec/str.h"
 #include "vec/vec.h"           /* ray_str_pool_reserve, ray_raw_is_null */
+#include <stdatomic.h>
 #include <string.h>
+
+static _Atomic(uint64_t) g_par_gathers;   /* test hook: parallel selection gathers */
+uint64_t ray_col_test_gather_par(void) { return atomic_load_explicit(&g_par_gathers, memory_order_relaxed); }
 
 /* The result under construction: the output vector (len set, cells filled
  * by position) and, for STR, the pool built for it (a RAY_U8 block grown
- * as ray_str_vec_append grows one, attached at the finish). */
+ * as ray_str_vec_append grows one, attached at the finish).  A parallel
+ * gather gives each task its own accumulator over the one shared output:
+ * the task writes only its own output positions and its own pool, and
+ * notes a null in `nulls` instead of the output's attrs, which only the
+ * finish sets (after the join). */
 typedef struct {
     ray_t*  out;
     ray_t*  pool;
     uint8_t ow;          /* SYM: the output's width class */
+    bool    nulls;       /* a null was written: HAS_NULLS at the finish */
 } gather_acc_t;
 
 static ray_t* acc_open(gather_acc_t* a, const ray_col_src_t* src, int64_t n) {
@@ -76,6 +86,23 @@ static ray_t* acc_pool_put(gather_acc_t* a, const char* p, uint32_t len, uint32_
     return NULL;
 }
 
+/* The type's null sentinel at output position pos, as ray_vec_set_null
+ * writes it for the fixed-width types a view can carry nulls in; the
+ * HAS_NULLS bit waits for the finish (a.nulls). */
+static void acc_null(gather_acc_t* a, int64_t pos) {
+    void* p = ray_data(a->out);
+    switch (a->out->type) {
+    case RAY_F64:                               ((double*)p)[pos]  = NULL_F64; break;
+    case RAY_F32:                               ((float*)p)[pos]   = NULL_F32; break;
+    case RAY_I64: case RAY_TIMESTAMP:           ((int64_t*)p)[pos] = NULL_I64; break;
+    case RAY_I32: case RAY_DATE: case RAY_TIME: ((int32_t*)p)[pos] = NULL_I32; break;
+    case RAY_I16:                               ((int16_t*)p)[pos] = NULL_I16; break;
+    case RAY_GUID:                              memset((uint8_t*)p + pos * 16, 0, 16); break;
+    default: return;                            /* not nullable (BOOL, U8): as ray_vec_set_null */
+    }
+    a->nulls = true;
+}
+
 /* Elements [i, i + cnt) of view `v` to output positions [pos, pos + cnt),
  * as generation 0's gather leaves them: STR descriptors rebuilt over the
  * result's pool (as ray_str_vec_append builds them), SYM ids written as
@@ -93,7 +120,7 @@ static ray_t* acc_put(gather_acc_t* a, const ray_col_range_t* v, int64_t i, int6
             memset(&e, 0, sizeof e);
             e.len = s->len;
             if (s->len == 0) {
-                o->attrs |= RAY_ATTR_HAS_NULLS;
+                a->nulls = true;
             } else if (ray_str_is_inline(s)) {
                 memcpy(e.data, s->data, s->len);
             } else {
@@ -125,7 +152,7 @@ static ray_t* acc_put(gather_acc_t* a, const ray_col_range_t* v, int64_t i, int6
                      : a->ow == RAY_SYM_W32 ? UINT32_MAX : UINT64_MAX;
         for (int64_t k = 0; k < cnt; k++) {
             uint64_t id = (uint64_t)ray_read_sym(v->data, i + k, RAY_SYM, v->attrs);
-            if (id == 0) o->attrs |= RAY_ATTR_HAS_NULLS;
+            if (id == 0) a->nulls = true;
             if (vw == a->ow) continue;
             if (id > lim)    /* the width scan said every segment fits */
                 return ray_error("corrupt", "gather: symbol id %llu above its width class", (unsigned long long)id);
@@ -137,13 +164,55 @@ static ray_t* acc_put(gather_acc_t* a, const ray_col_range_t* v, int64_t i, int6
     memcpy((char*)ray_data(o) + (size_t)pos * esz, (const char*)v->data + (size_t)i * esz, (size_t)cnt * esz);
     if (v->may_null)
         for (int64_t k = 0; k < cnt; k++)
-            if (ray_raw_is_null(v->type, v->attrs, v->data, i + k)) ray_vec_set_null(o, pos + k, true);
+            if (ray_raw_is_null(v->type, v->attrs, v->data, i + k)) acc_null(a, pos + k);
     return NULL;
 }
+
+/* A partial vector: view elements base + li[q] (li16 or li64, whichever is
+ * not NULL), q in [0, cnt), to output positions [pos, pos + cnt).  A
+ * fixed-width view (SYM at the output's width included) is copied by one
+ * width-specialised loop, then its nulls are rewritten as acc_put rewrites
+ * them; STR and widened SYM go element by element through acc_put. */
+#define ACC_LIST_COPY(IX) do {                                                                       \
+        switch (esz) {                                                                               \
+        case 1: for (int64_t q = 0; q < cnt; q++) d[q] = sd[(IX)]; break;                            \
+        case 2: for (int64_t q = 0; q < cnt; q++) memcpy(d + q * 2, sd + (IX) * 2, 2); break;        \
+        case 4: for (int64_t q = 0; q < cnt; q++) memcpy(d + q * 4, sd + (IX) * 4, 4); break;        \
+        case 8: for (int64_t q = 0; q < cnt; q++) memcpy(d + q * 8, sd + (IX) * 8, 8); break;        \
+        default: for (int64_t q = 0; q < cnt; q++) memcpy(d + q * esz, sd + (IX) * esz, esz); break; \
+        }                                                                                            \
+    } while (0)
+static ray_t* acc_put_list(gather_acc_t* a, const ray_col_range_t* v, int64_t base, const uint16_t* li16,
+                           const int64_t* li64, int64_t cnt, int64_t pos) {
+    if (v->type == RAY_STR || (v->type == RAY_SYM && (v->attrs & RAY_SYM_W_MASK) != a->ow)) {
+        for (int64_t q = 0; q < cnt; q++) {
+            ray_t* err = acc_put(a, v, base + (li16 ? (int64_t)li16[q] : li64[q]), pos + q, 1);
+            if (err) return err;
+        }
+        return NULL;
+    }
+    uint8_t esz = ray_sym_elem_size(v->type, v->attrs);
+    const char* sd = (const char*)v->data;
+    char* d = (char*)ray_data(a->out) + (size_t)pos * esz;
+    if (li16) ACC_LIST_COPY(base + (int64_t)li16[q]);
+    else      ACC_LIST_COPY(base + li64[q]);
+    if (v->type == RAY_SYM) {
+        for (int64_t q = 0; q < cnt && !a->nulls; q++)
+            if (ray_read_sym(ray_data(a->out), pos + q, RAY_SYM, a->out->attrs) == 0) a->nulls = true;
+    } else if (v->may_null) {
+        for (int64_t q = 0; q < cnt; q++) {
+            int64_t r = base + (li16 ? (int64_t)li16[q] : li64[q]);
+            if (ray_raw_is_null(v->type, v->attrs, v->data, r)) acc_null(a, pos + q);
+        }
+    }
+    return NULL;
+}
+#undef ACC_LIST_COPY
 
 static ray_t* acc_finish(gather_acc_t* a, const ray_col_src_t* src, ray_t** out) {
     ray_t* o = a->out;
     if (a->pool) { o->str_pool = a->pool; a->pool = NULL; }   /* the result's own pool */
+    if (a->nulls) o->attrs |= RAY_ATTR_HAS_NULLS;
     if (src->type == RAY_SYM && src->dom && src->dom != ray_sym_runtime_domain()) {
         ray_sym_domain_retain(src->dom);                     /* the agg_src_standin pattern */
         o->sym_domain = src->dom;
@@ -207,13 +276,13 @@ ray_t* ray_col_gather_rows(ray_col_src_t* src, const int64_t* ids, int64_t n, ra
         const ray_col_range_t* v;
         if ((err = ray_col_cursor_at(&cur, r, &v)) != NULL) break;
         int64_t end = v->start + v->n;
-        if (!ord) {                              /* in order: consecutive ids are one copy */
-            while (k < n && ids[k] < end && !err) {
-                int64_t j = k + 1;
-                while (j < n && ids[j] == ids[j - 1] + 1 && ids[j] < end) j++;
-                err = acc_put(&a, v, ids[k] - v->start, k, j - k);
-                k = j;
-            }
+        if (!ord) {                              /* in order: the view's ids are one copy */
+            int64_t j = k + 1;
+            while (j < n && ids[j] < end) j++;
+            err = ids[j - 1] - ids[k] == j - 1 - k   /* one run, no repeats */
+                ? acc_put(&a, v, ids[k] - v->start, k, j - k)
+                : acc_put_list(&a, v, -v->start, NULL, ids + k, j - k, k);
+            k = j;
             continue;
         }
         for (; k < n && !err; k++) {
@@ -229,6 +298,112 @@ ray_t* ray_col_gather_rows(ray_col_src_t* src, const int64_t* ids, int64_t n, ra
     return acc_finish(&a, src, out);
 }
 
+/* ray_col_gather_sel's work: segments [s0, s1) of the selection, the
+ * first written at output position pos, through one task's cursor. */
+typedef struct {
+    ray_col_src_t*  src;
+    const uint8_t*  flags;    /* NULL: every segment ALL */
+    const uint32_t* offs;
+    const uint16_t* idx;
+} gsel_in_t;
+
+static ray_t* gsel_range(const gsel_in_t* in, gather_acc_t* a, ray_col_cursor_t* cur,
+                         int64_t s0, int64_t s1, int64_t pos) {
+    ray_col_src_t* src = in->src;
+    ray_t* err = NULL;
+    for (int64_t s = s0; s < s1 && !err; s++) {
+        uint8_t f = in->flags ? in->flags[s] : RAY_SEL_ALL;
+        if (f == RAY_SEL_NONE) continue;                 /* the vector is never read */
+        int64_t lo = s * RAY_MORSEL_ELEMS;
+        int64_t hi = lo + RAY_MORSEL_ELEMS < src->len ? lo + RAY_MORSEL_ELEMS : src->len;
+        if (f == RAY_SEL_ALL) {
+            /* a segment may span two views (a parted segment boundary) */
+            for (int64_t r = lo; r < hi && !err; ) {
+                const ray_col_range_t* v;
+                if ((err = ray_col_cursor_at(cur, r, &v)) != NULL) break;
+                int64_t end = v->start + v->n < hi ? v->start + v->n : hi;
+                err = acc_put(a, v, r - v->start, pos, end - r);
+                pos += end - r;
+                r = end;
+            }
+            continue;
+        }
+        uint32_t k0 = in->offs[s], k1 = in->offs[s + 1];
+        for (uint32_t k = k0; k < k1; k++)
+            if (in->idx[k] >= hi - lo)
+                return ray_error("corrupt", "gather: selection row %lld past its segment", (long long)(lo + in->idx[k]));
+        for (uint32_t k = k0; k < k1 && !err; ) {
+            const ray_col_range_t* v;
+            if ((err = ray_col_cursor_at(cur, lo + in->idx[k], &v)) != NULL) break;
+            int64_t end = v->start + v->n;
+            uint32_t j = k + 1;
+            while (j < k1 && lo + in->idx[j] < end) j++;
+            err = acc_put_list(a, v, lo - v->start, in->idx + k, NULL, j - k, pos);
+            pos += j - k;
+            k = j;
+        }
+    }
+    return err;
+}
+
+/* The parallel form: task t gathers segments [t * spt, (t + 1) * spt) at
+ * output position pos0[t] (the selection's own counts, summed before the
+ * dispatch) into its own accumulator over the shared output; failures go
+ * to the envelope keyed by the task's first row. */
+typedef struct {
+    gsel_in_t        in;
+    int64_t          nseg, spt;
+    const int64_t*   pos0;
+    gather_acc_t*    acc;
+    ray_scan_fail_t  fail;
+} gsel_par_t;
+
+static void gsel_task(void* ctxp, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    gsel_par_t* c = (gsel_par_t*)ctxp;
+    for (int64_t t = start; t < end; t++) {
+        int64_t s0 = t * c->spt, s1 = s0 + c->spt < c->nseg ? s0 + c->spt : c->nseg;
+        int64_t key = s0 * RAY_MORSEL_ELEMS;
+        if (ray_scan_fail_skip(&c->fail, key)) continue;
+        ray_col_fixed_t fixed;                   /* the task's decode vector on its stack */
+        ray_col_cursor_t cur;
+        ray_col_cursor_init_lent(&cur, c->in.src, &fixed);
+        ray_t* err = gsel_range(&c->in, &c->acc[t], &cur, s0, s1, c->pos0[t]);
+        ray_col_cursor_free(&cur);
+        if (err) ray_scan_fail_note(&c->fail, key, err);
+    }
+}
+
+/* Task pools appended in task order (row order) into one pool: each task's
+ * pooled descriptors (output positions [pos0[t], pos0[t + 1])) move by the
+ * bytes before them.  `range` when the whole would pass UINT32_MAX. */
+static ray_t* gsel_merge_pools(gather_acc_t* acc, int64_t ntask, const int64_t* pos0, gather_acc_t* a) {
+    int64_t total = 0, first = -1, users = 0;
+    for (int64_t t = 0; t < ntask; t++)
+        if (acc[t].pool) { total += acc[t].pool->len; users++; if (first < 0) first = t; }
+    if (!users) return NULL;
+    if (users == 1 && first == 0) { a->pool = acc[0].pool; acc[0].pool = NULL; return NULL; }
+    int64_t at;
+    ray_err_t pe = ray_str_pool_reserve(&a->pool, (size_t)total, &at);
+    if (pe == RAY_ERR_RANGE)
+        return ray_error("range", "gather: STR pool exceeds %lld bytes", (long long)UINT32_MAX);
+    if (pe != RAY_OK) return ray_error("oom", NULL);
+    ray_str_t* d = (ray_str_t*)ray_data(a->out);
+    int64_t b = at;
+    for (int64_t t = 0; t < ntask; t++) {
+        if (!acc[t].pool) continue;
+        memcpy((char*)ray_data(a->pool) + b, ray_data(acc[t].pool), (size_t)acc[t].pool->len);
+        if (b)
+            for (int64_t p = pos0[t]; p < pos0[t + 1]; p++)
+                if (d[p].len && !ray_str_is_inline(&d[p])) d[p].pool_off += (uint32_t)b;
+        b += acc[t].pool->len;
+        ray_release(acc[t].pool);
+        acc[t].pool = NULL;
+    }
+    a->pool->len = b;
+    return NULL;
+}
+
 ray_t* ray_col_gather_sel(ray_col_src_t* src, ray_t* sel, ray_t** out) {
     *out = NULL;
     ray_rowsel_t* m = sel ? ray_rowsel_meta(sel) : NULL;
@@ -238,53 +413,64 @@ ray_t* ray_col_gather_sel(ray_col_src_t* src, ray_t* sel, ray_t** out) {
     gather_acc_t a;
     ray_t* err = acc_open(&a, src, n);
     if (err) return err;
-    ray_col_fixed_t fixed;                       /* the decode vector on the stack (P2 17i) */
-    ray_col_cursor_t cur;
-    ray_col_cursor_init_lent(&cur, src, &fixed);
     int64_t nseg = m ? (int64_t)m->n_segs : (src->len + RAY_MORSEL_ELEMS - 1) / RAY_MORSEL_ELEMS;
-    const uint8_t* flags = sel ? ray_rowsel_flags(sel) : NULL;
-    const uint32_t* offs = sel ? ray_rowsel_offsets(sel) : NULL;
-    const uint16_t* idx = sel ? ray_rowsel_idx(sel) : NULL;
-    int64_t pos = 0;
+    gsel_in_t in = { .src = src, .flags = sel ? ray_rowsel_flags(sel) : NULL,
+                     .offs = sel ? ray_rowsel_offsets(sel) : NULL, .idx = sel ? ray_rowsel_idx(sel) : NULL };
+    /* the tasks: the pool's grain of segments each, at most the ring's
+     * initial capacity of them; one runs here when the pool cannot help */
+    ray_pool_t* pool = ray_pool_get();
+    int64_t spt = RAY_DISPATCH_MORSELS;
+    while ((nseg + spt - 1) / spt > (int64_t)RAY_POOL_INIT_TASKS) spt *= 2;
+    int64_t ntask = ray_pool_par_dispatch_ok(pool, n, RAY_PARALLEL_THRESHOLD) ? (nseg + spt - 1) / spt : 1;
+    if (ntask <= 1) { ntask = 1; spt = nseg; }
+    /* each task's first output position, from the selection's counts:
+     * checked against total_pass before anything is written */
+    int64_t pos0_one[2];
+    int64_t* pos0 = ntask > 1 ? (int64_t*)ray_alloc_raw((size_t)(ntask + 1) * sizeof(int64_t)) : pos0_one;
+    gather_acc_t* acc = ntask > 1 ? (gather_acc_t*)ray_calloc_raw((size_t)ntask * sizeof(gather_acc_t)) : NULL;
+    if (!pos0 || (ntask > 1 && !acc)) {
+        if (pos0 != pos0_one) ray_free_raw(pos0);
+        ray_free_raw(acc);
+        acc_abort(&a);
+        return ray_error("oom", "gather tasks");
+    }
+    int64_t cum = 0;
     for (int64_t s = 0; s < nseg && !err; s++) {
-        uint8_t f = flags ? flags[s] : RAY_SEL_ALL;
-        if (f == RAY_SEL_NONE) continue;                 /* the vector is never read */
+        if (s % spt == 0) pos0[s / spt] = cum;
+        uint8_t f = in.flags ? in.flags[s] : RAY_SEL_ALL;
+        if (f == RAY_SEL_NONE) continue;
         int64_t lo = s * RAY_MORSEL_ELEMS;
         int64_t hi = lo + RAY_MORSEL_ELEMS < src->len ? lo + RAY_MORSEL_ELEMS : src->len;
         /* the rows this segment adds, checked before any is written */
-        int64_t add = f == RAY_SEL_ALL ? hi - lo : (int64_t)offs[s + 1] - (int64_t)offs[s];
-        if (add < 0 || add > n - pos) {
+        int64_t add = f == RAY_SEL_ALL ? hi - lo : (int64_t)in.offs[s + 1] - (int64_t)in.offs[s];
+        if (add < 0 || add > n - cum)
             err = ray_error("corrupt", "gather: selection holds more rows than its %lld", (long long)n);
-            break;
-        }
-        if (f != RAY_SEL_ALL)
-            for (uint32_t k = offs[s]; k < offs[s + 1] && !err; k++)
-                if (idx[k] >= hi - lo)
-                    err = ray_error("corrupt", "gather: selection row %lld past its segment", (long long)(lo + idx[k]));
-        if (err) break;
-        if (f == RAY_SEL_ALL) {
-            /* a segment may span two views (a parted segment boundary) */
-            for (int64_t r = lo; r < hi && !err; ) {
-                const ray_col_range_t* v;
-                if ((err = ray_col_cursor_at(&cur, r, &v)) != NULL) break;
-                int64_t end = v->start + v->n < hi ? v->start + v->n : hi;
-                err = acc_put(&a, v, r - v->start, pos, end - r);
-                pos += end - r;
-                r = end;
-            }
-            continue;
-        }
-        for (uint32_t k = offs[s]; k < offs[s + 1] && !err; ) {
-            const ray_col_range_t* v;
-            if ((err = ray_col_cursor_at(&cur, lo + idx[k], &v)) != NULL) break;
-            int64_t end = v->start + v->n;
-            for (; k < offs[s + 1] && lo + idx[k] < end && !err; k++)
-                err = acc_put(&a, v, lo + idx[k] - v->start, pos++, 1);
-        }
+        else
+            cum += add;
     }
-    ray_col_cursor_free(&cur);
-    if (!err && pos != n)
-        err = ray_error("corrupt", "gather: selection holds %lld rows, says %lld", (long long)pos, (long long)n);
+    if (nseg == 0) pos0[0] = 0;
+    pos0[ntask] = cum;
+    if (!err && cum != n)
+        err = ray_error("corrupt", "gather: selection holds %lld rows, says %lld", (long long)cum, (long long)n);
+    if (!err && ntask == 1) {
+        ray_col_fixed_t fixed;                   /* the decode vector on the stack (P2 17i) */
+        ray_col_cursor_t cur;
+        ray_col_cursor_init_lent(&cur, src, &fixed);
+        err = gsel_range(&in, &a, &cur, 0, nseg, 0);
+        ray_col_cursor_free(&cur);
+    } else if (!err) {
+        gsel_par_t c = { .in = in, .nseg = nseg, .spt = spt, .pos0 = pos0, .acc = acc };
+        for (int64_t t = 0; t < ntask; t++) { acc[t].out = a.out; acc[t].ow = a.ow; }
+        ray_scan_fail_init(&c.fail);
+        atomic_fetch_add_explicit(&g_par_gathers, 1, memory_order_relaxed);
+        ray_pool_dispatch_n(pool, gsel_task, &c, (uint32_t)ntask);
+        err = ray_scan_fail_finish(&c.fail, pool);
+        for (int64_t t = 0; t < ntask; t++) a.nulls |= acc[t].nulls;
+        if (!err) err = gsel_merge_pools(acc, ntask, pos0, &a);
+        for (int64_t t = 0; t < ntask; t++) if (acc[t].pool) ray_release(acc[t].pool);
+    }
+    if (pos0 != pos0_one) ray_free_raw(pos0);
+    ray_free_raw(acc);
     if (err) { acc_abort(&a); return err; }
     return acc_finish(&a, src, out);
 }

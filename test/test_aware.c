@@ -2120,6 +2120,180 @@ static test_result_t test_gather_parted_sym(void) {
     PASS();
 }
 
+/* Fix round 1: a selection of at least RAY_PARALLEL_THRESHOLD rows is
+ * gathered by pool tasks.  300000 rows (five chunks) under ALL, MIX and
+ * NONE segments, every type a view carries (nulls, NaN, in-band SYM and
+ * STR nulls, pooled and inline STR): each result equals generation 0's
+ * `at` and the generation-0 source's own gather (pool bytes included, so
+ * the task pools are appended in row order), and the dispatch ran. */
+#define AW_GP_PRED "(or (< (til 300000) 70000) (and (>= (til 300000) 100000) (< (til 300000) 260000) (!= 0 (% (til 300000) 5))) (> (til 300000) 290000))"
+static test_result_t test_gather_sel_parallel(void) {
+    aw_save("gp", "(table [i f s y d h] (list "
+            "(map (fn [j] (if (== 0 (% j 7)) 0Nl (* j 3))) (til 300000)) "
+            "(map (fn [j] (if (== 0 (% j 11)) 0Nf (* j 0.5))) (til 300000)) "
+            "(map (fn [j] (if (== 0 (% j 5)) \"\" (if (== 0 (% j 2)) \"short\" (format \"a pooled string of row %\" j)))) (til 300000)) "
+            "(as 'SYMBOL (map (fn [j] (if (== 0 (% j 13)) \"\" (format \"k%\" (% j 300)))) (til 300000))) "
+            "(as 'DATE (til 300000)) (% (til 300000) 251)))", -1);
+    ray_t* t0 = aw_load("gp", 0); ray_t* t2 = aw_load("gp", 2);
+    TEST_ASSERT_TRUE(t0 && t2);
+    ray_t* pred = aw_eval(AW_GP_PRED);
+    TEST_ASSERT_TRUE(pred && !RAY_IS_ERR(pred) && pred->type == RAY_BOOL);
+    ray_t* sel = ray_rowsel_from_pred(pred);
+    TEST_ASSERT_NOT_NULL(sel);
+    TEST_ASSERT_TRUE(ray_rowsel_meta(sel)->total_pass >= RAY_PARALLEL_THRESHOLD);
+    static const char* cols[] = { "i", "f", "s", "y", "d", "h" };
+    for (int c = 0; c < 6; c++) {
+        int64_t nm = ray_sym_intern(cols[c], 1);
+        ray_t* out[2];
+        for (int gen = 0; gen < 2; gen++) {
+            ray_col_src_t s;
+            TEST_ASSERT_NULL(ray_table_col_src(gen ? t2 : t0, nm, &s));
+            uint64_t p0 = ray_col_test_gather_par();
+            TEST_ASSERT_NULL(ray_col_gather_sel(&s, sel, &out[gen]));
+            TEST_ASSERT_EQ_U(ray_col_test_gather_par(), p0 + 1);      /* the pool tasks ran */
+            ray_col_src_release(&s);
+        }
+        char q[700];
+        snprintf(q, sizeof q, "(at (at (.db.splayed.get \"" AW_TMP "/gp0/\") '%s) (where %s))", cols[c], AW_GP_PRED);
+        ray_t* ref = aw_eval(q);
+        TEST_ASSERT_FMT(ref && !RAY_IS_ERR(ref), "%s: %s", q, ray_error_msg());
+        AW_GATHER_REF(out[0], ref, true, cols[c]);
+        AW_GATHER_REF(out[1], ref, false, cols[c]);
+        ray_release(ref);
+        test_result_t r = aw_vec_same(out[0], out[1], cols[c]);
+        if (r.status != TEST_PASS) return r;
+        if (cols[c][0] == 's') TEST_ASSERT_TRUE(out[1]->str_pool && out[1]->str_pool->len > 0);
+        ray_release(out[0]); ray_release(out[1]);
+    }
+    ray_rowsel_release(sel); ray_release(pred);
+    ray_release(t0); ray_release(t2);
+    PASS();
+}
+
+/* Fix round 1: tasks in the middle of a parallel selection gather fail.
+ * Chunks 2 and 4 of i (five chunks) have a corrupted descriptor; every
+ * row is selected.  The answer is chunk 2's error whatever the schedule
+ * (the envelope keeps the lowest row), equal to the error a serial read
+ * of chunk 2 reports, and the partial output and every task's pool are
+ * released (STR column t, whose own chunks are intact, beside it). */
+static test_result_t test_gather_sel_task_error(void) {
+    aw_eval_ok("(set W (table [i t] (list (til 300000) (map (fn [j] (format \"a pooled string of row %\" j)) (til 300000)))))");
+    aw_eval_ok("(.db.splayed.set \"" AW_TMP "/ge2/\" W {compress: true})");
+    char dir[512], ipath[600];
+    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(ray_test_tmp(AW_TMP "/ge2"), dir, sizeof dir), RAY_OK);
+    snprintf(ipath, sizeof ipath, "%s/i", dir);
+    for (int c = 2; c <= 4; c += 2) {
+        ray_enc_dirent_t de; memset(&de, 0, sizeof de);
+        FILE* fh = fopen(ipath, "r+b"); TEST_ASSERT_NOT_NULL(fh);
+        fseek(fh, (long)(RAY_ENC_DIR_OFF + (uint64_t)c * sizeof de), SEEK_SET);
+        TEST_ASSERT_EQ_I(fread(&de, sizeof de, 1, fh), 1);
+        fseek(fh, (long)de.offset + 6, SEEK_SET); fputc(1, fh); fclose(fh);
+    }
+    /* the reference message: the serial read of chunk 2's first rows */
+    char want[512] = "";
+    {
+        ray_t* t = aw_load("ge", 2);
+        TEST_ASSERT_NOT_NULL(t);
+        ray_col_src_t s; TEST_ASSERT_NULL(ray_table_col_src(t, ray_sym_intern("i", 1), &s));
+        static const int64_t ids[] = { 2 * 65536 };
+        ray_t* g = NULL;
+        ray_error_clear();
+        ray_t* e = ray_col_gather_rows(&s, ids, 1, &g);
+        TEST_ASSERT_TRUE(e && RAY_IS_ERR(e) && !g);
+        TEST_ASSERT_STR_EQ(ray_err_code(e), "corrupt");
+        snprintf(want, sizeof want, "%s", ray_error_msg());
+        ray_error_free(e); ray_col_src_release(&s); ray_release(t);
+    }
+    for (int round = 0; round < 3; round++) {
+        ray_t* t = aw_load("ge", 2);
+        TEST_ASSERT_NOT_NULL(t);
+        ray_t* pred = ray_vec_new(RAY_BOOL, 300000); pred->len = 300000;
+        for (int64_t r = 0; r < 300000; r++) ((uint8_t*)ray_data(pred))[r] = r % 3 != 1;
+        ray_t* sel = ray_rowsel_from_pred(pred);
+        TEST_ASSERT_NOT_NULL(sel);
+        ray_col_src_t si, st;
+        TEST_ASSERT_NULL(ray_table_col_src(t, ray_sym_intern("i", 1), &si));
+        TEST_ASSERT_NULL(ray_table_col_src(t, ray_sym_intern("t", 1), &st));
+        ray_t* ok = NULL;
+        TEST_ASSERT_NULL(ray_col_gather_sel(&st, sel, &ok));             /* intact: many task pools, merged */
+        TEST_ASSERT_EQ_I(ok->len, ray_rowsel_meta(sel)->total_pass);
+        ray_release(ok);
+        ray_mem_stats_t m0, m1; ray_mem_stats(&m0);
+        uint64_t p0 = ray_col_test_gather_par();
+        ray_t* g = NULL;
+        ray_error_clear();
+        ray_t* e = ray_col_gather_sel(&si, sel, &g);
+        TEST_ASSERT_EQ_U(ray_col_test_gather_par(), p0 + 1);
+        TEST_ASSERT_TRUE(e && RAY_IS_ERR(e) && !g);
+        TEST_ASSERT_STR_EQ(ray_err_code(e), "corrupt");
+        TEST_ASSERT_FMT(strcmp(ray_error_msg(), want) == 0, "round %d: %s, want %s", round, ray_error_msg(), want);
+        ray_error_free(e);
+        ray_mem_stats(&m1);
+        TEST_ASSERT_EQ_U(m1.bytes_allocated, m0.bytes_allocated);       /* nothing left behind */
+        ray_col_src_release(&si); ray_col_src_release(&st);
+        ray_rowsel_release(sel); ray_release(pred); ray_release(t);
+    }
+    PASS();
+}
+
+/* A chained filter built through the API, the q41 order: FILTER(in or
+ * not in of `col` against `set`, FILTER(k < 3000, T)), unoptimized so the
+ * membership test arrives over the first filter's selection (1.5% of the
+ * rows) and is answered by the refinement. */
+static ray_t* aw_refine_in_run(ray_t* t, const char* col, bool neg, ray_t* set, uint64_t* mat) {
+    ray_graph_t* g = ray_graph_new(t);
+    ray_op_t* f1 = ray_filter(g, ray_const_table(g, t), ray_lt(g, ray_scan(g, "k"), ray_const_i64(g, 3000)));
+    ray_op_t* m = neg ? ray_not_in(g, ray_scan(g, col), ray_const_vec(g, set))
+                      : ray_in(g, ray_scan(g, col), ray_const_vec(g, set));
+    ray_op_t* f2 = ray_filter(g, f1, m);
+    ray_enc_counters_reset();
+    ray_t* r = ray_execute(g, f2);
+    ray_enc_counters_t k; ray_enc_counters_get(&k);
+    *mat = k.materialized;
+    ray_graph_free(g);
+    return r;
+}
+
+/* Fix round 1 (q41's TraficSourceID): a later conjunct `in` / `not in`
+ * over a selective first one is answered by the refinement on the
+ * survivors' gathered values, so the column is not materialized; nullable
+ * members answer as generation 0. */
+static test_result_t test_refine_in(void) {
+    aw_save("ri", AW_WIDE, -1);
+    AW_SAME("ri", "(select {c: (count k) from: T where: (and (== g 3) (in k [3 10 17 24 1000 5000]))})", 0);
+    AW_SAME("ri", "(select {k: k v: v from: T where: (and (== g 3) (not-in v [3 10 17 24]))})", 0);
+    AW_SAME("ri", "(select {c: (count k) from: T where: (and (== g 3) (in v [0N 101 115 20001]))})", 0);
+    AW_SAME("ri", "(select {c: (count k) by: s from: T where: (and (== g 3) (in v [0N 101 115 20001]))})", 0);
+    /* the refinement itself: I16 and nullable I32 members, in and not in */
+    ray_t* t0 = aw_load("ri", 0); ray_t* t2 = aw_load("ri", 2);
+    TEST_ASSERT_TRUE(t0 && t2);
+    static const struct { const char* col; bool neg; const char* set; } cs[] = {
+        { "g", false, "[-1 6 3]" }, { "g", true, "[-1 6 3]" },
+        { "v", false, "(as 'I32 [0N 101 115 2001])" }, { "v", true, "(as 'I32 [101 115 2001])" },
+    };
+    for (int i = 0; i < 4; i++) {
+        ray_t* set = aw_eval(cs[i].set);
+        TEST_ASSERT_TRUE(set && !RAY_IS_ERR(set));
+        uint64_t m0 = 0, m2 = 0;
+        ray_t* r0 = aw_refine_in_run(t0, cs[i].col, cs[i].neg, set, &m0);
+        ray_t* r2 = aw_refine_in_run(t2, cs[i].col, cs[i].neg, set, &m2);
+        TEST_ASSERT_TRUE(r0 && r2 && !RAY_IS_ERR(r0) && !RAY_IS_ERR(r2) && r0->type == RAY_TABLE);
+        TEST_ASSERT_FMT(m2 == 0, "%s %d: %llu materializations", cs[i].col, cs[i].neg, (unsigned long long)m2);
+        TEST_ASSERT_TRUE(ray_table_nrows(r0) > 0 && ray_table_nrows(r0) < 3000);
+        ray_t* fa = ray_fmt(r0, 0); ray_t* fb = ray_fmt(r2, 0);
+        TEST_ASSERT_FMT(ray_str_len(fa) == ray_str_len(fb) && memcmp(ray_str_ptr(fa), ray_str_ptr(fb), ray_str_len(fa)) == 0,
+                        "%s %d differs", cs[i].col, cs[i].neg);
+        ray_release(fa); ray_release(fb); ray_release(r0); ray_release(r2); ray_release(set);
+    }
+    ray_release(t0); ray_release(t2);
+    /* q41's shape: a grouped take, whose conjuncts run as a filter chain */
+    AW_SAME("ri", "(take (select {c: (count k) from: T where: (and (== g 3) (>= k 100) (<= k 150000) "
+                  "(in v [101 115 136 20001 0N]) (!= s 'q)) by: {s: s k: k} desc: c take: 20}) -10)", 0);
+    AW_SAME("ri", "(take (select {c: (count k) from: T where: (and (== g 3) (>= k 100) (<= k 150000) "
+                  "(not-in v [101 115 136 20001])) by: {s: s k: k} desc: c take: 20}) -10)", 0);
+    PASS();
+}
+
 /* The operators called directly on generation-0 and generation-2 copies
  * of one table: exec_filter (its parallel gather over 200000 rows and the
  * parted arm over 140000; its sequential arm under the parallel
@@ -2274,5 +2448,8 @@ const test_entry_t aware_entries[] = {
     { "aware/gather_refine",     test_gather_refine,     aw_setup, aw_teardown },
     { "aware/gather_parted_sym", test_gather_parted_sym, aw_setup, aw_teardown },
     { "aware/gather_filter_ops", test_gather_filter_ops, aw_setup, aw_teardown },
+    { "aware/gather_sel_parallel", test_gather_sel_parallel, aw_setup, aw_teardown },
+    { "aware/gather_sel_task_error", test_gather_sel_task_error, aw_setup, aw_teardown },
+    { "aware/refine_in",         test_refine_in,         aw_setup, aw_teardown },
     { NULL, NULL, NULL, NULL },
 };
