@@ -3574,6 +3574,23 @@ static test_result_t test_pool_clamp(void) {
                         "%s: clamped dispatch differs", qs[i]);
         ray_release(fa); ray_release(fb); ray_release(a); ray_release(b);
     }
+    /* count distinct per group over 60001 groups: the partitioned kernel
+     * (cdpg_*), whose per-task counters follow the clamped geometry */
+    {
+        const int64_t n = 300000, ng = 60001;
+        ray_t* src = ray_vec_new(RAY_I64, n);
+        int64_t* gid = (int64_t*)malloc((size_t)n * sizeof(int64_t));
+        TEST_ASSERT_TRUE(src && !RAY_IS_ERR(src) && gid);
+        src->len = n;
+        for (int64_t i = 0; i < n; i++) { ((int64_t*)ray_data(src))[i] = (i * 31) % 1009; gid[i] = (i * 7) % ng; }
+        ray_t* a = ray_count_distinct_per_group(src, gid, n, ng);
+        ray_pool_test_ring_fail(3);
+        ray_t* b = ray_count_distinct_per_group(src, gid, n, ng);
+        ray_pool_test_ring_fail(0);
+        TEST_ASSERT_TRUE(a && b && !RAY_IS_ERR(a) && !RAY_IS_ERR(b) && a->len == ng && b->len == ng);
+        TEST_ASSERT_TRUE(memcmp(ray_data(a), ray_data(b), (size_t)ng * sizeof(int64_t)) == 0);
+        ray_release(a); ray_release(b); ray_release(src); free(gid);
+    }
     PASS();
 }
 

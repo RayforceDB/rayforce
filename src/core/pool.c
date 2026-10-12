@@ -562,16 +562,21 @@ void ray_pool_free(ray_pool_t* pool) {
 static _Atomic(uint32_t) g_pool_test_cap;
 void ray_pool_test_ring_fail(uint32_t cap) { atomic_store_explicit(&g_pool_test_cap, cap, memory_order_relaxed); }
 
-void ray_pool_dispatch(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
-                      int64_t total_elems) {
-    if (total_elems <= 0) return;
-
-    /* Calculate number of tasks.
-     * Overflow guard: total_elems + grain - 1 could wrap for extreme values. */
-    int64_t grain = TASK_GRAIN;
-    if (RAY_UNLIKELY(total_elems > INT64_MAX - grain + 1))
-        total_elems = INT64_MAX - grain + 1;
-    uint32_t n_tasks = (uint32_t)((total_elems + grain - 1) / grain);
+/* The task geometry of a dispatch of total_elems at `grain` (a whole
+ * multiple of RAY_MORSEL_ELEMS): grows the ring when it can, then clamps
+ * to it.  A clamped grain is the smallest whole multiple of the requested
+ * one that fits the ring, so task starts stay multiples of `grain`.  One
+ * helper for ray_pool_dispatch, ray_pool_dispatch_grain and
+ * ray_pool_dispatch_geometry, so a caller sizing per-task state from the
+ * geometry sees what the dispatch does.  Main thread only (single
+ * producer). */
+static void pool_geometry(ray_pool_t* pool, int64_t* total_elems, int64_t* grain, uint32_t* n_out) {
+    int64_t g = *grain;
+    /* Overflow guard: total_elems + grain - 1 could wrap for extreme values. */
+    if (RAY_UNLIKELY(*total_elems > INT64_MAX - g + 1))
+        *total_elems = INT64_MAX - g + 1;
+    int64_t total = *total_elems;
+    uint32_t n_tasks = (uint32_t)((total + g - 1) / g);
 
     /* conc-L6: Ring growth is safe without synchronization because dispatch is
      * single-producer: only the main thread (the dispatch caller) writes
@@ -594,16 +599,45 @@ void ray_pool_dispatch(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
     }
 
     /* Clamp n_tasks to task_cap to prevent ring overflow.  The wider grain
-     * stays a whole multiple of TASK_GRAIN, so every task still starts on a
-     * TASK_GRAIN (morsel, vector) boundary: callers slot per-task state by
-     * start / TASK_GRAIN-aligned grain (pred_sel_drive's rowsel builders) or
-     * read whole vectors per task. */
+     * stays a whole multiple of the requested one, so every task still
+     * starts on a grain (morsel, vector) boundary: callers slot per-task
+     * state by start / grain (pred_sel_drive's rowsel builders) or read
+     * whole vectors per task. */
     uint32_t cap = test_cap && test_cap < pool->task_cap ? test_cap : pool->task_cap;
     if (n_tasks > cap) {
-        int64_t per = (total_elems + cap - 1) / cap;
-        grain = (per + TASK_GRAIN - 1) / TASK_GRAIN * TASK_GRAIN;
-        n_tasks = (uint32_t)((total_elems + grain - 1) / grain);   /* <= cap */
+        int64_t per = (total + cap - 1) / cap;
+        g = (per + *grain - 1) / *grain * *grain;
+        n_tasks = (uint32_t)((total + g - 1) / g);   /* <= cap */
     }
+    *grain = g;
+    *n_out = n_tasks;
+}
+
+void ray_pool_dispatch_geometry(ray_pool_t* pool, int64_t total_elems, int64_t grain,
+                                uint32_t* n_tasks, int64_t* eff_grain) {
+    *n_tasks = 0; *eff_grain = grain;
+    if (total_elems <= 0) return;
+    pool_geometry(pool, &total_elems, eff_grain, n_tasks);
+}
+
+static void pool_dispatch_at(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
+                             int64_t total_elems, int64_t grain);
+
+void ray_pool_dispatch(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
+                      int64_t total_elems) {
+    pool_dispatch_at(pool, fn, ctx, total_elems, TASK_GRAIN);
+}
+
+void ray_pool_dispatch_grain(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
+                             int64_t total_elems, int64_t grain) {
+    pool_dispatch_at(pool, fn, ctx, total_elems, grain);
+}
+
+static void pool_dispatch_at(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
+                             int64_t total_elems, int64_t grain) {
+    if (total_elems <= 0) return;
+    uint32_t n_tasks;
+    pool_geometry(pool, &total_elems, &grain, &n_tasks);
 
     /* Carve a fresh window [base, base+n_tasks) off the monotonic high-water
      * mark.  The prior dispatch is fully claimed, so task_claim == task_limit

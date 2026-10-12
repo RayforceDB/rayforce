@@ -181,6 +181,18 @@ void ray_pool_free(ray_pool_t* pool);
  * grains, still starting on a grain boundary: a caller keeping per-grain
  * state walks its task grain by grain. */
 void ray_pool_dispatch(ray_pool_t* pool, ray_pool_fn fn, void* ctx, int64_t total_elems);
+/* ray_pool_dispatch at `grain` elements per task (a whole multiple of
+ * RAY_MORSEL_ELEMS), under the same clamp and contract. */
+void ray_pool_dispatch_grain(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
+                             int64_t total_elems, int64_t grain);
+/* The task count and grain a dispatch of total_elems at `grain` takes
+ * (after the ring's growth and clamp; the default grain is
+ * RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS).  A ring never shrinks, so a
+ * later ray_pool_dispatch_grain at *eff_grain runs exactly *n_tasks tasks
+ * starting at multiples of *eff_grain: two passes that size per-task state
+ * from this agree.  Main thread only, as a dispatch. */
+void ray_pool_dispatch_geometry(ray_pool_t* pool, int64_t total_elems, int64_t grain,
+                                uint32_t* n_tasks, int64_t* eff_grain);
 /* Test hook (C tests only): ray_pool_dispatch's ring growth fails (its
  * realloc returns NULL) and the ring holds at most `cap` tasks, so the clamp
  * runs at test sizes as it does above task_cap * TASK_GRAIN elements when
