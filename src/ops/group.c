@@ -9722,11 +9722,13 @@ static void scalar_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
 }
 
 /* ---- The scalar route by storage chunks (P3: statistics under a selection) ----
- * When every input has a rule here, a staged context runs one task per
- * group of directory chunks (RAY_ENC_CHUNK rows) instead of
- * RAY_COL_BLOCK_ROWS-row blocks, which never hold a whole chunk.  Each
- * chunk is answered at the coarsest level its selection allows, input by
- * input:
+ * When every input has a rule here, a staged context walks each task's
+ * RAY_COL_BLOCK_ROWS-row block chunk by chunk (scalar_chunk_fn).  A block
+ * never holds a whole chunk, so every block of a chunk decides the chunk
+ * level alike and the chunk's first block folds it; a whole-chunk task
+ * would leave the last workers a chunk each (measured 4% on a selection
+ * that decodes).  Each chunk is answered at the coarsest level its
+ * selection allows, input by input:
  *   1. every row selected: the chunk's directory statistics;
  *   2. otherwise, or for an input the directory cannot answer, each fully
  *      selected vector from its view (sums) or its descriptor (extremes);
@@ -9763,9 +9765,6 @@ typedef struct {
 
 typedef struct {
     scalar_ctx_t*    c;
-    const sc_unit_t* units;
-    int64_t          n_units;
-    uint32_t         n_tasks;
     const uint8_t*   rule;       /* per input */
     int64_t          nrows;
 } sc_chunk_ctx_t;
@@ -9820,7 +9819,8 @@ static ray_enccol_t* sc_unit_col(const sc_chunk_ctx_t* cc, uint32_t a, const sc_
 
 /* Fold `rows` fully selected rows of input a from their statistics: the
  * null count, the extremes when has_mm (logical values; a float's bits),
- * the exact sum when has_sum.  False: the rows are read instead (no rule,
+ * the exact sum when has_sum; acc NULL only decides.  False: the rows are
+ * read instead (no rule,
  * no extremes for non-null rows, a non-finite float extreme, nulls in a
  * BOOL / U8 input whose kernel counts every row). */
 static bool sc_fold(scalar_ctx_t* c, da_accum_t* acc, uint32_t a, uint8_t rule, int64_t rows,
@@ -9832,6 +9832,7 @@ static bool sc_fold(scalar_ctx_t* c, da_accum_t* acc, uint32_t a, uint8_t rule, 
     bool is_min = c->agg_ops[a] == OP_MIN;
     if (rule == SC_RULE_SUM) {
         if (!has_sum) return false;
+        if (!acc) return true;
         if (acc->sum_hi) ray_i128_add128(&acc->sum_hi[a], (uint64_t*)&acc->sum[a].i, s_hi, s_lo);
         else acc->sum[a].i = wrap_add_i64(acc->sum[a].i, (int64_t)s_lo);
     } else if (nn > 0) {
@@ -9841,18 +9842,21 @@ static bool sc_fold(scalar_ctx_t* c, da_accum_t* acc, uint32_t a, uint8_t rule, 
             int64_t b = is_min ? mn : mx;
             memcpy(&x, &b, sizeof x);
             if (!(fabs(x) <= DBL_MAX)) return false;   /* finite only (D4) */
+            if (!acc) return true;
             if (is_min) { if (x < acc->min_val[a].f) acc->min_val[a].f = x; }
             else        { if (x > acc->max_val[a].f) acc->max_val[a].f = x; }
         } else {
+            if (!acc) return true;
             if (is_min) { if (mn < acc->min_val[a].i) acc->min_val[a].i = mn; }
             else        { if (mx > acc->max_val[a].i) acc->max_val[a].i = mx; }
         }
     }
-    if (acc->nn_count) acc->nn_count[a] += nn;
+    if (acc && acc->nn_count) acc->nn_count[a] += nn;
     return true;
 }
 
-/* Input a over unit u, every row selected, from the chunk's directory. */
+/* Input a over unit u, every row selected, from the chunk's directory
+ * (acc NULL: whether it would). */
 static bool sc_chunk_answer(const sc_chunk_ctx_t* cc, da_accum_t* acc, uint32_t a, const sc_unit_t* u) {
     ray_t* obj;
     ray_enccol_t* e = sc_unit_col(cc, a, u, &obj);
@@ -9874,7 +9878,14 @@ static bool sc_vec_answer(const sc_chunk_ctx_t* cc, da_accum_t* acc, uint32_t a,
     ray_enccol_t* e = sc_unit_col(cc, a, u, &obj);
     if (!e) return false;
     ray_t* err = NULL;
+    const ray_enc_desc_t* d;
+    if ((err = ray_enccol_chunk_descs_ref(e, u->chunk, &d)) != NULL) { ray_error_free(err); return false; }
+    d += j;
     if (cc->rule[a] == SC_RULE_SUM) {
+        /* only the encodings with a sum rule build a view (a declined one
+         * would validate the vector and then decode it as well) */
+        if (!(d->encoding == RAY_ENC_CONST || d->encoding == RAY_ENC_FOR_BP ||
+              (d->encoding == RAY_ENC_RLE && d->n_nulls == 0))) return false;
         if (ray_enccol_decoded_peek(obj)) return false;          /* read in place */
         int rc = ray_enccol_vview(e, u->chunk * RAY_ENC_VECS_PER_CHUNK + j, vv, &err);
         if (rc < 0) { ray_error_free(err); return false; }
@@ -9882,9 +9893,6 @@ static bool sc_vec_answer(const sc_chunk_ctx_t* cc, da_accum_t* acc, uint32_t a,
         if (rc == 0 || vv->n != vlen || !ray_enc_vec_sum(vv, &hi, &lo, &nn)) return false;
         return sc_fold(cc->c, acc, a, SC_RULE_SUM, vlen, vlen - nn, false, 0, 0, true, hi, lo);
     }
-    const ray_enc_desc_t* d;
-    if ((err = ray_enccol_chunk_descs_ref(e, u->chunk, &d)) != NULL) { ray_error_free(err); return false; }
-    d += j;
     return sc_fold(cc->c, acc, a, cc->rule[a], vlen, d->n_nulls, !(d->flags & RAY_ENC_STAT_ABSENT),
                    d->min, d->max, false, 0, 0);
 }
@@ -9915,29 +9923,35 @@ static void sc_rows(scalar_ctx_t* c, uint32_t wid, int64_t lo, int64_t hi, const
     scalar_run_staged(&local, wid, lo, hi, scalar_accum_body);
 }
 
-static void sc_unit_run(const sc_chunk_ctx_t* cc, uint32_t wid, const sc_unit_t* u, ray_enc_vview_t* vv) {
+/* Rows [plo, phi) of unit u (one task's share of the chunk).  Every share
+ * makes the chunk-level decision the same way from the chunk's selection
+ * and statistics; the share holding the chunk's first row folds them. */
+static void sc_unit_run(const sc_chunk_ctx_t* cc, uint32_t wid, const sc_unit_t* u,
+                        int64_t plo, int64_t phi, ray_enc_vview_t* vv) {
     scalar_ctx_t* c = cc->c;
     da_accum_t* acc = &c->accums[wid];
-    if (ray_scan_fail_skip(c->fail, u->lo)) return;
+    if (ray_scan_fail_skip(c->fail, plo)) return;
     int64_t sel = sc_sel_rows(c->rowsel, u->lo, u->hi);
     if (sel == 0) return;
+    bool owner = plo == u->lo;
     uint32_t n = c->n_aggs ? c->n_aggs : 1;
     bool need[n], vneed[n], run_need[n];
     for (uint32_t a = 0; a < n; a++) need[a] = vneed[a] = run_need[a] = false;
     bool any = false;
     for (uint32_t a = 0; a < c->n_aggs; a++) {
         need[a] = cc->rule[a] != SC_RULE_COUNT &&
-                  !(sel == u->hi - u->lo && sc_chunk_answer(cc, acc, a, u));
+                  !(sel == u->hi - u->lo && sc_chunk_answer(cc, owner ? acc : NULL, a, u));
         any |= need[a];
     }
-    if (!any) { acc->count[0] += sel; return; }
+    if (!any) { if (owner) acc->count[0] += sel; return; }
     for (uint32_t a = 0; a < c->n_aggs; a++)
-        if (need[a] && !c->plain[a]) ray_col_src_advise(c->srcs[a], u->lo, u->hi);
-    /* Vectors are the segment's: consecutive ones read by rows with the
-     * same inputs form one run (one piece walk). */
+        if (need[a] && !c->plain[a]) ray_col_src_advise(c->srcs[a], plo, phi);
+    /* Consecutive vectors read by rows with the same inputs form one run
+     * (one piece walk). */
     int64_t run_lo = -1, run_hi = -1;
-    for (int64_t vlo = u->lo, j = 0; vlo < u->hi; vlo += RAY_ENC_VEC, j++) {
-        int64_t vhi = vlo + RAY_ENC_VEC < u->hi ? vlo + RAY_ENC_VEC : u->hi;
+    for (int64_t vlo = plo; vlo < phi; vlo += RAY_ENC_VEC) {
+        int64_t vhi = vlo + RAY_ENC_VEC < phi ? vlo + RAY_ENC_VEC : phi;
+        int64_t j = (vlo - u->lo) / RAY_ENC_VEC;
         int64_t vsel = sc_sel_rows(c->rowsel, vlo, vhi);
         if (vsel == 0) continue;
         bool vany = false;
@@ -9958,35 +9972,26 @@ static void sc_unit_run(const sc_chunk_ctx_t* cc, uint32_t wid, const sc_unit_t*
     if (run_lo >= 0) sc_rows(c, wid, run_lo, run_hi, run_need);
 }
 
-/* Task t of n_tasks: its contiguous share of the units, in row order. */
+/* A task's rows [start, end) (the pool's RAY_COL_BLOCK_ROWS grain, which
+ * divides a chunk; any other cut works too), chunk by chunk. */
 static void scalar_chunk_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
     const sc_chunk_ctx_t* cc = (const sc_chunk_ctx_t*)ctx;
     ray_enc_vview_t vv;                                 /* one view, on this task's stack */
-    for (int64_t t = start; t < end; t++) {
-        int64_t u0 = t * cc->n_units / cc->n_tasks, u1 = (t + 1) * cc->n_units / cc->n_tasks;
-        for (int64_t u = u0; u < u1; u++) sc_unit_run(cc, wid, &cc->units[u], &vv);
+    for (int64_t ch = start / RAY_ENC_CHUNK; ch * RAY_ENC_CHUNK < end; ch++) {
+        sc_unit_t u = { .lo = ch * RAY_ENC_CHUNK, .chunk = ch };
+        u.hi = u.lo + RAY_ENC_CHUNK < cc->nrows ? u.lo + RAY_ENC_CHUNK : cc->nrows;
+        sc_unit_run(cc, wid, &u, start > u.lo ? start : u.lo, end < u.hi ? end : u.hi, &vv);
     }
 }
 
-/* The units of the scalar route's staged inputs: the directory chunks of
- * their row space.  A parted source never reaches this route (parted
- * groups run per partition, each partition a single-file table), and one
- * that did takes the block dispatch: NULL, as on OOM.  ray_free_raw. */
-static sc_unit_t* sc_units_build(ray_col_src_t** srcs, const uint8_t* rule, uint32_t n_aggs,
-                                 int64_t nrows, int64_t* n_out) {
-    *n_out = 0;
+/* Whether the scalar route's staged inputs share the chunk grid of their
+ * row space.  A parted source never reaches this route (parted groups run
+ * per partition, each partition a single-file table), and one that did
+ * takes the block dispatch. */
+static bool sc_chunk_grid_ok(ray_col_src_t** srcs, const uint8_t* rule, uint32_t n_aggs, int64_t nrows) {
     for (uint32_t a = 0; a < n_aggs; a++)
-        if (rule[a] != SC_RULE_COUNT && srcs[a] && (srcs[a]->parted || srcs[a]->len != nrows)) return NULL;
-    int64_t cnt = (nrows + RAY_ENC_CHUNK - 1) / RAY_ENC_CHUNK;
-    if (cnt <= 0) return NULL;
-    sc_unit_t* units = (sc_unit_t*)ray_alloc_raw((size_t)cnt * sizeof *units);
-    if (!units) return NULL;
-    for (int64_t c = 0; c < cnt; c++)
-        units[c] = (sc_unit_t){ .lo = c * RAY_ENC_CHUNK,
-                                .hi = (c + 1) * RAY_ENC_CHUNK < nrows ? (c + 1) * RAY_ENC_CHUNK : nrows,
-                                .chunk = c };
-    *n_out = cnt;
-    return units;
+        if (rule[a] != SC_RULE_COUNT && srcs[a] && (srcs[a]->parted || srcs[a]->len != nrows)) return false;
+    return nrows > 0;
 }
 
 /* Inner DA accumulation for a single row — shared by single-key and multi-key paths.
@@ -15000,24 +15005,14 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 sc_fn = scalar_sum_linear_i64_fn;
         }
 
-        /* Every input with a statistics rule: one task per group of
-         * directory chunks (scalar_chunk_fn), else the block dispatch. */
-        sc_unit_t* sc_units = NULL;
-        int64_t sc_n_units = 0;
-        if (sc_chunk_route) {
-            sc_units = sc_units_build(sc_srcs, sc_rule, n_aggs, nrows, &sc_n_units);
-            if (sc_units) {
-                sc_chunk_ctx_t cc = {
-                    .c = &sc_ctx, .units = sc_units, .n_units = sc_n_units,
-                    .n_tasks = (uint32_t)(sc_n_units < (int64_t)RAY_POOL_INIT_TASKS ? sc_n_units : RAY_POOL_INIT_TASKS),
-                    .rule = sc_rule, .nrows = nrows,
-                };
-                if (sc_n > 1) ray_pool_dispatch_n(sc_pool, scalar_chunk_fn, &cc, cc.n_tasks);
-                else scalar_chunk_fn(&cc, 0, 0, cc.n_tasks);
-                ray_free_raw(sc_units);
-            }
-        }
-        if (!sc_units) {
+        /* Every input with a statistics rule: the blocks chunk by chunk
+         * (scalar_chunk_fn), else the block kernels. */
+        bool sc_by_chunk = sc_chunk_route && sc_chunk_grid_ok(sc_srcs, sc_rule, n_aggs, nrows);
+        if (sc_by_chunk) {
+            sc_chunk_ctx_t cc = { .c = &sc_ctx, .rule = sc_rule, .nrows = nrows };
+            if (sc_n > 1) ray_pool_dispatch(sc_pool, scalar_chunk_fn, &cc, nrows);
+            else scalar_chunk_fn(&cc, 0, 0, nrows);
+        } else {
             if (sc_chunk_route)          /* the block dispatch reads ahead as it always did */
                 for (uint32_t a = 0; a < n_aggs; a++)
                     if (sc_srcs[a] && !sc_plain[a]) ray_col_src_advise(sc_srcs[a], 0, nrows);
