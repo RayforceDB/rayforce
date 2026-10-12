@@ -1687,6 +1687,112 @@ int ray_enccol_point_i64(ray_enccol_t* e, int64_t row, int64_t* out, ray_t** err
     return point_read(e, d, e->base + de.offset + d->payload_off, d->payload_bytes, c, j, vlen, i, k, out, err);
 }
 
+/* Rows of one CONST / RLE vector (local rows rows[q] - base, ascending)
+ * read off its runs, checked as point_body and point_read check them:
+ * the runs read once (fk_runs), each row's run found by advancing over
+ * the ends.  Out of line, as point_run.  1 / 0 / -1 as point_read. */
+static __attribute__((noinline)) int points_runs(ray_enccol_t* e, const ray_enc_desc_t* d, const uint8_t* p,
+                                                 uint64_t avail, int64_t c, int j, int vlen, const int64_t* rows,
+                                                 int64_t n, int64_t base, ray_enc_kind_t k, int64_t* out, ray_t** err) {
+    if (vlen < 1 || vlen > RAY_ENC_VEC || ((uintptr_t)p & 7)) return 0;
+    _Alignas(64) fk_vals_t vals, ends;
+    uint32_t nr;
+    if (!fk_runs(d->encoding, vlen, p, avail, k.T, &vals, &ends, &nr)) return 0;
+    const uint64_t m = k.T == 64 ? ~0ull : (1ull << k.T) - 1;
+    const uint64_t sent = k.is_signed ? (uint64_t)1 << (k.T - 1) : ~0ull;   /* none for unsigned kinds */
+    const int sh = 64 - k.T;
+    uint32_t r = 0;
+    for (int64_t q = 0; q < n; q++) {
+        const int64_t i = rows[q] - base;
+        while (r + 1 < nr && ends.h[r] <= (uint32_t)i) r++;
+        uint64_t x = fk_val(&vals, k.T, r) & m;
+        if (x == sent) return 0;                           /* the sentinel outside a bitmap */
+        const int64_t v = k.is_signed ? (int64_t)(x << sh) >> sh : (int64_t)x;
+        if (!(d->flags & RAY_ENC_STAT_ABSENT) && (v < d->min || v > d->max)) {
+            *err = ray_error("corrupt", "column %s: chunk %lld vector %d value outside its statistics", e->path, (long long)c, j);
+            return -1;
+        }
+        out[q] = v;
+    }
+    return 1;
+}
+
+int ray_enccol_points_i64(ray_enccol_t* e, const int64_t* rows, int64_t n, int64_t base, int64_t* out, ray_t** err) {
+    *err = NULL;
+    ray_enc_kind_t k;
+    if (n <= 0 || e->kind != RAY_ENCCOL_SINGLE || !point_type(e, &k)) return 0;
+    const int64_t r0 = rows[0] - base;
+    if (r0 < 0 || r0 >= e->len) return 0;
+    const int64_t c = r0 / RAY_ENC_CHUNK;
+    const int j = (int)(r0 % RAY_ENC_CHUNK / RAY_ENC_VEC);
+    const int64_t vs = c * RAY_ENC_CHUNK + (int64_t)j * RAY_ENC_VEC;
+    const int64_t rows_c = chunk_rows(e, c);
+    const int vlen = (int)(rows_c - (int64_t)j * RAY_ENC_VEC < RAY_ENC_VEC ? rows_c - (int64_t)j * RAY_ENC_VEC : RAY_ENC_VEC);
+    for (int64_t q = 0; q < n; q++)                        /* one vector, ascending: the caller's contract */
+        if (rows[q] - base < vs || rows[q] - base >= vs + vlen || (q && rows[q] < rows[q - 1])) return 0;
+    const ray_enc_desc_t* descs;
+    if ((*err = ray_enccol_chunk_descs_ref(e, c, &descs)) != NULL) return -1;   /* validated once per chunk */
+    const ray_enc_desc_t* d = &descs[j];
+    if (d->n_nulls) return 0;
+    ray_enc_dirent_t de; dirent_at(e, c, &de);
+    const uint8_t* p = e->base + de.offset + d->payload_off;
+    if ((d->encoding == RAY_ENC_CONST || d->encoding == RAY_ENC_RLE) && d->width == 0)
+        return points_runs(e, d, p, d->payload_bytes, c, j, vlen, rows, n, base + vs, k, out, err);
+    if (d->encoding == RAY_ENC_FOR_BP) {
+        /* point_body's FOR_BP checks once, then point_field's lane
+         * arithmetic per row with the power-of-two divisions as shifts */
+        const int w = d->width, T = k.T;
+        const uint64_t m = T == 64 ? ~0ull : (1ull << T) - 1;
+        if (w > T || d->payload_bytes != (uint64_t)ray_enc_size_for(w)) return 0;
+        uint64_t fb; memcpy(&fb, p, 8);
+        if (fb & ~m) return 0;
+        const uint8_t* pk = p + 8;
+        const uint64_t wm = w >= 64 ? ~0ull : (1ull << w) - 1;
+        const uint64_t sent = k.is_signed ? (uint64_t)1 << (T - 1) : ~0ull;   /* none for unsigned kinds */
+        const int sh = 64 - T;
+        /* point_field at a fixed lane width UT: L = 1024 / T lanes, the
+         * divisions as shifts and masks, fixed-size loads */
+#define FOR_POINTS(UT, LS, TS) do {                                                              \
+            const UT* lanes = (const UT*)(const void*)pk;                                          \
+            for (int64_t q = 0; q < n; q++) {                                                      \
+                const int i = (int)(rows[q] - base - vs);                                          \
+                uint64_t f = 0;                                                                    \
+                if (w) {                                                                           \
+                    const int bit = (i >> (LS)) * w, off = bit & (T - 1);                          \
+                    const size_t at = (size_t)(bit >> (TS)) * ((size_t)1 << (LS)) + (size_t)(i & ((1 << (LS)) - 1)); \
+                    UT lo, hi;                                                                     \
+                    memcpy(&lo, lanes + at, sizeof lo);                                            \
+                    f = (uint64_t)lo >> off;                                                       \
+                    if (off + w > T) { memcpy(&hi, lanes + at + ((size_t)1 << (LS)), sizeof hi); f |= (uint64_t)hi << (T - off); } \
+                    f &= wm;                                                                       \
+                }                                                                                  \
+                const uint64_t x = (fb + f) & m;                                                   \
+                if (x == sent) return 0;                       /* the sentinel outside a bitmap */ \
+                const int64_t v = k.is_signed ? (int64_t)(x << sh) >> sh : (int64_t)x;             \
+                if (!(d->flags & RAY_ENC_STAT_ABSENT) && (v < d->min || v > d->max)) {             \
+                    *err = ray_error("corrupt", "column %s: chunk %lld vector %d value outside its statistics", \
+                                     e->path, (long long)c, j);                                    \
+                    return -1;                                                                     \
+                }                                                                                  \
+                out[q] = v;                                                                        \
+            }                                                                                      \
+        } while (0)
+        switch (T) {
+        case 8:  FOR_POINTS(uint8_t,  7, 3); break;
+        case 16: FOR_POINTS(uint16_t, 6, 4); break;
+        case 32: FOR_POINTS(uint32_t, 5, 5); break;
+        default: FOR_POINTS(uint64_t, 4, 6); break;
+        }
+#undef FOR_POINTS
+        return 1;
+    }
+    for (int64_t q = 0; q < n; q++) {
+        int r = point_read(e, d, p, d->payload_bytes, c, j, vlen, (int)(rows[q] - base - vs), k, &out[q], err);
+        if (r != 1) return r;
+    }
+    return 1;
+}
+
 /* ---- Encoded vector views: a body validated, never expanded ----
  * A view is built only after every check the vector's decode makes has
  * passed, through the fast kernels' own validators (fk_runs, fk_runs_ok,

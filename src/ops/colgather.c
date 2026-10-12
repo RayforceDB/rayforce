@@ -210,6 +210,44 @@ static ray_t* acc_put_list(gather_acc_t* a, const ray_col_range_t* v, int64_t ba
 }
 #undef ACC_LIST_COPY
 
+/* Point reads (open decision D2): a vector holding at most
+ * RAY_COL_POINT_ROWS of the requested rows serves them through
+ * ray_col_src_points_i64 (FOR_BP, DICT over FOR_BP, CONST or RLE without
+ * nulls: the body read once, then one lane unpacked or one run found per
+ * row) instead of being decoded whole; the crossover is measured in the
+ * Task 6b report.  A
+ * declined read (nulls, RAW, DELTA_BP, a plain or materialized source)
+ * leaves the vector to the cursor, which decodes or reports it.  A
+ * point-served value lies inside its vector's statistics
+ * (ray_enccol_point_i64, `corrupt` otherwise), and those nest inside the
+ * chunk's directory statistics (descriptor validation), so a guarded
+ * source (stats_guard) needs no further check: ray_enccol_check_dir's rule
+ * holds for every value served. */
+#define GATHER_POINT_ROWS RAY_COL_POINT_ROWS
+
+/* The source's values can be point-read: an encoded integer or temporal
+ * column (SYM ids are read by decode, which checks them against the
+ * domain bound). */
+static bool gather_point_src(const ray_col_src_t* src) {
+    if (!ray_col_src_encoded(src)) return false;
+    switch (src->type) {
+    case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8: case RAY_BOOL:
+    case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: return true;
+    default: return false;
+    }
+}
+
+/* A point-served value (never null) at output position pos. */
+static inline void acc_point(gather_acc_t* a, int64_t pos, int64_t x) {
+    void* d = ray_data(a->out);
+    switch (ray_sym_elem_size(a->out->type, a->out->attrs)) {
+    case 1:  ((uint8_t*)d)[pos]  = (uint8_t)x;  break;
+    case 2:  ((int16_t*)d)[pos]  = (int16_t)x;  break;
+    case 4:  ((int32_t*)d)[pos]  = (int32_t)x;  break;
+    default: ((int64_t*)d)[pos]  = x;           break;
+    }
+}
+
 static ray_t* acc_finish(gather_acc_t* a, const ray_col_src_t* src, ray_t** out) {
     ray_t* o = a->out;
     if (a->pool) { o->str_pool = a->pool; a->pool = NULL; }   /* the result's own pool */
@@ -272,8 +310,27 @@ ray_t* ray_col_gather_rows(ray_col_src_t* src, const int64_t* ids, int64_t n, ra
     ray_col_fixed_t fixed;                       /* the decode vector on the stack (P2 17i) */
     ray_col_cursor_t cur;
     ray_col_cursor_init_lent(&cur, src, &fixed);
+    const bool point = gather_point_src(src);
     for (int64_t k = 0; k < n && !err; ) {
         int64_t pos = ord ? ord[k] : k, r = ids[pos];
+        int64_t vlo, vhi;
+        if (point && ray_col_src_vec_span(src, r, &vlo, &vhi)) {
+            /* the ids inside r's vector, in decode order: few are point-read */
+            int64_t j = k + 1;
+            while (j < n && j - k <= GATHER_POINT_ROWS && ids[ord ? ord[j] : j] < vhi) j++;
+            if (j - k <= GATHER_POINT_ROWS) {
+                int64_t rows[GATHER_POINT_ROWS], x[GATHER_POINT_ROWS];
+                const int64_t* rp = ids + k;     /* in order: the ids themselves */
+                if (ord) { for (int64_t q = k; q < j; q++) rows[q - k] = ids[ord[q]]; rp = rows; }
+                int pr = ray_col_src_points_i64(src, rp, j - k, x, &err);
+                if (pr < 0) break;
+                if (pr > 0) {                    /* every row of the vector served */
+                    for (int64_t q = k; q < j; q++) acc_point(&a, ord ? ord[q] : q, x[q - k]);
+                    k = j;
+                    continue;
+                }                                /* declined: the cursor reads the vector */
+            }
+        }
         const ray_col_range_t* v;
         if ((err = ray_col_cursor_at(&cur, r, &v)) != NULL) break;
         int64_t end = v->start + v->n;
@@ -306,6 +363,7 @@ typedef struct {
     const uint8_t*  flags;    /* NULL: every segment ALL */
     const uint32_t* offs;
     const uint16_t* idx;
+    bool            point;    /* gather_point_src: few-row segments are point-read */
 } gsel_in_t;
 
 static ray_t* gsel_range(const gsel_in_t* in, gather_acc_t* a, ray_col_cursor_t* cur,
@@ -333,7 +391,25 @@ static ray_t* gsel_range(const gsel_in_t* in, gather_acc_t* a, ray_col_cursor_t*
         for (uint32_t k = k0; k < k1; k++)
             if (in->idx[k] >= hi - lo)
                 return ray_error("corrupt", "gather: selection row %lld past its segment", (long long)(lo + in->idx[k]));
-        for (uint32_t k = k0; k < k1 && !err; ) {
+        uint32_t k = k0;
+        if (in->point && k1 - k0 <= GATHER_POINT_ROWS) {
+            /* few rows: point reads of each vector they fall in (a parted
+             * segment boundary may split them; the segment's rows bound
+             * each vector's share), a declined vector left to the cursor */
+            int64_t rows[GATHER_POINT_ROWS], x[GATHER_POINT_ROWS];
+            while (k < k1) {
+                int64_t vlo, vhi;
+                if (!ray_col_src_vec_span(src, lo + in->idx[k], &vlo, &vhi)) break;
+                uint32_t j = k;
+                for (; j < k1 && lo + in->idx[j] < vhi; j++) rows[j - k] = lo + in->idx[j];
+                int pr = ray_col_src_points_i64(src, rows, j - k, x, &err);
+                if (pr <= 0) break;
+                for (uint32_t q = k; q < j; q++) acc_point(a, pos++, x[q - k]);
+                k = j;
+            }
+            if (err) break;
+        }
+        while (k < k1 && !err) {
             const ray_col_range_t* v;
             if ((err = ray_col_cursor_at(cur, lo + in->idx[k], &v)) != NULL) break;
             int64_t end = v->start + v->n;
@@ -419,7 +495,8 @@ ray_t* ray_col_gather_sel(ray_col_src_t* src, ray_t* sel, ray_t** out) {
     if (err) return err;
     int64_t nseg = m ? (int64_t)m->n_segs : (src->len + RAY_MORSEL_ELEMS - 1) / RAY_MORSEL_ELEMS;
     gsel_in_t in = { .src = src, .flags = sel ? ray_rowsel_flags(sel) : NULL,
-                     .offs = sel ? ray_rowsel_offsets(sel) : NULL, .idx = sel ? ray_rowsel_idx(sel) : NULL };
+                     .offs = sel ? ray_rowsel_offsets(sel) : NULL, .idx = sel ? ray_rowsel_idx(sel) : NULL,
+                     .point = gather_point_src(src) };
     /* the tasks: the pool's grain of segments each, at most the ring's
      * initial capacity of them; one runs here when the pool cannot help */
     ray_pool_t* pool = ray_pool_get();

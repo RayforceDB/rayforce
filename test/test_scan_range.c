@@ -38,6 +38,7 @@
 #include "store/colrange.h"
 #include "store/enccol.h"
 #include "store/encfmt.h"
+#include "store/encw.h"      /* ray_encw_test_force */
 #include "store/splay.h"
 #include "store/part.h"
 #include "vec/str.h"
@@ -4195,6 +4196,47 @@ static test_result_t test_v2_forged_consumers(void) {
     PASS();
 }
 
+/* P3 Task 6b: point reads under a guard.  A selective filter (every 97th
+ * row: a few rows per vector) groups by k, whose selected rows are
+ * point-read (FOR_BP, no nulls) by the dense plan's selection bounds and
+ * by the compact gather.  Chunk 3's statistics (directory and descriptors,
+ * still nested) are lowered below its values: the dense plan sized from
+ * them never sees a value outside them, since the point read checks each
+ * value against its vector's statistics (`corrupt` naming k, twice, no
+ * write past the slab under ASan).  The first-n passes over the same
+ * forged key (an unordered take) report it too.  Unpatched, the answer is
+ * generation 0's and nothing is materialized. */
+static test_result_t test_v2_forged_points(void) {
+    sr_eval_ok("(set ja (til 196608))");
+    sr_eval_ok("(set jb (+ 196608 (til 65536)))");
+    sr_eval_ok("(set FP (table [k v] (list (concat (% (* ja 7) 1000) (% (* jb 7) 5001)) (til 262144))))");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/fp0/\" FP {compress: false})");
+    ray_encw_test_force(RAY_ENC_FOR_BP);
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/fp2/\" FP {compress: true})");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/fpb/\" FP {compress: true})");
+    ray_encw_test_force(-1);
+    static const char* const qs[] = {
+        "(select {c: (count v) from: T where: (== 0 (% v 97)) by: k})",
+        "(select {c: (count v) s: (sum v) from: T where: (== 0 (% v 97)) by: k desc: c take: 5})",
+        "(select {c: (count v) from: T by: k take: 5})",   /* first-n: pass 2 reads every vector */
+        NULL,
+    };
+    for (int i = 0; qs[i]; i++) {
+        test_result_t r = sr_same_on("(.db.splayed.get \"" SR_TMP "/fp0/\")", "(.db.splayed.get \"" SR_TMP "/fp2/\")", qs[i], 0);
+        if (r.status != TEST_PASS) return r;
+        if (i < 2) TEST_ASSERT_FMT(sr_col_decoded("k") == 0, "%s: %llu bytes of k decoded", qs[i], (unsigned long long)sr_col_decoded("k"));
+    }
+    char dir[512], path[600];
+    if (ray_splay_resolve_dir(ray_test_tmp(SR_TMP "/fpb/"), dir, sizeof dir) != RAY_OK) FAIL("resolve");
+    snprintf(path, sizeof path, "%s/k", dir);
+    if (!sr_forge_max(path, 3, 999)) FAIL("forge");
+    for (int i = 0; qs[i]; i++) {
+        test_result_t r = sr_corrupt_twice("(.db.splayed.get \"" SR_TMP "/fpb/\")", qs[i], path);
+        if (r.status != TEST_PASS) return r;
+    }
+    PASS();
+}
+
 /* Task 17b fix round 1: the split prescan over a forged directory.  A mixed
  * key set (SYM g scanned exactly, staged I64 k through the directory path
  * as a set of its own) whose k chunk 3 maximum (directory and descriptors)
@@ -4515,9 +4557,11 @@ static test_result_t test_parted_sample_reads(void) {
         uint64_t m = 9;
         int64_t s0 = ray_group_segstream_runs(), f0 = ray_group_firstkeys_runs();
         ray_t* r0 = sr_q(a, NULL); ray_t* r2 = sr_q(b, &m);
-        /* none is an in-place concat: low cardinality goes per partition,
-         * and an unordered take keeps the flatten */
-        TEST_ASSERT_FMT(ray_group_segstream_runs() == s0, "not in place: %s", q[i]);
+        /* low cardinality goes per partition, not in place; the unordered
+         * take keeps the flatten on generation 0 and runs in place over
+         * generation 2's keys (its first-n passes read the parted sources,
+         * P3 Task 6b) */
+        TEST_ASSERT_FMT(ray_group_segstream_runs() - s0 == (i == 1 ? 1 : 0), "in place: %s", q[i]);
         /* the per-partition takes keep the first keys read up front (a wrong
          * read declines to the concat: same answer, so the route is pinned) */
         TEST_ASSERT_FMT(ray_group_firstkeys_runs() - f0 == (i >= 2 ? 2 : 0), "first keys: %s", q[i]);
@@ -5585,7 +5629,7 @@ static test_result_t test_v2_forged_parted_segment(void) {
  * operators, key widths and clauses: k and h stand for the I64 columns
  * (WatchID, UserID), v for the nullable I32 (ClientIP), g and u for the
  * narrow integers, d for EventDate and s for the SYM columns.  q18 and q39
- * are pinned in sr_gaps instead (q18 still materializes until Task 6b). */
+ * are pinned in sr_gaps instead (q18 materialized its keys until P3 Task 6b). */
 #define SR_Q18 "(select {c: (count h) from: T by: {h: h s: s} take: 10})"
 #define SR_Q35 "(select {one: 1 s: s c: (count s) from: T by: s desc: c take: 10})"
 #define SR_Q39 "(take (select {s: s p: (count s) from: T where: (and (== g 3) (>= d 100) (<= d 400) " \
@@ -5632,8 +5676,10 @@ static test_result_t sr_battery(const char* t0, const char* t2, const char* cons
 typedef struct { const char* q; uint64_t mat; } sr_gap_t;
 static const sr_gap_t sr_gaps[] = {
     /* q18: a group-by take without an order runs the first-n pre-pass
-     * (agg_first_n_run), whose keys unstage (agg_keys_unstage, first-n) */
-    { SR_Q18, 2 },
+     * (agg_first_n_run) over the keys' sources: rows read through task
+     * cursors, the sample point-read, the groups' rows gathered by range
+     * (P3 Task 6b) */
+    { SR_Q18, 0 },
     /* q39: the conjunction's later filter refines a selective first one by
      * compacting its predicate column (exec_node OP_FILTER -> sel_compact),
      * and the v2 group over fewer survivors than the parallel threshold
@@ -5651,7 +5697,8 @@ static const sr_gap_t sr_gaps[] = {
  * output no longer flattens the table (Task 15b): it is in the scan-only
  * set. */
 static const sr_gap_t sr_gaps_parted[] = {
-    /* q18 takes the flat-copy run (agg_seg_flat_run) and gathers nothing */
+    /* q18 runs the first-n passes in place over the parted sources (P3
+     * Task 6b; before, a flat copy), materializing nothing */
     { SR_Q18, 0 },
     /* q39: the filter refinement and the compact fallback, per segment,
      * gather by range (P3 Task 6) */
@@ -6682,6 +6729,7 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/v2_sel_bounds",      test_v2_sel_bounds,      srr_setup, srr_teardown },
     { "scanrange/v2_forged_dir_max",  test_v2_forged_dir_max,  srr_setup, srr_teardown },
     { "scanrange/v2_forged_consumers", test_v2_forged_consumers, srr_setup, srr_teardown },
+    { "scanrange/v2_forged_points",    test_v2_forged_points,    srr_setup, srr_teardown },
     { "scanrange/v2_forged_serial_dense", test_v2_forged_serial_dense, srr_setup, srr_teardown },
     { "scanrange/v2_sel_key_types",   test_v2_sel_key_types,   srr_setup, srr_teardown },
     { "scanrange/v2_radix_decode_once", test_v2_radix_decode_once, sr_rt_setup, srr_pool_teardown },

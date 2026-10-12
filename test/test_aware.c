@@ -43,6 +43,7 @@
 #include "store/splay.h"
 #include "store/part.h"
 #include "ops/colgather.h"
+#include "ops/agg_engine.h"   /* agg_route_stats: the first-n route */
 #include "core/pool.h"      /* ray_cancel */
 #include "vec/str.h"
 #include <math.h>
@@ -1562,11 +1563,17 @@ static test_result_t test_gather_rows_contract(void) {
     ray_enc_counters_t k; ray_enc_counters_get(&k);
     TEST_ASSERT_EQ_U(k.materialized, 0);
     /* v's generation-2 segment: ids 0, 3 (vector 0), 1030 (vector 1), 2999
-     * (vector 2: 952 rows), each vector read once despite repeats and order */
+     * (vector 2: 952 rows), each vector read once despite repeats and order.
+     * Its vectors are DELTA_BP, which a point read declines (Task 6b), so
+     * the few ids of each still decode it (gather_points pins the served
+     * encodings) */
     ray_t* venc = ray_table_get_col_enc(t, ray_sym_intern("v", 1));
     TEST_ASSERT_NOT_NULL(venc);
     ray_t* vseg0 = ray_enccol_seg(venc, 0);
     TEST_ASSERT_TRUE(vseg0 && vseg0->type == RAY_ENCCOL);
+    const ray_enc_desc_t* vd;
+    TEST_ASSERT_NULL(ray_enccol_chunk_descs_ref(ray_enccol_of(vseg0), 0, &vd));
+    for (int j = 0; j < 3; j++) TEST_ASSERT_EQ_I(vd[j].encoding, RAY_ENC_DELTA_BP);
     TEST_ASSERT_EQ_U(atomic_load(&ray_enccol_of(vseg0)->decoded_bytes), (1024 + 1024 + 952) * 8);
     ray_release(t);                                       /* sources gone: results must stand alone */
     for (int64_t i = 0; i < n; i++) {
@@ -1613,7 +1620,12 @@ static test_result_t test_gather_sel_parted(void) {
         TEST_ASSERT_NULL(ray_col_gather_sel(&s, sel, &res[c]));
         ray_col_src_release(&s);
     }
+    /* DELTA_BP vectors (as in gather_rows_contract): declined point reads,
+     * each touched vector decoded once */
     ray_t* venc = ray_table_get_col_enc(t, ray_sym_intern("v", 1));
+    const ray_enc_desc_t* vd;
+    TEST_ASSERT_NULL(ray_enccol_chunk_descs_ref(ray_enccol_of(ray_enccol_seg(venc, 0)), 0, &vd));
+    for (int j = 0; j < 3; j++) TEST_ASSERT_EQ_I(vd[j].encoding, RAY_ENC_DELTA_BP);
     TEST_ASSERT_EQ_U(atomic_load(&ray_enccol_of(ray_enccol_seg(venc, 0))->decoded_bytes), (1024 + 1024 + 952) * 8);
     ray_release(t); ray_rowsel_release(sel); ray_release(pred);
     for (int i = 0; i < 5; i++) {
@@ -2568,6 +2580,320 @@ static test_result_t test_gather_filter_ops(void) {
     PASS();
 }
 
+/* ---- Task 6b: group keys read at rows ---- */
+
+/* q18's shape (Task 15 gap 1): a group-by take without an order runs the
+ * first-n pre-pass over the keys' sources, nothing unstaged. */
+static test_result_t test_firstn_by_range(void) {
+    aw_save("fn", "(table [h s v] (list (% (* (til 300000) 7919) 100003) "
+                  "(as 'SYMBOL (map (fn [j] (format \"p%\" (% j 97))) (til 300000))) (til 300000)))", -1);
+    static const char* const qs[] = {
+        "(select {c: (count h) from: T by: {h: h s: s} take: 10})",
+        "(select {c: (count h) s: (sum v) from: T by: h take: 25})",
+        NULL,
+    };
+    for (int i = 0; qs[i]; i++) {
+        agg_route_reset();
+        AW_SAME("fn", qs[i], 0);
+        TEST_ASSERT_FMT(agg_route_stats().first_n == 2, "%s: first-n answered %llu of 2 runs", qs[i],
+                        (unsigned long long)agg_route_stats().first_n);
+    }
+    PASS();
+}
+
+/* The parted form: two partitions of the fn table under a generation-0 and
+ * a generation-2 root.  The first-n passes run over the parted sources (no
+ * flat copy), nothing is materialized, answers and group order are
+ * generation 0's. */
+static void aw_firstn_parted_tables(void) {
+    for (int gen = 0; gen <= 2; gen += 2)
+        for (int p = 0; p < 2; p++) {
+            char q[900];
+            snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/fp%d/2024.01.0%d/t/\" "
+                     "(table [h s v] (list (%% (* (+ (til 150000) %d) 7919) 100003) "
+                     "(as 'SYMBOL (map (fn [j] (format \"p%%\" (%% (+ j %d) 97))) (til 150000))) (+ (til 150000) %d))) "
+                     "\"" AW_TMP "/fp%d/.sym\" {compress: %s})",
+                     gen, p + 1, p * 150000, p * 150000, p * 150000, gen, gen ? "true" : "false");
+            aw_eval_ok(q);
+        }
+}
+static test_result_t test_firstn_parted(void) {
+    aw_firstn_parted_tables();
+    static const char* const qs[] = {
+        "(select {c: (count h) from: T by: {h: h s: s} take: 10})",
+        "(select {c: (count h) s: (sum v) from: T by: h take: 25})",
+        NULL,
+    };
+    for (int i = 0; qs[i]; i++) {
+        ray_t* out[2];
+        for (int gen = 0; gen < 2; gen++) {
+            char b[256];
+            snprintf(b, sizeof b, "(set T (.db.parted.get \"" AW_TMP "/fp%d\" 't))", gen ? 2 : 0);
+            aw_eval_ok(b);
+            ray_enc_counters_reset();
+            agg_route_reset();
+            int64_t f0 = ray_group_test_flat_copies(), s0 = ray_group_segstream_runs();
+            out[gen] = aw_eval(qs[i]);
+            TEST_ASSERT_FMT(out[gen] && !RAY_IS_ERR(out[gen]), "%s gen %d: %s", qs[i], gen, ray_error_msg());
+            if (!gen) continue;
+            ray_enc_counters_t k; ray_enc_counters_get(&k);
+            TEST_ASSERT_FMT(k.materialized == 0, "%s: %llu materializations", qs[i], (unsigned long long)k.materialized);
+            TEST_ASSERT_FMT(ray_group_test_flat_copies() == f0, "%s: %lld flat copies", qs[i],
+                            (long long)(ray_group_test_flat_copies() - f0));
+            TEST_ASSERT_FMT(ray_group_segstream_runs() - s0 == 1, "%s: not grouped in place", qs[i]);
+            TEST_ASSERT_FMT(agg_route_stats().first_n >= 1, "%s: not first-n", qs[i]);
+        }
+        ray_t* fa = ray_fmt(out[0], 0); ray_t* fb = ray_fmt(out[1], 0);
+        TEST_ASSERT_FMT(ray_str_len(fa) == ray_str_len(fb) && memcmp(ray_str_ptr(fa), ray_str_ptr(fb), ray_str_len(fa)) == 0,
+                        "%s differs", qs[i]);
+        ray_release(fa); ray_release(fb); ray_release(out[0]); ray_release(out[1]);
+    }
+    PASS();
+}
+
+/* q42's shape: a selective filter, keys read at a few rows of a few
+ * vectors: point reads, no vector decoded for the keys.  w and h are runs
+ * (RLE) or packed (FOR_BP) without nulls, the encodings a point read
+ * serves.  c is answered from its statistics; the second conjunct is not
+ * a fused leaf, so it compacts w over c's 3000 rows (vectors 181-184, each
+ * holding more than RAY_COL_POINT_ROWS of them: decoded once, by the
+ * filter).  The group's key reads (the dense plan's selection bounds and
+ * the compact gather of its ~60 survivors) decode nothing. */
+static test_result_t test_sparse_key_points(void) {
+    aw_save("sp", "(table [c w h] (list (div (til 300000) 3000) (as 'I16 (% (div (til 300000) 7) 300)) "
+                  "(as 'I16 (% (div (til 300000) 11) 200))))", -1);
+    for (int64_t v = 181; v <= 184; v++) {               /* c == 62: rows 186000..188999 */
+        int ew = aw_vec_enc("sp", "w", v), eh = aw_vec_enc("sp", "h", v);
+        TEST_ASSERT_FMT(ew == RAY_ENC_RLE || ew == RAY_ENC_FOR_BP || ew == RAY_ENC_CONST, "w vector %lld: %d", (long long)v, ew);
+        TEST_ASSERT_FMT(eh == RAY_ENC_RLE || eh == RAY_ENC_FOR_BP || eh == RAY_ENC_CONST, "h vector %lld: %d", (long long)v, eh);
+    }
+    AW_SAME("sp", "(select {n: (count w) from: T where: (and (== c 62) (== 0 (% w 50))) by: {w: w h: h} desc: n take: 10})", 0);
+    TEST_ASSERT_FMT(aw_col_decoded("w") == 4 * 1024 * 2 && aw_col_decoded("h") == 0, "w %llu h %llu",
+                    (unsigned long long)aw_col_decoded("w"), (unsigned long long)aw_col_decoded("h"));
+    PASS();
+}
+
+/* Point reads in the row-list and selection gathers (open decision D2):
+ * per encoding, a vector holding at most RAY_COL_POINT_ROWS requested rows
+ * (vector 0: 64 rows, vector 5: one row, repeated) is point-read and
+ * decodes nothing, one holding more (vector 1: 65 rows) is decoded; a
+ * declined read (DELTA_BP, a vector with nulls) decodes every touched
+ * vector.  Ids sorted, reversed and repeated; values equal generation 0's. */
+static test_result_t test_gather_points(void) {
+    static const struct { const char* name; const char* x; int enc; bool point; } cs[] = {
+        { "pf", "(% (* (til 70000) 7919) 1000)", RAY_ENC_FOR_BP, true },
+        { "pr", "(div (til 70000) 5)", RAY_ENC_RLE, true },
+        { "pd", "(* 1000003 (% (til 70000) 5))", RAY_ENC_DICT, true },
+        { "pe", "(% (* (til 70000) 7919) 1000)", RAY_ENC_DELTA_BP, false },
+        { "pn", "(map (fn [j] (if (== 0 (% j 100)) 0N (% (* j 7919) 1000))) (til 70000))", RAY_ENC_FOR_BP, false },
+    };
+    int64_t ids[64 + 65 + 2];
+    int64_t n = 0;
+    for (int64_t i = 0; i < 64; i++) ids[n++] = 2 * i;              /* vector 0: 64 rows */
+    for (int64_t i = 0; i <= 64; i++) ids[n++] = 1024 + i;          /* vector 1: 65 rows */
+    ids[n++] = 5 * 1024 + 7; ids[n++] = 5 * 1024 + 7;              /* vector 5: one row, twice */
+    int64_t rev[sizeof ids / sizeof ids[0]];
+    for (int64_t i = 0; i < n; i++) rev[i] = ids[n - 1 - i];
+    for (size_t c = 0; c < sizeof cs / sizeof cs[0]; c++) {
+        char tq[256];
+        snprintf(tq, sizeof tq, "(table [x] (list %s))", cs[c].x);
+        aw_save(cs[c].name, tq, cs[c].enc);
+        for (int64_t v = 0; v <= 5; v += 5) TEST_ASSERT_EQ_I(aw_vec_enc(cs[c].name, "x", v), cs[c].enc);
+        ray_t* t0 = aw_load(cs[c].name, 0);
+        ray_t* t2 = aw_load(cs[c].name, 2);
+        TEST_ASSERT_TRUE(t0 && t2);
+        ray_t* ref = ray_table_col(t0, ray_sym_intern("x", 1));
+        const int64_t* rv = (const int64_t*)ray_data(ref);
+        ray_t* encv = ray_table_get_col_enc(t2, ray_sym_intern("x", 1));
+        TEST_ASSERT_NOT_NULL(encv);
+        const uint64_t want = (cs[c].point ? 1 : 3) * 1024 * 8;   /* vector 1, or vectors 0, 1 and 5 */
+        for (int pass = 0; pass < 3; pass++) {
+            ray_col_src_t s;
+            TEST_ASSERT_NULL(ray_table_col_src(t2, ray_sym_intern("x", 1), &s));
+            uint64_t d0 = atomic_load(&ray_enccol_of(encv)->decoded_bytes);
+            ray_t* out = NULL;
+            ray_t* sel = NULL; ray_t* pred = NULL;
+            const int64_t* want_ids = pass == 1 ? rev : ids;
+            int64_t want_n = n;
+            if (pass < 2) {
+                TEST_ASSERT_NULL(ray_col_gather_rows(&s, want_ids, n, &out));
+            } else {                                  /* a rowsel of the distinct rows */
+                pred = ray_vec_new(RAY_BOOL, 70000); pred->len = 70000;
+                memset(ray_data(pred), 0, 70000);
+                for (int64_t i = 0; i < n; i++) ((uint8_t*)ray_data(pred))[ids[i]] = 1;
+                sel = ray_rowsel_from_pred(pred);
+                TEST_ASSERT_NOT_NULL(sel);
+                TEST_ASSERT_NULL(ray_col_gather_sel(&s, sel, &out));
+                want_n = n - 1;
+            }
+            ray_col_src_release(&s);
+            uint64_t got = atomic_load(&ray_enccol_of(encv)->decoded_bytes) - d0;
+            TEST_ASSERT_FMT(got == want, "%s pass %d: decoded %llu, want %llu", cs[c].name, pass,
+                            (unsigned long long)got, (unsigned long long)want);
+            TEST_ASSERT_EQ_I(out->len, want_n);
+            TEST_ASSERT_EQ_I(out->attrs & RAY_ATTR_HAS_NULLS, ref->attrs & RAY_ATTR_HAS_NULLS);
+            for (int64_t i = 0; i < want_n; i++)
+                TEST_ASSERT_FMT(((int64_t*)ray_data(out))[i] == rv[want_ids[i]], "%s pass %d row %lld",
+                                cs[c].name, pass, (long long)i);
+            ray_release(out);
+            if (sel) ray_rowsel_release(sel);
+            if (pred) ray_release(pred);
+        }
+        ray_release(t0); ray_release(t2);
+    }
+    /* parted: segment-local vectors (partitions of 3000 rows, so vectors
+     * and segments straddle the global morsels); few ids per local vector,
+     * unsorted and repeated, as a row list and as a rowsel: nothing
+     * decoded */
+    ray_encw_test_force(RAY_ENC_FOR_BP);
+    for (int p = 0; p < 2; p++) {
+        char q[600];
+        snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/gpp/2024.01.0%d/t/\" "
+                 "(table [x] (list (%% (* (+ (til 3000) %d) 7919) 1000))) {compress: true})", p + 1, p * 3000);
+        aw_eval_ok(q);
+    }
+    ray_encw_test_force(-1);
+    ray_t* tp = aw_eval("(.db.parted.get \"" AW_TMP "/gpp\" 't)");
+    TEST_ASSERT_TRUE(tp && !RAY_IS_ERR(tp));
+    static const int64_t pids[] = { 3075, 3070, 5999, 3075, 10, 2999, 3000, 4100 };
+    const int64_t pn = 8;
+    ray_t* penc = ray_table_get_col_enc(tp, ray_sym_intern("x", 1));
+    TEST_ASSERT_NOT_NULL(penc);
+    for (int sg = 0; sg < 2; sg++) {
+        const ray_enc_desc_t* d;
+        TEST_ASSERT_NULL(ray_enccol_chunk_descs_ref(ray_enccol_of(ray_enccol_seg(penc, sg)), 0, &d));
+        for (int j = 0; j < 3; j++) TEST_ASSERT_EQ_I(d[j].encoding, RAY_ENC_FOR_BP);
+    }
+    ray_t* ppred = ray_vec_new(RAY_BOOL, 6000); ppred->len = 6000;
+    memset(ray_data(ppred), 0, 6000);
+    for (int64_t i = 0; i < pn; i++) ((uint8_t*)ray_data(ppred))[pids[i]] = 1;
+    ray_t* psel = ray_rowsel_from_pred(ppred);
+    TEST_ASSERT_NOT_NULL(psel);
+    static const int64_t psorted[] = { 10, 2999, 3000, 3070, 3075, 4100, 5999 };
+    for (int pass = 0; pass < 2; pass++) {
+        ray_col_src_t s;
+        TEST_ASSERT_NULL(ray_table_col_src(tp, ray_sym_intern("x", 1), &s));
+        ray_enc_counters_reset();
+        ray_t* out = NULL;
+        TEST_ASSERT_NULL(pass ? ray_col_gather_sel(&s, psel, &out) : ray_col_gather_rows(&s, pids, pn, &out));
+        ray_col_src_release(&s);
+        ray_enc_counters_t k; ray_enc_counters_get(&k);
+        TEST_ASSERT_FMT(k.decoded_bytes == 0 && k.materialized == 0, "parted pass %d: decoded %llu", pass,
+                        (unsigned long long)k.decoded_bytes);
+        const int64_t* w = pass ? psorted : pids;
+        TEST_ASSERT_EQ_I(out->len, pass ? 7 : pn);
+        for (int64_t i = 0; i < out->len; i++)
+            TEST_ASSERT_EQ_I(((int64_t*)ray_data(out))[i], (w[i] * 7919) % 1000);
+        ray_release(out);
+    }
+    ray_rowsel_release(psel); ray_release(ppred); ray_release(tp);
+    PASS();
+}
+
+/* First-n on runs: keys whose vectors are run views (h: runs of 11; s: a
+ * SYM in runs of 7, every 13th run "", the in-band null) are probed once
+ * per span of equal tuples, without decoding (agg_firstn_runs).  h decodes
+ * only the vector pass 1 reads through its cursor; the sample point-reads
+ * it and pass 2 reads its runs.  With a where: the table is compacted
+ * first (firstn_sel installs a selection itself); answers and order are
+ * generation 0's. */
+static test_result_t test_firstn_runs(void) {
+    aw_save("fr", "(table [h s] (list (% (* (div (til 300000) 11) 7919) 100003) "
+                  "(as 'SYMBOL (map (fn [j] (if (== 0 (% (div j 7) 13)) \"\" (format \"r%\" (% (div j 7) 97)))) (til 300000)))))",
+            RAY_ENC_RLE);
+    for (int64_t v = 0; v < 290; v += 41) {
+        TEST_ASSERT_EQ_I(aw_vec_enc("fr", "h", v), RAY_ENC_RLE);
+        TEST_ASSERT_EQ_I(aw_vec_enc("fr", "s", v), RAY_ENC_RLE);
+    }
+    static const char* const qs[] = {
+        "(select {c: (count h) from: T by: {h: h s: s} take: 10})",
+        "(select {c: (count h) m: (max h) from: T where: (!= s 'r5) by: {s: s h: h} take: 7})",
+        NULL,
+    };
+    for (int i = 0; qs[i]; i++) {
+        agg_route_reset();
+        AW_SAME("fr", qs[i], 0);
+        TEST_ASSERT_FMT(agg_route_stats().first_n == 2, "%s: first-n %llu", qs[i], (unsigned long long)agg_route_stats().first_n);
+        if (i == 0)   /* the where: compacts the table first (HEAD(GROUP) over a selection): all of h gathered */
+            TEST_ASSERT_FMT(aw_col_decoded("h") == 1024 * 8, "%s: h decoded %llu", qs[i], (unsigned long long)aw_col_decoded("h"));
+    }
+    PASS();
+}
+
+/* The parallel strategies' selection reads (agg_idx_walk) with few rows
+ * per vector: every 25th row of 2M (41 per vector, above the parallel
+ * threshold) grouped by two I32 keys read at those rows by point reads
+ * into the walk's sparse views, and by the dense plan's bounds: neither
+ * key decodes a vector. */
+static test_result_t test_sparse_walk_points(void) {
+    aw_save("sw", "(table [a b v] (list (as 'I32 (% (* (div (til 2000000) 7) 7919) 1000)) (as 'I32 (% (div (til 2000000) 50000) 7)) "
+                  "(til 2000000)))", -1);
+    for (int64_t v = 0; v < 1950; v += 397) {
+        int ea = aw_vec_enc("sw", "a", v), eb = aw_vec_enc("sw", "b", v);
+        TEST_ASSERT_FMT(ea == RAY_ENC_RLE || ea == RAY_ENC_FOR_BP, "a vector %lld: %d", (long long)v, ea);
+        TEST_ASSERT_FMT(eb == RAY_ENC_RLE || eb == RAY_ENC_CONST, "b vector %lld: %d", (long long)v, eb);
+    }
+    static const char* const qs[] = {
+        "(select {n: (count a) from: T where: (== 0 (% v 25)) by: {a: a b: b} desc: n take: 10})",
+        "(select {n: (count a) s: (sum v) from: T where: (== 0 (% v 25)) by: a})",
+        NULL,
+    };
+    for (int i = 0; qs[i]; i++) {
+        AW_SAME("sw", qs[i], 0);
+        TEST_ASSERT_FMT(aw_col_decoded("a") == 0 && aw_col_decoded("b") == 0, "%s: a %llu b %llu", qs[i],
+                        (unsigned long long)aw_col_decoded("a"), (unsigned long long)aw_col_decoded("b"));
+    }
+    PASS();
+}
+
+/* The first-n passes under a selection (the language compacts a where:
+ * before an unordered take, so a C caller installs the rowsel): every
+ * third row dropped (MIX segments), keys on runs (agg_firstn_runs) and,
+ * for a key set over the RLE keys plus a FOR_BP one, through the cursor
+ * pieces (agg_firstn_piece).  Results and order equal generation 0's;
+ * nothing is materialized. */
+static ray_t* aw_firstn_sel_run(ray_t* t, int with_v, int64_t limit) {
+    ray_graph_t* g = ray_graph_new(t);
+    ray_t* pred = ray_vec_new(RAY_BOOL, 300000); pred->len = 300000;
+    for (int64_t r = 0; r < 300000; r++) ((uint8_t*)ray_data(pred))[r] = r % 3 != 0;
+    g->selection = ray_rowsel_from_pred(pred);
+    ray_release(pred);
+    ray_op_t* keys[3] = { ray_scan(g, "h"), ray_scan(g, "s"), with_v ? ray_scan(g, "v") : NULL };
+    ray_op_t* ins[2] = { ray_scan(g, "h"), ray_scan(g, "h") };
+    uint16_t ops[2] = { OP_COUNT, OP_MAX };
+    ray_op_t* grp = ray_group(g, keys, with_v ? 3 : 2, ops, ins, 2);
+    ray_t* r = exec_group(g, grp, t, limit);
+    ray_graph_free(g);
+    return r;
+}
+static test_result_t test_firstn_sel(void) {
+    aw_save("fs", "(table [h s v] (list (% (* (div (til 300000) 11) 7919) 100003) "
+                  "(as 'SYMBOL (map (fn [j] (if (== 0 (% (div j 7) 13)) \"\" (format \"r%\" (% (div j 7) 97)))) (til 300000))) "
+                  "(% (div (til 300000) 3) 5)))", RAY_ENC_RLE);
+    ray_t* t[2] = { aw_load("fs", 0), aw_load("fs", 2) };
+    TEST_ASSERT_TRUE(t[0] && t[1]);
+    for (int with_v = 0; with_v < 2; with_v++)
+        for (int64_t limit = 5; limit <= 40; limit += 35) {
+            ray_t* out[2];
+            for (int gen = 0; gen < 2; gen++) {
+                ray_enc_counters_reset();
+                agg_route_reset();
+                out[gen] = aw_firstn_sel_run(t[gen], with_v, limit);
+                TEST_ASSERT_FMT(out[gen] && !RAY_IS_ERR(out[gen]), "gen %d v %d: %s", gen, with_v, ray_error_msg());
+                TEST_ASSERT_FMT(agg_route_stats().first_n == 1, "gen %d v %d: not first-n", gen, with_v);
+                ray_enc_counters_t k; ray_enc_counters_get(&k);
+                if (gen) TEST_ASSERT_EQ_U(k.materialized, 0);
+            }
+            TEST_ASSERT_EQ_I(ray_table_nrows(out[0]), limit);
+            ray_t* fa = ray_fmt(out[0], 0); ray_t* fb = ray_fmt(out[1], 0);
+            TEST_ASSERT_FMT(ray_str_len(fa) == ray_str_len(fb) && memcmp(ray_str_ptr(fa), ray_str_ptr(fb), ray_str_len(fa)) == 0,
+                            "v %d limit %lld differs", with_v, (long long)limit);
+            ray_release(fa); ray_release(fb); ray_release(out[0]); ray_release(out[1]);
+        }
+    ray_release(t[0]); ray_release(t[1]);
+    PASS();
+}
+
 const test_entry_t aware_entries[] = {
     { "aware/vview_encodings", test_vview_encodings, aw_setup, aw_teardown },
     { "aware/vview_near_top",  test_vview_near_top,  aw_setup, aw_teardown },
@@ -2610,5 +2936,12 @@ const test_entry_t aware_entries[] = {
     { "aware/gather_sel_task_error", test_gather_sel_task_error, aw_setup, aw_teardown },
     { "aware/refine_in",         test_refine_in,         aw_setup, aw_teardown },
     { "aware/gather_sel_late_null_cancel", test_gather_sel_late_null_cancel, aw_setup, aw_teardown },
+    { "aware/firstn_by_range",    test_firstn_by_range,    aw_setup, aw_teardown },
+    { "aware/firstn_parted",      test_firstn_parted,      aw_setup, aw_teardown },
+    { "aware/sparse_key_points",  test_sparse_key_points,  aw_setup, aw_teardown },
+    { "aware/gather_points",      test_gather_points,      aw_setup, aw_teardown },
+    { "aware/firstn_runs",        test_firstn_runs,        aw_setup, aw_teardown },
+    { "aware/firstn_sel",         test_firstn_sel,         aw_setup, aw_teardown },
+    { "aware/sparse_walk_points", test_sparse_walk_points, aw_setup, aw_teardown },
     { NULL, NULL, NULL, NULL },
 };

@@ -10808,7 +10808,11 @@ uint8_t parted_sym_width(ray_t* col) {
     return w;
 }
 
+static _Atomic(int64_t) g_flat_copies;   /* test hook: parted_flatten_fixed calls */
+int64_t ray_group_test_flat_copies(void) { return atomic_load_explicit(&g_flat_copies, memory_order_relaxed); }
+
 ray_t* parted_flatten_fixed(ray_t* col, int64_t total) {
+    atomic_fetch_add_explicit(&g_flat_copies, 1, memory_order_relaxed);
     ray_col_meta_t m;
     if (!ray_col_meta_of(col, &m) || !RAY_IS_PARTED(m.type)) return ray_error("type", "flatten: not a parted column");
     int8_t base = (int8_t)RAY_PARTED_BASETYPE(m.type);
@@ -11056,22 +11060,28 @@ static ray_t* grp_ragged_plain(ray_t* slot, int64_t* budget) {
  * Every key a scan of a parted fixed-width integer, temporal or SYM column;
  * every aggregate a streaming one over a scan of a parted number column
  * (or a count), with no second input and no parameter; no selection (v2's
- * compact prologue would gather the parted sources) and no unordered take
- * (v2's first-N pre-pass reads keys at rows); and v2 admits the shape over
- * the base types. */
+ * compact prologue would gather the parted sources); an unordered take
+ * only over a generation-2 key (v2's first-N pre-pass reads the keys at
+ * rows through their parted sources and gathers its groups' rows by range,
+ * any decline running the group over its flat copy; a generation-0 table
+ * keeps the flat copy, as before); and v2 admits the shape over the base
+ * types. */
 static bool group_seg_stream_ok(ray_graph_t* g, ray_op_t* op, ray_op_ext_t* ext,
                                 ray_t* parted_tbl, int64_t group_limit) {
     if (!ray_agg_engine_v2 || g_group_test_route >= 1 || g->selection || g->sg_col ||
         ext->n_keys == 0 || group_limit < 0)
         return false;
-    if (group_limit > 0 && !ray_group_emit_filter_active().enabled) return false;
+    bool firstn = group_limit > 0 && !ray_group_emit_filter_active().enabled;
+    bool enc_key = false;
     for (uint32_t k = 0; k < ext->n_keys; k++) {
         ray_op_ext_t* ke = find_ext(g, ext->keys[k]);
         ray_col_meta_t m;
         if (!ke || ke->base.opcode != OP_SCAN || !ray_table_col_meta(parted_tbl, ke->sym, &m) ||
             !RAY_IS_PARTED(m.type)) return false;
         if (!agg_key_i64_type((int8_t)RAY_PARTED_BASETYPE(m.type))) return false;
+        enc_key |= ray_table_get_col_enc(parted_tbl, ke->sym) != NULL;
     }
+    if (firstn && !enc_key) return false;
     for (uint32_t a = 0; a < ext->n_aggs; a++) {
         uint16_t aop = ext->agg_ops[a];
         if (aop != OP_SUM && aop != OP_COUNT && aop != OP_MIN && aop != OP_MAX && aop != OP_AVG &&

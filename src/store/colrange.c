@@ -769,26 +769,54 @@ bool ray_col_src_parted_chunks(ray_col_src_t* s, void* ctx, ray_col_chunk_fn fn,
     return true;
 }
 
-int ray_col_src_point_i64(ray_col_src_t* s, int64_t row, int64_t* out, ray_t** err) {
-    *err = NULL;
-    if (!ray_col_src_encoded(s) || ray_enccol_decoded_peek(s->obj)) return 0;   /* the cursor reads it in place */
+/* The single-file encoded column holding row `row` of a generation-2
+ * source, not materialized: the column itself, or the row's parted segment
+ * when that is one (*seg0 its first row); NULL for anything else, read by
+ * a cursor. */
+static ray_enccol_t* src_point_col(ray_col_src_t* s, int64_t row, int64_t* seg0, int64_t* seg1) {
+    if (!ray_col_src_encoded(s) || ray_enccol_decoded_peek(s->obj)) return NULL;   /* the cursor reads it in place */
     ray_enccol_t* e = ray_enccol_of(s->obj);
-    if (e->kind == RAY_ENCCOL_SINGLE) return ray_enccol_point_i64(e, row, out, err);
+    if (e->kind == RAY_ENCCOL_SINGLE) { *seg0 = 0; *seg1 = e->len; return e; }
     /* parted: the row's segment, when it is a single-file encoded one */
     ray_t* w = parted_wrapper(s->obj);
     const int64_t* off;
-    if (!w || w->len <= 0 || row < 0 || row >= s->len) return 0;
+    if (!w || w->len <= 0 || row < 0 || row >= s->len) return NULL;
     ray_t* oerr = src_seg_off(s, w, &off);                  /* seg_off: published once, atomically */
-    if (oerr) { ray_error_free(oerr); return 0; }          /* the cursor reports it */
+    if (oerr) { ray_error_free(oerr); return NULL; }        /* the cursor reports it */
     int64_t lo = 0, hi = w->len - 1;                       /* the last i with off[i] <= row */
     while (lo < hi) {
         int64_t mid = lo + (hi - lo + 1) / 2;
         if (off[mid] <= row) lo = mid; else hi = mid - 1;
     }
     ray_t* sg = ((ray_t**)ray_data(w))[lo];
-    if (!sg || sg->type != RAY_ENCCOL || ray_enccol_decoded_peek(sg)) return 0;
+    if (!sg || sg->type != RAY_ENCCOL || ray_enccol_decoded_peek(sg)) return NULL;
     ray_enccol_t* se = ray_enccol_of(sg);
-    return se->kind == RAY_ENCCOL_SINGLE ? ray_enccol_point_i64(se, row - off[lo], out, err) : 0;
+    if (se->kind != RAY_ENCCOL_SINGLE) return NULL;
+    *seg0 = off[lo]; *seg1 = off[lo + 1];
+    return se;
+}
+
+int ray_col_src_point_i64(ray_col_src_t* s, int64_t row, int64_t* out, ray_t** err) {
+    *err = NULL;
+    int64_t s0, s1;
+    ray_enccol_t* e = src_point_col(s, row, &s0, &s1);
+    return e ? ray_enccol_point_i64(e, row - s0, out, err) : 0;
+}
+
+int ray_col_src_points_i64(ray_col_src_t* s, const int64_t* rows, int64_t n, int64_t* out, ray_t** err) {
+    *err = NULL;
+    int64_t s0, s1;
+    ray_enccol_t* e = n > 0 ? src_point_col(s, rows[0], &s0, &s1) : NULL;
+    return e ? ray_enccol_points_i64(e, rows, n, s0, out, err) : 0;
+}
+
+bool ray_col_src_vec_span(ray_col_src_t* s, int64_t row, int64_t* lo, int64_t* hi) {
+    int64_t s0, s1;
+    ray_enccol_t* e = src_point_col(s, row, &s0, &s1);
+    if (!e || row < s0 || row >= s1) return false;
+    *lo = s0 + ((row - s0) & ~(int64_t)(RAY_ENC_VEC - 1));
+    *hi = *lo + RAY_ENC_VEC < s1 ? *lo + RAY_ENC_VEC : s1;
+    return true;
 }
 
 /* One read-ahead span: page-aligned start, bytes. */

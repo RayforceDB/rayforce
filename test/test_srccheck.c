@@ -273,6 +273,31 @@ static test_result_t test_plain_marker_forms(void) {
     PASS();
 }
 
+/* P3 Task 6b: the first-n pre-pass (agg_first_n_run) reads its keys at
+ * rows through their sources and gathers its groups' rows by range: its
+ * body neither unstages a key nor requests a plain column.  The other
+ * whole-column strategies (indexed, serial) keep their marked sites. */
+static test_result_t test_firstn_reads_by_range(void) {
+    struct stat st;
+    const char* root = stat("src/table/table.c", &st) == 0 ? "." : "..";
+    char path[128]; snprintf(path, sizeof path, "%s/src/ops/agg_engine.c", root);
+    FILE* f = fopen(path, "rb");
+    TEST_ASSERT_TRUE(f != NULL);
+    char line[4096]; int ln = 0, body = 0, bad = 0, lines = 0;
+    while (fgets(line, sizeof line, f)) {
+        ln++;
+        if (!body && strncmp(line, "static ray_t* agg_first_n_run(", 30) == 0 && !strchr(line, ';')) body = ln;
+        if (!body) continue;
+        lines++;
+        if (strstr(line, "agg_keys_unstage(") || strstr(line, "ray_col_src_plain(")) { if (!bad) bad = ln; }
+        if (line[0] == '}') break;
+    }
+    fclose(f);
+    TEST_ASSERT_FMT(body && lines > 50, "agg_first_n_run not found (%d lines)", lines);
+    TEST_ASSERT_FMT(bad == 0, "src/ops/agg_engine.c:%d: agg_first_n_run reads a key whole", bad);
+    PASS();
+}
+
 /* P1's transitional whole-table decode (carry 4) stays removed. */
 static void check_no_table_decode(const char* p, const char* rel, srccheck_acc_t* acc) {
     static const char* const needles[] = { "TABLE_DECODE_OR_RETURN", NULL };
@@ -304,5 +329,6 @@ const test_entry_t srccheck_entries[] = {
     { "srccheck/plain_requests_marked",      test_plain_requests_marked,      NULL, NULL },
     { "srccheck/plain_marker_forms",         test_plain_marker_forms,         NULL, NULL },
     { "srccheck/no_table_decode_or_return",  test_no_table_decode_or_return,  NULL, NULL },
+    { "srccheck/firstn_reads_by_range",      test_firstn_reads_by_range,      NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };

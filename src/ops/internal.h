@@ -1377,6 +1377,9 @@ int64_t ray_group_firstkeys_runs(void);
  * cells at the widest segment's width over the first segment's domain,
  * HAS_NULLS from the segments.  An owned vector or error. */
 ray_t* parted_flatten_fixed(ray_t* col, int64_t total);
+/* Test hook: parted_flatten_fixed calls since process start (the flat
+ * copies of parted columns the group fallbacks make). */
+int64_t ray_group_test_flat_copies(void);
 /* The widest SYM width class over a parted SYM column's segments (a plain
  * parted wrapper or a RAY_ENCCOL_PARTED slot), read from their headers: the
  * width a vector holding every segment's ids needs.  0 for anything else. */

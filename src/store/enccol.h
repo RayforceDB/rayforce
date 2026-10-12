@@ -164,6 +164,13 @@ int    ray_enccol_decode_wide(ray_enccol_t* e, int64_t c, int j, const ray_enc_d
  * owned error in *err (descriptors, dictionary, or the value outside its
  * statistics: `corrupt`). */
 int    ray_enccol_point_i64(ray_enccol_t* e, int64_t row, int64_t* out, ray_t** err);
+/* ray_enccol_point_i64 of rows rows[q] - base, q in [0, n): ascending
+ * rows of one vector, its body read once (CONST / RLE: the runs parsed
+ * once, not once per row).  1: every row served into out (each value
+ * checked against the vector's statistics, `corrupt` otherwise); 0:
+ * declined (as ray_enccol_point_i64, or rows outside one vector or not
+ * ascending), out partly written; -1: an owned error in *err. */
+int    ray_enccol_points_i64(ray_enccol_t* e, const int64_t* rows, int64_t n, int64_t base, int64_t* out, ray_t** err);
 
 /* RAY_ENC_VEC lane values at the kind's width T (the fast kernels' own
  * buffer: enccol.c's fk_vals_t is a typedef of this). */

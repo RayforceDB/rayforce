@@ -235,6 +235,23 @@ bool ray_col_src_parted_chunks(ray_col_src_t* s, void* ctx, ray_col_chunk_fn fn,
  * For samplers: a sampled row costs no vector decode.  A parted source
  * publishes its segment offsets on first use (so the source is not const). */
 int  ray_col_src_point_i64(ray_col_src_t* s, int64_t row, int64_t* out, ray_t** err);
+/* ray_col_src_point_i64 of the ascending rows[0, n), all inside one
+ * vector (ray_col_src_vec_span), the vector's body read once
+ * (ray_enccol_points_i64): 1 every row served into out, 0 declined (read
+ * the vector through a cursor; out partly written), -1 an owned *err. */
+int  ray_col_src_points_i64(ray_col_src_t* s, const int64_t* rows, int64_t n, int64_t* out, ray_t** err);
+/* The rows [*lo, *hi) of the vector holding row `row` (segment-local
+ * vectors for a parted source) when ray_col_src_point_i64 may serve it (a
+ * single-file encoded column or segment, not materialized): true.  False
+ * for any other row, which a cursor reads.  For a caller choosing between
+ * point reads and one decode by how many of a vector's rows it needs. */
+bool ray_col_src_vec_span(ray_col_src_t* s, int64_t row, int64_t* lo, int64_t* hi);
+/* Open decision D2: a vector's requested rows are point-read when there
+ * are at most this many of them (1/16 of a vector, RAY_ENC_VEC =
+ * RAY_MORSEL_ELEMS values): a point read unpacks one lane or
+ * binary-searches the runs, a decode writes the whole vector.  A
+ * structural ratio, not a knob. */
+#define RAY_COL_POINT_ROWS (RAY_MORSEL_ELEMS / 16)
 /* One sequential read-ahead hint for rows [lo, hi): plain mmapped
  * columns hint their element bytes, generation 2 the chunk bytes from the
  * directory, parted sources each touched segment; heap vectors nothing. */
