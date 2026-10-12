@@ -524,7 +524,7 @@ spills exactly as it did before.
 | `.sys.args` | nullary | Application arguments as a typed dict (`user` subdict for post-`--` args) | `(.sys.args)` |
 | `env` | unary | List all global environment bindings | `(env 0)` |
 | `.sys.build` | nullary | Build metadata: `version` + `build-date` | `(.sys.build)` |
-| `.sys.mem` | variadic | Memory allocator statistics (alloc/peak/slab) | `(.sys.mem)` |
+| `.sys.mem` | nullary | Memory allocator statistics (alloc/peak/slab) | `(.sys.mem)` |
 | `.sys.info` | nullary | System information (cores, page size, memory) | `(.sys.info)` |
 
 ## Serialization & Storage

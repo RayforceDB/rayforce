@@ -107,6 +107,8 @@
 ;; ray_memstat_fn (.sys.mem)  (lines 703-728)
 ;; ══════════════════════════════════════════════════════════════════════
 (type (.sys.mem)) -- 'DICT
+(.sys.mem 1) !- arity
+(.sys.prof 1) !- arity
 (count (.sys.mem)) -- 18
 (type (value (.sys.mem))) -- 'LIST
 
