@@ -4268,7 +4268,8 @@ static bool dag_can_stream(ray_graph_t* g, ray_op_t* root) {
     return ok && has_default_scan;
 }
 
-static ray_t* ray_execute_inner(ray_graph_t* g, ray_op_t* root);
+static ray_t* ray_execute_inner(ray_graph_t* g, ray_op_t* root, bool reset_cancel);
+static _Thread_local int exec_depth;   /* nesting of ray_execute on this thread */
 
 /* Validate compiler-marked missing scans before execution.  Optimizer rewrites
  * may replace a root or eliminate such a scan from the live DAG (for example
@@ -4371,7 +4372,14 @@ ray_t* ray_execute(ray_graph_t* g, ray_op_t* root) {
      * a compaction or a merge fails to allocate (the flat path's
      * `return result`, the streaming path's seg_tbl / partial / merged
      * returns); `(times <lazy> ...)` would then crash in loop_count. */
-    ray_t* result = ray_execute_inner(g, root);
+    /* The cancel flag is reset at the outermost call only.  A node's own
+     * path may execute a sub-graph (the grouped expression bridge
+     * materializing an input the element-wise compiler declines, #756);
+     * were that call to reset the flag, a cancel that arrived before it
+     * would be dropped and the workers would run the remaining tickets. */
+    bool outermost = exec_depth++ == 0;
+    ray_t* result = ray_execute_inner(g, root, outermost);
+    exec_depth--;
     if (own_scan) ray_pool_scan_set(prev_scan);
     return result ? result : ray_error("oom", NULL);
 }
@@ -4413,14 +4421,15 @@ static ray_t* flatten_parted_col(ray_t* col) {
     return flat;
 }
 
-static ray_t* ray_execute_inner(ray_graph_t* g, ray_op_t* root) {
+static ray_t* ray_execute_inner(ray_graph_t* g, ray_op_t* root, bool reset_cancel) {
     if (!g || !root) return ray_error("nyi", NULL);
 
     /* Lazy-init the global thread pool on first call */
     ray_pool_t* pool = ray_pool_get();
 
-    /* Reset cancellation flag at the start of each query */
-    if (pool)
+    /* Reset cancellation flag at the start of each query (not of a nested
+     * execution — see ray_execute) */
+    if (pool && reset_cancel)
         atomic_store_explicit(&pool->cancelled, 0, memory_order_relaxed);
 
     /* Detect streaming mode: check if g->table has parted columns.
