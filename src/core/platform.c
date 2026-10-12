@@ -31,6 +31,16 @@
 /* ==========================================================================
  * Linux / macOS (POSIX)
  * ========================================================================== */
+#include <stdatomic.h>
+
+/* Bytes asked for ahead so far (ray_vm_advise_willneed), process-wide:
+ * the pool's trace summary, and tests of the readers that must ask before
+ * they read a mapped column they sample. */
+static _Atomic(uint64_t) vm_willneed_bytes;
+uint64_t ray_vm_willneed_bytes(void) {
+    return atomic_load_explicit(&vm_willneed_bytes, memory_order_relaxed);
+}
+
 #if defined(RAY_OS_LINUX) || defined(RAY_OS_MACOS)
 
 #include <sys/mman.h>
@@ -188,6 +198,7 @@ static size_t vm_willneed_step(void) {
 
 void ray_vm_advise_willneed(void* ptr, size_t size) {
     if (!ptr || !size) return;
+    atomic_fetch_add_explicit(&vm_willneed_bytes, size, memory_order_relaxed);
     /* madvise wants a page-aligned start.  One WILLNEED reads at most what
      * the device allows per call (vm_willneed_step), so a large range is
      * requested step by step: each call only queues its reads, so the steps
@@ -820,6 +831,7 @@ void ray_vm_advise_seq(void* ptr, size_t size) {
 
 void ray_vm_advise_willneed(void* ptr, size_t size) {
     if (!ptr || !size) return;
+    atomic_fetch_add_explicit(&vm_willneed_bytes, size, memory_order_relaxed);
     WIN32_MEMORY_RANGE_ENTRY entry;
     entry.VirtualAddress = ptr;
     entry.NumberOfBytes  = size;
@@ -1054,7 +1066,9 @@ void* ray_vm_map_fd_ro(int fd, size_t size) {
 
 /* madvise hints are advisory and have no analog on WASM — no-ops. */
 void ray_vm_advise_seq(void* ptr, size_t size)      { (void)ptr; (void)size; }
-void ray_vm_advise_willneed(void* ptr, size_t size) { (void)ptr; (void)size; }
+void ray_vm_advise_willneed(void* ptr, size_t size) {
+    if (ptr && size) atomic_fetch_add_explicit(&vm_willneed_bytes, size, memory_order_relaxed);
+}
 void ray_file_writeback_start(int fd, int64_t off, int64_t len) { (void)fd; (void)off; (void)len; }
 void ray_sleep_ms(int ms)                          { (void)ms; }
 bool ray_vm_resident(const void* ptr, size_t size)  { (void)ptr; (void)size; return true; }

@@ -2043,6 +2043,19 @@ void ray_col_want_row(ray_t* col, int64_t row) {
     ray_vm_advise_willneed((uint8_t*)ray_data(col) + (size_t)row * esz, esz);
 }
 
+/* A run of pages to request, and the pool task that requests a range of
+ * such runs (col_want_runs_fn). */
+typedef struct { uintptr_t a; size_t bytes; } col_want_run_t;
+typedef struct { const col_want_run_t* runs; size_t nr, per; } col_want_ctx_t;
+
+/* Task `start` of a dispatch_n: runs [start * per, (start + 1) * per). */
+static void col_want_runs_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid; (void)end;
+    const col_want_ctx_t* c = raw;
+    size_t a = (size_t)start * c->per, b = a + c->per < c->nr ? a + c->per : c->nr;
+    for (size_t i = a; i < b; i++) ray_vm_advise_willneed((void*)c->runs[i].a, c->runs[i].bytes);
+}
+
 void ray_col_want_rows(ray_t* col, const int64_t* idx, int64_t n) {
     size_t esz = col_fixed_esz(col);
     if (!esz || n <= 0 || !ray_pool_scan_on()) return;
@@ -2084,9 +2097,18 @@ void ray_col_want_rows(ray_t* col, const int64_t* idx, int64_t n) {
         else ray_vm_advise_willneed((void*)p, esz);
     }
     if (!mark) return;
-    size_t run = 0;
+    /* The runs of marked pages, listed: a run starts at each page marked
+     * whose lower neighbour is not. */
+    const size_t words = (pages + 63) / 64;
+    size_t n_runs = 0;
+    for (size_t w = 0; w < words; w++) {
+        uint64_t m = mark[w], below = (m << 1) | (w ? mark[w - 1] >> 63 : 0);
+        n_runs += (size_t)__builtin_popcountll(m & ~below);
+    }
+    col_want_run_t* runs = n_runs ? ray_alloc_raw(n_runs * sizeof *runs) : NULL;
+    size_t run = 0, nr = 0;
     bool open = false;
-    for (size_t w = 0; w < (pages + 63) / 64; w++) {
+    for (size_t w = 0; runs && w < words; w++) {
         uint64_t m = mark[w];
         if (m == (open ? ~UINT64_C(0) : 0)) continue;
         for (unsigned b = 0; b < 64; b++) {
@@ -2094,12 +2116,31 @@ void ray_col_want_rows(ray_t* col, const int64_t* idx, int64_t n) {
             if (on == open) continue;
             size_t pg = w * 64 + b;
             if (on) run = pg;
-            else ray_pool_want((void*)((p0 + run) << 12), (pg - run) << 12);
+            else runs[nr++] = (col_want_run_t){ (p0 + run) << 12, (pg - run) << 12 };
             open = on;
         }
     }
-    if (open) ray_pool_want((void*)((p0 + run) << 12), (pages - run) << 12);
+    if (open && runs) runs[nr++] = (col_want_run_t){ (p0 + run) << 12, (pages - run) << 12 };
     ray_free_raw(mark);
+    if (!runs) return;
+    /* Many short runs — a sparse sample of a large column, a page apiece —
+     * are requested over the pool's threads, a task per 256 of them
+     * (ray_pool_dispatch_n: the plain dispatch cuts at 8,192 elements, and
+     * thousands of runs would stay on one task): one request costs a few
+     * microseconds of the kernel's, and 30,000 of them on this thread
+     * 100 ms.  Few, or long, each through ray_pool_want, which splits a
+     * long range over the threads itself. */
+    enum { RUNS_PER_TASK = 256 };
+    ray_pool_t* pool = ray_pool_get();
+    if (nr >= 2 * RUNS_PER_TASK && ray_pool_par_dispatch_ok(pool, (int64_t)nr, 2 * RUNS_PER_TASK)) {
+        size_t tasks = (nr + RUNS_PER_TASK - 1) / RUNS_PER_TASK;
+        if (tasks > RAY_POOL_INIT_TASKS) tasks = RAY_POOL_INIT_TASKS;
+        col_want_ctx_t ctx = { runs, nr, (nr + tasks - 1) / tasks };
+        ray_pool_dispatch_n(pool, col_want_runs_fn, &ctx, (uint32_t)tasks);
+    } else {
+        for (size_t i = 0; i < nr; i++) ray_pool_want((void*)runs[i].a, runs[i].bytes);
+    }
+    ray_free_raw(runs);
 }
 
 ray_t* ray_col_mmap_splayed_dom(const char* path, struct ray_sym_domain_s* dom) {

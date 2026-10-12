@@ -219,6 +219,75 @@ bool agg_dense_plan(ray_t** key_cols, uint32_t n_keys,
                     const agg_vtable_t** vts, uint32_t n_aggs,
                     int64_t nrows, dense_plan_t* out);
 
+/* Cardinality estimates for a planner choosing between strategies before
+ * any grouping runs (try_count_distinct_v2_rewrite), from one strided
+ * sample of 32,768 rows over `cols` (every row below that) — over the
+ * `nrows` row indices of `rows` when that is given (a selection's
+ * survivors), else over rows 0..nrows.  When `rows` is itself a sample of
+ * a larger population (the survivors of a predicate run over sampled rows),
+ * `population` is that population's size — the estimates and the caps
+ * scale to it — else 0.  A column's
+ * distinct values in the sample are raised by the Chao1 estimator from the
+ * values seen once and twice, so a key the sample cannot exhaust — a
+ * million values, or one value on most rows and a million on the rest — is
+ * estimated near its size, while a key of 45 values stays 45.  The
+ * estimate is capped at the span of the sampled values — the codes of a
+ * SYM key, fixed once interned, where the process-wide domain's count
+ * would move the estimate with every symbol interned afterwards.
+ * col_est[k] (when given) receives column k's estimate;
+ * prefix_est the estimate for the tuple of the first n_prefix columns (the
+ * groups a composite key forms, which the product of its columns' estimates
+ * overstates when one column follows from another); prefix_max the rows of
+ * the largest such group (its share of the sample over the input: a
+ * per-group pass is serial over it); all_est the estimate
+ * for the tuple of all n columns (the tuples a (key, value) grouping would
+ * keep).  A tuple is capped at the product of its columns' caps and at
+ * nrows; a sorted prefix, which a stride reads as all distinct, is read
+ * through blocks of adjacent rows as well.  Estimates, never bounds: a
+ * planner weighs them against thresholds with slack.  false — with the
+ * outputs unset — when a column is not a dense key type (integer, temporal,
+ * SYM), n is 0 or above 16, the input is empty, or memory runs out. */
+bool agg_group_card_sample(ray_t** cols, uint32_t n, uint32_t n_prefix,
+                           const int64_t* rows, int64_t nrows, int64_t population,
+                           int64_t* col_est, int64_t* prefix_est, int64_t* prefix_max,
+                           int64_t* all_est);
+
+/* The rows the estimator samples (every row below that). */
+#define AGG_EST_SAMPLE_ROWS (1 << 15)
+
+/* The row the estimator samples from window i of the `sample` equal ones
+ * the rows are cut into (nrows / sample rows each, fractional): an offset
+ * into the window hashed from i by the splitmix64 finaliser.  A fixed
+ * offset reads a key whose period divides the stride — five values
+ * cycling under a stride of 305 — as one value.  An offset nearly linear
+ * in i, the high bits of i times the golden ratio, keeps the sampled rows
+ * an arithmetic progression and a key with a period near the stride at a
+ * nearly fixed phase: a composite of (% i 1000) and (% i 1009) at 10 M
+ * rows read as ten million tuples under it, one of 1000 and 1013 as a
+ * tenth of its groups.  The finaliser's offsets make the collisions those
+ * of a random sample.  Shared with a planner sampling rows for a predicate
+ * (query.c). */
+static inline int64_t agg_est_sample_row(int64_t i, int64_t sample, int64_t nrows) {
+    /* window i of `sample` equal ones over the rows, [lo, hi): a whole
+     * stride would leave the rows past sample * (nrows / sample) unread,
+     * the last fifth of 41,943 rows under a sample of 32,768 */
+    const int64_t lo = (int64_t)((double)i * (double)nrows / (double)sample);
+    int64_t hi = (int64_t)((double)(i + 1) * (double)nrows / (double)sample);
+    if (hi > nrows) hi = nrows;
+    const int64_t w = hi - lo;
+    if (w <= 1) return lo;
+    uint64_t h = (uint64_t)i * 0x9E3779B97F4A7C15ULL;
+    h = (h ^ (h >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    h = (h ^ (h >> 27)) * 0x94D049BB133111EBULL;
+    h ^= h >> 31;
+    return lo + (int64_t)(h % (uint64_t)w);
+}
+
+/* The product of the per-key estimates above for key_cols: the packed key
+ * space a direct-index grouping would hold.  -1 when a key is not a dense
+ * key type, the input is empty, or the product overflows. */
+int64_t agg_group_card_estimate(ray_t** key_cols, uint32_t n_keys, int64_t nrows);
+
 /* Result column name for a plain-column-input aggregate: input column name
  * (ray_sym_str of in_sym) + per-op suffix (_sum/_count/_mean/_min/_max/...),
  * interned.  Falls back to in_sym on buffer overflow.  Behavior-identical to

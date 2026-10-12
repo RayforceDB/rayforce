@@ -4519,15 +4519,18 @@ bool ght_compute_layout(ght_layout_t* out, uint32_t n_keys, uint32_t n_aggs,
             }
         }
         /* Packed-tuple eligibility: every key is a plain fixed-width integer
-         * lane.  This is a WHITELIST of exactly the types read_col_i64
-         * decodes deliberately, not a `!= RAY_F64` blacklist: read_col_i64's
+         * lane.  This is a WHITELIST of exactly the integer types
+         * read_col_i64 decodes, not a `!= RAY_F64` blacklist: read_col_i64's
          * `default` arm reads ONE BYTE, so an un-enumerated fixed-width type
-         * (RAY_F32 is the live example) would be silently mis-loaded, and a
-         * packed layout would then hash those wrong bits as the key identity.
-         * F64 is excluded by the same rule (read_col_i64 does not decode it),
-         * which additionally keeps the packed lanes clear of the -0.0
-         * canonicalisation the F64 key builders apply (group_key_f64_bits,
-         * #407) — see ght_layout_t.packed_key.
+         * would be silently mis-loaded, and a packed layout would then hash
+         * those wrong bits as the key identity.  F64 is excluded because
+         * read_col_i64 does not decode it, which additionally keeps the
+         * packed lanes clear of the -0.0 canonicalisation the F64 key
+         * builders apply (group_key_f64_bits, #407) — see
+         * ght_layout_t.packed_key.  F32 stays off the list for the same
+         * reason: read_col_i64 does decode it (since #760, canonicalising
+         * -0.0 at the read), so the generic builders below group it
+         * correctly, but a packed region is meant to be raw bit identity.
          * GUID/STR are excluded by any_wide_key.  n_keys == 0 is not a
          * tuple. */
         if (n_keys >= 1 && !out->any_wide_key) {
@@ -11195,8 +11198,22 @@ static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             ok = false; break;   /* user column shadows the synthetic name */
         }
         ray_expr_t ex;
-        if (!expr_compile(g, tbl, in, &ex)) { ok = false; break; }
-        ray_t* v = expr_eval_full(&ex, nrows);
+        ray_t* v;
+        if (expr_compile(g, tbl, in, &ex)) {
+            v = expr_eval_full(&ex, nrows);
+        } else {
+            /* An input the element-wise compiler declines — an `if`, say:
+             * `(sum (if (== st 'bad) 1 0))` used to drop the whole group onto
+             * the legacy path, 6x slower under a WHERE selection (#756).  The
+             * DAG executor materializes it row-wise over the whole table; the
+             * selection is cleared around the call so the vector comes back
+             * at full length (the final gather only compacts tables, but the
+             * node's own paths need not see the selection). */
+            ray_t* saved_sel = g->selection;
+            g->selection = NULL;
+            v = ray_execute(g, in);
+            g->selection = saved_sel;
+        }
         if (!v || RAY_IS_ERR(v) || !ray_is_vec(v) || v->len != nrows) {
             if (v && !RAY_IS_ERR(v)) ray_release(v);
             else if (v) ray_release(v);

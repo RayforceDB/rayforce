@@ -1,0 +1,30 @@
+;; #760 — an F32 group key read through the shared column reader
+;; (read_col_i64) fell to that reader's one-byte default arm: the parallel
+;; group hash table hashed and stored one byte of each key, so a multi-core
+;; group by an F32 key over more than a morsel of rows (65 536) emitted
+;; garbage keys and split or merged groups — on a plain count, on a distinct
+;; count beside the key, and for a composite key with an F32 member.  The
+;; reader now decodes the 4-byte lane, with -0.0 canonicalised to +0.0 as the
+;; F64 key readers do.
+(set N 100000)
+(set T (select {from: (table [p s x] (list (as 'F64 (% (til N) 10)) (take ['a 'b] N) (til N))) p: (as 'F32 p) s: s x: x}))
+(set R (select {from: T by: p c: (count x) asc: p}))
+(count R) -- 10
+(at R 'p) -- (as 'F64 (til 10))
+(at R 'c) -- (take [10000] 10)
+(set Rd (select {from: T by: p n: (count (distinct x)) asc: p}))
+(at Rd 'p) -- (as 'F64 (til 10))
+(at Rd 'n) -- (take [10000] 10)
+(set Rc (select {from: T by: [p s] c: (count x) n: (count (distinct x)) asc: [p s]}))
+(count Rc) -- 10
+(at Rc 'p) -- (as 'F64 (til 10))
+(at Rc 's) -- (take ['a 'b] 10)
+(at Rc 'c) -- (take [10000] 10)
+(at Rc 'n) -- (take [10000] 10)
+(at (select {from: T by: [s p] c: (count x) asc: [s p]}) 'p) -- (as 'F64 [0 2 4 6 8 1 3 5 7 9])
+;; -0.0 and +0.0 are one group on the parallel path too, and a null key its own
+(set Z (select {from: (table [z s x] (list (as 'F64 (% (til N) 4)) (take ['a 'b] N) (til N))) z: (as 'F32 (* (if (== z 1.0) -1.0 1.0) (if (< z 2.0) 0.0 z))) s: s x: x}))
+(at (select {from: Z by: z c: (count x) asc: z}) 'c) -- [50000 25000 25000]
+(at (select {from: Z by: [z s] c: (count x) n: (count (distinct x)) asc: [z s]}) 'n) -- [25000 25000 25000 25000]
+(set Q (select {from: (table [z x] (list (as 'F64 (% (til N) 3)) (til N))) z: (as 'F32 (if (== z 0.0) 0Nf z)) x: x}))
+(at (select {from: Q by: z c: (count x) asc: z}) 'c) -- [33334 33333 33333]

@@ -159,6 +159,10 @@ void  ray_vm_advise_seq(void* ptr, size_t size);
 /* Ask the kernel to start reading [ptr, ptr+size) of a file mapping now,
  * asynchronously, so a later access finds it resident.  Best effort. */
 void  ray_vm_advise_willneed(void* ptr, size_t size);
+/* Bytes asked for so far by ray_vm_advise_willneed, process-wide: the
+ * pool's trace summary, and tests of readers that must ask before they
+ * read a mapped column they sample. */
+uint64_t ray_vm_willneed_bytes(void);
 /* Start writing back bytes [off, off+len) of open file `fd` without waiting
  * (Linux sync_file_range WRITE; a no-op elsewhere): a later fsync then
  * finds them on disk. */
