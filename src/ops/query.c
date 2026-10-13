@@ -348,6 +348,23 @@ static bool dag_arith_rejects_sym(const char* fname, size_t fname_len,
     return arith && (lt == RAY_SYM || rt == RAY_SYM);
 }
 
+/* The value type of a DAG operand.  A partitioned table's key scans as
+ * the RAY_MAPCOMMON wrapper, which names no value type: the plan-time type
+ * guards below matched none of their cases on it, so `(+ date 1)` over a
+ * DATE partition key ran as raw integer arithmetic and came back as I32
+ * day counts (8768, not 2024.01.03), `(in (+ date 0) [2024.01.02])` then
+ * compared I32 cells against a DATE set and matched nothing, and
+ * `(+ sym_key 1)` added interned ids.  The key vector carries the type. */
+static int8_t dag_operand_type(ray_graph_t* g, ray_op_t* x) {
+    if (x->out_type != RAY_MAPCOMMON || x->opcode != OP_SCAN || !g->table)
+        return x->out_type;
+    ray_op_ext_t* ext = find_ext(g, x->id);
+    ray_t* col = ext ? ray_table_get_col(g->table, ext->sym) : NULL;
+    if (!col || col->type != RAY_MAPCOMMON || col->len < 1) return x->out_type;
+    ray_t* keys = ((ray_t**)ray_data(col))[0];
+    return keys ? keys->type : x->out_type;
+}
+
 static bool dag_temporal_arith_needs_eval(const char* name, size_t len,
                                           int8_t left_type, int8_t right_type) {
     if (!dag_type_is_temporal(left_type) && !dag_type_is_temporal(right_type))
@@ -2176,27 +2193,25 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
                     (!dag_bool_operand_ok(g, left, ctor == ray_and) ||
                      !dag_bool_operand_ok(g, right, ctor == ray_and)))
                     return NULL;
-                if (dag_temporal_arith_needs_eval(fname, fname_len,
-                                                  left->out_type,
-                                                  right->out_type))
+                int8_t lvt = dag_operand_type(g, left);
+                int8_t rvt = dag_operand_type(g, right);
+                if (dag_temporal_arith_needs_eval(fname, fname_len, lvt, rvt))
                     return NULL;
                 if (g->if_arm_depth == 0 &&
-                    dag_arith_rejects_sym(fname, fname_len,
-                                          left->out_type, right->out_type)) {
+                    dag_arith_rejects_sym(fname, fname_len, lvt, rvt)) {
                     if (!g->compile_err)
                         g->compile_err = ray_error("type", "cannot %s %s and %s",
                             dag_arith_verb(fname, fname_len),
-                            ray_type_name((int8_t)-left->out_type),
-                            ray_type_name((int8_t)-right->out_type));
+                            ray_type_name((int8_t)-lvt),
+                            ray_type_name((int8_t)-rvt));
                     return NULL;
                 }
                 if (g->if_arm_depth == 0 &&
-                    dag_cmp_rejects_temporal_float(fname, fname_len,
-                                                   left->out_type, right->out_type)) {
+                    dag_cmp_rejects_temporal_float(fname, fname_len, lvt, rvt)) {
                     if (!g->compile_err)
                         g->compile_err = ray_error("type", "cannot compare %s and %s",
-                            ray_type_name((int8_t)-left->out_type),
-                            ray_type_name((int8_t)-right->out_type));
+                            ray_type_name((int8_t)-lvt),
+                            ray_type_name((int8_t)-rvt));
                     return NULL;
                 }
                 if (fname_len == 3 && memcmp(fname, "pow", 3) == 0 &&
@@ -3146,14 +3161,56 @@ static ray_t* select_eval_over_table(ray_t* expr, ray_t* tbl) {
     return v;
 }
 
+static bool table_has_parted_columns(ray_t* tbl);
+static ray_t* query_materialize_parted_col(ray_t* col);
+static int collect_col_refs_set(ray_t* expr, ray_t* tbl,
+                                int64_t* out_syms, int max_out, int n);
+
+/* `tbl` with the parted / MAPCOMMON columns `expr` names flattened, every
+ * other column shared as it is.  The evaluator's verbs take a segmented
+ * column only in part (a comparison does, arithmetic does not: `(+ date 1)`
+ * over the partition key raised `cannot add ? and i64`), so a where: the
+ * DAG declines is evaluated over plain vectors.  Owned, or an error. */
+static ray_t* parted_flatten_expr_cols(ray_t* expr, ray_t* tbl) {
+    int64_t refs[256];
+    int nref = collect_col_refs_set(expr, tbl, refs, 256, 0);
+    int64_t nc = ray_table_ncols(tbl);
+    ray_t* out = ray_table_new(nc);
+    for (int64_t c = 0; c < nc && out && !RAY_IS_ERR(out); c++) {
+        int64_t cn = ray_table_col_name(tbl, c);
+        ray_t* col = ray_table_get_col_idx(tbl, c);
+        if (!col) continue;
+        bool want = false;
+        for (int r = 0; r < nref; r++) want |= refs[r] == cn;
+        if (!want || (!RAY_IS_PARTED(col->type) && col->type != RAY_MAPCOMMON)) {
+            out = ray_table_add_col(out, cn, col);
+            continue;
+        }
+        ray_t* v = query_materialize_parted_col(col);
+        if (!v || RAY_IS_ERR(v)) { ray_release(out); return v ? v : ray_error("oom", NULL); }
+        out = ray_table_add_col(out, cn, v);
+        ray_release(v);
+    }
+    return out ? out : ray_error("oom", NULL);
+}
+
 static ray_t* eval_where_mask(ray_t* where_expr, ray_t* tbl, const char* label) {
-    if (ray_env_push_query_scope() != RAY_OK) return ray_error("oom", NULL);
-    ray_t* _aqt = bind_all_columns(tbl);
-    ray_t* mask = eval_query_expr(where_expr, tbl);
+    ray_t* etbl = tbl;
+    if (table_has_parted_columns(tbl)) {
+        etbl = parted_flatten_expr_cols(where_expr, tbl);
+        if (!etbl || RAY_IS_ERR(etbl)) return etbl ? etbl : ray_error("oom", NULL);
+    }
+    if (ray_env_push_query_scope() != RAY_OK) {
+        if (etbl != tbl) ray_release(etbl);
+        return ray_error("oom", NULL);
+    }
+    ray_t* _aqt = bind_all_columns(etbl);
+    ray_t* mask = eval_query_expr(where_expr, etbl);
     if (mask && !RAY_IS_ERR(mask))
         mask = ray_lazy_materialize(mask);
     g_active_query_table = _aqt;
     ray_env_pop_scope();
+    if (etbl != tbl) ray_release(etbl);
 
     if (!mask)
         return ray_error("domain", "%s: WHERE predicate evaluation failed", label);
@@ -3551,14 +3608,16 @@ static ray_t* select_fallback_passthrough_col(ray_t* expr, ray_t* tbl, int64_t n
 }
 
 /* True when a projection's TOP-LEVEL call is a "whole-column verb": a
- * collection builtin (distinct, asc, desc, reverse, enlist) that
+ * collection builtin (distinct, asc, desc, reverse, where, enlist) that
  * consumes an entire column vector and returns a vector.  The DAG compiler
  * has no bucket for these — they are neither element-wise ops nor
  * scalar-reducing aggregations — so `compile_expr_dag` returns NULL and the
  * projection lands in the eval fallback.  There the default per-row scatter
  * feeds the verb one scalar cell at a time: `distinct` errors ("argument must
- * be a list") and `asc`/`desc`/`reverse` silently return the column untouched
- * (reordering a 1-element slice is a no-op).  Both are wrong; such a
+ * be a list"), `where` errors (it takes a B8 vector, and got one b8 cell:
+ * `(count (where (> i 2)))` never counted anything) and `asc`/`desc`/`reverse`
+ * silently return the column untouched (reordering a 1-element slice is a
+ * no-op).  All are wrong; such a
  * projection must instead be evaluated once against the full column
  * (see eval_expr_whole_column).  Matched on the top-level head only —
  * a whole-column verb nested under an element-wise op has ambiguous length
@@ -3621,6 +3680,7 @@ static int is_whole_column_projection(ray_t* expr, ray_t* tbl) {
     }
     return (l == 8 && memcmp(p, "distinct", 8) == 0) ||
            (l == 7 && memcmp(p, "reverse", 7) == 0) ||
+           (l == 5 && memcmp(p, "where", 5) == 0) ||
            (l == 3 && memcmp(p, "asc", 3) == 0) ||
            (l == 4 && memcmp(p, "desc", 4) == 0);
 }

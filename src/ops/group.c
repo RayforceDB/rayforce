@@ -16616,6 +16616,7 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
              * this batch).  The reference partition is never skipped, so the
              * bp[ref_bi] type lookups below always resolve. */
             int64_t sel_off = 0, sel_len = 0, sel_lo = 0, sel_cnt = -1;
+            int32_t src_p = p;   /* the partition whose segments are read */
             if (saved_sel) {
                 sel_off = part_off[p];
                 sel_len = part_off[p + 1] - sel_off;
@@ -16626,6 +16627,19 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                 if (sel_cnt == 0 && (running || ref_bi >= 0)) {
                     bp[bi] = NULL;
                     continue;
+                }
+                /* A whole-table aggregate answers one row whatever the
+                 * where: keeps, and that row comes from the reference
+                 * partial.  Over a partition holding no rows the sub-group
+                 * answers none (a 0-row input has no row to aggregate), so
+                 * when every partition's survivors are skipped the select
+                 * came back empty.  Read the reference from a partition
+                 * that has rows, under an empty selection: the same
+                 * columns, no survivors, the one row of the empty answer. */
+                if (sel_cnt == 0 && n_keys == 0 && sel_len == 0) {
+                    for (int32_t q = 0; q < n_parts; q++)
+                        if (part_off[q + 1] > part_off[q]) { src_p = q; break; }
+                    sel_len = part_off[src_p + 1] - part_off[src_p];
                 }
             }
 
@@ -16649,7 +16663,7 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                 if (!pcol || !RAY_IS_PARTED(pcol->type)) {
                     ray_release(sub); goto batch_fail;
                 }
-                ray_t* seg = ((ray_t**)ray_data(pcol))[p];
+                ray_t* seg = ((ray_t**)ray_data(pcol))[src_p];
                 if (!seg) { ray_release(sub); goto batch_fail; }
                 if (part_nrows < 0) part_nrows = seg->len;
                 ray_retain(seg);
@@ -17075,15 +17089,17 @@ batch_fail:
                     const double* sv = (const double*)ray_data(sum_col);
                     const int64_t* cv = (const int64_t*)ray_data(cnt_col);
                     for (int64_t r = 0; r < nrows; r++)
-                        out[r] = cv[r] > 0 ? ray_f64_fin(sv[r] / (double)cv[r]) : 0.0;
+                        out[r] = cv[r] > 0 ? ray_f64_fin(sv[r] / (double)cv[r]) : NULL_F64;
                 } else {
                     const int64_t* sv = (const int64_t*)ray_data(sum_col);
                     const int64_t* cv = (const int64_t*)ray_data(cnt_col);
                     for (int64_t r = 0; r < nrows; r++)
-                        out[r] = cv[r] > 0 ? ray_f64_fin((double)sv[r] / (double)cv[r]) : 0.0;
+                        out[r] = cv[r] > 0 ? ray_f64_fin((double)sv[r] / (double)cv[r]) : NULL_F64;
                 }
                 /* Single-null float model: flip HAS_NULLS for any avg
-                 * canonicalized to NULL_F64 (overflow). */
+                 * canonicalized to NULL_F64 (overflow), and for the avg
+                 * of no rows -- a whole-table aggregate whose where: kept
+                 * none -- which is null, as over a flat table (was 0.0). */
                 grp_finalize_nulls(avg_col);
                 trimmed = ray_table_add_col(trimmed, nm, avg_col);
                 ray_release(avg_col);

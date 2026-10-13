@@ -27,4 +27,48 @@
 (at (select {str: str x: (+ d 1) from: P}) 'str) -- (list "a" "" "ccc" "dd" "a" "" "ccc" "dd")
 ;; with a where: clause
 (at (select {i: i x: (+ d 1) from: P where: (> i 2)}) 'i) -- [3 4 3 4]
+
+;; ─── arithmetic on the partition key itself ─────────────────────────────────
+;; The key scans as the MAPCOMMON wrapper, which named no value type to the
+;; planner's type guards: `(+ date 1)` ran as raw integer arithmetic and came
+;; back as day counts (8768, not 2024.01.03), `(in (+ date 0) [..])` compared
+;; those against a DATE set and kept no row, and the arithmetic on a SYM key
+;; added to interned ids.  Oracle: the same select over a flat copy.
+(set F (select {from: P where: (> i 0)}))
+(at (select {i: i from: P where: (in (+ date 0) [2024.01.02])}) 'i) -- [1 2 3 4]
+(at (select {i: i from: P where: (in (+ date 0) [2024.01.02])}) 'i) -- (at (select {i: i from: F where: (in (+ date 0) [2024.01.02])}) 'i)
+(at (select {i: i from: P where: (in (+ date 1) [2024.01.02])}) 'i) -- [1 2 3 4]
+(at (select {i: i from: P where: (not (in (- date 1) [2023.12.31]))}) 'i) -- [1 2 3 4]
+(at (select {i: i from: P where: (and (> i 2) (in (+ date 0) [2024.01.01]))}) 'i) -- [3 4]
+(count (select {i: i from: P where: (in (+ date 0) [2024.01.05])})) -- 0
+(at (select {c: (count i) from: P where: (in (+ date 0) [2024.01.02])}) 'c) -- [4]
+(type (at (select {c: (count i) by: {m: (+ date 1)} from: P}) 'm)) -- 'DATE
+(at (select {c: (count i) by: {m: (+ date 1)} from: P}) 'm) -- [2024.01.02 2024.01.03]
+(at (select {c: (count i) by: {m: (+ date 1)} from: P}) 'm) -- (at (select {c: (count i) by: {m: (+ date 1)} from: F}) 'm)
+(at (select {c: (count i) by: {m: (+ date 1)} from: P where: (> i 2)}) 'c) -- [2 2]
+(at (select {c: (count i) by: {m: (- date 1) n: name} from: P where: (> i 3)}) 'm) -- [2023.12.31 2024.01.01]
+(at (select {x: (+ date 1) from: P}) 'x) -- (at (select {x: (+ date 1) from: F}) 'x)
+(at (select {m: (max (+ date 1)) from: P}) 'm) -- [2024.01.03]
 (.sys.exec "rm -rf /tmp/rfl_evalfb_parted")
+
+;; An integer key keeps its I64 lane; a partition with no rows takes part.
+(.sys.exec "rm -rf /tmp/rfl_evalfb_parted_int")
+(.db.splayed.set "/tmp/rfl_evalfb_parted_int/1/t/" (table [i] (list [1 2])))
+(.db.splayed.set "/tmp/rfl_evalfb_parted_int/2/t/" (table [i] (list (take [1] 0))))
+(.db.splayed.set "/tmp/rfl_evalfb_parted_int/3/t/" (table [i] (list [3 4 5])))
+(set PI (.db.parted.get "/tmp/rfl_evalfb_parted_int/" 't))
+(at (select {i: i from: PI where: (in (+ part 0) [3])}) 'i) -- [3 4 5]
+(at (select {i: i from: PI where: (in (* part 2) [2])}) 'i) -- [1 2]
+(at (select {c: (count i) by: {m: (+ part 1)} from: PI}) 'm) -- [2 4]
+(type (at (select {c: (count i) by: {m: (+ part 1)} from: PI}) 'm)) -- 'I64
+(.sys.exec "rm -rf /tmp/rfl_evalfb_parted_int")
+
+;; A SYM key has no arithmetic, as over a flat SYM column.
+(.sys.exec "rm -rf /tmp/rfl_evalfb_parted_sym")
+(.db.splayed.set "/tmp/rfl_evalfb_parted_sym/1.2.3/t/" (table [i] (list [1 2])))
+(.db.splayed.set "/tmp/rfl_evalfb_parted_sym/4.5.6/t/" (table [i] (list [3])))
+(set PS (.db.parted.get "/tmp/rfl_evalfb_parted_sym/" 't))
+(select {x: (+ part 1) from: PS}) !- type
+(select {i: i from: PS where: (in (+ part 1) [2])}) !- type
+(select {c: (count i) by: {m: (+ part 1)} from: PS}) !- type
+(.sys.exec "rm -rf /tmp/rfl_evalfb_parted_sym")

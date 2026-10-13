@@ -1,4 +1,4 @@
-;; Whole-column verbs (distinct / asc / desc / reverse) as SELECT projections.
+;; Whole-column verbs (distinct / asc / desc / reverse / where) as SELECT projections.
 ;;
 ;; These builtins consume an entire column and return a vector; the DAG has no
 ;; bucket for them, so the projection lands in the eval fallback.  Previously the
@@ -32,6 +32,20 @@
 
 ;; ── SYM column distinct (first-occurrence order) ────────────────────────────
 (at (select {d: (distinct d) from: (table [d] (list ['zebra 'apple 'mango 'apple]))}) 'd) -- ['zebra 'apple 'mango]
+
+;; ── where: the indices of the true rows, over the whole column ──────────────
+;;   Scattered per row it was handed one b8 cell, and failed with "where:
+;;   argument must be a b8 vector, got b8".  A null compares false, as the
+;;   where: clause drops it.
+(set TW (table [i j] (list [1 0Nl 3 4] [5 6 7 8])))
+(at (select {w: (where (> i 2)) from: TW}) 'w) -- (where (> [1 0Nl 3 4] 2))
+(at (select {w: (where (> i 2)) from: TW}) 'w) -- [2 3]
+(at (select {c: (count (where (> i 2))) from: TW}) 'c) -- [2]
+(first (at (select {c: (count (where (> i 2))) from: TW}) 'c)) -- (count (select {from: TW where: (> i 2)}))
+(at (select {c: (count (where (> i 2))) from: TW where: (> j 5)}) 'c) -- [2]
+(at (select {c: (first (where (> i 2))) from: TW}) 'c) -- [2]
+(select {w: (where (> i 2)) j: j from: TW}) !- length
+(where true) !- type
 
 ;; ── ragged result rejected: a length-changing column beside a full column ────
 (select {a: (distinct v) b: v from: T}) !- length

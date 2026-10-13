@@ -157,5 +157,45 @@
 (at RPd6 'cv) -- [400 400]
 (count (select {cv: (count v) by: part from: Pw where: (> u 5000)})) -- 0
 
+;; ══════════════════════════════════════════════════════════════════════════
+;; (e) NO KEY AT ALL — a whole-table aggregate answers one row whatever the
+;;     where: keeps (the aggregates of no rows), as over a flat table.  The
+;;     row comes from the reference partition; when that partition held no
+;;     rows its sub-group answered none, every later zero-survivor partition
+;;     was skipped, and the select came back with 0 rows.  The avg of no rows
+;;     is null (the merge divided by a zero count to 0.0).
+;; ══════════════════════════════════════════════════════════════════════════
+(set Re1 (select {c: (count v) s: (sum u) a: (avg v) mn: (min u) from: Pw where: (> u 5000)}))
+(set Fe1 (select {c: (count v) s: (sum u) a: (avg v) mn: (min u) from: TF where: (> u 5000)}))
+(count Re1) -- 1
+(at Re1 'c)  -- (at Fe1 'c)
+(at Re1 's)  -- (at Fe1 's)
+(at Re1 'a)  -- [0Nf]
+(at Re1 'a)  -- (at Fe1 'a)
+(at Re1 'mn) -- (at Fe1 'mn)
+
+;; empty partitions first and last, rows only in the middle one
+(.sys.exec "rm -rf /tmp/rfl_pgwh_e")
+(.db.splayed.set "/tmp/rfl_pgwh_e/2024.01.01/t/" (table [a b] (list (take [1] 0) (take [1] 0))))
+(.db.splayed.set "/tmp/rfl_pgwh_e/2024.01.02/t/" (table [a b] (list [4 5] [40 50])))
+(.db.splayed.set "/tmp/rfl_pgwh_e/2024.01.03/t/" (table [a b] (list (take [1] 0) (take [1] 0))))
+(set Pe (.db.parted.get "/tmp/rfl_pgwh_e/" 't))
+(set Fe (table [a b] (list [4 5] [40 50])))
+(set Be2 (at (.sys.mem) 'group-perpart-runs))
+(set Re2 (select {c: (count a) s: (sum b) from: Pe where: (> a 40)}))
+(> (at (.sys.mem) 'group-perpart-runs) Be2) -- true
+(count Re2) -- 1
+(at Re2 'c) -- [0]
+(at Re2 's) -- [0]
+(at Re2 'c) -- (at (select {c: (count a) s: (sum b) from: Fe where: (> a 40)}) 'c)
+(at (select {c: (count a) from: Pe where: (> a 40)}) 'c) -- [0]
+(at (select {mx: (max b) a: (avg b) from: Pe where: (> a 40)}) 'mx) -- [0Nl]
+(at (select {mx: (max b) a: (avg b) from: Pe where: (> a 40)}) 'a) -- [0Nf]
+(at (select {c: (count a) s: (sum b) from: Pe where: (> a 4)}) 's) -- [50]
+(at (select {c: (count a) s: (sum b) from: Pe}) 'c) -- [2]
+;; keyed, the same where: keeps no group
+(count (select {c: (count a) by: date from: Pe where: (> a 40)})) -- 0
+(.sys.exec "rm -rf /tmp/rfl_pgwh_e")
+
 ;; ─── cleanup ─────────────────────────────────────────────────────────────────
 (.sys.exec "rm -rf /tmp/rfl_pgwh")
