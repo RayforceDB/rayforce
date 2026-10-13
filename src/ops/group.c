@@ -6728,14 +6728,24 @@ static int topn_part_gid_cmp(const void* a, const void* b) {
  * rank it above every value), so it is ranked as the null instead: INT64_MIN,
  * below every value, i.e. last under desc: and first under asc:, where the
  * stable sort puts nulls (#808).  INT64_MIN is the I64 null itself, never a
- * value, and narrower types widen into the slot above it. */
+ * value, and narrower types widen into the slot above it.
+ *
+ * `bias` is the constant of an affine SUM (`(sum (+ x c))` aggregates x and
+ * phase 3 adds c * count, wrapping as the I64 sum does), else 0: the group
+ * is ranked by that final value, not by the column's sum (#813). */
 static inline int64_t topn_group_push(group_topn_item_t* h, int64_t hn,
                                       int64_t k, uint8_t desc_dir,
                                       const group_ht_t* ph, uint16_t order_off,
-                                      uint16_t nn_off, uint32_t p, uint32_t gi) {
+                                      uint16_t nn_off, int64_t bias,
+                                      uint32_t p, uint32_t gi) {
     const char* row = ph->rows + (size_t)gi * ph->layout.row_stride;
     int64_t v, first;
     memcpy(&v, row + order_off, 8);
+    if (bias) {
+        int64_t cnt;
+        memcpy(&cnt, row, 8);
+        v = wrap_add_i64(v, wrap_mul_i64(bias, cnt));
+    }
     if (nn_off) {
         int64_t nn;
         memcpy(&nn, row + nn_off, 8);
@@ -6758,6 +6768,7 @@ typedef struct {
     uint32_t*          item_cnt;   /* [n_parts] survivors produced */
     uint16_t           order_off;  /* in-row byte offset of the ordering agg */
     uint16_t           nn_off;     /* its non-null count, 0 = never null */
+    int64_t            bias;       /* affine SUM constant, 0 = none */
     uint8_t            desc_dir;
 } topn_scan_ctx_t;
 
@@ -6774,7 +6785,7 @@ static void topn_scan_fn(void* vctx, uint32_t worker_id, int64_t start,
         int64_t hn = 0;
         for (uint32_t gi = 0; gi < gc; gi++)
             hn = topn_group_push(h, hn, cap, c->desc_dir, ph, c->order_off,
-                                 c->nn_off, p, gi);
+                                 c->nn_off, c->bias, p, gi);
         c->item_cnt[p] = (uint32_t)hn;
     }
 }
@@ -6799,6 +6810,7 @@ typedef struct {
     uint32_t           cap;       /* per-partition capacity = k_take */
     uint16_t           order_off; /* in-row byte offset of the ordering agg */
     uint16_t           nn_off;    /* its non-null count, 0 = never null */
+    int64_t            bias;      /* affine SUM constant, 0 = none */
     uint8_t            desc_dir;
 } topn_fuse_t;
 
@@ -6810,7 +6822,7 @@ static inline void topn_fuse_partition(const topn_fuse_t* f, group_ht_t* ph,
     int64_t hn = 0;
     for (uint32_t gi = 0; gi < gc; gi++)
         hn = topn_group_push(h, hn, cap, f->desc_dir, ph, f->order_off,
-                             f->nn_off, p, gi);
+                             f->nn_off, f->bias, p, gi);
     f->item_cnt[p] = (uint32_t)hn;
 }
 
@@ -17315,6 +17327,7 @@ ht_path:;
      * topn_compact_skip` did before. */
     uint16_t topn_order_off = 0;   /* default: COUNT at row + 0 */
     uint16_t topn_nn_off    = 0;   /* non-null count of a nullable MIN/MAX */
+    int64_t  topn_bias      = 0;   /* affine SUM constant (#813) */
     uint8_t  topn_desc_dir  = 0;
     bool     topn_order_ok  = false;
     if (use_topn_filter) {
@@ -17332,6 +17345,11 @@ ht_path:;
             if (agg_slot < 0 || order_is_f64) topn_order_ok = false;
             else topn_order_off = (uint16_t)(ght_layout.off_sum
                                              + (uint16_t)agg_slot * 8u);
+            /* `(sum (+ x c))` aggregates x; phase 3 adds c * count.  An
+             * integer slot's affine constant is always integral (a
+             * fractional one declines the rewrite, try_affine_sumavg_input),
+             * so the heap folds bias_i64 in exactly as the emit does. */
+            if (agg_affine[ai].enabled) topn_bias = agg_affine[ai].bias_i64;
         } else if (order_op == OP_MIN) {
             if (agg_slot < 0 || order_is_f64
                 || (ght_layout.agg_flags[ai] & GHT_AF_SYM)) topn_order_ok = false;
@@ -17393,6 +17411,7 @@ ht_path:;
                 topn_fuse.cap       = (uint32_t)kt;
                 topn_fuse.order_off = topn_order_off;
                 topn_fuse.nn_off    = topn_nn_off;
+                topn_fuse.bias      = topn_bias;
                 topn_fuse.desc_dir  = topn_desc_dir;
             } else if (fcnt) {
                 scratch_free(topn_fuse_cnt_hdr);
@@ -17859,7 +17878,8 @@ v2_emit:;
                                 .part_hts = part_hts, .items = items_w,
                                 .item_off = off_w, .item_cnt = cnt_w,
                                 .order_off = order_off,
-                                .nn_off = topn_nn_off, .desc_dir = desc_dir,
+                                .nn_off = topn_nn_off, .bias = topn_bias,
+                                .desc_dir = desc_dir,
                             };
                             ray_pool_dispatch_n(pool, topn_scan_fn, &sctx,
                                                 radix_n_parts);
@@ -17906,7 +17926,7 @@ v2_emit:;
                         for (uint32_t gi = 0; gi < gc; gi++)
                             hn = topn_group_push(heap, hn, k_take, desc_dir,
                                                  ph, order_off, topn_nn_off,
-                                                 p, gi);
+                                                 topn_bias, p, gi);
                     }
 
                 if (hn > 0) {
