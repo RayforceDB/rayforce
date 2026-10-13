@@ -2591,10 +2591,8 @@ ray_t* ray_where_fn(ray_t* x) {
     ray_pool_t* pool = ray_pool_get();
     if (ray_pool_par_dispatch_ok(pool, n, RAY_PARALLEL_THRESHOLD)) {
         /* One task per chunk (ray_pool_dispatch_n).  Chunk count is capped
-         * at 1024 — the pool's INITIAL ring capacity — so dispatch_n never
-         * needs to grow the ring (its clamp-on-grow-failure silently DROPS
-         * tasks, which here would mean uninitialized prefix entries and
-         * out-of-bounds emit offsets).  1024 tasks is ample granularity. */
+         * at 1024 — the pool's INITIAL ring capacity — so dispatch_n runs in
+         * one window with no ring growth; 1024 tasks is ample granularity. */
         int64_t chunk_rows = WHERE_CHUNK_ROWS;
         while ((n + chunk_rows - 1) / chunk_rows > RAY_POOL_INIT_TASKS) chunk_rows *= 2;
         int64_t n_chunks = (n + chunk_rows - 1) / chunk_rows;
