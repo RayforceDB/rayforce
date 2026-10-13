@@ -178,7 +178,8 @@
 (at TP 'ah) -- (at TF 'ah)
 (at TP 's)  -- (at TF 's)
 ;; v2 has no SUM over DATE (a DATE avg's partial), so this partition group
-;; stays off v2 and its count slots fall back to the indicator
+;; runs on the legacy engine: its non-null count slots (OP_COUNT_NN) are
+;; re-planned there as SUM over a not-null indicator, whatever the pool size
 (at (select {a: (avg d) af: (avg f) from: Pt by: g asc: g}) 'a) -- (at (select {a: (avg d) af: (avg f) from: Ft by: g asc: g}) 'a)
 (at (select {a: (avg d) af: (avg f) from: Pt by: g asc: g}) 'af) -- [600.0 900.0 0Nf]
 (set qa (fn [T] (select {c: (count f) a: (avg f) ak: (avg k) from: T by: g asc: g})))

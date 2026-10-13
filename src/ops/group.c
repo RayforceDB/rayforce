@@ -11933,17 +11933,54 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         if (r) return r;
     }
 
+    /* OP_COUNT_NN (internal, see exec_group_per_partition) is served by the
+     * v2 kernels only.  A group bound for the legacy engine is re-planned
+     * with each such slot as SUM over a not-null indicator of the same input
+     * (SUM over BOOL emits I64), so the op is valid whichever route the group
+     * takes and no caller has to predict it.  Node creation may realloc
+     * g->nodes: work on ids, build the pointer arrays after the last new
+     * node, and return straight away (`op` itself may dangle). */
+    for (uint32_t a = 0; a < ext->n_aggs; a++) {
+        if (ext->agg_ops[a] != OP_COUNT_NN) continue;
+        uint32_t na = ext->n_aggs, nk = ext->n_keys;
+        uint16_t ops2[na];
+        uint32_t in_ids[na];
+        for (uint32_t i = 0; i < na; i++) {
+            ops2[i] = ext->agg_ops[i];
+            in_ids[i] = ext->agg_ins[i];
+        }
+        for (uint32_t i = 0; i < na; i++) {
+            if (ops2[i] != OP_COUNT_NN) continue;
+            ray_op_t* nn = ray_not(g, ray_isnull(g, op_node(g, in_ids[i])));
+            if (!nn) return ray_error("oom", NULL);
+            ops2[i] = OP_SUM;
+            in_ids[i] = nn->id;
+        }
+        bool has2 = false, hask = false;
+        ray_op_t* keys[nk > 0 ? nk : 1];
+        ray_op_t* ins[na];
+        ray_op_t* ins2[na];
+        for (uint32_t k = 0; k < nk; k++)
+            keys[k] = op_node(g, ext->keys[k]);
+        for (uint32_t i = 0; i < na; i++) {
+            ins[i] = op_node(g, in_ids[i]);
+            ins2[i] = (ext->agg_ins2 && ext->agg_ins2[i] != RAY_OP_NONE)
+                ? op_node(g, ext->agg_ins2[i]) : NULL;
+            if (ins2[i]) has2 = true;
+            if (ext->agg_k && ext->agg_k[i]) hask = true;
+        }
+        ray_op_t* op2 = (has2 || hask)
+            ? ray_group_build(g, keys, nk, ops2, ins, has2 ? ins2 : NULL,
+                              hask ? ext->agg_k : NULL, na)
+            : ray_group(g, keys, nk, ops2, ins, na);
+        if (!op2) return ray_error("oom", NULL);
+        return exec_group_run(g, op2, tbl, group_limit);
+    }
+
     agg_route_record(AGG_ROUTE_LEGACY);
     int64_t nrows = ray_table_nrows(tbl);
     uint32_t n_keys = ext->n_keys;
     uint32_t n_aggs = ext->n_aggs;
-
-    /* OP_COUNT_NN (internal, see exec_group_per_partition) has no legacy
-     * accumulator.  The caller emits it only for groups v2 admits; should the
-     * route still land here, decline rather than emit a wrong count. */
-    for (uint32_t a = 0; a < n_aggs; a++)
-        if (ext->agg_ops[a] == OP_COUNT_NN)
-            return ray_error("nyi", "group: internal non-null count off the v2 engine");
 
     /* Factorized shortcut: if input is a factorized expand result with
      * (_src, _count) columns, and GROUP BY _src with COUNT/SUM(_count),
@@ -16578,8 +16615,8 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
      * COUNT(x) here is the NON-NULL count (SUM skips null x, so the divisor
      * must too).  OP_COUNT is the group row count (nulls included), so it is
      * used only for a partition whose segment cannot hold nulls; otherwise
-     * the slot is the internal OP_COUNT_NN (v2 groups) or sums a not-null
-     * indicator (chosen per partition below).
+     * the slot is the internal OP_COUNT_NN (a plain column) or sums a
+     * not-null indicator (an expression input), chosen per partition below.
      * Build per-partition agg_ops with decomposed ops, then merge ops.
      * part_ops/merge_ops/avg_idx/std_idx/std_orig_op/std_sq_slot/std_cnt_slot
      * are carved above; n_avg/n_std are recounted here to fill them. */
@@ -16824,12 +16861,11 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
              * indicator instead (SUM over BOOL emits I64).  The op is chosen
              * per partition; COUNT and SUM both emit I64 and the merge op
              * stays SUM, so the partials concatenate unchanged. */
-            /* A plain nullable column first tries OP_COUNT_NN, which counts
-             * the live rows in place (the indicator costs a materialized BOOL
-             * column per partition, ~a third of a nullable parted avg).  Only
-             * the v2 engine serves it, so when v2 would not take this
-             * partition's group, those slots revert to the indicator. */
-            bool cnt_nn = false;
+            /* A plain nullable column takes OP_COUNT_NN, which the v2 kernels
+             * count in place (the indicator costs a materialized BOOL column
+             * per partition, ~a third of a nullable parted avg); a group the
+             * legacy engine runs re-plans it as the indicator itself (see
+             * exec_group_run), so no route is predicted here. */
             for (uint32_t a = cnt_slot_lo; a < part_n_aggs; a++) {
                 uint32_t ci = a - cnt_slot_lo;
                 uint32_t src_a = ci < n_avg ? avg_idx[ci] : std_idx[ci - n_avg];
@@ -16837,9 +16873,8 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                           : ray_table_get_col(sub, part_agg_syms[a]);
                 if (xc && !ray_vec_may_have_nulls(xc)) {
                     part_ops[a] = OP_COUNT;
-                } else if (xc && ray_agg_engine_v2) {
+                } else if (xc) {
                     part_ops[a] = OP_COUNT_NN;
-                    cnt_nn = true;
                 } else {
                     part_ops[a] = OP_SUM;
                     pagg_ins[a] = ray_not(pg, ray_isnull(pg, pagg_ins[a]));
@@ -16848,16 +16883,6 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
 
             ray_op_t* proot = ray_group(pg, pkeys, n_part_keys,
                                        part_ops, pagg_ins, part_n_aggs);
-            if (proot && cnt_nn &&
-                agg_v2_admission(pg, proot, sub) != AGG_V2_ADMITTED) {
-                for (uint32_t a = cnt_slot_lo; a < part_n_aggs; a++) {
-                    if (part_ops[a] != OP_COUNT_NN) continue;
-                    part_ops[a] = OP_SUM;
-                    pagg_ins[a] = ray_not(pg, ray_isnull(pg, pagg_ins[a]));
-                }
-                proot = ray_group(pg, pkeys, n_part_keys,
-                                  part_ops, pagg_ins, part_n_aggs);
-            }
             proot = ray_optimize(pg, proot);
 
             /* Pushed-down WHERE: translate this partition's global survivor
