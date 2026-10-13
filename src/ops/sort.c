@@ -1142,10 +1142,7 @@ void radix_encode_fn(void* arg, uint32_t wid, int64_t start, int64_t end) {
                 } else if (col->type == RAY_I64 || col->type == RAY_TIMESTAMP) {
                     val = ((const int64_t*)ray_data(col))[i];
                 } else if (col->type == RAY_F64) {
-                    uint64_t bits;
-                    memcpy(&bits, &((const double*)ray_data(col))[i], 8);
-                    uint64_t mask = -(bits >> 63) | ((uint64_t)1 << 63);
-                    val = (int64_t)(bits ^ mask);
+                    val = radix_f64_ord(((const double*)ray_data(col))[i]);
                 } else if (col->type == RAY_I32 || col->type == RAY_DATE || col->type == RAY_TIME) {
                     val = (int64_t)((const int32_t*)ray_data(col))[i];
                 } else if (col->type == RAY_I16) {
@@ -2230,10 +2227,7 @@ void mk_prescan_fn(void* arg, uint32_t wid,
         } else if (col->type == RAY_F64) {
             const double* d = (const double*)ray_data(col);
             for (int64_t i = start; i < end; i++) {
-                uint64_t bits;
-                memcpy(&bits, &d[i], 8);
-                uint64_t mask = -(bits >> 63) | ((uint64_t)1 << 63);
-                int64_t v = (int64_t)(bits ^ mask);
+                int64_t v = radix_f64_ord(d[i]);
                 if (v < kmin) kmin = v;
                 if (v > kmax) kmax = v;
             }
@@ -2743,10 +2737,7 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
                         } else if (col->type == RAY_F64) {
                             const double* d = (const double*)ray_data(col);
                             for (int64_t i = 0; i < nrows; i++) {
-                                uint64_t bits;
-                                memcpy(&bits, &d[i], 8);
-                                uint64_t mask = -(bits >> 63) | ((uint64_t)1 << 63);
-                                int64_t v = (int64_t)(bits ^ mask);
+                                int64_t v = radix_f64_ord(d[i]);
                                 if (v < kmin) kmin = v;
                                 if (v > kmax) kmax = v;
                             }

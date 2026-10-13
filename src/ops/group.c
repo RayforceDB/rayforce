@@ -9996,27 +9996,40 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
                 for (size_t i = 0; i < bwords; i++)
                     card += __builtin_popcountll(bits[i]);
                 scratch_free(bits_hdr);
-            } else if (bt == RAY_I64) {
-                const int64_t* v = (const int64_t*)ray_data(seg0);
-                int64_t lo = v[0], hi = v[0];
-                for (int64_t r = 1; r < seg0->len; r++) {
-                    if (v[r] < lo) lo = v[r];
-                    if (v[r] > hi) hi = v[r];
+            } else if (bt == RAY_I64 || bt == RAY_I32) {
+                /* The null sentinel is one group of its own, not the low
+                 * end of the value range: taking it as lo would turn a
+                 * nullable low-cardinality key into a span of ~2^63 (I64)
+                 * or ~2^31 (I32) and force the concat path.  Range over
+                 * the non-null values, plus one group when a null shows. */
+                int64_t lo = INT64_MAX, hi = INT64_MIN;
+                bool has_null = false;
+                if (bt == RAY_I64) {
+                    const int64_t* v = (const int64_t*)ray_data(seg0);
+                    for (int64_t r = 0; r < seg0->len; r++) {
+                        if (v[r] == NULL_I64) { has_null = true; continue; }
+                        if (v[r] < lo) lo = v[r];
+                        if (v[r] > hi) hi = v[r];
+                    }
+                } else {
+                    const int32_t* v = (const int32_t*)ray_data(seg0);
+                    for (int64_t r = 0; r < seg0->len; r++) {
+                        if (v[r] == NULL_I32) { has_null = true; continue; }
+                        if (v[r] < lo) lo = v[r];
+                        if (v[r] > hi) hi = v[r];
+                    }
                 }
-                /* Unsigned span: lo can be the i64 null sentinel, and
-                 * hi - lo then overflows i64.  A span past the partition
-                 * size already saturates the estimate, so cap it there. */
-                uint64_t span = (uint64_t)hi - (uint64_t)lo;
-                card = span < (uint64_t)rows_per_part
-                     ? (int64_t)span + 1 : rows_per_part + 1;
-            } else if (bt == RAY_I32) {
-                const int32_t* v = (const int32_t*)ray_data(seg0);
-                int32_t lo = v[0], hi = v[0];
-                for (int64_t r = 1; r < seg0->len; r++) {
-                    if (v[r] < lo) lo = v[r];
-                    if (v[r] > hi) hi = v[r];
+                if (lo > hi) {
+                    card = 1;                 /* all null */
+                } else {
+                    /* Unsigned span: hi - lo can still exceed INT64_MAX
+                     * for a full-range I64 key.  A span past the partition
+                     * size already saturates the estimate, so cap it. */
+                    uint64_t span = (uint64_t)hi - (uint64_t)lo;
+                    card = span < (uint64_t)rows_per_part
+                         ? (int64_t)span + 1 : rows_per_part + 1;
+                    if (has_null) card++;
                 }
-                card = (int64_t)hi - (int64_t)lo + 1;
             } else {
                 card = seg0->len;
             }

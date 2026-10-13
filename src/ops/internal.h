@@ -1110,6 +1110,17 @@ int64_t* msd_radix_sort_run(ray_pool_t* pool, uint64_t* keys, int64_t* indices,
                               int64_t n, uint8_t n_bytes,
                               uint64_t** sorted_keys_out);
 void radix_encode_fn(void* arg, uint32_t wid, int64_t start, int64_t end);
+/* A double as a composite radix component: the bits read as an i64 with
+ * a negative value's low 63 bits flipped, so signed i64 order equals
+ * numeric order.  The composite prescans take SIGNED min/max per key; the
+ * single-key encoding (bits ^ mask) is unsigned-ordered instead and would
+ * put every positive below every negative there.  The encode subtracts the
+ * min and so only needs the same form on both sides. */
+static inline int64_t radix_f64_ord(double x) {
+    uint64_t bits;
+    memcpy(&bits, &x, 8);
+    return (int64_t)(bits ^ (-(bits >> 63) >> 1));
+}
 void mk_prescan_fn(void* arg, uint32_t wid, int64_t start, int64_t end);
 uint32_t* build_enum_rank(ray_t* col, int64_t nrows, ray_t** hdr_out);
 ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit);

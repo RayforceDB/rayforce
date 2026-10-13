@@ -41,3 +41,13 @@
 (count RC) -- 3000
 (sum (at RC 'c)) -- 200000
 (count (select {from: (select {from: (table [i] (list (til 70000))) k: (as 'F32 (/ (as 'F64 i) 7.0)) v: i}) by: k c: (count v)})) -- 70000
+;; The group by above only reaches read_col_i64 on a 2..8-worker pool (larger
+;; pools admit float keys to the v2 engine, which reads F32 natively), so on a
+;; wide pool those checks pass without the F32 arm.  Joins hash and compare
+;; their keys through the same reader on any pool size: one byte per key made
+;; 1000 distinct F32 keys collide and the join fanned out to ~40M rows.
+(set JF (inner-join [k] TF RF))
+(count JF) -- 200000
+(sum (at JF 'c)) -- 40000000
+(count (left-join [k] TF RF)) -- 200000
+(count (inner-join [k g] TF RC)) -- 200000
