@@ -4444,8 +4444,11 @@ static test_result_t test_group_topn_nulls(void) {
  * one. */
 static test_result_t test_group_topn_affine(void) {
     aw_eval_ok("(set K (map (fn [i] (if (< i 3000) (% i 50) (% (* i 7919) 2000))) (til 8000)))");
-    aw_eval_ok("(set W (table [s w v] (list (at (as 'SYMBOL (map (fn [j] (format \"w%\" j)) (til 2000))) K) "
-               "(map (fn [k] (if (< k 50) 0 (% k 13))) K) (til 8000))))");
+    /* wn is nullable so the ordering SUM's non-null counts sit beside
+     * another slot's: the heap must read its own slot's (agg_slot > 0) */
+    aw_eval_ok("(set W (table [s w v wn] (list (at (as 'SYMBOL (map (fn [j] (format \"w%\" j)) (til 2000))) K) "
+               "(map (fn [k] (if (< k 50) 0 (% k 13))) K) (til 8000) "
+               "(as 'I64 (map (fn [k] (if (< (% k 5) 1) 0Nl (% k 7))) K)))))");
     aw_eval_ok("(.db.splayed.set \"" AW_TMP "/ta/2024.01.01/t/\" (take W 4000) \"" AW_TMP "/ta/.sym\")");
     aw_eval_ok("(.db.splayed.set \"" AW_TMP "/ta/2024.01.02/t/\" (drop W 4000) \"" AW_TMP "/ta/.sym\")");
     aw_eval_ok("(.db.splayed.set \"" AW_TMP "/tas/t/\" W \"" AW_TMP "/tas/.sym\")");
@@ -4461,6 +4464,8 @@ static test_result_t test_group_topn_affine(void) {
         "{m: (avg (+ w 100)) from: %s by: {s: s z: (%% v 1) t: s} asc: m take: %d}",
         "{m: (avg (- w 100)) from: %s by: {s: s z: (%% v 1) t: s} desc: m take: %d}",
         "{m: (avg (- w 100)) from: %s by: {s: s z: (%% v 1) t: s} asc: m take: %d}",
+        "{a: (min wn) m: (sum (+ w 100)) from: %s by: {s: s z: (%% v 1) t: s} desc: m take: %d}",
+        "{a: (min wn) m: (sum (+ w 100)) from: %s by: {s: s z: (%% v 1) t: s} asc: m take: %d}",
     };
     static const int takes[] = { 20, 5 };
     for (size_t si = 0; si < sizeof shapes / sizeof *shapes; si++)
