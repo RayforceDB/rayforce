@@ -784,22 +784,10 @@ ray_t* exec_filter_head(ray_t* input, ray_t* pred, int64_t limit) {
                 ray_release(new_col);
                 new_col = parted_gather_str_rows(segs, n_segs, match_idx, found);
             } else {
-                /* Non-STR parted gather */
-                int64_t seg_start = 0;
-                int64_t cur_seg = 0;
-                int64_t cur_seg_end = (n_segs > 0 && segs[0]) ? segs[0]->len : 0;
-                for (int64_t j = 0; j < found; j++) {
-                    int64_t r = match_idx[j];
-                    while (cur_seg < n_segs - 1 && r >= cur_seg_end) {
-                        seg_start = cur_seg_end;
-                        cur_seg++;
-                        cur_seg_end += segs[cur_seg] ? segs[cur_seg]->len : 0;
-                    }
-                    if (!segs[cur_seg])
-                        continue;  /* NULL segment — zero-fill from memset */
-                    parted_copy_cells(dst, out_type, out_attrs, j,
-                                      segs[cur_seg], r - seg_start, 1);
-                }
+                /* Non-STR parted gather: the shared helper also carries
+                 * each segment's null cells over (the sentinel alone
+                 * reads back as a plain value without HAS_NULLS). */
+                parted_gather_col(col, match_idx, found, new_col);
             }
         } else {
             char* src = (char*)ray_data(col);
