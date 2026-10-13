@@ -195,6 +195,33 @@
 (at RPe3 'k) -- ["" "https_example_com_some_long_page_1"]
 (at RPe3 'n) -- [13330 6670]
 
+;; (e4) LIST partials: first/last over a LIST column are concatenated by
+;;      reference (a raw copy aliased the partials' elements); 10 partitions
+;;      span two merge batches here as well.
+(set LS (take (list [1 2] [3] [4 5 6] [7]) NS))
+(set PL (table [e v l] (list ES VS LS)))
+(.sys.exec "rm -rf /tmp/rfl_pgwh_lst")
+(.db.splayed.set "/tmp/rfl_pgwh_lst/01/t/" PL)
+(.db.splayed.set "/tmp/rfl_pgwh_lst/02/t/" PL)
+(.db.splayed.set "/tmp/rfl_pgwh_lst/03/t/" PL)
+(.db.splayed.set "/tmp/rfl_pgwh_lst/04/t/" PL)
+(.db.splayed.set "/tmp/rfl_pgwh_lst/05/t/" PL)
+(.db.splayed.set "/tmp/rfl_pgwh_lst/06/t/" PL)
+(.db.splayed.set "/tmp/rfl_pgwh_lst/07/t/" PL)
+(.db.splayed.set "/tmp/rfl_pgwh_lst/08/t/" PL)
+(.db.splayed.set "/tmp/rfl_pgwh_lst/09/t/" PL)
+(.db.splayed.set "/tmp/rfl_pgwh_lst/10/t/" PL)
+(set Pl (.db.parted.get "/tmp/rfl_pgwh_lst/" 't))
+(set TFl (table [e v l] (list (raze (take (list ES) 10)) (raze (take (list VS) 10)) (raze (take (list LS) 10)))))
+(set Be4 (at (.sys.mem) 'group-perpart-runs))
+(set RPe4 (select {from: Pl where: (== (% v 50) 7) by: e n: (count v) fl: (first l) ll: (last l) asc: e}))
+(> (at (.sys.mem) 'group-perpart-runs) Be4) -- true
+(set RFe4 (select {from: TFl where: (== (% v 50) 7) by: e n: (count v) fl: (first l) ll: (last l) asc: e}))
+(at RPe4 'e)  -- [0 1 2]
+(at RPe4 'n)  -- (at RFe4 'n)
+(at RPe4 'fl) -- (at RFe4 'fl)
+(at RPe4 'll) -- (at RFe4 'll)
+
 ;; ══════════════════════════════════════════════════════════════════════════
 ;; (f) COMPOSITE KEY WITH A ROW OUTPUT (#731) — `b: b by: [s bo]` groups at
 ;;     eval level on boxed key cells; a cell is a SYM atom holding the RUNTIME
@@ -218,9 +245,21 @@
 ;; a splayed (FILE-domain, non-parted) source took the same path
 (.db.splayed.set "/tmp/rfl_pgwh_cmp/flat/" (table [s bo b] (list ['alpha 'beta 'alpha 'gamma 'beta] [true false true false true] [91 92 93 94 95])))
 (set Sc (.db.splayed.get "/tmp/rfl_pgwh_cmp/flat/"))
-(at (select {b: b by: [s bo] from: Sc where: (> b 90)}) 's) -- ['alpha 'beta 'gamma 'beta]
+(set RSc (select {b: b by: [s bo] from: Sc where: (> b 90)}))
+(at RSc 's)  -- ['alpha 'beta 'gamma 'beta]
+(at RSc 'bo) -- [true false false true]
+(at RSc 'b)  -- (list [91 93] [92] [94] [95])
 (at (select {b: b by: [s bo] from: Sc}) 's) -- ['alpha 'beta 'gamma 'beta]
+;; a source wide enough for a two-byte index (300 symbols)
+(set S16 (table [s bo b] (list (as 'SYM (% (til 600) 300)) (== (% (til 600) 2) 0) (til 600))))
+(.db.splayed.set "/tmp/rfl_pgwh_cmp/w16/" S16)
+(set Sw (.db.splayed.get "/tmp/rfl_pgwh_cmp/w16/"))
+(set RPw (select {b: b by: [s bo] from: Sw}))
+(set RFw (select {b: b by: [s bo] from: S16}))
+(count RPw) -- 300
+(at RPw 's) -- (at RFw 's)
+(at RPw 'b) -- (at RFw 'b)
 
 ;; ─── cleanup ─────────────────────────────────────────────────────────────────
 (.sys.exec "rm -rf /tmp/rfl_pgwh")
-(.sys.exec "rm -rf /tmp/rfl_pgwh_str /tmp/rfl_pgwh_cmp")
+(.sys.exec "rm -rf /tmp/rfl_pgwh_str /tmp/rfl_pgwh_lst /tmp/rfl_pgwh_cmp")

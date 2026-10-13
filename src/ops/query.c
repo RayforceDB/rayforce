@@ -14053,8 +14053,9 @@ by_dict_done:
             }
             if (by_key_sym < 0 && by_expr->type == RAY_SYM && ray_len(by_expr) > 1) {
                 /* The composite path reads key and output cells row by row,
-                 * which a parted column does not serve: with no where: (one
-                 * flattens the rows it keeps) flatten the columns read. */
+                 * which a parted column does not serve.  A where: hands back
+                 * a flattened copy of the rows it keeps; when the table
+                 * reaches here as is, flatten the columns the clauses read. */
                 if (eval_tbl == tbl && table_has_parted_columns(tbl)) {
                     ray_t* flat = parted_flatten_read_cols(dict, tbl);
                     if (!flat || RAY_IS_ERR(flat)) {
