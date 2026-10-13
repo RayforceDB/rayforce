@@ -1,0 +1,38 @@
+;; (if c1 r1 c2 r2 ... else?) — condition/result pairs tried in order, an
+;; odd trailing arg is the fallback.  Covers the tree-walking evaluator
+;; (top level) and the bytecode compiler (inside a lambda) alike.
+
+;; ── tree-walking evaluator ──────────────────────────────────────────────────
+(if false 1 false 2 3) -- 3
+(if false 1 true 2 3) -- 2
+(if true 1 false 2 3) -- 1
+(if false 1 false 2 false 3 4) -- 4
+(if false 1 false 2 true 3 4) -- 3
+;; even arg count: no fallback, 0 when nothing matches
+(if false 1 false 2) -- 0
+(if false 1 true 2) -- 2
+;; the three-arg form is unchanged
+(if false 1 3) -- 3
+(if true 1 3) -- 1
+(if false 1) -- 0
+
+;; ── bytecode compiler ──────────────────────────────────────────────────────
+(set classify (fn [x] (if (> x 100) "high" (> x 50) "mid" "low")))
+(classify 200) -- "high"
+(classify 60) -- "mid"
+(classify 10) -- "low"
+((fn [] (if false 1 false 2 false 3 4))) -- 4
+((fn [] (if false 1 false 2))) -- 0
+((fn [] (if false 1 true 2))) -- 2
+
+;; ── only the taken branch is evaluated ─────────────────────────────────────
+(set n 0)
+(if false (set n 1) true (set n 2) (set n 3))
+n -- 2
+(set m 0)
+((fn [] (if false (set m 1) false (set m 2) (set m 3))))
+m -- 3
+;; conditions after the first truthy one are not evaluated
+(set k 0)
+((fn [] (if true 1 (set k 9) 2 3)))
+k -- 0

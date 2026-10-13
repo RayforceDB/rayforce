@@ -497,7 +497,7 @@ spills exactly as it did before.
 |---|---|---|---|
 | `set` | binary, special | Bind value to global variable | `(set x 42)` |
 | `let` | binary, special | Bind value to local variable | `(let y (+ x 1))` |
-| `if` | variadic, special | Conditional (if/then/else) | `(if (> x 0) "pos" "neg")` |
+| `if` | variadic, special | Conditional: condition/result pairs, optional final else | `(if (> x 0) "pos" "neg")` |
 | `do` | variadic, special | Sequential execution, returns last | `(do (set x 1) (set y 2) (+ x y))` |
 | `fn` | variadic, special | Create lambda function | `(fn [x] (* x x))` |
 | `try` | binary, special | Error handling (expr handler-or-fallback) | `(try (/ 1 0) (fn [e] 0))` |
