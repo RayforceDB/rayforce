@@ -2978,12 +2978,12 @@ static test_result_t test_repl_cli_option_errors(void) {
         const char* option;
         const char* message;
     } cases[] = {
-        { "--bogus", "error: unknown option --bogus" },
-        { "-x", "error: unknown option -x" },
-        { "-u", "error: option -u requires an argument" },
-        { "-U", "error: option -U requires an argument" },
-        { "-l", "error: option -l requires an argument" },
-        { "-L", "error: option -L requires an argument" },
+        { "--bogus", "error: unknown option '--bogus'" },
+        { "-x", "error: unknown option '-x'" },
+        { "-u", "error: -u expects a value" },
+        { "-U", "error: -U expects a value" },
+        { "-l", "error: -l expects a value" },
+        { "-L", "error: -L expects a value" },
     };
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
         char command[256];
