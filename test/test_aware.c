@@ -4297,6 +4297,80 @@ static test_result_t test_topk_prune_cases(void) {
     PASS();
 }
 
+/* #801: a grouped take (`by … desc: <agg> take: N`, N <= 1024) arms the
+ * radix group's top-N emit filter, which cuts the groups to exactly N.
+ * Groups tied at the cut value are decided by the earliest source row, the
+ * order every other group route and the stable sort follow: the answer
+ * equals the stable full sort's first N rows (take: 1025 is above the
+ * filter's cap, so it sorts everything) and the splayed copy's answer, at
+ * every iteration.  10000 groups of 4 rows each, spread over the four
+ * partitions (row i holds group i*7919 mod 10000), and 50 groups of 8 rows
+ * at the head: the cut falls inside a tie set of thousands of groups.  The
+ * SYM keys beside a computed one take the flattened parted group onto the
+ * radix fat-entry path. */
+static test_result_t test_group_topn_ties(void) {
+    aw_eval_ok("(set K (concat (% (* (til 40000) 7919) 10000) (% (til 200) 50)))");
+    aw_eval_ok("(set W (table [s u v g] (list (at (as 'SYMBOL (map (fn [j] (format \"w%\" j)) (til 10000))) K) "
+               "(% K 3) (til 40200) K)))");
+    for (int gen = 0; gen <= 2; gen += 2)
+        for (int p = 0; p < 4; p++) {
+            char q[600];
+            snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/tt%d/2024.01.0%d/t/\" (take (drop W %d) 10050) "
+                     "\"" AW_TMP "/tt%d/.sym\" {compress: %s})", gen, p + 1, p * 10050, gen, gen ? "true" : "false");
+            aw_eval_ok(q);
+        }
+    aw_eval_ok("(.db.splayed.set \"" AW_TMP "/ts/t/\" W \"" AW_TMP "/ts/.sym\")");
+    aw_eval_ok("(set S (.db.splayed.get \"" AW_TMP "/ts/t/\" \"" AW_TMP "/ts/.sym\"))");
+    static const char* const shapes[] = {
+        "{c: (count v) from: %s by: {s: s z: (%% v 1) t: s} desc: c take: %d}",
+        "{c: (count v) from: %s by: {s: s z: (%% v 1) t: s} asc: c take: %d}",
+        "{m: (min u) c: (count v) from: %s by: {s: s z: (%% v 1) t: s} desc: m take: %d}",
+        "{q: (sum u) from: %s by: {s: s z: (%% v 1) t: s} asc: q take: %d}",
+        "{q: (max u) from: %s by: {s: s z: (%% v 1) t: s} desc: q take: %d}",
+        "{c: (count v) from: %s by: {g: g z: (%% v 1) h: g} desc: c take: %d}",
+        "{q: (sum u) from: %s by: {g: g z: (%% v 1) h: g} asc: q take: %d}",
+    };
+    static const int takes[] = { 100, 7 };
+    for (int gen = 0; gen <= 2; gen += 2) {
+        char q[600], body[300];
+        snprintf(q, sizeof q, "(set P (.db.parted.get \"" AW_TMP "/tt%d\" 't))", gen);
+        aw_eval_ok(q);
+        for (size_t si = 0; si < sizeof shapes / sizeof *shapes; si++)
+            for (size_t ti = 0; ti < sizeof takes / sizeof *takes; ti++) {
+                int n = takes[ti];
+                snprintf(body, sizeof body, shapes[si], "P", 1025);
+                snprintf(q, sizeof q, "(take (select %s) %d)", body, n);
+                ray_t* ref = aw_eval(q);
+                TEST_ASSERT_FMT(ref && !RAY_IS_ERR(ref) && ray_table_nrows(ref) == n, "%s: %s", q, ray_error_msg());
+                snprintf(body, sizeof body, shapes[si], "S", n);
+                snprintf(q, sizeof q, "(select %s)", body);
+                ray_t* spl = aw_eval(q);
+                TEST_ASSERT_FMT(spl && !RAY_IS_ERR(spl), "%s: %s", q, ray_error_msg());
+                test_result_t r = aw_csv_eq(q, gen, ref, spl);
+                ray_release(spl);
+                if (r.status != TEST_PASS) { ray_release(ref); return r; }
+                snprintf(body, sizeof body, shapes[si], "P", n);
+                snprintf(q, sizeof q, "(select %s)", body);
+                /* the race needs repeats; the other cuts are checked a few times */
+                int iters = si == 0 && ti == 0 && !g_aw_unaligned ? 20 : 3;
+                for (int it = 0; it < iters; it++) {
+                    agg_route_reset();
+                    ray_t* got = aw_eval(q);
+                    TEST_ASSERT_FMT(got && !RAY_IS_ERR(got), "%s: %s", q, ray_error_msg());
+                    agg_route_stats_t st = agg_route_stats();
+                    /* the flattened parted group, on the radix ladder, not v2 */
+                    TEST_ASSERT_TRUE(st.routes[AGG_ROUTE_PARTED] > 0 && st.routes[AGG_ROUTE_LEGACY] > 0 && !st.topn_native);
+                    r = aw_csv_eq(q, it, ref, got);
+                    ray_release(got);
+                    if (r.status != TEST_PASS) { ray_release(ref); return r; }
+                }
+                ray_release(ref);
+            }
+    }
+    aw_eval_ok("(set P 0)"); aw_eval_ok("(set S 0)"); aw_eval_ok("(set W 0)"); aw_eval_ok("(set K 0)");
+    PASS();
+}
+
 /* ray_pool_dispatch clamped to a ring whose growth fails (#792; shrunk to a
  * few slots so the clamp runs at test sizes): fused where: filters
  * (pred_sel_drive and the expression selection, whose rowsel builders are
@@ -4306,7 +4380,7 @@ static test_result_t test_pool_clamp(void) {
     static test_result_t (*const fns[])(void) = {
         test_scalar_route_mixed, test_eq_runs_lack, test_filter_encoded_leaves, test_scalar_route_stats,
         test_count_on_runs, test_group_count_on_runs, test_group_runs_forged, test_topk_prune_cases,
-        test_gather_sym_points, test_sort_head_late,
+        test_gather_sym_points, test_sort_head_late, test_group_topn_ties,
     };
     static const uint32_t caps[] = { 7, 3 };
     for (size_t c = 0; c < sizeof caps / sizeof *caps; c++)
@@ -4437,5 +4511,6 @@ const test_entry_t aware_entries[] = {
     { "aware/group_count_on_runs", test_group_count_on_runs, aw_setup, aw_teardown },
     { "aware/group_runs_forged",   test_group_runs_forged,   aw_setup, aw_teardown },
     { "aware/topk_prune_cases",    test_topk_prune_cases,    aw_setup, aw_teardown },
+    { "aware/group_topn_ties",     test_group_topn_ties,     aw_setup, aw_teardown },
     { NULL, NULL, NULL, NULL },
 };

@@ -6644,6 +6644,7 @@ static inline uint32_t group_radix_part(uint64_t hash, uint32_t n_parts) {
 
 typedef struct {
     int64_t value;
+    int64_t first;   /* the group's earliest source row: the tie-break */
     uint32_t part;
     uint32_t gid;
 } group_topn_item_t;
@@ -6654,72 +6655,63 @@ typedef struct {
  * its cost is O(total groups) — tens of millions of rows on a high-cardinality
  * 100M-row group-by, and it ran on one thread.
  *
- * `TOPN_BETTER(desc, a, b)` is the single ordering predicate: for `desc` a
- * larger value is better, otherwise a smaller one.  The heap keeps the WORST
- * retained item at the root (min-heap when desc), so the invariant is
- * "parent is not better than child" and a swap is needed exactly when the
- * parent IS better. */
+ * `TOPN_BETTER(desc, a, b)` orders two values: for `desc` a larger value is
+ * better, otherwise a smaller one.  `TOPN_ITEM_BETTER` orders two items and
+ * is the ONLY predicate the heap uses: the better value, and between equal
+ * values the smaller earliest source row (`first`).  That is the tie rule of
+ * the answer itself: phase 3 emits groups by earliest source row and the
+ * final sort is stable, so of the groups tied at the cut the take keeps the
+ * ones seen first.  Groups have distinct earliest rows, so this is a strict
+ * total order.  The heap keeps the WORST retained item at the root, so the
+ * invariant is "parent is not better than child" and a swap is needed
+ * exactly when the parent IS better. */
 #define TOPN_BETTER(desc_dir, a, b) ((desc_dir) ? ((a) > (b)) : ((a) < (b)))
+#define TOPN_ITEM_BETTER(desc_dir, a, b) (TOPN_BETTER(desc_dir, (a).value, (b).value) || \
+    ((a).value == (b).value && (a).first < (b).first))
 
 /* Push one candidate into a bounded "best k" heap; returns the new count.
- * Replacement is on STRICT improvement: an item that merely TIES the root is
- * rejected and the heap is left byte-for-byte unchanged.
+ * Replacement is on strict improvement under TOPN_ITEM_BETTER.  Because that
+ * order is total, the heap retains exactly the k best items it was shown,
+ * whatever order they came in: the (partition, gid) push order, which
+ * depends on how phase 1's workers claimed morsels, on phase 2's fold and on
+ * the partition count, cannot change the retained set.  (A value-only order
+ * left ties to that push order, and the answer changed between runs and
+ * core counts: #801.)
  *
- * That is NOT the same as "the earliest of equal values wins" — with k=2,
- * desc, pushing 5,5,7 evicts the FIRST 5, because sift-down may promote
- * either equal child to the root.  What holds is only that the outcome is a
- * deterministic function of the push sequence, which is all the callers need.
- *
- * WHY THE PARALLEL PRE-PASS RETAINS THE SAME SET AS ONE SERIAL SCAN.  Let H
- * be the global heap of the serial scan and H_p a partition's local heap.
- * When H_p is full it holds the k best of what that partition has shown so
- * far; H at the same point holds the k best of a SUPERSET of those items, so
- * H's root is never worse than H_p's.  An item H_p rejects is therefore not
- * strictly better than H's root either — H would reject it too, leaving H
- * unchanged.  So the pre-pass elides only pushes that are provably no-ops,
- * and feeding H the survivors alone reproduces its exact trajectory.
- *
- * TWO CONDITIONS CARRY THAT ARGUMENT.  Do not "optimise" either away:
- *   (1) the per-partition cap is k_take ITSELF, never k_take/n_parts or any
- *       other share.  (It may be smaller only when the partition holds fewer
- *       than k_take groups — then the heap drops nothing at all.)  With a
- *       smaller cap H_p's root could be BETTER than H's, and H_p would drop
- *       an item the serial scan keeps.
- *   (2) the merge feeds candidates in the serial scan's order: partitions
- *       ascending, and gid ascending within a partition.  Ties are
- *       order-sensitive (see the 5,5,7 trace above), so topn_scan_fn sorts
- *       its survivors back into gid order for exactly this reason. */
+ * WHY THE PARALLEL PRE-PASS RETAINS THE SAME SET AS ONE SCAN.  Each
+ * partition's own k best contain every item of the global k best that lives
+ * in it, so the union of the per-partition survivors contains the global k
+ * best, and the heap fed that union retains exactly them.  This needs the
+ * per-partition cap to be k_take ITSELF, never k_take/n_parts or any other
+ * share (it may be smaller only when the partition holds fewer than k_take
+ * groups, so that it drops nothing): with a smaller cap a partition could
+ * drop an item of the global k best.  Do not "optimise" it away. */
 static inline int64_t topn_heap_push(group_topn_item_t* h, int64_t hn,
                                      int64_t k, uint8_t desc_dir, int64_t v,
-                                     uint32_t part, uint32_t gid) {
+                                     int64_t first, uint32_t part, uint32_t gid) {
+    group_topn_item_t it = {v, first, part, gid};
     if (hn < k) {
         int64_t j = hn++;
-        h[j] = (group_topn_item_t){v, part, gid};
+        h[j] = it;
         while (j > 0) {                             /* sift up */
             int64_t pr = (j - 1) >> 1;
-            if (!TOPN_BETTER(desc_dir, h[pr].value, h[j].value)) break;
+            if (!TOPN_ITEM_BETTER(desc_dir, h[pr], h[j])) break;
             group_topn_item_t t = h[pr]; h[pr] = h[j]; h[j] = t;
             j = pr;
         }
         return hn;
     }
-    if (!TOPN_BETTER(desc_dir, v, h[0].value)) return hn;
-    h[0] = (group_topn_item_t){v, part, gid};
+    if (!TOPN_ITEM_BETTER(desc_dir, it, h[0])) return hn;
+    h[0] = it;
     for (int64_t j = 0;;) {                         /* sift down */
         int64_t l = j * 2 + 1, r = l + 1, m = j;
-        if (l < hn && TOPN_BETTER(desc_dir, h[m].value, h[l].value)) m = l;
-        if (r < hn && TOPN_BETTER(desc_dir, h[m].value, h[r].value)) m = r;
+        if (l < hn && TOPN_ITEM_BETTER(desc_dir, h[m], h[l])) m = l;
+        if (r < hn && TOPN_ITEM_BETTER(desc_dir, h[m], h[r])) m = r;
         if (m == j) break;
         group_topn_item_t t = h[m]; h[m] = h[j]; h[j] = t;
         j = m;
     }
     return hn;
-}
-
-static int topn_gid_cmp(const void* a, const void* b) {
-    uint32_t ga = ((const group_topn_item_t*)a)->gid;
-    uint32_t gb = ((const group_topn_item_t*)b)->gid;
-    return ga < gb ? -1 : (ga > gb ? 1 : 0);
 }
 
 static int topn_part_gid_cmp(const void* a, const void* b) {
@@ -6729,12 +6721,24 @@ static int topn_part_gid_cmp(const void* a, const void* b) {
     return x->gid < y->gid ? -1 : (x->gid > y->gid ? 1 : 0);
 }
 
+/* The (value, earliest row) item of group gi of partition p. */
+static inline int64_t topn_group_push(group_topn_item_t* h, int64_t hn,
+                                      int64_t k, uint8_t desc_dir,
+                                      const group_ht_t* ph, uint16_t order_off,
+                                      uint32_t p, uint32_t gi) {
+    const char* row = ph->rows + (size_t)gi * ph->layout.row_stride;
+    int64_t v, first;
+    memcpy(&v, row + order_off, 8);
+    memcpy(&first, row + ph->layout.off_group_first, 8);
+    return topn_heap_push(h, hn, k, desc_dir, v, first, p, gi);
+}
+
 /* Parallel pre-pass: reduce each partition to its OWN top-k.  The global
  * top-k is a subset of the union of those, so the serial merge that follows
- * only walks the survivors.  Each worker sorts its survivors back into gid
- * order and the merge walks partitions in ascending order, so the merge sees
- * candidates in the same (partition, gid) sequence the single-threaded scan
- * did — the retained set, and therefore the emitted rows, are identical. */
+ * only walks the survivors.  The heap's order is total, so the survivors'
+ * order within a partition and the order the merge walks them in do not
+ * matter: the retained set, and therefore the emitted rows, are those of a
+ * single scan. */
 typedef struct {
     group_ht_t*        part_hts;
     group_topn_item_t* items;      /* [item_off[n_parts]] staging */
@@ -6750,18 +6754,13 @@ static void topn_scan_fn(void* vctx, uint32_t worker_id, int64_t start,
     topn_scan_ctx_t* c = (topn_scan_ctx_t*)vctx;
     for (int64_t pi = start; pi < end; pi++) {
         uint32_t p = (uint32_t)pi;
-        group_ht_t* ph = &c->part_hts[p];
+        const group_ht_t* ph = &c->part_hts[p];
         uint32_t gc = ph->grp_count;
-        uint16_t rs = ph->layout.row_stride;
         group_topn_item_t* h = c->items + c->item_off[p];
         int64_t cap = (int64_t)(c->item_off[p + 1] - c->item_off[p]);
         int64_t hn = 0;
-        for (uint32_t gi = 0; gi < gc; gi++) {
-            int64_t v = *(const int64_t*)(const void*)
-                        (ph->rows + (size_t)gi * rs + c->order_off);
-            hn = topn_heap_push(h, hn, cap, c->desc_dir, v, p, gi);
-        }
-        if (hn > 1) qsort(h, (size_t)hn, sizeof(*h), topn_gid_cmp);
+        for (uint32_t gi = 0; gi < gc; gi++)
+            hn = topn_group_push(h, hn, cap, c->desc_dir, ph, c->order_off, p, gi);
         c->item_cnt[p] = (uint32_t)hn;
     }
 }
@@ -6770,12 +6769,10 @@ static void topn_scan_fn(void* vctx, uint32_t worker_id, int64_t start,
  * the END of the phase-2 task that BUILT the partition, while its rows are
  * still in that core's L2/L3 instead of being re-read from DRAM afterwards.
  *
- * It is arithmetically the same scan — same shared topn_heap_push, the same
- * per-partition cap (`cap` is k_take ITSELF, condition (1) of the proof above,
- * here as a uniform stride because grp_count is unknown at allocation time),
- * and the same sort back into gid order so the merge still sees candidates
- * partitions-ascending / gid-ascending (condition (2)).  Fusion moves only
- * WHERE the scan runs, never what it retains.
+ * It is arithmetically the same scan: the same shared topn_heap_push and the
+ * same per-partition cap (`cap` is k_take ITSELF, as the proof above needs,
+ * here as a uniform stride because grp_count is unknown at allocation time).
+ * Fusion moves only WHERE the scan runs, never what it retains.
  *
  * `items == NULL` means fusion is off and the standalone topn_scan_fn pre-pass
  * (or the serial scan) runs instead.  `item_cnt` is calloc'd by the driver and
@@ -6793,16 +6790,11 @@ typedef struct {
 static inline void topn_fuse_partition(const topn_fuse_t* f, group_ht_t* ph,
                                        uint32_t p) {
     uint32_t gc = ph->grp_count;
-    uint16_t rs = ph->layout.row_stride;
     group_topn_item_t* h = f->items + (size_t)p * f->cap;
     int64_t cap = (int64_t)f->cap;
     int64_t hn = 0;
-    for (uint32_t gi = 0; gi < gc; gi++) {
-        int64_t v = *(const int64_t*)(const void*)
-                    (ph->rows + (size_t)gi * rs + f->order_off);
-        hn = topn_heap_push(h, hn, cap, f->desc_dir, v, p, gi);
-    }
-    if (hn > 1) qsort(h, (size_t)hn, sizeof(*h), topn_gid_cmp);
+    for (uint32_t gi = 0; gi < gc; gi++)
+        hn = topn_group_push(h, hn, cap, f->desc_dir, ph, f->order_off, p, gi);
     f->item_cnt[p] = (uint32_t)hn;
 }
 
@@ -17723,11 +17715,13 @@ v2_emit:;
          * total_grps is in the millions but N is much smaller.
          *
          * Implementation notes:
-         *  - The bounded heap orders by count (the agg at COUNT slot, the
-         *    first int64 in each row).  Equal counts are stable: the
-         *    first row seen wins.  Final per-partition row order is
-         *    preserved so apply_sort_take below can do the final
-         *    arrange-by-agg deterministically.
+         *  - The bounded heap orders by the ordering agg's int64 row slot
+         *    (topn_order_off) in the take's direction, and equal values
+         *    by the group's earliest source row, smaller first: of the
+         *    groups tied at the cut it keeps the ones the stable sort
+         *    would take (TOPN_ITEM_BETTER).  Final per-partition row
+         *    order is preserved so apply_sort_take below can do the
+         *    final arrange-by-agg deterministically.
          *  - We also handle the "fewer total rows than N" case — compact
          *    becomes a no-op.
          *  - Only fires when emit_filter.top_count_take > 0; existing
@@ -17776,8 +17770,8 @@ v2_emit:;
                  *     allocation failure, or a staging array that would not
                  *     reduce.
                  *
-                 * All three feed the same heap in the same (partition asc,
-                 * gid asc) order, so they retain the same set. */
+                 * All three feed the same heap, whose order is total, so they
+                 * retain the same set. */
                 ray_t* stage_hdr = NULL;
                 ray_t* item_hdr = NULL;
                 const uint32_t* item_off = NULL;  /* NULL => uniform stride */
@@ -17861,10 +17855,7 @@ v2_emit:;
                     }
                 }
 
-                /* Merge the per-partition survivors: partitions ascending,
-                 * gid ascending within one — the serial scan's push order,
-                 * which is what makes the retained set identical (condition
-                 * (2) of the topn_heap_push proof).  `item_off` is the
+                /* Merge the per-partition survivors.  `item_off` is the
                  * standalone pre-pass's packed layout; the fused stash uses a
                  * uniform k_take stride instead. */
                 if (scanned)
@@ -17875,23 +17866,19 @@ v2_emit:;
                         uint32_t n = item_cnt[p];
                         for (uint32_t i = 0; i < n; i++)
                             hn = topn_heap_push(heap, hn, k_take, desc_dir,
-                                                h[i].value, h[i].part,
-                                                h[i].gid);
+                                                h[i].value, h[i].first,
+                                                h[i].part, h[i].gid);
                     }
                 scratch_free(item_hdr);
                 scratch_free(stage_hdr);
 
                 if (!scanned)
                     for (uint32_t p = 0; p < radix_n_parts; p++) {
-                        group_ht_t* ph = &part_hts[p];
-                        uint16_t rs = ph->layout.row_stride;
+                        const group_ht_t* ph = &part_hts[p];
                         uint32_t gc = ph->grp_count;
-                        for (uint32_t gi = 0; gi < gc; gi++) {
-                            int64_t v = *(const int64_t*)(const void*)
-                                        (ph->rows + (size_t)gi * rs + order_off);
-                            hn = topn_heap_push(heap, hn, k_take, desc_dir,
-                                                v, p, gi);
-                        }
+                        for (uint32_t gi = 0; gi < gc; gi++)
+                            hn = topn_group_push(heap, hn, k_take, desc_dir,
+                                                 ph, order_off, p, gi);
                     }
 
                 if (hn > 0) {
