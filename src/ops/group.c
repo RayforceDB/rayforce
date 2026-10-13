@@ -1216,10 +1216,10 @@ ray_t* exec_count_distinct(ray_graph_t* g, ray_op_t* op, ray_t* input) {
     if (grain <= 0) grain = 8192;
     int64_t n_tasks_64 = (len + grain - 1) / grain;
     if (n_tasks_64 <= 0) n_tasks_64 = 1;
-    /* MAX_RING_CAP guards against pathological len; if we'd exceed it,
-     * fall back to the sequential kernel — the cap is high enough that
-     * this only fires on absurd inputs. */
-    if (n_tasks_64 > (1u << 16)) {
+    /* Tasks past the ring run in further rounds; the only bound on the task
+     * count is the uint32 ray_pool_dispatch_n takes (a vector that long
+     * cannot exist, so the sequential kernel below is a formality). */
+    if (n_tasks_64 > UINT32_MAX) {
         int64_t cnt = cd_seq_count(in_type, input->attrs, base, len);
         if (cnt < 0) return ray_error("oom", NULL);
         return ray_i64(cnt);
@@ -1497,7 +1497,7 @@ ray_t* distinct_radix_first_ids(ray_t* input) {
     int64_t grain = (int64_t)RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS;
     if (grain <= 0) grain = 8192;
     int64_t n_tasks_64 = (len + grain - 1) / grain;
-    if (n_tasks_64 <= 0 || n_tasks_64 > (1u << 16)) return NULL;
+    if (n_tasks_64 <= 0 || n_tasks_64 > UINT32_MAX) return NULL;   /* dispatch_n takes a uint32 */
     uint32_t n_tasks = (uint32_t)n_tasks_64;
 
     void* base = ray_data(input);
@@ -1835,14 +1835,10 @@ static ray_t* count_distinct_per_group_parallel(
 
     /* Match ray_pool_dispatch's task layout so task_id derived from
      * `start / grain` inside the worker fn matches the row range the
-     * dispatch hands out.  Mirrors pool.c's TASK_GRAIN (8 morsels of
-     * 1024 rows each) and MAX_RING_CAP (65536) clamping logic. */
+     * dispatch hands out: every task is one TASK_GRAIN (8 morsels of
+     * 1024 rows each), however many rounds the ring needs. */
     int64_t grain = (int64_t)RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS;
     int64_t n_tasks = (n_rows + grain - 1) / grain;
-    if (n_tasks > 65536) {
-        n_tasks = 65536;
-        grain = (n_rows + n_tasks - 1) / n_tasks;
-    }
     ctx.grain   = grain;
     ctx.n_tasks = n_tasks;
 
@@ -7540,7 +7536,7 @@ static void minmax_scan_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t
                                              memory_order_relaxed)) \
                         goto minmax_done; \
                     if (kmax >= kmin && \
-                        (uint64_t)(kmax - kmin) > (uint64_t)span_budget) { \
+                        (uint64_t)kmax - (uint64_t)kmin > (uint64_t)span_budget) { \
                         atomic_store_explicit(c->abort_flag, 1, \
                                               memory_order_relaxed); \
                         goto minmax_done; \
@@ -9996,22 +9992,39 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
                 for (size_t i = 0; i < bwords; i++)
                     card += __builtin_popcountll(bits[i]);
                 scratch_free(bits_hdr);
-            } else if (bt == RAY_I64) {
-                const int64_t* v = (const int64_t*)ray_data(seg0);
-                int64_t lo = v[0], hi = v[0];
-                for (int64_t r = 1; r < seg0->len; r++) {
-                    if (v[r] < lo) lo = v[r];
-                    if (v[r] > hi) hi = v[r];
+            } else if (bt == RAY_I64 || bt == RAY_TIMESTAMP ||
+                       bt == RAY_I32 || bt == RAY_DATE || bt == RAY_TIME ||
+                       bt == RAY_I16) {
+                /* Range proxy for every integer-like key, by width.  The
+                 * null sentinel is one group of its own, not the low end
+                 * of the value range: taking it as lo would turn a
+                 * nullable low-cardinality key into a span of ~2^63 (I64)
+                 * or ~2^31 (I32) and force the concat path.  Range over
+                 * the non-null values, plus one group when a null shows. */
+                int64_t lo = INT64_MAX, hi = INT64_MIN;
+                bool has_null = false;
+#define PARTED_KEY_RANGE(T, NULLV) do { \
+                    const T* v = (const T*)ray_data(seg0); \
+                    for (int64_t r = 0; r < seg0->len; r++) { \
+                        if (v[r] == (NULLV)) { has_null = true; continue; } \
+                        if ((int64_t)v[r] < lo) lo = v[r]; \
+                        if ((int64_t)v[r] > hi) hi = v[r]; \
+                    } } while (0)
+                if (bt == RAY_I64 || bt == RAY_TIMESTAMP) PARTED_KEY_RANGE(int64_t, NULL_I64);
+                else if (bt == RAY_I16)                   PARTED_KEY_RANGE(int16_t, NULL_I16);
+                else                                      PARTED_KEY_RANGE(int32_t, NULL_I32);
+#undef PARTED_KEY_RANGE
+                if (lo > hi) {
+                    card = 1;                 /* all null */
+                } else {
+                    /* Unsigned span: hi - lo can still exceed INT64_MAX
+                     * for a full-range I64 key.  A span past the partition
+                     * size already saturates the estimate, so cap it. */
+                    uint64_t span = (uint64_t)hi - (uint64_t)lo;
+                    card = span < (uint64_t)rows_per_part
+                         ? (int64_t)span + 1 : rows_per_part + 1;
+                    if (has_null) card++;
                 }
-                card = hi - lo + 1;
-            } else if (bt == RAY_I32) {
-                const int32_t* v = (const int32_t*)ray_data(seg0);
-                int32_t lo = v[0], hi = v[0];
-                for (int64_t r = 1; r < seg0->len; r++) {
-                    if (v[r] < lo) lo = v[r];
-                    if (v[r] > hi) hi = v[r];
-                }
-                card = (int64_t)(hi - lo + 1);
             } else {
                 card = seg0->len;
             }

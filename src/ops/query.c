@@ -9603,8 +9603,8 @@ ray_t* ray_try_count_select_expr(ray_t* expr, int* handled) {
     int64_t pre_nrows = ray_table_nrows(tbl);
 
     /* Fused predicate→selection: count directly off the streamed rowsel,
-     * skipping the full BOOL vec + the BOOL→rowsel scan.  Unsupported shapes,
-     * or >RAY_POOL_MAX_TASKS fall through to exec_node. */
+     * skipping the full BOOL vec + the BOOL→rowsel scan.  Unsupported shapes
+     * fall through to exec_node. */
     {
         bool all_pass = false;
         ray_t* fsel = exec_pred_to_selection(g, pred, pre_nrows, &all_pass);
