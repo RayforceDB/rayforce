@@ -4297,20 +4297,56 @@ static test_result_t test_topk_prune_cases(void) {
     PASS();
 }
 
+/* One cut of test_group_topn_ties: `shape` at take n over the parted P
+ * equals ref (the stable full sort's first n rows) and the splayed copy's
+ * answer, on every iteration and on the radix ladder. */
+static test_result_t aw_topn_case(const char* shape, int n, int gen, int iters, ray_t* ref) {
+    char q[600], body[300];
+    snprintf(body, sizeof body, shape, "S", n);
+    snprintf(q, sizeof q, "(select %s)", body);
+    ray_t* spl = aw_eval(q);
+    TEST_ASSERT_FMT(spl && !RAY_IS_ERR(spl), "%s: %s", q, ray_error_msg());
+    test_result_t r = aw_csv_eq(q, gen, ref, spl);
+    ray_release(spl);
+    if (r.status != TEST_PASS) return r;
+    snprintf(body, sizeof body, shape, "P", n);
+    snprintf(q, sizeof q, "(select %s)", body);
+    for (int it = 0; it < iters; it++) {
+        agg_route_reset();
+        ray_t* got = aw_eval(q);
+        TEST_ASSERT_FMT(got && !RAY_IS_ERR(got), "%s: %s", q, ray_error_msg());
+        agg_route_stats_t st = agg_route_stats();
+        /* the flattened parted group, on the radix ladder, not v2 */
+        bool radix = st.routes[AGG_ROUTE_PARTED] > 0 && st.routes[AGG_ROUTE_LEGACY] > 0 && !st.topn_native;
+        if (!radix) ray_release(got);
+        TEST_ASSERT_FMT(radix, "%s: not on the radix ladder", q);
+        r = aw_csv_eq(q, it, ref, got);
+        ray_release(got);
+        if (r.status != TEST_PASS) return r;
+    }
+    PASS();
+}
+
 /* #801: a grouped take (`by … desc: <agg> take: N`, N <= 1024) arms the
  * radix group's top-N emit filter, which cuts the groups to exactly N.
  * Groups tied at the cut value are decided by the earliest source row, the
- * order every other group route and the stable sort follow: the answer
+ * order the radix route's phase 3 and the stable sort follow: the answer
  * equals the stable full sort's first N rows (take: 1025 is above the
- * filter's cap, so it sorts everything) and the splayed copy's answer, at
- * every iteration.  10000 groups of 4 rows each, spread over the four
- * partitions (row i holds group i*7919 mod 10000), and 50 groups of 8 rows
- * at the head: the cut falls inside a tie set of thousands of groups.  The
- * SYM keys beside a computed one take the flattened parted group onto the
- * radix fat-entry path. */
+ * filter's cap, so it sorts everything) and the splayed copy's answer (the
+ * v2 engine, a separate route), at every iteration.  The row-to-group map
+ * is aperiodic against the 10050-row partitions and the dispatch tasks:
+ * rows [0, 20000) hold group i*i mod 10007 (about 4 rows each) and rows
+ * [20000, 40000) hold 10007 + i*i mod 5003 (about 8 rows each), groups
+ * that first appear past the first task, so their earliest row is found
+ * only by taking the minimum across workers and partitions.  50 more rows
+ * go to groups 0..49 at the end.  Every cut falls inside a tie set of
+ * thousands of groups.  The SYM keys beside a computed one take the
+ * flattened parted group onto the radix fat-entry path; the integer keys
+ * take its v2 direct-insert phase 2. */
 static test_result_t test_group_topn_ties(void) {
-    aw_eval_ok("(set K (concat (% (* (til 40000) 7919) 10000) (% (til 200) 50)))");
-    aw_eval_ok("(set W (table [s u v g] (list (at (as 'SYMBOL (map (fn [j] (format \"w%\" j)) (til 10000))) K) "
+    aw_eval_ok("(set K (concat (concat (% (* (til 20000) (til 20000)) 10007) (+ 10007 (% (* (til 20000) (til 20000)) 5003))) "
+               "(% (til 200) 50)))");
+    aw_eval_ok("(set W (table [s u v g] (list (at (as 'SYMBOL (map (fn [j] (format \"w%\" j)) (til 15010))) K) "
                "(% K 3) (til 40200) K)))");
     for (int gen = 0; gen <= 2; gen += 2)
         for (int p = 0; p < 4; p++) {
@@ -4341,30 +4377,15 @@ static test_result_t test_group_topn_ties(void) {
                 snprintf(body, sizeof body, shapes[si], "P", 1025);
                 snprintf(q, sizeof q, "(take (select %s) %d)", body, n);
                 ray_t* ref = aw_eval(q);
-                TEST_ASSERT_FMT(ref && !RAY_IS_ERR(ref) && ray_table_nrows(ref) == n, "%s: %s", q, ray_error_msg());
-                snprintf(body, sizeof body, shapes[si], "S", n);
-                snprintf(q, sizeof q, "(select %s)", body);
-                ray_t* spl = aw_eval(q);
-                TEST_ASSERT_FMT(spl && !RAY_IS_ERR(spl), "%s: %s", q, ray_error_msg());
-                test_result_t r = aw_csv_eq(q, gen, ref, spl);
-                ray_release(spl);
-                if (r.status != TEST_PASS) { ray_release(ref); return r; }
-                snprintf(body, sizeof body, shapes[si], "P", n);
-                snprintf(q, sizeof q, "(select %s)", body);
+                TEST_ASSERT_FMT(ref && !RAY_IS_ERR(ref), "%s: %s", q, ray_error_msg());
+                int64_t ref_rows = ray_table_nrows(ref);
+                if (ref_rows != n) ray_release(ref);
+                TEST_ASSERT_FMT(ref_rows == n, "%s: %d rows wanted", q, n);
                 /* the race needs repeats; the other cuts are checked a few times */
                 int iters = si == 0 && ti == 0 && !g_aw_unaligned ? 20 : 3;
-                for (int it = 0; it < iters; it++) {
-                    agg_route_reset();
-                    ray_t* got = aw_eval(q);
-                    TEST_ASSERT_FMT(got && !RAY_IS_ERR(got), "%s: %s", q, ray_error_msg());
-                    agg_route_stats_t st = agg_route_stats();
-                    /* the flattened parted group, on the radix ladder, not v2 */
-                    TEST_ASSERT_TRUE(st.routes[AGG_ROUTE_PARTED] > 0 && st.routes[AGG_ROUTE_LEGACY] > 0 && !st.topn_native);
-                    r = aw_csv_eq(q, it, ref, got);
-                    ray_release(got);
-                    if (r.status != TEST_PASS) { ray_release(ref); return r; }
-                }
+                test_result_t r = aw_topn_case(shapes[si], n, gen, iters, ref);
                 ray_release(ref);
+                if (r.status != TEST_PASS) return r;
             }
     }
     aw_eval_ok("(set P 0)"); aw_eval_ok("(set S 0)"); aw_eval_ok("(set W 0)"); aw_eval_ok("(set K 0)");

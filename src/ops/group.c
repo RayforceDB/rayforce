@@ -17341,8 +17341,8 @@ ht_path:;
      * and admits it only as a real reduction (<= an eighth of the groups).
      * Fusion has to commit before any group exists, so the same test is made
      * against the row count that bounds them: groups <= scattered rows, so
-     * n_parts * k_take <= radix_rows / 8 keeps the stash under 2 bytes per
-     * scattered row — against the >= 16 bytes per row phase 1's fat entries
+     * n_parts * k_take <= radix_rows / 8 keeps the stash (24-byte items) at
+     * most 3 bytes per scattered row — against the >= 16 bytes per row phase 1's fat entries
      * (or the v2 worker HTs) already hold, peak memory cannot move.  Failing
      * that test, or a single worker/partition, or allocation failure, leaves
      * .items NULL and the unchanged post-phase-2 scan runs. */
@@ -17761,7 +17761,8 @@ v2_emit:;
                  *     topn_fuse, at a uniform k_take stride per partition.
                  *  2. the standalone topn_scan_fn pre-pass, admitted when the
                  *     staging array is a real REDUCTION — at most an eighth of
-                 *     the groups, i.e. under 2 bytes per group against the
+                 *     the groups, i.e. at most 3 bytes per group (24-byte
+                 *     items) against the
                  *     >= 24-byte group rows already resident, so peak memory
                  *     cannot move.  (Fusion could not make this test: it must
                  *     commit before any group exists, so it makes the
