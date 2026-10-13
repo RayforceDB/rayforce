@@ -16743,6 +16743,20 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
             ray_release(sub);
 
             if (!bp[bi] || RAY_IS_ERR(bp[bi])) goto batch_fail;
+            /* A zero-survivor partition is built only as the schema
+             * reference.  Grouped on partition keys alone, its sub-group
+             * has no key and still answers one row (the aggregates of no
+             * rows), which the merge would key by this partition: keep
+             * its columns, drop the row.  With no key at all that row is
+             * the empty-input answer of a whole-table aggregate: keep it. */
+            if (sel_cnt == 0 && n_part_keys == 0 && n_mc_keys > 0) {
+                ray_t* zero = make_i64(0);
+                ray_t* empty = zero ? ray_take_fn(bp[bi], zero) : NULL;
+                if (zero) ray_release(zero);
+                ray_release(bp[bi]);
+                bp[bi] = empty;
+                if (!bp[bi] || RAY_IS_ERR(bp[bi])) goto batch_fail;
+            }
             if (ref_bi < 0) ref_bi = bi;   /* first built partial in this batch */
 
             /* Capture agg column name IDs once (all partials share names) */

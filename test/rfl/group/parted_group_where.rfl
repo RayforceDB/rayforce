@@ -138,5 +138,24 @@
 (at RPd2 'cv)  -- (at RFd2 'cv)
 (at RPd2 'mxv) -- (at RFd2 'mxv)
 
+;;     (d3) grouped on the partition key alone, P1 the empty reference
+;;          partition: its sub-group has no key and answers one row of
+;;          empty-input aggregates, which must not surface as a group of P1.
+(set Bd3 (at (.sys.mem) 'group-perpart-runs))
+(set RPd3 (select {cv: (count v) by: part from: Pw where: (> u 700)}))
+(> (at (.sys.mem) 'group-perpart-runs) Bd3) -- true
+(at RPd3 'part) -- [2 3 4]
+(at RPd3 'cv)   -- [99 400 400]
+(set RPd4 (select {cv: (count v) by: part from: Pw where: (and (== part 3) (> v 100))}))
+(at RPd4 'part) -- [3]
+(at RPd4 'cv)   -- [299]
+(set RPd5 (select {cv: (count v) sv: (sum v) by: part from: Pw where: (== part 3)}))
+(at RPd5 'part) -- [3]
+(at RPd5 'cv)   -- [400]
+(set RPd6 (select {cv: (count v) by: {p: part} from: Pw where: (in part [2 4])}))
+(at RPd6 'p)  -- [2 4]
+(at RPd6 'cv) -- [400 400]
+(count (select {cv: (count v) by: part from: Pw where: (> u 5000)})) -- 0
+
 ;; ─── cleanup ─────────────────────────────────────────────────────────────────
 (.sys.exec "rm -rf /tmp/rfl_pgwh")
