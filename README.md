@@ -143,39 +143,42 @@ int main(void) {
 ## Embedding
 
 `make lib` builds the engine as a static library, `librayforce.a`, with no
-dependencies beyond libc, libm and pthreads.
+dependencies beyond libc, libm and pthreads. The build compiles library
+objects with `-ffunction-sections -fdata-sections` (the Makefile's
+`LIB_CFLAGS` flavour, applied automatically to the `.lib.o` objects that go
+into the archive), so no extra flags are needed at this step.
 
-To minimise the linked size, compile the library objects with
-`-ffunction-sections -fdata-sections` (added to `RELEASE_CFLAGS`, the
-release flag list in the Makefile) and pass `-Wl,--gc-sections` on your
-final link, so the linker discards everything your code never reaches.
-A DAG-route client such as [`examples/analytics.c`](examples/analytics.c)
-never touches the Rayfall parser, compiler, REPL or IPC server, and
-section GC drops that whole surface:
+To discard everything your code never reaches, pass `-Wl,--gc-sections` to
+the linker on the final link, and `-s` to strip the result. A DAG-route
+client, meaning one that builds and executes query plans through the
+`ray_graph_*`, `ray_scan` and `ray_execute` C API and never calls
+`ray_eval_str` or loads `.rfl` files, never touches the Rayfall parser,
+compiler, REPL or IPC server, and section GC drops that whole surface
+(mixing the two routes pulls the parser back in):
 
 ```sh
-make lib RELEASE_CFLAGS="-fPIC -Wall -Wextra -Werror -Wstrict-prototypes \
-  -Wno-unused-parameter -std=c17 -O3 -march=native -funroll-loops \
-  -fomit-frame-pointer -fno-math-errno -falign-functions=64 \
-  -fassociative-math -ffp-contract=fast -fno-signed-zeros \
-  -fno-trapping-math -ffunction-sections -fdata-sections"
+make clean && make lib
 cc -O2 -Iinclude -Isrc examples/analytics.c librayforce.a \
-   -lm -lpthread -Wl,--gc-sections -o analytics
+   -lm -lpthread -Wl,--gc-sections -s -o analytics
 ```
 
-The Makefile's `RELEASE_CFLAGS` is the source of truth; the two section
-flags are the only addition.
+The command above is the Linux one. On macOS, use `-Wl,-dead_strip` in
+place of `-Wl,--gc-sections` (the Makefile's platform block does the same
+for its own release links). On MinGW, link the winsock libraries as well:
+`-lws2_32 -lmswsock -lkernel32 -ladvapi32`, with the same section-GC flag
+the toolchain accepts.
 
-A checkout at the time of writing links `analytics.c` to a 3.46 MB
-stripped binary, from a 9.36 MB archive; sizes move with the tree, so
+A checkout at the current commit links `analytics.c` to a 3.47 MB
+stripped binary, from a 10.22 MB archive; sizes move with the tree, so
 this is just one measurement, not a bound.
 
-Memory follows a consumed-argument convention, documented per function in
-the headers: arguments marked `consumes` (`ray_dict_new` "consumes both")
-are released by the call on every path, the error path included; returns
-marked `borrowed` stay owned by the container. Values are COW, managed
-with `ray_retain`/`ray_release`; error objects are owned and freed with
-`ray_error_free`.
+Memory follows consumed-argument conventions documented per function in
+the headers: arguments marked `consumes` are released by the call, and
+returns marked `borrowed` stay owned by the container. On error paths the
+library releases the references it holds, with one known exception: the
+`ray_dict_new` both-arguments-error path leaks, tracked in #790. Values
+are COW, managed with `ray_retain`/`ray_release`; error objects are owned
+and freed with `ray_error_free`.
 
 ## How It Works
 
