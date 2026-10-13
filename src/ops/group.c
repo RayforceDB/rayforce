@@ -7536,7 +7536,7 @@ static void minmax_scan_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t
                                              memory_order_relaxed)) \
                         goto minmax_done; \
                     if (kmax >= kmin && \
-                        (uint64_t)(kmax - kmin) > (uint64_t)span_budget) { \
+                        (uint64_t)kmax - (uint64_t)kmin > (uint64_t)span_budget) { \
                         atomic_store_explicit(c->abort_flag, 1, \
                                               memory_order_relaxed); \
                         goto minmax_done; \
@@ -9992,22 +9992,39 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
                 for (size_t i = 0; i < bwords; i++)
                     card += __builtin_popcountll(bits[i]);
                 scratch_free(bits_hdr);
-            } else if (bt == RAY_I64) {
-                const int64_t* v = (const int64_t*)ray_data(seg0);
-                int64_t lo = v[0], hi = v[0];
-                for (int64_t r = 1; r < seg0->len; r++) {
-                    if (v[r] < lo) lo = v[r];
-                    if (v[r] > hi) hi = v[r];
+            } else if (bt == RAY_I64 || bt == RAY_TIMESTAMP ||
+                       bt == RAY_I32 || bt == RAY_DATE || bt == RAY_TIME ||
+                       bt == RAY_I16) {
+                /* Range proxy for every integer-like key, by width.  The
+                 * null sentinel is one group of its own, not the low end
+                 * of the value range: taking it as lo would turn a
+                 * nullable low-cardinality key into a span of ~2^63 (I64)
+                 * or ~2^31 (I32) and force the concat path.  Range over
+                 * the non-null values, plus one group when a null shows. */
+                int64_t lo = INT64_MAX, hi = INT64_MIN;
+                bool has_null = false;
+#define PARTED_KEY_RANGE(T, NULLV) do { \
+                    const T* v = (const T*)ray_data(seg0); \
+                    for (int64_t r = 0; r < seg0->len; r++) { \
+                        if (v[r] == (NULLV)) { has_null = true; continue; } \
+                        if ((int64_t)v[r] < lo) lo = v[r]; \
+                        if ((int64_t)v[r] > hi) hi = v[r]; \
+                    } } while (0)
+                if (bt == RAY_I64 || bt == RAY_TIMESTAMP) PARTED_KEY_RANGE(int64_t, NULL_I64);
+                else if (bt == RAY_I16)                   PARTED_KEY_RANGE(int16_t, NULL_I16);
+                else                                      PARTED_KEY_RANGE(int32_t, NULL_I32);
+#undef PARTED_KEY_RANGE
+                if (lo > hi) {
+                    card = 1;                 /* all null */
+                } else {
+                    /* Unsigned span: hi - lo can still exceed INT64_MAX
+                     * for a full-range I64 key.  A span past the partition
+                     * size already saturates the estimate, so cap it. */
+                    uint64_t span = (uint64_t)hi - (uint64_t)lo;
+                    card = span < (uint64_t)rows_per_part
+                         ? (int64_t)span + 1 : rows_per_part + 1;
+                    if (has_null) card++;
                 }
-                card = hi - lo + 1;
-            } else if (bt == RAY_I32) {
-                const int32_t* v = (const int32_t*)ray_data(seg0);
-                int32_t lo = v[0], hi = v[0];
-                for (int64_t r = 1; r < seg0->len; r++) {
-                    if (v[r] < lo) lo = v[r];
-                    if (v[r] > hi) hi = v[r];
-                }
-                card = (int64_t)(hi - lo + 1);
             } else {
                 card = seg0->len;
             }
