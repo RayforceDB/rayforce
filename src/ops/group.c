@@ -16963,6 +16963,30 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
             }
             if (!tref) goto batch_fail;
 
+            /* A STR cell points into its own vector's string pool and a LIST
+             * cell holds a reference: concatenate them by value.  The raw
+             * cell copy below left a STR flat with no pool, which the merge
+             * group's key compare read through a NULL pointer. */
+            if (!is_mc && (tref->type == RAY_STR || tref->type == RAY_LIST)) {
+                ray_t* srcs[MERGE_BATCH + 1];
+                int32_t ns = 0;
+                if (running) srcs[ns++] = ray_table_get_col_idx(running, (int64_t)k);
+                for (int32_t i = 0; i < batch_n; i++)
+                    srcs[ns++] = bp[i] ? ray_table_get_col_idx(bp[i], (int64_t)pk_pos) : NULL;
+                ray_t* flat = tref->type == RAY_STR
+                            ? parted_flatten_str(srcs, ns, mrows)
+                            : parted_flatten_list(srcs, ns, mrows);
+                if (!flat || RAY_IS_ERR(flat)) {
+                    if (flat) ray_error_free(flat);
+                    goto batch_fail;
+                }
+                merge_tbl = ray_table_add_col(merge_tbl, mcol_names[k], flat);
+                ray_release(flat);
+                if (!merge_tbl || RAY_IS_ERR(merge_tbl)) goto merge_add_fail;
+                pk_pos++;   /* a STR/LIST key is never MAPCOMMON */
+                continue;
+            }
+
             /* Per-partition group outputs keep their partition's SYM index
              * width, so partials in one batch can legitimately differ —
              * size the merged flat at the max width and convert per
@@ -16986,7 +17010,10 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                 out_attrs = w;
             }
             ray_t* flat = typed_vec_new(tref->type, out_attrs, mrows);
-            if (!flat || RAY_IS_ERR(flat)) goto batch_fail;
+            if (!flat || RAY_IS_ERR(flat)) {
+                if (flat) ray_error_free(flat);
+                goto batch_fail;
+            }
             /* cell ids copied id-preserving from running/partial/MAPCOMMON
              * key vecs — all resolve over the same dictionary (PARTED
              * contract: one root symfile domain), represented by tref. */
@@ -17046,6 +17073,7 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
             flat->attrs |= src_nulls;
             merge_tbl = ray_table_add_col(merge_tbl, mcol_names[k], flat);
             ray_release(flat);
+            if (!merge_tbl || RAY_IS_ERR(merge_tbl)) goto merge_add_fail;
             if (!is_mc) pk_pos++;
         }
 
@@ -17063,6 +17091,27 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                                         (int64_t)n_part_keys + a);
             if (!tref) goto batch_fail;
 
+            /* STR / LIST partials (FIRST/LAST/MIN/MAX): by value, as the
+             * key columns above. */
+            if (tref->type == RAY_STR || tref->type == RAY_LIST) {
+                ray_t* srcs[MERGE_BATCH + 1];
+                int32_t ns = 0;
+                if (running) srcs[ns++] = ray_table_get_col_idx(running, (int64_t)n_keys + a);
+                for (int32_t i = 0; i < batch_n; i++)
+                    srcs[ns++] = bp[i] ? ray_table_get_col_idx(bp[i], (int64_t)n_part_keys + a) : NULL;
+                ray_t* flat = tref->type == RAY_STR
+                            ? parted_flatten_str(srcs, ns, mrows)
+                            : parted_flatten_list(srcs, ns, mrows);
+                if (!flat || RAY_IS_ERR(flat)) {
+                    if (flat) ray_error_free(flat);
+                    goto batch_fail;
+                }
+                merge_tbl = ray_table_add_col(merge_tbl, mcol_names[n_keys + a], flat);
+                ray_release(flat);
+                if (!merge_tbl || RAY_IS_ERR(merge_tbl)) goto merge_add_fail;
+                continue;
+            }
+
             /* SYM partials (FIRST/LAST/MIN/MAX) keep their partition's
              * index width — size at max width, convert per source. */
             uint8_t out_attrs = tref->attrs;
@@ -17078,7 +17127,10 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                 out_attrs = w;
             }
             ray_t* flat = typed_vec_new(tref->type, out_attrs, mrows);
-            if (!flat || RAY_IS_ERR(flat)) goto batch_fail;
+            if (!flat || RAY_IS_ERR(flat)) {
+                if (flat) ray_error_free(flat);
+                goto batch_fail;
+            }
             /* SYM FIRST/LAST/MIN/MAX partials carry raw cell ids — same
              * single-dictionary contract as the key flats above. */
             if (flat->type == RAY_SYM)
@@ -17113,6 +17165,7 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
             flat->attrs |= src_nulls;
             merge_tbl = ray_table_add_col(merge_tbl, mcol_names[n_keys + a], flat);
             ray_release(flat);
+            if (!merge_tbl || RAY_IS_ERR(merge_tbl)) goto merge_add_fail;
         }
 
         /* Free batch partials */
@@ -17153,6 +17206,11 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
 
         continue;
 
+merge_add_fail:
+        /* ray_table_add_col consumed merge_tbl and handed back an error
+         * (ray_release is a no-op on one) or NULL. */
+        if (merge_tbl) ray_error_free(merge_tbl);
+        merge_tbl = NULL;
 batch_fail:
         for (int32_t i = 0; i < batch_n; i++)
             if (bp[i]) ray_release(bp[i]);
