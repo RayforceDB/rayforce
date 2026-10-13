@@ -138,5 +138,71 @@
 (at RPd2 'cv)  -- (at RFd2 'cv)
 (at RPd2 'mxv) -- (at RFd2 'mxv)
 
+;; ══════════════════════════════════════════════════════════════════════════
+;; (e) ORDERED TAKE ON AN AGGREGATE (#729) — `asc:/desc: c take: N` and the
+;;     `having` shape arm a top-N / threshold emit filter for the select's
+;;     group.  It describes the MERGED groups: applied to each partition's
+;;     partial it kept only that partition's top N, and the merge summed the
+;;     survivors.  Uneven partitions with a small first one (keys 0..10) clear
+;;     the cardinality gate, so every shape below streams per partition.
+;; ══════════════════════════════════════════════════════════════════════════
+(set mkp (fn [n m o] (table [k v] (list (% (* (+ o (til n)) 7919) m) (+ o (til n))))))
+(set Q1 (mkp 40 11 0))
+(set Q2 (mkp 6000 31 5))
+(set Q3 (mkp 900 17 11))
+(set Q4 (mkp 8000 29 3))
+(.sys.exec "rm -rf /tmp/rfl_pgtk")
+(.db.splayed.set "/tmp/rfl_pgtk/2024.01.01/t/" Q1)
+(.db.splayed.set "/tmp/rfl_pgtk/2024.01.02/t/" Q2)
+(.db.splayed.set "/tmp/rfl_pgtk/2024.01.03/t/" Q3)
+(.db.splayed.set "/tmp/rfl_pgtk/2024.01.04/t/" Q4)
+(set Pt (.db.parted.get "/tmp/rfl_pgtk/" 't))
+(set TK (table [date k v] (list (concat (concat (take 2024.01.01 40) (take 2024.01.02 6000)) (concat (take 2024.01.03 900) (take 2024.01.04 8000))) (concat (concat (at Q1 'k) (at Q2 'k)) (concat (at Q3 'k) (at Q4 'k))) (concat (concat (at Q1 'v) (at Q2 'v)) (concat (at Q3 'v) (at Q4 'v))))))
+
+(set Be (at (.sys.mem) 'group-perpart-runs))
+(set RPe1 (select {c: (count v) by: k from: Pt asc: c take: 2}))
+(set RPe2 (select {c: (sum v) by: k from: Pt desc: c take: 3}))
+(set RPe3 (select {c: (min v) by: k from: Pt desc: c take: 3}))
+(set RPe4 (select {c: (max v) by: k from: Pt asc: c take: 3}))
+(set RPe5 (select {c: (count v) by: k from: Pt where: (>= date 2024.01.02) asc: c take: 2}))
+(set RPe6 (select {c: (sum v) by: {kk: k} from: Pt where: (> v 100) desc: c take: 3}))
+(set RPe7 (select {n: (count v) c: (sum v) by: k from: Pt desc: c take: 3}))
+(set Ae (at (.sys.mem) 'group-perpart-runs))
+;; PROVES all seven ran through exec_group_per_partition.
+(- Ae Be) -- 7
+(set RFe1 (select {c: (count v) by: k from: TK asc: c take: 2}))
+(set RFe2 (select {c: (sum v) by: k from: TK desc: c take: 3}))
+(set RFe3 (select {c: (min v) by: k from: TK desc: c take: 3}))
+(set RFe4 (select {c: (max v) by: k from: TK asc: c take: 3}))
+(set RFe5 (select {c: (count v) by: k from: TK where: (>= date 2024.01.02) asc: c take: 2}))
+(set RFe6 (select {c: (sum v) by: {kk: k} from: TK where: (> v 100) desc: c take: 3}))
+(set RFe7 (select {n: (count v) c: (sum v) by: k from: TK desc: c take: 3}))
+(at RPe1 'k) -- (at RFe1 'k)
+(at RPe1 'c) -- (at RFe1 'c)
+(at RPe1 'c) -- [193 194]
+(at RPe2 'k) -- (at RFe2 'k)
+(at RPe2 'c) -- (at RFe2 'c)
+(at RPe3 'k) -- (at RFe3 'k)
+(at RPe3 'c) -- (at RFe3 'c)
+(at RPe4 'k) -- (at RFe4 'k)
+(at RPe4 'c) -- (at RFe4 'c)
+(at RPe5 'k) -- (at RFe5 'k)
+(at RPe5 'c) -- (at RFe5 'c)
+(at RPe6 'kk) -- (at RFe6 'kk)
+(at RPe6 'c) -- (at RFe6 'c)
+(at RPe7 'k) -- (at RFe7 'k)
+(at RPe7 'n) -- (at RFe7 'n)
+(at RPe7 'c) -- (at RFe7 'c)
+
+;; `having` over a per-partition group: the count threshold also applies to
+;; the merged counts, not to each partition's partial counts.
+(set RPe8 (select {from: (select {c: (count v) by: k from: Pt}) where: (> c 520)}))
+(set RFe8 (select {from: (select {c: (count v) by: k from: TK}) where: (> c 520)}))
+(count RPe8) -- 17
+(count RPe8) -- (count RFe8)
+(asc (at RPe8 'k)) -- (asc (at RFe8 'k))
+(asc (at RPe8 'c)) -- (asc (at RFe8 'c))
+(.sys.exec "rm -rf /tmp/rfl_pgtk")
+
 ;; ─── cleanup ─────────────────────────────────────────────────────────────────
 (.sys.exec "rm -rf /tmp/rfl_pgwh")

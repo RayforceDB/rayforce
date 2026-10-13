@@ -16351,6 +16351,16 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
     atomic_fetch_add_explicit(&ray_group_perpart_runs_ctr, 1,
                               memory_order_relaxed);
 
+    /* The thread-local emit filter (`asc:/desc: agg take: N`, the `having`
+     * count threshold) describes the MERGED groups.  Applied to one
+     * partition's partial it drops groups whose other partitions would have
+     * lifted them into the answer, and the merge then sums the survivors.
+     * Disarm it for the per-partition and merge executions (restored in
+     * pp_cleanup); the caller's sort/take/where still runs over the merged
+     * result. */
+    ray_group_emit_filter_t saved_emit = ray_group_emit_filter_get();
+    ray_group_emit_filter_set((ray_group_emit_filter_t){0});
+
     uint32_t n_keys = ext->n_keys;
     uint32_t n_aggs = ext->n_aggs;
 
@@ -17204,6 +17214,7 @@ pp_cleanup:
     scratch_free(part_off_hdr);
     scratch_free(local_ids_hdr);
     g->selection = saved_sel;
+    ray_group_emit_filter_set(saved_emit);
     return ret;
 }
 
