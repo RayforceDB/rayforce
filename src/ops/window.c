@@ -1052,26 +1052,12 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                 uint16_t total_bits = 0;
                 bool fits = true;
 
-                /* A float null is NaN, which the composite encode packs
-                 * above every real number (last on ascending), while the
-                 * single-key encode and the merge comparator follow
-                 * sort_nulls_first (a null is the smallest value).
-                 * As in sort.c, keep a null-bearing float key out of the
-                 * composite so the placement does not depend on nrows;
-                 * window has no rank-then-compose path, so it takes the
-                 * merge-sort fallback below. */
-                bool nullable_f64_key = false;
-                for (uint32_t k = 0; k < n_sort; k++)
-                    if (sort_vecs[k]->type == RAY_F64 &&
-                        ray_vec_may_have_nulls(sort_vecs[k])) {
-                        nullable_f64_key = true;
-                        break;
-                    }
-
+                /* A null-bearing F64 key packs its nulls into a reserved
+                 * slot below its minimum (radix_key_bounds_finish), so it
+                 * stays on the composite with the placement the single-key
+                 * encode and the merge comparator give, at every row count. */
                 ray_pool_t* mk_prescan_pool2 = (nrows >= SMALL_POOL_THRESHOLD) ? pool2 : NULL;
-                if (nullable_f64_key) {
-                    fits = false;
-                } else if (n_sort <= MK_PRESCAN_MAX_KEYS && mk_prescan_pool2) {
+                if (n_sort <= MK_PRESCAN_MAX_KEYS && mk_prescan_pool2) {
                     uint32_t nw = ray_pool_total_workers(mk_prescan_pool2);
                     size_t pw_count = (size_t)nw * n_sort;
                     int64_t pw_mins_stack[512], pw_maxs_stack[512];
@@ -1101,6 +1087,7 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                             if (wmin < kmin) kmin = wmin;
                             if (wmax > kmax) kmax = wmax;
                         }
+                        radix_key_bounds_finish(sort_vecs[k], &kmin, &kmax);
                         mins[k] = kmin;
                         maxs[k] = kmax;
                         /* Unsigned subtraction: kmin can be the i64 null
@@ -1136,6 +1123,7 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                         } else if (col->type == RAY_F64) {
                             const double* d = (const double*)ray_data(col);
                             for (int64_t i = 0; i < nrows; i++) {
+                                if (radix_f64_is_null(d[i])) continue;
                                 int64_t v = radix_f64_ord(d[i]);
                                 if (v < kmin) kmin = v;
                                 if (v > kmax) kmax = v;
@@ -1159,6 +1147,7 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                                 if (d[i] > kmax) kmax = (int64_t)d[i];
                             }
                         }
+                        radix_key_bounds_finish(sort_vecs[k], &kmin, &kmax);
                         mins[k] = kmin;
                         maxs[k] = kmax;
                         /* Unsigned subtraction: kmin can be the i64 null

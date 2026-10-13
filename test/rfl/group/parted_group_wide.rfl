@@ -87,10 +87,17 @@
 (.db.splayed.set "/tmp/rfl_pgs/1/t/" (table [a b c d v] (list [-9000000000000000000 9000000000000000000 3] [0N 5 3] (as 'I32 [-2000000000 2000000000 3]) (as 'I32 [0N 5 3]) [10 20 30])))
 (.db.splayed.set "/tmp/rfl_pgs/2/t/" (table [a b c d v] (list [-9000000000000000000 9000000000000000000 4] [0N 5 4] (as 'I32 [-2000000000 2000000000 4]) (as 'I32 [0N 5 4]) [40 50 60])))
 (set Ps (.db.parted.get "/tmp/rfl_pgs/" 't))
+;; Route pinned too: 3 rows per partition, so the full-span keys saturate the
+;; estimate to rows_per_part+1 and the nullable ones count 3 values plus the
+;; null; est_groups*100 > rows_per_part either way, so none of these streams
+;; per partition.  A span computed in signed arithmetic that wrapped small
+;; would pick the per-partition route by accident and still sum right.
+(set B (at (.sys.mem) 'group-perpart-runs))
 (at (select {s: (sum v) from: Ps by: a asc: a}) 's) -- [50 30 60 70]
 (at (select {s: (sum v) from: Ps by: b asc: b}) 's) -- [50 30 60 70]
 (at (select {s: (sum v) from: Ps by: c asc: c}) 's) -- [50 30 60 70]
 (at (select {s: (sum v) from: Ps by: d asc: d}) 's) -- [50 30 60 70]
+(at (.sys.mem) 'group-perpart-runs) -- B
 (.sys.exec "rm -rf /tmp/rfl_pgs")
 
 ;; A nullable low-cardinality key must still stream per partition: the gate
@@ -99,7 +106,10 @@
 ;; to the concat path.  Four groups (null + 1..3) over 1000 rows/partition
 ;; clear est_groups*100 <= rows_per_part only when the null counts as one group.
 (set NN 1000)
-(set PN (fn [b] (table [k j v] (list (at [0N 1 2 3] (% (til NN) 4)) (as 'I32 (at [0N 1 2 3] (% (til NN) 4))) (+ b (til NN))))))
+;; The same for the other integer-like widths — DATE, TIME, TIMESTAMP, I16 —
+;; which had no range estimate at all (card = rows of the partition) and so
+;; always left the per-partition path.
+(set PN (fn [b] (table [k j d t p h v] (list (at [0N 1 2 3] (% (til NN) 4)) (as 'I32 (at [0N 1 2 3] (% (til NN) 4))) (as 'DATE (at [0N 1 2 3] (% (til NN) 4))) (as 'TIME (at [0N 1 2 3] (% (til NN) 4))) (as 'TIMESTAMP (at [0N 1 2 3] (% (til NN) 4))) (as 'I16 (at [0N 1 2 3] (% (til NN) 4))) (+ b (til NN))))))
 (.sys.exec "rm -rf /tmp/rfl_pgn")
 (.db.splayed.set "/tmp/rfl_pgn/1/t/" (PN 0))
 (.db.splayed.set "/tmp/rfl_pgn/2/t/" (PN 1000))
@@ -110,6 +120,18 @@
 (> (at (.sys.mem) 'group-perpart-runs) B) -- true
 (set B (at (.sys.mem) 'group-perpart-runs))
 (at (select {s: (sum v) from: Pn by: j asc: j}) 's) -- [1123500 1124250 1125000 1125750]
+(> (at (.sys.mem) 'group-perpart-runs) B) -- true
+(set B (at (.sys.mem) 'group-perpart-runs))
+(at (select {s: (sum v) from: Pn by: d asc: d}) 's) -- [1123500 1124250 1125000 1125750]
+(> (at (.sys.mem) 'group-perpart-runs) B) -- true
+(set B (at (.sys.mem) 'group-perpart-runs))
+(at (select {s: (sum v) from: Pn by: t asc: t}) 's) -- [1123500 1124250 1125000 1125750]
+(> (at (.sys.mem) 'group-perpart-runs) B) -- true
+(set B (at (.sys.mem) 'group-perpart-runs))
+(at (select {s: (sum v) from: Pn by: p asc: p}) 's) -- [1123500 1124250 1125000 1125750]
+(> (at (.sys.mem) 'group-perpart-runs) B) -- true
+(set B (at (.sys.mem) 'group-perpart-runs))
+(at (select {s: (sum v) from: Pn by: h asc: h}) 's) -- [1123500 1124250 1125000 1125750]
 (> (at (.sys.mem) 'group-perpart-runs) B) -- true
 (.sys.exec "rm -rf /tmp/rfl_pgn")
 

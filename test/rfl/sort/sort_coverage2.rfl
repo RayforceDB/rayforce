@@ -657,16 +657,40 @@
 ;; encoding: with values like ±1e300 the span fit ~58 bits, the direct
 ;; composite ran, and every positive sorted before every negative within a
 ;; k.  Checked against an I64 surrogate s with the same order as f.  100 rows
-;; take the serial prescan, 9000 the pooled prescan + introsort, 20000 the
+;; take the serial prescan + introsort, 6000 the serial prescan + radix
+;; (RADIX_SORT_THRESHOLD 4096 < n < SMALL_POOL_THRESHOLD 8192), 20000 the
 ;; pooled prescan + radix.
 (set FS (fn [n] (table [k f s] (list (take [0 0 0 0 1 1 1 1] n) (take [1e300 -1e300 2e300 -2e300] n) (take [1 -1 2 -2] n)))))
 (set Tfs (FS 100))
 (at (at (xasc Tfs [k f]) 'f) [0 13 26 39 52 65 78 91]) -- [-2e300 -1e300 1e300 2e300 -2e300 -1e300 1e300 2e300]
 (at (xasc Tfs [k f]) 'f) -- (at (xasc Tfs [k s]) 'f)
 (at (xdesc Tfs [k f]) 'f) -- (at (xdesc Tfs [k s]) 'f)
-(set Tfs (FS 9000))
+(set Tfs (FS 6000))
 (at (xasc Tfs [k f]) 'f) -- (at (xasc Tfs [k s]) 'f)
 (at (xdesc Tfs [k f]) 'f) -- (at (xdesc Tfs [k s]) 'f)
 (set Tfs (FS 20000))
 (at (xasc Tfs [k f]) 'f) -- (at (xasc Tfs [k s]) 'f)
 (at (xdesc Tfs [k f]) 'f) -- (at (xdesc Tfs [k s]) 'f)
+
+;; ── composite sort over a nullable F64 key ──────────────────────────────────
+;; A float null is NaN; packed by its bits it went above every real number,
+;; so a multi-key sort placed it last above 64 rows and first (comparator)
+;; below.  The composite now reserves the slot below the key's minimum for
+;; nulls: first on ascending, last on descending, at every row count, as the
+;; I64 surrogate s (0N is INT64_MIN) and the single-key sort place theirs.
+(set FN (fn [n] (table [k f s] (list (take [0 0 0 0 1 1 1 1] n) (take [1.5 0Nf -2.5 3.5] n) (take [1 0N -2 3] n)))))
+(set Tfn (FN 100))
+(at (at (xasc Tfn [k f]) 'f) [0 13 26 39 52 64 76 88]) -- [0Nf -2.5 1.5 3.5 0Nf -2.5 1.5 3.5]
+(at (xasc Tfn [k f]) 'f) -- (at (xasc Tfn [k s]) 'f)
+(at (xdesc Tfn [k f]) 'f) -- (at (xdesc Tfn [k s]) 'f)
+(at (xasc Tfn [k f]) 's) -- (at (xasc Tfn [k s]) 's)
+(set Tfn (FN 6000))
+(at (xasc Tfn [k f]) 'f) -- (at (xasc Tfn [k s]) 'f)
+(at (xdesc Tfn [k f]) 'f) -- (at (xdesc Tfn [k s]) 'f)
+(set Tfn (FN 20000))
+(at (xasc Tfn [k f]) 'f) -- (at (xasc Tfn [k s]) 'f)
+(at (xdesc Tfn [k f]) 'f) -- (at (xdesc Tfn [k s]) 'f)
+;; every row null in the float key: a single slot, the other key decides
+(set Tfa (table [k f v] (list (take [1 0] 6000) (take [0Nf] 6000) (til 6000))))
+(at (xasc Tfa [k f]) 'k) -- (at (xasc Tfa [k]) 'k)
+(sum (at (xasc Tfa [f k]) 'v)) -- 17997000
