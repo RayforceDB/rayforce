@@ -74,6 +74,21 @@ static inline ray_err_t ray_col_check_format(const ray_t* header) {
     return header->order == RAY_COL_FORMAT_MAJOR ? RAY_OK : RAY_ERR_VERSION;
 }
 
+/* STR column files: a writer that stored every pooled descriptor's content
+ * hash (ray_str_t.hash32) says so by putting this value in the header's
+ * `rc` field, which is otherwise 0 on disk for STR (RAY_SYM uses it for
+ * the saved dictionary count).  A reader that sees the mark takes the
+ * descriptors as written; without it (files from before the hash cache,
+ * whose final four descriptor bytes are padding) the loaders recompute the
+ * hashes and repair them in the private mapping.  Mapping a marked file
+ * therefore costs no pass over the pool and leaves the descriptor pages
+ * shared with the page cache. */
+#define RAY_COL_STR_HASHED      ((uint32_t)0x48534148)  /* "HASH" */
+
+static inline void ray_col_stamp_str_hashed(ray_t* header) {
+    header->rc = RAY_COL_STR_HASHED;
+}
+
 /* Column file I/O.
  *
  * The bare save/load/mmap entry points keep PROCESS-LOCAL semantics for
@@ -131,6 +146,23 @@ void      ray_col_want_rows(ray_t* col, const int64_t* idx, int64_t n);
  * store/ header). */
 ray_err_t ray_col_append_index(const char* path, const void* ix,
                                int64_t col_len, int8_t col_type);
+
+/* Build the hash index of `col`, the payload of index-less column file
+ * `path`, and append it as the inline region, built in place: the file is
+ * extended (its blocks allocated) and the region mapped, and the arrays are
+ * written there once instead of staged in memory and copied in.  Same bytes
+ * as ray_col_append_index of the index ray_index_attach_hash builds.  The
+ * marker is stamped last; on failure the file is cut back to the payload.
+ * RAY_ERR_NYI (the file left at, or cut back to, its payload) where the
+ * in-place build does not apply and the caller builds in memory and appends
+ * instead: a STR column; a platform or filesystem where the region's blocks
+ * cannot be held before the mapping writes them (anything but Linux on
+ * ext4, xfs or tmpfs: overlayfs too, whose upper layer cannot be told);
+ * or a region that could not be allocated
+ * or mapped this time.  Any other error is final (RAY_ERR_CANCEL, OOM, an
+ * I/O error on the marker, RAY_ERR_CORRUPT for a file already indexed).
+ * `trace` is a ray_hash_trace_t* (NULL: none), void as `ix` above. */
+ray_err_t ray_col_build_hash_index(const char* path, ray_t* col, void* trace);
 
 /* Seek f to its end, pad to 32 bytes and write ix's inline region there;
  * flushes. Does not touch the header. The caller stamps the marker with

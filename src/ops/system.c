@@ -37,6 +37,7 @@
 #include "core/block.h"
 #include "ops/idxop.h"
 #include "core/profile.h"   /* g_ray_profile — (.sys.prof) */
+#include "core/runtime.h"  /* __VM — (return x) parks its value on the VM */
 #include "core/qmeasure.h"  /* shared per-query measurement lifecycle */
 #include "core/qlog.h"      /* g_qlog — (.sys.querylog) */
 #include "store/serde.h"
@@ -651,7 +652,7 @@ static bool objsize_seen_insert(ray_objsize_walk_t* w, ray_t* p, bool* ok) {
 static size_t objsize_shallow(ray_t* v) {
     if (v->attrs & RAY_ATTR_SLICE) return sizeof(ray_t);
     if (v->type == RAY_LAMBDA)
-        return sizeof(ray_t) + 7 * sizeof(ray_t*);
+        return sizeof(ray_t) + LAMBDA_SLOTS * sizeof(ray_t*);
     if (v->type == RAY_INDEX)
         return sizeof(ray_t) + sizeof(ray_index_t);
     if (RAY_IS_PARTED(v->type))
@@ -697,8 +698,10 @@ static bool objsize_push_children(ray_objsize_walk_t* w, ray_t* v) {
     if (v->type == RAY_LAMBDA) {
         ray_t** slots = (ray_t**)ray_data(v);
         for (int i = 0; i < 4; i++) OBJSIZE_PUSH(slots[i]);
-        OBJSIZE_PUSH(slots[5]);
-        OBJSIZE_PUSH(slots[6]);
+        OBJSIZE_PUSH(LAMBDA_NFO(v));
+        OBJSIZE_PUSH(LAMBDA_DBG(v));
+        OBJSIZE_PUSH(LAMBDA_CLOSURE(v));
+        OBJSIZE_PUSH(LAMBDA_CAPROWS(v));
         return true;
     }
     if (ray_is_atom(v)) {
@@ -1106,15 +1109,21 @@ ray_t* ray_quote_fn(ray_t** args, int64_t n) {
     return a;
 }
 
-/* (return) | (return x) — early exit from enclosing compiled lambda.
- * Outside a compiled lambda (e.g. value position: (map return xs), or
- * REPL top-level) this collapses to: identity for one arg, null for
- * zero, domain error otherwise. The early-exit semantics are emitted
- * by the bytecode compiler — see compile.c. */
+/* (return) | (return x) — early exit from the enclosing lambda.  The
+ * bytecode compiler emits the exit itself (see compile.c); this is the
+ * tree walker's form.  Inside a lambda it parks the value on the VM and
+ * returns the `return` marker, an error-typed value every form propagates
+ * and the lambda call boundary turns back into the value (`try` lets it
+ * through).  Outside any lambda (REPL top level) it is the identity: the
+ * value, or null for no arg. */
 ray_t* ray_return_fn(ray_t** args, int64_t n) {
-    if (n == 0) return RAY_NULL_OBJ;
-    if (n == 1) { ray_retain(args[0]); return args[0]; }
-    return ray_error("domain", "return expects 0 or 1 argument");
+    if (n > 1) return ray_error("domain", "return expects 0 or 1 argument");
+    ray_t* val = n == 1 ? args[0] : RAY_NULL_OBJ;
+    ray_retain(val);
+    if (!__VM || __VM->lambda_depth == 0) return val;
+    if (__VM->return_val) ray_release(__VM->return_val);
+    __VM->return_val = val;
+    return ray_error("return", NULL);
 }
 
 /* (rc x) -- return reference count of object */

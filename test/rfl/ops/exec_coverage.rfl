@@ -348,12 +348,11 @@
 (count (select {from: (select {from: TT where: (< a 0)}) where: (not-in a [1 2 3])})) -- 0
 
 ;; ====================================================================
-;; OP_IN — RAY_STR error path — exec.c:675-676.
-;; Either side being RAY_STR returns ray_error("nyi").  We assert it
-;; produces an `nyi`-tagged error rather than running the kernel.
+;; OP_IN — RAY_STR column.  The typed kernel refuses string cells; the
+;; executor answers them through the general membership path instead.
 ;; ====================================================================
 (set TStrCol (table [s] (list ["alpha" "beta" "gamma"])))
-(select {from: TStrCol where: (in s ["alpha"])}) !- nyi
+(at (select {from: TStrCol where: (in s ["alpha"])}) 's) -- ["alpha"]
 
 ;; ====================================================================
 ;; OP_IN — sym-vs-non-sym type mismatch — exec.c:691-693 sets

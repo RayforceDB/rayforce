@@ -62,6 +62,7 @@
 #include "mem/heap.h"
 #include "mem/sys.h"   /* domain buffers are process-global → mmap-backed, not buddy */
 #include "mem/arena.h"   /* ray_arena_t / ray_arena_str — domain atom storage */
+#include "store/part.h"     /* discard unused partition-owned FILE domains */
 #include "store/fileio.h"   /* flock + tmp/rename protocol for flush */
 #include "ops/hash.h"       /* ray_hash_bytes (same hash family as g_sym) */
 #include "core/pool.h"      /* batch intern: parallel read-only probe */
@@ -590,6 +591,12 @@ static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
 static ray_sym_domain_t* dom_open_impl(const char* path, bool create) {
     if (!path) return NULL;
 
+    /* A script or IPC caller may drop a parted view without running GC.
+     * Do not let its cache-only domain survive into a splayed read/write
+     * of a rebuilt root. Prune before taking g_dom_lock: releasing the
+     * cached SYM columns takes that lock itself. Live views keep their refs. */
+    ray_parted_cache_prune();
+
     char* rpath = dom_resolve_path(path);
     if (!rpath) return NULL;
 
@@ -705,6 +712,16 @@ ray_sym_domain_t* ray_sym_domain_create_import(const char* path) {
     if (d->path) d->imp = ray_symimp_create(path, &d->count);
     if (!d->imp) { ray_sys_free(d->path); ray_sys_free(d); return NULL; }
     return d;
+}
+
+bool ray_sym_domain_import_stats(ray_sym_domain_t* dom, struct ray_symimp_stats_s* out) {
+    if (!dom || dom->kind != DOM_IMPORT) return false;
+    ray_symimp_stats(dom->imp, out);
+    return true;
+}
+
+struct ray_symimp_s* ray_sym_domain_import(ray_sym_domain_t* dom) {
+    return dom && dom->kind == DOM_IMPORT ? dom->imp : NULL;
 }
 
 ray_sym_domain_t* ray_sym_domain_new(void) {
@@ -989,7 +1006,7 @@ int64_t ray_sym_domain_intern(ray_sym_domain_t* dom, const char* str, size_t len
     if (!dom || !str) return -1;
     if (dom->kind == DOM_RUNTIME) return ray_sym_intern(str, len);
     if (dom->kind == DOM_IMPORT) {
-        uint32_t h = (uint32_t)ray_hash_bytes(str, len);
+        uint64_t h = ray_hash_bytes(str, len);
         int64_t pos = -1;
         return ray_symimp_intern_batch(dom->imp, 1, &str, &len, &h, &pos) ? pos : -1;
     }
@@ -1190,8 +1207,19 @@ bool ray_sym_domain_intern_batch(ray_sym_domain_t* dom, int64_t n,
                                  const uint32_t* hashes, int64_t* out_pos) {
     if (!dom || n < 0) return false;
     if (n == 0) return true;
-    if (dom->kind == DOM_IMPORT)
-        return ray_symimp_intern_batch(dom->imp, n, strs, lens, hashes, out_pos);
+    if (dom->kind == DOM_IMPORT) {
+        /* The import dictionary keys on all 64 bits of the hash, which a
+         * caller of this entry point has dropped: hashed again here
+         * (ray_sym_domain_intern_batch64 is the path that keeps them). */
+        uint64_t h64[1024];
+        for (int64_t o = 0; o < n; o += 1024) {
+            int64_t k = n - o < 1024 ? n - o : 1024;
+            for (int64_t i = 0; i < k; i++)
+                h64[i] = strs[o + i] ? ray_hash_bytes(strs[o + i], lens[o + i]) : ray_hash_bytes("", 0);
+            if (!ray_symimp_intern_batch(dom->imp, k, strs + o, lens + o, h64, out_pos + o)) return false;
+        }
+        return true;
+    }
     if (dom->kind == DOM_RUNTIME) {
         for (int64_t i = 0; i < n; i++) {
             int64_t id = ray_sym_intern_prehashed(hashes[i], strs[i], lens[i]);
@@ -1413,6 +1441,23 @@ bool ray_sym_domain_intern_batch(ray_sym_domain_t* dom, int64_t n,
     ray_sys_free(b.tab);
     ray_sys_free(b.ui);
     return ok;
+}
+
+bool ray_sym_domain_intern_batch64(ray_sym_domain_t* dom, int64_t n,
+                                   const char* const* strs, const size_t* lens,
+                                   const uint64_t* hashes, int64_t* out_pos) {
+    if (!dom || n < 0) return false;
+    if (dom->kind == DOM_IMPORT)
+        return n == 0 || ray_symimp_intern_batch(dom->imp, n, strs, lens, hashes, out_pos);
+    /* the other domains key on the low 32 bits; in slices of 4096, which
+     * still take the parallel probe */
+    uint32_t h32[4096];
+    for (int64_t o = 0; o < n; o += 4096) {
+        int64_t k = n - o < 4096 ? n - o : 4096;
+        for (int64_t i = 0; i < k; i++) h32[i] = (uint32_t)hashes[o + i];
+        if (!ray_sym_domain_intern_batch(dom, k, strs + o, lens + o, h32, out_pos + o)) return false;
+    }
+    return true;
 }
 
 int64_t ray_sym_domain_count(ray_sym_domain_t* dom) {

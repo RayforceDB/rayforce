@@ -442,10 +442,11 @@ static void pool_trace_dump(const ray_pool_t* pool) {
             (unsigned long long)(atomic_load_explicit(&pool->win_state, memory_order_relaxed) / 2),
             (unsigned long long)(own + stolen), (unsigned long long)own,
             (unsigned long long)stolen, (unsigned long long)steals);
-    fprintf(stderr, "pool: scan read-ahead %llu KiB per column, requested %llu MiB in %llu ranges\n",
+    fprintf(stderr, "pool: scan read-ahead %llu KiB per column, requested %llu MiB in %llu ranges, %llu MiB asked for in all\n",
             (unsigned long long)(pool->scan_bytes >> 10),
             (unsigned long long)(atomic_load_explicit(&pool_scan_req_bytes, memory_order_relaxed) >> 20),
-            (unsigned long long)atomic_load_explicit(&pool_scan_req_ranges, memory_order_relaxed));
+            (unsigned long long)atomic_load_explicit(&pool_scan_req_ranges, memory_order_relaxed),
+            (unsigned long long)(ray_vm_willneed_bytes() >> 20));
     for (uint32_t w = 0; w < W; w++) {
         const ray_pool_slot_t* s = &pool->slots[w];
         fprintf(stderr, "pool:  w%-3u own %12llu  stolen %12llu  steals %8llu\n", w,
@@ -468,6 +469,9 @@ static void worker_loop(void* arg) {
      * pairs with its acquire: the heap is fully initialised when seen). */
     atomic_store_explicit(&pool->worker_heaps[wctx.worker_id - 1], ray_tl_heap,
                           memory_order_release);
+    /* started: no getenv of this thread's start runs after this (the
+     * creator waits for it, ray_pool_create_impl) */
+    ray_sem_signal(&pool->started);
 
     for (;;) {
         ray_sem_wait(&pool->work_ready);
@@ -625,12 +629,19 @@ static ray_err_t ray_pool_create_impl(ray_pool_t* pool, uint32_t n_workers,
         ray_sys_free(pool->tasks);
         return err;
     }
+    err = ray_sem_init(&pool->started, 0);
+    if (err != RAY_OK) {
+        ray_sem_destroy(&pool->work_ready);
+        ray_sys_free(pool->slots_raw);
+        ray_sys_free(pool->tasks);
+        return err;
+    }
 
     /* Spawn worker threads */
     if (n_workers > 0) {
         pool->threads = (ray_thread_t*)ray_sys_alloc(n_workers * sizeof(ray_thread_t));
         if (!pool->threads) {
-            ray_sem_destroy(&pool->work_ready);
+            ray_sem_destroy(&pool->work_ready); ray_sem_destroy(&pool->started);
             ray_sys_free(pool->slots_raw);
             ray_sys_free(pool->tasks);
             return RAY_ERR_OOM;
@@ -638,7 +649,7 @@ static ray_err_t ray_pool_create_impl(ray_pool_t* pool, uint32_t n_workers,
         pool->worker_heaps = ray_sys_alloc(n_workers * sizeof(*pool->worker_heaps));
         if (!pool->worker_heaps) {
             ray_sys_free(pool->threads);
-            ray_sem_destroy(&pool->work_ready);
+            ray_sem_destroy(&pool->work_ready); ray_sem_destroy(&pool->started);
             ray_sys_free(pool->slots_raw);
             ray_sys_free(pool->tasks);
             return RAY_ERR_OOM;
@@ -659,7 +670,7 @@ static ray_err_t ray_pool_create_impl(ray_pool_t* pool, uint32_t n_workers,
                 }
                 ray_sys_free(pool->worker_heaps);
                 ray_sys_free(pool->threads);
-                ray_sem_destroy(&pool->work_ready);
+                ray_sem_destroy(&pool->work_ready); ray_sem_destroy(&pool->started);
                 ray_sys_free(pool->slots_raw);
                 ray_sys_free(pool->tasks);
                 return RAY_ERR_OOM;
@@ -679,12 +690,17 @@ static ray_err_t ray_pool_create_impl(ray_pool_t* pool, uint32_t n_workers,
                 }
                 ray_sys_free(pool->worker_heaps);
                 ray_sys_free(pool->threads);
-                ray_sem_destroy(&pool->work_ready);
+                ray_sem_destroy(&pool->work_ready); ray_sem_destroy(&pool->started);
                 ray_sys_free(pool->slots_raw);
                 ray_sys_free(pool->tasks);
                 return err;
             }
         }
+        /* Every worker through its start before the pool is handed out:
+         * ray_heap_init reads the environment (getenv), and a caller's
+         * setenv right after this returns could otherwise free the
+         * environment array under one of those reads. */
+        for (uint32_t i = 0; i < n_workers; i++) ray_sem_wait(&pool->started);
     }
 
     return RAY_OK;
@@ -716,7 +732,7 @@ void ray_pool_free(ray_pool_t* pool) {
 
     ray_sys_free(pool->worker_heaps);
     ray_sys_free(pool->threads);
-    ray_sem_destroy(&pool->work_ready);
+    ray_sem_destroy(&pool->work_ready); ray_sem_destroy(&pool->started);
     ray_sys_free(pool->slots_raw);
     ray_sys_free(pool->tasks);
     memset(pool, 0, sizeof(*pool));

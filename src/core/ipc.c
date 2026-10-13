@@ -360,6 +360,7 @@ static bool hook_vm_bind(hook_vm_t* hv) {
 static void hook_vm_unbind(hook_vm_t* hv) {
     if (!hv->owned) return;
     if (hv->owned->raise_val) ray_release(hv->owned->raise_val);
+    if (hv->owned->return_val) ray_release(hv->owned->return_val);
     if (hv->owned->trace) ray_release(hv->owned->trace);
     __VM = NULL;
     ray_free_raw(hv->owned);

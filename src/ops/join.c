@@ -652,15 +652,16 @@ static inline bool join_keys_eq(ray_t* const* l_vecs, ray_t* const* r_vecs, uint
         ray_t* lc = l_vecs[k];
         ray_t* rc = r_vecs[k];
         if (!lc || !rc) return false;
-        /* null == null, null != non-null.  This is the rule the rest of the
-         * runtime already applies to key columns: collection.c's hashset
-         * folds every null into one bucket (so `distinct` keeps exactly one
-         * null and `in` matches null against null), group.c folds them into
-         * one group, and atom_eq answers 1 for two nulls.  Joins used to
-         * reject a null outright, which made `anti-join [c] X X` non-empty
-         * whenever c held a null and made left-join miss a null-keyed match.
-         * As-of join keeps its own documented NULLs-never-match rule; it
-         * does not route through here. */
+        /* null == null, null != non-null.  Joins used to reject a null
+         * outright, which made `anti-join [c] X X` non-empty whenever c held
+         * a null and made left-join miss a null-keyed match.  Two nulls pair
+         * where two values of their key types would be compared: the value
+         * arms below pair STR only with STR and GUID only with GUID and read
+         * every other key type as a raw integer, so the nulls follow that
+         * rule rather than `in`'s (which keeps, say, a date null apart from
+         * an integer null) — a join must not match 5 to 5 across two key
+         * types yet refuse their nulls.  As-of join keeps its own documented
+         * NULLs-never-match rule; it does not route through here. */
         bool l_null = !nullfree && ray_vec_is_null(lc, l);
         bool r_null = !nullfree && ray_vec_is_null(rc, r);
         if (l_null || r_null) {

@@ -49,6 +49,12 @@
 #else
 #include <unistd.h>
 #endif
+#if defined(RAY_OS_LINUX)
+#include <fcntl.h>      /* fallocate: the in-place hash region */
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/vfs.h>    /* fstatfs: the filesystems it is built in place on */
+#endif
 
 /* --------------------------------------------------------------------------
  * validate_sym_bounds -- check all indices in a RAY_SYM column are < sym_count
@@ -529,6 +535,13 @@ static ray_t* col_read_recursive(const uint8_t** pp, size_t* remaining) {
         *pp += data_size; *remaining -= data_size;
 
         if (type == RAY_STR) {
+            /* The nested format carries no hash mark, and files from before
+             * the hash cache hold padding in the descriptor's last four
+             * bytes.  Drop whatever was copied: a zero hash32 is the lazy
+             * state every consumer computes from (ray_str_t_hash32). */
+            ray_str_t* elems = (ray_str_t*)ray_data(vec);
+            for (int64_t i = 0; i < len; i++)
+                if (!ray_str_is_inline(&elems[i])) elems[i].hash32 = 0;
             if (*remaining < 8) { ray_release(vec); return ray_error("corrupt", NULL); }
             uint64_t pool_size;
             memcpy(&pool_size, *pp, 8);
@@ -767,6 +780,148 @@ ray_err_t ray_col_append_index(const char* path, const void* ix_v,
     return err;
 }
 
+#if defined(RAY_OS_LINUX)
+/* Debug builds: RAY_HASH_INJECT names a step of the in-place build to fail
+ * there, for the tests — "fs": the filesystem is not one it trusts;
+ * "fs:<hex>": the filesystem's type is taken to be <hex> (a magic number
+ * as fstatfs reports it), so filesystems the tests cannot mount are
+ * classified too; "grow", "map": the region cannot be allocated, or
+ * mapped; "build": an interrupt as soon as it is mapped; "premarker": the
+ * process ends with the region written, before the marker. */
+static bool col_hash_inject(const char* step) {
+#if defined(DEBUG)
+    const char* e = getenv("RAY_HASH_INJECT");
+    return e && strcmp(e, step) == 0;
+#else
+    (void)step;
+    return false;
+#endif
+}
+static bool col_hash_inject_fs_type(unsigned long* type) {
+#if defined(DEBUG)
+    const char* e = getenv("RAY_HASH_INJECT");
+    if (!e || strncmp(e, "fs:", 3) != 0) return false;
+    char* end = NULL;
+    unsigned long t = strtoul(e + 3, &end, 16);
+    if (end == e + 3 || *end) return false;
+    *type = t;
+    return true;
+#else
+    (void)type;
+    return false;
+#endif
+}
+
+/* Writing the region through a shared mapping is safe only where the
+ * blocks it lands on are held before the first write: a write fault that
+ * needs a block on a full disk is a SIGBUS, and a writeback that fails is
+ * lost without a word (the fwrite append gets ENOSPC instead).  So the
+ * filesystems whose fallocate reserves what the writes use — not
+ * copy-on-write ones (ZFS, btrfs, bcachefs: an overwrite takes new space),
+ * nor network or user ones (NFS, SMB, Ceph, FUSE: the server decides).
+ * Nor overlayfs: it hands the mapping and the fallocate to its upper layer,
+ * which can be any of those, and fstatfs reports the overlay — its upper
+ * directory, named in the mount options, is often not even reachable from
+ * where the overlay is used (a container). */
+static bool col_fs_reserves(int fd) {
+    if (col_hash_inject("fs")) return false;
+    unsigned long type = 0;
+    if (!col_hash_inject_fs_type(&type)) {
+        struct statfs sf;
+        if (fstatfs(fd, &sf) != 0) return false;
+        type = (unsigned long)sf.f_type;
+    }
+    switch (type) {
+    case 0xEF53UL:       /* ext4 (an ext2/3 one has no fallocate: refused there) */
+    case 0x58465342UL:   /* xfs */
+    case 0x01021994UL:   /* tmpfs */
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* A column file's index region, mapped writable for a build in place. */
+typedef struct {
+    int      fd;
+    int64_t  payload_end;   /* the file's length before: the column payload */
+    int64_t  region_off;    /* where the region starts: the payload, 32-aligned */
+    uint8_t* map;           /* the mapping, from the page holding region_off */
+    size_t   map_len;
+    bool     refused;       /* the region could not be allocated or mapped */
+} col_region_t;
+
+/* ray_index_region_fn: `bytes` of region at region_off, zero-filled, its
+ * blocks allocated first — a full disk fails here, not as a fault on a write
+ * through the mapping.  NULL (refused) when either cannot be done. */
+static uint8_t* col_region_map(void* raw, int64_t bytes) {
+    col_region_t* r = (col_region_t*)raw;
+    if (r->map || bytes <= 0) return NULL;
+    int64_t end = r->region_off + bytes;
+    if (col_hash_inject("grow") ||
+        fallocate(r->fd, 0, (off_t)r->payload_end, (off_t)(end - r->payload_end)) != 0) {
+        r->refused = true;
+        return NULL;
+    }
+    long ps = sysconf(_SC_PAGESIZE);
+    int64_t pg = ps > 0 ? (int64_t)ps : 4096;
+    int64_t moff = r->region_off & ~(pg - 1);
+    void* p = col_hash_inject("map") ? MAP_FAILED
+            : mmap(NULL, (size_t)(end - moff), PROT_READ | PROT_WRITE, MAP_SHARED,
+                   r->fd, (off_t)moff);
+    if (p == MAP_FAILED) { r->refused = true; return NULL; }
+    r->map = (uint8_t*)p;
+    r->map_len = (size_t)(end - moff);
+    if (col_hash_inject("build")) ray_request_interrupt();
+    return r->map + (r->region_off - moff);
+}
+#endif
+
+ray_err_t ray_col_build_hash_index(const char* path, ray_t* col, void* trace) {
+#if !defined(RAY_OS_LINUX)
+    /* Elsewhere the blocks a mapped write lands on cannot be held up front
+     * (macOS: APFS is copy-on-write) — the caller builds in memory. */
+    (void)path; (void)col; (void)trace;
+    return RAY_ERR_NYI;
+#else
+    if (!path || !col || RAY_IS_ERR(col)) return RAY_ERR_DOMAIN;
+    if (col->type == RAY_STR) return RAY_ERR_NYI;
+    ray_hash_trace_t* tr = (ray_hash_trace_t*)trace;
+    int fd = open(path, O_RDWR | O_CLOEXEC);
+    if (fd < 0) return RAY_ERR_IO;
+    uint32_t mg = 0;
+    struct stat st;
+    if (pread(fd, &mg, 4, 0) != 4 || fstat(fd, &st) != 0 || st.st_size < 32) {
+        close(fd);
+        return RAY_ERR_IO;
+    }
+    if (mg == COL_IDX_AUX_MAGIC) { close(fd); return RAY_ERR_CORRUPT; }   /* indexed already */
+    if (!col_fs_reserves(fd)) { close(fd); return RAY_ERR_NYI; }
+    col_region_t r = { .fd = fd, .payload_end = (int64_t)st.st_size,
+                       .region_off = ((int64_t)st.st_size + 31) & ~(int64_t)31 };
+    ray_err_t err = ray_index_hash_build_region(col, col_region_map, &r, tr);
+    ray_hash_mark_t tm = tr ? ray_hash_trace_mark() : (ray_hash_mark_t){0};
+    /* the pages stay in the page cache, dirty: the writeback is the kernel's */
+    if (r.map) munmap(r.map, r.map_len);
+    if (err == RAY_OK) {
+        if (col_hash_inject("premarker")) _exit(86);
+        /* the region is in the file before the marker claims it */
+        mg = COL_IDX_AUX_MAGIC;
+        if (pwrite(fd, &mg, 4, 0) != 4) err = RAY_ERR_IO;
+    }
+    /* Without the marker the loader requires the exact payload length.
+     * Best effort, as in ray_col_append_index. */
+    if (err != RAY_OK) (void)!ftruncate(fd, (off_t)r.payload_end);
+    /* A region that could not be allocated or mapped is no reason to go
+     * without the index: the caller builds it in memory and appends it,
+     * where a full disk is an ENOSPC like any other write. */
+    if (err == RAY_ERR_IO && r.refused) err = RAY_ERR_NYI;
+    if (close(fd) != 0 && err == RAY_OK) err = RAY_ERR_IO;
+    if (tr) ray_hash_trace_add(tr, RAY_HXT_APPEND, tm, 0);
+    return err;
+#endif
+}
+
 /* Does the payload hold the type's null sentinel anywhere?  Sequential
  * read with an early return on the first hit; resolves a slice through
  * its parent like every other reader.  Types without a sentinel (BOOL,
@@ -899,6 +1054,9 @@ static ray_err_t col_save_impl(ray_t* vec, const char* path, bool durable) {
         /* For RAY_SYM: store sym count in rc field (always 0 on disk otherwise).
          * This serves as O(1) fast-reject metadata on load. */
         header.rc = (vec->type == RAY_SYM) ? ray_sym_count() : 0;
+        /* STR: every pooled descriptor goes to disk with its content hash
+         * (filled in below), and the header says so (col.h). */
+        if (vec->type == RAY_STR) ray_col_stamp_str_hashed(&header);
 
         /* HAS_INDEX rebase: an attached accelerator index displaces the
          * 16-byte aux union with an index pointer.  Strip HAS_INDEX from the
@@ -998,7 +1156,40 @@ static ray_err_t col_save_impl(ray_t* vec, const char* path, bool durable) {
             data = ray_data(vec);
         }
 
-        if (data_size > 0) {
+        if (data_size > 0 && vec->type == RAY_STR) {
+            /* Pooled descriptors are written with their content hash filled
+             * in (RAY_COL_STR_HASHED).  They are staged through a bounded
+             * buffer: the source may be a mapped or shared column, and a
+             * save must not write into it.  A hash the column already
+             * caches is reused; a missing one (lazy, 0) is computed here. */
+            const ray_str_t* src = (const ray_str_t*)data;
+            ray_t* pool_owner = (vec->attrs & RAY_ATTR_SLICE) ? vec->slice_parent : vec;
+            const char* pool_base = NULL;
+            size_t pool_len = 0;
+            if (pool_owner->str_pool && !RAY_IS_ERR(pool_owner->str_pool) &&
+                pool_owner->str_pool->len > 0) {
+                pool_base = (const char*)ray_data(pool_owner->str_pool);
+                pool_len  = (size_t)pool_owner->str_pool->len;
+            }
+            ray_str_t buf[1024];
+            for (int64_t off = 0; off < vec->len; ) {
+                int64_t cnt = vec->len - off < 1024 ? vec->len - off : 1024;
+                memcpy(buf, src + off, (size_t)cnt * sizeof(ray_str_t));
+                for (int64_t i = 0; i < cnt; i++) {
+                    if (ray_str_is_inline(&buf[i])) continue;
+                    if (!pool_base || buf[i].pool_off > pool_len ||
+                        buf[i].len > pool_len - buf[i].pool_off) {
+                        fclose(f); remove(tmp_path); return RAY_ERR_CORRUPT;
+                    }
+                    buf[i].hash32 = ray_str_t_hash32(&buf[i], pool_base);
+                }
+                written = fwrite(buf, 1, (size_t)cnt * sizeof(ray_str_t), f);
+                if (written != (size_t)cnt * sizeof(ray_str_t)) {
+                    fclose(f); remove(tmp_path); return RAY_ERR_IO;
+                }
+                off += cnt;
+            }
+        } else if (data_size > 0) {
             written = fwrite(data, 1, data_size, f);
             if (written != data_size) { fclose(f); remove(tmp_path); ray_free_raw(sym_xlate); return RAY_ERR_IO; }
         }
@@ -1338,7 +1529,12 @@ static ray_err_t col_validate_str_region(ray_t* hdr, const void* ptr,
         }
     }
 
-    /* Pre-hash-cache column files persisted the descriptor's final four
+    /* A current writer stores every pooled descriptor's content hash and
+     * marks the header (RAY_COL_STR_HASHED, col.h): those descriptors are
+     * taken as written, so mapping the column reads no string bytes and
+     * dirties no descriptor page.
+     *
+     * Pre-hash-cache column files persisted the descriptor's final four
      * bytes as uninitialized padding.  A nonzero legacy value must never be
      * trusted as a content hash: equal strings could otherwise probe
      * different join/group slots and silently produce wrong results.
@@ -1346,11 +1542,19 @@ static ray_err_t col_validate_str_region(ray_t* hdr, const void* ptr,
      * ray_vm_map_file is MAP_PRIVATE / copy-on-write, so refreshing the
      * validated descriptors repairs both callers: ray_col_load copies these
      * values into its buddy block, while ray_col_mmap retains the private
-     * repaired mapping without modifying the file. */
-    for (int64_t i = 0; i < hdr->len; i++) {
-        if (ray_str_is_inline(&elems[i])) continue;
-        uint32_t h = (uint32_t)ray_str_t_hash(&elems[i], pool_base);
-        elems[i].hash32 = h != 0 ? h : 1u;
+     * repaired mapping without modifying the file.  Only a descriptor whose
+     * stored value is wrong is written, so pages that happen to be right
+     * stay shared with the page cache.  Read rc with memcpy: file bytes are
+     * not atomic storage. */
+    uint32_t disk_rc;
+    memcpy(&disk_rc, (const char*)hdr + offsetof(ray_t, rc), sizeof(disk_rc));
+    if (disk_rc != RAY_COL_STR_HASHED) {
+        for (int64_t i = 0; i < hdr->len; i++) {
+            if (ray_str_is_inline(&elems[i])) continue;
+            uint32_t h = (uint32_t)ray_str_t_hash(&elems[i], pool_base);
+            h = h != 0 ? h : 1u;
+            if (elems[i].hash32 != h) elems[i].hash32 = h;
+        }
     }
 
     out->has_str_pool = true;
@@ -1839,6 +2043,19 @@ void ray_col_want_row(ray_t* col, int64_t row) {
     ray_vm_advise_willneed((uint8_t*)ray_data(col) + (size_t)row * esz, esz);
 }
 
+/* A run of pages to request, and the pool task that requests a range of
+ * such runs (col_want_runs_fn). */
+typedef struct { uintptr_t a; size_t bytes; } col_want_run_t;
+typedef struct { const col_want_run_t* runs; size_t nr, per; } col_want_ctx_t;
+
+/* Task `start` of a dispatch_n: runs [start * per, (start + 1) * per). */
+static void col_want_runs_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid; (void)end;
+    const col_want_ctx_t* c = raw;
+    size_t a = (size_t)start * c->per, b = a + c->per < c->nr ? a + c->per : c->nr;
+    for (size_t i = a; i < b; i++) ray_vm_advise_willneed((void*)c->runs[i].a, c->runs[i].bytes);
+}
+
 void ray_col_want_rows(ray_t* col, const int64_t* idx, int64_t n) {
     size_t esz = col_fixed_esz(col);
     if (!esz || n <= 0 || !ray_pool_scan_on()) return;
@@ -1880,9 +2097,18 @@ void ray_col_want_rows(ray_t* col, const int64_t* idx, int64_t n) {
         else ray_vm_advise_willneed((void*)p, esz);
     }
     if (!mark) return;
-    size_t run = 0;
+    /* The runs of marked pages, listed: a run starts at each page marked
+     * whose lower neighbour is not. */
+    const size_t words = (pages + 63) / 64;
+    size_t n_runs = 0;
+    for (size_t w = 0; w < words; w++) {
+        uint64_t m = mark[w], below = (m << 1) | (w ? mark[w - 1] >> 63 : 0);
+        n_runs += (size_t)__builtin_popcountll(m & ~below);
+    }
+    col_want_run_t* runs = n_runs ? ray_alloc_raw(n_runs * sizeof *runs) : NULL;
+    size_t run = 0, nr = 0;
     bool open = false;
-    for (size_t w = 0; w < (pages + 63) / 64; w++) {
+    for (size_t w = 0; runs && w < words; w++) {
         uint64_t m = mark[w];
         if (m == (open ? ~UINT64_C(0) : 0)) continue;
         for (unsigned b = 0; b < 64; b++) {
@@ -1890,12 +2116,31 @@ void ray_col_want_rows(ray_t* col, const int64_t* idx, int64_t n) {
             if (on == open) continue;
             size_t pg = w * 64 + b;
             if (on) run = pg;
-            else ray_pool_want((void*)((p0 + run) << 12), (pg - run) << 12);
+            else runs[nr++] = (col_want_run_t){ (p0 + run) << 12, (pg - run) << 12 };
             open = on;
         }
     }
-    if (open) ray_pool_want((void*)((p0 + run) << 12), (pages - run) << 12);
+    if (open && runs) runs[nr++] = (col_want_run_t){ (p0 + run) << 12, (pages - run) << 12 };
     ray_free_raw(mark);
+    if (!runs) return;
+    /* Many short runs — a sparse sample of a large column, a page apiece —
+     * are requested over the pool's threads, a task per 256 of them
+     * (ray_pool_dispatch_n: the plain dispatch cuts at 8,192 elements, and
+     * thousands of runs would stay on one task): one request costs a few
+     * microseconds of the kernel's, and 30,000 of them on this thread
+     * 100 ms.  Few, or long, each through ray_pool_want, which splits a
+     * long range over the threads itself. */
+    enum { RUNS_PER_TASK = 256 };
+    ray_pool_t* pool = ray_pool_get();
+    if (nr >= 2 * RUNS_PER_TASK && ray_pool_par_dispatch_ok(pool, (int64_t)nr, 2 * RUNS_PER_TASK)) {
+        size_t tasks = (nr + RUNS_PER_TASK - 1) / RUNS_PER_TASK;
+        if (tasks > RAY_POOL_INIT_TASKS) tasks = RAY_POOL_INIT_TASKS;
+        col_want_ctx_t ctx = { runs, nr, (nr + tasks - 1) / tasks };
+        ray_pool_dispatch_n(pool, col_want_runs_fn, &ctx, (uint32_t)tasks);
+    } else {
+        for (size_t i = 0; i < nr; i++) ray_pool_want((void*)runs[i].a, runs[i].bytes);
+    }
+    ray_free_raw(runs);
 }
 
 ray_t* ray_col_mmap_splayed_dom(const char* path, struct ray_sym_domain_s* dom) {

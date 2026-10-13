@@ -47,6 +47,10 @@
 #include <string.h>
 #include <math.h>
 
+/* True if every leaf is constant or reduced to a scalar. */
+bool op_tree_is_scalar(ray_graph_t* g, uint32_t id);
+bool op_tree_is_atom(ray_graph_t* g, uint32_t id);
+
 /* Borrow only while the symbol table stays read-only through the dispatch
  * barrier. Workers compare or copy source-domain codes without interning.
  * File-domain lookup keeps its own publication/lifetime contract. */
@@ -192,6 +196,18 @@ static inline int64_t read_col_i64(const void* data, int64_t row,
         return (int64_t)((const int32_t*)data)[row];
     case RAY_I16:
         return (int64_t)((const int16_t*)data)[row];
+    case RAY_F32: {
+        /* The 4-byte lane's bits, zero-extended, with -0.0 canonicalised
+         * to +0.0 the way the F64 group-key readers do (group_key_f64_bits,
+         * #407): a group hash table stores and compares these bits, so the
+         * two zeros must read alike.  Bit-level, as there, because release
+         * builds use -fno-signed-zeros.  Before this arm F32 fell to the
+         * one-byte default below, and a multi-core group by an F32 key
+         * hashed a byte of each value as the key (#760). */
+        uint32_t u; memcpy(&u, (const float*)data + row, 4);
+        if (u == 0x80000000u) u = 0;
+        return (int64_t)u;
+    }
     default: /* RAY_BOOL, RAY_U8 */
         return (int64_t)((const uint8_t*)data)[row];
     }
@@ -208,6 +224,9 @@ static inline void write_col_i64(void* data, int64_t row, int64_t val,
         ((int32_t*)data)[row] = (int32_t)val; return;
     case RAY_I16:
         ((int16_t*)data)[row] = (int16_t)val; return;
+    case RAY_F32: {
+        uint32_t u = (uint32_t)val; memcpy((float*)data + row, &u, 4); return;
+    }
     default: /* RAY_BOOL, RAY_U8 */
         ((uint8_t*)data)[row] = (uint8_t)val; return;
     }
@@ -642,6 +661,15 @@ ray_op_t* graph_alloc_node(ray_graph_t* g);
  * query.c.  Used by fused_* operators that need to evaluate a small
  * predicate without going through the full select planner. */
 ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr);
+
+/* The rows a `where:` keeps, sampled for the distinct-count route gate
+ * (query.c; exposed for the contract tests): the table rows surviving the
+ * predicate among CD_GATE_WHERE_SAMPLE sampled ones in *rows, *nrows of
+ * them, *population the rows the whole predicate would keep.  NULL (the
+ * outputs then describe the whole table) when the predicate names no
+ * column the gather covers or keeps every sampled row. */
+ray_t* query_cd_gate_where_rows(ray_t* tbl, ray_t* where_expr, int64_t n_table,
+                                const int64_t** rows, int64_t* nrows, int64_t* population);
 
 /* Pointer to trailing bytes after an ext node. */
 #define EXT_TRAIL(ext) ((char*)((ext) + 1))
@@ -1822,6 +1850,9 @@ void ray_group_winners(ray_group_winner_fn fn, void* context, const int64_t* row
 
 /* Gather winning group rows, retaining source domains and native types. */
 ray_t* ray_group_gather(ray_t* column, const int64_t* rows, int64_t count);
+/* Keep a grouped key column's "may have nulls" flag only when a key value is
+ * null (vectorised, pool-split scan); see agg_engine.c. */
+void   ray_group_key_settle_nulls(ray_t* kc);
 
 
 /* A scalar `where:` predicate holds for every row or none.  It needs a truth

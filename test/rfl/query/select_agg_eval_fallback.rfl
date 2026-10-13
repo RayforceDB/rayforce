@@ -70,5 +70,8 @@
 (count (select {t: (til 4) s: (+ (max ts) 1) from: T})) -- 4
 (count (select {t: (til 4) s: (max i) from: T})) -- 4
 
-;; ── a length-changing verb beside an aggregate is still ragged ───────────────
-(select {a: (distinct i) m: (max i) from: (table [i] (list [1 2 2 3]))}) !- length
+;; A scalar aggregate broadcasts to the collection's length in either order.
+(set D (table [i] (list [1 2 2 3])))
+(at (select {a: (distinct i) m: (max i) from: D}) 'm) -- [3 3 3]
+(at (select {m: (max i) a: (distinct i) from: D}) 'm) -- [3 3 3]
+(select {a: (distinct i) v: i from: D}) !- length

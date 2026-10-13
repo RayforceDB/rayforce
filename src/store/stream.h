@@ -28,7 +28,9 @@ typedef struct {
     /* runtime id -> domain position, direct-mapped: the chunk vecs are
      * runtime-domain and a column's values repeat across rows and chunks,
      * so a value is interned into the symfile's domain (a locked probe) the
-     * first time it is met and looked up here after. */
+     * first time it is met and looked up here after.  Made by the first
+     * runtime-domain chunk: NULL while every chunk is already encoded over
+     * `dom` (a converter's own symbol decode) and needs no translation. */
     int64_t*  lut_id;    /* [COL_STREAM_LUT] runtime id per slot, -1 empty */
     uint32_t* lut_pos;   /* [COL_STREAM_LUT] position per slot */
     ray_zone_acc_t* zone;   /* numeric / temporal: the running chunk zone */
