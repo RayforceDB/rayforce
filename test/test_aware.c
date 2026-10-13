@@ -4572,14 +4572,17 @@ static test_result_t test_group_affine_nulls(void) {
  * generation 0's. */
 static void aw_str_key_tables(const char* tag, int n_part, int n_flat) {
     /* STR key mixing CONST vectors (one repeated string) and RAW vectors,
-     * equal strings crossing every vector boundary; two partitions */
+     * equal strings crossing every vector boundary; two partitions, the
+     * second offset and longer, a string in the first only */
     for (int gen = 0; gen <= 2; gen += 2)
         for (int p = 0; p < 2; p++) {
-            char q[800];
+            char q[1000];
+            int n = n_part + p * 1000, off = p * 777;
             snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/%sk%d/2024.01.0%d/t/\" "
-                     "(table [t v] (list (map (fn [j] (if (< (%% j 2048) 1024) \"constant run text\" "
-                     "(format \"long key %%\" (%% j 37)))) (til %d)) (til %d))) {compress: %s})",
-                     tag, gen, p + 1, n_part, n_part, gen ? "true" : "false");
+                     "(table [t v] (list (map (fn [j] (if (and (== %d 0) (== (%% j 4000) 17)) \"in the first partition only\" "
+                     "(if (< (%% j 2048) 1024) \"constant run text\" (format \"long key %%\" (%% j 37))))) (+ %d (til %d))) "
+                     "(+ %d (til %d)))) {compress: %s})",
+                     tag, gen, p + 1, p, off, n, off, n, gen ? "true" : "false");
             aw_eval_ok(q);
         }
     /* the unparted case: one column mixing CONST and RAW vectors */
@@ -4603,24 +4606,39 @@ static void aw_str_key_tables(const char* tag, int n_part, int n_flat) {
                  tag, gen, n_flat, n_flat, gen ? "true" : "false");
         aw_eval_ok(q);
     }
+    /* first occurrence over a selection: z0 z1 z2, then the cycle b a m;
+     * a filter past the z rows sees a m b first, in two partitions */
+    for (int gen = 0; gen <= 2; gen += 2)
+        for (int p = 0; p < 2; p++) {
+            char q[800];
+            snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/%so%d/2024.01.0%d/t/\" "
+                     "(table [t v] (list (map (fn [j] (if (< j 3) (format \"z%%\" j) (at [\"b\" \"a\" \"m\"] (%% j 3)))) "
+                     "(til %d)) (til %d))) {compress: %s})",
+                     tag, gen, p + 1, n_part, n_part, gen ? "true" : "false");
+            aw_eval_ok(q);
+        }
 }
 
-/* Each query on table T, loaded as <tag><kind><gen>, on both generations:
- * equal formatted results, and generation 2 leaves t unmaterialized (its
- * vectors CONST and RAW).  Strict queries materialize nothing at all; the
- * others may materialize v: below RAY_PARALLEL_THRESHOLD rows the serial
+/* Each query on table T, loaded as <tag><kind><gen> (k and o parted), on
+ * both generations: equal formatted results.  AW_SK_KEY (and AW_SK_STRICT):
+ * generation 2 leaves t unmaterialized (its vectors CONST and RAW).
+ * AW_SK_STRICT on a large table: nothing at all materializes; the others
+ * may materialize v, as below RAY_PARALLEL_THRESHOLD rows the serial
  * whole-column strategy (R-RANDOM) reads the aggregates' column whole
- * whatever the key, and a composite key's expression is evaluated over
- * its materialized column (bind_referenced_columns). */
-typedef struct { char kind; bool strict; const char* q; } aw_sk_q_t;
+ * whatever the key, and a composite key's expression is evaluated over its
+ * materialized column (bind_referenced_columns).  AW_SK_DECLINE: shapes
+ * the string-domain swap declines (the key column read by an aggregate or
+ * another key), answers only. */
+enum { AW_SK_DECLINE, AW_SK_KEY, AW_SK_STRICT };
+typedef struct { char kind; int mode; const char* q; } aw_sk_q_t;
 static test_result_t aw_str_key_check(const char* tag, const aw_sk_q_t* qs, bool strict_ok) {
     int64_t tsym = ray_sym_intern("t", 1);
     for (int i = 0; qs[i].q; i++) {
         ray_t* out[2];
         for (int gen = 0; gen <= 2; gen += 2) {
             char b[512];
-            if (qs[i].kind == 'k')
-                snprintf(b, sizeof b, "(set T (.db.parted.get \"" AW_TMP "/%sk%d\" 't))", tag, gen);
+            if (qs[i].kind == 'k' || qs[i].kind == 'o')
+                snprintf(b, sizeof b, "(set T (.db.parted.get \"" AW_TMP "/%s%c%d\" 't))", tag, qs[i].kind, gen);
             else
                 snprintf(b, sizeof b, "(set T (.db.splayed.get \"" AW_TMP "/%s%c%d/\"))", tag, qs[i].kind, gen);
             aw_eval_ok(b);
@@ -4635,9 +4653,12 @@ static test_result_t aw_str_key_check(const char* tag, const aw_sk_q_t* qs, bool
         ray_enccol_info_t info;
         TEST_ASSERT_TRUE(encv && !ray_enccol_info(encv, &info));
         ray_release(t);
-        TEST_ASSERT_FMT(!info.materialized, "%s%c %s: t materialized", tag, qs[i].kind, qs[i].q);
-        TEST_ASSERT_TRUE(qs[i].kind == 'n' || (info.vectors[RAY_ENC_CONST] > 0 && info.vectors[RAY_ENC_RAW] > 0));
-        if (strict_ok && qs[i].strict)
+        if (qs[i].mode != AW_SK_DECLINE) {
+            TEST_ASSERT_FMT(!info.materialized, "%s%c %s: t materialized", tag, qs[i].kind, qs[i].q);
+            TEST_ASSERT_TRUE(qs[i].kind == 'n' || qs[i].kind == 'o' ||
+                             (info.vectors[RAY_ENC_CONST] > 0 && info.vectors[RAY_ENC_RAW] > 0));
+        }
+        if (strict_ok && qs[i].mode == AW_SK_STRICT)
             TEST_ASSERT_FMT(k.materialized == 0, "%s%c %s: %llu materializations", tag, qs[i].kind, qs[i].q,
                             (unsigned long long)k.materialized);
         ray_t* fx = ray_fmt(out[0], 0); ray_t* fy = ray_fmt(out[1], 0);
@@ -4656,18 +4677,37 @@ static test_result_t test_str_key_domain(void) {
     aw_str_key_tables("l", 70000, 140000);
     /* group order is the route's; asc: makes the comparison order-insensitive */
     static const aw_sk_q_t qs[] = {
-        { 'k', true,  "(select {c: (count v) s: (sum v) from: T by: t asc: t})" },
-        { 'k', false, "(select {c: (count v) from: T by: {t: t m: (% v 3)} asc: [t m]})" },   /* composite */
-        { 'u', true,  "(select {c: (count v) s: (sum v) from: T by: t asc: t})" },
-        { 'u', false, "(select {c: (count v) from: T by: {t: t m: (% v 3)} asc: [t m]})" },
-        { 'n', true,  "(select {c: (count v) s: (sum v) from: T by: t asc: t})" },
-        { 'n', false, "(select {c: (count v) from: T by: {t: t m: (% v 3)} asc: [t m]})" },
-        /* no asc: the ids are in first-occurrence order, so a route
-         * emitting groups by first occurrence (or by id) emits generation
-         * 0's order */
-        { 'n', true,  "(select {c: (count v) s: (sum v) from: T by: t})" },
-        { 'u', true,  "(select {c: (count v) s: (sum v) from: T by: t})" },
-        { 0, false, NULL },
+        { 'k', AW_SK_STRICT,  "(select {c: (count v) s: (sum v) from: T by: t asc: t})" },
+        { 'k', AW_SK_KEY,     "(select {c: (count v) from: T by: {t: t m: (% v 3)} asc: [t m]})" },   /* composite */
+        { 'u', AW_SK_STRICT,  "(select {c: (count v) s: (sum v) from: T by: t asc: t})" },
+        { 'u', AW_SK_KEY,     "(select {c: (count v) from: T by: {t: t m: (% v 3)} asc: [t m]})" },
+        { 'n', AW_SK_STRICT,  "(select {c: (count v) s: (sum v) from: T by: t asc: t})" },
+        { 'n', AW_SK_KEY,     "(select {c: (count v) from: T by: {t: t m: (% v 3)} asc: [t m]})" },
+        /* no asc: the ids are in first-occurrence order over the rows
+         * read (the selection, under a filter), so a route emitting groups
+         * by first occurrence (or by id) emits generation 0's order */
+        { 'n', AW_SK_STRICT,  "(select {c: (count v) s: (sum v) from: T by: t})" },
+        { 'u', AW_SK_STRICT,  "(select {c: (count v) s: (sum v) from: T by: t})" },
+        { 'k', AW_SK_STRICT,  "(select {c: (count v) s: (sum v) from: T by: t})" },
+        { 'o', AW_SK_STRICT,  "(select {c: (count v) from: T where: (> v 3) by: t})" },
+        { 'o', AW_SK_STRICT,  "(select {c: (count v) from: T where: (> v 100) by: t})" },
+        { 'u', AW_SK_STRICT,  "(select {c: (count v) from: T where: (> v 3000) by: t})" },
+        /* a composite without asc: on a single-file column generation 0
+         * groups on its DICT codes (RAY_DICT_MIN_ROWS rows and up) or as STR,
+         * and the ids take the same routes; a parted one is not compared
+         * unsorted (generation 0's segments group as STR, by first
+         * occurrence of the tuple, where the ids take the dense route, in
+         * slot order) */
+        { 'u', AW_SK_KEY,     "(select {c: (count v) from: T by: {k: (% v 4) t: t}})" },
+        { 'n', AW_SK_KEY,     "(select {c: (count v) from: T where: (> v 50) by: {t: t k: (% v 4)}})" },
+        /* the swap declines: the key column is read by an aggregate or by
+         * another key's expression */
+        { 'u', AW_SK_DECLINE, "(select {f: (first t) c: (count v) from: T by: t asc: t})" },
+        { 'n', AW_SK_DECLINE, "(select {c: (count t) from: T by: t asc: t})" },
+        { 'k', AW_SK_DECLINE, "(select {d: (count (distinct t)) from: T by: t asc: t})" },
+        { 'k', AW_SK_DECLINE, "(select {c: (count v) from: T by: {t: t u: (concat t \"x\")} asc: t})" },
+        { 'n', AW_SK_DECLINE, "(select {c: (count v) from: T by: {t: t l: (strlen t)} asc: [t l]})" },
+        { 0, 0, NULL },
     };
     test_result_t r = aw_str_key_check("s", qs, false);
     if (r.status != TEST_PASS) return r;

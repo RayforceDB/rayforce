@@ -28,10 +28,11 @@
  * while it is read by range, each with a dense id.  A group-by keys a
  * generation-2 STR column on the ids (an I64 key column built for the query)
  * and emits the groups' strings from the domain, so the column is never
- * materialized.  Ids are assigned in first-occurrence order over the rows:
- * a route emitting groups in first-occurrence order or in id order emits
- * them in the order generation 0's STR key gives.  "" is the STR null (its
- * canonical empty payload): null and "" rows share one id. */
+ * materialized.  Ids are assigned in first-occurrence order over the rows
+ * read (the selected rows, under a selection): a route emitting groups in
+ * first-occurrence order or in id order emits them in the order generation
+ * 0's STR key gives.  "" is the STR null (its canonical empty payload):
+ * null and "" rows share one id. */
 
 #include <rayforce.h>
 #include "store/colrange.h"
@@ -44,6 +45,14 @@ typedef struct ray_strdom_s ray_strdom_t;
  * the id vector is sized by the source's row count.  NULL with *dom_out and
  * *ids_out owned, or an owned error with both NULL. */
 ray_t* ray_strdom_build(ray_col_src_t* src, ray_strdom_t** dom_out, ray_t** ids_out);
+/* ray_strdom_build reading only the rows `sel` selects (a ray_rowsel over
+ * the source's rows; NULL, or one over another row count: every row), the
+ * ids written into caller parts: rows [part_off[i], part_off[i + 1]) into
+ * part_dst[i] (NULL only for an empty part), part_off[0] == 0 and
+ * part_off[n_parts] the source's rows.  An unselected row's id is 0 (it is
+ * never grouped).  NULL with *dom_out owned, or an owned error. */
+ray_t* ray_strdom_build_parts(ray_col_src_t* src, ray_t* sel, int64_t n_parts, const int64_t* part_off,
+                              int64_t* const* part_dst, ray_strdom_t** dom_out);
 /* The strings of ids[0..n) as a new STR vector (the group keys' output); an
  * id outside the domain (none a group emits) reads as "".  NULL with *out
  * owned, or an owned error with *out NULL. */

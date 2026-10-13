@@ -483,8 +483,10 @@ ray_err_t ray_dict_acc_init(ray_dict_acc_t* a);
  * sets dead and returns RAY_OK; further adds are no-ops. A non-OK return
  * (OOM, CANCEL) leaves the accumulator partial: free/discard it. */
 ray_err_t ray_dict_acc_add(ray_dict_acc_t* a, ray_t* v);
+/* The fewest rows a saved generation-0 STR column carries its DICT index at. */
+#define RAY_DICT_MIN_ROWS 65536
 /* The standalone RAY_IDX_DICT for a column of `len` rows, identical to
- * ray_index_dict_compute; NULL when dead or len < 65536. Frees `a`. */
+ * ray_index_dict_compute; NULL when dead or len < RAY_DICT_MIN_ROWS. Frees `a`. */
 ray_t*    ray_dict_acc_finish(ray_dict_acc_t* a, int64_t len);
 void      ray_dict_acc_free(ray_dict_acc_t* a);
 

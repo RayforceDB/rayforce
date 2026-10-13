@@ -1402,7 +1402,7 @@ ray_err_t ray_dict_acc_add(ray_dict_acc_t* a, ray_t* v) {
 }
 
 ray_t* ray_dict_acc_finish(ray_dict_acc_t* a, int64_t len) {
-    if (a->dead || len < 65536 || a->n_rows != len) { ray_dict_acc_free(a); return NULL; }
+    if (a->dead || len < RAY_DICT_MIN_ROWS || a->n_rows != len) { ray_dict_acc_free(a); return NULL; }
     ray_t* codes = ray_vec_new(RAY_I32, len);
     ray_t* first_occ = ray_vec_new(RAY_I32, a->n_distinct > 0 ? a->n_distinct : 1);
     ray_t* idx = ray_index_alloc(RAY_IDX_DICT, RAY_STR, len);

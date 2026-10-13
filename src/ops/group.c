@@ -12122,46 +12122,63 @@ static bool strdom_key_ok(ray_graph_t* g, const ray_op_ext_t* ext, int64_t sym) 
     return true;
 }
 
-/* The id column of STR key `sym` of tbl over a new domain *dom: an I64
+/* The id column of STR key `sym` of tbl over a new domain *dom, ids
+ * first-occurrence over the rows `sel` selects (NULL: every row): an I64
  * vector, or for a parted column a parted wrapper of I64 segments, one per
- * source segment (a missing segment stays missing).  NULL with *dom and
- * *out owned, or an owned error. */
-static ray_t* strdom_key_col(ray_t* tbl, int64_t sym, ray_strdom_t** dom, ray_t** out) {
+ * source segment (a missing segment stays missing), the ids written into
+ * them directly.  NULL with *dom and *out owned, or an owned error. */
+static ray_t* strdom_key_col(ray_t* tbl, int64_t sym, ray_t* sel, ray_strdom_t** dom, ray_t** out) {
     *dom = NULL; *out = NULL;
     ray_col_src_t src;
     ray_t* err = ray_table_col_src(tbl, sym, &src);
     if (err) return err;
     if (!src.obj) return ray_error("domain", "group: key column not found");
     ray_t* ids = NULL;
-    err = ray_strdom_build(&src, dom, &ids);
-    if (!err && src.parted) {
-        int64_t ns = 0; ray_t** segs = NULL; const int64_t* off = NULL;
+    ray_t* dst_hdr = NULL;
+    int64_t one_off[2] = { 0, src.len };
+    int64_t* one_dst[1];
+    int64_t ns = 1; const int64_t* off = one_off; int64_t** dst = one_dst;
+    if (!src.parted) {
+        ids = ray_vec_new(RAY_I64, src.len > 0 ? src.len : 1);
+        if (!ids || RAY_IS_ERR(ids)) { err = ids ? ids : ray_error("oom", NULL); ids = NULL; }
+        else { ids->len = src.len; one_dst[0] = (int64_t*)ray_data(ids); }
+    } else {
+        ray_t** segs = NULL;
         if (!ray_col_src_parted_segs(&src, &ns, &segs, &off, &err))
             err = err ? err : ray_error("type", "group: STR key not parted");
-        ray_t* w = err ? NULL : ray_alloc((size_t)(ns > 0 ? ns : 1) * sizeof(ray_t*));
-        if (!err && (!w || RAY_IS_ERR(w))) err = w ? w : ray_error("oom", NULL);
         if (!err) {
-            w->type = RAY_PARTED_BASE + RAY_I64;
-            w->len = 0;
-            w->attrs = 0;
-            memset(w->aux, 0, 16);
-            ray_t** dst = (ray_t**)ray_data(w);
-            memset(dst, 0, (size_t)(ns > 0 ? ns : 1) * sizeof(ray_t*));
-            for (int64_t i = 0; i < ns && !err; i++) {
-                if (segs[i]) {
+            dst = (int64_t**)scratch_calloc(&dst_hdr, (size_t)(ns > 0 ? ns : 1) * sizeof(int64_t*));
+            ids = ray_alloc((size_t)(ns > 0 ? ns : 1) * sizeof(ray_t*));
+            if (!dst || !ids || RAY_IS_ERR(ids)) {
+                err = ids && RAY_IS_ERR(ids) ? ids : ray_error("oom", NULL);
+                if (ids && !RAY_IS_ERR(ids)) ray_release(ids);   /* len 0: no segments yet */
+                ids = NULL;
+            }
+        }
+        if (!err) {
+            ids->type = RAY_PARTED_BASE + RAY_I64;
+            ids->len = 0;
+            ids->attrs = 0;
+            memset(ids->aux, 0, 16);
+            ray_t** wseg = (ray_t**)ray_data(ids);
+            memset(wseg, 0, (size_t)(ns > 0 ? ns : 1) * sizeof(ray_t*));
+            for (int64_t i = 0; i < ns; i++) {
+                /* a segment of rows gets ids (one not yet opened may read
+                 * NULL here); a missing one holds none */
+                if (segs[i] || off[i + 1] > off[i]) {
                     int64_t n = off[i + 1] - off[i];
                     ray_t* v = ray_vec_new(RAY_I64, n > 0 ? n : 1);
                     if (!v || RAY_IS_ERR(v)) { err = v ? v : ray_error("oom", NULL); break; }
                     v->len = n;
-                    if (n > 0) memcpy(ray_data(v), (const int64_t*)ray_data(ids) + off[i], (size_t)n * sizeof(int64_t));
-                    dst[i] = v;
+                    wseg[i] = v;
+                    dst[i] = (int64_t*)ray_data(v);
                 }
-                w->len = i + 1;
+                ids->len = i + 1;
             }
-            if (err) ray_release(w);
-            else { ray_release(ids); ids = w; }
         }
     }
+    if (!err) err = ray_strdom_build_parts(&src, sel, ns, off, dst, dom);
+    scratch_free(dst_hdr);
     ray_col_src_release(&src);
     if (err) {
         if (ids) ray_release(ids);
@@ -12221,6 +12238,7 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit)
     ray_strdom_t** sdom = NULL; /* string domain per generation-2 STR key (owned) */
     ray_t** sd_col = NULL;      /* its id column (owned) */
     uint32_t sd_n = 0;          /* entries of sdom / sd_col */
+    bool sd_any = false;        /* a key was swapped for string-domain ids */
     if (!tbl || RAY_IS_ERR(tbl) || tbl->type != RAY_TABLE) {
         result = exec_group_run(g, op, tbl, group_limit); goto grp_done;
     }
@@ -12246,17 +12264,25 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit)
         int64_t sym = ke->sym;
         ray_col_meta_t km;
         if (!ray_table_col_meta(tbl, sym, &km)) continue;
-        /* a generation-2 STR key: query-wide domain ids (never under a
-         * slice-group hint, whose slices index the column itself) */
-        if (km.enc && !g->sg_col &&
+        /* a generation-2 STR key: query-wide domain ids */
+        if (km.enc &&
             (RAY_IS_PARTED(km.type) ? RAY_PARTED_BASETYPE(km.type) : km.type) == RAY_STR) {
             bool dup = false;
             for (uint32_t j = 0; j < k; j++) if (sd_col[j] && dict_sym[j] == sym) dup = true;
             if (dup || !strdom_key_ok(g, ext, sym)) continue;
-            ray_t* serr = strdom_key_col(tbl, sym, &sdom[k], &sd_col[k]);
+            /* The ids are first-occurrence over the rows generation 0
+             * orders this key's groups by.  A single-file column as long as
+             * a saved generation-0 STR column carrying its DICT index
+             * (RAY_DICT_MIN_ROWS, up to int32 codes): generation 0 groups on
+             * those codes (above), first-occurrence over the whole column,
+             * so every row.  Otherwise (shorter, or parted, whose segments
+             * group as STR): the selected rows. */
+            bool whole = !RAY_IS_PARTED(km.type) && km.len >= RAY_DICT_MIN_ROWS && km.len <= INT32_MAX;
+            ray_t* serr = strdom_key_col(tbl, sym, whole ? NULL : g->selection, &sdom[k], &sd_col[k]);
             if (serr) { result = serr; goto grp_done; }
             dict_sym[k] = sym;
             any = true;
+            sd_any = true;
             continue;
         }
         if (km.type != RAY_STR ||
@@ -12308,6 +12334,13 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit)
 
     result = exec_group_run(g, op, sub, group_limit);
     ray_release(sub);
+    /* A group's result is a table (or an error): a swapped key's ids are
+     * mapped back below, never returned as the key. */
+    if (sd_any && result && !RAY_IS_ERR(result) && result->type != RAY_TABLE) {
+        ray_release(result);
+        result = ray_error("nyi", "group: string-domain key without a table result");
+        goto grp_done;
+    }
 
     if (result && !RAY_IS_ERR(result) && result->type == RAY_TABLE) {
         for (uint32_t k = 0; k < nk; k++) {
