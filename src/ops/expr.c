@@ -2246,9 +2246,8 @@ ray_t* expr_eval_full(const ray_expr_t* expr, int64_t nrows) {
  * as [i*grain, min((i+1)*grain, nrows)); grain is morsel-aligned so each task
  * owns a contiguous run of whole segments.  On return *parallel and *n_builders
  * describe the dispatch geometry.  Returns NULL when the table needs more tasks
- * than the ring holds (pool clamps n_tasks to RAY_POOL_MAX_TASKS and re-derives
- * a non-morsel-aligned grain, which would trip the worker's `start % grain == 0`
- * assert) or on OOM — caller falls back to the bool path. */
+ * than RAY_POOL_MAX_TASKS (bounds the builder array) or on OOM — caller falls
+ * back to the bool path. */
 static rowsel_builder_t* pred_sel_builders_alloc(int64_t nrows, ray_pool_t* pool,
                                                  bool* parallel,
                                                  uint32_t* n_builders_out) {
@@ -3334,9 +3333,8 @@ static void binary_range(ray_op_t* op, int8_t out_type,
 
     /* SYM index scratch — needed ONLY by narrow-width (W8/W16) or cross-domain
      * SYM columns.  Allocated lazily on the heap (freed at `done:`) rather than
-     * as a stack VLA: the pool can hand a worker a morsel far larger than a page
-     * (grain is total/task_cap once the ring saturates), so an n-sized stack
-     * array would overflow the worker stack.  Non-SYM ops (the common case)
+     * as a stack VLA: a caller can hand a worker a range far larger than a
+     * page, so an n-sized stack array would overflow the worker stack.  Non-SYM ops (the common case)
      * allocate nothing. */
     int64_t* lsym_buf = NULL;
     int64_t* rsym_buf = NULL;

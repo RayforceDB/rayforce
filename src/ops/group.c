@@ -1835,14 +1835,10 @@ static ray_t* count_distinct_per_group_parallel(
 
     /* Match ray_pool_dispatch's task layout so task_id derived from
      * `start / grain` inside the worker fn matches the row range the
-     * dispatch hands out.  Mirrors pool.c's TASK_GRAIN (8 morsels of
-     * 1024 rows each) and MAX_RING_CAP (65536) clamping logic. */
+     * dispatch hands out: every task is one TASK_GRAIN (8 morsels of
+     * 1024 rows each), however many rounds the ring needs. */
     int64_t grain = (int64_t)RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS;
     int64_t n_tasks = (n_rows + grain - 1) / grain;
-    if (n_tasks > 65536) {
-        n_tasks = 65536;
-        grain = (n_rows + n_tasks - 1) / n_tasks;
-    }
     ctx.grain   = grain;
     ctx.n_tasks = n_tasks;
 
