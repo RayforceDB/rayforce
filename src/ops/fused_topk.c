@@ -292,10 +292,10 @@ static bool fpk_one_vec_pruned(const fpk_par_ctx_t* c, int64_t v) {
 }
 
 /* No row of the morsel [row, mend) can beat the bound: every vector it
- * touches (one, or two when a task edge cuts the morsel off the vector
- * grid) says so.  Statistics bound every row of their vector, so a morsel
- * that covers only part of one is pruned as exactly as a whole one: the
- * answer never depends on the grain, and unaligned tasks still prune. */
+ * touches says so.  Task starts stay on the dispatch grain (a multiple of
+ * the vector, pool_geometry), so a morsel touches one vector today; the
+ * loop guards a grain off the vector grid.  Statistics bound every row of
+ * their vector, so a partial morsel is pruned as exactly as a whole one. */
 static bool fpk_vec_pruned(const fpk_par_ctx_t* c, int64_t row, int64_t mend) {
     if (!atomic_load_explicit(&c->bound_set, memory_order_relaxed)) return false;
     int64_t v0 = row / RAY_ENC_VEC, v1 = (mend - 1) / RAY_ENC_VEC;
