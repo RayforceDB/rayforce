@@ -14052,6 +14052,17 @@ by_dict_done:
                 ray_graph_free(g); g = NULL;
             }
             if (by_key_sym < 0 && by_expr->type == RAY_SYM && ray_len(by_expr) > 1) {
+                /* The composite path reads key and output cells row by row,
+                 * which a parted column does not serve: with no where: (one
+                 * flattens the rows it keeps) flatten the columns read. */
+                if (eval_tbl == tbl && table_has_parted_columns(tbl)) {
+                    ray_t* flat = parted_flatten_read_cols(dict, tbl);
+                    if (!flat || RAY_IS_ERR(flat)) {
+                        ray_release(tbl);
+                        scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return flat ? flat : ray_error("oom", NULL);
+                    }
+                    eval_tbl = flat;
+                }
                 int64_t nk = ray_len(by_expr);
                 int64_t* key_syms = (int64_t*)ray_data(by_expr);
                 int64_t nrows = ray_table_nrows(eval_tbl);
@@ -14619,8 +14630,13 @@ by_dict_done:
                             key_vec = ray_str_vec_append(key_vec, sp ? sp : "", sp ? slen : 0);
                         }
                     } else {
+                        /* The composite cells are SYM atoms (runtime ids,
+                         * collection_elem's atom rule), so the key column is a
+                         * runtime-domain W64 vec: the source's width sizes ids
+                         * of the source's own (file) domain and truncated the
+                         * runtime ids into unrelated symbols. */
                         key_vec = (kt == RAY_SYM)
-                                ? ray_sym_vec_new(src->attrs & RAY_SYM_W_MASK, out_groups)
+                                ? ray_sym_vec_new(RAY_SYM_W64, out_groups)
                                 : ray_vec_new(kt, out_groups);
                         if (key_vec && !RAY_IS_ERR(key_vec)) {
                             key_vec->len = out_groups;

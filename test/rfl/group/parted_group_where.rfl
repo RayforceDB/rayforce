@@ -196,3 +196,31 @@
 (at RPe3 'n) -- [13330 6670]
 
 ;; ══════════════════════════════════════════════════════════════════════════
+;; (f) COMPOSITE KEY WITH A ROW OUTPUT (#731) — `b: b by: [s bo]` groups at
+;;     eval level on boxed key cells; a cell is a SYM atom holding the RUNTIME
+;;     id, and the key column was built at the source column's width, which
+;;     sizes FILE-domain ids: the runtime ids were truncated into unrelated
+;;     symbols.  Without a where the parted columns reached the row reader
+;;     unflattened (`type` error).
+;; ══════════════════════════════════════════════════════════════════════════
+(.sys.exec "rm -rf /tmp/rfl_pgwh_cmp")
+(.db.splayed.set "/tmp/rfl_pgwh_cmp/2024.01.01/t/" (table [s bo b] (list ['alpha 'beta 'alpha] [true false true] [91 92 93])))
+(.db.splayed.set "/tmp/rfl_pgwh_cmp/2024.01.02/t/" (table [s bo b] (list ['gamma 'beta] [false true] [94 95])))
+(set Pc (.db.parted.get "/tmp/rfl_pgwh_cmp/" 't))
+(set RPf1 (select {b: b by: [s bo] from: Pc where: (> b 90)}))
+(at RPf1 's)  -- ['alpha 'beta 'gamma 'beta]
+(at RPf1 'bo) -- [true false false true]
+(at RPf1 'b)  -- (list [91 93] [92] [94] [95])
+(set RPf2 (select {b: b c: (+ b 1) by: [s bo] from: Pc}))
+(at RPf2 's)  -- ['alpha 'beta 'gamma 'beta]
+(at RPf2 'b)  -- (list [91 93] [92] [94] [95])
+(at RPf2 'c)  -- (list [92 94] [93] [95] [96])
+;; a splayed (FILE-domain, non-parted) source took the same path
+(.db.splayed.set "/tmp/rfl_pgwh_cmp/flat/" (table [s bo b] (list ['alpha 'beta 'alpha 'gamma 'beta] [true false true false true] [91 92 93 94 95])))
+(set Sc (.db.splayed.get "/tmp/rfl_pgwh_cmp/flat/"))
+(at (select {b: b by: [s bo] from: Sc where: (> b 90)}) 's) -- ['alpha 'beta 'gamma 'beta]
+(at (select {b: b by: [s bo] from: Sc}) 's) -- ['alpha 'beta 'gamma 'beta]
+
+;; ─── cleanup ─────────────────────────────────────────────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_pgwh")
+(.sys.exec "rm -rf /tmp/rfl_pgwh_str /tmp/rfl_pgwh_cmp")
