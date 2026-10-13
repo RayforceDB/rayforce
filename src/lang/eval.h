@@ -254,6 +254,13 @@ void   ray_eval_set_nfo(ray_t* nfo);
 ray_t* ray_get_error_trace(void);
 void   ray_clear_error_trace(void);
 
+/* Pending uncaught (raise x) value.  ray_raise_clear drops it — call at each
+ * top-level evaluation boundary (ray_eval_str does).  ray_raise_render
+ * writes a bounded rendering into buf for an error printer; false when no
+ * raise is pending. */
+void   ray_raise_clear(void);
+bool   ray_raise_render(char* buf, size_t cap);
+
 /* Restricted mode: when true, builtins with RAY_FN_RESTRICTED are blocked. */
 void ray_eval_set_restricted(bool on);
 bool ray_eval_get_restricted(void);
