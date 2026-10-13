@@ -58,6 +58,7 @@
  *   Bit  0x08       vectors:         RAY_ATTR_HAS_INDEX (index ray_t* in aux[0..7])
  *   Bit  0x10       vectors:         RAY_ATTR_SLICE
  *   Bit  0x20       -RAY_SYM:        ATTR_QUOTED (quoted/literal symbol; default = name reference)
+ *   Bit  0x20       -RAY_I64 atoms:  RAY_ATTR_DLPROG (Datalog program handle in .i64)
  *   Bit  0x20       vectors:         RAY_ATTR_SORTED (non-descending order marker)
  *   Bit  0x40       vectors:         RAY_ATTR_HAS_NULLS (sentinel-encoded; payload is truth;
  *                                    a slice inherits its parent's bit)

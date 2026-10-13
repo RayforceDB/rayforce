@@ -613,6 +613,8 @@ Low-level API for building and evaluating Datalog programs directly, bypassing t
 | `dl-query` | binary | Query a derived or base relation | `(dl-query prog 'edge)` |
 | `dl-provenance` | binary | Reserved provenance hook; currently returns `domain: not available` | `(dl-provenance prog 'rel)` |
 
+A `dl-program` handle owns its program. Rebinding its symbol or leaving the handle's scope releases the program automatically; use `(dl-free prog)` to release it earlier.
+
 ```lisp
 ; Low-level Datalog program
 (set prog (dl-program))
