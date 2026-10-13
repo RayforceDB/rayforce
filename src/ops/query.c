@@ -16789,6 +16789,20 @@ by_dict_done:
                         scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return eval_tbl ? eval_tbl : ray_error("oom", NULL);
                     }
                     release_eval_tbl = 1;
+                } else if (table_has_parted_columns(tbl)) {
+                    /* No where:, or one every row passes: no selection
+                     * compacted the source, so its columns are still
+                     * segmented.  The fallback evaluates whole-column
+                     * verbs (distinct, asc, ...) over them, which take
+                     * plain vectors: flatten the columns the select
+                     * reads, as a partial where: does. */
+                    eval_tbl = parted_flatten_read_cols(dict, tbl);
+                    if (!eval_tbl || RAY_IS_ERR(eval_tbl)) {
+                        ray_graph_free(g); ray_release(tbl);
+                        scratch_free(sagg_hdr);
+                        scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return eval_tbl ? eval_tbl : ray_error("oom", NULL);
+                    }
+                    release_eval_tbl = 1;
                 }
                 ray_t* result = eval_scalar_agg_outputs(dict_elems, dict_n, eval_tbl,
                                                         from_id, where_id, by_id,
