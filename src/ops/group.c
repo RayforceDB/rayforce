@@ -10340,6 +10340,56 @@ static int64_t ray_grp_card_lookup(int64_t sym) {
 /* exec_group wrapper: when a plain STR scan key carries a RAY_IDX_DICT, group on
  * its int32 codes (cheap integer path) instead of the 16-byte descriptors, then
  * map codes -> strings on the small result.  Falls through otherwise. */
+/* The length error for an aggregate input that carries none of the rows
+ * but holds several values (`(sum [1 2 3])` over ten rows, a global vector
+ * of another length): the aggregation loops read an input row by row, so
+ * such a vector was read past its end.  A vector of the table's length
+ * stands for a column (sliced per group, filtered by where:), and one value
+ * (an atom or a one-element vector) is spread over the rows; anything else
+ * is an error.  COUNT reads no value of its input.  Cold: only a constant
+ * collection ever gets here. */
+static __attribute__((noinline, cold)) ray_t* group_const_input_check(ray_graph_t* g, uint32_t id,
+                                                                      ray_t* tbl, int64_t nrows) {
+    ray_op_t* in = op_node(g, id);
+    if (!in) return NULL;
+    ray_op_ext_t* x = find_ext(g, in->id);
+    ray_t* v = NULL;
+    bool owned = false;
+    if (in->opcode == OP_CONST) {
+        v = x ? x->literal : NULL;
+    } else {
+        ray_t* saved = g->table;
+        g->table = tbl;
+        v = exec_node(g, in);
+        g->table = saved;
+        if (!v || RAY_IS_ERR(v)) return v;
+        owned = true;
+    }
+    ray_t* err = NULL;
+    if (v && !ray_is_atom(v) && (ray_is_vec(v) || v->type == RAY_LIST) &&
+        v->len != 1 && v->len != nrows)
+        err = ray_error("length", "aggregate input has %lld values for %lld rows",
+                        (long long)v->len, (long long)nrows);
+    if (owned) ray_release(v);
+    return err;
+}
+
+static ray_t* group_const_inputs_check(ray_graph_t* g, ray_op_ext_t* ext, ray_t* tbl) {
+    int64_t nrows = ray_table_nrows(tbl);
+    for (uint32_t a = 0; a < ext->n_aggs; a++) {
+        if (ext->agg_ops[a] == OP_COUNT) continue;
+        uint32_t ids[2] = { ext->agg_ins[a],
+                            ext->agg_ins2 ? ext->agg_ins2[a] : RAY_OP_NONE };
+        for (int k = 0; k < 2; k++) {
+            if (ids[k] == RAY_OP_NONE) continue;
+            if (!op_tree_is_scalar(g, ids[k]) || op_tree_is_atom(g, ids[k])) continue;
+            ray_t* err = group_const_input_check(g, ids[k], tbl, nrows);
+            if (err) return err;
+        }
+    }
+    return NULL;
+}
+
 ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit) {
     ray_dict_cd_clear();
     /* Save the outer group-key cardinality hint and publish a fresh empty one
@@ -10368,6 +10418,7 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit)
         result = exec_group_run(g, op, tbl, group_limit); goto grp_done;
     }
     ray_op_ext_t* ext = find_ext(g, op->id);
+    if (ext && (result = group_const_inputs_check(g, ext, tbl))) goto grp_done;
     if (!ext || ext->n_keys == 0) {
         result = exec_group_run(g, op, tbl, group_limit); goto grp_done;
     }
@@ -16351,6 +16402,16 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
     atomic_fetch_add_explicit(&ray_group_perpart_runs_ctr, 1,
                               memory_order_relaxed);
 
+    /* The thread-local emit filter (`asc:/desc: agg take: N`, the `having`
+     * count threshold) describes the MERGED groups.  Applied to one
+     * partition's partial it drops groups whose other partitions would have
+     * lifted them into the answer, and the merge then sums the survivors.
+     * Disarm it for the per-partition and merge executions (restored in
+     * pp_cleanup); the caller's sort/take/where still runs over the merged
+     * result. */
+    ray_group_emit_filter_t saved_emit = ray_group_emit_filter_get();
+    ray_group_emit_filter_set((ray_group_emit_filter_t){0});
+
     uint32_t n_keys = ext->n_keys;
     uint32_t n_aggs = ext->n_aggs;
 
@@ -17234,6 +17295,7 @@ pp_cleanup:
     scratch_free(part_off_hdr);
     scratch_free(local_ids_hdr);
     g->selection = saved_sel;
+    ray_group_emit_filter_set(saved_emit);
     return ret;
 }
 
