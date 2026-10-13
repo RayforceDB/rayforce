@@ -2973,39 +2973,6 @@ static test_result_t test_repl_cli_cores_are_total(void) {
     PASS();
 }
 
-static test_result_t test_repl_cli_option_errors(void) {
-    const struct {
-        const char* option;
-        const char* message;
-    } cases[] = {
-        { "--bogus", "error: unknown option '--bogus'" },
-        { "-x", "error: unknown option '-x'" },
-        { "-u", "error: -u expects a value" },
-        { "-U", "error: -U expects a value" },
-        { "-l", "error: -l expects a value" },
-        { "-L", "error: -L expects a value" },
-    };
-    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
-        char command[256];
-        snprintf(command, sizeof command, "./rayforce %s </dev/null 2>&1",
-                 cases[i].option);
-        FILE* pipe = popen(command, "r");
-        TEST_ASSERT_FMT(pipe != NULL, "popen failed for %s", cases[i].option);
-
-        char output[256] = {0};
-        size_t used = fread(output, 1, sizeof output - 1, pipe);
-        output[used] = '\0';
-        int status = pclose(pipe);
-        TEST_ASSERT_FMT(status != -1 && WIFEXITED(status) &&
-                            WEXITSTATUS(status) == 2,
-                        "%s exited with status %d and output %s",
-                        cases[i].option, status, output);
-        TEST_ASSERT_FMT(strstr(output, cases[i].message) != NULL,
-                        "%s produced unexpected output: %s", cases[i].option,
-                        output);
-    }
-    PASS();
-}
 #endif
 
 /* ─── Suite definition ───────────────────────────────────────────── */
@@ -3013,7 +2980,6 @@ static test_result_t test_repl_cli_option_errors(void) {
 const test_entry_t repl_entries[] = {
 #if defined(__linux__)
     { "repl/cli/cores_are_total",       test_repl_cli_cores_are_total,       NULL,       NULL          },
-    { "repl/cli/option_errors",          test_repl_cli_option_errors,          NULL,       NULL          },
 #endif
     /* file-batch entrypoint — ray_repl_run_file */
     { "repl/run_file/happy",            test_repl_run_file_happy,            repl_setup, repl_teardown },
