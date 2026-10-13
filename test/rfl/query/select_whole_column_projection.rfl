@@ -60,3 +60,27 @@
 (at (select {y: x k: (if true 7 0) from: TPB}) 'k) -- (take 7 7)
 (count (select {k: (+ (sum x) 0) from: TPB})) -- 1
 (.sys.exec "rm -rf /tmp/rfl_scalar_bcast_parted") -- 0
+
+;; A scalar aggregate over a whole-column verb, `(first (asc k))`, has no DAG
+;; node and lands in the scalar-aggregate eval fallback, which binds every
+;; column whole.  Over a parted table it bound the parted column itself, and
+;; `asc` rejected it ("asc expects a vector", #732).  Parted == flat for
+;; first/last over asc/desc, with or without where:, across column types.
+(.sys.exec "rm -rf /tmp/rfl_scalar_asc_parted")
+(set W1 (table [s k f t d n] (list ['b 'a 'c] [3 1 2] [1.5 0.5 2.5] (list "bb" "aa" "cc") [2024.03.02 2024.03.01 2024.03.05] [7 0Nl 5])))
+(set W2 (table [s k f t d n] (list ['a ' 'd] [5 4 6] [-1.0 4.0 0Nf] (list "ab" "" "zz") [2024.02.01 2024.04.01 2024.01.09] [0Nl 2 9])))
+(.db.splayed.set "/tmp/rfl_scalar_asc_parted/2024.01.01/t/" W1)
+(.db.splayed.set "/tmp/rfl_scalar_asc_parted/2024.01.02/t/" W2)
+(set TPW (.db.parted.get "/tmp/rfl_scalar_asc_parted/" 't))
+(set TFW (table [s k f t d n] (list (concat (at W1 's) (at W2 's)) (concat (at W1 'k) (at W2 'k)) (concat (at W1 'f) (at W2 'f)) (concat (at W1 't) (at W2 't)) (concat (at W1 'd) (at W2 'd)) (concat (at W1 'n) (at W2 'n)))))
+(at (select {x: (first (asc k)) from: TPW}) 'x) -- [1]
+(select {x: (first (asc k)) from: TPW}) -- (select {x: (first (asc k)) from: TFW})
+(select {x: (last (asc k)) y: (first (desc k)) from: TPW}) -- (select {x: (last (asc k)) y: (first (desc k)) from: TFW})
+(select {x: (first (asc f)) y: (last (asc f)) from: TPW}) -- (select {x: (first (asc f)) y: (last (asc f)) from: TFW})
+(select {x: (first (asc s)) y: (last (asc s)) z: (first (desc s)) from: TPW}) -- (select {x: (first (asc s)) y: (last (asc s)) z: (first (desc s)) from: TFW})
+(select {x: (first (asc t)) y: (last (asc t)) from: TPW}) -- (select {x: (first (asc t)) y: (last (asc t)) from: TFW})
+(select {x: (first (asc d)) y: (last (desc d)) from: TPW}) -- (select {x: (first (asc d)) y: (last (desc d)) from: TFW})
+(select {x: (first (asc n)) y: (last (asc n)) from: TPW}) -- (select {x: (first (asc n)) y: (last (asc n)) from: TFW})
+(select {x: (first (asc k)) c: (count k) m: (min s) from: TPW}) -- (select {x: (first (asc k)) c: (count k) m: (min s) from: TFW})
+(select {x: (first (asc s)) y: (last (asc k)) from: TPW where: (> k 1)}) -- (select {x: (first (asc s)) y: (last (asc k)) from: TFW where: (> k 1)})
+(.sys.exec "rm -rf /tmp/rfl_scalar_asc_parted") -- 0
