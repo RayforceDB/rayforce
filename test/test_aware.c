@@ -3153,6 +3153,69 @@ static test_result_t test_gather_points_forged(void) {
     PASS();
 }
 
+/* Task 10b: HEAD(SORT) under a lazy selection over a parted table (late
+ * materialization).  The keys are compacted and top-k'd, then only the
+ * winners' rows of every column gathered: the answer is the full sort's
+ * first rows (ties kept by row order, nulls where the sort puts them),
+ * on both generations, and generation 2's equals generation 0's.  k has
+ * ties and nulls, s is a SYM key (string order), t the row number; one
+ * selection holds whole segments (ALL) beside partial ones.  A take at
+ * or past the selection's rows keeps the old route (counter unchanged). */
+static test_result_t test_sort_head_late(void) {
+    static const int64_t np[2] = { 3000, 37000 };
+    for (int gen = 0; gen <= 2; gen += 2)
+        for (int p = 0; p < 2; p++) {
+            char q[1600];
+            snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/sl%d/2024.01.0%d/t/\" "
+                     "(table [k v s t] (list (map (fn [j] (if (== 0 (%% j 101)) 0N (%% (* j 7919) 50))) (til %lld)) "
+                     "(as 'I32 (%% (* (til %lld) 31) 1000)) "
+                     "(as 'SYMBOL (map (fn [j] (format \"s%%\" (%% j 37))) (til %lld))) (+ %lld (til %lld)))) "
+                     "\"" AW_TMP "/sl%d/.sym\" {compress: %s})", gen, p + 1, (long long)np[p], (long long)np[p],
+                     (long long)np[p], (long long)(p ? np[0] : 0), (long long)np[p], gen, gen ? "true" : "false");
+            aw_eval_ok(q);
+        }
+    const char* t0 = "(.db.parted.get \"" AW_TMP "/sl0\" 't)";
+    const char* t2 = "(.db.parted.get \"" AW_TMP "/sl2\" 't)";
+    static const struct { const char* q; const char* ref; bool late; } qs[] = {
+        { "(select {from: T where: (> v 900) asc: k take: 25})",
+          "(take (select {from: T where: (> v 900) asc: k}) 25)", true },
+        { "(select {from: T where: (> v 900) desc: k take: 25})",
+          "(take (select {from: T where: (> v 900) desc: k}) 25)", true },
+        { "(select {from: T where: (< v 500) asc: [k s] take: 40})",
+          "(take (select {from: T where: (< v 500) asc: [k s]}) 40)", true },
+        { "(select {from: T where: (== (% v 7) 3) desc: s take: 12})",
+          "(take (select {from: T where: (== (% v 7) 3) desc: s}) 12)", true },
+        { "(select {from: T where: (or (< t 2048) (== 0 (% v 3))) asc: t take: 2100})",
+          "(take (select {from: T where: (or (< t 2048) (== 0 (% v 3))) asc: t}) 2100)", true },
+        { "(select {from: T where: (or (< t 2048) (== 0 (% v 3))) desc: v take: 50})",   /* part of the ALL segments */
+          "(take (select {from: T where: (or (< t 2048) (== 0 (% v 3))) desc: v}) 50)", true },
+        { "(select {from: T where: (> v 998) asc: k take: 5000})",
+          "(select {from: T where: (> v 998) asc: k})", false },          /* 40 rows: a longer take would cycle */
+    };
+    for (size_t i = 0; i < sizeof qs / sizeof *qs; i++) {
+        uint64_t h0 = ray_sort_test_late_heads();
+        AW_CSV_SAME(t0, t2, qs[i].q, 0);
+        uint64_t got = ray_sort_test_late_heads() - h0;
+        TEST_ASSERT_FMT(got == (qs[i].late ? 2u : 0u), "%s: %llu late heads", qs[i].q, (unsigned long long)got);
+        /* generation 0's answer is the full sort's first rows */
+        char buf[600]; char* csv[2]; size_t len[2];
+        snprintf(buf, sizeof buf, "(set T %s)", t0);
+        aw_eval_ok(buf);
+        for (int w = 0; w < 2; w++) {
+            ray_t* r = ray_eval_str(w ? qs[i].ref : qs[i].q);
+            TEST_ASSERT_FMT(r && !RAY_IS_ERR(r), "%s: %s", w ? qs[i].ref : qs[i].q, ray_error_msg());
+            ray_env_set(ray_sym_intern("R", 1), r);
+            ray_release(r);
+            csv[w] = aw_csv("R", w ? "lr" : "lq", &len[w]);
+        }
+        bool same = csv[0] && csv[1] && len[0] == len[1] && memcmp(csv[0], csv[1], len[0]) == 0;
+        free(csv[0]); free(csv[1]);
+        aw_eval_ok("(set R 0)");
+        TEST_ASSERT_FMT(same, "%s: differs from the full sort's first rows", qs[i].q);
+    }
+    PASS();
+}
+
 /* First-n on runs: keys whose vectors are run views (h: runs of 11; s: a
  * SYM in runs of 7, every 13th run "", the in-band null) are probed once
  * per span of equal tuples, without decoding (agg_firstn_runs).  h decodes
@@ -4141,7 +4204,7 @@ static test_result_t test_pool_clamp(void) {
     static test_result_t (*const fns[])(void) = {
         test_scalar_route_mixed, test_eq_runs_lack, test_filter_encoded_leaves, test_scalar_route_stats,
         test_count_on_runs, test_group_count_on_runs, test_group_runs_forged, test_topk_prune_cases,
-        test_gather_sym_points,
+        test_gather_sym_points, test_sort_head_late,
     };
     static const uint32_t caps[] = { 7, 3 };
     for (size_t c = 0; c < sizeof caps / sizeof *caps; c++)
@@ -4247,6 +4310,7 @@ const test_entry_t aware_entries[] = {
     { "aware/gather_raw_points",  test_gather_raw_points,  aw_setup, aw_teardown },
     { "aware/gather_sym_points",  test_gather_sym_points,  aw_setup, aw_teardown },
     { "aware/gather_points_forged", test_gather_points_forged, aw_setup, aw_teardown },
+    { "aware/sort_head_late",     test_sort_head_late,     aw_setup, aw_teardown },
     { "aware/firstn_runs",        test_firstn_runs,        aw_setup, aw_teardown },
     { "aware/firstn_sel",         test_firstn_sel,         aw_setup, aw_teardown },
     { "aware/sparse_walk_points", test_sparse_walk_points, aw_setup, aw_teardown },

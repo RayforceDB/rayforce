@@ -3970,7 +3970,18 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 ray_t* sort_input = exec_node(g, op_child(g, child_op, 0));
                 if (!sort_input || RAY_IS_ERR(sort_input)) return sort_input;
                 ray_t* tbl = (sort_input->type == RAY_TABLE) ? sort_input : g->table;
-                /* Compact lazy selection before sort */
+                /* Under a lazy selection, the keys first and only the
+                 * winners' rows of the other columns (late
+                 * materialization); else compact the table and sort */
+                if (g->selection && tbl && !RAY_IS_ERR(tbl) && tbl->type == RAY_TABLE) {
+                    ray_t* late = exec_sort_head_sel(g, child_op, tbl, g->selection, n);
+                    if (late) {
+                        ray_release(sort_input);      /* owned: see OP_SORT */
+                        ray_release(g->selection);
+                        g->selection = NULL;
+                        return late;
+                    }
+                }
                 if (g->selection && tbl && !RAY_IS_ERR(tbl) && tbl->type == RAY_TABLE) {
                     ray_t* compacted = sel_compact(g, tbl, g->selection, NULL, 0);
                     ray_release(sort_input);          /* owned: see OP_SORT */

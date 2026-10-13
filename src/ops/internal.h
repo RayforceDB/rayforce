@@ -1267,6 +1267,12 @@ void radix_encode_fn(void* arg, uint32_t wid, int64_t start, int64_t end);
 void mk_prescan_fn(void* arg, uint32_t wid, int64_t start, int64_t end);
 uint32_t* build_enum_rank(ray_t* col, int64_t nrows, ray_t** hdr_out);
 ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit);
+/* HEAD(SORT) of `limit` rows under the lazy selection `sel` (borrowed),
+ * late materialization: the keys compacted and top-k'd, then only the
+ * winners' rows gathered, the old route's answer row for row.  NULL when
+ * the shape is not the top-k shortcut's (compact the table and sort). */
+ray_t* exec_sort_head_sel(ray_graph_t* g, ray_op_t* op, ray_t* tbl, ray_t* sel, int64_t limit);
+uint64_t ray_sort_test_late_heads(void);   /* test hook: HEAD(SORT)s it answered */
 
 /* ── join.c ── */
 ray_t* exec_join(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ray_t* right_table);
