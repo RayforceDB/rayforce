@@ -124,12 +124,14 @@ static inline int64_t group_pack_y_i64(ray_t* col, int64_t row) {
     return v;
 }
 
-/* Monotonic count of exec_group_per_partition entries (the streaming parted
- * GROUP kernel).  Bumped ONCE at the kernel entry — O(1) per query, never
- * per-row, so it does not violate the "instrumentation never costs O(data)"
- * rule.  Counts every entry regardless of success/cancel/NULL-return.  Atomic
- * because group exec may run on worker threads.  Surfaced via
- * ray_group_perpart_runs() and (.sys.mem)'s "group-perpart-runs" entry. */
+/* Monotonic count of results served by exec_group_per_partition (the
+ * streaming parted GROUP kernel).  Bumped ONCE per result — O(1) per query,
+ * never per-row, so it does not violate the "instrumentation never costs
+ * O(data)" rule.  A run that bails (error, cancel, NULL return) is not
+ * counted: the caller then answers from the concat path, and a test pinning
+ * the route must see the difference.  Atomic because group exec may run on
+ * worker threads.  Surfaced via ray_group_perpart_runs() and (.sys.mem)'s
+ * "group-perpart-runs" entry. */
 static _Atomic(int64_t) ray_group_perpart_runs_ctr = 0;
 
 int64_t ray_group_perpart_runs(void) {
@@ -11951,7 +11953,8 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         }
         for (uint32_t i = 0; i < na; i++) {
             if (ops2[i] != OP_COUNT_NN) continue;
-            ray_op_t* nn = ray_not(g, ray_isnull(g, op_node(g, in_ids[i])));
+            ray_op_t* isn = ray_isnull(g, op_node(g, in_ids[i]));
+            ray_op_t* nn = isn ? ray_not(g, isn) : NULL;
             if (!nn) return ray_error("oom", NULL);
             ops2[i] = OP_SUM;
             in_ids[i] = nn->id;
@@ -16456,11 +16459,6 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                          int n_borrow, int has_avg, int has_stddev,
                          int64_t group_limit) {
 
-    /* Count every entry into the streaming per-partition kernel (O(1), see the
-     * ray_group_perpart_runs_ctr definition near the top of this file). */
-    atomic_fetch_add_explicit(&ray_group_perpart_runs_ctr, 1,
-                              memory_order_relaxed);
-
     uint32_t n_keys = ext->n_keys;
     uint32_t n_aggs = ext->n_aggs;
 
@@ -16706,6 +16704,7 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
         char nbuf[24];
         int nl = snprintf(nbuf, sizeof(nbuf), "_gm%u", (unsigned)c);
         mcol_names[c] = ray_sym_intern(nbuf, (size_t)nl);
+        if (mcol_names[c] < 0) goto pp_cleanup;
     }
 
     ray_t* running = NULL;
@@ -16848,6 +16847,18 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                 ray_op_t* xf = (x->out_type == RAY_F64) ? x : ray_cast(pg, x, RAY_F64);
                 pagg_ins[sq] = ray_mul(pg, xf, xf);
             }
+            /* SUM over TIME emits TIME (4 bytes) on both engines, while the
+             * readout below takes every non-F64 sum partial as I64 (and a
+             * clock-value sum overflows 32 bits within a few thousand rows):
+             * sum the AVG/VAR input of a TIME column as I64. */
+            for (uint32_t j = 0; j < n_avg + n_std; j++) {
+                uint32_t a = j < n_avg ? avg_idx[j] : std_idx[j - n_avg];
+                ray_op_t* x = pagg_ins[a];
+                if (x && x->out_type == RAY_TIME) {
+                    pagg_ins[a] = ray_cast(pg, x, RAY_I64);
+                    if (!pagg_ins[a]) { ray_graph_free(pg); ray_release(sub); goto batch_fail; }
+                }
+            }
             /* Non-null COUNT(x) slots.  A plain column segment without
              * HAS_NULLS takes OP_COUNT (the group row count), which costs
              * nothing.  That is the matching divisor because the segment
@@ -16877,7 +16888,9 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                     part_ops[a] = OP_COUNT_NN;
                 } else {
                     part_ops[a] = OP_SUM;
-                    pagg_ins[a] = ray_not(pg, ray_isnull(pg, pagg_ins[a]));
+                    ray_op_t* isn = ray_isnull(pg, pagg_ins[a]);
+                    pagg_ins[a] = isn ? ray_not(pg, isn) : NULL;
+                    if (!pagg_ins[a]) { ray_graph_free(pg); ray_release(sub); goto batch_fail; }
                 }
             }
 
@@ -17405,6 +17418,11 @@ batch_fail:
 
     if (merge_tbl) ray_release(merge_tbl);
     ret = result;
+    /* Count the result served (O(1); see ray_group_perpart_runs_ctr).  A bail
+     * above returns NULL and the caller answers from the concat path, which a
+     * route check must not mistake for this kernel. */
+    atomic_fetch_add_explicit(&ray_group_perpart_runs_ctr, 1,
+                              memory_order_relaxed);
 
 pp_cleanup:
     scratch_free(mc_sym_ids_hdr);

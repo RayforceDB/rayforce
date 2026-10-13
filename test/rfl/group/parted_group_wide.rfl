@@ -182,6 +182,26 @@
 ;; re-planned there as SUM over a not-null indicator, whatever the pool size
 (at (select {a: (avg d) af: (avg f) from: Pt by: g asc: g}) 'a) -- (at (select {a: (avg d) af: (avg f) from: Ft by: g asc: g}) 'a)
 (at (select {a: (avg d) af: (avg f) from: Pt by: g asc: g}) 'af) -- [600.0 900.0 0Nf]
+;; a TIME input: SUM over TIME emits a 4-byte TIME partial on both engines,
+;; which the readout took as I64 (garbage averages, zero variances); the
+;; partial is summed as I64.  Every 4th row null, no all-null group.
+(set mktm (fn [n off] (do (set i (+ (til n) off)) (set k (as 'I64 (/ (as 'F64 i) (as 'F64 (!= (% i 4) 0))))) (table [g t k] (list (% i 3) (as 'TIME k) k)))))
+(.sys.exec "rm -rf /tmp/rfl_pgwtm")
+(.db.splayed.set "/tmp/rfl_pgwtm/2024.01.01/t/" (mktm 600 0))
+(.db.splayed.set "/tmp/rfl_pgwtm/2024.01.02/t/" (mktm 600 600))
+(set Ptm (.db.parted.get "/tmp/rfl_pgwtm/" 't))
+(set Ftm (concat (mktm 600 0) (mktm 600 600)))
+(set qtm (fn [T] (select {a: (avg t) v: (var t) d: (dev t) ak: (avg k) from: T by: g asc: g})))
+(set Btm (at (.sys.mem) 'group-perpart-runs))
+(set MTP (qtm Ptm))
+(> (at (.sys.mem) 'group-perpart-runs) Btm) -- true
+(set MTF (qtm Ftm))
+(at MTP 'a)  -- [600.0 600.0 600.0]
+(at MTP 'a)  -- (at MTF 'a)
+(at MTP 'ak) -- (at MTF 'ak)
+(any (nil? (at MTP 'v))) -- false
+(< (max (abs (- (at MTP 'v) (at MTF 'v)))) 0.000001) -- true
+(< (max (abs (- (at MTP 'd) (at MTF 'd)))) 0.000001) -- true
 (set qa (fn [T] (select {c: (count f) a: (avg f) ak: (avg k) from: T by: g asc: g})))
 (at (qa Pm) 'a)  -- (at (qa Fm) 'a)
 (at (qa Pm) 'ak) -- (at (qa Fm) 'ak)
@@ -190,10 +210,10 @@
 
 ;; ─── key column named like an aggregate partial ─────────────────────────────
 ;; The merge table holds the key columns next to the partials and the merge
-;; GROUP BY scans them by name, so a key named after a partial ("f_count" for
-;; (count f), "_gpnn1" for avg's non-null count) was read in the partial's
-;; place: counts [0 3 6], avg [0Nf 499833.33 250083.33].  Keys named like the
-;; positional merge names (_gm0.._gm3) must not clash either.
+;; GROUP BY scanned them by name, so a key named after a partial ("f_count"
+;; for (count f)) was read in the partial's place: counts [0 3 6], avg
+;; [0Nf 499833.33 250083.33].  Keys named like the positional merge names
+;; (_gm0.._gm3) must not clash either; _gpnn1 is one more name of that shape.
 (set mkname (fn [n off] (do (set i (+ (til n) off)) (table [_gpnn1 f_count _gm0 _gm1 _gm3 f] (list (% i 3) (% i 3) (% i 3) (% i 3) (% i 3) (as 'F64 i))))))
 (.sys.exec "rm -rf /tmp/rfl_pgwk")
 (.db.splayed.set "/tmp/rfl_pgwk/2024.01.01/t/" (mkname 1000 0))
@@ -287,4 +307,4 @@
 (.sys.exec "rm -rf /tmp/rfl_pgn")
 
 ;; ─── cleanup ─────────────────────────────────────────────────────────────────
-(.sys.exec "rm -rf /tmp/rfl_pgw /tmp/rfl_pgwn /tmp/rfl_pgwm /tmp/rfl_pgwk /tmp/rfl_pgwt")
+(.sys.exec "rm -rf /tmp/rfl_pgw /tmp/rfl_pgwn /tmp/rfl_pgwm /tmp/rfl_pgwk /tmp/rfl_pgwt /tmp/rfl_pgwtm")
