@@ -232,6 +232,10 @@ void     ray_cancel_reset(void);
 #define OP_BOT_N        90   /* per-group smallest K values (bounded min-heap) */
 #define OP_QUANTILE     91   /* exact quantile per group (literal probability) */
 #define OP_MODE        145   /* most frequent non-null value per group */
+/* Internal aggregate, never compiled from Rayfall: the non-null count of its
+ * input.  Served by the v2 engine only (agg_stream.c); the legacy group
+ * engine rejects it, so it is emitted only for a group v2 admits. */
+#define OP_COUNT_NN    147
 #define OP_ALL          131  /* truthy-all reduction (nulls skipped) */
 #define OP_ANY          132  /* truthy-any reduction (nulls skipped) */
 #define OP_COV          133  /* population covariance per group (binary input) */

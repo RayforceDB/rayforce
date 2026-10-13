@@ -8316,7 +8316,24 @@ static bool try_strlen_sumavg_input(ray_graph_t* g, ray_t* tbl,
 
 /* Materialize a scalar (atom or len-1 vector) into a full-length vector so
  * group-aggregation loops can read row-wise without out-of-bounds access. */
+static ray_t* materialize_broadcast_input_fill(ray_t* src, int64_t nrows);
+
+/* The fill copies the source's null payload (sentinel / NaN / empty) into
+ * every row, but every aggregation loop gates its null skip on HAS_NULLS:
+ * without the attr a broadcast 0Nl was summed as INT64_MIN per row.  Mark the
+ * result nullable when the source is a null atom or a nullable vector.  BOOL
+ * and U8 vectors have no null representation, so they never carry the attr. */
 static ray_t* materialize_broadcast_input(ray_t* src, int64_t nrows) {
+    ray_t* out = materialize_broadcast_input_fill(src, nrows);
+    if (!out || RAY_IS_ERR(out) || nrows == 0) return out;
+    if (out->type == RAY_BOOL || out->type == RAY_U8) return out;
+    bool src_null = ray_is_atom(src) ? RAY_ATOM_IS_NULL(src)
+                                     : (src->attrs & RAY_ATTR_HAS_NULLS) != 0;
+    if (src_null) out->attrs |= RAY_ATTR_HAS_NULLS;
+    return out;
+}
+
+static ray_t* materialize_broadcast_input_fill(ray_t* src, int64_t nrows) {
     if (!src || RAY_IS_ERR(src) || nrows < 0) return NULL;
     /* A STR atom has no fixed-width payload to copy: the switch below has no
      * case for it, and the NULL surfaced as "oom". */
@@ -11907,6 +11924,13 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     int64_t nrows = ray_table_nrows(tbl);
     uint32_t n_keys = ext->n_keys;
     uint32_t n_aggs = ext->n_aggs;
+
+    /* OP_COUNT_NN (internal, see exec_group_per_partition) has no legacy
+     * accumulator.  The caller emits it only for groups v2 admits; should the
+     * route still land here, decline rather than emit a wrong count. */
+    for (uint32_t a = 0; a < n_aggs; a++)
+        if (ext->agg_ops[a] == OP_COUNT_NN)
+            return ray_error("nyi", "group: internal non-null count off the v2 engine");
 
     /* Factorized shortcut: if input is a factorized expand result with
      * (_src, _count) columns, and GROUP BY _src with COUNT/SUM(_count),
@@ -16453,11 +16477,15 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
     ray_op_t** pagg_ins     = scratch_alloc(&pagg_ins_hdr,      pna_n * sizeof(ray_op_t*));
     ray_op_t** magg_ins     = scratch_alloc(&magg_ins_hdr,      pna_n * sizeof(ray_op_t*));
     int64_t*  unique_agg    = scratch_alloc(&unique_agg_hdr,    pna_n * sizeof(int64_t));
+    /* Merge-table column names, one per POSITION (keys then partial slots). */
+    ray_t* mcol_names_hdr = NULL;
+    int64_t* mcol_names = scratch_alloc(&mcol_names_hdr,
+                                        (key_n + pna_n) * sizeof(int64_t));
 
     if (!mc_sym_ids || !pk_syms || !pkeys || !mkeys || !avg_idx || !std_idx ||
         !std_orig_op || !std_sq_slot || !std_cnt_slot || !part_ops ||
         !merge_ops || !part_agg_syms || !part_needs_sq || !agg_name_ids ||
-        !pagg_ins || !magg_ins || !unique_agg)
+        !pagg_ins || !magg_ins || !unique_agg || !mcol_names)
         goto pp_cleanup;
 
     /* Identify MAPCOMMON vs PARTED keys.  MAPCOMMON keys are constant
@@ -16537,7 +16565,8 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
      * COUNT(x) here is the NON-NULL count (SUM skips null x, so the divisor
      * must too).  OP_COUNT is the group row count (nulls included), so it is
      * used only for a partition whose segment cannot hold nulls; otherwise
-     * the slot sums a not-null indicator (chosen per partition below).
+     * the slot is the internal OP_COUNT_NN (v2 groups) or sums a not-null
+     * indicator (chosen per partition below).
      * Build per-partition agg_ops with decomposed ops, then merge ops.
      * part_ops/merge_ops/avg_idx/std_idx/std_orig_op/std_sq_slot/std_cnt_slot
      * are carved above; n_avg/n_std are recounted here to fill them. */
@@ -16614,6 +16643,20 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
     /* Capture agg column name IDs from first partition result
      * (agg_name_ids carved above, sized part_n_aggs_max). */
     int agg_names_captured = 0;
+
+    /* The merge table holds ONLY the key columns (positions [0, n_keys)) and
+     * the partial slots (positions [n_keys, n_keys + part_n_aggs)), and the
+     * merge GROUP BY can only address them through name scans.  Partial
+     * names come from the partition's group emit ("f_count", "f_sum", ...)
+     * and key names are user columns, so the two families can collide (a key
+     * column named "f_count" next to (count f) — the first-match scan then
+     * reads the key as the partial).  Name every merge column after its
+     * position instead: no two coincide, and no user name enters the merge. */
+    for (uint32_t c = 0; c < n_keys + part_n_aggs; c++) {
+        char nbuf[24];
+        int nl = snprintf(nbuf, sizeof(nbuf), "_gm%u", (unsigned)c);
+        mcol_names[c] = ray_sym_intern(nbuf, (size_t)nl);
+    }
 
     ray_t* running = NULL;
     ray_t* merge_tbl = NULL;      /* last merge table (for column name fixup) */
@@ -16756,14 +16799,24 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                 pagg_ins[sq] = ray_mul(pg, xf, xf);
             }
             /* Non-null COUNT(x) slots.  A plain column segment without
-             * HAS_NULLS takes OP_COUNT (the group row count): the partition's
-             * SUM(x) skips nothing either — the group engine gates its own
-             * null skip (NaN or sentinel) on the same attr — so the row count
-             * is the matching divisor and costs nothing.  A segment that may
+             * HAS_NULLS takes OP_COUNT (the group row count), which costs
+             * nothing.  That is the matching divisor because the segment
+             * really holds no null: the attr is derived from the values by
+             * every writer (col.c ray_col_save scans the payload, stream.c
+             * accumulates it per zone), so the partition's SUM(x) skips no
+             * row.  (The group engine does not consult the attr for F64 — the
+             * dense path skips a NaN unconditionally — so the soundness rests
+             * on the attr, not on a matching gate in SUM.)  A segment that may
              * hold nulls, or an expression input, sums a not-null BOOL
              * indicator instead (SUM over BOOL emits I64).  The op is chosen
              * per partition; COUNT and SUM both emit I64 and the merge op
              * stays SUM, so the partials concatenate unchanged. */
+            /* A plain nullable column first tries OP_COUNT_NN, which counts
+             * the live rows in place (the indicator costs a materialized BOOL
+             * column per partition, ~a third of a nullable parted avg).  Only
+             * the v2 engine serves it, so when v2 would not take this
+             * partition's group, those slots revert to the indicator. */
+            bool cnt_nn = false;
             for (uint32_t a = cnt_slot_lo; a < part_n_aggs; a++) {
                 uint32_t ci = a - cnt_slot_lo;
                 uint32_t src_a = ci < n_avg ? avg_idx[ci] : std_idx[ci - n_avg];
@@ -16771,6 +16824,9 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                           : ray_table_get_col(sub, part_agg_syms[a]);
                 if (xc && !ray_vec_may_have_nulls(xc)) {
                     part_ops[a] = OP_COUNT;
+                } else if (xc && ray_agg_engine_v2) {
+                    part_ops[a] = OP_COUNT_NN;
+                    cnt_nn = true;
                 } else {
                     part_ops[a] = OP_SUM;
                     pagg_ins[a] = ray_not(pg, ray_isnull(pg, pagg_ins[a]));
@@ -16779,6 +16835,16 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
 
             ray_op_t* proot = ray_group(pg, pkeys, n_part_keys,
                                        part_ops, pagg_ins, part_n_aggs);
+            if (proot && cnt_nn &&
+                agg_v2_admission(pg, proot, sub) != AGG_V2_ADMITTED) {
+                for (uint32_t a = cnt_slot_lo; a < part_n_aggs; a++) {
+                    if (part_ops[a] != OP_COUNT_NN) continue;
+                    part_ops[a] = OP_SUM;
+                    pagg_ins[a] = ray_not(pg, ray_isnull(pg, pagg_ins[a]));
+                }
+                proot = ray_group(pg, pkeys, n_part_keys,
+                                  part_ops, pagg_ins, part_n_aggs);
+            }
             proot = ray_optimize(pg, proot);
 
             /* Pushed-down WHERE: translate this partition's global survivor
@@ -16813,16 +16879,6 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                 for (uint32_t a = 0; a < part_n_aggs; a++)
                     agg_name_ids[a] = ray_table_col_name(
                         bp[bi], (int64_t)n_part_keys + a);
-                /* The non-null COUNT slots switch between OP_COUNT and
-                 * SUM(indicator) per partition, so the first partial's name
-                 * for one ("x_count") can collide with a user (count x) slot
-                 * while their merged values differ.  The merge scans by name,
-                 * so give each its own synthetic name. */
-                for (uint32_t a = cnt_slot_lo; a < part_n_aggs; a++) {
-                    char nbuf[24];
-                    int nl = snprintf(nbuf, sizeof(nbuf), "_gpnn%u", (unsigned)a);
-                    agg_name_ids[a] = ray_sym_intern(nbuf, (size_t)nl);
-                }
                 agg_names_captured = 1;
             }
         }
@@ -16838,7 +16894,10 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
             merge_tbl = NULL; goto batch_fail;
         }
 
-        /* Key columns */
+        /* Key columns.  Read by position: running keeps key k at column k,
+         * a partial keeps its non-MAPCOMMON keys first, in key order (pk_pos
+         * counts them). */
+        uint32_t pk_pos = 0;
         for (uint32_t k = 0; k < n_keys; k++) {
             /* Poll cancellation before allocating this column's flat vec
              * (each concat copy is O(total merged groups)).  No live `flat`
@@ -16854,14 +16913,15 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
             /* Type reference for column allocation */
             ray_t* tref = NULL;
             if (running) {
-                tref = ray_table_get_col(running, key_syms[k]);
+                tref = ray_table_get_col_idx(running, (int64_t)k);
             } else if (is_mc) {
                 ray_t* mc_col = ray_table_get_col(parted_tbl, key_syms[k]);
                 tref = ((ray_t**)ray_data(mc_col))[0];
             } else {
                 /* ref_bi = first built partial (skipped zero-survivor
                  * partitions leave bp[bi] NULL); always >= 0 here. */
-                tref = ray_table_get_col(bp[ref_bi >= 0 ? ref_bi : 0], key_syms[k]);
+                tref = ray_table_get_col_idx(bp[ref_bi >= 0 ? ref_bi : 0],
+                                             (int64_t)pk_pos);
             }
             if (!tref) goto batch_fail;
 
@@ -16873,14 +16933,14 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
             if (tref->type == RAY_SYM) {
                 uint8_t w = tref->attrs & RAY_SYM_W_MASK;
                 if (running) {
-                    ray_t* rc = ray_table_get_col(running, key_syms[k]);
+                    ray_t* rc = ray_table_get_col_idx(running, (int64_t)k);
                     if (rc && rc->type == RAY_SYM &&
                         (rc->attrs & RAY_SYM_W_MASK) > w)
                         w = rc->attrs & RAY_SYM_W_MASK;
                 }
                 for (int32_t i = 0; i < batch_n; i++) {
                     ray_t* pc = is_mc ? NULL
-                              : ray_table_get_col(bp[i], key_syms[k]);
+                              : ray_table_get_col_idx(bp[i], (int64_t)pk_pos);
                     if (pc && pc->type == RAY_SYM &&
                         (pc->attrs & RAY_SYM_W_MASK) > w)
                         w = pc->attrs & RAY_SYM_W_MASK;
@@ -16902,7 +16962,7 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
 
             /* Copy from running result */
             if (running) {
-                ray_t* rc = ray_table_get_col(running, key_syms[k]);
+                ray_t* rc = ray_table_get_col_idx(running, (int64_t)k);
                 if (rc && rc->len > 0) {
                     parted_copy_cells(out, flat->type, out_attrs, 0,
                                       rc, 0, rc->len);
@@ -16934,7 +16994,7 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                     src_nulls |= mc_kv->attrs & RAY_ATTR_HAS_NULLS;
                     off += pnrows;
                 } else {
-                    ray_t* pc = ray_table_get_col(bp[i], key_syms[k]);
+                    ray_t* pc = ray_table_get_col_idx(bp[i], (int64_t)pk_pos);
                     if (pc && pc->len > 0) {
                         parted_copy_cells(out, flat->type, out_attrs, off,
                                           pc, 0, pc->len);
@@ -16946,8 +17006,9 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
 
             /* Null propagation: propagate HAS_NULLS from copied sources. */
             flat->attrs |= src_nulls;
-            merge_tbl = ray_table_add_col(merge_tbl, key_syms[k], flat);
+            merge_tbl = ray_table_add_col(merge_tbl, mcol_names[k], flat);
             ray_release(flat);
+            if (!is_mc) pk_pos++;
         }
 
         /* Agg columns */
@@ -17012,7 +17073,7 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
 
             /* Null propagation: propagate HAS_NULLS from copied sources. */
             flat->attrs |= src_nulls;
-            merge_tbl = ray_table_add_col(merge_tbl, agg_name_ids[a], flat);
+            merge_tbl = ray_table_add_col(merge_tbl, mcol_names[n_keys + a], flat);
             ray_release(flat);
         }
 
@@ -17026,14 +17087,11 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
         ray_graph_t* mg = ray_graph_new(merge_tbl);
         if (!mg) goto batch_fail;
 
-        for (uint32_t k = 0; k < n_keys; k++) {
-            ray_t* sym_atom = ray_sym_str(key_syms[k]);
-            mkeys[k] = ray_scan(mg, ray_str_ptr(sym_atom));
-        }
-
-        for (uint32_t a = 0; a < part_n_aggs; a++) {
-            ray_t* agg_name = ray_sym_str(agg_name_ids[a]);
-            magg_ins[a] = ray_scan(mg, ray_str_ptr(agg_name));
+        for (uint32_t c = 0; c < n_keys + part_n_aggs; c++) {
+            ray_t* nm_atom = ray_sym_str(mcol_names[c]);
+            ray_op_t* sc = ray_scan(mg, ray_str_ptr(nm_atom));
+            if (c < n_keys) mkeys[c] = sc;
+            else            magg_ins[c - n_keys] = sc;
         }
 
         ray_op_t* mroot = ray_group(mg, mkeys, n_keys,
@@ -17270,6 +17328,7 @@ pp_cleanup:
     scratch_free(pagg_ins_hdr);
     scratch_free(magg_ins_hdr);
     scratch_free(unique_agg_hdr);
+    scratch_free(mcol_names_hdr);
     /* Pushed-down WHERE cleanup: free the flattened-ids block and offset/
      * local-id scratch, and restore the caller's global selection (needed by
      * the concat fallback when this path returns NULL). */

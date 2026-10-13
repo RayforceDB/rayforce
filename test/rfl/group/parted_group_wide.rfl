@@ -154,5 +154,80 @@
 (at (um Pm) 'c) -- (at (um Fm) 'c)
 (< (abs (- (first (at (um Pm) 'v)) (first (at (um Fm) 'v)))) 0.000001) -- true
 
+;; avg-only shapes: the partition group runs on the v2 engine, which counts
+;; each nullable column's live rows in place (internal non-null count, one
+;; kernel per representation) instead of summing a materialized indicator.
+;; Mixed with a null-free partition (row-count divisor) in Pm.
+(set mkty (fn [n off] (do (set t (mknull n off)) (table [g f k i h d] (list (at t 'g) (at t 'f) (at t 'k) (as 'I32 (at t 'k)) (as 'I16 (% (at t 'k) 1000)) (as 'DATE (at t 'k)))))))
+(.sys.exec "rm -rf /tmp/rfl_pgwt")
+(.db.splayed.set "/tmp/rfl_pgwt/2024.01.01/t/" (mkty 600 0))
+(.db.splayed.set "/tmp/rfl_pgwt/2024.01.02/t/" (mkty 600 600))
+(set Pt (.db.parted.get "/tmp/rfl_pgwt/" 't))
+(set Ft (concat (mkty 600 0) (mkty 600 600)))
+(set qt (fn [T] (select {a: (avg f) ak: (avg k) ai: (avg i) ah: (avg h) s: (sum f) from: T by: g asc: g})))
+(set Bt (at (.sys.mem) 'group-perpart-runs))
+(set TP (qt Pt))
+(> (at (.sys.mem) 'group-perpart-runs) Bt) -- true
+(set TF (qt Ft))
+(at TP 'a)  -- [600.0 900.0 0Nf]
+(at TP 'ak) -- [600.0 900.0 0Nf]
+(at TP 'ai) -- [600.0 900.0 0Nf]
+(at TP 'a)  -- (at TF 'a)
+(at TP 'ak) -- (at TF 'ak)
+(at TP 'ai) -- (at TF 'ai)
+(at TP 'ah) -- (at TF 'ah)
+(at TP 's)  -- (at TF 's)
+;; v2 has no SUM over DATE (a DATE avg's partial), so this partition group
+;; stays off v2 and its count slots fall back to the indicator
+(at (select {a: (avg d) af: (avg f) from: Pt by: g asc: g}) 'a) -- (at (select {a: (avg d) af: (avg f) from: Ft by: g asc: g}) 'a)
+(at (select {a: (avg d) af: (avg f) from: Pt by: g asc: g}) 'af) -- [600.0 900.0 0Nf]
+(set qa (fn [T] (select {c: (count f) a: (avg f) ak: (avg k) from: T by: g asc: g})))
+(at (qa Pm) 'a)  -- (at (qa Fm) 'a)
+(at (qa Pm) 'ak) -- (at (qa Fm) 'ak)
+(at (qa Pm) 'c)  -- (at (qa Fm) 'c)
+(last (at (qa Pm) 'a)) -- 300.5
+
+;; ─── key column named like an aggregate partial ─────────────────────────────
+;; The merge table holds the key columns next to the partials and the merge
+;; GROUP BY scans them by name, so a key named after a partial ("f_count" for
+;; (count f), "_gpnn1" for avg's non-null count) was read in the partial's
+;; place: counts [0 3 6], avg [0Nf 499833.33 250083.33].  Keys named like the
+;; positional merge names (_gm0.._gm3) must not clash either.
+(set mkname (fn [n off] (do (set i (+ (til n) off)) (table [_gpnn1 f_count _gm0 _gm1 _gm3 f] (list (% i 3) (% i 3) (% i 3) (% i 3) (% i 3) (as 'F64 i))))))
+(.sys.exec "rm -rf /tmp/rfl_pgwk")
+(.db.splayed.set "/tmp/rfl_pgwk/2024.01.01/t/" (mkname 1000 0))
+(.db.splayed.set "/tmp/rfl_pgwk/2024.01.02/t/" (mkname 1000 1000))
+(.db.splayed.set "/tmp/rfl_pgwk/2024.01.03/t/" (mkname 1000 2000))
+(set Pk (.db.parted.get "/tmp/rfl_pgwk/" 't))
+(set Fk (concat (mkname 1000 0) (concat (mkname 1000 1000) (mkname 1000 2000))))
+(set Bk (at (.sys.mem) 'group-perpart-runs))
+(set KA (select {a: (avg f) from: Pk by: _gpnn1 asc: _gpnn1}))
+(> (at (.sys.mem) 'group-perpart-runs) Bk) -- true
+(at KA 'a) -- [1498.5 1499.5 1500.5]
+(at KA 'a) -- (at (select {a: (avg f) from: Fk by: _gpnn1 asc: _gpnn1}) 'a)
+(at (select {c: (count f) from: Pk by: f_count asc: f_count}) 'c) -- [1000 1000 1000]
+(at (select {c: (count f) from: Pk by: f_count asc: f_count}) 'c) -- (at (select {c: (count f) from: Fk by: f_count asc: f_count}) 'c)
+(set qk (fn [T] (select {c: (count f) a: (avg f) v: (var f) s: (sum f) from: T by: {_gm1: _gm1 date: date _gm3: _gm3} asc: [_gm1 date]})))
+(set Bq (at (.sys.mem) 'group-perpart-runs))
+(set KP (qk Pk))
+(> (at (.sys.mem) 'group-perpart-runs) Bq) -- true
+(set mkd (fn [n off d] (update {date: d from: (mkname n off)})))
+(set KF (qk (concat (mkd 1000 0 2024.01.01) (concat (mkd 1000 1000 2024.01.02) (mkd 1000 2000 2024.01.03)))))
+(at KP 'c) -- (at KF 'c)
+(at KP 's) -- (at KF 's)
+(at KP '_gm3) -- (at KF '_gm3)
+(< (max (abs (- (at KP 'v) (at KF 'v)))) 0.000001) -- true
+(at KP 'a) -- (at KF 'a)
+(at KP 'a) -- [499.5 1500.0 2499.0 499.0 1499.5 2500.0 500.0 1499.0 2499.5]
+
+;; ─── null atom as an aggregate input (parted) ────────────────────────────────
+;; Its broadcast filled the sentinel without HAS_NULLS, so (avg 0Nl) averaged
+;; INT64_MIN per group and wsum summed it.
+(at (select {s: (avg 0Nl) from: Pm by: g asc: g}) 's) -- [0Nf 0Nf 0Nf]
+(at (select {s: (wsum 0Nl f) from: Pm by: g asc: g}) 's) -- [0.0 0.0 0.0]
+(at (select {s: (wsum f 0Nl) from: Pm by: g asc: g}) 's) -- [0.0 0.0 0.0]
+(at (select {s: (avg 0Nl) from: Pm}) 's) -- [0Nf]
+(at (select {s: (wsum 0Nl f) from: Pm}) 's) -- [0.0]
+
 ;; ─── cleanup ─────────────────────────────────────────────────────────────────
-(.sys.exec "rm -rf /tmp/rfl_pgw /tmp/rfl_pgwn /tmp/rfl_pgwm")
+(.sys.exec "rm -rf /tmp/rfl_pgw /tmp/rfl_pgwn /tmp/rfl_pgwm /tmp/rfl_pgwk /tmp/rfl_pgwt")
