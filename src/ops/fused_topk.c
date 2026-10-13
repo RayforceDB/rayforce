@@ -71,6 +71,7 @@ int ray_fused_topk_supported(ray_t* where_expr, ray_t* tbl) {
 
 #define FPK_MAX_KEYS 16
 _Static_assert(RAY_ENC_CHUNK == (1 << 16), "the directory zone is one chunk per 1 << 16 rows");
+_Static_assert(RAY_MORSEL_ELEMS == RAY_ENC_VEC, "a top-k morsel touches at most two key vectors");
 
 /* Test hook: how often a fused select compiled its predicate (ran) and how
  * often it declined to the unfused path. */
@@ -84,8 +85,10 @@ void ray_fused_topk_counters(uint64_t* ran, uint64_t* declined) {
 }
 void ray_fused_topk_counters_reset(void) { atomic_store(&g_fpk_ran, 0); atomic_store(&g_fpk_declined, 0); }
 
-/* Test hook: chunks and vectors the last ray_fused_topk_select pruned from
- * directory and descriptor statistics (reset at its entry). */
+/* Test hook: pruning events of the last ray_fused_topk_select (reset at
+ * its entry): chunk-slot prunes (per task fragment, so a chunk split
+ * across tasks counts once per task: dispatch geometry, not distinct
+ * chunks) and pruned morsels. */
 static _Atomic uint64_t g_fpk_pruned_chunks, g_fpk_pruned_vecs;
 void ray_fused_topk_test_pruned(uint64_t* chunks, uint64_t* vectors) {
     *chunks  = atomic_load(&g_fpk_pruned_chunks);
@@ -269,26 +272,36 @@ static inline bool fpk_dir_chunk_pruned(const fpk_par_ctx_t* c, int64_t g) {
     return fpk_stat_prunes(c, c->zdir->zstat[g], has_nulls, c->zmin[g], c->zmax[g]);
 }
 
-/* The morsel [row, mend) is one whole vector of the first key and its
- * descriptor says no row of it can beat the bound.  Only a whole vector is
- * decided, so the answer does not depend on how the rows were cut into
- * tasks.  ray_col_src_vec_stat declines an all-null vector and one without
- * statistics alike; the descriptor's null count tells them apart. */
-static bool fpk_vec_pruned(const fpk_par_ctx_t* c, int64_t row, int64_t mend) {
-    if (!atomic_load_explicit(&c->bound_set, memory_order_relaxed)) return false;
-    if (row % RAY_ENC_VEC) return false;
-    int64_t vend = row + RAY_ENC_VEC < c->nrows ? row + RAY_ENC_VEC : c->nrows;
-    if (mend != vend) return false;
-    int64_t v = row / RAY_ENC_VEC, mn = 0, mx = 0;
+/* Vector v of the first key cannot hold a row that beats the bound (its
+ * descriptor; ray_col_src_vec_stat declines an all-null vector and one
+ * without statistics alike, and the descriptor's null count tells them
+ * apart). */
+static bool fpk_one_vec_pruned(const fpk_par_ctx_t* c, int64_t v) {
+    int64_t vrows = c->nrows - v * RAY_ENC_VEC;
+    if (vrows > RAY_ENC_VEC) vrows = RAY_ENC_VEC;
+    int64_t mn = 0, mx = 0;
     uint32_t nn = 0;
     uint8_t cls = FPK_STATS;
     if (!ray_col_src_vec_stat(c->zdir->src, v, &mn, &mx, &nn)) {
         const ray_enc_desc_t* d;
         ray_t* err = ray_enccol_chunk_descs_ref(c->zdir->e, v / RAY_ENC_VECS_PER_CHUNK, &d);
         if (err) { ray_error_free(err); return false; }       /* the scan reads it */
-        cls = d[v % RAY_ENC_VECS_PER_CHUNK].n_nulls == vend - row ? FPK_ALL_NULL : FPK_NO_STATS;
+        cls = d[v % RAY_ENC_VECS_PER_CHUNK].n_nulls == vrows ? FPK_ALL_NULL : FPK_NO_STATS;
     }
     return fpk_stat_prunes(c, cls, nn > 0, mn, mx);
+}
+
+/* No row of the morsel [row, mend) can beat the bound: every vector it
+ * touches (one, or two when a task edge cuts the morsel off the vector
+ * grid) says so.  Statistics bound every row of their vector, so a morsel
+ * that covers only part of one is pruned as exactly as a whole one: the
+ * answer never depends on the grain, and unaligned tasks still prune. */
+static bool fpk_vec_pruned(const fpk_par_ctx_t* c, int64_t row, int64_t mend) {
+    if (!atomic_load_explicit(&c->bound_set, memory_order_relaxed)) return false;
+    int64_t v0 = row / RAY_ENC_VEC, v1 = (mend - 1) / RAY_ENC_VEC;
+    for (int64_t v = v0; v <= v1; v++)
+        if (!fpk_one_vec_pruned(c, v)) return false;
+    return true;
 }
 
 /* Chunk `a` is more promising than chunk `b` for the first key's
@@ -492,9 +505,9 @@ static inline void fpk_heapify(const fpk_par_ctx_t* c, int64_t* heap, int32_t n)
  * does a failure noted below them.  The task's other chunk slots may lie
  * lower and are still scanned (fpk_par_fn).
  * `zv` (constant per instance, with `rs`): the zone arrays are a
- * generation-2 first key's directory; a morsel that is one whole vector of
- * it is first tested on the vector's descriptor and skipped, predicate
- * unread, when it cannot beat the bound (counted in *npv). */
+ * generation-2 first key's directory; each morsel is first tested on the
+ * descriptors of the key vectors it touches and skipped, predicate unread,
+ * when it cannot beat the bound (counted in *npv). */
 RAY_INLINE void fpk_scan_rows(fpk_par_ctx_t* c, fp_scratch_t* fs, int64_t* hidx, int32_t* hnp,
                               int32_t k, int64_t row, int64_t end, int64_t chunk, const bool rs,
                               const bool zv, uint64_t* npv) {
@@ -554,7 +567,10 @@ RAY_INLINE void fpk_par_body(void* raw, uint32_t worker_id, int64_t start, int64
     int32_t  hn   = c->heap_n[worker_id];
     fp_scratch_t fs;
     if (rs) fp_scratch_init(&fs);
-    uint64_t npc = 0, npv = 0;           /* pruned here (zv): added once per task */
+    /* pruned here (zv), added once per task: npc counts chunk-slot prunes
+     * (a chunk split across tasks counts once per task; one abandoned
+     * mid-scan is not counted), npv pruned morsels */
+    uint64_t npc = 0, npv = 0;
 
     if (!c->zmin) {
         fpk_scan_rows(c, &fs, hidx, &hn, k, start, end, -1, rs, zv, &npv);

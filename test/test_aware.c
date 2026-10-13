@@ -3826,7 +3826,36 @@ static test_result_t test_topk_prune_cases(void) {
     uint64_t pc = 0, pv = 0;
     ray_fused_topk_test_pruned(&pc, &pv);
     TEST_ASSERT_TRUE(pc > 0);
-    TEST_ASSERT_TRUE(g_aw_unaligned || pv > 0);                 /* a clamped grain may cut every vector */
+    TEST_ASSERT_TRUE(pv > 0);                                   /* also under a clamped grain */
+    /* I32 and TIMESTAMP first keys: negative values climbing through zero
+     * (row j holds j - 150000, the timestamp that many seconds from the
+     * epoch), a null every 5000 rows (every chunk has some, most vectors
+     * none), and chunk 3 all null.  Ascending prunes vectors only (every
+     * chunk has nulls); descending prunes at both levels. */
+    aw_save("tr", "(table [i t v] (list "
+                  "(as 'I32 (map (fn [j] (if (or (== 0 (% j 5000)) (and (>= j 196608) (< j 262144))) 0N (- j 150000))) (til 300000))) "
+                  "(as 'TIMESTAMP (map (fn [j] (if (or (== 0 (% j 5000)) (and (>= j 196608) (< j 262144))) 0N (* (- j 150000) 1000000000))) (til 300000))) "
+                  "(% (* (til 300000) 13) 1000)))", -1);
+    static const char* const qr[] = {
+        "(select {i: i v: v from: T where: (> v 100) asc: i take: 12})",
+        "(select {i: i v: v from: T where: (> v 100) desc: i take: 12})",
+        "(select {t: t v: v from: T where: (> v 100) asc: t take: 12})",
+        "(select {t: t v: v from: T where: (> v 100) desc: t take: 12})",
+        "(select {i: i v: v from: T asc: i take: 70})",          /* past the 60 nulls outside chunk 3 */
+        "(select {t: t i: i from: T where: (< v 20) desc: [t i] take: 9})",
+        NULL,
+    };
+    static const uint64_t matr[] = { 1, 1, 1, 1, 1, 2 };
+    static const bool descr[] = { false, true, false, true, false, true };
+    for (int i = 0; qr[i]; i++) {
+        AW_SAME("tr", qr[i], matr[i]);
+        /* q5's answer is nulls (no bound is published); a clamped grain may
+         * leave the best chunk to one task that scans it in rising order */
+        if (i == 4 || g_aw_unaligned) continue;
+        ray_fused_topk_test_pruned(&pc, &pv);
+        TEST_ASSERT_FMT(pv > 0 && (!descr[i] || pc > 0), "%s: pruned %llu chunk slots, %llu vectors", qr[i],
+                        (unsigned long long)pc, (unsigned long long)pv);
+    }
     /* generation 0 never takes the directory path */
     aw_eval_ok("(set T (.db.splayed.get \"" AW_TMP "/tp0/\"))");
     aw_eval_ok("(select {kn: kn v: v from: T where: (> v 100) desc: kn take: 20})");
