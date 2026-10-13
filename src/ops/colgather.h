@@ -62,8 +62,9 @@ uint64_t ray_col_test_gather_par(void);
 /* Rows ids[0..n) of `src`, in that order, repeats included, as a new plain
  * vector.  Ids are bucketed by vector; each touched vector is range-read
  * once and its values scattered to their output positions, or, holding at
- * most RAY_COL_POINT_ROWS of the ids, point-read (an encoded integer
- * source; ray_col_gather_sel's few-row segments likewise). */
+ * most its codec's point-read limit of the ids, point-read (an encoded
+ * integer or SYM source, nulls included; ray_col_gather_sel's few-row
+ * segments likewise). */
 ray_t* ray_col_gather_rows(ray_col_src_t* src, const int64_t* ids, int64_t n, ray_t** out);
 
 #endif /* RAY_COLGATHER_H */

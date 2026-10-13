@@ -2772,21 +2772,26 @@ static test_result_t test_sparse_key_points(void) {
     PASS();
 }
 
-/* Point reads in the row-list and selection gathers (open decision D2):
- * per encoding, a vector holding at most RAY_COL_POINT_ROWS requested rows
- * (vector 0: 64 rows, vector 5: one row, repeated) is point-read and
- * decodes nothing, one holding more (vector 1: 65 rows) is decoded; a
- * declined read (DELTA_BP, a vector with nulls) decodes every touched
- * vector.  Ids sorted, reversed and repeated; values equal generation 0's. */
+/* Point reads in the row-list and selection gathers (open decision D2,
+ * per codec in Task 10b): per encoding, a vector holding at most its
+ * codec's limit of requested rows (vector 0: lim rows, vector 5: one row,
+ * repeated) is point-read and decodes nothing, one holding more (vector 1:
+ * lim + 1 rows) is decoded; a declined read (DELTA_BP) decodes every
+ * touched vector.  A vector with a null bitmap is point-read on every
+ * codec (pn, pw), its nulls as the decode writes them.  Ids sorted,
+ * reversed and repeated; values equal generation 0's. */
 static test_result_t test_gather_points(void) {
-    /* lim: the codec's D2 limit (RAY_ENC_VEC / 32 packed lanes,
-     * RAY_ENC_VEC / 16 runs); 0: the codec declines */
+    /* lim: the codec's limit (RAY_ENC_VEC / 32 packed lanes, / 16 runs,
+     * DICT and any vector with a bitmap); 0: the codec declines */
     static const struct { const char* name; const char* x; int enc; int64_t lim; } cs[] = {
         { "pf", "(% (* (til 70000) 7919) 1000)", RAY_ENC_FOR_BP, RAY_ENC_VEC / 32 },
         { "pr", "(div (til 70000) 5)", RAY_ENC_RLE, RAY_ENC_VEC / 16 },
-        { "pd", "(* 1000003 (% (til 70000) 5))", RAY_ENC_DICT, 0 },
+        { "pc", "(div (til 70000) 2048)", RAY_ENC_CONST, RAY_ENC_VEC / 16 },
+        { "pd", "(* 1000003 (% (til 70000) 5))", RAY_ENC_DICT, RAY_ENC_VEC / 16 },
         { "pe", "(% (* (til 70000) 7919) 1000)", RAY_ENC_DELTA_BP, 0 },
-        { "pn", "(map (fn [j] (if (== 0 (% j 100)) 0N (% (* j 7919) 1000))) (til 70000))", RAY_ENC_FOR_BP, 0 },
+        { "pn", "(map (fn [j] (if (== 0 (% j 100)) 0N (% (* j 7919) 1000))) (til 70000))", RAY_ENC_FOR_BP, RAY_ENC_VEC / 16 },
+        { "pw", "(map (fn [j] (if (== 0 (% j 100)) 0N (* j 7919))) (til 70000))", RAY_ENC_RAW, RAY_ENC_VEC / 16 },
+        { "pq", "(map (fn [j] (if (== 0 (% j 100)) 0N (* 1000003 (% j 5)))) (til 70000))", RAY_ENC_DICT, RAY_ENC_VEC / 16 },
     };
     for (size_t c = 0; c < sizeof cs / sizeof cs[0]; c++) {
         /* vector 0: lim rows (point-read when lim > 0), vector 1: lim + 1
@@ -2893,6 +2898,258 @@ static test_result_t test_gather_points(void) {
         ray_release(out);
     }
     ray_rowsel_release(psel); ray_release(ppred); ray_release(tp);
+    PASS();
+}
+
+static bool aw_forge_cap(const char* path, int64_t c, int64_t x);
+static bool aw_forge_absent(const char* path, int64_t c);
+
+/* Task 10b: a RAW vector without nulls.  While its chunk's views are not
+ * validated (raw_ok), a few rows are point-read: the view's first read
+ * checks every RAW vector of the chunk.  A read past the limit takes the
+ * view, which validates the chunk and counts the vector's bytes; from then
+ * on the view is the cheaper read and the few rows take it too. */
+static test_result_t test_gather_raw_points(void) {
+    aw_save("pv", "(table [x] (list (* (til 70000) 7919)))", RAY_ENC_RAW);
+    for (int64_t v = 0; v <= 5; v++) TEST_ASSERT_EQ_I(aw_vec_enc("pv", "x", v), RAY_ENC_RAW);
+    ray_t* t0 = aw_load("pv", 0); ray_t* t2 = aw_load("pv", 2);
+    TEST_ASSERT_TRUE(t0 && t2);
+    const int64_t* rv = (const int64_t*)ray_data(ray_table_col(t0, ray_sym_intern("x", 1)));
+    ray_t* encv = ray_table_get_col_enc(t2, ray_sym_intern("x", 1));
+    TEST_ASSERT_NOT_NULL(encv);
+    ray_enccol_t* e = ray_enccol_of(encv);
+    TEST_ASSERT_NOT_NULL(e->raw_ok);
+    static const struct { int64_t v, n; uint64_t want; uint8_t ok_after; } rd[] = {
+        { 5, RAY_ENC_VEC / 128, 0, 0 },                    /* point-read: chunk 0 stays unvalidated */
+        { 1, RAY_ENC_VEC / 128 + 1, 1024 * 8, 1 },         /* past the limit: the view validates chunk 0 */
+        { 5, RAY_ENC_VEC / 128, 1024 * 8, 1 },             /* validated: the view */
+    };
+    for (int r = 0; r < 3; r++) {
+        int64_t ids[RAY_ENC_VEC / 128 + 1];
+        for (int64_t q = 0; q < rd[r].n; q++) ids[q] = rd[r].v * 1024 + 3 * q;
+        ray_col_src_t s;
+        TEST_ASSERT_NULL(ray_table_col_src(t2, ray_sym_intern("x", 1), &s));
+        uint64_t d0 = atomic_load(&e->decoded_bytes);
+        ray_t* out = NULL;
+        TEST_ASSERT_NULL(ray_col_gather_rows(&s, ids, rd[r].n, &out));
+        ray_col_src_release(&s);
+        uint64_t got = atomic_load(&e->decoded_bytes) - d0;
+        TEST_ASSERT_FMT(got == rd[r].want, "read %d: decoded %llu, want %llu", r, (unsigned long long)got,
+                        (unsigned long long)rd[r].want);
+        TEST_ASSERT_EQ_I(atomic_load(&e->raw_ok[0]), rd[r].ok_after);
+        for (int64_t q = 0; q < rd[r].n; q++) TEST_ASSERT_EQ_I(((int64_t*)ray_data(out))[q], rv[ids[q]]);
+        ray_release(out);
+    }
+    ray_release(t0); ray_release(t2);
+    PASS();
+}
+
+/* Encodings of every vector of column `col` of the parted table `t`
+ * (segment-local descriptors): per encoding, how many. */
+static void aw_parted_encs(ray_t* t, const char* col, int64_t cnt[8]) {
+    memset(cnt, 0, 8 * sizeof(int64_t));
+    ray_t* encv = ray_table_get_col_enc(t, ray_sym_intern(col, strlen(col)));
+    if (!encv) return;
+    for (int64_t sg = 0; ; sg++) {
+        ray_t* seg = ray_enccol_seg(encv, sg);
+        if (!seg) break;
+        ray_enccol_t* e = ray_enccol_of(seg);
+        if (!e || e->kind != RAY_ENCCOL_SINGLE) continue;
+        for (int64_t v = 0; v * RAY_ENC_VEC < e->len; v++) {
+            const ray_enc_desc_t* d;
+            ray_t* err = ray_enccol_chunk_descs_ref(e, v / RAY_ENC_VECS_PER_CHUNK, &d);
+            if (err) { ray_error_free(err); return; }
+            int enc = d[v % RAY_ENC_VECS_PER_CHUNK].encoding;
+            if (enc >= 0 && enc < 8) cnt[enc]++;
+        }
+    }
+}
+
+/* Task 10b: SYM ids point-read by the selection and row-list gathers of a
+ * parted source.  Two partitions (3000 and 67000 rows, so segment vectors
+ * straddle the global morsels): a in vector-wide constants, b in runs of 7
+ * with every 13th run "" (the in-band null), c cycling over 300 symbols,
+ * so CONST, RLE and packed vectors all occur.  A few rows per vector
+ * (every 997th row and the rows at the partition boundary), sorted and
+ * unsorted: nothing decoded, and the result equals generation 0's own
+ * gather and `at` (width, domain, nulls and symbols). */
+static test_result_t test_gather_sym_points(void) {
+    static const int64_t np[2] = { 3000, 67000 };
+    for (int gen = 0; gen <= 2; gen += 2)
+        for (int p = 0; p < 2; p++) {
+            char q[1600];
+            snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/sy%d/2024.01.0%d/t/\" "
+                     "(table [k a b c] (list (+ %lld (til %lld)) "
+                     "(as 'SYMBOL (map (fn [j] (format \"c%%\" (div j 4096))) (til %lld))) "
+                     "(as 'SYMBOL (map (fn [j] (if (== 0 (%% (div j 7) 13)) \"\" (format \"r%%\" (%% (div j 7) 97)))) (til %lld))) "
+                     "(as 'SYMBOL (map (fn [j] (format \"w%%\" (%% (* j 7919) 300))) (til %lld))))) "
+                     "\"" AW_TMP "/sy%d/.sym\" {compress: %s})", gen, p + 1, (long long)(p ? np[0] : 0),
+                     (long long)np[p], (long long)np[p], (long long)np[p], (long long)np[p], gen, gen ? "true" : "false");
+            aw_eval_ok(q);
+        }
+    ray_t* tp[2] = { aw_eval("(.db.parted.get \"" AW_TMP "/sy0\" 't)"), aw_eval("(.db.parted.get \"" AW_TMP "/sy2\" 't)") };
+    TEST_ASSERT_TRUE(tp[0] && tp[1] && !RAY_IS_ERR(tp[0]) && !RAY_IS_ERR(tp[1]));
+    int64_t ca[8], cb[8], cc[8];
+    aw_parted_encs(tp[1], "a", ca); aw_parted_encs(tp[1], "b", cb); aw_parted_encs(tp[1], "c", cc);
+    TEST_ASSERT_FMT(ca[RAY_ENC_CONST] > 0 && cb[RAY_ENC_RLE] > 0 && cc[RAY_ENC_FOR_BP] + cc[RAY_ENC_DICT] > 0,
+                    "a CONST %lld, b RLE %lld, c FOR_BP %lld DICT %lld RAW %lld", (long long)ca[RAY_ENC_CONST],
+                    (long long)cb[RAY_ENC_RLE], (long long)cc[RAY_ENC_FOR_BP], (long long)cc[RAY_ENC_DICT],
+                    (long long)cc[RAY_ENC_RAW]);
+    const int64_t n = np[0] + np[1];
+    ray_t* pred = ray_vec_new(RAY_BOOL, n); pred->len = n;
+    memset(ray_data(pred), 0, (size_t)n);
+    int64_t ids[128], ni = 0;
+    for (int64_t r = 0; r < n; r++)
+        if (r % 997 == 5 || (r >= 2998 && r <= 3001) || r == n - 1) {
+            ((uint8_t*)ray_data(pred))[r] = 1;
+            if (ni < 128) ids[ni++] = r;
+        }
+    for (int64_t i = 0; i < ni / 2; i++) { int64_t x = ids[i]; ids[i] = ids[ni - 1 - i]; ids[ni - 1 - i] = x; }  /* unsorted */
+    ray_t* sel = ray_rowsel_from_pred(pred);
+    TEST_ASSERT_NOT_NULL(sel);
+    static const char* const cols[] = { "a", "b", "c" };
+    for (int c = 0; c < 3; c++) {
+        ray_t* out[2][2];
+        for (int g = 0; g < 2; g++) {
+            ray_col_src_t s;
+            TEST_ASSERT_NULL(ray_table_col_src(tp[g], ray_sym_intern(cols[c], 1), &s));
+            ray_enc_counters_reset();
+            TEST_ASSERT_NULL(ray_col_gather_sel(&s, sel, &out[g][0]));
+            TEST_ASSERT_NULL(ray_col_gather_rows(&s, ids, ni, &out[g][1]));
+            ray_col_src_release(&s);
+            ray_enc_counters_t k; ray_enc_counters_get(&k);
+            if (g && !g_aw_unaligned)
+                TEST_ASSERT_FMT(k.decoded_bytes == 0 && k.materialized == 0, "%s: decoded %llu", cols[c],
+                                (unsigned long long)k.decoded_bytes);
+        }
+        for (int w = 0; w < 2; w++) {
+            char q[1600];
+            if (w) {
+                char lst[128 * 8] = "[";
+                for (int64_t i = 0; i < ni; i++)
+                    snprintf(lst + strlen(lst), sizeof lst - strlen(lst), "%s%lld", i ? " " : "", (long long)ids[i]);
+                strcat(lst, "]");
+                snprintf(q, sizeof q, "(at (at (.db.parted.get \"" AW_TMP "/sy0\" 't) '%s) %s)", cols[c], lst);
+            } else {
+                snprintf(q, sizeof q, "(at (at (.db.parted.get \"" AW_TMP "/sy0\" 't) '%s) (where (or (== 5 (%% (til %lld) 997)) "
+                         "(and (>= (til %lld) 2998) (<= (til %lld) 3001)) (== (til %lld) %lld))))", cols[c],
+                         (long long)n, (long long)n, (long long)n, (long long)n, (long long)(n - 1));
+            }
+            ray_t* ref = aw_eval(q);
+            TEST_ASSERT_FMT(ref && !RAY_IS_ERR(ref), "%s: %s", q, ray_error_msg());
+            AW_GATHER_REF(out[0][w], ref, false, cols[c]);
+            AW_GATHER_REF(out[1][w], ref, false, cols[c]);
+            ray_release(ref);
+            test_result_t r = aw_vec_same(out[0][w], out[1][w], cols[c]);
+            if (r.status != TEST_PASS) return r;
+            ray_release(out[0][w]); ray_release(out[1][w]);
+        }
+    }
+    ray_rowsel_release(sel); ray_release(pred);
+    ray_release(tp[0]); ray_release(tp[1]);
+    PASS();
+}
+
+/* The column file `col` of the generation-2 table <name>2 (its path in
+ * *path) and chunk c's directory entry and vector j's descriptor. */
+static bool aw_col_file(const char* name, const char* col, char* path, size_t cap) {
+    char dir[512], q[600];
+    snprintf(q, sizeof q, AW_TMP "/%s2/", name);
+    if (ray_splay_resolve_dir(ray_test_tmp(q), dir, sizeof dir) != RAY_OK) return false;
+    snprintf(path, cap, "%s/%s", dir, col);
+    return true;
+}
+/* Overwrite `len` bytes at byte `off` of vector j (chunk 0) of the column
+ * file `path`'s payload. */
+static bool aw_forge_payload(const char* path, int j, uint64_t off, const void* bytes, size_t len) {
+    FILE* f = fopen(path, "r+b"); if (!f) return false;
+    ray_enc_dirent_t de; ray_enc_desc_t d;
+    bool ok = fseek(f, (long)RAY_ENC_DIR_OFF, SEEK_SET) == 0 && fread(&de, sizeof de, 1, f) == 1 &&
+              fseek(f, (long)(de.offset + (uint64_t)j * sizeof d), SEEK_SET) == 0 && fread(&d, sizeof d, 1, f) == 1 &&
+              off + len <= d.payload_bytes &&
+              fseek(f, (long)(de.offset + d.payload_off + off), SEEK_SET) == 0 && fwrite(bytes, len, 1, f) == 1;
+    return fclose(f) == 0 && ok;
+}
+
+/* `rows` gathered from column `col` of <name>2 by a row list and by a
+ * rowsel: both fail `corrupt`, naming `path` (no sanitizer report); the
+ * point read's own statistics error exactly when `stats` (else the
+ * decode's report: the read declined). */
+static test_result_t aw_gather_corrupt(const char* name, const char* col, const int64_t* rows, int64_t n,
+                                       int64_t nrows, const char* path, bool stats, const char* what) {
+    ray_t* t = aw_load(name, 2);
+    TEST_ASSERT_NOT_NULL(t);
+    ray_t* pred = ray_vec_new(RAY_BOOL, nrows); pred->len = nrows;
+    memset(ray_data(pred), 0, (size_t)nrows);
+    for (int64_t i = 0; i < n; i++) ((uint8_t*)ray_data(pred))[rows[i]] = 1;
+    ray_t* sel = ray_rowsel_from_pred(pred);
+    TEST_ASSERT_NOT_NULL(sel);
+    for (int w = 0; w < 2; w++) {
+        ray_col_src_t s;
+        TEST_ASSERT_NULL(ray_table_col_src(t, ray_sym_intern(col, strlen(col)), &s));
+        ray_t* out = NULL;
+        ray_error_clear();
+        ray_t* err = w ? ray_col_gather_sel(&s, sel, &out) : ray_col_gather_rows(&s, rows, n, &out);
+        ray_col_src_release(&s);
+        TEST_ASSERT_FMT(err && RAY_IS_ERR(err) && !out, "%s (%s): answered", what, w ? "rowsel" : "rows");
+        TEST_ASSERT_FMT(strcmp(ray_err_code(err), "corrupt") == 0 && ray_error_msg() && strstr(ray_error_msg(), path),
+                        "%s: %s \"%s\"", what, ray_err_code(err), ray_error_msg() ? ray_error_msg() : "");
+        TEST_ASSERT_FMT(!strstr(ray_error_msg(), "value outside its statistics") == !stats, "%s: \"%s\"", what, ray_error_msg());
+        ray_error_free(err);
+    }
+    ray_rowsel_release(sel); ray_release(pred); ray_release(t);
+    PASS();
+}
+#define AW_GATHER_CORRUPT(...) do { test_result_t r_ = aw_gather_corrupt(__VA_ARGS__); if (r_.status != TEST_PASS) return r_; } while (0)
+
+/* Task 10b: forged vectors under the new point reads.  Each read either
+ * declines, so the decode reports the vector, or reports a value outside
+ * its statistics itself; never an answer and never a sanitizer report:
+ * - a DICT code past the dictionary (the code child's base moved up);
+ * - a null bitmap whose count disagrees with the descriptor;
+ * - a SYM id at the domain bound in a chunk without statistics (present
+ *   SYM statistics lie below the bound, so only then is the bound the
+ *   check);
+ * - a DICT value outside its (capped) statistics, the memory-safety
+ *   erratum's case: the point read's own `corrupt`. */
+static test_result_t test_gather_points_forged(void) {
+    char path[700];
+    static const int64_t rows[] = { 4, 9, 14 };
+    /* the DICT code: the child's 8-byte header, then its base */
+    aw_save("fd", "(table [x] (list (* 1000003 (% (til 70000) 5))))", RAY_ENC_DICT);
+    TEST_ASSERT_EQ_I(aw_vec_enc("fd", "x", 0), RAY_ENC_DICT);
+    TEST_ASSERT_TRUE(aw_col_file("fd", "x", path, sizeof path));
+    const uint64_t base = 1000;
+    TEST_ASSERT_TRUE(aw_forge_payload(path, 0, 8, &base, 8));
+    AW_GATHER_CORRUPT("fd", "x", rows, 3, 70000, path, false, "DICT code past the dictionary");
+    /* the bitmap: row 1 (not null) set in it */
+    aw_save("fb", "(table [x] (list (map (fn [j] (if (== 0 (% j 100)) 0N (% (* j 7919) 1000))) (til 70000))))", RAY_ENC_FOR_BP);
+    TEST_ASSERT_TRUE(aw_col_file("fb", "x", path, sizeof path));
+    const uint8_t bm0 = 0x03;                             /* rows 0 (null) and 1 */
+    TEST_ASSERT_TRUE(aw_forge_payload(path, 0, 0, &bm0, 1));
+    AW_GATHER_CORRUPT("fb", "x", rows, 3, 70000, path, false, "null bitmap count");
+    /* the SYM id: chunk 0 without statistics, vector 0's constant at 250
+     * (the file domain holds 18 symbols: ids below 19, one byte wide) */
+    aw_save("fs", "(table [s] (list (as 'SYMBOL (map (fn [j] (format \"c%\" (div j 4096))) (til 70000)))))", RAY_ENC_CONST);
+    TEST_ASSERT_EQ_I(aw_vec_enc("fs", "s", 0), RAY_ENC_CONST);
+    TEST_ASSERT_TRUE(aw_col_file("fs", "s", path, sizeof path));
+    TEST_ASSERT_TRUE(aw_forge_absent(path, 0));
+    const uint8_t id = 250;
+    TEST_ASSERT_TRUE(aw_forge_payload(path, 0, 0, &id, 1));
+    {
+        ray_t* t = aw_load("fs", 2);
+        TEST_ASSERT_NOT_NULL(t);
+        ray_enccol_t* e = ray_enccol_of(ray_table_get_col_enc(t, ray_sym_intern("s", 1)));
+        TEST_ASSERT_TRUE(e && e->sym_bound > 1 && e->sym_bound <= id && (e->attrs & RAY_SYM_W_MASK) == RAY_SYM_W8);
+        ray_release(t);
+    }
+    AW_GATHER_CORRUPT("fs", "s", rows, 3, 70000, path, false, "SYM id at the domain bound");
+    /* the DICT value: chunk 0's statistics capped at 2000006, so the rows
+     * holding 3000009 and 4000012 lie outside them */
+    aw_save("fc", "(table [x] (list (* 1000003 (% (til 70000) 5))))", RAY_ENC_DICT);
+    TEST_ASSERT_TRUE(aw_col_file("fc", "x", path, sizeof path));
+    TEST_ASSERT_TRUE(aw_forge_cap(path, 0, 2000006));
+    AW_GATHER_CORRUPT("fc", "x", rows, 3, 70000, path, true, "DICT value outside its statistics");
     PASS();
 }
 
@@ -3884,6 +4141,7 @@ static test_result_t test_pool_clamp(void) {
     static test_result_t (*const fns[])(void) = {
         test_scalar_route_mixed, test_eq_runs_lack, test_filter_encoded_leaves, test_scalar_route_stats,
         test_count_on_runs, test_group_count_on_runs, test_group_runs_forged, test_topk_prune_cases,
+        test_gather_sym_points,
     };
     static const uint32_t caps[] = { 7, 3 };
     for (size_t c = 0; c < sizeof caps / sizeof *caps; c++)
@@ -3986,6 +4244,9 @@ const test_entry_t aware_entries[] = {
     { "aware/firstn_parted",      test_firstn_parted,      aw_setup, aw_teardown },
     { "aware/sparse_key_points",  test_sparse_key_points,  aw_setup, aw_teardown },
     { "aware/gather_points",      test_gather_points,      aw_setup, aw_teardown },
+    { "aware/gather_raw_points",  test_gather_raw_points,  aw_setup, aw_teardown },
+    { "aware/gather_sym_points",  test_gather_sym_points,  aw_setup, aw_teardown },
+    { "aware/gather_points_forged", test_gather_points_forged, aw_setup, aw_teardown },
     { "aware/firstn_runs",        test_firstn_runs,        aw_setup, aw_teardown },
     { "aware/firstn_sel",         test_firstn_sel,         aw_setup, aw_teardown },
     { "aware/sparse_walk_points", test_sparse_walk_points, aw_setup, aw_teardown },

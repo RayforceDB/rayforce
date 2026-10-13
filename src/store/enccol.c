@@ -31,6 +31,7 @@
 #include "table/domain.h"
 #include "vec/vec.h"              /* ray_vec_has_nulls */
 #include "store/enc.h"
+#include "store/colrange.h"     /* RAY_COL_POINT_ROWS: the most rows a caller hands one point read */
 #include "vec/str.h"
 #include "core/pool.h"
 #include <math.h>
@@ -1707,40 +1708,219 @@ int ray_enccol_point_i64(ray_enccol_t* e, int64_t row, int64_t* out, ray_t** err
     return point_read(e, d, e->base + de.offset + d->payload_off, d->payload_bytes, c, j, vlen, i, k, out, err);
 }
 
+/* ---- Batched point reads: the rows of one vector, its body read once ----
+ * The most rows of one vector a batched point read serves, per codec:
+ * past it one decode is the cheaper read (open decision D2, re-measured
+ * and extended per codec in Task 10b).  Release microbenchmark over the
+ * 10M ClickBench store's vectors, warm: one cursor range read of a vector
+ * against one batched point read of N rows spread over it, as a fraction
+ * of the read (crossover: where it reaches 1):
+ *   FOR_BP          decode 140-420 ns  N=16 0.30-0.77, N=32 0.47-1.33   -> RAY_ENC_VEC / 32
+ *   RLE             decode 200-1100 ns N=32 0.68-1.20, N=64 0.99-1.91   -> RAY_ENC_VEC / 16
+ *   CONST           decode ~100 ns     N=8  0.79-0.86, N=16 1.18-1.33   -> RAY_ENC_VEC / 16, as
+ *                   ruled for runs (the warm crossover is ~10 rows; the group
+ *                   key reads pinned at 10-26 rows per vector rely on it)
+ *   DICT            decode 660-1350 ns N=64 0.30-0.61                   -> RAY_ENC_VEC / 16
+ *   RAW, viewed     a view, 34-38 ns   N=1  1.05-1.26                   -> declined
+ *   RAW, chunk not yet validated: the view's first read checks every RAW
+ *                   vector of the chunk (0.4-0.9 us each, ~60 us a chunk),
+ *                   so a few rows are point-read; N=8 costs 2.8 views   -> RAY_ENC_VEC / 128
+ *   with a bitmap   decode 1.8-2.4 us  N=64 0.17-0.25 (every codec)     -> RAY_ENC_VEC / 16
+ * SYM vectors took the same limits (FOR_BP N=32 0.52-0.55, RLE N=64
+ * 1.01-1.87, CONST N=8 0.79, N=64 3.2).  RAY_ENC_VEC / 16 is RAY_COL_POINT_ROWS,
+ * the most rows a caller hands one call.  Structural ratios, not knobs. */
+#define PT_ROWS_FOR   (RAY_ENC_VEC / 32)
+#define PT_ROWS_RUNS  (RAY_ENC_VEC / 16)
+#define PT_ROWS_CONST (RAY_ENC_VEC / 16)
+#define PT_ROWS_DICT  (RAY_ENC_VEC / 16)
+#define PT_ROWS_NULLS (RAY_ENC_VEC / 16)
+#define PT_ROWS_RAW   (RAY_ENC_VEC / 128)
+_Static_assert(PT_ROWS_RUNS <= RAY_COL_POINT_ROWS && PT_ROWS_DICT <= RAY_COL_POINT_ROWS &&
+               PT_ROWS_NULLS <= RAY_COL_POINT_ROWS && PT_ROWS_FOR <= RAY_COL_POINT_ROWS,
+               "a codec's point-read limit is at most the caller's batch");
+
+/* What every served row of one vector is checked against: its kind, the
+ * descriptor's statistics, the bitmap (NULL: the vector has none) and, for
+ * SYM, the domain bound. */
+typedef struct {
+    ray_enccol_t*         e;
+    const ray_enc_desc_t* d;
+    const uint8_t*        bm;      /* the validated null bitmap, or NULL */
+    uint8_t*              nul;     /* the caller's null flags (NULL: none taken) */
+    ray_enc_kind_t        k;
+    uint64_t              m;       /* the lane mask */
+    uint64_t              sent;    /* a signed kind's sentinel (none for unsigned kinds) */
+    int64_t               c;
+    int                   j;
+    bool                  sym;
+} pt_ctx_t;
+
+/* Row i (output q) in the bitmap: a null, flagged; nothing else of the row
+ * is read (a null slot's value or code may be anything the writer chose). */
+static inline __attribute__((always_inline)) bool pt_null(const pt_ctx_t* t, int i, int64_t q, int64_t* out) {
+    if (!t->bm || !((t->bm[i >> 3] >> (i & 7)) & 1)) return false;
+    t->nul[q] = 1;
+    out[q] = 0;
+    return true;
+}
+
+/* The T-bit pattern x of a row outside the bitmap as its logical value:
+ * 1 served, 0 declined (the decode reports it: a sentinel outside the
+ * bitmap, a SYM id at or above the domain bound), -1 a value outside the
+ * vector's statistics (`corrupt`, which the decode of a FOR_BP, RAW or
+ * run vector does not check).  SYM id 0 is the in-band null and is served
+ * as itself.  So every value served lies inside its vector's statistics,
+ * and those inside the chunk's (descriptor validation): a stats_guard
+ * source needs no further check.  The bound matters where statistics are
+ * absent: present SYM statistics lie below it (descriptor validation). */
+static inline __attribute__((always_inline)) int pt_val(const pt_ctx_t* t, uint64_t x, int64_t q, int64_t* out, ray_t** err) {
+    const ray_enc_desc_t* d = t->d;
+    if (t->sym) {
+        if (x == 0) { out[q] = 0; return 1; }
+        if (x >= t->e->sym_bound) return 0;
+    } else if (x == t->sent) {
+        return 0;
+    }
+    const int sh = 64 - t->k.T;
+    const int64_t v = t->k.is_signed ? (int64_t)(x << sh) >> sh : (int64_t)x;
+    if (!(d->flags & RAY_ENC_STAT_ABSENT) && (v < d->min || v > d->max)) {
+        *err = ray_error("corrupt", "column %s: chunk %lld vector %d value outside its statistics",
+                         t->e->path, (long long)t->c, t->j);
+        return -1;
+    }
+    out[q] = v;
+    return 1;
+}
+
 /* Rows of one CONST / RLE vector (local rows rows[q] - base, ascending)
  * read off its runs, checked as point_body and point_read check them:
  * the runs read once (fk_runs), each row's run found by advancing over
  * the ends.  Out of line, as point_run.  1 / 0 / -1 as point_read. */
-static __attribute__((noinline)) int points_runs(ray_enccol_t* e, const ray_enc_desc_t* d, const uint8_t* p,
-                                                 uint64_t avail, int64_t c, int j, int vlen, const int64_t* rows,
-                                                 int64_t n, int64_t base, ray_enc_kind_t k, int64_t* out, ray_t** err) {
+static __attribute__((noinline)) int points_runs(const pt_ctx_t* t, const uint8_t* p, uint64_t avail, int vlen,
+                                                 const int64_t* rows, int64_t n, int64_t base, int64_t* out,
+                                                 ray_t** err) {
     if (vlen < 1 || vlen > RAY_ENC_VEC || ((uintptr_t)p & 7)) return 0;
     _Alignas(64) fk_vals_t vals, ends;
     uint32_t nr;
-    if (!fk_runs(d->encoding, vlen, p, avail, k.T, &vals, &ends, &nr)) return 0;
-    const uint64_t m = k.T == 64 ? ~0ull : (1ull << k.T) - 1;
-    const uint64_t sent = k.is_signed ? (uint64_t)1 << (k.T - 1) : ~0ull;   /* none for unsigned kinds */
-    const int sh = 64 - k.T;
+    if (!fk_runs(t->d->encoding, vlen, p, avail, t->k.T, &vals, &ends, &nr)) return 0;
     uint32_t r = 0;
     for (int64_t q = 0; q < n; q++) {
         const int64_t i = rows[q] - base;
+        if (pt_null(t, (int)i, q, out)) continue;
         while (r + 1 < nr && ends.h[r] <= (uint32_t)i) r++;
-        uint64_t x = fk_val(&vals, k.T, r) & m;
-        if (x == sent) return 0;                           /* the sentinel outside a bitmap */
-        const int64_t v = k.is_signed ? (int64_t)(x << sh) >> sh : (int64_t)x;
-        if (!(d->flags & RAY_ENC_STAT_ABSENT) && (v < d->min || v > d->max)) {
-            *err = ray_error("corrupt", "column %s: chunk %lld vector %d value outside its statistics", e->path, (long long)c, j);
-            return -1;
-        }
-        out[q] = v;
+        const int pr = pt_val(t, fk_val(&vals, t->k.T, r) & t->m, q, out, err);
+        if (pr != 1) return pr;
     }
     return 1;
 }
 
-int ray_enccol_points_i64(ray_enccol_t* e, const int64_t* rows, int64_t n, int64_t base, int64_t* out, ray_t** err) {
+/* point_field at a fixed lane width UT: L = 1024 / T lanes (LS = log2 L,
+ * TS = log2 T), the divisions as shifts and masks, fixed-size loads. */
+#define PT_FIELD(NAME, UT, LS, TS)                                                               \
+static inline __attribute__((always_inline)) uint64_t NAME(const UT* lanes, int w, uint64_t wm, int i) { \
+    const int T = 8 * (int)sizeof(UT);                                                           \
+    const int bit = (i >> (LS)) * w, off = bit & (T - 1);                                        \
+    const size_t at = (size_t)(bit >> (TS)) * ((size_t)1 << (LS)) + (size_t)(i & ((1 << (LS)) - 1)); \
+    UT lo, hi;                                                                                   \
+    memcpy(&lo, lanes + at, sizeof lo);                                                          \
+    uint64_t f = (uint64_t)lo >> off;                                                            \
+    if (off + w > T) { memcpy(&hi, lanes + at + ((size_t)1 << (LS)), sizeof hi); f |= (uint64_t)hi << (T - off); } \
+    return f & wm;                                                                               \
+}
+PT_FIELD(pt_field8,  uint8_t,  7, 3)
+PT_FIELD(pt_field16, uint16_t, 6, 4)
+PT_FIELD(pt_field32, uint32_t, 5, 5)
+PT_FIELD(pt_field64, uint64_t, 4, 6)
+#undef PT_FIELD
+
+/* Rows of one FOR_BP vector: point_body's FOR_BP checks once, then the
+ * lane arithmetic per row. */
+static int points_for(const pt_ctx_t* t, const uint8_t* p, uint64_t avail, const int64_t* rows, int64_t n,
+                      int64_t base, int64_t* out, ray_t** err) {
+    const int w = t->d->width, T = t->k.T;
+    if (w > T || avail != (uint64_t)ray_enc_size_for(w)) return 0;
+    uint64_t fb; memcpy(&fb, p, 8);
+    if (fb & ~t->m) return 0;
+    const uint8_t* pk = p + 8;
+    const uint64_t wm = w >= 64 ? ~0ull : (1ull << w) - 1;
+#define FOR_POINTS(UT, FIELD) do {                                                               \
+        const UT* lanes = (const UT*)(const void*)pk;                                            \
+        for (int64_t q = 0; q < n; q++) {                                                        \
+            const int i = (int)(rows[q] - base);                                                 \
+            if (pt_null(t, i, q, out)) continue;                                                 \
+            const uint64_t f = w ? FIELD(lanes, w, wm, i) : 0;                                   \
+            const int pr = pt_val(t, (fb + f) & t->m, q, out, err);                              \
+            if (pr != 1) return pr;                                                              \
+        }                                                                                        \
+    } while (0)
+    switch (T) {
+    case 8:  FOR_POINTS(uint8_t,  pt_field8);  break;
+    case 16: FOR_POINTS(uint16_t, pt_field16); break;
+    case 32: FOR_POINTS(uint32_t, pt_field32); break;
+    default: FOR_POINTS(uint64_t, pt_field64); break;
+    }
+#undef FOR_POINTS
+    return 1;
+}
+
+/* Rows of one DICT vector over a U32 FOR_BP code child: point_body's
+ * child checks once and the dictionary validated (once per column, its
+ * errors -1), then per row the code unpacked at its lane, checked below
+ * the dictionary size (else declined: the decode reports the code) and
+ * its entry read. */
+static int points_dict(const pt_ctx_t* t, const uint8_t* p, uint64_t avail, const int64_t* rows, int64_t n,
+                       int64_t base, int64_t* out, ray_t** err) {
+    if (avail < 16 || p[0] != RAY_ENC_FOR_BP) return 0;
+    const int w = p[1];
+    uint16_t rsv; memcpy(&rsv, p + 2, 2);
+    uint32_t bb; memcpy(&bb, p + 4, 4);
+    if (rsv || w > 32 || (uint64_t)bb + 8 != avail || bb != (uint64_t)ray_enc_size_for(w)) return 0;
+    uint64_t cb; memcpy(&cb, p + 8, 8);
+    if (cb >> 32) return 0;
+    ray_enc_dict_t dict;
+    if ((*err = enc_dict(t->e, &dict)) != NULL) return -1;
+    const uint32_t* lanes = (const uint32_t*)(const void*)(p + 16);
+    const uint64_t wm = w >= 64 ? ~0ull : (1ull << w) - 1;
+    for (int64_t q = 0; q < n; q++) {
+        const int i = (int)(rows[q] - base);
+        if (pt_null(t, i, q, out)) continue;
+        const uint64_t code = (cb + (w ? pt_field32(lanes, w, wm, i) : 0)) & 0xffffffffull;
+        if (code >= dict.n) return 0;
+        const int pr = pt_val(t, dict.v[code] & t->m, q, out, err);
+        if (pr != 1) return pr;
+    }
+    return 1;
+}
+
+/* Rows of one RAW vector: the body's size checked once (dec_fast_raw's
+ * rule; the padding and the other rows are not read), then each row's
+ * T-bit element. */
+static int points_raw(const pt_ctx_t* t, const uint8_t* p, uint64_t avail, int vlen, const int64_t* rows,
+                      int64_t n, int64_t base, int64_t* out, ray_t** err) {
+    if (avail != (uint64_t)ray_enc_size_raw(vlen, t->k.T)) return 0;
+    const size_t tb = (size_t)t->k.T / 8;
+    for (int64_t q = 0; q < n; q++) {
+        const int i = (int)(rows[q] - base);
+        if (pt_null(t, i, q, out)) continue;
+        uint64_t x = 0;
+        memcpy(&x, p + (size_t)i * tb, tb);                     /* little-endian: the low tb bytes */
+        const int pr = pt_val(t, x, q, out, err);
+        if (pr != 1) return pr;
+    }
+    return 1;
+}
+
+/* ray_enccol_points_i64 and ray_enccol_gather_points: nul NULL declines
+ * SYM and vectors with a null bitmap, else both are served (nul[q] set for
+ * a bitmap row). */
+static int points_core(ray_enccol_t* e, const int64_t* rows, int64_t n, int64_t base, int64_t* out, uint8_t* nul,
+                       ray_t** err) {
     *err = NULL;
     ray_enc_kind_t k;
-    if (n <= 0 || e->kind != RAY_ENCCOL_SINGLE || !point_type(e, &k)) return 0;
+    if (n <= 0 || e->kind != RAY_ENCCOL_SINGLE || !fk_int_type(e->type) || !ray_enc_kind_of(e->type, e->attrs, &k))
+        return 0;
+    const bool sym = e->type == RAY_SYM;
+    if (sym && !nul) return 0;                                   /* ids only to a caller that takes them */
     const int64_t r0 = rows[0] - base;
     if (r0 < 0 || r0 >= e->len) return 0;
     const int64_t c = r0 / RAY_ENC_CHUNK;
@@ -1753,63 +1933,72 @@ int ray_enccol_points_i64(ray_enccol_t* e, const int64_t* rows, int64_t n, int64
     const ray_enc_desc_t* descs;
     if ((*err = ray_enccol_chunk_descs_ref(e, c, &descs)) != NULL) return -1;   /* validated once per chunk */
     const ray_enc_desc_t* d = &descs[j];
-    if (d->n_nulls) return 0;
     ray_enc_dirent_t de; dirent_at(e, c, &de);
     const uint8_t* p = e->base + de.offset + d->payload_off;
-    /* open decision D2, per codec at the measured crossovers: runs up to
-     * RAY_ENC_VEC / 16 rows, packed lanes up to RAY_ENC_VEC / 32, any other
-     * codec declines (its decode is the cheaper read) */
-    if ((d->encoding == RAY_ENC_CONST || d->encoding == RAY_ENC_RLE) && d->width == 0)
-        return n <= RAY_ENC_VEC / 16 ? points_runs(e, d, p, d->payload_bytes, c, j, vlen, rows, n, base + vs, k, out, err) : 0;
-    if (d->encoding != RAY_ENC_FOR_BP || n > RAY_ENC_VEC / 32) return 0;
-    {
-        /* point_body's FOR_BP checks once, then point_field's lane
-         * arithmetic per row with the power-of-two divisions as shifts */
-        const int w = d->width, T = k.T;
-        const uint64_t m = T == 64 ? ~0ull : (1ull << T) - 1;
-        if (w > T || d->payload_bytes != (uint64_t)ray_enc_size_for(w)) return 0;
-        uint64_t fb; memcpy(&fb, p, 8);
-        if (fb & ~m) return 0;
-        const uint8_t* pk = p + 8;
-        const uint64_t wm = w >= 64 ? ~0ull : (1ull << w) - 1;
-        const uint64_t sent = k.is_signed ? (uint64_t)1 << (T - 1) : ~0ull;   /* none for unsigned kinds */
-        const int sh = 64 - T;
-        /* point_field at a fixed lane width UT: L = 1024 / T lanes, the
-         * divisions as shifts and masks, fixed-size loads */
-#define FOR_POINTS(UT, LS, TS) do {                                                              \
-            const UT* lanes = (const UT*)(const void*)pk;                                          \
-            for (int64_t q = 0; q < n; q++) {                                                      \
-                const int i = (int)(rows[q] - base - vs);                                          \
-                uint64_t f = 0;                                                                    \
-                if (w) {                                                                           \
-                    const int bit = (i >> (LS)) * w, off = bit & (T - 1);                          \
-                    const size_t at = (size_t)(bit >> (TS)) * ((size_t)1 << (LS)) + (size_t)(i & ((1 << (LS)) - 1)); \
-                    UT lo, hi;                                                                     \
-                    memcpy(&lo, lanes + at, sizeof lo);                                            \
-                    f = (uint64_t)lo >> off;                                                       \
-                    if (off + w > T) { memcpy(&hi, lanes + at + ((size_t)1 << (LS)), sizeof hi); f |= (uint64_t)hi << (T - off); } \
-                    f &= wm;                                                                       \
-                }                                                                                  \
-                const uint64_t x = (fb + f) & m;                                                   \
-                if (x == sent) return 0;                       /* the sentinel outside a bitmap */ \
-                const int64_t v = k.is_signed ? (int64_t)(x << sh) >> sh : (int64_t)x;             \
-                if (!(d->flags & RAY_ENC_STAT_ABSENT) && (v < d->min || v > d->max)) {             \
-                    *err = ray_error("corrupt", "column %s: chunk %lld vector %d value outside its statistics", \
-                                     e->path, (long long)c, j);                                    \
-                    return -1;                                                                     \
-                }                                                                                  \
-                out[q] = v;                                                                        \
-            }                                                                                      \
-        } while (0)
-        switch (T) {
-        case 8:  FOR_POINTS(uint8_t,  7, 3); break;
-        case 16: FOR_POINTS(uint16_t, 6, 4); break;
-        case 32: FOR_POINTS(uint32_t, 5, 5); break;
-        default: FOR_POINTS(uint64_t, 4, 6); break;
+    uint64_t avail = d->payload_bytes;
+    pt_ctx_t t = { .e = e, .d = d, .bm = NULL, .nul = nul, .k = k,
+                   .m = k.T == 64 ? ~0ull : (1ull << k.T) - 1,
+                   .sent = k.is_signed ? (uint64_t)1 << (k.T - 1) : ~0ull, .c = c, .j = j, .sym = sym };
+    if (d->n_nulls && !sym) {
+        /* the bitmap as payload_parts checks it: present, its count and
+         * a clear tail (a word at a time: popcount_prefix's bit loop cost
+         * more than the rows); anything off is the decode's to report */
+        if (!nul || !ray_enc_has_bitmap(e->type) || avail < 128) return 0;
+        uint32_t cnt = 0;
+        uint64_t tail = 0;
+        for (int w = 0; w < RAY_ENC_VEC / 64; w++) {
+            uint64_t x; memcpy(&x, p + 8 * w, 8);
+            const int lo = 64 * w;
+            const uint64_t keep = vlen >= lo + 64 ? ~0ull : vlen <= lo ? 0 : (1ull << (vlen - lo)) - 1;
+            cnt += (uint32_t)__builtin_popcountll(x & keep);
+            tail |= x & ~keep;
         }
-#undef FOR_POINTS
-        return 1;
+        if (cnt != (uint32_t)d->n_nulls || tail) return 0;
+        t.bm = p; p += 128; avail -= 128;
     }
+    /* the codec's limit (above): a vector with a bitmap decodes through
+     * the merge, so its point reads win up to the caller's batch */
+    const bool bm = t.bm != NULL;
+    const int64_t vb = base + vs;
+    switch (d->encoding) {
+    case RAY_ENC_CONST:
+        if (d->width || n > (bm ? PT_ROWS_NULLS : PT_ROWS_CONST)) return 0;
+        break;
+    case RAY_ENC_RLE:
+        if (d->width || n > (bm ? PT_ROWS_NULLS : PT_ROWS_RUNS)) return 0;
+        break;
+    case RAY_ENC_FOR_BP:
+        if (n > (bm ? PT_ROWS_NULLS : PT_ROWS_FOR)) return 0;
+        break;
+    case RAY_ENC_DICT:
+        if (d->width || n > (bm ? PT_ROWS_NULLS : PT_ROWS_DICT)) return 0;
+        break;
+    case RAY_ENC_RAW:
+        /* without a bitmap the view is the cheaper read once its chunk is
+         * validated (raw_ok); before that, a few rows are point-read */
+        if (bm ? n > PT_ROWS_NULLS
+               : n > PT_ROWS_RAW || (e->raw_ok && atomic_load_explicit(&e->raw_ok[c], memory_order_acquire)))
+            return 0;
+        break;
+    default:
+        return 0;                                          /* DELTA_BP and the rest: the decode */
+    }
+    if (nul) memset(nul, 0, (size_t)n);
+    switch (d->encoding) {
+    case RAY_ENC_CONST: case RAY_ENC_RLE: return points_runs(&t, p, avail, vlen, rows, n, vb, out, err);
+    case RAY_ENC_FOR_BP:                  return points_for(&t, p, avail, rows, n, vb, out, err);
+    case RAY_ENC_DICT:                    return points_dict(&t, p, avail, rows, n, vb, out, err);
+    default:                              return points_raw(&t, p, avail, vlen, rows, n, vb, out, err);
+    }
+}
+
+int ray_enccol_points_i64(ray_enccol_t* e, const int64_t* rows, int64_t n, int64_t base, int64_t* out, ray_t** err) {
+    return points_core(e, rows, n, base, out, NULL, err);
+}
+
+int ray_enccol_gather_points(ray_enccol_t* e, const int64_t* rows, int64_t n, int64_t base, int64_t* out,
+                             uint8_t* nul, ray_t** err) {
+    return points_core(e, rows, n, base, out, nul, err);
 }
 
 /* ---- Encoded vector views: a body validated, never expanded ----

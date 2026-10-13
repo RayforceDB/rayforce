@@ -245,6 +245,10 @@ int  ray_col_src_point_i64(ray_col_src_t* s, int64_t row, int64_t* out, ray_t** 
  * (ray_enccol_points_i64): 1 every row served into out, 0 declined (read
  * the vector through a cursor; out partly written), -1 an owned *err. */
 int  ray_col_src_points_i64(ray_col_src_t* s, const int64_t* rows, int64_t n, int64_t* out, ray_t** err);
+/* ray_col_src_points_i64 for a gather (ray_enccol_gather_points): SYM ids
+ * and vectors with a null bitmap served too, nul[q] 1 for a bitmap null. */
+int  ray_col_src_gather_points(ray_col_src_t* s, const int64_t* rows, int64_t n, int64_t* out, uint8_t* nul,
+                               ray_t** err);
 /* The rows [*lo, *hi) of the vector holding row `row` (segment-local
  * vectors for a parted source) when ray_col_src_point_i64 may serve it (a
  * single-file encoded column or segment, not materialized): true.  False
@@ -267,12 +271,15 @@ bool ray_col_src_vec_span(ray_col_src_t* s, int64_t row, int64_t* lo, int64_t* h
  * -1 an owned *err (the descriptors', the payload's or the guard's). */
 int  ray_col_src_runview(ray_col_src_t* s, int64_t row, struct ray_enc_vview_s* out, int64_t* lo, int64_t* hi, ray_t** err);
 /* Open decision D2 (ruled per codec at the measured crossovers of a
- * batched point read against one decode): a vector's requested rows are
- * point-read when there are at most RAY_ENC_VEC / 32 of them in a FOR_BP
- * vector, RAY_ENC_VEC / 16 in an RLE or CONST one; any other codec
- * declines (ray_enccol_points_i64 decides).  RAY_COL_POINT_ROWS is the
- * largest of them, the most rows a caller hands one call (RAY_ENC_VEC =
- * RAY_MORSEL_ELEMS values).  Structural ratios, not knobs. */
+ * batched point read against one decode, re-measured in Task 10b): a
+ * vector's requested rows are point-read when there are at most
+ * RAY_ENC_VEC / 32 of them in a FOR_BP vector, RAY_ENC_VEC / 16 in an RLE,
+ * CONST or DICT one or any vector with a null bitmap, RAY_ENC_VEC / 128 in
+ * a RAW one whose chunk is not yet validated; any other codec
+ * declines (ray_enccol_points_i64 decides; enccol.c records the
+ * measurements).  RAY_COL_POINT_ROWS is the largest of them, the most
+ * rows a caller hands one call (RAY_ENC_VEC = RAY_MORSEL_ELEMS values).
+ * Structural ratios, not knobs. */
 #define RAY_COL_POINT_ROWS (RAY_MORSEL_ELEMS / 16)
 /* One sequential read-ahead hint for rows [lo, hi): plain mmapped
  * columns hint their element bytes, generation 2 the chunk bytes from the

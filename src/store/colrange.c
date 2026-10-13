@@ -822,6 +822,14 @@ int ray_col_src_points_i64(ray_col_src_t* s, const int64_t* rows, int64_t n, int
     return e ? ray_enccol_points_i64(e, rows, n, s0, out, err) : 0;
 }
 
+int ray_col_src_gather_points(ray_col_src_t* s, const int64_t* rows, int64_t n, int64_t* out, uint8_t* nul,
+                              ray_t** err) {
+    *err = NULL;
+    int64_t s0, s1;
+    ray_enccol_t* e = n > 0 ? src_point_col(s, rows[0], &s0, &s1) : NULL;
+    return e ? ray_enccol_gather_points(e, rows, n, s0, out, nul, err) : 0;
+}
+
 bool ray_col_src_vec_span(ray_col_src_t* s, int64_t row, int64_t* lo, int64_t* hi) {
     int64_t s0, s1;
     ray_enccol_t* e = src_point_col(s, row, &s0, &s1);

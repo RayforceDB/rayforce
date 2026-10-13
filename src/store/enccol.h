@@ -171,9 +171,22 @@ int    ray_enccol_point_i64(ray_enccol_t* e, int64_t row, int64_t* out, ray_t** 
  * checked against the vector's statistics, `corrupt` otherwise); 0:
  * declined (as ray_enccol_point_i64; above open decision D2's limit for
  * the codec, RAY_ENC_VEC / 32 rows of a FOR_BP vector, RAY_ENC_VEC / 16
- * of an RLE or CONST one; any other codec; or rows outside one vector or
- * not ascending), out partly written; -1: an owned error in *err. */
+ * of an RLE, CONST or DICT one, RAY_ENC_VEC / 128 of a RAW one whose
+ * chunk is not yet validated; a vector with nulls; SYM; any other
+ * codec; or rows outside one vector or not ascending), out partly written;
+ * -1: an owned error in *err. */
 int    ray_enccol_points_i64(ray_enccol_t* e, const int64_t* rows, int64_t n, int64_t base, int64_t* out, ray_t** err);
+/* ray_enccol_points_i64 for a gather, which takes nulls and SYM ids: also
+ * serves a vector with a null bitmap (the bitmap's count and tail checked
+ * as the decode checks them; nul[q] 1 for a row in it, out[q] then 0, and
+ * nothing else of the row read) and a SYM column's ids (id 0, the in-band
+ * null, as itself; any other below the domain bound and inside the
+ * vector's statistics, else declined so the decode reports it).  nul[q]
+ * is 0 for every other row.  The codecs and their per-vector row limits
+ * are ray_enccol_points_i64's: FOR_BP, DICT over FOR_BP codes, CONST or
+ * RLE, and RAW.  1 / 0 / -1 as there. */
+int    ray_enccol_gather_points(ray_enccol_t* e, const int64_t* rows, int64_t n, int64_t base, int64_t* out,
+                                uint8_t* nul, ray_t** err);
 
 /* RAY_ENC_VEC lane values at the kind's width T (the fast kernels' own
  * buffer: enccol.c's fk_vals_t is a typedef of this). */
