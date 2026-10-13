@@ -85,7 +85,7 @@ int parse_sys_int_arg(const char* s, bool nonnegative, bool core_count,
     long long v = strtoll(s, &end, 10);
     if (errno == ERANGE || end == s || *end != '\0' ||
         (nonnegative && v < 0) ||
-        (core_count && v > (int64_t)RAY_HEAP_ID_BITS))
+        (core_count && v > (int64_t)RAY_HEAP_ID_BITS - 1))
         return 0;
     *out = (int64_t)v;
     return 1;

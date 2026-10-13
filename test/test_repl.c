@@ -2954,9 +2954,11 @@ static int run_cli_task_count(const char* cores, long* out_count) {
     int status;
     snprintf(command, sizeof(command),
              "printf '(count (.fs.list \"/proc/self/task\"))\\n'"
-             " | ./rayforce -c %s -i", cores);
+             " | ./rayforce -c %s -i 2>&1", cores);
     if (run_cli_capture(command, output, sizeof(output), &status) != 0 ||
-        !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+        !WIFEXITED(status) || WEXITSTATUS(status) != 0 ||
+        strstr(output, "ray_pool_init_total") != NULL ||
+        strstr(output, "heap-ID pool exhausted") != NULL)
         return -1;
     char* end = NULL;
     long count = strtol(output, &end, 10);
@@ -2978,6 +2980,10 @@ static test_result_t test_repl_cli_cores_are_total(void) {
     rc = run_cli_task_count("007", &count);
     TEST_ASSERT_FMT(rc == 0, "-c 007 launcher probe failed: %d", rc);
     TEST_ASSERT_FMT(count == 7, "-c 007 created %ld total threads", count);
+
+    rc = run_cli_task_count("1023", &count);
+    TEST_ASSERT_FMT(rc == 0, "-c 1023 launcher probe failed: %d", rc);
+    TEST_ASSERT_FMT(count == 1023, "-c 1023 created %ld total threads", count);
     PASS();
 }
 
@@ -2985,7 +2991,7 @@ static test_result_t test_repl_cli_cores_reject_malformed(void) {
     const struct { const char* args; const char* token; } bad[] = {
         { "-c -1", "-1" },
         { "-c +4", "+4" },
-        { "-c 1025", "1025" },
+        { "-c 1024", "1024" },
         { "-t 1abc", "1abc" },
         { "-Q 0abc", "0abc" },
     };

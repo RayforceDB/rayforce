@@ -191,7 +191,7 @@ int main(int argc, char** argv) {
             int64_t parsed;
             if (!parse_sys_int_arg(cv, true, true, &parsed)) {
                 fprintf(stderr, "error: %s expects a worker count in 0..%u, got '%s'\n",
-                        flag, (unsigned)RAY_HEAP_ID_BITS, cv);
+                        flag, (unsigned)(RAY_HEAP_ID_BITS - 1), cv);
                 ray_runtime_destroy(rt);
                 return 2;
             }
@@ -253,7 +253,7 @@ int main(int argc, char** argv) {
                 "  -f, --file FILE     run script file (or pass as a positional arg)\n"
                 "  -p, --port PORT     listen for IPC clients on PORT (all interfaces)\n"
                 "      --port HOST:PORT  bind the listener to HOST only (e.g. 127.0.0.1:7701)\n"
-                "  -c, --cores N       decimal digits; 0 = auto, 1..1024 includes main thread\n"
+                "  -c, --cores N       decimal digits; 0 = auto, 1..1023 includes main thread\n"
                 "  -t, --timeit N      enable profiler at startup (N != 0)\n"
                 "  -Q, --querylog N    enable query logging at startup (N != 0);\n"
                 "                      read the ring with (.sys.querylog)\n"
@@ -315,9 +315,12 @@ int main(int argc, char** argv) {
      * pool to its lazy default on first use. */
     if (n_cores >= 0) {
         ray_err_t err = ray_pool_init_total((uint32_t)n_cores);
-        if (err != RAY_OK)
-            fprintf(stderr, "warning: ray_pool_init_total(%d) failed (%d)\n",
+        if (err != RAY_OK) {
+            fprintf(stderr, "error: ray_pool_init_total(%d) failed (%d)\n",
                     n_cores, (int)err);
+            ray_runtime_destroy(rt);
+            return 2;
+        }
     }
 
     /* -t at startup flips the global profiler flag. The REPL reads
