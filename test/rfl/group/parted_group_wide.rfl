@@ -79,5 +79,50 @@
 (< (max (abs (- (at RP 'sdv) (at RF 'sdv)))) 0.000001) -- true
 (< (max (abs (- (at RP 'vrv) (at RF 'vrv)))) 0.000001) -- true
 
+;; ─── nullable inputs: AVG/VAR/STDDEV divide by the NON-NULL count (#767) ─────
+;; The streaming kernel decomposes AVG into SUM+COUNT and VAR/STDDEV into
+;; SUM+SUM(x²)+COUNT.  SUM skips nulls, so the COUNT must too — it used to be
+;; the group row count, dividing the non-null sum by every row.  Fixture: 2
+;; partitions × 600 rows, key g = i mod 3 (gate: 3*100 <= 600).  Every 4th row
+;; is null; g=2 is null everywhere (all-null group → null avg/var, as flat);
+;; g=1 is all null in partition 1 only.  f is F64, k the same values as I64.
+(set mknull (fn [n off] (do (set i (+ (til n) off)) (set g (% i 3)) (set z (or (or (== g 2) (== (% i 4) 0)) (and (< off 1) (== g 1)))) (set f (/ (as 'F64 i) (as 'F64 (not z)))) (table [g f k] (list g f (as 'I64 f))))))
+(.sys.exec "rm -rf /tmp/rfl_pgwn")
+(.db.splayed.set "/tmp/rfl_pgwn/2024.01.01/t/" (mknull 600 0))
+(.db.splayed.set "/tmp/rfl_pgwn/2024.01.02/t/" (mknull 600 600))
+(set Pn (.db.parted.get "/tmp/rfl_pgwn/" 't))
+(set Fn (concat (mknull 600 0) (mknull 600 600)))
+(set qn (fn [T] (select {a: (avg f) v: (var f) vp: (var_pop f) d: (dev f) sd: (stddev f) sp: (stddev_pop f) ak: (avg k) vk: (var k) dk: (dev k) fi: (first f) la: (last k) from: T by: g asc: g})))
+(set Bn (at (.sys.mem) 'group-perpart-runs))
+(set NP (qn Pn))
+(> (at (.sys.mem) 'group-perpart-runs) Bn) -- true
+(set NF (qn Fn))
+(at NP 'a)  -- [600.0 900.0 0Nf]
+(at NP 'ak) -- [600.0 900.0 0Nf]
+(at NP 'a)  -- (at NF 'a)
+(at NP 'ak) -- (at NF 'ak)
+(at NP 'fi) -- (at NF 'fi)
+(at NP 'la) -- (at NF 'la)
+(nil? (at NP 'v))  -- (nil? (at NF 'v))
+(nil? (at NP 'vk)) -- (nil? (at NF 'vk))
+(< (max (abs (- (take (at NP 'v)  2) (take (at NF 'v)  2)))) 0.000001) -- true
+(< (max (abs (- (take (at NP 'vp) 2) (take (at NF 'vp) 2)))) 0.000001) -- true
+(< (max (abs (- (take (at NP 'd)  2) (take (at NF 'd)  2)))) 0.000001) -- true
+(< (max (abs (- (take (at NP 'sd) 2) (take (at NF 'sd) 2)))) 0.000001) -- true
+(< (max (abs (- (take (at NP 'sp) 2) (take (at NF 'sp) 2)))) 0.000001) -- true
+(< (max (abs (- (take (at NP 'vk) 2) (take (at NF 'vk) 2)))) 0.000001) -- true
+(< (max (abs (- (take (at NP 'dk) 2) (take (at NF 'dk) 2)))) 0.000001) -- true
+;; same under a pushed-down WHERE (k is not filtered, so its nulls survive)
+(set wn (fn [T] (select {a: (avg k) v: (var k) from: T where: (> g 0) by: g asc: g})))
+(at (wn Pn) 'a) -- (at (wn Fn) 'a)
+(< (abs (- (first (at (wn Pn) 'v)) (first (at (wn Fn) 'v)))) 0.000001) -- true
+;; ungrouped, and grouped by the MAPCOMMON partition column
+(set un (fn [T] (select {a: (avg f) ak: (avg k) v: (var k) from: T})))
+(at (un Pn) 'a)  -- (at (un Fn) 'a)
+(at (un Pn) 'ak) -- (at (un Fn) 'ak)
+(< (abs (- (first (at (un Pn) 'v)) (first (at (un Fn) 'v)))) 0.000001) -- true
+(at (select {a: (avg f) ak: (avg k) from: Pn by: date}) 'a)  -- [300.0 900.0]
+(at (select {a: (avg f) ak: (avg k) from: Pn by: date}) 'ak) -- [300.0 900.0]
+
 ;; ─── cleanup ─────────────────────────────────────────────────────────────────
-(.sys.exec "rm -rf /tmp/rfl_pgw")
+(.sys.exec "rm -rf /tmp/rfl_pgw /tmp/rfl_pgwn")

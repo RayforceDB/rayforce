@@ -10082,9 +10082,10 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
          * of the key over flat_tbl fails "by: column not found" (the former
          * collector silently dropped expression-key sources).  A distinct
          * source column can never exceed the table's column count, and each
-         * slot may reference several, so bound the union at n_keys+n_aggs+ncols
-         * (min 1); the dedup keeps the live count ≤ ncols. */
-        int64_t needed_max = (int64_t)n_keys + (int64_t)n_aggs + ncols;
+         * slot may reference several, so bound the union at
+         * n_keys+2*n_aggs+ncols (min 1; an agg has up to two inputs); the
+         * dedup keeps the live count ≤ ncols. */
+        int64_t needed_max = (int64_t)n_keys + 2 * (int64_t)n_aggs + ncols;
         if (needed_max < 1) needed_max = 1;
         ray_t* needed_hdr = NULL;
         int64_t* needed = (int64_t*)scratch_alloc(&needed_hdr,
@@ -10119,8 +10120,16 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
                 }
             }
         }
-        for (uint32_t a = 0; !copy_all && a < n_aggs; a++) {
-            ray_op_ext_t* ae = find_ext(g, ext->agg_ins[a]);
+        /* Both inputs of every agg: agg_ins2 carries the second operand of a
+         * binary agg (wsum/wavg/cov/scov/pearson_corr) — a column referenced
+         * only there must be carried into flat_tbl too. */
+        for (uint32_t s2 = 0; !copy_all && s2 < 2 * n_aggs; s2++) {
+            uint32_t a = s2 >> 1;
+            uint32_t in_id = (s2 & 1)
+                ? (ext->agg_ins2 ? ext->agg_ins2[a] : RAY_OP_NONE)
+                : ext->agg_ins[a];
+            if (in_id == RAY_OP_NONE) continue;
+            ray_op_ext_t* ae = find_ext(g, in_id);
             if (ae && ae->base.opcode == OP_SCAN) {
                 int dup = 0;
                 for (int i = 0; i < n_needed; i++)
@@ -10129,7 +10138,7 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
             } else {
                 /* Expression agg input — carry its source columns; unknown
                  * subtrees copy everything (safe). */
-                int ns = group_expr_src_syms(g, ext->agg_ins[a], c_esrc, (int)esrc_max);
+                int ns = group_expr_src_syms(g, in_id, c_esrc, (int)esrc_max);
                 if (ns < 0) { copy_all = 1; break; }
                 for (int s = 0; s < ns; s++) {
                     int dup = 0;
@@ -15284,11 +15293,12 @@ v2_emit:;
         result = ray_table_new(total_cols);
         if (!result || RAY_IS_ERR(result)) goto cleanup;
 
-        /* Pre-allocate key columns */
-        ray_t* key_cols[n_keys];
-        char* key_dsts[n_keys];
-        int8_t key_out_types[n_keys];
-        uint8_t key_esizes[n_keys];
+        /* Pre-allocate key columns (vla_keys == max(n_keys,1): a keyless
+         * group reaches here too, and a zero-length VLA is UB). */
+        ray_t* key_cols[vla_keys];
+        char* key_dsts[vla_keys];
+        int8_t key_out_types[vla_keys];
+        uint8_t key_esizes[vla_keys];
         for (uint32_t k = 0; k < n_keys; k++) {
             ray_t* src_col = key_vecs[k];
             key_cols[k] = NULL;
@@ -16323,7 +16333,8 @@ static inline int64_t grp_sorted_lower_bound(const int64_t* a, int64_t n,
  * then merges the small partial results via a second exec_group pass.
  *
  * Merge ops: SUM→SUM, COUNT→SUM, MIN→MIN, MAX→MAX, FIRST→FIRST, LAST→LAST.
- * AVG: decomposed into SUM+COUNT per partition, merged, then divided.
+ * AVG: decomposed into SUM+COUNT per partition, merged, then divided
+ *   (COUNT = non-null count of x; an all-null group yields a null AVG).
  * STDDEV/VAR: decomposed into SUM(x)+SUM(x²)+COUNT(x) per partition,
  *   merged with SUM, then final variance/stddev computed from merged totals.
  *
@@ -16498,6 +16509,9 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
 
     /* Decomposition: AVG(x) → SUM(x) + COUNT(x).
      * STDDEV/VAR(x) → SUM(x) + SUM(x²) + COUNT(x).
+     * COUNT(x) here is the NON-NULL count (SUM skips null x, so the divisor
+     * must too): it is computed as SUM over a not-null I64 indicator, never
+     * OP_COUNT, which is the group row count (nulls included).
      * Build per-partition agg_ops with decomposed ops, then merge ops.
      * part_ops/merge_ops/avg_idx/std_idx/std_orig_op/std_sq_slot/std_cnt_slot
      * are carved above; n_avg/n_std are recounted here to fill them. */
@@ -16524,13 +16538,15 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
         std_sq_slot[i] = part_n_aggs;
         part_ops[part_n_aggs++] = OP_SUM;  /* SUM(x²) */
     }
-    /* Append COUNT for each AVG column */
+    /* Append non-null COUNT for each AVG column, then for each STDDEV/VAR
+     * column: SUM of a not-null indicator (see the pagg_ins build below).
+     * These slots are exactly [cnt_slot_lo, part_n_aggs). */
+    uint32_t cnt_slot_lo = part_n_aggs;
     for (uint32_t i = 0; i < n_avg; i++)
-        part_ops[part_n_aggs++] = OP_COUNT;
-    /* Append COUNT for each STDDEV/VAR column */
+        part_ops[part_n_aggs++] = OP_SUM;
     for (uint32_t i = 0; i < n_std; i++) {
         std_cnt_slot[i] = part_n_aggs;
-        part_ops[part_n_aggs++] = OP_COUNT;
+        part_ops[part_n_aggs++] = OP_SUM;
     }
 
     /* Merge ops: SUM→SUM, COUNT→SUM, MIN→MIN, MAX→MAX,
@@ -16713,6 +16729,10 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                 ray_op_t* xf = (x->out_type == RAY_F64) ? x : ray_cast(pg, x, RAY_F64);
                 pagg_ins[sq] = ray_mul(pg, xf, xf);
             }
+            /* Non-null COUNT(x) slots: SUM(not(isnull x)) as I64. */
+            for (uint32_t a = cnt_slot_lo; a < part_n_aggs; a++)
+                pagg_ins[a] = ray_cast(pg, ray_not(pg, ray_isnull(pg, pagg_ins[a])),
+                                       RAY_I64);
 
             ray_op_t* proot = ray_group(pg, pkeys, n_part_keys,
                                        part_ops, pagg_ins, part_n_aggs);
@@ -17061,12 +17081,12 @@ batch_fail:
                     const double* sv = (const double*)ray_data(sum_col);
                     const int64_t* cv = (const int64_t*)ray_data(cnt_col);
                     for (int64_t r = 0; r < nrows; r++)
-                        out[r] = cv[r] > 0 ? ray_f64_fin(sv[r] / (double)cv[r]) : 0.0;
+                        out[r] = cv[r] > 0 ? ray_f64_fin(sv[r] / (double)cv[r]) : NULL_F64;
                 } else {
                     const int64_t* sv = (const int64_t*)ray_data(sum_col);
                     const int64_t* cv = (const int64_t*)ray_data(cnt_col);
                     for (int64_t r = 0; r < nrows; r++)
-                        out[r] = cv[r] > 0 ? ray_f64_fin((double)sv[r] / (double)cv[r]) : 0.0;
+                        out[r] = cv[r] > 0 ? ray_f64_fin((double)sv[r] / (double)cv[r]) : NULL_F64;
                 }
                 /* Single-null float model: flip HAS_NULLS for any avg
                  * canonicalized to NULL_F64 (overflow). */
