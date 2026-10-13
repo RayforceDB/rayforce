@@ -138,5 +138,61 @@
 (at RPd2 'cv)  -- (at RFd2 'cv)
 (at RPd2 'mxv) -- (at RFd2 'mxv)
 
-;; ─── cleanup ─────────────────────────────────────────────────────────────────
-(.sys.exec "rm -rf /tmp/rfl_pgwh")
+;; ══════════════════════════════════════════════════════════════════════════
+;; (e) STR KEYS AND STR PARTIALS (#737) — a selective where caps est_groups by
+;;     the survivors, so a STR key (plain or computed) streams too.  The merge
+;;     concatenated the partials' STR cells raw, leaving the merged key column
+;;     with no string pool: the merge group read the long strings through a
+;;     NULL pointer.  10 partitions span two merge batches (the running
+;;     result is merged again); strings are empty, inline and pooled.
+;; ══════════════════════════════════════════════════════════════════════════
+(set NS 2000)
+(set RS (take ["short" "a_rather_long_reason_text_value" "" "x" "another_long_reason_string_here" "mid_size_str" "yy"] NS))
+(set ES (% (til NS) 3))
+(set SS (take ["https_example_com_some_long_page_1" "https_example_com_other_long_page_2" "q"] NS))
+(set VS (til NS))
+(set PS (table [r e s v] (list RS ES SS VS)))
+(.sys.exec "rm -rf /tmp/rfl_pgwh_str")
+(.db.splayed.set "/tmp/rfl_pgwh_str/01/t/" PS)
+(.db.splayed.set "/tmp/rfl_pgwh_str/02/t/" PS)
+(.db.splayed.set "/tmp/rfl_pgwh_str/03/t/" PS)
+(.db.splayed.set "/tmp/rfl_pgwh_str/04/t/" PS)
+(.db.splayed.set "/tmp/rfl_pgwh_str/05/t/" PS)
+(.db.splayed.set "/tmp/rfl_pgwh_str/06/t/" PS)
+(.db.splayed.set "/tmp/rfl_pgwh_str/07/t/" PS)
+(.db.splayed.set "/tmp/rfl_pgwh_str/08/t/" PS)
+(.db.splayed.set "/tmp/rfl_pgwh_str/09/t/" PS)
+(.db.splayed.set "/tmp/rfl_pgwh_str/10/t/" PS)
+(set Ps (.db.parted.get "/tmp/rfl_pgwh_str/" 't))
+(set TFs (table [r e s v] (list (raze (take (list RS) 10)) (raze (take (list ES) 10)) (raze (take (list SS) 10)) (raze (take (list VS) 10)))))
+(count TFs) -- 20000
+
+;; (e1) bare STR key — the reported shape (count, desc, take)
+(set Be1 (at (.sys.mem) 'group-perpart-runs))
+(set RPe1 (select {from: Ps where: (== (% v 200) 7) by: r n: (count r) desc: n take: 12}))
+(> (at (.sys.mem) 'group-perpart-runs) Be1) -- true
+(set RPe1 (select {from: Ps where: (== (% v 200) 7) by: r n: (count r) asc: r}))
+(set RFe1 (select {from: TFs where: (== (% v 200) 7) by: r n: (count r) asc: r}))
+(at RPe1 'r) -- ["" "a_rather_long_reason_text_value" "another_long_reason_string_here" "mid_size_str" "short" "x" "yy"]
+(at RPe1 'r) -- (at RFe1 'r)
+(at RPe1 'n) -- (at RFe1 'n)
+
+;; (e2) computed STR key beside an int key, STR min/max/first partials
+(set Be2 (at (.sys.mem) 'group-perpart-runs))
+(set RPe2 (select {from: Ps where: (== (% v 200) 7) by: {e: e k: (if (== e 0) s "")} n: (count v) mn: (min r) mx: (max r) fr: (first r) asc: e}))
+(> (at (.sys.mem) 'group-perpart-runs) Be2) -- true
+(set RFe2 (select {from: TFs where: (== (% v 200) 7) by: {e: e k: (if (== e 0) s "")} n: (count v) mn: (min r) mx: (max r) fr: (first r) asc: e}))
+(at RPe2 'k)  -- ["https_example_com_some_long_page_1" "" ""]
+(at RPe2 'k)  -- (at RFe2 'k)
+(at RPe2 'n)  -- (at RFe2 'n)
+(at RPe2 'mn) -- (at RFe2 'mn)
+(at RPe2 'mx) -- (at RFe2 'mx)
+(at RPe2 'fr) -- (at RFe2 'fr)
+;; (e3) no where: a computed STR key with few values streams on its own
+(set Be3 (at (.sys.mem) 'group-perpart-runs))
+(set RPe3 (select {from: Ps by: {k: (if (== e 0) s "")} n: (count v) asc: k}))
+(> (at (.sys.mem) 'group-perpart-runs) Be3) -- true
+(at RPe3 'k) -- ["" "https_example_com_some_long_page_1"]
+(at RPe3 'n) -- [13330 6670]
+
+;; ══════════════════════════════════════════════════════════════════════════
