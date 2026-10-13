@@ -386,32 +386,12 @@ bool ray_enc_runs(const ray_enc_vview_t* v, void* ctx, ray_enc_run_fn fn) {
     return true;
 }
 
-#define VR_LOOP(ARR, N) do { for (int q_ = 0; q_ < (N); q_++) { if ((ARR)[q_] < lo_) lo_ = (ARR)[q_]; if ((ARR)[q_] > hi_) hi_ = (ARR)[q_]; } } while (0)
-void ray_enc_view_range(const ray_enc_vview_t* v, const ray_enc_lanes_t* u, int64_t* mn, int64_t* mx) {
-    if (v->enc == RAY_ENC_CONST || v->enc == RAY_ENC_RLE) {
-        int64_t a = INT64_MAX, b = INT64_MIN;
-        for (uint32_t q = 0; q < v->n_runs; q++) {
-            const int64_t x = logical_of(lane(&v->run_vals, v->k.T, q), v->k);
-            if (x < a) a = x;
-            if (x > b) b = x;
-        }
-        *mn = a; *mx = b;
-    } else if (v->enc == RAY_ENC_FOR_BP) {
-        /* no wrap (the view's guarantee): base + the extreme residuals are
-         * the extreme values */
-        uint64_t lo_ = UINT64_MAX, hi_ = 0;
-        switch (v->k.T) {
-        case 8:  VR_LOOP(u->b, v->n); break;
-        case 16: VR_LOOP(u->h, v->n); break;
-        case 32: VR_LOOP(u->s, v->n); break;
-        default: VR_LOOP(u->q, v->n); break;
-        }
-        const uint64_t lb = (uint64_t)ray_enc_logical(v->base, v->k);
-        *mn = (int64_t)(lb + lo_); *mx = (int64_t)(lb + hi_);
-    } else {                                                  /* DICT: entries ascending in native order */
-        uint32_t lo_ = UINT32_MAX, hi_ = 0;
-        VR_LOOP(v->codes, v->n);
-        *mn = logical_of(v->dict[lo_], v->k); *mx = logical_of(v->dict[hi_], v->k);
+void ray_enc_view_range(const ray_enc_vview_t* v, int64_t* mn, int64_t* mx) {
+    int64_t a = INT64_MAX, b = INT64_MIN;
+    for (uint32_t q = 0; q < v->n_runs; q++) {
+        const int64_t x = logical_of(lane(&v->run_vals, v->k.T, q), v->k);
+        if (x < a) a = x;
+        if (x > b) b = x;
     }
+    *mn = a; *mx = b;
 }
-#undef VR_LOOP

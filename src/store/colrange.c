@@ -877,7 +877,7 @@ int ray_col_src_runview(ray_col_src_t* s, int64_t row, ray_enc_vview_t* out, int
          * values: their [min, max] inside the chunk's directory statistics
          * (a vector that passed is recorded, as a range read records it) */
         int64_t mn, mx;
-        ray_enc_view_range(out, NULL, &mn, &mx);
+        ray_enc_view_range(out, &mn, &mx);
         if ((*err = ray_enccol_check_dir_range(e, c, j, mn, mx)) != NULL) return -1;
     }
     return 1;

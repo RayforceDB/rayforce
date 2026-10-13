@@ -2820,30 +2820,29 @@ bool ray_enccol_dir_vec_ok(const ray_enccol_t* e, int64_t c, int j) {
     return e->dir_vec_ok && ((atomic_load_explicit(&e->dir_vec_ok[c], memory_order_acquire) >> j) & 1);
 }
 
-ray_t* ray_enccol_check_dir(ray_enccol_t* e, int64_t c, int j, const void* data, int vlen, bool may_null) {
-    /* a vector that passed once passes again (the mapping is immutable,
-     * the decode deterministic); a failure is never recorded */
-    const uint64_t bit = UINT64_C(1) << j;
-    if (e->dir_vec_ok && (atomic_load_explicit(&e->dir_vec_ok[c], memory_order_acquire) & bit)) return NULL;
-    ray_enc_dirent_t de; dirent_at(e, c, &de);
-    if ((de.flags & RAY_ENC_STAT_ABSENT) ||                /* no statistics: nothing sized from them */
-        dir_range_ok(e->type, data, vlen, may_null && !(e->type == RAY_BOOL || e->type == RAY_U8), de.min, de.max)) {
-        if (e->dir_vec_ok) atomic_fetch_or_explicit(&e->dir_vec_ok[c], bit, memory_order_release);
+/* The guard's verdict on vector j of chunk c: a pass (or a chunk without
+ * statistics) is recorded, a failure is `corrupt` and never recorded. */
+static ray_t* check_dir_tail(ray_enccol_t* e, int64_t c, int j, bool ok) {
+    if (ok) {
+        if (e->dir_vec_ok) atomic_fetch_or_explicit(&e->dir_vec_ok[c], UINT64_C(1) << j, memory_order_release);
         return NULL;
     }
     return ray_error("corrupt", "column %s: chunk %lld vector %d value outside the chunk's statistics",
                      e->path, (long long)c, j);
 }
 
-ray_t* ray_enccol_check_dir_range(ray_enccol_t* e, int64_t c, int j, int64_t mn, int64_t mx) {
-    const uint64_t bit = UINT64_C(1) << j;
+ray_t* ray_enccol_check_dir(ray_enccol_t* e, int64_t c, int j, const void* data, int vlen, bool may_null) {
+    /* a vector that passed once passes again (the mapping is immutable,
+     * the decode deterministic); a failure is never recorded */
+    if (ray_enccol_dir_vec_ok(e, c, j)) return NULL;
     ray_enc_dirent_t de; dirent_at(e, c, &de);
-    if ((de.flags & RAY_ENC_STAT_ABSENT) || (mn >= de.min && mx <= de.max)) {
-        if (e->dir_vec_ok) atomic_fetch_or_explicit(&e->dir_vec_ok[c], bit, memory_order_release);
-        return NULL;
-    }
-    return ray_error("corrupt", "column %s: chunk %lld vector %d value outside the chunk's statistics",
-                     e->path, (long long)c, j);
+    return check_dir_tail(e, c, j, (de.flags & RAY_ENC_STAT_ABSENT) ||   /* no statistics: nothing sized from them */
+        dir_range_ok(e->type, data, vlen, may_null && !(e->type == RAY_BOOL || e->type == RAY_U8), de.min, de.max));
+}
+
+ray_t* ray_enccol_check_dir_range(ray_enccol_t* e, int64_t c, int j, int64_t mn, int64_t mx) {
+    ray_enc_dirent_t de; dirent_at(e, c, &de);
+    return check_dir_tail(e, c, j, (de.flags & RAY_ENC_STAT_ABSENT) || (mn >= de.min && mx <= de.max));
 }
 
 ray_t* ray_enccol_check_dir_all(ray_t* encv) {

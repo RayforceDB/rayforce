@@ -3596,6 +3596,17 @@ static test_result_t test_group_count_on_runs(void) {
     if (!g_aw_unaligned) TEST_ASSERT_FMT(aw_col_decoded("a") == 0, "gm 2: a decoded %llu", (unsigned long long)aw_col_decoded("a"));
     /* not COUNT only: the per-row path, same answers */
     if ((r = aw_reduce("gm", "(select {c: (count a) s: (sum k) from: T where: (!= a 0) by: a})", -1)).status != TEST_PASS) return r;
+    /* a nullable key in runs: a vector with nulls carries a bitmap, so its
+     * run view declines (counting it by runs would put the null rows under
+     * the run's stored value: 5 groups instead of 6) */
+    aw_save("gn", "(table [a] (list (as 'I16 (map (fn [j] (if (== 500 (% j 4096)) 0Nh (+ 1 (% (div j 1024) 5)))) (til 300000)))))", -1);
+    if ((r = aw_reduce("gn", "(select {c: (count a) from: T by: a})", -1)).status != TEST_PASS) return r;
+    {
+        aw_eval_ok("(set R (select {c: (count a) from: T by: a}))");
+        ray_t* n = ray_eval_str("(count R)");
+        TEST_ASSERT_TRUE(n && !RAY_IS_ERR(n) && n->i64 == 6);
+        ray_release(n);
+    }
     /* packed keys (every vector FOR_BP, or DICT): no run view, so each
      * vector is decoded and counted per row, as before (D6); the same
      * answers, nothing materialized */

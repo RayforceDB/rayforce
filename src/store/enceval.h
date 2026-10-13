@@ -85,10 +85,8 @@ bool ray_enc_count_cmp(const ray_enc_vview_t* v, uint16_t op, int64_t c, int64_t
 typedef void (*ray_enc_run_fn)(void* ctx, int64_t value, int32_t lo, int32_t hi);
 bool ray_enc_runs(const ray_enc_vview_t* v, void* ctx, ray_enc_run_fn fn);
 
-/* The [min, max] of the logical values of a CONST, RLE, FOR_BP or DICT
- * view, nulls not excluded (a caller declines a view with a bitmap): one
- * pass over the runs, residuals or codes (FOR_BP: its residuals unpacked
- * in u by ray_enccol_unpack_resid; u unused otherwise). */
-void ray_enc_view_range(const ray_enc_vview_t* v, const ray_enc_lanes_t* u, int64_t* mn, int64_t* mx);
+/* The [min, max] of the run values of a CONST / RLE view (nulls not
+ * excluded: a caller declines a view with a bitmap). */
+void ray_enc_view_range(const ray_enc_vview_t* v, int64_t* mn, int64_t* mx);
 
 #endif /* RAY_ENCEVAL_H */
