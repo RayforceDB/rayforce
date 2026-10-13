@@ -4567,6 +4567,113 @@ static test_result_t test_group_affine_nulls(void) {
     PASS();
 }
 
+/* Group-by on a generation-2 STR key through a query-wide string domain
+ * (strdom.c): the key column t is never materialized and the groups equal
+ * generation 0's. */
+static void aw_str_key_tables(const char* tag, int n_part, int n_flat) {
+    /* STR key mixing CONST vectors (one repeated string) and RAW vectors,
+     * equal strings crossing every vector boundary; two partitions */
+    for (int gen = 0; gen <= 2; gen += 2)
+        for (int p = 0; p < 2; p++) {
+            char q[800];
+            snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/%sk%d/2024.01.0%d/t/\" "
+                     "(table [t v] (list (map (fn [j] (if (< (%% j 2048) 1024) \"constant run text\" "
+                     "(format \"long key %%\" (%% j 37)))) (til %d)) (til %d))) {compress: %s})",
+                     tag, gen, p + 1, n_part, n_part, gen ? "true" : "false");
+            aw_eval_ok(q);
+        }
+    /* the unparted case: one column mixing CONST and RAW vectors */
+    for (int gen = 0; gen <= 2; gen += 2) {
+        char q[800];
+        snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/%su%d/\" "
+                 "(table [t v] (list (map (fn [j] (if (< (%% j 2048) 1024) \"constant run text\" "
+                 "(format \"long key %%\" (%% j 37)))) (til %d)) (til %d))) {compress: %s})",
+                 tag, gen, n_flat, n_flat, gen ? "true" : "false");
+        aw_eval_ok(q);
+    }
+    /* nulls: "" is the STR null (its canonical empty payload): the null and
+     * "" rows are one group in either generation, beside short (inline) and
+     * long (pooled) keys */
+    for (int gen = 0; gen <= 2; gen += 2) {
+        char q[800];
+        snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/%sn%d/\" "
+                 "(table [t v] (list (map (fn [j] (if (== (%% j 7) 3) \"\" (if (== (%% j 7) 1) "
+                 "(format \"a long pooled key %%\" (%% j 3)) (format \"k%%\" (%% j 5))))) (til %d)) (til %d))) "
+                 "{compress: %s})",
+                 tag, gen, n_flat, n_flat, gen ? "true" : "false");
+        aw_eval_ok(q);
+    }
+}
+
+/* Each query on table T, loaded as <tag><kind><gen>, on both generations:
+ * equal formatted results, and generation 2 leaves t unmaterialized (its
+ * vectors CONST and RAW).  Strict queries materialize nothing at all; the
+ * others may materialize v: below RAY_PARALLEL_THRESHOLD rows the serial
+ * whole-column strategy (R-RANDOM) reads the aggregates' column whole
+ * whatever the key, and a composite key's expression is evaluated over
+ * its materialized column (bind_referenced_columns). */
+typedef struct { char kind; bool strict; const char* q; } aw_sk_q_t;
+static test_result_t aw_str_key_check(const char* tag, const aw_sk_q_t* qs, bool strict_ok) {
+    int64_t tsym = ray_sym_intern("t", 1);
+    for (int i = 0; qs[i].q; i++) {
+        ray_t* out[2];
+        for (int gen = 0; gen <= 2; gen += 2) {
+            char b[512];
+            if (qs[i].kind == 'k')
+                snprintf(b, sizeof b, "(set T (.db.parted.get \"" AW_TMP "/%sk%d\" 't))", tag, gen);
+            else
+                snprintf(b, sizeof b, "(set T (.db.splayed.get \"" AW_TMP "/%s%c%d/\"))", tag, qs[i].kind, gen);
+            aw_eval_ok(b);
+            ray_enc_counters_reset();
+            out[gen / 2] = ray_eval_str(qs[i].q);
+            TEST_ASSERT_FMT(out[gen / 2] && !RAY_IS_ERR(out[gen / 2]), "%s%c%d %s: %s", tag, qs[i].kind, gen,
+                            qs[i].q, ray_error_msg());
+        }
+        ray_enc_counters_t k; ray_enc_counters_get(&k);
+        ray_t* t = ray_eval_str("T");
+        ray_t* encv = ray_table_get_col_enc(t, tsym);
+        ray_enccol_info_t info;
+        TEST_ASSERT_TRUE(encv && !ray_enccol_info(encv, &info));
+        ray_release(t);
+        TEST_ASSERT_FMT(!info.materialized, "%s%c %s: t materialized", tag, qs[i].kind, qs[i].q);
+        TEST_ASSERT_TRUE(qs[i].kind == 'n' || (info.vectors[RAY_ENC_CONST] > 0 && info.vectors[RAY_ENC_RAW] > 0));
+        if (strict_ok && qs[i].strict)
+            TEST_ASSERT_FMT(k.materialized == 0, "%s%c %s: %llu materializations", tag, qs[i].kind, qs[i].q,
+                            (unsigned long long)k.materialized);
+        ray_t* fx = ray_fmt(out[0], 0); ray_t* fy = ray_fmt(out[1], 0);
+        TEST_ASSERT_FMT(ray_str_len(fx) == ray_str_len(fy) && memcmp(ray_str_ptr(fx), ray_str_ptr(fy), ray_str_len(fx)) == 0,
+                        "%s%c %s differs", tag, qs[i].kind, qs[i].q);
+        ray_release(fx); ray_release(fy); ray_release(out[0]); ray_release(out[1]);
+    }
+    aw_eval_ok("(set T 0)");
+    PASS();
+}
+
+static test_result_t test_str_key_domain(void) {
+    /* "s": the brief's sizes (the serial strategy); "l": above the parallel
+     * threshold, every partition too */
+    aw_str_key_tables("s", 5000, 10000);
+    aw_str_key_tables("l", 70000, 140000);
+    /* group order is the route's; asc: makes the comparison order-insensitive */
+    static const aw_sk_q_t qs[] = {
+        { 'k', true,  "(select {c: (count v) s: (sum v) from: T by: t asc: t})" },
+        { 'k', false, "(select {c: (count v) from: T by: {t: t m: (% v 3)} asc: [t m]})" },   /* composite */
+        { 'u', true,  "(select {c: (count v) s: (sum v) from: T by: t asc: t})" },
+        { 'u', false, "(select {c: (count v) from: T by: {t: t m: (% v 3)} asc: [t m]})" },
+        { 'n', true,  "(select {c: (count v) s: (sum v) from: T by: t asc: t})" },
+        { 'n', false, "(select {c: (count v) from: T by: {t: t m: (% v 3)} asc: [t m]})" },
+        /* no asc: the ids are in first-occurrence order, so a route
+         * emitting groups by first occurrence (or by id) emits generation
+         * 0's order */
+        { 'n', true,  "(select {c: (count v) s: (sum v) from: T by: t})" },
+        { 'u', true,  "(select {c: (count v) s: (sum v) from: T by: t})" },
+        { 0, false, NULL },
+    };
+    test_result_t r = aw_str_key_check("s", qs, false);
+    if (r.status != TEST_PASS) return r;
+    return aw_str_key_check("l", qs, true);
+}
+
 /* ray_pool_dispatch clamped to a ring whose growth fails (#792; shrunk to a
  * few slots so the clamp runs at test sizes): fused where: filters
  * (pred_sel_drive and the expression selection, whose rowsel builders are
@@ -4712,5 +4819,6 @@ const test_entry_t aware_entries[] = {
     { "aware/group_topn_nulls",    test_group_topn_nulls,    aw_setup, aw_teardown },
     { "aware/group_topn_affine",   test_group_topn_affine,   aw_setup, aw_teardown },
     { "aware/group_affine_nulls",  test_group_affine_nulls,  aw_setup, aw_teardown },
+    { "aware/str_key_domain",      test_str_key_domain,      aw_setup, aw_teardown },
     { NULL, NULL, NULL, NULL },
 };

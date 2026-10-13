@@ -3583,16 +3583,17 @@ static test_result_t test_radix_route_shapes(void) {
         test_result_t r = sr_same(qs[i].q, qs[i].mat);
         if (r.status != TEST_PASS) { ray_group_test_route(0); return r; }
     }
-    /* a wide (STR) key: every key of the group-by materializes, the inputs
-     * are read by range */
+    /* a STR key: grouped on its query-wide string-domain ids (strdom.c), so
+     * no key materializes and the inputs are read by range; only the
+     * holistic input (med) materializes */
     sr_eval_ok("(set Z (table [t g v f] (list (as 'STR (% i 50)) (as 'I16 (% i 7)) "
                "(as 'I32 (map (fn [j] (if (== 0 (% j 10)) 0N j)) i)) (as 'F64 i))))");
     sr_eval_ok("(.db.splayed.set \"" SR_TMP "/z0/\" Z {compress: false})");
     sr_eval_ok("(.db.splayed.set \"" SR_TMP "/z2/\" Z {compress: true})");
     static const struct { const char* q; uint64_t mat; } qz[] = {
-        { "(select {s: (sum v) c: (count g) a: (avg f) from: T by: t})", 1 },
-        { "(select {s: (sum v) m: (max f) from: T where: (> g 1) by: {t: t g: g}})", 2 },
-        { "(select {m: (med f) s: (sum v) from: T by: t})", 2 },
+        { "(select {s: (sum v) c: (count g) a: (avg f) from: T by: t})", 0 },
+        { "(select {s: (sum v) m: (max f) from: T where: (> g 1) by: {t: t g: g}})", 0 },
+        { "(select {m: (med f) s: (sum v) from: T by: t})", 1 },
     };
     for (size_t i = 0; i < sizeof qz / sizeof qz[0]; i++) {
         test_result_t r = sr_same_on("(.db.splayed.get \"" SR_TMP "/z0/\")", "(.db.splayed.get \"" SR_TMP "/z2/\")",
@@ -3767,8 +3768,8 @@ static test_result_t test_radix_route_serial(void) {
         { "(select {c: (count k) s: (sum v) from: T where: (> k 100) by: v})", 0 },
         { "(select {m: (med v) s: (sum f) from: T by: s})", 1 },
         { "(select {m: (med f) from: T where: (> g 2) by: {g: g s: s}})", 1 },
-        { "(select {s: (sum v) c: (count k) from: T by: t})", 1 },
-        { "(select {m: (med v) a: (avg f) from: T by: {t: t g: g}})", 3 },
+        { "(select {s: (sum v) c: (count k) from: T by: t})", 0 },       /* STR key: string-domain ids */
+        { "(select {m: (med v) a: (avg f) from: T by: {t: t g: g}})", 1 },
     };
     ray_group_test_route(2);
     for (size_t i = 0; i < sizeof qs / sizeof qs[0]; i++) {

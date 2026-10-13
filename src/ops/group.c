@@ -32,6 +32,7 @@
 #include "ops/agg_engine.h" /* v2 agg engine routing gate (ray_agg_engine_v2) */
 #include "vec/str.h"        /* ray_str_t SSO hash/eq for wide STR group keys */
 #include "ops/idxop.h"      /* RAY_IDX_DICT: group on persisted string codes */
+#include "ops/strdom.h"     /* query-wide string domain: generation-2 STR keys */
 #include "store/enccol.h"    /* encoded-slot segments, decoded peek */
 #include "store/enceval.h"   /* ray_enc_vec_sum: a selected vector's sum from its encoding */
 #include "store/encw.h"      /* ray_encw_type_summable: the types whose directory has sums */
@@ -12093,9 +12094,106 @@ static int64_t ray_grp_card_lookup(int64_t sym) {
     return 0;
 }
 
+/* A generation-2 STR key (its source a RAY_ENCCOL: single file, or a parted
+ * column with an encoded segment) groups on query-wide string-domain ids
+ * (strdom.c) read by range, never materializing the column: the key's
+ * column is swapped for the ids, as a DICT key's for its codes, and the
+ * groups' ids map back to strings.  A generation-0 STR key keeps its route.
+ * The swap is safe only when nothing but the key itself reads the column:
+ * no aggregate input (COUNT included: the ids have no nulls) and no other
+ * key's expression may scan it. */
+static bool strdom_key_ok(ray_graph_t* g, const ray_op_ext_t* ext, int64_t sym) {
+    int64_t syms[64];
+    for (uint32_t k = 0; k < ext->n_keys; k++) {
+        ray_op_ext_t* ke = find_ext(g, ext->keys[k]);
+        if (ke && ke->base.opcode == OP_SCAN) continue;      /* a scan key: swapped alike */
+        int n = group_expr_src_syms(g, ext->keys[k], syms, 64);
+        if (n < 0) return false;
+        for (int i = 0; i < n; i++) if (syms[i] == sym) return false;
+    }
+    for (uint32_t a = 0; a < ext->n_aggs; a++)
+        for (int w = 0; w < 2; w++) {
+            uint32_t in = w ? (ext->agg_ins2 ? ext->agg_ins2[a] : RAY_OP_NONE) : ext->agg_ins[a];
+            if (in == RAY_OP_NONE) continue;
+            int n = group_expr_src_syms(g, in, syms, 64);
+            if (n < 0) return false;
+            for (int i = 0; i < n; i++) if (syms[i] == sym) return false;
+        }
+    return true;
+}
+
+/* The id column of STR key `sym` of tbl over a new domain *dom: an I64
+ * vector, or for a parted column a parted wrapper of I64 segments, one per
+ * source segment (a missing segment stays missing).  NULL with *dom and
+ * *out owned, or an owned error. */
+static ray_t* strdom_key_col(ray_t* tbl, int64_t sym, ray_strdom_t** dom, ray_t** out) {
+    *dom = NULL; *out = NULL;
+    ray_col_src_t src;
+    ray_t* err = ray_table_col_src(tbl, sym, &src);
+    if (err) return err;
+    if (!src.obj) return ray_error("domain", "group: key column not found");
+    ray_t* ids = NULL;
+    err = ray_strdom_build(&src, dom, &ids);
+    if (!err && src.parted) {
+        int64_t ns = 0; ray_t** segs = NULL; const int64_t* off = NULL;
+        if (!ray_col_src_parted_segs(&src, &ns, &segs, &off, &err))
+            err = err ? err : ray_error("type", "group: STR key not parted");
+        ray_t* w = err ? NULL : ray_alloc((size_t)(ns > 0 ? ns : 1) * sizeof(ray_t*));
+        if (!err && (!w || RAY_IS_ERR(w))) err = w ? w : ray_error("oom", NULL);
+        if (!err) {
+            w->type = RAY_PARTED_BASE + RAY_I64;
+            w->len = 0;
+            w->attrs = 0;
+            memset(w->aux, 0, 16);
+            ray_t** dst = (ray_t**)ray_data(w);
+            memset(dst, 0, (size_t)(ns > 0 ? ns : 1) * sizeof(ray_t*));
+            for (int64_t i = 0; i < ns && !err; i++) {
+                if (segs[i]) {
+                    int64_t n = off[i + 1] - off[i];
+                    ray_t* v = ray_vec_new(RAY_I64, n > 0 ? n : 1);
+                    if (!v || RAY_IS_ERR(v)) { err = v ? v : ray_error("oom", NULL); break; }
+                    v->len = n;
+                    if (n > 0) memcpy(ray_data(v), (const int64_t*)ray_data(ids) + off[i], (size_t)n * sizeof(int64_t));
+                    dst[i] = v;
+                }
+                w->len = i + 1;
+            }
+            if (err) ray_release(w);
+            else { ray_release(ids); ids = w; }
+        }
+    }
+    ray_col_src_release(&src);
+    if (err) {
+        if (ids) ray_release(ids);
+        ray_strdom_free(*dom); *dom = NULL;
+        return err;
+    }
+    *out = ids;
+    return NULL;
+}
+
+/* A group result's key column of domain ids as the domain's strings. */
+static ray_t* strdom_key_emit(const ray_strdom_t* dom, ray_t* ids_col, ray_t** out) {
+    *out = NULL;
+    int64_t n = ids_col->len;
+    if (ids_col->type == RAY_I64) return ray_strdom_emit(dom, (const int64_t*)ray_data(ids_col), n, out);
+    if (ids_col->type != RAY_I32 && ids_col->type != RAY_I16 && ids_col->type != RAY_U8)
+        return ray_error("type", "group: string-domain key emitted as %s", ray_type_name(ids_col->type));
+    int64_t* w = (int64_t*)ray_alloc_raw((size_t)(n > 0 ? n : 1) * sizeof(int64_t));
+    if (!w) return ray_error("oom", NULL);
+    const void* d = ray_data(ids_col);
+    for (int64_t i = 0; i < n; i++)
+        w[i] = ids_col->type == RAY_I32 ? ((const int32_t*)d)[i]
+             : ids_col->type == RAY_I16 ? ((const int16_t*)d)[i] : ((const uint8_t*)d)[i];
+    ray_t* err = ray_strdom_emit(dom, w, n, out);
+    ray_free_raw(w);
+    return err;
+}
+
 /* exec_group wrapper: when a plain STR scan key carries a RAY_IDX_DICT, group on
  * its int32 codes (cheap integer path) instead of the 16-byte descriptors, then
- * map codes -> strings on the small result.  Falls through otherwise. */
+ * map codes -> strings on the small result; a generation-2 STR scan key groups
+ * on its string-domain ids likewise (strdom_key_col).  Falls through otherwise. */
 ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit) {
     ray_dict_cd_clear();
     /* Save the outer group-key cardinality hint and publish a fresh empty one
@@ -12120,6 +12218,9 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit)
     ray_t*  wrap_hdr = NULL;
     ray_t** key_col = NULL;     /* source STR column per dict'd key (for output) */
     int64_t* dict_sym = NULL;
+    ray_strdom_t** sdom = NULL; /* string domain per generation-2 STR key (owned) */
+    ray_t** sd_col = NULL;      /* its id column (owned) */
+    uint32_t sd_n = 0;          /* entries of sdom / sd_col */
     if (!tbl || RAY_IS_ERR(tbl) || tbl->type != RAY_TABLE) {
         result = exec_group_run(g, op, tbl, group_limit); goto grp_done;
     }
@@ -12130,10 +12231,13 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit)
 
     uint32_t nk = ext->n_keys;
     key_col = (ray_t**)scratch_alloc(&wrap_hdr,
-        (size_t)nk * (sizeof(ray_t*) + sizeof(int64_t)));
+        (size_t)nk * (3 * sizeof(ray_t*) + sizeof(int64_t)));
     if (!key_col) { result = exec_group_run(g, op, tbl, group_limit); goto grp_done; }
-    dict_sym = (int64_t*)(key_col + nk);
-    for (uint32_t k = 0; k < nk; k++) key_col[k] = NULL;
+    sd_col = key_col + nk;
+    sdom = (ray_strdom_t**)(sd_col + nk);
+    dict_sym = (int64_t*)(sdom + nk);
+    for (uint32_t k = 0; k < nk; k++) { key_col[k] = NULL; sd_col[k] = NULL; sdom[k] = NULL; }
+    sd_n = nk;
     bool any = false;
     for (uint32_t k = 0; k < nk; k++) {
         ray_op_t* key_op = op_node(g, ext->keys[k]);
@@ -12141,7 +12245,21 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit)
         if (!ke || ke->base.opcode != OP_SCAN) continue;
         int64_t sym = ke->sym;
         ray_col_meta_t km;
-        if (!ray_table_col_meta(tbl, sym, &km) || km.type != RAY_STR ||
+        if (!ray_table_col_meta(tbl, sym, &km)) continue;
+        /* a generation-2 STR key: query-wide domain ids (never under a
+         * slice-group hint, whose slices index the column itself) */
+        if (km.enc && !g->sg_col &&
+            (RAY_IS_PARTED(km.type) ? RAY_PARTED_BASETYPE(km.type) : km.type) == RAY_STR) {
+            bool dup = false;
+            for (uint32_t j = 0; j < k; j++) if (sd_col[j] && dict_sym[j] == sym) dup = true;
+            if (dup || !strdom_key_ok(g, ext, sym)) continue;
+            ray_t* serr = strdom_key_col(tbl, sym, &sdom[k], &sd_col[k]);
+            if (serr) { result = serr; goto grp_done; }
+            dict_sym[k] = sym;
+            any = true;
+            continue;
+        }
+        if (km.type != RAY_STR ||
             km.index_kind != RAY_IDX_DICT) continue;
         ray_t* dix_blk;
         ray_t* ierr = ray_table_col_index(tbl, sym, &dix_blk);
@@ -12172,7 +12290,11 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit)
         int64_t name = ray_table_col_name(tbl, c);
         ray_t* use = ray_table_slot_idx(tbl, c);     /* pass encoded slots on undecoded */
         for (uint32_t k = 0; k < nk; k++)
-            if (key_col[k] && dict_sym[k] == name) {
+            if (sd_col[k] && dict_sym[k] == name) {
+                use = sd_col[k];
+                ray_grp_card_add(name, ray_strdom_count(sdom[k]));
+                break;
+            } else if (key_col[k] && dict_sym[k] == name) {
                 const ray_index_t* dix = ray_index_payload(key_col[k]->index);
                 use = dix->u.dict.codes;
                 /* Record the dict's distinct-count so exec_group_v2's DA
@@ -12189,6 +12311,28 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit)
 
     if (result && !RAY_IS_ERR(result) && result->type == RAY_TABLE) {
         for (uint32_t k = 0; k < nk; k++) {
+            /* the string-domain keys: every scan key of a swapped column
+             * (a key repeated holds the same ids) */
+            int64_t sd = -1;
+            if (!key_col[k]) {
+                ray_op_ext_t* ke = find_ext(g, ext->keys[k]);
+                for (uint32_t j = 0; ke && ke->base.opcode == OP_SCAN && j < nk; j++)
+                    if (sd_col[j] && dict_sym[j] == ke->sym) { sd = j; break; }
+            }
+            if (sd >= 0) {
+                ray_t* ids_col = ray_table_col_idx(result, k);
+                if (!ids_col || RAY_IS_ERR(ids_col)) {
+                    ray_release(result);
+                    result = ids_col ? ids_col : ray_error("domain", "group: key column missing");
+                    break;
+                }
+                ray_t* str_col = NULL;
+                ray_t* eerr = strdom_key_emit(sdom[sd], ids_col, &str_col);
+                if (eerr) { ray_release(result); result = eerr; break; }
+                ray_table_set_col_idx(result, k, str_col);
+                ray_release(str_col);
+                continue;
+            }
             if (!key_col[k]) continue;
             ray_t* codes_col = ray_table_col_idx(result, k);
             if (codes_col && RAY_IS_ERR(codes_col)) {
@@ -12215,6 +12359,10 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit)
         }
     }
 grp_done:
+    for (uint32_t k = 0; k < sd_n; k++) {
+        if (sd_col[k]) ray_release(sd_col[k]);
+        ray_strdom_free(sdom[k]);
+    }
     scratch_free(wrap_hdr);   /* NULL on early bails → no-op */
     if (gvm) {
         gvm->grp_card_n = sv_grp_n;
@@ -17103,7 +17251,9 @@ ht_path:;
      * readers take their plain columns here (R-RANDOM): every key of a
      * group-by with a wide key (STR, GUID, LIST), because equality compares
      * every key at stored rows, and exactly the inputs of the holistic
-     * aggregates, whose per-group buffers gather stored rows. */
+     * aggregates, whose per-group buffers gather stored rows.  A
+     * generation-2 STR scan key reaches here only when exec_group's
+     * string-domain swap declined it (strdom_key_ok). */
     bool ht_wide = false;
     for (uint32_t k = 0; k < n_keys; k++)
         if (key_types[k] == RAY_STR || key_types[k] == RAY_GUID || key_types[k] == RAY_LIST)
