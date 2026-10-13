@@ -1230,7 +1230,7 @@ ray_t* ray_in_vec_exec(ray_t* col, ray_t* set, bool negate) {
 }
 
 static ray_t* flatten_parted_col(ray_t* col);
-static ray_t* flatten_parted_table(ray_t* tbl);
+static ray_t* flatten_parted_table(ray_t* tbl, const char* ragged_op);
 
 /* General membership fallback: the typed `in` kernel bails on guid operands
  * (16-byte cells it can't compare) and on string columns (variable-length
@@ -3011,7 +3011,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
              * which the sort cannot gather.  Sort a flattened copy, as the
              * partial-where path above does. */
             if (!g->selection && tbl && tbl->type == RAY_TABLE) {
-                ray_t* flat = flatten_parted_table(tbl);
+                ray_t* flat = flatten_parted_table(tbl, "sort");
                 if (flat) {
                     ray_release(input);
                     if (RAY_IS_ERR(flat)) return flat;
@@ -3277,7 +3277,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 }
                 /* All-pass where: over a parted source: see OP_SORT */
                 if (!g->selection && tbl && tbl->type == RAY_TABLE) {
-                    ray_t* flat = flatten_parted_table(tbl);
+                    ray_t* flat = flatten_parted_table(tbl, "sort");
                     if (flat) {
                         ray_release(sort_input);
                         if (RAY_IS_ERR(flat)) return flat;
@@ -4469,10 +4469,72 @@ static ray_t* flatten_parted_col(ray_t* col) {
     return flat;
 }
 
+/* Ragged parted table (a partition lacks a trailing column, see
+ * src/store/part.c): flatten_parted_col skips the NULL segment, so the flat
+ * column would come out shorter than the table and misaligned with its
+ * siblings.  Name the first such column and partition in a "nyi" error;
+ * NULL when every parted column covers every partition's rows.  The
+ * per-partition row counts come from the MAPCOMMON partition column. */
+static ray_t* parted_ragged_error(ray_t* tbl, const char* op) {
+    int64_t ncols = ray_table_ncols(tbl);
+    ray_t* mc = NULL;
+    for (int64_t c = 0; c < ncols && !mc; c++) {
+        ray_t* col = ray_table_get_col_idx(tbl, c);
+        if (col && col->type == RAY_MAPCOMMON) mc = col;
+    }
+    ray_t* keys = mc ? ((ray_t**)ray_data(mc))[0] : NULL;
+    ray_t* cnts = mc ? ((ray_t**)ray_data(mc))[1] : NULL;
+    int64_t nrows = ray_table_nrows(tbl);
+    for (int64_t c = 0; c < ncols; c++) {
+        ray_t* col = ray_table_get_col_idx(tbl, c);
+        if (!col || !RAY_IS_PARTED(col->type)) continue;
+        ray_t** segs = (ray_t**)ray_data(col);
+        int64_t bad = -1;
+        for (int64_t s = 0; s < col->len && bad < 0; s++) {
+            int64_t want = (cnts && s < cnts->len)
+                         ? ((const int64_t*)ray_data(cnts))[s] : -1;
+            int64_t have = segs[s] ? segs[s]->len : 0;
+            if (want >= 0 ? have != want : !segs[s]) bad = s;
+        }
+        if (bad < 0 && ray_parted_nrows(col) == nrows) continue;
+        ray_t* name = ray_sym_str(ray_table_col_name(tbl, c));
+        int nlen = name ? (int)ray_str_len(name) : 0;
+        const char* nptr = name ? ray_str_ptr(name) : "";
+        if (bad < 0)
+            return ray_error("nyi", "%s: column '%.*s' has %lld rows, the "
+                             "table has %lld (ragged parted table)", op,
+                             nlen, nptr, (long long)ray_parted_nrows(col),
+                             (long long)nrows);
+        ray_t* key_s = NULL;
+        if (keys && bad < keys->len) {
+            int alloc = 0;
+            ray_t* key = collection_elem(keys, bad, &alloc);
+            if (key && !RAY_IS_ERR(key)) key_s = ray_fmt(key, 0);
+            if (alloc && key) ray_release(key);
+        }
+        ray_t* err;
+        if (key_s && !RAY_IS_ERR(key_s) && key_s->type == -RAY_STR)
+            err = ray_error("nyi", "%s: column '%.*s' is missing in "
+                            "partition %.*s (ragged parted table)", op,
+                            nlen, nptr, (int)ray_str_len(key_s),
+                            ray_str_ptr(key_s));
+        else
+            err = ray_error("nyi", "%s: column '%.*s' is missing in "
+                            "partition %lld (ragged parted table)", op,
+                            nlen, nptr, (long long)bad);
+        if (key_s) ray_release(key_s);
+        return err;
+    }
+    return NULL;
+}
+
 /* A flattened copy of `tbl` when any column is parted / mapcommon, built
  * without mutating the (possibly stored) source; NULL when every column is
- * already dense.  Returns an owned table or a RAY_ERR. */
-static ray_t* flatten_parted_table(ray_t* tbl) {
+ * already dense.  Returns an owned table or a RAY_ERR.  A non-NULL
+ * `ragged_op` rejects a ragged parted table with an error naming that op
+ * (the sort paths gather rows across columns, so a short column would be
+ * read past its end); NULL flattens it as is. */
+static ray_t* flatten_parted_table(ray_t* tbl, const char* ragged_op) {
     int64_t ncols = ray_table_ncols(tbl);
     bool any_parted = false;
     for (int64_t c = 0; c < ncols; c++) {
@@ -4482,6 +4544,10 @@ static ray_t* flatten_parted_table(ray_t* tbl) {
         }
     }
     if (!any_parted) return NULL;
+    if (ragged_op) {
+        ray_t* err = parted_ragged_error(tbl, ragged_op);
+        if (err) return err;
+    }
     ray_t* out = ray_table_new(ncols);
     for (int64_t c = 0; out && !RAY_IS_ERR(out) && c < ncols; c++) {
         ray_t* col = ray_table_get_col_idx(tbl, c);
@@ -4570,7 +4636,7 @@ static ray_t* ray_execute_inner(ray_graph_t* g, ray_op_t* root, bool reset_cance
              * sel_compact.  Build a flattened copy (never mutating the
              * possibly-stored source) so downstream at/count/first see dense
              * columns, matching the partial-filter path. */
-            ray_t* out = flatten_parted_table(result);
+            ray_t* out = flatten_parted_table(result, NULL);
             if (out) {
                 ray_release(result);
                 result = out;

@@ -91,6 +91,19 @@
 ;; (format "%" printed the column flattened by `at`, short of those rows)
 (format "%" Rser) -- (format "%" Nser)
 (format "%" Pser) -- (format "%" Fser)
+;; a present segment holding nulls (no NULL segment): the flat column
+;; carries HAS_NULLS (the OR over the segments), so the bytes match the
+;; flat copy and the nulls read back as nulls
+(.db.splayed.set "/tmp/rfl_serde_parted/n/2024.01.01/t/" (table [i f s] (list [1 2] [1.5 2.5] ['x 'y])))
+(.db.splayed.set "/tmp/rfl_serde_parted/n/2024.01.02/t/" (table [i f s] (list [3 0N 5] [0Nf 4.5 5.5] ['z ' 'x])))
+(.db.splayed.set "/tmp/rfl_serde_parted/n/2024.01.03/t/" (table [i f s] (list [6 7] [6.5 7.5] ['y 'z])))
+(set NPser (.db.parted.get "/tmp/rfl_serde_parted/n/" 't))
+(set NFser (table [date i f s] (list [2024.01.01 2024.01.01 2024.01.02 2024.01.02 2024.01.02 2024.01.03 2024.01.03] [1 2 3 0N 5 6 7] [1.5 2.5 0Nf 4.5 5.5 6.5 7.5] ['x 'y 'z ' 'x 'y 'z])))
+(ser NPser) -- (ser NFser)
+(de (ser NPser)) -- NFser
+(nil? (at (de (ser NPser)) 'i)) -- [false false false true false false false]
+(nil? (at (de (ser NPser)) 'f)) -- [false false true false false false false]
+(nil? (at (de (ser NPser)) 's)) -- [false false false true false false false]
 ;; SYM segments of different index widths (W8, then W16 past 256 symbols)
 ;; and an integer partition key
 (.db.splayed.set "/tmp/rfl_serde_parted/w/0/t/" (table [a s] (list [1 2 3] ['x 'y 'x])))

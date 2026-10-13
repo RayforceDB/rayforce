@@ -507,6 +507,35 @@
 (select {from: Pck where: (>= y 0) desc: date}) -- (select {from: Mck desc: date})
 (select {y: y from: Pck where: (>= y 0) desc: x}) -- (select {y: y from: Mck desc: x})
 (select {x: x from: Pck where: (>= y 0) desc: y take: 2}) -- (select {x: x from: Mck desc: y take: 2})
+;; a ragged parted table (a partition lacks a column) is not flattened for
+;; the sort: the missing segment left the flat column short of the table,
+;; and the sort gathered rows past its end.  It fails with nyi; a partition
+;; with no rows that lacks the column has nothing to misalign and sorts
+(.sys.exec "rm -rf /tmp/rfl_ckragged")
+(.db.splayed.set "/tmp/rfl_ckragged/2024.01.01/t/" (table [a b h] (list [0 1] [0.5 1.5] [true false])))
+(.db.splayed.set "/tmp/rfl_ckragged/2024.01.02/t/" (table [a] (list [2 3 4])))
+(.db.splayed.set "/tmp/rfl_ckragged/2024.01.03/t/" (table [a b h] (list [5 6] [5.5 6.5] [true true])))
+(set Prg (.db.parted.get "/tmp/rfl_ckragged/" 't))
+(select {from: Prg where: (>= a 0) desc: a take: 3}) !- nyi
+(select {from: Prg where: (>= a 0) asc: h}) !- nyi
+(select {from: Prg where: (>= a 0) desc: b}) !- nyi
+(count (select {from: Prg where: (>= a 0)})) -- 7
+(.sys.exec "rm -rf /tmp/rfl_ckragged")
+(.db.splayed.set "/tmp/rfl_ckragged/2024.01.01/t/" (table [a b] (list [0 1] [0.5 1.5])))
+(.db.splayed.set "/tmp/rfl_ckragged/2024.01.02/t/" (table [a b] (list [2 3] [2.5 3.5])))
+(.db.splayed.set "/tmp/rfl_ckragged/2024.01.03/t/" (table [a] (list [4 5])))
+(set Prg (.db.parted.get "/tmp/rfl_ckragged/" 't))
+(select {from: Prg where: (>= a 0) asc: b}) !- nyi
+(select {from: Prg where: (>= a 0) desc: a take: 2}) !- nyi
+(.sys.exec "rm -rf /tmp/rfl_ckragged")
+(.db.splayed.set "/tmp/rfl_ckragged/2024.01.01/t/" (table [a b] (list [0 1] [0.5 1.5])))
+(.db.splayed.set "/tmp/rfl_ckragged/2024.01.02/t/" (table [a] (list (as 'I64 []))))
+(.db.splayed.set "/tmp/rfl_ckragged/2024.01.03/t/" (table [a b] (list [5 6] [5.5 6.5])))
+(set Prg (.db.parted.get "/tmp/rfl_ckragged/" 't))
+(set Frg (table [date a b] (list [2024.01.01 2024.01.01 2024.01.03 2024.01.03] [0 1 5 6] [0.5 1.5 5.5 6.5])))
+(select {from: Prg where: (>= a 0) desc: a take: 3}) -- (select {from: Frg desc: a take: 3})
+(select {from: Prg where: (>= a 0) asc: b}) -- (select {from: Frg asc: b})
+(.sys.exec "rm -rf /tmp/rfl_ckragged")
 ;; a select with no clauses answers the parted table itself, uncopied; it
 ;; counts, prints and serializes as its rows: ser writes each parted column
 ;; as the flat vector it stands for, byte for byte, and de reads a flat table
