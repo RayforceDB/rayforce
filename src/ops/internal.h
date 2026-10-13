@@ -46,6 +46,13 @@
 #include "vec/vec.h"
 #include <string.h>
 #include <math.h>
+#include <stdbool.h>
+#include <stdint.h>
+
+/* Shared strict parser for launcher flags and .sys.args.  When core_count is
+ * true, values are limited to the heap registry's total worker capacity. */
+int parse_sys_int_arg(const char* s, bool nonnegative, bool core_count,
+                      int64_t* out);
 
 /* True if every leaf is constant or reduced to a scalar. */
 bool op_tree_is_scalar(ray_graph_t* g, uint32_t id);
@@ -1054,8 +1061,7 @@ ray_t* expr_eval_full(const ray_expr_t* expr, int64_t nrows);
  *
  * Compiles and evaluates `pred` in selection-output mode (per-task rowsel
  * builders dispatched over [0,nrows), then finished into one rowsel block).
- * Handles the parted/non-BOOL guard and the
- * large-table fallback (>RAY_POOL_MAX_TASKS tasks → non-morsel-aligned grain).
+ * Handles the parted/non-BOOL guard.
  * Returns:
  *   - non-NULL rowsel block  → the selection (caller installs / reads it).
  *   - NULL with *all_pass=1  → every row passed (all-pass = "no selection").

@@ -160,18 +160,16 @@ struct ray_pool {
 /* Total workers = n_workers + 1 (main thread is worker 0) */
 #define ray_pool_total_workers(p) ((p)->n_workers + 1)
 
-/* Maximum number of tasks per ray_pool_dispatch call (ring capacity ceiling).
- * Workloads that would require more tasks must either fall back to a serial
- * path or be restructured — the dispatcher clamps n_tasks and re-derives a
- * non-morsel-aligned grain, which breaks slot math in morsel-sensitive callers
- * (e.g. exec_pred_to_selection).  Value must stay in sync with MAX_RING_CAP
- * in pool.c. */
+/* Task-ring capacity ceiling.  A dispatch that needs more tasks than the ring
+ * holds (this ceiling, or a smaller ring that failed to grow) runs them in
+ * further rounds; the per-task ranges are unchanged, so ray_pool_dispatch's
+ * tasks always start on TASK_GRAIN boundaries.  Value must stay in sync with
+ * MAX_RING_CAP in pool.c. */
 #define RAY_POOL_MAX_TASKS  (1u << 16)
 
 /* Initial task-ring capacity (power of 2).  ray_pool_dispatch_n callers that
- * must never trigger ring growth (its clamp-on-grow-failure silently DROPS
- * tasks) cap their task count at this value — one shared constant instead of
- * a hardcoded 1024 at every site. */
+ * want their tasks in one round, with no ring growth, cap their task count at
+ * this value — one shared constant instead of a hardcoded 1024 at every site. */
 #define RAY_POOL_INIT_TASKS 1024u
 
 /* True when a data-parallel dispatch is both worthwhile AND safe: a live

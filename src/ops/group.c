@@ -1216,10 +1216,10 @@ ray_t* exec_count_distinct(ray_graph_t* g, ray_op_t* op, ray_t* input) {
     if (grain <= 0) grain = 8192;
     int64_t n_tasks_64 = (len + grain - 1) / grain;
     if (n_tasks_64 <= 0) n_tasks_64 = 1;
-    /* MAX_RING_CAP guards against pathological len; if we'd exceed it,
-     * fall back to the sequential kernel — the cap is high enough that
-     * this only fires on absurd inputs. */
-    if (n_tasks_64 > (1u << 16)) {
+    /* Tasks past the ring run in further rounds; the only bound on the task
+     * count is the uint32 ray_pool_dispatch_n takes (a vector that long
+     * cannot exist, so the sequential kernel below is a formality). */
+    if (n_tasks_64 > UINT32_MAX) {
         int64_t cnt = cd_seq_count(in_type, input->attrs, base, len);
         if (cnt < 0) return ray_error("oom", NULL);
         return ray_i64(cnt);
@@ -1497,7 +1497,7 @@ ray_t* distinct_radix_first_ids(ray_t* input) {
     int64_t grain = (int64_t)RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS;
     if (grain <= 0) grain = 8192;
     int64_t n_tasks_64 = (len + grain - 1) / grain;
-    if (n_tasks_64 <= 0 || n_tasks_64 > (1u << 16)) return NULL;
+    if (n_tasks_64 <= 0 || n_tasks_64 > UINT32_MAX) return NULL;   /* dispatch_n takes a uint32 */
     uint32_t n_tasks = (uint32_t)n_tasks_64;
 
     void* base = ray_data(input);
@@ -1835,14 +1835,10 @@ static ray_t* count_distinct_per_group_parallel(
 
     /* Match ray_pool_dispatch's task layout so task_id derived from
      * `start / grain` inside the worker fn matches the row range the
-     * dispatch hands out.  Mirrors pool.c's TASK_GRAIN (8 morsels of
-     * 1024 rows each) and MAX_RING_CAP (65536) clamping logic. */
+     * dispatch hands out: every task is one TASK_GRAIN (8 morsels of
+     * 1024 rows each), however many rounds the ring needs. */
     int64_t grain = (int64_t)RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS;
     int64_t n_tasks = (n_rows + grain - 1) / grain;
-    if (n_tasks > 65536) {
-        n_tasks = 65536;
-        grain = (n_rows + n_tasks - 1) / n_tasks;
-    }
     ctx.grain   = grain;
     ctx.n_tasks = n_tasks;
 
