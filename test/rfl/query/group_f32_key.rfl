@@ -28,3 +28,16 @@
 (at (select {from: Z by: [z s] c: (count x) n: (count (distinct x)) asc: [z s]}) 'n) -- [25000 25000 25000 25000]
 (set Q (select {from: (table [z x] (list (as 'F64 (% (til N) 3)) (til N))) z: (as 'F32 (if (== z 0.0) 0Nf z)) x: x}))
 (at (select {from: Q by: z c: (count x) asc: z}) 'c) -- [33334 33333 33333]
+;; #765 — more than 256 distinct F32 keys: one byte per key capped the parallel
+;; result at 256 groups.  1000 keys j/8 (exact in F32), 200 rows each.
+(set NF 200000)
+(set TF (select {from: (table [i] (list (til NF))) k: (as 'F32 (/ (as 'F64 (% i 1000)) 8.0)) g: (% i 3) v: i}))
+(set RF (select {from: TF by: k c: (count v) s: (sum v) asc: k}))
+(count RF) -- 1000
+(all (== (at RF 'k) (/ (as 'F64 (til 1000)) 8.0))) -- true
+(at RF 'c) -- (take [200] 1000)
+(at RF 's) -- (+ 19900000 (* 200 (til 1000)))
+(set RC (select {from: TF by: [k g] c: (count v) asc: [k g]}))
+(count RC) -- 3000
+(sum (at RC 'c)) -- 200000
+(count (select {from: (select {from: (table [i] (list (til 70000))) k: (as 'F32 (/ (as 'F64 i) 7.0)) v: i}) by: k c: (count v)})) -- 70000
