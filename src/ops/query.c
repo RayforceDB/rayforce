@@ -3620,9 +3620,23 @@ static int is_whole_column_projection(ray_t* expr, ray_t* tbl) {
         return value && ray_is_atom(value);
     }
     return (l == 8 && memcmp(p, "distinct", 8) == 0) ||
+           (l == 5 && memcmp(p, "where", 5) == 0) ||
            (l == 7 && memcmp(p, "reverse", 7) == 0) ||
            (l == 3 && memcmp(p, "asc", 3) == 0) ||
            (l == 4 && memcmp(p, "desc", 4) == 0);
+}
+
+static int collect_col_refs_set(ray_t* expr, ray_t* tbl,
+                                int64_t* out_syms, int max_out, int n);
+static bool clause_runs_code_in(ray_t* v, ray_t* tbl, bool containers);
+
+/* Does `expr` read no column of `tbl`: it names none, nor runs code (a
+ * lambda, a computed callee, text evaluated at run time) whose reads it
+ * does not show?  Its value is then the same for every row. */
+static bool expr_reads_no_column(ray_t* expr, ray_t* tbl) {
+    int64_t ref;
+    return collect_col_refs_set(expr, tbl, &ref, 1, 0) == 0 &&
+           !clause_runs_code_in(expr, tbl, false);
 }
 
 /* True when a grouped aggregate expression can be lowered to OP_GROUP.
@@ -3655,14 +3669,26 @@ static bool agg_input_needs_group_eval(ray_t* arg, ray_t* tbl, bool collections)
             if (!collections) return false;
         } else if (arg->type != RAY_LIST) {
             return collections && ray_is_vec(arg);
+        } else if (expr_contains_call_named(arg, "where", 5)) {
+            /* `where` keeps the positions it selects, not the rows: its
+             * result is no row-aligned input, so aggregate what it returns
+             * within each group. */
+            return true;
         } else if (!expr_contains_call_named(arg, "concat", 6) && !query_expr_has_helper(arg)) {
-            if (!collections || expr_refs_row_column(arg, tbl)) return false;
+            if (expr_refs_row_column(arg, tbl)) return false;
+            if (!collections && !expr_reads_no_column(arg, tbl)) return false;
         }
     }
     bool lowered = false;
     bool constant = expr_is_constant_collection(arg, tbl, &lowered);
     if (constant && collections) return true;
     if (lowered) return false;
+    /* A source the planner cannot lower that reads no column (`(til 5)`)
+     * is one value whatever the row: aggregate it per group in the
+     * evaluator, as a constant collection is counted, not row by row. */
+    if (tbl && tbl->type == RAY_TABLE && arg->type == RAY_LIST &&
+        expr_reads_no_column(arg, tbl))
+        return true;
     /* A helper the planner can neither lower nor expand (several
      * statements, a closure, recursion) runs per group in the evaluator,
      * where its argument keeps the group's rows. */
@@ -8886,10 +8912,31 @@ static ray_t* eval_scalar_agg_outputs(ray_t** dict_elems, int64_t dict_n,
         /* Expand helpers first: a pure helper around such a verb is the
          * verb, and must not be fed one cell at a time either. */
         ray_t* agg_src_expr = query_inline_helpers(agg_elems[1], tbl);
-        ray_t* src = (is_whole_column_projection(agg_src_expr, tbl) ||
-                     expr_is_constant_collection(agg_src_expr, tbl, NULL))
-                   ? eval_expr_whole_column_impl(agg_src_expr, tbl)
-                   : eval_expr_per_row_impl(agg_src_expr, tbl, nrows);
+        ray_t* src = NULL;
+        if (is_whole_column_projection(agg_src_expr, tbl) ||
+            expr_is_constant_collection(agg_src_expr, tbl, NULL))
+            src = eval_expr_whole_column_impl(agg_src_expr, tbl);
+        else if (expr_reads_no_column(agg_src_expr, tbl)) {
+            /* A source that reads no column (`(til 5)`, which the planner
+             * does not lower) has one value whatever the row: a collection
+             * is aggregated as it stands, as outside a select; per row it
+             * would be counted once per row.  A scalar keeps its per-row
+             * meaning (`(sum 1)` is the row count): the rows' cells, all
+             * this one value.  Evaluated once either way, so an effect in
+             * it runs once. */
+            src = eval_expr_whole_column_impl(agg_src_expr, tbl);
+            if (src && !RAY_IS_ERR(src) && ray_is_atom(src)) {
+                ray_t* cells = atom_broadcast_vec(src, nrows);
+                if (!cells) {
+                    cells = ray_list_new(nrows);
+                    for (int64_t r = 0; r < nrows && cells && !RAY_IS_ERR(cells); r++)
+                        cells = ray_list_append(cells, src);
+                }
+                ray_release(src);
+                src = cells ? cells : ray_error("oom", NULL);
+            }
+        }
+        else src = eval_expr_per_row_impl(agg_src_expr, tbl, nrows);
         ray_release(agg_src_expr);
         if (!src || RAY_IS_ERR(src)) {
             ray_release(result);
@@ -11487,8 +11534,10 @@ static bool parted_clauses_plain(ray_t* dict, ray_t* tbl);
 
 /* The columns of a parted table a select reads, flattened: every column a
  * clause names, in the table's order; the whole table when a clause runs
- * code whose column reads it does not show, or names no column. */
-static ray_t* parted_flatten_read_cols(ray_t* dict, ray_t* tbl) {
+ * code whose column reads it does not show.  When the clauses name no
+ * column, the whole table too, unless `keep_unread`: then `tbl` itself,
+ * retained, since nothing in the select reads a column of it. */
+static ray_t* parted_flatten_read_cols(ray_t* dict, ray_t* tbl, bool keep_unread) {
     int64_t nc = ray_table_ncols(tbl);
     ray_t* keys = ray_dict_keys(dict);
     ray_t* vals = ray_dict_vals(dict);
@@ -11510,7 +11559,11 @@ static ray_t* parted_flatten_read_cols(ray_t* dict, ray_t* tbl) {
         }
         if (nsym == 0) nref = collect_col_refs_set(v, tbl, refs, 256, nref);
     }
-    if (nref == 0) return query_materialize_parted_table(tbl);
+    if (nref == 0) {
+        if (!keep_unread) return query_materialize_parted_table(tbl);
+        ray_retain(tbl);
+        return tbl;
+    }
     ray_t* out = ray_table_new(nref);
     for (int64_t c = 0; c < nc && out && !RAY_IS_ERR(out); c++) {
         int64_t cn = ray_table_col_name(tbl, c);
@@ -11605,7 +11658,7 @@ static ray_t* select_plan_computed_key(ray_t* dict, ray_t* tbl, int64_t* key_nam
                     any_out = !rsv;
                 }
                 if (!any_out) { ray_release(base); return NULL; }
-                ray_t* flat = parted_flatten_read_cols(dict, base);
+                ray_t* flat = parted_flatten_read_cols(dict, base, false);
                 ray_release(base);
                 if (!flat || RAY_IS_ERR(flat)) return flat ? flat : ray_error("oom", NULL);
                 base = flat;
@@ -11727,6 +11780,93 @@ static ray_t* select_plan_computed_key(ray_t* dict, ray_t* tbl, int64_t* key_nam
     if (!engine || RAY_IS_ERR(engine)) return engine ? engine : ray_error("oom", NULL);
     *key_name = kname;
     return engine;
+}
+
+/* A literal of value `v` for a query dict: a symbol is quoted, so it is
+ * not read as a name.  Consumes `v`. */
+static ray_t* select_literal_of(ray_t* v) {
+    if (!v || RAY_IS_ERR(v) || v->type != -RAY_SYM) return v;
+    ray_t* q = ray_sym(v->i64);
+    ray_release(v);
+    if (q && !RAY_IS_ERR(q)) q->attrs |= ATTR_QUOTED;
+    return q;
+}
+
+/* A grouped aggregate whose source reads no column and has no DAG node
+ * (`(sum (at [1 2 3] 0))`, `(sum (til 5))`) has one value whatever the
+ * row.  It is evaluated once, here, and the select planned with what it
+ * gave: a scalar stands for every row, as `1` in `(sum 1)` does, so the
+ * output becomes `(agg <scalar>)`, which the engine folds over each
+ * group's rows; a collection is aggregated as it stands, as without by:,
+ * and its aggregate is the same in every group, a literal output.  The
+ * table already evaluated is the new from:.  NULL when no output has that
+ * shape. */
+static ray_t* select_plan_column_free_aggs(ray_t* dict, ray_t* tbl) {
+    if (!dict_get(dict, "by")) return NULL;
+    ray_t* keys = ray_dict_keys(dict);
+    ray_t* vals = ray_dict_vals(dict);
+    if (!keys || keys->type != RAY_SYM || !vals || vals->type != RAY_LIST) return NULL;
+    static const char* const reserved[] = { "from", "where", "by", "take", "asc", "desc", "nearest" };
+    int64_t rid[7];
+    for (int i = 0; i < 7; i++) rid[i] = ray_sym_intern(reserved[i], strlen(reserved[i]));
+    ray_t* engine = NULL;
+    int64_t nd = ray_dict_len(dict);
+    for (int64_t i = 0; i < nd; i++) {
+        int64_t kid = sym_cell_runtime_id(keys, i);
+        bool clause = false;
+        for (int r = 0; r < 7; r++) clause |= kid == rid[r];
+        if (clause) continue;
+        ray_t* v = ((ray_t**)ray_data(vals))[i];
+        if (!is_agg_expr(v) || ray_len(v) != 2) continue;
+        ray_t** el = (ray_t**)ray_data(v);
+        ray_t* fn_obj = ray_env_get(el[0]->i64);
+        if (!fn_obj || fn_obj->type != RAY_UNARY) continue;
+        ray_t* src = query_inline_helpers(el[1], tbl);
+        if (!src || RAY_IS_ERR(src)) { if (engine) ray_release(engine); return src ? src : ray_error("oom", NULL); }
+        bool take = src->type == RAY_LIST && !expr_contains_agg(src) && expr_reads_no_column(src, tbl);
+        if (take) {
+            ray_graph_t* pg = ray_graph_new(tbl);
+            take = pg && compile_expr_dag(pg, src) == NULL;
+            if (pg) ray_graph_free(pg);
+        }
+        if (!take) { ray_release(src); continue; }
+        ray_t* val = eval_expr_whole_column_impl(src, tbl);
+        ray_release(src);
+        if (!val || RAY_IS_ERR(val)) { if (engine) ray_release(engine); return val ? val : ray_error("oom", NULL); }
+        ray_t* out;
+        if (ray_is_atom(val)) {
+            ray_t* lit = select_literal_of(val);
+            out = lit && !RAY_IS_ERR(lit) ? ray_list_new(2) : lit;
+            if (out && !RAY_IS_ERR(out)) out = ray_list_append(out, el[0]);
+            if (out && !RAY_IS_ERR(out)) out = ray_list_append(out, lit);
+            if (lit && !RAY_IS_ERR(lit)) ray_release(lit);
+        } else {
+            ray_t* agg = ((ray_unary_fn)(uintptr_t)fn_obj->i64)(val);
+            ray_release(val);
+            if (agg && !RAY_IS_ERR(agg) && ray_is_lazy(agg)) agg = ray_lazy_materialize(agg);
+            if (agg && !RAY_IS_ERR(agg) && !ray_is_atom(agg)) {
+                /* an aggregate with a collection result: not one value
+                 * per group; the output keeps its own planning */
+                ray_release(agg);
+                continue;
+            }
+            out = select_literal_of(agg);
+        }
+        if (!out || RAY_IS_ERR(out)) { if (engine) ray_release(engine); return out ? out : ray_error("oom", NULL); }
+        if (!engine) { engine = dict; ray_retain(engine); }
+        ray_t* k = ray_sym(kid);
+        if (!k || RAY_IS_ERR(k)) { ray_release(out); ray_release(engine); return k ? k : ray_error("oom", NULL); }
+        engine = ray_dict_upsert(engine, k, out);
+        ray_release(k);
+        ray_release(out);
+        if (!engine || RAY_IS_ERR(engine)) return engine ? engine : ray_error("oom", NULL);
+    }
+    if (!engine) return NULL;
+    ray_t* k_from = ray_sym(rid[0]);
+    if (!k_from || RAY_IS_ERR(k_from)) { ray_release(engine); return k_from ? k_from : ray_error("oom", NULL); }
+    engine = ray_dict_upsert(engine, k_from, tbl);
+    ray_release(k_from);
+    return engine ? engine : ray_error("oom", NULL);
 }
 
 /* Names the hidden key column of a select_plan_computed_key result. */
@@ -12374,6 +12514,17 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, bool aliases_resolved,
             ray_release(engine);
             ray_release(tbl);
             return select_name_computed_key(r, key_name);
+        }
+    }
+
+    {
+        ray_t* engine = select_plan_column_free_aggs(dict, tbl);
+        if (engine && RAY_IS_ERR(engine)) { ray_release(tbl); return engine; }
+        if (engine) {
+            ray_t* r = ray_select_impl(&engine, 1, aliases_resolved);
+            ray_release(engine);
+            ray_release(tbl);
+            return r;
         }
     }
 
@@ -13217,7 +13368,7 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, bool aliases_resolved,
                 if (pg) ray_graph_free(pg);
             }
             if (unlowered) {
-                ray_t* flat = n_out > 0 ? parted_flatten_read_cols(dict, tbl)
+                ray_t* flat = n_out > 0 ? parted_flatten_read_cols(dict, tbl, false)
                                         : query_materialize_parted_table(tbl);
                 ray_release(tbl);
                 if (!flat || RAY_IS_ERR(flat)) {
@@ -16792,8 +16943,10 @@ by_dict_done:
                 } else if (table_has_parted_columns(tbl)) {
                     /* The evaluator binds each column as a whole vector:
                      * over a parted table flatten the columns the select
-                     * reads, as sel_compact does for the where: rows. */
-                    eval_tbl = parted_flatten_read_cols(dict, tbl);
+                     * reads, as sel_compact does for the where: rows.  A
+                     * select reading no column (`(count [1 2 3])`) keeps
+                     * the parted table: nothing in it is bound. */
+                    eval_tbl = parted_flatten_read_cols(dict, tbl, true);
                     if (!eval_tbl || RAY_IS_ERR(eval_tbl)) {
                         ray_graph_free(g); ray_release(tbl);
                         scratch_free(sagg_hdr);

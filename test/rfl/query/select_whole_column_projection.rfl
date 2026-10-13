@@ -83,4 +83,113 @@
 (select {x: (first (asc n)) y: (last (asc n)) from: TPW}) -- (select {x: (first (asc n)) y: (last (asc n)) from: TFW})
 (select {x: (first (asc k)) c: (count k) m: (min s) from: TPW}) -- (select {x: (first (asc k)) c: (count k) m: (min s) from: TFW})
 (select {x: (first (asc s)) y: (last (asc k)) from: TPW where: (> k 1)}) -- (select {x: (first (asc s)) y: (last (asc k)) from: TFW where: (> k 1)})
+;; A scalar aggregate whose source reads no column has nothing of the
+;; table to bind: over a parted table it answers as over a flat one.
+(at (select {x: (count [1 2 3]) from: TPW}) 'x) -- [3]
+(at (select {x: (first (asc [3 1 2])) from: TPW}) 'x) -- [1]
+(select {x: (count [1 2 3]) y: (first (asc [3 1 2])) from: TPW}) -- (select {x: (count [1 2 3]) y: (first (asc [3 1 2])) from: TFW})
+
+;; An aggregate source that reads no column and has no DAG node, `(til 5)`,
+;; is one collection whatever the row: `(count (til 5))` is 5, as outside a
+;; select.  It was evaluated row by row and counted once per row (the row
+;; count; `sum`/`max` rejected the list of per-row vectors).  A scalar
+;; source keeps its per-row meaning: `(sum 1)` is the row count.
+(at (select {x: (count (til 5)) from: TFW}) 'x) -- [5]
+(at (select {x: (count (til 5)) from: TPW}) 'x) -- [5]
+(at (select {x: (count (til 5)) from: TFW where: (> k 2)}) 'x) -- [5]
+(at (select {x: (count (til 5)) from: TPW where: (> k 2)}) 'x) -- [5]
+(at (select {x: (count (+ 1 (til 5))) y: (count k) from: TPW}) 'x) -- [5]
+(at (select {x: (max (til 5)) from: TFW}) 'x) -- [4]
+(at (select {x: (max (til 5)) from: TPW}) 'x) -- [4]
+(set n5 5)
+(at (select {x: (count (til n5)) from: TPW}) 'x) -- [5]
+(at (select {x: (count (til 5)) from: TFW by: s asc: s}) 'x) -- [5 5 5 5 5]
+(at (select {x: (count (til 5)) from: TPW by: s asc: s}) 'x) -- [5 5 5 5 5]
+(at (select {x: (sum 1) from: TPW}) 'x) -- [6]
+(at (select {x: (count 1) from: TFW}) 'x) -- [6]
+;; Grouped, every aggregate over such a source takes it whole in each
+;; group; the groups are uneven ('a holds two rows), so counting or summing
+;; the group's rows shows.
+(at (select {x: (sum (til 5)) from: TFW by: s asc: s}) 'x) -- [10 10 10 10 10]
+(at (select {x: (sum (til 5)) from: TPW by: s asc: s}) 'x) -- [10 10 10 10 10]
+(at (select {x: (min (+ 1 (til 5))) y: (max (til 5)) from: TFW by: s asc: s}) 'x) -- [1 1 1 1 1]
+(at (select {x: (min (+ 1 (til 5))) y: (max (til 5)) from: TPW by: s asc: s}) 'y) -- [4 4 4 4 4]
+(at (select {x: (avg (til 5)) from: TFW by: s asc: s}) 'x) -- [2.0 2.0 2.0 2.0 2.0]
+(at (select {x: (avg (til 5)) from: TPW by: s asc: s}) 'x) -- [2.0 2.0 2.0 2.0 2.0]
+(at (select {x: (first (reverse (til 5))) y: (last (til 5)) z: (sum k) from: TFW by: s asc: s}) 'x) -- [4 4 4 4 4]
+(at (select {x: (first (reverse (til 5))) y: (last (til 5)) z: (sum k) from: TPW by: s asc: s}) 'y) -- [4 4 4 4 4]
+(at (select {x: (sum (til 5)) z: (sum k) from: TPW by: s asc: s}) 'z) -- (at (select {z: (sum k) from: TFW by: s asc: s}) 'z)
+
+;; Without by: the source is evaluated once, scalar or collection, so an
+;; effect in it runs once, not once per row.
+;; `where` returns the positions it keeps, not one value per row: an
+;; aggregate over it takes what it returns, in each group (positions within
+;; the group) and over the whole table.  Grouped, count/sum/max read the
+;; group's rows instead (count gave the group sizes).
+(set TWi (table [i j] (list [1 1 3 4 5] [5 5 6 6 6])))
+(at (select {c: (count (where (> i 2))) by: j from: TWi}) 'c) -- [0 3]
+(at (select {c: (first (where (> i 2))) by: j from: TWi}) 'c) -- [0Nl 0]
+(at (select {c: (sum (where (> i 2))) d: (sum i) by: j from: TWi}) 'c) -- [0 3]
+(at (select {c: (count (where (> i 2))) from: TWi}) 'c) -- [3]
+(at (select {c: (sum (where (> i 2))) from: TWi where: (> i 1)}) 'c) -- [3]
+(at (select {x: (count (where (> k 2))) from: TFW by: s asc: s}) 'x) -- [1 1 1 0 1]
+(at (select {x: (count (where (> k 2))) from: TPW by: s asc: s}) 'x) -- [1 1 1 0 1]
+(at (select {x: (sum (where (> k 2))) y: (max (where (> k 2))) from: TPW by: s asc: s}) 'x) -- [0 1 0 0 0]
+(at (select {x: (sum (where (> k 2))) y: (max (where (> k 2))) from: TPW by: s asc: s}) 'y) -- [0 1 0 0Nl 0]
+(at (select {x: (count (where (> k 2))) from: TPW}) 'x) -- [4]
+
+;; A grouped source that reads no column and gives one value stands for
+;; every row of the group, as without by: (`(sum 1)` is the row count): 2 in
+;; groups of 1 2 1 1 1 rows sums to 2 4 2 2 2.  It is evaluated once, not
+;; once per group; it was taken as one value per group (1 per group).
+(at (select {x: (sum (at [1 2 3] 1)) from: TFW by: s asc: s}) 'x) -- [2 4 2 2 2]
+(at (select {x: (sum (at [1 2 3] 1)) from: TPW by: s asc: s}) 'x) -- [2 4 2 2 2]
+(at (select {x: (count (at [1 2 3] 1)) from: TPW by: s asc: s}) 'x) -- [1 2 1 1 1]
+(at (select {x: (first (at ['p 'q] 1)) from: TFW by: s asc: s}) 'x) -- ['q 'q 'q 'q 'q]
+(set TB (table [a b] (list (til 10) (< (til 10) 3))))
+(at (select {x: (sum (at [1 2 3] 0)) from: TB by: b}) 'x) -- [3 7]
+(at (select {x: (sum (at [1 2 3] 1)) from: TB by: b}) 'x) -- [6 14]
+(at (select {x: (sum (at [1 2 3] 1)) from: TB by: b where: (> a 1)}) 'x) -- [2 14]
+(set ticks 0)
+(at (select {x: (sum (do (set ticks (+ ticks 1)) (at [1 2 3] 1))) from: TPW by: s asc: s}) 'x) -- [2 4 2 2 2]
+ticks -- 1
+(set ticks 0)
+(at (select {x: (sum (do (set ticks (+ ticks 1)) (til 5))) y: (sum k) from: TFW by: s asc: s}) 'x) -- [10 10 10 10 10]
+ticks -- 1
+
+;; A vector constant in an aggregate stands for a column: one of the
+;; table's length is sliced per group and filtered by where: (the table's
+;; rows before the filter; a parted table's rows across its partitions).
+;; Any other length is a length error; it was read past its end.  One
+;; value spreads over the rows, and count keeps the vector's own length.
+(set W6 [10 20 30 40 50 60])
+(at (select {x: (sum W6) from: TFW}) 'x) -- [210]
+(at (select {x: (sum W6) from: TPW}) 'x) -- [210]
+(at (select {x: (sum W6) from: TFW where: (> k 2)}) 'x) -- [160]
+(at (select {x: (sum W6) from: TPW where: (> k 2)}) 'x) -- [160]
+(at (select {x: (sum W6) from: TFW by: s asc: s}) 'x) -- [50 60 10 30 60]
+(at (select {x: (sum W6) from: TPW by: s asc: s}) 'x) -- [50 60 10 30 60]
+(at (select {x: (sum W6) from: TPW by: s where: (> k 2) asc: s}) 'x) -- [50 40 10 60]
+(at (select {x: (sum [7]) from: TFW}) 'x) -- [42]
+(set L3 [5 1 9])
+(select {x: (sum [1 2 3]) from: TFW}) !- length
+(select {x: (sum [1 2 3]) from: TPW}) !- length
+(select {x: (avg L3) from: TFW}) !- length
+(select {x: (sum (+ 1 L3)) from: TFW}) !- length
+(select {x: (max [1 2 3]) from: TFW by: s}) !- length
+(select {x: (max L3) from: TPW by: s}) !- length
+(select {x: (first L3) from: TFW by: s}) !- length
+(select {x: (sum [1 2 3 4]) from: TFW where: (> k 2)}) !- length
+(at (select {x: (count L3) from: TFW}) 'x) -- [3]
+(at (select {x: (count L3) from: TPW by: s asc: s}) 'x) -- [3 3 3 3 3]
+
+(set ticks 0)
+(at (select {x: (sum (do (set ticks (+ ticks 1)) (at [1 2 3] 0))) from: TFW}) 'x) -- [6]
+ticks -- 1
+(set ticks 0)
+(at (select {x: (count (at (do (set ticks (+ ticks 1)) (til 3)) 1)) from: TPW where: (> k 2)}) 'x) -- [4]
+ticks -- 1
+(set ticks 0)
+(at (select {x: (count (do (set ticks (+ ticks 1)) (til 5))) from: TPW}) 'x) -- [5]
+ticks -- 1
 (.sys.exec "rm -rf /tmp/rfl_scalar_asc_parted") -- 0

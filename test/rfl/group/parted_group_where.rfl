@@ -204,5 +204,24 @@
 (asc (at RPe8 'c)) -- (asc (at RFe8 'c))
 (.sys.exec "rm -rf /tmp/rfl_pgtk")
 
+;; Each key leads one partition and trails another, so a partition's own top
+;; 2 is not the merged top 2: a top-N applied per partition kept dd and a
+;; from partitions 1 and 2 only (dd 250250, a 250250 for desc:), and a 124500
+;; and dd 124750 for asc:.
+(.sys.exec "rm -rf /tmp/rfl_pgtq")
+(.db.splayed.set "/tmp/rfl_pgtq/01/t/" (table [q v] (list (at ['a 'b 'c 'dd] (% (til 1000) 4)) (til 1000))))
+(.db.splayed.set "/tmp/rfl_pgtq/02/t/" (table [q v] (list (at ['a 'b 'c 'dd] (% (+ 1 (til 1000)) 4)) (til 1000))))
+(.db.splayed.set "/tmp/rfl_pgtq/03/t/" (table [q v] (list (at ['a 'b 'c 'dd] (% (+ 2 (til 1000)) 4)) (til 1000))))
+(set Pq (.db.parted.get "/tmp/rfl_pgtq/" 't))
+(set Bq (at (.sys.mem) 'group-perpart-runs))
+(set RPq1 (select {from: Pq by: q s: (sum v) desc: s take: 2}))
+(set RPq2 (select {from: Pq by: q s: (sum v) asc: s take: 2}))
+(- (at (.sys.mem) 'group-perpart-runs) Bq) -- 2
+(at RPq1 'q) -- ['dd 'a]
+(at RPq1 's) -- [375000 374750]
+(at RPq2 'q) -- ['c 'b]
+(at RPq2 's) -- [374250 374500]
+(.sys.exec "rm -rf /tmp/rfl_pgtq")
+
 ;; ─── cleanup ─────────────────────────────────────────────────────────────────
 (.sys.exec "rm -rf /tmp/rfl_pgwh")
