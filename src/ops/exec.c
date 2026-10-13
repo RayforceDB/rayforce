@@ -1653,6 +1653,7 @@ typedef struct {
     in_worker_ctx_t* ic;
     ray_col_src_t*   src;
     ray_scan_fail_t* fail;
+    int64_t          key_base;         /* added to failure keys: a parted segment's first row */
     /* Membership bounds (integer and SYM columns): the probe values, sorted
      * ascending and distinct (keys == NULL: no bounds, every morsel read),
      * and whether "" (SYM id 0) is one of them. */
@@ -1764,11 +1765,12 @@ static int in_fkey_cmp(const void* a, const void* b) {
 
 static void in_sel_rfill(void* vctx, ray_col_scratch_t* sc, int64_t start, int64_t n, uint8_t* out) {
     in_sel_rfill_ctx_t* c = (in_sel_rfill_ctx_t*)vctx;
-    if (ray_scan_fail_skip(c->fail, start)) { memset(out, 0, (size_t)n); return; }
+    const int64_t key = c->key_base + start;
+    if (ray_scan_fail_skip(c->fail, key)) { memset(out, 0, (size_t)n); return; }
     ray_t* berr = NULL;
     int b = in_sel_bounds(c, start, n, out, &berr);
     if (b > 0) return;
-    if (b < 0) { ray_scan_fail_note(c->fail, start, berr); memset(out, 0, (size_t)n); return; }
+    if (b < 0) { ray_scan_fail_note(c->fail, key, berr); memset(out, 0, (size_t)n); return; }
     int64_t at = 0;
     while (at < n) {
         ray_col_range_t v;
@@ -1776,7 +1778,7 @@ static void in_sel_rfill(void* vctx, ray_col_scratch_t* sc, int64_t start, int64
         if (!e && v.n <= 0)
             e = ray_error("range", "in selection: empty range read at row %lld", (long long)(start + at));
         if (e) {
-            ray_scan_fail_note(c->fail, start, e);
+            ray_scan_fail_note(c->fail, key, e);
             memset(out + at, 0, (size_t)(n - at));
             return;
         }
@@ -1788,6 +1790,183 @@ static void in_sel_rfill(void* vctx, ray_col_scratch_t* sc, int64_t start, int64
         at += v.n;
     }
 }
+
+/* The range-reading fill's context over bound source `src` with probe ic:
+ * the membership bounds, the probe values sorted once (integer and SYM
+ * columns as int64; a float column or set as doubles), in kstack / fstack
+ * when they hold 32 values or fewer.  A failed allocation leaves those
+ * bounds off (every morsel read).  in_rfill_free releases them. */
+static void in_rfill_setup(in_sel_rfill_ctx_t* f, in_worker_ctx_t* ic, ray_col_src_t* src,
+                           ray_scan_fail_t* fail, bool negate, int64_t* kstack, double* fstack) {
+    *f = (in_sel_rfill_ctx_t){ .ic = ic, .src = src, .fail = fail, .negate = negate };
+    if (!ic->use_double && ic->sv_len <= INT32_MAX) {
+        int64_t* keys = ic->sv_len <= 32 ? kstack : (int64_t*)ray_alloc_raw((size_t)ic->sv_len * sizeof(int64_t));
+        if (keys) {
+            if (ic->sv_len) memcpy(keys, ic->svi, (size_t)ic->sv_len * sizeof(int64_t));
+            qsort(keys, (size_t)ic->sv_len, sizeof(int64_t), in_key_cmp);
+            int64_t nk = 0;
+            for (int64_t j = 0; j < ic->sv_len; j++)
+                if (nk == 0 || keys[nk - 1] != keys[j]) keys[nk++] = keys[j];
+            f->keys = keys;
+            f->nkeys = (int)nk;
+            f->has_zero = src->type == RAY_SYM && nk > 0 && keys[0] == 0;
+            /* a SYM view's id-0 rows answer (0 in set) ^ negate, as the
+             * verdict LUT and the unchecked loop do; the null-checked
+             * loop passes them as 0, so it takes views without them */
+            f->sym_view_ok = ic->symlut || !ic->col_has_nulls;
+        }
+    }
+    if (ic->use_double && ic->sv_len <= INT32_MAX) {
+        double* fkeys = ic->sv_len <= 32 ? fstack : (double*)ray_alloc_raw((size_t)ic->sv_len * sizeof(double));
+        if (fkeys) {
+            int64_t nk = 0;
+            for (int64_t j = 0; j < ic->sv_len; j++)
+                if (ic->svf[j] == ic->svf[j]) fkeys[nk++] = ic->svf[j];   /* a NaN member matches nothing */
+            qsort(fkeys, (size_t)nk, sizeof(double), in_fkey_cmp);
+            f->fkeys = fkeys;
+            f->nfkeys = (int)nk;
+            f->col_float = src->type == RAY_F32 || src->type == RAY_F64;
+        }
+    }
+}
+
+static void in_rfill_free(in_sel_rfill_ctx_t* f, int64_t* kstack, double* fstack) {
+    if (f->keys && f->keys != kstack) ray_free_raw((void*)f->keys);
+    if (f->fkeys && f->fkeys != fstack) ray_free_raw((void*)f->fkeys);
+    f->keys = NULL; f->fkeys = NULL;
+}
+
+/* One segment of a parted `in` selection: its own bound source and probe
+ * (a SYM segment translates the set into its own domain, an integer DICT
+ * segment's views decide on its own dictionary), read in place when ready
+ * (a plain segment, or a published materialization) and by range
+ * otherwise. */
+typedef struct {
+    ray_col_src_t      src;
+    bool               bound, ready;
+    in_worker_ctx_t    ic;
+    ray_t*             sv_hdr;
+    ray_t*             lut_hdr;
+    double             svf_stack[32];
+    int64_t            svi_stack[32];
+    int64_t            kstack[32];
+    double             fstack[32];
+    in_sel_fill_ctx_t  f;
+    in_sel_rfill_ctx_t rf;
+} in_seg_sel_t;
+
+typedef struct {
+    in_seg_sel_t*  segs;
+    const int64_t* off;      /* segment i: rows [off[i], off[i + 1]) */
+    int64_t        n_segs;
+    /* An installed selection the result is ANDed with (a later conjunct),
+     * or NULL: its morsel flags, offsets and ids. */
+    const uint8_t*  wflags;
+    const uint32_t* woff;
+    const uint16_t* widx;
+} in_sel_parted_ctx_t;
+
+/* Rows [start, start + n) of a parted table (one morsel: pred_sel_drive
+ * fills morsel by morsel): each piece inside one segment goes to that
+ * segment's fill at segment-local rows (a morsel straddling a segment
+ * boundary is cut there).  Under an installed selection a morsel it drops
+ * is not read, and a mixed one keeps only its own rows. */
+static void in_sel_parted_fill(void* vctx, ray_col_scratch_t* sc, int64_t start, int64_t n, uint8_t* out) {
+    const in_sel_parted_ctx_t* c = (const in_sel_parted_ctx_t*)vctx;
+    const int64_t ms = start / RAY_MORSEL_ELEMS;
+    if (c->wflags && c->wflags[ms] == RAY_SEL_NONE) { memset(out, 0, (size_t)n); return; }
+    int64_t r = start;
+    const int64_t end = start + n;
+    while (r < end) {
+        int64_t lo = 0, hi = c->n_segs - 1;          /* the last i with off[i] <= r: never empty */
+        while (lo < hi) { int64_t mid = lo + (hi - lo + 1) / 2; if (c->off[mid] <= r) lo = mid; else hi = mid - 1; }
+        in_seg_sel_t* s = &c->segs[lo];
+        int64_t e = c->off[lo + 1] < end ? c->off[lo + 1] : end;
+        if (s->ready) in_sel_fill(&s->f, sc, r - c->off[lo], e - r, out + (r - start));
+        else          in_sel_rfill(&s->rf, sc, r - c->off[lo], e - r, out + (r - start));
+        r = e;
+    }
+    if (c->wflags && c->wflags[ms] == RAY_SEL_MIX) {
+        uint8_t keep[RAY_MORSEL_ELEMS];
+        memset(keep, 0, sizeof keep);
+        for (uint32_t j = c->woff[ms]; j < c->woff[ms + 1]; j++)
+            if (c->widx[j] < n) keep[c->widx[j]] = 1;
+        for (int64_t i = 0; i < n; i++) out[i] &= keep[i];
+    }
+}
+
+static void in_seg_sel_free(in_seg_sel_t* segs, int64_t n) {
+    for (int64_t i = 0; i < n; i++) {
+        in_seg_sel_t* s = &segs[i];
+        if (!s->ready) in_rfill_free(&s->rf, s->kstack, s->fstack);
+        if (s->sv_hdr) ray_free(s->sv_hdr);
+        if (s->lut_hdr) ray_free(s->lut_hdr);
+        if (s->bound) ray_col_src_release(&s->src);
+    }
+    ray_free_raw(segs);
+}
+
+/* exec_in_to_selection over a generation-2 parted column (src, bound over
+ * the RAY_ENCCOL parted object): the segments evaluated each by its own
+ * source and probe, as the single-file path reads one, into one selection
+ * over the table's rows; the column is never materialized.  A generation-0
+ * parted wrapper is not taken (its route is unchanged).  With `within` (a
+ * selection over the same rows, borrowed) the result is its AND with that
+ * one.  NULL (the caller's fallback) for a shape a segment declines (STR,
+ * GUID), an owned error, or the selection. */
+static ray_t* in_sel_parted(ray_col_src_t* src, ray_t* set_lit, bool negate, int64_t nrows, ray_t* within,
+                            bool* all_pass) {
+    *all_pass = false;
+    if (!src->obj || src->obj->type != RAY_ENCCOL) return NULL;
+    int64_t ns = 0; ray_t** segv = NULL; const int64_t* off = NULL; ray_t* err = NULL;
+    if (!ray_col_src_parted_segs(src, &ns, &segv, &off, &err)) return err;
+    if (ns <= 0 || off[ns] != nrows) return NULL;
+    in_seg_sel_t* segs = (in_seg_sel_t*)ray_calloc_raw((size_t)ns * sizeof(in_seg_sel_t));
+    if (!segs) return NULL;
+    ray_scan_fail_t fail; ray_scan_fail_init(&fail);
+    for (int64_t i = 0; i < ns; i++) {
+        in_seg_sel_t* s = &segs[i];
+        if (off[i + 1] == off[i]) { s->ready = true; continue; }   /* empty: never filled */
+        ray_t* be = ray_col_src_bind(segv[i], &s->src);
+        if (be) { ray_error_free(be); in_seg_sel_free(segs, ns); return NULL; }
+        s->bound = true;
+        if (s->src.parted || s->src.len != off[i + 1] - off[i]) { in_seg_sel_free(segs, ns); return NULL; }
+        ray_t* col = ray_col_src_ready(&s->src);
+        in_ctx_status_t st;
+        if (col) {
+            if (ray_is_atom(col) || RAY_IS_PARTED(col->type)) { in_seg_sel_free(segs, ns); return NULL; }
+            s->ready = true;
+            st = in_build_worker_ctx(col, set_lit, negate, s->svf_stack, s->svi_stack, &s->ic, &s->sv_hdr, &s->lut_hdr);
+            s->f.ic = &s->ic;
+        } else {
+            st = in_build_worker_ctx_meta(s->src.type, s->src.attrs, s->src.may_null, s->src.dom, set_lit, negate,
+                                          s->svf_stack, s->svi_stack, &s->ic, &s->sv_hdr, &s->lut_hdr);
+            if (st == IN_CTX_OK) {
+                in_rfill_setup(&s->rf, &s->ic, &s->src, &fail, negate, s->kstack, s->fstack);
+                s->rf.key_base = off[i];
+                ray_col_src_advise(&s->src, 0, s->src.len);
+            }
+        }
+        if (st != IN_CTX_OK) { s->ready = true; in_seg_sel_free(segs, ns); return NULL; }   /* STR / GUID / OOM */
+    }
+    in_sel_parted_ctx_t pc = { segs, off, ns, NULL, NULL, NULL };
+    if (within) {
+        ray_rowsel_t* wm = ray_rowsel_meta(within);
+        if (!wm || wm->nrows != nrows) { in_seg_sel_free(segs, ns); return NULL; }
+        pc.wflags = ray_rowsel_flags(within);
+        pc.woff = ray_rowsel_offsets(within);
+        pc.widx = ray_rowsel_idx(within);
+    }
+    ray_t* sel = pred_sel_drive(nrows, in_sel_parted_fill, &pc, &fail, all_pass);
+    in_seg_sel_free(segs, ns);
+    return sel;
+}
+
+/* A parted `in` / `not in` filter's selection, for a FILTER that already
+ * holds one (a later conjunct): the generation-2 route above, or NULL when
+ * it is not taken (any other column keeps the bool path). */
+static ray_t* exec_in_parted_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows, ray_t* within,
+                                       bool* all_pass);
 
 ray_t* exec_in_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
                             bool* all_pass) {
@@ -1809,8 +1988,8 @@ ray_t* exec_in_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
     memcpy(&stored_table_id, le->base.pad, sizeof(uint16_t));
     if (stored_table_id != 0 || !g->table) return NULL;   /* default table only, as idx_filter_in_decode */
     ray_col_meta_t m;
-    if (!ray_table_col_meta(g->table, le->sym, &m) || RAY_IS_PARTED(m.type) ||
-        m.type == RAY_MAPCOMMON) return NULL;
+    if (!ray_table_col_meta(g->table, le->sym, &m) || m.type == RAY_MAPCOMMON) return NULL;
+    if (RAY_IS_PARTED(m.type)) return exec_in_parted_selection(g, pred, nrows, NULL, all_pass);
     if (ray_col_bind_declines(g->table, le->sym)) return NULL;
     ray_t* berr = NULL;
     ray_col_src_t* src = ray_graph_bind_col(g, g->table, le->sym, &berr);
@@ -1840,50 +2019,42 @@ ray_t* exec_in_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
                                      &ic, &sv_hdr, &lut_hdr) != IN_CTX_OK)
             return NULL;  /* STR / GUID / OOM → bool-path fallback */
         ray_col_src_advise(src, 0, nrows);
-        in_sel_rfill_ctx_t fctx = { .ic = &ic, .src = src, .fail = &fail, .negate = negate };
-        /* membership bounds: the probe values sorted once (integer and SYM
-         * columns as int64; a float column or set as doubles) */
+        in_sel_rfill_ctx_t fctx;
         int64_t kstack[32];
-        int64_t* keys = NULL;
-        if (!ic.use_double && ic.sv_len <= INT32_MAX) {
-            keys = ic.sv_len <= 32 ? kstack : (int64_t*)ray_alloc_raw((size_t)ic.sv_len * sizeof(int64_t));
-            if (keys) {
-                if (ic.sv_len) memcpy(keys, ic.svi, (size_t)ic.sv_len * sizeof(int64_t));
-                qsort(keys, (size_t)ic.sv_len, sizeof(int64_t), in_key_cmp);
-                int64_t nk = 0;
-                for (int64_t j = 0; j < ic.sv_len; j++)
-                    if (nk == 0 || keys[nk - 1] != keys[j]) keys[nk++] = keys[j];
-                fctx.keys = keys;
-                fctx.nkeys = (int)nk;
-                fctx.has_zero = src->type == RAY_SYM && nk > 0 && keys[0] == 0;
-                /* a SYM view's id-0 rows answer (0 in set) ^ negate, as the
-                 * verdict LUT and the unchecked loop do; the null-checked
-                 * loop passes them as 0, so it takes views without them */
-                fctx.sym_view_ok = ic.symlut || !ic.col_has_nulls;
-            }
-        }
         double fstack[32];
-        double* fkeys = NULL;
-        if (ic.use_double && ic.sv_len <= INT32_MAX) {
-            fkeys = ic.sv_len <= 32 ? fstack : (double*)ray_alloc_raw((size_t)ic.sv_len * sizeof(double));
-            if (fkeys) {
-                int64_t nk = 0;
-                for (int64_t j = 0; j < ic.sv_len; j++)
-                    if (ic.svf[j] == ic.svf[j]) fkeys[nk++] = ic.svf[j];   /* a NaN member matches nothing */
-                qsort(fkeys, (size_t)nk, sizeof(double), in_fkey_cmp);
-                fctx.fkeys = fkeys;
-                fctx.nfkeys = (int)nk;
-                fctx.col_float = src->type == RAY_F32 || src->type == RAY_F64;
-            }
-        }
+        in_rfill_setup(&fctx, &ic, src, &fail, negate, kstack, fstack);
         sel = pred_sel_drive(nrows, in_sel_rfill, &fctx, &fail, all_pass);
-        if (keys && keys != kstack) ray_free_raw(keys);
-        if (fkeys && fkeys != fstack) ray_free_raw(fkeys);
+        in_rfill_free(&fctx, kstack, fstack);
     }
 
     if (sv_hdr) ray_free(sv_hdr);
     if (lut_hdr) ray_free(lut_hdr);
     return sel;
+}
+
+static ray_t* exec_in_parted_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows, ray_t* within,
+                                       bool* all_pass) {
+    *all_pass = false;
+    if (!g || !g->table || !pred || nrows <= 0) return NULL;
+    if ((pred->opcode != OP_IN && pred->opcode != OP_NOT_IN) || pred->arity != 2) return NULL;
+    ray_op_t* lhs = op_child(g, pred, 0);
+    ray_op_t* rhs = op_child(g, pred, 1);
+    if (!lhs || lhs->opcode != OP_SCAN || !rhs || rhs->opcode != OP_CONST) return NULL;
+    ray_op_ext_t* le = find_ext(g, lhs->id);
+    ray_op_ext_t* re = find_ext(g, rhs->id);
+    if (!le || !re || !re->literal) return NULL;
+    uint16_t stored_table_id = 0;
+    memcpy(&stored_table_id, le->base.pad, sizeof(uint16_t));
+    if (stored_table_id != 0) return NULL;
+    ray_col_meta_t m;
+    /* generation 2 only: a generation-0 parted column is never bound here */
+    if (!ray_table_col_meta(g->table, le->sym, &m) || !RAY_IS_PARTED(m.type) || !m.enc) return NULL;
+    if (ray_col_bind_declines(g->table, le->sym)) return NULL;
+    ray_t* berr = NULL;
+    ray_col_src_t* src = ray_graph_bind_col(g, g->table, le->sym, &berr);
+    if (berr) return berr;
+    if (!src || !src->parted || src->len != nrows) return NULL;
+    return in_sel_parted(src, re->literal, pred->opcode == OP_NOT_IN, nrows, within, all_pass);
 }
 
 static int idx_filter_decode(ray_graph_t* g, ray_op_t* pred_op, unsigned want,
@@ -3648,6 +3819,22 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                             ray_release(sub);   /* all-pass retain */
                         }
                     }
+                }
+            }
+
+            /* A later `in` conjunct over a generation-2 parted column: read
+             * segment by segment over the morsels the installed selection
+             * keeps, ANDed with it (exec_in_parted_selection), instead of a
+             * bool vector over the column read whole. */
+            if (input->type == RAY_TABLE && g->selection && input == g->table) {
+                bool in_all = false;
+                ray_t* isel = exec_in_parted_selection(g, op_child(g, op, 1), ray_table_nrows(input),
+                                                       g->selection, &in_all);
+                if (isel && RAY_IS_ERR(isel)) { ray_release(input); return isel; }
+                if (isel || in_all) {
+                    ray_rowsel_release(g->selection);
+                    g->selection = isel;               /* NULL: every row passes both */
+                    return input;
                 }
             }
 

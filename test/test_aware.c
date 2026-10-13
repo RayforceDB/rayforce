@@ -4865,12 +4865,6 @@ static test_result_t test_cross_segment_codes(void) {
         "(select {v: v from: (.db.parted.get \"" AW_TMP "/%s\" 't) where: (in x [3 -997])})",
         NULL,
     };
-    /* Materializations on generation 2.  An `in` filter over a parted table
-     * is not fused: exec_node's OP_IN evaluates its OP_SCAN child, and
-     * ray_table_col reads the parted x whole (enc_materialize_parted, one
-     * per partition).  The ledger carries this route to the Task 14 audit
-     * (not a ClickBench route); the answer is still compared. */
-    static const uint64_t want_mat[] = { 0, 0, 0, 2 };
     for (int i = 0; qs[i]; i++) {
         char a[512], b[512];
         snprintf(a, sizeof a, qs[i], "csq"); snprintf(b, sizeof b, qs[i], "csp");
@@ -4879,15 +4873,75 @@ static test_result_t test_cross_segment_codes(void) {
         ray_t* y = aw_eval(b);
         ray_enc_counters_t k; ray_enc_counters_get(&k);
         TEST_ASSERT_TRUE(x && y && !RAY_IS_ERR(x) && !RAY_IS_ERR(y));
-        TEST_ASSERT_FMT(k.materialized == want_mat[i], "query %d materialized %llu, want %llu", i,
-                        (unsigned long long)k.materialized, (unsigned long long)want_mat[i]);
+        TEST_ASSERT_FMT(k.materialized == 0, "query %d materialized %llu", i, (unsigned long long)k.materialized);
         /* `5` matches 1750 rows of partition 0, `< -990` 17500 of partition
-         * 1: equal counts of zero would pin nothing */
+         * 1: equal counts of zero would pin nothing (checked on the
+         * generation-0 answer; the generation-2 one equals it below) */
         if (i < 2) TEST_ASSERT_FMT(x->i64 == (i ? 17500 : 1750), "query %d counted %lld", i, (long long)x->i64);
         ray_t* fx = ray_fmt(x, 0); ray_t* fy = ray_fmt(y, 0);
         TEST_ASSERT_FMT(ray_str_len(fx) == ray_str_len(fy) && memcmp(ray_str_ptr(fx), ray_str_ptr(fy), ray_str_len(fx)) == 0, "query %d", i);
         ray_release(fx); ray_release(fy); ray_release(x); ray_release(y);
     }
+    PASS();
+}
+
+/* A parted `in` / `not in` filter over generation 2 reads each segment by
+ * range through its own source and probe (exec_in_parted_selection), at
+ * any position in the where: chain: first (the fused selection), later
+ * (intersected with the selection installed), after a selective `==` (the
+ * survivors' compact), grouped and row-returning.  Three partitions of
+ * 70000 rows (segments end inside a morsel); x's values differ per
+ * partition; nullable integer, SYM and F64 columns.  Answers equal
+ * generation 0's; nothing materializes. */
+static test_result_t test_parted_in(void) {
+    for (int gen = 0; gen <= 2; gen += 2)
+        for (int p = 0; p < 3; p++) {
+            char q[1600];
+            snprintf(q, sizeof q,
+                     "(.db.splayed.set \"" AW_TMP "/pi%d/2024.01.0%d/t/\" (table [k x v s f] (list (+ (til 70000) %d) "
+                     "(as 'I32 (- (%% (til 70000) 40) %d)) "
+                     "(as 'I32 (map (fn [j] (if (== 0 (%% j 9)) 0N (%% j 1000))) (til 70000))) "
+                     "(take ['a 'b 'c 'd 'e] 70000) (as 'F64 (%% (til 70000) 50)))) "
+                     "\"" AW_TMP "/pi%d/.sym\" {compress: %s})",
+                     gen, p + 1, p * 70000, p * 500, gen, gen ? "true" : "false");
+            aw_eval_ok(q);
+        }
+    static const char* const qs[] = {
+        "(select {from: T where: (in x [3 -497 -980 5])})",                              /* first, row-returning */
+        "(count (select {from: T where: (not-in x [3 -497 -980 5])}))",
+        "(select {c: (count k) s: (sum v) from: T where: (and (> v 10) (in x [3 -497 -980])) by: x asc: x})",   /* second, grouped */
+        "(select {c: (count k) from: T where: (and (> v 10) (in x [3 -497]) (< v 900)) by: s asc: s})",          /* middle */
+        "(select {c: (count k) from: T where: (and (> v 10) (not-in x [3 -497 -998]) (< v 900))})",
+        "(select {k: k v: v from: T where: (and (== k 70005) (in x [5 -495 -1000]))})",   /* after a selective == */
+        "(select {c: (count k) from: T where: (in v [1 2 3 9 500])})",                    /* nullable column */
+        "(select {c: (count k) from: T where: (not-in v [1 2 3 9 500])})",
+        "(select {c: (count k) from: T where: (and (> k 1000) (in s ['a 'c])) by: s asc: s})",
+        "(select {c: (count k) from: T where: (not-in s ['a 'c])})",
+        "(select {c: (count k) from: T where: (and (> k 1000) (in f [1.0 7.0 -0.0]))})",
+        "(select {c: (count k) from: T where: (in x [12345])})",                          /* matches nothing */
+        "(select {c: (count k) from: T where: (and (> k 1000) (not-in x [100000]))})",    /* every row */
+        NULL,
+    };
+    for (int i = 0; qs[i]; i++) {
+        ray_t* out[2];
+        for (int gen = 0; gen <= 2; gen += 2) {
+            char b[256];
+            snprintf(b, sizeof b, "(set T (.db.parted.get \"" AW_TMP "/pi%d\" 't))", gen);
+            aw_eval_ok(b);
+            ray_enc_counters_reset();
+            out[gen / 2] = ray_eval_str(qs[i]);
+            TEST_ASSERT_FMT(out[gen / 2] && !RAY_IS_ERR(out[gen / 2]), "%s gen %d: %s", qs[i], gen, ray_error_msg());
+            if (gen) {
+                ray_enc_counters_t k; ray_enc_counters_get(&k);
+                TEST_ASSERT_FMT(k.materialized == 0, "%s: %llu materializations", qs[i], (unsigned long long)k.materialized);
+            }
+        }
+        ray_t* fa = ray_fmt(out[0], 0); ray_t* fb = ray_fmt(out[1], 0);
+        TEST_ASSERT_FMT(ray_str_len(fa) == ray_str_len(fb) && memcmp(ray_str_ptr(fa), ray_str_ptr(fb), ray_str_len(fa)) == 0,
+                        "%s differs", qs[i]);
+        ray_release(fa); ray_release(fb); ray_release(out[0]); ray_release(out[1]);
+    }
+    aw_eval_ok("(set T 0)");
     PASS();
 }
 
@@ -4973,5 +5027,6 @@ const test_entry_t aware_entries[] = {
     { "aware/gate_materialization", test_gate_materialization, aw_setup, aw_teardown },
     { "aware/gate_decoded_bytes",   test_gate_decoded_bytes,   aw_setup, aw_teardown },
     { "aware/cross_segment_codes",  test_cross_segment_codes,  aw_setup, aw_teardown },
+    { "aware/parted_in",            test_parted_in,            aw_setup, aw_teardown },
     { NULL, NULL, NULL, NULL },
 };

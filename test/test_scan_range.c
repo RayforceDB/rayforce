@@ -5775,6 +5775,11 @@ static const char* const sr_clickbench_scan[] = {
     SR_COMPACT_GROUP,
     /* a conjunctive where: is counted off its selection (Task 15b) */
     SR_AND_COUNT,
+    /* q41: TraficSourceID IN (-1, 6) later in a chain of == conjuncts: on a
+     * parted table the `in` conjunct reads each segment by range and is
+     * intersected with the selection (exec_in_parted_selection, P3 Task 12) */
+    "(select {h: h d: d c: (count h) from: T where: (and (== g 3) (>= d 100) (<= d 400) (== b false) "
+    "(in u [1 6]) (!= h 0)) by: {h: h d: d} desc: c take: 10})",                         /* q41 */
     NULL,
 };
 
@@ -5890,6 +5895,11 @@ static test_result_t test_no_materialization_parted(void) {
         "(select {s: (sum v) c: (count k) from: T by: g})",
         "(select {c: (count k) from: T where: (> v 100) by: {g: g s: s}})",
         "(select {c: (count k) from: T by: k})",
+        /* q41's `in` conjunct where the optimizer puts it first, and after a
+         * conjunct that keeps most rows (the chain's full-width step):
+         * each segment by range (exec_in_parted_selection, P3 Task 12) */
+        "(count (select {from: T where: (in u [1 6])}))",
+        "(select {c: (count h) from: T where: (and (!= g 0) (in u [1 6])) by: d desc: c take: 10})",
         NULL,
     };
     const char* t0 = SR_NP0;
