@@ -1,0 +1,66 @@
+;; @requires: posix  (cleanup runs through a POSIX shell via .sys.exec)
+;; Compressed-columns P3: the encoding-aware operator paths over a
+;; generation-2 splayed table answer exactly as over the generation-0 copy
+;; of the same data.  The P2 scan shapes (compress_scan.rfl) carry, plus the
+;; shapes P3 reads on codes, statistics, views and point reads.
+(.sys.exec "rm -rf /tmp/rf_test_caware") -- 0
+(set i (til 150000))
+(set T (table [k g v d s e b u h n w t] (list i (as 'I16 (% i 9)) (as 'I32 (map (fn [j] (if (== 0 (% j 11)) 0N j)) i)) (as 'DATE (% i 900)) (take ['x 'y 'z] 150000) (as 'SYM (take ["p" "" "q" "r"] 150000)) (== 0 (% i 3)) (as 'U8 (% i 200)) (% (* i 7919) 1000003) (map (fn [j] (if (== 0 (% j 7)) 0N (% (* j 31) 1009))) i) (take [9223372036854775807 -9223372036854775807 9223372036854775806 -9223372036854775806 1] 150000) (map (fn [j] (format "text %" (% j 333))) i))))
+(.db.splayed.set "/tmp/rf_test_caware/g2/" T {compress: true})
+(.db.splayed.set "/tmp/rf_test_caware/g0/" T {compress: false})
+(set A (.db.splayed.get "/tmp/rf_test_caware/g2/"))
+(set B (.db.splayed.get "/tmp/rf_test_caware/g0/"))
+(at (.idx.info A 'k) 'gen) -- 2
+(at (.idx.info B 'k) 'gen) -- 0
+;; the P2 scan shapes
+(count (select {from: A where: (> v 70000)})) -- (count (select {from: B where: (> v 70000)}))
+(count (select {from: A where: (== g 4)})) -- (count (select {from: B where: (== g 4)}))
+(sum (at A 'v)) -- (sum (at B 'v))
+(min (at A 'k)) -- (min (at B 'k))
+(select {s: (sum v) from: A by: g}) -- (select {s: (sum v) from: B by: g})
+(select {c: (count k) from: A where: (== s 'y) by: g}) -- (select {c: (count k) from: B where: (== s 'y) by: g})
+(select {k: k from: A where: (> v 100) desc: k take: 3}) -- (select {k: k from: B where: (> v 100) desc: k take: 3})
+;; SYM != against "" on a column with "" rows (e) and without (s)
+(count (select {from: A where: (!= e "")})) -- (count (select {from: B where: (!= e "")}))
+(count (select {from: A where: (!= s "")})) -- (count (select {from: B where: (!= s "")}))
+(select {c: (count k) from: A where: (!= e "") by: e asc: e}) -- (select {c: (count k) from: B where: (!= e "") by: e asc: e})
+;; == "" and != "" on a SYM column with and without "" rows
+(count (select {from: A where: (== e "")})) -- (count (select {from: B where: (== e "")}))
+(count (select {from: A where: (== s "")})) -- (count (select {from: B where: (== s "")}))
+(select {k: k e: e from: A where: (== e "") take: 5}) -- (select {k: k e: e from: B where: (== e "") take: 5})
+(select {s: (sum u) from: A where: (and (!= e "") (!= s ""))}) -- (select {s: (sum u) from: B where: (and (!= e "") (!= s ""))})
+;; in / not in on integer columns
+(count (select {from: A where: (in g [1 4 7])})) -- (count (select {from: B where: (in g [1 4 7])}))
+(count (select {from: A where: (in h [0 7919 15838 999999])})) -- (count (select {from: B where: (in h [0 7919 15838 999999])}))
+(count (select {from: A where: (not-in u [0 1 2 199])})) -- (count (select {from: B where: (not-in u [0 1 2 199])}))
+(select {c: (count k) from: A where: (in v [11 12 13 22 70001]) by: g}) -- (select {c: (count k) from: B where: (in v [11 12 13 22 70001]) by: g})
+;; sum and avg at the I64 extremes
+(sum (at A 'w)) -- (sum (at B 'w))
+(avg (at A 'w)) -- (avg (at B 'w))
+(select {s: (sum w) a: (avg w) mn: (min w) mx: (max w) from: A}) -- (select {s: (sum w) a: (avg w) mn: (min w) mx: (max w) from: B})
+(select {s: (sum w) a: (avg w) from: A where: (< g 4)}) -- (select {s: (sum w) a: (avg w) from: B where: (< g 4)})
+(select {s: (sum w) a: (avg w) from: A by: g}) -- (select {s: (sum w) a: (avg w) from: B by: g})
+;; top-k over a nullable key, both directions
+(select {k: k n: n from: A desc: n take: 5}) -- (select {k: k n: n from: B desc: n take: 5})
+(select {k: k n: n from: A asc: n take: 5}) -- (select {k: k n: n from: B asc: n take: 5})
+(select {k: k n: n from: A where: (> g 2) desc: n take: 7}) -- (select {k: k n: n from: B where: (> g 2) desc: n take: 7})
+(select {k: k n: n from: A where: (> g 2) asc: n take: 7}) -- (select {k: k n: n from: B where: (> g 2) asc: n take: 7})
+(select {k: k v: v from: A asc: v take: 4}) -- (select {k: k v: v from: B asc: v take: 4})
+(select {k: k v: v from: A desc: v take: 4}) -- (select {k: k v: v from: B desc: v take: 4})
+;; a STR group key
+(select {c: (count k) from: A by: t asc: t}) -- (select {c: (count k) from: B by: t asc: t})
+(select {c: (count k) s: (sum v) from: A where: (< g 3) by: t}) -- (select {c: (count k) s: (sum v) from: B where: (< g 3) by: t})
+;; the ClickBench-shaped P2 carries: q2, q8, q18, q39, q42
+(count (select {from: A where: (!= u 0)})) -- (count (select {from: B where: (!= u 0)}))
+(select {u: u c: (count u) from: A where: (!= u 0) by: u desc: c take: 10}) -- (select {u: u c: (count u) from: B where: (!= u 0) by: u desc: c take: 10})
+(select {c: (count h) from: A by: {h: h s: s} take: 10}) -- (select {c: (count h) from: B by: {h: h s: s} take: 10})
+(take (select {s: s p: (count s) from: A where: (and (== g 3) (>= d 100) (<= d 400) (== b false) (!= u 0)) by: s desc: p take: 1010}) -10) -- (take (select {s: s p: (count s) from: B where: (and (== g 3) (>= d 100) (<= d 400) (== b false) (!= u 0)) by: s desc: p take: 1010}) -10)
+(select {n: (count u) from: A where: (and (== s 'z) (>= d 100) (<= d 130) (== b false)) by: {u: u g: g} desc: n take: 10}) -- (select {n: (count u) from: B where: (and (== s 'z) (>= d 100) (<= d 130) (== b false)) by: {u: u g: g} desc: n take: 10})
+;; nothing above read these columns whole
+(at (.idx.info A 'g) 'materialized) -- false
+(at (.idx.info A 'u) 'materialized) -- false
+(at (.idx.info A 'd) 'materialized) -- false
+(at (.idx.info A 's) 'materialized) -- false
+(at (.idx.info A 'e) 'materialized) -- false
+(at (.idx.info A 'w) 'materialized) -- false
+(.sys.exec "rm -rf /tmp/rf_test_caware") -- 0

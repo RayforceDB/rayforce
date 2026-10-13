@@ -4781,6 +4781,114 @@ static test_result_t test_pool_clamp(void) {
     PASS();
 }
 
+/* ---- Task 12: the P3 gate --------------------------------------------- */
+
+/* P3 gate: filtered, rowsel-gather and aggregate shapes, planning included. */
+static test_result_t test_gate_materialization(void) {
+    aw_save("gm", AW_WIDE, -1);
+    static const char* const q[] = {
+        "(select {from: T where: (and (>= k 1000) (< k 3000))})",                   /* filter + gather */
+        "(select {k: k t: t from: T where: (== s 'b) take: 9})",                    /* SYM equality + take */
+        "(select {s: (sum v) a: (avg v) c: (count k) from: T where: (< g 3)})",     /* aggregates under a filter */
+        "(select {c: (count k) from: T where: (!= s 'a) by: g})",
+        "(select {c: (count k) from: T by: t})",                                    /* STR key */
+        "(sum (at T 'v))",
+        NULL,
+    };
+    for (int i = 0; q[i]; i++) AW_SAME("gm", q[i], 0);
+    AW_SAME("gm", "(select {t: t from: T where: (> v 10) desc: v take: 3})", 1);   /* top-k: only the sort key */
+    /* A STR input to a scalar aggregate under a filter is the audited
+     * whole-column class "unstage: scalar holistic or wide input": the
+     * scalar route (exec_group_run, n_keys == 0) streams only the types
+     * scalar_stageable admits, and agg_unstage reads t whole.  The zero
+     * shape above counts k; this one pins t's one materialization. */
+    AW_SAME("gm", "(select {s: (sum v) a: (avg v) c: (count t) from: T where: (< g 3)})", 1);
+    PASS();
+}
+
+/* Decoded bytes: zero where statistics or codes answer, exact otherwise. */
+static test_result_t test_gate_decoded_bytes(void) {
+    aw_save("gd", "(table [k x] (list (til 70000) (as 'I32 (% (til 70000) 50))))", RAY_ENC_FOR_BP);
+    test_result_t r;
+    if ((r = aw_reduce("gd", "(select {c: (count k) from: T where: (== x 7)})", 0)).status != TEST_PASS) return r;
+    if ((r = aw_reduce("gd", "(select {s: (sum x) from: T})", 0)).status != TEST_PASS) return r;
+    /* k's leaf runs on FOR_BP.  10 selected rows in x's vector 0 are under
+     * the FOR_BP point-read limit (RAY_ENC_VEC/32, Task 6b's D2), so they
+     * are read in place and nothing decodes; 100 rows are over it, so x's
+     * vector 0 (1024 I32 rows) is decoded and gathered. */
+    if ((r = aw_reduce("gd", "(select {x: x from: T where: (< k 10)})", 0)).status != TEST_PASS) return r;
+    if ((r = aw_reduce("gd", "(select {x: x from: T where: (< k 100)})", 1024 * 4)).status != TEST_PASS) return r;
+    PASS();
+}
+
+/* Cross-segment codes: integer VALUE_DICT per partition, the same value
+ * under different codes and the same code for different values. */
+static test_result_t test_cross_segment_codes(void) {
+    for (int p = 0; p < 2; p++) {
+        char q[600];
+        /* v repeats within 997 values: every column of the table is forced
+         * to DICT, and the chunk-0 dictionary (65536 entries at most) must
+         * cover chunk 1's values */
+        snprintf(q, sizeof q, "(table [x v] (list (as 'I32 %s) (%% (til 70000) 997)))",
+                 p ? "(- (% (til 70000) 40) 1000)" : "(% (til 70000) 40)");   /* -1000..-961 / 0..39 */
+        char name[16]; snprintf(name, sizeof name, "cs%d", p);
+        aw_save(name, q, RAY_ENC_DICT);
+    }
+    /* assemble both generation-2 tables as partitions of one parted table */
+    ray_encw_test_force(RAY_ENC_DICT);          /* the re-encode keeps each partition's own VALUE_DICT */
+    aw_eval_ok("(.db.splayed.set \"" AW_TMP "/csp/2024.01.01/t/\" (.db.splayed.get \"" AW_TMP "/cs02/\") \"" AW_TMP "/csp/.sym\")");
+    aw_eval_ok("(.db.splayed.set \"" AW_TMP "/csp/2024.01.02/t/\" (.db.splayed.get \"" AW_TMP "/cs12/\") \"" AW_TMP "/csp/.sym\")");
+    ray_encw_test_force(-1);
+    aw_eval_ok("(.db.splayed.set \"" AW_TMP "/csq/2024.01.01/t/\" (.db.splayed.get \"" AW_TMP "/cs00/\") \"" AW_TMP "/csq/.sym\")");
+    aw_eval_ok("(.db.splayed.set \"" AW_TMP "/csq/2024.01.02/t/\" (.db.splayed.get \"" AW_TMP "/cs10/\") \"" AW_TMP "/csq/.sym\")");
+    /* the re-saves inherit generation 2 from their encoded sources, and
+     * generation 0 from their plain ones */
+    for (int gen = 0; gen <= 2; gen += 2) {
+        ray_t* g = aw_eval(gen ? "(at (.idx.info (.db.parted.get \"" AW_TMP "/csp\" 't) 'x) 'gen)"
+                               : "(at (.idx.info (.db.parted.get \"" AW_TMP "/csq\" 't) 'x) 'gen)");
+        TEST_ASSERT_FMT(g && !RAY_IS_ERR(g) && g->i64 == gen, "generation %d: %lld", gen,
+                        g && !RAY_IS_ERR(g) ? (long long)g->i64 : -1LL);
+        ray_release(g);
+    }
+    /* every vector of x in both partitions (2 x 69) is DICT over its own
+     * partition's dictionary */
+    ray_t* nd = aw_eval("(at (at (.idx.info (.db.parted.get \"" AW_TMP "/csp\" 't) 'x) 'enc) 'dict)");
+    TEST_ASSERT_FMT(nd && !RAY_IS_ERR(nd) && nd->i64 == 138, "DICT vectors: %lld",
+                    nd && !RAY_IS_ERR(nd) ? (long long)nd->i64 : -1LL);
+    ray_release(nd);
+    static const char* const qs[] = {
+        "(count (select {from: (.db.parted.get \"" AW_TMP "/%s\" 't) where: (== x 5)}))",
+        "(count (select {from: (.db.parted.get \"" AW_TMP "/%s\" 't) where: (< x -990)}))",
+        "(select {c: (count v) from: (.db.parted.get \"" AW_TMP "/%s\" 't) by: x asc: x})",
+        "(select {v: v from: (.db.parted.get \"" AW_TMP "/%s\" 't) where: (in x [3 -997])})",
+        NULL,
+    };
+    /* Materializations on generation 2.  An `in` filter over a parted table
+     * is not fused: exec_node's OP_IN evaluates its OP_SCAN child, and
+     * ray_table_col reads the parted x whole (enc_materialize_parted, one
+     * per partition).  The ledger carries this route to the Task 14 audit
+     * (not a ClickBench route); the answer is still compared. */
+    static const uint64_t want_mat[] = { 0, 0, 0, 2 };
+    for (int i = 0; qs[i]; i++) {
+        char a[512], b[512];
+        snprintf(a, sizeof a, qs[i], "csq"); snprintf(b, sizeof b, qs[i], "csp");
+        ray_t* x = aw_eval(a);
+        ray_enc_counters_reset();
+        ray_t* y = aw_eval(b);
+        ray_enc_counters_t k; ray_enc_counters_get(&k);
+        TEST_ASSERT_TRUE(x && y && !RAY_IS_ERR(x) && !RAY_IS_ERR(y));
+        TEST_ASSERT_FMT(k.materialized == want_mat[i], "query %d materialized %llu, want %llu", i,
+                        (unsigned long long)k.materialized, (unsigned long long)want_mat[i]);
+        /* `5` matches 1750 rows of partition 0, `< -990` 17500 of partition
+         * 1: equal counts of zero would pin nothing */
+        if (i < 2) TEST_ASSERT_FMT(x->i64 == (i ? 17500 : 1750), "query %d counted %lld", i, (long long)x->i64);
+        ray_t* fx = ray_fmt(x, 0); ray_t* fy = ray_fmt(y, 0);
+        TEST_ASSERT_FMT(ray_str_len(fx) == ray_str_len(fy) && memcmp(ray_str_ptr(fx), ray_str_ptr(fy), ray_str_len(fx)) == 0, "query %d", i);
+        ray_release(fx); ray_release(fy); ray_release(x); ray_release(y);
+    }
+    PASS();
+}
+
 const test_entry_t aware_entries[] = {
     { "aware/vview_encodings", test_vview_encodings, aw_setup, aw_teardown },
     { "aware/vview_near_top",  test_vview_near_top,  aw_setup, aw_teardown },
@@ -4860,5 +4968,8 @@ const test_entry_t aware_entries[] = {
     { "aware/group_topn_affine",   test_group_topn_affine,   aw_setup, aw_teardown },
     { "aware/group_affine_nulls",  test_group_affine_nulls,  aw_setup, aw_teardown },
     { "aware/str_key_domain",      test_str_key_domain,      aw_setup, aw_teardown },
+    { "aware/gate_materialization", test_gate_materialization, aw_setup, aw_teardown },
+    { "aware/gate_decoded_bytes",   test_gate_decoded_bytes,   aw_setup, aw_teardown },
+    { "aware/cross_segment_codes",  test_cross_segment_codes,  aw_setup, aw_teardown },
     { NULL, NULL, NULL, NULL },
 };

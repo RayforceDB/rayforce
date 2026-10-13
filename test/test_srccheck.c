@@ -320,6 +320,51 @@ static test_result_t test_no_table_decode_or_return(void) {
     PASS();
 }
 
+/* P3's gate (Task 12): the P3 random-access classes are gone, every one of
+ * those sites gathers by range, and none comes back: no audited class names
+ * a P3 deferral, and no `random:` marker in the source carries "(P3)". */
+static bool p3_marker_line(const char* line) {
+    for (const char* m = strstr(line, "random:"); m; m = strstr(m + 1, "random:")) {
+        const char* end = strstr(m, "*/");
+        const char* p3 = strstr(m, "(P3)");
+        if (p3 && (!end || p3 < end)) return true;
+    }
+    return false;
+}
+static void check_no_p3_markers(const char* p, const char* rel, srccheck_acc_t* acc) {
+    acc->nseen++;
+    if (strcmp(rel, "src/table/table.c") == 0) acc->saw_table = true;
+    FILE* f = fopen(p, "rb");
+    if (!f) return;
+    char line[4096]; int ln = 0;
+    while (fgets(line, sizeof line, f)) {
+        ln++;
+        if (!p3_marker_line(line)) continue;
+        if (!acc->nbad) snprintf(acc->bad, sizeof acc->bad, "%s:%d a (P3) random-access marker", rel, ln);
+        acc->nbad++;
+    }
+    fclose(f);
+}
+static test_result_t test_no_p3_markers(void) {
+    for (int i = 0; plain_classes[i]; i++)
+        TEST_ASSERT_FMT(!strstr(plain_classes[i], "(P3)"), "plain_classes names \"%s\"", plain_classes[i]);
+    /* the line check itself */
+    TEST_ASSERT_TRUE(p3_marker_line("x = ray_col_src_plain(s, &c);   /* random: top-k gather (P3) */"));
+    TEST_ASSERT_TRUE(p3_marker_line("/* ready-only */ y(); /* random: selection gather (P3) */"));
+    TEST_ASSERT_TRUE(p3_marker_line(" * random: a wide gather (P3), until the views land"));
+    TEST_ASSERT_FALSE(p3_marker_line("x = ray_col_src_plain(s, &c);   /* random: wide key */"));
+    TEST_ASSERT_FALSE(p3_marker_line("/* random: sort */ /* gathers by range since (P3) Task 6 */"));
+    TEST_ASSERT_FALSE(p3_marker_line("/* gathers by range since (P3) Task 6 */"));
+    struct stat st;
+    const char* root = stat("src/table/table.c", &st) == 0 ? "." : "..";
+    char dir[64]; snprintf(dir, sizeof dir, "%s/src", root);
+    srccheck_acc_t acc = { "", 0, 0, false };
+    walk(dir, "src", &acc, check_no_p3_markers);
+    TEST_ASSERT_FMT(acc.saw_table && acc.nseen > 50, "source tree not scanned (%d files)", acc.nseen);
+    TEST_ASSERT_FMT(acc.nbad == 0, "%s (%d lines)", acc.bad, acc.nbad);
+    PASS();
+}
+
 const test_entry_t srccheck_entries[] = {
     { "srccheck/no_legacy_getters", test_no_legacy_getters, NULL, NULL },
     { "srccheck/no_raw_column_list",  test_no_raw_column_list,  NULL, NULL },
@@ -330,5 +375,6 @@ const test_entry_t srccheck_entries[] = {
     { "srccheck/plain_marker_forms",         test_plain_marker_forms,         NULL, NULL },
     { "srccheck/no_table_decode_or_return",  test_no_table_decode_or_return,  NULL, NULL },
     { "srccheck/firstn_reads_by_range",      test_firstn_reads_by_range,      NULL, NULL },
+    { "srccheck/no_p3_markers",              test_no_p3_markers,              NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };

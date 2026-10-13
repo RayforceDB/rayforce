@@ -5737,8 +5737,10 @@ static test_result_t test_v2_forged_parted_segment(void) {
  * SCAN_ONLY), each written over the battery tables' columns with the same
  * operators, key widths and clauses: k and h stand for the I64 columns
  * (WatchID, UserID), v for the nullable I32 (ClientIP), g and u for the
- * narrow integers, d for EventDate and s for the SYM columns.  q18 and q39
- * are pinned in sr_gaps instead (q18 materialized its keys until P3 Task 6b). */
+ * narrow integers, d for EventDate and s for the SYM columns.  q18, q39,
+ * the compact fallback and the conjunctive count were pinned in sr_gaps
+ * until each stopped materializing (P3 Tasks 6 and 6b, Task 15b); the P3
+ * gate (Task 12) moved them here, at zero. */
 #define SR_Q18 "(select {c: (count h) from: T by: {h: h s: s} take: 10})"
 #define SR_Q35 "(select {one: 1 s: s c: (count s) from: T by: s desc: c take: 10})"
 #define SR_Q39 "(take (select {s: s p: (count s) from: T where: (and (== g 3) (>= d 100) (<= d 400) " \
@@ -5757,6 +5759,22 @@ static const char* const sr_clickbench_scan[] = {
     "(select {c: (count v) s: (sum g) a: (avg u) from: T by: {k: k v: v} desc: c take: 10})", /* q33 */
     "(select {s: s c: (count s) from: T by: s desc: c take: 10})",                        /* q34 */
     SR_Q35,                                                                               /* q35 */
+    /* q18: a group-by take without an order runs the first-n pre-pass
+     * (agg_first_n_run) over the keys' sources: rows read through task
+     * cursors, the sample point-read, the groups' rows gathered by range
+     * (P3 Task 6b); on a parted table in place over the segments */
+    SR_Q18,                                                                               /* q18 */
+    /* q39: the conjunction's later filter refines a selective first one by
+     * compacting its predicate column (exec_node OP_FILTER -> sel_compact),
+     * and the v2 group over fewer survivors than the parallel threshold
+     * compacts its key (AGG_RUN_COMPACT_FALLBACK -> agg_build_compact):
+     * both gather by range since P3 Task 6, per segment on a parted table */
+    SR_Q39,                                                                               /* q39 */
+    /* the v2 compact fallback alone: a filtered group-by under the parallel
+     * threshold gathers its key and input by range (agg_build_compact) */
+    SR_COMPACT_GROUP,
+    /* a conjunctive where: is counted off its selection (Task 15b) */
+    SR_AND_COUNT,
     NULL,
 };
 
@@ -5779,49 +5797,13 @@ static test_result_t sr_battery(const char* t0, const char* t2, const char* cons
     PASS();
 }
 
-/* Scan-only shapes that still materialize (the Task 15 report's gaps),
- * pinned at today's count so a fix or a regression shows here.  Each names
- * the route that gathers. */
+/* A shape and its materialization count on generation 2. */
 typedef struct { const char* q; uint64_t mat; } sr_gap_t;
-static const sr_gap_t sr_gaps[] = {
-    /* q18: a group-by take without an order runs the first-n pre-pass
-     * (agg_first_n_run) over the keys' sources: rows read through task
-     * cursors, the sample point-read, the groups' rows gathered by range
-     * (P3 Task 6b) */
-    { SR_Q18, 0 },
-    /* q39: the conjunction's later filter refines a selective first one by
-     * compacting its predicate column (exec_node OP_FILTER -> sel_compact),
-     * and the v2 group over fewer survivors than the parallel threshold
-     * compacts its key (AGG_RUN_COMPACT_FALLBACK -> agg_build_compact):
-     * both gather by range since P3 Task 6 */
-    { SR_Q39, 0 },
-    /* the v2 compact fallback alone: a filtered group-by under the parallel
-     * threshold gathers its key and input by range (agg_build_compact) */
-    { SR_COMPACT_GROUP, 0 },
-    /* a conjunctive where: is counted off its selection (Task 15b) */
-    { SR_AND_COUNT, 0 },
-    { NULL, 0 },
-};
-/* The parted arm's gaps (three partitions of eight columns).  q35's constant
- * output no longer flattens the table (Task 15b): it is in the scan-only
- * set. */
-static const sr_gap_t sr_gaps_parted[] = {
-    /* q18 runs the first-n passes in place over the parted sources (P3
-     * Task 6b; before, a flat copy), materializing nothing */
-    { SR_Q18, 0 },
-    /* q39: the filter refinement and the compact fallback, per segment,
-     * gather by range (P3 Task 6) */
-    { SR_Q39, 0 },
-    { SR_COMPACT_GROUP, 0 },
-    /* counted off the selection per segment, as on the splayed table */
-    { SR_AND_COUNT, 0 },
-    { NULL, 0 },
-};
 
 /* Review focus 5: every scan-only shape, planning included, leaves the
  * materialization counter at zero on a generation-2 table; the binding
- * assert is the final count (sr_same).  Then the ClickBench scan-only set,
- * the known gaps at their pinned counts, and the row-returning filter: both
+ * assert is the final count (sr_same).  Then the ClickBench scan-only set
+ * (the former gaps among it, at zero) and the row-returning filter: both
  * ray_execute of a bare FILTER (the API caller, Task 5) and a language
  * select that returns the filtered table compact the selection through
  * sel_compact, which gathers every column by range (P3 Task 6): nothing
@@ -5847,8 +5829,6 @@ static test_result_t test_no_materialization(void) {
     const char* t2 = "(.db.splayed.get \"" SR_G2 "\")";
     test_result_t r = sr_battery(t0, t2, shapes, 0, NULL);
     if (r.status == TEST_PASS) r = sr_battery(t0, t2, sr_clickbench_scan, 0, NULL);
-    for (int i = 0; r.status == TEST_PASS && sr_gaps[i].q; i++)
-        r = sr_same_on(t0, t2, sr_gaps[i].q, sr_gaps[i].mat);
     if (r.status != TEST_PASS) return r;
 
     uint64_t mat[2] = { 0, 0 };
@@ -5916,8 +5896,6 @@ static test_result_t test_no_materialization_parted(void) {
     const char* t2 = SR_NP2;
     test_result_t r = sr_battery(t0, t2, shapes, 0, NULL);
     if (r.status == TEST_PASS) r = sr_battery(t0, t2, sr_clickbench_scan, 0, NULL);
-    for (int i = 0; r.status == TEST_PASS && sr_gaps_parted[i].q; i++)
-        r = sr_same_on(t0, t2, sr_gaps_parted[i].q, sr_gaps_parted[i].mat);
     return r;
 }
 
@@ -6169,7 +6147,7 @@ static test_result_t test_const_beside_parted_group(void) {
           "(select {c: (count k) from: T where: (!= u 0) by: s})",
           "(all (== (at R 'one) (take 1 5)))", 0 },
         /* no group: the compact fallback gathers the key and input by
-         * range (sr_gaps' SR_COMPACT_GROUP, P3 Task 6), with or without the
+         * range (SR_COMPACT_GROUP, P3 Task 6), with or without the
          * constant */
         { "(select {one: 1 c: (count k) from: T where: (== g 9) by: s})",
           "(select {c: (count k) from: T where: (== g 9) by: s})",
