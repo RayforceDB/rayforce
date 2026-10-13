@@ -404,12 +404,15 @@ typedef struct {
 /* The first segment in [s, s1) whose flag is not RAY_SEL_NONE (0), else
  * s1: eight flags per load, so a sparse selection's long runs of empty
  * segments cost a load per eight (every column's gather walks them). */
+_Static_assert(RAY_SEL_NONE == 0, "gsel_next skips empty segments as zero bytes");
 static inline int64_t gsel_next(const uint8_t* flags, int64_t s, int64_t s1) {
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
     for (; s + 8 <= s1; s += 8) {
         uint64_t w;
         memcpy(&w, flags + s, 8);
         if (w) return s + (__builtin_ctzll(w) >> 3);   /* little-endian: the lowest set byte */
     }
+#endif
     while (s < s1 && flags[s] == RAY_SEL_NONE) s++;
     return s;
 }

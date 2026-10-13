@@ -1725,6 +1725,14 @@ int ray_enccol_point_i64(ray_enccol_t* e, int64_t row, int64_t* out, ray_t** err
  *   RAW, chunk not yet validated: the view's first read checks every RAW
  *                   vector of the chunk (0.4-0.9 us each, ~60 us a chunk),
  *                   so a few rows are point-read; N=8 costs 2.8 views   -> RAY_ENC_VEC / 128
+ *                   This one is a heuristic around that one-time cost, not
+ *                   a D2 crossover: a workload that only ever reads a few
+ *                   rows of a chunk never validates it and pays the point
+ *                   read (1.05-2.8 views) on every warm read.  It also
+ *                   depends on timing: in a parallel read another task may
+ *                   validate the chunk through a view first, so a vector's
+ *                   decoded bytes (0 or the vector's) vary between runs.
+ *                   Answers do not: both reads deliver the same values.
  *   with a bitmap   decode 1.8-2.4 us  N=64 0.17-0.25 (every codec)     -> RAY_ENC_VEC / 16
  * SYM vectors took the same limits (FOR_BP N=32 0.52-0.55, RLE N=64
  * 1.01-1.87, CONST N=8 0.79, N=64 3.2).  RAY_ENC_VEC / 16 is RAY_COL_POINT_ROWS,
@@ -1736,7 +1744,8 @@ int ray_enccol_point_i64(ray_enccol_t* e, int64_t row, int64_t* out, ray_t** err
 #define PT_ROWS_NULLS (RAY_ENC_VEC / 16)
 #define PT_ROWS_RAW   (RAY_ENC_VEC / 128)
 _Static_assert(PT_ROWS_RUNS <= RAY_COL_POINT_ROWS && PT_ROWS_DICT <= RAY_COL_POINT_ROWS &&
-               PT_ROWS_NULLS <= RAY_COL_POINT_ROWS && PT_ROWS_FOR <= RAY_COL_POINT_ROWS,
+               PT_ROWS_NULLS <= RAY_COL_POINT_ROWS && PT_ROWS_FOR <= RAY_COL_POINT_ROWS &&
+               PT_ROWS_CONST <= RAY_COL_POINT_ROWS && PT_ROWS_RAW <= RAY_COL_POINT_ROWS,
                "a codec's point-read limit is at most the caller's batch");
 
 /* What every served row of one vector is checked against: its kind, the

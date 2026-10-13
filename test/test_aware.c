@@ -2898,6 +2898,53 @@ static test_result_t test_gather_points(void) {
         ray_release(out);
     }
     ray_rowsel_release(psel); ray_release(ppred); ray_release(tp);
+    /* parted DICT with a null bitmap (Task 10b): the rows on both sides of
+     * the partition boundary at 3000 (one global morsel over two segments'
+     * vectors), as a rowsel and as a row list, point-read: nothing decoded,
+     * nulls where generation 0 has them */
+    ray_encw_test_force(RAY_ENC_DICT);
+    for (int p = 0; p < 2; p++) {
+        char q[700];
+        snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/gpd/2024.01.0%d/t/\" "
+                 "(table [x] (list (map (fn [j] (if (== 0 (%% j 100)) 0N (* 1000003 (%% j 5)))) (+ (til 3000) %d)))) "
+                 "{compress: true})", p + 1, p * 3000);
+        aw_eval_ok(q);
+    }
+    ray_encw_test_force(-1);
+    ray_t* td = aw_eval("(.db.parted.get \"" AW_TMP "/gpd\" 't)");
+    TEST_ASSERT_TRUE(td && !RAY_IS_ERR(td));
+    {
+        ray_t* denc = ray_table_get_col_enc(td, ray_sym_intern("x", 1));
+        TEST_ASSERT_NOT_NULL(denc);
+        for (int sg = 0; sg < 2; sg++) {
+            const ray_enc_desc_t* d;
+            TEST_ASSERT_NULL(ray_enccol_chunk_descs_ref(ray_enccol_of(ray_enccol_seg(denc, sg)), 0, &d));
+            TEST_ASSERT_TRUE(d[2].encoding == RAY_ENC_DICT && d[2].n_nulls > 0);
+            TEST_ASSERT_TRUE(d[0].encoding == RAY_ENC_DICT && d[0].n_nulls > 0);
+        }
+    }
+    static const int64_t dids[] = { 2900, 2990, 2999, 3000, 3005, 3100, 4100 };
+    ray_t* dpred = ray_vec_new(RAY_BOOL, 6000); dpred->len = 6000;
+    memset(ray_data(dpred), 0, 6000);
+    for (int i = 0; i < 7; i++) ((uint8_t*)ray_data(dpred))[dids[i]] = 1;
+    ray_t* dsel = ray_rowsel_from_pred(dpred);
+    TEST_ASSERT_NOT_NULL(dsel);
+    for (int pass = 0; pass < 2; pass++) {
+        ray_col_src_t s;
+        TEST_ASSERT_NULL(ray_table_col_src(td, ray_sym_intern("x", 1), &s));
+        ray_enc_counters_reset();
+        ray_t* out = NULL;
+        TEST_ASSERT_NULL(pass ? ray_col_gather_sel(&s, dsel, &out) : ray_col_gather_rows(&s, dids, 7, &out));
+        ray_col_src_release(&s);
+        ray_enc_counters_t k; ray_enc_counters_get(&k);
+        TEST_ASSERT_FMT(k.decoded_bytes == 0, "parted DICT pass %d: decoded %llu", pass, (unsigned long long)k.decoded_bytes);
+        TEST_ASSERT_EQ_I(out->len, 7);
+        TEST_ASSERT_TRUE(out->attrs & RAY_ATTR_HAS_NULLS);
+        for (int i = 0; i < 7; i++)
+            TEST_ASSERT_EQ_I(((int64_t*)ray_data(out))[i], dids[i] % 100 == 0 ? NULL_I64 : 1000003 * (dids[i] % 5));
+        ray_release(out);
+    }
+    ray_rowsel_release(dsel); ray_release(dpred); ray_release(td);
     PASS();
 }
 
@@ -3158,20 +3205,49 @@ static test_result_t test_gather_points_forged(void) {
  * winners' rows of every column gathered: the answer is the full sort's
  * first rows (ties kept by row order, nulls where the sort puts them),
  * on both generations, and generation 2's equals generation 0's.  k has
- * ties and nulls, s is a SYM key (string order), t the row number; one
- * selection holds whole segments (ALL) beside partial ones.  A take at
- * or past the selection's rows keeps the old route (counter unchanged). */
+ * ties and nulls, s is a SYM key (string order), f an F64 key with nulls,
+ * w a STR key and payload, t the row number; one selection holds whole
+ * segments (ALL) beside partial ones.  Takes at the selection's rows minus
+ * one (late) and at or past them, an empty selection and a LIST column
+ * keep the old route (counter unchanged). */
+static test_result_t aw_late_same(const char* t0, const char* t2, const char* q, const char* ref, bool late) {
+    uint64_t h0 = ray_sort_test_late_heads();
+    AW_CSV_SAME(t0, t2, q, 0);
+    uint64_t got = ray_sort_test_late_heads() - h0;
+    TEST_ASSERT_FMT(got == (late ? 2u : 0u), "%s: %llu late heads", q, (unsigned long long)got);
+    /* generation 0's answer is the full sort's first rows */
+    char buf[600]; char* csv[2]; size_t len[2];
+    snprintf(buf, sizeof buf, "(set T %s)", t0);
+    aw_eval_ok(buf);
+    for (int w = 0; w < 2; w++) {
+        ray_t* r = ray_eval_str(w ? ref : q);
+        TEST_ASSERT_FMT(r && !RAY_IS_ERR(r), "%s: %s", w ? ref : q, ray_error_msg());
+        ray_env_set(ray_sym_intern("R", 1), r);
+        ray_release(r);
+        csv[w] = aw_csv("R", w ? "lr" : "lq", &len[w]);
+    }
+    bool same = csv[0] && csv[1] && len[0] == len[1] && memcmp(csv[0], csv[1], len[0]) == 0;
+    free(csv[0]); free(csv[1]);
+    aw_eval_ok("(set R 0)");
+    TEST_ASSERT_FMT(same, "%s: differs from the full sort's first rows", q);
+    PASS();
+}
+#define AW_LATE_SAME(a, b, q, r, l) do { test_result_t r_ = aw_late_same((a), (b), (q), (r), (l)); if (r_.status != TEST_PASS) return r_; } while (0)
+
 static test_result_t test_sort_head_late(void) {
     static const int64_t np[2] = { 3000, 37000 };
     for (int gen = 0; gen <= 2; gen += 2)
         for (int p = 0; p < 2; p++) {
-            char q[1600];
+            char q[2400];
             snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/sl%d/2024.01.0%d/t/\" "
-                     "(table [k v s t] (list (map (fn [j] (if (== 0 (%% j 101)) 0N (%% (* j 7919) 50))) (til %lld)) "
+                     "(table [k v s t f w] (list (map (fn [j] (if (== 0 (%% j 101)) 0N (%% (* j 7919) 50))) (til %lld)) "
                      "(as 'I32 (%% (* (til %lld) 31) 1000)) "
-                     "(as 'SYMBOL (map (fn [j] (format \"s%%\" (%% j 37))) (til %lld))) (+ %lld (til %lld)))) "
+                     "(as 'SYMBOL (map (fn [j] (format \"s%%\" (%% j 37))) (til %lld))) (+ %lld (til %lld)) "
+                     "(map (fn [j] (if (== 0 (%% j 89)) 0Nf (* 0.5 (%% (* j 13) 400)))) (til %lld)) "
+                     "(map (fn [j] (if (== 0 (%% j 71)) \"\" (format \"a pooled string %%\" (%% (* j 17) 53)))) (til %lld)))) "
                      "\"" AW_TMP "/sl%d/.sym\" {compress: %s})", gen, p + 1, (long long)np[p], (long long)np[p],
-                     (long long)np[p], (long long)(p ? np[0] : 0), (long long)np[p], gen, gen ? "true" : "false");
+                     (long long)np[p], (long long)(p ? np[0] : 0), (long long)np[p], (long long)np[p], (long long)np[p],
+                     gen, gen ? "true" : "false");
             aw_eval_ok(q);
         }
     const char* t0 = "(.db.parted.get \"" AW_TMP "/sl0\" 't)";
@@ -3185,33 +3261,56 @@ static test_result_t test_sort_head_late(void) {
           "(take (select {from: T where: (< v 500) asc: [k s]}) 40)", true },
         { "(select {from: T where: (== (% v 7) 3) desc: s take: 12})",
           "(take (select {from: T where: (== (% v 7) 3) desc: s}) 12)", true },
+        { "(select {from: T where: (> v 700) asc: w take: 15})",           /* a STR key */
+          "(take (select {from: T where: (> v 700) asc: w}) 15)", true },
+        { "(select {from: T where: (< v 300) desc: f take: 9})",           /* an F64 key with nulls */
+          "(take (select {from: T where: (< v 300) desc: f}) 9)", true },
+        { "(select {from: T where: (< v 300) asc: [f w] take: 30})",
+          "(take (select {from: T where: (< v 300) asc: [f w]}) 30)", true },
         { "(select {from: T where: (or (< t 2048) (== 0 (% v 3))) asc: t take: 2100})",
           "(take (select {from: T where: (or (< t 2048) (== 0 (% v 3))) asc: t}) 2100)", true },
         { "(select {from: T where: (or (< t 2048) (== 0 (% v 3))) desc: v take: 50})",   /* part of the ALL segments */
           "(take (select {from: T where: (or (< t 2048) (== 0 (% v 3))) desc: v}) 50)", true },
         { "(select {from: T where: (> v 998) asc: k take: 5000})",
-          "(select {from: T where: (> v 998) asc: k})", false },          /* 40 rows: a longer take would cycle */
+          "(select {from: T where: (> v 998) asc: k})", false },          /* a longer take would cycle */
+        { "(select {from: T where: (> v 5000) asc: k take: 5})",          /* an empty selection */
+          "(select {from: T where: (> v 5000) asc: k})", false },
     };
-    for (size_t i = 0; i < sizeof qs / sizeof *qs; i++) {
+    for (size_t i = 0; i < sizeof qs / sizeof *qs; i++) AW_LATE_SAME(t0, t2, qs[i].q, qs[i].ref, qs[i].late);
+    /* K at the selection's rows minus one (the late route) and at them (the
+     * old route: the shortcut needs K below the rows) */
+    aw_eval_ok("(set T (.db.parted.get \"" AW_TMP "/sl0\" 't))");
+    ray_t* cnt = ray_eval_str("(count (select {from: T where: (> v 990)}))");
+    TEST_ASSERT_TRUE(cnt && !RAY_IS_ERR(cnt) && cnt->i64 > 2);
+    const int64_t pass = cnt->i64;
+    ray_release(cnt);
+    for (int e = 0; e < 2; e++) {
+        char q[300], ref[300];
+        snprintf(q, sizeof q, "(select {from: T where: (> v 990) desc: k take: %lld})", (long long)(pass - 1 + e));
+        if (e) snprintf(ref, sizeof ref, "(select {from: T where: (> v 990) desc: k})");
+        else   snprintf(ref, sizeof ref, "(take (select {from: T where: (> v 990) desc: k}) %lld)", (long long)(pass - 1));
+        AW_LATE_SAME(t0, t2, q, ref, e == 0);
+    }
+    /* a LIST column: ray_topk_table declines, so the late route does too
+     * (generation 0: LIST stays plain in either store) */
+    for (int p = 0; p < 2; p++) {
+        char q[600];
+        snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/sll/2024.01.0%d/t/\" "
+                 "(table [k v l] (list (%% (* (til 3000) 7919) 50) (%% (til 3000) 10) (map (fn [j] (list j)) (til 3000)))))",
+                 p + 1);
+        aw_eval_ok(q);
+    }
+    aw_eval_ok("(set T (.db.parted.get \"" AW_TMP "/sll\" 't))");
+    {
         uint64_t h0 = ray_sort_test_late_heads();
-        AW_CSV_SAME(t0, t2, qs[i].q, 0);
-        uint64_t got = ray_sort_test_late_heads() - h0;
-        TEST_ASSERT_FMT(got == (qs[i].late ? 2u : 0u), "%s: %llu late heads", qs[i].q, (unsigned long long)got);
-        /* generation 0's answer is the full sort's first rows */
-        char buf[600]; char* csv[2]; size_t len[2];
-        snprintf(buf, sizeof buf, "(set T %s)", t0);
-        aw_eval_ok(buf);
-        for (int w = 0; w < 2; w++) {
-            ray_t* r = ray_eval_str(w ? qs[i].ref : qs[i].q);
-            TEST_ASSERT_FMT(r && !RAY_IS_ERR(r), "%s: %s", w ? qs[i].ref : qs[i].q, ray_error_msg());
-            ray_env_set(ray_sym_intern("R", 1), r);
-            ray_release(r);
-            csv[w] = aw_csv("R", w ? "lr" : "lq", &len[w]);
-        }
-        bool same = csv[0] && csv[1] && len[0] == len[1] && memcmp(csv[0], csv[1], len[0]) == 0;
-        free(csv[0]); free(csv[1]);
-        aw_eval_ok("(set R 0)");
-        TEST_ASSERT_FMT(same, "%s: differs from the full sort's first rows", qs[i].q);
+        ray_t* a = ray_eval_str("(select {from: T where: (> v 5) asc: k take: 7})");
+        ray_t* r = ray_eval_str("(take (select {from: T where: (> v 5) asc: k}) 7)");
+        TEST_ASSERT_FMT(a && r && !RAY_IS_ERR(a) && !RAY_IS_ERR(r), "LIST: %s", ray_error_msg());
+        TEST_ASSERT_EQ_U(ray_sort_test_late_heads(), h0);
+        ray_t* fa = ray_fmt(a, 0); ray_t* fr = ray_fmt(r, 0);
+        TEST_ASSERT_FMT(ray_str_len(fa) == ray_str_len(fr) && memcmp(ray_str_ptr(fa), ray_str_ptr(fr), ray_str_len(fa)) == 0,
+                        "LIST: differs from the full sort's first rows");
+        ray_release(fa); ray_release(fr); ray_release(a); ray_release(r);
     }
     PASS();
 }
@@ -4145,7 +4244,10 @@ static test_result_t test_topk_prune_cases(void) {
     aw_eval_ok("(select {kn: kn v: v from: T where: (> v 100) desc: kn take: 20})");
     uint64_t pc = 0, pv = 0;
     ray_fused_topk_test_pruned(&pc, &pv);
-    TEST_ASSERT_TRUE(pc > 0);
+    /* chunk-slot prunes only on aligned grains: a clamped ring may hand the
+     * best chunks to one task, whose bound then never undercuts a later
+     * chunk (as the tr cases below) */
+    if (!g_aw_unaligned) TEST_ASSERT_TRUE(pc > 0);
     TEST_ASSERT_TRUE(pv > 0);                                   /* also under a clamped grain */
     /* I32 and TIMESTAMP first keys: negative values climbing through zero
      * (row j holds j - 150000, the timestamp that many seconds from the

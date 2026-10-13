@@ -3719,6 +3719,13 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
             /* Compact lazy selection before sort (needs dense data) */
             if (g->selection && tbl && !RAY_IS_ERR(tbl) && tbl->type == RAY_TABLE) {
                 ray_t* compacted = sel_compact(g, tbl, g->selection, NULL, 0);
+                /* sel_compact's alloc fallback hands back the table itself:
+                 * sorting it would answer from rows the selection dropped */
+                if (compacted && !RAY_IS_ERR(compacted) &&
+                    ray_table_nrows(compacted) != ray_rowsel_meta(g->selection)->total_pass) {
+                    ray_release(compacted);
+                    compacted = ray_error("oom", NULL);
+                }
                 ray_release(input);
                 ray_release(g->selection);
                 g->selection = NULL;
@@ -3984,6 +3991,11 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 }
                 if (g->selection && tbl && !RAY_IS_ERR(tbl) && tbl->type == RAY_TABLE) {
                     ray_t* compacted = sel_compact(g, tbl, g->selection, NULL, 0);
+                    if (compacted && !RAY_IS_ERR(compacted) &&   /* the alloc fallback: see OP_SORT */
+                        ray_table_nrows(compacted) != ray_rowsel_meta(g->selection)->total_pass) {
+                        ray_release(compacted);
+                        compacted = ray_error("oom", NULL);
+                    }
                     ray_release(sort_input);          /* owned: see OP_SORT */
                     ray_release(g->selection);
                     g->selection = NULL;
