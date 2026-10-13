@@ -6721,14 +6721,26 @@ static int topn_part_gid_cmp(const void* a, const void* b) {
     return x->gid < y->gid ? -1 : (x->gid > y->gid ? 1 : 0);
 }
 
-/* The (value, earliest row) item of group gi of partition p. */
+/* The (value, earliest row) item of group gi of partition p.  `nn_off` is
+ * the in-row offset of the ordering agg's non-null count when its result is
+ * null for an all-null group (MIN/MAX over a nullable column), else 0.  Such
+ * a group's slot holds the accumulator's init sentinel (MIN's INT64_MAX would
+ * rank it above every value), so it is ranked as the null instead: INT64_MIN,
+ * below every value, i.e. last under desc: and first under asc:, where the
+ * stable sort puts nulls (#808).  INT64_MIN is the I64 null itself, never a
+ * value, and narrower types widen into the slot above it. */
 static inline int64_t topn_group_push(group_topn_item_t* h, int64_t hn,
                                       int64_t k, uint8_t desc_dir,
                                       const group_ht_t* ph, uint16_t order_off,
-                                      uint32_t p, uint32_t gi) {
+                                      uint16_t nn_off, uint32_t p, uint32_t gi) {
     const char* row = ph->rows + (size_t)gi * ph->layout.row_stride;
     int64_t v, first;
     memcpy(&v, row + order_off, 8);
+    if (nn_off) {
+        int64_t nn;
+        memcpy(&nn, row + nn_off, 8);
+        if (nn == 0) v = INT64_MIN;
+    }
     memcpy(&first, row + ph->layout.off_group_first, 8);
     return topn_heap_push(h, hn, k, desc_dir, v, first, p, gi);
 }
@@ -6745,6 +6757,7 @@ typedef struct {
     const uint32_t*    item_off;   /* [n_parts + 1] per-partition capacity */
     uint32_t*          item_cnt;   /* [n_parts] survivors produced */
     uint16_t           order_off;  /* in-row byte offset of the ordering agg */
+    uint16_t           nn_off;     /* its non-null count, 0 = never null */
     uint8_t            desc_dir;
 } topn_scan_ctx_t;
 
@@ -6760,7 +6773,8 @@ static void topn_scan_fn(void* vctx, uint32_t worker_id, int64_t start,
         int64_t cap = (int64_t)(c->item_off[p + 1] - c->item_off[p]);
         int64_t hn = 0;
         for (uint32_t gi = 0; gi < gc; gi++)
-            hn = topn_group_push(h, hn, cap, c->desc_dir, ph, c->order_off, p, gi);
+            hn = topn_group_push(h, hn, cap, c->desc_dir, ph, c->order_off,
+                                 c->nn_off, p, gi);
         c->item_cnt[p] = (uint32_t)hn;
     }
 }
@@ -6784,6 +6798,7 @@ typedef struct {
     uint32_t*          item_cnt;  /* [n_parts] survivors per partition */
     uint32_t           cap;       /* per-partition capacity = k_take */
     uint16_t           order_off; /* in-row byte offset of the ordering agg */
+    uint16_t           nn_off;    /* its non-null count, 0 = never null */
     uint8_t            desc_dir;
 } topn_fuse_t;
 
@@ -6794,7 +6809,8 @@ static inline void topn_fuse_partition(const topn_fuse_t* f, group_ht_t* ph,
     int64_t cap = (int64_t)f->cap;
     int64_t hn = 0;
     for (uint32_t gi = 0; gi < gc; gi++)
-        hn = topn_group_push(h, hn, cap, f->desc_dir, ph, f->order_off, p, gi);
+        hn = topn_group_push(h, hn, cap, f->desc_dir, ph, f->order_off,
+                             f->nn_off, p, gi);
     f->item_cnt[p] = (uint32_t)hn;
 }
 
@@ -17298,6 +17314,7 @@ ht_path:;
      * whole compaction is skipped, exactly as the in-place `goto
      * topn_compact_skip` did before. */
     uint16_t topn_order_off = 0;   /* default: COUNT at row + 0 */
+    uint16_t topn_nn_off    = 0;   /* non-null count of a nullable MIN/MAX */
     uint8_t  topn_desc_dir  = 0;
     bool     topn_order_ok  = false;
     if (use_topn_filter) {
@@ -17326,6 +17343,13 @@ ht_path:;
             else topn_order_off = (uint16_t)(ght_layout.off_max
                                              + (uint16_t)agg_slot * 8u);
         }
+        /* MIN and MAX of an all-null group are null (phase 3 emits them so
+         * when the slot's non-null count is 0); SUM is 0 and COUNT never
+         * null, and their slots already hold that value.  off_nn is set
+         * only for a layout with a nullable agg (see topn_group_push). */
+        if (topn_order_ok && (order_op == OP_MIN || order_op == OP_MAX) &&
+            ght_layout.off_nn && agg_slot >= 0)
+            topn_nn_off = (uint16_t)(ght_layout.off_nn + (uint16_t)agg_slot * 8u);
         /* `.desc` is authoritative for every agg kind, COUNT included: every
          * arming site in query.c sets it (1 for desc:, 0 for asc:).  It used
          * to be force-set to 1 for COUNT — that silently turned
@@ -17368,6 +17392,7 @@ ht_path:;
                 topn_fuse.item_cnt  = fcnt;
                 topn_fuse.cap       = (uint32_t)kt;
                 topn_fuse.order_off = topn_order_off;
+                topn_fuse.nn_off    = topn_nn_off;
                 topn_fuse.desc_dir  = topn_desc_dir;
             } else if (fcnt) {
                 scratch_free(topn_fuse_cnt_hdr);
@@ -17833,7 +17858,8 @@ v2_emit:;
                             topn_scan_ctx_t sctx = {
                                 .part_hts = part_hts, .items = items_w,
                                 .item_off = off_w, .item_cnt = cnt_w,
-                                .order_off = order_off, .desc_dir = desc_dir,
+                                .order_off = order_off,
+                                .nn_off = topn_nn_off, .desc_dir = desc_dir,
                             };
                             ray_pool_dispatch_n(pool, topn_scan_fn, &sctx,
                                                 radix_n_parts);
@@ -17879,7 +17905,8 @@ v2_emit:;
                         uint32_t gc = ph->grp_count;
                         for (uint32_t gi = 0; gi < gc; gi++)
                             hn = topn_group_push(heap, hn, k_take, desc_dir,
-                                                 ph, order_off, p, gi);
+                                                 ph, order_off, topn_nn_off,
+                                                 p, gi);
                     }
 
                 if (hn > 0) {

@@ -4392,6 +4392,48 @@ static test_result_t test_group_topn_ties(void) {
     PASS();
 }
 
+/* #808: an all-null group's aggregate is a null, and the stable sort ranks
+ * nulls below every value: first under asc:, last under desc:.  The radix
+ * top-N ranks such a group there too, not by the slot's init sentinel (MIN's
+ * INT64_MAX put all-null groups at the top of a desc: take and dropped them
+ * from an asc: one).  2000 groups over two partitions, 400 of them all-null
+ * in w; take 5 runs the fused per-partition scan, take 30 the serial one. */
+static test_result_t test_group_topn_nulls(void) {
+    aw_eval_ok("(set K (% (* (til 8000) 7919) 2000))");
+    aw_eval_ok("(set W (table [s w v] (list (at (as 'SYMBOL (map (fn [j] (format \"w%\" j)) (til 2000))) K) "
+               "(as 'I64 (map (fn [k] (if (< (% k 5) 1) 0Nl (% k 13))) K)) (til 8000))))");
+    aw_eval_ok("(.db.splayed.set \"" AW_TMP "/tn/2024.01.01/t/\" (take W 4000) \"" AW_TMP "/tn/.sym\")");
+    aw_eval_ok("(.db.splayed.set \"" AW_TMP "/tn/2024.01.02/t/\" (drop W 4000) \"" AW_TMP "/tn/.sym\")");
+    aw_eval_ok("(.db.splayed.set \"" AW_TMP "/tns/t/\" W \"" AW_TMP "/tns/.sym\")");
+    aw_eval_ok("(set P (.db.parted.get \"" AW_TMP "/tn\" 't))");
+    aw_eval_ok("(set S (.db.splayed.get \"" AW_TMP "/tns/t/\" \"" AW_TMP "/tns/.sym\"))");
+    static const char* const shapes[] = {
+        "{m: (min w) from: %s by: {s: s z: (%% v 1) t: s} desc: m take: %d}",
+        "{m: (min w) from: %s by: {s: s z: (%% v 1) t: s} asc: m take: %d}",
+        "{m: (max w) from: %s by: {s: s z: (%% v 1) t: s} desc: m take: %d}",
+        "{m: (max w) from: %s by: {s: s z: (%% v 1) t: s} asc: m take: %d}",
+        "{m: (sum w) from: %s by: {s: s z: (%% v 1) t: s} desc: m take: %d}",
+        "{m: (sum w) from: %s by: {s: s z: (%% v 1) t: s} asc: m take: %d}",
+        "{m: (avg w) from: %s by: {s: s z: (%% v 1) t: s} desc: m take: %d}",
+        "{m: (avg w) from: %s by: {s: s z: (%% v 1) t: s} asc: m take: %d}",
+    };
+    static const int takes[] = { 5, 30 };
+    for (size_t si = 0; si < sizeof shapes / sizeof *shapes; si++)
+        for (size_t ti = 0; ti < sizeof takes / sizeof *takes; ti++) {
+            char q[600], body[300];
+            int n = takes[ti];
+            snprintf(body, sizeof body, shapes[si], "P", 1025);
+            snprintf(q, sizeof q, "(take (select %s) %d)", body, n);
+            ray_t* ref = aw_eval(q);
+            TEST_ASSERT_FMT(ref && !RAY_IS_ERR(ref), "%s: %s", q, ray_error_msg());
+            test_result_t r = aw_topn_case(shapes[si], n, 0, 2, ref);
+            ray_release(ref);
+            if (r.status != TEST_PASS) return r;
+        }
+    aw_eval_ok("(set P 0)"); aw_eval_ok("(set S 0)"); aw_eval_ok("(set W 0)"); aw_eval_ok("(set K 0)");
+    PASS();
+}
+
 /* ray_pool_dispatch clamped to a ring whose growth fails (#792; shrunk to a
  * few slots so the clamp runs at test sizes): fused where: filters
  * (pred_sel_drive and the expression selection, whose rowsel builders are
@@ -4401,7 +4443,7 @@ static test_result_t test_pool_clamp(void) {
     static test_result_t (*const fns[])(void) = {
         test_scalar_route_mixed, test_eq_runs_lack, test_filter_encoded_leaves, test_scalar_route_stats,
         test_count_on_runs, test_group_count_on_runs, test_group_runs_forged, test_topk_prune_cases,
-        test_gather_sym_points, test_sort_head_late, test_group_topn_ties,
+        test_gather_sym_points, test_sort_head_late, test_group_topn_ties, test_group_topn_nulls,
     };
     static const uint32_t caps[] = { 7, 3 };
     for (size_t c = 0; c < sizeof caps / sizeof *caps; c++)
@@ -4533,5 +4575,6 @@ const test_entry_t aware_entries[] = {
     { "aware/group_runs_forged",   test_group_runs_forged,   aw_setup, aw_teardown },
     { "aware/topk_prune_cases",    test_topk_prune_cases,    aw_setup, aw_teardown },
     { "aware/group_topn_ties",     test_group_topn_ties,     aw_setup, aw_teardown },
+    { "aware/group_topn_nulls",    test_group_topn_nulls,    aw_setup, aw_teardown },
     { NULL, NULL, NULL, NULL },
 };
