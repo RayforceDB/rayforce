@@ -2972,7 +2972,6 @@ static test_result_t test_repl_cli_cores_are_total(void) {
     TEST_ASSERT_FMT(count == 3, "-c 3 created %ld total threads", count);
     PASS();
 }
-
 #endif
 
 /* ─── Suite definition ───────────────────────────────────────────── */
