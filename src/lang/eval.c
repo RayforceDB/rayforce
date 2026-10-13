@@ -322,7 +322,20 @@ ray_t* ray_raise_fn(ray_t* val) {
     if (__VM->raise_val) ray_release(__VM->raise_val);
     ray_retain(val);
     __VM->raise_val = val;
-    return ray_error("domain", NULL);
+    /* The raised value travels in raise_val for `try`.  An uncaught raise
+     * reaches the REPL and the script runner as the bare code, so carry
+     * the value as the message too: a string verbatim, anything else in
+     * its compact printed form. */
+    if (val->type == -RAY_STR)
+        return ray_error("domain", "%.*s", (int)ray_str_len(val), ray_str_ptr(val));
+    ray_t* text = ray_fmt(val, 0);
+    if (!text || RAY_IS_ERR(text)) {
+        if (text) ray_release(text);
+        return ray_error("domain", NULL);
+    }
+    ray_t* err = ray_error("domain", "%.*s", (int)ray_str_len(text), ray_str_ptr(text));
+    ray_release(text);
+    return err;
 }
 
 /* Dispatch a `try` handler value against the error value.  A *callable*

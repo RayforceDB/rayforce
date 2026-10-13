@@ -646,6 +646,32 @@ static test_result_t test_public_get_error_trace_cleared_on_eval(void) {
     PASS();
 }
 
+/* An uncaught (raise x) carries x as the error message, so the REPL and
+ * the script runner print it instead of the bare "domain" code.  A string
+ * is used verbatim; any other value in its compact printed form. */
+extern const char* ray_error_msg(void);
+static test_result_t test_public_raise_sets_error_msg(void) {
+    ray_t* err = ray_eval_str("(raise \"order 7 rejected\")");
+    TEST_ASSERT_TRUE(RAY_IS_ERR(err));
+    TEST_ASSERT_STR_EQ(ray_err_code(err), "domain");
+    TEST_ASSERT_NOT_NULL(ray_error_msg());
+    TEST_ASSERT_STR_EQ(ray_error_msg(), "order 7 rejected");
+    ray_error_free(err);
+
+    err = ray_eval_str("((fn [] (raise [1 2 3])))");
+    TEST_ASSERT_TRUE(RAY_IS_ERR(err));
+    TEST_ASSERT_NOT_NULL(ray_error_msg());
+    TEST_ASSERT_STR_EQ(ray_error_msg(), "[1 2 3]");
+    ray_error_free(err);
+
+    /* try still hands the handler the raised value itself. */
+    ray_t* r = ray_eval_str("(try (raise 41) (fn [e] (+ e 1)))");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->i64, 42);
+    ray_release(r);
+    PASS();
+}
+
 static test_result_t test_public_nullability_matrix(void) {
     ray_t* ordinary[] = {
         ray_sym(0),
@@ -724,6 +750,7 @@ const test_entry_t public_api_entries[] = {
     { "public/eval_restricted_allows_arith",   test_public_eval_restricted_allows_arith,   public_api_setup, public_api_teardown },
     { "public/get_error_trace_populated",      test_public_get_error_trace_populated,      public_api_setup, public_api_teardown },
     { "public/get_error_trace_cleared_on_eval",test_public_get_error_trace_cleared_on_eval,public_api_setup, public_api_teardown },
+    { "public/raise_sets_error_msg",           test_public_raise_sets_error_msg,           public_api_setup, public_api_teardown },
     { "public/nullability_matrix",             test_public_nullability_matrix,             public_api_setup, public_api_teardown },
 
     { NULL, NULL, NULL, NULL },
