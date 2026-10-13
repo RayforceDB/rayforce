@@ -71,8 +71,8 @@ void* ray_runtime_get_sys_args(void);
 #define RAY_PCLOSE(f)    _pclose(f)
 #endif
 
-static int parse_sys_int_arg(const char* s, bool nonnegative, bool core_count,
-                             int64_t* out) {
+int parse_sys_int_arg(const char* s, bool nonnegative, bool core_count,
+                      int64_t* out) {
     if (!s || !*s) return 0;
     const unsigned char* p = (const unsigned char*)s;
     if (!nonnegative && (*p == '+' || *p == '-')) p++;
@@ -84,7 +84,8 @@ static int parse_sys_int_arg(const char* s, bool nonnegative, bool core_count,
     errno = 0;
     long long v = strtoll(s, &end, 10);
     if (errno == ERANGE || end == s || *end != '\0' ||
-        (nonnegative && v < 0) || (core_count && v > INT_MAX))
+        (nonnegative && v < 0) ||
+        (core_count && v > (int64_t)RAY_HEAP_ID_BITS - 1))
         return 0;
     *out = (int64_t)v;
     return 1;

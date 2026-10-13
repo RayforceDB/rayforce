@@ -39,6 +39,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <limits.h>
 #include <signal.h>
 #include <unistd.h>
 
@@ -184,20 +185,41 @@ int main(int argc, char** argv) {
             port = (uint16_t)pv;
         }
         else if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--cores") == 0) {
-            const char* v = flag_value(argc, argv, &i, argv[i]);
-            if (!v) { ray_runtime_destroy(rt); return 2; }
-            n_cores = atoi(v);
-            if (n_cores < 0) n_cores = 0;
+            const char* flag = argv[i];
+            const char* cv = flag_value(argc, argv, &i, flag);
+            if (!cv) { ray_runtime_destroy(rt); return 2; }
+            int64_t parsed;
+            if (!parse_sys_int_arg(cv, true, true, &parsed)) {
+                fprintf(stderr, "error: %s expects a worker count in 0..%u, got '%s'\n",
+                        flag, (unsigned)(RAY_HEAP_ID_BITS - 1), cv);
+                ray_runtime_destroy(rt);
+                return 2;
+            }
+            n_cores = (int)parsed;
         }
         else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--timeit") == 0) {
-            const char* v = flag_value(argc, argv, &i, argv[i]);
+            const char* flag = argv[i];
+            const char* v = flag_value(argc, argv, &i, flag);
             if (!v) { ray_runtime_destroy(rt); return 2; }
-            timeit_init = (atoi(v) != 0);
+            int64_t parsed;
+            if (!parse_sys_int_arg(v, false, false, &parsed)) {
+                fprintf(stderr, "error: %s expects an integer, got '%s'\n", flag, v);
+                ray_runtime_destroy(rt);
+                return 2;
+            }
+            timeit_init = (parsed != 0);
         }
         else if (strcmp(argv[i], "-Q") == 0 || strcmp(argv[i], "--querylog") == 0) {
-            const char* v = flag_value(argc, argv, &i, argv[i]);
+            const char* flag = argv[i];
+            const char* v = flag_value(argc, argv, &i, flag);
             if (!v) { ray_runtime_destroy(rt); return 2; }
-            qlog_init = (atoi(v) != 0);
+            int64_t parsed;
+            if (!parse_sys_int_arg(v, false, false, &parsed)) {
+                fprintf(stderr, "error: %s expects an integer, got '%s'\n", flag, v);
+                ray_runtime_destroy(rt);
+                return 2;
+            }
+            qlog_init = (parsed != 0);
         }
         else if (strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0) {
             file = flag_value(argc, argv, &i, argv[i]);
@@ -231,7 +253,7 @@ int main(int argc, char** argv) {
                 "  -f, --file FILE     run script file (or pass as a positional arg)\n"
                 "  -p, --port PORT     listen for IPC clients on PORT (all interfaces)\n"
                 "      --port HOST:PORT  bind the listener to HOST only (e.g. 127.0.0.1:7701)\n"
-                "  -c, --cores N       total execution cores, main included (0 = auto)\n"
+                "  -c, --cores N       decimal digits; 0 = auto, 1..1023 includes main thread\n"
                 "  -t, --timeit N      enable profiler at startup (N != 0)\n"
                 "  -Q, --querylog N    enable query logging at startup (N != 0);\n"
                 "                      read the ring with (.sys.querylog)\n"
@@ -293,9 +315,12 @@ int main(int argc, char** argv) {
      * pool to its lazy default on first use. */
     if (n_cores >= 0) {
         ray_err_t err = ray_pool_init_total((uint32_t)n_cores);
-        if (err != RAY_OK)
-            fprintf(stderr, "warning: ray_pool_init_total(%d) failed (%d)\n",
+        if (err != RAY_OK) {
+            fprintf(stderr, "error: ray_pool_init_total(%d) failed (%d)\n",
                     n_cores, (int)err);
+            ray_runtime_destroy(rt);
+            return 2;
+        }
     }
 
     /* -t at startup flips the global profiler flag. The REPL reads
