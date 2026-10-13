@@ -14055,9 +14055,12 @@ by_dict_done:
                 /* The composite path reads key and output cells row by row,
                  * which a parted column does not serve.  A where: hands back
                  * a flattened copy of the rows it keeps; when the table
-                 * reaches here as is, flatten the columns the clauses read. */
+                 * reaches here as is, flatten the columns the clauses read;
+                 * with no outputs every column is read (first of each group
+                 * below), so the whole table is flattened. */
                 if (eval_tbl == tbl && table_has_parted_columns(tbl)) {
-                    ray_t* flat = parted_flatten_read_cols(dict, tbl);
+                    ray_t* flat = n_out > 0 ? parted_flatten_read_cols(dict, tbl)
+                                            : query_materialize_parted_table(tbl);
                     if (!flat || RAY_IS_ERR(flat)) {
                         ray_release(tbl);
                         scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return flat ? flat : ray_error("oom", NULL);

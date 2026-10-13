@@ -242,6 +242,13 @@
 (at RPf2 's)  -- ['alpha 'beta 'gamma 'beta]
 (at RPf2 'b)  -- (list [91 93] [92] [94] [95])
 (at RPf2 'c)  -- (list [92 94] [93] [95] [96])
+;; no outputs: the first row of each group, every column of it
+(set RPf3 (select {by: [s bo] from: Pc}))
+(at RPf3 's) -- ['alpha 'beta 'gamma 'beta]
+(at RPf3 'b) -- [91 92 94 95]
+(set RPf4 (select {by: [s bo] from: Pc where: (> b 0)}))
+(at RPf4 's) -- ['alpha 'beta 'gamma 'beta]
+(at RPf4 'b) -- [91 92 94 95]
 ;; a splayed (FILE-domain, non-parted) source took the same path
 (.db.splayed.set "/tmp/rfl_pgwh_cmp/flat/" (table [s bo b] (list ['alpha 'beta 'alpha 'gamma 'beta] [true false true false true] [91 92 93 94 95])))
 (set Sc (.db.splayed.get "/tmp/rfl_pgwh_cmp/flat/"))
