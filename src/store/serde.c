@@ -211,6 +211,413 @@ static inline bool sym_enc_cacheable(ray_t* obj) {
 }
 
 
+/* ---- Vector cell payloads ------------------------------------------------
+ * The bytes after a vector's type/attrs/len header.  Shared by the flat
+ * vector cases and the parted-column writer below, which streams each
+ * partition segment's cells through the same code so a parted column goes
+ * out byte-identical to its flat equivalent. */
+
+/* Bytes per cell of a fixed-width vector type; 0 for a variable-width one. */
+static int64_t serde_fixed_esz(int8_t type) {
+    switch (type) {
+    case RAY_BOOL: case RAY_U8:                         return 1;
+    case RAY_I16:                                       return 2;
+    case RAY_I32: case RAY_DATE: case RAY_TIME:
+    case RAY_F32:                                       return 4;
+    case RAY_I64: case RAY_TIMESTAMP: case RAY_F64:     return 8;
+    case RAY_GUID:                                      return 16;
+    default:                                            return 0;
+    }
+}
+
+/* SYM VECTOR cells are positions in THE VEC's domain — resolve each
+ * through ray_sym_vec_cell, not the global table (sym-domain Phase 2;
+ * identical strings while the domain is the runtime singleton).  Also
+ * honors narrow W8/16/32 index widths.  sym_cells_size and
+ * sym_cells_write must stay in lockstep. */
+static int64_t sym_cells_size(ray_t* obj) {
+    int64_t size = 0;
+    int64_t i = 0;
+    if (sym_enc_cacheable(obj)) {
+        const void* data = ray_data(obj);
+        uint8_t attrs = obj->attrs;
+        uint32_t seen = 0, hits = 0;
+        for (; i < obj->len; i++) {
+            int64_t id = ray_read_sym(data, i, RAY_SYM, attrs);
+            sym_enc_ent* e = &g_sym_enc_cache[(uint64_t)id & (SYM_ENC_CACHE_N - 1)];
+            if (e->ptr && e->id == id) { size += (int64_t)e->len + 1; hits++; }
+            else {
+                ray_t* a = ray_sym_str(id);
+                uint32_t l = a ? (uint32_t)ray_str_len(a) : 0u;
+                const char* pp = a ? ray_str_ptr(a) : NULL;
+                if (pp) { e->ptr = pp; e->len = l; e->id = id; }
+                size += (int64_t)l + 1;
+            }
+            /* Thrashing column: leave the rest to the plain loop below,
+             * which is what this path costs without a cache. */
+            if (++seen == SYM_ENC_SAMPLE && hits * 4u < seen) { i++; break; }
+        }
+    }
+    for (; i < obj->len; i++) {
+        ray_t* a = ray_sym_vec_cell(obj, i);
+        size += (a ? (int64_t)ray_str_len(a) : 0) + 1;
+    }
+    return size;
+}
+
+/* Each cell as its NUL-terminated string; returns the bytes written. */
+static int64_t sym_cells_write(uint8_t* buf, ray_t* obj) {
+    int64_t c = 0;
+    int64_t i = 0;
+    if (sym_enc_cacheable(obj)) {
+        const void* data = ray_data(obj);
+        uint8_t attrs = obj->attrs;
+        uint32_t seen = 0, hits = 0;
+        for (; i < obj->len; i++) {
+            int64_t id = ray_read_sym(data, i, RAY_SYM, attrs);
+            sym_enc_ent* e = &g_sym_enc_cache[(uint64_t)id & (SYM_ENC_CACHE_N - 1)];
+            const char* pp; uint32_t slen;
+            if (e->ptr && e->id == id) { pp = e->ptr; slen = e->len; hits++; }
+            else {
+                ray_t* a = ray_sym_str(id);
+                slen = a ? (uint32_t)ray_str_len(a) : 0u;
+                pp   = a ? ray_str_ptr(a) : NULL;
+                if (pp) { e->ptr = pp; e->len = slen; e->id = id; }
+            }
+            if (slen) { memcpy(buf + c, pp, slen); c += (int64_t)slen; }
+            buf[c++] = '\0';
+            if (++seen == SYM_ENC_SAMPLE && hits * 4u < seen) { i++; break; }
+        }
+    }
+    for (; i < obj->len; i++) {
+        ray_t* a = ray_sym_vec_cell(obj, i);
+        if (a) {
+            size_t slen = ray_str_len(a);
+            memcpy(buf + c, ray_str_ptr(a), slen);
+            c += (int64_t)slen;
+        }
+        buf[c++] = '\0';
+    }
+    return c;
+}
+
+/* STR cells: each as i64 length + raw bytes. */
+static int64_t str_cells_size(ray_t* obj) {
+    int64_t size = 0;
+    ray_str_t* elems = (ray_str_t*)ray_data(obj);
+    for (int64_t i = 0; i < obj->len; i++)
+        size += 8 + elems[i].len;
+    return size;
+}
+
+static int64_t str_cells_write(uint8_t* buf, ray_t* obj) {
+    ray_str_t* elems = (ray_str_t*)ray_data(obj);
+    const char* pool = obj->str_pool ? (const char*)ray_data(obj->str_pool) : NULL;
+    int64_t c = 0;
+    for (int64_t i = 0; i < obj->len; i++) {
+        int64_t slen = (int64_t)elems[i].len;
+        memcpy(buf + c, &slen, 8);
+        c += 8;
+        const char* p = ray_str_t_ptr(&elems[i], pool);
+        memcpy(buf + c, p, (size_t)slen);
+        c += slen;
+    }
+    return c;
+}
+
+/* ---- Parted tables -------------------------------------------------------
+ * A parted table (.db.parted.get) holds per-partition storage views, not
+ * vectors: a parted column (RAY_PARTED_BASE + type) is an array of one
+ * segment per partition, and the partition-key column (RAY_MAPCOMMON) a key
+ * and a row count per partition.  On the wire it is the flat table it
+ * stands for, written without building it: each column goes out as the
+ * flat vector of its type, its cells streamed segment by segment in
+ * partition order.  The partition-key column writes each key once per row
+ * of its partition.  A NULL segment — a partition without the column
+ * (ragged mode, see store/part.c) — writes that partition's rows as
+ * typed nulls; its row count comes from the partition-key counts, the
+ * table's authoritative row numbering. */
+
+static bool serde_col_is_parted(ray_t* col) {
+    return col && !RAY_IS_ERR(col) &&
+           (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON);
+}
+
+static bool serde_table_is_parted(ray_t* tbl) {
+    ray_t* cols = ((ray_t**)ray_data(tbl))[1];
+    if (!cols || RAY_IS_ERR(cols) || cols->type != RAY_LIST) return false;
+    ray_t** cv = (ray_t**)ray_data(cols);
+    for (int64_t c = 0; c < cols->len; c++)
+        if (serde_col_is_parted(cv[c])) return true;
+    return false;
+}
+
+typedef struct {
+    ray_t**        cols;    /* the table's columns */
+    int64_t        ncols;
+    const int64_t* counts;  /* partition-key row counts, NULL if none */
+    int64_t        nparts;
+} serde_parted_t;
+
+static void serde_parted_init(serde_parted_t* x, ray_t* tbl) {
+    ray_t* cols = ((ray_t**)ray_data(tbl))[1];
+    x->cols   = (ray_t**)ray_data(cols);
+    x->ncols  = cols->len;
+    x->counts = NULL;
+    x->nparts = 0;
+    for (int64_t c = 0; c < x->ncols; c++) {
+        ray_t* col = x->cols[c];
+        if (!col || RAY_IS_ERR(col) || col->type != RAY_MAPCOMMON) continue;
+        ray_t* rc = ((ray_t**)ray_data(col))[1];
+        if (rc && !RAY_IS_ERR(rc)) {
+            x->counts = (const int64_t*)ray_data(rc);
+            x->nparts = rc->len;
+        }
+        break;
+    }
+}
+
+/* Rows of partition p: the partition-key count; without a key column, the
+ * longest segment any parted column holds for that partition. */
+static int64_t serde_part_rows(const serde_parted_t* x, int64_t p) {
+    if (x->counts) return p < x->nparts ? x->counts[p] : 0;
+    int64_t n = 0;
+    for (int64_t c = 0; c < x->ncols; c++) {
+        ray_t* col = x->cols[c];
+        if (!col || RAY_IS_ERR(col) || !RAY_IS_PARTED(col->type) || p >= col->len)
+            continue;
+        ray_t* seg = ((ray_t**)ray_data(col))[p];
+        if (seg && !RAY_IS_ERR(seg) && seg->len > n) n = seg->len;
+    }
+    return n;
+}
+
+/* Rows a segment slot contributes: its own length, or for a NULL segment
+ * the partition's row count (written as nulls). */
+static int64_t serde_seg_rows(const serde_parted_t* x, ray_t* seg, int64_t p) {
+    if (seg && !RAY_IS_ERR(seg)) return seg->len;
+    return serde_part_rows(x, p);
+}
+
+/* Type, attrs and length of the flat vector a parted column stands for.
+ * HAS_NULLS is the OR over the segments (as the flattened column carries
+ * it), set too when a NULL segment fills rows with nulls of a nullable
+ * type.  BOOL/U8 have no null: their missing rows are written as 0. */
+static int64_t serde_parted_header(const serde_parted_t* x, ray_t* col,
+                                   int8_t* type, uint8_t* attrs) {
+    int64_t total = 0;
+    uint8_t a = 0;
+    if (col->type == RAY_MAPCOMMON) {
+        ray_t* kv = ((ray_t**)ray_data(col))[0];
+        ray_t* rc = ((ray_t**)ray_data(col))[1];
+        *type = kv ? kv->type : 0;
+        if (rc) {
+            const int64_t* cnt = (const int64_t*)ray_data(rc);
+            for (int64_t p = 0; p < rc->len; p++) total += cnt[p];
+        }
+    } else {
+        int8_t base = (int8_t)RAY_PARTED_BASETYPE(col->type);
+        ray_t** segs = (ray_t**)ray_data(col);
+        *type = base;
+        for (int64_t p = 0; p < col->len; p++) {
+            ray_t* seg = segs[p];
+            int64_t n = serde_seg_rows(x, seg, p);
+            total += n;
+            if (seg && !RAY_IS_ERR(seg)) a |= seg->attrs & RAY_ATTR_HAS_NULLS;
+            else if (n > 0 && base != RAY_BOOL && base != RAY_U8 && base != RAY_LIST)
+                a |= RAY_ATTR_HAS_NULLS;
+        }
+    }
+    *attrs = a;
+    return total;
+}
+
+static int64_t serde_parted_col_size(const serde_parted_t* x, ray_t* col) {
+    int8_t type; uint8_t attrs;
+    int64_t total = serde_parted_header(x, col, &type, &attrs);
+    if (total < 0 || total > (INT64_MAX - 32) / 16) return -1;
+    int64_t esz = serde_fixed_esz(type);
+    if (esz) return 1 + 1 + 8 + total * esz;
+
+    int64_t size = 1 + 1 + 8;
+    if (col->type == RAY_MAPCOMMON) {
+        /* keys: DATE / I64 are fixed-width (above); SYM keys repeat */
+        ray_t* kv = ((ray_t**)ray_data(col))[0];
+        ray_t* rc = ((ray_t**)ray_data(col))[1];
+        if (type != RAY_SYM || !kv || !rc) return 0;
+        const int64_t* cnt = (const int64_t*)ray_data(rc);
+        for (int64_t p = 0; p < rc->len && p < kv->len; p++) {
+            ray_t* a = ray_sym_vec_cell(kv, p);
+            size += cnt[p] * ((a ? (int64_t)ray_str_len(a) : 0) + 1);
+        }
+        return size;
+    }
+    ray_t** segs = (ray_t**)ray_data(col);
+    for (int64_t p = 0; p < col->len; p++) {
+        ray_t* seg = segs[p];
+        if (!seg || RAY_IS_ERR(seg)) {
+            /* null rows: SYM "" + NUL, STR length 0, LIST the null marker */
+            int64_t n = serde_part_rows(x, p);
+            if (type == RAY_SYM || type == RAY_LIST) size += n;
+            else if (type == RAY_STR)                size += n * 8;
+            else return 0;
+            continue;
+        }
+        if (type == RAY_SYM)      size += sym_cells_size(seg);
+        else if (type == RAY_STR) size += str_cells_size(seg);
+        else if (type == RAY_LIST) {
+            ray_t** elems = (ray_t**)ray_data(seg);
+            for (int64_t i = 0; i < seg->len; i++) {
+                int64_t child = ray_serde_size(elems[i]);
+                if (child <= 0) return child;
+                size += child;
+            }
+        } else return 0;
+    }
+    return size;
+}
+
+/* Typed null cells of a fixed-width type (the NULL_* sentinels; GUID all
+ * zero bytes; BOOL/U8, which have none, 0). */
+static void serde_fill_nulls(uint8_t* buf, int8_t type, int64_t n) {
+    switch (type) {
+    case RAY_F64: {
+        double v = NULL_F64;
+        for (int64_t i = 0; i < n; i++) memcpy(buf + i * 8, &v, 8);
+        return;
+    }
+    case RAY_F32: {
+        float v = NULL_F32;
+        for (int64_t i = 0; i < n; i++) memcpy(buf + i * 4, &v, 4);
+        return;
+    }
+    case RAY_I64: case RAY_TIMESTAMP: {
+        int64_t v = NULL_I64;
+        for (int64_t i = 0; i < n; i++) memcpy(buf + i * 8, &v, 8);
+        return;
+    }
+    case RAY_I32: case RAY_DATE: case RAY_TIME: {
+        int32_t v = NULL_I32;
+        for (int64_t i = 0; i < n; i++) memcpy(buf + i * 4, &v, 4);
+        return;
+    }
+    case RAY_I16: {
+        int16_t v = NULL_I16;
+        for (int64_t i = 0; i < n; i++) memcpy(buf + i * 2, &v, 2);
+        return;
+    }
+    default:
+        memset(buf, 0, (size_t)(n * serde_fixed_esz(type)));
+        return;
+    }
+}
+
+static int64_t serde_parted_col_write(uint8_t* buf, const serde_parted_t* x,
+                                      ray_t* col) {
+    int8_t type; uint8_t attrs;
+    int64_t total = serde_parted_header(x, col, &type, &attrs);
+    buf[0] = (uint8_t)type;
+    buf[1] = attrs;
+    memcpy(buf + 2, &total, 8);
+    int64_t c = 1 + 1 + 8;
+    int64_t esz = serde_fixed_esz(type);
+
+    if (col->type == RAY_MAPCOMMON) {
+        ray_t* kv = ((ray_t**)ray_data(col))[0];
+        ray_t* rc = ((ray_t**)ray_data(col))[1];
+        if (!kv || !rc) return 0;
+        const int64_t* cnt = (const int64_t*)ray_data(rc);
+        for (int64_t p = 0; p < rc->len && p < kv->len; p++) {
+            if (esz) {
+                const uint8_t* key = (const uint8_t*)ray_data(kv) + p * esz;
+                for (int64_t r = 0; r < cnt[p]; r++, c += esz)
+                    memcpy(buf + c, key, (size_t)esz);
+            } else if (type == RAY_SYM) {
+                ray_t* a = ray_sym_vec_cell(kv, p);
+                size_t slen = a ? ray_str_len(a) : 0;
+                const char* sp = a ? ray_str_ptr(a) : NULL;
+                for (int64_t r = 0; r < cnt[p]; r++) {
+                    if (slen) { memcpy(buf + c, sp, slen); c += (int64_t)slen; }
+                    buf[c++] = '\0';
+                }
+            } else return 0;
+        }
+        return c;
+    }
+
+    ray_t** segs = (ray_t**)ray_data(col);
+    for (int64_t p = 0; p < col->len; p++) {
+        ray_t* seg = segs[p];
+        if (!seg || RAY_IS_ERR(seg)) {
+            int64_t n = serde_part_rows(x, p);
+            if (esz) {
+                serde_fill_nulls(buf + c, type, n);
+                c += n * esz;
+            } else if (type == RAY_SYM) {
+                memset(buf + c, 0, (size_t)n);
+                c += n;
+            } else if (type == RAY_STR) {
+                memset(buf + c, 0, (size_t)(n * 8));
+                c += n * 8;
+            } else if (type == RAY_LIST) {
+                memset(buf + c, RAY_SERDE_NULL, (size_t)n);
+                c += n;
+            } else return 0;
+            continue;
+        }
+        if (esz) {
+            memcpy(buf + c, ray_data(seg), (size_t)(seg->len * esz));
+            c += seg->len * esz;
+        } else if (type == RAY_SYM) {
+            c += sym_cells_write(buf + c, seg);
+        } else if (type == RAY_STR) {
+            c += str_cells_write(buf + c, seg);
+        } else if (type == RAY_LIST) {
+            ray_t** elems = (ray_t**)ray_data(seg);
+            for (int64_t i = 0; i < seg->len; i++) {
+                int64_t child = ray_ser_raw(buf + c, elems[i]);
+                if (child <= 0) return child;
+                c += child;
+            }
+        } else return 0;
+    }
+    return c;
+}
+
+/* The column list of a parted table, laid out as ray_ser_raw lays out the
+ * RAY_LIST of a flat table's columns. */
+static int64_t serde_parted_cols_size(ray_t* tbl) {
+    serde_parted_t x;
+    serde_parted_init(&x, tbl);
+    int64_t size = 1 + 1 + 8;
+    for (int64_t c = 0; c < x.ncols; c++) {
+        ray_t* col = x.cols[c];
+        int64_t child = serde_col_is_parted(col) ? serde_parted_col_size(&x, col)
+                                                 : ray_serde_size(col);
+        if (child <= 0) return child;
+        size += child;
+    }
+    return size;
+}
+
+static int64_t serde_parted_cols_write(uint8_t* buf, ray_t* tbl) {
+    serde_parted_t x;
+    serde_parted_init(&x, tbl);
+    ray_t* cols = ((ray_t**)ray_data(tbl))[1];
+    buf[0] = (uint8_t)RAY_LIST;
+    buf[1] = cols->attrs & RAY_SERDE_ATTR_WIRE_MASK;
+    memcpy(buf + 2, &cols->len, 8);
+    int64_t c = 1 + 1 + 8;
+    for (int64_t i = 0; i < x.ncols; i++) {
+        ray_t* col = x.cols[i];
+        int64_t child = serde_col_is_parted(col) ? serde_parted_col_write(buf + c, &x, col)
+                                                 : ray_ser_raw(buf + c, col);
+        if (child <= 0) return child;
+        c += child;
+    }
+    return c;
+}
+
 /* --------------------------------------------------------------------------
  * ray_serde_size — calculate serialized size (excluding IPC header)
  * -------------------------------------------------------------------------- */
@@ -275,47 +682,8 @@ int64_t ray_serde_size(ray_t* obj) {
     case RAY_TIMESTAMP:
     case RAY_F64:       return 1 + 1 + 8 + obj->len * 8;
     case RAY_GUID:      return 1 + 1 + 8 + obj->len * 16;
-    case RAY_SYM: {
-        /* SYM VECTOR cells are positions in THE VEC's domain — resolve
-         * each through ray_sym_vec_cell, not the global table (sym-domain
-         * Phase 2; identical strings while the domain is the runtime
-         * singleton).  Also honors narrow W8/16/32 index widths.  Must
-         * stay in lockstep with the ray_ser_raw RAY_SYM loop below. */
-        int64_t size = 1 + 1 + 8;
-        int64_t i = 0;
-        if (sym_enc_cacheable(obj)) {
-            const void* data = ray_data(obj);
-            uint8_t attrs = obj->attrs;
-            uint32_t seen = 0, hits = 0;
-            for (; i < obj->len; i++) {
-                int64_t id = ray_read_sym(data, i, RAY_SYM, attrs);
-                sym_enc_ent* e = &g_sym_enc_cache[(uint64_t)id & (SYM_ENC_CACHE_N - 1)];
-                if (e->ptr && e->id == id) { size += (int64_t)e->len + 1; hits++; }
-                else {
-                    ray_t* a = ray_sym_str(id);
-                    uint32_t l = a ? (uint32_t)ray_str_len(a) : 0u;
-                    const char* pp = a ? ray_str_ptr(a) : NULL;
-                    if (pp) { e->ptr = pp; e->len = l; e->id = id; }
-                    size += (int64_t)l + 1;
-                }
-                /* Thrashing column: leave the rest to the plain loop below,
-                 * which is what this path costs without a cache. */
-                if (++seen == SYM_ENC_SAMPLE && hits * 4u < seen) { i++; break; }
-            }
-        }
-        for (; i < obj->len; i++) {
-            ray_t* a = ray_sym_vec_cell(obj, i);
-            size += (a ? (int64_t)ray_str_len(a) : 0) + 1;
-        }
-        return size;
-    }
-    case RAY_STR: {
-        int64_t size = 1 + 1 + 8;
-        ray_str_t* elems = (ray_str_t*)ray_data(obj);
-        for (int64_t i = 0; i < obj->len; i++)
-            size += 8 + elems[i].len; /* i64 length + raw bytes */
-        return size;
-    }
+    case RAY_SYM:       return 1 + 1 + 8 + sym_cells_size(obj);
+    case RAY_STR:       return 1 + 1 + 8 + str_cells_size(obj);
     case RAY_LIST: {
         int64_t size = 1 + 1 + 8;
         ray_t** elems = (ray_t**)ray_data(obj);
@@ -331,7 +699,8 @@ int64_t ray_serde_size(ray_t* obj) {
         ray_t** slots = (ray_t**)ray_data(obj);
         int64_t schema = schema_names_serde_size(slots[0]);
         if (schema <= 0) return schema;
-        int64_t cols = ray_serde_size(slots[1]);
+        int64_t cols = serde_table_is_parted(obj) ? serde_parted_cols_size(obj)
+                                                  : ray_serde_size(slots[1]);
         if (cols <= 0) return cols;
         return 1 + 1 + schema + cols;
     }
@@ -535,61 +904,16 @@ int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
     }
     case RAY_SYM: {
         /* Cells resolve through THE VEC's domain (sym-domain Phase 2);
-         * the wire format is unchanged — only the resolution source.
-         * Must stay in lockstep with the ray_serde_size RAY_SYM loop. */
+         * the wire format is unchanged — only the resolution source. */
         buf[0] = wire_attrs; buf++;
         memcpy(buf, &obj->len, 8); buf += 8;
-        c = 0;
-        {
-            int64_t i = 0;
-            if (sym_enc_cacheable(obj)) {
-                const void* data = ray_data(obj);
-                uint8_t attrs = obj->attrs;
-                uint32_t seen = 0, hits = 0;
-                for (; i < obj->len; i++) {
-                    int64_t id = ray_read_sym(data, i, RAY_SYM, attrs);
-                    sym_enc_ent* e = &g_sym_enc_cache[(uint64_t)id & (SYM_ENC_CACHE_N - 1)];
-                    const char* pp; uint32_t slen;
-                    if (e->ptr && e->id == id) { pp = e->ptr; slen = e->len; hits++; }
-                    else {
-                        ray_t* a = ray_sym_str(id);
-                        slen = a ? (uint32_t)ray_str_len(a) : 0u;
-                        pp   = a ? ray_str_ptr(a) : NULL;
-                        if (pp) { e->ptr = pp; e->len = slen; e->id = id; }
-                    }
-                    if (slen) { memcpy(buf + c, pp, slen); c += (int64_t)slen; }
-                    buf[c++] = '\0';
-                    if (++seen == SYM_ENC_SAMPLE && hits * 4u < seen) { i++; break; }
-                }
-            }
-            for (; i < obj->len; i++) {
-                ray_t* a = ray_sym_vec_cell(obj, i);
-                if (a) {
-                    size_t slen = ray_str_len(a);
-                    memcpy(buf + c, ray_str_ptr(a), slen);
-                    c += (int64_t)slen;
-                }
-                buf[c++] = '\0';
-            }
-        }
-        return 1 + 1 + 8 + c;
+        return 1 + 1 + 8 + sym_cells_write(buf, obj);
     }
 
     case RAY_STR: {
         buf[0] = wire_attrs; buf++;
         memcpy(buf, &obj->len, 8); buf += 8;
-        ray_str_t* elems = (ray_str_t*)ray_data(obj);
-        const char* pool = obj->str_pool ? (const char*)ray_data(obj->str_pool) : NULL;
-        c = 0;
-        for (int64_t i = 0; i < obj->len; i++) {
-            int64_t slen = (int64_t)elems[i].len;
-            memcpy(buf + c, &slen, 8);
-            c += 8;
-            const char* p = ray_str_t_ptr(&elems[i], pool);
-            memcpy(buf + c, p, (size_t)slen);
-            c += slen;
-        }
-        return 1 + 1 + 8 + c;
+        return 1 + 1 + 8 + str_cells_write(buf, obj);
     }
 
     case RAY_LIST: {
@@ -614,7 +938,9 @@ int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
         ray_t** slots = (ray_t**)ray_data(obj);
         c = ser_schema_names(buf, slots[0]);     /* schema names as RAY_SYM vector */
         if (c <= 0) return c;
-        int64_t cols = ray_ser_raw(buf + c, slots[1]);     /* cols (RAY_LIST) */
+        int64_t cols = serde_table_is_parted(obj)          /* cols (RAY_LIST) */
+                     ? serde_parted_cols_write(buf + c, obj)
+                     : ray_ser_raw(buf + c, slots[1]);
         if (cols <= 0) return cols;
         c += cols;
         return 1 + 1 + c;

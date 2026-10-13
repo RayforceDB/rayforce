@@ -1230,6 +1230,7 @@ ray_t* ray_in_vec_exec(ray_t* col, ray_t* set, bool negate) {
 }
 
 static ray_t* flatten_parted_col(ray_t* col);
+static ray_t* flatten_parted_table(ray_t* tbl);
 
 /* General membership fallback: the typed `in` kernel bails on guid operands
  * (16-byte cells it can't compare) and on string columns (variable-length
@@ -3005,6 +3006,19 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 input = compacted;
                 tbl = compacted;
             }
+            /* An all-pass where: leaves no selection and hands over the
+             * source itself; a parted source still has segmented columns,
+             * which the sort cannot gather.  Sort a flattened copy, as the
+             * partial-where path above does. */
+            if (!g->selection && tbl && tbl->type == RAY_TABLE) {
+                ray_t* flat = flatten_parted_table(tbl);
+                if (flat) {
+                    ray_release(input);
+                    if (RAY_IS_ERR(flat)) return flat;
+                    input = flat;
+                    tbl = flat;
+                }
+            }
             ray_t* result = exec_sort(g, op, tbl, 0);
             ray_release(input);
             return result;
@@ -3260,6 +3274,16 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     g->selection = NULL;
                     sort_input = compacted;
                     tbl = compacted;
+                }
+                /* All-pass where: over a parted source: see OP_SORT */
+                if (!g->selection && tbl && tbl->type == RAY_TABLE) {
+                    ray_t* flat = flatten_parted_table(tbl);
+                    if (flat) {
+                        ray_release(sort_input);
+                        if (RAY_IS_ERR(flat)) return flat;
+                        sort_input = flat;
+                        tbl = flat;
+                    }
                 }
                 ray_t* result = exec_sort(g, child_op, tbl, n);
                 ray_release(sort_input);
@@ -4445,6 +4469,38 @@ static ray_t* flatten_parted_col(ray_t* col) {
     return flat;
 }
 
+/* A flattened copy of `tbl` when any column is parted / mapcommon, built
+ * without mutating the (possibly stored) source; NULL when every column is
+ * already dense.  Returns an owned table or a RAY_ERR. */
+static ray_t* flatten_parted_table(ray_t* tbl) {
+    int64_t ncols = ray_table_ncols(tbl);
+    bool any_parted = false;
+    for (int64_t c = 0; c < ncols; c++) {
+        ray_t* col = ray_table_get_col_idx(tbl, c);
+        if (col && (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON)) {
+            any_parted = true; break;
+        }
+    }
+    if (!any_parted) return NULL;
+    ray_t* out = ray_table_new(ncols);
+    for (int64_t c = 0; out && !RAY_IS_ERR(out) && c < ncols; c++) {
+        ray_t* col = ray_table_get_col_idx(tbl, c);
+        int64_t name = ray_table_col_name(tbl, c);
+        if (col && (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON)) {
+            ray_t* flat = flatten_parted_col(col);
+            if (!flat || RAY_IS_ERR(flat)) {
+                ray_release(out);
+                return flat ? flat : ray_error("oom", NULL);
+            }
+            out = ray_table_add_col(out, name, flat);
+            ray_release(flat);
+        } else if (col) {
+            out = ray_table_add_col(out, name, col);
+        }
+    }
+    return out ? out : ray_error("oom", NULL);
+}
+
 static ray_t* ray_execute_inner(ray_graph_t* g, ray_op_t* root, bool reset_cancel) {
     if (!g || !root) return ray_error("nyi", NULL);
 
@@ -4514,31 +4570,8 @@ static ray_t* ray_execute_inner(ray_graph_t* g, ray_op_t* root, bool reset_cance
              * sel_compact.  Build a flattened copy (never mutating the
              * possibly-stored source) so downstream at/count/first see dense
              * columns, matching the partial-filter path. */
-            int64_t ncols = ray_table_ncols(result);
-            bool any_parted = false;
-            for (int64_t c = 0; c < ncols; c++) {
-                ray_t* col = ray_table_get_col_idx(result, c);
-                if (col && (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON)) {
-                    any_parted = true; break;
-                }
-            }
-            if (any_parted) {
-                ray_t* out = ray_table_new(ncols);
-                for (int64_t c = 0; out && !RAY_IS_ERR(out) && c < ncols; c++) {
-                    ray_t* col = ray_table_get_col_idx(result, c);
-                    int64_t name = ray_table_col_name(result, c);
-                    if (col && (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON)) {
-                        ray_t* flat = flatten_parted_col(col);
-                        if (!flat || RAY_IS_ERR(flat)) {
-                            ray_release(out); ray_release(result);
-                            return flat ? flat : ray_error("oom", NULL);
-                        }
-                        out = ray_table_add_col(out, name, flat);
-                        ray_release(flat);
-                    } else if (col) {
-                        out = ray_table_add_col(out, name, col);
-                    }
-                }
+            ray_t* out = flatten_parted_table(result);
+            if (out) {
                 ray_release(result);
                 result = out;
             }
