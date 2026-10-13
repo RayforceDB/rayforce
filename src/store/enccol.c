@@ -427,7 +427,6 @@ static ray_t* chunk_descs_validate(ray_enccol_t* e, int64_t c, const ray_enc_des
                                    const ray_enc_dirent_t* dep) {
     static const uint8_t zero[48];
     const ray_enc_dirent_t de = *dep;
-    atomic_fetch_add_explicit(&g_desc_validations, 1, memory_order_relaxed);
     int64_t rows = chunk_rows(e, c);
     int nv = (int)((rows + RAY_ENC_VEC - 1) / RAY_ENC_VEC);
     uint64_t at = RAY_ENC_DESC_AREA;
@@ -533,8 +532,11 @@ ray_t* ray_enccol_chunk_descs_ref(ray_enccol_t* e, int64_t c, const ray_enc_desc
     const ray_enc_desc_t* d = (const ray_enc_desc_t*)p;
     if (!chunk_validated(e, c)) {
         ray_t* err = chunk_descs_validate(e, c, d, p, &de);
+        /* The test hook counts failed validations and the one that marks
+         * the chunk, not the racing first readers that lose the mark. */
+        if (err || !e->desc_ok || !atomic_exchange_explicit(&e->desc_ok[c], 1, memory_order_acq_rel))
+            atomic_fetch_add_explicit(&g_desc_validations, 1, memory_order_relaxed);
         if (err) return err;
-        if (e->desc_ok) atomic_store_explicit(&e->desc_ok[c], 1, memory_order_release);
     }
     *out = d;
     return NULL;
