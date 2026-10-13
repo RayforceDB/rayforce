@@ -46,6 +46,13 @@
 #include "vec/vec.h"
 #include <string.h>
 #include <math.h>
+#include <stdbool.h>
+#include <stdint.h>
+
+/* Shared strict parser for launcher flags and .sys.args.  When core_count is
+ * true, values are limited to the heap registry's total worker capacity. */
+int parse_sys_int_arg(const char* s, bool nonnegative, bool core_count,
+                      int64_t* out);
 
 /* True if every leaf is constant or reduced to a scalar. */
 bool op_tree_is_scalar(ray_graph_t* g, uint32_t id);

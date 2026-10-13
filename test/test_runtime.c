@@ -679,6 +679,7 @@ static test_result_t test_build_sys_args_rejects_malformed_numbers(void) {
     char* cases[][3] = {
         { "rayforce", "-c", "2abc" },
         { "rayforce", "-c", "999999999999999999999999" },
+        { "rayforce", "-c", "1025" },
         { "rayforce", "-t", "1abc" },
         { "rayforce", "-Q", "0abc" },
     };
