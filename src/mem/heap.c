@@ -968,8 +968,8 @@ static void ray_release_owned_refs(ray_t* v) {
             return;
         }
         /* I64 atom tagged as a Datalog program owns the program block.  The
-         * explicit dl-free path clears this tag first, so scope cleanup is
-         * safe and does not double-free an already released handle. */
+         * explicit dl-free path clears the tag and pointer after early
+         * release, so scope cleanup does not free the program a second time. */
         if (v->type == -RAY_I64 && (v->attrs & RAY_ATTR_DLPROG)) {
             dl_program_free((dl_program_t*)(uintptr_t)v->i64);
             v->i64 = 0;
@@ -1113,6 +1113,13 @@ bool ray_retain_owned_refs(ray_t* v) {
             v->attrs &= (uint8_t)~RAY_ATTR_GRAPH;
             return true;
         }
+        /* Datalog program handles follow the graph handle policy: the
+         * shallow block copy is not a second owner, so detach its pointer. */
+        if (v->type == -RAY_I64 && (v->attrs & RAY_ATTR_DLPROG)) {
+            v->i64 = 0;
+            v->attrs &= (uint8_t)~RAY_ATTR_DLPROG;
+            return true;
+        }
         if (ray_atom_owns_obj(v) && v->obj && !RAY_IS_ERR(v->obj))
             ray_retain(v->obj);
         return true;
@@ -1218,6 +1225,13 @@ static void ray_detach_owned_refs(ray_t* v) {
         if (v->type == -RAY_I64 && (v->attrs & RAY_ATTR_GRAPH)) {
             v->i64 = 0;
             v->attrs &= (uint8_t)~RAY_ATTR_GRAPH;
+            return;
+        }
+        /* Datalog program ownership moved with the memcpy; keep the old
+         * block's finalizer from freeing the program now owned by new_v. */
+        if (v->type == -RAY_I64 && (v->attrs & RAY_ATTR_DLPROG)) {
+            v->i64 = 0;
+            v->attrs &= (uint8_t)~RAY_ATTR_DLPROG;
             return;
         }
         if (ray_atom_owns_obj(v)) v->obj = NULL;

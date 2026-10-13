@@ -237,7 +237,7 @@ int64_t ray_serde_size(ray_t* obj) {
         case RAY_TIME:
         case RAY_F32:       return 1 + 1 + 4;
         case RAY_I64:
-            if (obj->attrs & RAY_ATTR_GRAPH) return 0;
+            if (obj->attrs & (RAY_ATTR_GRAPH | RAY_ATTR_DLPROG)) return 0;
             return 1 + 1 + 8;
         case RAY_TIMESTAMP:
         case RAY_F64:       return 1 + 1 + 8;
@@ -408,7 +408,8 @@ int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
      * carries the typed-null marker (aux[0] & 1 on the source atom)
      * so (de (ser 0Nl)) roundtrips instead of decoding as plain 0. */
     if (type < 0) {
-        if (type == -RAY_I64 && (obj->attrs & RAY_ATTR_GRAPH)) return 0;
+        if (type == -RAY_I64 &&
+            (obj->attrs & (RAY_ATTR_GRAPH | RAY_ATTR_DLPROG))) return 0;
         buf[0] = (uint8_t)type;
         buf++;
         uint8_t aflags = (uint8_t)(obj->aux[0] & 1);

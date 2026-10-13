@@ -103,8 +103,8 @@
  * integer or an arithmetic copy (which drops attrs) is rejected with a type
  * error instead of being reinterpreted as a pointer — see dl_unwrap_program.
  * Reuses 0x20 (RAY_ATTR_SORTED on vectors / ATTR_QUOTED on -RAY_SYM); the
- * -RAY_I64 type tag disambiguates, and no free-path or generic check reads
- * 0x20 on a -RAY_I64 atom.  User must (dl-free h). */
+ * -RAY_I64 type tag disambiguates.  The heap finalizer frees the program when
+ * its owning atom is released; users may call (dl-free h) for early release. */
 #define RAY_ATTR_DLPROG       0x20
 
 /* Vector is a linked column.  The 8 bytes of the aux union at offset
