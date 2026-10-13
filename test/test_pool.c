@@ -1144,6 +1144,46 @@ static test_result_t test_dispatch_max_ring_rounds(void) {
 }
 
 /* --------------------------------------------------------------------------
+ * Test: a cancelled multi-round dispatch stops at the round boundary.
+ *
+ * Every ticket of a cancelled window is skipped, so the rounds past the
+ * cancel point would be pure publish/wake/skip overhead (over a hundred
+ * rounds when the ring is stuck at RAY_POOL_INIT_TASKS).  The round loop
+ * checks the flag before each round: with it set at entry no window is
+ * published at all, so the ticket high-water mark does not move and fn
+ * never runs.  Covers both ray_pool_dispatch and ray_pool_dispatch_n.
+ * -------------------------------------------------------------------------- */
+
+static test_result_t test_dispatch_cancelled_skips_rounds(void) {
+    ray_heap_init();
+
+    ray_pool_t pool;
+    TEST_ASSERT_EQ_I(ray_pool_create(&pool, 1), RAY_OK);
+
+    pool_count_ctx_t ctx = {0};
+    uint64_t limit0 = atomic_load(&pool.task_limit);
+    atomic_store(&pool.cancelled, 1);
+
+    ray_pool_dispatch(&pool, pool_count_fn, &ctx, 70000LL * 8192);
+    TEST_ASSERT_EQ_I(atomic_load(&ctx.calls), 0);
+    TEST_ASSERT_EQ_U(atomic_load(&pool.task_limit), limit0);
+
+    ray_pool_dispatch_n(&pool, pool_count_fn, &ctx, 70000u);
+    TEST_ASSERT_EQ_I(atomic_load(&ctx.calls), 0);
+    TEST_ASSERT_EQ_U(atomic_load(&pool.task_limit), limit0);
+
+    /* Cleared again, the same dispatch runs every task once. */
+    atomic_store(&pool.cancelled, 0);
+    ray_pool_dispatch(&pool, pool_count_fn, &ctx, 70000LL * 8192);
+    TEST_ASSERT_EQ_I(atomic_load(&ctx.calls), 70000);
+    TEST_ASSERT_EQ_I(atomic_load(&ctx.elem_sum), 70000LL * 8192);
+
+    ray_pool_free(&pool);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
  * Test: ray_pool_destroy on uninitialized state is a no-op.
  *
  * Already partly covered by test_pool_destroy_and_reinit (calling destroy
@@ -2442,6 +2482,7 @@ const test_entry_t pool_entries[] = {
     { "pool/workers_participate",   test_dispatch_workers_participate, NULL, NULL },
     { "pool/dispatch_n_max_ring",   test_dispatch_n_max_ring_cap_clamp, NULL, NULL },
     { "pool/dispatch_max_ring",     test_dispatch_max_ring_rounds, NULL, NULL },
+    { "pool/dispatch_cancel_rounds", test_dispatch_cancelled_skips_rounds, NULL, NULL },
     { "pool/destroy_when_uninit",   test_destroy_when_uninit,   NULL, NULL },
     { "pool/dispatch_n_multi_grow", test_dispatch_n_multi_grow, NULL, NULL },
     { "pool/dispatch_n_exact_cap",  test_dispatch_n_exact_cap,  NULL, NULL },

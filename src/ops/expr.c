@@ -2244,10 +2244,10 @@ ray_t* expr_eval_full(const ray_expr_t* expr, int64_t nrows) {
 /* Allocate + init one rowsel builder per dispatched grain task (parallel) or a
  * single builder over all segments (serial).  ray_pool_dispatch carves task i
  * as [i*grain, min((i+1)*grain, nrows)); grain is morsel-aligned so each task
- * owns a contiguous run of whole segments.  On return *parallel and *n_builders
- * describe the dispatch geometry.  Returns NULL when the table needs more tasks
- * than RAY_POOL_MAX_TASKS (bounds the builder array) or on OOM — caller falls
- * back to the bool path. */
+ * owns a contiguous run of whole segments; tasks past the ring run in further
+ * rounds of the same grain, so one builder per task holds for any table.  On
+ * return *parallel and *n_builders describe the dispatch geometry.  Returns
+ * NULL on OOM — caller falls back to the bool path. */
 static rowsel_builder_t* pred_sel_builders_alloc(int64_t nrows, ray_pool_t* pool,
                                                  bool* parallel,
                                                  uint32_t* n_builders_out) {
@@ -2256,7 +2256,6 @@ static rowsel_builder_t* pred_sel_builders_alloc(int64_t nrows, ray_pool_t* pool
     bool          par    = (pool && nrows >= RAY_PARALLEL_THRESHOLD);
 
     uint32_t n_builders = par ? (uint32_t)((nrows + grain - 1) / grain) : 1u;
-    if (par && n_builders > RAY_POOL_MAX_TASKS) return NULL;
 
     rowsel_builder_t* builders =
         (rowsel_builder_t*)ray_alloc_raw((size_t)n_builders * sizeof(rowsel_builder_t));
