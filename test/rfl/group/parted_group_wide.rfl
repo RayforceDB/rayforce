@@ -123,6 +123,36 @@
 (< (abs (- (first (at (un Pn) 'v)) (first (at (un Fn) 'v)))) 0.000001) -- true
 (at (select {a: (avg f) ak: (avg k) from: Pn by: date}) 'a)  -- [300.0 900.0]
 (at (select {a: (avg f) ak: (avg k) from: Pn by: date}) 'ak) -- [300.0 900.0]
+;; mixed partitions: partition 1 has no nulls (its segments carry no
+;; HAS_NULLS, so its divisor slot takes the free group row count), partition 2
+;; does (that slot sums a not-null indicator).  A user (count f) sits next to
+;; (avg f): both divisor columns were named "f_count" by the first partial, so
+;; the merge — which scans by name — read the row count for avg's divisor.
+(set mkclean (fn [n off] (do (set i (+ (til n) off)) (table [g f k] (list (% i 3) (as 'F64 i) i)))))
+(.sys.exec "rm -rf /tmp/rfl_pgwm")
+(.db.splayed.set "/tmp/rfl_pgwm/2024.01.01/t/" (mkclean 600 0))
+(.db.splayed.set "/tmp/rfl_pgwm/2024.01.02/t/" (mknull 600 600))
+(set Pm (.db.parted.get "/tmp/rfl_pgwm/" 't))
+(set Fm (concat (mkclean 600 0) (mknull 600 600)))
+(set qm (fn [T] (select {c: (count f) a: (avg f) v: (var f) ck: (count k) ak: (avg k) dk: (dev k) from: T by: g asc: g})))
+(set Bm (at (.sys.mem) 'group-perpart-runs))
+(set MP (qm Pm))
+(> (at (.sys.mem) 'group-perpart-runs) Bm) -- true
+(set MF (qm Fm))
+(last (at MP 'a)) -- 300.5
+(at MP 'a)  -- (at MF 'a)
+(at MP 'ak) -- (at MF 'ak)
+(at MP 'c)  -- (at MF 'c)
+(at MP 'ck) -- (at MF 'ck)
+(any (nil? (at MP 'v)))  -- false
+(any (nil? (at MP 'dk))) -- false
+(< (max (abs (- (at MP 'v)  (at MF 'v))))  0.000001) -- true
+(< (max (abs (- (at MP 'dk) (at MF 'dk)))) 0.000001) -- true
+;; ungrouped over the same mix
+(set um (fn [T] (select {c: (count f) a: (avg f) v: (var k) from: T})))
+(at (um Pm) 'a) -- (at (um Fm) 'a)
+(at (um Pm) 'c) -- (at (um Fm) 'c)
+(< (abs (- (first (at (um Pm) 'v)) (first (at (um Fm) 'v)))) 0.000001) -- true
 
 ;; ─── cleanup ─────────────────────────────────────────────────────────────────
-(.sys.exec "rm -rf /tmp/rfl_pgw /tmp/rfl_pgwn")
+(.sys.exec "rm -rf /tmp/rfl_pgw /tmp/rfl_pgwn /tmp/rfl_pgwm")

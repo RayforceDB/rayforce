@@ -12303,6 +12303,31 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         agg_vecs[a] = bcast;
         agg_owned[a] = 1;
     }
+    /* Same for the second input of a binary agg (wsum/wavg/cov/scov/
+     * pearson_corr): a literal or constant-folded operand is an atom, and
+     * the pair loops index it per row. */
+    for (uint32_t a = 0; a < n_aggs; a++) {
+        if (!agg_vecs2[a] || RAY_IS_ERR(agg_vecs2[a])) continue;
+        bool needs_broadcast = ray_is_atom(agg_vecs2[a]) ||
+                               (agg_vecs2[a]->type > 0 && agg_vecs2[a]->len == 1 && nrows > 1);
+        if (!needs_broadcast) continue;
+
+        ray_t* bcast = materialize_broadcast_input(agg_vecs2[a], nrows);
+        if (!bcast || RAY_IS_ERR(bcast)) {
+            for (uint32_t i = 0; i < n_aggs; i++) {
+                { if (agg_owned[i] && agg_vecs[i]) ray_release(agg_vecs[i]); if (agg_owned2[i] && agg_vecs2[i]) ray_release(agg_vecs2[i]); }
+            }
+            for (uint32_t k = 0; k < n_keys; k++) {
+                if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+            }
+            scratch_free(vla_hdr);
+            return bcast && RAY_IS_ERR(bcast) ? bcast : ray_error("oom", NULL);
+        }
+
+        if (agg_owned2[a]) ray_release(agg_vecs2[a]);
+        agg_vecs2[a] = bcast;
+        agg_owned2[a] = 1;
+    }
 
     /* Pre-compute key metadata.  VLA sized to vla_keys (== max(n_keys,1)),
      * matching key_vecs above: the width guard is retired (unbounded-slots
@@ -16510,8 +16535,9 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
     /* Decomposition: AVG(x) → SUM(x) + COUNT(x).
      * STDDEV/VAR(x) → SUM(x) + SUM(x²) + COUNT(x).
      * COUNT(x) here is the NON-NULL count (SUM skips null x, so the divisor
-     * must too): it is computed as SUM over a not-null I64 indicator, never
-     * OP_COUNT, which is the group row count (nulls included).
+     * must too).  OP_COUNT is the group row count (nulls included), so it is
+     * used only for a partition whose segment cannot hold nulls; otherwise
+     * the slot sums a not-null indicator (chosen per partition below).
      * Build per-partition agg_ops with decomposed ops, then merge ops.
      * part_ops/merge_ops/avg_idx/std_idx/std_orig_op/std_sq_slot/std_cnt_slot
      * are carved above; n_avg/n_std are recounted here to fill them. */
@@ -16729,10 +16755,27 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                 ray_op_t* xf = (x->out_type == RAY_F64) ? x : ray_cast(pg, x, RAY_F64);
                 pagg_ins[sq] = ray_mul(pg, xf, xf);
             }
-            /* Non-null COUNT(x) slots: SUM(not(isnull x)) as I64. */
-            for (uint32_t a = cnt_slot_lo; a < part_n_aggs; a++)
-                pagg_ins[a] = ray_cast(pg, ray_not(pg, ray_isnull(pg, pagg_ins[a])),
-                                       RAY_I64);
+            /* Non-null COUNT(x) slots.  A plain column segment without
+             * HAS_NULLS takes OP_COUNT (the group row count): the partition's
+             * SUM(x) skips nothing either — the group engine gates its own
+             * null skip (NaN or sentinel) on the same attr — so the row count
+             * is the matching divisor and costs nothing.  A segment that may
+             * hold nulls, or an expression input, sums a not-null BOOL
+             * indicator instead (SUM over BOOL emits I64).  The op is chosen
+             * per partition; COUNT and SUM both emit I64 and the merge op
+             * stays SUM, so the partials concatenate unchanged. */
+            for (uint32_t a = cnt_slot_lo; a < part_n_aggs; a++) {
+                uint32_t ci = a - cnt_slot_lo;
+                uint32_t src_a = ci < n_avg ? avg_idx[ci] : std_idx[ci - n_avg];
+                ray_t* xc = agg_is_expr[src_a] ? NULL
+                          : ray_table_get_col(sub, part_agg_syms[a]);
+                if (xc && !ray_vec_may_have_nulls(xc)) {
+                    part_ops[a] = OP_COUNT;
+                } else {
+                    part_ops[a] = OP_SUM;
+                    pagg_ins[a] = ray_not(pg, ray_isnull(pg, pagg_ins[a]));
+                }
+            }
 
             ray_op_t* proot = ray_group(pg, pkeys, n_part_keys,
                                        part_ops, pagg_ins, part_n_aggs);
@@ -16770,6 +16813,16 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                 for (uint32_t a = 0; a < part_n_aggs; a++)
                     agg_name_ids[a] = ray_table_col_name(
                         bp[bi], (int64_t)n_part_keys + a);
+                /* The non-null COUNT slots switch between OP_COUNT and
+                 * SUM(indicator) per partition, so the first partial's name
+                 * for one ("x_count") can collide with a user (count x) slot
+                 * while their merged values differ.  The merge scans by name,
+                 * so give each its own synthetic name. */
+                for (uint32_t a = cnt_slot_lo; a < part_n_aggs; a++) {
+                    char nbuf[24];
+                    int nl = snprintf(nbuf, sizeof(nbuf), "_gpnn%u", (unsigned)a);
+                    agg_name_ids[a] = ray_sym_intern(nbuf, (size_t)nl);
+                }
                 agg_names_captured = 1;
             }
         }
