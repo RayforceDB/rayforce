@@ -524,8 +524,8 @@ spills exactly as it did before.
 | `.sys.args` | nullary | Application arguments as a typed dict (`user` subdict for post-`--` args) | `(.sys.args)` |
 | `env` | unary | List all global environment bindings | `(env 0)` |
 | `.sys.build` | nullary | Build metadata: `version` + `build-date` | `(.sys.build)` |
-| `.sys.mem` | variadic | Memory allocator statistics (alloc/peak/slab) | `(.sys.mem)` |
-| `.sys.info` | variadic | System information (cores, page size, memory) | `(.sys.info)` |
+| `.sys.mem` | nullary | Memory allocator statistics (alloc/peak/slab) | `(.sys.mem)` |
+| `.sys.info` | nullary | System information (cores, page size, memory) | `(.sys.info)` |
 
 ## Serialization & Storage
 
@@ -612,6 +612,8 @@ Low-level API for building and evaluating Datalog programs directly, bypassing t
 | `dl-eval` | unary | Evaluate program to fixpoint | `(dl-eval prog)` |
 | `dl-query` | binary | Query a derived or base relation | `(dl-query prog 'edge)` |
 | `dl-provenance` | binary | Reserved provenance hook; currently returns `domain: not available` | `(dl-provenance prog 'rel)` |
+
+A `dl-program` handle owns its program. Rebinding its symbol or leaving the handle's scope releases the program automatically; use `(dl-free prog)` to release it earlier.
 
 ```lisp
 ; Low-level Datalog program

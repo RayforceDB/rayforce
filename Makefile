@@ -58,6 +58,10 @@ DEBUG_CFLAGS   = -fPIC $(WARNS) -std=$(STD) -g -O0 -march=$(RAY_MARCH) -DDEBUG \
 RELEASE_CFLAGS = -fPIC $(WARNS) -std=$(STD) -O3 -march=$(RAY_MARCH) \
   -funroll-loops -fomit-frame-pointer -fno-math-errno -falign-functions=64 \
   -fassociative-math -ffp-contract=fast -fno-signed-zeros -fno-trapping-math
+# -ffunction-sections/-fdata-sections: isolate code/data so static-library
+#   clients can discard unused sections with linker GC. Keep this library-only:
+#   the server keeps nearly all code live and gains little from these flags.
+LIB_CFLAGS = $(RELEASE_CFLAGS) -ffunction-sections -fdata-sections
 # -falign-functions=64: start every function on a cache line.  The default
 #   16-byte alignment makes hot leaf functions' cost depend on where unrelated
 #   edits elsewhere in the same translation unit happen to push them —
@@ -166,6 +170,7 @@ TEST_OBJ = $(TEST_SRC:.c=.o)
 
 # Per-flavour object lists (see the flavour CFLAGS block above).
 REL_LIB_OBJ   = $(LIB_SRC:.c=.rel.o)
+LIB_LIB_OBJ   = $(LIB_SRC:.c=.lib.o)
 REL_MAIN_OBJ  = $(MAIN_SRC:.c=.rel.o)
 FUZZ_LIB_OBJ  = $(LIB_SRC:.c=.fuzz.o)
 TSAN_LIB_OBJ  = $(LIB_SRC:.c=.tsan.o)
@@ -182,7 +187,7 @@ NDEBUG_TEST_OBJ = $(TEST_SRC:.c=.ndebug.o)
 # them here would let a .d's first rule (e.g. `foo.o: ...`) become the
 # default goal, so bare `make` would build one object instead of `debug`.
 DEPS = $(LIB_OBJ:.o=.d) $(MAIN_OBJ:.o=.d) $(TEST_OBJ:.o=.d) \
-       $(REL_LIB_OBJ:.o=.d) $(REL_MAIN_OBJ:.o=.d) \
+       $(REL_LIB_OBJ:.o=.d) $(REL_MAIN_OBJ:.o=.d) $(LIB_LIB_OBJ:.o=.d) \
        $(FUZZ_LIB_OBJ:.o=.d) \
        $(TSAN_LIB_OBJ:.o=.d) $(TSAN_MAIN_OBJ:.o=.d) $(TSAN_TEST_OBJ:.o=.d) \
        $(HARD_LIB_OBJ:.o=.d) $(HARD_MAIN_OBJ:.o=.d) \
@@ -197,6 +202,9 @@ default: debug
 
 %.rel.o: %.c
 	$(CC) -c $(RELEASE_CFLAGS) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
+
+%.lib.o: %.c
+	$(CC) -c $(LIB_CFLAGS) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
 
 %.fuzz.o: %.c
 	$(CLANG) -c $(FUZZ_CFLAGS) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
@@ -216,7 +224,7 @@ default: debug
 # and the test that compares ray_git_commit against it), in every object
 # flavour.
 GIT_HASH_SRCS := src/core/types src/app/repl src/core/crash test/test_types
-GIT_HASH_OBJS := $(foreach v,.o .rel.o .fuzz.o .tsan.o .hard.o .ndebug.o,$(addsuffix $(v),$(GIT_HASH_SRCS)))
+GIT_HASH_OBJS := $(foreach v,.o .rel.o .lib.o .fuzz.o .tsan.o .hard.o .ndebug.o,$(addsuffix $(v),$(GIT_HASH_SRCS)))
 $(GIT_HASH_OBJS): $(GIT_HASH_STAMP)
 
 # Main binary for debug/test (some tests spawn ./$(TARGET) as a server).
@@ -234,8 +242,9 @@ release: $(REL_LIB_OBJ) $(REL_MAIN_OBJ)
 	$(CC) $(RELEASE_CFLAGS) -o $(TARGET) $(REL_LIB_OBJ) $(REL_MAIN_OBJ) $(LIBS) $(RELEASE_LDFLAGS)
 
 # Static library
-lib: $(REL_LIB_OBJ)
-	$(AR) rc lib$(TARGET).a $(REL_LIB_OBJ)
+lib: $(LIB_LIB_OBJ)
+	rm -f lib$(TARGET).a
+	$(AR) rc lib$(TARGET).a $(LIB_LIB_OBJ)
 
 # Release tarball: build the optimized binary and package it as
 # dist/rayforce-<version>-<os>-<arch>.tar.gz plus a SHA-256 checksum.
@@ -464,7 +473,7 @@ cppcheck:
 .PHONY: tidy cppcheck
 
 clean:
-	-rm -f $(LIB_OBJ) $(MAIN_OBJ) $(TEST_OBJ) $(REL_LIB_OBJ) $(REL_MAIN_OBJ)
+	-rm -f $(LIB_OBJ) $(MAIN_OBJ) $(TEST_OBJ) $(REL_LIB_OBJ) $(REL_MAIN_OBJ) $(LIB_LIB_OBJ)
 	-rm -f $(FUZZ_LIB_OBJ) $(TSAN_LIB_OBJ) $(TSAN_MAIN_OBJ) $(TSAN_TEST_OBJ) \
 	       $(HARD_LIB_OBJ) $(HARD_MAIN_OBJ) \
 	       $(NDEBUG_LIB_OBJ) $(NDEBUG_MAIN_OBJ) $(NDEBUG_TEST_OBJ)

@@ -1,7 +1,7 @@
 # Core C API Reference
 
 !!! note "Headers"
-    Include `<rayforce.h>` for the bulk of the public API. A few internal helpers documented here live in their own headers — in particular `ray_cow` and the `ray_heap_init` / `ray_heap_destroy` lifecycle calls are declared in `"mem/heap.h"`, not in `<rayforce.h>`. Link against `librayforce.a` (static) or `librayforce.so` (shared). No external dependencies.
+    Include `<rayforce.h>` for the bulk of the public API. A few internal helpers documented here live in their own headers — in particular `ray_cow` and the `ray_heap_init` / `ray_heap_destroy` lifecycle calls are declared in `"mem/heap.h"`, not in `<rayforce.h>`. The Makefile builds the static archive `librayforce.a`; it does not provide a shared-library target. On Linux, link the archive with `-Wl,--gc-sections -lm -lpthread` so the linker can discard unused function and data sections.
 
 ## Lifecycle
 
