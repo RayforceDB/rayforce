@@ -6731,19 +6731,22 @@ static int topn_part_gid_cmp(const void* a, const void* b) {
  * value, and narrower types widen into the slot above it.
  *
  * `bias` is the constant of an affine SUM (`(sum (+ x c))` aggregates x and
- * phase 3 adds c * count, wrapping as the I64 sum does), else 0: the group
- * is ranked by that final value, not by the column's sum (#813). */
+ * phase 3 adds c once per non-null x, wrapping as the I64 sum does), else 0:
+ * the group is ranked by that final value, not by the column's sum (#813).
+ * `bias_off` is the in-row offset of the count it multiplies: the slot's
+ * non-null count in a nullable layout, else the group's row count at row + 0,
+ * the same count phase 3 uses (#814). */
 static inline int64_t topn_group_push(group_topn_item_t* h, int64_t hn,
                                       int64_t k, uint8_t desc_dir,
                                       const group_ht_t* ph, uint16_t order_off,
                                       uint16_t nn_off, int64_t bias,
-                                      uint32_t p, uint32_t gi) {
+                                      uint16_t bias_off, uint32_t p, uint32_t gi) {
     const char* row = ph->rows + (size_t)gi * ph->layout.row_stride;
     int64_t v, first;
     memcpy(&v, row + order_off, 8);
     if (bias) {
         int64_t cnt;
-        memcpy(&cnt, row, 8);
+        memcpy(&cnt, row + bias_off, 8);
         v = wrap_add_i64(v, wrap_mul_i64(bias, cnt));
     }
     if (nn_off) {
@@ -6769,6 +6772,7 @@ typedef struct {
     uint16_t           order_off;  /* in-row byte offset of the ordering agg */
     uint16_t           nn_off;     /* its non-null count, 0 = never null */
     int64_t            bias;       /* affine SUM constant, 0 = none */
+    uint16_t           bias_off;   /* the count it multiplies */
     uint8_t            desc_dir;
 } topn_scan_ctx_t;
 
@@ -6785,7 +6789,7 @@ static void topn_scan_fn(void* vctx, uint32_t worker_id, int64_t start,
         int64_t hn = 0;
         for (uint32_t gi = 0; gi < gc; gi++)
             hn = topn_group_push(h, hn, cap, c->desc_dir, ph, c->order_off,
-                                 c->nn_off, c->bias, p, gi);
+                                 c->nn_off, c->bias, c->bias_off, p, gi);
         c->item_cnt[p] = (uint32_t)hn;
     }
 }
@@ -6811,6 +6815,7 @@ typedef struct {
     uint16_t           order_off; /* in-row byte offset of the ordering agg */
     uint16_t           nn_off;    /* its non-null count, 0 = never null */
     int64_t            bias;      /* affine SUM constant, 0 = none */
+    uint16_t           bias_off;  /* the count it multiplies */
     uint8_t            desc_dir;
 } topn_fuse_t;
 
@@ -6822,7 +6827,7 @@ static inline void topn_fuse_partition(const topn_fuse_t* f, group_ht_t* ph,
     int64_t hn = 0;
     for (uint32_t gi = 0; gi < gc; gi++)
         hn = topn_group_push(h, hn, cap, f->desc_dir, ph, f->order_off,
-                             f->nn_off, f->bias, p, gi);
+                             f->nn_off, f->bias, f->bias_off, p, gi);
     f->item_cnt[p] = (uint32_t)hn;
 }
 
@@ -7314,7 +7319,8 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                         case OP_SUM:
                             v = sf ? ROW_RD_F64(row, ly->off_sum, s)
                                    : (double)ROW_RD_I64(row, ly->off_sum, s);
-                            if (ao->affine) v += ao->bias_f64 * cnt;
+                            /* `(sum (+ x c))`: c once per non-null x (#814) */
+                            if (ao->affine) v += ao->bias_f64 * nn;
                             break;
                         case OP_PROD:
                             if (nn == 0) { v = NULL_F64; grp_set_null(ao->vec, di); break; }
@@ -7410,7 +7416,7 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                     switch (op) {
                         case OP_SUM:
                             v = ROW_RD_I64(row, ly->off_sum, s);
-                            if (ao->affine) v = wrap_add_i64(v, wrap_mul_i64(ao->bias_i64, cnt));
+                            if (ao->affine) v = wrap_add_i64(v, wrap_mul_i64(ao->bias_i64, nn));
                             break;
                         case OP_PROD:
                             if (nn == 0) { v = int_null; grp_set_null(ao->vec, di); break; }
@@ -8363,8 +8369,9 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
                 switch (agg_op) {
                     case OP_SUM:
                         v = is_f64 ? sum_f64[idx] : (double)sum_i64[idx];
+                        /* `(sum (+ x c))`: c once per non-null x (#814) */
                         if (affine && affine[a].enabled)
-                            v += affine[a].bias_f64 * counts[gi];
+                            v += affine[a].bias_f64 * nn;
                         break;
                     case OP_PROD:
                         if (nn == 0) { v = NULL_F64; ray_vec_set_null(new_col, gi, true); break; }
@@ -8455,7 +8462,7 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
                     case OP_SUM:
                         v = sum_i64[idx];
                         if (affine && affine[a].enabled)
-                            v = wrap_add_i64(v, wrap_mul_i64(affine[a].bias_i64, counts[gi]));
+                            v = wrap_add_i64(v, wrap_mul_i64(affine[a].bias_i64, nn));
                         break;
                     case OP_PROD:
                         if (nn == 0) { v = int_null; ray_vec_set_null(new_col, gi, true); break; }
@@ -17328,6 +17335,7 @@ ht_path:;
     uint16_t topn_order_off = 0;   /* default: COUNT at row + 0 */
     uint16_t topn_nn_off    = 0;   /* non-null count of a nullable MIN/MAX */
     int64_t  topn_bias      = 0;   /* affine SUM constant (#813) */
+    uint16_t topn_bias_off  = 0;   /* ...times this count: row + 0 or nn (#814) */
     uint8_t  topn_desc_dir  = 0;
     bool     topn_order_ok  = false;
     if (use_topn_filter) {
@@ -17345,11 +17353,20 @@ ht_path:;
             if (agg_slot < 0 || order_is_f64) topn_order_ok = false;
             else topn_order_off = (uint16_t)(ght_layout.off_sum
                                              + (uint16_t)agg_slot * 8u);
-            /* `(sum (+ x c))` aggregates x; phase 3 adds c * count.  An
+            /* `(sum (+ x c))` aggregates x; phase 3 adds c once per
+             * non-null x (topn_bias_off below).  An
              * integer slot's affine constant is always integral (a
              * fractional one declines the rewrite, try_affine_sumavg_input),
              * so the heap folds bias_i64 in exactly as the emit does. */
-            if (agg_affine[ai].enabled) topn_bias = agg_affine[ai].bias_i64;
+            if (agg_affine[ai].enabled) {
+                topn_bias = agg_affine[ai].bias_i64;
+                /* c is added once per non-null x: a nullable layout keeps
+                 * the slot's non-null count, a null-free one has only the
+                 * row count, which then equals it (#814) */
+                if (ght_layout.off_nn)
+                    topn_bias_off = (uint16_t)(ght_layout.off_nn
+                                               + (uint16_t)agg_slot * 8u);
+            }
         } else if (order_op == OP_MIN) {
             if (agg_slot < 0 || order_is_f64
                 || (ght_layout.agg_flags[ai] & GHT_AF_SYM)) topn_order_ok = false;
@@ -17412,6 +17429,7 @@ ht_path:;
                 topn_fuse.order_off = topn_order_off;
                 topn_fuse.nn_off    = topn_nn_off;
                 topn_fuse.bias      = topn_bias;
+                topn_fuse.bias_off  = topn_bias_off;
                 topn_fuse.desc_dir  = topn_desc_dir;
             } else if (fcnt) {
                 scratch_free(topn_fuse_cnt_hdr);
@@ -17879,6 +17897,7 @@ v2_emit:;
                                 .item_off = off_w, .item_cnt = cnt_w,
                                 .order_off = order_off,
                                 .nn_off = topn_nn_off, .bias = topn_bias,
+                                .bias_off = topn_bias_off,
                                 .desc_dir = desc_dir,
                             };
                             ray_pool_dispatch_n(pool, topn_scan_fn, &sctx,
@@ -17926,7 +17945,8 @@ v2_emit:;
                         for (uint32_t gi = 0; gi < gc; gi++)
                             hn = topn_group_push(heap, hn, k_take, desc_dir,
                                                  ph, order_off, topn_nn_off,
-                                                 topn_bias, p, gi);
+                                                 topn_bias, topn_bias_off,
+                                                 p, gi);
                     }
 
                 if (hn > 0) {
@@ -18913,7 +18933,8 @@ sequential_fallback:;
                     case OP_SUM:
                         v = is_f64 ? ROW_RD_F64(row, ly->off_sum, s)
                                    : (double)ROW_RD_I64(row, ly->off_sum, s);
-                        if (agg_affine[a].enabled) v += agg_affine[a].bias_f64 * cnt;
+                        /* `(sum (+ x c))`: c once per non-null x (#814) */
+                        if (agg_affine[a].enabled) v += agg_affine[a].bias_f64 * nn;
                         break;
                     case OP_PROD:
                         if (nn == 0) { v = NULL_F64; ray_vec_set_null(new_col, gi, true); break; }
@@ -19001,7 +19022,7 @@ sequential_fallback:;
                     case OP_SUM:
                         v = ROW_RD_I64(row, ly->off_sum, s);
                         if (agg_affine[a].enabled)
-                            v = wrap_add_i64(v, wrap_mul_i64(agg_affine[a].bias_i64, cnt));
+                            v = wrap_add_i64(v, wrap_mul_i64(agg_affine[a].bias_i64, nn));
                         break;
                     case OP_PROD:
                         if (nn == 0) { v = int_null; ray_vec_set_null(new_col, gi, true); break; }

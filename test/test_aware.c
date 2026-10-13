@@ -4327,6 +4327,22 @@ static test_result_t aw_topn_case(const char* shape, int n, int gen, int iters, 
     PASS();
 }
 
+/* aw_topn_case against the reference built here: the first n rows of the
+ * same shape over P at take: 1025 (above the filter's cap: a full sort). */
+static test_result_t aw_topn_check(const char* shape, int n, int gen, int iters) {
+    char q[600], body[300];
+    snprintf(body, sizeof body, shape, "P", 1025);
+    snprintf(q, sizeof q, "(take (select %s) %d)", body, n);
+    ray_t* ref = aw_eval(q);
+    TEST_ASSERT_FMT(ref && !RAY_IS_ERR(ref), "%s: %s", q, ray_error_msg());
+    int64_t ref_rows = ray_table_nrows(ref);
+    if (ref_rows != n) ray_release(ref);
+    TEST_ASSERT_FMT(ref_rows == n, "%s: %lld rows, %d wanted", q, (long long)ref_rows, n);
+    test_result_t r = aw_topn_case(shape, n, gen, iters, ref);
+    ray_release(ref);
+    return r;
+}
+
 /* #801: a grouped take (`by … desc: <agg> take: N`, N <= 1024) arms the
  * radix group's top-N emit filter, which cuts the groups to exactly N.
  * Groups tied at the cut value are decided by the earliest source row, the
@@ -4369,23 +4385,14 @@ static test_result_t test_group_topn_ties(void) {
     };
     static const int takes[] = { 100, 7 };
     for (int gen = 0; gen <= 2; gen += 2) {
-        char q[600], body[300];
+        char q[600];
         snprintf(q, sizeof q, "(set P (.db.parted.get \"" AW_TMP "/tt%d\" 't))", gen);
         aw_eval_ok(q);
         for (size_t si = 0; si < sizeof shapes / sizeof *shapes; si++)
             for (size_t ti = 0; ti < sizeof takes / sizeof *takes; ti++) {
-                int n = takes[ti];
-                snprintf(body, sizeof body, shapes[si], "P", 1025);
-                snprintf(q, sizeof q, "(take (select %s) %d)", body, n);
-                ray_t* ref = aw_eval(q);
-                TEST_ASSERT_FMT(ref && !RAY_IS_ERR(ref), "%s: %s", q, ray_error_msg());
-                int64_t ref_rows = ray_table_nrows(ref);
-                if (ref_rows != n) ray_release(ref);
-                TEST_ASSERT_FMT(ref_rows == n, "%s: %d rows wanted", q, n);
                 /* the race needs repeats; the other cuts are checked a few times */
                 int iters = si == 0 && ti == 0 && !g_aw_unaligned ? 20 : 3;
-                test_result_t r = aw_topn_case(shapes[si], n, gen, iters, ref);
-                ray_release(ref);
+                test_result_t r = aw_topn_check(shapes[si], takes[ti], gen, iters);
                 if (r.status != TEST_PASS) return r;
             }
     }
@@ -4421,14 +4428,7 @@ static test_result_t test_group_topn_nulls(void) {
     static const int takes[] = { 5, 30 };
     for (size_t si = 0; si < sizeof shapes / sizeof *shapes; si++)
         for (size_t ti = 0; ti < sizeof takes / sizeof *takes; ti++) {
-            char q[600], body[300];
-            int n = takes[ti];
-            snprintf(body, sizeof body, shapes[si], "P", 1025);
-            snprintf(q, sizeof q, "(take (select %s) %d)", body, n);
-            ray_t* ref = aw_eval(q);
-            TEST_ASSERT_FMT(ref && !RAY_IS_ERR(ref), "%s: %s", q, ray_error_msg());
-            test_result_t r = aw_topn_case(shapes[si], n, 0, 2, ref);
-            ray_release(ref);
+            test_result_t r = aw_topn_check(shapes[si], takes[ti], 0, 2);
             if (r.status != TEST_PASS) return r;
         }
     aw_eval_ok("(set P 0)"); aw_eval_ok("(set S 0)"); aw_eval_ok("(set W 0)"); aw_eval_ok("(set K 0)");
@@ -4465,17 +4465,100 @@ static test_result_t test_group_topn_affine(void) {
     static const int takes[] = { 20, 5 };
     for (size_t si = 0; si < sizeof shapes / sizeof *shapes; si++)
         for (size_t ti = 0; ti < sizeof takes / sizeof *takes; ti++) {
-            char q[600], body[300];
-            int n = takes[ti];
-            snprintf(body, sizeof body, shapes[si], "P", 1025);
-            snprintf(q, sizeof q, "(take (select %s) %d)", body, n);
-            ray_t* ref = aw_eval(q);
-            TEST_ASSERT_FMT(ref && !RAY_IS_ERR(ref), "%s: %s", q, ray_error_msg());
-            test_result_t r = aw_topn_case(shapes[si], n, 0, 2, ref);
-            ray_release(ref);
+            test_result_t r = aw_topn_check(shapes[si], takes[ti], 0, 2);
             if (r.status != TEST_PASS) return r;
         }
     aw_eval_ok("(set P 0)"); aw_eval_ok("(set S 0)"); aw_eval_ok("(set W 0)"); aw_eval_ok("(set K 0)");
+    PASS();
+}
+
+/* csv-equal answers of two table expressions, under `what`. */
+static test_result_t aw_tables_same(const char* what, const char* qa, const char* qb) {
+    ray_t* a = aw_eval(qa);
+    TEST_ASSERT_FMT(a && !RAY_IS_ERR(a), "%s: %s", qa, ray_error_msg());
+    ray_t* b = aw_eval(qb);
+    if (!b || RAY_IS_ERR(b)) ray_release(a);
+    TEST_ASSERT_FMT(b && !RAY_IS_ERR(b), "%s: %s", qb, ray_error_msg());
+    test_result_t r = aw_csv_eq(what, 0, a, b);
+    ray_release(a); ray_release(b);
+    return r;
+}
+
+/* #814: SUM of `col +/- c` over a nullable column is the sum of the
+ * non-null rows' col + c, so the bias counts only the non-null rows (an
+ * all-null group sums to 0), and AVG adds c to the non-null average.  wn is
+ * all-null in every group with k mod 5 == 0 (the #808 fixture), wp is null
+ * on every third row (partially null groups), wf is wp as F64.  Checked against the
+ * in-memory table's `by: s` (the v2 engine): the parted `by: s`, the
+ * 3-key parted shape (the serial emit), and the radix top-N (its values
+ * against the in-memory full sort's first n, its rows against take: 1025).
+ * The no-key answers, with and without a where:, over the in-memory,
+ * splayed and parted tables, against the sum of the materialized input. */
+static test_result_t test_group_affine_nulls(void) {
+    aw_eval_ok("(set K (% (* (til 8000) 7919) 2000))");
+    aw_eval_ok("(set W (table [s wn wp v] (list (at (as 'SYMBOL (map (fn [j] (format \"w%\" j)) (til 2000))) K) "
+               "(as 'I64 (map (fn [k] (if (< (% k 5) 1) 0Nl (% k 13))) K)) "
+               "(as 'I64 (map (fn [i] (if (== 0 (% i 3)) 0Nl (% i 11))) (til 8000))) (til 8000))))");
+    aw_eval_ok("(set W (select {s: s wn: wn wp: wp v: v wf: (as 'F64 wp) from: W}))");
+    aw_eval_ok("(.db.splayed.set \"" AW_TMP "/tz/2024.01.01/t/\" (take W 4000) \"" AW_TMP "/tz/.sym\")");
+    aw_eval_ok("(.db.splayed.set \"" AW_TMP "/tz/2024.01.02/t/\" (drop W 4000) \"" AW_TMP "/tz/.sym\")");
+    aw_eval_ok("(.db.splayed.set \"" AW_TMP "/tzs/t/\" W \"" AW_TMP "/tzs/.sym\")");
+    aw_eval_ok("(set P (.db.parted.get \"" AW_TMP "/tz\" 't))");
+    aw_eval_ok("(set S (.db.splayed.get \"" AW_TMP "/tzs/t/\" \"" AW_TMP "/tzs/.sym\"))");
+    /* the inputs materialized: the reference for the scalar (no-key) answers */
+    aw_eval_ok("(set X (select {a: (+ wn 100) b: (- wn 100) c: (+ wp 100) d: (- wp 100) e: (+ wf 100) v: v from: W}))");
+    static const char* const aggs[] = {
+        "(sum (+ wn 100))", "(sum (- wn 100))", "(sum (+ wp 100))", "(sum (- wp 100))",
+        "(avg (+ wn 100))", "(avg (- wn 100))", "(avg (+ wp 100))", "(avg (- wp 100))",
+        "(sum (+ wf 100))", "(avg (+ wf 100))",
+    };
+    static const char* const mats[] = {
+        "(sum a)", "(sum b)", "(sum c)", "(sum d)", "(avg a)", "(avg b)", "(avg c)", "(avg d)",
+        "(sum e)", "(avg e)",
+    };
+    static const char* const tbls[] = { "W", "S", "P" };
+    static const char* const dirs[] = { "desc", "asc" };
+    static const int takes[] = { 5, 20 };
+    for (size_t ai = 0; ai < sizeof aggs / sizeof *aggs; ai++) {
+        char qa[700], qb[700], shape[300];
+        const char* ag = aggs[ai];
+        /* no key, and under a where: */
+        for (int t = 0; t < 3; t++) {
+            snprintf(qa, sizeof qa, "(select {m: %s from: X})", mats[ai]);
+            snprintf(qb, sizeof qb, "(select {m: %s from: %s})", ag, tbls[t]);
+            test_result_t r = aw_tables_same(qb, qa, qb);
+            if (r.status != TEST_PASS) return r;
+            snprintf(qa, sizeof qa, "(select {m: %s from: X where: (< v 5000)})", mats[ai]);
+            snprintf(qb, sizeof qb, "(select {m: %s from: %s where: (< v 5000)})", ag, tbls[t]);
+            r = aw_tables_same(qb, qa, qb);
+            if (r.status != TEST_PASS) return r;
+        }
+        /* every group's value, by key */
+        snprintf(qa, sizeof qa, "(select {s: s m: m from: (select {m: %s from: W by: s}) asc: s})", ag);
+        snprintf(qb, sizeof qb, "(select {s: s m: m from: (select {m: %s from: P by: s}) asc: s})", ag);
+        test_result_t r = aw_tables_same(qb, qa, qb);
+        if (r.status != TEST_PASS) return r;
+        snprintf(qb, sizeof qb, "(select {s: s m: m from: (select {m: %s from: P by: {s: s z: (%% v 1) t: s}}) asc: s})", ag);
+        r = aw_tables_same(qb, qa, qb);
+        if (r.status != TEST_PASS) return r;
+        for (int d = 0; d < 2; d++)
+            for (size_t ti = 0; ti < sizeof takes / sizeof *takes; ti++) {
+                int n = takes[ti];
+                /* the cut's values are the full sort's first n, ties aside */
+                snprintf(qa, sizeof qa, "(table [m] (list (take (at (select {m: %s from: W by: s %s: m}) 'm) %d)))",
+                         ag, dirs[d], n);
+                snprintf(qb, sizeof qb, "(table [m] (list (at (select {m: %s from: P by: {s: s z: (%% v 1) t: s} "
+                         "%s: m take: %d}) 'm)))", ag, dirs[d], n);
+                r = aw_tables_same(qb, qa, qb);
+                if (r.status != TEST_PASS) return r;
+                snprintf(shape, sizeof shape, "{m: %s from: %%s by: {s: s z: (%%%% v 1) t: s} %s: m take: %%d}",
+                         ag, dirs[d]);
+                r = aw_topn_check(shape, n, 0, 2);
+                if (r.status != TEST_PASS) return r;
+            }
+    }
+    aw_eval_ok("(set P 0)"); aw_eval_ok("(set S 0)"); aw_eval_ok("(set W 0)"); aw_eval_ok("(set K 0)");
+    aw_eval_ok("(set X 0)");
     PASS();
 }
 
@@ -4489,7 +4572,7 @@ static test_result_t test_pool_clamp(void) {
         test_scalar_route_mixed, test_eq_runs_lack, test_filter_encoded_leaves, test_scalar_route_stats,
         test_count_on_runs, test_group_count_on_runs, test_group_runs_forged, test_topk_prune_cases,
         test_gather_sym_points, test_sort_head_late, test_group_topn_ties, test_group_topn_nulls,
-        test_group_topn_affine,
+        test_group_topn_affine, test_group_affine_nulls,
     };
     static const uint32_t caps[] = { 7, 3 };
     for (size_t c = 0; c < sizeof caps / sizeof *caps; c++)
@@ -4623,5 +4706,6 @@ const test_entry_t aware_entries[] = {
     { "aware/group_topn_ties",     test_group_topn_ties,     aw_setup, aw_teardown },
     { "aware/group_topn_nulls",    test_group_topn_nulls,    aw_setup, aw_teardown },
     { "aware/group_topn_affine",   test_group_topn_affine,   aw_setup, aw_teardown },
+    { "aware/group_affine_nulls",  test_group_affine_nulls,  aw_setup, aw_teardown },
     { NULL, NULL, NULL, NULL },
 };
