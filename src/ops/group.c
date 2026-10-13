@@ -7540,7 +7540,7 @@ static void minmax_scan_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t
                                              memory_order_relaxed)) \
                         goto minmax_done; \
                     if (kmax >= kmin && \
-                        (uint64_t)(kmax - kmin) > (uint64_t)span_budget) { \
+                        (uint64_t)kmax - (uint64_t)kmin > (uint64_t)span_budget) { \
                         atomic_store_explicit(c->abort_flag, 1, \
                                               memory_order_relaxed); \
                         goto minmax_done; \
@@ -10003,7 +10003,12 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
                     if (v[r] < lo) lo = v[r];
                     if (v[r] > hi) hi = v[r];
                 }
-                card = hi - lo + 1;
+                /* Unsigned span: lo can be the i64 null sentinel, and
+                 * hi - lo then overflows i64.  A span past the partition
+                 * size already saturates the estimate, so cap it there. */
+                uint64_t span = (uint64_t)hi - (uint64_t)lo;
+                card = span < (uint64_t)rows_per_part
+                     ? (int64_t)span + 1 : rows_per_part + 1;
             } else if (bt == RAY_I32) {
                 const int32_t* v = (const int32_t*)ray_data(seg0);
                 int32_t lo = v[0], hi = v[0];
@@ -10011,7 +10016,7 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
                     if (v[r] < lo) lo = v[r];
                     if (v[r] > hi) hi = v[r];
                 }
-                card = (int64_t)(hi - lo + 1);
+                card = (int64_t)hi - (int64_t)lo + 1;
             } else {
                 card = seg0->len;
             }

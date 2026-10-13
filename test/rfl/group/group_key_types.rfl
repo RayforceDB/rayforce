@@ -224,3 +224,11 @@
 (at (select {c: (first (upper "a")) from: TSa by: s}) 'c) -- ["A" "A" "A"]
 (at (select {c: (last (trim " a")) from: TSa by: s}) 'c) -- ["a" "a" "a"]
 (at (select {c: (first "zz") from: TSa}) 'c) -- ["zz"]
+
+;; I64 key spanning more than INT64_MAX: the dense-array min/max prescan
+;; (minmax_scan_fn) checked its span budget as kmax - kmin in i64, which
+;; overflowed (UBSan abort) once one batch had seen both extremes.
+(set GKspan (table [k v] (list (take [-9000000000000000000 9000000000000000000 7] 3000) (til 3000))))
+(set GRspan (select {c: (count v) s: (sum v) from: GKspan by: (* k 1)}))
+(at GRspan 'c) -- [1000 1000 1000]
+(asc (at GRspan 's)) -- [1498500 1499500 1500500]

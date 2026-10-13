@@ -2929,9 +2929,9 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
                     uint8_t accum = 0;
                     for (int k = n_cols - 1; k >= 0; k--) {
                         bit_shifts[k] = accum;
-                        uint64_t range = (uint64_t)(maxs[k] - mins[k]);
+                        uint64_t range = (uint64_t)maxs[k] - (uint64_t)mins[k];
                         uint8_t bits = 1;
-                        while (((uint64_t)1 << bits) <= range && bits < 64)
+                        while (bits < 64 && ((uint64_t)1 << bits) <= range)
                             bits++;
                         accum += bits;
                     }
@@ -2952,7 +2952,7 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
                             };
                             for (uint32_t k = 0; k < n_cols; k++) {
                                 enc.mins[k] = mins[k];
-                                enc.ranges[k] = maxs[k] - mins[k];
+                                enc.ranges[k] = (int64_t)((uint64_t)maxs[k] - (uint64_t)mins[k]);
                                 enc.bit_shifts[k] = bit_shifts[k];
                                 enc.descs[k] = descs ? descs[k] : 0;
                                 enc.enum_ranks[k] = enum_ranks[k];

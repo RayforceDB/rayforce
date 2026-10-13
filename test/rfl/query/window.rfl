@@ -65,6 +65,26 @@
 (at FV 'l) -- [3.5 3.5 20.0 3.5 20.0]
 (.sys.exec "rm -f /tmp/rfl_window_f32.csv")
 
+;; ── composite radix prescan over a full-span or nullable I64 key ────────────
+;; The per-key span kmax - kmin overflowed i64 (UBSan abort) when a key spans
+;; more than INT64_MAX, or when the 0N sentinel sits next to a positive key.
+;; Checked against the same running window over a small-span key with the same
+;; partitions.  200 rows take the serial prescan, 10000 rows the pooled one.
+(set WN 200)
+(set WV (til WN))
+(set WO (- WN WV))
+(set WS (at (window {from: (table [k o v] (list (% WV 2) WO WV)) part: [k] order: [o] frame: 'running funcs: {cs: (sum v)}}) 'cs))
+(first WS) -- 9900
+(at (window {from: (table [k o v] (list (take [-9000000000000000000 9000000000000000000] WN) WO WV)) part: [k] order: [o] frame: 'running funcs: {cs: (sum v)}}) 'cs) -- WS
+(at (window {from: (table [k o v] (list (take [0N 5] WN) WO WV)) part: [k] order: [o] frame: 'running funcs: {cs: (sum v)}}) 'cs) -- WS
+(set WN 10000)
+(set WV (til WN))
+(set WO (- WN WV))
+(set WS (at (window {from: (table [k o v] (list (% WV 2) WO WV)) part: [k] order: [o] frame: 'running funcs: {cs: (sum v)}}) 'cs))
+(first WS) -- 24995000
+(at (window {from: (table [k o v] (list (take [-9000000000000000000 9000000000000000000] WN) WO WV)) part: [k] order: [o] frame: 'running funcs: {cs: (sum v)}}) 'cs) -- WS
+(at (window {from: (table [k o v] (list (take [0N 5] WN) WO WV)) part: [k] order: [o] frame: 'running funcs: {cs: (sum v)}}) 'cs) -- WS
+
 ;; ── fby shape: rows equal to their group's min (keeps ties) ─────────────────
 ;; min over k: a→2 (only row v=2), b→4 (rows v=4,4 both) → 3 rows total
 (count (select {from: (window {from: T part: [k] funcs: {mn: (min v)}}) where: (== v mn)})) -- 3

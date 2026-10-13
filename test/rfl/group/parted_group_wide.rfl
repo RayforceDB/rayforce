@@ -79,5 +79,19 @@
 (< (max (abs (- (at RP 'sdv) (at RF 'sdv)))) 0.000001) -- true
 (< (max (abs (- (at RP 'vrv) (at RF 'vrv)))) 0.000001) -- true
 
+;; ─── cardinality gate over a full-span or nullable integer key ──────────────
+;; The gate's range proxy hi - lo + 1 overflowed (UBSan abort) for an I64 key
+;; spanning more than INT64_MAX or holding 0N next to a positive value, and in
+;; i32 arithmetic for an I32 key spanning more than INT32_MAX or holding 0Ni.
+(.sys.exec "rm -rf /tmp/rfl_pgs")
+(.db.splayed.set "/tmp/rfl_pgs/1/t/" (table [a b c d v] (list [-9000000000000000000 9000000000000000000 3] [0N 5 3] (as 'I32 [-2000000000 2000000000 3]) (as 'I32 [0N 5 3]) [10 20 30])))
+(.db.splayed.set "/tmp/rfl_pgs/2/t/" (table [a b c d v] (list [-9000000000000000000 9000000000000000000 4] [0N 5 4] (as 'I32 [-2000000000 2000000000 4]) (as 'I32 [0N 5 4]) [40 50 60])))
+(set Ps (.db.parted.get "/tmp/rfl_pgs/" 't))
+(at (select {s: (sum v) from: Ps by: a asc: a}) 's) -- [50 30 60 70]
+(at (select {s: (sum v) from: Ps by: b asc: b}) 's) -- [50 30 60 70]
+(at (select {s: (sum v) from: Ps by: c asc: c}) 's) -- [50 30 60 70]
+(at (select {s: (sum v) from: Ps by: d asc: d}) 's) -- [50 30 60 70]
+(.sys.exec "rm -rf /tmp/rfl_pgs")
+
 ;; ─── cleanup ─────────────────────────────────────────────────────────────────
 (.sys.exec "rm -rf /tmp/rfl_pgw")
