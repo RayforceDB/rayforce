@@ -9524,9 +9524,12 @@ static void scalar_sum_linear_i64_fn(void* ctx, uint32_t worker_id, int64_t star
 
 /* An input the scalar route reads by pieces when it is staged: a fixed-width
  * type and a streaming op that scalar_accum_row (or a tight kernel) computes
- * from the values alone.  Anything else (holistic and row-gathered
- * aggregates, wide types) reads its plain column (R-RANDOM). */
+ * from the values alone.  A count of any type reads no values (it counts
+ * rows, nulls included, as on generation 0), so it never needs the column.
+ * Anything else (holistic and row-gathered aggregates, wide types) reads its
+ * plain column (R-RANDOM). */
 static bool scalar_stageable(int8_t t, uint16_t op) {
+    if (op == OP_COUNT) return true;
     switch (t) {
     case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
     case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: case RAY_F32: case RAY_F64: case RAY_SYM:
@@ -9535,7 +9538,7 @@ static bool scalar_stageable(int8_t t, uint16_t op) {
         return false;
     }
     switch (op) {
-    case OP_SUM: case OP_AVG: case OP_MIN: case OP_MAX: case OP_COUNT:
+    case OP_SUM: case OP_AVG: case OP_MIN: case OP_MAX:
     case OP_FIRST: case OP_LAST: case OP_PROD: case OP_ALL: case OP_ANY:
     case OP_VAR: case OP_VAR_POP: case OP_STDDEV: case OP_STDDEV_POP:
         return !agg_needs_row_gather(t, op);

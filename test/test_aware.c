@@ -4789,7 +4789,7 @@ static test_result_t test_gate_materialization(void) {
     static const char* const q[] = {
         "(select {from: T where: (and (>= k 1000) (< k 3000))})",                   /* filter + gather */
         "(select {k: k t: t from: T where: (== s 'b) take: 9})",                    /* SYM equality + take */
-        "(select {s: (sum v) a: (avg v) c: (count k) from: T where: (< g 3)})",     /* aggregates under a filter */
+        "(select {s: (sum v) a: (avg v) c: (count t) from: T where: (< g 3)})",     /* aggregates under a filter */
         "(select {c: (count k) from: T where: (!= s 'a) by: g})",
         "(select {c: (count k) from: T by: t})",                                    /* STR key */
         "(sum (at T 'v))",
@@ -4797,12 +4797,14 @@ static test_result_t test_gate_materialization(void) {
     };
     for (int i = 0; q[i]; i++) AW_SAME("gm", q[i], 0);
     AW_SAME("gm", "(select {t: t from: T where: (> v 10) desc: v take: 3})", 1);   /* top-k: only the sort key */
-    /* A STR input to a scalar aggregate under a filter is the audited
-     * whole-column class "unstage: scalar holistic or wide input": the
-     * scalar route (exec_group_run, n_keys == 0) streams only the types
-     * scalar_stageable admits, and agg_unstage reads t whole.  The zero
-     * shape above counts k; this one pins t's one materialization. */
-    AW_SAME("gm", "(select {s: (sum v) a: (avg v) c: (count t) from: T where: (< g 3)})", 1);
+    /* a staged scalar count reads no values: t decodes nothing, and ""
+     * (STR null) rows count, as on generation 0 */
+    AW_SAME("gm", "(select {c: (count t) from: T where: (< g 3)})", 0);
+    TEST_ASSERT_FMT(aw_col_decoded("t") == 0, "t decoded %llu", (unsigned long long)aw_col_decoded("t"));
+    aw_save("gn", "(table [g t] (list (as 'I16 (% (til 70000) 7)) "
+                  "(map (fn [j] (if (== 0 (% j 5)) \"\" (format \"text value %\" (% j 333)))) (til 70000))))", -1);
+    AW_SAME("gn", "(select {c: (count t) d: (count g) from: T where: (< g 3)})", 0);
+    TEST_ASSERT_FMT(aw_col_decoded("t") == 0, "t decoded %llu", (unsigned long long)aw_col_decoded("t"));
     PASS();
 }
 
