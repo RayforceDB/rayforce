@@ -103,5 +103,8 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
 /* Test hooks: predicates compiled by the fused selects / declined. */
 void ray_fused_topk_counters(uint64_t* ran, uint64_t* declined);
 void ray_fused_topk_counters_reset(void);
+/* Test hook: chunks and vectors the last ray_fused_topk_select pruned from
+ * a generation-2 first key's directory and descriptor statistics. */
+void ray_fused_topk_test_pruned(uint64_t* chunks, uint64_t* vectors);
 
 #endif /* RAY_OPS_FUSED_TOPK_H */

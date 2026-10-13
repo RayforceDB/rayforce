@@ -3770,6 +3770,82 @@ static test_result_t test_unaligned_grain(void) {
     PASS();
 }
 
+/* Chunk c of the generation-2 column file at `path` rewritten without
+ * statistics: its directory entry and every vector that has values carry
+ * RAY_ENC_STAT_ABSENT and zero bounds (a valid file: the writer may omit
+ * them; all-null vectors never carry any). */
+static bool aw_forge_absent(const char* path, int64_t c) {
+    FILE* f = fopen(path, "r+b"); if (!f) return false;
+    ray_enc_dirent_t de;
+    long doff = (long)(RAY_ENC_DIR_OFF + (uint64_t)c * sizeof de);
+    bool ok = fseek(f, doff, SEEK_SET) == 0 && fread(&de, sizeof de, 1, f) == 1 && !(de.flags & RAY_ENC_STAT_ABSENT);
+    if (ok) {
+        de.flags |= RAY_ENC_STAT_ABSENT; de.min = 0; de.max = 0;
+        ok = fseek(f, doff, SEEK_SET) == 0 && fwrite(&de, sizeof de, 1, f) == 1;
+    }
+    for (int j = 0; ok && j < RAY_ENC_VECS_PER_CHUNK; j++) {
+        ray_enc_desc_t d;
+        long off = (long)(de.offset + (uint64_t)j * sizeof d);
+        ok = fseek(f, off, SEEK_SET) == 0 && fread(&d, sizeof d, 1, f) == 1;
+        if (!ok || (d.encoding == 0 && d.payload_bytes == 0)) break;     /* past the last vector */
+        if (d.flags & RAY_ENC_STAT_ABSENT) continue;
+        d.flags |= RAY_ENC_STAT_ABSENT; d.min = 0; d.max = 0;
+        ok = fseek(f, off, SEEK_SET) == 0 && fwrite(&d, sizeof d, 1, f) == 1;
+    }
+    return fclose(f) == 0 && ok;
+}
+
+/* Review focus 6: every pruning case, results and order equal to
+ * generation 0; the key materializes (sort key), nothing else.  kn has a
+ * null every 1000 rows and chunk 2 all null; its values climb to 300004
+ * at row 299999 and restart at 5. */
+static test_result_t test_topk_prune_cases(void) {
+    aw_save("tp", "(table [kn v] (list (as 'I64 (map (fn [j] (if (or (== 0 (% j 1000)) (and (>= j 131072) (< j 196608))) 0N "
+                  "(+ 5 (% j 300000)))) (til 400000))) (% (* (til 400000) 13) 1000)))", -1);
+    static const char* const q[] = {
+        "(select {kn: kn v: v from: T where: (> v 100) asc: kn take: 20})",
+        "(select {kn: kn v: v from: T where: (> v 100) desc: kn take: 20})",
+        "(select {kn: kn v: v from: T where: (== v 7) asc: [kn v] take: 5})",   /* two sort keys */
+        "(select {kn: kn from: T desc: kn take: 401})",          /* K above the null count of a chunk */
+        "(select {kn: kn v: v from: T asc: kn take: 8000})",     /* near FPK_MAX_K (8192), past the leading nulls */
+        "(select {kn: kn v: v from: T where: (> v 900) asc: kn take: 3})",     /* the answer: nulls of chunk 2 */
+        "(select {kn: kn v: v from: T where: (< v 50) desc: kn take: 7})",
+        NULL,
+    };
+    static const uint64_t mat[] = { 1, 1, 2, 1, 1, 1, 1 };      /* the sort keys */
+    for (int i = 0; q[i]; i++) AW_SAME("tp", q[i], mat[i]);
+    /* Ties on the first key at the bound: k1 is constant over 4096 rows, so
+     * the first morsel fills the heap and publishes k1 = 0 while the next
+     * vectors (minimum 0, equal to the bound) still hold better rows by k2. */
+    aw_save("tq", "(table [k1 k2] (list (div (til 200000) 4096) (- 200000 (til 200000))))", -1);
+    AW_SAME("tq", "(select {k1: k1 k2: k2 from: T asc: [k1 k2] take: 3})", 2);
+    AW_SAME("tq", "(select {k1: k1 k2: k2 from: T where: (> k2 0) desc: [k1 k2] take: 3})", 2);
+    /* pruning happened at both levels on the generation-2 key */
+    aw_eval_ok("(set T (.db.splayed.get \"" AW_TMP "/tp2/\"))");
+    aw_eval_ok("(select {kn: kn v: v from: T where: (> v 100) desc: kn take: 20})");
+    uint64_t pc = 0, pv = 0;
+    ray_fused_topk_test_pruned(&pc, &pv);
+    TEST_ASSERT_TRUE(pc > 0);
+    TEST_ASSERT_TRUE(g_aw_unaligned || pv > 0);                 /* a clamped grain may cut every vector */
+    /* generation 0 never takes the directory path */
+    aw_eval_ok("(set T (.db.splayed.get \"" AW_TMP "/tp0/\"))");
+    aw_eval_ok("(select {kn: kn v: v from: T where: (> v 100) desc: kn take: 20})");
+    ray_fused_topk_test_pruned(&pc, &pv);
+    TEST_ASSERT_EQ_I(pc + pv, 0);
+    /* A chunk without statistics (chunk 4, which holds the largest keys) is
+     * never pruned: visited after the ordered chunks, it still wins. */
+    {
+        char dir[512], path[600];
+        TEST_ASSERT_EQ_I(ray_splay_resolve_dir(ray_test_tmp(AW_TMP "/tp2/"), dir, sizeof dir), RAY_OK);
+        snprintf(path, sizeof path, "%s/kn", dir);
+        TEST_ASSERT_TRUE(aw_forge_absent(path, 4));
+        AW_SAME("tp", q[1], 1);
+        AW_SAME("tp", q[3], 1);
+        AW_SAME("tp", "(select {kn: kn v: v from: T where: (< v 500) asc: kn take: 9})", 1);
+    }
+    PASS();
+}
+
 /* ray_pool_dispatch clamped to a ring whose growth fails (#792; shrunk to a
  * few slots so the clamp runs at test sizes): fused where: filters
  * (pred_sel_drive and the expression selection, whose rowsel builders are
@@ -3778,7 +3854,7 @@ static test_result_t test_unaligned_grain(void) {
 static test_result_t test_pool_clamp(void) {
     static test_result_t (*const fns[])(void) = {
         test_scalar_route_mixed, test_eq_runs_lack, test_filter_encoded_leaves, test_scalar_route_stats,
-        test_count_on_runs, test_group_count_on_runs, test_group_runs_forged,
+        test_count_on_runs, test_group_count_on_runs, test_group_runs_forged, test_topk_prune_cases,
     };
     static const uint32_t caps[] = { 7, 3 };
     for (size_t c = 0; c < sizeof caps / sizeof *caps; c++)
@@ -3904,5 +3980,6 @@ const test_entry_t aware_entries[] = {
     { "aware/count_on_runs",       test_count_on_runs,       aw_setup, aw_teardown },
     { "aware/group_count_on_runs", test_group_count_on_runs, aw_setup, aw_teardown },
     { "aware/group_runs_forged",   test_group_runs_forged,   aw_setup, aw_teardown },
+    { "aware/topk_prune_cases",    test_topk_prune_cases,    aw_setup, aw_teardown },
     { NULL, NULL, NULL, NULL },
 };
