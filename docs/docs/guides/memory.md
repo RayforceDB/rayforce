@@ -14,7 +14,7 @@ For a deep dive into the allocator internals, see [Memory Model](../architecture
 
 ## 2. The `.sys.mem` Function
 
-Call `(.sys.mem 0)` to get a snapshot of the current heap's allocation statistics. It returns a dictionary with the following fields:
+Call `(.sys.mem)` to get a snapshot of the current heap's allocation statistics. It returns a dictionary with the following fields:
 
 | Field | Type | Description |
 |---|---|---|
@@ -86,7 +86,7 @@ tracing collector.
 
 ## 4. The `.sys.info` Function
 
-Call `(.sys.info 0)` to see system-level information about the Rayforce runtime:
+Call `(.sys.info)` to see system-level information about the Rayforce runtime:
 
 ```lisp
 (.sys.info)
@@ -392,9 +392,9 @@ This tells you the join needed about 1 GB of temporary memory beyond what was al
 
 | Tool | What It Does | When to Use |
 |---|---|---|
-| `(.sys.mem 0)` | Returns heap allocation statistics | Monitor memory usage, detect leaks |
+| `(.sys.mem)` | Returns heap allocation statistics | Monitor memory usage, detect leaks |
 | `(.sys.gc)` | Flushes caches, releases pages | Between heavy queries, before benchmarks |
-| `(.sys.info 0)` | Shows system and runtime info | Check total RAM, CPU count, OS details |
+| `(.sys.info)` | Shows system and runtime info | Check total RAM, CPU count, OS details |
 | `(timeit expr)` | Measures execution time of one expression | Benchmark a specific operation |
 | `:timeit` | Toggles profiling for all REPL expressions | Interactive performance exploration |
 | Progress bar | Automatic during long queries | Visual feedback on query progress |

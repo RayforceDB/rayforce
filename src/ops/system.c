@@ -1268,7 +1268,8 @@ ray_t* ray_internals_fn(ray_t** args, int64_t n) {
 
 /* (.sys.mem) -- return dict with memory allocator statistics */
 ray_t* ray_memstat_fn(ray_t** args, int64_t n) {
-    (void)args; (void)n;
+    (void)args;
+    if (n != 0) return ray_error("arity", ".sys.mem takes no arguments");
     ray_mem_stats_t st;
     ray_mem_stats(&st);
 
@@ -1330,7 +1331,8 @@ ray_t* ray_memstat_fn(ray_t** args, int64_t n) {
  * no query has run.  Profiling is toggled with `:t` / the `-t` flag.
  */
 ray_t* ray_prof_fn(ray_t** args, int64_t n) {
-    (void)args; (void)n;
+    (void)args;
+    if (n != 0) return ray_error("arity", ".sys.prof takes no arguments");
 
     /* Read the snapshot of the last completed query — NOT the in-flight
      * buffer, which currently holds this `(.sys.prof)` call's own spans.
@@ -1525,7 +1527,8 @@ static bool ray_os_hostname(char* buf, size_t cap) {
 }
 
 ray_t* ray_sysinfo_fn(ray_t** args, int64_t n) {
-    (void)args; (void)n;
+    (void)args;
+    if (n != 0) return ray_error("arity", ".sys.info takes no arguments");
     ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 5);
     if (RAY_IS_ERR(keys)) return keys;
     ray_t* vals = ray_list_new(5);
