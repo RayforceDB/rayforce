@@ -153,9 +153,9 @@ Boolean logic operators. Work on scalars and vectors alike.
 
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
-| `and` | binary | — | Logical AND | `(and true false)` → `false` |
-| `or` | binary | — | Logical OR | `(or true false)` → `true` |
-| `not` | unary | — | Logical NOT | `(not true)` → `false` |
+| `and` | binary | — | Logical AND; element-wise on vectors and lists (lengths must match) | `(and true false)` → `false` |
+| `or` | binary | — | Logical OR; element-wise on vectors and lists (lengths must match) | `(or true false)` → `true` |
+| `not` | unary | — | Logical NOT; element-wise on vectors and lists | `(not true)` → `false` |
 
 ```lisp
 ; Combine filters with logic ops

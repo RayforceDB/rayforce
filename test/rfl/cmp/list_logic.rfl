@@ -1,0 +1,66 @@
+;; Comparisons and and/or/not over a LIST, and over vectors that are not
+;; B8, follow q: element by element, booleans out (#820).
+;;
+;; A LIST of numbers turns up unasked, e.g. from a lookup that missed a
+;; key; a filter built on it used to collapse to one truth value and
+;; accept every row.
+
+;; ── comparisons on a LIST give a B8 vector ──────────────────────────
+(> (list 1 2) 1) -- [false true]
+(type (> (list 1 2) 1)) -- 'B8
+(type (>= (list 1 2) 1)) -- 'B8
+(< (list 1 2) (list 2 1)) -- [true false]
+(== (list 1 2.0 3) [1 2 3]) -- [true true true]
+(type (== (list 1 2.0 3) [1 2 3])) -- 'B8
+(!= (list 1 2) 1) -- [false true]
+(<= 1 (list 0 1 2)) -- [false true true]
+(== (list 0Nl 1) [0Nl 1]) -- [true true]
+
+;; a nested LIST keeps its shape, each part compared
+(== (list [1 2] [3 4]) 1) -- (list [true false] [false false])
+
+;; an element that cannot be compared, or a length mismatch, is an error
+(== (list 1 'a) 1) !- type
+(> (list 1 2 3) [1 2]) !- length
+
+;; ── and / or are element-wise on any collection ─────────────────────
+(and (list false false) [true true]) -- [false false]
+(or (list false false) [false false]) -- [false false]
+(and (list true false) true) -- [true false]
+(or false (list true false)) -- [true false]
+(and (list true false) (list true true)) -- [true false]
+(type (and (list true false) (list true true))) -- 'B8
+
+;; numeric vectors: each element by truthiness, booleans out
+(and [1 0 2] [1 1 0]) -- [true false false]
+(or (list 0 0) [false true]) -- [false true]
+
+;; variadic, with a LIST in the middle
+(and [true true true] (list true false true) [true true false]) -- [true false false]
+
+;; nested lists recurse
+(and (list [true false] [true true]) true) -- (list [true false] [true true])
+
+;; lengths must match, B8 vectors included
+(and [true false] [true]) !- length
+(or [true false] [true]) !- length
+(and (list true false) [true]) !- length
+
+;; empty
+(and (list) (list)) -- []
+
+;; atoms are unchanged
+(and true false) -- false
+(or false true) -- true
+(and 1 2) -- true
+
+;; ── not is element-wise on a LIST ───────────────────────────────────
+(not (list true false)) -- [false true]
+(type (not (list true false))) -- 'B8
+(not (list 1 0)) -- [false true]
+(not (list 1 0 [0 1])) -- (list false true [true false])
+
+;; ── the filter from the issue: a missing key no longer passes all ───
+(set counts (list 3 0Nl 5))
+(set fresh [true true true])
+(and fresh (>= (fill 0 counts) 2)) -- [true false true]

@@ -1341,7 +1341,7 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
     /* Coerce an integer atom to the scalar's integer type */
     #define COERCE_TO_SCALAR(elem) do { \
         if (scalar_int_type && ray_is_atom(elem) && elem->type != scalar_int_type && \
-            elem->type != -RAY_F64 && is_numeric(elem)) { \
+            elem->type != -RAY_F64 && elem->type != -RAY_BOOL && is_numeric(elem)) { \
             int64_t _v = as_i64(elem); \
             ray_t* _coerced = make_typed_int(scalar_int_type, _v); \
             ray_release(elem); \
@@ -1387,7 +1387,22 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
         out[i] = elem;
     }
     #undef COERCE_TO_SCALAR
-    return result;
+    return ray_list_collapse_bool(result);
+}
+
+ray_t* ray_list_collapse_bool(ray_t* list) {
+    if (!list || RAY_IS_ERR(list) || list->type != RAY_LIST) return list;
+    int64_t n = ray_len(list);
+    ray_t** e = (ray_t**)ray_data(list);
+    for (int64_t i = 0; i < n; i++)
+        if (!e[i] || e[i]->type != -RAY_BOOL) return list;
+    ray_t* vec = ray_vec_new(RAY_BOOL, n);
+    if (!vec || RAY_IS_ERR(vec)) return list;
+    uint8_t* d = (uint8_t*)ray_data(vec);
+    for (int64_t i = 0; i < n; i++) d[i] = e[i]->b8 ? 1 : 0;
+    vec->len = n;
+    ray_release(list);
+    return vec;
 }
 
 /* Map a unary function element-wise over a collection.

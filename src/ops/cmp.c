@@ -267,27 +267,74 @@ ray_t* ray_neq_fn(ray_t* a, ray_t* b) {
     return r;                                              \
 } while(0)
 
+/* and/or with a collection operand that is not a BOOL vector — a LIST, or
+ * a numeric or temporal vector: element by element, as q's & and | are,
+ * never one truth value for the whole collection.  Each pair goes back
+ * through `fn`, so a nested list recurses, and a result whose elements
+ * are all booleans is a B8 vector.  An atom broadcasts; two collections
+ * must have the same length. */
+static ray_t* logic_map(ray_binary_fn fn, const char* name, ray_t* a, ray_t* b) {
+    int ac = is_collection(a), bc = is_collection(b);
+    if (ac && bc && ray_len(a) != ray_len(b))
+        return ray_error("length", "%s: operand lengths must match, got %lld and %lld",
+                         name, (long long)ray_len(a), (long long)ray_len(b));
+    int64_t n = ac ? ray_len(a) : ray_len(b);
+    ray_t* out = ray_list_new(n > 0 ? n : 1);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    for (int64_t i = 0; i < n; i++) {
+        int la = 0, lb = 0;
+        ray_t* ea = ac ? collection_elem(a, i, &la) : a;
+        ray_t* eb = bc ? collection_elem(b, i, &lb) : b;
+        ray_t* r = (RAY_IS_ERR(ea) || RAY_IS_ERR(eb))
+                 ? ray_error("type", NULL) : fn(ea, eb);
+        if (la) ray_release(ea);
+        if (lb) ray_release(eb);
+        if (!r || RAY_IS_ERR(r)) { ray_release(out); return r ? r : ray_error("oom", NULL); }
+        out = ray_list_append(out, r);
+        ray_release(r);
+        if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    }
+    if (n == 0) { ray_release(out); return ray_vec_new(RAY_BOOL, 0); }
+    return ray_list_collapse_bool(out);
+}
+
+static inline bool is_bool_vec(ray_t* x) {
+    return ray_is_vec(x) && x->type == RAY_BOOL;
+}
+
 ray_t* ray_and_fn(ray_t* a, ray_t* b) {
     /* Element-wise for bool vectors */
-    if (ray_is_vec(a) && a->type == RAY_BOOL && ray_is_vec(b) && b->type == RAY_BOOL)
+    if (is_bool_vec(a) && is_bool_vec(b)) {
+        if (a->len != b->len)
+            return ray_error("length", "and: operand lengths must match, got %lld and %lld",
+                             (long long)a->len, (long long)b->len);
         BOOL_VEC_BINOP(a, b, &);
+    }
     /* Scalar broadcast: vec and scalar */
-    if (ray_is_vec(a) && a->type == RAY_BOOL && ray_is_atom(b))
+    if (is_bool_vec(a) && ray_is_atom(b))
         BOOL_VEC_SCALAR_L(a, is_truthy(b), &&);
-    if (ray_is_atom(a) && ray_is_vec(b) && b->type == RAY_BOOL)
+    if (ray_is_atom(a) && is_bool_vec(b))
         BOOL_VEC_SCALAR_L(b, is_truthy(a), &&);
+    if (is_collection(a) || is_collection(b))
+        return logic_map(ray_and_fn, "and", a, b);
     return make_bool((is_truthy(a) && is_truthy(b)) ? 1 : 0);
 }
 
 ray_t* ray_or_fn(ray_t* a, ray_t* b) {
     /* Element-wise for bool vectors */
-    if (ray_is_vec(a) && a->type == RAY_BOOL && ray_is_vec(b) && b->type == RAY_BOOL)
+    if (is_bool_vec(a) && is_bool_vec(b)) {
+        if (a->len != b->len)
+            return ray_error("length", "or: operand lengths must match, got %lld and %lld",
+                             (long long)a->len, (long long)b->len);
         BOOL_VEC_BINOP(a, b, |);
+    }
     /* Scalar broadcast */
-    if (ray_is_vec(a) && a->type == RAY_BOOL && ray_is_atom(b))
+    if (is_bool_vec(a) && ray_is_atom(b))
         BOOL_VEC_SCALAR_L(a, is_truthy(b), ||);
-    if (ray_is_atom(a) && ray_is_vec(b) && b->type == RAY_BOOL)
+    if (ray_is_atom(a) && is_bool_vec(b))
         BOOL_VEC_SCALAR_L(b, is_truthy(a), ||);
+    if (is_collection(a) || is_collection(b))
+        return logic_map(ray_or_fn, "or", a, b);
     return make_bool((is_truthy(a) || is_truthy(b)) ? 1 : 0);
 }
 
@@ -400,6 +447,23 @@ ray_t* ray_not_fn(ray_t* x) {
         }
         r->len = n;
         return r;
+    }
+    /* A LIST, element by element as q's `not` is: a nested list recurses,
+     * and all-boolean results make a B8 vector. */
+    if (is_list(x)) {
+        int64_t n = ray_len(x);
+        if (n == 0) return ray_vec_new(RAY_BOOL, 0);
+        ray_t* out = ray_list_new(n);
+        if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+        ray_t** e = (ray_t**)ray_data(x);
+        for (int64_t i = 0; i < n; i++) {
+            ray_t* r = ray_not_fn(e[i]);
+            if (!r || RAY_IS_ERR(r)) { ray_release(out); return r ? r : ray_error("oom", NULL); }
+            out = ray_list_append(out, r);
+            ray_release(r);
+            if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+        }
+        return ray_list_collapse_bool(out);
     }
     return make_bool(is_truthy(x) ? 0 : 1);
 }
