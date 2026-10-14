@@ -799,8 +799,8 @@ ray_t* ray_graph_expand_fn(ray_t** args, int64_t n);
 ray_t* ray_graph_var_expand_fn(ray_t** args, int64_t n);
 
 /* A LIST whose every element is a BOOL atom as a B8 vector (the list is
- * released); any other list is returned as it is.  An atomic op over a
- * LIST yields a vector when its results are uniform, as in q. */
+ * released); any other list is returned as it is: an atomic op over a
+ * LIST yields a vector when its results are uniform booleans. */
 ray_t* ray_list_collapse_bool(ray_t* list);
 
 /* Convenience wrapper: atomic_map_binary with no DAG opcode */

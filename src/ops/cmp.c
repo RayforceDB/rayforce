@@ -268,8 +268,8 @@ ray_t* ray_neq_fn(ray_t* a, ray_t* b) {
 } while(0)
 
 /* and/or with a collection operand that is not a BOOL vector — a LIST, or
- * a numeric or temporal vector: element by element, as q's & and | are,
- * never one truth value for the whole collection.  Each pair goes back
+ * a numeric or temporal vector: element by element, never one truth value
+ * for the whole collection.  Each pair goes back
  * through `fn`, so a nested list recurses, and a result whose elements
  * are all booleans is a B8 vector.  An atom broadcasts; two collections
  * must have the same length. */
@@ -448,8 +448,8 @@ ray_t* ray_not_fn(ray_t* x) {
         r->len = n;
         return r;
     }
-    /* A LIST, element by element as q's `not` is: a nested list recurses,
-     * and all-boolean results make a B8 vector. */
+    /* A LIST, element by element: a nested list recurses, and all-boolean
+     * results make a B8 vector. */
     if (is_list(x)) {
         int64_t n = ray_len(x);
         if (n == 0) return ray_vec_new(RAY_BOOL, 0);

@@ -1,5 +1,5 @@
 ;; Comparisons and and/or/not over a LIST, and over vectors that are not
-;; B8, follow q: element by element, booleans out (#820).
+;; B8, work element by element, booleans out (#820).
 ;;
 ;; A LIST of numbers turns up unasked, e.g. from a lookup that missed a
 ;; key; a filter built on it used to collapse to one truth value and
