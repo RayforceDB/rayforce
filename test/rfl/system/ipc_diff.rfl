@@ -84,10 +84,8 @@
 ;; parted table itself), goes back as the flat table it stands for: the
 ;; reply streams each partition segment onto the wire.  Both failed with a
 ;; `type` error reply.  The table is ragged (2024.01.03 has no x or s
-;; columns): that partition's rows answer nulls.  A sort over a ragged
-;; table is not supported and replies nyi, whichever partition lacks the
-;; column (flattened, that column comes out shorter than the table and the
-;; sort would gather past its end); the server stays up.
+;; columns): that partition's rows answer nulls, and a sort over it
+;; answers the sorted flat table, whichever partition lacks the column.
 (.sys.exec "rm -rf /tmp/rfl_ipc_parted")
 (.db.splayed.set "/tmp/rfl_ipc_parted/2024.01.01/t/" (table [a x s] (list [0 1 2] [5.0 3.0 9.0] ['p 'q 'p])))
 (.db.splayed.set "/tmp/rfl_ipc_parted/2024.01.02/t/" (table [a x s] (list [3 4 5] [1.0 7.0 2.0] ['r 'p 'q])))
@@ -100,17 +98,20 @@
 (ser (.ipc.send h "Pipc")) -- (ser Fipc)
 (ser (.ipc.send h "(select {from: Pipc})")) -- (ser Pipc)
 (.ipc.send h "(list Pipc 1)") -- (list Fipc 1)
-(.ipc.send h "(select {from: Pipc where: (>= a 0) desc: x take: 2})") !- nyi
+(.ipc.send h "(select {from: Pipc where: (>= a 0) desc: x take: 2})") -- (select {from: Fipc desc: x take: 2})
+(.ipc.send h "(select {from: Pipc desc: x take: 2})") -- (select {from: Fipc desc: x take: 2})
 (.sys.exec "rm -rf /tmp/rfl_ipc_parted") -- 0
 (.sys.exec "rm -rf /tmp/rfl_ipc_ragmid")
 (.db.splayed.set "/tmp/rfl_ipc_ragmid/2024.01.01/t/" (table [a b s h t] (list [0 1] [0.5 1.5] ['p 'q] [true false] (as 'STR (list "u" "a longer string value")))))
 (.db.splayed.set "/tmp/rfl_ipc_ragmid/2024.01.02/t/" (table [a] (list [2 3 4])))
 (.db.splayed.set "/tmp/rfl_ipc_ragmid/2024.01.03/t/" (table [a b s h t] (list [5 6] [5.5 6.5] ['r 'p] [true true] (as 'STR (list "w" "another long string value")))))
 (.ipc.send h "(do (set Pmid (.db.parted.get \"/tmp/rfl_ipc_ragmid/\" 't)) 0)") -- 0
-(.ipc.send h "(select {from: Pmid where: (>= a 0) desc: a take: 3})") !- nyi
-(.ipc.send h "(select {from: Pmid where: (>= a 0) asc: h})") !- nyi
-(.ipc.send h "(select {from: Pmid where: (>= a 0) desc: b})") !- nyi
-(.ipc.send h "(select {from: Pmid where: (>= a 0) asc: t take: 2})") !- nyi
+(set Fmid (table [date a b s h t] (list [2024.01.01 2024.01.01 2024.01.02 2024.01.02 2024.01.02 2024.01.03 2024.01.03] (til 7) [0.5 1.5 0Nf 0Nf 0Nf 5.5 6.5] ['p 'q ' ' ' 'r 'p] [true false false false false true true] (as 'STR (list "u" "a longer string value" "" "" "" "w" "another long string value")))))
+(.ipc.send h "(select {from: Pmid where: (>= a 0) desc: a take: 3})") -- (select {from: Fmid desc: a take: 3})
+(.ipc.send h "(select {from: Pmid where: (>= a 0) asc: h})") -- (select {from: Fmid asc: h})
+(.ipc.send h "(select {from: Pmid where: (>= a 0) desc: b})") -- (select {from: Fmid desc: b})
+(.ipc.send h "(select {from: Pmid where: (>= a 0) asc: t take: 2})") -- (select {from: Fmid asc: t take: 2})
+(.ipc.send h "(select {from: Pmid where: (> a 1)})") -- (select {from: Fmid where: (> a 1)})
 (.ipc.send h "(count Pmid)") -- 7
 (.sys.exec "rm -rf /tmp/rfl_ipc_ragmid") -- 0
 
