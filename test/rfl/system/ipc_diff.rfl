@@ -79,6 +79,42 @@
 (.ipc.send h "(do (set E (table [src dst] (list [0 1] [1 0]))) (set G (.graph.build E 'src 'dst)) G)") !- type
 (.ipc.send h "(do (set E2 (table [src dst] (list [0 1] [1 0]))) (set G2 (.graph.build E2 'src 'dst)) (list G2 1))") !- type
 
+;; ── a parted table ─────────────────────────────────────────────────
+;; A parted table, bare or as a select with no clauses (which answers the
+;; parted table itself), goes back as the flat table it stands for: the
+;; reply streams each partition segment onto the wire.  Both failed with a
+;; `type` error reply.  The table is ragged (2024.01.03 has no x or s
+;; columns): that partition's rows answer nulls, and a sort over it
+;; answers the sorted flat table, whichever partition lacks the column.
+(.sys.exec "rm -rf /tmp/rfl_ipc_parted")
+(.db.splayed.set "/tmp/rfl_ipc_parted/2024.01.01/t/" (table [a x s] (list [0 1 2] [5.0 3.0 9.0] ['p 'q 'p])))
+(.db.splayed.set "/tmp/rfl_ipc_parted/2024.01.02/t/" (table [a x s] (list [3 4 5] [1.0 7.0 2.0] ['r 'p 'q])))
+(.db.splayed.set "/tmp/rfl_ipc_parted/2024.01.03/t/" (table [a] (list [6 7])))
+(set Pipc (.db.parted.get "/tmp/rfl_ipc_parted/" 't))
+(.ipc.send h "(do (set Pipc (.db.parted.get \"/tmp/rfl_ipc_parted/\" 't)) 0)") -- 0
+(set Fipc (table [date a x s] (list [2024.01.01 2024.01.01 2024.01.01 2024.01.02 2024.01.02 2024.01.02 2024.01.03 2024.01.03] (til 8) [5.0 3.0 9.0 1.0 7.0 2.0 0Nf 0Nf] ['p 'q 'p 'r 'p 'q ' '])))
+(.ipc.send h "Pipc") -- Fipc
+(.ipc.send h "(select {from: Pipc})") -- Fipc
+(ser (.ipc.send h "Pipc")) -- (ser Fipc)
+(ser (.ipc.send h "(select {from: Pipc})")) -- (ser Pipc)
+(.ipc.send h "(list Pipc 1)") -- (list Fipc 1)
+(.ipc.send h "(select {from: Pipc where: (>= a 0) desc: x take: 2})") -- (select {from: Fipc desc: x take: 2})
+(.ipc.send h "(select {from: Pipc desc: x take: 2})") -- (select {from: Fipc desc: x take: 2})
+(.sys.exec "rm -rf /tmp/rfl_ipc_parted") -- 0
+(.sys.exec "rm -rf /tmp/rfl_ipc_ragmid")
+(.db.splayed.set "/tmp/rfl_ipc_ragmid/2024.01.01/t/" (table [a b s h t] (list [0 1] [0.5 1.5] ['p 'q] [true false] (as 'STR (list "u" "a longer string value")))))
+(.db.splayed.set "/tmp/rfl_ipc_ragmid/2024.01.02/t/" (table [a] (list [2 3 4])))
+(.db.splayed.set "/tmp/rfl_ipc_ragmid/2024.01.03/t/" (table [a b s h t] (list [5 6] [5.5 6.5] ['r 'p] [true true] (as 'STR (list "w" "another long string value")))))
+(.ipc.send h "(do (set Pmid (.db.parted.get \"/tmp/rfl_ipc_ragmid/\" 't)) 0)") -- 0
+(set Fmid (table [date a b s h t] (list [2024.01.01 2024.01.01 2024.01.02 2024.01.02 2024.01.02 2024.01.03 2024.01.03] (til 7) [0.5 1.5 0Nf 0Nf 0Nf 5.5 6.5] ['p 'q ' ' ' 'r 'p] [true false false false false true true] (as 'STR (list "u" "a longer string value" "" "" "" "w" "another long string value")))))
+(.ipc.send h "(select {from: Pmid where: (>= a 0) desc: a take: 3})") -- (select {from: Fmid desc: a take: 3})
+(.ipc.send h "(select {from: Pmid where: (>= a 0) asc: h})") -- (select {from: Fmid asc: h})
+(.ipc.send h "(select {from: Pmid where: (>= a 0) desc: b})") -- (select {from: Fmid desc: b})
+(.ipc.send h "(select {from: Pmid where: (>= a 0) asc: t take: 2})") -- (select {from: Fmid asc: t take: 2})
+(.ipc.send h "(select {from: Pmid where: (> a 1)})") -- (select {from: Fmid where: (> a 1)})
+(.ipc.send h "(count Pmid)") -- 7
+(.sys.exec "rm -rf /tmp/rfl_ipc_ragmid") -- 0
+
 ;; ── large payloads ─────────────────────────────────────────────────
 ;; Multi-KB results over the framing path.  These no longer exercise
 ;; ray_ipc_compress: since #541 a loopback link never compresses, so

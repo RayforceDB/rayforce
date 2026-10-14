@@ -198,6 +198,10 @@ Mounting the same root again on the same thread reuses unchanged partitions whil
 
 The cache holds at most 1024 partition tables per thread. GC, symbol-domain opens and the next mount discard entries whose columns have no external references; heap abandonment, heap teardown and runtime shutdown clear the thread's entries. To release a dropped view's mappings and copied LIST values immediately, call `(.sys.gc)`. C callers can also use `ray_parted_cache_clear()` from `store/part.h` to clear their thread's cache.
 
+### Partitions without a column (ragged tables)
+
+A partition may hold fewer columns than the first one, as long as the columns it has come first in the same order with the same names and types; a column it lacks is a NULL segment for that partition. Such a ragged table reads as the flat table with typed nulls in the missing rows, wherever its rows are read: a select over it (projections, `where:`, `asc:`/`desc:`, `take:`, `by:` and aggregates), `(at table 'col)`, printing and `show`, and `ser`, whose bytes equal those of the equivalent flat table. The partition-key column's row counts give the missing rows; `BOOL` and `U8`, which have no null, read as `false` and `0`. A parted column met away from its table (through `get` on a column value rather than a query) still contributes no rows for a partition that lacks it.
+
 !!! warning "`update` over a partitioned table materializes in memory"
     `update` on a partitioned table flattens the whole table into memory first — the parted/`MAPCOMMON` columns cannot be mutated in place — so the result is an ordinary in-memory table. It is **not** written back to the store: re-reading the root returns the original values, and the returned table loses its parted / memory-mapped identity.
 

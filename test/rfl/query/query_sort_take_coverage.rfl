@@ -497,6 +497,72 @@
 (select {from: Pck desc: 'y}) -- (select {from: Mck desc: 'y})
 (select {x: x from: Pck desc: x}) -- (select {x: x from: Mck desc: x})
 (select {y: y from: Pck desc: x}) -- (select {y: y from: Mck desc: x})
+;; a where: that keeps every row leaves no selection and hands the sort the
+;; parted table itself; it sorts it flattened, as a partial where: does
+(select {from: Pck where: (>= y 0) desc: x}) -- (select {from: Mck desc: x})
+(select {from: Pck where: (>= y 0) asc: [x y]}) -- (select {from: Mck asc: [x y]})
+(select {from: Pck where: (>= y 0) desc: x take: 2}) -- (select {from: Mck desc: x take: 2})
+(select {from: Pck where: (>= y 0) asc: s}) -- (select {from: Mck asc: s})
+(select {from: Pck where: (>= y 0) desc: r take: 3}) -- (select {from: Mck desc: r take: 3})
+(select {from: Pck where: (>= y 0) desc: date}) -- (select {from: Mck desc: date})
+(select {y: y from: Pck where: (>= y 0) desc: x}) -- (select {y: y from: Mck desc: x})
+(select {x: x from: Pck where: (>= y 0) desc: y take: 2}) -- (select {x: x from: Mck desc: y take: 2})
+;; a ragged parted table (a partition lacks a column) sorts, filters and
+;; projects as the flat table with typed nulls in that partition's rows,
+;; the way it prints and serializes; the missing rows come from the
+;; partition-key counts.  The partition without the column is in the
+;; middle here, then last.
+(.sys.exec "rm -rf /tmp/rfl_ckragged")
+(.db.splayed.set "/tmp/rfl_ckragged/2024.01.01/t/" (table [a b h] (list [0 1] [0.5 1.5] [true false])))
+(.db.splayed.set "/tmp/rfl_ckragged/2024.01.02/t/" (table [a] (list [2 3 4])))
+(.db.splayed.set "/tmp/rfl_ckragged/2024.01.03/t/" (table [a b h] (list [5 6] [5.5 6.5] [true true])))
+(set Prg (.db.parted.get "/tmp/rfl_ckragged/" 't))
+(set Frg (table [date a b h] (list [2024.01.01 2024.01.01 2024.01.02 2024.01.02 2024.01.02 2024.01.03 2024.01.03] [0 1 2 3 4 5 6] [0.5 1.5 0Nf 0Nf 0Nf 5.5 6.5] [true false false false false true true])))
+(select {from: Prg where: (>= a 0) desc: a take: 3}) -- (select {from: Frg desc: a take: 3})
+(select {from: Prg where: (>= a 0) asc: h}) -- (select {from: Frg asc: h})
+(select {from: Prg where: (>= a 0) desc: b}) -- (select {from: Frg desc: b})
+(select {from: Prg desc: b}) -- (select {from: Frg desc: b})
+(select {from: Prg asc: a take: 3}) -- (select {from: Frg asc: a take: 3})
+(select {from: Prg where: (>= a 0)}) -- Frg
+(count (select {from: Prg where: (>= a 0)})) -- 7
+(de (ser (select {from: Prg where: (>= a 0)}))) -- Frg
+(select {from: Prg where: (> a 1)}) -- (select {from: Frg where: (> a 1)})
+(select {b: b h: h from: Prg where: (> a 1)}) -- (select {b: b h: h from: Frg where: (> a 1)})
+(select {b: b from: Prg where: (> a 1) desc: a take: 2}) -- (select {b: b from: Frg where: (> a 1) desc: a take: 2})
+(select {from: Prg take: 4}) -- (select {from: Frg take: 4})
+(select {from: Prg take: -4}) -- (select {from: Frg take: -4})
+(select {s: (sum b) n: (count b) f: (first b) from: Prg by: date}) -- (select {s: (sum b) n: (count b) f: (first b) from: Frg by: date})
+(.sys.exec "rm -rf /tmp/rfl_ckragged")
+(.db.splayed.set "/tmp/rfl_ckragged/2024.01.01/t/" (table [a b] (list [0 1] [0.5 1.5])))
+(.db.splayed.set "/tmp/rfl_ckragged/2024.01.02/t/" (table [a b] (list [2 3] [2.5 3.5])))
+(.db.splayed.set "/tmp/rfl_ckragged/2024.01.03/t/" (table [a] (list [4 5])))
+(set Prg (.db.parted.get "/tmp/rfl_ckragged/" 't))
+(set Frg (table [date a b] (list [2024.01.01 2024.01.01 2024.01.02 2024.01.02 2024.01.03 2024.01.03] [0 1 2 3 4 5] [0.5 1.5 2.5 3.5 0Nf 0Nf])))
+(select {from: Prg where: (>= a 0) asc: b}) -- (select {from: Frg asc: b})
+(select {from: Prg where: (>= a 0) desc: a take: 2}) -- (select {from: Frg desc: a take: 2})
+(select {from: Prg desc: a take: 2}) -- (select {from: Frg desc: a take: 2})
+(.sys.exec "rm -rf /tmp/rfl_ckragged")
+(.db.splayed.set "/tmp/rfl_ckragged/2024.01.01/t/" (table [a b] (list [0 1] [0.5 1.5])))
+(.db.splayed.set "/tmp/rfl_ckragged/2024.01.02/t/" (table [a] (list (as 'I64 []))))
+(.db.splayed.set "/tmp/rfl_ckragged/2024.01.03/t/" (table [a b] (list [5 6] [5.5 6.5])))
+(set Prg (.db.parted.get "/tmp/rfl_ckragged/" 't))
+(set Frg (table [date a b] (list [2024.01.01 2024.01.01 2024.01.03 2024.01.03] [0 1 5 6] [0.5 1.5 5.5 6.5])))
+(select {from: Prg where: (>= a 0) desc: a take: 3}) -- (select {from: Frg desc: a take: 3})
+(select {from: Prg where: (>= a 0) asc: b}) -- (select {from: Frg asc: b})
+(.sys.exec "rm -rf /tmp/rfl_ckragged")
+;; a select with no clauses answers the parted table itself, uncopied; it
+;; counts, prints and serializes as its rows: ser writes each parted column
+;; as the flat vector it stands for, byte for byte, and de reads a flat table
+(count (select {from: Pck})) -- (count Mck)
+(ser Pck) -- (ser Mck)
+(ser (select {from: Pck})) -- (ser Mck)
+(de (ser Pck)) -- Mck
+(de (ser (select {from: Pck}))) -- Mck
+(ser (list Pck 1)) -- (ser (list Mck 1))
+(ser (dict [k] (list Pck))) -- (ser (dict [k] (list Mck)))
+(format "%" (select {from: Pck})) -- (format "%" Mck)
+;; and a parted table formats as its rows (its column types were `?`)
+(format "%" Pck) -- (format "%" Mck)
 ;; sort keys no output carries, or carried under another name: the sort
 ;; reads them as columns whatever the outputs are named, as the flat one
 ;; does; an output naming another output reads that output
