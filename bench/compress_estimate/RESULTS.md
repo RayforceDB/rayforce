@@ -1659,6 +1659,10 @@ gen0 warm_gmean(base>=1ms n=42)=0.763 warm_worst=1.047 worst5 [(1.047, 'q30'), (
 
 ## P3 aware paths (10M store, release build, commit 7a603266)
 
+**The first run below (7a603266, "FAIL (pending)") is kept as history.
+"Gate rerun (HEAD 2f949edc, after Task 14b)" at the end of this section
+supersedes it and holds the verdict: P3 gate: PASS (Ruling 14-8).**
+
 The P3 gate (plan: compressed-columns P3, Task 14).  The P2 driver ran
 unchanged: `W=/home/hetoku/data/tmp/p3_bench p2_bench.sh all`, 07:14-08:55,
 with HEAD 7a603266 (release, sha256 95039693ca59) against the base 80a28e49
@@ -1689,8 +1693,9 @@ P3GATE p2_strict=FAIL materialization=FAIL rss=PASS
 P3 GATE: FAIL
 ```
 
-**P3 gate: FAIL (pending)**.  The controller rules on each failing clause:
-fix in a 14b, accept, or carry.  `P3_DEFERRALS` stays as it is until then.
+**P3 gate (first run): FAIL (pending)**, superseded by the rerun below.
+The controller ruled on each failing clause (rulings 14-1 to 14-7: fixed in
+14b, or accepted).
 Parted (arm B) passes every P2 clause on its own, with no exemption.
 
 ### Failing clauses
@@ -1927,9 +1932,9 @@ Parted:
 
 The one splayed query slower than at P2 is q29 (1.218).
 
-### Gate items
+### Gate items (first run, superseded by the rerun below)
 
-**P3 gate: FAIL (pending)**:
+**P3 gate (first run): FAIL (pending)**:
 - the materialization counter is zero for filtered, rowsel-gather and
   aggregate shapes: the unit gates pass (`aware/gate_materialization`,
   planning included).  On ClickBench, `p3_unexpected_materializations`
@@ -2285,9 +2290,11 @@ P3GATE p2_strict=FAIL materialization=PASS rss=PASS
 P3 GATE: FAIL
 ```
 
-**P3 gate: FAIL (pending)**, on one clause, gen0-splayed warm: C0 q25 (base
-against p2 on g0) at 0.92 -> 0.97 ms, best-round ratio 1.055, with a gap of
-0.052 ms against the 0.05 ms floor.
+**P3 gate: PASS** (Ruling 14-8: the only failing clause, gen-0 splayed C0 q25 at 1.055 by best round, 0.002 ms over the floor, is sub-ms noise; medians 1.011 vs 0.994, identical perf)
+
+The clause in detail: gen0-splayed warm, C0 q25 (base against p2 on g0),
+0.92 -> 0.97 ms, best-round ratio 1.055, a gap of 0.052 ms against the
+0.05 ms floor.
 - The medians of the rounds are base 1.011 and p2 0.994 ms.
 - A 9-round alternated re-check on a rebuilt g0 gave medians of base 1.010
   and p2 0.998 ms, and best rounds of 0.939 and 0.874.
@@ -2335,6 +2342,43 @@ which is reported and not gated.  q15 warm is 1.026 (bound 1.05).
 | q24-q27 first, parted | 1.220 / 0.770 / 0.964 / 0.740 | 1.221 / 0.770 / 0.937 / 0.740 |
 | SYM / integer `in` later in a chain, splayed g2 | materializes the column | 0 (both shapes; same counts) |
 | parted `in`, first and later | 0 | 0 |
+
+#### Gate items (rerun)
+
+**P3 gate: PASS** (Ruling 14-8):
+- the materialization counter is zero for filtered, rowsel-gather and
+  aggregate shapes (`aware/gate_materialization`, planning included), and
+  `p3_unexpected_materializations none` on ClickBench;
+- decoded bytes are zero where statistics or codes answer, and exact
+  otherwise (`aware/gate_decoded_bytes`, `aware/filter_*`,
+  `aware/count_on_runs`, `aware/sum_*`);
+- index row-list shapes materialize only the indexed column
+  (`aware/gather_index_rows`), and top-k only its sort keys
+  (`aware/topk_prune_cases`, `aware/gather_operators`, and the q24-q27
+  materialization lines: EventTime and SearchPhrase only);
+- the cross-segment code tests pass (`aware/cross_segment_codes`,
+  `aware/str_key_domain`);
+- the conformance battery passes (Task 13; full suite 5851/5851 on the 14b
+  tree, 0 UBSan runtime errors);
+- the P2 gate's strict line passes, with every P2 deferral cleared.  Every
+  field passes except gen-0 splayed warm C0 q25, which Ruling 14-8 rules
+  sub-ms noise; q40 on C1 and R is an intended change (ruling 14-2);
+- RSS is within D3's bound (x0.989 splayed, x0.984 parted).
+
+Benchmarks (generation 2 against generation 0, same binary, all 43
+queries).  Faster warm: 28 of 43 splayed, 27 of 43 parted.  Faster cold:
+37 of 43 splayed, 40 of 43 parted.
+
+Slower warm by more than 5%: only the directory-answered queries whose
+medians are 0.00 ms on both sides:
+- splayed q4 1.064, q5 1.272, q6 1.276, q7 1.150;
+- parted q1 1.109.
+
+All of these pass on the floor.  Slower than 1.05 by first run: splayed
+q24 1.364, q25 3.073, q26 1.376, q27 4.359 (the top-k sort keys'
+first-touch decode), q10 1.169 and q22 1.156 (materializing; first touch of
+the materialized columns).  These are reported, not gated.
+
 
 #### Per-query tables (rerun summary.txt)
 

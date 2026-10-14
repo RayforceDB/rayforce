@@ -36,26 +36,9 @@ FLOOR_MS, FLOOR_GAP_MS = 1.0, 0.05
 # warm | first | cold | rss.  Data only: the controller trims rows as the fix
 # tasks land.
 # GATE (P3-exempt) skips exactly these (query, arm, metric) clauses.
-P3_DEFERRALS = [
-    # (query, arms, metric, max_ratio, reason).  One row per arm, so each arm
-    # has its own cap.  max_ratio is about 1.5x the ratio measured on the final
-    # gate run (HEAD df637f04); above it the exemption lapses and the clause
-    # fails, so a regression of a deferred query still shows.  For rss the
-    # ratio is the arm's peak-RSS ratio (informational, not gated).  Rows whose
-    # clause passed on the final run were removed.
-    ("q8",  "A",  "warm",  2.13, "run-level compute (group over RLE runs)"),
-    ("q8",  "A",  "first", 1.74, "run-level compute (group over RLE runs, first run)"),
-    ("q18", "A",  "first", 2.94, "row-list gather (first-n keys published, P3 path 2)"),
-    ("q39", "A",  "first", 3.23, "selection gather (P3 path 2)"),
-    ("q39", "B",  "first", 2.20, "selection gather (P3 path 2)"),
-    ("q39", "A",  "cold",  3.20, "selection gather reads whole columns cold (P3)"),
-    ("q42", "A",  "warm",  2.50, "point gathers of the selected keys (P3)"),
-    ("q42", "B",  "warm",  1.87, "point gathers of the selected keys (P3)"),
-    ("q24", "A",  "rss",   2.37, "top-k output gather RSS"),
-    ("q25", "A",  "rss",   2.37, "top-k output gather RSS"),
-    ("q26", "A",  "rss",   2.37, "top-k output gather RSS"),
-    ("q27", "A",  "rss",   2.37, "top-k output gather RSS"),
-]
+# Every P3 deferral cleared at the P3 gate (Ruling 14-8): see RESULTS.md,
+# "P3 aware paths", subsection "Gate rerun (HEAD 2f949edc, after Task 14b)".
+P3_DEFERRALS = []
 # Intended answer changes against the base binary (data only, ruling 14-2):
 # (query, arm, reason).  A DIFF listed here is not an answer failure on any
 # GATE line; nothing else is ignored, and arms A, B and C0 still compare it.
