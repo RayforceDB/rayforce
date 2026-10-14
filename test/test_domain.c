@@ -67,6 +67,7 @@ static void domain_setup(void) {
 
 static void domain_teardown(void) {
     ray_clear_interrupt();
+    ray_sym_domain_batch_cancel_for_test(0);   /* disarm a hook a test left armed */
     ray_sym_destroy();
     ray_heap_destroy();
 }
@@ -521,10 +522,6 @@ static test_result_t test_domain_intern_batch(void) {
 static test_result_t test_domain_intern_batch_cancel(void) {
     unlink(TMP_DOM_SYM_PATH);
     unlink(TMP_DOM_SYM_PATH ".lk");
-    ray_pool_t* pool = ray_pool_get();
-    TEST_ASSERT_NOT_NULL(pool);
-    TEST_ASSERT_TRUE(pool->n_workers > 0);
-
     ray_sym_domain_t* dom = ray_sym_domain_open_or_create(TMP_DOM_SYM_PATH);
     TEST_ASSERT_NOT_NULL(dom);
     TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom, "seed", 4), 1);
@@ -545,9 +542,12 @@ static test_result_t test_domain_intern_batch_cancel(void) {
         hashes[i] = (uint32_t)ray_hash_bytes(strs[i], lens[i]);
     }
 
+    /* out is zero-filled: a skipped probe task then leaves "hits" at
+     * position 0 behind, which the pre-fix code took as a complete probe
+     * with no misses and returned true with those ids. */
     const int phases[] = {RAY_SYM_DOMAIN_CANCEL_PROBE, RAY_SYM_DOMAIN_CANCEL_DEDUPE};
     for (size_t p = 0; p < sizeof(phases) / sizeof(phases[0]); p++) {
-        memset(out, 0xa5, (size_t)N * sizeof(*out));
+        memset(out, 0, (size_t)N * sizeof(*out));
         ray_sym_domain_batch_cancel_for_test(phases[p]);
         TEST_ASSERT_FALSE(ray_sym_domain_intern_batch(dom, N, strs, lens, hashes, out));
         TEST_ASSERT_TRUE(ray_interrupted());
@@ -557,8 +557,27 @@ static test_result_t test_domain_intern_batch_cancel(void) {
             TEST_ASSERT_EQ_I(ray_sym_domain_find(dom, strs[i], lens[i]), -1);
     }
 
+    /* A cancel that lands once the commit has begun is too late to stop
+     * it: the parallel insert skips tasks, the caller completes them, and
+     * the batch is published whole. */
+    ray_sym_domain_batch_cancel_for_test(RAY_SYM_DOMAIN_CANCEL_INSERT);
     TEST_ASSERT_TRUE(ray_sym_domain_intern_batch(dom, N, strs, lens, hashes, out));
+    TEST_ASSERT_TRUE(ray_interrupted());
+    ray_clear_interrupt();
     TEST_ASSERT_EQ_I(ray_sym_domain_count(dom), before + N);
+    for (int64_t i = 0; i < N; i++)
+        TEST_ASSERT_EQ_I(ray_sym_domain_find(dom, strs[i], lens[i]), out[i]);
+    for (int64_t i = 0; i < N; i += 257)
+        TEST_ASSERT_EQ_I(out[i], before + i);
+
+    /* And a second batch of new strings, uncancelled, lands after them. */
+    for (int64_t i = 0; i < N; i++) {
+        snprintf(storage + (size_t)i * SL, SL, "second-%07lld", (long long)i);
+        lens[i] = strlen(strs[i]);
+        hashes[i] = (uint32_t)ray_hash_bytes(strs[i], lens[i]);
+    }
+    TEST_ASSERT_TRUE(ray_sym_domain_intern_batch(dom, N, strs, lens, hashes, out));
+    TEST_ASSERT_EQ_I(ray_sym_domain_count(dom), before + 2 * N);
     for (int64_t i = 0; i < N; i += 257)
         TEST_ASSERT_EQ_I(ray_sym_domain_find(dom, strs[i], lens[i]), out[i]);
 

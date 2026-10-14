@@ -199,7 +199,8 @@ bool ray_sym_domain_intern_batch(ray_sym_domain_t* dom, int64_t n,
 #ifdef DEBUG
 enum {
     RAY_SYM_DOMAIN_CANCEL_PROBE = 1,
-    RAY_SYM_DOMAIN_CANCEL_DEDUPE = 2
+    RAY_SYM_DOMAIN_CANCEL_DEDUPE = 2,
+    RAY_SYM_DOMAIN_CANCEL_INSERT = 3   /* before the commit's insert dispatch */
 };
 void ray_sym_domain_batch_cancel_for_test(int phase);
 #endif
