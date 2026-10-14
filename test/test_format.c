@@ -1739,6 +1739,24 @@ static test_result_t test_fmt_pp_scalar_passthrough(void) {
     PASS();
 }
 
+/* ---- Test: a quoted indexed times prints its binding as written ----
+ * The parser turns [i 3] after a `times` head into a marker list; the
+ * formatter prints that list back as [i 3], in every mode, so the quoted
+ * form reads as the source did and re-parses. */
+static test_result_t test_fmt_times_binding(void) {
+    ray_t* q = ray_eval_str("(quote (times [i 3] (set r (+ r i))))");
+    TEST_ASSERT_FALSE(!q || RAY_IS_ERR(q));
+    for (int mode = 0; mode <= 2; mode++) {
+        ray_t* s = ray_fmt(q, mode);
+        TEST_ASSERT_FALSE(!s || RAY_IS_ERR(s));
+        TEST_ASSERT_NOT_NULL(strstr(ray_str_ptr(s), "[i 3]"));
+        TEST_ASSERT_NULL(strstr(ray_str_ptr(s), "times bind"));
+        ray_release(s);
+    }
+    ray_release(q);
+    PASS();
+}
+
 /* ---- Suite definition ---- */
 
 const test_entry_t format_entries[] = {
@@ -1848,5 +1866,6 @@ const test_entry_t format_entries[] = {
     { "format/table/list_col_null", test_fmt_raw_elem_list_null, fmt_setup, fmt_teardown },
     { "format/table/na_head", test_fmt_table_na_head, fmt_setup, fmt_teardown },
     { "format/table/utf8_width", test_fmt_table_utf8_width, fmt_setup, fmt_teardown },
+    { "format/times_binding", test_fmt_times_binding, fmt_setup_full, fmt_teardown_full },
     { NULL, NULL, NULL, NULL },
 };

@@ -520,6 +520,22 @@ static void fmt_list(fmt_buf_t* b, ray_t* list, int mode) {
     int64_t len = ray_len(list);
     if (len == 0) { fmt_puts(b, "()"); return; }
 
+    /* The binding of an indexed `times`, (RAY_TIMES_BIND name count) as the
+     * parser builds it from [name count]: print it as it was written, so a
+     * quoted loop reads back and round-trips. */
+    {
+        int64_t bname = -1;
+        ray_t* bcount = NULL;
+        if (ray_times_binding(list, &bname, &bcount)) {
+            fmt_putc(b, '[');
+            fmt_obj(b, ((ray_t**)ray_data(list))[1], mode);
+            fmt_putc(b, ' ');
+            fmt_obj(b, bcount, mode);
+            fmt_putc(b, ']');
+            return;
+        }
+    }
+
     /* Historical display equivalence: a homogeneous-atom list renders as a
      * vector [..] in the round-trippable / cell modes (0 and 2), which the
      * test suite and value-equality (fmt_eq, mode 0) rely on.  REPL display
