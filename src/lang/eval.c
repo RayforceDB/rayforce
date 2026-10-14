@@ -171,7 +171,7 @@ bool ray_raise_render(char* buf, size_t cap) {
         n = ray_str_len(val);
     } else {
         text = ray_fmt(val, 1);
-        if (!text || RAY_IS_ERR(text)) { if (text) ray_release(text); return false; }
+        if (!text || RAY_IS_ERR(text)) { if (text) ray_error_free(text); return false; }
         p = ray_str_ptr(text);
         n = ray_str_len(text);
     }
