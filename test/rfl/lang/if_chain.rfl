@@ -36,3 +36,26 @@ m -- 3
 (set k 0)
 ((fn [] (if true 1 (set k 9) 2 3)))
 k -- 0
+
+;; ── inside queries ─────────────────────────────────────────────────────────
+;; A chain with a fallback lowers to nested element-wise OP_IF (the planner
+;; and the fused kernels), so where:, by: and projections see it row by row,
+;; and a text literal becomes a SYM cell as in the three-argument form; a
+;; pure helper holding one is inlined the same way.  A chain with no
+;; fallback stays with the evaluator, which runs it per row in a projection.
+(set Tq (table [v s] (list [1 3 6 9 150] ["a" "b" "c" "d" "e"])))
+(set clq (fn [x] (if (> x 100) "high" (> x 5) "mid" "low")))
+(at (select {k: (if (> v 100) "high" (> v 5) "mid" "low") from: Tq}) 'k) -- ['low 'low 'mid 'mid 'high]
+(at (select {k: (clq v) from: Tq}) 'k) -- ['low 'low 'mid 'mid 'high]
+(at (select {from: Tq where: (if (> v 100) false (> v 5) true false)}) 'v) -- [6 9]
+(at (select {from: Tq where: (if (> v 100) (== s "e") (> v 5) (!= s "c") false)}) 'v) -- [9 150]
+(set Bq (select {n: (count v) mx: (max v) from: Tq by: {k: (if (> v 100) "high" (> v 5) "mid" "low")}}))
+(at Bq 'k)  -- ['low 'mid 'high]
+(at Bq 'n)  -- [2 2 1]
+(at Bq 'mx) -- [3 9 150]
+(at (select {n: (count v) from: Tq by: {k: (clq v)}}) 'n) -- [2 2 1]
+(at (update {k: (if (> v 100) 3 (> v 5) 2 1) from: Tq}) 'k) -- [1 1 2 2 3]
+;; numeric chain with a nested arithmetic result and a where: on top
+(at (select {k: (if (> v 100) (* v 2) (> v 5) (+ v 1) 0) from: Tq where: (> v 1)}) 'k) -- [0 7 10 300]
+;; no fallback: the evaluator's per-row path, 0 where nothing matches
+(at (select {k: (if (> v 100) 3 (> v 5) 2) from: Tq}) 'k) -- [0 0 2 2 3]

@@ -31,6 +31,8 @@ other result, are never evaluated:
 0
 ```
 
+Inside a query (a projection, `where:`, a `by:` key), a chain with a fallback is evaluated row by row like the three-argument form, and a text literal in it becomes a symbol cell; a chain without a fallback is left to the evaluator.
+
 ## Sequential Evaluation: do
 
 `do` evaluates expressions in order and returns the last result. `let` bindings inside `do` are scoped to that block:
