@@ -190,9 +190,9 @@ static int minmax_rank(int8_t t) {
 
 /* The atom type the result of (min a b) / (max a b) takes: the wider of
  * two numeric types (BOOL < U8 < I16 < I32 < I64 < F32 < F64), or
- * TIMESTAMP for a DATE against a TIMESTAMP, as in q, where 2 0&1b is a
- * long vector and 1&2.0 is a float.  0 when the types already agree or
- * no promotion applies. */
+ * TIMESTAMP for a DATE against a TIMESTAMP, so an integer against a float
+ * is a float and a boolean against an integer an integer.  0 when the
+ * types already agree or no promotion applies. */
 static int8_t minmax_type(ray_t* a, ray_t* b) {
     if (a->type == b->type) return 0;
     int ra = minmax_rank(a->type), rb = minmax_rank(b->type);

@@ -232,7 +232,7 @@ static ray_t* list_collapse_uniform(ray_t* list) {
 
 /* (min a b) / (max a b) over collections.  Two collections must have the
  * same length, an error named for the call; and over a LIST the results,
- * when they share one type, make a vector of it, as q's & and | give. */
+ * when they share one type, make a vector of it. */
 static ray_t* minmax_map(ray_binary_fn f2, ray_t* a, ray_t* b) {
     if (is_collection(a) && is_collection(b) && ray_len(a) != ray_len(b))
         return ray_error("length", "%s: operand lengths must match, got %lld and %lld",

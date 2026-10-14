@@ -1,6 +1,6 @@
 ;; Dyadic (min a b) / (max a b): element-wise, null lowest, and the result
-;; takes the promoted type of the operands whichever one is chosen, as q's
-;; & and | do (2 0&1b is a long vector, 1&2.0 a float).
+;; takes the promoted type of the operands whichever one is chosen (an
+;; integer against a boolean is an integer, against a float a float).
 
 ;; ── the result type does not depend on which operand wins ───────────
 (min 1 2.5) -- 1.0
@@ -45,7 +45,7 @@
 (min (list 1 2) 1) -- [1 1]
 (type (max (list 1 2) 1)) -- 'I64
 (max (list 1 2) (list 3 0)) -- [3 2]
-;; results of different types stay a LIST, as q keeps (1;1f)
+;; results of different types stay a LIST
 (max (list 1 2.0) 1) -- (list 1 2.0)
 ;; a nested LIST keeps its shape
 (min (list [1 5] [3 0]) 2) -- (list [1 2] [2 0])
