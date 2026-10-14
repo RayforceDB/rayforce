@@ -287,6 +287,12 @@ test-large: $(LIB_OBJ) $(MAIN_OBJ) $(TEST_OBJ)
 	$(CC) $(CFLAGS) -o $(TARGET).test $(LIB_OBJ) $(TEST_OBJ) $(LIBS) $(LDFLAGS) -Itest
 	RAYFORCE_CORES=$(TEST_CORES) ./$(TARGET).test -f large/
 
+# Generation-2 wire structs compile to the same layout on wasm32 (no libc
+# needed: test/wasm/stub supplies the three string.h declarations).
+check-wasm32-layout:
+	clang --target=wasm32 -ffreestanding -fsyntax-only -std=c17 -Wall -Werror \
+	    -Itest/wasm/stub -Isrc -Iinclude test/wasm/layout_check.c
+
 # ─── ThreadSanitizer ────────────────────────────────────────────────
 # Data-race detection for the lock-free pool/heap paths, which the
 # default ASan build cannot see (ASan and TSan are mutually exclusive,
@@ -485,7 +491,7 @@ clean:
 	-rm -f cov-*.profraw default.profraw coverage.profdata
 	-rm -rf coverage_html
 
-.PHONY: default debug release lib dist test test-ndebug test-large coverage compdb tsan tsan-test hardened fuzz-smoke tidy cppcheck clean
+.PHONY: check-wasm32-layout default debug release lib dist test test-ndebug test-large coverage compdb tsan tsan-test hardened fuzz-smoke tidy cppcheck clean
 
 # Header dependencies last: .d fragments only add prerequisites to the
 # object targets above, and being last they can't hijack the default goal.
