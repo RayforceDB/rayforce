@@ -1657,3 +1657,609 @@ order_differences none
 gen0 warm_gmean(base>=1ms n=42)=0.763 warm_worst=1.047 worst5 [(1.047, 'q30'), (1.019, 'q40'), (1.018, 'q5'), (1.011, 'q6'), (1.009, 'q1')]
 ```
 
+## P3 aware paths (10M store, release build, commit 7a603266)
+
+The P3 gate (plan: compressed-columns P3, Task 14).  The P2 driver ran
+unchanged: `W=/home/hetoku/data/tmp/p3_bench p2_bench.sh all`, 07:14-08:55,
+with HEAD 7a603266 (release, sha256 95039693ca59) against the base 80a28e49
+(release from `git archive`, sha256 f1075b366780).  It ran all 43 queries
+on arms A, B, C0, C1 and R, in 5 alternated rounds, with 3 cold trials per
+query (fadvise eviction) and full answers compared; the ragged partition 9
+keeps 40 columns.  The verdict is `p3_summary.py` (P2's `p2_summary.py`
+unchanged, plus the P3 clauses).  Raw data:
+/home/hetoku/data/tmp/p3_bench/p2.tsv, with summary.txt beside it.  Nothing
+else heavy ran: the CI runner's listener was idle the whole time, no
+Runner.Worker process appeared, and the load came from the driver alone.
+
+Sizes are unchanged (g0 5 948 677 939 B, g2 3 307 128 731 B; p0
+4 807 844 987 B, p2 2 072 366 907 B).  Peak RSS over all 43 queries is now
+lower on generation 2 than on generation 0: g0 5 120 100 kB against g2
+5 060 388 kB (x0.988; P2: x1.58), and p0 12 158 788 kB against p2
+11 963 400 kB (x0.984).
+
+### Gate lines
+
+```
+GATE (strict) splayed[answers=PASS warm=FAIL cold=FAIL first=FAIL materializing_warm=FAIL no_unexpected_materialization=PASS first_total=PASS] parted[answers=PASS warm=PASS cold=PASS first=PASS materializing_warm=PASS no_unexpected_materialization=PASS] gen0-splayed[answers=PASS warm=FAIL] gen0-parted[answers=FAIL warm=PASS q16_first=PASS] gen0-ragged[answers=FAIL warm=PASS]
+P2 GATE (strict): FAIL
+p3_unexpected_materializations A/q23:SearchPhrase B/q6:SearchPhrase B/q28:URL
+rss A: 5120100 -> 5060388 kB (x0.988, bound 1.1)
+rss B: 12158788 -> 11963400 kB (x0.984, bound 1.1)
+P3GATE p2_strict=FAIL materialization=FAIL rss=PASS
+P3 GATE: FAIL
+```
+
+**P3 gate: FAIL (pending)**.  The controller rules on each failing clause:
+fix in a 14b, accept, or carry.  `P3_DEFERRALS` stays as it is until then.
+Parted (arm B) passes every P2 clause on its own, with no exemption.
+
+### Failing clauses
+
+The profiles are `perf record -g` on the release binary, with the query run
+5-30 times in one process; each line gives the top symbols as self samples,
+g0 -> g2.
+
+| clause | query, arm | a -> b (ms) | ratio | owning path (diagnosis) |
+|---|---|---|---|---|
+| splayed warm (scan-only) | q13, A | 22.30 -> 31.54 | 1.414 | SYM-key group over the staged fused radix |
+| splayed first | q13, A | 32.21 -> 40.57 | 1.260 | same |
+| splayed warm | q15, A | 26.83 -> 35.98 | 1.341 | same (keys SearchEngineID, SearchPhrase) |
+| splayed first | q15, A | 39.58 -> 49.43 | 1.249 | same |
+| splayed warm | q29, A | 347.47 -> 425.13 | 1.224 | group by Referer: an extra min/max pass and a packed agg read |
+| splayed first | q29, A | 434.76 -> 515.64 | 1.186 | same |
+| splayed cold | q29, A | 500.27 -> 554.97 | 1.109 | same |
+| splayed warm | q8, A | 3.59 -> 4.05 | 1.128 | run-level dense count; P3_DEFERRALS exempts it, the strict line does not |
+| splayed materializing warm | q22, A | 18.04 -> 20.55 | 1.139 | SearchPhrase key decoded per morsel after the URL LIKE |
+| gen0-splayed warm (C0) | q27 | 0.90 -> 1.00 | 1.110 | sub-ms gate statistic, not a regression (re-check below) |
+| gen0-parted / gen0-ragged answers | q40, C1 and R | - | DIFF | tie order at the `take: 1010` boundary, not a wrong answer |
+| materialization | q23, A | SearchPhrase | - | count-distinct group key, outside ALLOW |
+| materialization | q6, B | SearchPhrase | - | parted `(at hits 'SearchPhrase)` takes the whole column |
+| materialization | q28, B | URL | - | `strlen URL` in the per-partition group |
+
+- **q13 and q15, splayed.**  Generation 2 did not slow down.  Its time
+  stayed where the P2 gate had it (q13 31.87 -> 31.54 ms, q15 37.51 ->
+  35.98 ms).  Generation 0 sped up during P3 (C0: q13 0.709, q15 0.724; g0
+  31.91 -> 22.30 ms) and generation 2 did not follow.  The profiles:
+  - g0 (q13): agg_radix_group_fn 3 081, agg_radix_scatter_fn 2 112,
+    rowsel_emit_segment 1 809, agg_radix_count_fn 1 267,
+    agg_sel_cursor_next 953;
+  - g2 (q13): agg_radix_group_fused_fn 3 342, agg_radix_stage_rows 1 834,
+    rowsel_emit_segment 1 812, dec_fast_runs 1 382, eval_runs 1 170;
+  - q15 matches, with ray_enccol_vview 869 in sixth place.
+
+  Generation 0 groups over the selection with the plain radix.  Generation
+  2 stages the SYM key rows (`agg_radix_stage_rows`) and decodes the key per
+  morsel (dec_fast_runs, eval_runs and the view: about 18% of the samples).
+  The owning path is the group-by key read on generation 2: the staged fused
+  radix in agg_engine.c / group.c (Path 5 ids by range).
+- **q22, splayed** (materializing: URL by LIKE).  The P3 gain is the same as
+  for q13: g0 27.53 -> 18.04 ms, g2 27.56 -> 20.55 ms.  The profiles:
+  - g0: like_rows_fn 7 865, memmem 3 573, rowsel_emit_segment 2 644,
+    dom_parse_strl_atoms 803, expr_eval_morsel 826;
+  - g2: like_rows_fn 7 700, memmem 3 651, rowsel_emit_segment 2 664,
+    eval_runs 1 736, dom_parse_strl_atoms 826, ray_enccol_vview 609.
+
+  The extra eval_runs and view time is the SearchPhrase key and its
+  `!= ""` filter read by range.  It is the same owner as q13.
+- **q29, splayed** (`by: Referer`, `avg (strlen Referer)`).  This one is a
+  generation-2 slowdown since P2: g2 349.10 -> 425.13 ms, with g0
+  unchanged.  P2 materialized Referer, and the group then read the flat
+  column.  The profiles:
+  - g0: radix_phase1_body 21 124, radix_phase3_fn 10 568,
+    accum_from_entry_nullable 3 800, radix_phase2_fn 3 081,
+    exec_group_run 1 412;
+  - g2: radix_phase1_body 14 216, minmax_scan_body 11 631,
+    radix_phase3_fn 10 456, ght_pack_aggs_piece 7 256,
+    accum_from_entry_nullable 3 922.
+
+  The DWARF call graph puts minmax_scan_body under exec_group_run ->
+  minmax_scan_fn -> group_sel_walk -> ray_col_walk -> minmax_piece, and
+  ght_pack_aggs_piece under radix_phase1_body.  Generation 2 makes a range
+  pass over the key for its bounds, which generation 0 does not make, and it
+  packs the aggregate inputs piece by piece.  The owning path is the
+  exec_group_run range-read setup (min/max key bounds by a column walk
+  instead of from the directory or the SYM bound), group.c.
+- **q8, splayed** (watch item, was 1.17 after Task 3b).  The profiles:
+  - g0: rowsel_emit_segment 1 315, dom_parse_strl_atoms 792,
+    expr_eval_morsel 679, expr_load_i64 389, agg_dense_sel_rows 294;
+  - g2: rowsel_emit_segment 1 252, dom_parse_strl_atoms 780, eval_runs 279,
+    ray_enccol_vview 263, agg_dense_runs_sel 194.
+
+  What remains is the run view built for the filter and again for the dense
+  count (the triple-view structure ruled on at Task 3b).  P3_DEFERRALS
+  exempts it (cap 2.13), but the strict line counts it.
+- **Gen-0 q27 (C0)** (`asc: [EventTime SearchPhrase] take: 10`).  Both
+  medians are about 1 ms, and the gap of 0.10 ms is above the 0.05 ms floor.
+  The gate statistic takes the best round: base 0.902 against p2 1.001.  The
+  medians of the rounds are 0.983 and 1.039.  A 9-round alternated re-check
+  on g0 gave a median of 1.031 ms for both binaries, and best rounds of 0.886
+  and 0.918.  This is the same sub-ms artifact as P2's gen-0 q25.  Gen-0 q30
+  at 1.773 passes on the floor (0.02 -> 0.03 ms).
+- **q40, gen-0 parted and ragged** (base against p2, both p0).  The whole
+  grouped result (354 662 rows) is byte-identical once sorted.  945 groups
+  have PageViews > 13, and 131 tie at 13.  `desc: PageViews take: 1010` cuts
+  through that tie, so `take: -10` returns ten of the tied groups, and which
+  ten depends on tie order.  The new binary now returns the same ten as
+  arms A, B and C0 (raw hash dd41af295a7d).  The base returns a different
+  ten (2da5238161f2).  The driver's sorted compare cannot tell a cut tie set
+  from a wrong answer, so it reports DIFF.  At the P2 gate (df637f04) the
+  p2 binary still matched the base here.
+- **Materializations outside ALLOW**:
+  - **A/q23 SearchPhrase**: taken directly by ray_select_impl, on the
+    count-distinct route (UserID by count_distinct_per_group_buf).  This is
+    the same class as q10's RegionID: the group key of a group that has a
+    holistic aggregate.  Parted q23 does not materialize it.  Covering it
+    would widen ALLOW, which needs a ruling (D7).
+  - **B/q6 SearchPhrase**: `(count (distinct (at hits 'SearchPhrase)))`.
+    `ray_table_col_value` materializes the parted column for `at`, and
+    `enc_materialize_parted` fans out to every segment.  Splayed `at` is
+    lazy and materializes nothing.  The class is the eval-level column value
+    of a parted table (holistic distinct).  The profile is the same on p0
+    and p2 (sym_intern_nolock 12 815 / 12 690, ray_str_len 2 415 / 2 409),
+    and so is the time (warm 1.008).
+  - **B/q28 URL**: exec_strlen inside exec_group_per_partition
+    materializes each partition's URL (10 segments).  The class is a row
+    expression (`strlen`) over a STR column in the per-partition group.  No
+    ALLOW class covers it, and splayed q28 materializes nothing.  The
+    profile is the same on p0 and p2 (strlen_sym_task 4 798 / 4 782,
+    agg_dense_sel_rows 1 965 / 2 071), and so is the time (0.964).
+  - The owning paths: parted `at` (eval / table column value) and the
+    per-partition group's expression inputs (exec_group_per_partition).
+
+### Materialization classes, traced
+
+The traces ran gdb on the release binary, with breakpoints on
+`enc_materialize_single` and `enc_materialize_parted` printing the column
+path and the backtrace, on generation-2 stores rebuilt after the run under
+the same driver paths.
+
+| query | ALLOW entry | A (splayed) traced | B (parted) traced | class / outcome |
+|---|---|---|---|---|
+| q11 | UserID, MobilePhoneModel | both, try_count_distinct_v2_rewrite | none | count distinct (holistic): holds |
+| q12 | UserID, MobilePhone, MobilePhoneModel | none | none | nested group: narrowed out of ALLOW |
+| q14 | UserID, SearchPhrase | both, try_count_distinct_v2_rewrite | none | count distinct (holistic): holds |
+| q22 | URL | URL, exec_like | URL, exec_like | LIKE: holds |
+| q23 | Title, URL, UserID | Title and URL by exec_like, UserID by count_distinct_per_group_buf, plus SearchPhrase (ray_select_impl) | Title, URL by exec_like | LIKE and count distinct: hold; SearchPhrase is outside the entry (see above) |
+| q24 | EventTime, URL | EventTime, ray_col_src_plain in ray_fused_topk_select | URL, exec_like | sort key (A); LIKE outside the fused predicate (B): both hold |
+| q40 | URL, Referer, SearchEngineID, AdvEngineID, TraficSourceID | none | none | computed key Src: narrowed out of ALLOW |
+
+The other materializations take the classes ALLOW states:
+- q9 and q10: count distinct (try_count_distinct_v2_rewrite,
+  count_distinct_per_group_buf);
+- q19: `minute EventTime`, by bind_referenced_columns (A) and exec_extract
+  (B);
+- q21: LIKE in ray_try_count_select_expr;
+- q25-q27: sort keys in ray_fused_topk_select;
+- q30: `set`, by ray_lazy_materialize.
+
+### Carries and watch list
+
+Each carry is printed with its P2 re-run ratio and today's:
+
+```
+carry q2/A/warm: P2 x1.086 -> P3 x0.606
+carry q8/A/warm: P2 x1.424 -> P3 x1.128
+carry q8/B/warm: P2 x1.060 -> P3 x0.356
+carry q18/A/first: P2 x1.983 -> P3 x0.487
+carry q18/B/warm: P2 x1.088 -> P3 x0.764
+carry q39/A/first: P2 x2.402 -> P3 x0.725
+carry q39/B/first: P2 x1.503 -> P3 x0.740
+carry q42/A/warm: P2 x1.664 -> P3 x1.012
+carry q42/B/warm: P2 x1.237 -> P3 x1.007
+```
+
+Every carry is within its P2 clause bound except q8/A/warm (1.128 > 1.05).
+The splayed rss carries (q24-q27) are x0.99 now.
+
+| watch item | number |
+|---|---|
+| q8 splayed warm (was 1.17) | 1.128 (first 0.997, cold 0.243); parted q8 warm 0.356 |
+| q10 | splayed warm 1.024 (materializing, passes), first 1.176, cold 0.374; parted warm 1.007 |
+| q26 splayed warm (was 1.058) | 1.044 |
+| parted q42 (was 1.03-1.08) | warm 1.007, first 1.006, 3-run 1.074, cold 0.769 |
+| arm R, gen-0 ragged | warm gmean 0.588 (n=42), worst 1.018 (q1, below 1 ms); answers all same except q40's tie order |
+| parted nullable avg (parted q4) | p0 272.86 ms, p2 0.00 ms (answered without a decode); gen 0 base -> p2 0.974 (C1) and 0.991 (R) |
+| URL first-touch, q24 | splayed first 1.377 (URL is not materialized on A, only the EventTime sort key); parted first 1.220 (URL by LIKE) |
+| q24-q27 first run (reported, not gated) | splayed 1.377 / 3.064 / 1.371 / 4.306; parted 1.220 / 0.770 / 0.964 / 0.740 |
+| SYM `in` later in a chain (ledger line 88) | still materializes, on splayed generation 2: `(and (== IsRefresh 0) (in MobilePhoneModel ['iPad 'iPhone]))` leaves MobilePhoneModel materialized (generic OP_IN in exec_node_inner); the integer `(in TraficSourceID [-1 6])` after `(== IsRefresh 0)` does the same, so the shape is wider than SYM; `in` first in the chain: 0 |
+| parted `in` (Task 12) | 0 materializations: integer and SYM, first and later in the chain, also under a group |
+
+### Compared with the final P2 gate (same store, same driver)
+
+The ratios are generation-2 warm, P3 / P2; generation-0 times moved too,
+so the gen2/gen0 ratio for each run is shown beside it.
+
+| q | A g2 warm P2 -> P3 (ms) | A P3/P2 | A g2/g0 P2 -> P3 | B p2 warm P2 -> P3 (ms) | B P3/P2 | B p2/p0 P2 -> P3 |
+|---|---|---|---|---|---|---|
+| q1 | 0.00 -> 0.00 | - | 1.000 -> 1.000 | 0.00 -> 0.00 | - | 1.046 -> 1.052 |
+| q2 | 0.65 -> 0.39 | 0.600 | 1.049 -> 0.606 | 6.69 -> 6.43 | 0.961 | 1.015 -> 0.953 |
+| q3 | 0.00 -> 0.00 | - | 0.001 -> 0.001 | 5.85 -> 0.00 | 0.000 | 0.010 -> 0.000 |
+| q4 | 0.00 -> 0.00 | - | 1.013 -> 1.068 | 7.43 -> 0.00 | 0.000 | 0.027 -> 0.000 |
+| q5 | 0.00 -> 0.00 | - | 1.296 -> 1.314 | 0.00 -> 0.00 | - | 0.000 -> 0.000 |
+| q6 | 0.00 -> 0.00 | - | 1.275 -> 1.244 | 346.09 -> 342.61 | 0.990 | 0.994 -> 1.008 |
+| q7 | 0.00 -> 0.00 | - | 1.175 -> 1.143 | 2.54 -> 0.00 | 0.000 | 0.005 -> 0.000 |
+| q8 | 5.06 -> 4.05 | 0.800 | 1.422 -> 1.128 | 6.60 -> 2.25 | 0.341 | 1.038 -> 0.356 |
+| q9 | 74.96 -> 75.25 | 1.004 | 0.999 -> 0.997 | 82.99 -> 83.23 | 1.003 | 0.973 -> 0.974 |
+| q10 | 72.61 -> 71.13 | 0.980 | 1.052 -> 1.024 | 80.44 -> 79.37 | 0.987 | 1.020 -> 1.007 |
+| q11 | 16.18 -> 11.70 | 0.723 | 1.016 -> 1.004 | 23.26 -> 16.14 | 0.694 | 0.946 -> 0.790 |
+| q12 | 16.38 -> 11.68 | 0.713 | 1.010 -> 0.988 | 25.93 -> 17.95 | 0.692 | 0.968 -> 0.780 |
+| q13 | 31.87 -> 31.54 | 0.990 | 0.999 -> 1.414 | 39.79 -> 37.92 | 0.953 | 0.987 -> 1.025 |
+| q14 | 62.68 -> 53.37 | 0.851 | 0.999 -> 1.014 | 101.48 -> 85.77 | 0.845 | 1.000 -> 0.867 |
+| q15 | 37.51 -> 35.98 | 0.959 | 1.030 -> 1.341 | 46.19 -> 44.84 | 0.971 | 0.990 -> 1.035 |
+| q16 | 63.35 -> 60.88 | 0.961 | 0.907 -> 0.874 | 64.32 -> 61.44 | 0.955 | 0.888 -> 0.848 |
+| q17 | 92.67 -> 90.22 | 0.974 | 0.992 -> 0.953 | 93.16 -> 90.11 | 0.967 | 0.971 -> 0.943 |
+| q18 | 6.87 -> 5.01 | 0.729 | 1.004 -> 0.736 | 17.54 -> 13.18 | 0.751 | 1.027 -> 0.764 |
+| q19 | 139.33 -> 138.35 | 0.993 | 1.016 -> 1.002 | 144.65 -> 145.35 | 1.005 | 1.019 -> 1.015 |
+| q20 | 0.73 -> 0.59 | 0.808 | 0.631 -> 0.506 | 1.57 -> 1.48 | 0.943 | 0.340 -> 0.318 |
+| q21 | 42.20 -> 41.98 | 0.995 | 1.007 -> 1.002 | 41.82 -> 41.76 | 0.999 | 1.000 -> 1.000 |
+| q22 | 27.56 -> 20.55 | 0.746 | 1.001 -> 1.139 | 60.26 -> 58.55 | 0.972 | 0.992 -> 1.023 |
+| q23 | 48.96 -> 39.39 | 0.805 | 1.002 -> 1.002 | 90.05 -> 89.69 | 0.996 | 0.994 -> 1.023 |
+| q24 | 29.38 -> 27.75 | 0.945 | 0.997 -> 0.948 | 43.64 -> 43.06 | 0.987 | 0.976 -> 1.016 |
+| q25 | 0.95 -> 0.95 | 1.000 | 1.049 -> 0.979 | 1045.10 -> 23.81 | 0.023 | 0.992 -> 0.858 |
+| q26 | 10.91 -> 11.28 | 1.034 | 1.006 -> 1.044 | 1102.02 -> 76.64 | 0.070 | 0.997 -> 0.917 |
+| q27 | 0.96 -> 0.81 | 0.844 | 0.957 -> 0.902 | 1057.73 -> 38.77 | 0.037 | 0.992 -> 0.753 |
+| q28 | 67.00 -> 65.20 | 0.973 | 0.822 -> 0.814 | 87.55 -> 83.84 | 0.958 | 0.966 -> 0.964 |
+| q29 | 349.10 -> 425.13 | 1.218 | 1.002 -> 1.224 | 356.29 -> 360.24 | 1.011 | 1.001 -> 0.999 |
+| q30 | 0.02 -> 0.02 | - | 1.010 -> 1.027 | 276.13 -> 264.89 | 0.959 | 0.995 -> 1.001 |
+| q31 | 51.61 -> 39.86 | 0.772 | 1.004 -> 0.939 | 56.22 -> 53.17 | 0.946 | 1.012 -> 1.019 |
+| q32 | 59.28 -> 47.78 | 0.806 | 1.000 -> 0.962 | 71.43 -> 67.74 | 0.948 | 1.038 -> 1.032 |
+| q33 | 212.53 -> 212.20 | 0.998 | 1.051 -> 1.044 | 217.37 -> 215.53 | 0.992 | 1.030 -> 1.009 |
+| q34 | 38.68 -> 38.72 | 1.001 | 0.983 -> 0.990 | 43.57 -> 43.38 | 0.996 | 1.006 -> 0.998 |
+| q35 | 38.64 -> 38.75 | 1.003 | 0.986 -> 0.985 | 43.37 -> 43.33 | 0.999 | 1.012 -> 1.004 |
+| q36 | 61.05 -> 58.54 | 0.959 | 0.950 -> 0.917 | 144.73 -> 144.67 | 1.000 | 0.993 -> 0.994 |
+| q37 | 16.53 -> 9.23 | 0.558 | 1.000 -> 0.549 | 34.42 -> 21.86 | 0.635 | 0.962 -> 0.603 |
+| q38 | 14.81 -> 7.99 | 0.540 | 0.988 -> 0.529 | 33.22 -> 20.82 | 0.627 | 0.958 -> 0.579 |
+| q39 | 7.19 -> 5.26 | 0.732 | 1.004 -> 0.731 | 13.24 -> 8.64 | 0.653 | 0.882 -> 0.567 |
+| q40 | 58.61 -> 51.53 | 0.879 | 1.004 -> 0.876 | 115.19 -> 109.18 | 0.948 | 0.986 -> 0.929 |
+| q41 | 5.69 -> 3.86 | 0.678 | 0.975 -> 0.672 | 17.17 -> 13.14 | 0.765 | 0.973 -> 0.743 |
+| q42 | 7.54 -> 4.56 | 0.605 | 1.669 -> 1.012 | 16.36 -> 13.26 | 0.811 | 1.246 -> 1.007 |
+| q43 | 8.93 -> 7.49 | 0.839 | 0.995 -> 0.834 | 26.56 -> 16.04 | 0.604 | 0.941 -> 0.563 |
+
+The warm-time gains since P2 are spread across the filtered and aggregate
+queries.  Splayed:
+- q37 0.558, q38 0.540, q39 0.732, q41 0.678, q42 0.605;
+- q18 0.729, q11 0.723, q12 0.713, q22 0.746, q31 0.772, q8 0.800.
+
+Parted:
+- the top-k queries q25 0.023, q26 0.070, q27 0.037;
+- the directory answers q3, q4, q7 (now 0.00 ms);
+- q8 0.341, q37 0.635, q43 0.604.
+
+The one splayed query slower than at P2 is q29 (1.218).
+
+### Gate items
+
+**P3 gate: FAIL (pending)**:
+- the materialization counter is zero for filtered, rowsel-gather and
+  aggregate shapes: the unit gates pass (`aware/gate_materialization`,
+  planning included).  On ClickBench, `p3_unexpected_materializations`
+  lists A/q23 SearchPhrase, B/q6 SearchPhrase and B/q28 URL: **FAIL**;
+- decoded bytes are zero where statistics or codes answer, and exact
+  otherwise: `aware/gate_decoded_bytes`, `aware/filter_*`,
+  `aware/count_on_runs` and `aware/sum_*` pass;
+- index row-list shapes materialize only the indexed column
+  (`aware/gather_index_rows`), and top-k only its sort keys
+  (`aware/topk_prune_cases`, `aware/gather_operators`, and the q24-q27
+  traces above): pass;
+- the cross-segment code tests pass (`aware/cross_segment_codes`,
+  `aware/str_key_domain`);
+- the conformance battery passes (Task 13).  The full suite at 7a603266 is
+  5844 / 5844, with 0 UBSan runtime errors;
+- the P2 gate's strict line: **FAIL**.  The splayed warm, first, cold and
+  materializing-warm clauses fail (q13, q15, q29, q8, q22); gen-0 splayed
+  warm fails on q27, below 1 ms; gen-0 parted and ragged answers fail on
+  q40's tie order;
+- RSS is within D3's bound: pass (x0.988 splayed, x0.984 parted).
+
+Benchmarks.  Faster warm than generation 0: 23 of 43 splayed, 27 of 43
+parted.  Faster cold: 37 of 43 splayed, 40 of 43 parted.  Slower warm by
+more than 5%:
+- splayed q13 1.414, q15 1.341, q29 1.224, q22 1.139, q8 1.128 (profiles
+  above);
+- the directory-answered q4-q7 (splayed) and q1 (parted), whose medians are
+  0.00 ms on both sides.
+
+### Per-query tables (summary.txt)
+
+```
+## arm A: splayed g0 vs g2 (ms; ratio = g2/g0)
+q	warm_a	warm_b	wr	first_a	first_b	fr	3run_a	3run_b	tr	cold_a	cold_b	cr	materialized	answers
+q1	0.00	0.00	1.000	0.01	0.01	0.561	0.01	0.01	0.589	0.01	0.01	1.552	[]	same
+q2	0.64	0.39	0.606	1.59	1.25	0.783	3.07	2.14	0.695	38.23	3.39	0.089	[]	same
+q3	3.78	0.00	0.001	5.50	0.04	0.007	13.23	0.05	0.004	94.34	0.04	0.000	[]	same
+q4	0.00	0.00	1.068	0.02	0.03	1.230	0.03	0.03	1.217	0.03	0.04	1.430	[]	same
+q5	0.00	0.00	1.314	0.03	0.03	1.027	0.03	0.03	1.031	0.03	0.03	0.906	[]	same
+q6	0.00	0.00	1.244	0.03	0.03	1.009	0.03	0.03	1.015	0.03	0.04	1.149	[]	same
+q7	0.00	0.00	1.143	0.02	0.04	1.982	0.02	0.04	1.838	0.02	0.04	2.002	[]	same
+q8	3.59	4.05	1.128	9.09	9.06	0.997	16.52	17.63	1.068	41.13	10.01	0.243	[]	same
+q9	75.49	75.25	0.997	118.27	126.46	1.069	268.82	280.19	1.042	608.63	154.72	0.254	[RegionID UserID]	same
+q10	69.50	71.13	1.024	99.27	116.77	1.176	239.28	268.10	1.120	410.25	153.27	0.374	[RegionID UserID]	same
+q11	11.65	11.70	1.004	22.01	35.94	1.633	45.58	59.77	1.311	239.53	57.82	0.241	[UserID MobilePhoneModel]	same
+q12	11.83	11.68	0.988	20.78	19.08	0.918	44.83	43.02	0.960	273.33	51.80	0.190	[]	same
+q13	22.30	31.54	1.414	32.21	40.57	1.260	77.34	103.98	1.344	102.35	58.79	0.574	[]	same
+q14	52.62	53.37	1.014	78.05	93.80	1.202	187.65	203.66	1.085	292.48	131.24	0.449	[UserID SearchPhrase]	same
+q15	26.83	35.98	1.341	39.58	49.43	1.249	93.29	124.05	1.330	142.31	99.58	0.700	[]	same
+q16	69.68	60.88	0.874	95.75	86.21	0.900	241.47	213.75	0.885	240.47	163.17	0.679	[]	same
+q17	94.68	90.22	0.953	130.42	124.13	0.952	323.63	306.21	0.946	465.76	246.13	0.528	[]	same
+q18	6.81	5.01	0.736	13.47	6.57	0.487	27.36	16.63	0.608	655.77	58.84	0.090	[]	same
+q19	138.04	138.35	1.002	210.39	207.39	0.986	493.70	493.87	1.000	679.95	448.07	0.659	[EventTime]	same
+q20	1.16	0.59	0.506	6.77	6.07	0.896	9.40	7.39	0.787	55.10	16.87	0.306	[]	same
+q21	41.90	41.98	1.002	45.36	50.92	1.123	131.15	136.09	1.038	77.37	93.28	1.206	[URL]	same
+q22	18.04	20.55	1.139	26.65	33.43	1.255	63.54	74.61	1.174	173.68	110.34	0.635	[URL]	same
+q23	39.30	39.39	1.002	55.12	85.60	1.553	134.14	165.62	1.235	415.93	245.74	0.591	[Title UserID URL SearchPhrase]	same
+q24	29.29	27.75	0.948	34.49	47.50	1.377	93.42	103.63	1.109	594.88	546.27	0.918	[EventTime]	same
+q25	0.97	0.95	0.979	4.40	13.48	3.064	6.47	15.43	2.386	294.72	244.45	0.829	[EventTime]	same
+q26	10.80	11.28	1.044	15.30	20.98	1.371	37.05	43.77	1.181	549.75	292.27	0.532	[SearchPhrase]	same
+q27	0.90	0.81	0.902	4.43	19.07	4.306	6.44	20.93	3.249	290.37	251.87	0.867	[EventTime SearchPhrase]	same
+q28	80.11	65.20	0.814	89.57	71.31	0.796	257.71	205.99	0.799	220.05	90.68	0.412	[]	same
+q29	347.47	425.13	1.224	434.76	515.64	1.186	1133.70	1365.76	1.205	500.27	554.97	1.109	[]	same
+q30	0.02	0.02	1.027	2.80	4.64	1.655	2.87	4.71	1.642	54.73	11.58	0.212	[ResolutionWidth]	same
+q31	42.44	39.86	0.939	62.70	57.37	0.915	147.53	138.16	0.936	306.03	110.14	0.360	[]	same
+q32	49.65	47.78	0.962	76.68	73.12	0.954	176.17	169.64	0.963	438.33	262.80	0.600	[]	same
+q33	203.22	212.20	1.044	364.70	363.27	0.996	774.13	796.00	1.028	609.63	554.47	0.910	[]	same
+q34	39.10	38.72	0.990	70.84	71.86	1.014	149.38	151.00	1.011	138.28	109.16	0.789	[]	same
+q35	39.34	38.75	0.985	69.84	72.08	1.032	149.47	154.96	1.037	137.79	110.02	0.798	[]	same
+q36	63.86	58.54	0.917	88.27	82.88	0.939	217.58	203.80	0.937	160.52	128.09	0.798	[]	same
+q37	16.80	9.23	0.549	27.15	19.12	0.704	60.74	38.97	0.642	42.04	22.35	0.532	[]	same
+q38	15.11	7.99	0.529	25.74	16.17	0.628	56.89	33.57	0.590	39.65	19.92	0.503	[]	same
+q39	7.20	5.26	0.731	14.76	10.70	0.725	29.36	22.28	0.759	38.41	18.45	0.480	[]	same
+q40	58.84	51.53	0.876	91.43	84.72	0.927	210.87	191.33	0.907	118.61	94.68	0.798	[]	same
+q41	5.75	3.86	0.672	13.54	10.15	0.750	25.52	18.19	0.712	74.21	40.16	0.541	[]	same
+q42	4.51	4.56	1.012	11.05	10.66	0.965	21.04	20.64	0.981	37.12	20.15	0.543	[]	same
+q43	8.98	7.49	0.834	18.54	17.59	0.949	37.20	33.51	0.901	40.77	26.63	0.653	[]	same
+totals over all 43: warm 1712.2 vs 1749.0 (1.021); first run 2531.4 vs 2675.2 (1.057); 3-run 6007.7 vs 6249.1 (1.040)
+answer_mismatches none
+order_differences none
+scan_only(gated) n=30; gmeans over base>=1ms (per column): warm n=24 0.651, first n=25 0.738, cold n=25 0.357; worst warm=1.414
+below_1ms_excluded_from_warm_gmean q1 q2 q4 q5 q6 q7
+below_1ms_excluded_from_first_gmean q1 q4 q5 q6 q7
+below_1ms_excluded_from_cold_gmean q1 q4 q5 q6 q7
+mat rows missing none
+scan_only_list_but_materializing none
+measured_materializing q9(2 cols) q10(2 cols) q11(2 cols) q14(2 cols) q19(1 cols) q21(1 cols) q22(1 cols) q23(4 cols) q24(1 cols) q25(1 cols) q26(1 cols) q27(2 cols) q30(1 cols)
+class_vs_SCAN_ONLY_list_disagreements q5(measured scan, list other) q6(measured scan, list other) q12(measured scan, list other) q13(measured scan, list other) q15(measured scan, list other) q20(measured scan, list other) q28(measured scan, list other) q29(measured scan, list other) q31(measured scan, list other) q32(measured scan, list other) q36(measured scan, list other) q37(measured scan, list other) q38(measured scan, list other) q40(measured scan, list other) q41(measured scan, list other) q42(measured scan, list other) q43(measured scan, list other)
+worst5 warm [(1.414, 'q13'), (1.341, 'q15'), (1.314, 'q5'), (1.244, 'q6'), (1.224, 'q29')]
+worst5 cold [(2.002, 'q7'), (1.552, 'q1'), (1.43, 'q4'), (1.149, 'q6'), (1.109, 'q29')]
+worst5 first [(1.982, 'q7'), (1.26, 'q13'), (1.249, 'q15'), (1.23, 'q4'), (1.186, 'q29')]
+worst5 materializing_warm [(1.139, 'q22'), (1.044, 'q26'), (1.027, 'q30'), (1.024, 'q10'), (1.014, 'q14')]
+first_run_total_ratio 1.057 (PI after P1: 2.99)
+pi_row q41 warm 0.672 first 0.750 3run 0.712
+pi_row q42 warm 1.012 first 0.965 3run 0.981
+
+## arm B: parted p0 vs p2 (ms; ratio = p2/p0)
+q	warm_a	warm_b	wr	first_a	first_b	fr	3run_a	3run_b	tr	cold_a	cold_b	cr	materialized	answers
+q1	0.00	0.00	1.052	0.01	0.01	0.976	0.01	0.01	0.981	0.01	0.01	0.581	[]	same
+q2	6.75	6.43	0.953	16.81	16.35	0.973	30.37	29.32	0.965	45.63	16.32	0.358	[]	same
+q3	532.99	0.00	0.000	548.07	0.05	0.000	1628.48	0.06	0.000	574.17	0.05	0.000	[]	same
+q4	272.86	0.00	0.000	319.81	0.04	0.000	869.00	0.04	0.000	365.63	0.04	0.000	[]	same
+q5	273.15	0.00	0.000	319.23	0.03	0.000	868.18	0.03	0.000	361.11	0.03	0.000	[]	same
+q6	339.91	342.61	1.008	9704.33	9710.43	1.001	10384.72	10398.35	1.001	9764.99	9763.91	1.000	[SearchPhrase]	same
+q7	527.02	0.00	0.000	555.42	0.05	0.000	1610.10	0.05	0.000	573.31	0.05	0.000	[]	same
+q8	6.31	2.25	0.356	7.95	3.97	0.499	20.77	8.66	0.417	40.94	3.76	0.092	[]	same
+q9	85.50	83.23	0.974	154.75	164.19	1.061	330.08	334.28	1.013	392.26	190.25	0.485	[RegionID UserID]	same
+q10	78.79	79.37	1.007	153.99	167.29	1.086	313.14	337.93	1.079	440.67	196.62	0.446	[RegionID UserID]	same
+q11	20.44	16.14	0.790	38.30	29.69	0.775	81.69	65.14	0.797	338.89	56.00	0.165	[]	same
+q12	23.01	17.95	0.780	41.05	30.59	0.745	88.50	67.15	0.759	397.37	55.65	0.140	[]	same
+q13	36.99	37.92	1.025	69.20	52.30	0.756	143.21	130.20	0.909	137.12	69.88	0.510	[]	same
+q14	98.88	85.77	0.867	134.19	116.45	0.868	337.07	291.09	0.864	397.42	158.15	0.398	[]	same
+q15	43.31	44.84	1.035	88.47	64.58	0.730	175.92	160.28	0.911	194.91	86.78	0.445	[]	same
+q16	72.45	61.44	0.848	98.92	87.39	0.883	244.24	213.77	0.875	251.36	163.40	0.650	[]	same
+q17	95.57	90.11	0.943	136.37	125.13	0.918	331.74	312.21	0.941	475.64	240.24	0.505	[]	same
+q18	17.25	13.18	0.764	85.16	18.96	0.223	119.75	45.66	0.381	330.87	61.77	0.187	[]	same
+q19	143.26	145.35	1.015	340.74	244.55	0.718	629.70	539.07	0.856	745.55	373.40	0.501	[EventTime]	same
+q20	4.64	1.48	0.318	14.62	12.05	0.824	24.25	15.61	0.644	154.69	22.32	0.144	[]	same
+q21	41.76	41.76	1.000	46.70	56.18	1.203	131.20	140.11	1.068	87.68	99.23	1.132	[URL]	same
+q22	57.22	58.55	1.023	69.66	74.42	1.068	184.84	193.35	1.046	198.94	154.62	0.777	[URL]	same
+q23	87.67	89.69	1.023	102.12	114.66	1.123	277.49	299.63	1.080	443.42	279.65	0.631	[Title URL]	same
+q24	42.38	43.06	1.016	52.97	64.62	1.220	137.98	150.62	1.092	754.23	445.57	0.591	[URL]	same
+q25	27.76	23.81	0.858	47.76	36.77	0.770	103.20	85.00	0.824	570.34	250.53	0.439	[]	same
+q26	83.62	76.64	0.917	196.44	189.39	0.964	367.00	347.96	0.948	631.47	397.15	0.629	[]	same
+q27	51.50	38.77	0.753	71.21	52.68	0.740	175.70	131.67	0.749	612.33	263.97	0.431	[]	same
+q28	86.97	83.84	0.964	128.12	133.02	1.038	306.78	309.81	1.010	275.38	184.98	0.672	[URL]	same
+q29	360.55	360.24	0.999	470.82	452.51	0.961	1197.06	1186.56	0.991	541.74	500.62	0.924	[]	same
+q30	264.50	264.89	1.001	280.06	290.50	1.037	829.42	834.86	1.007	296.49	287.85	0.971	[ResolutionWidth]	same
+q31	52.18	53.17	1.019	124.44	78.79	0.633	237.38	188.76	0.795	388.58	117.48	0.302	[]	same
+q32	65.66	67.74	1.032	181.00	106.82	0.590	314.16	245.93	0.783	580.28	274.13	0.472	[]	same
+q33	213.58	215.53	1.009	376.52	385.70	1.024	808.07	830.19	1.027	612.29	637.07	1.040	[]	same
+q34	43.49	43.38	0.998	95.86	75.46	0.787	183.59	163.62	0.891	175.37	119.33	0.680	[]	same
+q35	43.14	43.33	1.004	96.24	75.96	0.789	184.67	166.80	0.903	177.87	119.13	0.670	[]	same
+q36	145.50	144.67	0.994	214.78	198.11	0.922	511.90	495.09	0.967	302.06	208.95	0.692	[]	same
+q37	36.25	21.86	0.603	70.06	37.17	0.531	142.85	83.19	0.582	230.61	83.01	0.360	[]	same
+q38	35.95	20.82	0.579	69.57	38.06	0.547	145.73	81.02	0.556	230.92	82.49	0.357	[]	same
+q39	15.22	8.64	0.567	27.59	20.42	0.740	59.01	37.75	0.640	122.33	26.11	0.213	[]	same
+q40	117.47	109.18	0.929	427.83	350.02	0.818	665.59	574.86	0.864	783.75	442.62	0.565	[]	same
+q41	17.68	13.14	0.743	39.28	26.75	0.681	74.72	54.43	0.728	263.31	176.16	0.669	[]	same
+q42	13.17	13.26	1.007	23.71	23.86	1.006	50.85	54.62	1.074	191.60	147.31	0.769	[]	same
+q43	28.49	16.04	0.563	41.11	27.63	0.672	98.10	60.97	0.621	135.74	35.19	0.259	[]	same
+totals over all 43: warm 4610.8 vs 2880.1 (0.625); first run 16081.3 vs 13753.6 (0.855); 3-run 25418.2 vs 19665.7 (0.774)
+answer_mismatches none
+order_differences none
+scan_only(gated) n=33; gmeans over base>=1ms (per column): warm n=32 0.170, first n=32 0.241, cold n=32 0.140; worst warm=1.052
+below_1ms_excluded_from_warm_gmean q1
+below_1ms_excluded_from_first_gmean q1
+below_1ms_excluded_from_cold_gmean q1
+mat rows missing none
+scan_only_list_but_materializing none
+measured_materializing q6(1 cols) q9(2 cols) q10(2 cols) q19(1 cols) q21(1 cols) q22(1 cols) q23(2 cols) q24(1 cols) q28(1 cols) q30(1 cols)
+class_vs_SCAN_ONLY_list_disagreements q5(measured scan, list other) q11(measured scan, list other) q12(measured scan, list other) q13(measured scan, list other) q14(measured scan, list other) q15(measured scan, list other) q20(measured scan, list other) q25(measured scan, list other) q26(measured scan, list other) q27(measured scan, list other) q29(measured scan, list other) q31(measured scan, list other) q32(measured scan, list other) q36(measured scan, list other) q37(measured scan, list other) q38(measured scan, list other) q40(measured scan, list other) q41(measured scan, list other) q42(measured scan, list other) q43(measured scan, list other)
+worst5 warm [(1.052, 'q1'), (1.035, 'q15'), (1.032, 'q32'), (1.025, 'q13'), (1.019, 'q31')]
+worst5 cold [(1.04, 'q33'), (0.924, 'q29'), (0.769, 'q42'), (0.692, 'q36'), (0.68, 'q34')]
+worst5 first [(1.024, 'q33'), (1.006, 'q42'), (0.976, 'q1'), (0.973, 'q2'), (0.964, 'q26')]
+worst5 materializing_warm [(1.023, 'q23'), (1.023, 'q22'), (1.016, 'q24'), (1.015, 'q19'), (1.008, 'q6')]
+pi_row q41 warm 0.743 first 0.681 3run 0.728
+pi_row q42 warm 1.007 first 1.006 3run 1.074
+
+## arm C0: splayed g0, base vs p2 binary (ms; ratio = p2/base)
+q	warm_a	warm_b	wr	first_a	first_b	fr	3run_a	3run_b	tr	cold_a	cold_b	cr	materialized	answers
+q1	0.00	0.00	0.989	0.01	0.01	1.009	0.01	0.01	1.006	nan	nan	nan		same
+q2	1.11	0.64	0.576	2.01	1.67	0.830	4.41	3.13	0.709	nan	nan	nan		same
+q3	3.78	3.79	1.002	5.83	5.85	1.004	13.68	13.47	0.985	nan	nan	nan		same
+q4	0.00	0.00	1.018	0.02	0.02	1.023	0.02	0.02	1.027	nan	nan	nan		same
+q5	0.00	0.00	1.014	0.03	0.03	1.153	0.03	0.03	1.141	nan	nan	nan		same
+q6	0.00	0.00	1.059	0.03	0.03	1.155	0.03	0.03	1.146	nan	nan	nan		same
+q7	0.00	0.00	1.005	0.02	0.02	1.025	0.02	0.02	1.029	nan	nan	nan		same
+q8	3.51	3.60	1.025	9.02	9.13	1.012	16.32	16.48	1.010	nan	nan	nan		same
+q9	75.82	75.11	0.991	114.42	117.44	1.026	272.55	268.70	0.986	nan	nan	nan		same
+q10	69.40	69.03	0.995	97.93	98.25	1.003	243.15	238.14	0.979	nan	nan	nan		same
+q11	16.16	11.56	0.715	25.50	22.21	0.871	58.57	45.94	0.784	nan	nan	nan		same
+q12	16.33	11.87	0.727	25.84	20.82	0.806	59.60	45.00	0.755	nan	nan	nan		same
+q13	31.95	22.65	0.709	41.14	32.17	0.782	105.35	77.59	0.737	nan	nan	nan		same
+q14	62.66	53.25	0.850	87.92	78.04	0.888	218.26	186.88	0.856	nan	nan	nan		same
+q15	36.58	26.48	0.724	48.60	39.72	0.817	126.01	93.49	0.742	nan	nan	nan		same
+q16	70.03	69.61	0.994	95.84	94.27	0.984	237.68	234.65	0.987	nan	nan	nan		same
+q17	93.33	93.28	0.999	129.64	130.37	1.006	322.60	317.00	0.983	nan	nan	nan		same
+q18	6.93	6.92	0.998	14.98	15.02	1.003	28.95	29.38	1.015	nan	nan	nan		same
+q19	137.39	138.02	1.005	208.71	212.28	1.017	489.99	492.37	1.005	nan	nan	nan		same
+q20	1.12	1.13	1.009	6.88	7.10	1.031	9.48	9.60	1.013	nan	nan	nan		same
+q21	41.75	42.02	1.006	45.48	46.24	1.017	130.68	132.69	1.015	nan	nan	nan		same
+q22	27.70	18.12	0.654	32.01	26.55	0.829	88.49	63.38	0.716	nan	nan	nan		same
+q23	48.89	39.22	0.802	60.72	55.16	0.908	158.90	134.07	0.844	nan	nan	nan		same
+q24	29.16	29.51	1.012	35.42	34.42	0.972	97.06	95.06	0.979	nan	nan	nan		same
+q25	0.94	0.91	0.967	4.48	4.50	1.004	6.40	6.49	1.015	nan	nan	nan		same
+q26	10.78	10.82	1.003	15.44	15.68	1.015	37.04	37.72	1.018	nan	nan	nan		same
+q27	0.90	1.00	1.110	4.48	4.46	0.995	6.46	6.60	1.023	nan	nan	nan		same
+q28	82.75	80.21	0.969	84.94	86.76	1.021	257.95	248.18	0.962	nan	nan	nan		same
+q29	356.59	345.68	0.969	450.96	436.37	0.968	1174.50	1138.82	0.970	nan	nan	nan		same
+q30	0.02	0.03	1.773	3.02	3.00	0.994	3.08	3.05	0.989	nan	nan	nan		same
+q31	52.72	42.10	0.799	71.65	61.02	0.852	178.12	146.52	0.823	nan	nan	nan		same
+q32	59.36	49.48	0.833	86.30	79.12	0.917	208.20	183.31	0.880	nan	nan	nan		same
+q33	202.80	204.42	1.008	369.58	361.75	0.979	782.89	785.95	1.004	nan	nan	nan		same
+q34	39.55	39.18	0.990	70.45	71.60	1.016	150.64	150.05	0.996	nan	nan	nan		same
+q35	39.46	39.25	0.995	70.49	69.75	0.989	157.26	148.98	0.947	nan	nan	nan		same
+q36	63.90	64.17	1.004	87.56	87.05	0.994	218.99	216.70	0.990	nan	nan	nan		same
+q37	17.20	16.61	0.966	27.95	27.24	0.974	62.51	60.64	0.970	nan	nan	nan		same
+q38	15.68	15.43	0.984	25.29	24.58	0.972	57.42	55.78	0.971	nan	nan	nan		same
+q39	7.48	7.19	0.961	14.74	14.65	0.994	30.15	29.20	0.968	nan	nan	nan		same
+q40	58.87	58.83	0.999	89.87	90.75	1.010	210.31	210.83	1.002	nan	nan	nan		same
+q41	5.81	5.76	0.993	13.31	13.49	1.014	25.25	25.26	1.001	nan	nan	nan		same
+q42	4.65	4.40	0.945	11.07	11.15	1.007	20.57	20.70	1.006	nan	nan	nan		same
+q43	9.31	9.06	0.973	18.82	18.38	0.977	40.33	37.58	0.932	nan	nan	nan		same
+totals over all 43: warm 1802.3 vs 1710.3 (0.949); first run 2608.4 vs 2528.1 (0.969); 3-run 6309.9 vs 6009.5 (0.952)
+answer_mismatches none
+order_differences none
+gen0 warm_gmean(base>=1ms n=35)=0.910 warm_worst=1.773 worst5 [(1.773, 'q30'), (1.11, 'q27'), (1.059, 'q6'), (1.025, 'q8'), (1.018, 'q4')]
+
+## arm C1: parted p0, base vs p2 binary (ms; ratio = p2/base)
+q	warm_a	warm_b	wr	first_a	first_b	fr	3run_a	3run_b	tr	cold_a	cold_b	cr	materialized	answers
+q1	0.00	0.00	1.168	0.01	0.01	1.659	0.01	0.01	1.628	nan	nan	nan		same
+q2	6.55	6.69	1.022	17.20	16.91	0.983	30.47	30.55	1.003	nan	nan	nan		same
+q3	531.18	534.29	1.006	558.45	548.30	0.982	1636.17	1622.64	0.992	nan	nan	nan		same
+q4	277.78	270.61	0.974	331.31	319.15	0.963	886.86	868.90	0.980	nan	nan	nan		same
+q5	277.98	273.13	0.983	328.60	321.27	0.978	892.74	869.66	0.974	nan	nan	nan		same
+q6	342.94	342.45	0.999	9721.68	9706.65	0.998	10414.78	10393.52	0.998	nan	nan	nan		same
+q7	527.64	523.20	0.992	555.78	551.49	0.992	1610.99	1613.99	1.002	nan	nan	nan		same
+q8	9.19	6.41	0.697	21.42	7.92	0.370	39.95	20.91	0.524	nan	nan	nan		same
+q9	88.90	85.11	0.957	179.93	151.86	0.844	360.03	324.32	0.901	nan	nan	nan		same
+q10	87.26	78.65	0.901	203.74	152.91	0.751	383.84	316.04	0.823	nan	nan	nan		same
+q11	358.46	20.23	0.056	596.91	38.22	0.064	1321.14	81.00	0.061	nan	nan	nan		same
+q12	361.36	22.66	0.063	592.09	40.32	0.068	1317.56	86.38	0.066	nan	nan	nan		same
+q13	40.07	36.80	0.918	69.60	70.25	1.009	150.93	145.26	0.962	nan	nan	nan		same
+q14	1135.50	98.14	0.086	1421.63	136.09	0.096	3706.61	337.04	0.091	nan	nan	nan		same
+q15	46.44	43.07	0.927	89.30	90.06	1.009	184.30	178.61	0.969	nan	nan	nan		same
+q16	76.32	72.72	0.953	147.98	97.44	0.659	305.43	244.71	0.801	nan	nan	nan		same
+q17	103.93	96.16	0.925	207.04	133.39	0.644	418.69	329.98	0.788	nan	nan	nan		same
+q18	17.23	17.11	0.993	84.69	83.96	0.991	120.69	118.09	0.978	nan	nan	nan		same
+q19	141.17	143.41	1.016	333.40	338.59	1.016	624.15	629.11	1.008	nan	nan	nan		same
+q20	4.63	4.67	1.007	14.45	14.35	0.993	24.05	23.90	0.994	nan	nan	nan		same
+q21	41.80	41.87	1.002	47.31	46.70	0.987	130.78	131.59	1.006	nan	nan	nan		same
+q22	60.42	57.13	0.945	85.91	69.22	0.806	209.53	184.53	0.881	nan	nan	nan		same
+q23	93.83	86.82	0.925	214.63	101.17	0.471	405.77	276.54	0.682	nan	nan	nan		same
+q24	44.54	42.46	0.953	135.14	52.17	0.386	225.82	139.81	0.619	nan	nan	nan		same
+q25	1074.76	27.44	0.026	1345.66	46.19	0.034	3501.16	101.40	0.029	nan	nan	nan		same
+q26	1131.50	83.50	0.074	1501.25	195.22	0.130	3763.66	363.50	0.097	nan	nan	nan		same
+q27	1086.70	51.36	0.047	1359.10	69.76	0.051	3542.68	174.50	0.049	nan	nan	nan		same
+q28	92.07	86.96	0.944	148.73	128.95	0.867	335.79	303.46	0.904	nan	nan	nan		same
+q29	363.91	358.75	0.986	473.12	467.32	0.988	1210.94	1194.90	0.987	nan	nan	nan		same
+q30	266.48	263.67	0.989	282.45	278.91	0.987	831.26	819.76	0.986	nan	nan	nan		same
+q31	55.79	51.86	0.930	122.18	123.21	1.008	236.81	234.04	0.988	nan	nan	nan		same
+q32	69.13	65.57	0.949	177.54	179.40	1.010	317.70	316.87	0.997	nan	nan	nan		same
+q33	218.46	213.21	0.976	462.22	371.26	0.803	912.23	813.09	0.891	nan	nan	nan		same
+q34	43.38	42.96	0.990	96.01	98.13	1.022	184.36	185.42	1.006	nan	nan	nan		same
+q35	389.48	42.94	0.110	2307.75	96.61	0.042	3084.96	185.00	0.060	nan	nan	nan		same
+q36	148.19	145.38	0.981	215.49	217.27	1.008	517.26	514.67	0.995	nan	nan	nan		same
+q37	36.67	36.12	0.985	69.54	68.33	0.982	145.21	141.25	0.973	nan	nan	nan		same
+q38	35.45	35.22	0.994	68.43	67.82	0.991	146.19	144.36	0.987	nan	nan	nan		same
+q39	15.38	15.10	0.982	27.27	27.13	0.995	58.31	58.22	0.998	nan	nan	nan		same
+q40	117.61	117.90	1.002	421.18	423.15	1.005	663.45	664.41	1.001	nan	nan	nan		DIFF
+q41	17.63	17.55	0.995	38.74	38.73	1.000	74.52	74.10	0.994	nan	nan	nan		same
+q42	13.47	13.19	0.980	24.37	23.80	0.977	51.46	51.13	0.994	nan	nan	nan		same
+q43	28.45	28.23	0.992	41.48	41.05	0.989	101.26	98.83	0.976	nan	nan	nan		same
+totals over all 43: warm 9879.7 vs 4600.7 (0.466); first run 25140.7 vs 16050.6 (0.638); 3-run 45080.5 vs 25406.0 (0.564)
+answer_mismatches q40:DIFF
+order_differences none
+gen0 warm_gmean(base>=1ms n=42)=0.607 warm_worst=1.168 worst5 [(1.168, 'q1'), (1.022, 'q2'), (1.016, 'q19'), (1.007, 'q20'), (1.006, 'q3')]
+q16 first run base 148.0 ms, p2 97.4 ms (carry 2)
+
+## arm R: parted ragged, base vs p2 binary (ms; ratio = p2/base)
+q	warm_a	warm_b	wr	first_a	first_b	fr	3run_a	3run_b	tr	cold_a	cold_b	cr	materialized	answers
+q1	0.00	0.00	1.018	0.01	0.01	1.043	0.01	0.01	1.041	nan	nan	nan		same
+q2	7.81	7.58	0.970	18.24	17.47	0.958	33.82	32.90	0.973	nan	nan	nan		same
+q3	582.34	269.71	0.463	598.13	286.38	0.479	1769.76	830.03	0.469	nan	nan	nan		same
+q4	276.11	273.71	0.991	325.57	316.65	0.973	881.32	867.24	0.984	nan	nan	nan		same
+q5	277.60	271.26	0.977	325.52	323.44	0.994	884.05	863.94	0.977	nan	nan	nan		same
+q6	344.27	340.36	0.989	9731.98	9744.37	1.001	10453.01	10432.31	0.998	nan	nan	nan		same
+q7	526.78	523.55	0.994	552.98	552.63	0.999	1620.81	1604.75	0.990	nan	nan	nan		same
+q8	9.58	8.77	0.915	22.33	10.32	0.462	41.77	27.88	0.668	nan	nan	nan		same
+q9	89.20	85.31	0.956	178.64	154.91	0.867	361.46	330.29	0.914	nan	nan	nan		same
+q10	87.28	79.38	0.909	204.49	154.54	0.756	384.14	315.69	0.822	nan	nan	nan		same
+q11	379.16	19.95	0.053	663.10	36.74	0.055	1422.76	77.06	0.054	nan	nan	nan		same
+q12	376.05	22.56	0.060	661.86	39.83	0.060	1414.53	85.41	0.060	nan	nan	nan		same
+q13	39.96	36.74	0.919	71.42	70.54	0.988	152.46	144.43	0.947	nan	nan	nan		same
+q14	1191.29	100.21	0.084	1526.78	134.44	0.088	3921.24	337.68	0.086	nan	nan	nan		same
+q15	46.49	42.87	0.922	89.50	88.20	0.985	186.38	174.72	0.937	nan	nan	nan		same
+q16	76.22	72.72	0.954	145.99	103.06	0.706	301.88	250.89	0.831	nan	nan	nan		same
+q17	103.27	95.81	0.928	203.53	134.01	0.658	411.28	327.71	0.797	nan	nan	nan		same
+q18	17.02	16.99	0.998	83.65	83.54	0.999	118.48	118.08	0.997	nan	nan	nan		same
+q19	141.58	143.21	1.012	336.17	339.45	1.010	623.27	630.08	1.011	nan	nan	nan		same
+q20	4.46	4.47	1.001	14.34	14.27	0.995	23.55	23.62	1.003	nan	nan	nan		same
+q21	41.80	41.90	1.002	46.35	46.63	1.006	131.44	130.91	0.996	nan	nan	nan		same
+q22	60.24	56.86	0.944	85.16	69.43	0.815	206.76	184.57	0.893	nan	nan	nan		same
+q23	93.95	86.72	0.923	276.29	101.92	0.369	471.20	279.65	0.593	nan	nan	nan		same
+q24	44.44	42.61	0.959	196.59	51.75	0.263	293.39	136.94	0.467	nan	nan	nan		same
+q25	1130.54	27.65	0.024	1444.58	44.69	0.031	3720.06	100.78	0.027	nan	nan	nan		same
+q26	1186.13	83.17	0.070	1594.96	197.36	0.124	3975.01	365.39	0.092	nan	nan	nan		same
+q27	1142.81	51.62	0.045	1467.56	70.03	0.048	3752.06	175.32	0.047	nan	nan	nan		same
+q28	92.13	86.64	0.940	148.17	125.80	0.849	334.51	302.53	0.904	nan	nan	nan		same
+q29	364.79	358.93	0.984	474.70	471.02	0.992	1213.72	1201.51	0.990	nan	nan	nan		same
+q30	267.16	265.30	0.993	281.35	280.43	0.997	834.16	833.52	0.999	nan	nan	nan		same
+q31	55.26	51.89	0.939	125.77	122.81	0.976	237.51	236.77	0.997	nan	nan	nan		same
+q32	69.00	65.60	0.951	176.83	176.68	0.999	319.67	310.37	0.971	nan	nan	nan		same
+q33	217.79	213.02	0.978	469.57	381.03	0.811	917.57	813.04	0.886	nan	nan	nan		same
+q34	43.26	43.11	0.997	95.99	96.08	1.001	185.92	183.58	0.987	nan	nan	nan		same
+q35	412.19	43.17	0.105	2415.11	94.99	0.039	3246.49	183.31	0.056	nan	nan	nan		same
+q36	148.93	146.04	0.981	215.76	216.21	1.002	525.13	513.53	0.978	nan	nan	nan		same
+q37	36.36	33.02	0.908	72.94	66.21	0.908	147.72	133.17	0.901	nan	nan	nan		same
+q38	35.06	32.13	0.916	73.33	64.97	0.886	147.71	137.17	0.929	nan	nan	nan		same
+q39	15.21	12.51	0.823	29.11	24.68	0.848	60.02	49.91	0.832	nan	nan	nan		same
+q40	153.14	148.95	0.973	463.08	452.18	0.976	772.32	752.17	0.974	nan	nan	nan		DIFF
+q41	17.60	17.16	0.976	40.71	38.13	0.937	76.46	73.68	0.964	nan	nan	nan		same
+q42	13.29	12.44	0.936	26.61	22.68	0.852	53.36	47.83	0.896	nan	nan	nan		same
+q43	28.12	26.05	0.926	42.45	39.02	0.919	100.90	91.37	0.905	nan	nan	nan		same
+totals over all 43: warm 10245.7 vs 4361.6 (0.426); first run 26017.2 vs 15859.5 (0.610); 3-run 46729.1 vs 24711.7 (0.529)
+answer_mismatches q40:DIFF
+order_differences none
+gen0 warm_gmean(base>=1ms n=42)=0.588 warm_worst=1.018 worst5 [(1.018, 'q1'), (1.012, 'q19'), (1.002, 'q21'), (1.001, 'q20'), (0.998, 'q18')]
+
+enc A: columns with DELTA vectors: ['UserID {raw:76 const:3 delta_bp:97 rle:9526 dict:64}]
+enc B: columns with DELTA vectors: ['UserID {raw:75 const:3 delta_bp:89 rle:8963 dict:640}]
+sizes {('A', 'g0'): 5948677939, ('A', 'g2'): 3307128731, ('B', 'p0'): 4807844987, ('B', 'p2'): 2072366907}  peak_rss_kb {('A', 'g0'): 5120100, ('A', 'g2'): 5060388, ('B', 'p0'): 12158788, ('B', 'p2'): 11963400}  evict_modes fadvise  ragged_partition ['9', '40']  meta {'p2': ['7a603266', '95039693ca59'], 'base': ['80a28e49', 'f1075b366780']}
+GATE (strict) splayed[answers=PASS warm=FAIL cold=FAIL first=FAIL materializing_warm=FAIL no_unexpected_materialization=PASS first_total=PASS] parted[answers=PASS warm=PASS cold=PASS first=PASS materializing_warm=PASS no_unexpected_materialization=PASS] gen0-splayed[answers=PASS warm=FAIL] gen0-parted[answers=FAIL warm=PASS q16_first=PASS] gen0-ragged[answers=FAIL warm=PASS]
+P2 GATE (strict): FAIL
+GATE (P3-exempt) splayed[answers=PASS warm=FAIL cold=FAIL first=FAIL materializing_warm=FAIL no_unexpected_materialization=PASS first_total=PASS] parted[answers=PASS warm=PASS cold=PASS first=PASS materializing_warm=PASS no_unexpected_materialization=PASS] gen0-splayed[answers=PASS warm=FAIL] gen0-parted[answers=FAIL warm=PASS q16_first=PASS] gen0-ragged[answers=FAIL warm=PASS]
+P2 GATE (P3-exempt): FAIL
+P3-EXEMPT LIST q8/A/warm[run-level compute (group over RLE runs)]: 3.59 -> 4.05 ms (x1.128) EXEMPTED; q8/A/first[run-level compute (group over RLE runs, first run)]: 9.09 -> 9.06 ms (x0.997) within-bound; q18/A/first[row-list gather (first-n keys published, P3 path 2)]: 13.47 -> 6.57 ms (x0.487) within-bound; q39/A/first[selection gather (P3 path 2)]: 14.76 -> 10.70 ms (x0.725) within-bound; q39/B/first[selection gather (P3 path 2)]: 27.59 -> 20.42 ms (x0.740) within-bound; q39/A/cold[selection gather reads whole columns cold (P3)]: 38.41 -> 18.45 ms (x0.480) within-bound; q42/A/warm[point gathers of the selected keys (P3)]: 4.51 -> 4.56 ms (x1.012) within-bound; q42/B/warm[point gathers of the selected keys (P3)]: 13.17 -> 13.26 ms (x1.007) within-bound; q24/A/rss[top-k output gather RSS]: arm peak-RSS 5120100 -> 5060388 kB (x0.99, max 2.37) not gated; q25/A/rss[top-k output gather RSS]: arm peak-RSS 5120100 -> 5060388 kB (x0.99, max 2.37) not gated; q26/A/rss[top-k output gather RSS]: arm peak-RSS 5120100 -> 5060388 kB (x0.99, max 2.37) not gated; q27/A/rss[top-k output gather RSS]: arm peak-RSS 5120100 -> 5060388 kB (x0.99, max 2.37) not gated
+p3_unexpected_materializations A/q23:SearchPhrase B/q6:SearchPhrase B/q28:URL
+rss A: 5120100 -> 5060388 kB (x0.988, bound 1.1)
+rss B: 12158788 -> 11963400 kB (x0.984, bound 1.1)
+carry q2/A/warm: P2 x1.086 -> P3 x0.606
+carry q8/A/warm: P2 x1.424 -> P3 x1.128
+carry q8/B/warm: P2 x1.060 -> P3 x0.356
+carry q18/A/first: P2 x1.983 -> P3 x0.487
+carry q18/B/warm: P2 x1.088 -> P3 x0.764
+carry q39/A/first: P2 x2.402 -> P3 x0.725
+carry q39/B/first: P2 x1.503 -> P3 x0.740
+carry q42/A/warm: P2 x1.664 -> P3 x1.012
+carry q42/B/warm: P2 x1.237 -> P3 x1.007
+P3GATE p2_strict=FAIL materialization=FAIL rss=PASS
+P3 GATE: FAIL
+```
