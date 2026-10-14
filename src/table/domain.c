@@ -62,7 +62,11 @@
  *     a dispatch drains before it returns), the IPC loop is one thread,
  *     every reopen site runs before a dispatch, and the one lock-free
  *     reader that outlives a lock release — the batch probe — is counted
- *     in batch_inflight.  Retiring here too was #717: a replica reopening
+ *     in batch_inflight.  The flush paths (ray_sym_domain_flush, _append)
+ *     also read `atoms` after releasing the lock, but only while
+ *     count != disk_count, and an extend refuses a dirty domain, so no
+ *     extend can run while they read.  Retiring here too was #717: a
+ *     replica reopening
  *     on a timer never drops its last reference, so every reopen leaked a
  *     generation.  The contract this rests on is in domain.h at
  *     ray_sym_domain_raw_pin: no pin across a reopen, no reopen under a
@@ -170,7 +174,8 @@ struct ray_sym_domain_s {
      * on first access from the arena.  A slot is NULL until materialized;
      * the per-slot publication is an atomic release store.  count is
      * release-published AFTER the slot write (for appends); growth REPLACES
-     * the array via atomic store and retires the old one.  Lock-free readers
+     * the array via atomic store; an append retires the old one, an external
+     * extend frees it (see the concurrency note above).  Lock-free readers
      * load count (acquire) then atoms (acquire) then the slot (acquire). */
     _Atomic(int64_t)  count;
     _Atomic(ray_t**)  atoms;
@@ -578,12 +583,19 @@ static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
             atomic_store_explicit(&d->count, fresh_count, memory_order_release);
             d->disk_count = fresh_count;
             d->disk_size = st_size;
-            (void)dom_publish_raw_snap(d, true);
+            /* The new snapshot record must be published before the old
+             * generation goes.  When its allocation fails the old record
+             * stays published and still points at the old offsets and
+             * mapping, so those are retired (valid memory, covering fewer
+             * positions, as before) rather than freed; the atoms array is
+             * referenced by no record and goes either way. */
+            bool snap_ok = dom_publish_raw_snap(d, true);
 
             (void)dom_drop_locked(d, atoms);
-            (void)dom_drop_locked(d, old_offsets);
+            if (snap_ok) (void)dom_drop_locked(d, old_offsets);
+            else         (void)dom_retire(d, old_offsets);
             if (old_map) {
-                if (d->batch_inflight == 0) {
+                if (snap_ok && d->batch_inflight == 0) {
                     ray_vm_unmap_file(old_map, old_map_size);
                 } else {
                     dom_retired_map_t* rm = (dom_retired_map_t*)ray_sys_alloc(sizeof(*rm));
@@ -811,9 +823,11 @@ ray_t* ray_sym_domain_str(ray_sym_domain_t* dom, int64_t pos) {
 
     /* Lock-free fast path: acquire the published count, then the array, then
      * the slot.  Appends release-publish the count after the slot write;
-     * array replacements are release-published before the count bump and old
-     * arrays are retired (valid memory) — a reader can never index a
-     * published position into memory that lacks it.  A NULL slot is an
+     * array replacements are release-published before the count bump, and an
+     * append retires the old array (valid memory) — a reader can never index
+     * a published position into memory that lacks it.  An external extend
+     * frees the old array instead: no reader runs during a reopen (see the
+     * concurrency note at the top of the file).  A NULL slot is an
      * unmaterialized lazy file entry: fall to the lock-held materialize. */
     int64_t count = atomic_load_explicit(&dom->count, memory_order_acquire);
     if (pos < 0 || pos >= count) return NULL;
@@ -838,7 +852,8 @@ bool ray_sym_domain_raw_pin(ray_sym_domain_t* dom, ray_sym_domain_raw_t* out) {
     return true;
 }
 void ray_sym_domain_raw_unpin(ray_sym_domain_t* dom) {
-    (void)dom;   /* the snapshot outlives its readers by construction */
+    (void)dom;   /* the snapshot outlives its readers by contract: no pin
+                  * across a reopen (domain.h, ray_sym_domain_raw_pin) */
 }
 /* Empty-vocabulary FILE domains get a distinct non-NULL LUT so callers
  * can branch on NULL == "runtime domain, ids pass through".  Never

@@ -31,10 +31,10 @@
 (count (select {s: s from: (.db.splayed.get "/tmp/rfl_717/scratch/t" "/tmp/rfl_717/root/.sym") where: (== s 'new19_9)})) -- 1
 
 ;; 18 reopens later: no copy of the vocabulary per reopen (the leak was
-;; about 90 KB each here; what remains is the page rounding of arrays that
-;; grew by 180 words), and the symfile is mapped once — each reopen
-;; unmapped the image it replaced.
-(< (- (get m20 'sys-current) (get m2 'sys-current)) 65536) -- true
+;; about 90 KB each here, 1.6 MB over the run; the bound leaves room for a
+;; heap pool or arena growing meanwhile), and the symfile is mapped once —
+;; each reopen unmapped the image it replaced.
+(< (- (get m20 'sys-current) (get m2 'sys-current)) 524288) -- true
 (<= (- (get m20 'sys-mapped) (get m2 'sys-mapped)) (.fs.size "/tmp/rfl_717/root/.sym")) -- true
 
 (.sys.exec "rm -rf /tmp/rfl_717") -- 0

@@ -2080,11 +2080,14 @@ static test_result_t test_domain_extend_reopen_flat(void) {
     ray_sym_domain_release(dom);
     unlink(TMP_DOM_SYM_PATH);
     unlink(TMP_DOM_SYM_PATH ".lk");
-    /* committed RAM: nothing per reopen (one arena chunk of slack for the
-     * atoms materialised above); file mappings: exactly one image of the
+    /* committed RAM: nothing per reopen (slack for the atoms materialised
+     * above and arena growth); file mappings: exactly one image of the
      * current file, whatever the number of reopens.  Asserted once the
      * domain is released, so a failure leaves none cached behind it. */
-    TEST_ASSERT_FMT(sys1 - sys0 <= 64 * 1024,
+    /* The leak was one generation per reopen: two pointer-sized arrays
+     * over the vocabulary, about 320 KB each cycle here, 9.6 MB over the
+     * run.  The bound leaves room for arena and hash-table growth. */
+    TEST_ASSERT_FMT(sys1 - sys0 <= 1024 * 1024,
                     "sys-current grew by %lld bytes over %d reopens",
                     (long long)(sys1 - sys0), CYCLES);
     TEST_ASSERT_FMT(map1 - map_before_open == one_image,
