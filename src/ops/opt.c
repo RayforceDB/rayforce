@@ -161,6 +161,11 @@ static void pass_type_inference(ray_graph_t* g, ray_op_t* root) {
                     for (uint32_t a = 0; a < ext->n_aggs; a++)
                         if (op_node(g, ext->agg_ins[a]) && !visited[ext->agg_ins[a]] && sp < (int)stack_cap)
                             stack[sp++] = ext->agg_ins[a];
+                    /* Second inputs of binary aggs (wsum/wavg/cov/pearson). */
+                    if (ext->agg_ins2)
+                        for (uint32_t a = 0; a < ext->n_aggs; a++)
+                            if (op_node(g, ext->agg_ins2[a]) && !visited[ext->agg_ins2[a]] && sp < (int)stack_cap)
+                                stack[sp++] = ext->agg_ins2[a];
                     break;
                 case OP_SORT:
                 case OP_SELECT:
@@ -778,6 +783,11 @@ static void pass_constant_fold(ray_graph_t* g, ray_op_t* root) {
                     for (uint32_t a = 0; a < ext->n_aggs; a++)
                         if (op_node(g, ext->agg_ins[a]) && !visited[ext->agg_ins[a]] && sp < (int)stack_cap)
                             stack[sp++] = ext->agg_ins[a];
+                    /* Second inputs of binary aggs (wsum/wavg/cov/pearson). */
+                    if (ext->agg_ins2)
+                        for (uint32_t a = 0; a < ext->n_aggs; a++)
+                            if (op_node(g, ext->agg_ins2[a]) && !visited[ext->agg_ins2[a]] && sp < (int)stack_cap)
+                                stack[sp++] = ext->agg_ins2[a];
                     break;
                 case OP_SORT:
                 case OP_SELECT:
@@ -924,6 +934,13 @@ static void mark_live(ray_graph_t* g, ray_op_t* root, bool* live) {
                             if (op_node(g, ext->agg_ins[a]) && !live[ext->agg_ins[a]] && sp < (int)stack_cap)
                                 stack[sp++] = ext->agg_ins[a];
                         }
+                        /* Second inputs of binary aggs: an expression
+                         * referenced only here must stay live. */
+                        if (ext->agg_ins2)
+                            for (uint32_t a = 0; a < ext->n_aggs; a++) {
+                                if (op_node(g, ext->agg_ins2[a]) && !live[ext->agg_ins2[a]] && sp < (int)stack_cap)
+                                    stack[sp++] = ext->agg_ins2[a];
+                            }
                         break;
                     case OP_SORT:
                     case OP_SELECT:
@@ -1834,6 +1851,12 @@ static bool pass_projection_pushdown(ray_graph_t* g, ray_op_t* root) {
                             live[ext->agg_ins[a]] = true;
                             if (qt < (int)nc) q[qt++] = ext->agg_ins[a];
                         }
+                    if (ext->agg_ins2)
+                        for (uint32_t a = 0; a < ext->n_aggs; a++)
+                            if (op_node(g, ext->agg_ins2[a]) && !live[ext->agg_ins2[a]]) {
+                                live[ext->agg_ins2[a]] = true;
+                                if (qt < (int)nc) q[qt++] = ext->agg_ins2[a];
+                            }
                     break;
                 case OP_SORT:
                 case OP_SELECT:
