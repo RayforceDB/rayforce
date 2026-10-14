@@ -10218,11 +10218,15 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
             int8_t base_type = (int8_t)RAY_PARTED_BASETYPE(col->type);
             ray_t** segs = (ray_t**)ray_data(col);
             ray_t* flat;
+            /* A partition without the column (ragged parted table) spans
+             * its rows, from the partition-key counts, as typed nulls. */
+            int64_t rg_ncnt = 0;
+            const int64_t* rg_cnt = parted_table_counts(parted_tbl, &rg_ncnt);
 
             if (base_type == RAY_STR) {
-                flat = parted_flatten_str(segs, col->len, total_rows);
+                flat = parted_flatten_str_c(segs, col->len, rg_cnt, rg_ncnt);
             } else if (base_type == RAY_LIST) {
-                flat = parted_flatten_list(segs, col->len, total_rows);
+                flat = parted_flatten_list_c(segs, col->len, rg_cnt, rg_ncnt);
             } else {
                 uint8_t base_attrs = (base_type == RAY_SYM)
                                    ? parted_sym_max_attrs(segs, col->len) : 0;
@@ -10243,7 +10247,14 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
                 uint8_t seg_nulls = 0;
                 for (int32_t p = 0; p < n_parts; p++) {
                     ray_t* seg = segs[p];
-                    if (!seg || seg->len <= 0) continue;
+                    if (!seg) {
+                        int64_t n = parted_seg_rows(segs, p, rg_cnt, rg_ncnt);
+                        if (offset + n > total_rows) n = total_rows - offset;
+                        parted_fill_nulls(flat, offset, n);
+                        offset += n;
+                        continue;
+                    }
+                    if (seg->len <= 0) continue;
                     parted_copy_cells(ray_data(flat), base_type, base_attrs,
                                       offset, seg, 0, seg->len);
                     seg_nulls |= seg->attrs & RAY_ATTR_HAS_NULLS;
