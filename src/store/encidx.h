@@ -132,6 +132,32 @@ typedef struct {
  * or length (naming the kind), io on a short write. */
 ray_t*  ray_enc_index_write(FILE* f, const ray_enc_idx_src_t* s, uint64_t* bytes);
 
+/* A validated region: the root's fields by kind, the name into the region. */
+typedef struct {
+    uint8_t        kind;
+    int8_t         parent_type;
+    uint8_t        attrs;
+    int64_t        len;
+    const uint8_t* base;          /* the region */
+    uint64_t       size;
+    ray_enc_idx_hash_t  hash;     /* the kind's fields, by kind */
+    ray_enc_idx_sort_t  sort;
+    ray_enc_idx_bloom_t bloom;
+    ray_enc_idx_part_t  part;
+    const char*    order_name;    /* into the region, or NULL */
+    uint32_t       order_len;
+} ray_enc_idx_view_t;
+
+/* Validate `size` bytes at `region` as an index of `kind` for a column of
+ * (parent_type, attrs, len); SYM ids must be below sym_bound.  col_data is
+ * the decoded column (PART float zero-sign rule) or NULL to skip that one
+ * rule (writers re-checking a source).  NULL with *out filled, or an owned
+ * corrupt error naming `path`. */
+ray_t* ray_enc_index_validate(const uint8_t* region, uint64_t size, uint8_t kind,
+                              int8_t parent_type, uint8_t attrs, int64_t len,
+                              uint32_t sym_bound, const void* col_data,
+                              const char* path, ray_enc_idx_view_t* out);
+
 /* order_sym a writer may convert to a name (spec "Writing the index"):
  * the root's HASH / PART order_sym when RAY_MARK_MMAP is clear, else -1. */
 int64_t ray_enc_index_trusted_order(const ray_t* root);
