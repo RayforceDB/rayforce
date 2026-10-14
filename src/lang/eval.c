@@ -205,6 +205,42 @@ static inline ray_binary_fn unary_binary_overload(ray_unary_fn fn) {
     return NULL;
 }
 
+/* A LIST whose elements are all atoms of one numeric or temporal type, as
+ * a vector of that type (the list is released); any other list as it is. */
+static ray_t* list_collapse_uniform(ray_t* list) {
+    if (!list || RAY_IS_ERR(list) || list->type != RAY_LIST || ray_len(list) == 0)
+        return list;
+    ray_t** e = (ray_t**)ray_data(list);
+    int8_t t = e[0] ? e[0]->type : 0;
+    switch (t) {
+    case -RAY_BOOL: case -RAY_U8: case -RAY_I16: case -RAY_I32: case -RAY_I64:
+    case -RAY_F32: case -RAY_F64: case -RAY_DATE: case -RAY_TIME: case -RAY_TIMESTAMP:
+        break;
+    default:
+        return list;
+    }
+    int64_t n = ray_len(list);
+    for (int64_t i = 1; i < n; i++)
+        if (!e[i] || e[i]->type != t) return list;
+    ray_t* vec = ray_vec_new((int8_t)-t, n);
+    if (!vec || RAY_IS_ERR(vec)) return list;
+    vec->len = n;
+    for (int64_t i = 0; i < n; i++) store_typed_elem(vec, i, e[i]);
+    ray_release(list);
+    return vec;
+}
+
+/* (min a b) / (max a b) over collections.  Two collections must have the
+ * same length, an error named for the call; and over a LIST the results,
+ * when they share one type, make a vector of it, as q's & and | give. */
+static ray_t* minmax_map(ray_binary_fn f2, ray_t* a, ray_t* b) {
+    if (is_collection(a) && is_collection(b) && ray_len(a) != ray_len(b))
+        return ray_error("length", "%s: operand lengths must match, got %lld and %lld",
+                         f2 == ray_min2_fn ? "min" : "max",
+                         (long long)ray_len(a), (long long)ray_len(b));
+    return list_collapse_uniform(atomic_map_binary(f2, a, b));
+}
+
 static ray_t* materialize_owned_args(ray_t** args, int64_t n) {
     for (int64_t i = 0; i < n; i++) {
         if (!args[i] || !ray_is_lazy(args[i])) continue;
@@ -818,7 +854,7 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
          * does NOT broadcast (only a true atom does — see the
          * !left_coll/!right_coll branch). */
         if (ray_len(left) != ray_len(right)) {
-            const char* opn = ray_opcode_name(dag_opcode);
+            const char* opn = dag_opcode ? ray_opcode_name(dag_opcode) : NULL;
             return ray_error("length", "%s: operand lengths must match, got %lld and %lld",
                              opn ? opn : "binary op",
                              (long long)ray_len(left), (long long)ray_len(right));
@@ -1565,7 +1601,7 @@ ray_t* call_fn2(ray_t* fn, ray_t* a, ray_t* b) {
                 owned_b = true;
             }
             ray_t* out = (is_collection(la) || is_collection(lb))
-                       ? atomic_map_binary(f2, la, lb) : f2(la, lb);
+                       ? minmax_map(f2, la, lb) : f2(la, lb);
             if (owned_a) ray_release(la);
             if (owned_b) ray_release(lb);
             return out;
@@ -3359,7 +3395,7 @@ op_callf: {
                     }
                 }
                 result = (is_collection(fn_args[0]) || is_collection(fn_args[1]))
-                       ? atomic_map_binary(binary, fn_args[0], fn_args[1])
+                       ? minmax_map(binary, fn_args[0], fn_args[1])
                        : binary(fn_args[0], fn_args[1]);
                 ray_release(fn_args[0]);
                 ray_release(fn_args[1]);
@@ -4864,7 +4900,7 @@ ray_t* ray_eval(ray_t* obj) {
                     if (!right || RAY_IS_ERR(right)) { ray_release(left); ret = right ? right : ray_error("type", NULL); goto out; }
                 }
                 ret = (is_collection(left) || is_collection(right))
-                    ? atomic_map_binary(fn2, left, right) : fn2(left, right);
+                    ? minmax_map(fn2, left, right) : fn2(left, right);
                 ray_release(left);
                 ray_release(right);
                 goto out;
