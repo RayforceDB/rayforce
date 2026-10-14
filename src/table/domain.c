@@ -505,11 +505,20 @@ static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
     }
 
     /* Append-only prefix check: every position we already published must be
-     * byte-identical between the old and new file images (compare mmap bytes
-     * directly via the old/new offsets — no materialization needed). */
+     * byte-identical between the old and new file images.  The old image
+     * indexes [0, base_count): compare mmap bytes directly via the old/new
+     * offsets — no materialization needed.  A flush of this process wrote
+     * the rest, [base_count, count), from appended atoms (never NULL). */
+    ray_t** cur_atoms = atomic_load_explicit(&d->atoms, memory_order_relaxed);
     for (int64_t i = 0; ok && i < count; i++) {
         uint32_t ol, nl; const char *op, *np;
-        DOM_REC(obase, d->offsets[i], ol, op);
+        if (i < d->base_count) {
+            DOM_REC(obase, d->offsets[i], ol, op);
+        } else {
+            ray_t* a = cur_atoms[i];
+            ol = (uint32_t)ray_str_len(a);
+            op = ray_str_ptr(a);
+        }
         DOM_REC(nbase, fresh_offsets[i], nl, np);
         if (ol != nl || (ol > 0 && memcmp(op, np, ol) != 0)) ok = false;
     }

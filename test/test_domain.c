@@ -2092,6 +2092,91 @@ static test_result_t test_domain_extend_reopen_flat(void) {
                     (long long)(map1 - map_before_open), (long long)one_image);
     PASS();
 }
+/* Write `words` as the symfile at `path` the way another process's writer
+ * does: a tmp file renamed over it (a new inode). */
+static bool write_symfile(const char* path, const char* const* words, int n) {
+    char tmp[256];
+    snprintf(tmp, sizeof tmp, "%s.ext", path);
+    FILE* f = fopen(tmp, "wb");
+    if (!f) return false;
+    uint32_t magic = 0x4C525453U;   /* "STRL" */
+    int64_t count = n;
+    bool ok = fwrite(&magic, 4, 1, f) == 1 && fwrite(&count, 8, 1, f) == 1;
+    for (int i = 0; ok && i < n; i++) {
+        uint32_t l = (uint32_t)strlen(words[i]);
+        ok = fwrite(&l, 4, 1, f) == 1 && (l == 0 || fwrite(words[i], 1, l, f) == l);
+    }
+    ok = fclose(f) == 0 && ok;
+    return ok && rename(tmp, path) == 0;
+}
+
+/* Every position resolves to words[pos], by position and by string, and
+ * a raw pin covers them all: the extend made them file positions. */
+static bool dom_holds(ray_sym_domain_t* dom, const char* const* words, int n) {
+    if (ray_sym_domain_count(dom) != n) return false;
+    ray_sym_domain_raw_t raw;
+    if (!ray_sym_domain_raw_pin(dom, &raw) || raw.count != n) return false;
+    for (int p = 0; p < n; p++) {
+        size_t l = strlen(words[p]), rl = 0;
+        ray_t* s = ray_sym_domain_str(dom, p);
+        const char* rp = ray_sym_domain_raw_str(&raw, p, &rl);
+        if (!s || ray_str_len(s) != l || memcmp(ray_str_ptr(s), words[p], l) != 0 ||
+            rl != l || memcmp(rp, words[p], l) != 0 ||
+            ray_sym_domain_find(dom, words[p], l) != p)
+            return false;
+    }
+    ray_sym_domain_raw_unpin(dom);
+    return true;
+}
+
+/* A reopen after this process flushed its own appends: the positions the
+ * flush wrote have atoms but no offset into the mapping (none at all when
+ * the domain was created empty), yet the prefix check must still compare
+ * them against the grown file — and the extend give them offsets. */
+static test_result_t test_domain_extend_after_flush(void) {
+    unlink(TMP_DOM_SYM_PATH);
+    unlink(TMP_DOM_SYM_PATH ".lk");
+
+    /* (i) created empty, interned, flushed: nothing is mapped */
+    ray_sym_domain_t* dom = ray_sym_domain_open_or_create(TMP_DOM_SYM_PATH);
+    TEST_ASSERT_NOT_NULL(dom);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom, "fa", 2), 1);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom, "fb", 2), 2);
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush(dom, false), RAY_OK);
+    const char* grown1[] = { "", "fa", "fb", "fc", "fd" };
+    TEST_ASSERT(write_symfile(TMP_DOM_SYM_PATH, grown1, 5), "external growth");
+    ray_sym_domain_t* again = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    TEST_ASSERT_EQ_PTR(again, dom);
+    TEST_ASSERT(dom_holds(dom, grown1, 5), "created-empty domain extended");
+    ray_sym_domain_release(again);
+    ray_sym_domain_release(dom);
+
+    /* (ii) opened from 3 records, 2 interned and flushed: offsets cover 3 */
+    const char* base[] = { "", "ga", "gb" };
+    TEST_ASSERT(write_symfile(TMP_DOM_SYM_PATH, base, 3), "base file");
+    dom = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    TEST_ASSERT_NOT_NULL(dom);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom, "gc", 2), 3);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom, "gd", 2), 4);
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush(dom, false), RAY_OK);
+    /* a file that disagrees with the flushed tail is refused, and leaves
+     * the domain as it was */
+    const char* wrong[] = { "", "ga", "gb", "gc", "gX", "ge" };
+    TEST_ASSERT(write_symfile(TMP_DOM_SYM_PATH, wrong, 6), "diverging file");
+    TEST_ASSERT_NULL(ray_sym_domain_open(TMP_DOM_SYM_PATH));
+    const char* grown2[] = { "", "ga", "gb", "gc", "gd", "ge", "gf" };
+    TEST_ASSERT(write_symfile(TMP_DOM_SYM_PATH, grown2, 7), "external growth");
+    again = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    TEST_ASSERT_EQ_PTR(again, dom);
+    TEST_ASSERT(dom_holds(dom, grown2, 7), "flushed tail extended");
+    ray_sym_domain_release(again);
+    ray_sym_domain_release(dom);
+
+    unlink(TMP_DOM_SYM_PATH);
+    unlink(TMP_DOM_SYM_PATH ".lk");
+    PASS();
+}
+
 /* Runtime-id LUT: NULL for the runtime singleton; for a FILE domain a
  * position-indexed array of runtime intern ids (round-trips strings),
  * built once (idempotent: same pointer).  Divergent fixture proves the
@@ -2895,6 +2980,7 @@ const test_entry_t domain_entries[] = {
     { "domain/str_eager_lockfree",      test_domain_str_eager_lockfree,      domain_setup, domain_teardown },
     { "domain/raw_pin",                 test_domain_raw_pin,                 domain_setup, domain_teardown },
     { "domain/extend_reopen_flat",      test_domain_extend_reopen_flat,      domain_setup, domain_teardown },
+    { "domain/extend_after_flush",      test_domain_extend_after_flush,      domain_setup, domain_teardown },
     { "domain/concat_text_nulls",       test_domain_concat_text_nulls,       domain_rt_setup, domain_rt_teardown },
     { "domain/runtime_lut",             test_domain_runtime_lut,             domain_rt_setup, domain_rt_teardown },
     { "domain/open_position0_validation", test_domain_open_position0_validation, domain_setup, domain_teardown },
