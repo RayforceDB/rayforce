@@ -4969,6 +4969,25 @@ static test_result_t test_parted_in(void) {
     PASS();
 }
 
+/* The results of `q` in generation 0 (a) and generation 2 (b), both owned:
+ * either the same error code, or the same type and formatted result. */
+static test_result_t aw_cmp_pair(const char* q, ray_t* a, ray_t* b) {
+    TEST_ASSERT_FMT(a && b, "%s: no result (gen 0 %p, gen 2 %p)", q, (void*)a, (void*)b);
+    bool e0 = RAY_IS_ERR(a), e2 = RAY_IS_ERR(b);
+    TEST_ASSERT_FMT(e0 == e2, "%s: error in one generation only", q);
+    if (e0) {
+        TEST_ASSERT_FMT(strcmp(ray_err_code(a), ray_err_code(b)) == 0, "%s: %s vs %s", q,
+                        ray_err_code(a), ray_err_code(b));
+        ray_error_free(a); ray_error_free(b);
+        PASS();
+    }
+    TEST_ASSERT_FMT(a->type == b->type, "%s: type %d vs %d", q, a->type, b->type);
+    ray_t* fa = ray_fmt(a, 0); ray_t* fb = ray_fmt(b, 0);
+    TEST_ASSERT_FMT(ray_str_len(fa) == ray_str_len(fb) && memcmp(ray_str_ptr(fa), ray_str_ptr(fb), ray_str_len(fa)) == 0, "%s differs", q);
+    ray_release(fa); ray_release(fb); ray_release(a); ray_release(b);
+    PASS();
+}
+
 /* Either the same error code in both generations, or equal formatted results. */
 static test_result_t aw_same_or_err(const char* name, const char* q) {
     char buf[2048]; ray_t* out[2];
@@ -4977,21 +4996,38 @@ static test_result_t aw_same_or_err(const char* name, const char* q) {
         aw_eval_ok(buf);
         out[gen] = aw_eval(q);
     }
-    bool e0 = out[0] && RAY_IS_ERR(out[0]), e2 = out[1] && RAY_IS_ERR(out[1]);
-    TEST_ASSERT_FMT(e0 == e2, "%s: error in one generation only", q);
-    if (e0) {
-        TEST_ASSERT_FMT(strcmp(ray_err_code(out[0]), ray_err_code(out[1])) == 0, "%s: %s vs %s", q,
-                        ray_err_code(out[0]), ray_err_code(out[1]));
-        ray_error_free(out[0]); ray_error_free(out[1]);
-        PASS();
-    }
-    ray_t* fa = ray_fmt(out[0], 0); ray_t* fb = ray_fmt(out[1], 0);
-    TEST_ASSERT_FMT(out[0]->type == out[1]->type, "%s: type %d vs %d", q, out[0]->type, out[1]->type);
-    TEST_ASSERT_FMT(ray_str_len(fa) == ray_str_len(fb) && memcmp(ray_str_ptr(fa), ray_str_ptr(fb), ray_str_len(fa)) == 0, "%s differs", q);
-    ray_release(fa); ray_release(fb); ray_release(out[0]); ray_release(out[1]);
-    PASS();
+    return aw_cmp_pair(q, out[0], out[1]);
 }
 #define AW_SAME_OR_ERR(n, q) do { test_result_t r_ = aw_same_or_err((n), (q)); if (r_.status != TEST_PASS) return r_; } while (0)
+
+/* `q` formats as `want` in both generations: an absolute pin, for the
+ * properties gen 0 and gen 2 share code for (a shared mistake passes
+ * aw_same_or_err). */
+static test_result_t aw_expect(const char* name, const char* q, const char* want) {
+    char buf[2048];
+    for (int gen = 0; gen < 2; gen++) {
+        snprintf(buf, sizeof buf, "(set T (.db.splayed.get \"" AW_TMP "/%s%d/\"))", name, gen ? 2 : 0);
+        aw_eval_ok(buf);
+        ray_t* r = aw_eval(q);
+        TEST_ASSERT_FMT(r && !RAY_IS_ERR(r), "%s gen %d: %s", q, gen ? 2 : 0, r ? ray_error_msg() : "no result");
+        ray_t* f = ray_fmt(r, 0);
+        bool ok = ray_str_len(f) == strlen(want) && memcmp(ray_str_ptr(f), want, strlen(want)) == 0;
+        TEST_ASSERT_FMT(ok, "%s gen %d: %.*s, want %s", q, gen ? 2 : 0, (int)ray_str_len(f), ray_str_ptr(f), want);
+        ray_release(f); ray_release(r);
+    }
+    PASS();
+}
+#define AW_EXPECT(n, q, w) do { test_result_t r_ = aw_expect((n), (q), (w)); if (r_.status != TEST_PASS) return r_; } while (0)
+
+/* Saved SYM width class of column `col` of table <name>2, or -1. */
+static int aw_sym_width(const char* name, const char* col) {
+    ray_t* t = aw_load(name, 2);
+    ray_t* encv = t ? ray_table_get_col_enc(t, ray_sym_intern(col, strlen(col))) : NULL;
+    ray_enccol_t* e = encv ? ray_enccol_of(encv) : NULL;
+    int w = e ? (int)(e->attrs & RAY_SYM_W_MASK) : -1;
+    if (t) ray_release(t);
+    return w;
+}
 
 /* Rows of column f of the loaded T holding -0.0 / +0.0 (by sign bit), read
  * from the evaluated column; -1 if it does not come back as a plain F64. */
@@ -5123,6 +5159,20 @@ static test_result_t test_signed_zeros(void) {
  * generation 0; equality and in still decide by ids. */
 static test_result_t test_symbol_order(void) {
     aw_save("so", "(table [k s] (list (til 3000) (as 'SYMBOL (map (fn [j] (at [\"z\" \"a\" \"m\" \"b\"] (% j 4))) (til 3000)))))", RAY_ENC_FOR_BP);
+    TEST_ASSERT_EQ_I(aw_vec_enc("so", "s", 0), RAY_ENC_FOR_BP);
+    TEST_ASSERT_EQ_I(aw_vec_enc("so", "s", 2), RAY_ENC_FOR_BP);
+    TEST_ASSERT_EQ_I(aw_sym_width("so", "s"), RAY_SYM_W8);
+    /* Absolute pins: gen 0 and gen 2 share the string-order code of min, max,
+     * LIKE and the top-k, so equal answers alone would not catch id order.
+     * The range operators get no absolute count here: on this branch both
+     * generations still compare SYM ranges by id (#738, fixed on dev); pin
+     * them at the dev merge. */
+    AW_EXPECT("so", "(min (at T 's))", "a");
+    AW_EXPECT("so", "(max (at T 's))", "z");
+    AW_EXPECT("so", "(at (select {s: s k: k from: T asc: s take: 3}) 's)", "[a a a]");
+    AW_EXPECT("so", "(at (select {s: s k: k from: T desc: [s k] take: 3}) 's)", "[z z z]");
+    AW_EXPECT("so", "(at (select {s: s k: k from: T desc: [s k] take: 3}) 'k)", "[2996 2992 2988]");
+    AW_EXPECT("so", "(count (select {from: T where: (like s \"*a*\")}))", "750");
     AW_SAME_OR_ERR("so", "(count (select {from: T where: (< s 'm)}))");
     AW_SAME_OR_ERR("so", "(count (select {from: T where: (>= s 'b)}))");
     AW_SAME_OR_ERR("so", "(count (select {from: T where: (like s \"*a*\")}))");
@@ -5134,6 +5184,17 @@ static test_result_t test_symbol_order(void) {
     AW_SAME_OR_ERR("so", "(count (select {from: T where: (in s ['z 'b])}))");
     PASS();
 }
+
+/* aw_same_or_err on the parted tables adp0 / adp2, loaded as P. */
+static test_result_t aw_parted_same_or_err(const char* q) {
+    ray_t* out[2];
+    for (int gen = 0; gen < 2; gen++) {
+        aw_eval_ok(gen ? "(set P (.db.parted.get \"" AW_TMP "/adp2\" 't))" : "(set P (.db.parted.get \"" AW_TMP "/adp0\" 't))");
+        out[gen] = aw_eval(q);
+    }
+    return aw_cmp_pair(q, out[0], out[1]);
+}
+#define AW_PARTED_SAME_OR_ERR(q) do { test_result_t r_ = aw_parted_same_or_err(q); if (r_.status != TEST_PASS) return r_; } while (0)
 
 /* Aggregate admission: sum, avg, count, min, max over every type, flat,
  * under a selection and parted: same values, types and errors. */
@@ -5148,8 +5209,9 @@ static test_result_t test_agg_admission(void) {
     aw_save("ad", tbl, -1);
     for (int p = 0; p < 2; p++) for (int gen = 0; gen <= 2; gen += 2) {
         char q[1600];
-        snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/adp%d/2024.01.0%d/t/\" %s {compress: %s})",
-                 gen, p + 1, tbl, gen ? "true" : "false");
+        int n = snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/adp%d/2024.01.0%d/t/\" %s {compress: %s})",
+                         gen, p + 1, tbl, gen ? "true" : "false");
+        TEST_ASSERT_TRUE(n > 0 && (size_t)n < sizeof q);
         aw_eval_ok(q);
     }
     static const char* const cols[] = { "b", "u", "h", "i", "l", "f", "e", "d", "t", "ts", "s", "x" };
@@ -5160,17 +5222,8 @@ static test_result_t test_agg_admission(void) {
         AW_SAME_OR_ERR("ad", q);
         snprintf(q, sizeof q, "(select {r: (%s %s) from: T where: (> k 1700)})", aggs[a], cols[c]);
         AW_SAME_OR_ERR("ad", q);
-        /* parted: both generations side by side */
-        char q0[512], q2[512];
-        snprintf(q0, sizeof q0, "(select {r: (%s %s) from: (.db.parted.get \"" AW_TMP "/adp0\" 't)})", aggs[a], cols[c]);
-        snprintf(q2, sizeof q2, "(select {r: (%s %s) from: (.db.parted.get \"" AW_TMP "/adp2\" 't)})", aggs[a], cols[c]);
-        ray_t* x = aw_eval(q0); ray_t* y = aw_eval(q2);
-        bool ex = x && RAY_IS_ERR(x), ey = y && RAY_IS_ERR(y);
-        TEST_ASSERT_FMT(ex == ey, "parted %s", q0);
-        if (ex) { TEST_ASSERT_TRUE(strcmp(ray_err_code(x), ray_err_code(y)) == 0); ray_error_free(x); ray_error_free(y); continue; }
-        ray_t* fx = ray_fmt(x, 0); ray_t* fy = ray_fmt(y, 0);
-        TEST_ASSERT_FMT(ray_str_len(fx) == ray_str_len(fy) && memcmp(ray_str_ptr(fx), ray_str_ptr(fy), ray_str_len(fx)) == 0, "parted %s", q0);
-        ray_release(fx); ray_release(fy); ray_release(x); ray_release(y);
+        snprintf(q, sizeof q, "(select {r: (%s %s) from: P})", aggs[a], cols[c]);
+        AW_PARTED_SAME_OR_ERR(q);
     }
     PASS();
 }
@@ -5181,6 +5234,12 @@ static test_result_t test_agg_admission(void) {
 static test_result_t test_sign_bit_widths(void) {
     aw_save("w8", "(table [s u] (list (as 'SYMBOL (map (fn [j] (format \"v%\" (% j 200))) (til 5000))) (as 'U8 (+ 100 (% (til 5000) 60)))))", RAY_ENC_FOR_BP);
     aw_save("w16", "(table [s] (list (as 'SYMBOL (map (fn [j] (format \"v%\" (% j 40000))) (til 80000)))))", RAY_ENC_FOR_BP);
+    TEST_ASSERT_EQ_I(aw_vec_enc("w8", "s", 0), RAY_ENC_FOR_BP);
+    TEST_ASSERT_EQ_I(aw_vec_enc("w8", "s", 4), RAY_ENC_FOR_BP);
+    TEST_ASSERT_EQ_I(aw_sym_width("w8", "s"), RAY_SYM_W8);
+    TEST_ASSERT_EQ_I(aw_vec_enc("w16", "s", 0), RAY_ENC_FOR_BP);
+    TEST_ASSERT_EQ_I(aw_vec_enc("w16", "s", 78), RAY_ENC_FOR_BP);
+    TEST_ASSERT_EQ_I(aw_sym_width("w16", "s"), RAY_SYM_W16);
     static const char* const q8[] = {
         "(min (at T 's))", "(max (at T 's))", "(count (at T 's))", "(sum (at T 's))", "(avg (at T 's))",
         "(count (select {from: T where: (== s 'v127)}))", "(count (select {from: T where: (== s 'v128)}))",
@@ -5197,7 +5256,8 @@ static test_result_t test_sign_bit_widths(void) {
     PASS();
 }
 
-/* Top-k on F64, BOOL and U8 first keys: results equal, nothing pruned. */
+/* Top-k on F64, BOOL, U8 and SYM first keys: results equal, the fused top-k
+ * takes each query on generation 2, and nothing is pruned. */
 static test_result_t test_topk_never_pruned(void) {
     aw_save("tn", "(table [f b u v s] (list (map (fn [j] (if (== 0 (% j 97)) 0N (* 0.5 (- j 100000)))) (til 200000)) "
                   "(== 0 (% (til 200000) 5)) (as 'U8 (% (til 200000) 251)) (% (til 200000) 1000) "
@@ -5211,7 +5271,17 @@ static test_result_t test_topk_never_pruned(void) {
         NULL,
     };
     for (int i = 0; q[i]; i++) {
-        AW_SAME_OR_ERR("tn", q[i]);                    /* leaves T on generation 2: the last run was gen 2 */
+        AW_SAME_OR_ERR("tn", q[i]);                    /* leaves T on generation 2 */
+        /* Run it once more on generation 2 alone: the fused top-k must take
+         * it (else the pruned counters would be another call's). */
+        ray_fused_topk_counters_reset();
+        ray_t* r = aw_eval(q[i]);
+        TEST_ASSERT_FMT(r && !RAY_IS_ERR(r), "%s: gen 2 rerun failed", q[i]);
+        ray_release(r);
+        uint64_t ran = 0, dec = 0;
+        ray_fused_topk_counters(&ran, &dec);
+        TEST_ASSERT_FMT(ran >= 1 && dec == 0, "%s: fused top-k ran %llu declined %llu", q[i],
+                        (unsigned long long)ran, (unsigned long long)dec);
         uint64_t pc = 1, pv = 1;
         ray_fused_topk_test_pruned(&pc, &pv);
         TEST_ASSERT_FMT(pc == 0 && pv == 0, "%s pruned %llu chunks %llu vectors", q[i],
