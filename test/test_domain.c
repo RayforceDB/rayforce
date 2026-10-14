@@ -66,6 +66,7 @@ static void domain_setup(void) {
 }
 
 static void domain_teardown(void) {
+    ray_clear_interrupt();
     ray_sym_destroy();
     ray_heap_destroy();
 }
@@ -509,6 +510,61 @@ static test_result_t test_domain_intern_batch(void) {
     ray_sys_free(vocab); ray_sys_free(pre); ray_sys_free(seen);
     ray_sys_free(strs); ray_sys_free(lens); ray_sys_free(hashes);
     ray_sys_free(pos); ray_sys_free(pos2);
+    unlink(TMP_DOM_SYM_PATH);
+    unlink(TMP_DOM_SYM_PATH ".lk");
+    PASS();
+}
+
+/* A cancelled pool dispatch can skip tasks while still returning normally.
+ * The batch intern must not classify misses or commit dedupe output from
+ * arrays those skipped tasks never filled. */
+static test_result_t test_domain_intern_batch_cancel(void) {
+    unlink(TMP_DOM_SYM_PATH);
+    unlink(TMP_DOM_SYM_PATH ".lk");
+    ray_pool_t* pool = ray_pool_get();
+    TEST_ASSERT_NOT_NULL(pool);
+    TEST_ASSERT_TRUE(pool->n_workers > 0);
+
+    ray_sym_domain_t* dom = ray_sym_domain_open_or_create(TMP_DOM_SYM_PATH);
+    TEST_ASSERT_NOT_NULL(dom);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom, "seed", 4), 1);
+    int64_t before = ray_sym_domain_count(dom);
+
+    enum { N = 8192, SL = 24 };
+    char* storage = ray_sys_alloc((size_t)N * SL);
+    const char** strs = ray_sys_alloc((size_t)N * sizeof(*strs));
+    size_t* lens = ray_sys_alloc((size_t)N * sizeof(*lens));
+    uint32_t* hashes = ray_sys_alloc((size_t)N * sizeof(*hashes));
+    int64_t* out = ray_sys_alloc((size_t)N * sizeof(*out));
+    TEST_ASSERT_NOT_NULL(storage); TEST_ASSERT_NOT_NULL(strs);
+    TEST_ASSERT_NOT_NULL(lens); TEST_ASSERT_NOT_NULL(hashes); TEST_ASSERT_NOT_NULL(out);
+    for (int64_t i = 0; i < N; i++) {
+        snprintf(storage + (size_t)i * SL, SL, "cancel-%07lld", (long long)i);
+        strs[i] = storage + (size_t)i * SL;
+        lens[i] = strlen(strs[i]);
+        hashes[i] = (uint32_t)ray_hash_bytes(strs[i], lens[i]);
+    }
+
+    const int phases[] = {RAY_SYM_DOMAIN_CANCEL_PROBE, RAY_SYM_DOMAIN_CANCEL_DEDUPE};
+    for (size_t p = 0; p < sizeof(phases) / sizeof(phases[0]); p++) {
+        memset(out, 0xa5, (size_t)N * sizeof(*out));
+        ray_sym_domain_batch_cancel_for_test(phases[p]);
+        TEST_ASSERT_FALSE(ray_sym_domain_intern_batch(dom, N, strs, lens, hashes, out));
+        TEST_ASSERT_TRUE(ray_interrupted());
+        ray_clear_interrupt();
+        TEST_ASSERT_EQ_I(ray_sym_domain_count(dom), before);
+        for (int64_t i = 0; i < N; i += 257)
+            TEST_ASSERT_EQ_I(ray_sym_domain_find(dom, strs[i], lens[i]), -1);
+    }
+
+    TEST_ASSERT_TRUE(ray_sym_domain_intern_batch(dom, N, strs, lens, hashes, out));
+    TEST_ASSERT_EQ_I(ray_sym_domain_count(dom), before + N);
+    for (int64_t i = 0; i < N; i += 257)
+        TEST_ASSERT_EQ_I(ray_sym_domain_find(dom, strs[i], lens[i]), out[i]);
+
+    ray_sym_domain_release(dom);
+    ray_sys_free(storage); ray_sys_free(strs); ray_sys_free(lens);
+    ray_sys_free(hashes); ray_sys_free(out);
     unlink(TMP_DOM_SYM_PATH);
     unlink(TMP_DOM_SYM_PATH ".lk");
     PASS();
@@ -2746,6 +2802,7 @@ const test_entry_t domain_entries[] = {
     { "domain/runtime_lut",             test_domain_runtime_lut,             domain_rt_setup, domain_rt_teardown },
     { "domain/open_position0_validation", test_domain_open_position0_validation, domain_setup, domain_teardown },
     { "domain/intern_batch",            test_domain_intern_batch,            domain_setup, domain_teardown },
+    { "domain/intern_batch_cancel",     test_domain_intern_batch_cancel,     domain_setup, domain_teardown },
     { "domain/intern_batch_concurrent", test_domain_intern_batch_concurrent, domain_setup, domain_teardown },
     { "domain/dict_upsert_file_keys",   test_domain_dict_upsert_file_keys,   domain_rt_setup, domain_rt_teardown },
     { NULL, NULL, NULL, NULL },

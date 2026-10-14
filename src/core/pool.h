@@ -196,10 +196,13 @@ void ray_pool_free(ray_pool_t* pool);
  * may run tasks from anywhere in the window (with ranges+stealing a worker
  * walks its own slice in order and then takes chunks cut from the END of
  * other workers' slices; with the shared cursor tasks start in index order
- * but still finish in any order).  Callers may rely only on (a) each task
- * running exactly once, (b) a task's identity — its [start, end) or index —
- * which is what results must be placed by, and (c) everything being done
- * when the dispatch returns.  Anything that stops early ("first N", a
+ * but still finish in any order).  Without cancellation callers may rely
+ * only on (a) each task running exactly once, (b) a task's identity — its
+ * [start, end) or index — which is what results must be placed by, and (c)
+ * everything being done when the dispatch returns.  Cancellation may skip
+ * tasks that have not started; callers must check ray_interrupted() before
+ * consuming outputs that require every task to have run.  Anything
+ * that stops early ("first N", a
  * cutoff, a bound) must be sound whatever the order: derive it from row
  * positions or values, never from "the tasks before this one have run"
  * (see ray_fused_take_select in fused_topk.c for the pattern). */
