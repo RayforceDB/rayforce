@@ -174,25 +174,61 @@ ray_t* ray_lte_fn(ray_t* a, ray_t* b) {
     return make_bool(as_f64(a) <= as_f64(b) ? 1 : 0);
 }
 
+/* Rank of a numeric atom type in the promotion order min/max use, or -1. */
+static int minmax_rank(int8_t t) {
+    switch (t) {
+    case -RAY_BOOL: return 0;
+    case -RAY_U8:   return 1;
+    case -RAY_I16:  return 2;
+    case -RAY_I32:  return 3;
+    case -RAY_I64:  return 4;
+    case -RAY_F32:  return 5;
+    case -RAY_F64:  return 6;
+    default:        return -1;
+    }
+}
+
+/* The atom type the result of (min a b) / (max a b) takes: the wider of
+ * two numeric types (BOOL < U8 < I16 < I32 < I64 < F32 < F64), or
+ * TIMESTAMP for a DATE against a TIMESTAMP, so an integer against a float
+ * is a float and a boolean against an integer an integer.  0 when the
+ * types already agree or no promotion applies. */
+static int8_t minmax_type(ray_t* a, ray_t* b) {
+    if (a->type == b->type) return 0;
+    int ra = minmax_rank(a->type), rb = minmax_rank(b->type);
+    if (ra >= 0 && rb >= 0) return ra > rb ? a->type : b->type;
+    if ((a->type == -RAY_DATE && b->type == -RAY_TIMESTAMP) ||
+        (a->type == -RAY_TIMESTAMP && b->type == -RAY_DATE))
+        return -RAY_TIMESTAMP;
+    return 0;
+}
+
+/* `x` as an atom of type `t` (from minmax_type); a null stays null. */
+static ray_t* minmax_promote(ray_t* x, int8_t t) {
+    if (RAY_ATOM_IS_NULL(x)) return ray_typed_null(t);
+    if (t == -RAY_TIMESTAMP) return ray_timestamp(temporal_as_ns(x));
+    if (t == -RAY_F64) return make_f64(as_f64(x));
+    if (t == -RAY_F32) return ray_f32((float)as_f64(x));
+    int64_t v = x->type == -RAY_BOOL ? (int64_t)(x->b8 != 0) : as_i64(x);
+    return make_typed_int(t, v);
+}
+
 /* Elementwise dyadic overloads for the aggregate names `min` and `max`.
- * Their vectorization is supplied by the evaluator, just like comparisons. */
-ray_t* ray_min2_fn(ray_t* a, ray_t* b) {
-    ray_t* cmp = ray_lte_fn(a, b);
+ * Their vectorization is supplied by the evaluator, just like comparisons.
+ * The result takes the promoted type of the two operands (minmax_type),
+ * whichever of them is chosen. */
+static ray_t* minmax_pick(ray_t* a, ray_t* b, ray_t* cmp) {
     if (!cmp || RAY_IS_ERR(cmp)) return cmp ? cmp : ray_error("oom", NULL);
     ray_t* out = cmp->b8 ? a : b;
-    ray_retain(out);
     ray_release(cmp);
+    int8_t t = minmax_type(a, b);
+    if (t && out->type != t) return minmax_promote(out, t);
+    ray_retain(out);
     return out;
 }
 
-ray_t* ray_max2_fn(ray_t* a, ray_t* b) {
-    ray_t* cmp = ray_gte_fn(a, b);
-    if (!cmp || RAY_IS_ERR(cmp)) return cmp ? cmp : ray_error("oom", NULL);
-    ray_t* out = cmp->b8 ? a : b;
-    ray_retain(out);
-    ray_release(cmp);
-    return out;
-}
+ray_t* ray_min2_fn(ray_t* a, ray_t* b) { return minmax_pick(a, b, ray_lte_fn(a, b)); }
+ray_t* ray_max2_fn(ray_t* a, ray_t* b) { return minmax_pick(a, b, ray_gte_fn(a, b)); }
 
 
 ray_t* ray_eq_fn(ray_t* a, ray_t* b) {
