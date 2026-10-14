@@ -289,6 +289,34 @@ static bool ast_refs_locals(compiler_t *c, ray_t *ast) {
 }
 
 
+/* Lower (if c1 r1 c2 r2 ... else?) — args are the forms after `if`, nargs
+ * >= 2.  Each condition jumps past its result when false; the result
+ * jumps to the end of the chain.  Recursing per pair keeps every end jump
+ * local to its own frame.  No fallback: the chain yields 0, matching
+ * ray_cond_fn. */
+static void compile_if_chain(compiler_t *c, ray_t **args, int64_t nargs) {
+    if (nargs == 1) { compile_expr(c, args[0]); return; }
+    if (nargs == 0) {
+        ray_t *zero = ray_alloc(0);
+        zero->type = -RAY_I64;
+        zero->i64 = 0;
+        int32_t idx = add_constant(c, zero);
+        ray_release(zero);
+        emit_const(c, idx);
+        return;
+    }
+    compile_expr(c, args[0]);
+    /* Match ray_cond_fn: truthiness belongs to the materialized value,
+     * not to the non-NULL lazy handle that happens to contain it. */
+    emit(c, OP_FORCE);
+    int32_t jmpf_pos = emit_jump(c, OP_JMPF);
+    compile_expr(c, args[1]);
+    int32_t jmp_pos = emit_jump(c, OP_JMP);
+    patch_jump(c, jmpf_pos);
+    compile_if_chain(c, args + 2, nargs - 2);
+    patch_jump(c, jmp_pos);
+}
+
 /* ── Compile a list (special form or function call) ── */
 static void compile_list(compiler_t *c, ray_t *ast) {
     if (c->error) return;
@@ -380,30 +408,9 @@ static void compile_list(compiler_t *c, ray_t *ast) {
             return;
         }
 
-        /* (if cond then else?) */
+        /* (if c1 r1 c2 r2 ... else?) */
         if (sym_id == sf_if && n >= 3) {
-            compile_expr(c, elems[1]);
-            /* Match ray_cond_fn: truthiness belongs to the materialized value,
-             * not to the non-NULL lazy handle that happens to contain it. */
-            emit(c, OP_FORCE);
-            int32_t jmpf_pos = emit_jump(c, OP_JMPF);
-            compile_expr(c, elems[2]);
-            if (n >= 4) {
-                int32_t jmp_pos = emit_jump(c, OP_JMP);
-                patch_jump(c, jmpf_pos);
-                compile_expr(c, elems[3]);
-                patch_jump(c, jmp_pos);
-            } else {
-                int32_t jmp_pos = emit_jump(c, OP_JMP);
-                patch_jump(c, jmpf_pos);
-                ray_t *zero = ray_alloc(0);
-                zero->type = -RAY_I64;
-                zero->i64 = 0;
-                int32_t idx = add_constant(c, zero);
-                ray_release(zero);
-                emit_const(c, idx);
-                patch_jump(c, jmp_pos);
-            }
+            compile_if_chain(c, elems + 1, n - 1);
             return;
         }
 

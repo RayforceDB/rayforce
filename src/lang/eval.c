@@ -2039,22 +2039,28 @@ ray_t* ray_let_fn(ray_t* name_obj, ray_t* val_expr) {
     return val;
 }
 
-/* (if cond then else?) — conditional. Receives unevaluated args. */
+/* (if c1 r1 c2 r2 ... else?) — conditional chain.  Receives unevaluated
+ * args.  Conditions are tried in order and the result paired with the
+ * first truthy one is evaluated; an odd trailing arg is the fallback.  No
+ * fallback: return 0. */
 ray_t* ray_cond_fn(ray_t** args, int64_t n) {
     if (n < 2) return ray_error("domain", "if: expected at least 2 args (cond then), got %lld", (long long)n);
-    ray_t* cond = ray_eval(args[0]);
-    if (RAY_IS_ERR(cond)) return cond;
-    /* A vector condition tested whole: the expression may have needed
-     * row-by-row evaluation (see the opaque by: key). */
-    if (!ray_is_atom(cond)) __VM->rows_cond++;
-    /* Materialize lazy handles before testing truthiness */
-    if (ray_is_lazy(cond))
-        cond = ray_lazy_materialize(cond);
-    if (RAY_IS_ERR(cond)) return cond;
-    int truthy = is_truthy(cond);
-    ray_release(cond);
-    if (truthy) return ray_eval(args[1]);
-    if (n >= 3) return ray_eval(args[2]);
+    int64_t i = 0;
+    for (; i + 1 < n; i += 2) {
+        ray_t* cond = ray_eval(args[i]);
+        if (RAY_IS_ERR(cond)) return cond;
+        /* A vector condition tested whole: the expression may have needed
+         * row-by-row evaluation (see the opaque by: key). */
+        if (!ray_is_atom(cond)) __VM->rows_cond++;
+        /* Materialize lazy handles before testing truthiness */
+        if (ray_is_lazy(cond))
+            cond = ray_lazy_materialize(cond);
+        if (RAY_IS_ERR(cond)) return cond;
+        int truthy = is_truthy(cond);
+        ray_release(cond);
+        if (truthy) return ray_eval(args[i + 1]);
+    }
+    if (i < n) return ray_eval(args[i]);
     /* No else branch: return 0 */
     return make_i64(0);
 }
