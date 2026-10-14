@@ -1962,6 +1962,38 @@ static ray_t* in_sel_parted(ray_col_src_t* src, ray_t* set_lit, bool negate, int
     return sel;
 }
 
+/* A later `in` conjunct over a single-file generation-2 column read by
+ * range (exec_in_to_selection's range fill), ANDed with the installed
+ * selection `within` inside the fill (in_sel_parted_fill over one
+ * segment: a morsel `within` drops is not read).  NULL when the column is
+ * read in place (a published materialization: the bool path, as before)
+ * or the shape declines (STR, GUID, OOM); an owned error, or the
+ * selection. */
+static ray_t* in_sel_single_within(ray_col_src_t* src, ray_t* set_lit, bool negate, int64_t nrows,
+                                   ray_t* within, bool* all_pass) {
+    *all_pass = false;
+    if (ray_col_src_ready(src)) return NULL;
+    ray_rowsel_t* wm = ray_rowsel_meta(within);
+    if (!wm || wm->nrows != nrows) return NULL;
+    in_seg_sel_t* seg = (in_seg_sel_t*)ray_calloc_raw(sizeof(in_seg_sel_t));
+    if (!seg) return NULL;
+    ray_scan_fail_t fail; ray_scan_fail_init(&fail);
+    if (in_build_worker_ctx_meta(src->type, src->attrs, src->may_null, src->dom, set_lit, negate,
+                                 seg->svf_stack, seg->svi_stack, &seg->ic, &seg->sv_hdr, &seg->lut_hdr) != IN_CTX_OK) {
+        seg->ready = true;                         /* nothing set up to free but the headers */
+        in_seg_sel_free(seg, 1);
+        return NULL;
+    }
+    in_rfill_setup(&seg->rf, &seg->ic, src, &fail, negate, seg->kstack, seg->fstack);
+    ray_col_src_advise(src, 0, nrows);
+    const int64_t off[2] = { 0, nrows };
+    in_sel_parted_ctx_t pc = { seg, off, 1, ray_rowsel_flags(within), ray_rowsel_offsets(within),
+                               ray_rowsel_idx(within) };
+    ray_t* sel = pred_sel_drive(nrows, in_sel_parted_fill, &pc, &fail, all_pass);
+    in_seg_sel_free(seg, 1);                       /* src is the graph's: not bound here */
+    return sel;
+}
+
 /* A parted `in` / `not in` filter's selection, for a FILTER that already
  * holds one (a later conjunct): the generation-2 route above, or NULL when
  * it is not taken (any other column keeps the bool path). */
@@ -2047,13 +2079,17 @@ static ray_t* exec_in_parted_selection(ray_graph_t* g, ray_op_t* pred, int64_t n
     memcpy(&stored_table_id, le->base.pad, sizeof(uint16_t));
     if (stored_table_id != 0) return NULL;
     ray_col_meta_t m;
-    /* generation 2 only: a generation-0 parted column is never bound here */
-    if (!ray_table_col_meta(g->table, le->sym, &m) || !RAY_IS_PARTED(m.type) || !m.enc) return NULL;
+    /* generation 2 only: a generation-0 column is never bound here; a
+     * single-file one only as a later conjunct (within: the first one
+     * takes exec_in_to_selection's range fill) */
+    if (!ray_table_col_meta(g->table, le->sym, &m) || !m.enc) return NULL;
+    if (!RAY_IS_PARTED(m.type) && (!within || m.type == RAY_MAPCOMMON)) return NULL;
     if (ray_col_bind_declines(g->table, le->sym)) return NULL;
     ray_t* berr = NULL;
     ray_col_src_t* src = ray_graph_bind_col(g, g->table, le->sym, &berr);
     if (berr) return berr;
-    if (!src || !src->parted || src->len != nrows) return NULL;
+    if (!src || src->len != nrows) return NULL;
+    if (!src->parted) return in_sel_single_within(src, re->literal, pred->opcode == OP_NOT_IN, nrows, within, all_pass);
     return in_sel_parted(src, re->literal, pred->opcode == OP_NOT_IN, nrows, within, all_pass);
 }
 
@@ -3822,10 +3858,11 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 }
             }
 
-            /* A later `in` conjunct over a generation-2 parted column: read
-             * segment by segment over the morsels the installed selection
-             * keeps, ANDed with it (exec_in_parted_selection), instead of a
-             * bool vector over the column read whole. */
+            /* A later `in` conjunct over a generation-2 column (parted:
+             * segment by segment; single-file: by range) read over the
+             * morsels the installed selection keeps, ANDed with it
+             * (exec_in_parted_selection), instead of a bool vector over the
+             * column read whole. */
             if (input->type == RAY_TABLE && g->selection && input == g->table) {
                 bool in_all = false;
                 ray_t* isel = exec_in_parted_selection(g, op_child(g, op, 1), ray_table_nrows(input),

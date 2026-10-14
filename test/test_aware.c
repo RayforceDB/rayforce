@@ -2448,12 +2448,14 @@ static test_result_t test_refine_in(void) {
                         "%s %d differs", cs[i].col, cs[i].neg);
         ray_release(fa); ray_release(fb); ray_release(r0); ray_release(r2); ray_release(set);
     }
-    /* SYM `in` is not admitted (exec_in does not translate the file
-     * domain): as a later conjunct it keeps the full-width path, which
-     * reads s whole (1 materialization, pinned: a SYM refinement would need
-     * the constant translated into the column's domain first, Task 4's
-     * ray_col_src_sym_find); as a first conjunct Task 4's fused leaf
-     * answers it on ids (sym_membership) */
+    /* SYM `in` is not admitted by the refinement (exec_in does not
+     * translate the file domain): this direct refinement call keeps the
+     * full-width path.  Through the language the later conjunct is read by
+     * range over the installed selection (P3 Task 14b, the single-file arm
+     * of exec_in_parted_selection, whose probe translates the set into the
+     * column's domain): 0 materializations (it read s whole before, 1); as
+     * a first conjunct Task 4's fused leaf answers it on ids
+     * (sym_membership) */
     {
         ray_t* set = aw_eval("['a 'c 'zz]");
         TEST_ASSERT_TRUE(set && !RAY_IS_ERR(set));
@@ -2466,7 +2468,7 @@ static test_result_t test_refine_in(void) {
         ray_t* fa = ray_fmt(r0, 0); ray_t* fb = ray_fmt(r2, 0);
         TEST_ASSERT_TRUE(ray_str_len(fa) == ray_str_len(fb) && memcmp(ray_str_ptr(fa), ray_str_ptr(fb), ray_str_len(fa)) == 0);
         ray_release(fa); ray_release(fb); ray_release(r0); ray_release(r2); ray_release(set);
-        AW_SAME("ri", "(select {c: (count k) by: g from: T where: (and (== g 3) (in s ['a 'c 'zz]))})", 1);
+        AW_SAME("ri", "(select {c: (count k) by: g from: T where: (and (== g 3) (in s ['a 'c 'zz]))})", 0);
     }
     ray_release(t0); ray_release(t2);
     /* F64 members: NaN nulls, -0.0 against +0.0, through exec_in on the
@@ -5391,6 +5393,44 @@ static test_result_t test_topk_never_pruned(void) {
     PASS();
 }
 
+/* A splayed generation-2 `in` / `not in` filter later in the where:
+ * chain (P3 Task 14b) reads its column by range over the morsels the
+ * installed selection keeps, ANDed with it (exec_in_parted_selection's
+ * single-file arm), as the first conjunct does: nullable integer, SYM and
+ * F64 columns, middle and last conjuncts, grouped and counted.  Answers
+ * equal generation 0's; nothing materializes (the generic OP_IN read the
+ * column whole). */
+static test_result_t test_splayed_in_later(void) {
+    aw_save("il", "(table [k x v s f] (list (til 210000) (as 'I32 (- (% (til 210000) 40) (* 500 (div (til 210000) 70000)))) "
+                  "(as 'I32 (map (fn [j] (if (== 0 (% j 9)) 0N (% j 1000))) (til 210000))) "
+                  "(take ['a 'b 'c 'd 'e] 210000) (as 'F64 (% (til 210000) 50))))", -1);
+    static const char* const qs[] = {
+        "(select {c: (count k) s: (sum v) from: T where: (and (> v 10) (in x [3 -497 -980])) by: x asc: x})",
+        "(select {c: (count k) from: T where: (and (> v 10) (in x [3 -497]) (< v 900)) by: s asc: s})",
+        "(select {c: (count k) from: T where: (and (> v 10) (not-in x [3 -497 -998]) (< v 900))})",
+        "(select {k: k v: v from: T where: (and (== k 70005) (in x [5 -495 -1000]))})",
+        "(select {c: (count k) from: T where: (and (> f 10.0) (in v [1 2 3 9 500]))})",
+        "(select {c: (count k) from: T where: (and (> f 10.0) (not-in v [1 2 3 9 500]))})",
+        "(select {c: (count k) from: T where: (and (> v 10) (in s ['a 'c])) by: s asc: s})",
+        "(select {c: (count k) from: T where: (and (> v 10) (not-in s ['a 'c]))})",
+        "(select {c: (count k) from: T where: (and (> v 10) (in f [1.0 7.0 -0.0]))})",
+        "(select {c: (count k) from: T where: (and (> v 10) (in x [12345]))})",
+        "(select {c: (count k) from: T where: (and (> v 10) (not-in x [100000]))})",
+        NULL,
+    };
+    static const char* const in_col[] = { "x", "x", "x", "x", "v", "v", "s", "s", "f", "x", "x" };
+    for (int i = 0; qs[i]; i++) {
+        AW_SAME("il", qs[i], 0);
+        /* and the column stays unmaterialized (T: generation 2) */
+        char b[128];
+        snprintf(b, sizeof b, "(at (.idx.info T '%s) 'materialized)", in_col[i]);
+        ray_t* mt = aw_eval(b);
+        TEST_ASSERT_FMT(mt && !RAY_IS_ERR(mt) && mt->b8 == 0, "%s: %s materialized", qs[i], in_col[i]);
+        ray_release(mt);
+    }
+    PASS();
+}
+
 /* A parted group's (strlen c) SUM / AVG input (ClickBench q28: avg
  * (strlen URL) by CounterID) is aggregated by each partition's group over
  * the borrowed segment, by range on generation 2, as the splayed group
@@ -5529,6 +5569,7 @@ const test_entry_t aware_entries[] = {
     { "aware/gate_decoded_bytes",   test_gate_decoded_bytes,   aw_setup, aw_teardown },
     { "aware/cross_segment_codes",  test_cross_segment_codes,  aw_setup, aw_teardown },
     { "aware/parted_in",            test_parted_in,            aw_setup, aw_teardown },
+    { "aware/splayed_in_later",     test_splayed_in_later,     aw_setup, aw_teardown },
     { "aware/parted_strlen_avg",    test_parted_strlen_avg,    aw_setup, aw_teardown },
     { "aware/signed_zeros",      test_signed_zeros,      aw_setup, aw_teardown },
     { "aware/symbol_order",      test_symbol_order,      aw_setup, aw_teardown },
