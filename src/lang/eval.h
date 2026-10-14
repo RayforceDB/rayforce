@@ -46,6 +46,11 @@
 #define ATTR_QUOTED  0x20  /* -RAY_SYM atom with this flag SET = quoted/literal symbol;
                               CLEAR (default) = name reference, resolved at eval. */
 
+/* Head of the list the parser makes from the [name count] binding of an
+ * indexed `times`: (RAY_TIMES_BIND name count).  The space keeps any
+ * source token from spelling it. */
+#define RAY_TIMES_BIND "times bind"
+
 /* Internal eval flag for RAY_LIST values carried as nested IPC arguments.
  * The evaluator still runs callable lists normally; this only makes a
  * non-callable list head fall back to returning the list as data. */
@@ -427,6 +432,8 @@ ray_t* ray_while_fn(ray_t** args, int64_t n);
 ray_t* ray_times_fn(ray_t** args, int64_t n);
 ray_t* ray_times_norm_fn(ray_t* x);
 ray_t* ray_times_dec_fn(ray_t* x);
+ray_t* ray_times_idx_fn(ray_t* lim, ray_t* ctr);
+bool   ray_times_binding(ray_t* ast, int64_t* name, ray_t** count);
 ray_t* ray_fn(ray_t** args, int64_t n);
 ray_t* ray_raise_fn(ray_t* val);
 ray_t* ray_try_fn(ray_t* expr, ray_t* handler_expr);

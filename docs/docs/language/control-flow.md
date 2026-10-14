@@ -121,6 +121,21 @@ error. Like `while`, `times` pushes no scope of its own, so a `let` in the body
 binds in the enclosing frame; wrap the body in `do` when a fresh binding per
 pass is wanted.
 
+To loop over positions, give `times` a `[name count]` binding instead of a bare
+count. The name takes `0`, `1`, …, `count - 1`, one value per pass:
+
+```lisp
+(times [i (count qty)]
+  (alter 'qty set i (+ (at qty i) (at delta i))))
+```
+
+The index is bound like a `let`, in the enclosing frame, and keeps the last
+index once the loop ends; a loop that runs no pass leaves it as it was. It is
+set from the loop's own counter at the start of every pass, so a body that
+rebinds the name changes it for the rest of that pass only, never the passes
+that follow. The count follows the rules above: evaluated once, an integer,
+nothing run when it is zero or less.
+
 Reach for `times` when the number of passes is known up front and for `while`
 when it is not. Neither allocates a sequence, so neither pays for a range that
 exists only to be counted.
