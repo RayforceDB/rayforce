@@ -364,6 +364,57 @@ static inline void col_propagate_nulls_filter(ray_t* dst, const ray_t* src,
     }
 }
 
+/* ── Ragged parted tables ─────────────────────────────────────────────────
+ * A partition may lack a trailing column (store/part.c): that column's
+ * segment for it is NULL and stands for the partition's rows as typed
+ * nulls, which is how ser and the formatter read it.  The partition's row
+ * count lives in the table's partition-key (MAPCOMMON) column, so every
+ * reader that flattens or gathers a parted column takes those counts and a
+ * NULL segment contributes its rows as nulls rather than none.  Without
+ * counts (a column met away from its table) a NULL segment contributes no
+ * rows, as before. */
+static inline const int64_t* parted_table_counts(ray_t* tbl, int64_t* n_out) {
+    *n_out = 0;
+    if (!tbl || RAY_IS_ERR(tbl) || tbl->type != RAY_TABLE) return NULL;
+    int64_t nc = ray_table_ncols(tbl);
+    for (int64_t c = 0; c < nc; c++) {
+        ray_t* col = ray_table_get_col_idx(tbl, c);
+        if (col && col->type == RAY_MAPCOMMON) {
+            ray_t* rc = ((ray_t**)ray_data(col))[1];
+            if (!rc || RAY_IS_ERR(rc)) return NULL;
+            *n_out = rc->len;
+            return (const int64_t*)ray_data(rc);
+        }
+    }
+    return NULL;
+}
+
+/* Rows segment s stands for: its length, or a NULL segment's partition count. */
+static inline int64_t parted_seg_rows(ray_t** segs, int64_t s,
+                                      const int64_t* cnt, int64_t ncnt) {
+    if (segs[s] && !RAY_IS_ERR(segs[s])) return segs[s]->len;
+    return (cnt && s < ncnt) ? cnt[s] : 0;
+}
+
+/* Rows of a parted column, NULL segments counted by the partition counts. */
+static inline int64_t parted_rows_counted(ray_t* col, const int64_t* cnt, int64_t ncnt) {
+    ray_t** segs = (ray_t**)ray_data(col);
+    int64_t total = 0;
+    for (int64_t s = 0; s < col->len; s++) total += parted_seg_rows(segs, s, cnt, ncnt);
+    return total;
+}
+
+/* Rows [off, off+n) of a flat fixed-width or SYM vector (len already
+ * covering them) as the type's null; BOOL/U8 have none and get 0. */
+static inline void parted_fill_nulls(ray_t* flat, int64_t off, int64_t n) {
+    if (n <= 0) return;
+    if (flat->type == RAY_BOOL || flat->type == RAY_U8) {
+        memset((char*)ray_data(flat) + off, 0, (size_t)n);
+        return;
+    }
+    for (int64_t i = 0; i < n; i++) ray_vec_set_null(flat, off + i, true);
+}
+
 /* Append one string element from a parted segment, preserving nulls. */
 static inline ray_t* parted_str_append_elem(ray_t* out, ray_t* seg,
                                             int64_t local_idx,
@@ -383,10 +434,12 @@ static inline ray_t* parted_str_append_elem(ray_t* out, ray_t* seg,
 /* Deep-copy gather from parted RAY_STR segments by row index.
  * Resolves each string from its source segment's pool and appends
  * into the output vector's own pool. Safe for multi-pool segments. */
-static inline ray_t* parted_gather_str_rows(ray_t** segs, int64_t n_segs,
-                                            const int64_t* row_indices,
-                                            int64_t count) {
-    /* Build prefix-sum segment boundaries */
+static inline ray_t* parted_gather_str_rows_c(ray_t** segs, int64_t n_segs,
+                                              const int64_t* row_indices,
+                                              int64_t count,
+                                              const int64_t* cnt, int64_t ncnt) {
+    /* Build prefix-sum segment boundaries (a NULL segment spans its
+     * partition's rows) */
     int64_t cumul = 0;
     int64_t stack_ends[64];
     int64_t* seg_ends = (n_segs <= 64) ? stack_ends : NULL;
@@ -396,7 +449,7 @@ static inline ray_t* parted_gather_str_rows(ray_t** segs, int64_t n_segs,
         if (!seg_ends) return ray_error("oom", NULL);
     }
     for (int64_t i = 0; i < n_segs; i++) {
-        cumul += (segs[i]) ? segs[i]->len : 0;
+        cumul += parted_seg_rows(segs, i, cnt, ncnt);
         seg_ends[i] = cumul;
     }
 
@@ -424,61 +477,101 @@ static inline ray_t* parted_gather_str_rows(ray_t** segs, int64_t n_segs,
     return out;
 }
 
-/* Deep-copy head (first n rows) from parted RAY_STR segments. */
-static inline ray_t* parted_head_str(ray_t** segs, int64_t n_segs, int64_t n) {
+static inline ray_t* parted_gather_str_rows(ray_t** segs, int64_t n_segs,
+                                            const int64_t* row_indices,
+                                            int64_t count) {
+    return parted_gather_str_rows_c(segs, n_segs, row_indices, count, NULL, 0);
+}
+
+/* First n rows from parted RAY_STR segments; a NULL segment's rows (its
+ * partition count) are null strings. */
+static inline ray_t* parted_head_str_c(ray_t** segs, int64_t n_segs, int64_t n,
+                                       const int64_t* cnt, int64_t ncnt) {
     ray_t* out = ray_vec_new(RAY_STR, n);
     if (!out || RAY_IS_ERR(out)) return out;
     int64_t remaining = n;
     for (int64_t s = 0; s < n_segs && remaining > 0; s++) {
-        if (!segs[s]) continue;
-        int64_t seg_len = segs[s]->len;
-        int64_t take = (seg_len > remaining) ? remaining : seg_len;
-        const char* pool_base = segs[s]->str_pool
-                              ? (const char*)ray_data(segs[s]->str_pool) : NULL;
-        for (int64_t i = 0; i < take; i++) {
-            out = parted_str_append_elem(out, segs[s], i, pool_base);
-            if (RAY_IS_ERR(out)) return out;
+        int64_t seg_len = parted_seg_rows(segs, s, cnt, ncnt);
+        int64_t take = seg_len < remaining ? seg_len : remaining;
+        if (!segs[s] || RAY_IS_ERR(segs[s])) {
+            for (int64_t i = 0; i < take; i++) {
+                out = ray_str_vec_append(out, "", 0);
+                if (RAY_IS_ERR(out)) return out;
+                ray_vec_set_null(out, out->len - 1, true);
+            }
+        } else {
+            const char* pool_base = segs[s]->str_pool
+                                  ? (const char*)ray_data(segs[s]->str_pool) : NULL;
+            for (int64_t i = 0; i < take; i++) {
+                out = parted_str_append_elem(out, segs[s], i, pool_base);
+                if (RAY_IS_ERR(out)) return out;
+            }
         }
         remaining -= take;
     }
     return out;
 }
+static inline ray_t* parted_head_str(ray_t** segs, int64_t n_segs, int64_t n) {
+    return parted_head_str_c(segs, n_segs, n, NULL, 0);
+}
 
-/* Deep-copy tail (last n rows) from parted RAY_STR segments. */
-static inline ray_t* parted_tail_str(ray_t** segs, int64_t n_segs, int64_t n) {
-    /* First pass: count total rows to find start offset */
+/* Last n rows from parted RAY_STR segments; a NULL segment's rows (its
+ * partition count) are null strings. */
+static inline ray_t* parted_tail_str_c(ray_t** segs, int64_t n_segs, int64_t n,
+                                       const int64_t* cnt, int64_t ncnt) {
     int64_t total = 0;
-    for (int64_t s = 0; s < n_segs; s++)
-        if (segs[s]) total += segs[s]->len;
+    for (int64_t s = 0; s < n_segs; s++) total += parted_seg_rows(segs, s, cnt, ncnt);
     int64_t skip = total - n;
     if (skip < 0) { skip = 0; n = total; }
-
     ray_t* out = ray_vec_new(RAY_STR, n);
     if (!out || RAY_IS_ERR(out)) return out;
     int64_t skipped = 0;
     for (int64_t s = 0; s < n_segs; s++) {
-        if (!segs[s]) continue;
-        int64_t seg_len = segs[s]->len;
+        int64_t seg_len = parted_seg_rows(segs, s, cnt, ncnt);
         int64_t seg_start = 0;
         if (skipped + seg_len <= skip) { skipped += seg_len; continue; }
         if (skipped < skip) { seg_start = skip - skipped; skipped = skip; }
-        const char* pool_base = segs[s]->str_pool
-                              ? (const char*)ray_data(segs[s]->str_pool) : NULL;
-        for (int64_t i = seg_start; i < seg_len; i++) {
-            out = parted_str_append_elem(out, segs[s], i, pool_base);
-            if (RAY_IS_ERR(out)) return out;
+        if (!segs[s] || RAY_IS_ERR(segs[s])) {
+            for (int64_t i = seg_start; i < seg_len; i++) {
+                out = ray_str_vec_append(out, "", 0);
+                if (RAY_IS_ERR(out)) return out;
+                ray_vec_set_null(out, out->len - 1, true);
+            }
+        } else {
+            const char* pool_base = segs[s]->str_pool
+                                  ? (const char*)ray_data(segs[s]->str_pool) : NULL;
+            for (int64_t i = seg_start; i < seg_len; i++) {
+                out = parted_str_append_elem(out, segs[s], i, pool_base);
+                if (RAY_IS_ERR(out)) return out;
+            }
         }
         skipped += seg_len;
     }
     return out;
 }
+static inline ray_t* parted_tail_str(ray_t** segs, int64_t n_segs, int64_t n) {
+    return parted_tail_str_c(segs, n_segs, n, NULL, 0);
+}
 
-/* Deep-copy flatten all rows from parted RAY_STR segments. */
-static inline ray_t* parted_flatten_str(ray_t** segs, int64_t n_segs, int64_t total) {
+/* Deep-copy flatten all rows from parted RAY_STR segments; a NULL segment
+ * yields its partition's rows as null (empty) strings. */
+static inline ray_t* parted_flatten_str_c(ray_t** segs, int64_t n_segs,
+                                          const int64_t* cnt, int64_t ncnt) {
+    int64_t total = 0;
+    for (int64_t s = 0; s < n_segs; s++) total += parted_seg_rows(segs, s, cnt, ncnt);
     ray_t* out = ray_vec_new(RAY_STR, total);
     if (!out || RAY_IS_ERR(out)) return out;
     for (int64_t s = 0; s < n_segs; s++) {
-        if (!segs[s] || segs[s]->len <= 0) continue;
+        if (!segs[s] || RAY_IS_ERR(segs[s])) {
+            int64_t n = parted_seg_rows(segs, s, cnt, ncnt);
+            for (int64_t i = 0; i < n; i++) {
+                out = ray_str_vec_append(out, "", 0);
+                if (RAY_IS_ERR(out)) return out;
+                ray_vec_set_null(out, out->len - 1, true);
+            }
+            continue;
+        }
+        if (segs[s]->len <= 0) continue;
         const char* pool_base = segs[s]->str_pool
                               ? (const char*)ray_data(segs[s]->str_pool) : NULL;
         for (int64_t i = 0; i < segs[s]->len; i++) {
@@ -489,6 +582,12 @@ static inline ray_t* parted_flatten_str(ray_t** segs, int64_t n_segs, int64_t to
     return out;
 }
 
+/* Deep-copy flatten all rows from parted RAY_STR segments. */
+static inline ray_t* parted_flatten_str(ray_t** segs, int64_t n_segs, int64_t total) {
+    (void)total;   /* a capacity hint; the segments give the exact count */
+    return parted_flatten_str_c(segs, n_segs, NULL, 0);
+}
+
 /* ── LIST analogues of the parted STR helpers ────────────────────────────
  * A LIST cell is a ray_t* — every copy below SHARES elements via
  * ray_retain, never byte-copies: a raw memcpy of the 8-byte pointers
@@ -496,15 +595,25 @@ static inline ray_t* parted_flatten_str(ray_t** segs, int64_t n_segs, int64_t to
  * on release (issue #355).  NULL segments contribute zero rows, matching
  * parted_gather_col's row numbering. */
 
-/* Flatten all rows from parted RAY_LIST segments. */
-static inline ray_t* parted_flatten_list(ray_t** segs, int64_t n_segs,
-                                         int64_t total) {
+/* Flatten all rows from parted RAY_LIST segments; a NULL segment yields its
+ * partition's rows as the null object. */
+static inline ray_t* parted_flatten_list_c(ray_t** segs, int64_t n_segs,
+                                           const int64_t* cnt, int64_t ncnt) {
+    int64_t total = 0;
+    for (int64_t s = 0; s < n_segs; s++) total += parted_seg_rows(segs, s, cnt, ncnt);
     ray_t* out = ray_list_new(total);
     if (!out || RAY_IS_ERR(out)) return out;
     ray_t** dst = (ray_t**)ray_data(out);
     int64_t pos = 0;
     for (int64_t s = 0; s < n_segs; s++) {
-        if (!segs[s]) continue;
+        if (!segs[s] || RAY_IS_ERR(segs[s])) {
+            int64_t n = parted_seg_rows(segs, s, cnt, ncnt);
+            for (int64_t i = 0; i < n && pos < total; i++) {
+                ray_retain(RAY_NULL_OBJ);
+                dst[pos++] = RAY_NULL_OBJ;
+            }
+            continue;
+        }
         ray_t** src = (ray_t**)ray_data(segs[s]);
         for (int64_t i = 0; i < segs[s]->len && pos < total; i++) {
             ray_t* e = src[i];
@@ -516,16 +625,32 @@ static inline ray_t* parted_flatten_list(ray_t** segs, int64_t n_segs,
     return out;
 }
 
-/* First n rows from parted RAY_LIST segments. */
-static inline ray_t* parted_head_list(ray_t** segs, int64_t n_segs, int64_t n) {
+/* Flatten all rows from parted RAY_LIST segments. */
+static inline ray_t* parted_flatten_list(ray_t** segs, int64_t n_segs,
+                                         int64_t total) {
+    (void)total;
+    return parted_flatten_list_c(segs, n_segs, NULL, 0);
+}
+
+/* First n rows from parted RAY_LIST segments; a NULL segment's rows are the
+ * null object. */
+static inline ray_t* parted_head_list_c(ray_t** segs, int64_t n_segs, int64_t n,
+                                        const int64_t* cnt, int64_t ncnt) {
     ray_t* out = ray_list_new(n);
     if (!out || RAY_IS_ERR(out)) return out;
     ray_t** dst = (ray_t**)ray_data(out);
     int64_t pos = 0;
     for (int64_t s = 0; s < n_segs && pos < n; s++) {
-        if (!segs[s]) continue;
+        int64_t seg_len = parted_seg_rows(segs, s, cnt, ncnt);
+        if (!segs[s] || RAY_IS_ERR(segs[s])) {
+            for (int64_t i = 0; i < seg_len && pos < n; i++) {
+                ray_retain(RAY_NULL_OBJ);
+                dst[pos++] = RAY_NULL_OBJ;
+            }
+            continue;
+        }
         ray_t** src = (ray_t**)ray_data(segs[s]);
-        for (int64_t i = 0; i < segs[s]->len && pos < n; i++) {
+        for (int64_t i = 0; i < seg_len && pos < n; i++) {
             ray_t* e = src[i];
             if (e) ray_retain(e);
             dst[pos++] = e;
@@ -534,54 +659,72 @@ static inline ray_t* parted_head_list(ray_t** segs, int64_t n_segs, int64_t n) {
     out->len = pos;
     return out;
 }
+static inline ray_t* parted_head_list(ray_t** segs, int64_t n_segs, int64_t n) {
+    return parted_head_list_c(segs, n_segs, n, NULL, 0);
+}
 
-/* Last n rows from parted RAY_LIST segments. */
-static inline ray_t* parted_tail_list(ray_t** segs, int64_t n_segs, int64_t n) {
+/* Last n rows from parted RAY_LIST segments; a NULL segment's rows are the
+ * null object. */
+static inline ray_t* parted_tail_list_c(ray_t** segs, int64_t n_segs, int64_t n,
+                                        const int64_t* cnt, int64_t ncnt) {
     int64_t total = 0;
-    for (int64_t s = 0; s < n_segs; s++)
-        if (segs[s]) total += segs[s]->len;
+    for (int64_t s = 0; s < n_segs; s++) total += parted_seg_rows(segs, s, cnt, ncnt);
     int64_t skip = total - n;
-    if (skip < 0) skip = 0;
-
-    ray_t* out = ray_list_new(total - skip);
+    if (skip < 0) { skip = 0; n = total; }
+    ray_t* out = ray_list_new(n);
     if (!out || RAY_IS_ERR(out)) return out;
     ray_t** dst = (ray_t**)ray_data(out);
-    int64_t pos = 0, seen = 0;
-    for (int64_t s = 0; s < n_segs; s++) {
-        if (!segs[s]) continue;
-        ray_t** src = (ray_t**)ray_data(segs[s]);
-        for (int64_t i = 0; i < segs[s]->len; i++, seen++) {
-            if (seen < skip) continue;
-            ray_t* e = src[i];
-            if (e) ray_retain(e);
-            dst[pos++] = e;
+    int64_t pos = 0, skipped = 0;
+    for (int64_t s = 0; s < n_segs && pos < n; s++) {
+        int64_t seg_len = parted_seg_rows(segs, s, cnt, ncnt);
+        int64_t seg_start = 0;
+        if (skipped + seg_len <= skip) { skipped += seg_len; continue; }
+        if (skipped < skip) { seg_start = skip - skipped; skipped = skip; }
+        if (!segs[s] || RAY_IS_ERR(segs[s])) {
+            for (int64_t i = seg_start; i < seg_len && pos < n; i++) {
+                ray_retain(RAY_NULL_OBJ);
+                dst[pos++] = RAY_NULL_OBJ;
+            }
+        } else {
+            ray_t** src = (ray_t**)ray_data(segs[s]);
+            for (int64_t i = seg_start; i < seg_len && pos < n; i++) {
+                ray_t* e = src[i];
+                if (e) ray_retain(e);
+                dst[pos++] = e;
+            }
         }
+        skipped += seg_len;
     }
     out->len = pos;
     return out;
+}
+static inline ray_t* parted_tail_list(ray_t** segs, int64_t n_segs, int64_t n) {
+    return parted_tail_list_c(segs, n_segs, n, NULL, 0);
 }
 
 /* Gather rows (global row indices, sorted ascending) from parted RAY_LIST
  * segments — LIST counterpart of parted_gather_str_rows. */
-static inline ray_t* parted_gather_list_rows(ray_t** segs, int64_t n_segs,
-                                             const int64_t* idx,
-                                             int64_t count) {
+static inline ray_t* parted_gather_list_rows_c(ray_t** segs, int64_t n_segs,
+                                               const int64_t* idx, int64_t count,
+                                               const int64_t* cnt, int64_t ncnt) {
     ray_t* out = ray_list_new(count);
     if (!out || RAY_IS_ERR(out)) return out;
     ray_t** dst = (ray_t**)ray_data(out);
     int64_t seg = 0;
     int64_t seg_start = 0;
-    int64_t seg_end = (n_segs > 0 && segs[0]) ? segs[0]->len : 0;
+    int64_t seg_end = n_segs > 0 ? parted_seg_rows(segs, 0, cnt, ncnt) : 0;
     for (int64_t j = 0; j < count; j++) {
         int64_t r = idx[j];
         while (seg < n_segs - 1 && r >= seg_end) {
             seg_start = seg_end;
             seg++;
-            seg_end += segs[seg] ? segs[seg]->len : 0;
+            seg_end += parted_seg_rows(segs, seg, cnt, ncnt);
         }
         ray_t* e = NULL;
         if (segs[seg] && r >= seg_start && r - seg_start < segs[seg]->len)
             e = ((ray_t**)ray_data(segs[seg]))[r - seg_start];
+        else if (!segs[seg] && r >= seg_start && r < seg_end)
+            e = RAY_NULL_OBJ;   /* a missing segment's row */
         if (e) ray_retain(e);
         dst[j] = e;
     }
@@ -589,29 +732,49 @@ static inline ray_t* parted_gather_list_rows(ray_t** segs, int64_t n_segs,
     return out;
 }
 
+static inline ray_t* parted_gather_list_rows(ray_t** segs, int64_t n_segs,
+                                             const int64_t* idx,
+                                             int64_t count) {
+    return parted_gather_list_rows_c(segs, n_segs, idx, count, NULL, 0);
+}
+
 /* Filter parted RAY_LIST segments by a boolean predicate over the column's
- * global rows. */
-static inline ray_t* parted_filter_list(ray_t** segs, int64_t n_segs,
-                                        const uint8_t* pred,
-                                        int64_t pass_count) {
+ * global rows; a NULL segment spans its partition's rows, which pass as
+ * the null object. */
+static inline ray_t* parted_filter_list_c(ray_t** segs, int64_t n_segs,
+                                          const uint8_t* pred, int64_t pass_count,
+                                          const int64_t* cnt, int64_t ncnt) {
     ray_t* out = ray_list_new(pass_count);
     if (!out || RAY_IS_ERR(out)) return out;
     ray_t** dst = (ray_t**)ray_data(out);
     int64_t off = 0, pos = 0;
     for (int64_t s = 0; s < n_segs; s++) {
-        if (!segs[s]) continue;
+        int64_t seg_len = parted_seg_rows(segs, s, cnt, ncnt);
+        if (!segs[s] || RAY_IS_ERR(segs[s])) {
+            for (int64_t i = 0; i < seg_len && pos < pass_count; i++) {
+                if (!pred[off + i]) continue;
+                ray_retain(RAY_NULL_OBJ);
+                dst[pos++] = RAY_NULL_OBJ;
+            }
+            off += seg_len;
+            continue;
+        }
         ray_t** src = (ray_t**)ray_data(segs[s]);
-        for (int64_t i = 0; i < segs[s]->len; i++) {
+        for (int64_t i = 0; i < seg_len; i++) {
             if (!pred[off + i]) continue;
             if (pos >= pass_count) break;
             ray_t* e = src[i];
             if (e) ray_retain(e);
             dst[pos++] = e;
         }
-        off += segs[s]->len;
+        off += seg_len;
     }
     out->len = pos;
     return out;
+}
+static inline ray_t* parted_filter_list(ray_t** segs, int64_t n_segs,
+                                        const uint8_t* pred, int64_t pass_count) {
+    return parted_filter_list_c(segs, n_segs, pred, pass_count, NULL, 0);
 }
 
 /* True for a parted column whose segments are RAY_LIST vectors — such a

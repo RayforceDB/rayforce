@@ -1066,6 +1066,8 @@ typedef struct {
     char*                region;     /* one arena region for the whole batch */
     int64_t              base;       /* position of new string 0 */
     ray_t**              atoms_w;    /* current atom array (fill target) */
+    _Atomic(uint8_t)*    done;       /* [n_tasks] insert task t finished (parallel commit) */
+    int64_t              insert_total;
     /* Set when a probe met an entry it could not compare (no atom, no
      * raw bytes): the misses are then resolved under the lock instead. */
     _Atomic(bool)        unsure;
@@ -1178,6 +1180,24 @@ static void dom_batch_insert_fn(void* raw, uint32_t wid, int64_t k0, int64_t k1)
     }
 }
 
+/* The insert in tasks of DOM_INSERT_GRAIN new strings, each flagged done
+ * when it finishes.  A cancelled pool dispatch skips tasks that have not
+ * started but runs a started one to its end (nothing here polls), so after
+ * the dispatch every task is either whole or untouched, and the caller
+ * completes the untouched ones serially: the commit then always publishes
+ * every string, cancel or not, without a serial pass over all of them. */
+#define DOM_INSERT_GRAIN 4096
+static void dom_batch_insert_task_fn(void* raw, uint32_t wid, int64_t t0, int64_t t1) {
+    dom_batch_ctx_t* b = (dom_batch_ctx_t*)raw;
+    for (int64_t t = t0; t < t1; t++) {
+        int64_t k0 = t * DOM_INSERT_GRAIN;
+        int64_t k1 = k0 + DOM_INSERT_GRAIN;
+        if (k1 > b->insert_total) k1 = b->insert_total;
+        dom_batch_insert_fn(raw, wid, k0, k1);
+        atomic_store_explicit(&b->done[t], 1, memory_order_release);
+    }
+}
+
 /* A repeated miss takes the position its first occurrence received. */
 static void dom_batch_repeat_fn(void* raw, uint32_t wid, int64_t j0, int64_t j1) {
     (void)wid;
@@ -1188,6 +1208,34 @@ static void dom_batch_repeat_fn(void* raw, uint32_t wid, int64_t j0, int64_t j1)
         if (v < -1) b->out_pos[i] = b->out_pos[-(v + 2)];
     }
 }
+
+/* Whether a pool dispatch issued now would skip tasks: the evaluator's
+ * interrupt flag, or the pool's own cancel flag (set together by
+ * ray_request_interrupt; a handler on a worker thread can leave the pool's
+ * set alone for a moment). */
+static inline bool dom_batch_cancelled(ray_pool_t* pool) {
+    if (ray_interrupted()) return true;
+    return pool && atomic_load_explicit(&pool->cancelled, memory_order_relaxed);
+}
+
+#ifdef DEBUG
+static _Atomic(int) g_dom_batch_cancel_phase_for_test = 0;
+
+void ray_sym_domain_batch_cancel_for_test(int phase) {
+    atomic_store_explicit(&g_dom_batch_cancel_phase_for_test, phase,
+                          memory_order_relaxed);
+}
+
+static void dom_batch_cancel_for_test(int phase) {
+    int expected = phase;
+    if (atomic_compare_exchange_strong_explicit(
+            &g_dom_batch_cancel_phase_for_test, &expected, 0,
+            memory_order_relaxed, memory_order_relaxed))
+        ray_request_interrupt();
+}
+#else
+#define dom_batch_cancel_for_test(...) ((void)0)
+#endif
 
 static bool dom_batch_append_serial_locked(ray_sym_domain_t* dom, int64_t n,
                                            const char* const* strs, const size_t* lens,
@@ -1207,6 +1255,7 @@ bool ray_sym_domain_intern_batch(ray_sym_domain_t* dom, int64_t n,
                                  const uint32_t* hashes, int64_t* out_pos) {
     if (!dom || n < 0) return false;
     if (n == 0) return true;
+    if (ray_interrupted()) return false;
     if (dom->kind == DOM_IMPORT) {
         /* The import dictionary keys on all 64 bits of the hash, which a
          * caller of this entry point has dropped: hashed again here
@@ -1257,8 +1306,15 @@ bool ray_sym_domain_intern_batch(ray_sym_domain_t* dom, int64_t n,
 
     ray_pool_t* pool = ray_pool_get();
     bool par = ray_pool_par_dispatch_ok(pool, n, 4096);
+    dom_batch_cancel_for_test(RAY_SYM_DOMAIN_CANCEL_PROBE);
     if (par) ray_pool_dispatch(pool, dom_batch_probe_fn, &b, n);
     else dom_batch_probe_fn(&b, 0, 0, n);
+    if (dom_batch_cancelled(pool)) {
+        dom_lock();
+        dom->batch_inflight--;
+        dom_unlock();
+        return false;
+    }
 
     /* Misses, grouped by hash partition: no more partitions than workers*4
      * or than the batch fills with a few thousand misses each.  Every
@@ -1312,13 +1368,27 @@ bool ray_sym_domain_intern_batch(ray_sym_domain_t* dom, int64_t n,
         b.tab_off[n_part] = tcap;
         b.tab = (int64_t*)ray_sys_alloc((size_t)(tcap > 0 ? tcap : 1) * sizeof(int64_t));
         if (!b.tab) ok = false;
-        else if (par) ray_pool_dispatch_n(pool, dom_batch_dedupe_fn, &b, (uint32_t)n_part);
-        else dom_batch_dedupe_fn(&b, 0, 0, n_part);
+        else {
+            dom_batch_cancel_for_test(RAY_SYM_DOMAIN_CANCEL_DEDUPE);
+            if (par) ray_pool_dispatch_n(pool, dom_batch_dedupe_fn, &b, (uint32_t)n_part);
+            else dom_batch_dedupe_fn(&b, 0, 0, n_part);
+            if (dom_batch_cancelled(pool)) ok = false;
+        }
         ray_profile_tick("dom batch: misses deduped");
     }
 
     dom_lock();
     dom->batch_inflight--;   /* no probe outside the lock past this point */
+    if (dom_batch_cancelled(pool)) {
+        dom_unlock();
+        ray_sys_free(b.miss);
+        ray_sys_free(b.uniq);
+        ray_sys_free(b.part_off);
+        ray_sys_free(b.uniq_n);
+        ray_sys_free(b.tab_off);
+        ray_sys_free(b.tab);
+        return false;
+    }
     bool unchanged = ok && dom->buckets == b.buckets &&
                      atomic_load_explicit(&dom->count, memory_order_relaxed) == b.count &&
                      !atomic_load_explicit(&b.unsure, memory_order_relaxed);
@@ -1397,14 +1467,40 @@ bool ray_sym_domain_intern_batch(ray_sym_domain_t* dom, int64_t n,
             if (ok) {
                 b.base = base;
                 b.atoms_w = atomic_load_explicit(&dom->atoms, memory_order_relaxed);
+                /* The commit is not interruptible: once bucket and atom
+                 * publication starts, a partial insert cannot be rolled
+                 * back.  It still runs in parallel: a cancel arriving now
+                 * makes the dispatch skip tasks, and every skipped task is
+                 * run here afterwards (dom_batch_insert_task_fn), so the
+                 * publication is whole either way.  The repeat pass is
+                 * idempotent and simply re-runs serially after a cancel. */
+                dom_batch_cancel_for_test(RAY_SYM_DOMAIN_CANCEL_INSERT);
                 if (total > 0) {
-                    if (par && ray_pool_par_dispatch_ok(pool, total, 4096))
-                        ray_pool_dispatch(pool, dom_batch_insert_fn, &b, total);
-                    else dom_batch_insert_fn(&b, 0, 0, total);
+                    int64_t n_tasks = (total + DOM_INSERT_GRAIN - 1) / DOM_INSERT_GRAIN;
+                    b.insert_total = total;
+                    void* done_mem = NULL;
+                    if (par && ray_pool_par_dispatch_ok(pool, total, DOM_INSERT_GRAIN) &&
+                        n_tasks <= RAY_POOL_MAX_TASKS)
+                        done_mem = ray_sys_alloc((size_t)n_tasks);
+                    b.done = done_mem;
+                    if (done_mem) {
+                        memset(done_mem, 0, (size_t)n_tasks);
+                        ray_pool_dispatch_n(pool, dom_batch_insert_task_fn, &b, (uint32_t)n_tasks);
+                        for (int64_t t = 0; t < n_tasks; t++)
+                            if (!atomic_load_explicit(&b.done[t], memory_order_acquire))
+                                dom_batch_insert_task_fn(&b, 0, t, t + 1);
+                        ray_sys_free(done_mem);
+                        b.done = NULL;
+                    } else {
+                        dom_batch_insert_fn(&b, 0, 0, total);
+                    }
                 }
-                if (par && ray_pool_par_dispatch_ok(pool, n_miss, 4096))
+                if (par && ray_pool_par_dispatch_ok(pool, n_miss, 4096)) {
                     ray_pool_dispatch(pool, dom_batch_repeat_fn, &b, n_miss);
-                else dom_batch_repeat_fn(&b, 0, 0, n_miss);
+                    if (dom_batch_cancelled(pool)) dom_batch_repeat_fn(&b, 0, 0, n_miss);
+                } else {
+                    dom_batch_repeat_fn(&b, 0, 0, n_miss);
+                }
                 ray_profile_tick("dom batch: inserted");
                 atomic_store_explicit(&dom->count, pos, memory_order_release);
                 /* Same invalidation as dom_append_locked: the runtime LUT
