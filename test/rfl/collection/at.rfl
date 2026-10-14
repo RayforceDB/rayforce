@@ -8,9 +8,9 @@
 (type (at (as 'I64 [10 20 30 40 50]) [0 2 4])) -- 'I64
 (+ 1 (at (as 'I64 [10 20 30 40 50]) [0 2 4])) -- [11 31 51]
 (type (at (as 'F64 [1.5 2.5 3.5]) [2 0])) -- 'F64
-(type (at (as 'I64 [10 20 30]) [0 99])) -- 'LIST
+(type (at (as 'I64 [10 20 30]) [0 99])) -- 'I64
 (nil? (at (at (as 'I64 [10 20 30]) [0 99]) 1)) -- true
-(type (at (as 'I64 [10 20 30]) (as 'I64 [0 0N 2]))) -- 'LIST
+(type (at (as 'I64 [10 20 30]) (as 'I64 [0 0N 2]))) -- 'I64
 
 ;; table row indices return a table, not a boxed list of row dicts
 (type (at (table [a b] (list [1 2 3] [4 5 6])) [0 2])) -- 'TABLE
@@ -54,3 +54,55 @@
 (count (at [10 20 30] (as 'I64 (list)))) -- 0
 ;; dict missing key → 0Nl typed null (line 1667)
 (nil? (at (dict ['a 'b] [1 2]) 'missing)) -- true
+
+;; ─── a vector indexed by an integer vector keeps its type (#819) ─────
+;; A null or out-of-range index gives the type's null in place, as the
+;; scalar `at` gives a typed null atom; it never boxes the whole result.
+(at [5 6 7] (as 'I64 (list 0Nl 1))) -- [0Nl 6]
+(at [5 6 7] [1 9]) -- [6 0Nl]
+(at [5 6 7] [-1 0]) -- [0Nl 5]
+(type (at [5 6 7] (as 'I64 (list 0Nl 1)))) -- 'I64
+(fill 0 (at [5 6 7] (as 'I64 (list 0Nl 1)))) -- [0 6]
+(type (fill 0 (at [5 6 7] (as 'I64 (list 0Nl 1))))) -- 'I64
+
+;; the alignment through find: a missing key no longer changes the type
+(set ks ['a 'b 'c])
+(set vs [1.5 2.5 3.5])
+(at vs (find ks ['c 'z 'a])) -- [3.5 0Nf 1.5]
+(type (at vs (find ks ['c 'z 'a]))) -- 'F64
+(> (at vs (find ks ['c 'z 'a])) 2.0) -- [true false false]
+
+;; every nullable type keeps its type and gets its own null
+(at (as 'I32 [5 6]) [1 -1]) -- (as 'I32 (list 6 0Ni))
+(type (at (as 'I32 [5 6]) [1 -1])) -- 'I32
+(type (at (as 'I16 [5 6]) [1 9])) -- 'I16
+(type (at [1.5 2.5] [0 5])) -- 'F64
+(nil? (at (at [1.5 2.5] [0 5]) 1)) -- true
+(type (at [2024.01.01 2024.01.02] [1 7])) -- 'DATE
+(nil? (at (at [2024.01.01 2024.01.02] [1 7]) 1)) -- true
+(type (at ['a 'b] [0 5])) -- 'SYM
+(at ['a 'b] [1 5]) -- ['b ']
+(type (at (as 'STR (list "x" "y")) [0 5])) -- 'STR
+(at (at (as 'STR (list "x" "y")) [0 5]) 1) -- ""
+
+;; BOOL and U8 have no null: a missing position is false / 0x00
+(at [true false] [0 5]) -- [true false]
+(type (at [true false] [0 5])) -- 'B8
+(type (at (as 'U8 [1 2]) [0 5])) -- 'U8
+
+;; an empty source gives all nulls, of its type
+(at (as 'I64 []) (as 'I64 (list 0Nl))) -- [0Nl]
+(type (at (as 'I64 []) [0 1])) -- 'I64
+(count (at (as 'I64 []) [0 1])) -- 2
+(type (at (as 'SYM []) [0 1])) -- 'SYM
+
+;; index vectors of the narrower integer types gather typed too
+(at [5 6 7] (as 'I32 [2 0])) -- [7 5]
+(type (at [5 6 7] (as 'I32 [2 0]))) -- 'I64
+(type (at [5 6 7] (as 'I16 [2 0]))) -- 'I64
+(type (at [5 6 7] (as 'U8 [2 0]))) -- 'I64
+(at [5 6 7] (as 'I32 (list 0Ni 1))) -- [0Nl 6]
+
+;; a nested index keeps its shape, each part typed
+(at [5 6 7] (list [0 1] [2 9])) -- (list [5 6] [7 0Nl])
+(type (at (at [5 6 7] (list [0 1] [2 9])) 1)) -- 'I64
