@@ -183,6 +183,12 @@ int64_t ray_group_null_fill_bytes(void) {
     return atomic_load_explicit(&ray_group_null_fill_bytes_ctr, memory_order_relaxed);
 }
 
+/* Rows of staged keys the direct-array prescan walked (minmax_piece). */
+static _Atomic(int64_t) ray_group_minmax_staged_rows_ctr = 0;
+int64_t ray_group_test_minmax_staged_rows(void) {
+    return atomic_load_explicit(&ray_group_minmax_staged_rows_ctr, memory_order_relaxed);
+}
+
 /* ============================================================================
  * Reduction execution
  * ============================================================================ */
@@ -8187,11 +8193,22 @@ minmax_done:
 /* One piece of a staged key: the body over [b, e) with the piece's base
  * and SYM width. */
 static void minmax_piece(void* ctx, uint32_t wid, int64_t b, int64_t e, const ray_col_piece_t* p) {
-    minmax_ctx_t local = *(minmax_ctx_t*)ctx;
+    minmax_ctx_t* c = (minmax_ctx_t*)ctx;
+    if (atomic_load_explicit(c->abort_flag, memory_order_relaxed)) return;
+    minmax_ctx_t local = *c;
     local.key_data = p[0].data;
     local.key_attrs = p[0].attrs;
     local.row_base = b;
     minmax_scan_body(&local, wid, b, e);
+    atomic_fetch_add_explicit(&ray_group_minmax_staged_rows_ctr, e - b, memory_order_relaxed);
+    /* A piece is at most one vector, and the body's batched span check
+     * runs on the piece's own bounds, which start empty: it never fires
+     * inside a piece.  The worker's bounds so far (the body merged them)
+     * decide instead, as the plain scan's check does over the same rows. */
+    const uint32_t w = wid % c->n_workers;
+    const int64_t mn = c->per_worker_min[w], mx = c->per_worker_max[w];
+    if (mx >= mn && (uint64_t)mx - (uint64_t)mn > (uint64_t)c->span_budget)
+        atomic_store_explicit(c->abort_flag, 1, memory_order_relaxed);
 }
 
 static void minmax_scan_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
@@ -8211,6 +8228,11 @@ static void minmax_scan_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t
             while (q * RAY_ENC_CHUNK < end && c->scan_chunk[q]) q++;
             if (q * RAY_ENC_CHUNK < hi) hi = q * RAY_ENC_CHUNK;
         }
+        /* eight vectors at a time, so an abort (minmax_piece) stops the
+         * walk, and its decodes, within eight vectors of the worker */
+        const int64_t step = (int64_t)RAY_ENC_VEC * 8;
+        const int64_t ce = (lo / step + 1) * step;
+        if (ce < hi) hi = ce;
         if (atomic_load_explicit(c->abort_flag, memory_order_relaxed)) break;
         err = group_sel_walk(srcs, plain, 1, c->match_idx ? NULL : c->rowsel,
                              lo, hi, c, worker_id, minmax_piece);

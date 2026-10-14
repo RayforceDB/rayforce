@@ -1385,6 +1385,9 @@ int64_t ray_group_segstream_runs(void);
  * partitions' stand-ins (bounded per query by the group's transient
  * budget, AGG_COMPACT_BITMAP_BUDGET).  Tests. */
 int64_t ray_group_null_fill_bytes(void);
+/* Monotonic count of rows the direct-array key prescan walked over a
+ * staged (generation-2) key by range (minmax_piece).  Tests. */
+int64_t ray_group_test_minmax_staged_rows(void);
 /* Monotonic count of per-partition unordered takes answered from the
  * first keys read up front (grp_first_keys_scan).  Tests. */
 int64_t ray_group_firstkeys_runs(void);

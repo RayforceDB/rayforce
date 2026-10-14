@@ -3464,6 +3464,26 @@ static test_result_t test_leaf_emit_runs(void) {
     PASS();
 }
 
+/* The direct-array prescan of a staged key that cannot fit (ClickBench
+ * q29: by a wide SYM key beside avg (strlen key), the group.c route) stops
+ * as the plain scan does, once a worker's bounds exceed the slot budget:
+ * 900000 rows, the first 300000 interning 300000 symbols in row order
+ * (unselected), the selected 600000 spreading their ids over all of them
+ * in every vector.  The walk reads eight vectors at a time and checks the
+ * worker's bounds after each piece, so it stops within a few vectors per
+ * worker, not after every selected row.  The answer is generation 0's. */
+static test_result_t test_da_prescan_abort_staged(void) {
+    aw_save("dp", "(table [s f] (list (at (as 'SYMBOL (map (fn [x] (format \"r%\" x)) (til 300000))) "
+                  "(raze (list (til 300000) (% (* (til 600000) 7919) 300000)))) (til 900000)))", -1);
+    const char* q = "(select {n: (count l) t: (sum l) m: (max c) from: (select {l: (avg (strlen s)) c: (count s) "
+                    "from: T where: (>= f 300000) by: s})})";
+    int64_t r0 = ray_group_test_minmax_staged_rows();
+    AW_SAME("dp", q, 0);
+    int64_t dr = ray_group_test_minmax_staged_rows() - r0;
+    TEST_ASSERT_FMT(dr > 0 && dr <= 150000, "staged prescan rows %lld", (long long)dr);
+    PASS();
+}
+
 /* The first-n passes under a selection (the language compacts a where:
  * before an unordered take, so a C caller installs the rowsel): every
  * third row dropped (MIX segments), keys on runs (agg_firstn_runs) and,
@@ -5427,6 +5447,7 @@ const test_entry_t aware_entries[] = {
     { "aware/sym_key_chunk_extremes", test_sym_key_chunk_extremes, aw_setup, aw_teardown },
     { "aware/sym_key_points", test_sym_key_points, aw_setup, aw_teardown },
     { "aware/leaf_emit_runs", test_leaf_emit_runs, aw_setup, aw_teardown },
+    { "aware/da_prescan_abort_staged", test_da_prescan_abort_staged, aw_setup, aw_teardown },
     { "aware/refine_on_views",    test_refine_on_views,    aw_setup, aw_teardown },
     { "aware/eq_on_runs",         test_eq_runs_lack,       aw_setup, aw_teardown },
     { "aware/gather_rows_parallel", test_gather_rows_parallel, aw_setup, aw_teardown },
