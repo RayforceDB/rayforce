@@ -46,3 +46,71 @@
 ;; the C level in test_store.c (store/serde_builtin_name_roundtrip).
 ((de (ser .db.parted.tables)) 123)    !- type
 ((de (ser .sys.querylog.enable)) 1 2) !- domain
+
+;; ────────────── a parted table ──────────────
+;; ser writes a parted table (.db.parted.get) as the flat table it stands
+;; for, streamed from the partition segments without a flat copy: each
+;; column byte-identical to the flattened column, the date key repeated on
+;; every row of its partition, and de reads back a plain table.  It failed
+;; with a misleading `domain: zero serialized size`.
+(.sys.exec "rm -rf /tmp/rfl_serde_parted")
+(set Gser (guid 7))
+(set mkser (fn [lo n] (table [i j h f b s t g ts l] (list (+ lo (til n)) (as 'I32 (+ lo (til n))) (as 'I16 (+ lo (til n))) (as 'F64 (+ lo (til n))) (as 'B8 (% (+ lo (til n)) 2)) (take (drop ['x 'y 'zz 'x 'q 'r 'x] lo) n) (as 'STR (map (fn [x] (as 'STR x)) (+ lo (til n)))) (take (drop Gser lo) n) (as 'TIMESTAMP (+ lo (til n))) (map (fn [x] (list x (as 'STR x))) (+ lo (til n)))))))
+(set Aser (mkser 0 3))
+(set Bser (mkser 3 2))
+(set Cser (mkser 5 2))
+(.db.splayed.set "/tmp/rfl_serde_parted/f/2024.01.01/t/" Aser)
+(.db.splayed.set "/tmp/rfl_serde_parted/f/2024.01.02/t/" Bser)
+(.db.splayed.set "/tmp/rfl_serde_parted/f/2024.01.03/t/" Cser)
+(set Pser (.db.parted.get "/tmp/rfl_serde_parted/f/" 't))
+(set Dser [2024.01.01 2024.01.01 2024.01.01 2024.01.02 2024.01.02 2024.01.03 2024.01.03])
+(set catser (fn [c] (concat (concat (at Aser c) (at Bser c)) (at Cser c))))
+(set Fser (table [date i j h f b s t g ts l] (list Dser (catser 'i) (catser 'j) (catser 'h) (catser 'f) (catser 'b) (catser 's) (catser 't) (catser 'g) (catser 'ts) (catser 'l))))
+(ser Pser) -- (ser Fser)
+(ser Pser) -- (ser (select {from: Pser where: (>= i 0)}))
+(de (ser Pser)) -- Fser
+(count (de (ser Pser))) -- 7
+(ser (list Pser 1)) -- (ser (list Fser 1))
+(ser (dict [k] (list Pser))) -- (ser (dict [k] (list Fser)))
+(de (ser (list 1 (dict [k] (list Pser))))) -- (list 1 (dict [k] (list Fser)))
+;; a ragged table: the 2024.01.02 partition has no columns h..l, so their
+;; segments are NULL; its rows go out as typed nulls (B8, which has none,
+;; as false), exactly as the same flat table with nulls
+(.db.splayed.set "/tmp/rfl_serde_parted/r/2024.01.01/t/" Aser)
+(.db.splayed.set "/tmp/rfl_serde_parted/r/2024.01.02/t/" (table [i j] (list (at Bser 'i) (at Bser 'j))))
+(.db.splayed.set "/tmp/rfl_serde_parted/r/2024.01.03/t/" Cser)
+(set Rser (.db.parted.get "/tmp/rfl_serde_parted/r/" 't))
+(set nulser (fn [c n] (concat (concat (at Aser c) n) (at Cser c))))
+(set Gnul (at (left-join [k] (table [k] (list [0 0])) (table [k g] (list [1] (take Gser 1)))) 'g))
+(set Nser (table [date i j h f b s t g ts l] (list Dser (catser 'i) (catser 'j) (nulser 'h (as 'I16 [0N 0N])) (nulser 'f (take 0Nf 2)) (nulser 'b [false false]) (nulser 's (as 'SYM (list "" ""))) (nulser 't (as 'STR (list "" ""))) (nulser 'g Gnul) (nulser 'ts (as 'TIMESTAMP [0N 0N])) (nulser 'l (list null null)))))
+(ser Rser) -- (ser Nser)
+(de (ser Rser)) -- Nser
+(at (de (ser Rser)) 'f) -- [0.0 1.0 2.0 0Nf 0Nf 5.0 6.0]
+(ser (list Rser 1)) -- (ser (list Nser 1))
+;; and it prints as that flat table: typed nulls in the partition's rows
+;; (format "%" printed the column flattened by `at`, short of those rows)
+(format "%" Rser) -- (format "%" Nser)
+(format "%" Pser) -- (format "%" Fser)
+;; a present segment holding nulls (no NULL segment): the flat column
+;; carries HAS_NULLS (the OR over the segments), so the bytes match the
+;; flat copy and the nulls read back as nulls
+(.db.splayed.set "/tmp/rfl_serde_parted/n/2024.01.01/t/" (table [i f s] (list [1 2] [1.5 2.5] ['x 'y])))
+(.db.splayed.set "/tmp/rfl_serde_parted/n/2024.01.02/t/" (table [i f s] (list [3 0N 5] [0Nf 4.5 5.5] ['z ' 'x])))
+(.db.splayed.set "/tmp/rfl_serde_parted/n/2024.01.03/t/" (table [i f s] (list [6 7] [6.5 7.5] ['y 'z])))
+(set NPser (.db.parted.get "/tmp/rfl_serde_parted/n/" 't))
+(set NFser (table [date i f s] (list [2024.01.01 2024.01.01 2024.01.02 2024.01.02 2024.01.02 2024.01.03 2024.01.03] [1 2 3 0N 5 6 7] [1.5 2.5 0Nf 4.5 5.5 6.5 7.5] ['x 'y 'z ' 'x 'y 'z])))
+(ser NPser) -- (ser NFser)
+(de (ser NPser)) -- NFser
+(nil? (at (de (ser NPser)) 'i)) -- [false false false true false false false]
+(nil? (at (de (ser NPser)) 'f)) -- [false false true false false false false]
+(nil? (at (de (ser NPser)) 's)) -- [false false false true false false false]
+;; SYM segments of different index widths (W8, then W16 past 256 symbols)
+;; and an integer partition key
+(.db.splayed.set "/tmp/rfl_serde_parted/w/0/t/" (table [a s] (list [1 2 3] ['x 'y 'x])))
+(.db.splayed.set "/tmp/rfl_serde_parted/w/1/t/" (table [a s] (list (til 400) (as 'SYM (map (fn [x] (as 'STR (+ 1000 x))) (til 400))))))
+(.db.splayed.set "/tmp/rfl_serde_parted/w/2/t/" (table [a s] (list [7 8] ['y 'x])))
+(set Wser (.db.parted.get "/tmp/rfl_serde_parted/w/" 't))
+(ser Wser) -- (ser (select {from: Wser where: (>= a 0)}))
+(at (at (de (ser Wser)) 's) [0 3 402 403 404]) -- ['x '1000 '1399 'y 'x]
+(at (at (de (ser Wser)) 'part) [0 3 403]) -- [0 1 2]
+(.sys.exec "rm -rf /tmp/rfl_serde_parted") -- 0

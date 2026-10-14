@@ -1757,6 +1757,151 @@ static test_result_t test_fmt_times_binding(void) {
     PASS();
 }
 
+/* ---- Test: a parted table formats as its rows ----
+ * A parted column is an array of per-partition segments and the partition
+ * key column (date) a key per partition: the formatter read them as plain
+ * vectors, so every type printed as `?` and the cells as the segment count.
+ * Every mode, and show's stream, now writes what the flat table does:
+ * 30 rows over 3 partitions, so the REPL display reads its tail rows from
+ * the last partition. */
+static size_t fmt_write_to_buf(ray_t* obj, char* buf, size_t cap) {
+    FILE* fp = tmpfile();
+    if (!fp) return 0;
+    ray_err_t e = ray_fmt_write(fp, obj);
+    size_t n = 0;
+    if (e == RAY_OK) {
+        rewind(fp);
+        n = fread(buf, 1, cap - 1, fp);
+    }
+    buf[n] = '\0';
+    fclose(fp);
+    return n;
+}
+
+static test_result_t test_fmt_table_parted(void) {
+    ray_t* r = ray_eval_str(
+        "(do (.sys.exec \"rm -rf /tmp/rfl_fmt_parted\")"
+        " (set T (table [i s t] (list (til 10) (take ['a 'b 'c] 10) (as 'STR (til 10)))))"
+        " (.db.splayed.set \"/tmp/rfl_fmt_parted/2024.01.01/t/\" T)"
+        " (.db.splayed.set \"/tmp/rfl_fmt_parted/2024.01.02/t/\" (update {i: (+ i 10) from: T}))"
+        " (.db.splayed.set \"/tmp/rfl_fmt_parted/2024.01.03/t/\" (update {i: (+ i 20) from: T}))"
+        " 0)");
+    TEST_ASSERT_FALSE(!r || RAY_IS_ERR(r));
+    ray_release(r);
+    ray_t* parted = ray_eval_str("(.db.parted.get \"/tmp/rfl_fmt_parted/\" 't)");
+    TEST_ASSERT_FALSE(!parted || RAY_IS_ERR(parted));
+    ray_t* flat = ray_eval_str(
+        "(select {from: (.db.parted.get \"/tmp/rfl_fmt_parted/\" 't) where: (>= i 0)})");
+    TEST_ASSERT_FALSE(!flat || RAY_IS_ERR(flat));
+
+    for (int mode = 0; mode <= 2; mode++) {
+        ray_t* fp = ray_fmt(parted, mode);
+        ray_t* ff = ray_fmt(flat, mode);
+        TEST_ASSERT_FALSE(!fp || RAY_IS_ERR(fp));
+        TEST_ASSERT_FALSE(!ff || RAY_IS_ERR(ff));
+        TEST_ASSERT_STR_EQ(ray_str_ptr(fp), ray_str_ptr(ff));
+        if (mode == 1) {
+            const char* s = ray_str_ptr(fp);
+            TEST_ASSERT_NOT_NULL(strstr(s, "DATE"));
+            TEST_ASSERT_NOT_NULL(strstr(s, "SYM"));
+            TEST_ASSERT_NOT_NULL(strstr(s, "STR"));
+            TEST_ASSERT_NOT_NULL(strstr(s, "2024.01.03"));
+            TEST_ASSERT_NOT_NULL(strstr(s, "30 rows (20 shown)"));
+        }
+        ray_release(fp);
+        ray_release(ff);
+    }
+
+    char bp[16384], bf[16384];
+    size_t np = fmt_write_to_buf(parted, bp, sizeof(bp));
+    size_t nf = fmt_write_to_buf(flat, bf, sizeof(bf));
+    TEST_ASSERT_TRUE(nf > 0);
+    TEST_ASSERT_EQ_I((int64_t)np, (int64_t)nf);
+    TEST_ASSERT_TRUE(strcmp(bp, bf) == 0);
+
+    ray_release(flat);
+    ray_release(parted);
+    r = ray_eval_str("(.sys.exec \"rm -rf /tmp/rfl_fmt_parted\")");
+    if (r) ray_release(r);
+    PASS();
+}
+
+/* ---- Test: a ragged parted table formats as the flat table with nulls ----
+ * The 2024.01.02 partition has no columns b..l, so their segments for it
+ * are NULL.  The REPL display walked the segments by their own lengths,
+ * skipping it: the 2024.01.03 cells moved up into the 2024.01.02 rows and
+ * NA landed at the end; format "%" and show flattened every column with
+ * `at`, which drops the partition, so b printed 5 values for 7 rows.  Every
+ * mode, and show's stream, now writes byte for byte what the same flat
+ * table with typed nulls in those rows writes.  The 30-row table makes the
+ * REPL display hide rows, its head and tail both crossing the partition. */
+static test_result_t fmt_ragged_case(int64_t mid) {
+    char src[2048];
+    snprintf(src, sizeof(src),
+        "(do (.sys.exec \"rm -rf /tmp/rfl_fmt_ragged\")"
+        " (set RA (table [a b s t f l] (list [1 2 3] [30 20 10] ['x 'y 'x]"
+        "   (as 'STR (list \"p\" \"q\" \"r\")) [1.5 2.5 3.5] (list (list 1 \"a\") (list 2 \"b\") (list 3 \"c\")))))"
+        " (set RC (table [a b s t f l] (list [6 7] [70 60] ['zz 'x]"
+        "   (as 'STR (list \"u\" \"v\")) [6.5 7.5] (list (list 6 \"f\") (list 7 \"g\")))))"
+        " (set RM (+ 4 (til %lld)))"
+        " (.db.splayed.set \"/tmp/rfl_fmt_ragged/2024.01.01/t/\" RA)"
+        " (.db.splayed.set \"/tmp/rfl_fmt_ragged/2024.01.02/t/\" (table [a] (list RM)))"
+        " (.db.splayed.set \"/tmp/rfl_fmt_ragged/2024.01.03/t/\" RC)"
+        " 0)", (long long)mid);
+    ray_t* r = ray_eval_str(src);
+    TEST_ASSERT_FALSE(!r || RAY_IS_ERR(r));
+    ray_release(r);
+    ray_t* parted = ray_eval_str("(.db.parted.get \"/tmp/rfl_fmt_ragged/\" 't)");
+    TEST_ASSERT_FALSE(!parted || RAY_IS_ERR(parted));
+    snprintf(src, sizeof(src),
+        "(do (set n %lld)"
+        " (set nul (fn [c v] (concat (concat (at RA c) v) (at RC c))))"
+        " (table [date a b s t f l] (list"
+        "   (concat (concat (take 2024.01.01 3) (take 2024.01.02 n)) (take 2024.01.03 2))"
+        "   (concat (concat (at RA 'a) RM) (at RC 'a))"
+        "   (nul 'b (take 0Nl n))"
+        "   (nul 's (as 'SYM (map (fn [x] \"\") (til n))))"
+        "   (nul 't (as 'STR (map (fn [x] \"\") (til n))))"
+        "   (nul 'f (take 0Nf n))"
+        "   (nul 'l (map (fn [x] null) (til n))))))", (long long)mid);
+    ray_t* flat = ray_eval_str(src);
+    TEST_ASSERT_FALSE(!flat || RAY_IS_ERR(flat));
+
+    for (int mode = 0; mode <= 2; mode++) {
+        ray_t* fp = ray_fmt(parted, mode);
+        ray_t* ff = ray_fmt(flat, mode);
+        TEST_ASSERT_FALSE(!fp || RAY_IS_ERR(fp));
+        TEST_ASSERT_FALSE(!ff || RAY_IS_ERR(ff));
+        TEST_ASSERT_STR_EQ(ray_str_ptr(fp), ray_str_ptr(ff));
+        if (mode == 1) {
+            const char* out = ray_str_ptr(fp);
+            TEST_ASSERT_NOT_NULL(strstr(out, "0Nl"));
+            TEST_ASSERT_NOT_NULL(strstr(out, "0Nf"));
+            TEST_ASSERT_NULL(strstr(out, "NA"));
+        }
+        ray_release(fp);
+        ray_release(ff);
+    }
+    char bp[16384], bf[16384];
+    size_t np = fmt_write_to_buf(parted, bp, sizeof(bp));
+    size_t nf = fmt_write_to_buf(flat, bf, sizeof(bf));
+    TEST_ASSERT_TRUE(nf > 0);
+    TEST_ASSERT_EQ_I((int64_t)np, (int64_t)nf);
+    TEST_ASSERT_TRUE(strcmp(bp, bf) == 0);
+
+    ray_release(flat);
+    ray_release(parted);
+    r = ray_eval_str("(.sys.exec \"rm -rf /tmp/rfl_fmt_ragged\")");
+    if (r) ray_release(r);
+    PASS();
+}
+
+static test_result_t test_fmt_table_parted_ragged(void) {
+    test_result_t res = fmt_ragged_case(2);
+    if (res.status != TEST_PASS) return res;
+    return fmt_ragged_case(25);
+}
+
 /* ---- Suite definition ---- */
 
 const test_entry_t format_entries[] = {
@@ -1867,5 +2012,7 @@ const test_entry_t format_entries[] = {
     { "format/table/na_head", test_fmt_table_na_head, fmt_setup, fmt_teardown },
     { "format/table/utf8_width", test_fmt_table_utf8_width, fmt_setup, fmt_teardown },
     { "format/times_binding", test_fmt_times_binding, fmt_setup_full, fmt_teardown_full },
+    { "format/table/parted", test_fmt_table_parted, fmt_setup_full, fmt_teardown_full },
+    { "format/table/parted_ragged", test_fmt_table_parted_ragged, fmt_setup_full, fmt_teardown_full },
     { NULL, NULL, NULL, NULL },
 };
