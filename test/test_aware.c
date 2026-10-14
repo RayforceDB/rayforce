@@ -3383,6 +3383,87 @@ static test_result_t test_sparse_walk_points(void) {
     PASS();
 }
 
+/* A SYM group key read like ClickBench q13 (P3 Task 14b).  Its rows are
+ * 600000 (ten chunks): the selected third (f == 0) holds 100 bulk symbols
+ * and, once each, the symbol interned first (row 0) and the last selected
+ * row's symbol, interned after 400000 unselected ones.  The exact id range
+ * of the selected rows exceeds their count, so the dense plan is
+ * impossible; 64 evenly spaced selected rows span only the bulk (and row
+ * 0), so the row probe alone is undecided, and the chunks holding the
+ * directory's lowest minimum and highest maximum (two of ten) decide it:
+ * no bounds scan of every selected row.  The answer (a tied top 5: emit
+ * order) is generation 0's; nothing is materialized. */
+static test_result_t test_sym_key_chunk_extremes(void) {
+    aw_save("pq", "(table [s f] (list (as 'SYMBOL (map (fn [j] (if (== j 0) \"plo\" (if (== j 599997) \"phi\" "
+                  "(if (== 0 (% j 3)) (format \"b%\" (% j 100)) (format \"u%\" j))))) (til 600000))) "
+                  "(as 'I32 (% (til 600000) 3))))", -1);
+    const char* q = "(select {c: (count s) from: T where: (== f 0) by: s desc: c take: 5})";
+    uint64_t p0 = ray_agg_test_sel_probe_hits();
+    AW_SAME("pq", q, 0);
+    TEST_ASSERT_FMT(ray_agg_test_sel_probe_hits() == p0 + 1, "probe hits %llu", (unsigned long long)(ray_agg_test_sel_probe_hits() - p0));
+    /* without the two extremes selected (f == 1: u symbols only, ids
+     * within the selected count of each other) the plan is not proved
+     * impossible, and the answer still agrees */
+    p0 = ray_agg_test_sel_probe_hits();
+    AW_SAME("pq", "(select {c: (count s) from: T where: (and (== f 0) (!= s 'plo) (!= s 'phi)) by: s desc: c take: 5})", 0);
+    TEST_ASSERT_EQ_U(ray_agg_test_sel_probe_hits(), p0);
+    PASS();
+}
+
+/* SYM keys read by point reads (agg_src_points: ids through
+ * ray_col_src_gather_points) in the selection walk, the table-stack
+ * samplers and the dense plan's probe: every 20th of 1.5M rows (51 per
+ * vector, under the RLE limit), a SYM key on runs of 7 and an I32 one.
+ * The SYM key decodes no vector; the answers are generation 0's. */
+static test_result_t test_sym_key_points(void) {
+    aw_save("sp", "(table [k b v] (list (at (as 'SYMBOL (map (fn [x] (format \"k%\" x)) (til 1000))) "
+                  "(% (div (til 1500000) 7) 1000)) (as 'I32 (% (div (til 1500000) 50000) 7)) (til 1500000)))", -1);
+    for (int64_t v = 0; v < 1400; v += 197)
+        TEST_ASSERT_FMT(aw_vec_enc("sp", "k", v) == RAY_ENC_RLE, "k vector %lld: %d", (long long)v, aw_vec_enc("sp", "k", v));
+    static const char* const qs[] = {
+        "(select {n: (count k) from: T where: (== 0 (% v 20)) by: {k: k b: b} desc: n take: 10})",
+        "(select {n: (count k) s: (sum v) from: T where: (== 0 (% v 20)) by: k})",
+        NULL,
+    };
+    for (int i = 0; qs[i]; i++) {
+        AW_SAME("sp", qs[i], 0);
+        TEST_ASSERT_FMT(aw_col_decoded("k") == 0, "%s: k decoded %llu", qs[i], (unsigned long long)aw_col_decoded("k"));
+    }
+    PASS();
+}
+
+/* A selection whose program is one encoded leaf is emitted from the
+ * vector's view (expr_leaf_emit): an RLE vector from its runs, a CONST
+ * one as a uniform segment, any other through the evaluator's bools.
+ * The selection is byte-for-byte generation 0's under every operator,
+ * for an I32 column on runs of 3 and a SYM one alternating "" runs with
+ * symbols (both forced RLE); a nullable RLE column (a bitmap) keeps the
+ * bools. */
+static ray_op_t* ap_x_lt500(ray_graph_t* g) { return ray_lt(g, ray_scan(g, "x"), ray_const_i64(g, 500)); }
+static test_result_t test_leaf_emit_runs(void) {
+    aw_save("lr", "(table [x s] (list (as 'I32 (div (% (til 300000) 3000) 3)) "
+                  "(as 'SYMBOL (map (fn [j] (if (< (% j 10) 6) \"\" (format \"w%\" (% (div j 10) 50)))) (til 300000)))))", RAY_ENC_RLE);
+    TEST_ASSERT_EQ_I(aw_vec_enc("lr", "x", 5), RAY_ENC_RLE);
+    TEST_ASSERT_EQ_I(aw_vec_enc("lr", "s", 5), RAY_ENC_RLE);
+    ray_op_t* (*const ps[])(ray_graph_t*) = { ap_x_eq7, ap_x_gt10, ap_x_lt500, ap_s_ne_empty, ap_s_eq_empty, ap_s_eq, NULL };
+    for (int i = 0; ps[i]; i++) {
+        int64_t r0 = ray_expr_test_leaf_runs();
+        test_result_t r = aw_sel_same("lr", ps[i], -1);
+        if (r.status != TEST_PASS) return r;
+        TEST_ASSERT_FMT(ray_expr_test_leaf_runs() > r0, "predicate %d: no segment from runs", i);
+    }
+    aw_save("ln", "(table [x] (list (as 'I32 (map (fn [j] (if (== 0 (% j 50)) 0N (div (% j 3000) 3))) (til 300000)))))", RAY_ENC_RLE);
+    TEST_ASSERT_EQ_I(aw_vec_enc("ln", "x", 5), RAY_ENC_RLE);
+    ray_op_t* (*const pn[])(ray_graph_t*) = { ap_x_eq7, ap_x_gt10, ap_x_lt500, NULL };
+    for (int i = 0; pn[i]; i++) {
+        int64_t r0 = ray_expr_test_leaf_runs();
+        test_result_t r = aw_sel_same("ln", pn[i], -1);
+        if (r.status != TEST_PASS) return r;
+        TEST_ASSERT_EQ_I(ray_expr_test_leaf_runs(), r0);     /* a bitmap: the bools */
+    }
+    PASS();
+}
+
 /* The first-n passes under a selection (the language compacts a where:
  * before an unordered take, so a C caller installs the rowsel): every
  * third row dropped (MIX segments), keys on runs (agg_firstn_runs) and,
@@ -5343,6 +5424,9 @@ const test_entry_t aware_entries[] = {
     { "aware/firstn_runs",        test_firstn_runs,        aw_setup, aw_teardown },
     { "aware/firstn_sel",         test_firstn_sel,         aw_setup, aw_teardown },
     { "aware/sparse_walk_points", test_sparse_walk_points, aw_setup, aw_teardown },
+    { "aware/sym_key_chunk_extremes", test_sym_key_chunk_extremes, aw_setup, aw_teardown },
+    { "aware/sym_key_points", test_sym_key_points, aw_setup, aw_teardown },
+    { "aware/leaf_emit_runs", test_leaf_emit_runs, aw_setup, aw_teardown },
     { "aware/refine_on_views",    test_refine_on_views,    aw_setup, aw_teardown },
     { "aware/eq_on_runs",         test_eq_runs_lack,       aw_setup, aw_teardown },
     { "aware/gather_rows_parallel", test_gather_rows_parallel, aw_setup, aw_teardown },

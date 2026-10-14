@@ -47,6 +47,12 @@
  * the view has no evaluator (RAW, DELTA_BP, a float type): decode. */
 bool ray_enc_eval_cmp(const ray_enc_vview_t* v, uint16_t op, int64_t c,
                       uint8_t null_result, uint8_t* bits);
+/* (x op c) of each run of an RLE view without bitmap nulls into
+ * pass[0..n_runs): the run-level answer ray_enc_eval_cmp expands into
+ * bits, for a consumer that takes runs (a selection emitted from the
+ * runs).  False for any other view, a bitmap, or an operator
+ * ray_enc_eval_cmp declines. */
+bool ray_enc_eval_cmp_runs(const ray_enc_vview_t* v, uint16_t op, int64_t c, uint8_t* pass);
 /* (x in set): set holds nset logical values, sorted ascending, distinct. */
 bool ray_enc_eval_in(const ray_enc_vview_t* v, const int64_t* set, int nset,
                      uint8_t null_result, uint8_t* bits);

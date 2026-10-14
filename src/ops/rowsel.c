@@ -313,6 +313,50 @@ void rowsel_emit_segment(rowsel_builder_t* b, uint32_t seg,
     b->seg_off[seg + 1] = b->idx_len;
 }
 
+void rowsel_emit_uniform(rowsel_builder_t* b, uint32_t seg, uint8_t d, int64_t n) {
+    assert(seg < b->n_segs && "rowsel_emit_uniform: seg is not builder-local");
+    b->seg_off[seg] = b->idx_len;
+    /* rowsel_emit_segment's classification of n equal bools */
+    if (d && n > 0) { b->seg_flags[seg] = RAY_SEL_ALL; b->total_pass += n; }
+    else b->seg_flags[seg] = RAY_SEL_NONE;
+    b->seg_off[seg + 1] = b->idx_len;
+}
+
+void rowsel_emit_runs(rowsel_builder_t* b, uint32_t seg, const uint16_t* ends,
+                      const uint8_t* pass, uint32_t n_runs, int64_t n) {
+    assert(seg < b->n_segs && "rowsel_emit_runs: seg is not builder-local");
+    b->seg_off[seg] = b->idx_len;
+    uint32_t pc = 0, s0 = 0;
+    for (uint32_t r = 0; r < n_runs; r++) {
+        pc += pass[r] ? (uint32_t)ends[r] - s0 : 0;
+        s0 = ends[r];
+    }
+    b->total_pass += pc;
+    /* rowsel_emit_segment's NONE / ALL / MIX classification */
+    if (pc == 0) {
+        b->seg_flags[seg] = RAY_SEL_NONE;
+    } else if ((int64_t)pc == n) {
+        b->seg_flags[seg] = RAY_SEL_ALL;
+    } else {
+        b->seg_flags[seg] = RAY_SEL_MIX;
+        if (b->idx_len + pc > b->idx_cap) {
+            uint32_t newcap = b->idx_cap ? b->idx_cap : 8u;
+            while (newcap < b->idx_len + pc) newcap *= 2u;
+            b->idx = (uint16_t*)ray_realloc_raw(b->idx, (size_t)newcap * sizeof(uint16_t));
+            b->idx_cap = newcap;
+        }
+        uint16_t* out = b->idx + b->idx_len;
+        s0 = 0;
+        for (uint32_t r = 0; r < n_runs; r++) {
+            const uint32_t e = ends[r];
+            if (pass[r]) for (uint32_t i = s0; i < e; i++) *out++ = (uint16_t)i;
+            s0 = e;
+        }
+        b->idx_len += pc;
+    }
+    b->seg_off[seg + 1] = b->idx_len;
+}
+
 ray_t* rowsel_builder_finish(rowsel_builder_t* builders, uint32_t n_workers,
                              int64_t nrows) {
     int64_t total_pass = 0;

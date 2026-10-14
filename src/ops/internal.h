@@ -1174,6 +1174,9 @@ void ray_expr_test_parted_all_segments(bool on);
 /* Monotonic count of fused-expression morsels decided from statistics
  * (zone or directory) without reading their rows.  Tests. */
 int64_t ray_expr_test_zone_skips(void);
+/* Test hook: selection segments a single-leaf program emitted from an RLE
+ * view's runs (expr_leaf_emit), never expanded to bools. */
+int64_t ray_expr_test_leaf_runs(void);
 
 /* exec.c test hook: membership tests the sparse filter refinement took
  * (refine_in_keep) since process start. */

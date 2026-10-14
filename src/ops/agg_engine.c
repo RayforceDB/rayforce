@@ -430,10 +430,26 @@ static bool agg_walk_cs(const agg_rr_t* rr, agg_curs_t* cs, void* ctx, agg_body_
     return false;
 }
 
+/* Point reads of a staged key or input (ray_col_src_points_i64's
+ * contract: the ascending rows[0, n) of one vector, 1 / 0 / -1).  A SYM
+ * source's rows are its ids (ray_col_src_gather_points: each checked
+ * against the domain bound, id 0 the in-band null served as itself), so
+ * an id key costs no vector decode either.  SYM has no null bitmap; a
+ * flagged row would be one, and declines (the cursor reads it). */
+static inline int agg_src_points(ray_col_src_t* s, const int64_t* rows, int64_t n, int64_t* out, ray_t** err) {
+    if (s->type != RAY_SYM) return ray_col_src_points_i64(s, rows, n, out, err);
+    *err = NULL;
+    if (n < 1 || n > RAY_COL_POINT_ROWS) return 0;
+    uint8_t nul[RAY_COL_POINT_ROWS];
+    int pr = ray_col_src_gather_points(s, rows, n, out, nul, err);
+    if (pr > 0) for (int64_t q = 0; q < n; q++) if (nul[q]) return 0;
+    return pr;
+}
+
 /* R-SPARSE over the ascending rows idx[i0, i1) through the task's cursors:
  * the rows every staged source's current view covers form one run, handed
  * to body as the index range [ib, ie) with a view positioned at idx[ib].
- * Point reads (open decision D2): the first AGG_CURS_LENT integer sources
+ * Point reads (open decision D2): the first AGG_CURS_LENT integer and SYM sources
  * read a vector holding few of the rows (D2, per codec; none
  * decoded yet) by point reads into a vector-sized buffer of the walk, at
  * the rows' own offsets: a sparse view, valid for exactly those rows,
@@ -454,7 +470,7 @@ static ray_t* agg_idx_walk(const agg_rr_t* rr, agg_curs_t* cs, const int64_t* id
         if (!src || !ray_col_src_encoded(src)) continue;
         switch (src->type) {
         case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8: case RAY_BOOL:
-        case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP:
+        case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: case RAY_SYM:
             sp_src[nsp] = s; sp_lo[nsp] = sp_hi[nsp] = -1; nsp++; break;
         default: break;
         }
@@ -476,7 +492,7 @@ static ray_t* agg_idx_walk(const agg_rr_t* rr, agg_curs_t* cs, const int64_t* id
                     if (j - i <= RAY_COL_POINT_ROWS) {
                         int64_t x[RAY_COL_POINT_ROWS];
                         ray_t* err = NULL;
-                        int pr = ray_col_src_points_i64(rr->srcs[s], idx + i, j - i, x, &err);
+                        int pr = agg_src_points(rr->srcs[s], idx + i, j - i, x, &err);
                         if (pr < 0) return err;
                         if (pr > 0) {
                             uint8_t esz = ray_sym_elem_size(rr->srcs[s]->type, rr->srcs[s]->attrs);
@@ -525,7 +541,8 @@ static ray_t* agg_idx_walk(const agg_rr_t* rr, agg_curs_t* cs, const int64_t* id
 static inline int64_t agg_key_at(const agg_rr_t* rr, agg_curs_t* cs, uint32_t k, int64_t r, ray_t** err) {
     if (!rr->srcs[k]) return agg_read_key_i64_raw(rr->key_types[k], rr->key_attrs[k], rr->plain[k], r);
     int64_t x;
-    int pr = ray_col_src_point_i64(rr->srcs[k], r, &x, err);
+    int pr = rr->srcs[k]->type == RAY_SYM ? agg_src_points(rr->srcs[k], &r, 1, &x, err)
+                                          : ray_col_src_point_i64(rr->srcs[k], r, &x, err);
     if (pr) return pr > 0 ? x : 0;
     const ray_col_range_t* v;
     if ((*err = ray_col_cursor_at(&cs->cur[k], r, &v)) != NULL) return 0;
@@ -2179,6 +2196,22 @@ static int agg_sel_bounds_split(const agg_sel_bounds_ctx_t* bc, int64_t* mins, i
  * True: impossible.  False: undecided (a read error or OOM included; the
  * exact scan reports it). */
 #define AGG_SEL_PROBE_ROWS (RAY_MORSEL_ELEMS / 16)
+/* True when the key ranges mn / mx (a subset of the selected rows' values)
+ * already exceed the dense limit, as agg_sel_bounds_split judges them
+ * (agg_dense_range's ranges, nullability included). */
+static bool agg_sel_ranges_exceed(const agg_sel_bounds_ctx_t* bc, const int64_t* mn, const int64_t* mx) {
+    const int64_t limit = bc->n_sel < (int64_t)UINT32_MAX ? bc->n_sel : (int64_t)UINT32_MAX;
+    int64_t total = 1;
+    for (uint32_t k = 0; k < bc->n_keys; k++) {
+        if (mx[k] < mn[k]) continue;                   /* no value seen: at least 1 */
+        uint64_t span = (uint64_t)mx[k] - (uint64_t)mn[k];
+        if (span >= (uint64_t)INT64_MAX - (uint64_t)bc->nullable[k]) return true;
+        int64_t rng = (int64_t)span + 1 + bc->nullable[k];
+        if (total > limit / rng) return true;
+        total *= rng;
+    }
+    return false;
+}
 static _Atomic(uint64_t) g_sel_probe_hits;   /* test hook: plans the probe proved impossible */
 uint64_t ray_agg_test_sel_probe_hits(void) { return atomic_load_explicit(&g_sel_probe_hits, memory_order_relaxed); }
 static bool agg_sel_bounds_impossible(const agg_sel_bounds_ctx_t* bc) {
@@ -2201,7 +2234,8 @@ static bool agg_sel_bounds_impossible(const agg_sel_bounds_ctx_t* bc) {
             if (!krr->srcs[k]) x = agg_read_key_i64_raw(krr->key_types[k], krr->key_attrs[k], krr->plain[k], row);
             else {
                 ray_t* err = NULL;
-                int pr = ray_col_src_point_i64(krr->srcs[k], row, &x, &err);
+                int pr = krr->srcs[k]->type == RAY_SYM ? agg_src_points(krr->srcs[k], &row, 1, &x, &err)
+                                                       : ray_col_src_point_i64(krr->srcs[k], row, &x, &err);
                 if (pr < 0) { ray_error_free(err); ok = false; break; }
                 if (pr == 0) continue;
             }
@@ -2211,17 +2245,67 @@ static bool agg_sel_bounds_impossible(const agg_sel_bounds_ctx_t* bc) {
         }
     }
     if (!ok) return false;
-    const int64_t limit = bc->n_sel < (int64_t)UINT32_MAX ? bc->n_sel : (int64_t)UINT32_MAX;
-    int64_t total = 1;
-    for (uint32_t k = 0; k < nk; k++) {                /* agg_dense_range's ranges, as the split's */
-        if (mx[k] < mn[k]) continue;                   /* no value seen: at least 1 */
-        uint64_t span = (uint64_t)mx[k] - (uint64_t)mn[k];
-        if (span >= (uint64_t)INT64_MAX - (uint64_t)bc->nullable[k]) return true;
-        int64_t rng = (int64_t)span + 1 + bc->nullable[k];
-        if (total > limit / rng) return true;
-        total *= rng;
+    if (agg_sel_ranges_exceed(bc, mn, mx)) return true;
+    /* Undecided: the selected rows of the chunks holding each SYM key's
+     * lowest minimum and highest maximum in the directory (its membership
+     * bounds; a SYM key has no directory route to its exact bounds) are
+     * scanned too.  The
+     * statistics only choose the chunks; the bound is still the values
+     * read, so it stays a subset of the exact scan's whatever they say.  A
+     * key whose extremes are a few rare values (SYM ids interned early)
+     * is proved here, where evenly spaced rows miss them. */
+    const ray_rowsel_t* m = ray_rowsel_meta(bc->sel);
+    const int64_t nrows = m->nrows, nch = (nrows + RAY_ENC_CHUNK - 1) / RAY_ENC_CHUNK;
+    const int64_t spc = RAY_ENC_CHUNK / RAY_MORSEL_ELEMS;      /* selection segments per chunk */
+    if (nch < 2) return false;                                 /* one chunk: the exact scan */
+    ray_t* hdr;
+    int64_t* spans = (int64_t*)scratch_alloc(&hdr, (size_t)nch * (2 + 2 * nk) * sizeof(int64_t) + (size_t)nch);
+    if (!spans) return false;
+    int64_t* tb = spans + 2 * nch;
+    uint8_t* state = (uint8_t*)(tb + 2 * (size_t)nch * nk);
+    memset(state, 0, (size_t)nch);
+    int64_t marked = 0;
+    uint32_t sk[16], nsk = 0;                                  /* the SYM keys read */
+    ray_enc_chunk_stat_t st;
+    for (uint32_t k = 0; k < nk; k++) {
+        /* SYM keys only: the others' exact bounds take the directory
+         * (agg_sel_bounds_dir / _split), which reads these chunks anyway */
+        if (!krr->srcs[k] || krr->key_types[k] != RAY_SYM || krr->srcs[k]->len != nrows ||
+            !ray_col_src_chunk_stat(krr->srcs[k], 0, &st)) continue;
+        int64_t lo_ch = -1, hi_ch = -1, lo_v = INT64_MAX, hi_v = INT64_MIN;
+        for (int64_t ch = 0; ch < nch; ch++) {
+            int64_t se = (ch + 1) * spc < (int64_t)m->n_segs ? (ch + 1) * spc : (int64_t)m->n_segs;
+            if (bc->sel_prefix[se] == bc->sel_prefix[ch * spc]) continue;     /* no selected row */
+            if (!ray_col_src_chunk_stat(krr->srcs[k], ch, &st) || !st.has_minmax) continue;
+            if (st.min < lo_v) { lo_v = st.min; lo_ch = ch; }
+            if (st.max > hi_v) { hi_v = st.max; hi_ch = ch; }
+        }
+        if (lo_ch < 0) continue;
+        sk[nsk++] = k;
+        if (state[lo_ch] != 2) { state[lo_ch] = 2; marked++; }
+        if (state[hi_ch] != 2) { state[hi_ch] = 2; marked++; }
     }
-    return false;
+    /* only while the chunks are a small share of the scan they may save;
+     * those keys alone are read (a key set of their own, agg_sel_keys) */
+    bool proved = false;
+    if (marked > 0 && marked * 4 <= nch) {
+        agg_sel_keys_t ko;
+        agg_sel_bounds_ctx_t co;
+        agg_sel_keys(bc, sk, nsk, &ko, &co);
+        int64_t cm[16], cx[16];
+        for (uint32_t i = 0; i < nsk; i++) { cm[i] = INT64_MAX; cx[i] = INT64_MIN; }
+        if (agg_sel_bounds_round(&co, state, nch, spc, spans, tb, cm, cx)) {
+            int64_t am[16], ax[16];
+            for (uint32_t k = 0; k < nk; k++) { am[k] = mn[k]; ax[k] = mx[k]; }
+            for (uint32_t i = 0; i < nsk; i++) {
+                if (cm[i] < am[sk[i]]) am[sk[i]] = cm[i];
+                if (cx[i] > ax[sk[i]]) ax[sk[i]] = cx[i];
+            }
+            proved = agg_sel_ranges_exceed(bc, am, ax);
+        }
+    }
+    scratch_free(hdr);
+    return proved;
 }
 
 static bool agg_dense_plan_sel(ray_t** key_cols, const agg_rr_t* krr, uint32_t n_keys, int64_t n_sel,
@@ -7879,7 +7963,7 @@ static void agg_ts_sample_staged_fn(void* vctx, uint32_t wid, int64_t start, int
                 int64_t vlo, vhi, b = a + 1;
                 if (src && ray_col_src_vec_span(src, rows[a], &vlo, &vhi)) {
                     while (b < nr && b - a < RAY_COL_POINT_ROWS && rows[b] < vhi) b++;
-                    int pr = ray_col_src_points_i64(src, rows + a, b - a, vals + a, &err);
+                    int pr = agg_src_points(src, rows + a, b - a, vals + a, &err);
                     if (pr < 0) break;
                     if (pr > 0) { a = b; continue; }
                 }
@@ -9269,7 +9353,7 @@ static ray_t* agg_firstn_seen_staged(const agg_rr_t* rr, agg_firstn_set_t* set, 
 }
 
 /* The share sample over staged keys: the plain sample's rows, each key
- * point-read (agg_key_at: no vector decoded) or, declined (SYM, RAW,
+ * point-read (agg_key_at: no vector decoded; SYM ids too) or, declined (RAW,
  * DELTA_BP, nulls), read through a cursor, which decodes the sampled
  * vector.  The rows are split across pool tasks when the pass-2 dispatch
  * is (each task its own cursors), so declined reads do not decode serially;

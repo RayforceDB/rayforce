@@ -210,6 +210,28 @@ static bool runs_hold(const ray_enc_vview_t* v, int64_t c) {
 }
 #undef RUNS_HOLD
 
+/* eval_runs of EQ / NE for a constant some run holds (runs_hold, so it
+ * lies inside the kind's range): its T-bit pattern once, then one compare
+ * per run at the lane width (no per-run widening or operator switch). */
+#define RUNS_EQ(UT, F) do { const UT x_ = (UT)pat;                                        \
+        for (uint32_t r = 0; r < v->n_runs; r++) {                                        \
+            const uint32_t e_ = v->run_ends.h[r];                                         \
+            fill_run(bits, i, e_, (uint32_t)v->n, (uint8_t)((v->run_vals.F[r] == x_) ^ ne)); \
+            i = e_;                                                                       \
+        } } while (0)
+static void eval_runs_eq(const ray_enc_vview_t* v, int64_t c, uint8_t ne, uint8_t* bits) {
+    const int T = v->k.T;
+    const uint64_t pat = T == 64 ? (uint64_t)c : (uint64_t)c & ((1ull << T) - 1);
+    uint32_t i = 0;
+    switch (T) {
+    case 8:  RUNS_EQ(uint8_t, b);  break;
+    case 16: RUNS_EQ(uint16_t, h); break;
+    case 32: RUNS_EQ(uint32_t, s); break;
+    default: RUNS_EQ(uint64_t, q); break;
+    }
+}
+#undef RUNS_EQ
+
 bool ray_enc_eval_cmp(const ray_enc_vview_t* v, uint16_t op, int64_t c, uint8_t nr, uint8_t* bits) {
     if (is_float(v->type)) return false;                              /* floats: ray_enc_const_decision_f64 */
     if (!is_cmp_op(op)) return false;
@@ -221,12 +243,41 @@ bool ray_enc_eval_cmp(const ray_enc_vview_t* v, uint16_t op, int64_t c, uint8_t 
     case RAY_ENC_FOR_BP: eval_for(v, op, c, bits); break;
     case RAY_ENC_RLE:
         if ((op == OP_EQ || op == OP_NE) && !runs_hold(v, c)) memset(bits, op == OP_NE, (size_t)v->n);
+        else if (op == OP_EQ || op == OP_NE) eval_runs_eq(v, c, op == OP_NE, bits);
         else eval_runs(v, &(run_pred_t){ false, op, c, NULL, 0 }, bits);
         break;
     case RAY_ENC_DICT:   eval_dict(v, op, c, bits); break;
     default: return false;
     }
     ray_enc_mask_nulls(v, nr, bits);
+    return true;
+}
+
+bool ray_enc_eval_cmp_runs(const ray_enc_vview_t* v, uint16_t op, int64_t c, uint8_t* pass) {
+    if (v->enc != RAY_ENC_RLE || v->nullmap || is_float(v->type) || !is_cmp_op(op)) return false;
+    if (v->type == RAY_SYM && op != OP_EQ && op != OP_NE) return false;   /* never order ids (#738) */
+    if ((op == OP_EQ || op == OP_NE) && !runs_hold(v, c)) {
+        memset(pass, op == OP_NE, v->n_runs);
+        return true;
+    }
+    if (op == OP_EQ || op == OP_NE) {
+        const int T = v->k.T;
+        const uint64_t pat = T == 64 ? (uint64_t)c : (uint64_t)c & ((1ull << T) - 1);
+        const uint8_t ne = op == OP_NE;
+#define RUNS_PASS(UT, F) do { const UT x_ = (UT)pat;                                          \
+            for (uint32_t r = 0; r < v->n_runs; r++) pass[r] = (uint8_t)((v->run_vals.F[r] == x_) ^ ne); \
+        } while (0)
+        switch (T) {
+        case 8:  RUNS_PASS(uint8_t, b);  break;
+        case 16: RUNS_PASS(uint16_t, h); break;
+        case 32: RUNS_PASS(uint32_t, s); break;
+        default: RUNS_PASS(uint64_t, q); break;
+        }
+#undef RUNS_PASS
+        return true;
+    }
+    for (uint32_t r = 0; r < v->n_runs; r++)
+        pass[r] = (uint8_t)cmp_one(logical_of(lane(&v->run_vals, v->k.T, r), v->k), op, c);
     return true;
 }
 

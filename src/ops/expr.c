@@ -2504,6 +2504,45 @@ static int expr_leaf_on_view(const ray_expr_t* expr, const expr_enc_plan_t* p, u
     return 1;
 }
 
+static _Atomic(int64_t) g_expr_leaf_runs;       /* test hook */
+int64_t ray_expr_test_leaf_runs(void) { return atomic_load_explicit(&g_expr_leaf_runs, memory_order_relaxed); }
+
+/* A program that is one leaf: its only instruction is the leaf and its
+ * output (a selection is the leaf's answer itself). */
+static bool expr_single_leaf(const ray_expr_t* expr, const expr_enc_plan_t* p) {
+    return p && p->n_leaves == 1 && expr->n_ins == 1 && p->leaf_of_ins[0] == 0 &&
+           expr->ins[0].dst == expr->out_reg && !p->leaf[0].is_f64;
+}
+
+/* A single-leaf program's selection segment for morsel [ms, ms + n) (one
+ * vector), emitted from the vector's view: a CONST decision as one
+ * uniform segment, an RLE view without bitmap nulls from its runs
+ * (ray_enc_eval_cmp_runs: no per-row bools to scan), any other view
+ * through the encoded evaluator's bools (out, a morsel buffer).  The
+ * segment is the one rowsel_emit_segment makes of expr_leaf_on_view's
+ * bools.  1 emitted, 0 no view or no evaluator (the caller's morsel
+ * evaluation, nothing emitted), -1 an owned *err. */
+static int expr_leaf_emit(const ray_expr_t* expr, const expr_enc_plan_t* p, ray_enc_vview_t* vbuf,
+                          rowsel_builder_t* sb, uint32_t lseg, uint8_t* out, int64_t ms, int64_t n,
+                          ray_t** err) {
+    const expr_enc_leaf_t* l = &p->leaf[0];
+    if (ms % RAY_ENC_VEC) return 0;
+    int vr = ray_col_src_vview(expr->regs[l->reg].src, ms / RAY_ENC_VEC, vbuf, err);
+    if (vr <= 0) return vr;
+    if (n != vbuf->n) return 0;
+    int cd = ray_enc_const_decision(vbuf, l->op, l->ci, l->null_result);
+    if (cd >= 0) { rowsel_emit_uniform(sb, lseg, (uint8_t)cd, n); return 1; }
+    uint8_t pass[RAY_ENC_VEC];
+    if (ray_enc_eval_cmp_runs(vbuf, l->op, l->ci, pass)) {
+        rowsel_emit_runs(sb, lseg, vbuf->run_ends.h, pass, vbuf->n_runs, n);
+        atomic_fetch_add_explicit(&g_expr_leaf_runs, 1, memory_order_relaxed);
+        return 1;
+    }
+    if (!ray_enc_eval_cmp(vbuf, l->op, l->ci, l->null_result, out)) return 0;
+    rowsel_emit_segment(sb, lseg, out, n);
+    return 1;
+}
+
 /* Context for parallel full-vector expression evaluation.
  *
  * Two output modes:
@@ -2568,6 +2607,7 @@ static void expr_full_block(void* ctx, uint32_t worker_id, int64_t start, int64_
     /* encoded leaves: one vector view on this task's stack (never the heap) */
     const expr_enc_plan_t* plan = c->plan && c->plan->n_leaves ? c->plan : NULL;
     ray_enc_vview_t vbuf;
+    const bool leaf1 = expr_single_leaf(expr, plan);
 
     /* Fused selection-output mode: resolve this task's builder + its first
      * global segment once.  Task boundaries are morsel-aligned because
@@ -2605,6 +2645,13 @@ static void expr_full_block(void* ctx, uint32_t worker_id, int64_t start, int64_
                 }
                 continue;
             }
+        }
+        if (sb && leaf1 && !failed) {
+            ray_t* err = NULL;
+            uint32_t lseg = (uint32_t)(ms / RAY_MORSEL_ELEMS) - local_base_seg;
+            int lr = expr_leaf_emit(expr, plan, &vbuf, sb, lseg, (uint8_t*)scratch[0], ms, me - ms, &err);
+            if (lr > 0) continue;
+            if (lr < 0) { ray_scan_fail_note(c->fail, key, err); failed = true; }
         }
         void* result = NULL;
         if (!failed) {
