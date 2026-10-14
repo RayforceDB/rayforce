@@ -1414,6 +1414,12 @@ bool ray_sym_domain_intern_batch(ray_sym_domain_t* dom, int64_t n,
         ray_sys_free(b.tab);
         return false;
     }
+    /* An external extend meanwhile dropped the reverse index the probe
+     * read (dom_extend_from_file_locked): everything below, the serial
+     * fallback included, probes the current vocabulary, so rebuild it
+     * first; without one there is nothing to fall back to. */
+    bool indexed = dom->buckets || dom_build_index_locked(dom, n + 1);
+    if (!indexed) ok = false;
     bool unchanged = ok && dom->buckets == b.buckets &&
                      atomic_load_explicit(&dom->count, memory_order_relaxed) == b.count &&
                      !atomic_load_explicit(&b.unsure, memory_order_relaxed);
@@ -1549,7 +1555,7 @@ bool ray_sym_domain_intern_batch(ray_sym_domain_t* dom, int64_t n,
     } else {
         for (int64_t i = 0; i < n; i++) if (out_pos[i] < -1) out_pos[i] = -1;
     }
-    if (!unchanged || !ok)
+    if (indexed && (!unchanged || !ok))
         ok = dom_batch_append_serial_locked(dom, n, strs, lens, hashes, out_pos);
     dom_unlock();
     ray_profile_tick("dom batch: done");

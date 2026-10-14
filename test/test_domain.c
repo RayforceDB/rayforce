@@ -2177,6 +2177,80 @@ static test_result_t test_domain_extend_after_flush(void) {
     PASS();
 }
 
+/* A reopen that extends the domain while a batch intern probes outside
+ * the lock drops the reverse index the batch then commits against.  The
+ * batch interns exactly what the external writer appends, so however the
+ * two interleave — extend first (all hits), during the probe (the misses
+ * found again in the current index), after the commit (appended in batch
+ * order; the reopen then refuses the dirty domain) — every string lands
+ * at the position the file gives it. */
+enum { XB_BASE = 64, XB_N = 50000, XB_ROUNDS = 10, XB_W = 24 };
+typedef struct {
+    ray_sym_domain_t* dom;
+    const char* const* strs;
+    const size_t*   lens;
+    const uint32_t* hashes;
+    int64_t*        out;
+    _Atomic(bool)   started;
+    bool            ok;
+} xbatch_ctx_t;
+
+static void xbatch_run(void* arg) {
+    xbatch_ctx_t* c = (xbatch_ctx_t*)arg;
+    atomic_store(&c->started, true);
+    c->ok = ray_sym_domain_intern_batch(c->dom, XB_N, c->strs, c->lens, c->hashes, c->out);
+}
+
+static test_result_t test_domain_extend_under_batch(void) {
+    unlink(TMP_DOM_SYM_PATH);
+    unlink(TMP_DOM_SYM_PATH ".lk");
+    enum { ALL = XB_BASE + XB_N };
+    char* buf = (char*)ray_sys_alloc((size_t)ALL * XB_W);
+    const char** words = (const char**)ray_sys_alloc((size_t)ALL * sizeof(char*));
+    size_t* lens = (size_t*)ray_sys_alloc((size_t)XB_N * sizeof(size_t));
+    uint32_t* hashes = (uint32_t*)ray_sys_alloc((size_t)XB_N * sizeof(uint32_t));
+    int64_t* out = (int64_t*)ray_sys_alloc((size_t)XB_N * sizeof(int64_t));
+    TEST_ASSERT(buf && words && lens && hashes && out, "buffers");
+    for (int r = 0; r < XB_ROUNDS; r++) {
+        words[0] = "";
+        for (int i = 1; i < ALL; i++) {
+            snprintf(buf + (size_t)i * XB_W, XB_W, "xb%d_%d", r, i);
+            words[i] = buf + (size_t)i * XB_W;
+        }
+        for (int i = 0; i < XB_N; i++) {
+            lens[i] = strlen(words[XB_BASE + i]);
+            hashes[i] = (uint32_t)ray_hash_bytes(words[XB_BASE + i], lens[i]);
+        }
+        TEST_ASSERT(write_symfile(TMP_DOM_SYM_PATH, words, XB_BASE), "base file");
+        TEST_ASSERT(write_symfile(TMP_DOM_SYM_PATH ".grown", words, ALL), "grown file");
+        ray_sym_domain_t* dom = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+        TEST_ASSERT_NOT_NULL(dom);
+        TEST_ASSERT_EQ_I(ray_sym_domain_find(dom, words[1], strlen(words[1])), 1);   /* index built */
+
+        xbatch_ctx_t c = { dom, words + XB_BASE, lens, hashes, out, false, false };
+        ray_thread_t th;
+        TEST_ASSERT_EQ_I(ray_thread_create(&th, xbatch_run, &c), RAY_OK);
+        while (!atomic_load(&c.started)) {}
+        int moved = rename(TMP_DOM_SYM_PATH ".grown", TMP_DOM_SYM_PATH);
+        ray_sym_domain_t* again = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+        ray_thread_join(th);
+
+        TEST_ASSERT_EQ_I(moved, 0);
+        TEST_ASSERT(c.ok, "batch interned");
+        for (int i = 0; i < XB_N; i++) TEST_ASSERT_EQ_I(out[i], XB_BASE + i);
+        if (again) ray_sym_domain_release(again);   /* NULL: the batch committed first */
+        ray_sym_domain_release(dom);
+    }
+    ray_sys_free(buf);
+    ray_sys_free(words);
+    ray_sys_free(lens);
+    ray_sys_free(hashes);
+    ray_sys_free(out);
+    unlink(TMP_DOM_SYM_PATH);
+    unlink(TMP_DOM_SYM_PATH ".lk");
+    PASS();
+}
+
 /* Runtime-id LUT: NULL for the runtime singleton; for a FILE domain a
  * position-indexed array of runtime intern ids (round-trips strings),
  * built once (idempotent: same pointer).  Divergent fixture proves the
@@ -2981,6 +3055,7 @@ const test_entry_t domain_entries[] = {
     { "domain/raw_pin",                 test_domain_raw_pin,                 domain_setup, domain_teardown },
     { "domain/extend_reopen_flat",      test_domain_extend_reopen_flat,      domain_setup, domain_teardown },
     { "domain/extend_after_flush",      test_domain_extend_after_flush,      domain_setup, domain_teardown },
+    { "domain/extend_under_batch",      test_domain_extend_under_batch,      domain_setup, domain_teardown },
     { "domain/concat_text_nulls",       test_domain_concat_text_nulls,       domain_rt_setup, domain_rt_teardown },
     { "domain/runtime_lut",             test_domain_runtime_lut,             domain_rt_setup, domain_rt_teardown },
     { "domain/open_position0_validation", test_domain_open_position0_validation, domain_setup, domain_teardown },
