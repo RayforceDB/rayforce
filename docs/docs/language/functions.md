@@ -158,7 +158,7 @@ Query `concat` joins text row by row when every vector operand comes from a sour
 | `except` | binary | Set difference | `(except [1 2 3] [2])` → `[1 3]` |
 | `union` | binary | Set union | `(union [1 2] [2 3])` → `[1 2 3]` |
 | `sect` | binary | Set intersection | `(sect [1 2 3] [2 3 4])` → `[2 3]` |
-| `take` | binary | Take first/last N elements | `(take [10 20 30] 2)` → `[10 20]` |
+| `take` | binary | Take first/last N elements; past the length it cycles (`select … take:` stops at the table's length) | `(take [10 20 30] 2)` → `[10 20]`; `(take [1 2 3] 5)` → `[1 2 3 1 2]` |
 | `drop` | binary | Drop first/last N elements | `(drop [10 20 30] 1)` → `[20 30]` |
 | `rotate` | binary | Rotate left by N positions; negative rotates right | `(rotate [1 2 3 4] 1)` → `[2 3 4 1]` |
 | `cut` | binary | Split at sorted 0-based indices | `(cut [1 2 3 4] [2])` → `([1 2] [3 4])` |
@@ -497,7 +497,7 @@ spills exactly as it did before.
 |---|---|---|---|
 | `set` | binary, special | Bind value to global variable | `(set x 42)` |
 | `let` | binary, special | Bind value to local variable | `(let y (+ x 1))` |
-| `if` | variadic, special | Conditional (if/then/else) | `(if (> x 0) "pos" "neg")` |
+| `if` | variadic, special | Conditional: condition/result pairs, optional final else | `(if (> x 0) "pos" "neg")` |
 | `do` | variadic, special | Sequential execution, returns last | `(do (set x 1) (set y 2) (+ x y))` |
 | `fn` | variadic, special | Create lambda function | `(fn [x] (* x x))` |
 | `try` | binary, special | Error handling (expr handler-or-fallback) | `(try (/ 1 0) (fn [e] 0))` |

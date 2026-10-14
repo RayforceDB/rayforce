@@ -259,7 +259,7 @@ Query `concat` joins text row by row when an operand comes from a source column,
 | `except` | binary | — | Set difference (elements in A not in B) | `(except [1 2 3] [2])` → `[1 3]` |
 | `union` | binary | — | Set union (deduplicated) | `(union [1 2] [2 3])` → `[1 2 3]` |
 | `sect` | binary | — | Set intersection | `(sect [1 2 3] [2 3 4])` → `[2 3]` |
-| `take` | binary | — | Take first N elements (negative N takes from end) | `(take [10 20 30] 2)` → `[10 20]` |
+| `take` | binary | — | Take first N elements (negative N takes from end); past the length it cycles | `(take [10 20 30] 2)` → `[10 20]`; `(take [1 2 3] -5)` → `[2 3 1 2 3]` |
 | `drop` | binary | — | Drop first N elements (negative N drops from end) | `(drop [10 20 30] 1)` → `[20 30]` |
 | `rotate` | binary | — | Rotate left by N positions (negative rotates right) | `(rotate [1 2 3 4] 1)` → `[2 3 4 1]` |
 | `cut` | binary | — | Split a collection at sorted 0-based indices | `(cut [1 2 3 4] [2])` → `([1 2] [3 4])` |
@@ -363,7 +363,7 @@ Special forms receive their arguments unevaluated. These are the core language p
 |---|---|---|---|---|
 | `set` | binary | special, restricted | Bind value to global variable | `(set x 42)` |
 | `let` | binary | special | Bind value to local variable (lexical scope) | `(let y (+ x 1))` |
-| `if` | variadic | special | Conditional: (if cond then else) | `(if (> x 0) "pos" "neg")` |
+| `if` | variadic | special | Conditional: (if c1 r1 c2 r2 ... else?) — first truthy condition wins | `(if (> x 0) "pos" "neg")` |
 | `do` | variadic | special | Sequential execution, returns last value | `(do (set x 1) (set y 2) (+ x y))` |
 | `while` | variadic | special | Iterate while cond is truthy; returns null | `(while (> n 0) (set n (- n 1)))` |
 | `times` | variadic | special | Run body exactly n times (count evaluated once); returns null | `(times 5 (set n (+ n 1)))` |

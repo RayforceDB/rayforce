@@ -432,11 +432,21 @@ static void print_banner(void) {
 
 #define PIPE_BUF_SIZE 4096
 
+/* The detail printed after an error code: the error's own message, or else
+ * the value of an uncaught (raise x), which carries no message.  `buf`
+ * holds the rendering; ray_raise_render bounds it to `cap`. */
+static const char* repl_error_detail(char* buf, size_t cap) {
+    const char* detail = ray_error_msg();
+    if (detail) return detail;
+    return ray_raise_render(buf, cap) ? buf : NULL;
+}
+
 /* Format a rich error message with source snippet, carets, and stack trace. */
 static void fmt_error_with_trace(FILE* fp, ray_t* err, ray_t* trace, bool use_color) {
     char err_code[8] = {0};
     memcpy(err_code, err->sdata, err->slen < 7 ? err->slen : 7);
-    const char* detail = ray_error_msg();
+    char raised[512];
+    const char* detail = repl_error_detail(raised, sizeof(raised));
 
     fprintf(fp, "\n");
     if (use_color) fprintf(fp, "\033[1;31m");
@@ -556,7 +566,8 @@ static void repl_print_result(FILE* fp, ray_t* val, bool use_color) {
             memcpy(err_code, val->sdata, val->slen < 7 ? val->slen : 7);
             if (use_color) fprintf(fp, "\033[1;31m");
             fprintf(fp, "error: %s", err_code);
-            const char* detail = ray_error_msg();
+            char raised[512];
+            const char* detail = repl_error_detail(raised, sizeof(raised));
             if (detail) fprintf(fp, ": %s", detail);
             if (use_color) fprintf(fp, "\033[0m");
             fprintf(fp, "\n");
@@ -836,6 +847,7 @@ static void eval_and_print(ray_term_t* term, const char* input,
 
     ray_t* nfo = ray_nfo_create(RAY_NFO_REPL_NAME, strlen(RAY_NFO_REPL_NAME), input, strlen(input));
     ray_clear_error_trace();
+    ray_raise_clear();
 
     ray_t* parsed = ray_parse_with_nfo(input, nfo);
     if (profiling) ray_profile_tick("parse");
@@ -1481,6 +1493,7 @@ int ray_repl_run_file(const char* path) {
 
     ray_t* nfo = ray_nfo_create(path, strlen(path), buf, nread);
     ray_clear_error_trace();
+    ray_raise_clear();
 
     ray_t* parsed = ray_parse_with_nfo(buf, nfo);
     if (profiling) ray_profile_tick("parse");
