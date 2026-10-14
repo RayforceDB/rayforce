@@ -1969,6 +1969,8 @@ static ray_t* in_sel_parted(ray_col_src_t* src, ray_t* set_lit, bool negate, int
  * read in place (a published materialization: the bool path, as before)
  * or the shape declines (STR, GUID, OOM); an owned error, or the
  * selection. */
+static _Atomic(uint64_t) g_in_single_within;   /* test hook */
+uint64_t ray_exec_test_in_single_within(void) { return atomic_load(&g_in_single_within); }
 static ray_t* in_sel_single_within(ray_col_src_t* src, ray_t* set_lit, bool negate, int64_t nrows,
                                    ray_t* within, bool* all_pass) {
     *all_pass = false;
@@ -1991,6 +1993,7 @@ static ray_t* in_sel_single_within(ray_col_src_t* src, ray_t* set_lit, bool nega
                                ray_rowsel_idx(within) };
     ray_t* sel = pred_sel_drive(nrows, in_sel_parted_fill, &pc, &fail, all_pass);
     in_seg_sel_free(seg, 1);                       /* src is the graph's: not bound here */
+    if ((sel && !RAY_IS_ERR(sel)) || (!sel && *all_pass)) atomic_fetch_add(&g_in_single_within, 1);
     return sel;
 }
 

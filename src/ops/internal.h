@@ -1181,6 +1181,9 @@ int64_t ray_expr_test_leaf_runs(void);
 /* exec.c test hook: membership tests the sparse filter refinement took
  * (refine_in_keep) since process start. */
 uint64_t ray_exec_test_refine_in(void);
+/* exec.c test hook: later `in` conjuncts over a single-file generation-2
+ * column answered by range (in_sel_single_within) since process start. */
+uint64_t ray_exec_test_in_single_within(void);
 /* query.c test hook: counts the (count (select ... where <compare>)) fast
  * path answered since process start. */
 uint64_t ray_query_test_count_fast(void);

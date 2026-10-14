@@ -5401,9 +5401,10 @@ static test_result_t test_topk_never_pruned(void) {
  * equal generation 0's; nothing materializes (the generic OP_IN read the
  * column whole). */
 static test_result_t test_splayed_in_later(void) {
-    aw_save("il", "(table [k x v s f] (list (til 210000) (as 'I32 (- (% (til 210000) 40) (* 500 (div (til 210000) 70000)))) "
+    aw_save("il", "(table [k x v s f b t] (list (til 210000) (as 'I32 (- (% (til 210000) 40) (* 500 (div (til 210000) 70000)))) "
                   "(as 'I32 (map (fn [j] (if (== 0 (% j 9)) 0N (% j 1000))) (til 210000))) "
-                  "(take ['a 'b 'c 'd 'e] 210000) (as 'F64 (% (til 210000) 50))))", -1);
+                  "(take ['a 'b 'c 'd 'e] 210000) (as 'F64 (% (til 210000) 50)) "
+                  "(as 'I16 (% (til 210000) 2)) (as 'I16 (- (% (til 210000) 11) 1))))", -1);
     static const char* const qs[] = {
         "(select {c: (count k) s: (sum v) from: T where: (and (> v 10) (in x [3 -497 -980])) by: x asc: x})",
         "(select {c: (count k) from: T where: (and (> v 10) (in x [3 -497]) (< v 900)) by: s asc: s})",
@@ -5416,11 +5417,27 @@ static test_result_t test_splayed_in_later(void) {
         "(select {c: (count k) from: T where: (and (> v 10) (in f [1.0 7.0 -0.0]))})",
         "(select {c: (count k) from: T where: (and (> v 10) (in x [12345]))})",
         "(select {c: (count k) from: T where: (and (> v 10) (not-in x [100000]))})",
+        "(select {c: (count k) from: T where: (and (== b 0) (in t [-1 6]))})",
+        "(select {c: (count k) from: T where: (and (== b 1) (not-in t [-1 6 9]))})",
+        "(select {c: (count k) from: T where: (and (== b 0) (in f [1.0 7.0 -0.0]))})",
+        "(select {c: (count k) from: T where: (and (== b 0) (in v [1 2 3 9 500]))})",
+        "(select {c: (count k) from: T where: (and (< v 100) (in x [3 -497 -980]))})",
+        "(select {c: (count k) from: T where: (and (< v 100) (in f [1.0 7.0 -0.0]))})",
+        "(select {c: (count k) from: T where: (and (== b 0) (not-in x [3 -497]))})",
+        "(select {c: (count k) from: T where: (and (== b 0) (not-in f [1.0 7.0]))})",
         NULL,
     };
-    static const char* const in_col[] = { "x", "x", "x", "x", "v", "v", "s", "s", "f", "x", "x" };
+    static const char* const in_col[] = { "x", "x", "x", "x", "v", "v", "s", "s", "f", "x", "x", "t", "t", "f", "v", "x", "f", "x", "f" };
+    /* the rows that reach exec_node's later-conjunct `in` (the others take
+     * another route, which the materialization check covers): SYM, I16,
+     * I32 and F64; each is answered by in_sel_single_within (route
+     * counter), so disabling that arm for any type fails here */
+    static const bool routed[] = { 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 1, 1, 0, 0, 0, 0, 1, 1 };
     for (int i = 0; qs[i]; i++) {
+        uint64_t w0 = ray_exec_test_in_single_within();
         AW_SAME("il", qs[i], 0);
+        if (routed[i])
+            TEST_ASSERT_FMT(ray_exec_test_in_single_within() == w0 + 1, "%s: not read by range over the selection", qs[i]);
         /* and the column stays unmaterialized (T: generation 2) */
         char b[128];
         snprintf(b, sizeof b, "(at (.idx.info T '%s) 'materialized)", in_col[i]);
