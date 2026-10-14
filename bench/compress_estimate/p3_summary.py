@@ -43,6 +43,11 @@ ALLOW = {
     "q30": {"ResolutionWidth"},                            # (set rw (at hits 'ResolutionWidth))
     "q43": {"EventTime"},                                  # computed key (xbar EventTime)
 }
+# Per-arm entries (ruling 14-3), outside the per-query table above.
+ALLOW_ARM = {
+    ("A", "q23"): {"SearchPhrase"},   # the key of a count-distinct group (holistic), q10's RegionID class
+    ("B", "q6"):  {"SearchPhrase"},   # count distinct (holistic); parted `at` reads the column eagerly (follow-up)
+}
 def cols(m):
     if m.startswith("<"): return {"*many*"}
     return set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", m))
@@ -52,7 +57,7 @@ for arm in ("A", "B"):
         q = f"q{i}"
         m = mat.get((arm, q))
         if m is None: bad.append(f"{arm}/{q}:no-mat-row"); continue
-        extra = cols(m) - ALLOW.get(q, set())
+        extra = cols(m) - ALLOW.get(q, set()) - ALLOW_ARM.get((arm, q), set())
         if extra: bad.append(f"{arm}/{q}:{'+'.join(sorted(extra))}")
 print("p3_unexpected_materializations " + (" ".join(bad) if bad else "none"))
 

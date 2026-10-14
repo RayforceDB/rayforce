@@ -56,6 +56,16 @@ P3_DEFERRALS = [
     ("q26", "A",  "rss",   2.37, "top-k output gather RSS"),
     ("q27", "A",  "rss",   2.37, "top-k output gather RSS"),
 ]
+# Intended answer changes against the base binary (data only, ruling 14-2):
+# (query, arm, reason).  A DIFF listed here is not an answer failure on any
+# GATE line; nothing else is ignored, and arms A, B and C0 still compare it.
+INTENDED_ANSWER_CHANGES = [
+    # #801: grouped take breaks ties on the earliest source row.  q40's
+    # `take: 1010` cuts a 131-group tie at PageViews 13; HEAD returns the
+    # earliest-row tie set (= arms A, B, C0), the pre-fix base another.
+    ("q40", "C1", "#801 tie set at the take boundary"),
+    ("q40", "R",  "#801 tie set at the take boundary"),
+]
 PI_SPLAYED_FIRST_TOTAL = 2.99    # RESULTS.md "PI index policy": gen-2 first-run total 7 740 vs 2 586 ms
 ARMS = {"A": ("g0", "g2", "splayed g0 vs g2"), "B": ("p0", "p2", "parted p0 vs p2"),
         "C0": ("base", "p2", "splayed g0, base vs p2 binary"),
@@ -115,7 +125,9 @@ for arm, (va, vb, title) in ARMS.items():
     other = [q for q in QS if q in rows and not measured_scan(q)]
     disagree = [q for q in QS if q in rows and (q in SCAN_ONLY) != measured_scan(q)]
     v = {}
-    v["answers"] = not missing and all(rows[q][4] == "same" for q in rows)
+    intended = {q for q, a, _ in INTENDED_ANSWER_CHANGES if a == arm}
+    v["answers"] = not missing and all(rows[q][4] == "same" or (q in intended and rows[q][4] == "DIFF") for q in rows)
+    print("intended_answer_changes " + (" ".join(f"{q}:{rows[q][4]}" for q in sorted(intended) if q in rows) or "none"))
     def top5(qs, i): return sorted(((round(rows[q][i], 3), q) for q in qs), reverse=True)[:5]
     def clauses(qs, i, bound, metric):
         """(query, passes) per query for ratio column i; a query below the
