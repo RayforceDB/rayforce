@@ -4969,6 +4969,155 @@ static test_result_t test_parted_in(void) {
     PASS();
 }
 
+/* Either the same error code in both generations, or equal formatted results. */
+static test_result_t aw_same_or_err(const char* name, const char* q) {
+    char buf[2048]; ray_t* out[2];
+    for (int gen = 0; gen < 2; gen++) {
+        snprintf(buf, sizeof buf, "(set T (.db.splayed.get \"" AW_TMP "/%s%d/\"))", name, gen ? 2 : 0);
+        aw_eval_ok(buf);
+        out[gen] = aw_eval(q);
+    }
+    bool e0 = out[0] && RAY_IS_ERR(out[0]), e2 = out[1] && RAY_IS_ERR(out[1]);
+    TEST_ASSERT_FMT(e0 == e2, "%s: error in one generation only", q);
+    if (e0) {
+        TEST_ASSERT_FMT(strcmp(ray_err_code(out[0]), ray_err_code(out[1])) == 0, "%s: %s vs %s", q,
+                        ray_err_code(out[0]), ray_err_code(out[1]));
+        ray_error_free(out[0]); ray_error_free(out[1]);
+        PASS();
+    }
+    ray_t* fa = ray_fmt(out[0], 0); ray_t* fb = ray_fmt(out[1], 0);
+    TEST_ASSERT_FMT(out[0]->type == out[1]->type, "%s: type %d vs %d", q, out[0]->type, out[1]->type);
+    TEST_ASSERT_FMT(ray_str_len(fa) == ray_str_len(fb) && memcmp(ray_str_ptr(fa), ray_str_ptr(fb), ray_str_len(fa)) == 0, "%s differs", q);
+    ray_release(fa); ray_release(fb); ray_release(out[0]); ray_release(out[1]);
+    PASS();
+}
+#define AW_SAME_OR_ERR(n, q) do { test_result_t r_ = aw_same_or_err((n), (q)); if (r_.status != TEST_PASS) return r_; } while (0)
+
+/* Signed zeros: CONST vectors of -0.0 and of +0.0 next to a RAW vector
+ * mixing both; every comparison with both zero literals, in, min, max (which
+ * zero) and a float top-k. */
+static test_result_t test_signed_zeros(void) {
+    aw_save("sz", "(table [k f] (list (til 3072) (map (fn [j] (if (< j 1024) -0.0 (if (< j 2048) 0.0 (if (== 0 (% j 2)) -0.0 (* 0.5 (- j 2600)))))) (til 3072))))", -1);
+    TEST_ASSERT_EQ_I(aw_vec_enc("sz", "f", 0), RAY_ENC_CONST);
+    TEST_ASSERT_EQ_I(aw_vec_enc("sz", "f", 1), RAY_ENC_CONST);
+    static const char* const ops[] = { "==", "!=", "<", "<=", ">", ">=" };
+    static const char* const lits[] = { "0.0", "-0.0" };
+    char q[256];
+    for (int o = 0; o < 6; o++) for (int l = 0; l < 2; l++) {
+        snprintf(q, sizeof q, "(count (select {from: T where: (%s f %s)}))", ops[o], lits[l]);
+        AW_SAME_OR_ERR("sz", q);
+    }
+    AW_SAME_OR_ERR("sz", "(count (select {from: T where: (in f [0.0 1.5])}))");
+    AW_SAME_OR_ERR("sz", "(count (select {from: T where: (in f [-0.0])}))");
+    AW_SAME_OR_ERR("sz", "(min (at T 'f))");
+    AW_SAME_OR_ERR("sz", "(max (at T 'f))");
+    AW_SAME_OR_ERR("sz", "(select {f: f k: k from: T where: (> k 1000) asc: f take: 5})");
+    AW_SAME_OR_ERR("sz", "(select {f: f k: k from: T where: (> k 1000) desc: f take: 5})");
+    PASS();
+}
+
+/* Symbol order is lexical, not by id: symbols first seen as z, a, m, SYM
+ * forced to FOR_BP; range operators, LIKE, min, max and top-k equal
+ * generation 0; equality and in still decide by ids. */
+static test_result_t test_symbol_order(void) {
+    aw_save("so", "(table [k s] (list (til 3000) (as 'SYMBOL (map (fn [j] (at [\"z\" \"a\" \"m\" \"b\"] (% j 4))) (til 3000)))))", RAY_ENC_FOR_BP);
+    AW_SAME_OR_ERR("so", "(count (select {from: T where: (< s 'm)}))");
+    AW_SAME_OR_ERR("so", "(count (select {from: T where: (>= s 'b)}))");
+    AW_SAME_OR_ERR("so", "(count (select {from: T where: (like s \"*a*\")}))");
+    AW_SAME_OR_ERR("so", "(min (at T 's))");
+    AW_SAME_OR_ERR("so", "(max (at T 's))");
+    AW_SAME_OR_ERR("so", "(select {s: s k: k from: T asc: s take: 3})");
+    AW_SAME_OR_ERR("so", "(select {s: s k: k from: T desc: [s k] take: 3})");
+    AW_SAME_OR_ERR("so", "(count (select {from: T where: (== s 'm)}))");
+    AW_SAME_OR_ERR("so", "(count (select {from: T where: (in s ['z 'b])}))");
+    PASS();
+}
+
+/* Aggregate admission: sum, avg, count, min, max over every type, flat,
+ * under a selection and parted: same values, types and errors. */
+static test_result_t test_agg_admission(void) {
+    const char* tbl =
+        "(table [k b u h i l f e d t ts s x] (list (til 3000) (== 0 (% (til 3000) 3)) (as 'U8 (% (til 3000) 250)) "
+        "(as 'I16 (- (% (til 3000) 300) 150)) (as 'I32 (- (til 3000) 1500)) (* (til 3000) 1000003) "
+        "(at (select {e: (as 'F32 x) from: (table [x] (list (* 0.5 (til 3000))))}) 'e) (* 0.25 (til 3000)) (as 'DATE (% (til 3000) 900)) (as 'TIME (* 1000 (til 3000))) "
+        "(as 'TIMESTAMP (* 1000000 (til 3000))) (as 'SYMBOL (map (fn [j] (format \"s%\" (% j 7))) (til 3000))) "
+        "(map (fn [j] (format \"string %\" (% j 11))) (til 3000))))";
+    /* `as 'F32` is a query-projection cast only, so column f is cast inside a select. */
+    aw_save("ad", tbl, -1);
+    for (int p = 0; p < 2; p++) for (int gen = 0; gen <= 2; gen += 2) {
+        char q[1600];
+        snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/adp%d/2024.01.0%d/t/\" %s {compress: %s})",
+                 gen, p + 1, tbl, gen ? "true" : "false");
+        aw_eval_ok(q);
+    }
+    static const char* const cols[] = { "b", "u", "h", "i", "l", "f", "e", "d", "t", "ts", "s", "x" };
+    static const char* const aggs[] = { "sum", "avg", "count", "min", "max" };
+    char q[512];
+    for (int c = 0; c < 12; c++) for (int a = 0; a < 5; a++) {
+        snprintf(q, sizeof q, "(select {r: (%s %s) from: T})", aggs[a], cols[c]);
+        AW_SAME_OR_ERR("ad", q);
+        snprintf(q, sizeof q, "(select {r: (%s %s) from: T where: (> k 1700)})", aggs[a], cols[c]);
+        AW_SAME_OR_ERR("ad", q);
+        /* parted: both generations side by side */
+        char q0[512], q2[512];
+        snprintf(q0, sizeof q0, "(select {r: (%s %s) from: (.db.parted.get \"" AW_TMP "/adp0\" 't)})", aggs[a], cols[c]);
+        snprintf(q2, sizeof q2, "(select {r: (%s %s) from: (.db.parted.get \"" AW_TMP "/adp2\" 't)})", aggs[a], cols[c]);
+        ray_t* x = aw_eval(q0); ray_t* y = aw_eval(q2);
+        bool ex = x && RAY_IS_ERR(x), ey = y && RAY_IS_ERR(y);
+        TEST_ASSERT_FMT(ex == ey, "parted %s", q0);
+        if (ex) { TEST_ASSERT_TRUE(strcmp(ray_err_code(x), ray_err_code(y)) == 0); ray_error_free(x); ray_error_free(y); continue; }
+        ray_t* fx = ray_fmt(x, 0); ray_t* fy = ray_fmt(y, 0);
+        TEST_ASSERT_FMT(ray_str_len(fx) == ray_str_len(fy) && memcmp(ray_str_ptr(fx), ray_str_ptr(fy), ray_str_len(fx)) == 0, "parted %s", q0);
+        ray_release(fx); ray_release(fy); ray_release(x); ray_release(y);
+    }
+    PASS();
+}
+
+/* SYM ids at widths 8 and 16 across the sign bit (ids 127/128 and
+ * 32767/32768) and U8 values across 127/128: min, max, count, the
+ * not-admitted sum / avg errors, and equality. */
+static test_result_t test_sign_bit_widths(void) {
+    aw_save("w8", "(table [s u] (list (as 'SYMBOL (map (fn [j] (format \"v%\" (% j 200))) (til 5000))) (as 'U8 (+ 100 (% (til 5000) 60)))))", RAY_ENC_FOR_BP);
+    aw_save("w16", "(table [s] (list (as 'SYMBOL (map (fn [j] (format \"v%\" (% j 40000))) (til 80000)))))", RAY_ENC_FOR_BP);
+    static const char* const q8[] = {
+        "(min (at T 's))", "(max (at T 's))", "(count (at T 's))", "(sum (at T 's))", "(avg (at T 's))",
+        "(count (select {from: T where: (== s 'v127)}))", "(count (select {from: T where: (== s 'v128)}))",
+        "(sum (at T 'u))", "(avg (at T 'u))", "(min (at T 'u))", "(max (at T 'u))",
+        "(count (select {from: T where: (> u 127)}))", NULL,
+    };
+    for (int i = 0; q8[i]; i++) AW_SAME_OR_ERR("w8", q8[i]);
+    static const char* const q16[] = {
+        "(min (at T 's))", "(max (at T 's))",
+        "(count (select {from: T where: (== s 'v32767)}))", "(count (select {from: T where: (== s 'v32768)}))",
+        "(count (select {from: T where: (in s ['v32767 'v32768 'v1])}))", NULL,
+    };
+    for (int i = 0; q16[i]; i++) AW_SAME_OR_ERR("w16", q16[i]);
+    PASS();
+}
+
+/* Top-k on F64, BOOL and U8 first keys: results equal, nothing pruned. */
+static test_result_t test_topk_never_pruned(void) {
+    aw_save("tn", "(table [f b u v s] (list (map (fn [j] (if (== 0 (% j 97)) 0N (* 0.5 (- j 100000)))) (til 200000)) "
+                  "(== 0 (% (til 200000) 5)) (as 'U8 (% (til 200000) 251)) (% (til 200000) 1000) "
+                  "(as 'SYMBOL (map (fn [j] (format \"k%\" (% j 300))) (til 200000)))))", -1);
+    static const char* const q[] = {
+        "(select {f: f from: T where: (> v 10) asc: f take: 7})",
+        "(select {f: f from: T where: (> v 10) desc: f take: 7})",
+        "(select {b: b v: v from: T where: (> v 990) asc: [b v] take: 7})",
+        "(select {u: u v: v from: T where: (> v 990) desc: [u v] take: 7})",
+        "(select {s: s v: v from: T where: (> v 990) asc: [s v] take: 7})",     /* SYM first key: never pruned */
+        NULL,
+    };
+    for (int i = 0; q[i]; i++) {
+        AW_SAME_OR_ERR("tn", q[i]);                    /* leaves T on generation 2: the last run was gen 2 */
+        uint64_t pc = 1, pv = 1;
+        ray_fused_topk_test_pruned(&pc, &pv);
+        TEST_ASSERT_FMT(pc == 0 && pv == 0, "%s pruned %llu chunks %llu vectors", q[i],
+                        (unsigned long long)pc, (unsigned long long)pv);
+    }
+    PASS();
+}
+
 const test_entry_t aware_entries[] = {
     { "aware/vview_encodings", test_vview_encodings, aw_setup, aw_teardown },
     { "aware/vview_near_top",  test_vview_near_top,  aw_setup, aw_teardown },
@@ -5052,5 +5201,10 @@ const test_entry_t aware_entries[] = {
     { "aware/gate_decoded_bytes",   test_gate_decoded_bytes,   aw_setup, aw_teardown },
     { "aware/cross_segment_codes",  test_cross_segment_codes,  aw_setup, aw_teardown },
     { "aware/parted_in",            test_parted_in,            aw_setup, aw_teardown },
+    { "aware/signed_zeros",      test_signed_zeros,      aw_setup, aw_teardown },
+    { "aware/symbol_order",      test_symbol_order,      aw_setup, aw_teardown },
+    { "aware/agg_admission",     test_agg_admission,     aw_setup, aw_teardown },
+    { "aware/sign_bit_widths",   test_sign_bit_widths,   aw_setup, aw_teardown },
+    { "aware/topk_never_pruned", test_topk_never_pruned, aw_setup, aw_teardown },
     { NULL, NULL, NULL, NULL },
 };
