@@ -287,7 +287,9 @@ void   ray_enc_counters_reset(void);
 void   ray_enccol_test_fail_alloc(int64_t nth);
 void   ray_enccol_test_fail_path(const char* sub);
 /* The fail_alloc counter, for a materialization step outside this file
- * (the index-region parse): true when this allocation is the nth. */
+ * (the index-region parse): true when this allocation is the nth.  It is
+ * the counter only: ray_enc_index_parse takes no path, so fail_path does
+ * not reach the parse's allocations (it fails only the ones made here). */
 bool   ray_enccol_test_nth_alloc_fails(void);
 /* interrupt_after: the nth chunk decoded successfully from now on calls
  * ray_request_interrupt() (0 disables), exercising the per-chunk poll. */

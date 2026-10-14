@@ -1074,12 +1074,12 @@ static bool same_child(const ray_t* a, const ray_t* b, size_t esz) {
 static test_result_t ix_parse_same(ray_t* v, const ray_enc_idx_view_t* iv, const char* name, const char* what) {
     ray_t* root = NULL;
     ray_t* e = ray_enc_index_parse(iv, v, &root);
+    if (e) ray_error_free(e);
     TEST_ASSERT_FMT(e == NULL && root != NULL, "%s: parse failed", what);
     const ray_index_t* a = ray_index_payload(v->index);
     const ray_index_t* p = ray_index_payload(root);
-    TEST_ASSERT_FMT(p->kind == a->kind && p->parent_type == a->parent_type && p->built_for_len == a->built_for_len,
-                    "%s: root header", what);
-    TEST_ASSERT_FMT(!(p->markers & RAY_MARK_MMAP), "%s: parsed root marked mapped", what);
+    bool hdr = p->kind == a->kind && p->parent_type == a->parent_type && p->built_for_len == a->built_for_len;
+    bool mapped = (p->markers & RAY_MARK_MMAP) != 0;
     int64_t want_sym = name ? ray_sym_intern(name, strlen(name)) : -1;
     bool ok = false;
     switch (a->kind) {
@@ -1113,7 +1113,9 @@ static test_result_t ix_parse_same(ray_t* v, const ray_enc_idx_view_t* iv, const
         break;
     }
     }
-    ray_release(root);
+    ray_release(root);                                  /* before any assertion can return */
+    TEST_ASSERT_FMT(hdr, "%s: root header", what);
+    TEST_ASSERT_FMT(!mapped, "%s: parsed root marked mapped", what);
     TEST_ASSERT_FMT(ok, "%s: parsed root differs from the source", what);
     PASS();
 }
@@ -1293,7 +1295,12 @@ static uint8_t* long_cluster_region(int64_t ng, size_t* n) {
         of[g] = g; rw[g] = g;
     }
     of[ng] = ng;
-    uint8_t* b = next < cap ? fab_region(fab_hash(RAY_I64, ng, tbl, cap, gk, ng, of, rw, ng), RAY_I64, 0, ng, n) : NULL;
+    uint8_t* b = NULL;
+    if (next < cap) {
+        ray_t* root = fab_hash(RAY_I64, ng, tbl, cap, gk, ng, of, rw, ng);
+        b = fab_region(root, RAY_I64, 0, ng, n);
+        ray_release(root);
+    }
     free(tbl); free(gk); free(of); free(rw); free(hk);
     return b;
 }
@@ -1426,29 +1433,27 @@ static test_result_t test_parse_part_order_sym(void) {
 
 /* Every allocation of the parse failing in turn: oom, no root, and
  * nothing left allocated (the error path releases what it set). */
-static test_result_t ix_parse_oom(ray_t* v, const char* name, uint32_t bound) {
-    size_t n; ray_t* err; uint8_t* b = ix_region(v, name, name ? (uint32_t)strlen(name) : 0, &n, &err);
-    TEST_ASSERT_NOT_NULL(b);
-    ray_enc_idx_view_t iv;
-    TEST_ASSERT_NULL(ix_validate(b, n, v, bound, &iv));
-    if (name) (void)ray_sym_intern(name, strlen(name));        /* interned before the baseline */
+static test_result_t ix_parse_oom_run(ray_t* v, const ray_enc_idx_view_t* iv) {
     int fails = 0;
     for (int64_t nth = 1; ; nth++) {
         ray_mem_stats_t m0, m1; ray_mem_stats(&m0);
         ray_enccol_test_fail_alloc(nth);
         ray_t* root = (ray_t*)1;
-        ray_t* e = ray_enc_index_parse(&iv, v, &root);
+        ray_t* e = ray_enc_index_parse(iv, v, &root);
         ray_enccol_test_fail_alloc(0);
         if (!e) {
-            TEST_ASSERT_NOT_NULL(root);
-            ray_release(root);
+            bool got = root != NULL && root != (ray_t*)1;
+            if (got) ray_release(root);
             ray_mem_stats(&m1);
+            TEST_ASSERT_TRUE(got);
             TEST_ASSERT_EQ_U(m1.bytes_allocated, m0.bytes_allocated);
             break;
         }
-        TEST_ASSERT_STR_EQ(ray_err_code(e), "oom");
-        TEST_ASSERT_NULL(root);
+        bool oom = strcmp(ray_err_code(e), "oom") == 0;
         ray_error_free(e);
+        if (root && root != (ray_t*)1) { ray_release(root); FAILF("allocation %lld failing: a root with the error", (long long)nth); }
+        TEST_ASSERT_FMT(oom, "allocation %lld failing: not oom", (long long)nth);
+        TEST_ASSERT_NULL(root);
         ray_mem_stats(&m1);
         TEST_ASSERT_FMT(m1.bytes_allocated == m0.bytes_allocated, "allocation %lld failing leaks %lld bytes",
                         (long long)nth, (long long)(m1.bytes_allocated - m0.bytes_allocated));
@@ -1456,8 +1461,19 @@ static test_result_t ix_parse_oom(ray_t* v, const char* name, uint32_t bound) {
         TEST_ASSERT_TRUE(nth < 16);
     }
     TEST_ASSERT_TRUE(fails >= 2);                    /* the root and at least one child */
-    free(b);
     PASS();
+}
+static test_result_t ix_parse_oom(ray_t* v, const char* name, uint32_t bound) {
+    size_t n; ray_t* err; uint8_t* b = ix_region(v, name, name ? (uint32_t)strlen(name) : 0, &n, &err);
+    if (err) ray_error_free(err);
+    TEST_ASSERT_NOT_NULL(b);
+    ray_enc_idx_view_t iv;
+    ray_t* ve = ix_validate(b, n, v, bound, &iv);
+    if (ve) { ray_error_free(ve); free(b); FAIL("region not valid"); }
+    if (name) (void)ray_sym_intern(name, strlen(name));        /* interned before the baseline */
+    test_result_t r = ix_parse_oom_run(v, &iv);
+    free(b);
+    return r;
 }
 #define PARSE_OOM(v, name, bound) do { test_result_t r_ = ix_parse_oom((v), (name), (bound)); \
     if (r_.status != TEST_PASS) return r_; } while (0)
@@ -1516,9 +1532,27 @@ static test_result_t test_parse_rejects_view(void) {
     VIEW_REFUSED("corrupt", w.kind = RAY_IDX_ZONE);
     VIEW_REFUSED("corrupt", (w.kind = RAY_IDX_SORT, w.len = (int64_t)n));
     VIEW_REFUSED("corrupt", (w.kind = RAY_IDX_BLOOM, w.bloom.bits = 96, w.bloom.m_mask = UINT64_MAX));
+    /* boundaries: one element past the region, a name in the root */
+    VIEW_REFUSED("corrupt", w.hash.n_keys = ((int64_t)n - iv.hash.rows) / 8 + 1);
+    VIEW_REFUSED("corrupt", w.order_name = (const char*)b + 8);
+    VIEW_REFUSED("corrupt", w.order_name = (const char*)b + 95);
     ray_mem_stats(&m1);
     TEST_ASSERT_EQ_U(m1.bytes_allocated, m0.bytes_allocated);
     free(b); ray_release(v);
+    /* a 256-byte name inside a region long enough to hold it: refused by
+     * the name limit, not by the span */
+    { int64_t d2[40];
+      for (int i = 0; i < 40; i++) d2[i] = i % 11;
+      ray_t* v2 = with_index(i64_vec(d2, 40), ray_index_attach_hash);
+      TEST_ASSERT_NOT_NULL(v2);
+      b = ix_region(v2, "ts", 2, &n, &err);
+      TEST_ASSERT_NOT_NULL(b);
+      TEST_ASSERT_TRUE(n >= RAY_ENC_IDX_FIRST_CHILD + 256);
+      TEST_ASSERT_NULL(ix_validate(b, n, v2, 0, &iv));
+      ray_t* vsave = v; v = v2;
+      VIEW_REFUSED("corrupt", (w.order_name = (const char*)b + RAY_ENC_IDX_FIRST_CHILD, w.order_len = 256));
+      v = vsave;
+      free(b); ray_release(v2); }
     ray_t* s = ray_sym_vec_new(RAY_SYM_W8, 4);
     s->len = 4;
     uint8_t ids[4] = { 3, 3, 6, 6 };

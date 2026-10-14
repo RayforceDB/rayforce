@@ -402,13 +402,30 @@ static bool src_ident_char(char c) {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
 }
 
+/* A floating identifier: a token equal to a floating type or macro, a
+ * token containing a classifier or magnitude / sign helper (so
+ * __builtin_signbit, isnanf, fabsl, _Float64x match too), or a compiler
+ * builtin naming an infinity or NaN (__builtin_inf, __builtin_nanf). */
+static bool float_ident(const char* t, size_t n) {
+    static const char* const exact[] = { "double", "float", "NAN", "INFINITY", NULL };
+    static const char* const inside[] = { "signbit", "isnan", "isinf", "isfinite", "isnormal", "fpclassify",
+                                          "fabs", "copysign", "HUGE_VAL", "_Float", NULL };
+    static const char* const builtin[] = { "inf", "nan", "huge_val", NULL };
+    char tok[256];
+    if (n >= sizeof tok) n = sizeof tok - 1;
+    memcpy(tok, t, n); tok[n] = 0;
+    for (int k = 0; exact[k]; k++) if (strcmp(tok, exact[k]) == 0) return true;
+    for (int k = 0; inside[k]; k++) if (strstr(tok, inside[k])) return true;
+    if (strncmp(tok, "__builtin_", 10) == 0)
+        for (int k = 0; builtin[k]; k++) if (strncmp(tok + 10, builtin[k], strlen(builtin[k])) == 0) return true;
+    return false;
+}
+
 /* Line of the first floating construct in the code of `text` (comments and
- * literals skipped), 0 if none: an identifier token naming a floating type
- * or classifier, or a floating literal (a decimal number with '.' or an
- * exponent, a hex number with '.' or a 'p' exponent). */
+ * literals skipped), 0 if none: a floating identifier (float_ident), or a
+ * floating literal (a decimal number with '.' or an exponent, a hex number
+ * with '.' or a 'p' exponent). */
 static int float_code_hit(const char* text) {
-    static const char* const idents[] = { "signbit", "double", "float", "isnan", "isinf", "isfinite",
-                                          "fpclassify", NULL };
     char* c = code_only(text);
     if (!c) return -1;
     int line = 1, hit = 0;
@@ -418,8 +435,7 @@ static int float_code_hit(const char* text) {
         if (src_ident_char(c[i]) && !num) {
             size_t j = i;
             while (src_ident_char(c[j])) j++;
-            for (int k = 0; idents[k]; k++)
-                if (strlen(idents[k]) == j - i && strncmp(c + i, idents[k], j - i) == 0) hit = line;
+            if (float_ident(c + i, j - i)) hit = line;
             i = j;
         } else if (num) {
             bool hex = c[i] == '0' && (c[i + 1] == 'x' || c[i + 1] == 'X');
@@ -473,6 +489,17 @@ static test_result_t test_encidx_float_bits(void) {
     TEST_ASSERT_EQ_I(float_code_hit("x = 0x1p3;"), 1);
     TEST_ASSERT_EQ_I(float_code_hit("char q = '\"'; float z;"), 1);
     TEST_ASSERT_EQ_I(float_code_hit("s = \"a\\\"b\"; isnan(z);"), 1);
+    TEST_ASSERT_EQ_I(float_code_hit("/* __builtin_signbit( __builtin_isnan( */ int x;"), 0);
+    TEST_ASSERT_EQ_I(float_code_hit("// __builtin_inf() __builtin_nan(\"\")\nint x;"), 0);
+    TEST_ASSERT_EQ_I(float_code_hit("if (__builtin_signbit(x)) return;"), 1);
+    TEST_ASSERT_EQ_I(float_code_hit("int a;\nb = __builtin_isnan(x);"), 2);
+    TEST_ASSERT_EQ_I(float_code_hit("x = __builtin_inf();"), 1);
+    TEST_ASSERT_EQ_I(float_code_hit("x = __builtin_nan(\"\");"), 1);
+    TEST_ASSERT_EQ_I(float_code_hit("y = fabs(x) + copysign(a, b);"), 1);
+    TEST_ASSERT_EQ_I(float_code_hit("y = HUGE_VAL; _Float64 z;"), 1);
+    TEST_ASSERT_EQ_I(float_code_hit("y = NAN;"), 1);
+    TEST_ASSERT_EQ_I(float_code_hit("y = INFINITY;"), 1);
+    TEST_ASSERT_EQ_I(float_code_hit("int nan_count = __builtin_popcountll(x), infos;"), 0);
     struct stat st;
     const char* root = stat("src/store/encidx.c", &st) == 0 ? "." : "..";
     char p[128]; snprintf(p, sizeof p, "%s/src/store/encidx.c", root);
