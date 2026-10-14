@@ -110,6 +110,32 @@ static const agg_vtable_t COUNT_ANY = {
     .merge = count_merge, .finalize = count_final, .finalize_value = count_final_value,
 };
 
+/* ---- non-null count (internal OP_COUNT_NN) ----------------------------
+ * The per-partition AVG/VAR divisor of a nullable column: the AVG state's
+ * count without its sum, read straight from the column (no materialized
+ * not-null indicator).  One kernel per nullable native representation. */
+#define COUNT_NN_KERNEL(SFX, T)                                                \
+static void count_nn_##SFX##_update(void* base, size_t stride,                 \
+                                    const uint32_t* gids, const void* vals,    \
+                                    const ray_valid_t* valid, int64_t n,       \
+                                    acc_arena_t* a) {                          \
+    (void)a; const T* d = (const T*)vals;                                      \
+    AGG_UPDATE_LOOP(valid, n, {                                                \
+        ((count_state*)((char*)base + (size_t)gids[i]*stride))->n++;           \
+    });                                                                        \
+}                                                                              \
+static const agg_vtable_t COUNT_NN_##SFX = {                                   \
+    .state_size = sizeof(count_state), .kind = ACC_STREAMING, .out_type = RAY_I64, \
+    .init = count_init, .update_batch = count_nn_##SFX##_update,               \
+    .merge = count_merge, .finalize = count_final, .finalize_value = count_final_value, \
+};
+COUNT_NN_KERNEL(F64, double)
+COUNT_NN_KERNEL(F32, float)
+COUNT_NN_KERNEL(I64, int64_t)
+COUNT_NN_KERNEL(I32, int32_t)
+COUNT_NN_KERNEL(I16, int16_t)
+#undef COUNT_NN_KERNEL
+
 /* ---- min / max I64 (empty group → typed null) ------------------------ */
 typedef struct { int64_t v; int64_t cnt; } ext_i64_state;
 /* Narrow native extrema need a value and validity, not a 64-bit count. */
@@ -1847,6 +1873,16 @@ static const agg_vtable_t PROD_F64 = {
 };
 
 const agg_vtable_t* agg_resolve(uint16_t agg_kind, int8_t in_type) {
+    if (agg_kind == OP_COUNT_NN) {
+        switch (in_type) {
+            case RAY_F64: return &COUNT_NN_F64;
+            case RAY_F32: return &COUNT_NN_F32;
+            case RAY_I64: case RAY_TIMESTAMP: return &COUNT_NN_I64;
+            case RAY_I32: case RAY_DATE: case RAY_TIME: return &COUNT_NN_I32;
+            case RAY_I16: return &COUNT_NN_I16;
+            default: return NULL;
+        }
+    }
     if (agg_kind == OP_PROD && in_type == RAY_BOOL) return &PROD_BOOL;
     if (agg_kind == OP_PROD && in_type == RAY_U8) return &PROD_U8;
     if (agg_kind == OP_PROD && in_type == RAY_I16) return &PROD_I16;

@@ -138,6 +138,56 @@ void   ray_clear_error_trace(void) {
     if (__VM && __VM->trace) { ray_release(__VM->trace); __VM->trace = NULL; }
 }
 
+/* A (raise x) value is consumed by `try`.  An uncaught one stays in
+ * __VM->raise_val until the next raise; clearing it at every top-level
+ * boundary keeps a value from one evaluation from being reported against
+ * an error in a later one. */
+void ray_raise_clear(void) {
+    if (__VM && __VM->raise_val) { ray_release(__VM->raise_val); __VM->raise_val = NULL; }
+}
+
+/* Render the pending uncaught raise value into buf (cap > 0, always
+ * NUL-terminated) for an error printer.  Returns false when nothing is
+ * pending.  Only error printers call this, so `raise` itself stays O(1),
+ * and the cost here is bounded: a string is copied up to cap, a table is
+ * summarised as "<table RxC>" (as println does), and anything else is
+ * formatted in the REPL's display-limited mode.  Text cut at cap ends in
+ * "..". */
+bool ray_raise_render(char* buf, size_t cap) {
+    if (!buf || cap == 0) return false;
+    buf[0] = '\0';
+    ray_t* val = __VM ? __VM->raise_val : NULL;
+    if (!val) return false;
+    if (val->type == RAY_TABLE) {
+        snprintf(buf, cap, "<table %" PRId64 "x%" PRId64 ">",
+                 ray_table_nrows(val), ray_table_ncols(val));
+        return true;
+    }
+    ray_t* text = NULL;
+    const char* p;
+    size_t n;
+    if (val->type == -RAY_STR) {
+        p = ray_str_ptr(val);
+        n = ray_str_len(val);
+    } else {
+        text = ray_fmt(val, 1);
+        if (!text || RAY_IS_ERR(text)) { if (text) ray_error_free(text); return false; }
+        p = ray_str_ptr(text);
+        n = ray_str_len(text);
+    }
+    if (n >= cap) {
+        /* Keep what fits, leaving room for ".." and the NUL. */
+        n = cap > 3 ? cap - 3 : cap - 1;
+        memcpy(buf, p, n);
+        if (cap > 3) { buf[n++] = '.'; buf[n++] = '.'; }
+    } else {
+        memcpy(buf, p, n);
+    }
+    buf[n] = '\0';
+    if (text) ray_release(text);
+    return true;
+}
+
 /* ══════════════════════════════════════════
  * Restricted-mode check
  * ══════════════════════════════════════════ */
@@ -5077,6 +5127,7 @@ out:
 
 ray_t* ray_eval_str(const char* source) {
     ray_clear_error_trace();
+    ray_raise_clear();
     ray_t* nfo = ray_nfo_create(RAY_NFO_REPL_NAME, strlen(RAY_NFO_REPL_NAME), source, strlen(source));
     ray_t* parsed = ray_parse_with_nfo(source, nfo);
     if (RAY_IS_ERR(parsed)) { ray_release(nfo); return parsed; }

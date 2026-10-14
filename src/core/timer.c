@@ -188,19 +188,27 @@ uint32_t ray_timers_fire_expired(ray_timers_t* t) {
          * releases both.  The result (if any) is a new ref the caller
          * must release. */
         ray_t* arg    = make_i64(now);
+        /* A callback is a top-level evaluation of its own: a (raise x)
+         * left uncaught by the last REPL line must not be reported
+         * against this callback's error. */
+        ray_raise_clear();
         ray_t* result = call_fn1(timer->fn, arg);
         ray_release(arg);
         if (result) {
             if (RAY_IS_ERR(result)) {
                 /* An error formats as its code alone; the message lives
-                 * in the runtime's last-error slot.  Print both, as the
+                 * in the runtime's last-error slot, or, for an uncaught
+                 * (raise x), x itself is pending.  Print both, as the
                  * REPL does, so a failing poll names its peer and cause. */
                 char code[8] = {0};
+                char raised[512];
                 memcpy(code, result->sdata, result->slen < 7 ? result->slen : 7);
                 const char* detail = ray_error_msg();
+                if (!detail && ray_raise_render(raised, sizeof raised)) detail = raised;
                 fprintf(stderr, "timer %lld: error: %s%s%s\n",
                         (long long)timer->id, code,
                         detail ? ": " : "", detail ? detail : "");
+                ray_raise_clear();
                 ray_error_free(result);
             } else {
                 ray_release(result);

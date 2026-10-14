@@ -280,6 +280,58 @@ static test_result_t test_repl_run_file_eval_error(void) {
     PASS();
 }
 
+/* Run tmp_rfl_path() through ray_repl_run_file with stderr captured into
+ * out (NUL-terminated, up to cap-1 bytes) and stdout muted.  Returns rc. */
+static int run_file_capture_stderr(char* out, size_t cap) {
+    char path[96];
+    snprintf(path, sizeof path, "/tmp/ray_test_repl_err_%d", (int)getpid());
+    fflush(stdout);
+    fflush(stderr);
+    int saved_out = dup(fileno(stdout));
+    int saved_err = dup(fileno(stderr));
+    int devnull = open("/dev/null", O_WRONLY);
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (devnull >= 0) dup2(devnull, fileno(stdout));
+    if (fd >= 0) dup2(fd, fileno(stderr));
+
+    int rc = ray_repl_run_file(tmp_rfl_path());
+
+    fflush(stdout);
+    fflush(stderr);
+    if (saved_out >= 0) { dup2(saved_out, fileno(stdout)); close(saved_out); }
+    if (saved_err >= 0) { dup2(saved_err, fileno(stderr)); close(saved_err); }
+    if (devnull >= 0) close(devnull);
+    size_t n = 0;
+    if (fd >= 0) {
+        lseek(fd, 0, SEEK_SET);
+        ssize_t r = read(fd, out, cap - 1);
+        if (r > 0) n = (size_t)r;
+        close(fd);
+    }
+    out[n] = '\0';
+    unlink(path);
+    return rc;
+}
+
+/* An uncaught (raise x) prints x after the error code, on the plain path
+ * (top level) and on the traced path (inside a lambda). */
+static test_result_t test_repl_run_file_raise_prints_value(void) {
+    char out[4096];
+
+    TEST_ASSERT_EQ_I(write_rfl("(raise \"order 7 rejected\")\n"), 0);
+    int rc = run_file_capture_stderr(out, sizeof out);
+    TEST_ASSERT_EQ_I(rc, 1);
+    TEST_ASSERT_NOT_NULL(strstr(out, "error: domain: order 7 rejected"));
+
+    TEST_ASSERT_EQ_I(write_rfl("(set f (fn [] (raise [1 2 3])))\n(f)\n"), 0);
+    rc = run_file_capture_stderr(out, sizeof out);
+    TEST_ASSERT_EQ_I(rc, 1);
+    TEST_ASSERT_NOT_NULL(strstr(out, "domain: [1 2 3]"));
+
+    unlink_rfl();
+    PASS();
+}
+
 /* Empty file: ray_repl_run_file shortcircuits (nread == 0 path) and
  * returns 0 without calling parse/eval. */
 static test_result_t test_repl_run_file_empty(void) {
@@ -3025,6 +3077,7 @@ const test_entry_t repl_entries[] = {
     { "repl/run_file/multi_form",       test_repl_run_file_multi_form,       repl_setup, repl_teardown },
     { "repl/run_file/parse_error",      test_repl_run_file_parse_error,      repl_setup, repl_teardown },
     { "repl/run_file/eval_error",       test_repl_run_file_eval_error,       repl_setup, repl_teardown },
+    { "repl/run_file/raise_prints_value", test_repl_run_file_raise_prints_value, repl_setup, repl_teardown },
     { "repl/run_file/empty",            test_repl_run_file_empty,            repl_setup, repl_teardown },
     { "repl/run_file/comments_only",    test_repl_run_file_comments_only,    repl_setup, repl_teardown },
     { "repl/run_file/nonexistent",      test_repl_run_file_nonexistent,      repl_setup, repl_teardown },

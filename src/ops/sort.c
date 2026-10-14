@@ -1142,10 +1142,8 @@ void radix_encode_fn(void* arg, uint32_t wid, int64_t start, int64_t end) {
                 } else if (col->type == RAY_I64 || col->type == RAY_TIMESTAMP) {
                     val = ((const int64_t*)ray_data(col))[i];
                 } else if (col->type == RAY_F64) {
-                    uint64_t bits;
-                    memcpy(&bits, &((const double*)ray_data(col))[i], 8);
-                    uint64_t mask = -(bits >> 63) | ((uint64_t)1 << 63);
-                    val = (int64_t)(bits ^ mask);
+                    double x = ((const double*)ray_data(col))[i];
+                    val = radix_f64_is_null(x) ? c->mins[k] : radix_f64_ord(x);
                 } else if (col->type == RAY_I32 || col->type == RAY_DATE || col->type == RAY_TIME) {
                     val = (int64_t)((const int32_t*)ray_data(col))[i];
                 } else if (col->type == RAY_I16) {
@@ -2199,13 +2197,6 @@ void mk_prescan_fn(void* arg, uint32_t wid,
     int64_t* my_mins = c->pw_mins + (int64_t)wid * nk;
     int64_t* my_maxs = c->pw_maxs + (int64_t)wid * nk;
 
-    /* Initialize on first morsel, merge on subsequent */
-    for (uint32_t k = 0; k < nk; k++) {
-        if (my_mins[k] == INT64_MAX) {
-            /* first morsel for this worker — will be set below */
-        }
-    }
-
     for (uint32_t k = 0; k < nk; k++) {
         ray_t* col = c->vecs[k];
         int64_t kmin = my_mins[k], kmax = my_maxs[k];
@@ -2230,10 +2221,8 @@ void mk_prescan_fn(void* arg, uint32_t wid,
         } else if (col->type == RAY_F64) {
             const double* d = (const double*)ray_data(col);
             for (int64_t i = start; i < end; i++) {
-                uint64_t bits;
-                memcpy(&bits, &d[i], 8);
-                uint64_t mask = -(bits >> 63) | ((uint64_t)1 << 63);
-                int64_t v = (int64_t)(bits ^ mask);
+                if (radix_f64_is_null(d[i])) continue;
+                int64_t v = radix_f64_ord(d[i]);
                 if (v < kmin) kmin = v;
                 if (v > kmax) kmax = v;
             }
@@ -2649,30 +2638,14 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
                 uint16_t total_bits = 0;
                 bool fits = true;
 
-                /* A float null is NaN, and the composite encode packs a
-                 * double by flipping its bits — which puts NaN above every
-                 * real number, i.e. last on ascending, whatever
-                 * sort_nulls_first says.  The other types carry a sentinel
-                 * that already lands where the rule wants it (INT64_MIN is
-                 * the smallest), so only F64 disagrees.  Rather than teach
-                 * the packing a second placement, hand a null-bearing float
-                 * key to the rank-then-compose fallback, which ranks
-                 * through sort_indices_ex and is null-aware.  Leaving it in
-                 * the direct encode is what made a multi-key sort place
-                 * floats one way below 64 rows and the other way above. */
-                bool nullable_f64_key = false;
-                for (uint32_t k = 0; k < n_cols; k++)
-                    if (cols[k]->type == RAY_F64 &&
-                        ray_vec_may_have_nulls(cols[k])) {
-                        nullable_f64_key = true;
-                        break;
-                    }
-
+                /* A null-bearing F64 key packs its nulls into a reserved
+                 * slot below its minimum (radix_key_bounds_finish), so it
+                 * stays on the composite with the placement the comparator
+                 * gives, at every row count. */
                 ray_pool_t* mk_prescan_pool = (nrows >= SMALL_POOL_THRESHOLD) ? pool : NULL;
-                if (has_wide_key || nullable_f64_key) {
+                if (has_wide_key) {
                     /* RAY_STR / RAY_GUID can't be packed into a composite
-                     * uint64 key, and a nullable float must not be.  Force
-                     * the rank-then-compose fallback. */
+                     * uint64 key.  Force the rank-then-compose fallback. */
                     total_bits = UINT16_MAX;
                     fits = false;
                 } else if (n_cols <= MK_PRESCAN_MAX_KEYS && mk_prescan_pool) {
@@ -2706,6 +2679,7 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
                             if (wmin < kmin) kmin = wmin;
                             if (wmax > kmax) kmax = wmax;
                         }
+                        radix_key_bounds_finish(cols[k], &kmin, &kmax);
                         mins[k] = kmin;
                         maxs[k] = kmax;
                         /* Unsigned subtraction: kmin can be the i64 null
@@ -2743,10 +2717,8 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
                         } else if (col->type == RAY_F64) {
                             const double* d = (const double*)ray_data(col);
                             for (int64_t i = 0; i < nrows; i++) {
-                                uint64_t bits;
-                                memcpy(&bits, &d[i], 8);
-                                uint64_t mask = -(bits >> 63) | ((uint64_t)1 << 63);
-                                int64_t v = (int64_t)(bits ^ mask);
+                                if (radix_f64_is_null(d[i])) continue;
+                                int64_t v = radix_f64_ord(d[i]);
                                 if (v < kmin) kmin = v;
                                 if (v > kmax) kmax = v;
                             }
@@ -2770,6 +2742,7 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
                             }
                         }
 
+                        radix_key_bounds_finish(cols[k], &kmin, &kmax);
                         mins[k] = kmin;
                         maxs[k] = kmax;
                         /* Unsigned subtraction: kmin can be the i64 null
@@ -2929,9 +2902,9 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
                     uint8_t accum = 0;
                     for (int k = n_cols - 1; k >= 0; k--) {
                         bit_shifts[k] = accum;
-                        uint64_t range = (uint64_t)(maxs[k] - mins[k]);
+                        uint64_t range = (uint64_t)maxs[k] - (uint64_t)mins[k];
                         uint8_t bits = 1;
-                        while (((uint64_t)1 << bits) <= range && bits < 64)
+                        while (bits < 64 && ((uint64_t)1 << bits) <= range)
                             bits++;
                         accum += bits;
                     }
@@ -2952,7 +2925,7 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
                             };
                             for (uint32_t k = 0; k < n_cols; k++) {
                                 enc.mins[k] = mins[k];
-                                enc.ranges[k] = maxs[k] - mins[k];
+                                enc.ranges[k] = (int64_t)((uint64_t)maxs[k] - (uint64_t)mins[k]);
                                 enc.bit_shifts[k] = bit_shifts[k];
                                 enc.descs[k] = descs ? descs[k] : 0;
                                 enc.enum_ranks[k] = enum_ranks[k];

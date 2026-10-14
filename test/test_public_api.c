@@ -646,6 +646,65 @@ static test_result_t test_public_get_error_trace_cleared_on_eval(void) {
     PASS();
 }
 
+/* (raise x) stays O(1): it records x for `try` and formats nothing.  An
+ * uncaught x is rendered only on demand, bounded, for an error printer;
+ * `try` consumes it and every top-level ray_eval_str clears it. */
+extern const char* ray_error_msg(void);
+extern bool ray_raise_render(char* buf, size_t cap);
+static test_result_t test_public_raise_render(void) {
+    char buf[64];
+
+    ray_t* err = ray_eval_str("(raise \"order 7 rejected\")");
+    TEST_ASSERT_TRUE(RAY_IS_ERR(err));
+    TEST_ASSERT_STR_EQ(ray_err_code(err), "domain");
+    TEST_ASSERT_NULL(ray_error_msg());            /* nothing formatted at raise */
+    TEST_ASSERT_TRUE(ray_raise_render(buf, sizeof buf));
+    TEST_ASSERT_STR_EQ(buf, "order 7 rejected");
+    ray_error_free(err);
+
+    err = ray_eval_str("((fn [] (raise [1 2 3])))");
+    TEST_ASSERT_TRUE(RAY_IS_ERR(err));
+    TEST_ASSERT_TRUE(ray_raise_render(buf, sizeof buf));
+    TEST_ASSERT_STR_EQ(buf, "[1 2 3]");
+    ray_error_free(err);
+
+    /* A table is summarised, not drawn. */
+    err = ray_eval_str("(raise (table [a] (list [1 2])))");
+    TEST_ASSERT_TRUE(RAY_IS_ERR(err));
+    TEST_ASSERT_TRUE(ray_raise_render(buf, sizeof buf));
+    TEST_ASSERT_STR_EQ(buf, "<table 2x1>");
+    ray_error_free(err);
+
+    /* Large values render bounded, marked "..". */
+    err = ray_eval_str("(raise (til 1000000))");
+    TEST_ASSERT_TRUE(RAY_IS_ERR(err));
+    TEST_ASSERT_TRUE(ray_raise_render(buf, 16));
+    TEST_ASSERT_EQ_I((int)strlen(buf), 15);
+    TEST_ASSERT_STR_EQ(buf + 13, "..");
+    ray_error_free(err);
+
+    /* A string longer than the buffer is cut, not over-read. */
+    err = ray_eval_str("(raise \"abcdefghijklmnopqrstuvwxyz\")");
+    TEST_ASSERT_TRUE(RAY_IS_ERR(err));
+    TEST_ASSERT_TRUE(ray_raise_render(buf, 8));
+    TEST_ASSERT_STR_EQ(buf, "abcde..");
+    ray_error_free(err);
+
+    /* The next top-level evaluation clears a pending value. */
+    ray_t* r = ray_eval_str("(+ 1 2)");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    TEST_ASSERT_FALSE(ray_raise_render(buf, sizeof buf));
+
+    /* try consumes the value and still hands the handler the raw value. */
+    r = ray_eval_str("(try (raise 41) (fn [e] (+ e 1)))");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->i64, 42);
+    ray_release(r);
+    TEST_ASSERT_FALSE(ray_raise_render(buf, sizeof buf));
+    PASS();
+}
+
 static test_result_t test_public_nullability_matrix(void) {
     ray_t* ordinary[] = {
         ray_sym(0),
@@ -724,6 +783,7 @@ const test_entry_t public_api_entries[] = {
     { "public/eval_restricted_allows_arith",   test_public_eval_restricted_allows_arith,   public_api_setup, public_api_teardown },
     { "public/get_error_trace_populated",      test_public_get_error_trace_populated,      public_api_setup, public_api_teardown },
     { "public/get_error_trace_cleared_on_eval",test_public_get_error_trace_cleared_on_eval,public_api_setup, public_api_teardown },
+    { "public/raise_render",                   test_public_raise_render,                   public_api_setup, public_api_teardown },
     { "public/nullability_matrix",             test_public_nullability_matrix,             public_api_setup, public_api_teardown },
 
     { NULL, NULL, NULL, NULL },

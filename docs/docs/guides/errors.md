@@ -133,10 +133,10 @@ Any error you create with `raise`:
 
 ```text
 (raise "custom error message")
-; error: domain
+; error: domain: custom error message
 ```
 
-Internally, `raise` stores your value and triggers a domain error. The `try` handler receives the stored value.
+Internally, `raise` stores your value and triggers a domain error. The `try` handler receives the stored value. When nothing catches it, the REPL, the script runner and a timer callback print the value after the code: a string as is, a table as `<table RxC>`, anything else in the REPL's display form, cut with `..` when long.
 
 ### Access Errors (Restricted Mode)
 
