@@ -138,6 +138,56 @@ void   ray_clear_error_trace(void) {
     if (__VM && __VM->trace) { ray_release(__VM->trace); __VM->trace = NULL; }
 }
 
+/* A (raise x) value is consumed by `try`.  An uncaught one stays in
+ * __VM->raise_val until the next raise; clearing it at every top-level
+ * boundary keeps a value from one evaluation from being reported against
+ * an error in a later one. */
+void ray_raise_clear(void) {
+    if (__VM && __VM->raise_val) { ray_release(__VM->raise_val); __VM->raise_val = NULL; }
+}
+
+/* Render the pending uncaught raise value into buf (cap > 0, always
+ * NUL-terminated) for an error printer.  Returns false when nothing is
+ * pending.  Only error printers call this, so `raise` itself stays O(1),
+ * and the cost here is bounded: a string is copied up to cap, a table is
+ * summarised as "<table RxC>" (as println does), and anything else is
+ * formatted in the REPL's display-limited mode.  Text cut at cap ends in
+ * "..". */
+bool ray_raise_render(char* buf, size_t cap) {
+    if (!buf || cap == 0) return false;
+    buf[0] = '\0';
+    ray_t* val = __VM ? __VM->raise_val : NULL;
+    if (!val) return false;
+    if (val->type == RAY_TABLE) {
+        snprintf(buf, cap, "<table %" PRId64 "x%" PRId64 ">",
+                 ray_table_nrows(val), ray_table_ncols(val));
+        return true;
+    }
+    ray_t* text = NULL;
+    const char* p;
+    size_t n;
+    if (val->type == -RAY_STR) {
+        p = ray_str_ptr(val);
+        n = ray_str_len(val);
+    } else {
+        text = ray_fmt(val, 1);
+        if (!text || RAY_IS_ERR(text)) { if (text) ray_error_free(text); return false; }
+        p = ray_str_ptr(text);
+        n = ray_str_len(text);
+    }
+    if (n >= cap) {
+        /* Keep what fits, leaving room for ".." and the NUL. */
+        n = cap > 3 ? cap - 3 : cap - 1;
+        memcpy(buf, p, n);
+        if (cap > 3) { buf[n++] = '.'; buf[n++] = '.'; }
+    } else {
+        memcpy(buf, p, n);
+    }
+    buf[n] = '\0';
+    if (text) ray_release(text);
+    return true;
+}
+
 /* ══════════════════════════════════════════
  * Restricted-mode check
  * ══════════════════════════════════════════ */
@@ -153,6 +203,42 @@ static inline ray_binary_fn unary_binary_overload(ray_unary_fn fn) {
     if (fn == ray_min_fn) return ray_min2_fn;
     if (fn == ray_max_fn) return ray_max2_fn;
     return NULL;
+}
+
+/* A LIST whose elements are all atoms of one numeric or temporal type, as
+ * a vector of that type (the list is released); any other list as it is. */
+static ray_t* list_collapse_uniform(ray_t* list) {
+    if (!list || RAY_IS_ERR(list) || list->type != RAY_LIST || ray_len(list) == 0)
+        return list;
+    ray_t** e = (ray_t**)ray_data(list);
+    int8_t t = e[0] ? e[0]->type : 0;
+    switch (t) {
+    case -RAY_BOOL: case -RAY_U8: case -RAY_I16: case -RAY_I32: case -RAY_I64:
+    case -RAY_F32: case -RAY_F64: case -RAY_DATE: case -RAY_TIME: case -RAY_TIMESTAMP:
+        break;
+    default:
+        return list;
+    }
+    int64_t n = ray_len(list);
+    for (int64_t i = 1; i < n; i++)
+        if (!e[i] || e[i]->type != t) return list;
+    ray_t* vec = ray_vec_new((int8_t)-t, n);
+    if (!vec || RAY_IS_ERR(vec)) return list;
+    vec->len = n;
+    for (int64_t i = 0; i < n; i++) store_typed_elem(vec, i, e[i]);
+    ray_release(list);
+    return vec;
+}
+
+/* (min a b) / (max a b) over collections.  Two collections must have the
+ * same length, an error named for the call; and over a LIST the results,
+ * when they share one type, make a vector of it. */
+static ray_t* minmax_map(ray_binary_fn f2, ray_t* a, ray_t* b) {
+    if (is_collection(a) && is_collection(b) && ray_len(a) != ray_len(b))
+        return ray_error("length", "%s: operand lengths must match, got %lld and %lld",
+                         f2 == ray_min2_fn ? "min" : "max",
+                         (long long)ray_len(a), (long long)ray_len(b));
+    return list_collapse_uniform(atomic_map_binary(f2, a, b));
 }
 
 static ray_t* materialize_owned_args(ray_t** args, int64_t n) {
@@ -768,7 +854,7 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
          * does NOT broadcast (only a true atom does — see the
          * !left_coll/!right_coll branch). */
         if (ray_len(left) != ray_len(right)) {
-            const char* opn = ray_opcode_name(dag_opcode);
+            const char* opn = dag_opcode ? ray_opcode_name(dag_opcode) : NULL;
             return ray_error("length", "%s: operand lengths must match, got %lld and %lld",
                              opn ? opn : "binary op",
                              (long long)ray_len(left), (long long)ray_len(right));
@@ -835,7 +921,11 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
     /* When LEFT is scalar broadcast to RIGHT vector, the output type follows
      * the RIGHT vector's element type for integer types,
      * unless float or temporal promotion is involved. */
-    if (!e0_null && !e0_bool && !left_coll && right_coll && ray_is_vec(right) && out_type != RAY_F64) {
+    /* Not for the dyadic min/max: their result type is already the
+     * operands' promoted one (minmax_type), and narrowing it here would
+     * wrap a chosen scalar, (max 300 u8vec) giving 0x2c. */
+    if (!e0_null && !e0_bool && !left_coll && right_coll && ray_is_vec(right) && out_type != RAY_F64 &&
+        fn != ray_min2_fn && fn != ray_max2_fn) {
         int8_t vec_type = right->type;
         /* Only override for integer family: if probed type is wider int, downcast */
         int out_is_int = (out_type == RAY_I64 || out_type == RAY_I32 || out_type == RAY_I16 || out_type == RAY_U8);
@@ -1291,7 +1381,7 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
     /* Coerce an integer atom to the scalar's integer type */
     #define COERCE_TO_SCALAR(elem) do { \
         if (scalar_int_type && ray_is_atom(elem) && elem->type != scalar_int_type && \
-            elem->type != -RAY_F64 && is_numeric(elem)) { \
+            elem->type != -RAY_F64 && elem->type != -RAY_BOOL && is_numeric(elem)) { \
             int64_t _v = as_i64(elem); \
             ray_t* _coerced = make_typed_int(scalar_int_type, _v); \
             ray_release(elem); \
@@ -1337,7 +1427,22 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
         out[i] = elem;
     }
     #undef COERCE_TO_SCALAR
-    return result;
+    return ray_list_collapse_bool(result);
+}
+
+ray_t* ray_list_collapse_bool(ray_t* list) {
+    if (!list || RAY_IS_ERR(list) || list->type != RAY_LIST) return list;
+    int64_t n = ray_len(list);
+    ray_t** e = (ray_t**)ray_data(list);
+    for (int64_t i = 0; i < n; i++)
+        if (!e[i] || e[i]->type != -RAY_BOOL) return list;
+    ray_t* vec = ray_vec_new(RAY_BOOL, n);
+    if (!vec || RAY_IS_ERR(vec)) return list;
+    uint8_t* d = (uint8_t*)ray_data(vec);
+    for (int64_t i = 0; i < n; i++) d[i] = e[i]->b8 ? 1 : 0;
+    vec->len = n;
+    ray_release(list);
+    return vec;
 }
 
 /* Map a unary function element-wise over a collection.
@@ -1515,7 +1620,7 @@ ray_t* call_fn2(ray_t* fn, ray_t* a, ray_t* b) {
                 owned_b = true;
             }
             ray_t* out = (is_collection(la) || is_collection(lb))
-                       ? atomic_map_binary(f2, la, lb) : f2(la, lb);
+                       ? minmax_map(f2, la, lb) : f2(la, lb);
             if (owned_a) ray_release(la);
             if (owned_b) ray_release(lb);
             return out;
@@ -1989,22 +2094,28 @@ ray_t* ray_let_fn(ray_t* name_obj, ray_t* val_expr) {
     return val;
 }
 
-/* (if cond then else?) — conditional. Receives unevaluated args. */
+/* (if c1 r1 c2 r2 ... else?) — conditional chain.  Receives unevaluated
+ * args.  Conditions are tried in order and the result paired with the
+ * first truthy one is evaluated; an odd trailing arg is the fallback.  No
+ * fallback: return 0. */
 ray_t* ray_cond_fn(ray_t** args, int64_t n) {
     if (n < 2) return ray_error("domain", "if: expected at least 2 args (cond then), got %lld", (long long)n);
-    ray_t* cond = ray_eval(args[0]);
-    if (RAY_IS_ERR(cond)) return cond;
-    /* A vector condition tested whole: the expression may have needed
-     * row-by-row evaluation (see the opaque by: key). */
-    if (!ray_is_atom(cond)) __VM->rows_cond++;
-    /* Materialize lazy handles before testing truthiness */
-    if (ray_is_lazy(cond))
-        cond = ray_lazy_materialize(cond);
-    if (RAY_IS_ERR(cond)) return cond;
-    int truthy = is_truthy(cond);
-    ray_release(cond);
-    if (truthy) return ray_eval(args[1]);
-    if (n >= 3) return ray_eval(args[2]);
+    int64_t i = 0;
+    for (; i + 1 < n; i += 2) {
+        ray_t* cond = ray_eval(args[i]);
+        if (RAY_IS_ERR(cond)) return cond;
+        /* A vector condition tested whole: the expression may have needed
+         * row-by-row evaluation (see the opaque by: key). */
+        if (!ray_is_atom(cond)) __VM->rows_cond++;
+        /* Materialize lazy handles before testing truthiness */
+        if (ray_is_lazy(cond))
+            cond = ray_lazy_materialize(cond);
+        if (RAY_IS_ERR(cond)) return cond;
+        int truthy = is_truthy(cond);
+        ray_release(cond);
+        if (truthy) return ray_eval(args[i + 1]);
+    }
+    if (i < n) return ray_eval(args[i]);
     /* No else branch: return 0 */
     return make_i64(0);
 }
@@ -2106,8 +2217,34 @@ ray_t* ray_times_dec_fn(ray_t* x) {
     return make_i64(as_i64(x) - 1);
 }
 
+/* The index of the pass about to run, from the normalized bound and the
+ * passes still to go (counter > 0 when this is called). */
+ray_t* ray_times_idx_fn(ray_t* lim, ray_t* ctr) {
+    return make_i64(as_i64(lim) - as_i64(ctr));
+}
+
+/* If `ast` is the binding of an indexed `times`, as the parser builds it
+ * from [name count], fill the name's sym and the count expression. */
+bool ray_times_binding(ray_t* ast, int64_t* name, ray_t** count) {
+    if (!ast || ast->type != RAY_LIST || ast->len != 3) return false;
+    ray_t** e = (ray_t**)ray_data(ast);
+    if (!e[0] || e[0]->type != -RAY_SYM || (e[0]->attrs & ATTR_QUOTED) ||
+        e[0]->i64 != ray_sym_intern(RAY_TIMES_BIND, sizeof(RAY_TIMES_BIND) - 1))
+        return false;
+    if (!e[1] || e[1]->type != -RAY_SYM) return false;
+    *name = e[1]->i64;
+    *count = e[2];
+    return true;
+}
+
 /* (times n body...) — evaluate the body exactly n times.  Receives
  * unevaluated args.  Always returns null, like `while`.
+ *
+ * (times [i n] body...) also binds i to 0, 1, ..., n-1, one per pass.
+ * The name is bound like a `let`, in the current frame, and stays bound
+ * after the loop to the last index (untouched when no pass runs).  The
+ * index is assigned at the top of each pass from the loop's own counter,
+ * so a body that rebinds i changes it for the rest of that pass only.
  *
  * `n` is evaluated ONCE, up front: the count is a bound fixed on entry,
  * so a body that mutates whatever produced it cannot change how many
@@ -2122,7 +2259,12 @@ ray_t* ray_times_dec_fn(ray_t* x) {
  * The compiled form is emitted by the bytecode compiler — see compile.c. */
 ray_t* ray_times_fn(ray_t** args, int64_t n) {
     if (n < 1) return ray_error("domain", "times: expected at least 1 arg (count), got %lld", (long long)n);
-    ray_t* cnt = ray_eval(args[0]);
+    int64_t name = -1;
+    ray_t* cexpr = args[0];
+    if (ray_times_binding(args[0], &name, &cexpr) &&
+        ray_sym_is_reserved(name) && !ray_sym_is_ipc_hook(name))
+        return ray_error(ray_err_code_str(RAY_ERR_RESERVED), NULL);
+    ray_t* cnt = ray_eval(cexpr);
     if (RAY_IS_ERR(cnt)) return cnt;
     if (ray_is_lazy(cnt))
         cnt = ray_lazy_materialize(cnt);
@@ -2133,6 +2275,13 @@ ray_t* ray_times_fn(ray_t** args, int64_t n) {
     ray_release(cnt);
     if (bad) return err;
     for (int64_t r = 0; r < reps; r++) {
+        if (name >= 0) {
+            ray_t* idx = make_i64(r);
+            if (RAY_IS_ERR(idx)) return idx;
+            ray_err_t e = ray_env_set_local_rows(name, idx, 0);
+            ray_release(idx);
+            if (e != RAY_OK) return ray_error(ray_err_code_str(e), NULL);
+        }
         for (int64_t i = 1; i < n; i++) {
             ray_t* val = ray_eval(args[i]);
             if (RAY_IS_ERR(val)) return val;
@@ -3303,7 +3452,7 @@ op_callf: {
                     }
                 }
                 result = (is_collection(fn_args[0]) || is_collection(fn_args[1]))
-                       ? atomic_map_binary(binary, fn_args[0], fn_args[1])
+                       ? minmax_map(binary, fn_args[0], fn_args[1])
                        : binary(fn_args[0], fn_args[1]);
                 ray_release(fn_args[0]);
                 ray_release(fn_args[1]);
@@ -4808,7 +4957,7 @@ ray_t* ray_eval(ray_t* obj) {
                     if (!right || RAY_IS_ERR(right)) { ray_release(left); ret = right ? right : ray_error("type", NULL); goto out; }
                 }
                 ret = (is_collection(left) || is_collection(right))
-                    ? atomic_map_binary(fn2, left, right) : fn2(left, right);
+                    ? minmax_map(fn2, left, right) : fn2(left, right);
                 ray_release(left);
                 ray_release(right);
                 goto out;
@@ -5071,6 +5220,7 @@ out:
 
 ray_t* ray_eval_str(const char* source) {
     ray_clear_error_trace();
+    ray_raise_clear();
     ray_t* nfo = ray_nfo_create(RAY_NFO_REPL_NAME, strlen(RAY_NFO_REPL_NAME), source, strlen(source));
     ray_t* parsed = ray_parse_with_nfo(source, nfo);
     if (RAY_IS_ERR(parsed)) { ray_release(nfo); return parsed; }

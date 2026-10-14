@@ -520,6 +520,22 @@ static void fmt_list(fmt_buf_t* b, ray_t* list, int mode) {
     int64_t len = ray_len(list);
     if (len == 0) { fmt_puts(b, "()"); return; }
 
+    /* The binding of an indexed `times`, (RAY_TIMES_BIND name count) as the
+     * parser builds it from [name count]: print it as it was written, so a
+     * quoted loop reads back and round-trips. */
+    {
+        int64_t bname = -1;
+        ray_t* bcount = NULL;
+        if (ray_times_binding(list, &bname, &bcount)) {
+            fmt_putc(b, '[');
+            fmt_obj(b, ((ray_t**)ray_data(list))[1], mode);
+            fmt_putc(b, ' ');
+            fmt_obj(b, bcount, mode);
+            fmt_putc(b, ']');
+            return;
+        }
+    }
+
     /* Historical display equivalence: a homogeneous-atom list renders as a
      * vector [..] in the round-trippable / cell modes (0 and 2), which the
      * test suite and value-equality (fmt_eq, mode 0) rely on.  REPL display
@@ -801,6 +817,178 @@ static void fmt_centered(fmt_buf_t* b, const char* s, int32_t slen, int32_t widt
     for (int32_t i = 0; i < right; i++) fmt_putc(b, ' ');
 }
 
+/* ===== Parted table cells =====
+ *
+ * A parted table's columns hold no cells of their own: a parted column
+ * (RAY_PARTED_BASE + type) is an array of per-partition segments, and the
+ * partition-key column (RAY_MAPCOMMON) one key per partition with that
+ * partition's row count.  Every table format reads their cells in place,
+ * as the flat column they stand for prints them, without building it.  A
+ * NULL segment — a partition without the column (ragged, see store/part.c)
+ * — spans that partition's rows, from the table's partition-key counts,
+ * and prints the column's typed null, as the flat column with nulls does.
+ *
+ * fmt_col_t walks one column: a cursor over its partitions, so reading the
+ * rows in order costs one step per row (a jump back restarts it). */
+typedef struct {
+    ray_t*         col;     /* the table column (any kind) */
+    int8_t         type;    /* element type of the flat column */
+    const int64_t* cnt;     /* per-partition row counts, NULL if none */
+    int64_t        ncnt;
+    int64_t        s;       /* cursor: current partition */
+    int64_t        start;   /* cursor: its first row */
+} fmt_col_t;
+
+enum { FMT_CELL_OUT, FMT_CELL_MISSING, FMT_CELL_AT };
+
+static bool fmt_col_is_parted(ray_t* col) {
+    return col && (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON);
+}
+
+static int8_t fmt_col_type(ray_t* col) {
+    if (!col) return 0;
+    if (RAY_IS_PARTED(col->type)) return (int8_t)RAY_PARTED_BASETYPE(col->type);
+    if (col->type == RAY_MAPCOMMON) {
+        ray_t* keys = ((ray_t**)ray_data(col))[0];
+        return keys ? keys->type : 0;
+    }
+    return col->type;
+}
+
+/* The per-partition row counts of a parted table: its partition-key
+ * column's counts vector, or NULL. */
+static ray_t* fmt_part_counts(ray_t* tbl) {
+    int64_t ncols = ray_table_ncols(tbl);
+    for (int64_t c = 0; c < ncols; c++) {
+        ray_t* col = ray_table_get_col_idx(tbl, c);
+        if (col && col->type == RAY_MAPCOMMON) {
+            ray_t* rc = ((ray_t**)ray_data(col))[1];
+            return rc && !RAY_IS_ERR(rc) ? rc : NULL;
+        }
+    }
+    return NULL;
+}
+
+static void fmt_col_init(fmt_col_t* c, ray_t* col, ray_t* counts) {
+    c->col = col;
+    c->type = fmt_col_type(col);
+    c->cnt = NULL;
+    c->ncnt = 0;
+    c->s = 0;
+    c->start = 0;
+    if (col && col->type == RAY_MAPCOMMON) counts = ((ray_t**)ray_data(col))[1];
+    if (counts && !RAY_IS_ERR(counts)) {
+        c->cnt  = (const int64_t*)ray_data(counts);
+        c->ncnt = counts->len;
+    }
+}
+
+static int64_t fmt_col_nparts(const fmt_col_t* c) {
+    if (RAY_IS_PARTED(c->col->type)) return c->col->len;
+    ray_t* keys = ((ray_t**)ray_data(c->col))[0];
+    if (!keys) return 0;
+    return c->ncnt < keys->len ? c->ncnt : keys->len;
+}
+
+/* Rows of partition p: its segment's length, else the partition's count. */
+static int64_t fmt_col_part_rows(const fmt_col_t* c, int64_t p) {
+    if (RAY_IS_PARTED(c->col->type)) {
+        ray_t* seg = ((ray_t**)ray_data(c->col))[p];
+        if (seg && !RAY_IS_ERR(seg)) return seg->len;
+    }
+    return p < c->ncnt ? c->cnt[p] : 0;
+}
+
+/* Resolve row ri to the vector and index holding its cell (FMT_CELL_AT),
+ * a missing segment's null (FMT_CELL_MISSING), or no such row. */
+static int fmt_col_cell(fmt_col_t* c, int64_t ri, ray_t** vec, int64_t* at) {
+    ray_t* col = c->col;
+    if (!col || ri < 0) return FMT_CELL_OUT;
+    if (!fmt_col_is_parted(col)) {
+        if (ri >= ray_len(col)) return FMT_CELL_OUT;
+        *vec = col; *at = ri;
+        return FMT_CELL_AT;
+    }
+    if (ri < c->start) { c->s = 0; c->start = 0; }
+    int64_t np = fmt_col_nparts(c);
+    while (c->s < np) {
+        int64_t n = fmt_col_part_rows(c, c->s);
+        if (ri - c->start < n) break;
+        c->start += n;
+        c->s++;
+    }
+    if (c->s >= np) return FMT_CELL_OUT;
+    if (col->type == RAY_MAPCOMMON) {
+        *vec = ((ray_t**)ray_data(col))[0];
+        *at = c->s;
+        return FMT_CELL_AT;
+    }
+    ray_t* seg = ((ray_t**)ray_data(col))[c->s];
+    if (!seg || RAY_IS_ERR(seg)) return FMT_CELL_MISSING;
+    *vec = seg;
+    *at = ri - c->start;
+    return FMT_CELL_AT;
+}
+
+/* A missing segment's cell, as fmt_raw_elem prints a null of the type:
+ * its null literal, "" for STR, null for a LIST cell; B8/U8 have no null
+ * (the flat column holds 0 there, as ser writes it). */
+static void fmt_missing_cell(fmt_buf_t* b, int8_t type) {
+    switch (type) {
+    case RAY_BOOL: fmt_bool(b, 0); return;
+    case RAY_U8:   fmt_u8(b, 0); return;
+    case RAY_STR:  fmt_puts(b, "\"\""); return;
+    default:       fmt_puts(b, null_literal(type)); return;
+    }
+}
+
+/* Write row ri's cell; false when the column has no such row. */
+static bool fmt_col_write(fmt_buf_t* b, fmt_col_t* c, int64_t ri) {
+    ray_t* v = NULL;
+    int64_t at = 0;
+    switch (fmt_col_cell(c, ri, &v, &at)) {
+    case FMT_CELL_AT:      fmt_raw_elem(b, v, at); return true;
+    case FMT_CELL_MISSING: fmt_missing_cell(b, c->type); return true;
+    default:               return false;
+    }
+}
+
+/* Row ri's element of a parted LIST column (a missing segment's is null). */
+static ray_t* fmt_col_elem(fmt_col_t* c, int64_t ri) {
+    ray_t* v = NULL;
+    int64_t at = 0;
+    if (fmt_col_cell(c, ri, &v, &at) != FMT_CELL_AT) return RAY_NULL_OBJ;
+    return ((ray_t**)ray_data(v))[at];
+}
+
+/* A parted column of `nrows` rows in compact mode (0), exactly as fmt_obj
+ * writes the flat column: fmt_vector unlimited, or fmt_list for LIST. */
+static void fmt_col_compact(fmt_buf_t* b, fmt_col_t* c, int64_t nrows) {
+    if (c->type != RAY_LIST) {
+        if (nrows == 0) { fmt_puts(b, "[]"); return; }
+        fmt_putc(b, '[');
+        for (int64_t ri = 0; ri < nrows && !b->err; ri++) {
+            if (ri > 0) fmt_putc(b, ' ');
+            if (!fmt_col_write(b, c, ri)) fmt_missing_cell(b, c->type);
+        }
+        fmt_putc(b, ']');
+        return;
+    }
+    if (nrows == 0) { fmt_puts(b, "()"); return; }
+    ray_t* first = fmt_col_elem(c, 0);
+    bool homogeneous = first && !RAY_IS_ERR(first) && ray_is_atom(first);
+    for (int64_t ri = 1; homogeneous && ri < nrows; ri++) {
+        ray_t* e = fmt_col_elem(c, ri);
+        if (!e || RAY_IS_ERR(e) || e->type != first->type) homogeneous = false;
+    }
+    fmt_puts(b, homogeneous ? "[" : "(list ");
+    for (int64_t ri = 0; ri < nrows && !b->err; ri++) {
+        if (ri > 0) fmt_putc(b, ' ');
+        fmt_obj(b, fmt_col_elem(c, ri), 0);
+    }
+    fmt_putc(b, homogeneous ? ']' : ')');
+}
+
 /* The REPL display (mode 1) pre-formats at most FMT_TABLE_MAX_WIDTH x
  * FMT_TABLE_MAX_HEIGHT cells on the stack; mode 2 without a sink pre-formats
  * the whole table on the heap, and show streams it (fmt_table_stream). */
@@ -815,11 +1003,10 @@ typedef struct {
  * each column's display width over every cell; the second writes the rows,
  * which the sink flushes as the buffer fills.  Memory is O(columns), unlike
  * the pre-formatted cell grid of the REPL display. */
-static void fmt_stream_cell(fmt_buf_t* tmp, ray_t* col, int64_t ri,
+static void fmt_stream_cell(fmt_buf_t* tmp, fmt_col_t* col, int64_t ri,
                             const char** s, int32_t* len) {
-    if (!col || ri >= ray_len(col)) { *s = "NA"; *len = 2; return; }
     tmp->len = 0;
-    fmt_raw_elem(tmp, col, ri);
+    if (!fmt_col_write(tmp, col, ri)) { *s = "NA"; *len = 2; return; }
     *s = tmp->buf;
     *len = tmp->len;   /* whole cell: tmp grows, unlike the REPL's fixed grid */
 }
@@ -846,21 +1033,25 @@ static void fmt_table_stream(fmt_buf_t* b, ray_t* tbl) {
 
     ray_t* wblk = ray_alloc((size_t)ncols * sizeof(int32_t));
     ray_t* nblk = ray_alloc((size_t)ncols * sizeof(ray_t*));
+    ray_t* cblk = ray_alloc((size_t)ncols * sizeof(fmt_col_t));
     if (nblk) memset(ray_data(nblk), 0, (size_t)ncols * sizeof(ray_t*));
     fmt_buf_t tmp;
     fmt_init(&tmp);
-    if (!wblk || !nblk || tmp.err) {
+    if (!wblk || !nblk || !cblk || tmp.err) {
         b->err = true; b->err_msg = "out of memory formatting a table";
         goto done;
     }
-    int32_t* widths = (int32_t*)ray_data(wblk);
-    ray_t**  names  = (ray_t**)ray_data(nblk);
+    int32_t*   widths = (int32_t*)ray_data(wblk);
+    ray_t**    names  = (ray_t**)ray_data(nblk);
+    fmt_col_t* cols   = (fmt_col_t*)ray_data(cblk);
+    ray_t*     counts = fmt_part_counts(tbl);
 
     for (int64_t ci = 0; ci < ncols; ci++) {
         ray_t* nm = ray_sym_str(ray_table_col_name(tbl, ci));
         names[ci] = (nm && !RAY_IS_ERR(nm)) ? nm : NULL;
-        ray_t* col = ray_table_get_col_idx(tbl, ci);
-        const char* tname = ray_type_name(col ? col->type : 0);
+        fmt_col_t* col = &cols[ci];
+        fmt_col_init(col, ray_table_get_col_idx(tbl, ci), counts);
+        const char* tname = ray_type_name(col->type);
         int32_t w = names[ci] ? fmt_utf8_width(ray_str_ptr(names[ci]), (int32_t)ray_str_len(names[ci])) : 1;
         if ((int32_t)strlen(tname) > w) w = (int32_t)strlen(tname);
         int32_t cell_w = 0;
@@ -895,8 +1086,7 @@ static void fmt_table_stream(fmt_buf_t* b, ray_t* tbl) {
     fmt_putc(b, '\n');
     fmt_puts(b, G_V);
     for (int64_t ci = 0; ci < ncols; ci++) {
-        ray_t* col = ray_table_get_col_idx(tbl, ci);
-        const char* tname = ray_type_name(col ? col->type : 0);
+        const char* tname = ray_type_name(cols[ci].type);
         fmt_centered(b, tname, (int32_t)strlen(tname), widths[ci]);
         fmt_puts(b, G_V);
     }
@@ -907,7 +1097,7 @@ static void fmt_table_stream(fmt_buf_t* b, ray_t* tbl) {
         fmt_puts(b, G_V);
         for (int64_t ci = 0; ci < ncols; ci++) {
             const char* cs; int32_t cl;
-            fmt_stream_cell(&tmp, ray_table_get_col_idx(tbl, ci), ri, &cs, &cl);
+            fmt_stream_cell(&tmp, &cols[ci], ri, &cs, &cl);
             if (tmp.err) { b->err = true; b->err_msg = "out of memory formatting a table"; goto done; }
             fmt_putc(b, ' ');
             fmt_putn(b, cs, cl);
@@ -935,12 +1125,15 @@ done:
         ray_free(nblk);
     }
     if (wblk) ray_free(wblk);
+    if (cblk) ray_free(cblk);
     fmt_destroy(&tmp);
 }
 
 static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
     int64_t ncols = ray_table_ncols(tbl);
     int64_t nrows = ray_table_nrows(tbl);
+
+    ray_t* part_counts = fmt_part_counts(tbl);   /* NULL unless parted */
 
     /* Compact mode: round-trippable (table [names] (list col1 col2 ...)) */
     if (mode == 0) {
@@ -958,7 +1151,11 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
         for (int64_t i = 0; i < ncols; i++) {
             if (i > 0) fmt_putc(b, ' ');
             ray_t* col = ray_table_get_col_idx(tbl, i);
-            if (col) {
+            if (fmt_col_is_parted(col)) {
+                fmt_col_t cur;
+                fmt_col_init(&cur, col, part_counts);
+                fmt_col_compact(b, &cur, nrows);
+            } else if (col) {
                 fmt_obj(b, col, mode);
             }
         }
@@ -1067,7 +1264,9 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
 
         /* Column type */
         ray_t* col_vec = ray_table_get_col_idx(tbl, ci);
-        const char* tname = ray_type_name(col_vec ? col_vec->type : 0);
+        fmt_col_t cur;
+        fmt_col_init(&cur, col_vec, part_counts);
+        const char* tname = ray_type_name(cur.type);
         col_types[ci]     = tname;
         col_type_lens[ci] = (int32_t)strlen(tname);
 
@@ -1076,25 +1275,27 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
         int32_t max_w = fmt_utf8_width(col_names[ci], col_name_lens[ci]);
         if (col_type_lens[ci] > max_w) max_w = col_type_lens[ci];
 
-        int64_t col_len = col_vec ? ray_len(col_vec) : 0;
+        /* A parted column spans the table's rows (a NULL segment's too). */
+        int64_t col_len = !col_vec ? 0
+                        : (RAY_IS_PARTED(col_vec->type) || col_vec->type == RAY_MAPCOMMON)
+                        ? nrows : ray_len(col_vec);
 
         /* Format first half (head rows) */
         int64_t half = table_height / 2;
         for (int64_t ri = 0; ri < half; ri++) {
             fmt_cell_t* cell = &cells[ci * table_height + ri];
-            if (ri < col_len) {
-                fmt_buf_t tmp;
-                fmt_init(&tmp);
-                fmt_raw_elem(&tmp, col_vec, ri);
+            fmt_buf_t tmp;
+            fmt_init(&tmp);
+            if (ri < col_len && fmt_col_write(&tmp, &cur, ri)) {
                 int32_t clen = tmp.len < FMT_CELL_BUF_SIZE - 1 ? tmp.len : FMT_CELL_BUF_SIZE - 1;
                 if (clen > 0) memcpy(cell->str, tmp.buf, (size_t)clen);
                 cell->str[clen] = '\0';
                 cell->len = clen;
-                fmt_destroy(&tmp);
             } else {
                 memcpy(cell->str, "NA", 3);
                 cell->len = 2;
             }
+            fmt_destroy(&tmp);
             int32_t cell_dw = fmt_utf8_width(cell->str, cell->len);
             if (cell_dw > max_w) max_w = cell_dw;
         }
@@ -1108,19 +1309,18 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
             } else {
                 src_idx = col_len - table_height + ri;
             }
-            if (src_idx >= 0 && src_idx < col_len) {
-                fmt_buf_t tmp;
-                fmt_init(&tmp);
-                fmt_raw_elem(&tmp, col_vec, src_idx);
+            fmt_buf_t tmp;
+            fmt_init(&tmp);
+            if (src_idx >= 0 && src_idx < col_len && fmt_col_write(&tmp, &cur, src_idx)) {
                 int32_t clen = tmp.len < FMT_CELL_BUF_SIZE - 1 ? tmp.len : FMT_CELL_BUF_SIZE - 1;
                 if (clen > 0) memcpy(cell->str, tmp.buf, (size_t)clen);
                 cell->str[clen] = '\0';
                 cell->len = clen;
-                fmt_destroy(&tmp);
             } else {
                 memcpy(cell->str, "NA", 3);
                 cell->len = 2;
             }
+            fmt_destroy(&tmp);
             int32_t cell_dw = fmt_utf8_width(cell->str, cell->len);
             if (cell_dw > max_w) max_w = cell_dw;
         }

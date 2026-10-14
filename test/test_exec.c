@@ -8760,11 +8760,10 @@ static test_result_t test_exec_streaming_mapcommon_too_short(void) {
     PASS();
 }
 
-/* ---- streaming: parted segment is NULL — build_segment_table !segs[seg_idx]
- * path (exec.c L1904: seg_idx >= col->len || !segs[seg_idx]).
- *
- * A parted column with a NULL segment pointer at index 1 triggers the
- * NULL-segment guard in build_segment_table.                             */
+/* ---- streaming: parted segment is NULL (a partition without the column,
+ * ragged parted table).  build_segment_table gives that partition's rows,
+ * from the partition-key counts, as typed nulls; the scan over the two
+ * segments is the flat column with nulls in the second partition's rows. */
 static test_result_t test_exec_streaming_parted_null_segment(void) {
     ray_heap_init();
     (void)ray_sym_init();
@@ -8783,7 +8782,7 @@ static test_result_t test_exec_streaming_parted_null_segment(void) {
 
     /* Valid MAPCOMMON with 2 keys */
     int64_t kv_data[] = {10, 20};
-    int64_t rc_data[] = {2, 0};
+    int64_t rc_data[] = {2, 3};
     ray_t* kv = ray_vec_from_raw(RAY_I64, kv_data, 2);
     ray_t* rc = ray_vec_from_raw(RAY_I64, rc_data, 2);
     ray_t* mc = exec_make_mapcommon(kv, rc);
@@ -8798,13 +8797,19 @@ static test_result_t test_exec_streaming_parted_null_segment(void) {
     ray_graph_t* g = ray_graph_new(tbl);
     ray_op_t* scan_v = ray_scan(g, "v");
 
-    /* Segment 0: seg_rows from pcol[0]->len=2; MAPCOMMON broadcast OK.
-     * Then pcol[0] itself: seg_idx=0 < col->len=2 and segs[0] non-NULL.
-     * Segment 1: MAPCOMMON kv has key for idx=1 (OK), pcol[1] is NULL
-     * → build_segment_table L1904: !segs[seg_idx] → schema error.      */
+    /* Segment 0: pcol[0], two rows.  Segment 1: pcol[1] is NULL and the
+     * partition counts 3 rows, so the segment table carries three I64
+     * nulls for v; the scan concatenates to five rows. */
     ray_t* result = ray_execute(g, scan_v);
     TEST_ASSERT_NOT_NULL(result);
-    TEST_ASSERT_TRUE(RAY_IS_ERR(result));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_I64);
+    TEST_ASSERT_EQ_I(result->len, 5);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(result))[0], 1);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(result))[1], 2);
+    TEST_ASSERT_TRUE(ray_vec_is_null(result, 2));
+    TEST_ASSERT_TRUE(ray_vec_is_null(result, 4));
+    ray_release(result);
 
     ray_graph_free(g);
     ray_release(tbl);

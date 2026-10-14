@@ -580,12 +580,11 @@ int ray_count_distinct_approx_pg_buf(ray_t* src,
     };
     ray_pool_t* pool = ray_pool_get();
     if (pool && ray_pool_total_workers(pool) >= 2 && n_groups >= 4) {
-        /* dispatch_n issues exactly n_groups tasks of [i, i+1), but the
-         * task ring is hard-capped at 65536 so n_groups > 65536 would
-         * silently drop trailing groups.  For high-cardinality grouping
-         * use element-based dispatch — each worker gets a range of
-         * groups, processes them serially, and reuses its stack sketch
-         * across the range. */
+        /* dispatch_n issues exactly n_groups tasks of [i, i+1): one
+         * sketch set-up per task, which is fine while groups are few.
+         * For high-cardinality grouping use element-based dispatch
+         * instead — each task gets a range of groups, processes them
+         * serially, and reuses its stack sketch across the range. */
         if (n_groups <= 65536) {
             ray_pool_dispatch_n(pool, cda_pg_buf_task, &ctx, (uint32_t)n_groups);
         } else {

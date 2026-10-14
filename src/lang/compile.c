@@ -289,6 +289,34 @@ static bool ast_refs_locals(compiler_t *c, ray_t *ast) {
 }
 
 
+/* Lower (if c1 r1 c2 r2 ... else?) — args are the forms after `if`, nargs
+ * >= 2.  Each condition jumps past its result when false; the result
+ * jumps to the end of the chain.  Recursing per pair keeps every end jump
+ * local to its own frame.  No fallback: the chain yields 0, matching
+ * ray_cond_fn. */
+static void compile_if_chain(compiler_t *c, ray_t **args, int64_t nargs) {
+    if (nargs == 1) { compile_expr(c, args[0]); return; }
+    if (nargs == 0) {
+        ray_t *zero = ray_alloc(0);
+        zero->type = -RAY_I64;
+        zero->i64 = 0;
+        int32_t idx = add_constant(c, zero);
+        ray_release(zero);
+        emit_const(c, idx);
+        return;
+    }
+    compile_expr(c, args[0]);
+    /* Match ray_cond_fn: truthiness belongs to the materialized value,
+     * not to the non-NULL lazy handle that happens to contain it. */
+    emit(c, OP_FORCE);
+    int32_t jmpf_pos = emit_jump(c, OP_JMPF);
+    compile_expr(c, args[1]);
+    int32_t jmp_pos = emit_jump(c, OP_JMP);
+    patch_jump(c, jmpf_pos);
+    compile_if_chain(c, args + 2, nargs - 2);
+    patch_jump(c, jmp_pos);
+}
+
 /* ── Compile a list (special form or function call) ── */
 static void compile_list(compiler_t *c, ray_t *ast) {
     if (c->error) return;
@@ -380,30 +408,9 @@ static void compile_list(compiler_t *c, ray_t *ast) {
             return;
         }
 
-        /* (if cond then else?) */
+        /* (if c1 r1 c2 r2 ... else?) */
         if (sym_id == sf_if && n >= 3) {
-            compile_expr(c, elems[1]);
-            /* Match ray_cond_fn: truthiness belongs to the materialized value,
-             * not to the non-NULL lazy handle that happens to contain it. */
-            emit(c, OP_FORCE);
-            int32_t jmpf_pos = emit_jump(c, OP_JMPF);
-            compile_expr(c, elems[2]);
-            if (n >= 4) {
-                int32_t jmp_pos = emit_jump(c, OP_JMP);
-                patch_jump(c, jmpf_pos);
-                compile_expr(c, elems[3]);
-                patch_jump(c, jmp_pos);
-            } else {
-                int32_t jmp_pos = emit_jump(c, OP_JMP);
-                patch_jump(c, jmpf_pos);
-                ray_t *zero = ray_alloc(0);
-                zero->type = -RAY_I64;
-                zero->i64 = 0;
-                int32_t idx = add_constant(c, zero);
-                ray_release(zero);
-                emit_const(c, idx);
-                patch_jump(c, jmp_pos);
-            }
+            compile_if_chain(c, elems + 1, n - 1);
             return;
         }
 
@@ -465,8 +472,30 @@ static void compile_list(compiler_t *c, ray_t *ast) {
          * which is what keeps nested `times` counters apart.
          *
          * As with `while`, compiling the body inline is what keeps
-         * `return` unwinding the enclosing lambda from inside the loop. */
+         * `return` unwinding the enclosing lambda from inside the loop.
+         *
+         * The indexed form, (times [i n] body...), keeps the normalized
+         * bound in a second hidden slot and stores bound - counter into
+         * i's slot at the top of each pass, so the index comes from the
+         * loop, never from i, and a body that rebinds i cannot steer it. */
         if (sym_id == sf_times && n >= 2) {
+            int64_t iname = -1;
+            ray_t *cexpr = elems[1];
+            int32_t islot = -1, lslot = -1, idx_idx = -1;
+            if (ray_times_binding(elems[1], &iname, &cexpr)) {
+                if (ray_sym_is_reserved(iname) && !ray_sym_is_ipc_hook(iname)) {
+                    c->error = true;
+                    return;
+                }
+                ray_t *idx_fn = ray_fn_binary("times idx", RAY_FN_NONE, ray_times_idx_fn);
+                if (!idx_fn || RAY_IS_ERR(idx_fn)) { c->error = true; return; }
+                idx_idx = add_constant(c, idx_fn);
+                ray_release(idx_fn);
+                islot = find_local(c, iname);
+                if (islot < 0) islot = add_local(c, iname);
+                lslot = add_local(c, ray_sym_intern("times lim", 9));
+                if (islot < 0 || lslot < 0 || c->error) { c->error = true; return; }
+            }
             ray_t *norm_fn = ray_fn_unary("times norm", RAY_FN_NONE, ray_times_norm_fn);
             ray_t *dec_fn  = ray_fn_unary("times dec",  RAY_FN_NONE, ray_times_dec_fn);
             if (!norm_fn || RAY_IS_ERR(norm_fn) || !dec_fn || RAY_IS_ERR(dec_fn)) {
@@ -482,10 +511,15 @@ static void compile_list(compiler_t *c, ray_t *ast) {
             int32_t cslot = add_local(c, ray_sym_intern("times ctr", 9));
             if (cslot < 0 || c->error) { c->error = true; return; }
 
-            /* counter = normalize(<count>) */
+            /* counter = normalize(<count>), and bound = counter if indexed */
             emit_const(c, norm_idx);
-            compile_expr(c, elems[1]);
+            compile_expr(c, cexpr);
             emit(c, OP_CALL1);
+            if (lslot >= 0) {
+                emit(c, OP_DUP);
+                emit(c, OP_STOREENV);
+                emit(c, (uint8_t)lslot);
+            }
             emit(c, OP_STOREENV);
             emit(c, (uint8_t)cslot);
 
@@ -493,6 +527,17 @@ static void compile_list(compiler_t *c, ray_t *ast) {
             emit(c, OP_LOADENV);
             emit(c, (uint8_t)cslot);
             int32_t jmpf_pos = emit_jump(c, OP_JMPF);
+            /* i = bound - counter */
+            if (islot >= 0) {
+                emit_const(c, idx_idx);
+                emit(c, OP_LOADENV);
+                emit(c, (uint8_t)lslot);
+                emit(c, OP_LOADENV);
+                emit(c, (uint8_t)cslot);
+                emit(c, OP_CALL2);
+                emit(c, OP_STOREENV);
+                emit(c, (uint8_t)islot);
+            }
             for (int64_t i = 2; i < n; i++) {
                 compile_expr(c, elems[i]);
                 emit(c, OP_POP);

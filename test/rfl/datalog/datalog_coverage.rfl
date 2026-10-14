@@ -567,6 +567,10 @@
 (dl-free CPcopy) !- type
 (dl-free CP) -- true
 
+;; Rebinding an unfreed handle must release the program automatically.
+(set AutoReleased (dl-program))
+(set AutoReleased 0)
+
 
 ;; --- Claim 4: fixpoint non-convergence must error loudly, not return a partial result ---
 ;; Reachability over a linear chain needs ~N iterations. The loop caps at 1000.

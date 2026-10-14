@@ -206,14 +206,16 @@ ray_t* ray_log_roll_fn(ray_t** args, int64_t n) {
 }
 
 ray_t* ray_log_snapshot_fn(ray_t** args, int64_t n) {
-    (void)args; (void)n;
+    (void)args;
+    if (n != 0) return ray_error("arity", ".log.snapshot takes no arguments");
     if (!ray_journal_is_open())
         return ray_error("domain", ".log.snapshot: no journal open");
     return err_to_ray(ray_journal_snapshot(), "io");
 }
 
 ray_t* ray_log_sync_fn(ray_t** args, int64_t n) {
-    (void)args; (void)n;
+    (void)args;
+    if (n != 0) return ray_error("arity", ".log.sync takes no arguments");
     return err_to_ray(ray_journal_sync(), "io");
 }
 

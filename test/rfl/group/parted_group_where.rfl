@@ -282,5 +282,135 @@
 (at RPq2 's) -- [374250 374500]
 (.sys.exec "rm -rf /tmp/rfl_pgtq")
 
+;; ══════════════════════════════════════════════════════════════════════════
+;; (g) STR KEYS AND STR PARTIALS (#737) — a selective where caps est_groups by
+;;     the survivors, so a STR key (plain or computed) streams too.  The merge
+;;     concatenated the partials' STR cells raw, leaving the merged key column
+;;     with no string pool: the merge group read the long strings through a
+;;     NULL pointer.  10 partitions span two merge batches (the running
+;;     result is merged again); strings are empty, inline and pooled.
+;; ══════════════════════════════════════════════════════════════════════════
+(set NS 2000)
+(set RS (take ["short" "a_rather_long_reason_text_value" "" "x" "another_long_reason_string_here" "mid_size_str" "yy"] NS))
+(set ES (% (til NS) 3))
+(set SS (take ["https_example_com_some_long_page_1" "https_example_com_other_long_page_2" "q"] NS))
+(set VS (til NS))
+(set PS (table [r e s v] (list RS ES SS VS)))
+(.sys.exec "rm -rf /tmp/rfl_pgwh_str")
+(.db.splayed.set "/tmp/rfl_pgwh_str/01/t/" PS)
+(.db.splayed.set "/tmp/rfl_pgwh_str/02/t/" PS)
+(.db.splayed.set "/tmp/rfl_pgwh_str/03/t/" PS)
+(.db.splayed.set "/tmp/rfl_pgwh_str/04/t/" PS)
+(.db.splayed.set "/tmp/rfl_pgwh_str/05/t/" PS)
+(.db.splayed.set "/tmp/rfl_pgwh_str/06/t/" PS)
+(.db.splayed.set "/tmp/rfl_pgwh_str/07/t/" PS)
+(.db.splayed.set "/tmp/rfl_pgwh_str/08/t/" PS)
+(.db.splayed.set "/tmp/rfl_pgwh_str/09/t/" PS)
+(.db.splayed.set "/tmp/rfl_pgwh_str/10/t/" PS)
+(set Ps (.db.parted.get "/tmp/rfl_pgwh_str/" 't))
+(set TFs (table [r e s v] (list (raze (take (list RS) 10)) (raze (take (list ES) 10)) (raze (take (list SS) 10)) (raze (take (list VS) 10)))))
+(count TFs) -- 20000
+
+;; (g1) bare STR key — the reported shape (count, desc, take)
+(set Be1 (at (.sys.mem) 'group-perpart-runs))
+(set RPe1 (select {from: Ps where: (== (% v 200) 7) by: r n: (count r) desc: n take: 12}))
+(> (at (.sys.mem) 'group-perpart-runs) Be1) -- true
+(set RPe1 (select {from: Ps where: (== (% v 200) 7) by: r n: (count r) asc: r}))
+(set RFe1 (select {from: TFs where: (== (% v 200) 7) by: r n: (count r) asc: r}))
+(at RPe1 'r) -- ["" "a_rather_long_reason_text_value" "another_long_reason_string_here" "mid_size_str" "short" "x" "yy"]
+(at RPe1 'r) -- (at RFe1 'r)
+(at RPe1 'n) -- (at RFe1 'n)
+
+;; (g2) computed STR key beside an int key, STR min/max/first partials
+(set Be2 (at (.sys.mem) 'group-perpart-runs))
+(set RPe2 (select {from: Ps where: (== (% v 200) 7) by: {e: e k: (if (== e 0) s "")} n: (count v) mn: (min r) mx: (max r) fr: (first r) asc: e}))
+(> (at (.sys.mem) 'group-perpart-runs) Be2) -- true
+(set RFe2 (select {from: TFs where: (== (% v 200) 7) by: {e: e k: (if (== e 0) s "")} n: (count v) mn: (min r) mx: (max r) fr: (first r) asc: e}))
+(at RPe2 'k)  -- ["https_example_com_some_long_page_1" "" ""]
+(at RPe2 'k)  -- (at RFe2 'k)
+(at RPe2 'n)  -- (at RFe2 'n)
+(at RPe2 'mn) -- (at RFe2 'mn)
+(at RPe2 'mx) -- (at RFe2 'mx)
+(at RPe2 'fr) -- (at RFe2 'fr)
+;; (g3) no where: a computed STR key with few values streams on its own
+(set Be3 (at (.sys.mem) 'group-perpart-runs))
+(set RPe3 (select {from: Ps by: {k: (if (== e 0) s "")} n: (count v) asc: k}))
+(> (at (.sys.mem) 'group-perpart-runs) Be3) -- true
+(at RPe3 'k) -- ["" "https_example_com_some_long_page_1"]
+(at RPe3 'n) -- [13330 6670]
+
+;; (g4) LIST partials: first/last over a LIST column are concatenated by
+;;      reference (a raw copy aliased the partials' elements); 10 partitions
+;;      span two merge batches here as well.
+(set LS (take (list [1 2] [3] [4 5 6] [7]) NS))
+(set PL (table [e v l] (list ES VS LS)))
+(.sys.exec "rm -rf /tmp/rfl_pgwh_lst")
+(.db.splayed.set "/tmp/rfl_pgwh_lst/01/t/" PL)
+(.db.splayed.set "/tmp/rfl_pgwh_lst/02/t/" PL)
+(.db.splayed.set "/tmp/rfl_pgwh_lst/03/t/" PL)
+(.db.splayed.set "/tmp/rfl_pgwh_lst/04/t/" PL)
+(.db.splayed.set "/tmp/rfl_pgwh_lst/05/t/" PL)
+(.db.splayed.set "/tmp/rfl_pgwh_lst/06/t/" PL)
+(.db.splayed.set "/tmp/rfl_pgwh_lst/07/t/" PL)
+(.db.splayed.set "/tmp/rfl_pgwh_lst/08/t/" PL)
+(.db.splayed.set "/tmp/rfl_pgwh_lst/09/t/" PL)
+(.db.splayed.set "/tmp/rfl_pgwh_lst/10/t/" PL)
+(set Pl (.db.parted.get "/tmp/rfl_pgwh_lst/" 't))
+(set TFl (table [e v l] (list (raze (take (list ES) 10)) (raze (take (list VS) 10)) (raze (take (list LS) 10)))))
+(set Be4 (at (.sys.mem) 'group-perpart-runs))
+(set RPe4 (select {from: Pl where: (== (% v 50) 7) by: e n: (count v) fl: (first l) ll: (last l) asc: e}))
+(> (at (.sys.mem) 'group-perpart-runs) Be4) -- true
+(set RFe4 (select {from: TFl where: (== (% v 50) 7) by: e n: (count v) fl: (first l) ll: (last l) asc: e}))
+(at RPe4 'e)  -- [0 1 2]
+(at RPe4 'n)  -- (at RFe4 'n)
+(at RPe4 'fl) -- (at RFe4 'fl)
+(at RPe4 'll) -- (at RFe4 'll)
+
+;; ══════════════════════════════════════════════════════════════════════════
+;; (h) COMPOSITE KEY WITH A ROW OUTPUT (#731) — `b: b by: [s bo]` groups at
+;;     eval level on boxed key cells; a cell is a SYM atom holding the RUNTIME
+;;     id, and the key column was built at the source column's width, which
+;;     sizes FILE-domain ids: the runtime ids were truncated into unrelated
+;;     symbols.  Without a where the parted columns reached the row reader
+;;     unflattened (`type` error).
+;; ══════════════════════════════════════════════════════════════════════════
+(.sys.exec "rm -rf /tmp/rfl_pgwh_cmp")
+(.db.splayed.set "/tmp/rfl_pgwh_cmp/2024.01.01/t/" (table [s bo b] (list ['alpha 'beta 'alpha] [true false true] [91 92 93])))
+(.db.splayed.set "/tmp/rfl_pgwh_cmp/2024.01.02/t/" (table [s bo b] (list ['gamma 'beta] [false true] [94 95])))
+(set Pc (.db.parted.get "/tmp/rfl_pgwh_cmp/" 't))
+(set RPf1 (select {b: b by: [s bo] from: Pc where: (> b 90)}))
+(at RPf1 's)  -- ['alpha 'beta 'gamma 'beta]
+(at RPf1 'bo) -- [true false false true]
+(at RPf1 'b)  -- (list [91 93] [92] [94] [95])
+(set RPf2 (select {b: b c: (+ b 1) by: [s bo] from: Pc}))
+(at RPf2 's)  -- ['alpha 'beta 'gamma 'beta]
+(at RPf2 'b)  -- (list [91 93] [92] [94] [95])
+(at RPf2 'c)  -- (list [92 94] [93] [95] [96])
+;; no outputs: the first row of each group, every column of it
+(set RPf3 (select {by: [s bo] from: Pc}))
+(at RPf3 's) -- ['alpha 'beta 'gamma 'beta]
+(at RPf3 'b) -- [91 92 94 95]
+(set RPf4 (select {by: [s bo] from: Pc where: (> b 0)}))
+(at RPf4 's) -- ['alpha 'beta 'gamma 'beta]
+(at RPf4 'b) -- [91 92 94 95]
+;; a splayed (FILE-domain, non-parted) source took the same path
+(.db.splayed.set "/tmp/rfl_pgwh_cmp/flat/" (table [s bo b] (list ['alpha 'beta 'alpha 'gamma 'beta] [true false true false true] [91 92 93 94 95])))
+(set Sc (.db.splayed.get "/tmp/rfl_pgwh_cmp/flat/"))
+(set RSc (select {b: b by: [s bo] from: Sc where: (> b 90)}))
+(at RSc 's)  -- ['alpha 'beta 'gamma 'beta]
+(at RSc 'bo) -- [true false false true]
+(at RSc 'b)  -- (list [91 93] [92] [94] [95])
+(at (select {b: b by: [s bo] from: Sc}) 's) -- ['alpha 'beta 'gamma 'beta]
+;; a source wide enough for a two-byte index (300 symbols)
+(set S16 (table [s bo b] (list (as 'SYM (% (til 600) 300)) (== (% (til 600) 2) 0) (til 600))))
+(.db.splayed.set "/tmp/rfl_pgwh_cmp/w16/" S16)
+(set Sw (.db.splayed.get "/tmp/rfl_pgwh_cmp/w16/"))
+(set RPw (select {b: b by: [s bo] from: Sw}))
+(set RFw (select {b: b by: [s bo] from: S16}))
+(count RPw) -- 300
+(at RPw 's) -- (at RFw 's)
+(at RPw 'b) -- (at RFw 'b)
+
 ;; ─── cleanup ─────────────────────────────────────────────────────────────────
 (.sys.exec "rm -rf /tmp/rfl_pgwh")
+(.sys.exec "rm -rf /tmp/rfl_pgwh_str /tmp/rfl_pgwh_lst /tmp/rfl_pgwh_cmp")

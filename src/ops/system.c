@@ -71,8 +71,8 @@ void* ray_runtime_get_sys_args(void);
 #define RAY_PCLOSE(f)    _pclose(f)
 #endif
 
-static int parse_sys_int_arg(const char* s, bool nonnegative, bool core_count,
-                             int64_t* out) {
+int parse_sys_int_arg(const char* s, bool nonnegative, bool core_count,
+                      int64_t* out) {
     if (!s || !*s) return 0;
     const unsigned char* p = (const unsigned char*)s;
     if (!nonnegative && (*p == '+' || *p == '-')) p++;
@@ -84,7 +84,8 @@ static int parse_sys_int_arg(const char* s, bool nonnegative, bool core_count,
     errno = 0;
     long long v = strtoll(s, &end, 10);
     if (errno == ERANGE || end == s || *end != '\0' ||
-        (nonnegative && v < 0) || (core_count && v > INT_MAX))
+        (nonnegative && v < 0) ||
+        (core_count && v > (int64_t)RAY_HEAP_ID_BITS - 1))
         return 0;
     *out = (int64_t)v;
     return 1;
@@ -1267,7 +1268,8 @@ ray_t* ray_internals_fn(ray_t** args, int64_t n) {
 
 /* (.sys.mem) -- return dict with memory allocator statistics */
 ray_t* ray_memstat_fn(ray_t** args, int64_t n) {
-    (void)args; (void)n;
+    (void)args;
+    if (n != 0) return ray_error("arity", ".sys.mem takes no arguments");
     ray_mem_stats_t st;
     ray_mem_stats(&st);
 
@@ -1329,7 +1331,8 @@ ray_t* ray_memstat_fn(ray_t** args, int64_t n) {
  * no query has run.  Profiling is toggled with `:t` / the `-t` flag.
  */
 ray_t* ray_prof_fn(ray_t** args, int64_t n) {
-    (void)args; (void)n;
+    (void)args;
+    if (n != 0) return ray_error("arity", ".sys.prof takes no arguments");
 
     /* Read the snapshot of the last completed query — NOT the in-flight
      * buffer, which currently holds this `(.sys.prof)` call's own spans.
@@ -1524,7 +1527,8 @@ static bool ray_os_hostname(char* buf, size_t cap) {
 }
 
 ray_t* ray_sysinfo_fn(ray_t** args, int64_t n) {
-    (void)args; (void)n;
+    (void)args;
+    if (n != 0) return ray_error("arity", ".sys.info takes no arguments");
     ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 5);
     if (RAY_IS_ERR(keys)) return keys;
     ray_t* vals = ray_list_new(5);

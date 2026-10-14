@@ -1403,6 +1403,27 @@ static bool in_set_names_global_value(ray_graph_t* g, ray_t* set) {
     return v && !ray_is_atom(v) && !ray_is_vec(v);
 }
 
+
+/* Lower the arguments of an if chain (c1 r1 c2 r2 ... else), nargs odd and
+ * >= 3, into nested OP_IF nodes.  Node creation may realloc g->nodes:
+ * re-derive pointers from ids after compiling each arm.  The arms are
+ * compiled under if_arm_depth, as the three-argument form's were. */
+static ray_op_t* compile_if_chain_dag(ray_graph_t* g, ray_t** a, int64_t nargs) {
+    if (nargs == 1) return compile_expr_dag(g, a[0]);
+    ray_op_t* c = compile_expr_dag(g, a[0]);
+    if (!c) return NULL;
+    uint32_t c_id = c->id;
+    g->if_arm_depth++;
+    ray_op_t* t = compile_expr_dag(g, a[1]);
+    uint32_t t_id = t ? t->id : 0;
+    ray_op_t* e = t ? compile_if_chain_dag(g, a + 2, nargs - 2) : NULL;
+    g->if_arm_depth--;
+    if (!t || !e) return NULL;
+    c = &g->nodes[c_id];
+    t = &g->nodes[t_id];
+    return ray_if(g, c, t, e);
+}
+
 ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
     if (!expr) return NULL;
 
@@ -1780,23 +1801,15 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
             return ray_cast(g, r, temporal);
         }
 
-        /* (if cond then else) — 4 elements (fn + 3 args).  Compiles
-         * to OP_IF which is supported by the element-wise fusion
-         * pipeline. */
+        /* (if c1 r1 c2 r2 ... else) — condition/result pairs with a
+         * fallback.  Pairs nest right to left into OP_IF, which the
+         * element-wise fusion pipeline serves: (if c1 r1 c2 r2 e) is
+         * OP_IF(c1, r1, OP_IF(c2, r2, e)).  A chain with no fallback has
+         * no column value for the rows no condition takes (the evaluator
+         * yields 0), so it is left to the evaluator. */
         if (fname_len == 2 && memcmp(fname, "if", 2) == 0) {
-            if (n != 4) return NULL;
-            ray_op_t* c = compile_expr_dag(g, elems[1]);
-            if (!c) return NULL;
-            uint32_t c_id = c->id;
-            g->if_arm_depth++;
-            ray_op_t* t = compile_expr_dag(g, elems[2]);
-            uint32_t t_id = t ? t->id : 0;
-            ray_op_t* e = t ? compile_expr_dag(g, elems[3]) : NULL;
-            g->if_arm_depth--;
-            if (!t || !e) return NULL;
-            c = &g->nodes[c_id];
-            t = &g->nodes[t_id];
-            return ray_if(g, c, t, e);
+            if (n < 4 || (n & 1)) return NULL;
+            return compile_if_chain_dag(g, elems + 1, n - 1);
         }
 
         /* (substr str start len) — 4 elements. */
@@ -3162,7 +3175,7 @@ static ray_t* select_eval_over_table(ray_t* expr, ray_t* tbl) {
 }
 
 static bool table_has_parted_columns(ray_t* tbl);
-static ray_t* query_materialize_parted_col(ray_t* col);
+static ray_t* query_materialize_parted_col(ray_t* col, ray_t* tbl);
 static int collect_col_refs_set(ray_t* expr, ray_t* tbl,
                                 int64_t* out_syms, int max_out, int n);
 
@@ -3186,7 +3199,7 @@ static ray_t* parted_flatten_expr_cols(ray_t* expr, ray_t* tbl) {
             out = ray_table_add_col(out, cn, col);
             continue;
         }
-        ray_t* v = query_materialize_parted_col(col);
+        ray_t* v = query_materialize_parted_col(col, tbl);
         if (!v || RAY_IS_ERR(v)) { ray_release(out); return v ? v : ray_error("oom", NULL); }
         out = ray_table_add_col(out, cn, v);
         ray_release(v);
@@ -3581,7 +3594,7 @@ static int expr_contains_call_named(ray_t* expr, const char* name, size_t name_l
     return 0;
 }
 
-static ray_t* query_materialize_parted_col(ray_t* col);
+static ray_t* query_materialize_parted_col(ray_t* col, ray_t* tbl);
 static bool table_has_parted_columns(ray_t* tbl);
 static ray_t* query_materialize_parted_table(ray_t* tbl);
 
@@ -4548,7 +4561,7 @@ static ray_t* group_key_eval(ray_t* v, ray_t* tbl) {
         ray_t* ref_col = ray_table_get_col(tbl, ref_syms[ri]);
         if (ref_col && (RAY_IS_PARTED(ref_col->type) ||
                         ref_col->type == RAY_MAPCOMMON)) {
-            ray_t* flat = query_materialize_parted_col(ref_col);
+            ray_t* flat = query_materialize_parted_col(ref_col, tbl);
             if (!flat || RAY_IS_ERR(flat)) {
                 col_vec = flat ? flat : ray_error("oom", NULL);
                 break;
@@ -5289,10 +5302,18 @@ static int dkp_compile(dkp_prog_t* P, ray_t* e, int64_t col, int64_t* bsym, int*
         return dkp_compile(P, el[3], col, bsym, breg, nb + 1);
     }
     if (DKP_IS("if")) {
-        if (n != 4) return -1;
-        int c = DKP_ARG(1), t = DKP_ARG(2), f = DKP_ARG(3);
-        if (c < 0 || t < 0 || f < 0 || DKP_K(c) != DKP_BOOL || DKP_K(t) != DKP_K(f)) return -1;
-        return dkp_emit(P, DKO_IF, DKP_K(t), c, t, f);
+        /* (if c1 r1 c2 r2 ... else): pairs nest right to left, as `cond`
+         * below; a chain without a fallback is left to the evaluator. */
+        if (n < 4 || (n & 1)) return -1;
+        int acc = DKP_ARG(n - 1);
+        if (acc < 0) return -1;
+        for (int64_t i = n - 3; i >= 1; i -= 2) {
+            int c = DKP_ARG(i), t = DKP_ARG(i + 1);
+            if (c < 0 || t < 0 || DKP_K(c) != DKP_BOOL || DKP_K(t) != DKP_K(acc)) return -1;
+            acc = dkp_emit(P, DKO_IF, DKP_K(t), c, t, acc);
+            if (acc < 0) return -1;
+        }
+        return acc;
     }
     if (DKP_IS("cond")) {
         /* right to left into an if chain; the last clause is the else */
@@ -7558,7 +7579,9 @@ static bool slice_build(const int64_t* row_gid, int64_t nrows, ray_t* sel,
     return true;
 }
 
-static ray_t* query_materialize_parted_col(ray_t* col) {
+/* `tbl` is the column's table (or NULL): its partition counts give a NULL
+ * segment, a partition without the column, its rows as typed nulls. */
+static ray_t* query_materialize_parted_col(ray_t* col, ray_t* tbl) {
     if (!col) return NULL;
     if (col->type == RAY_MAPCOMMON) return materialize_mapcommon(col);
     if (!RAY_IS_PARTED(col->type)) {
@@ -7568,9 +7591,11 @@ static ray_t* query_materialize_parted_col(ray_t* col) {
 
     int8_t base = (int8_t)RAY_PARTED_BASETYPE(col->type);
     ray_t** segs = (ray_t**)ray_data(col);
-    int64_t total = ray_parted_nrows(col);
-    if (base == RAY_STR) return parted_flatten_str(segs, col->len, total);
-    if (base == RAY_LIST) return parted_flatten_list(segs, col->len, total);
+    int64_t ncnt = 0;
+    const int64_t* cnt = parted_table_counts(tbl, &ncnt);
+    if (base == RAY_STR) return parted_flatten_str_c(segs, col->len, cnt, ncnt);
+    if (base == RAY_LIST) return parted_flatten_list_c(segs, col->len, cnt, ncnt);
+    int64_t total = parted_rows_counted(col, cnt, ncnt);
 
     uint8_t attrs = (base == RAY_SYM) ? parted_sym_max_attrs(segs, col->len) : 0;
     ray_t* flat = typed_vec_new(base, attrs, total);
@@ -7581,7 +7606,13 @@ static ray_t* query_materialize_parted_col(ray_t* col) {
     uint8_t seg_nulls = 0;
     for (int64_t s = 0; s < col->len; s++) {
         ray_t* seg = segs[s];
-        if (!seg || seg->len <= 0) continue;
+        if (!seg || RAY_IS_ERR(seg)) {
+            int64_t n = parted_seg_rows(segs, s, cnt, ncnt);
+            parted_fill_nulls(flat, off, n);
+            off += n;
+            continue;
+        }
+        if (seg->len <= 0) continue;
         parted_copy_cells(ray_data(flat), base, attrs, off, seg, 0, seg->len);
         seg_nulls |= seg->attrs & RAY_ATTR_HAS_NULLS;
         off += seg->len;
@@ -8056,7 +8087,7 @@ static ray_t* count_distinct_per_group_buf(ray_t* inner_expr, ray_t* tbl,
         if (!src || RAY_IS_ERR(src)) return src ? src : ray_error("domain", "select by: failed to evaluate count-distinct source");
     }
     if (src && !RAY_IS_ERR(src) && (RAY_IS_PARTED(src->type) || src->type == RAY_MAPCOMMON)) {
-        ray_t* flat = query_materialize_parted_col(src);
+        ray_t* flat = query_materialize_parted_col(src, tbl);
         ray_release(src);
         src = flat;
         if (!src || RAY_IS_ERR(src)) return src ? src : ray_error("oom", NULL);
@@ -8237,7 +8268,7 @@ static ray_t* count_distinct_per_group_groups(ray_t* inner_expr, ray_t* tbl,
         if (!src || RAY_IS_ERR(src)) return src ? src : ray_error("domain", "select by: failed to evaluate count-distinct source");
     }
     if (src && !RAY_IS_ERR(src) && (RAY_IS_PARTED(src->type) || src->type == RAY_MAPCOMMON)) {
-        ray_t* flat = query_materialize_parted_col(src);
+        ray_t* flat = query_materialize_parted_col(src, tbl);
         ray_release(src);
         src = flat;
         if (!src || RAY_IS_ERR(src)) return src ? src : ray_error("oom", NULL);
@@ -8673,7 +8704,7 @@ static ray_t* rgid_build_multikey(ray_t* tbl, ray_t* result, ray_t* by_expr,
         if (!orig || !g) { err = ray_error("domain", "select by: group key column not found"); break; }
         ray_t* sc = orig;
         if (RAY_IS_PARTED(sc->type) || sc->type == RAY_MAPCOMMON) {
-            sc = query_materialize_parted_col(sc);
+            sc = query_materialize_parted_col(sc, tbl);
             if (!sc || RAY_IS_ERR(sc)) { err = sc ? sc : ray_error("oom", NULL); break; }
             owned[k] = 1;
         }
@@ -9709,8 +9740,8 @@ ray_t* ray_try_count_select_expr(ray_t* expr, int* handled) {
     int64_t pre_nrows = ray_table_nrows(tbl);
 
     /* Fused predicate→selection: count directly off the streamed rowsel,
-     * skipping the full BOOL vec + the BOOL→rowsel scan.  Unsupported shapes,
-     * or >RAY_POOL_MAX_TASKS fall through to exec_node. */
+     * skipping the full BOOL vec + the BOOL→rowsel scan.  Unsupported shapes
+     * fall through to exec_node. */
     {
         bool all_pass = false;
         ray_t* fsel = exec_pred_to_selection(g, pred, pre_nrows, &all_pass);
@@ -11629,7 +11660,7 @@ static ray_t* parted_flatten_read_cols(ray_t* dict, ray_t* tbl, bool keep_unread
         bool want = false;
         for (int r = 0; r < nref; r++) want |= refs[r] == cn;
         if (!want) continue;
-        ray_t* v = query_materialize_parted_col(ray_table_get_col_idx(tbl, c));
+        ray_t* v = query_materialize_parted_col(ray_table_get_col_idx(tbl, c), tbl);
         if (!v || RAY_IS_ERR(v)) { ray_release(out); return v ? v : ray_error("oom", NULL); }
         out = ray_table_add_col(out, cn, v);
         ray_release(v);
@@ -12126,7 +12157,7 @@ static ray_t* parted_rows_open(parted_rows_t* pr, ray_t* tbl, const int64_t* rv,
 static ray_t* parted_rows_gather(parted_rows_t* pr, int64_t c) {
     ray_t* v;
     if (!pr->sel) {
-        v = query_materialize_parted_col(ray_table_get_col_idx(pr->tbl, c));
+        v = query_materialize_parted_col(ray_table_get_col_idx(pr->tbl, c), pr->tbl);
     } else {
         int64_t cn = ray_table_col_name(pr->tbl, c);
         ray_t* one = sel_compact(NULL, pr->tbl, pr->sel, &cn, 1);
@@ -12224,7 +12255,7 @@ static ray_t* select_parted_first_rows(ray_t* dict, ray_t* tbl, bool aliases_res
     ray_t* narrow = ray_table_new(nc + 1);
     for (int64_t c = 0; c < nc && narrow && !RAY_IS_ERR(narrow); c++) {
         if (!real[c]) continue;
-        ray_t* v = query_materialize_parted_col(ray_table_get_col_idx(tbl, c));
+        ray_t* v = query_materialize_parted_col(ray_table_get_col_idx(tbl, c), tbl);
         if (!v || RAY_IS_ERR(v)) { ray_release(narrow); narrow = v ? v : ray_error("oom", NULL); break; }
         narrow = ray_table_add_col(narrow, ray_table_col_name(tbl, c), v);
         ray_release(v);
@@ -12381,7 +12412,7 @@ static ray_t* select_parted_sorted(ray_t* dict, ray_t* tbl, bool aliases_resolve
     ray_t* narrow = ray_table_new(nc + 1);
     for (int64_t c = 0; c < nc && narrow && !RAY_IS_ERR(narrow); c++) {
         if (!real[c]) continue;
-        ray_t* v = query_materialize_parted_col(ray_table_get_col_idx(tbl, c));
+        ray_t* v = query_materialize_parted_col(ray_table_get_col_idx(tbl, c), tbl);
         if (!v || RAY_IS_ERR(v)) { ray_release(narrow); narrow = v ? v : ray_error("oom", NULL); break; }
         narrow = ray_table_add_col(narrow, ray_table_col_name(tbl, c), v);
         ray_release(v);
@@ -14262,6 +14293,21 @@ by_dict_done:
                 ray_graph_free(g); g = NULL;
             }
             if (by_key_sym < 0 && by_expr->type == RAY_SYM && ray_len(by_expr) > 1) {
+                /* The composite path reads key and output cells row by row,
+                 * which a parted column does not serve.  A where: hands back
+                 * a flattened copy of the rows it keeps; when the table
+                 * reaches here as is, flatten the columns the clauses read;
+                 * with no outputs every column is read (first of each group
+                 * below), so the whole table is flattened. */
+                if (eval_tbl == tbl && table_has_parted_columns(tbl)) {
+                    ray_t* flat = n_out > 0 ? parted_flatten_read_cols(dict, tbl, false)
+                                            : query_materialize_parted_table(tbl);
+                    if (!flat || RAY_IS_ERR(flat)) {
+                        ray_release(tbl);
+                        scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return flat ? flat : ray_error("oom", NULL);
+                    }
+                    eval_tbl = flat;
+                }
                 int64_t nk = ray_len(by_expr);
                 int64_t* key_syms = (int64_t*)ray_data(by_expr);
                 int64_t nrows = ray_table_nrows(eval_tbl);
@@ -14829,8 +14875,13 @@ by_dict_done:
                             key_vec = ray_str_vec_append(key_vec, sp ? sp : "", sp ? slen : 0);
                         }
                     } else {
+                        /* The composite cells are SYM atoms (runtime ids,
+                         * collection_elem's atom rule), so the key column is a
+                         * runtime-domain W64 vec: the source's width sizes ids
+                         * of the source's own (file) domain and truncated the
+                         * runtime ids into unrelated symbols. */
                         key_vec = (kt == RAY_SYM)
-                                ? ray_sym_vec_new(src->attrs & RAY_SYM_W_MASK, out_groups)
+                                ? ray_sym_vec_new(RAY_SYM_W64, out_groups)
                                 : ray_vec_new(kt, out_groups);
                         if (key_vec && !RAY_IS_ERR(key_vec)) {
                             key_vec->len = out_groups;
@@ -15770,7 +15821,7 @@ by_dict_done:
             for (int64_t c = 0; c < ncols; c++) {
                 ray_t* col = ray_table_get_col_idx(tbl, c);
                 int64_t name = ray_table_col_name(tbl, c);
-                ray_t* flat_col = query_materialize_parted_col(col);
+                ray_t* flat_col = query_materialize_parted_col(col, tbl);
                 if (!flat_col || RAY_IS_ERR(flat_col)) {
                     ray_release(flat_tbl); ray_graph_free(g); ray_release(tbl);
                     scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return flat_col ? flat_col : ray_error("oom", NULL);
@@ -17971,7 +18022,7 @@ by_dict_done:
                 ray_t* scan_key = orig_key;
                 int scan_key_owned = 0;
                 if (RAY_IS_PARTED(scan_key->type) || scan_key->type == RAY_MAPCOMMON) {
-                    scan_key = query_materialize_parted_col(scan_key);
+                    scan_key = query_materialize_parted_col(scan_key, tbl);
                     if (!scan_key || RAY_IS_ERR(scan_key)) {
                         ray_release(result); ray_release(tbl);
                         scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return scan_key ? scan_key : ray_error("oom", NULL);
@@ -18475,7 +18526,7 @@ by_dict_done:
                         if (src_for_global && n_groups > 50000) {
                             if (RAY_IS_PARTED(src_for_global->type) ||
                                 src_for_global->type == RAY_MAPCOMMON) {
-                                ray_t* flat = query_materialize_parted_col(src_for_global);
+                                ray_t* flat = query_materialize_parted_col(src_for_global, tbl);
                                 if (!flat || RAY_IS_ERR(flat)) {
                                     col = flat ? flat : ray_error("oom", NULL);
                                     src_for_global = NULL;
@@ -19764,7 +19815,7 @@ ray_t* ray_update(ray_t** args, int64_t n) {
         int64_t nc = ray_table_ncols(tbl);
         for (int64_t c = 0; c < nc; c++) {
             ray_t* col = ray_table_get_col_idx(tbl, c);
-            ray_t* flat_col = query_materialize_parted_col(col);
+            ray_t* flat_col = query_materialize_parted_col(col, tbl);
             if (!flat_col || RAY_IS_ERR(flat_col)) {
                 ray_release(flat_tbl); ray_release(tbl);
                 return flat_col ? flat_col : ray_error("oom", NULL);
@@ -20784,7 +20835,7 @@ static ray_t* query_materialize_parted_table(ray_t* tbl) {
     ray_t* flat_tbl = ray_table_new(nc);
     if (!flat_tbl || RAY_IS_ERR(flat_tbl)) return flat_tbl ? flat_tbl : ray_error("oom", NULL);
     for (int64_t c = 0; c < nc; c++) {
-        ray_t* flat_col = query_materialize_parted_col(ray_table_get_col_idx(tbl, c));
+        ray_t* flat_col = query_materialize_parted_col(ray_table_get_col_idx(tbl, c), tbl);
         if (!flat_col || RAY_IS_ERR(flat_col)) {
             ray_release(flat_tbl);
             return flat_col ? flat_col : ray_error("oom", NULL);
@@ -26576,7 +26627,7 @@ ray_t* ray_delete(ray_t** args, int64_t n) {
         if (!flat || RAY_IS_ERR(flat)) { ray_release(tbl); return flat ? flat : ray_error("oom", NULL); }
         int64_t nc = ray_table_ncols(tbl);
         for (int64_t c = 0; c < nc; c++) {
-            ray_t* fc = query_materialize_parted_col(ray_table_get_col_idx(tbl, c));
+            ray_t* fc = query_materialize_parted_col(ray_table_get_col_idx(tbl, c), tbl);
             if (!fc || RAY_IS_ERR(fc)) { ray_release(flat); ray_release(tbl); return fc ? fc : ray_error("oom", NULL); }
             flat = ray_table_add_col(flat, ray_table_col_name(tbl, c), fc);
             ray_release(fc);

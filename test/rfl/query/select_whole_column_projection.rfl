@@ -216,6 +216,8 @@ ticks -- 1
 (at (select {s: (first (list [1 2] [3])) from: TCF by: b}) 's) -- (list [1 2] [1 2] [1 2])
 (at (select {s: (first (at [2024.01.01 2024.02.02] 1)) from: TCF by: b}) 's) -- [2024.02.02 2024.02.02 2024.02.02]
 (at (select {s: (sum (at [1.5 2.5] 0)) from: TCF by: b}) 's) -- [3.0 4.5 1.5]
+(at (select {s: (sum (at [0N 1] 0)) from: TCF by: b}) 's) -- [0 0 0]
+(at (select {s: (avg (at [0N 1] 0)) from: TCF by: b}) 's) -- [0Nf 0Nf 0Nf]
 (at (select {s: (max (at [3 9] 1)) n: (count acf) from: TCF by: b}) 'n) -- [2 3 1]
 (at (select {s: (sum (at [2 3] 0)) from: TCF by: b where: (> acf 1) desc: s take: 1}) 's) -- [6]
 (set GCF 5)

@@ -31,7 +31,6 @@
 #include "table/table.h"
 #include "lang/eval.h"
 #include "lang/env.h"
-#define _POSIX_C_SOURCE 200809L
 
 #include "ops/linkop.h"
 #include "ops/idxop.h"

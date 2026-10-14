@@ -18,6 +18,21 @@ Without an else branch, `if` returns `0`:
 0
 ```
 
+More condition/result pairs chain: conditions are tested in order, the
+result paired with the first truthy one is evaluated, and an odd trailing
+argument is the fallback. Conditions after the first truthy one, and every
+other result, are never evaluated:
+
+```lisp
+‣ (set classify (fn [x] (if (> x 100) "high" (> x 50) "mid" "low")))
+‣ (classify 60)
+"mid"
+‣ (if false 1 false 2)
+0
+```
+
+Inside a query (a projection, `where:`, a `by:` key), a chain with a fallback is evaluated row by row like the three-argument form, and a text literal in it becomes a symbol cell; a chain without a fallback is left to the evaluator.
+
 ## Sequential Evaluation: do
 
 `do` evaluates expressions in order and returns the last result. `let` bindings inside `do` are scoped to that block:
@@ -105,6 +120,21 @@ that computes to empty is a no-op, not an error. A non-integer count is a type
 error. Like `while`, `times` pushes no scope of its own, so a `let` in the body
 binds in the enclosing frame; wrap the body in `do` when a fresh binding per
 pass is wanted.
+
+To loop over positions, give `times` a `[name count]` binding instead of a bare
+count. The name takes `0`, `1`, …, `count - 1`, one value per pass:
+
+```lisp
+(times [i (count qty)]
+  (alter 'qty set i (+ (at qty i) (at delta i))))
+```
+
+The index is bound like a `let`, in the enclosing frame, and keeps the last
+index once the loop ends; a loop that runs no pass leaves it as it was. It is
+set from the loop's own counter at the start of every pass, so a body that
+rebinds the name changes it for the rest of that pass only, never the passes
+that follow. The count follows the rules above: evaluated once, an integer,
+nothing run when it is zero or less.
 
 Reach for `times` when the number of passes is known up front and for `while`
 when it is not. Neither allocates a sequence, so neither pays for a range that

@@ -134,7 +134,9 @@ ray_err_t ray_col_stream_append(ray_col_stream_t* w,
                 for (int64_t i = 0; i < count; i++) u.h32[i] = (uint32_t)ray_hash_bytes(strings[i],lengths[i]);
                 ok = ray_sym_domain_intern_batch(w->dom,count,strings,lengths,u.h32,ids);
             }
-            if (!ok) return RAY_ERR_OOM;
+            /* The intern declines a cancelled batch as well as a failed
+             * allocation; report the cancel as one. */
+            if (!ok) return ray_interrupted() ? RAY_ERR_CANCEL : RAY_ERR_OOM;
             for (int64_t i = 0; i < count; i++) {
                 if (ids[i] < 0 || (uint64_t)ids[i] >= UINT32_MAX) return RAY_ERR_RANGE;
                 u.pos[i] = (uint32_t)ids[i]; if (!ids[i]) w->had_nulls = true;

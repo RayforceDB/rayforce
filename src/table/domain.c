@@ -39,15 +39,38 @@
  * refcounts, appends, the lazily built reverse index and the runtime-id
  * LUT build. Bulk imports can hold it while growing a large dictionary;
  * contending workers sleep instead of spending CPU time spinning. The
- * two hot read paths are LOCK-FREE: ray_sym_domain_str reads the
+ * hot read paths are LOCK-FREE: ray_sym_domain_str reads the
  * atomically published (count, atoms) pair — appends publish a slot
- * write with a release store of the count, growth REPLACES the array
- * (old arrays are retired, never freed in place, so a stale pointer is
- * always valid memory covering every position < its publish count) —
- * and ray_sym_domain_runtime_lut reads an atomically published array
- * (invalidated and rebuilt across appends; retired likewise).  The
- * runtime singleton never touches the lock (immortal, delegates to
- * sym.c's own locking).
+ * write with a release store of the count, growth REPLACES the array —
+ * ray_sym_domain_raw_pin copies the published (map, offsets, count)
+ * record, and ray_sym_domain_runtime_lut reads an atomically published
+ * array (invalidated and rebuilt across appends).  The runtime singleton
+ * never touches the lock (immortal, delegates to sym.c's own locking).
+ *
+ * What happens to a REPLACED array, record or mapping depends on who can
+ * still be reading it:
+ *   - append paths (dom_append_locked, the batch commit): import workers
+ *     probe a snapshot outside the lock while another worker commits, so
+ *     the old one is RETIRED (dom_retire) and freed with the domain; a
+ *     stale pointer is always valid memory covering every position below
+ *     its publish count.
+ *   - external extend (dom_extend_from_file_locked: the symfile grew under
+ *     another process, reopened on a cache hit): FREED at once
+ *     (dom_drop_locked), unless a batch intern is in flight, then retired.
+ *     Safe because a reopen runs under the lock on the calling thread
+ *     between kernels: the pool is fork-join (the main thread is worker 0,
+ *     a dispatch drains before it returns), the IPC loop is one thread,
+ *     every reopen site runs before a dispatch, and the one lock-free
+ *     reader that outlives a lock release — the batch probe — is counted
+ *     in batch_inflight.  The flush paths (ray_sym_domain_flush, _append)
+ *     also read `atoms` after releasing the lock, but only while
+ *     count != disk_count, and an extend refuses a dirty domain, so no
+ *     extend can run while they read.  Retiring here too was #717: a
+ *     replica reopening
+ *     on a timer never drops its last reference, so every reopen leaked a
+ *     generation.  The contract this rests on is in domain.h at
+ *     ray_sym_domain_raw_pin: no pin across a reopen, no reopen under a
+ *     running kernel.
  */
 
 #if defined(__APPLE__)
@@ -151,7 +174,8 @@ struct ray_sym_domain_s {
      * on first access from the arena.  A slot is NULL until materialized;
      * the per-slot publication is an atomic release store.  count is
      * release-published AFTER the slot write (for appends); growth REPLACES
-     * the array via atomic store and retires the old one.  Lock-free readers
+     * the array via atomic store; an append retires the old one, an external
+     * extend frees it (see the concurrency note above).  Lock-free readers
      * load count (acquire) then atoms (acquire) then the slot (acquire). */
     _Atomic(int64_t)  count;
     _Atomic(ray_t**)  atoms;
@@ -171,9 +195,9 @@ struct ray_sym_domain_s {
     size_t*   offsets;
     /* Published raw snapshot (see ray_sym_domain_raw_pin): map, offsets and
      * the file-prefix count as one immutable record.  Replaced whole on
-     * extend; the previous record, its offsets and its mapping are retired
-     * (retired / retired_maps) rather than freed, so a reader holding the
-     * old snapshot stays valid until the domain is destroyed. */
+     * extend; the previous record, its offsets and its mapping are freed
+     * then, or retired (retired / retired_maps) while a batch intern is
+     * probing outside the lock — see the concurrency note above. */
     _Atomic(struct dom_raw_snap_s*) raw_snap;
     struct dom_retired_map_s* retired_maps;
 
@@ -191,11 +215,11 @@ struct ray_sym_domain_s {
     uint64_t* buckets;
     uint64_t  bucket_mask; /* cap - 1; 0 = not built yet */
     /* Batch interns currently probing a snapshot of `buckets` outside the
-     * lock (guarded by g_dom_lock).  While non-zero a replaced table is
-     * retired instead of freed. */
+     * lock (guarded by g_dom_lock).  While non-zero, whatever an extend
+     * or an index rebuild replaces is retired instead of freed. */
     int32_t   batch_inflight;
 
-    dom_retired_t* retired; /* replaced atom arrays + old LUTs */
+    dom_retired_t* retired; /* replaced atom arrays, offsets, snapshot records, LUTs */
 
     struct ray_symimp_s* imp; /* DOM_IMPORT: the import dictionary */
 
@@ -320,17 +344,27 @@ static bool dom_retire(ray_sym_domain_t* d, void* p) {
     return true;
 }
 
-/* Drop a replaced reverse-index table: freed at once unless a batch intern
- * is probing a snapshot outside the lock, then retired with the domain. */
-static bool dom_drop_buckets_locked(ray_sym_domain_t* d, uint64_t* old) {
+/* Drop something a lock-free reader of this domain MAY hold: freed at once
+ * unless a batch intern is probing a snapshot outside the lock, then
+ * retired with the domain.  Correct only where no other reader can be
+ * holding it -- the reverse index (probed by batch interns alone) and the
+ * generation replaced by an external extend (see the concurrency note at
+ * the top of the file: a reopen runs between kernels, and a pin does not
+ * survive one).  The append paths keep dom_retire: their readers are the
+ * concurrent import workers. */
+static bool dom_drop_locked(ray_sym_domain_t* d, void* old) {
     if (!old) return true;
     if (d->batch_inflight == 0) { ray_sys_free(old); return true; }
     return dom_retire(d, old);
 }
+static bool dom_drop_buckets_locked(ray_sym_domain_t* d, uint64_t* old) {
+    return dom_drop_locked(d, old);
+}
 
-/* Publish (map, offsets, count) as the domain's raw snapshot; the previous
- * record is retired.  Called with the file's current image in place. */
-static bool dom_publish_raw_snap(ray_sym_domain_t* d) {
+/* Publish (map, offsets, count) as the domain's raw snapshot.  The previous
+ * record is dropped (external extend: no reader holds it) or retired.
+ * Called with the file's current image in place. */
+static bool dom_publish_raw_snap(ray_sym_domain_t* d, bool drop_old) {
     dom_raw_snap_t* snap = NULL;
     if (d->map && d->offsets && d->base_count > 0) {
         snap = (dom_raw_snap_t*)ray_sys_alloc(sizeof(*snap));
@@ -340,7 +374,7 @@ static bool dom_publish_raw_snap(ray_sym_domain_t* d) {
         snap->count = d->base_count;
     }
     dom_raw_snap_t* old = atomic_exchange_explicit(&d->raw_snap, snap, memory_order_acq_rel);
-    if (old) (void)dom_retire(d, old);
+    if (old) (void)(drop_old ? dom_drop_locked(d, old) : dom_retire(d, old));
     return true;
 }
 
@@ -495,11 +529,20 @@ static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
     }
 
     /* Append-only prefix check: every position we already published must be
-     * byte-identical between the old and new file images (compare mmap bytes
-     * directly via the old/new offsets — no materialization needed). */
+     * byte-identical between the old and new file images.  The old image
+     * indexes [0, base_count): compare mmap bytes directly via the old/new
+     * offsets — no materialization needed.  A flush of this process wrote
+     * the rest, [base_count, count), from appended atoms (never NULL). */
+    ray_t** cur_atoms = atomic_load_explicit(&d->atoms, memory_order_relaxed);
     for (int64_t i = 0; ok && i < count; i++) {
         uint32_t ol, nl; const char *op, *np;
-        DOM_REC(obase, d->offsets[i], ol, op);
+        if (i < d->base_count) {
+            DOM_REC(obase, d->offsets[i], ol, op);
+        } else {
+            ray_t* a = cur_atoms[i];
+            ol = (uint32_t)ray_str_len(a);
+            op = ray_str_ptr(a);
+        }
         DOM_REC(nbase, fresh_offsets[i], nl, np);
         if (ol != nl || (ol > 0 && memcmp(op, np, ol) != 0)) ok = false;
     }
@@ -507,26 +550,27 @@ static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
 
     if (ok && fresh_count > count) {
         /* Publish the grown vocabulary.  Build a NEW slot array (replace,
-         * never realloc — lock-free readers may hold the old one): carry the
-         * already-materialized prefix atoms (arena-owned, still valid; long
-         * atoms hold their own copy, so swapping the map is safe), new file
-         * slots start NULL (lazy). */
+         * never realloc, so a batch intern probing outside the lock keeps a
+         * valid one): carry the already-materialized prefix atoms
+         * (arena-owned, still valid; long atoms hold their own copy, so
+         * swapping the map is safe), new file slots start NULL (lazy). */
         ray_t** atoms = atomic_load_explicit(&d->atoms, memory_order_relaxed);
         ray_t** narr = (ray_t**)ray_sys_alloc((size_t)fresh_count * sizeof(ray_t*));
         if (!narr) {
-            ok = false;
-        } else if (!dom_retire(d, atoms)) {
-            ray_sys_free(narr);
             ok = false;
         } else {
             if (count > 0) memcpy(narr, atoms, (size_t)count * sizeof(ray_t*));
             for (int64_t i = count; i < fresh_count; i++) narr[i] = NULL;
             ray_sys_free(fresh);  /* fresh slot array unused — narr carries the prefix */
 
-            /* Swap in the new offsets + map.  Prefix atoms are arena
-             * copies, but a raw snapshot may still point at the old
-             * offsets and mapping: retire both instead of freeing. */
-            (void)dom_retire(d, d->offsets);
+            /* Swap in the new offsets + map, publish, then let go of the
+             * superseded generation.  Nothing holds it: a reopen runs on
+             * the calling thread between kernels, and a raw snapshot does
+             * not survive one (domain.h) -- unless a batch intern is
+             * probing outside the lock, in which case dom_drop_locked
+             * retires instead.  Retiring until the domain dies here was
+             * #717: a replica never lets its domain die. */
+            size_t* old_offsets = d->offsets;
             d->offsets = fresh_offsets;
             void* old_map = d->map;
             size_t old_map_size = d->map_size;
@@ -539,23 +583,35 @@ static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
             atomic_store_explicit(&d->count, fresh_count, memory_order_release);
             d->disk_count = fresh_count;
             d->disk_size = st_size;
+            /* The new snapshot record must be published before the old
+             * generation goes.  When its allocation fails the old record
+             * stays published and still points at the old offsets and
+             * mapping, so those are retired (valid memory, covering fewer
+             * positions, as before) rather than freed; the atoms array is
+             * referenced by no record and goes either way. */
+            bool snap_ok = dom_publish_raw_snap(d, true);
 
+            (void)dom_drop_locked(d, atoms);
+            if (snap_ok) (void)dom_drop_locked(d, old_offsets);
+            else         (void)dom_retire(d, old_offsets);
             if (old_map) {
-                dom_retired_map_t* rm = (dom_retired_map_t*)ray_sys_alloc(sizeof(*rm));
-                if (rm) { rm->map = old_map; rm->size = old_map_size; rm->next = d->retired_maps; d->retired_maps = rm; }
-                /* no rm: the old mapping stays mapped for the process
-                 * lifetime — never unmapped under a live snapshot */
+                if (snap_ok && d->batch_inflight == 0) {
+                    ray_vm_unmap_file(old_map, old_map_size);
+                } else {
+                    dom_retired_map_t* rm = (dom_retired_map_t*)ray_sys_alloc(sizeof(*rm));
+                    if (rm) { rm->map = old_map; rm->size = old_map_size; rm->next = d->retired_maps; d->retired_maps = rm; }
+                    /* no rm: the old mapping stays mapped for the process
+                     * lifetime — never unmapped under a live snapshot */
+                }
             }
-            (void)dom_publish_raw_snap(d);
 
             /* Reverse index + LUT now cover a stale prefix: drop both.
-             * A retire-OOM here would keep the stale LUT published over
-             * the grown count (OOB reads for lock-free consumers) — the
-             * same corner dom_append_locked hits; mirror its loud abort
-             * (the count is already published, there is no clean undo). */
+             * A retire-OOM here (batch in flight) would keep the stale LUT
+             * published over the grown count (OOB reads for lock-free
+             * consumers) — the same corner dom_append_locked hits; mirror
+             * its loud abort (the count is already published, there is no
+             * clean undo). */
             if (d->buckets) {
-                /* A batch intern may be probing a snapshot of this
-                 * table outside the lock. */
                 if (!dom_drop_buckets_locked(d, d->buckets)) {
                     fprintf(stderr, "rayforce: sym domain '%s': OOM retiring "
                                     "reverse index after external extend\n",
@@ -566,14 +622,14 @@ static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
             }
             int64_t* lut = atomic_load_explicit(&d->runtime_lut, memory_order_relaxed);
             if (lut) {
-                if (!dom_retire(d, lut)) {
+                atomic_store_explicit(&d->runtime_lut, NULL, memory_order_release);
+                if (!dom_drop_locked(d, lut)) {
                     fprintf(stderr, "rayforce: sym domain '%s': OOM retiring "
                                     "runtime LUT after external extend — cannot "
                                     "keep id translation consistent\n",
                             d->path ? d->path : "?");
                     abort();
                 }
-                atomic_store_explicit(&d->runtime_lut, NULL, memory_order_release);
             }
             return true;
         }
@@ -652,7 +708,7 @@ static ray_sym_domain_t* dom_open_impl(const char* path, bool create) {
         d->offsets = offsets;
         d->atoms_cap = count;
         d->base_count = count;
-        (void)dom_publish_raw_snap(d);
+        (void)dom_publish_raw_snap(d, false);
         d->disk_count = count;
         d->disk_size = d->map_size;
         /* Position-0 reservation: every non-empty symfile must carry the
@@ -767,9 +823,11 @@ ray_t* ray_sym_domain_str(ray_sym_domain_t* dom, int64_t pos) {
 
     /* Lock-free fast path: acquire the published count, then the array, then
      * the slot.  Appends release-publish the count after the slot write;
-     * array replacements are release-published before the count bump and old
-     * arrays are retired (valid memory) — a reader can never index a
-     * published position into memory that lacks it.  A NULL slot is an
+     * array replacements are release-published before the count bump, and an
+     * append retires the old array (valid memory) — a reader can never index
+     * a published position into memory that lacks it.  An external extend
+     * frees the old array instead: no reader runs during a reopen (see the
+     * concurrency note at the top of the file).  A NULL slot is an
      * unmaterialized lazy file entry: fall to the lock-held materialize. */
     int64_t count = atomic_load_explicit(&dom->count, memory_order_acquire);
     if (pos < 0 || pos >= count) return NULL;
@@ -794,7 +852,8 @@ bool ray_sym_domain_raw_pin(ray_sym_domain_t* dom, ray_sym_domain_raw_t* out) {
     return true;
 }
 void ray_sym_domain_raw_unpin(ray_sym_domain_t* dom) {
-    (void)dom;   /* the snapshot outlives its readers by construction */
+    (void)dom;   /* the snapshot outlives its readers by contract: no pin
+                  * across a reopen (domain.h, ray_sym_domain_raw_pin) */
 }
 /* Empty-vocabulary FILE domains get a distinct non-NULL LUT so callers
  * can branch on NULL == "runtime domain, ids pass through".  Never
@@ -1066,6 +1125,8 @@ typedef struct {
     char*                region;     /* one arena region for the whole batch */
     int64_t              base;       /* position of new string 0 */
     ray_t**              atoms_w;    /* current atom array (fill target) */
+    _Atomic(uint8_t)*    done;       /* [n_tasks] insert task t finished (parallel commit) */
+    int64_t              insert_total;
     /* Set when a probe met an entry it could not compare (no atom, no
      * raw bytes): the misses are then resolved under the lock instead. */
     _Atomic(bool)        unsure;
@@ -1178,6 +1239,24 @@ static void dom_batch_insert_fn(void* raw, uint32_t wid, int64_t k0, int64_t k1)
     }
 }
 
+/* The insert in tasks of DOM_INSERT_GRAIN new strings, each flagged done
+ * when it finishes.  A cancelled pool dispatch skips tasks that have not
+ * started but runs a started one to its end (nothing here polls), so after
+ * the dispatch every task is either whole or untouched, and the caller
+ * completes the untouched ones serially: the commit then always publishes
+ * every string, cancel or not, without a serial pass over all of them. */
+#define DOM_INSERT_GRAIN 4096
+static void dom_batch_insert_task_fn(void* raw, uint32_t wid, int64_t t0, int64_t t1) {
+    dom_batch_ctx_t* b = (dom_batch_ctx_t*)raw;
+    for (int64_t t = t0; t < t1; t++) {
+        int64_t k0 = t * DOM_INSERT_GRAIN;
+        int64_t k1 = k0 + DOM_INSERT_GRAIN;
+        if (k1 > b->insert_total) k1 = b->insert_total;
+        dom_batch_insert_fn(raw, wid, k0, k1);
+        atomic_store_explicit(&b->done[t], 1, memory_order_release);
+    }
+}
+
 /* A repeated miss takes the position its first occurrence received. */
 static void dom_batch_repeat_fn(void* raw, uint32_t wid, int64_t j0, int64_t j1) {
     (void)wid;
@@ -1188,6 +1267,34 @@ static void dom_batch_repeat_fn(void* raw, uint32_t wid, int64_t j0, int64_t j1)
         if (v < -1) b->out_pos[i] = b->out_pos[-(v + 2)];
     }
 }
+
+/* Whether a pool dispatch issued now would skip tasks: the evaluator's
+ * interrupt flag, or the pool's own cancel flag (set together by
+ * ray_request_interrupt; a handler on a worker thread can leave the pool's
+ * set alone for a moment). */
+static inline bool dom_batch_cancelled(ray_pool_t* pool) {
+    if (ray_interrupted()) return true;
+    return pool && atomic_load_explicit(&pool->cancelled, memory_order_relaxed);
+}
+
+#ifdef DEBUG
+static _Atomic(int) g_dom_batch_cancel_phase_for_test = 0;
+
+void ray_sym_domain_batch_cancel_for_test(int phase) {
+    atomic_store_explicit(&g_dom_batch_cancel_phase_for_test, phase,
+                          memory_order_relaxed);
+}
+
+static void dom_batch_cancel_for_test(int phase) {
+    int expected = phase;
+    if (atomic_compare_exchange_strong_explicit(
+            &g_dom_batch_cancel_phase_for_test, &expected, 0,
+            memory_order_relaxed, memory_order_relaxed))
+        ray_request_interrupt();
+}
+#else
+#define dom_batch_cancel_for_test(...) ((void)0)
+#endif
 
 static bool dom_batch_append_serial_locked(ray_sym_domain_t* dom, int64_t n,
                                            const char* const* strs, const size_t* lens,
@@ -1207,6 +1314,7 @@ bool ray_sym_domain_intern_batch(ray_sym_domain_t* dom, int64_t n,
                                  const uint32_t* hashes, int64_t* out_pos) {
     if (!dom || n < 0) return false;
     if (n == 0) return true;
+    if (ray_interrupted()) return false;
     if (dom->kind == DOM_IMPORT) {
         /* The import dictionary keys on all 64 bits of the hash, which a
          * caller of this entry point has dropped: hashed again here
@@ -1257,8 +1365,15 @@ bool ray_sym_domain_intern_batch(ray_sym_domain_t* dom, int64_t n,
 
     ray_pool_t* pool = ray_pool_get();
     bool par = ray_pool_par_dispatch_ok(pool, n, 4096);
+    dom_batch_cancel_for_test(RAY_SYM_DOMAIN_CANCEL_PROBE);
     if (par) ray_pool_dispatch(pool, dom_batch_probe_fn, &b, n);
     else dom_batch_probe_fn(&b, 0, 0, n);
+    if (dom_batch_cancelled(pool)) {
+        dom_lock();
+        dom->batch_inflight--;
+        dom_unlock();
+        return false;
+    }
 
     /* Misses, grouped by hash partition: no more partitions than workers*4
      * or than the batch fills with a few thousand misses each.  Every
@@ -1312,13 +1427,33 @@ bool ray_sym_domain_intern_batch(ray_sym_domain_t* dom, int64_t n,
         b.tab_off[n_part] = tcap;
         b.tab = (int64_t*)ray_sys_alloc((size_t)(tcap > 0 ? tcap : 1) * sizeof(int64_t));
         if (!b.tab) ok = false;
-        else if (par) ray_pool_dispatch_n(pool, dom_batch_dedupe_fn, &b, (uint32_t)n_part);
-        else dom_batch_dedupe_fn(&b, 0, 0, n_part);
+        else {
+            dom_batch_cancel_for_test(RAY_SYM_DOMAIN_CANCEL_DEDUPE);
+            if (par) ray_pool_dispatch_n(pool, dom_batch_dedupe_fn, &b, (uint32_t)n_part);
+            else dom_batch_dedupe_fn(&b, 0, 0, n_part);
+            if (dom_batch_cancelled(pool)) ok = false;
+        }
         ray_profile_tick("dom batch: misses deduped");
     }
 
     dom_lock();
     dom->batch_inflight--;   /* no probe outside the lock past this point */
+    if (dom_batch_cancelled(pool)) {
+        dom_unlock();
+        ray_sys_free(b.miss);
+        ray_sys_free(b.uniq);
+        ray_sys_free(b.part_off);
+        ray_sys_free(b.uniq_n);
+        ray_sys_free(b.tab_off);
+        ray_sys_free(b.tab);
+        return false;
+    }
+    /* An external extend meanwhile dropped the reverse index the probe
+     * read (dom_extend_from_file_locked): everything below, the serial
+     * fallback included, probes the current vocabulary, so rebuild it
+     * first; without one there is nothing to fall back to. */
+    bool indexed = dom->buckets || dom_build_index_locked(dom, n + 1);
+    if (!indexed) ok = false;
     bool unchanged = ok && dom->buckets == b.buckets &&
                      atomic_load_explicit(&dom->count, memory_order_relaxed) == b.count &&
                      !atomic_load_explicit(&b.unsure, memory_order_relaxed);
@@ -1397,14 +1532,40 @@ bool ray_sym_domain_intern_batch(ray_sym_domain_t* dom, int64_t n,
             if (ok) {
                 b.base = base;
                 b.atoms_w = atomic_load_explicit(&dom->atoms, memory_order_relaxed);
+                /* The commit is not interruptible: once bucket and atom
+                 * publication starts, a partial insert cannot be rolled
+                 * back.  It still runs in parallel: a cancel arriving now
+                 * makes the dispatch skip tasks, and every skipped task is
+                 * run here afterwards (dom_batch_insert_task_fn), so the
+                 * publication is whole either way.  The repeat pass is
+                 * idempotent and simply re-runs serially after a cancel. */
+                dom_batch_cancel_for_test(RAY_SYM_DOMAIN_CANCEL_INSERT);
                 if (total > 0) {
-                    if (par && ray_pool_par_dispatch_ok(pool, total, 4096))
-                        ray_pool_dispatch(pool, dom_batch_insert_fn, &b, total);
-                    else dom_batch_insert_fn(&b, 0, 0, total);
+                    int64_t n_tasks = (total + DOM_INSERT_GRAIN - 1) / DOM_INSERT_GRAIN;
+                    b.insert_total = total;
+                    void* done_mem = NULL;
+                    if (par && ray_pool_par_dispatch_ok(pool, total, DOM_INSERT_GRAIN) &&
+                        n_tasks <= RAY_POOL_MAX_TASKS)
+                        done_mem = ray_sys_alloc((size_t)n_tasks);
+                    b.done = done_mem;
+                    if (done_mem) {
+                        memset(done_mem, 0, (size_t)n_tasks);
+                        ray_pool_dispatch_n(pool, dom_batch_insert_task_fn, &b, (uint32_t)n_tasks);
+                        for (int64_t t = 0; t < n_tasks; t++)
+                            if (!atomic_load_explicit(&b.done[t], memory_order_acquire))
+                                dom_batch_insert_task_fn(&b, 0, t, t + 1);
+                        ray_sys_free(done_mem);
+                        b.done = NULL;
+                    } else {
+                        dom_batch_insert_fn(&b, 0, 0, total);
+                    }
                 }
-                if (par && ray_pool_par_dispatch_ok(pool, n_miss, 4096))
+                if (par && ray_pool_par_dispatch_ok(pool, n_miss, 4096)) {
                     ray_pool_dispatch(pool, dom_batch_repeat_fn, &b, n_miss);
-                else dom_batch_repeat_fn(&b, 0, 0, n_miss);
+                    if (dom_batch_cancelled(pool)) dom_batch_repeat_fn(&b, 0, 0, n_miss);
+                } else {
+                    dom_batch_repeat_fn(&b, 0, 0, n_miss);
+                }
                 ray_profile_tick("dom batch: inserted");
                 atomic_store_explicit(&dom->count, pos, memory_order_release);
                 /* Same invalidation as dom_append_locked: the runtime LUT
@@ -1428,7 +1589,7 @@ bool ray_sym_domain_intern_batch(ray_sym_domain_t* dom, int64_t n,
     } else {
         for (int64_t i = 0; i < n; i++) if (out_pos[i] < -1) out_pos[i] = -1;
     }
-    if (!unchanged || !ok)
+    if (indexed && (!unchanged || !ok))
         ok = dom_batch_append_serial_locked(dom, n, strs, lens, hashes, out_pos);
     dom_unlock();
     ray_profile_tick("dom batch: done");

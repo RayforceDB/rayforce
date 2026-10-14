@@ -122,3 +122,76 @@ out -- 6
 (set i 0)
 (times 3 (do (let sq (* i i)) (set out (concat out sq))) (set i (+ i 1)))
 out -- (list 0 1 4)
+
+;; ── indexed form: (times [i n] body...) ──────────────────────────────
+;; i runs over 0, 1, ..., n-1, one value per pass
+(set out (list))
+(times [i 4] (set out (concat out i)))
+out -- [0 1 2 3]
+
+;; the count is any expression, evaluated once
+(set qty [1 2 3])
+(set delta [10 20 30])
+(times [j (count qty)] (alter 'qty set j (+ (at qty j) (at delta j))))
+qty -- [11 22 33]
+
+;; a name as the count is a reference, not a symbol literal
+(set m 3)
+(set s 0)
+(times [k m] (set s (+ s k)))
+s -- 3
+
+;; i is bound like a let and keeps the last index after the loop
+(times [last 5] 0)
+last -- 4
+
+;; zero and negative counts run no pass and leave i alone
+(set z 99)
+(times [z 0] (set z 1))
+z -- 99
+(times [z -2] (set z 1))
+z -- 99
+
+;; rebinding i in the body lasts for the rest of that pass only
+(set seen (list))
+(times [i 3] (set seen (concat seen i)) (set i 100))
+seen -- [0 1 2]
+
+;; still a statement form
+(nil? (times [i 3] i)) -- true
+
+;; ── indexed form, compiled ───────────────────────────────────────────
+((fn [n] (let acc 0) (times [k n] (let acc (+ acc k))) acc) 5) -- 10
+((fn [n] (let s (list)) (times [k n] (let s (concat s k)) (let k 100)) s) 3) -- [0 1 2]
+((fn [] (times [k 5] 0) k)) -- 4
+((fn [n] (let k 99) (times [k n] (let k 1)) k) 0) -- 99
+((fn [n] (let k 99) (times [k n] (let k 1)) k) -3) -- 99
+((fn [n] (times [k n] (if (== k 2) (return (* k 10)))) -1) 10) -- 20
+((fn [] (times [i "3"] 1))) !- type
+((fn [] (times [i 1.5] 1))) !- type
+
+;; the index reaches a compiled loop's alter, the backtester shape
+(set pos [5 5 5 5])
+((fn [d] (times [i (count pos)] (alter 'pos set i (- (at pos i) (at d i))))) [1 2 3 4])
+pos -- [4 3 2 1]
+
+;; nested, each index its own; the hidden bounds do not collide
+((fn [] (let t 0) (times [a 3] (times [b 4] (let t (+ t (* a b))))) t)) -- 18
+(set t 0)
+(times [a 3] (times [b 4] (set t (+ t (* a b)))))
+t -- 18
+
+;; indexed and plain loops nest in either order
+((fn [] (let t 0) (times 2 (times [b 3] (let t (+ t b)))) t)) -- 6
+((fn [] (let t 0) (times [a 3] (times 2 (let t (+ t a)))) t)) -- 6
+
+;; a closure made in the body sees the index of its pass
+((fn [] (let fs (list)) (times [i 3] (let fs (concat fs (list (fn [] i))))) (map (fn [f] (f)) fs))) -- [0 1 2]
+
+;; ── indexed form, errors ─────────────────────────────────────────────
+(set c 0)
+(== (try (times [i (raise 'bad-count)] (set c (+ c 1))) (fn [e] e)) 'bad-count) -- true
+c -- 0
+(times [.sys.gc 3] 1) !- reserve
+((fn [] (times [.sys.gc 3] 1))) !- reserve
+(times [i 1.5] 1) !- type

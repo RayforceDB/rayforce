@@ -153,9 +153,9 @@ Boolean logic operators. Work on scalars and vectors alike.
 
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
-| `and` | binary | — | Logical AND | `(and true false)` → `false` |
-| `or` | binary | — | Logical OR | `(or true false)` → `true` |
-| `not` | unary | — | Logical NOT | `(not true)` → `false` |
+| `and` | binary | — | Logical AND; element-wise on vectors and lists (lengths must match) | `(and true false)` → `false` |
+| `or` | binary | — | Logical OR; element-wise on vectors and lists (lengths must match) | `(or true false)` → `true` |
+| `not` | unary | — | Logical NOT; element-wise on vectors and lists | `(not true)` → `false` |
 
 ```lisp
 ; Combine filters with logic ops
@@ -175,8 +175,8 @@ Aggregation functions reduce vectors to scalar values. Functions marked **aggr**
 | `any` | unary | aggr | True if any non-null numeric element is truthy; empty/all-null returns `false` | `(any [0 0 3])` → `true` |
 | `count` | unary | aggr | Count of elements | `(count [1 2 3])` → `3` |
 | `avg` | unary | aggr | Arithmetic mean | `(avg [1 2 3])` → `2.0` |
-| `min` | unary aggr, or binary | aggr/atomic | Reduce one vector, or choose the element-wise minimum of two values | `(min [3 9 1] [2 10 4])` → `[2 9 1]` |
-| `max` | unary aggr, or binary | aggr/atomic | Reduce one vector, or choose the element-wise maximum of two values | `(max [3 9 1] 5)` → `[5 9 5]` |
+| `min` | unary aggr, or binary | aggr/atomic | Reduce one vector, or choose the element-wise minimum of two values, in their promoted type (null lowest) | `(min [3 9 1] [2 10 4])` → `[2 9 1]`, `(min 1 2.5)` → `1.0` |
+| `max` | unary aggr, or binary | aggr/atomic | Reduce one vector, or choose the element-wise maximum of two values, in their promoted type (null lowest) | `(max [3 9 1] 5)` → `[5 9 5]`, `(max [2 0] true)` → `[2 1]` |
 | `first` | unary | — | First element of a vector | `(first [10 20 30])` → `10` |
 | `last` | unary | — | Last element of a vector | `(last [10 20 30])` → `30` |
 | `med` | unary | aggr | Median value (returns f64) | `(med [1 3 2])` → `2.0` |
@@ -259,12 +259,12 @@ Query `concat` joins text row by row when an operand comes from a source column,
 | `except` | binary | — | Set difference (elements in A not in B) | `(except [1 2 3] [2])` → `[1 3]` |
 | `union` | binary | — | Set union (deduplicated) | `(union [1 2] [2 3])` → `[1 2 3]` |
 | `sect` | binary | — | Set intersection | `(sect [1 2 3] [2 3 4])` → `[2 3]` |
-| `take` | binary | — | Take first N elements (negative N takes from end) | `(take [10 20 30] 2)` → `[10 20]` |
+| `take` | binary | — | Take first N elements (negative N takes from end); past the length it cycles | `(take [10 20 30] 2)` → `[10 20]`; `(take [1 2 3] -5)` → `[2 3 1 2 3]` |
 | `drop` | binary | — | Drop first N elements (negative N drops from end) | `(drop [10 20 30] 1)` → `[20 30]` |
 | `rotate` | binary | — | Rotate left by N positions (negative rotates right) | `(rotate [1 2 3 4] 1)` → `[2 3 4 1]` |
 | `cut` | binary | — | Split a collection at sorted 0-based indices | `(cut [1 2 3 4] [2])` → `([1 2] [3 4])` |
 | `cross` | binary | — | Cartesian product as pairs | `(cross [1 2] ['a 'b])` → `((1 'a) (1 'b) (2 'a) (2 'b))` |
-| `at` | binary | — | Index a collection; vector keys batch dictionary lookups | `(at [10 20 30] 1)` → `20` |
+| `at` | binary | — | Index a collection; vector keys batch dictionary lookups. A typed vector indexed by an integer vector keeps its type: a null or out-of-range index gives the type's null (`false`/`0x00` for BOOL/U8) | `(at [10 20 30] 1)` → `20`, `(at [10 20 30] [2 9])` → `[30 0Nl]` |
 | `find` | binary | — | Find index of first occurrence | `(find [10 20 30] 20)` → `1` |
 | `fill` | binary | atomic | Replace null values; the replacement is the first argument | `(fill 0 [1 0Nl 3])` → `[1 0 3]` |
 | `reverse` | unary | — | Reverse element order | `(reverse [1 2 3])` → `[3 2 1]` |
@@ -363,10 +363,10 @@ Special forms receive their arguments unevaluated. These are the core language p
 |---|---|---|---|---|
 | `set` | binary | special, restricted | Bind value to global variable | `(set x 42)` |
 | `let` | binary | special | Bind value to local variable (lexical scope) | `(let y (+ x 1))` |
-| `if` | variadic | special | Conditional: (if cond then else) | `(if (> x 0) "pos" "neg")` |
+| `if` | variadic | special | Conditional: (if c1 r1 c2 r2 ... else?) — first truthy condition wins | `(if (> x 0) "pos" "neg")` |
 | `do` | variadic | special | Sequential execution, returns last value | `(do (set x 1) (set y 2) (+ x y))` |
 | `while` | variadic | special | Iterate while cond is truthy; returns null | `(while (> n 0) (set n (- n 1)))` |
-| `times` | variadic | special | Run body exactly n times (count evaluated once); returns null | `(times 5 (set n (+ n 1)))` |
+| `times` | variadic | special | Run body exactly n times (count evaluated once); `(times [i n] ...)` binds `i` to 0..n-1, one per pass; returns null | `(times 5 (set n (+ n 1)))`, `(times [i 3] (println i))` |
 | `fn` | variadic | special | Create lambda function | `(fn [x y] (+ x y))` |
 | `try` | binary | special | Error handling: (try expr handler-fn-or-fallback-value) | `(try (/ 1 0) (fn [e] 0))` |
 | `raise` | unary | — | Throw an error with message | `(raise "bad input")` |
@@ -661,11 +661,11 @@ System interaction, metaprogramming, diagnostics, and runtime inspection.
 | `.time.timer.set` | variadic | restricted | Schedule callback every `ms`, `num` times (0 = forever); returns id | `(.time.timer.set 1000 0 (fn [t] (println t)))` |
 | `.time.timer.del` | unary | restricted | Cancel a scheduled timer by id; returns null | `(.time.timer.del 0)` |
 | `.sys.build` | nullary | — | Build metadata dict with `version` + `build-date` | `(.sys.build)` |
-| `.sys.mem` | variadic | — | Memory allocator statistics (alloc / peak / slab hits) | `(.sys.mem)` |
-| `.sys.prof` | variadic | — | Last profiled query's per-step statistics as a table (opt-in via `:t`) | `(.sys.prof)` |
+| `.sys.mem` | nullary | — | Memory allocator statistics (alloc / peak / slab hits) | `(.sys.mem)` |
+| `.sys.prof` | nullary | — | Last profiled query's per-step statistics as a table (opt-in via `:t`) | `(.sys.prof)` |
 | `.sys.querylog` | variadic | — | Ambient per-query statistics ring as a table (opt-in via `-Q` / `.sys.querylog.enable`) | `(.sys.querylog)` |
 | `.sys.querylog.enable` | variadic | restricted | Toggle query-statistics logging; returns new state | `(.sys.querylog.enable 1)` |
-| `.sys.info` | variadic | — | Host and process info (cores, page size, total memory, pid, hostname) | `(.sys.info)` |
+| `.sys.info` | nullary | — | Host and process info (cores, page size, total memory, pid, hostname) | `(.sys.info)` |
 
 ```lisp
 ; Metaprogramming: parse and eval
@@ -678,8 +678,8 @@ System interaction, metaprogramming, diagnostics, and runtime inspection.
 (println (format "%ms" (- (.time.now) t0)))
 
 ; System diagnostics
-(.sys.info 0)                  ; OS, CPU cores, memory budget
-(.sys.mem 0)                  ; heap usage statistics
+(.sys.info)                    ; OS, CPU cores, memory budget
+(.sys.mem)                    ; heap usage statistics
 ```
 
 ## Serialization
