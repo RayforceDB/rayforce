@@ -155,6 +155,15 @@ int64_t ray_group_perpart_runs(void) {
                                 memory_order_relaxed);
 }
 
+/* Monotonic count of exec_group_per_partition runs that returned their
+ * merged result (the concat fallback's NULL and errors excluded).  Test
+ * hook, O(1) per query. */
+static _Atomic(int64_t) ray_group_perpart_done_ctr = 0;
+
+int64_t ray_group_perpart_done(void) {
+    return atomic_load_explicit(&ray_group_perpart_done_ctr, memory_order_relaxed);
+}
+
 /* Monotonic count of the per-partition non-null count slots built as a SUM
  * of a not-null indicator (one per nullable AVG/VAR/DEV input per
  * partition); a null-free input keeps the row count and adds none.  Test
@@ -20013,15 +20022,12 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
     if (frow_sym >= 0) part_agg_syms[frow_slot] = frow_sym;
     /* (strlen c) SUM / AVG inputs (pp_strlen_scan_sym) scan the borrowed c
      * itself: its SUM slot is wrapped in the expression per partition
-     * below, an AVG's count slot counts c's rows (OP_COUNT counts rows; an
-     * AVG of strlen counts every row, pp_avg_counts_rows: never a
-     * not-null indicator) */
+     * below.  An AVG's count slot keeps its scan: an AVG of strlen counts
+     * every row (pp_avg_counts_rows: an OP_COUNT, never a not-null
+     * indicator), and OP_COUNT counts rows without reading its input. */
     for (uint32_t a = 0; a < n_aggs; a++) {
         int64_t ls = pp_strlen_scan_sym(g, parted_tbl, ext, a, agg_is_expr, borrow_syms, n_borrow);
-        if (ls < 0) continue;
-        part_agg_syms[a] = ls;
-        for (uint32_t i = 0; i < n_avg; i++)
-            if (avg_idx[i] == a) part_agg_syms[n_aggs + n_std + i] = ls;
+        if (ls >= 0) part_agg_syms[a] = ls;
     }
     int64_t frow_base = 0;   /* global row id of the partition's first row (no selection) */
 
@@ -20774,6 +20780,8 @@ batch_fail:
     ret = result;
     if (agg_emit_filter_targets(&ef_trim, ext))
         ret = agg_emit_filter_trim(ret, n_keys, n_aggs, ext->agg_ops, &ef_trim);
+    if (ret && !RAY_IS_ERR(ret))
+        atomic_fetch_add_explicit(&ray_group_perpart_done_ctr, 1, memory_order_relaxed);
 
 pp_cleanup:
     if (ef_saved.enabled) ray_group_emit_filter_set(ef_saved);

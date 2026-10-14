@@ -5481,10 +5481,11 @@ static test_result_t test_parted_strlen_avg(void) {
             snprintf(b, sizeof b, "(set T (.db.parted.get \"" AW_TMP "/ps%d\" 't))", gen);
             aw_eval_ok(b);
             ray_enc_counters_reset();
-            int64_t pp0 = ray_group_perpart_runs();
+            int64_t pp0 = ray_group_perpart_done();
             out[gen / 2] = ray_eval_str(qs[i]);
             TEST_ASSERT_FMT(out[gen / 2] && !RAY_IS_ERR(out[gen / 2]), "%s gen %d: %s", qs[i], gen, ray_error_msg());
-            TEST_ASSERT_FMT(ray_group_perpart_runs() > pp0, "%s gen %d: not the per-partition group", qs[i], gen);
+            /* the per-partition group returned the answer (not its concat fallback) */
+            TEST_ASSERT_FMT(ray_group_perpart_done() == pp0 + 1, "%s gen %d: not the per-partition group", qs[i], gen);
             if (gen) {
                 ray_enc_counters_t k; ray_enc_counters_get(&k);
                 TEST_ASSERT_FMT(k.materialized == 0, "%s: %llu materializations", qs[i], (unsigned long long)k.materialized);
