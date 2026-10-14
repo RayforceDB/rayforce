@@ -52,6 +52,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <sys/stat.h>   /* stat: the symfile size behind the mapping counters */
 #include <stdlib.h>   /* setenv */
 #include <stdatomic.h>
 
@@ -2015,6 +2016,82 @@ static test_result_t test_domain_raw_pin(void) {
     unlink(TMP_DOM_SYM_PATH ".lk");
     PASS();
 }
+
+/* #717: a reader that reopens a symfile another process grew must keep
+ * memory proportional to the vocabulary, however many times it reopened.
+ * Each reopen is a cache hit that extends the domain; the arrays it
+ * replaces and the mapping it supersedes used to be retired until the
+ * domain died — and a replica never lets it die. */
+static test_result_t test_domain_extend_reopen_flat(void) {
+    unlink(TMP_DOM_SYM_PATH);
+    unlink(TMP_DOM_SYM_PATH ".lk");
+    enum { VOCAB = 20000, WARM = 2, CYCLES = 30, PER_CYCLE = 10 };
+    for (int i = 0; i < VOCAB; i++) {
+        char b[32]; int n = snprintf(b, sizeof b, "flat_base_%d", i);
+        (void)ray_sym_intern(b, (size_t)n);
+    }
+    TEST_ASSERT_EQ_I(ray_sym_save(TMP_DOM_SYM_PATH), RAY_OK);
+    int64_t map_before_open = 0;
+    ray_sys_get_mapped(&map_before_open, NULL);
+    ray_sym_domain_t* dom = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    TEST_ASSERT_NOT_NULL(dom);
+    int64_t base = ray_sym_domain_count(dom);
+
+    int64_t sys0 = 0, next = 0;
+    for (int c = 0; c < WARM + CYCLES; c++) {
+        if (c == WARM) ray_sys_get_stat(&sys0, NULL);
+        for (int j = 0; j < PER_CYCLE; j++, next++) {
+            char b[32]; int n = snprintf(b, sizeof b, "flat_new_%lld", (long long)next);
+            (void)ray_sym_intern(b, (size_t)n);
+        }
+        TEST_ASSERT_EQ_I(ray_sym_save(TMP_DOM_SYM_PATH), RAY_OK);   /* tmp + rename: a new inode */
+        ray_sym_domain_t* again = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+        TEST_ASSERT_EQ_PTR(again, dom);                              /* cache hit → extend */
+        TEST_ASSERT_EQ_I(ray_sym_domain_count(dom), base + next);
+        /* the grown tail resolves both ways: lazily materialised atom and
+         * reverse index (rebuilt over the grown vocabulary) */
+        char last[32]; int ln = snprintf(last, sizeof last, "flat_new_%lld", (long long)(next - 1));
+        ray_t* s = ray_sym_domain_str(dom, base + next - 1);
+        TEST_ASSERT_NOT_NULL(s);
+        TEST_ASSERT_EQ_U(ray_str_len(s), (size_t)ln);
+        TEST_ASSERT_MEM_EQ((size_t)ln, ray_str_ptr(s), last);
+        TEST_ASSERT_EQ_I(ray_sym_domain_find(dom, last, (size_t)ln), base + next - 1);
+        ray_sym_domain_release(again);
+    }
+    int64_t sys1 = 0, map1 = 0;
+    ray_sys_get_stat(&sys1, NULL);
+    ray_sys_get_mapped(&map1, NULL);
+    struct stat st;
+    TEST_ASSERT_EQ_I(stat(TMP_DOM_SYM_PATH, &st), 0);
+    int64_t one_image = ((int64_t)st.st_size + 4095) & ~(int64_t)4095;
+    /* a pin taken after the growth covers the whole grown prefix (a pin
+     * taken before a reopen is not readable after it: see domain.h) */
+    ray_sym_domain_raw_t fresh;
+    TEST_ASSERT(ray_sym_domain_raw_pin(dom, &fresh), "pin after growth");
+    TEST_ASSERT_EQ_I(fresh.count, base + next);
+    for (int64_t p = 0; p < base + next; p += 997) {
+        size_t rl = 0;
+        const char* rp = ray_sym_domain_raw_str(&fresh, p, &rl);
+        ray_t* g = ray_sym_str(p);
+        TEST_ASSERT_EQ_U(rl, ray_str_len(g));
+        TEST_ASSERT_MEM_EQ(rl, rp, ray_str_ptr(g));
+    }
+    ray_sym_domain_raw_unpin(dom);
+    ray_sym_domain_release(dom);
+    unlink(TMP_DOM_SYM_PATH);
+    unlink(TMP_DOM_SYM_PATH ".lk");
+    /* committed RAM: nothing per reopen (one arena chunk of slack for the
+     * atoms materialised above); file mappings: exactly one image of the
+     * current file, whatever the number of reopens.  Asserted once the
+     * domain is released, so a failure leaves none cached behind it. */
+    TEST_ASSERT_FMT(sys1 - sys0 <= 64 * 1024,
+                    "sys-current grew by %lld bytes over %d reopens",
+                    (long long)(sys1 - sys0), CYCLES);
+    TEST_ASSERT_FMT(map1 - map_before_open == one_image,
+                    "sys-mapped holds %lld bytes for a %lld-byte symfile",
+                    (long long)(map1 - map_before_open), (long long)one_image);
+    PASS();
+}
 /* Runtime-id LUT: NULL for the runtime singleton; for a FILE domain a
  * position-indexed array of runtime intern ids (round-trips strings),
  * built once (idempotent: same pointer).  Divergent fixture proves the
@@ -2817,6 +2894,7 @@ const test_entry_t domain_entries[] = {
     { "domain/parted_flatten_adopts",   test_domain_parted_flatten_adopts,   domain_rt_setup, domain_rt_teardown },
     { "domain/str_eager_lockfree",      test_domain_str_eager_lockfree,      domain_setup, domain_teardown },
     { "domain/raw_pin",                 test_domain_raw_pin,                 domain_setup, domain_teardown },
+    { "domain/extend_reopen_flat",      test_domain_extend_reopen_flat,      domain_setup, domain_teardown },
     { "domain/concat_text_nulls",       test_domain_concat_text_nulls,       domain_rt_setup, domain_rt_teardown },
     { "domain/runtime_lut",             test_domain_runtime_lut,             domain_rt_setup, domain_rt_teardown },
     { "domain/open_position0_validation", test_domain_open_position0_validation, domain_setup, domain_teardown },
