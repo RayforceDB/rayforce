@@ -20024,7 +20024,9 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
      * itself: its SUM slot is wrapped in the expression per partition
      * below.  An AVG's count slot keeps its scan: an AVG of strlen counts
      * every row (pp_avg_counts_rows: an OP_COUNT, never a not-null
-     * indicator), and OP_COUNT counts rows without reading its input. */
+     * indicator), and OP_COUNT counts rows without reading its input.
+     * The name that slot scans is absent from the per-partition sub-table;
+     * an absent COUNT input binds to nothing, which COUNT never reads. */
     for (uint32_t a = 0; a < n_aggs; a++) {
         int64_t ls = pp_strlen_scan_sym(g, parted_tbl, ext, a, agg_is_expr, borrow_syms, n_borrow);
         if (ls >= 0) part_agg_syms[a] = ls;
