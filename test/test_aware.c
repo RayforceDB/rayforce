@@ -5391,6 +5391,57 @@ static test_result_t test_topk_never_pruned(void) {
     PASS();
 }
 
+/* A parted group's (strlen c) SUM / AVG input (ClickBench q28: avg
+ * (strlen URL) by CounterID) is aggregated by each partition's group over
+ * the borrowed segment, by range on generation 2, as the splayed group
+ * does: the SYM segments (URL's type in the ClickBench schema) are not
+ * materialized (the per-partition path evaluated the expression into a
+ * column, reading each segment whole).  Three partitions of 70000 rows,
+ * under a filter and without one, with a column without "" and one
+ * holding it; answers equal generation 0's. */
+static test_result_t test_parted_strlen_avg(void) {
+    for (int gen = 0; gen <= 2; gen += 2)
+        for (int p = 0; p < 3; p++) {
+            char q[1200];
+            snprintf(q, sizeof q,
+                     "(.db.splayed.set \"" AW_TMP "/ps%d/2024.01.0%d/t/\" (table [g u w v] (list (%% (til 70000) 13) "
+                     "(as 'SYM (as 'STR (* (%% (til 70000) 997) %d))) "
+                     "(as 'SYMBOL (map (fn [j] (if (== 0 (%% j 7)) \"\" (format \"w%%\" (%% j 50)))) (til 70000))) (til 70000))) "
+                     "\"" AW_TMP "/ps%d/.sym\" {compress: %s})",
+                     gen, p + 1, 1000 + p * 7, gen, gen ? "true" : "false");
+            aw_eval_ok(q);
+        }
+    static const char* const qs[] = {
+        "(select {l: (avg (strlen u)) c: (count v) from: T where: (!= w \"\") by: g asc: g})",
+        "(select {l: (avg (strlen w)) s: (sum (strlen u)) c: (count v) from: T by: g asc: g})",
+        "(select {l: (avg (strlen w)) c: (count v) from: T where: (> v 1000) by: g asc: g})",
+        NULL,
+    };
+    for (int i = 0; qs[i]; i++) {
+        ray_t* out[2];
+        for (int gen = 0; gen <= 2; gen += 2) {
+            char b[256];
+            snprintf(b, sizeof b, "(set T (.db.parted.get \"" AW_TMP "/ps%d\" 't))", gen);
+            aw_eval_ok(b);
+            ray_enc_counters_reset();
+            int64_t pp0 = ray_group_perpart_runs();
+            out[gen / 2] = ray_eval_str(qs[i]);
+            TEST_ASSERT_FMT(out[gen / 2] && !RAY_IS_ERR(out[gen / 2]), "%s gen %d: %s", qs[i], gen, ray_error_msg());
+            TEST_ASSERT_FMT(ray_group_perpart_runs() > pp0, "%s gen %d: not the per-partition group", qs[i], gen);
+            if (gen) {
+                ray_enc_counters_t k; ray_enc_counters_get(&k);
+                TEST_ASSERT_FMT(k.materialized == 0, "%s: %llu materializations", qs[i], (unsigned long long)k.materialized);
+            }
+        }
+        ray_t* fa = ray_fmt(out[0], 0); ray_t* fb = ray_fmt(out[1], 0);
+        TEST_ASSERT_FMT(ray_str_len(fa) == ray_str_len(fb) && memcmp(ray_str_ptr(fa), ray_str_ptr(fb), ray_str_len(fa)) == 0,
+                        "%s differs", qs[i]);
+        ray_release(fa); ray_release(fb); ray_release(out[0]); ray_release(out[1]);
+    }
+    aw_eval_ok("(set T 0)");
+    PASS();
+}
+
 const test_entry_t aware_entries[] = {
     { "aware/vview_encodings", test_vview_encodings, aw_setup, aw_teardown },
     { "aware/vview_near_top",  test_vview_near_top,  aw_setup, aw_teardown },
@@ -5478,6 +5529,7 @@ const test_entry_t aware_entries[] = {
     { "aware/gate_decoded_bytes",   test_gate_decoded_bytes,   aw_setup, aw_teardown },
     { "aware/cross_segment_codes",  test_cross_segment_codes,  aw_setup, aw_teardown },
     { "aware/parted_in",            test_parted_in,            aw_setup, aw_teardown },
+    { "aware/parted_strlen_avg",    test_parted_strlen_avg,    aw_setup, aw_teardown },
     { "aware/signed_zeros",      test_signed_zeros,      aw_setup, aw_teardown },
     { "aware/symbol_order",      test_symbol_order,      aw_setup, aw_teardown },
     { "aware/agg_admission",     test_agg_admission,     aw_setup, aw_teardown },

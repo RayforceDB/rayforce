@@ -19656,6 +19656,28 @@ static bool pp_avg_counts_rows(ray_graph_t* g, ray_op_ext_t* ext, uint32_t a,
     return pp_expr_null_free(g, in, parted_tbl, n_parts, 0);
 }
 
+/* SUM / AVG input a of the per-partition group that is (strlen c) of a
+ * borrowed generation-2 column scan: c's symbol, else -1.  Its partitions are not
+ * evaluated into a column: each partition's group takes the expression
+ * over its borrowed segment and aggregates it inline, by range over a
+ * generation-2 segment, as the splayed group does (try_strlen_sumavg_input
+ * and the range reads), so the segment is never materialized. */
+static int64_t pp_strlen_scan_sym(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext, uint32_t a,
+                                  const uint8_t* agg_is_expr, const int64_t* borrow_syms, int n_borrow) {
+    if (!agg_is_expr[a] || (ext->agg_ops[a] != OP_SUM && ext->agg_ops[a] != OP_AVG)) return -1;
+    ray_op_t* in = op_node(g, ext->agg_ins[a]);
+    if (!in || in->opcode != OP_STRLEN || in->arity != 1) return -1;
+    ray_op_t* c = op_child(g, in, 0);
+    ray_op_ext_t* ce = c && c->opcode == OP_SCAN ? find_ext(g, c->id) : NULL;
+    if (!ce) return -1;
+    /* generation 2 only: a generation-0 column keeps its route (the
+     * partition's plain strlen column, measured cheaper there) */
+    ray_col_meta_t cm;
+    if (!ray_table_col_meta(parted_tbl, ce->sym, &cm) || !cm.enc) return -1;
+    for (int j = 0; j < n_borrow; j++) if (borrow_syms[j] == ce->sym) return ce->sym;
+    return -1;
+}
+
 /* --------------------------------------------------------------------------
  * exec_group_per_partition — per-partition GROUP BY with merge
  *
@@ -19989,6 +20011,18 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
     for (uint32_t i = 0; i < n_std; i++)
         part_agg_syms[std_cnt_slot[i]] = agg_syms[std_idx[i]];
     if (frow_sym >= 0) part_agg_syms[frow_slot] = frow_sym;
+    /* (strlen c) SUM / AVG inputs (pp_strlen_scan_sym) scan the borrowed c
+     * itself: its SUM slot is wrapped in the expression per partition
+     * below, an AVG's count slot counts c's rows (OP_COUNT counts rows; an
+     * AVG of strlen counts every row, pp_avg_counts_rows: never a
+     * not-null indicator) */
+    for (uint32_t a = 0; a < n_aggs; a++) {
+        int64_t ls = pp_strlen_scan_sym(g, parted_tbl, ext, a, agg_is_expr, borrow_syms, n_borrow);
+        if (ls < 0) continue;
+        part_agg_syms[a] = ls;
+        for (uint32_t i = 0; i < n_avg; i++)
+            if (avg_idx[i] == a) part_agg_syms[n_aggs + n_std + i] = ls;
+    }
     int64_t frow_base = 0;   /* global row id of the partition's first row (no selection) */
 
     /* ---- Batched incremental merge ----
@@ -20112,6 +20146,7 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
             }
             for (uint32_t a = 0; a < n_aggs; a++) {
                 if (!agg_is_expr[a]) continue;
+                if (pp_strlen_scan_sym(g, parted_tbl, ext, a, agg_is_expr, borrow_syms, n_borrow) >= 0) continue;   /* below */
                 ray_t* saved = g->table;
                 g->table = sub;
                 ray_t* v = exec_node(g, op_node(g, ext->agg_ins[a]));
@@ -20155,6 +20190,13 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
             for (uint32_t a = 0; a < part_n_aggs; a++) {
                 ray_t* sym_atom = ray_sym_str(part_agg_syms[a]);
                 pagg_ins[a] = ray_scan(pg, ray_str_ptr(sym_atom));
+            }
+            /* (strlen c) inputs: the SUM slot's scan of c (set above)
+             * wrapped in the expression */
+            for (uint32_t a = 0; a < n_aggs; a++) {
+                if (pp_strlen_scan_sym(g, parted_tbl, ext, a, agg_is_expr, borrow_syms, n_borrow) < 0) continue;
+                pagg_ins[a] = pagg_ins[a] ? ray_strlen(pg, pagg_ins[a]) : NULL;
+                if (!pagg_ins[a]) { ray_graph_free(pg); pp_release_sub(g, sub); goto batch_fail; }
             }
             for (uint32_t j = 0; j < n_std; j++) {
                 uint8_t sq = std_sq_slot[j];
