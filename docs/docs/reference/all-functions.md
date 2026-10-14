@@ -264,7 +264,7 @@ Query `concat` joins text row by row when an operand comes from a source column,
 | `rotate` | binary | — | Rotate left by N positions (negative rotates right) | `(rotate [1 2 3 4] 1)` → `[2 3 4 1]` |
 | `cut` | binary | — | Split a collection at sorted 0-based indices | `(cut [1 2 3 4] [2])` → `([1 2] [3 4])` |
 | `cross` | binary | — | Cartesian product as pairs | `(cross [1 2] ['a 'b])` → `((1 'a) (1 'b) (2 'a) (2 'b))` |
-| `at` | binary | — | Index a collection; vector keys batch dictionary lookups | `(at [10 20 30] 1)` → `20` |
+| `at` | binary | — | Index a collection; vector keys batch dictionary lookups. A typed vector indexed by an integer vector keeps its type: a null or out-of-range index gives the type's null (`false`/`0x00` for BOOL/U8) | `(at [10 20 30] 1)` → `20`, `(at [10 20 30] [2 9])` → `[30 0Nl]` |
 | `find` | binary | — | Find index of first occurrence | `(find [10 20 30] 20)` → `1` |
 | `fill` | binary | atomic | Replace null values; the replacement is the first argument | `(fill 0 [1 0Nl 3])` → `[1 0 3]` |
 | `reverse` | unary | — | Reverse element order | `(reverse [1 2 3])` → `[3 2 1]` |

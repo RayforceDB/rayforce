@@ -2568,6 +2568,76 @@ ray_t* ray_cross_fn(ray_t* a, ray_t* b) {
 }
 
 /* (at vec idx) or (at table 'col) — index into vector or table */
+/* Row j of an integer index vector as a row id into a vec of vlen rows,
+ * or -1 when it is null or out of range. */
+static int64_t at_row(ray_t* idx, const void* ids, int64_t j, int64_t vlen, bool nulls) {
+    if (nulls && ray_vec_is_null(idx, j)) return -1;
+    int64_t k;
+    switch (idx->type) {
+    case RAY_I64: k = ((const int64_t*)ids)[j]; break;
+    case RAY_I32: k = ((const int32_t*)ids)[j]; break;
+    case RAY_I16: k = ((const int16_t*)ids)[j]; break;
+    default:      k = ((const uint8_t*)ids)[j]; break;
+    }
+    return k >= 0 && k < vlen ? k : -1;
+}
+
+/* (at vec idx) for a typed vec and an integer index vector — see the
+ * caller in ray_at_fn.  The valid row ids are gathered; an invalid one
+ * reads row 0 (nothing, from an empty vec) and is then set to the type's
+ * null, or to zero for BOOL and U8, which have none. */
+static ray_t* at_gather_typed(ray_t* vec, ray_t* idx) {
+    int64_t n = ray_len(idx);
+    int64_t vlen = ray_len(vec);
+    bool nulls = ray_vec_may_have_nulls(idx);
+    const void* ids = ray_data(idx);
+
+    /* The common case: I64 row ids, all valid — gather straight from them. */
+    int64_t nbad = 0;
+    for (int64_t j = 0; j < n; j++)
+        if (at_row(idx, ids, j, vlen, nulls) < 0) nbad++;
+    if (idx->type == RAY_I64 && nbad == 0)
+        return gather_by_idx(vec, (int64_t*)ids, n);
+
+    ray_t* out;
+    if (vlen > 0) {
+        ray_t* rows = ray_vec_new(RAY_I64, n);
+        if (!rows || RAY_IS_ERR(rows)) return rows ? rows : ray_error("oom", NULL);
+        rows->len = n;
+        int64_t* r = (int64_t*)ray_data(rows);
+        for (int64_t j = 0; j < n; j++) {
+            int64_t k = at_row(idx, ids, j, vlen, nulls);
+            r[j] = k < 0 ? 0 : k;
+        }
+        out = gather_by_idx(vec, r, n);
+        ray_release(rows);
+    } else if (vec->type == RAY_SYM) {
+        out = ray_sym_vec_new(vec->attrs & RAY_SYM_W_MASK, n);
+        if (out && !RAY_IS_ERR(out)) {
+            ray_sym_vec_adopt_domain(out, vec);
+            out->len = n;
+            memset(ray_data(out), 0, (size_t)n * RAY_SYM_ELEM(vec->attrs & RAY_SYM_W_MASK));
+        }
+    } else {
+        out = ray_vec_new(vec->type, n);
+        if (out && !RAY_IS_ERR(out)) {
+            out->len = n;
+            memset(ray_data(out), 0, (size_t)n * ray_type_sizes[vec->type]);
+        }
+    }
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    if (nbad == 0) return out;
+
+    bool nullable = vec->type != RAY_BOOL && vec->type != RAY_U8;
+    uint8_t* bytes = (uint8_t*)ray_data(out);
+    for (int64_t j = 0; j < n; j++) {
+        if (at_row(idx, ids, j, vlen, nulls) >= 0) continue;
+        if (nullable) ray_vec_set_null(out, j, true);
+        else          bytes[j] = 0;
+    }
+    return out;
+}
+
 ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
     if (ray_is_lazy(vec)) vec = ray_lazy_materialize(vec);
     /* Table column access by symbol key — return the typed vector directly.
@@ -2739,24 +2809,15 @@ ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
         return ray_str(&s[i], 1);
     }
 
-    /* Typed vector index: keep the result typed when every row id is valid.
-     * The generic path below remains responsible for out-of-range/null row ids,
-     * because it preserves the scalar `at` rule of producing typed null atoms. */
-    if (ray_is_vec(vec) && idx->type == RAY_I64 && ray_is_vec(idx)) {
-        int64_t idxlen = ray_len(idx);
-        int64_t vlen = ray_len(vec);
-        int64_t* ids = (int64_t*)ray_data(idx);
-        bool idx_has_nulls = ray_vec_may_have_nulls(idx);
-        bool valid = true;
-        for (int64_t j = 0; j < idxlen; j++) {
-            if ((idx_has_nulls && ray_vec_is_null(idx, j)) ||
-                ids[j] < 0 || ids[j] >= vlen) {
-                valid = false;
-                break;
-            }
-        }
-        if (valid) return gather_by_idx(vec, ids, idxlen);
-    }
+    /* Typed vector indexed by an integer vector: the result has the
+     * source's type, whatever the index holds.  A null or out-of-range
+     * index gives the type's null there, as the scalar `at` gives a typed
+     * null atom; BOOL and U8 have no null and give false / 0x00.  Only a
+     * nested index (a LIST of index vectors) takes the generic path. */
+    if (ray_is_vec(vec) && ray_is_vec(idx) &&
+        (idx->type == RAY_I64 || idx->type == RAY_I32 ||
+         idx->type == RAY_I16 || idx->type == RAY_U8))
+        return at_gather_typed(vec, idx);
 
     /* Vector index: (at vec [i j k]) → vector of values */
     if (is_collection(idx) && idx->type != -RAY_SYM) {
