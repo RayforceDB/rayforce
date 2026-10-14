@@ -91,6 +91,16 @@ column of that name, in that order; one naming neither stays a constant
 symbol.  Arithmetic on a symbol — a literal or a symbol column — is a `type`
 error inside a select, as it is outside.
 
+To use a symbol that is also a column name as a constant, write it as
+`(quote name)` or pass it in through a variable.  `enlist` does not escape it:
+its argument resolves first, so `(enlist 'price)` enlists the `price` column.
+
+```lisp
+(set t (table [sym price] (list [AAPL GOOG price] [10 20 30])))
+(select {from: t x: (== sym 'price)})          ; x: [false false false], compares with the column
+(select {from: t x: (== sym (quote price))})   ; x: [false false true]
+```
+
 ### Whole-column projections
 
 A projection may be a whole-column verb — `distinct`, `asc`, `desc`, or
