@@ -320,17 +320,27 @@ static bool dom_retire(ray_sym_domain_t* d, void* p) {
     return true;
 }
 
-/* Drop a replaced reverse-index table: freed at once unless a batch intern
- * is probing a snapshot outside the lock, then retired with the domain. */
-static bool dom_drop_buckets_locked(ray_sym_domain_t* d, uint64_t* old) {
+/* Drop something a lock-free reader of this domain MAY hold: freed at once
+ * unless a batch intern is probing a snapshot outside the lock, then
+ * retired with the domain.  Correct only where no other reader can be
+ * holding it -- the reverse index (probed by batch interns alone) and the
+ * generation replaced by an external extend (see the concurrency note at
+ * the top of the file: a reopen runs between kernels, and a pin does not
+ * survive one).  The append paths keep dom_retire: their readers are the
+ * concurrent import workers. */
+static bool dom_drop_locked(ray_sym_domain_t* d, void* old) {
     if (!old) return true;
     if (d->batch_inflight == 0) { ray_sys_free(old); return true; }
     return dom_retire(d, old);
 }
+static bool dom_drop_buckets_locked(ray_sym_domain_t* d, uint64_t* old) {
+    return dom_drop_locked(d, old);
+}
 
-/* Publish (map, offsets, count) as the domain's raw snapshot; the previous
- * record is retired.  Called with the file's current image in place. */
-static bool dom_publish_raw_snap(ray_sym_domain_t* d) {
+/* Publish (map, offsets, count) as the domain's raw snapshot.  The previous
+ * record is dropped (external extend: no reader holds it) or retired.
+ * Called with the file's current image in place. */
+static bool dom_publish_raw_snap(ray_sym_domain_t* d, bool drop_old) {
     dom_raw_snap_t* snap = NULL;
     if (d->map && d->offsets && d->base_count > 0) {
         snap = (dom_raw_snap_t*)ray_sys_alloc(sizeof(*snap));
@@ -340,7 +350,7 @@ static bool dom_publish_raw_snap(ray_sym_domain_t* d) {
         snap->count = d->base_count;
     }
     dom_raw_snap_t* old = atomic_exchange_explicit(&d->raw_snap, snap, memory_order_acq_rel);
-    if (old) (void)dom_retire(d, old);
+    if (old) (void)(drop_old ? dom_drop_locked(d, old) : dom_retire(d, old));
     return true;
 }
 
@@ -507,26 +517,27 @@ static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
 
     if (ok && fresh_count > count) {
         /* Publish the grown vocabulary.  Build a NEW slot array (replace,
-         * never realloc — lock-free readers may hold the old one): carry the
-         * already-materialized prefix atoms (arena-owned, still valid; long
-         * atoms hold their own copy, so swapping the map is safe), new file
-         * slots start NULL (lazy). */
+         * never realloc, so a batch intern probing outside the lock keeps a
+         * valid one): carry the already-materialized prefix atoms
+         * (arena-owned, still valid; long atoms hold their own copy, so
+         * swapping the map is safe), new file slots start NULL (lazy). */
         ray_t** atoms = atomic_load_explicit(&d->atoms, memory_order_relaxed);
         ray_t** narr = (ray_t**)ray_sys_alloc((size_t)fresh_count * sizeof(ray_t*));
         if (!narr) {
-            ok = false;
-        } else if (!dom_retire(d, atoms)) {
-            ray_sys_free(narr);
             ok = false;
         } else {
             if (count > 0) memcpy(narr, atoms, (size_t)count * sizeof(ray_t*));
             for (int64_t i = count; i < fresh_count; i++) narr[i] = NULL;
             ray_sys_free(fresh);  /* fresh slot array unused — narr carries the prefix */
 
-            /* Swap in the new offsets + map.  Prefix atoms are arena
-             * copies, but a raw snapshot may still point at the old
-             * offsets and mapping: retire both instead of freeing. */
-            (void)dom_retire(d, d->offsets);
+            /* Swap in the new offsets + map, publish, then let go of the
+             * superseded generation.  Nothing holds it: a reopen runs on
+             * the calling thread between kernels, and a raw snapshot does
+             * not survive one (domain.h) -- unless a batch intern is
+             * probing outside the lock, in which case dom_drop_locked
+             * retires instead.  Retiring until the domain dies here was
+             * #717: a replica never lets its domain die. */
+            size_t* old_offsets = d->offsets;
             d->offsets = fresh_offsets;
             void* old_map = d->map;
             size_t old_map_size = d->map_size;
@@ -539,23 +550,28 @@ static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
             atomic_store_explicit(&d->count, fresh_count, memory_order_release);
             d->disk_count = fresh_count;
             d->disk_size = st_size;
+            (void)dom_publish_raw_snap(d, true);
 
+            (void)dom_drop_locked(d, atoms);
+            (void)dom_drop_locked(d, old_offsets);
             if (old_map) {
-                dom_retired_map_t* rm = (dom_retired_map_t*)ray_sys_alloc(sizeof(*rm));
-                if (rm) { rm->map = old_map; rm->size = old_map_size; rm->next = d->retired_maps; d->retired_maps = rm; }
-                /* no rm: the old mapping stays mapped for the process
-                 * lifetime — never unmapped under a live snapshot */
+                if (d->batch_inflight == 0) {
+                    ray_vm_unmap_file(old_map, old_map_size);
+                } else {
+                    dom_retired_map_t* rm = (dom_retired_map_t*)ray_sys_alloc(sizeof(*rm));
+                    if (rm) { rm->map = old_map; rm->size = old_map_size; rm->next = d->retired_maps; d->retired_maps = rm; }
+                    /* no rm: the old mapping stays mapped for the process
+                     * lifetime — never unmapped under a live snapshot */
+                }
             }
-            (void)dom_publish_raw_snap(d);
 
             /* Reverse index + LUT now cover a stale prefix: drop both.
-             * A retire-OOM here would keep the stale LUT published over
-             * the grown count (OOB reads for lock-free consumers) — the
-             * same corner dom_append_locked hits; mirror its loud abort
-             * (the count is already published, there is no clean undo). */
+             * A retire-OOM here (batch in flight) would keep the stale LUT
+             * published over the grown count (OOB reads for lock-free
+             * consumers) — the same corner dom_append_locked hits; mirror
+             * its loud abort (the count is already published, there is no
+             * clean undo). */
             if (d->buckets) {
-                /* A batch intern may be probing a snapshot of this
-                 * table outside the lock. */
                 if (!dom_drop_buckets_locked(d, d->buckets)) {
                     fprintf(stderr, "rayforce: sym domain '%s': OOM retiring "
                                     "reverse index after external extend\n",
@@ -566,14 +582,14 @@ static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
             }
             int64_t* lut = atomic_load_explicit(&d->runtime_lut, memory_order_relaxed);
             if (lut) {
-                if (!dom_retire(d, lut)) {
+                atomic_store_explicit(&d->runtime_lut, NULL, memory_order_release);
+                if (!dom_drop_locked(d, lut)) {
                     fprintf(stderr, "rayforce: sym domain '%s': OOM retiring "
                                     "runtime LUT after external extend — cannot "
                                     "keep id translation consistent\n",
                             d->path ? d->path : "?");
                     abort();
                 }
-                atomic_store_explicit(&d->runtime_lut, NULL, memory_order_release);
             }
             return true;
         }
@@ -652,7 +668,7 @@ static ray_sym_domain_t* dom_open_impl(const char* path, bool create) {
         d->offsets = offsets;
         d->atoms_cap = count;
         d->base_count = count;
-        (void)dom_publish_raw_snap(d);
+        (void)dom_publish_raw_snap(d, false);
         d->disk_count = count;
         d->disk_size = d->map_size;
         /* Position-0 reservation: every non-empty symfile must carry the
