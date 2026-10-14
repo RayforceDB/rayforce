@@ -26,9 +26,12 @@
 #include "mem/heap.h"
 #include "ops/idxop.h"
 #include "table/sym.h"
+#include "table/domain.h"
 #include "store/encidx.h"
 #include "ops/hash.h"
 #include "core/pool.h"
+#include "ops/rowsel.h"
+#include "store/enccol.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -713,9 +716,13 @@ static test_result_t test_reject_str_unreachable(void) {
  * past the collision; beta (whose own word is in no bucket here) and gamma
  * are absent.  The parsed root's half of this comparison, answering exactly
  * as the source root, lands with the parse (Task 4). */
-static test_result_t test_str_word_collision(void) {
+static ray_t* swc_col(void) {
     ray_t* v = ray_vec_new(RAY_STR, 3);
     v = ray_str_vec_append(v, "alpha", 5); v = ray_str_vec_append(v, "beta", 4); v = ray_str_vec_append(v, "alpha", 5);
+    return v;
+}
+static test_result_t test_str_word_collision(void) {
+    ray_t* v = swc_col();
     int64_t w = (int64_t)ray_hash_bytes("alpha", 5);
     int64_t gk[2] = { w, w }, of[3] = { 0, 1, 3 }, rw[3] = { 1, 0, 2 };   /* g0 = beta, g1 = alpha */
     int64_t t8[8] = { 0 };
@@ -727,18 +734,42 @@ static test_result_t test_str_word_collision(void) {
     ray_enc_idx_view_t iv;
     TEST_ASSERT_NULL(ray_enc_index_validate(b, n, RAY_IDX_HASH, RAY_STR, 0, 3, 0, NULL, "col x", &iv));
     TEST_ASSERT_EQ_I(iv.hash.n_groups, 2);
+    /* the parsed root: the source's fields and children, and nothing in
+     * it refers to the region (freed before the probes) */
+    ray_t* proot = NULL;
+    TEST_ASSERT_NULL(ray_enc_index_parse(&iv, v, &proot));
+    TEST_ASSERT_NOT_NULL(proot);
+    free(b);
+    { ray_index_t* sx = ray_index_payload(root); ray_index_t* px = ray_index_payload(proot);
+      TEST_ASSERT_EQ_I(px->kind, RAY_IDX_HASH);
+      TEST_ASSERT_EQ_U(px->u.hash.mask, 7);
+      TEST_ASSERT_EQ_I(px->u.hash.n_groups, 2);
+      TEST_ASSERT_EQ_I(px->u.hash.n_keys, 3);
+      TEST_ASSERT_EQ_I(px->u.hash.order_sym, -1);
+      TEST_ASSERT_TRUE(memcmp(ray_data(px->u.hash.table), ray_data(sx->u.hash.table), 64) == 0);
+      TEST_ASSERT_TRUE(memcmp(ray_data(px->u.hash.gkeys), gk, 16) == 0);
+      TEST_ASSERT_TRUE(memcmp(ray_data(px->u.hash.offs), of, 24) == 0);
+      TEST_ASSERT_TRUE(memcmp(ray_data(px->u.hash.rows), rw, 24) == 0); }
     ray_t* src = v; ray_retain(src);
     ray_t* a = ray_index_attach_persisted(&src, root);                 /* consumes root */
     TEST_ASSERT_TRUE(a && !RAY_IS_ERR(a)); src = a;
+    ray_t* pv = swc_col();
+    ray_t* pa = ray_index_attach_persisted(&pv, proot);                /* consumes proot */
+    TEST_ASSERT_TRUE(pa && !RAY_IS_ERR(pa)); pv = pa;
+    /* Both roots give alpha past the collision at row 0.  beta is absent
+     * from both: the fabricated root gives beta alpha's word, so no bucket
+     * holds beta's own word and its probe ends at an empty bucket. */
     static const char* const probes[3] = { "alpha", "beta", "gamma" };
-    static const int64_t want[3] = { 0, -1, -1 };   /* beta carries alpha's word here */
+    static const int64_t want[3] = { 0, -1, -1 };
     for (int i = 0; i < 3; i++) {
         ray_t* atom = ray_str(probes[i], strlen(probes[i]));
         int64_t r0 = ray_index_find_atom(src, atom);
-        TEST_ASSERT_FMT(r0 == want[i], "probe %s: %lld, want %lld", probes[i], (long long)r0, (long long)want[i]);
+        int64_t r1 = ray_index_find_atom(pv, atom);
+        TEST_ASSERT_FMT(r0 == want[i], "source probe %s: %lld, want %lld", probes[i], (long long)r0, (long long)want[i]);
+        TEST_ASSERT_FMT(r1 == r0, "parsed probe %s: %lld, source %lld", probes[i], (long long)r1, (long long)r0);
         ray_release(atom);
     }
-    free(b); ray_release(src); ray_release(v);
+    ray_release(pv); ray_release(src); ray_release(v);
     PASS();
 }
 
@@ -938,6 +969,43 @@ static test_result_t test_reject_part_zero_sign(void) {
     PASS();
 }
 
+/* Signaling NaNs are NaN too: a quiet-only check would accept a positive
+ * sNaN as the largest key and a negative sNaN as the smallest. */
+static test_result_t test_reject_part_snan(void) {
+    double d[3] = { -1.0, 1.0, 2.0 };
+    ray_t* p = with_index(ray_vec_from_raw(RAY_F64, d, 3), ray_index_attach_part);
+    TEST_ASSERT_NOT_NULL(p);
+    size_t n; ray_t* err; uint8_t* b = ix_region(p, NULL, 0, &n, &err);
+    TEST_ASSERT_NOT_NULL(b);
+    ray_enc_idx_view_t iv;
+    TEST_ASSERT_NULL(ix_validate(b, n, p, 0, &iv));
+    ray_enc_idx_part_t pp; memcpy(&pp, b + 16, 40);
+    uint8_t* m = malloc(n);
+    static const uint64_t s64[2] = { 0x7FF0000000000001ull, 0x7FF4000000000000ull };   /* quiet bit clear */
+    for (int i = 0; i < 2; i++) {
+        uint64_t neg = s64[i] | 0x8000000000000000ull;
+        memcpy(m, b, n); memcpy(m + pp.keys + 16, &s64[i], 8); IX_CORRUPT(m, n, p, 0, "NaN");   /* last */
+        memcpy(m, b, n); memcpy(m + pp.keys, &neg, 8);         IX_CORRUPT(m, n, p, 0, "NaN");   /* first */
+    }
+    free(m); free(b); ray_release(p);
+    float f[3] = { -1.0f, 1.0f, 2.0f };
+    ray_t* q = with_index(ray_vec_from_raw(RAY_F32, f, 3), ray_index_attach_part);
+    TEST_ASSERT_NOT_NULL(q);
+    b = ix_region(q, NULL, 0, &n, &err);
+    TEST_ASSERT_NOT_NULL(b);
+    TEST_ASSERT_NULL(ix_validate(b, n, q, 0, &iv));
+    memcpy(&pp, b + 16, 40);
+    m = malloc(n);
+    static const uint32_t s32[2] = { 0x7F800001u, 0x7FA00000u };
+    for (int i = 0; i < 2; i++) {
+        uint32_t neg = s32[i] | 0x80000000u;
+        memcpy(m, b, n); memcpy(m + pp.keys + 8, &s32[i], 4); IX_CORRUPT(m, n, q, 0, "NaN");
+        memcpy(m, b, n); memcpy(m + pp.keys, &neg, 4);        IX_CORRUPT(m, n, q, 0, "NaN");
+    }
+    free(m); free(b); ray_release(q);
+    PASS();
+}
+
 /* Review carry (Task 2): every byte outside the root fields, the children
  * and the name bytes is zero in the writer's output (root reserved, kind
  * tail, inter-child padding, the name block's reserved u32, BLOOM rsv, the
@@ -994,6 +1062,63 @@ static test_result_t test_write_zero_fill(void) {
     return r;
 }
 
+/* ===== Parse ===== */
+
+static bool same_child(const ray_t* a, const ray_t* b, size_t esz) {
+    return a && b && a->type == b->type && a->len == b->len &&
+           memcmp(ray_data((ray_t*)a), ray_data((ray_t*)b), (size_t)a->len * esz) == 0;
+}
+
+/* Parse the validated view of v's index and compare the heap root with
+ * the source root field by field; name: the order_name written. */
+static test_result_t ix_parse_same(ray_t* v, const ray_enc_idx_view_t* iv, const char* name, const char* what) {
+    ray_t* root = NULL;
+    ray_t* e = ray_enc_index_parse(iv, v, &root);
+    TEST_ASSERT_FMT(e == NULL && root != NULL, "%s: parse failed", what);
+    const ray_index_t* a = ray_index_payload(v->index);
+    const ray_index_t* p = ray_index_payload(root);
+    TEST_ASSERT_FMT(p->kind == a->kind && p->parent_type == a->parent_type && p->built_for_len == a->built_for_len,
+                    "%s: root header", what);
+    TEST_ASSERT_FMT(!(p->markers & RAY_MARK_MMAP), "%s: parsed root marked mapped", what);
+    int64_t want_sym = name ? ray_sym_intern(name, strlen(name)) : -1;
+    bool ok = false;
+    switch (a->kind) {
+    case RAY_IDX_HASH:
+        ok = p->u.hash.mask == a->u.hash.mask && p->u.hash.n_keys == a->u.hash.n_keys &&
+             p->u.hash.n_groups == a->u.hash.n_groups && p->u.hash.order_sym == want_sym &&
+             same_child(p->u.hash.table, a->u.hash.table, 8) && same_child(p->u.hash.gkeys, a->u.hash.gkeys, 8) &&
+             same_child(p->u.hash.offs, a->u.hash.offs, 8) && same_child(p->u.hash.rows, a->u.hash.rows, 8);
+        break;
+    case RAY_IDX_SORT:
+        ok = same_child(p->u.sort.perm, a->u.sort.perm, 8);
+        break;
+    case RAY_IDX_BLOOM:
+        ok = p->u.bloom.m_mask == a->u.bloom.m_mask && p->u.bloom.k == a->u.bloom.k &&
+             p->u.bloom.n_keys == a->u.bloom.n_keys && same_child(p->u.bloom.bits, a->u.bloom.bits, 1);
+        break;
+    default: {
+        const ray_t* pk = p->u.part.keys; const ray_t* ak = a->u.part.keys;
+        ok = p->u.part.n_parts == a->u.part.n_parts && p->u.part.order_sym == want_sym &&
+             same_child(p->u.part.starts, a->u.part.starts, 8) && same_child(p->u.part.lens, a->u.part.lens, 8) &&
+             pk && pk->type == ak->type && pk->len == ak->len;
+        if (ok && v->type == RAY_SYM) {
+            ok = ray_sym_vec_domain((ray_t*)pk) == ray_sym_vec_domain(v) &&
+                 ray_sym_elem_size(RAY_SYM, pk->attrs) == ray_sym_elem_size(RAY_SYM, v->attrs);
+            for (int64_t i = 0; ok && i < pk->len; i++)
+                ok = ray_read_sym(ray_data((ray_t*)pk), i, RAY_SYM, pk->attrs) ==
+                     ray_read_sym(ray_data((ray_t*)ak), i, RAY_SYM, ak->attrs);
+        } else if (ok) {
+            ok = memcmp(ray_data((ray_t*)pk), ray_data((ray_t*)ak), (size_t)pk->len * ray_sym_elem_size(pk->type, pk->attrs)) == 0;
+        }
+        break;
+    }
+    }
+    ray_release(root);
+    TEST_ASSERT_FMT(ok, "%s: parsed root differs from the source", what);
+    PASS();
+}
+#define PARSE_SAME(v, iv, name, ...) do { char w_[96]; snprintf(w_, sizeof w_, __VA_ARGS__); \
+    test_result_t r_ = ix_parse_same((v), (iv), (name), w_); if (r_.status != TEST_PASS) return r_; } while (0)
 
 /* A column of type t over n rows for the engine matrix: ascending
  * value-blocks when `sorted` (PART), else mixed values with nulls, both
@@ -1053,6 +1178,7 @@ static test_result_t test_validate_engine_matrix(void) {
                 TEST_ASSERT_FMT(b != NULL, "type %d len %lld kind %d: not written", types[ti], (long long)lens[li], k);
                 ray_t* e = ix_validate(b, n, v, 0, &iv);
                 TEST_ASSERT_FMT(e == NULL, "type %d len %lld kind %d: %s", types[ti], (long long)lens[li], k, ray_error_msg());
+                PARSE_SAME(v, &iv, k == 3 || k == 0 ? "ts" : NULL, "type %d len %lld kind %d", types[ti], (long long)lens[li], k);
                 free(b); ray_release(v); built++;
             }
     static const uint8_t ws[3] = { RAY_SYM_W8, RAY_SYM_W16, RAY_SYM_W32 };
@@ -1074,6 +1200,7 @@ static test_result_t test_validate_engine_matrix(void) {
                 TEST_ASSERT_NOT_NULL(b);
                 ray_t* e = ix_validate(b, rn, v, (uint32_t)(base[w] + 20), &iv);
                 TEST_ASSERT_FMT(e == NULL, "SYM width %d len %lld kind %d: %s", w, (long long)n, k, ray_error_msg());
+                PARSE_SAME(v, &iv, "ts", "SYM width %d len %lld kind %d", w, (long long)n, k);
                 free(b); ray_release(v); built++;
             }
     for (int li = 0; li < 5; li++) {
@@ -1086,6 +1213,49 @@ static test_result_t test_validate_engine_matrix(void) {
         TEST_ASSERT_NOT_NULL(b);
         ray_t* e = ix_validate(b, n, v, 0, &iv);
         TEST_ASSERT_FMT(e == NULL, "STR len %lld: %s", (long long)lens[li], ray_error_msg());
+        PARSE_SAME(v, &iv, NULL, "STR len %lld", (long long)lens[li]);
+        free(b); ray_release(v); built++;
+    }
+    /* A HASH carried through concat (ray_index_carry_append) over several
+     * appends of new keys, its bucket table regrown past 8: written, then
+     * validated and parsed like a built one. */
+    for (int t = 0; t < 3; t++) {
+        ray_t* v = NULL;
+        int64_t rows = 0;
+        for (int step = 0; step < 5; step++) {
+            int64_t m = step ? 3 + step : 6;         /* rows: 6, then 4, 5, 6, 7 new keys */
+            ray_t* nv;
+            if (t == 2) {
+                nv = ray_vec_new(RAY_STR, rows + m);
+                for (int64_t i = 0; i < rows + m; i++) {
+                    char sb[16]; int sl = snprintf(sb, sizeof sb, "k%lld", (long long)(i < 6 ? i % 3 : i));
+                    nv = ray_str_vec_append(nv, sb, (size_t)sl);
+                }
+            } else {
+                nv = t == 0 ? ray_vec_new(RAY_I64, rows + m) : ray_sym_vec_new(RAY_SYM_W16, rows + m);
+                nv->len = rows + m;
+                for (int64_t i = 0; i < rows + m; i++) {
+                    int64_t k = i < 6 ? i % 3 : i;           /* the first 6 rows repeat; appends are new */
+                    if (t == 0) ((int64_t*)ray_data(nv))[i] = k * 1000 - 7;
+                    else ray_write_sym(ray_data(nv), i, (uint64_t)(k + 1), RAY_SYM, RAY_SYM_W16);
+                }
+            }
+            if (!step) {
+                v = with_index(nv, ray_index_attach_hash);
+            } else {
+                ray_index_carry_append(v, nv);
+                ray_release(v);
+                v = nv;
+            }
+            TEST_ASSERT_FMT(v && ray_index_kind(v) == RAY_IDX_HASH, "carried HASH type %d step %d: no index", t, step);
+            rows += m;
+        }
+        TEST_ASSERT_TRUE(ray_index_payload(v->index)->u.hash.mask + 1 >= 32);
+        size_t n; ray_t* err; uint8_t* b = ix_region(v, t == 2 ? NULL : "ts", 2, &n, &err);
+        TEST_ASSERT_FMT(b != NULL, "carried HASH type %d: not written", t);
+        ray_t* e = ix_validate(b, n, v, 64, &iv);
+        TEST_ASSERT_FMT(e == NULL, "carried HASH type %d: %s", t, ray_error_msg());
+        PARSE_SAME(v, &iv, t == 2 ? NULL : "ts", "carried HASH type %d", t);
         free(b); ray_release(v); built++;
     }
     TEST_ASSERT_FMT(built >= 150, "only %d indexes built", built);
@@ -1159,6 +1329,218 @@ static test_result_t test_validate_long_cluster(void) {
     PASS();
 }
 
+/* ===== Parse round trips ===== */
+
+/* Region of v's index -> validate -> parse -> attach to a fresh copy of v. */
+static ray_t* ix_roundtrip(ray_t* v, const char* name, uint32_t nlen, uint32_t bound) {
+    size_t n; ray_t* err; uint8_t* b = ix_region(v, name, nlen, &n, &err);
+    if (!b) { if (err) ray_error_free(err); return NULL; }
+    ray_enc_idx_view_t iv;
+    ray_t* fresh = ray_vec_new(v->type, v->len);
+    if (v->type == RAY_SYM) { ray_release(fresh); fresh = ray_sym_vec_new(v->attrs & RAY_SYM_W_MASK, v->len); ray_sym_vec_adopt_domain(fresh, v); }
+    fresh->len = v->len;
+    memcpy(ray_data(fresh), ray_data(v), (size_t)v->len * ray_sym_elem_size(v->type, v->attrs));
+    ray_t* ve = ix_validate(b, n, v, bound, &iv);
+    if (ve) { ray_error_free(ve); free(b); ray_release(fresh); return NULL; }
+    ray_t* root = NULL;
+    ray_t* pe = ray_enc_index_parse(&iv, fresh, &root);
+    free(b);
+    if (pe) { ray_error_free(pe); ray_release(fresh); return NULL; }
+    ray_t* r = ray_index_attach_persisted(&fresh, root);
+    if (!r || RAY_IS_ERR(r)) { if (r) ray_error_free(r); ray_release(fresh); return NULL; }
+    return r;
+}
+
+static test_result_t test_parse_hash_probes(void) {
+    int64_t d[5000];
+    for (int i = 0; i < 5000; i++) d[i] = (i * 7919) % 1499;
+    ray_t* v = with_index(i64_vec(d, 5000), ray_index_attach_hash);
+    ray_t* p = ix_roundtrip(v, NULL, 0, 0);
+    TEST_ASSERT_NOT_NULL(p);
+    ray_index_t* a = ray_index_payload(v->index);
+    ray_index_t* b = ray_index_payload(p->index);
+    TEST_ASSERT_EQ_I(b->kind, RAY_IDX_HASH);
+    TEST_ASSERT_EQ_U(b->u.hash.mask, a->u.hash.mask);
+    TEST_ASSERT_EQ_I(b->u.hash.n_groups, a->u.hash.n_groups);
+    TEST_ASSERT_EQ_I(b->u.hash.order_sym, -1);
+    TEST_ASSERT_FALSE(b->markers & RAY_MARK_MMAP);
+    for (int64_t key = 0; key < 1499; key += 37) {
+        ray_t* sa = ray_index_hash_eq_rowsel(v, key);
+        ray_t* sb = ray_index_hash_eq_rowsel(p, key);
+        TEST_ASSERT_TRUE(sa && sb);
+        TEST_ASSERT_EQ_I(ray_rowsel_meta(sb)->total_pass, ray_rowsel_meta(sa)->total_pass);
+        ray_rowsel_release(sa); ray_rowsel_release(sb);
+    }
+    ray_release(p); ray_release(v);
+    PASS();
+}
+
+/* PART with an order name: the name interns to the same id; SYM keys keep
+ * the column's domain. */
+static test_result_t test_parse_part_order_sym(void) {
+    int64_t d[8] = { 1, 1, 1, 4, 4, 9, 9, 9 };
+    ray_t* v = with_index(i64_vec(d, 8), ray_index_attach_part);
+    ray_t* p = ix_roundtrip(v, "ordcol_p4", 9, 0);
+    TEST_ASSERT_NOT_NULL(p);
+    TEST_ASSERT_EQ_I(ray_index_payload(p->index)->u.part.order_sym, ray_sym_intern("ordcol_p4", 9));
+    ray_release(p); ray_release(v);
+    for (int i = 0; i < 20; i++) { char b[8]; int n = snprintf(b, sizeof b, "q%d", i); (void)ray_sym_intern(b, (size_t)n); }
+    ray_t* s = ray_sym_vec_new(RAY_SYM_W8, 6);
+    s->len = 6;
+    uint8_t ids[6] = { 3, 3, 7, 7, 7, 5 };
+    memcpy(ray_data(s), ids, 6);
+    ray_t* sp = with_index(s, ray_index_attach_part);
+    TEST_ASSERT_NOT_NULL(sp);
+    ray_t* q = ix_roundtrip(sp, NULL, 0, 21);
+    TEST_ASSERT_NOT_NULL(q);
+    ray_t* keys = ray_index_payload(q->index)->u.part.keys;
+    TEST_ASSERT_EQ_I(keys->type, RAY_SYM);
+    TEST_ASSERT_EQ_I(keys->len, 3);
+    TEST_ASSERT_EQ_I(ray_read_sym(ray_data(keys), 1, RAY_SYM, keys->attrs), 7);
+    TEST_ASSERT_TRUE(ray_sym_vec_domain(keys) == ray_sym_vec_domain(q));
+    ray_release(q); ray_release(sp);
+    /* a column over a private domain: the keys resolve over that domain */
+    ray_sym_domain_t* dom = ray_sym_domain_new();
+    TEST_ASSERT_NOT_NULL(dom);
+    static const char* const words[4] = { "pd_zero", "pd_one", "pd_two", "pd_three" };
+    int64_t pos[4];
+    for (int i = 0; i < 4; i++) pos[i] = ray_sym_domain_intern(dom, words[i], strlen(words[i]));
+    ray_t* f = ray_sym_vec_new(RAY_SYM_W8, 5);
+    f->len = 5;
+    uint8_t fid[5] = { (uint8_t)pos[2], (uint8_t)pos[2], (uint8_t)pos[1], (uint8_t)pos[3], (uint8_t)pos[3] };
+    memcpy(ray_data(f), fid, 5);
+    f->sym_domain = dom;                                        /* the vector holds the reference */
+    ray_t* fp = with_index(f, ray_index_attach_part);
+    TEST_ASSERT_NOT_NULL(fp);
+    ray_t* fq = ix_roundtrip(fp, NULL, 0, (uint32_t)ray_sym_domain_count(dom));
+    TEST_ASSERT_NOT_NULL(fq);
+    keys = ray_index_payload(fq->index)->u.part.keys;
+    TEST_ASSERT_TRUE(ray_sym_vec_domain(keys) == dom);
+    TEST_ASSERT_TRUE(ray_sym_vec_domain(keys) != ray_sym_runtime_domain());
+    TEST_ASSERT_EQ_I(keys->len, 3);
+    ray_t* w1 = ray_sym_domain_str(ray_sym_vec_domain(keys), ray_read_sym(ray_data(keys), 1, RAY_SYM, keys->attrs));
+    TEST_ASSERT_TRUE(w1 && ray_str_len(w1) == 6 && memcmp(ray_str_ptr(w1), "pd_one", 6) == 0);
+    ray_release(fq); ray_release(fp);
+    PASS();
+}
+
+/* Every allocation of the parse failing in turn: oom, no root, and
+ * nothing left allocated (the error path releases what it set). */
+static test_result_t ix_parse_oom(ray_t* v, const char* name, uint32_t bound) {
+    size_t n; ray_t* err; uint8_t* b = ix_region(v, name, name ? (uint32_t)strlen(name) : 0, &n, &err);
+    TEST_ASSERT_NOT_NULL(b);
+    ray_enc_idx_view_t iv;
+    TEST_ASSERT_NULL(ix_validate(b, n, v, bound, &iv));
+    if (name) (void)ray_sym_intern(name, strlen(name));        /* interned before the baseline */
+    int fails = 0;
+    for (int64_t nth = 1; ; nth++) {
+        ray_mem_stats_t m0, m1; ray_mem_stats(&m0);
+        ray_enccol_test_fail_alloc(nth);
+        ray_t* root = (ray_t*)1;
+        ray_t* e = ray_enc_index_parse(&iv, v, &root);
+        ray_enccol_test_fail_alloc(0);
+        if (!e) {
+            TEST_ASSERT_NOT_NULL(root);
+            ray_release(root);
+            ray_mem_stats(&m1);
+            TEST_ASSERT_EQ_U(m1.bytes_allocated, m0.bytes_allocated);
+            break;
+        }
+        TEST_ASSERT_STR_EQ(ray_err_code(e), "oom");
+        TEST_ASSERT_NULL(root);
+        ray_error_free(e);
+        ray_mem_stats(&m1);
+        TEST_ASSERT_FMT(m1.bytes_allocated == m0.bytes_allocated, "allocation %lld failing leaks %lld bytes",
+                        (long long)nth, (long long)(m1.bytes_allocated - m0.bytes_allocated));
+        fails++;
+        TEST_ASSERT_TRUE(nth < 16);
+    }
+    TEST_ASSERT_TRUE(fails >= 2);                    /* the root and at least one child */
+    free(b);
+    PASS();
+}
+#define PARSE_OOM(v, name, bound) do { test_result_t r_ = ix_parse_oom((v), (name), (bound)); \
+    if (r_.status != TEST_PASS) return r_; } while (0)
+
+static test_result_t test_parse_oom_frees(void) {
+    int64_t d[40];
+    for (int i = 0; i < 40; i++) d[i] = (i * 7) % 11;
+    ray_t* (*kinds[3])(ray_t**) = { ray_index_attach_hash, ray_index_attach_sort, ray_index_attach_bloom };
+    for (int k = 0; k < 3; k++) {
+        ray_t* v = with_index(i64_vec(d, 40), kinds[k]);
+        TEST_ASSERT_NOT_NULL(v);
+        PARSE_OOM(v, k == 0 ? "ts" : NULL, 0);
+        ray_release(v);
+    }
+    int64_t pd[6] = { 1, 1, 3, 3, 3, 8 };
+    ray_t* p = with_index(i64_vec(pd, 6), ray_index_attach_part);
+    TEST_ASSERT_NOT_NULL(p);
+    PARSE_OOM(p, "ts", 0);
+    ray_release(p);
+    ray_t* s = ray_sym_vec_new(RAY_SYM_W16, 5);
+    s->len = 5;
+    uint16_t ids[5] = { 4, 4, 9, 2, 2 };
+    memcpy(ray_data(s), ids, sizeof ids);
+    ray_t* sp = with_index(s, ray_index_attach_part);
+    TEST_ASSERT_NOT_NULL(sp);
+    PARSE_OOM(sp, "ts", 64);
+    ray_release(sp);
+    PASS();
+}
+
+/* A view the region does not hold is refused before any allocation, and
+ * a SYM PART needs the decoded SYM column for its domain. */
+static test_result_t test_parse_rejects_view(void) {
+    int64_t d[6] = { 5, 7, 5, 9, 7, 5 };
+    ray_t* v = with_index(i64_vec(d, 6), ray_index_attach_hash);
+    TEST_ASSERT_NOT_NULL(v);
+    size_t n; ray_t* err; uint8_t* b = ix_region(v, "ts", 2, &n, &err);
+    TEST_ASSERT_NOT_NULL(b);
+    ray_enc_idx_view_t iv, w;
+    TEST_ASSERT_NULL(ix_validate(b, n, v, 0, &iv));
+    ray_mem_stats_t m0, m1; ray_mem_stats(&m0);
+    #define VIEW_REFUSED(code, mut) do { w = iv; mut; ray_t* r_ = (ray_t*)1; ray_t* e_ = ray_enc_index_parse(&w, v, &r_); \
+        TEST_ASSERT_TRUE(e_ != NULL); TEST_ASSERT_STR_EQ(ray_err_code(e_), code); TEST_ASSERT_NULL(r_); \
+        ray_error_free(e_); } while (0)
+    VIEW_REFUSED("corrupt", w.hash.rows = (int64_t)n);
+    VIEW_REFUSED("corrupt", w.hash.rows = 64);                              /* inside the root */
+    VIEW_REFUSED("corrupt", w.hash.n_keys = (int64_t)n);
+    VIEW_REFUSED("corrupt", w.hash.n_keys = -1);
+    VIEW_REFUSED("corrupt", w.hash.n_groups = INT64_MAX);
+    VIEW_REFUSED("corrupt", w.hash.mask = UINT64_MAX);
+    VIEW_REFUSED("corrupt", w.hash.mask = ((uint64_t)1 << 40) - 1);
+    VIEW_REFUSED("corrupt", w.size = 64);
+    VIEW_REFUSED("corrupt", w.base = NULL);
+    VIEW_REFUSED("corrupt", w.order_len = (uint32_t)n);
+    VIEW_REFUSED("corrupt", w.order_name = (const char*)b + n);
+    VIEW_REFUSED("corrupt", w.kind = RAY_IDX_ZONE);
+    VIEW_REFUSED("corrupt", (w.kind = RAY_IDX_SORT, w.len = (int64_t)n));
+    VIEW_REFUSED("corrupt", (w.kind = RAY_IDX_BLOOM, w.bloom.bits = 96, w.bloom.m_mask = UINT64_MAX));
+    ray_mem_stats(&m1);
+    TEST_ASSERT_EQ_U(m1.bytes_allocated, m0.bytes_allocated);
+    free(b); ray_release(v);
+    ray_t* s = ray_sym_vec_new(RAY_SYM_W8, 4);
+    s->len = 4;
+    uint8_t ids[4] = { 3, 3, 6, 6 };
+    memcpy(ray_data(s), ids, 4);
+    ray_t* sp = with_index(s, ray_index_attach_part);
+    TEST_ASSERT_NOT_NULL(sp);
+    b = ix_region(sp, NULL, 0, &n, &err);
+    TEST_ASSERT_NOT_NULL(b);
+    TEST_ASSERT_NULL(ix_validate(b, n, sp, 64, &iv));
+    ray_t* r = (ray_t*)1;
+    ray_t* e = ray_enc_index_parse(&iv, NULL, &r);
+    TEST_ASSERT_TRUE(e && strcmp(ray_err_code(e), "type") == 0 && r == NULL);
+    ray_error_free(e);
+    ray_t* i64v = i64_vec(d, 4);
+    e = ray_enc_index_parse(&iv, i64v, &r);
+    TEST_ASSERT_TRUE(e && strcmp(ray_err_code(e), "type") == 0 && r == NULL);
+    ray_error_free(e); ray_release(i64v);
+    #undef VIEW_REFUSED
+    free(b); ray_release(sp);
+    PASS();
+}
+
 const test_entry_t encidx_entries[] = {
     { "idxval/write_hash_layout", test_write_hash_layout, ix_setup, ix_teardown },
     { "idxval/write_name_block",  test_write_name_block,  ix_setup, ix_teardown },
@@ -1181,5 +1563,10 @@ const test_entry_t encidx_entries[] = {
     { "idxval/validate_empty",          test_validate_empty,          ix_setup, ix_teardown },
     { "idxval/validate_engine_matrix",  test_validate_engine_matrix,  ix_setup, ix_teardown },
     { "idxval/validate_long_cluster",   test_validate_long_cluster,   ix_setup, ix_teardown },
+    { "idxval/reject_part_snan",        test_reject_part_snan,        ix_setup, ix_teardown },
+    { "idxval/parse_hash_probes",       test_parse_hash_probes,       ix_setup, ix_teardown },
+    { "idxval/parse_part_order_sym",    test_parse_part_order_sym,    ix_setup, ix_teardown },
+    { "idxval/parse_oom_frees",         test_parse_oom_frees,         ix_setup, ix_teardown },
+    { "idxval/parse_rejects_view",      test_parse_rejects_view,      ix_setup, ix_teardown },
     { NULL, NULL, NULL, NULL },
 };

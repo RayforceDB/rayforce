@@ -139,6 +139,9 @@ static test_result_t test_materializer_attach(void) {
     const char* root = stat("src/table/table.c", &st) == 0 ? "." : "..";
     char path[128]; snprintf(path, sizeof path, "%s/src/store/enccol.c", root);
     TEST_ASSERT_EQ_I(first_hit(path, needles), 0);
+    snprintf(path, sizeof path, "%s/src/store/encidx.c", root);    /* the index-region parse */
+    TEST_ASSERT_TRUE(stat(path, &st) == 0);
+    TEST_ASSERT_EQ_I(first_hit(path, needles), 0);
     PASS();
 }
 
@@ -365,16 +368,118 @@ static test_result_t test_no_p3_markers(void) {
     PASS();
 }
 
-/* The index-region validator and writer decide float rules on bits:
+/* `text` with comments and string / character literals blanked to spaces
+ * (newlines kept, so line numbers hold).  Caller frees. */
+static char* code_only(const char* text) {
+    size_t n = strlen(text);
+    char* o = malloc(n + 1);
+    if (!o) return NULL;
+    memcpy(o, text, n + 1);
+    for (size_t i = 0; i < n; ) {
+        if (text[i] == '/' && text[i + 1] == '*') {
+            size_t j = i + 2;
+            while (j < n && !(text[j] == '*' && text[j + 1] == '/')) j++;
+            j = j < n ? j + 2 : n;
+            for (size_t k = i; k < j; k++) if (o[k] != '\n') o[k] = ' ';
+            i = j;
+        } else if (text[i] == '/' && text[i + 1] == '/') {
+            while (i < n && text[i] != '\n') o[i++] = ' ';
+        } else if (text[i] == '"' || text[i] == '\'') {
+            char q = text[i];
+            size_t j = i + 1;
+            while (j < n && text[j] != q && text[j] != '\n') j += text[j] == '\\' && j + 1 < n ? 2 : 1;
+            j = j < n && text[j] == q ? j + 1 : j;
+            for (size_t k = i; k < j; k++) if (o[k] != '\n') o[k] = ' ';
+            i = j;
+        } else {
+            i++;
+        }
+    }
+    return o;
+}
+
+static bool src_ident_char(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+}
+
+/* Line of the first floating construct in the code of `text` (comments and
+ * literals skipped), 0 if none: an identifier token naming a floating type
+ * or classifier, or a floating literal (a decimal number with '.' or an
+ * exponent, a hex number with '.' or a 'p' exponent). */
+static int float_code_hit(const char* text) {
+    static const char* const idents[] = { "signbit", "double", "float", "isnan", "isinf", "isfinite",
+                                          "fpclassify", NULL };
+    char* c = code_only(text);
+    if (!c) return -1;
+    int line = 1, hit = 0;
+    for (size_t i = 0; c[i] && !hit; ) {
+        if (c[i] == '\n') { line++; i++; continue; }
+        bool num = (c[i] >= '0' && c[i] <= '9') || (c[i] == '.' && c[i + 1] >= '0' && c[i + 1] <= '9');
+        if (src_ident_char(c[i]) && !num) {
+            size_t j = i;
+            while (src_ident_char(c[j])) j++;
+            for (int k = 0; idents[k]; k++)
+                if (strlen(idents[k]) == j - i && strncmp(c + i, idents[k], j - i) == 0) hit = line;
+            i = j;
+        } else if (num) {
+            bool hex = c[i] == '0' && (c[i + 1] == 'x' || c[i + 1] == 'X');
+            bool fl = false;
+            size_t j = i;
+            while (src_ident_char(c[j]) || c[j] == '.') {
+                char ch = c[j];
+                if (ch == '.') fl = true;
+                if (hex ? (ch == 'p' || ch == 'P') : (j > i && (ch == 'e' || ch == 'E'))) {
+                    fl = true;
+                    if (c[j + 1] == '+' || c[j + 1] == '-') j++;
+                }
+                j++;
+            }
+            if (fl) hit = line;
+            i = j;
+        } else {
+            i++;
+        }
+    }
+    free(c);
+    return hit;
+}
+
+static char* src_slurp(const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    char* t = n >= 0 ? malloc((size_t)n + 1) : NULL;
+    if (t) { size_t r = fread(t, 1, (size_t)n, f); t[r] = 0; }
+    fclose(f);
+    return t;
+}
+
+/* The index-region validator, writer and parse decide float rules on bits:
  * release builds use -fno-signed-zeros, under which a zero's sign test
- * or a compare against zero may fold away (P4 Task 3 review). */
+ * or a compare against zero may fold away (P4 Task 3 review).  The check
+ * reads code only: a comment or message may say "10.0" or "doubles". */
 static test_result_t test_encidx_float_bits(void) {
+    /* the matcher itself */
+    TEST_ASSERT_EQ_I(float_code_hit("/* 10.0 doubles, signbit( */ int x;"), 0);
+    TEST_ASSERT_EQ_I(float_code_hit("int a; // 0.0 double isnan\nint b;"), 0);
+    TEST_ASSERT_EQ_I(float_code_hit("f(\"0.0 double float\", 'x', '\\'');"), 0);
+    TEST_ASSERT_EQ_I(float_code_hit("int doubles = 10, my_double = 0x1Eu, d2 = 07;"), 0);
+    TEST_ASSERT_EQ_I(float_code_hit("if (signbit(x)) return;"), 1);
+    TEST_ASSERT_EQ_I(float_code_hit("int a;\n  double y;"), 2);
+    TEST_ASSERT_EQ_I(float_code_hit("/* x */\n/* y */ b = a < 0.0;"), 2);
+    TEST_ASSERT_EQ_I(float_code_hit("b = a < 10.0;"), 1);
+    TEST_ASSERT_EQ_I(float_code_hit("x = 1e3;"), 1);
+    TEST_ASSERT_EQ_I(float_code_hit("x = .5f;"), 1);
+    TEST_ASSERT_EQ_I(float_code_hit("x = 0x1p3;"), 1);
+    TEST_ASSERT_EQ_I(float_code_hit("char q = '\"'; float z;"), 1);
+    TEST_ASSERT_EQ_I(float_code_hit("s = \"a\\\"b\"; isnan(z);"), 1);
     struct stat st;
     const char* root = stat("src/store/encidx.c", &st) == 0 ? "." : "..";
     char p[128]; snprintf(p, sizeof p, "%s/src/store/encidx.c", root);
-    static const char* const needles[] = { "signbit", "double", "isnan", "fpclassify", "0.0", NULL };
-    TEST_ASSERT_TRUE(stat(p, &st) == 0);
-    int ln = first_hit(p, needles);
+    char* text = src_slurp(p);
+    TEST_ASSERT_NOT_NULL(text);
+    int ln = float_code_hit(text);
+    free(text);
     TEST_ASSERT_FMT(ln == 0, "src/store/encidx.c:%d compares floating values", ln);
     PASS();
 }

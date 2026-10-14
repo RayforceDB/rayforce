@@ -22,6 +22,7 @@
  */
 #include "store/encidx.h"
 #include "store/encfmt.h"
+#include "store/enccol.h"     /* ray_enccol_test_nth_alloc_fails: the materialization fail hook */
 #include "ops/idxop.h"
 #include "table/sym.h"
 #include "lang/format.h"
@@ -648,4 +649,127 @@ out:
     ray_free_raw(bm);
     ray_free_raw(hs);
     return err;
+}
+
+/* ===== Parse (spec "Materialization" step 2) =====
+ *
+ * A validated view becomes a fresh heap root: the ray_index_t is rebuilt
+ * field by field and every child is copied out of the region, so nothing
+ * in the root refers to the mapping and the root outlives it.  No count
+ * sizes an allocation before it is tied to the region again here: the
+ * validator proved it, but the view is a plain struct a caller fills. */
+
+/* `count` elements of `esz` bytes at region offset `off` lie inside the
+ * region, past the root. */
+static bool ep_span(const ray_enc_idx_view_t* v, int64_t off, int64_t count, uint64_t esz) {
+    return count >= 0 && off >= RAY_ENC_IDX_FIRST_CHILD && (uint64_t)off <= v->size &&
+           (uint64_t)count <= (v->size - (uint64_t)off) / esz;
+}
+
+/* A heap vector of `type` holding n elements copied from p; NULL on oom. */
+static ray_t* ep_copy(int8_t type, const uint8_t* p, int64_t n, size_t esz) {
+    if (ray_enccol_test_nth_alloc_fails()) return NULL;
+    ray_t* c = ray_vec_new(type, n > 0 ? n : 1);
+    if (!c) return NULL;
+    if (RAY_IS_ERR(c)) { ray_error_free(c); return NULL; }
+    c->len = n;
+    if (n) memcpy(ray_data(c), p, (size_t)n * esz);
+    return c;
+}
+
+ray_t* ray_enc_index_parse(const ray_enc_idx_view_t* v, ray_t* vec, ray_t** root_out) {
+    *root_out = NULL;
+    const uint8_t* b = v->base;
+    int kesz = v->kind == RAY_IDX_PART ? ei_key_esz(v->parent_type, v->attrs) : 0;
+    bool in = b && v->size >= RAY_ENC_IDX_FIRST_CHILD && v->len >= 0 && ray_enc_idx_kind_has_region(v->kind);
+    if (in) {
+        switch (v->kind) {
+        case RAY_IDX_HASH:
+            in = v->hash.mask < EI_HASH_CAP_MAX && v->hash.n_groups < INT64_MAX &&
+                 ep_span(v, v->hash.table, (int64_t)(v->hash.mask + 1), 8) &&
+                 ep_span(v, v->hash.gkeys, v->hash.n_groups, 8) &&
+                 ep_span(v, v->hash.offs, v->hash.n_groups + 1, 8) &&
+                 ep_span(v, v->hash.rows, v->hash.n_keys, 8);
+            break;
+        case RAY_IDX_SORT:
+            in = ep_span(v, v->sort.perm, v->len, 8);
+            break;
+        case RAY_IDX_BLOOM:
+            in = v->bloom.m_mask < UINT64_MAX && ep_span(v, v->bloom.bits, (int64_t)((v->bloom.m_mask + 1) / 8), 1);
+            break;
+        default:
+            in = kesz > 0 && ep_span(v, v->part.keys, v->part.n_parts, (uint64_t)kesz) &&
+                 ep_span(v, v->part.starts, v->part.n_parts, 8) && ep_span(v, v->part.lens, v->part.n_parts, 8);
+            break;
+        }
+    }
+    /* the name, when there is one, is inside the region too */
+    if (in && v->order_name) {
+        const uint8_t* np = (const uint8_t*)v->order_name;
+        in = v->order_len >= 1 && v->order_len <= RAY_ENC_IDX_NAME_MAX && np >= b + RAY_ENC_IDX_FIRST_CHILD &&
+             (uint64_t)(np - b) <= v->size && v->order_len <= v->size - (uint64_t)(np - b);
+    }
+    if (!in) return ray_error("corrupt", "index parse: the view is outside its region");
+    /* SYM PART keys resolve over the decoded column's domain. */
+    if (v->kind == RAY_IDX_PART && v->parent_type == RAY_SYM && (!vec || RAY_IS_ERR(vec) || vec->type != RAY_SYM))
+        return ray_error("type", "index parse: SYM PART keys need the decoded SYM column");
+
+    ray_t* root = ray_enccol_test_nth_alloc_fails() ? NULL
+                : ray_index_new_root((ray_idx_kind_t)v->kind, v->parent_type, v->len);
+    if (!root || RAY_IS_ERR(root)) {
+        if (root) ray_error_free(root);
+        return ray_error("oom", "index parse");
+    }
+    ray_index_t* ix = ray_index_payload(root);
+    bool ok;
+    switch (v->kind) {
+    case RAY_IDX_HASH:
+        ix->u.hash.mask = v->hash.mask; ix->u.hash.n_keys = v->hash.n_keys;
+        ix->u.hash.n_groups = v->hash.n_groups; ix->u.hash.order_sym = -1;
+        ok = (ix->u.hash.table = ep_copy(RAY_I64, b + v->hash.table, (int64_t)(v->hash.mask + 1), 8)) &&
+             (ix->u.hash.gkeys = ep_copy(RAY_I64, b + v->hash.gkeys, v->hash.n_groups, 8)) &&
+             (ix->u.hash.offs  = ep_copy(RAY_I64, b + v->hash.offs, v->hash.n_groups + 1, 8)) &&
+             (ix->u.hash.rows  = ep_copy(RAY_I64, b + v->hash.rows, v->hash.n_keys, 8));
+        break;
+    case RAY_IDX_SORT:
+        ok = (ix->u.sort.perm = ep_copy(RAY_I64, b + v->sort.perm, v->len, 8)) != NULL;
+        break;
+    case RAY_IDX_BLOOM:
+        ix->u.bloom.m_mask = v->bloom.m_mask; ix->u.bloom.k = v->bloom.k; ix->u.bloom.n_keys = v->bloom.n_keys;
+        ok = (ix->u.bloom.bits = ep_copy(RAY_U8, b + v->bloom.bits, (int64_t)((v->bloom.m_mask + 1) / 8), 1)) != NULL;
+        break;
+    default: {
+        int64_t np = v->part.n_parts;
+        ix->u.part.n_parts = np; ix->u.part.order_sym = -1;
+        if (v->parent_type == RAY_SYM) {
+            /* the column's width class, as written; ids are positions in
+             * the column's domain (the validator bounded them by it) */
+            ray_t* k = ray_enccol_test_nth_alloc_fails() ? NULL
+                     : ray_sym_vec_new(v->attrs & RAY_SYM_W_MASK, np > 0 ? np : 1);
+            if (k && RAY_IS_ERR(k)) { ray_error_free(k); k = NULL; }
+            if (k) {
+                k->len = np;
+                if (np) memcpy(ray_data(k), b + v->part.keys, (size_t)np * (size_t)kesz);
+                ray_sym_vec_adopt_domain(k, vec);
+            }
+            ix->u.part.keys = k;
+        } else {
+            ix->u.part.keys = ep_copy(v->parent_type, b + v->part.keys, np, (size_t)kesz);
+        }
+        ok = ix->u.part.keys &&
+             (ix->u.part.starts = ep_copy(RAY_I64, b + v->part.starts, np, 8)) &&
+             (ix->u.part.lens   = ep_copy(RAY_I64, b + v->part.lens, np, 8));
+        break;
+    }
+    }
+    /* order_name: interned in this process (HASH and PART carry one) */
+    if (ok && v->order_name && (v->kind == RAY_IDX_HASH || v->kind == RAY_IDX_PART)) {
+        int64_t id = ray_sym_intern(v->order_name, v->order_len);
+        if (id < 0) ok = false;
+        else if (v->kind == RAY_IDX_HASH) ix->u.hash.order_sym = id;
+        else ix->u.part.order_sym = id;
+    }
+    if (!ok) { ray_release(root); return ray_error("oom", "index parse"); }   /* releases the set children */
+    *root_out = root;
+    return NULL;
 }

@@ -158,6 +158,16 @@ ray_t* ray_enc_index_validate(const uint8_t* region, uint64_t size, uint8_t kind
                               uint32_t sym_bound, const void* col_data,
                               const char* path, ray_enc_idx_view_t* out);
 
+/* A fresh heap RAY_INDEX root from a validated view, every child copied
+ * into a heap vector of its slot's type.  SYM PART keys adopt the domain
+ * of `vec` (the decoded column); order_name is interned in this process.
+ * NULL with *root_out set (owned), or an owned oom error.  Nothing in the
+ * root refers to the region, so it outlives the mapping.  A view whose
+ * fields do not lie inside its region is corrupt, and a SYM PART without
+ * a SYM `vec` is a type error: the view is re-tied to the region before
+ * any count sizes an allocation. */
+ray_t* ray_enc_index_parse(const ray_enc_idx_view_t* v, ray_t* vec, ray_t** root_out);
+
 /* order_sym a writer may convert to a name (spec "Writing the index"):
  * the root's HASH / PART order_sym when RAY_MARK_MMAP is clear, else -1. */
 int64_t ray_enc_index_trusted_order(const ray_t* root);

@@ -559,12 +559,15 @@ void ray_enccol_test_fail_path(const char* sub) {
     atomic_store(&g_fail_path_on, false);
     if (sub) { snprintf(g_fail_path, sizeof g_fail_path, "%s", sub); atomic_store(&g_fail_path_on, true); }
 }
-static bool enc_alloc_fails(const ray_enccol_t* e) {
-    if (atomic_load(&g_fail_path_on) && strstr(e->path, g_fail_path)) return true;
+bool ray_enccol_test_nth_alloc_fails(void) {
     int64_t v = atomic_load(&g_fail_alloc_at);
     while (v > 0)
         if (atomic_compare_exchange_weak(&g_fail_alloc_at, &v, v - 1)) return v == 1;
     return false;
+}
+static bool enc_alloc_fails(const ray_enccol_t* e) {
+    if (atomic_load(&g_fail_path_on) && strstr(e->path, g_fail_path)) return true;
+    return ray_enccol_test_nth_alloc_fails();
 }
 
 /* ---- VALUE_DICT side entry: validated once (spec "Side data") ---- */
