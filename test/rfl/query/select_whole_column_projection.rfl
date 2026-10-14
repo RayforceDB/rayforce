@@ -206,4 +206,29 @@ ticks -- 1
 (set ticks 0)
 (at (select {x: (count (do (set ticks (+ ticks 1)) (til 5))) from: TPW}) 'x) -- [5]
 ticks -- 1
+;; A column-free source with by: is evaluated once and its value spliced back
+;; into the query: every value type must survive the round trip, the other
+;; clauses must apply, and a name that is both a global and a column must
+;; still read the column.
+(set TCF (table [acf b] (list [1 2 3 4 5 6] ['x 'x 'y 'y 'y 'z])))
+(at (select {s: (first (at ['p 'q] 0)) from: TCF by: b}) 's) -- ['p 'p 'p]
+(at (select {s: (first (at ["xy" "z"] 0)) from: TCF by: b}) 's) -- ["xy" "xy" "xy"]
+(at (select {s: (first (list [1 2] [3])) from: TCF by: b}) 's) -- (list [1 2] [1 2] [1 2])
+(at (select {s: (first (at [2024.01.01 2024.02.02] 1)) from: TCF by: b}) 's) -- [2024.02.02 2024.02.02 2024.02.02]
+(at (select {s: (sum (at [1.5 2.5] 0)) from: TCF by: b}) 's) -- [3.0 4.5 1.5]
+(at (select {s: (max (at [3 9] 1)) n: (count acf) from: TCF by: b}) 'n) -- [2 3 1]
+(at (select {s: (sum (at [2 3] 0)) from: TCF by: b where: (> acf 1) desc: s take: 1}) 's) -- [6]
+(set GCF 5)
+(at (select {s: (sum (+ GCF 0)) from: TCF by: b}) 's) -- [10 15 5]
+(set acf 100)
+(at (select {s: (sum (+ acf 0)) from: TCF by: b}) 's) -- [3 12 6]
+(set fcf (fn [x] (+ x 1)))
+(at (select {s: (sum (fcf 1)) from: TCF by: b}) 's) -- [4 6 2]
+(at (select {s: (sum (fcf acf)) from: TCF by: b}) 's) -- [5 15 7]
+(set ticks 0)
+(count (select {s: (sum (at [2 3] 0)) from: (do (set ticks (+ ticks 1)) TCF) by: b})) -- 3
+ticks -- 1
+(set ticks 0)
+(at (select {s: (sum (do (set ticks (+ ticks 1)) (til 3))) from: TCF}) 's) -- [3]
+ticks -- 1
 (.sys.exec "rm -rf /tmp/rfl_scalar_asc_parted") -- 0
