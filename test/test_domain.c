@@ -52,6 +52,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <sys/stat.h>   /* stat: the symfile size behind the mapping counters */
 #include <stdlib.h>   /* setenv */
 #include <stdatomic.h>
 
@@ -1977,10 +1978,10 @@ static test_result_t test_domain_raw_pin(void) {
     TEST_ASSERT_EQ_I(raw.count, (int64_t)count_at_save);
     ray_sym_domain_raw_unpin(dom);
     ray_sym_domain_release(dom);
-    /* The file grows under another writer while a reader holds a snapshot:
-     * the reopen extends the domain (new mapping, new offsets), and the
-     * old snapshot must still read every old position from its retired
-     * mapping, while a fresh pin sees the grown prefix. */
+    /* The file grows under another writer: the reopen extends the domain
+     * (new mapping, new offsets, the old ones freed), and a pin taken after
+     * it covers the grown prefix and still reads every old position.  A pin
+     * taken before the reopen is not readable after it (domain.h). */
     unlink(TMP_DOM_SYM_PATH);
     unlink(TMP_DOM_SYM_PATH ".lk");
     TEST_ASSERT_EQ_I(ray_sym_save(TMP_DOM_SYM_PATH), RAY_OK);
@@ -1997,16 +1998,16 @@ static test_result_t test_domain_raw_pin(void) {
     ray_sym_domain_t* d2 = ray_sym_domain_open(TMP_DOM_SYM_PATH);   /* cache hit → extend */
     TEST_ASSERT_EQ_PTR(d2, d1);
     TEST_ASSERT(ray_sym_domain_count(d1) > before, "reopen extended the domain");
+    ray_sym_domain_raw_t fresh;
+    TEST_ASSERT(ray_sym_domain_raw_pin(d1, &fresh), "pin after growth");
+    TEST_ASSERT(fresh.count > before, "fresh snapshot covers the grown prefix");
     for (int64_t p = 0; p < before; p++) {
         size_t rl = 0;
-        const char* rp = ray_sym_domain_raw_str(&held, p, &rl);
+        const char* rp = ray_sym_domain_raw_str(&fresh, p, &rl);
         ray_t* g = ray_sym_str(p);
         TEST_ASSERT_EQ_U(rl, ray_str_len(g));
         TEST_ASSERT_MEM_EQ(rl, rp, ray_str_ptr(g));
     }
-    ray_sym_domain_raw_t fresh;
-    TEST_ASSERT(ray_sym_domain_raw_pin(d1, &fresh), "pin after growth");
-    TEST_ASSERT(fresh.count > before, "fresh snapshot covers the grown prefix");
     ray_sym_domain_raw_unpin(d1);
     ray_sym_domain_raw_unpin(d1);
     ray_sym_domain_release(d2);
@@ -2015,6 +2016,244 @@ static test_result_t test_domain_raw_pin(void) {
     unlink(TMP_DOM_SYM_PATH ".lk");
     PASS();
 }
+
+/* #717: a reader that reopens a symfile another process grew must keep
+ * memory proportional to the vocabulary, however many times it reopened.
+ * Each reopen is a cache hit that extends the domain; the arrays it
+ * replaces and the mapping it supersedes used to be retired until the
+ * domain died — and a replica never lets it die. */
+static test_result_t test_domain_extend_reopen_flat(void) {
+    unlink(TMP_DOM_SYM_PATH);
+    unlink(TMP_DOM_SYM_PATH ".lk");
+    enum { VOCAB = 20000, WARM = 2, CYCLES = 30, PER_CYCLE = 10 };
+    for (int i = 0; i < VOCAB; i++) {
+        char b[32]; int n = snprintf(b, sizeof b, "flat_base_%d", i);
+        (void)ray_sym_intern(b, (size_t)n);
+    }
+    TEST_ASSERT_EQ_I(ray_sym_save(TMP_DOM_SYM_PATH), RAY_OK);
+    int64_t map_before_open = 0;
+    ray_sys_get_mapped(&map_before_open, NULL);
+    ray_sym_domain_t* dom = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    TEST_ASSERT_NOT_NULL(dom);
+    int64_t base = ray_sym_domain_count(dom);
+
+    int64_t sys0 = 0, next = 0;
+    for (int c = 0; c < WARM + CYCLES; c++) {
+        if (c == WARM) ray_sys_get_stat(&sys0, NULL);
+        for (int j = 0; j < PER_CYCLE; j++, next++) {
+            char b[32]; int n = snprintf(b, sizeof b, "flat_new_%lld", (long long)next);
+            (void)ray_sym_intern(b, (size_t)n);
+        }
+        TEST_ASSERT_EQ_I(ray_sym_save(TMP_DOM_SYM_PATH), RAY_OK);   /* tmp + rename: a new inode */
+        ray_sym_domain_t* again = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+        TEST_ASSERT_EQ_PTR(again, dom);                              /* cache hit → extend */
+        TEST_ASSERT_EQ_I(ray_sym_domain_count(dom), base + next);
+        /* the grown tail resolves both ways: lazily materialised atom and
+         * reverse index (rebuilt over the grown vocabulary) */
+        char last[32]; int ln = snprintf(last, sizeof last, "flat_new_%lld", (long long)(next - 1));
+        ray_t* s = ray_sym_domain_str(dom, base + next - 1);
+        TEST_ASSERT_NOT_NULL(s);
+        TEST_ASSERT_EQ_U(ray_str_len(s), (size_t)ln);
+        TEST_ASSERT_MEM_EQ((size_t)ln, ray_str_ptr(s), last);
+        TEST_ASSERT_EQ_I(ray_sym_domain_find(dom, last, (size_t)ln), base + next - 1);
+        ray_sym_domain_release(again);
+    }
+    int64_t sys1 = 0, map1 = 0;
+    ray_sys_get_stat(&sys1, NULL);
+    ray_sys_get_mapped(&map1, NULL);
+    struct stat st;
+    TEST_ASSERT_EQ_I(stat(TMP_DOM_SYM_PATH, &st), 0);
+    int64_t one_image = ((int64_t)st.st_size + 4095) & ~(int64_t)4095;
+    /* a pin taken after the growth covers the whole grown prefix (a pin
+     * taken before a reopen is not readable after it: see domain.h) */
+    ray_sym_domain_raw_t fresh;
+    TEST_ASSERT(ray_sym_domain_raw_pin(dom, &fresh), "pin after growth");
+    TEST_ASSERT_EQ_I(fresh.count, base + next);
+    for (int64_t p = 0; p < base + next; p += 997) {
+        size_t rl = 0;
+        const char* rp = ray_sym_domain_raw_str(&fresh, p, &rl);
+        ray_t* g = ray_sym_str(p);
+        TEST_ASSERT_EQ_U(rl, ray_str_len(g));
+        TEST_ASSERT_MEM_EQ(rl, rp, ray_str_ptr(g));
+    }
+    ray_sym_domain_raw_unpin(dom);
+    ray_sym_domain_release(dom);
+    unlink(TMP_DOM_SYM_PATH);
+    unlink(TMP_DOM_SYM_PATH ".lk");
+    /* committed RAM: nothing per reopen (slack for the atoms materialised
+     * above and arena growth); file mappings: exactly one image of the
+     * current file, whatever the number of reopens.  Asserted once the
+     * domain is released, so a failure leaves none cached behind it. */
+    /* The leak was one generation per reopen: two pointer-sized arrays
+     * over the vocabulary, about 320 KB each cycle here, 9.6 MB over the
+     * run.  The bound leaves room for arena and hash-table growth. */
+    TEST_ASSERT_FMT(sys1 - sys0 <= 1024 * 1024,
+                    "sys-current grew by %lld bytes over %d reopens",
+                    (long long)(sys1 - sys0), CYCLES);
+    TEST_ASSERT_FMT(map1 - map_before_open == one_image,
+                    "sys-mapped holds %lld bytes for a %lld-byte symfile",
+                    (long long)(map1 - map_before_open), (long long)one_image);
+    PASS();
+}
+/* Write `words` as the symfile at `path` the way another process's writer
+ * does: a tmp file renamed over it (a new inode). */
+static bool write_symfile(const char* path, const char* const* words, int n) {
+    char tmp[256];
+    snprintf(tmp, sizeof tmp, "%s.ext", path);
+    FILE* f = fopen(tmp, "wb");
+    if (!f) return false;
+    uint32_t magic = 0x4C525453U;   /* "STRL" */
+    int64_t count = n;
+    bool ok = fwrite(&magic, 4, 1, f) == 1 && fwrite(&count, 8, 1, f) == 1;
+    for (int i = 0; ok && i < n; i++) {
+        uint32_t l = (uint32_t)strlen(words[i]);
+        ok = fwrite(&l, 4, 1, f) == 1 && (l == 0 || fwrite(words[i], 1, l, f) == l);
+    }
+    ok = fclose(f) == 0 && ok;
+    return ok && rename(tmp, path) == 0;
+}
+
+/* Every position resolves to words[pos], by position and by string, and
+ * a raw pin covers them all: the extend made them file positions. */
+static bool dom_holds(ray_sym_domain_t* dom, const char* const* words, int n) {
+    if (ray_sym_domain_count(dom) != n) return false;
+    ray_sym_domain_raw_t raw;
+    if (!ray_sym_domain_raw_pin(dom, &raw) || raw.count != n) return false;
+    for (int p = 0; p < n; p++) {
+        size_t l = strlen(words[p]), rl = 0;
+        ray_t* s = ray_sym_domain_str(dom, p);
+        const char* rp = ray_sym_domain_raw_str(&raw, p, &rl);
+        if (!s || ray_str_len(s) != l || memcmp(ray_str_ptr(s), words[p], l) != 0 ||
+            rl != l || memcmp(rp, words[p], l) != 0 ||
+            ray_sym_domain_find(dom, words[p], l) != p)
+            return false;
+    }
+    ray_sym_domain_raw_unpin(dom);
+    return true;
+}
+
+/* A reopen after this process flushed its own appends: the positions the
+ * flush wrote have atoms but no offset into the mapping (none at all when
+ * the domain was created empty), yet the prefix check must still compare
+ * them against the grown file — and the extend give them offsets. */
+static test_result_t test_domain_extend_after_flush(void) {
+    unlink(TMP_DOM_SYM_PATH);
+    unlink(TMP_DOM_SYM_PATH ".lk");
+
+    /* (i) created empty, interned, flushed: nothing is mapped */
+    ray_sym_domain_t* dom = ray_sym_domain_open_or_create(TMP_DOM_SYM_PATH);
+    TEST_ASSERT_NOT_NULL(dom);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom, "fa", 2), 1);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom, "fb", 2), 2);
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush(dom, false), RAY_OK);
+    const char* grown1[] = { "", "fa", "fb", "fc", "fd" };
+    TEST_ASSERT(write_symfile(TMP_DOM_SYM_PATH, grown1, 5), "external growth");
+    ray_sym_domain_t* again = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    TEST_ASSERT_EQ_PTR(again, dom);
+    TEST_ASSERT(dom_holds(dom, grown1, 5), "created-empty domain extended");
+    ray_sym_domain_release(again);
+    ray_sym_domain_release(dom);
+
+    /* (ii) opened from 3 records, 2 interned and flushed: offsets cover 3 */
+    const char* base[] = { "", "ga", "gb" };
+    TEST_ASSERT(write_symfile(TMP_DOM_SYM_PATH, base, 3), "base file");
+    dom = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    TEST_ASSERT_NOT_NULL(dom);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom, "gc", 2), 3);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom, "gd", 2), 4);
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush(dom, false), RAY_OK);
+    /* a file that disagrees with the flushed tail is refused, and leaves
+     * the domain as it was */
+    const char* wrong[] = { "", "ga", "gb", "gc", "gX", "ge" };
+    TEST_ASSERT(write_symfile(TMP_DOM_SYM_PATH, wrong, 6), "diverging file");
+    TEST_ASSERT_NULL(ray_sym_domain_open(TMP_DOM_SYM_PATH));
+    const char* grown2[] = { "", "ga", "gb", "gc", "gd", "ge", "gf" };
+    TEST_ASSERT(write_symfile(TMP_DOM_SYM_PATH, grown2, 7), "external growth");
+    again = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    TEST_ASSERT_EQ_PTR(again, dom);
+    TEST_ASSERT(dom_holds(dom, grown2, 7), "flushed tail extended");
+    ray_sym_domain_release(again);
+    ray_sym_domain_release(dom);
+
+    unlink(TMP_DOM_SYM_PATH);
+    unlink(TMP_DOM_SYM_PATH ".lk");
+    PASS();
+}
+
+/* A reopen that extends the domain while a batch intern probes outside
+ * the lock drops the reverse index the batch then commits against.  The
+ * batch interns exactly what the external writer appends, so however the
+ * two interleave — extend first (all hits), during the probe (the misses
+ * found again in the current index), after the commit (appended in batch
+ * order; the reopen then refuses the dirty domain) — every string lands
+ * at the position the file gives it. */
+enum { XB_BASE = 64, XB_N = 50000, XB_ROUNDS = 10, XB_W = 24 };
+typedef struct {
+    ray_sym_domain_t* dom;
+    const char* const* strs;
+    const size_t*   lens;
+    const uint32_t* hashes;
+    int64_t*        out;
+    _Atomic(bool)   started;
+    bool            ok;
+} xbatch_ctx_t;
+
+static void xbatch_run(void* arg) {
+    xbatch_ctx_t* c = (xbatch_ctx_t*)arg;
+    atomic_store(&c->started, true);
+    c->ok = ray_sym_domain_intern_batch(c->dom, XB_N, c->strs, c->lens, c->hashes, c->out);
+}
+
+static test_result_t test_domain_extend_under_batch(void) {
+    unlink(TMP_DOM_SYM_PATH);
+    unlink(TMP_DOM_SYM_PATH ".lk");
+    enum { ALL = XB_BASE + XB_N };
+    char* buf = (char*)ray_sys_alloc((size_t)ALL * XB_W);
+    const char** words = (const char**)ray_sys_alloc((size_t)ALL * sizeof(char*));
+    size_t* lens = (size_t*)ray_sys_alloc((size_t)XB_N * sizeof(size_t));
+    uint32_t* hashes = (uint32_t*)ray_sys_alloc((size_t)XB_N * sizeof(uint32_t));
+    int64_t* out = (int64_t*)ray_sys_alloc((size_t)XB_N * sizeof(int64_t));
+    TEST_ASSERT(buf && words && lens && hashes && out, "buffers");
+    for (int r = 0; r < XB_ROUNDS; r++) {
+        words[0] = "";
+        for (int i = 1; i < ALL; i++) {
+            snprintf(buf + (size_t)i * XB_W, XB_W, "xb%d_%d", r, i);
+            words[i] = buf + (size_t)i * XB_W;
+        }
+        for (int i = 0; i < XB_N; i++) {
+            lens[i] = strlen(words[XB_BASE + i]);
+            hashes[i] = (uint32_t)ray_hash_bytes(words[XB_BASE + i], lens[i]);
+        }
+        TEST_ASSERT(write_symfile(TMP_DOM_SYM_PATH, words, XB_BASE), "base file");
+        TEST_ASSERT(write_symfile(TMP_DOM_SYM_PATH ".grown", words, ALL), "grown file");
+        ray_sym_domain_t* dom = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+        TEST_ASSERT_NOT_NULL(dom);
+        TEST_ASSERT_EQ_I(ray_sym_domain_find(dom, words[1], strlen(words[1])), 1);   /* index built */
+
+        xbatch_ctx_t c = { dom, words + XB_BASE, lens, hashes, out, false, false };
+        ray_thread_t th;
+        TEST_ASSERT_EQ_I(ray_thread_create(&th, xbatch_run, &c), RAY_OK);
+        while (!atomic_load(&c.started)) {}
+        int moved = rename(TMP_DOM_SYM_PATH ".grown", TMP_DOM_SYM_PATH);
+        ray_sym_domain_t* again = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+        ray_thread_join(th);
+
+        TEST_ASSERT_EQ_I(moved, 0);
+        TEST_ASSERT(c.ok, "batch interned");
+        for (int i = 0; i < XB_N; i++) TEST_ASSERT_EQ_I(out[i], XB_BASE + i);
+        if (again) ray_sym_domain_release(again);   /* NULL: the batch committed first */
+        ray_sym_domain_release(dom);
+    }
+    ray_sys_free(buf);
+    ray_sys_free(words);
+    ray_sys_free(lens);
+    ray_sys_free(hashes);
+    ray_sys_free(out);
+    unlink(TMP_DOM_SYM_PATH);
+    unlink(TMP_DOM_SYM_PATH ".lk");
+    PASS();
+}
+
 /* Runtime-id LUT: NULL for the runtime singleton; for a FILE domain a
  * position-indexed array of runtime intern ids (round-trips strings),
  * built once (idempotent: same pointer).  Divergent fixture proves the
@@ -2817,6 +3056,9 @@ const test_entry_t domain_entries[] = {
     { "domain/parted_flatten_adopts",   test_domain_parted_flatten_adopts,   domain_rt_setup, domain_rt_teardown },
     { "domain/str_eager_lockfree",      test_domain_str_eager_lockfree,      domain_setup, domain_teardown },
     { "domain/raw_pin",                 test_domain_raw_pin,                 domain_setup, domain_teardown },
+    { "domain/extend_reopen_flat",      test_domain_extend_reopen_flat,      domain_setup, domain_teardown },
+    { "domain/extend_after_flush",      test_domain_extend_after_flush,      domain_setup, domain_teardown },
+    { "domain/extend_under_batch",      test_domain_extend_under_batch,      domain_setup, domain_teardown },
     { "domain/concat_text_nulls",       test_domain_concat_text_nulls,       domain_rt_setup, domain_rt_teardown },
     { "domain/runtime_lut",             test_domain_runtime_lut,             domain_rt_setup, domain_rt_teardown },
     { "domain/open_position0_validation", test_domain_open_position0_validation, domain_setup, domain_teardown },
