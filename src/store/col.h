@@ -126,8 +126,10 @@ void      ray_col_test_fail_alloc(int64_t nth);   /* test hook; 0 disarms */
  * generation directory, NULL or "" when it holds no published table.
  * ON: 2 for every file generation 2 can hold; OFF: 0; ABSENT: 2 when the
  * source is a RAY_ENCCOL or the destination's current generation stores the
- * file `name` as generation 2, else 0.  Linked, nested, list and
- * HASH/SORT/BLOOM/PART-indexed columns are always 0. */
+ * file `name` as generation 2, else 0.  Linked, nested and list columns
+ * are always 0; an indexed column is generation 2 with its index region,
+ * except a SYM column with a HASH or PART index, which stays 0 until the
+ * writer rebuilds those over the target ids. */
 /* lossy: read errors read as 0 — writers use the *_err forms */
 uint8_t ray_col_file_gen(const char* path);   /* 2 when the file is generation 2, else 0 (missing included) */
 /* lossy: read errors read as 0 — writers use the *_err forms */
@@ -159,6 +161,9 @@ ray_err_t ray_col_resolve_gen_type_err(ray_compress_t mode, int8_t type, const c
 ray_t* ray_compress_opt_parse(ray_t* opts, bool strict, ray_compress_t* mode);
 void    ray_store_test_force_compress(bool on);   /* equivalence run: absent behaves as true */
 
+/* Can generation 2 hold this plain vector (type, no link, the SYM HASH /
+ * PART exception above)?  Index meta: the kind (every fresh kind) and the
+ * UNIQUE flag a plain column records; a stale root records none. */
 bool ray_col_gen2_eligible(ray_t* col);
 void ray_col_gen2_index_meta(ray_t* col, uint8_t* index_kind, uint8_t* col_flags);
 /* Validate the complete object graph accepted by ray_col_save without

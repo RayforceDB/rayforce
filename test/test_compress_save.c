@@ -1229,7 +1229,7 @@ static test_result_t test_forced_generation0(void) {
     ray_release(lnk); ray_release(hx); ray_release(lst);
     TEST_ASSERT_EQ_I(ray_splay_save_mode(t, d, NULL, RAY_COMPRESS_ON), RAY_OK);
     TEST_ASSERT_EQ_I(col_gen_in(d, "l"), 0);
-    TEST_ASSERT_EQ_I(col_gen_in(d, "h"), 0);
+    TEST_ASSERT_EQ_I(col_gen_in(d, "h"), 2);           /* P4: an indexed column is generation 2 */
     char cur[1024], p[1200];
     ray_splay_resolve_dir(d, cur, sizeof cur);
     snprintf(p, sizeof p, "%s/l.link", cur);
@@ -4887,10 +4887,11 @@ static test_result_t test_select_routes_failed_decode(void) {
 }
 
 /* The slice-group probe reads the key's index only after metadata admits it
- * (a SYM key with a HASH or PART index).  Generation 2 records neither kind
- * in P1 (such a key is saved as generation 0), so the probe's key read never
- * meets an encoded slot; the slice route still runs over an encoded
- * aggregate column, and that column failing is the query's error. */
+ * (a SYM key with a HASH or PART index).  A SYM key with either kind is
+ * still saved as generation 0 (the writer does not yet rebuild SYM indexes
+ * over the target ids), so the probe's key read never meets an encoded
+ * slot; the slice route still runs over an encoded aggregate column, and
+ * that column failing is the query's error. */
 static test_result_t test_select_slice_probe_failed_decode(void) {
     static const char* const cols[] = { "f", NULL };
     for (int c = 0; cols[c]; c++) {
@@ -4902,7 +4903,7 @@ static test_result_t test_select_slice_probe_failed_decode(void) {
         char p[128]; snprintf(p, sizeof p, "%s/sp/%s", ray_test_tmp(CS_TMP), cols[c]);
         TEST_ASSERT_EQ_U(file_gen(p), 2);
         TEST_ASSERT_TRUE(qb_damage(p, 4000));
-        TEST_ASSERT_EQ_U(file_gen(ray_test_tmp(CS_TMP "/sp/s")), 0);   /* the HASH-indexed key */
+        TEST_ASSERT_EQ_U(file_gen(ray_test_tmp(CS_TMP "/sp/s")), 0);   /* the HASH-indexed SYM key */
         TEST_ASSERT_STR_EQ(ev_code(ray_test_tmp("(set TL (.db.splayed.get \"" CS_TMP "/sp\"))")), "");
         uint64_t hits0 = ray_idx_hits[IDX_SITE_GROUP_SLICE];
         ray_error_clear();

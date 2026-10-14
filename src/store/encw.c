@@ -339,6 +339,19 @@ ray_err_t ray_encw_begin(ray_encw_t* w, FILE* f, int8_t type, uint8_t attrs, int
     return fput(w, NULL, (size_t)RAY_ENC_DIR_OFF + (size_t)w->n_chunks * sizeof(ray_enc_dirent_t));
 }
 
+void ray_encw_set_index(ray_encw_t* w, const ray_enc_idx_src_t* s) {
+    w->idx = *s;
+    w->has_idx = true;
+    w->idx_copy = NULL; w->idx_copy_len = 0;
+    w->index_kind = ray_index_payload((ray_t*)s->root)->kind;
+}
+
+void ray_encw_set_index_copy(ray_encw_t* w, uint8_t kind, const uint8_t* region, uint64_t len) {
+    w->has_idx = false;
+    w->idx_copy = region; w->idx_copy_len = len;
+    w->index_kind = kind;
+}
+
 /* VALUE_DICT is trained on the column's first chunk and frozen (spec
  * "Encoding selection"): the filled T-bit values of every vector. */
 static ray_err_t train_dict(ray_encw_t* w, const void* data, int64_t n) {
@@ -426,15 +439,22 @@ ray_err_t ray_encw_chunk(ray_encw_t* w, const void* data, const char* str_pool, 
     return RAY_OK;
 }
 
+/* The persisted attrs of the column: the source's disk attrs, HAS_NULLS
+ * for bitmap nulls. */
+static uint8_t encw_final_attrs(const ray_encw_t* w, bool has_nulls) {
+    return (uint8_t)((w->attrs & COL_DISK_ATTRS_MASK) | (has_nulls ? RAY_ATTR_HAS_NULLS : 0));
+}
+
 /* The 32-byte outer header and the enc header of a column of w->pos bytes. */
 static void encw_headers(const ray_encw_t* w, uint64_t side_off, uint64_t side_len, bool has_nulls,
-                         ray_t* hdr, ray_enc_hdr_t* eh) {
+                         uint64_t index_off, ray_t* hdr, ray_enc_hdr_t* eh) {
     memset(eh, 0, sizeof *eh);
     memcpy(eh->magic, "RENC", 4);
     eh->header_version = RAY_ENC_HDR_VERSION;
     eh->index_kind = w->index_kind;
     eh->col_flags = w->col_flags;
     eh->side_off = side_off; eh->side_len = side_len;
+    eh->index_off = index_off;
     eh->str_pool_bytes = w->type == RAY_STR ? w->str_pool_bytes : 0;
     eh->end_off = w->pos;
     memset(hdr, 0, sizeof *hdr);
@@ -442,7 +462,7 @@ static void encw_headers(const ray_encw_t* w, uint64_t side_off, uint64_t side_l
     memcpy(hdr->aux, &xenc, 4);
     hdr->order = RAY_ENC_GEN;
     hdr->type  = w->type;
-    hdr->attrs = (uint8_t)((w->attrs & COL_DISK_ATTRS_MASK) | (has_nulls ? RAY_ATTR_HAS_NULLS : 0));
+    hdr->attrs = encw_final_attrs(w, has_nulls);
     hdr->rc    = w->sym_count;
     hdr->len   = w->len;
 }
@@ -474,9 +494,25 @@ ray_err_t ray_encw_finish(ray_encw_t* w) {
         if ((err = fput(w, NULL, (size_t)(ray_enc_pad8(used) - used))) != RAY_OK) return err;
         side_len = 32 + ebytes;
     }
+    /* the index region follows the side data, 32-aligned (spec "Writers") */
+    uint64_t index_off = 0;
+    if (w->has_idx || w->idx_copy) {
+        index_off = ray_enc_pad32(w->pos);
+        if ((err = fput(w, NULL, (size_t)(index_off - w->pos))) != RAY_OK) return err;
+        if (w->idx_copy) {
+            if ((err = fput(w, w->idx_copy, (size_t)w->idx_copy_len)) != RAY_OK) return err;
+        } else {
+            ray_enc_idx_src_t s = w->idx;
+            s.attrs = encw_final_attrs(w, w->any_bitmap_null);   /* SYM PART keys at the saved width */
+            uint64_t nb = 0;
+            ray_t* ie = ray_enc_index_write(w->f, &s, &nb);
+            if (ie) { ray_err_t c = ray_err_from_obj(ie); ray_error_free(ie); return c; }
+            w->pos += nb;
+        }
+    }
     ray_enc_hdr_t eh;
     ray_t hdr;
-    encw_headers(w, side_off, side_len, w->any_bitmap_null, &hdr, &eh);
+    encw_headers(w, side_off, side_len, w->any_bitmap_null, index_off, &hdr, &eh);
     if (fflush(w->f) != 0 || fseek(w->f, 0, SEEK_SET) != 0) return RAY_ERR_IO;
     if (fwrite(&hdr, 1, 32, w->f) != 32 || fwrite(&eh, 1, 64, w->f) != 64) return RAY_ERR_IO;
     if (w->n_chunks > 0 &&
@@ -544,7 +580,7 @@ ray_err_t ray_encw_null_image(int8_t type, uint8_t attrs, int64_t len, uint32_t 
     w.pos = size;
     ray_enc_hdr_t eh;
     ray_t hdr;
-    encw_headers(&w, 0, 0, w.any_bitmap_null, &hdr, &eh);   /* ray_encw_finish's rule */
+    encw_headers(&w, 0, 0, w.any_bitmap_null, 0, &hdr, &eh);   /* ray_encw_finish's rule */
     memcpy(img, &hdr, 32);
     memcpy(img + RAY_ENC_HDR_OFF, &eh, sizeof eh);
     *out = img; *out_size = (size_t)size;

@@ -1139,7 +1139,15 @@ static test_result_t test_gen0_fallback(void) {
     ray_t* r = ray_index_attach_hash(&v);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(ENCFMT_TMP "/fh"), 2), RAY_OK);
-    TEST_ASSERT_EQ_I(file_gen(ray_test_tmp(ENCFMT_TMP "/fh")), 0);
+    TEST_ASSERT_EQ_I(file_gen(ray_test_tmp(ENCFMT_TMP "/fh")), 2);      /* P4: indexed columns are generation 2 */
+    {
+        size_t n = 0; uint8_t* b = read_file(ray_test_tmp(ENCFMT_TMP "/fh"), &n);
+        TEST_ASSERT_TRUE(b && n >= 96);
+        ray_enc_hdr_t eh; memcpy(&eh, b + 32, 64);
+        free(b);
+        TEST_ASSERT_EQ_I(eh.index_kind, RAY_IDX_HASH);
+        TEST_ASSERT_TRUE(eh.index_off != 0 && eh.index_off % 32 == 0);
+    }
     ray_release(v);
 
     ray_t* l = ray_list_new(2);

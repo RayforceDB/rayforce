@@ -58,31 +58,61 @@ static ray_err_t colw_publish(const char* tmp, const char* path, bool durable) {
     return RAY_OK;
 }
 
-/* Generation 2 holds plain vectors of BOOL..STR without a link and without
- * a HASH, SORT, BLOOM or PART index (spec P1: those stay generation 0 until
- * the index region exists). */
+/* Generation 2 holds plain vectors of BOOL..STR without a link (spec
+ * "Always generation 0"); every index kind is held since P4, except a SYM
+ * column's HASH or PART, which the writer rebuilds over the target ids
+ * (spec "SYM columns", the range writer): until that rebuild exists such a
+ * column stays generation 0 rather than lose its index. */
 bool ray_col_gen2_eligible(ray_t* col) {
     if (!col || RAY_IS_ERR(col)) return false;
     if (!ray_encw_type_supported(col->type)) return false;
     if (col->attrs & RAY_ATTR_HAS_LINK) return false;
-    switch (ray_index_kind(col)) {
-    case RAY_IDX_HASH: case RAY_IDX_SORT: case RAY_IDX_BLOOM: case RAY_IDX_PART: return false;
-    default: return true;
+    if (col->type == RAY_SYM) {
+        ray_idx_kind_t k = ray_index_kind(col);
+        if (k == RAY_IDX_HASH || k == RAY_IDX_PART) return false;
     }
+    return true;
 }
 
-/* The index kind and UNIQUE flag a plain column records in the enc header:
- * ZONE and CHUNK_ZONE (synthesized at materialization), UNIQUE as a flag;
- * DICT and a marker-only root record none. */
+/* Index kind and UNIQUE flag a plain column records: every fresh kind with
+ * a region or a synthesized form; DICT and a stale root record nothing. */
 void ray_col_gen2_index_meta(ray_t* col, uint8_t* index_kind, uint8_t* col_flags) {
     *index_kind = 0; *col_flags = 0;
     if (!ray_index_has(col)) return;
     ray_index_t* ix = ray_index_payload(col->index);
-    if (ix->kind == RAY_IDX_ZONE || ix->kind == RAY_IDX_CHUNK_ZONE) *index_kind = ix->kind;
+    if (ix->built_for_len != col->len) return;                /* stale: dropped */
     if (ix->markers & RAY_MARK_UNIQUE) *col_flags |= RAY_ENC_FLAG_UNIQUE;
+    switch (ix->kind) {
+    case RAY_IDX_ZONE: case RAY_IDX_CHUNK_ZONE: case RAY_IDX_HASH:
+    case RAY_IDX_SORT: case RAY_IDX_BLOOM: case RAY_IDX_PART:
+        *index_kind = (uint8_t)ix->kind; break;
+    default: break;
+    }
 }
 
-static ray_err_t colw_gen2_vec(ray_t* vec, const char* path, bool durable, uint8_t ik_override) {
+/* The order name of a trustworthy root, or NULL (spec "order_sym"). */
+static const char* colw_order_name(const ray_t* root, uint32_t* len) {
+    *len = 0;
+    int64_t s = ray_enc_index_trusted_order(root);
+    if (s < 0) return NULL;
+    ray_t* na = ray_sym_str(s);
+    if (!na || RAY_IS_ERR(na) || ray_str_len(na) < 1 || ray_str_len(na) > RAY_ENC_IDX_NAME_MAX) return NULL;
+    *len = (uint32_t)ray_str_len(na);
+    return ray_str_ptr(na);
+}
+
+/* The region writer's "index region: ..." message gains the column's
+ * "column %s: " prefix (the spec's message form); the code is unchanged. */
+static void colw_region_msg(const char* path) {
+    const char* m = ray_error_msg();
+    if (!m || strncmp(m, "index region:", 13) != 0) return;
+    char copy[256];
+    snprintf(copy, sizeof copy, "%s", m);
+    ray_error_free(ray_error("io", "column %s: %s", path, copy));   /* sets the message; code unused */
+}
+
+static ray_err_t colw_gen2_vec(ray_t* vec, const char* path, bool durable, uint8_t ik_override,
+                               uint8_t ix_decision) {
     if (!ray_enc_gen2_supported()) return RAY_ERR_NYI;      /* before <path>.tmp exists */
     char tmp[1100];
     if (snprintf(tmp, sizeof tmp, "%s.tmp", path) >= (int)sizeof tmp) return RAY_ERR_IO;
@@ -90,7 +120,12 @@ static ray_err_t colw_gen2_vec(ray_t* vec, const char* path, bool durable, uint8
     if (!f) return RAY_ERR_IO;
     uint8_t ik, cf;
     ray_col_gen2_index_meta(vec, &ik, &cf);
+    /* a region from the root's own kind; an override never re-labels a
+     * region root, and DROP writes none */
+    bool region = ray_enc_idx_kind_has_region(ik) && (!ik_override || ik_override == ik) &&
+                  ix_decision != RAY_COL_IDX_DROP;
     if (ik_override) ik = ik_override;
+    if (ray_enc_idx_kind_has_region(ik) && !region) ik = 0;           /* no region: none recorded */
     /* the writer applies the same matrix as the validator (spec step 3) */
     if ((ik && !ray_index_kind_admits((ray_idx_kind_t)ik, vec->type)) ||
         ((cf & RAY_ENC_FLAG_UNIQUE) && !ray_index_kind_admits(RAY_IDX_NONE, vec->type))) {
@@ -105,15 +140,20 @@ static ray_err_t colw_gen2_vec(ray_t* vec, const char* path, bool durable, uint8
                        ? (const char*)ray_data(owner->str_pool) : NULL;
     ray_encw_t w;
     ray_err_t e = ray_encw_begin(&w, f, vec->type, vec->attrs, vec->len, sc, ik, cf);
+    if (e == RAY_OK && region) {
+        ray_enc_idx_src_t is = { vec->index, vec->type, vec->attrs, vec->len, NULL, 0 };
+        is.order_name = colw_order_name(vec->index, &is.order_len);
+        ray_encw_set_index(&w, &is);
+    }
     for (int64_t c = 0; e == RAY_OK && c < w.n_chunks; c++) {
         int64_t n = vec->len - c * RAY_ENC_CHUNK;
         if (n > RAY_ENC_CHUNK) n = RAY_ENC_CHUNK;
         e = ray_encw_chunk(&w, data + (size_t)c * RAY_ENC_CHUNK * esz, pool, n);
     }
-    if (e == RAY_OK) e = ray_encw_finish(&w);
+    if (e == RAY_OK && (e = ray_encw_finish(&w)) != RAY_OK && region) colw_region_msg(path);
     ray_encw_free(&w);
     if (fclose(f) != 0 && e == RAY_OK) e = RAY_ERR_IO;
-    if (e != RAY_OK) { remove(tmp); return e; }
+    if (e != RAY_OK) { remove(tmp); return e; }             /* nothing of this write remains */
     return colw_publish(tmp, path, durable);
 }
 
@@ -168,6 +208,9 @@ static ray_err_t colw_gen2_range(ray_col_write_t* w, const char* path) {
     uint8_t ik, cf;
     colw_src_index_meta(s->obj, &ik, &cf);
     if (w->index_kind) ik = w->index_kind;
+    /* never a recorded region kind without its region: the range writer
+     * writes no region yet (a SYM HASH / PART column is not eligible) */
+    if (ray_enc_idx_kind_has_region(ik)) return RAY_ERR_NYI;
     if ((ik && !ray_index_kind_admits((ray_idx_kind_t)ik, type)) ||
         ((cf & RAY_ENC_FLAG_UNIQUE) && !ray_index_kind_admits(RAY_IDX_NONE, type)))
         return RAY_ERR_NYI;
@@ -253,7 +296,7 @@ ray_err_t ray_col_save_ctx(ray_col_write_t* w, const char* path) {
         return RAY_ERR_NYI;
     if (w->gen == 2 && colw_src_gen2_ok(obj)) {
         if (obj->type != RAY_ENCCOL && obj->type != RAY_SYM)
-            return colw_gen2_vec(obj, path, w->durable, w->index_kind);   /* direct pointers */
+            return colw_gen2_vec(obj, path, w->durable, w->index_kind, w->index_decision);   /* direct pointers */
         return colw_gen2_range(w, path);
     }
     if (w->gen != 0 && w->gen != 2) return RAY_ERR_VERSION;

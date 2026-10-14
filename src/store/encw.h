@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include "store/enc.h"
 #include "store/encfmt.h"
+#include "store/encidx.h"
 
 typedef struct {
     ray_enc_desc_t desc;        /* payload_off is set by the column writer */
@@ -58,7 +59,7 @@ typedef struct {
     uint8_t  attrs;            /* source attrs; masked + HAS_NULLS derived at finish */
     int64_t  len;
     uint32_t sym_count;        /* outer header rc (SYM) */
-    uint8_t  index_kind;       /* 0, RAY_IDX_ZONE or RAY_IDX_CHUNK_ZONE in P1 */
+    uint8_t  index_kind;       /* the recorded kind; a region kind needs a region (set_index*) */
     uint8_t  col_flags;        /* RAY_ENC_FLAG_UNIQUE */
     int64_t  n_chunks, chunk_i;
     ray_enc_dirent_t* dir;
@@ -68,12 +69,21 @@ typedef struct {
     uint64_t* dict_v; uint32_t dict_n; bool dict_used;
     ray_enc_buf_t  chunk;
     ray_encw_vec_t vec;
+    ray_enc_idx_src_t idx; bool has_idx;              /* region from a heap root */
+    const uint8_t* idx_copy; uint64_t idx_copy_len;   /* region copied verbatim */
 } ray_encw_t;
 ray_err_t ray_encw_begin(ray_encw_t* w, FILE* f, int8_t type, uint8_t attrs, int64_t len,
                          uint32_t sym_count, uint8_t index_kind, uint8_t col_flags);
 ray_err_t ray_encw_chunk(ray_encw_t* w, const void* data, const char* str_pool, int64_t n);
 ray_err_t ray_encw_finish(ray_encw_t* w);
 void      ray_encw_free(ray_encw_t* w);
+/* Write s's index as the region (index_kind = the root's kind).  The root
+ * must stay alive until ray_encw_finish; s->attrs is replaced by the
+ * column's final persisted attrs at finish.  A region writer failure leaves
+ * its "index region: ..." message in ray_error_msg(). */
+void      ray_encw_set_index(ray_encw_t* w, const ray_enc_idx_src_t* s);
+/* Copy `len` bytes of an already validated region of `kind` verbatim. */
+void      ray_encw_set_index_copy(ray_encw_t* w, uint8_t kind, const uint8_t* region, uint64_t len);
 
 /* An all-null generation-2 column image of `len` rows in an anonymous
  * mapping (*out, *out_size; ray_vm_unmap_file releases it).  `fill`: min(len,

@@ -32,6 +32,8 @@
 #include "core/pool.h"
 #include "ops/rowsel.h"
 #include "store/enccol.h"
+#include "store/encw.h"
+#include "store/col.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1575,6 +1577,214 @@ static test_result_t test_parse_rejects_view(void) {
     PASS();
 }
 
+/* ---- the column writer emits the region (Task 5) ---- */
+
+/* The region of a written column file and its enc header, or NULL when the
+ * file has none. */
+static uint8_t* ix_file_region(const char* path, size_t* rn, ray_enc_hdr_t* eh) {
+    size_t n; uint8_t* b = ix_slurp(path, &n);
+    memset(eh, 0, sizeof *eh);
+    if (!b) return NULL;
+    if (n < 96) { free(b); return NULL; }
+    memcpy(eh, b + 32, 64);
+    if (!eh->index_off || eh->index_off >= n) { free(b); return NULL; }
+    *rn = n - eh->index_off;
+    uint8_t* r = malloc(*rn);
+    memcpy(r, b + eh->index_off, *rn);
+    free(b);
+    return r;
+}
+
+/* A HASH-indexed column is written as generation 2 with its region. */
+static test_result_t test_file_has_region(void) {
+    int64_t d[3000];
+    for (int i = 0; i < 3000; i++) d[i] = (i * 13) % 211;
+    ray_t* v = with_index(i64_vec(d, 3000), ray_index_attach_hash);
+    TEST_ASSERT_NOT_NULL(v);
+    const char* p = ray_test_tmp(IDX_TMP "/h");
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, p, 2), RAY_OK);
+    TEST_ASSERT_EQ_U(ray_col_file_gen(p), 2);
+    size_t rn = 0; ray_enc_hdr_t eh;
+    uint8_t* r = ix_file_region(p, &rn, &eh);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_EQ_I(eh.index_kind, RAY_IDX_HASH);
+    TEST_ASSERT_EQ_U(eh.index_off % 32, 0);
+    size_t n2 = 0; ray_t* err = NULL; uint8_t* direct = ix_region(v, NULL, 0, &n2, &err);
+    bool same = direct && n2 == rn && memcmp(direct, r, rn) == 0;
+    free(direct); free(r); ray_release(v);
+    TEST_ASSERT_FMT(same, "the file's region differs from the region writer's (%zu vs %zu bytes)", rn, n2);
+    PASS();
+}
+
+/* UNIQUE is a header flag, never in the region; a stale root writes none. */
+static test_result_t test_unique_and_stale(void) {
+    int64_t d[100]; for (int i = 0; i < 100; i++) d[i] = i;
+    ray_t* v = with_index(i64_vec(d, 100), ray_index_attach_hash);
+    TEST_ASSERT_NOT_NULL(v);
+    ray_index_payload(v->index)->markers |= RAY_MARK_UNIQUE;
+    size_t rn = 0, dn = 0; ray_enc_hdr_t eh;
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(IDX_TMP "/u"), 2), RAY_OK);
+    uint8_t* r = ix_file_region(ray_test_tmp(IDX_TMP "/u"), &rn, &eh);
+    ray_t* err = NULL; uint8_t* direct = ix_region(v, NULL, 0, &dn, &err);   /* markers are not on the wire */
+    bool same = r && direct && rn == dn && memcmp(r, direct, rn) == 0;
+    free(r); free(direct);
+    TEST_ASSERT_TRUE(same);
+    TEST_ASSERT_EQ_I(eh.index_kind, RAY_IDX_HASH);
+    TEST_ASSERT_EQ_I(eh.col_flags, RAY_ENC_FLAG_UNIQUE);
+    ray_index_payload(v->index)->built_for_len = 99;           /* stale */
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(IDX_TMP "/s"), 2), RAY_OK);
+    r = ix_file_region(ray_test_tmp(IDX_TMP "/s"), &rn, &eh);
+    ray_index_payload(v->index)->built_for_len = 100;
+    ray_release(v);
+    TEST_ASSERT_NULL(r);
+    TEST_ASSERT_EQ_U(ray_col_file_gen(ray_test_tmp(IDX_TMP "/s")), 2);
+    TEST_ASSERT_EQ_I(eh.index_kind, 0);
+    TEST_ASSERT_EQ_I(eh.col_flags, 0);
+    PASS();
+}
+
+/* Spec "Writing the index": a child of a type the slot does not allow fails
+ * the SAVE with nyi naming the kind, the message reaches the caller's error
+ * slot with the "column %s:" prefix, and nothing is published or left. */
+static test_result_t test_save_nyi_names_kind(void) {
+    int64_t d[3] = { 1, 2, 3 };
+    ray_t* v = with_index(i64_vec(d, 3), ray_index_attach_part);
+    TEST_ASSERT_NOT_NULL(v);
+    ray_index_t* ix = ray_index_payload(v->index);
+    ray_t* keys = ix->u.part.keys;
+    ray_t* fake = ray_vec_new(RAY_STR, 3);
+    for (int i = 0; i < 3; i++) fake = ray_str_vec_append(fake, "k", 1);
+    ix->u.part.keys = fake;
+    const char* p = ray_test_tmp(IDX_TMP "/nyi");
+    ray_error_clear();
+    ray_err_t e = ray_col_save_gen(v, p, 2);
+    const char* m = ray_error_msg();
+    char msg[256]; snprintf(msg, sizeof msg, "%s", m ? m : "");
+    ix->u.part.keys = keys;
+    ray_release(fake); ray_release(v);
+    TEST_ASSERT_EQ_I(e, RAY_ERR_NYI);
+    TEST_ASSERT_FMT(strstr(msg, "PART") != NULL, "message: %s", msg);
+    char want[300]; snprintf(want, sizeof want, "column %s: index region:", p);
+    TEST_ASSERT_FMT(strncmp(msg, want, strlen(want)) == 0, "message: %s", msg);
+    FILE* f = fopen(p, "rb");                                 TEST_ASSERT_NULL(f);
+    f = fopen(ray_test_tmp(IDX_TMP "/nyi.tmp"), "rb");        TEST_ASSERT_NULL(f);
+    PASS();
+}
+
+/* An override kind never re-labels a region root: the file records the
+ * override and carries no region. */
+static test_result_t test_save_override_kind(void) {
+    int64_t d[3000];
+    for (int i = 0; i < 3000; i++) d[i] = (i * 13) % 211;
+    ray_t* v = with_index(i64_vec(d, 3000), ray_index_attach_sort);
+    TEST_ASSERT_NOT_NULL(v);
+    ray_col_write_t w; memset(&w, 0, sizeof w);
+    ray_t* err = ray_col_src_bind(v, &w.src);
+    TEST_ASSERT_NULL(err);
+    w.gen = 2; w.index_kind = RAY_IDX_CHUNK_ZONE;
+    ray_err_t e = ray_col_save_ctx(&w, ray_test_tmp(IDX_TMP "/o"));
+    ray_col_src_release(&w.src);
+    size_t rn; ray_enc_hdr_t eh;
+    uint8_t* r = ix_file_region(ray_test_tmp(IDX_TMP "/o"), &rn, &eh);
+    ray_release(v);
+    TEST_ASSERT_EQ_I(e, RAY_OK);
+    TEST_ASSERT_NULL(r);
+    TEST_ASSERT_EQ_I(eh.index_kind, RAY_IDX_CHUNK_ZONE);
+    PASS();
+}
+
+/* Golden index regions (spec "Golden fixtures": one per persisted kind).
+ * Compile with ENC_GOLDEN_KEEP to regenerate them into the fixture
+ * directory (relative to the repository root, where the tests run). */
+#define IDX_GOLDEN_DIR "test/data/enc"
+#ifdef ENC_GOLDEN_KEEP
+#  define IDX_GOLDEN_OUT IDX_GOLDEN_DIR
+#else
+#  define IDX_GOLDEN_OUT ray_test_tmp(IDX_TMP "/golden_emit")
+#endif
+static const char* const g_idx_golden[] = {
+    "idx_hash_i64", "idx_hash_str", "idx_hash_sym", "idx_sort_i32", "idx_bloom_i64",
+    "idx_part_i64", "idx_part_f64", "idx_part_sym", "idx_part_order", "idx_hash_unique", NULL,
+};
+
+/* SYM fixtures go through the column writer directly, like P1's golden_sym,
+ * so the saved count does not depend on the process symbol table. */
+static ray_err_t idx_golden_sym(const char* dir, const char* name, uint8_t kind) {
+    ray_t* v = ray_sym_vec_new(RAY_SYM_W8, 600);
+    if (!v || RAY_IS_ERR(v)) return RAY_ERR_OOM;
+    v->len = 600;
+    uint8_t* ids = (uint8_t*)ray_data(v);
+    for (int k = 0; k < 600; k++)
+        ids[k] = kind == RAY_IDX_PART ? (uint8_t)(1 + k / 100) : (uint8_t)(1 + (k * 7) % 40);
+    ray_t* iv = with_index(v, kind == RAY_IDX_PART ? ray_index_attach_part : ray_index_attach_hash);
+    if (!iv) return RAY_ERR_TYPE;
+    char path[512]; snprintf(path, sizeof path, "%s/%s.bin", dir, name);
+    FILE* f = fopen(path, "wb+");
+    if (!f) { ray_release(iv); return RAY_ERR_IO; }
+    ray_encw_t w;
+    ray_err_t e = ray_encw_begin(&w, f, RAY_SYM, RAY_SYM_W8, 600, 64, 0, 0);
+    ray_enc_idx_src_t s = { iv->index, RAY_SYM, RAY_SYM_W8, 600, NULL, 0 };
+    if (e == RAY_OK) { ray_encw_set_index(&w, &s); e = ray_encw_chunk(&w, ray_data(iv), NULL, 600); }
+    if (e == RAY_OK) e = ray_encw_finish(&w);
+    ray_encw_free(&w); fclose(f); ray_release(iv);
+    return e;
+}
+
+static const char* idx_golden_emit(const char* dir) {
+    static char why[256];
+    (void)ray_test_mkdir_p(dir);
+    char path[512];
+    #define GOLD(name, vec) do { ray_t* gv_ = (vec); snprintf(path, sizeof path, "%s/%s.bin", dir, name); \
+        ray_err_t ge_ = gv_ ? ray_col_save_gen(gv_, path, 2) : RAY_ERR_TYPE; \
+        if (gv_) ray_release(gv_); \
+        if (ge_ != RAY_OK) { snprintf(why, sizeof why, "%s: %d", name, (int)ge_); return why; } } while (0)
+    int64_t a[1000]; for (int i = 0; i < 1000; i++) a[i] = (i * 7919) % 317;
+    GOLD("idx_hash_i64", with_index(i64_vec(a, 1000), ray_index_attach_hash));
+    ray_t* s = ray_vec_new(RAY_STR, 300);
+    for (int i = 0; i < 300; i++) { char b[32]; int n = snprintf(b, sizeof b, "string key number %d", i % 23); s = ray_str_vec_append(s, b, (size_t)n); }
+    GOLD("idx_hash_str", with_index(s, ray_index_attach_hash));
+    int32_t c[700]; for (int i = 0; i < 700; i++) c[i] = (int32_t)((i * 31) % 499) - 250;
+    GOLD("idx_sort_i32", with_index(ray_vec_from_raw(RAY_I32, c, 700), ray_index_attach_sort));
+    GOLD("idx_bloom_i64", with_index(i64_vec(a, 1000), ray_index_attach_bloom));
+    int64_t p[1000]; for (int i = 0; i < 1000; i++) p[i] = i / 128 * 3;
+    GOLD("idx_part_i64", with_index(i64_vec(p, 1000), ray_index_attach_part));
+    double f[8] = { -2.5, -0.0, 0.0, 0.0, 1.5, 1.5, 3.0, 3.0 };
+    GOLD("idx_part_f64", with_index(ray_vec_from_raw(RAY_F64, f, 8), ray_index_attach_part));
+    ray_t* o = with_index(i64_vec(p, 1000), ray_index_attach_part);
+    if (o) ray_index_payload(o->index)->u.part.order_sym = ray_sym_intern("ts", 2);
+    GOLD("idx_part_order", o);
+    ray_t* u = with_index(i64_vec(a, 1000), ray_index_attach_hash);
+    if (u) ray_index_payload(u->index)->markers |= RAY_MARK_UNIQUE;
+    GOLD("idx_hash_unique", u);
+    #undef GOLD
+    if (idx_golden_sym(dir, "idx_hash_sym", RAY_IDX_HASH) != RAY_OK) return "idx_hash_sym";
+    if (idx_golden_sym(dir, "idx_part_sym", RAY_IDX_PART) != RAY_OK) return "idx_part_sym";
+    return NULL;
+}
+
+static test_result_t test_idx_golden_emit(void) {
+    const char* why = idx_golden_emit(IDX_GOLDEN_OUT);
+    TEST_ASSERT_FMT(why == NULL, "%s", why);
+    PASS();
+}
+
+static test_result_t test_idx_golden_match(void) {
+    const char* why = idx_golden_emit(ray_test_tmp(IDX_TMP "/golden"));
+    TEST_ASSERT_FMT(why == NULL, "%s", why);
+    for (int i = 0; g_idx_golden[i]; i++) {
+        char a[512], b[512];
+        snprintf(a, sizeof a, "%s/%s.bin", IDX_GOLDEN_DIR, g_idx_golden[i]);
+        snprintf(b, sizeof b, "%s/golden/%s.bin", ray_test_tmp(IDX_TMP), g_idx_golden[i]);
+        size_t na = 0, nb = 0; uint8_t* pa = ix_slurp(a, &na); uint8_t* pb = ix_slurp(b, &nb);
+        bool have = pa != NULL;
+        bool same = pa && pb && na == nb && memcmp(pa, pb, na) == 0;
+        free(pa); free(pb);
+        TEST_ASSERT_FMT(have, "missing fixture %s", a);
+        TEST_ASSERT_FMT(same, "%s differs from its fixture", g_idx_golden[i]);
+    }
+    PASS();
+}
+
 const test_entry_t encidx_entries[] = {
     { "idxval/write_hash_layout", test_write_hash_layout, ix_setup, ix_teardown },
     { "idxval/write_name_block",  test_write_name_block,  ix_setup, ix_teardown },
@@ -1602,5 +1812,11 @@ const test_entry_t encidx_entries[] = {
     { "idxval/parse_part_order_sym",    test_parse_part_order_sym,    ix_setup, ix_teardown },
     { "idxval/parse_oom_frees",         test_parse_oom_frees,         ix_setup, ix_teardown },
     { "idxval/parse_rejects_view",      test_parse_rejects_view,      ix_setup, ix_teardown },
+    { "idxval/file_has_region",         test_file_has_region,         ix_setup, ix_teardown },
+    { "idxval/unique_and_stale",        test_unique_and_stale,        ix_setup, ix_teardown },
+    { "idxval/save_nyi_names_kind",     test_save_nyi_names_kind,     ix_setup, ix_teardown },
+    { "idxval/save_override_kind",      test_save_override_kind,      ix_setup, ix_teardown },
+    { "idxval/golden_emit",             test_idx_golden_emit,         ix_setup, ix_teardown },
+    { "idxval/golden_match",            test_idx_golden_match,        ix_setup, ix_teardown },
     { NULL, NULL, NULL, NULL },
 };
