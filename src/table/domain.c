@@ -39,15 +39,34 @@
  * refcounts, appends, the lazily built reverse index and the runtime-id
  * LUT build. Bulk imports can hold it while growing a large dictionary;
  * contending workers sleep instead of spending CPU time spinning. The
- * two hot read paths are LOCK-FREE: ray_sym_domain_str reads the
+ * hot read paths are LOCK-FREE: ray_sym_domain_str reads the
  * atomically published (count, atoms) pair — appends publish a slot
- * write with a release store of the count, growth REPLACES the array
- * (old arrays are retired, never freed in place, so a stale pointer is
- * always valid memory covering every position < its publish count) —
- * and ray_sym_domain_runtime_lut reads an atomically published array
- * (invalidated and rebuilt across appends; retired likewise).  The
- * runtime singleton never touches the lock (immortal, delegates to
- * sym.c's own locking).
+ * write with a release store of the count, growth REPLACES the array —
+ * ray_sym_domain_raw_pin copies the published (map, offsets, count)
+ * record, and ray_sym_domain_runtime_lut reads an atomically published
+ * array (invalidated and rebuilt across appends).  The runtime singleton
+ * never touches the lock (immortal, delegates to sym.c's own locking).
+ *
+ * What happens to a REPLACED array, record or mapping depends on who can
+ * still be reading it:
+ *   - append paths (dom_append_locked, the batch commit): import workers
+ *     probe a snapshot outside the lock while another worker commits, so
+ *     the old one is RETIRED (dom_retire) and freed with the domain; a
+ *     stale pointer is always valid memory covering every position below
+ *     its publish count.
+ *   - external extend (dom_extend_from_file_locked: the symfile grew under
+ *     another process, reopened on a cache hit): FREED at once
+ *     (dom_drop_locked), unless a batch intern is in flight, then retired.
+ *     Safe because a reopen runs under the lock on the calling thread
+ *     between kernels: the pool is fork-join (the main thread is worker 0,
+ *     a dispatch drains before it returns), the IPC loop is one thread,
+ *     every reopen site runs before a dispatch, and the one lock-free
+ *     reader that outlives a lock release — the batch probe — is counted
+ *     in batch_inflight.  Retiring here too was #717: a replica reopening
+ *     on a timer never drops its last reference, so every reopen leaked a
+ *     generation.  The contract this rests on is in domain.h at
+ *     ray_sym_domain_raw_pin: no pin across a reopen, no reopen under a
+ *     running kernel.
  */
 
 #if defined(__APPLE__)
@@ -171,9 +190,9 @@ struct ray_sym_domain_s {
     size_t*   offsets;
     /* Published raw snapshot (see ray_sym_domain_raw_pin): map, offsets and
      * the file-prefix count as one immutable record.  Replaced whole on
-     * extend; the previous record, its offsets and its mapping are retired
-     * (retired / retired_maps) rather than freed, so a reader holding the
-     * old snapshot stays valid until the domain is destroyed. */
+     * extend; the previous record, its offsets and its mapping are freed
+     * then, or retired (retired / retired_maps) while a batch intern is
+     * probing outside the lock — see the concurrency note above. */
     _Atomic(struct dom_raw_snap_s*) raw_snap;
     struct dom_retired_map_s* retired_maps;
 
@@ -191,11 +210,11 @@ struct ray_sym_domain_s {
     uint64_t* buckets;
     uint64_t  bucket_mask; /* cap - 1; 0 = not built yet */
     /* Batch interns currently probing a snapshot of `buckets` outside the
-     * lock (guarded by g_dom_lock).  While non-zero a replaced table is
-     * retired instead of freed. */
+     * lock (guarded by g_dom_lock).  While non-zero, whatever an extend
+     * or an index rebuild replaces is retired instead of freed. */
     int32_t   batch_inflight;
 
-    dom_retired_t* retired; /* replaced atom arrays + old LUTs */
+    dom_retired_t* retired; /* replaced atom arrays, offsets, snapshot records, LUTs */
 
     struct ray_symimp_s* imp; /* DOM_IMPORT: the import dictionary */
 
