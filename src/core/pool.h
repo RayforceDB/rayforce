@@ -197,12 +197,20 @@ void ray_pool_free(ray_pool_t* pool);
  * walks its own slice in order and then takes chunks cut from the END of
  * other workers' slices; with the shared cursor tasks start in index order
  * but still finish in any order).  Callers may rely only on (a) each task
- * running exactly once, (b) a task's identity — its [start, end) or index —
- * which is what results must be placed by, and (c) everything being done
- * when the dispatch returns.  Anything that stops early ("first N", a
- * cutoff, a bound) must be sound whatever the order: derive it from row
- * positions or values, never from "the tasks before this one have run"
- * (see ray_fused_take_select in fused_topk.c for the pattern). */
+ * running at most once, and exactly once unless the dispatch was
+ * cancelled, (b) a task's identity — its [start, end) or index — which is
+ * what results must be placed by, and (c) everything that ran being done
+ * when the dispatch returns.  A cancel (ray_request_interrupt, or the
+ * pool's cancelled flag) makes the dispatch skip every task that has not
+ * started and return normally; a task that has started runs to its end.
+ * A caller whose outputs need every task must check ray_interrupted() and
+ * the pool's cancelled flag after the dispatch before consuming them, and
+ * either give up or run the skipped tasks itself (see
+ * ray_sym_domain_intern_batch in table/domain.c).  Anything that stops
+ * early ("first N", a cutoff, a bound) must be sound whatever the order:
+ * derive it from row positions or values, never from "the tasks before
+ * this one have run" (see ray_fused_take_select in fused_topk.c for the
+ * pattern). */
 
 /* Dispatch fn over [0, total_elems) partitioned into morsel-sized tasks.
  * Blocks until all tasks complete. Main thread participates as worker 0. */

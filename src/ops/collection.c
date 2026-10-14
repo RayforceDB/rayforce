@@ -1259,18 +1259,19 @@ ray_t* distinct_vec_eager(ray_t* x) {
     return result;
 }
 
-static ray_t* parted_to_flat_vec(ray_t* x) {
+/* `cnt`/`ncnt` are the partition row counts of the column's table (NULL
+ * when the column is met on its own): a NULL segment, a partition without
+ * the column, then yields its rows as the type's null. */
+static ray_t* parted_to_flat_vec_c(ray_t* x, const int64_t* cnt, int64_t ncnt) {
     if (!x || !RAY_IS_PARTED(x->type)) return ray_error("type", NULL);
     int8_t base = (int8_t)RAY_PARTED_BASETYPE(x->type);
     ray_t** segs = (ray_t**)ray_data(x);
-    int64_t total = 0;
-    for (int64_t s = 0; s < x->len; s++)
-        if (segs[s]) total += segs[s]->len;
+    int64_t total = parted_rows_counted(x, cnt, ncnt);
 
     /* RAY_LIST: share (retain) elements — ray_vec_new rejects type 0 and
      * the per-cell copy below has no notion of nested elements. */
     if (base == RAY_LIST)
-        return parted_flatten_list(segs, x->len, total);
+        return parted_flatten_list_c(segs, x->len, cnt, ncnt);
 
     ray_t* out = ray_vec_new(base, base == RAY_STR ? 0 : total);
     if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
@@ -1279,7 +1280,20 @@ static ray_t* parted_to_flat_vec(ray_t* x) {
     int64_t pos = 0;
     for (int64_t s = 0; s < x->len; s++) {
         ray_t* seg = segs[s];
-        if (!seg) continue;
+        if (!seg) {
+            int64_t n = parted_seg_rows(segs, s, cnt, ncnt);
+            if (base == RAY_STR) {
+                for (int64_t i = 0; i < n; i++) {
+                    out = ray_str_vec_append(out, "", 0);
+                    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+                    ray_vec_set_null(out, pos++, true);
+                }
+            } else {
+                parted_fill_nulls(out, pos, n);
+                pos += n;
+            }
+            continue;
+        }
         for (int64_t i = 0; i < seg->len; i++) {
             if (base == RAY_STR) {
                 size_t slen = 0;
@@ -1301,6 +1315,10 @@ static ray_t* parted_to_flat_vec(ray_t* x) {
         }
     }
     return out;
+}
+
+static ray_t* parted_to_flat_vec(ray_t* x) {
+    return parted_to_flat_vec_c(x, NULL, 0);
 }
 
 /* (distinct x) — remove duplicates. Dispatches on type:
@@ -2648,7 +2666,11 @@ ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
     if (vec->type == RAY_TABLE && idx->type == -RAY_SYM) {
         ray_t* col = ray_table_get_col(vec, idx->i64);
         if (!col) return ray_error("domain", "at: unknown table column");
-        if (RAY_IS_PARTED(col->type)) return parted_to_flat_vec(col);
+        if (RAY_IS_PARTED(col->type)) {
+            int64_t ncnt = 0;
+            const int64_t* cnt = parted_table_counts(vec, &ncnt);
+            return parted_to_flat_vec_c(col, cnt, ncnt);
+        }
         if (col->type == RAY_MAPCOMMON) return materialize_mapcommon(col);
         ray_retain(col);
         return col;
