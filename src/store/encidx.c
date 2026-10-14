@@ -25,7 +25,6 @@
 #include "ops/idxop.h"
 #include "table/sym.h"
 #include "lang/format.h"
-#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -84,7 +83,8 @@ static bool ei_layout(int n, const uint64_t* bytes, uint32_t name_len, ei_layout
 typedef enum {
     EI_RULE_OK = 0,
     EI_RULE_HASH_NG, EI_RULE_HASH_NK, EI_RULE_HASH_POW2, EI_RULE_HASH_FULL, EI_RULE_HASH_BIG,
-    EI_RULE_BLOOM_POW2, EI_RULE_BLOOM_K, EI_RULE_BLOOM_NK,
+    EI_RULE_HASH_CAP,
+    EI_RULE_BLOOM_POW2, EI_RULE_BLOOM_K, EI_RULE_BLOOM_NK, EI_RULE_BLOOM_M,
     EI_RULE_PART_NP, EI_RULE_LEN,
 } ei_rule_t;
 
@@ -95,9 +95,11 @@ static const char* ei_rule_text(ei_rule_t r) {
     case EI_RULE_HASH_POW2:  return "HASH bucket count is not a power of two";
     case EI_RULE_HASH_FULL:  return "HASH table has no empty bucket";
     case EI_RULE_HASH_BIG:   return "HASH table too large";
+    case EI_RULE_HASH_CAP:   return "HASH bucket count is not the builder's for n_groups";
     case EI_RULE_BLOOM_POW2: return "BLOOM bit count is not a power of two of at least 8";
     case EI_RULE_BLOOM_K:    return "BLOOM k outside 1 .. the builder's maximum";
     case EI_RULE_BLOOM_NK:   return "BLOOM n_keys negative or above the column's rows";
+    case EI_RULE_BLOOM_M:    return "BLOOM bit count is not the builder's for n_keys";
     case EI_RULE_PART_NP:    return "PART n_parts outside 1 .. rows (0 only with no rows)";
     case EI_RULE_LEN:        return "negative row count";
     default:                 return "";
@@ -107,6 +109,25 @@ static const char* ei_rule_text(ei_rule_t r) {
 /* At most 2^59 buckets (2^62 bytes, past any region): cap * 8 never wraps. */
 #define EI_HASH_CAP_MAX ((uint64_t)1 << 59)
 
+/* The builders' sizes (src/ops/idxop.c: attach_hash_impl, hash_build_par
+ * and ray_index_hash_carry_append size the bucket table by distinct keys;
+ * ray_index_attach_bloom sizes the bits by non-null rows):
+ *   HASH  mask + 1   = 8 when n_groups < 4, else next_pow2(2 * n_groups);
+ *   BLOOM m_mask + 1 = 64 when n_keys < 8, else next_pow2(8 * n_keys).
+ * Callers bound the count first (n_groups < cap <= EI_HASH_CAP_MAX;
+ * n_keys <= 2^56). */
+static uint64_t ei_pow2_at_least(uint64_t x) {
+    uint64_t p = 1;
+    while (p < x) p <<= 1;
+    return p;
+}
+static uint64_t ei_hash_cap_for(int64_t ng) {
+    return ng < 4 ? 8 : ei_pow2_at_least(2 * (uint64_t)ng);
+}
+static uint64_t ei_bloom_bits_for(int64_t nk) {
+    return nk < 8 ? 64 : ei_pow2_at_least(8 * (uint64_t)nk);
+}
+
 static ei_rule_t ei_hash_rule(int64_t ng, int64_t nk, uint64_t mask, int64_t len) {
     if (len < 0) return EI_RULE_LEN;
     if (ng < 0 || ng > nk) return EI_RULE_HASH_NG;
@@ -115,6 +136,7 @@ static ei_rule_t ei_hash_rule(int64_t ng, int64_t nk, uint64_t mask, int64_t len
     if (cap == 0 || (cap & (cap - 1))) return EI_RULE_HASH_POW2;
     if (cap <= (uint64_t)ng) return EI_RULE_HASH_FULL;
     if (cap > EI_HASH_CAP_MAX) return EI_RULE_HASH_BIG;
+    if (cap != ei_hash_cap_for(ng)) return EI_RULE_HASH_CAP;   /* ng < cap <= 2^59 */
     return EI_RULE_OK;
 }
 static ei_rule_t ei_bloom_rule(uint64_t m_mask, uint32_t k, int64_t nk, int64_t len) {
@@ -123,6 +145,8 @@ static ei_rule_t ei_bloom_rule(uint64_t m_mask, uint32_t k, int64_t nk, int64_t 
     if (m < 8 || (m & (m - 1))) return EI_RULE_BLOOM_POW2;
     if (k < 1 || k > RAY_ENC_IDX_BLOOM_K_MAX) return EI_RULE_BLOOM_K;
     if (nk < 0 || nk > len) return EI_RULE_BLOOM_NK;
+    /* past 2^56 keys the bits pass 2^59 bytes: no region holds them */
+    if (nk > ((int64_t)1 << 56) || m != ei_bloom_bits_for(nk)) return EI_RULE_BLOOM_M;
     return EI_RULE_OK;
 }
 static ei_rule_t ei_part_rule(int64_t np, int64_t len) {
@@ -179,8 +203,11 @@ ray_t* ray_enc_index_write(FILE* f, const ray_enc_idx_src_t* s, uint64_t* bytes)
     const ray_t* ch[4] = { NULL, NULL, NULL, NULL };
     uint64_t cb[4] = { 0, 0, 0, 0 };
     int nch = 0;
-    uint32_t nlen = (s->order_name && s->order_len >= 1 && s->order_len <= RAY_ENC_IDX_NAME_MAX)
-                    ? s->order_len : 0;
+    /* Only HASH and PART carry order_name; a name the validator would
+     * refuse (empty, too long, holding a NUL) is written as -1. */
+    uint32_t nlen = ((kind == RAY_IDX_HASH || kind == RAY_IDX_PART) && s->order_name &&
+                     s->order_len >= 1 && s->order_len <= RAY_ENC_IDX_NAME_MAX &&
+                     !memchr(s->order_name, 0, s->order_len)) ? s->order_len : 0;
     int kesz = 0;
     switch (kind) {
     case RAY_IDX_HASH: {
@@ -315,9 +342,29 @@ static int64_t ev_key_int(const uint8_t* p, int8_t t, int64_t i) {
     default: return ev_at(p, i);
     }
 }
-static double ev_key_f(const uint8_t* p, int8_t t, int64_t i) {
-    if (t == RAY_F32) { float x; memcpy(&x, p + i * 4, 4); return (double)x; }
-    double x; memcpy(&x, p + i * 8, 8); return x;
+/* F32 / F64 key i decoded from its bits.  Floating values are never
+ * compared here: release builds use -fno-signed-zeros, under which a
+ * test of a zero's sign, or a compare against zero, may be folded away.
+ * ord orders every non-NaN value numerically with both zeros equal. */
+typedef struct { bool nan, zero, neg; uint64_t ord; } ev_fkey_t;
+static ev_fkey_t ev_key_f(const uint8_t* p, int8_t t, int64_t i) {
+    uint64_t mag, expo, frac;
+    bool neg;
+    if (t == RAY_F32) {
+        uint32_t x; memcpy(&x, p + i * 4, 4);
+        neg = x >> 31; mag = x & 0x7FFFFFFFu; expo = mag >> 23; frac = mag & 0x7FFFFFu;
+        if (expo != 0xFF) frac = 0;
+        expo = expo == 0xFF;
+    } else {
+        uint64_t x; memcpy(&x, p + i * 8, 8);
+        neg = x >> 63; mag = x & 0x7FFFFFFFFFFFFFFFull; expo = mag >> 52; frac = mag & 0xFFFFFFFFFFFFFull;
+        if (expo != 0x7FF) frac = 0;
+        expo = expo == 0x7FF;
+    }
+    ev_fkey_t k = { expo && frac, mag == 0, neg, 0 };
+    uint64_t mid = (uint64_t)1 << 63;
+    k.ord = neg ? mid - mag : mid + mag;              /* both zeros: mid */
+    return k;
 }
 /* SYM PART key i at the column's width class (esz bytes, zero-extended). */
 static int64_t ev_key_sym(const uint8_t* p, int esz, int64_t i) {
@@ -420,6 +467,7 @@ ray_t* ray_enc_index_validate(const uint8_t* b, uint64_t size, uint8_t kind,
         if (nlen < 1 || nlen > RAY_ENC_IDX_NAME_MAX) EV("column %s: index name block length %u", path, nlen);
         if (rsv) EV("column %s: index name block reserved field set", path);
         if (size - no - 8 < nlen) EV("column %s: index name block outside the region", path);
+        if (memchr(b + no + 8, 0, nlen)) EV("column %s: index name holds a NUL byte", path);
     }
     if (!ei_layout(nch, cb, nlen, &L)) EV("column %s: index children outside the region", path);
     for (int i = 0; i < nch; i++)
@@ -465,27 +513,47 @@ ray_t* ray_enc_index_validate(const uint8_t* b, uint64_t size, uint8_t kind,
             }
         }
         if (seen != ng) EV("column %s: index HASH %lld of %lld groups have a bucket", path, (long long)seen, (long long)ng);
-        /* The probe walks at most cap buckets: cap > ng, so an empty one ends it. */
         for (int64_t g = 0; g < ng; g++) {
             int64_t kw = ev_at(gk, g);
             if (pt == RAY_SYM && (kw < 1 || (uint64_t)kw >= sym_bound))
                 EV("column %s: index HASH SYM key %lld outside the symbol domain", path, (long long)kw);
-            uint64_t s = ray_index_mix64((uint64_t)kw) & h->mask;
-            bool found = false;
-            for (uint64_t step = 0; step < cap; step++, s = (s + 1) & h->mask) {
-                int64_t t = ev_at(tbl, (int64_t)s);
-                if (t == 0) break;
-                if (pt == RAY_STR) { if (t - 1 == g) { found = true; break; } }
-                else if (ev_at(gk, t - 1) == kw) {
-                    if (t - 1 != g)
-                        EV("column %s: index HASH lookup of group %lld finds group %lld", path, (long long)g, (long long)(t - 1));
-                    found = true; break;
+        }
+        /* Reachability in one O(cap) walk, on any input.  cap > ng leaves an
+         * empty bucket e0; walking from it, run is the position of bucket p
+         * in its cluster (0 for the first bucket after an empty one).  The
+         * group in bucket p, home h = mix64(gkeys[g]) & mask, is met by a
+         * probe from h without crossing an empty bucket iff
+         * (p - h) & mask <= run. */
+        {
+            uint64_t e0 = 0;
+            while (ev_at(tbl, (int64_t)e0) != 0) e0++;           /* seen == ng < cap */
+            uint64_t run = 0;
+            bool in_run = false;
+            for (uint64_t j = 1; j <= cap; j++) {
+                uint64_t p = (e0 + j) & h->mask;
+                int64_t t = ev_at(tbl, (int64_t)p);
+                if (!t) { in_run = false; continue; }
+                run = in_run ? run + 1 : 0;
+                in_run = true;
+                int64_t g = t - 1;
+                uint64_t home = ray_index_mix64((uint64_t)ev_at(gk, g)) & h->mask;
+                if (((p - home) & h->mask) > run) {
+                    if (pt == RAY_STR) EV("column %s: index HASH STR group %lld unreachable from its word", path, (long long)g);
+                    EV("column %s: index HASH lookup of group %lld finds nothing", path, (long long)g);
                 }
             }
-            if (!found) {
-                if (pt == RAY_STR) EV("column %s: index HASH STR group %lld unreachable from its word", path, (long long)g);
-                EV("column %s: index HASH lookup of group %lld finds nothing", path, (long long)g);
-            }
+        }
+        /* Numeric, temporal and SYM: distinct gkeys (a sorted copy), so the
+         * probe that reaches group g meets no other group of its key first
+         * and the lookup returns g.  STR words may repeat. */
+        if (pt != RAY_STR && ng > 1) {
+            hs = ray_alloc_raw((size_t)ng * sizeof(int64_t));    /* ng <= size / 8 */
+            if (!hs) EV_OOM();
+            memcpy(hs, gk, (size_t)ng * sizeof(int64_t));
+            qsort(hs, (size_t)ng, sizeof(int64_t), ev_cmp_i64);
+            for (int64_t i = 1; i < ng; i++)
+                if (hs[i] == hs[i - 1]) EV("column %s: index HASH lookup of key %lld finds two groups", path, (long long)hs[i]);
+            ray_free_raw(hs); hs = NULL;
         }
         if (ev_at(of, 0) != 0 || ev_at(of, ng) != nk) EV("column %s: index HASH offs bounds", path);
         for (int64_t g = 0; g < ng; g++)
@@ -547,30 +615,27 @@ ray_t* ray_enc_index_validate(const uint8_t* b, uint64_t size, uint8_t kind,
         if (sum != len) EV("column %s: index PART lens sum %lld, column has %lld rows", path, (long long)sum, (long long)len);
         if (pt == RAY_F32 || pt == RAY_F64) {
             for (int64_t i = 0; i < np; i++) {
-                double k = ev_key_f(kp, pt, i);
-                if (k != k) EV("column %s: index PART key %lld is NaN", path, (long long)i);
-                if (i && !(ev_key_f(kp, pt, i - 1) < k)) EV("column %s: index PART float keys do not strictly increase", path);
+                ev_fkey_t k = ev_key_f(kp, pt, i);
+                if (k.nan) EV("column %s: index PART key %lld is NaN", path, (long long)i);
+                if (i && !(ev_key_f(kp, pt, i - 1).ord < k.ord))
+                    EV("column %s: index PART float keys do not strictly increase", path);
                 /* starts[i] < len: lens are positive and sum to len */
-                if (k == 0.0 && col_data && signbit(k) != signbit(ev_key_f(col_data, pt, ev_at(st, i))))
+                if (k.zero && col_data && k.neg != ev_key_f(col_data, pt, ev_at(st, i)).neg)
                     EV("column %s: index PART zero key sign differs from its block's first row", path);
             }
         } else if (pt == RAY_SYM) {
-            uint64_t cap = 16;
-            while (cap < 2 * (uint64_t)np) cap <<= 1;                /* np <= size / 8 */
-            hs = ray_alloc_raw((size_t)cap * sizeof(int64_t));
+            /* distinct: a sorted copy, O(np log np) on any input */
+            hs = ray_alloc_raw((size_t)(np > 0 ? np : 1) * sizeof(int64_t));   /* np <= size / 8 */
             if (!hs) EV_OOM();
-            for (uint64_t i = 0; i < cap; i++) hs[i] = -1;
             for (int64_t i = 0; i < np; i++) {
                 int64_t k = ev_key_sym(kp, kesz, i);
                 if (k < 1 || (uint64_t)k >= sym_bound)
                     EV("column %s: index PART SYM key %lld outside the symbol domain", path, (long long)k);
-                uint64_t s = ray_index_mix64((uint64_t)k) & (cap - 1);
-                while (hs[s] != -1) {
-                    if (hs[s] == k) EV("column %s: index PART SYM keys not distinct", path);
-                    s = (s + 1) & (cap - 1);
-                }
-                hs[s] = k;
+                hs[i] = k;
             }
+            qsort(hs, (size_t)np, sizeof(int64_t), ev_cmp_i64);
+            for (int64_t i = 1; i < np; i++)
+                if (hs[i] == hs[i - 1]) EV("column %s: index PART SYM keys not distinct", path);
         } else {
             for (int64_t i = 1; i < np; i++)
                 if (!(ev_key_int(kp, pt, i - 1) < ev_key_int(kp, pt, i)))

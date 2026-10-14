@@ -365,6 +365,20 @@ static test_result_t test_no_p3_markers(void) {
     PASS();
 }
 
+/* The index-region validator and writer decide float rules on bits:
+ * release builds use -fno-signed-zeros, under which a zero's sign test
+ * or a compare against zero may fold away (P4 Task 3 review). */
+static test_result_t test_encidx_float_bits(void) {
+    struct stat st;
+    const char* root = stat("src/store/encidx.c", &st) == 0 ? "." : "..";
+    char p[128]; snprintf(p, sizeof p, "%s/src/store/encidx.c", root);
+    static const char* const needles[] = { "signbit", "double", "isnan", "fpclassify", "0.0", NULL };
+    TEST_ASSERT_TRUE(stat(p, &st) == 0);
+    int ln = first_hit(p, needles);
+    TEST_ASSERT_FMT(ln == 0, "src/store/encidx.c:%d compares floating values", ln);
+    PASS();
+}
+
 const test_entry_t srccheck_entries[] = {
     { "srccheck/no_legacy_getters", test_no_legacy_getters, NULL, NULL },
     { "srccheck/no_raw_column_list",  test_no_raw_column_list,  NULL, NULL },
@@ -376,5 +390,6 @@ const test_entry_t srccheck_entries[] = {
     { "srccheck/no_table_decode_or_return",  test_no_table_decode_or_return,  NULL, NULL },
     { "srccheck/firstn_reads_by_range",      test_firstn_reads_by_range,      NULL, NULL },
     { "srccheck/no_p3_markers",              test_no_p3_markers,              NULL, NULL },
+    { "srccheck/encidx_float_bits",          test_encidx_float_bits,          NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
