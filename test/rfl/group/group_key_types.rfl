@@ -225,6 +225,27 @@
 (at (select {c: (last (trim " a")) from: TSa by: s}) 'c) -- ["a" "a" "a"]
 (at (select {c: (first "zz") from: TSa}) 'c) -- ["zz"]
 
+;; A null atom as an aggregate input is null in every row.  The broadcast
+;; copied its sentinel without setting HAS_NULLS, so no null skip fired:
+;; (avg 0Nl) averaged INT64_MIN per group and wsum summed it.  Keyless, the
+;; SUM/AVG constant fold read 0Nl as INT64_MIN the same way.  Oracle: the same
+;; aggregate over a real all-null column z.
+(set TNa (table [w y z] (list (% (til 70) 7) (as 'F64 (til 70)) (take 0Nl 70))))
+(at (select {s: (avg 0Nl) from: TNa by: w}) 's) -- [0Nf 0Nf 0Nf 0Nf 0Nf 0Nf 0Nf]
+(at (select {s: (avg 0Nl) from: TNa by: w}) 's) -- (at (select {s: (avg z) from: TNa by: w}) 's)
+(at (select {s: (wsum 0Nl y) from: TNa by: w}) 's) -- [0.0 0.0 0.0 0.0 0.0 0.0 0.0]
+(at (select {s: (wsum 0Nl y) from: TNa by: w}) 's) -- (at (select {s: (wsum z y) from: TNa by: w}) 's)
+(at (select {s: (wsum y 0Nl) from: TNa by: w}) 's) -- (at (select {s: (wsum y z) from: TNa by: w}) 's)
+(at (select {s: (wavg y 0Nl) from: TNa by: w}) 's) -- (at (select {s: (wavg y z) from: TNa by: w}) 's)
+(at (select {s: (avg 0Nf) from: TNa by: w}) 's) -- [0Nf 0Nf 0Nf 0Nf 0Nf 0Nf 0Nf]
+(at (select {s: (min 0Nl) from: TNa by: w}) 's) -- (at (select {s: (min z) from: TNa by: w}) 's)
+(at (select {s: (var 0Nl) from: TNa by: w}) 's) -- [0Nf 0Nf 0Nf 0Nf 0Nf 0Nf 0Nf]
+(at (select {s: (avg 0Ni) from: TNa by: w}) 's) -- [0Nf 0Nf 0Nf 0Nf 0Nf 0Nf 0Nf]
+(at (select {s: (avg 0Nl) from: TNa}) 's) -- [0Nf]
+(at (select {s: (avg (+ y 0Nl)) from: TNa}) 's) -- [0Nf]
+(at (select {s: (avg (* 2 0Nl)) from: TNa}) 's) -- [0Nf]
+(at (select {s: (wsum 0Nl y) from: TNa}) 's) -- [0.0]
+
 ;; I64 key spanning more than INT64_MAX: the dense-array min/max prescan
 ;; (minmax_scan_fn) checked its span budget as kmax - kmin in i64, which
 ;; overflowed (UBSan abort) once one batch had seen both extremes.
