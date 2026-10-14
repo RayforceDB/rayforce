@@ -472,8 +472,30 @@ static void compile_list(compiler_t *c, ray_t *ast) {
          * which is what keeps nested `times` counters apart.
          *
          * As with `while`, compiling the body inline is what keeps
-         * `return` unwinding the enclosing lambda from inside the loop. */
+         * `return` unwinding the enclosing lambda from inside the loop.
+         *
+         * The indexed form, (times [i n] body...), keeps the normalized
+         * bound in a second hidden slot and stores bound - counter into
+         * i's slot at the top of each pass, so the index comes from the
+         * loop, never from i, and a body that rebinds i cannot steer it. */
         if (sym_id == sf_times && n >= 2) {
+            int64_t iname = -1;
+            ray_t *cexpr = elems[1];
+            int32_t islot = -1, lslot = -1, idx_idx = -1;
+            if (ray_times_binding(elems[1], &iname, &cexpr)) {
+                if (ray_sym_is_reserved(iname) && !ray_sym_is_ipc_hook(iname)) {
+                    c->error = true;
+                    return;
+                }
+                ray_t *idx_fn = ray_fn_binary("times idx", RAY_FN_NONE, ray_times_idx_fn);
+                if (!idx_fn || RAY_IS_ERR(idx_fn)) { c->error = true; return; }
+                idx_idx = add_constant(c, idx_fn);
+                ray_release(idx_fn);
+                islot = find_local(c, iname);
+                if (islot < 0) islot = add_local(c, iname);
+                lslot = add_local(c, ray_sym_intern("times lim", 9));
+                if (islot < 0 || lslot < 0 || c->error) { c->error = true; return; }
+            }
             ray_t *norm_fn = ray_fn_unary("times norm", RAY_FN_NONE, ray_times_norm_fn);
             ray_t *dec_fn  = ray_fn_unary("times dec",  RAY_FN_NONE, ray_times_dec_fn);
             if (!norm_fn || RAY_IS_ERR(norm_fn) || !dec_fn || RAY_IS_ERR(dec_fn)) {
@@ -489,10 +511,15 @@ static void compile_list(compiler_t *c, ray_t *ast) {
             int32_t cslot = add_local(c, ray_sym_intern("times ctr", 9));
             if (cslot < 0 || c->error) { c->error = true; return; }
 
-            /* counter = normalize(<count>) */
+            /* counter = normalize(<count>), and bound = counter if indexed */
             emit_const(c, norm_idx);
-            compile_expr(c, elems[1]);
+            compile_expr(c, cexpr);
             emit(c, OP_CALL1);
+            if (lslot >= 0) {
+                emit(c, OP_DUP);
+                emit(c, OP_STOREENV);
+                emit(c, (uint8_t)lslot);
+            }
             emit(c, OP_STOREENV);
             emit(c, (uint8_t)cslot);
 
@@ -500,6 +527,17 @@ static void compile_list(compiler_t *c, ray_t *ast) {
             emit(c, OP_LOADENV);
             emit(c, (uint8_t)cslot);
             int32_t jmpf_pos = emit_jump(c, OP_JMPF);
+            /* i = bound - counter */
+            if (islot >= 0) {
+                emit_const(c, idx_idx);
+                emit(c, OP_LOADENV);
+                emit(c, (uint8_t)lslot);
+                emit(c, OP_LOADENV);
+                emit(c, (uint8_t)cslot);
+                emit(c, OP_CALL2);
+                emit(c, OP_STOREENV);
+                emit(c, (uint8_t)islot);
+            }
             for (int64_t i = 2; i < n; i++) {
                 compile_expr(c, elems[i]);
                 emit(c, OP_POP);

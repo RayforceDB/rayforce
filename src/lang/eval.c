@@ -2162,8 +2162,34 @@ ray_t* ray_times_dec_fn(ray_t* x) {
     return make_i64(as_i64(x) - 1);
 }
 
+/* The index of the pass about to run, from the normalized bound and the
+ * passes still to go (counter > 0 when this is called). */
+ray_t* ray_times_idx_fn(ray_t* lim, ray_t* ctr) {
+    return make_i64(as_i64(lim) - as_i64(ctr));
+}
+
+/* If `ast` is the binding of an indexed `times`, as the parser builds it
+ * from [name count], fill the name's sym and the count expression. */
+bool ray_times_binding(ray_t* ast, int64_t* name, ray_t** count) {
+    if (!ast || ast->type != RAY_LIST || ast->len != 3) return false;
+    ray_t** e = (ray_t**)ray_data(ast);
+    if (!e[0] || e[0]->type != -RAY_SYM || (e[0]->attrs & ATTR_QUOTED) ||
+        e[0]->i64 != ray_sym_intern(RAY_TIMES_BIND, sizeof(RAY_TIMES_BIND) - 1))
+        return false;
+    if (!e[1] || e[1]->type != -RAY_SYM) return false;
+    *name = e[1]->i64;
+    *count = e[2];
+    return true;
+}
+
 /* (times n body...) — evaluate the body exactly n times.  Receives
  * unevaluated args.  Always returns null, like `while`.
+ *
+ * (times [i n] body...) also binds i to 0, 1, ..., n-1, one per pass.
+ * The name is bound like a `let`, in the current frame, and stays bound
+ * after the loop to the last index (untouched when no pass runs).  The
+ * index is assigned at the top of each pass from the loop's own counter,
+ * so a body that rebinds i changes it for the rest of that pass only.
  *
  * `n` is evaluated ONCE, up front: the count is a bound fixed on entry,
  * so a body that mutates whatever produced it cannot change how many
@@ -2178,7 +2204,12 @@ ray_t* ray_times_dec_fn(ray_t* x) {
  * The compiled form is emitted by the bytecode compiler — see compile.c. */
 ray_t* ray_times_fn(ray_t** args, int64_t n) {
     if (n < 1) return ray_error("domain", "times: expected at least 1 arg (count), got %lld", (long long)n);
-    ray_t* cnt = ray_eval(args[0]);
+    int64_t name = -1;
+    ray_t* cexpr = args[0];
+    if (ray_times_binding(args[0], &name, &cexpr) &&
+        ray_sym_is_reserved(name) && !ray_sym_is_ipc_hook(name))
+        return ray_error(ray_err_code_str(RAY_ERR_RESERVED), NULL);
+    ray_t* cnt = ray_eval(cexpr);
     if (RAY_IS_ERR(cnt)) return cnt;
     if (ray_is_lazy(cnt))
         cnt = ray_lazy_materialize(cnt);
@@ -2189,6 +2220,13 @@ ray_t* ray_times_fn(ray_t** args, int64_t n) {
     ray_release(cnt);
     if (bad) return err;
     for (int64_t r = 0; r < reps; r++) {
+        if (name >= 0) {
+            ray_t* idx = make_i64(r);
+            if (RAY_IS_ERR(idx)) return idx;
+            ray_err_t e = ray_env_set_local_rows(name, idx, 0);
+            ray_release(idx);
+            if (e != RAY_OK) return ray_error(ray_err_code_str(e), NULL);
+        }
         for (int64_t i = 1; i < n; i++) {
             ray_t* val = ray_eval(args[i]);
             if (RAY_IS_ERR(val)) return val;
