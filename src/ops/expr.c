@@ -137,6 +137,11 @@ static bool eval_const_numeric_expr(ray_graph_t* g, ray_op_t* op,
     if (op->opcode == OP_CONST) {
         ray_op_ext_t* ext = find_ext(g, op->id);
         if (!ext || !ext->literal) return false;
+        /* A null constant has no numeric value: atom_to_numeric would hand
+         * back its sentinel (INT64_MIN for 0Nl) and the SUM/AVG linear and
+         * affine folds would sum it per row.  Decline, as expr_compile does,
+         * so the null-aware path evaluates it. */
+        if (RAY_ATOM_IS_NULL(ext->literal)) return false;
         return atom_to_numeric(ext->literal, out_f, out_i, out_is_f64);
     }
 

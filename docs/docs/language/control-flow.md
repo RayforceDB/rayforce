@@ -18,6 +18,21 @@ Without an else branch, `if` returns `0`:
 0
 ```
 
+More condition/result pairs chain: conditions are tested in order, the
+result paired with the first truthy one is evaluated, and an odd trailing
+argument is the fallback. Conditions after the first truthy one, and every
+other result, are never evaluated:
+
+```lisp
+‣ (set classify (fn [x] (if (> x 100) "high" (> x 50) "mid" "low")))
+‣ (classify 60)
+"mid"
+‣ (if false 1 false 2)
+0
+```
+
+Inside a query (a projection, `where:`, a `by:` key), a chain with a fallback is evaluated row by row like the three-argument form, and a text literal in it becomes a symbol cell; a chain without a fallback is left to the evaluator.
+
 ## Sequential Evaluation: do
 
 `do` evaluates expressions in order and returns the last result. `let` bindings inside `do` are scoped to that block:
