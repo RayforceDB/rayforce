@@ -362,8 +362,8 @@ Every `.`-prefixed name is protected: `set`, `let`, lambda parameters, and `del`
   (raise "oops")     ; throws an error
   (fn [e] "caught")) ; handler receives error → "caught"
 
-; Unhandled raise:
-; (raise "custom error") ; error: domain
+; Unhandled raise: the error code, then the raised value
+; (raise "custom error") ; error: domain: custom error
 ```
 
 ## Lambdas & the VM
