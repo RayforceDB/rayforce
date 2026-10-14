@@ -101,25 +101,6 @@ its argument resolves first, so `(enlist 'price)` enlists the `price` column.
 (select {from: t x: (== sym (quote price))})   ; x: [false false true]
 ```
 
-### Names from the enclosing function
-
-Inside a lambda, a parameter or `let`-local shadows a source column of the
-same name, in every clause: projections, aggregates, `where:`, `by:` and
-`update`.  A name resolves to an earlier alias of the same select, then to a
-local, then to a source column, then to a global.  Code that queries a
-table from inside a function therefore cannot reach a column through a name
-it has bound locally.
-
-```lisp
-(set t (table [sym price] (list [AAPL GOOG AAPL] [10 20 30])))
-(set f (fn [price] (select {from: t p: (+ price 1)})))
-(f 100)                                         ; p: [101 101 101], the parameter
-(set g (fn [p] (select {from: t p: (* price 2) q: (+ p 1)})))
-(g 1000)                                        ; q: [21 41 61], the alias
-```
-
-Give locals names that no column of the queried tables uses.
-
 ### Whole-column projections
 
 A projection may be a whole-column verb — `distinct`, `asc`, `desc`, or
