@@ -4891,19 +4891,25 @@ static test_result_t test_cross_segment_codes(void) {
  * (intersected with the selection installed), after a selective `==` (the
  * survivors' compact), grouped and row-returning.  Three partitions of
  * 70000 rows (segments end inside a morsel); x's values differ per
- * partition; nullable integer, SYM and F64 columns.  Answers equal
- * generation 0's; nothing materializes. */
+ * partition; nullable integer, SYM and F64 columns, and w with nulls only
+ * after partition 0 (each segment's own probe and null flag).  The chained
+ * shapes run under a selection with dropped (NONE) morsels and under one
+ * mixed in every morsel.  Answers equal generation 0's; nothing
+ * materializes. */
 static test_result_t test_parted_in(void) {
     for (int gen = 0; gen <= 2; gen += 2)
         for (int p = 0; p < 3; p++) {
             char q[1600];
             snprintf(q, sizeof q,
-                     "(.db.splayed.set \"" AW_TMP "/pi%d/2024.01.0%d/t/\" (table [k x v s f] (list (+ (til 70000) %d) "
+                     "(.db.splayed.set \"" AW_TMP "/pi%d/2024.01.0%d/t/\" (table [k x v s f w] (list (+ (til 70000) %d) "
                      "(as 'I32 (- (%% (til 70000) 40) %d)) "
                      "(as 'I32 (map (fn [j] (if (== 0 (%% j 9)) 0N (%% j 1000))) (til 70000))) "
-                     "(take ['a 'b 'c 'd 'e] 70000) (as 'F64 (%% (til 70000) 50)))) "
+                     "(take ['a 'b 'c 'd 'e] 70000) (as 'F64 (%% (til 70000) 50)) %s)) "
                      "\"" AW_TMP "/pi%d/.sym\" {compress: %s})",
-                     gen, p + 1, p * 70000, p * 500, gen, gen ? "true" : "false");
+                     gen, p + 1, p * 70000, p * 500,
+                     p ? "(as 'I32 (map (fn [j] (if (== 0 (% j 9)) 0N (% j 1000))) (til 70000)))"
+                       : "(as 'I32 (% (til 70000) 1000))",
+                     gen, gen ? "true" : "false");
             aw_eval_ok(q);
         }
     static const char* const qs[] = {
@@ -4918,6 +4924,24 @@ static test_result_t test_parted_in(void) {
         "(select {c: (count k) from: T where: (and (> k 1000) (in s ['a 'c])) by: s asc: s})",
         "(select {c: (count k) from: T where: (not-in s ['a 'c])})",
         "(select {c: (count k) from: T where: (and (> k 1000) (in f [1.0 7.0 -0.0]))})",
+        /* w has nulls only after partition 0: each segment answers with its
+         * own null flag */
+        "(select {c: (count k) from: T where: (in w [1 2 3 9 500])})",
+        "(select {c: (count k) from: T where: (not-in w [1 2 3 9 500])})",
+        "(select {c: (count k) from: T where: (and (> k 1000) (not-in w [1 2 3 9 500])) by: s asc: s})",
+        /* x matches partition 0 only, so it is installed first and the
+         * selection drops every morsel of partitions 1-2 (NONE): the s
+         * conjunct runs through the chained route, in both written orders
+         * and with not-in */
+        "(count (select {from: T where: (and (in x [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39]) (in s ['a 'c]))}))",
+        "(count (select {from: T where: (and (in s ['a 'c]) (in x [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39]))}))",
+        "(count (select {from: T where: (and (not-in x [-500 -499 -498 -497 -496 -495 -494 -493 -492 -491 -490 -489 -488 -487 -486 -485 -484 -483 -482 -481 -480 -479 -478 -477 -476 -475 -474 -473 -472 -471 -470 -469 -468 -467 -466 -465 -464 -463 -462 -461 -1000 -999 -998 -997 -996 -995 -994 -993 -992 -991 -990 -989 -988 -987 -986 -985 -984 -983 -982 -981 -980 -979 -978 -977 -976 -975 -974 -973 -972 -971 -970 -969 -968 -967 -966 -965 -964 -963 -962 -961]) (in s ['a 'c]))}))",
+        "(count (select {from: T where: (and (in s ['a 'c]) (not-in x [-500 -499 -498 -497 -496 -495 -494 -493 -492 -491 -490 -489 -488 -487 -486 -485 -484 -483 -482 -481 -480 -479 -478 -477 -476 -475 -474 -473 -472 -471 -470 -469 -468 -467 -466 -465 -464 -463 -462 -461 -1000 -999 -998 -997 -996 -995 -994 -993 -992 -991 -990 -989 -988 -987 -986 -985 -984 -983 -982 -981 -980 -979 -978 -977 -976 -975 -974 -973 -972 -971 -970 -969 -968 -967 -966 -965 -964 -963 -962 -961]))}))",
+        "(count (select {from: T where: (and (in x [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39]) (not-in s ['a 'c]))}))",
+        /* s is installed first (mixed in every morsel) and x runs chained:
+         * x == 4 rows are all 'e, outside the selection */
+        "(count (select {from: T where: (and (in s ['a 'b 'c 'd]) (in x [3 4 -497 -496 -980]))}))",
+        "(select {c: (count k) from: T where: (and (in s ['a 'b 'c 'd]) (in x [3 4 -497 -496 -980])) by: x asc: x})",
         "(select {c: (count k) from: T where: (in x [12345])})",                          /* matches nothing */
         "(select {c: (count k) from: T where: (and (> k 1000) (not-in x [100000]))})",    /* every row */
         NULL,
