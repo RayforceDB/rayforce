@@ -276,12 +276,7 @@ static bool vec_is_ascending(const ray_t* v) {
 
 /* 64-bit avalanche mix (splittable hash from Stafford / xxhash). */
 static inline uint64_t mix64(uint64_t x) {
-    x ^= x >> 30;
-    x *= 0xbf58476d1ce4e5b9ULL;
-    x ^= x >> 27;
-    x *= 0x94d049bb133111ebULL;
-    x ^= x >> 31;
-    return x;
+    return ray_index_mix64(x);
 }
 
 /* Smallest power of two >= n, clamped to >= 1. */

@@ -66,18 +66,47 @@ typedef struct {               /* PART */
 
 #define ENCIDX_OFF(T, f, o) _Static_assert(offsetof(T, f) == (o), #T "." #f " offset")
 _Static_assert(sizeof(ray_enc_idx_root_t) == RAY_ENC_IDX_ROOT_BYTES, "wire root is 80 bytes");
+_Static_assert(RAY_ENC_IDX_FIRST_CHILD == ((RAY_ENC_IDX_ROOT_BYTES + 31) & ~31),
+               "children start at pad32 of the root");
 ENCIDX_OFF(ray_enc_idx_root_t, parent_type, 0);
+ENCIDX_OFF(ray_enc_idx_root_t, rsv, 1);
 ENCIDX_OFF(ray_enc_idx_root_t, built_for_len, 8);
 ENCIDX_OFF(ray_enc_idx_root_t, kind_area, 16);
+_Static_assert(sizeof(((ray_enc_idx_root_t*)0)->kind_area) == 64, "kind area is 64 bytes");
+
 _Static_assert(sizeof(ray_enc_idx_hash_t) == 64, "HASH fills the kind area");
+ENCIDX_OFF(ray_enc_idx_hash_t, table, 0);
+ENCIDX_OFF(ray_enc_idx_hash_t, gkeys, 8);
+ENCIDX_OFF(ray_enc_idx_hash_t, offs, 16);
+ENCIDX_OFF(ray_enc_idx_hash_t, rows, 24);
 ENCIDX_OFF(ray_enc_idx_hash_t, mask, 32);
+ENCIDX_OFF(ray_enc_idx_hash_t, n_keys, 40);
+ENCIDX_OFF(ray_enc_idx_hash_t, n_groups, 48);
 ENCIDX_OFF(ray_enc_idx_hash_t, order_name, 56);
+
 _Static_assert(sizeof(ray_enc_idx_sort_t) == 8, "SORT kind fields");
+ENCIDX_OFF(ray_enc_idx_sort_t, perm, 0);
+
 _Static_assert(sizeof(ray_enc_idx_bloom_t) == 32, "BLOOM kind fields");
+ENCIDX_OFF(ray_enc_idx_bloom_t, bits, 0);
+ENCIDX_OFF(ray_enc_idx_bloom_t, m_mask, 8);
 ENCIDX_OFF(ray_enc_idx_bloom_t, k, 16);
+ENCIDX_OFF(ray_enc_idx_bloom_t, rsv, 20);
 ENCIDX_OFF(ray_enc_idx_bloom_t, n_keys, 24);
+
 _Static_assert(sizeof(ray_enc_idx_part_t) == 40, "PART kind fields");
+ENCIDX_OFF(ray_enc_idx_part_t, keys, 0);
+ENCIDX_OFF(ray_enc_idx_part_t, starts, 8);
+ENCIDX_OFF(ray_enc_idx_part_t, lens, 16);
+ENCIDX_OFF(ray_enc_idx_part_t, n_parts, 24);
 ENCIDX_OFF(ray_enc_idx_part_t, order_name, 32);
+
+#define ENCIDX_FITS(T) _Static_assert(sizeof(T) <= sizeof(((ray_enc_idx_root_t*)0)->kind_area), \
+                                      #T " fits in the kind area")
+ENCIDX_FITS(ray_enc_idx_hash_t);
+ENCIDX_FITS(ray_enc_idx_sort_t);
+ENCIDX_FITS(ray_enc_idx_bloom_t);
+ENCIDX_FITS(ray_enc_idx_part_t);
 
 /* The index kinds that carry a region: HASH, SORT, BLOOM, PART. */
 static inline int ray_enc_idx_kind_has_region(uint8_t k) {
@@ -85,8 +114,27 @@ static inline int ray_enc_idx_kind_has_region(uint8_t k) {
 }
 
 #ifndef RAY_ENC_IDX_WIRE_ONLY
-/* Functions are declared in Task 2 (writer), Task 3 (validator) and Task 4
- * (parse). */
+#include <stdio.h>
+#include <rayforce.h>
+
+typedef struct {
+    const ray_t* root;          /* RAY_INDEX block: HASH, SORT, BLOOM or PART */
+    int8_t       parent_type;   /* the column's logical type */
+    uint8_t      attrs;         /* the column's persisted attrs (width of SYM PART keys) */
+    int64_t      len;           /* the column's rows */
+    const char*  order_name;    /* NULL: order_name -1 */
+    uint32_t     order_len;
+} ray_enc_idx_src_t;
+
+/* Stream the normalized region to f at its current position; *bytes is
+ * the region size (a multiple of 32).  NULL, or an owned error: nyi for a
+ * kind / type the admission matrix refuses or a child of the wrong type
+ * or length (naming the kind), io on a short write. */
+ray_t*  ray_enc_index_write(FILE* f, const ray_enc_idx_src_t* s, uint64_t* bytes);
+
+/* order_sym a writer may convert to a name (spec "Writing the index"):
+ * the root's HASH / PART order_sym when RAY_MARK_MMAP is clear, else -1. */
+int64_t ray_enc_index_trusted_order(const ray_t* root);
 #endif /* RAY_ENC_IDX_WIRE_ONLY */
 
 #endif /* RAY_ENCIDX_H */

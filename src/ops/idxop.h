@@ -245,6 +245,14 @@ static inline ray_index_t* ray_index_payload(ray_t* idx) {
     return (ray_index_t*)idx->data;
 }
 
+/* The 64-bit mix every hash index uses (builder, probes, and the
+ * generation-2 validator). */
+static inline uint64_t ray_index_mix64(uint64_t x) {
+    x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ULL;
+    x ^= x >> 27; x *= 0x94d049bb133111ebULL;
+    x ^= x >> 31; return x;
+}
+
 /* ── Routing observability: per-site consult/hit counters ──
  * Diagnostic, unsynchronized (same caveat as ray_expr_bail_counts). */
 typedef enum {
