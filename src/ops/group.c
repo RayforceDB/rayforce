@@ -9968,8 +9968,8 @@ static void sc_unit_run(const sc_chunk_ctx_t* cc, uint32_t wid, const sc_unit_t*
     if (sel == 0) return;
     bool owner = plo == u->lo;
     uint32_t n = c->n_aggs ? c->n_aggs : 1;
-    bool need[n], vneed[n], run_need[n];
-    for (uint32_t a = 0; a < n; a++) need[a] = vneed[a] = run_need[a] = false;
+    bool need[n], vneed[n], run_need[n], vdefer[n];
+    for (uint32_t a = 0; a < n; a++) need[a] = vneed[a] = run_need[a] = vdefer[a] = false;
     bool any = false;
     for (uint32_t a = 0; a < c->n_aggs; a++) {
         need[a] = cc->rule[a] != SC_RULE_COUNT &&
@@ -9992,14 +9992,23 @@ static void sc_unit_run(const sc_chunk_ctx_t* cc, uint32_t wid, const sc_unit_t*
         bool whole = vlo == vs && vhi == ve;
         int64_t vsel = sc_sel_rows(c->rowsel, vlo, vhi);
         if (vsel == 0) continue;
+        /* Folds keep row order: a float extreme from statistics is decided
+         * here and folded only after the pending run's rows (a -0.0 / +0.0
+         * tie keeps the first row's zero, as the kernel's strict compares
+         * do).  Sums and integer extremes are order-free and fold at once. */
         bool vany = false;
         for (uint32_t a = 0; a < c->n_aggs; a++) {
-            vneed[a] = need[a] && !(whole && vsel == ve - vs && sc_vec_answer(cc, acc, a, u, j, ve - vs, vv));
+            bool stat_ok = need[a] && whole && vsel == ve - vs;
+            bool defer = stat_ok && cc->rule[a] == SC_RULE_FMM;
+            vneed[a] = need[a] && !(stat_ok && sc_vec_answer(cc, defer ? NULL : acc, a, u, j, ve - vs, vv));
+            vdefer[a] = defer && !vneed[a];
             vany |= vneed[a];
         }
         bool same = run_lo >= 0;
         for (uint32_t a = 0; a < c->n_aggs && same; a++) same = vneed[a] == run_need[a];
         if (run_lo >= 0 && (!vany || !same)) { sc_rows(c, wid, run_lo, run_hi, run_need); run_lo = -1; }
+        for (uint32_t a = 0; a < c->n_aggs; a++)
+            if (vdefer[a]) (void)sc_vec_answer(cc, acc, a, u, j, ve - vs, vv);
         if (!vany) { acc->count[0] += vsel; continue; }
         if (run_lo < 0) {
             run_lo = vlo;

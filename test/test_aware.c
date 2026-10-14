@@ -4993,13 +4993,66 @@ static test_result_t aw_same_or_err(const char* name, const char* q) {
 }
 #define AW_SAME_OR_ERR(n, q) do { test_result_t r_ = aw_same_or_err((n), (q)); if (r_.status != TEST_PASS) return r_; } while (0)
 
+/* Rows of column f of the loaded T holding -0.0 / +0.0 (by sign bit), read
+ * from the evaluated column; -1 if it does not come back as a plain F64. */
+static void aw_zero_signs(int64_t* neg, int64_t* pos) {
+    *neg = *pos = -1;
+    ray_t* r = ray_eval_str("(at T 'f)");
+    if (r && !RAY_IS_ERR(r) && r->type == RAY_F64) {
+        const double* d = (const double*)ray_data(r);
+        *neg = *pos = 0;
+        for (int64_t i = 0; i < r->len; i++)
+            if (d[i] == 0.0) { if (signbit(d[i])) (*neg)++; else (*pos)++; }
+    }
+    if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+}
+
+/* Both generations of <name> hold exactly `neg` -0.0 and `pos` +0.0 rows. */
+static test_result_t aw_zero_rows(const char* name, int64_t neg, int64_t pos) {
+    char buf[512];
+    for (int gen = 0; gen < 2; gen++) {
+        snprintf(buf, sizeof buf, "(set T (.db.splayed.get \"" AW_TMP "/%s%d/\"))", name, gen ? 2 : 0);
+        aw_eval_ok(buf);
+        int64_t n, p; aw_zero_signs(&n, &p);
+        TEST_ASSERT_FMT(n == neg && p == pos, "%s gen %d: %lld -0.0 / %lld +0.0 rows, want %lld / %lld", name,
+                        gen ? 2 : 0, (long long)n, (long long)p, (long long)neg, (long long)pos);
+    }
+    PASS();
+}
+#define AW_ZERO_ROWS(n, a, b) do { test_result_t r_ = aw_zero_rows((n), (a), (b)); if (r_.status != TEST_PASS) return r_; } while (0)
+
+/* The sign bit of the F64 result of `q` (an atom or a one-element vector)
+ * is the same in both generations. */
+static test_result_t aw_zero_mm(const char* name, const char* q) {
+    char buf[512]; int sb[2];
+    for (int gen = 0; gen < 2; gen++) {
+        snprintf(buf, sizeof buf, "(set T (.db.splayed.get \"" AW_TMP "/%s%d/\"))", name, gen ? 2 : 0);
+        aw_eval_ok(buf);
+        ray_t* r = aw_eval(q);
+        TEST_ASSERT_FMT(r && !RAY_IS_ERR(r), "%s gen %d failed", q, gen ? 2 : 0);
+        double x;
+        if (r->type == -RAY_F64) x = r->f64;
+        else { TEST_ASSERT_FMT(r->type == RAY_F64 && r->len == 1, "%s: type %d", q, r->type); x = ((const double*)ray_data(r))[0]; }
+        TEST_ASSERT_FMT(x == 0.0, "%s gen %d: not a zero", q, gen ? 2 : 0);
+        sb[gen] = signbit(x) ? 1 : 0;
+        ray_release(r);
+    }
+    TEST_ASSERT_FMT(sb[0] == sb[1], "%s: sign bit %d in gen 0, %d in gen 2", q, sb[0], sb[1]);
+    PASS();
+}
+#define AW_ZERO_MM(n, q) do { test_result_t r_ = aw_zero_mm((n), (q)); if (r_.status != TEST_PASS) return r_; } while (0)
+
 /* Signed zeros: CONST vectors of -0.0 and of +0.0 next to a RAW vector
  * mixing both; every comparison with both zero literals, in, min, max (which
  * zero) and a float top-k. */
 static test_result_t test_signed_zeros(void) {
-    aw_save("sz", "(table [k f] (list (til 3072) (map (fn [j] (if (< j 1024) -0.0 (if (< j 2048) 0.0 (if (== 0 (% j 2)) -0.0 (* 0.5 (- j 2600)))))) (til 3072))))", -1);
+    /* -0.0 is computed as (neg 0.0): inside one lambda the literals -0.0 and
+     * 0.0 share a constant-pool slot (compile.c add_constant compares by ==, #824),
+     * so the literal form would hold no +0.0 at all. */
+    aw_save("sz", "(table [k f] (list (til 3072) (map (fn [j] (if (< j 1024) (neg 0.0) (if (< j 2048) 0.0 (if (== 0 (% j 2)) (neg 0.0) (* 0.5 (- j 2600)))))) (til 3072))))", -1);
     TEST_ASSERT_EQ_I(aw_vec_enc("sz", "f", 0), RAY_ENC_CONST);
     TEST_ASSERT_EQ_I(aw_vec_enc("sz", "f", 1), RAY_ENC_CONST);
+    AW_ZERO_ROWS("sz", 1024 + 512, 1024);
     static const char* const ops[] = { "==", "!=", "<", "<=", ">", ">=" };
     static const char* const lits[] = { "0.0", "-0.0" };
     char q[256];
@@ -5013,6 +5066,55 @@ static test_result_t test_signed_zeros(void) {
     AW_SAME_OR_ERR("sz", "(max (at T 'f))");
     AW_SAME_OR_ERR("sz", "(select {f: f k: k from: T where: (> k 1000) asc: f take: 5})");
     AW_SAME_OR_ERR("sz", "(select {f: f k: k from: T where: (> k 1000) desc: f take: 5})");
+    /* Zeros only: which zero min / max return (1/x tells them apart) and how
+     * the top-k orders -0.0 against 0.0 (k shows the rows taken). */
+    aw_save("sz0", "(table [k f] (list (til 3072) (map (fn [j] (if (< j 1024) (neg 0.0) (if (< j 2048) 0.0 (if (== 0 (% j 2)) (neg 0.0) 0.0)))) (til 3072))))", -1);
+    TEST_ASSERT_EQ_I(aw_vec_enc("sz0", "f", 0), RAY_ENC_CONST);
+    TEST_ASSERT_EQ_I(aw_vec_enc("sz0", "f", 1), RAY_ENC_CONST);
+    TEST_ASSERT_EQ_I(aw_vec_enc("sz0", "f", 2), RAY_ENC_RAW);
+    AW_ZERO_ROWS("sz0", 1024 + 512, 1024 + 512);
+    /* Rayfall prints both zeros as 0.0 and 1/0 is null, so the sign of a
+     * min / max result is read in C: aw_zero_mm compares it across generations. */
+    AW_ZERO_MM("sz0", "(min (at T 'f))");
+    AW_ZERO_MM("sz0", "(max (at T 'f))");
+    AW_ZERO_MM("sz0", "(at (select {r: (min f) from: T where: (> k 1000)}) 'r)");
+    AW_ZERO_MM("sz0", "(at (select {r: (max f) from: T where: (> k 1000)}) 'r)");
+    AW_SAME_OR_ERR("sz0", "(select {f: f k: k from: T where: (> k 1000) asc: f take: 5})");
+    AW_SAME_OR_ERR("sz0", "(select {f: f k: k from: T where: (> k 1000) desc: f take: 5})");
+    AW_SAME_OR_ERR("sz0", "(select {f: f k: k from: T asc: f take: 5})");
+    AW_SAME_OR_ERR("sz0", "(select {f: f k: k from: T desc: f take: 5})");
+    /* Two chunks of zero vectors: -0.0 CONST, +0.0 CONST, a RAW mix, in
+     * turn.  Selections cut inside vectors, at vector and chunk edges, so
+     * vectors answered from statistics, row-read runs and whole chunks
+     * alternate in every order.  Over 64 Ki rows both generations dispatch
+     * in parallel and the merge of the workers' zeros is not row order, so
+     * generation 2 runs in row order under the scalar-grain hook (whole
+     * blocks, and one task) and must keep the first selected row's zero. */
+    aw_save("szc", "(table [k f] (list (til 131072) (map (fn [j] (if (== 0 (% (div j 1024) 3)) (neg 0.0) "
+                   "(if (== 1 (% (div j 1024) 3)) 0.0 (if (== 0 (% j 2)) (neg 0.0) 0.0)))) (til 131072))))", -1);
+    TEST_ASSERT_EQ_I(aw_vec_enc("szc", "f", 63), RAY_ENC_CONST);
+    TEST_ASSERT_EQ_I(aw_vec_enc("szc", "f", 64), RAY_ENC_CONST);
+    TEST_ASSERT_EQ_I(aw_vec_enc("szc", "f", 65), RAY_ENC_RAW);
+    aw_eval_ok("(set T (.db.splayed.get \"" AW_TMP "/szc2/\"))");
+    static const int64_t los[] = { -1, 0, 1000, 1023, 1024, 2047, 64511, 65000, 65535, 65536, 66000 };
+    static const int64_t his[] = { 131072, 65536, 65537, 66560, 70000 };
+    static const int64_t grains[] = { RAY_COL_BLOCK_ROWS, 131072 };
+    for (int g = 0; g < 2; g++)
+    for (int l = 0; l < 11; l++) for (int h = 0; h < 5; h++) for (int m = 0; m < 2; m++) {
+        if (his[h] <= los[l] + 1) continue;
+        int64_t r0 = los[l] + 1, v0 = r0 / 1024;           /* the first selected row */
+        bool want_neg = v0 % 3 == 0 || (v0 % 3 == 2 && r0 % 2 == 0);
+        snprintf(q, sizeof q, "(at (select {r: (%s f) from: T where: (and (> k %lld) (< k %lld))}) 'r)",
+                 m ? "max" : "min", (long long)los[l], (long long)his[h]);
+        ray_group_test_scalar_grain(grains[g]);
+        ray_t* r = aw_eval(q);
+        ray_group_test_scalar_grain(0);
+        TEST_ASSERT_FMT(r && !RAY_IS_ERR(r) && r->type == RAY_F64 && r->len == 1, "%s failed", q);
+        double x = ((const double*)ray_data(r))[0];
+        ray_release(r);
+        TEST_ASSERT_FMT(x == 0.0 && (signbit(x) != 0) == want_neg, "%s, grain %lld: %s0.0, want %s0.0", q,
+                        (long long)grains[g], signbit(x) ? "-" : "+", want_neg ? "-" : "+");
+    }
     PASS();
 }
 
