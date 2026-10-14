@@ -4096,12 +4096,12 @@ static test_result_t test_v2_sel_bounds_boundary(void) {
         { "bb", "(select {c: (count v) from: T where: (and (<= v 5000) (!= v 1)) by: [k g]})", false },
         /* nullable k (range 2): 5000 rows, g spans 2500 ids: 2 x 2500 == n_sel */
         { "bn", "(select {c: (count v) from: T where: (< v 5000) by: [g k]})", true },
-        /* 5000 rows (0, 3..5001), g spans 2501 ids: 2 x 2501 > n_sel.  g
-         * alone fits; the probe of the dense plan (P3 Task 14b) reads g's
-         * selected rows in the chunk holding its directory extremes (here
-         * all of them) and k's probed rows (range 2, its null included),
-         * and the product already exceeds n_sel: k is not read for bounds */
-        { "bn", "(select {c: (count v) from: T where: (and (<= v 5001) (!= v 1) (!= v 2)) by: [g k]})", false },
+        /* 5000 rows (0, 3..5001), g spans 2501 ids: 2 x 2501 > n_sel, but g
+         * alone fits, so k is read and the plan fails on the product (the
+         * chunk-extremes probe of P3 Task 14b does not run: the chunk
+         * holding g's extremes holds every selected row, more than its
+         * quarter) */
+        { "bn", "(select {c: (count v) from: T where: (and (<= v 5001) (!= v 1) (!= v 2)) by: [g k]})", true },
         { NULL, NULL, false },
     };
     for (int i = 0; qs[i].q; i++) {

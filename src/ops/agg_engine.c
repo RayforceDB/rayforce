@@ -2249,29 +2249,34 @@ static bool agg_sel_bounds_impossible(const agg_sel_bounds_ctx_t* bc) {
     /* Undecided: the selected rows of the chunks holding each SYM key's
      * lowest minimum and highest maximum in the directory (its membership
      * bounds; a SYM key has no directory route to its exact bounds) are
-     * scanned too.  The
-     * statistics only choose the chunks; the bound is still the values
-     * read, so it stays a subset of the exact scan's whatever they say.  A
-     * key whose extremes are a few rare values (SYM ids interned early)
-     * is proved here, where evenly spaced rows miss them. */
+     * scanned too.  The statistics only choose the chunks; the bound is
+     * still the values read, so it stays a subset of the exact scan's
+     * whatever they say.  A key whose extremes are a few rare values (SYM
+     * ids interned early) is proved here, where evenly spaced rows miss
+     * them. */
     const ray_rowsel_t* m = ray_rowsel_meta(bc->sel);
     const int64_t nrows = m->nrows, nch = (nrows + RAY_ENC_CHUNK - 1) / RAY_ENC_CHUNK;
     const int64_t spc = RAY_ENC_CHUNK / RAY_MORSEL_ELEMS;      /* selection segments per chunk */
     if (nch < 2) return false;                                 /* one chunk: the exact scan */
+    /* the SYM keys with a directory (the others' exact bounds take the
+     * directory, agg_sel_bounds_dir / _split, which reads these chunks
+     * anyway); none (every generation-0 key): nothing allocated */
+    uint32_t sk[16], nsk = 0;
+    ray_enc_chunk_stat_t st;
+    for (uint32_t k = 0; k < nk; k++)
+        if (krr->srcs[k] && krr->key_types[k] == RAY_SYM && krr->srcs[k]->len == nrows &&
+            ray_col_src_chunk_stat(krr->srcs[k], 0, &st)) sk[nsk++] = k;
+    if (nsk == 0) return false;
     ray_t* hdr;
     int64_t* spans = (int64_t*)scratch_alloc(&hdr, (size_t)nch * (2 + 2 * nk) * sizeof(int64_t) + (size_t)nch);
     if (!spans) return false;
     int64_t* tb = spans + 2 * nch;
     uint8_t* state = (uint8_t*)(tb + 2 * (size_t)nch * nk);
     memset(state, 0, (size_t)nch);
-    int64_t marked = 0;
-    uint32_t sk[16], nsk = 0;                                  /* the SYM keys read */
-    ray_enc_chunk_stat_t st;
-    for (uint32_t k = 0; k < nk; k++) {
-        /* SYM keys only: the others' exact bounds take the directory
-         * (agg_sel_bounds_dir / _split), which reads these chunks anyway */
-        if (!krr->srcs[k] || krr->key_types[k] != RAY_SYM || krr->srcs[k]->len != nrows ||
-            !ray_col_src_chunk_stat(krr->srcs[k], 0, &st)) continue;
+    int64_t probe_rows = 0;                                    /* selected rows of the marked chunks */
+    uint32_t nread = 0;
+    for (uint32_t i = 0; i < nsk; i++) {
+        const uint32_t k = sk[i];
         int64_t lo_ch = -1, hi_ch = -1, lo_v = INT64_MAX, hi_v = INT64_MIN;
         for (int64_t ch = 0; ch < nch; ch++) {
             int64_t se = (ch + 1) * spc < (int64_t)m->n_segs ? (ch + 1) * spc : (int64_t)m->n_segs;
@@ -2281,23 +2286,33 @@ static bool agg_sel_bounds_impossible(const agg_sel_bounds_ctx_t* bc) {
             if (st.max > hi_v) { hi_v = st.max; hi_ch = ch; }
         }
         if (lo_ch < 0) continue;
-        sk[nsk++] = k;
-        if (state[lo_ch] != 2) { state[lo_ch] = 2; marked++; }
-        if (state[hi_ch] != 2) { state[hi_ch] = 2; marked++; }
+        sk[nread++] = k;
+        const int64_t mk[2] = { lo_ch, hi_ch };
+        for (int e = 0; e < 2; e++) {
+            const int64_t ch = mk[e];
+            if (state[ch] == 2) continue;
+            state[ch] = 2;
+            int64_t se = (ch + 1) * spc < (int64_t)m->n_segs ? (ch + 1) * spc : (int64_t)m->n_segs;
+            probe_rows += bc->sel_prefix[se] - bc->sel_prefix[ch * spc];
+        }
     }
-    /* only while the chunks are a small share of the scan they may save;
-     * those keys alone are read (a key set of their own, agg_sel_keys) */
+    /* The probe reads the marked chunks' selected rows; undecided, the
+     * exact scan then reads every selected row again, so a miss costs
+     * probe_rows / n_sel more.  At most a quarter of the selected rows
+     * keeps a miss under a quarter of the exact scan, while a hit saves
+     * the other three quarters and more (q13: 2 of 153 chunks).  Those
+     * keys alone are read (a key set of their own, agg_sel_keys). */
     bool proved = false;
-    if (marked > 0 && marked * 4 <= nch) {
+    if (nread > 0 && probe_rows * 4 <= bc->n_sel) {
         agg_sel_keys_t ko;
         agg_sel_bounds_ctx_t co;
-        agg_sel_keys(bc, sk, nsk, &ko, &co);
+        agg_sel_keys(bc, sk, nread, &ko, &co);
         int64_t cm[16], cx[16];
-        for (uint32_t i = 0; i < nsk; i++) { cm[i] = INT64_MAX; cx[i] = INT64_MIN; }
+        for (uint32_t i = 0; i < nread; i++) { cm[i] = INT64_MAX; cx[i] = INT64_MIN; }
         if (agg_sel_bounds_round(&co, state, nch, spc, spans, tb, cm, cx)) {
             int64_t am[16], ax[16];
             for (uint32_t k = 0; k < nk; k++) { am[k] = mn[k]; ax[k] = mx[k]; }
-            for (uint32_t i = 0; i < nsk; i++) {
+            for (uint32_t i = 0; i < nread; i++) {
                 if (cm[i] < am[sk[i]]) am[sk[i]] = cm[i];
                 if (cx[i] > ax[sk[i]]) ax[sk[i]] = cx[i];
             }
