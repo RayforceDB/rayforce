@@ -15,6 +15,13 @@
 (max (as 'U8 [1 9]) (as 'I16 [5 5])) -- (as 'I16 [5 9])
 (type (max (as 'U8 [1 9]) (as 'I16 [5 5]))) -- 'I16
 
+;; a scalar wider than the vector is not narrowed to the vector's type,
+;; whichever side it is on
+(max 300 (as 'U8 [1 2])) -- [300 300]
+(max (as 'U8 [1 2]) 300) -- [300 300]
+(min -5 (as 'U8 [1 2])) -- [-5 -5]
+(min 1 (as 'U8 [5 0])) -- [1 0]
+
 ;; same types are unchanged
 (min [3 9 1] [2 10 4]) -- [2 9 1]
 (max [3 9 1] 5) -- [5 9 5]

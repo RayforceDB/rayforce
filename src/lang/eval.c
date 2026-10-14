@@ -921,7 +921,11 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
     /* When LEFT is scalar broadcast to RIGHT vector, the output type follows
      * the RIGHT vector's element type for integer types,
      * unless float or temporal promotion is involved. */
-    if (!e0_null && !e0_bool && !left_coll && right_coll && ray_is_vec(right) && out_type != RAY_F64) {
+    /* Not for the dyadic min/max: their result type is already the
+     * operands' promoted one (minmax_type), and narrowing it here would
+     * wrap a chosen scalar, (max 300 u8vec) giving 0x2c. */
+    if (!e0_null && !e0_bool && !left_coll && right_coll && ray_is_vec(right) && out_type != RAY_F64 &&
+        fn != ray_min2_fn && fn != ray_max2_fn) {
         int8_t vec_type = right->type;
         /* Only override for integer family: if probed type is wider int, downcast */
         int out_is_int = (out_type == RAY_I64 || out_type == RAY_I32 || out_type == RAY_I16 || out_type == RAY_U8);
