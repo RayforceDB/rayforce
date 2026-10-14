@@ -58,6 +58,7 @@
  *   Bit  0x08       vectors:         RAY_ATTR_HAS_INDEX (index ray_t* in aux[0..7])
  *   Bit  0x10       vectors:         RAY_ATTR_SLICE
  *   Bit  0x20       -RAY_SYM:        ATTR_QUOTED (quoted/literal symbol; default = name reference)
+ *   Bit  0x20       -RAY_I64 atoms:  RAY_ATTR_DLPROG (Datalog program handle in .i64)
  *   Bit  0x20       vectors:         RAY_ATTR_SORTED (non-descending order marker)
  *   Bit  0x40       vectors:         RAY_ATTR_HAS_NULLS (sentinel-encoded; payload is truth;
  *                                    a slice inherits its parent's bit)
@@ -103,8 +104,8 @@
  * integer or an arithmetic copy (which drops attrs) is rejected with a type
  * error instead of being reinterpreted as a pointer — see dl_unwrap_program.
  * Reuses 0x20 (RAY_ATTR_SORTED on vectors / ATTR_QUOTED on -RAY_SYM); the
- * -RAY_I64 type tag disambiguates, and no free-path or generic check reads
- * 0x20 on a -RAY_I64 atom.  User must (dl-free h). */
+ * -RAY_I64 type tag disambiguates.  The heap finalizer frees the program when
+ * its owning atom is released; users may call (dl-free h) for early release. */
 #define RAY_ATTR_DLPROG       0x20
 
 /* Vector is a linked column.  The 8 bytes of the aux union at offset

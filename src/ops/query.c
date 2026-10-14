@@ -1386,6 +1386,27 @@ static bool in_set_names_global_value(ray_graph_t* g, ray_t* set) {
     return v && !ray_is_atom(v) && !ray_is_vec(v);
 }
 
+
+/* Lower the arguments of an if chain (c1 r1 c2 r2 ... else), nargs odd and
+ * >= 3, into nested OP_IF nodes.  Node creation may realloc g->nodes:
+ * re-derive pointers from ids after compiling each arm.  The arms are
+ * compiled under if_arm_depth, as the three-argument form's were. */
+static ray_op_t* compile_if_chain_dag(ray_graph_t* g, ray_t** a, int64_t nargs) {
+    if (nargs == 1) return compile_expr_dag(g, a[0]);
+    ray_op_t* c = compile_expr_dag(g, a[0]);
+    if (!c) return NULL;
+    uint32_t c_id = c->id;
+    g->if_arm_depth++;
+    ray_op_t* t = compile_expr_dag(g, a[1]);
+    uint32_t t_id = t ? t->id : 0;
+    ray_op_t* e = t ? compile_if_chain_dag(g, a + 2, nargs - 2) : NULL;
+    g->if_arm_depth--;
+    if (!t || !e) return NULL;
+    c = &g->nodes[c_id];
+    t = &g->nodes[t_id];
+    return ray_if(g, c, t, e);
+}
+
 ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
     if (!expr) return NULL;
 
@@ -1763,23 +1784,15 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
             return ray_cast(g, r, temporal);
         }
 
-        /* (if cond then else) — 4 elements (fn + 3 args).  Compiles
-         * to OP_IF which is supported by the element-wise fusion
-         * pipeline. */
+        /* (if c1 r1 c2 r2 ... else) — condition/result pairs with a
+         * fallback.  Pairs nest right to left into OP_IF, which the
+         * element-wise fusion pipeline serves: (if c1 r1 c2 r2 e) is
+         * OP_IF(c1, r1, OP_IF(c2, r2, e)).  A chain with no fallback has
+         * no column value for the rows no condition takes (the evaluator
+         * yields 0), so it is left to the evaluator. */
         if (fname_len == 2 && memcmp(fname, "if", 2) == 0) {
-            if (n != 4) return NULL;
-            ray_op_t* c = compile_expr_dag(g, elems[1]);
-            if (!c) return NULL;
-            uint32_t c_id = c->id;
-            g->if_arm_depth++;
-            ray_op_t* t = compile_expr_dag(g, elems[2]);
-            uint32_t t_id = t ? t->id : 0;
-            ray_op_t* e = t ? compile_expr_dag(g, elems[3]) : NULL;
-            g->if_arm_depth--;
-            if (!t || !e) return NULL;
-            c = &g->nodes[c_id];
-            t = &g->nodes[t_id];
-            return ray_if(g, c, t, e);
+            if (n < 4 || (n & 1)) return NULL;
+            return compile_if_chain_dag(g, elems + 1, n - 1);
         }
 
         /* (substr str start len) — 4 elements. */
@@ -5204,10 +5217,18 @@ static int dkp_compile(dkp_prog_t* P, ray_t* e, int64_t col, int64_t* bsym, int*
         return dkp_compile(P, el[3], col, bsym, breg, nb + 1);
     }
     if (DKP_IS("if")) {
-        if (n != 4) return -1;
-        int c = DKP_ARG(1), t = DKP_ARG(2), f = DKP_ARG(3);
-        if (c < 0 || t < 0 || f < 0 || DKP_K(c) != DKP_BOOL || DKP_K(t) != DKP_K(f)) return -1;
-        return dkp_emit(P, DKO_IF, DKP_K(t), c, t, f);
+        /* (if c1 r1 c2 r2 ... else): pairs nest right to left, as `cond`
+         * below; a chain without a fallback is left to the evaluator. */
+        if (n < 4 || (n & 1)) return -1;
+        int acc = DKP_ARG(n - 1);
+        if (acc < 0) return -1;
+        for (int64_t i = n - 3; i >= 1; i -= 2) {
+            int c = DKP_ARG(i), t = DKP_ARG(i + 1);
+            if (c < 0 || t < 0 || DKP_K(c) != DKP_BOOL || DKP_K(t) != DKP_K(acc)) return -1;
+            acc = dkp_emit(P, DKO_IF, DKP_K(t), c, t, acc);
+            if (acc < 0) return -1;
+        }
+        return acc;
     }
     if (DKP_IS("cond")) {
         /* right to left into an if chain; the last clause is the else */
@@ -9613,8 +9634,8 @@ ray_t* ray_try_count_select_expr(ray_t* expr, int* handled) {
     int64_t pre_nrows = ray_table_nrows(tbl);
 
     /* Fused predicate→selection: count directly off the streamed rowsel,
-     * skipping the full BOOL vec + the BOOL→rowsel scan.  Unsupported shapes,
-     * or >RAY_POOL_MAX_TASKS fall through to exec_node. */
+     * skipping the full BOOL vec + the BOOL→rowsel scan.  Unsupported shapes
+     * fall through to exec_node. */
     {
         bool all_pass = false;
         ray_t* fsel = exec_pred_to_selection(g, pred, pre_nrows, &all_pass);
@@ -14062,6 +14083,21 @@ by_dict_done:
                 ray_graph_free(g); g = NULL;
             }
             if (by_key_sym < 0 && by_expr->type == RAY_SYM && ray_len(by_expr) > 1) {
+                /* The composite path reads key and output cells row by row,
+                 * which a parted column does not serve.  A where: hands back
+                 * a flattened copy of the rows it keeps; when the table
+                 * reaches here as is, flatten the columns the clauses read;
+                 * with no outputs every column is read (first of each group
+                 * below), so the whole table is flattened. */
+                if (eval_tbl == tbl && table_has_parted_columns(tbl)) {
+                    ray_t* flat = n_out > 0 ? parted_flatten_read_cols(dict, tbl)
+                                            : query_materialize_parted_table(tbl);
+                    if (!flat || RAY_IS_ERR(flat)) {
+                        ray_release(tbl);
+                        scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return flat ? flat : ray_error("oom", NULL);
+                    }
+                    eval_tbl = flat;
+                }
                 int64_t nk = ray_len(by_expr);
                 int64_t* key_syms = (int64_t*)ray_data(by_expr);
                 int64_t nrows = ray_table_nrows(eval_tbl);
@@ -14629,8 +14665,13 @@ by_dict_done:
                             key_vec = ray_str_vec_append(key_vec, sp ? sp : "", sp ? slen : 0);
                         }
                     } else {
+                        /* The composite cells are SYM atoms (runtime ids,
+                         * collection_elem's atom rule), so the key column is a
+                         * runtime-domain W64 vec: the source's width sizes ids
+                         * of the source's own (file) domain and truncated the
+                         * runtime ids into unrelated symbols. */
                         key_vec = (kt == RAY_SYM)
-                                ? ray_sym_vec_new(src->attrs & RAY_SYM_W_MASK, out_groups)
+                                ? ray_sym_vec_new(RAY_SYM_W64, out_groups)
                                 : ray_vec_new(kt, out_groups);
                         if (key_vec && !RAY_IS_ERR(key_vec)) {
                             key_vec->len = out_groups;

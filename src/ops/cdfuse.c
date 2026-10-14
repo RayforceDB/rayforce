@@ -255,12 +255,10 @@ typedef struct {
     cdf_part_t* parts;
     uint32_t nw, n_parts, part_bits;
     _Atomic(int) oom;
-    /* Partitions actually processed.  ray_pool_dispatch_n CLAMPS its task
-     * count to the ring capacity when the growth realloc fails (see
-     * RAY_POOL_INIT_TASKS in core/pool.h) and a cancelled pool skips claimed
-     * tasks — either way the tail partitions never run, keep ng == 0, and
-     * their groups would silently vanish from the result.  The wrapper
-     * compares this against n_parts and declines (NULL) on mismatch. */
+    /* Partitions actually processed.  A cancelled pool skips its tasks, so
+     * the partitions left keep ng == 0 and their groups would silently
+     * vanish from the result.  The wrapper compares this against n_parts
+     * and declines (NULL) on mismatch. */
     _Atomic(int64_t) done;
 } cdf_p2_ctx_t;
 

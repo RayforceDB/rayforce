@@ -150,5 +150,110 @@
 (sum (at Pl 'l)) !- type
 (count (select {r: ((fn [c] (sum (first (list c)))) 'l) from: Pl})) -- 3
 
+;; ─── parted two-input aggregates (#730, #780) ────────────────────────
+;; wsum/wavg/cov/scov/pearson_corr over a parted table go through the
+;; concat fallback, which flattens only the columns the group references.
+;; A column used ONLY as the second input (agg_ins2) used to be left out,
+;; so the aggregate read it as missing (0.0 / 0Nf / garbage).
+(.sys.exec "rm -rf /tmp/rfl_agg_pbin /tmp/rfl_agg_pbinw")
+(.db.splayed.set "/tmp/rfl_agg_pbinw/2024.01.01/t/" (table [a b] (list [1 2 3] [10.0 20.0 30.0])))
+(.db.splayed.set "/tmp/rfl_agg_pbinw/2024.01.02/t/" (table [a b] (list [4 5] [40.0 50.0])))
+(set Pbw (.db.parted.get "/tmp/rfl_agg_pbinw/" 't))
+(first (at (select {w: (wavg a b) from: Pbw}) 'w)) -- (wavg [1 2 3 4 5] [10.0 20.0 30.0 40.0 50.0])
+(at (select {w: (wsum a b) from: Pbw}) 'w) -- [550.0]
+(first (at (select {w: (wavg a b) from: Pbw where: (> a 1)}) 'w)) -- (wavg [2 3 4 5] [20.0 30.0 40.0 50.0])
+(set mkbin (fn [lo n] (do (set i (+ lo (til n))) (table [w x y] (list (% i 7) (as 'F64 (% (* i 13) 101)) (as 'I64 (% (* i 7) 53)))))))
+(.db.splayed.set "/tmp/rfl_agg_pbin/1/t/" (mkbin 0 300))
+(.db.splayed.set "/tmp/rfl_agg_pbin/2/t/" (mkbin 300 300))
+(.db.splayed.set "/tmp/rfl_agg_pbin/3/t/" (mkbin 600 300))
+(set Pb (.db.parted.get "/tmp/rfl_agg_pbin/" 't))
+(set Fb (concat (concat (mkbin 0 300) (mkbin 300 300)) (mkbin 600 300)))
+;; grouped: x is referenced only as the second input in each select
+(at (select {c: (wsum y x) from: Pb by: w asc: w}) 'c) -- (at (select {c: (wsum y x) from: Fb by: w asc: w}) 'c)
+(at (select {c: (wavg y x) from: Pb by: w asc: w}) 'c) -- (at (select {c: (wavg y x) from: Fb by: w asc: w}) 'c)
+(< (max (abs (- (at (select {c: (cov y x) from: Pb by: w asc: w}) 'c) (at (select {c: (cov y x) from: Fb by: w asc: w}) 'c)))) 0.000001) -- true
+(< (max (abs (- (at (select {c: (scov y x) from: Pb by: w asc: w}) 'c) (at (select {c: (scov y x) from: Fb by: w asc: w}) 'c)))) 0.000001) -- true
+;; pearson_corr read a missing x as all 0Nf, and (< 0Nf eps) is true — the
+;; tolerance compare alone cannot fail, so pin non-null first.
+(set PcP (at (select {c: (pearson_corr y x) from: Pb by: w asc: w}) 'c))
+(set PcF (at (select {c: (pearson_corr y x) from: Fb by: w asc: w}) 'c))
+(any (nil? PcF)) -- false
+(any (nil? PcP)) -- false
+(< (max (abs (- PcP PcF))) 0.000001) -- true
+(at (select {c: (wsum y x) from: Pb where: (> w 2) by: w asc: w}) 'c) -- (at (select {c: (wsum y x) from: Fb where: (> w 2) by: w asc: w}) 'c)
+;; ungrouped
+(at (select {c: (wsum y x) from: Pb}) 'c) -- (at (select {c: (wsum y x) from: Fb}) 'c)
+(at (select {c: (wavg y x) from: Pb}) 'c) -- (at (select {c: (wavg y x) from: Fb}) 'c)
+(set PuP (first (at (select {c: (pearson_corr y x) from: Pb}) 'c)))
+(set PuF (first (at (select {c: (pearson_corr y x) from: Fb}) 'c)))
+(nil? PuF) -- false
+(nil? PuP) -- false
+(< (abs (- PuP PuF)) 0.000001) -- true
+;; second operand an EXPRESSION over a column referenced nowhere else: the
+;; optimizer's liveness/DCE passes walked agg_ins but not agg_ins2, so that
+;; subtree was marked dead, its source column was left out of the parted
+;; flatten and the select failed with `schema`.  Oracle: the same aggregate
+;; over a flat table holding the expression as a plain column x2.
+(set Fx (table [w y x2] (list (at Fb 'w) (at Fb 'y) (* (at Fb 'x) 2.0))))
+(set Wk (at (select {c: (wsum y x2) from: Fx by: w asc: w}) 'c))
+(set Ak (at (select {c: (wavg y x2) from: Fx by: w asc: w}) 'c))
+(set Ck (at (select {c: (cov y x2) from: Fx by: w asc: w}) 'c))
+(set Rk (at (select {c: (pearson_corr y x2) from: Fx by: w asc: w}) 'c))
+(any (nil? Ck)) -- false
+(any (nil? Rk)) -- false
+;; grouped, flat
+(at (select {c: (wsum y (* x 2.0)) from: Fb by: w asc: w}) 'c) -- Wk
+(at (select {c: (wavg y (* x 2.0)) from: Fb by: w asc: w}) 'c) -- Ak
+(< (max (abs (- (at (select {c: (cov y (* x 2.0)) from: Fb by: w asc: w}) 'c) Ck))) 0.000001) -- true
+(< (max (abs (- (at (select {c: (pearson_corr y (* x 2.0)) from: Fb by: w asc: w}) 'c) Rk))) 0.000001) -- true
+;; grouped, parted
+(at (select {c: (wsum y (* x 2.0)) from: Pb by: w asc: w}) 'c) -- Wk
+(at (select {c: (wavg y (* x 2.0)) from: Pb by: w asc: w}) 'c) -- Ak
+(set CkP (at (select {c: (cov y (* x 2.0)) from: Pb by: w asc: w}) 'c))
+(set RkP (at (select {c: (pearson_corr y (* x 2.0)) from: Pb by: w asc: w}) 'c))
+(any (nil? CkP)) -- false
+(any (nil? RkP)) -- false
+(< (max (abs (- CkP Ck))) 0.000001) -- true
+(< (max (abs (- RkP Rk))) 0.000001) -- true
+;; keyless, flat and parted
+(set Wu (at (select {c: (wsum y x2) from: Fx}) 'c))
+(set Au (at (select {c: (wavg y x2) from: Fx}) 'c))
+(set Cu (first (at (select {c: (cov y x2) from: Fx}) 'c)))
+(set Ru (first (at (select {c: (pearson_corr y x2) from: Fx}) 'c)))
+(nil? Cu) -- false
+(nil? Ru) -- false
+(at (select {c: (wsum y (* x 2.0)) from: Fb}) 'c) -- Wu
+(at (select {c: (wavg y (* x 2.0)) from: Fb}) 'c) -- Au
+(< (abs (- (first (at (select {c: (cov y (* x 2.0)) from: Fb}) 'c)) Cu)) 0.000001) -- true
+(< (abs (- (first (at (select {c: (pearson_corr y (* x 2.0)) from: Fb}) 'c)) Ru)) 0.000001) -- true
+(at (select {c: (wsum y (* x 2.0)) from: Pb}) 'c) -- Wu
+(at (select {c: (wavg y (* x 2.0)) from: Pb}) 'c) -- Au
+(set CuP (first (at (select {c: (cov y (* x 2.0)) from: Pb}) 'c)))
+(set RuP (first (at (select {c: (pearson_corr y (* x 2.0)) from: Pb}) 'c)))
+(nil? CuP) -- false
+(nil? RuP) -- false
+(< (abs (- CuP Cu)) 0.000001) -- true
+(< (abs (- RuP Ru)) 0.000001) -- true
+;; a constant second operand — literal or constant-folded once the folder
+;; reaches agg_ins2 — is an atom; the pair loops indexed it per row (garbage)
+;; until it was broadcast like a constant first operand.
+(set Sy (* 6.0 (at (select {c: (sum y) from: Fb by: w asc: w}) 'c)))
+(at (select {c: (wsum y 6.0) from: Fb by: w asc: w}) 'c) -- Sy
+(at (select {c: (wsum y (* 2.0 3.0)) from: Fb by: w asc: w}) 'c) -- Sy
+(at (select {c: (wsum y 6.0) from: Pb by: w asc: w}) 'c) -- Sy
+(at (select {c: (wsum y (* 2.0 3.0)) from: Pb by: w asc: w}) 'c) -- Sy
+(at (select {c: (wavg y 6.0) from: Fb by: w asc: w}) 'c) -- [6.0 6.0 6.0 6.0 6.0 6.0 6.0]
+(first (at (select {c: (wsum y 6.0) from: Fb}) 'c)) -- (sum Sy)
+(first (at (select {c: (wsum y 6.0) from: Pb}) 'c)) -- (sum Sy)
+;; ungrouped over > RAY_PARALLEL_THRESHOLD rows: the keyless group takes the
+;; radix emit, whose key-column VLAs were sized n_keys == 0 (UBSan abort).
+(.sys.exec "rm -rf /tmp/rfl_agg_pbin")
+(.db.splayed.set "/tmp/rfl_agg_pbin/1/t/" (mkbin 0 40000))
+(.db.splayed.set "/tmp/rfl_agg_pbin/2/t/" (mkbin 40000 40000))
+(set Pb (.db.parted.get "/tmp/rfl_agg_pbin/" 't))
+(set Fb (concat (mkbin 0 40000) (mkbin 40000 40000)))
+(at (select {c: (wsum y x) from: Pb}) 'c) -- (at (select {c: (wsum y x) from: Fb}) 'c)
+(at (select {c: (wavg y x) from: Pb}) 'c) -- (at (select {c: (wavg y x) from: Fb}) 'c)
+
 ;; ─── cleanup ─────────────────────────────────────────────────────────
-(.sys.exec "rm -rf /tmp/rfl_agg_pf64 /tmp/rfl_agg_pf64b /tmp/rfl_agg_pf64g /tmp/rfl_agg_pi64 /tmp/rfl_agg_pwrap /tmp/rfl_agg_pdate /tmp/rfl_agg_pts /tmp/rfl_agg_plist")
+(.sys.exec "rm -rf /tmp/rfl_agg_pf64 /tmp/rfl_agg_pf64b /tmp/rfl_agg_pf64g /tmp/rfl_agg_pi64 /tmp/rfl_agg_pwrap /tmp/rfl_agg_pdate /tmp/rfl_agg_pts /tmp/rfl_agg_plist /tmp/rfl_agg_pbin /tmp/rfl_agg_pbinw")

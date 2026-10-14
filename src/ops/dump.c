@@ -289,6 +289,10 @@ static void dump_node(FILE* f, ray_graph_t* g, ray_op_t* node, int depth) {
                 /* agg inputs */
                 for (uint32_t i = 0; i < ext->n_aggs; i++)
                     dump_node(f, g, op_node(g, ext->agg_ins[i]), depth + 1);
+                if (ext->agg_ins2)
+                    for (uint32_t i = 0; i < ext->n_aggs; i++)
+                        if (ext->agg_ins2[i] != RAY_OP_NONE)
+                            dump_node(f, g, op_node(g, ext->agg_ins2[i]), depth + 1);
             }
             /* Also recurse into standard inputs */
             for (uint32_t i = 0; i < node->arity && i < 2; i++)

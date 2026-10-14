@@ -46,6 +46,13 @@
 #include "vec/vec.h"
 #include <string.h>
 #include <math.h>
+#include <stdbool.h>
+#include <stdint.h>
+
+/* Shared strict parser for launcher flags and .sys.args.  When core_count is
+ * true, values are limited to the heap registry's total worker capacity. */
+int parse_sys_int_arg(const char* s, bool nonnegative, bool core_count,
+                      int64_t* out);
 
 /* True if every leaf is constant or reduced to a scalar. */
 bool op_tree_is_scalar(ray_graph_t* g, uint32_t id);
@@ -1217,8 +1224,7 @@ ray_t* expr_eval_full(const ray_expr_t* expr, int64_t nrows);
  *
  * Compiles and evaluates `pred` in selection-output mode (per-task rowsel
  * builders dispatched over [0,nrows), then finished into one rowsel block).
- * Handles the parted/non-BOOL guard and the
- * large-table fallback (>RAY_POOL_MAX_TASKS tasks → non-morsel-aligned grain).
+ * Handles the parted/non-BOOL guard.
  * Returns:
  *   - non-NULL rowsel block  → the selection (caller installs / reads it).
  *   - NULL with *all_pass=1  → every row passed (all-pass = "no selection").
@@ -1273,6 +1279,39 @@ int64_t* msd_radix_sort_run(ray_pool_t* pool, uint64_t* keys, int64_t* indices,
                               int64_t n, uint8_t n_bytes,
                               uint64_t** sorted_keys_out);
 void radix_encode_fn(void* arg, uint32_t wid, int64_t start, int64_t end);
+/* A double as a composite radix component: the bits read as an i64 with
+ * a negative value's low 63 bits flipped, so signed i64 order equals
+ * numeric order.  The composite prescans take SIGNED min/max per key; the
+ * single-key encoding (bits ^ mask) is unsigned-ordered instead and would
+ * put every positive below every negative there.  The encode subtracts the
+ * min and so only needs the same form on both sides.  -0.0 reads as +0.0:
+ * the comparator holds the two equal, so a tie between them must not be
+ * split by sign here either (it was, above the comparator's row count). */
+static inline int64_t radix_f64_ord(double x) {
+    if (x == 0.0) x = 0.0;
+    uint64_t bits;
+    memcpy(&bits, &x, 8);
+    return (int64_t)(bits ^ (-(bits >> 63) >> 1));
+}
+
+/* A float null is NaN.  Its bits would pack above every real number, so a
+ * null-bearing float key sorted one way below 64 rows (comparator: a null
+ * is the smallest value) and the other above (composite).  Instead the
+ * prescans leave nulls out of the key's min/max, radix_key_bounds_finish
+ * reserves the slot below the minimum, and the encode maps a null there:
+ * first on ascending, last on descending, as the I64 sentinel INT64_MIN
+ * already is and as the comparator orders it. */
+static inline bool radix_f64_is_null(double x) { return x != x; }
+
+/* Final bounds of key `col` for the composite, once kmin/kmax hold the
+ * min/max over its non-null values.  An F64 key that may hold nulls gets
+ * one slot below its minimum for them; a key with no non-null value at all
+ * (every row null) spans a single slot. */
+static inline void radix_key_bounds_finish(ray_t* col, int64_t* kmin, int64_t* kmax) {
+    if (col->type != RAY_F64) return;
+    if (*kmin > *kmax) { *kmin = 0; *kmax = 0; }
+    if (ray_vec_may_have_nulls(col)) *kmin = (int64_t)((uint64_t)*kmin - 1);
+}
 void mk_prescan_fn(void* arg, uint32_t wid, int64_t start, int64_t end);
 uint32_t* build_enum_rank(ray_t* col, int64_t nrows, ray_t** hdr_out);
 ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit);
