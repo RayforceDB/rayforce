@@ -1478,17 +1478,18 @@ bool ray_sym_domain_intern_batch(ray_sym_domain_t* dom, int64_t n,
                 if (total > 0) {
                     int64_t n_tasks = (total + DOM_INSERT_GRAIN - 1) / DOM_INSERT_GRAIN;
                     b.insert_total = total;
-                    b.done = NULL;
+                    void* done_mem = NULL;
                     if (par && ray_pool_par_dispatch_ok(pool, total, DOM_INSERT_GRAIN) &&
                         n_tasks <= RAY_POOL_MAX_TASKS)
-                        b.done = (_Atomic(uint8_t)*)ray_sys_alloc((size_t)n_tasks);
-                    if (b.done) {
-                        memset((void*)b.done, 0, (size_t)n_tasks);
+                        done_mem = ray_sys_alloc((size_t)n_tasks);
+                    b.done = done_mem;
+                    if (done_mem) {
+                        memset(done_mem, 0, (size_t)n_tasks);
                         ray_pool_dispatch_n(pool, dom_batch_insert_task_fn, &b, (uint32_t)n_tasks);
                         for (int64_t t = 0; t < n_tasks; t++)
                             if (!atomic_load_explicit(&b.done[t], memory_order_acquire))
                                 dom_batch_insert_task_fn(&b, 0, t, t + 1);
-                        ray_sys_free((void*)b.done);
+                        ray_sys_free(done_mem);
                         b.done = NULL;
                     } else {
                         dom_batch_insert_fn(&b, 0, 0, total);
