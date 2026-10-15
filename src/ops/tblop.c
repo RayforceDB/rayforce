@@ -1245,6 +1245,13 @@ ray_t* ray_alter_fn(ray_t** args, int64_t n) {
     /* Resolve the variable */
     ray_t* var = ray_env_get(name_sym->i64);
     if (!var) { ray_release(name_sym); return ray_error("name", NULL); }
+    /* alter writes through ray_env_set, which binds globally.  Refuse a
+     * local target before any mutation rather than reading the local and
+     * silently replacing a different (global) binding. */
+    if (ray_env_get_local(name_sym->i64)) {
+        ray_release(name_sym);
+        return ray_error("domain", "alter: local bindings are not supported");
+    }
 
     /* Second arg: operation name (unevaluated, must be a name) */
     ray_t* op = args[1];
