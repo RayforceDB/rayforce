@@ -2813,7 +2813,7 @@ P3GATE p2_strict=FAIL materialization=FAIL rss=FAIL
 P3 GATE: FAIL
 ```
 
-**D7 no-regression rerun: FAIL (pending)** (P3 GATE FAIL: p2_strict, materialization, rss; answers PASS on every arm)
+**D7 no-regression rerun: FAIL by the letter, after Task 10b** (Rulings 10-1 to 10-5).  Materialization and RSS PASS (Ruling 10-1); first index use fixed (Ruling 10-2); splayed warm q33 1.068 stays open (Ruling 10-3, analysis below); gen-0 q25 (Ruling 10-4) and gen-0 parted (Ruling 10-5) accepted.  Answers PASS on every arm.  The rerun is in "Task 10b" below.
 
 Failing clauses, each profiled on the release binaries (`perf record -g`;
 the top-5 tables are in the Task 10 report):
@@ -2859,3 +2859,74 @@ the top-5 tables are in the Task 10 report):
    under src/lang or src/mem, nor src/ops/collection.c (`parted_to_flat_vec`)
    or src/store/part.c (the splay.c change is write-side).  The cause is code or data
    layout, not P4 logic.
+
+### Task 10b: first index use on generation 2, the D7 rerun (Rulings 10-1 to 10-5)
+
+The index-query driver was rerun in full on 5b8a8ff6 (release, sha256
+af0c122eecba): `W=/home/hetoku/data/tmp/p4_bench p4_bench.sh clean all`
+(20:11-20:18, 9 rounds, 3 first-touch trials; two 20 s load waits).
+ff68a997 changes the validator and the parse only (the stores the writer
+produces are the same).
+
+| query | warm g0 ms | warm g2 ms | ratio | best round g0 / g2 (ratio) | in-process run 1 g0 / g2 | first touch g0 / g2 ms | rows | answers warm / first |
+|---|---|---|---|---|---|---|---|---|
+| q1 UserID point lookup (ClickBench q20) | 0.009 | 0.009 | 0.966 | 0.008 / 0.008 (0.947) | 0.740 / 45.347 | 1.3 / 293.2 | 0 | same / same |
+| q2 RefererHash point lookup (q41's constant) | 0.342 | 0.327 | 0.957 | 0.318 / 0.263 (0.826) | 1.447 / 61.182 | 15.3 / 523.1 | 81558 | same / same |
+| q3 URLHash point lookup (q42's constant) | 0.388 | 0.342 | 0.881 | 0.345 / 0.295 (0.856) | 1.441 / 63.202 | 15.3 / 494.6 | 90899 | same / same |
+| q4 ClickBench q41 | 5.847 | 4.717 | 0.807 | 5.698 / 4.568 (0.802) | 13.276 / 70.473 | 74.7 / 553.7 | 10 | same / same |
+| q5 ClickBench q42 | 4.615 | 4.677 | 1.013 | 4.505 / 4.566 (1.014) | 11.119 / 71.871 | 36.7 / 509.1 | 10 | same / same |
+
+meta p4=5b8a8ff6/af0c122eecba; sizes, kinds and `.idx.uses` as above.
+
+**P4 index answers: PASS** (every query's full answer, warm and first touch, g2 equal to g0)
+**P4 index queries warm: PASS** (each warm median at most 1.05x generation 0, or under 1 ms within 0.05 ms)
+
+First index use (Ruling 10-2), in-process run 1 on g2: q1 253 -> 45 ms,
+q2 636 -> 61 ms, q3 653 -> 63 ms; first touch 630 -> 293, 1312 -> 523 and
+1253 -> 495 ms.  The distinctness check moved into the reachability walk
+(a sort only past a compare budget), and tables of 2^17 buckets or more are
+checked and copied over the pool (the serial checks rerun on any doubt, so
+verdicts and messages do not depend on the core count).  The rest of a
+first use is mostly the page faults of about 270 MB of fresh heap (the
+decoded column and the four HASH children) on this 4-core machine.
+
+D7, the splayed stage only, on 5b8a8ff6 against BASE 25eabaf2:
+`W=/home/hetoku/data/tmp/p2_bench BASE=25eabaf2 p2_bench.sh prep`, then
+`splayed` (20:19-20:52).  Task 10's data in that directory was moved, not
+deleted, to `old_p4t10_20261015/`.  The driver now records the memx rows
+(arm A without queries 41 and 42, 5b8a8ff6).  Splayed-only summary:
+/home/hetoku/data/tmp/p2_bench/summary.txt.  The gate lines below come from
+the splayed rows joined with Task 10's parted rows (arms B, C1 and R,
+binary 3abe880e; ff68a997 does not run on those arms, which hold no index
+region): /home/hetoku/data/tmp/p4t10b/d7_merged.tsv.
+
+```
+totals over all 43: warm 1709.4 vs 1645.7 (0.963); first run 2522.3 vs 2705.8 (1.073); 3-run 5994.6 vs 6079.5 (1.014)
+pi_row q41 warm 0.825 first 5.642 3run 3.388
+pi_row q42 warm 1.036 first 6.638 3run 4.102
+gen0 warm_gmean(base>=1ms n=34)=1.001 warm_worst=1.111 worst5 [(1.111, 'q25'), (1.077, 'q27'), (1.031, 'q30'), (1.02, 'q42'), (1.018, 'q20')]
+GATE (strict) splayed[answers=PASS warm=FAIL cold=PASS first=PASS materializing_warm=PASS no_unexpected_materialization=PASS first_total=PASS] parted[answers=PASS warm=PASS cold=PASS first=PASS materializing_warm=PASS no_unexpected_materialization=PASS] gen0-splayed[answers=PASS warm=FAIL] gen0-parted[answers=PASS warm=FAIL q16_first=PASS] gen0-ragged[answers=PASS warm=FAIL]
+P2 GATE (strict): FAIL
+p3_unexpected_materializations none
+rss A: 5111900 -> 5968704 kB (x1.168 over all 43, bound 1.1)
+rss A without D2 q41,q42: 5084840 -> 5039312 kB (x0.991, bound 1.1, gated)
+rss B: 12144580 -> 11965660 kB (x0.985 over all 43, bound 1.1)
+P3GATE p2_strict=FAIL materialization=PASS rss=PASS
+P3 GATE: FAIL
+```
+
+The strict line's failing clauses, by ruling:
+- splayed warm: q33 1.068 (202.9 -> 216.6 ms) only (Ruling 10-3).  The gap is
+  phase 2 of the fused encoded group (`agg_radix_group_fused_fn`, +325 M
+  cycles a query, +19% on `agg_radix_group_fn`), reading each partition as
+  about 300 runs of about 7 records, one per chunk; the fused phase 1 is
+  about 55 M cycles cheaper than the two passes.  Prefetching whole runs,
+  prefetching further ahead and gathering the runs first did not help; a
+  huge-page record buffer helps generation 0 (q33 205 -> 198 ms) and not
+  generation 2.  Larger runs end the fused pass for q33 (212-215 ms) but
+  cost q15, q16, q17 and q36 6-16% on generation 2.  Not closed: the fix
+  is phase 2's layout, more than a medium change.
+- gen-0 splayed warm: q25 1.111 (0.91 -> 1.01 ms; Ruling 10-4, accepted).
+- gen-0 parted and ragged warm (Task 10's parted stage; Ruling 10-5,
+  accepted).
+
