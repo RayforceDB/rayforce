@@ -727,15 +727,21 @@ static bool expr_null_capable(uint8_t op, int8_t dt, int8_t t1) {
     return false;
 }
 
-/* The bytes of a STR literal constant node ("" included) or of a non-null
- * SYM one, or false. */
+/* The null SYM literal (', the SYM null "": id 0 in every domain). */
+static bool expr_lit_null_sym(const ray_t* lit) {
+    return lit && lit->type == -RAY_SYM && RAY_ATOM_IS_NULL(lit);
+}
+
+/* The bytes of a STR literal constant node ("" included) or of a SYM one
+ * (the null SYM as ""), or false. */
 static bool expr_sym_lit_bytes(ray_graph_t* g, ray_op_t* n, const char** s, size_t* len) {
     if (!n || n->opcode != OP_CONST) return false;
     ray_op_ext_t* ext = find_ext(g, n->id);
     ray_t* lit = ext ? ext->literal : NULL;
     if (!lit) return false;
     if (lit->type == -RAY_STR) { *s = ray_str_ptr(lit); *len = ray_str_len(lit); return true; }   /* "" included */
-    if (lit->type == -RAY_SYM && !RAY_ATOM_IS_NULL(lit)) {
+    if (expr_lit_null_sym(lit)) { *s = ""; *len = 0; return true; }
+    if (lit->type == -RAY_SYM) {
         ray_t* str = ray_sym_str(lit->i64);        /* borrowed from the intern table */
         if (!str) return false;
         *s = ray_str_ptr(str); *len = ray_str_len(str);
@@ -743,9 +749,19 @@ static bool expr_sym_lit_bytes(ray_graph_t* g, ray_op_t* n, const char** s, size
     }
     return false;
 }
-static bool expr_sym_lit(ray_graph_t* g, ray_op_t* n) {
+/* `n` is a SYM / STR literal an EQ / NE against `col` may compare on the
+ * column's file-domain ids.  The null SYM literal only against a
+ * generation-2 column (its id 0, decided by ids on the encoded route,
+ * spec "SYM ids decide equality"); generation 0 keeps its fallback for it,
+ * unchanged. */
+static bool expr_sym_lit(ray_graph_t* g, ray_t* tbl, ray_op_t* n, ray_op_t* col) {
     const char* s; size_t len;
-    return expr_sym_lit_bytes(g, n, &s, &len);
+    if (!expr_sym_lit_bytes(g, n, &s, &len)) return false;
+    ray_op_ext_t* ext = find_ext(g, n->id);
+    if (!expr_lit_null_sym(ext->literal)) return true;
+    ray_op_ext_t* ce = col && col->opcode == OP_SCAN ? find_ext(g, col->id) : NULL;
+    ray_col_meta_t cm;
+    return ce && ray_table_col_meta(tbl, ce->sym, &cm) && cm.enc != NULL;
 }
 /* A STR / SYM literal as an id of a file-domain source: "" is id 0 in
  * every domain; a string absent from the domain is the impossible id -1
@@ -778,14 +794,17 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
      * below everything in all six comparisons (null == null, null != x,
      * null < x hold; null == x, x < null do not).  Raw id compares in the
      * fused lane produce the same table, so a SYM column whose every
-     * consumer in this subtree is EQ..GE against a non-null constant (a
-     * null literal bails at OP_CONST) or another SYM scan needs no O(n)
+     * consumer in this subtree is EQ..GE against a constant (a null
+     * literal bails at OP_CONST, except "" and the null SYM, id 0, read
+     * only by an EQ / NE on file-domain ids: null == null holds, as the
+     * fallback ranks it) or another SYM scan needs no O(n)
      * ray_vec_has_nulls walk.  Any other consumer — ISNULL, CAST,
      * arithmetic — reads the lane as a value and keeps the proof. */
     uint8_t sym_cmp_safe[nc];
     memset(sym_cmp_safe, 1, nc * sizeof(uint8_t));
     /* Which nodes are consumed only by EQ / NE against a STR constant
-     * ("" included: id 0) or a non-null SYM one: a file-domain SYM column
+     * ("" included: id 0) or a SYM one (the null SYM, id 0, only for a
+     * generation-2 column: expr_sym_lit): a file-domain SYM column
      * read so compares on its own
      * ids once the constant is translated into its domain (below, at the
      * compare).  An ordered consumer keeps EXPR_BAIL_SYM_DOMAIN: ids are
@@ -827,7 +846,7 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
                     }
                 }
                 if (!safe) sym_cmp_safe[ch->id] = 0;
-                if (!(eqne && expr_sym_lit(g, op_child(g, n, 1 - i)))) sym_eq_only[ch->id] = 0;
+                if (!(eqne && expr_sym_lit(g, tbl, op_child(g, n, 1 - i), ch))) sym_eq_only[ch->id] = 0;
                 if (!seen[ch->id]) { seen[ch->id] = 1; stk[ssp++] = ch->id; }
             }
         }
@@ -1004,11 +1023,12 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
                 if (!ext || !ext->literal) EXPR_BAIL(EXPR_BAIL_CONST);
                 double cf; int64_t ci; bool is_f64;
                 if (RAY_ATOM_IS_NULL(ext->literal)) {
-                    /* null constants need the null-aware path, except "":
-                     * id 0 of a file-domain SYM compare, which reads its own
-                     * re-translation (the check after the walk bails any
-                     * other reader) */
-                    if (ext->literal->type != -RAY_STR) EXPR_BAIL(EXPR_BAIL_CONST);
+                    /* null constants need the null-aware path, except ""
+                     * and the null SYM: id 0 of a file-domain SYM compare,
+                     * which reads its own re-translation (the check after
+                     * the walk bails any other reader) */
+                    if (ext->literal->type != -RAY_STR && !expr_lit_null_sym(ext->literal))
+                        EXPR_BAIL(EXPR_BAIL_CONST);
                     const_unres[r] = true;
                     ci = 0; cf = 0; is_f64 = false;
                 } else if (!atom_to_numeric(ext->literal, &cf, &ci, &is_f64)) {

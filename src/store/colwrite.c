@@ -156,15 +156,24 @@ static ray_err_t colw_gen2_vec(ray_t* vec, const char* path, bool durable, uint8
 }
 
 /* Index kind / flags recorded for a source: a plain column's attached
- * index, or an encoded column's own header (every recorded kind). */
-static void colw_src_index_meta(ray_t* obj, uint8_t* ik, uint8_t* cf) {
+ * index, or an encoded column's own header (every recorded kind).  A SYM
+ * column's stale HASH / PART still names its kind (*stale): the range
+ * writer rebuilds every SYM index from the column, so the stale contents
+ * never matter, but its UNIQUE and order name are not trusted (generation
+ * 0 rebuilds a stale SYM HASH too: generation 2 keeps at least as much). */
+static void colw_src_index_meta(ray_t* obj, uint8_t* ik, uint8_t* cf, bool* stale) {
+    *stale = false;
     if (obj->type == RAY_ENCCOL) {
         ray_enccol_t* e = ray_enccol_of(obj);
         *ik = e->hdr.index_kind;
         *cf = e->hdr.col_flags & RAY_ENC_FLAG_UNIQUE;
         return;
     }
-    ray_col_gen2_index_meta(obj, ik, cf);
+    ray_col_gen2_index_meta(obj, ik, cf);           /* a stale root: no kind, no UNIQUE */
+    if (*ik == 0 && obj->type == RAY_SYM && ray_index_has(obj)) {
+        ray_idx_kind_t k = ray_index_kind(obj);
+        if (k == RAY_IDX_HASH || k == RAY_IDX_PART) { *ik = (uint8_t)k; *stale = true; }
+    }
 }
 
 /* The target id of `id` (P1 Task 14's rule): checked against target_dom
@@ -210,7 +219,10 @@ static ray_t* colw_sym_rebuild(ray_col_write_t* w, ray_t* plain, uint8_t attrs, 
     ray_t* rm = ray_sym_vec_new(attrs & RAY_SYM_W_MASK, plain->len);
     if (!rm || RAY_IS_ERR(rm)) return rm ? rm : ray_error("oom", "index rebuild");
     rm->len = plain->len;
-    rm->attrs |= (uint8_t)(attrs & RAY_ATTR_HAS_NULLS);
+    /* no HAS_NULLS: SYM nulls are in-band (id 0) and the builders read a
+     * SYM column as possibly null whatever its attrs
+     * (ray_vec_may_have_nulls); the root they build records nothing of it
+     * on the wire (saved_attrs is not serialized) */
     struct ray_sym_domain_s* vdom = ray_sym_vec_domain(plain);
     const void* sd = ray_data(plain);
     for (int64_t i = 0; i < plain->len; i++) {
@@ -229,9 +241,13 @@ static ray_t* colw_sym_rebuild(ray_col_write_t* w, ray_t* plain, uint8_t attrs, 
  * rebuilt over the target ids, or any kind on REBUILD, built from the
  * materialized column), or an encoded non-SYM source's region to copy
  * after validation (*copy, into the source's mapping).  The order name of
- * a rebuilt root is the source root's trustworthy one, which a
- * materialization of generation 2 carries (its parsed root). */
-static ray_t* colw_region_prepare(ray_col_write_t* w, uint8_t ik, uint8_t attrs, const int64_t* lut,
+ * a rebuilt root is the source root's trustworthy one (none for a stale
+ * root), which a materialization of generation 2 carries (its parsed
+ * root).  Fails closed: a copy of a region the validator refuses, and a
+ * REBUILD (or SYM rebuild) of an encoded source whose region is corrupt
+ * (its materialization validates and attaches the region first), both
+ * fail the save with the validator's corrupt error; nothing is written. */
+static ray_t* colw_region_prepare(ray_col_write_t* w, uint8_t ik, uint8_t attrs, const int64_t* lut, bool stale,
                                   ray_t** root, const uint8_t** copy, uint64_t* copy_len,
                                   const char** order, uint32_t* order_len) {
     ray_t* src = w->src.obj;
@@ -249,7 +265,7 @@ static ray_t* colw_region_prepare(ray_col_write_t* w, uint8_t ik, uint8_t attrs,
     /* a materialization is counted once and owned by the source */
     ray_t* plain = enc ? ray_enccol_materialize(src) : src;
     if (RAY_IS_ERR(plain)) return plain;
-    if (ray_index_has(plain)) *order = colw_order_name(plain->index, order_len);
+    if (!stale && ray_index_has(plain)) *order = colw_order_name(plain->index, order_len);
     if (w->src.type == RAY_SYM) return colw_sym_rebuild(w, plain, attrs, lut, ik, root);
     ray_retain(plain);
     return colw_rebuild_root(plain, ik, root);
@@ -292,7 +308,8 @@ static ray_err_t colw_gen2_range(ray_col_write_t* w, const char* path) {
         }
     }
     uint8_t src_ik, cf;
-    colw_src_index_meta(s->obj, &src_ik, &cf);
+    bool stale;
+    colw_src_index_meta(s->obj, &src_ik, &cf, &stale);
     /* a region from the source's own kind (as colw_gen2_vec): an override
      * never re-labels a region kind, DROP writes none, and a region kind is
      * never recorded without its region */
@@ -312,7 +329,14 @@ static ray_err_t colw_gen2_range(ray_col_write_t* w, const char* path) {
     const uint8_t* idx_copy = NULL; uint64_t idx_copy_len = 0;
     const char* order = NULL; uint32_t order_len = 0;
     if (region) {
-        ray_t* ierr = colw_region_prepare(w, ik, attrs, lut, &idx_root, &idx_copy, &idx_copy_len, &order, &order_len);
+        ray_t* ierr = colw_region_prepare(w, ik, attrs, lut, stale, &idx_root, &idx_copy, &idx_copy_len,
+                                          &order, &order_len);
+        /* a stale SYM PART over values no longer in contiguous blocks has
+         * no rebuild: it records nothing, as a stale root did before */
+        if (ierr && stale && strcmp(ray_err_code(ierr), "domain") == 0) {
+            ray_error_free(ierr); ierr = NULL;
+            ik = 0;
+        }
         if (ierr) { ray_err_t ie = ray_err_from_obj(ierr); ray_error_free(ierr); return ie; }
     }
     uint8_t* buf = colw_alloc(NULL, (size_t)RAY_ENC_CHUNK * (esz ? esz : 1));

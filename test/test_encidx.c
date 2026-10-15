@@ -2365,44 +2365,44 @@ static test_result_t test_consult_routes(void) {
      * consults the column's region index (its materialization on generation
      * 2 is that index use); every other shape takes P3's encoded route on
      * generation 2 and materializes nothing. */
-    static const struct { const char* q; bool uses; const char* d; bool scan_mat; } qs[] = {
-        { "(sum (at (select {from: X where: (== k 4242)}) 'v))", true, NULL, false },
-        { "(sum (at (select {from: X where: (in k [1 2 3 4242])}) 'v))", true, NULL, false },
-        { "(sum (at (select {from: X where: (> s 3000)}) 'v))", true, NULL, false },
-        { "(sum (at (select {from: X where: (== b 50020)}) 'v))", true, NULL, false },     /* present: consulted, no prune */
-        { "(sum (at (select {from: X where: (== b 3)}) 'v))", true, NULL, false },
-        { "(sum (at (select {from: X where: (== p 77)}) 'v))", true, NULL, false },
-        { "(sum (at (select {from: X where: (in p [3 77])}) 'v))", true, NULL, false },
-        { "(sum (at (select {from: X where: (!= k 4242)}) 'v))", false, NULL, false },
-        { "(sum (at (select {from: X where: (> k 50000)}) 'v))", false, NULL, false },
-        { "(sum (at (select {from: X where: (< k 500)}) 'v))", false, NULL, false },
-        { "(sum (at (select {from: X where: (> k 999999)}) 'v))", false, NULL, false },
-        { "(sum (at (select {from: X where: (!= s 3000)}) 'v))", false, NULL, false },
-        { "(sum (at (select {from: X where: (in s [1 2 3000])}) 'v))", false, NULL, false },
-        { "(sum (at (select {from: X where: (!= b 5)}) 'v))", false, NULL, false },
-        { "(sum (at (select {from: X where: (> b 40000)}) 'v))", false, NULL, false },
-        { "(sum (at (select {from: X where: (in b [3 50020])}) 'v))", false, NULL, false },
-        { "(sum (at (select {from: X where: (!= p 77)}) 'v))", false, NULL, false },
-        { "(sum (at (select {from: X where: (> p 90)}) 'v))", false, NULL, false },
-        { "(sum (at (select {from: X where: (== k 42)}) 'v))", false, "cn", false },
-        { "(sum (at (select {from: X where: (in k [42 43])}) 'v))", true, "cn", false },
+    static const struct { const char* q; bool uses; const char* d; } qs[] = {
+        { "(sum (at (select {from: X where: (== k 4242)}) 'v))", true, NULL },
+        { "(sum (at (select {from: X where: (in k [1 2 3 4242])}) 'v))", true, NULL },
+        { "(sum (at (select {from: X where: (> s 3000)}) 'v))", true, NULL },
+        { "(sum (at (select {from: X where: (== b 50020)}) 'v))", true, NULL },     /* present: consulted, no prune */
+        { "(sum (at (select {from: X where: (== b 3)}) 'v))", true, NULL },
+        { "(sum (at (select {from: X where: (== p 77)}) 'v))", true, NULL },
+        { "(sum (at (select {from: X where: (in p [3 77])}) 'v))", true, NULL },
+        { "(sum (at (select {from: X where: (!= k 4242)}) 'v))", false, NULL },
+        { "(sum (at (select {from: X where: (> k 50000)}) 'v))", false, NULL },
+        { "(sum (at (select {from: X where: (< k 500)}) 'v))", false, NULL },
+        { "(sum (at (select {from: X where: (> k 999999)}) 'v))", false, NULL },
+        { "(sum (at (select {from: X where: (!= s 3000)}) 'v))", false, NULL },
+        { "(sum (at (select {from: X where: (in s [1 2 3000])}) 'v))", false, NULL },
+        { "(sum (at (select {from: X where: (!= b 5)}) 'v))", false, NULL },
+        { "(sum (at (select {from: X where: (> b 40000)}) 'v))", false, NULL },
+        { "(sum (at (select {from: X where: (in b [3 50020])}) 'v))", false, NULL },
+        { "(sum (at (select {from: X where: (!= p 77)}) 'v))", false, NULL },
+        { "(sum (at (select {from: X where: (> p 90)}) 'v))", false, NULL },
+        { "(sum (at (select {from: X where: (== k 42)}) 'v))", false, "cn" },
+        { "(sum (at (select {from: X where: (in k [42 43])}) 'v))", true, "cn" },
         /* SORT: every compare but NE consults the range probe */
-        { "(sum (at (select {from: X where: (== s 3000)}) 'v))", true, NULL, false },
-        { "(sum (at (select {from: X where: (< s -3000)}) 'v))", true, NULL, false },
-        { "(sum (at (select {from: X where: (<= s -3000)}) 'v))", true, NULL, false },
-        { "(sum (at (select {from: X where: (>= s 3000)}) 'v))", true, NULL, false },
+        { "(sum (at (select {from: X where: (== s 3000)}) 'v))", true, NULL },
+        { "(sum (at (select {from: X where: (< s -3000)}) 'v))", true, NULL },
+        { "(sum (at (select {from: X where: (<= s -3000)}) 'v))", true, NULL },
+        { "(sum (at (select {from: X where: (>= s 3000)}) 'v))", true, NULL },
         /* float keys: neither HASH nor BLOOM, EQ or `in` */
-        { "(sum (at (select {from: X where: (== h 42.0)}) 'v))", false, "cf", false },
-        { "(sum (at (select {from: X where: (in h [42.0 43.0])}) 'v))", false, "cf", false },
-        { "(sum (at (select {from: X where: (== b 42.0)}) 'v))", false, "cf", false },
-        { "(sum (at (select {from: X where: (in b [42.0 43.0])}) 'v))", false, "cf", false },
+        { "(sum (at (select {from: X where: (== h 42.0)}) 'v))", false, "cf" },
+        { "(sum (at (select {from: X where: (in h [42.0 43.0])}) 'v))", false, "cf" },
+        { "(sum (at (select {from: X where: (== b 42.0)}) 'v))", false, "cf" },
+        { "(sum (at (select {from: X where: (in b [42.0 43.0])}) 'v))", false, "cf" },
         /* SYM HASH with nulls: key 0, a nonzero key, `in` */
-        /* the null key: the encoded route materializes a SYM column for it
-         * whatever its index (as for an unindexed one); the sites agree */
-        { "(sum (at (select {from: X where: (== k ')}) 'v))", false, "cs", true },
-        { "(sum (at (select {from: X where: (== k 'k42)}) 'v))", true, "cs", false },
-        { "(sum (at (select {from: X where: (in k ['k42 'k43])}) 'v))", true, "cs", false },
-        { NULL, false, NULL, false },
+        /* the null key: decided on ids on the encoded route (id 0) */
+        { "(sum (at (select {from: X where: (== k ')}) 'v))", false, "cs" },
+        { "(sum (at (select {from: X where: (!= k ')}) 'v))", false, "cs" },
+        { "(sum (at (select {from: X where: (== k 'k42)}) 'v))", true, "cs" },
+        { "(sum (at (select {from: X where: (in k ['k42 'k43])}) 'v))", true, "cs" },
+        { NULL, false, NULL },
     };
     for (int i = 0; qs[i].q; i++) {
         uint64_t c[2][IDX_SITE__N], h[2][IDX_SITE__N]; int64_t n[2];
@@ -2417,7 +2417,7 @@ static test_result_t test_consult_routes(void) {
             for (int s = 0; s < IDX_SITE__N; s++) { c[g][s] = ray_idx_consults[s] - c0[s]; h[g][s] = ray_idx_hits[s] - h0[s]; }
             if (g) {
                 ray_enc_counters_t k; ray_enc_counters_get(&k);
-                TEST_ASSERT_FMT(k.materialized == (qs[i].uses || qs[i].scan_mat ? 1u : 0u), "%s: %llu materializations", qs[i].q,
+                TEST_ASSERT_FMT(k.materialized == (qs[i].uses ? 1u : 0u), "%s: %llu materializations", qs[i].q,
                                 (unsigned long long)k.materialized);
                 TEST_ASSERT_EQ_I(ixr_i64("(if (at (.idx.info X 'v) 'materialized) 1 0)"), 0);
             }
@@ -2601,6 +2601,8 @@ static test_result_t test_sym_rebuild_remap(void) {
     v = with_index(v, ray_index_attach_hash);
     TEST_ASSERT_NOT_NULL(v);
     ray_index_payload(v->index)->markers |= RAY_MARK_UNIQUE;    /* flag only: the builder does not check it */
+    int64_t ts = ray_sym_intern("ts", 2);
+    ray_index_payload(v->index)->u.hash.order_sym = ts;          /* a heap root of this process: trusted */
     ray_sym_domain_t* dom = ray_sym_domain_open_or_create(ray_test_tmp(IDX_TMP "/sym"));
     TEST_ASSERT_NOT_NULL(dom);
     for (int i = 0; i < 300; i++) { int n = snprintf(wb, sizeof wb, "pre%d", i); (void)ray_sym_domain_intern(dom, wb, (size_t)n); }
@@ -2616,6 +2618,7 @@ static test_result_t test_sym_rebuild_remap(void) {
     TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m));
     TEST_ASSERT_EQ_I(ray_index_kind(m), RAY_IDX_HASH);
     TEST_ASSERT_TRUE(ray_index_payload(m->index)->markers & RAY_MARK_UNIQUE);
+    TEST_ASSERT_EQ_I(ray_index_payload(m->index)->u.hash.order_sym, ts);   /* the source's order name */
     for (int w = 0; w < 1000; w += 111) {
         int n = snprintf(wb, sizeof wb, "w%d", w);
         int64_t pos = ray_sym_domain_find(dom, wb, (size_t)n);
@@ -2639,6 +2642,8 @@ static test_result_t test_sym_rebuild_remap(void) {
     TEST_ASSERT_EQ_I(ray_enccol_of(c)->hdr.col_flags, RAY_ENC_FLAG_UNIQUE);
     m = ray_enccol_materialize(c);
     TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m));
+    TEST_ASSERT_TRUE(ray_index_payload(m->index)->markers & RAY_MARK_UNIQUE);
+    TEST_ASSERT_EQ_I(ray_index_payload(m->index)->u.hash.order_sym, ts);   /* kept through the encoded re-save */
     ray_t* sel = ray_index_hash_eq_rowsel(m, ray_sym_domain_find(dom, "w7", 2));
     TEST_ASSERT_TRUE(sel && ray_rowsel_meta(sel)->total_pass == 5);
     ray_rowsel_release(sel);
@@ -2727,7 +2732,156 @@ static test_result_t test_encoded_keep_copies(void) {
     TEST_ASSERT_TRUE(same);
     /* an unknown decision is a type error; generation 0 takes KEEP only */
     TEST_ASSERT_EQ_I(ix_save_ctx(v, ray_test_tmp(IDX_TMP "/x"), NULL, RAY_COL_IDX_DROP + 1), RAY_ERR_TYPE);
+    /* a corrupt source region fails closed: KEEP (the copy is validated
+     * first) and REBUILD (the materialization validates) fail with corrupt,
+     * and nothing is published or left behind */
+    const char* pc = ray_test_tmp(IDX_TMP "/ac");
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, pc, 2), RAY_OK);
+    ray_enc_hdr_t ec = ix_hdr(pc);
+    TEST_ASSERT_EQ_I(ec.index_kind, RAY_IDX_HASH);
+    uint8_t bad = 1; ix_patch(pc, (long)ec.index_off + 3, &bad, 1);     /* root reserved bytes */
+    for (int d = 0; d < 2; d++) {
+        c = ray_col_mmap(pc);
+        TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c) && c->type == RAY_ENCCOL);   /* the open does not read the region */
+        const char* out = ray_test_tmp(d ? IDX_TMP "/acr" : IDX_TMP "/ack");
+        ray_error_clear();
+        ray_err_t ce = ix_save_ctx(c, out, NULL, d ? RAY_COL_IDX_REBUILD : RAY_COL_IDX_KEEP);
+        TEST_ASSERT_FMT(ce == RAY_ERR_CORRUPT, "decision %d: %d", d, (int)ce);
+        TEST_ASSERT_TRUE(ray_error_msg() && strstr(ray_error_msg(), "index root reserved bytes set"));
+        FILE* f = fopen(out, "rb");                                         TEST_ASSERT_NULL(f);
+        char tmpp[1200]; snprintf(tmpp, sizeof tmpp, "%s.tmp", out);
+        f = fopen(tmpp, "rb");                                              TEST_ASSERT_NULL(f);
+        ray_release(c);
+    }
     ray_release(v);
+    PASS();
+}
+
+/* Review minor 1: a stale SYM HASH / PART is rebuilt from the column on
+ * generation 2 (every SYM index is rebuilt over the target ids), without
+ * the stale root's UNIQUE: after a splayed save and reload, generation 2
+ * keeps at least what generation 0 keeps (a rebuilt HASH; no PART). */
+static test_result_t test_sym_stale_rebuild(void) {
+    char wb[16];
+    ray_t* g = ray_sym_vec_new(RAY_SYM_W64, 4000); g->len = 4000;
+    ray_t* p = ray_sym_vec_new(RAY_SYM_W64, 4000); p->len = 4000;
+    for (int i = 0; i < 4000; i++) {
+        int n = snprintf(wb, sizeof wb, "sg%d", (i * 7) % 800);
+        ((int64_t*)ray_data(g))[i] = ray_sym_intern(wb, (size_t)n);
+        n = snprintf(wb, sizeof wb, "sp%d", i / 500);
+        ((int64_t*)ray_data(p))[i] = ray_sym_intern(wb, (size_t)n);
+    }
+    g = with_index(g, ray_index_attach_hash);
+    p = with_index(p, ray_index_attach_part);
+    TEST_ASSERT_TRUE(g && p);
+    ray_index_payload(g->index)->markers |= RAY_MARK_UNIQUE;
+    ray_index_payload(g->index)->built_for_len = 3999;              /* stale */
+    ray_index_payload(p->index)->built_for_len = 3999;
+    ray_t* t = ray_table_new(2);
+    t = ray_table_add_col(t, ray_sym_intern("g", 1), g);
+    t = ray_table_add_col(t, ray_sym_intern("p", 1), p);
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    for (int gen = 0; gen <= 2; gen += 2) {
+        char d[64], y[64];
+        snprintf(d, sizeof d, IDX_TMP "/st%d/", gen); snprintf(y, sizeof y, IDX_TMP "/st%d.sym", gen);
+        TEST_ASSERT_EQ_I(ray_splay_save_mode(t, ray_test_tmp(d), ray_test_tmp(y), gen ? RAY_COMPRESS_ON : RAY_COMPRESS_OFF),
+                         RAY_OK);
+    }
+    ray_index_payload(g->index)->built_for_len = 4000;
+    ray_index_payload(p->index)->built_for_len = 4000;
+    ray_t* l0 = ray_read_splayed(ray_test_tmp(IDX_TMP "/st0/"), ray_test_tmp(IDX_TMP "/st0.sym"));
+    ray_t* l2 = ray_read_splayed(ray_test_tmp(IDX_TMP "/st2/"), ray_test_tmp(IDX_TMP "/st2.sym"));
+    TEST_ASSERT_TRUE(l0 && !RAY_IS_ERR(l0) && l2 && !RAY_IS_ERR(l2));
+    ray_t* g0 = ray_table_get_col(l0, ray_sym_intern("g", 1));
+    ray_t* p0 = ray_table_get_col(l0, ray_sym_intern("p", 1));
+    ray_t* g2 = ray_table_col(l2, ray_sym_intern("g", 1));             /* materialized: attaches the region */
+    ray_t* p2 = ray_table_col(l2, ray_sym_intern("p", 1));
+    TEST_ASSERT_TRUE(g2 && !RAY_IS_ERR(g2) && p2 && !RAY_IS_ERR(p2));
+    TEST_ASSERT_EQ_I(ray_index_kind(g0), RAY_IDX_HASH);              /* generation 0 rebuilds the HASH */
+    TEST_ASSERT_TRUE(ray_index_kind(p0) != RAY_IDX_PART);            /* and drops the PART */
+    TEST_ASSERT_EQ_I(ray_index_kind(g2), RAY_IDX_HASH);
+    TEST_ASSERT_EQ_I(ray_index_kind(p2), RAY_IDX_PART);
+    TEST_ASSERT_FALSE(ray_index_payload(g2->index)->markers & RAY_MARK_UNIQUE);   /* a stale flag is not kept */
+    TEST_ASSERT_EQ_I(ray_index_payload(g2->index)->built_for_len, 4000);
+    /* the rebuilt indexes answer by the file's ids */
+    ray_t* cell = ray_sym_vec_cell(g2, 7);
+    int64_t key = ray_read_sym(ray_data(g2), 7, RAY_SYM, g2->attrs);
+    ray_t* sel = ray_index_hash_eq_rowsel(g2, key);
+    TEST_ASSERT_TRUE(cell && sel && ray_rowsel_meta(sel)->total_pass == 5);
+    ray_rowsel_release(sel);
+    key = ray_read_sym(ray_data(p2), 1000, RAY_SYM, p2->attrs);
+    sel = ray_index_part_eq_rowsel(p2, key);
+    TEST_ASSERT_TRUE(sel && ray_rowsel_meta(sel)->total_pass == 500);
+    ray_rowsel_release(sel);
+    ray_release(l0); ray_release(l2); ray_release(t); ray_release(g); ray_release(p);
+    PASS();
+}
+
+/* A stale SYM PART over values that are no longer in contiguous blocks has
+ * no rebuild: the save still succeeds and records no index. */
+static test_result_t test_sym_stale_part_unbuildable(void) {
+    char wb[16];
+    ray_t* p = ray_sym_vec_new(RAY_SYM_W64, 600); p->len = 600;
+    for (int i = 0; i < 600; i++) { int n = snprintf(wb, sizeof wb, "q%d", i / 100); ((int64_t*)ray_data(p))[i] = ray_sym_intern(wb, (size_t)n); }
+    p = with_index(p, ray_index_attach_part);
+    TEST_ASSERT_NOT_NULL(p);
+    ray_index_payload(p->index)->built_for_len = 599;              /* stale */
+    ((int64_t*)ray_data(p))[599] = ray_sym_intern("q0", 2);        /* q0 again after q5: not contiguous */
+    ray_sym_domain_t* dom = ray_sym_domain_open_or_create(ray_test_tmp(IDX_TMP "/symq"));
+    for (int i = 0; i < 6; i++) { int n = snprintf(wb, sizeof wb, "q%d", i); (void)ray_sym_domain_intern(dom, wb, (size_t)n); }
+    const char* pa = ray_test_tmp(IDX_TMP "/sq");
+    TEST_ASSERT_EQ_I(ix_save_ctx(p, pa, dom, RAY_COL_IDX_KEEP), RAY_OK);
+    size_t n; ray_enc_hdr_t eh; uint64_t fn;
+    TEST_ASSERT_NULL(ix_file_region(pa, &n, &eh, &fn));
+    TEST_ASSERT_EQ_I(eh.index_kind, 0);
+    ray_t* c = ray_col_mmap_splayed_dom(pa, dom);
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+    ray_release(c);
+    ray_index_payload(p->index)->built_for_len = 600;
+    ray_sym_domain_release(dom); ray_release(p);
+    PASS();
+}
+
+/* Review important 1: the null-key compare on a SYM HASH uses no index
+ * (generation 0 consults none for key 0), so a corrupt region never fails
+ * it: generation 2 answers on ids as generation 0 does, while an
+ * index-using key fails with the validator's corrupt error. */
+static test_result_t test_corrupt_sym_hash_null_key(void) {
+    ray_t* r = ixr_eval("(set SK (as 'SYM (map (fn [i] (if (== i 0) \"\" (concat \"k\" (as 'STR i)))) (til 5000))))");
+    if (r) ray_release(r);
+    r = ixr_eval("(set TS (table [k v] (list (.idx.hash (at SK (% (* (til 70000) 7) 5000))) (til 70000))))");
+    if (r) ray_release(r);
+    r = ixr_eval("(.db.splayed.set \"" IDX_TMP "/zn0/\" TS {compress: false})"); if (r) ray_release(r);
+    r = ixr_eval("(.db.splayed.set \"" IDX_TMP "/zn2/\" TS {compress: true})"); if (r) ray_release(r);
+    char kp[1200];
+    TEST_ASSERT_TRUE(ix_live_path(IDX_TMP "/zn2/", "k", kp, sizeof kp));
+    ray_enc_hdr_t eh = ix_hdr(kp);
+    TEST_ASSERT_EQ_I(eh.index_kind, RAY_IDX_HASH);
+    uint8_t bad = 1; ix_patch(kp, (long)eh.index_off + 3, &bad, 1);
+    static const char* const qs[] = {
+        "(sum (at (select {from: X where: (== k ')}) 'v))",
+        "(sum (at (select {from: X where: (!= k ')}) 'v))",
+        "(count (select {from: X where: (== k ')}))",
+        NULL,
+    };
+    for (int i = 0; qs[i]; i++) {
+        r = ixr_eval("(set X (.db.splayed.get \"" IDX_TMP "/zn0/\"))"); if (r) ray_release(r);
+        int64_t want = ixr_i64(qs[i]);
+        TEST_ASSERT_TRUE(want != INT64_MIN);
+        r = ixr_eval("(set X (.db.splayed.get \"" IDX_TMP "/zn2/\"))"); if (r) ray_release(r);
+        ray_enc_counters_reset();
+        int64_t got = ixr_i64(qs[i]);
+        ray_enc_counters_t k; ray_enc_counters_get(&k);
+        TEST_ASSERT_FMT(got == want, "%s: %lld vs generation 0 %lld", qs[i], (long long)got, (long long)want);
+        TEST_ASSERT_EQ_U(k.materialized, 0);
+    }
+    TEST_ASSERT_EQ_I(ixr_i64("(count (select {from: X where: (== k ')}))"), 14);
+    ray_error_clear();
+    r = ray_eval_str("(sum (at (select {from: X where: (== k 'k42)}) 'v))");
+    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+    TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
+    TEST_ASSERT_TRUE(strstr(ray_error_msg(), kp) && strstr(ray_error_msg(), "index root reserved bytes set"));
+    ray_error_free(r);
     PASS();
 }
 
@@ -3094,5 +3248,8 @@ const test_entry_t encidx_entries[] = {
     { "idxval/admission_through_all",  test_admission_through_all,  ix_setup, ix_teardown },
     { "idxval/stale_root_chunk_zone",  test_stale_root_chunk_zone,  ixr_setup, ixr_teardown },
     { "idxval/sym_splay_kept",         test_sym_splay_kept,         ixr_setup, ixr_teardown },
+    { "idxval/sym_stale_rebuild",      test_sym_stale_rebuild,      ixr_setup, ixr_teardown },
+    { "idxval/sym_stale_part_unbuildable", test_sym_stale_part_unbuildable, ix_setup, ix_teardown },
+    { "idxval/corrupt_sym_hash_null_key",  test_corrupt_sym_hash_null_key,  ixr_setup, ixr_teardown },
     { NULL, NULL, NULL, NULL },
 };

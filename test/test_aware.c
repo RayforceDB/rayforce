@@ -1430,6 +1430,92 @@ static test_result_t test_sym_membership(void) {
     PASS();
 }
 
+/* The null SYM literal (', the SYM null "", id 0) against a generation-2
+ * column with no index is decided on ids, as "" is: no materialization,
+ * equality and inequality as on generation 0, splayed and parted.
+ * Generation 0 keeps its fallback for it (the compile bails as before). */
+static ray_op_t* ap_s_eq_null(ray_graph_t* g) {
+    ray_t* lit = ray_sym(0);
+    ray_op_t* o = ray_eq(g, ray_scan(g, "s"), ray_const_atom(g, lit)); ray_release(lit); return o;
+}
+static ray_op_t* ap_s_ne_null(ray_graph_t* g) {
+    ray_t* lit = ray_sym(0);
+    ray_op_t* o = ray_ne(g, ray_scan(g, "s"), ray_const_atom(g, lit)); ray_release(lit); return o;
+}
+static test_result_t test_sym_null_literal(void) {
+    aw_save("sn", "(table [s v] (list (as 'SYMBOL (map (fn [j] (if (and (>= j 65536) (== 0 (% j 3))) \"\" "
+                  "(format \"w%\" (+ (* 4 (div j 65536)) (% j 4))))) (til 200000))) (til 200000)))", -1);
+    int64_t ne = 0, vs = 0;
+    for (int64_t j = 0; j < 200000; j++) if (aw_sy_val(j) < 0) { ne++; vs += j; }
+    static const char* const qs[] = {
+        "(count (select {from: T where: (== s ')}))",
+        "(count (select {from: T where: (!= s ')}))",
+        "(sum (at (select {from: T where: (== s ')}) 'v))",
+        "(count (select {from: T where: (and (== s ') (> v 100000))}))",
+        "(count (select {from: T where: (or (!= s ') (== v 3))}))",
+        NULL,
+    };
+    for (int i = 0; qs[i]; i++) {
+        int64_t want = aw_unfused_count("sn", qs[i]);
+        TEST_ASSERT_FMT(want >= 0, "%s: unfused", qs[i]);
+        AW_SAME("sn", qs[i], 0);
+        ray_t* got = aw_eval(qs[i]);                          /* T: generation 2 (aw_same) */
+        TEST_ASSERT_FMT(got && !RAY_IS_ERR(got) && got->i64 == want, "%s: %lld, unfused %lld", qs[i],
+                        got && !RAY_IS_ERR(got) ? (long long)got->i64 : -1LL, (long long)want);
+        ray_release(got);
+    }
+    TEST_ASSERT_EQ_I(aw_unfused_count("sn", qs[0]), ne);       /* null == null holds */
+    TEST_ASSERT_EQ_I(aw_unfused_count("sn", qs[1]), 200000 - ne);
+    TEST_ASSERT_EQ_I(aw_unfused_count("sn", qs[2]), vs);
+    /* the fused selection on generation 2: on ids, nothing materialized */
+    ray_enc_counters_t k;
+    TEST_ASSERT_EQ_I(aw_sel_count("sn", 2, ap_s_eq_null, &k), ne);
+    TEST_ASSERT_EQ_U(k.materialized, 0);
+    TEST_ASSERT_EQ_I(aw_sel_count("sn", 2, ap_s_ne_null, &k), 200000 - ne);
+    TEST_ASSERT_EQ_U(k.materialized, 0);
+    /* generation 0 is unchanged: the compile still declines this constant */
+    {
+        ray_t* t = aw_load("sn", 0);
+        TEST_ASSERT_NOT_NULL(t);
+        ray_graph_t* g = ray_graph_new(t);
+        ray_expr_t ex; ray_t* cerr = NULL;
+        uint64_t before = ray_expr_bail_counts[EXPR_BAIL_SYM_DOMAIN];
+        TEST_ASSERT_FALSE(expr_compile(g, t, ap_s_eq_null(g), &ex, &cerr));
+        TEST_ASSERT_NULL(cerr);
+        TEST_ASSERT_EQ_U(ray_expr_bail_counts[EXPR_BAIL_SYM_DOMAIN], before + 1);
+        ray_graph_free(g); ray_release(t);
+    }
+    /* parted: two partitions over one symfile, "" rows in the second */
+    for (int gen = 0; gen <= 2; gen += 2)
+        for (int p = 0; p < 2; p++) {
+            char q[900];
+            snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/pn%d/2024.01.0%d/t/\" "
+                     "(table [s v] (list (as 'SYMBOL (map (fn [j] (if (and (== %d 1) (== 0 (%% j 5))) \"\" (format \"w%%\" (%% j 9)))) (til 70000))) "
+                     "(til 70000))) \"" AW_TMP "/pn%d/.sym\" {compress: %s})", gen, p + 1, p, gen, gen ? "true" : "false");
+            aw_eval_ok(q);
+        }
+    static const char* const pq[] = {
+        "(count (select {from: (.db.parted.get \"" AW_TMP "/pn%d\" 't) where: (== s ')}))",
+        "(count (select {from: (.db.parted.get \"" AW_TMP "/pn%d\" 't) where: (!= s ')}))",
+        "(sum (at (select {from: (.db.parted.get \"" AW_TMP "/pn%d\" 't) where: (== s ')}) 'v))",
+        NULL,
+    };
+    for (int i = 0; pq[i]; i++) {
+        char q0[400], q2[400];
+        snprintf(q0, sizeof q0, pq[i], 0); snprintf(q2, sizeof q2, pq[i], 2);
+        ray_t* a = aw_eval(q0);
+        ray_enc_counters_reset();
+        ray_t* b = aw_eval(q2);
+        ray_enc_counters_get(&k);
+        TEST_ASSERT_FMT(a && b && !RAY_IS_ERR(a) && !RAY_IS_ERR(b) && a->i64 == b->i64, "%s: %lld vs %lld", pq[i],
+                        a && !RAY_IS_ERR(a) ? (long long)a->i64 : -1LL, b && !RAY_IS_ERR(b) ? (long long)b->i64 : -1LL);
+        TEST_ASSERT_FMT(k.materialized == 0, "%s: %llu materializations", pq[i], (unsigned long long)k.materialized);
+        if (i == 0) TEST_ASSERT_EQ_I(a->i64, 14000);
+        ray_release(a); ray_release(b);
+    }
+    PASS();
+}
+
 /* `in` / `not in` by membership bounds: a set none of whose ids lies in a
  * chunk's or vector's [min, max] decides it without a read (`not in` only
  * without "" rows); the rest is answered on the views' ids.  Generation 0
@@ -5523,6 +5609,7 @@ const test_entry_t aware_entries[] = {
     { "aware/filter_leaf_ops",         test_filter_leaf_ops,         aw_setup, aw_teardown },
     { "aware/sym_membership", test_sym_membership, aw_setup, aw_teardown },
     { "aware/sym_in_bounds",  test_sym_in_bounds,  aw_setup, aw_teardown },
+    { "aware/sym_null_literal", test_sym_null_literal, aw_setup, aw_teardown },
     { "aware/sym_fused_gen0", test_sym_fused_gen0, aw_setup, aw_teardown },
     { "aware/float_in_bounds", test_float_in_bounds, aw_setup, aw_teardown },
     { "aware/gather_rows_contract",  test_gather_rows_contract,  aw_setup, aw_teardown },
