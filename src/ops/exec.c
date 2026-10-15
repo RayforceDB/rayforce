@@ -1620,9 +1620,11 @@ static bool idx_eqrange_meta_ok(ray_graph_t* g, ray_op_t** conj, int ncj) {
  * materialization (finding C1), from its directory: the zone class (recorded
  * ZONE), an EQ key outside the chunk zone's range, then the PI lazy HASH,
  * which materializes the column only when the accumulated probes pay for
- * the build.  Only a column idx_enc_from_dir admits comes here (recorded
- * kind none, ZONE or CHUNK_ZONE); a recorded HASH, SORT, BLOOM or PART is
- * materialized and answered by the generation-0 block from its index.
+ * the build.  Only a column idx_enc_from_dir admits comes here: recorded
+ * kind none, ZONE or CHUNK_ZONE, or a recorded HASH, SORT, BLOOM or PART
+ * under a shape that does not use it (idx_enc_cmp_uses_index); a shape
+ * that uses it is materialized and answered by the generation-0 block from
+ * its index.
  * 1: every row passes; 2: *sel is the selection; 0: undecided (the fused
  * scan answers, by range); -1: *err owned.  Mirrors the generation-0 steps
  * of the OP_FILTER arm: the same counters in the same order, the same null
@@ -3418,12 +3420,12 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 double   key_f    = 0.0;
                 int      is_float = 0;
                 /* A generation-2 column without a published materialization
-                 * whose recorded kind has no region is consulted from its
-                 * directory (finding C1) and never decoded here; a recorded
-                 * HASH / SORT / BLOOM / PART is materialized now (its
-                 * failure is the query's) and, like a published one, takes
-                 * the block below on its materialization, which carries the
-                 * synthesized zone or the attached index. */
+                 * is consulted from its directory (finding C1) and never
+                 * decoded here, unless the shape uses its recorded HASH /
+                 * SORT / BLOOM / PART (idx_enc_cmp_uses_index): that column
+                 * is materialized now (its failure is the query's) and, like
+                 * a published one, takes the block below on its
+                 * materialization, which carries the attached index. */
                 ray_col_meta_t fm;
                 bool enc_done = false;
                 bool fm_ok = idx_filter_decode(g, op_child(g, op, 1), IDXW_INDEX, NULL, &cmp_op,
@@ -3757,11 +3759,12 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 {
                     ray_t* in_col     = NULL;
                     ray_t* in_set_lit = NULL;
-                    /* generation 2 without a published materialization and
-                     * no recorded region kind: from the directory, never
-                     * decoded here; a recorded HASH / SORT / BLOOM / PART
-                     * materializes now (its failure the query's) and takes
-                     * the block below on its index */
+                    /* generation 2 without a published materialization:
+                     * from the directory, never decoded here, unless the
+                     * `in` uses its recorded HASH / PART
+                     * (idx_enc_in_uses_index): that column materializes now
+                     * (its failure the query's) and takes the block below on
+                     * its index */
                     ray_col_meta_t im;
                     bool in_enc_done = false;
                     bool im_ok = idx_filter_in_decode(g, op_child(g, op, 1), IDXW_INDEX, NULL, &in_set_lit, &im);

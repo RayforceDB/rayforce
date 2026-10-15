@@ -2389,10 +2389,10 @@ ray_zone_class_t ray_index_zone_class(ray_t* col, uint16_t cmp_op,
 }
 
 /* ---- Directory twins (P2) ----
- * A single-file generation-2 column whose recorded kind is ZONE or
- * CHUNK_ZONE is answered from its directory; a recorded HASH, SORT, BLOOM
- * or PART is answered from the index its materialization attaches (exec.c,
- * idx_enc_from_dir).  The materialization synthesizes a ZONE / CHUNK_ZONE
+ * A single-file generation-2 column is answered from its directory, unless
+ * the shape uses its recorded HASH, SORT, BLOOM or PART: then from the
+ * index its materialization attaches (exec.c, idx_enc_from_dir and the
+ * idx_enc_*_uses_index pairs).  The materialization synthesizes a ZONE / CHUNK_ZONE
  * from the directory (enc_synth_zone / enc_synth_chunk_zone,
  * src/store/enccol.c); these answer what the synthesized zone would, from
  * the same entries, without decoding. */

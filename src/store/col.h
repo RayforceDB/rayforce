@@ -114,7 +114,8 @@ typedef struct {
     const char*   name;                   /* column name, diagnostics */
     uint8_t       gen;                    /* resolved generation: 0 or 2 */
     struct ray_sym_domain_s* target_dom;  /* SYM: destination symfile domain; NULL = bare */
-    uint8_t       index_decision;         /* P1: RAY_COL_IDX_KEEP */
+    uint8_t       index_decision;         /* RAY_COL_IDX_*: generation 2 keeps, rebuilds or drops a
+                                           * region index; generation 0 takes KEEP only */
     uint8_t       index_kind;             /* generation 2: kind to record (0 = from the source) */
     bool          durable;
 } ray_col_write_t;
@@ -127,9 +128,8 @@ void      ray_col_test_fail_alloc(int64_t nth);   /* test hook; 0 disarms */
  * ON: 2 for every file generation 2 can hold; OFF: 0; ABSENT: 2 when the
  * source is a RAY_ENCCOL or the destination's current generation stores the
  * file `name` as generation 2, else 0.  Linked, nested and list columns
- * are always 0; an indexed column is generation 2 with its index region,
- * except a SYM column with a HASH or PART index, which stays 0 until the
- * writer rebuilds those over the target ids. */
+ * are always 0; an indexed column is generation 2 with its index region
+ * (a SYM column's HASH or PART rebuilt over the target ids). */
 /* lossy: read errors read as 0 — writers use the *_err forms */
 uint8_t ray_col_file_gen(const char* path);   /* 2 when the file is generation 2, else 0 (missing included) */
 /* lossy: read errors read as 0 — writers use the *_err forms */
@@ -161,9 +161,9 @@ ray_err_t ray_col_resolve_gen_type_err(ray_compress_t mode, int8_t type, const c
 ray_t* ray_compress_opt_parse(ray_t* opts, bool strict, ray_compress_t* mode);
 void    ray_store_test_force_compress(bool on);   /* equivalence run: absent behaves as true */
 
-/* Can generation 2 hold this plain vector (type, no link, the SYM HASH /
- * PART exception above)?  Index meta: the kind (every fresh kind) and the
- * UNIQUE flag a plain column records; a stale root records none. */
+/* Can generation 2 hold this plain vector (type, no link)?  Index meta:
+ * the kind (every fresh kind) and the UNIQUE flag a plain column records;
+ * a stale root records none. */
 bool ray_col_gen2_eligible(ray_t* col);
 void ray_col_gen2_index_meta(ray_t* col, uint8_t* index_kind, uint8_t* col_flags);
 /* Validate the complete object graph accepted by ray_col_save without

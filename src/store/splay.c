@@ -588,9 +588,12 @@ static ray_err_t splay_write_table_impl(ray_t* tbl, const char* dir,
         w.target_dom = m.type == RAY_SYM ? dom : NULL;
         w.durable = durable;
         /* Generation 0 persists a chunk zone for numeric columns of at least
-         * one chunk (ray_splay_build_indexes); generation 2 records it. */
+         * one chunk (ray_splay_build_indexes); generation 2 records it when
+         * the column records no other kind (a stale root records none). */
+        uint8_t rec_kind = m.index_kind, rec_flags = 0;
+        if (ray_is_vec(col)) ray_col_gen2_index_meta(col, &rec_kind, &rec_flags);
         if (w.gen == 2 && build_indexes && ray_zone_acc_supported(m.type) &&
-            m.len >= RAY_ENC_CHUNK && m.index_kind == 0)
+            m.len >= RAY_ENC_CHUNK && rec_kind == 0)
             w.index_kind = RAY_IDX_CHUNK_ZONE;
         ray_err_t err = ray_col_save_ctx(&w, path);
         ray_col_src_release(&w.src);

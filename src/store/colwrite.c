@@ -59,18 +59,13 @@ static ray_err_t colw_publish(const char* tmp, const char* path, bool durable) {
 }
 
 /* Generation 2 holds plain vectors of BOOL..STR without a link (spec
- * "Always generation 0"); every index kind is held since P4, except a SYM
- * column's HASH or PART, which the writer rebuilds over the target ids
- * (spec "SYM columns", the range writer): until that rebuild exists such a
- * column stays generation 0 rather than lose its index. */
+ * "Always generation 0"), with every index kind: a SYM column's HASH or
+ * PART is rebuilt over the target ids by the range writer (spec "SYM
+ * columns"). */
 bool ray_col_gen2_eligible(ray_t* col) {
     if (!col || RAY_IS_ERR(col)) return false;
     if (!ray_encw_type_supported(col->type)) return false;
     if (col->attrs & RAY_ATTR_HAS_LINK) return false;
-    if (col->type == RAY_SYM) {
-        ray_idx_kind_t k = ray_index_kind(col);
-        if (k == RAY_IDX_HASH || k == RAY_IDX_PART) return false;
-    }
     return true;
 }
 
@@ -161,15 +156,103 @@ static ray_err_t colw_gen2_vec(ray_t* vec, const char* path, bool durable, uint8
 }
 
 /* Index kind / flags recorded for a source: a plain column's attached
- * index, or an encoded column's own header. */
+ * index, or an encoded column's own header (every recorded kind). */
 static void colw_src_index_meta(ray_t* obj, uint8_t* ik, uint8_t* cf) {
     if (obj->type == RAY_ENCCOL) {
         ray_enccol_t* e = ray_enccol_of(obj);
-        *ik = (e->hdr.index_kind == 3 || e->hdr.index_kind == 5) ? e->hdr.index_kind : 0;
+        *ik = e->hdr.index_kind;
         *cf = e->hdr.col_flags & RAY_ENC_FLAG_UNIQUE;
         return;
     }
     ray_col_gen2_index_meta(obj, ik, cf);
+}
+
+/* The target id of `id` (P1 Task 14's rule): checked against target_dom
+ * when the source already resolves over it, re-expressed in target_dom
+ * from another domain, or through the runtime LUT for a bare save of a
+ * FILE-domain source.  False: the id has no target. */
+static bool colw_sym_map(ray_col_write_t* w, struct ray_sym_domain_s* vdom, const int64_t* lut,
+                         int64_t id, int64_t* pos) {
+    *pos = id;
+    if (w->target_dom && vdom == w->target_dom) {
+        if (id < 0 || id >= ray_sym_domain_count(w->target_dom)) *pos = -1;
+    } else if (w->target_dom) {
+        ray_t* str = ray_sym_domain_str(vdom, id);
+        *pos = str ? ray_sym_domain_find(w->target_dom, ray_str_ptr(str), ray_str_len(str)) : -1;
+    } else if (lut) {
+        *pos = (id >= 0 && id < ray_sym_domain_count(vdom)) ? lut[id] : -1;
+    }
+    return *pos >= 0;
+}
+
+/* A fresh root of `kind` built by the generation-0 builder over `v`
+ * (owned: consumed on every path; a shared vector is copied by the
+ * builder, never modified). */
+static ray_t* colw_rebuild_root(ray_t* v, uint8_t kind, ray_t** root_out) {
+    *root_out = NULL;
+    ray_t* r = kind == RAY_IDX_HASH ? ray_index_attach_hash(&v)
+             : kind == RAY_IDX_SORT ? ray_index_attach_sort(&v)
+             : kind == RAY_IDX_BLOOM ? ray_index_attach_bloom(&v)
+             : ray_index_attach_part(&v);
+    if (!r || RAY_IS_ERR(r)) { ray_release(v); return r ? r : ray_error("oom", "index rebuild"); }
+    *root_out = r->index;
+    ray_retain(*root_out);
+    ray_release(r);
+    return NULL;
+}
+
+/* SYM: `plain` (borrowed) remapped into the target ids at the target width
+ * (`attrs`), then its HASH / PART rebuilt (spec "SYM columns", "Index
+ * rebuild"). */
+static ray_t* colw_sym_rebuild(ray_col_write_t* w, ray_t* plain, uint8_t attrs, const int64_t* lut,
+                               uint8_t kind, ray_t** root_out) {
+    *root_out = NULL;
+    ray_t* rm = ray_sym_vec_new(attrs & RAY_SYM_W_MASK, plain->len);
+    if (!rm || RAY_IS_ERR(rm)) return rm ? rm : ray_error("oom", "index rebuild");
+    rm->len = plain->len;
+    rm->attrs |= (uint8_t)(attrs & RAY_ATTR_HAS_NULLS);
+    struct ray_sym_domain_s* vdom = ray_sym_vec_domain(plain);
+    const void* sd = ray_data(plain);
+    for (int64_t i = 0; i < plain->len; i++) {
+        int64_t pos;
+        if (!colw_sym_map(w, vdom, lut, ray_read_sym(sd, i, RAY_SYM, plain->attrs), &pos)) {
+            ray_release(rm);
+            return ray_error("corrupt", "col %s: SYM id outside the target domain", w->name ? w->name : "?");
+        }
+        ray_write_sym(ray_data(rm), i, (uint64_t)pos, RAY_SYM, attrs);
+    }
+    return colw_rebuild_root(rm, kind, root_out);
+}
+
+/* The region of a range write (spec "Index decisions"), decided before the
+ * file exists: a root to serialize (*root, owned: a SYM HASH / PART
+ * rebuilt over the target ids, or any kind on REBUILD, built from the
+ * materialized column), or an encoded non-SYM source's region to copy
+ * after validation (*copy, into the source's mapping).  The order name of
+ * a rebuilt root is the source root's trustworthy one, which a
+ * materialization of generation 2 carries (its parsed root). */
+static ray_t* colw_region_prepare(ray_col_write_t* w, uint8_t ik, uint8_t attrs, const int64_t* lut,
+                                  ray_t** root, const uint8_t** copy, uint64_t* copy_len,
+                                  const char** order, uint32_t* order_len) {
+    ray_t* src = w->src.obj;
+    bool enc = src->type == RAY_ENCCOL;
+    if (enc && w->src.type != RAY_SYM && w->index_decision == RAY_COL_IDX_KEEP) {
+        ray_enccol_t* se = ray_enccol_of(src);
+        ray_enc_idx_view_t sv;
+        ray_t* verr = ray_enc_index_validate(se->base + se->hdr.index_off, se->hdr.end_off - se->hdr.index_off,
+                                             ik, se->type, se->attrs, se->len, 0, NULL, se->path, &sv);
+        if (verr) return verr;
+        *copy = se->base + se->hdr.index_off;
+        *copy_len = se->hdr.end_off - se->hdr.index_off;
+        return NULL;
+    }
+    /* a materialization is counted once and owned by the source */
+    ray_t* plain = enc ? ray_enccol_materialize(src) : src;
+    if (RAY_IS_ERR(plain)) return plain;
+    if (ray_index_has(plain)) *order = colw_order_name(plain->index, order_len);
+    if (w->src.type == RAY_SYM) return colw_sym_rebuild(w, plain, attrs, lut, ik, root);
+    ray_retain(plain);
+    return colw_rebuild_root(plain, ik, root);
 }
 
 /* Test hook: the nth allocation of the range writer's own buffers fails. */
@@ -208,18 +291,30 @@ static ray_err_t colw_gen2_range(ray_col_write_t* w, const char* path) {
             sc = ray_sym_count();
         }
     }
-    uint8_t ik, cf;
-    colw_src_index_meta(s->obj, &ik, &cf);
-    if (w->index_kind) ik = w->index_kind;
-    /* never a recorded region kind without its region: the range writer
-     * writes no region yet (a SYM HASH / PART column is not eligible) */
-    if (ray_enc_idx_kind_has_region(ik)) return RAY_ERR_NYI;
+    uint8_t src_ik, cf;
+    colw_src_index_meta(s->obj, &src_ik, &cf);
+    /* a region from the source's own kind (as colw_gen2_vec): an override
+     * never re-labels a region kind, DROP writes none, and a region kind is
+     * never recorded without its region */
+    bool region = ray_enc_idx_kind_has_region(src_ik) && (!w->index_kind || w->index_kind == src_ik) &&
+                  w->index_decision != RAY_COL_IDX_DROP;
+    uint8_t ik = w->index_kind ? w->index_kind : src_ik;
+    if (ray_enc_idx_kind_has_region(ik) && !region) ik = 0;
     if ((ik && !ray_index_kind_admits((ray_idx_kind_t)ik, type)) ||
         ((cf & RAY_ENC_FLAG_UNIQUE) && !ray_index_kind_admits(RAY_IDX_NONE, type)))
         return RAY_ERR_NYI;
     uint8_t esz = ray_sym_elem_size(type, attrs);
     char tmp[1100];
     if (snprintf(tmp, sizeof tmp, "%s.tmp", path) >= (int)sizeof tmp) return RAY_ERR_IO;
+    /* the region is decided before the file exists: a rebuilt root must be
+     * whole before the chunk loop, and ray_encw_set_index borrows it */
+    ray_t* idx_root = NULL;                 /* owned; released on every exit */
+    const uint8_t* idx_copy = NULL; uint64_t idx_copy_len = 0;
+    const char* order = NULL; uint32_t order_len = 0;
+    if (region) {
+        ray_t* ierr = colw_region_prepare(w, ik, attrs, lut, &idx_root, &idx_copy, &idx_copy_len, &order, &order_len);
+        if (ierr) { ray_err_t ie = ray_err_from_obj(ierr); ray_error_free(ierr); return ie; }
+    }
     uint8_t* buf = colw_alloc(NULL, (size_t)RAY_ENC_CHUNK * (esz ? esz : 1));
     char* pool = NULL; size_t pool_cap = 0;
     ray_col_scratch_t scr; ray_col_scratch_init(&scr);
@@ -227,6 +322,15 @@ static ray_err_t colw_gen2_range(ray_col_write_t* w, const char* path) {
     ray_err_t e = !buf ? RAY_ERR_OOM : (!f ? RAY_ERR_IO : RAY_OK);
     ray_encw_t ew; memset(&ew, 0, sizeof ew);
     if (e == RAY_OK) e = ray_encw_begin(&ew, f, type, attrs, s->len, sc, ik, cf);
+    if (e == RAY_OK && idx_root) {
+        /* the source attrs, as colw_gen2_vec passes them: finish writes the
+         * region at the column's final persisted attrs (SYM PART keys at
+         * the saved width) */
+        ray_enc_idx_src_t is = { idx_root, type, s->attrs, s->len, order, order_len };
+        ray_encw_set_index(&ew, &is);
+    } else if (e == RAY_OK && idx_copy) {
+        ray_encw_set_index_copy(&ew, ik, idx_copy, idx_copy_len);
+    }
     for (int64_t c = 0; e == RAY_OK && c < ew.n_chunks; c++) {
         int64_t base = c * RAY_ENC_CHUNK;
         int64_t rows = s->len - base < RAY_ENC_CHUNK ? s->len - base : RAY_ENC_CHUNK;
@@ -238,16 +342,10 @@ static ray_err_t colw_gen2_range(ray_col_write_t* w, const char* path) {
             if (v.n <= 0) { e = RAY_ERR_CORRUPT; break; }
             if (type == RAY_SYM) {
                 for (int64_t i = 0; i < v.n; i++) {
-                    int64_t id = ray_read_sym(v.data, i, RAY_SYM, v.attrs), pos = id;
-                    if (w->target_dom && v.dom == w->target_dom) {
-                        if (id < 0 || id >= ray_sym_domain_count(w->target_dom)) { e = RAY_ERR_CORRUPT; break; }
-                    } else if (w->target_dom) {
-                        ray_t* str = ray_sym_domain_str(v.dom, id);
-                        pos = str ? ray_sym_domain_find(w->target_dom, ray_str_ptr(str), ray_str_len(str)) : -1;
-                    } else if (lut) {
-                        pos = (id >= 0 && id < ray_sym_domain_count(v.dom)) ? lut[id] : -1;
+                    int64_t pos;
+                    if (!colw_sym_map(w, v.dom, lut, ray_read_sym(v.data, i, RAY_SYM, v.attrs), &pos)) {
+                        e = RAY_ERR_CORRUPT; break;
                     }
-                    if (pos < 0) { e = RAY_ERR_CORRUPT; break; }
                     ray_write_sym(buf, r + i, (uint64_t)pos, RAY_SYM, attrs);
                 }
             } else if (type == RAY_STR) {
@@ -274,8 +372,12 @@ static ray_err_t colw_gen2_range(ray_col_write_t* w, const char* path) {
         }
         if (e == RAY_OK) e = ray_encw_chunk(&ew, buf, pool, rows);
     }
-    if (e == RAY_OK) e = ray_encw_finish(&ew);
+    bool has_region = idx_root || idx_copy;
+    /* colw_region_msg reads the thread-local message: clear it first */
+    if (e == RAY_OK && has_region) ray_error_clear();
+    if (e == RAY_OK && (e = ray_encw_finish(&ew)) != RAY_OK && has_region) colw_region_msg(path);
     ray_encw_free(&ew);
+    if (idx_root) ray_release(idx_root);
     ray_col_scratch_free(&scr);
     ray_free_raw(buf); ray_free_raw(pool);
     if (f && fclose(f) != 0 && e == RAY_OK) e = RAY_ERR_IO;
@@ -292,17 +394,20 @@ static bool colw_src_gen2_ok(ray_t* obj) {
 ray_err_t ray_col_save_ctx(ray_col_write_t* w, const char* path) {
     ray_t* obj = w->src.obj;
     if (!obj || !path) return RAY_ERR_TYPE;
-    if (w->index_decision != RAY_COL_IDX_KEEP) return RAY_ERR_NYI;      /* P1: keep only */
+    if (w->index_decision > RAY_COL_IDX_DROP) return RAY_ERR_TYPE;
     /* parted sources have no single-file form; a later preflight admitting
      * RAY_ENCCOL must keep excluding parted kinds */
     if (RAY_IS_PARTED(obj->type) || (obj->type == RAY_ENCCOL && ray_enccol_is_parted(obj)))
         return RAY_ERR_NYI;
     if (w->gen == 2 && colw_src_gen2_ok(obj)) {
-        if (obj->type != RAY_ENCCOL && obj->type != RAY_SYM)
-            return colw_gen2_vec(obj, path, w->durable, w->index_kind, w->index_decision);   /* direct pointers */
+        /* direct pointers; a REBUILD goes by range, the path that holds it */
+        if (obj->type != RAY_ENCCOL && obj->type != RAY_SYM && w->index_decision != RAY_COL_IDX_REBUILD)
+            return colw_gen2_vec(obj, path, w->durable, w->index_kind, w->index_decision);
         return colw_gen2_range(w, path);
     }
     if (w->gen != 0 && w->gen != 2) return RAY_ERR_VERSION;
+    /* generation 0 writes its index as today: it takes no other decision */
+    if (w->index_decision != RAY_COL_IDX_KEEP) return RAY_ERR_NYI;
     ray_t* col = obj;
     if (obj->type == RAY_ENCCOL) {
         col = ray_enccol_materialize(obj);          /* the object's own once-state */
