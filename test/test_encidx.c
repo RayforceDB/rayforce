@@ -3642,8 +3642,32 @@ static void ph_group_twice(int64_t* tb, uint64_t cap, const int64_t* gk) {
             return;
         }
 }
-static test_result_t test_hash_par_rejects(void) {
-    int64_t* gk = ph_keys();
+/* Scratch of the pool-pass tests, freed by their wrappers whatever the
+ * body returns (an assertion returns early). */
+typedef struct { int64_t *gk, *g2, *tb, *of, *rw; } ph_bufs_t;
+#define PH_CAP ((uint64_t)1 << 18)
+static bool ph_bufs_new(ph_bufs_t* B) {
+    B->gk = ph_keys(); B->g2 = malloc(PH_NG * 8); B->tb = malloc(PH_CAP * 8);
+    B->of = malloc((PH_NG + 1) * 8); B->rw = malloc(2 * PH_NG * 8);
+    return B->gk && B->g2 && B->tb && B->of && B->rw;
+}
+static void ph_bufs_free(ph_bufs_t* B) { free(B->gk); free(B->g2); free(B->tb); free(B->of); free(B->rw); }
+/* B's table, offs and rows built from keys gk as ph_root builds them */
+static void ph_build(ph_bufs_t* B, const int64_t* gk) {
+    memset(B->tb, 0, PH_CAP * 8);
+    for (int64_t g = 0; g < PH_NG; g++) {
+        uint64_t s = slot_of(gk[g], PH_CAP);
+        while (B->tb[s]) s = (s + 1) & (PH_CAP - 1);
+        B->tb[s] = g + 1;
+        B->of[g] = 2 * g; B->rw[2 * g] = g; B->rw[2 * g + 1] = g + PH_NG;
+    }
+    B->of[PH_NG] = 2 * PH_NG;
+}
+static ray_t* ph_fab(ph_bufs_t* B, const int64_t* gk) {
+    return fab_hash(RAY_I64, 2 * PH_NG, B->tb, PH_CAP, gk, PH_NG, B->of, B->rw, 2 * PH_NG);
+}
+static test_result_t ph_rejects_body(ph_bufs_t* B) {
+    int64_t* gk = B->gk;
     int64_t len = 2 * PH_NG;
     DK_ACCEPTS(ph_root(RAY_I64, gk, NULL, NULL, NULL, NULL), len, "pool pass, valid");
     /* parse_copy over a pool-validated region gives the root parse gives */
@@ -3683,10 +3707,10 @@ static test_result_t test_hash_par_rejects(void) {
     /* a repeated key: two adjacent groups, the second at its own home,
      * given the first one's key (same home, distance 1) */
     {
-        uint64_t cap = (uint64_t)1 << 18;
-        int64_t* tb = malloc(cap * 8);
+        uint64_t cap = PH_CAP;
+        int64_t* tb = B->tb;
         ray_release(ph_root(RAY_I64, gk, tb, NULL, NULL, NULL));
-        int64_t* g2 = malloc(PH_NG * 8); memcpy(g2, gk, PH_NG * 8);
+        int64_t* g2 = B->g2; memcpy(g2, gk, PH_NG * 8);
         bool placed = false;
         for (uint64_t s = 0; s + 1 < cap && !placed; s++) {
             if (!tb[s] || !tb[s + 1]) continue;
@@ -3707,7 +3731,6 @@ static test_result_t test_hash_par_rejects(void) {
         for (int64_t g = 3; g < PH_NG; g++) dist &= g2[g] != g2[0] && g2[g] != g2[1] && g2[g] != g2[2];
         TEST_ASSERT_TRUE(dist);
         DK_ACCEPTS(ph_root(RAY_I64, g2, NULL, NULL, NULL, NULL), len, "pool pass through the wrap, distinct");
-        free(g2); free(tb);
     }
     /* table: a group number out of range; a group in two buckets */
     ph_val = PH_NG + 1;
@@ -3725,7 +3748,7 @@ static test_result_t test_hash_par_rejects(void) {
     FAB_CORRUPT(ph_root(RAY_I64, gk, NULL, (int64_t[]){ 10, 3 }, NULL, NULL), RAY_I64, len, 0, "rows not unique");
     /* SYM: a key outside the domain (bound PH_NG * 7919 + 14 holds the rest) */
     {
-        int64_t* g2 = malloc(PH_NG * 8); memcpy(g2, gk, PH_NG * 8);
+        int64_t* g2 = B->g2; memcpy(g2, gk, PH_NG * 8);
         uint32_t bound = (uint32_t)(PH_NG * 7919 + 14);
         {   size_t n; uint8_t* b = fab_region(ph_root(RAY_SYM, g2, NULL, NULL, NULL, NULL), RAY_SYM, RAY_SYM_W8, len, &n);
             TEST_ASSERT_NOT_NULL(b);
@@ -3735,25 +3758,126 @@ static test_result_t test_hash_par_rejects(void) {
             TEST_ASSERT_FMT(e == NULL, "SYM keys under the bound: %s", e ? ray_error_msg() : ""); }
         g2[777] = (int64_t)bound;
         FAB_CORRUPT(ph_root(RAY_SYM, g2, NULL, NULL, NULL, NULL), RAY_SYM, len, bound, "outside the symbol domain");
-        free(g2);
     }
     /* an unreachable group: one moved before its home */
     {
-        uint64_t cap = (uint64_t)1 << 18;
-        int64_t* tb = malloc(cap * 8);
-        ray_t* r0 = ph_root(RAY_I64, gk, tb, NULL, NULL, NULL);
-        ray_release(r0);
+        uint64_t cap = PH_CAP;
+        int64_t* tb = B->tb;
+        ph_build(B, gk);
         uint64_t s = 1;
         while (!(tb[s] && !tb[s - 1] && slot_of(gk[tb[s] - 1], cap) == s)) s++;
         tb[s - 1] = tb[s]; tb[s] = 0;
-        int64_t* of = malloc((PH_NG + 1) * 8); int64_t* rw = malloc(2 * PH_NG * 8);
-        for (int64_t g = 0; g < PH_NG; g++) { of[g] = 2 * g; rw[2 * g] = g; rw[2 * g + 1] = g + PH_NG; }
-        of[PH_NG] = 2 * PH_NG;
-        FAB_CORRUPT(fab_hash(RAY_I64, len, tb, cap, gk, PH_NG, of, rw, len), RAY_I64, len, 0, "finds nothing");
-        free(tb); free(of); free(rw);
+        FAB_CORRUPT(ph_fab(B, gk), RAY_I64, len, 0, "finds nothing");
     }
-    free(gk);
     PASS();
+}
+static test_result_t test_hash_par_rejects(void) {
+    ph_bufs_t B;
+    test_result_t r = ph_bufs_new(&B) ? ph_rejects_body(&B) : (test_result_t){ TEST_FAIL, "scratch allocation" };
+    bool alloc = B.gk && B.g2 && B.tb && B.of && B.rw;
+    ph_bufs_free(&B);
+    TEST_ASSERT_TRUE(alloc);
+    return r;
+}
+
+/* One forgery per rule of the pool pass, each breaking that rule only, so a
+ * pool pass that dropped the rule would accept it (Task 10b review).  And a
+ * cluster across a pool span boundary: accepted, copied by the pool pass. */
+static test_result_t ph_rules_body(ph_bufs_t* B) {
+    const int64_t* gk = B->gk;
+    int64_t len = 2 * PH_NG;
+    int64_t* tb = B->tb;
+    /* reachability: a group two buckets past its home, an empty bucket
+     * between (d = 2, run = 0, under the compare budget) */
+    {
+        ph_build(B, gk);
+        uint64_t s = 0;
+        while (s + 3 < PH_CAP && !(tb[s] && slot_of(gk[tb[s] - 1], PH_CAP) == s && !tb[s + 1] && !tb[s + 2] && !tb[s + 3])) s++;
+        TEST_ASSERT_TRUE(s + 3 < PH_CAP);
+        tb[s + 2] = tb[s]; tb[s] = 0;
+        FAB_CORRUPT(ph_fab(B, gk), RAY_I64, len, 0, "finds nothing");
+    }
+    /* rows ascending: one group's two rows swapped (no duplicate, in range) */
+    {
+        ph_build(B, gk);
+        int64_t g = 1234, t = B->rw[2 * g];
+        B->rw[2 * g] = B->rw[2 * g + 1]; B->rw[2 * g + 1] = t;
+        FAB_CORRUPT(ph_fab(B, gk), RAY_I64, len, 0, "ascending");
+    }
+    /* offs strictly increasing: group g's slice empty, its rows moved into
+     * group g+1's slice in ascending order */
+    {
+        ph_build(B, gk);
+        int64_t g = 2000;
+        B->of[g + 1] = B->of[g];
+        B->rw[2 * g] = g; B->rw[2 * g + 1] = g + 1; B->rw[2 * g + 2] = g + PH_NG; B->rw[2 * g + 3] = g + 1 + PH_NG;
+        FAB_CORRUPT(ph_fab(B, gk), RAY_I64, len, 0, "offs not strictly increasing");
+    }
+    /* every group has a bucket: a cluster's last bucket emptied */
+    {
+        ph_build(B, gk);
+        uint64_t s = 1000;
+        while (s + 1 < PH_CAP && !(tb[s] && !tb[s + 1])) s++;
+        TEST_ASSERT_TRUE(s + 1 < PH_CAP);
+        tb[s] = 0;
+        FAB_CORRUPT(ph_fab(B, gk), RAY_I64, len, 0, "groups have a bucket");
+    }
+    /* a cluster across the first pool span (cap 2^18: 4 spans of 2^16 walk
+     * steps from the first empty bucket e0) */
+    {
+        int64_t* g2 = B->g2;
+        memcpy(g2, gk, PH_NG * 8);
+        ph_build(B, g2);
+        uint64_t e0 = 0;
+        while (tb[e0]) e0++;
+        uint64_t home = (e0 + 65536 - 3) & (PH_CAP - 1);
+        int64_t k = 1;
+        for (int i = 0; i < 8; i++) {
+            int64_t c;
+            bool clash;
+            do {                                     /* a key no other group has */
+                c = dk_key_at(home, PH_CAP, &k);
+                clash = c >= 13 && (c - 13) % 7919 == 0 && (c - 13) / 7919 < PH_NG;
+                for (int j = 0; j < i; j++) clash |= g2[j] == c;
+            } while (clash);
+            g2[i] = c;
+        }
+        ph_build(B, g2);
+        uint64_t f0 = 0;
+        while (tb[f0]) f0++;
+        TEST_ASSERT_TRUE(tb[(f0 + 65536) & (PH_CAP - 1)] && tb[(f0 + 65537) & (PH_CAP - 1)]);
+        size_t n; uint8_t* b = fab_region(ph_fab(B, g2), RAY_I64, 0, len, &n);
+        TEST_ASSERT_NOT_NULL(b);
+        ray_enc_idx_view_t iv, iv2;
+        ray_enc_idx_copies_t cp;
+        ray_t* e = ray_enc_index_validate_copy(b, n, RAY_IDX_HASH, RAY_I64, 0, len, 0, NULL, "col x", &iv, &cp);
+        ray_t* e2 = ray_enc_index_validate(b, n, RAY_IDX_HASH, RAY_I64, 0, len, 0, NULL, "col x", &iv2);
+        ray_pool_t* tp = ray_pool_get();
+        bool pooled = tp && tp->n_workers > 0, copied = cp.hash[0] != NULL;
+        ray_t *r1 = NULL, *r2 = NULL;
+        ray_t* p1 = e ? NULL : ray_enc_index_parse_copy(&iv, NULL, &r1, &cp);
+        ray_t* p2 = e2 ? NULL : ray_enc_index_parse(&iv2, NULL, &r2);
+        bool same = r1 && r2 && same_child(ray_index_payload(r1)->u.hash.table, ray_index_payload(r2)->u.hash.table, 8) &&
+                    same_child(ray_index_payload(r1)->u.hash.rows, ray_index_payload(r2)->u.hash.rows, 8);
+        if (e) ray_error_free(e);
+        if (e2) ray_error_free(e2);
+        if (p1) ray_error_free(p1);
+        if (p2) ray_error_free(p2);
+        if (r1) ray_release(r1);
+        if (r2) ray_release(r2);
+        free(b);
+        TEST_ASSERT_TRUE(e == NULL && e2 == NULL && same);
+        TEST_ASSERT_FMT(copied == pooled, "span-crossing cluster: copies %d, pool workers %u", copied, tp ? tp->n_workers : 0);
+    }
+    PASS();
+}
+static test_result_t test_hash_par_rules(void) {
+    ph_bufs_t B;
+    test_result_t r = ph_bufs_new(&B) ? ph_rules_body(&B) : (test_result_t){ TEST_FAIL, "scratch allocation" };
+    bool alloc = B.gk && B.g2 && B.tb && B.of && B.rw;
+    ph_bufs_free(&B);
+    TEST_ASSERT_TRUE(alloc);
+    return r;
 }
 
 const test_entry_t encidx_entries[] = {
@@ -3781,6 +3905,7 @@ const test_entry_t encidx_entries[] = {
     { "idxval/hash_dup_walk",           test_hash_dup_walk,           ix_setup, ix_teardown },
     { "idxval/hash_dup_budget",         test_hash_dup_budget,         ix_setup, ix_teardown },
     { "idxval/hash_par_rejects",        test_hash_par_rejects,        ix_setup, ix_teardown },
+    { "idxval/hash_par_rules",          test_hash_par_rules,          ix_setup, ix_teardown },
     { "idxval/reject_part_snan",        test_reject_part_snan,        ix_setup, ix_teardown },
     { "idxval/parse_hash_probes",       test_parse_hash_probes,       ix_setup, ix_teardown },
     { "idxval/parse_part_order_sym",    test_parse_part_order_sym,    ix_setup, ix_teardown },

@@ -1582,6 +1582,45 @@ static test_result_t test_fuzz_flips(void) {
     PASS();
 }
 
+
+/* Byte flips over an index region the validator's pool pass checks: 70000
+ * distinct I64 keys give a HASH of 2^18 buckets (the pool pass needs 2^17).
+ * Seeded, region-only flips; an accepted image must probe in bounds. */
+static test_result_t test_fuzz_flips_pool(void) {
+    const char* p = ray_test_tmp(EC_TMP "/fzp");
+    g_fz = 0xF00DF00D;
+    ray_t* v = ray_vec_new(RAY_I64, 70000); v->len = 70000;
+    for (int i = 0; i < 70000; i++) ((int64_t*)ray_data(v))[i] = i % 8 ? (int64_t)i * 7919 + 13 : i / 8 % 8;
+    ray_t* r = ray_index_attach_hash(&v);
+    TEST_ASSERT_FMT(r && !RAY_IS_ERR(r), "attach hash failed");
+    v = r;
+    SAVE(v, p);
+    size_t index_off = (size_t)rd64(EH + 32);
+    TEST_ASSERT_TRUE(g_img[EH + 6] == RAY_IDX_HASH && index_off < g_len);
+    uint64_t mask = rd64(index_off + 16 + 32);                /* the HASH kind area's mask */
+    TEST_ASSERT_FMT(mask + 1 >= ((uint64_t)1 << 17), "HASH of %llu buckets", (unsigned long long)(mask + 1));
+    uint8_t* orig = malloc(g_len); TEST_ASSERT_TRUE(orig != NULL); memcpy(orig, g_img, g_len);
+    {   const char* bad = NULL;
+        bool rej = fuzz_one(p, &bad);
+        if (bad || rej) { free(orig); TEST_ASSERT_FMT(0, "unmutated image: %s", bad ? bad : "rejected"); } }
+    int region_rej = 0;
+    for (int it = 0; it < 100; it++) {
+        memcpy(g_img, orig, g_len);
+        int flips = 1 + (int)(fz() % 3);
+        for (int k = 0; k < flips; k++) {
+            size_t pos = index_off + (size_t)(fz() % (g_len - index_off)); uint8_t bit = (uint8_t)(1u << (fz() % 8));
+            g_img[pos] ^= bit;
+        }
+        const char* bad = NULL;
+        if (!img_store(p, g_len)) bad = "could not write the mutated image";
+        else if (fuzz_one(p, &bad)) region_rej++;
+        if (bad) { free(orig); TEST_ASSERT_FMT(0, "pool region iter %d: %s", it, bad); }
+    }
+    free(orig);
+    TEST_ASSERT_FMT(region_rej > 0, "pool region: %d of 100 mutated images rejected", region_rej);
+    PASS();
+}
+
 const test_entry_t enccorrupt_entries[] = {
     { "enccorrupt/headers",       test_reject_headers,       ec_setup, ec_teardown },
     { "enccorrupt/directory",     test_reject_directory,     ec_setup, ec_teardown },
@@ -1598,6 +1637,7 @@ const test_entry_t enccorrupt_entries[] = {
     { "enccorrupt/stats_point_read", test_stats_point_read,  ec_setup, ec_teardown },
     { "enccorrupt/stats_guard",   test_stats_guard,          ec_setup, ec_teardown },
     { "enccorrupt/idx_info",      test_idx_info_corrupt,     ec_setup, ec_teardown },
+    { "enccorrupt/fuzz_flips_pool", test_fuzz_flips_pool,    ec_setup, ec_teardown },
     { "enccorrupt/fuzz_flips",    test_fuzz_flips,           ec_setup, ec_teardown },
     { NULL, NULL, NULL, NULL },
 };
