@@ -3621,7 +3621,7 @@ static ray_t* exec_window_join_flat(ray_graph_t* g, ray_op_t* op,
      * fails. */
     bool rt_no_nulls = !ray_vec_may_have_nulls(rt_time_vec);
     for (uint32_t k = 0; k < n_eq && rt_no_nulls; k++)
-        if (ray_vec_may_have_nulls(rt_eq[k])) rt_no_nulls = false;
+        if (!join_key_col_nullfree(rt_eq[k])) rt_no_nulls = false;
     if (asof_hash_group_match(n_eq, lt_eq, rt_eq, eq_xlut, eq_xn,
                               lt_time, rt_time, lt_null, rt_null,
                               left_n, right_n,
