@@ -676,6 +676,25 @@ static test_result_t test_build_sys_args_edges(void) {
     PASS();
 }
 
+static test_result_t test_build_sys_args_mem_flag(void) {
+    char* cases[][4] = {
+        { "rayforce", "script.rfl", "-m", "4G" },
+        { "rayforce", "script.rfl", "--mem", "512M" },
+        { "rayforce", "-m", "4G", "script.rfl" },
+        { "rayforce", "--mem", "512M", "script.rfl" },
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        ray_t* d = ray_build_sys_args(4, cases[i]);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(d));
+        ray_t* file = args_top(d, "file");
+        TEST_ASSERT_EQ_I(file->type, -RAY_STR);
+        TEST_ASSERT_EQ_I(strcmp(ray_str_ptr(file), "script.rfl"), 0);
+        ray_release(file);
+        ray_release(d);
+    }
+    PASS();
+}
+
 static test_result_t test_build_sys_args_rejects_malformed_numbers(void) {
     char* cases[][3] = {
         { "rayforce", "-c", "2abc" },
@@ -1416,6 +1435,7 @@ const test_entry_t runtime_entries[] = {
     { "runtime/build_sys_args_defaults",     test_build_sys_args_defaults,     sys_setup, sys_teardown },
     { "runtime/build_sys_args_flags_user",   test_build_sys_args_flags_and_user, sys_setup, sys_teardown },
     { "runtime/build_sys_args_edges",        test_build_sys_args_edges,        sys_setup, sys_teardown },
+    { "runtime/build_sys_args_mem_flag",     test_build_sys_args_mem_flag,     sys_setup, sys_teardown },
     { "runtime/build_sys_args_rejects_malformed_numbers", test_build_sys_args_rejects_malformed_numbers, sys_setup, sys_teardown },
     { "runtime/sys_args_builtin",            test_sys_args_builtin,            sys_setup, sys_teardown },
     { "runtime/syscov_rc",                   test_syscov_rc,                   sys_setup, sys_teardown },
