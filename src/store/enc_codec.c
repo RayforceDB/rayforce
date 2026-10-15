@@ -94,14 +94,18 @@ int ray_enc_delta_width(const uint64_t* v, int n, ray_enc_kind_t k, uint64_t* db
 }
 
 /* ---- slots ---- */
-static const ray_enc_kind_t K_U16 = { 16, false };
-static const ray_enc_kind_t K_U32 = { 32, false };
+static const ray_enc_kind_t K_U16 = { 16, false, false };
+static const ray_enc_kind_t K_U32 = { 32, false, false };
+static const ray_enc_kind_t K_U64 = { 64, false, false };
+static const ray_enc_kind_t K_U8  = { 8,  false, false };
 
 /* Kind of a child slot's values given the parent's kind. */
 static ray_enc_kind_t slot_child_kind(ray_enc_slot_t child, ray_enc_kind_t parent) {
     switch (child) {
     case RAY_ENC_SLOT_RLE_ENDS: return K_U16;
     case RAY_ENC_SLOT_CODES:    return K_U32;
+    case RAY_ENC_SLOT_ALP_INTS: return K_U64;
+    case RAY_ENC_SLOT_ALP_RD_LEFT: return K_U8;
     default:                    return parent;   /* RLE values: enclosing kind */
     }
 }
@@ -112,14 +116,21 @@ static bool enc_legal(uint8_t enc, ray_enc_slot_t slot, int depth, ray_enc_kind_
     if (depth >= RAY_ENC_DEPTH_MAX && enc != RAY_ENC_RAW && enc != RAY_ENC_FOR_BP) return false;
     switch (slot) {
     case RAY_ENC_SLOT_TOP:
+        if (k.is_float)                      /* ALP / ALP_RD live in enc_alp.c */
+            return enc == RAY_ENC_RAW || enc == RAY_ENC_CONST || enc == RAY_ENC_RLE ||
+                   (enc == RAY_ENC_DICT && dict && dict->n > 0);
         if (enc == RAY_ENC_DELTA_BP) return k.is_signed;          /* integer and temporal only */
         if (enc == RAY_ENC_DICT) return k.is_signed && dict && dict->n > 0;
         return enc == RAY_ENC_RAW || enc == RAY_ENC_CONST || enc == RAY_ENC_FOR_BP || enc == RAY_ENC_RLE;
     case RAY_ENC_SLOT_RLE_VALUES:
-        return enc == RAY_ENC_RAW || enc == RAY_ENC_FOR_BP;
+        return enc == RAY_ENC_RAW || (enc == RAY_ENC_FOR_BP && !k.is_float);
     case RAY_ENC_SLOT_RLE_ENDS:
         return enc == RAY_ENC_RAW || enc == RAY_ENC_FOR_BP || enc == RAY_ENC_DELTA_BP;
     case RAY_ENC_SLOT_CODES:
+        return enc == RAY_ENC_RAW || enc == RAY_ENC_FOR_BP || enc == RAY_ENC_RLE;
+    case RAY_ENC_SLOT_ALP_INTS:
+        return enc == RAY_ENC_RAW || enc == RAY_ENC_FOR_BP || enc == RAY_ENC_DELTA_BP || enc == RAY_ENC_RLE;
+    case RAY_ENC_SLOT_ALP_RD_LEFT:
         return enc == RAY_ENC_RAW || enc == RAY_ENC_FOR_BP || enc == RAY_ENC_RLE;
     }
     return false;
@@ -301,6 +312,13 @@ bool ray_enc_write_as(uint8_t enc, const uint64_t* v, int n, ray_enc_kind_t k,
     if ((int64_t)(out->len - at) != sz) { out->len = at; return false; }     /* size model and writer agree */
     if (chosen) { chosen->enc = enc; chosen->width = w; chosen->bytes = sz; }
     return true;
+}
+
+int64_t ray_enc_body_size(uint8_t enc, const uint64_t* v, int n, ray_enc_kind_t k,
+                          const ray_enc_dict_t* dict) {
+    if (n < 0 || n > RAY_ENC_VEC || enc > RAY_ENC_DICT || !enc_legal(enc, RAY_ENC_SLOT_TOP, 0, k, dict)) return -1;
+    uint8_t w;
+    return enc_size(enc, v, n, k, RAY_ENC_SLOT_TOP, 0, dict, &w);
 }
 
 /* ---- readers ---- */

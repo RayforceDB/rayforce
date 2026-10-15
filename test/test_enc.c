@@ -118,7 +118,7 @@ static test_result_t test_kind_of(void) {
 }
 
 static test_result_t test_logical_and_order(void) {
-    ray_enc_kind_t s16 = { 16, true }, u8 = { 8, false };
+    ray_enc_kind_t s16 = { 16, true, false }, u8 = { 8, false, false };
     TEST_ASSERT_EQ_I(ray_enc_logical(0xFFFF, s16), -1);
     TEST_ASSERT_EQ_I(ray_enc_logical(0x7FFF, s16), 32767);
     TEST_ASSERT_TRUE(ray_enc_lt(0xFFFF, 0x0001, s16));   /* -1 < 1 */
@@ -168,7 +168,7 @@ static test_result_t test_load_sym_w8_inband(void) {
 
 static test_result_t test_stats_runs_and_equal(void) {
     uint64_t v[6] = { 5, 5, 5, 9, 9, 5 };
-    ray_enc_kind_t k = { 32, true };
+    ray_enc_kind_t k = { 32, true, false };
     ray_enc_stats_t s;
     ray_enc_stats(v, 6, k, &s);
     TEST_ASSERT_EQ_I(s.runs, 3);
@@ -200,7 +200,7 @@ static test_result_t test_sizes_raw_const(void) {
 
 static test_result_t test_for_width_signed_extremes(void) {
     uint64_t v[3] = { (uint64_t)(INT64_MIN + 1), (uint64_t)INT64_MAX, 0 };
-    ray_enc_kind_t k = { 64, true };
+    ray_enc_kind_t k = { 64, true, false };
     uint64_t base;
     int w = ray_enc_for_width(v, 3, k, &base);
     TEST_ASSERT_EQ_U(base, (uint64_t)(INT64_MIN + 1));  /* native min */
@@ -211,7 +211,7 @@ static test_result_t test_for_width_signed_extremes(void) {
 
 static test_result_t test_for_width_narrow(void) {
     uint64_t v[4] = { 0xFFFE, 0xFFFF, 0x0000, 0x0001 };  /* -2,-1,0,1 as I16 */
-    ray_enc_kind_t k = { 16, true };
+    ray_enc_kind_t k = { 16, true, false };
     uint64_t base;
     int w = ray_enc_for_width(v, 4, k, &base);
     TEST_ASSERT_EQ_U(base, 0xFFFE);
@@ -222,7 +222,7 @@ static test_result_t test_for_width_narrow(void) {
 static test_result_t test_delta_width_sorted(void) {
     static uint64_t v[RAY_ENC_VEC];
     for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = (uint64_t)(1000000 + 3 * i);
-    ray_enc_kind_t k = { 64, true };
+    ray_enc_kind_t k = { 64, true, false };
     uint64_t dbase;
     int w = ray_enc_delta_width(v, RAY_ENC_VEC, k, &dbase);
     TEST_ASSERT_EQ_U(dbase, 3 * 16);                      /* lane stride L=16 */
@@ -250,7 +250,7 @@ static int enc_roundtrip(const uint64_t* v, int n, ray_enc_kind_t k,
 static test_result_t test_choose_const(void) {
     uint64_t v[1000];
     for (int i = 0; i < 1000; i++) v[i] = 42;
-    ray_enc_kind_t k = { 32, true };
+    ray_enc_kind_t k = { 32, true, false };
     int64_t bytes;
     TEST_ASSERT_EQ_I(enc_roundtrip(v, 1000, k, NULL, &bytes), RAY_ENC_CONST);
     TEST_ASSERT_EQ_I(bytes, 8);
@@ -260,7 +260,7 @@ static test_result_t test_choose_const(void) {
 static test_result_t test_choose_rle_runs(void) {
     static uint64_t v[RAY_ENC_VEC];
     for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = (uint64_t)(i / 100) * 1000003ull;  /* 11 runs, wide values */
-    ray_enc_kind_t k = { 64, true };
+    ray_enc_kind_t k = { 64, true, false };
     TEST_ASSERT_EQ_I(enc_roundtrip(v, RAY_ENC_VEC, k, NULL, NULL), RAY_ENC_RLE);
     PASS();
 }
@@ -269,7 +269,7 @@ static test_result_t test_choose_for(void) {
     static uint64_t v[RAY_ENC_VEC];
     uint64_t s = 7;
     for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = 5000 + (enc_rng(&s) & 0x3F);  /* 6-bit spread */
-    ray_enc_kind_t k = { 32, true };
+    ray_enc_kind_t k = { 32, true, false };
     int64_t bytes;
     TEST_ASSERT_EQ_I(enc_roundtrip(v, RAY_ENC_VEC, k, NULL, &bytes), RAY_ENC_FOR_BP);
     TEST_ASSERT_EQ_I(bytes, 8 + 1024 * 6 / 8);
@@ -279,7 +279,7 @@ static test_result_t test_choose_for(void) {
 static test_result_t test_choose_delta(void) {
     static uint64_t v[RAY_ENC_VEC];
     for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = 1700000000000ull + 1000ull * (uint64_t)i;  /* timestamps */
-    ray_enc_kind_t k = { 64, true };
+    ray_enc_kind_t k = { 64, true, false };
     TEST_ASSERT_EQ_I(enc_roundtrip(v, RAY_ENC_VEC, k, NULL, NULL), RAY_ENC_DELTA_BP);
     PASS();
 }
@@ -288,7 +288,7 @@ static test_result_t test_keep_raw_when_gain_small(void) {
     static uint64_t v[RAY_ENC_VEC];
     uint64_t s = 99;
     for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = enc_rng(&s) & 0xFFFF;  /* full 16-bit spread */
-    ray_enc_kind_t k = { 16, false };
+    ray_enc_kind_t k = { 16, false, false };
     TEST_ASSERT_EQ_I(enc_roundtrip(v, RAY_ENC_VEC, k, NULL, NULL), RAY_ENC_RAW);
     PASS();
 }
@@ -301,7 +301,7 @@ static test_result_t test_dict_wide_sparse_values(void) {
      * not what this test exercises. */
     uint64_t s = 31;
     for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = vals[enc_rng(&s) & 3];
-    ray_enc_kind_t k = { 64, true };
+    ray_enc_kind_t k = { 64, true, false };
     uint64_t* d; uint32_t dn;
     TEST_ASSERT_EQ_I(ray_enc_train_dict(v, RAY_ENC_VEC, k, &d, &dn), 1);
     TEST_ASSERT_EQ_I(dn, 4);
@@ -315,7 +315,7 @@ static test_result_t test_dict_wide_sparse_values(void) {
 
 static test_result_t test_roundtrip_lengths_and_types(void) {
     static const int lens[6] = { 1, 2, 1023, 1024, 17, 512 };
-    static const ray_enc_kind_t kinds[5] = { {8,false}, {16,true}, {32,true}, {64,true}, {16,false} };
+    static const ray_enc_kind_t kinds[5] = { { 8, false, false }, { 16, true, false }, { 32, true, false }, { 64, true, false }, { 16, false, false } };
     uint64_t s = 12345;
     for (int ki = 0; ki < 5; ki++)
         for (int li = 0; li < 6; li++)
@@ -335,7 +335,7 @@ static test_result_t test_roundtrip_lengths_and_types(void) {
 static test_result_t test_i64_extremes_roundtrip(void) {
     uint64_t v[6] = { (uint64_t)(INT64_MIN + 1), (uint64_t)INT64_MAX, 0,
                       (uint64_t)(INT64_MIN + 1), (uint64_t)-5, (uint64_t)INT64_MAX };
-    ray_enc_kind_t k = { 64, true };
+    ray_enc_kind_t k = { 64, true, false };
     TEST_ASSERT_TRUE(enc_roundtrip(v, 6, k, NULL, NULL) >= 0);
     PASS();
 }
@@ -347,7 +347,7 @@ static test_result_t test_i64_extremes_roundtrip(void) {
 static test_result_t test_dict_codes_rle_nested(void) {
     static uint64_t v[RAY_ENC_VEC];
     for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = 0x123456789ABull * (uint64_t)((i / 10) % 100 + 1);
-    ray_enc_kind_t k = { 64, true };
+    ray_enc_kind_t k = { 64, true, false };
     uint64_t* d; uint32_t dn;
     TEST_ASSERT_EQ_I(ray_enc_train_dict(v, RAY_ENC_VEC, k, &d, &dn), 1);
     ray_enc_dict_t dict = { d, dn };
@@ -376,7 +376,7 @@ static void rle_body(uint8_t* b, uint32_t nr, uint32_t v0, uint32_t v1, uint16_t
 }
 
 static test_result_t test_read_rejects_malformed(void) {
-    ray_enc_kind_t k = { 32, true }, k16 = { 16, false };
+    ray_enc_kind_t k = { 32, true, false }, k16 = { 16, false, false };
     uint8_t b[400];
     uint64_t out[RAY_ENC_VEC];
 #define RLE_READ(av) ray_enc_read(b, (av), RAY_ENC_RLE, 0, 4, k, RAY_ENC_SLOT_TOP, 0, NULL, out)
@@ -429,7 +429,7 @@ static test_result_t test_read_rejects_malformed(void) {
     /* DELTA as a depth-3 child */
     memset(b, 0, sizeof b);
     b[0] = RAY_ENC_DELTA_BP; uint32_t bb = 8; memcpy(b + 4, &bb, 4);
-    TEST_ASSERT_EQ_I(ray_enc_read(b, 16, 0, 0, 2, ((ray_enc_kind_t){16,false}), RAY_ENC_SLOT_RLE_ENDS, 3, NULL, out), -1);
+    TEST_ASSERT_EQ_I(ray_enc_read(b, 16, 0, 0, 2, ((ray_enc_kind_t){ 16, false, false }), RAY_ENC_SLOT_RLE_ENDS, 3, NULL, out), -1);
 
     /* DICT code >= dictionary count (top-level DICT, RAW codes child) */
     static const uint64_t dv[1] = { 77 };
@@ -449,7 +449,7 @@ static test_result_t test_read_rejects_bad_child(void) {
     uint32_t nruns = 1; memcpy(body, &nruns, 4);
     body[8] = RAY_ENC_CONST;               /* child header: encoding */
     uint32_t bb = 8; memcpy(body + 12, &bb, 4);
-    ray_enc_kind_t k = { 32, true };
+    ray_enc_kind_t k = { 32, true, false };
     uint64_t out[RAY_ENC_VEC];
     TEST_ASSERT_EQ_I(ray_enc_read(body, sizeof body, RAY_ENC_RLE, 0, 4, k, RAY_ENC_SLOT_TOP, 0, NULL, out), -1);
     PASS();
@@ -529,7 +529,7 @@ static void delta_data(uint64_t* v, int n, int T) {
 static int layout_case(int want_enc, int T, int n, bool delta, int expect_w) {
     static uint64_t v[RAY_ENC_VEC];
     static uint8_t exp[8 + 8 * 128 + RAY_ENC_VEC * 8];
-    ray_enc_kind_t k = { (uint8_t)T, true };
+    ray_enc_kind_t k = { (uint8_t)T, true, false };
     if (delta) delta_data(v, n, T);
     else for_data(v, n, T, -200, expect_w == 9 ? 512 : 1000, 0x1234567ull + (uint64_t)T + (uint64_t)n);
     int w; size_t len = delta ? ref_delta_body(v, n, T, exp, &w) : ref_for_body(v, n, T, exp, &w);
@@ -589,7 +589,7 @@ static test_result_t test_encode_sign_extended(void) {
     static uint64_t ext[RAY_ENC_VEC], msk[RAY_ENC_VEC], out[RAY_ENC_VEC];
     for (int ci = 0; ci < 2; ci++) {
         int T = ci ? 32 : 16;
-        ray_enc_kind_t k = { (uint8_t)T, true };
+        ray_enc_kind_t k = { (uint8_t)T, true, false };
         for (int delta = 0; delta < 2; delta++) {
             for (int i = 0; i < RAY_ENC_VEC; i++) {
                 int64_t x = delta ? -500 + 7 * i + (i % 3) : -(i & 1);
@@ -610,7 +610,7 @@ static test_result_t test_encode_sign_extended(void) {
     }
     /* The small case from the review: I16 {-1, 0}. */
     uint64_t two[2] = { ~0ull, 0 }, o2[2];
-    ray_enc_kind_t k16 = { 16, true };
+    ray_enc_kind_t k16 = { 16, true, false };
     ray_enc_buf_t t = {0}; ray_enc_choice_t ct;
     TEST_ASSERT_TRUE(ray_enc_write(two, 2, k16, RAY_ENC_SLOT_TOP, 0, NULL, &t, &ct));
     TEST_ASSERT_EQ_I(ray_enc_read(t.p, t.len, ct.enc, ct.width, 2, k16, RAY_ENC_SLOT_TOP, 0, NULL, o2), (int64_t)t.len);
@@ -642,7 +642,7 @@ static test_result_t test_buf_free_clears_oom(void) {
 
 static test_result_t test_train_dict_tristate(void) {
     static uint64_t v[RAY_ENC_VEC * 70];
-    ray_enc_kind_t k = { 64, true };
+    ray_enc_kind_t k = { 64, true, false };
     uint64_t* d = NULL; uint32_t dn = 0;
     TEST_ASSERT_EQ_I(ray_enc_train_dict(v, 0, k, &d, &dn), 0);
     for (int64_t i = 0; i < (int64_t)RAY_ENC_VEC * 70; i++) v[i] = (uint64_t)i;   /* 71680 > 1<<16 distinct */
@@ -664,7 +664,7 @@ static size_t put_child(uint8_t* p, uint8_t enc, uint32_t body_bytes) {
  * with a RAW values child reads; the same body with the values child's
  * encoding byte set to DICT (codes child well formed) is rejected. */
 static test_result_t test_read_rejects_dict_child(void) {
-    ray_enc_kind_t k = { 64, true };
+    ray_enc_kind_t k = { 64, true, false };
     uint64_t dv[1] = { 7 };
     ray_enc_dict_t dict = { dv, 1 };
     uint64_t out[RAY_ENC_VEC];
@@ -700,7 +700,7 @@ static test_result_t test_read_rejects_dict_child(void) {
 /* Training sorts in the kind's native order. */
 static test_result_t test_train_dict_native_order(void) {
     uint64_t s16[6] = { 0xFFFE, 0x0003, 0x8000, 0x7FFF, 0xFFFE, 0x0000 }; /* -2,3,-32768,32767,-2,0 */
-    ray_enc_kind_t ks = { 16, true };
+    ray_enc_kind_t ks = { 16, true, false };
     uint64_t* d; uint32_t dn;
     TEST_ASSERT_EQ_I(ray_enc_train_dict(s16, 6, ks, &d, &dn), 1);
     TEST_ASSERT_EQ_I(dn, 5);
@@ -708,7 +708,7 @@ static test_result_t test_train_dict_native_order(void) {
     for (int i = 0; i < 5; i++) TEST_ASSERT_FMT(d[i] == want_s[i], "signed i=%d", i);
     ray_free_raw(d);
     uint64_t u8[4] = { 128, 127, 255, 0 };
-    ray_enc_kind_t ku = { 8, false };
+    ray_enc_kind_t ku = { 8, false, false };
     TEST_ASSERT_EQ_I(ray_enc_train_dict(u8, 4, ku, &d, &dn), 1);
     static const uint64_t want_u[4] = { 0, 127, 128, 255 };
     for (int i = 0; i < 4; i++) TEST_ASSERT_FMT(d[i] == want_u[i], "unsigned i=%d", i);
@@ -740,13 +740,13 @@ static test_result_t test_write_as_forced(void) {
         uint64_t m = T == 64 ? ~0ull : ((1ull << T) - 1);
         int64_t hi = T == 16 ? 32767 : T == 32 ? 2147483647ll : INT64_MAX;
         for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = (uint64_t)(((i / L) & 1) ? hi : -hi) & m;
-        ray_enc_kind_t k = { (uint8_t)T, true };
+        ray_enc_kind_t k = { (uint8_t)T, true, false };
         TEST_ASSERT_EQ_I(forced_roundtrip(RAY_ENC_DELTA_BP, v, RAY_ENC_VEC, k, NULL, &b, &c), 0);
         TEST_ASSERT_EQ_I(c.width, T);
         TEST_ASSERT_TRUE(ray_enc_choose(v, RAY_ENC_VEC, k, RAY_ENC_SLOT_TOP, 0, NULL).enc != RAY_ENC_DELTA_BP);
     }
     /* DICT over a constant vector: the codes child is FOR_BP at width 0 (a constant child at depth 1). */
-    ray_enc_kind_t k64 = { 64, true };
+    ray_enc_kind_t k64 = { 64, true, false };
     for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = 900000000001ull;
     uint64_t dv[2] = { 11, 900000000001ull };
     ray_enc_dict_t dict = { dv, 2 };
@@ -763,7 +763,7 @@ static test_result_t test_write_as_forced(void) {
     uint32_t vb; memcpy(&vb, b.p + 12, 4);
     TEST_ASSERT_EQ_I(b.p[16 + vb], RAY_ENC_DELTA_BP);    /* ends child */
     /* illegal or inapplicable */
-    ray_enc_kind_t ku8 = { 8, false };
+    ray_enc_kind_t ku8 = { 8, false, false };
     TEST_ASSERT_EQ_I(forced_roundtrip(RAY_ENC_DELTA_BP, v, 16, ku8, NULL, &b, &c), -1);  /* unsigned */
     TEST_ASSERT_EQ_I(forced_roundtrip(RAY_ENC_CONST, v, 16, k64, NULL, &b, &c), -1);     /* unequal */
     TEST_ASSERT_EQ_I(forced_roundtrip(RAY_ENC_DICT, v, 16, k64, &dict, &b, &c), -1);     /* not in dict */
@@ -777,7 +777,7 @@ static test_result_t test_write_bounds_rollback_masking(void) {
     static uint64_t v[RAY_ENC_VEC + 1];
     ray_enc_buf_t b = {0};
     ray_enc_choice_t c;
-    ray_enc_kind_t k64 = { 64, true };
+    ray_enc_kind_t k64 = { 64, true, false };
     TEST_ASSERT_TRUE(!ray_enc_write(v, -1, k64, RAY_ENC_SLOT_TOP, 0, NULL, &b, &c));
     TEST_ASSERT_TRUE(!ray_enc_write(v, RAY_ENC_VEC + 1, k64, RAY_ENC_SLOT_TOP, 0, NULL, &b, &c));
     TEST_ASSERT_TRUE(!ray_enc_write_as(RAY_ENC_RAW, v, -1, k64, NULL, &b, &c));
@@ -791,7 +791,7 @@ static test_result_t test_write_bounds_rollback_masking(void) {
     TEST_ASSERT_TRUE(!ray_enc_write_as(RAY_ENC_CONST, v, 16, k64, NULL, &b, &c));
     TEST_ASSERT_EQ_I(b.len, len0);
     /* sign-extended I16 input encodes like the masked input */
-    ray_enc_kind_t k16 = { 16, true };
+    ray_enc_kind_t k16 = { 16, true, false };
     uint64_t sx[64], mk[64];
     for (int i = 0; i < 64; i++) { int16_t x = (int16_t)(i * 37 - 1000); sx[i] = (uint64_t)(int64_t)x; mk[i] = (uint64_t)(uint16_t)x; }
     ray_enc_buf_t b1 = {0}, b2 = {0};

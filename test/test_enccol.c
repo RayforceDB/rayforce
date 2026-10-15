@@ -779,7 +779,7 @@ static test_result_t test_fast_kernel_equal(void) {
     /* a sentinel outside the bitmap: the fast kernel declines, the reference reports it */
     for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = (uint64_t)(uint16_t)(int16_t)(i % 50 - 25);
     v[700] = fk_sentinel(16);
-    ray_enc_kind_t k16 = { 16, true };
+    ray_enc_kind_t k16 = { 16, true, false };
     ray_enc_buf_t b = { 0 }; ray_enc_choice_t ch;
     TEST_ASSERT_TRUE(ray_enc_write_as(RAY_ENC_FOR_BP, v, RAY_ENC_VEC, k16, NULL, &b, &ch));
     static uint8_t out[RAY_ENC_VEC * 8];
@@ -916,7 +916,7 @@ static bool rk_child(ray_enc_buf_t* b, uint8_t enc, const uint64_t* v, int n, ra
 static bool rk_rle(ray_enc_buf_t* b, ray_enc_kind_t k, const uint64_t* vals, const uint64_t* ends, int nr,
                    uint8_t venc, uint8_t eenc) {
     uint32_t h[2] = { (uint32_t)nr, 0 };
-    ray_enc_kind_t ke = { 16, eenc == RAY_ENC_DELTA_BP };
+    ray_enc_kind_t ke = { 16, eenc == RAY_ENC_DELTA_BP, false };
     return ray_enc_buf_put(b, h, 8) && rk_child(b, venc, vals, nr, k) && rk_child(b, eenc, ends, nr, ke);
 }
 
@@ -1037,7 +1037,7 @@ static test_result_t test_runs_kernel_equal(void) {
         }
     }
     /* every run count 1..1024 over a full I16 vector, the writer's children */
-    ray_enc_kind_t k16 = { 16, true };
+    ray_enc_kind_t k16 = { 16, true, false };
     memset(bm, 0, sizeof bm);
     for (int nr = 1; nr <= RAY_ENC_VEC; nr++) {
         rk_vals(k16, false, nr, nr & 1, vals);
@@ -1087,7 +1087,7 @@ static test_result_t test_runs_kernel_declines(void) {
     static uint64_t vals[RAY_ENC_VEC], ends[RAY_ENC_VEC], rows[RAY_ENC_VEC], want[RAY_ENC_VEC];
     static uint8_t bm[RAY_ENC_VEC / 8];
     _Alignas(8) static uint8_t buf[8192];
-    const ray_enc_kind_t k16 = { 16, true };
+    const ray_enc_kind_t k16 = { 16, true, false };
     test_result_t r;
 #define RK_BAD(TYPE, ATTRS, ENC, LEN, VLEN, BM, NN, WHAT) \
     if ((r = rk_declines(TYPE, ATTRS, ENC, buf, LEN, VLEN, BM, NN, WHAT)).status != TEST_PASS) return r
@@ -1196,7 +1196,7 @@ static test_result_t test_runs_kernel_declines(void) {
      * child's size does not depend on it.  I64 runs (16 lanes) in a body
      * of exactly its bytes, so an unbounded unpack reads past it and writes
      * past the 1024 values (ASan) */
-    const ray_enc_kind_t k64 = { 64, true };
+    const ray_enc_kind_t k64 = { 64, true, false };
     rk_vals(k64, false, 300, true, vals);
     rk_ends(RAY_ENC_VEC, 300, ends);
     b = (ray_enc_buf_t){ 0 };
@@ -1212,7 +1212,7 @@ static test_result_t test_runs_kernel_declines(void) {
     }
     ray_enc_buf_free(&b);
     /* CONST I32: 8 B, the value then zero padding */
-    const ray_enc_kind_t k32 = { 32, true };
+    const ray_enc_kind_t k32 = { 32, true, false };
     for (int i = 0; i < RAY_ENC_VEC; i++) rows[i] = 7;
     b = (ray_enc_buf_t){ 0 }; ray_enc_choice_t ch;
     TEST_ASSERT_TRUE(ray_enc_write_as(RAY_ENC_CONST, rows, RAY_ENC_VEC, k32, NULL, &b, &ch));
@@ -1226,7 +1226,7 @@ static test_result_t test_runs_kernel_declines(void) {
     RK_FRESH(); memcpy(buf, &u32, 4);                   RK_BAD(RAY_I32, 0, RAY_ENC_CONST, 8, 1024, bm, 1000, "CONST on the sentinel, rows outside");
     ray_enc_buf_free(&b);
     /* SYM: ids outside the domain, the null count */
-    const ray_enc_kind_t ks = { 32, false };
+    const ray_enc_kind_t ks = { 32, false, false };
     for (int i = 0; i < 11; i++) vals[i] = (uint64_t)(5 + i);
     for (int i = 0; i < 11; i++) ends[i] = (uint64_t)(i < 10 ? 100 * (i + 1) : 1024);
     b = (ray_enc_buf_t){ 0 };
@@ -1748,7 +1748,7 @@ static test_result_t test_point_read_runs(void) {
     TEST_ASSERT_TRUE(cases > 1000);
     /* statistics: I32 runs 10, 20, 30 (rows 0..99, 100..599, 600..1023);
      * descriptor [10, 20] puts the last run outside */
-    const ray_enc_kind_t k32 = { 32, true };
+    const ray_enc_kind_t k32 = { 32, true, false };
     const uint64_t v3[3] = { 10, 20, 30 }, e3[3] = { 100, 600, 1024 };
     ray_enc_buf_t b = { 0 };
     TEST_ASSERT_TRUE(rk_rle(&b, k32, v3, e3, 3, RAY_ENC_RAW, RAY_ENC_RAW));
@@ -1777,7 +1777,7 @@ static test_result_t test_point_read_runs(void) {
 static test_result_t test_point_read_stats(void) {
     static uint64_t v[RAY_ENC_VEC], u[RAY_ENC_VEC], bodyw[RAY_ENC_VEC / 2 + 4];
     static int64_t pv[RAY_ENC_VEC]; static int8_t res[RAY_ENC_VEC];
-    ray_enc_kind_t k32 = { 32, true };
+    ray_enc_kind_t k32 = { 32, true, false };
     for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = (uint64_t)(uint32_t)(int32_t)(i % 300 - 100);
     ray_enc_buf_t b = { 0 }; ray_enc_choice_t ch;
     TEST_ASSERT_TRUE(ray_enc_write_as(RAY_ENC_FOR_BP, v, RAY_ENC_VEC, k32, NULL, &b, &ch));
@@ -1812,7 +1812,7 @@ static test_result_t test_point_read_declines(void) {
     static uint64_t v[RAY_ENC_VEC], u[RAY_ENC_VEC], bodyw[RAY_ENC_VEC / 2 + 4];
     static int64_t pv[RAY_ENC_VEC]; static int8_t res[RAY_ENC_VEC];
     static uint8_t ref[RAY_ENC_VEC * 8];
-    ray_enc_kind_t k32 = { 32, true }, k16 = { 16, true };
+    ray_enc_kind_t k32 = { 32, true, false }, k16 = { 16, true, false };
     for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = (uint64_t)(uint32_t)(int32_t)(i % 300 - 100);
     ray_enc_buf_t b = { 0 }; ray_enc_choice_t ch;
     TEST_ASSERT_TRUE(ray_enc_write_as(RAY_ENC_FOR_BP, v, RAY_ENC_VEC, k32, NULL, &b, &ch));

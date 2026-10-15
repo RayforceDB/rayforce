@@ -30,16 +30,22 @@ static inline uint64_t tmask(int T) { return T == 64 ? ~0ull : ((1ull << T) - 1)
 
 bool ray_enc_kind_of(int8_t type, uint8_t attrs, ray_enc_kind_t* k) {
     switch (type) {
-    case RAY_BOOL: case RAY_U8:       *k = (ray_enc_kind_t){ 8,  false }; return true;
-    case RAY_I16:                     *k = (ray_enc_kind_t){ 16, true  }; return true;
+    case RAY_BOOL: case RAY_U8:       *k = (ray_enc_kind_t){ 8,  false, false }; return true;
+    case RAY_I16:                     *k = (ray_enc_kind_t){ 16, true,  false }; return true;
     case RAY_I32: case RAY_DATE:
-    case RAY_TIME:                    *k = (ray_enc_kind_t){ 32, true  }; return true;
-    case RAY_I64: case RAY_TIMESTAMP: *k = (ray_enc_kind_t){ 64, true  }; return true;
+    case RAY_TIME:                    *k = (ray_enc_kind_t){ 32, true,  false }; return true;
+    case RAY_I64: case RAY_TIMESTAMP: *k = (ray_enc_kind_t){ 64, true,  false }; return true;
     case RAY_SYM:
-        *k = (ray_enc_kind_t){ (uint8_t)(8 * RAY_SYM_ELEM(attrs)), false };
+        *k = (ray_enc_kind_t){ (uint8_t)(8 * RAY_SYM_ELEM(attrs)), false, false };
         return true;
     default: return false;
     }
+}
+
+bool ray_enc_value_kind(int8_t type, uint8_t attrs, ray_enc_kind_t* k) {
+    if (type == RAY_F32) { *k = (ray_enc_kind_t){ 32, false, true }; return true; }
+    if (type == RAY_F64) { *k = (ray_enc_kind_t){ 64, false, true }; return true; }
+    return ray_enc_kind_of(type, attrs, k);
 }
 
 bool ray_enc_has_bitmap(int8_t type) {
@@ -58,7 +64,18 @@ int64_t ray_enc_logical(uint64_t bits, ray_enc_kind_t k) {
     return (int64_t)bits;
 }
 
+static double enc_fval(uint64_t b, int T) {
+    if (T == 32) { uint32_t u = (uint32_t)b; float f; memcpy(&f, &u, 4); return (double)f; }
+    double d; memcpy(&d, &b, 8); return d;
+}
+
 bool ray_enc_lt(uint64_t a, uint64_t b, ray_enc_kind_t k) {
+    if (k.is_float) {                    /* dictionary order (spec "Comparison semantics") */
+        double x = enc_fval(a, k.T), y = enc_fval(b, k.T);
+        if (x < y) return true;
+        if (x > y) return false;
+        return ((a >> (k.T - 1)) & 1) && !((b >> (k.T - 1)) & 1);   /* -0.0 before +0.0 */
+    }
     if (k.is_signed) return ray_enc_logical(a, k) < ray_enc_logical(b, k);
     uint64_t m = tmask(k.T);
     return (a & m) < (b & m);

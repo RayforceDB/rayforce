@@ -275,7 +275,7 @@ static void* sym_par_worker(void* a) {
 /* The FSST `lengths` slot (U32) allows only RAW and FOR_BP: size one vector
  * of lengths as the smaller of the two plus its 8-byte child header. */
 static int64_t fsst_lengths_bytes(const uint64_t* lv, int m) {
-    ray_enc_kind_t ku = { 32, false };
+    ray_enc_kind_t ku = { 32, false, false };
     uint64_t base;
     int w = ray_enc_for_width(lv, m, ku, &base);
     int64_t raw = ray_enc_size_raw(m, 32), fo = ray_enc_size_for(w);

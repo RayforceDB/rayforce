@@ -49,11 +49,16 @@ void   ray_enc_unpack(const uint8_t* in, int T, int w, uint64_t* u);
 int    ray_enc_bitlen(uint64_t x);
 
 /* ---- kinds and logical values ---- */
-typedef struct { uint8_t T; bool is_signed; } ray_enc_kind_t;
+typedef struct { uint8_t T; bool is_signed; bool is_float; } ray_enc_kind_t;
 
 bool    ray_enc_kind_of(int8_t type, uint8_t attrs, ray_enc_kind_t* k);
+/* The value kind of a type: ray_enc_kind_of for integer kinds, a float
+ * kind ({32|64, false, true}) for F32 / F64; false otherwise. */
+bool    ray_enc_value_kind(int8_t type, uint8_t attrs, ray_enc_kind_t* k);
 bool    ray_enc_has_bitmap(int8_t type);
 int64_t ray_enc_logical(uint64_t bits, ray_enc_kind_t k);
+/* a < b in kind order; on a float kind this is dictionary order: numeric
+ * on the value (F32 widened), -0.0 before +0.0. */
 bool    ray_enc_lt(uint64_t a, uint64_t b, ray_enc_kind_t k);
 
 /* One vector of input: T-bit patterns, null bitmap (bit i set = row i
@@ -108,7 +113,9 @@ typedef enum {
     RAY_ENC_SLOT_TOP = 0,
     RAY_ENC_SLOT_RLE_VALUES,   /* kind: element type at depth 1, else the enclosing slot's kind */
     RAY_ENC_SLOT_RLE_ENDS,     /* kind U16 */
-    RAY_ENC_SLOT_CODES         /* kind U32 (DICT / STR_DICT codes) */
+    RAY_ENC_SLOT_CODES,        /* kind U32 (DICT / STR_DICT codes) */
+    RAY_ENC_SLOT_ALP_INTS,     /* kind U64 */
+    RAY_ENC_SLOT_ALP_RD_LEFT   /* kind U8 */
 } ray_enc_slot_t;
 
 typedef struct { const uint64_t* v; uint32_t n; } ray_enc_dict_t;
@@ -126,6 +133,10 @@ bool    ray_enc_write(const uint64_t* v, int n, ray_enc_kind_t k,
  * outside the dictionary), or on OOM. */
 bool    ray_enc_write_as(uint8_t enc, const uint64_t* v, int n, ray_enc_kind_t k,
                          const ray_enc_dict_t* dict, ray_enc_buf_t* out, ray_enc_choice_t* chosen);
+/* Size of a top-level body in `enc` (RAW, CONST, FOR_BP, DELTA_BP, RLE,
+ * DICT), or -1 when not legal or not applicable. */
+int64_t ray_enc_body_size(uint8_t enc, const uint64_t* v, int n, ray_enc_kind_t k,
+                          const ray_enc_dict_t* dict);
 int64_t ray_enc_read(const uint8_t* p, size_t avail, uint8_t enc, uint8_t width,
                      int n, ray_enc_kind_t k, ray_enc_slot_t slot, int depth,
                      const ray_enc_dict_t* dict, uint64_t* out);

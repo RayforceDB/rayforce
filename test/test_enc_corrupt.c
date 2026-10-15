@@ -703,7 +703,7 @@ static size_t rle_body(uint8_t* b, uint32_t value, uint16_t n) {
 }
 static test_result_t test_reject_depth4(void) {
     uint8_t body[256]; uint64_t out[RAY_ENC_VEC];
-    ray_enc_kind_t u32 = { 32, false };
+    ray_enc_kind_t u32 = { 32, false, false };
     /* control: a valid RLE body at the top, children at depth 1 */
     size_t n = rle_body(body, 77, 4);
     TEST_ASSERT_EQ_I(n, 40);

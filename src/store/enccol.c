@@ -2207,7 +2207,7 @@ int ray_enccol_vview(ray_enccol_t* e, int64_t vec, ray_enc_vview_t* v, ray_t** e
     if (d->flags & RAY_ENC_DESC_TRAILER) return 0;
     if (fl) {
         if (d->encoding != RAY_ENC_CONST) return 0;
-        v->k = (ray_enc_kind_t){ (uint8_t)(e->type == RAY_F32 ? 32 : 64), false };
+        v->k = (ray_enc_kind_t){ (uint8_t)(e->type == RAY_F32 ? 32 : 64), false, false };
     } else {
         if (!fk_int_type(e->type) || !ray_enc_kind_of(e->type, e->attrs, &v->k)) return 0;
         if (d->encoding != RAY_ENC_CONST && d->encoding != RAY_ENC_FOR_BP &&
