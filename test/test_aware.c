@@ -2117,7 +2117,8 @@ static test_result_t test_gather_index_rows(void) {
                "(map (fn [j] (format \"r%\" j)) (til 100000)))))");
     aw_eval_ok("(.db.splayed.set \"" AW_TMP "/ix0/\" W {compress: false})");
     aw_eval_ok("(.db.splayed.set \"" AW_TMP "/ix2/\" W {compress: true})");
-    AW_SAME("ix", "(select {v: v t: t from: T where: (== h 7919)})", 0);
+    /* the HASH key materializes (the index use); v and t are gathered by rows */
+    AW_SAME("ix", "(select {v: v t: t from: T where: (== h 7919)})", 1);
     PASS();
 }
 

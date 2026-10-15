@@ -2641,6 +2641,7 @@ static ray_t* enc_attach_index(ray_enccol_t* e, ray_t** vp) {
         root = kind == RAY_IDX_ZONE ? enc_synth_zone(e) : enc_synth_chunk_zone(e);
         if (RAY_IS_ERR(root)) return root;
     } else if (kind == RAY_IDX_HASH || kind == RAY_IDX_SORT || kind == RAY_IDX_BLOOM || kind == RAY_IDX_PART) {
+        /* the nth counter's step (fail_path already failed at "materialize") */
         if (enc_alloc_fails(e) || atomic_load(&g_fail_index_parse))
             return ray_error("oom", "column %s: index parse", e->path);
         ray_enc_idx_view_t iv;

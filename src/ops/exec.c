@@ -29,6 +29,7 @@
 #include "ops/rowsel.h"
 #include "store/enccol.h"
 #include "store/enceval.h"
+#include "store/encidx.h"   /* ray_enc_idx_kind_has_region */
 #include "table/table.h"
 #include "ops/fused_group.h"
 #include "ops/idxop.h"
@@ -1479,6 +1480,24 @@ static bool idx_lazy_meta_ok(const ray_col_meta_t* m) {
     return m->null_count >= 0 ? m->null_count == 0 : !(m->attrs & RAY_ATTR_HAS_NULLS);
 }
 
+/* An unpublished generation-2 column is consulted from its directory only
+ * when its recorded kind has no region (none, ZONE, CHUNK_ZONE).  A
+ * recorded HASH, SORT, BLOOM or PART answers as on generation 0, from the
+ * index its materialization attaches (the "index an executor chose to use"
+ * exception of spec "Instrumentation"). */
+static bool idx_enc_from_dir(const ray_col_meta_t* m) {
+    return m->enc && !ray_enccol_decoded_peek(m->enc) && !ray_enc_idx_kind_has_region(m->index_kind);
+}
+
+/* Materialize a region-kind generation-2 column for its index: NULL when
+ * the column is plain, published, or materialized now; an owned error
+ * otherwise (spec "Accessors": an error never reads as "no index"). */
+static ray_t* idx_enc_index_ready(ray_graph_t* g, const ray_col_meta_t* m, int64_t sym) {
+    if (!m->enc || !ray_enc_idx_kind_has_region(m->index_kind) || ray_enccol_decoded_peek(m->enc)) return NULL;
+    ray_t* c = ray_table_col(g->table, sym);
+    return (c && RAY_IS_ERR(c)) ? c : NULL;
+}
+
 /* A lazy-hash failure is best effort (the scan answers), except an
  * interrupted build: that is the query's cancellation, handed back. */
 static ray_t* idx_lazy_err(ray_t* le) {
@@ -1505,7 +1524,9 @@ static bool idx_lazy_set_ok(const ray_t* col, const ray_t* set) {
 }
 
 /* The plain column for a decode that declines (the scan fallback re-reads the
- * column through the accessors and reports a failure with its message). */
+ * column through the accessors and reports a failure with its message).  A
+ * region-kind generation-2 column's failure never reaches here: the arms
+ * materialize it first (idx_enc_index_ready) and return that error. */
 static ray_t* idx_decode_col(ray_t* tbl, int64_t sym) {
     ray_t* col = ray_table_col(tbl, sym);
     if (col && RAY_IS_ERR(col)) { ray_error_free(col); return NULL; }
@@ -1566,7 +1587,9 @@ static bool idx_eqrange_meta_ok(ray_graph_t* g, ray_op_t** conj, int ncj) {
  * materialization (finding C1), from its directory: the zone class (recorded
  * ZONE), an EQ key outside the chunk zone's range, then the PI lazy HASH,
  * which materializes the column only when the accumulated probes pay for
- * the build.  Bloom, HASH, PART and SORT are never recorded on generation 2.
+ * the build.  Only a column idx_enc_from_dir admits comes here (recorded
+ * kind none, ZONE or CHUNK_ZONE); a recorded HASH, SORT, BLOOM or PART is
+ * materialized and answered by the generation-0 block from its index.
  * 1: every row passes; 2: *sel is the selection; 0: undecided (the fused
  * scan answers, by range); -1: *err owned.  Mirrors the generation-0 steps
  * of the OP_FILTER arm: the same counters in the same order, the same null
@@ -3362,14 +3385,17 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 double   key_f    = 0.0;
                 int      is_float = 0;
                 /* A generation-2 column without a published materialization
-                 * is consulted from its directory (finding C1) and never
-                 * decoded here; a published one takes the block below on
-                 * its materialization, which carries the synthesized zone. */
+                 * whose recorded kind has no region is consulted from its
+                 * directory (finding C1) and never decoded here; a recorded
+                 * HASH / SORT / BLOOM / PART is materialized now (its
+                 * failure is the query's) and, like a published one, takes
+                 * the block below on its materialization, which carries the
+                 * synthesized zone or the attached index. */
                 ray_col_meta_t fm;
                 bool enc_done = false;
-                if (idx_filter_decode(g, op_child(g, op, 1), IDXW_INDEX, NULL, &cmp_op,
-                                      &key_i, &key_f, &is_float, &fm) &&
-                    fm.enc && !ray_enccol_decoded_peek(fm.enc)) {
+                bool fm_ok = idx_filter_decode(g, op_child(g, op, 1), IDXW_INDEX, NULL, &cmp_op,
+                                               &key_i, &key_f, &is_float, &fm);
+                if (fm_ok && idx_enc_from_dir(&fm)) {
                     enc_done = true;
                     ray_t* esel = NULL; ray_t* eerr = NULL;
                     int rc = idx_filter_enc_consult(fm.enc, &fm, cmp_op, key_i, key_f, is_float,
@@ -3377,6 +3403,9 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     if (rc < 0) { ray_release(input); return eerr; }
                     if (rc == 1) return input;
                     if (rc == 2) { g->selection = esel; return input; }
+                } else if (fm_ok && fm.enc) {
+                    ray_t* merr = idx_enc_index_ready(g, &fm, idx_conj_sym(g, op_child(g, op, 1)));
+                    if (merr) { ray_release(input); return merr; }
                 }
                 if (!enc_done && idx_filter_decode(g, op_child(g, op, 1), IDXW_INDEX, &col, &cmp_op,
                                                    &key_i, &key_f, &is_float, NULL)) {
@@ -3553,6 +3582,12 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                         if (has_hash_eq && cm.enc && !ray_enccol_decoded_peek(cm.enc) &&
                             cm.index_kind != RAY_IDX_HASH)
                             eq_enc = cm.enc;
+                        /* a recorded HASH materializes for its index here,
+                         * its failure the query's; the decode loop reads it */
+                        if (has_hash_eq && cm.enc && cm.index_kind == RAY_IDX_HASH) {
+                            ray_t* merr = idx_enc_index_ready(g, &cm, idx_conj_sym(g, conj[ci]));
+                            if (merr) { ray_release(input); return merr; }
+                        }
                     }
                     shape_ok = shape_ok && has_hash_eq;
                     /* Finding C1: a generation-2 equality column is probed
@@ -3684,18 +3719,24 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 {
                     ray_t* in_col     = NULL;
                     ray_t* in_set_lit = NULL;
-                    /* generation 2 without a published materialization:
-                     * from the directory, never decoded here */
+                    /* generation 2 without a published materialization and
+                     * no recorded region kind: from the directory, never
+                     * decoded here; a recorded HASH / SORT / BLOOM / PART
+                     * materializes now (its failure the query's) and takes
+                     * the block below on its index */
                     ray_col_meta_t im;
                     bool in_enc_done = false;
-                    if (idx_filter_in_decode(g, op_child(g, op, 1), IDXW_INDEX, NULL, &in_set_lit, &im) &&
-                        im.enc && !ray_enccol_decoded_peek(im.enc)) {
+                    bool im_ok = idx_filter_in_decode(g, op_child(g, op, 1), IDXW_INDEX, NULL, &in_set_lit, &im);
+                    if (im_ok && idx_enc_from_dir(&im)) {
                         in_enc_done = true;
                         ray_t* isel = NULL; ray_t* ierr = NULL;
                         int rc = idx_filter_enc_in_consult(im.enc, &im, in_set_lit,
                                                            ray_table_nrows(input), &isel, &ierr);
                         if (rc < 0) { ray_release(input); return ierr; }
                         if (rc == 2) { g->selection = isel; return input; }
+                    } else if (im_ok && im.enc) {
+                        ray_t* merr = idx_enc_index_ready(g, &im, idx_conj_sym(g, op_child(g, op, 1)));
+                        if (merr) { ray_release(input); return merr; }
                     }
                     if (!in_enc_done &&
                         idx_filter_in_decode(g, op_child(g, op, 1), IDXW_INDEX, &in_col, &in_set_lit, NULL)) {
