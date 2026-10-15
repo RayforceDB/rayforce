@@ -2184,16 +2184,19 @@ static test_result_t ix_concurrent(bool corrupt) {
     ray_enc_counters_reset();
     ray_thread_t th[8]; ix_thr_t a[8];
     ray_sem_t ready, go;
-    TEST_ASSERT_EQ_I(ray_sem_init(&ready, 0), RAY_OK);
-    TEST_ASSERT_EQ_I(ray_sem_init(&go, 0), RAY_OK);
-    for (int i = 0; i < 8; i++) {
-        a[i] = (ix_thr_t){ .tbl = tbl, .sym = sym, .which = i, .ready = &ready, .go = &go };
-        TEST_ASSERT_EQ_I(ray_thread_create(&th[i], ix_thr, &a[i]), RAY_OK);
+    if (ray_sem_init(&ready, 0) != RAY_OK) { ray_release(tbl); ray_release(v); FAIL("sem"); }
+    if (ray_sem_init(&go, 0) != RAY_OK) { ray_sem_destroy(&ready); ray_release(tbl); ray_release(v); FAIL("sem"); }
+    int nt = 0;
+    while (nt < 8) {
+        a[nt] = (ix_thr_t){ .tbl = tbl, .sym = sym, .which = nt, .ready = &ready, .go = &go };
+        if (ray_thread_create(&th[nt], ix_thr, &a[nt]) != RAY_OK) break;
+        nt++;
     }
-    for (int i = 0; i < 8; i++) ray_sem_wait(&ready);           /* all eight parked before any starts */
-    for (int i = 0; i < 8; i++) ray_sem_signal(&go);
-    for (int i = 0; i < 8; i++) ray_thread_join(th[i]);
+    for (int i = 0; i < nt; i++) ray_sem_wait(&ready);          /* every thread parked before any starts */
+    for (int i = 0; i < nt; i++) ray_sem_signal(&go);
+    for (int i = 0; i < nt; i++) ray_thread_join(th[i]);
     ray_sem_destroy(&ready); ray_sem_destroy(&go);
+    if (nt < 8) { ray_release(tbl); ray_release(v); FAIL("thread create"); }
     ray_enc_counters_t k; ray_enc_counters_get(&k);
     TEST_ASSERT_EQ_U(k.materialized, corrupt ? 0 : 1);
     for (int i = 0; i < 8; i++) {
@@ -2241,16 +2244,29 @@ static bool ix_live_path(const char* dir, const char* col, char* out, size_t cap
     return n > 0 && (size_t)n < cap;
 }
 
-/* FILTER(t, (== k key) AND (>= v 10)) over the global table `t`, as one
- * unsplit conjunction (a graph run without the optimizer, which would split
- * it): the eq+range arm (test_store.c, lazy_eq_range).  Owned result. */
-static ray_t* ix_eqrange(const char* t, int64_t key) {
+/* FILTER(t, (== k key) AND (>= rc 10)) over the global table `t`, as one
+ * unsplit conjunction (a graph run without ray_optimize, which would split
+ * it; only the internal graph API reaches this arm): the eq+range arm
+ * (test_store.c, lazy_eq_range).  rc "v" is the arm's shape, rc "k" one it
+ * declines (the range on the equality column).  Owned result. */
+static ray_t* ix_eqrange(const char* t, int64_t key, const char* rc) {
     ray_t* tbl = ray_env_get(ray_sym_intern(t, strlen(t)));         /* borrowed */
     if (!tbl || tbl->type != RAY_TABLE) return NULL;
     ray_graph_t* g = ray_graph_new(tbl);
     ray_op_t* pred = ray_and(g, ray_eq(g, ray_scan(g, "k"), ray_const_i64(g, key)),
-                             ray_ge(g, ray_scan(g, "v"), ray_const_i64(g, 10)));
+                             ray_ge(g, ray_scan(g, rc), ray_const_i64(g, 10)));
     ray_t* r = ray_execute(g, ray_filter(g, ray_const_table(g, tbl), pred));
+    ray_graph_free(g);
+    return r;
+}
+
+/* FILTER(t, (== col key)) as a bare graph (no ray_optimize): the
+ * OP_FILTER single-compare arm itself.  Owned result. */
+static ray_t* ix_filter_eq(const char* t, const char* col, int64_t key) {
+    ray_t* tbl = ray_env_get(ray_sym_intern(t, strlen(t)));         /* borrowed */
+    if (!tbl || tbl->type != RAY_TABLE) return NULL;
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_t* r = ray_execute(g, ray_filter(g, ray_const_table(g, tbl), ray_eq(g, ray_scan(g, col), ray_const_i64(g, key))));
     ray_graph_free(g);
     return r;
 }
@@ -2265,8 +2281,18 @@ static test_result_t test_consult_routes(void) {
     if (r) ray_release(r);
     r = ixr_eval("(.db.splayed.set \"" IDX_TMP "/cr0/\" T {compress: false})"); if (r) ray_release(r);
     r = ixr_eval("(.db.splayed.set \"" IDX_TMP "/cr2/\" T {compress: true})"); if (r) ray_release(r);
-    /* the eq+range conjunction: the HASH key's index slice, the same rows */
-    {
+    /* cn: a HASH key with nulls: generation 0's EQ probe needs a null-free
+     * column (so generation 2 must not materialize for it), its `in` probe
+     * does not */
+    r = ixr_eval("(set TN (table [k v] (list (.idx.hash (as 'I64 (map (fn [j] (if (== 0 (% j 100)) 0N (% (* j 7) 10007))) (til 70000)))) "
+                 "(til 70000))))");
+    if (r) ray_release(r);
+    r = ixr_eval("(.db.splayed.set \"" IDX_TMP "/cn0/\" TN {compress: false})"); if (r) ray_release(r);
+    r = ixr_eval("(.db.splayed.set \"" IDX_TMP "/cn2/\" TN {compress: true})"); if (r) ray_release(r);
+    /* the eq+range conjunction: the HASH key's index slice, the same rows;
+     * a declined shape (the range on k itself) consults nothing and
+     * materializes nothing */
+    for (int sh = 0; sh < 2; sh++) {
         uint64_t ec[2], eh[2]; int64_t en[2];
         for (int g = 0; g < 2; g++) {
             char q[200];
@@ -2274,52 +2300,95 @@ static test_result_t test_consult_routes(void) {
             r = ixr_eval(q); if (r) ray_release(r);
             uint64_t c0 = ray_idx_consults[IDX_SITE_FILTER_EQRANGE], h0 = ray_idx_hits[IDX_SITE_FILTER_EQRANGE];
             ray_enc_counters_reset();
-            r = ix_eqrange("X", 4242);
+            r = ix_eqrange("X", 4242, sh ? "k" : "v");
             TEST_ASSERT_FMT(r && !RAY_IS_ERR(r) && r->type == RAY_TABLE, "eq+range gen %d: %s", g * 2,
                             r && RAY_IS_ERR(r) ? ray_error_msg() : "no table");
             en[g] = ray_table_nrows(r);
             ray_release(r);
             ec[g] = ray_idx_consults[IDX_SITE_FILTER_EQRANGE] - c0; eh[g] = ray_idx_hits[IDX_SITE_FILTER_EQRANGE] - h0;
-            if (g) { ray_enc_counters_t k; ray_enc_counters_get(&k); TEST_ASSERT_EQ_U(k.materialized, 2); }  /* k and v */
+            if (g) {                                                  /* k and v; nothing when declined */
+                ray_enc_counters_t k; ray_enc_counters_get(&k);
+                TEST_ASSERT_FMT(k.materialized == (sh ? 0u : 2u), "eq+range shape %d: %llu materializations", sh,
+                                (unsigned long long)k.materialized);
+            }
         }
         TEST_ASSERT_TRUE(en[0] == en[1] && en[0] >= 1);
-        TEST_ASSERT_TRUE(ec[0] == 1 && eh[0] == 1);                  /* generation 0 takes the arm */
+        TEST_ASSERT_TRUE(ec[0] == (sh ? 0u : 1u) && eh[0] == ec[0]);   /* generation 0 takes the arm, or not */
         TEST_ASSERT_TRUE(ec[1] == ec[0] && eh[1] == eh[0]);
     }
-    /* sum-of-a-projection shapes: (count (select ...)) is answered before
-     * the OP_FILTER index arm (test/rfl/store/sym_index_persist.rfl) and
-     * would consult nothing on either generation */
-    static const char* const qs[] = {
-        "(sum (at (select {from: X where: (== k 4242)}) 'v))",
-        "(sum (at (select {from: X where: (in k [1 2 3 4242])}) 'v))",
-        "(sum (at (select {from: X where: (> s 3000)}) 'v))",
-        "(sum (at (select {from: X where: (== b 50020)}) 'v))",
-        "(sum (at (select {from: X where: (== p 77)}) 'v))",
-        "(sum (at (select {from: X where: (in p [3 77])}) 'v))",
-        NULL,
+    /* the bare single compare on the nullable HASH key: generation 0's EQ
+     * probe declines a column with nulls, so generation 2 reads by range */
+    {
+        uint64_t c[2][IDX_SITE__N]; int64_t n[2];
+        for (int g = 0; g < 2; g++) {
+            char q[200];
+            snprintf(q, sizeof q, "(set X (.db.splayed.get \"" IDX_TMP "/cn%d/\"))", g * 2);
+            r = ixr_eval(q); if (r) ray_release(r);
+            uint64_t c0[IDX_SITE__N]; memcpy(c0, ray_idx_consults, sizeof c0);
+            ray_enc_counters_reset();
+            r = ix_filter_eq("X", "k", 42);
+            TEST_ASSERT_FMT(r && !RAY_IS_ERR(r) && r->type == RAY_TABLE, "bare eq gen %d: %s", g * 2,
+                            r && RAY_IS_ERR(r) ? ray_error_msg() : "no table");
+            n[g] = ray_table_nrows(r);
+            ray_release(r);
+            for (int s = 0; s < IDX_SITE__N; s++) c[g][s] = ray_idx_consults[s] - c0[s];
+            if (g) { ray_enc_counters_t k; ray_enc_counters_get(&k); TEST_ASSERT_EQ_U(k.materialized, 0); }
+        }
+        TEST_ASSERT_TRUE(n[0] == n[1] && n[0] >= 1);
+        TEST_ASSERT_TRUE(c[0][IDX_SITE_FILTER_HASH] == 0 && memcmp(c[0], c[1], sizeof c[0]) == 0);
+    }
+    /* sum-of-a-projection shapes: the select gathers v by the selection, so
+     * each also pins that v is never materialized.  `uses`: generation 0
+     * consults the column's region index (its materialization on generation
+     * 2 is that index use); every other shape takes P3's encoded route on
+     * generation 2 and materializes nothing. */
+    static const struct { const char* q; bool uses; const char* d; } qs[] = {
+        { "(sum (at (select {from: X where: (== k 4242)}) 'v))", true, NULL },
+        { "(sum (at (select {from: X where: (in k [1 2 3 4242])}) 'v))", true, NULL },
+        { "(sum (at (select {from: X where: (> s 3000)}) 'v))", true, NULL },
+        { "(sum (at (select {from: X where: (== b 50020)}) 'v))", true, NULL },     /* present: consulted, no prune */
+        { "(sum (at (select {from: X where: (== b 3)}) 'v))", true, NULL },
+        { "(sum (at (select {from: X where: (== p 77)}) 'v))", true, NULL },
+        { "(sum (at (select {from: X where: (in p [3 77])}) 'v))", true, NULL },
+        { "(sum (at (select {from: X where: (!= k 4242)}) 'v))", false, NULL },
+        { "(sum (at (select {from: X where: (> k 50000)}) 'v))", false, NULL },
+        { "(sum (at (select {from: X where: (< k 500)}) 'v))", false, NULL },
+        { "(sum (at (select {from: X where: (> k 999999)}) 'v))", false, NULL },
+        { "(sum (at (select {from: X where: (!= s 3000)}) 'v))", false, NULL },
+        { "(sum (at (select {from: X where: (in s [1 2 3000])}) 'v))", false, NULL },
+        { "(sum (at (select {from: X where: (!= b 5)}) 'v))", false, NULL },
+        { "(sum (at (select {from: X where: (> b 40000)}) 'v))", false, NULL },
+        { "(sum (at (select {from: X where: (in b [3 50020])}) 'v))", false, NULL },
+        { "(sum (at (select {from: X where: (!= p 77)}) 'v))", false, NULL },
+        { "(sum (at (select {from: X where: (> p 90)}) 'v))", false, NULL },
+        { "(sum (at (select {from: X where: (== k 42)}) 'v))", false, "cn" },
+        { "(sum (at (select {from: X where: (in k [42 43])}) 'v))", true, "cn" },
+        { NULL, false, NULL },
     };
-    for (int i = 0; qs[i]; i++) {
+    for (int i = 0; qs[i].q; i++) {
         uint64_t c[2][IDX_SITE__N], h[2][IDX_SITE__N]; int64_t n[2];
         for (int g = 0; g < 2; g++) {
             char q[200];
-            snprintf(q, sizeof q, "(set X (.db.splayed.get \"" IDX_TMP "/cr%d/\"))", g * 2);
+            snprintf(q, sizeof q, "(set X (.db.splayed.get \"" IDX_TMP "/%s%d/\"))", qs[i].d ? qs[i].d : "cr", g * 2);
             r = ixr_eval(q); if (r) ray_release(r);
             uint64_t c0[IDX_SITE__N], h0[IDX_SITE__N];
             memcpy(c0, ray_idx_consults, sizeof c0); memcpy(h0, ray_idx_hits, sizeof h0);
             ray_enc_counters_reset();
-            n[g] = ixr_i64(qs[i]);
+            n[g] = ixr_i64(qs[i].q);
             for (int s = 0; s < IDX_SITE__N; s++) { c[g][s] = ray_idx_consults[s] - c0[s]; h[g][s] = ray_idx_hits[s] - h0[s]; }
             if (g) {
                 ray_enc_counters_t k; ray_enc_counters_get(&k);
-                TEST_ASSERT_FMT(k.materialized == 1, "%s: %llu materializations", qs[i], (unsigned long long)k.materialized);
+                TEST_ASSERT_FMT(k.materialized == (qs[i].uses ? 1u : 0u), "%s: %llu materializations", qs[i].q,
+                                (unsigned long long)k.materialized);
                 TEST_ASSERT_EQ_I(ixr_i64("(if (at (.idx.info X 'v) 'materialized) 1 0)"), 0);
             }
         }
-        TEST_ASSERT_FMT(n[0] == n[1], "%s: %lld vs %lld", qs[i], (long long)n[0], (long long)n[1]);
+        TEST_ASSERT_FMT(n[0] == n[1] && n[0] != INT64_MIN, "%s: %lld vs %lld", qs[i].q, (long long)n[0], (long long)n[1]);
         uint64_t any = 0; for (int s = 0; s < IDX_SITE__N; s++) any += c[0][s];
-        TEST_ASSERT_FMT(any >= 1, "%s: generation 0 consults no index (the shape does not discriminate)", qs[i]);
+        if (qs[i].uses)
+            TEST_ASSERT_FMT(any >= 1, "%s: generation 0 consults no index (the shape does not discriminate)", qs[i].q);
         TEST_ASSERT_FMT(memcmp(c[0], c[1], sizeof c[0]) == 0 && memcmp(h[0], h[1], sizeof h[0]) == 0,
-                        "%s: index sites differ between generations", qs[i]);
+                        "%s: index sites differ between generations", qs[i].q);
     }
     PASS();
 }
@@ -2373,7 +2442,7 @@ static test_result_t test_corrupt_region_query(void) {
         }
     for (int i = 0; i < 2; i++) {                 /* the unsplit eq+range conjunction */
         ray_error_clear();
-        r = ix_eqrange("CQ", 42);
+        r = ix_eqrange("CQ", 42, "v");
         TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "eq+range run %d answered", i);
         TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
         TEST_ASSERT_TRUE(strstr(ray_error_msg(), kpath) != NULL);
@@ -2381,6 +2450,91 @@ static test_result_t test_corrupt_region_query(void) {
         ray_error_free(r);
     }
     TEST_ASSERT_EQ_I(ixr_i64("(count (select {from: CQ where: (> v 69990)}))"), 9);
+    /* a shape that uses no index answers from the encoded route: the
+     * region is never read */
+    TEST_ASSERT_EQ_I(ixr_i64("(count (select {from: CQ where: (!= k 42)}))"), 70000 - 7);
+    r = ix_eqrange("CQ", 42, "k");                  /* the declined conjunction: k 42 >= 10, seven rows */
+    TEST_ASSERT_FMT(r && !RAY_IS_ERR(r) && r->type == RAY_TABLE && ray_table_nrows(r) == 7, "declined eq+range: %s",
+                    r && RAY_IS_ERR(r) ? ray_error_msg() : "wrong rows");
+    ray_release(r);
+    PASS();
+}
+
+/* Spec "Lazy validation" for every region kind: a malformed SORT, BLOOM or
+ * PART region fails the queries that use that index with corrupt, the
+ * column's path and the validator's text; a shape that uses no index on
+ * the same column answers as generation 0. */
+static test_result_t test_corrupt_region_kinds(void) {
+    ray_t* r = ixr_eval("(set T (table [s b p v] (list (.idx.sort (as 'I32 (- (% (* (til 70000) 31) 9973) 4000))) "
+                        "(.idx.bloom (% (* (til 70000) 17) 50021)) (.attr.set 'parted (div (til 70000) 1000)) (til 70000))))");
+    if (r) ray_release(r);
+    r = ixr_eval("(.db.splayed.set \"" IDX_TMP "/ck0/\" T {compress: false})"); if (r) ray_release(r);
+    r = ixr_eval("(.db.splayed.set \"" IDX_TMP "/ck2/\" T {compress: true})"); if (r) ray_release(r);
+    static const struct { const char* col; uint8_t kind; const char* q; bool uses; } qs[] = {
+        { "s", RAY_IDX_SORT,  "(sum (at (select {from: X where: (> s 3000)}) 'v))", true },
+        { "s", RAY_IDX_SORT,  "(sum (at (select {from: X where: (!= s 3000)}) 'v))", false },
+        { "b", RAY_IDX_BLOOM, "(sum (at (select {from: X where: (== b 5)}) 'v))", true },
+        { "b", RAY_IDX_BLOOM, "(sum (at (select {from: X where: (> b 40000)}) 'v))", false },
+        { "p", RAY_IDX_PART,  "(sum (at (select {from: X where: (== p 7)}) 'v))", true },
+        { "p", RAY_IDX_PART,  "(sum (at (select {from: X where: (in p [3 7])}) 'v))", true },
+        { "p", RAY_IDX_PART,  "(sum (at (select {from: X where: (!= p 7)}) 'v))", false },
+        { NULL, 0, NULL, false },
+    };
+    static const char* const cols[] = { "s", "b", "p" };
+    char path[3][1200];
+    for (int c = 0; c < 3; c++) {
+        TEST_ASSERT_TRUE(ix_live_path(IDX_TMP "/ck2/", cols[c], path[c], sizeof path[c]));
+        size_t n; uint8_t* b = ix_slurp(path[c], &n);
+        TEST_ASSERT_TRUE(b && n >= 96);
+        ray_enc_hdr_t eh; memcpy(&eh, b + 32, 64); free(b);
+        TEST_ASSERT_EQ_I(eh.index_kind, c == 0 ? RAY_IDX_SORT : c == 1 ? RAY_IDX_BLOOM : RAY_IDX_PART);
+        uint8_t bad = 1; ix_patch(path[c], (long)eh.index_off + 3, &bad, 1);
+    }
+    for (int i = 0; qs[i].q; i++) {
+        const char* p = path[qs[i].col[0] == 's' ? 0 : qs[i].col[0] == 'b' ? 1 : 2];
+        r = ixr_eval("(set X (.db.splayed.get \"" IDX_TMP "/ck0/\"))"); if (r) ray_release(r);
+        int64_t want = ixr_i64(qs[i].q);
+        TEST_ASSERT_TRUE(want != INT64_MIN);
+        r = ixr_eval("(set X (.db.splayed.get \"" IDX_TMP "/ck2/\"))");
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r)); ray_release(r);          /* the load is fine */
+        for (int run = 0; run < 2; run++) {
+            ray_error_clear();
+            r = ray_eval_str(qs[i].q);
+            if (!qs[i].uses) {
+                TEST_ASSERT_FMT(r && !RAY_IS_ERR(r) && r->i64 == want, "%s: %s", qs[i].q,
+                                r && RAY_IS_ERR(r) ? ray_error_msg() : "wrong answer");
+                ray_release(r);
+                continue;
+            }
+            TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "%s run %d answered", qs[i].q, run);
+            TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
+            TEST_ASSERT_FMT(strstr(ray_error_msg(), p) && strstr(ray_error_msg(), "index root reserved bytes set"),
+                            "%s: %s", qs[i].q, ray_error_msg());
+            ray_error_free(r);
+        }
+    }
+    PASS();
+}
+
+/* Spec "Errors": a transient failure on the index route (the parse's oom)
+ * is the query's error, not a scan, and not cached: the next query, with
+ * the hook off, answers from the index. */
+static test_result_t test_index_route_oom(void) {
+    ray_t* r = ixr_eval("(.db.splayed.set \"" IDX_TMP "/co/\" (table [k v] (list (.idx.hash (% (* (til 70000) 7) 10007)) (til 70000))) {compress: true})");
+    if (r) ray_release(r);
+    r = ixr_eval("(set CO (.db.splayed.get \"" IDX_TMP "/co/\"))"); if (r) ray_release(r);
+    const char* q = "(count (at (select {from: CO where: (== k 42)}) 'v))";
+    ray_enccol_test_fail_index_parse(true);
+    ray_error_clear();
+    r = ray_eval_str(q);
+    ray_enccol_test_fail_index_parse(false);
+    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+    TEST_ASSERT_STR_EQ(ray_err_code(r), "oom");
+    TEST_ASSERT_TRUE(ray_error_msg() && strstr(ray_error_msg(), "index parse") != NULL);
+    ray_error_free(r);
+    uint64_t h0 = ray_idx_hits[IDX_SITE_FILTER_HASH];
+    TEST_ASSERT_EQ_I(ixr_i64(q), 7);
+    TEST_ASSERT_EQ_U(ray_idx_hits[IDX_SITE_FILTER_HASH], h0 + 1);    /* from the index */
     PASS();
 }
 
@@ -2429,5 +2583,7 @@ const test_entry_t encidx_entries[] = {
     { "idxval/consult_routes",        test_consult_routes,        ixr_setup, ixr_teardown },
     { "idxval/consult_dir_unchanged", test_consult_dir_unchanged, ixr_setup, ixr_teardown },
     { "idxval/corrupt_region_query",  test_corrupt_region_query,  ixr_setup, ixr_teardown },
+    { "idxval/corrupt_region_kinds",  test_corrupt_region_kinds,  ixr_setup, ixr_teardown },
+    { "idxval/index_route_oom",       test_index_route_oom,       ixr_setup, ixr_teardown },
     { NULL, NULL, NULL, NULL },
 };

@@ -1480,18 +1480,51 @@ static bool idx_lazy_meta_ok(const ray_col_meta_t* m) {
     return m->null_count >= 0 ? m->null_count == 0 : !(m->attrs & RAY_ATTR_HAS_NULLS);
 }
 
-/* An unpublished generation-2 column is consulted from its directory only
- * when its recorded kind has no region (none, ZONE, CHUNK_ZONE).  A
- * recorded HASH, SORT, BLOOM or PART answers as on generation 0, from the
- * index its materialization attaches (the "index an executor chose to use"
- * exception of spec "Instrumentation"). */
-static bool idx_enc_from_dir(const ray_col_meta_t* m) {
-    return m->enc && !ray_enccol_decoded_peek(m->enc) && !ray_enc_idx_kind_has_region(m->index_kind);
+/* The (kind, op, type) pairs the generation-0 single-compare block consults
+ * a persisted region index for, decided from metadata (cmp_op, key_i and
+ * is_float as idx_filter_decode reconciled them with the column):
+ *   BLOOM        EQ, integer key (the definite-absent probe, step 2);
+ *   HASH / PART  EQ, integer key, a nonzero SYM key or a column without
+ *                HAS_NULLS (ray_vec_may_have_nulls of the materialization,
+ *                whose attrs are the persisted ones; step 3);
+ *   SORT         every compare but NE (the range probe, step 4).
+ * Any other shape consults no region index on generation 0. */
+static bool idx_enc_cmp_uses_index(const ray_col_meta_t* m, uint16_t cmp_op, int64_t key_i, int is_float) {
+    switch (m->index_kind) {
+    case RAY_IDX_BLOOM: return cmp_op == OP_EQ && !is_float;
+    case RAY_IDX_HASH:
+    case RAY_IDX_PART:
+        if (cmp_op != OP_EQ || is_float) return false;
+        if (m->type == RAY_SYM) return key_i != 0;
+        return m->type != RAY_STR && !(m->attrs & RAY_ATTR_HAS_NULLS);
+    case RAY_IDX_SORT:  return cmp_op != OP_NE;
+    default:            return false;
+    }
 }
 
-/* Materialize a region-kind generation-2 column for its index: NULL when
- * the column is plain, published, or materialized now; an owned error
- * otherwise (spec "Accessors": an error never reads as "no index"). */
+/* The generation-0 `in` block's region-index pairs: HASH or PART over a
+ * non-float column (the IN probe, step 5). */
+static bool idx_enc_in_uses_index(const ray_col_meta_t* m) {
+    return (m->index_kind == RAY_IDX_HASH || m->index_kind == RAY_IDX_PART) &&
+           m->type != RAY_F32 && m->type != RAY_F64;
+}
+
+/* An unpublished generation-2 column is consulted from its directory (P3's
+ * encoded route) unless the shape uses its recorded region index (`uses`,
+ * from idx_enc_cmp_uses_index / idx_enc_in_uses_index): then a recorded
+ * HASH, SORT, BLOOM or PART answers as on generation 0, from the index its
+ * materialization attaches (the "index an executor chose to use" exception
+ * of spec "Instrumentation").  Every other shape materializes nothing, and
+ * a malformed region fails only an index-using query. */
+static bool idx_enc_from_dir(const ray_col_meta_t* m, bool uses) {
+    return m->enc && !ray_enccol_decoded_peek(m->enc) &&
+           !(uses && ray_enc_idx_kind_has_region(m->index_kind));
+}
+
+/* Materialize a region-kind generation-2 column for its index (called only
+ * for a shape that uses it): NULL when the column is plain, published, or
+ * materialized now; an owned error otherwise (spec "Accessors": an error
+ * never reads as "no index"). */
 static ray_t* idx_enc_index_ready(ray_graph_t* g, const ray_col_meta_t* m, int64_t sym) {
     if (!m->enc || !ray_enc_idx_kind_has_region(m->index_kind) || ray_enccol_decoded_peek(m->enc)) return NULL;
     ray_t* c = ray_table_col(g->table, sym);
@@ -3395,7 +3428,8 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 bool enc_done = false;
                 bool fm_ok = idx_filter_decode(g, op_child(g, op, 1), IDXW_INDEX, NULL, &cmp_op,
                                                &key_i, &key_f, &is_float, &fm);
-                if (fm_ok && idx_enc_from_dir(&fm)) {
+                bool fm_uses = fm_ok && fm.enc && idx_enc_cmp_uses_index(&fm, cmp_op, key_i, is_float);
+                if (fm_ok && idx_enc_from_dir(&fm, fm_uses)) {
                     enc_done = true;
                     ray_t* esel = NULL; ray_t* eerr = NULL;
                     int rc = idx_filter_enc_consult(fm.enc, &fm, cmp_op, key_i, key_f, is_float,
@@ -3403,7 +3437,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     if (rc < 0) { ray_release(input); return eerr; }
                     if (rc == 1) return input;
                     if (rc == 2) { g->selection = esel; return input; }
-                } else if (fm_ok && fm.enc) {
+                } else if (fm_uses) {
                     ray_t* merr = idx_enc_index_ready(g, &fm, idx_conj_sym(g, op_child(g, op, 1)));
                     if (merr) { ray_release(input); return merr; }
                 }
@@ -3582,9 +3616,13 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                         if (has_hash_eq && cm.enc && !ray_enccol_decoded_peek(cm.enc) &&
                             cm.index_kind != RAY_IDX_HASH)
                             eq_enc = cm.enc;
-                        /* a recorded HASH materializes for its index here,
-                         * its failure the query's; the decode loop reads it */
-                        if (has_hash_eq && cm.enc && cm.index_kind == RAY_IDX_HASH) {
+                        /* a recorded HASH materializes for its index only
+                         * when the whole shape is the one the decode below
+                         * takes (else nothing is decoded); its failure is
+                         * the query's, and the decode loop reads it */
+                        if (has_hash_eq && cm.enc && cm.index_kind == RAY_IDX_HASH &&
+                            !ray_enccol_decoded_peek(cm.enc)) {
+                            if (!idx_eqrange_meta_ok(g, conj, ncj)) { shape_ok = false; break; }
                             ray_t* merr = idx_enc_index_ready(g, &cm, idx_conj_sym(g, conj[ci]));
                             if (merr) { ray_release(input); return merr; }
                         }
@@ -3727,14 +3765,15 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     ray_col_meta_t im;
                     bool in_enc_done = false;
                     bool im_ok = idx_filter_in_decode(g, op_child(g, op, 1), IDXW_INDEX, NULL, &in_set_lit, &im);
-                    if (im_ok && idx_enc_from_dir(&im)) {
+                    bool im_uses = im_ok && im.enc && idx_enc_in_uses_index(&im);
+                    if (im_ok && idx_enc_from_dir(&im, im_uses)) {
                         in_enc_done = true;
                         ray_t* isel = NULL; ray_t* ierr = NULL;
                         int rc = idx_filter_enc_in_consult(im.enc, &im, in_set_lit,
                                                            ray_table_nrows(input), &isel, &ierr);
                         if (rc < 0) { ray_release(input); return ierr; }
                         if (rc == 2) { g->selection = isel; return input; }
-                    } else if (im_ok && im.enc) {
+                    } else if (im_uses) {
                         ray_t* merr = idx_enc_index_ready(g, &im, idx_conj_sym(g, op_child(g, op, 1)));
                         if (merr) { ray_release(input); return merr; }
                     }
