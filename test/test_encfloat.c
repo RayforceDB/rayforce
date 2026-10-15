@@ -59,12 +59,12 @@ static const ray_enc_kind_t K32F = { 32, false, true };
 
 /* Dictionary order: numeric, -0.0 before +0.0, F32 widened. */
 static test_result_t test_float_order(void) {
-    TEST_ASSERT_TRUE(ray_enc_lt(db(-1.0), db(-0.0), K64F));
-    TEST_ASSERT_TRUE(ray_enc_lt(db(-0.0), db(0.0), K64F));
-    TEST_ASSERT_FALSE(ray_enc_lt(db(0.0), db(-0.0), K64F));
+    TEST_ASSERT_TRUE(ray_enc_lt(db(-1.0), NEG0_64, K64F));
+    TEST_ASSERT_TRUE(ray_enc_lt(NEG0_64, db(0.0), K64F));
+    TEST_ASSERT_FALSE(ray_enc_lt(db(0.0), NEG0_64, K64F));
     TEST_ASSERT_FALSE(ray_enc_lt(db(0.0), db(0.0), K64F));
     TEST_ASSERT_TRUE(ray_enc_lt(db(0.0), db(1e-300), K64F));
-    TEST_ASSERT_TRUE(ray_enc_lt(fb(-0.0f), fb(0.0f), K32F));
+    TEST_ASSERT_TRUE(ray_enc_lt(NEG0_32, fb(0.0f), K32F));
     TEST_ASSERT_TRUE(ray_enc_lt(fb(-2.5f), fb(1.0f), K32F));
     ray_enc_kind_t k;
     TEST_ASSERT_TRUE(ray_enc_value_kind(RAY_F64, 0, &k));
@@ -77,13 +77,13 @@ static test_result_t test_float_order(void) {
 
 /* Training keeps both zeros as distinct entries, -0.0 first. */
 static test_result_t test_float_train_dict(void) {
-    uint64_t v[7] = { db(2.25), db(0.0), db(-3.5), db(-0.0), db(0.0), db(2.25), db(-0.0) };
+    uint64_t v[7] = { db(2.25), db(0.0), db(-3.5), NEG0_64, db(0.0), db(2.25), NEG0_64 };
     uint64_t* d = NULL; uint32_t dn;
     int rc = ray_enc_train_dict(v, 7, K64F, &d, &dn);
     if (rc == 1) fl_dict = d;                                   /* freed in teardown */
     TEST_ASSERT_EQ_I(rc, 1);
     TEST_ASSERT_EQ_I(dn, 4);
-    TEST_ASSERT_EQ_U(d[0], db(-3.5)); TEST_ASSERT_EQ_U(d[1], db(-0.0));
+    TEST_ASSERT_EQ_U(d[0], db(-3.5)); TEST_ASSERT_EQ_U(d[1], NEG0_64);
     TEST_ASSERT_EQ_U(d[2], db(0.0));  TEST_ASSERT_EQ_U(d[3], db(2.25));
     PASS();
 }
@@ -121,7 +121,7 @@ static test_result_t test_float_bodies(void) {
     bp->p[8] = RAY_ENC_FOR_BP;
     TEST_ASSERT_EQ_I(ray_enc_read(bp->p, bp->len, RAY_ENC_RLE, 0, RAY_ENC_VEC, K64F, RAY_ENC_SLOT_TOP, 0, NULL, out), -1);
     bp->len = 0;
-    uint64_t dv[4] = { db(-3.5), db(-0.0), db(0.0), db(2.25) };
+    uint64_t dv[4] = { db(-3.5), NEG0_64, db(0.0), db(2.25) };
     ray_enc_dict_t dict = { dv, 4 };
     for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = dv[(i * 7) % 4];
     TEST_ASSERT_TRUE(ray_enc_body_size(RAY_ENC_DICT, v, RAY_ENC_VEC, K64F, &dict) > 0);
@@ -136,11 +136,12 @@ static test_result_t test_float_bodies(void) {
     PASS();
 }
 
-/* The new slots: ALP ints (U64) admit DELTA_BP and RLE, ALP_RD left (U8)
- * admits RLE and FOR_BP and not DELTA_BP, and the reader enforces it. */
+/* The new slots: ALP ints (I64, spec erratum E-P5-1) admit DELTA_BP, RLE
+ * and a signed FOR_BP, ALP_RD left (U8) admits RLE and FOR_BP and not
+ * DELTA_BP, and the reader enforces it. */
 static test_result_t test_new_slots(void) {
     uint64_t v[RAY_ENC_VEC];
-    ray_enc_kind_t k64 = { 64, false, false }, k8 = { 8, false, false };
+    ray_enc_kind_t k64 = { 64, true, false }, k8 = { 8, false, false };
     for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = 1000000 + 10 * (uint64_t)i;    /* lane-linear: DELTA_BP w=0 */
     ray_enc_choice_t c = ray_enc_choose(v, RAY_ENC_VEC, k64, RAY_ENC_SLOT_ALP_INTS, 1, NULL);
     TEST_ASSERT_EQ_I(c.enc, RAY_ENC_DELTA_BP);
@@ -151,6 +152,11 @@ static test_result_t test_new_slots(void) {
     for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = 0x0123456789abull * (uint64_t)((i / 256) * 3 + 1);
     c = ray_enc_choose(v, RAY_ENC_VEC, k64, RAY_ENC_SLOT_ALP_INTS, 1, NULL);
     TEST_ASSERT_EQ_I(c.enc, RAY_ENC_RLE);
+    /* mixed-sign integers in -1000..1000: FOR_BP in signed order, width 11 */
+    for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = (uint64_t)(int64_t)((i * 7919) % 2001 - 1000);
+    c = ray_enc_choose(v, RAY_ENC_VEC, k64, RAY_ENC_SLOT_ALP_INTS, 1, NULL);
+    TEST_ASSERT_EQ_I(c.enc, RAY_ENC_FOR_BP);
+    TEST_ASSERT_EQ_I(c.width, 11);
     /* 3-bit values: FOR_BP w=3 in the left slot (DELTA_BP is illegal there,
      * and at T = 8 its 128 eight-byte starts exceed RAW anyway) */
     for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = (uint64_t)(i & 7);
@@ -198,7 +204,7 @@ static int alp_roundtrip(const uint64_t* v, int n, int T, const ray_enc_alp_cand
     return 0;
 }
 
-/* Two-decimal prices: ALP with e = 2 wins by far over RAW. */
+/* Two-decimal prices: ALP with e - f = 2 wins by far over RAW. */
 static test_result_t test_alp_decimals(void) {
     uint64_t v[RAY_ENC_VEC];
     for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = db((double)((i * 7919) % 100000) / 100.0);
@@ -208,12 +214,19 @@ static test_result_t test_alp_decimals(void) {
     int64_t sz;
     TEST_ASSERT_EQ_I(alp_roundtrip(v, RAY_ENC_VEC, 64, &c, &sz), 0);
     TEST_ASSERT_TRUE(sz * 8 <= 8192 * 7);
+    /* the pick is pinned: (2, 0) loses to rounding (n * 0.01 is not n / 100),
+     * (14, 12) is the smallest pair exact on every sample */
+    TEST_ASSERT_EQ_I(c.n, 1);
+    TEST_ASSERT_TRUE(c.c[0].e == 14 && c.c[0].f == 12);
     /* F32 tenths */
     for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = fb((float)((i * 31) % 5000) / 10.0f);
     ray_enc_alp_train(v, RAY_ENC_VEC, 32, &c);
     TEST_ASSERT_TRUE(c.n >= 1);
     TEST_ASSERT_EQ_I(alp_roundtrip(v, RAY_ENC_VEC, 32, &c, &sz), 0);
     TEST_ASSERT_TRUE(sz * 8 <= 4096 * 7);
+    /* pinned: (2, 1) is exact on the 32 samples and ties keep the smaller pair */
+    TEST_ASSERT_EQ_I(c.n, 1);
+    TEST_ASSERT_TRUE(c.c[0].e == 2 && c.c[0].f == 1);
     /* training is deterministic */
     ray_enc_alp_cands_t c2;
     ray_enc_alp_train(v, RAY_ENC_VEC, 32, &c2);
@@ -221,20 +234,49 @@ static test_result_t test_alp_decimals(void) {
     PASS();
 }
 
-/* Review focus 3: edges are exact or exceptions, never wrong values. */
-static test_result_t test_alp_edges(void) {
-    static const double edge[] = { -0.0, 0.0, 1e300, -1e300, 1e-300, 4.9e-324, INFINITY, -INFINITY,
-                                   9.0e18, -9.0e18, 8.999999999999999e17, 0.1, 1.0 / 3.0, -2.5, 123456789.123 };
+/* Mixed-sign two-decimal values in [-10, 10]: the signed ints child packs
+ * them at their real width (spec erratum E-P5-1), far below RAW. */
+static test_result_t test_alp_signed(void) {
     uint64_t v[RAY_ENC_VEC];
-    for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = db(edge[i % (int)(sizeof edge / sizeof edge[0])]);
+    for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = db((double)((i * 7919) % 2001 - 1000) / 100.0);
+    ray_enc_alp_cands_t c;
+    ray_enc_alp_train(v, RAY_ENC_VEC, 64, &c);
+    TEST_ASSERT_TRUE(c.n >= 1);
+    int64_t sz;
+    TEST_ASSERT_EQ_I(alp_roundtrip(v, RAY_ENC_VEC, 64, &c, &sz), 0);
+    TEST_ASSERT_TRUE(sz * 8 <= 8192 * 4);
+    /* F32 the same */
+    for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = fb((float)((i * 7919) % 2001 - 1000) / 100.0f);
+    ray_enc_alp_train(v, RAY_ENC_VEC, 32, &c);
+    TEST_ASSERT_TRUE(c.n >= 1);
+    TEST_ASSERT_EQ_I(alp_roundtrip(v, RAY_ENC_VEC, 32, &c, &sz), 0);
+    TEST_ASSERT_TRUE(sz * 8 <= 4096 * 4);
+    PASS();
+}
+
+/* Review focus 3: edges are exact or exceptions, never wrong values.
+ * -0.0 and NaNs are bit patterns (D10). */
+static test_result_t test_alp_edges(void) {
+    static const double edge[] = { 0.0, 1e300, -1e300, 1e-300, 4.9e-324, INFINITY, -INFINITY,
+                                   9.0e18, -9.0e18, 8.999999999999999e17, 0.1, 1.0 / 3.0, -2.5, 123456789.123 };
+    static const uint64_t ebits[] = { NEG0_64, 0x7ff8000000000000ull /* canonical NaN */,
+                                      0x7ff8000000000123ull /* payload */, 0xfff8000000000000ull /* negative */,
+                                      0x7ff0000000000001ull /* signalling */, 0xfff00000deadbeefull };
+    enum { NE = sizeof edge / sizeof edge[0], NB = sizeof ebits / sizeof ebits[0] };
+    uint64_t v[RAY_ENC_VEC];
+    for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = i % (NE + NB) < NE ? db(edge[i % (NE + NB)]) : ebits[i % (NE + NB) - NE];
     ray_enc_alp_cands_t c = { { { 2, 0 }, { 14, 0 }, { 18, 18 }, { 0, 0 }, { 3, 1 } }, 5 };
     TEST_ASSERT_EQ_I(alp_roundtrip(v, RAY_ENC_VEC, 64, &c, NULL), 0);
     for (int n = 1; n <= 1024; n = n * 3 + 1) TEST_ASSERT_EQ_I(alp_roundtrip(v, n, 64, &c, NULL), 0);
-    static const float fedge[] = { -0.0f, 16777217.0f, 3.4e38f, 1e-38f, 0.1f, -7.25f };
-    for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = fb(fedge[i % 6]);
+    static const uint64_t fedge[] = { NEG0_32, 0, 0, 0, 0, 0, 0x7fc00000u, 0x7fc00123u, 0xffc00000u, 0x7f800001u };
+    static const float fval[] = { 0.0f, 16777217.0f, 3.4e38f, 1e-38f, 0.1f, -7.25f };
+    for (int i = 0; i < RAY_ENC_VEC; i++) {
+        int k = i % 10;
+        v[i] = k >= 1 && k <= 5 ? fb(fval[k]) : fedge[k];           /* k 1..5: values, else bit patterns */
+    }
     TEST_ASSERT_EQ_I(alp_roundtrip(v, RAY_ENC_VEC, 32, &c, NULL), 0);
     /* every value an exception: still legal */
-    for (int i = 0; i < 16; i++) v[i] = db(-0.0);
+    for (int i = 0; i < 16; i++) v[i] = i & 1 ? NEG0_64 : 0x7ff8000000000123ull;
     TEST_ASSERT_EQ_I(alp_roundtrip(v, 16, 64, &c, NULL), 0);
     PASS();
 }
@@ -242,7 +284,7 @@ static test_result_t test_alp_edges(void) {
 /* Grammar rules: e <= 18, f <= e, positions ascending below n, padding. */
 static test_result_t test_alp_rejects(void) {
     uint64_t v[64];
-    for (int i = 0; i < 64; i++) v[i] = db(i % 9 == 0 ? -0.0 : (double)i * 0.25);
+    for (int i = 0; i < 64; i++) v[i] = i % 9 == 0 ? NEG0_64 : db((double)i * 0.25);
     ray_enc_buf_t* bp = &fl_buf;                                /* freed in teardown */
     TEST_ASSERT_TRUE(ray_enc_alp_write(v, 64, 64, 2, 0, bp));
     uint64_t out[RAY_ENC_VEC];
@@ -260,6 +302,50 @@ static test_result_t test_alp_rejects(void) {
                                  memcpy(m + pos_at, &c2, 2); memcpy(m + pos_at + 2, &a, 2); }
     TEST_ASSERT_EQ_I(ray_enc_alp_read(m, bp->len, 64, 64, out), -1);
     TEST_ASSERT_EQ_I(ray_enc_alp_read(bp->p, bp->len - 8, 64, 64, out), -1);      /* truncated */
+    /* the last position at n */
+    {   uint32_t ne = 8; size_t last = pos_at + 2 * (ne - 1);
+        memcpy(m, bp->p, bp->len); uint16_t q = 64; memcpy(m + last, &q, 2);
+        TEST_ASSERT_EQ_I(ray_enc_alp_read(m, bp->len, 64, 64, out), -1); }
+    /* padding: 5 exceptions leave 6 pad bytes after the positions and, at
+     * F32, 4 pad bytes after the raw elements; any non-zero pad is corrupt */
+    for (int T = 32; T <= 64; T += 32) {
+        for (int i = 0; i < 64; i++)
+            v[i] = i % 13 == 0 ? (T == 64 ? NEG0_64 : NEG0_32) : (T == 64 ? db((double)i * 0.25) : fb((float)i * 0.25f));
+        bp->len = 0;
+        TEST_ASSERT_TRUE(ray_enc_alp_write(v, 64, T, 2, 0, bp));
+        TEST_ASSERT_EQ_I(bp->p[2], 5);                                           /* n_exc */
+        TEST_ASSERT_EQ_I(ray_enc_alp_read(bp->p, bp->len, 64, T, out), (int64_t)bp->len);
+        free(fl_mem); m = fl_mem = malloc(bp->len);
+        TEST_ASSERT_NOT_NULL(m);
+        memcpy(&cb, bp->p + 12, 4);
+        pos_at = 8 + 8 + cb;
+        size_t raw_at = pos_at + 16, raw_len = 5u * (size_t)(T / 8);
+        TEST_ASSERT_EQ_I((int64_t)bp->len, (int64_t)(raw_at + ((raw_len + 7) & ~(size_t)7)));
+        memcpy(m, bp->p, bp->len); m[pos_at + 10] = 1;  TEST_ASSERT_EQ_I(ray_enc_alp_read(m, bp->len, 64, T, out), -1);
+        memcpy(m, bp->p, bp->len); m[pos_at + 15] = 0x80; TEST_ASSERT_EQ_I(ray_enc_alp_read(m, bp->len, 64, T, out), -1);
+        if (T == 32) {
+            memcpy(m, bp->p, bp->len); m[raw_at + raw_len] = 1; TEST_ASSERT_EQ_I(ray_enc_alp_read(m, bp->len, 64, T, out), -1);
+            memcpy(m, bp->p, bp->len); m[raw_at + raw_len + 3] = 1; TEST_ASSERT_EQ_I(ray_enc_alp_read(m, bp->len, 64, T, out), -1);
+        }
+        /* a position at n, and one past it */
+        memcpy(m, bp->p, bp->len); { uint16_t q = 64; memcpy(m + pos_at + 8, &q, 2); }
+        TEST_ASSERT_EQ_I(ray_enc_alp_read(m, bp->len, 64, T, out), -1);
+        memcpy(m, bp->p, bp->len); { uint16_t q = 1000; memcpy(m + pos_at + 8, &q, 2); }
+        TEST_ASSERT_EQ_I(ray_enc_alp_read(m, bp->len, 64, T, out), -1);
+    }
+    /* argument rules: T, candidate count and pairs */
+    TEST_ASSERT_FALSE(ray_enc_alp_write(v, 64, 16, 2, 0, bp));
+    TEST_ASSERT_EQ_I(ray_enc_alp_read(bp->p, bp->len, 64, 16, out), -1);
+    int bi;
+    ray_enc_alp_cands_t bad = { { { 2, 0 } }, RAY_ENC_ALP_CANDS + 1 };
+    TEST_ASSERT_EQ_I(ray_enc_alp_size(v, 64, 64, &bad, &bi), -1);
+    bad.n = 1; bad.c[0].e = 19; bad.c[0].f = 0;
+    TEST_ASSERT_EQ_I(ray_enc_alp_size(v, 64, 64, &bad, &bi), -1);
+    bad.c[0].e = 2; bad.c[0].f = 3;
+    TEST_ASSERT_EQ_I(ray_enc_alp_size(v, 64, 64, &bad, &bi), -1);
+    bad.c[0].f = 0;
+    TEST_ASSERT_TRUE(ray_enc_alp_size(v, 64, 64, &bad, &bi) > 0);
+    TEST_ASSERT_EQ_I(ray_enc_alp_size(v, 64, 16, &bad, &bi), -1);
     PASS();
 }
 
@@ -269,6 +355,7 @@ const test_entry_t encfloat_entries[] = {
     { "encfloat/float_bodies",     test_float_bodies,     fl_setup, fl_teardown },
     { "encfloat/new_slots",        test_new_slots,        fl_setup, fl_teardown },
     { "encfloat/alp_decimals",     test_alp_decimals,     fl_setup, fl_teardown },
+    { "encfloat/alp_signed",       test_alp_signed,       fl_setup, fl_teardown },
     { "encfloat/alp_edges",        test_alp_edges,        fl_setup, fl_teardown },
     { "encfloat/alp_rejects",      test_alp_rejects,      fl_setup, fl_teardown },
     { NULL, NULL, NULL, NULL },

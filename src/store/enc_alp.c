@@ -59,7 +59,10 @@ static const float IF10F[19] = { 1e0f, 1e-1f, 1e-2f, 1e-3f, 1e-4f, 1e-5f, 1e-6f,
                                  1e-11f, 1e-12f, 1e-13f, 1e-14f, 1e-15f, 1e-16f, 1e-17f, 1e-18f };
 
 static inline int64_t p8(int64_t x) { return (x + 7) & ~(int64_t)7; }
-static const ray_enc_kind_t K_U64 = { 64, false, false };
+/* The ints child is I64 (spec erratum E-P5-1): FOR_BP takes its base and
+ * range in signed order, so mixed-sign decimals pack at their real width. */
+static const ray_enc_kind_t K_I64 = { 64, true, false };
+static inline bool alp_t_ok(int T) { return T == 32 || T == 64; }
 
 /* Decode of one integer (the spec's expression). */
 static uint64_t alp_dec1(int64_t n, int T, int e, int f) {
@@ -80,6 +83,7 @@ static bool alp_enc1(uint64_t bits, int T, int e, int f, int64_t* out) {
         float d = x * F10F[e] * IF10F[f];
         if (!(d > -9.0e18f && d < 9.0e18f)) return false;
         r = (int64_t)(d < 0 ? d - 0.5f : d + 0.5f);
+        bits = b32;                                                 /* the lane's 32 bits only */
     }
     if (alp_dec1(r, T, e, f) != bits) return false;                /* keep only bit-exact values */
     *out = r;
@@ -107,13 +111,14 @@ static void alp_plan(const uint64_t* v, int n, int T, int e, int f, alp_plan_t* 
 }
 
 static int64_t alp_plan_size(const alp_plan_t* p, int n, int T) {
-    ray_enc_choice_t c = ray_enc_choose(p->ints, n, K_U64, RAY_ENC_SLOT_ALP_INTS, 1, NULL);
+    ray_enc_choice_t c = ray_enc_choose(p->ints, n, K_I64, RAY_ENC_SLOT_ALP_INTS, 1, NULL);
     return 8 + c.bytes + p8(2LL * p->n_exc) + p8((int64_t)p->n_exc * (T / 8));
 }
 
 /* alp_plan_t is about 10 KB: heap, not stack (this runs on pool workers). */
 int64_t ray_enc_alp_size(const uint64_t* v, int n, int T, const ray_enc_alp_cands_t* c, int* best) {
-    if (!c || c->n <= 0 || n <= 0 || n > RAY_ENC_VEC) return -1;
+    if (!c || c->n <= 0 || c->n > RAY_ENC_ALP_CANDS || n <= 0 || n > RAY_ENC_VEC || !alp_t_ok(T)) return -1;
+    for (int i = 0; i < c->n; i++) if (c->c[i].e > 18 || c->c[i].f > c->c[i].e) return -1;
     alp_plan_t* p = ray_alloc_raw(sizeof *p);
     if (!p) return -1;
     int64_t bs = -1;
@@ -127,7 +132,7 @@ int64_t ray_enc_alp_size(const uint64_t* v, int n, int T, const ray_enc_alp_cand
 }
 
 bool ray_enc_alp_write(const uint64_t* v, int n, int T, uint8_t e, uint8_t f, ray_enc_buf_t* out) {
-    if (n <= 0 || n > RAY_ENC_VEC || e > 18 || f > e) return false;
+    if (n <= 0 || n > RAY_ENC_VEC || !alp_t_ok(T) || e > 18 || f > e) return false;
     alp_plan_t* p = ray_alloc_raw(sizeof *p);
     if (!p) { out->oom = true; return false; }
     alp_plan(v, n, T, e, f, p);
@@ -137,7 +142,7 @@ bool ray_enc_alp_write(const uint64_t* v, int n, int T, uint8_t e, uint8_t f, ra
     memcpy(h + 2, &ne, 2);
     ray_enc_choice_t c;
     bool ok = ray_enc_buf_put(out, h, 8) &&
-              ray_enc_write(p->ints, n, K_U64, RAY_ENC_SLOT_ALP_INTS, 1, NULL, out, &c) &&
+              ray_enc_write(p->ints, n, K_I64, RAY_ENC_SLOT_ALP_INTS, 1, NULL, out, &c) &&
               ray_enc_buf_put(out, p->pos, 2u * ne) && ray_enc_buf_pad8(out);
     for (int k = 0; ok && k < ne; k++) ok = ray_enc_buf_put(out, &v[p->pos[k]], (size_t)T / 8);
     ok = ok && ray_enc_buf_pad8(out);
@@ -149,13 +154,12 @@ bool ray_enc_alp_write(const uint64_t* v, int n, int T, uint8_t e, uint8_t f, ra
 static bool zero_bytes(const uint8_t* p, size_t n) { for (size_t i = 0; i < n; i++) if (p[i]) return false; return true; }
 
 int64_t ray_enc_alp_read(const uint8_t* p, size_t avail, int n, int T, uint64_t* out) {
-    if (n <= 0 || n > RAY_ENC_VEC || avail < 8) return -1;
+    if (n <= 0 || n > RAY_ENC_VEC || !alp_t_ok(T) || avail < 8) return -1;
     uint8_t e = p[0], f = p[1];
     uint16_t ne; memcpy(&ne, p + 2, 2);
     uint32_t rsv; memcpy(&rsv, p + 4, 4);
     if (e > 18 || f > e || ne > n || rsv) return -1;
-    uint64_t ints[RAY_ENC_VEC];
-    int64_t a = ray_enc_read(p + 8, avail - 8, 0, 0, n, K_U64, RAY_ENC_SLOT_ALP_INTS, 1, NULL, ints);
+    int64_t a = ray_enc_read(p + 8, avail - 8, 0, 0, n, K_I64, RAY_ENC_SLOT_ALP_INTS, 1, NULL, out);   /* ints, decoded in place below */
     if (a < 0) return -1;
     size_t at = 8 + (size_t)a, esz = (size_t)T / 8;
     size_t pb = (size_t)p8(2LL * ne), rb = (size_t)p8((int64_t)ne * (int64_t)esz);
@@ -164,7 +168,7 @@ int64_t ray_enc_alp_read(const uint8_t* p, size_t avail, int n, int T, uint64_t*
     if (!zero_bytes(pos + 2u * ne, pb - 2u * ne)) return -1;
     const uint8_t* raw = pos + pb;
     if (!zero_bytes(raw + (size_t)ne * esz, rb - (size_t)ne * esz)) return -1;
-    for (int i = 0; i < n; i++) out[i] = alp_dec1((int64_t)ints[i], T, e, f);
+    for (int i = 0; i < n; i++) out[i] = alp_dec1((int64_t)out[i], T, e, f);
     int prev = -1;
     for (int k = 0; k < ne; k++) {
         uint16_t q; memcpy(&q, pos + 2 * k, 2);

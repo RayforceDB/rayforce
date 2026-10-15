@@ -117,7 +117,7 @@ typedef enum {
     RAY_ENC_SLOT_RLE_VALUES,   /* kind: element type at depth 1, else the enclosing slot's kind */
     RAY_ENC_SLOT_RLE_ENDS,     /* kind U16 */
     RAY_ENC_SLOT_CODES,        /* kind U32 (DICT / STR_DICT codes) */
-    RAY_ENC_SLOT_ALP_INTS,     /* kind U64 */
+    RAY_ENC_SLOT_ALP_INTS,     /* kind I64 (spec erratum E-P5-1: the slot table says U64) */
     RAY_ENC_SLOT_ALP_RD_LEFT   /* kind U8 */
 } ray_enc_slot_t;
 

@@ -96,7 +96,7 @@ int ray_enc_delta_width(const uint64_t* v, int n, ray_enc_kind_t k, uint64_t* db
 /* ---- slots ---- */
 static const ray_enc_kind_t K_U16 = { 16, false, false };
 static const ray_enc_kind_t K_U32 = { 32, false, false };
-static const ray_enc_kind_t K_U64 = { 64, false, false };
+static const ray_enc_kind_t K_I64 = { 64, true,  false };
 static const ray_enc_kind_t K_U8  = { 8,  false, false };
 
 /* Kind of a child slot's values given the parent's kind. */
@@ -104,7 +104,7 @@ static ray_enc_kind_t slot_child_kind(ray_enc_slot_t child, ray_enc_kind_t paren
     switch (child) {
     case RAY_ENC_SLOT_RLE_ENDS: return K_U16;
     case RAY_ENC_SLOT_CODES:    return K_U32;
-    case RAY_ENC_SLOT_ALP_INTS: return K_U64;
+    case RAY_ENC_SLOT_ALP_INTS: return K_I64;      /* signed: spec erratum E-P5-1 */
     case RAY_ENC_SLOT_ALP_RD_LEFT: return K_U8;
     default:                    return parent;   /* RLE values: enclosing kind */
     }
