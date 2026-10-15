@@ -46,7 +46,8 @@
  * rule that stops firing, or a different rule firing in its place, fails
  * the test.  Organized by the spec's "Validation" list: headers, directory,
  * side data, descriptors, payloads, codec grammar, lazy validation, fuzz.
- * Index region parsing is Task P4 and is not covered here. */
+ * Index region parsing has its own suite (idxval/); the fuzz below also
+ * flips an indexed column's region. */
 
 /* structural flips (headers, directory, descriptors) must be rejected at least this often; measured 94.8% */
 #define STRUCT_MIN_PCT 90
@@ -1448,6 +1449,17 @@ static bool fuzz_one(const char* p, const char** bad) {
             ray_error_free(m); rejected = true;
         } else if (!m) *bad = "materialize returned NULL";
         else if (m->type != want_type || m->len != want_len) *bad = "materialized vector disagrees with the header";
+        else if (ray_index_kind(m) == RAY_IDX_HASH) {
+            /* an accepted region may answer wrongly, never unsafely: every
+             * probed row is in bounds and the row list ascends */
+            for (int64_t key = 0; key < 8 && !*bad; key++) {
+                const int64_t* rows = NULL; int64_t n = 0;
+                if (ray_index_hash_group(m, key, &rows, &n) != 1) continue;
+                for (int64_t i = 0; i < n && !*bad; i++)
+                    if (rows[i] < 0 || rows[i] >= m->len || (i && rows[i] <= rows[i - 1]))
+                        *bad = "hash probe: row out of bounds or out of order";
+            }
+        }
         ray_release(c);
     } else if (c) {
         if (!ec_allowed_code(ray_err_code(c))) *bad = "load: error code outside {corrupt, nyi, version}";
@@ -1490,7 +1502,7 @@ static test_result_t test_fuzz_flips(void) {
     const char* p = ray_test_tmp(EC_TMP "/fz");
     g_fz = 0xC0FFEE;
     int rej_all_total = 0, structural_total = 0, structural_rej = 0;
-    for (int base = 0; base < 5; base++) {
+    for (int base = 0; base < 6; base++) {
         ray_t* v;
         if (base == 0) v = bool_runs();
         else if (base == 1) { v = ray_vec_new(RAY_I32, 70000); v->len = 70000;
@@ -1498,10 +1510,29 @@ static test_result_t test_fuzz_flips(void) {
         else if (base == 2) v = f64_two_odd();
         else if (base == 3) { v = ray_vec_new(RAY_STR, 50);
             for (int i = 0; i < 50; i++) v = ray_str_vec_append(v, i % 3 ? "a long pooled string value" : "s", i % 3 ? 26 : 1); }
-        else v = i64_dict();
+        else if (base == 4) v = i64_dict();
+        else {   /* an indexed column: flips land in its index region too */
+            v = ray_vec_new(RAY_I64, 70000); v->len = 70000;
+            for (int i = 0; i < 70000; i++) ((int64_t*)ray_data(v))[i] = (i * 13) % 300;
+            ray_t* r = ray_index_attach_hash(&v);
+            TEST_ASSERT_FMT(r && !RAY_IS_ERR(r), "attach hash failed");
+            v = r;
+        }
         SAVE(v, p);
         uint8_t* orig = malloc(g_len); TEST_ASSERT_TRUE(orig != NULL); memcpy(orig, g_img, g_len);
         size_t first_payload = (size_t)rd64(DIR(0)) + 3072;
+        size_t index_off = (size_t)rd64(EH + 32);
+        if (base == 5) {
+            TEST_ASSERT_FMT(g_img[EH + 6] == RAY_IDX_HASH && index_off > first_payload && index_off < g_len,
+                            "indexed column: kind %d, region at %zu of %zu", g_img[EH + 6], index_off, g_len);
+            ray_t* c = ray_col_mmap(p);                       /* the unmutated file attaches its HASH */
+            TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+            ray_t* m = ray_enccol_materialize(c);
+            bool hashed = m && !RAY_IS_ERR(m) && ray_index_kind(m) == RAY_IDX_HASH;
+            if (m && RAY_IS_ERR(m)) ray_error_free(m);
+            ray_release(c);
+            TEST_ASSERT_TRUE(hashed);
+        }
         int rejected = 0;
         for (int it = 0; it < 300; it++) {
             memcpy(g_img, orig, g_len);
@@ -1526,6 +1557,22 @@ static test_result_t test_fuzz_flips(void) {
             if (!img_store(p, g_len)) bad = "could not write the mutated image";
             else { structural_total++; if (fuzz_one(p, &bad)) structural_rej++; }
             if (bad) { free(orig); TEST_ASSERT_FMT(0, "base %d structural iter %d: %s", base, it, bad); }
+        }
+        if (base == 5) {   /* index region only: one to three flips in [index_off, end) */
+            int region_rej = 0;
+            for (int it = 0; it < 300; it++) {
+                memcpy(g_img, orig, g_len);
+                int flips = 1 + (int)(fz() % 3);
+                for (int k = 0; k < flips; k++) {
+                    size_t pos = index_off + (size_t)(fz() % (g_len - index_off)); uint8_t bit = (uint8_t)(1u << (fz() % 8));
+                    g_img[pos] ^= bit;
+                }
+                const char* bad = NULL;
+                if (!img_store(p, g_len)) bad = "could not write the mutated image";
+                else if (fuzz_one(p, &bad)) region_rej++;
+                if (bad) { free(orig); TEST_ASSERT_FMT(0, "region iter %d: %s", it, bad); }
+            }
+            TEST_ASSERT_FMT(region_rej > 0, "index region: %d of 300 mutated images rejected", region_rej);
         }
         free(orig);
     }
