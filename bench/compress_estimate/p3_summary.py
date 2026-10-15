@@ -2,7 +2,8 @@
 """P3 gate (plan: compressed-columns P3, Task 14) from the P2 driver's TSV.
 1. P2's summary, unchanged; its strict line must pass (no P3 exemption).
 2. Materialization per query against the P3 expectations (arms A and B).
-3. Peak RSS, generation 2 against generation 0 (open decision D3's bound).
+3. Peak RSS, generation 2 against generation 0 (open decision D3's bound),
+   judged without an arm's D2 index queries (ruling 10-1), all 43 beside it.
 4. The P2 carries, each with its P2 re-run ratio and today's.
 Every number comes from the file; nothing is typed."""
 import re, subprocess, sys, statistics
@@ -13,11 +14,12 @@ p2 = subprocess.run([sys.executable, f"{here}/p2_summary.py", tsv], capture_outp
 print(p2, end="")
 strict = re.search(r"^P2 GATE \(strict\): (PASS|FAIL)$", p2, re.M)
 
-mat, mem, runs = {}, {}, defaultdict(list)
+mat, mem, memx, runs = {}, {}, {}, defaultdict(list)
 for line in open(tsv):
     f = line.rstrip("\n").split("\t")
     if f[0] == "mat": mat[(f[1], f[2])] = f[3].strip()
     elif f[0] == "mem": mem[(f[1], f[2])] = int(f[3])
+    elif f[0] == "memx": memx[(f[1], f[2])] = (int(f[3]), frozenset(f[4].split(",")))
     elif f[0] == "m" and len(f) == 11:
         try: runs[(f[1], f[2], f[3])].append([float(x) for x in f[5:11]])
         except ValueError: pass
@@ -48,6 +50,12 @@ ALLOW_ARM = {
     ("A", "q23"): {"SearchPhrase"},   # the key of a count-distinct group (holistic), q10's RegionID class
     ("B", "q6"):  {"SearchPhrase"},   # count distinct (holistic); parted `at` reads the column eagerly (follow-up)
 }
+# D2: an indexed gen-2 column materializes on first index use (ruling 10-1).
+D2 = {
+    ("A", "q41"): {"RefererHash"},
+    ("A", "q42"): {"URLHash"},
+}
+ALLOW_ARM.update(D2)
 def cols(m):
     if m.startswith("<"): return {"*many*"}
     return set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", m))
@@ -62,11 +70,26 @@ for arm in ("A", "B"):
 print("p3_unexpected_materializations " + (" ".join(bad) if bad else "none"))
 
 RSS_BOUND = 1.10   # open decision D3 (recommended); the P2 re-run had splayed x1.58
+# The gate takes an arm's run without its D2 queries (ruling 10-1: their
+# materialization is D2's stated cost); the 43-query figure is printed beside
+# it.  An arm with D2 entries needs the driver's memx rows over exactly them.
 rss = {}
 for arm, (a, b) in (("A", ("g0", "g2")), ("B", ("p0", "p2"))):
     if (arm, a) in mem and (arm, b) in mem:
-        rss[arm] = mem[(arm, b)] / mem[(arm, a)]
-        print(f"rss {arm}: {mem[(arm, a)]} -> {mem[(arm, b)]} kB (x{rss[arm]:.3f}, bound {RSS_BOUND})")
+        r43 = mem[(arm, b)] / mem[(arm, a)]
+        print(f"rss {arm}: {mem[(arm, a)]} -> {mem[(arm, b)]} kB (x{r43:.3f} over all 43, bound {RSS_BOUND})")
+        skip = frozenset(q for (ar, q) in D2 if ar == arm)
+        if not skip:
+            rss[arm] = r43
+            continue
+        xa, xb = memx.get((arm, a)), memx.get((arm, b))
+        if not xa or not xb or xa[1] != skip or xb[1] != skip:
+            print(f"rss {arm} without D2 {','.join(sorted(skip))}: no memx rows over exactly them")
+            rss[arm] = float("inf")
+            continue
+        rss[arm] = xb[0] / xa[0]
+        print(f"rss {arm} without D2 {','.join(sorted(skip))}: {xa[0]} -> {xb[0]} kB "
+              f"(x{rss[arm]:.3f}, bound {RSS_BOUND}, gated)")
 
 def ratio(arm, q, metric):
     va, vb = {"A": ("g0", "g2"), "B": ("p0", "p2")}[arm]

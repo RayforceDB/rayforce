@@ -122,14 +122,24 @@ enc() {         # arm kind dir: every column's encoding mix (records which keys 
   rm -f "$s"
 }
 
-mem() {         # arm kind dirA labA dirB labB: peak RSS of one process running all 43 queries
-  local arm=$1 v d lab s
+mem() {         # arm kind dirA labA dirB labB [skip]: peak RSS of one process running all 43 queries;
+                # with skip (query numbers), also of one running all but those (row memx)
+  local arm=$1 v d lab s q
   for v in a b; do
     if [ "$v" = a ]; then d=$3; lab=$4; else d=$5; lab=$6; fi
     s=$(mktemp -p "$W/g")
     { loadline "$2" "$d"; for q in $(seq 1 $NQ); do printf '(do %s null)\n' "$(cat "$QD/$q.rfl")"; done; } > "$s"
     /usr/bin/time -f "%M" -o "$W/g/mem" "$P2" "$s" >/dev/null 2>&1 || true; rm -f "$s"
     printf 'mem\t%s\t%s\t%s\n' "$arm" "$lab" "$(cat "$W/g/mem")" >> "$OUT"
+    [ -n "${7:-}" ] || continue
+    s=$(mktemp -p "$W/g")
+    { loadline "$2" "$d"
+      for q in $(seq 1 $NQ); do
+        case " $7 " in *" $q "*) continue ;; esac
+        printf '(do %s null)\n' "$(cat "$QD/$q.rfl")"
+      done; } > "$s"
+    /usr/bin/time -f "%M" -o "$W/g/mem" "$P2" "$s" >/dev/null 2>&1 || true; rm -f "$s"
+    printf 'memx\t%s\t%s\t%s\t%s\n' "$arm" "$lab" "$(cat "$W/g/mem")" "$(printf 'q%s,' $7 | sed 's/,$//')" >> "$OUT"
   done
 }
 
@@ -182,7 +192,7 @@ stage_splayed() {
   mat A splayed "$W/g2"
   measure A splayed "$W/g0" "$P2" g0 "$W/g2" "$P2" g2
   cold A splayed "$W/g0" g0 "$W/g2" g2
-  mem A splayed "$W/g0" g0 "$W/g2" g2
+  mem A splayed "$W/g0" g0 "$W/g2" g2 "41 42"   # memx: without p3_summary's D2 entries (index queries)
   ident A splayed "$W/g0" "$P2" "$W/g2" "$P2"
   measure C0 splayed "$W/g0" "$BB" base "$W/g0" "$P2" p2
   ident C0 splayed "$W/g0" "$BB" "$W/g0" "$P2"
