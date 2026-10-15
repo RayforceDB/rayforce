@@ -68,16 +68,20 @@ evict() {       # dir: per-file page-cache eviction
   sync
   find "$1" -type f -exec dd if={} iflag=nocache count=0 status=none \;
 }
-answer() {      # dir q file: the full result of query q written to file
+answer() {      # dir q file: the full result of query q written to file; a result that is
+                # not a table (an error: every query here is a select) leaves file.err
   local s c; s=$(mktemp -p "$W/g"); c=$(mktemp -p "$W/g" --suffix=.csv); rm -f "$c"
   { loadline "$1"; printf '(set r %s)\n' "$(cat "$QD/$2.rfl")"
     printf '(if (== (type r) (quote TABLE)) (.csv.write r "%s") (println r))\n' "$c"; } > "$s"
   "$BIN" "$s" > "$3.stdout" 2>&1 || true; rm -f "$s"
-  if [ -f "$c" ]; then mv "$c" "$3"; else cp "$3.stdout" "$3"; fi
+  rm -f "$3.err"
+  if [ -f "$c" ]; then mv "$c" "$3"; else cp "$3.stdout" "$3"; : > "$3.err"; fi
   rm -f "$3.stdout"
 }
-h_raw()  { md5sum < "$1" | cut -c1-12; }
-h_sort() { { head -n 1 "$1"; tail -n +2 "$1" | LC_ALL=C sort; } | md5sum | cut -c1-12; }
+# An error output hashes as ERR-<file>: never equal to the other side's.
+h_raw()  { if [ -f "$1.err" ]; then echo "ERR-$(basename "$1")"; else md5sum < "$1" | cut -c1-12; fi; }
+h_sort() { if [ -f "$1.err" ]; then echo "ERR-$(basename "$1")"; return; fi
+           { head -n 1 "$1"; tail -n +2 "$1" | LC_ALL=C sort; } | md5sum | cut -c1-12; }
 rows()   { echo $(( $(wc -l < "$1") - 1 )); }
 
 prep() {

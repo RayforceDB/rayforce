@@ -40,6 +40,7 @@ def answers(mode, q):
     r = ident.get((mode, q))
     if not r: return "?"
     a, b, b2, sa, sb, sb2, order = r[:7]
+    if any(h.startswith("ERR") for h in (a, b, b2)): return "ERROR"     # an error on either side
     if b != b2 or sb != sb2: return "noise"
     if a == b: return "same"
     if sa == sb: return "order" if order == "ordered" else "same(sorted)"

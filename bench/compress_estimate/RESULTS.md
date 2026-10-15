@@ -2813,7 +2813,9 @@ P3GATE p2_strict=FAIL materialization=FAIL rss=FAIL
 P3 GATE: FAIL
 ```
 
-**D7 no-regression rerun: FAIL by the letter, after Task 10b** (Rulings 10-1 to 10-5).  Materialization and RSS PASS (Ruling 10-1); first index use fixed (Ruling 10-2); splayed warm q33 1.068 stays open (Ruling 10-3, analysis below); gen-0 q25 (Ruling 10-4) and gen-0 parted (Ruling 10-5) accepted.  Answers PASS on every arm.  The rerun is in "Task 10b" below.
+**D7 no-regression rerun: FAIL by the letter, after Task 10b; every failing clause is ruled** (Rulings 10-1 to 10-7).  Materialization and RSS PASS (Ruling 10-1); first index use fixed (Ruling 10-2; q2/q3 61-63 ms accepted, Ruling 10-6); splayed warm q33 1.068 accepted (Ruling 10-7, post-spec tuning); gen-0 C0 q25 1.111, q27 1.077 and gmean 1.001 (Ruling 10-4 extended) and gen-0 parted (Ruling 10-5) accepted.  Answers PASS on every arm.  The rerun is in "Task 10b" below.
+
+**P4 gate: PASS** (Rulings 10-1 to 10-7)
 
 Failing clauses, each profiled on the release binaries (`perf record -g`;
 the top-5 tables are in the Task 10 report):
@@ -2916,7 +2918,8 @@ P3 GATE: FAIL
 ```
 
 The strict line's failing clauses, by ruling:
-- splayed warm: q33 1.068 (202.9 -> 216.6 ms) only (Ruling 10-3).  The gap is
+- splayed warm: q33 1.068 (202.9 -> 216.6 ms) only (Ruling 10-7: accepted
+  with a PR note, post-spec tuning; analysis under Ruling 10-3).  The gap is
   phase 2 of the fused encoded group (`agg_radix_group_fused_fn`, +325 M
   cycles a query, +19% on `agg_radix_group_fn`), reading each partition as
   about 300 runs of about 7 records, one per chunk; the fused phase 1 is
@@ -2926,7 +2929,11 @@ The strict line's failing clauses, by ruling:
   generation 2.  Larger runs end the fused pass for q33 (212-215 ms) but
   cost q15, q16, q17 and q36 6-16% on generation 2.  Not closed: the fix
   is phase 2's layout, more than a medium change.
-- gen-0 splayed warm: q25 1.111 (0.91 -> 1.01 ms; Ruling 10-4, accepted).
+- gen-0 splayed warm (C0), every failing clause (Ruling 10-4 extended:
+  the sub-ms class; 10b changes no gen-0 code; Task 10's C0 gmean was 0.998):
+  - q25 1.111 (0.91 -> 1.01 ms, a 0.10 ms gap over the 0.05 ms floor);
+  - q27 1.077 (0.91 -> 0.98 ms, a 0.07 ms gap);
+  - gmean (base >= 1 ms, n=34) 1.001 against the 1.00 bound.
 - gen-0 parted and ragged warm (Task 10's parted stage; Ruling 10-5,
   accepted).
 
