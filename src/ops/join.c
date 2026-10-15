@@ -2860,6 +2860,7 @@ static bool asof_hash_group_match(uint32_t n_eq,
              * with a shared bail flag. */
             int64_t verify_rows = 0;
             bool idx_ordered = asof_index_ordered_by(rt_eq[0], rt_time_sym);
+            if (idx_ordered) ray_idx_consults[IDX_SITE_ASOF_ORDERED]++;
             for (int32_t g = 0; g < n_groups && served; g++) {
                 int hit = asof_index_group(rt_eq[0], gkeys[g], &gsl[g]);
                 if (hit < 0) { served = false; break; }  /* ineligible */
@@ -2987,6 +2988,7 @@ static bool asof_hash_group_match(uint32_t n_eq,
              * for the density bail. */
             int64_t total_slice = 0;
             bool idx_ordered = asof_index_ordered_by(rt_eq[0], rt_time_sym);
+            if (idx_ordered) ray_idx_consults[IDX_SITE_ASOF_ORDERED]++;
             for (int32_t f = 0; f < n_fk && served; f++) {
                 int32_t rep = fk_head[f];
                 int hit = asof_index_group(rt_eq[0],

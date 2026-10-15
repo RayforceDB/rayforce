@@ -139,7 +139,7 @@ static void idx_stats_dump(void) {
     static const char* names[IDX_SITE__N] = {
         "filter-zone", "filter-bloom", "filter-hash", "filter-part",
         "filter-range", "in", "find", "sort", "distinct", "asof",
-        "filter-eq-range", "group-slice",
+        "filter-eq-range", "group-slice", "asof-ordered",
     };
     for (int i = 0; i < IDX_SITE__N; i++)
         if (ray_idx_consults[i] || ray_idx_hits[i])

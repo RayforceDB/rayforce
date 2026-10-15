@@ -41,6 +41,7 @@
 #include "ops/ops.h"         /* ray_graph_new: the unsplit eq+range conjunction */
 #include "lang/env.h"       /* ray_env_get */
 #include "mem/cow.h"       /* ray_rc_sync */
+#include "lang/format.h"    /* ray_fmt */
 #include <math.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -2759,8 +2760,9 @@ static test_result_t test_encoded_keep_copies(void) {
 
 /* Review minor 1: a stale SYM HASH / PART is rebuilt from the column on
  * generation 2 (every SYM index is rebuilt over the target ids), without
- * the stale root's UNIQUE: after a splayed save and reload, generation 2
- * keeps at least what generation 0 keeps (a rebuilt HASH; no PART). */
+ * the stale root's UNIQUE or order name (colw_region_prepare's `!stale`):
+ * after a splayed save and reload, generation 2 keeps at least what
+ * generation 0 keeps (a rebuilt HASH; no PART). */
 static test_result_t test_sym_stale_rebuild(void) {
     char wb[16];
     ray_t* g = ray_sym_vec_new(RAY_SYM_W64, 4000); g->len = 4000;
@@ -2775,6 +2777,8 @@ static test_result_t test_sym_stale_rebuild(void) {
     p = with_index(p, ray_index_attach_part);
     TEST_ASSERT_TRUE(g && p);
     ray_index_payload(g->index)->markers |= RAY_MARK_UNIQUE;
+    ray_index_payload(g->index)->u.hash.order_sym = ray_sym_intern("ts", 2);   /* heap roots: trusted unless stale */
+    ray_index_payload(p->index)->u.part.order_sym = ray_sym_intern("ts", 2);
     ray_index_payload(g->index)->built_for_len = 3999;              /* stale */
     ray_index_payload(p->index)->built_for_len = 3999;
     ray_t* t = ray_table_new(2);
@@ -2802,6 +2806,8 @@ static test_result_t test_sym_stale_rebuild(void) {
     TEST_ASSERT_EQ_I(ray_index_kind(g2), RAY_IDX_HASH);
     TEST_ASSERT_EQ_I(ray_index_kind(p2), RAY_IDX_PART);
     TEST_ASSERT_FALSE(ray_index_payload(g2->index)->markers & RAY_MARK_UNIQUE);   /* a stale flag is not kept */
+    TEST_ASSERT_EQ_I(ray_index_payload(g2->index)->u.hash.order_sym, -1);         /* nor a stale order name */
+    TEST_ASSERT_EQ_I(ray_index_payload(p2->index)->u.part.order_sym, -1);
     TEST_ASSERT_EQ_I(ray_index_payload(g2->index)->built_for_len, 4000);
     /* the rebuilt indexes answer by the file's ids */
     ray_t* cell = ray_sym_vec_cell(g2, 7);
@@ -3191,6 +3197,259 @@ static test_result_t test_sym_splay_kept(void) {
     PASS();
 }
 
+/* ---- end to end: save paths, converter parity (Task 8) ---- */
+
+/* The formatted value of `src` (owned string), or NULL on an error. */
+static ray_t* ixr_fmt(const char* src) {
+    ray_t* r = ixr_eval(src);
+    if (!r || RAY_IS_ERR(r)) { if (r) ray_error_free(r); return NULL; }
+    ray_t* f = ray_fmt(r, 0);
+    ray_release(r);
+    return f;
+}
+static bool ixr_same_fmt(ray_t* a, ray_t* b) {
+    return a && b && ray_str_len(a) == ray_str_len(b) && memcmp(ray_str_ptr(a), ray_str_ptr(b), ray_str_len(a)) == 0;
+}
+/* Two tables with the same column names and, column by column, the same
+ * formatted values (a table's own format is only its shape). */
+static bool ixr_same_table(ray_t* a, ray_t* b) {
+    if (!a || !b || a->type != RAY_TABLE || b->type != RAY_TABLE || ray_table_ncols(a) != ray_table_ncols(b)) return false;
+    bool same = true;
+    for (int64_t c = 0; same && c < ray_table_ncols(a); c++) {
+        if (ray_table_col_name(a, c) != ray_table_col_name(b, c)) return false;
+        ray_t* fa = ray_fmt(ray_table_col_idx(a, c), 0); ray_t* fb = ray_fmt(ray_table_col_idx(b, c), 0);
+        same = ixr_same_fmt(fa, fb);
+        if (fa && !RAY_IS_ERR(fa)) ray_release(fa);
+        if (fb && !RAY_IS_ERR(fb)) ray_release(fb);
+    }
+    return same;
+}
+
+/* Every index the save path persists on generation 0 is on the generation-2
+ * copy (STR DICT excepted until P6), and no auto pass touched a gen-2 file. */
+static test_result_t test_converter_parity(void) {
+    FILE* f = fopen(ray_test_tmp(IDX_TMP "/in.csv"), "w");
+    TEST_ASSERT_NOT_NULL(f);
+    fprintf(f, "u,c,s\n");
+    for (int i = 0; i < 200000; i++) fprintf(f, "%d,%d,name%d\n", (i * 7919) % 1000003, i / 10, i % 50);
+    fclose(f);
+    ray_t* r;
+    r = ixr_eval("(.csv.splayed {compress: false} [I64 I64 STR] \"" IDX_TMP "/in.csv\" \"" IDX_TMP "/c0/\")"); if (r) ray_release(r);
+    r = ixr_eval("(.csv.splayed {compress: true} [I64 I64 STR] \"" IDX_TMP "/in.csv\" \"" IDX_TMP "/c2/\")"); if (r) ray_release(r);
+    r = ixr_eval("(set A (.db.splayed.get \"" IDX_TMP "/c0/\"))"); if (r) ray_release(r);
+    r = ixr_eval("(set C (.db.splayed.get \"" IDX_TMP "/c2/\"))"); if (r) ray_release(r);
+    static const char* const cols[] = { "u", "c", NULL };
+    for (int i = 0; cols[i]; i++) {
+        char q0[256], q2[256], g2[256];
+        snprintf(q0, sizeof q0, "(at (.idx.info (at A '%s)) 'kind)", cols[i]);
+        snprintf(q2, sizeof q2, "(at (.idx.info C '%s) 'index)", cols[i]);
+        snprintf(g2, sizeof g2, "(at (.idx.info C '%s) 'gen)", cols[i]);
+        TEST_ASSERT_EQ_I(ixr_i64(g2), 2);
+        int64_t k0 = ixr_i64(q0);
+        TEST_ASSERT_TRUE(k0 != INT64_MIN);
+        TEST_ASSERT_EQ_I(k0, ixr_i64(q2));                             /* chunk_zone on both */
+    }
+    /* explicit indexes, then .db.splayed.set: generation 2 keeps the kind */
+    r = ixr_eval("(.db.splayed.set \"" IDX_TMP "/e2/\" (table [u s] (list (.idx.hash (at A 'u)) (.idx.hash (at A 's)))) {compress: true})"); if (r) ray_release(r);
+    r = ixr_eval("(set E (.db.splayed.get \"" IDX_TMP "/e2/\"))"); if (r) ray_release(r);
+    TEST_ASSERT_EQ_I(ixr_i64("(at (.idx.info E 'u) 'gen)"), 2);
+    TEST_ASSERT_EQ_I(ixr_i64("(at (.idx.info E 'u) 'index)"), ray_sym_intern("hash", 4));
+    TEST_ASSERT_EQ_I(ixr_i64("(at (.idx.info E 's) 'gen)"), 2);
+    TEST_ASSERT_EQ_I(ixr_i64("(at (.idx.info E 's) 'index)"), ray_sym_intern("hash", 4));
+    TEST_ASSERT_EQ_I(ixr_i64("(count (select {from: E where: (== s \"name7\")}))"), 4000);
+    PASS();
+}
+
+/* Spec "Index use materializes once": a point lookup on an indexed column
+ * materializes only that column. */
+static test_result_t test_use_materializes_once(void) {
+    ray_t* r = ixr_eval("(.db.splayed.set \"" IDX_TMP "/m2/\" (table [k v w] (list (.idx.hash (% (* (til 200000) 7919) 100003)) (til 200000) (map (fn [j] (format \"t%\" j)) (til 200000)))) {compress: true})");
+    if (r) ray_release(r);
+    r = ixr_eval("(set M (.db.splayed.get \"" IDX_TMP "/m2/\"))"); if (r) ray_release(r);
+    ray_enc_counters_reset();
+    int64_t got = ixr_i64("(count (at (select {v: v w: w from: M where: (== k 4242)}) 'v))");   /* the select runs the filter; count of its column, not count(select) */
+    ray_enc_counters_t k; ray_enc_counters_get(&k);
+    TEST_ASSERT_EQ_I(got, ixr_i64("(count (where (== (% (* (til 200000) 7919) 100003) 4242)))"));
+    TEST_ASSERT_EQ_U(k.materialized, 1);
+    TEST_ASSERT_EQ_I(ixr_i64("(if (at (.idx.info M 'v) 'materialized) 1 0)"), 0);
+    TEST_ASSERT_EQ_I(ixr_i64("(if (at (.idx.info M 'k) 'materialized) 1 0)"), 1);
+    PASS();
+}
+
+/* Parted (Task 6b minor 5): a parted table consults its per-segment indexes
+ * on generation 2 exactly as on generation 0: every site's consults and
+ * hits, the answers, and one materialization per segment HASH consult on
+ * generation 0 (the consult-set rule), so a segment that is pruned or not
+ * consulted is never decoded.  At this HEAD no parted shape reaches a
+ * segment's index on generation 0 (the parted select answers by its scan;
+ * a bare FILTER graph over a constant table does not stream), so the
+ * counters are zero on both and generation 2 materializes nothing; when
+ * generation 0 starts consulting a segment, the same assertions require
+ * generation 2 to follow. */
+static test_result_t test_parted_segment_index(void) {
+    for (int gen = 0; gen <= 2; gen += 2)
+        for (int d = 1; d <= 3; d++) {
+            char q[600];
+            snprintf(q, sizeof q, "(.db.splayed.set \"" IDX_TMP "/pt%d/2024.01.0%d/t/\" (table [k v] (list (.idx.hash (%% (* (til 70000) %d) 10007)) (til 70000))) {compress: %s})",
+                     gen, d, d + 6, gen ? "true" : "false");
+            ray_t* r = ixr_eval(q); if (r) ray_release(r);
+        }
+    /* a segment of each generation, loaded alone, records / attaches its HASH */
+    TEST_ASSERT_EQ_I(ixr_i64("(if (== (at (.idx.info (at (.db.splayed.get \"" IDX_TMP "/pt0/2024.01.02/t/\") 'k)) 'kind) 'hash) 1 0)"), 1);
+    TEST_ASSERT_EQ_I(ixr_i64("(at (.idx.info (.db.splayed.get \"" IDX_TMP "/pt2/2024.01.02/t/\") 'k) 'index)"), ray_sym_intern("hash", 4));
+    static const char* const qs[] = {
+        "(sum (at (select {from: PT where: (and (== date 2024.01.01) (== k 42))}) 'v))",
+        "(sum (at (select {from: PT where: (== k 42)}) 'v))",
+        "(sum (at (select {from: PT where: (in k [1 42 77])}) 'v))",
+        "(sum (at (select {v: v from: PT where: (and (== date 2024.01.02) (== k 7))}) 'v))",
+        NULL,
+    };
+    for (int i = 0; qs[i]; i++) {
+        uint64_t c[2][IDX_SITE__N], h[2][IDX_SITE__N], mat[2];
+        int64_t cnt[2];
+        for (int g = 0; g < 2; g++) {
+            char q[300];
+            snprintf(q, sizeof q, "(set PT (.db.parted.get \"" IDX_TMP "/pt%d\" 't))", g * 2);
+            ray_t* r = ixr_eval(q); if (r) ray_release(r);
+            uint64_t c0[IDX_SITE__N], h0[IDX_SITE__N];
+            memcpy(c0, ray_idx_consults, sizeof c0); memcpy(h0, ray_idx_hits, sizeof h0);
+            ray_enc_counters_reset();
+            cnt[g] = ixr_i64(qs[i]);
+            ray_enc_counters_t k; ray_enc_counters_get(&k);
+            mat[g] = k.materialized;
+            for (int s = 0; s < IDX_SITE__N; s++) { c[g][s] = ray_idx_consults[s] - c0[s]; h[g][s] = ray_idx_hits[s] - h0[s]; }
+        }
+        TEST_ASSERT_FMT(cnt[0] != INT64_MIN && cnt[0] == cnt[1], "%s: %lld vs generation 0 %lld", qs[i], (long long)cnt[1], (long long)cnt[0]);
+        for (int s = 0; s < IDX_SITE__N; s++)
+            TEST_ASSERT_FMT(c[0][s] == c[1][s] && h[0][s] == h[1][s], "%s: site %d consults %llu/%llu hits %llu/%llu", qs[i], s,
+                            (unsigned long long)c[0][s], (unsigned long long)c[1][s], (unsigned long long)h[0][s], (unsigned long long)h[1][s]);
+        TEST_ASSERT_FMT(mat[0] == 0 && mat[1] == c[0][IDX_SITE_FILTER_HASH], "%s: generation 2 materialized %llu, generation 0 consulted %llu segment HASHes",
+                        qs[i], (unsigned long long)mat[1], (unsigned long long)c[0][IDX_SITE_FILTER_HASH]);
+    }
+    PASS();
+}
+
+/* Spec "Indexes / UNIQUE": unique-only and HASH+UNIQUE numeric columns from a
+ * heap source and from a generation-0 passenger source: the flag is known
+ * before materialization (metadata, nothing decoded) and .attr.get matches
+ * generation 0 after it. */
+static test_result_t test_unique_attr_get(void) {
+    ray_t* r = ixr_eval("(set U (table [u h] (list (.attr.set 'unique (til 70000)) (.attr.set 'unique (.idx.hash (* (til 70000) 3))))))");
+    if (r) ray_release(r);
+    r = ixr_eval("(.db.splayed.set \"" IDX_TMP "/u0/\" U {compress: false})"); if (r) ray_release(r);
+    r = ixr_eval("(.db.splayed.set \"" IDX_TMP "/u2/\" U {compress: true})"); if (r) ray_release(r);
+    r = ixr_eval("(.db.splayed.set \"" IDX_TMP "/up/\" (.db.splayed.get \"" IDX_TMP "/u0/\") {compress: true})"); if (r) ray_release(r);  /* passenger source */
+    static const char* const dirs[2] = { IDX_TMP "/u2/", IDX_TMP "/up/" };
+    for (int d = 0; d < 2; d++)
+        for (int c = 0; c < 2; c++) {
+            const char* col = c ? "h" : "u";
+            char q[300];
+            snprintf(q, sizeof q, "(.db.splayed.get \"%s\")", dirs[d]);
+            ray_t* t = ixr_eval(q);
+            TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+            ray_col_meta_t m;
+            ray_enc_counters_reset();
+            TEST_ASSERT_TRUE(ray_table_col_meta(t, ray_sym_intern(col, 1), &m));
+            TEST_ASSERT_EQ_I(m.enc != NULL, 1);                          /* generation 2, not decoded */
+            TEST_ASSERT_FMT(m.unique, "%s %s: UNIQUE known from the header", dirs[d], col);
+            ray_enc_counters_t k; ray_enc_counters_get(&k);
+            TEST_ASSERT_EQ_U(k.materialized, 0);
+            ray_release(t);
+            char q0[300], q2[300];
+            snprintf(q0, sizeof q0, "(.attr.get (at (.db.splayed.get \"" IDX_TMP "/u0/\") '%s))", col);
+            snprintf(q2, sizeof q2, "(.attr.get (at (.db.splayed.get \"%s\") '%s))", dirs[d], col);
+            ray_t* fa = ixr_fmt(q0); ray_t* fb = ixr_fmt(q2);
+            TEST_ASSERT_FMT(ixr_same_fmt(fa, fb), "%s %s: .attr.get differs (%.*s vs %.*s)", dirs[d], col,
+                            fa ? (int)ray_str_len(fa) : 5, fa ? ray_str_ptr(fa) : "error",
+                            fb ? (int)ray_str_len(fb) : 5, fb ? ray_str_ptr(fb) : "error");
+            if (fa) ray_release(fa);
+            if (fb) ray_release(fb);
+        }
+    PASS();
+}
+
+/* Spec "Normalized bytes: the same table saved from different allocations
+ * and domains writes byte-identical regions": one SYM HASH / PART table,
+ * once from the runtime domain and once from a FILE domain with another
+ * insertion order, saved into one target symfile. */
+static test_result_t test_normalized_domains(void) {
+    ray_t* r;
+    r = ixr_eval("(set N (table [k p] (list (.idx.hash (at ['zeta 'alpha 'mu 'omega] (% (* (til 6000) 7) 4))) (.attr.set 'parted (at ['b 'a 'c] (div (til 6000) 2000))))))");
+    if (r) ray_release(r);
+    r = ixr_eval("(.db.splayed.set \"" IDX_TMP "/nd1/\" N {compress: false})"); if (r) ray_release(r);
+    r = ixr_eval("(.db.splayed.set \"" IDX_TMP "/ndA/\" N \"" IDX_TMP "/target.sym\" {compress: true})"); if (r) ray_release(r);
+    /* the generation-0 save drops the SYM PART (D1, #838): the FILE-domain
+     * copy re-attaches it over its own ids */
+    r = ixr_eval("(set F (.db.splayed.get \"" IDX_TMP "/nd1/\"))"); if (r) ray_release(r);
+    TEST_ASSERT_TRUE(ixr_i64("(if (== (at (.idx.info (at F 'k)) 'kind) 'hash) 1 0)") == 1);
+    r = ixr_eval("(set F (table [k p] (list (at F 'k) (.attr.set 'parted (at F 'p)))))"); if (r) ray_release(r);
+    r = ixr_eval("(.db.splayed.set \"" IDX_TMP "/ndB/\" F \"" IDX_TMP "/target.sym\" {compress: true})");
+    if (r) ray_release(r);
+    static const char* const cols[2] = { "k", "p" };
+    for (int c = 0; c < 2; c++) {
+        char pa[1200], pb[1200];
+        TEST_ASSERT_TRUE(ix_live_path(IDX_TMP "/ndA/", cols[c], pa, sizeof pa));   /* the published generation's file */
+        TEST_ASSERT_TRUE(ix_live_path(IDX_TMP "/ndB/", cols[c], pb, sizeof pb));
+        size_t na = 0, nb = 0; ray_enc_hdr_t ea, eb; uint64_t fa, fb;
+        uint8_t* ra = ix_file_region(pa, &na, &ea, &fa); uint8_t* rb = ix_file_region(pb, &nb, &eb, &fb);
+        bool same = ra && rb && na == nb && memcmp(ra, rb, na) == 0;
+        free(ra); free(rb);
+        TEST_ASSERT_FMT(same, "column %s: regions differ", cols[c]);
+        TEST_ASSERT_TRUE(ea.index_kind == (c ? RAY_IDX_PART : RAY_IDX_HASH) && eb.index_kind == ea.index_kind);
+    }
+    PASS();
+}
+
+/* Spec "Indexes / order_sym": a PART ordered by `ts`, loaded from generation
+ * 2, takes the index-ordered as-of route (the IDX_SITE_ASOF_ORDERED counter);
+ * a name naming no column disables it and the results stay generation 0's.
+ * The key is I64: the as-of index variant needs a right side proven
+ * null-free, which a SYM column never is (ray_vec_may_have_nulls), so a SYM
+ * key takes no index route on either generation. */
+static test_result_t test_order_sym_fast_path(void) {
+    ray_t* r;
+    r = ixr_eval("(set Q (xasc (xasc (table [id ts bid] (list (% (til 3000) 3) (til 3000) (as 'F64 (til 3000)))) ['id 'ts]) ['id 'ts]))");
+    if (r) ray_release(r);
+    r = ixr_eval("(set L (table [id ts] (list [0 1 2] [100 200 2999])))"); if (r) ray_release(r);
+    r = ixr_eval("(.db.splayed.set \"" IDX_TMP "/os0/\" Q {compress: false})"); if (r) ray_release(r);
+    r = ixr_eval("(.db.splayed.set \"" IDX_TMP "/os2/\" Q {compress: true})"); if (r) ray_release(r);
+    /* the same table with order_sym naming no column */
+    ray_t* q = ray_eval_str("Q");
+    TEST_ASSERT_TRUE(q && !RAY_IS_ERR(q));
+    ray_t* qc = ray_table_col(q, ray_sym_intern("id", 2));
+    TEST_ASSERT_EQ_I(ray_index_kind(qc), RAY_IDX_PART);
+    int64_t keep = ray_index_payload(qc->index)->u.part.order_sym;
+    TEST_ASSERT_EQ_I(keep, ray_sym_intern("ts", 2));
+    ray_index_payload(qc->index)->u.part.order_sym = ray_sym_intern("no_such_col", 11);
+    r = ixr_eval("(.db.splayed.set \"" IDX_TMP "/osn/\" Q {compress: true})"); if (r) ray_release(r);
+    ray_index_payload(qc->index)->u.part.order_sym = keep;
+    ray_release(q);
+    /* 0: the in-memory Q (heap root, order_sym ts: the ordered route in this
+     * process); 1: the generation-0 load (the answer reference); 2: the
+     * generation-2 load; 3: the generation-2 load whose name block names no
+     * column. */
+    static const char* const srcs[4] = { "Q", "(.db.splayed.get \"" IDX_TMP "/os0/\")",
+                                         "(.db.splayed.get \"" IDX_TMP "/os2/\")", "(.db.splayed.get \"" IDX_TMP "/osn/\")" };
+    ray_t* out[4]; uint64_t ordered[4];
+    for (int d = 0; d < 4; d++) {
+        char qs[400];
+        snprintf(qs, sizeof qs, "(asof-join [id ts] L %s)", srcs[d]);
+        uint64_t c0 = ray_idx_consults[IDX_SITE_ASOF_ORDERED];
+        out[d] = ixr_eval(qs);
+        TEST_ASSERT_TRUE(out[d] && !RAY_IS_ERR(out[d]));
+        ordered[d] = ray_idx_consults[IDX_SITE_ASOF_ORDERED] - c0;
+    }
+    TEST_ASSERT_TRUE(ordered[0] >= 1);            /* the heap root: the ordered route */
+    TEST_ASSERT_EQ_U(ordered[2], ordered[0]);     /* generation 2: the same route through the name block */
+    TEST_ASSERT_EQ_U(ordered[3], 0);              /* no such column: off */
+    for (int d = 0; d < 4; d++) {
+        if (d == 1) continue;
+        TEST_ASSERT_FMT(ixr_same_table(out[1], out[d]), "as-of %d differs from generation 0", d);
+    }
+    for (int d = 0; d < 4; d++) ray_release(out[d]);
+    PASS();
+}
+
 const test_entry_t encidx_entries[] = {
     { "idxval/write_hash_layout", test_write_hash_layout, ix_setup, ix_teardown },
     { "idxval/write_name_block",  test_write_name_block,  ix_setup, ix_teardown },
@@ -3251,5 +3510,11 @@ const test_entry_t encidx_entries[] = {
     { "idxval/sym_stale_rebuild",      test_sym_stale_rebuild,      ixr_setup, ixr_teardown },
     { "idxval/sym_stale_part_unbuildable", test_sym_stale_part_unbuildable, ix_setup, ix_teardown },
     { "idxval/corrupt_sym_hash_null_key",  test_corrupt_sym_hash_null_key,  ixr_setup, ixr_teardown },
+    { "idxval/converter_parity",      test_converter_parity,      ixr_setup, ixr_teardown },
+    { "idxval/use_materializes_once", test_use_materializes_once, ixr_setup, ixr_teardown },
+    { "idxval/parted_segment_index",  test_parted_segment_index,  ixr_setup, ixr_teardown },
+    { "idxval/unique_attr_get",       test_unique_attr_get,       ixr_setup, ixr_teardown },
+    { "idxval/normalized_domains",    test_normalized_domains,    ixr_setup, ixr_teardown },
+    { "idxval/order_sym_fast_path",   test_order_sym_fast_path,   ixr_setup, ixr_teardown },
     { NULL, NULL, NULL, NULL },
 };
