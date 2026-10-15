@@ -26,17 +26,20 @@
 (at (.idx.info C 'b) 'index) -- 'bloom
 (at (.idx.info C 'p) 'index) -- 'part
 (at (.idx.info C 'y) 'index) -- 'hash
+(at (.idx.info C 'z) 'index) -- 'part
 (at (.idx.info C 'k) 'materialized) -- false
 
-;; equality, in, ranges, grouping: generation-0 answers
-(count (select {from: C where: (== k 4242)})) -- (count (select {from: A where: (== k 4242)}))
-(count (select {from: C where: (in k [1 2 3 4242])})) -- (count (select {from: A where: (in k [1 2 3 4242])}))
-(count (select {from: C where: (> s 3000)})) -- (count (select {from: A where: (> s 3000)}))
-(count (select {from: C where: (== p 77)})) -- (count (select {from: A where: (== p 77)}))
-(count (select {from: C where: (== y 'mu)})) -- (count (select {from: A where: (== y 'mu)}))
+;; equality, in, ranges, grouping: generation-0 answers (a projected column,
+;; so the select runs the filter; count(select) would take the count fast
+;; path, which consults no index)
+(sum (at (select {from: C where: (== k 4242)}) 'v)) -- (sum (at (select {from: A where: (== k 4242)}) 'v))
+(sum (at (select {from: C where: (in k [1 2 3 4242])}) 'v)) -- (sum (at (select {from: A where: (in k [1 2 3 4242])}) 'v))
+(sum (at (select {from: C where: (> s 3000)}) 'v)) -- (sum (at (select {from: A where: (> s 3000)}) 'v))
+(sum (at (select {from: C where: (== p 77)}) 'v)) -- (sum (at (select {from: A where: (== p 77)}) 'v))
+(sum (at (select {from: C where: (== y 'mu)}) 'v)) -- (sum (at (select {from: A where: (== y 'mu)}) 'v))
 (select {c: (count v) from: C by: y asc: y}) -- (select {c: (count v) from: A by: y asc: y})
-(count (select {from: C where: (== z 0.0)})) -- (count (select {from: A where: (== z 0.0)}))
-(count (select {from: C where: (== z -0.0)})) -- (count (select {from: A where: (== z -0.0)}))
+(sum (at (select {from: C where: (== z 0.0)}) 'v)) -- (sum (at (select {from: A where: (== z 0.0)}) 'v))
+(sum (at (select {from: C where: (== z -0.0)}) 'v)) -- (sum (at (select {from: A where: (== z -0.0)}) 'v))
 
 ;; .attr.get after materialization, index kind on the column value
 (.attr.get (at C 'y)) -- (.attr.get (at A 'y))

@@ -3208,7 +3208,8 @@ static ray_t* ixr_fmt(const char* src) {
     return f;
 }
 static bool ixr_same_fmt(ray_t* a, ray_t* b) {
-    return a && b && ray_str_len(a) == ray_str_len(b) && memcmp(ray_str_ptr(a), ray_str_ptr(b), ray_str_len(a)) == 0;
+    return a && b && !RAY_IS_ERR(a) && !RAY_IS_ERR(b) &&           /* an error never matches */
+           ray_str_len(a) == ray_str_len(b) && memcmp(ray_str_ptr(a), ray_str_ptr(b), ray_str_len(a)) == 0;
 }
 /* Two tables with the same column names and, column by column, the same
  * formatted values (a table's own format is only its shape). */
@@ -3217,10 +3218,12 @@ static bool ixr_same_table(ray_t* a, ray_t* b) {
     bool same = true;
     for (int64_t c = 0; same && c < ray_table_ncols(a); c++) {
         if (ray_table_col_name(a, c) != ray_table_col_name(b, c)) return false;
-        ray_t* fa = ray_fmt(ray_table_col_idx(a, c), 0); ray_t* fb = ray_fmt(ray_table_col_idx(b, c), 0);
+        ray_t* ca = ray_table_col_idx(a, c); ray_t* cb = ray_table_col_idx(b, c);
+        if (!ca || !cb || RAY_IS_ERR(ca) || RAY_IS_ERR(cb)) return false;
+        ray_t* fa = ray_fmt(ca, 0); ray_t* fb = ray_fmt(cb, 0);
         same = ixr_same_fmt(fa, fb);
-        if (fa && !RAY_IS_ERR(fa)) ray_release(fa);
-        if (fb && !RAY_IS_ERR(fb)) ray_release(fb);
+        if (fa) { if (RAY_IS_ERR(fa)) ray_error_free(fa); else ray_release(fa); }
+        if (fb) { if (RAY_IS_ERR(fb)) ray_error_free(fb); else ray_release(fb); }
     }
     return same;
 }
@@ -3247,6 +3250,7 @@ static test_result_t test_converter_parity(void) {
         TEST_ASSERT_EQ_I(ixr_i64(g2), 2);
         int64_t k0 = ixr_i64(q0);
         TEST_ASSERT_TRUE(k0 != INT64_MIN);
+        TEST_ASSERT_EQ_I(k0, ray_sym_intern("chunk_zone", 10));       /* the kind is there */
         TEST_ASSERT_EQ_I(k0, ixr_i64(q2));                             /* chunk_zone on both */
     }
     /* explicit indexes, then .db.splayed.set: generation 2 keeps the kind */
@@ -3424,6 +3428,11 @@ static test_result_t test_order_sym_fast_path(void) {
     r = ixr_eval("(.db.splayed.set \"" IDX_TMP "/osn/\" Q {compress: true})"); if (r) ray_release(r);
     ray_index_payload(qc->index)->u.part.order_sym = keep;
     ray_release(q);
+    /* os2 and osn are generation-2 files that record the PART */
+    TEST_ASSERT_EQ_I(ixr_i64("(at (.idx.info (.db.splayed.get \"" IDX_TMP "/os2/\") 'id) 'gen)"), 2);
+    TEST_ASSERT_EQ_I(ixr_i64("(at (.idx.info (.db.splayed.get \"" IDX_TMP "/os2/\") 'id) 'index)"), ray_sym_intern("part", 4));
+    TEST_ASSERT_EQ_I(ixr_i64("(at (.idx.info (.db.splayed.get \"" IDX_TMP "/osn/\") 'id) 'gen)"), 2);
+    TEST_ASSERT_EQ_I(ixr_i64("(at (.idx.info (.db.splayed.get \"" IDX_TMP "/osn/\") 'id) 'index)"), ray_sym_intern("part", 4));
     /* 0: the in-memory Q (heap root, order_sym ts: the ordered route in this
      * process); 1: the generation-0 load (the answer reference); 2: the
      * generation-2 load; 3: the generation-2 load whose name block names no
