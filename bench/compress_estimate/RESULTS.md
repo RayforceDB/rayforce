@@ -2689,3 +2689,173 @@ carry q42/B/warm: P2 x1.237 -> P3 x0.947
 P3GATE p2_strict=FAIL materialization=PASS rss=PASS
 P3 GATE: FAIL
 ```
+
+
+## P4 index region (10M store, release build, commit 3abe880e)
+
+The index-query driver is `W=/home/hetoku/data/tmp/p4_bench
+p4_bench.sh all` (prep 15:49-15:52, measured 15:52-15:58; a second
+`prep clean` at 15:58-16:00 recorded the g2 size the first prep missed, with
+the same binary).  The binary is a2ca3564's release build (sha256
+a8b202bb00e0; 3abe880e adds only the scripts).  Both copies come from the
+`.db.splayed.get` store /skull/clickbench/rfsplayed with explicit HASH
+indexes on UserID, RefererHash and URLHash (`update` keeps the index: the
+source, g0 and g2 report `hash` on all three).  9 rounds alternated
+(order swapped per round), 6 timed runs per process; first touch is a fresh
+process with the store's files evicted (3 trials).  The load average was
+checked before each round; one wait (40 s, 15:54) before the first first-touch
+trial.  Raw data: /home/hetoku/data/tmp/p4_bench/p4.tsv, summary.txt beside it.
+
+Query shapes: a count over a select is answered before the index arm, so
+the lookups are projecting selects.  q1 is ClickBench q20 as written; its key
+is absent from the 10M store (0 rows, the HASH proves it absent).  `.idx.uses`
+shows the same index consulted once on g0 and g2 for every query (D2); g2
+leaves only the looked-up column materialized.
+
+| query | warm g0 ms | warm g2 ms | ratio | best round g0 / g2 (ratio) | in-process run 1 g0 / g2 | first touch g0 / g2 ms | rows | answers warm / first |
+|---|---|---|---|---|---|---|---|---|
+| q1 UserID point lookup (ClickBench q20) | 0.009 | 0.008 | 0.895 | 0.008 / 0.008 (0.963) | 0.764 / 253.282 | 1.4 / 630.4 | 0 | same / same |
+| q2 RefererHash point lookup (q41's constant) | 0.358 | 0.310 | 0.867 | 0.326 / 0.279 (0.855) | 1.396 / 636.295 | 15.2 / 1312.1 | 81558 | same / same |
+| q3 URLHash point lookup (q42's constant) | 0.371 | 0.352 | 0.949 | 0.358 / 0.295 (0.824) | 1.425 / 653.018 | 15.4 / 1253.0 | 90899 | same / same |
+| q4 ClickBench q41 | 5.832 | 4.888 | 0.838 | 5.713 / 4.646 (0.813) | 13.318 / 644.923 | 98.9 / 1347.8 | 10 | same / same |
+| q5 ClickBench q42 | 4.656 | 4.680 | 1.005 | 4.560 / 4.595 (1.008) | 10.961 / 659.465 | 37.2 / 1270.5 | 10 | same / same |
+
+rounds: 9; first-touch trials: 3
+sizes: g0 6086708243 B, g2 3354488811 B (x0.551)
+index kinds (UserID RefererHash URLHash): source ['hash 'hash 'hash]; g0 ['hash 'hash 'hash]; g2 ['hash 'hash 'hash]
+uses q1: g0 {UserID:1}	[] | g2 {UserID:1}	[UserID]
+uses q2: g0 {RefererHash:1}	[] | g2 {RefererHash:1}	[RefererHash]
+uses q3: g0 {URLHash:1}	[] | g2 {URLHash:1}	[URLHash]
+uses q4: g0 {RefererHash:1}	[] | g2 {RefererHash:1}	[RefererHash]
+uses q5: g0 {URLHash:1}	[] | g2 {URLHash:1}	[URLHash]
+meta p4=a2ca3564/a8b202bb00e0
+load waits first1/15:54:20/40
+
+**P4 index answers: PASS** (every query's full answer, warm and first touch, g2 equal to g0)
+**P4 index queries warm: PASS** (each warm median at most 1.05x generation 0, or under 1 ms within 0.05 ms)
+
+- Equivalence pass (`make test TEST_FILTER=equiv/`): 1178 tests, 0 failed, 0
+  runtime errors, at the default cores and at 8.  The indexed saving `.rfl`
+  files it runs: 21.  The brief's grep lists 22, but
+  `hof/eval_coverage3.rfl` matches only a comment and saves nothing, so the
+  pass does not run it.  The list includes `storage/compress_index.rfl`.
+  No triage was needed: no failure, no new D1 site, no `equiv_skip` entry,
+  `equiv_groups` unchanged.
+- Index validation suite (`make test TEST_FILTER=idxval/`): 65 tests, 0
+  failed at cores 0, 2 and 8.  `srccheck/` 11/11.  `enccorrupt/` 16/16 at
+  cores 2 and 8.  `fuzz_flips` gains an I64 HASH column saved by
+  `ray_col_save_gen` (a2ca3564): 300 of 300 flips confined to its index
+  region were rejected, and structural flips over all six bases were rejected
+  1184 of 1200 times.  Full suite: 5920/5920, 0 runtime errors.
+- WASM golden run: not run (no emcc on this machine); wasm32 layout check PASS — SPEC DEVIATION.
+- First touch (fresh process, cache evicted per file): generation 2 pays the
+  column decode and the region parse.  This is reported, not gated (spec
+  "Benchmarks").  About 630 ms for UserID and 1.25-1.35 s for the
+  RefererHash and URLHash columns, against 1-100 ms on generation 0.
+  In-process run 1 (warm page cache) is 250-660 ms.  A profile of q41's first
+  use attributes 47% to `ray_enc_index_validate` (32% in its sort for
+  distinctness) and 7% to the decode.
+
+**P4 gate (equivalence): PASS**
+**P4 gate (index validation suite): PASS**
+**P4 index answers: PASS** (every query's full answer, warm and first touch, g2 equal to g0)
+**P4 index queries warm: PASS** (each warm median at most 1.05x generation 0, or under 1 ms within 0.05 ms)
+
+### D7: the P2/P3 driver rerun (no regression, I8)
+
+`W=/home/hetoku/data/tmp/p2_bench BASE=25eabaf2 p2_bench.sh prep`, then
+`splayed` (16:04-16:35) and `parted` (16:35-17:36).  The P4 binary is
+3abe880e (release, sha256 a2d3151c0de3, same source as a2ca3564).  The base
+is 25eabaf2, the end of P3 (1e9feb84f335).  The driver's previous data in
+that directory (P2 gate, 2026-10-10) was moved to `old_p2gate_20261010/`.
+Load was 1.00 at the start; no other heavy job ran (a light cron worker
+was the only other process seen).  `p3_summary.py` is unchanged, including
+its ALLOW table.  Raw data: /home/hetoku/data/tmp/p2_bench/p2.tsv and
+summary.txt.
+
+```
+totals over all 43: warm 1707.3 vs 1647.7 (0.965); first run 2516.1 vs 3882.2 (1.543); 3-run 5989.7 vs 7241.1 (1.209)
+answer_mismatches none
+first_run_total_ratio 1.543 (PI after P1: 2.99)
+pi_row q41 warm 0.814 first 47.001 3run 25.474
+pi_row q42 warm 1.005 first 58.635 3run 32.166
+totals over all 43: warm 4707.3 vs 2904.4 (0.617); first run 16199.4 vs 13738.1 (0.848); 3-run 25750.6 vs 19671.9 (0.764)
+answer_mismatches none
+pi_row q41 warm 0.792 first 0.688 3run 0.751
+pi_row q42 warm 0.954 first 0.997 3run 1.068
+totals over all 43: warm 1711.1 vs 1711.1 (1.000); first run 2524.3 vs 2531.3 (1.003); 3-run 6011.3 vs 6017.0 (1.001)
+answer_mismatches none
+gen0 warm_gmean(base>=1ms n=34)=0.998 warm_worst=1.102 worst5 [(1.102, 'q1'), (1.089, 'q25'), (1.057, 'q7'), (1.022, 'q42'), (1.021, 'q5')]
+totals over all 43: warm 4650.9 vs 4713.8 (1.014); first run 16076.3 vs 16160.0 (1.005); 3-run 25486.7 vs 25750.1 (1.010)
+answer_mismatches none
+gen0 warm_gmean(base>=1ms n=42)=1.005 warm_worst=1.046 worst5 [(1.046, 'q5'), (1.045, 'q4'), (1.04, 'q26'), (1.028, 'q7'), (1.026, 'q6')]
+totals over all 43: warm 4392.1 vs 4459.9 (1.015); first run 15853.2 vs 15930.9 (1.005); 3-run 24764.8 vs 24998.8 (1.009)
+answer_mismatches none
+gen0 warm_gmean(base>=1ms n=42)=1.006 warm_worst=1.052 worst5 [(1.052, 'q5'), (1.049, 'q4'), (1.04, 'q30'), (1.036, 'q26'), (1.027, 'q6')]
+sizes {('A', 'g0'): 5948677939, ('A', 'g2'): 3216455899, ('B', 'p0'): 4807844987, ('B', 'p2'): 2072366907}  peak_rss_kb {('A', 'g0'): 5118136, ('A', 'g2'): 5970564, ('B', 'p0'): 12144580, ('B', 'p2'): 11965660}  evict_modes fadvise  ragged_partition ['9', '40']  meta {'p2': ['3abe880e', 'a2d3151c0de3'], 'base': ['25eabaf2', '1e9feb84f335']}
+GATE (strict) splayed[answers=PASS warm=FAIL cold=PASS first=PASS materializing_warm=PASS no_unexpected_materialization=PASS first_total=PASS] parted[answers=PASS warm=PASS cold=PASS first=PASS materializing_warm=PASS no_unexpected_materialization=PASS] gen0-splayed[answers=PASS warm=FAIL] gen0-parted[answers=PASS warm=FAIL q16_first=PASS] gen0-ragged[answers=PASS warm=FAIL]
+P2 GATE (strict): FAIL
+GATE (P3-exempt) splayed[answers=PASS warm=FAIL cold=PASS first=PASS materializing_warm=PASS no_unexpected_materialization=PASS first_total=PASS] parted[answers=PASS warm=PASS cold=PASS first=PASS materializing_warm=PASS no_unexpected_materialization=PASS] gen0-splayed[answers=PASS warm=FAIL] gen0-parted[answers=PASS warm=FAIL q16_first=PASS] gen0-ragged[answers=PASS warm=FAIL]
+P2 GATE (P3-exempt): FAIL
+p3_unexpected_materializations A/q41:RefererHash A/q42:URLHash
+rss A: 5118136 -> 5970564 kB (x1.167, bound 1.1)
+rss B: 12144580 -> 11965660 kB (x0.985, bound 1.1)
+carry q2/A/warm: P2 x1.086 -> P3 x0.617
+carry q8/A/warm: P2 x1.424 -> P3 x0.831
+carry q8/B/warm: P2 x1.060 -> P3 x0.362
+carry q18/A/first: P2 x1.983 -> P3 x0.435
+carry q18/B/warm: P2 x1.088 -> P3 x0.736
+carry q39/A/first: P2 x2.402 -> P3 x0.690
+carry q39/B/first: P2 x1.503 -> P3 x0.735
+carry q42/A/warm: P2 x1.664 -> P3 x1.005
+carry q42/B/warm: P2 x1.237 -> P3 x0.954
+P3GATE p2_strict=FAIL materialization=FAIL rss=FAIL
+P3 GATE: FAIL
+```
+
+**D7 no-regression rerun: FAIL (pending)** (P3 GATE FAIL: p2_strict, materialization, rss; answers PASS on every arm)
+
+Failing clauses, each profiled on the release binaries (`perf record -g`;
+the top-5 tables are in the Task 10 report):
+
+1. **Materialization, A/q41 RefererHash, A/q42 URLHash**, and **RSS A x1.167**.
+   The source store carries a persisted HASH on RefererHash, URLHash and
+   WatchID.  Up to P3, generation 2 wrote these indexed columns as
+   generation 0: a base-written g2 reports gen-0 HASH dicts on them.  Under P4
+   they are generation 2 with an index region.  D2 sends q41 / q42 down
+   generation 0's index route: materialize, then probe the HASH.  The
+   counters match gen 0 (`.idx.uses` {RefererHash:1} / {URLHash:1} on both).
+   The warm times are 0.814 and 1.005.  The first runs are 647 / 657 ms
+   against 14 / 11 ms on g0 (47x / 59x; PI rows above).  The RSS excess is
+   entirely q41 / q42: a 41-query run without them gives g0 5 080 248 kB
+   and g2 5 059 724 kB (x0.996).  With all 43, the figures are 5 104 436 and
+   5 965 972 kB.  This is D2's stated cost ("one materialization per indexed
+   column"), not an answer change.  The ALLOW table and the RSS bound
+   predate indexed generation-2 columns.
+2. **Splayed warm (A), q33 1.082** (202.6 -> 219.3 ms; the P3 rerun gave 1.039).
+   The group runs on the P3 fused encoded path on g2:
+   `agg_radix_group_fused_fn`, `agg_radix_fused_fn` and
+   `agg_radix_stage_block_c`, against `agg_radix_group_fn` and
+   `agg_radix_scatter_fn` on g0.  The key WatchID (10M distinct, HASH) is
+   now generation 2: enc raw:9702 dict:64.  On P3 it was a generation-0 file.
+   On the same P4 binary, a P3-written g2 (WatchID gen 0) takes 213 ms and a
+   P4-written g2 takes 217.5 ms; the base binary on the P3-written g2 takes
+   213 ms.  About 2 points come from WatchID being encoded, and about 4 points
+   are P3's existing gap.  Nothing in P4's code path runs here: no
+   materialization, no index use.
+3. **Gen-0 splayed warm (C0), q25 1.089** (0.93 -> 1.01 ms, a gap of 0.08 ms
+   over the 0.05 ms floor).  This is Ruling 14-8's class.  A 4-pass recheck
+   of 41 runs gives medians of base 0.96-1.01 and p4 1.00-1.01, with equal
+   minimums.  3000 in-process iterations take 2947 vs 2957 ms (1.003), with
+   identical profiles (`fpk_par_fn_plain`, `fpk_cmp`, `fp_eval_cmp`).
+4. **Gen-0 parted warm (C1 gmean 1.005; R gmean 1.006 and q5 1.052)**.
+   The worst queries are q4 `(avg (at hits 'UserID))` and q5
+   `(count (distinct (at hits 'UserID)))`, at 278 -> 291 ms, plus q6, q7 and
+   q26 at +3-4%.  The cost is parted `at`, the per-element
+   `parted_to_flat_vec` (`ray_alloc` / `ray_free` / `store_typed_elem`),
+   with identical profiles on both binaries.  `perf stat` on q4 gives
+   46.57 G instructions on both (within 0.003%) but cycles +3.9%.  None
+   of these functions changed in P4: `git diff 25eabaf2` touches no file
+   under src/lang or src/mem, nor src/ops/collection.c (`parted_to_flat_vec`)
+   or src/store/part.c (the splay.c change is write-side).  The cause is code or data
+   layout, not P4 logic.
