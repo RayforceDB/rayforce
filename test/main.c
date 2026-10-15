@@ -927,6 +927,7 @@ void ray_test_hooks_off(void) {
     ray_enccol_test_interrupt_after(0);
     ray_enccol_test_parted_mode(0);
     ray_enccol_test_refuse_attach(0);
+    ray_enccol_test_fail_index_parse(false);
     ray_col_test_fail_alloc(0);
     ray_encw_test_force(-1);
     ray_graph_bind_test_fail_alloc(0);

@@ -339,14 +339,15 @@ static test_result_t test_reject_headers(void) {
         BAD(p, 0, "corrupt", "padding before the index region not zero");
     }
     /* an index region shorter than its 80-byte wire root is a truncation; a full
-     * root loads and is a newer build's index at materialization */
+     * 80-byte root loads and fails validation at materialization (the region
+     * holds no padded root, so no child) */
     for (size_t rl = 32; rl <= 80; rl += 48) {
         SAVE(bool_runs(), p);
         size_t prev = chunk_end(0), off = (prev + 31) & ~(size_t)31;
         uint8_t* q = realloc(g_img, off + rl); g_img = q; memset(g_img + prev, 0, off + rl - prev);
         g_len = off + rl; W64(EH + 56, g_len); W8(EH + 6, 1); W64(EH + 32, off);
         if (rl < 80) BAD(p, 0, "corrupt", "index region shorter than its 80-byte root");
-        else         BAD(p, 1, "nyi", "index region needs a newer build");
+        else         BAD(p, 1, "corrupt", "index region shorter than its root");
     }
     /* bytes after the last section */
     SAVE(bool_runs(), p); { size_t n = g_len; g_img = realloc(g_img, n + 8); memset(g_img + n, 0, 8); g_len = n + 8; W64(EH + 56, g_len); }

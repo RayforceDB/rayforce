@@ -288,9 +288,13 @@ void   ray_enccol_test_fail_alloc(int64_t nth);
 void   ray_enccol_test_fail_path(const char* sub);
 /* The fail_alloc counter, for a materialization step outside this file
  * (the index-region parse): true when this allocation is the nth.  It is
- * the counter only: ray_enc_index_parse takes no path, so fail_path does
- * not reach the parse's allocations (it fails only the ones made here). */
+ * the counter only: ray_enc_index_parse takes no path, so fail_path
+ * reaches the parse through the materializer, which checks both hooks
+ * before it validates and parses the region. */
 bool   ray_enccol_test_nth_alloc_fails(void);
+/* Test hook: while set, the index parse of every materialization fails
+ * with "oom" ("column <path>: index parse"); transient, so not cached. */
+void   ray_enccol_test_fail_index_parse(bool on);
 /* interrupt_after: the nth chunk decoded successfully from now on calls
  * ray_request_interrupt() (0 disables), exercising the per-chunk poll. */
 void   ray_enccol_test_interrupt_after(int64_t nth);

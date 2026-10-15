@@ -34,7 +34,11 @@
 #include "store/enccol.h"
 #include "store/encw.h"
 #include "store/col.h"
+#include "table/table.h"   /* ray_table_col_index */
+#include "core/platform.h" /* ray_thread_create */
+#include "mem/cow.h"       /* ray_rc_sync */
 #include <math.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1580,10 +1584,12 @@ static test_result_t test_parse_rejects_view(void) {
 /* ---- the column writer emits the region (Task 5) ---- */
 
 /* The region of a written column file and its enc header, or NULL when the
- * file has none. */
-static uint8_t* ix_file_region(const char* path, size_t* rn, ray_enc_hdr_t* eh) {
-    size_t n; uint8_t* b = ix_slurp(path, &n);
+ * file has none; *fn is the file's size (0 when unreadable), which callers
+ * check against end_off. */
+static uint8_t* ix_file_region(const char* path, size_t* rn, ray_enc_hdr_t* eh, uint64_t* fn) {
+    size_t n = 0; uint8_t* b = ix_slurp(path, &n);
     memset(eh, 0, sizeof *eh);
+    *fn = b ? n : 0;
     if (!b) return NULL;
     if (n < 96) { free(b); return NULL; }
     memcpy(eh, b + 32, 64);
@@ -1605,7 +1611,9 @@ static test_result_t test_file_has_region(void) {
     TEST_ASSERT_EQ_I(ray_col_save_gen(v, p, 2), RAY_OK);
     TEST_ASSERT_EQ_U(ray_col_file_gen(p), 2);
     size_t rn = 0; ray_enc_hdr_t eh;
-    uint8_t* r = ix_file_region(p, &rn, &eh);
+    uint64_t fn = 0;
+    uint8_t* r = ix_file_region(p, &rn, &eh, &fn);
+    TEST_ASSERT_TRUE(fn > 0 && eh.end_off == fn);              /* the header covers the whole file */
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_EQ_I(eh.index_kind, RAY_IDX_HASH);
     TEST_ASSERT_EQ_U(eh.index_off % 32, 0);
@@ -1624,7 +1632,9 @@ static test_result_t test_unique_and_stale(void) {
     ray_index_payload(v->index)->markers |= RAY_MARK_UNIQUE;
     size_t rn = 0, dn = 0; ray_enc_hdr_t eh;
     TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(IDX_TMP "/u"), 2), RAY_OK);
-    uint8_t* r = ix_file_region(ray_test_tmp(IDX_TMP "/u"), &rn, &eh);
+    uint64_t fn = 0;
+    uint8_t* r = ix_file_region(ray_test_tmp(IDX_TMP "/u"), &rn, &eh, &fn);
+    TEST_ASSERT_TRUE(fn > 0 && eh.end_off == fn);              /* the header covers the whole file */
     ray_t* err = NULL; uint8_t* direct = ix_region(v, NULL, 0, &dn, &err);   /* markers are not on the wire */
     bool same = r && direct && rn == dn && memcmp(r, direct, rn) == 0;
     free(r); free(direct);
@@ -1633,7 +1643,8 @@ static test_result_t test_unique_and_stale(void) {
     TEST_ASSERT_EQ_I(eh.col_flags, RAY_ENC_FLAG_UNIQUE);
     ray_index_payload(v->index)->built_for_len = 99;           /* stale */
     TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(IDX_TMP "/s"), 2), RAY_OK);
-    r = ix_file_region(ray_test_tmp(IDX_TMP "/s"), &rn, &eh);
+    r = ix_file_region(ray_test_tmp(IDX_TMP "/s"), &rn, &eh, &fn);
+    TEST_ASSERT_TRUE(fn > 0 && eh.end_off == fn);              /* the header covers the whole file */
     ray_index_payload(v->index)->built_for_len = 100;
     ray_release(v);
     TEST_ASSERT_NULL(r);
@@ -1685,7 +1696,9 @@ static test_result_t test_save_override_kind(void) {
     ray_err_t e = ray_col_save_ctx(&w, ray_test_tmp(IDX_TMP "/o"));
     ray_col_src_release(&w.src);
     size_t rn; ray_enc_hdr_t eh;
-    uint8_t* r = ix_file_region(ray_test_tmp(IDX_TMP "/o"), &rn, &eh);
+    uint64_t fn = 0;
+    uint8_t* r = ix_file_region(ray_test_tmp(IDX_TMP "/o"), &rn, &eh, &fn);
+    TEST_ASSERT_TRUE(fn > 0 && eh.end_off == fn);              /* the header covers the whole file */
     ray_release(v);
     TEST_ASSERT_EQ_I(e, RAY_OK);
     TEST_ASSERT_NULL(r);
@@ -1785,6 +1798,393 @@ static test_result_t test_idx_golden_match(void) {
     PASS();
 }
 
+/* ---- materialization attaches the parsed index (Task 6) ---- */
+
+static void ix_patch(const char* path, long off, const void* b, size_t n) {
+    FILE* f = fopen(path, "r+b"); fseek(f, off, SEEK_SET); fwrite(b, 1, n, f); fclose(f);
+}
+static ray_t* ix_hash_col(int64_t n) {
+    ray_t* v = ray_vec_new(RAY_I64, n); v->len = n;
+    for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(v))[i] = (i * 2654435761u) % 10007;
+    return with_index(v, ray_index_attach_hash);
+}
+/* The enc header of a written column file. */
+static ray_enc_hdr_t ix_hdr(const char* path) {
+    ray_enc_hdr_t eh; memset(&eh, 0, sizeof eh);
+    size_t n; uint8_t* b = ix_slurp(path, &n);
+    if (b && n >= 96) memcpy(&eh, b + 32, 64);
+    free(b);
+    return eh;
+}
+
+/* Spec "Golden fixtures": the reader decodes them.  Each committed
+ * test/data/enc/idx_*.bin validates and parses from its own header (type,
+ * attrs, len, SYM bound) and loads as a column whose materialization
+ * attaches the same index: kind, rows, order name, UNIQUE. */
+static test_result_t test_idx_golden_read(void) {
+    static const struct { const char* name; uint8_t kind; const char* order; bool unique; } fx[] = {
+        { "idx_hash_i64",    RAY_IDX_HASH,  NULL, false }, { "idx_hash_str",  RAY_IDX_HASH,  NULL, false },
+        { "idx_hash_sym",    RAY_IDX_HASH,  NULL, false }, { "idx_sort_i32",  RAY_IDX_SORT,  NULL, false },
+        { "idx_bloom_i64",   RAY_IDX_BLOOM, NULL, false }, { "idx_part_i64",  RAY_IDX_PART,  NULL, false },
+        { "idx_part_f64",    RAY_IDX_PART,  NULL, false }, { "idx_part_sym",  RAY_IDX_PART,  NULL, false },
+        { "idx_part_order",  RAY_IDX_PART,  "ts", false }, { "idx_hash_unique", RAY_IDX_HASH, NULL, true },
+    };
+    size_t nfx = sizeof fx / sizeof fx[0];
+    /* the SYM fixtures record 64 symbols: a process with fewer refuses them */
+    for (int i = 0; i < 64; i++) { char nb[8]; int nn = snprintf(nb, sizeof nb, "g%d", i); (void)ray_sym_intern(nb, (size_t)nn); }
+    for (int i = 0; g_idx_golden[i]; i++) TEST_ASSERT_TRUE((size_t)i < nfx && strcmp(fx[i].name, g_idx_golden[i]) == 0);
+    for (size_t i = 0; i < nfx; i++) {
+        char path[512]; snprintf(path, sizeof path, "%s/%s.bin", IDX_GOLDEN_DIR, fx[i].name);
+        /* the column: loads, materializes, attaches */
+        ray_t* c = ray_col_mmap(path);
+        TEST_ASSERT_FMT(c && !RAY_IS_ERR(c) && c->type == RAY_ENCCOL, "%s: load", fx[i].name);
+        ray_error_clear();
+        ray_t* m = ray_enccol_materialize(c);
+        TEST_ASSERT_FMT(m && !RAY_IS_ERR(m), "%s: %s", fx[i].name, ray_error_msg() ? ray_error_msg() : "?");
+        TEST_ASSERT_FMT(ray_index_kind(m) == fx[i].kind, "%s: attached kind %d", fx[i].name, (int)ray_index_kind(m));
+        ray_index_t* aix = ray_index_payload(m->index);
+        TEST_ASSERT_EQ_I(aix->built_for_len, m->len);
+        TEST_ASSERT_FALSE(aix->markers & RAY_MARK_MMAP);
+        TEST_ASSERT_FMT(((aix->markers & RAY_MARK_UNIQUE) != 0) == fx[i].unique, "%s: UNIQUE", fx[i].name);
+        /* the region alone, from the file's own header */
+        size_t n = 0; uint8_t* b = ix_slurp(path, &n);
+        TEST_ASSERT_TRUE(b && n >= 96);
+        ray_t h; memcpy(&h, b, 32);
+        uint32_t saved; memcpy(&saved, b + offsetof(ray_t, rc), 4);
+        ray_enc_hdr_t eh; memcpy(&eh, b + 32, 64);
+        TEST_ASSERT_TRUE(eh.end_off == n && eh.index_off > 0 && eh.index_off < n);
+        TEST_ASSERT_EQ_I(eh.index_kind, fx[i].kind);
+        TEST_ASSERT_EQ_I(h.type, m->type);
+        TEST_ASSERT_EQ_I(h.len, m->len);
+        ray_enc_idx_view_t iv; ray_t* root = NULL;
+        ray_t* e = ray_enc_index_validate(b + eh.index_off, n - eh.index_off, eh.index_kind, h.type, h.attrs, h.len,
+                                          h.type == RAY_SYM ? saved : 0, ray_data(m), path, &iv);
+        TEST_ASSERT_FMT(e == NULL, "%s: %s", fx[i].name, ray_error_msg() ? ray_error_msg() : "?");
+        e = ray_enc_index_parse(&iv, m, &root);
+        free(b);
+        TEST_ASSERT_FMT(e == NULL && root, "%s: parse", fx[i].name);
+        ray_index_t* pix = ray_index_payload(root);
+        bool ok = pix->kind == fx[i].kind && pix->built_for_len == h.len && pix->parent_type == h.type;
+        int64_t osym = pix->kind == RAY_IDX_PART ? pix->u.part.order_sym
+                     : pix->kind == RAY_IDX_HASH ? pix->u.hash.order_sym : -1;
+        int64_t asym = aix->kind == RAY_IDX_PART ? aix->u.part.order_sym
+                     : aix->kind == RAY_IDX_HASH ? aix->u.hash.order_sym : -1;
+        ray_release(root);
+        TEST_ASSERT_FMT(ok, "%s: parsed root", fx[i].name);
+        TEST_ASSERT_EQ_I(osym, asym);
+        if (fx[i].order) {
+            TEST_ASSERT_TRUE(osym >= 0);
+            ray_t* nm = ray_sym_str(osym);
+            TEST_ASSERT_TRUE(nm && !RAY_IS_ERR(nm) && ray_str_len(nm) == strlen(fx[i].order) &&
+                             memcmp(ray_str_ptr(nm), fx[i].order, ray_str_len(nm)) == 0);
+        } else {
+            TEST_ASSERT_FMT(osym < 0, "%s: order_sym %lld", fx[i].name, (long long)osym);
+        }
+        ray_release(c);
+    }
+    PASS();
+}
+
+static test_result_t test_materialize_attaches(void) {
+    const char* p = ray_test_tmp(IDX_TMP "/m");
+    ray_t* v = ix_hash_col(70000);
+    TEST_ASSERT_NOT_NULL(v);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, p, 2), RAY_OK);
+    ray_t* c = ray_col_mmap(p);
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c) && c->type == RAY_ENCCOL);
+    ray_enc_counters_reset();
+    ray_t* m = ray_enccol_materialize(c);                           /* borrowed */
+    TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m));
+    ray_enc_counters_t k; ray_enc_counters_get(&k);
+    TEST_ASSERT_EQ_U(k.materialized, 1);
+    TEST_ASSERT_EQ_I(ray_index_kind(m), RAY_IDX_HASH);
+    ray_t* sa = ray_index_hash_eq_rowsel(v, 4242);
+    ray_t* sb = ray_index_hash_eq_rowsel(m, 4242);
+    TEST_ASSERT_TRUE(sa && sb && ray_rowsel_meta(sa)->total_pass == ray_rowsel_meta(sb)->total_pass);
+    ray_rowsel_release(sa); ray_rowsel_release(sb);
+    TEST_ASSERT_FALSE(ray_index_payload(m->index)->markers & RAY_MARK_MMAP);
+    TEST_ASSERT_FALSE(ray_index_payload(m->index)->markers & RAY_MARK_UNIQUE);
+    ray_release(c); ray_release(v);
+    PASS();
+}
+
+/* Every region kind round-trips through a file: the materialized column's
+ * index writes the same region as the source's (the wire is normalized),
+ * and SORT / PART / BLOOM probes agree. */
+static test_result_t test_materialize_all_kinds(void) {
+    ray_t* (*const kinds[])(ray_t**) = { ray_index_attach_hash, ray_index_attach_sort,
+                                         ray_index_attach_bloom, ray_index_attach_part };
+    const int want[] = { RAY_IDX_HASH, RAY_IDX_SORT, RAY_IDX_BLOOM, RAY_IDX_PART };
+    static int64_t d[70000];
+    for (int k = 0; k < 4; k++) {
+        for (int i = 0; i < 70000; i++)                 /* PART: ascending value-blocks */
+            d[i] = want[k] == RAY_IDX_PART ? (i / 700) * 3 - 50 : (int64_t)((i * 2654435761u) % 10007) - 5000;
+        const char* p = ray_test_tmp(IDX_TMP "/k");
+        ray_t* v = with_index(i64_vec(d, 70000), kinds[k]);
+        TEST_ASSERT_NOT_NULL(v);
+        TEST_ASSERT_EQ_I(ray_col_save_gen(v, p, 2), RAY_OK);
+        TEST_ASSERT_EQ_I(ix_hdr(p).index_kind, want[k]);
+        ray_t* c = ray_col_mmap(p);
+        TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c) && c->type == RAY_ENCCOL);
+        ray_t* m = ray_enccol_materialize(c);
+        TEST_ASSERT_FMT(m && !RAY_IS_ERR(m), "kind %d: %s", want[k], ray_error_msg() ? ray_error_msg() : "?");
+        TEST_ASSERT_EQ_I(ray_index_kind(m), want[k]);
+        TEST_ASSERT_FALSE(ray_index_payload(m->index)->markers & RAY_MARK_MMAP);
+        size_t na = 0, nb = 0; ray_t* ea = NULL; ray_t* eb = NULL;
+        uint8_t* ra = ix_region(v, NULL, 0, &na, &ea);
+        uint8_t* rb = ix_region(m, NULL, 0, &nb, &eb);
+        bool same = ra && rb && na == nb && memcmp(ra, rb, na) == 0;
+        free(ra); free(rb);
+        if (ea) ray_error_free(ea);
+        if (eb) ray_error_free(eb);
+        TEST_ASSERT_FMT(same, "kind %d: the materialized index differs from the source's", want[k]);
+        TEST_ASSERT_EQ_I(memcmp(ray_data(m), d, sizeof d), 0);
+        ray_release(c); ray_release(v);
+    }
+    PASS();
+}
+
+/* Carry: UNIQUE comes from col_flags and is added by the materializer
+ * after the parse (the parse leaves it to the caller). */
+static test_result_t test_materialize_unique(void) {
+    int64_t d[3000]; for (int i = 0; i < 3000; i++) d[i] = 3000 - i;
+    ray_t* v = with_index(i64_vec(d, 3000), ray_index_attach_hash);
+    TEST_ASSERT_NOT_NULL(v);
+    ray_index_payload(v->index)->markers |= RAY_MARK_UNIQUE;
+    const char* p = ray_test_tmp(IDX_TMP "/uq");
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, p, 2), RAY_OK);
+    ray_enc_hdr_t eh = ix_hdr(p);
+    TEST_ASSERT_EQ_I(eh.index_kind, RAY_IDX_HASH);
+    TEST_ASSERT_EQ_I(eh.col_flags, RAY_ENC_FLAG_UNIQUE);
+    /* the parse alone leaves UNIQUE clear */
+    size_t n; uint8_t* b = ix_slurp(p, &n);
+    TEST_ASSERT_NOT_NULL(b);
+    ray_enc_idx_view_t iv; ray_t* root = NULL;
+    ray_t* e = ray_enc_index_validate(b + eh.index_off, n - eh.index_off, RAY_IDX_HASH, RAY_I64, v->attrs,
+                                      3000, 0, d, p, &iv);
+    TEST_ASSERT_NULL(e);
+    e = ray_enc_index_parse(&iv, v, &root);
+    free(b);
+    TEST_ASSERT_TRUE(!e && root);
+    TEST_ASSERT_FALSE(ray_index_payload(root)->markers & RAY_MARK_UNIQUE);
+    ray_release(root);
+    /* the materializer adds it */
+    ray_t* c = ray_col_mmap(p);
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+    ray_t* m = ray_enccol_materialize(c);
+    TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m));
+    TEST_ASSERT_EQ_I(ray_index_kind(m), RAY_IDX_HASH);
+    TEST_ASSERT_TRUE(ray_index_payload(m->index)->markers & RAY_MARK_UNIQUE);
+    TEST_ASSERT_FALSE(ray_index_payload(m->index)->markers & RAY_MARK_MMAP);
+    ray_release(c); ray_release(v);
+    PASS();
+}
+
+/* Spec "Lazy validation": a malformed region fails materialization (cached,
+ * with the path), not the load. */
+static test_result_t test_corrupt_region_cached(void) {
+    const char* p = ray_test_tmp(IDX_TMP "/c");
+    ray_t* v = ix_hash_col(5000);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, p, 2), RAY_OK);
+    ray_enc_hdr_t eh = ix_hdr(p);
+    TEST_ASSERT_TRUE(eh.index_off != 0);
+    uint8_t bad = 1;
+    ix_patch(p, (long)eh.index_off + 3, &bad, 1);                    /* root reserved byte */
+    ray_t* c = ray_col_mmap(p);
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));                            /* load is fine */
+    ray_enc_counters_reset();
+    for (int i = 0; i < 2; i++) {
+        ray_error_clear();
+        ray_t* m = ray_enccol_materialize(c);
+        TEST_ASSERT_TRUE(m && RAY_IS_ERR(m));
+        TEST_ASSERT_STR_EQ(ray_err_code(m), "corrupt");
+        TEST_ASSERT_TRUE(ray_error_msg() && strstr(ray_error_msg(), p) != NULL);
+        ray_error_free(m);
+    }
+    ray_enc_counters_t k; ray_enc_counters_get(&k);
+    TEST_ASSERT_EQ_U(k.materialized, 0);
+    ray_release(c); ray_release(v);
+    PASS();
+}
+
+/* Spec "Errors": injected allocation failure DURING INDEX PARSING is oom,
+ * not cached, then succeeds; allocator accounting returns to baseline.  The
+ * parse-only hook fails exactly the parse step (P1's nth-allocation hook
+ * would trip at the start of materialization first). */
+static test_result_t test_parse_oom_retry(void) {
+    const char* p = ray_test_tmp(IDX_TMP "/o");
+    ray_t* v = ix_hash_col(3000);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, p, 2), RAY_OK);
+    ray_mem_stats_t m0, m1, m2; ray_mem_stats(&m0);
+    ray_t* c = ray_col_mmap(p);
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+    for (int i = 0; i < 2; i++) {
+        ray_enccol_test_fail_index_parse(true);
+        ray_error_clear();
+        ray_t* r = ray_enccol_materialize(c);
+        ray_enccol_test_fail_index_parse(false);
+        TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+        TEST_ASSERT_STR_EQ(ray_err_code(r), "oom");
+        TEST_ASSERT_TRUE(ray_error_msg() && strstr(ray_error_msg(), "index parse") != NULL);
+        TEST_ASSERT_TRUE(strstr(ray_error_msg(), p) != NULL);
+        ray_error_free(r);
+        /* The first attempt leaves caches owned by the column object (they
+         * go with it, checked below); the second allocates nothing that
+         * outlives it. */
+        if (i == 0) ray_mem_stats(&m1);
+        else { ray_mem_stats(&m2); TEST_ASSERT_EQ_U(m2.bytes_allocated, m1.bytes_allocated); }
+    }
+    ray_t* r = ray_enccol_materialize(c);                           /* not cached: the retry succeeds */
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && ray_index_kind(r) == RAY_IDX_HASH);
+    ray_release(c);
+    ray_mem_stats(&m2);
+    TEST_ASSERT_EQ_U(m2.bytes_allocated, m0.bytes_allocated);       /* the column took everything with it */
+    ray_release(v);
+    PASS();
+}
+
+/* Every allocation of a HASH materialization, the parse's included, fails
+ * in turn: each is oom, not cached, frees what it took; one of them is the
+ * parse's, with the path (the nth hook reaches the parse through
+ * ray_enccol_test_nth_alloc_fails, the path hook through the materializer's
+ * check before it). */
+static test_result_t test_materialize_oom_sweep(void) {
+    const char* p = ray_test_tmp(IDX_TMP "/sw");
+    ray_t* v = ix_hash_col(3000);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, p, 2), RAY_OK);
+    ray_mem_stats_t base, m0, m1; ray_mem_stats(&base);
+    ray_t* c = ray_col_mmap(p);
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+    ray_enccol_test_fail_index_parse(true);                          /* warm the column's caches */
+    ray_t* w = ray_enccol_materialize(c);
+    ray_enccol_test_fail_index_parse(false);
+    TEST_ASSERT_TRUE(w && RAY_IS_ERR(w));
+    ray_error_free(w);
+    ray_mem_stats(&m0);
+    bool parse_hit = false, done = false;
+    for (int64_t nth = 1; nth <= 400 && !done; nth++) {
+        ray_enccol_test_fail_alloc(nth);
+        ray_error_clear();
+        ray_t* r = ray_enccol_materialize(c);
+        ray_enccol_test_fail_alloc(0);
+        if (r && !RAY_IS_ERR(r)) { done = true; TEST_ASSERT_EQ_I(ray_index_kind(r), RAY_IDX_HASH); break; }
+        TEST_ASSERT_TRUE(r != NULL);
+        TEST_ASSERT_FMT(strcmp(ray_err_code(r), "oom") == 0, "nth %lld: %s", (long long)nth, ray_err_code(r));
+        const char* msg = ray_error_msg();
+        if (msg && strstr(msg, "index parse") && strstr(msg, p)) parse_hit = true;
+        ray_error_free(r);
+        ray_mem_stats(&m1);
+        TEST_ASSERT_FMT(m1.bytes_allocated == m0.bytes_allocated, "nth %lld leaked %lld bytes (%s)", (long long)nth,
+                        (long long)m1.bytes_allocated - (long long)m0.bytes_allocated, msg ? msg : "?");
+    }
+    TEST_ASSERT_TRUE(done);
+    TEST_ASSERT_TRUE(parse_hit);
+    ray_release(c);
+    ray_mem_stats(&m1);
+    TEST_ASSERT_EQ_U(m1.bytes_allocated, base.bytes_allocated);
+    /* the path hook fails this column's materialization as oom, not cached */
+    c = ray_col_mmap(p);
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+    ray_enccol_test_fail_path("/sw");
+    ray_t* r = ray_enccol_materialize(c);
+    ray_enccol_test_fail_path(NULL);
+    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+    TEST_ASSERT_STR_EQ(ray_err_code(r), "oom");
+    ray_error_free(r);
+    r = ray_enccol_materialize(c);
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && ray_index_kind(r) == RAY_IDX_HASH);
+    ray_release(c);
+    ray_release(v);
+    PASS();
+}
+
+/* Spec "Lifetime": a column retained from ray_table_col survives the
+ * table, index included. */
+static test_result_t test_retained_index_outlives_table(void) {
+    const char* p = ray_test_tmp(IDX_TMP "/rt");
+    ray_t* v = ix_hash_col(70000);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, p, 2), RAY_OK);
+    ray_t* sa = ray_index_hash_eq_rowsel(v, 4242);
+    TEST_ASSERT_NOT_NULL(sa);
+    int64_t want = ray_rowsel_meta(sa)->total_pass;
+    ray_rowsel_release(sa);
+    ray_release(v);
+    int64_t sym = ray_sym_intern("k", 1);
+    int64_t live = ray_enccol_test_live();
+    ray_mem_stats_t m0, m1; ray_mem_stats(&m0);
+    ray_t* c = ray_col_mmap(p);
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c) && c->type == RAY_ENCCOL);
+    ray_t* tbl = ray_table_add_col(ray_table_new(1), sym, c);
+    ray_release(c);
+    TEST_ASSERT_TRUE(tbl && !RAY_IS_ERR(tbl));
+    ray_t* col = ray_table_col(tbl, sym);                            /* borrowed, materialized */
+    TEST_ASSERT_TRUE(col && !RAY_IS_ERR(col));
+    TEST_ASSERT_EQ_I(ray_index_kind(col), RAY_IDX_HASH);
+    ray_retain(col);
+    ray_release(tbl);                                                /* the table, the column object, the mapping */
+    TEST_ASSERT_EQ_I(ray_enccol_test_live(), live);
+    ray_t* sb = ray_index_hash_eq_rowsel(col, 4242);
+    TEST_ASSERT_NOT_NULL(sb);
+    TEST_ASSERT_EQ_I(ray_rowsel_meta(sb)->total_pass, want);
+    ray_rowsel_release(sb);
+    ray_release(col);
+    ray_mem_stats(&m1);
+    TEST_ASSERT_EQ_U(m1.bytes_allocated, m0.bytes_allocated);
+    PASS();
+}
+
+/* Spec "Concurrency": many threads on one fresh column, one materialization. */
+typedef struct { ray_t* tbl; int64_t sym; ray_t* index; const char* code; int which; } ix_thr_t;
+/* Even threads ask for the index, odd ones for the plain column (spec
+ * "Concurrency": ray_table_col_index and ray_table_col). */
+static void ix_thr(void* p) {
+    ix_thr_t* t = p;
+    ray_rc_sync = true;                      /* thread-local: shared objects, atomic counts */
+    ray_t* e;
+    if (t->which & 1) {
+        ray_t* col = ray_table_col(t->tbl, t->sym);
+        e = (col && RAY_IS_ERR(col)) ? col : NULL;
+        t->index = (col && !RAY_IS_ERR(col)) ? col->index : NULL;
+    } else {
+        e = ray_table_col_index(t->tbl, t->sym, &t->index);
+    }
+    t->code = e ? (ray_err_code(e) && strcmp(ray_err_code(e), "corrupt") == 0 ? "corrupt" : "other") : "";
+    if (e) ray_error_free(e);
+    ray_heap_abandon();
+}
+static test_result_t ix_concurrent(bool corrupt) {
+    const char* p = ray_test_tmp(IDX_TMP "/t");
+    ray_t* v = ix_hash_col(70000);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, p, 2), RAY_OK);
+    if (corrupt) {
+        ray_enc_hdr_t eh = ix_hdr(p);
+        uint8_t bad = 1; ix_patch(p, (long)eh.index_off + 85, &bad, 1);
+    }
+    ray_t* c = ray_col_mmap(p);
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+    int64_t sym = ray_sym_intern("k", 1);
+    ray_t* tbl = ray_table_add_col(ray_table_new(1), sym, c);
+    ray_release(c);
+    ray_enc_counters_reset();
+    ray_thread_t th[8]; ix_thr_t a[8];
+    for (int i = 0; i < 8; i++) { a[i] = (ix_thr_t){ tbl, sym, NULL, NULL, i }; ray_thread_create(&th[i], ix_thr, &a[i]); }
+    for (int i = 0; i < 8; i++) ray_thread_join(th[i]);
+    ray_enc_counters_t k; ray_enc_counters_get(&k);
+    TEST_ASSERT_EQ_U(k.materialized, corrupt ? 0 : 1);
+    for (int i = 0; i < 8; i++) {
+        TEST_ASSERT_STR_EQ(a[i].code, corrupt ? "corrupt" : "");
+        if (!corrupt) TEST_ASSERT_TRUE(a[i].index == a[0].index && a[i].index != NULL);
+    }
+    ray_release(tbl); ray_release(v);
+    PASS();
+}
+static test_result_t test_concurrent_index(void) {
+    test_result_t r = ix_concurrent(false);
+    if (r.status != TEST_PASS) return r;
+    return ix_concurrent(true);
+}
+
+
 const test_entry_t encidx_entries[] = {
     { "idxval/write_hash_layout", test_write_hash_layout, ix_setup, ix_teardown },
     { "idxval/write_name_block",  test_write_name_block,  ix_setup, ix_teardown },
@@ -1818,5 +2218,14 @@ const test_entry_t encidx_entries[] = {
     { "idxval/save_override_kind",      test_save_override_kind,      ix_setup, ix_teardown },
     { "idxval/golden_emit",             test_idx_golden_emit,         ix_setup, ix_teardown },
     { "idxval/golden_match",            test_idx_golden_match,        ix_setup, ix_teardown },
+    { "idxval/materialize_attaches",    test_materialize_attaches,    ix_setup, ix_teardown },
+    { "idxval/materialize_all_kinds",   test_materialize_all_kinds,   ix_setup, ix_teardown },
+    { "idxval/materialize_unique",      test_materialize_unique,      ix_setup, ix_teardown },
+    { "idxval/corrupt_region_cached",   test_corrupt_region_cached,   ix_setup, ix_teardown },
+    { "idxval/parse_oom_retry",         test_parse_oom_retry,         ix_setup, ix_teardown },
+    { "idxval/materialize_oom_sweep",   test_materialize_oom_sweep,   ix_setup, ix_teardown },
+    { "idxval/retained_index_outlives_table", test_retained_index_outlives_table, ix_setup, ix_teardown },
+    { "idxval/concurrent_index",        test_concurrent_index,        ix_setup, ix_teardown },
+    { "idxval/golden_read",             test_idx_golden_read,         ix_setup, ix_teardown },
     { NULL, NULL, NULL, NULL },
 };

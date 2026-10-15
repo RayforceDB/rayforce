@@ -23,6 +23,7 @@
 #include "store/enccol.h"
 #include "store/col.h"
 #include "store/encw.h"          /* ray_encw_type_supported / _summable / _has_dict */
+#include "store/encidx.h"        /* the index region: validate, parse */
 #include "ops/idxop.h"            /* ray_index_kind_admits, ray_idx_lazy_forget */
 #include "lang/format.h"          /* ray_type_name */
 #include "core/platform.h"
@@ -2540,6 +2541,8 @@ static ray_t* enc_str_prepass(ray_enccol_t* e, uint64_t* chunk_pool) {
 
 static _Atomic int g_refuse_attach;
 void ray_enccol_test_refuse_attach(int on) { atomic_store(&g_refuse_attach, on); }
+static _Atomic(bool) g_fail_index_parse;
+void ray_enccol_test_fail_index_parse(bool on) { atomic_store(&g_fail_index_parse, on); }
 
 static double dbl_of(int64_t b) { double d; memcpy(&d, &b, 8); return d; }
 
@@ -2620,9 +2623,13 @@ static ray_t* enc_synth_chunk_zone(ray_enccol_t* e) {
     return root;
 }
 
-/* ZONE / CHUNK_ZONE roots are synthesized from the verified directory and
- * the UNIQUE marker from the column flag; every attach goes through the
- * admission predicate, a refusal is corrupt. */
+/* ZONE / CHUNK_ZONE roots are synthesized from the verified directory;
+ * HASH / SORT / BLOOM / PART roots are parsed from the index region, which
+ * is validated here, on first materialization (spec "Lazy validation"), so
+ * a malformed region fails the materialization and never reads as "no
+ * index".  The UNIQUE marker comes from the column flag (the parse leaves
+ * it to this caller); every attach goes through the admission predicate,
+ * a refusal is corrupt. */
 static ray_t* enc_attach_index(ray_enccol_t* e, ray_t** vp) {
     uint8_t kind = e->hdr.index_kind;
     bool unique = e->hdr.col_flags & RAY_ENC_FLAG_UNIQUE;
@@ -2633,8 +2640,27 @@ static ray_t* enc_attach_index(ray_enccol_t* e, ray_t** vp) {
             return ray_error("corrupt", "column %s: zone index on type %s", e->path, ray_type_name(e->type));
         root = kind == RAY_IDX_ZONE ? enc_synth_zone(e) : enc_synth_chunk_zone(e);
         if (RAY_IS_ERR(root)) return root;
+    } else if (kind == RAY_IDX_HASH || kind == RAY_IDX_SORT || kind == RAY_IDX_BLOOM || kind == RAY_IDX_PART) {
+        if (enc_alloc_fails(e) || atomic_load(&g_fail_index_parse))
+            return ray_error("oom", "column %s: index parse", e->path);
+        ray_enc_idx_view_t iv;
+        ray_t* verr = ray_enc_index_validate(e->base + e->hdr.index_off, e->hdr.end_off - e->hdr.index_off,
+                                             kind, e->type, e->attrs, e->len,
+                                             e->type == RAY_SYM ? e->sym_bound : 0,
+                                             ray_data(*vp), e->path, &iv);
+        if (verr) return verr;
+        ray_t* perr = ray_enc_index_parse(&iv, *vp, &root);
+        if (perr) {
+            /* the parse names no path: keep its code, add the column's */
+            char code[8], msg[200];
+            snprintf(code, sizeof code, "%s", ray_err_code(perr) ? ray_err_code(perr) : "error");
+            const char* m = ray_error_msg();
+            snprintf(msg, sizeof msg, "%s", m ? m : "index parse");
+            ray_error_free(perr);
+            return ray_error(code, "column %s: %s", e->path, msg);
+        }
     } else if (kind != 0) {
-        return ray_error("corrupt", "column %s: index kind %u without a region", e->path, kind);
+        return ray_error("corrupt", "column %s: index kind %u", e->path, kind);
     }
     if (unique) {
         if (!root) {
@@ -2660,11 +2686,6 @@ static ray_t* enc_attach_index(ray_enccol_t* e, ray_t** vp) {
 
 static ray_t* enc_materialize_single(void* ctx, ray_enc_snap_t* fail) {
     ray_enccol_t* e = ctx;
-    uint8_t ik = e->hdr.index_kind;
-    if (ik == 1 || ik == 2 || ik == 4 || ik == 6) {
-        ray_enc_snap_set(fail, "nyi", "column %s: index region needs a newer build", e->path);
-        return NULL;
-    }
     if (ray_interrupted()) { ray_enc_snap_set(fail, "cancel", "column %s: interrupted", e->path); return NULL; }
     if (enc_alloc_fails(e)) { ray_enc_snap_set(fail, "oom", "column %s: materialize", e->path); return NULL; }
     ray_t* vec = e->type == RAY_SYM ? ray_sym_vec_new(e->attrs & RAY_SYM_W_MASK, e->len)
