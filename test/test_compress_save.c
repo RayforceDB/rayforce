@@ -1156,7 +1156,7 @@ static test_result_t test_write_parted_refused(void) {
 static uint8_t col_gen_in(const char* dir, const char* name) {
     char cur[1024], p[1200];
     if (ray_splay_resolve_dir(dir, cur, sizeof cur) != RAY_OK) return 253;
-    snprintf(p, sizeof p, "%s/%s", cur, name);
+    if (snprintf(p, sizeof p, "%s/%s", cur, name) >= (int)sizeof p) return 253;
     return file_gen(p);
 }
 

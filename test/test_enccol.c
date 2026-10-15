@@ -2171,9 +2171,9 @@ static void grow_payload(const char* path) {
     FILE* f = fopen(path, "r+b");
     if (!f) ray_test_fatal("cannot open %s", path);
     uint64_t chunk_bytes, end_off, pb;
-    fseek(f, 96 + 8, SEEK_SET); fread(&chunk_bytes, 8, 1, f);
-    fseek(f, 32 + 56, SEEK_SET); fread(&end_off, 8, 1, f);
-    fseek(f, 160 + 16, SEEK_SET); fread(&pb, 8, 1, f);
+    fseek(f, 96 + 8, SEEK_SET);   if (fread(&chunk_bytes, 8, 1, f) != 1) ray_test_fatal("short read %s", path);
+    fseek(f, 32 + 56, SEEK_SET);  if (fread(&end_off, 8, 1, f) != 1) ray_test_fatal("short read %s", path);
+    fseek(f, 160 + 16, SEEK_SET); if (fread(&pb, 8, 1, f) != 1) ray_test_fatal("short read %s", path);
     chunk_bytes += 8; end_off += 8; pb += 8;
     fseek(f, 96 + 8, SEEK_SET); fwrite(&chunk_bytes, 8, 1, f);
     fseek(f, 32 + 56, SEEK_SET); fwrite(&end_off, 8, 1, f);
@@ -2767,7 +2767,7 @@ static test_result_t test_synth_zone(void) {
         ray_t* z = ray_index_attach_zone(&v);
         TEST_ASSERT_TRUE(z && !RAY_IS_ERR(z));
         v = z;
-        ray_t* keep;
+        ray_t* keep = NULL;
         ray_t* m = save_and_materialize(v, ray_test_tmp(ENCCOL_TMP "/z"), &keep);
         TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m));
         TEST_ASSERT_EQ_I(ray_index_kind(m), RAY_IDX_ZONE);
@@ -2818,7 +2818,7 @@ static test_result_t test_synth_chunk_zone(void) {
         null_rows(v, 65536, 2 * 65536);                           /* chunk 1 all null */
         ray_t* z = ray_index_attach_chunk_zone(&v, 16);
         TEST_ASSERT_TRUE(z && !RAY_IS_ERR(z)); v = z;
-        ray_t* keep;
+        ray_t* keep = NULL;
         ray_t* m = save_and_materialize(v, ray_test_tmp(ENCCOL_TMP "/cz"), &keep);
         TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m));
         TEST_ASSERT_EQ_I(ray_index_kind(m), RAY_IDX_CHUNK_ZONE);
@@ -2838,7 +2838,7 @@ static test_result_t test_unique_flag(void) {
     ray_index_payload(root)->markers = RAY_MARK_UNIQUE;
     ray_t* a = ray_index_attach_persisted(&v, root);
     TEST_ASSERT_TRUE(a && !RAY_IS_ERR(a)); v = a;
-    ray_t* keep;
+    ray_t* keep = NULL;
     ray_t* m = save_and_materialize(v, ray_test_tmp(ENCCOL_TMP "/u"), &keep);
     TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m));
     ray_enccol_t* e = ray_enccol_of(keep);

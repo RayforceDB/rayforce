@@ -146,7 +146,7 @@ static void cleanup_base(const char* base) {
     }
 #else
     snprintf(path, sizeof(path), "rm -f '%s'.*.log 2>/dev/null", base);
-    (void)system(path);
+    if (system(path) != 0) { /* nothing to remove */ }
 #endif
 }
 

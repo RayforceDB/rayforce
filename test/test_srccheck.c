@@ -55,8 +55,12 @@ static void walk(const char* dir, const char* rel, srccheck_acc_t* acc,
     while ((e = readdir(d))) {
         if (e->d_name[0] == '.') continue;
         char p[1024], r[1024];
-        snprintf(p, sizeof p, "%s/%s", dir, e->d_name);
-        snprintf(r, sizeof r, "%s/%s", rel, e->d_name);
+        if (snprintf(p, sizeof p, "%s/%s", dir, e->d_name) >= (int)sizeof p ||
+            snprintf(r, sizeof r, "%s/%s", rel, e->d_name) >= (int)sizeof r) {   /* never skip a file unseen */
+            if (!acc->nbad) snprintf(acc->bad, sizeof acc->bad, "a path under %.400s is too long to check", rel);
+            acc->nbad++;
+            continue;
+        }
         struct stat st;
         if (stat(p, &st) != 0) continue;
         if (S_ISDIR(st.st_mode)) { walk(p, r, acc, fn); continue; }
@@ -72,7 +76,7 @@ static void check_getters(const char* p, const char* rel, srccheck_acc_t* acc) {
     if (strcmp(rel, "src/table/table.c") == 0) { acc->saw_table = true; return; }
     int ln = first_hit(p, needles);
     if (ln) {
-        if (!acc->nbad) snprintf(acc->bad, sizeof acc->bad, "%s:%d uses a legacy getter", rel, ln);
+        if (!acc->nbad && snprintf(acc->bad, sizeof acc->bad, "%s:%d uses a legacy getter", rel, ln) < 0) acc->bad[0] = 0;   /* a long message is cut */
         acc->nbad++;
     }
 }
@@ -308,7 +312,7 @@ static void check_no_table_decode(const char* p, const char* rel, srccheck_acc_t
     if (strcmp(rel, "src/table/table.c") == 0) acc->saw_table = true;
     int ln = first_hit(p, needles);
     if (ln) {
-        if (!acc->nbad) snprintf(acc->bad, sizeof acc->bad, "%s:%d names TABLE_DECODE_OR_RETURN", rel, ln);
+        if (!acc->nbad && snprintf(acc->bad, sizeof acc->bad, "%s:%d names TABLE_DECODE_OR_RETURN", rel, ln) < 0) acc->bad[0] = 0;   /* a long message is cut */
         acc->nbad++;
     }
 }

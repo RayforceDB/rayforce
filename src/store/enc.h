@@ -153,4 +153,20 @@ const char* ray_enc_read_why(void);
 int     ray_enc_train_dict(const uint64_t* v, int64_t n, ray_enc_kind_t k,
                            uint64_t** out, uint32_t* out_n);
 
+/* ---- ALP (src/store/enc_alp.c, compiled with strict IEEE flags) ----
+ * v holds T-bit float patterns (T 32 or 64), n in 1..1024. */
+#define RAY_ENC_ALP_CANDS 5
+typedef struct { uint8_t e, f; } ray_enc_alp_ef_t;
+typedef struct { ray_enc_alp_ef_t c[RAY_ENC_ALP_CANDS]; int n; } ray_enc_alp_cands_t;
+/* Candidates from the filled bit patterns of a column's first chunk
+ * (n values, T 32 or 64): every 32nd value of each 1024-value vector. */
+void    ray_enc_alp_train(const uint64_t* bits, int64_t n, int T, ray_enc_alp_cands_t* out);
+/* Smallest ALP body over the candidates (*best = its index), -1 when there
+ * are none. */
+int64_t ray_enc_alp_size(const uint64_t* v, int n, int T, const ray_enc_alp_cands_t* c, int* best);
+bool    ray_enc_alp_write(const uint64_t* v, int n, int T, uint8_t e, uint8_t f, ray_enc_buf_t* out);
+/* Validates and decodes an ALP body into T-bit patterns; returns the body
+ * bytes or -1 (corrupt). */
+int64_t ray_enc_alp_read(const uint8_t* p, size_t avail, int n, int T, uint64_t* out);
+
 #endif /* RAY_ENC_H */

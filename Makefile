@@ -152,6 +152,15 @@ HARDENED_CFLAGS = -fPIC $(WARNS) -std=$(STD) -O3 -march=$(RAY_MARCH) -g \
 # the whole suite that way.
 NDEBUG_CFLAGS = $(DEBUG_CFLAGS) -DNDEBUG
 
+# Strict IEEE arithmetic for the ALP / ALP_RD codec (compressed-columns P5):
+# its decode is a fixed expression (spec "ALP") and must give the same bits
+# in every build profile, so reassociation, contraction and signed-zero
+# folding are switched off for these objects only.  Applied LAST on each
+# pattern rule's command line, so it overrides the profile's fast-math flags.
+STRICT_FP_CFLAGS := -fno-fast-math -fno-unsafe-math-optimizations -fno-associative-math \
+  -fno-reciprocal-math -fsigned-zeros -ffp-contract=off
+FP_STRICT_src/store/enc_alp := $(STRICT_FP_CFLAGS)
+
 CFLAGS  = $(DEBUG_CFLAGS)
 LDFLAGS = $(DEBUG_LDFLAGS)
 
@@ -176,6 +185,8 @@ HARD_MAIN_OBJ = $(MAIN_SRC:.c=.hard.o)
 NDEBUG_LIB_OBJ  = $(LIB_SRC:.c=.ndebug.o)
 NDEBUG_MAIN_OBJ = $(MAIN_SRC:.c=.ndebug.o)
 NDEBUG_TEST_OBJ = $(TEST_SRC:.c=.ndebug.o)
+RELT_LIB_OBJ  = $(LIB_SRC:.c=.reltest.o)
+RELT_TEST_OBJ = $(TEST_SRC:.c=.reltest.o)
 
 # Auto-generated header dependencies (one .d per .o, see DEPFLAGS).
 # The fragments are -included at the very END of this file — including
@@ -186,37 +197,47 @@ DEPS = $(LIB_OBJ:.o=.d) $(MAIN_OBJ:.o=.d) $(TEST_OBJ:.o=.d) \
        $(FUZZ_LIB_OBJ:.o=.d) \
        $(TSAN_LIB_OBJ:.o=.d) $(TSAN_MAIN_OBJ:.o=.d) $(TSAN_TEST_OBJ:.o=.d) \
        $(HARD_LIB_OBJ:.o=.d) $(HARD_MAIN_OBJ:.o=.d) \
-       $(NDEBUG_LIB_OBJ:.o=.d) $(NDEBUG_MAIN_OBJ:.o=.d) $(NDEBUG_TEST_OBJ:.o=.d)
+       $(NDEBUG_LIB_OBJ:.o=.d) $(NDEBUG_MAIN_OBJ:.o=.d) $(NDEBUG_TEST_OBJ:.o=.d) \
+       $(RELT_LIB_OBJ:.o=.d) $(RELT_TEST_OBJ:.o=.d)
 
 # Default target (pinned so an -included .d fragment can't steal it).
 .DEFAULT_GOAL := default
 default: debug
 
 %.o: %.c
-	$(CC) -c $(CFLAGS) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
+	$(CC) -c $(CFLAGS) $(FP_STRICT_$*) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
 
 %.rel.o: %.c
-	$(CC) -c $(RELEASE_CFLAGS) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
+	$(CC) -c $(RELEASE_CFLAGS) $(FP_STRICT_$*) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
 
 %.fuzz.o: %.c
-	$(CLANG) -c $(FUZZ_CFLAGS) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
+	$(CLANG) -c $(FUZZ_CFLAGS) $(FP_STRICT_$*) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
 
 # TSan objects build with clang: gcc's -Werror=tsan rejects standalone
 # atomic_thread_fence (src/core/platform.h), which clang instruments fine.
 %.tsan.o: %.c
-	$(CLANG) -c $(TSAN_CFLAGS) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
+	$(CLANG) -c $(TSAN_CFLAGS) $(FP_STRICT_$*) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
 
 %.hard.o: %.c
-	$(CC) -c $(HARDENED_CFLAGS) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
+	$(CC) -c $(HARDENED_CFLAGS) $(FP_STRICT_$*) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
 
 %.ndebug.o: %.c
-	$(CC) -c $(NDEBUG_CFLAGS) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
+	$(CC) -c $(NDEBUG_CFLAGS) $(FP_STRICT_$*) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
+
+# The C suite in the RELEASE FP profile (`make test-release`).  Its own object
+# flavour: the release flags plus -DDEBUG, because the suite calls test
+# seams compiled only under DEBUG (platform.h, ipc.h, lang/internal.h);
+# -DDEBUG changes no FP flag.  The codec object gets the strict group as
+# in every flavour; test sources are compiled with strict FP too, so their
+# literals (e.g. -0.0) mean what they say.  No sanitizers.
+%.reltest.o: %.c
+	$(CC) -c $(RELEASE_CFLAGS) -DDEBUG $(FP_STRICT_$*) $(if $(filter test/%,$<),$(STRICT_FP_CFLAGS) -Itest) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
 
 # Sources that embed GIT_HASH (ray_git_commit, the REPL and crash banners,
 # and the test that compares ray_git_commit against it), in every object
 # flavour.
 GIT_HASH_SRCS := src/core/types src/app/repl src/core/crash test/test_types
-GIT_HASH_OBJS := $(foreach v,.o .rel.o .fuzz.o .tsan.o .hard.o .ndebug.o,$(addsuffix $(v),$(GIT_HASH_SRCS)))
+GIT_HASH_OBJS := $(foreach v,.o .rel.o .fuzz.o .tsan.o .hard.o .ndebug.o .reltest.o,$(addsuffix $(v),$(GIT_HASH_SRCS)))
 $(GIT_HASH_OBJS): $(GIT_HASH_STAMP)
 
 # Main binary for debug/test (some tests spawn ./$(TARGET) as a server).
@@ -278,6 +299,12 @@ test-ndebug: $(NDEBUG_LIB_OBJ) $(NDEBUG_MAIN_OBJ) $(NDEBUG_TEST_OBJ)
 	$(CC) $(NDEBUG_CFLAGS) -o $(TARGET) $(NDEBUG_LIB_OBJ) $(NDEBUG_MAIN_OBJ) $(LIBS) $(DEBUG_LDFLAGS)
 	$(CC) $(NDEBUG_CFLAGS) -o $(TARGET).test $(NDEBUG_LIB_OBJ) $(NDEBUG_TEST_OBJ) $(LIBS) $(DEBUG_LDFLAGS) -Itest
 	RAYFORCE_CORES=$(TEST_CORES) ./$(TARGET).test $(TEST_ARGS)
+
+# The suite over the .reltest.o flavour (see its pattern rule).  Does not
+# relink ./$(TARGET): tests that spawn it get whatever build is on disk.
+test-release: $(RELT_LIB_OBJ) $(RELT_TEST_OBJ)
+	$(CC) $(RELEASE_CFLAGS) -o $(TARGET).test.rel $(RELT_LIB_OBJ) $(RELT_TEST_OBJ) $(LIBS) $(RELEASE_LDFLAGS)
+	RAYFORCE_CORES=$(TEST_CORES) ./$(TARGET).test.rel $(TEST_ARGS)
 
 # Multi-GiB generation-2 STR pool limits (spec "Large data").  Needs ~10 GiB
 # of RAM and ~5 GiB of free space under /tmp.
@@ -480,9 +507,10 @@ clean:
 	-rm -f $(LIB_OBJ) $(MAIN_OBJ) $(TEST_OBJ) $(REL_LIB_OBJ) $(REL_MAIN_OBJ)
 	-rm -f $(FUZZ_LIB_OBJ) $(TSAN_LIB_OBJ) $(TSAN_MAIN_OBJ) $(TSAN_TEST_OBJ) \
 	       $(HARD_LIB_OBJ) $(HARD_MAIN_OBJ) \
-	       $(NDEBUG_LIB_OBJ) $(NDEBUG_MAIN_OBJ) $(NDEBUG_TEST_OBJ)
+	       $(NDEBUG_LIB_OBJ) $(NDEBUG_MAIN_OBJ) $(NDEBUG_TEST_OBJ) \
+	       $(RELT_LIB_OBJ) $(RELT_TEST_OBJ)
 	-rm -f $(DEPS)
-	-rm -f $(TARGET) $(TARGET).test lib$(TARGET).a
+	-rm -f $(TARGET) $(TARGET).test $(TARGET).test.rel lib$(TARGET).a
 	-rm -f $(TARGET).tsan $(TARGET).test.tsan
 	-rm -rf build build_release build_fuzz build_compdb dist
 	# Test-generated fixtures (see test/rfl/system/*.rfl) — should not linger after a run.
@@ -491,7 +519,7 @@ clean:
 	-rm -f cov-*.profraw default.profraw coverage.profdata
 	-rm -rf coverage_html
 
-.PHONY: check-wasm32-layout default debug release lib dist test test-ndebug test-large coverage compdb tsan tsan-test hardened fuzz-smoke tidy cppcheck clean
+.PHONY: check-wasm32-layout default debug release lib dist test test-ndebug test-release test-large coverage compdb tsan tsan-test hardened fuzz-smoke tidy cppcheck clean
 
 # Header dependencies last: .d fragments only add prerequisites to the
 # object targets above, and being last they can't hijack the default goal.

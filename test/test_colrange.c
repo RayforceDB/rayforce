@@ -387,12 +387,14 @@ static ray_err_t write_splayed_gen2(const char* dir, ray_t* tbl) {
     ray_t* names = ray_vec_new(RAY_STR, nc);
     for (int64_t c = 0; c < nc; c++) {
         ray_t* nm = ray_sym_str(ray_table_col_name(tbl, c));
-        char p[512]; snprintf(p, sizeof p, "%s/%.*s", dir, (int)ray_str_len(nm), ray_str_ptr(nm));
+        char p[512];
+        if (snprintf(p, sizeof p, "%s/%.*s", dir, (int)ray_str_len(nm), ray_str_ptr(nm)) >= (int)sizeof p) { ray_release(names); return RAY_ERR_IO; }
         ray_err_t e = ray_col_save_gen(ray_table_get_col_idx(tbl, c), p, 2);
         if (e != RAY_OK) { ray_release(names); return e; }
         names = ray_str_vec_append(names, ray_str_ptr(nm), ray_str_len(nm));
     }
-    char p[512]; snprintf(p, sizeof p, "%s/.d", dir);
+    char p[512];
+    if (snprintf(p, sizeof p, "%s/.d", dir) >= (int)sizeof p) { ray_release(names); return RAY_ERR_IO; }
     ray_err_t e = ray_col_save(names, p);
     ray_release(names);
     return e;
