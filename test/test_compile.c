@@ -899,6 +899,29 @@ static test_result_t test_compile_float_literal(void) {
     PASS();
 }
 
+static test_result_t test_compile_signed_zero_constants(void) {
+    const char* const exprs[] = {
+        "(do (set f (fn [] (do 0.0 -0.0))) (f))",
+        "(do (set f (fn [] (do -0.0 0.0))) (f))",
+    };
+    const uint64_t expected[] = { UINT64_C(0x8000000000000000), UINT64_C(0) };
+    for (size_t i = 0; i < sizeof exprs / sizeof exprs[0]; i++) {
+        ray_t* r = ray_eval_str(exprs[i]);
+        if (!r || RAY_IS_ERR(r)) {
+            if (r) ray_error_free(r);
+            FAILF("eval error on signed-zero constant test");
+        }
+        TEST_ASSERT(r->type == -RAY_F64, "expected f64");
+        uint64_t bits;
+        memcpy(&bits, &r->f64, sizeof bits);
+        ray_release(r);
+        TEST_ASSERT_FMT(bits == expected[i],
+                        "signed-zero bits: expected %016llx, got %016llx",
+                        (unsigned long long)expected[i], (unsigned long long)bits);
+    }
+    PASS();
+}
+
 /* ════════════════════════════════════════════════════════════════════
  * 22. find_local hits existing local (returns slot >= 0) — let re-bind
  * ════════════════════════════════════════════════════════════════════ */
@@ -1086,6 +1109,7 @@ const test_entry_t compile_entries[] = {
     { "compile/multi_body_exprs",    test_compile_multi_body_exprs,    compile_setup, compile_teardown },
     { "compile/bool_literal",        test_compile_bool_literal,        compile_setup, compile_teardown },
     { "compile/float_literal",       test_compile_float_literal,       compile_setup, compile_teardown },
+    { "compile/signed_zero_constants", test_compile_signed_zero_constants, compile_setup, compile_teardown },
     { "compile/let_rebind",          test_compile_let_rebind,          compile_setup, compile_teardown },
     { "compile/const_dedup",         test_compile_const_dedup,         compile_setup, compile_teardown },
     { "compile/compile_reset",       test_compile_ray_compile_reset,   compile_setup, compile_teardown },
