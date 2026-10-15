@@ -158,6 +158,19 @@ ray_t* ray_enc_index_validate(const uint8_t* region, uint64_t size, uint8_t kind
                               uint32_t sym_bound, const void* col_data,
                               const char* path, ray_enc_idx_view_t* out);
 
+/* Children copied out of the region by the validation itself (a large
+ * HASH: table, gkeys, offs, rows), for ray_enc_index_parse_copy; owned
+ * heap vectors or NULL.  Every slot is NULL after a validation error. */
+typedef struct { ray_t* hash[4]; } ray_enc_idx_copies_t;
+
+/* ray_enc_index_validate, filling *copies when the checks copied the
+ * children as they read them (the same verdict and errors either way). */
+ray_t* ray_enc_index_validate_copy(const uint8_t* region, uint64_t size, uint8_t kind,
+                                   int8_t parent_type, uint8_t attrs, int64_t len,
+                                   uint32_t sym_bound, const void* col_data,
+                                   const char* path, ray_enc_idx_view_t* out,
+                                   ray_enc_idx_copies_t* copies);
+
 /* A fresh heap RAY_INDEX root from a validated view, every child copied
  * into a heap vector of its slot's type.  SYM PART keys adopt the domain
  * of `vec` (the decoded column); order_name is interned in this process.
@@ -167,6 +180,11 @@ ray_t* ray_enc_index_validate(const uint8_t* region, uint64_t size, uint8_t kind
  * a SYM `vec` is a type error: the view is re-tied to the region before
  * any count sizes an allocation. */
 ray_t* ray_enc_index_parse(const ray_enc_idx_view_t* v, ray_t* vec, ray_t** root_out);
+/* ray_enc_index_parse taking the children *copies holds for the view's
+ * kind and counts in place of copying them; consumes *copies (every slot
+ * is NULL on return, on any path). */
+ray_t* ray_enc_index_parse_copy(const ray_enc_idx_view_t* v, ray_t* vec, ray_t** root_out,
+                                ray_enc_idx_copies_t* copies);
 
 /* order_sym a writer may convert to a name (spec "Writing the index"):
  * the root's HASH / PART order_sym when RAY_MARK_MMAP is clear, else -1. */

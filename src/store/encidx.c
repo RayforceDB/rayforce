@@ -26,6 +26,7 @@
 #include "ops/idxop.h"
 #include "table/sym.h"
 #include "lang/format.h"
+#include "core/pool.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -380,11 +381,302 @@ static int ev_cmp_i64(const void* a, const void* b) {
     int64_t x = *(const int64_t*)a, y = *(const int64_t*)b;
     return (x > y) - (x < y);
 }
+/* a[0..n) sorted ascending as signed integers: LSD radix, 8 passes of a
+ * byte, a pass skipped when every key shares its byte; tmp holds n.  O(n)
+ * on any input. */
+static void ev_radix_i64(int64_t* a, int64_t* tmp, int64_t n) {
+    uint64_t* src = (uint64_t*)a;
+    uint64_t* dst = (uint64_t*)tmp;
+    const uint64_t flip = (uint64_t)1 << 63;       /* signed order as unsigned */
+    for (int sh = 0; sh < 64; sh += 8) {
+        int64_t cnt[256] = { 0 };
+        for (int64_t i = 0; i < n; i++) cnt[((src[i] ^ flip) >> sh) & 0xFF]++;
+        if (cnt[((src[0] ^ flip) >> sh) & 0xFF] == n) continue;
+        int64_t at = 0;
+        for (int d = 0; d < 256; d++) { int64_t c = cnt[d]; cnt[d] = at; at += c; }
+        for (int64_t i = 0; i < n; i++) dst[cnt[((src[i] ^ flip) >> sh) & 0xFF]++] = src[i];
+        uint64_t* t = src; src = dst; dst = t;
+    }
+    if (src != (uint64_t*)a) memcpy(a, src, (size_t)n * sizeof(int64_t));
+}
+
+/* The HASH distinctness check's compare budget, in compares per bucket.  A
+ * key equal to group g's has g's home h, so a probe from h meets every
+ * other group of g's key in [h, p) before p.  The writer's tables (load at
+ * most 1/2) displace about cap / 4 in total; past the budget a forged table
+ * falls back to a sorted copy, so the check stays O(cap + ng) compares
+ * before the fallback and O(ng) after it. */
+#define EV_HASH_DUP_BUDGET 4
+/* Keys of the walk's last buckets, so a short displacement compares
+ * without reading gkeys again. */
+#define EV_HASH_RING 256
+
+/* ===== HASH accept pass on the pool =====
+ *
+ * The same predicate as the serial checks below, run over the pool when
+ * the table is large: a task's verdict is only "holds" or "not sure".  An
+ * accept needs every task to hold; anything else (a violation, a task the
+ * pool skipped on cancel, a failed allocation) reruns the serial checks,
+ * which name the first violation in a fixed order.  So the verdict and its
+ * message never depend on the core count or the task order.
+ *
+ * Two passes, in one dispatch.  The table pass: buckets in walk order
+ * from the empty bucket e0 (walk step j is bucket (e0 + j) & mask, j in
+ * 1 .. cap), cut into spans; a task owns the clusters whose first bucket lies in its span and
+ * walks each to its end, past the span if need be (step cap is e0, empty,
+ * so no cluster wraps).  Per bucket: the group number in range, the SYM
+ * key in the domain, the reachability rule and the distinctness compares
+ * under a per-task budget (past it, not sure).  A group in two buckets has
+ * one key in both, so the distinctness compares find it, and the buckets
+ * then name ng distinct groups exactly when they number ng; STR, which has
+ * no distinctness, marks each group met (an atomic byte).  The group pass:
+ * offs strictly increasing inside [0, nk], each slice's rows in [0, len)
+ * and ascending, every row met once (a bitmap over len rows per worker,
+ * merged without overlap; one shared atomic bitmap when they would not fit
+ * in the region's size). */
+#define EV_PAR_MIN_CAP ((uint64_t)1 << 17)       /* below it, the serial checks */
+#define EV_PAR_SPAN    ((uint64_t)1 << 16)       /* buckets per table task, at least */
+#define EV_PAR_GROUPS  ((int64_t)1 << 14)        /* groups per group task, at least */
+#define EV_PAR_AHEAD   32                         /* buckets the table pass prefetches ahead */
+
+typedef struct {
+    int64_t seen;
+    bool done, bad;
+    char pad[64 - sizeof(int64_t) - 2 * sizeof(bool)];
+} ev_par_res_t;
+
+typedef struct {
+    const uint8_t *tbl, *gk, *of, *rw;
+    uint64_t mask, cap, e0, span;
+    int64_t ng, nk, len, gper;
+    int8_t pt;
+    uint32_t sym_bound;
+    uint8_t* gseen;        /* STR: ng bytes, a group met */
+    uint64_t* rseen;       /* len bits, nbm times: one per worker, or one shared */
+    int64_t nw, nbm;       /* words per bitmap, bitmaps */
+    uint8_t *dtbl, *dgk, *dof, *drw;    /* the children's copies, or NULL */
+    int64_t gkper;         /* gkeys copied per table task */
+    int64_t nt_tbl;        /* tasks [0, nt_tbl) walk the table, the rest the groups */
+    ev_par_res_t* res;
+} ev_par_t;
+
+static void ev_par_table(void* ctx, uint32_t wid, int64_t ti, int64_t te) {
+    (void)wid;
+    ev_par_t* x = ctx;
+    for (int64_t task = ti; task < te; task++) {
+        ev_par_res_t* r = &x->res[task];
+        if (x->dtbl) {      /* this task's share of table and gkeys, in index order */
+            memcpy(x->dtbl + (uint64_t)task * x->span * 8, x->tbl + (uint64_t)task * x->span * 8, (size_t)x->span * 8);
+            int64_t k0 = task * x->gkper, k1 = k0 + x->gkper > x->ng ? x->ng : k0 + x->gkper;
+            if (k1 > k0) memcpy(x->dgk + k0 * 8, x->gk + k0 * 8, (size_t)(k1 - k0) * 8);
+        }
+        uint64_t j0 = 1 + (uint64_t)task * x->span;
+        uint64_t j1 = j0 + x->span > x->cap + 1 ? x->cap + 1 : j0 + x->span;
+        uint64_t mask = x->mask, left = EV_HASH_DUP_BUDGET * (j1 - j0);
+        bool dup = x->pt != RAY_STR && x->ng > 1;
+        int64_t seen = 0;
+        /* the first cluster start in the span: a step after an empty bucket */
+        uint64_t j = j0;
+        while (j < j1 && ev_at(x->tbl, (int64_t)((x->e0 + j - 1) & mask)) != 0) j++;
+        if (j == j1) { r->done = true; continue; }      /* inside a cluster of an earlier span */
+        uint64_t run = 0;
+        bool in_run = false;
+        int64_t ring[EV_HASH_RING];
+        for (; j <= x->cap; j++) {
+            uint64_t p = (x->e0 + j) & mask;
+            int64_t t = ev_at(x->tbl, (int64_t)p);
+            {   /* the group of a bucket further on: its key and mark, ahead of use */
+                int64_t tf = ev_at(x->tbl, (int64_t)((p + EV_PAR_AHEAD) & mask));
+                if (tf > 0 && tf <= x->ng) __builtin_prefetch(x->gk + (uint64_t)(tf - 1) * 8);
+            }
+            if (!t) {
+                if (j + 1 >= j1) break;       /* the next cluster is the next span's */
+                in_run = false;
+                continue;
+            }
+            if (t < 0 || t > x->ng) { r->bad = true; return; }
+            if (x->gseen && __atomic_exchange_n(&x->gseen[t - 1], 1, __ATOMIC_RELAXED)) { r->bad = true; return; }
+            seen++;
+            run = in_run ? run + 1 : 0;
+            in_run = true;
+            int64_t key = ev_at(x->gk, t - 1);
+            if (x->pt == RAY_SYM && (key < 1 || (uint64_t)key >= x->sym_bound)) { r->bad = true; return; }
+            uint64_t d = (p - (ray_index_mix64((uint64_t)key) & mask)) & mask;
+            if (d > run) { r->bad = true; return; }
+            if (dup) {
+                if (d > left) { r->bad = true; return; }    /* the serial checks sort */
+                else {
+                    left -= d;
+                    for (uint64_t q = 1; q <= d; q++) {
+                        int64_t kq = q < EV_HASH_RING ? ring[(j - q) % EV_HASH_RING]
+                                                      : ev_at(x->gk, ev_at(x->tbl, (int64_t)((p - q) & mask)) - 1);
+                        if (kq == key) { r->bad = true; return; }
+                    }
+                }
+            }
+            ring[j % EV_HASH_RING] = key;
+        }
+        r->seen = seen;
+        r->done = true;
+    }
+}
+
+static void ev_par_groups(void* ctx, uint32_t wid, int64_t ti, int64_t te) {
+    ev_par_t* x = ctx;
+    for (int64_t task = ti; task < te; task++) {
+        ev_par_res_t* r = &x->res[task];
+        int64_t g0 = (task - x->nt_tbl) * x->gper, g1 = g0 + x->gper > x->ng ? x->ng : g0 + x->gper;
+        for (int64_t g = g0; g < g1; g++) {
+            int64_t a = ev_at(x->of, g), e = ev_at(x->of, g + 1);
+            if (a < 0 || e <= a || e > x->nk) { r->bad = true; return; }
+            int64_t prev = -1;
+            for (int64_t i = a; i < e; i++) {
+                int64_t row = ev_at(x->rw, i);
+                if (row <= prev || row >= x->len) { r->bad = true; return; }     /* prev >= -1 */
+                prev = row;
+                uint64_t bit = (uint64_t)1 << (row & 63);
+                if (x->nbm == 1) {
+                    if (__atomic_fetch_or(&x->rseen[row >> 6], bit, __ATOMIC_RELAXED) & bit) { r->bad = true; return; }
+                } else {
+                    uint64_t* w = &x->rseen[(int64_t)wid * x->nw + (row >> 6)];
+                    if (*w & bit) { r->bad = true; return; }
+                    *w |= bit;
+                }
+            }
+        }
+        if (x->dof && g1 > g0) {   /* offs[g0, g1) and their rows, now proven in [0, nk] */
+            memcpy(x->dof + g0 * 8, x->of + g0 * 8, (size_t)(g1 - g0) * 8);
+            int64_t a = ev_at(x->of, g0), e = ev_at(x->of, g1);
+            memcpy(x->drw + a * 8, x->rw + a * 8, (size_t)(e - a) * 8);
+        }
+        r->done = true;
+    }
+}
+
+/* One dispatch for both passes (they read disjoint children). */
+static void ev_par_pass(void* ctx, uint32_t wid, int64_t ti, int64_t te) {
+    ev_par_t* x = ctx;
+    for (int64_t task = ti; task < te; task++) {
+        if (task < x->nt_tbl) ev_par_table(ctx, wid, task, task + 1);
+        else ev_par_groups(ctx, wid, task, task + 1);
+    }
+}
+
+/* The per-worker row bitmaps share no bit: words [task * EV_PAR_WORDS, ..). */
+#define EV_PAR_WORDS ((int64_t)1 << 14)
+static void ev_par_merge(void* ctx, uint32_t wid, int64_t ti, int64_t te) {
+    (void)wid;
+    ev_par_t* x = ctx;
+    for (int64_t task = ti; task < te; task++) {
+        int64_t w0 = task * EV_PAR_WORDS, w1 = w0 + EV_PAR_WORDS > x->nw ? x->nw : w0 + EV_PAR_WORDS;
+        for (int64_t w = w0; w < w1; w++) {
+            uint64_t acc = 0;
+            for (int64_t k = 0; k < x->nbm; k++) {
+                uint64_t m = x->rseen[k * x->nw + w];
+                if (acc & m) { x->res[task].bad = true; return; }
+                acc |= m;
+            }
+        }
+        x->res[task].done = true;
+    }
+}
+
+/* An I64 heap vector of n elements for a child's copy; NULL on oom. */
+static ray_t* ev_child_vec(int64_t n) {
+    if (ray_enccol_test_nth_alloc_fails()) return NULL;
+    ray_t* c = ray_vec_new(RAY_I64, n > 0 ? n : 1);
+    if (c && RAY_IS_ERR(c)) { ray_error_free(c); c = NULL; }
+    if (c) c->len = n;
+    return c;
+}
+
+static void ev_copies_drop(ray_enc_idx_copies_t* cp) {
+    for (int i = 0; i < 4; i++) { if (cp->hash[i]) ray_release(cp->hash[i]); cp->hash[i] = NULL; }
+}
+
+/* True when the HASH region holds every rule of the serial checks; false
+ * when it may not (the serial checks then decide).  Called only past the
+ * scalar rules, the layout and the padding checks, on a table of at least
+ * EV_PAR_MIN_CAP buckets whose rows bitmap fits the region (len / 8 < size).
+ * With cp, the children are copied into fresh vectors as they are read
+ * (all four on true, none on false). */
+static bool ev_hash_par_holds(const uint8_t* b, uint64_t size, const ray_enc_idx_hash_t* h, int8_t pt,
+                              int64_t len, uint32_t sym_bound, ray_enc_idx_copies_t* cp) {
+    ray_pool_t* tp = ray_pool_get();
+    uint64_t cap = h->mask + 1;
+    int64_t ng = h->n_groups, nk = h->n_keys;
+    if (!ray_pool_par_dispatch_ok(tp, (int64_t)cap, (int64_t)EV_PAR_MIN_CAP)) return false;
+    ev_par_t x = { .tbl = b + h->table, .gk = b + h->gkeys, .of = b + h->offs, .rw = b + h->rows,
+                   .mask = h->mask, .cap = cap, .ng = ng, .nk = nk, .len = len, .pt = pt,
+                   .sym_bound = sym_bound };
+    if (ev_at(x.of, 0) != 0 || ev_at(x.of, ng) != nk) return false;
+    while (ev_at(x.tbl, (int64_t)x.e0) != 0) {        /* an empty bucket exists: ng < cap */
+        if (++x.e0 == cap) return false;
+    }
+    uint64_t nt_tbl = cap / EV_PAR_SPAN;              /* cap and the span are powers of two */
+    if (nt_tbl > RAY_POOL_INIT_TASKS / 2) nt_tbl = RAY_POOL_INIT_TASKS / 2;
+    x.nt_tbl = (int64_t)nt_tbl;
+    x.span = cap / nt_tbl;
+    x.gkper = (ng + (int64_t)nt_tbl - 1) / (int64_t)nt_tbl;
+    int64_t nt_grp = (ng + EV_PAR_GROUPS - 1) / EV_PAR_GROUPS;
+    if (nt_grp > (int64_t)RAY_POOL_INIT_TASKS / 2) nt_grp = RAY_POOL_INIT_TASKS / 2;
+    if (nt_grp < 1) nt_grp = 1;
+    x.gper = (ng + nt_grp - 1) / nt_grp;
+    int64_t nres = (int64_t)nt_tbl + nt_grp;
+    bool ok = false;
+    if (pt == RAY_STR) x.gseen = ray_calloc_raw((size_t)(ng > 0 ? ng : 1));
+    /* a bitmap per worker when they fit in the region's size, else one
+     * shared bitmap set atomically */
+    x.nw = len / 64 + 1;
+    int64_t nmw = (x.nw + EV_PAR_WORDS - 1) / EV_PAR_WORDS;
+    x.nbm = ray_pool_total_workers(tp);
+    if (nmw > (int64_t)RAY_POOL_INIT_TASKS || (uint64_t)x.nbm * (uint64_t)x.nw > size / 8) x.nbm = 1;
+    if (nmw > nres) nres = nmw;
+    x.rseen = ray_calloc_raw((size_t)x.nbm * (size_t)x.nw * sizeof(uint64_t));
+    x.res = ray_calloc_raw((size_t)nres * sizeof(ev_par_res_t));
+    if ((pt == RAY_STR && !x.gseen) || !x.rseen || !x.res) goto done;
+    if (cp) {   /* the copies the parse takes: table, gkeys, offs, rows */
+        int64_t n[4] = { (int64_t)cap, ng, ng + 1, nk };
+        for (int i = 0; i < 4; i++)
+            if (!(cp->hash[i] = ev_child_vec(n[i]))) goto done;
+        x.dtbl = ray_data(cp->hash[0]); x.dgk = ray_data(cp->hash[1]);
+        x.dof = ray_data(cp->hash[2]); x.drw = ray_data(cp->hash[3]);
+    }
+    ray_pool_dispatch_n(tp, ev_par_pass, &x, (uint32_t)(nt_tbl + (uint64_t)nt_grp));
+    int64_t seen = 0;
+    for (int64_t i = 0; i < (int64_t)nt_tbl + nt_grp; i++) {
+        if (!x.res[i].done || x.res[i].bad) goto done;
+        seen += x.res[i].seen;
+    }
+    if (seen != ng) goto done;
+    if (x.nbm > 1) {
+        memset(x.res, 0, (size_t)nres * sizeof(ev_par_res_t));
+        ray_pool_dispatch_n(tp, ev_par_merge, &x, (uint32_t)nmw);
+        for (int64_t i = 0; i < nmw; i++)
+            if (!x.res[i].done || x.res[i].bad) goto done;
+    }
+    if (cp) memcpy(x.dof + ng * 8, x.of + ng * 8, 8);      /* offs[ng] = nk */
+    ok = true;
+done:
+    if (!ok && cp) ev_copies_drop(cp);
+    ray_free_raw(x.gseen);
+    ray_free_raw(x.rseen);
+    ray_free_raw(x.res);
+    return ok;
+}
 
 ray_t* ray_enc_index_validate(const uint8_t* b, uint64_t size, uint8_t kind,
                               int8_t pt, uint8_t attrs, int64_t len,
                               uint32_t sym_bound, const void* col_data,
                               const char* path, ray_enc_idx_view_t* v) {
+    return ray_enc_index_validate_copy(b, size, kind, pt, attrs, len, sym_bound, col_data, path, v, NULL);
+}
+
+ray_t* ray_enc_index_validate_copy(const uint8_t* b, uint64_t size, uint8_t kind,
+                                   int8_t pt, uint8_t attrs, int64_t len,
+                                   uint32_t sym_bound, const void* col_data,
+                                   const char* path, ray_enc_idx_view_t* v, ray_enc_idx_copies_t* cp) {
+    if (cp) memset(cp, 0, sizeof *cp);
     ray_t* err = NULL;
     uint8_t* bm = NULL;     /* bitmaps and scratch, one at a time; freed at out */
     int64_t* hs = NULL;     /* SYM key hash set / sorted rows */
@@ -497,6 +789,8 @@ ray_t* ray_enc_index_validate(const uint8_t* b, uint64_t size, uint8_t kind,
     case RAY_IDX_HASH: {
         const ray_enc_idx_hash_t* h = &v->hash;
         uint64_t cap = h->mask + 1;
+        if (cap >= EV_PAR_MIN_CAP && (uint64_t)len / 8 < size && ev_hash_par_holds(b, size, h, pt, len, sym_bound, cp))
+            break;
         int64_t ng = h->n_groups, nk = h->n_keys;
         const uint8_t* tbl = b + h->table;
         const uint8_t* gk = b + h->gkeys;
@@ -524,12 +818,23 @@ ray_t* ray_enc_index_validate(const uint8_t* b, uint64_t size, uint8_t kind,
          * in its cluster (0 for the first bucket after an empty one).  The
          * group in bucket p, home h = mix64(gkeys[g]) & mask, is met by a
          * probe from h without crossing an empty bucket iff
-         * (p - h) & mask <= run. */
+         * (p - h) & mask <= run.
+         *
+         * Numeric, temporal and SYM gkeys are distinct, so the probe that
+         * reaches group g meets no other group of its key first and the
+         * lookup returns g (STR words may repeat).  The same walk checks
+         * it: every bucket in [h, p) is in p's run, and a group there of
+         * g's key would have g's home, so comparing g's key with the
+         * buckets in [h, p) over all groups finds any repeated key (the
+         * later of two is displaced past the earlier).  The compares are
+         * bounded by EV_HASH_DUP_BUDGET * cap; past it, a sorted copy. */
+        bool dup_walk = pt != RAY_STR && ng > 1, dup_sort = false;
         {
             uint64_t e0 = 0;
             while (ev_at(tbl, (int64_t)e0) != 0) e0++;           /* seen == ng < cap */
-            uint64_t run = 0;
+            uint64_t run = 0, left = EV_HASH_DUP_BUDGET * cap;    /* cap <= 2^59 */
             bool in_run = false;
+            int64_t ring[EV_HASH_RING];                           /* ring[j % R]: key of walk step j */
             for (uint64_t j = 1; j <= cap; j++) {
                 uint64_t p = (e0 + j) & h->mask;
                 int64_t t = ev_at(tbl, (int64_t)p);
@@ -537,21 +842,34 @@ ray_t* ray_enc_index_validate(const uint8_t* b, uint64_t size, uint8_t kind,
                 run = in_run ? run + 1 : 0;
                 in_run = true;
                 int64_t g = t - 1;
-                uint64_t home = ray_index_mix64((uint64_t)ev_at(gk, g)) & h->mask;
-                if (((p - home) & h->mask) > run) {
+                int64_t key = ev_at(gk, g);
+                uint64_t home = ray_index_mix64((uint64_t)key) & h->mask;
+                uint64_t d = (p - home) & h->mask;
+                if (d > run) {
                     if (pt == RAY_STR) EV("column %s: index HASH STR group %lld unreachable from its word", path, (long long)g);
                     EV("column %s: index HASH lookup of group %lld finds nothing", path, (long long)g);
                 }
+                if (dup_walk) {
+                    if (d > left) { dup_walk = false; dup_sort = true; }
+                    else {
+                        left -= d;
+                        /* buckets p - q, q in [1, d]: walk steps j - q of this run */
+                        for (uint64_t q = 1; q <= d; q++) {
+                            int64_t kq = q < EV_HASH_RING ? ring[(j - q) % EV_HASH_RING]
+                                                          : ev_at(gk, ev_at(tbl, (int64_t)((p - q) & h->mask)) - 1);
+                            if (kq == key)
+                                EV("column %s: index HASH lookup of key %lld finds two groups", path, (long long)key);
+                        }
+                    }
+                }
+                ring[j % EV_HASH_RING] = key;
             }
         }
-        /* Numeric, temporal and SYM: distinct gkeys (a sorted copy), so the
-         * probe that reaches group g meets no other group of its key first
-         * and the lookup returns g.  STR words may repeat. */
-        if (pt != RAY_STR && ng > 1) {
-            hs = ray_alloc_raw((size_t)ng * sizeof(int64_t));    /* ng <= size / 8 */
+        if (dup_sort) {
+            hs = ray_alloc_raw((size_t)ng * 2 * sizeof(int64_t));    /* ng <= size / 8 */
             if (!hs) EV_OOM();
             memcpy(hs, gk, (size_t)ng * sizeof(int64_t));
-            qsort(hs, (size_t)ng, sizeof(int64_t), ev_cmp_i64);
+            ev_radix_i64(hs, hs + ng, ng);
             for (int64_t i = 1; i < ng; i++)
                 if (hs[i] == hs[i - 1]) EV("column %s: index HASH lookup of key %lld finds two groups", path, (long long)hs[i]);
             ray_free_raw(hs); hs = NULL;
@@ -648,6 +966,7 @@ ray_t* ray_enc_index_validate(const uint8_t* b, uint64_t size, uint8_t kind,
 out:
     ray_free_raw(bm);
     ray_free_raw(hs);
+    if (err && cp) ev_copies_drop(cp);
     return err;
 }
 
@@ -666,6 +985,36 @@ static bool ep_span(const ray_enc_idx_view_t* v, int64_t off, int64_t count, uin
            (uint64_t)count <= (v->size - (uint64_t)off) / esz;
 }
 
+static ray_t* ep_parse(const ray_enc_idx_view_t* v, ray_t* vec, ray_t** root_out, ray_enc_idx_copies_t* cp);
+
+/* A large child is copied over the pool in pieces of EP_PIECE bytes (the
+ * copy's page faults are most of its cost); a piece the pool skipped on
+ * cancel is copied here, so the copy is always whole. */
+#define EP_PIECE ((size_t)1 << 20)
+typedef struct { uint8_t* dst; const uint8_t* src; size_t n; _Atomic(bool)* done; } ep_par_copy_t;
+static void ep_copy_piece(void* ctx, uint32_t wid, int64_t i0, int64_t i1) {
+    (void)wid;
+    ep_par_copy_t* x = ctx;
+    for (int64_t i = i0; i < i1; i++) {
+        size_t at = (size_t)i * EP_PIECE, k = x->n - at < EP_PIECE ? x->n - at : EP_PIECE;
+        memcpy(x->dst + at, x->src + at, k);
+        atomic_store_explicit(&x->done[i], true, memory_order_release);
+    }
+}
+static void ep_memcpy(uint8_t* dst, const uint8_t* src, size_t n) {
+    size_t np = (n + EP_PIECE - 1) / EP_PIECE;
+    ray_pool_t* tp = ray_pool_get();
+    _Atomic(bool)* done = NULL;
+    if (np >= 4 && np <= RAY_POOL_INIT_TASKS && ray_pool_par_dispatch_ok(tp, (int64_t)np, 4))
+        done = ray_calloc_raw(np * sizeof *done);
+    if (!done) { memcpy(dst, src, n); return; }
+    ep_par_copy_t x = { dst, src, n, done };
+    ray_pool_dispatch_n(tp, ep_copy_piece, &x, (uint32_t)np);
+    for (size_t i = 0; i < np; i++)
+        if (!atomic_load_explicit(&done[i], memory_order_acquire)) ep_copy_piece(&x, 0, (int64_t)i, (int64_t)i + 1);
+    ray_free_raw(done);
+}
+
 /* A heap vector of `type` holding n elements copied from p; NULL on oom. */
 static ray_t* ep_copy(int8_t type, const uint8_t* p, int64_t n, size_t esz) {
     if (ray_enccol_test_nth_alloc_fails()) return NULL;
@@ -673,11 +1022,32 @@ static ray_t* ep_copy(int8_t type, const uint8_t* p, int64_t n, size_t esz) {
     if (!c) return NULL;
     if (RAY_IS_ERR(c)) { ray_error_free(c); return NULL; }
     c->len = n;
-    if (n) memcpy(ray_data(c), p, (size_t)n * esz);
+    if (n) ep_memcpy(ray_data(c), p, (size_t)n * esz);
     return c;
 }
 
 ray_t* ray_enc_index_parse(const ray_enc_idx_view_t* v, ray_t* vec, ray_t** root_out) {
+    return ray_enc_index_parse_copy(v, vec, root_out, NULL);
+}
+
+/* cp's child when it is the I64 vector of n elements the view names. */
+static ray_t* ep_take(ray_enc_idx_copies_t* cp, int i, int64_t n) {
+    ray_t* c = cp ? cp->hash[i] : NULL;
+    if (!c) return NULL;
+    cp->hash[i] = NULL;
+    if (c->type == RAY_I64 && c->len == n) return c;
+    ray_release(c);
+    return NULL;
+}
+
+ray_t* ray_enc_index_parse_copy(const ray_enc_idx_view_t* v, ray_t* vec, ray_t** root_out,
+                                ray_enc_idx_copies_t* cp) {
+    ray_t* r = ep_parse(v, vec, root_out, cp);
+    if (cp) ev_copies_drop(cp);         /* the copies the parse did not take */
+    return r;
+}
+
+static ray_t* ep_parse(const ray_enc_idx_view_t* v, ray_t* vec, ray_t** root_out, ray_enc_idx_copies_t* cp) {
     *root_out = NULL;
     const uint8_t* b = v->base;
     int kesz = v->kind == RAY_IDX_PART ? ei_key_esz(v->parent_type, v->attrs) : 0;
@@ -726,10 +1096,15 @@ ray_t* ray_enc_index_parse(const ray_enc_idx_view_t* v, ray_t* vec, ray_t** root
     case RAY_IDX_HASH:
         ix->u.hash.mask = v->hash.mask; ix->u.hash.n_keys = v->hash.n_keys;
         ix->u.hash.n_groups = v->hash.n_groups; ix->u.hash.order_sym = -1;
-        ok = (ix->u.hash.table = ep_copy(RAY_I64, b + v->hash.table, (int64_t)(v->hash.mask + 1), 8)) &&
-             (ix->u.hash.gkeys = ep_copy(RAY_I64, b + v->hash.gkeys, v->hash.n_groups, 8)) &&
-             (ix->u.hash.offs  = ep_copy(RAY_I64, b + v->hash.offs, v->hash.n_groups + 1, 8)) &&
-             (ix->u.hash.rows  = ep_copy(RAY_I64, b + v->hash.rows, v->hash.n_keys, 8));
+        /* the validator's copies when it made them, else copied here */
+        ix->u.hash.table = ep_take(cp, 0, (int64_t)(v->hash.mask + 1));
+        ix->u.hash.gkeys = ep_take(cp, 1, v->hash.n_groups);
+        ix->u.hash.offs  = ep_take(cp, 2, v->hash.n_groups + 1);
+        ix->u.hash.rows  = ep_take(cp, 3, v->hash.n_keys);
+        ok = (ix->u.hash.table || (ix->u.hash.table = ep_copy(RAY_I64, b + v->hash.table, (int64_t)(v->hash.mask + 1), 8))) &&
+             (ix->u.hash.gkeys || (ix->u.hash.gkeys = ep_copy(RAY_I64, b + v->hash.gkeys, v->hash.n_groups, 8))) &&
+             (ix->u.hash.offs  || (ix->u.hash.offs  = ep_copy(RAY_I64, b + v->hash.offs, v->hash.n_groups + 1, 8))) &&
+             (ix->u.hash.rows  || (ix->u.hash.rows  = ep_copy(RAY_I64, b + v->hash.rows, v->hash.n_keys, 8)));
         break;
     case RAY_IDX_SORT:
         ok = (ix->u.sort.perm = ep_copy(RAY_I64, b + v->sort.perm, v->len, 8)) != NULL;

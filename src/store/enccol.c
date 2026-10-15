@@ -2645,12 +2645,13 @@ static ray_t* enc_attach_index(ray_enccol_t* e, ray_t** vp) {
         if (enc_alloc_fails(e) || atomic_load(&g_fail_index_parse))
             return ray_error("oom", "column %s: index parse", e->path);
         ray_enc_idx_view_t iv;
-        ray_t* verr = ray_enc_index_validate(e->base + e->hdr.index_off, e->hdr.end_off - e->hdr.index_off,
-                                             kind, e->type, e->attrs, e->len,
-                                             e->type == RAY_SYM ? e->sym_bound : 0,
-                                             ray_data(*vp), e->path, &iv);
+        ray_enc_idx_copies_t cp;      /* children the checks copied as they read them */
+        ray_t* verr = ray_enc_index_validate_copy(e->base + e->hdr.index_off, e->hdr.end_off - e->hdr.index_off,
+                                                  kind, e->type, e->attrs, e->len,
+                                                  e->type == RAY_SYM ? e->sym_bound : 0,
+                                                  ray_data(*vp), e->path, &iv, &cp);
         if (verr) return verr;
-        ray_t* perr = ray_enc_index_parse(&iv, *vp, &root);
+        ray_t* perr = ray_enc_index_parse_copy(&iv, *vp, &root, &cp);
         if (perr) {
             /* the parse names no path: keep its code, add the column's */
             char code[8], msg[200];
