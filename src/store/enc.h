@@ -58,7 +58,10 @@ bool    ray_enc_value_kind(int8_t type, uint8_t attrs, ray_enc_kind_t* k);
 bool    ray_enc_has_bitmap(int8_t type);
 int64_t ray_enc_logical(uint64_t bits, ray_enc_kind_t k);
 /* a < b in kind order; on a float kind this is dictionary order: numeric
- * on the value (F32 widened), -0.0 before +0.0. */
+ * on the value (F32 widened), -0.0 before +0.0.  The float order is defined
+ * on non-NaN values only (a NaN is not ordered, so it breaks a sort or a
+ * binary search): float callers (training, dict_codes, stats) must drop
+ * NaN / null rows first. */
 bool    ray_enc_lt(uint64_t a, uint64_t b, ray_enc_kind_t k);
 
 /* One vector of input: T-bit patterns, null bitmap (bit i set = row i
@@ -142,7 +145,8 @@ int64_t ray_enc_read(const uint8_t* p, size_t avail, uint8_t enc, uint8_t width,
                      const ray_enc_dict_t* dict, uint64_t* out);
 /* Why the last ray_enc_read on this thread failed (diagnostics only). */
 const char* ray_enc_read_why(void);
-/* Distinct sorted values of v in the logical order of k.  Returns 1 =
+/* Distinct sorted values of v in the logical order of k (ray_enc_lt; on a
+ * float kind v must hold no NaN, see ray_enc_lt).  Returns 1 =
  * trained (*out holds *out_n values; free with ray_free_raw), 0 = no
  * dictionary (n <= 0 or more than 1<<16 distinct values), -1 = out of
  * memory.  *out is untouched unless 1 is returned. */
