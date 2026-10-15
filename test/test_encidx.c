@@ -3405,7 +3405,7 @@ static test_result_t test_normalized_domains(void) {
  * a name naming no column disables it and the results stay generation 0's.
  * The key is I64: the as-of index variant needs a right side proven
  * null-free, which a SYM column never is (ray_vec_may_have_nulls), so a SYM
- * key takes no index route on either generation. */
+ * key takes no index route on either generation (#842). */
 static test_result_t test_order_sym_fast_path(void) {
     ray_t* r;
     r = ixr_eval("(set Q (xasc (xasc (table [id ts bid] (list (% (til 3000) 3) (til 3000) (as 'F64 (til 3000)))) ['id 'ts]) ['id 'ts]))");
