@@ -1,0 +1,14 @@
+;; An already ordered select without take can reuse its input table.
+(set Ssp (xasc (table [k v] (list [3 1 2 1] [30 10 20 11])) 'k))
+(at (select {from: Ssp asc: k}) 'v) -- [10 11 20 30]
+(at (select {from: Ssp where: (> v 10) asc: k}) 'v) -- [11 20 30]
+(set Dsp (xdesc Ssp 'k))
+(at (select {from: Dsp desc: k}) 'v) -- [30 20 10 11]
+
+;; Multi-key order uses the same lexicographic check.  A mixed-direction
+;; request and a null-bearing key must still take the general sort path.
+(set Msp (xasc (table [a b v] (list [2 1 1 2] [1 2 1 0] [40 30 20 10])) ['a 'b]))
+(at (select {from: Msp asc: [a b]}) 'v) -- [20 30 10 40]
+(at (select {from: Msp asc: a desc: b}) 'v) -- [30 20 40 10]
+(set Nsp (table [k v] (list (as 'I64 [0N 1 2]) [10 20 30])))
+(at (select {from: Nsp asc: k}) 'v) -- [10 20 30]

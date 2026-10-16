@@ -1,0 +1,18 @@
+;; iterate_typed_peak.rfl — fold, fold-right and the scalar walks of map and
+;; scan box a typed vector's elements one at a time (#823).
+;;
+;; They used to turn the whole vector into a LIST of boxed atoms before the
+;; first call and keep it for the whole walk: about ten times the vector's
+;; memory, even for a builtin with a scalar accumulator.  Measured first in
+;; this file, so the peak counter holds only what these walks cost: the
+;; vector (1.6 MB) plus O(1), well under twice the vector.  Boxed up front, the
+;; peak was ~5x the vector.
+(set X (til 200000))
+(set bound (* 2 (* 8 200000)))
+(fold + 0 X) -- 19999900000
+(< (at (.sys.mem) 'peak-bytes) bound) -- true
+(fold (fn [a i] (+ a i)) 0 X) -- 19999900000
+(< (at (.sys.mem) 'peak-bytes) bound) -- true
+(fold + X) -- 19999900000
+(fold-right + 0 X) -- 19999900000
+(< (at (.sys.mem) 'peak-bytes) bound) -- true
