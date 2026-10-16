@@ -3368,15 +3368,30 @@ static int64_t relieve_cancelled(void) {
     return -1;
 #endif
 }
+
+/* The bytes of file fd past its first page that are dirty in the page cache
+ * (cachestat): those a discard must drop unwritten.  A file system with no
+ * writeback — tmpfs — tags none, its pages owing no write; -1 where the
+ * kernel cannot tell (cachestat is Linux 6.5+). */
+static int64_t relieve_dirty(int fd) {
+    long ps = sysconf(_SC_PAGESIZE);
+    uint64_t pg = ps > 0 ? (uint64_t)ps : 4096;
+    struct { uint64_t off, len; } range = { pg, 0 };      /* len 0: to EOF */
+    struct { uint64_t cache, dirty, writeback, evicted, recently; } cs;
+    if (fd < 0 || syscall(451 /* __NR_cachestat */, fd, &range, &cs, 0) != 0) return -1;
+    return (int64_t)(cs.dirty * pg);
+}
 #endif
 
 /* An empty spill pool parked at a boundary keeps its file and its mapping
  * for the next statement that spills, but its pages — dead data — are
  * discarded: punched out of the file, the dirty ones unwritten (the
- * thread's cancelled writes count them), then reserved again, so the file
- * keeps its disk blocks.  A spill pool still in use keeps its data.  Taken
- * back, the pool serves blocks anew, no pool mapped for them.  An idle event
- * loop does not wake for a parked pool (ray_heap_decay_due_ms). */
+ * thread's cancelled writes count at least the file's dirty pages just
+ * before: none on tmpfs, which writes nothing back), then reserved again,
+ * so the file keeps its disk blocks.  A spill pool still in use keeps its
+ * data.  Taken back, the pool serves blocks anew, no pool mapped for them.
+ * An idle event loop does not wake for a parked pool
+ * (ray_heap_decay_due_ms). */
 static test_result_t test_relieve_spill_discard(void) {
 #if !defined(__linux__)
     SKIP("pages are discarded on Linux only");
@@ -3402,10 +3417,11 @@ static test_result_t test_relieve_spill_discard(void) {
     }
     if (s2) ray_free(s2);
 
+    int64_t dirty = relieve_dirty(fd);
     int64_t c0 = relieve_cancelled();
     ray_heap_set_anon_watermark(INT64_C(1) << 40);
     ray_heap_relieve();                          /* its own spill: no relief */
-    int64_t cw = c0 >= 0 ? relieve_cancelled() - c0 : -1;
+    int64_t cw = c0 >= 0 && dirty >= 0 ? relieve_cancelled() - c0 : -1;
     int64_t n1 = ray_heap_spill_discard_count();
     relieve_far();                               /* the pool still parked */
     bool once = ray_heap_spill_discard_count() == n1;
@@ -3438,7 +3454,7 @@ static test_result_t test_relieve_spill_discard(void) {
     if (i2 < 0) SKIP("the spill directory cannot punch holes");
     TEST_ASSERT(kept, "the emptied spill pool was parked, file and mapping kept");
     if (relieve_mincore()) TEST_ASSERT(res == 0, "its pages were discarded");
-    if (cw >= 0) TEST_ASSERT(cw >= (int64_t)RELIEVE_HALF, "the dirty ones unwritten");
+    if (cw >= 0) TEST_ASSERT(cw >= dirty, "the dirty ones unwritten");
     TEST_ASSERT(reserved, "its file keeps its disk blocks");
     TEST_ASSERT(live, "the spill pool in use kept its data");
     TEST_ASSERT(due > 0, "an idle event loop does not wake for the parked pool");

@@ -39,7 +39,7 @@ Signature: `(.sys.args)`. Returns the process's command-line arguments as a dict
 | `source` | str | — | The file currently being evaluated: the innermost `load`, or the command-line script, by the path that was actually opened. Empty at the REPL, under a pipe, or in a hook or timer that runs outside any file. `file` is the script named on the command line (`$0`); `source` follows nested loads (`$BASH_SOURCE`). |
 | `user` | dict | after `--` | The application's own arguments. |
 
-The top-level schema is **stable** — every launcher key is always present with its effective value (the default when the flag wasn't passed), so `(get (.sys.args) 'port)` never misses. Auth passwords (`-u` / `-U`) are deliberately **not** exposed.
+The top-level schema is **stable** — every launcher key is always present with its effective value (the default when the flag wasn't passed), so `(get (.sys.args) 'port)` never misses. Auth passwords (`-u` / `-U`) and the RAM budget (`-m` / `--mem`) are deliberately **not** exposed; the effective budget is `anon-watermark` in `(.sys.mem)`.
 
 ```lisp
 ;; load a sibling of the running file, whichever directory it was started from

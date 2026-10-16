@@ -1,0 +1,12 @@
+;; The radix top-N path must rank all-null MIN groups as the final sort does.
+;; take: 1025 bypasses the heap and provides the reference order.
+(.sys.exec "rm -rf /tmp/rfl_nullable_min_topn")
+(set K (% (* (til 8000) 7919) 2000))
+(set W (as 'I64 (map (fn [k] (if (< (% k 5) 1) 0Nl (% k 13))) K)))
+(set T (table [s w v] (list (at (as 'SYMBOL (map (fn [j] (format "w%" j)) (til 2000))) K) W (til 8000))))
+(.db.splayed.set "/tmp/rfl_nullable_min_topn/2024.01.01/t/" (take T 4000) "/tmp/rfl_nullable_min_topn/.sym")
+(.db.splayed.set "/tmp/rfl_nullable_min_topn/2024.01.02/t/" (drop T 4000) "/tmp/rfl_nullable_min_topn/.sym")
+(set P (.db.parted.get "/tmp/rfl_nullable_min_topn" 't))
+(at (select {m: (min w) from: P by: {s: s z: (% v 1) t: s} desc: m take: 5}) 'm) -- (at (take (select {m: (min w) from: P by: {s: s z: (% v 1) t: s} desc: m take: 1025}) 5) 'm)
+(at (select {m: (min w) from: P by: {s: s z: (% v 1) t: s} asc: m take: 5}) 'm) -- (at (take (select {m: (min w) from: P by: {s: s z: (% v 1) t: s} asc: m take: 1025}) 5) 'm)
+(.sys.exec "rm -rf /tmp/rfl_nullable_min_topn")

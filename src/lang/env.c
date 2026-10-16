@@ -996,6 +996,33 @@ ray_t* ray_env_get_global(int64_t sym_id) {
     return env_global_lookup(sym_id);
 }
 
+/* True when `leaf` (what ray_env_get returned for the dotted `sym_id`) is
+ * reached through a chain of dicts that nothing else references: the global
+ * head and every dict below it held once, each dict's vals list held once.
+ * A write into the leaf is then seen through this name only, so it needs no
+ * copy and no rebuild of the chain.  The leaf's own count is the caller's to
+ * check.  A flat binding of the dotted name, a local shadowing the head, a
+ * table on the way or any shared level says no. */
+bool ray_env_dotted_sole(int64_t sym_id, ray_t* leaf) {
+    const int64_t* segs;
+    int n = ray_sym_segs(sym_id, &segs);
+    if (n < 2 || !leaf) return false;
+    if (env_lookup_flat_impl(sym_id, NULL, false)) return false;
+
+    ray_t* v = env_global_lookup(segs[0]);
+    for (int i = 1; i < n; i++) {
+        if (!v || v->type != RAY_DICT || v->rc != 1 || v->mmod != 0 ||
+            (v->attrs & (RAY_ATTR_SLICE | RAY_ATTR_ARENA)))
+            return false;
+        ray_t* vals = ray_dict_slots(v)[1];
+        if (!vals || vals->type != RAY_LIST || vals->rc != 1 || vals->mmod != 0 ||
+            (vals->attrs & (RAY_ATTR_SLICE | RAY_ATTR_ARENA)))
+            return false;
+        v = ray_dict_probe_sym_borrowed(v, segs[i]);
+    }
+    return v == leaf;
+}
+
 static ray_t* lookup_top_frame(int64_t sym_id) {
     if (__VM->scope_depth <= 0) return NULL;
     ray_scope_frame_t* f = &__VM->scope_stack[__VM->scope_depth - 1];

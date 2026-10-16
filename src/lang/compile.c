@@ -148,7 +148,8 @@ static int32_t add_constant(compiler_t *c, ray_t *value) {
         if (v == value) return i;
         if (v->type == value->type && ray_is_atom(v)) {
             if (v->type == -RAY_I64 && v->i64 == value->i64) return i;
-            if (v->type == -RAY_F64 && v->f64 == value->f64) return i;
+            if (v->type == -RAY_F64 &&
+                memcmp(&v->f64, &value->f64, sizeof v->f64) == 0) return i;
             if (v->type == -RAY_BOOL && v->b8 == value->b8) return i;
             if (v->type == -RAY_SYM && v->i64 == value->i64 &&
                 v->attrs == value->attrs) return i;

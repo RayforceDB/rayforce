@@ -1326,14 +1326,17 @@ ray_t* ray_alter_fn(ray_t** args, int64_t n) {
          * binding's reference and ours.  The other three exclusions keep the
          * previous behaviour exactly — ray_cow returns an arena block as-is,
          * and a slice or a mapped block is not ours to write through. */
-        /* A dotted name is NOT a candidate.  ray_env_get resolves `d.x` to the
-         * leaf living inside the container, which typically holds the only
-         * reference to it — so the leaf passes an rc test that says nothing
-         * about whether the CONTAINER is shared.  Writing through it would be
-         * seen by every alias of the dict or table, and env_set_dotted's
-         * COW-rebuild of the chain cannot undo a write that already
-         * happened.  The copy is what made that safe. */
-        bool sole = !ray_sym_is_dotted(name_sym->i64) &&
+        /* A dotted name is a candidate only when the whole chain is ours.
+         * ray_env_get resolves `d.x` to the leaf living inside the container,
+         * which typically holds the only reference to it — so the leaf passes
+         * an rc test that says nothing about whether the CONTAINER is shared.
+         * Writing through it would be seen by every alias of the dict or
+         * table, and env_set_dotted's COW-rebuild of the chain cannot undo a
+         * write that already happened.  ray_env_dotted_sole checks every dict
+         * on the path (and its vals list) is held once; a table head, a
+         * shadowed head or any shared level keeps the copy. */
+        bool dotted = ray_sym_is_dotted(name_sym->i64);
+        bool sole = (!dotted || ray_env_dotted_sole(name_sym->i64, var)) &&
                     var->rc == 2 && var->mmod == 0 &&
                     !(var->attrs & (RAY_ATTR_SLICE | RAY_ATTR_ARENA));
         ray_t* cow_result = sole ? var : ray_cow(var);
@@ -1414,7 +1417,10 @@ ray_t* ray_alter_fn(ray_t** args, int64_t n) {
             ray_release(idx);
         }
         ray_release(val);
-        ray_env_set(name_sym->i64, var);
+        /* A dotted leaf written in place is already where the chain points;
+         * rebinding it would only copy each dict on the way up.  The index
+         * drop above may still have copied it, and that copy must be bound. */
+        if (!(dotted && sole && var == original_var)) ray_env_set(name_sym->i64, var);
         /* The retain-first at the top of the set path gave us an owning
          * ref to var; ray_env_set retained its own for the binding, so
          * drop ours.  In-place amend returns the symbol, not the value. */
