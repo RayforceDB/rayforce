@@ -11678,8 +11678,12 @@ static bool parted_clauses_plain(ray_t* dict, ray_t* tbl);
  * clause names, in the table's order; the whole table when a clause runs
  * code whose column reads it does not show.  When the clauses name no
  * column, the whole table too, unless `keep_unread`: then `tbl` itself,
- * retained, since nothing in the select reads a column of it. */
-static ray_t* parted_flatten_read_cols(ray_t* dict, ray_t* tbl, bool keep_unread) {
+ * retained, since nothing in the select reads a column of it.  `also`, a
+ * symbol or symbol vector or NULL, names columns kept beside those: the
+ * group keys a by-dict has added under their aliases, which no clause
+ * names. */
+static ray_t* parted_flatten_read_cols(ray_t* dict, ray_t* tbl, bool keep_unread,
+                                       ray_t* also) {
     int64_t nc = ray_table_ncols(tbl);
     ray_t* keys = ray_dict_keys(dict);
     ray_t* vals = ray_dict_vals(dict);
@@ -11689,6 +11693,13 @@ static ray_t* parted_flatten_read_cols(ray_t* dict, ray_t* tbl, bool keep_unread
     int64_t id_from = ray_sym_intern("from", 4);
     int64_t refs[256];
     int nref = 0;
+    int64_t nalso = also && also->type == -RAY_SYM ? 1 : (also && also->type == RAY_SYM ? also->len : 0);
+    for (int64_t j = 0; j < nalso; j++) {
+        int64_t s = also->type == -RAY_SYM ? also->i64 : sym_cell_runtime_id(also, j);
+        bool seen = false;
+        for (int r = 0; r < nref; r++) seen |= refs[r] == s;
+        if (!seen && nref < 256 && ray_table_get_col(tbl, s)) refs[nref++] = s;
+    }
     for (int64_t i = 0; i < ray_dict_len(dict); i++) {
         if (sym_cell_runtime_id(keys, i) == id_from) continue;
         ray_t* v = ((ray_t**)ray_data(vals))[i];
@@ -11800,7 +11811,7 @@ static ray_t* select_plan_computed_key(ray_t* dict, ray_t* tbl, int64_t* key_nam
                     any_out = !rsv;
                 }
                 if (!any_out) { ray_release(base); return NULL; }
-                ray_t* flat = parted_flatten_read_cols(dict, base, false);
+                ray_t* flat = parted_flatten_read_cols(dict, base, false, NULL);
                 ray_release(base);
                 if (!flat || RAY_IS_ERR(flat)) return flat ? flat : ray_error("oom", NULL);
                 base = flat;
@@ -13575,7 +13586,7 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
                 if (pg) ray_graph_free(pg);
             }
             if (unlowered) {
-                ray_t* flat = n_out > 0 ? parted_flatten_read_cols(dict, tbl, false)
+                ray_t* flat = n_out > 0 ? parted_flatten_read_cols(dict, tbl, false, NULL)
                                         : query_materialize_parted_table(tbl);
                 ray_release(tbl);
                 if (!flat || RAY_IS_ERR(flat)) {
@@ -14409,22 +14420,24 @@ by_dict_done:
             } else {
                 ray_graph_free(g); g = NULL;
             }
-            if (by_key_sym < 0 && by_expr->type == RAY_SYM && ray_len(by_expr) > 1) {
-                /* The composite path reads key and output cells row by row,
-                 * which a parted column does not serve.  A where: hands back
-                 * a flattened copy of the rows it keeps; when the table
-                 * reaches here as is, flatten the columns the clauses read;
-                 * with no outputs every column is read (first of each group
-                 * below), so the whole table is flattened. */
-                if (eval_tbl == tbl && table_has_parted_columns(tbl)) {
-                    ray_t* flat = n_out > 0 ? parted_flatten_read_cols(dict, tbl, false)
-                                            : query_materialize_parted_table(tbl);
-                    if (!flat || RAY_IS_ERR(flat)) {
-                        ray_release(tbl);
-                        scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return flat ? flat : ray_error("oom", NULL);
-                    }
-                    eval_tbl = flat;
+            /* Eval-level grouping, composite or single-key, reads key and
+             * output cells row by row, which a parted column does not
+             * serve.  A where: hands back a flattened copy of the rows it
+             * keeps; when the table reaches here as is, flatten the columns
+             * the clauses read and the keys (a by-dict key is a column
+             * under its alias, which no clause names); with no outputs
+             * every column is read (first of each group below), so the
+             * whole table is flattened. */
+            if (eval_tbl == tbl && table_has_parted_columns(tbl)) {
+                ray_t* flat = n_out > 0 ? parted_flatten_read_cols(dict, tbl, false, by_expr)
+                                        : query_materialize_parted_table(tbl);
+                if (!flat || RAY_IS_ERR(flat)) {
+                    ray_release(tbl);
+                    scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return flat ? flat : ray_error("oom", NULL);
                 }
+                eval_tbl = flat;
+            }
+            if (by_key_sym < 0 && by_expr->type == RAY_SYM && ray_len(by_expr) > 1) {
                 int64_t nk = ray_len(by_expr);
                 int64_t* key_syms = (int64_t*)ray_data(by_expr);
                 int64_t nrows = ray_table_nrows(eval_tbl);
@@ -14518,15 +14531,22 @@ by_dict_done:
                  * the routing change above, every all-count-agg >1-key by:
                  * answers through the parallel DAG/v2 path instead (see
                  * test/rfl/query/width_matrix.rfl's ROUTING NOTE on the `rmk`
-                 * cell). The only remaining trigger into this block is a
-                 * RAY_LIST-typed by-key column, which hits a pre-existing
-                 * vec_new(LIST) bug building the key output column. Left in
-                 * place — not correctness-load-bearing — pending a follow-up
-                 * that either fixes the LIST-key case or deletes this block. */
+                 * cell). The only remaining trigger into this block was a
+                 * RAY_LIST-typed by-key column, whose cells the int64 key
+                 * reader does not hold (the key column then failed in
+                 * vec_new): a key it cannot read leaves the shape to the
+                 * composite path below.  Left in place — not
+                 * correctness-load-bearing — pending a follow-up that
+                 * deletes this block. */
                 int64_t pre_take_groups = nrows;
                 bool has_pre_take = unsorted_positive_take_limit(
                     dict_elems, dict_n, asc_id, desc_id, take_id,
                     nrows, &pre_take_groups);
+                for (int64_t k = 0; k < nk && has_pre_take; k++) {
+                    int8_t pkt = query_col_base_type(key_cols[k]);
+                    if (pkt == RAY_LIST || pkt == RAY_STR || pkt == RAY_GUID)
+                        has_pre_take = false;
+                }
                 if (has_pre_take && pre_take_groups <= 1024) {
                     /* Per-key reader and per-output name buffers carved to the
                      * exact key / output counts (no fixed slot cap).  Both live
@@ -14990,6 +15010,16 @@ by_dict_done:
                             const char* sp = cell ? ray_str_ptr(cell) : "";
                             size_t slen = cell ? ray_str_len(cell) : 0;
                             key_vec = ray_str_vec_append(key_vec, sp ? sp : "", sp ? slen : 0);
+                        }
+                    } else if (kt == RAY_LIST) {
+                        /* A LIST key's cells are the source's items: the key
+                         * column lists them (no typed vector holds them). */
+                        key_vec = ray_list_new(out_groups);
+                        for (int64_t gi = 0; gi < out_groups && key_vec && !RAY_IS_ERR(key_vec); gi++) {
+                            ray_t* row_key = grp_items[gi * 2];
+                            ray_t* cell = (row_key && row_key->type == RAY_LIST && k < row_key->len)
+                                        ? ((ray_t**)ray_data(row_key))[k] : NULL;
+                            key_vec = ray_list_append(key_vec, cell ? cell : RAY_NULL_OBJ);
                         }
                     } else {
                         /* The composite cells are SYM atoms (runtime ids,
@@ -17175,7 +17205,7 @@ by_dict_done:
                      * the parted table: its columns are bound as they are
                      * (bind_all_columns in eval_expr_whole_column_impl),
                      * but nothing reads one, so none is materialised. */
-                    eval_tbl = parted_flatten_read_cols(dict, tbl, true);
+                    eval_tbl = parted_flatten_read_cols(dict, tbl, true, NULL);
                     if (!eval_tbl || RAY_IS_ERR(eval_tbl)) {
                         ray_graph_free(g); ray_release(tbl);
                         scratch_free(sagg_hdr);
