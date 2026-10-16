@@ -14730,7 +14730,10 @@ ht_path:;
         int8_t agg_slot = ght_layout.agg_val_slot[ai];
         topn_order_ok = true;
         if (order_op == OP_SUM) {
-            if (agg_slot < 0 || order_is_f64) topn_order_ok = false;
+            /* The heap sees the raw sum, before bias * group_count is added. */
+            if (agg_slot < 0 || order_is_f64 ||
+                (agg_affine[ai].enabled && agg_affine[ai].bias_i64 != 0))
+                topn_order_ok = false;
             else topn_order_off = (uint16_t)(ght_layout.off_sum
                                              + (uint16_t)agg_slot * 8u);
         } else if (order_op == OP_MIN) {

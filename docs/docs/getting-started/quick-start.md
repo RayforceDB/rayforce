@@ -6,7 +6,8 @@ Build Rayforce from source, start the Rayfall REPL, and run your first query in 
 
 Rayforce is a pure C library with zero external dependencies. You need:
 
-- A **C compiler** — GCC 7+ or Clang 6+
+- A **C compiler** — Clang 6+ or GCC 7+. `make` uses `clang` when `CC` is not set;
+  `make CC=gcc` (or `CC=gcc` in the environment) builds with GCC
 - **GNU Make**
 - **POSIX environment** (Linux, macOS, WSL)
 

@@ -3667,6 +3667,29 @@ ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit) {
         }
     }
 
+    /* With no take, an already ordered table needs no permutation or
+     * gather.  The shared check rejects null-bearing and unsupported key
+     * types; mixed directions still require the general comparator. */
+    if (limit <= 0 && n_sort > 0 && !table_has_parted_col(tbl) &&
+        (!g || !g->selection)) {
+        uint8_t descending = ext->sort.desc ? ext->sort.desc[0] : 0;
+        bool uniform = ray_is_vec(sort_vecs[0]) && sort_vecs[0]->len == nrows;
+        for (uint32_t k = 1; k < n_sort && uniform; k++)
+            if (!ray_is_vec(sort_vecs[k]) || sort_vecs[k]->len != nrows ||
+                (ext->sort.desc ? ext->sort.desc[k] : 0) != descending) {
+                uniform = false;
+                break;
+            }
+        if (uniform && ray_key_cols_sorted(sort_vecs, n_sort, descending, nrows) &&
+            !pool_cancelled(ray_pool_get())) {
+            for (uint32_t k = 0; k < n_sort; k++)
+                if (sort_owned[k]) ray_release(sort_vecs[k]);
+            scratch_free(sort_hdr);
+            ray_retain(tbl);
+            return tbl;
+        }
+    }
+
     /* ---- Sort-index permutation reuse ----
      * When there is exactly one ascending sort key that is a direct column
      * scan and that column carries a fresh, null-free sort index, reuse the
