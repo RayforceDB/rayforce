@@ -3138,6 +3138,9 @@ timeit (1.157) and wall (1.163) ratios; it is still the only query over
 1.05, and it is accepted as a recorded deviation (Ruling 8b-1).  No row
 prints CHECK.
 
+The writer is unchanged by 8b: save g2 p5 / base 20.446, save g0 p5 / base
+0.709 (summary.txt of the 8b run).
+
 **The floor (q8).**  q8 is the only query over 1.05.  g0's group is
 compute-bound in the dense aggregation (`sum_f64_update`, `count_update`,
 `agg_dense_phaseA_fn`: 85% of its cycles).  g2 runs the same aggregation
