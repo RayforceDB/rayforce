@@ -13790,7 +13790,6 @@ da_path:;
                 .rowsel      = rowsel,
                 .da_n_scan   = n_scan,
             };
-            /* Pin each SYM agg column's vocabulary once for the accumulate. */
             /* strlen-on-STR: resolve each column's descriptors once. */
             const ray_str_t* da_agg_str[vla_aggs];
             for (uint32_t a = 0; a < n_aggs; a++) {
@@ -13812,6 +13811,7 @@ da_path:;
                 }
                 if (sl_ok && one >= 0) da_ctx.sl_agg = one;
             }
+            /* Pin each SYM agg column's vocabulary once for the accumulate. */
             ray_t* agg_raw_hdr = NULL;
             if (n_aggs > 0) {
                 char* rm = (char*)scratch_calloc(&agg_raw_hdr,
