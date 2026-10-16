@@ -1058,6 +1058,35 @@ ray_t* ray_apply_fn(ray_t** args, int64_t n) {
  * Collection operations
  * ══════════════════════════════════════════ */
 
+/* atom_eq for a column of a table / dict cell.  A SYM column is read at
+ * its storage width (the vector branch reads 8 bytes a cell) and compared
+ * by text across domains; a STR column by content (a descriptor holds a
+ * pool offset and a cached hash).  Other columns take atom_eq. */
+static int atom_eq_cell_col(ray_t* a, ray_t* b) {
+    if (a->type != b->type || a->len != b->len ||
+        (a->type != RAY_SYM && a->type != RAY_STR))
+        return atom_eq(a, b);
+    if (a->type == RAY_STR) {
+        for (int64_t i = 0; i < a->len; i++) {
+            size_t la = 0, lb = 0;
+            const char* sa = ray_str_vec_get(a, i, &la);
+            const char* sb = ray_str_vec_get(b, i, &lb);
+            if (la != lb || (la && memcmp(sa, sb, la) != 0)) return 0;
+        }
+        return 1;
+    }
+    bool same_dom = ray_sym_vec_domain(a) == ray_sym_vec_domain(b);
+    for (int64_t i = 0; i < a->len; i++) {
+        if (same_dom) {
+            if (ray_read_sym(ray_data(a), i, RAY_SYM, a->attrs) !=
+                ray_read_sym(ray_data(b), i, RAY_SYM, b->attrs)) return 0;
+        } else if (ray_str_cmp(ray_sym_vec_cell(a, i), ray_sym_vec_cell(b, i)) != 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 /* Helper: compare two atoms for equality (value-based) */
 int atom_eq(ray_t* a, ray_t* b) {
     int a_null = RAY_ATOM_IS_NULL(a);
@@ -1113,6 +1142,30 @@ int atom_eq(ray_t* a, ray_t* b) {
             if (!atom_eq(ea[i], eb[i])) return 0;
         }
         return 1;
+    }
+    case RAY_TABLE: {
+        /* Same column names in order and equal columns.  The vector branch
+         * below compares len * elem_size bytes, zero for a table, so every
+         * pair of same-length tables compared equal (one group for all). */
+        int64_t nc = ray_table_ncols(a);
+        if (nc != ray_table_ncols(b) || ray_table_nrows(a) != ray_table_nrows(b))
+            return 0;
+        for (int64_t c = 0; c < nc; c++) {
+            if (ray_table_col_name(a, c) != ray_table_col_name(b, c)) return 0;
+            ray_t* ca = ray_table_get_col_idx(a, c);
+            ray_t* cb = ray_table_get_col_idx(b, c);
+            if (!ca || !cb) { if (ca != cb) return 0; continue; }
+            if (!atom_eq_cell_col(ca, cb)) return 0;
+        }
+        return 1;
+    }
+    case RAY_DICT: {
+        /* Equal keys and equal values, position by position (the vector
+         * branch saw every pair of same-length dicts as equal too). */
+        ray_t* ka = ray_dict_keys(a); ray_t* kb = ray_dict_keys(b);
+        ray_t* va = ray_dict_vals(a); ray_t* vb = ray_dict_vals(b);
+        if (!ka || !kb || !va || !vb) return ka == kb && va == vb;
+        return atom_eq_cell_col(ka, kb) && atom_eq_cell_col(va, vb);
     }
     default:
         /* Vector equality: same type and length, element-wise comparison */
