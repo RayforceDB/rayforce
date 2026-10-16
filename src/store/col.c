@@ -319,6 +319,7 @@ static ray_t* col_load_str_vec(const uint8_t* ptr, size_t remaining) {
  *   atoms (type < 0):
  *     -RAY_STR: [4B len][data bytes]
  *     -RAY_SYM: [4B len][data bytes]   (resolved string; load re-interns)
+ *     -RAY_GUID: [16B value]
  *     other:       [8B raw value]
  *   RAY_SYM vector: [8B len][per cell: 4B len + data bytes]
  *   other vectors with is_serializable_type: [8B len][raw data]
@@ -352,6 +353,12 @@ static ray_err_t col_write_recursive(ray_t* obj, FILE* f) {
             uint32_t len32 = (uint32_t)slen;
             if (fwrite(&len32, 4, 1, f) != 1) return RAY_ERR_IO;
             if (slen > 0 && fwrite(sp, 1, slen, f) != slen) return RAY_ERR_IO;
+        } else if (type == -RAY_GUID) {
+            /* GUID atoms hold their 16 bytes behind obj: write the value,
+             * never the pointer (a NULL obj is the null GUID). */
+            static const uint8_t null_guid[16] = {0};
+            const uint8_t* b = obj->obj ? (const uint8_t*)ray_data(obj->obj) : null_guid;
+            if (fwrite(b, 1, 16, f) != 16) return RAY_ERR_IO;
         } else {
             /* Fixed-size atom: write 8 bytes of the value union */
             if (fwrite(&obj->i64, 8, 1, f) != 1) return RAY_ERR_IO;
@@ -462,6 +469,14 @@ static ray_t* col_read_recursive(const uint8_t** pp, size_t* remaining) {
             ray_t* s = ray_str((const char*)*pp, (size_t)slen);
             *pp += slen; *remaining -= slen;
             return s;
+        } else if (type == -RAY_GUID) {
+            /* GUID atom: its 16-byte value.  Files written before this
+             * held a process pointer here and were never readable. */
+            if (*remaining < 16) return ray_error("corrupt", NULL);
+            uint8_t gb[16];
+            memcpy(gb, *pp, 16);
+            *pp += 16; *remaining -= 16;
+            return ray_guid(gb);
         } else {
             /* Fixed atom: 8 bytes */
             if (*remaining < 8) return ray_error("corrupt", NULL);
@@ -527,11 +542,22 @@ static ray_t* col_read_recursive(const uint8_t** pp, size_t* remaining) {
         size_t data_size = (size_t)len * esz;
         if (data_size > *remaining) return ray_error("corrupt", NULL);
 
-        ray_t* vec = ray_vec_new(type, len);
-        if (!vec || RAY_IS_ERR(vec)) return vec;
-        vec->len = len;
-        if (data_size > 0)
-            memcpy(ray_data(vec), *pp, data_size);
+        /* The nested format carries no attrs for fixed-width vectors, so
+         * their HAS_NULLS is rebuilt from the sentinels — the source of
+         * truth — by ray_vec_from_raw's construction scan.  Without it a
+         * null cell loaded as plain data (`[0N 2]` read back as
+         * `[-9223372036854775808 2]`). */
+        ray_t* vec;
+        if (type == RAY_STR) {
+            vec = ray_vec_new(type, len);
+            if (!vec || RAY_IS_ERR(vec)) return vec;
+            vec->len = len;
+            if (data_size > 0)
+                memcpy(ray_data(vec), *pp, data_size);
+        } else {
+            vec = ray_vec_from_raw(type, *pp, len);
+            if (!vec || RAY_IS_ERR(vec)) return vec;
+        }
         *pp += data_size; *remaining -= data_size;
 
         if (type == RAY_STR) {

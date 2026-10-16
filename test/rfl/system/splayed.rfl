@@ -60,3 +60,73 @@
 (count (.db.parted.get "/tmp/rfl_parted/" 't)) -- 10
 ;; column count = 1 partition-key + 2 data columns
 (count (key (.db.parted.get "/tmp/rfl_parted/" 't))) -- 3
+
+;; ────────────── LIST column cells keep their nulls ──────────────
+;; A LIST column is stored in the nested format, which carries no attrs for a
+;; fixed-width vector cell.  The loader rebuilt the cell without HAS_NULLS, so
+;; the sentinel read back as plain data: `[0N 2]` came back as
+;; `[-9223372036854775808 2]`, and sum/nil? saw no null.  One cell per
+;; nullable nested type, a nested LIST cell among them.
+(.sys.exec "rm -rf /tmp/rfl_splayed_listnull /tmp/rfl_parted_listnull")
+(set LG (concat (guid 1) (as 'GUID 0N)))
+(set LN (list [0Nl 2] [0Ni 3i] [0Nh 4h] [0Nf 1.5] [0Nd 2024.01.01] [0Nt 12:00:00.000] [0Np 2024.01.01D00:00:00.000000000] (concat ['a] (as 'SYM "")) ["x" ""] LG (list [0Nl 5] [1 2])))
+(set LT (table [k l] (list (til 11) LN)))
+(set LNULLS (list [true false] [true false] [true false] [true false] [true false] [true false] [true false] [false true] [false true] [false true]))
+;; the in-memory table is the reference
+(take (map nil? (at LT 'l)) 10) -- LNULLS
+(.db.splayed.set "/tmp/rfl_splayed_listnull/" LT)
+(set LR (.db.splayed.get "/tmp/rfl_splayed_listnull/"))
+(take (map nil? (at LR 'l)) 10) -- LNULLS
+(nil? (first (at (at LR 'l) 10))) -- [true false]
+(nil? (last (at (at LR 'l) 10))) -- [false false]
+(map type (at LR 'l)) -- (map type (at LT 'l))
+(sum (first (at LR 'l))) -- 2
+(sum (at (at LR 'l) 3)) -- 1.5
+(at LR 'l) -- (at LT 'l)
+
+;; a parted table reads its LIST segments through the same loader
+(.db.splayed.set "/tmp/rfl_parted_listnull/2024.01.01/t/" LT)
+(.db.splayed.set "/tmp/rfl_parted_listnull/2024.01.02/t/" LT)
+(set LP (.db.parted.get "/tmp/rfl_parted_listnull/" 't))
+(set LPL (at LP 'l))
+(count LPL) -- 22
+(take (map nil? LPL) 10) -- LNULLS
+(take (map nil? (drop LPL 11)) 10) -- LNULLS
+(nil? (first (at LPL 21))) -- [true false]
+(map sum (at (select {from: LP where: (== k 0)}) 'l)) -- [2 2]
+(.sys.exec "rm -rf /tmp/rfl_splayed_listnull /tmp/rfl_parted_listnull")
+
+;; ────────────── GUID atoms inside LIST cells ──────────────
+;; The nested writer stored 8 bytes of a GUID atom's value union, which for
+;; GUID is the pointer to its 16-byte payload: a fresh process dereferenced a
+;; stale address (SIGSEGV), and in the writing process the loaded atom shared
+;; the source's payload without a reference.  The atom is now written as its
+;; 16 bytes.  The source table is released before the read back, and a second
+;; process reads the same files.  The flat GUID column g is the reference.
+(.sys.exec "rm -rf /tmp/rfl_splayed_guidatom /tmp/rfl_parted_guidatom /tmp/rfl_guidatom_read.rfl")
+(set GA (guid 3))
+(set GT (table [k g a] (list [0 1 2] GA (list (list (at GA 0) 1) (list 2 (list (at GA 1) (as 'GUID 0N))) (list (at GA 2))))))
+(.db.splayed.set "/tmp/rfl_splayed_guidatom/" GT)
+(.db.splayed.set "/tmp/rfl_parted_guidatom/2024.01.01/t/" GT)
+(.db.splayed.set "/tmp/rfl_parted_guidatom/2024.01.02/t/" GT)
+(set GT 0)
+(set GR (.db.splayed.get "/tmp/rfl_splayed_guidatom/"))
+(== (first (at (at GR 'a) 0)) (at (at GR 'g) 0)) -- true
+(== (first (last (at (at GR 'a) 1))) (at (at GR 'g) 1)) -- true
+(== (first (at (at GR 'a) 2)) (at (at GR 'g) 2)) -- true
+(nil? (last (last (at (at GR 'a) 1)))) -- true
+(nil? (first (last (at (at GR 'a) 1)))) -- false
+(set GP (.db.parted.get "/tmp/rfl_parted_guidatom/" 't))
+(count (at GP 'a)) -- 6
+(== (first (at (at GP 'a) 3)) (at (at GP 'g) 3)) -- true
+(== (first (last (at (at GP 'a) 4))) (at (at GP 'g) 1)) -- true
+(nil? (last (last (at (at GP 'a) 4)))) -- true
+(set GR 0)
+(set GP 0)
+(.sys.exec "printf '%s\n' '(set R (.db.splayed.get \"/tmp/rfl_splayed_guidatom/\"))' '(set P (.db.parted.get \"/tmp/rfl_parted_guidatom/\" (quote t)))' '(println (and (== (first (at (at R (quote a)) 0)) (at (at R (quote g)) 0)) (== (first (last (at (at R (quote a)) 1))) (at (at R (quote g)) 1)) (nil? (last (last (at (at R (quote a)) 1)))) (== (first (at (at P (quote a)) 5)) (at (at P (quote g)) 2))))' > /tmp/rfl_guidatom_read.rfl") -- 0
+(.sys.exec "./rayforce /tmp/rfl_guidatom_read.rfl </dev/null | grep -qx true") -- 0
+
+;; A typed-null BOOL/U8 atom carries its null mark in aux[0], which the 8-byte
+;; atom encoding does not hold, so it reads back as false / 0 (serde keeps it).
+;; (do (.db.splayed.set "/tmp/rfl_splayed_boolnull/" (table [k a] (list [1 2] (list (list (as 'BOOL 0N) (as 'U8 0N)) (list 1))))) (map nil? (first (at (.db.splayed.get "/tmp/rfl_splayed_boolnull/") 'a)))) -- [true true]   ;; xfail BUG: nested typed-null BOOL/U8 atoms lose their null mark; needs an encoding decision
+(.sys.exec "rm -rf /tmp/rfl_splayed_guidatom /tmp/rfl_parted_guidatom /tmp/rfl_guidatom_read.rfl")
