@@ -1060,6 +1060,28 @@ static void fk_stats(const ray_enc_desc_t* d, uint64_t m, uint64_t* lo, uint64_t
     *span = has ? ((uint64_t)d->max - (uint64_t)d->min) & m : m;
 }
 
+/* The codes of a DICT body over a U32 FOR_BP code child, unpacked by the
+ * lane kernel and checked below the validated dictionary's size in one
+ * or-reduce: false (declined) on anything else, as ray_enc_read would
+ * accept or reject it (a RAW or RLE code child, a header or size off, a
+ * dictionary not yet validated, a code outside it). */
+static bool fk_dict_codes(ray_enccol_t* e, const ray_enc_desc_t* d, int vlen, const uint8_t* body,
+                          uint64_t avail, ray_enc_dict_t* dict, uint32_t* codes) {
+    if (d->width || avail < 16 || body[0] != RAY_ENC_FOR_BP) return false;
+    const int w = body[1];
+    uint16_t rsv; memcpy(&rsv, body + 2, 2);
+    uint32_t bb; memcpy(&bb, body + 4, 4);
+    if (rsv || w > 32 || (uint64_t)bb + 8 != avail || bb != (uint64_t)ray_enc_size_for(w)) return false;
+    uint64_t base; memcpy(&base, body + 8, 8);
+    if (base >> 32) return false;
+    if (!enc_dict_ready(e, dict)) return false;              /* validation and its errors: the reference path */
+    (void)fk_for32((const uint32_t*)(body + 16), w, (uint32_t)base, codes, vlen, 0);
+    const uint32_t lim = dict->n - 1;                        /* a validated dictionary is not empty */
+    uint32_t bad = 0;
+    for (int i = 0; i < vlen; i++) bad |= (uint32_t)-(uint32_t)(codes[i] > lim);
+    return !bad;
+}
+
 /* DICT over a U32 FOR_BP code child, at the generation-0 width: the codes
  * unpacked by the lane kernel, checked below the dictionary size in one
  * or-reduce, gathered from the validated dictionary with the values'
@@ -1072,21 +1094,10 @@ static void fk_stats(const ray_enc_desc_t* d, uint64_t m, uint64_t* lo, uint64_t
  * its errors). */
 static int dec_fast_dict(ray_enccol_t* e, const ray_enc_desc_t* d, int vlen, const uint8_t* body,
                          uint64_t avail, const uint8_t* bm, ray_enc_kind_t k, void* out) {
-    if (d->width || !k.is_signed || avail < 16 || body[0] != RAY_ENC_FOR_BP) return 0;
-    const int w = body[1];
-    uint16_t rsv; memcpy(&rsv, body + 2, 2);
-    uint32_t bb; memcpy(&bb, body + 4, 4);
-    if (rsv || w > 32 || (uint64_t)bb + 8 != avail || bb != (uint64_t)ray_enc_size_for(w)) return 0;
-    uint64_t base; memcpy(&base, body + 8, 8);
-    if (base >> 32) return 0;
+    if (!k.is_signed) return 0;
     ray_enc_dict_t dict;
-    if (!enc_dict_ready(e, &dict)) return 0;                 /* validation and its errors: the reference path */
     _Alignas(64) uint32_t codes[RAY_ENC_VEC];
-    (void)fk_for32((const uint32_t*)(body + 16), w, (uint32_t)base, codes, vlen, 0);
-    const uint32_t lim = dict.n - 1;                         /* a validated dictionary is not empty */
-    uint32_t bad = 0;
-    for (int i = 0; i < vlen; i++) bad |= (uint32_t)-(uint32_t)(codes[i] > lim);
-    if (bad) return 0;
+    if (!fk_dict_codes(e, d, vlen, body, avail, &dict, codes)) return 0;
     const uint64_t* dv = dict.v;
     uint64_t lo, span;
     fk_stats(d, k.T == 64 ? ~0ull : (1ull << k.T) - 1, &lo, &span);
@@ -1346,15 +1357,160 @@ static int dec_fast_raw(ray_enccol_t* e, const ray_enc_desc_t* d, int vlen, cons
     return fk_nulls_native(d, k.T, vlen, bm, true, out);
 }
 
+/* ---- Float fast path: every float encoding straight into the destination ----
+ * The values are written at the element width, then one branch-free pass
+ * folds the rules dec_floats checks row by row (a non-null row is no NaN
+ * and lies inside the vector's statistics; the bitmap's rows become the
+ * canonical null) into one flag.  The comparisons are dec_floats' own on
+ * doubles: !(x >= lo && x <= hi) is x != x || x < lo || x > hi, and an
+ * absent statistic is the infinite bound.  It declines (0) on anything off,
+ * a trailer included, so the reference path decodes the vector or names
+ * its first failing rule with its own error; it never accepts what
+ * dec_floats rejects. */
+#define FL_CHECK(NAME, FT, UT, NULLV)                                                   \
+static __attribute__((noinline)) bool NAME(UT* restrict o, int n, const uint8_t* restrict bm, \
+                                           double lo, double hi) {                     \
+    uint64_t bad = 0;                                                                   \
+    if (!bm) {                                                                          \
+        for (int i = 0; i < n; i++) {                                                   \
+            FT f; memcpy(&f, &o[i], sizeof f); const double x = f;                      \
+            bad |= (uint64_t)!((x >= lo) & (x <= hi));                                  \
+        }                                                                               \
+        return bad == 0;                                                                \
+    }                                                                                   \
+    FT nf = NULLV; UT nb; memcpy(&nb, &nf, sizeof nb);                                  \
+    for (int i = 0; i < n; i++) {                                                       \
+        const UT nul = (UT)-(UT)((bm[i >> 3] >> (i & 7)) & 1u);                         \
+        FT f; memcpy(&f, &o[i], sizeof f); const double x = f;                          \
+        bad |= (uint64_t)(~nul & (UT)-(UT)!((x >= lo) & (x <= hi)));                    \
+        o[i] = (UT)((o[i] & ~nul) | (nb & nul));                                        \
+    }                                                                                   \
+    return bad == 0;                                                                    \
+}
+FL_CHECK(fl_check64, double, uint64_t, NULL_F64)
+FL_CHECK(fl_check32, float, uint32_t, NULL_F32)
+#undef FL_CHECK
+
+/* The low 32 bits of each decoded F32 pattern, then fl_check32. */
+static __attribute__((noinline)) bool fl_narrow32(const uint64_t* restrict b, uint32_t* restrict o, int n,
+                                                  const uint8_t* bm, double lo, double hi) {
+    for (int i = 0; i < n; i++) o[i] = (uint32_t)b[i];
+    return fl_check32(o, n, bm, lo, hi);
+}
+
+static int dec_fast_float(ray_enccol_t* e, const ray_enc_desc_t* d, int vlen,
+                          const uint8_t* body, uint64_t avail, const uint8_t* bm, void* out) {
+    const bool f32 = e->type == RAY_F32;
+    const int T = f32 ? 32 : 64;
+    const uint8_t enc = d->encoding;
+    if ((d->flags & RAY_ENC_DESC_TRAILER) || d->width || vlen < 1 || vlen > RAY_ENC_VEC) return 0;
+    if (((uintptr_t)body & 7) || ((uintptr_t)out & ((size_t)T / 8 - 1))) return 0;
+    if (d->n_nulls && !bm) return 0;
+    double lo = -INFINITY, hi = INFINITY;
+    if (!(d->flags & RAY_ENC_STAT_ABSENT)) { memcpy(&lo, &d->min, 8); memcpy(&hi, &d->max, 8); }
+    switch (enc) {
+    case RAY_ENC_CONST: case RAY_ENC_RLE: case RAY_ENC_DICT: {
+        _Alignas(64) fk_vals_t vals, ends;
+        uint32_t nr;
+        if (enc == RAY_ENC_DICT) {
+            if (avail >= 8 && body[0] == RAY_ENC_FOR_BP) {
+                ray_enc_dict_t dict;
+                _Alignas(64) uint32_t codes[RAY_ENC_VEC];
+                if (!fk_dict_codes(e, d, vlen, body, avail, &dict, codes)) return 0;
+                const uint64_t* dv = dict.v;
+                if (f32) { uint32_t* o = out; for (int i = 0; i < vlen; i++) o[i] = (uint32_t)dv[codes[i]]; }
+                else     { uint64_t* o = out; for (int i = 0; i < vlen; i++) o[i] = dv[codes[i]]; }
+                break;
+            }
+            /* an RLE code child (depth 1, its children at depth 2): the
+             * header as ray_enc_read reads it, the runs as fk_runs checks
+             * them at the U32 code kind, each code below the dictionary */
+            if (avail < 16 || body[0] != RAY_ENC_RLE || body[1] || body[2] || body[3]) return 0;
+            uint32_t bb; memcpy(&bb, body + 4, 4);
+            if ((uint64_t)bb + 8 != avail) return 0;
+            ray_enc_dict_t dict;
+            if (!enc_dict_ready(e, &dict)) return 0;
+            if (!fk_runs(RAY_ENC_RLE, vlen, body + 8, bb, 32, &vals, &ends, &nr)) return 0;
+            uint32_t badc = 0;
+            for (uint32_t i = 0; i < nr; i++) badc |= (uint32_t)-(uint32_t)(vals.s[i] >= dict.n);
+            if (badc) return 0;
+            /* the runs' values: the entries their codes name (nr <= vlen,
+             * so in place, at a lane index never above the code's) */
+            if (f32) for (uint32_t i = 0; i < nr; i++) vals.s[i] = (uint32_t)dict.v[vals.s[i]];
+            else     for (uint32_t i = nr; i-- > 0;) vals.q[i] = dict.v[vals.s[i]];
+        } else {
+            /* float RLE values are RAW only (a FOR_BP child is illegal there) */
+            if (enc == RAY_ENC_RLE && (avail < 16 || body[8] != RAY_ENC_RAW)) return 0;
+            if (!fk_runs(enc, vlen, body, avail, T, &vals, &ends, &nr)) return 0;
+        }
+        if (!bm) {                                           /* the rule per run, not per row */
+            uint64_t bad = 0;
+            for (uint32_t i = 0; i < nr; i++) {
+                double x;
+                if (f32) { float f; memcpy(&f, &vals.s[i], 4); x = f; } else memcpy(&x, &vals.q[i], 8);
+                bad |= (uint64_t)!((x >= lo) & (x <= hi));
+            }
+            if (bad) return 0;
+        }
+        /* Each run in fixed FL_W-element stores while they stay inside
+         * the vector (one store for most runs, no per-row loop); the rows a
+         * store writes past the run's end belong to the runs after it,
+         * which are filled later and wholly, so every row ends up holding
+         * its own run's value; nothing is written past vlen. */
+#define FL_FILL(OT, V) do { OT* o_ = (OT*)out; uint32_t p_ = 0;                          \
+        for (uint32_t i = 0; i < nr; i++) {                                             \
+            const OT v_ = (V); const uint32_t e_ = ends.h[i];                           \
+            uint32_t r_ = p_;                                                           \
+            while (r_ < e_ && r_ + FL_W <= (uint32_t)vlen) {                            \
+                for (uint32_t z = 0; z < FL_W; z++) o_[r_ + z] = v_;                    \
+                r_ += FL_W;                                                             \
+            }                                                                           \
+            for (; r_ < e_; r_++) o_[r_] = v_;                                          \
+            p_ = e_; } } while (0)
+#define FL_W 16
+        if (f32) FL_FILL(uint32_t, vals.s[i]); else FL_FILL(uint64_t, vals.q[i]);
+#undef FL_W
+#undef FL_FILL
+        if (!bm) return 1;
+        return (f32 ? fl_check32((uint32_t*)out, vlen, bm, lo, hi) : fl_check64((uint64_t*)out, vlen, bm, lo, hi)) ? 1 : 0;
+    }
+    case RAY_ENC_RAW: {
+        const size_t nb = (size_t)vlen * (size_t)T / 8;
+        if (avail != (uint64_t)ray_enc_size_raw(vlen, T) || !all_zero(body + nb, (size_t)avail - nb)) return 0;
+        memcpy(out, body, nb);
+        break;
+    }
+    case RAY_ENC_ALP: case RAY_ENC_ALP_RD: {
+        /* ALP writes vlen patterns, ALP_RD a whole vector (its pad rows
+         * checked): F64 straight into out when that fits, else aside */
+        if (!f32 && (enc == RAY_ENC_ALP || vlen == RAY_ENC_VEC)) {
+            int64_t used = ray_enc_float_read(body, (size_t)avail, enc, vlen, 64, NULL, (uint64_t*)out);
+            if (used < 0 || (uint64_t)used != avail) return 0;
+            break;
+        }
+        _Alignas(64) uint64_t bits[RAY_ENC_VEC];
+        int64_t used = ray_enc_float_read(body, (size_t)avail, enc, vlen, T, NULL, bits);
+        if (used < 0 || (uint64_t)used != avail) return 0;
+        if (f32) return fl_narrow32(bits, (uint32_t*)out, vlen, bm, lo, hi) ? 1 : 0;
+        memcpy(out, bits, (size_t)vlen * 8);
+        break;
+    }
+    default: return 0;
+    }
+    return (f32 ? fl_check32((uint32_t*)out, vlen, bm, lo, hi) : fl_check64((uint64_t*)out, vlen, bm, lo, hi)) ? 1 : 0;
+}
+
 /* Decode a FOR_BP / DELTA_BP / CONST / RLE vector body of e's type into
  * out: `wide` 0 at the generation-0 width, RAY_I64 / RAY_F64 widened with
  * nulls as NULL_I64 / NULL_F64 (narrow non-SYM types only).  DICT over a
  * FOR_BP code child (dec_fast_dict) and RAW (dec_fast_raw) at the
- * generation-0 width.  1 decoded, 0 declined (out may be partly written). */
+ * generation-0 width; every float encoding at its width (dec_fast_float,
+ * wide 0 only).  1 decoded, 0 declined (out may be partly written). */
 static int dec_fast(ray_enccol_t* e, const ray_enc_desc_t* d, int vlen,
                     const uint8_t* body, uint64_t avail, const uint8_t* bm, int8_t wide, void* out) {
     const uint8_t enc = d->encoding;
     ray_enc_kind_t k;
+    if (e->type == RAY_F32 || e->type == RAY_F64) return wide ? 0 : dec_fast_float(e, d, vlen, body, avail, bm, out);
     if (!fk_int_type(e->type) || !ray_enc_kind_of(e->type, e->attrs, &k)) return 0;
     if (enc == RAY_ENC_CONST || enc == RAY_ENC_RLE || enc == RAY_ENC_RAW) {
         if (d->width || vlen < 1 || vlen > RAY_ENC_VEC || ((uintptr_t)body & 7)) return 0;   /* a width only on BP */
@@ -2388,7 +2544,7 @@ static ray_enccol_t* test_col(int8_t type, uint8_t attrs, uint32_t sym_bound,
     snprintf(e->path, sizeof e->path, "decode_body");
     ray_enc_once_init(&e->dict_once);
     ray_enc_kind_t k;
-    if (dict && ray_enc_kind_of(type, attrs, &k)) {
+    if (dict && ray_enc_value_kind(type, attrs, &k)) {      /* floats: their F32 / F64 patterns */
         size_t esz = (size_t)k.T / 8, len = 8 + (size_t)ray_enc_pad8((uint64_t)n_dict * esz);
         uint8_t* b = ray_calloc_raw(len);
         if (!b) { ray_free_raw(e); return NULL; }
@@ -2479,6 +2635,32 @@ int ray_enccol_test_decode_body(int8_t type, uint8_t attrs, uint32_t sym_bound, 
     ray_enccol_t* e = test_col(type, attrs, sym_bound, NULL, 0, 0);
     if (!e) return -1;
     int r = test_decode(e, enc, width, n_nulls, bm, body, avail, vlen, fast, wide, out);
+    test_col_free(e);
+    return r;
+}
+
+int ray_enccol_test_decode_float(int8_t type, const uint64_t* dict, uint32_t n_dict, uint8_t enc, int n_nulls,
+                                 const uint8_t* bm, const uint8_t* body, uint64_t avail, int vlen,
+                                 bool stats, double mn, double mx, bool fast, void* out) {
+    if (!enc_type_float(type)) return -1;
+    ray_enccol_t* e = test_col(type, 0, 0, dict, n_dict, 0);
+    if (!e) return -1;
+    if (dict && fast) {                           /* the kernel reads a published dictionary only */
+        ray_enc_dict_t dd;
+        ray_t* err = enc_dict(e, &dd);
+        if (err) ray_error_free(err);
+    }
+    ray_enc_desc_t d; memset(&d, 0, sizeof d);
+    d.encoding = enc; d.n_nulls = (uint16_t)n_nulls;
+    d.flags = stats ? 0 : RAY_ENC_STAT_ABSENT;
+    if (stats) { memcpy(&d.min, &mn, 8); memcpy(&d.max, &mx, 8); }
+    int r;
+    if (fast) r = dec_fast(e, &d, vlen, body, avail, bm, 0, out);
+    else {
+        ray_t* err = dec_floats(e, 0, 0, &d, vlen, body, avail, bm, out);
+        if (err) ray_error_free(err);
+        r = err ? -1 : 1;
+    }
     test_col_free(e);
     return r;
 }

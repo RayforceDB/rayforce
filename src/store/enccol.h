@@ -327,6 +327,15 @@ int    ray_enccol_test_decode_body(int8_t type, uint8_t attrs, uint32_t sym_boun
 int    ray_enccol_test_decode_dict(int8_t type, const uint64_t* dict, uint32_t n_dict, int trim,
                                    int n_nulls, const uint8_t* bm, const uint8_t* body, uint64_t avail,
                                    int vlen, bool fast, void* out);
+/* One top-level float vector body (`enc`, any float encoding; F32 / F64)
+ * of a column with the VALUE_DICT dict[0, n_dict) (NULL: none), n_nulls
+ * as its descriptor says, the statistics [mn, mx] when `stats` (else
+ * absent), no trailer.  fast: through the fast kernel only (the dictionary
+ * validated first); else through dec_floats.  1 decoded, 0 the fast kernel
+ * declined, -1 the reference path reports it corrupt. */
+int    ray_enccol_test_decode_float(int8_t type, const uint64_t* dict, uint32_t n_dict, uint8_t enc, int n_nulls,
+                                    const uint8_t* bm, const uint8_t* body, uint64_t avail, int vlen,
+                                    bool stats, double mn, double mx, bool fast, void* out);
 /* ray_enccol_point_i64's body read of every row [0, vlen) of one top-level
  * body (`enc`, `width`, n_nulls as its descriptor says; no statistics) of a
  * column of `type`

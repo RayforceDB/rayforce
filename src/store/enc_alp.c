@@ -162,6 +162,77 @@ static bool zero_bytes(const uint8_t* p, size_t n) { for (size_t i = 0; i < n; i
  * a failed child read keeps the child's reason. */
 #define ALP_FAIL(why) ray_enc_read_fail(why)
 
+/* The body of an ALP ints child at c (avail bytes left in the ALP body)
+ * when it is a FOR_BP child that ray_enc_read accepts whole at depth 1:
+ * its header (reserved bytes zero, a body size that is a multiple of 8
+ * inside the parent and exactly the packed size of its width <= 64); else
+ * NULL, and ray_enc_read reads (or rejects) the child. */
+static const uint8_t* alp_for_child(const uint8_t* c, size_t avail) {
+    if (avail < 8 || c[0] != RAY_ENC_FOR_BP || c[1] > 64 || c[2] || c[3]) return NULL;
+    uint32_t bb; memcpy(&bb, c + 4, 4);
+    if ((bb & 7) || bb > avail - 8 || bb != (uint64_t)ray_enc_size_for(c[1])) return NULL;
+    return c + 8;
+}
+
+/* ALP decode fused with the FOR_BP unpack of its ints (I64 lanes: L = 16
+ * words per row, row r's field at bit r * w of its lane): base + field,
+ * then alp_dec1, row by row over contiguous lanes.  The same integers and
+ * the same expression as ray_enc_read followed by the alp_dec1 loop. */
+static inline __attribute__((always_inline)) void alp_dec_for(const uint8_t* b, int w, int n, int T, int e, int f,
+                                                              uint64_t* restrict out) {
+    enum { L = RAY_ENC_VEC / 64 };
+    uint64_t base; memcpy(&base, b, 8);
+    const uint8_t* pk = b + 8;
+    const uint64_t vm = w >= 64 ? ~0ull : (1ull << w) - 1;
+    /* F64 with every integer inside [-2^51, 2^51): the integer added to
+     * the pattern of 1.5 * 2^52, then 1.5 * 2^52 subtracted, is the
+     * integer as a double exactly (both steps are exact), so the bits
+     * are (double)n's; unlike the int64 conversion it vectorises.  The
+     * multiplies are alp_dec1's, in its order. */
+    const int64_t lim = (int64_t)1 << 51;
+    if (T == 64 && w >= 1 && w <= 50 && (int64_t)base >= -lim && (int64_t)base < lim - (int64_t)vm) {
+        const double m1 = F10[f], m2 = IF10[e], mg = 6755399441055744.0;    /* 1.5 * 2^52 */
+        const uint64_t mgb = 0x4338000000000000ull;
+        for (int r = 0, bit = 0; r * L < n; r++, bit += w) {
+            const int k = bit / 64, off = bit % 64;
+            const int nl = n - r * L < L ? n - r * L : L;
+            uint64_t* o = out + (size_t)r * L;
+            const uint8_t* lo = pk + (size_t)k * L * 8;
+            const unsigned sl = (unsigned)(64 - off) & 63;
+            const bool two = off + w > 64;
+            for (int l = 0; l < nl; l++) {
+                uint64_t x0, x1 = 0; memcpy(&x0, lo + 8 * l, 8);
+                if (two) memcpy(&x1, lo + 8 * (l + L), 8);
+                const uint64_t u = ((x0 >> off) | (two ? x1 << sl : 0)) & vm;
+                const uint64_t t = base + u + mgb;
+                double d; memcpy(&d, &t, 8);
+                const double b = (d - mg) * m1 * m2;
+                memcpy(&o[l], &b, 8);
+            }
+        }
+        return;
+    }
+    for (int r = 0, bit = 0; r * L < n; r++, bit += w) {
+        const int k = bit / 64, off = bit % 64;
+        const int nl = n - r * L < L ? n - r * L : L;
+        uint64_t* o = out + (size_t)r * L;
+        const uint8_t* lo = pk + (size_t)k * L * 8;
+        if (w == 0) {
+            for (int l = 0; l < nl; l++) o[l] = alp_dec1((int64_t)base, T, e, f);
+        } else if (off + w > 64) {
+            for (int l = 0; l < nl; l++) {
+                uint64_t x0, x1; memcpy(&x0, lo + 8 * l, 8); memcpy(&x1, lo + 8 * (l + L), 8);
+                o[l] = alp_dec1((int64_t)(base + (((x0 >> off) | (x1 << (64 - off))) & vm)), T, e, f);
+            }
+        } else {
+            for (int l = 0; l < nl; l++) {
+                uint64_t x0; memcpy(&x0, lo + 8 * l, 8);
+                o[l] = alp_dec1((int64_t)(base + ((x0 >> off) & vm)), T, e, f);
+            }
+        }
+    }
+}
+
 int64_t ray_enc_alp_read(const uint8_t* p, size_t avail, int n, int T, uint64_t* out) {
     if (n <= 0 || n > RAY_ENC_VEC || !alp_t_ok(T)) return ALP_FAIL("ALP vector length or float width");
     if (avail < 8) return ALP_FAIL("ALP header short");
@@ -172,8 +243,18 @@ int64_t ray_enc_alp_read(const uint8_t* p, size_t avail, int n, int T, uint64_t*
     if (f > e) return ALP_FAIL("ALP factor above the exponent");
     if (ne > n) return ALP_FAIL("ALP exception count above the vector length");
     if (rsv) return ALP_FAIL("ALP reserved word not zero");
-    int64_t a = ray_enc_read(p + 8, avail - 8, 0, 0, n, K_I64, RAY_ENC_SLOT_ALP_INTS, 1, NULL, out);   /* ints, decoded in place below */
-    if (a < 0) return -1;
+    /* A FOR_BP ints child that ray_enc_read would accept whole (the usual
+     * case) is decoded below in one fused pass; any other child is read
+     * by ray_enc_read, which names its errors. */
+    const uint8_t* fb = alp_for_child(p + 8, avail - 8);
+    int64_t a;
+    if (fb) {
+        uint32_t bb; memcpy(&bb, p + 8 + 4, 4);
+        a = 8 + (int64_t)bb;
+    } else {
+        a = ray_enc_read(p + 8, avail - 8, 0, 0, n, K_I64, RAY_ENC_SLOT_ALP_INTS, 1, NULL, out);   /* ints, decoded in place below */
+        if (a < 0) return -1;
+    }
     size_t at = 8 + (size_t)a, esz = (size_t)T / 8;
     size_t pb = (size_t)p8(2LL * ne), rb = (size_t)p8((int64_t)ne * (int64_t)esz);
     if (avail - at < pb + rb) return ALP_FAIL("ALP exceptions overrun the body");
@@ -181,7 +262,11 @@ int64_t ray_enc_alp_read(const uint8_t* p, size_t avail, int n, int T, uint64_t*
     if (!zero_bytes(pos + 2u * ne, pb - 2u * ne)) return ALP_FAIL("ALP exception position padding");
     const uint8_t* raw = pos + pb;
     if (!zero_bytes(raw + (size_t)ne * esz, rb - (size_t)ne * esz)) return ALP_FAIL("ALP exception value padding");
-    for (int i = 0; i < n; i++) out[i] = alp_dec1((int64_t)out[i], T, e, f);
+    if (fb) {
+        if (T == 64) alp_dec_for(fb, p[9], n, 64, e, f, out); else alp_dec_for(fb, p[9], n, 32, e, f, out);
+    } else {
+        for (int i = 0; i < n; i++) out[i] = alp_dec1((int64_t)out[i], T, e, f);
+    }
     int prev = -1;
     for (int k = 0; k < ne; k++) {
         uint16_t q; memcpy(&q, pos + 2 * k, 2);

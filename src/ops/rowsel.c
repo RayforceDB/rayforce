@@ -339,17 +339,31 @@ void rowsel_emit_runs(rowsel_builder_t* b, uint32_t seg, const uint16_t* ends,
         b->seg_flags[seg] = RAY_SEL_ALL;
     } else {
         b->seg_flags[seg] = RAY_SEL_MIX;
-        if (b->idx_len + pc > b->idx_cap) {
+        /* room for pc indices plus one 16-index store past them (below) */
+        if (b->idx_len + pc + 16 > b->idx_cap) {
             uint32_t newcap = b->idx_cap ? b->idx_cap : 8u;
-            while (newcap < b->idx_len + pc) newcap *= 2u;
+            while (newcap < b->idx_len + pc + 16) newcap *= 2u;
             b->idx = (uint16_t*)ray_realloc_raw(b->idx, (size_t)newcap * sizeof(uint16_t));
             b->idx_cap = newcap;
         }
+        /* a passing run's indices in fixed 16-index stores: the indices a
+         * store writes past the run are overwritten by the next passing
+         * run's (out advances by the run's length only), and the last
+         * store's tail lies past idx_len, inside the capacity reserved
+         * above, where nothing reads it */
+        typedef uint16_t idx16_t __attribute__((vector_size(32)));
+        const idx16_t iota = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
         uint16_t* out = b->idx + b->idx_len;
         s0 = 0;
         for (uint32_t r = 0; r < n_runs; r++) {
             const uint32_t e = ends[r];
-            if (pass[r]) for (uint32_t i = s0; i < e; i++) *out++ = (uint16_t)i;
+            if (pass[r]) {
+                for (uint32_t i = s0; i < e; i += 16) {
+                    const idx16_t v = iota + (uint16_t)i;
+                    memcpy(out + (i - s0), &v, sizeof v);
+                }
+                out += e - s0;
+            }
             s0 = e;
         }
         b->idx_len += pc;

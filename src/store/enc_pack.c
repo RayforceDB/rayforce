@@ -69,18 +69,38 @@ void ray_enc_pack(const uint64_t* u, int T, int w, uint8_t* out) {
     }
 }
 
+/* Row-major over the lanes: row r of every lane shares its word index and
+ * shift, so the inner loop is a contiguous, vectorisable pass over the L
+ * lanes (the lane-major loop above it is the writer's, not hot). */
+#define UNPACK_T(UT, TB) do {                                                     \
+        enum { L = RAY_ENC_VEC / TB };                                            \
+        const UT* a = (const UT*)(const void*)in;                                \
+        for (int r = 0, bit = 0; r < TB; r++, bit += w) {                         \
+            const int k = bit / TB, off = bit % TB;                               \
+            const UT* lo = a + (size_t)k * L;                                     \
+            uint64_t* o = u + (size_t)r * L;                                      \
+            if (off + w > TB) {                                                   \
+                const UT* hi = lo + L;                                            \
+                for (int l = 0; l < L; l++) {                                     \
+                    UT x0, x1; memcpy(&x0, lo + l, sizeof x0); memcpy(&x1, hi + l, sizeof x1); \
+                    o[l] = (((uint64_t)x0 >> off) | ((uint64_t)x1 << (TB - off))) & vmask; \
+                }                                                                 \
+            } else {                                                              \
+                for (int l = 0; l < L; l++) {                                     \
+                    UT x0; memcpy(&x0, lo + l, sizeof x0);                        \
+                    o[l] = ((uint64_t)x0 >> off) & vmask;                         \
+                }                                                                 \
+            }                                                                     \
+        } } while (0)
+
 void ray_enc_unpack(const uint8_t* in, int T, int w, uint64_t* u) {
     if (w == 0) { memset(u, 0, sizeof(uint64_t) * RAY_ENC_VEC); return; }
-    const int L = RAY_ENC_VEC / T;
     const uint64_t vmask = w == 64 ? ~0ull : ((1ull << w) - 1);
-    for (int l = 0; l < L; l++) {
-        int bit = 0;
-        for (int r = 0; r < T; r++, bit += w) {
-            int k = bit / T, off = bit % T;
-            uint64_t x = word_get(in, T, (size_t)k * (size_t)L + (size_t)l) >> off;
-            if (off + w > T)
-                x |= word_get(in, T, (size_t)(k + 1) * (size_t)L + (size_t)l) << (T - off);
-            u[l + r * L] = x & vmask;
-        }
+    switch (T) {
+    case 8:  UNPACK_T(uint8_t, 8); break;
+    case 16: UNPACK_T(uint16_t, 16); break;
+    case 32: UNPACK_T(uint32_t, 32); break;
+    default: UNPACK_T(uint64_t, 64); break;
     }
 }
+#undef UNPACK_T

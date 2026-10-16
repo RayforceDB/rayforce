@@ -2532,7 +2532,7 @@ int64_t ray_expr_test_leaf_runs(void) { return atomic_load_explicit(&g_expr_leaf
  * output (a selection is the leaf's answer itself). */
 static bool expr_single_leaf(const ray_expr_t* expr, const expr_enc_plan_t* p) {
     return p && p->n_leaves == 1 && expr->n_ins == 1 && p->leaf_of_ins[0] == 0 &&
-           expr->ins[0].dst == expr->out_reg && !p->leaf[0].is_f64;
+           expr->ins[0].dst == expr->out_reg;
 }
 
 /* A single-leaf program's selection segment for morsel [ms, ms + n) (one
@@ -2551,15 +2551,18 @@ static int expr_leaf_emit(const ray_expr_t* expr, const expr_enc_plan_t* p, ray_
     int vr = ray_col_src_vview(expr->regs[l->reg].src, ms / RAY_ENC_VEC, vbuf, err);
     if (vr <= 0) return vr;
     if (n != vbuf->n) return 0;
-    int cd = ray_enc_const_decision(vbuf, l->op, l->ci, l->null_result);
+    int cd = l->is_f64 ? ray_enc_const_decision_f64(vbuf, l->op, l->cf, l->null_result)
+                       : ray_enc_const_decision(vbuf, l->op, l->ci, l->null_result);
     if (cd >= 0) { rowsel_emit_uniform(sb, lseg, (uint8_t)cd, n); return 1; }
     uint8_t pass[RAY_ENC_VEC];
-    if (ray_enc_eval_cmp_runs(vbuf, l->op, l->ci, pass)) {
+    if (l->is_f64 ? ray_enc_eval_cmp_runs_f64(vbuf, l->op, l->cf, pass)
+                  : ray_enc_eval_cmp_runs(vbuf, l->op, l->ci, pass)) {
         rowsel_emit_runs(sb, lseg, vbuf->run_ends.h, pass, vbuf->n_runs, n);
         atomic_fetch_add_explicit(&g_expr_leaf_runs, 1, memory_order_relaxed);
         return 1;
     }
-    if (!ray_enc_eval_cmp(vbuf, l->op, l->ci, l->null_result, out)) return 0;
+    if (!(l->is_f64 ? ray_enc_eval_cmp_f64(vbuf, l->op, l->cf, l->null_result, out)
+                    : ray_enc_eval_cmp(vbuf, l->op, l->ci, l->null_result, out))) return 0;
     rowsel_emit_segment(sb, lseg, out, n);
     return 1;
 }

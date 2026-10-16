@@ -75,6 +75,11 @@ int  ray_enc_const_decision_f64(const ray_enc_vview_t* v, uint16_t op, double c,
  * constant, as ray_enc_const_decision_f64). */
 bool ray_enc_eval_cmp_f64(const ray_enc_vview_t* v, uint16_t op, double c,
                           uint8_t null_result, uint8_t* bits);
+/* (x op c) of each run of a float RLE view without bitmap nulls into
+ * pass[0..n_runs), under ray_enc_eval_cmp_f64's comparator: the run-level
+ * answer it expands into bits.  False for any other view, a bitmap, an
+ * operator it declines and a NaN c. */
+bool ray_enc_eval_cmp_runs_f64(const ray_enc_vview_t* v, uint16_t op, double c, uint8_t* pass);
 
 /* Exact 128-bit sum of the non-null logical values of a fully selected
  * integer vector, and its non-null count.  False when the encoding has no

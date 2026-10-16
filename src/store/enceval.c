@@ -328,6 +328,14 @@ bool ray_enc_eval_cmp_runs(const ray_enc_vview_t* v, uint16_t op, int64_t c, uin
     return true;
 }
 
+bool ray_enc_eval_cmp_runs_f64(const ray_enc_vview_t* v, uint16_t op, double c, uint8_t* pass) {
+    if (v->enc != RAY_ENC_RLE || v->nullmap || !is_float(v->type) || !is_cmp_op(op) || isnan(c)) return false;
+    const int T = v->k.T;
+    for (uint32_t r = 0; r < v->n_runs; r++)
+        pass[r] = (uint8_t)cmp_one_f(ray_enc_fval(lane(&v->run_vals, T, r), T), op, c);
+    return true;
+}
+
 bool ray_enc_eval_in(const ray_enc_vview_t* v, const int64_t* set, int nset, uint8_t nr, uint8_t* bits) {
     if (is_float(v->type)) return false;
     if (nset < 0) nset = 0;

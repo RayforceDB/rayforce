@@ -2009,6 +2009,158 @@ static test_result_t test_sweep_bit_exact(void) {
     PASS();
 }
 
+/* ---- Task 8b: the float fast kernel against dec_floats ----
+ * Each body is decoded by the fast kernel and by the reference: a sound
+ * body must be taken by the fast kernel with the reference's exact bytes,
+ * and over every one-byte forgery of it (and statistics narrowed by one
+ * step at either end) a body the fast kernel takes is one the reference
+ * accepts, with the same bytes; the kernel writes nothing past vlen.  A
+ * declined body goes to the reference in the real read, so its verdict
+ * and its error are the reference's. */
+static char fe_what[160];
+static int fe_check(int8_t ty, const ray_enc_dict_t* dict, uint8_t enc, int nn, const uint8_t* bm,
+                    const uint8_t* body, size_t len, int vlen, bool st, double mn, double mx, bool must) {
+    static _Alignas(64) uint8_t ref[RAY_ENC_VEC * 8 + 64], fast[RAY_ENC_VEC * 8 + 64];
+    const size_t esz = ty == RAY_F32 ? 4 : 8;
+    memset(ref, 0xA5, sizeof ref); memset(fast, 0x5A, sizeof fast);
+    const uint64_t* dv = dict ? dict->v : NULL; uint32_t dn = dict ? dict->n : 0;
+    int rr = ray_enccol_test_decode_float(ty, dv, dn, enc, nn, bm, body, len, vlen, st, mn, mx, false, ref);
+    int fr = ray_enccol_test_decode_float(ty, dv, dn, enc, nn, bm, body, len, vlen, st, mn, mx, true, fast);
+    if (must && (rr != 1 || fr != 1)) { snprintf(fe_what + strlen(fe_what), 40, ": ref %d fast %d", rr, fr); return 1; }
+    for (size_t i = (size_t)vlen * esz; i < sizeof fast; i++) if (fast[i] != 0x5A) { strcat(fe_what, ": wrote past vlen"); return 1; }
+    if (fr == 1 && (rr != 1 || memcmp(ref, fast, (size_t)vlen * esz) != 0)) {
+        snprintf(fe_what + strlen(fe_what), 60, ": fast took it, ref %d%s", rr, rr == 1 ? " (bytes differ)" : "");
+        return 1;
+    }
+    return 0;
+}
+
+/* One case: vals (T-bit patterns) written as enc, then the checks above. */
+static int fe_case(int8_t ty, uint8_t enc, const uint64_t* vals, int vlen, const uint8_t* bm,
+                   const ray_enc_dict_t* dict, const ray_enc_alp_cands_t* c, const char* what) {
+    const int T = ty == RAY_F32 ? 32 : 64;
+    snprintf(fe_what, sizeof fe_what, "%s (T %d, enc %d, vlen %d%s)", what, T, enc, vlen, bm ? ", nulls" : "");
+    ray_enc_buf_t b = { 0 }; ray_enc_choice_t ch;
+    if (!ray_enc_float_write(enc, vals, vlen, T, dict, c, &b, &ch)) { strcat(fe_what, ": write"); ray_enc_buf_free(&b); return 1; }
+    int nn = 0;
+    if (bm) for (int i = 0; i < vlen; i++) nn += (bm[i >> 3] >> (i & 7)) & 1;
+    const uint8_t* bmp = nn ? bm : NULL;
+    /* the statistics: the non-null range of the reference decode */
+    static _Alignas(64) uint8_t out[RAY_ENC_VEC * 8 + 64];
+    const uint64_t* dv = dict ? dict->v : NULL; uint32_t dn = dict ? dict->n : 0;
+    if (ray_enccol_test_decode_float(ty, dv, dn, enc, nn, bmp, b.p, b.len, vlen, false, 0, 0, false, out) != 1) {
+        strcat(fe_what, ": reference rejects the written body"); ray_enc_buf_free(&b); return 1;
+    }
+    bool st = false; double mn = 0, mx = 0;
+    for (int i = 0; i < vlen; i++) {
+        if (bmp && ((bmp[i >> 3] >> (i & 7)) & 1)) continue;
+        double x; if (T == 32) { float f; memcpy(&f, out + 4 * i, 4); x = f; } else memcpy(&x, out + 8 * i, 8);
+        if (!st || x < mn) mn = x;
+        if (!st || x > mx) mx = x;
+        st = true;
+    }
+    /* the kernel takes every sound body but a DICT one over RAW codes (a
+     * short vector's), which the reference reads */
+    const bool take = enc != RAY_ENC_DICT || b.p[0] == RAY_ENC_FOR_BP || b.p[0] == RAY_ENC_RLE;
+    int bad = fe_check(ty, dict, enc, nn, bmp, b.p, b.len, vlen, st, mn, mx, take);
+    if (!bad && st) {                                  /* narrowed statistics: rejected, never taken */
+        bad |= fe_check(ty, dict, enc, nn, bmp, b.p, b.len, vlen, true, nextafter(mn, INFINITY), mx, false);
+        bad |= fe_check(ty, dict, enc, nn, bmp, b.p, b.len, vlen, true, mn, nextafter(mx, -INFINITY), false);
+    }
+    static _Alignas(64) uint8_t forged[RAY_ENC_VEC * 8 + 4096];
+    const size_t step = b.len > 2048 ? 7 : 1;
+    static const int ops[5] = { 0x101, 0x180, 0x2FF, 0x200, 0x27F };   /* xor 0x01, xor 0x80, set 0xFF, 0x00, 0x7F */
+    for (size_t at = 0; !bad && at < b.len && b.len <= sizeof forged; at += step)
+        for (int o = 0; !bad && o < 5; o++) {
+            memcpy(forged, b.p, b.len);
+            forged[at] = (uint8_t)(ops[o] >> 8 == 1 ? forged[at] ^ (ops[o] & 0xFF) : (ops[o] & 0xFF));
+            if (forged[at] == b.p[at]) continue;
+            if (fe_check(ty, dict, enc, nn, bmp, forged, b.len, vlen, st, mn, mx, false)) {
+                snprintf(fe_what + strlen(fe_what), 40, " [byte %zu op %d]", at, o);
+                bad = 1;
+            }
+        }
+    ray_enc_buf_free(&b);
+    return bad;
+}
+
+static uint64_t fe_bits(int8_t ty, double x) {
+    if (ty == RAY_F64) return db(x);
+    float f = (float)x; uint32_t u; memcpy(&u, &f, 4); return u;
+}
+
+static test_result_t test_fast_equals_reference(void) {
+    static uint64_t v[RAY_ENC_VEC], dvals[64];
+    static uint8_t bm[RAY_ENC_VEC / 8];
+    static const int lens[3] = { RAY_ENC_VEC, 1000, 7 };
+    for (int t = 0; t < 2; t++) {
+        const int8_t ty = t ? RAY_F32 : RAY_F64;
+        const int T = t ? 32 : 64;
+        for (int li = 0; li < 3; li++) for (int nul = 0; nul < 2; nul++) {
+            const int n = lens[li];
+            memset(bm, 0, sizeof bm);
+            if (nul) for (int i = 3; i < n; i += 11) bm[i >> 3] |= (uint8_t)(1u << (i & 7));
+            const uint8_t* bmp = nul ? bm : NULL;
+            /* the null rows hold a NaN (any value is legal there) */
+#define FE_NULLS() do { if (nul) for (int i = 0; i < n; i++) if ((bm[i >> 3] >> (i & 7)) & 1) v[i] = T == 64 ? 0x7FF8000000000123ull : 0x7FC00123u; } while (0)
+            /* RAW, CONST (with -0.0), RLE of run lengths 1 .. 40 */
+            for (int i = 0; i < n; i++) v[i] = frng() & (T == 64 ? 0x7FEFFFFFFFFFFFFFull : 0x7F7FFFFFu);
+            FE_NULLS();
+            TEST_ASSERT_FMT(!fe_case(ty, RAY_ENC_RAW, v, n, bmp, NULL, NULL, "raw"), "%s", fe_what);
+            for (int i = 0; i < n; i++) v[i] = T == 64 ? NEG0_64 : NEG0_32;
+            TEST_ASSERT_FMT(!fe_case(ty, RAY_ENC_CONST, v, n, NULL, NULL, NULL, "const -0"), "%s", fe_what);
+            for (int i = 0, r = 0; i < n; r++) {
+                const int len = 1 + (r * 13) % 40;
+                const uint64_t x = fe_bits(ty, (double)((r * 37) % 23) - 11.5);
+                for (int k = 0; k < len && i < n; k++) v[i++] = x;
+            }
+            if (n == RAY_ENC_VEC) v[100] = T == 64 ? NEG0_64 : NEG0_32;
+            TEST_ASSERT_FMT(!fe_case(ty, RAY_ENC_RLE, v, n, bmp, NULL, NULL, "rle"), "%s", fe_what);
+            /* DICT over FOR_BP codes and over RLE codes */
+            for (int k = 0; k < 40; k++) dvals[k] = fe_bits(ty, -20.0 + 0.75 * k);
+            ray_enc_dict_t dict = { dvals, 40 };
+            for (int i = 0; i < n; i++) v[i] = dvals[(i * 7) % 40];
+            TEST_ASSERT_FMT(!fe_case(ty, RAY_ENC_DICT, v, n, bmp, &dict, NULL, "dict for_bp codes"), "%s", fe_what);
+            for (int i = 0; i < n; i++) v[i] = dvals[(i / 50 * 3) % 40];
+            TEST_ASSERT_FMT(!fe_case(ty, RAY_ENC_DICT, v, n, bmp, &dict, NULL, "dict rle codes"), "%s", fe_what);
+            /* ALP: decimals with exceptions (FOR_BP ints, the exact
+             * conversion), integers past 2^51 (F64), one repeated value
+             * (width 0), negative ones */
+            ray_enc_alp_cands_t c = { .n = 1 };
+            if (T == 64) {
+                c.c[0].e = 2; c.c[0].f = 0;
+                for (int i = 0; i < n; i++) v[i] = db((double)((i * 7919) % 100000 - 30000) / 100.0);
+                v[n / 2] = db(3.14159265358979);
+                FE_NULLS();
+                TEST_ASSERT_FMT(!fe_case(ty, RAY_ENC_ALP, v, n, bmp, NULL, &c, "alp decimals"), "%s", fe_what);
+                c.c[0].e = 0; c.c[0].f = 0;
+                for (int i = 0; i < n; i++) v[i] = db((double)((1LL << 53) - 2LL * (i * 31 % 977)));
+                TEST_ASSERT_FMT(!fe_case(ty, RAY_ENC_ALP, v, n, bmp, NULL, &c, "alp past 2^51"), "%s", fe_what);
+                for (int i = 0; i < n; i++) v[i] = db(-((double)(1LL << 51)) + (double)(i % 5));
+                TEST_ASSERT_FMT(!fe_case(ty, RAY_ENC_ALP, v, n, bmp, NULL, &c, "alp at -2^51"), "%s", fe_what);
+                for (int i = 0; i < n; i++) v[i] = db(42.0);
+                TEST_ASSERT_FMT(!fe_case(ty, RAY_ENC_ALP, v, n, NULL, NULL, &c, "alp width 0"), "%s", fe_what);
+            } else {
+                c.c[0].e = 0; c.c[0].f = 0;
+                for (int i = 0; i < n; i++) v[i] = fe_bits(ty, (double)((i * 7919) % 4001 - 2000));
+                v[n / 2] = fe_bits(ty, 0.3);
+                FE_NULLS();
+                TEST_ASSERT_FMT(!fe_case(ty, RAY_ENC_ALP, v, n, bmp, NULL, &c, "alp f32"), "%s", fe_what);
+            }
+            /* ALP_RD: high-entropy mantissas, few exponents */
+            for (int i = 0; i < n; i++) {
+                const double sc = i % 3 ? 1.0 : 4.0;
+                v[i] = T == 64 ? db((1.0 + (double)(frng() >> 11) / 9007199254740992.0) * sc)
+                               : fe_bits(ty, (1.0 + (double)(frng() >> 40) / 16777216.0) * sc);
+            }
+            FE_NULLS();
+            TEST_ASSERT_FMT(!fe_case(ty, RAY_ENC_ALP_RD, v, n, bmp, NULL, NULL, "alp_rd"), "%s", fe_what);
+#undef FE_NULLS
+        }
+    }
+    PASS();
+}
+
 const test_entry_t encfloat_entries[] = {
     { "encfloat/float_order",      test_float_order,      fl_setup, fl_teardown },
     { "encfloat/float_train_dict", test_float_train_dict, fl_setup, fl_teardown },
@@ -2045,5 +2197,6 @@ const test_entry_t encfloat_entries[] = {
     { "encfloat/no_materialization",   test_no_materialization,   fl_rt_setup, fl_rt_teardown },
     { "encfloat/part_zero_sign",       test_part_zero_sign,       fl_rt_setup, fl_rt_teardown },
     { "encfloat/sweep_bit_exact",      test_sweep_bit_exact,      fl_setup,    fl_teardown },
+    { "encfloat/fast_equals_reference", test_fast_equals_reference, fl_setup,  fl_teardown },
     { NULL, NULL, NULL, NULL },
 };

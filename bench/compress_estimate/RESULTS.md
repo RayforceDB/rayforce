@@ -2940,6 +2940,9 @@ The strict line's failing clauses, by ruling:
 
 ## P5 float encodings (float store derived from the 10M splayed store, release build, commit f41e6c99)
 
+The tables below this paragraph are **before 8b** (Task 8, f41e6c99).  The
+Task 8b numbers (float decode speed) follow them, under "After Task 8b".
+
 Driver: `W=/home/hetoku/data/tmp/p5_bench bench/compress_estimate/p5_bench.sh`
 (prep / enc / ident / warm / cold / savet 13:07-13:16; a second prep / ident /
 wall pass 15:00-15:05 after the P2/P3 rerun, with full-precision answers).
@@ -3015,7 +3018,140 @@ load waits: 4 (13:10:24/1.79, 15:03:22/2.26, 15:04:07/2.92, 15:04:37/1.77)
 **P5 float store, scan-only warm (no regression, <= 1.05 per query): FAIL** (worst 24242.886)
 ```
 
-Reading the float-store table:
+Which store each stage's numbers come from (before 8b): prep / enc /
+warm / cold / savet ran on the first derived store (13:07-13:16); ident and
+wall ran on a second store, derived and saved again by the same binary at
+15:00 after the P2/P3 rerun (same derivation, same bytes: the sizes match).
+
+### After Task 8b: float decode speed
+
+Driver: `W=/home/hetoku/data/tmp/p5b_bench bench/compress_estimate/p5_bench.sh all`
+(16:21-16:58), with the fixed summary (`fix(bench)` commit: the scan-only
+ratio of a query comes from the wall stage when its timeit g0 median is
+below 0.05 ms, wall times below 0.05 ms are floored, every query must be
+present in every stage).  Binary: the 8b tree on 7d744e4c, release (sha256
+d6b3aefbbbee); BASE for the writer cost 81c04acb.  One store for every
+stage: `all` derives and saves it once (prep), then enc / ident / warm /
+cold / wall / savet run on it, then clean deletes it.  9 warm rounds, 3 cold
+trials, 5 wall rounds, alternated; 7 load waits, logged.  Raw data:
+/home/hetoku/data/tmp/p5b_bench/p5.tsv, summary.txt beside it.  The store's
+bytes and encodings are unchanged (83 551 112 B g2; the mix and vector
+tables above hold).
+
+```
+| query | warm g0 | warm g2 | ratio | first g0 | first g2 | cold g0 | cold g2 | ratio | answers |
+|---|---|---|---|---|---|---|---|---|---|
+| q0 | 0.00 | 2.88 | 5825.818 | 0.02 | 7.30 | 0.0 | 19.2 | 1515.681 | DIFF (g0 drifts against itself too) |
+| q1 | 0.00 | 1.94 | 3847.465 | 0.02 | 6.16 | 0.0 | 7.0 | 333.307 | DIFF |
+| q2 | 0.00 | 0.00 | 0.940 | 0.01 | 0.03 | 0.0 | 0.0 | 3.398 | same |
+| q3 | 0.00 | 0.00 | 1.234 | 0.01 | 0.04 | 0.0 | 0.0 | 2.622 | same |
+| q4 | 7.07 | 6.82 | 0.965 | 20.93 | 19.81 | 162.0 | 29.5 | 0.182 | same |
+| q5 | 3.26 | 2.25 | 0.690 | 9.44 | 7.02 | 152.9 | 25.8 | 0.169 | same |
+| q6 | 6.58 | 6.37 | 0.968 | 13.03 | 11.73 | 153.0 | 37.7 | 0.247 | same |
+| q7 | 5.47 | 1.15 | 0.210 | 11.22 | 5.93 | 152.6 | 6.1 | 0.040 | same |
+| q8 | 7.56 | 8.74 | 1.157 | 9.76 | 10.41 | 188.5 | 23.7 | 0.126 | same |
+| q9 | 16.68 | 16.72 | 1.003 | 18.74 | 27.10 | 149.6 | 33.8 | 0.226 | same |
+
+| query | wall g0 ms/call | wall g2 ms/call | ratio | rounds |
+|---|---|---|---|---|
+| q0 | 2.956 | 2.873 | 0.972 | 5 |
+| q1 | 2.950 | 1.921 | 0.651 | 5 |
+| q2 | 0.002 | 0.002 | 1.000 (floored) | 5 |
+| q3 | 0.003 | 0.002 | 1.000 (floored) | 5 |
+| q4 | 7.046 | 6.798 | 0.965 | 5 |
+| q5 | 3.276 | 2.265 | 0.691 | 5 |
+| q6 | 6.620 | 6.355 | 0.960 | 5 |
+| q7 | 5.525 | 1.118 | 0.202 | 5 |
+| q8 | 7.663 | 8.910 | 1.163 | 5 |
+| q9 | 16.987 | 16.898 | 0.995 | 5 |
+
+| query | scan-only ratio g2 / g0 | source |
+|---|---|---|
+| q0 | 0.972 | wall |
+| q1 | 0.651 | wall |
+| q2 | 1.000 | wall (floored) |
+| q3 | 1.000 | wall (floored) |
+| q4 | 0.965 | timeit |
+| q5 | 0.690 | timeit |
+| q6 | 0.968 | timeit |
+| q7 | 0.210 | timeit |
+| q8 | 1.157 | timeit |
+| q9 | 1.003 | timeit |
+
+save g2 p5 / base: 20.446; save g0 p5 / base: 0.709   (the writer is unchanged)
+
+**P5 float store, all 10 queries present in warm, cold, wall and ident: PASS**
+**P5 float store, answers g2 = g0: FAIL**
+**P5 float store, scan-only warm (no regression, <= 1.05 per query): FAIL** (worst 1.157, q8, timeit)
+```
+
+Before 8b / after 8b, g2 / g0 (the scan-only source of each row; before 8b
+q0 / q1 from the wall table, the rest timeit):
+
+| query | before 8b | after 8b |
+|---|---|---|
+| q0 `sum price` | 4.084 | 0.972 |
+| q1 `avg sendt` | 2.766 | 0.651 |
+| q4 `price > 12.5` | 1.807 | 0.965 |
+| q5 `level == 213.0` | 1.897 | 0.690 |
+| q6 `ratio < 0.25` | 1.302 | 0.968 |
+| q7 `sendt in [0.5, 1.5)` | 0.321 | 0.210 |
+| q8 group `sum price by refresh` | 2.516 | 1.157 |
+| q9 top 10 by price | 1.004 | 1.003 |
+
+What changed (no byte on disk, no answer, no corruption verdict changes):
+- **Float fast path** (`dec_fast_float`, enccol.c).  Every float encoding
+  decodes straight into the destination at the element width; one
+  branch-free pass (or one check per run for CONST / RLE / DICT-over-RLE
+  codes) folds the NaN, statistics and null rules.  Anything off declines
+  (a trailer, a width, an illegal child, a code outside the dictionary, a
+  flag that trips), and the reference `dec_floats` then decodes the vector
+  or names its first failing rule with its own error.  DICT over FOR_BP and
+  over RLE codes, RLE runs filled in fixed 16-element stores.
+- **ALP**: a FOR_BP ints child that `ray_enc_read` would accept whole is
+  unpacked and decoded in one pass in enc_alp.c (strict FP flags kept; FMA
+  count 0); integers inside [-2^51, 2^51) are converted by the exact
+  1.5 * 2^52 trick, which gives (double)n's bits and vectorises, then
+  `alp_dec1`'s two multiplies in its order.
+- **`ray_enc_unpack`** runs row-major over the lanes (contiguous,
+  vectorisable) instead of lane-major (gen-2 only).
+- **Float filters**: the single-leaf selection emit (an RLE view's runs
+  straight to the selection, P3's integer path) now takes F64 leaves too
+  (`ray_enc_eval_cmp_runs_f64`), and `rowsel_emit_runs` writes a passing
+  run's indices in 16-index vector stores.
+
+Checks: the decoded bytes of all six float columns, written back as gen 0,
+are identical to the g0 store's files (`cmp`).  At one core the 18 sums /
+filters / groups over the store give the same answers before and after
+(the parallel sums drift run to run, #744).  New test
+`encfloat/fast_equals_reference`: every float encoding, F64 and F32, three
+lengths, with and without nulls; the fast kernel must take each sound body
+with the reference's exact bytes, and over every one-byte forgery of the
+body (5 kinds) and statistics narrowed at either end, a body the kernel
+takes is one `dec_floats` accepts, with the same bytes.  A mutation (the
+per-run statistics check removed) fails it.
+
+**The floor (q8).**  q8 is the only query over 1.05.  g0's group is
+compute-bound in the dense aggregation (`sum_f64_update`, `count_update`,
+`agg_dense_phaseA_fn`: 85% of its cycles).  g2 runs the same aggregation
+(and skips g0's `agg_key_bounds_raw`, 11%, by its statistics), and adds the
+decode of price and refresh: about 20% of g2's cycles (`dec_fast_float` 10%,
+mostly the RLE fill stores; `ray_enc_alp_read` 3.5%; the I16 key 3%; the
+range-read dispatch 3%).  Per cores: 1 core 21.6 / 24.4 ms (1.13), 4 cores
+10.4 / 11.4 (1.09), 8 threads 7.66 / 8.91 (1.16).  Only one decode per
+vector runs (counted).  The decode is about 0.9 cycles per row on one core;
+with two threads per core it competes with the sibling's aggregation, which
+g0 hides behind its memory latency.  What is left is the materialization
+itself: the price vectors are 47% RLE and 26% DICT over RLE codes (median 75
+runs per vector), and filling 8 KB per vector is store-bound.  Getting q8 to
+1.05 needs the group aggregation to consume runs without materializing them
+(a run-aware dense sum), which is outside 8b.
+
+The `(timeit (sum v))` ~0 ms reading reproduces on dev 94a77eeb: `timeit`
+releases a lazy result without materializing it inside the timed span.
+Filed as #856.
+
+Reading the float-store table (before 8b):
 - **Answers FAIL is #744, not P5.**  q2-q9 are equal byte for byte.  q0
   (`sum price`) and q1 (`avg sendt`) differ only in the last digits, and the
   values are nondeterministic run to run.  Eight runs each (full precision,
