@@ -35,6 +35,23 @@
 (reverse ['x])    -- ['x]
 (reverse ["one"]) -- ["one"]
 
+;; Tables reverse rows while preserving column names and column types.
+(set _reverse_table (table [a b] (list [1 2 3] ["x" "y" "z"])))
+(key (reverse _reverse_table)) -- [a b]
+(at (reverse _reverse_table) 'a) -- [3 2 1]
+(at (reverse _reverse_table) 'b) -- ["z" "y" "x"]
+(count (reverse (table [a] (list [])))) -- 0
+
+;; Dictionary entries move together for typed and boxed values.
+(set _reverse_dict (dict ['a 'b 'c] [10 20 30]))
+(key (reverse _reverse_dict)) -- ['c 'b 'a]
+(value (reverse _reverse_dict)) -- [30 20 10]
+(at (reverse _reverse_dict) 'b) -- 20
+(set _reverse_boxed (dict ['a 'b] (list [1 2] "x")))
+(key (reverse _reverse_boxed)) -- ['b 'a]
+(at (reverse _reverse_boxed) 'a) -- [1 2]
+(at (reverse _reverse_boxed) 'b) -- "x"
+
 ;; OP_REVERSE vector-input guard: a lazy chain whose previous op is
 ;; an aggregator (FIRST) yields a scalar at materialisation; OP_REVERSE
 ;; must reject the non-vec input rather than dispatching to
