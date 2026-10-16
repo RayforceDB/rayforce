@@ -2710,7 +2710,22 @@ ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
             ray_t* col = ray_table_get_col_idx(vec, c);
             int64_t name = ray_table_col_name(vec, c);
             if (!col) continue;
-            ray_t* gathered = gather_by_idx(col, ids, nidx);
+            /* Parted and MAPCOMMON columns (.db.parted.get) are not dense
+             * vectors: flatten them the way the symbol arm does, then gather. */
+            ray_t* flat = NULL;
+            if (RAY_IS_PARTED(col->type)) {
+                int64_t ncnt = 0;
+                const int64_t* cnt = parted_table_counts(vec, &ncnt);
+                flat = parted_to_flat_vec_c(col, cnt, ncnt);
+            } else if (col->type == RAY_MAPCOMMON) {
+                flat = materialize_mapcommon(col);
+            }
+            if (flat && RAY_IS_ERR(flat)) {
+                ray_release(result);
+                return flat;
+            }
+            ray_t* gathered = gather_by_idx(flat ? flat : col, ids, nidx);
+            if (flat) ray_release(flat);
             if (!gathered || RAY_IS_ERR(gathered)) {
                 ray_release(result);
                 return gathered ? gathered : ray_error("oom", NULL);
@@ -4487,7 +4502,7 @@ ray_t* ray_mdev_fn(ray_t* n, ray_t* x) {
     return ts_moving_fn(n, x, OP_MDEV);
 }
 
-/* (reverse vec) — reverse a vector */
+/* (reverse x) — reverse a vector, table's rows, or dictionary's entries */
 ray_t* ray_reverse_fn(ray_t* x) {
     if (!x || RAY_IS_ERR(x)) return x;
 
@@ -4495,6 +4510,28 @@ ray_t* ray_reverse_fn(ray_t* x) {
     if (ray_is_lazy(x)) return ray_lazy_append(x, OP_REVERSE);
 
     if (ray_is_atom(x)) { ray_retain(x); return x; }
+
+    if (x->type == RAY_TABLE) {
+        int64_t nrows = ray_table_nrows(x);
+        ray_t* ids = ray_vec_new(RAY_I64, nrows);
+        if (!ids || RAY_IS_ERR(ids)) return ids ? ids : ray_error("oom", NULL);
+        ids->len = nrows;
+        int64_t* rows = (int64_t*)ray_data(ids);
+        for (int64_t i = 0; i < nrows; i++) rows[i] = nrows - 1 - i;
+        ray_t* result = ray_at_fn(x, ids);
+        ray_release(ids);
+        return result;
+    }
+
+    if (x->type == RAY_DICT) {
+        ray_t* keys = ray_dict_keys(x);
+        ray_t* vals = ray_dict_vals(x);
+        if (!keys || !vals) return ray_error("domain", "reverse: malformed dictionary");
+        ray_t* nk = ray_is_vec(keys) ? reverse_vec_eager(keys) : ray_reverse_fn(keys);
+        if (!nk || RAY_IS_ERR(nk)) return nk ? nk : ray_error("oom", NULL);
+        ray_t* nv = ray_is_vec(vals) ? reverse_vec_eager(vals) : ray_reverse_fn(vals);
+        return ray_dict_new(nk, nv);
+    }
 
     /* Typed vector path: start a fresh lazy chain.  The DAG executor will
      * call reverse_vec_eager() when the chain is materialised. */
