@@ -2724,7 +2724,22 @@ ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
             ray_t* col = ray_table_get_col_idx(vec, c);
             int64_t name = ray_table_col_name(vec, c);
             if (!col) continue;
-            ray_t* gathered = gather_by_idx(col, ids, nidx);
+            /* Parted and MAPCOMMON columns (.db.parted.get) are not dense
+             * vectors: flatten them the way the symbol arm does, then gather. */
+            ray_t* flat = NULL;
+            if (RAY_IS_PARTED(col->type)) {
+                int64_t ncnt = 0;
+                const int64_t* cnt = parted_table_counts(vec, &ncnt);
+                flat = parted_to_flat_vec_c(col, cnt, ncnt);
+            } else if (col->type == RAY_MAPCOMMON) {
+                flat = materialize_mapcommon(col);
+            }
+            if (flat && RAY_IS_ERR(flat)) {
+                ray_release(result);
+                return flat;
+            }
+            ray_t* gathered = gather_by_idx(flat ? flat : col, ids, nidx);
+            if (flat) ray_release(flat);
             if (!gathered || RAY_IS_ERR(gathered)) {
                 ray_release(result);
                 return gathered ? gathered : ray_error("oom", NULL);
