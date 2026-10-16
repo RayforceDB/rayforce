@@ -6758,7 +6758,8 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                         case OP_SUM:
                             v = sf ? ROW_RD_F64(row, ly->off_sum, s)
                                    : (double)ROW_RD_I64(row, ly->off_sum, s);
-                            if (ao->affine) v += ao->bias_f64 * cnt;
+                            /* (col + c) is null wherever col is: bias per non-null row. */
+                            if (ao->affine) v += ao->bias_f64 * nn;
                             break;
                         case OP_PROD:
                             if (nn == 0) { v = NULL_F64; grp_set_null(ao->vec, di); break; }
@@ -6854,7 +6855,7 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                     switch (op) {
                         case OP_SUM:
                             v = ROW_RD_I64(row, ly->off_sum, s);
-                            if (ao->affine) v = wrap_add_i64(v, wrap_mul_i64(ao->bias_i64, cnt));
+                            if (ao->affine) v = wrap_add_i64(v, wrap_mul_i64(ao->bias_i64, nn));
                             break;
                         case OP_PROD:
                             if (nn == 0) { v = int_null; grp_set_null(ao->vec, di); break; }
@@ -7728,8 +7729,9 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
                 switch (agg_op) {
                     case OP_SUM:
                         v = is_f64 ? sum_f64[idx] : (double)sum_i64[idx];
+                        /* (col + c) is null wherever col is: bias per non-null row. */
                         if (affine && affine[a].enabled)
-                            v += affine[a].bias_f64 * counts[gi];
+                            v += affine[a].bias_f64 * nn;
                         break;
                     case OP_PROD:
                         if (nn == 0) { v = NULL_F64; ray_vec_set_null(new_col, gi, true); break; }
@@ -7820,7 +7822,7 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
                     case OP_SUM:
                         v = sum_i64[idx];
                         if (affine && affine[a].enabled)
-                            v = wrap_add_i64(v, wrap_mul_i64(affine[a].bias_i64, counts[gi]));
+                            v = wrap_add_i64(v, wrap_mul_i64(affine[a].bias_i64, nn));
                         break;
                     case OP_PROD:
                         if (nn == 0) { v = int_null; ray_vec_set_null(new_col, gi, true); break; }
@@ -14730,7 +14732,9 @@ ht_path:;
         int8_t agg_slot = ght_layout.agg_val_slot[ai];
         topn_order_ok = true;
         if (order_op == OP_SUM) {
-            /* The heap sees the raw sum, before bias * group_count is added. */
+            /* The heap sees the raw sum; the affine bias is added at emit,
+             * once per non-null row, so raw and emitted order can differ
+             * (nullable groups of equal size). */
             if (agg_slot < 0 || order_is_f64 ||
                 (agg_affine[ai].enabled && agg_affine[ai].bias_i64 != 0))
                 topn_order_ok = false;
@@ -16297,7 +16301,8 @@ sequential_fallback:;
                     case OP_SUM:
                         v = is_f64 ? ROW_RD_F64(row, ly->off_sum, s)
                                    : (double)ROW_RD_I64(row, ly->off_sum, s);
-                        if (agg_affine[a].enabled) v += agg_affine[a].bias_f64 * cnt;
+                        /* (col + c) is null wherever col is: bias per non-null row. */
+                        if (agg_affine[a].enabled) v += agg_affine[a].bias_f64 * nn;
                         break;
                     case OP_PROD:
                         if (nn == 0) { v = NULL_F64; ray_vec_set_null(new_col, gi, true); break; }
@@ -16385,7 +16390,7 @@ sequential_fallback:;
                     case OP_SUM:
                         v = ROW_RD_I64(row, ly->off_sum, s);
                         if (agg_affine[a].enabled)
-                            v = wrap_add_i64(v, wrap_mul_i64(agg_affine[a].bias_i64, cnt));
+                            v = wrap_add_i64(v, wrap_mul_i64(agg_affine[a].bias_i64, nn));
                         break;
                     case OP_PROD:
                         if (nn == 0) { v = int_null; ray_vec_set_null(new_col, gi, true); break; }
