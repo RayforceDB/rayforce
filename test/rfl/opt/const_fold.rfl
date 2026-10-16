@@ -143,9 +143,11 @@
 ;; FLOOR(i64) in SELECT — line 365: is_f64=false
 (at (select {c: (floor 2) from: Tbase}) 'c) -- [2 2 2]
 
-;; NEG(u8) in SELECT — atom_to_numeric case -RAY_U8 (line 290, falls through to U8/BOOL code)
-;; 0x42 = 66 (U8 hex literal), neg → -66 (stored as i64 after fold)
-(at (select {c: (neg 0x42) from: Tbase}) 'c) -- [-66 -66 -66]
+;; SQRT(u8) in SELECT — atom_to_numeric case -RAY_U8 (falls through to U8/BOOL code)
+(at (select {c: (sqrt 0x04) from: Tbase}) 'c) -- [2.0 2.0 2.0]
+;; NEG(u8) is not folded: `neg` rejects U8 as the builtin does (#854)
+(neg 0x42) !- type
+(select {c: (neg 0x42) from: Tbase}) !- type
 
 ;; ====================================================================
 ;; Section 3: fold_binary_const — I64 arithmetic edge cases
