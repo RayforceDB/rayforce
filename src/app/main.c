@@ -83,10 +83,9 @@ static int64_t parse_size_arg(const char* s) {
  * password, a negative number) stays legal — refusing those would break
  * working command lines for no gain.
  *
- * Keep this list in step with the flags handled in main's parse loop and
- * with --help.  (ray_build_sys_args in src/ops/system.c walks argv a
- * second time for .sys.args; it only ever sees a command line that
- * already passed this guard, so it cannot mis-pair.)
+ * Keep this list in step with the flags handled in main's parse loop,
+ * ray_build_sys_args in src/ops/system.c, and --help.  The .sys.args
+ * builder walks argv again and must skip every flag's value too.
  * -------------------------------------------------------------------------- */
 static const char* const k_known_flags[] = {
     "-i", "--interactive", "-p", "--port", "-c", "--cores",

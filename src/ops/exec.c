@@ -1746,7 +1746,11 @@ static ray_t* exec_pushed_group_filter(ray_graph_t* g, ray_op_t* filter_op) {
  * scan or literal.  Only scalar expression nodes (OP_SCAN/OP_CONST and the
  * element-wise range OP_ROUND..OP_IDIV) are admitted in the walk; any other
  * opcode, an oversized graph, or overflow returns -1 — callers must treat
- * that as "unknown" and skip the optimisation. */
+ * that as "unknown" and skip the optimisation.  So does a constant holding
+ * several values: a vector of the table's length stands for a column, row
+ * aligned with the table, and the compacted survivors would read it from
+ * its first cell on (one of another length is the group's length error,
+ * which measures it against the table). */
 /* Opcodes handled by the elementwise case of exec_node_inner — must
  * match its case labels (ROUND sits at 9, outside NEG..CAST; IDIV at
  * 49, outside ADD..MAX2; extra unary math starts at 137). */
@@ -1794,7 +1798,12 @@ static int collect_scan_syms(ray_graph_t* g, const uint32_t* roots, int nroots,
             }
             continue;
         }
-        if (node->opcode == OP_CONST) continue;
+        if (node->opcode == OP_CONST) {
+            ray_op_ext_t* cx = find_ext(g, nid);
+            ray_t* lit = cx ? cx->literal : NULL;
+            if (lit && !ray_is_atom(lit) && ray_len(lit) != 1) return -1;
+            continue;
+        }
         /* Admit only scalar element-wise expression nodes. */
         if (!op_is_elementwise(node->opcode)) return -1;
 
@@ -1813,6 +1822,63 @@ static int collect_scan_syms(ray_graph_t* g, const uint32_t* roots, int nroots,
         }
     }
     return n;
+}
+
+/* Does a GROUP read a constant of several values as rows: a vector
+ * literal under its key or aggregate inputs, as one or as an operand of an
+ * element-wise node?  Such a vector stands for a column of the table it was
+ * written against, so compacting the table under a where: would leave it
+ * longer than the survivors.  An operand of any other node (the set of an
+ * `in`, say) is no row input and does not count. */
+static bool group_reads_vector_const(ray_graph_t* g, ray_op_ext_t* gx) {
+    if (!gx) return false;
+    uint32_t nc = g->node_count;
+    if (nc > 4096) return true;
+    bool visited[4096];
+    memset(visited, 0, nc * sizeof(bool));
+    uint32_t stack[64];
+    bool rows[64];
+    int sp = 0;
+    for (uint8_t k = 0; k < gx->n_keys; k++) {
+        if (sp >= 64) return true;
+        stack[sp] = gx->keys[k]; rows[sp++] = true;
+    }
+    for (uint8_t a = 0; a < gx->n_aggs; a++) {
+        uint32_t ins[2] = { gx->agg_ins ? gx->agg_ins[a] : RAY_OP_NONE,
+                            gx->agg_ins2 ? gx->agg_ins2[a] : RAY_OP_NONE };
+        for (int i = 0; i < 2; i++) {
+            if (ins[i] == RAY_OP_NONE) continue;
+            if (sp >= 64) return true;
+            stack[sp] = ins[i]; rows[sp++] = true;
+        }
+    }
+    while (sp > 0) {
+        sp--;
+        uint32_t nid = stack[sp];
+        bool as_rows = rows[sp];
+        if (nid >= nc) return true;
+        ray_op_t* node = &g->nodes[nid];
+        if (node->flags & OP_FLAG_DEAD) continue;
+        if (node->opcode == OP_CONST) {
+            ray_op_ext_t* cx = find_ext(g, nid);
+            ray_t* lit = cx ? cx->literal : NULL;
+            if (as_rows && lit && !ray_is_atom(lit) && ray_len(lit) != 1) return true;
+            continue;
+        }
+        if (visited[nid]) continue;
+        visited[nid] = true;
+        bool child_rows = op_is_elementwise(node->opcode);
+        ray_op_ext_t* nx = find_ext(g, nid);
+        uint32_t kids[3] = { node->arity > 0 ? node->in_id[0] : RAY_OP_NONE,
+                             node->arity > 1 ? node->in_id[1] : RAY_OP_NONE,
+                             nx && nx->third_in != 0 ? nx->third_in : RAY_OP_NONE };
+        for (int i = 0; i < 3; i++) {
+            if (kids[i] == RAY_OP_NONE) continue;
+            if (sp >= 64) return true;
+            stack[sp] = kids[i]; rows[sp++] = child_rows;
+        }
+    }
+    return false;
 }
 
 /* collect_scan_syms over a GROUP's key + agg-input subtrees. */
@@ -3284,7 +3350,8 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     if (res) { owned_tbl = res; tbl = res; }
                     /* NULL → lazy path; g->selection installed, tbl unchanged */
                 } else if (g->selection && tbl->type == RAY_TABLE &&
-                           group_has_keys(g, child_op)) {
+                           group_has_keys(g, child_op) &&
+                           !group_reads_vector_const(g, find_ext(g, child_op->id))) {
                     /* A keyless group (an all-aggregate select) is one row
                      * whatever the limit, and its aggregates read the
                      * selection themselves: compacting a no-match where:
