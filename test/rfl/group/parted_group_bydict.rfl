@@ -153,14 +153,14 @@
 (at (select {x: (sum x) from: LI by: {a: l t: s}}) 'x) -- [4 2 4 5]
 
 ;; splayed: the same answers
-;; (at (select {x: (sum x) from: LSP by: {a: l}}) 'a) -- (at RLa 'a)   ;; xfail BUG: a splayed LIST column loses the null of an inner vector ([0Nl] reads back as [-9223372036854775808]), by: l and plain reads alike
+(at (select {x: (sum x) from: LSP by: {a: l}}) 'a) -- (at RLa 'a)
 (at (select {x: (sum x) from: LSP by: {a: l}}) 'a) -- (at (select {x: (sum x) from: LSP by: l}) 'l)
 (at (select {x: (sum x) from: LSP by: {a: l}}) 'x) -- [4 7 4]
 (at (select {x: x from: LSP by: {a: l t: s}}) 'x) -- (at RLd 'x)
 
 ;; parted: parity with the flat oracle
 (set PLa (select {x: (sum x) from: LP by: {a: l}}))
-;; (at PLa 'a) -- (at (select {x: (sum x) from: LF by: {a: l}}) 'a)   ;; xfail BUG: stored LIST column loses an inner vector's null (see the splayed line above)
+(at PLa 'a) -- (at (select {x: (sum x) from: LF by: {a: l}}) 'a)
 (at PLa 'a) -- (at (select {x: (sum x) from: LP by: l}) 'l)
 (at PLa 'x) -- [44 77 44]
 (at PLa 'x) -- (at (select {x: (sum x) from: LF by: l}) 'x)
@@ -171,7 +171,7 @@
 (at (select {x: (sum x) from: LP by: [l s]}) 'x) -- [44 22 44 55]
 (at (select {x: x from: LP by: [l s]}) 'x) -- (at (select {x: x from: LF by: [l s]}) 'x)
 (set PLd (select {x: x from: LP by: {a: l t: s}}))
-;; (at PLd 'a) -- (at RLd 'a)   ;; xfail BUG: stored LIST column loses an inner vector's null (see the splayed line above)
+(at PLd 'a) -- (at RLd 'a)
 (at PLd 'a) -- (at (select {x: x from: LP by: [l s]}) 'l)
 (at PLd 'x) -- (list [1 3 10 30] [2 20] [4 40] [5 50])
 (at (select {from: LP by: {a: l t: s}}) 'x) -- [1 2 4 5]
