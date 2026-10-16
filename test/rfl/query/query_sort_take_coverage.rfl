@@ -895,6 +895,43 @@
 (lctm Ulc (table [m] (list [true false true]))) !- length
 (lcde Qlc Cdw) -- (lcde Ulc Cdw)
 (at (lcde Qlc Cdw) 'x) -- [1 3 5 6]
+;; more row-wise verbs keep the stream: the null test, sym-name, str-find,
+;; text concat under like, within between row-wise bounds
+(.db.splayed.set "/tmp/rfl_cklocal/w/2024.01.01/t/" (table [x y s] (list [1 2 3] [10.0 0Nf 20.0] ['a 'b 'c])))
+(.db.splayed.set "/tmp/rfl_cklocal/w/2024.01.02/t/" (table [x y s] (list [4 5 6] [30.0 35.0 0Nf] ['a 'x 'b])))
+(set Pwr (.db.parted.get "/tmp/rfl_cklocal/w/" 't))
+(set Fwr (select {from: Pwr where: (> x 0)}))
+(set lcw1 (fn [t] (select {x: x from: t where: (not (nil? y)) desc: x take: 2})))
+(set lcw2 (fn [t] (select {x: x from: t where: (if (> x 3) (nil? y) (> y 5)) desc: x take: 2})))
+(set lcw3 (fn [t] (select {x: x from: t where: (>= (str-find (as 'STR s) "a") 0) desc: x take: 2})))
+(set lcw4 (fn [t] (select {x: x from: t where: (like (sym-name s) "a*") desc: x take: 2})))
+(set lcw5 (fn [t] (select {x: x from: t where: (like (concat (as 'STR s) "z") "az") desc: x take: 2})))
+(set lcw6 (fn [t] (select {x: x from: t where: (within y (list x 100)) desc: x take: 2})))
+(set Brw (at (.sys.mem) 'sort-perpart-runs))
+(at (lcw1 Pwr) 'x) -- [5 4]
+(- (at (.sys.mem) 'sort-perpart-runs) Brw) -- 2
+(lcw1 Pwr) -- (lcw1 Fwr)
+(set Brw (at (.sys.mem) 'sort-perpart-runs))
+(lcw2 Pwr) -- (lcw2 Fwr)
+(- (at (.sys.mem) 'sort-perpart-runs) Brw) -- 2
+(set Brw (at (.sys.mem) 'sort-perpart-runs))
+(lcw3 Pwr) -- (lcw3 Fwr)
+(- (at (.sys.mem) 'sort-perpart-runs) Brw) -- 2
+(set Brw (at (.sys.mem) 'sort-perpart-runs))
+(lcw4 Pwr) -- (lcw4 Fwr)
+(- (at (.sys.mem) 'sort-perpart-runs) Brw) -- 2
+(set Brw (at (.sys.mem) 'sort-perpart-runs))
+(lcw5 Pwr) -- (lcw5 Fwr)
+(- (at (.sys.mem) 'sort-perpart-runs) Brw) -- 2
+(at (lcw5 Pwr) 'x) -- [4 1]
+(set Brw (at (.sys.mem) 'sort-perpart-runs))
+(lcw6 Pwr) -- (lcw6 Fwr)
+(- (at (.sys.mem) 'sort-perpart-runs) Brw) -- 2
+(at (lcw6 Pwr) 'x) -- [5 4]
+;; a concat of collections is not row-wise (it changes the length)
+(set Brw (at (.sys.mem) 'sort-perpart-runs))
+(select {x: x from: Pwr where: (in x (concat (as 'I64 y) [4])) desc: x take: 2}) -- (select {x: x from: Fwr where: (in x (concat (as 'I64 y) [4])) desc: x take: 2})
+(- (at (.sys.mem) 'sort-perpart-runs) Brw) -- 0
 ;; a draw is one draw over the table, not one per partition
 (set Bsd (at (.sys.mem) 'sort-perpart-runs))
 (count (select {x: x from: Qlc where: (>= (rand 6 100) 0) desc: x take: 2})) -- 2
@@ -994,6 +1031,26 @@ Ctg -- 1
 Ctg -- 1
 (value ((fn [t k] (select {c: (count y) by: k from: t where: (> y 15)})) Pcd Kcd)) -- (list [1 2] [1 3])
 (value ((fn [t k] (select {c: (count (distinct y)) d: (reverse y) by: k from: t where: (> y 15)})) Pcd Kcd)) -- (list [1 2] [1 3] (list [20] [50 40 30]))
+;; the carried key costs only the columns the clauses read: an aggregate
+;; route leaves the parted table as it is (the grouping reads the name), and
+;; the eval-level route copies the columns its clauses name, not the other
+;; eight (a whole copy peaked at 13 MB here; the aggregate route stays
+;; under 0.7 MB, 1.25 MB with a carried key; a where: on the key's hidden
+;; name carries it at 1.35 MB, 5.8 MB as a whole copy)
+(.db.splayed.set "/tmp/rfl_cklocal/m/2024.01.01/t/" (table [k y a b c d e f g h] (list (% (til 20000) 7) (til 20000) (til 20000) (til 20000) (til 20000) (til 20000) (til 20000) (til 20000) (til 20000) (til 20000))))
+(.db.splayed.set "/tmp/rfl_cklocal/m/2024.01.02/t/" (table [k y a b c d e f g h] (list (% (til 20000) 7) (+ 20000 (til 20000)) (til 20000) (til 20000) (til 20000) (til 20000) (til 20000) (til 20000) (til 20000) (til 20000))))
+(set Pmk (.db.parted.get "/tmp/rfl_cklocal/m/" 't))
+(set Fmk (select {from: Pmk where: (> y -1)}))
+(set Kmk (% (til 40000) 5))
+(set fmk (fn [t k] (select {s: (sum y) by: k from: t where: (> y 15)})))
+(set gmk (fn [t k] (select {s: (count (distinct y)) by: k from: t where: (> y 15)})))
+(< (at (.mem.ts (fmk Pmk Kmk)) 'peak-live-bytes) 1000000) -- true
+(< (at (.mem.ts (gmk Pmk Kmk)) 'peak-live-bytes) 8000000) -- true
+(fmk Pmk Kmk) -- (fmk Fmk Kmk)
+(set hmk (fn [t k] (select {s: (sum y) by: k from: t where: (> k 1)})))
+(hmk Pmk Kmk) -- (hmk Fmk Kmk)
+(< (at (.mem.ts (hmk Pmk Kmk)) 'peak-live-bytes) 3000000) -- true
+(gmk Pmk Kmk) -- (gmk Fmk Kmk)
 ;; a where: on the name the key's local hides reads the local, on the
 ;; parted table as on the flat one (the carried key beside the parted
 ;; columns kept every row of such a comparison)
@@ -1004,6 +1061,9 @@ Ctg -- 1
 (cdkr Scd Kcr) -- (cdkr Tcd Kcr)
 ((fn [t k] (value (select {c: (count (distinct y)) by: k from: t where: (< k 3)}))) Pcd Kcr) -- (list [1 2] [2 2])
 ((fn [t k] (value (select {c: (count (distinct y)) by: k from: t where: (== k 1)}))) Pcd Kcr) -- (list [1] [2])
+;; the aggregate grouping by a local named like a column, under a where:
+;; on that name, reads the local on a parted table too (it raised length)
+((fn [t k] (value (select {c: (sum y) by: k from: t where: (> k 1)}))) Pcd Kcr) -- (list [2 3] [90 20])
 ((fn [t k] (value (select {c: (sum y) by: k from: t where: (> k 1)}))) Pcd Kcr) -- ((fn [t k] (value (select {c: (sum y) by: k from: t where: (> k 1)}))) Tcd Kcr)
 ;; the key's own name in an aggregate reads the local as any other name of
 ;; that value does on the same grouping

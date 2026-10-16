@@ -11841,8 +11841,10 @@ static bool lambda_reads_a_col(ray_t* lam, ray_t* tbl) {
  * value on one partition's segment is not that segment's rows of its value
  * on the whole table?  Only row-wise builtins keep a segment's rows: the
  * elementwise ones (arithmetic, comparisons, logic, casts, temporal
- * fields), `if`, and `in`/`not-in`/`within`/`like` whose right side reads
- * no column, and `at`/indexing into a value that reads no column.  Any
+ * fields, `nil?`, `sym-name`), `if`, `in`/`not-in`/`within`/`like`/
+ * `str-find` whose right side reads no column, `within` between bounds
+ * `(list lo hi)` that are row-wise themselves, text `concat` under `like`,
+ * and `at`/indexing into a value that reads no column.  Any
  * other builtin over a column (an aggregate, a scan, sums, deltas, rank,
  * bin, concat, inner-prod, a moving window, take) answers per partition, as
  * do a lambda that reads a column, a callee the clause computes, and
@@ -11853,8 +11855,8 @@ static bool clause_segment_sensitive(ray_t* v, ray_t* tbl) {
         "and", "or", "not", "neg", "round", "floor", "ceil", "abs", "sqrt", "log",
         "exp", "sin", "asin", "cos", "acos", "tan", "atan", "reciprocal", "signum",
         "pow", "div", "fill", "if", "as", "xbar", "date", "time", "timestamp", "ss",
-        "hh", "minute", "yyyy", "mm", "dd", "dow", "doy", "strlen" };
-    static const char* const row_first[] = { "in", "not-in", "within", "like" };
+        "hh", "minute", "yyyy", "mm", "dd", "dow", "doy", "strlen", "nil?", "sym-name" };
+    static const char* const row_first[] = { "in", "not-in", "within", "like", "str-find" };
     static const char* const draw[] = { "rand" };
     if (!v || RAY_IS_ERR(v)) return false;
     if (v->type == RAY_LAMBDA) return true;
@@ -11878,9 +11880,26 @@ static bool clause_segment_sensitive(ray_t* v, ray_t* tbl) {
     if (sym_names_col(tbl, head->i64)) return true;              /* indexing a column */
     ray_t* b = sym_binding(head->i64);
     if (b && b->type == -RAY_SYM) b = sym_binding(b->i64);       /* a name of a function */
+    static const char* const like_fn[] = { "like" };
+    static const char* const within_fn[] = { "within" };
+    static const char* const concat_fn[] = { "concat" };
+    static const char* const list_fn[] = { "list" };
     bool args_sensitive = false;
-    for (int64_t i = 1; i < v->len && !args_sensitive; i++)
-        args_sensitive = clause_segment_sensitive(el[i], tbl);
+    for (int64_t i = 1; i < v->len && !args_sensitive; i++) {
+        ray_t* a = el[i];
+        ray_t** ae = (a && a->type == RAY_LIST && a->len >= 1) ? (ray_t**)ray_data(a) : NULL;
+        ray_t* ah = ae && ae[0] && ae[0]->type == -RAY_SYM && !(ae[0]->attrs & ATTR_QUOTED)
+                  ? sym_binding(ae[0]->i64) : NULL;
+        /* `like` matches text: a concat under it joins text row by row;
+         * `within` bounds written `(list lo hi)` are compared row by row */
+        if ((i == 1 && builtin_named(b, like_fn, 1) && builtin_named(ah, concat_fn, 1)) ||
+            (i == 2 && builtin_named(b, within_fn, 1) && builtin_named(ah, list_fn, 1))) {
+            for (int64_t j = 1; j < a->len && !args_sensitive; j++)
+                args_sensitive = clause_segment_sensitive(ae[j], tbl);
+            continue;
+        }
+        args_sensitive = clause_segment_sensitive(a, tbl);
+    }
     if (args_sensitive) return true;
     if (!b) return clause_reads_a_col(v, tbl);
     if (b->type == RAY_LAMBDA)
@@ -11892,7 +11911,13 @@ static bool clause_segment_sensitive(ray_t* v, ray_t* tbl) {
     if ((b->attrs & RAY_FN_ATOMIC) || builtin_named(b, row_fn, sizeof row_fn / sizeof row_fn[0]))
         return false;
     if (builtin_named(b, row_first, sizeof row_first / sizeof row_first[0])) {
-        for (int64_t i = 2; i < v->len; i++) if (clause_reads_a_col(el[i], tbl)) return true;
+        for (int64_t i = 2; i < v->len; i++) {
+            ray_t** be = el[i] && el[i]->type == RAY_LIST && el[i]->len >= 1 ? (ray_t**)ray_data(el[i]) : NULL;
+            if (i == 2 && be && builtin_named(b, within_fn, 1) && be[0] && be[0]->type == -RAY_SYM &&
+                !(be[0]->attrs & ATTR_QUOTED) && builtin_named(sym_binding(be[0]->i64), list_fn, 1))
+                continue;                                    /* row-wise bounds, checked above */
+            if (clause_reads_a_col(el[i], tbl)) return true;
+        }
         return false;
     }
     static const char* const at_fn[] = { "at" };
@@ -12455,6 +12480,40 @@ static bool parted_clauses_plain(ray_t* dict, ray_t* tbl) {
  * projection. */
 static bool clauses_name_their_columns(ray_t* dict, ray_t* tbl) {
     return !clauses_run_code(dict, tbl, false);
+}
+
+/* `tbl` (parted) flattened to the columns a clause of the select `dict`
+ * reads, every column when a clause runs code whose reads it does not
+ * show: the rest of the table is never copied.  Owned, or an error. */
+static ray_t* parted_flatten_clause_cols(ray_t* dict, ray_t* tbl) {
+    int64_t nc = ray_table_ncols(tbl);
+    bool all = clauses_run_code(dict, tbl, true);
+    ray_t* refs_hdr = NULL;
+    int64_t* refs = (int64_t*)scratch_alloc(&refs_hdr, (size_t)(nc > 0 ? nc : 1) * sizeof(int64_t));
+    if (!refs) return ray_error("oom", NULL);
+    int n = 0;
+    ray_t* keys = ray_dict_keys(dict);
+    ray_t* vals = ray_dict_vals(dict);
+    int64_t id_from = ray_sym_intern("from", 4);
+    if (!keys || keys->type != RAY_SYM || !vals || vals->type != RAY_LIST) all = true;
+    for (int64_t i = 0; !all && i < ray_dict_len(dict); i++)
+        if (sym_cell_runtime_id(keys, i) != id_from)
+            n = collect_col_refs_set(((ray_t**)ray_data(vals))[i], tbl, refs, (int)nc, n);
+    ray_t* out = ray_table_new(nc);
+    for (int64_t c = 0; c < nc && out && !RAY_IS_ERR(out); c++) {
+        int64_t cn = ray_table_col_name(tbl, c);
+        ray_t* col = ray_table_get_col_idx(tbl, c);
+        bool want = all || (n == 0 && c == 0);   /* one column keeps the row count */
+        for (int r = 0; r < n && !want; r++) want = refs[r] == cn;
+        if (!want || !col) continue;
+        ray_t* v = (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON)
+                 ? query_materialize_parted_col(col, tbl) : (ray_retain(col), col);
+        if (!v || RAY_IS_ERR(v)) { ray_release(out); out = v ? v : ray_error("oom", NULL); break; }
+        out = ray_table_add_col(out, cn, v);
+        ray_release(v);
+    }
+    scratch_free(refs_hdr);
+    return out ? out : ray_error("oom", NULL);
 }
 
 /* Does `expr` hold a vector of several values, written or named (a global
@@ -13994,19 +14053,39 @@ by_dict_done:
     /* A by: name that reads no column but holds one value per row of the
      * table (a lambda parameter, a let, a global vector) is carried under a
      * where: as the hidden column __by_key, so the filter keeps its rows in
-     * the one run of where: (the eval-level grouping groups on it).  A
-     * parted table is flattened first: a flat column beside parted ones is
-     * no table the filter reads (it kept every row of a comparison on a
-     * name the key hides), and such a grouping does not stream. */
+     * the one run of where: (the eval-level grouping, which outputs the
+     * grouping DAG does not serve take, groups on it; the DAG route reads
+     * the name itself).  A parted table is flattened first, to the columns
+     * the clauses read: a flat column beside parted ones is no table the
+     * filter reads (it kept every row of a comparison on a name the key
+     * hides), and such a grouping does not stream. */
     bool by_key_carried = false;
-    if (where_expr && by_expr && by_expr->type == -RAY_SYM && !(by_expr->attrs & ATTR_QUOTED) &&
-        select_output_count(dict_elems, dict_n) > 0 && !sym_names_col(tbl, by_expr->i64) &&
+    bool by_key_carry = false;   /* an output the grouping DAG does not serve, or a where: below */
+    for (int64_t i = 0; i + 1 < dict_n && !by_key_carry; i += 2) {
+        int64_t kid = dict_elems[i]->i64;
+        if (kid == from_id || kid == where_id || kid == by_id || kid == take_id ||
+            kid == asc_id || kid == desc_id || kid == nearest_id) continue;
+        ray_t* ov = dict_elems[i + 1];
+        by_key_carry = !is_single_group_key_projection(by_expr, ov) &&
+                        !is_group_dag_agg_expr(ov, tbl) && !is_decomposable_agg_compound(ov, tbl);
+    }
+    /* A where: comparing the name of a column the key's local hides reads
+     * the local; the parted aggregate grouping raised length on that, so
+     * the key is carried (the parted table copied to the columns read) for
+     * it too.  Any other aggregate grouping keeps the table as it is. */
+    if (!by_key_carry && where_expr && by_expr && by_expr->type == -RAY_SYM &&
+        !(by_expr->attrs & ATTR_QUOTED) && table_has_parted_columns(tbl) &&
+        ray_table_get_col(tbl, by_expr->i64) && ray_env_get_lexical_local(by_expr->i64) &&
+        clause_names_sym(where_expr, by_expr->i64))
+        by_key_carry = true;
+    if (where_expr && by_key_carry && by_expr && by_expr->type == -RAY_SYM &&
+        !(by_expr->attrs & ATTR_QUOTED) && !sym_names_col(tbl, by_expr->i64) &&
         !ray_table_get_col(tbl, ray_sym_intern("__by_key", 8))) {
         ray_t* kv = sym_binding(by_expr->i64);
         if (kv && !ray_is_atom(kv) && (ray_is_vec(kv) || kv->type == RAY_LIST) &&
             ray_len(kv) == ray_table_nrows(tbl)) {
             if (table_has_parted_columns(tbl)) {
-                ray_t* flat = query_materialize_parted_table(tbl);
+                ray_t* flat = parted_flatten_clause_cols(dict, tbl);
                 ray_release(tbl);
                 if (!flat || RAY_IS_ERR(flat)) {
                     scratch_free(dep_src_hdr);
