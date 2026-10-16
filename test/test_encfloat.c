@@ -33,6 +33,9 @@
 #include "store/enccol.h"
 #include "store/colrange.h"
 #include "store/enceval.h"
+#include "store/splay.h"
+#include "ops/fused_topk.h"
+#include "ops/idxop.h"
 #include "ops/ops.h"
 #include "lang/env.h"
 #include "lang/format.h"
@@ -1285,24 +1288,48 @@ static bool fl_eval_ok(const char* src) {
     if (r) ray_release(r);
     return true;
 }
-/* q on generation 0 (table vc0) and generation 2 (vc2) as T: equal types
- * and formatted results. */
-static test_result_t fl_same(const char* q) {
-    ray_t* out[2];
-    for (int gen = 0; gen < 2; gen++) {
-        TEST_ASSERT_TRUE(fl_eval_ok(gen ? "(set T (.db.splayed.get \"" FL_TMP "/vc2/\"))"
-                                        : "(set T (.db.splayed.get \"" FL_TMP "/vc0/\"))"));
-        out[gen] = fl_eval(q);
-        TEST_ASSERT_FMT(out[gen] && !RAY_IS_ERR(out[gen]), "%s gen %d: %s", q, gen, ray_error_msg());
+/* Float bits of results a and b equal: F32 / F64 atoms (both hold a
+ * double) and vectors bit for bit, a table column by column; formatting
+ * prints both zeros as 0.0, so it cannot tell them apart. */
+static bool fl_bits_eq(ray_t* a, ray_t* b) {
+    if (a->type != b->type) return false;
+    if (a->type == -RAY_F64 || a->type == -RAY_F32) return memcmp(&a->f64, &b->f64, 8) == 0;
+    if (a->type == RAY_F64 || a->type == RAY_F32)
+        return a->len == b->len && memcmp(ray_data(a), ray_data(b), (size_t)a->len * (a->type == RAY_F64 ? 8 : 4)) == 0;
+    if (a->type == RAY_TABLE) {
+        if (ray_table_ncols(a) != ray_table_ncols(b)) return false;
+        for (int64_t c = 0; c < ray_table_ncols(a); c++) {
+            ray_t* ca = ray_table_get_col_idx(a, c); ray_t* cb = ray_table_get_col_idx(b, c);
+            if (!ca || !cb || !fl_bits_eq(ca, cb)) return false;
+        }
     }
-    TEST_ASSERT_FMT(out[0]->type == out[1]->type, "%s: type %d vs %d", q, out[0]->type, out[1]->type);
+    return true;
+}
+
+/* q on generation 0 (table <name>0) and generation 2 (<name>2) as T: equal
+ * types, formatted results and float bits. */
+static test_result_t flr_same(const char* name, const char* q) {
+    char buf[512]; ray_t* out[2];
+    for (int gen = 0; gen < 2; gen++) {
+        snprintf(buf, sizeof buf, "(set T (.db.splayed.get \"" FL_TMP "/%s%d/\"))", name, gen ? 2 : 0);
+        TEST_ASSERT_TRUE(fl_eval_ok(buf));
+        out[gen] = fl_eval(q);
+        TEST_ASSERT_FMT(out[gen] && !RAY_IS_ERR(out[gen]), "%s: %s gen %d: %s", name, q, gen, ray_error_msg());
+    }
+    TEST_ASSERT_FMT(out[0]->type == out[1]->type, "%s: %s: type %d vs %d", name, q, out[0]->type, out[1]->type);
     ray_t* fa = ray_fmt(out[0], 0); ray_t* fb2 = ray_fmt(out[1], 0);
     bool eq = ray_str_len(fa) == ray_str_len(fb2) && memcmp(ray_str_ptr(fa), ray_str_ptr(fb2), ray_str_len(fa)) == 0;
     if (!eq) fprintf(stderr, "gen 0: %.*s\ngen 2: %.*s\n", (int)ray_str_len(fa), ray_str_ptr(fa), (int)ray_str_len(fb2), ray_str_ptr(fb2));
+    bool beq = eq && fl_bits_eq(out[0], out[1]);
+    if (eq && !beq && (out[0]->type == -RAY_F64 || out[0]->type == -RAY_F32))
+        fprintf(stderr, "gen 0: %a\ngen 2: %a\n", out[0]->f64, out[1]->f64);
     ray_release(fa); ray_release(fb2); ray_release(out[0]); ray_release(out[1]);
-    TEST_ASSERT_FMT(eq, "%s differs", q);
+    TEST_ASSERT_FMT(eq, "%s: %s differs", name, q);
+    TEST_ASSERT_FMT(beq, "%s: %s: float bits differ", name, q);
     PASS();
 }
+#define FLR_SAME(n, q) do { test_result_t r_ = flr_same((n), (q)); if (r_.status != TEST_PASS) return r_; } while (0)
+static test_result_t fl_same(const char* q) { return flr_same("vc", q); }
 #define FL_SAME(q) do { test_result_t r_ = fl_same(q); if (r_.status != TEST_PASS) return r_; } while (0)
 
 /* -0.0 / +0.0 alternating (with 1.5, -2.0 and NaN nulls), in runs forced
@@ -1480,6 +1507,434 @@ static test_result_t test_filter_views(void) {
     PASS();
 }
 
+/* ---- the conformance battery (Task 7): every answer against generation 0
+ * (the same data saved {compress: false}); every float column is built in
+ * C and bound (D10: -0.0 as its bit pattern, #824) ---- */
+
+/* Binds table tb (consumed) as W and saves it as <name>0 (generation 0)
+ * and <name>2 (generation 2, every float vector forced to enc, -1:
+ * selection).  False on any failure. */
+static bool flr_save(const char* name, ray_t* tb, int enc) {
+    if (!tb || RAY_IS_ERR(tb)) return false;
+    ray_err_t e = ray_env_set(ray_sym_intern("W", 1), tb);
+    ray_release(tb);
+    if (e != RAY_OK) return false;
+    char q[256];
+    snprintf(q, sizeof q, "(.db.splayed.set \"" FL_TMP "/%s0/\" W {compress: false})", name);
+    if (!fl_eval_ok(q)) return false;
+    ray_encw_test_force_float(enc);
+    snprintf(q, sizeof q, "(.db.splayed.set \"" FL_TMP "/%s2/\" W {compress: true})", name);
+    bool ok = fl_eval_ok(q);
+    ray_encw_test_force_float(-1);
+    return ok && fl_eval_ok("(set W 0)");
+}
+/* A table of the given columns (each consumed). */
+static ray_t* flr_table(int n, const char* const* names, ray_t* const* cols) {
+    ray_t* tb = ray_table_new(n);
+    for (int i = 0; i < n; i++) {
+        tb = ray_table_add_col(tb, ray_sym_intern(names[i], strlen(names[i])), cols[i]);
+        ray_release(cols[i]);
+    }
+    return tb;
+}
+static ray_t* flr_til(int64_t n) {
+    ray_t* v = ray_vec_new(RAY_I64, n); v->len = n;
+    for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(v))[i] = i;
+    return v;
+}
+/* Encoding of vector vec of column col of <name>2 (its descriptor), or -1. */
+static int flr_enc(const char* name, const char* col, int64_t vec) {
+    char q[256];
+    snprintf(q, sizeof q, "(.db.splayed.get \"" FL_TMP "/%s2/\")", name);
+    ray_t* t = fl_eval(q);
+    if (!t || RAY_IS_ERR(t)) { if (t) ray_error_free(t); return -1; }
+    ray_t* encv = ray_table_get_col_enc(t, ray_sym_intern(col, strlen(col)));
+    int enc = -1;
+    if (encv) {
+        const ray_enc_desc_t* d;
+        ray_t* err = ray_enccol_chunk_descs_ref(ray_enccol_of(encv), vec / RAY_ENC_VECS_PER_CHUNK, &d);
+        if (!err) enc = d[vec % RAY_ENC_VECS_PER_CHUNK].encoding; else ray_error_free(err);
+    }
+    ray_release(t);
+    return enc;
+}
+/* Rows of float column v holding -0.0 and +0.0, by bit pattern. */
+static void flr_zeros(ray_t* v, int64_t* neg, int64_t* pos) {
+    *neg = *pos = 0;
+    for (int64_t i = 0; i < v->len; i++) {
+        uint64_t b = 0;
+        if (v->type == RAY_F64) memcpy(&b, (const double*)ray_data(v) + i, 8);
+        else { uint32_t w; memcpy(&w, (const float*)ray_data(v) + i, 4); b = w == (uint32_t)NEG0_32 ? NEG0_64 : w; }
+        if (b == NEG0_64) (*neg)++; else if (b == 0) (*pos)++;
+    }
+}
+/* The live file of column col of splayed directory dir (a "/tmp" path):
+ * saves publish a generation through .current (#649 / #713). */
+static bool flr_live(const char* dir, const char* col, char* out, size_t cap) {
+    char cur[1024];
+    if (ray_splay_resolve_dir(ray_test_tmp(dir), cur, sizeof cur) != RAY_OK) return false;
+    int n = snprintf(out, cap, "%s/%s", cur, col);
+    return n > 0 && (size_t)n < cap;
+}
+/* Files a and b hold the same bytes: 0, else a negative step. */
+static int flr_same_file(const char* a, const char* b) {
+    FILE* fa = fopen(a, "rb"); FILE* fb2 = fopen(b, "rb");
+    int rc = 0;
+    uint8_t ba[65536], bb[65536];
+    if (!fa || !fb2) rc = -1;
+    while (rc == 0) {
+        size_t na = fread(ba, 1, sizeof ba, fa), nb = fread(bb, 1, sizeof bb, fb2);
+        if (na != nb) rc = -2;
+        else if (memcmp(ba, bb, na) != 0) rc = -3;
+        else if (na == 0) break;
+    }
+    if (fa) fclose(fa);
+    if (fb2) fclose(fb2);
+    return rc;
+}
+
+/* Review focus 1: both zeros through every float encoding, F64 and F32;
+ * every comparison with both literals, in, top-k, which zero min / max
+ * return (6000 rows, below RAY_PARALLEL_THRESHOLD: P3's ruling on the
+ * zero sign) and the column itself, bit for bit. */
+static test_result_t test_signed_zeros_battery(void) {
+    _Static_assert(RAY_PARALLEL_THRESHOLD > 6000, "the zero-sign tables must stay serial");
+    static const int encs[] = { -1, RAY_ENC_RAW, RAY_ENC_RLE, RAY_ENC_DICT, RAY_ENC_ALP, RAY_ENC_ALP_RD };
+    static const char* const qs[] = {
+        "(count (select {from: T where: (== f 0.0)}))", "(count (select {from: T where: (== f -0.0)}))",
+        "(count (select {from: T where: (< f 0.0)}))",  "(count (select {from: T where: (<= f -0.0)}))",
+        "(count (select {from: T where: (> f -0.0)}))", "(count (select {from: T where: (>= f 0.0)}))",
+        "(count (select {from: T where: (!= f 0.0)}))", "(count (select {from: T where: (!= f -0.0)}))",
+        "(count (select {from: T where: (in f [0.0 -3.5])}))", "(count (select {from: T where: (in f [-0.0])}))",
+        "(count (select {from: T where: (not (in f [0.0]))}))",
+        "(select {f: f k: k from: T asc: f take: 5})", "(select {f: f k: k from: T desc: f take: 5})",
+        "(select {f: f k: k from: T where: (> k 1000) asc: f take: 5})",
+        "(select {f: f k: k from: T where: (> k 1000) desc: f take: 5})",
+        "(min (at T 'f))", "(max (at T 'f))", "(at T 'f)", NULL,
+    };
+    const int64_t n = 6000;
+    static double d[6000];
+    const double dv[4] = { -3.5, bd(NEG0_64), 0.0, 2.25 };
+    for (int t = 0; t < 2; t++)                                  /* zeros only; zeros among values */
+    for (int ty = 0; ty < 2; ty++)                               /* F64, F32 */
+    for (size_t k = 0; k < sizeof encs / sizeof encs[0]; k++) {
+        for (int64_t i = 0; i < n; i++) d[i] = t == 0 ? ((i % 2048) < 1024 ? bd(NEG0_64) : 0.0) : dv[(i / 3) % 4];
+        ray_t* f = fl_typed(ty ? RAY_F32 : RAY_F64, d, n);
+        int64_t zn, zp; flr_zeros(f, &zn, &zp);
+        TEST_ASSERT_FMT(zn > 0 && zp > 0, "table %d type %d: %lld -0.0 and %lld +0.0 rows", t, ty, (long long)zn, (long long)zp);
+        char name[16]; snprintf(name, sizeof name, "z%d%d_%zu", t, ty, k);
+        TEST_ASSERT_TRUE(flr_save(name, flr_table(2, (const char* const[]){ "f", "k" }, (ray_t* const[]){ f, flr_til(n) }), encs[k]));
+        if (encs[k] >= 0)
+            for (int64_t v = 0; v < (n + 1023) / 1024; v++)
+                TEST_ASSERT_FMT(flr_enc(name, "f", v) == encs[k], "%s vector %lld: encoding %d", name, (long long)v, flr_enc(name, "f", v));
+        for (int i = 0; qs[i]; i++) FLR_SAME(name, qs[i]);
+    }
+    /* CONST: a vector of -0.0, then one of +0.0 */
+    for (int ty = 0; ty < 2; ty++) {
+        for (int64_t i = 0; i < 2048; i++) d[i] = i < 1024 ? bd(NEG0_64) : 0.0;
+        ray_t* f = fl_typed(ty ? RAY_F32 : RAY_F64, d, 2048);
+        int64_t zn, zp; flr_zeros(f, &zn, &zp);
+        TEST_ASSERT_TRUE(zn == 1024 && zp == 1024);
+        const char* name = ty ? "zc1" : "zc0";
+        TEST_ASSERT_TRUE(flr_save(name, flr_table(2, (const char* const[]){ "f", "k" }, (ray_t* const[]){ f, flr_til(2048) }), RAY_ENC_CONST));
+        TEST_ASSERT_EQ_I(flr_enc(name, "f", 0), RAY_ENC_CONST);
+        TEST_ASSERT_EQ_I(flr_enc(name, "f", 1), RAY_ENC_CONST);
+        for (int i = 0; qs[i]; i++) FLR_SAME(name, qs[i]);
+    }
+    PASS();
+}
+
+/* Review focus 5: float sums bit-identical while vectors change encoding:
+ * cancellation, overflow to infinity, all -0.0, ALP decimals, and a column
+ * whose vectors select CONST and DICT in turn (chunk 0's dictionary holds
+ * every value, so DICT, its codes RLE where they run, takes the rest).  The tables stay
+ * below RAY_PARALLEL_THRESHOLD: over it, this branch's float reduction keeps
+ * one accumulator per worker while tasks are claimed dynamically, so float
+ * sums vary from run to run in generation 0 itself (fixed on dev by #744,
+ * chunk-ordered partials; it arrives with the dev merge). */
+static test_result_t test_float_sums(void) {
+    static const int64_t ns[] = { 64512, 4096, 5000, 64512, 64512 };
+    static const int encs[] = { -1, RAY_ENC_RAW, RAY_ENC_RLE, RAY_ENC_CONST, RAY_ENC_ALP, RAY_ENC_ALP_RD };
+    _Static_assert(64512 < RAY_PARALLEL_THRESHOLD, "the float sums must stay serial");
+    for (int t = 0; t < 5; t++)
+        for (size_t k = 0; k < sizeof encs / sizeof encs[0]; k++) {
+            if (encs[k] == RAY_ENC_CONST && t != 2) continue;          /* constant per vector only there */
+            const int64_t n = ns[t];
+            ray_t* f = ray_vec_new(RAY_F64, n); f->len = n;
+            double* fd = (double*)ray_data(f);
+            uint64_t s = 5;
+            for (int64_t j = 0; j < n; j++) {
+                s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+                const int64_t v = j / 1024;                            /* t == 4: by vector */
+                fd[j] = t == 0 ? ((j % 1024) < 512 ? 1e16 : 1.0)
+                      : t == 1 ? (j % 2 == 0 ? 1.7976931348623157e308 : 1e308)
+                      : t == 2 ? bd(NEG0_64)
+                      : t == 3 ? (double)(j % 997) / 10.0
+                      : v % 4 == 0 ? 1e16 + (double)v                  /* CONST */
+                      : v % 4 == 1 ? (double)((j / 64) % 5) * 3.3     /* runs */
+                      : v % 4 == 2 ? (j % 3 ? -1e16 : 0.1)             /* cancellation */
+                      : (double)(s >> 11) / 1024.0 - 4e12;             /* random */
+            }
+            char name[16]; snprintf(name, sizeof name, "s%d_%zu", t, k);
+            TEST_ASSERT_TRUE(flr_save(name, flr_table(1, (const char* const[]){ "f" }, (ray_t* const[]){ f }), encs[k]));
+            if (encs[k] >= 0) TEST_ASSERT_FMT(flr_enc(name, "f", 0) == encs[k], "%s: encoding %d", name, flr_enc(name, "f", 0));
+            if (t == 4 && encs[k] < 0) {                               /* the vectors change encoding */
+                int seen[RAY_ENC_ALP_RD + 1] = { 0 };
+                for (int64_t v = 0; v < n / 1024; v++) { int e = flr_enc(name, "f", v); if (e >= 0 && e <= RAY_ENC_ALP_RD) seen[e] = 1; }
+                TEST_ASSERT_FMT(seen[RAY_ENC_CONST] && seen[RAY_ENC_DICT], "encodings of vectors 0-3: %d %d %d %d",
+                                flr_enc(name, "f", 0), flr_enc(name, "f", 1), flr_enc(name, "f", 2), flr_enc(name, "f", 3));
+            }
+            FLR_SAME(name, "(sum (at T 'f))");
+            FLR_SAME(name, "(avg (at T 'f))");
+            FLR_SAME(name, "(select {s: (sum f) from: T where: (> f -1e300)})");
+            FLR_SAME(name, "(select {s: (sum f) a: (avg f) from: T})");
+        }
+    PASS();
+}
+
+/* Float first keys are never pruned: nulls, both zeros and both infinities,
+ * results and order equal to generation 0 under every float encoding. */
+static test_result_t test_topk_floats(void) {
+    const int64_t n = 140000;
+    static const int encs[] = { -1, RAY_ENC_RAW, RAY_ENC_DICT, RAY_ENC_ALP, RAY_ENC_ALP_RD };
+    static const char* const qs[] = {
+        "(select {f: f v: v from: T asc: f take: 20})", "(select {f: f v: v from: T desc: f take: 20})",
+        "(select {f: f v: v from: T where: (> v 1000) asc: f take: 5})",
+        "(select {f: f v: v from: T where: (> v 1000) desc: f take: 5})", NULL,
+    };
+    for (size_t k = 0; k < sizeof encs / sizeof encs[0]; k++) {
+        ray_t* f = ray_vec_new(RAY_F64, n); f->len = n;
+        double* fd = (double*)ray_data(f);
+        for (int64_t j = 0; j < n; j++)
+            fd[j] = j % 11 == 0 ? NULL_F64 : j % 7 == 0 ? bd(NEG0_64) : j % 13 == 0 ? INFINITY
+                  : j % 17 == 0 ? -INFINITY : (double)((j * 7919) % 1000) / 4.0;
+        f->attrs |= RAY_ATTR_HAS_NULLS;
+        int64_t zn, zp; flr_zeros(f, &zn, &zp);
+        TEST_ASSERT_TRUE(zn > 0 && zp > 0);
+        char name[16]; snprintf(name, sizeof name, "tk%zu", k);
+        TEST_ASSERT_TRUE(flr_save(name, flr_table(2, (const char* const[]){ "f", "v" }, (ray_t* const[]){ f, flr_til(n) }), encs[k]));
+        if (encs[k] >= 0) TEST_ASSERT_FMT(flr_enc(name, "f", 70) == encs[k], "%s: encoding %d", name, flr_enc(name, "f", 70));
+        for (int i = 0; qs[i]; i++) {
+            ray_fused_topk_counters_reset();
+            FLR_SAME(name, qs[i]);
+            uint64_t ch = 1, ve = 1; ray_fused_topk_test_pruned(&ch, &ve);
+            TEST_ASSERT_FMT(ch == 0 && ve == 0, "%s %s: pruned %llu chunk slots, %llu vectors", name, qs[i],
+                            (unsigned long long)ch, (unsigned long long)ve);
+        }
+    }
+    PASS();
+}
+
+/* The deepest legal float chain is depth 2 (Decisions: "Cascade depth"):
+ * ALP, its ints child RLE (depth 1), the RLE values child a leaf (depth 2). */
+static test_result_t test_depth_bound(void) {
+    uint64_t v[RAY_ENC_VEC];
+    for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = db((double)(i / 256) * 0.5);   /* ALP ints: four runs */
+    ray_enc_buf_t* bp = &fl_buf;                                       /* freed in teardown */
+    TEST_ASSERT_TRUE(ray_enc_alp_write(v, RAY_ENC_VEC, 64, 1, 0, bp));
+    TEST_ASSERT_EQ_I(bp->p[8], RAY_ENC_RLE);                                   /* ints child, depth 1 */
+    TEST_ASSERT_TRUE(bp->p[8 + 8 + 8] == RAY_ENC_RAW || bp->p[8 + 8 + 8] == RAY_ENC_FOR_BP);   /* its values, depth 2 */
+    uint64_t out[RAY_ENC_VEC];
+    TEST_ASSERT_EQ_I(ray_enc_alp_read(bp->p, bp->len, RAY_ENC_VEC, 64, out), (int64_t)bp->len);
+    TEST_ASSERT_TRUE(memcmp(out, v, sizeof v) == 0);
+    /* a third level (the values child itself RLE) is corrupt */
+    bp->p[8 + 8 + 8] = RAY_ENC_RLE;
+    TEST_ASSERT_EQ_I(ray_enc_alp_read(bp->p, bp->len, RAY_ENC_VEC, 64, out), -1);
+    PASS();
+}
+
+/* Float filters on DICT vectors: no materialization, and no vector decoded
+ * where the encoded form answers. */
+static test_result_t test_no_materialization(void) {
+    const int64_t n = 70000;
+    const double dv[4] = { -3.5, bd(NEG0_64), 0.0, 2.25 };
+    ray_t* f = ray_vec_new(RAY_F64, n); f->len = n;
+    for (int64_t i = 0; i < n; i++) ((double*)ray_data(f))[i] = dv[(i * 7) % 4];   /* scattered: FOR_BP codes */
+    TEST_ASSERT_TRUE(flr_save("nm", flr_table(1, (const char* const[]){ "f" }, (ray_t* const[]){ f }), RAY_ENC_DICT));
+    TEST_ASSERT_EQ_I(flr_enc("nm", "f", 0), RAY_ENC_DICT);
+    TEST_ASSERT_EQ_I(flr_enc("nm", "f", 68), RAY_ENC_DICT);
+    static const char* const qs[] = {
+        "(count (select {from: T where: (<= f 0.0)}))", "(count (select {from: T where: (== f -0.0)}))",
+        "(count (select {from: T where: (> f -0.0)}))", NULL,
+    };
+    for (int i = 0; qs[i]; i++) {
+        TEST_ASSERT_TRUE(fl_eval_ok("(set T (.db.splayed.get \"" FL_TMP "/nm2/\"))"));
+        ray_enc_counters_reset();
+        TEST_ASSERT_TRUE(fl_eval_ok(qs[i]));
+        ray_enc_counters_t c; ray_enc_counters_get(&c);
+        TEST_ASSERT_FMT(c.materialized == 0 && c.decoded_bytes == 0, "%s: materialized %llu, decoded %llu bytes", qs[i],
+                        (unsigned long long)c.materialized, (unsigned long long)c.decoded_bytes);
+        FLR_SAME("nm", qs[i]);
+    }
+    PASS();
+}
+
+/* Chunk 0 of the stream / re-save columns: shape 0 is the brief's (i % 300)
+ * / 4, whose stride-32 training samples are all integers, so the trained
+ * ALP candidate is (0, 0) and the later two-decimal vectors take ALP_RD
+ * (the sampler weakness carried to Task 8); shape 1's samples carry two
+ * decimals, so the later vectors take the chunk-0 candidates (ALP). */
+static double flr_shape(int shape, int64_t i) {
+    if (i >= 65536) return (double)((i * 7919) % 100000) / 100.0 + 2000.0;
+    return shape == 0 ? (double)(i % 300) / 4.0 : (double)(i % 64) * 1.37 + 1000.01;
+}
+
+/* The stream writer and the resident writer agree byte for byte on a float
+ * column that trains VALUE_DICT and the ALP candidates (spec "Encoding
+ * selection"): chunk 0 DICT, chunks 1-2 ALP.  %.17g round-trips every
+ * double through the parser, so both writers see the same bits. */
+static test_result_t test_stream_equals_resident(void) {
+    for (int shape = 0; shape < 2; shape++) {
+        FILE* f = fopen(ray_test_tmp(FL_TMP "/in.csv"), "w");
+        TEST_ASSERT_NOT_NULL(f);
+        fprintf(f, "f\n");
+        for (int64_t i = 0; i < 140000; i++) fprintf(f, "%.17g\n", flr_shape(shape, i));
+        fclose(f);
+        (void)ray_test_rm_rf(ray_test_tmp(FL_TMP "/cs")); (void)ray_test_rm_rf(ray_test_tmp(FL_TMP "/c0"));
+        TEST_ASSERT_TRUE(fl_eval_ok("(.csv.splayed {compress: true} [F64] \"" FL_TMP "/in.csv\" \"" FL_TMP "/cs/\")"));
+        TEST_ASSERT_TRUE(fl_eval_ok("(.csv.splayed {compress: false} [F64] \"" FL_TMP "/in.csv\" \"" FL_TMP "/c0/\")"));
+        ray_t* t0 = fl_eval("(.db.splayed.get \"" FL_TMP "/c0/\")");
+        TEST_ASSERT_TRUE(t0 && !RAY_IS_ERR(t0));
+        ray_t* col = ray_table_col(t0, ray_sym_intern("f", 1));
+        /* the parser gives the written bits; both writers read through it,
+         * so the comparison below holds either way.  The one tolerated
+         * difference is +0.0 read as -0.0: release builds' ray_parse_f64
+         * folds the zero's sign under -fno-signed-zeros (#850). */
+        bool bits = col && !RAY_IS_ERR(col) && col->type == RAY_F64 && col->len == 140000;
+        int64_t bad = -1;
+        for (int64_t i = 0; bits && i < 140000; i++) {
+            uint64_t w = db(flr_shape(shape, i)), r; memcpy(&r, (const double*)ray_data(col) + i, 8);
+            if (!(bits = r == w || (w == 0 && r == NEG0_64)) ) bad = i;
+        }
+        if (bad >= 0) fprintf(stderr, "shape %d row %lld: wrote %a, read %a\n", shape, (long long)bad,
+                              flr_shape(shape, bad), ((const double*)ray_data(col))[bad]);
+        ray_err_t e = bits ? ray_col_save_gen(col, ray_test_tmp(FL_TMP "/rs_f"), 2) : RAY_ERR_TYPE;
+        ray_release(t0);
+        TEST_ASSERT_FMT(bits, "shape %d: the parser did not give the written bits", shape);
+        TEST_ASSERT_EQ_I(e, RAY_OK);                                   /* the resident writer, plain source */
+        char sp[1200];
+        TEST_ASSERT_TRUE(flr_live(FL_TMP "/cs/", "f", sp, sizeof sp));
+        TEST_ASSERT_FMT(flr_same_file(sp, ray_test_tmp(FL_TMP "/rs_f")) == 0, "shape %d: stream and resident bytes differ", shape);
+        TEST_ASSERT_EQ_I(desc_enc(sp, 0), RAY_ENC_DICT);               /* VALUE_DICT trained */
+        if (shape == 1) {
+            TEST_ASSERT_EQ_I(desc_enc(sp, 64), RAY_ENC_ALP);           /* ALP candidates trained */
+            TEST_ASSERT_EQ_I(desc_enc(sp, 128), RAY_ENC_ALP);
+        }
+    }
+    PASS();
+}
+
+/* An encoded source re-saved (the range writer, colw_gen2_range) gives the
+ * bytes of the resident save of the same data: DICT column d (both zeros,
+ * nulls), column a DICT in chunk 0 and ALP after it, F32 twin g; by
+ * selection and with ALP forced.  The re-save materializes nothing. */
+static test_result_t test_resave_equals_resident(void) {
+    const int64_t n = 140000;
+    static double ad[140000], dd[140000];
+    const double dv[6] = { bd(NEG0_64), 0.0, 0.5, 1.0, 1.5, -2.0 };
+    for (int64_t i = 0; i < n; i++) {
+        dd[i] = i % 4999 == 3 ? NULL_F64 : dv[(i * 7) % 6];
+        ad[i] = i % 5000 == 7 ? NULL_F64 : flr_shape(1, i);
+    }
+    static const int encs[] = { -1, RAY_ENC_ALP };
+    static const char* const cols[] = { "d", "a", "g" };
+    for (size_t k = 0; k < 2; k++) {
+        ray_t* tb = flr_table(3, cols, (ray_t* const[]){ fl_typed(RAY_F64, dd, n), fl_typed(RAY_F64, ad, n), fl_typed(RAY_F32, ad, n) });
+        TEST_ASSERT_TRUE(flr_save(k ? "rf" : "rs", tb, encs[k]));
+        const char* name = k ? "rf" : "rs";
+        if (k == 0) {
+            TEST_ASSERT_EQ_I(flr_enc(name, "d", 0), RAY_ENC_DICT);
+            TEST_ASSERT_EQ_I(flr_enc(name, "d", 100), RAY_ENC_DICT);
+            TEST_ASSERT_EQ_I(flr_enc(name, "a", 0), RAY_ENC_DICT);
+            TEST_ASSERT_EQ_I(flr_enc(name, "a", 64), RAY_ENC_ALP);
+        } else
+            for (int c = 0; c < 3; c++) TEST_ASSERT_EQ_I(flr_enc(name, cols[c], 0), RAY_ENC_ALP);
+        char q[256];
+        snprintf(q, sizeof q, "(set T (.db.splayed.get \"" FL_TMP "/%s2/\"))", name);
+        TEST_ASSERT_TRUE(fl_eval_ok(q));
+        ray_t* t = fl_eval("T");
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        for (int c = 0; c < 3; c++) TEST_ASSERT_NOT_NULL(ray_table_get_col_enc(t, ray_sym_intern(cols[c], 1)));
+        ray_release(t);
+        ray_enc_counters_reset();
+        ray_encw_test_force_float(encs[k]);
+        snprintf(q, sizeof q, "(.db.splayed.set \"" FL_TMP "/%sr/\" T {compress: true})", name);
+        bool ok = fl_eval_ok(q);
+        ray_encw_test_force_float(-1);
+        TEST_ASSERT_TRUE(ok);
+        ray_enc_counters_t ec; ray_enc_counters_get(&ec);
+        TEST_ASSERT_EQ_U(ec.materialized, 0);                          /* by range, never whole */
+        TEST_ASSERT_TRUE(ec.decoded_bytes > 0);
+        TEST_ASSERT_TRUE(fl_eval_ok("(set T 0)"));
+        for (int c = 0; c < 3; c++) {
+            char dr[64], dz[64], pa[1200], pb[1200];
+            snprintf(dr, sizeof dr, FL_TMP "/%s2/", name); snprintf(dz, sizeof dz, FL_TMP "/%sr/", name);
+            TEST_ASSERT_TRUE(flr_live(dr, cols[c], pa, sizeof pa));
+            TEST_ASSERT_TRUE(flr_live(dz, cols[c], pb, sizeof pb));
+            TEST_ASSERT_FMT(flr_same_file(pa, pb) == 0, "force %d column %s: re-save differs (%d)", encs[k], cols[c], flr_same_file(pa, pb));
+        }
+        /* no float sum: over 64 Ki rows it varies from run to run (float_sums) */
+        FLR_SAME(name, "(select {c: (count d) lo: (min a) hi: (max g) from: T where: (== d -0.0)})");
+        FLR_SAME(name, "(at T 'd)");
+    }
+    PASS();
+}
+
+/* P4 interplay: an F64 column with a PART index over blocks -2.5, -0.0,
+ * +0.0, 1.5 (the zero blocks merge; the key keeps the first row's sign),
+ * under each forced float encoding: materialization validates the region
+ * (the zero-sign rule runs on the decoded column, so -0.0 must decode
+ * exactly) and the zero filters equal generation 0 (which drops the PART). */
+static test_result_t test_part_zero_sign(void) {
+    const int64_t n = 6000;
+    static const int encs[] = { RAY_ENC_RAW, RAY_ENC_RLE, RAY_ENC_DICT, RAY_ENC_ALP, RAY_ENC_ALP_RD };
+    const double blk[4] = { -2.5, bd(NEG0_64), 0.0, 1.5 };
+    static const char* const qs[] = {
+        "(sum (at (select {from: T where: (== z -0.0)}) 'v))", "(sum (at (select {from: T where: (== z 0.0)}) 'v))",
+        "(count (select {from: T where: (== z -0.0)}))", "(count (select {from: T where: (in z [0.0 1.5])}))",
+        "(count (select {from: T where: (< z 0.0)}))", "(count (select {from: T where: (>= z -0.0)}))",
+        "(at T 'z)", NULL,
+    };
+    for (size_t k = 0; k < sizeof encs / sizeof encs[0]; k++) {
+        ray_t* z = ray_vec_new(RAY_F64, n); z->len = n;
+        for (int64_t i = 0; i < n; i++) ((double*)ray_data(z))[i] = blk[i / 1500];
+        int64_t zn, zp; flr_zeros(z, &zn, &zp);
+        TEST_ASSERT_TRUE(zn == 1500 && zp == 1500);
+        ray_t* r = ray_index_attach_part(&z);
+        TEST_ASSERT_FMT(r && !RAY_IS_ERR(r), "attach: %s", r && RAY_IS_ERR(r) ? ray_error_msg() : "null");
+        z = r;
+        TEST_ASSERT_EQ_I(ray_index_payload(z->index)->u.part.n_parts, 3);
+        char name[16]; snprintf(name, sizeof name, "pz%zu", k);
+        TEST_ASSERT_TRUE(flr_save(name, flr_table(2, (const char* const[]){ "z", "v" }, (ray_t* const[]){ z, flr_til(n) }), encs[k]));
+        for (int64_t v = 0; v < 6; v++) TEST_ASSERT_FMT(flr_enc(name, "z", v) == encs[k], "%s vector %lld", name, (long long)v);
+        /* materialization validates the region and attaches the PART */
+        char q[256];
+        snprintf(q, sizeof q, "(.db.splayed.get \"" FL_TMP "/%s2/\")", name);
+        ray_t* t = fl_eval(q);
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        ray_t* encv = ray_table_get_col_enc(t, ray_sym_intern("z", 1));
+        TEST_ASSERT_TRUE(encv && ray_enccol_of(encv)->hdr.index_kind == RAY_IDX_PART);
+        ray_t* m = ray_table_col(t, ray_sym_intern("z", 1));
+        bool mok = m && !RAY_IS_ERR(m);
+        if (!mok) fprintf(stderr, "%s: %s\n", name, ray_error_msg());
+        bool kind = mok && ray_index_kind(m) == RAY_IDX_PART;
+        ray_index_t* ix = kind ? ray_index_payload(m->index) : NULL;
+        bool parts = ix && ix->u.part.n_parts == 3 && ix->u.part.keys && ix->u.part.keys->type == RAY_F64;
+        uint64_t kb[3] = { 0 };
+        if (parts) memcpy(kb, ray_data(ix->u.part.keys), sizeof kb);
+        bool data = mok && m->type == RAY_F64 && m->len == n;
+        for (int64_t i = 0; data && i < n; i++) data = memcmp((const double*)ray_data(m) + i, &blk[i / 1500], 8) == 0;
+        ray_release(t);
+        TEST_ASSERT_FMT(mok, "%s: materialize failed", name);
+        TEST_ASSERT_FMT(kind && parts, "%s: no three-part PART", name);
+        TEST_ASSERT_FMT(kb[0] == db(-2.5) && kb[1] == NEG0_64 && kb[2] == db(1.5), "%s: keys %llx %llx %llx", name,
+                        (unsigned long long)kb[0], (unsigned long long)kb[1], (unsigned long long)kb[2]);
+        TEST_ASSERT_FMT(data, "%s: decoded column differs", name);
+        for (int i = 0; qs[i]; i++) FLR_SAME(name, qs[i]);
+    }
+    PASS();
+}
+
 const test_entry_t encfloat_entries[] = {
     { "encfloat/float_order",      test_float_order,      fl_setup, fl_teardown },
     { "encfloat/float_train_dict", test_float_train_dict, fl_setup, fl_teardown },
@@ -1507,5 +1962,13 @@ const test_entry_t encfloat_entries[] = {
     { "encfloat/view_checks",          test_view_checks,          fl_setup, fl_teardown },
     { "encfloat/view_consumers",       test_view_consumers,       fl_rt_setup, fl_rt_teardown },
     { "encfloat/filter_views",         test_filter_views,         fl_rt_setup, fl_rt_teardown },
+    { "encfloat/signed_zeros",         test_signed_zeros_battery, fl_rt_setup, fl_rt_teardown },
+    { "encfloat/stream_equals_resident", test_stream_equals_resident, fl_rt_setup, fl_rt_teardown },
+    { "encfloat/resave_equals_resident", test_resave_equals_resident, fl_rt_setup, fl_rt_teardown },
+    { "encfloat/float_sums",           test_float_sums,           fl_rt_setup, fl_rt_teardown },
+    { "encfloat/topk_floats",          test_topk_floats,          fl_rt_setup, fl_rt_teardown },
+    { "encfloat/depth_bound",          test_depth_bound,          fl_setup,    fl_teardown },
+    { "encfloat/no_materialization",   test_no_materialization,   fl_rt_setup, fl_rt_teardown },
+    { "encfloat/part_zero_sign",       test_part_zero_sign,       fl_rt_setup, fl_rt_teardown },
     { NULL, NULL, NULL, NULL },
 };

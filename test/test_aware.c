@@ -5268,6 +5268,36 @@ static test_result_t aw_zero_mm(const char* name, const char* q) {
 }
 #define AW_ZERO_MM(n, q) do { test_result_t r_ = aw_zero_mm((n), (q)); if (r_.status != TEST_PASS) return r_; } while (0)
 
+/* The szc table <name>2 (vector v of 1024 rows: -0.0 when v % 3 == 0,
+ * +0.0 when 1, alternating -0.0 / +0.0 when 2), over 64 Ki rows: min / max
+ * of a selection keep the first selected row's zero under the scalar-grain
+ * hook (row order, one task). */
+static test_result_t aw_szc_first_zero(const char* name) {
+    char q[256];
+    snprintf(q, sizeof q, "(set T (.db.splayed.get \"" AW_TMP "/%s2/\"))", name);
+    aw_eval_ok(q);
+    static const int64_t los[] = { -1, 0, 1000, 1023, 1024, 2047, 64511, 65000, 65535, 65536, 66000 };
+    static const int64_t his[] = { 131072, 65536, 65537, 66560, 70000 };
+    static const int64_t grains[] = { RAY_COL_BLOCK_ROWS, 131072 };
+    for (int g = 0; g < 2; g++)
+    for (int l = 0; l < 11; l++) for (int h = 0; h < 5; h++) for (int m = 0; m < 2; m++) {
+        if (his[h] <= los[l] + 1) continue;
+        int64_t r0 = los[l] + 1, v0 = r0 / 1024;           /* the first selected row */
+        bool want_neg = v0 % 3 == 0 || (v0 % 3 == 2 && r0 % 2 == 0);
+        snprintf(q, sizeof q, "(at (select {r: (%s f) from: T where: (and (> k %lld) (< k %lld))}) 'r)",
+                 m ? "max" : "min", (long long)los[l], (long long)his[h]);
+        ray_group_test_scalar_grain(grains[g]);
+        ray_t* r = aw_eval(q);
+        ray_group_test_scalar_grain(0);
+        TEST_ASSERT_FMT(r && !RAY_IS_ERR(r) && r->type == RAY_F64 && r->len == 1, "%s failed", q);
+        double x = ((const double*)ray_data(r))[0];
+        ray_release(r);
+        TEST_ASSERT_FMT(x == 0.0 && (signbit(x) != 0) == want_neg, "%s, grain %lld: %s0.0, want %s0.0", q,
+                        (long long)grains[g], signbit(x) ? "-" : "+", want_neg ? "-" : "+");
+    }
+    PASS();
+}
+
 /* Signed zeros: CONST vectors of -0.0 and of +0.0 next to a RAW vector
  * mixing both; every comparison with both zero literals, in, min, max (which
  * zero) and a float top-k. */
@@ -5336,26 +5366,15 @@ static test_result_t test_signed_zeros(void) {
     TEST_ASSERT_EQ_I(aw_vec_enc("szc", "f", 64), RAY_ENC_CONST);
     /* P5: the +/-0.0 mix now selects DICT (it was RAW) */
     TEST_ASSERT_EQ_I(aw_vec_enc("szc", "f", 65), RAY_ENC_DICT);
-    aw_eval_ok("(set T (.db.splayed.get \"" AW_TMP "/szc2/\"))");
-    static const int64_t los[] = { -1, 0, 1000, 1023, 1024, 2047, 64511, 65000, 65535, 65536, 66000 };
-    static const int64_t his[] = { 131072, 65536, 65537, 66560, 70000 };
-    static const int64_t grains[] = { RAY_COL_BLOCK_ROWS, 131072 };
-    for (int g = 0; g < 2; g++)
-    for (int l = 0; l < 11; l++) for (int h = 0; h < 5; h++) for (int m = 0; m < 2; m++) {
-        if (his[h] <= los[l] + 1) continue;
-        int64_t r0 = los[l] + 1, v0 = r0 / 1024;           /* the first selected row */
-        bool want_neg = v0 % 3 == 0 || (v0 % 3 == 2 && r0 % 2 == 0);
-        snprintf(q, sizeof q, "(at (select {r: (%s f) from: T where: (and (> k %lld) (< k %lld))}) 'r)",
-                 m ? "max" : "min", (long long)los[l], (long long)his[h]);
-        ray_group_test_scalar_grain(grains[g]);
-        ray_t* r = aw_eval(q);
-        ray_group_test_scalar_grain(0);
-        TEST_ASSERT_FMT(r && !RAY_IS_ERR(r) && r->type == RAY_F64 && r->len == 1, "%s failed", q);
-        double x = ((const double*)ray_data(r))[0];
-        ray_release(r);
-        TEST_ASSERT_FMT(x == 0.0 && (signbit(x) != 0) == want_neg, "%s, grain %lld: %s0.0, want %s0.0", q,
-                        (long long)grains[g], signbit(x) ? "-" : "+", want_neg ? "-" : "+");
-    }
+    {   test_result_t r_ = aw_szc_first_zero("szc"); if (r_.status != TEST_PASS) return r_; }
+    /* P5 (Task 7): the same vectors as RAW bodies (the pre-P5 shape of
+     * vector 65, and CONST vectors 63 / 64 read as rows) */
+    aw_save("szcr", "(table [k f] (list (til 131072) (map (fn [j] (if (== 0 (% (div j 1024) 3)) (neg 0.0) "
+                    "(if (== 1 (% (div j 1024) 3)) 0.0 (if (== 0 (% j 2)) (neg 0.0) 0.0)))) (til 131072))))", RAY_ENC_RAW);
+    TEST_ASSERT_EQ_I(aw_vec_enc("szcr", "f", 63), RAY_ENC_RAW);
+    TEST_ASSERT_EQ_I(aw_vec_enc("szcr", "f", 64), RAY_ENC_RAW);
+    TEST_ASSERT_EQ_I(aw_vec_enc("szcr", "f", 65), RAY_ENC_RAW);
+    {   test_result_t r_ = aw_szc_first_zero("szcr"); if (r_.status != TEST_PASS) return r_; }
     PASS();
 }
 
