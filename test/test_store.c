@@ -2736,6 +2736,7 @@ static test_result_t test_stream_close_all_cancel(void) {
     PASS();
 }
 
+#if defined(DEBUG) && defined(RAY_OS_LINUX)
 /* Two hash-candidate columns: the debug build's "build" injection raises an
  * interrupt inside the first hash build, once every column file is written. */
 static ray_t* store_cancel_table(void) {
@@ -2747,6 +2748,7 @@ static ray_t* store_cancel_table(void) {
     }
     return t;
 }
+#endif
 
 /* A cancel that lands once the columns are written (here: in the hash
  * build, the last phase before .d) still stops a save: over an existing
