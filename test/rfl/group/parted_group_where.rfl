@@ -476,6 +476,11 @@
 (select {c: (sum v) from: Pd by: {a: (+ g 1) b: (* a k)}}) -- (select {c: (sum v) from: Id by: {a: (+ g 1) b: (* a k)}})
 (select {c: (sum v) from: Pd where: (> v 2) by: {a: (+ g 1) b: (* a k)}}) -- (select {c: (sum v) from: Id where: (> v 2) by: {a: (+ g 1) b: (* a k)}})
 (select {x: s from: Pd by: {a: g b: (* a k)}}) -- (select {x: s from: Id by: {a: g b: (* a k)}})
+;; the alias read as a free name in a helper's body
+(set hbd (fn [y] (* y a)))
+(take (at (select {x: s from: Pd by: {a: (+ g 1) b: (hbd k)}}) 'b) 9) -- [0 2 6 12 4 10 18 200 303]
+(select {x: s from: Pd by: {a: (+ g 1) b: (hbd k)}}) -- (select {x: s from: Id by: {a: (+ g 1) b: (hbd k)}})
+(select {c: (sum v) from: Pd by: {a: (+ g 1) b: (hbd k)}}) -- (select {c: (sum v) from: Id by: {a: (+ g 1) b: (hbd k)}})
 ;; a LIST key beside another in the composite grouping
 (select {c: (count k) one: 1 from: Ia by: [l s]}) -- (table [l s c one] (list (list [1 2] [3] [1 2] [3] [1 2] [3]) [aa bb cc aa bb cc] [4 4 4 4 4 4] [1 1 1 1 1 1]))
 (select {c: (count k) from: Pa by: [l s]}) -- (select {c: (count k) from: I2 by: [l s]})

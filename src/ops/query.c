@@ -12091,12 +12091,16 @@ static bool clause_names_sym(ray_t* v, int64_t s) {
  * values) name an alias an earlier pair adds as a new column of `tbl`?
  * The eager by-dict loop binds that column as a flat vector, so the value
  * must be evaluated over flat columns too: over a parted table it would
- * pair every partition with the alias column read again from row 0. */
+ * pair every partition with the alias column read again from row 0.  A
+ * value that runs code (a helper) may read the alias as a free name in
+ * its body, unseen here: it is taken to read it. */
 static bool bydict_names_earlier_alias(ray_t** d_elems, int64_t i, ray_t* tbl) {
+    ray_t* v = d_elems[i * 2 + 1];
+    bool runs_code = clause_runs_code_in(v, tbl, true);
     for (int64_t j = 0; j < i; j++) {
         ray_t* k = d_elems[j * 2];
         if (!k || k->type != -RAY_SYM || ray_table_get_col(tbl, k->i64)) continue;
-        if (clause_names_sym(d_elems[i * 2 + 1], k->i64)) return true;
+        if (runs_code || clause_names_sym(v, k->i64)) return true;
     }
     return false;
 }
