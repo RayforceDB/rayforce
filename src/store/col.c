@@ -556,7 +556,8 @@ static ray_t* col_read_recursive(const uint8_t** pp, size_t* remaining) {
                 memcpy(ray_data(vec), *pp, data_size);
         } else {
             vec = ray_vec_from_raw(type, *pp, len);
-            if (!vec || RAY_IS_ERR(vec)) return vec;
+            if (!vec) return ray_error("oom", NULL);
+            if (RAY_IS_ERR(vec)) return vec;
         }
         *pp += data_size; *remaining -= data_size;
 
