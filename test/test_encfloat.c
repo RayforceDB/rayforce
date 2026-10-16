@@ -185,7 +185,7 @@ static test_result_t test_new_slots(void) {
 
 /* xorshift64 for random float data (the ALP_RD tests). */
 static uint64_t g_fseed = 7;
-__attribute__((unused)) static uint64_t frng(void) { uint64_t x = g_fseed; x ^= x << 13; x ^= x >> 7; x ^= x << 17; return g_fseed = x; }
+static uint64_t frng(void) { uint64_t x = g_fseed; x ^= x << 13; x ^= x >> 7; x ^= x << 17; return g_fseed = x; }
 
 static int alp_roundtrip(const uint64_t* v, int n, int T, const ray_enc_alp_cands_t* c, int64_t* size_out) {
     int bi;
@@ -349,6 +349,152 @@ static test_result_t test_alp_rejects(void) {
     PASS();
 }
 
+/* ---- ALP_RD ---- */
+static int alprd_roundtrip(const uint64_t* v, int n, int T, int64_t* sz) {
+    int64_t s = ray_enc_alprd_size(v, n, T);
+    ray_enc_buf_t b = {0};
+    if (!ray_enc_alprd_write(v, n, T, &b)) { ray_enc_buf_free(&b); return -1; }
+    if ((int64_t)b.len != s) { ray_enc_buf_free(&b); return -2; }
+    uint64_t out[RAY_ENC_VEC];
+    int64_t u = ray_enc_alprd_read(b.p, b.len, n, T, out);
+    ray_enc_buf_free(&b);
+    if (u != s) return -3;
+    uint64_t m = T == 64 ? ~0ull : 0xFFFFFFFFull;
+    for (int i = 0; i < n; i++) if (out[i] != (v[i] & m)) return -4;
+    if (sz) *sz = s;
+    return 0;
+}
+
+/* Review focus 4: lengths 1, 1023, 1024; F64 in [1, 2) and F32. */
+static test_result_t test_alprd_lengths(void) {
+    g_fseed = 7;                                                   /* the same data under any filter */
+    uint64_t v[RAY_ENC_VEC];
+    for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = db(1.0 + (double)(frng() >> 11) / 9007199254740992.0);
+    int64_t sz;
+    TEST_ASSERT_EQ_I(alprd_roundtrip(v, RAY_ENC_VEC, 64, &sz), 0);
+    TEST_ASSERT_TRUE(sz * 8 <= 8192 * 7);                          /* left parts: one sign/exponent */
+    TEST_ASSERT_EQ_I(alprd_roundtrip(v, 1, 64, NULL), 0);
+    TEST_ASSERT_EQ_I(alprd_roundtrip(v, 1023, 64, NULL), 0);
+    for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = frng() & 0x7FEFFFFFFFFFFFFFull;   /* random non-NaN bits */
+    TEST_ASSERT_EQ_I(alprd_roundtrip(v, RAY_ENC_VEC, 64, NULL), 0);    /* many exceptions */
+    for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = fb(1.0f + (float)(frng() >> 41) / 8388608.0f);
+    TEST_ASSERT_EQ_I(alprd_roundtrip(v, RAY_ENC_VEC, 32, NULL), 0);
+    TEST_ASSERT_EQ_I(alprd_roundtrip(v, 1, 32, NULL), 0);
+    PASS();
+}
+
+static test_result_t test_alprd_rejects(void) {
+    uint64_t v[64];
+    for (int i = 0; i < 64; i++) v[i] = db(i == 5 ? -123.0 : 1.0 + i / 64.0);   /* row 5: another sign */
+    ray_enc_buf_t* bp = &fl_buf;                                   /* freed in teardown */
+    TEST_ASSERT_TRUE(ray_enc_alprd_write(v, 64, 64, bp));
+    uint64_t out[RAY_ENC_VEC];
+    TEST_ASSERT_EQ_I(ray_enc_alprd_read(bp->p, bp->len, 64, 64, out), (int64_t)bp->len);
+    uint8_t rb = bp->p[0], dn = bp->p[1];
+    uint8_t* m = fl_mem = malloc(bp->len);                         /* freed in teardown */
+    TEST_ASSERT_NOT_NULL(m);
+    memcpy(m, bp->p, bp->len); m[0] = 47;              TEST_ASSERT_EQ_I(ray_enc_alprd_read(m, bp->len, 64, 64, out), -1);   /* < T-16 */
+    memcpy(m, bp->p, bp->len); m[0] = 64;              TEST_ASSERT_EQ_I(ray_enc_alprd_read(m, bp->len, 64, 64, out), -1);   /* > T-1 */
+    memcpy(m, bp->p, bp->len); m[1] = 0;               TEST_ASSERT_EQ_I(ray_enc_alprd_read(m, bp->len, 64, 64, out), -1);
+    memcpy(m, bp->p, bp->len); m[1] = 9;               TEST_ASSERT_EQ_I(ray_enc_alprd_read(m, bp->len, 64, 64, out), -1);
+    memcpy(m, bp->p, bp->len); m[4] = 1;               TEST_ASSERT_EQ_I(ray_enc_alprd_read(m, bp->len, 64, 64, out), -1);
+    TEST_ASSERT_TRUE(dn >= 2);            /* row 5's sign differs at every right_bits: two left parts */
+    memcpy(m, bp->p, bp->len); memcpy(m + 8, bp->p + 10, 2); memcpy(m + 10, bp->p + 8, 2);
+    TEST_ASSERT_EQ_I(ray_enc_alprd_read(m, bp->len, 64, 64, out), -1);                               /* dict not ascending */
+    /* a non-zero pad bit in the packed right parts (row 1023's lane word) */
+    uint32_t lb; memcpy(&lb, bp->p + 8 + ((2 * dn + 7) & ~7) + 4, 4);
+    size_t packed_at = 8 + ((2 * dn + 7) & ~7) + 8 + lb;
+    size_t packed_len = ray_enc_packed_bytes(rb);
+    memcpy(m, bp->p, bp->len); m[packed_at + packed_len - 1] |= 0x80;
+    TEST_ASSERT_EQ_I(ray_enc_alprd_read(m, bp->len, 64, 64, out), -1);
+    TEST_ASSERT_EQ_I(ray_enc_alprd_read(bp->p, bp->len - 8, 64, 64, out), -1);                       /* truncated */
+    /* argument rules: T and n */
+    TEST_ASSERT_EQ_I(ray_enc_alprd_size(v, 64, 16), -1);
+    TEST_ASSERT_EQ_I(ray_enc_alprd_size(v, 0, 64), -1);
+    TEST_ASSERT_EQ_I(ray_enc_alprd_read(bp->p, bp->len, 64, 16, out), -1);
+    size_t len = bp->len;
+    TEST_ASSERT_FALSE(ray_enc_alprd_write(v, 64, 16, bp));
+    TEST_ASSERT_EQ_I((int64_t)bp->len, (int64_t)len);                                                /* no partial body */
+    PASS();
+}
+
+/* Exception framing on a hand-built body (spec "Reject rules": ALP/ALP_RD
+ * exception framing; Review focus 4): T = 64, right_bits = 52, dict
+ * {0x3FF, 0x400}, four rows, rows 2 and 3 exceptions with raw left parts
+ * 0x3FE and 0x401. */
+static size_t alprd_body(uint8_t* b, const uint8_t codes[4], const uint16_t pos[2], const uint16_t lefts[2]) {
+    memset(b, 0, 8 + 8 + 16 + 6656 + 8 + 8);
+    b[0] = 52; b[1] = 2; uint16_t ne = 2; memcpy(b + 2, &ne, 2);
+    uint16_t dict[2] = { 0x3FF, 0x400 }; memcpy(b + 8, dict, 4);          /* dict, padded to 8 */
+    uint32_t bb = 8;                                                       /* left child: RAW, 4 codes + pad */
+    b[16] = RAY_ENC_RAW; memcpy(b + 20, &bb, 4); memcpy(b + 24, codes, 4);
+    size_t at = 32 + ray_enc_packed_bytes(52);                             /* right parts: all zero */
+    memcpy(b + at, pos, 4);   at += 8;
+    memcpy(b + at, lefts, 4); at += 8;
+    return at;
+}
+static test_result_t test_alprd_exceptions(void) {
+    static uint8_t b[8 + 8 + 16 + 6656 + 8 + 8];
+    uint8_t codes[4] = { 0, 1, 0, 0 };
+    uint16_t pos[2] = { 2, 3 }, lefts[2] = { 0x3FE, 0x401 };
+    uint64_t out[RAY_ENC_VEC];
+    size_t n = alprd_body(b, codes, pos, lefts);
+    TEST_ASSERT_EQ_I(ray_enc_alprd_read(b, n, 4, 64, out), (int64_t)n);
+    TEST_ASSERT_EQ_U(out[0], 0x3FFull << 52); TEST_ASSERT_EQ_U(out[1], 0x400ull << 52);
+    TEST_ASSERT_EQ_U(out[2], 0x3FEull << 52); TEST_ASSERT_EQ_U(out[3], 0x401ull << 52);
+    uint8_t c2[4] = { 0, 1, 1, 0 };                                        /* exception row with code 1 */
+    n = alprd_body(b, c2, pos, lefts);
+    TEST_ASSERT_EQ_I(ray_enc_alprd_read(b, n, 4, 64, out), -1);
+    uint16_t big[2] = { 0x1000, 0x401 };                                   /* raw left at 2^(T-right_bits) */
+    n = alprd_body(b, codes, pos, big);
+    TEST_ASSERT_EQ_I(ray_enc_alprd_read(b, n, 4, 64, out), -1);
+    uint16_t swapped[2] = { 3, 2 };                                        /* positions not ascending */
+    n = alprd_body(b, codes, swapped, lefts);
+    TEST_ASSERT_EQ_I(ray_enc_alprd_read(b, n, 4, 64, out), -1);
+    uint16_t past[2] = { 2, 4 };                                           /* position at n */
+    n = alprd_body(b, codes, past, lefts);
+    TEST_ASSERT_EQ_I(ray_enc_alprd_read(b, n, 4, 64, out), -1);
+    PASS();
+}
+
+/* The choice: CONST, RLE, DICT, ALP, ALP_RD and RAW each win somewhere. */
+static test_result_t test_float_choice(void) {
+    g_fseed = 7;
+    uint64_t v[RAY_ENC_VEC];
+    ray_enc_alp_cands_t c;
+    for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = db(1.5);
+    TEST_ASSERT_EQ_I(ray_enc_float_choose(v, RAY_ENC_VEC, 64, NULL, NULL, 0).enc, RAY_ENC_CONST);
+    for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = db((double)((frng() % 1000)) * 1.0000001);
+    for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = v[(i / 128) * 128];   /* runs of 128 of awkward values */
+    TEST_ASSERT_EQ_I(ray_enc_float_choose(v, RAY_ENC_VEC, 64, NULL, NULL, 0).enc, RAY_ENC_RLE);
+    uint64_t dv[4] = { db(-3.5), NEG0_64, db(0.0), db(2.25) };
+    ray_enc_dict_t dict = { dv, 4 };
+    for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = dv[(uint32_t)(i * 2654435761u) >> 30];
+    TEST_ASSERT_EQ_I(ray_enc_float_choose(v, RAY_ENC_VEC, 64, &dict, NULL, 0).enc, RAY_ENC_DICT);
+    for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = db((double)((i * 7919) % 100000) / 100.0);
+    ray_enc_alp_train(v, RAY_ENC_VEC, 64, &c);
+    TEST_ASSERT_EQ_I(ray_enc_float_choose(v, RAY_ENC_VEC, 64, NULL, &c, 0).enc, RAY_ENC_ALP);
+    for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = db(1.0 + (double)(frng() >> 11) / 9007199254740992.0);
+    TEST_ASSERT_EQ_I(ray_enc_float_choose(v, RAY_ENC_VEC, 64, NULL, &c, 0).enc, RAY_ENC_ALP_RD);
+    for (int i = 0; i < 8; i++) v[i] = frng() & 0x7FEFFFFFFFFFFFFFull;
+    TEST_ASSERT_EQ_I(ray_enc_float_choose(v, 8, 64, NULL, &c, 0).enc, RAY_ENC_RAW);
+    /* every choice round-trips through float_write / float_read */
+    static const uint8_t encs[] = { RAY_ENC_RAW, RAY_ENC_RLE, RAY_ENC_DICT, RAY_ENC_ALP, RAY_ENC_ALP_RD };
+    for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = dv[(i / 7) % 4];
+    ray_enc_buf_t* bp = &fl_buf;                                   /* freed in teardown */
+    for (size_t k = 0; k < sizeof encs; k++) {
+        ray_enc_choice_t ch;
+        bp->len = 0;
+        TEST_ASSERT_TRUE(ray_enc_float_write(encs[k], v, RAY_ENC_VEC, 64, &dict, &c, bp, &ch));
+        TEST_ASSERT_EQ_I(ch.enc, encs[k]);
+        TEST_ASSERT_EQ_I(ch.bytes, (int64_t)bp->len);
+        uint64_t out[RAY_ENC_VEC];
+        TEST_ASSERT_EQ_I(ray_enc_float_read(bp->p, bp->len, encs[k], RAY_ENC_VEC, 64, &dict, out), (int64_t)bp->len);
+        TEST_ASSERT_TRUE(memcmp(out, v, sizeof v) == 0);
+    }
+    PASS();
+}
+
 const test_entry_t encfloat_entries[] = {
     { "encfloat/float_order",      test_float_order,      fl_setup, fl_teardown },
     { "encfloat/float_train_dict", test_float_train_dict, fl_setup, fl_teardown },
@@ -358,5 +504,9 @@ const test_entry_t encfloat_entries[] = {
     { "encfloat/alp_signed",       test_alp_signed,       fl_setup, fl_teardown },
     { "encfloat/alp_edges",        test_alp_edges,        fl_setup, fl_teardown },
     { "encfloat/alp_rejects",      test_alp_rejects,      fl_setup, fl_teardown },
+    { "encfloat/alprd_lengths",    test_alprd_lengths,    fl_setup, fl_teardown },
+    { "encfloat/alprd_rejects",    test_alprd_rejects,    fl_setup, fl_teardown },
+    { "encfloat/alprd_exceptions", test_alprd_exceptions, fl_setup, fl_teardown },
+    { "encfloat/float_choice",     test_float_choice,     fl_setup, fl_teardown },
     { NULL, NULL, NULL, NULL },
 };

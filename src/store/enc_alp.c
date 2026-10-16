@@ -116,9 +116,14 @@ static int64_t alp_plan_size(const alp_plan_t* p, int n, int T) {
 }
 
 /* alp_plan_t is about 10 KB: heap, not stack (this runs on pool workers). */
+static bool alp_args_ok(int n, int T, const ray_enc_alp_cands_t* c) {
+    if (!c || c->n <= 0 || c->n > RAY_ENC_ALP_CANDS || n <= 0 || n > RAY_ENC_VEC || !alp_t_ok(T)) return false;
+    for (int i = 0; i < c->n; i++) if (c->c[i].e > 18 || c->c[i].f > c->c[i].e) return false;
+    return true;
+}
+
 int64_t ray_enc_alp_size(const uint64_t* v, int n, int T, const ray_enc_alp_cands_t* c, int* best) {
-    if (!c || c->n <= 0 || c->n > RAY_ENC_ALP_CANDS || n <= 0 || n > RAY_ENC_VEC || !alp_t_ok(T)) return -1;
-    for (int i = 0; i < c->n; i++) if (c->c[i].e > 18 || c->c[i].f > c->c[i].e) return -1;
+    if (!alp_args_ok(n, T, c)) return -1;
     alp_plan_t* p = ray_alloc_raw(sizeof *p);
     if (!p) return -1;
     int64_t bs = -1;
@@ -226,4 +231,207 @@ void ray_enc_alp_train(const uint64_t* bits, int64_t n, int T, ray_enc_alp_cands
         out->c[out->n].e = (uint8_t)be; out->c[out->n].f = (uint8_t)bf; out->n++;
         count[be][bf] = 0;
     }
+}
+
+/* ---- ALP_RD (spec "Encodings", code 7) ----
+ * Integer arithmetic only: the bytes do not depend on the float flags. */
+static const ray_enc_kind_t K_U8 = { 8, false, false };
+
+typedef struct {
+    int rb, dict_n, n_exc;
+    uint16_t dict[8];
+    uint64_t codes[RAY_ENC_VEC];
+    uint16_t pos[RAY_ENC_VEC], lefts[RAY_ENC_VEC];
+} alprd_plan_t;
+
+static inline uint64_t alprd_mask(int T) { return T == 64 ? ~0ull : 0xFFFFFFFFull; }
+
+static int u16_cmp(const void* a, const void* b) {
+    uint16_t x = *(const uint16_t*)a, y = *(const uint16_t*)b;
+    return x < y ? -1 : x > y;
+}
+
+/* The plan at one right_bits: the eight most frequent left parts as the
+ * dictionary (strictly ascending), a code per row, the rest exceptions
+ * (code 0, raw left part kept). */
+static void alprd_plan_rb(const uint64_t* v, int n, int T, int rb, alprd_plan_t* p) {
+    const uint64_t m = alprd_mask(T);
+    uint16_t s[RAY_ENC_VEC];
+    for (int i = 0; i < n; i++) s[i] = (uint16_t)((v[i] & m) >> rb);
+    qsort(s, (size_t)n, 2, u16_cmp);
+    /* the eight most frequent left parts; ties: the smaller value */
+    uint16_t val[8]; int cnt[8]; int nd = 0;
+    for (int i = 0; i < n;) {
+        int j = i; while (j < n && s[j] == s[i]) j++;
+        int c = j - i;
+        int at = nd;
+        while (at > 0 && cnt[at - 1] < c) at--;                       /* stable: equal counts keep order */
+        if (at < 8) {
+            for (int k = (nd < 8 ? nd : 7); k > at; k--) { val[k] = val[k - 1]; cnt[k] = cnt[k - 1]; }
+            val[at] = s[i]; cnt[at] = c;
+            if (nd < 8) nd++;
+        }
+        i = j;
+    }
+    qsort(val, (size_t)nd, 2, u16_cmp);                                /* strictly ascending */
+    p->rb = rb; p->dict_n = nd; p->n_exc = 0;
+    memcpy(p->dict, val, (size_t)nd * 2);
+    for (int i = 0; i < n; i++) {
+        uint16_t l = (uint16_t)((v[i] & m) >> rb);
+        int code = -1;
+        for (int k = 0; k < nd; k++) if (p->dict[k] == l) { code = k; break; }
+        if (code < 0) { p->codes[i] = 0; p->pos[p->n_exc] = (uint16_t)i; p->lefts[p->n_exc++] = l; }
+        else p->codes[i] = (uint64_t)code;
+    }
+}
+
+static int64_t alprd_plan_size(const alprd_plan_t* p, int n) {
+    ray_enc_choice_t c = ray_enc_choose(p->codes, n, K_U8, RAY_ENC_SLOT_ALP_RD_LEFT, 1, NULL);
+    return 8 + p8(2LL * p->dict_n) + c.bytes + (int64_t)ray_enc_packed_bytes(p->rb) + 2 * p8(2LL * p->n_exc);
+}
+
+/* The smallest plan over right_bits T-1 down to T-16 (ties keep the larger
+ * right_bits); -1 on OOM.  alprd_plan_t is about 12 KB: heap, not stack. */
+static int64_t alprd_best(const uint64_t* v, int n, int T, alprd_plan_t* best) {
+    alprd_plan_t* p = ray_alloc_raw(sizeof *p);
+    if (!p) return -1;
+    int64_t bs = -1;
+    for (int rb = T - 1; rb >= T - 16; rb--) {
+        alprd_plan_rb(v, n, T, rb, p);
+        int64_t s = alprd_plan_size(p, n);
+        if (bs < 0 || s < bs) { bs = s; if (best) *best = *p; }
+    }
+    ray_free_raw(p);
+    return bs;
+}
+
+int64_t ray_enc_alprd_size(const uint64_t* v, int n, int T) {
+    if (n <= 0 || n > RAY_ENC_VEC || !alp_t_ok(T)) return -1;
+    return alprd_best(v, n, T, NULL);
+}
+
+bool ray_enc_alprd_write(const uint64_t* v, int n, int T, ray_enc_buf_t* out) {
+    if (n <= 0 || n > RAY_ENC_VEC || !alp_t_ok(T)) return false;
+    alprd_plan_t* p = ray_alloc_raw(sizeof *p);
+    if (!p) { out->oom = true; return false; }
+    if (alprd_best(v, n, T, p) < 0) { ray_free_raw(p); out->oom = true; return false; }   /* p unset */
+    size_t at = out->len;
+    const uint64_t m = alprd_mask(T), rm = (1ull << p->rb) - 1;       /* rb <= T - 1 <= 63 */
+    uint16_t ne = (uint16_t)p->n_exc;
+    uint8_t h[8] = { (uint8_t)p->rb, (uint8_t)p->dict_n, 0, 0, 0, 0, 0, 0 };
+    memcpy(h + 2, &ne, 2);
+    ray_enc_choice_t c;
+    bool ok = ray_enc_buf_put(out, h, 8) && ray_enc_buf_put(out, p->dict, 2u * (size_t)p->dict_n) &&
+              ray_enc_buf_pad8(out) &&
+              ray_enc_write(p->codes, n, K_U8, RAY_ENC_SLOT_ALP_RD_LEFT, 1, NULL, out, &c);
+    if (ok) {
+        uint64_t* u = p->codes;                                       /* codes written: reuse for the right parts */
+        for (int i = 0; i < RAY_ENC_VEC; i++) u[i] = i < n ? (v[i] & m & rm) : 0;   /* pad rows 0 */
+        size_t pk = out->len;
+        ok = ray_enc_buf_put(out, NULL, ray_enc_packed_bytes(p->rb));
+        if (ok) ray_enc_pack(u, T, p->rb, out->p + pk);
+    }
+    ok = ok && ray_enc_buf_put(out, p->pos, 2u * ne) && ray_enc_buf_pad8(out) &&
+         ray_enc_buf_put(out, p->lefts, 2u * ne) && ray_enc_buf_pad8(out);
+    ray_free_raw(p);
+    if (!ok) out->len = at;                                           /* no partial body */
+    return ok;
+}
+
+int64_t ray_enc_alprd_read(const uint8_t* p, size_t avail, int n, int T, uint64_t* out) {
+    if (n <= 0 || n > RAY_ENC_VEC || !alp_t_ok(T) || avail < 8) return -1;
+    int rb = p[0], dn = p[1];
+    uint16_t ne; memcpy(&ne, p + 2, 2);
+    uint32_t rsv; memcpy(&rsv, p + 4, 4);
+    if (rb < T - 16 || rb > T - 1 || dn < 1 || dn > 8 || ne > n || rsv) return -1;
+    uint32_t lmax = 1u << (T - rb);                                    /* left parts are below this */
+    size_t at = 8, db = (size_t)p8(2LL * dn);
+    if (avail - at < db) return -1;
+    uint16_t dict[8];
+    for (int k = 0; k < dn; k++) {
+        memcpy(&dict[k], p + at + 2 * k, 2);
+        if (dict[k] >= lmax || (k && dict[k] <= dict[k - 1])) return -1;
+    }
+    if (!zero_bytes(p + at + 2u * dn, db - 2u * dn)) return -1;
+    at += db;
+    uint64_t codes[RAY_ENC_VEC];
+    int64_t a = ray_enc_read(p + at, avail - at, 0, 0, n, K_U8, RAY_ENC_SLOT_ALP_RD_LEFT, 1, NULL, codes);
+    if (a < 0) return -1;
+    at += (size_t)a;
+    size_t pk = ray_enc_packed_bytes(rb);
+    size_t pb = (size_t)p8(2LL * ne);
+    if (avail - at < pk + 2 * pb) return -1;
+    uint64_t u[RAY_ENC_VEC];
+    ray_enc_unpack(p + at, T, rb, u);
+    for (int i = n; i < RAY_ENC_VEC; i++) if (u[i]) return -1;          /* pad rows 0 */
+    at += pk;
+    const uint8_t* pos = p + at;
+    const uint8_t* lefts = pos + pb;
+    if (!zero_bytes(pos + 2u * ne, pb - 2u * ne) || !zero_bytes(lefts + 2u * ne, pb - 2u * ne)) return -1;
+    for (int i = 0; i < n; i++) {
+        if (codes[i] >= (uint64_t)dn) return -1;
+        out[i] = ((uint64_t)dict[codes[i]] << rb) | u[i];
+    }
+    int prev = -1;
+    for (int k = 0; k < ne; k++) {
+        uint16_t q, l; memcpy(&q, pos + 2 * k, 2); memcpy(&l, lefts + 2 * k, 2);
+        /* codes[q] != 0 is corrupt: a spec clarification of "the left code is 0" (D8) */
+        if ((int)q <= prev || q >= n || codes[q] != 0 || l >= lmax) return -1;
+        prev = q;
+        out[q] = ((uint64_t)l << rb) | u[q];
+    }
+    return (int64_t)(at + 2 * pb);
+}
+
+/* ---- the float top level ---- */
+ray_enc_choice_t ray_enc_float_choose(const uint64_t* v, int n, int T, const ray_enc_dict_t* dict,
+                                      const ray_enc_alp_cands_t* c, int64_t extra) {
+    ray_enc_kind_t fk = { (uint8_t)T, false, true };
+    int64_t raw = ray_enc_size_raw(n, T);
+    ray_enc_choice_t best = { RAY_ENC_RAW, 0, raw };
+    if (!alp_t_ok(T) || n <= 0 || n > RAY_ENC_VEC) return best;
+    static const uint8_t ints_like[] = { RAY_ENC_CONST, RAY_ENC_RLE, RAY_ENC_DICT };
+    for (size_t i = 0; i < sizeof ints_like; i++) {
+        int64_t s = ray_enc_body_size(ints_like[i], v, n, fk, dict);
+        if (s >= 0 && s < best.bytes) { best.enc = ints_like[i]; best.bytes = s; }
+    }
+    int bi;
+    int64_t s = ray_enc_alp_size(v, n, T, c, &bi);                    /* -1: no candidates (or OOM) */
+    if (s >= 0 && s < best.bytes) { best.enc = RAY_ENC_ALP; best.bytes = s; }
+    s = ray_enc_alprd_size(v, n, T);
+    if (s >= 0 && s < best.bytes) { best.enc = RAY_ENC_ALP_RD; best.bytes = s; }
+    if (best.enc != RAY_ENC_RAW && (best.bytes + extra) * 8 > (raw + extra) * 7) {   /* 1/8 gain */
+        best.enc = RAY_ENC_RAW; best.bytes = raw;
+    }
+    return best;
+}
+
+bool ray_enc_float_write(uint8_t enc, const uint64_t* v, int n, int T, const ray_enc_dict_t* dict,
+                         const ray_enc_alp_cands_t* c, ray_enc_buf_t* out, ray_enc_choice_t* chosen) {
+    if (!alp_t_ok(T)) return false;
+    ray_enc_kind_t fk = { (uint8_t)T, false, true };
+    size_t at = out->len;
+    bool ok;
+    if (enc == RAY_ENC_ALP) {
+        int bi;
+        if (!alp_args_ok(n, T, c)) return false;                        /* no candidates: not applicable */
+        if (ray_enc_alp_size(v, n, T, c, &bi) < 0) { out->oom = true; return false; }   /* valid args: OOM */
+        ok = ray_enc_alp_write(v, n, T, c->c[bi].e, c->c[bi].f, out);
+    } else if (enc == RAY_ENC_ALP_RD) {
+        ok = ray_enc_alprd_write(v, n, T, out);
+    } else {
+        return ray_enc_write_as(enc, v, n, fk, dict, out, chosen);
+    }
+    if (!ok) { out->len = at; return false; }
+    if (chosen) { chosen->enc = enc; chosen->width = 0; chosen->bytes = (int64_t)(out->len - at); }
+    return true;
+}
+
+int64_t ray_enc_float_read(const uint8_t* p, size_t avail, uint8_t enc, int n, int T,
+                           const ray_enc_dict_t* dict, uint64_t* out) {
+    if (!alp_t_ok(T)) return -1;
+    if (enc == RAY_ENC_ALP) return ray_enc_alp_read(p, avail, n, T, out);
+    if (enc == RAY_ENC_ALP_RD) return ray_enc_alprd_read(p, avail, n, T, out);
+    ray_enc_kind_t fk = { (uint8_t)T, false, true };
+    return ray_enc_read(p, avail, enc, 0, n, fk, RAY_ENC_SLOT_TOP, 0, dict, out);
 }

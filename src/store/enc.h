@@ -169,4 +169,32 @@ bool    ray_enc_alp_write(const uint64_t* v, int n, int T, uint8_t e, uint8_t f,
  * bytes or -1 (corrupt). */
 int64_t ray_enc_alp_read(const uint8_t* p, size_t avail, int n, int T, uint64_t* out);
 
+/* ---- ALP_RD (src/store/enc_alp.c): each value split into a left part
+ * (the top T - right_bits bits, a code into an 8-entry dictionary, or an
+ * exception) and its low right_bits bits packed.  v holds T-bit float
+ * patterns (T 32 or 64), n in 1..1024.  The best right_bits in T-16..T-1
+ * depends on v only, so size and write agree. ---- */
+/* Smallest ALP_RD body, -1 on bad arguments or OOM. */
+int64_t ray_enc_alprd_size(const uint64_t* v, int n, int T);
+/* Appends the body; false on bad arguments or OOM (out->oom), with no
+ * partial body left in out. */
+bool    ray_enc_alprd_write(const uint64_t* v, int n, int T, ray_enc_buf_t* out);
+/* Validates and decodes an ALP_RD body into T-bit patterns (out holds
+ * RAY_ENC_VEC values); returns the body bytes or -1 (corrupt, out
+ * partial). */
+int64_t ray_enc_alprd_read(const uint8_t* p, size_t avail, int n, int T, uint64_t* out);
+
+/* ---- the float top level ---- */
+/* The float vector's top-level choice among RAW, CONST, RLE, DICT, ALP,
+ * ALP_RD; `extra` is the trailer's bytes, counted on both sides of the
+ * 1/8 gain rule.  dict and c may be NULL (no DICT, no ALP). */
+ray_enc_choice_t ray_enc_float_choose(const uint64_t* v, int n, int T, const ray_enc_dict_t* dict,
+                                      const ray_enc_alp_cands_t* c, int64_t extra);
+/* Write `enc`'s body (false: not applicable, illegal or OOM; out->oom tells). */
+bool    ray_enc_float_write(uint8_t enc, const uint64_t* v, int n, int T, const ray_enc_dict_t* dict,
+                            const ray_enc_alp_cands_t* c, ray_enc_buf_t* out, ray_enc_choice_t* chosen);
+/* Validate and decode any float body; bytes used or -1. */
+int64_t ray_enc_float_read(const uint8_t* p, size_t avail, uint8_t enc, int n, int T,
+                           const ray_enc_dict_t* dict, uint64_t* out);
+
 #endif /* RAY_ENC_H */
