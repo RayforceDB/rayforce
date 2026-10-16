@@ -733,6 +733,11 @@ static void splay_remove_created(const ray_splay_write_t* write, bool unlink_loc
 
 ray_err_t ray_splay_write_finish(ray_splay_write_t* write, ray_err_t result,
                                   bool durable) {
+    /* The last moment a cancel can stop a staged write: its generation is
+     * not published yet, so the call reports the cancel and the previous
+     * one stays current.  (A first write commits in place with its .d.) */
+    if (result == RAY_OK && write->staged && ray_interrupted())
+        result = RAY_ERR_CANCEL;
     if (result == RAY_OK && write->staged) {
         /* ray_file_sync_dir syncs the PARENT of its argument. */
         char schema[1100];

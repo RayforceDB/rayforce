@@ -3620,7 +3620,9 @@ ray_t* ray_read_csv_opts(const char* path, char delimiter, bool header,
  * .csv.splayed load is cancelled: "append" (from column 0's append task,
  * mid-dispatch), "skip" (the last column's append task returns as a
  * skipped ticket does) or "close" (before the column finish dispatch);
- * debug builds only. */
+ * debug builds only.  "skip" raises no interrupt, which a real skip always
+ * comes with, so production never reaches it; it is kept because only it
+ * reaches the append done-count past the interrupt checks after it. */
 static bool csv_splayed_inject(const char* step) {
 #if defined(DEBUG)
     const char* e = getenv("RAY_CSV_SPLAYED_INJECT");

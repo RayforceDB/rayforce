@@ -2224,7 +2224,7 @@ static test_result_t test_csv_splayed_cancel(void) {
     /* "append": cancelled from column 0's task, the others run or are
      * skipped; "skip": the last column misses the chunk; "close": every
      * finish task is skipped (needs the pool); the single column appends
-     * and finishes in line, so only the load's own check sees the cancel. */
+     * and finishes in line, so only the load's own checks see the cancel. */
     ray_pool_t* pool = ray_pool_get();
     bool par = pool && pool->n_workers > 0;
     struct { const char* step; int ncols; } cases[] = {
@@ -2255,12 +2255,60 @@ static test_result_t test_csv_splayed_cancel(void) {
     for (int c = 0; c < 4; c++) TEST_ASSERT_EQ_I(ray_table_get_col_idx(t, c)->len, 5000);
     ray_release(t);
     csv_test_rm_rf(dir);
+    /* a first write commits in place with its .d: cancelled before it,
+     * it leaves no table behind */
+    csv_cancel_write(5000, 1);
+    setenv("RAY_CSV_SPLAYED_INJECT", "append", 1);
+    ray_err_t e = ray_csv_save_splayed_named_opts(TMP_CSV,',',true,types,1,NULL,0,dir,100000);
+    unsetenv("RAY_CSV_SPLAYED_INJECT");
+    ray_clear_interrupt();
+    TEST_ASSERT_EQ_I(e, RAY_ERR_CANCEL);
+    char schema[160]; snprintf(schema, sizeof(schema), "%s/.d", dir);
+    TEST_ASSERT_TRUE(access(schema, F_OK) != 0);
+    csv_test_rm_rf(dir);
+    unlink(TMP_CSV); ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* A cancel that lands once every column is finished (debug builds raise
+ * one inside the first hash build, RAY_HASH_INJECT=build) still stops a
+ * load over an existing table: the call reports it and the previous
+ * generation stays current. */
+static test_result_t test_csv_splayed_cancel_hash(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    char dir[128]; snprintf(dir,sizeof(dir),"/tmp/rayforce-csv-hcancel-%d",(int)getpid());
+    csv_test_rm_rf(dir);
+    int8_t types[] = {RAY_I64,RAY_I64};
+    FILE* f = fopen(TMP_CSV, "w"); TEST_ASSERT_NOT_NULL(f);
+    fputs("a,b\n1,2\n3,4\n5,6\n", f); fclose(f);
+    TEST_ASSERT_EQ_I(ray_csv_save_splayed_named_opts(TMP_CSV,',',true,types,2,NULL,0,dir,100000),RAY_OK);
+    f = fopen(TMP_CSV, "w"); TEST_ASSERT_NOT_NULL(f);
+    fputs("a,b\n", f);
+    for (long long i = 0; i < 300000; i++)
+        fprintf(f, "%lld,%lld\n", (i * 7919) % 1000003, (i * 104729 + 7) % 1000003);
+    fclose(f);
+    setenv("RAY_HASH_INJECT", "build", 1);
+    ray_err_t e = ray_csv_save_splayed_named_opts(TMP_CSV,',',true,types,2,NULL,0,dir,100000);
+    unsetenv("RAY_HASH_INJECT");
+    bool cancelled = ray_interrupted();
+    ray_clear_interrupt();
+    if (!cancelled) {
+        csv_test_rm_rf(dir); unlink(TMP_CSV); ray_sym_destroy(); ray_heap_destroy();
+        SKIP("no in-place hash build on this filesystem");
+    }
+    TEST_ASSERT_EQ_I(e, RAY_ERR_CANCEL);
+    ray_t* t = ray_read_splayed(dir, NULL);
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    TEST_ASSERT_EQ_I(ray_table_nrows(t), 3);
+    ray_release(t);
+    csv_test_rm_rf(dir);
     unlink(TMP_CSV); ray_sym_destroy(); ray_heap_destroy();
     PASS();
 }
 
 const test_entry_t csv_entries[] = {
     { "csv/splayed_cancel", test_csv_splayed_cancel, NULL, NULL },
+    { "csv/splayed_cancel_hash", test_csv_splayed_cancel_hash, NULL, NULL },
     { "csv/splayed_sentinel_literal", test_csv_splayed_sentinel_literal, NULL, NULL },
     { "csv/parted_staging", test_csv_parted_staging, NULL, NULL },
     { "csv/parted_zones", test_csv_parted_zones, NULL, NULL },

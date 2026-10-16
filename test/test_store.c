@@ -2708,6 +2708,123 @@ static test_result_t test_col_build_hash_index_truncate(void) {
 #endif
 }
 
+/* A cancel skips the finish tasks not yet started and the dispatch returns
+ * normally (#716): close_all must report it and publish no column. */
+static test_result_t test_stream_close_all_cancel(void) {
+    ray_pool_t* pool = ray_pool_get();
+    if (!pool || pool->n_workers == 0) SKIP("the finish runs in line without pool workers");
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-stream-cancel-%d", (int)getpid());
+    (void)ray_test_rm_rf(dir);
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    ray_col_stream_t w[2];
+    memset(w, 0, sizeof(w));
+    ray_t* v = store_hash_col(RAY_I64, 1000, 97, 0);
+    for (int c = 0; c < 2; c++) {
+        TEST_ASSERT_EQ_I(ray_col_stream_open(&w[c], dir, ray_sym_intern(c ? "y" : "x", 1), RAY_I64, NULL), RAY_OK);
+        TEST_ASSERT_EQ_I(ray_col_stream_append(&w[c], v), RAY_OK);
+    }
+    ray_request_interrupt();
+    ray_err_t e = ray_col_stream_close_all(w, 2, false, NULL);
+    ray_clear_interrupt();
+    TEST_ASSERT_EQ_I(e, RAY_ERR_CANCEL);
+    for (int c = 0; c < 2; c++) {
+        char p[200]; snprintf(p, sizeof(p), "%s/%s", dir, c ? "y" : "x");
+        TEST_ASSERT_TRUE(access(p, F_OK) != 0);
+    }
+    ray_release(v);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+}
+
+/* Two hash-candidate columns: the debug build's "build" injection raises an
+ * interrupt inside the first hash build, once every column file is written. */
+static ray_t* store_cancel_table(void) {
+    ray_t* t = ray_table_new(2);
+    for (int c = 0; c < 2; c++) {
+        ray_t* v = store_hash_col(RAY_I64, 300000, c ? 7919 : 5003, c ? 0 : 977);
+        t = ray_table_add_col(t, ray_sym_intern(c ? "b" : "a", 1), v);
+        ray_release(v);
+    }
+    return t;
+}
+
+/* A cancel that lands once the columns are written (here: in the hash
+ * build, the last phase before .d) still stops a save over an existing
+ * table: the call reports it and the previous generation stays current. */
+static test_result_t test_splay_save_cancel_late(void) {
+#if defined(DEBUG) && defined(RAY_OS_LINUX)
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-save-cancel-%d", (int)getpid());
+    (void)ray_test_rm_rf(dir);
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    if (!store_in_place(dir)) { (void)ray_test_rm_rf(dir); SKIP("no in-place build on this filesystem"); }
+    char sd[200]; snprintf(sd, sizeof(sd), "%s/t", dir);
+    int64_t small[3] = {1, 2, 3};
+    ray_t* t = ray_table_new(2);
+    for (int c = 0; c < 2; c++) {
+        ray_t* v = ray_vec_from_raw(RAY_I64, small, 3);
+        t = ray_table_add_col(t, ray_sym_intern(c ? "b" : "a", 1), v);
+        ray_release(v);
+    }
+    TEST_ASSERT_EQ_I(ray_splay_save(t, sd, NULL), RAY_OK);
+    ray_release(t);
+    t = store_cancel_table();
+    TEST_ASSERT_EQ_I(setenv("RAY_HASH_INJECT", "build", 1), 0);
+    ray_err_t e = ray_splay_save(t, sd, NULL);
+    unsetenv("RAY_HASH_INJECT");
+    bool cancelled = ray_interrupted();
+    ray_clear_interrupt();
+    ray_release(t);
+    TEST_ASSERT_TRUE(cancelled);
+    TEST_ASSERT_EQ_I(e, RAY_ERR_CANCEL);
+    ray_t* back = ray_read_splayed(sd, NULL);
+    TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
+    TEST_ASSERT_EQ_I(ray_table_nrows(back), 3);
+    ray_release(back);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+#else
+    SKIP("needs a debug build on Linux");
+#endif
+}
+
+/* The same cancel skips the dispatch that persists the deferred zones:
+ * what it would have written is released, not left behind a save. */
+static test_result_t test_splay_save_cancel_leaks(void) {
+#if defined(DEBUG) && defined(RAY_OS_LINUX)
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-save-cleak-%d", (int)getpid());
+    (void)ray_test_rm_rf(dir);
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    if (!store_in_place(dir)) { (void)ray_test_rm_rf(dir); SKIP("no in-place build on this filesystem"); }
+    char sd[200]; snprintf(sd, sizeof(sd), "%s/t", dir);
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(2), RAY_OK);   /* one worker */
+    ray_t* t = store_cancel_table();
+    TEST_ASSERT_EQ_I(ray_splay_save(t, sd, NULL), RAY_OK);
+    size_t base = 0;
+    int bad = 0;
+    for (int k = 0; k < 5; k++) {
+        TEST_ASSERT_EQ_I(setenv("RAY_HASH_INJECT", "build", 1), 0);
+        if (ray_splay_save(t, sd, NULL) != RAY_ERR_CANCEL) bad++;
+        unsetenv("RAY_HASH_INJECT");
+        ray_clear_interrupt();
+        ray_mem_stats_t st; ray_mem_stats(&st);
+        if (k == 1) base = st.bytes_allocated;
+        if (k == 4 && st.bytes_allocated > base + 256) {
+            fprintf(stderr, "  save_cancel_leaks heap %+lld B\n",
+                    (long long)st.bytes_allocated - (long long)base);
+            bad++;
+        }
+    }
+    ray_release(t);
+    ray_pool_destroy();
+    (void)ray_test_rm_rf(dir);
+    TEST_ASSERT_EQ_I(bad, 0);
+    PASS();
+#else
+    SKIP("needs a debug build on Linux");
+#endif
+}
+
 /* The marker goes on last: a process that ends with the whole region
  * written but before the marker (debug builds end it right there, in a
  * child) leaves a file that does not claim an index.  The column is under
@@ -7744,6 +7861,9 @@ const test_entry_t store_entries[] = {
     { "store/col_build_hash_index_fs_types", test_col_build_hash_index_fs_types, store_setup, store_teardown },
     { "store/col_build_hash_index_refused", test_col_build_hash_index_refused, store_setup, store_teardown },
     { "store/col_build_hash_index_truncate", test_col_build_hash_index_truncate, store_setup, store_teardown },
+    { "store/stream_close_all_cancel", test_stream_close_all_cancel, store_setup, store_teardown },
+    { "store/splay_save_cancel_late", test_splay_save_cancel_late, store_setup, store_teardown },
+    { "store/splay_save_cancel_leaks", test_splay_save_cancel_leaks, store_setup, store_teardown },
     { "store/col_build_hash_index_marker_last", test_col_build_hash_index_marker_last, store_setup, store_teardown },
     { "store/col_build_hash_index_rollback", test_col_build_hash_index_rollback, store_setup, store_teardown },
     { "store/col_build_hash_index_interrupt", test_col_build_hash_index_interrupt, store_setup, store_teardown },
