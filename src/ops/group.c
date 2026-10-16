@@ -7957,7 +7957,7 @@ typedef struct {
     ray_sym_domain_raw_t* agg_raw;
     uint8_t*       agg_raw_ok;
     /* Per-agg STR descriptors of a strlen fusion's column, resolved once
-     * (slice offset applied); NULL for other aggs. */
+     * (slice offset applied); NULL for other aggs.  Always set. */
     const ray_str_t** agg_str;
 } da_ctx_t;
 
@@ -8850,13 +8850,9 @@ static void scalar_chunk_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
  * length is the u32 prefix in the pinned mapping; anything else resolves
  * as group_strlen_at_cached does. */
 static inline int64_t da_strlen_at(const da_ctx_t* c, uint32_t a, int64_t r) {
-    if (c->agg_str && c->agg_str[a]) return (int64_t)c->agg_str[a][r].len;
     const ray_t* col = c->agg_cols[a];
-    if (col->type == RAY_STR) {
-        const ray_str_t* elems; const char* pool; (void)pool;
-        str_resolve(col, &elems, &pool);
-        return (int64_t)elems[r].len;
-    }
+    /* STR: descriptors resolved once at setup (every strlen-on-STR agg). */
+    if (col->type == RAY_STR) return (int64_t)c->agg_str[a][r].len;
     if (col->type == RAY_SYM) {
         int64_t sid = ray_read_sym(ray_data((ray_t*)col), r, RAY_SYM, col->attrs);
         if (sid == 0) return 0;
@@ -13674,24 +13670,27 @@ da_path:;
                 .da_n_scan   = n_scan,
             };
             /* Pin each SYM agg column's vocabulary once for the accumulate. */
+            /* strlen-on-STR: resolve each column's descriptors once. */
+            const ray_str_t* da_agg_str[vla_aggs];
+            for (uint32_t a = 0; a < n_aggs; a++) {
+                da_agg_str[a] = NULL;
+                if (agg_strlen[a] && agg_vecs[a] && agg_vecs[a]->type == RAY_STR) {
+                    const char* pool; (void)pool;
+                    str_resolve(agg_vecs[a], &da_agg_str[a], &pool);
+                }
+            }
+            da_ctx.agg_str = da_agg_str;
             ray_t* agg_raw_hdr = NULL;
             if (n_aggs > 0) {
                 char* rm = (char*)scratch_calloc(&agg_raw_hdr,
-                    (size_t)n_aggs * (sizeof(const ray_str_t*) + sizeof(ray_sym_domain_raw_t) + 1));
+                    (size_t)n_aggs * (sizeof(ray_sym_domain_raw_t) + 1));
                 if (rm) {
-                    da_ctx.agg_str = (const ray_str_t**)rm;
-                    rm += (size_t)n_aggs * sizeof(const ray_str_t*);
                     da_ctx.agg_raw = (ray_sym_domain_raw_t*)rm;
                     da_ctx.agg_raw_ok = (uint8_t*)(rm + (size_t)n_aggs * sizeof(ray_sym_domain_raw_t));
-                    for (uint32_t a = 0; a < n_aggs; a++) {
+                    for (uint32_t a = 0; a < n_aggs; a++)
                         if (agg_vecs[a] && agg_vecs[a]->type == RAY_SYM)
                             da_ctx.agg_raw_ok[a] = ray_sym_domain_raw_pin(
                                 ray_sym_vec_domain(agg_vecs[a]), &da_ctx.agg_raw[a]) ? 1 : 0;
-                        if (agg_strlen[a] && agg_vecs[a] && agg_vecs[a]->type == RAY_STR) {
-                            const char* pool; (void)pool;
-                            str_resolve(agg_vecs[a], &da_ctx.agg_str[a], &pool);
-                        }
-                    }
                 }
             }
 
