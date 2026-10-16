@@ -8891,8 +8891,12 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
             }
             if (!c->agg_ptrs[a]) continue;
             if (c->agg_strlen && c->agg_strlen[a]) {
-                acc->sum[idx].i = wrap_add_i64(acc->sum[idx].i, da_strlen_at(c, a, r));
-                if (nn) nn[idx]++;
+                /* Length 0 is the empty string, the STR/SYM null: it adds
+                 * nothing to the sum and is kept out of the AVG divisor, as
+                 * exec_strlen's null.  Branch-free on the length. */
+                int64_t len = da_strlen_at(c, a, r);
+                acc->sum[idx].i = wrap_add_i64(acc->sum[idx].i, len);
+                if (nn) nn[idx] += (len != 0);
             } else if (f64m & ((uint64_t)1 << a)) {
                 /* NaN payload = null, skip from sum. */
                 double v = group_fp_at(c->agg_ptrs[a], c->agg_types[a], r);
@@ -12613,10 +12617,13 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 /* Only flag int-null for storage types whose sentinel is
                  * meaningful. BOOL/U8 are non-nullable; SYM zero is the
                  * canonical empty value and must be skipped by aggregates.
-                 * F64 has its own NaN path. */
+                 * F64 has its own NaN path.  A strlen fusion reads lengths:
+                 * its null is length 0 (the empty string, the STR/SYM null
+                 * that exec_strlen maps to null), already the STR/SYM sentinel. */
                 int8_t t = agg_vecs[a]->type;
                 bool is_sentinel_typed = (t == RAY_I16 || t == RAY_I32 || t == RAY_I64 ||
-                                          t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP || t == RAY_SYM);
+                                          t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP || t == RAY_SYM) ||
+                                         agg_strlen[a];
                 sc_int_null_has[a] = is_sentinel_typed && ray_vec_may_have_nulls(agg_vecs[a]);
                 if (ray_vec_may_have_nulls(agg_vecs[a]) &&
                     (group_fp_type(agg_vecs[a]->type) || is_sentinel_typed))
@@ -13403,10 +13410,14 @@ da_path:;
                     da_int_null_sentinel[a] = agg_int_null_sentinel_for(agg_vecs[a]->type);
                     /* Only set the int-null mask bit for storage types whose
                      * sentinel is meaningful. BOOL/U8 are non-nullable; SYM
-                     * zero is skipped by aggregates. F64 has its own NaN path. */
+                     * zero is skipped by aggregates. F64 has its own NaN path.
+                     * A strlen fusion's null is length 0 (the empty string,
+                     * the STR/SYM null exec_strlen maps to null), already
+                     * the STR/SYM sentinel. */
                     int8_t t = agg_vecs[a]->type;
                     bool is_sentinel_typed = (t == RAY_I16 || t == RAY_I32 || t == RAY_I64 ||
-                                              t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP || t == RAY_SYM);
+                                              t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP || t == RAY_SYM) ||
+                                             agg_strlen[a];
                     if (is_sentinel_typed && ray_vec_may_have_nulls(agg_vecs[a]))
                         da_int_null_mask |= ((uint64_t)1 << a);
                     if (ray_vec_may_have_nulls(agg_vecs[a]) &&
