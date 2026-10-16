@@ -180,8 +180,8 @@ int64_t ray_enc_alprd_size(const uint64_t* v, int n, int T);
  * partial body left in out. */
 bool    ray_enc_alprd_write(const uint64_t* v, int n, int T, ray_enc_buf_t* out);
 /* Validates and decodes an ALP_RD body into T-bit patterns (out holds
- * RAY_ENC_VEC values); returns the body bytes or -1 (corrupt, out
- * partial). */
+ * RAY_ENC_VEC values); returns the body bytes or -1 (corrupt: out is
+ * then untouched or all zero, never partly decoded). */
 int64_t ray_enc_alprd_read(const uint8_t* p, size_t avail, int n, int T, uint64_t* out);
 
 /* ---- the float top level ---- */

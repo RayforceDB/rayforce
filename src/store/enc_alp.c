@@ -361,26 +361,28 @@ int64_t ray_enc_alprd_read(const uint8_t* p, size_t avail, int n, int T, uint64_
     size_t pk = ray_enc_packed_bytes(rb);
     size_t pb = (size_t)p8(2LL * ne);
     if (avail - at < pk + 2 * pb) return -1;
-    uint64_t u[RAY_ENC_VEC];
-    ray_enc_unpack(p + at, T, rb, u);
-    for (int i = n; i < RAY_ENC_VEC; i++) if (u[i]) return -1;          /* pad rows 0 */
-    at += pk;
-    const uint8_t* pos = p + at;
+    const uint8_t* pos = p + at + pk;
     const uint8_t* lefts = pos + pb;
     if (!zero_bytes(pos + 2u * ne, pb - 2u * ne) || !zero_bytes(lefts + 2u * ne, pb - 2u * ne)) return -1;
-    for (int i = 0; i < n; i++) {
-        if (codes[i] >= (uint64_t)dn) return -1;
-        out[i] = ((uint64_t)dict[codes[i]] << rb) | u[i];
-    }
+    for (int i = 0; i < n; i++) if (codes[i] >= (uint64_t)dn) return -1;
     int prev = -1;
     for (int k = 0; k < ne; k++) {
         uint16_t q, l; memcpy(&q, pos + 2 * k, 2); memcpy(&l, lefts + 2 * k, 2);
         /* codes[q] != 0 is corrupt: a spec clarification of "the left code is 0" (D8) */
         if ((int)q <= prev || q >= n || codes[q] != 0 || l >= lmax) return -1;
         prev = q;
-        out[q] = ((uint64_t)l << rb) | u[q];
     }
-    return (int64_t)(at + 2 * pb);
+    /* Every rule but the pad rows is checked: the right parts go straight
+     * into out (no second 8 KB array), and a corrupt pad leaves out zeroed. */
+    ray_enc_unpack(p + at, T, rb, out);
+    for (int i = n; i < RAY_ENC_VEC; i++)
+        if (out[i]) { memset(out, 0, sizeof *out * RAY_ENC_VEC); return -1; }   /* pad rows 0 */
+    for (int i = 0; i < n; i++) out[i] |= (uint64_t)dict[codes[i]] << rb;
+    for (int k = 0; k < ne; k++) {
+        uint16_t q, l; memcpy(&q, pos + 2 * k, 2); memcpy(&l, lefts + 2 * k, 2);
+        out[q] = (out[q] & ((1ull << rb) - 1)) | ((uint64_t)l << rb);          /* code 0 replaced */
+    }
+    return (int64_t)(at + pk + 2 * pb);
 }
 
 /* ---- the float top level ---- */
