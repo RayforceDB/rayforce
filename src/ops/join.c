@@ -2672,6 +2672,16 @@ static void asof_idx_match_fn(void* raw, uint32_t wid,
     }
 }
 
+/* The two index variants of asof_hash_group_match (single key and
+ * multi-key) admit only a right side whose FIRST eq key carries a grouped
+ * HASH or PART index.  Shared with the caller so it pays the exact text
+ * null proof (rt_no_nulls) only when one of those variants can use it. */
+static bool asof_rt_eq_indexed(uint32_t n_eq, ray_t* const* rt_eq) {
+    if (n_eq == 0) return false;
+    ray_idx_kind_t kind = ray_index_kind(rt_eq[0]);
+    return kind == RAY_IDX_HASH || kind == RAY_IDX_PART;
+}
+
 static bool asof_hash_group_match(uint32_t n_eq,
                                   ray_t* const* lt_eq, ray_t* const* rt_eq,
                                   const int64_t* const* eq_xlut,
@@ -2802,9 +2812,7 @@ static bool asof_hash_group_match(uint32_t n_eq,
      * sequential memory and costs a fraction of the binary searches it
      * unlocks.  No pass over the right table is needed: cost is
      * per-probed-key, not per-row. */
-    if (ok && n_eq == 1 && rt_no_nulls &&
-        (ray_index_kind(rt_eq[0]) == RAY_IDX_HASH ||
-         ray_index_kind(rt_eq[0]) == RAY_IDX_PART)) {
+    if (ok && n_eq == 1 && rt_no_nulls && asof_rt_eq_indexed(n_eq, rt_eq)) {
         ray_idx_consults[IDX_SITE_ASOF]++;
         bool served = true;
         ray_t* gsl_hdr = NULL;
@@ -2866,8 +2874,7 @@ static bool asof_hash_group_match(uint32_t n_eq,
      * table anyway, the sequential full pass is cheaper per row, so bail
      * upfront on the (known!) slice-length sum. */
     if (ok && n_eq >= 2 && rt_no_nulls && n_groups > 0 &&
-        (ray_index_kind(rt_eq[0]) == RAY_IDX_HASH ||
-         ray_index_kind(rt_eq[0]) == RAY_IDX_PART)) {
+        asof_rt_eq_indexed(n_eq, rt_eq)) {
         ray_idx_consults[IDX_SITE_ASOF]++;
         bool served = true;
 
@@ -3618,10 +3625,27 @@ static ray_t* exec_window_join_flat(ray_graph_t* g, ray_op_t* op,
      * (no sorting of either side; a fresh CSR grouped index on a single eq
      * key answers groups with no right pass at all).  Falls back to the
      * sort-merge when the per-group right-time monotonicity precondition
-     * fails. */
+     * fails.
+     *
+     * rt_no_nulls feeds only the index variants.  The O(1) attrs check
+     * settles every key it can; a SYM/STR key, which that check can never
+     * clear, is proven by a full payload scan — so take that scan only
+     * when the first key carries an index the variants accept, and only
+     * after every flag-readable key has passed.  Without such an index
+     * rt_no_nulls stays false at no cost, as nothing would consume it. */
     bool rt_no_nulls = !ray_vec_may_have_nulls(rt_time_vec);
-    for (uint32_t k = 0; k < n_eq && rt_no_nulls; k++)
-        if (!join_key_col_nullfree(rt_eq[k])) rt_no_nulls = false;
+    bool rt_text_keys = false;
+    for (uint32_t k = 0; k < n_eq && rt_no_nulls; k++) {
+        if (!ray_vec_may_have_nulls(rt_eq[k])) continue;
+        if (join_key_col_scanned(rt_eq[k])) rt_text_keys = true;
+        else rt_no_nulls = false;
+    }
+    if (rt_no_nulls && rt_text_keys) {
+        if (!asof_rt_eq_indexed(n_eq, rt_eq)) rt_no_nulls = false;
+        for (uint32_t k = 0; k < n_eq && rt_no_nulls; k++)
+            if (join_key_col_scanned(rt_eq[k]) &&
+                !join_key_col_nullfree(rt_eq[k])) rt_no_nulls = false;
+    }
     if (asof_hash_group_match(n_eq, lt_eq, rt_eq, eq_xlut, eq_xn,
                               lt_time, rt_time, lt_null, rt_null,
                               left_n, right_n,
