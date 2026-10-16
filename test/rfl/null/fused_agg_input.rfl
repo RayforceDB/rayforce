@@ -36,3 +36,53 @@
 ;; would overflow to 0 only by coincidence for exactly 2 null rows).
 (at (at (select {s: (sum (* x 2)) from: T by: k where: (== k 1)}) 's) 0) -- 60
 (at (at (select {s: (sum (* x 2)) from: T by: k where: (== k 2)}) 's) 0) -- 0
+
+;; ── Affine input (col +/- c) over a nullable col (issue #814) ──────────────
+;; try_affine_sumavg_input aggregates the bare column and adds the bias at
+;; emit.  (col + c) is null wherever col is, so a SUM adds bias * NON-NULL
+;; count, not bias * group rows: an all-null group sums to 0 and a partly
+;; null group is not off by c per null row.  The oracle is the same agg over
+;; the materialized expression column (e = w + 100, f = w - 7, nulls kept).
+;; Keys: w is null when k % 5 == 0 (all-null groups) or v % 7 == 0 (partly
+;; null groups).  Values are small integers, so F64 sums are exact.
+(set AffEq (fn [x y] (and (== (count x) (count y)) (all (== x y)))))
+(set AffMk (fn [n ng ty] (do (set k (% (* (til n) 7919) ng)) (set v (til n)) (set w (as ty (at (concat (til 13) (take 0Nl 13)) (+ (% (+ k v) 13) (* 13 (as 'I64 (or (== (% k 5) 0) (== (% v 7) 0)))))))) (table [k s v w e f] (list k (at (as 'SYMBOL (map (fn [j] (format "a%" j)) (til ng))) k) v w (+ w 100) (- w 7))))))
+(set AffChk (fn [T] (do (set x (select {m: (sum (+ w 100)) r: (sum (+ 100 w)) d: (sum (- w 7)) a: (avg (+ w 100)) from: T by: {s: s z: (% v 1) t: s}})) (set y (select {m: (sum e) r: (sum e) d: (sum f) a: (avg e) from: T by: {s: s z: (% v 1) t: s}})) (and (AffEq (at x 's) (at y 's)) (AffEq (at x 'm) (at y 'm)) (AffEq (at x 'r) (at y 'r)) (AffEq (at x 'd) (at y 'd)) (AffEq (at x 'a) (at y 'a))))))
+(set AffZero (fn [T] (at (select {m: (sum (+ w 100)) from: T by: {s: s z: (% v 1) t: s} where: (== s 'a0)}) 'm)))
+
+;; Keyless: the scalar reduction emits through emit_agg_columns.
+(set Ta (table [w e f] (list [0N 1 2 0N 4] (+ [0N 1 2 0N 4] 100) (- [0N 1 2 0N 4] 7))))
+(at (select {m: (sum (+ w 100)) d: (sum (- w 7)) from: Ta}) 'm) -- [307]
+(at (select {m: (sum (+ w 100)) d: (sum (- w 7)) from: Ta}) 'd) -- [-14]
+(at (select {m: (sum (+ w 100)) from: Ta}) 'm) -- [307]
+(at (select {m: (avg (+ w 100)) from: Ta}) 'm) -- [102.33333333333333]
+(set Tb (table [w] (list [0N 1.5 2.0 0N 4.5])))
+(at (select {m: (sum (+ w 100.0)) d: (sum (- w 7)) from: Tb}) 'm) -- [308.0]
+(at (select {m: (sum (+ w 100.0)) from: Tb}) 'm) -- [308.0]
+(at (select {m: (sum (+ w 100)) from: (table [w] (list (as 'I64 [0N 0N])))}) 'm) -- [0]
+
+;; Parted, compound key: each partition groups on its own.  8000 rows over two
+;; partitions run the sequential HT emit; 2 x 70000 rows (above the parallel
+;; threshold) run the radix phase-3 emit.
+(.sys.exec "rm -rf /tmp/rfl_aff814")
+(set Wi (AffMk 8000 2000 'I64))
+(.db.splayed.set "/tmp/rfl_aff814/s/2024.01.01/t/" (take Wi 4000) "/tmp/rfl_aff814/s/.sym")
+(.db.splayed.set "/tmp/rfl_aff814/s/2024.01.02/t/" (drop Wi 4000) "/tmp/rfl_aff814/s/.sym")
+(AffChk (.db.parted.get "/tmp/rfl_aff814/s" 't)) -- true
+(AffZero (.db.parted.get "/tmp/rfl_aff814/s" 't)) -- [0]
+(set Wf (AffMk 8000 2000 'F64))
+(.db.splayed.set "/tmp/rfl_aff814/sf/2024.01.01/t/" (take Wf 4000) "/tmp/rfl_aff814/sf/.sym")
+(.db.splayed.set "/tmp/rfl_aff814/sf/2024.01.02/t/" (drop Wf 4000) "/tmp/rfl_aff814/sf/.sym")
+(AffChk (.db.parted.get "/tmp/rfl_aff814/sf" 't)) -- true
+(AffZero (.db.parted.get "/tmp/rfl_aff814/sf" 't)) -- [0.0]
+(set Wi (AffMk 140000 3000 'I64))
+(.db.splayed.set "/tmp/rfl_aff814/r/2024.01.01/t/" (take Wi 70000) "/tmp/rfl_aff814/r/.sym")
+(.db.splayed.set "/tmp/rfl_aff814/r/2024.01.02/t/" (drop Wi 70000) "/tmp/rfl_aff814/r/.sym")
+(AffChk (.db.parted.get "/tmp/rfl_aff814/r" 't)) -- true
+(AffZero (.db.parted.get "/tmp/rfl_aff814/r" 't)) -- [0]
+(set Wf (AffMk 140000 3000 'F64))
+(.db.splayed.set "/tmp/rfl_aff814/rf/2024.01.01/t/" (take Wf 70000) "/tmp/rfl_aff814/rf/.sym")
+(.db.splayed.set "/tmp/rfl_aff814/rf/2024.01.02/t/" (drop Wf 70000) "/tmp/rfl_aff814/rf/.sym")
+(AffChk (.db.parted.get "/tmp/rfl_aff814/rf" 't)) -- true
+(AffZero (.db.parted.get "/tmp/rfl_aff814/rf" 't)) -- [0.0]
+(.sys.exec "rm -rf /tmp/rfl_aff814")
