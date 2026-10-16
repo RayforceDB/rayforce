@@ -10392,6 +10392,59 @@ static int64_t ray_grp_card_lookup(int64_t sym) {
 /* exec_group wrapper: when a plain STR scan key carries a RAY_IDX_DICT, group on
  * its int32 codes (cheap integer path) instead of the 16-byte descriptors, then
  * map codes -> strings on the small result.  Falls through otherwise. */
+/* The length error for an aggregate input that carries none of the rows
+ * but holds several values (`(sum [1 2 3])` over ten rows, a global vector
+ * of another length): the aggregation loops read an input row by row, so
+ * such a vector was read past its end.  A vector of the table's length
+ * stands for a column (sliced per group, filtered by where:), and one value
+ * (an atom or a one-element vector) is spread over the rows; anything else
+ * is an error.  COUNT reads no value of its input.  Cold: only a constant
+ * collection ever gets here. */
+static __attribute__((noinline, cold)) ray_t* group_const_input_check(ray_graph_t* g, uint32_t id,
+                                                                      ray_t* tbl, int64_t nrows) {
+    ray_op_t* in = op_node(g, id);
+    if (!in) return NULL;
+    ray_op_ext_t* x = find_ext(g, in->id);
+    ray_t* v = NULL;
+    bool owned = false;
+    if (in->opcode == OP_CONST) {
+        v = x ? x->literal : NULL;
+    } else {
+        ray_t* saved = g->table;
+        g->table = tbl;
+        v = exec_node(g, in);
+        g->table = saved;
+        if (!v || RAY_IS_ERR(v)) return v;
+        owned = true;
+    }
+    ray_t* err = NULL;
+    if (v && !ray_is_atom(v) && (ray_is_vec(v) || v->type == RAY_LIST) &&
+        v->len != 1 && v->len != nrows)
+        err = ray_error("length", "aggregate input has %lld values for %lld rows",
+                        (long long)v->len, (long long)nrows);
+    if (owned) ray_release(v);
+    return err;
+}
+
+static ray_t* group_const_inputs_check(ray_graph_t* g, ray_op_ext_t* ext, ray_t* tbl) {
+    int64_t nrows = ray_table_nrows(tbl);
+    /* Over no rows nothing of an input is read: `(sum [1 2])` over an
+     * empty table is the sum of no values, as `(sum (til 3))` is. */
+    if (nrows == 0) return NULL;
+    for (uint32_t a = 0; a < ext->n_aggs; a++) {
+        if (ext->agg_ops[a] == OP_COUNT) continue;
+        uint32_t ids[2] = { ext->agg_ins[a],
+                            ext->agg_ins2 ? ext->agg_ins2[a] : RAY_OP_NONE };
+        for (int k = 0; k < 2; k++) {
+            if (ids[k] == RAY_OP_NONE) continue;
+            if (!op_tree_is_scalar(g, ids[k]) || op_tree_is_atom(g, ids[k])) continue;
+            ray_t* err = group_const_input_check(g, ids[k], tbl, nrows);
+            if (err) return err;
+        }
+    }
+    return NULL;
+}
+
 ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit) {
     ray_dict_cd_clear();
     /* Save the outer group-key cardinality hint and publish a fresh empty one
@@ -10420,6 +10473,7 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit)
         result = exec_group_run(g, op, tbl, group_limit); goto grp_done;
     }
     ray_op_ext_t* ext = find_ext(g, op->id);
+    if (ext && (result = group_const_inputs_check(g, ext, tbl))) goto grp_done;
     if (!ext || ext->n_keys == 0) {
         result = exec_group_run(g, op, tbl, group_limit); goto grp_done;
     }
@@ -11205,6 +11259,29 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     return result;
 }
 
+/* The rows of a constant aggregate input, or NULL when it has none to give
+ * here: one value (an atom, a one-element vector) spread over the rows, or
+ * a vector of the table's length, which stands for a column.  The legacy
+ * engine broadcasts the same way; given rows, the constant is grouped as a
+ * column is, so `(sum 1)` orders its groups as `(sum v)` and `(count v)`
+ * do. */
+static ray_t* group_const_input_rows(ray_graph_t* g, ray_op_t* in, int64_t nrows) {
+    ray_op_ext_t* x = find_ext(g, in->id);
+    ray_t* lit = x ? x->literal : NULL;
+    if (!lit || RAY_IS_ERR(lit)) return NULL;
+    if (ray_is_atom(lit) || (ray_is_vec(lit) && lit->len == 1))
+        return materialize_broadcast_input(lit, nrows);
+    if (ray_is_vec(lit) && lit->len == nrows) { ray_retain(lit); return lit; }
+    return NULL;
+}
+
+static bool group_const_input_spreads(ray_graph_t* g, ray_op_t* in, int64_t nrows) {
+    ray_op_ext_t* x = find_ext(g, in->id);
+    ray_t* lit = x ? x->literal : NULL;
+    if (!lit || RAY_IS_ERR(lit)) return false;
+    return ray_is_atom(lit) || (ray_is_vec(lit) && (lit->len == 1 || lit->len == nrows));
+}
+
 /* v2 bridge for expression agg inputs — see the call site in
  * exec_group_run.  Returns the v2 result (or an error), or NULL when the
  * shape is ineligible and the caller should continue on the legacy path. */
@@ -11218,8 +11295,9 @@ static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
      * every index loop below is uint32_t. */
     if (!ext || ext->n_keys < 1 || ext->n_aggs < 1) return NULL;
 
-    /* At least one agg input must be a compiled-expression node; scans,
-     * COUNT and binary/holistic second inputs pass through untouched. */
+    /* At least one agg input must be a compiled-expression node or a
+     * constant with rows to give (group_const_input_rows); scans, COUNT
+     * and binary/holistic second inputs pass through untouched. */
     int64_t nrows = ray_table_nrows(tbl);
     if (nrows <= 0) return NULL;
     uint32_t na = ext->n_aggs, nkk = ext->n_keys;
@@ -11228,7 +11306,8 @@ static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         if (ext->agg_ops[a] == OP_COUNT) continue;
         ray_op_t* in = op_node(g, ext->agg_ins[a]);
         if (!in) return NULL;
-        if (in->opcode == OP_SCAN || in->opcode == OP_CONST) continue;
+        if (in->opcode == OP_SCAN) continue;
+        if (in->opcode == OP_CONST && !group_const_input_spreads(g, in, nrows)) continue;
         any_expr = true;
     }
     if (!any_expr) return NULL;
@@ -11244,14 +11323,17 @@ static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     for (uint32_t a = 0; a < na && ok; a++) {
         if (ext->agg_ops[a] == OP_COUNT) continue;
         ray_op_t* in = op_node(g, ext->agg_ins[a]);
-        if (in->opcode == OP_SCAN || in->opcode == OP_CONST) continue;
+        if (in->opcode == OP_SCAN) continue;
+        if (in->opcode == OP_CONST && !group_const_input_spreads(g, in, nrows)) continue;
         snprintf(names[a], sizeof(names[a]), "_e%u", (unsigned)a);
         if (ray_table_get_col(tbl, ray_sym_intern(names[a], strlen(names[a])))) {
             ok = false; break;   /* user column shadows the synthetic name */
         }
         ray_expr_t ex;
         ray_t* v;
-        if (expr_compile(g, tbl, in, &ex)) {
+        if (in->opcode == OP_CONST) {
+            v = group_const_input_rows(g, in, nrows);
+        } else if (expr_compile(g, tbl, in, &ex)) {
             v = expr_eval_full(&ex, nrows);
         } else {
             /* An input the element-wise compiler declines — an `if`, say:
@@ -16470,6 +16552,16 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                          int n_borrow, int has_avg, int has_stddev,
                          int64_t group_limit) {
 
+    /* The thread-local emit filter (`asc:/desc: agg take: N`, the `having`
+     * count threshold) describes the MERGED groups.  Applied to one
+     * partition's partial it drops groups whose other partitions would have
+     * lifted them into the answer, and the merge then sums the survivors.
+     * Disarm it for the per-partition and merge executions (restored in
+     * pp_cleanup); the caller's sort/take/where still runs over the merged
+     * result. */
+    ray_group_emit_filter_t saved_emit = ray_group_emit_filter_get();
+    ray_group_emit_filter_set((ray_group_emit_filter_t){0});
+
     uint32_t n_keys = ext->n_keys;
     uint32_t n_aggs = ext->n_aggs;
 
@@ -16761,6 +16853,7 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
              * this batch).  The reference partition is never skipped, so the
              * bp[ref_bi] type lookups below always resolve. */
             int64_t sel_off = 0, sel_len = 0, sel_lo = 0, sel_cnt = -1;
+            int32_t src_p = p;   /* the partition whose segments are read */
             if (saved_sel) {
                 sel_off = part_off[p];
                 sel_len = part_off[p + 1] - sel_off;
@@ -16771,6 +16864,19 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                 if (sel_cnt == 0 && (running || ref_bi >= 0)) {
                     bp[bi] = NULL;
                     continue;
+                }
+                /* A whole-table aggregate answers one row whatever the
+                 * where: keeps, and that row comes from the reference
+                 * partial.  Over a partition holding no rows the sub-group
+                 * answers none (a 0-row input has no row to aggregate), so
+                 * when every partition's survivors are skipped the select
+                 * came back empty.  Read the reference from a partition
+                 * that has rows, under an empty selection: the same
+                 * columns, no survivors, the one row of the empty answer. */
+                if (sel_cnt == 0 && n_keys == 0 && sel_len == 0) {
+                    for (int32_t q = 0; q < n_parts; q++)
+                        if (part_off[q + 1] > part_off[q]) { src_p = q; break; }
+                    sel_len = part_off[src_p + 1] - part_off[src_p];
                 }
             }
 
@@ -16794,7 +16900,7 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                 if (!pcol || !RAY_IS_PARTED(pcol->type)) {
                     ray_release(sub); goto batch_fail;
                 }
-                ray_t* seg = ((ray_t**)ray_data(pcol))[p];
+                ray_t* seg = ((ray_t**)ray_data(pcol))[src_p];
                 if (!seg) { ray_release(sub); goto batch_fail; }
                 if (part_nrows < 0) part_nrows = seg->len;
                 ray_retain(seg);
@@ -16933,7 +17039,24 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
             ray_graph_free(pg);
             ray_release(sub);
 
-            if (!bp[bi] || RAY_IS_ERR(bp[bi])) goto batch_fail;
+            /* batch_fail releases bp[], which leaves an error object be */
+            if (bp[bi] && RAY_IS_ERR(bp[bi])) { ray_error_free(bp[bi]); bp[bi] = NULL; }
+            if (!bp[bi]) goto batch_fail;
+            /* A zero-survivor partition is built only as the schema
+             * reference.  Grouped on partition keys alone, its sub-group
+             * has no key and still answers one row (the aggregates of no
+             * rows), which the merge would key by this partition: keep
+             * its columns, drop the row.  With no key at all that row is
+             * the empty-input answer of a whole-table aggregate: keep it. */
+            if (sel_cnt == 0 && n_part_keys == 0 && n_mc_keys > 0) {
+                ray_t* zero = make_i64(0);
+                ray_t* empty = zero ? ray_take_fn(bp[bi], zero) : NULL;
+                if (zero) ray_release(zero);
+                ray_release(bp[bi]);
+                bp[bi] = empty;
+                if (bp[bi] && RAY_IS_ERR(bp[bi])) { ray_error_free(bp[bi]); bp[bi] = NULL; }
+                if (!bp[bi]) goto batch_fail;
+            }
             if (ref_bi < 0) ref_bi = bi;   /* first built partial in this batch */
 
             /* Capture agg column name IDs once (all partials share names) */
@@ -17320,7 +17443,9 @@ batch_fail:
                         out[r] = cv[r] > 0 ? ray_f64_fin((double)sv[r] / (double)cv[r]) : NULL_F64;
                 }
                 /* Single-null float model: flip HAS_NULLS for any avg
-                 * canonicalized to NULL_F64 (overflow). */
+                 * canonicalized to NULL_F64 (overflow), and for the avg
+                 * of no rows -- a whole-table aggregate whose where: kept
+                 * none -- which is null, as over a flat table (was 0.0). */
                 grp_finalize_nulls(avg_col);
                 trimmed = ray_table_add_col(trimmed, nm, avg_col);
                 ray_release(avg_col);
@@ -17461,6 +17586,7 @@ pp_cleanup:
     scratch_free(part_off_hdr);
     scratch_free(local_ids_hdr);
     g->selection = saved_sel;
+    ray_group_emit_filter_set(saved_emit);
     return ret;
 }
 

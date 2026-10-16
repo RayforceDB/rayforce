@@ -2584,7 +2584,8 @@ static void where_emit_fn(void* ctxp, uint32_t wid, int64_t start, int64_t end) 
 
 ray_t* ray_where_fn(ray_t* x) {
     if (!ray_is_vec(x) || x->type != RAY_BOOL)
-        return ray_error("type", "where: argument must be a b8 vector, got %s", ray_type_name(x->type));
+        return ray_error("type", "where: argument must be a B8 vector, got %s%s",
+                         ray_type_name(x->type), ray_is_atom(x) ? " atom" : "");
     const uint8_t* data = (const uint8_t*)ray_data(x);
     int64_t n = x->len;
 
