@@ -7702,6 +7702,19 @@ static bool agg_list_key_eq(ray_t* a, ray_t* b, const ray_group_sym_view_t* view
             if (!agg_list_key_eq(ray_list_get(a, i), ray_list_get(b, i), view)) return false;
         return true;
     }
+    if (a->type == RAY_TABLE && b->type == RAY_TABLE) {
+        /* Same names in order and equal columns, each compared as a key. */
+        int64_t nc = ray_table_ncols(a);
+        if (nc != ray_table_ncols(b) || ray_table_nrows(a) != ray_table_nrows(b)) return false;
+        for (int64_t c = 0; c < nc; c++) {
+            if (ray_table_col_name(a, c) != ray_table_col_name(b, c)) return false;
+            if (!agg_list_key_eq(ray_table_get_col_idx(a, c), ray_table_get_col_idx(b, c), view)) return false;
+        }
+        return true;
+    }
+    if (a->type == RAY_DICT && b->type == RAY_DICT)
+        return agg_list_key_eq(ray_dict_keys(a), ray_dict_keys(b), view) &&
+               agg_list_key_eq(ray_dict_vals(a), ray_dict_vals(b), view);
     if (a->type == b->type && (a->type == RAY_SYM || a->type == RAY_STR)) {
         if (a->len != b->len) return false;
         for (int64_t i = 0; i < a->len; i++) {
@@ -7730,6 +7743,18 @@ static uint64_t agg_list_key_hash(ray_t* value, const ray_group_sym_view_t* view
         for (int64_t i = 0; i < value->len; i++) hash = ray_hash_combine(hash, agg_list_key_hash(children[i], view));
         return hash;
     }
+    if (value->type == RAY_TABLE) {
+        int64_t nc = ray_table_ncols(value);
+        uint64_t hash = ray_hash_i64(nc);
+        for (int64_t c = 0; c < nc; c++) {
+            hash = ray_hash_combine(hash, ray_hash_i64(ray_table_col_name(value, c)));
+            hash = ray_hash_combine(hash, agg_list_key_hash(ray_table_get_col_idx(value, c), view));
+        }
+        return hash;
+    }
+    if (value->type == RAY_DICT)
+        return ray_hash_combine(agg_list_key_hash(ray_dict_keys(value), view),
+                                agg_list_key_hash(ray_dict_vals(value), view));
     if (value->type == RAY_SYM || value->type == RAY_STR) {
         uint64_t hash = ray_hash_i64(value->type);
         for (int64_t i = 0; i < value->len; i++) {

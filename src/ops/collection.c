@@ -1128,6 +1128,30 @@ int atom_eq(ray_t* a, ray_t* b) {
         }
         return 1;
     }
+    case RAY_TABLE: {
+        /* Same column names in order and equal columns.  The vector branch
+         * below compares len * elem_size bytes, zero for a table, so every
+         * pair of same-length tables compared equal (one group for all). */
+        int64_t nc = ray_table_ncols(a);
+        if (nc != ray_table_ncols(b) || ray_table_nrows(a) != ray_table_nrows(b))
+            return 0;
+        for (int64_t c = 0; c < nc; c++) {
+            if (ray_table_col_name(a, c) != ray_table_col_name(b, c)) return 0;
+            ray_t* ca = ray_table_get_col_idx(a, c);
+            ray_t* cb = ray_table_get_col_idx(b, c);
+            if (!ca || !cb) { if (ca != cb) return 0; continue; }
+            if (!atom_eq(ca, cb)) return 0;
+        }
+        return 1;
+    }
+    case RAY_DICT: {
+        /* Equal keys and equal values, position by position (the vector
+         * branch saw every pair of same-length dicts as equal too). */
+        ray_t* ka = ray_dict_keys(a); ray_t* kb = ray_dict_keys(b);
+        ray_t* va = ray_dict_vals(a); ray_t* vb = ray_dict_vals(b);
+        if (!ka || !kb || !va || !vb) return ka == kb && va == vb;
+        return atom_eq(ka, kb) && atom_eq(va, vb);
+    }
     default:
         /* Vector equality: same type and length, element-wise comparison */
         if (a->type > 0 && a->type == b->type && a->len == b->len) {

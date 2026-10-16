@@ -174,3 +174,44 @@
 ;; `error: limit`.  Post-fix: 1500 distinct groups, one row each.
 (set Tmk (table [k1 k2 v] (list (til 1500) (til 1500) (til 1500))))
 (count (select {from: Tmk r: (* v 2) by: {k1: k1 k2: k2}})) -- 1500
+
+;; ─── LIST cells holding tables / dicts ───
+;; Cell equality fell through to the vector branch, which compares
+;; len * elem_size bytes, zero for TABLE/DICT, so every table (and every
+;; dict) of one length landed in one group.  Equal tables (same column names
+;; in order, equal columns) group together, built apart or not; a different
+;; column name or value starts a group of its own.  Same for dicts.
+(set TA1 (table [q] (list [1 2])))
+(set TA2 (table [q] (list [1 2])))
+(set TB (table [r] (list [1 2])))
+(set TC (table [q] (list [1 3])))
+(set TL (list TA1 TB TA2 TC TA1))
+(set TLT (table [x c] (list [1 2 3 4 5] TL)))
+(map count (value (group TL))) -- [3 1 1]
+(value (group TL)) -- (list [0 2 4] [1] [3])
+(at (select {x: (sum x) from: TLT by: c}) 'x) -- [9 2 4]
+(at (select {x: x from: TLT by: c}) 'x) -- (list [1 3 5] [2] [4])
+(at (select {x: (sum x) from: (table [x c s] (list [1 2 3 4 5] TL ['a 'a 'a 'a 'b])) by: [c s]}) 'x) -- [4 2 4 5]
+(set TT2 (at (list (table [q] (list [1])) (table [q] (list [2]))) (% (til 5) 2)))
+(at (select {x: (sum x) from: (table [x c] (list [1 2 3 4 5] TT2)) by: c}) 'x) -- [9 6]
+;; SYM and STR columns compare by value
+(set TS1 (table [n] (list ['a 'b])))
+(set TS2 (table [n] (list (as 'SYM ["a" "b"]))))
+(set TS3 (table [n] (list ["a long string beyond the inline size" "b"])))
+(set TS4 (table [n] (list (concat ["a long string beyond the inline size"] ["b"]))))
+(at (select {x: (sum x) from: (table [x c] (list [1 2 3 4] (list TS1 TS2 TS3 TS4))) by: c}) 'x) -- [3 7]
+(map count (value (group (list TS1 TS2 TS3 TS4)))) -- [2 2]
+(set DL (list {p: 1} {p: 2} {r: 1} {p: 1} (dict ['p] (list 1))))
+(map count (value (group DL))) -- [3 1 1]
+(at (select {x: (sum x) from: (table [x c] (list [1 2 3 4 5] DL)) by: c}) 'x) -- [10 2 3]
+;; a SYM column of a splayed table holds file-domain positions: by: compares
+;; the table / dict cells by symbol text, as it does vector cells
+(.sys.exec "rm -rf /tmp/rfl_grp_tblcell")
+(.db.splayed.set "/tmp/rfl_grp_tblcell/" (table [n] (list ['b 'a])))
+(set FN (at (.db.splayed.get "/tmp/rfl_grp_tblcell/") 'n))
+(set TFL (list (table [n] (list FN)) (table [n] (list ['b 'a])) (table [n] (list ['a 'b]))))
+(at (select {x: (sum x) from: (table [x c] (list [1 2 4] TFL)) by: c}) 'x) -- [3 4]
+(set DFL (list (dict FN [1 2]) (dict ['b 'a] [1 2]) (dict ['a 'b] [1 2])))
+(at (select {x: (sum x) from: (table [x c] (list [1 2 4] DFL)) by: c}) 'x) -- [3 4]
+;; (map count (value (group TFL))) -- [2 1]   ;; xfail BUG: group/distinct compare vector cells (here a table's SYM column) byte for byte, so file-domain and runtime symbols of equal text split; same for (group (list FN ['b 'a])) — the atom_eq vector branch, rewritten on fix/iss-801
+(.sys.exec "rm -rf /tmp/rfl_grp_tblcell")
