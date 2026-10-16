@@ -14732,7 +14732,9 @@ ht_path:;
         int8_t agg_slot = ght_layout.agg_val_slot[ai];
         topn_order_ok = true;
         if (order_op == OP_SUM) {
-            /* The heap sees the raw sum, before bias * group_count is added. */
+            /* The heap sees the raw sum; the affine bias is added at emit,
+             * once per non-null row, so raw and emitted order can differ
+             * (nullable groups of equal size). */
             if (agg_slot < 0 || order_is_f64 ||
                 (agg_affine[ai].enabled && agg_affine[ai].bias_i64 != 0))
                 topn_order_ok = false;
