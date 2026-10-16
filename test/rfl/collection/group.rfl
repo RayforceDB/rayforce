@@ -194,7 +194,7 @@
 (at (select {x: (sum x) from: (table [x c s] (list [1 2 3 4 5] TL ['a 'a 'a 'a 'b])) by: [c s]}) 'x) -- [4 2 4 5]
 (set TT2 (at (list (table [q] (list [1])) (table [q] (list [2]))) (% (til 5) 2)))
 (at (select {x: (sum x) from: (table [x c] (list [1 2 3 4 5] TT2)) by: c}) 'x) -- [9 6]
-;; SYM and STR columns compare by value
+;; SYM columns compare by symbol, STR columns by content
 (set TS1 (table [n] (list ['a 'b])))
 (set TS2 (table [n] (list (as 'SYM ["a" "b"]))))
 (set TS3 (table [n] (list ["a long string beyond the inline size" "b"])))
@@ -204,8 +204,9 @@
 (set DL (list {p: 1} {p: 2} {r: 1} {p: 1} (dict ['p] (list 1))))
 (map count (value (group DL))) -- [3 1 1]
 (at (select {x: (sum x) from: (table [x c] (list [1 2 3 4 5] DL)) by: c}) 'x) -- [10 2 3]
-;; a SYM column of a splayed table holds file-domain positions: by: compares
-;; the table / dict cells by symbol text, as it does vector cells
+;; a SYM column of a splayed table holds file-domain positions at a narrow
+;; width: the cells compare by symbol text, read at the column's own width
+;; (an 8-byte read a cell ran past the end of a W8 column)
 (.sys.exec "rm -rf /tmp/rfl_grp_tblcell")
 (.db.splayed.set "/tmp/rfl_grp_tblcell/" (table [n] (list ['b 'a])))
 (set FN (at (.db.splayed.get "/tmp/rfl_grp_tblcell/") 'n))
@@ -213,5 +214,20 @@
 (at (select {x: (sum x) from: (table [x c] (list [1 2 4] TFL)) by: c}) 'x) -- [3 4]
 (set DFL (list (dict FN [1 2]) (dict ['b 'a] [1 2]) (dict ['a 'b] [1 2])))
 (at (select {x: (sum x) from: (table [x c] (list [1 2 4] DFL)) by: c}) 'x) -- [3 4]
-;; (map count (value (group TFL))) -- [2 1]   ;; xfail BUG: group/distinct compare vector cells (here a table's SYM column) byte for byte, so file-domain and runtime symbols of equal text split; same for (group (list FN ['b 'a])) — the atom_eq vector branch, rewritten on fix/iss-801
+(map count (value (group TFL))) -- [2 1]
+(map count (value (group DFL))) -- [2 1]
+(count (distinct TFL)) -- 2
+(.db.splayed.set "/tmp/rfl_grp_tblcell/" (table [n] (list (take ['b 'a 'c] 300000))))
+(set FW1 (at (.db.splayed.get "/tmp/rfl_grp_tblcell/") 'n))
+(set FW2 (at (.db.splayed.get "/tmp/rfl_grp_tblcell/") 'n))
+(map count (value (group (list (table [n] (list FW1)) (table [n] (list FW2)))))) -- [2]
+(map count (value (group (list (dict FW1 (til 300000)) (dict FW2 (til 300000)))))) -- [2]
+;; (map count (value (group (list FN ['b 'a])))) -- [2]   ;; xfail BUG: group/distinct compare plain vector cells byte for byte, so file-domain and runtime symbols of equal text split (and a narrow SYM cell is read 8 bytes a cell) — the atom_eq vector branch, rewritten on fix/iss-801
 (.sys.exec "rm -rf /tmp/rfl_grp_tblcell")
+;; equal long strings at different pool offsets: compared by content
+(set VS1 ["a long string beyond the inline size" "b"])
+(set VS2 (drop ["another long string beyond the inline size" "a long string beyond the inline size" "b"] 1))
+(map count (value (group (list (table [s] (list VS1)) (table [s] (list VS2)))))) -- [2]
+(at (select {x: (sum x) from: (table [x c] (list [1 2] (list (table [s] (list VS1)) (table [s] (list VS2))))) by: c}) 'x) -- [3]
+(map count (value (group (list (dict VS1 [1 2]) (dict VS2 [1 2]))))) -- [2]
+;; (map count (value (group (list (table [v] (list [0.0])) (table [v] (list [-0.0])))))) -- [2]   ;; xfail BUG: 0.0 and -0.0 F64 cells compare byte for byte and split (by: too)
