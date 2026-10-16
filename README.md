@@ -175,10 +175,9 @@ this is just one measurement, not a bound.
 Memory follows consumed-argument conventions documented per function in
 the headers: arguments marked `consumes` are released by the call, and
 returns marked `borrowed` stay owned by the container. On error paths the
-library releases the references it holds, with one known exception: the
-`ray_dict_new` both-arguments-error path leaks, tracked in #790. Values
-are COW, managed with `ray_retain`/`ray_release`; error objects are owned
-and freed with `ray_error_free`.
+library releases the references it holds. Values are COW, managed with
+`ray_retain`/`ray_release`; error objects are owned and freed with
+`ray_error_free`.
 
 ## How It Works
 
