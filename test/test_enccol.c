@@ -154,14 +154,20 @@ static test_result_t test_load_rejects(void) {
         uint8_t z = 3; patch(p, 32 + 6, &z, 1);
         TEST_ASSERT_NULL(mmap_expect_err(p, "corrupt"));
     }
-    /* a STR chunk with statistics present: a newer build's file, nyi */
+    /* a STR chunk with statistics present on a chunk that is not all
+     * STR_DICT: corrupt (saved forced RAW, so selection cannot make it
+     * STR_DICT; no STR_DICT entry to bound the codes) */
     {
         ray_t* st = ray_vec_new(RAY_STR, 2);
         st = ray_str_vec_append(st, "a", 1); st = ray_str_vec_append(st, "b", 1);
-        TEST_ASSERT_EQ_I(ray_col_save_gen(st, p, 2), RAY_OK); ray_release(st);
+        ray_encw_test_force(RAY_ENC_RAW);
+        ray_err_t se = ray_col_save_gen(st, p, 2);
+        ray_encw_test_force(-1);
+        ray_release(st);
+        TEST_ASSERT_EQ_I(se, RAY_OK);
         uint32_t fl = 0; patch(p, 96 + 56, &fl, 4);
         int64_t one64 = 1; patch(p, 96 + 24, &one64, 8);
-        TEST_ASSERT_NULL(mmap_expect_err(p, "nyi"));
+        TEST_ASSERT_NULL(mmap_expect_err(p, "corrupt"));
     }
     /* outer header: attrs bit outside the persisted mask (HAS_INDEX) */
     TEST_ASSERT_EQ_I(save_i32_rows(p, 3000), RAY_OK);

@@ -74,6 +74,13 @@ typedef struct ray_enccol_s {
     uint64_t        vdict_off, vdict_len;  /* VALUE_DICT entry (file offset, bytes); 0 when absent */
     ray_enc_once_t  dict_once;      /* VALUE_DICT validation (Task 7) */
     ray_t*          dict;           /* validated VALUE_DICT values as RAY_I64 bit patterns */
+    /* STR side entries (P6): file offset and bytes, 0 when absent */
+    uint64_t        sdict_off, sdict_len;  /* STR_DICT */
+    uint64_t        fsst_off, fsst_len;    /* FSST_TABLE */
+    ray_enc_once_t  sdict_once;     /* STR_DICT validation, once (spec "Validation") */
+    ray_enc_once_t  fsst_once;      /* FSST_TABLE validation, once */
+    ray_t*          sdict;          /* validated STR_DICT: a RAY_U8 blob holding a ray_enc_sdict_t */
+    ray_t*          fsst;           /* validated FSST_TABLE: a RAY_U8 blob holding a ray_fsst_table_t */
     /* parted (Task 12) */
     ray_t*          wrapper;        /* RAY_PARTED_BASE + type; segments are RAY_ENCCOL or plain */
     /* materialization (Task 8) */
@@ -103,6 +110,33 @@ typedef struct ray_enccol_s {
      * never set on a failure */
     _Atomic(uint64_t)* dir_vec_ok;
 } ray_enccol_t;
+
+/* A validated STR_DICT side entry (heap blob; offs / bytes point into the
+ * immutable mapping).  Entries are pairwise distinct; "" (the STR null, in
+ * band) is an ordinary entry, null_code its code (UINT32_MAX when no entry
+ * is empty).  slot[] is an open-addressing table over ray_hash_bytes of the
+ * entry bytes: code + 1, 0 empty. */
+typedef struct {
+    uint32_t        n;
+    uint32_t        null_code;
+    const uint64_t* offs;       /* n + 1 */
+    const uint8_t*  bytes;
+    uint64_t        pooled;     /* sum of entry lengths over 12 */
+    uint64_t        mask;       /* hash slots - 1 */
+    uint32_t        slot[];     /* mask + 1 */
+} ray_enc_sdict_t;
+static inline void ray_enc_sdict_entry(const ray_enc_sdict_t* d, uint32_t k, const char** p, uint32_t* len) {
+    *p = (const char*)d->bytes + d->offs[k]; *len = (uint32_t)(d->offs[k + 1] - d->offs[k]);
+}
+
+/* Bound arithmetic of the STR side data (pure, unit-tested: sizes no small
+ * file reaches).  STR_DICT offsets: offs[0] == 0, nondecreasing, each entry
+ * at most UINT32_MAX bytes, offs[n] <= area and pad8(offs[n]) == area (the
+ * entry bytes' area). */
+bool ray_enc_sdict_offsets_ok(const uint64_t* offs, uint32_t n, uint64_t area);
+/* *total += x unless x > UINT32_MAX, the sum overflows or passes cap
+ * (then false, *total unchanged): a decoded-pool total. */
+bool ray_enc_fsst_pool_add(uint64_t* total, uint64_t x, uint64_t cap);
 
 ray_enccol_t* ray_enccol_of(ray_t* v);
 ray_t*  ray_enccol_open(void* mapped, size_t size, const char* path,
@@ -431,6 +465,15 @@ void ray_enccol_meta(ray_t* encv, ray_col_meta_t* m);
 /* Could materialization attach an index (recorded kind, UNIQUE, or for STR
  * a runtime DICT, possible only when every chunk has statistics)? */
 bool ray_enccol_may_have_index(ray_t* encv);
+
+/* The column's validated STR dictionary (*out NULL when it has none, or the
+ * column is not STR), or an owned error (validation, once). */
+ray_t* ray_enccol_strdict(ray_enccol_t* e, const ray_enc_sdict_t** out);
+/* Code of `s` in the column's dictionary: *code >= 0, -1 absent, -2 no
+ * dictionary.  NULL, or an owned error (validation; *code untouched). */
+ray_t* ray_enccol_strdict_code(ray_enccol_t* e, const char* s, size_t len, int64_t* code);
+/* Test hook: how many STR pools materialization has allocated so far. */
+uint64_t ray_enccol_test_str_pool_allocs(void);
 /* A fresh SYM vector `out` (runtime domain) takes the domain the column's ids
  * resolve over, as its materialization would; no decode. */
 void ray_enccol_adopt_domain(ray_t* out, ray_t* encv);

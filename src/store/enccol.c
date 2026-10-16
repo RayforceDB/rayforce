@@ -34,6 +34,7 @@
 #include "store/enc.h"
 #include "store/colrange.h"     /* RAY_COL_POINT_ROWS: the most rows a caller hands one point read */
 #include "vec/str.h"
+#include "ops/hash.h"            /* ray_hash_bytes: the STR_DICT validator's private table */
 #include "core/pool.h"
 #include <math.h>
 #include <stdio.h>
@@ -57,6 +58,8 @@ static void enccol_free(ray_enccol_t* e) {
         ray_release(e->decoded);
     }
     if (e->dict)    ray_release(e->dict);
+    if (e->sdict)   ray_release(e->sdict);
+    if (e->fsst)    ray_release(e->fsst);
     if (e->wrapper) ray_release(e->wrapper);
     if (e->dom && e->dom_owned) ray_sym_domain_release(e->dom);
     if (e->map)     ray_file_map_release(e->map);
@@ -166,6 +169,10 @@ static ray_t* enc_validate_side_table(ray_enccol_t* e) {
             e->vdict_off = e->hdr.side_off + off; e->vdict_len = len;
         } else if (e->type != RAY_STR) {
             ENC_CORRUPT("column %s: string side entry on type %s", e->path, ray_type_name(e->type));
+        } else if (kind == RAY_ENC_SIDE_STR_DICT) {
+            e->sdict_off = e->hdr.side_off + off; e->sdict_len = len;
+        } else {
+            e->fsst_off = e->hdr.side_off + off; e->fsst_len = len;
         }
         at = off + len;
     }
@@ -244,10 +251,6 @@ static ray_t* enc_validate_load(ray_enccol_t* e, uint32_t* saved_sym) {
             ENC_CORRUPT("column %s: chunk %lld statistics on an all-null chunk", e->path, (long long)c);
         if (h.type == RAY_GUID && !absent)
             ENC_CORRUPT("column %s: chunk %lld statistics on GUID", e->path, (long long)c);
-        /* STR code bounds exist exactly when every vector is STR_DICT (P6):
-         * a valid newer file, not a damaged one. */
-        if (h.type == RAY_STR && !absent)
-            return ray_error("nyi", "column %s: STR dictionary statistics need a newer build", e->path);
         if (absent && (de.min || de.max)) ENC_CORRUPT("column %s: chunk %lld absent statistics not zero", e->path, (long long)c);
         if (!absent) {
             if (enc_type_float(h.type)) {
@@ -276,6 +279,19 @@ static ray_t* enc_validate_load(ray_enccol_t* e, uint32_t* saved_sym) {
         prev = eh->side_off + eh->side_len;
     } else if (eh->side_len) {
         ENC_CORRUPT("column %s: side length without side data", e->path);
+    }
+    /* STR directory bounds are codes into the STR_DICT entry (D5): present
+     * only with that entry, and below its count.  Read after the side table
+     * is validated; the entry's contents are validated before first use. */
+    if (h.type == RAY_STR) {
+        uint32_t dn = 0;
+        if (e->sdict_len) memcpy(&dn, b + e->sdict_off, 4);      /* len >= 8: side table */
+        for (int64_t c = 0; c < e->n_chunks; c++) {
+            ray_enc_dirent_t de; memcpy(&de, b + RAY_ENC_DIR_OFF + c * sizeof de, sizeof de);
+            if (de.flags & RAY_ENC_STAT_ABSENT) continue;
+            if (!e->sdict_len || de.min < 0 || (uint64_t)de.max >= dn)
+                ENC_CORRUPT("column %s: chunk %lld STR code bounds outside the dictionary", e->path, (long long)c);
+        }
     }
     bool want_index = eh->index_kind == 1 || eh->index_kind == 2 ||
                       eh->index_kind == 4 || eh->index_kind == 6;
@@ -312,6 +328,8 @@ ray_t* ray_enccol_open(void* mapped, size_t size, const char* path,
     snprintf(e->path, sizeof e->path, "%s", path ? path : "?");
     ray_enc_once_init(&e->once);
     ray_enc_once_init(&e->dict_once);
+    ray_enc_once_init(&e->sdict_once);
+    ray_enc_once_init(&e->fsst_once);
     uint32_t saved = 0;
     /* Descriptors and packed bodies are read in place as 8-byte words: the
      * format keeps every offset 8-aligned, and a mapping starts on a page. */
@@ -392,7 +410,7 @@ static void dirent_at(const ray_enccol_t* e, int64_t c, ray_enc_dirent_t* de) {
 static int lane_width(const ray_enccol_t* e) { return 8 * (int)ray_enccol_esz(e); }
 
 /* 1 legal and implemented, 2 legal by the spec but not in this build
- * (STR_DICT, FSST: P6), 0 illegal. */
+ * (none today; kept for a future code), 0 illegal. */
 static int top_encoding_class(int8_t t, uint8_t enc) {
     switch (t) {
     case RAY_BOOL: case RAY_U8:
@@ -405,8 +423,7 @@ static int top_encoding_class(int8_t t, uint8_t enc) {
         return (enc == RAY_ENC_RAW || enc == RAY_ENC_CONST || enc == RAY_ENC_RLE || enc == RAY_ENC_DICT ||
                 enc == RAY_ENC_ALP || enc == RAY_ENC_ALP_RD) ? 1 : 0;
     case RAY_STR:
-        if (enc == RAY_ENC_RAW || enc == RAY_ENC_CONST) return 1;
-        return (enc == RAY_ENC_STR_DICT || enc == RAY_ENC_FSST) ? 2 : 0;
+        return (enc == RAY_ENC_RAW || enc == RAY_ENC_CONST || enc == RAY_ENC_STR_DICT || enc == RAY_ENC_FSST) ? 1 : 0;
     case RAY_GUID:
         return (enc == RAY_ENC_RAW || enc == RAY_ENC_CONST) ? 1 : 0;
     default: return 0;
@@ -433,6 +450,10 @@ static ray_t* chunk_descs_validate(ray_enccol_t* e, int64_t c, const ray_enc_des
     ray_enc_kind_t kind;
     const bool have_kind = ray_enc_kind_of(e->type, e->attrs, &kind);
     const bool de_absent = de.flags & RAY_ENC_STAT_ABSENT;
+    const bool str = e->type == RAY_STR;
+    uint32_t sdn = 0;                              /* STR_DICT entry count (0: no entry) */
+    if (str && e->sdict_len) memcpy(&sdn, e->base + e->sdict_off, 4);
+    bool all_sdict = true;                         /* STR: every vector of the chunk is STR_DICT */
     for (int j = 0; j < RAY_ENC_VECS_PER_CHUNK; j++) {
         const ray_enc_desc_t* d = &out[j];
         if (j >= nv) {
@@ -466,15 +487,21 @@ static ray_t* chunk_descs_validate(ray_enccol_t* e, int64_t c, const ray_enc_des
             ENC_CORRUPT("column %s: chunk %lld vector %d all-null vector carries statistics", e->path, (long long)c, j);
         if (absent && (d->min || d->max)) ENC_CORRUPT("column %s: chunk %lld vector %d absent statistics not zero", e->path, (long long)c, j);
         if (!absent && e->type == RAY_GUID) ENC_CORRUPT("column %s: chunk %lld vector %d statistics on GUID", e->path, (long long)c, j);
-        /* Only STR_DICT carries code bounds, and a STR_DICT vector already
-         * returned nyi above: on RAW / CONST this is damage in every build. */
-        if (!absent && e->type == RAY_STR) ENC_CORRUPT("column %s: chunk %lld vector %d statistics on a RAW / CONST string vector", e->path, (long long)c, j);
+        /* STR statistics are STR_DICT code bounds (D5): a STR vector has
+         * them exactly when it is STR_DICT (an all-null vector is CONST,
+         * without them), and they are codes below the entry count. */
+        if (str && absent == (d->encoding == RAY_ENC_STR_DICT))
+            ENC_CORRUPT("column %s: chunk %lld vector %d STR statistics %s", e->path, (long long)c, j,
+                        absent ? "missing on a STR_DICT vector" : "on a vector that is not STR_DICT");
+        if (str && d->encoding != RAY_ENC_STR_DICT) all_sdict = false;
         if (!absent) {
             if (enc_type_float(e->type)) {
                 double mn, mx; memcpy(&mn, &d->min, 8); memcpy(&mx, &d->max, 8);
                 if (isnan(mn) || isnan(mx) || mn > mx) ENC_CORRUPT("column %s: chunk %lld vector %d float bounds", e->path, (long long)c, j);
             } else if (d->min > d->max) {
                 ENC_CORRUPT("column %s: chunk %lld vector %d min above max", e->path, (long long)c, j);
+            } else if (str && (d->min < 0 || (uint64_t)d->max >= sdn)) {
+                ENC_CORRUPT("column %s: chunk %lld vector %d STR code bounds outside the dictionary", e->path, (long long)c, j);
             } else if (e->type == RAY_SYM && (d->min < 1 || (uint64_t)d->max >= e->sym_bound ||
                                               (T < 64 && ((uint64_t)d->max >> T)))) {
                 ENC_CORRUPT("column %s: chunk %lld vector %d SYM statistics outside the domain or the id width", e->path, (long long)c, j);
@@ -488,8 +515,11 @@ static ray_t* chunk_descs_validate(ray_enccol_t* e, int64_t c, const ray_enc_des
          * range must lie inside the chunk's.  A vector with values carries
          * statistics exactly when its chunk does (the writer's rule): one
          * without them under a chunk with them would leave its values
-         * unchecked against the range consumers use. */
-        if (!all_null && absent != de_absent) {
+         * unchecked against the range consumers use.  STR (D5) replaces
+         * the rule: its chunk has bounds exactly when every vector is
+         * STR_DICT (checked after the loop), so a STR_DICT vector may keep
+         * its bounds under a chunk without them. */
+        if (!str && !all_null && absent != de_absent) {
             if (absent) ENC_CORRUPT("column %s: chunk %lld vector %d statistics missing under the chunk's", e->path, (long long)c, j);
             ENC_CORRUPT("column %s: chunk %lld vector %d statistics under a chunk without them", e->path, (long long)c, j);
         }
@@ -505,6 +535,9 @@ static ray_t* chunk_descs_validate(ray_enccol_t* e, int64_t c, const ray_enc_des
             if (out) ENC_CORRUPT("column %s: chunk %lld vector %d statistics outside the chunk's", e->path, (long long)c, j);
         }
     }
+    if (str && nv > 0 && all_sdict == de_absent)
+        ENC_CORRUPT("column %s: chunk %lld STR bounds %s", e->path, (long long)c,
+                    de_absent ? "missing although every vector is STR_DICT" : "present although not every vector is STR_DICT");
     if (nsum != de.null_count) ENC_CORRUPT("column %s: chunk %lld descriptor null counts sum to %llu, directory says %u", e->path,
                                            (long long)c, (unsigned long long)nsum, de.null_count);
     if (at != de.bytes) ENC_CORRUPT("column %s: chunk %lld has %llu bytes after its payloads", e->path,
@@ -627,6 +660,148 @@ static ray_t* enc_dict(ray_enccol_t* e, ray_enc_dict_t* out) {
     if (RAY_IS_ERR(d)) return d;
     out->v = (const uint64_t*)ray_data(d);
     out->n = (uint32_t)d->len;
+    return NULL;
+}
+
+/* ---- STR side entries (P6): validated once, before first use ---- */
+
+bool ray_enc_sdict_offsets_ok(const uint64_t* offs, uint32_t n, uint64_t area) {
+    if (offs[0] != 0) return false;
+    for (uint32_t k = 0; k < n; k++)
+        if (offs[k + 1] < offs[k] || offs[k + 1] - offs[k] > UINT32_MAX) return false;
+    return offs[n] <= area && offs[n] <= UINT64_MAX - 7 && ray_enc_pad8(offs[n]) == area;
+}
+
+bool ray_enc_fsst_pool_add(uint64_t* total, uint64_t x, uint64_t cap) {
+    if (x > UINT32_MAX || x > UINT64_MAX - *total || *total + x > cap) return false;
+    *total += x;
+    return true;
+}
+
+static ray_t* enc_sdict_validate(void* ctx, ray_enc_snap_t* fail) {
+    ray_enccol_t* e = ctx;
+    const char* why;
+    if (enc_alloc_fails(e)) { ray_enc_snap_set(fail, "oom", "column %s: STR_DICT", e->path); return NULL; }
+    const uint8_t* p = e->base + e->sdict_off;
+    const uint64_t L = e->sdict_len;                 /* >= 8: the side table */
+    uint32_t n, rsv; memcpy(&n, p, 4); memcpy(&rsv, p + 4, 4);
+    if (rsv) { why = "STR_DICT entry reserved word"; goto bad; }
+    if (n < 1 || n > RAY_ENCW_SDICT_CAP) { why = "STR_DICT entry count"; goto bad; }
+    if (L - 8 < 8ull * (n + 1)) { why = "STR_DICT offsets past the entry"; goto bad; }
+    const uint64_t* offs = (const uint64_t*)(p + 8);  /* 8-aligned: 32-aligned entry in a mapping */
+    const uint64_t area = L - 8 - 8ull * (n + 1);
+    if (!ray_enc_sdict_offsets_ok(offs, n, area)) { why = "STR_DICT offsets"; goto bad; }
+    const uint8_t* bytes = p + 8 + 8ull * (n + 1);
+    if (!all_zero(bytes + offs[n], (size_t)(area - offs[n]))) { why = "STR_DICT padding"; goto bad; }
+    uint64_t cap = 16; while (cap < 2ull * n) cap <<= 1;
+    const int64_t blen = (int64_t)(sizeof(ray_enc_sdict_t) + cap * sizeof(uint32_t));
+    ray_t* blob = ray_vec_new(RAY_U8, blen);
+    if (!blob || RAY_IS_ERR(blob)) {
+        if (blob) ray_error_free(blob);
+        ray_enc_snap_set(fail, "oom", "column %s: STR_DICT", e->path);
+        return NULL;
+    }
+    blob->len = blen;
+    ray_enc_sdict_t* d = (ray_enc_sdict_t*)ray_data(blob);
+    memset(d, 0, (size_t)blen);
+    d->n = n; d->null_code = UINT32_MAX; d->offs = offs; d->bytes = bytes; d->mask = cap - 1;
+    for (uint32_t k = 0; k < n; k++) {
+        const uint64_t len = offs[k + 1] - offs[k];
+        if (len == 0) d->null_code = k;              /* at most one: entries are distinct */
+        if (len > RAY_STR_INLINE_MAX) d->pooled += len;
+        uint64_t h = ray_hash_bytes(bytes + offs[k], (size_t)len) & d->mask;
+        while (d->slot[h]) {
+            const uint32_t q = d->slot[h] - 1;
+            if (offs[q + 1] - offs[q] == len && memcmp(bytes + offs[q], bytes + offs[k], (size_t)len) == 0) {
+                ray_release(blob); why = "STR_DICT entries not distinct"; goto bad;
+            }
+            h = (h + 1) & d->mask;
+        }
+        d->slot[h] = k + 1;
+    }
+    return blob;
+bad:
+    ray_enc_snap_set(fail, "corrupt", "column %s: %s", e->path, why);
+    return NULL;
+}
+
+/* The validated dictionary once published, else NULL (never validates):
+ * read without the once-state's lock, as enc_dict_ready. */
+static const ray_enc_sdict_t* enc_sdict_ready(const ray_enccol_t* e) {
+    if (atomic_load_explicit(&e->sdict_once.state, memory_order_acquire) != RAY_ENC_ONCE_DONE) return NULL;
+    return (const ray_enc_sdict_t*)ray_data(e->sdict);
+}
+
+ray_t* ray_enccol_strdict(ray_enccol_t* e, const ray_enc_sdict_t** out) {
+    *out = NULL;
+    if (e->type != RAY_STR || !e->sdict_len) return NULL;
+    if ((*out = enc_sdict_ready(e)) != NULL) return NULL;      /* every STR_DICT vector decode asks */
+    ray_t* b = ray_enc_once_get(&e->sdict_once, &e->sdict, enc_sdict_validate, e);
+    if (RAY_IS_ERR(b)) return b;
+    *out = (const ray_enc_sdict_t*)ray_data(b);
+    return NULL;
+}
+
+ray_t* ray_enccol_strdict_code(ray_enccol_t* e, const char* s, size_t len, int64_t* code) {
+    const ray_enc_sdict_t* d;
+    ray_t* err = ray_enccol_strdict(e, &d);
+    if (err) return err;
+    if (!d) { *code = -2; return NULL; }
+    *code = -1;
+    uint64_t h = ray_hash_bytes(s, len) & d->mask;
+    while (d->slot[h]) {
+        const uint32_t q = d->slot[h] - 1;
+        if (d->offs[q + 1] - d->offs[q] == len && memcmp(d->bytes + d->offs[q], s, len) == 0) { *code = q; break; }
+        h = (h + 1) & d->mask;
+    }
+    return NULL;
+}
+
+/* FSST_TABLE (spec "Side data"): u8 n, 7 zero bytes, n symbol lengths
+ * padded to 8, n symbols of 8 bytes (zero past their length). */
+static ray_t* enc_fsst_validate(void* ctx, ray_enc_snap_t* fail) {
+    ray_enccol_t* e = ctx;
+    const char* why;
+    if (enc_alloc_fails(e)) { ray_enc_snap_set(fail, "oom", "column %s: FSST_TABLE", e->path); return NULL; }
+    const uint8_t* p = e->base + e->fsst_off;          /* fsst_len >= 8: the side table */
+    const uint8_t n = p[0];
+    if (!all_zero(p + 1, 7)) { why = "FSST_TABLE reserved bytes"; goto bad; }
+    if (n < 1) { why = "FSST_TABLE symbol count"; goto bad; }
+    if (e->fsst_len != 8 + ray_enc_pad8(n) + 8ull * n) { why = "FSST_TABLE size"; goto bad; }
+    if (!all_zero(p + 8 + n, (size_t)(ray_enc_pad8(n) - n))) { why = "FSST_TABLE length padding"; goto bad; }
+    ray_t* blob = ray_vec_new(RAY_U8, (int64_t)sizeof(ray_fsst_table_t));
+    if (!blob || RAY_IS_ERR(blob)) {
+        if (blob) ray_error_free(blob);
+        ray_enc_snap_set(fail, "oom", "column %s: FSST_TABLE", e->path);
+        return NULL;
+    }
+    blob->len = (int64_t)sizeof(ray_fsst_table_t);
+    ray_fsst_table_t* t = (ray_fsst_table_t*)ray_data(blob);
+    memset(t, 0, sizeof *t);
+    t->n = n;
+    const uint8_t* syms = p + 8 + ray_enc_pad8(n);
+    for (int k = 0; k < n; k++) {
+        const uint8_t l = p[8 + k];
+        if (l < 1 || l > 8) { ray_release(blob); why = "FSST_TABLE symbol length"; goto bad; }
+        if (!all_zero(syms + 8 * k + l, (size_t)(8 - l))) { ray_release(blob); why = "FSST_TABLE symbol padding"; goto bad; }
+        t->len[k] = l; memcpy(t->sym[k], syms + 8 * k, 8);
+    }
+    return blob;
+bad:
+    ray_enc_snap_set(fail, "corrupt", "column %s: %s", e->path, why);
+    return NULL;
+}
+
+static ray_t* enc_fsst(ray_enccol_t* e, const ray_fsst_table_t** out) {
+    *out = NULL;
+    if (!e->fsst_len) return ray_error("corrupt", "column %s: FSST vector without an FSST_TABLE entry", e->path);
+    if (atomic_load_explicit(&e->fsst_once.state, memory_order_acquire) == RAY_ENC_ONCE_DONE) {
+        *out = (const ray_fsst_table_t*)ray_data(e->fsst);     /* published: no lock (enc_dict_ready) */
+        return NULL;
+    }
+    ray_t* b = ray_enc_once_get(&e->fsst_once, &e->fsst, enc_fsst_validate, e);
+    if (RAY_IS_ERR(b)) return b;
+    *out = (const ray_fsst_table_t*)ray_data(b);
     return NULL;
 }
 
@@ -777,17 +952,79 @@ static ray_t* dec_guid(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* 
     return NULL;
 }
 
-/* STR RAW / CONST grammar (spec "STR RAW").  With out == NULL it only
- * validates and sizes the decoded pool bytes (pooled strings once per row);
+/* STR vectors: the RAW / CONST grammar (spec "STR RAW"), STR_DICT codes
+ * into the column's dictionary and FSST slices against its table.  With
+ * out == NULL it validates every rule and sizes the decoded pool bytes;
  * with out set the caller has already validated, and pool_out has room for
- * pool_base + pooled bytes. */
+ * pool_base + pooled bytes: it only writes.  dict_pool_off: NULL in vector
+ * scope, where a STR_DICT vector copies each pooled entry once per row
+ * (counted per row); at materialization the dictionary region's offset of
+ * each code, whose entries add no bytes to the vector's (Task 4). */
 static ray_t* dec_str(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d, int vlen,
                       const uint8_t* p, uint64_t avail, void* out, char* pool_out,
-                      uint64_t pool_base, uint64_t pool_cap, uint64_t* pooled_out) {
+                      uint64_t pool_base, uint64_t pool_cap, uint64_t* pooled_out,
+                      const uint32_t* dict_pool_off) {
     ray_str_t* o = (ray_str_t*)out;
     int nulls = 0;
     uint64_t pooled = 0;
-    if (d->encoding == RAY_ENC_CONST) {
+    if (d->encoding == RAY_ENC_STR_DICT) {
+        const ray_enc_sdict_t* sd;
+        ray_t* err = ray_enccol_strdict(e, &sd);
+        if (err) return err;
+        if (!sd) VEC_CORRUPT("STR_DICT vector without a STR_DICT entry");
+        uint64_t codes[RAY_ENC_VEC];
+        if (ray_enc_strdict_read(p, (size_t)avail, vlen, sd->n, codes) < 0)
+            ENC_CORRUPT("column %s: chunk %lld vector %d codec body: %s", e->path, (long long)c, j, ray_enc_read_why());
+        for (int i = 0; i < vlen; i++) {
+            const char* sp; uint32_t len;
+            ray_enc_sdict_entry(sd, (uint32_t)codes[i], &sp, &len);
+            const bool pooled_row = len > RAY_STR_INLINE_MAX;
+            if (pooled_row && !dict_pool_off) pooled += len;      /* vector scope: once per row */
+            /* the null is in band (D4): the empty entry's rows; the bounds
+             * cover the non-null rows (a STR_DICT vector has them) */
+            if (len == 0) nulls++;
+            if (!out) {
+                if (len && ((int64_t)codes[i] < d->min || (int64_t)codes[i] > d->max)) VEC_CORRUPT("code outside its statistics");
+                continue;
+            }
+            memset(&o[i], 0, sizeof o[i]);
+            o[i].len = len;
+            if (!pooled_row) { memcpy(o[i].data, sp, len); continue; }
+            memcpy(o[i].prefix, sp, 4);
+            if (dict_pool_off) { o[i].pool_off = dict_pool_off[codes[i]]; continue; }
+            const uint64_t off = pool_base + pooled - len;
+            memcpy(pool_out + off, sp, len);
+            o[i].pool_off = (uint32_t)off;
+        }
+    } else if (d->encoding == RAY_ENC_FSST) {
+        const ray_fsst_table_t* t;
+        ray_t* err = enc_fsst(e, &t);
+        if (err) return err;
+        uint64_t clen[RAY_ENC_VEC], xlen[RAY_ENC_VEC]; const uint8_t* cb;
+        if (ray_enc_fsst_check(p, (size_t)avail, vlen, t, clen, xlen, &cb) < 0)
+            ENC_CORRUPT("column %s: chunk %lld vector %d codec body: %s", e->path, (long long)c, j, ray_enc_read_why());
+        for (int i = 0; i < vlen; i++) {
+            if (xlen[i] == 0) nulls++;
+            if (xlen[i] > RAY_STR_INLINE_MAX && !ray_enc_fsst_pool_add(&pooled, xlen[i], UINT32_MAX))
+                VEC_CORRUPT("FSST pool above 4 GiB");
+        }
+        uint64_t at = 0, run = 0;
+        for (int i = 0; out && i < vlen; i++) {
+            memset(&o[i], 0, sizeof o[i]);
+            o[i].len = (uint32_t)xlen[i];
+            if (xlen[i] <= RAY_STR_INLINE_MAX) {
+                (void)ray_fsst_decode(t, cb + at, (uint32_t)clen[i], (uint8_t*)o[i].data, RAY_STR_INLINE_MAX);
+            } else {
+                uint8_t* dst = (uint8_t*)pool_out + pool_base + run;
+                (void)ray_fsst_decode(t, cb + at, (uint32_t)clen[i], dst, (size_t)xlen[i]);
+                memcpy(o[i].prefix, dst, 4);
+                o[i].pool_off = (uint32_t)(pool_base + run);
+                run += xlen[i];
+            }
+            at += clen[i];
+        }
+        (void)pool_cap;   /* decode_vec checked pool_base + pooled against it */
+    } else if (d->encoding == RAY_ENC_CONST) {
         if (avail < 8) VEC_CORRUPT("STR CONST body short");
         uint32_t len, rsv; memcpy(&len, p, 4); memcpy(&rsv, p + 4, 4);
         if (rsv) VEC_CORRUPT("STR CONST reserved word");
@@ -1700,7 +1937,7 @@ static ray_t* dec_aside(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t*
 
 static ray_t* decode_vec(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d,
                          void* out, char* pool_out, uint64_t pool_base, uint64_t pool_cap,
-                         bool priv, uint64_t* produced) {
+                         bool priv, uint64_t* produced, const uint32_t* dict_pool_off) {
     int64_t rows = chunk_rows(e, c);
     int vlen = (int)(rows - (int64_t)j * RAY_ENC_VEC < RAY_ENC_VEC ? rows - (int64_t)j * RAY_ENC_VEC : RAY_ENC_VEC);
     const uint8_t* body = NULL; uint64_t avail = 0; const uint8_t* bm = NULL;
@@ -1711,11 +1948,11 @@ static ray_t* decode_vec(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t
     const size_t nbytes = (size_t)vlen * ray_enccol_esz(e);
     if (e->type == RAY_STR) {
         /* validate and size first, so a corrupt vector writes nothing */
-        err = dec_str(e, c, j, d, vlen, body, avail, NULL, NULL, 0, 0, &pooled);
+        err = dec_str(e, c, j, d, vlen, body, avail, NULL, NULL, 0, 0, &pooled, dict_pool_off);
         if (err) return err;
         if (pooled > pool_cap || pool_base > pool_cap - pooled || pool_base + pooled > UINT32_MAX)
             VEC_CORRUPT("pool overflow");
-        err = dec_str(e, c, j, d, vlen, body, avail, out, pool_out, pool_base, pool_cap, NULL);
+        err = dec_str(e, c, j, d, vlen, body, avail, out, pool_out, pool_base, pool_cap, NULL, dict_pool_off);
     } else if (priv) {
         /* a private destination may hold a partial vector on failure (it is
          * never returned): decode straight into it, no aside copy */
@@ -1736,7 +1973,7 @@ void ray_enccol_note_decoded(ray_enccol_t* e, uint64_t nb) {
 ray_t* ray_enccol_decode_desc(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d,
                               void* out, char* pool_out, uint64_t pool_base, uint64_t pool_cap) {
     uint64_t nb;
-    ray_t* err = decode_vec(e, c, j, d, out, pool_out, pool_base, pool_cap, false, &nb);
+    ray_t* err = decode_vec(e, c, j, d, out, pool_out, pool_base, pool_cap, false, &nb, NULL);
     if (!err) ray_enccol_note_decoded(e, nb);
     return err;
 }
@@ -1744,7 +1981,7 @@ ray_t* ray_enccol_decode_desc(ray_enccol_t* e, int64_t c, int j, const ray_enc_d
 ray_t* ray_enccol_decode_into(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d,
                               void* out, char* pool_out, uint64_t pool_base, uint64_t pool_cap,
                               uint64_t* produced) {
-    return decode_vec(e, c, j, d, out, pool_out, pool_base, pool_cap, true, produced);
+    return decode_vec(e, c, j, d, out, pool_out, pool_base, pool_cap, true, produced, NULL);
 }
 
 int ray_enccol_decode_wide(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d,
@@ -2688,7 +2925,7 @@ ray_t* ray_enccol_desc_pool_bytes(ray_enccol_t* e, int64_t c, int j, const ray_e
     const uint8_t* body = NULL; uint64_t avail = 0; const uint8_t* bm = NULL;
     ray_t* err = payload_parts(e, c, j, d, vlen, &body, &avail, &bm);
     if (err) return err;
-    return dec_str(e, c, j, d, vlen, body, avail, NULL, NULL, 0, 0, out);
+    return dec_str(e, c, j, d, vlen, body, avail, NULL, NULL, 0, 0, out, NULL);   /* vector scope */
 }
 
 ray_t* ray_enccol_decode_vec(ray_enccol_t* e, int64_t vec, void* out, char* pool_out,
@@ -2814,9 +3051,8 @@ static ray_t* enc_str_prepass(ray_enccol_t* e, uint64_t* chunk_pool) {
         for (int j = 0; j < nv; j++) {
             uint64_t pb;
             if ((err = ray_enccol_desc_pool_bytes(e, c, j, &descs[j], &pb)) != NULL) return err;
-            if (pb > e->hdr.str_pool_bytes - total)
+            if (!ray_enc_fsst_pool_add(&total, pb, e->hdr.str_pool_bytes))
                 return ray_error("corrupt", "column %s: decoded pool exceeds str_pool_bytes at chunk %lld", e->path, (long long)c);
-            total += pb;
         }
     }
     if (total != e->hdr.str_pool_bytes)
@@ -2972,6 +3208,11 @@ static ray_t* enc_attach_index(ray_enccol_t* e, ray_t** vp) {
     return NULL;
 }
 
+/* Test hook: STR pools allocated by materialization (after the prepass, so a
+ * column it rejects allocates none). */
+static _Atomic(uint64_t) g_str_pool_allocs;
+uint64_t ray_enccol_test_str_pool_allocs(void) { return atomic_load(&g_str_pool_allocs); }
+
 static ray_t* enc_materialize_single(void* ctx, ray_enc_snap_t* fail) {
     ray_enccol_t* e = ctx;
     if (ray_interrupted()) { ray_enc_snap_set(fail, "cancel", "column %s: interrupted", e->path); return NULL; }
@@ -2996,6 +3237,7 @@ static ray_t* enc_materialize_single(void* ctx, ray_enc_snap_t* fail) {
             pool->type = RAY_U8;
             pool->len  = (int64_t)e->hdr.str_pool_bytes;
             vec->str_pool = pool;
+            atomic_fetch_add_explicit(&g_str_pool_allocs, 1, memory_order_relaxed);
         }
     }
     res = enc_alloc_fails(e) ? NULL : ray_calloc_raw((size_t)(e->n_chunks + 1) * sizeof *res);

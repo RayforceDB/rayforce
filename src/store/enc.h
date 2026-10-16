@@ -189,9 +189,8 @@ int64_t ray_enc_alp_read(const uint8_t* p, size_t avail, int n, int T, uint64_t*
  * depends on v only, so size and write agree. ---- */
 /* Smallest ALP_RD body, -1 on bad arguments or OOM. */
 int64_t ray_enc_alprd_size(const uint64_t* v, int n, int T);
-/* Appends the body; false on bad arguments (n outside 0..1024, a length
- * above UINT32_MAX, total not their sum) or OOM (out->oom), with no
- * partial body left in out. */
+/* Appends the body; false on bad arguments (n outside 1..1024, T not 32
+ * or 64) or OOM (out->oom), with no partial body left in out. */
 bool    ray_enc_alprd_write(const uint64_t* v, int n, int T, ray_enc_buf_t* out);
 /* Validates and decodes an ALP_RD body into T-bit patterns (out holds
  * RAY_ENC_VEC values); returns the body bytes or -1 (corrupt: out is

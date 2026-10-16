@@ -609,7 +609,7 @@ static test_result_t test_reject_descriptors(void) {
     SAVE(i32_allnull(), p); W16(desc_at(0, 0) + 4, 0);     BAD(p, 1, "corrupt", "all-null vector carries statistics");
     SAVE(i32_nulls_raw(), p); W16(desc_at(0, 0) + 2, 9);   BAD(p, 1, "corrupt", "descriptor null counts sum to 9");
     {   /* STR statistics on a RAW vector (directory says absent, the descriptor does not) */
-        SAVE(str_mixed(), p); W16(desc_at(0, 0) + 4, 0);   BAD(p, 1, "corrupt", "statistics on a RAW / CONST string vector");
+        SAVE(str_mixed(), p); W16(desc_at(0, 0) + 4, 0);   BAD(p, 1, "corrupt", "STR statistics on a vector that is not STR_DICT");
     }
     {   /* SYM statistics outside the domain: ids in 1..4, saved count 200 */
         uint8_t ids[4] = { 1, 2, 3, 4 };
@@ -1614,6 +1614,50 @@ static test_result_t test_lazy_float(void) {
     PASS();
 }
 
+/* Lazy validation of a STR side entry (spec "Lazy validation"): chunk 0 is
+ * a STR_DICT chunk, chunk 1 FSST; the STR_DICT entry is damaged.  Reads of
+ * FSST vectors succeed; the first read touching a STR_DICT vector fails
+ * `corrupt` on the entry, and so does every later one (the once-state keeps
+ * the verdict), while FSST reads keep succeeding. */
+static test_result_t test_lazy_str(void) {
+    const char* p = ray_test_tmp(EC_TMP "/lazys");
+    ray_t* v = ray_vec_new(RAY_STR, 70000);
+    for (int i = 0; i < 70000; i++) {
+        char b[64];
+        int n = i < 65536 ? snprintf(b, sizeof b, "category number %d long", i % 37)
+                          : snprintf(b, sizeof b, "category number %d long", i);
+        v = ray_str_vec_append(v, b, (size_t)n);
+    }
+    SAVE(v, p);
+    NEED_ENC(0, 0, RAY_ENC_STR_DICT); NEED_ENC(1, 0, RAY_ENC_FSST);
+    size_t side = (size_t)rd64(EH + 16);
+    uint32_t ne; memcpy(&ne, g_img + side, 4);
+    uint16_t k0; memcpy(&k0, g_img + side + 8, 2);
+    TEST_ASSERT_TRUE(ne == 2 && k0 == RAY_ENC_SIDE_STR_DICT);
+    size_t e0 = side + (size_t)rd64(side + 16);
+    W32(e0 + 4, 1);                                       /* the entry's reserved word */
+    TEST_ASSERT_TRUE(img_store(p, g_len));
+    ray_t* c = ray_col_mmap(p);
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));                /* entry contents are not read at load */
+    ray_col_src_t s; TEST_ASSERT_NULL(ray_col_src_bind(c, &s));
+    ray_col_scratch_t sc; ray_col_scratch_init(&sc);
+    ray_col_range_t r;
+    TEST_ASSERT_NULL(ray_col_range(&s, 65536, 4464, &sc, &r));        /* FSST: fine */
+    for (int k = 0; k < 2; k++) {
+        ray_error_clear();
+        ray_t* e = ray_col_range(&s, 1024, 1024, &sc, &r);              /* a STR_DICT vector */
+        bool ok = e && RAY_IS_ERR(e) && strcmp(ray_err_code(e), "corrupt") == 0 &&
+                  has_needle("STR_DICT entry reserved word") && names_path(p);
+        if (e) ray_error_free(e);
+        TEST_ASSERT_TRUE(ok);
+        TEST_ASSERT_NULL(ray_col_range(&s, 66560, 1024, &sc, &r));    /* FSST still fine */
+    }
+    ray_col_scratch_free(&sc); ray_col_src_release(&s);
+    ray_release(c);
+    EXPECT(p, 1, "corrupt", "STR_DICT entry reserved word");
+    PASS();
+}
+
 static uint64_t g_fz;
 static uint64_t fz(void) { uint64_t x = g_fz; x ^= x << 13; x ^= x >> 7; x ^= x << 17; return g_fz = x; }
 
@@ -1687,9 +1731,10 @@ static test_result_t test_fuzz_flips(void) {
     const char* p = ray_test_tmp(EC_TMP "/fz");
     g_fz = 0xC0FFEE;
     int rej_all_total = 0, structural_total = 0, structural_rej = 0;
-    for (int base = 0; base < 10; base++) {
+    for (int base = 0; base < 12; base++) {
         ray_t* v;
         int force = -1;                 /* bases 6..9: P5 float bodies, saved forced */
+        int need = -1;                  /* bases 10, 11: P6 STR bodies, by selection */
         if (base == 0) v = bool_runs();
         else if (base == 1) { v = ray_vec_new(RAY_I32, 70000); v->len = 70000;
             for (int i = 0; i < 70000; i++) ((int32_t*)ray_data(v))[i] = i % 7 ? i % 300 : NULL_I32; }
@@ -1725,9 +1770,26 @@ static test_result_t test_fuzz_flips(void) {
             }
             v->attrs |= RAY_ATTR_HAS_NULLS;
             force = RAY_ENC_RLE;
+        } else if (base == 10) {   /* STR_DICT: inline entries, "" in band, two vectors */
+            v = ray_vec_new(RAY_STR, 2048);
+            for (int i = 0; i < 2048; i++) {
+                char b[16]; int n = i % 11 == 0 ? 0 : snprintf(b, sizeof b, "k%d", i % 6);
+                v = ray_str_vec_append(v, b, (size_t)n);
+            }
+            need = RAY_ENC_STR_DICT;
+        } else if (base == 11) {   /* FSST: an FSST_TABLE entry, pooled and inline rows */
+            v = ray_vec_new(RAY_STR, 1500);
+            for (int i = 0; i < 1500; i++) {
+                char b[96];
+                int n = i % 7 == 0 ? snprintf(b, sizeof b, "id%d", i)
+                                   : snprintf(b, sizeof b, "https://www.example.com/p/%d?q=%d", i, i * 7919 % 10007);
+                v = ray_str_vec_append(v, b, (size_t)n);
+            }
+            need = RAY_ENC_FSST;
         }
         if (force >= 0) { SAVE_AS(v, p, force); NEED_ENC(0, 0, force); }
         else SAVE(v, p);
+        if (need >= 0) { NEED_ENC(0, 0, need); NEED_ENC(0, 1, need); TEST_ASSERT_TRUE(rd64(EH + 16) != 0); }
         if (base == 9) TEST_ASSERT_TRUE(g_img[desc_at(0, 0) + 4] & RAY_ENC_DESC_TRAILER);
         if (base == 6) {   /* the exceptions are the subject: the saved body really has some */
             uint16_t ne; memcpy(&ne, g_img + payload_at(0, 0) + 2, 2);
@@ -1845,6 +1907,7 @@ const test_entry_t enccorrupt_entries[] = {
     { "enccorrupt/depth4",        test_reject_depth4,        ec_setup, ec_teardown },
     { "enccorrupt/lazy",          test_lazy_validation,      ec_setup, ec_teardown },
     { "enccorrupt/lazy_float",    test_lazy_float,           ec_rt_setup, ec_rt_teardown },
+    { "enccorrupt/lazy_str",      test_lazy_str,             ec_setup, ec_teardown },
     { "enccorrupt/fast_kernel_twice", test_fast_kernel_corrupt_twice, ec_setup, ec_teardown },
     { "enccorrupt/runs_kernel_twice", test_runs_kernel_corrupt_twice, ec_setup, ec_teardown },
     { "enccorrupt/stats_nested",  test_stats_nested,         ec_setup, ec_teardown },

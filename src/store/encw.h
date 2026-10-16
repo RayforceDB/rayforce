@@ -86,7 +86,14 @@ void      ray_encw_test_force(int enc);
  * force.  -1 restores. */
 void      ray_encw_test_force_float(int enc);
 /* Test hook: like ray_encw_test_force, for STR vectors only (it wins over
- * ray_encw_test_force there): RAW, CONST, STR_DICT or FSST.  -1 restores. */
+ * ray_encw_test_force there); -1 restores.  STR's encodings are RAW, CONST,
+ * STR_DICT and FSST; all-null vectors stay CONST whatever is forced.  A
+ * forced STR (or general) encoding gives RAY_ERR_NYI on a vector with a
+ * non-null row when it does not apply: CONST over unequal strings; FSST
+ * with no trained table (ray_encw_vec, or a column with no string bytes to
+ * train on) or a slice longer than UINT32_MAX; STR_DICT outside a column
+ * writer (ray_encw_vec has no dictionary) or once the column's entries
+ * would pass RAY_ENCW_SDICT_CAP; any other code. */
 void      ray_encw_test_force_str(int enc);
 
 /* Column assembly (spec "Format"): begin, one chunk per 65536 rows, finish. */
