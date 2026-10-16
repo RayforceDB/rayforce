@@ -804,10 +804,80 @@
 (lcb Plc Klc) -- (select {from: (lcbn Plc Klc) take: 1})
 (lcb Slc Klc) -- (select {from: (lcbn Slc Klc) take: 1})
 (value (lcb Slc Klc)) -- (list [1] [80])
-;; xfail BUG: a bare local counted distinct counts the column of its name,
-;; with and without take: ((count (distinct (+ y 0))) reads the local: [2 2 2])
-;; ((fn [tbl y] (at (select {c: (count (distinct y)) by: x from: tbl}) 'c)) (table [x y] (list [1 1 2 2 3 3] [10 10 20 30 40 50])) [1 2 3 4 5 6]) -- [2 2 2]
-;; xfail BUG: a local key of a count distinct groups by the column (the
-;; rewrite) or raises domain (the general path); expected two groups [2 3]
-;; ((fn [tbl x] (at (select {c: (count (distinct y)) by: x from: tbl}) 'c)) (table [x y] (list [1 1 2 2 3 3] [10 10 20 30 40 50])) [1 1 1 2 2 2]) -- [2 3]
+;; a where: reading a local list of another length (a membership list)
+;; reads the same on every segment: the parted routes still stream it
+(set lcin (fn [tbl m] (select {x: x y: y from: tbl where: (in x m) desc: x take: 2})))
+(set lcio (fn [tbl m] (select {x: x y: y from: tbl where: (in x m) asc: x})))
+(set Bsr (at (.sys.mem) 'sort-perpart-runs))
+(lcin Qlc [1 4 5]) -- (table [x y] (list [5 4] [35 30]))
+(- (at (.sys.mem) 'sort-perpart-runs) Bsr) -- 2
+(set Bso (at (.sys.mem) 'sort-perpart-runs))
+(lcio Qlc [1 4 5]) -- (table [x y] (list [1 4 5] [10 30 35]))
+(- (at (.sys.mem) 'sort-perpart-runs) Bso) -- 2
+(lcio Qlc [1 4 5]) -- (lcio Ulc [1 4 5])
+;; count(distinct) of a name a local hides counts the local, and a key a
+;; local hides groups by the local, on every count-distinct route (the
+;; composite rewrite, the per-group kernel, the high-cardinality global
+;; hash, the eval-level grouping), flat, splayed and parted, with and
+;; without take:.  The routes read the column of the name.
+(.db.splayed.set "/tmp/rfl_cklocal/c/2024.01.01/t/" (table [k y] (list [1 1 2] [10 10 20])))
+(.db.splayed.set "/tmp/rfl_cklocal/c/2024.01.02/t/" (table [k y] (list [2 3 3] [30 40 50])))
+(.db.splayed.set "/tmp/rfl_cklocal/d/t/" (table [k y] (list [1 1 2 2 3 3] [10 10 20 30 40 50])))
+(set Pcd (.db.parted.get "/tmp/rfl_cklocal/c/" 't))
+(set Scd (.db.splayed.get "/tmp/rfl_cklocal/d/t/"))
+(set Tcd (table [k y] (list [1 1 2 2 3 3] [10 10 20 30 40 50])))
+(set Vcd [1 2 3 3 4 4])
+(set cdl (fn [tbl y] (at (select {c: (count (distinct y)) by: k from: tbl}) 'c)))
+(set cdle (fn [tbl y] (at (select {c: (count (distinct (+ y 0))) by: k from: tbl}) 'c)))
+(cdl Tcd Vcd) -- [2 1 1]
+(cdl Tcd Vcd) -- (cdle Tcd Vcd)
+(cdl Scd Vcd) -- [2 1 1]
+(cdl Pcd Vcd) -- [2 1 1]
+(set cdlt (fn [tbl y] (select {c: (count (distinct y)) by: k from: tbl desc: c take: 1})))
+(set cdltn (fn [tbl y] (select {c: (count (distinct y)) by: k from: tbl desc: c})))
+(value (cdlt Tcd Vcd)) -- (list [1] [2])
+(cdlt Tcd Vcd) -- (select {from: (cdltn Tcd Vcd) take: 1})
+(cdlt Scd Vcd) -- (select {from: (cdltn Scd Vcd) take: 1})
+(cdlt Pcd Vcd) -- (select {from: (cdltn Pcd Vcd) take: 1})
+(set cdlw (fn [tbl y] (at (select {c: (count (distinct y)) by: k from: tbl where: (> k 1)}) 'c)))
+(cdlw Tcd Vcd) -- [1 1]
+(cdlw Pcd Vcd) -- [1 1]
+(value ((fn [tbl y] (select {c: (count (distinct y)) s: (sum y) by: k from: tbl})) Tcd Vcd)) -- (list [1 2 3] [2 1 1] [3 6 8])
+;; a scalar local is no list, as outside a query
+(cdl Tcd 7) !- type
+(cdl Pcd 7) !- type
+;; over 50000 groups (the global hash): rows r and r+60000 share a group,
+;; the column differs between them, the local (their parity) does not
+(set Nhc 120000)
+(set Thc (table [k y] (list (% (til Nhc) 60000) (til Nhc))))
+(sum (cdl Thc (% (til Nhc) 2))) -- 60000
+(sum (cdl Thc (til Nhc))) -- 120000
+;; dense keys take the composite (K, X) rewrite
+(set Tdn (table [k y] (list (% (til 1200) 3) (% (til 1200) 4))))
+(cdl Tdn (% (til 1200) 2)) -- [2 2 2]
+(cdl Tdn (% (til 1200) 2)) -- (cdle Tdn (% (til 1200) 2))
+(value (cdlt Tdn (% (til 1200) 2))) -- (list [0] [2])
+;; a key a local holds, or a global vector, groups by its values
+(set Kcd [1 1 1 2 2 2])
+(set cdk (fn [tbl k] (at (select {c: (count (distinct y)) by: k from: tbl}) 'c)))
+(cdk Tcd Kcd) -- [2 3]
+(cdk Scd Kcd) -- [2 3]
+(cdk Pcd Kcd) -- [2 3]
+(at (select {c: (count (distinct y)) by: Kcd from: Tcd}) 'c) -- [2 3]
+(set cdkt (fn [tbl k] (select {c: (count (distinct y)) by: k from: tbl desc: c take: 1})))
+(value (cdkt Tcd Kcd)) -- (list [2] [3])
+(value (cdkt Pcd Kcd)) -- (list [2] [3])
+(value ((fn [tbl k] (select {c: (count (distinct y)) n: (count y) by: k from: tbl})) Tcd Kcd)) -- (list [1 2] [2 3] [3 3])
+(cdk Tdn (% (til 1200) 2)) -- [2 2]
+(value (cdkt Tdn (% (til 1200) 2))) -- (list [0] [2])
+;; under a where: the key meets the rows it keeps, as the aggregate form's
+(set cdkw (fn [tbl k] (select {c: (count (distinct y)) by: k from: tbl where: (> y 15)})))
+(value (cdkw Tcd Kcd)) -- (list [1 2] [1 3])
+(value (cdkw Pcd Kcd)) -- (list [1 2] [1 3])
+(value (cdkw Tcd Kcd)) -- (value ((fn [tbl k] (select {c: (count y) by: k from: tbl where: (> y 15)})) Tcd Kcd))
+;; xfail BUG: on the eval-level grouping (a STR key, a key a local holds) an
+;; output calling a lambda literal that reduces its argument runs once over
+;; the whole table and spreads that one value: [5 error error], expected
+;; the per-group counts [1 2 2] the DAG path gives for an integer key
+;; (at (select {c: ((fn [v] (count (distinct v))) y) by: k from: (table [k y] (list (list "a" "a" "b" "b" "c" "c") [10 10 20 30 40 50]))}) 'c) -- [1 2 2]
 (.sys.exec "rm -rf /tmp/rfl_cklocal")

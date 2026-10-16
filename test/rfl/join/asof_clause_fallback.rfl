@@ -115,3 +115,39 @@
 (at RSwh 'Bid) -- (at ORwh 'Bid)
 (at RSwh 'Price) -- (at ORwh 'Price)
 (at RSwh 'Bid) -- (as 'F64 [100.0])
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; A clause reading a lambda parameter or let of the table's rows (a mask, a
+;; projected vector) reads the whole table: run on one day's segment it met
+;; that day's rows (length / ragged errors).  Such an operand declines to the
+;; flat eager kernel and matches the flat tables; a scalar local or a local
+;; list of another length (a membership list) still streams.
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "rm -rf /tmp/rfl_asof_cf_ll /tmp/rfl_asof_cf_lr")
+(.db.splayed.set "/tmp/rfl_asof_cf_ll/2024.01.01/t/" (table [Ts P] (list [1 5 9] [10 20 30])))
+(.db.splayed.set "/tmp/rfl_asof_cf_ll/2024.01.02/t/" (table [Ts P] (list [12 16 18] [40 50 60])))
+(.db.splayed.set "/tmp/rfl_asof_cf_lr/2024.01.01/t/" (table [Ts B] (list [0 4 8] [100 200 300])))
+(.db.splayed.set "/tmp/rfl_asof_cf_lr/2024.01.02/t/" (table [Ts B] (list [11 15 17] [400 500 600])))
+(set Lll (.db.parted.get "/tmp/rfl_asof_cf_ll/" 't))
+(set Llr (.db.parted.get "/tmp/rfl_asof_cf_lr/" 't))
+(set Fll (select {from: Lll where: (>= Ts 0)}))
+(set Flr (select {from: Llr where: (>= Ts 0)}))
+(set Mll [true false true false true true])
+(set alw (fn [l r m] (asof-join [Ts] (select {from: l where: m}) (select {from: r}))))
+(set Blw (at (.sys.mem) 'asof-perpart-runs))
+(set RSlw (alw Lll Llr Mll))
+(- (at (.sys.mem) 'asof-perpart-runs) Blw) -- 0
+(value RSlw) -- (value (alw Fll Flr Mll))
+(at RSlw 'B) -- [100 300 500 600]
+(set alo (fn [l r Q] (asof-join [Ts] (select {Ts: Ts Q: Q from: l}) (select {from: r}))))
+(value (alo Lll Llr [1 2 3 4 5 6])) -- (value (alo Fll Flr [1 2 3 4 5 6]))
+(at (alo Lll Llr [1 2 3 4 5 6]) 'Q) -- [1 2 3 4 5 6]
+(set Bls (at (.sys.mem) 'asof-perpart-runs))
+(at (alo Lll Llr 7) 'Q) -- [7 7 7 7 7 7]
+(- (at (.sys.mem) 'asof-perpart-runs) Bls) -- 2
+(set ali (fn [l r m] (asof-join [Ts] (select {from: l where: (in P m)}) (select {from: r}))))
+(set Bli (at (.sys.mem) 'asof-perpart-runs))
+(at (ali Lll Llr [10 50]) 'B) -- [100 500]
+(- (at (.sys.mem) 'asof-perpart-runs) Bli) -- 2
+(value (ali Lll Llr [10 50])) -- (value (ali Fll Flr [10 50]))
+(.sys.exec "rm -rf /tmp/rfl_asof_cf_ll /tmp/rfl_asof_cf_lr")
