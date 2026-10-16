@@ -788,6 +788,10 @@ ray_t* ray_mem_ts_fn(ray_t** args, int64_t n) {
     ray_query_measure_t measure;
     ray_query_measure_begin(&measure);
     ray_t* result = ray_eval(args[0]);
+    /* Force a lazy result inside the measured scope so the time, worker and
+     * allocation figures cover the computation, not just graph construction
+     * (#856).  Consumes the handle; yields an owned value or an error. */
+    if (ray_is_lazy(result)) result = ray_lazy_materialize(result);
     ray_query_metrics_t metrics;
     ray_query_measure_end(&measure, &metrics);
 

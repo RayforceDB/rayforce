@@ -475,6 +475,12 @@ ray_t* ray_timeit_fn(ray_t** args, int64_t n) {
     if (n < 1) return ray_error("arity", "timeit: expects 1 argument, got %lld", (long long)n);
     int64_t t0 = ray_profile_now_ns();
     ray_t* result = ray_eval(args[0]);
+    /* Reductions such as (sum v) return a lazy handle whose work only runs
+     * on materialization.  Force it inside the timed span, or timeit reports
+     * the cost of building the graph rather than of the computation (#856).
+     * ray_lazy_materialize consumes the handle and returns an owned value or
+     * an error. */
+    if (ray_is_lazy(result)) result = ray_lazy_materialize(result);
     int64_t t1 = ray_profile_now_ns();
     /* Propagate errors instead of swallowing them — otherwise a failing
      * expression silently reports a timing as if it had succeeded. */
