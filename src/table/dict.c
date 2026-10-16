@@ -68,7 +68,10 @@ static ray_t* dict_alloc_block(ray_t* keys, ray_t* vals) {
 
 ray_t* ray_dict_new(ray_t* keys, ray_t* vals) {
     if (!keys || RAY_IS_ERR(keys)) {
-        if (vals && !RAY_IS_ERR(vals)) ray_release(vals);
+        if (vals && vals != keys) {
+            if (RAY_IS_ERR(vals)) ray_error_free(vals);
+            else ray_release(vals);
+        }
         return keys ? keys : ray_error("type", "dict: keys vector is null");
     }
     if (!vals || RAY_IS_ERR(vals)) {

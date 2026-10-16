@@ -154,6 +154,16 @@
 (set Rcd (select {RegionID: RegionID u: (count (distinct UserID)) from: Pcd by: RegionID desc: u take: 3}))
 (at Rcd 'RegionID) -- [2 3 1]
 (at Rcd 'u) -- [3 2 1]
+;; scalar outputs over a whole-column verb, with no where: or one every row
+;; passes: no selection compacts the source, and the verb reads the parted
+;; columns and the partition key flattened, as after a partial where:
+(at (select {c: (count (distinct date)) from: Pcd}) 'c) -- [2]
+(at (select {c: (count (distinct date)) from: Pcd where: (> UserID 0)}) 'c) -- [2]
+(at (select {c: (count (distinct date)) from: Pcd where: (> UserID 10)}) 'c) -- [2]
+(set Rcdv (select {d: (first (desc date)) r: (last (reverse RegionID)) u: (count (distinct UserID)) from: Pcd}))
+(at Rcdv 'd) -- [2024.01.02]
+(at Rcdv 'r) -- [1]
+(at Rcdv 'u) -- [6]
 (set CD-S1 (table [phrase user] (list ['skip 'alpha 'alpha 'beta] [1 2 3 4])))
 (set CD-S2 (table [phrase user] (list ['skip 'beta 'gamma 'gamma] [5 6 7 8])))
 (.db.splayed.set "/tmp/rfl_part_cd_sym/2024.02.01/s/" CD-S1)
@@ -504,6 +514,26 @@
 (set PKI (.db.parted.get "/tmp/rfl_part_keep/" 't))
 (at (select {from: PKI where: (> ts 3) take: 2}) 'part) -- [1 7]
 (key (select {from: PKI where: (> ts 30)})) -- [part ts v]
+(.sys.exec "rm -rf /tmp/rfl_part_keep")
+;; take: after a where: gathers the null cells as nulls, not as the
+;; sentinel's plain value, as take: alone and where: alone do
+(.db.splayed.set "/tmp/rfl_part_keep/2024.01.01/t/" (table [a b] (list (as 'I64 [0N 1 2 0N 4]) (as 'I32 [5 0N 7 8 9]))))
+(.db.splayed.set "/tmp/rfl_part_keep/2024.01.02/t/" (table [a b] (list (as 'I64 [0N 1 2 0N 4]) (as 'I32 [5 0N 7 8 9]))))
+(set PKN (.db.parted.get "/tmp/rfl_part_keep/" 't))
+(at (select {from: PKN where: (not (== date 2024.01.02)) take: 3}) 'a) -- [0Nl 1 2]
+(at (select {from: PKN where: (not (== date 2024.01.02)) take: 3}) 'b) -- (as 'I32 [5 0N 7])
+(at (select {from: PKN where: (< b 100) take: 3}) 'a) -- [0Nl 1 2]
+(at (select {from: PKN where: (> date 2024.01.01) take: 4}) 'a) -- [0Nl 1 2 0Nl]
+(nil? (at (select {from: PKN where: (< b 100) take: 3}) 'a)) -- [true false false]
+(at (select {from: PKN take: 3}) 'a) -- [0Nl 1 2]
+;; a flat table under where: and take: (the predicate a `not` routes to
+;; the same gather): the flat branch copied the sentinels without marks
+(set MKN (table [date a b] (list [2024.01.01 2024.01.01 2024.01.02 2024.01.03 2024.01.03] (as 'I64 [0N 1 2 0N 4]) (as 'I32 [5 0N 7 8 9]))))
+(at (select {from: MKN where: (not (== date 2024.01.02)) take: 4}) 'a) -- [0Nl 1 0Nl 4]
+(at (select {from: MKN where: (not (== date 2024.01.02)) take: 4}) 'a) -- (at (select {from: MKN where: (not (== date 2024.01.02))}) 'a)
+(nil? (at (select {from: MKN where: (not (== date 2024.01.02)) take: 4}) 'a)) -- [true false true false]
+(at (select {from: MKN where: (not (== date 2024.01.02)) take: 4}) 'b) -- (as 'I32 [5 0N 8 9])
+(nil? (at (select {from: MKN where: (not (== date 2024.01.02)) take: 4}) 'b)) -- [false true false false]
 (.sys.exec "rm -rf /tmp/rfl_part_keep")
 
 ;; ────────────── failed first write of a partition ──────────────
