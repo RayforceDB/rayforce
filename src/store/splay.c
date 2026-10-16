@@ -544,6 +544,13 @@ static ray_err_t splay_write_table_impl(ray_t* tbl, const char* dir,
     if (build_indexes)
         ray_splay_build_indexes(dir, tbl);
 
+    /* A cancel before the commit marker leaves nothing committed: the
+     * write finish removes what this save created. */
+    if (ray_interrupted()) {
+        ray_release(schema);
+        return RAY_ERR_CANCEL;
+    }
+
     /* 3. .d LAST — the commit marker. */
     {
         char path[1024];
@@ -735,7 +742,8 @@ ray_err_t ray_splay_write_finish(ray_splay_write_t* write, ray_err_t result,
                                   bool durable) {
     /* The last moment a cancel can stop a staged write: its generation is
      * not published yet, so the call reports the cancel and the previous
-     * one stays current.  (A first write commits in place with its .d.) */
+     * one stays current.  A first write commits in place with its .d, so
+     * the writers check before writing it. */
     if (result == RAY_OK && write->staged && ray_interrupted())
         result = RAY_ERR_CANCEL;
     if (result == RAY_OK && write->staged) {

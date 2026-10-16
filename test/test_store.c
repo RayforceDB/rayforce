@@ -2749,8 +2749,9 @@ static ray_t* store_cancel_table(void) {
 }
 
 /* A cancel that lands once the columns are written (here: in the hash
- * build, the last phase before .d) still stops a save over an existing
- * table: the call reports it and the previous generation stays current. */
+ * build, the last phase before .d) still stops a save: over an existing
+ * table the previous generation stays current, and a first write leaves
+ * no table (a directory made beforehand keeps what else it holds). */
 static test_result_t test_splay_save_cancel_late(void) {
 #if defined(DEBUG) && defined(RAY_OS_LINUX)
     char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-save-cancel-%d", (int)getpid());
@@ -2780,6 +2781,27 @@ static test_result_t test_splay_save_cancel_late(void) {
     TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
     TEST_ASSERT_EQ_I(ray_table_nrows(back), 3);
     ray_release(back);
+    (void)ray_test_rm_rf(sd);
+    char schema[240], keep[240], col[240];
+    snprintf(schema, sizeof(schema), "%s/.d", sd);
+    snprintf(keep, sizeof(keep), "%s/keep.txt", sd);
+    snprintf(col, sizeof(col), "%s/a", sd);
+    t = store_cancel_table();
+    for (int premade = 0; premade < 2; premade++) {
+        if (premade) {
+            TEST_ASSERT_EQ_I(ray_test_mkdir_p(sd), 0);
+            FILE* f = fopen(keep, "w"); TEST_ASSERT_NOT_NULL(f); fputs("foreign\n", f); fclose(f);
+        }
+        TEST_ASSERT_EQ_I(setenv("RAY_HASH_INJECT", "build", 1), 0);
+        e = ray_splay_save(t, sd, NULL);
+        unsetenv("RAY_HASH_INJECT");
+        ray_clear_interrupt();
+        TEST_ASSERT_EQ_I(e, RAY_ERR_CANCEL);
+        TEST_ASSERT_TRUE(access(schema, F_OK) != 0);
+        TEST_ASSERT_TRUE(access(col, F_OK) != 0);
+        TEST_ASSERT_TRUE(premade ? access(keep, F_OK) == 0 : access(sd, F_OK) != 0);
+    }
+    ray_release(t);
     (void)ray_test_rm_rf(dir);
     PASS();
 #else

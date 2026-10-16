@@ -2271,9 +2271,10 @@ static test_result_t test_csv_splayed_cancel(void) {
 }
 
 /* A cancel that lands once every column is finished (debug builds raise
- * one inside the first hash build, RAY_HASH_INJECT=build) still stops a
- * load over an existing table: the call reports it and the previous
- * generation stays current. */
+ * one inside the first hash build, RAY_HASH_INJECT=build) still stops the
+ * load: over an existing table the previous generation stays current, and
+ * a first write leaves no table (a directory made beforehand keeps what
+ * else it holds). */
 static test_result_t test_csv_splayed_cancel_hash(void) {
     ray_heap_init(); (void)ray_sym_init();
     char dir[128]; snprintf(dir,sizeof(dir),"/tmp/rayforce-csv-hcancel-%d",(int)getpid());
@@ -2301,6 +2302,29 @@ static test_result_t test_csv_splayed_cancel_hash(void) {
     TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
     TEST_ASSERT_EQ_I(ray_table_nrows(t), 3);
     ray_release(t);
+    csv_test_rm_rf(dir);
+    char schema[160], keep[160];
+    snprintf(schema, sizeof(schema), "%s/.d", dir);
+    snprintf(keep, sizeof(keep), "%s/keep.txt", dir);
+    for (int premade = 0; premade < 2; premade++) {
+        if (premade) {
+            TEST_ASSERT_EQ_I(mkdir(dir, 0755), 0);
+            f = fopen(keep, "w"); TEST_ASSERT_NOT_NULL(f); fputs("foreign\n", f); fclose(f);
+        }
+        setenv("RAY_HASH_INJECT", "build", 1);
+        e = ray_csv_save_splayed_named_opts(TMP_CSV,',',true,types,2,NULL,0,dir,100000);
+        unsetenv("RAY_HASH_INJECT");
+        ray_clear_interrupt();
+        TEST_ASSERT_EQ_I(e, RAY_ERR_CANCEL);
+        TEST_ASSERT_TRUE(access(schema, F_OK) != 0);
+        if (premade) {
+            TEST_ASSERT_TRUE(access(keep, F_OK) == 0);
+            char col[160]; snprintf(col, sizeof(col), "%s/a", dir);
+            TEST_ASSERT_TRUE(access(col, F_OK) != 0);
+        } else {
+            TEST_ASSERT_TRUE(access(dir, F_OK) != 0);
+        }
+    }
     csv_test_rm_rf(dir);
     unlink(TMP_CSV); ray_sym_destroy(); ray_heap_destroy();
     PASS();
