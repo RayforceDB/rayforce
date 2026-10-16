@@ -56,12 +56,13 @@ EE -- [5 5 7]
 GG -- [42 4 5]
 FF -- [1 2 3 4 5]
 
-;; ── a dotted target keeps taking the copy ───────────────────────────────
+;; ── a dotted target takes the copy when anything on its path is shared ──
 ;; `ray_env_get` resolves `d.x` to the leaf inside the container, and that
 ;; leaf usually holds the only reference to itself — so an rc test on it says
 ;; nothing about whether the container is shared.  Writing through it would be
 ;; seen by every alias of the dict, and env_set_dotted's COW-rebuild of the
-;; chain cannot undo a write that already landed.
+;; chain cannot undo a write that already landed.  Only a chain of dicts each
+;; held once is amended in place (test_link.c pins that it is in place).
 (set DA (dict ['x] (list (til 3))))
 (set DB DA)
 (alter 'DA.x set 0 99)
@@ -75,3 +76,34 @@ DB.x -- [0 1 2]
 (alter 'TA.c set 0 77)
 (at TA 'c) -- [0 1 2]
 (at TB 'c) -- [0 1 2]
+
+;; sole-owned chain: amended in place, at any depth
+(set DC (dict [cash v] (list 100 (til 4))))
+(alter 'DC.v set 1 50)
+(alter 'DC.v set [2 3] 7)
+DC.v -- [0 50 7 7]
+DC.cash -- 100
+(set DN (dict [a] (list (dict [v] (list (til 3))))))
+(alter 'DN.a.v set 2 60)
+DN.a.v -- [0 1 60]
+
+;; an alias of the head, of an inner dict, or of the leaf itself keeps its value
+(set DM DN)
+(alter 'DN.a.v set 0 9)
+DN.a.v -- [9 1 60]
+DM.a.v -- [0 1 60]
+(set DI DN.a)
+(alter 'DN.a.v set 1 8)
+DN.a.v -- [9 8 60]
+DI.v -- [9 1 60]
+(set DL DC.v)
+(alter 'DC.v set 0 -1)
+DC.v -- [-1 50 7 7]
+DL -- [0 50 7 7]
+
+;; an indexed leaf: dropping the index copies it, and the copy is bound
+(set DX (dict [v] (list (.idx.zone [5 1 9]))))
+(alter 'DX.v set 0 2)
+DX.v -- [2 1 9]
+(.idx.has? DX.v) -- false
+

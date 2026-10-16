@@ -1,0 +1,11 @@
+;; A grouped take must rank by the emitted SUM, including the per-row bias.
+;; The compound SYM key over two partitions takes the radix top-N route.
+(.sys.exec "rm -rf /tmp/rfl_affine_sum_topn")
+(set K (map (fn [i] (if (< i 3000) (% i 50) (% (* i 7919) 2000))) (til 8000)))
+(set W (table [s w v] (list (at (as 'SYMBOL (map (fn [j] (format "w%" j)) (til 2000))) K) (as 'I64 (map (fn [k] (if (< k 50) 0 (% k 13))) K)) (til 8000))))
+(.db.splayed.set "/tmp/rfl_affine_sum_topn/2024.01.01/t/" (take W 4000) "/tmp/rfl_affine_sum_topn/.sym")
+(.db.splayed.set "/tmp/rfl_affine_sum_topn/2024.01.02/t/" (drop W 4000) "/tmp/rfl_affine_sum_topn/.sym")
+(set P (.db.parted.get "/tmp/rfl_affine_sum_topn" 't))
+(at (select {m: (sum (+ w 100)) from: P by: {s: s z: (% v 1) t: s} desc: m take: 20}) 'm) -- (take 6300 20)
+(at (take (select {m: (sum (+ w 100)) from: P by: {s: s z: (% v 1) t: s} desc: m take: 1025}) 20) 'm) -- (take 6300 20)
+(.sys.exec "rm -rf /tmp/rfl_affine_sum_topn")

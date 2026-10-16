@@ -7730,6 +7730,22 @@ static uint64_t agg_list_key_hash(ray_t* value, const ray_group_sym_view_t* view
         for (int64_t i = 0; i < value->len; i++) hash = ray_hash_combine(hash, agg_list_key_hash(children[i], view));
         return hash;
     }
+    /* TABLE / DICT cells compare in atom_eq (the fallthrough of
+     * agg_list_key_eq).  Hashing their names and columns only spreads the
+     * buckets: the fallback hash (type and length) puts every table of one
+     * length in one bucket, a linear scan per row. */
+    if (value->type == RAY_TABLE) {
+        int64_t nc = ray_table_ncols(value);
+        uint64_t hash = ray_hash_i64(nc);
+        for (int64_t c = 0; c < nc; c++) {
+            hash = ray_hash_combine(hash, ray_hash_i64(ray_table_col_name(value, c)));
+            hash = ray_hash_combine(hash, agg_list_key_hash(ray_table_get_col_idx(value, c), view));
+        }
+        return hash;
+    }
+    if (value->type == RAY_DICT)
+        return ray_hash_combine(agg_list_key_hash(ray_dict_keys(value), view),
+                                agg_list_key_hash(ray_dict_vals(value), view));
     if (value->type == RAY_SYM || value->type == RAY_STR) {
         uint64_t hash = ray_hash_i64(value->type);
         for (int64_t i = 0; i < value->len; i++) {
