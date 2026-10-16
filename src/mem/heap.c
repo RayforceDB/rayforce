@@ -1771,9 +1771,60 @@ void ray_file_map_release(ray_file_map_t* m) {
     ray_sys_free(m);
 }
 
+/* Deep ownership chains.  Freeing a block releases what it owns, and a
+ * release that drops the last ref frees that child in turn, so a chain of
+ * blocks each owning the next (a list nested a million levels, a parse tree
+ * built in a loop) used to free one C frame group per level and overflow the
+ * stack.  Past RAY_FREE_DEPTH_MAX nested frees a block is parked on this
+ * thread's defer stack instead, and the outermost ray_free drains it before
+ * returning — so a release still frees everything it reached by the time it
+ * returns, and the C stack stays bounded however deep the chain.  The stack
+ * is a plain ray_sys buffer (never a heap block, which would have to be
+ * freed through here) and is let go once drained; should it fail to grow,
+ * the free simply recurses as before. */
+#define RAY_FREE_DEPTH_MAX 256
+
+static RAY_TLS uint32_t free_depth      = 0;
+static RAY_TLS ray_t**  free_defer      = NULL;
+static RAY_TLS size_t   free_defer_len  = 0;
+static RAY_TLS size_t   free_defer_cap  = 0;
+
+static bool free_defer_push(ray_t* v) {
+    if (free_defer_len == free_defer_cap) {
+        size_t cap = free_defer_cap ? free_defer_cap * 2 : 256;
+        ray_t** grown = (ray_t**)ray_sys_realloc(free_defer, cap * sizeof(ray_t*));
+        if (!grown) return false;
+        free_defer = grown;
+        free_defer_cap = cap;
+    }
+    /* rc=1 while parked, as ray_free_one keeps it while releasing children:
+     * buddy coalescing must not merge a block that is not yet free. */
+    ray_atomic_store(&v->rc, 1);
+    free_defer[free_defer_len++] = v;
+    return true;
+}
+
+static void ray_free_one(ray_t* v);
+
 void ray_free(ray_t* v) {
     if (!v || RAY_IS_ERR(v)) return;
     if (v->attrs & RAY_ATTR_ARENA) return;  /* arena-owned, bulk-freed */
+    if (free_depth >= RAY_FREE_DEPTH_MAX && free_defer_push(v)) return;
+
+    bool outer = (free_depth == 0);
+    free_depth++;
+    ray_free_one(v);
+    if (outer) {
+        while (free_defer_len > 0)
+            ray_free_one(free_defer[--free_defer_len]);
+        ray_sys_free(free_defer);
+        free_defer = NULL;
+        free_defer_cap = 0;
+    }
+    free_depth--;
+}
+
+static void ray_free_one(ray_t* v) {
 #ifdef DEBUG
     if (dfd_contains(v)) dfd_report("ray_free (double free)", v);
 #endif

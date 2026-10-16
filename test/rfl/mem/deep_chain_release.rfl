@@ -1,0 +1,24 @@
+;; deep_chain_release.rfl — freeing a chain of blocks each owning the next
+;; must not recurse once per level on the C stack.  A list nested 200000
+;; levels overflowed an 8 MB stack on free even in a release build (and a
+;; few thousand levels did under the sanitizers); past a fixed depth the
+;; free now parks blocks and drains them iteratively.
+;;
+;; The chain is built in a loop, so only the release is deep.  After it is
+;; dropped every level must be back in the heap: `bytes-allocated` returns
+;; to within a few KB of where it was before the chain was built.
+(set heapb (fn [] (at (.sys.mem) 'bytes-allocated)))
+(set chain (fn [n] (let a (list 1)) (times n (let a (list a))) a))
+(set dchain (fn [n] (let a (dict [k] (list 1))) (times n (let a (dict [k] (list a)))) a))
+(set deep (chain 10))
+(set deep (dchain 10))
+(set deep 0)
+(set h0 (heapb))
+(set deep (chain 500000))
+(> (- (heapb) h0) 1000000) -- true
+(set deep 0)
+(< (- (heapb) h0) 4096) -- true
+;; a chain of dicts, each owning the next through its values, frees the same way
+(set deep (dchain 300000))
+(set deep 0)
+(< (- (heapb) h0) 4096) -- true
