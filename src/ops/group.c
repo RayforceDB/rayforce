@@ -7959,6 +7959,9 @@ typedef struct {
     /* Per-agg STR descriptors of a strlen fusion's column, resolved once
      * (slice offset applied); NULL for other aggs.  Always set. */
     const ray_str_t** agg_str;
+    /* The one SUM/AVG(strlen) agg when every other agg is a COUNT, the key
+     * is single and all_sum holds (da_accum_strlen_fn); -1 otherwise. */
+    int32_t        sl_agg;
 } da_ctx_t;
 
 typedef struct {
@@ -9087,12 +9090,130 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
     if (last_advanced)  acc->last_row[gid]  = r;
 }
 
+/* Off the hot loop: an id past the pinned mapping / snapshot. */
+static int64_t __attribute__((noinline, cold))
+da_sid_len_slow(const da_ctx_t* c, uint32_t a, int64_t r) {
+    return group_strlen_at_cached(c->agg_cols[a], r, c->sym_strings, c->sym_count);
+}
+
+/* strlen of SYM id sid (cell r of agg a): raw is the pinned FILE mapping or
+ * NULL, rt the runtime domain with the borrowed snapshot — both decided by
+ * the caller once.  Same answer as da_strlen_at. */
+RAY_INLINE int64_t da_sid_len(const da_ctx_t* c, uint32_t a, int64_t sid,
+                              const ray_sym_domain_raw_t* raw, bool rt, int64_t r) {
+    if (sid == 0) return 0;
+    if (raw && sid > 0 && sid < raw->count) {
+        size_t sl;
+        (void)ray_sym_domain_raw_str(raw, sid, &sl);
+        return (int64_t)sl;
+    }
+    if (rt && sid > 0 && (uint64_t)sid < c->sym_count) {
+        ray_t* atom = c->sym_strings[sid];
+        return atom ? (int64_t)ray_str_len(atom) : 0;
+    }
+    return da_sid_len_slow(c, a, r);
+}
+
+/* One SUM/AVG(strlen) beside COUNTs, one key, no row selection
+ * (c->sl_agg >= 0).  Per block of rows the lengths are read first by a loop
+ * of the column's own kind — STR descriptors, or SYM ids at their width —
+ * and then folded by a loop of the key's width, so neither loop carries the
+ * other's dispatch nor da_accum_row's per-agg one.  Keeps the state the
+ * SUM/AVG fast path keeps for it: count, the length sum, nn when allocated,
+ * sl_null for an AVG (COUNT emits from count alone). */
+#define DA_SL_BLK 512
+static void __attribute__((noinline))
+da_accum_strlen_fn(da_ctx_t* c, da_accum_t* acc, int64_t start, int64_t end) {
+    const uint32_t sa = (uint32_t)c->sl_agg;
+    const size_t n_aggs = c->n_aggs;
+    int64_t* restrict count = acc->count;
+    da_val_t* restrict sum = acc->sum;
+    int64_t* nn = acc->nn_count;
+    int64_t* sln = acc->sl_null;
+    const int64_t kmin = c->key_mins[0];
+    const bool ksym = c->key_types[0] == RAY_SYM;
+    const bool da_pf = c->n_slots >= 4096;
+    const ray_t* col = c->agg_cols[sa];
+    const ray_str_t* desc = c->agg_str[sa];
+    const void* ids = desc ? NULL : ray_data((ray_t*)col);
+    const uint8_t sw = col->attrs & RAY_SYM_W_MASK;
+    const ray_sym_domain_raw_t* raw =
+        (!desc && c->agg_raw_ok && c->agg_raw_ok[sa]) ? &c->agg_raw[sa] : NULL;
+    const bool rt = !desc && c->sym_strings &&
+                    ray_sym_vec_domain((ray_t*)col) == ray_sym_runtime_domain();
+    int64_t lens[DA_SL_BLK];
+    #define DA_SL_SYM(T) \
+    do { \
+        const T* sp = (const T*)ids; \
+        for (int64_t j = 0; j < n; j++) \
+            lens[j] = da_sid_len(c, sa, (int64_t)sp[b0 + j], raw, rt, b0 + j); \
+    } while (0)
+    #define DA_SL_PF_DIST 8
+    #define DA_SL_FOLD(KTYPE, KCAST) \
+    do { \
+        const KTYPE* kp = (const KTYPE*)c->key_ptrs[0]; \
+        for (int64_t j = 0; j < n; j++) { \
+            int64_t r = b0 + j; \
+            if (da_pf && RAY_LIKELY(r + DA_SL_PF_DIST < end)) { \
+                int64_t pfk = (int64_t)KCAST kp[r + DA_SL_PF_DIST]; \
+                if (ksym && pfk == 0) pfk = kmin; \
+                __builtin_prefetch(&count[(int32_t)(pfk - kmin)], 1, 1); \
+                __builtin_prefetch(&sum[(size_t)(int32_t)(pfk - kmin) * n_aggs], 1, 1); \
+            } \
+            int64_t kv = (int64_t)KCAST kp[r]; \
+            if (ksym && kv == 0) kv = kmin; \
+            int32_t gid = (int32_t)(kv - kmin); \
+            count[gid]++; \
+            size_t idx = (size_t)gid * n_aggs + sa; \
+            int64_t len = lens[j]; \
+            sum[idx].i = wrap_add_i64(sum[idx].i, len); \
+            if (nn) nn[idx]++; \
+            if (RAY_UNLIKELY(len == 0) && sln) sln[idx]++; \
+        } \
+    } while (0)
+    for (int64_t b0 = start; b0 < end; b0 += DA_SL_BLK) {
+        int64_t n = end - b0 < DA_SL_BLK ? end - b0 : DA_SL_BLK;
+        if (desc) {
+            for (int64_t j = 0; j < n; j++) lens[j] = (int64_t)desc[b0 + j].len;
+        } else {
+            switch (sw) {
+            case RAY_SYM_W8:  DA_SL_SYM(uint8_t);  break;
+            case RAY_SYM_W16: DA_SL_SYM(uint16_t); break;
+            case RAY_SYM_W32: DA_SL_SYM(uint32_t); break;
+            default:          DA_SL_SYM(int64_t);  break;
+            }
+        }
+        /* Key widths as da_accum_fn's single-key loop (sign-extend signed). */
+        if (da_key_is_unsigned(c->key_types[0])) {
+            switch (c->key_esz[0]) {
+            case 1: DA_SL_FOLD(uint8_t, ); break;
+            case 2: DA_SL_FOLD(uint16_t, ); break;
+            case 4: DA_SL_FOLD(uint32_t, (int64_t)); break;
+            default: DA_SL_FOLD(int64_t, ); break;
+            }
+        } else {
+            switch (c->key_esz[0]) {
+            case 1: DA_SL_FOLD(int8_t, ); break;
+            case 2: DA_SL_FOLD(int16_t, ); break;
+            case 4: DA_SL_FOLD(int32_t, (int64_t)); break;
+            default: DA_SL_FOLD(int64_t, ); break;
+            }
+        }
+    }
+    #undef DA_SL_FOLD
+    #undef DA_SL_PF_DIST
+    #undef DA_SL_SYM
+}
+#undef DA_SL_BLK
+
 static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
     da_ctx_t* c = (da_ctx_t*)ctx;
     da_accum_t* acc = &c->accums[worker_id];
     uint8_t n_aggs = c->n_aggs;
     uint8_t n_keys = c->n_keys;
     const int64_t* match_idx = c->match_idx;
+
+    if (c->sl_agg >= 0) { da_accum_strlen_fn(c, acc, start, end); return; }
 
     /* Fast path: single key — avoid composite GID loop overhead.
      * Templated by key element size: the entire loop is stamped out per width
@@ -13680,6 +13801,17 @@ da_path:;
                 }
             }
             da_ctx.agg_str = da_agg_str;
+            da_ctx.sl_agg = -1;
+            if (all_sum && n_keys == 1 && !match_idx && !rowsel) {
+                int32_t one = -1;
+                bool sl_ok = true;
+                for (uint32_t a = 0; a < n_aggs && sl_ok; a++) {
+                    if (agg_prod[a].enabled) sl_ok = false;
+                    else if (agg_strlen[a] && agg_vecs[a]) { if (one >= 0) sl_ok = false; else one = (int32_t)a; }
+                    else if (ext->agg_ops[a] != OP_COUNT) sl_ok = false;
+                }
+                if (sl_ok && one >= 0) da_ctx.sl_agg = one;
+            }
             ray_t* agg_raw_hdr = NULL;
             if (n_aggs > 0) {
                 char* rm = (char*)scratch_calloc(&agg_raw_hdr,

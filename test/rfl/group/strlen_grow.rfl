@@ -201,3 +201,25 @@
 (distinct (at Rm 'a)) -- [4.0]
 (at (select {from: (select {c: (count s) a: (avg (strlen s)) f: (first g) from: Tl by: g}) where: (> c 1)}) 'a) -- [4.0 4.0]
 (at (select {from: (select {c: (count s) a: (avg (strlen s)) f: (first g) from: Yl by: g}) where: (> c 1)}) 'a) -- [4.0 4.0]
+;; one strlen agg beside COUNTs (the specialised direct-array loop): key
+;; widths and signedness, SYM key, a WHERE selection, >=4096 slots
+(set Kw (table [g s] (list [0 0 0 0 1 1 1 1 2 2] (at Tn 's))))
+(at (select {from: (select {c: (count s) a: (avg (strlen s)) from: (table [g s] (list (as 'I32 (at Kw 'g)) (at Kw 's))) by: g}) where: (> c 1)}) 'a) -- [3.0 4.0 0Nf]
+(at (select {from: (select {c: (count s) a: (avg (strlen s)) from: (table [g s] (list (as 'I16 (at Kw 'g)) (at Kw 's))) by: g}) where: (> c 1)}) 'a) -- [3.0 4.0 0Nf]
+(at (select {from: (select {c: (count s) a: (avg (strlen s)) from: (table [g s] (list (as 'U8 (at Kw 'g)) (at Kw 's))) by: g}) where: (> c 1)}) 'a) -- [3.0 4.0 0Nf]
+(at (select {from: (select {c: (count s) a: (avg (strlen s)) from: (table [g s] (list (- (at Kw 'g) 5) (at Yn 's))) by: g}) where: (> c 1)}) 'a) -- [3.0 4.0 0Nf]
+(at (select {from: (select {c: (count s) a: (avg (strlen s)) from: (table [g s] (list (as 'SYM (at Kw 'g)) (at Kw 's))) by: g}) where: (> c 1)}) 'a) -- [3.0 4.0 0Nf]
+(at (select {from: (select {c: (count s) a: (avg (strlen s)) from: Tn by: g where: (!= g 1)}) where: (> c 1)}) 'a) -- [3.0 0Nf]
+(at (select {from: (select {c: (count s) b: (sum (strlen s)) from: Yn by: g where: (!= g 0)}) where: (> c 1)}) 'b) -- [12 0]
+(set Tw (table [g s] (list (% (til NL) 5000) (take (list "abcd" "abcd" "") NL))))
+(distinct (at (select {from: (select {c: (count s) a: (avg (strlen s)) from: Tw by: g}) where: (> c 1)}) 'a)) -- [4.0]
+(set Yw (table [g s] (list (at Tw 'g) (as 'SYM (at Tw 's)))))
+(distinct (at (select {from: (select {c: (count s) a: (avg (strlen s)) from: Yw by: g}) where: (> c 1)}) 'a)) -- [4.0]
+(at (select {from: (select {c: (count s) a: (avg (strlen s)) from: (table [g s] (list (as 'I16 (- (at Kw 'g) 5)) (at Kw 's))) by: g}) where: (> c 1)}) 'a) -- [3.0 4.0 0Nf]
+(at (select {from: (select {c: (count s) a: (avg (strlen s)) from: (table [g s] (list (as 'I32 (- (at Kw 'g) 5)) (at Kw 's))) by: g}) where: (> c 1)}) 'a) -- [3.0 4.0 0Nf]
+;; a null SYM key groups with itself
+(set Kz (table [g s] (list (as 'SYM (list "" "" "" "" "b" "b" "b" "b" "c" "c")) (at Tn 's))))
+(at (select {from: (select {c: (count s) a: (avg (strlen s)) from: Kz by: g}) where: (> c 1)}) 'a) -- [3.0 4.0 0Nf]
+;; exact sums across the 512-row length blocks of the specialised loop
+(at (select {from: (select {c: (count s) b: (sum (strlen s)) from: Tl by: g}) where: (> c 1)}) 'b) -- [133332 133336]
+(at (select {from: (select {c: (count s) b: (sum (strlen s)) from: Yl by: g}) where: (> c 1)}) 'b) -- [133332 133336]
