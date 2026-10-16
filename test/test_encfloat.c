@@ -30,6 +30,8 @@
 #include "store/encfmt.h"
 #include "store/col.h"
 #include "store/encw.h"
+#include "store/enccol.h"
+#include "store/colrange.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -452,6 +454,7 @@ static test_result_t test_alprd_exceptions(void) {
     uint8_t c2[4] = { 0, 1, 1, 0 };                                        /* exception row with code 1 */
     n = alprd_body(b, c2, pos, lefts);
     TEST_ASSERT_EQ_I(ray_enc_alprd_read(b, n, 4, 64, out), -1);
+    TEST_ASSERT_STR_EQ(ray_enc_read_why(), "ALP_RD exception row with a non-zero left code");   /* D8 */
     uint16_t big[2] = { 0x1000, 0x401 };                                   /* raw left at 2^(T-right_bits) */
     n = alprd_body(b, codes, pos, big);
     TEST_ASSERT_EQ_I(ray_enc_alprd_read(b, n, 4, 64, out), -1);
@@ -607,6 +610,28 @@ static int desc_enc(const char* path, int64_t vec) {
     return r;
 }
 
+/* n bytes of path at off. */
+static bool fl_read(const char* path, long off, void* b, size_t n) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return false;
+    bool ok = fseek(f, off, SEEK_SET) == 0 && fread(b, 1, n, f) == n;
+    fclose(f);
+    return ok;
+}
+
+/* The (e, f) of the ALP body of vector j of chunk c (no null bitmap) as
+ * e * 256 + f, -1 on a short file. */
+static int fl_alp_ef(const char* path, int64_t c, int j) {
+    uint64_t off, poff;
+    if (!fl_read(path, 96 + (long)c * 64, &off, 8) || !fl_read(path, (long)(off + (uint64_t)j * 48 + 8), &poff, 8)) return -1;
+    uint8_t ef[2];
+    return fl_read(path, (long)(off + poff), ef, 2) ? ef[0] * 256 + ef[1] : -1;
+}
+static bool fl_cands_have(const ray_enc_alp_cands_t* c, int ef) {
+    for (int i = 0; i < c->n; i++) if (c->c[i].e * 256 + c->c[i].f == ef) return true;
+    return false;
+}
+
 /* Saves gen 2 (optionally forced), loads, compares the payload bit for bit. */
 static int fl_roundtrip(ray_t* v, int force, const char* path) {
     ray_encw_test_force(force);
@@ -698,9 +723,11 @@ static test_result_t test_nan_payloads(void) {
     PASS();
 }
 
-/* All-null float vectors at lengths 1, 1023, 1024 stay CONST under any force. */
+/* All-null float vectors at lengths 1, 1023, 1024 stay CONST under any
+ * force (the six float encodings) and under selection. */
 static test_result_t test_all_null_floats(void) {
     static const int lens[] = { 1, 1023, 1024 };
+    static const int forces[] = { -1, RAY_ENC_RAW, RAY_ENC_CONST, RAY_ENC_RLE, RAY_ENC_DICT, RAY_ENC_ALP, RAY_ENC_ALP_RD };
     const char* p = ray_test_tmp(FL_TMP "/an");
     for (int t = 0; t < 2; t++)                          /* F64 and F32: every nullable float type */
         for (int l = 0; l < 3; l++) {
@@ -710,8 +737,11 @@ static test_result_t test_all_null_floats(void) {
                 if (t) ((float*)ray_data(fl_vec))[i] = NULL_F32; else ((double*)ray_data(fl_vec))[i] = NULL_F64;
             }
             fl_vec->attrs |= RAY_ATTR_HAS_NULLS;
-            TEST_ASSERT_EQ_I(fl_roundtrip(fl_vec, RAY_ENC_ALP, p), 0);
-            TEST_ASSERT_EQ_I(desc_enc(p, 0), RAY_ENC_CONST);
+            for (size_t k = 0; k < sizeof forces / sizeof forces[0]; k++) {
+                TEST_ASSERT_FMT(fl_roundtrip(fl_vec, forces[k], p) == 0, "type %d len %d force %d", ty, lens[l], forces[k]);
+                TEST_ASSERT_FMT(desc_enc(p, 0) == RAY_ENC_CONST, "type %d len %d force %d: encoding %d",
+                                ty, lens[l], forces[k], desc_enc(p, 0));
+            }
             fl_drop();
         }
     PASS();
@@ -729,6 +759,229 @@ static test_result_t test_first_chunk_training(void) {
     TEST_ASSERT_EQ_I(desc_enc(p, 0), RAY_ENC_DICT);
     TEST_ASSERT_TRUE(desc_enc(p, 64) != RAY_ENC_DICT);
     fl_drop();
+    /* ALP candidates: chunk 0 holds two-decimal values, chunk 1
+     * one-decimal values, whose own training gives another (e, f).  The
+     * candidates trained on chunk 0 still apply to them (wider ints), so
+     * chunk 1's ALP vector carries one of those; alone (forced ALP: its
+     * own chunk 0 trains), the same values take a pair outside them. */
+    n = 65536 + 1024;
+    fl_vec = ray_vec_new(RAY_F64, n); fl_vec->len = n;
+    for (int64_t i = 0; i < n; i++)
+        ((double*)ray_data(fl_vec))[i] = i < 65536 ? (double)((i * 7919) % 100000) / 100.0
+                                                   : 3000.0 + (double)(((i - 65536) * 7919) % 10000) / 10.0;
+    ray_enc_alp_cands_t c0;
+    ray_enc_alp_train((const uint64_t*)ray_data(fl_vec), 65536, 64, &c0);
+    TEST_ASSERT_TRUE(c0.n > 0);
+    TEST_ASSERT_EQ_I(fl_roundtrip(fl_vec, -1, p), 0);
+    TEST_ASSERT_EQ_I(desc_enc(p, 64), RAY_ENC_ALP);
+    int ef1 = fl_alp_ef(p, 1, 0);
+    TEST_ASSERT_FMT(fl_cands_have(&c0, ef1), "chunk 1 (e, f) = (%d, %d) is not a chunk-0 candidate", ef1 >> 8, ef1 & 255);
+    fl_drop();
+    fl_vec = ray_vec_new(RAY_F64, 1024); fl_vec->len = 1024;
+    for (int64_t i = 0; i < 1024; i++) ((double*)ray_data(fl_vec))[i] = 3000.0 + (double)((i * 7919) % 10000) / 10.0;
+    TEST_ASSERT_EQ_I(fl_roundtrip(fl_vec, RAY_ENC_ALP, p), 0);        /* alone, DICT would win */
+    TEST_ASSERT_EQ_I(desc_enc(p, 0), RAY_ENC_ALP);
+    int efa = fl_alp_ef(p, 0, 0);
+    TEST_ASSERT_FMT(!fl_cands_have(&c0, efa), "alone (e, f) = (%d, %d) is also a chunk-0 candidate", efa >> 8, efa & 255);
+    fl_drop();
+    /* An F32 VALUE_DICT has 4-byte elements, in dictionary order:
+     * -3.5, -0.0, +0.0, 2.25 (the zeros as bit patterns, D10). */
+    static const uint32_t fv[4] = { 0xC0600000u, 0x80000000u, 0x00000000u, 0x40100000u };
+    fl_vec = ray_vec_new(RAY_F32, 1024); fl_vec->len = 1024;
+    for (int i = 0; i < 1024; i++) memcpy((float*)ray_data(fl_vec) + i, &fv[(i * 7) % 4], 4);
+    TEST_ASSERT_EQ_I(fl_roundtrip(fl_vec, RAY_ENC_DICT, p), 0);
+    TEST_ASSERT_EQ_I(desc_enc(p, 0), RAY_ENC_DICT);
+    ray_enc_hdr_t eh;
+    TEST_ASSERT_TRUE(fl_read(p, 32, &eh, sizeof eh));
+    uint8_t side[8 + 24 + 8 + 16];
+    TEST_ASSERT_EQ_U(eh.side_len, sizeof side);                        /* one entry, 24 bytes at 32 */
+    TEST_ASSERT_TRUE(fl_read(p, (long)eh.side_off, side, sizeof side));
+    static const uint8_t want[sizeof side] = {
+        1, 0, 0, 0,  0, 0, 0, 0,                                       /* one entry */
+        1, 0, 0, 0, 0, 0, 0, 0,  32, 0, 0, 0, 0, 0, 0, 0,  24, 0, 0, 0, 0, 0, 0, 0,   /* VALUE_DICT, @32, 24 B */
+        4, 0, 0, 0,  0, 0, 0, 0,                                       /* n = 4 */
+        0x00, 0x00, 0x60, 0xC0,  0x00, 0x00, 0x00, 0x80,  0x00, 0x00, 0x00, 0x00,  0x00, 0x00, 0x10, 0x40,
+    };
+    for (size_t i = 0; i < sizeof side; i++)
+        TEST_ASSERT_FMT(side[i] == want[i], "side byte %zu: 0x%02x, want 0x%02x", i, side[i], want[i]);
+    fl_drop();
+    PASS();
+}
+
+/* ---- the reader (Task 5) ---- */
+static void fl_patch(const char* path, long off, const void* b, size_t n) {
+    FILE* f = fopen(path, "r+b");
+    if (!f) ray_test_fatal("cannot open %s", path);
+    if (fseek(f, off, SEEK_SET) != 0 || fwrite(b, 1, n, f) != n) { fclose(f); ray_test_fatal("cannot patch %s", path); }
+    fclose(f);
+}
+
+/* The error code materialization gives ("" on success), its message in
+ * fl_msg. */
+static char fl_msg[512];
+static const char* fl_mat_code(const char* path) {
+    static char code[16];
+    fl_msg[0] = 0;
+    ray_error_clear();
+    ray_t* c = ray_col_mmap(path);
+    if (!c || RAY_IS_ERR(c)) {
+        snprintf(code, sizeof code, "%s", c ? ray_err_code(c) : "null");
+        snprintf(fl_msg, sizeof fl_msg, "%s", ray_error_msg() ? ray_error_msg() : "");
+        if (c) ray_error_free(c);
+        return code;
+    }
+    ray_t* m = ray_enccol_materialize(c);                  /* borrowed on success */
+    snprintf(code, sizeof code, "%s", RAY_IS_ERR(m) ? ray_err_code(m) : "");
+    if (RAY_IS_ERR(m)) { snprintf(fl_msg, sizeof fl_msg, "%s", ray_error_msg() ? ray_error_msg() : ""); ray_error_free(m); }
+    ray_release(c);
+    return code;
+}
+
+/* Range reads of the whole column at path equal v bit for bit: 0, else a
+ * negative step. */
+static int fl_range_equal(const char* path, ray_t* v) {
+    ray_t* c = ray_col_mmap(path);
+    if (!c || RAY_IS_ERR(c)) { if (c) ray_error_free(c); return -1; }
+    ray_col_src_t s;
+    ray_t* err = ray_col_src_bind(c, &s);
+    if (err) { ray_error_free(err); ray_release(c); return -2; }
+    ray_col_scratch_t sc; ray_col_scratch_init(&sc);
+    const size_t esz = v->type == RAY_F32 ? 4 : 8;
+    int rc = 0;
+    int64_t at = 0;
+    while (at < v->len && rc == 0) {
+        ray_col_range_t r;
+        err = ray_col_range(&s, at, v->len - at, &sc, &r);
+        if (err) { ray_error_free(err); rc = -3; break; }
+        if (r.n <= 0) { rc = -4; break; }
+        if (memcmp(r.data, (const uint8_t*)ray_data(v) + (size_t)at * esz, (size_t)r.n * esz) != 0) rc = -5;
+        at += r.n;
+    }
+    ray_col_scratch_free(&sc); ray_col_src_release(&s); ray_release(c);
+    return rc;
+}
+
+/* Every encoding round-trips through load (materialization) and range reads. */
+static test_result_t test_decode_paths(void) {
+    static double d[3 * 1024];
+    for (int i = 0; i < 3 * 1024; i++) d[i] = (double)((i * 7919) % 100000) / 100.0;
+    fl_vec = f64_col(d, 3 * 1024);
+    const char* p = ray_test_tmp(FL_TMP "/dp");
+    static const int forces[] = { RAY_ENC_RAW, RAY_ENC_RLE, RAY_ENC_DICT, RAY_ENC_ALP, RAY_ENC_ALP_RD };
+    for (size_t k = 0; k < sizeof forces / sizeof forces[0]; k++) {
+        if (forces[k] == RAY_ENC_DICT) continue;           /* 3072 distinct values: covered in nan_payloads */
+        TEST_ASSERT_FMT(fl_roundtrip(fl_vec, forces[k], p) == 0, "force %d", forces[k]);
+        for (int64_t j = 0; j < 3; j++) TEST_ASSERT_FMT(desc_enc(p, j) == forces[k], "force %d vector %lld", forces[k], (long long)j);
+        TEST_ASSERT_FMT(fl_range_equal(p, fl_vec) == 0, "force %d range read %d", forces[k], fl_range_equal(p, fl_vec));
+    }
+    fl_drop();
+    PASS();
+}
+
+/* VALUE_DICT invariants for floats: no NaN, strictly ascending in
+ * dictionary order (the two zeros are -0.0 then +0.0). */
+static test_result_t test_float_dict_rejects(void) {
+    static double d[1024];
+    static const uint64_t dv[4] = { 0xC00C000000000000ull, NEG0_64, 0, 0x4002000000000000ull };   /* -3.5, -0.0, +0.0, 2.25 */
+    for (int i = 0; i < 1024; i++) memcpy(&d[i], &dv[(i * 7) % 4], 8);
+    fl_vec = f64_col(d, 1024);
+    const char* p = ray_test_tmp(FL_TMP "/vd");
+    TEST_ASSERT_EQ_I(fl_roundtrip(fl_vec, RAY_ENC_DICT, p), 0);
+    TEST_ASSERT_EQ_I(desc_enc(p, 0), RAY_ENC_DICT);
+    TEST_ASSERT_EQ_I(fl_range_equal(p, fl_vec), 0);
+    ray_enc_hdr_t eh;
+    TEST_ASSERT_TRUE(fl_read(p, 32, &eh, sizeof eh));
+    long vals = (long)eh.side_off + 32 + 8;                            /* the entry's first value */
+    uint64_t x;
+    for (int i = 0; i < 4; i++) { TEST_ASSERT_TRUE(fl_read(p, vals + 8 * i, &x, 8)); TEST_ASSERT_EQ_U(x, dv[i]); }
+    TEST_ASSERT_STR_EQ(fl_mat_code(p), "");
+    uint64_t pz = 0, nz = NEG0_64, nan = 0x7FF8000000000000ull;
+    fl_patch(p, vals + 8, &pz, 8); fl_patch(p, vals + 16, &nz, 8);   /* +0 before -0 */
+    TEST_ASSERT_STR_EQ(fl_mat_code(p), "corrupt");
+    TEST_ASSERT_FMT(strstr(fl_msg, "VALUE_DICT values not ascending") != NULL, "%s", fl_msg);
+    fl_patch(p, vals + 8, &nz, 8); fl_patch(p, vals + 16, &pz, 8);
+    TEST_ASSERT_STR_EQ(fl_mat_code(p), "");
+    fl_patch(p, vals + 24, &nan, 8);
+    TEST_ASSERT_STR_EQ(fl_mat_code(p), "corrupt");
+    TEST_ASSERT_FMT(strstr(fl_msg, "VALUE_DICT value is a NaN") != NULL, "%s", fl_msg);
+    fl_drop();
+    PASS();
+}
+
+/* ALP / ALP_RD framing in a file, and the trailer after a codec body, are
+ * corrupt at materialization (spec "Reject rules"). */
+static test_result_t test_float_file_rejects(void) {
+    static double d[1024];
+    for (int i = 0; i < 1024; i++) { d[i] = (double)(i % 100) / 4.0; if (i % 17 == 0) memcpy(&d[i], &(uint64_t){ NEG0_64 }, 8); }
+    fl_vec = f64_col(d, 1024);
+    const char* ar = ray_test_tmp(FL_TMP "/ar");
+    TEST_ASSERT_EQ_I(fl_roundtrip(fl_vec, RAY_ENC_ALP, ar), 0);
+    TEST_ASSERT_EQ_I(desc_enc(ar, 0), RAY_ENC_ALP);
+    const long payload = 96 + 64 + RAY_ENC_DESC_AREA;                  /* chunk 0, vector 0, no bitmap */
+    uint8_t e19 = 19;
+    fl_patch(ar, payload, &e19, 1);
+    TEST_ASSERT_STR_EQ(fl_mat_code(ar), "corrupt");
+    TEST_ASSERT_FMT(strstr(fl_msg, "chunk 0 vector 0 codec body: ALP exponent above 18") != NULL, "%s", fl_msg);
+    const char* rd = ray_test_tmp(FL_TMP "/rd");
+    TEST_ASSERT_EQ_I(fl_roundtrip(fl_vec, RAY_ENC_ALP_RD, rd), 0);
+    TEST_ASSERT_EQ_I(desc_enc(rd, 0), RAY_ENC_ALP_RD);
+    uint8_t rb = 40;                                                   /* below T-16 */
+    fl_patch(rd, payload, &rb, 1);
+    TEST_ASSERT_STR_EQ(fl_mat_code(rd), "corrupt");
+    TEST_ASSERT_FMT(strstr(fl_msg, "codec body: ALP_RD right width outside T-16..T-1") != NULL, "%s", fl_msg);
+    fl_drop();
+    /* a trailer after an ALP body: one non-canonical NaN, so the payload
+     * ends with [u16 1, 6 reserved][position, padded to 8][the raw NaN] */
+    d[5] = 0; memcpy(&d[5], &(uint64_t){ 0x7FF8000000000077ull }, 8);
+    fl_vec = f64_col(d, 1024);
+    fl_vec->attrs |= RAY_ATTR_HAS_NULLS;
+    const char* tr = ray_test_tmp(FL_TMP "/tr");
+    TEST_ASSERT_EQ_I(fl_roundtrip(fl_vec, RAY_ENC_ALP, tr), 0);
+    TEST_ASSERT_EQ_I(desc_enc(tr, 0), RAY_ENC_ALP);
+    TEST_ASSERT_EQ_I(fl_range_equal(tr, fl_vec), 0);
+    uint64_t pbytes;
+    TEST_ASSERT_TRUE(fl_read(tr, 96 + 64 + 16, &pbytes, 8));         /* descriptor 0's payload_bytes */
+    uint64_t raw;
+    TEST_ASSERT_TRUE(fl_read(tr, payload + (long)pbytes - 8, &raw, 8));
+    TEST_ASSERT_EQ_U(raw, 0x7FF8000000000077ull);
+    uint64_t one = db(1.0);
+    fl_patch(tr, payload + (long)pbytes - 8, &one, 8);
+    TEST_ASSERT_STR_EQ(fl_mat_code(tr), "corrupt");
+    TEST_ASSERT_FMT(strstr(fl_msg, "trailer value is not a NaN") != NULL, "%s", fl_msg);
+    fl_drop();
+    PASS();
+}
+
+/* The trailer's bytes count on both sides of the 1/8 gain rule at the
+ * writer.  1 + 52 random mantissa bits: ALP_RD of 8 + 8 + 16 + 6656 =
+ * 6688 B against RAW 8192, so a trailer of more than 7 * 8192 - 8 * 6688 =
+ * 3840 B flips the choice to RAW.  384 NaN rows (filled alike, so the
+ * same body): canonical, no trailer, ALP_RD; 383 with payloads, a trailer
+ * of 8 + 768 + 3064 = 3840 B, still ALP_RD; 384 with payloads, 3848 B,
+ * RAW.  Left out of the choice, the trailer would give ALP_RD all three. */
+static test_result_t test_trailer_counts_in_choice(void) {
+    static double d[RAY_ENC_VEC];
+    static const int odd[3] = { 0, 383, 384 };
+    for (int k = 0; k < 3; k++) {
+        uint64_t s = 11;
+        int nan_rows = 0;
+        for (int i = 0; i < RAY_ENC_VEC; i++) {
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            d[i] = 1.0 + (double)(s >> 12) / 4503599627370496.0;
+            if (i % 8 < 3) {
+                if (nan_rows++ < odd[k]) memcpy(&d[i], &(uint64_t){ 0x7FF8000000000100ull + (uint64_t)i }, 8);
+                else d[i] = NULL_F64;
+            }
+        }
+        ray_encw_vec_t v; ray_encw_vec_init(&v);
+        ray_err_t e = ray_encw_vec(RAY_F64, RAY_ATTR_HAS_NULLS, d, NULL, 0, RAY_ENC_VEC, NULL, &v);
+        int enc = v.desc.encoding, flags = v.desc.flags, nn = v.desc.n_nulls;
+        ray_encw_vec_free(&v);
+        TEST_ASSERT_EQ_I(e, RAY_OK);
+        TEST_ASSERT_EQ_I(nn, 384);
+        TEST_ASSERT_FMT(enc == (k == 2 ? RAY_ENC_RAW : RAY_ENC_ALP_RD), "%d payload NaNs: encoding %d", odd[k], enc);
+        TEST_ASSERT_EQ_I(!!(flags & RAY_ENC_DESC_TRAILER), k > 0);
+    }
     PASS();
 }
 
@@ -750,5 +1003,9 @@ const test_entry_t encfloat_entries[] = {
     { "encfloat/nan_payloads",         test_nan_payloads,         fl_setup, fl_teardown },
     { "encfloat/all_null_floats",      test_all_null_floats,      fl_setup, fl_teardown },
     { "encfloat/first_chunk_training", test_first_chunk_training, fl_setup, fl_teardown },
+    { "encfloat/decode_paths",         test_decode_paths,         fl_setup, fl_teardown },
+    { "encfloat/float_dict_rejects",   test_float_dict_rejects,   fl_setup, fl_teardown },
+    { "encfloat/float_file_rejects",   test_float_file_rejects,   fl_setup, fl_teardown },
+    { "encfloat/trailer_counts_in_choice", test_trailer_counts_in_choice, fl_setup, fl_teardown },
     { NULL, NULL, NULL, NULL },
 };

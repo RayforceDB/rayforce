@@ -285,6 +285,41 @@ static test_result_t test_vec_forced(void) {
     PASS();
 }
 
+/* The forced hook on floats: RAW, CONST and the float encodings where
+ * they apply; FOR_BP and DELTA_BP are illegal at the float top level, and
+ * CONST on unequal values or DICT without a dictionary do not apply: all
+ * RAY_ERR_NYI. */
+static test_result_t test_vec_forced_float(void) {
+    double d[RAY_ENC_VEC];
+    float f[RAY_ENC_VEC];
+    for (int i = 0; i < RAY_ENC_VEC; i++) { d[i] = 1.5 + (double)(i % 64); f[i] = 1.5f + (float)(i % 64); }
+    static const int8_t types[2] = { RAY_F64, RAY_F32 };
+    for (int t = 0; t < 2; t++) {
+        const void* data = t ? (const void*)f : (const void*)d;
+        ray_encw_vec_t v; ray_encw_vec_init(&v);
+        ray_encw_test_force(RAY_ENC_RAW);
+        ray_err_t e = ray_encw_vec(types[t], 0, data, NULL, 0, RAY_ENC_VEC, NULL, &v);
+        int enc = v.desc.encoding;
+        static const int refused[] = { RAY_ENC_FOR_BP, RAY_ENC_DELTA_BP, RAY_ENC_CONST, RAY_ENC_DICT };
+        ray_err_t r[4];
+        for (int k = 0; k < 4; k++) {
+            ray_encw_test_force(refused[k]);
+            r[k] = ray_encw_vec(types[t], 0, data, NULL, 0, RAY_ENC_VEC, NULL, &v);   /* no dictionary */
+        }
+        ray_encw_test_force(RAY_ENC_ALP_RD);
+        ray_err_t erd = ray_encw_vec(types[t], 0, data, NULL, 0, RAY_ENC_VEC, NULL, &v);
+        int encrd = v.desc.encoding;
+        ray_encw_test_force(-1);
+        ray_encw_vec_free(&v);
+        TEST_ASSERT_EQ_I(e, RAY_OK);
+        TEST_ASSERT_EQ_I(enc, RAY_ENC_RAW);
+        for (int k = 0; k < 4; k++) TEST_ASSERT_FMT(r[k] == RAY_ERR_NYI, "type %d force %d: %d", types[t], refused[k], r[k]);
+        TEST_ASSERT_EQ_I(erd, RAY_OK);
+        TEST_ASSERT_EQ_I(encrd, RAY_ENC_ALP_RD);
+    }
+    PASS();
+}
+
 static test_result_t test_vec_guid(void) {
     uint8_t g[4][16]; memset(g, 0, sizeof g);
     for (int i = 0; i < 4; i++) for (int j = 0; j < 16; j++) g[i][j] = (uint8_t)(j + 1);
@@ -1304,6 +1339,7 @@ const test_entry_t encfmt_entries[] = {
     { "encfmt/vec_f64_const_and_zeros",     test_vec_f64_const_and_zeros,     encfmt_setup, encfmt_teardown },
     { "encfmt/vec_f64_const_trailer",       test_vec_f64_const_with_trailer,  encfmt_setup, encfmt_teardown },
     { "encfmt/vec_forced",                  test_vec_forced,                  encfmt_setup, encfmt_teardown },
+    { "encfmt/vec_forced_float",            test_vec_forced_float,            encfmt_setup, encfmt_teardown },
     { "encfmt/vec_guid",                    test_vec_guid,                    encfmt_setup, encfmt_teardown },
     { "encfmt/vec_str_raw_and_const",       test_vec_str_raw_and_const,       encfmt_setup, encfmt_teardown },
     { "encfmt/vec_sym_w8_inband",           test_vec_sym_w8_inband,           encfmt_setup, encfmt_teardown },

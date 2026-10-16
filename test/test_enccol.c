@@ -2184,17 +2184,33 @@ static void grow_payload(const char* path) {
 }
 
 static test_result_t test_decode_trailing_bytes(void) {
-    static const struct { int8_t type; int s; } cases[] = {
-        { RAY_I32, 1 }, { RAY_I64, 3 }, { RAY_I16, 4 }, { RAY_U8, 0 }, { RAY_BOOL, 2 },
-        { RAY_F64, 0 }, { RAY_F32, 4 }, { RAY_GUID, 0 }, { RAY_STR, 0 }, { RAY_STR, 3 }, { RAY_SYM, 1 },
+    /* force -1: selection.  P5: a float column selects DICT, whose
+     * VALUE_DICT follows the payload; the float cases are forced to the
+     * float bodies without side data, so the payload stays the tail. */
+    static const struct { int8_t type; int s; int force; } cases[] = {
+        { RAY_I32, 1, -1 }, { RAY_I64, 3, -1 }, { RAY_I16, 4, -1 }, { RAY_U8, 0, -1 }, { RAY_BOOL, 2, -1 },
+        { RAY_F64, 0, RAY_ENC_RAW }, { RAY_F32, 4, RAY_ENC_RAW }, { RAY_F64, 0, RAY_ENC_RLE },
+        { RAY_F64, 0, RAY_ENC_ALP }, { RAY_F32, 4, RAY_ENC_ALP }, { RAY_F64, 4, RAY_ENC_ALP_RD },
+        { RAY_GUID, 0, -1 }, { RAY_STR, 0, -1 }, { RAY_STR, 3, -1 }, { RAY_SYM, 1, -1 },
     };
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
         ray_t* v = make_col(cases[i].type, 1000, cases[i].s);
-        TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(ENCCOL_TMP "/tb"), 2), RAY_OK);
+        ray_encw_test_force(cases[i].force);
+        ray_err_t se = ray_col_save_gen(v, ray_test_tmp(ENCCOL_TMP "/tb"), 2);
+        ray_encw_test_force(-1);
         ray_release(v);
+        TEST_ASSERT_EQ_I(se, RAY_OK);
         ray_t* c = ray_col_mmap(ray_test_tmp(ENCCOL_TMP "/tb"));
         TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
         TEST_ASSERT_EQ_U(ray_enccol_of(c)->hdr.side_off, 0);     /* the payload is the file's tail */
+        if (cases[i].force >= 0) {
+            const ray_enc_desc_t* d;
+            ray_t* de = ray_enccol_chunk_descs_ref(ray_enccol_of(c), 0, &d);
+            int enc = de ? -1 : d[0].encoding;
+            if (de) ray_error_free(de);
+            TEST_ASSERT_FMT(enc == cases[i].force, "type %d shape %d: encoding %d, forced %d",
+                            (int)cases[i].type, cases[i].s, enc, cases[i].force);
+        }
         ray_release(c);
         grow_payload(ray_test_tmp(ENCCOL_TMP "/tb"));
         c = ray_col_mmap(ray_test_tmp(ENCCOL_TMP "/tb"));

@@ -145,6 +145,9 @@ int64_t ray_enc_read(const uint8_t* p, size_t avail, uint8_t enc, uint8_t width,
                      const ray_enc_dict_t* dict, uint64_t* out);
 /* Why the last ray_enc_read on this thread failed (diagnostics only). */
 const char* ray_enc_read_why(void);
+/* Sets the reason ray_enc_read_why reports and returns -1: for readers
+ * outside enc_codec.c (ALP, ALP_RD). */
+int64_t ray_enc_read_fail(const char* why);
 /* Distinct sorted values of v in the logical order of k (ray_enc_lt; on a
  * float kind v must hold no NaN, see ray_enc_lt).  Returns 1 =
  * trained (*out holds *out_n values; free with ray_free_raw), 0 = no

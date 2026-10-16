@@ -326,6 +326,7 @@ int64_t ray_enc_body_size(uint8_t enc, const uint64_t* v, int n, ray_enc_kind_t 
  * file's error names the rule that fired.  Not format. */
 static _Thread_local const char* rd_why;
 const char* ray_enc_read_why(void) { return rd_why ? rd_why : "unknown"; }
+int64_t ray_enc_read_fail(const char* why) { rd_why = why; return -1; }
 #define RD_FAIL(why) ((void)(rd_why = (why)), -1)
 
 static bool get_raw(const uint8_t* p, size_t avail, int n, int T, uint64_t* out, int64_t* used) {

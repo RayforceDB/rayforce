@@ -162,10 +162,6 @@ static ray_t* enc_validate_side_table(ray_enccol_t* e) {
         if (len > sl || off > sl - len) ENC_CORRUPT("column %s: side entry %u overruns the side data", e->path, i);
         if (!all_zero(s + at, (size_t)(off - at))) ENC_CORRUPT("column %s: side padding", e->path);
         if (kind == RAY_ENC_SIDE_VALUE_DICT) {
-            /* float dictionaries are legal from P5 (spec "Type coverage"):
-             * a newer build's file, not damage */
-            if (e->type == RAY_F32 || e->type == RAY_F64)
-                return ray_error("nyi", "column %s: float dictionary needs a newer build", e->path);
             if (!ray_encw_type_has_dict(e->type)) ENC_CORRUPT("column %s: VALUE_DICT on type %s", e->path, ray_type_name(e->type));
             e->vdict_off = e->hdr.side_off + off; e->vdict_len = len;
         } else if (e->type != RAY_STR) {
@@ -396,7 +392,7 @@ static void dirent_at(const ray_enccol_t* e, int64_t c, ray_enc_dirent_t* de) {
 static int lane_width(const ray_enccol_t* e) { return 8 * (int)ray_enccol_esz(e); }
 
 /* 1 legal and implemented, 2 legal by the spec but not in this build
- * (ALP, ALP_RD, float RLE/DICT: P5; STR_DICT, FSST: P6), 0 illegal. */
+ * (STR_DICT, FSST: P6), 0 illegal. */
 static int top_encoding_class(int8_t t, uint8_t enc) {
     switch (t) {
     case RAY_BOOL: case RAY_U8:
@@ -406,8 +402,8 @@ static int top_encoding_class(int8_t t, uint8_t enc) {
     case RAY_SYM:
         return (enc == RAY_ENC_RAW || enc == RAY_ENC_CONST || enc == RAY_ENC_FOR_BP || enc == RAY_ENC_RLE) ? 1 : 0;
     case RAY_F32: case RAY_F64:
-        if (enc == RAY_ENC_RAW || enc == RAY_ENC_CONST) return 1;
-        return (enc == RAY_ENC_RLE || enc == RAY_ENC_DICT || enc == RAY_ENC_ALP || enc == RAY_ENC_ALP_RD) ? 2 : 0;
+        return (enc == RAY_ENC_RAW || enc == RAY_ENC_CONST || enc == RAY_ENC_RLE || enc == RAY_ENC_DICT ||
+                enc == RAY_ENC_ALP || enc == RAY_ENC_ALP_RD) ? 1 : 0;
     case RAY_STR:
         if (enc == RAY_ENC_RAW || enc == RAY_ENC_CONST) return 1;
         return (enc == RAY_ENC_STR_DICT || enc == RAY_ENC_FSST) ? 2 : 0;
@@ -579,7 +575,7 @@ static ray_t* enc_dict_validate(void* ctx, ray_enc_snap_t* fail) {
     const char* why;
     /* Structure was checked at load (Task 6); the entry's contents are
      * checked here, once, before the first lookup. */
-    if (!ray_enc_kind_of(e->type, e->attrs, &k) || !e->vdict_len) {
+    if (!ray_enc_value_kind(e->type, e->attrs, &k) || !e->vdict_len) {
         ray_enc_snap_set(fail, "corrupt", "column %s: DICT vector without a VALUE_DICT entry", e->path);
         return NULL;
     }
@@ -600,7 +596,13 @@ static ray_t* enc_dict_validate(void* ctx, ray_enc_snap_t* fail) {
         for (uint32_t i = 0; i < n; i++) {
             uint64_t x = 0; memcpy(&x, d + 8 + i * esz, esz);
             out[i] = x;
-            if (i && !ray_enc_lt(out[i - 1], x, k)) { ray_release(vals); why = "VALUE_DICT values not ascending"; goto bad; }  /* strictly ascending */
+            if (k.is_float) {                    /* no NaN: dictionary order is defined on the rest */
+                double fv;
+                if (k.T == 32) { uint32_t u = (uint32_t)x; float f; memcpy(&f, &u, 4); fv = f; } else memcpy(&fv, &x, 8);
+                if (fv != fv) { ray_release(vals); why = "VALUE_DICT value is a NaN"; goto bad; }
+            }
+            /* strictly ascending in dictionary order (floats: -0.0 before +0.0) */
+            if (i && !ray_enc_lt(out[i - 1], x, k)) { ray_release(vals); why = "VALUE_DICT values not ascending"; goto bad; }
         }
         return vals;
     }
@@ -691,35 +693,14 @@ static ray_t* dec_ints(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* 
     return NULL;
 }
 
-static ray_t* dec_floats(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d, int vlen,
-                         const uint8_t* p, uint64_t avail, const uint8_t* bm, void* out) {
+/* The float trailer after a codec body that ends at t, `rest` bytes before
+ * the payload's end (spec "Floats"): validated, and with `out` its raw NaN
+ * bits written at their rows (after the canonical nulls).  With `out ==
+ * NULL` it only validates. */
+static ray_t* enc_float_trailer(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d, int vlen,
+                                const uint8_t* t, uint64_t rest, const uint8_t* bm, void* out) {
     const bool f32 = e->type == RAY_F32;
     const size_t esz = f32 ? 4 : 8;
-    uint64_t body = d->encoding == RAY_ENC_CONST ? 8 : ray_enc_pad8((uint64_t)vlen * esz);
-    if (body > avail) VEC_CORRUPT("float body short");
-    if (d->encoding == RAY_ENC_CONST) {
-        if (!all_zero(p + esz, 8 - esz)) VEC_CORRUPT("float CONST padding");
-        for (int i = 0; i < vlen; i++) memcpy((uint8_t*)out + i * esz, p, esz);
-    } else {
-        if (!all_zero(p + (size_t)vlen * esz, (size_t)(body - (uint64_t)vlen * esz))) VEC_CORRUPT("float body padding");
-        memcpy(out, p, (size_t)vlen * esz);
-    }
-    const bool has_st = !(d->flags & RAY_ENC_STAT_ABSENT);
-    double smin = 0, smax = 0;
-    if (has_st) { memcpy(&smin, &d->min, 8); memcpy(&smax, &d->max, 8); }
-    for (int i = 0; i < vlen; i++) {
-        bool null = bm && ((bm[i >> 3] >> (i & 7)) & 1);
-        uint8_t* q = (uint8_t*)out + i * esz;
-        if (null) {
-            if (f32) { float n = NULL_F32; memcpy(q, &n, 4); } else { double n = NULL_F64; memcpy(q, &n, 8); }
-        } else {
-            double x; if (f32) { float f; memcpy(&f, q, 4); x = f; } else memcpy(&x, q, 8);
-            if (x != x) VEC_CORRUPT("NaN outside the bitmap");
-            if (has_st && (x < smin || x > smax)) VEC_CORRUPT("value outside its statistics");
-        }
-    }
-    uint64_t rest = avail - body;
-    const uint8_t* t = p + body;
     if (d->flags & RAY_ENC_DESC_TRAILER) {
         if (rest < 8) VEC_CORRUPT("trailer missing");
         uint16_t cnt; memcpy(&cnt, t, 2);
@@ -739,12 +720,45 @@ static ray_t* dec_floats(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t
             prev = pos;
             double x; if (f32) { float f; memcpy(&f, raw + i * esz, 4); x = f; } else memcpy(&x, raw + i * esz, 8);
             if (x == x) VEC_CORRUPT("trailer value is not a NaN");
-            memcpy((uint8_t*)out + pos * esz, raw + i * esz, esz);
+            if (out) memcpy((uint8_t*)out + pos * esz, raw + i * esz, esz);
         }
     } else if (rest != 0) {
         VEC_CORRUPT("bytes after the body");
     }
     return NULL;
+}
+
+/* Every float encoding (RAW, CONST, RLE, DICT, ALP, ALP_RD): the codec
+ * body, then the canonical nulls, then the trailer's raw bits (spec
+ * "Floats").  A non-null row is no NaN and lies inside the vector's
+ * statistics (spec erratum). */
+static ray_t* dec_floats(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d, int vlen,
+                         const uint8_t* p, uint64_t avail, const uint8_t* bm, void* out) {
+    const bool f32 = e->type == RAY_F32;
+    const size_t esz = f32 ? 4 : 8;
+    ray_enc_dict_t dict = {0};
+    if (d->encoding == RAY_ENC_DICT) { ray_t* err = enc_dict(e, &dict); if (err) return err; }
+    uint64_t bits[RAY_ENC_VEC];
+    int64_t used = ray_enc_float_read(p, (size_t)avail, d->encoding, vlen, f32 ? 32 : 64,
+                                      d->encoding == RAY_ENC_DICT ? &dict : NULL, bits);
+    /* on -1, bits is partly decoded (ALP) or zero (ALP_RD): never read */
+    if (used < 0) ENC_CORRUPT("column %s: chunk %lld vector %d codec body: %s", e->path, (long long)c, j, ray_enc_read_why());
+    const bool has_st = !(d->flags & RAY_ENC_STAT_ABSENT);
+    double smin = 0, smax = 0;
+    if (has_st) { memcpy(&smin, &d->min, 8); memcpy(&smax, &d->max, 8); }
+    for (int i = 0; i < vlen; i++) {
+        bool null = bm && ((bm[i >> 3] >> (i & 7)) & 1);
+        uint8_t* q = (uint8_t*)out + (size_t)i * esz;
+        if (null) {
+            if (f32) { float nf = NULL_F32; memcpy(q, &nf, 4); } else { double nd = NULL_F64; memcpy(q, &nd, 8); }
+            continue;
+        }
+        memcpy(q, &bits[i], esz);
+        double x; if (f32) { float f; memcpy(&f, q, 4); x = f; } else memcpy(&x, q, 8);
+        if (x != x) VEC_CORRUPT("NaN outside the bitmap");
+        if (has_st && (x < smin || x > smax)) VEC_CORRUPT("value outside its statistics");
+    }
+    return enc_float_trailer(e, c, j, d, vlen, p + used, avail - (uint64_t)used, bm, out);
 }
 
 static ray_t* dec_guid(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d, int vlen,

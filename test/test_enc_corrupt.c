@@ -34,6 +34,8 @@
 #include "store/enccol.h"
 #include "vec/str.h"
 #include "ops/idxop.h"
+#include "store/splay.h"
+#include "lang/format.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -182,6 +184,12 @@ static void save_vec(ray_t* v, const char* p) {
     (void)img_load(p);
 }
 #define SAVE(v, p) do { save_vec((v), (p)); TEST_ASSERT_TRUE(g_img != NULL); } while (0)
+/* Saved with every vector's top-level encoding forced to `enc`. */
+#define SAVE_AS(v, p, enc) do { ray_encw_test_force(enc); save_vec((v), (p)); ray_encw_test_force(-1); \
+    TEST_ASSERT_TRUE(g_img != NULL); } while (0)
+/* A float fixture whose patches assume a RAW body: P5 selection would
+ * encode it otherwise (f64_plain is DICT, f64_stats ALP). */
+#define SAVE_RAW(v, p) SAVE_AS((v), (p), RAY_ENC_RAW)
 
 #define NEED_ENC(c, j, enc) TEST_ASSERT_FMT(g_img[desc_at(c, j)] == (enc), \
     "descriptor %d.%d is encoding %d, the test pins %d", c, j, g_img[desc_at(c, j)], enc)
@@ -262,6 +270,13 @@ static ray_t* f32_plain(void) {
 static ray_t* f32_const(void) {
     ray_t* v = ray_vec_new(RAY_F32, 64); v->len = 64;
     for (int i = 0; i < 64; i++) ((float*)ray_data(v))[i] = 2.5f;
+    return v;
+}
+/* -3.5, -0.0, +0.0, 2.25 at hashed rows (the zeros as bit patterns, D10). */
+static ray_t* f64_zeros_dict(void) {
+    static const uint64_t b[4] = { 0xC00C000000000000ull, 1ull << 63, 0, 0x4002000000000000ull };
+    ray_t* v = ray_vec_new(RAY_F64, 1024); v->len = 1024;
+    for (int i = 0; i < 1024; i++) memcpy((double*)ray_data(v) + i, &b[(uint32_t)((uint32_t)i * 2654435761u) >> 30], 8);
     return v;
 }
 static ray_t* guid_raw(void) {
@@ -443,9 +458,32 @@ static test_result_t test_reject_side_data(void) {
     kind[0] = 1; off[0] = 32; len[0] = 40;
     side_table(sb, 72, 1, kind, off, len);
     SAVE(bool_runs(), p); put_side(sb, 72); BAD(p, 0, "corrupt", "VALUE_DICT on type");
-    /* a VALUE_DICT entry on a float column: legal from P5, so a newer build's file */
-    SAVE(f64_plain(), p); put_side(sb, 72); BAD(p, 0, "nyi", "float dictionary needs a newer build");
-    SAVE(f32_plain(), p); put_side(sb, 72); BAD(p, 0, "nyi", "float dictionary needs a newer build");
+    /* a well-formed VALUE_DICT entry on a float column without DICT
+     * vectors: legal (P5), checked only when a DICT vector uses it, so the
+     * column loads and materializes */
+    for (int t = 0; t < 2; t++) {
+        side_table(sb, 72, 1, kind, off, len);
+        uint32_t ne = t ? 8 : 4; memcpy(sb + 32, &ne, 4);            /* 32 value bytes: 4 F64 or 8 F32 */
+        for (uint32_t i = 0; i < ne; i++) {
+            if (t) { float f = 1.0f + (float)i; memcpy(sb + 40 + 4 * i, &f, 4); }
+            else { double x = 1.0 + (double)i; memcpy(sb + 40 + 8 * i, &x, 8); }
+        }
+        ray_t* want = t ? f32_plain() : f64_plain();
+        ray_retain(want);
+        SAVE_RAW(want, p); NEED_ENC(0, 0, RAY_ENC_RAW);
+        put_side(sb, 72); TEST_ASSERT_TRUE(img_store(p, g_len));
+        ray_t* c = ray_col_mmap(p);
+        bool loaded = c && !RAY_IS_ERR(c);
+        if (c && RAY_IS_ERR(c)) ray_error_free(c);
+        if (!loaded) ray_release(want);
+        TEST_ASSERT_FMT(loaded, "float VALUE_DICT entry, type %d: load failed", want->type);
+        ray_t* m = ray_enccol_materialize(c);                      /* borrowed on success */
+        bool same = m && !RAY_IS_ERR(m) && m->len == want->len &&
+                    memcmp(ray_data(m), ray_data(want), (size_t)want->len * (t ? 4 : 8)) == 0;
+        if (m && RAY_IS_ERR(m)) ray_error_free(m);
+        ray_release(c); ray_release(want);
+        TEST_ASSERT_FMT(same, "float VALUE_DICT entry, type %d: materialization differs", t ? RAY_F32 : RAY_F64);
+    }
     /* side region placement */
     SAVE(bool_runs(), p); put_side(good, 72); W64(EH + 16, rd64(EH + 16) + 8); BAD(p, 0, "corrupt", "side data not at the next 32-aligned offset");
     SAVE(bool_runs(), p); put_side(good, 72); W64(EH + 24, 4);                 BAD(p, 0, "corrupt", "side data length 4");
@@ -476,6 +514,17 @@ static test_result_t test_reject_side_data(void) {
         TEST_ASSERT_EQ_I((int)rd64(EH + 24), 8 + 24 + 8 + 16);
         W8(entry + 8 + 12, 1);
         BAD(p, 1, "corrupt", "VALUE_DICT entry padding");
+    }
+    {   /* float entry contents (a forced-DICT F64 file: -3.5, -0.0, +0.0, 2.25) */
+        for (int k = 0; k < 2; k++) {
+            SAVE_AS(f64_zeros_dict(), p, RAY_ENC_DICT); NEED_ENC(0, 0, RAY_ENC_DICT);
+            size_t entry = (size_t)rd64(EH + 16) + 32;
+            TEST_ASSERT_TRUE(rd64(entry + 16) == 1ull << 63 && rd64(entry + 24) == 0);
+            const char* needle = "";
+            if (k == 0) { W64(entry + 16, 0); W64(entry + 24, 1ull << 63); needle = "VALUE_DICT values not ascending"; }   /* +0 before -0 */
+            if (k == 1) { W64(entry + 32, 0x7FF8000000000000ull); needle = "VALUE_DICT value is a NaN"; }
+            BAD(p, 1, "corrupt", needle);
+        }
     }
     {   /* a DICT vector whose side entry is gone */
         SAVE(i64_dict(), p); NEED_ENC(0, 0, RAY_ENC_DICT);
@@ -509,9 +558,12 @@ static test_result_t test_reject_descriptors(void) {
     SAVE(bool_runs(), p); set_chunk_bytes(0, rd64(DIR(0) + 8) + 8); BAD(p, 1, "corrupt", "bytes after its payloads");
     SAVE(bool_runs(), p); W16(desc_at(0, 0) + 4, 1); W64(desc_at(0, 0) + 40, 1); BAD(p, 1, "corrupt", "absent statistics not zero");
     SAVE(bool_runs(), p); W64(desc_at(0, 0) + 32, 2); W64(desc_at(0, 0) + 40, 1); BAD(p, 1, "corrupt", "min above max");
-    SAVE(f64_stats(), p); W64(desc_at(0, 0) + 32, 0x7FF8000000000000ull); BAD(p, 1, "corrupt", "float bounds");
-    SAVE(f64_stats(), p); { double hi = 5.0, lo = 1.0; wr(desc_at(0, 0) + 32, &hi, 8); wr(desc_at(0, 0) + 40, &lo, 8); } BAD(p, 1, "corrupt", "float bounds");
-    SAVE(f64_plain(), p); W8(desc_at(0, 0), RAY_ENC_ALP);  BAD(p, 1, "nyi", "needs a newer build");  /* legal, not in P1 */
+    SAVE_RAW(f64_stats(), p); NEED_ENC(0, 0, RAY_ENC_RAW);
+    W64(desc_at(0, 0) + 32, 0x7FF8000000000000ull); BAD(p, 1, "corrupt", "float bounds");
+    SAVE_RAW(f64_stats(), p); { double hi = 5.0, lo = 1.0; wr(desc_at(0, 0) + 32, &hi, 8); wr(desc_at(0, 0) + 40, &lo, 8); } BAD(p, 1, "corrupt", "float bounds");
+    /* RAW bytes are no ALP body: 1.0's high word is a non-zero reserved word */
+    SAVE_RAW(f64_plain(), p); NEED_ENC(0, 0, RAY_ENC_RAW);
+    W8(desc_at(0, 0), RAY_ENC_ALP);                        BAD(p, 1, "corrupt", "codec body: ALP reserved word not zero");
     SAVE(guid_raw(), p);  W16(desc_at(0, 0) + 4, 0);       BAD(p, 1, "corrupt", "statistics on GUID");
     SAVE(i32_allnull(), p); NEED_ENC(0, 0, RAY_ENC_CONST);
     W8(desc_at(0, 0), RAY_ENC_RAW);                        BAD(p, 1, "corrupt", "all-null vector not CONST");
@@ -542,20 +594,20 @@ static test_result_t test_reject_payloads(void) {
     SAVE(i32_nulls_raw(), p); at = payload_at(0, 0); W32(at + 128 + 4, (uint32_t)NULL_I32);
     BAD(p, 1, "corrupt", "sentinel outside the bitmap");
     /* floats */
-    SAVE(f64_plain(), p); NEED_ENC(0, 0, RAY_ENC_RAW); at = payload_at(0, 0);
+    SAVE_RAW(f64_plain(), p); NEED_ENC(0, 0, RAY_ENC_RAW); at = payload_at(0, 0);
     W64(at + 8, 0x7FF8000000000001ull);                    BAD(p, 1, "corrupt", "NaN outside the bitmap");
-    SAVE(f64_plain(), p); W64(desc_at(0, 0) + 16, 8); set_chunk_bytes(0, 3072 + 8);
-    BAD(p, 1, "corrupt", "float body short");
-    SAVE(f64_plain(), p); W16(desc_at(0, 0) + 4, 2);       BAD(p, 1, "corrupt", "trailer missing");
-    SAVE(f64_plain(), p); W64(desc_at(0, 0) + 16, 40); set_chunk_bytes(0, 3072 + 40);
+    SAVE_RAW(f64_plain(), p); W64(desc_at(0, 0) + 16, 8); set_chunk_bytes(0, 3072 + 8);
+    BAD(p, 1, "corrupt", "codec body: RAW body short");
+    SAVE_RAW(f64_plain(), p); W16(desc_at(0, 0) + 4, 2);   BAD(p, 1, "corrupt", "trailer missing");
+    SAVE_RAW(f64_plain(), p); W64(desc_at(0, 0) + 16, 40); set_chunk_bytes(0, 3072 + 40);
     BAD(p, 1, "corrupt", "bytes after the body");
-    SAVE(f32_plain(), p); NEED_ENC(0, 0, RAY_ENC_RAW); at = payload_at(0, 0);
-    W8(at + 12, 1);                                        BAD(p, 1, "corrupt", "float body padding");
+    SAVE_RAW(f32_plain(), p); NEED_ENC(0, 0, RAY_ENC_RAW); at = payload_at(0, 0);
+    W8(at + 12, 1);                                        BAD(p, 1, "corrupt", "codec body: RAW padding not zero");
     SAVE(f32_const(), p); NEED_ENC(0, 0, RAY_ENC_CONST); at = payload_at(0, 0);
-    W8(at + 4, 1);                                         BAD(p, 1, "corrupt", "float CONST padding");
+    W8(at + 4, 1);                                         BAD(p, 1, "corrupt", "codec body: RAW padding not zero");   /* CONST padding */
     /* the trailer (F64: bitmap 128, body 32, trailer @+160: u16 cnt, 6 reserved, positions @+168, values) */
     for (int k = 0; k < 9; k++) {
-        SAVE(f64_two_odd(), p); NEED_ENC(0, 0, RAY_ENC_RAW);
+        SAVE_RAW(f64_two_odd(), p); NEED_ENC(0, 0, RAY_ENC_RAW);
         at = payload_at(0, 0);
         TEST_ASSERT_TRUE(g_img[desc_at(0, 0) + 4] & RAY_ENC_DESC_TRAILER);
         size_t t = at + 128 + 32;
@@ -573,7 +625,7 @@ static test_result_t test_reject_payloads(void) {
         BAD(p, 1, "corrupt", needle);
     }
     /* F32: one trailer value; 4 value bytes, 4 padding (bitmap 128, body 16, trailer @+144, position @+152, value @+160) */
-    SAVE(f32_odd(), p); NEED_ENC(0, 0, RAY_ENC_RAW); at = payload_at(0, 0);
+    SAVE_RAW(f32_odd(), p); NEED_ENC(0, 0, RAY_ENC_RAW); at = payload_at(0, 0);
     W8(at + 128 + 16 + 16 + 4, 1);                         BAD(p, 1, "corrupt", "trailer value padding");
     /* GUID */
     SAVE(guid_raw(), p); NEED_ENC(0, 0, RAY_ENC_RAW);
@@ -882,8 +934,9 @@ static test_result_t test_stats_nested(void) {
     W64(D + 32, rd64(DIR(0) + 16) - 1);                     BAD(p, 1, "corrupt", "vector 0 " STATS_OUT);
     SAVE(i32_for(), p); D = desc_at(0, 0);
     W64(D + 40, rd64(DIR(0) + 24) + 1);                     BAD(p, 2, "corrupt", "vector 0 " STATS_OUT);   /* a range read */
-    SAVE(f64_stats(), p); { double hi = 100.0; wr(desc_at(0, 0) + 40, &hi, 8); } BAD(p, 1, "corrupt", STATS_OUT);
-    SAVE(f64_stats(), p); { double lo = -1.0; wr(desc_at(0, 0) + 32, &lo, 8); }  BAD(p, 1, "corrupt", STATS_OUT);
+    SAVE_RAW(f64_stats(), p); NEED_ENC(0, 0, RAY_ENC_RAW);
+    { double hi = 100.0; wr(desc_at(0, 0) + 40, &hi, 8); }  BAD(p, 1, "corrupt", STATS_OUT);
+    SAVE_RAW(f64_stats(), p); { double lo = -1.0; wr(desc_at(0, 0) + 32, &lo, 8); }  BAD(p, 1, "corrupt", STATS_OUT);
     {   /* SYM ids 1..4: the vector's maximum 5 is inside the domain, outside the chunk */
         uint8_t ids[4] = { 1, 2, 3, 4 };
         SAVE_SYM(ids, 4, p); W64(desc_at(0, 0) + 40, 5);    BAD(p, 1, "corrupt", STATS_OUT);
@@ -1179,16 +1232,22 @@ static test_result_t test_stats_values(void) {
         W64(DIR(0) + 24, 10); W64(D + 32, 10); W64(D + 40, 10); BAD2(p, 0, VALUE_OUT);
     }
     /* floats: RAW without nulls (read in place), with a NaN null (the copy) */
-    SAVE(f64_stats(), p); NEED_ENC(0, 0, RAY_ENC_RAW);
+    SAVE_RAW(f64_stats(), p); NEED_ENC(0, 0, RAY_ENC_RAW);
     { double hi = 98.0; wr(desc_at(0, 0) + 40, &hi, 8); }  BAD2(p, 0, VALUE_OUT);
-    SAVE(f64_stats(), p); { double lo = 0.5; wr(desc_at(0, 0) + 32, &lo, 8); } BAD2(p, 0, VALUE_OUT);
+    SAVE_RAW(f64_stats(), p); { double lo = 0.5; wr(desc_at(0, 0) + 32, &lo, 8); } BAD2(p, 0, VALUE_OUT);
     {
         ray_t* f = f64_stats();
         ((double*)ray_data(f))[10] = NAN; f->attrs |= RAY_ATTR_HAS_NULLS;
-        SAVE(f, p); TEST_ASSERT_TRUE(rd64(desc_at(0, 0)) >> 16 & 0xFFFF);
+        SAVE_RAW(f, p); NEED_ENC(0, 0, RAY_ENC_RAW); TEST_ASSERT_TRUE(rd64(desc_at(0, 0)) >> 16 & 0xFFFF);
         double hi = 98.0; wr(desc_at(0, 0) + 40, &hi, 8);   BAD2(p, 0, VALUE_OUT);
     }
-    SAVE(f32_plain(), p); { double hi = 2.5; wr(desc_at(0, 0) + 40, &hi, 8); } BAD2(p, 0, VALUE_OUT);
+    SAVE_RAW(f32_plain(), p); NEED_ENC(0, 0, RAY_ENC_RAW);
+    { double hi = 2.5; wr(desc_at(0, 0) + 40, &hi, 8); }   BAD2(p, 0, VALUE_OUT);
+    /* the same rule after a P5 codec body: ALP and ALP_RD */
+    SAVE_AS(f64_stats(), p, RAY_ENC_ALP); NEED_ENC(0, 0, RAY_ENC_ALP);
+    { double hi = 98.0; wr(desc_at(0, 0) + 40, &hi, 8); }  BAD2(p, 0, VALUE_OUT);
+    SAVE_AS(f64_stats(), p, RAY_ENC_ALP_RD); NEED_ENC(0, 0, RAY_ENC_ALP_RD);
+    { double lo = 0.5; wr(desc_at(0, 0) + 32, &lo, 8); }   BAD2(p, 0, VALUE_OUT);
     PASS();
 }
 
@@ -1429,6 +1488,71 @@ static test_result_t test_lazy_validation(void) {
     PASS();
 }
 
+/* Lazy validation over a P5 body (spec "Lazy validation"): a two-chunk F64
+ * column saved as forced ALP, chunk 1's first ALP header carrying e = 19.
+ * A query whose filter skips chunk 1 by its statistics answers as
+ * generation 0; a query reading chunk 1, and materialization, report
+ * `corrupt`.  Its own runtime: the query needs the evaluator. */
+static ray_runtime_t* g_ecrt;
+static void ec_rt_setup(void) { g_ecrt = ray_runtime_create(0, NULL); (void)ray_test_rm_rf(ray_test_tmp(EC_TMP)); (void)ray_test_mkdir_p(ray_test_tmp(EC_TMP)); }
+static void ec_rt_teardown(void) {
+    ray_test_hooks_off(); free(g_img); g_img = NULL; g_len = 0;
+    (void)ray_test_rm_rf(ray_test_tmp(EC_TMP)); ray_runtime_destroy(g_ecrt);
+}
+static bool ec_eval_ok(const char* src) {
+    ray_t* r = ray_eval_str(ray_test_tmp(src));
+    bool ok = r && !RAY_IS_ERR(r);
+    if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+    return ok;
+}
+/* `q` over table T loaded from dir (formatted, owned), or an error. */
+static ray_t* ec_query(const char* dir, const char* q) {
+    char b[512];
+    snprintf(b, sizeof b, "(set T (.db.splayed.get \"%s\"))", dir);
+    if (!ec_eval_ok(b)) return ray_error("domain", "load %s", dir);
+    ray_t* r = ray_eval_str(q);
+    if (!r || RAY_IS_ERR(r)) return r;
+    ray_t* f = ray_fmt(r, 0);
+    ray_release(r);
+    return f;
+}
+static test_result_t test_lazy_float(void) {
+    TEST_ASSERT_TRUE(ec_eval_ok("(set W (table [x] (list (* 0.25 (til 131072)))))"));
+    TEST_ASSERT_TRUE(ec_eval_ok("(.db.splayed.set \"" EC_TMP "/lf0/\" W {compress: false})"));
+    ray_encw_test_force(RAY_ENC_ALP);
+    bool saved = ec_eval_ok("(.db.splayed.set \"" EC_TMP "/lf2/\" W {compress: true})");
+    ray_encw_test_force(-1);
+    TEST_ASSERT_TRUE(saved);
+    char dir[512], path[600];
+    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(ray_test_tmp(EC_TMP "/lf2/"), dir, sizeof dir), RAY_OK);   /* as the query loads it */
+    snprintf(path, sizeof path, "%s/x", dir);
+    TEST_ASSERT_TRUE(img_load(path));
+    NEED_ENC(0, 0, RAY_ENC_ALP); NEED_ENC(1, 0, RAY_ENC_ALP);
+    TEST_ASSERT_TRUE(g_img[payload_at(1, 0)] <= 18);                  /* a legal e (the 32-row samples are integers: 0) */
+    W8(payload_at(1, 0), 19);
+    TEST_ASSERT_TRUE(img_store(path, g_len));
+    static const char* q = "(select {from: T where: (< x 1000.0)})";   /* chunk 1 holds 16384.. */
+    ray_t* a0 = ec_query(ray_test_tmp(EC_TMP "/lf0/"), q);
+    TEST_ASSERT_TRUE(a0 && !RAY_IS_ERR(a0));
+    ray_t* a2 = ec_query(ray_test_tmp(EC_TMP "/lf2/"), q);
+    bool same = a2 && !RAY_IS_ERR(a2) && ray_str_len(a0) == ray_str_len(a2) &&
+                memcmp(ray_str_ptr(a0), ray_str_ptr(a2), ray_str_len(a0)) == 0;
+    const char* why = a2 && RAY_IS_ERR(a2) ? ray_error_msg() : "differs";
+    char msg[512]; snprintf(msg, sizeof msg, "%s", why ? why : "");
+    if (a2 && RAY_IS_ERR(a2)) ray_error_free(a2); else if (a2) ray_release(a2);
+    ray_release(a0);
+    TEST_ASSERT_FMT(same, "filtered query on generation 2: %s", msg);
+    ray_error_clear();
+    ray_t* e = ec_query(ray_test_tmp(EC_TMP "/lf2/"), "(sum (at T 'x))");          /* reads chunk 1 */
+    TEST_ASSERT_TRUE(e && RAY_IS_ERR(e) && strcmp(ray_err_code(e), "corrupt") == 0);
+    TEST_ASSERT_FMT(has_needle("chunk 1 vector 0 codec body: ALP exponent above 18") && names_path(path),
+                    "%s (path %s)", ray_error_msg() ? ray_error_msg() : "", path);
+    ray_error_free(e);
+    TEST_ASSERT_TRUE(ec_eval_ok("(set T 0)"));                          /* drop the table's columns */
+    EXPECT(path, 1, "corrupt", "chunk 1 vector 0 codec body: ALP exponent above 18");
+    PASS();
+}
+
 static uint64_t g_fz;
 static uint64_t fz(void) { uint64_t x = g_fz; x ^= x << 13; x ^= x >> 7; x ^= x << 17; return g_fz = x; }
 
@@ -1502,8 +1626,9 @@ static test_result_t test_fuzz_flips(void) {
     const char* p = ray_test_tmp(EC_TMP "/fz");
     g_fz = 0xC0FFEE;
     int rej_all_total = 0, structural_total = 0, structural_rej = 0;
-    for (int base = 0; base < 6; base++) {
+    for (int base = 0; base < 10; base++) {
         ray_t* v;
+        int force = -1;                 /* bases 6..9: P5 float bodies, saved forced */
         if (base == 0) v = bool_runs();
         else if (base == 1) { v = ray_vec_new(RAY_I32, 70000); v->len = 70000;
             for (int i = 0; i < 70000; i++) ((int32_t*)ray_data(v))[i] = i % 7 ? i % 300 : NULL_I32; }
@@ -1518,7 +1643,36 @@ static test_result_t test_fuzz_flips(void) {
             TEST_ASSERT_FMT(r && !RAY_IS_ERR(r), "attach hash failed");
             v = r;
         }
-        SAVE(v, p);
+        if (base == 6) {   /* ALP with exceptions (-0.0), two vectors */
+            v = ray_vec_new(RAY_F64, 2048); v->len = 2048;
+            for (int i = 0; i < 2048; i++) {
+                double x = (double)(i % 100) / 4.0;
+                if (i % 17 == 0) memcpy(&x, &(uint64_t){ 1ull << 63 }, 8);
+                ((double*)ray_data(v))[i] = x;
+            }
+            force = RAY_ENC_ALP;
+        } else if (base == 7) {   /* ALP_RD */
+            v = ray_vec_new(RAY_F64, 1024); v->len = 1024;
+            uint64_t s = 5;
+            for (int i = 0; i < 1024; i++) { s ^= s << 13; s ^= s >> 7; s ^= s << 17; ((double*)ray_data(v))[i] = 1.0 + (double)(s >> 12) / 4503599627370496.0; }
+            force = RAY_ENC_ALP_RD;
+        } else if (base == 8) {   /* DICT with both zeros: a float VALUE_DICT */
+            v = f64_zeros_dict();
+            force = RAY_ENC_DICT;
+        } else if (base == 9) {   /* F32 RLE with nulls and a trailer */
+            v = ray_vec_new(RAY_F32, 1024); v->len = 1024;
+            for (int i = 0; i < 1024; i++) {
+                float x = 0.5f * (float)(i / 64);
+                if (i % 50 == 7) x = NULL_F32;
+                if (i % 97 == 3) memcpy(&x, &(uint32_t){ 0x7FC00055u }, 4);
+                ((float*)ray_data(v))[i] = x;
+            }
+            v->attrs |= RAY_ATTR_HAS_NULLS;
+            force = RAY_ENC_RLE;
+        }
+        if (force >= 0) { SAVE_AS(v, p, force); NEED_ENC(0, 0, force); }
+        else SAVE(v, p);
+        if (base == 9) TEST_ASSERT_TRUE(g_img[desc_at(0, 0) + 4] & RAY_ENC_DESC_TRAILER);
         uint8_t* orig = malloc(g_len); TEST_ASSERT_TRUE(orig != NULL); memcpy(orig, g_img, g_len);
         size_t first_payload = (size_t)rd64(DIR(0)) + 3072;
         size_t index_off = (size_t)rd64(EH + 32);
@@ -1630,6 +1784,7 @@ const test_entry_t enccorrupt_entries[] = {
     { "enccorrupt/codec_grammar", test_reject_codec_grammar, ec_setup, ec_teardown },
     { "enccorrupt/depth4",        test_reject_depth4,        ec_setup, ec_teardown },
     { "enccorrupt/lazy",          test_lazy_validation,      ec_setup, ec_teardown },
+    { "enccorrupt/lazy_float",    test_lazy_float,           ec_rt_setup, ec_rt_teardown },
     { "enccorrupt/fast_kernel_twice", test_fast_kernel_corrupt_twice, ec_setup, ec_teardown },
     { "enccorrupt/runs_kernel_twice", test_runs_kernel_corrupt_twice, ec_setup, ec_teardown },
     { "enccorrupt/stats_nested",  test_stats_nested,         ec_setup, ec_teardown },
