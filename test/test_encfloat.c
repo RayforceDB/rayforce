@@ -1599,6 +1599,10 @@ static int flr_same_file(const char* a, const char* b) {
  * zero sign) and the column itself, bit for bit. */
 static test_result_t test_signed_zeros_battery(void) {
     _Static_assert(RAY_PARALLEL_THRESHOLD > 6000, "the zero-sign tables must stay serial");
+    /* In a release build the rayfall literal 0.0 parses as -0.0 (#850), so
+     * there the "0.0" and "-0.0" query literals below are the same constant
+     * and the distinct-literal comparisons are only partly covered; the data
+     * is C-built, so its zeros keep their signs in every build. */
     static const int encs[] = { -1, RAY_ENC_RAW, RAY_ENC_RLE, RAY_ENC_DICT, RAY_ENC_ALP, RAY_ENC_ALP_RD };
     static const char* const qs[] = {
         "(count (select {from: T where: (== f 0.0)}))", "(count (select {from: T where: (== f -0.0)}))",
@@ -1743,28 +1747,42 @@ static test_result_t test_depth_bound(void) {
     PASS();
 }
 
-/* Float filters on DICT vectors: no materialization, and no vector decoded
- * where the encoded form answers. */
+/* Float filters on CONST, RLE and DICT vectors (each forced, every vector
+ * checked): no materialization, and no vector decoded where the encoded
+ * form answers; the answers equal generation 0. */
 static test_result_t test_no_materialization(void) {
     const int64_t n = 70000;
+    static const int encs[] = { RAY_ENC_CONST, RAY_ENC_RLE, RAY_ENC_DICT };
     const double dv[4] = { -3.5, bd(NEG0_64), 0.0, 2.25 };
-    ray_t* f = ray_vec_new(RAY_F64, n); f->len = n;
-    for (int64_t i = 0; i < n; i++) ((double*)ray_data(f))[i] = dv[(i * 7) % 4];   /* scattered: FOR_BP codes */
-    TEST_ASSERT_TRUE(flr_save("nm", flr_table(1, (const char* const[]){ "f" }, (ray_t* const[]){ f }), RAY_ENC_DICT));
-    TEST_ASSERT_EQ_I(flr_enc("nm", "f", 0), RAY_ENC_DICT);
-    TEST_ASSERT_EQ_I(flr_enc("nm", "f", 68), RAY_ENC_DICT);
+    const double cv[3] = { bd(NEG0_64), 0.0, 2.25 };
     static const char* const qs[] = {
         "(count (select {from: T where: (<= f 0.0)}))", "(count (select {from: T where: (== f -0.0)}))",
-        "(count (select {from: T where: (> f -0.0)}))", NULL,
+        "(count (select {from: T where: (> f -0.0)}))", "(count (select {from: T where: (!= f 2.25)}))", NULL,
     };
-    for (int i = 0; qs[i]; i++) {
-        TEST_ASSERT_TRUE(fl_eval_ok("(set T (.db.splayed.get \"" FL_TMP "/nm2/\"))"));
-        ray_enc_counters_reset();
-        TEST_ASSERT_TRUE(fl_eval_ok(qs[i]));
-        ray_enc_counters_t c; ray_enc_counters_get(&c);
-        TEST_ASSERT_FMT(c.materialized == 0 && c.decoded_bytes == 0, "%s: materialized %llu, decoded %llu bytes", qs[i],
-                        (unsigned long long)c.materialized, (unsigned long long)c.decoded_bytes);
-        FLR_SAME("nm", qs[i]);
+    for (size_t k = 0; k < sizeof encs / sizeof encs[0]; k++) {
+        ray_t* f = ray_vec_new(RAY_F64, n); f->len = n;
+        double* fd = (double*)ray_data(f);
+        for (int64_t i = 0; i < n; i++)
+            fd[i] = encs[k] == RAY_ENC_CONST ? cv[(i / 1024) % 3]     /* one value per vector */
+                  : encs[k] == RAY_ENC_RLE   ? dv[(i / 3) % 4]        /* runs of 3 */
+                  : dv[(i * 7) % 4];                                  /* scattered: FOR_BP codes */
+        int64_t zn, zp; flr_zeros(f, &zn, &zp);
+        TEST_ASSERT_TRUE(zn > 0 && zp > 0);
+        char name[16]; snprintf(name, sizeof name, "nm%zu", k);
+        TEST_ASSERT_TRUE(flr_save(name, flr_table(1, (const char* const[]){ "f" }, (ray_t* const[]){ f }), encs[k]));
+        for (int64_t v = 0; v < (n + 1023) / 1024; v++)
+            TEST_ASSERT_FMT(flr_enc(name, "f", v) == encs[k], "%s vector %lld: encoding %d", name, (long long)v, flr_enc(name, "f", v));
+        char load[128];
+        snprintf(load, sizeof load, "(set T (.db.splayed.get \"" FL_TMP "/%s2/\"))", name);
+        for (int i = 0; qs[i]; i++) {
+            TEST_ASSERT_TRUE(fl_eval_ok(load));
+            ray_enc_counters_reset();
+            TEST_ASSERT_TRUE(fl_eval_ok(qs[i]));
+            ray_enc_counters_t c; ray_enc_counters_get(&c);
+            TEST_ASSERT_FMT(c.materialized == 0 && c.decoded_bytes == 0, "%s %s: materialized %llu, decoded %llu bytes", name, qs[i],
+                            (unsigned long long)c.materialized, (unsigned long long)c.decoded_bytes);
+            FLR_SAME(name, qs[i]);
+        }
     }
     PASS();
 }
@@ -1799,7 +1817,8 @@ static test_result_t test_stream_equals_resident(void) {
         /* the parser gives the written bits; both writers read through it,
          * so the comparison below holds either way.  The one tolerated
          * difference is +0.0 read as -0.0: release builds' ray_parse_f64
-         * folds the zero's sign under -fno-signed-zeros (#850). */
+         * folds the zero's sign under -fno-signed-zeros (#850).
+         * TODO(#850): remove this tolerance once #850 is fixed. */
         bool bits = col && !RAY_IS_ERR(col) && col->type == RAY_F64 && col->len == 140000;
         int64_t bad = -1;
         for (int64_t i = 0; bits && i < 140000; i++) {

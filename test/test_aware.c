@@ -5298,14 +5298,55 @@ static test_result_t aw_szc_first_zero(const char* name) {
     PASS();
 }
 
+/* The signed-zero tables [k f] built in C and saved as aw_save does: the
+ * zeros are bit patterns (D10).  Rayfall cannot build them in a release
+ * build, where the literal 0.0 parses as -0.0 (#850, -fno-signed-zeros) and
+ * (neg 0.0) is then +0.0.  shape 0 (sz): rows < 1024 -0.0, < 2048 +0.0, then
+ * -0.0 on even rows and 0.5 * (j - 2600) on odd ones; shape 1 (sz0): the
+ * same with +0.0 on the odd rows; shape 2 (szc): by vector v = j / 1024,
+ * -0.0 when v % 3 == 0, +0.0 when 1, -0.0 / +0.0 on even / odd rows when 2. */
+static void aw_save_zeros(const char* name, int shape, int64_t n, int enc) {
+    const uint64_t neg0 = 1ull << 63, pos0 = 0;
+    ray_t* k = ray_vec_new(RAY_I64, n);
+    ray_t* f = ray_vec_new(RAY_F64, n);
+    if (!k || !f) { fprintf(stderr, "aw_save_zeros: oom\n"); abort(); }
+    k->len = f->len = n;
+    for (int64_t j = 0; j < n; j++) {
+        ((int64_t*)ray_data(k))[j] = j;
+        uint64_t b;
+        if (shape == 2) {
+            int64_t v = j / 1024;
+            b = v % 3 == 0 ? neg0 : v % 3 == 1 ? pos0 : (j % 2 == 0 ? neg0 : pos0);
+        } else if (j < 1024) b = neg0;
+        else if (j < 2048)   b = pos0;
+        else if (j % 2 == 0) b = neg0;
+        else if (shape == 1) b = pos0;
+        else { double x = 0.5 * (double)(j - 2600); memcpy(&b, &x, 8); }
+        memcpy((double*)ray_data(f) + j, &b, 8);
+    }
+    ray_t* tb = ray_table_new(2);
+    tb = ray_table_add_col(tb, ray_sym_intern("k", 1), k); ray_release(k);
+    tb = ray_table_add_col(tb, ray_sym_intern("f", 1), f); ray_release(f);
+    if (ray_env_set(ray_sym_intern("W", 1), tb) != RAY_OK) { fprintf(stderr, "aw_save_zeros: bind\n"); abort(); }
+    ray_release(tb);
+    char q[512];
+    snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/%s0/\" W {compress: false})", name);
+    aw_eval_ok(q);
+    ray_encw_test_force(enc);
+    snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/%s2/\" W {compress: true})", name);
+    aw_eval_ok(q);
+    ray_encw_test_force(-1);
+}
+
 /* Signed zeros: CONST vectors of -0.0 and of +0.0 next to a RAW vector
  * mixing both; every comparison with both zero literals, in, min, max (which
  * zero) and a float top-k. */
 static test_result_t test_signed_zeros(void) {
-    /* -0.0 is computed as (neg 0.0): inside one lambda the literals -0.0 and
-     * 0.0 share a constant-pool slot (compile.c add_constant compares by ==, #824),
-     * so the literal form would hold no +0.0 at all. */
-    aw_save("sz", "(table [k f] (list (til 3072) (map (fn [j] (if (< j 1024) (neg 0.0) (if (< j 2048) 0.0 (if (== 0 (% j 2)) (neg 0.0) (* 0.5 (- j 2600)))))) (til 3072))))", -1);
+    /* The zeros are built in C (aw_save_zeros): inside one lambda the
+     * literals -0.0 and 0.0 share a constant-pool slot (compile.c
+     * add_constant compares by ==, #824), and in a release build the literal
+     * 0.0 is itself -0.0 (#850), so no rayfall form holds both zeros there. */
+    aw_save_zeros("sz", 0, 3072, -1);
     TEST_ASSERT_EQ_I(aw_vec_enc("sz", "f", 0), RAY_ENC_CONST);
     TEST_ASSERT_EQ_I(aw_vec_enc("sz", "f", 1), RAY_ENC_CONST);
     AW_ZERO_ROWS("sz", 1024 + 512, 1024);
@@ -5324,7 +5365,7 @@ static test_result_t test_signed_zeros(void) {
     AW_SAME_OR_ERR("sz", "(select {f: f k: k from: T where: (> k 1000) desc: f take: 5})");
     /* Zeros only: which zero min / max return (1/x tells them apart) and how
      * the top-k orders -0.0 against 0.0 (k shows the rows taken). */
-    aw_save("sz0", "(table [k f] (list (til 3072) (map (fn [j] (if (< j 1024) (neg 0.0) (if (< j 2048) 0.0 (if (== 0 (% j 2)) (neg 0.0) 0.0)))) (til 3072))))", -1);
+    aw_save_zeros("sz0", 1, 3072, -1);
     TEST_ASSERT_EQ_I(aw_vec_enc("sz0", "f", 0), RAY_ENC_CONST);
     TEST_ASSERT_EQ_I(aw_vec_enc("sz0", "f", 1), RAY_ENC_CONST);
     /* P5: the mixed +/-0.0 vector has two distinct values, so selection now
@@ -5342,7 +5383,7 @@ static test_result_t test_signed_zeros(void) {
     AW_SAME_OR_ERR("sz0", "(select {f: f k: k from: T asc: f take: 5})");
     AW_SAME_OR_ERR("sz0", "(select {f: f k: k from: T desc: f take: 5})");
     /* P5: the same mix as a RAW body (the pre-P5 shape): every vector RAW */
-    aw_save("sz0r", "(table [k f] (list (til 3072) (map (fn [j] (if (< j 1024) (neg 0.0) (if (< j 2048) 0.0 (if (== 0 (% j 2)) (neg 0.0) 0.0)))) (til 3072))))", RAY_ENC_RAW);
+    aw_save_zeros("sz0r", 1, 3072, RAY_ENC_RAW);
     TEST_ASSERT_EQ_I(aw_vec_enc("sz0r", "f", 2), RAY_ENC_RAW);
     AW_ZERO_ROWS("sz0r", 1024 + 512, 1024 + 512);
     AW_ZERO_MM("sz0r", "(min (at T 'f))");
@@ -5360,8 +5401,7 @@ static test_result_t test_signed_zeros(void) {
      * in parallel and the merge of the workers' zeros is not row order, so
      * generation 2 runs in row order under the scalar-grain hook (whole
      * blocks, and one task) and must keep the first selected row's zero. */
-    aw_save("szc", "(table [k f] (list (til 131072) (map (fn [j] (if (== 0 (% (div j 1024) 3)) (neg 0.0) "
-                   "(if (== 1 (% (div j 1024) 3)) 0.0 (if (== 0 (% j 2)) (neg 0.0) 0.0)))) (til 131072))))", -1);
+    aw_save_zeros("szc", 2, 131072, -1);
     TEST_ASSERT_EQ_I(aw_vec_enc("szc", "f", 63), RAY_ENC_CONST);
     TEST_ASSERT_EQ_I(aw_vec_enc("szc", "f", 64), RAY_ENC_CONST);
     /* P5: the +/-0.0 mix now selects DICT (it was RAW) */
@@ -5369,8 +5409,7 @@ static test_result_t test_signed_zeros(void) {
     {   test_result_t r_ = aw_szc_first_zero("szc"); if (r_.status != TEST_PASS) return r_; }
     /* P5 (Task 7): the same vectors as RAW bodies (the pre-P5 shape of
      * vector 65, and CONST vectors 63 / 64 read as rows) */
-    aw_save("szcr", "(table [k f] (list (til 131072) (map (fn [j] (if (== 0 (% (div j 1024) 3)) (neg 0.0) "
-                    "(if (== 1 (% (div j 1024) 3)) 0.0 (if (== 0 (% j 2)) (neg 0.0) 0.0)))) (til 131072))))", RAY_ENC_RAW);
+    aw_save_zeros("szcr", 2, 131072, RAY_ENC_RAW);
     TEST_ASSERT_EQ_I(aw_vec_enc("szcr", "f", 63), RAY_ENC_RAW);
     TEST_ASSERT_EQ_I(aw_vec_enc("szcr", "f", 64), RAY_ENC_RAW);
     TEST_ASSERT_EQ_I(aw_vec_enc("szcr", "f", 65), RAY_ENC_RAW);
