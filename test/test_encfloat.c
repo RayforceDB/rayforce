@@ -2063,6 +2063,9 @@ static int fe_case(int8_t ty, uint8_t enc, const uint64_t* vals, int vlen, const
      * short vector's), which the reference reads */
     const bool take = enc != RAY_ENC_DICT || b.p[0] == RAY_ENC_FOR_BP || b.p[0] == RAY_ENC_RLE;
     int bad = fe_check(ty, dict, enc, nn, bmp, b.p, b.len, vlen, st, mn, mx, take);
+    /* absent statistics over the same rows (non-null ones included): no
+     * bound, as dec_floats reads them; only a NaN fails */
+    if (!bad) bad |= fe_check(ty, dict, enc, nn, bmp, b.p, b.len, vlen, false, 0, 0, take);
     if (!bad && st) {                                  /* narrowed statistics: rejected, never taken */
         bad |= fe_check(ty, dict, enc, nn, bmp, b.p, b.len, vlen, true, nextafter(mn, INFINITY), mx, false);
         bad |= fe_check(ty, dict, enc, nn, bmp, b.p, b.len, vlen, true, mn, nextafter(mx, -INFINITY), false);
@@ -2146,6 +2149,31 @@ static test_result_t test_fast_equals_reference(void) {
                 v[n / 2] = fe_bits(ty, 0.3);
                 FE_NULLS();
                 TEST_ASSERT_FMT(!fe_case(ty, RAY_ENC_ALP, v, n, bmp, NULL, &c, "alp f32"), "%s", fe_what);
+            }
+            /* +-inf in the data, so at the statistics' bounds too (and
+             * narrowed past them: nextafter(-inf, 0) is -max) */
+            const uint64_t pinf = T == 64 ? 0x7FF0000000000000ull : 0x7F800000u;
+            const uint64_t ninf = T == 64 ? 0xFFF0000000000000ull : 0xFF800000u;
+            for (int i = 0; i < n; i++) v[i] = i % 5 == 1 ? pinf : i % 5 == 3 ? ninf : fe_bits(ty, (double)(i % 17) - 8.0);
+            FE_NULLS();
+            TEST_ASSERT_FMT(!fe_case(ty, RAY_ENC_RAW, v, n, bmp, NULL, NULL, "raw +-inf"), "%s", fe_what);
+            for (int i = 0; i < n; i++) v[i] = pinf;
+            TEST_ASSERT_FMT(!fe_case(ty, RAY_ENC_CONST, v, n, NULL, NULL, NULL, "const +inf"), "%s", fe_what);
+            for (int i = 0; i < n; i++) v[i] = (i / 30) % 3 == 0 ? ninf : (i / 30) % 3 == 1 ? fe_bits(ty, 2.5) : pinf;
+            TEST_ASSERT_FMT(!fe_case(ty, RAY_ENC_RLE, v, n, bmp, NULL, NULL, "rle +-inf"), "%s", fe_what);
+            {
+                static uint64_t idv[5];
+                idv[0] = ninf; idv[1] = fe_bits(ty, -1.0); idv[2] = fe_bits(ty, 0.5); idv[3] = fe_bits(ty, 7.0); idv[4] = pinf;
+                ray_enc_dict_t idict = { idv, 5 };
+                for (int i = 0; i < n; i++) v[i] = idv[(i * 3) % 5];
+                TEST_ASSERT_FMT(!fe_case(ty, RAY_ENC_DICT, v, n, bmp, &idict, NULL, "dict +-inf"), "%s", fe_what);
+            }
+            {   /* ALP: the infinities are exceptions */
+                ray_enc_alp_cands_t ic = { .n = 1 };
+                ic.c[0].e = 1; ic.c[0].f = 0;
+                for (int i = 0; i < n; i++) v[i] = i % 97 == 5 ? pinf : i % 97 == 50 ? ninf : fe_bits(ty, (double)(i % 200) / 10.0);
+                FE_NULLS();
+                TEST_ASSERT_FMT(!fe_case(ty, RAY_ENC_ALP, v, n, bmp, NULL, &ic, "alp +-inf"), "%s", fe_what);
             }
             /* ALP_RD: high-entropy mantissas, few exponents */
             for (int i = 0; i < n; i++) {

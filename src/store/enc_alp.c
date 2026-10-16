@@ -190,6 +190,10 @@ static inline __attribute__((always_inline)) void alp_dec_for(const uint8_t* b, 
      * are (double)n's; unlike the int64 conversion it vectorises.  The
      * multiplies are alp_dec1's, in its order. */
     const int64_t lim = (int64_t)1 << 51;
+    /* w <= 50 is kept although the base test bounds base + u for most
+     * widths: at w = 64, (int64_t)vm is -1 and the test would admit a base
+     * near 2^51 with u up to 2^64 - 1.  The guard keeps vm < 2^50, so
+     * lim - vm cannot wrap and every base + u lies in [-2^51, 2^51). */
     if (T == 64 && w >= 1 && w <= 50 && (int64_t)base >= -lim && (int64_t)base < lim - (int64_t)vm) {
         const double m1 = F10[f], m2 = IF10[e], mg = 6755399441055744.0;    /* 1.5 * 2^52 */
         const uint64_t mgb = 0x4338000000000000ull;
