@@ -145,18 +145,24 @@ enum {
  */
 #define LAMBDA_SLOTS 10
 
+/* The slots that hold no reference, and the last one that does.  The free
+ * walk in mem/heap.c drops slots 0 .. LAMBDA_SLOT_CAPROWS but n_locals. */
+#define LAMBDA_SLOT_NLOCALS   4
+#define LAMBDA_SLOT_CAPROWS   8
+#define LAMBDA_SLOT_CAPQ      9
+
 #define RAY_FN_COMPILED  0x40   /* lambda has been compiled to bytecode */
 
 #define LAMBDA_PARAMS(lam)    (((ray_t**)ray_data(lam))[0])
 #define LAMBDA_BODY(lam)      (((ray_t**)ray_data(lam))[1])
 #define LAMBDA_BC(lam)        (((ray_t**)ray_data(lam))[2])
 #define LAMBDA_CONSTS(lam)    (((ray_t**)ray_data(lam))[3])
-#define LAMBDA_NLOCALS(lam)   (*((int32_t*)&((ray_t**)ray_data(lam))[4]))
+#define LAMBDA_NLOCALS(lam)   (*((int32_t*)&((ray_t**)ray_data(lam))[LAMBDA_SLOT_NLOCALS]))
 #define LAMBDA_NFO(lam)       (((ray_t**)ray_data(lam))[5])
 #define LAMBDA_DBG(lam)       (((ray_t**)ray_data(lam))[6])
 #define LAMBDA_CLOSURE(lam)   (((ray_t**)ray_data(lam))[7])
-#define LAMBDA_CAPROWS(lam)   (((ray_t**)ray_data(lam))[8])
-#define LAMBDA_CAPQ(lam)      (*((uint32_t*)&((ray_t**)ray_data(lam))[9]))
+#define LAMBDA_CAPROWS(lam)   (((ray_t**)ray_data(lam))[LAMBDA_SLOT_CAPROWS])
+#define LAMBDA_CAPQ(lam)      (*((uint32_t*)&((ray_t**)ray_data(lam))[LAMBDA_SLOT_CAPQ]))
 
 #define LAMBDA_IS_COMPILED(lam) ((lam)->attrs & RAY_FN_COMPILED)
 

@@ -47,9 +47,10 @@ void ray_dfd_check_live(const void* p, const char* who);
 #endif
 
 /* Drop one reference to v.  True when that was the last one: the caller
- * now owns the block and must free it.  ray_release is this plus ray_free;
- * the free walk in heap.c drops a dying container's children through it
- * directly, so it frees them without nesting a ray_free per level. */
+ * now owns the block and must free it.  ray_release is this plus
+ * ray_free_last_ref; the free walk in heap.c drops a dying container's
+ * children through it directly, so it frees them without nesting a
+ * ray_free per level. */
 RAY_INLINE bool ray_release_last(ray_t* v) {
     if (!v || RAY_IS_ERR(v)) return false;
     if (v->attrs & RAY_ATTR_ARENA) return false;

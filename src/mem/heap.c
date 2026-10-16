@@ -920,7 +920,10 @@ static bool ray_atom_owns_obj(const ray_t* v) {
     return false;
 }
 
-static void ray_release_owned_refs(ray_t* v) {
+/* Forced inline: ray_free_node has two inlined copies (the per-node free
+ * and the free walk's leaf child), and a leaf free must not pay a call
+ * here to learn it owns nothing. */
+RAY_INLINE void ray_release_owned_refs(ray_t* v) {
     if (!v || RAY_IS_ERR(v)) return;
 
     if (ray_is_atom(v)) {
@@ -2048,9 +2051,15 @@ RAY_INLINE bool ray_free_walks(const ray_t* v) {
 
 /* How many leading data slots of a walked container are owned references:
  * the ones ray_release_owned_refs drops for its kind. */
+_Static_assert(LAMBDA_SLOT_CAPQ == LAMBDA_SLOTS - 1 &&
+               LAMBDA_SLOT_CAPROWS == LAMBDA_SLOT_CAPQ - 1 &&
+               LAMBDA_SLOT_NLOCALS < LAMBDA_SLOT_CAPROWS,
+               "the free walk drops lambda slots 0..CAPROWS except NLOCALS, "
+               "the references ray_release_owned_refs drops");
+
 RAY_INLINE int64_t ray_free_walk_width(const ray_t* v) {
     if (v->type == RAY_LIST)   return v->len;
-    if (v->type == RAY_LAMBDA) return 9;    /* params .. caprows; 4 cleared */
+    if (v->type == RAY_LAMBDA) return LAMBDA_SLOT_CAPROWS + 1;  /* NLOCALS cleared */
     return 2;                               /* dict / table: keys, values */
 }
 
@@ -2061,9 +2070,9 @@ RAY_INLINE void ray_free_walk_enter(ray_t* v) {
 #endif
     /* rc=1 while the children go, so buddy coalescing skips the block. */
     ray_atomic_store(&v->rc, 1);
-    /* A lambda's slot 4 is n_locals, not a reference.  The lambda is dying,
-     * so clear it and let the loop take slots 0-8 as one run. */
-    if (v->type == RAY_LAMBDA) ((ray_t**)ray_data(v))[4] = NULL;
+    /* A lambda's n_locals slot is not a reference.  The lambda is dying,
+     * so clear it and let the loop take slots 0..CAPROWS as one run. */
+    if (v->type == RAY_LAMBDA) ((ray_t**)ray_data(v))[LAMBDA_SLOT_NLOCALS] = NULL;
 }
 
 static void ray_free_walk(ray_t* v) {
@@ -2077,10 +2086,15 @@ static void ray_free_walk(ray_t* v) {
         while (i < n) {
             ray_t* c = slots[i++];
             if (!ray_release_last(c)) continue;
-            if (ray_free_walks(c)) { down = c; break; }
-            /* Through ray_free rather than ray_free_node, so the node free
-             * keeps its one inlined copy, in ray_free, as before the walk. */
-            ray_free(c);
+            if (!ray_free_walks(c)) { ray_free_node(c); continue; }
+            /* A container with no slots has nothing to park the walk for. */
+            if (ray_free_walk_width(c) == 0) {
+                ray_free_walk_enter(c);
+                ray_free_block(c);
+                continue;
+            }
+            down = c;
+            break;
         }
         if (down) {
             v->slice_parent = up;
@@ -2099,11 +2113,15 @@ static void ray_free_walk(ray_t* v) {
     }
 }
 
+void ray_free_last_ref(ray_t* v) {
+    if (ray_free_walks(v)) ray_free_walk(v);
+    else                   ray_free_node(v);
+}
+
 void ray_free(ray_t* v) {
     if (!v || RAY_IS_ERR(v)) return;
     if (v->attrs & RAY_ATTR_ARENA) return;  /* arena-owned, bulk-freed */
-    if (ray_free_walks(v)) ray_free_walk(v);
-    else                   ray_free_node(v);
+    ray_free_last_ref(v);
 }
 
 /* --------------------------------------------------------------------------

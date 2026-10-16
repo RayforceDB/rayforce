@@ -393,6 +393,7 @@ FV1 -- [1.5 2.5 3.5]
 (set h0 (heapb))
 (set d (dict ['k] (list 1)))
 (times 150000 (set d (dict ['k] (list d))))
+(> (- (heapb) h0) 10000000) -- true
 (set d 0)
 (< (- (heapb) h0) 65536) -- true
 
@@ -400,6 +401,7 @@ FV1 -- [1.5 2.5 3.5]
 (set h0 (heapb))
 (set t (table [c] (list (list 1))))
 (times 100000 (set t (table [c] (list (list t)))))
+(> (- (heapb) h0) 10000000) -- true
 (set t 0)
 (< (- (heapb) h0) 65536) -- true
 
@@ -411,6 +413,7 @@ FV1 -- [1.5 2.5 3.5]
 (f) -- 7
 (set h0 (heapb))
 (times 100000 (set f (mk f)))
+(> (- (heapb) h0) 10000000) -- true
 (set f (fn [] 7))
 (< (- (heapb) h0) 65536) -- true
 ((mk (mk f))) -- 7
@@ -429,6 +432,21 @@ FV1 -- [1.5 2.5 3.5]
 (set m (list 0))
 (times 100000 (set m (list m "a string longer than seven" [1 2 3] 'sym 1.5 (dict ['x] (list m)))))
 (set m 0)
+(< (- (heapb) h0) 65536) -- true
+
+;; the next level first and leaves after it: the walk comes back up to a
+;; parent with slots still to release, in a list and in a dict's values
+(set h0 (heapb))
+(set a (enlist 1))
+(times 100000 (set a (list a (til 3) "a string longer than seven")))
+(> (- (heapb) h0) 10000000) -- true
+(set a 0)
+(< (- (heapb) h0) 65536) -- true
+(set h0 (heapb))
+(set e (dict ['k] (list 1)))
+(times 100000 (set e (dict ['k 'x 'y] (list e (til 3) "a string longer than seven"))))
+(> (- (heapb) h0) 10000000) -- true
+(set e 0)
 (< (- (heapb) h0) 65536) -- true
 
 ;; a chain still referenced from the middle: dropping the top frees only

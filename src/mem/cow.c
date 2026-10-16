@@ -50,7 +50,7 @@ void ray_retain(ray_t* v) {
  * -------------------------------------------------------------------------- */
 
 void ray_release(ray_t* v) {
-    if (ray_release_last(v)) ray_free(v);
+    if (ray_release_last(v)) ray_free_last_ref(v);
 }
 
 /* --------------------------------------------------------------------------
