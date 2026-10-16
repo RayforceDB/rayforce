@@ -225,7 +225,8 @@ static test_result_t test_vec_f64_trailer(void) {
     PASS();
 }
 
-/* CONST merges equal bit patterns only: -0.0 and +0.0 stay RAW. */
+/* CONST and RLE merge equal bit patterns only: -0.0 and +0.0 never merge
+ * (-0.0 then 1023 x +0.0 is RLE of two runs, 48 B against RAW 8192 B). */
 static test_result_t test_vec_f64_const_and_zeros(void) {
     double d[RAY_ENC_VEC];
     for (int i = 0; i < RAY_ENC_VEC; i++) d[i] = 1.5;
@@ -233,10 +234,19 @@ static test_result_t test_vec_f64_const_and_zeros(void) {
     TEST_ASSERT_EQ_I(ray_encw_vec(RAY_F64, 0, d, NULL, 0, RAY_ENC_VEC, NULL, &v), RAY_OK);
     TEST_ASSERT_EQ_I(v.desc.encoding, RAY_ENC_CONST);
     TEST_ASSERT_EQ_U(v.payload.len, 8);
-    d[0] = -0.0; d[1] = 0.0;
-    for (int i = 2; i < RAY_ENC_VEC; i++) d[i] = 0.0;
+    const uint64_t neg0 = 0x8000000000000000ull;          /* -0.0 as its bit pattern (D10) */
+    memcpy(&d[0], &neg0, 8);
+    for (int i = 1; i < RAY_ENC_VEC; i++) d[i] = 0.0;
     TEST_ASSERT_EQ_I(ray_encw_vec(RAY_F64, 0, d, NULL, 0, RAY_ENC_VEC, NULL, &v), RAY_OK);
-    TEST_ASSERT_EQ_I(v.desc.encoding, RAY_ENC_RAW);
+    TEST_ASSERT_EQ_I(v.desc.encoding, RAY_ENC_RLE);
+    TEST_ASSERT_EQ_U(v.payload.len, 48);
+    uint32_t nruns; memcpy(&nruns, v.payload.p, 4);
+    TEST_ASSERT_EQ_U(nruns, 2);
+    uint64_t out[RAY_ENC_VEC];
+    TEST_ASSERT_EQ_I(ray_enc_float_read(v.payload.p, v.payload.len, RAY_ENC_RLE, RAY_ENC_VEC, 64, NULL, out),
+                     (int64_t)v.payload.len);
+    TEST_ASSERT_EQ_U(out[0], neg0);                          /* the run values: -0.0, then +0.0 */
+    for (int i = 1; i < RAY_ENC_VEC; i++) TEST_ASSERT_EQ_U(out[i], 0);
     TEST_ASSERT_EQ_U((uint64_t)v.desc.min, f64_bits(-0.0));   /* first of the tied zeros */
     TEST_ASSERT_EQ_U((uint64_t)v.desc.max, f64_bits(-0.0));
     ray_encw_vec_free(&v);
@@ -736,10 +746,10 @@ static test_result_t test_empty_column(void) {
     PASS();
 }
 
-/* Compile with -DENC_GOLDEN_KEEP to regenerate the fixtures into a kept
- * directory; otherwise the emit test writes into the (removed) test dir. */
+/* Compile with -DENC_GOLDEN_KEEP to regenerate the fixtures in place
+ * (test/data/enc); otherwise the emit test writes into the (removed) test dir. */
 #ifdef ENC_GOLDEN_KEEP
-#  define ENC_GOLDEN_OUT "/tmp/rayforce_enc_golden"
+#  define ENC_GOLDEN_OUT ENC_GOLDEN_DIR
 #else
 #  define ENC_GOLDEN_OUT ENCFMT_TMP "/golden_emit"
 #endif
@@ -778,7 +788,8 @@ static ray_t* golden_vec(int i, const char** name, int* force, int* want) {
               uint8_t d[1024]; for (int k = 0; k < 1024; k++) d[k] = (uint8_t)golden_rng(); v = ray_vec_from_raw(RAY_U8, d, 1024); break; }
     case 8: { *name = "bool_rle"; *want = RAY_ENC_RLE;               /* top-level RLE, RAW values and ends: 64 B */
               uint8_t d[1024]; for (int k = 0; k < 1024; k++) d[k] = (uint8_t)((k / 100) & 1); v = ray_vec_from_raw(RAY_BOOL, d, 1024); break; }
-    case 9: { *name = "f64_trailer"; *want = RAY_ENC_RAW;
+    /* forced RAW: the P5 choice would pick DICT (24 B against 32 B) */
+    case 9: { *name = "f64_trailer"; *force = RAY_ENC_RAW; *want = RAY_ENC_RAW;
               double d[4]; uint64_t odd = 0x7FF8000000000001ull; d[0] = 2.5; d[1] = NULL_F64; memcpy(&d[2], &odd, 8); d[3] = -1.0; v = ray_vec_from_raw(RAY_F64, d, 4); v->attrs |= RAY_ATTR_HAS_NULLS; break; }
     case 10: { *name = "f64_const"; *want = RAY_ENC_CONST;
                double d[1024]; for (int k = 0; k < 1024; k++) d[k] = 1.5; v = ray_vec_from_raw(RAY_F64, d, 1024); break; }
@@ -841,6 +852,31 @@ static ray_t* golden_vec(int i, const char** name, int* force, int* want) {
     case 27: { g_kid[1] = RAY_ENC_RAW;
                *name = "i64_dict_codes_raw"; *force = RAY_ENC_DICT; *want = RAY_ENC_DICT;
                int64_t d[3] = { 5, 900000000001ll, -77 }; v = ray_vec_from_raw(RAY_I64, d, 3); break; }
+    /* P5 floats; -0.0 is written as its bit pattern (D10) */
+    case 28: { *name = "f64_alp"; *force = RAY_ENC_ALP; *want = RAY_ENC_ALP;   /* forced: one chunk, so DICT would win */
+               double d[1024]; for (int k = 0; k < 1024; k++) d[k] = (double)((k * 7919) % 100000) / 100.0;
+               v = ray_vec_from_raw(RAY_F64, d, 1024); break; }
+    case 29: { *name = "f64_alprd_len1"; *force = RAY_ENC_ALP_RD; *want = RAY_ENC_ALP_RD;
+               double d[1] = { 1.0 + (double)(golden_rng() >> 11) / 9007199254740992.0 }; v = ray_vec_from_raw(RAY_F64, d, 1); break; }
+    case 30: { *name = "f64_alprd_len1023"; *force = RAY_ENC_ALP_RD; *want = RAY_ENC_ALP_RD;
+               double d[1023]; for (int k = 0; k < 1023; k++) d[k] = 1.0 + (double)(golden_rng() >> 11) / 9007199254740992.0;
+               v = ray_vec_from_raw(RAY_F64, d, 1023); break; }
+    case 31: { *name = "f64_dict_signed"; *force = RAY_ENC_DICT; *want = RAY_ENC_DICT;
+               static const uint64_t dv[4] = { 0xC00C000000000000ull /* -3.5 */, 0x8000000000000000ull /* -0.0 */,
+                                               0 /* +0.0 */, 0x4002000000000000ull /* 2.25 */ };
+               double d[1024]; for (int k = 0; k < 1024; k++) memcpy(&d[k], &dv[(uint32_t)((uint32_t)k * 2654435761u) >> 30], 8);
+               v = ray_vec_from_raw(RAY_F64, d, 1024); break; }
+    case 32: { *name = "f64_rle"; *force = RAY_ENC_RLE; *want = RAY_ENC_RLE;
+               double d[1024]; for (int k = 0; k < 1024; k++) d[k] = (double)(k / 128) * 1.0000001;
+               v = ray_vec_from_raw(RAY_F64, d, 1024); break; }
+    case 33: { *name = "f32_alp"; *force = RAY_ENC_ALP; *want = RAY_ENC_ALP;
+               float d[1024]; for (int k = 0; k < 1024; k++) d[k] = (float)((k * 31) % 5000) / 10.0f;
+               v = ray_vec_from_raw(RAY_F32, d, 1024); break; }
+    case 34: { *name = "f64_alp_trailer"; *force = RAY_ENC_ALP; *want = RAY_ENC_ALP;
+               double d[1024]; uint64_t odd = 0x7FF8000000000077ull, neg0 = 0x8000000000000000ull;
+               for (int k = 0; k < 1024; k++) { d[k] = (double)(k % 100) / 4.0; if (k % 50 == 7) memcpy(&d[k], &odd, 8);
+                                                if (k % 64 == 3) memcpy(&d[k], &neg0, 8); }
+               v = ray_vec_from_raw(RAY_F64, d, 1024); v->attrs |= RAY_ATTR_HAS_NULLS; break; }
     default: return NULL;
     }
     return v;
@@ -949,7 +985,8 @@ static const char* const g_golden_names[] = {
     "u8_raw", "bool_rle", "f64_trailer", "f64_const", "f32_zeros", "guid_mixed", "str_mixed",
     "str_const", "i64_empty", "i32_two_chunks", "str_inline", "str_pooled", "str_repeated",
     "i16_delta_wT", "i32_delta_wT", "i64_delta_wT", "i64_dict_const_child", "i64_rle_values_for",
-    "i64_rle_ends_delta", "i64_rle_ends_for", "i64_dict_codes_raw", "sym_w8_for", "sym_w32_rle", NULL,
+    "i64_rle_ends_delta", "i64_rle_ends_for", "i64_dict_codes_raw", "sym_w8_for", "sym_w32_rle",
+    "f64_alp", "f64_alprd_len1", "f64_alprd_len1023", "f64_dict_signed", "f64_rle", "f32_alp", "f64_alp_trailer", NULL,
 };
 
 static test_result_t test_golden_emit(void) {
@@ -995,8 +1032,9 @@ static test_result_t test_golden_stream(void) {
         snprintf(a, sizeof a, "%s/%s.bin", ENC_GOLDEN_DIR, name);
         snprintf(b, sizeof b, "%s/gs/%s", ray_test_tmp(ENCFMT_TMP), name);
         size_t na, nb; uint8_t* pa = read_file(a, &na); uint8_t* pb = read_file(b, &nb);
-        TEST_ASSERT_FMT(pa && pb && na == nb && memcmp(pa, pb, na) == 0, "%s: stream differs from the fixture", name);
+        bool same = pa && pb && na == nb && memcmp(pa, pb, na) == 0;
         free(pa); free(pb);
+        TEST_ASSERT_FMT(same, "%s: stream differs from the fixture", name);
     }
     PASS();
 }

@@ -28,6 +28,8 @@
 #include "core/runtime.h"
 #include "store/enc.h"
 #include "store/encfmt.h"
+#include "store/col.h"
+#include "store/encw.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,7 +42,10 @@ static void fl_setup(void)    { ray_heap_init(); (void)ray_sym_init(); (void)ray
 static ray_enc_buf_t fl_buf;
 static uint64_t*     fl_dict;
 static uint8_t*      fl_mem;                 /* malloc'd scratch */
+static ray_t*        fl_vec;                 /* a test's column */
 static void fl_teardown(void) {
+    ray_encw_test_force(-1);
+    if (fl_vec) { ray_release(fl_vec); fl_vec = NULL; }
     ray_enc_buf_free(&fl_buf); fl_buf = (ray_enc_buf_t){0};
     if (fl_dict) { ray_free_raw(fl_dict); fl_dict = NULL; }
     free(fl_mem); fl_mem = NULL;
@@ -580,6 +585,153 @@ static test_result_t test_float_choice(void) {
     PASS();
 }
 
+/* ---- the column writer (Task 4); the round trips decode through the
+ * generation-2 reader, so they first pass with Task 5 ---- */
+static ray_t* f64_col(const double* d, int64_t n) { return ray_vec_from_raw(RAY_F64, d, n); }
+/* Releases the test's column (the teardown releases it on a failed assertion). */
+static void fl_drop(void) { if (fl_vec) { ray_release(fl_vec); fl_vec = NULL; } }
+
+/* The top-level encoding of vector `vec` in a generation-2 file, -1 on a
+ * short file. */
+static int desc_enc(const char* path, int64_t vec) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return -1;
+    uint8_t h[96]; if (fread(h, 1, 96, f) != 96) { fclose(f); return -1; }
+    int64_t c = vec / 64, j = vec % 64;
+    uint64_t off;
+    if (fseek(f, 96 + c * 64, SEEK_SET) != 0 || fread(&off, 8, 1, f) != 1) { fclose(f); return -1; }
+    uint8_t d[48];
+    if (fseek(f, (long)(off + (uint64_t)j * 48), SEEK_SET) != 0) { fclose(f); return -1; }
+    int r = fread(d, 1, 48, f) == 48 ? d[0] : -1;
+    fclose(f);
+    return r;
+}
+
+/* Saves gen 2 (optionally forced), loads, compares the payload bit for bit. */
+static int fl_roundtrip(ray_t* v, int force, const char* path) {
+    ray_encw_test_force(force);
+    ray_err_t e = ray_col_save_gen(v, path, 2);
+    ray_encw_test_force(-1);
+    if (e != RAY_OK) return -1;
+    ray_t* b = ray_col_load(path);
+    if (!b || RAY_IS_ERR(b)) { if (b) ray_error_free(b); return -2; }
+    size_t esz = v->type == RAY_F32 ? 4 : 8;
+    int ok = b->len == v->len && memcmp(ray_data(b), ray_data(v), (size_t)v->len * esz) == 0;
+    ray_release(b);
+    return ok ? 0 : -3;
+}
+
+/* Selection, one shape per vector of chunk 1.  Chunk 0 holds two-decimal
+ * values: the frozen VALUE_DICT covers only them, so it does not apply to
+ * chunk 1, while the frozen ALP candidates (e = 2) do.  A one-chunk column
+ * would let DICT win every vector: a first chunk has at most 65536 distinct
+ * values, so the dictionary always trains (P0 rule). */
+static test_result_t test_encoder_selects(void) {
+    const int64_t base = 65536;
+    static double d[65536 + 5 * 1024];
+    uint64_t s = 9;
+    for (int64_t i = 0; i < base; i++) d[i] = (double)((i * 7919) % 100000) / 100.0;
+    for (int i = 0; i < 1024; i++) d[base + i] = 1.25;                                          /* CONST */
+    for (int i = 0; i < 1024; i++) d[base + 1024 + i] = 5000.0 + (double)(i / 128) * 1.0000001; /* RLE */
+    for (int i = 0; i < 1024; i++) d[base + 2048 + i] = 2000.0 + (double)((i * 7919) % 100000) / 100.0;  /* ALP */
+    for (int i = 0; i < 1024; i++) { s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+                                     d[base + 3072 + i] = 1.0 + (double)(s >> 11) / 9007199254740992.0; }  /* ALP_RD */
+    for (int i = 0; i < 1024; i++) { s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+                                     uint64_t b = s & 0x7FEFFFFFFFFFFFFFull; memcpy(&d[base + 4096 + i], &b, 8); }  /* RAW */
+    fl_vec = f64_col(d, base + 5 * 1024);
+    const char* p = ray_test_tmp(FL_TMP "/sel");
+    TEST_ASSERT_EQ_I(fl_roundtrip(fl_vec, -1, p), 0);
+    TEST_ASSERT_EQ_I(desc_enc(p, 64), RAY_ENC_CONST);
+    TEST_ASSERT_EQ_I(desc_enc(p, 65), RAY_ENC_RLE);
+    TEST_ASSERT_EQ_I(desc_enc(p, 66), RAY_ENC_ALP);
+    TEST_ASSERT_EQ_I(desc_enc(p, 67), RAY_ENC_ALP_RD);
+    TEST_ASSERT_EQ_I(desc_enc(p, 68), RAY_ENC_RAW);
+    fl_drop();
+    PASS();
+}
+
+/* Canonical and non-canonical NaNs with ALP exceptions, in every forced
+ * encoding.  -0.0 is written as its bit pattern (D10). */
+static test_result_t test_nan_payloads(void) {
+    static double d[2048];
+    uint64_t odd = 0x7FF8000000000123ull, neg = 0xFFF8000000000000ull, nz = NEG0_64;
+    for (int i = 0; i < 2048; i++) {
+        d[i] = (double)(i % 50) / 4.0;
+        if (i % 17 == 0) memcpy(&d[i], &nz, 8);           /* ALP exception */
+        if (i % 23 == 0) d[i] = NULL_F64;                 /* canonical null */
+        if (i % 29 == 0) memcpy(&d[i], &odd, 8);          /* trailer */
+        if (i % 31 == 0) memcpy(&d[i], &neg, 8);          /* trailer */
+    }
+    fl_vec = f64_col(d, 2048);
+    fl_vec->attrs |= RAY_ATTR_HAS_NULLS;
+    static const int forces[] = { -1, RAY_ENC_RAW, RAY_ENC_RLE, RAY_ENC_DICT, RAY_ENC_ALP, RAY_ENC_ALP_RD };
+    for (size_t k = 0; k < sizeof forces / sizeof forces[0]; k++)
+        TEST_ASSERT_FMT(fl_roundtrip(fl_vec, forces[k], ray_test_tmp(FL_TMP "/nan")) == 0, "force %d", forces[k]);
+    fl_drop();
+    /* F32: the same with float NaN payloads */
+    static float f[2048];
+    uint32_t fodd = 0x7FC00042u, fnz = (uint32_t)NEG0_32;
+    for (int i = 0; i < 2048; i++) {
+        f[i] = (float)(i % 40) / 8.0f;
+        if (i % 19 == 0) memcpy(&f[i], &fodd, 4);
+        if (i % 21 == 0) f[i] = NULL_F32;
+        if (i % 13 == 0) memcpy(&f[i], &fnz, 4);
+    }
+    fl_vec = ray_vec_from_raw(RAY_F32, f, 2048);
+    fl_vec->attrs |= RAY_ATTR_HAS_NULLS;
+    for (size_t k = 0; k < sizeof forces / sizeof forces[0]; k++)
+        TEST_ASSERT_FMT(fl_roundtrip(fl_vec, forces[k], ray_test_tmp(FL_TMP "/nan32")) == 0, "f32 force %d", forces[k]);
+    fl_drop();
+    /* forced CONST: one value plus canonical and non-canonical NaNs */
+    static double cst[1024];
+    for (int i = 0; i < 1024; i++) {
+        cst[i] = 2.5;
+        if (i % 9 == 0) cst[i] = NULL_F64;
+        if (i % 10 == 3) memcpy(&cst[i], &odd, 8);
+    }
+    fl_vec = f64_col(cst, 1024);
+    fl_vec->attrs |= RAY_ATTR_HAS_NULLS;
+    const char* p = ray_test_tmp(FL_TMP "/nanc");
+    TEST_ASSERT_EQ_I(fl_roundtrip(fl_vec, RAY_ENC_CONST, p), 0);
+    TEST_ASSERT_EQ_I(desc_enc(p, 0), RAY_ENC_CONST);
+    fl_drop();
+    PASS();
+}
+
+/* All-null float vectors at lengths 1, 1023, 1024 stay CONST under any force. */
+static test_result_t test_all_null_floats(void) {
+    static const int lens[] = { 1, 1023, 1024 };
+    const char* p = ray_test_tmp(FL_TMP "/an");
+    for (int t = 0; t < 2; t++)                          /* F64 and F32: every nullable float type */
+        for (int l = 0; l < 3; l++) {
+            int8_t ty = t ? RAY_F32 : RAY_F64;
+            fl_vec = ray_vec_new(ty, lens[l]); fl_vec->len = lens[l];
+            for (int i = 0; i < lens[l]; i++) {
+                if (t) ((float*)ray_data(fl_vec))[i] = NULL_F32; else ((double*)ray_data(fl_vec))[i] = NULL_F64;
+            }
+            fl_vec->attrs |= RAY_ATTR_HAS_NULLS;
+            TEST_ASSERT_EQ_I(fl_roundtrip(fl_vec, RAY_ENC_ALP, p), 0);
+            TEST_ASSERT_EQ_I(desc_enc(p, 0), RAY_ENC_CONST);
+            fl_drop();
+        }
+    PASS();
+}
+
+/* VALUE_DICT and ALP candidates come from the first chunk only, so a
+ * column whose second chunk has new values encodes them otherwise (the
+ * stream writer's agreement is encfloat/stream_equals_resident, Task 7). */
+static test_result_t test_first_chunk_training(void) {
+    int64_t n = 65536 + 4096;
+    fl_vec = ray_vec_new(RAY_F64, n); fl_vec->len = n;
+    for (int64_t i = 0; i < n; i++) ((double*)ray_data(fl_vec))[i] = i < 65536 ? (double)(i % 6) * 0.5 : 1e-7 * (double)i;
+    const char* p = ray_test_tmp(FL_TMP "/tr");
+    TEST_ASSERT_EQ_I(fl_roundtrip(fl_vec, -1, p), 0);
+    TEST_ASSERT_EQ_I(desc_enc(p, 0), RAY_ENC_DICT);
+    TEST_ASSERT_TRUE(desc_enc(p, 64) != RAY_ENC_DICT);
+    fl_drop();
+    PASS();
+}
+
 const test_entry_t encfloat_entries[] = {
     { "encfloat/float_order",      test_float_order,      fl_setup, fl_teardown },
     { "encfloat/float_train_dict", test_float_train_dict, fl_setup, fl_teardown },
@@ -594,5 +746,9 @@ const test_entry_t encfloat_entries[] = {
     { "encfloat/alprd_exceptions", test_alprd_exceptions, fl_setup, fl_teardown },
     { "encfloat/alprd_specials",   test_alprd_specials,   fl_setup, fl_teardown },
     { "encfloat/float_choice",     test_float_choice,     fl_setup, fl_teardown },
+    { "encfloat/encoder_selects",      test_encoder_selects,      fl_setup, fl_teardown },
+    { "encfloat/nan_payloads",         test_nan_payloads,         fl_setup, fl_teardown },
+    { "encfloat/all_null_floats",      test_all_null_floats,      fl_setup, fl_teardown },
+    { "encfloat/first_chunk_training", test_first_chunk_training, fl_setup, fl_teardown },
     { NULL, NULL, NULL, NULL },
 };

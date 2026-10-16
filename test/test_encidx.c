@@ -1755,7 +1755,7 @@ static const char* idx_golden_emit(const char* dir) {
     #define GOLD(name, vec) do { ray_t* gv_ = (vec); snprintf(path, sizeof path, "%s/%s.bin", dir, name); \
         ray_err_t ge_ = gv_ ? ray_col_save_gen(gv_, path, 2) : RAY_ERR_TYPE; \
         if (gv_) ray_release(gv_); \
-        if (ge_ != RAY_OK) { snprintf(why, sizeof why, "%s: %d", name, (int)ge_); return why; } } while (0)
+        if (ge_ != RAY_OK) { ray_encw_test_force(-1); snprintf(why, sizeof why, "%s: %d", name, (int)ge_); return why; } } while (0)
     int64_t a[1000]; for (int i = 0; i < 1000; i++) a[i] = (i * 7919) % 317;
     GOLD("idx_hash_i64", with_index(i64_vec(a, 1000), ray_index_attach_hash));
     ray_t* s = ray_vec_new(RAY_STR, 300);
@@ -1767,7 +1767,9 @@ static const char* idx_golden_emit(const char* dir) {
     int64_t p[1000]; for (int i = 0; i < 1000; i++) p[i] = i / 128 * 3;
     GOLD("idx_part_i64", with_index(i64_vec(p, 1000), ray_index_attach_part));
     double f[8] = { -2.5, -0.0, 0.0, 0.0, 1.5, 1.5, 3.0, 3.0 };
+    ray_encw_test_force(RAY_ENC_RAW);                       /* P5: keep the P4 fixture's column bytes */
     GOLD("idx_part_f64", with_index(ray_vec_from_raw(RAY_F64, f, 8), ray_index_attach_part));
+    ray_encw_test_force(-1);
     ray_t* o = with_index(i64_vec(p, 1000), ray_index_attach_part);
     if (o) ray_index_payload(o->index)->u.part.order_sym = ray_sym_intern("ts", 2);
     GOLD("idx_part_order", o);

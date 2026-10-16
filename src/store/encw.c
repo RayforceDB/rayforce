@@ -40,7 +40,8 @@ static bool canon_matches(void) {
 
 bool ray_encw_type_has_dict(int8_t t) {
     return t == RAY_I16 || t == RAY_I32 || t == RAY_I64 ||
-           t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP;
+           t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP ||
+           t == RAY_F32 || t == RAY_F64;
 }
 
 bool ray_encw_type_summable(int8_t t) {
@@ -117,20 +118,20 @@ out:
     return err;
 }
 
-/* ---- F32 / F64: RAW or CONST, NaN nulls in the bitmap, bit-restore trailer ---- */
-static ray_err_t encw_float(int8_t type, const void* data, int64_t start, int n,
-                            ray_encw_vec_t* o) {
-    if (!canon_matches()) return RAY_ERR_RANGE;
+/* ---- F32 / F64: NaN nulls in the bitmap, bit-restore trailer ---- */
+/* Float fill (spec "Nulls"): bits of rows [start, start+n), NaN rows set in
+ * nullmap and filled with the minimum non-null value's bits (first of
+ * ties), +0.0 when all are null.  Returns the null count; vmin / vmax get
+ * the non-null extrema when has != NULL.  The extrema follow the
+ * generation-0 min/max kernels' rule: strict compare, the first of tied
+ * values wins (so -0.0 vs +0.0 keeps whichever came first).  No NaN is
+ * left in bits, which the float dictionary order requires. */
+static int float_fill(int8_t type, const void* data, int64_t start, int n, uint64_t* bits,
+                      uint8_t* nullmap, double* vmin, double* vmax, bool* has) {
     const bool f32 = type == RAY_F32;
     const size_t esz = f32 ? 4 : 8;
-    const uint64_t canon = f32 ? ENC_F32_CANON : ENC_F64_CANON;
-    uint64_t bits[RAY_ENC_VEC];
-    uint8_t  nullmap[RAY_ENC_VEC / 8];
-    uint16_t tpos[RAY_ENC_VEC];
-    uint64_t traw[RAY_ENC_VEC];
-    int nt = 0;
-    memset(nullmap, 0, sizeof nullmap);
-    double vmin = 0, vmax = 0; bool have = false; uint64_t fill = 0;
+    int nn = 0; bool have = false; double mn = 0, mx = 0; uint64_t fill = 0;
+    memset(nullmap, 0, RAY_ENC_VEC / 8);
     for (int i = 0; i < n; i++) {
         uint64_t b = 0;
         memcpy(&b, (const uint8_t*)data + (size_t)(start + i) * esz, esz);
@@ -138,45 +139,67 @@ static ray_err_t encw_float(int8_t type, const void* data, int64_t start, int n,
         double x;
         if (f32) { float f; uint32_t b32 = (uint32_t)b; memcpy(&f, &b32, 4); x = (double)f; }
         else     memcpy(&x, &b, 8);
-        if (x != x) {                       /* every NaN is a null */
-            nullmap[i >> 3] |= (uint8_t)(1u << (i & 7));
-            o->n_nulls++;
-            if (b != canon) { tpos[nt] = (uint16_t)i; traw[nt] = b; nt++; }
-            continue;
-        }
-        /* The generation-0 min/max kernels' rule: strict compare, the first
-         * of tied values wins (so -0.0 vs +0.0 keeps whichever came first). */
-        if (!have || x < vmin) { vmin = x; fill = b; }
-        if (!have || x > vmax) vmax = x;
+        if (x != x) { nullmap[i >> 3] |= (uint8_t)(1u << (i & 7)); nn++; continue; }   /* every NaN is a null */
+        if (!have || x < mn) { mn = x; fill = b; }
+        if (!have || x > mx) mx = x;
         have = true;
     }
     if (!have) fill = 0;                    /* all null: +0.0 */
-    for (int i = 0; i < n; i++)
-        if ((nullmap[i >> 3] >> (i & 7)) & 1) bits[i] = fill;
-    bool eq = true;
-    for (int i = 1; i < n && eq; i++) if (bits[i] != bits[0]) eq = false;
-    ray_err_t err;
-    uint64_t raw_bytes = ray_enc_pad8((uint64_t)n * esz);
+    for (int i = 0; i < n; i++) if ((nullmap[i >> 3] >> (i & 7)) & 1) bits[i] = fill;
+    if (has) { *has = have; *vmin = mn; *vmax = mx; }
+    return nn;
+}
+
+/* The forced-encoding test hook's ALP on a column whose first chunk trained
+ * no candidate: (e, f) = (0, 0), so every value is an integer or an
+ * exception.  Selection never uses it. */
+static const ray_enc_alp_cands_t g_alp00 = { { { 0, 0 } }, 1 };
+
+static ray_err_t encw_float(int8_t type, const void* data, int64_t start, int n,
+                            const ray_encw_side_t* side, ray_encw_vec_t* o) {
+    if (!canon_matches()) return RAY_ERR_RANGE;
+    const bool f32 = type == RAY_F32;
+    const size_t esz = f32 ? 4 : 8;
+    const int T = f32 ? 32 : 64;
+    const uint64_t canon = f32 ? ENC_F32_CANON : ENC_F64_CANON;
+    const ray_enc_dict_t* dict = side ? side->dict : NULL;
+    const ray_enc_alp_cands_t* alp = side ? side->alp : NULL;
+    uint64_t bits[RAY_ENC_VEC];
+    uint8_t  nullmap[RAY_ENC_VEC / 8];
+    uint16_t tpos[RAY_ENC_VEC];
+    uint64_t traw[RAY_ENC_VEC];
+    int nt = 0;
+    for (int i = 0; i < n; i++) {           /* trailer: non-canonical NaN payloads, before the fill */
+        uint64_t b = 0;
+        memcpy(&b, (const uint8_t*)data + (size_t)(start + i) * esz, esz);
+        double x;
+        if (f32) { float f; uint32_t b32 = (uint32_t)b; memcpy(&f, &b32, 4); x = (double)f; }
+        else     memcpy(&x, &b, 8);
+        if (x != x && b != canon) { tpos[nt] = (uint16_t)i; traw[nt] = b; nt++; }
+    }
+    double vmin = 0, vmax = 0; bool have = false;
+    o->n_nulls = float_fill(type, data, start, n, bits, nullmap, &vmin, &vmax, &have);
     /* The trailer's size counts in every encoding's estimate (spec "Floats"). */
     uint64_t tb = nt ? 8 + ray_enc_pad8(2ull * (uint64_t)nt) + ray_enc_pad8((uint64_t)nt * esz) : 0;
-    int forced = atomic_load(&g_encw_force);
-    bool use_const = o->n_nulls == n ||
-        (forced == RAY_ENC_CONST ? eq
-         : forced == RAY_ENC_RAW ? false
-         : (eq && (8 + tb) * 8 <= (raw_bytes + tb) * 7));
-    if (o->n_nulls < n && forced >= 0 && forced != RAY_ENC_RAW && forced != RAY_ENC_CONST)
-        return RAY_ERR_NYI;
-    if (forced == RAY_ENC_CONST && !use_const) return RAY_ERR_NYI;
+    ray_err_t err;
     if (o->n_nulls > 0 && (err = put(o, nullmap, 128)) != RAY_OK) return err;
-    if (use_const) {
-        o->desc.encoding = RAY_ENC_CONST;
-        if ((err = put(o, &bits[0], esz)) != RAY_OK || (err = pad8(o)) != RAY_OK) return err;
+    ray_enc_choice_t c;
+    int forced = atomic_load(&g_encw_force);
+    if (o->n_nulls == n) {
+        /* Spec "Nulls": an all-null vector is always CONST of the fill (+0.0). */
+        if (!ray_enc_float_write(RAY_ENC_CONST, bits, n, T, NULL, NULL, &o->payload, &c))
+            return o->payload.oom ? RAY_ERR_OOM : RAY_ERR_RANGE;
+    } else if (forced >= 0) {
+        const ray_enc_alp_cands_t* ac = forced == RAY_ENC_ALP && (!alp || alp->n == 0) ? &g_alp00 : alp;
+        if (forced > UINT8_MAX ||
+            !ray_enc_float_write((uint8_t)forced, bits, n, T, dict, ac, &o->payload, &c))
+            return o->payload.oom ? RAY_ERR_OOM : RAY_ERR_NYI;
     } else {
-        o->desc.encoding = RAY_ENC_RAW;
-        for (int i = 0; i < n; i++)
-            if ((err = put(o, &bits[i], esz)) != RAY_OK) return err;
-        if ((err = pad8(o)) != RAY_OK) return err;
+        ray_enc_choice_t want = ray_enc_float_choose(bits, n, T, dict, alp, (int64_t)tb);
+        if (!ray_enc_float_write(want.enc, bits, n, T, dict, alp, &o->payload, &c))
+            return o->payload.oom ? RAY_ERR_OOM : RAY_ERR_RANGE;
     }
+    o->desc.encoding = c.enc;
     if (nt > 0) {
         uint16_t cnt = (uint16_t)nt;
         uint8_t zero6[6] = {0};
@@ -276,8 +299,8 @@ static ray_err_t encw_str(const void* data, const char* pool, int64_t start, int
     return pad8(o);
 }
 
-ray_err_t ray_encw_vec(int8_t type, uint8_t attrs, const void* data, const char* str_pool,
-                       int64_t start, int n, const ray_enc_dict_t* dict, ray_encw_vec_t* o) {
+ray_err_t ray_encw_vec_side(int8_t type, uint8_t attrs, const void* data, const char* str_pool,
+                            int64_t start, int n, const ray_encw_side_t* side, ray_encw_vec_t* o) {
     if (!ray_enc_gen2_supported()) {
         return RAY_ERR_NYI;
     }
@@ -285,13 +308,13 @@ ray_err_t ray_encw_vec(int8_t type, uint8_t attrs, const void* data, const char*
     if (n <= 0 || n > RAY_ENC_VEC) return RAY_ERR_RANGE;
     ray_err_t err;
     switch (type) {
-    case RAY_F32: case RAY_F64: err = encw_float(type, data, start, n, o); break;
+    case RAY_F32: case RAY_F64: err = encw_float(type, data, start, n, side, o); break;
     case RAY_GUID:              err = encw_guid(data, start, n, o); break;
     case RAY_STR:               err = encw_str(data, str_pool, start, n, o); break;
     case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
     case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: case RAY_SYM:
         err = encw_int(type, attrs, data, start, n,
-                       ray_encw_type_has_dict(type) ? dict : NULL, o);
+                       ray_encw_type_has_dict(type) && side ? side->dict : NULL, o);
         break;
     default: return RAY_ERR_NYI;
     }
@@ -300,6 +323,12 @@ ray_err_t ray_encw_vec(int8_t type, uint8_t attrs, const void* data, const char*
     o->desc.n_nulls = (uint16_t)o->n_nulls;
     o->desc.payload_bytes = o->payload.len;
     return RAY_OK;
+}
+
+ray_err_t ray_encw_vec(int8_t type, uint8_t attrs, const void* data, const char* str_pool,
+                       int64_t start, int n, const ray_enc_dict_t* dict, ray_encw_vec_t* out) {
+    ray_encw_side_t side = { dict, NULL };
+    return ray_encw_vec_side(type, attrs, data, str_pool, start, n, &side, out);
 }
 
 static ray_err_t fput(ray_encw_t* w, const void* p, size_t n) {
@@ -353,25 +382,33 @@ void ray_encw_set_index_copy(ray_encw_t* w, uint8_t kind, const uint8_t* region,
 }
 
 /* VALUE_DICT is trained on the column's first chunk and frozen (spec
- * "Encoding selection"): the filled T-bit values of every vector. */
+ * "Encoding selection"): the filled T-bit values of every vector.  Float
+ * columns go through float_fill, so no NaN reaches the dictionary, and
+ * train their ALP candidates from the same values. */
 static ray_err_t train_dict(ray_encw_t* w, const void* data, int64_t n) {
     ray_enc_kind_t k;
-    if (!ray_enc_kind_of(w->type, w->attrs, &k)) return RAY_OK;
+    if (!ray_enc_value_kind(w->type, w->attrs, &k)) return RAY_OK;
     uint64_t* all = ray_alloc_raw((size_t)n * sizeof(uint64_t));
-    ray_enc_input_t* in = ray_alloc_raw(sizeof *in);
-    if (!all || !in) { ray_free_raw(all); ray_free_raw(in); return RAY_ERR_OOM; }
+    ray_enc_input_t* in = k.is_float ? NULL : ray_alloc_raw(sizeof *in);
+    if (!all || (!k.is_float && !in)) { ray_free_raw(all); ray_free_raw(in); return RAY_ERR_OOM; }
     for (int64_t s = 0; s < n; s += RAY_ENC_VEC) {
         int vn = (int)(n - s < RAY_ENC_VEC ? n - s : RAY_ENC_VEC);
-        if (!ray_enc_load(data, w->type, w->attrs, s, vn, in)) {
-            ray_free_raw(all); ray_free_raw(in);
-            return RAY_ERR_RANGE;
+        if (k.is_float) {
+            uint8_t nm[RAY_ENC_VEC / 8];
+            (void)float_fill(w->type, data, s, vn, all + s, nm, NULL, NULL, NULL);
+        } else {
+            if (!ray_enc_load(data, w->type, w->attrs, s, vn, in)) {
+                ray_free_raw(all); ray_free_raw(in);
+                return RAY_ERR_RANGE;
+            }
+            memcpy(all + s, in->bits, (size_t)vn * sizeof(uint64_t));
         }
-        memcpy(all + s, in->bits, (size_t)vn * sizeof(uint64_t));
     }
     /* P0 final-review ruling: train_dict returns 1 trained, 0 no dictionary
      * (empty or more than 1<<16 distinct), -1 out of memory; OOM fails the
      * save so resident and streamed saves never diverge silently. */
     int tr = ray_enc_train_dict(all, n, k, &w->dict_v, &w->dict_n);
+    if (k.is_float) ray_enc_alp_train(all, n, k.T, &w->alp);
     ray_free_raw(all); ray_free_raw(in);
     if (tr < 0) return RAY_ERR_OOM;
     if (tr == 0) { w->dict_v = NULL; w->dict_n = 0; }
@@ -394,8 +431,8 @@ static ray_err_t encw_chunk_body(ray_encw_t* w, const void* data, const char* st
     int64_t nv = (n + RAY_ENC_VEC - 1) / RAY_ENC_VEC;
     for (int64_t j = 0; j < nv; j++) {
         int vn = (int)(n - j * RAY_ENC_VEC < RAY_ENC_VEC ? n - j * RAY_ENC_VEC : RAY_ENC_VEC);
-        err = ray_encw_vec(w->type, w->attrs, data, str_pool, j * RAY_ENC_VEC, vn,
-                           w->dict_n ? &dict : NULL, &w->vec);
+        ray_encw_side_t side = { w->dict_n ? &dict : NULL, w->alp.n ? &w->alp : NULL };
+        err = ray_encw_vec_side(w->type, w->attrs, data, str_pool, j * RAY_ENC_VEC, vn, &side, &w->vec);
         if (err != RAY_OK) return err;
         ray_enc_desc_t desc = w->vec.desc;
         desc.payload_off = w->chunk.len;
@@ -473,8 +510,8 @@ ray_err_t ray_encw_finish(ray_encw_t* w) {
     uint64_t side_off = 0, side_len = 0;
     if (w->dict_used) {
         ray_enc_kind_t k;
-        (void)ray_enc_kind_of(w->type, w->attrs, &k);
-        size_t esz = (size_t)k.T / 8;
+        if (!ray_enc_value_kind(w->type, w->attrs, &k)) return RAY_ERR_RANGE;
+        size_t esz = (size_t)k.T / 8;                   /* F32 4 bytes, F64 8 */
         uint64_t ebytes = 8 + ray_enc_pad8((uint64_t)w->dict_n * esz);
         side_off = ray_enc_pad32(w->pos);
         if ((err = fput(w, NULL, (size_t)(side_off - w->pos))) != RAY_OK) return err;

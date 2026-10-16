@@ -39,8 +39,18 @@ typedef struct {
     uint64_t       str_pooled;
 } ray_encw_vec_t;
 
+/* Column-level structures trained on the first chunk (spec "Encoding
+ * selection"); every field may be NULL. */
+typedef struct {
+    const ray_enc_dict_t*      dict;   /* VALUE_DICT: integer, temporal, F32, F64 */
+    const ray_enc_alp_cands_t* alp;    /* ALP candidates: F32, F64 */
+} ray_encw_side_t;
+
 void      ray_encw_vec_init(ray_encw_vec_t* v);
 void      ray_encw_vec_free(ray_encw_vec_t* v);
+ray_err_t ray_encw_vec_side(int8_t type, uint8_t attrs, const void* data, const char* str_pool,
+                            int64_t start, int n, const ray_encw_side_t* side, ray_encw_vec_t* out);
+/* ray_encw_vec_side with { dict, NULL }: no ALP candidates. */
 ray_err_t ray_encw_vec(int8_t type, uint8_t attrs, const void* data, const char* str_pool,
                        int64_t start, int n, const ray_enc_dict_t* dict, ray_encw_vec_t* out);
 bool      ray_encw_type_has_dict(int8_t type);
@@ -48,8 +58,9 @@ bool      ray_encw_type_summable(int8_t type);
 bool      ray_encw_type_supported(int8_t type);
 /* Test hook: every following vector uses top-level encoding `enc` where it
  * is legal for the type and applicable to the values (all-null vectors stay
- * CONST); -1 restores selection.  A forced encoding that is not applicable
- * fails the vector with RAY_ERR_NYI. */
+ * CONST; floats take RAW, CONST, RLE, DICT, ALP and ALP_RD); -1 restores
+ * selection.  A forced encoding that is not applicable fails the vector
+ * with RAY_ERR_NYI. */
 void      ray_encw_test_force(int enc);
 
 /* Column assembly (spec "Format"): begin, one chunk per 65536 rows, finish. */
@@ -71,6 +82,7 @@ typedef struct {
     ray_encw_vec_t vec;
     ray_enc_idx_src_t idx; bool has_idx;              /* region from a heap root */
     const uint8_t* idx_copy; uint64_t idx_copy_len;   /* region copied verbatim */
+    ray_enc_alp_cands_t alp;   /* F32 / F64 ALP candidates from chunk 0 (n == 0: none) */
 } ray_encw_t;
 ray_err_t ray_encw_begin(ray_encw_t* w, FILE* f, int8_t type, uint8_t attrs, int64_t len,
                          uint32_t sym_count, uint8_t index_kind, uint8_t col_flags);
