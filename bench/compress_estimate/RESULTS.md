@@ -2937,3 +2937,269 @@ The strict line's failing clauses, by ruling:
 - gen-0 parted and ragged warm (Task 10's parted stage; Ruling 10-5,
   accepted).
 
+
+## P5 float encodings (float store derived from the 10M splayed store, release build, commit f41e6c99)
+
+Driver: `W=/home/hetoku/data/tmp/p5_bench bench/compress_estimate/p5_bench.sh`
+(prep / enc / ident / warm / cold / savet 13:07-13:16; a second prep / ident /
+wall pass 15:00-15:05 after the P2/P3 rerun, with full-precision answers).
+Binary: f41e6c99 release (sha256 4980fe53bf93; the scripts are the only
+change in this commit); BASE for the writer cost: 81c04acb (3073a046ace1).
+The store: five F64 columns and one F32 computed from ResolutionWidth,
+ClientIP, SendTiming, RegionID, EventTime of `/skull/clickbench/rfsplayed`
+(9 999 505 rows), plus IsRefresh as the group key; g0 / g2 saved, measured,
+deleted.  9 warm rounds alternated, 3 cold trials (per-file eviction), the
+load average checked before each round (4 waits, logged).  Raw data:
+/home/hetoku/data/tmp/p5_bench/p5.tsv, summary.txt beside it.
+
+```
+| column | encoded B | raw B | ratio | mix |
+|---|---|---|---|---|
+| price | 8598264 | 79996040 | 9.30x | {const:331 rle:4571 dict:2570 alp:2294} |
+| ratio | 17432608 | 79996040 | 4.59x | {raw:159 const:3 rle:9535 dict:64 alp_rd:5} |
+| sendt | 1169256 | 79996040 | 68.42x | {const:9185 alp:581} |
+| level | 11663056 | 79996040 | 6.86x | {const:3 rle:7290 dict:323 alp:2150} |
+| ts | 34648152 | 79996040 | 2.31x | {raw:1 dict:64 alp:9701} |
+| f32 | 8284320 | 39998020 | 4.83x | {const:331 rle:8923 dict:17 alp:495} |
+| refresh | 1755280 | 19999010 | 11.39x | {const:5 for_bp:8347 rle:1414} |
+
+| column | type | vectors | ALP vecs | ALP exc / rows | ALP (e,f) | ALP_RD vecs | ALP_RD exc / rows | DICT vecs | DICT w/ RAW codes (last vec) | trailers |
+|---|---|---|---|---|---|---|---|---|---|---|
+| f32 | F32 | 9766 | 495 | 0 / 506880 (0.00%) | (4,1)x495 | 0 | - | 17 | 0 (0) | 0 |
+| level | F64 | 9766 | 2150 | 0 / 2201600 (0.00%) | (0,0)x2150 | 0 | - | 323 | 0 (0) | 0 |
+| price | F64 | 9766 | 2294 | 0 / 2349056 (0.00%) | (14,12)x2294 | 0 | - | 2570 | 0 (0) | 0 |
+| ratio | F64 | 9766 | 0 | - | - | 5 | 92 / 5120 (1.80%) | 64 | 0 (0) | 0 |
+| refresh | 3 | 9766 | 0 | - | - | 0 | - | 0 | 0 (0) | 0 |
+| sendt | F64 | 9766 | 581 | 59851 / 594944 (10.06%) | (0,0)x581 | 0 | - | 0 | 0 (0) | 0 |
+| ts | F64 | 9766 | 9701 | 0 / 9933824 (0.00%) | (0,0)x9701 | 0 | - | 64 | 0 (0) | 0 |
+
+store: g0 459997072 B, g2 83551112 B (x0.182); save g0 1384 ms, g2 50932 ms (prep, one run)
+
+| writer (O5) | save g0 ms | save g2 ms | g2 / g0 | runs |
+|---|---|---|---|---|
+| p5 | 1320 | 50596 | 38.323 | 3 |
+| base | 1611 | 2436 | 1.512 | 3 |
+
+save g2 p5 / base: 20.766; save g0 p5 / base: 0.819
+g2 store bytes: p5 83551112, base 365338960; g0: p5 459997072, base 459997072
+
+| query | warm g0 | warm g2 | ratio | first g0 | first g2 | cold g0 | cold g2 | ratio | answers |
+|---|---|---|---|---|---|---|---|---|---|
+| q0 | 0.00 | 11.93 | 24242.886 | 0.02 | 16.22 | 0.0 | 22.5 | 1055.678 | DIFF (g0 drifts against itself too) |
+| q1 | 0.00 | 8.12 | 15735.291 | 0.02 | 11.99 | 0.0 | 12.6 | 752.185 | DIFF |
+| q2 | 0.00 | 0.00 | 0.886 | 0.01 | 0.03 | 0.0 | 0.0 | 2.674 | same |
+| q3 | 0.00 | 0.00 | 0.939 | 0.01 | 0.03 | 0.0 | 0.0 | 3.063 | same |
+| q4 | 7.07 | 12.78 | 1.807 | 20.85 | 24.87 | 177.7 | 31.4 | 0.177 | same |
+| q5 | 3.32 | 6.29 | 1.897 | 9.41 | 11.18 | 153.2 | 25.8 | 0.169 | same |
+| q6 | 6.56 | 8.54 | 1.302 | 13.10 | 13.42 | 169.5 | 38.4 | 0.226 | same |
+| q7 | 5.50 | 1.77 | 0.321 | 11.37 | 6.08 | 158.6 | 6.7 | 0.042 | same |
+| q8 | 7.57 | 19.04 | 2.516 | 9.76 | 20.78 | 203.9 | 29.0 | 0.142 | same |
+| q9 | 16.58 | 16.65 | 1.004 | 18.69 | 35.96 | 165.4 | 38.4 | 0.232 | same |
+
+| query | wall g0 ms/call | wall g2 ms/call | ratio |
+|---|---|---|---|
+| q0 | 2.96 | 12.09 | 4.084 |
+| q1 | 2.98 | 8.23 | 2.766 |
+| q2 | 0.00 | 0.00 | 2.000 |
+| q3 | 0.00 | 0.00 | 0.333 |
+| q4 | 7.07 | 12.93 | 1.829 |
+| q5 | 3.32 | 6.35 | 1.911 |
+| q6 | 6.59 | 8.41 | 1.276 |
+| q7 | 5.58 | 1.80 | 0.323 |
+| q8 | 7.74 | 18.53 | 2.394 |
+| q9 | 16.86 | 16.86 | 1.000 |
+
+load waits: 4 (13:10:24/1.79, 15:03:22/2.26, 15:04:07/2.92, 15:04:37/1.77)
+
+**P5 float store, answers g2 = g0: FAIL**
+**P5 float store, scan-only warm (no regression, <= 1.05 per query): FAIL** (worst 24242.886)
+```
+
+Reading the float-store table:
+- **Answers FAIL is #744, not P5.**  q2-q9 are equal byte for byte.  q0
+  (`sum price`) and q1 (`avg sendt`) differ only in the last digits, and the
+  values are nondeterministic run to run.  Eight runs each (full precision,
+  /home/hetoku/data/tmp/p5/recheck/drift744.txt):
+  - `sum price` gives 7 distinct values on g0 and 8 on g2, all within
+    150873431.4403-.4406;
+  - `avg sendt` is stable on g0 in this sample (one other run gave
+    ...13067), and gives 7 distinct values on g2.
+
+  This is the unordered parallel float fold that dev's #744 fixes.  Gen 2's
+  `reduce_src_walk` needs the same chunk-ordered fold at the dev merge
+  (already carried).  The first pass printed 6 digits and showed "same" for
+  all 10 queries; the driver now writes scalars through `.csv.write`.
+- **Scan-only warm FAIL is real and goes to the controller.**  `(timeit q)` on
+  a plain generation-0 vector reports a top-level reduction as ~0 ms (q0, q1,
+  0.00 ms warm, 0.02 ms first).  The `wall` table is the honest per-call cost
+  (process wall time over 100 calls).  On it, g2 is 4.08x on q0, 2.77x on q1,
+  1.8-1.9x on q4 / q5, 1.28x on q6 and 2.39x on q8.  q7 is 0.32x (CONST /
+  statistics), and q2 / q3 / q9 are at parity or answered from statistics.
+  Profile (`perf record`, release binary, 150 calls per query):
+  - g2 time is in the decode: `dec_floats` 25-73%, `read_body`, `ray_enc_unpack`;
+  - the filters spend 6-16% in `ray_enc_eval_cmp_f64`;
+  - g0 is `reduce_range_raw` / `expr_eval_morsel` only.
+
+  `dec_floats` decodes every float vector into a bits buffer, then runs a
+  scalar per-row loop over it: the bitmap, the NaN check, the statistics
+  bound check and the copy.  The sums cannot use views (float sums decode,
+  bit-identical; Task 7).  So every sum, avg, filter and group over a float
+  column pays a full decode of about 1 ns per row, on top of the scan.
+- **O5, the writer cost.**  Medians of 3 alternated rounds; the table holds
+  six float columns and one I16:
+
+  | writer | g0 save | g2 save |
+  |---|---|---|
+  | f41e6c99 | 1.32 s | 50.6 s |
+  | BASE 81c04acb | 1.61 s | 2.44 s |
+
+  So g2 saves 20.8x slower than at BASE, and the g2 store is 4.4x smaller
+  (83.6 MB against 365.3 MB).  Per column, each float column takes 6.8-10.0 s
+  and the I16 0.92 s.  Profile of one F64 column's save:
+  - 61% `alprd_best` → `alprd_plan_rb`: 16 `qsort` calls of 1024 `u16` per
+    vector, through glibc's merge sort with a comparison callback;
+  - 24% `enc_size` / `ray_enc_stats` (`ray_enc_lt`), the candidate sizing.
+
+  The 16 ALP_RD trials run for every vector, even where ALP or DICT wins.
+  Sorting the left parts once at the widest split and reading every
+  narrower split from that sorted array (a prefix order) would remove 15
+  of the 16 sorts.  A counting pass would remove the sort altogether.
+  Post-spec tuning; recorded, not changed here.
+- **O1, the ALP sampler.**
+  - sendt (SendTiming / 1000) trained (0,0), because most sampled rows of
+    chunk 0 are integers (0.0).  Its 581 ALP vectors carry 59 851 exceptions
+    over 594 944 rows: 10.06%, about 600 KB of the column's 1.17 MB.
+    (3,0) would have none.
+  - price (14,12), level (0,0), ts (0,0) and the F32 column (4,1) have 0
+    exceptions.
+  - ratio is 5 ALP_RD vectors at 1.80% exceptions; the rest of it is RLE.
+
+  The sampler weakness seen in Tasks 2, 5 and 7 therefore shows on real data
+  whenever chunk 0 is mostly integral.  Recommendation (post-spec): sample
+  from the non-CONST vectors of the chunk, or with an odd stride / offset.
+  Or re-train a vector whose exception rate passes a bound against its own
+  sample, and add the result to the candidates.  The negative check in
+  `encfloat/first_chunk_training` (an alone-trained (e, f) outside the
+  chunk-0 candidates) depends on today's sampler.  A comment there now says
+  so; re-derive it if the sampler is tuned.
+- **The short float DICT tail.**  0 of 3 038 DICT vectors in the store have
+  RAW codes, and no column's last (145-row) vector is DICT.  The case
+  (Task 6 Minor 4) did not occur on this data.
+- #850 does not bear on these numbers.  The derived values come from integer
+  columns by division in the engine (no `0.0` literal is parsed into data),
+  and ident compares two stores written by the same release binary.
+
+Step 1, the gate runs (logs under /home/hetoku/data/tmp/p5/):
+
+| run | result | runtime errors |
+|---|---|---|
+| debug `encfloat/`, default cores (2) | 35/35, 0 failed | 0 |
+| debug `encfloat/`, `TEST_CORES=0` | 35/35 | 0 |
+| debug `encfloat/`, `TEST_CORES=8` | 35/35 | 0 |
+| debug full suite | 5964/5964 | 0 |
+| debug `equiv/` | 1179/1179 | 0 |
+| release FP profile `encfloat/` (incl. `sweep_bit_exact`) | 35/35 | - |
+| release FP profile `encfmt/golden` | 4/4 | - |
+| release FP profile `idxval/golden` | 3/3 | - |
+| informational (O3), release FP profile `aware/` | 94/94 | - |
+| informational (O3), release FP profile `idxval/` | 69/69 | - |
+
+- Sweep: 480 saves (2 widths x 6 shapes x 8 lengths x 5 forced encodings),
+  NaN payloads and both zeros included, bit-exact (`encfloat/sweep_bit_exact`),
+  in the debug build at cores 0 / 2 / 8 and in the release FP profile
+  (`make test-release`).  The data is built in C with the zeros as bit
+  patterns (D10).
+- Codec object flags.  Every line ends with the strict group
+  `-fno-fast-math -fno-unsafe-math-optimizations -fno-associative-math
+  -fno-reciprocal-math -fsigned-zeros -ffp-contract=off`.  The flags that
+  come before it:
+  - `enc_alp.o` (debug): `-g -O0 -march=native -DDEBUG -fsanitize=address,undefined ...`;
+  - `enc_alp.rel.o`: `-O3 -march=native -funroll-loops -fomit-frame-pointer
+    -fno-math-errno -falign-functions=64 -fassociative-math -ffp-contract=fast
+    -fno-signed-zeros -fno-trapping-math`;
+  - `enc_alp.hard.o`: `-O3 -march=native -g -fno-omit-frame-pointer
+    -DRAY_HARDENED -funroll-loops -fno-math-errno -fassociative-math
+    -ffp-contract=fast -fno-signed-zeros -fno-trapping-math -falign-functions=64`;
+  - `enc_alp.reltest.o`: the release flags plus `-DDEBUG`.
+
+  The full lines are in `cl-*.txt` beside the logs.  FMA instructions in
+  `enc_alp.rel.o`: 0 (and 0 in `enc_alp.hard.o`).
+- Cross-binary check: the release and debug `./rayforce` write
+  byte-identical float column files.  `cmp` gives same for price, ratio,
+  sendt, level and f32 on the 1M-row table, with mixes ALP (14,12) / DICT,
+  ALP_RD (3 647 exceptions), DICT, RLE / CONST, DICT.  Each binary reads
+  each store with identical output: the four md5s are 1b4695e0.  The
+  printed sums carry 6 digits.
+- Informational, release FP profile (O3): `aware/` 94/94 and `idxval/`
+  69/69.  Nothing goes to the final-review watch.
+- PR notes:
+  - D8: the ALP_RD exception code is 0, a spec clarification;
+  - the WASM golden run was not run (ruling; no float wire struct added);
+  - the P2 64 KB float scratch is unchanged.
+
+### P2/P3 driver rerun against BASE 81c04acb (I8)
+
+`W=/home/hetoku/data/tmp/p2_bench BASE=81c04acb p2_bench.sh prep` (13:25-13:28),
+`splayed` (13:28-13:59), `parted` (13:59-15:00).  P5 binary f41e6c99
+(4980fe53bf93), base 81c04acb (3073a046ace1).  The previous data in that
+directory (P4's final rerun) moved to `old_p4final_20261015/`.
+`p3_summary.py` is unchanged.  Raw data:
+/home/hetoku/data/tmp/p2_bench/p2.tsv and summary.txt.
+
+```
+totals over all 43: warm 1705.9 vs 1644.7 (0.964); first run 2522.7 vs 2713.4 (1.076); 3-run 5996.4 vs 6092.4 (1.016)
+answer_mismatches none
+scan_only(gated) n=28; gmeans over base>=1ms (per column): warm n=22 0.588, first n=23 0.707, cold n=23 0.338; worst warm=1.241
+scan_only_list_but_materializing none
+worst5 warm [(1.241, 'q5'), (1.179, 'q6'), (1.109, 'q7'), (1.068, 'q4'), (1.068, 'q33')]
+totals over all 43: warm 4625.0 vs 2875.6 (0.622); first run 16086.7 vs 13743.0 (0.854); 3-run 25520.0 vs 19602.9 (0.768)
+answer_mismatches none
+scan_only(gated) n=34; gmeans over base>=1ms (per column): warm n=33 0.179, first n=33 0.251, cold n=33 0.144; worst warm=1.027
+scan_only_list_but_materializing none
+worst5 warm [(1.027, 'q33'), (1.013, 'q15'), (1.007, 'q32'), (1.007, 'q29'), (1.007, 'q13')]
+totals over all 43: warm 1706.1 vs 1705.8 (1.000); first run 2530.0 vs 2532.6 (1.001); 3-run 6001.3 vs 6031.9 (1.005)
+answer_mismatches none
+gen0 warm_gmean(base>=1ms n=35)=0.998 warm_worst=1.073 worst5 [(1.073, 'q27'), (1.032, 'q7'), (1.024, 'q30'), (1.02, 'q1'), (1.019, 'q5')]
+totals over all 43: warm 4635.3 vs 4636.9 (1.000); first run 16037.0 vs 16116.2 (1.005); 3-run 25492.0 vs 25536.2 (1.002)
+answer_mismatches none
+gen0 warm_gmean(base>=1ms n=42)=0.999 warm_worst=1.036 worst5 [(1.036, 'q1'), (1.008, 'q33'), (1.008, 'q30'), (1.007, 'q19'), (1.007, 'q18')]
+q16 first run base 97.9 ms, p2 99.1 ms (carry 2)
+totals over all 43: warm 4387.9 vs 4390.5 (1.001); first run 15795.6 vs 15839.8 (1.003); 3-run 24713.9 vs 24767.2 (1.002)
+answer_mismatches none
+gen0 warm_gmean(base>=1ms n=42)=0.999 warm_worst=1.014 worst5 [(1.014, 'q31'), (1.01, 'q4'), (1.009, 'q5'), (1.009, 'q30'), (1.009, 'q12')]
+enc A: columns with DELTA vectors: ['UserID {raw:76 const:3 delta_bp:97 rle:9526 dict:64}]
+enc B: columns with DELTA vectors: ['UserID {raw:75 const:3 delta_bp:89 rle:8963 dict:640}]
+sizes {('A', 'g0'): 5948677939, ('A', 'g2'): 3216455899, ('B', 'p0'): 4807844987, ('B', 'p2'): 2072366907}  peak_rss_kb {('A', 'g0'): 5112180, ('A', 'g2'): 5966708, ('B', 'p0'): 12160960, ('B', 'p2'): 11981660}  evict_modes fadvise  ragged_partition ['9', '40']  meta {'p2': ['f41e6c99', '4980fe53bf93'], 'base': ['81c04acb', '3073a046ace1']}
+GATE (strict) splayed[answers=PASS warm=FAIL cold=PASS first=PASS materializing_warm=PASS no_unexpected_materialization=PASS first_total=PASS] parted[answers=PASS warm=PASS cold=PASS first=PASS materializing_warm=PASS no_unexpected_materialization=PASS] gen0-splayed[answers=PASS warm=FAIL] gen0-parted[answers=PASS warm=PASS q16_first=FAIL] gen0-ragged[answers=PASS warm=PASS]
+P2 GATE (strict): FAIL
+GATE (P3-exempt) splayed[answers=PASS warm=FAIL cold=PASS first=PASS materializing_warm=PASS no_unexpected_materialization=PASS first_total=PASS] parted[answers=PASS warm=PASS cold=PASS first=PASS materializing_warm=PASS no_unexpected_materialization=PASS] gen0-splayed[answers=PASS warm=FAIL] gen0-parted[answers=PASS warm=PASS q16_first=FAIL] gen0-ragged[answers=PASS warm=PASS]
+P2 GATE (P3-exempt): FAIL
+p3_unexpected_materializations none
+rss A: 5112180 -> 5966708 kB (x1.167 over all 43, bound 1.1)
+rss A without D2 q41,q42: 5070228 -> 5042840 kB (x0.995, bound 1.1, gated)
+rss B: 12160960 -> 11981660 kB (x0.985 over all 43, bound 1.1)
+P3GATE p2_strict=FAIL materialization=PASS rss=PASS
+P3 GATE: FAIL
+```
+
+**P2/P3 rerun strict line: FAIL by the letter (`P2 GATE (strict): FAIL`,
+`P3 GATE: FAIL` through `p2_strict`).  Every failing clause is one P4 ruled,
+at the same size.**  Materialization PASS, RSS PASS, and answers PASS on
+every arm.  Sizes are byte-identical to P4's rerun (A g0 5 948 677 939,
+g2 3 216 455 899; B p0 4 807 844 987, p2 2 072 366 907): the ClickBench
+store has no float column.
+
+1. **Splayed warm (A), q33 1.068.**  P4's rerun gave 1.068 too (Ruling
+   10-7, post-spec tuning).  q4-q7 above 1.05 are 0.00 ms rows under the
+   sub-ms floor.
+2. **Gen-0 splayed warm (C0), q27 1.073**, from 0.92 to 0.98 ms, a gap of
+   0.06 ms over the 0.05 ms floor (Ruling 14-8's class; P4 had q25 / q27).
+   Recheck: 12 alternated processes, 10 warm runs each, on a fresh g0 copy:
+   base 1.020 ms, P5 1.004 ms, ratio 0.985
+   (/home/hetoku/data/tmp/p5/recheck/q27.txt).  The gmean is 0.998.
+3. **Gen-0 parted q16_first**: P5 99.1 ms against base 97.9 ms (1.013).  The
+   clause requires P5 to be strictly below base, and P4 accepted the same
+   clause (Ruling 10-5).  Gen-0 parted warm passes this time (gmean 0.999,
+   worst 1.036 for q1), and so does ragged (0.999, worst 1.014).
+
+**P5 gate (float round trip bit-exact, NaN payloads included): PASS**

@@ -794,6 +794,9 @@ static test_result_t test_first_chunk_training(void) {
     TEST_ASSERT_EQ_I(fl_roundtrip(fl_vec, RAY_ENC_ALP, p), 0);        /* alone, DICT would win */
     TEST_ASSERT_EQ_I(desc_enc(p, 0), RAY_ENC_ALP);
     int efa = fl_alp_ef(p, 0, 0);
+    /* Sampler-dependent: training samples every 32nd row of the first
+     * chunk, so this negative check holds for today's sampler only.  If the
+     * sampling is tuned (P5 Task 8, O1), re-derive it. */
     TEST_ASSERT_FMT(!fl_cands_have(&c0, efa), "alone (e, f) = (%d, %d) is also a chunk-0 candidate", efa >> 8, efa & 255);
     fl_drop();
     /* An F32 VALUE_DICT has 4-byte elements, in dictionary order:
@@ -1954,6 +1957,58 @@ static test_result_t test_part_zero_sign(void) {
     PASS();
 }
 
+/* The P5 exit gate: every shape x length x forced encoding x width, NaN
+ * payloads and both zeros included, saved and loaded bit-exact. */
+static void sweep_fill(int shape, int8_t type, int64_t n, void* out) {
+    uint64_t s = 0x9E3779B97F4A7C15ull + (uint64_t)shape;
+    for (int64_t i = 0; i < n; i++) {
+        s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+        double x;
+        switch (shape) {
+        case 0: x = (double)(s % 100000) / 100.0; break;                       /* decimals */
+        case 1: x = 1.0 + (double)(s >> 11) / 9007199254740992.0; break;       /* [1, 2) */
+        case 2: x = (double)(i / 300); break;                                  /* runs */
+        case 3: { static const uint64_t dv[5] = { 0xC00C000000000000ull, 0x8000000000000000ull, 0,   /* -3.5, -0.0, +0.0 */
+                                                  0x4002000000000000ull, 0x7E37E43C8800759Cull }; /* 2.25, 1e300 (bits, D10) */
+                  memcpy(&x, &dv[s % 5], 8); break; }
+        case 4: { uint64_t b = s & 0x7FEFFFFFFFFFFFFFull; memcpy(&x, &b, 8); break; } /* random bits */
+        default: x = 7.75; break;                                               /* constant */
+        }
+        if (s % 41 == 0) x = NULL_F64;
+        if (s % 53 == 0) { uint64_t b = 0x7FF8000000000000ull | (s & 0xFFFF) | 1; memcpy(&x, &b, 8); }
+        if (s % 59 == 0) { uint64_t b = 0x8000000000000000ull; memcpy(&x, &b, 8); }   /* -0.0 by bits (D10) */
+        if (type == RAY_F64) memcpy((uint8_t*)out + i * 8, &x, 8);
+        else {
+            float f = (float)x;
+            if (x != x) { uint32_t b = 0x7FC00000u | (uint32_t)(s & 0x3FF) | 1; memcpy(&f, &b, 4); }
+            memcpy((uint8_t*)out + i * 4, &f, 4);
+        }
+    }
+}
+
+static test_result_t test_sweep_bit_exact(void) {
+    static const int64_t lens[] = { 0, 1, 1023, 1024, 1025, 65535, 65536, 65537 };   /* spec: lengths 0 .. 65537 */
+    static const int forces[] = { -1, RAY_ENC_RAW, RAY_ENC_RLE, RAY_ENC_ALP, RAY_ENC_ALP_RD };
+    static const int8_t types[] = { RAY_F64, RAY_F32 };
+    const char* p = ray_test_tmp(FL_TMP "/sw");
+    int runs = 0;
+    for (size_t t = 0; t < 2; t++)
+        for (int shape = 0; shape < 6; shape++)
+            for (size_t l = 0; l < sizeof lens / sizeof lens[0]; l++) {
+                fl_vec = ray_vec_new(types[t], lens[l]); fl_vec->len = lens[l];
+                sweep_fill(shape, types[t], lens[l], ray_data(fl_vec));
+                fl_vec->attrs |= RAY_ATTR_HAS_NULLS;
+                for (size_t k = 0; k < sizeof forces / sizeof forces[0]; k++) {
+                    int r = fl_roundtrip(fl_vec, forces[k], p);
+                    TEST_ASSERT_FMT(r == 0, "type %d shape %d len %lld force %d: %d", types[t], shape, (long long)lens[l], forces[k], r);
+                    runs++;
+                }
+                fl_drop();
+            }
+    TEST_ASSERT_EQ_I(runs, 2 * 6 * 8 * 5);
+    PASS();
+}
+
 const test_entry_t encfloat_entries[] = {
     { "encfloat/float_order",      test_float_order,      fl_setup, fl_teardown },
     { "encfloat/float_train_dict", test_float_train_dict, fl_setup, fl_teardown },
@@ -1989,5 +2044,6 @@ const test_entry_t encfloat_entries[] = {
     { "encfloat/depth_bound",          test_depth_bound,          fl_setup,    fl_teardown },
     { "encfloat/no_materialization",   test_no_materialization,   fl_rt_setup, fl_rt_teardown },
     { "encfloat/part_zero_sign",       test_part_zero_sign,       fl_rt_setup, fl_rt_teardown },
+    { "encfloat/sweep_bit_exact",      test_sweep_bit_exact,      fl_setup,    fl_teardown },
     { NULL, NULL, NULL, NULL },
 };
