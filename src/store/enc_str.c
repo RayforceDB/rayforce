@@ -72,6 +72,12 @@ int64_t ray_enc_fsst_size(const uint64_t* clen, int n, uint64_t total) {
 bool ray_enc_fsst_write(const uint64_t* clen, int n, const uint8_t* bytes, uint64_t total,
                         ray_enc_buf_t* out) {
     if (n < 0 || n > RAY_ENC_VEC || total > SIZE_MAX - 8) return false;
+    uint64_t sum = 0;                       /* total is the lengths' sum (each U32, n <= 1024) */
+    for (int i = 0; i < n; i++) {
+        if (clen[i] > UINT32_MAX) return false;
+        sum += clen[i];
+    }
+    if (sum != total) return false;
     size_t at = out->len;
     ray_enc_choice_t c;
     if (ray_enc_write(clen, n, K_U32, RAY_ENC_SLOT_FSST_LENGTHS, 1, NULL, out, &c) &&
@@ -84,6 +90,7 @@ bool ray_enc_fsst_write(const uint64_t* clen, int n, const uint8_t* bytes, uint6
 
 int64_t ray_enc_fsst_check(const uint8_t* p, size_t avail, int n, const ray_fsst_table_t* t,
                            uint64_t* clen, uint64_t* xlen, const uint8_t** bytes) {
+    if (n < 0 || n > RAY_ENC_VEC) return ray_enc_read_fail("FSST vector length");
     int64_t a = ray_enc_read(p, avail, 0, 0, n, K_U32, RAY_ENC_SLOT_FSST_LENGTHS, 1, NULL, clen);
     if (a < 0) return -1;                                       /* the child reader named it */
     size_t rest = avail - (size_t)a;

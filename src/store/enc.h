@@ -189,7 +189,8 @@ int64_t ray_enc_alp_read(const uint8_t* p, size_t avail, int n, int T, uint64_t*
  * depends on v only, so size and write agree. ---- */
 /* Smallest ALP_RD body, -1 on bad arguments or OOM. */
 int64_t ray_enc_alprd_size(const uint64_t* v, int n, int T);
-/* Appends the body; false on bad arguments or OOM (out->oom), with no
+/* Appends the body; false on bad arguments (n outside 0..1024, a length
+ * above UINT32_MAX, total not their sum) or OOM (out->oom), with no
  * partial body left in out. */
 bool    ray_enc_alprd_write(const uint64_t* v, int n, int T, ray_enc_buf_t* out);
 /* Validates and decodes an ALP_RD body into T-bit patterns (out holds
@@ -226,7 +227,8 @@ uint64_t ray_enc_fsst_encode(const ray_fsst_table_t* t, const ray_fsst_index_t* 
                              const char* const* s, const uint32_t* len, int n,
                              uint8_t* buf, uint64_t* clen);
 int64_t ray_enc_fsst_size(const uint64_t* clen, int n, uint64_t total);
-/* Appends the body; false on bad arguments or OOM (out->oom), with no
+/* Appends the body; false on bad arguments (n outside 0..1024, a length
+ * above UINT32_MAX, total not their sum) or OOM (out->oom), with no
  * partial body left in out. */
 bool    ray_enc_fsst_write(const uint64_t* clen, int n, const uint8_t* bytes, uint64_t total,
                            ray_enc_buf_t* out);

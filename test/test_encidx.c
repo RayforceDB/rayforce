@@ -1760,7 +1760,9 @@ static const char* idx_golden_emit(const char* dir) {
     GOLD("idx_hash_i64", with_index(i64_vec(a, 1000), ray_index_attach_hash));
     ray_t* s = ray_vec_new(RAY_STR, 300);
     for (int i = 0; i < 300; i++) { char b[32]; int n = snprintf(b, sizeof b, "string key number %d", i % 23); s = ray_str_vec_append(s, b, (size_t)n); }
+    ray_encw_test_force(RAY_ENC_RAW);                       /* P6: keep the P4 fixture's column bytes */
     GOLD("idx_hash_str", with_index(s, ray_index_attach_hash));
+    ray_encw_test_force(-1);
     int32_t c[700]; for (int i = 0; i < 700; i++) c[i] = (int32_t)((i * 31) % 499) - 250;
     GOLD("idx_sort_i32", with_index(ray_vec_from_raw(RAY_I32, c, 700), ray_index_attach_sort));
     GOLD("idx_bloom_i64", with_index(i64_vec(a, 1000), ray_index_attach_bloom));

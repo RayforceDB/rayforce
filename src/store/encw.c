@@ -24,6 +24,7 @@
 #include "vec/str.h"
 #include "ops/idxop.h"      /* ray_i128_add */
 #include "mem/heap.h"
+#include "ops/hash.h"     /* ray_hash_bytes */
 #include "store/col.h"       /* COL_DISK_ATTRS_MASK */
 #include "core/platform.h"   /* ray_vm_map_anon */
 #include <stdatomic.h>
@@ -55,6 +56,8 @@ static _Atomic(int) g_encw_force = -1;
 void ray_encw_test_force(int enc) { atomic_store(&g_encw_force, enc); }
 static _Atomic(int) g_encw_force_float = -1;
 void ray_encw_test_force_float(int enc) { atomic_store(&g_encw_force_float, enc); }
+static _Atomic(int) g_encw_force_str = -1;
+void ray_encw_test_force_str(int enc) { atomic_store(&g_encw_force_str, enc); }
 
 void ray_encw_vec_init(ray_encw_vec_t* v) { memset(v, 0, sizeof *v); }
 void ray_encw_vec_free(ray_encw_vec_t* v) { ray_enc_buf_free(&v->payload); }
@@ -249,37 +252,235 @@ static ray_err_t encw_guid(const void* data, int64_t start, int n, ray_encw_vec_
     return err;
 }
 
-/* ---- STR: RAW (wire descriptors + vector pool) or CONST; "" is the null ---- */
-static ray_err_t encw_str(const void* data, const char* pool, int64_t start, int n,
-                          ray_encw_vec_t* o) {
-    const ray_str_t* s = (const ray_str_t*)data + start;
-    uint64_t pooled = 0; bool eq = true;
+/* ---- STR: RAW (wire descriptors + vector pool), CONST, STR_DICT, FSST; "" is the null ---- */
+
+/* The forced encoding for STR vectors (-1: selection). */
+static int str_forced(void) {
+    int f = atomic_load(&g_encw_force_str);
+    return f >= 0 ? f : atomic_load(&g_encw_force);
+}
+
+static void sd_free(ray_encw_sdict_t* d) {
+    ray_free_raw(d->slot); ray_free_raw(d->at); ray_free_raw(d->offs);
+    ray_free_raw(d->lens); ray_free_raw(d->bytes);
+    memset(d, 0, sizeof *d);
+}
+
+static bool sd_rehash(ray_encw_sdict_t* d, uint64_t ncap) {
+    uint32_t* s = ray_calloc_raw((size_t)ncap * sizeof(uint32_t));
+    if (!s) return false;
+    for (uint32_t k = 0; k < d->n; k++) {
+        uint64_t h = ray_hash_bytes(d->bytes + d->offs[k], d->lens[k]) & (ncap - 1);
+        while (s[h]) h = (h + 1) & (ncap - 1);
+        s[h] = k + 1; d->at[k] = h;
+    }
+    ray_free_raw(d->slot); d->slot = s; d->mask = ncap - 1;
+    return true;
+}
+
+/* The entry's code, adding it when new; -1 on OOM. */
+static int64_t sd_code(ray_encw_sdict_t* d, const char* p, uint32_t len) {
+    if (!d->slot && !sd_rehash(d, 1024)) return -1;
+    uint64_t h = ray_hash_bytes(p, len) & d->mask;
+    for (;;) {
+        uint32_t c1 = d->slot[h];
+        if (!c1) break;
+        uint32_t k = c1 - 1;
+        if (d->lens[k] == len && (len == 0 || memcmp(d->bytes + d->offs[k], p, len) == 0)) return k;
+        h = (h + 1) & d->mask;
+    }
+    if (d->n == d->cap) {
+        uint32_t nc = d->cap ? d->cap * 2 : 1024;
+        uint64_t* o = ray_realloc_raw(d->offs, (size_t)nc * 8);           if (o) d->offs = o;
+        uint32_t* l = o ? ray_realloc_raw(d->lens, (size_t)nc * 4) : NULL; if (l) d->lens = l;
+        uint64_t* a = l ? ray_realloc_raw(d->at, (size_t)nc * 8) : NULL;   if (a) d->at = a;
+        if (!o || !l || !a) return -1;
+        d->cap = nc;
+    }
+    if (!d->bytes || d->blen + len > d->bcap) {         /* never NULL: "" may be the first entry */
+        uint64_t nb = d->bcap ? d->bcap : 65536;
+        while (nb < d->blen + len) nb *= 2;
+        char* b = ray_realloc_raw(d->bytes, (size_t)nb);
+        if (!b) return -1;
+        d->bytes = b; d->bcap = nb;
+    }
+    if (len) memcpy(d->bytes + d->blen, p, len);
+    uint32_t k = d->n++;
+    d->offs[k] = d->blen; d->lens[k] = len; d->blen += len;
+    if (len > RAY_STR_INLINE_MAX) d->pooled += len;
+    d->slot[h] = k + 1; d->at[k] = h;
+    if ((uint64_t)d->n * 2 > d->mask + 1 && !sd_rehash(d, (d->mask + 1) * 2)) return -1;
+    return k;
+}
+
+/* Drop the entries added since `keep`.  Removing in reverse insertion order
+ * is safe for linear probing: every surviving entry was inserted before the
+ * removed ones, so its probe path never crossed a removed slot; a rehash
+ * re-places only entries already present, and `at` tracks every slot. */
+static void sd_truncate(ray_encw_sdict_t* d, uint32_t keep) {
+    while (d->n > keep) {
+        uint32_t k = --d->n;
+        d->slot[d->at[k]] = 0;
+        d->blen = d->offs[k];
+        if (d->lens[k] > RAY_STR_INLINE_MAX) d->pooled -= d->lens[k];
+    }
+}
+
+typedef struct { uint8_t enc; uint64_t bytes; } str_choice_t;
+
+/* The best plain encoding of one STR vector: RAW, CONST, FSST (smallest
+ * wins, ties in that order; RAW unless the winner is at most 7/8 of it), or
+ * the forced one.  An all-null vector is CONST of "" whatever is forced.
+ * With fbuf != NULL the FSST codes of an FSST winner are kept for the
+ * writer (*fbuf owned by the caller, ray_free_raw). */
+static ray_err_t str_choose_plain(const ray_str_t* s, const char* pool, int n, const ray_encw_side_t* side,
+                                  int forced, str_choice_t* out, uint8_t** fbuf, uint64_t* clen, uint64_t* ftotal) {
+    uint64_t pooled = 0, sum = 0; bool eq = true; int nulls = 0;
     for (int i = 0; i < n; i++) {
         uint32_t len = s[i].len;
-        if (len == 0) o->n_nulls++;
+        nulls += len == 0; sum += len;
         if (len > RAY_STR_INLINE_MAX) pooled += len;
         if (i && eq && (len != s[0].len ||
-                        memcmp(ray_str_t_ptr(&s[i], pool), ray_str_t_ptr(&s[0], pool), len) != 0))
-            eq = false;
+                        memcmp(ray_str_t_ptr(&s[i], pool), ray_str_t_ptr(&s[0], pool), len) != 0)) eq = false;
     }
-    if (pooled > UINT32_MAX) return RAY_ERR_RANGE;
-    /* Pool order rule 2: RAW and CONST strings over 12 bytes count once per row. */
-    o->str_pooled = pooled;
     uint64_t raw = (uint64_t)n * 16 + 8 + ray_enc_pad8(pooled);
     uint64_t cst = 8 + ray_enc_pad8(s[0].len);
-    ray_err_t err;
+    out->enc = RAY_ENC_RAW; out->bytes = raw;
+    if (nulls == n) { out->enc = RAY_ENC_CONST; out->bytes = 8; return RAY_OK; }   /* all null: CONST of "" */
+    int64_t fs = -1;
+    uint8_t* fb = NULL; uint64_t cl[RAY_ENC_VEC]; uint64_t ft = 0;
+    if (side && side->fsst && (forced < 0 || forced == RAY_ENC_FSST)) {
+        fb = ray_alloc_raw((size_t)(2 * sum + 8));
+        if (!fb) return RAY_ERR_OOM;
+        const char* sp[RAY_ENC_VEC]; uint32_t sl[RAY_ENC_VEC];
+        for (int i = 0; i < n; i++) { sp[i] = ray_str_t_ptr(&s[i], pool); sl[i] = s[i].len; }
+        ft = ray_enc_fsst_encode(side->fsst, side->fsst_ix, sp, sl, n, fb, cl);
+        bool fit = true;                                  /* the lengths child is U32 */
+        for (int i = 0; i < n; i++) if (cl[i] > UINT32_MAX) fit = false;
+        if (fit) fs = ray_enc_fsst_size(cl, n, ft);
+        else { ray_free_raw(fb); fb = NULL; }
+    }
+    if (forced >= 0) {
+        bool ok = forced == RAY_ENC_RAW || (forced == RAY_ENC_CONST && eq) || (forced == RAY_ENC_FSST && fs >= 0);
+        if (!ok) { ray_free_raw(fb); return RAY_ERR_NYI; }
+        out->enc = (uint8_t)forced;
+        out->bytes = forced == RAY_ENC_CONST ? cst : forced == RAY_ENC_FSST ? (uint64_t)fs : raw;
+    } else {
+        if (eq && cst < out->bytes) { out->enc = RAY_ENC_CONST; out->bytes = cst; }
+        if (fs >= 0 && (uint64_t)fs < out->bytes) { out->enc = RAY_ENC_FSST; out->bytes = (uint64_t)fs; }
+        if (out->enc != RAY_ENC_RAW && out->bytes * 8 > raw * 7) { out->enc = RAY_ENC_RAW; out->bytes = raw; }
+    }
+    if (fbuf && out->enc == RAY_ENC_FSST) { *fbuf = fb; memcpy(clen, cl, (size_t)n * 8); *ftotal = ft; }
+    else ray_free_raw(fb);
+    return RAY_OK;
+}
+
+/* Planning pass of one STR chunk: its codes plus the dictionary entries it
+ * adds, against the sum of its vectors' best plain encodings.  The chunk is
+ * a STR_DICT chunk when that is at most 7/8 of the plain total (the 1/8
+ * minimum gain at chunk level) or STR_DICT is forced; its entries are then
+ * kept, otherwise removed.  All-null vectors are CONST either way (8 bytes
+ * on both sides) and add no entry, so every entry occurs in a STR_DICT
+ * vector.  A chunk with no non-null row is never a dictionary chunk (the
+ * null image relies on it).  A chunk whose entries would pass the cap
+ * abandons the accumulator. */
+static ray_err_t str_plan_chunk(ray_encw_t* w, const void* data, const char* pool, int64_t n, bool* dict_chunk) {
+    ray_encw_sdict_t* sd = &w->sdict;
+    const ray_str_t* s = (const ray_str_t*)data;
+    *dict_chunk = false;
+    int forced = str_forced();
+    if (forced >= 0 && forced != RAY_ENC_STR_DICT) return RAY_OK;
+    bool any = false;
+    for (int64_t i = 0; i < n && !any; i++) any = s[i].len != 0;
+    if (!any) return RAY_OK;
+    if (sd->abandoned) return forced == RAY_ENC_STR_DICT ? RAY_ERR_NYI : RAY_OK;
+    uint32_t keep = sd->n; uint64_t bkeep = sd->blen;
+    uint64_t codes_total = 0, plain_total = 0;
+    ray_encw_side_t side = { .fsst = w->fsst, .fsst_ix = w->fsst_ix };
+    uint64_t codes[RAY_ENC_VEC];
+    for (int64_t at = 0; at < n; at += RAY_ENC_VEC) {
+        int vn = (int)(n - at < RAY_ENC_VEC ? n - at : RAY_ENC_VEC);
+        bool vany = false;
+        for (int i = 0; i < vn && !vany; i++) vany = s[at + i].len != 0;
+        if (!vany) { codes_total += 8; plain_total += 8; continue; }
+        for (int i = 0; i < vn; i++) {
+            int64_t k = sd_code(sd, ray_str_t_ptr(&s[at + i], pool), s[at + i].len);
+            if (k < 0) { sd_truncate(sd, keep); return RAY_ERR_OOM; }
+            codes[i] = (uint64_t)k;
+        }
+        codes_total += (uint64_t)ray_enc_strdict_size(codes, vn);
+        if (forced < 0) {
+            str_choice_t pc;
+            ray_err_t err = str_choose_plain(s + at, pool, vn, &side, -1, &pc, NULL, NULL, NULL);
+            if (err != RAY_OK) { sd_truncate(sd, keep); return err; }
+            plain_total += pc.bytes;
+        }
+    }
+    if (sd->n > RAY_ENCW_SDICT_CAP) {
+        sd_truncate(sd, keep);
+        sd->abandoned = true;
+        return forced == RAY_ENC_STR_DICT ? RAY_ERR_NYI : RAY_OK;
+    }
+    uint64_t dict_total = codes_total + (sd->blen - bkeep) + 8ull * (sd->n - keep);
+    if (forced == RAY_ENC_STR_DICT || dict_total * 8 <= plain_total * 7) { *dict_chunk = true; return RAY_OK; }
+    sd_truncate(sd, keep);
+    return RAY_OK;
+}
+
+/* The encoding pass of one STR vector.  side->sdict is non-NULL exactly for
+ * the vectors of a STR_DICT chunk, whose entries the plan already added. */
+static ray_err_t encw_str(const void* data, const char* pool, int64_t start, int n,
+                          const ray_encw_side_t* side, ray_encw_vec_t* o) {
+    const ray_str_t* s = (const ray_str_t*)data + start;
+    uint64_t pooled = 0;
+    for (int i = 0; i < n; i++) {
+        if (s[i].len == 0) o->n_nulls++;
+        if (s[i].len > RAY_STR_INLINE_MAX) pooled += s[i].len;
+    }
+    if (pooled > UINT32_MAX) return RAY_ERR_RANGE;
+    o->str_occ = pooled;                                  /* the generation-0 bound */
+    /* Pool order rule 2: RAW, CONST and FSST strings over 12 bytes count once per row. */
+    o->str_pooled = pooled;
     o->desc.flags |= RAY_ENC_STAT_ABSENT;
-    int forced = atomic_load(&g_encw_force);
-    if (o->n_nulls < n && forced >= 0 && forced != RAY_ENC_RAW && !(forced == RAY_ENC_CONST && eq))
-        return RAY_ERR_NYI;
-    if (o->n_nulls == n || forced == RAY_ENC_CONST || (forced < 0 && eq && cst * 8 <= raw * 7)) {
-        o->desc.encoding = RAY_ENC_CONST;
+    ray_err_t err;
+    if (side && side->sdict && o->n_nulls < n) {          /* a STR_DICT chunk */
+        ray_encw_sdict_t* sd = side->sdict;
+        uint32_t planned = sd->n;
+        uint64_t codes[RAY_ENC_VEC];
+        int64_t mn = INT64_MAX, mx = -1;
+        for (int i = 0; i < n; i++) {
+            int64_t k = sd_code(sd, ray_str_t_ptr(&s[i], pool), s[i].len);
+            if (k < 0) return RAY_ERR_OOM;
+            codes[i] = (uint64_t)k;
+            if (s[i].len == 0) continue;                  /* bounds over non-null rows (D4) */
+            if (k < mn) mn = k;
+            if (k > mx) mx = k;
+        }
+        if (sd->n != planned) return RAY_ERR_RANGE;       /* every entry comes from the plan */
+        if (!ray_enc_strdict_write(codes, n, &o->payload)) return RAY_ERR_OOM;
+        sd->used = true;
+        o->str_pooled = 0;                                /* entries live in the dictionary (rule 1) */
+        o->desc.encoding = RAY_ENC_STR_DICT;
+        o->desc.flags &= (uint16_t)~RAY_ENC_STAT_ABSENT;
+        o->desc.min = mn; o->desc.max = mx; o->has_stats = true;
+        return RAY_OK;
+    }
+    str_choice_t c; uint8_t* fbuf = NULL; uint64_t clen[RAY_ENC_VEC]; uint64_t ftotal = 0;
+    if ((err = str_choose_plain(s, pool, n, side, str_forced(), &c, &fbuf, clen, &ftotal)) != RAY_OK) return err;
+    o->desc.encoding = c.enc;
+    if (c.enc == RAY_ENC_FSST) {
+        bool ok = ray_enc_fsst_write(clen, n, fbuf, ftotal, &o->payload);
+        ray_free_raw(fbuf);
+        if (!ok) return o->payload.oom ? RAY_ERR_OOM : RAY_ERR_RANGE;
+        o->fsst_used = true;
+        return RAY_OK;
+    }
+    if (c.enc == RAY_ENC_CONST) {
         uint32_t hdr[2] = { o->n_nulls == n ? 0 : s[0].len, 0 };
         if ((err = put(o, hdr, 8)) != RAY_OK) return err;
         if (hdr[0] && (err = put(o, ray_str_t_ptr(&s[0], pool), hdr[0])) != RAY_OK) return err;
         return pad8(o);
     }
-    o->desc.encoding = RAY_ENC_RAW;
     uint32_t off = 0;
     for (int i = 0; i < n; i++) {
         uint8_t w[16] = {0};
@@ -313,7 +514,7 @@ ray_err_t ray_encw_vec_side(int8_t type, uint8_t attrs, const void* data, const 
     switch (type) {
     case RAY_F32: case RAY_F64: err = encw_float(type, data, start, n, side, o); break;
     case RAY_GUID:              err = encw_guid(data, start, n, o); break;
-    case RAY_STR:               err = encw_str(data, str_pool, start, n, o); break;
+    case RAY_STR:               err = encw_str(data, str_pool, start, n, side, o); break;
     case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
     case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: case RAY_SYM:
         err = encw_int(type, attrs, data, start, n,
@@ -330,7 +531,7 @@ ray_err_t ray_encw_vec_side(int8_t type, uint8_t attrs, const void* data, const 
 
 ray_err_t ray_encw_vec(int8_t type, uint8_t attrs, const void* data, const char* str_pool,
                        int64_t start, int n, const ray_enc_dict_t* dict, ray_encw_vec_t* out) {
-    ray_encw_side_t side = { dict, NULL };
+    ray_encw_side_t side = { .dict = dict };
     return ray_encw_vec_side(type, attrs, data, str_pool, start, n, &side, out);
 }
 
@@ -348,6 +549,9 @@ static ray_err_t fput(ray_encw_t* w, const void* p, size_t n) {
 void ray_encw_free(ray_encw_t* w) {
     ray_free_raw(w->dir); w->dir = NULL;
     ray_free_raw(w->dict_v); w->dict_v = NULL;
+    sd_free(&w->sdict);
+    ray_free_raw(w->fsst); w->fsst = NULL;
+    ray_free_raw(w->fsst_ix); w->fsst_ix = NULL;
     ray_enc_buf_free(&w->chunk);
     ray_encw_vec_free(&w->vec);
 }
@@ -418,6 +622,29 @@ static ray_err_t train_dict(ray_encw_t* w, const void* data, int64_t n) {
     return RAY_OK;
 }
 
+/* The FSST table is trained on the column's first chunk and frozen (spec
+ * "Encoding selection"); no table (no string bytes, no candidate) means no
+ * FSST for the column.  Training OOM fails the save (D3), so resident and
+ * streamed saves never diverge under memory pressure. */
+static ray_err_t train_fsst(ray_encw_t* w, const void* data, const char* pool, int64_t n) {
+    const ray_str_t* s = (const ray_str_t*)data;
+    const uint8_t** sp = ray_alloc_raw((size_t)n * sizeof *sp);
+    uint32_t* sl = ray_alloc_raw((size_t)n * sizeof *sl);
+    w->fsst = ray_calloc_raw(sizeof *w->fsst);
+    w->fsst_ix = ray_calloc_raw(sizeof *w->fsst_ix);
+    if (!sp || !sl || !w->fsst || !w->fsst_ix) { ray_free_raw(sp); ray_free_raw(sl); return RAY_ERR_OOM; }
+    for (int64_t i = 0; i < n; i++) { sp[i] = (const uint8_t*)ray_str_t_ptr(&s[i], pool); sl[i] = s[i].len; }
+    int tr = ray_fsst_train(sp, sl, n, w->fsst);
+    ray_free_raw(sp); ray_free_raw(sl);
+    if (tr < 0) return RAY_ERR_OOM;
+    if (tr == 0 || w->fsst->n == 0) {
+        ray_free_raw(w->fsst); ray_free_raw(w->fsst_ix); w->fsst = NULL; w->fsst_ix = NULL;
+        return RAY_OK;
+    }
+    ray_fsst_index_build(w->fsst, w->fsst_ix);
+    return RAY_OK;
+}
+
 static bool type_is_float(int8_t t) { return t == RAY_F32 || t == RAY_F64; }
 static double bits_double(int64_t b) { double d; memcpy(&d, &b, 8); return d; }
 
@@ -431,10 +658,14 @@ static ray_err_t encw_chunk_body(ray_encw_t* w, const void* data, const char* st
     if (!ray_enc_buf_put(&w->chunk, NULL, RAY_ENC_DESC_AREA)) return RAY_ERR_OOM;
     memset(de, 0, sizeof *de);
     bool have = false, fl = type_is_float(w->type);
+    bool str = w->type == RAY_STR, dict_chunk = false, all_sdict = true;
+    if (str && (err = str_plan_chunk(w, data, str_pool, n, &dict_chunk)) != RAY_OK) return err;
     int64_t nv = (n + RAY_ENC_VEC - 1) / RAY_ENC_VEC;
     for (int64_t j = 0; j < nv; j++) {
         int vn = (int)(n - j * RAY_ENC_VEC < RAY_ENC_VEC ? n - j * RAY_ENC_VEC : RAY_ENC_VEC);
-        ray_encw_side_t side = { w->dict_n ? &dict : NULL, w->alp.n ? &w->alp : NULL };
+        ray_encw_side_t side = { .dict = w->dict_n ? &dict : NULL, .alp = w->alp.n ? &w->alp : NULL,
+                                 .fsst = w->fsst, .fsst_ix = w->fsst_ix,
+                                 .sdict = dict_chunk ? &w->sdict : NULL };
         err = ray_encw_vec_side(w->type, w->attrs, data, str_pool, j * RAY_ENC_VEC, vn, &side, &w->vec);
         if (err != RAY_OK) return err;
         ray_enc_desc_t desc = w->vec.desc;
@@ -444,8 +675,13 @@ static ray_err_t encw_chunk_body(ray_encw_t* w, const void* data, const char* st
         if (desc.encoding == RAY_ENC_DICT) w->dict_used = true;
         de->null_count += (uint32_t)w->vec.n_nulls;
         if (w->vec.n_nulls > 0 && ray_enc_has_bitmap(w->type)) w->any_bitmap_null = true;
+        if (w->vec.fsst_used) w->fsst_used = true;
+        if (desc.encoding != RAY_ENC_STR_DICT) all_sdict = false;
+        /* Pool bound (plan Decisions, "Pool bound"): range on the per-occurrence count,
+         * the generation-0 bound, though dictionary entries count once. */
+        w->str_occ_bytes += w->vec.str_occ;
+        if (w->str_occ_bytes > UINT32_MAX) return RAY_ERR_RANGE;
         w->str_pool_bytes += w->vec.str_pooled;
-        if (w->str_pool_bytes > UINT32_MAX) return RAY_ERR_RANGE;
         if (ray_encw_type_summable(w->type))
             ray_i128_add128(&de->sum_hi, &de->sum_lo, w->vec.sum_hi, w->vec.sum_lo);
         if (w->vec.has_stats) {
@@ -458,7 +694,9 @@ static ray_err_t encw_chunk_body(ray_encw_t* w, const void* data, const char* st
             have = true;
         }
     }
-    if (!have) { de->flags = RAY_ENC_STAT_ABSENT; de->min = de->max = 0; }
+    /* STR: code bounds only when every vector is STR_DICT (D5); the combine
+     * above folded only STR_DICT vectors. */
+    if (!have || (str && !all_sdict)) { de->flags = RAY_ENC_STAT_ABSENT; de->min = de->max = 0; }
     de->bytes = w->chunk.len;
     return RAY_OK;
 }
@@ -471,6 +709,7 @@ ray_err_t ray_encw_chunk(ray_encw_t* w, const void* data, const char* str_pool, 
     ray_err_t err;
     if (w->chunk_i == 0 && ray_encw_type_has_dict(w->type) &&
         (err = train_dict(w, data, n)) != RAY_OK) return err;
+    if (w->chunk_i == 0 && w->type == RAY_STR && (err = train_fsst(w, data, str_pool, n)) != RAY_OK) return err;
     ray_enc_dirent_t* de = &w->dir[w->chunk_i];
     if ((err = encw_chunk_body(w, data, str_pool, n, de)) != RAY_OK) return err;
     de->offset = w->pos;
@@ -507,33 +746,80 @@ static void encw_headers(const ray_encw_t* w, uint64_t side_off, uint64_t side_l
     hdr->len   = w->len;
 }
 
+/* Side data (spec "Side data"): the table, then each entry 32-aligned
+ * relative to the side start, in kind order; each written only when used.
+ * A one-entry table is 32 bytes with its entry at 32. */
+static ray_err_t encw_side(ray_encw_t* w, uint64_t* side_off, uint64_t* side_len) {
+    *side_off = *side_len = 0;
+    uint16_t kind[3]; uint64_t eb[3]; int ne = 0;
+    size_t esz = 0;
+    if (w->dict_used) {
+        ray_enc_kind_t k;
+        if (!ray_enc_value_kind(w->type, w->attrs, &k)) return RAY_ERR_RANGE;
+        esz = (size_t)k.T / 8;                          /* F32 4 bytes, F64 8 */
+        kind[ne] = RAY_ENC_SIDE_VALUE_DICT; eb[ne++] = 8 + ray_enc_pad8((uint64_t)w->dict_n * esz);
+    }
+    if (w->sdict.used) {
+        if (w->sdict.n == 0 || w->sdict.n > RAY_ENCW_SDICT_CAP) return RAY_ERR_RANGE;
+        kind[ne] = RAY_ENC_SIDE_STR_DICT; eb[ne++] = 8 + 8ull * (w->sdict.n + 1) + ray_enc_pad8(w->sdict.blen);
+    }
+    if (w->fsst_used) {
+        if (!w->fsst || w->fsst->n == 0) return RAY_ERR_RANGE;
+        kind[ne] = RAY_ENC_SIDE_FSST_TABLE; eb[ne++] = (uint64_t)ray_fsst_table_bytes(w->fsst);
+    }
+    if (!ne) return RAY_OK;
+    ray_err_t err;
+    *side_off = ray_enc_pad32(w->pos);
+    if ((err = fput(w, NULL, (size_t)(*side_off - w->pos))) != RAY_OK) return err;
+    uint64_t off[3], at = 8 + 24ull * (uint64_t)ne;
+    for (int i = 0; i < ne; i++) { off[i] = ray_enc_pad32(at); at = off[i] + eb[i]; }
+    uint8_t tbl[8 + 24 * 3]; memset(tbl, 0, sizeof tbl);
+    uint32_t n32 = (uint32_t)ne; memcpy(tbl, &n32, 4);
+    for (int i = 0; i < ne; i++) {
+        memcpy(tbl + 8 + 24 * i, &kind[i], 2);
+        memcpy(tbl + 8 + 24 * i + 8, &off[i], 8);
+        memcpy(tbl + 8 + 24 * i + 16, &eb[i], 8);
+    }
+    if ((err = fput(w, tbl, 8 + 24 * (size_t)ne)) != RAY_OK) return err;
+    uint64_t rel = 8 + 24ull * (uint64_t)ne;
+    for (int i = 0; i < ne; i++) {
+        if ((err = fput(w, NULL, (size_t)(off[i] - rel))) != RAY_OK) return err;
+        uint64_t start = w->pos;
+        if (kind[i] == RAY_ENC_SIDE_VALUE_DICT) {
+            uint32_t h[2] = { w->dict_n, 0 };
+            if ((err = fput(w, h, 8)) != RAY_OK) return err;
+            for (uint32_t k = 0; k < w->dict_n; k++)
+                if ((err = fput(w, &w->dict_v[k], esz)) != RAY_OK) return err;   /* LE low bytes */
+        } else if (kind[i] == RAY_ENC_SIDE_STR_DICT) {
+            uint32_t h[2] = { w->sdict.n, 0 };
+            if ((err = fput(w, h, 8)) != RAY_OK) return err;
+            if ((err = fput(w, w->sdict.offs, (size_t)w->sdict.n * 8)) != RAY_OK) return err;
+            if ((err = fput(w, &w->sdict.blen, 8)) != RAY_OK) return err;        /* offsets[n] */
+            if (w->sdict.blen && (err = fput(w, w->sdict.bytes, (size_t)w->sdict.blen)) != RAY_OK) return err;
+        } else {
+            const ray_fsst_table_t* t = w->fsst;
+            uint8_t h[8] = { t->n, 0, 0, 0, 0, 0, 0, 0 };
+            if ((err = fput(w, h, 8)) != RAY_OK) return err;
+            if ((err = fput(w, t->len, t->n)) != RAY_OK) return err;
+            if ((err = fput(w, NULL, (size_t)(ray_enc_pad8(t->n) - t->n))) != RAY_OK) return err;
+            if ((err = fput(w, t->sym, (size_t)t->n * 8)) != RAY_OK) return err;
+        }
+        uint64_t used = w->pos - start;
+        if (used > eb[i]) return RAY_ERR_RANGE;
+        if ((err = fput(w, NULL, (size_t)(eb[i] - used))) != RAY_OK) return err;   /* pad8 */
+        rel = off[i] + eb[i];
+    }
+    *side_len = rel;
+    return RAY_OK;
+}
+
 ray_err_t ray_encw_finish(ray_encw_t* w) {
     if (w->chunk_i != w->n_chunks) return RAY_ERR_RANGE;
     ray_err_t err;
     uint64_t side_off = 0, side_len = 0;
-    if (w->dict_used) {
-        ray_enc_kind_t k;
-        if (!ray_enc_value_kind(w->type, w->attrs, &k)) return RAY_ERR_RANGE;
-        size_t esz = (size_t)k.T / 8;                   /* F32 4 bytes, F64 8 */
-        uint64_t ebytes = 8 + ray_enc_pad8((uint64_t)w->dict_n * esz);
-        side_off = ray_enc_pad32(w->pos);
-        if ((err = fput(w, NULL, (size_t)(side_off - w->pos))) != RAY_OK) return err;
-        /* side table: n_entries, reserved, one 24-byte entry; the entry
-         * itself starts 32-aligned relative to the side-data start. */
-        uint8_t tbl[32] = {0};
-        uint32_t ne = 1; memcpy(tbl, &ne, 4);
-        uint16_t kind = RAY_ENC_SIDE_VALUE_DICT; memcpy(tbl + 8, &kind, 2);
-        uint64_t eoff = 32; memcpy(tbl + 16, &eoff, 8);
-        memcpy(tbl + 24, &ebytes, 8);
-        if ((err = fput(w, tbl, 32)) != RAY_OK) return err;
-        uint32_t eh[2] = { w->dict_n, 0 };
-        if ((err = fput(w, eh, 8)) != RAY_OK) return err;
-        for (uint32_t i = 0; i < w->dict_n; i++)
-            if ((err = fput(w, &w->dict_v[i], esz)) != RAY_OK) return err;   /* LE low bytes */
-        uint64_t used = (uint64_t)w->dict_n * esz;
-        if ((err = fput(w, NULL, (size_t)(ray_enc_pad8(used) - used))) != RAY_OK) return err;
-        side_len = 32 + ebytes;
-    }
+    if ((err = encw_side(w, &side_off, &side_len)) != RAY_OK) return err;
+    /* Pool order rule 1: every STR_DICT entry over 12 bytes, once. */
+    if (w->sdict.used) w->str_pool_bytes += w->sdict.pooled;
     /* the index region follows the side data, 32-aligned (spec "Writers") */
     uint64_t index_off = 0;
     if (w->has_idx || w->idx_copy) {

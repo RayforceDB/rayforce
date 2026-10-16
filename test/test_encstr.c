@@ -29,6 +29,8 @@
 #include "store/enc.h"
 #include "store/encfmt.h"
 #include "store/fsst.h"
+#include "store/col.h"
+#include "store/encw.h"
 #include "vec/str.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -182,10 +184,141 @@ static test_result_t test_fsst_body_rejects(void) {
     PASS();
 }
 
+/* ---- the STR writer (Task 2) ---- */
+#define STP(p) ray_test_tmp(ST_TMP p)
+
+static ray_t* str_col(int64_t n, const char* (*gen)(int64_t, char*)) {
+    ray_t* v = ray_vec_new(RAY_STR, n);
+    char buf[256];
+    for (int64_t i = 0; i < n; i++) { const char* s = gen(i, buf); v = ray_str_vec_append(v, s, strlen(s)); }
+    return v;
+}
+static const char* gen_lowcard(int64_t i, char* b) { snprintf(b, 64, "category number %lld long", (long long)(i % 37)); return b; }
+static const char* gen_urls(int64_t i, char* b) { snprintf(b, 200, "https://www.example.com/path/%lld/item?id=%lld&ref=search", (long long)(i % 5000), (long long)(i * 7919 % 100003)); return b; }
+static const char* gen_nullish(int64_t i, char* b) { if (i % 9 == 0) return ""; return gen_lowcard(i, b); }
+/* High cardinality in the low-cardinality strings' shape: no dictionary chunk,
+ * but an FSST table trained on gen_lowcard compresses them. */
+static const char* gen_hc(int64_t i, char* b) { snprintf(b, 64, "category number %lld long", (long long)i); return b; }
+
+/* `path` is already wrapped by ray_test_tmp. */
+static int st_desc_enc(const char* path, int64_t vec, ray_enc_desc_t* out) {
+    FILE* f = fopen(path, "rb"); if (!f) return -1;
+    int64_t c = vec / 64, j = vec % 64;
+    uint64_t off; fseek(f, 96 + c * 64, SEEK_SET); if (fread(&off, 8, 1, f) != 1) { fclose(f); return -1; }
+    ray_enc_desc_t d; fseek(f, (long)(off + (uint64_t)j * 48), SEEK_SET);
+    int ok = fread(&d, 1, 48, f) == 48;
+    fclose(f);
+    if (!ok) return -1;
+    if (out) *out = d;
+    return d.encoding;
+}
+static ray_enc_hdr_t st_hdr(const char* path) {
+    ray_enc_hdr_t eh; memset(&eh, 0, sizeof eh);
+    FILE* f = fopen(path, "rb"); if (!f) return eh;
+    fseek(f, 32, SEEK_SET); if (fread(&eh, 1, 64, f) != 64) memset(&eh, 0, sizeof eh);
+    fclose(f);
+    return eh;
+}
+static ray_enc_dirent_t st_dirent(const char* path, int64_t c) {
+    ray_enc_dirent_t de; memset(&de, 0, sizeof de);
+    FILE* f = fopen(path, "rb"); if (!f) return de;
+    fseek(f, 96 + c * 64, SEEK_SET); if (fread(&de, 1, 64, f) != 64) memset(&de, 0, sizeof de);
+    fclose(f);
+    return de;
+}
+
+/* Low cardinality: STR_DICT with code bounds; directory bounds present. */
+static test_result_t test_writer_strdict(void) {
+    ray_t* v = str_col(70000, gen_nullish);
+    ray_err_t e = ray_col_save_gen(v, STP("/sd"), 2);
+    ray_release(v);
+    TEST_ASSERT_EQ_I(e, RAY_OK);
+    ray_enc_desc_t d;
+    TEST_ASSERT_EQ_I(st_desc_enc(STP("/sd"), 0, &d), RAY_ENC_STR_DICT);
+    TEST_ASSERT_FALSE(d.flags & RAY_ENC_STAT_ABSENT);
+    TEST_ASSERT_TRUE(d.min >= 1 && d.max <= 37 && d.min <= d.max);   /* "" (row 0) is code 0; the bounds cover non-null rows */
+    TEST_ASSERT_EQ_I(st_desc_enc(STP("/sd"), 68, NULL), RAY_ENC_STR_DICT);   /* chunk 1 reuses the entries */
+    ray_enc_dirent_t de = st_dirent(STP("/sd"), 0);
+    TEST_ASSERT_FALSE(de.flags & RAY_ENC_STAT_ABSENT);
+    TEST_ASSERT_TRUE(de.min >= 1 && de.max <= 37 && de.min <= de.max);
+    ray_enc_hdr_t eh = st_hdr(STP("/sd"));
+    TEST_ASSERT_TRUE(eh.side_off != 0);
+    /* rule 1: the 37 entries over 12 bytes once; no RAW / FSST rows here */
+    uint64_t want = 0; char b[64];
+    for (int k = 0; k < 37; k++) { uint64_t l = (uint64_t)snprintf(b, sizeof b, "category number %d long", k); if (l > 12) want += l; }
+    TEST_ASSERT_EQ_U(eh.str_pool_bytes, want);
+    PASS();
+}
+
+/* URL-like strings: FSST; no statistics; the FSST_TABLE side entry. */
+static test_result_t test_writer_fsst(void) {
+    ray_t* v = str_col(3000, gen_urls);
+    ray_err_t e = ray_col_save_gen(v, STP("/fs"), 2);
+    ray_release(v);
+    TEST_ASSERT_EQ_I(e, RAY_OK);
+    ray_enc_desc_t d;
+    TEST_ASSERT_EQ_I(st_desc_enc(STP("/fs"), 0, &d), RAY_ENC_FSST);
+    TEST_ASSERT_TRUE(d.flags & RAY_ENC_STAT_ABSENT);
+    ray_enc_dirent_t de = st_dirent(STP("/fs"), 0);
+    TEST_ASSERT_TRUE(de.flags & RAY_ENC_STAT_ABSENT);
+    ray_enc_hdr_t eh = st_hdr(STP("/fs"));
+    uint64_t want = 0; char b[256];
+    for (int64_t i = 0; i < 3000; i++) { uint64_t l = strlen(gen_urls(i, b)); if (l > 12) want += l; }
+    TEST_ASSERT_EQ_U(eh.str_pool_bytes, want);                         /* rule 2 */
+    FILE* f = fopen(STP("/fs"), "rb"); TEST_ASSERT_NOT_NULL(f);
+    uint8_t tb[32]; fseek(f, (long)eh.side_off, SEEK_SET);
+    size_t got = fread(tb, 1, 32, f); fclose(f);
+    TEST_ASSERT_EQ_I((int)got, 32);
+    uint32_t ne; memcpy(&ne, tb, 4); uint16_t k0; memcpy(&k0, tb + 8, 2);
+    TEST_ASSERT_EQ_I(ne, 1);
+    TEST_ASSERT_EQ_I(k0, RAY_ENC_SIDE_FSST_TABLE);
+    PASS();
+}
+
+/* Two side entries in kind order, 32-aligned: chunk 0 is a STR_DICT chunk
+ * (low cardinality), chunk 1 a plain one (gen_hc, FSST).  A STR_DICT chunk
+ * holding an all-null vector (CONST) has no code bounds. */
+static test_result_t test_writer_two_entries(void) {
+    int64_t n = 65536 + 4096;
+    ray_t* v = ray_vec_new(RAY_STR, n);
+    char b[256];
+    for (int64_t i = 0; i < n; i++) {
+        const char* s = i < 1024 ? "" : i < 65536 ? gen_lowcard(i, b) : gen_hc(i, b);
+        v = ray_str_vec_append(v, s, strlen(s));
+    }
+    ray_err_t e = ray_col_save_gen(v, STP("/two"), 2);
+    ray_release(v);
+    TEST_ASSERT_EQ_I(e, RAY_OK);
+    TEST_ASSERT_EQ_I(st_desc_enc(STP("/two"), 0, NULL), RAY_ENC_CONST);      /* all null */
+    ray_enc_desc_t d;
+    TEST_ASSERT_EQ_I(st_desc_enc(STP("/two"), 1, &d), RAY_ENC_STR_DICT);
+    TEST_ASSERT_FALSE(d.flags & RAY_ENC_STAT_ABSENT);                       /* the vector keeps its bounds (D5) */
+    TEST_ASSERT_EQ_I(st_desc_enc(STP("/two"), 64, NULL), RAY_ENC_FSST);
+    TEST_ASSERT_TRUE(st_dirent(STP("/two"), 0).flags & RAY_ENC_STAT_ABSENT);  /* CONST in the chunk */
+    TEST_ASSERT_TRUE(st_dirent(STP("/two"), 1).flags & RAY_ENC_STAT_ABSENT);
+    ray_enc_hdr_t eh = st_hdr(STP("/two"));
+    FILE* f = fopen(STP("/two"), "rb");
+    TEST_ASSERT_NOT_NULL(f);
+    fseek(f, (long)eh.side_off, SEEK_SET);
+    uint8_t tb[64]; size_t got = fread(tb, 1, 56, f); fclose(f);
+    TEST_ASSERT_EQ_I((int)got, 56);
+    uint32_t ne; memcpy(&ne, tb, 4);
+    TEST_ASSERT_EQ_I(ne, 2);
+    uint16_t k0, k1; memcpy(&k0, tb + 8, 2); memcpy(&k1, tb + 32, 2);
+    TEST_ASSERT_EQ_I(k0, RAY_ENC_SIDE_STR_DICT); TEST_ASSERT_EQ_I(k1, RAY_ENC_SIDE_FSST_TABLE);
+    uint64_t o0, o1; memcpy(&o0, tb + 16, 8); memcpy(&o1, tb + 40, 8);
+    TEST_ASSERT_EQ_U(o0, 64);
+    TEST_ASSERT_EQ_U(o1 % 32, 0);
+    PASS();
+}
+
 const test_entry_t encstr_entries[] = {
     { "encstr/strdict_body",       test_strdict_body,       st_setup, st_teardown },
     { "encstr/fsst_body",          test_fsst_body,          st_setup, st_teardown },
     { "encstr/fsst_train_verdict", test_fsst_train_verdict, st_setup, st_teardown },
     { "encstr/fsst_body_rejects",  test_fsst_body_rejects,  st_setup, st_teardown },
+    { "encstr/writer_strdict",     test_writer_strdict,     st_setup, st_teardown },
+    { "encstr/writer_fsst",        test_writer_fsst,        st_setup, st_teardown },
+    { "encstr/writer_two_entries", test_writer_two_entries, st_setup, st_teardown },
     { NULL, NULL, NULL, NULL },
 };

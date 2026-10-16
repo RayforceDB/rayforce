@@ -833,20 +833,22 @@ static ray_t* golden_vec(int i, const char** name, int* force, int* want) {
     case 12: { *name = "guid_mixed"; *want = RAY_ENC_RAW;
                uint8_t g[3][16]; for (int k = 0; k < 3; k++) for (int j = 0; j < 16; j++) g[k][j] = (uint8_t)(k * 16 + j + 1);
                memset(g[1], 0, 16); v = ray_vec_from_raw(RAY_GUID, g, 3); break; }
-    case 13: { *name = "str_mixed"; *want = RAY_ENC_RAW; v = ray_vec_new(RAY_STR, 4);
+    /* P1's STR cases forced to their encodings (P6 selection would pick
+     * STR_DICT or FSST); an unused FSST table or dictionary is not written. */
+    case 13: { *name = "str_mixed"; *force = RAY_ENC_RAW; *want = RAY_ENC_RAW; v = ray_vec_new(RAY_STR, 4);
                v = ray_str_vec_append(v, "", 0); v = ray_str_vec_append(v, "short", 5);
                v = ray_str_vec_append(v, "a very long string 1", 20); v = ray_str_vec_append(v, "a very long string 1", 20); break; }
-    case 14: { *name = "str_const"; *want = RAY_ENC_CONST; v = ray_vec_new(RAY_STR, 3);
+    case 14: { *name = "str_const"; *force = RAY_ENC_CONST; *want = RAY_ENC_CONST; v = ray_vec_new(RAY_STR, 3);
                for (int k = 0; k < 3; k++) { v = ray_str_vec_append(v, "same long string here", 21); }
                break; }
     case 15: { *name = "i64_empty"; *want = -1; v = ray_vec_new(RAY_I64, 0); break; }
     case 16: { *name = "i32_two_chunks"; *want = RAY_ENC_FOR_BP;
                v = ray_vec_new(RAY_I32, 65537); v->len = 65537; for (int k = 0; k < 65537; k++) ((int32_t*)ray_data(v))[k] = k % 1000; break; }
-    case 17: { *name = "str_inline"; *want = RAY_ENC_RAW; v = ray_vec_new(RAY_STR, 3);
+    case 17: { *name = "str_inline"; *force = RAY_ENC_RAW; *want = RAY_ENC_RAW; v = ray_vec_new(RAY_STR, 3);
                v = ray_str_vec_append(v, "ab", 2); v = ray_str_vec_append(v, "twelve bytes", 12); v = ray_str_vec_append(v, "x", 1); break; }
-    case 18: { *name = "str_pooled"; *want = RAY_ENC_RAW; v = ray_vec_new(RAY_STR, 2);
+    case 18: { *name = "str_pooled"; *force = RAY_ENC_RAW; *want = RAY_ENC_RAW; v = ray_vec_new(RAY_STR, 2);
                v = ray_str_vec_append(v, "thirteen byte", 13); v = ray_str_vec_append(v, "another pooled one", 18); break; }
-    case 19: { *name = "str_repeated"; *want = RAY_ENC_RAW; v = ray_vec_new(RAY_STR, 4);
+    case 19: { *name = "str_repeated"; *force = RAY_ENC_RAW; *want = RAY_ENC_RAW; v = ray_vec_new(RAY_STR, 4);
                v = ray_str_vec_append(v, "repeated long text", 18); v = ray_str_vec_append(v, "short", 5);
                v = ray_str_vec_append(v, "repeated long text", 18); v = ray_str_vec_append(v, "repeated long text", 18); break; }
     /* forced encodings (spec: every encoding also forced) */
@@ -912,6 +914,18 @@ static ray_t* golden_vec(int i, const char** name, int* force, int* want) {
                for (int k = 0; k < 1024; k++) { d[k] = (double)(k % 100) / 4.0; if (k % 50 == 7) memcpy(&d[k], &odd, 8);
                                                 if (k % 64 == 3) memcpy(&d[k], &neg0, 8); }
                v = ray_vec_from_raw(RAY_F64, d, 1024); v->attrs |= RAY_ATTR_HAS_NULLS; break; }
+    /* P6 STR bodies */
+    case 35: { *name = "str_dict"; *force = RAY_ENC_STR_DICT; *want = RAY_ENC_STR_DICT; v = ray_vec_new(RAY_STR, 1024);
+               static const char* const w[5] = { "", "zeta", "alpha long value one", "mu", "omega long value two" };
+               for (int k = 0; k < 1024; k++) { const char* s = w[(uint32_t)((uint32_t)k * 2654435761u) % 5]; v = ray_str_vec_append(v, s, strlen(s)); }
+               break; }
+    case 36: { *name = "str_dict_codes_rle"; *force = RAY_ENC_STR_DICT; *want = RAY_ENC_STR_DICT; v = ray_vec_new(RAY_STR, 1024);
+               for (int k = 0; k < 1024; k++) { char b[40]; int n = snprintf(b, sizeof b, "run value number %d", k / 256); v = ray_str_vec_append(v, b, (size_t)n); }
+               break; }
+    case 37: { *name = "str_fsst"; *force = RAY_ENC_FSST; *want = RAY_ENC_FSST; v = ray_vec_new(RAY_STR, 1024);
+               for (int k = 0; k < 1024; k++) { char b[96]; int n = snprintf(b, sizeof b, "https://www.example.com/p/%d?q=%d", k % 97, (k * 31) % 1000);
+                                                 v = ray_str_vec_append(v, b, (size_t)n); }
+               break; }
     default: return NULL;
     }
     return v;
@@ -1021,7 +1035,8 @@ static const char* const g_golden_names[] = {
     "str_const", "i64_empty", "i32_two_chunks", "str_inline", "str_pooled", "str_repeated",
     "i16_delta_wT", "i32_delta_wT", "i64_delta_wT", "i64_dict_const_child", "i64_rle_values_for",
     "i64_rle_ends_delta", "i64_rle_ends_for", "i64_dict_codes_raw", "sym_w8_for", "sym_w32_rle",
-    "f64_alp", "f64_alprd_len1", "f64_alprd_len1023", "f64_dict_signed", "f64_rle", "f32_alp", "f64_alp_trailer", NULL,
+    "f64_alp", "f64_alprd_len1", "f64_alprd_len1023", "f64_dict_signed", "f64_rle", "f32_alp", "f64_alp_trailer",
+    "str_dict", "str_dict_codes_rle", "str_fsst", NULL,
 };
 
 static test_result_t test_golden_emit(void) {

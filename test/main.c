@@ -933,6 +933,7 @@ void ray_test_hooks_off(void) {
     ray_col_test_fail_alloc(0);
     ray_encw_test_force(-1);
     ray_encw_test_force_float(-1);
+    ray_encw_test_force_str(-1);
     ray_graph_bind_test_fail_alloc(0);
     ray_store_test_force_compress(false);
     ray_idx_lazy_test_fail_build(NULL);
