@@ -11634,6 +11634,31 @@ static bool sym_names_col(ray_t* tbl, int64_t s) {
     return ray_table_get_col(tbl, head) != NULL;
 }
 
+/* Does clause value `v` read a lexical local that is no atom (a vector, a
+ * list, a table)?  It stands for the whole table's rows, so the clause
+ * cannot run on one partition's segment.  A quoted form reads nothing. */
+static bool clause_reads_local_value(ray_t* v) {
+    if (!v || RAY_IS_ERR(v)) return false;
+    if (v->type == -RAY_SYM) {
+        if (v->attrs & ATTR_QUOTED) return false;
+        int64_t head = v->i64;
+        if (ray_sym_is_dotted(head)) {
+            const int64_t* segs;
+            if (ray_sym_segs(head, &segs) < 1) return false;
+            head = segs[0];
+        }
+        ray_t* b = ray_env_get_lexical_local(head);
+        return b && !ray_is_atom(b);
+    }
+    if (v->type == RAY_DICT) return clause_reads_local_value(ray_dict_vals(v));
+    if (v->type != RAY_LIST) return false;
+    ray_t** el = (ray_t**)ray_data(v);
+    if (v->len == 2 && el[0] && el[0]->type == -RAY_SYM &&
+        el[0]->i64 == ray_sym_intern("quote", 5)) return false;
+    for (int64_t i = 0; i < v->len; i++) if (clause_reads_local_value(el[i])) return true;
+    return false;
+}
+
 static bool clause_runs_code_in(ray_t* v, ray_t* tbl, bool containers);
 
 /* Does key `e` name, anywhere, a builtin that binds a name or quotes its
@@ -13005,7 +13030,10 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
                     if (alias_ref) { bad_clause = 1; break; }
                 }
                 if (v && v->type == -RAY_SYM && !(v->attrs & ATTR_QUOTED)) {
-                    ray_t* oc = ray_table_get_col(tbl, v->i64);
+                    /* A lexical local of that name hides the column: the
+                     * output is the local, which the gathers cannot read. */
+                    ray_t* oc = sym_names_col(tbl, v->i64)
+                              ? ray_table_get_col(tbl, v->i64) : NULL;
                     if (!oc) { bad_clause = 1; break; }
                     int8_t ot = oc->type;
                     if (RAY_IS_PARTED(ot) || ot == RAY_MAPCOMMON)
@@ -25955,15 +25983,18 @@ static ray_t* try_stream_parted_order_by(
      * same invariant as try_stream_parted_order_by_topk's output-shape gate.
      * An aggregate/expression output collapses per segment (one row per
      * partition), which would concat into nseg wrong rows instead of the
-     * flat path's single correctly-aggregated result, so it declines here. */
+     * flat path's single correctly-aggregated result, so it declines here.
+     * A name a lexical local hides is the local, not the column; a where:
+     * reading a local vector reads the whole table's rows (both decline). */
     for (int64_t i = 0; i + 1 < dict_n; i += 2) {
         int64_t kid = dict_elems[i]->i64;
+        if (kid == where_id && clause_reads_local_value(dict_elems[i + 1])) return NULL;
         if (kid == from_id || kid == where_id || kid == by_id ||
             kid == take_id || kid == asc_id || kid == desc_id ||
             kid == nearest_id) continue;
         ray_t* v = dict_elems[i + 1];
         if (!v || v->type != -RAY_SYM || (v->attrs & ATTR_QUOTED)) return NULL;
-        if (!ray_table_get_col(tbl, v->i64)) return NULL;
+        if (!ray_table_get_col(tbl, v->i64) || !sym_names_col(tbl, v->i64)) return NULL;
     }
 
     /* Carve: key syms + resolved parted columns + two per-segment key-vec
@@ -26173,15 +26204,18 @@ static ray_t* try_stream_parted_order_by_topk(
      * negative / range take is a slice, not a top-k — decline it. */
     if (k < 0) return NULL;
 
-    /* Every output column must be a bare source-column ref (row-preserving). */
+    /* Every output column must be a bare source-column ref (row-preserving),
+     * no lexical local hiding it, and a where: reads no local vector: the
+     * segments would read a local's rows from the top of the table. */
     for (int64_t i = 0; i + 1 < dict_n; i += 2) {
         int64_t kid = dict_elems[i]->i64;
+        if (kid == where_id && clause_reads_local_value(dict_elems[i + 1])) return NULL;
         if (kid == from_id || kid == where_id || kid == by_id ||
             kid == take_id || kid == asc_id || kid == desc_id ||
             kid == nearest_id) continue;
         ray_t* v = dict_elems[i + 1];
         if (!v || v->type != -RAY_SYM || (v->attrs & ATTR_QUOTED)) return NULL;
-        if (!ray_table_get_col(tbl, v->i64)) return NULL;
+        if (!ray_table_get_col(tbl, v->i64) || !sym_names_col(tbl, v->i64)) return NULL;
     }
 
     /* Every sort key must be an output of that column under its name: the

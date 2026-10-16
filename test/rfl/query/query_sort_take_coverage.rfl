@@ -701,3 +701,113 @@
 (select {from: Prn asc: s}) -- (select {from: Mrn asc: s})
 (set __row 0)
 (.sys.exec "rm -rf /tmp/rfl_ckrown")
+;; a lambda parameter or let hides the column of its name in an output on
+;; every sorted and taken route, as it does without take: (the parameter
+;; and let bindings take precedence over query columns).  The fused top-k
+;; and positional take gathered the column by name; the parted per-segment
+;; routes ran the select on each partition, where a local of the whole
+;; table's rows met a segment's rows.  A sort key names a column either way.
+(.sys.exec "rm -rf /tmp/rfl_cklocal")
+(.db.splayed.set "/tmp/rfl_cklocal/p/2024.01.01/t/" (table [x y] (list [3 1 4] [30 10 40])))
+(.db.splayed.set "/tmp/rfl_cklocal/p/2024.01.02/t/" (table [x y] (list [2 3 1] [20 35 15])))
+(.db.splayed.set "/tmp/rfl_cklocal/q/2024.01.01/t/" (table [x y] (list [1 2 3] [10 15 20])))
+(.db.splayed.set "/tmp/rfl_cklocal/q/2024.01.02/t/" (table [x y] (list [4 5 6] [30 35 40])))
+(.db.splayed.set "/tmp/rfl_cklocal/s/t/" (table [x y] (list [3 1 4 2 3 1] [30 10 40 20 35 15])))
+(set Plc (.db.parted.get "/tmp/rfl_cklocal/p/" 't))
+(set Qlc (.db.parted.get "/tmp/rfl_cklocal/q/" 't))
+(set Slc (.db.splayed.get "/tmp/rfl_cklocal/s/t/"))
+(set Tlc (select {from: Plc where: (> x 0)}))
+(set Ulc (select {from: Qlc where: (> x 0)}))
+(set lca (fn [tbl y] (select {x: x yy: y from: tbl asc: x take: 4})))
+(set lcan (fn [tbl y] (select {x: x yy: y from: tbl asc: x})))
+(at (lca Tlc 5) 'yy) -- [5 5 5 5]
+(lca Tlc 5) -- (select {from: (lcan Tlc 5) take: 4})
+(lca Slc 5) -- (select {from: (lcan Slc 5) take: 4})
+(lca Plc 5) -- (select {from: (lcan Plc 5) take: 4})
+(set lcd (fn [tbl y] (select {x: x yy: y from: tbl desc: x take: 3})))
+(set lcdn (fn [tbl y] (select {x: x yy: y from: tbl desc: x})))
+(lcd Tlc 5) -- (select {from: (lcdn Tlc 5) take: 3})
+(lcd Slc 5) -- (select {from: (lcdn Slc 5) take: 3})
+(lcd Plc 5) -- (select {from: (lcdn Plc 5) take: 3})
+;; take: alone, and a where: with take: alone (the positional fused take)
+(set lct (fn [tbl y] (select {x: x yy: y from: tbl take: 3})))
+(set lctn (fn [tbl y] (select {x: x yy: y from: tbl})))
+(lct Tlc 5) -- (select {from: (lctn Tlc 5) take: 3})
+(lct Plc 5) -- (select {from: (lctn Plc 5) take: 3})
+(set lcw (fn [tbl y] (select {x: x yy: y from: tbl where: (> x 1) take: 2})))
+(set lcwe (fn [tbl y] (select {x: x yy: y from: tbl where: (> x 1) take: -2})))
+(set lcwn (fn [tbl y] (select {x: x yy: y from: tbl where: (> x 1)})))
+(at (lcw Tlc 5) 'yy) -- [5 5]
+(lcw Tlc 5) -- (select {from: (lcwn Tlc 5) take: 2})
+(lcw Slc 5) -- (select {from: (lcwn Slc 5) take: 2})
+(lcw Plc 5) -- (select {from: (lcwn Plc 5) take: 2})
+(lcwe Tlc 5) -- (select {from: (lcwn Tlc 5) take: -2})
+(lcwe Slc 5) -- (select {from: (lcwn Slc 5) take: -2})
+(lcwe Plc 5) -- (select {from: (lcwn Plc 5) take: -2})
+;; a where: with a sort and take:
+(set lcws (fn [tbl y] (select {x: x yy: y from: tbl where: (> x 1) asc: x take: 2})))
+(set lcwsn (fn [tbl y] (select {x: x yy: y from: tbl where: (> x 1) asc: x})))
+(lcws Tlc 5) -- (select {from: (lcwsn Tlc 5) take: 2})
+(lcws Slc 5) -- (select {from: (lcwsn Slc 5) take: 2})
+(lcws Plc 5) -- (select {from: (lcwsn Plc 5) take: 2})
+;; a let, and several sort keys (a key named like the local is the column)
+(set lcl (fn [tbl] (let y 7) (select {x: x yy: y from: tbl asc: x take: 4})))
+(at (lcl Tlc) 'yy) -- [7 7 7 7]
+(at (lcl Plc) 'yy) -- [7 7 7 7]
+(set lcm (fn [tbl y] (select {x: x yy: y from: tbl asc: [x y] take: 3})))
+(set lcmn (fn [tbl y] (select {x: x yy: y from: tbl asc: [x y]})))
+(lcm Tlc 5) -- (select {from: (lcmn Tlc 5) take: 3})
+(lcm Plc 5) -- (select {from: (lcmn Plc 5) take: 3})
+(set lck (fn [tbl x] (select {x: x yy: y from: tbl asc: x take: 3})))
+(set lckn (fn [tbl x] (select {x: x yy: y from: tbl asc: x})))
+(lck Tlc 5) -- (table [x yy] (list [5 5 5] [10 15 20]))
+(lck Tlc 5) -- (select {from: (lckn Tlc 5) take: 3})
+(lck Plc 5) -- (select {from: (lckn Plc 5) take: 3})
+;; a local of the table's rows: gathered in the sorted order, on the flat,
+;; splayed and parted table alike
+(set Vlc [9 8 7 6 5 4])
+(set lcv (fn [tbl x] (select {x: x yy: y from: tbl asc: y take: 4})))
+(set lcvn (fn [tbl x] (select {x: x yy: y from: tbl asc: y})))
+(at (lcv Tlc Vlc) 'x) -- [8 4 6 9]
+(lcv Tlc Vlc) -- (select {from: (lcvn Tlc Vlc) take: 4})
+(lcv Slc Vlc) -- (select {from: (lcvn Slc Vlc) take: 4})
+(lcv Plc Vlc) -- (select {from: (lcvn Plc Vlc) take: 4})
+(set lcy (fn [tbl y] (select {x: x yy: y from: tbl desc: x take: 2})))
+(set lcyn (fn [tbl y] (select {x: x yy: y from: tbl desc: x})))
+(at (lcy Ulc Vlc) 'yy) -- [4 5]
+(lcy Ulc Vlc) -- (select {from: (lcyn Ulc Vlc) take: 2})
+(lcy Qlc Vlc) -- (select {from: (lcyn Qlc Vlc) take: 2})
+(lcy Plc Vlc) -- (select {from: (lcyn Plc Vlc) take: 2})
+;; on partitions sorted on the key, without take:
+(set lcq (fn [tbl y] (select {x: x yy: y from: tbl asc: x})))
+(lcq Qlc Vlc) -- (lcq Ulc Vlc)
+(at (lcq Qlc Vlc) 'yy) -- Vlc
+(lcq Qlc 5) -- (lcq Ulc 5)
+;; a where: reading a local of the table's rows filters the whole table
+(set Mlc [false true false true false true])
+(set lcm2 (fn [tbl m] (select {y: y from: tbl where: m asc: y take: 2})))
+(set lcm2n (fn [tbl m] (select {y: y from: tbl where: m asc: y})))
+(at (lcm2n Ulc Mlc) 'y) -- [15 30 40]
+(lcm2n Qlc Mlc) -- (lcm2n Ulc Mlc)
+(lcm2 Ulc Mlc) -- (select {from: (lcm2n Ulc Mlc) take: 2})
+(lcm2 Qlc Mlc) -- (select {from: (lcm2n Ulc Mlc) take: 2})
+;; a local scalar in a where: is one value on every route
+(set lcs (fn [tbl x] (select {y: y from: tbl where: (> x 1) asc: y take: 2})))
+(at (lcs Qlc 5) 'y) -- [10 15]
+(at (lcs Ulc 5) 'y) -- [10 15]
+(count (lcs Qlc 0)) -- 0
+;; a grouped select: the key and an aggregate read the local
+(set lcb (fn [tbl x] (select {s: (sum y) by: x from: tbl desc: s take: 1})))
+(set lcbn (fn [tbl x] (select {s: (sum y) by: x from: tbl desc: s})))
+(set Klc [1 1 1 2 2 2])
+(lcb Tlc Klc) -- (select {from: (lcbn Tlc Klc) take: 1})
+(lcb Plc Klc) -- (select {from: (lcbn Plc Klc) take: 1})
+(lcb Slc Klc) -- (select {from: (lcbn Slc Klc) take: 1})
+(value (lcb Slc Klc)) -- (list [1] [80])
+;; xfail BUG: a bare local counted distinct counts the column of its name,
+;; with and without take: ((count (distinct (+ y 0))) reads the local: [2 2 2])
+;; ((fn [tbl y] (at (select {c: (count (distinct y)) by: x from: tbl}) 'c)) (table [x y] (list [1 1 2 2 3 3] [10 10 20 30 40 50])) [1 2 3 4 5 6]) -- [2 2 2]
+;; xfail BUG: a local key of a count distinct groups by the column (the
+;; rewrite) or raises domain (the general path); expected two groups [2 3]
+;; ((fn [tbl x] (at (select {c: (count (distinct y)) by: x from: tbl}) 'c)) (table [x y] (list [1 1 2 2 3 3] [10 10 20 30 40 50])) [1 1 1 2 2 2]) -- [2 3]
+(.sys.exec "rm -rf /tmp/rfl_cklocal")
