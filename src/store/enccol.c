@@ -957,9 +957,12 @@ static ray_t* dec_guid(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* 
  * out == NULL it validates every rule and sizes the decoded pool bytes;
  * with out set the caller has already validated, and pool_out has room for
  * pool_base + pooled bytes: it only writes.  dict_pool_off: NULL in vector
- * scope, where a STR_DICT vector copies each pooled entry once per row
- * (counted per row); at materialization the dictionary region's offset of
- * each code, whose entries add no bytes to the vector's (Task 4). */
+ * scope, where a STR_DICT vector copies each distinct pooled code's entry
+ * once, at its first row, and every row of that code shares the offset
+ * (Ruling 3-1: the layout of the dictionary-first pool; both passes meet
+ * the codes in the same order, so they count the same bytes); at
+ * materialization the dictionary region's offset of each code, whose
+ * entries add no bytes to the vector's (Task 4). */
 static ray_t* dec_str(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d, int vlen,
                       const uint8_t* p, uint64_t avail, void* out, char* pool_out,
                       uint64_t pool_base, uint64_t pool_cap, uint64_t* pooled_out,
@@ -975,11 +978,25 @@ static ray_t* dec_str(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d
         uint64_t codes[RAY_ENC_VEC];
         if (ray_enc_strdict_read(p, (size_t)avail, vlen, sd->n, codes) < 0)
             ENC_CORRUPT("column %s: chunk %lld vector %d codec body: %s", e->path, (long long)c, j, ray_enc_read_why());
+        /* vector scope: the pooled codes met so far (code + 1) and their
+         * offsets in the vector's pool; at most vlen <= 1024 of them */
+        uint32_t vk[2 * RAY_ENC_VEC], vo[2 * RAY_ENC_VEC];
+        if (!dict_pool_off) memset(vk, 0, sizeof vk);
         for (int i = 0; i < vlen; i++) {
             const char* sp; uint32_t len;
             ray_enc_sdict_entry(sd, (uint32_t)codes[i], &sp, &len);
             const bool pooled_row = len > RAY_STR_INLINE_MAX;
-            if (pooled_row && !dict_pool_off) pooled += len;      /* vector scope: once per row */
+            uint32_t slot = 0; bool first = false;
+            if (pooled_row && !dict_pool_off) {
+                slot = (uint32_t)(codes[i] * 0x9E3779B1u) & (2 * RAY_ENC_VEC - 1);
+                while (vk[slot] && vk[slot] != (uint32_t)codes[i] + 1) slot = (slot + 1) & (2 * RAY_ENC_VEC - 1);
+                if (!vk[slot]) {
+                    first = true;
+                    vk[slot] = (uint32_t)codes[i] + 1;
+                    vo[slot] = (uint32_t)pooled;                  /* < UINT32_MAX: capped below */
+                    if (!ray_enc_fsst_pool_add(&pooled, len, UINT32_MAX)) VEC_CORRUPT("STR_DICT pool above 4 GiB");
+                }
+            }
             /* the null is in band (D4): the empty entry's rows; the bounds
              * cover the non-null rows (a STR_DICT vector has them) */
             if (len == 0) nulls++;
@@ -992,8 +1009,8 @@ static ray_t* dec_str(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d
             if (!pooled_row) { memcpy(o[i].data, sp, len); continue; }
             memcpy(o[i].prefix, sp, 4);
             if (dict_pool_off) { o[i].pool_off = dict_pool_off[codes[i]]; continue; }
-            const uint64_t off = pool_base + pooled - len;
-            memcpy(pool_out + off, sp, len);
+            const uint64_t off = pool_base + vo[slot];
+            if (first) memcpy(pool_out + off, sp, len);
             o[i].pool_off = (uint32_t)off;
         }
     } else if (d->encoding == RAY_ENC_FSST) {
@@ -3010,9 +3027,9 @@ static void enc_mat_chunk(void* raw, uint32_t wid, int64_t start, int64_t end) {
             if (!err && e->type == RAY_STR) {
                 int vlen = ray_enc_vec_len(e->len, row / RAY_ENC_VEC);
                 ray_str_t* s = (ray_str_t*)dst;
+                pbase += nb - (uint64_t)vlen * esz;      /* the vector's pool bytes (rows may share them) */
                 for (int i = 0; i < vlen; i++) {
                     if (ray_str_is_inline(&s[i])) continue;
-                    pbase += s[i].len;
                     /* the generation-0 rule (col_validate_str_region), computed
                      * whatever the decoder left in the field */
                     uint32_t h = (uint32_t)ray_str_t_hash(&s[i], x->pool);

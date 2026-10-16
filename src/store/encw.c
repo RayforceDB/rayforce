@@ -384,9 +384,9 @@ static ray_err_t str_choose_plain(const ray_str_t* s, const char* pool, int n, c
  * vector.  Skipping them is safe only because such a column gets no
  * runtime DICT (D5 / D9): its chunk holding an all-null CONST vector has
  * no directory bounds, so ray_enccol_may_have_index never admits it, and
- * no consumer needs "" coded where it was never written.  A chunk with no non-null row is never a dictionary chunk (the
- * null image relies on it).  A chunk whose entries would pass the cap
- * abandons the accumulator. */
+ * no consumer needs "" coded where it was never written.  A chunk with no
+ * non-null row is never a dictionary chunk (the null image relies on it).
+ * A chunk whose entries would pass the cap abandons the accumulator. */
 static ray_err_t str_plan_chunk(ray_encw_t* w, const void* data, const char* pool, int64_t n, bool* dict_chunk) {
     ray_encw_sdict_t* sd = &w->sdict;
     const ray_str_t* s = (const ray_str_t*)data;

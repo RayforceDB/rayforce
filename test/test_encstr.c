@@ -426,6 +426,58 @@ static test_result_t test_range_reads_str(void) {
     PASS();
 }
 
+/* Ruling 3-1: in vector scope a STR_DICT vector copies each distinct pooled
+ * entry once and its rows share the offset.  One 40-byte entry on every row
+ * of two vectors (forced STR_DICT: selection would take CONST): each range
+ * read needs 40 pool bytes, every row points at them, hash32 stays 0. */
+static test_result_t test_range_shared_entry(void) {
+    const char* p = STP("/se");
+    static const char ent[] = "a forty byte entry repeated on every row";   /* 40 bytes */
+    TEST_ASSERT_EQ_U(sizeof ent - 1, 40);
+    ray_t* v = ray_vec_new(RAY_STR, 2048);
+    for (int i = 0; i < 2048; i++) v = ray_str_vec_append(v, ent, 40);
+    ray_encw_test_force_str(RAY_ENC_STR_DICT);
+    ray_err_t se = ray_col_save_gen(v, p, 2);
+    ray_encw_test_force_str(-1);
+    ray_release(v);
+    TEST_ASSERT_EQ_I(se, RAY_OK);
+    TEST_ASSERT_EQ_I(st_desc_enc(p, 0, NULL), RAY_ENC_STR_DICT);
+    TEST_ASSERT_EQ_I(st_desc_enc(p, 1, NULL), RAY_ENC_STR_DICT);
+    ray_t* c = ray_col_mmap(p);
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+    uint64_t pb0 = 0, pb1 = 0;
+    ray_t* e0 = ray_enccol_vec_pool_bytes(ray_enccol_of(c), 0, &pb0);
+    ray_t* e1 = ray_enccol_vec_pool_bytes(ray_enccol_of(c), 1, &pb1);
+    bool sized = !e0 && !e1 && pb0 == 40 && pb1 == 40;
+    if (e0) ray_error_free(e0);
+    if (e1) ray_error_free(e1);
+    ray_col_src_t src; ray_t* be = ray_col_src_bind(c, &src);
+    if (be) { ray_error_free(be); ray_release(c); FAIL("bind"); }
+    ray_col_scratch_t sc; ray_col_scratch_init(&sc);
+    bool same = true, shared = true, nohash = true, cap40 = true; int64_t nread = 0;
+    for (int64_t r = 0; r < 2048; ) {
+        ray_col_range_t rv;
+        ray_t* err = ray_col_range(&src, r, 2048 - r, &sc, &rv);
+        if (err) { ray_error_free(err); same = false; break; }
+        cap40 = cap40 && sc.pool_cap == 40;
+        const ray_str_t* d = (const ray_str_t*)rv.data;
+        for (int64_t k = 0; k < rv.n; k++) {
+            if (d[k].len != 40 || memcmp(ray_str_t_ptr(&d[k], rv.str_pool), ent, 40) != 0) same = false;
+            if (d[k].pool_off != d[0].pool_off) shared = false;
+            if (d[k].hash32 != 0) nohash = false;
+        }
+        r += rv.n; nread += rv.n;
+    }
+    ray_col_scratch_free(&sc); ray_col_src_release(&src); ray_release(c);
+    TEST_ASSERT_TRUE(sized);                              /* the entry's bytes once per vector */
+    TEST_ASSERT_EQ_I(nread, 2048);
+    TEST_ASSERT_TRUE(same);
+    TEST_ASSERT_TRUE(shared);
+    TEST_ASSERT_TRUE(nohash);
+    TEST_ASSERT_TRUE(cap40);                              /* the scratch pool is sized from them */
+    PASS();
+}
+
 /* Side-entry and statistics reject rules (before any lookup / decode). */
 static test_result_t test_side_rejects(void) {
     const char* p = STP("/sr");
@@ -485,7 +537,8 @@ static test_result_t test_side_rejects(void) {
     TEST_ASSERT_EQ_I(ray_col_save_gen(v, p, 2), RAY_OK);
     {
         uint64_t end; ST_READ(p, e0 + 8 + 8 * (long)n, &end, 8);
-        if (end & 7) { uint8_t x = 1; ST_PATCH(p, bytes + (long)end, &x, 1); ST_SCAN_CORRUPT(p, "STR_DICT padding"); }
+        TEST_ASSERT_EQ_U(end & 7, 1);                     /* 10 entries of 22 bytes, 27 of 23: 841, padding follows */
+        uint8_t x = 1; ST_PATCH(p, bytes + (long)end, &x, 1); ST_SCAN_CORRUPT(p, "STR_DICT padding");
         TEST_ASSERT_EQ_I(ray_col_save_gen(v, p, 2), RAY_OK);
     }
     /* n = 0 and n above the cap */
@@ -620,6 +673,16 @@ static test_result_t test_bound_arith(void) {
     t = UINT64_MAX - 5;
     TEST_ASSERT_FALSE(ray_enc_fsst_pool_add(&t, 10, UINT64_MAX));              /* the sum overflows */
     TEST_ASSERT_EQ_U(t, UINT64_MAX - 5);
+    /* the STR_DICT vector-scope sizing (Ruling 3-1): distinct entries
+     * added under the UINT32_MAX cap; one past it is rejected before any
+     * scratch pool is allocated */
+    t = (uint64_t)UINT32_MAX - 40;
+    TEST_ASSERT_TRUE(ray_enc_fsst_pool_add(&t, 40, UINT32_MAX));
+    TEST_ASSERT_EQ_U(t, UINT32_MAX);
+    TEST_ASSERT_FALSE(ray_enc_fsst_pool_add(&t, 13, UINT32_MAX));
+    t = 3ull << 30;                                       /* entries of 3 GiB and 2 GiB: over */
+    TEST_ASSERT_FALSE(ray_enc_fsst_pool_add(&t, 2ull << 30, UINT32_MAX));
+    TEST_ASSERT_EQ_U(t, 3ull << 30);
     t = 100;
     TEST_ASSERT_FALSE(ray_enc_fsst_pool_add(&t, 10, 109));                     /* one byte over cap */
     TEST_ASSERT_TRUE(ray_enc_fsst_pool_add(&t, 10, 110));
@@ -657,6 +720,7 @@ const test_entry_t encstr_entries[] = {
     { "encstr/writer_fsst",        test_writer_fsst,        st_setup, st_teardown },
     { "encstr/writer_two_entries", test_writer_two_entries, st_setup, st_teardown },
     { "encstr/range_reads_str",    test_range_reads_str,    st_setup, st_teardown },
+    { "encstr/range_shared_entry", test_range_shared_entry, st_setup, st_teardown },
     { "encstr/side_rejects",       test_side_rejects,       st_setup, st_teardown },
     { "encstr/fsst_rejects",       test_fsst_rejects,       st_setup, st_teardown },
     { "encstr/bound_arith",        test_bound_arith,        st_setup, st_teardown },

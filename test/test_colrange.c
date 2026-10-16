@@ -30,6 +30,7 @@
 #include "table/table.h"
 #include "store/col.h"
 #include "store/colrange.h"
+#include "store/encw.h"
 #include "store/enccol.h"
 #include "store/splay.h"
 #include "store/part.h"
@@ -317,11 +318,16 @@ static test_result_t test_range_slice_and_long_strings(void) {
     TEST_ASSERT_EQ_I(r.n, 10);                               /* slice boundary */
     TEST_ASSERT_EQ_PTR(r.data, (int32_t*)ray_data(v) + 2090);
     ray_col_src_release(&s); ray_release(sl); ray_release(v);
-    /* scratch grows for a vector of 1000-byte strings */
+    /* scratch grows for a vector of 1000-byte strings: the RAW per-occurrence
+     * pool (forced RAW; selection takes STR_DICT, whose 26 distinct entries
+     * a range read copies once each, Ruling 3-1) */
     static char big[1000]; memset(big, 'x', sizeof big);
     ray_t* st = ray_vec_new(RAY_STR, 1024);
     for (int i = 0; i < 1024; i++) { big[0] = (char)('a' + i % 26); st = ray_str_vec_append(st, big, sizeof big); }
-    TEST_ASSERT_EQ_I(ray_col_save_gen(st, ray_test_tmp(CR_TMP "/big"), 2), RAY_OK);
+    ray_encw_test_force_str(RAY_ENC_RAW);
+    ray_err_t se = ray_col_save_gen(st, ray_test_tmp(CR_TMP "/big"), 2);
+    ray_encw_test_force_str(-1);
+    TEST_ASSERT_EQ_I(se, RAY_OK);
     ray_t* c = ray_col_mmap(ray_test_tmp(CR_TMP "/big"));
     TEST_ASSERT_NULL(ray_col_src_bind(c, &s));
     TEST_ASSERT_NULL(ray_col_range(&s, 0, 1024, &sc, &r));
