@@ -56,6 +56,9 @@ make test       # run full test suite
 ./rayforce      # start the Rayfall REPL
 ```
 
+`make` compiles with `clang` when `CC` is not set; `make CC=gcc` (or `CC=gcc`
+in the environment) builds with gcc.
+
 ## Rayfall REPL
 
 Rayforce ships with **Rayfall** — a Lisp-like query language with a rich set
