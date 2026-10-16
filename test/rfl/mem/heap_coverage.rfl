@@ -449,6 +449,22 @@ FV1 -- [1.5 2.5 3.5]
 (set e 0)
 (< (- (heapb) h0) 65536) -- true
 
+;; leaves that own references of their own (fresh long strings) and empty
+;; containers, one level after another: each must be freed along with the
+;; level, not just have its block returned
+(set h0 (heapb))
+(set a (enlist 1))
+(times 100000 (set a (list a (concat "a string longer than seven" "x") (list) (format "%" 123456789012))))
+(> (- (heapb) h0) 10000000) -- true
+(set a 0)
+(< (- (heapb) h0) 65536) -- true
+(set h0 (heapb))
+(set z (list))
+(times 100000 (set z (list z (list) (dict [] (list)))))
+(> (- (heapb) h0) 10000000) -- true
+(set z 0)
+(< (- (heapb) h0) 65536) -- true
+
 ;; a chain still referenced from the middle: dropping the top frees only
 ;; the levels above it, and the rest stays whole until it goes too
 (set h0 (heapb))
