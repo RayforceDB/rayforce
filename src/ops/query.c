@@ -11681,7 +11681,9 @@ static bool parted_clauses_plain(ray_t* dict, ray_t* tbl);
  * retained, since nothing in the select reads a column of it.  `also`, a
  * symbol or symbol vector or NULL, names columns kept beside those: the
  * group keys a by-dict has added under their aliases, which no clause
- * names. */
+ * names.  When every one of them is a column, a by-dict's values have been
+ * evaluated into them, so the source columns those values name are read
+ * only if another clause names them too. */
 static ray_t* parted_flatten_read_cols(ray_t* dict, ray_t* tbl, bool keep_unread,
                                        ray_t* also) {
     int64_t nc = ray_table_ncols(tbl);
@@ -11693,16 +11695,21 @@ static ray_t* parted_flatten_read_cols(ray_t* dict, ray_t* tbl, bool keep_unread
     int64_t id_from = ray_sym_intern("from", 4);
     int64_t refs[256];
     int nref = 0;
+    int64_t id_by = ray_sym_intern("by", 2);
     int64_t nalso = also && also->type == -RAY_SYM ? 1 : (also && also->type == RAY_SYM ? also->len : 0);
+    bool also_cols = nalso > 0;
     for (int64_t j = 0; j < nalso; j++) {
         int64_t s = also->type == -RAY_SYM ? also->i64 : sym_cell_runtime_id(also, j);
         bool seen = false;
         for (int r = 0; r < nref; r++) seen |= refs[r] == s;
-        if (!seen && nref < 256 && ray_table_get_col(tbl, s)) refs[nref++] = s;
+        if (!ray_table_get_col(tbl, s)) { also_cols = false; continue; }
+        if (!seen && nref < 256) refs[nref++] = s;
     }
     for (int64_t i = 0; i < ray_dict_len(dict); i++) {
-        if (sym_cell_runtime_id(keys, i) == id_from) continue;
+        int64_t kid = sym_cell_runtime_id(keys, i);
+        if (kid == id_from) continue;
         ray_t* v = ((ray_t**)ray_data(vals))[i];
+        if (kid == id_by && also_cols && v && v->type == RAY_DICT) continue;
         int64_t nsym = v && v->type == -RAY_SYM ? 1 : (v && v->type == RAY_SYM ? v->len : 0);
         for (int64_t j = 0; j < nsym; j++) {   /* a sort key, quoted or not */
             int64_t s = v->type == -RAY_SYM ? v->i64 : sym_cell_runtime_id(v, j);
@@ -14532,11 +14539,14 @@ by_dict_done:
                  * answers through the parallel DAG/v2 path instead (see
                  * test/rfl/query/width_matrix.rfl's ROUTING NOTE on the `rmk`
                  * cell). The only remaining trigger into this block was a
-                 * RAY_LIST-typed by-key column, whose cells the int64 key
-                 * reader does not hold (the key column then failed in
-                 * vec_new): a key it cannot read leaves the shape to the
-                 * composite path below.  Left in place — not
-                 * correctness-load-bearing — pending a follow-up that
+                 * RAY_LIST-typed by-key column (an all-count output set is
+                 * all DAG aggregates, so only a LIST key sets
+                 * use_eval_group for it), whose cells the int64 key reader
+                 * does not hold (the key column then failed in vec_new): a
+                 * key it cannot read leaves the shape to the composite path
+                 * below, which makes the block unreachable.  The STR and
+                 * GUID arms of that gate are defensive.  Left in place —
+                 * not correctness-load-bearing — pending a follow-up that
                  * deletes this block. */
                 int64_t pre_take_groups = nrows;
                 bool has_pre_take = unsorted_positive_take_limit(
@@ -15221,6 +15231,11 @@ by_dict_done:
 	                scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("nyi", "eval-level groupby requires scalar key");
 	            }
             ray_t* key_col = ray_table_get_col(eval_tbl, by_key_sym);
+            if (!key_col) {
+                if (eval_tbl != tbl) ray_release(eval_tbl);
+                ray_release(tbl);
+                scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain", "group key column not found");
+            }
 
             /* Fast path: (select {from: t by: k}) with no aggs and
              * no non-agg expressions — we only need first-of-group

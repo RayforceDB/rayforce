@@ -456,6 +456,10 @@
 (select {x: k from: Pa by: {a: s b: g}}) -- (select {x: k from: I2 by: {a: s b: g}})
 (select {x: k from: Pa by: {a: s b: (% k 3)}}) -- (select {x: k from: I2 by: {a: s b: (% k 3)}})
 (select {x: s from: Pa by: {a: st}}) -- (select {x: s from: I2 by: {a: st}})
+;; the flattened copy takes the aliases, not the by-dict's source columns,
+;; unless an output reads one
+(select {x: s from: Pa by: {a: st b: (% k 3)}}) -- (select {x: s from: I2 by: {a: st b: (% k 3)}})
+(select {x: st y: k from: Pa by: {a: st b: g}}) -- (select {x: st y: k from: I2 by: {a: st b: g}})
 ;; a LIST key beside another in the composite grouping
 (select {c: (count k) one: 1 from: Ia by: [l s]}) -- (table [l s c one] (list (list [1 2] [3] [1 2] [3] [1 2] [3]) [aa bb cc aa bb cc] [4 4 4 4 4 4] [1 1 1 1 1 1]))
 (select {c: (count k) from: Pa by: [l s]}) -- (select {c: (count k) from: I2 by: [l s]})
