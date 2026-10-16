@@ -431,6 +431,11 @@ typedef struct ray_enc_chunk_stat_s {
 /* Chunk c of a single-file encoded column; the directory was verified at
  * load, so this cannot fail.  c must be below e->n_chunks. */
 void ray_enccol_chunk_stat(const ray_enccol_t* e, int64_t c, ray_enc_chunk_stat_t* out);
+/* STR code bounds (membership bounds, spec "Statistics") of chunk c (j < 0)
+ * or of vector j of chunk c: true with [*lo, *hi] when present.  The only
+ * reader of STR statistics; every generic accessor reports none for STR.
+ * *err is set (and false returned) when the chunk's descriptors are corrupt. */
+bool ray_enccol_code_bounds(ray_enccol_t* e, int64_t c, int j, int64_t* lo, int64_t* hi, ray_t** err);
 /* The totals below, computed once per column (the directory is immutable). */
 void ray_enccol_dir_totals(ray_enccol_t* e, ray_enc_col_totals_t* out);
 /* File byte range holding rows [lo, hi): from the first touched chunk's

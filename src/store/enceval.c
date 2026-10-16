@@ -494,7 +494,8 @@ bool ray_enc_runs(const ray_enc_vview_t* v, void* ctx, ray_enc_run_fn fn) {
 
 void ray_enc_view_range(const ray_enc_vview_t* v, int64_t* mn, int64_t* mx) {
     int64_t a = INT64_MAX, b = INT64_MIN;
-    for (uint32_t q = 0; q < v->n_runs; q++) {
+    /* only run values are a value range; any other view yields the empty range */
+    for (uint32_t q = 0; (v->enc == RAY_ENC_CONST || v->enc == RAY_ENC_RLE) && q < v->n_runs; q++) {
         const int64_t x = logical_of(lane(&v->run_vals, v->k.T, q), v->k);
         if (x < a) a = x;
         if (x > b) b = x;

@@ -988,7 +988,7 @@ static ray_t* dec_str(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d
             const bool pooled_row = len > RAY_STR_INLINE_MAX;
             uint32_t slot = 0; bool first = false;
             if (pooled_row && !dict_pool_off) {
-                slot = (uint32_t)(codes[i] * 0x9E3779B1u) & (2 * RAY_ENC_VEC - 1);
+                slot = (uint32_t)(codes[i] * 0x9E3779B1u) >> (32 - 11);          /* 2048 slots: the high bits (multiples of 2048 spread) */
                 while (vk[slot] && vk[slot] != (uint32_t)codes[i] + 1) slot = (slot + 1) & (2 * RAY_ENC_VEC - 1);
                 if (!vk[slot]) {
                     first = true;
@@ -3613,7 +3613,7 @@ ray_t* ray_enccol_check_dir(ray_enccol_t* e, int64_t c, int j, const void* data,
 
 ray_t* ray_enccol_check_dir_range(ray_enccol_t* e, int64_t c, int j, int64_t mn, int64_t mx) {
     ray_enc_dirent_t de; dirent_at(e, c, &de);
-    return check_dir_tail(e, c, j, (de.flags & RAY_ENC_STAT_ABSENT) || (mn >= de.min && mx <= de.max));
+    return check_dir_tail(e, c, j, (de.flags & RAY_ENC_STAT_ABSENT) || e->type == RAY_STR || (mn >= de.min && mx <= de.max));
 }
 
 ray_t* ray_enccol_check_dir_all(ray_t* encv) {
@@ -3652,10 +3652,30 @@ void ray_enccol_chunk_stat(const ray_enccol_t* e, int64_t c, ray_enc_chunk_stat_
     ray_enc_dirent_t de;
     dirent_at(e, c, &de);
     out->rows = chunk_rows(e, c);
-    out->has_minmax = (de.flags & RAY_ENC_STAT_ABSENT) == 0;
+    /* STR bounds are code bounds (first-occurrence codes, not ordered
+     * values): only ray_enccol_code_bounds reads them */
+    out->has_minmax = (de.flags & RAY_ENC_STAT_ABSENT) == 0 && e->type != RAY_STR;
     out->min = de.min; out->max = de.max;
     out->null_count = de.null_count;
     out->sum_lo = de.sum_lo; out->sum_hi = de.sum_hi;
+}
+
+bool ray_enccol_code_bounds(ray_enccol_t* e, int64_t c, int j, int64_t* lo, int64_t* hi, ray_t** err) {
+    *err = NULL;
+    if (e->type != RAY_STR || e->kind != RAY_ENCCOL_SINGLE || e->synthetic || c < 0 || c >= e->n_chunks) return false;
+    if (j < 0) {
+        ray_enc_dirent_t de; dirent_at(e, c, &de);
+        if (de.flags & RAY_ENC_STAT_ABSENT) return false;
+        *lo = de.min; *hi = de.max;
+        return true;
+    }
+    if (j >= RAY_ENC_VECS_PER_CHUNK || (c * RAY_ENC_VECS_PER_CHUNK + j) * RAY_ENC_VEC >= e->len) return false;
+    const ray_enc_desc_t* d;
+    if ((*err = ray_enccol_chunk_descs_ref(e, c, &d)) != NULL) return false;
+    d += j;
+    if (d->flags & RAY_ENC_STAT_ABSENT) return false;
+    *lo = d->min; *hi = d->max;
+    return true;
 }
 
 void ray_enccol_dir_totals(ray_enccol_t* e, ray_enc_col_totals_t* out) {
@@ -3673,7 +3693,7 @@ void ray_enccol_dir_totals(ray_enccol_t* e, ray_enc_col_totals_t* out) {
         out->sum_hi += (int64_t)de.sum_hi + (l < de.sum_lo ? 1 : 0);
         out->sum_lo = l;
         out->nonnull += chunk_rows(e, c) - (int64_t)de.null_count;
-        if (de.flags & RAY_ENC_STAT_ABSENT) {
+        if ((de.flags & RAY_ENC_STAT_ABSENT) || e->type == RAY_STR) {   /* STR: code bounds are no ordered statistic */
             if ((int64_t)de.null_count < chunk_rows(e, c)) out->mm_partial = true;
             continue;
         }

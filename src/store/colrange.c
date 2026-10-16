@@ -731,7 +731,7 @@ bool ray_col_src_chunk_stat(const ray_col_src_t* s, int64_t c, struct ray_enc_ch
 bool ray_col_src_vec_stat(const ray_col_src_t* s, int64_t v, int64_t* min, int64_t* max, uint32_t* n_nulls) {
     if (!ray_col_src_encoded(s)) return false;
     ray_enccol_t* e = ray_enccol_of(s->obj);
-    if (e->kind != RAY_ENCCOL_SINGLE || e->synthetic || v < 0 || v * RAY_ENC_VEC >= e->len) return false;
+    if (e->kind != RAY_ENCCOL_SINGLE || e->synthetic || e->type == RAY_STR || v < 0 || v * RAY_ENC_VEC >= e->len) return false;
     const ray_enc_desc_t* d;
     ray_t* err = ray_enccol_chunk_descs_ref(e, v / RAY_ENC_VECS_PER_CHUNK, &d);
     if (err) { ray_error_free(err); return false; }
@@ -880,7 +880,7 @@ int ray_col_src_runview(ray_col_src_t* s, int64_t row, ray_enc_vview_t* out, int
     int r = ray_enccol_vview(e, vec, out, err);
     if (r <= 0) return r;
     if (out->enc != enc || out->nullmap || out->n != *hi - *lo) return 0;
-    if (s->stats_guard && e->type != RAY_SYM && !ray_enccol_dir_vec_ok(e, c, j)) {
+    if (s->stats_guard && e->type != RAY_SYM && e->type != RAY_STR && !ray_enccol_dir_vec_ok(e, c, j)) {
         /* the range read's guard on the vector's values, which are its run
          * values: their [min, max] inside the chunk's directory statistics
          * (a vector that passed is recorded, as a range read records it) */
