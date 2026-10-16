@@ -2013,7 +2013,7 @@ static void pqx_snappy(pq_buf* o, const uint8_t* s, size_t n) {
             i += len; lit = i;
         } else i++;
     }
-    pqx_lit(o, s + lit, n - lit);
+    if (lit < n) pqx_lit(o, s + lit, n - lit);
 }
 /* pqx_page's checksums (PQX_CRC, PQX_CRCFLIP): 0 none; 1 each page's
  * CRC-32 in its header (PageHeader 4); 2 that, and a dictionary page's
