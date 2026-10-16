@@ -2915,7 +2915,10 @@ static test_result_t test_raw_float_view(void) {
     sr_bind_f32("yf", 140000, 0, 0.25f);
     sr_eval_ok("(set R (table [x y] (list (as 'F64 (% i 1000)) yf)))");
     sr_eval_ok("(.db.splayed.set \"" SR_TMP "/r0/\" R {compress: false})");
+    /* P5: the RAW float view is this test's subject */
+    ray_encw_test_force_float(RAY_ENC_RAW);
     sr_eval_ok("(.db.splayed.set \"" SR_TMP "/r2/\" R {compress: true})");
+    ray_encw_test_force_float(-1);
     static const char* const q[] = { "(sum (at T 'x))", "(sum (at T 'y))", "(avg (at T 'y))", "(prod (at T 'x))",
                                      "(any (at T 'y))", "(first (at T 'x))", "(last (at T 'y))", NULL };
     for (int i = 0; q[i]; i++) {
@@ -2933,7 +2936,10 @@ static test_result_t test_raw_float_view(void) {
         sr_drop(r);
     }
     /* chunk 1, vector 3, element 5 of x set to a NaN */
+    /* P5: the RAW float body is patched below */
+    ray_encw_test_force_float(RAY_ENC_RAW);
     sr_eval_ok("(.db.splayed.set \"" SR_TMP "/rbad/\" R {compress: true})");
+    ray_encw_test_force_float(-1);
     char dir[512], path[600];
     if (ray_splay_resolve_dir(ray_test_tmp(SR_TMP "/rbad/"), dir, sizeof dir) != RAY_OK) abort();
     snprintf(path, sizeof path, "%s/x", dir);

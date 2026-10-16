@@ -5297,7 +5297,9 @@ static test_result_t test_signed_zeros(void) {
     aw_save("sz0", "(table [k f] (list (til 3072) (map (fn [j] (if (< j 1024) (neg 0.0) (if (< j 2048) 0.0 (if (== 0 (% j 2)) (neg 0.0) 0.0)))) (til 3072))))", -1);
     TEST_ASSERT_EQ_I(aw_vec_enc("sz0", "f", 0), RAY_ENC_CONST);
     TEST_ASSERT_EQ_I(aw_vec_enc("sz0", "f", 1), RAY_ENC_CONST);
-    TEST_ASSERT_EQ_I(aw_vec_enc("sz0", "f", 2), RAY_ENC_RAW);
+    /* P5: the mixed +/-0.0 vector has two distinct values, so selection now
+     * takes DICT (it was RAW); the sign answers below hold for either body. */
+    TEST_ASSERT_EQ_I(aw_vec_enc("sz0", "f", 2), RAY_ENC_DICT);
     AW_ZERO_ROWS("sz0", 1024 + 512, 1024 + 512);
     /* Rayfall prints both zeros as 0.0 and 1/0 is null, so the sign of a
      * min / max result is read in C: aw_zero_mm compares it across generations. */
@@ -5309,6 +5311,18 @@ static test_result_t test_signed_zeros(void) {
     AW_SAME_OR_ERR("sz0", "(select {f: f k: k from: T where: (> k 1000) desc: f take: 5})");
     AW_SAME_OR_ERR("sz0", "(select {f: f k: k from: T asc: f take: 5})");
     AW_SAME_OR_ERR("sz0", "(select {f: f k: k from: T desc: f take: 5})");
+    /* P5: the same mix as a RAW body (the pre-P5 shape): every vector RAW */
+    aw_save("sz0r", "(table [k f] (list (til 3072) (map (fn [j] (if (< j 1024) (neg 0.0) (if (< j 2048) 0.0 (if (== 0 (% j 2)) (neg 0.0) 0.0)))) (til 3072))))", RAY_ENC_RAW);
+    TEST_ASSERT_EQ_I(aw_vec_enc("sz0r", "f", 2), RAY_ENC_RAW);
+    AW_ZERO_ROWS("sz0r", 1024 + 512, 1024 + 512);
+    AW_ZERO_MM("sz0r", "(min (at T 'f))");
+    AW_ZERO_MM("sz0r", "(max (at T 'f))");
+    AW_ZERO_MM("sz0r", "(at (select {r: (min f) from: T where: (> k 1000)}) 'r)");
+    AW_ZERO_MM("sz0r", "(at (select {r: (max f) from: T where: (> k 1000)}) 'r)");
+    AW_SAME_OR_ERR("sz0r", "(select {f: f k: k from: T where: (> k 1000) asc: f take: 5})");
+    AW_SAME_OR_ERR("sz0r", "(select {f: f k: k from: T where: (> k 1000) desc: f take: 5})");
+    AW_SAME_OR_ERR("sz0r", "(select {f: f k: k from: T asc: f take: 5})");
+    AW_SAME_OR_ERR("sz0r", "(select {f: f k: k from: T desc: f take: 5})");
     /* Two chunks of zero vectors: -0.0 CONST, +0.0 CONST, a RAW mix, in
      * turn.  Selections cut inside vectors, at vector and chunk edges, so
      * vectors answered from statistics, row-read runs and whole chunks
@@ -5320,7 +5334,8 @@ static test_result_t test_signed_zeros(void) {
                    "(if (== 1 (% (div j 1024) 3)) 0.0 (if (== 0 (% j 2)) (neg 0.0) 0.0)))) (til 131072))))", -1);
     TEST_ASSERT_EQ_I(aw_vec_enc("szc", "f", 63), RAY_ENC_CONST);
     TEST_ASSERT_EQ_I(aw_vec_enc("szc", "f", 64), RAY_ENC_CONST);
-    TEST_ASSERT_EQ_I(aw_vec_enc("szc", "f", 65), RAY_ENC_RAW);
+    /* P5: the +/-0.0 mix now selects DICT (it was RAW) */
+    TEST_ASSERT_EQ_I(aw_vec_enc("szc", "f", 65), RAY_ENC_DICT);
     aw_eval_ok("(set T (.db.splayed.get \"" AW_TMP "/szc2/\"))");
     static const int64_t los[] = { -1, 0, 1000, 1023, 1024, 2047, 64511, 65000, 65535, 65536, 66000 };
     static const int64_t his[] = { 131072, 65536, 65537, 66560, 70000 };

@@ -279,6 +279,35 @@ static ray_t* f64_zeros_dict(void) {
     for (int i = 0; i < 1024; i++) memcpy((double*)ray_data(v) + i, &b[(uint32_t)((uint32_t)i * 2654435761u) >> 30], 8);
     return v;
 }
+/* 2048 rows, ALP with exceptions: multiples of 0.25 (ALP-encodable) with a
+ * -0.0 (bit pattern, D10) every 17th row; two vectors of 61 / 60 exceptions. */
+static ray_t* f64_alp_exc(void) {
+    ray_t* v = ray_vec_new(RAY_F64, 2048); v->len = 2048;
+    for (int i = 0; i < 2048; i++) {
+        double x = (double)(i % 100) / 4.0;
+        if (i % 17 == 0) memcpy(&x, &(uint64_t){ 1ull << 63 }, 8);
+        ((double*)ray_data(v))[i] = x;
+    }
+    return v;
+}
+/* 1024 random mantissas under 1.0 <= x < 1.5 (the top 16 bits take 8 values):
+ * ALP_RD picks right_bits 48..51 and a small dictionary. */
+static ray_t* f64_alprd(void) {
+    ray_t* v = ray_vec_new(RAY_F64, 1024); v->len = 1024;
+    uint64_t s = 5;
+    for (int i = 0; i < 1024; i++) {
+        s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+        uint64_t b = 0x3FF0000000000000ull | ((s & 7) << 48) | (s >> 16 & 0xFFFFFFFFFFFFull);
+        memcpy((double*)ray_data(v) + i, &b, 8);
+    }
+    return v;
+}
+/* 16 runs of 64 equal values: float RLE */
+static ray_t* f64_runs(void) {
+    ray_t* v = ray_vec_new(RAY_F64, 1024); v->len = 1024;
+    for (int i = 0; i < 1024; i++) ((double*)ray_data(v))[i] = 1.5 + (double)(i / 64);
+    return v;
+}
 static ray_t* guid_raw(void) {
     ray_t* g = ray_vec_new(RAY_GUID, 4); g->len = 4;
     for (int i = 0; i < 64; i++) ((uint8_t*)ray_data(g))[i] = (uint8_t)(i * 37 + 1);
@@ -468,15 +497,14 @@ static test_result_t test_reject_side_data(void) {
             if (t) { float f = 1.0f + (float)i; memcpy(sb + 40 + 4 * i, &f, 4); }
             else { double x = 1.0 + (double)i; memcpy(sb + 40 + 8 * i, &x, 8); }
         }
-        ray_t* want = t ? f32_plain() : f64_plain();
-        ray_retain(want);
-        SAVE_RAW(want, p); NEED_ENC(0, 0, RAY_ENC_RAW);
+        SAVE_RAW(t ? f32_plain() : f64_plain(), p); NEED_ENC(0, 0, RAY_ENC_RAW);
         put_side(sb, 72); TEST_ASSERT_TRUE(img_store(p, g_len));
+        ray_t* want = t ? f32_plain() : f64_plain();               /* from here every path releases it */
         ray_t* c = ray_col_mmap(p);
         bool loaded = c && !RAY_IS_ERR(c);
         if (c && RAY_IS_ERR(c)) ray_error_free(c);
         if (!loaded) ray_release(want);
-        TEST_ASSERT_FMT(loaded, "float VALUE_DICT entry, type %d: load failed", want->type);
+        TEST_ASSERT_FMT(loaded, "float VALUE_DICT entry, type %d: load failed", t ? RAY_F32 : RAY_F64);
         ray_t* m = ray_enccol_materialize(c);                      /* borrowed on success */
         bool same = m && !RAY_IS_ERR(m) && m->len == want->len &&
                     memcmp(ray_data(m), ray_data(want), (size_t)want->len * (t ? 4 : 8)) == 0;
@@ -525,6 +553,17 @@ static test_result_t test_reject_side_data(void) {
             if (k == 1) { W64(entry + 32, 0x7FF8000000000000ull); needle = "VALUE_DICT value is a NaN"; }
             BAD(p, 1, "corrupt", needle);
         }
+    }
+    {   /* bytes after a float DICT body: the payload (and its chunk) grows by 32
+         * zero bytes spliced in before the side data, which shifts by the same 32 */
+        SAVE_AS(f64_zeros_dict(), p, RAY_ENC_DICT); NEED_ENC(0, 0, RAY_ENC_DICT);
+        size_t end = chunk_end(0), tail = g_len - end;
+        uint8_t* q = realloc(g_img, g_len + 32); TEST_ASSERT_TRUE(q != NULL); g_img = q;
+        memmove(g_img + end + 32, g_img + end, tail); memset(g_img + end, 0, 32);
+        g_len += 32;
+        W64(desc_at(0, 0) + 16, rd64(desc_at(0, 0) + 16) + 32); W64(DIR(0) + 8, rd64(DIR(0) + 8) + 32);
+        W64(EH + 16, rd64(EH + 16) + 32); W64(EH + 56, g_len);
+        BAD(p, 1, "corrupt", "bytes after the body");
     }
     {   /* a DICT vector whose side entry is gone */
         SAVE(i64_dict(), p); NEED_ENC(0, 0, RAY_ENC_DICT);
@@ -627,6 +666,27 @@ static test_result_t test_reject_payloads(void) {
     /* F32: one trailer value; 4 value bytes, 4 padding (bitmap 128, body 16, trailer @+144, position @+152, value @+160) */
     SAVE_RAW(f32_odd(), p); NEED_ENC(0, 0, RAY_ENC_RAW); at = payload_at(0, 0);
     W8(at + 128 + 16 + 16 + 4, 1);                         BAD(p, 1, "corrupt", "trailer value padding");
+    /* a NaN on a non-null row of a non-RAW body (P5): the bitmap has no
+     * bit for it, so it is corrupt whichever codec carries it */
+    {   /* ALP: the last exception value of vector 0 becomes a NaN */
+        SAVE_AS(f64_alp_exc(), p, RAY_ENC_ALP); NEED_ENC(0, 0, RAY_ENC_ALP);
+        uint16_t ne; memcpy(&ne, g_img + payload_at(0, 0) + 2, 2); TEST_ASSERT_TRUE(ne > 0);
+        W64(payload_at(0, 0) + (size_t)rd64(desc_at(0, 0) + 16) - 8, 0x7FF8000000000001ull);
+        BAD(p, 1, "corrupt", "NaN outside the bitmap");
+    }
+    {   /* ALP_RD: the last (largest) dictionary entry becomes the left part of a quiet NaN, so the rows coded with it are NaNs */
+        SAVE_AS(f64_alprd(), p, RAY_ENC_ALP_RD); NEED_ENC(0, 0, RAY_ENC_ALP_RD); at = payload_at(0, 0);
+        int rb = g_img[at], dn = g_img[at + 1];
+        TEST_ASSERT_FMT(rb >= 48 && rb <= 51 && dn >= 1, "ALP_RD fixture: right_bits %d, dictionary %d", rb, dn);
+        W16(at + 8 + 2 * (size_t)(dn - 1), (uint16_t)(0x7FF8000000000000ull >> rb));
+        BAD(p, 1, "corrupt", "NaN outside the bitmap");
+    }
+    {   /* RLE: the first run's value becomes a NaN (values child RAW: header @+8, values @+16) */
+        SAVE_AS(f64_runs(), p, RAY_ENC_RLE); NEED_ENC(0, 0, RAY_ENC_RLE); at = payload_at(0, 0);
+        TEST_ASSERT_EQ_I(g_img[at + 8], RAY_ENC_RAW);
+        W64(at + 16, 0x7FF8000000000001ull);
+        BAD(p, 1, "corrupt", "NaN outside the bitmap");
+    }
     /* GUID */
     SAVE(guid_raw(), p); NEED_ENC(0, 0, RAY_ENC_RAW);
     W64(desc_at(0, 0) + 16, 56); set_chunk_bytes(0, 3072 + 56); BAD(p, 1, "corrupt", "GUID RAW body size");
@@ -1544,10 +1604,11 @@ static test_result_t test_lazy_float(void) {
     TEST_ASSERT_FMT(same, "filtered query on generation 2: %s", msg);
     ray_error_clear();
     ray_t* e = ec_query(ray_test_tmp(EC_TMP "/lf2/"), "(sum (at T 'x))");          /* reads chunk 1 */
-    TEST_ASSERT_TRUE(e && RAY_IS_ERR(e) && strcmp(ray_err_code(e), "corrupt") == 0);
-    TEST_ASSERT_FMT(has_needle("chunk 1 vector 0 codec body: ALP exponent above 18") && names_path(path),
-                    "%s (path %s)", ray_error_msg() ? ray_error_msg() : "", path);
-    ray_error_free(e);
+    bool e_ok = e && RAY_IS_ERR(e) && strcmp(ray_err_code(e), "corrupt") == 0 &&
+                has_needle("chunk 1 vector 0 codec body: ALP exponent above 18") && names_path(path);
+    char e_msg[512]; snprintf(e_msg, sizeof e_msg, "%s", ray_error_msg() ? ray_error_msg() : "");
+    if (e && RAY_IS_ERR(e)) ray_error_free(e); else if (e) ray_release(e);
+    TEST_ASSERT_FMT(e_ok, "%s (path %s)", e_msg, path);
     TEST_ASSERT_TRUE(ec_eval_ok("(set T 0)"));                          /* drop the table's columns */
     EXPECT(path, 1, "corrupt", "chunk 1 vector 0 codec body: ALP exponent above 18");
     PASS();
@@ -1636,7 +1697,7 @@ static test_result_t test_fuzz_flips(void) {
         else if (base == 3) { v = ray_vec_new(RAY_STR, 50);
             for (int i = 0; i < 50; i++) v = ray_str_vec_append(v, i % 3 ? "a long pooled string value" : "s", i % 3 ? 26 : 1); }
         else if (base == 4) v = i64_dict();
-        else {   /* an indexed column: flips land in its index region too */
+        else if (base == 5) {   /* an indexed column: flips land in its index region too */
             v = ray_vec_new(RAY_I64, 70000); v->len = 70000;
             for (int i = 0; i < 70000; i++) ((int64_t*)ray_data(v))[i] = (i * 13) % 300;
             ray_t* r = ray_index_attach_hash(&v);
@@ -1644,12 +1705,7 @@ static test_result_t test_fuzz_flips(void) {
             v = r;
         }
         if (base == 6) {   /* ALP with exceptions (-0.0), two vectors */
-            v = ray_vec_new(RAY_F64, 2048); v->len = 2048;
-            for (int i = 0; i < 2048; i++) {
-                double x = (double)(i % 100) / 4.0;
-                if (i % 17 == 0) memcpy(&x, &(uint64_t){ 1ull << 63 }, 8);
-                ((double*)ray_data(v))[i] = x;
-            }
+            v = f64_alp_exc();
             force = RAY_ENC_ALP;
         } else if (base == 7) {   /* ALP_RD */
             v = ray_vec_new(RAY_F64, 1024); v->len = 1024;
@@ -1673,6 +1729,10 @@ static test_result_t test_fuzz_flips(void) {
         if (force >= 0) { SAVE_AS(v, p, force); NEED_ENC(0, 0, force); }
         else SAVE(v, p);
         if (base == 9) TEST_ASSERT_TRUE(g_img[desc_at(0, 0) + 4] & RAY_ENC_DESC_TRAILER);
+        if (base == 6) {   /* the exceptions are the subject: the saved body really has some */
+            uint16_t ne; memcpy(&ne, g_img + payload_at(0, 0) + 2, 2);
+            TEST_ASSERT_FMT(ne > 0, "fuzz base 6: ALP vector 0 has n_exc = %d", ne);
+        }
         uint8_t* orig = malloc(g_len); TEST_ASSERT_TRUE(orig != NULL); memcpy(orig, g_img, g_len);
         size_t first_payload = (size_t)rd64(DIR(0)) + 3072;
         size_t index_off = (size_t)rd64(EH + 32);

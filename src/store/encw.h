@@ -62,6 +62,10 @@ bool      ray_encw_type_supported(int8_t type);
  * selection.  A forced encoding that is not applicable fails the vector
  * with RAY_ERR_NYI. */
 void      ray_encw_test_force(int enc);
+/* Test hook: like ray_encw_test_force, for F32 / F64 vectors only (it wins
+ * over ray_encw_test_force there); other types keep selection or the general
+ * force.  -1 restores. */
+void      ray_encw_test_force_float(int enc);
 
 /* Column assembly (spec "Format"): begin, one chunk per 65536 rows, finish. */
 typedef struct {

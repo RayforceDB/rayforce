@@ -53,6 +53,8 @@ bool ray_encw_type_supported(int8_t t) { return t >= RAY_BOOL && t <= RAY_STR; }
 
 static _Atomic(int) g_encw_force = -1;
 void ray_encw_test_force(int enc) { atomic_store(&g_encw_force, enc); }
+static _Atomic(int) g_encw_force_float = -1;
+void ray_encw_test_force_float(int enc) { atomic_store(&g_encw_force_float, enc); }
 
 void ray_encw_vec_init(ray_encw_vec_t* v) { memset(v, 0, sizeof *v); }
 void ray_encw_vec_free(ray_encw_vec_t* v) { ray_enc_buf_free(&v->payload); }
@@ -184,7 +186,8 @@ static ray_err_t encw_float(int8_t type, const void* data, int64_t start, int n,
     ray_err_t err;
     if (o->n_nulls > 0 && (err = put(o, nullmap, 128)) != RAY_OK) return err;
     ray_enc_choice_t c;
-    int forced = atomic_load(&g_encw_force);
+    int forced = atomic_load(&g_encw_force_float);
+    if (forced < 0) forced = atomic_load(&g_encw_force);
     if (o->n_nulls == n) {
         /* Spec "Nulls": an all-null vector is always CONST of the fill (+0.0). */
         if (!ray_enc_float_write(RAY_ENC_CONST, bits, n, T, NULL, NULL, &o->payload, &c))
