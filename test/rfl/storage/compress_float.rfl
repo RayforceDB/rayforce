@@ -1,0 +1,32 @@
+;; @requires: posix  (fixtures/checks run through a POSIX shell via .sys.exec)
+;; Float encodings end to end (compressed-columns P5): generation-2 answers
+;; equal generation 0, both zeros, NaN nulls.  -0.0 appears only inside a
+;; vector literal or alone in a form (#824: -0.0 and 0.0 merge inside one
+;; lambda).
+(.sys.exec "rm -rf /tmp/rf_test_p5fl")
+(set n 200000)
+(set i (til n))
+(set price (/ (as 'F64 (% (* i 7919) 100000)) 100.0))
+(set zs (at [-3.5 -0.0 0.0 2.25] (% (div i 3) 4)))
+(set runs (as 'F64 (div i 5000)))
+(set rnd (+ 1.0 (/ (as 'F64 (% (* i 2654435761) 1000003)) 1000003.0)))
+(set nul (map (fn [j] (if (== 0 (% j 13)) 0Nf (as 'F64 j))) i))
+(set T (table [price zs runs rnd nul] (list price zs runs rnd nul)))
+(.db.splayed.set "/tmp/rf_test_p5fl/g0/" T {compress: false})
+(.db.splayed.set "/tmp/rf_test_p5fl/g2/" T {compress: true})
+(set A (.db.splayed.get "/tmp/rf_test_p5fl/g0/"))
+(set C (.db.splayed.get "/tmp/rf_test_p5fl/g2/"))
+(count (select {from: C where: (== zs 0.0)})) -- (count (select {from: A where: (== zs 0.0)}))
+(count (select {from: C where: (== zs -0.0)})) -- (count (select {from: A where: (== zs -0.0)}))
+(count (select {from: C where: (< zs 0.0)})) -- (count (select {from: A where: (< zs 0.0)}))
+(count (select {from: C where: (>= zs -0.0)})) -- (count (select {from: A where: (>= zs -0.0)}))
+(count (select {from: C where: (> price 500.25)})) -- (count (select {from: A where: (> price 500.25)}))
+(count (select {from: C where: (== runs 7.0)})) -- (count (select {from: A where: (== runs 7.0)}))
+(count (select {from: C where: (> nul 1000.0)})) -- (count (select {from: A where: (> nul 1000.0)}))
+(sum (at C 'price)) -- (sum (at A 'price))
+(avg (at C 'rnd)) -- (avg (at A 'rnd))
+(min (at C 'zs)) -- (min (at A 'zs))
+(max (at C 'nul)) -- (max (at A 'nul))
+(sum (at C 'nul)) -- (sum (at A 'nul))
+(at (select {p: price from: C desc: price take: 3}) 'p) -- (at (select {p: price from: A desc: price take: 3}) 'p)
+(.sys.exec "rm -rf /tmp/rf_test_p5fl") -- 0

@@ -32,6 +32,12 @@
 #include "store/encw.h"
 #include "store/enccol.h"
 #include "store/colrange.h"
+#include "store/enceval.h"
+#include "ops/ops.h"
+#include "lang/env.h"
+#include "lang/format.h"
+#include "table/table.h"
+#include "vec/str.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,9 +51,12 @@ static ray_enc_buf_t fl_buf;
 static uint64_t*     fl_dict;
 static uint8_t*      fl_mem;                 /* malloc'd scratch */
 static ray_t*        fl_vec;                 /* a test's column */
+static ray_t*        fl_map;                 /* a test's mapped generation-2 column */
+static ray_enc_vview_t fl_vw;                /* a test's vector view (about 21 KB) */
 static void fl_teardown(void) {
     ray_encw_test_force(-1);
     if (fl_vec) { ray_release(fl_vec); fl_vec = NULL; }
+    if (fl_map) { ray_release(fl_map); fl_map = NULL; }
     ray_enc_buf_free(&fl_buf); fl_buf = (ray_enc_buf_t){0};
     if (fl_dict) { ray_free_raw(fl_dict); fl_dict = NULL; }
     free(fl_mem); fl_mem = NULL;
@@ -985,6 +994,406 @@ static test_result_t test_trailer_counts_in_choice(void) {
     PASS();
 }
 
+/* ---- float views, evaluators and their consumers (Task 6) ---- */
+static double bd(uint64_t b) { double x; memcpy(&x, &b, 8); return x; }
+
+/* d as a column of type ty (F32: each value narrowed, -0.0 by its bit
+ * pattern, D10; a NaN becomes the type's null), HAS_NULLS when a NaN is in. */
+static ray_t* fl_typed(int8_t ty, const double* d, int64_t n) {
+    bool nul = false;
+    for (int64_t i = 0; i < n; i++) nul |= d[i] != d[i];
+    ray_t* v;
+    if (ty == RAY_F64) v = f64_col(d, n);
+    else {
+        v = ray_vec_new(RAY_F32, n); v->len = n;
+        float* o = (float*)ray_data(v);
+        for (int64_t i = 0; i < n; i++) {
+            if (db(d[i]) == NEG0_64) { uint32_t z = (uint32_t)NEG0_32; memcpy(&o[i], &z, 4); }
+            else o[i] = d[i] != d[i] ? NULL_F32 : (float)d[i];
+        }
+    }
+    if (nul) v->attrs |= RAY_ATTR_HAS_NULLS;
+    return v;
+}
+
+/* d saved at path as generation 2, every float vector forced to enc (-1:
+ * selection), then mapped into fl_map.  False on any failure. */
+static bool fl_view_col(int8_t ty, int enc, const double* d, int64_t n, const char* path) {
+    fl_drop();
+    if (fl_map) { ray_release(fl_map); fl_map = NULL; }
+    fl_vec = fl_typed(ty, d, n);
+    ray_encw_test_force_float(enc);
+    ray_err_t e = ray_col_save_gen(fl_vec, path, 2);
+    ray_encw_test_force_float(-1);
+    fl_drop();
+    if (e != RAY_OK) return false;
+    ray_t* c = ray_col_mmap(path);
+    if (!c || RAY_IS_ERR(c)) { if (c) ray_error_free(c); return false; }
+    fl_map = c;
+    return true;
+}
+/* path mapped again into fl_map (after a patch). */
+static bool fl_remap(const char* path) {
+    if (fl_map) { ray_release(fl_map); fl_map = NULL; }
+    ray_t* c = ray_col_mmap(path);
+    if (!c || RAY_IS_ERR(c)) { if (c) ray_error_free(c); return false; }
+    fl_map = c;
+    return true;
+}
+/* Vector vec of fl_map as a view into fl_vw: 1 / 0 / -1 (the error freed). */
+static int fl_vview(int64_t vec) {
+    ray_t* err = NULL;
+    int r = ray_enccol_vview(ray_enccol_of(fl_map), vec, &fl_vw, &err);
+    if (err) ray_error_free(err);
+    return r;
+}
+
+/* The evaluators equal a direct scalar evaluation under the predicate
+ * comparator (-0.0 == +0.0), for every operator, both zeros, both null
+ * results, F64 and F32 (widened), over RLE and DICT views. */
+static test_result_t test_eval_f64(void) {
+    static double d[1024];
+    const double dv[4] = { -3.5, bd(NEG0_64), 0.0, 2.25 };
+    for (int i = 0; i < 1024; i++) d[i] = dv[(i / 3) % 4];
+    d[100] = NULL_F64; d[513] = NULL_F64;
+    const double consts[] = { 0.0, bd(NEG0_64), -3.5, 2.25, 1.0, -10.0, 3.0 };
+    static const int encs[] = { RAY_ENC_RLE, RAY_ENC_DICT };
+    static const int8_t tys[] = { RAY_F64, RAY_F32 };
+    const char* p = ray_test_tmp(FL_TMP "/ev");
+    for (size_t t = 0; t < 2; t++)
+    for (size_t k = 0; k < 2; k++) {
+        TEST_ASSERT_TRUE(fl_view_col(tys[t], encs[k], d, 1024, p));
+        TEST_ASSERT_EQ_I(desc_enc(p, 0), encs[k]);
+        TEST_ASSERT_EQ_I(fl_vview(0), 1);
+        TEST_ASSERT_EQ_I(fl_vw.enc, encs[k]);
+        TEST_ASSERT_EQ_I(fl_vw.k.T, tys[t] == RAY_F32 ? 32 : 64);
+        TEST_ASSERT_TRUE(fl_vw.k.is_float);
+        TEST_ASSERT_EQ_I(fl_vw.n_nulls, 2);
+        TEST_ASSERT_NOT_NULL(fl_vw.nullmap);
+        uint8_t bits[1024];
+        for (uint16_t op = OP_EQ; op <= OP_GE; op++)
+            for (size_t ci = 0; ci < sizeof consts / sizeof consts[0]; ci++)
+                for (uint8_t nr = 0; nr < 2; nr++) {
+                    memset(bits, 0xAA, sizeof bits);
+                    TEST_ASSERT_TRUE(ray_enc_eval_cmp_f64(&fl_vw, op, consts[ci], nr, bits));
+                    const double c = consts[ci];
+                    for (int i = 0; i < 1024; i++) {
+                        uint8_t want;
+                        if (d[i] != d[i]) want = nr;
+                        else switch (op) {
+                            case OP_EQ: want = d[i] == c; break; case OP_NE: want = d[i] != c; break;
+                            case OP_LT: want = d[i] <  c; break; case OP_LE: want = d[i] <= c; break;
+                            case OP_GT: want = d[i] >  c; break; default:    want = d[i] >= c; break; }
+                        TEST_ASSERT_FMT(bits[i] == want, "type %d enc %d op %u c %g nr %u row %d: %u",
+                                        tys[t], encs[k], op, c, nr, i, bits[i]);
+                    }
+                }
+        /* declines: a NaN constant (the null constant), an operator outside
+         * OP_EQ .. OP_GE; the integer evaluator declines the float view */
+        TEST_ASSERT_FALSE(ray_enc_eval_cmp_f64(&fl_vw, OP_EQ, NULL_F64, 0, bits));
+        TEST_ASSERT_FALSE(ray_enc_eval_cmp_f64(&fl_vw, OP_GE + 1, 0.0, 0, bits));
+        TEST_ASSERT_FALSE(ray_enc_eval_cmp(&fl_vw, OP_EQ, 0, 0, bits));
+        TEST_ASSERT_EQ_I(ray_enc_const_decision_f64(&fl_vw, OP_EQ, 0.0, 0), -1);   /* not CONST */
+    }
+    /* CONST: one value for every row */
+    static double cst[1024];
+    for (int i = 0; i < 1024; i++) cst[i] = bd(NEG0_64);
+    TEST_ASSERT_TRUE(fl_view_col(RAY_F64, RAY_ENC_CONST, cst, 1024, p));
+    TEST_ASSERT_EQ_I(desc_enc(p, 0), RAY_ENC_CONST);
+    TEST_ASSERT_EQ_I(fl_vview(0), 1);
+    uint8_t bits[1024];
+    TEST_ASSERT_TRUE(ray_enc_eval_cmp_f64(&fl_vw, OP_EQ, 0.0, 0, bits));
+    for (int i = 0; i < 1024; i++) TEST_ASSERT_EQ_I(bits[i], 1);
+    TEST_ASSERT_TRUE(ray_enc_eval_cmp_f64(&fl_vw, OP_LT, 0.0, 0, bits));
+    for (int i = 0; i < 1024; i++) TEST_ASSERT_EQ_I(bits[i], 0);
+    PASS();
+}
+
+/* A nullable CONST float vector is decided whole only when the value's
+ * result equals null_result. */
+static test_result_t test_const_decision_f64(void) {
+    static double d[1024];
+    for (int i = 0; i < 1024; i++) d[i] = i == 7 ? NULL_F64 : bd(NEG0_64);
+    const char* p = ray_test_tmp(FL_TMP "/cd");
+    TEST_ASSERT_TRUE(fl_view_col(RAY_F64, RAY_ENC_CONST, d, 1024, p));
+    TEST_ASSERT_EQ_I(desc_enc(p, 0), RAY_ENC_CONST);
+    TEST_ASSERT_EQ_I(fl_vview(0), 1);
+    TEST_ASSERT_EQ_I(ray_enc_const_decision_f64(&fl_vw, OP_LE, 0.0, 1), 1);        /* -0 <= 0 and null -> 1 */
+    TEST_ASSERT_EQ_I(ray_enc_const_decision_f64(&fl_vw, OP_EQ, 0.0, 0), -1);       /* -0 == 0 but null -> 0 */
+    TEST_ASSERT_EQ_I(ray_enc_const_decision_f64(&fl_vw, OP_GT, 0.0, 0), 0);
+    TEST_ASSERT_EQ_I(ray_enc_const_decision_f64(&fl_vw, OP_EQ, NULL_F64, 0), -1);  /* a NaN constant */
+    PASS();
+}
+
+/* The float RLE / DICT views make dec_floats' checks, and decline what
+ * decode rejects (D7); a trailer, RAW, ALP and ALP_RD decline (D6). */
+static test_result_t test_view_checks(void) {
+    const long desc = 96 + 64, payload = desc + RAY_ENC_DESC_AREA;    /* chunk 0, vector 0 */
+    const char* p = ray_test_tmp(FL_TMP "/vc");
+    static double d[1024];
+    /* RLE: 16 runs of 64 rows, 1.5 .. 16.5, no nulls: [nr, rsv][values
+     * child header][16 values][ends child] */
+    for (int i = 0; i < 1024; i++) d[i] = 1.5 + (double)(i / 64);
+    TEST_ASSERT_TRUE(fl_view_col(RAY_F64, RAY_ENC_RLE, d, 1024, p));
+    TEST_ASSERT_EQ_I(desc_enc(p, 0), RAY_ENC_RLE);
+    TEST_ASSERT_EQ_I(fl_vview(0), 1);
+    TEST_ASSERT_EQ_I(fl_vw.n_runs, 16);
+    TEST_ASSERT_EQ_U(fl_vw.run_vals.q[3], db(4.5));
+    TEST_ASSERT_EQ_I(fl_vw.run_ends.h[3], 256);
+    TEST_ASSERT_TRUE(fl_vw.nullmap == NULL);
+    uint8_t enc0; TEST_ASSERT_TRUE(fl_read(p, payload + 8, &enc0, 1));
+    TEST_ASSERT_EQ_I(enc0, RAY_ENC_RAW);
+    uint64_t v0, nan = 0x7FF8000000000000ull, half = db(0.5), two = db(2.0), smin;
+    TEST_ASSERT_TRUE(fl_read(p, payload + 16, &v0, 8));
+    TEST_ASSERT_EQ_U(v0, db(1.5));
+    /* a run value that is a NaN on non-null rows */
+    fl_patch(p, payload + 16, &nan, 8);
+    TEST_ASSERT_TRUE(fl_remap(p)); TEST_ASSERT_EQ_I(fl_vview(0), 0);
+    TEST_ASSERT_STR_EQ(fl_mat_code(p), "corrupt");
+    TEST_ASSERT_FMT(strstr(fl_msg, "NaN outside the bitmap") != NULL, "%s", fl_msg);
+    /* a run value below the statistics */
+    fl_patch(p, payload + 16, &half, 8);
+    TEST_ASSERT_TRUE(fl_remap(p)); TEST_ASSERT_EQ_I(fl_vview(0), 0);
+    TEST_ASSERT_STR_EQ(fl_mat_code(p), "corrupt");
+    TEST_ASSERT_FMT(strstr(fl_msg, "value outside its statistics") != NULL, "%s", fl_msg);
+    fl_patch(p, payload + 16, &v0, 8);
+    TEST_ASSERT_TRUE(fl_remap(p)); TEST_ASSERT_EQ_I(fl_vview(0), 1);
+    /* the statistics raised above the first run */
+    TEST_ASSERT_TRUE(fl_read(p, desc + 32, &smin, 8));
+    fl_patch(p, desc + 32, &two, 8);
+    TEST_ASSERT_TRUE(fl_remap(p)); TEST_ASSERT_EQ_I(fl_vview(0), 0);
+    TEST_ASSERT_STR_EQ(fl_mat_code(p), "corrupt");
+    TEST_ASSERT_FMT(strstr(fl_msg, "value outside its statistics") != NULL, "%s", fl_msg);
+    fl_patch(p, desc + 32, &smin, 8);
+    /* a FOR_BP values child: legal for integers only */
+    uint8_t forbp = RAY_ENC_FOR_BP;
+    fl_patch(p, payload + 8, &forbp, 1);
+    TEST_ASSERT_TRUE(fl_remap(p)); TEST_ASSERT_EQ_I(fl_vview(0), 0);
+    TEST_ASSERT_STR_EQ(fl_mat_code(p), "corrupt");
+    fl_patch(p, payload + 8, &enc0, 1);
+    TEST_ASSERT_TRUE(fl_remap(p)); TEST_ASSERT_EQ_I(fl_vview(0), 1);
+    TEST_ASSERT_STR_EQ(fl_mat_code(p), "");
+
+    /* nullable RLE: a run wholly in the bitmap is never read, so its
+     * stored value may be anything (a NaN here); decode agrees */
+    for (int i = 0; i < 1024; i++) d[i] = i >= 192 && i < 256 ? NULL_F64 : 1.5 + (double)(i / 64);
+    TEST_ASSERT_TRUE(fl_view_col(RAY_F64, RAY_ENC_RLE, d, 1024, p));
+    TEST_ASSERT_EQ_I(desc_enc(p, 0), RAY_ENC_RLE);
+    TEST_ASSERT_EQ_I(fl_vview(0), 1);
+    TEST_ASSERT_NOT_NULL(fl_vw.nullmap);
+    int nullrun = -1;
+    for (uint32_t r = 0, prev = 0; r < fl_vw.n_runs; prev = fl_vw.run_ends.h[r++])
+        if (prev == 192 && fl_vw.run_ends.h[r] == 256) nullrun = (int)r;
+    TEST_ASSERT_FMT(nullrun >= 0, "no run holds exactly the null rows (%u runs)", fl_vw.n_runs);
+    const long nbody = payload + 128;                                  /* after the bitmap */
+    fl_patch(p, nbody + 16 + 8 * nullrun, &nan, 8);
+    TEST_ASSERT_TRUE(fl_remap(p)); TEST_ASSERT_EQ_I(fl_vview(0), 1);
+    TEST_ASSERT_STR_EQ(fl_mat_code(p), "");
+    TEST_ASSERT_EQ_I(fl_range_equal(p, (fl_vec = fl_typed(RAY_F64, d, 1024))), 0);
+    fl_drop();
+    /* the run next to it holds non-null rows: a NaN there is corrupt */
+    fl_patch(p, nbody + 16 + 8 * (nullrun + 1), &nan, 8);
+    TEST_ASSERT_TRUE(fl_remap(p)); TEST_ASSERT_EQ_I(fl_vview(0), 0);
+    TEST_ASSERT_STR_EQ(fl_mat_code(p), "corrupt");
+
+    /* DICT: -3.5, -0.0, +0.0, 2.25; [codes child header][base][packed] */
+    static const uint64_t dv[4] = { 0xC00C000000000000ull, NEG0_64, 0, 0x4002000000000000ull };
+    for (int i = 0; i < 1024; i++) memcpy(&d[i], &dv[(i * 7) % 4], 8);
+    TEST_ASSERT_TRUE(fl_view_col(RAY_F64, RAY_ENC_DICT, d, 1024, p));
+    TEST_ASSERT_EQ_I(desc_enc(p, 0), RAY_ENC_DICT);
+    TEST_ASSERT_EQ_I(fl_vview(0), 1);
+    TEST_ASSERT_EQ_I(fl_vw.enc, RAY_ENC_DICT);
+    TEST_ASSERT_EQ_U(fl_vw.dict_n, 4);
+    for (int i = 0; i < 1024; i++) TEST_ASSERT_EQ_U(fl_vw.dict[fl_vw.codes[i]], dv[(i * 7) % 4]);
+    TEST_ASSERT_TRUE(fl_read(p, payload, &enc0, 1));
+    TEST_ASSERT_EQ_I(enc0, RAY_ENC_FOR_BP);
+    /* the statistics' min at +0.0: the -3.5 rows fall outside */
+    uint64_t pz = 0, nz = NEG0_64, base, four = 4;
+    TEST_ASSERT_TRUE(fl_read(p, desc + 32, &smin, 8));
+    fl_patch(p, desc + 32, &pz, 8);
+    TEST_ASSERT_TRUE(fl_remap(p)); TEST_ASSERT_EQ_I(fl_vview(0), 0);
+    TEST_ASSERT_STR_EQ(fl_mat_code(p), "corrupt");
+    TEST_ASSERT_FMT(strstr(fl_msg, "value outside its statistics") != NULL, "%s", fl_msg);
+    fl_patch(p, desc + 32, &smin, 8);
+    /* codes past the dictionary (the FOR_BP base raised) */
+    TEST_ASSERT_TRUE(fl_read(p, payload + 8, &base, 8));
+    fl_patch(p, payload + 8, &four, 8);
+    TEST_ASSERT_TRUE(fl_remap(p)); TEST_ASSERT_EQ_I(fl_vview(0), 0);
+    TEST_ASSERT_STR_EQ(fl_mat_code(p), "corrupt");
+    fl_patch(p, payload + 8, &base, 8);
+    /* a codes child other than FOR_BP */
+    uint8_t raw = RAY_ENC_RAW;
+    fl_patch(p, payload, &raw, 1);
+    TEST_ASSERT_TRUE(fl_remap(p)); TEST_ASSERT_EQ_I(fl_vview(0), 0);
+    fl_patch(p, payload, &enc0, 1);
+    TEST_ASSERT_TRUE(fl_remap(p)); TEST_ASSERT_EQ_I(fl_vview(0), 1);
+    TEST_ASSERT_STR_EQ(fl_mat_code(p), "");
+    /* zeros against the statistics compare equal (the predicate
+     * comparator): -0.0 rows under a +0.0 min are inside, as decode reads them */
+    static const uint64_t zv[3] = { NEG0_64, 0, 0x4002000000000000ull };
+    for (int i = 0; i < 1024; i++) memcpy(&d[i], &zv[i % 3], 8);
+    TEST_ASSERT_TRUE(fl_view_col(RAY_F64, RAY_ENC_DICT, d, 1024, p));
+    TEST_ASSERT_EQ_I(desc_enc(p, 0), RAY_ENC_DICT);
+    TEST_ASSERT_TRUE(fl_read(p, desc + 32, &smin, 8));
+    TEST_ASSERT_EQ_U(smin, nz);
+    fl_patch(p, desc + 32, &pz, 8);
+    TEST_ASSERT_TRUE(fl_remap(p)); TEST_ASSERT_EQ_I(fl_vview(0), 1);
+    TEST_ASSERT_STR_EQ(fl_mat_code(p), "");
+
+    /* a trailer (a non-canonical NaN) declines every float view (D6); the
+     * range read still answers */
+    static const int tforces[] = { RAY_ENC_CONST, RAY_ENC_RLE, RAY_ENC_DICT };
+    for (size_t k = 0; k < 3; k++) {
+        for (int i = 0; i < 1024; i++) d[i] = k == 0 ? 2.5 : 1.5 + (double)(i / 64);
+        memcpy(&d[5], &(uint64_t){ 0x7FF8000000000077ull }, 8);
+        TEST_ASSERT_TRUE(fl_view_col(RAY_F64, tforces[k], d, 1024, p));
+        TEST_ASSERT_EQ_I(desc_enc(p, 0), tforces[k]);
+        uint16_t fl; TEST_ASSERT_TRUE(fl_read(p, desc + 4, &fl, 2));
+        TEST_ASSERT_TRUE(fl & RAY_ENC_DESC_TRAILER);
+        TEST_ASSERT_EQ_I(fl_vview(0), 0);
+        fl_vec = fl_typed(RAY_F64, d, 1024);
+        memcpy((double*)ray_data(fl_vec) + 5, &(uint64_t){ 0x7FF8000000000077ull }, 8);
+        TEST_ASSERT_FMT(fl_range_equal(p, fl_vec) == 0, "force %d", tforces[k]);
+        fl_drop();
+    }
+    /* RAW, ALP and ALP_RD decline: the caller decodes */
+    static const int dforces[] = { RAY_ENC_RAW, RAY_ENC_ALP, RAY_ENC_ALP_RD };
+    for (int i = 0; i < 1024; i++) d[i] = (double)((i * 7919) % 100000) / 100.0;
+    for (size_t k = 0; k < 3; k++) {
+        TEST_ASSERT_TRUE(fl_view_col(RAY_F64, dforces[k], d, 1024, p));
+        TEST_ASSERT_EQ_I(desc_enc(p, 0), dforces[k]);
+        TEST_ASSERT_EQ_I(fl_vview(0), 0);
+    }
+    PASS();
+}
+
+/* ---- the view consumers over a float column (D7) ---- */
+static ray_runtime_t* g_flrt;
+static void fl_rt_setup(void) {
+    g_flrt = ray_runtime_create(0, NULL);
+    (void)ray_test_rm_rf(ray_test_tmp(FL_TMP)); (void)ray_test_mkdir_p(ray_test_tmp(FL_TMP));
+}
+static void fl_rt_teardown(void) {
+    ray_test_hooks_off(); ray_encw_test_force(-1);
+    if (fl_map) { ray_release(fl_map); fl_map = NULL; }
+    (void)ray_test_rm_rf(ray_test_tmp(FL_TMP)); ray_runtime_destroy(g_flrt);
+}
+static ray_t* fl_eval(const char* src) { return ray_eval_str(ray_test_tmp(src)); }
+static bool fl_eval_ok(const char* src) {
+    ray_t* r = fl_eval(src);
+    if (r && RAY_IS_ERR(r)) { fprintf(stderr, "fl_eval_ok: %s: %s\n", src, ray_error_msg()); ray_error_free(r); return false; }
+    if (r) ray_release(r);
+    return true;
+}
+/* q on generation 0 (table vc0) and generation 2 (vc2) as T: equal types
+ * and formatted results. */
+static test_result_t fl_same(const char* q) {
+    ray_t* out[2];
+    for (int gen = 0; gen < 2; gen++) {
+        TEST_ASSERT_TRUE(fl_eval_ok(gen ? "(set T (.db.splayed.get \"" FL_TMP "/vc2/\"))"
+                                        : "(set T (.db.splayed.get \"" FL_TMP "/vc0/\"))"));
+        out[gen] = fl_eval(q);
+        TEST_ASSERT_FMT(out[gen] && !RAY_IS_ERR(out[gen]), "%s gen %d: %s", q, gen, ray_error_msg());
+    }
+    TEST_ASSERT_FMT(out[0]->type == out[1]->type, "%s: type %d vs %d", q, out[0]->type, out[1]->type);
+    ray_t* fa = ray_fmt(out[0], 0); ray_t* fb2 = ray_fmt(out[1], 0);
+    bool eq = ray_str_len(fa) == ray_str_len(fb2) && memcmp(ray_str_ptr(fa), ray_str_ptr(fb2), ray_str_len(fa)) == 0;
+    if (!eq) fprintf(stderr, "gen 0: %.*s\ngen 2: %.*s\n", (int)ray_str_len(fa), ray_str_ptr(fa), (int)ray_str_len(fb2), ray_str_ptr(fb2));
+    ray_release(fa); ray_release(fb2); ray_release(out[0]); ray_release(out[1]);
+    TEST_ASSERT_FMT(eq, "%s differs", q);
+    PASS();
+}
+#define FL_SAME(q) do { test_result_t r_ = fl_same(q); if (r_.status != TEST_PASS) return r_; } while (0)
+
+/* -0.0 / +0.0 alternating (with 1.5, -2.0 and NaN nulls), in runs forced
+ * RLE and then scattered forced DICT: every consumer of a float view (group keys, first-n keys,
+ * take, count, in, sum, the fused filter) equals generation 0, the zeros
+ * grouping together. */
+static test_result_t test_view_consumers(void) {
+    const int64_t n = 70000;                                      /* two chunks */
+    static const int forces[] = { RAY_ENC_RLE, RAY_ENC_DICT };
+    for (size_t fi = 0; fi < 2; fi++) {
+        ray_t* k = ray_vec_new(RAY_I64, n);
+        ray_t* h = ray_vec_new(RAY_I64, n);
+        ray_t* f = ray_vec_new(RAY_F64, n);
+        TEST_ASSERT_TRUE(k && h && f);
+        k->len = h->len = f->len = n;
+        const double pat[6] = { bd(NEG0_64), 0.0, 1.5, bd(NEG0_64), 0.0, -2.0 };
+        for (int64_t i = 0; i < n; i++) {
+            ((int64_t*)ray_data(k))[i] = i;
+            ((int64_t*)ray_data(h))[i] = i % 3;
+            /* RLE: runs of 37 rows; DICT: scattered, so its codes child is
+             * FOR_BP (runs would make it RLE, which the view declines) */
+            const int64_t at = forces[fi] == RAY_ENC_RLE ? (i / 37) % 6 : (i * 7) % 6;
+            ((double*)ray_data(f))[i] = i % 997 == 5 ? NULL_F64 : pat[at];
+        }
+        f->attrs |= RAY_ATTR_HAS_NULLS;
+        ray_t* tb = ray_table_new(3);
+        tb = ray_table_add_col(tb, ray_sym_intern("k", 1), k); ray_release(k);
+        tb = ray_table_add_col(tb, ray_sym_intern("h", 1), h); ray_release(h);
+        tb = ray_table_add_col(tb, ray_sym_intern("f", 1), f); ray_release(f);
+        TEST_ASSERT_EQ_I(ray_env_set(ray_sym_intern("W", 1), tb), RAY_OK);
+        ray_release(tb);
+        TEST_ASSERT_TRUE(fl_eval_ok("(.db.splayed.set \"" FL_TMP "/vc0/\" W {compress: false})"));
+        ray_encw_test_force_float(forces[fi]);
+        bool ok = fl_eval_ok("(.db.splayed.set \"" FL_TMP "/vc2/\" W {compress: true})");
+        ray_encw_test_force_float(-1);
+        TEST_ASSERT_TRUE(ok);
+        /* every vector of f is a view of the forced encoding */
+        TEST_ASSERT_TRUE(fl_eval_ok("(set T (.db.splayed.get \"" FL_TMP "/vc2/\"))"));
+        ray_t* t = fl_eval("T");
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        ray_t* encv = ray_table_get_col_enc(t, ray_sym_intern("f", 1));
+        TEST_ASSERT_NOT_NULL(encv);
+        for (int64_t v = 0; v < (n + 1023) / 1024; v++) {
+            ray_t* err = NULL;
+            int r = ray_enccol_vview(ray_enccol_of(encv), v, &fl_vw, &err);
+            if (err) ray_error_free(err);
+            TEST_ASSERT_FMT(r == 1 && fl_vw.enc == forces[fi], "force %d vector %lld: view %d enc %d",
+                            forces[fi], (long long)v, r, fl_vw.enc);
+        }
+        ray_release(t);
+        static const char* const qs[] = {
+            "(select {c: (count k) s: (sum k) from: T by: f})",
+            "(select {c: (count k) from: T by: {f: f h: h}})",
+            "(select {c: (count k) from: T by: f take: 2})",
+            "(select {c: (count k) s: (sum k) from: T by: {f: f h: h} take: 4})",
+            "(select {c: (count k) from: T by: {h: h f: f} take: 5})",
+            "(take (at T 'f) 100)",
+            "(select {f: f k: k from: T where: (> k 1000) take: 50})",
+            "(count (select {from: T where: (== f 0.0)}))",
+            "(count (select {from: T where: (== f -0.0)}))",
+            "(count (select {from: T where: (!= f 0.0)}))",
+            "(count (select {from: T where: (< f 0.0)}))",
+            "(count (select {from: T where: (<= f -0.0)}))",
+            "(count (select {from: T where: (>= f -0.0)}))",
+            "(count (select {from: T where: (> f -1.0)}))",
+            "(count (select {from: T where: (in f [0.0 1.5])}))",
+            "(count (select {from: T where: (in f [-0.0])}))",
+            "(count (select {from: T where: (not (in f [-2.0]))}))",
+            "(sum (at T 'f))",
+            "(select {s: (sum f) c: (count f) from: T where: (>= k 1000)})",
+            "(select {s: (sum k) c: (count k) from: T where: (== f 0.0)})",
+            "(select {s: (sum k) from: T where: (and (== f -0.0) (> k 500))})",
+            "(select {s: (sum k) from: T where: (or (< f -1.0) (> f 1.0))})",
+            NULL,
+        };
+        for (int i = 0; qs[i]; i++) FL_SAME(qs[i]);
+        /* the fused filter answers f from its views: nothing of f decoded */
+        TEST_ASSERT_TRUE(fl_eval_ok("(set T (.db.splayed.get \"" FL_TMP "/vc2/\"))"));
+        ray_t* r = fl_eval("(select {k: k from: T where: (>= f 0.0)})");
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+        ray_release(r);
+        t = fl_eval("T");
+        encv = ray_table_get_col_enc(t, ray_sym_intern("f", 1));
+        uint64_t fdec = encv ? atomic_load(&ray_enccol_of(encv)->decoded_bytes) : 1;
+        ray_release(t);
+        TEST_ASSERT_FMT(fdec == 0, "force %d: f decoded %llu bytes", forces[fi], (unsigned long long)fdec);
+        TEST_ASSERT_TRUE(fl_eval_ok("(set T 0)"));
+    }
+    PASS();
+}
+
 const test_entry_t encfloat_entries[] = {
     { "encfloat/float_order",      test_float_order,      fl_setup, fl_teardown },
     { "encfloat/float_train_dict", test_float_train_dict, fl_setup, fl_teardown },
@@ -1007,5 +1416,9 @@ const test_entry_t encfloat_entries[] = {
     { "encfloat/float_dict_rejects",   test_float_dict_rejects,   fl_setup, fl_teardown },
     { "encfloat/float_file_rejects",   test_float_file_rejects,   fl_setup, fl_teardown },
     { "encfloat/trailer_counts_in_choice", test_trailer_counts_in_choice, fl_setup, fl_teardown },
+    { "encfloat/eval_f64",             test_eval_f64,             fl_setup, fl_teardown },
+    { "encfloat/const_decision_f64",   test_const_decision_f64,   fl_setup, fl_teardown },
+    { "encfloat/view_checks",          test_view_checks,          fl_setup, fl_teardown },
+    { "encfloat/view_consumers",       test_view_consumers,       fl_rt_setup, fl_rt_teardown },
     { NULL, NULL, NULL, NULL },
 };

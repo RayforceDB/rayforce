@@ -232,8 +232,64 @@ static void eval_runs_eq(const ray_enc_vview_t* v, int64_t c, uint8_t ne, uint8_
 }
 #undef RUNS_EQ
 
+/* A float view's T-bit pattern as a double (F32 widened, exactly). */
+static inline double fval(uint64_t b, int T) {
+    if (T == 32) { uint32_t u = (uint32_t)b; float f; memcpy(&f, &u, 4); return (double)f; }
+    double d; memcpy(&d, &b, 8); return d;
+}
+
+bool ray_enc_eval_cmp_f64(const ray_enc_vview_t* v, uint16_t op, double c, uint8_t nr, uint8_t* bits) {
+    if (!is_float(v->type) || !is_cmp_op(op) || isnan(c)) return false;
+    const int T = v->k.T;
+    switch (v->enc) {
+    case RAY_ENC_CONST:
+        memset(bits, cmp_one_f(fval(v->cbits, T), op, c), (size_t)v->n);
+        break;
+    case RAY_ENC_RLE: {
+        uint32_t i = 0;
+        for (uint32_t r = 0; r < v->n_runs; r++) {
+            const uint32_t e = v->run_ends.h[r];
+            fill_run(bits, i, e, (uint32_t)v->n, (uint8_t)cmp_one_f(fval(lane(&v->run_vals, T, r), T), op, c));
+            i = e;
+        }
+        break;
+    }
+    case RAY_ENC_DICT: {
+        /* the entries ascend in dictionary order, numerically nondecreasing
+         * (the order only puts -0.0 before +0.0), so the entries equal to c
+         * under the predicate comparator are one interval [lb, ub): both
+         * zeros for a zero c */
+        uint32_t lo = 0, hi = v->dict_n;
+        while (lo < hi) { uint32_t mid = lo + (hi - lo) / 2; if (fval(v->dict[mid], T) < c) lo = mid + 1; else hi = mid; }
+        const uint32_t lb = lo;
+        hi = v->dict_n;
+        while (lo < hi) { uint32_t mid = lo + (hi - lo) / 2; if (fval(v->dict[mid], T) <= c) lo = mid + 1; else hi = mid; }
+        const uint32_t ub = lo;
+        uint32_t a = 0, b = 0; uint8_t neg = 0;
+        switch (op) {
+        case OP_EQ: a = lb; b = ub; break;
+        case OP_NE: a = lb; b = ub; neg = 1; break;
+        case OP_LT: a = 0;  b = lb; break;
+        case OP_LE: a = 0;  b = ub; break;
+        case OP_GT: a = ub; b = v->dict_n; break;
+        default:    a = lb; b = v->dict_n; break;          /* OP_GE */
+        }
+        const uint32_t span = b - a;
+        for (int i = 0; i < v->n; i++)
+            bits[i] = (uint8_t)((v->codes[i] - a < span) ^ neg);   /* unsigned: one compare */
+        break;
+    }
+    default:
+        return false;
+    }
+    /* a null row holds a real value (the fill rule) or, wholly null, any
+     * bits: the mask decides it */
+    ray_enc_mask_nulls(v, nr, bits);
+    return true;
+}
+
 bool ray_enc_eval_cmp(const ray_enc_vview_t* v, uint16_t op, int64_t c, uint8_t nr, uint8_t* bits) {
-    if (is_float(v->type)) return false;                              /* floats: ray_enc_const_decision_f64 */
+    if (is_float(v->type)) return false;                              /* floats: ray_enc_eval_cmp_f64 */
     if (!is_cmp_op(op)) return false;
     if (v->type == RAY_SYM && op != OP_EQ && op != OP_NE) return false;   /* never order ids (#738) */
     switch (v->enc) {

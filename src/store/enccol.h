@@ -197,8 +197,8 @@ typedef union {
 
 /* A parsed, validated top-level vector body; never expanded to values.
  * About 21 KB: a scan task keeps one on its stack (never the heap).
- * Floats (CONST only): k.T is the bit width (32 / 64), unsigned, and cbits
- * the value's F32 / F64 bit pattern. */
+ * Floats (CONST, RLE, DICT): k is { 32 | 64, unsigned, float }; cbits, the
+ * run values and the dictionary entries are F32 / F64 bit patterns. */
 typedef struct ray_enc_vview_s {
     uint8_t         enc;        /* RAY_ENC_CONST, _FOR_BP, _RLE or _DICT (a view exists only for these) */
     int             n, n_nulls;
@@ -213,7 +213,7 @@ typedef struct ray_enc_vview_s {
     ray_enc_lanes_t run_vals;   /* RLE / CONST: run values at width T */
     ray_enc_lanes_t run_ends;   /* RLE / CONST: .h[r] exclusive, strictly ascending, last == n */
     uint32_t        codes[RAY_ENC_VEC];   /* DICT */
-    const uint64_t* dict;       /* DICT: VALUE_DICT entries (T-bit patterns, strictly ascending) */
+    const uint64_t* dict;       /* DICT: VALUE_DICT entries (T-bit patterns, strictly ascending in dictionary order) */
     uint32_t        dict_n;
 } ray_enc_vview_t;
 
@@ -222,13 +222,14 @@ typedef struct ray_enc_vview_s {
  * and bitmap; body sizes, headers and padding; run ends; the sentinel
  * outside the bitmap; SYM ids against the bound, the statistics and the
  * null count; DICT codes below the dictionary size with their values
- * inside the statistics; float CONST: no NaN outside the bitmap, the value
- * inside the statistics), and a FOR_BP body whose residuals do not wrap
- * (base + each residual at most the kind's largest value, checked on the
- * actual residuals: a writer's base is the minimum, so a sound vector
- * passes; its residuals then compare in logical order); 0: declined (RAW, DELTA_BP,
- * floats other than CONST, a trailer, a DICT code child other than FOR_BP,
- * a body that could wrap, or anything decode would reject): read the
+ * inside the statistics; floats: no NaN outside the bitmap and the values
+ * inside the statistics, an RLE values child RAW), and a FOR_BP body whose
+ * residuals do not wrap (base + each residual at most the kind's largest
+ * value, checked on the actual residuals: a writer's base is the minimum,
+ * so a sound vector passes; its residuals then compare in logical order);
+ * 0: declined (RAW, DELTA_BP, floats other than CONST, RLE, DICT; a float
+ * vector with a trailer; a DICT code child other than FOR_BP, a body that
+ * could wrap, or anything decode would reject): read the
  * vector by range, which decodes or reports it; -1: an owned error in
  * *err (the descriptors', the payload split's or the VALUE_DICT's
  * validation, as the decode would report it).  Never counts decoded

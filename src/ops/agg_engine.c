@@ -9501,7 +9501,7 @@ static inline bool agg_firstn_member(const agg_firstn_ctx_t* c, uint32_t k, int6
     }
 }
 
-/* Key k's vector at segment `seg` when it is a run view (RLE or CONST
+/* Key k's vector at segment `seg` when it is a run view (RLE or CONST, not a float,
  * without a null bitmap: SYM nulls are in-band ids), read by
  * ray_col_src_vview, which makes every check the decode would: 1, 0 not
  * one (read the vector otherwise), -1 with *err.  The descriptor's
@@ -9518,6 +9518,9 @@ static int agg_firstn_runview(const agg_rr_t* rr, uint32_t k, int64_t seg, int64
     if (enc != RAY_ENC_RLE && enc != RAY_ENC_CONST) return 0;
     int r = ray_col_src_vview(src, seg, vv, err);
     if (r <= 0) return r;
+    /* a float view's run values are bit patterns: compared as integers they
+     * would split -0.0 from +0.0, so a float key is read by its values */
+    if (vv->type == RAY_F32 || vv->type == RAY_F64) return 0;
     if ((vv->enc != RAY_ENC_RLE && vv->enc != RAY_ENC_CONST) || vv->n != len ||
         vv->nullmap || (vv->n_nulls && rr->key_types[k] != RAY_SYM)) return 0;
     return 1;

@@ -29,7 +29,7 @@
 #include "ops/colbind.h"
 #include "ops/idxop.h"      /* RAY_IDX_CHUNK_ZONE per-morsel zone-skip */
 #include "store/enccol.h"    /* ray_enccol_seg: encoded parted segments */
-#include "store/enceval.h"   /* encoded leaves: ray_enc_eval_cmp, ray_enc_const_decision */
+#include "store/enceval.h"   /* encoded leaves: ray_enc_eval_cmp(_f64), ray_enc_const_decision(_f64) */
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -2519,7 +2519,8 @@ static int expr_leaf_on_view(const ray_expr_t* expr, const expr_enc_plan_t* p, u
     int cd = l->is_f64 ? ray_enc_const_decision_f64(vbuf, l->op, l->cf, l->null_result)
                        : ray_enc_const_decision(vbuf, l->op, l->ci, l->null_result);
     if (cd >= 0) memset(out, cd, (size_t)n);
-    else if (l->is_f64 || !ray_enc_eval_cmp(vbuf, l->op, l->ci, l->null_result, out)) return 0;
+    else if (!(l->is_f64 ? ray_enc_eval_cmp_f64(vbuf, l->op, l->cf, l->null_result, out)
+                         : ray_enc_eval_cmp(vbuf, l->op, l->ci, l->null_result, out))) return 0;
     rptrs[in->dst] = out;
     return 1;
 }

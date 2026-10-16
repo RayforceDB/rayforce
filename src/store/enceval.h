@@ -44,7 +44,8 @@
 /* (x op c) over a viewed vector into bits[0..n), integer kinds (every
  * encoding P1 writes for integer, temporal, BOOL, U8 and SYM), with null
  * masking: rows whose bitmap bit is set get `null_result`.  False when
- * the view has no evaluator (RAW, DELTA_BP, a float type): decode. */
+ * the view has no evaluator (RAW, DELTA_BP, a float type: see
+ * ray_enc_eval_cmp_f64): decode. */
 bool ray_enc_eval_cmp(const ray_enc_vview_t* v, uint16_t op, int64_t c,
                       uint8_t null_result, uint8_t* bits);
 /* (x op c) of each run of an RLE view without bitmap nulls into
@@ -65,6 +66,15 @@ int  ray_enc_const_decision(const ray_enc_vview_t* v, uint16_t op, int64_t c, ui
  * comparator (-0.0 == +0.0); -1 for any other view and for a NaN c
  * (generation 0 reads a NaN literal as the null constant). */
 int  ray_enc_const_decision_f64(const ray_enc_vview_t* v, uint16_t op, double c, uint8_t null_result);
+/* (x op c) over a float view (F32 widened) under the predicate comparator
+ * (-0.0 == +0.0), null rows set to null_result.  CONST: one test; RLE:
+ * one test per run; DICT: the code interval [lo, hi) of the entries equal
+ * to c, by lower / upper bound searches on the widened entries.  False for
+ * any other view (RAW, ALP and ALP_RD have none: decode), a non-float
+ * view, an operator outside OP_EQ .. OP_GE and a NaN c (the null
+ * constant, as ray_enc_const_decision_f64). */
+bool ray_enc_eval_cmp_f64(const ray_enc_vview_t* v, uint16_t op, double c,
+                          uint8_t null_result, uint8_t* bits);
 
 /* Exact 128-bit sum of the non-null logical values of a fully selected
  * integer vector, and its non-null count.  False when the encoding has no
