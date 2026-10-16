@@ -577,6 +577,39 @@ static test_result_t test_link_alter_set_failed_no_leak(void) {
     PASS();
 }
 
+/* ─── alter set through a dotted name: in place only when sole ────── */
+
+static test_result_t test_link_alter_set_dotted_in_place(void) {
+    /* A chain of dicts each held once is amended in place: the leaf the
+     * name resolves to is the same block before and after (#821 — every
+     * call used to copy the whole vector).  Once the head is aliased the
+     * write must copy, so the alias keeps the old value. */
+    ray_t* setup = ray_eval_str("(set PD (dict [cash v] (list 100 (til 4))))");
+    if (setup && !RAY_IS_ERR(setup)) ray_release(setup);
+    int64_t s_pdv = ray_sym_intern("PD.v", 4);
+
+    ray_t* before = ray_env_get(s_pdv);
+    TEST_ASSERT_NOT_NULL(before);
+    ray_t* r = ray_eval_str("(alter 'PD.v set 1 50)");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    ray_t* after = ray_env_get(s_pdv);
+    TEST_ASSERT_TRUE(after == before);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(after))[1], 50);
+
+    r = ray_eval_str("(set PE PD)");
+    if (r && !RAY_IS_ERR(r)) ray_release(r);
+    r = ray_eval_str("(alter 'PD.v set 2 60)");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    ray_t* copied = ray_env_get(s_pdv);
+    TEST_ASSERT_TRUE(copied != before);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(copied))[2], 60);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(before))[2], 2);
+
+    PASS();
+}
+
 /* ─── alter set's cow-failure cleanup helper, both branches ───────── */
 
 extern ray_t* ray_alter_set_cow_fail(ray_t* original_var, ray_t* cow_result,
@@ -1255,6 +1288,7 @@ const test_entry_t link_entries[] = {
     { "link/deref_unknown_field",            test_link_deref_unknown_field,           link_setup, link_teardown },
     { "link/save_no_link_no_sidecar",        test_link_save_no_link_no_sidecar,       link_setup, link_teardown },
     { "link/alter_set_failed_no_leak",       test_link_alter_set_failed_no_leak,      link_setup, link_teardown },
+    { "link/alter_set_dotted_in_place",      test_link_alter_set_dotted_in_place,     link_setup, link_teardown },
     { "link/alter_set_cow_fail_null",        test_link_alter_set_cow_fail_null,       link_setup, link_teardown },
     { "link/alter_set_cow_fail_error",       test_link_alter_set_cow_fail_error,      link_setup, link_teardown },
     { "link/slice_inherits",                 test_link_slice_inherits,                link_setup, link_teardown },

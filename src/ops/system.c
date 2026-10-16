@@ -1638,6 +1638,8 @@ ray_t* ray_build_sys_args(int argc, char** argv) {
         else if (strcmp(argv[i], "-U") == 0 && i + 1 < argc) i++;   /* skip secret */
         else if ((strcmp(argv[i], "-l") == 0 || strcmp(argv[i], "-L") == 0) && i + 1 < argc)
             log = argv[++i];
+        else if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--mem") == 0) && i + 1 < argc)
+            i++;   /* RAM budget is configured by the launcher, not exposed here */
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) { /* ignore */ }
         else file = argv[i];
     }
