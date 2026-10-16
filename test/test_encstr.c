@@ -37,7 +37,8 @@
 #include "table/table.h"
 #include "lang/env.h"
 #include "lang/format.h"
-#include "core/runtime.h"
+#include "store/splay.h"
+#include "ops/idxop.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,6 +48,29 @@
  * leaks nothing. */
 static ray_enc_buf_t st_buf;
 static uint8_t*      st_mem;                 /* malloc'd scratch */
+static ray_t*        st_held[8];             /* objects (or errors) a test holds: st_hold */
+static ray_col_src_t     st_src;             /* a bound source (st_src_on) */
+static bool              st_src_on;
+static ray_col_scratch_t st_sc;              /* a range-read scratch (st_sc_on) */
+static bool              st_sc_on;
+static ray_t* st_hold(ray_t* x) {
+    for (int i = 0; i < 8; i++) if (!st_held[i]) { st_held[i] = x; return x; }
+    abort();
+}
+/* x is no longer held (the caller releases it, or holds `by` instead). */
+static void st_unhold(ray_t* x, ray_t* by) {
+    for (int i = 0; i < 8; i++) if (st_held[i] == x) { st_held[i] = by; return; }
+}
+/* Before the heap goes: the scratch, the source, then the held objects. */
+static void st_release_held(void) {
+    if (st_sc_on) { ray_col_scratch_free(&st_sc); st_sc_on = false; }
+    if (st_src_on) { ray_col_src_release(&st_src); st_src_on = false; }
+    for (int i = 7; i >= 0; i--) {
+        if (st_held[i] && RAY_IS_ERR(st_held[i])) ray_error_free(st_held[i]);
+        else if (st_held[i]) ray_release(st_held[i]);
+        st_held[i] = NULL;
+    }
+}
 static void st_setup(void) {
     ray_heap_init(); (void)ray_sym_init();
     (void)ray_test_rm_rf(ray_test_tmp(ST_TMP)); (void)ray_test_mkdir_p(ray_test_tmp(ST_TMP));
@@ -54,6 +78,7 @@ static void st_setup(void) {
 static void st_teardown(void) {
     ray_enc_buf_free(&st_buf); st_buf = (ray_enc_buf_t){0};
     free(st_mem); st_mem = NULL;
+    st_release_held();
     ray_test_hooks_off(); (void)ray_test_rm_rf(ray_test_tmp(ST_TMP)); ray_sym_destroy(); ray_heap_destroy();
 }
 
@@ -358,9 +383,8 @@ static const char* st_mat(const char* path) {
 }
 /* The error code of loading `path` and range-reading every vector (vector
  * scope: each STR_DICT / FSST vector decodes alone), "" when both pass.
- * Materialization of a STR_DICT column with pooled entries reports corrupt
- * until the dictionary-first pool lands (D1, Task 4), so the side-entry
- * rules are pinned through the range reads, which validate the same entry. */
+ * The side-entry rules are pinned through the range reads, which validate
+ * the same entry as materialization (st_mat). */
 static const char* st_scan(const char* path) {
     static char code[16];
     st_msg[0] = 0;
@@ -490,7 +514,7 @@ static test_result_t test_side_rejects(void) {
     TEST_ASSERT_EQ_I(st_desc_enc(p, 0, NULL), RAY_ENC_STR_DICT);
     ray_enc_hdr_t eh = st_hdr(p);
     const long e0 = (long)eh.side_off + 32;               /* the STR_DICT entry (the only one) */
-    TEST_ASSERT_STR_EQ(st_scan(p), "");
+    TEST_ASSERT_FMT(strcmp(st_mat(p), "") == 0, "materialize: %s", st_msg);
     uint32_t n; ST_READ(p, e0, &n, 4);
     TEST_ASSERT_EQ_U(n, 37);
     uint64_t o1, o2; ST_READ(p, e0 + 16, &o1, 8); ST_READ(p, e0 + 24, &o2, 8);
@@ -722,7 +746,8 @@ static void st_q_setup(void) {
     (void)ray_test_rm_rf(ray_test_tmp(ST_TMP)); (void)ray_test_mkdir_p(ray_test_tmp(ST_TMP));
 }
 static void st_q_teardown(void) {
-    ray_test_hooks_off(); ray_encw_test_force_str(-1);
+    st_release_held();
+    ray_test_hooks_off(); ray_encw_test_force_str(-1); ray_encw_test_force(-1);
     (void)ray_test_rm_rf(ray_test_tmp(ST_TMP)); ray_runtime_destroy(st_rt);
 }
 /* The query's formatted result; NULL when it fails (message in st_msg). */
@@ -736,39 +761,69 @@ static ray_t* st_q_fmt(const char* q) {
     ray_t* f = ray_fmt(r, 0); ray_release(r);
     return f;
 }
-static void st_q_run(const char* q) { ray_t* r = ray_eval_str(ray_test_tmp(q)); if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r); }
+/* Evaluate q for its effect: false when it fails (message in st_msg). */
+static bool st_q_run(const char* q) {
+    st_msg[0] = 0;
+    ray_t* r = ray_eval_str(ray_test_tmp(q));
+    if (r && RAY_IS_ERR(r)) {
+        snprintf(st_msg, sizeof st_msg, "%s", ray_error_msg() ? ray_error_msg() : "");
+        ray_error_free(r);
+        return false;
+    }
+    if (r) ray_release(r);
+    return true;
+}
+#define ST_Q_OK(q) TEST_ASSERT_FMT(st_q_run(q), "%s: %s", (q), st_msg)
+/* The query's result is the boolean true. */
+static bool st_q_true(const char* q) {
+    ray_t* r = ray_eval_str(ray_test_tmp(q));
+    bool ok = r && !RAY_IS_ERR(r) && r->type == -RAY_BOOL && r->b8;
+    if (r && RAY_IS_ERR(r)) { snprintf(st_msg, sizeof st_msg, "%s", ray_error_msg() ? ray_error_msg() : ""); ray_error_free(r); }
+    else if (r) ray_release(r);
+    return ok;
+}
+#define ST_Q_TRUE(q) TEST_ASSERT_FMT(st_q_true(q), "%s: %s", (q), st_msg)
+/* The live generation's file of column `col` of the table saved at
+ * ST_TMP `rel` (#649 / #713: the table directory holds generations). */
+static bool st_live(const char* rel, const char* col, char* out, size_t n) {
+    char tmp[256], dir[512];
+    snprintf(tmp, sizeof tmp, "%s%s", ST_TMP, rel);
+    if (ray_splay_resolve_dir(ray_test_tmp(tmp), dir, sizeof dir) != RAY_OK) return false;
+    return (size_t)snprintf(out, n, "%s/%s", dir, col) < n;
+}
 
-static test_result_t test_stats_chokepoint(void) {
-    /* insertion order z, a, m: codes 0, 1, 2 are not value order.  Inline
-     * strings (no pool), so the materializing queries below work before
-     * Task 4's dictionary-first pool. */
-    static const char* const nm[3] = { "zulu", "alpha", "mike" };
+/* The chokepoint over a three-string column (insertion order z, a, m:
+ * codes 0, 1, 2 are not value order), its strings nm[0..2]. */
+static test_result_t st_chokepoint(const char* const nm[3]) {
     ray_t* v = ray_vec_new(RAY_STR, 70000);
     for (int64_t i = 0; i < 70000; i++) { const char* x = nm[i % 3]; v = ray_str_vec_append(v, x, strlen(x)); }
     ray_t* tb = ray_table_new(1);
     tb = ray_table_add_col(tb, ray_sym_intern("s", 1), v); ray_release(v);
     TEST_ASSERT_EQ_I(ray_env_set(ray_sym_intern("W", 1), tb), RAY_OK);
     ray_release(tb);
-    st_q_run("(.db.splayed.set \"" ST_TMP "/g0/\" W {compress: false})");
+    ST_Q_OK("(.db.splayed.set \"" ST_TMP "/g0/\" W {compress: false})");
     ray_encw_test_force_str(RAY_ENC_STR_DICT);
-    st_q_run("(.db.splayed.set \"" ST_TMP "/g2/\" W {compress: true})");
+    ST_Q_OK("(.db.splayed.set \"" ST_TMP "/g2/\" W {compress: true})");
     ray_encw_test_force_str(-1);
 
     /* the accessors, on the generation-2 column */
-    st_q_run("(set T (.db.splayed.get \"" ST_TMP "/g2/\"))");
-    ray_t* t = ray_eval_str("T");
+    ST_Q_OK("(set T (.db.splayed.get \"" ST_TMP "/g2/\"))");
+    ray_t* t = st_hold(ray_eval_str("T"));
     TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
     ray_t* encv = ray_table_get_col_enc(t, ray_sym_intern("s", 1));
     TEST_ASSERT_TRUE(encv != NULL);
     ray_enccol_t* e = ray_enccol_of(encv);
-    ray_col_src_t src; ray_t* be = ray_col_src_bind(encv, &src);
+    ray_t* be = ray_col_src_bind(encv, &st_src);
+    if (be) st_hold(be);
     TEST_ASSERT_TRUE(be == NULL);
+    st_src_on = true;
     ray_enc_chunk_stat_t cs;
-    TEST_ASSERT_TRUE(ray_col_src_chunk_stat(&src, 0, &cs));
+    TEST_ASSERT_TRUE(ray_col_src_chunk_stat(&st_src, 0, &cs));
     TEST_ASSERT_FALSE(cs.has_minmax);
+    TEST_ASSERT_TRUE(cs.min == 0 && cs.max == 0);                         /* no codes behind has_minmax */
     TEST_ASSERT_EQ_I(cs.rows, 65536);
     int64_t mn = 7, mx = 7; uint32_t nn = 0;
-    TEST_ASSERT_FALSE(ray_col_src_vec_stat(&src, 0, &mn, &mx, &nn));
+    TEST_ASSERT_FALSE(ray_col_src_vec_stat(&st_src, 0, &mn, &mx, &nn));
     ray_enc_col_totals_t tot; ray_enccol_dir_totals(e, &tot);
     TEST_ASSERT_TRUE(tot.mm_partial);
     TEST_ASSERT_TRUE(tot.min_i == INT64_MAX && tot.max_i == INT64_MIN);
@@ -779,8 +834,7 @@ static test_result_t test_stats_chokepoint(void) {
     TEST_ASSERT_TRUE(ray_enccol_code_bounds(e, 0, 0, &lo, &hi, &err));
     TEST_ASSERT_TRUE(err == NULL && lo == 0 && hi == 2);
     TEST_ASSERT_FALSE(ray_enccol_code_bounds(e, 5, -1, &lo, &hi, &err));    /* past the last chunk */
-    ray_col_src_release(&src);
-    ray_release(t);
+    TEST_ASSERT_NULL(err);                                                  /* none, not an error */
 
     /* the consumers answer as generation 0 does */
     static const char* const qs[] = {
@@ -790,17 +844,32 @@ static test_result_t test_stats_chokepoint(void) {
         "(select {s: s from: T desc: s take: 3})",
     };
     for (size_t i = 0; i < sizeof qs / sizeof *qs; i++) {
-        ray_t* f[2];
+        ray_t* f[2] = { NULL, NULL };
         for (int g = 0; g < 2; g++) {
-            st_q_run(g ? "(set T (.db.splayed.get \"" ST_TMP "/g2/\"))" : "(set T (.db.splayed.get \"" ST_TMP "/g0/\"))");
+            ST_Q_OK(g ? "(set T (.db.splayed.get \"" ST_TMP "/g2/\"))" : "(set T (.db.splayed.get \"" ST_TMP "/g0/\"))");
             f[g] = st_q_fmt(qs[i]);
+            if (f[g]) st_hold(f[g]);
             TEST_ASSERT_FMT(f[g] != NULL, "%s gen %d: %s", qs[i], g ? 2 : 0, st_msg);
         }
         bool same = ray_str_len(f[0]) == ray_str_len(f[1]) && memcmp(ray_str_ptr(f[0]), ray_str_ptr(f[1]), ray_str_len(f[0])) == 0;
-        ray_release(f[0]); ray_release(f[1]);
         TEST_ASSERT_FMT(same, "%s differs from generation 0", qs[i]);
+        st_unhold(f[0], NULL); st_unhold(f[1], NULL);
+        ray_release(f[0]); ray_release(f[1]);
     }
     PASS();
+}
+
+/* Inline strings: the materializing queries need no pool. */
+static test_result_t test_stats_chokepoint(void) {
+    static const char* const nm[3] = { "zulu", "alpha", "mike" };
+    return st_chokepoint(nm);
+}
+
+/* The same over pooled strings (over 12 bytes), which materialize through
+ * the dictionary-first pool. */
+static test_result_t test_stats_chokepoint_pooled(void) {
+    static const char* const nm[3] = { "zulu zulu zulu zulu", "alpha alpha alpha", "mike mike mike mike" };
+    return st_chokepoint(nm);
 }
 
 /* Carry from the Task 3 review: in a STR_DICT vector's code-to-offset
@@ -809,26 +878,30 @@ static test_result_t test_stats_chokepoint(void) {
  * rows, then a vector whose rows cycle through the codes k * 2048. */
 static test_result_t test_dict_slot_spread(void) {
     const char* p = STP("/sp");
-    ray_t* v = ray_vec_new(RAY_STR, 34816);
+    ray_t* v = st_hold(ray_vec_new(RAY_STR, 34816));
     char b[64];
     for (int64_t i = 0; i < 34816; i++) {
         int64_t k = i < 32768 ? i : ((i - 32768) % 16) * 2048;
         snprintf(b, sizeof b, "entry-%012lld-xx", (long long)k);
-        v = ray_str_vec_append(v, b, strlen(b));
+        ray_t* w = ray_str_vec_append(v, b, strlen(b));
+        st_unhold(v, w); v = w;
     }
     ray_encw_test_force_str(RAY_ENC_STR_DICT);
     ray_err_t se = ray_col_save_gen(v, p, 2);
     ray_encw_test_force_str(-1);
     TEST_ASSERT_EQ_I(se, RAY_OK);
     TEST_ASSERT_EQ_I(st_desc_enc(p, 32, NULL), RAY_ENC_STR_DICT);
-    ray_t* c = ray_col_mmap(p);
+    ray_t* c = st_hold(ray_col_mmap(p));
     TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
-    ray_col_src_t src; TEST_ASSERT_NULL(ray_col_src_bind(c, &src));
-    ray_col_scratch_t sc; ray_col_scratch_init(&sc);
+    ray_t* be = ray_col_src_bind(c, &st_src);
+    if (be) st_hold(be);
+    TEST_ASSERT_NULL(be);
+    st_src_on = true;
+    ray_col_scratch_init(&st_sc); st_sc_on = true;
     bool same = true; int64_t bad = -1;
     for (int64_t r = 0; r < 34816 && same; ) {
         ray_col_range_t rv;
-        ray_t* err = ray_col_range(&src, r, 34816 - r, &sc, &rv);
+        ray_t* err = ray_col_range(&st_src, r, 34816 - r, &st_sc, &rv);
         if (err) { ray_error_free(err); same = false; bad = r; break; }
         for (int64_t k = 0; k < rv.n && same; k++) {
             size_t lb; const char* want = ray_str_vec_get(v, r + k, &lb);
@@ -837,8 +910,264 @@ static test_result_t test_dict_slot_spread(void) {
         }
         r += rv.n;
     }
-    ray_col_scratch_free(&sc); ray_col_src_release(&src); ray_release(c); ray_release(v);
     TEST_ASSERT_FMT(same, "row %lld differs", (long long)bad);
+    PASS();
+}
+
+/* ---- Task 4: the dictionary-first pool and the runtime DICT index ---- */
+
+/* Two STR vectors hold the same strings, row for row. */
+static bool st_same(ray_t* a, ray_t* b) {
+    if (!a || !b || RAY_IS_ERR(a) || RAY_IS_ERR(b) || a->type != RAY_STR || b->type != RAY_STR || a->len != b->len)
+        return false;
+    for (int64_t i = 0; i < a->len; i++) {
+        size_t la, lb;
+        const char* pa = ray_str_vec_get(a, i, &la);
+        const char* pb = ray_str_vec_get(b, i, &lb);
+        if (la != lb || (la && memcmp(pa, pb, la) != 0)) return false;
+    }
+    return true;
+}
+
+/* Review focus 2: the decoded pool order, element equality, hash32.  Chunk
+ * 0 is a STR_DICT chunk; chunk 1 holds an FSST vector and a CONST vector. */
+static test_result_t test_pool_order(void) {
+    const char* p = STP("/po");
+    int64_t n = 65536 + 2048;
+    ray_t* v = st_hold(ray_vec_new(RAY_STR, n));
+    char b[256];
+    for (int64_t i = 0; i < n; i++) {
+        const char* s = i < 65536 ? gen_lowcard(i, b) : i < 65536 + 1024 ? gen_urls(i, b) : "a constant long string value";
+        ray_t* w = ray_str_vec_append(v, s, strlen(s));
+        st_unhold(v, w); v = w;
+    }
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, p, 2), RAY_OK);
+    TEST_ASSERT_EQ_I(st_desc_enc(p, 0, NULL), RAY_ENC_STR_DICT);
+    int e64 = st_desc_enc(p, 64, NULL);
+    TEST_ASSERT_TRUE(e64 == RAY_ENC_FSST || e64 == RAY_ENC_RAW);      /* FSST trained on chunk 0 */
+    TEST_ASSERT_EQ_I(st_desc_enc(p, 65, NULL), RAY_ENC_CONST);
+    ray_t* c = st_hold(ray_col_mmap(p));
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+    ray_t* m = ray_enccol_materialize(c);                  /* borrowed: the column's cache */
+    if (m && RAY_IS_ERR(m)) st_hold(m);
+    TEST_ASSERT_FMT(m && !RAY_IS_ERR(m), "materialize: %s", ray_error_msg() ? ray_error_msg() : "");
+    TEST_ASSERT_TRUE(st_same(m, v));
+    TEST_ASSERT_FALSE(ray_index_has(m));                   /* chunk 1 is no dictionary chunk: no DICT */
+    const char* pool = (const char*)ray_data(m->str_pool);
+    TEST_ASSERT_EQ_U((uint64_t)m->str_pool->len, ray_enccol_of(c)->hdr.str_pool_bytes);
+    /* the dictionary region: entries over 12 bytes, once, in code order */
+    const ray_enc_sdict_t* sd;
+    TEST_ASSERT_NULL(ray_enccol_strdict(ray_enccol_of(c), &sd));
+    TEST_ASSERT_NOT_NULL(sd);
+    uint64_t at = 0;
+    for (uint32_t k = 0; k < sd->n; k++) {
+        const char* ep; uint32_t el; ray_enc_sdict_entry(sd, k, &ep, &el);
+        if (el <= RAY_STR_INLINE_MAX) continue;
+        TEST_ASSERT_TRUE(memcmp(pool + at, ep, el) == 0);
+        at += el;
+    }
+    TEST_ASSERT_EQ_U(at, sd->pooled);
+    TEST_ASSERT_TRUE(sd->pooled > 0);
+    const ray_str_t* s0 = (const ray_str_t*)ray_data(m);
+    for (int64_t i = 0; i < 65536; i++)                   /* STR_DICT rows point into the region */
+        if (!ray_str_is_inline(&s0[i])) TEST_ASSERT_TRUE(s0[i].pool_off + s0[i].len <= sd->pooled);
+    /* the first pooled row of a non-dictionary vector starts right after it */
+    int64_t r1 = 65536;
+    while (r1 < m->len && ray_str_is_inline(&s0[r1])) r1++;
+    TEST_ASSERT_TRUE(r1 < m->len);
+    TEST_ASSERT_EQ_U(s0[r1].pool_off, sd->pooled);
+    for (int64_t i = 0; i < m->len; i++) {
+        const ray_str_t* s = &s0[i];
+        if (ray_str_is_inline(s)) continue;
+        uint32_t h = (uint32_t)ray_str_t_hash(s, pool); if (!h) h = 1;
+        TEST_ASSERT_EQ_U(s->hash32, h);
+    }
+    PASS();
+}
+
+/* Spec "FSST validation" scopes: a malformed first FSST vector does not
+ * stop a range read of the second; materialization fails before writing. */
+static test_result_t test_fsst_scopes(void) {
+    const char* p = STP("/fx");
+    ray_t* v = st_hold(str_col(2048, gen_urls));
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, p, 2), RAY_OK);
+    ray_enc_desc_t d; TEST_ASSERT_EQ_I(st_desc_enc(p, 0, &d), RAY_ENC_FSST);
+    const long payload = 96 + 64 + (long)d.payload_off;  /* one chunk: its descriptors follow the directory */
+    uint32_t lb; ST_READ(p, payload + 4, &lb, 4);         /* the lengths child's body bytes */
+    uint64_t total; ST_READ(p, payload + 8 + lb, &total, 8);
+    total += 8;                                           /* total_bytes no longer the sum of lengths */
+    ST_PATCH(p, payload + 8 + lb, &total, 8);
+    ray_t* c = st_hold(ray_col_mmap(p));
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+    ray_t* be = ray_col_src_bind(c, &st_src);
+    if (be) st_hold(be);
+    TEST_ASSERT_NULL(be);
+    st_src_on = true;
+    ray_col_scratch_init(&st_sc); st_sc_on = true;
+    ray_col_range_t rv;
+    ray_t* e1 = ray_col_range(&st_src, 1024, 1024, &st_sc, &rv);       /* vector 1: fine */
+    if (e1) st_hold(e1);
+    TEST_ASSERT_NULL(e1);
+    TEST_ASSERT_EQ_I(rv.n, 1024);
+    ray_t* e = st_hold(ray_col_range(&st_src, 0, 1024, &st_sc, &rv));
+    TEST_ASSERT_TRUE(e && strcmp(ray_err_code(e), "corrupt") == 0);
+    uint64_t allocs0 = ray_enccol_test_str_pool_allocs();
+    ray_t* m = ray_enccol_materialize(c);
+    if (m && RAY_IS_ERR(m)) st_hold(m);
+    TEST_ASSERT_TRUE(m && RAY_IS_ERR(m) && strcmp(ray_err_code(m), "corrupt") == 0);
+    TEST_ASSERT_EQ_U(ray_enccol_test_str_pool_allocs(), allocs0);       /* rejected before the pool */
+    PASS();
+}
+
+/* The P6 gate's second clause: the runtime DICT equals generation 0's. */
+static test_result_t test_dict_equals_gen0(void) {
+    ST_Q_OK("(set S (as 'STR (map (fn [j] (format \"value % of the domain\" (% (* j 7919) 300))) (til 70000))))");
+    ST_Q_OK("(.db.splayed.set \"" ST_TMP "/d0/\" (table [s] (list S)) {compress: false})");
+    ST_Q_OK("(.db.splayed.set \"" ST_TMP "/d2/\" (table [s] (list S)) {compress: true})");
+    char f2[600]; TEST_ASSERT_TRUE(st_live("/d2", "s", f2, sizeof f2));
+    for (int c = 0; c < 2; c++) TEST_ASSERT_FALSE(st_dirent(f2, c).flags & RAY_ENC_STAT_ABSENT);   /* all STR_DICT */
+    ray_t* t0 = st_hold(ray_eval_str(ray_test_tmp("(.db.splayed.get \"" ST_TMP "/d0/\")")));
+    ray_t* t2 = st_hold(ray_eval_str(ray_test_tmp("(.db.splayed.get \"" ST_TMP "/d2/\")")));
+    TEST_ASSERT_TRUE(t0 && !RAY_IS_ERR(t0) && t2 && !RAY_IS_ERR(t2));
+    int64_t sym = ray_sym_intern("s", 1);
+    ray_t* a = ray_table_col(t0, sym);
+    TEST_ASSERT_TRUE(a && !RAY_IS_ERR(a));
+    TEST_ASSERT_NOT_NULL(ray_table_get_col_enc(t2, sym));
+    ray_col_meta_t mt;
+    TEST_ASSERT_TRUE(ray_table_col_meta(t2, sym, &mt));
+    TEST_ASSERT_EQ_I(mt.index_kind, 0);                   /* no DICT on disk */
+    ray_enc_counters_reset();
+    ray_t* ix2 = NULL;
+    ray_t* ie = ray_table_col_index(t2, sym, &ix2);
+    if (ie) st_hold(ie);
+    TEST_ASSERT_NULL(ie);
+    TEST_ASSERT_NOT_NULL(ix2);
+    ray_t* b2 = ray_table_col(t2, sym);
+    TEST_ASSERT_TRUE(b2 && !RAY_IS_ERR(b2));
+    TEST_ASSERT_EQ_I(ray_index_kind(a), RAY_IDX_DICT);
+    TEST_ASSERT_EQ_I(ray_index_kind(b2), RAY_IDX_DICT);
+    TEST_ASSERT_TRUE(ix2 == b2->index);
+    ray_index_t* x = ray_index_payload(a->index);
+    ray_index_t* y = ray_index_payload(b2->index);
+    TEST_ASSERT_EQ_I(x->u.dict.n_distinct, 300);
+    TEST_ASSERT_EQ_I(x->u.dict.n_distinct, y->u.dict.n_distinct);
+    TEST_ASSERT_EQ_I(y->u.dict.codes->len, 70000);
+    TEST_ASSERT_EQ_I(y->u.dict.first_occ->len, 300);
+    TEST_ASSERT_TRUE(memcmp(ray_data(x->u.dict.codes), ray_data(y->u.dict.codes), 70000 * 4) == 0);
+    TEST_ASSERT_TRUE(memcmp(ray_data(x->u.dict.first_occ), ray_data(y->u.dict.first_occ), (size_t)x->u.dict.n_distinct * 4) == 0);
+    TEST_ASSERT_TRUE(st_same(b2, a));
+    ray_enc_counters_t k; ray_enc_counters_get(&k);
+    TEST_ASSERT_EQ_U(k.materialized, 1);
+    /* group-by and distinct answer identically */
+    ST_Q_TRUE("(== 300 (count (distinct (at (.db.splayed.get \"" ST_TMP "/d2/\") 's))))");
+    ST_Q_TRUE("(== (count (distinct (at (.db.splayed.get \"" ST_TMP "/d0/\") 's))) "
+              "(count (distinct (at (.db.splayed.get \"" ST_TMP "/d2/\") 's))))");
+    ray_t* g[2] = { NULL, NULL };
+    for (int i = 0; i < 2; i++) {
+        g[i] = st_q_fmt(i ? "(select {n: (count s) from: (.db.splayed.get \"" ST_TMP "/d2/\") by: s})"
+                          : "(select {n: (count s) from: (.db.splayed.get \"" ST_TMP "/d0/\") by: s})");
+        if (g[i]) st_hold(g[i]);
+        TEST_ASSERT_FMT(g[i] != NULL, "group gen %d: %s", i ? 2 : 0, st_msg);
+    }
+    TEST_ASSERT_TRUE(ray_str_len(g[0]) == ray_str_len(g[1]) && memcmp(ray_str_ptr(g[0]), ray_str_ptr(g[1]), ray_str_len(g[0])) == 0);
+    PASS();
+}
+
+/* HASH + all STR_DICT: HASH, no DICT.  DICT + UNIQUE from a heap source
+ * and from an encoded passenger source (a generation-2 store resaved): UNIQUE
+ * known before materialization (header), .attr.get equal to the source's
+ * after it.  A generation-0 passenger source (the generation-0 store
+ * resaved): DICT, and UNIQUE as generation 0 keeps it, which is not at all
+ * for STR (the generation-0 save drops a STR column's marker-only UNIQUE, a
+ * pre-existing dev behaviour, #864): .attr.get equal to
+ * generation 0's.  A short column (< 65536 rows) answers no index without
+ * decoding. */
+static test_result_t test_dict_variants(void) {
+    /* low cardinality, long strings: every chunk is a STR_DICT chunk */
+    ST_Q_OK("(set S (as 'STR (map (fn [j] (format \"value % of the domain\" (% (* j 7919) 300))) (til 70000))))");
+    ST_Q_OK("(.db.splayed.set \"" ST_TMP "/h2/\" (table [s] (list (.idx.hash S))) {compress: true})");
+    char fh[600]; TEST_ASSERT_TRUE(st_live("/h2", "s", fh, sizeof fh));
+    for (int c = 0; c < 2; c++) TEST_ASSERT_FALSE(st_dirent(fh, c).flags & RAY_ENC_STAT_ABSENT);
+    ray_t* t = st_hold(ray_eval_str(ray_test_tmp("(.db.splayed.get \"" ST_TMP "/h2/\")")));
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    ray_t* col = ray_table_col(t, ray_sym_intern("s", 1));
+    TEST_ASSERT_TRUE(col && !RAY_IS_ERR(col));
+    TEST_ASSERT_EQ_I(ray_index_kind(col), RAY_IDX_HASH);                 /* HASH, no DICT */
+    st_unhold(t, NULL); ray_release(t);
+    /* UNIQUE: distinct strings forced to STR_DICT (selection would pick FSST) */
+    ST_Q_OK("(set U (.attr.set 'unique (as 'STR (map (fn [j] (format \"unique key %\" j)) (til 70000)))))");
+    ST_Q_OK("(.db.splayed.set \"" ST_TMP "/u0/\" (table [s] (list U)) {compress: false})");
+    ray_encw_test_force_str(RAY_ENC_STR_DICT);
+    ST_Q_OK("(.db.splayed.set \"" ST_TMP "/u2/\" (table [s] (list U)) {compress: true})");
+    ST_Q_OK("(.db.splayed.set \"" ST_TMP "/uq/\" (.db.splayed.get \"" ST_TMP "/u2/\") {compress: true})");   /* encoded passenger */
+    ST_Q_OK("(.db.splayed.set \"" ST_TMP "/up/\" (.db.splayed.get \"" ST_TMP "/u0/\") {compress: true})");   /* generation-0 passenger */
+    ray_encw_test_force_str(-1);
+    static const struct { const char* dir; bool unique; const char* ref; } vs[3] = {
+        { "/u2", true,  "U" },
+        { "/uq", true,  "U" },
+        { "/up", false, "(at (.db.splayed.get \"" ST_TMP "/u0/\") 's)" },
+    };
+    for (int d = 0; d < 3; d++) {
+        char fl[600]; TEST_ASSERT_TRUE(st_live(vs[d].dir, "s", fl, sizeof fl));
+        for (int c = 0; c < 2; c++) TEST_ASSERT_FALSE(st_dirent(fl, c).flags & RAY_ENC_STAT_ABSENT);
+        char q[300]; snprintf(q, sizeof q, "(.db.splayed.get \"%s%s/\")", ST_TMP, vs[d].dir);
+        t = st_hold(ray_eval_str(ray_test_tmp(q)));
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        ray_col_meta_t m;
+        ray_enc_counters_reset();
+        TEST_ASSERT_TRUE(ray_table_col_meta(t, ray_sym_intern("s", 1), &m));
+        TEST_ASSERT_FMT(m.unique == vs[d].unique, "%s: unique %d", vs[d].dir, (int)m.unique);
+        ray_enc_counters_t k; ray_enc_counters_get(&k);
+        TEST_ASSERT_EQ_U(k.materialized, 0);
+        col = ray_table_col(t, ray_sym_intern("s", 1));
+        TEST_ASSERT_TRUE(col && !RAY_IS_ERR(col));
+        TEST_ASSERT_EQ_I(ray_index_kind(col), RAY_IDX_DICT);
+        TEST_ASSERT_EQ_I(!!(ray_index_payload(col->index)->markers & RAY_MARK_UNIQUE), vs[d].unique);
+        TEST_ASSERT_EQ_I(ray_index_payload(col->index)->u.dict.n_distinct, 70000);
+        st_unhold(t, NULL); ray_release(t);
+        char qa[700];                                     /* .attr.get equal to the source's */
+        snprintf(qa, sizeof qa, "(== (count (.attr.get %s)) (count (.attr.get (at (.db.splayed.get \"%s%s/\") 's))))",
+                 vs[d].ref, ST_TMP, vs[d].dir);
+        ST_Q_TRUE(qa);
+        snprintf(qa, sizeof qa, "(all (== (.attr.get %s) (.attr.get (at (.db.splayed.get \"%s%s/\") 's))))",
+                 vs[d].ref, ST_TMP, vs[d].dir);
+        ST_Q_TRUE(qa);
+    }
+    ST_Q_OK("(.db.splayed.set \"" ST_TMP "/sh/\" (table [s] (list (take [\"a\" \"b\"] 5000))) {compress: true})");
+    t = st_hold(ray_eval_str(ray_test_tmp("(.db.splayed.get \"" ST_TMP "/sh/\")")));
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    TEST_ASSERT_NOT_NULL(ray_table_get_col_enc(t, ray_sym_intern("s", 1)));
+    ray_enc_counters_reset();
+    ray_t* ix = (ray_t*)1;
+    ray_t* ie = ray_table_col_index(t, ray_sym_intern("s", 1), &ix);
+    if (ie) st_hold(ie);
+    TEST_ASSERT_NULL(ie);
+    TEST_ASSERT_NULL(ix);
+    ray_enc_counters_t k; ray_enc_counters_get(&k);
+    TEST_ASSERT_EQ_U(k.materialized, 0);
+    PASS();
+}
+
+/* Vector scope through a query: a filter whose survivors are all in vector
+ * 1 gathers only vector 1's slices, so a malformed vector 0 does not fail it
+ * and nothing is materialized; a query reaching vector 0 fails "corrupt". */
+static test_result_t test_fsst_scopes_query(void) {
+    ST_Q_OK("(set S (as 'STR (map (fn [j] (format \"https://www.example.com/path/%/item?id=%&ref=search\" (% j 5000) (% (* j 7919) 100003))) (til 2048))))");
+    ST_Q_OK("(.db.splayed.set \"" ST_TMP "/fq/\" (table [s v] (list S (til 2048))) {compress: true})");
+    char p[600]; TEST_ASSERT_TRUE(st_live("/fq", "s", p, sizeof p));
+    ray_enc_desc_t d; TEST_ASSERT_EQ_I(st_desc_enc(p, 0, &d), RAY_ENC_FSST);
+    const long payload = 96 + 64 + (long)d.payload_off;
+    uint32_t lb; ST_READ(p, payload + 4, &lb, 4);
+    uint64_t total; ST_READ(p, payload + 8 + lb, &total, 8);
+    total += 8;
+    ST_PATCH(p, payload + 8 + lb, &total, 8);
+    ST_Q_OK("(set T (.db.splayed.get \"" ST_TMP "/fq/\"))");
+    ray_enc_counters_reset();
+    ST_Q_TRUE("(all (== (at (select {s: s from: T where: (>= v 1024)}) 's) (at S (+ 1024 (til 1024)))))");
+    ray_enc_counters_t k; ray_enc_counters_get(&k);
+    TEST_ASSERT_EQ_U(k.materialized, 0);
+    ray_t* r = st_hold(ray_eval_str("(at (select {s: s from: T where: (< v 1024)}) 's)"));
+    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r) && strcmp(ray_err_code(r), "corrupt") == 0);
     PASS();
 }
 
@@ -857,6 +1186,12 @@ const test_entry_t encstr_entries[] = {
     { "encstr/bound_arith",        test_bound_arith,        st_setup, st_teardown },
     { "encstr/force_str_wins",     test_force_str_wins,     st_setup, st_teardown },
     { "encstr/stats_chokepoint",   test_stats_chokepoint,   st_q_setup, st_q_teardown },
+    { "encstr/stats_chokepoint_pooled", test_stats_chokepoint_pooled, st_q_setup, st_q_teardown },
     { "encstr/dict_slot_spread",   test_dict_slot_spread,   st_setup, st_teardown },
+    { "encstr/pool_order",         test_pool_order,         st_setup, st_teardown },
+    { "encstr/fsst_scopes",        test_fsst_scopes,        st_setup, st_teardown },
+    { "encstr/dict_equals_gen0",   test_dict_equals_gen0,   st_q_setup, st_q_teardown },
+    { "encstr/dict_variants",      test_dict_variants,      st_q_setup, st_q_teardown },
+    { "encstr/fsst_scopes_query",  test_fsst_scopes_query,  st_q_setup, st_q_teardown },
     { NULL, NULL, NULL, NULL },
 };

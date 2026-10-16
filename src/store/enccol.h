@@ -234,7 +234,7 @@ typedef union {
  * Floats (CONST, RLE, DICT): k is { 32 | 64, unsigned, float }; cbits, the
  * run values and the dictionary entries are F32 / F64 bit patterns. */
 typedef struct ray_enc_vview_s {
-    uint8_t         enc;        /* RAY_ENC_CONST, _FOR_BP, _RLE or _DICT (a view exists only for these) */
+    uint8_t         enc;        /* RAY_ENC_CONST, _FOR_BP, _RLE, _DICT or _STR_DICT (a view exists only for these) */
     int             n, n_nulls;
     const uint8_t*  nullmap;    /* the 128-byte bitmap (bitmap types with nulls), else NULL */
     ray_enc_kind_t  k;
@@ -246,7 +246,7 @@ typedef struct ray_enc_vview_s {
     uint32_t        n_runs;     /* RLE (CONST: 1) */
     ray_enc_lanes_t run_vals;   /* RLE / CONST: run values at width T */
     ray_enc_lanes_t run_ends;   /* RLE / CONST: .h[r] exclusive, strictly ascending, last == n */
-    uint32_t        codes[RAY_ENC_VEC];   /* DICT */
+    uint32_t        codes[RAY_ENC_VEC];   /* DICT, STR_DICT */
     const uint64_t* dict;       /* DICT: VALUE_DICT entries (T-bit patterns, strictly ascending in dictionary order) */
     uint32_t        dict_n;
 } ray_enc_vview_t;
@@ -261,12 +261,18 @@ typedef struct ray_enc_vview_s {
  * residuals do not wrap (base + each residual at most the kind's largest
  * value, checked on the actual residuals: a writer's base is the minimum,
  * so a sound vector passes; its residuals then compare in logical order);
- * 0: declined (RAW, DELTA_BP, floats other than CONST, RLE, DICT; a float
+ * STR (P6): a STR_DICT vector only, as its codes (k U32, type RAY_STR,
+ * dict NULL, dict_n the entry count, nullmap NULL: the null is the empty
+ * entry's code, in band), every code below the entry count, every
+ * non-null row's inside the vector's code bounds and the empty entry's
+ * rows counted against n_nulls (any code child);
+ * 0: declined (RAW, DELTA_BP, floats other than CONST, RLE, DICT; STR other
+ * than STR_DICT; a float
  * vector with a trailer; a DICT code child other than FOR_BP, a body that
  * could wrap, or anything decode would reject): read the
  * vector by range, which decodes or reports it; -1: an owned error in
- * *err (the descriptors', the payload split's or the VALUE_DICT's
- * validation, as the decode would report it).  Never counts decoded
+ * *err (the descriptors', the payload split's, the VALUE_DICT's or the
+ * STR_DICT entry's validation, as the decode would report it).  Never counts decoded
  * bytes.  A declined view may be partly written; the caller ignores it. */
 int  ray_enccol_vview(ray_enccol_t* e, int64_t vec, ray_enc_vview_t* out, ray_t** err);
 
@@ -433,7 +439,10 @@ typedef struct ray_enc_chunk_stat_s {
 void ray_enccol_chunk_stat(const ray_enccol_t* e, int64_t c, ray_enc_chunk_stat_t* out);
 /* STR code bounds (membership bounds, spec "Statistics") of chunk c (j < 0)
  * or of vector j of chunk c: true with [*lo, *hi] when present.  The only
- * reader of STR statistics; every generic accessor reports none for STR.
+ * reader of STR statistics as statistics (validation and the STR_DICT view
+ * check codes against them); every generic accessor reports none for STR
+ * (chunk_stat with min / max 0, dir_totals, vec_stat), and the ZONE /
+ * CHUNK_ZONE synthesis treats STR chunks as without them.
  * *err is set (and false returned) when the chunk's descriptors are corrupt. */
 bool ray_enccol_code_bounds(ray_enccol_t* e, int64_t c, int j, int64_t* lo, int64_t* hi, ray_t** err);
 /* The totals below, computed once per column (the directory is immutable). */
@@ -467,8 +476,10 @@ bool   ray_enccol_dir_vec_ok(const ray_enccol_t* e, int64_t c, int j);
 ray_t* ray_enccol_check_dir_all(ray_t* encv);
 
 void ray_enccol_meta(ray_t* encv, ray_col_meta_t* m);
-/* Could materialization attach an index (recorded kind, UNIQUE, or for STR
- * a runtime DICT, possible only when every chunk has statistics)? */
+/* Could materialization attach an index: a recorded kind, UNIQUE, or for
+ * STR a runtime DICT (spec "STR dictionary index"), possible only with a
+ * STR_DICT entry, code bounds on every chunk (every vector STR_DICT) and
+ * RAY_DICT_MIN_ROWS to INT32_MAX rows?  Known without decoding. */
 bool ray_enccol_may_have_index(ray_t* encv);
 
 /* The column's validated STR dictionary (*out NULL when it has none, or the

@@ -981,6 +981,7 @@ static ray_t* dec_str(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d
         /* vector scope: the pooled codes met so far (code + 1) and their
          * offsets in the vector's pool; at most vlen <= 1024 of them */
         uint32_t vk[2 * RAY_ENC_VEC], vo[2 * RAY_ENC_VEC];
+        _Static_assert(2 * RAY_ENC_VEC == 1 << 11, "the slot hash below keeps the product's top 11 bits");
         if (!dict_pool_off) memset(vk, 0, sizeof vk);
         for (int i = 0; i < vlen; i++) {
             const char* sp; uint32_t len;
@@ -2589,6 +2590,54 @@ static bool vview_codes_in(const ray_enc_vview_t* v, const uint8_t* bm, uint32_t
     return !bad;
 }
 
+/* vview_codes_in for a STR_DICT vector, whose null is in band (D4): every
+ * code below the entry count n; a row whose code is null_code (the empty
+ * entry, UINT32_MAX when there is none) is a null, exempt from the bounds,
+ * and exactly n_nulls rows are; every other row's code inside [clo, chi_x).
+ * dec_str's STR_DICT checks, row for row. */
+static bool vview_codes_in_inband(const ray_enc_vview_t* v, uint32_t n, uint32_t clo, uint32_t chi_x,
+                                  uint32_t null_code, int n_nulls) {
+    const bool none = clo >= chi_x;
+    const uint32_t lim = n - 1, span = none ? 0 : chi_x - 1 - clo;
+    uint32_t bad = 0;
+    int nulls = 0;
+    for (int i = 0; i < v->n; i++) {
+        const uint32_t c = v->codes[i];
+        const uint32_t nul = c == null_code;
+        nulls += (int)nul;
+        bad |= (uint32_t)(c > lim) | ((nul ^ 1u) & (uint32_t)(none | (c - clo > span)));
+    }
+    return !bad && nulls == n_nulls;
+}
+
+/* A STR_DICT vector's view: the codes (a U32 FOR_BP child through
+ * vview_codes_for, any other code child through ray_enc_strdict_read)
+ * with dec_str's checks (vview_codes_in_inband over the descriptor's code
+ * bounds, which a STR_DICT vector always carries).  No entry is read, no
+ * byte decoded or counted. */
+static int vview_str_dict(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d, const uint8_t* body,
+                          uint64_t avail, ray_enc_vview_t* v, ray_t** err) {
+    const ray_enc_sdict_t* sd;
+    if ((*err = ray_enccol_strdict(e, &sd)) != NULL) return -1;   /* validated once per column */
+    if (!sd) {
+        *err = ray_error("corrupt", "column %s: chunk %lld vector %d STR_DICT vector without a STR_DICT entry",
+                         e->path, (long long)c, j);
+        return -1;
+    }
+    if (d->flags & RAY_ENC_STAT_ABSENT) return 0;                 /* descriptor validation rejects it */
+    if (avail >= 16 && body[0] == RAY_ENC_FOR_BP) {
+        if (!vview_codes_for(body, avail, v)) return 0;
+    } else {
+        uint64_t codes[RAY_ENC_VEC];
+        if (ray_enc_strdict_read(body, (size_t)avail, v->n, sd->n, codes) < 0) return 0;
+        for (int i = 0; i < v->n; i++) v->codes[i] = (uint32_t)codes[i];
+    }
+    /* the bounds were checked against the entry count with the descriptors */
+    if (!vview_codes_in_inband(v, sd->n, (uint32_t)d->min, (uint32_t)d->max + 1, sd->null_code, d->n_nulls)) return 0;
+    v->dict_n = sd->n;
+    return 1;
+}
+
 /* dec_fast_dict's checks without the gather: the U32 FOR_BP code child's
  * header, size and base; the codes (unpacked into v->codes) below the
  * dictionary size; every non-null row's value inside the vector's
@@ -2719,7 +2768,11 @@ int ray_enccol_vview(ray_enccol_t* e, int64_t vec, ray_enc_vview_t* v, ray_t** e
     const int n = ray_enc_vec_len(e->len, vec);
     const bool fl = enc_type_float(e->type);
     if (d->flags & RAY_ENC_DESC_TRAILER) return 0;           /* floats only: decline (D6) */
-    if (fl) {
+    const bool str = e->type == RAY_STR;
+    if (str) {
+        if (d->encoding != RAY_ENC_STR_DICT) return 0;       /* RAW, CONST, FSST: decode */
+        v->k = (ray_enc_kind_t){ 32, false, false };         /* the codes */
+    } else if (fl) {
         if (d->encoding != RAY_ENC_CONST && d->encoding != RAY_ENC_RLE && d->encoding != RAY_ENC_DICT) return 0;
         if (!ray_enc_value_kind(e->type, e->attrs, &v->k)) return 0;   /* { 32 | 64, unsigned, float } */
     } else {
@@ -2733,6 +2786,7 @@ int ray_enccol_vview(ray_enccol_t* e, int64_t vec, ray_enc_vview_t* v, ray_t** e
     v->enc = d->encoding; v->n = n; v->n_nulls = d->n_nulls; v->nullmap = bm; v->type = e->type;
     v->cbits = 0; v->base = 0; v->width = 0; v->packed = NULL;
     v->n_runs = 0; v->dict = NULL; v->dict_n = 0;
+    if (str) return vview_str_dict(e, c, j, d, body, avail, v, err);   /* nulls in band: no bitmap */
     if (fl) return vview_float(e, d, body, avail, bm, v, err);
     const int T = v->k.T;
     const uint64_t m = T == 64 ? ~0ull : (1ull << T) - 1;
@@ -2986,6 +3040,8 @@ typedef struct {
     char*           pool;
     uint64_t        pool_cap;
     const uint64_t* chunk_pool;     /* STR: decoded-pool base of each chunk */
+    const uint32_t* dict_pool_off;  /* STR with a STR_DICT entry: each code's offset in the
+                                     * dictionary region (UINT32_MAX: inline entry) */
     enc_task_res_t* res;            /* one attempt result per chunk (task) */
     _Atomic(int64_t) lowest_failed; /* lowest failed chunk so far (INT64_MAX: none) */
 } enc_mat_ctx_t;
@@ -3022,12 +3078,17 @@ static void enc_mat_chunk(void* raw, uint32_t wid, int64_t start, int64_t end) {
             int64_t row = c * RAY_ENC_CHUNK + (int64_t)j * RAY_ENC_VEC;
             uint8_t* dst = x->out + (size_t)row * esz;   /* private until published */
             uint64_t nb = 0;
-            err = ray_enccol_decode_into(e, c, j, &descs[j], dst, x->pool, pbase, x->pool_cap, &nb);
+            /* ray_enccol_decode_into with the dictionary region's offsets */
+            err = decode_vec(e, c, j, &descs[j], dst, x->pool, pbase, x->pool_cap, true, &nb, x->dict_pool_off);
             produced += nb;
             if (!err && e->type == RAY_STR) {
                 int vlen = ray_enc_vec_len(e->len, row / RAY_ENC_VEC);
                 ray_str_t* s = (ray_str_t*)dst;
-                pbase += nb - (uint64_t)vlen * esz;      /* the vector's pool bytes (rows may share them) */
+                /* the vector's own pool bytes: a STR_DICT vector's rows point
+                 * into the dictionary region and add none (its nb is its
+                 * descriptors' bytes only), so the pool advances only over
+                 * RAW, CONST and FSST vectors, as the prepass counted them */
+                pbase += nb - (uint64_t)vlen * esz;
                 for (int i = 0; i < vlen; i++) {
                     if (ray_str_is_inline(&s[i])) continue;
                     /* the generation-0 rule (col_validate_str_region), computed
@@ -3052,13 +3113,20 @@ static void enc_mat_chunk(void* raw, uint32_t wid, int64_t start, int64_t end) {
     }
 }
 
-/* STR column-scope pass: every vector's decoded-pool bytes, with checked
- * arithmetic, before anything is written; the total must equal
- * str_pool_bytes.  The pool buffer is sized from these (str_pool_bytes and
- * the *_pool_bytes functions) only: decode reports a too-small pool_cap as
- * corrupt, so no other size may be used. */
-static ray_t* enc_str_prepass(ray_enccol_t* e, uint64_t* chunk_pool) {
-    uint64_t total = 0;
+/* STR column-scope pass (spec "STR pool", "FSST validation"): the decoded
+ * pool is the dictionary's entries over 12 bytes once, in code order (sd,
+ * the validated STR_DICT entry, or NULL), then every RAW / CONST / FSST
+ * vector's pooled bytes in row order; STR_DICT vectors share the
+ * dictionary region and add none.  Every vector's bytes are summed with
+ * checked arithmetic before anything is written (an FSST vector's slices
+ * are checked without writing: escapes, expansions, the cumulative count),
+ * and the total must equal str_pool_bytes.  The pool buffer is sized from
+ * these (str_pool_bytes and the *_pool_bytes functions) only: decode
+ * reports a too-small pool_cap as corrupt, so no other size may be used. */
+static ray_t* enc_str_prepass(ray_enccol_t* e, uint64_t* chunk_pool, const ray_enc_sdict_t* sd) {
+    uint64_t total = 0;                                   /* rule 1: the dictionary region first */
+    if (sd && !ray_enc_fsst_pool_add(&total, sd->pooled, e->hdr.str_pool_bytes))
+        return ray_error("corrupt", "column %s: dictionary exceeds str_pool_bytes", e->path);
     for (int64_t c = 0; c < e->n_chunks; c++) {
         ray_enc_desc_t descs[64];
         ray_t* err = ray_enccol_chunk_descs(e, c, descs);
@@ -3066,6 +3134,7 @@ static ray_t* enc_str_prepass(ray_enccol_t* e, uint64_t* chunk_pool) {
         chunk_pool[c] = total;
         int nv = (int)((chunk_rows(e, c) + RAY_ENC_VEC - 1) / RAY_ENC_VEC);
         for (int j = 0; j < nv; j++) {
+            if (descs[j].encoding == RAY_ENC_STR_DICT) continue;   /* rows in the dictionary region */
             uint64_t pb;
             if ((err = ray_enccol_desc_pool_bytes(e, c, j, &descs[j], &pb)) != NULL) return err;
             if (!ray_enc_fsst_pool_add(&total, pb, e->hdr.str_pool_bytes))
@@ -3095,7 +3164,7 @@ static ray_t* enc_synth_zone(ray_enccol_t* e) {
     int64_t mn = 0, mx = 0;
     for (int64_t c = 0; c < e->n_chunks; c++) {
         ray_enc_dirent_t de; dirent_at(e, c, &de);
-        if (de.flags & RAY_ENC_STAT_ABSENT) continue;
+        if ((de.flags & RAY_ENC_STAT_ABSENT) || e->type == RAY_STR) continue;   /* STR: code bounds, no order */
         bool lt = fl ? dbl_of(de.min) < dbl_of(mn) : de.min < mn;
         bool gt = fl ? dbl_of(de.max) > dbl_of(mx) : de.max > mx;
         if (!have || lt) mn = de.min;
@@ -3143,7 +3212,7 @@ static ray_t* enc_synth_chunk_zone(ray_enccol_t* e) {
     if (aggs) aggs->len = 3 * (int64_t)nc;
     for (uint32_t c = 0; c < nc; c++) {
         ray_enc_dirent_t de; dirent_at(e, c, &de);
-        bool absent = de.flags & RAY_ENC_STAT_ABSENT;
+        bool absent = (de.flags & RAY_ENC_STAT_ABSENT) || e->type == RAY_STR;   /* STR: code bounds, no order */
         if (fl) {
             ((double*)ray_data(mins))[c] = absent ? INFINITY  : dbl_of(de.min);
             ((double*)ray_data(maxs))[c] = absent ? -INFINITY : dbl_of(de.max);
@@ -3162,17 +3231,106 @@ static ray_t* enc_synth_chunk_zone(ray_enccol_t* e) {
     return root;
 }
 
+/* Spec "STR dictionary index" (D9): a STR column can carry a runtime DICT
+ * only when it has a STR_DICT entry, every chunk has code bounds (a STR
+ * chunk has them exactly when every vector in it is STR_DICT, checked at
+ * load against the directory) and its length is one a generation-0 DICT
+ * has: RAY_DICT_MIN_ROWS to INT32_MAX rows (I32 codes).  Known without
+ * decoding.  Single-file, not a stand-in. */
+static bool enc_str_dict_possible(const ray_enccol_t* e) {
+    if (e->type != RAY_STR || e->kind != RAY_ENCCOL_SINGLE || e->synthetic || !e->sdict_len ||
+        e->len < RAY_DICT_MIN_ROWS || e->len > INT32_MAX)
+        return false;
+    for (int64_t c = 0; c < e->n_chunks; c++) {
+        ray_enc_dirent_t de; dirent_at(e, c, &de);
+        if (de.flags & RAY_ENC_STAT_ABSENT) return false;
+    }
+    return true;
+}
+
+/* Recorded kind or UNIQUE first, then the runtime DICT's condition. */
+static bool enc_may_have_index(const ray_enccol_t* e) {
+    if (e->kind != RAY_ENCCOL_SINGLE) return false;
+    if (e->hdr.index_kind || (e->hdr.col_flags & RAY_ENC_FLAG_UNIQUE)) return true;
+    return enc_str_dict_possible(e);
+}
+
+/* Spec "STR dictionary index": the decoded codes are the index codes, read
+ * from each vector's view (every legal code child, every decode check);
+ * first occurrences follow from the codes in row order.  A sound file's
+ * codes are first-occurrence over the whole column (every chunk is a
+ * dictionary chunk), so code k first appears after codes 0 .. k-1 and the
+ * DICT is ray_index_dict_compute's.  NULL with *root_out NULL when that
+ * order breaks or an entry never occurs (a forged file: no DICT, never a
+ * wrong one); a view declined on a STR_DICT vector of a validated file is
+ * corrupt (its decode rejected the same rule), never "no DICT". */
+static ray_t* enc_runtime_dict(ray_enccol_t* e, ray_t** root_out) {
+    *root_out = NULL;
+    const ray_enc_sdict_t* sd;
+    ray_t* err = ray_enccol_strdict(e, &sd);
+    if (err || !sd) return err;
+    ray_t* codes = enc_alloc_fails(e) ? NULL : ray_vec_new(RAY_I32, e->len);
+    ray_t* focc = codes && !RAY_IS_ERR(codes) ? ray_vec_new(RAY_I32, sd->n) : NULL;
+    ray_enc_vview_t* vw = focc && !RAY_IS_ERR(focc) ? ray_alloc_raw(sizeof *vw) : NULL;
+    if (!vw) {
+        if (codes && !RAY_IS_ERR(codes)) ray_release(codes);
+        if (codes && RAY_IS_ERR(codes)) ray_error_free(codes);
+        if (focc && !RAY_IS_ERR(focc)) ray_release(focc);
+        if (focc && RAY_IS_ERR(focc)) ray_error_free(focc);
+        return ray_error("oom", "column %s: DICT index", e->path);
+    }
+    codes->len = e->len; focc->len = sd->n;
+    int32_t* cd = (int32_t*)ray_data(codes);
+    int32_t* fo = (int32_t*)ray_data(focc);
+    uint32_t ndist = 0;
+    bool first_order = true;
+    const int64_t nv = ray_enc_nvecs(e->len);
+    for (int64_t v = 0; v < nv && first_order; v++) {
+        int r = ray_enccol_vview(e, v, vw, &err);
+        if (r < 0) break;
+        if (r == 0 || vw->enc != RAY_ENC_STR_DICT) {
+            err = ray_error("corrupt", "column %s: vector %lld not readable as STR_DICT codes", e->path, (long long)v);
+            break;
+        }
+        const int64_t r0 = v * RAY_ENC_VEC;
+        for (int i = 0; i < vw->n; i++) {
+            const uint32_t k = vw->codes[i];             /* below sd->n: the view checked it */
+            if (k == ndist) fo[ndist++] = (int32_t)(r0 + i);
+            else if (k > ndist) { first_order = false; break; }
+            cd[r0 + i] = (int32_t)k;
+        }
+    }
+    ray_free_raw(vw);
+    if (err || !first_order || ndist != sd->n) {
+        ray_release(codes); ray_release(focc);
+        return err;
+    }
+    ray_t* root = enc_alloc_fails(e) ? NULL : ray_index_new_root(RAY_IDX_DICT, RAY_STR, e->len);
+    if (!root || RAY_IS_ERR(root)) {
+        ray_release(codes); ray_release(focc);
+        if (root) ray_error_free(root);
+        return ray_error("oom", "column %s: DICT index", e->path);
+    }
+    ray_index_t* ix = ray_index_payload(root);
+    ix->u.dict.codes = codes; ix->u.dict.first_occ = focc; ix->u.dict.n_distinct = sd->n;
+    *root_out = root;
+    return NULL;
+}
+
 /* ZONE / CHUNK_ZONE roots are synthesized from the verified directory;
  * HASH / SORT / BLOOM / PART roots are parsed from the index region, which
  * is validated here, on first materialization (spec "Lazy validation"), so
  * a malformed region fails the materialization and never reads as "no
  * index".  The UNIQUE marker comes from the column flag (the parse leaves
  * it to this caller); every attach goes through the admission predicate,
- * a refusal is corrupt. */
+ * a refusal is corrupt.  With no recorded kind, a STR column that can
+ * carry one gets its runtime DICT (spec "STR dictionary index"; a recorded
+ * HASH keeps HASH and builds none); UNIQUE marks whichever root results. */
 static ray_t* enc_attach_index(ray_enccol_t* e, ray_t** vp) {
     uint8_t kind = e->hdr.index_kind;
     bool unique = e->hdr.col_flags & RAY_ENC_FLAG_UNIQUE;
-    if (kind == 0 && !unique) return NULL;
+    const bool rdict = kind == 0 && enc_str_dict_possible(e);
+    if (kind == 0 && !unique && !rdict) return NULL;
     ray_t* root = NULL;
     if (kind == RAY_IDX_ZONE || kind == RAY_IDX_CHUNK_ZONE) {
         if (!ray_zone_acc_supported(e->type))
@@ -3202,6 +3360,11 @@ static ray_t* enc_attach_index(ray_enccol_t* e, ray_t** vp) {
         }
     } else if (kind != 0) {
         return ray_error("corrupt", "column %s: index kind %u", e->path, kind);
+    }
+    if (rdict) {
+        ray_t* derr = enc_runtime_dict(e, &root);
+        if (derr) return derr;
+        if (!root && !unique) return NULL;           /* a forged order: no DICT */
     }
     if (unique) {
         if (!root) {
@@ -3243,11 +3406,14 @@ static ray_t* enc_materialize_single(void* ctx, ray_enc_snap_t* fail) {
     vec->len = e->len;
     ray_t* err = NULL;
     uint64_t* chunk_pool = NULL;
+    uint32_t* dict_pool_off = NULL;
     enc_task_res_t* res = NULL;
     if (e->type == RAY_STR) {
+        const ray_enc_sdict_t* sd = NULL;                /* the dictionary first: the pool starts with it */
+        if ((err = ray_enccol_strdict(e, &sd)) != NULL) goto fail;
         chunk_pool = enc_alloc_fails(e) ? NULL : ray_alloc_raw((size_t)(e->n_chunks + 1) * sizeof(uint64_t));
         if (!chunk_pool) { err = ray_error("oom", "column %s: materialize", e->path); goto fail; }
-        if ((err = enc_str_prepass(e, chunk_pool)) != NULL) goto fail;
+        if ((err = enc_str_prepass(e, chunk_pool, sd)) != NULL) goto fail;
         if (e->hdr.str_pool_bytes > 0) {
             ray_t* pool = enc_alloc_fails(e) ? NULL : ray_alloc((size_t)e->hdr.str_pool_bytes);
             if (!pool || RAY_IS_ERR(pool)) { err = pool ? pool : ray_error("oom", "column %s: pool", e->path); goto fail; }
@@ -3256,13 +3422,31 @@ static ray_t* enc_materialize_single(void* ctx, ray_enc_snap_t* fail) {
             vec->str_pool = pool;
             atomic_fetch_add_explicit(&g_str_pool_allocs, 1, memory_order_relaxed);
         }
+        if (sd) {
+            /* the dictionary region: entries over 12 bytes once, in code
+             * order, at the pool's start (the prepass counted sd->pooled
+             * of it, so a pool exists when any entry is pooled) */
+            dict_pool_off = enc_alloc_fails(e) ? NULL : ray_alloc_raw((size_t)sd->n * sizeof(uint32_t));
+            if (!dict_pool_off) { err = ray_error("oom", "column %s: materialize", e->path); goto fail; }
+            char* pb = vec->str_pool ? (char*)ray_data(vec->str_pool) : NULL;
+            uint64_t at = 0;
+            for (uint32_t k = 0; k < sd->n; k++) {
+                const char* sp; uint32_t len;
+                ray_enc_sdict_entry(sd, k, &sp, &len);
+                if (len <= RAY_STR_INLINE_MAX) { dict_pool_off[k] = UINT32_MAX; continue; }
+                memcpy(pb + at, sp, len);
+                dict_pool_off[k] = (uint32_t)at;         /* at + len <= sd->pooled <= str_pool_bytes <= UINT32_MAX */
+                at += len;
+            }
+        }
     }
     res = enc_alloc_fails(e) ? NULL : ray_calloc_raw((size_t)(e->n_chunks + 1) * sizeof *res);
     if (!res) { err = ray_error("oom", "column %s: materialize", e->path); goto fail; }
     enc_mat_ctx_t x = {
         .e = e, .out = (uint8_t*)ray_data(vec),
         .pool = vec->str_pool ? (char*)ray_data(vec->str_pool) : NULL,
-        .pool_cap = e->hdr.str_pool_bytes, .chunk_pool = chunk_pool, .res = res,
+        .pool_cap = e->hdr.str_pool_bytes, .chunk_pool = chunk_pool, .dict_pool_off = dict_pool_off,
+        .res = res,
     };
     atomic_init(&x.lowest_failed, INT64_MAX);
     if (e->n_chunks > (int64_t)UINT32_MAX) { err = ray_error("range", "column %s: too many chunks", e->path); goto fail; }
@@ -3277,11 +3461,12 @@ static ray_t* enc_materialize_single(void* ctx, ray_enc_snap_t* fail) {
         if (res[c].failed || !res[c].done) {     /* the lowest-numbered failing task */
             if (res[c].failed) *fail = res[c].snap;
             else ray_enc_snap_set(fail, "cancel", "column %s: interrupted", e->path);
-            ray_free_raw(res); ray_free_raw(chunk_pool); ray_release(vec);
+            ray_free_raw(res); ray_free_raw(chunk_pool); ray_free_raw(dict_pool_off); ray_release(vec);
             return NULL;
         }
     ray_free_raw(res); res = NULL;
     ray_free_raw(chunk_pool); chunk_pool = NULL;
+    ray_free_raw(dict_pool_off); dict_pool_off = NULL;
     vec->attrs = e->attrs;                       /* persisted attrs (SYM width included) */
     if (e->type == RAY_SYM) {
         vec->sym_domain = e->dom;                /* sym_vec_new's runtime domain is immortal */
@@ -3291,7 +3476,7 @@ static ray_t* enc_materialize_single(void* ctx, ray_enc_snap_t* fail) {
     atomic_fetch_add_explicit(&g_enc_materialized, 1, memory_order_relaxed);
     return vec;
 fail:
-    ray_free_raw(res); ray_free_raw(chunk_pool);
+    ray_free_raw(res); ray_free_raw(chunk_pool); ray_free_raw(dict_pool_off);
     ray_release(vec);
     ray_enc_snap_take(fail, err);
     return NULL;
@@ -3537,14 +3722,7 @@ ray_t* ray_enccol_info(ray_t* encv, ray_enccol_info_t* out) {
 
 bool ray_enccol_may_have_index(ray_t* encv) {
     ray_enccol_t* e = ray_enccol_of(encv);
-    if (!e || e->kind != RAY_ENCCOL_SINGLE) return false;
-    if (e->hdr.index_kind || (e->hdr.col_flags & RAY_ENC_FLAG_UNIQUE)) return true;
-    if (e->type != RAY_STR || e->n_chunks == 0) return false;
-    for (int64_t c = 0; c < e->n_chunks; c++) {
-        ray_enc_dirent_t de; dirent_at(e, c, &de);
-        if (de.flags & RAY_ENC_STAT_ABSENT) return false;
-    }
-    return true;
+    return e && enc_may_have_index(e);
 }
 
 ray_t* ray_enccol_decoded_peek(ray_t* encv) {
@@ -3655,7 +3833,8 @@ void ray_enccol_chunk_stat(const ray_enccol_t* e, int64_t c, ray_enc_chunk_stat_
     /* STR bounds are code bounds (first-occurrence codes, not ordered
      * values): only ray_enccol_code_bounds reads them */
     out->has_minmax = (de.flags & RAY_ENC_STAT_ABSENT) == 0 && e->type != RAY_STR;
-    out->min = de.min; out->max = de.max;
+    out->min = e->type == RAY_STR ? 0 : de.min;          /* a reader ignoring has_minmax sees no codes */
+    out->max = e->type == RAY_STR ? 0 : de.max;
     out->null_count = de.null_count;
     out->sum_lo = de.sum_lo; out->sum_hi = de.sum_hi;
 }
