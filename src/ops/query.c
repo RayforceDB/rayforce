@@ -423,11 +423,23 @@ static int8_t dag_operand_type(ray_graph_t* g, ray_op_t* x) {
     return keys ? keys->type : x->out_type;
 }
 
+/* Arithmetic with a temporal operand keeps its meaning only in the
+ * builtins (arith.c), which pick the result type (DATE + I64 is DATE,
+ * DATE - DATE is I32 days) or reject the pair outright.  The DAG kernels
+ * see raw day / millisecond / nanosecond counts, so `(/ date 2)` and
+ * `(div date 2)` came back as F64 / I64 numbers where the builtin raises
+ * `cannot divide date by i64`, and `(% date 2)` came back as I64 where the
+ * builtin keeps DATE.  Every verb the DAG lowers declines a temporal
+ * operand to the evaluator, which runs the builtin per row. */
 static bool dag_temporal_arith_needs_eval(const char* name, size_t len,
                                           int8_t left_type, int8_t right_type) {
     if (!dag_type_is_temporal(left_type) && !dag_type_is_temporal(right_type))
         return false;
-    return len == 1 && (name[0] == '+' || name[0] == '-' || name[0] == '*');
+    if (len == 1)
+        return name[0] == '+' || name[0] == '-' || name[0] == '*' ||
+               name[0] == '/' || name[0] == '%';
+    return len == 3 && (memcmp(name, "div", 3) == 0 ||
+                        memcmp(name, "pow", 3) == 0);
 }
 
 /* A comparison between a temporal and a float has no meaning — the eval
