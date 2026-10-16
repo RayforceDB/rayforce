@@ -14730,12 +14730,18 @@ ht_path:;
         int8_t agg_slot = ght_layout.agg_val_slot[ai];
         topn_order_ok = true;
         if (order_op == OP_SUM) {
-            if (agg_slot < 0 || order_is_f64) topn_order_ok = false;
+            /* The heap sees the raw sum, before bias * group_count is added. */
+            if (agg_slot < 0 || order_is_f64 ||
+                (agg_affine[ai].enabled && agg_affine[ai].bias_i64 != 0))
+                topn_order_ok = false;
             else topn_order_off = (uint16_t)(ght_layout.off_sum
                                              + (uint16_t)agg_slot * 8u);
         } else if (order_op == OP_MIN) {
+            /* An all-null group's raw MIN slot is INT64_MAX, not its final
+             * null sort position; let the final sort rank nullable MINs. */
             if (agg_slot < 0 || order_is_f64
-                || (ght_layout.agg_flags[ai] & GHT_AF_SYM)) topn_order_ok = false;
+                || (ght_layout.agg_flags[ai] & GHT_AF_SYM)
+                || (ght_layout.agg_flags2[ai] & GHT_AF2_NULLABLE)) topn_order_ok = false;
             else topn_order_off = (uint16_t)(ght_layout.off_min
                                              + (uint16_t)agg_slot * 8u);
         } else if (order_op == OP_MAX) {
