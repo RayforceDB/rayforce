@@ -36,3 +36,87 @@
 ;; would overflow to 0 only by coincidence for exactly 2 null rows).
 (at (at (select {s: (sum (* x 2)) from: T by: k where: (== k 1)}) 's) 0) -- 60
 (at (at (select {s: (sum (* x 2)) from: T by: k where: (== k 2)}) 's) 0) -- 0
+
+;; ── Affine input (col +/- c) over a nullable col (issue #814) ──────────────
+;; try_affine_sumavg_input aggregates the bare column and adds the bias at
+;; emit.  (col + c) is null wherever col is, so a SUM adds bias * NON-NULL
+;; count, not bias * group rows: an all-null group sums to 0 and a partly
+;; null group is not off by c per null row.  The oracle is the same agg over
+;; the materialized expression column (e = w + 100, f = w - 7, nulls kept).
+;; Keys: w is null when k % 5 == 0 (all-null groups) or v % 7 == 0 (partly
+;; null groups).  Values are small integers, so F64 sums are exact.
+(set AffEq (fn [x y] (and (== (count x) (count y)) (all (== x y)))))
+(set AffMk (fn [n ng ty] (do (set k (% (* (til n) 7919) ng)) (set v (til n)) (set w (as ty (at (concat (til 13) (take 0Nl 13)) (+ (% (+ k v) 13) (* 13 (as 'I64 (or (== (% k 5) 0) (== (% v 7) 0)))))))) (table [k s v w e f] (list k (at (as 'SYMBOL (map (fn [j] (format "a%" j)) (til ng))) k) v w (+ w 100) (- w 7))))))
+(set AffChk (fn [T] (do (set x (select {m: (sum (+ w 100)) r: (sum (+ 100 w)) d: (sum (- w 7)) a: (avg (+ w 100)) from: T by: {s: s z: (% v 1) t: s}})) (set y (select {m: (sum e) r: (sum e) d: (sum f) a: (avg e) from: T by: {s: s z: (% v 1) t: s}})) (and (AffEq (at x 's) (at y 's)) (AffEq (at x 'm) (at y 'm)) (AffEq (at x 'r) (at y 'r)) (AffEq (at x 'd) (at y 'd)) (AffEq (at x 'a) (at y 'a))))))
+(set AffZero (fn [T] (at (select {m: (sum (+ w 100)) from: T by: {s: s z: (% v 1) t: s} where: (== s 'a0)}) 'm)))
+
+;; Keyless: the scalar reduction emits through emit_agg_columns.
+(set Ta (table [w e f] (list [0N 1 2 0N 4] (+ [0N 1 2 0N 4] 100) (- [0N 1 2 0N 4] 7))))
+(at (select {m: (sum (+ w 100)) d: (sum (- w 7)) from: Ta}) 'm) -- [307]
+(at (select {m: (sum (+ w 100)) d: (sum (- w 7)) from: Ta}) 'd) -- [-14]
+(at (select {m: (sum (+ w 100)) from: Ta}) 'm) -- [307]
+(at (select {m: (avg (+ w 100)) from: Ta}) 'm) -- [102.33333333333333]
+(set Tb (table [w] (list [0N 1.5 2.0 0N 4.5])))
+(at (select {m: (sum (+ w 100.0)) d: (sum (- w 7)) from: Tb}) 'm) -- [308.0]
+(at (select {m: (sum (+ w 100.0)) from: Tb}) 'm) -- [308.0]
+(at (select {m: (sum (+ w 100)) from: (table [w] (list (as 'I64 [0N 0N])))}) 'm) -- [0]
+
+;; Parted, compound key: each partition groups on its own.  8000 rows over two
+;; partitions run the sequential HT emit; 2 x 70000 rows (above the parallel
+;; threshold) run the radix phase-3 emit.
+(.sys.exec "rm -rf /tmp/rfl_aff814")
+(set Wi (AffMk 8000 2000 'I64))
+(.db.splayed.set "/tmp/rfl_aff814/s/2024.01.01/t/" (take Wi 4000) "/tmp/rfl_aff814/s/.sym")
+(.db.splayed.set "/tmp/rfl_aff814/s/2024.01.02/t/" (drop Wi 4000) "/tmp/rfl_aff814/s/.sym")
+(AffChk (.db.parted.get "/tmp/rfl_aff814/s" 't)) -- true
+(AffZero (.db.parted.get "/tmp/rfl_aff814/s" 't)) -- [0]
+(set Wf (AffMk 8000 2000 'F64))
+(.db.splayed.set "/tmp/rfl_aff814/sf/2024.01.01/t/" (take Wf 4000) "/tmp/rfl_aff814/sf/.sym")
+(.db.splayed.set "/tmp/rfl_aff814/sf/2024.01.02/t/" (drop Wf 4000) "/tmp/rfl_aff814/sf/.sym")
+(AffChk (.db.parted.get "/tmp/rfl_aff814/sf" 't)) -- true
+(AffZero (.db.parted.get "/tmp/rfl_aff814/sf" 't)) -- [0.0]
+(set Wi (AffMk 140000 3000 'I64))
+(.db.splayed.set "/tmp/rfl_aff814/r/2024.01.01/t/" (take Wi 70000) "/tmp/rfl_aff814/r/.sym")
+(.db.splayed.set "/tmp/rfl_aff814/r/2024.01.02/t/" (drop Wi 70000) "/tmp/rfl_aff814/r/.sym")
+(AffChk (.db.parted.get "/tmp/rfl_aff814/r" 't)) -- true
+(AffZero (.db.parted.get "/tmp/rfl_aff814/r" 't)) -- [0]
+(set Wf (AffMk 140000 3000 'F64))
+(.db.splayed.set "/tmp/rfl_aff814/rf/2024.01.01/t/" (take Wf 70000) "/tmp/rfl_aff814/rf/.sym")
+(.db.splayed.set "/tmp/rfl_aff814/rf/2024.01.02/t/" (drop Wf 70000) "/tmp/rfl_aff814/rf/.sym")
+(AffChk (.db.parted.get "/tmp/rfl_aff814/rf" 't)) -- true
+(AffZero (.db.parted.get "/tmp/rfl_aff814/rf" 't)) -- [0.0]
+(.sys.exec "rm -rf /tmp/rfl_aff814")
+
+;; Grouped take over an affine SUM of a nullable col.  The radix top-N heap
+;; ranks by the raw accumulator slot (sum of col alone); the emitted value is
+;; raw + c * non-null count, so with nulls the two orders disagree even when
+;; every group has the same row count.  2000 groups of 4 rows: even groups
+;; are w = 0 (raw 0, emitted 4c), odd groups are one 1 and three nulls (raw 1,
+;; emitted 1 + c).  Ranking by the raw slot returns the odd groups for desc:.
+;; For (- y 7) the even groups are y = 5 (raw 20, emitted -8) so that the raw
+;; order again disagrees with the emitted one (odd groups emit -6).
+(.sys.exec "rm -rf /tmp/rfl_aff814t")
+(set Kt (% (til 8000) 2000))
+(set Wti (as 'I64 (map (fn [i] (if (== 0 (% (at Kt i) 2)) 0 (if (< i 2000) 1 0Nl))) (til 8000))))
+(set Yti (as 'I64 (map (fn [i] (if (== 0 (% (at Kt i) 2)) 5 (if (< i 2000) 1 0Nl))) (til 8000))))
+(set Wt (table [s w x y yf v] (list (at (as 'SYMBOL (map (fn [j] (format "w%" j)) (til 2000))) Kt) Wti (as 'F64 Wti) Yti (as 'F64 Yti) (til 8000))))
+(at (select {m: (sum (+ w 100)) from: Wt by: {s: s z: (% v 1) t: s} desc: m take: 5}) 'm) -- [400 400 400 400 400]
+(at (select {m: (sum (+ w 100)) from: Wt by: {s: s z: (% v 1) t: s} asc: m take: 5}) 'm) -- [101 101 101 101 101]
+(at (select {m: (sum (- y 7)) from: Wt by: {s: s z: (% v 1) t: s} desc: m take: 5}) 'm) -- [-6 -6 -6 -6 -6]
+(at (select {m: (sum (- y 7)) from: Wt by: {s: s z: (% v 1) t: s} asc: m take: 5}) 'm) -- [-8 -8 -8 -8 -8]
+(at (select {m: (sum (+ x 2.5)) from: Wt by: {s: s z: (% v 1) t: s} desc: m take: 5}) 'm) -- [10.0 10.0 10.0 10.0 10.0]
+(at (select {m: (sum (+ x 2.5)) from: Wt by: {s: s z: (% v 1) t: s} asc: m take: 5}) 'm) -- [3.5 3.5 3.5 3.5 3.5]
+(at (select {m: (sum (- yf 7)) from: Wt by: {s: s z: (% v 1) t: s} desc: m take: 5}) 'm) -- [-6.0 -6.0 -6.0 -6.0 -6.0]
+(at (select {m: (sum (- yf 7)) from: Wt by: {s: s z: (% v 1) t: s} asc: m take: 5}) 'm) -- [-8.0 -8.0 -8.0 -8.0 -8.0]
+(.db.splayed.set "/tmp/rfl_aff814t/2024.01.01/t/" (take Wt 4000) "/tmp/rfl_aff814t/.sym")
+(.db.splayed.set "/tmp/rfl_aff814t/2024.01.02/t/" (drop Wt 4000) "/tmp/rfl_aff814t/.sym")
+(set Pt (.db.parted.get "/tmp/rfl_aff814t" 't))
+(at (select {m: (sum (+ w 100)) from: Pt by: {s: s z: (% v 1) t: s} desc: m take: 5}) 'm) -- [400 400 400 400 400]
+(at (select {m: (sum (+ w 100)) from: Pt by: {s: s z: (% v 1) t: s} asc: m take: 5}) 'm) -- [101 101 101 101 101]
+(at (select {m: (sum (- y 7)) from: Pt by: {s: s z: (% v 1) t: s} desc: m take: 5}) 'm) -- [-6 -6 -6 -6 -6]
+(at (select {m: (sum (- y 7)) from: Pt by: {s: s z: (% v 1) t: s} asc: m take: 5}) 'm) -- [-8 -8 -8 -8 -8]
+(at (select {m: (sum (+ x 2.5)) from: Pt by: {s: s z: (% v 1) t: s} desc: m take: 5}) 'm) -- [10.0 10.0 10.0 10.0 10.0]
+(at (select {m: (sum (+ x 2.5)) from: Pt by: {s: s z: (% v 1) t: s} asc: m take: 5}) 'm) -- [3.5 3.5 3.5 3.5 3.5]
+(at (select {m: (sum (- yf 7)) from: Pt by: {s: s z: (% v 1) t: s} desc: m take: 5}) 'm) -- [-6.0 -6.0 -6.0 -6.0 -6.0]
+(at (select {m: (sum (- yf 7)) from: Pt by: {s: s z: (% v 1) t: s} asc: m take: 5}) 'm) -- [-8.0 -8.0 -8.0 -8.0 -8.0]
+(.sys.exec "rm -rf /tmp/rfl_aff814t")
