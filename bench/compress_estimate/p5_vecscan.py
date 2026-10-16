@@ -12,7 +12,7 @@ Reads headers only; nothing is decoded.  usage: p5_vecscan.py <store dir>"""
 import collections, os, struct, sys
 
 ENC = {0: "raw", 1: "const", 2: "for_bp", 3: "delta_bp", 4: "rle", 5: "dict", 6: "alp", 7: "alp_rd"}
-TYPES = {6: "F32", 7: "F64"}   # the ray_t type byte (offset 18); rows at 24
+TYPES = {3: "I16", 6: "F32", 7: "F64"}   # the ray_t type byte (offset 18); rows at 24
 
 
 def scan(path):

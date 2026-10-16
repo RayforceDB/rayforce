@@ -3,7 +3,8 @@
 # The ClickBench store has no float column, so the float store is derived
 # from it: five F64 columns and one F32 computed from real integer columns
 # of the 10M .db.splayed.get store, saved g0 / g2, measured, deleted.
-#   prep : release binary copied, store derived and saved (save times recorded)
+#   prep : release binary copied, store derived and saved (save times recorded);
+#          the TSV is started afresh, so a stale pass never mixes with this one
 #   enc  : per-column encoding mix and sizes of g2; per-vector ALP / ALP_RD
 #          exception counts and DICT code children (p5_vecscan.py, O1)
 #   warm : every query, ROUNDS alternated rounds (order swapped), one process
@@ -11,7 +12,7 @@
 #   cold : 3 trials per variant, the store's files evicted first (fadvise)
 #   ident: the full answer of every query, g0 vs g2 (g0 run twice, so float
 #          sum drift (#744) is told apart from a g2 difference); raw and sorted
-#   wall : per-call wall time of every query, g0 / g2, 3 alternated rounds
+#   wall : per-call wall time of every query, g0 / g2, WALLS (5) alternated rounds
 #   savet: the writer cost (O5): SAVES alternated rounds of the g0 and g2
 #          saves of the derived table, with this binary and with BASE's
 #          (`git archive`), each into a scratch store deleted after the round
@@ -24,6 +25,7 @@ REPO=$(cd "$HERE/../.." && pwd)
 SRC=/skull/clickbench/rfsplayed
 ROUNDS=${ROUNDS:-9}
 SAVES=${SAVES:-3}
+WALLS=${WALLS:-5}
 BASE=${BASE:-81c04acb}
 OUT=$W/p5.tsv
 BIN=$W/bin/p5
@@ -67,13 +69,18 @@ answer() {   # variant q file
   # a scalar goes through .csv.write too (a one-cell table): println keeps
   # 6 significant digits, which would hide a float-sum difference
   { loadline "$1"; printf '(set r %s)\n(.csv.write (if (== (type r) (quote TABLE)) r (table [r] (list (enlist r)))) "%s")\n' "$2" "$c"; } > "$s"
-  "$BIN" "$s" > "$3" 2>&1 || true; rm -f "$s"
-  if [ -f "$c" ]; then mv "$c" "$3"; fi
+  "$BIN" "$s" > "$3.err" 2>&1 || true; rm -f "$s"
+  # no csv: a FAIL marker, never the error text (the same error on g0 and
+  # g2 would hash the same and read as "same")
+  if [ -f "$c" ]; then mv "$c" "$3"; rm -f "$3.err"; else { echo FAIL; cat "$3.err"; } > "$3"; rm -f "$3.err"; fi
 }
+h_or_fail() { if [ "$(head -n 1 "$2")" = FAIL ]; then echo FAIL; else "$1" "$2"; fi; }
 case "${1:?usage: p5_bench.sh prep|enc|warm|cold|ident|wall|savet|clean|all}" in
 prep)
   guard 4
   ( cd "$REPO" && make release >/dev/null ); cp "$REPO/rayforce" "$BIN"; rel_guard "$BIN"
+  : > "$OUT"
+  printf 'nq\t%s\n' "${#QS[@]}" >> "$OUT"
   printf 'meta\tp5\t%s\t%s\n' "$(git -C "$REPO" rev-parse --short HEAD)" "$(sha256sum "$BIN" | cut -c1-12)" >> "$OUT"
   rm -rf "$W/g0" "$W/g2"
   s=$(mktemp -p "$W/g")
@@ -119,8 +126,8 @@ ident)
   for qn in "${!QS[@]}"; do q=${QS[$qn]}
     a=$W/g/out_g0; b=$W/g/out_g2; a2=$W/g/out_g0b
     answer g0 "$q" "$a"; answer g2 "$q" "$b"; answer g0 "$q" "$a2"
-    printf 'ident\tq%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$qn" "$(h_raw "$a")" "$(h_raw "$b")" "$(h_raw "$a2")" \
-      "$(h_sort "$a")" "$(h_sort "$b")" "$(h_sort "$a2")" >> "$OUT"
+    printf 'ident\tq%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$qn" "$(h_or_fail h_raw "$a")" "$(h_or_fail h_raw "$b")" "$(h_or_fail h_raw "$a2")" \
+      "$(h_or_fail h_sort "$a")" "$(h_or_fail h_sort "$b")" "$(h_or_fail h_sort "$a2")" >> "$OUT"
     printf 'answer\tq%s\tg0\t%s\n' "$qn" "$(head -c 300 "$a" | tr '\n\t' '  ')" >> "$OUT"
     printf 'answer\tq%s\tg2\t%s\n' "$qn" "$(head -c 300 "$b" | tr '\n\t' '  ')" >> "$OUT"
   done
@@ -152,7 +159,7 @@ wall)   # per-call wall time, (T(1 + K) - T(1)) / K over K top-level calls: (tim
         # plain generation-0 vector reports the reduction as ~0 ms (q0, q1), so the warm
         # ratio of those queries is not a scan-to-scan ratio; this one is
   rel_guard "$BIN"; K=100
-  for round in 1 2 3; do
+  for round in $(seq 1 "$WALLS"); do
     calm
     if [ $((round % 2)) = 1 ]; then order="g0 g2"; else order="g2 g0"; fi
     for qn in "${!QS[@]}"; do q=${QS[$qn]}

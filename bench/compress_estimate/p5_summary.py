@@ -8,6 +8,15 @@ Every number comes from the TSV; nothing is typed."""
 import collections, statistics, sys
 m = collections.defaultdict(list); c = collections.defaultdict(list); wall = collections.defaultdict(list)
 cols, vecs, sizes, saves, ident, savet, meta, waits = [], [], {}, {}, {}, collections.defaultdict(list), {}, []
+nq = 10; bad_rows = []
+# A per-query ratio is taken from the `wall` stage when the timeit g0 median
+# is below FLOOR ms ((timeit q) reports a top-level reduction on a plain
+# vector as ~0 ms); a wall time below FLOOR is below the stage's resolution
+# and is floored to it, so two sub-resolution times compare as 1.0.
+FLOOR = 0.05
+def nums(xs):
+    try: return [float(x) for x in xs if x]
+    except ValueError: return None
 for line in open(sys.argv[1]):
     f = line.rstrip("\n").split("\t")
     if f[0] == "col": cols.append(f[1:])
@@ -20,11 +29,19 @@ for line in open(sys.argv[1]):
     elif f[0] == "savet" and len(f) >= 5 and f[3] and f[4]:
         savet[(f[1], "g0")].append(float(f[3])); savet[(f[1], "g2")].append(float(f[4]))
         if len(f) >= 7: savet[(f[1], "size_g0")].append(int(f[5])); savet[(f[1], "size_g2")].append(int(f[6]))
+    elif f[0] == "nq": nq = int(f[1])
     elif f[0] == "m":
-        t = [float(x) for x in f[4:] if x]
-        if len(t) == 6: m[(f[1], f[2], "first")].append(t[0]); m[(f[1], f[2], "warm")].append(statistics.median(t[1:]))
-    elif f[0] == "wall": wall[(f[1], f[2])].append(float(f[4]))
-    elif f[0] == "c" and len(f) > 4 and f[4]: c[(f[1], f[2])].append(float(f[4]))
+        t = nums(f[4:])
+        if t is not None and len(t) == 6: m[(f[1], f[2], "first")].append(t[0]); m[(f[1], f[2], "warm")].append(statistics.median(t[1:]))
+        else: bad_rows.append(("warm", f[1], f[2], f[3]))
+    elif f[0] == "wall":
+        t = nums(f[4:5])
+        if t: wall[(f[1], f[2])].append(t[0])
+        else: bad_rows.append(("wall", f[1], f[2], f[3]))
+    elif f[0] == "c":
+        t = nums(f[4:5])
+        if t: c[(f[1], f[2])].append(t[0])
+        else: bad_rows.append(("cold", f[1], f[2], f[3]))
 print(f"meta {meta}")
 print("| column | encoded B | raw B | ratio | mix |\n|---|---|---|---|---|")
 for name, e, r, mix in cols: print(f"| {name} | {e} | {r} | {int(r) / max(int(e), 1):.2f}x | {mix} |")
@@ -50,25 +67,53 @@ if savet:
         print(f"g2 store bytes: p5 {savet[('p5', 'size_g2')][0]}, base {savet[('base', 'size_g2')][0]}; "
               f"g0: p5 {savet[('p5', 'size_g0')][0]}, base {savet[('base', 'size_g0')][0]}\n")
 print("| query | warm g0 | warm g2 | ratio | first g0 | first g2 | cold g0 | cold g2 | ratio | answers |\n|---|---|---|---|---|---|---|---|---|---|")
-qs = sorted({k[1] for k in m}, key=lambda q: int(q[1:])); worst = 0.0; same = True
-for q in qs:
-    w0 = statistics.median(m[("g0", q, "warm")]); w2 = statistics.median(m[("g2", q, "warm")])
-    f0 = statistics.median(m[("g0", q, "first")]); f2 = statistics.median(m[("g2", q, "first")])
-    c0 = statistics.median(c[("g0", q)]) if c[("g0", q)] else float("nan")
-    c2 = statistics.median(c[("g2", q)]) if c[("g2", q)] else float("nan")
+want = [f"q{i}" for i in range(nq)]
+missing = []
+for q in want:
+    for what, have in (("warm", m.get(("g0", q, "warm")) and m.get(("g2", q, "warm"))),
+                       ("cold", c.get(("g0", q)) and c.get(("g2", q))),
+                       ("wall", wall.get(("g0", q)) and wall.get(("g2", q))),
+                       ("ident", q in ident)):
+        if not have: missing.append(f"{q}/{what}")
+med = lambda xs: statistics.median(xs) if xs else float("nan")
+ratio = lambda a, b: b / a if a > 0 else float("nan")
+same = True; scan = {}
+for q in want:
+    w0 = med(m.get(("g0", q, "warm"))); w2 = med(m.get(("g2", q, "warm")))
+    f0 = med(m.get(("g0", q, "first"))); f2 = med(m.get(("g2", q, "first")))
+    c0 = med(c.get(("g0", q))); c2 = med(c.get(("g2", q)))
     i = ident.get(q)
     if i is None: ok, how = False, "missing"
+    elif "FAIL" in i: ok, how = False, "FAIL (no answer)"
     elif i[0] == i[1]: ok, how = True, "same"
     elif i[3] == i[4]: ok, how = True, "same sorted"
     elif i[0] != i[2] and i[3] != i[5]: ok, how = False, "DIFF (g0 drifts against itself too)"
     else: ok, how = False, "DIFF"
-    same &= ok; worst = max(worst, w2 / w0)
-    print(f"| {q} | {w0:.2f} | {w2:.2f} | {w2 / w0:.3f} | {f0:.2f} | {f2:.2f} | {c0:.1f} | {c2:.1f} | {c2 / c0:.3f} | {how} |")
+    same &= ok
+    print(f"| {q} | {w0:.2f} | {w2:.2f} | {ratio(w0, w2):.3f} | {f0:.2f} | {f2:.2f} | {c0:.1f} | {c2:.1f} | {ratio(c0, c2):.3f} | {how} |")
+    a = med(wall.get(("g0", q))); b = med(wall.get(("g2", q)))
+    if not (w0 >= FLOOR) and wall.get(("g0", q)) and wall.get(("g2", q)):
+        fl = a < FLOOR or b < FLOOR
+        scan[q] = (ratio(max(a, FLOOR), max(b, FLOOR)), "wall" + (" (floored)" if fl else ""))
+    elif w0 >= FLOOR:
+        scan[q] = (ratio(w0, w2), "timeit")
+    else:
+        scan[q] = (float("nan"), "none")
 if wall:
-    print("\n| query | wall g0 ms/call | wall g2 ms/call | ratio |\n|---|---|---|---|")
-    for q in sorted({k[1] for k in wall}, key=lambda q: int(q[1:])):
-        a = statistics.median(wall[("g0", q)]); b = statistics.median(wall[("g2", q)])
-        print(f"| {q} | {a:.2f} | {b:.2f} | {b / a if a > 0 else float('nan'):.3f} |")
+    print("\n| query | wall g0 ms/call | wall g2 ms/call | ratio | rounds |\n|---|---|---|---|---|")
+    for q in want:
+        a = med(wall.get(("g0", q))); b = med(wall.get(("g2", q)))
+        r = ratio(max(a, FLOOR), max(b, FLOOR)) if a < FLOOR or b < FLOOR else ratio(a, b)
+        print(f"| {q} | {a:.3f} | {b:.3f} | {r:.3f}{' (floored)' if a < FLOOR or b < FLOOR else ''} | {len(wall.get(('g2', q), []))} |")
+print("\n| query | scan-only ratio g2 / g0 | source |\n|---|---|---|")
+for q in want: print(f"| {q} | {scan[q][0]:.3f} | {scan[q][1]} |")
 if waits: print(f"\nload waits: {len(waits)} ({', '.join(w[0] + '/' + w[1] for w in waits[:10])})")
-print(f"\n**P5 float store, answers g2 = g0: {'PASS' if same and qs else 'FAIL'}**")
-print(f"**P5 float store, scan-only warm (no regression, <= 1.05 per query): {'PASS' if worst <= 1.05 and qs else 'FAIL'}** (worst {worst:.3f})")
+if bad_rows: print(f"\nunparsed rows: {len(bad_rows)} ({', '.join('/'.join(r) for r in bad_rows[:10])})")
+if missing: print(f"\nmissing (query/stage): {', '.join(missing)}")
+complete = not missing
+worst = max((v[0] for v in scan.values()), default=float("nan"))
+wq = max(scan, key=lambda q: scan[q][0] if scan[q][0] == scan[q][0] else float("inf")) if scan else "-"
+scan_ok = complete and all(v[0] <= 1.05 for v in scan.values())   # a NaN ratio fails
+print(f"\n**P5 float store, all {nq} queries present in warm, cold, wall and ident: {'PASS' if complete else 'FAIL'}**")
+print(f"**P5 float store, answers g2 = g0: {'PASS' if same and complete else 'FAIL'}**")
+print(f"**P5 float store, scan-only warm (no regression, <= 1.05 per query): {'PASS' if scan_ok else 'FAIL'}** (worst {worst:.3f}, {wq}, {scan.get(wq, (0, '-'))[1]})")
