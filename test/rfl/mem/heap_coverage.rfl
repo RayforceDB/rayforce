@@ -368,5 +368,89 @@ FV1 -- [1.5 2.5 3.5]
 ;;     fast path.  Nothing to assert; see line 1106 in the trace.
 ;; ════════════════════════════════════════════════════════════════════════════
 
+;; ════════════════════════════════════════════════════════════════════════════
+;; 13. Releasing deeply nested values (ray_free_walk).
+;;     A dying container freed each child through a nested ray_free, one
+;;     chain of C frames per level, so dropping a value nested some 150k
+;;     deep overflowed an 8 MB stack in a release build (a few thousand
+;;     under ASan).  Each chain below is deeper than that, is dropped by
+;;     rebinding, and must hand every block back: bytes-allocated returns
+;;     to where it was before the build, where a skipped subtree leaks MBs.
+;; ════════════════════════════════════════════════════════════════════════════
+
+(set heapb (fn [] (at (.sys.mem) 'bytes-allocated)))
+(set down (fn [x k] (times k (let x (first x))) x))
+
+;; a list chain, 300k levels
+(set h0 (heapb))
+(set a (enlist 1))
+(times 300000 (set a (enlist a)))
+(> (- (heapb) h0) 10000000) -- true
+(set a 0)
+(< (- (heapb) h0) 65536) -- true
+
+;; a dict chain: dict -> values list -> dict, the keys vector per level
+(set h0 (heapb))
+(set d (dict ['k] (list 1)))
+(times 150000 (set d (dict ['k] (list d))))
+(set d 0)
+(< (- (heapb) h0) 65536) -- true
+
+;; a table chain: table -> column list -> list column -> table
+(set h0 (heapb))
+(set t (table [c] (list (list 1))))
+(times 100000 (set t (table [c] (list (list t)))))
+(set t 0)
+(< (- (heapb) h0) 65536) -- true
+
+;; a closure chain: each lambda captures the previous one, and all of them
+;; share the template's body and bytecode, which must survive the drop
+(set mk (fn [g] (fn [] (g))))
+(set f (fn [] 7))
+(times 3 (set f (mk f)))
+(f) -- 7
+(set h0 (heapb))
+(times 100000 (set f (mk f)))
+(set f (fn [] 7))
+(< (- (heapb) h0) 65536) -- true
+((mk (mk f))) -- 7
+
+;; every level holds the next one twice: a child whose count drops to zero
+;; on its parent's second reference, not its first
+(set h0 (heapb))
+(set g (list 1))
+(times 300000 (set g (list g g)))
+(set g 0)
+(< (- (heapb) h0) 65536) -- true
+
+;; every level mixes leaves (a long string atom, a vector, atoms) with the
+;; next level, held both directly and through a dict
+(set h0 (heapb))
+(set m (list 0))
+(times 100000 (set m (list m "a string longer than seven" [1 2 3] 'sym 1.5 (dict ['x] (list m)))))
+(set m 0)
+(< (- (heapb) h0) 65536) -- true
+
+;; a chain still referenced from the middle: dropping the top frees only
+;; the levels above it, and the rest stays whole until it goes too
+(set h0 (heapb))
+(set a (enlist 1))
+(times 200000 (set a (enlist a)))
+(set mid a)
+(times 200000 (set a (enlist a)))
+(set a 0)
+(down mid 200000) -- [1]
+(set mid 0)
+(< (- (heapb) h0) 65536) -- true
+
+;; one vector held by two lists: dropping either leaves it to the other
+(set s (til 5))
+(set p1 (list s s))
+(set p2 (list s))
+(set s 0)
+(set p1 0)
+(sum (at p2 0)) -- 10
+(set p2 0)
+
 ;; ────────────── teardown ──────────────
 (.sys.exec "rm -rf /tmp/rfl_heap_*")
