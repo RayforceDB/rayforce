@@ -378,6 +378,7 @@ typedef struct {
     int64_t* col_ns;
     bool durable;
     _Atomic(ray_err_t) err;
+    _Atomic(int64_t) done;   /* columns finished: a skipped task is not */
 } stream_finish_ctx_t;
 
 static void stream_finish_task(void* raw, uint32_t wid, int64_t start, int64_t end) {
@@ -389,6 +390,8 @@ static void stream_finish_task(void* raw, uint32_t wid, int64_t start, int64_t e
     if (e != RAY_OK) {
         ray_err_t ok = RAY_OK;
         atomic_compare_exchange_strong_explicit(&a->err, &ok, e, memory_order_relaxed, memory_order_relaxed);
+    } else {
+        atomic_fetch_add_explicit(&a->done, 1, memory_order_relaxed);
     }
 }
 
@@ -398,13 +401,18 @@ ray_err_t ray_col_stream_close_all(ray_col_stream_t* w, int64_t n, bool durable,
     /* finish touches only the writer's own files and never dispatches, so
      * every column finishes side by side: STR pool merges and dictionary
      * regions, which used to run one after another on the caller. */
-    stream_finish_ctx_t ctx = { .w = w, .col_ns = col_ns, .durable = durable, .err = RAY_OK };
+    stream_finish_ctx_t ctx = { .w = w, .col_ns = col_ns, .durable = durable, .err = RAY_OK,
+                                .done = 0 };
     ray_pool_t* pool = ray_pool_get();
     if (ray_pool_par_dispatch_ok(pool, n, 2))
         ray_pool_dispatch_n(pool, stream_finish_task, &ctx, (uint32_t)n);
     else
         for (int64_t c = 0; c < n; c++) stream_finish_task(&ctx, 0, c, c + 1);
     ray_err_t err = ctx.err;
+    /* A cancel skips the finish tasks not yet started and the dispatch
+     * returns normally: an unfinished column has no file to publish. */
+    if (err == RAY_OK && atomic_load_explicit(&ctx.done, memory_order_relaxed) != n)
+        err = RAY_ERR_CANCEL;
     /* The renames stay serial and in column order (microseconds each). */
     for (int64_t c = 0; c < n; c++) {
         ray_err_t cerr = (err == RAY_OK) ? ray_col_stream_publish(&w[c], durable) : RAY_ERR_IO;
