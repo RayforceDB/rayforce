@@ -83,6 +83,56 @@ static test_result_t test_dict_new_err_vals(void) {
     PASS();
 }
 
+/* When both inputs are distinct errors, the returned keys error remains
+ * caller-owned and the otherwise orphaned vals error must be freed here. */
+static test_result_t test_dict_new_both_errors(void) {
+    ray_mem_trace_t trace;
+    TEST_ASSERT_TRUE(ray_mem_trace_begin());
+    ray_t* keys = ray_error("test", "keys");
+    ray_t* vals = ray_error("test", "vals");
+    ray_t* d = ray_dict_new(keys, vals);
+    bool propagated = d == keys && RAY_IS_ERR(d);
+    ray_error_free(d);
+    ray_mem_trace_end(&trace);
+    TEST_ASSERT_TRUE(propagated);
+    TEST_ASSERT_FMT(trace.net_bytes == 0,
+                    "both-error path retained %lld bytes",
+                    (long long)trace.net_bytes);
+    PASS();
+}
+
+/* Aliased errors are one object: preserve it for the caller to free once. */
+static test_result_t test_dict_new_aliased_error(void) {
+    ray_mem_trace_t trace;
+    TEST_ASSERT_TRUE(ray_mem_trace_begin());
+    ray_t* err = ray_error("test", "shared");
+    ray_t* d = ray_dict_new(err, err);
+    bool propagated = d == err && RAY_IS_ERR(d);
+    ray_error_free(d);
+    ray_mem_trace_end(&trace);
+    TEST_ASSERT_TRUE(propagated);
+    TEST_ASSERT_FMT(trace.net_bytes == 0,
+                    "aliased-error path retained %lld bytes",
+                    (long long)trace.net_bytes);
+    PASS();
+}
+
+/* A NULL keys pointer still owns and must free an error passed as vals. */
+static test_result_t test_dict_new_null_keys_error_vals(void) {
+    ray_mem_trace_t trace;
+    TEST_ASSERT_TRUE(ray_mem_trace_begin());
+    ray_t* vals = ray_error("test", "vals");
+    ray_t* d = ray_dict_new(NULL, vals);
+    bool returned_error = RAY_IS_ERR(d);
+    ray_error_free(d);
+    ray_mem_trace_end(&trace);
+    TEST_ASSERT_TRUE(returned_error);
+    TEST_ASSERT_FMT(trace.net_bytes == 0,
+                    "NULL-keys/error-vals path retained %lld bytes",
+                    (long long)trace.net_bytes);
+    PASS();
+}
+
 /* ---- ray_dict_keys / ray_dict_vals / ray_dict_len NULL paths ----------- */
 
 static test_result_t test_dict_keys_null(void) {
@@ -1341,6 +1391,9 @@ const test_entry_t dict_entries[] = {
     { "dict/new_null_vals",                test_dict_new_null_vals,                dict_setup, dict_teardown },
     { "dict/new_err_keys",                 test_dict_new_err_keys,                 dict_setup, dict_teardown },
     { "dict/new_err_vals",                 test_dict_new_err_vals,                 dict_setup, dict_teardown },
+    { "dict/new_both_errors",              test_dict_new_both_errors,              dict_setup, dict_teardown },
+    { "dict/new_aliased_error",             test_dict_new_aliased_error,             dict_setup, dict_teardown },
+    { "dict/new_null_keys_error_vals",      test_dict_new_null_keys_error_vals,      dict_setup, dict_teardown },
     { "dict/keys_null",                    test_dict_keys_null,                    dict_setup, dict_teardown },
     { "dict/keys_nondict",                 test_dict_keys_nondict,                 dict_setup, dict_teardown },
     { "dict/keys_err",                     test_dict_keys_err,                     dict_setup, dict_teardown },
