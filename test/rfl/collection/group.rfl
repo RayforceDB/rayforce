@@ -231,3 +231,28 @@
 (at (select {x: (sum x) from: (table [x c] (list [1 2] (list (table [s] (list VS1)) (table [s] (list VS2))))) by: c}) 'x) -- [3]
 (map count (value (group (list (dict VS1 [1 2]) (dict VS2 [1 2]))))) -- [2]
 ;; (map count (value (group (list (table [v] (list [0.0])) (table [v] (list [-0.0])))))) -- [2]   ;; xfail BUG: 0.0 and -0.0 F64 cells compare byte for byte and split (by: too)
+;; the same cell equality backs find, in, except, union and the lookup in a
+;; dict keyed by a LIST (here group's keys); on every pair of tables of one
+;; length it answered equal
+(set TQ1 (table [q] (list [1 2])))
+(set TQ2 (table [q] (list [1 3])))
+(set TR3 (table [r] (list [1 2])))
+(set TQL (list TQ1 TQ2 TR3))
+(find TQL (table [q] (list [1 3]))) -- 1
+(in (list (table [q] (list [1 3])) (table [q] (list [9 9]))) TQL) -- [true false]
+(count (except TQL (list (table [q] (list [1 3]))))) -- 2
+(count (union TQL (list (table [q] (list [1 2])) (table [q] (list [7]))))) -- 4
+(at (group (list TQ1 TQ2 TR3 TQ2)) (table [q] (list [1 3]))) -- [1 3]
+(find (list {p: 1} {p: 2}) {p: 2}) -- 1
+(at (group (list {p: 1} {p: 2} {p: 2})) {p: 2}) -- [1 2]
+;; a few thousand distinct table cells, each twice: the TABLE hash arms only
+;; spread them over the buckets; this pins the grouping they serve
+(set MT (map (fn [i] (table [q] (list (+ i [0 1])))) (til 3000)))
+(set MT2 (concat MT MT))
+(count (group MT2)) -- 3000
+(distinct (map count (value (group MT2)))) -- [2]
+(set MR (select {n: (count x) from: (table [x c] (list (til 6000) MT2)) by: c}))
+(count MR) -- 3000
+(distinct (at MR 'n)) -- [2]
+(at (at MR 'c) 2999) -- (table [q] (list [2999 3000]))
+(count (distinct MT2)) -- 3000

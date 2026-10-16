@@ -2782,7 +2782,9 @@ uint64_t ray_atom_hash(ray_t* a) {
             return h;
         }
         case RAY_TABLE: {
-            /* atom_eq: same names in order, equal columns. */
+            /* atom_eq: same names in order, equal columns.  Hashing them
+             * only spreads the buckets: the default arm's type and length
+             * would put every table of one length in one bucket. */
             int64_t nc = ray_table_ncols(a);
             uint64_t h = ray_hash_i64(nc);
             for (int64_t c = 0; c < nc; c++) {
@@ -2796,9 +2798,10 @@ uint64_t ray_atom_hash(ray_t* a) {
                                     ray_atom_hash(ray_dict_vals(a)));
         default:
             /* Vec or unknown atom kind: fold type tag and length.  Two
-             * structurally-equal lists never reach here (RAY_LIST branch
-             * above) so we can't accidentally produce different hashes
-             * for atom_eq-equal pairs. */
+             * structurally-equal lists, tables or dicts never reach here
+             * (RAY_LIST / RAY_TABLE / RAY_DICT arms above) so we can't
+             * accidentally produce different hashes for atom_eq-equal
+             * pairs. */
             return ray_hash_i64(((int64_t)a->type << 32) ^ (int64_t)a->len);
     }
 }
