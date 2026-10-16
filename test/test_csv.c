@@ -2330,9 +2330,49 @@ static test_result_t test_csv_splayed_cancel_hash(void) {
     PASS();
 }
 
+/* A cancel during the last chunk's appends stops the load before the
+ * symfile flush: the root .sym a staged load shares with the current
+ * generation does not take the cancelled load's vocabulary. */
+static int64_t csv_file_size(const char* path) {
+    struct stat st;
+    return stat(path, &st) == 0 ? (int64_t)st.st_size : -1;
+}
+static test_result_t test_csv_splayed_cancel_symfile(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    char dir[128], sym[160];
+    snprintf(dir,sizeof(dir),"/tmp/rayforce-csv-scancel-%d",(int)getpid());
+    snprintf(sym,sizeof(sym),"%s/.sym",dir);
+    csv_test_rm_rf(dir);
+    int8_t types[] = {RAY_SYM};
+    FILE* f = fopen(TMP_CSV, "w"); TEST_ASSERT_NOT_NULL(f);
+    fputs("s\nalpha\nbeta\nalpha\n", f); fclose(f);
+    for (int run = 0; run < 2; run++)
+        TEST_ASSERT_EQ_I(ray_csv_save_splayed_named_opts(TMP_CSV,',',true,types,1,NULL,0,dir,100000),RAY_OK);
+    int64_t before = csv_file_size(sym);
+    TEST_ASSERT_TRUE(before > 0);
+    f = fopen(TMP_CSV, "w"); TEST_ASSERT_NOT_NULL(f);
+    fputs("s\n", f);
+    for (int i = 0; i < 5000; i++) fprintf(f, "word%05d\n", i);
+    fclose(f);
+    setenv("RAY_CSV_SPLAYED_INJECT", "append", 1);
+    ray_err_t e = ray_csv_save_splayed_named_opts(TMP_CSV,',',true,types,1,NULL,0,dir,100000);
+    unsetenv("RAY_CSV_SPLAYED_INJECT");
+    ray_clear_interrupt();
+    TEST_ASSERT_EQ_I(e, RAY_ERR_CANCEL);
+    TEST_ASSERT_EQ_I(csv_file_size(sym), before);
+    ray_t* t = ray_read_splayed(dir, sym);
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    TEST_ASSERT_EQ_I(ray_table_nrows(t), 3);
+    ray_release(t);
+    csv_test_rm_rf(dir);
+    unlink(TMP_CSV); ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t csv_entries[] = {
     { "csv/splayed_cancel", test_csv_splayed_cancel, NULL, NULL },
     { "csv/splayed_cancel_hash", test_csv_splayed_cancel_hash, NULL, NULL },
+    { "csv/splayed_cancel_symfile", test_csv_splayed_cancel_symfile, NULL, NULL },
     { "csv/splayed_sentinel_literal", test_csv_splayed_sentinel_literal, NULL, NULL },
     { "csv/parted_staging", test_csv_parted_staging, NULL, NULL },
     { "csv/parted_zones", test_csv_parted_zones, NULL, NULL },

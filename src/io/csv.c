@@ -3946,6 +3946,11 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
         if (cnt == 0) break;
         chunk_offset = next_offset;
     }
+    /* A cancel that lands during the last chunk's appends, once every one
+     * of them has started (or with the appends run in line), stops the
+     * load before the symfile flush and the column finish. */
+    if (err == RAY_OK && ray_interrupted()) err = RAY_ERR_CANCEL;
+
     /* Flush the symfile BEFORE committing column files (writer_close
      * renames tmp → final): columns must never reference positions the
      * symfile doesn't persist (sym-first crash ordering). */
@@ -4013,10 +4018,9 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
         fprintf(stderr, "csv.splayed: hash_phase=%.1fms\n", TR_MS(tr_hash_end - tr_rel_end));
     }
 
-    /* A cancel that landed once every append had started (or with the
-     * appends run in line), or in the finish or hash phases, stops the
-     * load here: without .d nothing is committed, and the caller's write
-     * finish removes what this load created. */
+    /* A cancel that landed in the finish or hash phases stops the load
+     * here: without .d nothing is committed, and the caller's write finish
+     * removes what this load created. */
     if (err == RAY_OK && ray_interrupted()) err = RAY_ERR_CANCEL;
 
     /* .d LAST — the commit marker.  All column files are renamed into

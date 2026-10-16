@@ -743,7 +743,8 @@ ray_err_t ray_splay_write_finish(ray_splay_write_t* write, ray_err_t result,
     /* The last moment a cancel can stop a staged write: its generation is
      * not published yet, so the call reports the cancel and the previous
      * one stays current.  A first write commits in place with its .d, so
-     * the writers check before writing it. */
+     * the writers check before writing it; this check is the deliberate
+     * backstop for the .d write itself and for writers yet to come. */
     if (result == RAY_OK && write->staged && ray_interrupted())
         result = RAY_ERR_CANCEL;
     if (result == RAY_OK && write->staged) {
