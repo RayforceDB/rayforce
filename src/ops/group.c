@@ -7956,6 +7956,9 @@ typedef struct {
      * entry off the mapping instead of pinning (and checking null) per row. */
     ray_sym_domain_raw_t* agg_raw;
     uint8_t*       agg_raw_ok;
+    /* Per-agg STR descriptors of a strlen fusion's column, resolved once
+     * (slice offset applied); NULL for other aggs. */
+    const ray_str_t** agg_str;
 } da_ctx_t;
 
 typedef struct {
@@ -8502,6 +8505,7 @@ struct scalar_ctx_s {
     uint8_t*       agg_strlen;
     ray_t**        sym_strings;  /* borrowed sym snapshot for strlen-on-SYM aggs */
     uint32_t       sym_count;
+    const ray_str_t** agg_str;   /* strlen-on-STR: descriptors resolved once */
     uint16_t*      agg_ops;
     agg_linear_t*  agg_linear;
     agg_prod_t*    agg_prod;     /* fused SUM/AVG(a*b) slots (may be NULL) */
@@ -8705,8 +8709,11 @@ static inline void scalar_accum_row(scalar_ctx_t* c, da_accum_t* acc, int64_t r)
         } else {
             if (!c->agg_ptrs[a]) continue;
             if (c->agg_strlen && c->agg_strlen[a]) {
-                iv = group_strlen_at_cached(c->agg_cols[a], r,
-                                            c->sym_strings, c->sym_count);
+                /* STR: the descriptor's length (a null is the empty
+                 * string, length 0); SYM through the borrowed snapshot. */
+                iv = c->agg_str[a] ? (int64_t)c->agg_str[a][r].len
+                                   : group_strlen_at_cached(c->agg_cols[a], r,
+                                                            c->sym_strings, c->sym_count);
                 fv = (double)iv;
             } else {
                 uint8_t attrs = c->agg_cols[a] ? c->agg_cols[a]->attrs : 0;
@@ -8843,6 +8850,7 @@ static void scalar_chunk_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
  * length is the u32 prefix in the pinned mapping; anything else resolves
  * as group_strlen_at_cached does. */
 static inline int64_t da_strlen_at(const da_ctx_t* c, uint32_t a, int64_t r) {
+    if (c->agg_str && c->agg_str[a]) return (int64_t)c->agg_str[a][r].len;
     const ray_t* col = c->agg_cols[a];
     if (col->type == RAY_STR) {
         const ray_str_t* elems; const char* pool; (void)pool;
@@ -12599,7 +12607,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         /* Keyless path serves unbounded n_aggs — VLAs here scale with the query,
          * so carve exactly (8-byte arrays first). */
         ray_t* sc_vla_hdr = NULL;
-        size_t sc_vla_bytes = (size_t)vla_aggs * (sizeof(void*) + sizeof(int64_t)
+        size_t sc_vla_bytes = (size_t)vla_aggs * (2 * sizeof(void*) + sizeof(int64_t)
                                                   + sizeof(int8_t) + sizeof(bool));
         uint8_t* sc_blk = (uint8_t*)scratch_alloc(&sc_vla_hdr, sc_vla_bytes);
         if (!sc_blk) {
@@ -12611,7 +12619,8 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             return ray_error("oom", NULL);
         }
         void*    *agg_ptrs             = (void**)sc_blk;
-        int64_t  *sc_int_null_sentinel = (int64_t*)(agg_ptrs + vla_aggs);
+        const ray_str_t** sc_agg_str   = (const ray_str_t**)(agg_ptrs + vla_aggs);
+        int64_t  *sc_int_null_sentinel = (int64_t*)(sc_agg_str + vla_aggs);
         int8_t   *agg_types            = (int8_t*)(sc_int_null_sentinel + vla_aggs);
         /* Per-element flag, not a bitmask: this path's n_aggs is VLA-sized
          * with no fixed cap, so a fixed-width bitmask would silently alias
@@ -12855,15 +12864,20 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         void* sc_raw = scratch_calloc(&sc_hdr, (size_t)sc_n * sc_bytes + sc_line);
         if (!sc_raw) { scratch_free(sc_vla_hdr); goto da_path; }
 
-        /* strlen-on-SYM: borrow the sym snapshot once (as the DA path
-         * does) — the uncached resolve takes the domain per row, and the
-         * workers contend on it. */
+        /* strlen-on-STR: resolve the descriptors once.  strlen-on-SYM:
+         * borrow the sym snapshot once (as the DA path does) — the
+         * uncached resolve takes the domain per row, and the workers
+         * contend on it. */
         ray_t** sc_sym_strings = NULL;
         uint32_t sc_sym_count = 0;
         for (uint32_t a = 0; a < n_aggs; a++) {
-            if (agg_strlen[a] && agg_vecs[a] && agg_vecs[a]->type == RAY_SYM) {
+            sc_agg_str[a] = NULL;
+            if (!agg_strlen[a] || !agg_vecs[a]) continue;
+            if (agg_vecs[a]->type == RAY_STR) {
+                const char* pool; (void)pool;
+                str_resolve(agg_vecs[a], &sc_agg_str[a], &pool);
+            } else if (agg_vecs[a]->type == RAY_SYM && !sc_sym_strings) {
                 ray_sym_strings_borrow(&sc_sym_strings, &sc_sym_count);
-                break;
             }
         }
         scalar_ctx_t sc_ctx = {
@@ -12873,6 +12887,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             .agg_strlen = agg_strlen,
             .sym_strings = sc_sym_strings,
             .sym_count  = sc_sym_count,
+            .agg_str    = sc_agg_str,
             .agg_ops    = ext->agg_ops,
             .agg_linear = agg_linear,
             .agg_prod   = agg_prod,
@@ -13662,14 +13677,21 @@ da_path:;
             ray_t* agg_raw_hdr = NULL;
             if (n_aggs > 0) {
                 char* rm = (char*)scratch_calloc(&agg_raw_hdr,
-                    (size_t)n_aggs * (sizeof(ray_sym_domain_raw_t) + 1));
+                    (size_t)n_aggs * (sizeof(const ray_str_t*) + sizeof(ray_sym_domain_raw_t) + 1));
                 if (rm) {
+                    da_ctx.agg_str = (const ray_str_t**)rm;
+                    rm += (size_t)n_aggs * sizeof(const ray_str_t*);
                     da_ctx.agg_raw = (ray_sym_domain_raw_t*)rm;
                     da_ctx.agg_raw_ok = (uint8_t*)(rm + (size_t)n_aggs * sizeof(ray_sym_domain_raw_t));
-                    for (uint32_t a = 0; a < n_aggs; a++)
+                    for (uint32_t a = 0; a < n_aggs; a++) {
                         if (agg_vecs[a] && agg_vecs[a]->type == RAY_SYM)
                             da_ctx.agg_raw_ok[a] = ray_sym_domain_raw_pin(
                                 ray_sym_vec_domain(agg_vecs[a]), &da_ctx.agg_raw[a]) ? 1 : 0;
+                        if (agg_strlen[a] && agg_vecs[a] && agg_vecs[a]->type == RAY_STR) {
+                            const char* pool; (void)pool;
+                            str_resolve(agg_vecs[a], &da_ctx.agg_str[a], &pool);
+                        }
+                    }
                 }
             }
 
