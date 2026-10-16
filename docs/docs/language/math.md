@@ -518,10 +518,14 @@ Take the first `n` elements from a vector, or repeat/cycle `x` to length `n`.
 
 ### `(reverse x)`
 
-Reverse a vector.
+Reverse a vector, a table's rows, or a dictionary's entries. A table keeps
+its column names and types; a dictionary's keys and values move together.
 
 ```lisp
 (reverse [1 2 3])  ; [3 2 1]
+(set t (table [a b] (list [1 2 3] ["x" "y" "z"])))
+(at (reverse t) 'a)  ; [3 2 1]
+(reverse (dict ['a 'b 'c] [10 20 30]))  ; {c:30 b:20 a:10}
 ```
 
 ### `(where x)`
