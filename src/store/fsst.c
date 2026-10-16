@@ -138,16 +138,17 @@ static void map_add(fsst_map_t* m, uint8_t len, const uint8_t* b, uint64_t g) {
     }
 }
 
-void ray_fsst_train(const uint8_t* const* strs, const uint32_t* lens, int64_t n,
-                    ray_fsst_table_t* t) {
+int ray_fsst_train(const uint8_t* const* strs, const uint32_t* lens, int64_t n,
+                   ray_fsst_table_t* t) {
     memset(t, 0, sizeof *t);
     uint64_t total = 0;
     for (int64_t i = 0; i < n; i++) total += lens[i];
+    if (total == 0) return 0;                                      /* no string bytes */
     int64_t stride = total > FSST_SAMPLE_BYTES ? (int64_t)((total + FSST_SAMPLE_BYTES - 1) / FSST_SAMPLE_BYTES) : 1;
     fsst_map_t m = { NULL, 0, 1u << FSST_MAP_BITS };
     m.e = ray_calloc_raw(sizeof(fsst_cand_t) * m.cap);
     fsst_cand_t* all = ray_calloc_raw(sizeof(fsst_cand_t) * (m.cap / 2 + 1));
-    if (!m.e || !all) { ray_free_raw(m.e); ray_free_raw(all); return; }  /* empty table: everything escapes */
+    if (!m.e || !all) { ray_free_raw(m.e); ray_free_raw(all); return -1; }  /* t stays empty */
     for (int round = 0; round < 5; round++) {
         memset(m.e, 0, sizeof(fsst_cand_t) * m.cap); m.n = 0;
         ray_fsst_index_t ix; ray_fsst_index_build(t, &ix);
@@ -179,4 +180,5 @@ void ray_fsst_train(const uint8_t* const* strs, const uint32_t* lens, int64_t n,
     }
     ray_free_raw(all);
     ray_free_raw(m.e);
+    return t->n > 0 ? 1 : 0;
 }

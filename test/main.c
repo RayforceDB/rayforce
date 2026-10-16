@@ -172,6 +172,7 @@ extern const test_entry_t enc_entries[];
 extern const test_entry_t encfmt_entries[];
 extern const test_entry_t encidx_entries[];
 extern const test_entry_t encfloat_entries[];
+extern const test_entry_t encstr_entries[];
 extern const test_entry_t enconce_entries[];
 extern const test_entry_t enccol_entries[];
 extern const test_entry_t enccorrupt_entries[];
@@ -226,7 +227,7 @@ static const test_entry_t* const compiled_groups[] = {
     public_api_entries,
     repl_entries,     rowsel_entries,   runtime_entries,  sel_entries,
     sort_entries,     splay_entries,    srccheck_entries, store_entries,    enc_entries,
-    encfmt_entries,   encidx_entries,   encfloat_entries, enconce_entries,   enccol_entries, enccorrupt_entries,
+    encfmt_entries,   encidx_entries,   encfloat_entries, encstr_entries, enconce_entries,   enccol_entries, enccorrupt_entries,
     large_entries,
     colrange_entries,
     scanrange_entries,

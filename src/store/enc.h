@@ -35,6 +35,8 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "store/fsst.h"
+
 #define RAY_ENC_VEC        1024
 #define RAY_ENC_CHUNK      65536
 #define RAY_ENC_DEPTH_MAX  3
@@ -125,7 +127,8 @@ typedef enum {
     RAY_ENC_SLOT_RLE_ENDS,     /* kind U16 */
     RAY_ENC_SLOT_CODES,        /* kind U32 (DICT / STR_DICT codes) */
     RAY_ENC_SLOT_ALP_INTS,     /* kind I64 (spec erratum E-P5-1: the slot table says U64) */
-    RAY_ENC_SLOT_ALP_RD_LEFT   /* kind U8 */
+    RAY_ENC_SLOT_ALP_RD_LEFT,  /* kind U8 */
+    RAY_ENC_SLOT_FSST_LENGTHS  /* kind U32: RAW, FOR_BP */
 } ray_enc_slot_t;
 
 typedef struct { const uint64_t* v; uint32_t n; } ray_enc_dict_t;
@@ -206,5 +209,33 @@ bool    ray_enc_float_write(uint8_t enc, const uint64_t* v, int n, int T, const 
 /* Validate and decode any float body; bytes used or -1. */
 int64_t ray_enc_float_read(const uint8_t* p, size_t avail, uint8_t enc, int n, int T,
                            const ray_enc_dict_t* dict, uint64_t* out);
+
+/* ---- STR bodies (src/store/enc_str.c), n in 0..1024 ----
+ * STR_DICT: child `codes` (U32), each below the STR_DICT entry count.
+ * FSST: child `lengths` (U32, RAW or FOR_BP), u64 total_bytes (the sum of
+ * the lengths), the compressed bytes padded to 8 with zeros.  Readers name
+ * their reject rule through ray_enc_read_fail. */
+int64_t ray_enc_strdict_size(const uint64_t* codes, int n);
+bool    ray_enc_strdict_write(const uint64_t* codes, int n, ray_enc_buf_t* out);
+/* codes (each below dict_n); the body must fill avail.  Bytes used, or -1. */
+int64_t ray_enc_strdict_read(const uint8_t* p, size_t avail, int n, uint32_t dict_n, uint64_t* codes);
+/* Compress n strings: buf receives the concatenated codes (capacity at
+ * least 2 x the strings' bytes), clen[i] each string's compressed length.
+ * Returns the total compressed bytes. */
+uint64_t ray_enc_fsst_encode(const ray_fsst_table_t* t, const ray_fsst_index_t* ix,
+                             const char* const* s, const uint32_t* len, int n,
+                             uint8_t* buf, uint64_t* clen);
+int64_t ray_enc_fsst_size(const uint64_t* clen, int n, uint64_t total);
+/* Appends the body; false on bad arguments or OOM (out->oom), with no
+ * partial body left in out. */
+bool    ray_enc_fsst_write(const uint64_t* clen, int n, const uint8_t* bytes, uint64_t total,
+                           ray_enc_buf_t* out);
+/* Validate an FSST body against table t (spec "FSST validation", vector
+ * scope): every slice self-contained, codes below n_symbols or 255, each
+ * expansion at most UINT32_MAX.  Fills clen[] and xlen[] (expanded
+ * lengths) and *bytes (the compressed area).  The body must fill avail.
+ * Body bytes, or -1. */
+int64_t ray_enc_fsst_check(const uint8_t* p, size_t avail, int n, const ray_fsst_table_t* t,
+                           uint64_t* clen, uint64_t* xlen, const uint8_t** bytes);
 
 #endif /* RAY_ENC_H */

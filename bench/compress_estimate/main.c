@@ -308,7 +308,7 @@ static void estimate_sym(const char* sym) {
             size_t len; const char* p = ray_sym_domain_raw_str(&r, b0 + i, &len);
             s[i] = (const uint8_t*)p; l[i] = (uint32_t)len; snapshot += 4 + (int64_t)len;
         }
-        ray_fsst_train(s, l, n, t);
+        if (ray_fsst_train(s, l, n, t) < 0) { fprintf(stderr, "fsst training out of memory\n"); exit(2); }
         ray_fsst_index_build(t, ix);                    /* once per block */
         int64_t blk = ray_fsst_table_bytes(t);
         /* encode into a block arena; lengths packed per 1024 as U32 vectors */

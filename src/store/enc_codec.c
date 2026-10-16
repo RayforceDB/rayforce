@@ -106,6 +106,7 @@ static ray_enc_kind_t slot_child_kind(ray_enc_slot_t child, ray_enc_kind_t paren
     case RAY_ENC_SLOT_CODES:    return K_U32;
     case RAY_ENC_SLOT_ALP_INTS: return K_I64;      /* signed: spec erratum E-P5-1 */
     case RAY_ENC_SLOT_ALP_RD_LEFT: return K_U8;
+    case RAY_ENC_SLOT_FSST_LENGTHS: return K_U32;
     default:                    return parent;   /* RLE values: enclosing kind */
     }
 }
@@ -132,6 +133,8 @@ static bool enc_legal(uint8_t enc, ray_enc_slot_t slot, int depth, ray_enc_kind_
         return enc == RAY_ENC_RAW || enc == RAY_ENC_FOR_BP || enc == RAY_ENC_DELTA_BP || enc == RAY_ENC_RLE;
     case RAY_ENC_SLOT_ALP_RD_LEFT:
         return enc == RAY_ENC_RAW || enc == RAY_ENC_FOR_BP || enc == RAY_ENC_RLE;
+    case RAY_ENC_SLOT_FSST_LENGTHS:
+        return enc == RAY_ENC_RAW || enc == RAY_ENC_FOR_BP;
     }
     return false;
 }
