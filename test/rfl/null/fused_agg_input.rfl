@@ -86,3 +86,37 @@
 (AffChk (.db.parted.get "/tmp/rfl_aff814/rf" 't)) -- true
 (AffZero (.db.parted.get "/tmp/rfl_aff814/rf" 't)) -- [0.0]
 (.sys.exec "rm -rf /tmp/rfl_aff814")
+
+;; Grouped take over an affine SUM of a nullable col.  The radix top-N heap
+;; ranks by the raw accumulator slot (sum of col alone); the emitted value is
+;; raw + c * non-null count, so with nulls the two orders disagree even when
+;; every group has the same row count.  2000 groups of 4 rows: even groups
+;; are w = 0 (raw 0, emitted 4c), odd groups are one 1 and three nulls (raw 1,
+;; emitted 1 + c).  Ranking by the raw slot returns the odd groups for desc:.
+;; For (- y 7) the even groups are y = 5 (raw 20, emitted -8) so that the raw
+;; order again disagrees with the emitted one (odd groups emit -6).
+(.sys.exec "rm -rf /tmp/rfl_aff814t")
+(set Kt (% (til 8000) 2000))
+(set Wti (as 'I64 (map (fn [i] (if (== 0 (% (at Kt i) 2)) 0 (if (< i 2000) 1 0Nl))) (til 8000))))
+(set Yti (as 'I64 (map (fn [i] (if (== 0 (% (at Kt i) 2)) 5 (if (< i 2000) 1 0Nl))) (til 8000))))
+(set Wt (table [s w x y yf v] (list (at (as 'SYMBOL (map (fn [j] (format "w%" j)) (til 2000))) Kt) Wti (as 'F64 Wti) Yti (as 'F64 Yti) (til 8000))))
+(at (select {m: (sum (+ w 100)) from: Wt by: {s: s z: (% v 1) t: s} desc: m take: 5}) 'm) -- [400 400 400 400 400]
+(at (select {m: (sum (+ w 100)) from: Wt by: {s: s z: (% v 1) t: s} asc: m take: 5}) 'm) -- [101 101 101 101 101]
+(at (select {m: (sum (- y 7)) from: Wt by: {s: s z: (% v 1) t: s} desc: m take: 5}) 'm) -- [-6 -6 -6 -6 -6]
+(at (select {m: (sum (- y 7)) from: Wt by: {s: s z: (% v 1) t: s} asc: m take: 5}) 'm) -- [-8 -8 -8 -8 -8]
+(at (select {m: (sum (+ x 2.5)) from: Wt by: {s: s z: (% v 1) t: s} desc: m take: 5}) 'm) -- [10.0 10.0 10.0 10.0 10.0]
+(at (select {m: (sum (+ x 2.5)) from: Wt by: {s: s z: (% v 1) t: s} asc: m take: 5}) 'm) -- [3.5 3.5 3.5 3.5 3.5]
+(at (select {m: (sum (- yf 7)) from: Wt by: {s: s z: (% v 1) t: s} desc: m take: 5}) 'm) -- [-6.0 -6.0 -6.0 -6.0 -6.0]
+(at (select {m: (sum (- yf 7)) from: Wt by: {s: s z: (% v 1) t: s} asc: m take: 5}) 'm) -- [-8.0 -8.0 -8.0 -8.0 -8.0]
+(.db.splayed.set "/tmp/rfl_aff814t/2024.01.01/t/" (take Wt 4000) "/tmp/rfl_aff814t/.sym")
+(.db.splayed.set "/tmp/rfl_aff814t/2024.01.02/t/" (drop Wt 4000) "/tmp/rfl_aff814t/.sym")
+(set Pt (.db.parted.get "/tmp/rfl_aff814t" 't))
+(at (select {m: (sum (+ w 100)) from: Pt by: {s: s z: (% v 1) t: s} desc: m take: 5}) 'm) -- [400 400 400 400 400]
+(at (select {m: (sum (+ w 100)) from: Pt by: {s: s z: (% v 1) t: s} asc: m take: 5}) 'm) -- [101 101 101 101 101]
+(at (select {m: (sum (- y 7)) from: Pt by: {s: s z: (% v 1) t: s} desc: m take: 5}) 'm) -- [-6 -6 -6 -6 -6]
+(at (select {m: (sum (- y 7)) from: Pt by: {s: s z: (% v 1) t: s} asc: m take: 5}) 'm) -- [-8 -8 -8 -8 -8]
+(at (select {m: (sum (+ x 2.5)) from: Pt by: {s: s z: (% v 1) t: s} desc: m take: 5}) 'm) -- [10.0 10.0 10.0 10.0 10.0]
+(at (select {m: (sum (+ x 2.5)) from: Pt by: {s: s z: (% v 1) t: s} asc: m take: 5}) 'm) -- [3.5 3.5 3.5 3.5 3.5]
+(at (select {m: (sum (- yf 7)) from: Pt by: {s: s z: (% v 1) t: s} desc: m take: 5}) 'm) -- [-6.0 -6.0 -6.0 -6.0 -6.0]
+(at (select {m: (sum (- yf 7)) from: Pt by: {s: s z: (% v 1) t: s} asc: m take: 5}) 'm) -- [-8.0 -8.0 -8.0 -8.0 -8.0]
+(.sys.exec "rm -rf /tmp/rfl_aff814t")
