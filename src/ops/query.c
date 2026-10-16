@@ -12087,6 +12087,20 @@ static bool clause_names_sym(ray_t* v, int64_t s) {
     return false;
 }
 
+/* Does the value of by-dict pair `i` (`d_elems` interleaves names and
+ * values) name an alias an earlier pair adds as a new column of `tbl`?
+ * The eager by-dict loop binds that column as a flat vector, so the value
+ * must be evaluated over flat columns too: over a parted table it would
+ * pair every partition with the alias column read again from row 0. */
+static bool bydict_names_earlier_alias(ray_t** d_elems, int64_t i, ray_t* tbl) {
+    for (int64_t j = 0; j < i; j++) {
+        ray_t* k = d_elems[j * 2];
+        if (!k || k->type != -RAY_SYM || ray_table_get_col(tbl, k->i64)) continue;
+        if (clause_names_sym(d_elems[i * 2 + 1], k->i64)) return true;
+    }
+    return false;
+}
+
 /* May the narrow copy of a parted table add a row-number column named
  * `row_sym`?  Not when the table has a column of that name or the select
  * names it anywhere (as a key, an alias, or a value the column would
@@ -13330,6 +13344,8 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
                 for (int64_t j = 0; j < i; j++)
                     if (d_elems[j * 2]->i64 == k->i64) { defer_ok = false; break; }
                 if (!defer_ok) break;
+                /* a value reading an earlier alias is evaluated eagerly */
+                if (bydict_names_earlier_alias(d_elems, i, tbl)) { defer_ok = false; break; }
                 bool trivial_self = (v && v->type == -RAY_SYM && v->i64 == k->i64);
                 if (ray_table_get_col(tbl, k->i64) && !trivial_self) {
                     defer_ok = false; break;   /* alias shadows an input column */
@@ -13579,14 +13595,15 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
         }
 
         /* A by-dict value the planner cannot lower (a helper, a builtin
-         * with no kernel) is evaluated below over whole columns: over a
-         * parted table, flatten the columns the select reads first (the
-         * whole table with no output, or when a clause runs code whose
-         * reads are unseen). */
+         * with no kernel), or one reading an earlier alias, is evaluated
+         * below over whole columns: over a parted table, flatten the
+         * columns the select reads first (the whole table with no output,
+         * or when a clause runs code whose reads are unseen). */
         if (table_has_parted_columns(tbl)) {
             bool unlowered = false;
             for (int64_t i = 0; i < nk && !unlowered; i++) {
                 ray_t* v = d_elems[i * 2 + 1];
+                if (bydict_names_earlier_alias(d_elems, i, tbl)) { unlowered = true; break; }
                 if (!v || v->type != RAY_LIST) continue;
                 ray_graph_t* pg = ray_graph_new(tbl);
                 unlowered = !pg || compile_expr_dag(pg, v) == NULL;
