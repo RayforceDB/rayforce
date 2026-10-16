@@ -8111,12 +8111,24 @@ static ray_t* count_distinct_per_group_buf(ray_t* inner_expr, ray_t* tbl,
         g_active_query_table = _aqt;
         ray_env_pop_scope();
         if (!src || RAY_IS_ERR(src)) return src ? src : ray_error("domain", "select by: failed to evaluate count-distinct source");
+        if (ray_is_lazy(src)) {
+            src = ray_lazy_materialize(src);
+            if (!src || RAY_IS_ERR(src)) return src ? src : ray_error("oom", NULL);
+        }
     }
     if (src && !RAY_IS_ERR(src) && (RAY_IS_PARTED(src->type) || src->type == RAY_MAPCOMMON)) {
         ray_t* flat = query_materialize_parted_col(src, tbl);
         ray_release(src);
         src = flat;
         if (!src || RAY_IS_ERR(src)) return src ? src : ray_error("oom", NULL);
+    }
+    /* The groups list rows of `tbl`: an operand of another length (a
+     * parameter, `(take y 2)`) has no cell for some of them. */
+    if (!ray_is_atom(src) && ray_len(src) != ray_table_nrows(tbl)) {
+        int64_t sl = ray_len(src);
+        ray_release(src);
+        return ray_error("length", "count distinct: operand has %lld values for %lld rows",
+                         (long long)sl, (long long)ray_table_nrows(tbl));
     }
 
     if (src->type == RAY_STR || src->type == RAY_GUID || src->type == RAY_LIST) {
@@ -11644,12 +11656,47 @@ static bool sym_names_col(ray_t* tbl, int64_t s) {
     return ray_table_get_col(tbl, head) != NULL;
 }
 
-/* Does clause value `v` read a lexical local holding one value per row of
- * a table of `nrows` rows (a vector or list that long; a table or dict
- * too)?  It stands for a column of the whole table, so the clause cannot
- * run on one partition's segment.  A local of another length (a membership
- * list) reads the same on every segment.  A quoted form reads nothing. */
-static bool clause_reads_row_local(ray_t* v, int64_t nrows) {
+/* Is `n` a row count of the parted table `tbl`: its own, or one of its
+ * partitions'? */
+static bool parted_row_count_like(ray_t* tbl, int64_t n) {
+    if (n == ray_table_nrows(tbl)) return true;
+    int64_t nc = ray_table_ncols(tbl);
+    for (int64_t c = 0; c < nc; c++) {
+        ray_t* col = ray_table_get_col_idx(tbl, c);
+        if (!col || !RAY_IS_PARTED(col->type)) continue;
+        ray_t** segs = (ray_t**)ray_data(col);
+        for (int64_t i = 0; i < col->len; i++)
+            if (segs[i] && segs[i]->len == n) return true;
+        return false;
+    }
+    return false;
+}
+
+/* Does value `b` hold one value per row of `tbl` or of one of its
+ * partitions: a vector or list that long, a table of that many rows, or a
+ * dict holding one (a config dict of scalars does not)? */
+static bool value_row_like(ray_t* b, ray_t* tbl, int depth) {
+    if (!b || RAY_IS_ERR(b) || ray_is_atom(b)) return false;
+    if (b->type == RAY_TABLE) return parted_row_count_like(tbl, ray_table_nrows(b));
+    if (b->type == RAY_DICT) {
+        ray_t* dv = ray_dict_vals(b);
+        if (depth > 2 || !dv) return false;
+        if (dv->type != RAY_LIST) return value_row_like(dv, tbl, depth + 1);
+        for (int64_t i = 0; i < dv->len; i++)
+            if (value_row_like(((ray_t**)ray_data(dv))[i], tbl, depth + 1)) return true;
+        return false;
+    }
+    return parted_row_count_like(tbl, ray_len(b));
+}
+
+/* Does clause value `v` read a name that is no column of the parted table
+ * `tbl` (a lexical local, or a global) holding one value per row of the
+ * table or of one of its partitions (value_row_like)?  Run on a partition's
+ * segment, the clause would read the whole table's value against that
+ * segment's rows, or a value as long as one partition against every one.
+ * Scalars, config dicts and membership lists read the same on every
+ * segment.  A quoted form reads nothing. */
+static bool clause_reads_row_local(ray_t* v, ray_t* tbl) {
     if (!v || RAY_IS_ERR(v)) return false;
     if (v->type == -RAY_SYM) {
         if (v->attrs & ATTR_QUOTED) return false;
@@ -11660,15 +11707,75 @@ static bool clause_reads_row_local(ray_t* v, int64_t nrows) {
             head = segs[0];
         }
         ray_t* b = ray_env_get_lexical_local(head);
-        if (!b || ray_is_atom(b)) return false;
-        return b->type == RAY_TABLE || b->type == RAY_DICT || ray_len(b) == nrows;
+        if (!b) {
+            if (ray_table_get_col(tbl, head)) return false;   /* the column */
+            b = ray_env_get(head);
+        }
+        return value_row_like(b, tbl, 0);
     }
-    if (v->type == RAY_DICT) return clause_reads_row_local(ray_dict_vals(v), nrows);
+    if (v->type == RAY_DICT) return clause_reads_row_local(ray_dict_vals(v), tbl);
     if (v->type != RAY_LIST) return false;
     ray_t** el = (ray_t**)ray_data(v);
     if (v->len == 2 && el[0] && el[0]->type == -RAY_SYM &&
         el[0]->i64 == ray_sym_intern("quote", 5)) return false;
-    for (int64_t i = 0; i < v->len; i++) if (clause_reads_row_local(el[i], nrows)) return true;
+    for (int64_t i = 0; i < v->len; i++) if (clause_reads_row_local(el[i], tbl)) return true;
+    return false;
+}
+
+/* Does `v` read a column of `tbl` anywhere (a name no local hides)? */
+static bool clause_reads_a_col(ray_t* v, ray_t* tbl) {
+    if (!v || RAY_IS_ERR(v)) return false;
+    if (v->type == -RAY_SYM) return !(v->attrs & ATTR_QUOTED) && sym_names_col(tbl, v->i64);
+    if (v->type == RAY_DICT) return clause_reads_a_col(ray_dict_vals(v), tbl);
+    if (v->type != RAY_LIST) return false;
+    ray_t** el = (ray_t**)ray_data(v);
+    if (v->len == 2 && el[0] && el[0]->type == -RAY_SYM &&
+        el[0]->i64 == ray_sym_intern("quote", 5)) return false;
+    for (int64_t i = 0; i < v->len; i++) if (clause_reads_a_col(el[i], tbl)) return true;
+    return false;
+}
+
+/* Does clause value `v` call something whose value on one partition's
+ * segment is not that segment's rows of its value on the whole table: an
+ * aggregate, a function of the rows' order or of their positions (sums,
+ * prev, deltas, fills, rank, a moving window, take, til) over the columns
+ * of `tbl`, a lambda or code it does not show, or a callee it computes?  A
+ * per-segment run of such a clause answers per partition.  Such a function
+ * of values alone (`(at cfg 'lo)`) reads the same on every segment; `rand`
+ * draws once per segment instead of once. */
+static bool clause_segment_sensitive(ray_t* v, ray_t* tbl) {
+    static const char* const seg_fn[] = {
+        "top", "bot", "cov", "scov", "wsum", "wavg", "quantile", "percentile",
+        "sum", "prod", "all", "any", "count", "avg", "min", "max", "first", "last",
+        "med", "mode", "dev", "stddev", "var", "map", "pmap", "fold", "scan", "prior",
+        "filter", "apply", "distinct", "except", "union", "sect", "take", "drop",
+        "rotate", "cut", "cross", "at", "find", "reverse", "til", "lag", "lead",
+        "deltas", "ratios", "fills", "sums", "avgs", "mins", "maxs", "prds", "differ",
+        "msum", "mavg", "mmin", "mmax", "mcount", "mvar", "mdev", "asc", "desc",
+        "iasc", "idesc", "rank", "xrank", "where", "group", "enlist", "raze",
+        "ungroup", "fold-left", "fold-while", "fold-right", "scan-left",
+        "scan-right", "window", "key", "value", "select", "update", "row" };
+    if (!v || RAY_IS_ERR(v)) return false;
+    if (v->type == RAY_LAMBDA) return true;
+    if (v->type == RAY_DICT) return clause_segment_sensitive(ray_dict_vals(v), tbl);
+    if (v->type != RAY_LIST || v->len < 1) return false;
+    ray_t** el = (ray_t**)ray_data(v);
+    ray_t* head = el[0];
+    if (head && head->type == -RAY_SYM && !(head->attrs & ATTR_QUOTED)) {
+        if (head->i64 == ray_sym_intern("quote", 5)) return false;
+        ray_t* b = sym_binding(head->i64);
+        if (b && b->type == -RAY_SYM) b = sym_binding(b->i64);   /* a name of a function */
+        if (b && (b->type == RAY_LAMBDA || builtin_runs_code(b))) return true;
+        if (b && b->type > RAY_LAMBDA && b->type <= RAY_VARY &&
+            ((b->attrs & RAY_FN_AGGR) || builtin_named(b, seg_fn, sizeof seg_fn / sizeof seg_fn[0])) &&
+            clause_reads_a_col(v, tbl))
+            return true;
+        static const char* const draw[] = { "rand" };   /* a draw per segment, not one */
+        if (builtin_named(b, draw, 1)) return true;
+    } else if (head && (head->type == RAY_LIST || head->type == RAY_LAMBDA)) {
+        return true;                                             /* a computed callee */
+    }
+    for (int64_t i = 0; i < v->len; i++) if (clause_segment_sensitive(el[i], tbl)) return true;
     return false;
 }
 
@@ -13763,6 +13870,27 @@ by_dict_done:
      * decl, dv-threaded returns below only close dv). */
     DICT_VIEW_CLOSE(byv);
 
+    /* A by: name that reads no column but holds one value per row of the
+     * table (a lambda parameter, a let, a global vector) is carried under a
+     * where: as the hidden column __by_key, so the filter keeps its rows in
+     * the one run of where: (the eval-level grouping groups on it). */
+    bool by_key_carried = false;
+    if (where_expr && by_expr && by_expr->type == -RAY_SYM && !(by_expr->attrs & ATTR_QUOTED) &&
+        select_output_count(dict_elems, dict_n) > 0 && !sym_names_col(tbl, by_expr->i64) &&
+        !ray_table_get_col(tbl, ray_sym_intern("__by_key", 8))) {
+        ray_t* kv = sym_binding(by_expr->i64);
+        if (kv && !ray_is_atom(kv) && (ray_is_vec(kv) || kv->type == RAY_LIST) &&
+            ray_len(kv) == ray_table_nrows(tbl)) {
+            ray_t* keyed = ray_table_add_col(tbl, ray_sym_intern("__by_key", 8), kv);   /* consumes tbl */
+            if (!keyed || RAY_IS_ERR(keyed)) {
+                scratch_free(dep_src_hdr);
+                DICT_VIEW_CLOSE(dv); return keyed ? keyed : ray_error("oom", NULL);
+            }
+            tbl = keyed;
+            by_key_carried = true;
+        }
+    }
+
     /* Build DAG */
     ray_graph_t* g = ray_graph_new(tbl);
     if (!g) {
@@ -15242,7 +15370,10 @@ by_dict_done:
              * it names a global vector) is evaluated the same way. */
             bool key_is_value = by_key_sym >= 0 && by_expr->type == -RAY_SYM &&
                                 !sym_names_col(eval_tbl, by_key_sym);
-            if ((by_key_sym < 0 && by_expr->type != RAY_SYM) || key_is_value) {
+            int64_t key_col_sym = ray_sym_intern("__by_key", 8);
+            if (key_is_value && by_key_carried && ray_table_get_col(eval_tbl, key_col_sym)) {
+                by_key_sym = key_col_sym;   /* filtered with the rows (by_key_carried) */
+            } else if ((by_key_sym < 0 && by_expr->type != RAY_SYM) || key_is_value) {
                 int64_t kn = ray_table_nrows(eval_tbl);
                 ray_t* kv = NULL;
                 if (ray_env_push_query_scope() != RAY_OK) kv = ray_error("oom", NULL);
@@ -15260,15 +15391,14 @@ by_dict_done:
                     ray_release(kv);
                     kv = wide ? wide : ray_error("type", "by: cannot broadcast the key");
                 }
-                /* A named key of the table's rows meets the rows where: keeps,
-                 * as the DAG path filters it: the mask is the where: rule's. */
-                if (key_is_value && where_expr && kv && !RAY_IS_ERR(kv) && ray_is_vec(kv) &&
-                    ray_len(kv) != kn && ray_len(kv) == ray_table_nrows(tbl)) {
-                    ray_t* m = eval_where_mask(where_expr, tbl, "select by");
-                    ray_t* f = (m && !RAY_IS_ERR(m)) ? ray_filter_fn(kv, m) : m;
-                    if (m && !RAY_IS_ERR(m)) ray_release(m);
+                /* A named key is one value per row of the table, as on the
+                 * DAG path; under a where: it came through the filter. */
+                if (key_is_value && kv && !RAY_IS_ERR(kv) && !ray_is_atom(kv) &&
+                    ray_len(kv) != ray_table_nrows(tbl)) {
+                    int64_t got = ray_len(kv);
                     ray_release(kv);
-                    kv = f;
+                    kv = ray_error("length", "by: key has %lld values for %lld rows",
+                                   (long long)got, (long long)ray_table_nrows(tbl));
                 }
                 if (kv && !RAY_IS_ERR(kv) && (!ray_is_vec(kv) || ray_len(kv) != kn)) {
                     int64_t got = ray_len(kv);
@@ -25880,12 +26010,14 @@ static ray_t* asof_parted_select_operand(ray_t* arg_ast, ray_t** out_dict) {
                        (sl == 4 && memcmp(sp, "desc",    4) == 0) ||
                        (sl == 7 && memcmp(sp, "nearest", 7) == 0);
         if (blocked) { ray_release(tbl); return NULL; }
-        /* A clause reading a lexical local of the table's rows reads the
-         * whole table: run on one day's segment it misreads it. */
+        /* A clause reading a value of the table's rows (a local, a global
+         * vector) or computing over the rows' order or the whole column
+         * (sums, an aggregate) misreads one day's segment. */
         ray_t* vals = ray_dict_vals(dict);
         bool is_from = sl == 4 && memcmp(sp, "from", 4) == 0;
         if (!is_from && vals && vals->type == RAY_LIST && i < vals->len &&
-            clause_reads_row_local(((ray_t**)ray_data(vals))[i], ray_table_nrows(tbl))) {
+            (clause_reads_row_local(((ray_t**)ray_data(vals))[i], tbl) ||
+             clause_segment_sensitive(((ray_t**)ray_data(vals))[i], tbl))) {
             ray_release(tbl);
             return NULL;
         }
@@ -26029,7 +26161,8 @@ static ray_t* try_stream_parted_order_by(
      * decline). */
     for (int64_t i = 0; i + 1 < dict_n; i += 2) {
         int64_t kid = dict_elems[i]->i64;
-        if (kid == where_id && clause_reads_row_local(dict_elems[i + 1], ray_table_nrows(tbl))) return NULL;
+        if (kid == where_id && (clause_reads_row_local(dict_elems[i + 1], tbl) ||
+                                clause_segment_sensitive(dict_elems[i + 1], tbl))) return NULL;
         if (kid == from_id || kid == where_id || kid == by_id ||
             kid == take_id || kid == asc_id || kid == desc_id ||
             kid == nearest_id) continue;
@@ -26250,7 +26383,8 @@ static ray_t* try_stream_parted_order_by_topk(
      * rows: the segments would read its rows from the top of the table. */
     for (int64_t i = 0; i + 1 < dict_n; i += 2) {
         int64_t kid = dict_elems[i]->i64;
-        if (kid == where_id && clause_reads_row_local(dict_elems[i + 1], ray_table_nrows(tbl))) return NULL;
+        if (kid == where_id && (clause_reads_row_local(dict_elems[i + 1], tbl) ||
+                                clause_segment_sensitive(dict_elems[i + 1], tbl))) return NULL;
         if (kid == from_id || kid == where_id || kid == by_id ||
             kid == take_id || kid == asc_id || kid == desc_id ||
             kid == nearest_id) continue;

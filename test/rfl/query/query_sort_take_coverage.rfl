@@ -804,17 +804,56 @@
 (lcb Plc Klc) -- (select {from: (lcbn Plc Klc) take: 1})
 (lcb Slc Klc) -- (select {from: (lcbn Slc Klc) take: 1})
 (value (lcb Slc Klc)) -- (list [1] [80])
-;; a where: reading a local list of another length (a membership list)
-;; reads the same on every segment: the parted routes still stream it
+;; a where: reading a local list of another length than the table or a
+;; partition (a membership list) reads the same on every segment: the
+;; parted routes still stream it
 (set lcin (fn [tbl m] (select {x: x y: y from: tbl where: (in x m) desc: x take: 2})))
 (set lcio (fn [tbl m] (select {x: x y: y from: tbl where: (in x m) asc: x})))
+(set lcc1 (fn [tbl c] (select {x: x from: tbl where: (> x c.lo) desc: x take: 2})))
+(set lcc2 (fn [tbl c] (select {x: x from: tbl where: (> x (at c 'lo)) asc: x take: 2})))
+(set lcc3 (fn [tbl u] (select {x: x from: tbl where: (in x u.x) desc: x take: 2})))
 (set Bsr (at (.sys.mem) 'sort-perpart-runs))
-(lcin Qlc [1 4 5]) -- (table [x y] (list [5 4] [35 30]))
+(lcin Qlc [1 4 5 9]) -- (table [x y] (list [5 4] [35 30]))
 (- (at (.sys.mem) 'sort-perpart-runs) Bsr) -- 2
 (set Bso (at (.sys.mem) 'sort-perpart-runs))
-(lcio Qlc [1 4 5]) -- (table [x y] (list [1 4 5] [10 30 35]))
+(lcio Qlc [1 4 5 9]) -- (table [x y] (list [1 4 5] [10 30 35]))
 (- (at (.sys.mem) 'sort-perpart-runs) Bso) -- 2
-(lcio Qlc [1 4 5]) -- (lcio Ulc [1 4 5])
+(lcio Qlc [1 4 5 9]) -- (lcio Ulc [1 4 5 9])
+;; a config dict or a table passed in reads the same on every segment
+(set Bsc (at (.sys.mem) 'sort-perpart-runs))
+(select {from: (lcc1 Qlc {lo: 2 hi: 9}) take: 9}) -- (lcc1 Ulc {lo: 2 hi: 9})
+(- (at (.sys.mem) 'sort-perpart-runs) Bsc) -- 2
+(set Bsc (at (.sys.mem) 'sort-perpart-runs))
+(lcc2 Qlc {lo: 2 hi: 9}) -- (lcc2 Ulc {lo: 2 hi: 9})
+(- (at (.sys.mem) 'sort-perpart-runs) Bsc) -- 2
+(set Bsc (at (.sys.mem) 'sort-perpart-runs))
+(lcc3 Qlc (table [x] (list [1 5]))) -- (table [x] (list [5 1]))
+(- (at (.sys.mem) 'sort-perpart-runs) Bsc) -- 2
+;; a mask as long as one partition, local or global, is no mask of the
+;; table: the parted routes raise length as the flat ones do (they
+;; filtered each partition with it); a global mask of the table's rows
+;; filters the whole table
+(set Gsm [true false true])
+(set Gwm [true false true false true true])
+(lcm2 Qlc [true false true]) !- length
+(lcm2 Ulc [true false true]) !- length
+(lcm2n Qlc [true false true]) !- length
+(select {y: y from: Qlc where: Gsm desc: y take: 2}) !- length
+(select {y: y from: Ulc where: Gsm desc: y take: 2}) !- length
+(select {y: y from: Qlc where: Gwm desc: y take: 2}) -- (select {y: y from: Ulc where: Gwm desc: y take: 2})
+(select {y: y from: Qlc where: Gwm asc: y}) -- (select {y: y from: Ulc where: Gwm asc: y})
+(at (select {y: y from: Qlc where: Gwm asc: y}) 'y) -- [10 20 35 40]
+;; a where: over the rows' order or the whole column (a scan, an aggregate)
+;; is the whole table's, not each partition's
+(select {x: x from: Qlc where: (> (sums x) 5) asc: x}) -- (select {x: x from: Ulc where: (> (sums x) 5) asc: x})
+(at (select {x: x from: Qlc where: (> (sums x) 5) asc: x}) 'x) -- [3 4 5 6]
+(select {x: x from: Qlc where: (> x (avg x)) asc: x take: 2}) -- (select {x: x from: Ulc where: (> x (avg x)) asc: x take: 2})
+(at (select {x: x from: Qlc where: (> x (avg x)) asc: x take: 2}) 'x) -- [4 5]
+(select {x: x from: Qlc where: (> (deltas x) 0) desc: x take: 2}) -- (select {x: x from: Ulc where: (> (deltas x) 0) desc: x take: 2})
+;; a draw is one draw over the table, not one per partition
+(set Bsd (at (.sys.mem) 'sort-perpart-runs))
+(count (select {x: x from: Qlc where: (>= (rand 6 100) 0) desc: x take: 2})) -- 2
+(- (at (.sys.mem) 'sort-perpart-runs) Bsd) -- 0
 ;; count(distinct) of a name a local hides counts the local, and a key a
 ;; local hides groups by the local, on every count-distinct route (the
 ;; composite rewrite, the per-group kernel, the high-cardinality global
@@ -875,9 +914,44 @@
 (value (cdkw Tcd Kcd)) -- (list [1 2] [1 3])
 (value (cdkw Pcd Kcd)) -- (list [1 2] [1 3])
 (value (cdkw Tcd Kcd)) -- (value ((fn [tbl k] (select {c: (count y) by: k from: tbl where: (> y 15)})) Tcd Kcd))
-;; xfail BUG: on the eval-level grouping (a STR key, a key a local holds) an
-;; output calling a lambda literal that reduces its argument runs once over
-;; the whole table and spreads that one value: [5 error error], expected
-;; the per-group counts [1 2 2] the DAG path gives for an integer key
+;; an operand of another length than the table (a parameter, a take of a
+;; column) has no value for some rows: the per-group kernel read past it
+(set Tln (table [k y] (list (% (til 1000) 10) (til 1000))))
+(cdl Tln (list "a" "b")) !- length
+(cdl Tln [1 2]) !- length
+(select {c: (count (distinct (take y 2))) by: k from: Tln}) !- length
+(cdl Thc [1 2]) !- length
+;; a named key must have one value per row of the table, under a where: too
+;; (a key as long as the rows the where: keeps is no key of the table)
+((fn [t k] (select {c: (count (distinct y)) by: k from: t where: (> y 15)})) Tcd [7 7 8 8]) !- length
+((fn [t k] (select {c: (count y) by: k from: t where: (> y 15)})) Tcd [7 7 8 8]) !- length
+;; the key meets the rows of the one run of where: (a predicate with an
+;; effect runs once and the key follows what it kept), flat and parted
+(set Ctg 0)
+(set tgp (fn [v] (set Ctg (+ Ctg 1)) (if (== 1 (% Ctg 2)) (> v 15) (> v 35))))
+(value ((fn [t k] (select {c: (count (distinct y)) by: k from: t where: (tgp y)})) Tcd Kcd)) -- (list [1 2] [1 3])
+Ctg -- 1
+(set Ctg 0)
+(value ((fn [t k] (select {c: (count (distinct y)) by: k from: t where: (tgp y)})) Pcd Kcd)) -- (list [1 2] [1 3])
+Ctg -- 1
+(value ((fn [t k] (select {c: (count y) by: k from: t where: (> y 15)})) Pcd Kcd)) -- (list [1 2] [1 3])
+(value ((fn [t k] (select {c: (count (distinct y)) d: (reverse y) by: k from: t where: (> y 15)})) Pcd Kcd)) -- (list [1 2] [1 3] (list [20] [50 40 30]))
+;; xfail BUG: count and count(distinct) of a bound vector of the table's
+;; length are not row-wise (sum and first are): (count z) is the vector's
+;; length in every group (documented for constant collections) and
+;; (count (distinct z)) its whole distinct count [4 4 4], while a parameter
+;; named like a column (y) is counted per group [2 1 1].  The parameter's
+;; name must not change the answer; which rule holds is an open question
+;; ((fn [t z] (at (select {c: (count (distinct z)) by: k from: t}) 'c)) Tcd Vcd) -- (cdl Tcd Vcd)
+;; xfail BUG: on the eval-level grouping (a STR key, a key a local or a global
+;; vector holds) an output calling a lambda literal that reduces its argument
+;; runs once over the whole table and spreads that one value: [5 error error]
+;; with a STR key, [5 error] with a local key (it raised domain before), where
+;; the DAG path gives the per-group counts [1 2 2] for an integer key
 ;; (at (select {c: ((fn [v] (count (distinct v))) y) by: k from: (table [k y] (list (list "a" "a" "b" "b" "c" "c") [10 10 20 30 40 50]))}) 'c) -- [1 2 2]
+;; ((fn [t k] (at (select {c: ((fn [v] (count (distinct v))) y) by: k from: t}) 'c)) Tcd Kcd) -- [2 3]
+;; xfail BUG: a grouped row expression over a local vector under a where:
+;; raises length (operand lengths 4 and 6); ungrouped it meets the rows the
+;; where: keeps, as the grouped form should: [[23 34] [45 56]]
+;; ((fn [t z] (at (select {d: (+ y z) by: k from: t where: (> y 15)}) 'd)) Tcd [1 2 3 4 5 6]) -- (list [23 34] [45 56])
 (.sys.exec "rm -rf /tmp/rfl_cklocal")
