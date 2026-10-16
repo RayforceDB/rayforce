@@ -9019,10 +9019,12 @@ static ray_t* eval_scalar_agg_outputs(ray_t** dict_elems, int64_t dict_n,
          * verb, and must not be fed one cell at a time either. */
         ray_t* agg_src_expr = query_inline_helpers(agg_elems[1], tbl);
         ray_t* src = NULL;
+        bool column_free = false;
         if (is_whole_column_projection(agg_src_expr, tbl) ||
             expr_is_constant_collection(agg_src_expr, tbl, NULL))
             src = eval_expr_whole_column_impl(agg_src_expr, tbl);
         else if (expr_reads_no_column(agg_src_expr, tbl)) {
+            column_free = true;
             /* A source that reads no column (`(til 5)`, which the planner
              * does not lower) has one value whatever the row: a collection
              * is aggregated as it stands, as outside a select; per row it
@@ -9059,6 +9061,18 @@ static ray_t* eval_scalar_agg_outputs(ray_t** dict_elems, int64_t dict_n,
             return agg_value ? agg_value : ray_error("domain", "select: scalar aggregate evaluation failed");
         }
 
+        /* The aggregate of a column-free source is one value, a collection
+         * too: boxed as one cell, as each group takes it under by:. */
+        if (column_free && !ray_is_atom(agg_value)) {
+            ray_t* box = ray_list_new(1);
+            if (box && !RAY_IS_ERR(box)) box = ray_list_append(box, agg_value);
+            ray_release(agg_value);
+            if (!box || RAY_IS_ERR(box)) {
+                ray_release(result);
+                return box ? box : ray_error("oom", NULL);
+            }
+            agg_value = box;
+        }
         ray_t* col = scalar_result_col(agg_value);
         ray_release(agg_value);
         if (!col || RAY_IS_ERR(col)) {
@@ -10135,7 +10149,7 @@ static bool temporal_materialize_pure(ray_t* expr, ray_t* tbl) {
     return (c == '+' || c == '-' || c == '*') &&
         temporal_materialize_pure(es[1], tbl) && temporal_materialize_pure(es[2], tbl);
 }
-static ray_t* try_temporal_group_materialize(ray_t* dict, ray_t* tbl) {
+static ray_t* try_temporal_group_materialize(ray_t* dict, ray_t* tbl, unsigned plan) {
     if (!dict_get(dict, "by")) return NULL;
     ray_t* vals = ray_dict_vals(dict);
     ray_t* keys = ray_dict_keys(dict);
@@ -10203,7 +10217,7 @@ static ray_t* try_temporal_group_materialize(ray_t* dict, ray_t* tbl) {
     rewritten = ray_dict_upsert(rewritten, from, extended);
     ray_release(from); ray_release(extended); extended = NULL;
     MAT_CHECK(rewritten);
-    ray_t* result = ray_select_impl(&rewritten, 1, SELECT_ALIASES_RESOLVED);
+    ray_t* result = ray_select_impl(&rewritten, 1, plan | SELECT_ALIASES_RESOLVED);
     ray_release(rewritten);
     return result;
 oom:
@@ -12141,6 +12155,60 @@ static bool clauses_name_their_columns(ray_t* dict, ray_t* tbl) {
     return !clauses_run_code(dict, tbl, false);
 }
 
+/* Does `expr` hold a vector of several values, written or named (a global
+ * that is no column and no local)?  Grouped, such a vector stands for a
+ * column of the table it was written against, so it must meet the rows
+ * before a where: removes any.  A quoted form is no value read. */
+static bool expr_holds_vector_const(ray_t* expr, ray_t* tbl) {
+    if (!expr) return false;
+    if (expr->type == -RAY_SYM) {
+        if ((expr->attrs & ATTR_QUOTED) || ray_table_get_col(tbl, expr->i64) ||
+            ray_sym_is_dotted(expr->i64) || ray_env_has_lexical_local(expr->i64))
+            return false;
+        ray_t* v = ray_env_get(expr->i64);
+        return v && ray_is_vec(v) && ray_len(v) != 1;
+    }
+    if (expr->type == RAY_LIST) {
+        ray_t** el = (ray_t**)ray_data(expr);
+        int64_t n = ray_len(expr);
+        if (n == 2 && el[0] && el[0]->type == -RAY_SYM &&
+            !(el[0]->attrs & ATTR_QUOTED) &&
+            el[0]->i64 == ray_sym_intern("quote", 5))
+            return false;
+        for (int64_t i = 0; i < n; i++)
+            if (expr_holds_vector_const(el[i], tbl)) return true;
+        return false;
+    }
+    if (expr->type == RAY_DICT) {
+        DICT_VIEW_DECL(dv);
+        DICT_VIEW_OPEN(expr, dv);
+        bool holds = DICT_VIEW_OVERFLOW(dv);
+        for (int64_t i = 0; !holds && i + 1 < dv_n; i += 2)
+            holds = expr_holds_vector_const(dv[i + 1], tbl);
+        DICT_VIEW_CLOSE(dv);
+        return holds;
+    }
+    return ray_is_vec(expr) && ray_len(expr) != 1;
+}
+
+/* expr_holds_vector_const over the outputs and the by: of a select. */
+static bool select_outputs_hold_vector_const(ray_t* dict, ray_t* tbl) {
+    static const char* skip[] = { "from", "where", "take", "asc", "desc", "nearest" };
+    int64_t skip_ids[6];
+    for (int i = 0; i < 6; i++) skip_ids[i] = ray_sym_intern(skip[i], strlen(skip[i]));
+    DICT_VIEW_DECL(dv);
+    DICT_VIEW_OPEN(dict, dv);
+    bool holds = DICT_VIEW_OVERFLOW(dv);
+    for (int64_t i = 0; !holds && i + 1 < dv_n; i += 2) {
+        bool reserved = false;
+        for (int j = 0; j < 6; j++)
+            reserved |= dv[i] && dv[i]->type == -RAY_SYM && dv[i]->i64 == skip_ids[j];
+        if (!reserved) holds = expr_holds_vector_const(dv[i + 1], tbl);
+    }
+    DICT_VIEW_CLOSE(dv);
+    return holds;
+}
+
 /* Rows rv[0..n) of a parted table, gathered one column at a time without
  * flattening the table: the rows are marked, a column is compacted to the
  * marked rows (in ascending order) by sel_compact, and when rv is not
@@ -12663,7 +12731,7 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
         }
     }
 
-    ray_t* temporal_result = try_temporal_group_materialize(dict, tbl);
+    ray_t* temporal_result = try_temporal_group_materialize(dict, tbl, plan);
     if (temporal_result) { ray_release(tbl); return temporal_result; }
 
     ray_t* by_expr = dict_get(dict, "by");
@@ -13360,7 +13428,11 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
          * filtered table dominates what was meant to be a cheap prefilter
          * (single-col filter is O(passing × esz), full filter scales with
          * every projected column). */
-        if (where_expr && (prefilter_computed_by || prefilter_multi_key_where)) {
+        /* A vector constant read as rows stays as long as the table it was
+         * written against: the rows reach the grouping unfiltered, the
+         * where: as its selection. */
+        if (where_expr && (prefilter_computed_by || prefilter_multi_key_where) &&
+            !select_outputs_hold_vector_const(dict, tbl)) {
             /* Exact-size carve: collect_col_refs_set dedups against real
              * table columns, so ray_table_ncols(tbl) is a hard upper bound —
              * no silent cap on wide tables past the former [256]. */

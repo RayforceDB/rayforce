@@ -235,9 +235,11 @@ a column:
 (select {s: (sum [1 2 3]) by: g from: t})            ; error: length
 ```
 
-A computed argument that reads no column — `(til 5)`, `(at [1 2 3] 0)`, a
-call of a function on constants — is evaluated once for the whole query, not
-once per row or per group, so a side effect in it runs once. A collection it
+A computed argument that reads no column — `(til 5)`, `(at [1 2 3] 0)`, an
+expression of constants, a call of a single-expression helper included — is
+evaluated once for the whole query, not once per row or per group, so a side
+effect in it runs once. A helper with several statements is not inlined and
+runs once per group. A collection it
 returns is aggregated as it stands, as outside a select, and gives the same
 value in every group; a scalar stands for every row, as `1` does in
 `(sum 1)`, which counts the rows:

@@ -284,6 +284,14 @@ ticks -- 1
 (at (select {s: (+ a V2) m: (* a 2) from: T3 where: (> a 990)}) 's) -- [2973 2976 2979 2982 2985 2988 2991 2994 2997]
 (select {s: (sum [1 2]) m: (sum (+ a 1)) by: k from: T3 where: (> a 990)}) !- length
 (select {s: (sum [1 2]) m: (sum (+ a 1)) by: k from: T3 where: (> a 99999)}) !- length
+;; take: and a dict computed key filter the rows before grouping too:
+;; the vector meets them unfiltered, the where: as their selection (both
+;; raised `length`; dev read the vector's first cells).
+(at (select {c: (sum V2) by: k from: T3 where: (> a 500)}) 'c) -- [250500 248834 249166]
+(at (select {c: (sum V2) by: k from: T3 where: (> a 500) take: 2}) 'c) -- [250500 248834]
+(at (select {c: (sum V2) by: {m: (+ k 1)} from: T3 where: (> a 500)}) 'c) -- [250500 248834 249166]
+(at (select {c: (sum V2) by: {m: (+ k 1)} from: T3 where: (> a 500)}) 'm) -- [1 2 3]
+(at (select {c: (sum (+ a V2)) by: {m: (+ k 1)} from: T3 where: (> a 500) take: 2}) 'c) -- [375750 373251]
 ;; Over an empty table nothing of the vector is read: the sum of no
 ;; values, as `(sum (til 3))` over it (an empty table grouped, none keyless).
 (set T7 (table [a k] (list (til 10) (% (til 10) 3))))
@@ -292,4 +300,15 @@ ticks -- 1
 (key (select {f: (sum [1 2]) from: (take T7 0)})) -- [f]
 (count (select {f: (sum [1 2]) from: (take T7 0)})) -- 0
 (select {f: (sum [1 2]) by: k from: T7 where: (> a 100)}) !- length
+;; A collection-valued aggregate of a column-free source is one cell
+;; without by: too, as each group takes it (it raised `length`).
+(set M5 (table [k v] (list [1 1 2 2 2] [10 20 30 40 50])))
+(at (select {c: (first (enlist [7 8])) from: M5}) 'c) -- (list [7 8])
+(at (select {c: (first (enlist [7 8])) by: k from: M5}) 'c) -- (list [7 8] [7 8])
+(at (select {c: (first (enlist ['v 'k])) from: M5}) 'c) -- (list ['v 'k])
+;; A helper of several statements is not inlined: it runs once per group.
+(set cntcf 0)
+(set hcf (fn [x] (set cntcf (+ cntcf 1)) (til x)))
+(at (select {c: (sum (hcf 3)) by: k from: M5}) 'c) -- [3 3]
+cntcf -- 2
 (.sys.exec "rm -rf /tmp/rfl_scalar_asc_parted") -- 0
