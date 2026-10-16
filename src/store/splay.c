@@ -1380,6 +1380,12 @@ void ray_splay_build_indexes(const char* dir, ray_t* tbl) {
             else if (hi) { if (RAY_IS_ERR(hi)) ray_error_free(hi); else ray_release(hi); }
         }
         ray_pool_dispatch_n(pool, splay_persist_task, &ctx, (uint32_t)nc);
+        /* A cancel skips the persist tasks not yet started: their columns
+         * go unindexed, and what they would have written is released. */
+        for (int64_t c = 0; c < nc; c++) {
+            if (ctx.hashed[c]) ray_release(ctx.hashed[c]);
+            if (deferred[c]) ray_release(deferred[c]);
+        }
         ray_sys_free(deferred);
     } else {
         for (int64_t c = 0; c < nc; c++) splay_build_index_col(dir, tbl, c, NULL);

@@ -21,6 +21,9 @@
  *   SOFTWARE.
  */
 
+#if !defined(_WIN32)
+#define _POSIX_C_SOURCE 200809L  /* setenv / unsetenv */
+#endif
 #include "test.h"
 #include <rayforce.h>
 #include <rayforce.h>
@@ -31,7 +34,9 @@
 #include "table/sym.h"
 #include "ops/idxop.h"
 #include "core/runtime.h"
+#include "core/pool.h"      /* the cancelled column finish needs the pool */
 #include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/stat.h>
@@ -2193,7 +2198,69 @@ static test_result_t test_csv_splayed_sentinel_literal(void) {
     PASS();
 }
 
+/* A cancel skips the pool tasks not yet started and the dispatch returns
+ * normally (#716): a .csv.splayed load cancelled while it appends or
+ * finishes its columns must fail with a cancel and leave the previous
+ * generation current, never publish one whose columns missed a chunk or
+ * were never finished.  RAY_CSV_SPLAYED_INJECT places the cancel. */
+static void csv_cancel_write(int64_t rows, int ncols) {
+    FILE* f = fopen(TMP_CSV, "w");
+    if (!f) return;
+    fputs(ncols == 1 ? "a\n" : "a,b,s,n\n", f);
+    for (int64_t i = 0; i < rows; i++) {
+        if (ncols == 1) fprintf(f, "%lld\n", (long long)i);
+        else fprintf(f, "%lld,%lld,text %lld,%lld\n", (long long)i, (long long)(i * 7),
+                     (long long)i, (long long)(rows - i));
+    }
+    fclose(f);
+}
+static test_result_t test_csv_splayed_cancel(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    char dir[128]; snprintf(dir,sizeof(dir),"/tmp/rayforce-csv-cancel-%d",(int)getpid());
+    csv_test_rm_rf(dir);
+    int8_t types[] = {RAY_I64,RAY_I64,RAY_STR,RAY_I64};
+    csv_cancel_write(10, 4);
+    TEST_ASSERT_EQ_I(ray_csv_save_splayed_named_opts(TMP_CSV,',',true,types,4,NULL,0,dir,100000),RAY_OK);
+    /* "append": cancelled from column 0's task, the others run or are
+     * skipped; "skip": the last column misses the chunk; "close": every
+     * finish task is skipped (needs the pool); the single column appends
+     * and finishes in line, so only the load's own check sees the cancel. */
+    ray_pool_t* pool = ray_pool_get();
+    bool par = pool && pool->n_workers > 0;
+    struct { const char* step; int ncols; } cases[] = {
+        {"append",4}, {"skip",4}, {"close",4}, {"append",1},
+    };
+    for (size_t k = 0; k < sizeof(cases) / sizeof(cases[0]); k++) {
+        if (!strcmp(cases[k].step, "close") && !par) continue;
+        csv_cancel_write(5000, cases[k].ncols);
+        setenv("RAY_CSV_SPLAYED_INJECT", cases[k].step, 1);
+        ray_err_t e = ray_csv_save_splayed_named_opts(TMP_CSV,',',true,types,cases[k].ncols,
+                                                      NULL,0,dir,100000);
+        unsetenv("RAY_CSV_SPLAYED_INJECT");
+        ray_clear_interrupt();
+        TEST_ASSERT_FMT(e == RAY_ERR_CANCEL, "%s over %d columns: got %d, expected a cancel",
+                        cases[k].step, cases[k].ncols, (int)e);
+        ray_t* t = ray_read_splayed(dir, NULL);
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        TEST_ASSERT_EQ_I(ray_table_ncols(t), 4);
+        for (int c = 0; c < 4; c++) TEST_ASSERT_EQ_I(ray_table_get_col_idx(t, c)->len, 10);
+        TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_table_get_col_idx(t, 3)))[0], 10);
+        ray_release(t);
+    }
+    /* an uncancelled load still replaces it */
+    csv_cancel_write(5000, 4);
+    TEST_ASSERT_EQ_I(ray_csv_save_splayed_named_opts(TMP_CSV,',',true,types,4,NULL,0,dir,100000),RAY_OK);
+    ray_t* t = ray_read_splayed(dir, NULL);
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    for (int c = 0; c < 4; c++) TEST_ASSERT_EQ_I(ray_table_get_col_idx(t, c)->len, 5000);
+    ray_release(t);
+    csv_test_rm_rf(dir);
+    unlink(TMP_CSV); ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t csv_entries[] = {
+    { "csv/splayed_cancel", test_csv_splayed_cancel, NULL, NULL },
     { "csv/splayed_sentinel_literal", test_csv_splayed_sentinel_literal, NULL, NULL },
     { "csv/parted_staging", test_csv_parted_staging, NULL, NULL },
     { "csv/parted_zones", test_csv_parted_zones, NULL, NULL },
