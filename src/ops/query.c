@@ -13687,7 +13687,9 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
                 fail_err = col_vec ? col_vec : ray_error("domain", "by-dict val eval");
                 failed = true; break;
             }
-            if (!ray_is_vec(col_vec) || ray_len(col_vec) != expected_len) {
+            /* a LIST column groups by its cells, as `by: l` does */
+            if (!(ray_is_vec(col_vec) || col_vec->type == RAY_LIST) ||
+                ray_len(col_vec) != expected_len) {
                 ray_release(col_vec);
                 fail_err = ray_error("length", "by-dict val must be a column vector");
                 failed = true; break;
