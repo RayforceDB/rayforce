@@ -103,7 +103,9 @@ warm)
       for v in $order; do
         s=$(mktemp -p "$W/g")
         { loadline "$v"; for k in 1 2 3 4 5 6; do printf '(println (timeit %s))\n' "$q"; done; } > "$s"
-        r=$("$BIN" "$s" 2>/dev/null | tail -6 | paste -sd '\t') || true; rm -f "$s"
+        # an erroring run (non-zero exit: a script stops at its first error)
+        # is a FAIL row, which the summary counts as a failure
+        if o=$("$BIN" "$s" 2>/dev/null); then r=$(printf '%s\n' "$o" | tail -6 | paste -sd '\t'); else r=FAIL; fi; rm -f "$s"
         printf 'm\t%s\tq%s\t%s\t%s\n' "$v" "$qn" "$round" "$r" >> "$OUT"
       done
     done
@@ -117,7 +119,7 @@ cold)
       calm; evict "$W/$v"
       s=$(mktemp -p "$W/g")
       { loadline "$v"; printf '(println (timeit %s))\n' "$q"; } > "$s"
-      r=$("$BIN" "$s" 2>/dev/null | tail -1) || true; rm -f "$s"
+      if o=$("$BIN" "$s" 2>/dev/null); then r=$(printf '%s\n' "$o" | tail -1); else r=FAIL; fi; rm -f "$s"
       printf 'c\t%s\tq%s\t%s\t%s\n' "$v" "$qn" "$trial" "$r" >> "$OUT"
     done; done
   done
@@ -164,14 +166,16 @@ wall)   # per-call wall time, (T(1 + K) - T(1)) / K over K top-level calls: (tim
     if [ $((round % 2)) = 1 ]; then order="g0 g2"; else order="g2 g0"; fi
     for qn in "${!QS[@]}"; do q=${QS[$qn]}
       for v in $order; do
-        t=()
+        t=(); ok=1
         for n in 1 $((K + 1)); do
           s=$(mktemp -p "$W/g")
           { loadline "$v"; for k in $(seq 1 $n); do printf '(set r %s)\n' "$q"; done; } > "$s"
-          a=$(date +%s%N); "$BIN" "$s" >/dev/null 2>&1 || true; b=$(date +%s%N); rm -f "$s"
+          # an erroring run stops early and would time as fast: fail it, never time it
+          a=$(date +%s%N); "$BIN" "$s" >/dev/null 2>&1 || ok=0; b=$(date +%s%N); rm -f "$s"
           t+=($(( (b - a) / 1000 )))
         done
-        printf 'wall\t%s\tq%s\t%s\t%s\n' "$v" "$qn" "$round" "$(awk -v a="${t[0]}" -v b="${t[1]}" -v k=$K 'BEGIN{printf "%.3f", (b - a) / k / 1000.0}')" >> "$OUT"
+        if [ "$ok" = 1 ]; then w=$(awk -v a="${t[0]}" -v b="${t[1]}" -v k=$K 'BEGIN{printf "%.3f", (b - a) / k / 1000.0}'); else w=FAIL; fi
+        printf 'wall\t%s\tq%s\t%s\t%s\n' "$v" "$qn" "$round" "$w" >> "$OUT"
       done
     done
   done

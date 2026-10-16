@@ -3029,7 +3029,9 @@ Driver: `W=/home/hetoku/data/tmp/p5b_bench bench/compress_estimate/p5_bench.sh a
 (16:21-16:58), with the fixed summary (`fix(bench)` commit: the scan-only
 ratio of a query comes from the wall stage when its timeit g0 median is
 below 0.05 ms, wall times below 0.05 ms are floored, every query must be
-present in every stage).  Binary: the 8b tree on 7d744e4c, release (sha256
+present in every stage; fix round 1: a failed or unparsable run fails
+its query, and where timeit and wall both exist the verdict takes the
+larger ratio, a gap over 0.10 printed as CHECK).  Binary: the 8b tree on 7d744e4c, release (sha256
 d6b3aefbbbee); BASE for the writer cost 81c04acb.  One store for every
 stage: `all` derives and saves it once (prep), then enc / ident / warm /
 cold / wall / savet run on it, then clean deletes it.  9 warm rounds, 3 cold
@@ -3071,18 +3073,18 @@ tables above hold).
 | q1 | 0.651 | wall |
 | q2 | 1.000 | wall (floored) |
 | q3 | 1.000 | wall (floored) |
-| q4 | 0.965 | timeit |
-| q5 | 0.690 | timeit |
-| q6 | 0.968 | timeit |
-| q7 | 0.210 | timeit |
-| q8 | 1.157 | timeit |
-| q9 | 1.003 | timeit |
+| q4 | 0.965 | max(timeit 0.965, wall 0.965) |
+| q5 | 0.691 | max(timeit 0.690, wall 0.691) |
+| q6 | 0.968 | max(timeit 0.968, wall 0.960) |
+| q7 | 0.210 | max(timeit 0.210, wall 0.202) |
+| q8 | 1.163 | max(timeit 1.157, wall 1.163) |
+| q9 | 1.003 | max(timeit 1.003, wall 0.995) |
 
-save g2 p5 / base: 20.446; save g0 p5 / base: 0.709   (the writer is unchanged)
+load waits: 7 (16:22:07/1.63, 16:22:42/1.55, 16:23:32/2.51, 16:24:02/1.59, 16:24:54/1.82, 16:25:24/1.61, 16:26:05/2.13)
 
-**P5 float store, all 10 queries present in warm, cold, wall and ident: PASS**
+**P5 float store, all 10 queries present (and no run failed) in warm, cold, wall and ident: PASS**
 **P5 float store, answers g2 = g0: FAIL**
-**P5 float store, scan-only warm (no regression, <= 1.05 per query): FAIL** (worst 1.157, q8, timeit)
+**P5 float store, scan-only warm (no regression, <= 1.05 per query): FAIL** (worst 1.163, q8, max(timeit 1.157, wall 1.163))
 ```
 
 Before 8b / after 8b, g2 / g0 (the scan-only source of each row; before 8b
@@ -3096,7 +3098,7 @@ q0 / q1 from the wall table, the rest timeit):
 | q5 `level == 213.0` | 1.897 | 0.690 |
 | q6 `ratio < 0.25` | 1.302 | 0.968 |
 | q7 `sendt in [0.5, 1.5)` | 0.321 | 0.210 |
-| q8 group `sum price by refresh` | 2.516 | 1.157 |
+| q8 group `sum price by refresh` | 2.516 | 1.163 (timeit 1.157, wall 1.163) |
 | q9 top 10 by price | 1.004 | 1.003 |
 
 What changed (no byte on disk, no answer, no corruption verdict changes):
@@ -3130,6 +3132,11 @@ with the reference's exact bytes, and over every one-byte forgery of the
 body (5 kinds) and statistics narrowed at either end, a body the kernel
 takes is one `dec_floats` accepts, with the same bytes.  A mutation (the
 per-run statistics check removed) fails it.
+
+Under the fixed summary (fix round 1) q8 reads 1.163, the larger of its
+timeit (1.157) and wall (1.163) ratios; it is still the only query over
+1.05, and it is accepted as a recorded deviation (Ruling 8b-1).  No row
+prints CHECK.
 
 **The floor (q8).**  q8 is the only query over 1.05.  g0's group is
 compute-bound in the dense aggregation (`sum_f64_update`, `count_update`,

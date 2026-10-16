@@ -21,8 +21,14 @@ def scan(path):
         return None
     rows = struct.unpack_from("<q", b, 24)[0]
     typ = struct.unpack_from("<b", b, 18)[0]
-    off0 = struct.unpack_from("<Q", b, 96)[0]
-    n_chunks = (off0 - 96) // 64
+    # the chunk count is ceil(rows / 65536) (spec); the directory of
+    # n_chunks 64-byte entries must end where chunk 0 begins
+    n_chunks = (rows + 65535) // 65536 if rows > 0 else 0
+    if n_chunks:
+        off0 = struct.unpack_from("<Q", b, 96)[0]
+        if off0 < 96 + 64 * n_chunks or len(b) < 96 + 64 * n_chunks:
+            sys.exit(f"{path}: directory of {n_chunks} chunks (ceil({rows} / 65536)) "
+                     f"does not fit before chunk 0 at {off0}")
     n_vec_total = (rows + 1023) // 1024 if rows > 0 else 0
     s = collections.Counter(); efs = collections.Counter()
     v_index = 0

@@ -14,6 +14,7 @@ nq = 10; bad_rows = []
 # vector as ~0 ms); a wall time below FLOOR is below the stage's resolution
 # and is floored to it, so two sub-resolution times compare as 1.0.
 FLOOR = 0.05
+XCHECK = 0.10       # the largest timeit / wall ratio gap printed without CHECK
 def nums(xs):
     try: return [float(x) for x in xs if x]
     except ValueError: return None
@@ -96,7 +97,16 @@ for q in want:
         fl = a < FLOOR or b < FLOOR
         scan[q] = (ratio(max(a, FLOOR), max(b, FLOOR)), "wall" + (" (floored)" if fl else ""))
     elif w0 >= FLOOR:
-        scan[q] = (ratio(w0, w2), "timeit")
+        rt = ratio(w0, w2)
+        if wall.get(("g0", q)) and wall.get(("g2", q)):
+            # both measures exist: the verdict takes the larger, and a gap
+            # over XCHECK is flagged (a timeit artifact on one store, #856,
+            # must not hide a regression the wall stage sees)
+            rw = ratio(max(a, FLOOR), max(b, FLOOR))
+            big = max(rt, rw) if rt == rt and rw == rw else float("nan")
+            scan[q] = (big, f"max(timeit {rt:.3f}, wall {rw:.3f})" + (" CHECK" if not abs(rt - rw) <= XCHECK else ""))
+        else:
+            scan[q] = (rt, "timeit")
     else:
         scan[q] = (float("nan"), "none")
 if wall:
@@ -109,11 +119,14 @@ print("\n| query | scan-only ratio g2 / g0 | source |\n|---|---|---|")
 for q in want: print(f"| {q} | {scan[q][0]:.3f} | {scan[q][1]} |")
 if waits: print(f"\nload waits: {len(waits)} ({', '.join(w[0] + '/' + w[1] for w in waits[:10])})")
 if bad_rows: print(f"\nunparsed rows: {len(bad_rows)} ({', '.join('/'.join(r) for r in bad_rows[:10])})")
-if missing: print(f"\nmissing (query/stage): {', '.join(missing)}")
+# a row that erred (FAIL) or does not parse is a failure of its query,
+# even when other rounds of it succeeded
+for st, v, q, rnd in bad_rows: missing.append(f"{q}/{st} ({v} round {rnd} failed)")
+if missing: print(f"\nmissing or failed (query/stage): {', '.join(missing)}")
 complete = not missing
 worst = max((v[0] for v in scan.values()), default=float("nan"))
 wq = max(scan, key=lambda q: scan[q][0] if scan[q][0] == scan[q][0] else float("inf")) if scan else "-"
 scan_ok = complete and all(v[0] <= 1.05 for v in scan.values())   # a NaN ratio fails
-print(f"\n**P5 float store, all {nq} queries present in warm, cold, wall and ident: {'PASS' if complete else 'FAIL'}**")
+print(f"\n**P5 float store, all {nq} queries present (and no run failed) in warm, cold, wall and ident: {'PASS' if complete else 'FAIL'}**")
 print(f"**P5 float store, answers g2 = g0: {'PASS' if same and complete else 'FAIL'}**")
 print(f"**P5 float store, scan-only warm (no regression, <= 1.05 per query): {'PASS' if scan_ok else 'FAIL'}** (worst {worst:.3f}, {wq}, {scan.get(wq, (0, '-'))[1]})")
