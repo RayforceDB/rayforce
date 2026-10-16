@@ -33,6 +33,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #define RAY_ENC_VEC        1024
 #define RAY_ENC_CHUNK      65536
@@ -56,6 +57,12 @@ bool    ray_enc_kind_of(int8_t type, uint8_t attrs, ray_enc_kind_t* k);
  * kind ({32|64, false, true}) for F32 / F64; false otherwise. */
 bool    ray_enc_value_kind(int8_t type, uint8_t attrs, ray_enc_kind_t* k);
 bool    ray_enc_has_bitmap(int8_t type);
+/* A float kind's T-bit pattern (T = 32 or 64) as a double: F32 widened,
+ * which is exact.  The one helper every float path reads values with. */
+static inline double ray_enc_fval(uint64_t b, int T) {
+    if (T == 32) { uint32_t u = (uint32_t)b; float f; memcpy(&f, &u, 4); return (double)f; }
+    double d; memcpy(&d, &b, 8); return d;
+}
 int64_t ray_enc_logical(uint64_t bits, ray_enc_kind_t k);
 /* a < b in kind order; on a float kind this is dictionary order: numeric
  * on the value (F32 widened), -0.0 before +0.0.  The float order is defined

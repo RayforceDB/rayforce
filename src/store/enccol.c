@@ -2164,6 +2164,21 @@ static bool vview_codes_for(const uint8_t* body, uint64_t avail, ray_enc_vview_t
     return true;
 }
 
+/* Every code of v below the dictionary size n, and every non-null row's
+ * (bm) code inside [clo, chi_x), none when the interval is empty: one
+ * branch-free pass.  Shared by the integer and float DICT views. */
+static bool vview_codes_in(const ray_enc_vview_t* v, const uint8_t* bm, uint32_t n, uint32_t clo, uint32_t chi_x) {
+    const bool none = clo >= chi_x;                          /* no non-null row may exist */
+    const uint32_t lim = n - 1, span = none ? 0 : chi_x - 1 - clo;
+    uint32_t bad = 0;
+    for (int i = 0; i < v->n; i++) {
+        const uint32_t c = v->codes[i];
+        const uint32_t nul = bm ? (uint32_t)((bm[i >> 3] >> (i & 7)) & 1) : 0;
+        bad |= (uint32_t)(c > lim) | ((nul ^ 1u) & (uint32_t)(none | (c - clo > span)));
+    }
+    return !bad;
+}
+
 /* dec_fast_dict's checks without the gather: the U32 FOR_BP code child's
  * header, size and base; the codes (unpacked into v->codes) below the
  * dictionary size; every non-null row's value inside the vector's
@@ -2187,21 +2202,7 @@ static bool vview_dict_codes(const ray_enc_desc_t* d, const uint8_t* body, uint6
     }
     const uint64_t sent = (uint64_t)1 << (k.T - 1);
     if (clo == 0 && dict->v[0] == sent) clo = 1;             /* the sentinel's code */
-    const bool none = clo >= chi_x;                          /* no non-null row may exist */
-    const uint32_t lim = n - 1, span = none ? 0 : chi_x - 1 - clo;
-    uint32_t bad = 0;
-    for (int i = 0; i < v->n; i++) {
-        const uint32_t c = v->codes[i];
-        const uint32_t nul = bm ? (uint32_t)((bm[i >> 3] >> (i & 7)) & 1) : 0;
-        bad |= (uint32_t)(c > lim) | ((nul ^ 1u) & (uint32_t)(none | (c - clo > span)));
-    }
-    return !bad;
-}
-
-/* A float view's T-bit pattern as a double (F32 widened, exactly). */
-static inline double vview_fval(uint64_t b, int T) {
-    if (T == 32) { uint32_t u = (uint32_t)b; float f; memcpy(&f, &u, 4); return (double)f; }
-    double x; memcpy(&x, &b, 8); return x;
+    return vview_codes_in(v, bm, n, clo, chi_x);
 }
 
 /* A float CONST body (no trailer): dec_floats' checks.  The 8-byte body
@@ -2212,8 +2213,7 @@ static bool vview_float_const(const ray_enc_desc_t* d, const uint8_t* body, uint
     if (!fk_runs(RAY_ENC_CONST, v->n, body, avail, T, &v->run_vals, &v->run_ends, &v->n_runs)) return false;
     v->cbits = T == 32 ? v->run_vals.s[0] : v->run_vals.q[0];
     if (d->n_nulls == v->n) return true;                     /* every row null: the value is never read */
-    double x;
-    if (T == 32) { float f; memcpy(&f, &v->run_vals.s[0], 4); x = f; } else memcpy(&x, &v->run_vals.q[0], 8);
+    const double x = ray_enc_fval(v->cbits, T);
     if (x != x) return false;                                /* a NaN outside the bitmap */
     if (!(d->flags & RAY_ENC_STAT_ABSENT)) {
         double smin, smax; memcpy(&smin, &d->min, 8); memcpy(&smax, &d->max, 8);
@@ -2242,7 +2242,7 @@ static bool vview_float_rle(const ray_enc_desc_t* d, const uint8_t* body, uint64
     for (uint32_t r = 0; r < v->n_runs; r++) {
         const uint32_t e = v->run_ends.h[r];
         if (!bm || !fk_bits_all(bm, prev, e)) {
-            const double x = vview_fval(fk_val(&v->run_vals, T, r), T);
+            const double x = ray_enc_fval(fk_val(&v->run_vals, T, r), T);
             if (x != x) return false;                        /* a NaN outside the bitmap */
             if (has_st && (x < smin || x > smax)) return false;
         }
@@ -2269,21 +2269,13 @@ static bool vview_dict_codes_f(const ray_enc_desc_t* d, const uint8_t* body, uin
     if (!(d->flags & RAY_ENC_STAT_ABSENT)) {
         double smin, smax; memcpy(&smin, &d->min, 8); memcpy(&smax, &d->max, 8);
         uint32_t a = 0, b = n;                               /* the first entry >= min */
-        while (a < b) { uint32_t mid = a + (b - a) / 2; if (vview_fval(dict->v[mid], T) < smin) a = mid + 1; else b = mid; }
+        while (a < b) { uint32_t mid = a + (b - a) / 2; if (ray_enc_fval(dict->v[mid], T) < smin) a = mid + 1; else b = mid; }
         clo = a;
         a = 0; b = n;                                        /* the first entry > max */
-        while (a < b) { uint32_t mid = a + (b - a) / 2; if (vview_fval(dict->v[mid], T) <= smax) a = mid + 1; else b = mid; }
+        while (a < b) { uint32_t mid = a + (b - a) / 2; if (ray_enc_fval(dict->v[mid], T) <= smax) a = mid + 1; else b = mid; }
         chi_x = a;
     }
-    const bool none = clo >= chi_x;                          /* no non-null row may exist */
-    const uint32_t lim = n - 1, span = none ? 0 : chi_x - 1 - clo;
-    uint32_t bad = 0;
-    for (int i = 0; i < v->n; i++) {
-        const uint32_t c = v->codes[i];
-        const uint32_t nul = bm ? (uint32_t)((bm[i >> 3] >> (i & 7)) & 1) : 0;
-        bad |= (uint32_t)(c > lim) | ((nul ^ 1u) & (uint32_t)(none | (c - clo > span)));
-    }
-    return !bad;
+    return vview_codes_in(v, bm, n, clo, chi_x);
 }
 
 /* Vector vec of a float column as a view: CONST, RLE and DICT, each with

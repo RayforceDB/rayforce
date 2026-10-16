@@ -9512,15 +9512,15 @@ static int agg_firstn_runview(const agg_rr_t* rr, uint32_t k, int64_t seg, int64
     if (!src || !ray_col_src_encoded(src) || ray_enccol_decoded_peek(src->obj)) return 0;
     ray_enccol_t* e = ray_enccol_of(src->obj);
     if (e->kind != RAY_ENCCOL_SINGLE) return 0;
+    /* a float view's run values are bit patterns: compared as integers they
+     * would split -0.0 from +0.0, so a float key is read by its values */
+    if (e->type == RAY_F32 || e->type == RAY_F64) return 0;
     const ray_enc_desc_t* d;
     if ((*err = ray_enccol_chunk_descs_ref(e, seg / RAY_ENC_VECS_PER_CHUNK, &d)) != NULL) return -1;
     uint8_t enc = d[seg % RAY_ENC_VECS_PER_CHUNK].encoding;
     if (enc != RAY_ENC_RLE && enc != RAY_ENC_CONST) return 0;
     int r = ray_col_src_vview(src, seg, vv, err);
     if (r <= 0) return r;
-    /* a float view's run values are bit patterns: compared as integers they
-     * would split -0.0 from +0.0, so a float key is read by its values */
-    if (vv->type == RAY_F32 || vv->type == RAY_F64) return 0;
     if ((vv->enc != RAY_ENC_RLE && vv->enc != RAY_ENC_CONST) || vv->n != len ||
         vv->nullmap || (vv->n_nulls && rr->key_types[k] != RAY_SYM)) return 0;
     return 1;

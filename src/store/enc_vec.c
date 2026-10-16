@@ -64,14 +64,9 @@ int64_t ray_enc_logical(uint64_t bits, ray_enc_kind_t k) {
     return (int64_t)bits;
 }
 
-static double enc_fval(uint64_t b, int T) {
-    if (T == 32) { uint32_t u = (uint32_t)b; float f; memcpy(&f, &u, 4); return (double)f; }
-    double d; memcpy(&d, &b, 8); return d;
-}
-
 bool ray_enc_lt(uint64_t a, uint64_t b, ray_enc_kind_t k) {
     if (k.is_float) {                    /* dictionary order (spec "Comparison semantics") */
-        double x = enc_fval(a, k.T), y = enc_fval(b, k.T);
+        double x = ray_enc_fval(a, k.T), y = ray_enc_fval(b, k.T);
         if (x < y) return true;
         if (x > y) return false;
         return ((a >> (k.T - 1)) & 1) && !((b >> (k.T - 1)) & 1);   /* -0.0 before +0.0 */

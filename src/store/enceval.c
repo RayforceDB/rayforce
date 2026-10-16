@@ -68,10 +68,7 @@ int ray_enc_const_decision_f64(const ray_enc_vview_t* v, uint16_t op, double c, 
     if (v->enc != RAY_ENC_CONST || !is_float(v->type) || !is_cmp_op(op)) return -1;
     if (isnan(c)) return -1;                                  /* a NaN constant is the null constant: decline */
     if (v->nullmap && v->n_nulls == v->n) return nr;
-    double x;
-    if (v->type == RAY_F64) memcpy(&x, &v->cbits, 8);
-    else { float f; uint32_t b = (uint32_t)v->cbits; memcpy(&f, &b, 4); x = f; }
-    int r = cmp_one_f(x, op, c);
+    int r = cmp_one_f(ray_enc_fval(v->cbits, v->type == RAY_F64 ? 64 : 32), op, c);
     if (!v->nullmap || r == nr) return r;
     return -1;
 }
@@ -232,24 +229,18 @@ static void eval_runs_eq(const ray_enc_vview_t* v, int64_t c, uint8_t ne, uint8_
 }
 #undef RUNS_EQ
 
-/* A float view's T-bit pattern as a double (F32 widened, exactly). */
-static inline double fval(uint64_t b, int T) {
-    if (T == 32) { uint32_t u = (uint32_t)b; float f; memcpy(&f, &u, 4); return (double)f; }
-    double d; memcpy(&d, &b, 8); return d;
-}
-
 bool ray_enc_eval_cmp_f64(const ray_enc_vview_t* v, uint16_t op, double c, uint8_t nr, uint8_t* bits) {
     if (!is_float(v->type) || !is_cmp_op(op) || isnan(c)) return false;
     const int T = v->k.T;
     switch (v->enc) {
     case RAY_ENC_CONST:
-        memset(bits, cmp_one_f(fval(v->cbits, T), op, c), (size_t)v->n);
+        memset(bits, cmp_one_f(ray_enc_fval(v->cbits, T), op, c), (size_t)v->n);
         break;
     case RAY_ENC_RLE: {
         uint32_t i = 0;
         for (uint32_t r = 0; r < v->n_runs; r++) {
             const uint32_t e = v->run_ends.h[r];
-            fill_run(bits, i, e, (uint32_t)v->n, (uint8_t)cmp_one_f(fval(lane(&v->run_vals, T, r), T), op, c));
+            fill_run(bits, i, e, (uint32_t)v->n, (uint8_t)cmp_one_f(ray_enc_fval(lane(&v->run_vals, T, r), T), op, c));
             i = e;
         }
         break;
@@ -260,10 +251,10 @@ bool ray_enc_eval_cmp_f64(const ray_enc_vview_t* v, uint16_t op, double c, uint8
          * under the predicate comparator are one interval [lb, ub): both
          * zeros for a zero c */
         uint32_t lo = 0, hi = v->dict_n;
-        while (lo < hi) { uint32_t mid = lo + (hi - lo) / 2; if (fval(v->dict[mid], T) < c) lo = mid + 1; else hi = mid; }
+        while (lo < hi) { uint32_t mid = lo + (hi - lo) / 2; if (ray_enc_fval(v->dict[mid], T) < c) lo = mid + 1; else hi = mid; }
         const uint32_t lb = lo;
         hi = v->dict_n;
-        while (lo < hi) { uint32_t mid = lo + (hi - lo) / 2; if (fval(v->dict[mid], T) <= c) lo = mid + 1; else hi = mid; }
+        while (lo < hi) { uint32_t mid = lo + (hi - lo) / 2; if (ray_enc_fval(v->dict[mid], T) <= c) lo = mid + 1; else hi = mid; }
         const uint32_t ub = lo;
         uint32_t a = 0, b = 0; uint8_t neg = 0;
         switch (op) {

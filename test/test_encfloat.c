@@ -1394,6 +1394,92 @@ static test_result_t test_view_consumers(void) {
     PASS();
 }
 
+/* Bytes decoded from column col of generation 2 (vc2) while q runs on a
+ * fresh load of it (the column's own counter), or UINT64_MAX on an error. */
+static uint64_t fl_q_decoded(const char* q, const char* col) {
+    if (!fl_eval_ok("(set T (.db.splayed.get \"" FL_TMP "/vc2/\"))")) return UINT64_MAX;
+    ray_t* r = fl_eval(q);
+    if (!r || RAY_IS_ERR(r)) { if (r) ray_error_free(r); return UINT64_MAX; }
+    ray_release(r);
+    ray_t* t = fl_eval("T");
+    if (!t || RAY_IS_ERR(t)) { if (t) ray_error_free(t); return UINT64_MAX; }
+    ray_t* encv = ray_table_get_col_enc(t, ray_sym_intern(col, strlen(col)));
+    uint64_t b = encv ? atomic_load(&ray_enccol_of(encv)->decoded_bytes) : UINT64_MAX;
+    ray_release(t);
+    return b;
+}
+
+/* compress_float.rfl's filters with the encoding forced and asserted, so
+ * they run on views: F64 f and F32 g, forced CONST (one value per vector,
+ * some nulls), RLE (runs of 3, the rfl's zs) and DICT (scattered), equal to
+ * generation 0, and nothing of the filtered column decoded. */
+static test_result_t test_filter_views(void) {
+    const int64_t n = 70000;                                      /* two chunks */
+    static const int forces[] = { RAY_ENC_CONST, RAY_ENC_RLE, RAY_ENC_DICT };
+    const double dv[4] = { -3.5, bd(NEG0_64), 0.0, 2.25 };
+    const double cv[3] = { bd(NEG0_64), 0.0, 2.25 };
+    for (size_t fi = 0; fi < 3; fi++) {
+        ray_t* k = ray_vec_new(RAY_I64, n);
+        ray_t* f = ray_vec_new(RAY_F64, n);
+        TEST_ASSERT_TRUE(k && f);
+        k->len = f->len = n;
+        double* fd = (double*)ray_data(f);
+        for (int64_t i = 0; i < n; i++) {
+            ((int64_t*)ray_data(k))[i] = i;
+            fd[i] = forces[fi] == RAY_ENC_CONST ? cv[(i / 1024) % 3]
+                  : forces[fi] == RAY_ENC_RLE   ? dv[(i / 3) % 4] : dv[(i * 7) % 4];
+            if (i % 5000 == 7) fd[i] = NULL_F64;
+        }
+        f->attrs |= RAY_ATTR_HAS_NULLS;
+        ray_t* g = fl_typed(RAY_F32, fd, n);
+        ray_t* tb = ray_table_new(3);
+        tb = ray_table_add_col(tb, ray_sym_intern("k", 1), k); ray_release(k);
+        tb = ray_table_add_col(tb, ray_sym_intern("f", 1), f); ray_release(f);
+        tb = ray_table_add_col(tb, ray_sym_intern("g", 1), g); ray_release(g);
+        TEST_ASSERT_EQ_I(ray_env_set(ray_sym_intern("W", 1), tb), RAY_OK);
+        ray_release(tb);
+        TEST_ASSERT_TRUE(fl_eval_ok("(.db.splayed.set \"" FL_TMP "/vc0/\" W {compress: false})"));
+        ray_encw_test_force_float(forces[fi]);
+        bool ok = fl_eval_ok("(.db.splayed.set \"" FL_TMP "/vc2/\" W {compress: true})");
+        ray_encw_test_force_float(-1);
+        TEST_ASSERT_TRUE(ok);
+        /* every vector of f and g is a view of the forced encoding */
+        TEST_ASSERT_TRUE(fl_eval_ok("(set T (.db.splayed.get \"" FL_TMP "/vc2/\"))"));
+        ray_t* t = fl_eval("T");
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        for (int ci = 0; ci < 2; ci++) {
+            ray_t* encv = ray_table_get_col_enc(t, ray_sym_intern(ci ? "g" : "f", 1));
+            TEST_ASSERT_NOT_NULL(encv);
+            for (int64_t v = 0; v < (n + 1023) / 1024; v++) {
+                ray_t* err = NULL;
+                int r = ray_enccol_vview(ray_enccol_of(encv), v, &fl_vw, &err);
+                if (err) ray_error_free(err);
+                TEST_ASSERT_FMT(r == 1 && fl_vw.enc == forces[fi], "force %d column %s vector %lld: view %d enc %d",
+                                forces[fi], ci ? "g" : "f", (long long)v, r, fl_vw.enc);
+            }
+        }
+        ray_release(t);
+        static const char* const conds[] = {
+            "(== %s 0.0)", "(== %s -0.0)", "(< %s 0.0)", "(>= %s -0.0)", "(!= %s 0.0)",
+            "(> %s 1.0)", "(<= %s -3.5)", NULL,
+        };
+        char cnd[64], q[256];
+        for (int ci = 0; ci < 2; ci++)
+            for (int i = 0; conds[i]; i++) {
+                snprintf(cnd, sizeof cnd, conds[i], ci ? "g" : "f");
+                snprintf(q, sizeof q, "(count (select {from: T where: %s}))", cnd);
+                FL_SAME(q);
+                snprintf(q, sizeof q, "(select {s: (sum k) c: (count k) from: T where: %s})", cnd);
+                FL_SAME(q);
+                snprintf(q, sizeof q, "(select {k: k from: T where: %s})", cnd);
+                uint64_t dec = fl_q_decoded(q, ci ? "g" : "f");
+                TEST_ASSERT_FMT(dec == 0, "force %d %s: decoded %llu bytes", forces[fi], q, (unsigned long long)dec);
+            }
+        TEST_ASSERT_TRUE(fl_eval_ok("(set T 0)"));
+    }
+    PASS();
+}
+
 const test_entry_t encfloat_entries[] = {
     { "encfloat/float_order",      test_float_order,      fl_setup, fl_teardown },
     { "encfloat/float_train_dict", test_float_train_dict, fl_setup, fl_teardown },
@@ -1420,5 +1506,6 @@ const test_entry_t encfloat_entries[] = {
     { "encfloat/const_decision_f64",   test_const_decision_f64,   fl_setup, fl_teardown },
     { "encfloat/view_checks",          test_view_checks,          fl_setup, fl_teardown },
     { "encfloat/view_consumers",       test_view_consumers,       fl_rt_setup, fl_rt_teardown },
+    { "encfloat/filter_views",         test_filter_views,         fl_rt_setup, fl_rt_teardown },
     { NULL, NULL, NULL, NULL },
 };
