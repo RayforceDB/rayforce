@@ -10428,6 +10428,9 @@ static __attribute__((noinline, cold)) ray_t* group_const_input_check(ray_graph_
 
 static ray_t* group_const_inputs_check(ray_graph_t* g, ray_op_ext_t* ext, ray_t* tbl) {
     int64_t nrows = ray_table_nrows(tbl);
+    /* Over no rows nothing of an input is read: `(sum [1 2])` over an
+     * empty table is the sum of no values, as `(sum (til 3))` is. */
+    if (nrows == 0) return NULL;
     for (uint32_t a = 0; a < ext->n_aggs; a++) {
         if (ext->agg_ops[a] == OP_COUNT) continue;
         uint32_t ids[2] = { ext->agg_ins[a],
@@ -11256,6 +11259,29 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     return result;
 }
 
+/* The rows of a constant aggregate input, or NULL when it has none to give
+ * here: one value (an atom, a one-element vector) spread over the rows, or
+ * a vector of the table's length, which stands for a column.  The legacy
+ * engine broadcasts the same way; given rows, the constant is grouped as a
+ * column is, so `(sum 1)` orders its groups as `(sum v)` and `(count v)`
+ * do. */
+static ray_t* group_const_input_rows(ray_graph_t* g, ray_op_t* in, int64_t nrows) {
+    ray_op_ext_t* x = find_ext(g, in->id);
+    ray_t* lit = x ? x->literal : NULL;
+    if (!lit || RAY_IS_ERR(lit)) return NULL;
+    if (ray_is_atom(lit) || (ray_is_vec(lit) && lit->len == 1))
+        return materialize_broadcast_input(lit, nrows);
+    if (ray_is_vec(lit) && lit->len == nrows) { ray_retain(lit); return lit; }
+    return NULL;
+}
+
+static bool group_const_input_spreads(ray_graph_t* g, ray_op_t* in, int64_t nrows) {
+    ray_op_ext_t* x = find_ext(g, in->id);
+    ray_t* lit = x ? x->literal : NULL;
+    if (!lit || RAY_IS_ERR(lit)) return false;
+    return ray_is_atom(lit) || (ray_is_vec(lit) && (lit->len == 1 || lit->len == nrows));
+}
+
 /* v2 bridge for expression agg inputs — see the call site in
  * exec_group_run.  Returns the v2 result (or an error), or NULL when the
  * shape is ineligible and the caller should continue on the legacy path. */
@@ -11269,8 +11295,9 @@ static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
      * every index loop below is uint32_t. */
     if (!ext || ext->n_keys < 1 || ext->n_aggs < 1) return NULL;
 
-    /* At least one agg input must be a compiled-expression node; scans,
-     * COUNT and binary/holistic second inputs pass through untouched. */
+    /* At least one agg input must be a compiled-expression node or a
+     * constant with rows to give (group_const_input_rows); scans, COUNT
+     * and binary/holistic second inputs pass through untouched. */
     int64_t nrows = ray_table_nrows(tbl);
     if (nrows <= 0) return NULL;
     uint32_t na = ext->n_aggs, nkk = ext->n_keys;
@@ -11279,7 +11306,8 @@ static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         if (ext->agg_ops[a] == OP_COUNT) continue;
         ray_op_t* in = op_node(g, ext->agg_ins[a]);
         if (!in) return NULL;
-        if (in->opcode == OP_SCAN || in->opcode == OP_CONST) continue;
+        if (in->opcode == OP_SCAN) continue;
+        if (in->opcode == OP_CONST && !group_const_input_spreads(g, in, nrows)) continue;
         any_expr = true;
     }
     if (!any_expr) return NULL;
@@ -11295,14 +11323,17 @@ static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     for (uint32_t a = 0; a < na && ok; a++) {
         if (ext->agg_ops[a] == OP_COUNT) continue;
         ray_op_t* in = op_node(g, ext->agg_ins[a]);
-        if (in->opcode == OP_SCAN || in->opcode == OP_CONST) continue;
+        if (in->opcode == OP_SCAN) continue;
+        if (in->opcode == OP_CONST && !group_const_input_spreads(g, in, nrows)) continue;
         snprintf(names[a], sizeof(names[a]), "_e%u", (unsigned)a);
         if (ray_table_get_col(tbl, ray_sym_intern(names[a], strlen(names[a])))) {
             ok = false; break;   /* user column shadows the synthetic name */
         }
         ray_expr_t ex;
         ray_t* v;
-        if (expr_compile(g, tbl, in, &ex)) {
+        if (in->opcode == OP_CONST) {
+            v = group_const_input_rows(g, in, nrows);
+        } else if (expr_compile(g, tbl, in, &ex)) {
             v = expr_eval_full(&ex, nrows);
         } else {
             /* An input the element-wise compiler declines — an `if`, say:
@@ -17008,7 +17039,9 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
             ray_graph_free(pg);
             ray_release(sub);
 
-            if (!bp[bi] || RAY_IS_ERR(bp[bi])) goto batch_fail;
+            /* batch_fail releases bp[], which leaves an error object be */
+            if (bp[bi] && RAY_IS_ERR(bp[bi])) { ray_error_free(bp[bi]); bp[bi] = NULL; }
+            if (!bp[bi]) goto batch_fail;
             /* A zero-survivor partition is built only as the schema
              * reference.  Grouped on partition keys alone, its sub-group
              * has no key and still answers one row (the aggregates of no
@@ -17021,7 +17054,8 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                 if (zero) ray_release(zero);
                 ray_release(bp[bi]);
                 bp[bi] = empty;
-                if (!bp[bi] || RAY_IS_ERR(bp[bi])) goto batch_fail;
+                if (bp[bi] && RAY_IS_ERR(bp[bi])) { ray_error_free(bp[bi]); bp[bi] = NULL; }
+                if (!bp[bi]) goto batch_fail;
             }
             if (ref_bi < 0) ref_bi = bi;   /* first built partial in this batch */
 

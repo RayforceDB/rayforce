@@ -103,10 +103,11 @@ its argument resolves first, so `(enlist 'price)` enlists the `price` column.
 
 ### Whole-column projections
 
-A projection may be a whole-column verb — `distinct`, `asc`, `desc`, or
-`reverse` — applied to a column. Unlike a per-row computed expression, these
-consume the entire column and return a vector, so the result's row count can
-differ from the source table (`distinct` in particular collapses duplicates):
+A projection may be a whole-column verb — `distinct`, `asc`, `desc`,
+`reverse`, or `where` — applied to a column. Unlike a per-row computed
+expression, these consume the entire column and return a vector, so the
+result's row count can differ from the source table (`distinct` in particular
+collapses duplicates, `where` keeps the positions of the true rows):
 
 ```lisp
 (select {price: (distinct price) from: t})
@@ -119,10 +120,19 @@ differ from the source table (`distinct` in particular collapses duplicates):
 (select {price: (asc price) from: t})   ; ascending column
 ```
 
-A `where:` clause is applied first, so the verb only sees the surviving rows:
+A `where:` clause is applied first, so the verb only sees the surviving rows.
+The positions `where` returns count those rows, not the table's:
 
 ```lisp
 (select {price: (distinct price) from: t where: (> volume 400)})
+
+(set m (table [k v] (list [1 1 2 2 2] [10 20 30 40 50])))
+(select {w: (where (> v 20)) from: m where: (> k 1)})
+; w
+; -
+; 0
+; 1
+; 2
 ```
 
 Because a whole-column verb changes the row count, it cannot be mixed with a
@@ -193,6 +203,54 @@ Expressions over aggregates work with any number of keys and with binary aggrega
 (select {from: trades spread: (- (max price) (min price)) by: {sym: sym venue: venue}})
 (select {from: trades r2: (pow (pearson_corr price size) 2) by: {sym: sym}})
 ```
+
+### Aggregate sources
+
+What an aggregate reads depends on what its argument is. A column, or an
+expression over columns, gives one value per row, and each group aggregates
+its own rows. An argument that reads no column follows one of two rules,
+depending on whether it is written as a value or computed.
+
+A vector written as a value — a literal, or a global holding one — stands for
+a column:
+
+- a vector as long as the table is sliced per group, and filtered by
+  `where:` like any column (the table's rows before the filter);
+- a one-element vector, like an atom, is spread over the rows: `(sum [7])`
+  and `(sum 7)` over ten rows are `70`;
+- a vector of any other length raises a `length` error;
+- `count` keeps a vector's own length: `(count [1 2 3])` is `3` in every
+  group.
+
+```lisp
+(set t (table [g x] (list [a a b b b c c c c c] (til 10))))
+(set W (* 10 (til 10)))
+(select {s: (sum W) by: g from: t})
+; g s
+; - ---
+; a  10
+; b  90
+; c 350
+(select {s: (sum W) by: g from: t where: (> x 2)})   ; s [70 350]
+(select {s: (sum [1 2 3]) by: g from: t})            ; error: length
+```
+
+A computed argument that reads no column — `(til 5)`, `(at [1 2 3] 0)`, a
+call of a function on constants — is evaluated once for the whole query, not
+once per row or per group, so a side effect in it runs once. A collection it
+returns is aggregated as it stands, as outside a select, and gives the same
+value in every group; a scalar stands for every row, as `1` does in
+`(sum 1)`, which counts the rows:
+
+```lisp
+(select {s: (sum (til 5)) by: g from: t})        ; s [10 10 10]
+(select {s: (count (til 5)) by: g from: t})      ; s [5 5 5]
+(select {s: (sum (at [1 2 3] 0)) by: g from: t}) ; s [2 3 5], the group sizes
+```
+
+The two rules answer differently for equal values: over the ten rows above,
+`(sum (til 3))` is `3` while `(sum [0 1 2])` raises `length`, and
+`(sum (take [7 8] 1))` is `7` while `(sum [7])` is `70`.
 
 ### Filter + Group-by
 

@@ -49,6 +49,32 @@
 (at (select {c: (count i) by: {m: (- date 1) n: name} from: P where: (> i 3)}) 'm) -- [2023.12.31 2024.01.01]
 (at (select {x: (+ date 1) from: P}) 'x) -- (at (select {x: (+ date 1) from: F}) 'x)
 (at (select {m: (max (+ date 1)) from: P}) 'm) -- [2024.01.03]
+;; A where: the planner declines is evaluated over the columns it reads,
+;; flattened: one read through a quoted symbol (the column inside a query)
+;; too, and every column when it calls a helper the planner does not
+;; inline, whose reads it does not show.  Both raised `cannot add ? and i64`.
+(at (select {i: i from: P where: (in (+ 'date 0) [2024.01.02])}) 'i) -- [1 2 3 4]
+(at (select {i: i from: P where: (in (+ 'date 0) [2024.01.02])}) 'i) -- (at (select {i: i from: F where: (in (+ 'date 0) [2024.01.02])}) 'i)
+(set gdx (fn [x] (set gdq 1) (+ date x)))
+(at (select {i: i from: P where: (== (gdx 1) 2024.01.03)}) 'i) -- [1 2 3 4]
+(at (select {i: i from: P where: (== (gdx 1) 2024.01.03)}) 'i) -- (at (select {i: i from: F where: (== (gdx 1) 2024.01.03)}) 'i)
+;; The key's value type guards unary ops, aggregate admission and `and`
+;; too.  The wrapper holds one value per partition, which `neg`/`abs` read
+;; as the rows (dates came back), and `sum` folded the day counts.  A unary
+;; op on the key is evaluated, as the builtin over the key's values; `sum`
+;; rejects a DATE key as it rejects a flat DATE column.
+(select {d: (neg date) from: P}) !- type
+(select {d: (abs date) from: P}) !- type
+(neg (at F 'date)) !- type
+(select {c: (sum date) from: P}) !- type
+(select {c: (sum date) from: F}) !- type
+(select {c: (sum date) by: i from: P}) !- type
+(select {c: (sum date) by: i from: F}) !- type
+(select {c: (+ (sum date) 0) from: P}) !- type
+(select {c: (and date (> i 0)) from: P}) !- type
+(select {c: (and date (> i 0)) from: F}) !- type
+(at (select {d: (min date) from: P}) 'd) -- (at (select {d: (min date) from: F}) 'd)
+;; (at (select {d: (neg date) from: F}) 'd) !- type   ;; xfail BUG: over a flat DATE column the fused DAG negates the day counts ([-8766 ...], abs likewise) where the builtin and the parted key raise type
 (.sys.exec "rm -rf /tmp/rfl_evalfb_parted")
 
 ;; An integer key keeps its I64 lane; a partition with no rows takes part.
@@ -61,6 +87,10 @@
 (at (select {i: i from: PI where: (in (* part 2) [2])}) 'i) -- [1 2]
 (at (select {c: (count i) by: {m: (+ part 1)} from: PI}) 'm) -- [2 4]
 (type (at (select {c: (count i) by: {m: (+ part 1)} from: PI}) 'm)) -- 'I64
+(set FI (select {from: PI where: (> i 0)}))
+(at (select {d: (neg part) from: PI}) 'd) -- [-1 -1 -3 -3 -3]
+(at (select {d: (neg part) from: PI}) 'd) -- (at (select {d: (neg part) from: FI}) 'd)
+(at (select {d: (abs (neg part)) from: PI}) 'd) -- (at (select {d: (abs (neg part)) from: FI}) 'd)
 (.sys.exec "rm -rf /tmp/rfl_evalfb_parted_int")
 
 ;; A SYM key has no arithmetic, as over a flat SYM column.
@@ -71,4 +101,8 @@
 (select {x: (+ part 1) from: PS}) !- type
 (select {i: i from: PS where: (in (+ part 1) [2])}) !- type
 (select {c: (count i) by: {m: (+ part 1)} from: PS}) !- type
+;; nor a sum: it summed the interned ids
+(select {c: (sum part) from: PS}) !- type
+(select {c: (sum part) from: (select {from: PS where: (> i 0)})}) !- type
+(select {c: (sum part) by: i from: PS}) !- type
 (.sys.exec "rm -rf /tmp/rfl_evalfb_parted_sym")

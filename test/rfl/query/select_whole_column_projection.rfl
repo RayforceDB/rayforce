@@ -233,4 +233,63 @@ ticks -- 1
 (set ticks 0)
 (at (select {s: (sum (do (set ticks (+ ticks 1)) (til 3))) from: TCF}) 's) -- [3]
 ticks -- 1
+;; A quoted symbol that names a column is the column inside a query (the
+;; literal-column rule): a source holding one reads a column, so it is
+;; sliced per group like the bare name.  It was classed as reading no
+;; column and evaluated once over the whole table ([1300 1300], [3 3]), or
+;; over a parted table met the segmented column whole (`at: index must be
+;; an integer`).
+(set MQ (table [k v s] (list [1 1 2 2 2] [10 20 30 40 50] ['a 'b 'a 'c 'a])))
+(at (select {c: (sum (at [100 200 300] 'k)) by: k from: MQ}) 'c) -- [400 900]
+(at (select {c: (sum (at [100 200 300] 'k)) by: k from: MQ}) 'c) -- (at (select {c: (sum (at [100 200 300] k)) by: k from: MQ}) 'c)
+(at (select {c: (count (distinct 's)) by: k from: MQ}) 'c) -- [2 2]
+(at (select {c: (sum (at [0 10 20 30 40 50 60] 'k)) from: TPW by: s asc: s}) 'c) -- (at (select {c: (sum (at [0 10 20 30 40 50 60] 'k)) from: TFW by: s asc: s}) 'c)
+(at (select {c: (sum (at [0 10 20 30 40 50 60] 'k)) from: TPW by: s asc: s}) 'c) -- [40 60 30 20 60]
+;; A symbol vector inside a source is a literal, whatever names it holds:
+;; `['v 'k]` counts 2 in each group as `['p 'q]` does (it was read as the
+;; columns v and k, and counted the group's rows).
+(at (select {c: (count (at (list ['v 'k]) 0)) by: k from: MQ}) 'c) -- [2 2]
+(at (select {c: (count (at (list ['v 'k]) 0)) by: k from: MQ}) 'c) -- (at (select {c: (count (at (list ['p 'q]) 0)) by: k from: MQ}) 'c)
+(at (select {c: (first (at (list ['v 'k]) 0)) from: MQ}) 'c) -- ['v]
+;; A column-free source is evaluated once for the whole select: not once to
+;; plan the output and again for each group, nor again when the select is
+;; planned anew around another rewritten output.  A collection-valued
+;; aggregate (`first` of a list) keeps the value it was planned with.  Both
+;; shapes counted 4 and 3 evaluations.
+(set ticks 0)
+(at (select {c: (first (do (set ticks (+ ticks 1)) (list [1 2] [3]))) d: (sum (til 3)) by: k from: MQ}) 'c) -- (list [1 2] [1 2])
+ticks -- 1
+(set ticks 0)
+(at (select {c: (first (do (set ticks (+ ticks 1)) (list [1 2] [3]))) by: k from: MQ}) 'c) -- (list [1 2] [1 2])
+ticks -- 1
+(set ticks 0)
+(at (select {c: (first (do (set ticks (+ ticks 1)) (list [1 2] [3]))) d: (sum (til 3)) by: k from: MQ}) 'd) -- [3 3]
+ticks -- 1
+;; The scalar it gives stands for every row, `(sum 1)` included, and the
+;; groups come out in the order every other aggregate gives them (the
+;; first rows where: keeps); they came in the table's order.
+(at (select {c: (sum (at [1 2 3] 0)) by: s from: MQ where: (> v 10)}) 's) -- (at (select {c: (count v) by: s from: MQ where: (> v 10)}) 's)
+(at (select {c: (sum (at [1 2 3] 0)) by: s from: MQ where: (> v 10)}) 's) -- (at (select {c: (sum v) by: s from: MQ where: (> v 10)}) 's)
+(at (select {c: (sum 1) by: s from: MQ where: (> v 10)}) 's) -- (at (select {c: (count v) by: s from: MQ where: (> v 10)}) 's)
+(at (select {c: (sum (at [1 2 3] 0)) n: (count v) by: s from: MQ where: (> v 10)}) 'c) -- (at (select {c: (sum (at [1 2 3] 0)) n: (count v) by: s from: MQ where: (> v 10)}) 'n)
+;; A vector constant of the table's length stays aligned with its rows when
+;; a selective where: compacts the group's input (an expression input
+;; beside it): it was read from its first cell, raising `length` (dev read
+;; V2[0..8] silently).  The projection and a computed input alike.
+(set T3 (table [a k] (list (til 1000) (% (til 1000) 3))))
+(set V2 (* 2 (til 1000)))
+(at (select {s: (sum V2) by: k from: T3 where: (> a 990) asc: k}) 's) -- [5976 5964 5970]
+(at (select {s: (sum V2) m: (sum (+ a 1)) by: k from: T3 where: (> a 990) asc: k}) 's) -- [5976 5964 5970]
+(at (select {s: (sum (+ a V2)) by: k from: T3 where: (> a 990) asc: k}) 's) -- [8964 8946 8955]
+(at (select {s: (+ a V2) m: (* a 2) from: T3 where: (> a 990)}) 's) -- [2973 2976 2979 2982 2985 2988 2991 2994 2997]
+(select {s: (sum [1 2]) m: (sum (+ a 1)) by: k from: T3 where: (> a 990)}) !- length
+(select {s: (sum [1 2]) m: (sum (+ a 1)) by: k from: T3 where: (> a 99999)}) !- length
+;; Over an empty table nothing of the vector is read: the sum of no
+;; values, as `(sum (til 3))` over it (an empty table grouped, none keyless).
+(set T7 (table [a k] (list (til 10) (% (til 10) 3))))
+(key (select {f: (sum [1 2]) by: k from: (take T7 0)})) -- [k f]
+(count (select {f: (sum [1 2]) by: k from: (take T7 0)})) -- 0
+(key (select {f: (sum [1 2]) from: (take T7 0)})) -- [f]
+(count (select {f: (sum [1 2]) from: (take T7 0)})) -- 0
+(select {f: (sum [1 2]) by: k from: T7 where: (> a 100)}) !- length
 (.sys.exec "rm -rf /tmp/rfl_scalar_asc_parted") -- 0

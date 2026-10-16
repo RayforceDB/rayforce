@@ -1746,7 +1746,11 @@ static ray_t* exec_pushed_group_filter(ray_graph_t* g, ray_op_t* filter_op) {
  * scan or literal.  Only scalar expression nodes (OP_SCAN/OP_CONST and the
  * element-wise range OP_ROUND..OP_IDIV) are admitted in the walk; any other
  * opcode, an oversized graph, or overflow returns -1 — callers must treat
- * that as "unknown" and skip the optimisation. */
+ * that as "unknown" and skip the optimisation.  So does a constant holding
+ * several values: a vector of the table's length stands for a column, row
+ * aligned with the table, and the compacted survivors would read it from
+ * its first cell on (one of another length is the group's length error,
+ * which measures it against the table). */
 /* Opcodes handled by the elementwise case of exec_node_inner — must
  * match its case labels (ROUND sits at 9, outside NEG..CAST; IDIV at
  * 49, outside ADD..MAX2; extra unary math starts at 137). */
@@ -1794,7 +1798,12 @@ static int collect_scan_syms(ray_graph_t* g, const uint32_t* roots, int nroots,
             }
             continue;
         }
-        if (node->opcode == OP_CONST) continue;
+        if (node->opcode == OP_CONST) {
+            ray_op_ext_t* cx = find_ext(g, nid);
+            ray_t* lit = cx ? cx->literal : NULL;
+            if (lit && !ray_is_atom(lit) && ray_len(lit) != 1) return -1;
+            continue;
+        }
         /* Admit only scalar element-wise expression nodes. */
         if (!op_is_elementwise(node->opcode)) return -1;
 

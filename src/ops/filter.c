@@ -830,6 +830,8 @@ ray_t* exec_filter_head(ray_t* input, ray_t* pred, int64_t limit) {
             for (int64_t j = 0; j < found; j++)
                 memcpy(dst + j * esz, src + match_idx[j] * esz, esz);
             col_propagate_str_pool(new_col, col);
+            /* the copy carried the null cells' sentinels, not their marks */
+            col_propagate_nulls_gather(new_col, col, match_idx, found);
         }
         /* SYM gather copied cell ids verbatim — resolve over the source
          * column's domain (flat → col itself; parted → first SYM seg). */
