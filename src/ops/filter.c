@@ -820,31 +820,18 @@ ray_t* exec_filter_head(ray_t* input, ray_t* pred, int64_t limit) {
                 new_col = parted_gather_str_rows_c(segs, n_segs, match_idx, found,
                                                    cnt, ncnt);
             } else {
-                /* Non-STR parted gather; a NULL segment spans its partition's
-                 * rows and yields the type's null */
-                int64_t seg_start = 0;
-                int64_t cur_seg = 0;
-                int64_t cur_seg_end = n_segs > 0 ? parted_seg_rows(segs, 0, cnt, ncnt) : 0;
-                for (int64_t j = 0; j < found; j++) {
-                    int64_t r = match_idx[j];
-                    while (cur_seg < n_segs - 1 && r >= cur_seg_end) {
-                        seg_start = cur_seg_end;
-                        cur_seg++;
-                        cur_seg_end += parted_seg_rows(segs, cur_seg, cnt, ncnt);
-                    }
-                    if (!segs[cur_seg]) {
-                        parted_fill_nulls(new_col, j, 1);
-                        continue;
-                    }
-                    parted_copy_cells(dst, out_type, out_attrs, j,
-                                      segs[cur_seg], r - seg_start, 1);
-                }
+                /* Non-STR parted gather: the shared helper spans a NULL
+                 * segment over its partition's rows and carries each
+                 * present segment's null cells over. */
+                parted_gather_col(col, match_idx, found, new_col, cnt, ncnt);
             }
         } else {
             char* src = (char*)ray_data(col);
             for (int64_t j = 0; j < found; j++)
                 memcpy(dst + j * esz, src + match_idx[j] * esz, esz);
             col_propagate_str_pool(new_col, col);
+            /* the copy carried the null cells' sentinels, not their marks */
+            col_propagate_nulls_gather(new_col, col, match_idx, found);
         }
         /* SYM gather copied cell ids verbatim — resolve over the source
          * column's domain (flat → col itself; parted → first SYM seg). */
