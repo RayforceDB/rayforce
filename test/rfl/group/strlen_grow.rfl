@@ -179,3 +179,25 @@
 (at (select {from: (select {c: (count s) a: (avg (strlen s)) from: Tl by: g}) where: (> c 1)}) 'a) -- [4.0 4.0]
 (set Yl (table [g s] (list (at Tl 'g) (as 'SYM (at Tl 's)))))
 (at (select {from: (select {c: (count s) a: (avg (strlen s)) from: Yl by: g}) where: (> c 1)}) 'a) -- [4.0 4.0]
+;; SUM-only strlen (no null tracking: "" adds 0) on the keyless and the
+;; direct-array routes, STR and SYM
+(at (select {b: (sum (strlen s)) from: Yn}) 'b) -- [18]
+(at (select {from: (select {c: (count s) b: (sum (strlen s)) from: Tn by: g}) where: (> c 1)}) 'b) -- [6 12 0]
+(at (select {from: (select {c: (count s) b: (sum (strlen s)) from: Yn by: g}) where: (> c 1)}) 'b) -- [6 12 0]
+;; AVG(strlen) beside an aggregate over a nullable column (per-agg non-null
+;; counts present): v is null on rows 1 and 4
+(set Tv (table [g s v] (list (at Tn 'g) (at Tn 's) [1 0N 3 4 0N 6 7 8 9 10])))
+(set Rv (select {from: (select {c: (count s) a: (avg (strlen s)) m: (max v) from: Tv by: g}) where: (> c 1)}))
+(at Rv 'a) -- [3.0 4.0 0Nf]
+(at Rv 'm) -- [4 8 10]
+(set Rv2 (select {from: (select {c: (count s) a: (avg (strlen s)) x: (avg v) from: Tv by: g}) where: (> c 1)}))
+(at Rv2 'a) -- [3.0 4.0 0Nf]
+(at Rv2 'x) -- [2.6666666666666665 7.0 9.5]
+;; per-worker merges: 2000 slots (parallel slot merge), and FIRST beside
+;; (row-ordered merge); every group holds both "abcd" and ""
+(set Tm (table [g s] (list (% (til NL) 2000) (take (list "abcd" "abcd" "") NL))))
+(set Rm (select {from: (select {c: (count s) a: (avg (strlen s)) from: Tm by: g}) where: (> c 1)}))
+(count Rm) -- 2000
+(distinct (at Rm 'a)) -- [4.0]
+(at (select {from: (select {c: (count s) a: (avg (strlen s)) f: (first g) from: Tl by: g}) where: (> c 1)}) 'a) -- [4.0 4.0]
+(at (select {from: (select {c: (count s) a: (avg (strlen s)) f: (first g) from: Yl by: g}) where: (> c 1)}) 'a) -- [4.0 4.0]
