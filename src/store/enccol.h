@@ -81,6 +81,11 @@ typedef struct ray_enccol_s {
     ray_enc_once_t  fsst_once;      /* FSST_TABLE validation, once */
     ray_t*          sdict;          /* validated STR_DICT: a RAY_U8 blob holding a ray_enc_sdict_t */
     ray_t*          fsst;           /* validated FSST_TABLE: a RAY_U8 blob holding a ray_fsst_table_t */
+    /* persisted DICT (P6b): the entry tier and the code tier, once each */
+    ray_enc_once_t  idict_once;
+    ray_t*          idict;          /* RAY_U8 blob: a ray_enc_idict_t, then its ray_enc_sdict_t */
+    ray_enc_once_t  icodes_once;
+    ray_t*          icodes;         /* RAY_I32: the validated codes */
     /* parted (Task 12) */
     ray_t*          wrapper;        /* RAY_PARTED_BASE + type; segments are RAY_ENCCOL or plain */
     /* materialization (Task 8) */
@@ -478,10 +483,8 @@ bool   ray_enccol_dir_vec_ok(const ray_enccol_t* e, int64_t c, int j);
 ray_t* ray_enccol_check_dir_all(ray_t* encv);
 
 void ray_enccol_meta(ray_t* encv, ray_col_meta_t* m);
-/* Could materialization attach an index: a recorded kind, UNIQUE, or for
- * STR a runtime DICT (spec "STR dictionary index"), possible only with a
- * STR_DICT entry, code bounds on every chunk (every vector STR_DICT) and
- * RAY_DICT_MIN_ROWS to INT32_MAX rows?  Known without decoding. */
+/* Could materialization attach an index: a recorded kind or UNIQUE
+ * (single-file)?  Known without decoding. */
 bool ray_enccol_may_have_index(ray_t* encv);
 
 /* The column's validated STR dictionary (*out NULL when it has none, or the
@@ -490,6 +493,28 @@ ray_t* ray_enccol_strdict(ray_enccol_t* e, const ray_enc_sdict_t** out);
 /* Code of `s` in the column's dictionary: *code >= 0, -1 absent, -2 no
  * dictionary.  NULL, or an owned error (validation; *code untouched). */
 ray_t* ray_enccol_strdict_code(ray_enccol_t* e, const char* s, size_t len, int64_t* code);
+
+/* A validated persisted DICT (spec "STR dictionary index"): the entry
+ * tier passed.  Pointers into the immutable mapping; ent is a STR_DICT-form
+ * view of the entries (offs / bytes in the mapping, slots in the blob). */
+typedef struct {
+    int64_t                len, n_distinct;
+    const int32_t*         codes;       /* len: read through ray_enccol_idict_codes */
+    const int32_t*         first_occ;   /* n_distinct */
+    const ray_enc_sdict_t* ent;         /* ent->n == n_distinct */
+} ray_enc_idict_t;
+/* The column's persisted DICT past the entry tier (*out NULL: the column
+ * records none, or is parted / synthetic), or an owned error (once). */
+ray_t* ray_enccol_idict(ray_enccol_t* e, const ray_enc_idict_t** out);
+/* Code of s: *code >= 0, -1 absent, -2 no persisted DICT. */
+ray_t* ray_enccol_idict_code(ray_enccol_t* e, const char* s, size_t len, int64_t* code);
+/* Codes of rows [start, start + n) in place (vector scope): every code
+ * returned is checked below n_distinct; no decode, no decoded bytes.  The
+ * column must record a DICT (ray_enccol_idict gave one). */
+ray_t* ray_enccol_idict_codes(ray_enccol_t* e, int64_t start, int64_t n, const int32_t** out);
+/* The code tier: the whole codes as a validated heap RAY_I32 vector,
+ * made once and kept for the object's lifetime (borrowed: retain to keep). */
+ray_t* ray_enccol_idict_codes_vec(ray_enccol_t* e, ray_t** out);
 /* Test hook: how many STR pools materialization has allocated so far. */
 uint64_t ray_enccol_test_str_pool_allocs(void);
 /* A fresh SYM vector `out` (runtime domain) takes the domain the column's ids

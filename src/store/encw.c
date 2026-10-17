@@ -381,10 +381,10 @@ static ray_err_t str_choose_plain(const ray_str_t* s, const char* pool, int n, c
  * minimum gain at chunk level) or STR_DICT is forced; its entries are then
  * kept, otherwise removed.  All-null vectors are CONST either way (8 bytes
  * on both sides) and add no entry, so every entry occurs in a STR_DICT
- * vector.  Skipping them is safe only because such a column gets no
- * runtime DICT (D5 / D9): its chunk holding an all-null CONST vector has
- * no directory bounds, so ray_enccol_may_have_index never admits it, and
- * no consumer needs "" coded where it was never written.  A chunk with no
+ * vector.  Skipping them is safe: a chunk holding an all-null CONST
+ * vector has no directory bounds; the column's DICT, when the save builds
+ * one, is the persisted one (P6b), and no consumer needs "" coded in the
+ * STR_DICT entry where it was never written.  A chunk with no
  * non-null row is never a dictionary chunk (the null image relies on it).
  * A chunk whose entries would pass the cap abandons the accumulator. */
 static ray_err_t str_plan_chunk(ray_encw_t* w, const void* data, const char* pool, int64_t n, bool* dict_chunk) {

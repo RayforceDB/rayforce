@@ -60,6 +60,8 @@ static void enccol_free(ray_enccol_t* e) {
     if (e->dict)    ray_release(e->dict);
     if (e->sdict)   ray_release(e->sdict);
     if (e->fsst)    ray_release(e->fsst);
+    if (e->idict)   ray_release(e->idict);
+    if (e->icodes)  ray_release(e->icodes);
     if (e->wrapper) ray_release(e->wrapper);
     if (e->dom && e->dom_owned) ray_sym_domain_release(e->dom);
     if (e->map)     ray_file_map_release(e->map);
@@ -332,6 +334,8 @@ ray_t* ray_enccol_open(void* mapped, size_t size, const char* path,
     ray_enc_once_init(&e->dict_once);
     ray_enc_once_init(&e->sdict_once);
     ray_enc_once_init(&e->fsst_once);
+    ray_enc_once_init(&e->idict_once);
+    ray_enc_once_init(&e->icodes_once);
     uint32_t saved = 0;
     /* Descriptors and packed bodies are read in place as 8-byte words: the
      * format keeps every offset 8-aligned, and a mapping starts on a page. */
@@ -680,6 +684,59 @@ bool ray_enc_fsst_pool_add(uint64_t* total, uint64_t x, uint64_t cap) {
     return true;
 }
 
+/* The entry table of a STR dictionary (the STR_DICT side entry, or the
+ * persisted DICT's entries, P6b): over n entries at offs / bytes (already
+ * bounded by their caller's validation), a zeroed RAY_U8 blob of head +
+ * sizeof(ray_enc_sdict_t) + cap * 4 bytes whose ray_enc_sdict_t sits at
+ * offset head (8-aligned), filled: the slot table, null_code, pooled.
+ * Distinctness is proven here, before any lookup trusts a code.  NULL with
+ * *blob set; NULL with *blob NULL and *why set (a rule failed: the caller
+ * reports corrupt, prefixing its entry's name); or an owned oom error. */
+static ray_t* enc_sdict_build(const ray_enccol_t* e, const char* what, const uint64_t* offs,
+                              const uint8_t* bytes, uint64_t n, size_t head, ray_t** blob,
+                              const char** why) {
+    *blob = NULL; *why = NULL;
+    uint64_t cap = 16; while (cap < 2ull * n) cap <<= 1;
+    const int64_t blen = (int64_t)(head + sizeof(ray_enc_sdict_t) + cap * sizeof(uint32_t));
+    ray_t* b = ray_vec_new(RAY_U8, blen);
+    if (!b || RAY_IS_ERR(b)) {
+        if (b) ray_error_free(b);
+        return ray_error("oom", "column %s: %s", e->path, what);
+    }
+    b->len = blen;
+    memset(ray_data(b), 0, (size_t)blen);
+    ray_enc_sdict_t* d = (ray_enc_sdict_t*)((uint8_t*)ray_data(b) + head);
+    d->n = (uint32_t)n; d->null_code = UINT32_MAX; d->offs = offs; d->bytes = bytes; d->mask = cap - 1;
+    for (uint64_t k = 0; k < n; k++) {
+        const uint64_t len = offs[k + 1] - offs[k];
+        if (len == 0) d->null_code = (uint32_t)k;    /* at most one: entries are distinct */
+        if (len > RAY_STR_INLINE_MAX) d->pooled += len;
+        uint64_t h = ray_hash_bytes(bytes + offs[k], (size_t)len) & d->mask;
+        while (d->slot[h]) {
+            const uint32_t q = d->slot[h] - 1;
+            if (offs[q + 1] - offs[q] == len && memcmp(bytes + offs[q], bytes + offs[k], (size_t)len) == 0) {
+                ray_release(b); *why = "entries not distinct";
+                return NULL;
+            }
+            h = (h + 1) & d->mask;
+        }
+        d->slot[h] = (uint32_t)k + 1;
+    }
+    *blob = b;
+    return NULL;
+}
+
+/* The code of s in a validated entry table: >= 0, or -1 absent. */
+static int64_t enc_sdict_find(const ray_enc_sdict_t* d, const char* s, size_t len) {
+    uint64_t h = ray_hash_bytes(s, len) & d->mask;
+    while (d->slot[h]) {
+        const uint32_t q = d->slot[h] - 1;
+        if (d->offs[q + 1] - d->offs[q] == len && memcmp(d->bytes + d->offs[q], s, len) == 0) return q;
+        h = (h + 1) & d->mask;
+    }
+    return -1;
+}
+
 static ray_t* enc_sdict_validate(void* ctx, ray_enc_snap_t* fail) {
     ray_enccol_t* e = ctx;
     const char* why;
@@ -695,32 +752,10 @@ static ray_t* enc_sdict_validate(void* ctx, ray_enc_snap_t* fail) {
     if (!ray_enc_sdict_offsets_ok(offs, n, area)) { why = "STR_DICT offsets"; goto bad; }
     const uint8_t* bytes = p + 8 + 8ull * (n + 1);
     if (!all_zero(bytes + offs[n], (size_t)(area - offs[n]))) { why = "STR_DICT padding"; goto bad; }
-    uint64_t cap = 16; while (cap < 2ull * n) cap <<= 1;
-    const int64_t blen = (int64_t)(sizeof(ray_enc_sdict_t) + cap * sizeof(uint32_t));
-    ray_t* blob = ray_vec_new(RAY_U8, blen);
-    if (!blob || RAY_IS_ERR(blob)) {
-        if (blob) ray_error_free(blob);
-        ray_enc_snap_set(fail, "oom", "column %s: STR_DICT", e->path);
-        return NULL;
-    }
-    blob->len = blen;
-    ray_enc_sdict_t* d = (ray_enc_sdict_t*)ray_data(blob);
-    memset(d, 0, (size_t)blen);
-    d->n = n; d->null_code = UINT32_MAX; d->offs = offs; d->bytes = bytes; d->mask = cap - 1;
-    for (uint32_t k = 0; k < n; k++) {
-        const uint64_t len = offs[k + 1] - offs[k];
-        if (len == 0) d->null_code = k;              /* at most one: entries are distinct */
-        if (len > RAY_STR_INLINE_MAX) d->pooled += len;
-        uint64_t h = ray_hash_bytes(bytes + offs[k], (size_t)len) & d->mask;
-        while (d->slot[h]) {
-            const uint32_t q = d->slot[h] - 1;
-            if (offs[q + 1] - offs[q] == len && memcmp(bytes + offs[q], bytes + offs[k], (size_t)len) == 0) {
-                ray_release(blob); why = "STR_DICT entries not distinct"; goto bad;
-            }
-            h = (h + 1) & d->mask;
-        }
-        d->slot[h] = k + 1;
-    }
+    ray_t* blob = NULL;
+    ray_t* err = enc_sdict_build(e, "STR_DICT", offs, bytes, n, 0, &blob, &why);
+    if (err) { ray_enc_snap_take(fail, err); return NULL; }
+    if (!blob) { ray_enc_snap_set(fail, "corrupt", "column %s: STR_DICT %s", e->path, why); return NULL; }
     return blob;
 bad:
     ray_enc_snap_set(fail, "corrupt", "column %s: %s", e->path, why);
@@ -749,13 +784,125 @@ ray_t* ray_enccol_strdict_code(ray_enccol_t* e, const char* s, size_t len, int64
     ray_t* err = ray_enccol_strdict(e, &d);
     if (err) return err;
     if (!d) { *code = -2; return NULL; }
-    *code = -1;
-    uint64_t h = ray_hash_bytes(s, len) & d->mask;
-    while (d->slot[h]) {
-        const uint32_t q = d->slot[h] - 1;
-        if (d->offs[q + 1] - d->offs[q] == len && memcmp(d->bytes + d->offs[q], s, len) == 0) { *code = q; break; }
-        h = (h + 1) & d->mask;
+    *code = enc_sdict_find(d, s, len);
+    return NULL;
+}
+
+/* ---- the persisted DICT (P6b, spec "STR dictionary index") ----
+ * Two once-states.  The entry tier (ray_enc_dict_validate, then the entry
+ * table, which proves the entries distinct) precedes every use; the code
+ * tier (ray_enc_dict_codes_check over the view the entry tier produced,
+ * writing the heap copy) precedes every whole-codes use.  A vector-scope
+ * read checks only code < n_distinct, on every code it returns. */
+typedef struct {
+    ray_enc_idict_t     pub;
+    ray_enc_dict_view_t view;    /* as ray_enc_dict_validate filled it: the code tier's input */
+} enc_idict_blob_t;
+_Static_assert(sizeof(enc_idict_blob_t) % 8 == 0, "the entry table follows 8-aligned");
+
+static ray_t* enc_idict_validate(void* ctx, ray_enc_snap_t* fail) {
+    ray_enccol_t* e = ctx;
+    if (enc_alloc_fails(e)) { ray_enc_snap_set(fail, "oom", "column %s: DICT", e->path); return NULL; }
+    ray_enc_dict_view_t v;
+    ray_t* err = ray_enc_dict_validate(e->base + e->hdr.index_off, e->hdr.end_off - e->hdr.index_off,
+                                       e->len, e->path, &v);
+    if (err) { ray_enc_snap_take(fail, err); return NULL; }
+    ray_t* blob = NULL; const char* why = NULL;
+    /* n_distinct is in 1 .. len <= INT32_MAX and bounded by the region (validated) */
+    err = enc_sdict_build(e, "DICT", v.offs, v.bytes, (uint64_t)v.n_distinct, sizeof(enc_idict_blob_t), &blob, &why);
+    if (err) { ray_enc_snap_take(fail, err); return NULL; }
+    if (!blob) { ray_enc_snap_set(fail, "corrupt", "column %s: DICT %s", e->path, why); return NULL; }
+    enc_idict_blob_t* d = (enc_idict_blob_t*)ray_data(blob);
+    d->pub.len = v.len; d->pub.n_distinct = v.n_distinct; d->pub.codes = v.codes; d->pub.first_occ = v.first_occ;
+    d->pub.ent = (const ray_enc_sdict_t*)((const uint8_t*)ray_data(blob) + sizeof(enc_idict_blob_t));
+    d->view = v;
+    return blob;
+}
+
+/* The entry tier once published, else NULL (never validates): read
+ * without the once-state's lock, as enc_sdict_ready. */
+static const enc_idict_blob_t* enc_idict_ready(const ray_enccol_t* e) {
+    if (atomic_load_explicit(&e->idict_once.state, memory_order_acquire) != RAY_ENC_ONCE_DONE) return NULL;
+    return (const enc_idict_blob_t*)ray_data(e->idict);
+}
+
+static ray_t* enc_idict_get(ray_enccol_t* e, const enc_idict_blob_t** out) {
+    *out = NULL;
+    if (!e || e->kind != RAY_ENCCOL_SINGLE || e->synthetic || e->hdr.index_kind != RAY_IDX_DICT) return NULL;
+    if ((*out = enc_idict_ready(e)) != NULL) return NULL;
+    ray_t* b = ray_enc_once_get(&e->idict_once, &e->idict, enc_idict_validate, e);
+    if (RAY_IS_ERR(b)) return b;
+    *out = (const enc_idict_blob_t*)ray_data(b);
+    return NULL;
+}
+
+ray_t* ray_enccol_idict(ray_enccol_t* e, const ray_enc_idict_t** out) {
+    const enc_idict_blob_t* b;
+    ray_t* err = enc_idict_get(e, &b);
+    *out = b ? &b->pub : NULL;
+    return err;
+}
+
+ray_t* ray_enccol_idict_code(ray_enccol_t* e, const char* s, size_t len, int64_t* code) {
+    const ray_enc_idict_t* d;
+    ray_t* err = ray_enccol_idict(e, &d);
+    if (err) return err;
+    if (!d) { *code = -2; return NULL; }
+    *code = enc_sdict_find(d->ent, s, len);
+    return NULL;
+}
+
+ray_t* ray_enccol_idict_codes(ray_enccol_t* e, int64_t start, int64_t n, const int32_t** out) {
+    *out = NULL;
+    const ray_enc_idict_t* d;
+    ray_t* err = ray_enccol_idict(e, &d);
+    if (err) return err;
+    if (!d) return ray_error("type", "column %s: no DICT index", e ? e->path : "?");
+    if (start < 0 || n < 0 || start > d->len || n > d->len - start)
+        return ray_error("range", "column %s: DICT codes [%lld, +%lld) outside %lld rows", e->path,
+                         (long long)start, (long long)n, (long long)d->len);
+    const int32_t* cd = d->codes + start;
+    const uint32_t nd = (uint32_t)d->n_distinct;
+    uint32_t bad = 0;
+    for (int64_t i = 0; i < n; i++) bad |= (uint32_t)((uint32_t)cd[i] >= nd);   /* branch-free */
+    if (bad) {
+        int64_t i = 0; while ((uint32_t)cd[i] < nd) i++;
+        return ray_error("corrupt", "column %s: DICT code %d at row %lld outside 0 .. %lld", e->path, cd[i],
+                         (long long)(start + i), (long long)d->n_distinct - 1);
     }
+    *out = cd;
+    return NULL;
+}
+
+/* The code tier: not a materialization (spec "Instrumentation", P6b), so
+ * neither e->once nor the counters move. */
+static ray_t* enc_icodes_build(void* ctx, ray_enc_snap_t* fail) {
+    ray_enccol_t* e = ctx;
+    const enc_idict_blob_t* d;
+    ray_t* err = enc_idict_get(e, &d);
+    if (err) { ray_enc_snap_take(fail, err); return NULL; }
+    if (!d) { ray_enc_snap_set(fail, "type", "column %s: no DICT index", e->path); return NULL; }
+    ray_t* v = enc_alloc_fails(e) ? NULL : ray_vec_new(RAY_I32, d->pub.len);
+    if (!v || RAY_IS_ERR(v)) {
+        if (v) ray_error_free(v);
+        ray_enc_snap_set(fail, "oom", "column %s: DICT codes", e->path);
+        return NULL;
+    }
+    v->len = d->pub.len;
+    err = ray_enc_dict_codes_check(&d->view, (int32_t*)ray_data(v), e->path);
+    if (err) { ray_release(v); ray_enc_snap_take(fail, err); return NULL; }
+    return v;
+}
+
+ray_t* ray_enccol_idict_codes_vec(ray_enccol_t* e, ray_t** out) {
+    *out = NULL;
+    if (!e) return ray_error("type", "column ?: no DICT index");
+    if (atomic_load_explicit(&e->icodes_once.state, memory_order_acquire) == RAY_ENC_ONCE_DONE) {
+        *out = e->icodes; return NULL;
+    }
+    ray_t* v = ray_enc_once_get(&e->icodes_once, &e->icodes, enc_icodes_build, e);
+    if (RAY_IS_ERR(v)) return v;
+    *out = v;
     return NULL;
 }
 
@@ -3233,90 +3380,9 @@ static ray_t* enc_synth_chunk_zone(ray_enccol_t* e) {
     return root;
 }
 
-/* Spec "STR dictionary index" (D9): a STR column can carry a runtime DICT
- * only when it has a STR_DICT entry, every chunk has code bounds (a STR
- * chunk has them exactly when every vector in it is STR_DICT, checked at
- * load against the directory) and its length is one a generation-0 DICT
- * has: RAY_DICT_MIN_ROWS to INT32_MAX rows (I32 codes).  Known without
- * decoding.  Single-file, not a stand-in. */
-static bool enc_str_dict_possible(const ray_enccol_t* e) {
-    if (e->type != RAY_STR || e->kind != RAY_ENCCOL_SINGLE || e->synthetic || !e->sdict_len ||
-        e->len < RAY_DICT_MIN_ROWS || e->len > INT32_MAX)
-        return false;
-    for (int64_t c = 0; c < e->n_chunks; c++) {
-        ray_enc_dirent_t de; dirent_at(e, c, &de);
-        if (de.flags & RAY_ENC_STAT_ABSENT) return false;
-    }
-    return true;
-}
-
-/* Recorded kind or UNIQUE first, then the runtime DICT's condition. */
+/* Recorded kind or UNIQUE (single file). */
 static bool enc_may_have_index(const ray_enccol_t* e) {
-    if (e->kind != RAY_ENCCOL_SINGLE) return false;
-    if (e->hdr.index_kind || (e->hdr.col_flags & RAY_ENC_FLAG_UNIQUE)) return true;
-    return enc_str_dict_possible(e);
-}
-
-/* Spec "STR dictionary index": the decoded codes are the index codes, read
- * from each vector's view (every legal code child, every decode check);
- * first occurrences follow from the codes in row order.  A sound file's
- * codes are first-occurrence over the whole column (every chunk is a
- * dictionary chunk), so code k first appears after codes 0 .. k-1 and the
- * DICT is ray_index_dict_compute's.  NULL with *root_out NULL when that
- * order breaks or an entry never occurs (a forged file: no DICT, never a
- * wrong one); a view declined on a STR_DICT vector of a validated file is
- * corrupt (its decode rejected the same rule), never "no DICT". */
-static ray_t* enc_runtime_dict(ray_enccol_t* e, ray_t** root_out) {
-    *root_out = NULL;
-    const ray_enc_sdict_t* sd;
-    ray_t* err = ray_enccol_strdict(e, &sd);
-    if (err || !sd) return err;
-    ray_t* codes = enc_alloc_fails(e) ? NULL : ray_vec_new(RAY_I32, e->len);
-    ray_t* focc = codes && !RAY_IS_ERR(codes) ? ray_vec_new(RAY_I32, sd->n) : NULL;
-    ray_enc_vview_t* vw = focc && !RAY_IS_ERR(focc) ? ray_alloc_raw(sizeof *vw) : NULL;
-    if (!vw) {
-        if (codes && !RAY_IS_ERR(codes)) ray_release(codes);
-        if (codes && RAY_IS_ERR(codes)) ray_error_free(codes);
-        if (focc && !RAY_IS_ERR(focc)) ray_release(focc);
-        if (focc && RAY_IS_ERR(focc)) ray_error_free(focc);
-        return ray_error("oom", "column %s: DICT index", e->path);
-    }
-    codes->len = e->len; focc->len = sd->n;
-    int32_t* cd = (int32_t*)ray_data(codes);
-    int32_t* fo = (int32_t*)ray_data(focc);
-    uint32_t ndist = 0;
-    bool first_order = true;
-    const int64_t nv = ray_enc_nvecs(e->len);
-    for (int64_t v = 0; v < nv && first_order; v++) {
-        int r = ray_enccol_vview(e, v, vw, &err);
-        if (r < 0) break;
-        if (r == 0 || vw->enc != RAY_ENC_STR_DICT) {
-            err = ray_error("corrupt", "column %s: vector %lld not readable as STR_DICT codes", e->path, (long long)v);
-            break;
-        }
-        const int64_t r0 = v * RAY_ENC_VEC;
-        for (int i = 0; i < vw->n; i++) {
-            const uint32_t k = vw->codes[i];             /* below sd->n: the view checked it */
-            if (k == ndist) fo[ndist++] = (int32_t)(r0 + i);
-            else if (k > ndist) { first_order = false; break; }
-            cd[r0 + i] = (int32_t)k;
-        }
-    }
-    ray_free_raw(vw);
-    if (err || !first_order || ndist != sd->n) {
-        ray_release(codes); ray_release(focc);
-        return err;
-    }
-    ray_t* root = enc_alloc_fails(e) ? NULL : ray_index_new_root(RAY_IDX_DICT, RAY_STR, e->len);
-    if (!root || RAY_IS_ERR(root)) {
-        ray_release(codes); ray_release(focc);
-        if (root) ray_error_free(root);
-        return ray_error("oom", "column %s: DICT index", e->path);
-    }
-    ray_index_t* ix = ray_index_payload(root);
-    ix->u.dict.codes = codes; ix->u.dict.first_occ = focc; ix->u.dict.n_distinct = sd->n;
-    *root_out = root;
-    return NULL;
+    return e->kind == RAY_ENCCOL_SINGLE && (e->hdr.index_kind || (e->hdr.col_flags & RAY_ENC_FLAG_UNIQUE));
 }
 
 /* ZONE / CHUNK_ZONE roots are synthesized from the verified directory;
@@ -3325,14 +3391,14 @@ static ray_t* enc_runtime_dict(ray_enccol_t* e, ray_t** root_out) {
  * a malformed region fails the materialization and never reads as "no
  * index".  The UNIQUE marker comes from the column flag (the parse leaves
  * it to this caller); every attach goes through the admission predicate,
- * a refusal is corrupt.  With no recorded kind, a STR column that can
- * carry one gets its runtime DICT (spec "STR dictionary index"; a recorded
- * HASH keeps HASH and builds none); UNIQUE marks whichever root results. */
+ * a refusal is corrupt.  A recorded DICT (P6b) attaches a heap root from
+ * both tiers of the persisted region: codes the code tier's vector (shared
+ * with the aware paths), first_occ a copy; nothing in the root refers to
+ * the mapping.  UNIQUE marks whichever root results. */
 static ray_t* enc_attach_index(ray_enccol_t* e, ray_t** vp) {
     uint8_t kind = e->hdr.index_kind;
     bool unique = e->hdr.col_flags & RAY_ENC_FLAG_UNIQUE;
-    const bool rdict = kind == 0 && enc_str_dict_possible(e);
-    if (kind == 0 && !unique && !rdict) return NULL;
+    if (kind == 0 && !unique) return NULL;
     ray_t* root = NULL;
     if (kind == RAY_IDX_ZONE || kind == RAY_IDX_CHUNK_ZONE) {
         if (!ray_zone_acc_supported(e->type))
@@ -3360,13 +3426,30 @@ static ray_t* enc_attach_index(ray_enccol_t* e, ray_t** vp) {
             ray_error_free(perr);
             return ray_error(code, "column %s: %s", e->path, msg);
         }
+    } else if (kind == RAY_IDX_DICT) {
+        /* spec "Materialization" step 2 (P6b): both tiers, then a heap root */
+        if (enc_alloc_fails(e) || atomic_load(&g_fail_index_parse))
+            return ray_error("oom", "column %s: index parse", e->path);
+        const ray_enc_idict_t* d;
+        ray_t* cv = NULL;
+        ray_t* err = ray_enccol_idict(e, &d);
+        if (!err && !d) err = ray_error("corrupt", "column %s: DICT index unreadable", e->path);
+        if (!err) err = ray_enccol_idict_codes_vec(e, &cv);
+        if (err) return err;
+        ray_t* fo = ray_vec_new(RAY_I32, d->n_distinct);
+        root = fo && !RAY_IS_ERR(fo) ? ray_index_new_root(RAY_IDX_DICT, RAY_STR, e->len) : NULL;
+        if (!root || RAY_IS_ERR(root)) {
+            if (fo && !RAY_IS_ERR(fo)) ray_release(fo); else if (fo) ray_error_free(fo);
+            if (root) ray_error_free(root);
+            return ray_error("oom", "column %s: DICT index", e->path);
+        }
+        fo->len = d->n_distinct;
+        memcpy(ray_data(fo), d->first_occ, (size_t)d->n_distinct * 4);
+        ray_retain(cv);                           /* shared with the aware paths */
+        ray_index_t* ix = ray_index_payload(root);
+        ix->u.dict.codes = cv; ix->u.dict.first_occ = fo; ix->u.dict.n_distinct = d->n_distinct;
     } else if (kind != 0) {
         return ray_error("corrupt", "column %s: index kind %u", e->path, kind);
-    }
-    if (rdict) {
-        ray_t* derr = enc_runtime_dict(e, &root);
-        if (derr) return derr;
-        if (!root && !unique) return NULL;           /* a forged order: no DICT */
     }
     if (unique) {
         if (!root) {

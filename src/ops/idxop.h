@@ -516,8 +516,8 @@ ray_t* ray_index_new_root(ray_idx_kind_t kind, int8_t parent_type, int64_t paren
 /* Spec "Materialization" step 3 admission matrix:
  * numeric and temporal types carry HASH, SORT, BLOOM, PART, ZONE,
  * CHUNK_ZONE and a marker-only root; SYM carries HASH, PART and a
- * marker-only root; STR carries HASH, the runtime DICT and a marker-only
- * root; GUID carries nothing. */
+ * marker-only root; STR carries HASH, DICT (persisted for generation 2
+ * since P6b) and a marker-only root; GUID carries nothing. */
 bool ray_index_kind_admits(ray_idx_kind_t kind, int8_t parent_type);
 
 /* ── Inline on-disk index region (zero-copy mmap) ──

@@ -1722,7 +1722,8 @@ static test_result_t test_save_override_kind(void) {
 #endif
 static const char* const g_idx_golden[] = {
     "idx_hash_i64", "idx_hash_str", "idx_hash_sym", "idx_sort_i32", "idx_bloom_i64",
-    "idx_part_i64", "idx_part_f64", "idx_part_sym", "idx_part_order", "idx_hash_unique", NULL,
+    "idx_part_i64", "idx_part_f64", "idx_part_sym", "idx_part_order", "idx_hash_unique",
+    "idx_dict_str", NULL,
 };
 
 /* SYM fixtures go through the column writer directly, like P1's golden_sym,
@@ -1781,6 +1782,28 @@ static const char* idx_golden_emit(const char* dir) {
     #undef GOLD
     if (idx_golden_sym(dir, "idx_hash_sym", RAY_IDX_HASH) != RAY_OK) return "idx_hash_sym";
     if (idx_golden_sym(dir, "idx_part_sym", RAY_IDX_PART) != RAY_OK) return "idx_part_sym";
+    {   /* DICT (P6b): 300 rows through the column writer; the 65536-row floor
+         * is the writers' decision, not a validity rule (D14) */
+        ray_t* ds = ray_vec_new(RAY_STR, 300);
+        for (int i = 0; i < 300 && ds && !RAY_IS_ERR(ds); i++) {
+            char b[32]; int n = snprintf(b, sizeof b, "dict entry %d", (i * 7) % 23);
+            ds = ray_str_vec_append(ds, b, (size_t)n);
+        }
+        if (!ds || RAY_IS_ERR(ds)) return "idx_dict_str";
+        snprintf(path, sizeof path, "%s/idx_dict_str.bin", dir);
+        FILE* f = fopen(path, "wb+");
+        ray_encw_t w; memset(&w, 0, sizeof w);
+        ray_encw_test_force_str(RAY_ENC_RAW);                  /* the subject is the region */
+        ray_err_t e = f ? ray_encw_begin(&w, f, RAY_STR, 0, 300, 0, RAY_IDX_DICT, 0) : RAY_ERR_IO;
+        const ray_t* own = ds;
+        const char* pool = own->str_pool ? (const char*)ray_data(own->str_pool) : NULL;
+        if (e == RAY_OK) e = ray_encw_chunk(&w, ray_data(ds), pool, 300);
+        if (e == RAY_OK) e = ray_encw_finish(&w);
+        ray_encw_test_force_str(-1);
+        if (f) { ray_encw_free(&w); fclose(f); }
+        ray_release(ds);
+        if (e != RAY_OK) return "idx_dict_str";
+    }
     return NULL;
 }
 
@@ -1837,6 +1860,7 @@ static test_result_t test_idx_golden_read(void) {
         { "idx_bloom_i64",   RAY_IDX_BLOOM, NULL, false }, { "idx_part_i64",  RAY_IDX_PART,  NULL, false },
         { "idx_part_f64",    RAY_IDX_PART,  NULL, false }, { "idx_part_sym",  RAY_IDX_PART,  NULL, false },
         { "idx_part_order",  RAY_IDX_PART,  "ts", false }, { "idx_hash_unique", RAY_IDX_HASH, NULL, true },
+        { "idx_dict_str",    RAY_IDX_DICT,  NULL, false },
     };
     size_t nfx = sizeof fx / sizeof fx[0];
     /* the SYM fixtures record 64 symbols: a process with fewer refuses them */
@@ -1865,6 +1889,23 @@ static test_result_t test_idx_golden_read(void) {
         TEST_ASSERT_EQ_I(eh.index_kind, fx[i].kind);
         TEST_ASSERT_EQ_I(h.type, m->type);
         TEST_ASSERT_EQ_I(h.len, m->len);
+        if (fx[i].kind == RAY_IDX_DICT) {      /* Task 1's validator, not ray_enc_index_validate */
+            const uint64_t rsz = eh.end_off - eh.index_off;
+            uint8_t* rb = aligned_alloc(32, (size_t)((rsz + 31) & ~(uint64_t)31));
+            TEST_ASSERT_NOT_NULL(rb);
+            memcpy(rb, b + eh.index_off, (size_t)rsz);
+            free(b);
+            ray_enc_dict_view_t dv;
+            ray_t* de = ray_enc_dict_validate(rb, rsz, 300, path, &dv);
+            if (!de) de = ray_enc_dict_codes_check(&dv, NULL, path);
+            const int64_t nd = de ? -1 : dv.n_distinct;
+            free(rb);
+            TEST_ASSERT_FMT(de == NULL, "%s: %s", fx[i].name, ray_error_msg() ? ray_error_msg() : "?");
+            TEST_ASSERT_EQ_I(nd, 23);
+            TEST_ASSERT_EQ_I(aix->u.dict.n_distinct, 23);
+            ray_release(c);
+            continue;
+        }
         ray_enc_idx_view_t iv; ray_t* root = NULL;
         ray_t* e = ray_enc_index_validate(b + eh.index_off, n - eh.index_off, eh.index_kind, h.type, h.attrs, h.len,
                                           h.type == RAY_SYM ? saved : 0, ray_data(m), path, &iv);
