@@ -421,8 +421,10 @@ static const char* null_literal(int8_t type) {
     case RAY_DATE:      return "0Nd";
     case RAY_TIME:      return "0Nt";
     case RAY_TIMESTAMP: return "0Np";
-    /* SYM/STR have no separate null literal: their canonical empty/null values
-     * render as ' / "" on their ordinary formatting paths. */
+    /* SYM's null is the empty symbol, written ' (as fmt_sym_atom renders
+     * it); `null` would read back as the symbol `null`.  STR's null is "",
+     * which its callers write on the ordinary string path. */
+    case RAY_SYM:       return "'";
     case RAY_GUID:      return "0Ng";
     default:            return "null";
     }
