@@ -159,10 +159,58 @@ static test_result_t test_gather_pool_range(void) {
     PASS();
 }
 
+/* A STR_DICT column whose per-occurrence pool is exactly UINT32_MAX saves
+ * (the generation-0 bound, Decisions: the writer keeps it for every
+ * encoding) and materializes with a dictionary region of two entries; one
+ * byte more fails with `range` under STR_DICT too (P1's range test keeps
+ * selection). */
+static test_result_t test_str_dict_pool_limit(void) {
+    const int64_t n = 65537;                        /* 65537 x 65535 = UINT32_MAX */
+    char* a = malloc(65535); char* b2 = malloc(65535);
+    TEST_ASSERT_TRUE(a && b2);
+    memset(a, 'a', 65535); memset(b2, 'b', 65535);
+    ray_t* v = ray_vec_new(RAY_STR, n);
+    for (int64_t i = 0; i < n; i++) v = ray_str_vec_append(v, (i & 1) ? a : b2, 65535);
+    free(a); free(b2);
+    TEST_ASSERT_TRUE(v && !RAY_IS_ERR(v) && v->len == n);
+    TEST_ASSERT_EQ_U((uint64_t)v->str_pool->len, UINT32_MAX);
+    ray_encw_test_force(RAY_ENC_STR_DICT);
+    ray_err_t e = ray_col_save_bulk_gen(v, ray_test_tmp(LG_TMP "/sd"), 2);
+    ray_encw_test_force(-1);
+    ray_release(v);
+    TEST_ASSERT_EQ_I(e, RAY_OK);
+    ray_t* c = ray_col_mmap(ray_test_tmp(LG_TMP "/sd"));
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+    TEST_ASSERT_EQ_U(ray_enccol_of(c)->hdr.str_pool_bytes, 2u * 65535u);
+    ray_t* m = ray_enccol_materialize(c);           /* borrowed: the column's cache */
+    TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m) && m->len == n);
+    TEST_ASSERT_EQ_I(m->str_pool->len, 2 * 65535);
+    size_t l; const char* p = ray_str_vec_get(m, n - 1, &l);
+    TEST_ASSERT_TRUE(l == 65535 && p[0] == 'b' && p[65534] == 'b');
+    p = ray_str_vec_get(m, n - 2, &l);
+    TEST_ASSERT_TRUE(l == 65535 && p[0] == 'a' && p[65534] == 'a');
+    ray_release(c);
+    (void)remove(ray_test_tmp(LG_TMP "/sd"));
+    /* one byte more, forced STR_DICT: shared_str's 65535 descriptors of
+     * 65537 bytes and a last of 65538 (two distinct entries' worth of
+     * pool, UINT32_MAX + 1 per occurrence) */
+    v = shared_str(65538);
+    TEST_ASSERT_TRUE(v && !RAY_IS_ERR(v));
+    ray_encw_test_force(RAY_ENC_STR_DICT);
+    e = ray_col_save_bulk_gen(v, ray_test_tmp(LG_TMP "/sd1"), 2);
+    ray_encw_test_force(-1);
+    ray_release(v);
+    TEST_ASSERT_EQ_I(e, RAY_ERR_RANGE);
+    TEST_ASSERT_TRUE(access(ray_test_tmp(LG_TMP "/sd1"), F_OK) != 0);
+    TEST_ASSERT_TRUE(access(ray_test_tmp(LG_TMP "/sd1.tmp"), F_OK) != 0);
+    PASS();
+}
+
 const test_entry_t large_entries[] = {
     { "large/pool_exact_limit",         test_pool_exact_limit,         lg_setup, lg_teardown },
     { "large/pool_one_byte_over",       test_pool_one_byte_over,       lg_setup, lg_teardown },
     { "large/stream_crossing_last_row", test_stream_crossing_last_row, lg_setup, lg_teardown },
     { "large/gather_pool_range",        test_gather_pool_range,        lg_setup, lg_teardown },
+    { "large/str_dict_pool_limit",      test_str_dict_pool_limit,      lg_setup, lg_teardown },
     { NULL, NULL, NULL, NULL },
 };

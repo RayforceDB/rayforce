@@ -189,13 +189,17 @@ static int sd_view(sd_build_t* b, int64_t v, int64_t vrows, ray_t** err) {
         got = ray_enccol_vview(b->se, v, b->vv, err);
         if (got < 0) return -1;
         if (got > 0 && b->vv->enc != RAY_ENC_STR_DICT) got = 0;
+        /* an invariant check, not a validation: the view's row count and
+         * entry count come from the same descriptors and dictionary as
+         * vrows and b->sdict, so this cannot fire on any file */
         if (got > 0 && (b->vv->n != vrows || b->vv->dict_n != b->sdict->n)) {
             *err = ray_error("corrupt", "column %s: string domain: vector %lld holds %d rows of %u entries",
                              b->se->path, (long long)v, b->vv->n, b->vv->dict_n);
             return -1;
         }
         if (got > 0 && !b->remap) {
-            b->remap = (int64_t*)ray_alloc_raw((size_t)(b->sdict->n ? b->sdict->n : 1) * sizeof(int64_t));
+            b->remap = ray_enccol_test_nth_alloc_fails() ? NULL       /* the materialization fail hook */
+                     : (int64_t*)ray_alloc_raw((size_t)(b->sdict->n ? b->sdict->n : 1) * sizeof(int64_t));
             if (!b->remap) { *err = ray_error("oom", NULL); return -1; }
             for (uint32_t k = 0; k < b->sdict->n; k++) b->remap[k] = -1;
         }

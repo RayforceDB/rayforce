@@ -322,7 +322,8 @@ void   ray_enc_counters_get(ray_enc_counters_t* out);
 void   ray_enc_counters_reset(void);
 
 /* Test hooks.  fail_alloc: the nth allocation inside generation-2 decode
- * or materialization fails (1 = the next one); 0 disables.  fail_path:
+ * or materialization (and a string-domain build's per-segment code remap,
+ * strdom.c) fails (1 = the next one); 0 disables.  fail_path:
  * while set, every such allocation fails for a column whose path contains
  * `sub` (NULL disables); both report "oom" (transient). */
 void   ray_enccol_test_fail_alloc(int64_t nth);

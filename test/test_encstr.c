@@ -747,6 +747,7 @@ static void st_q_setup(void) {
     (void)ray_test_rm_rf(ray_test_tmp(ST_TMP)); (void)ray_test_mkdir_p(ray_test_tmp(ST_TMP));
 }
 static void st_q_teardown(void) {
+    free(st_mem); st_mem = NULL;
     st_release_held();
     ray_test_hooks_off(); ray_encw_test_force_str(-1); ray_encw_test_force(-1);
     (void)ray_test_rm_rf(ray_test_tmp(ST_TMP)); ray_runtime_destroy(st_rt);
@@ -1830,6 +1831,281 @@ static test_result_t test_mixed_str_groupby(void) {
     PASS();
 }
 
+/* Task 6 review Minor 3: a group-by over a forged STR_DICT vector.  (a)
+ * code 9 of three entries: the descriptors reject it, so the view reports
+ * it; (b) a vector of codes 0 / 1 (bounds [0, 1]) whose FOR_BP base is
+ * moved to 1: codes 1 / 2, rows outside the bounds, so the view declines
+ * and the group path's cursor read decodes it, which reports it.  Either
+ * way the group-by answers `corrupt`, as the filter path does.  (A sound
+ * STR_DICT vector is never declined: every decline is a file the decode
+ * rejects.) */
+static int gf_entry(int64_t i) { return i / RAY_ENC_VEC == ray_enc_nvecs(SF_ROWS) - 1 ? 2 : (int)(i & 1); }
+static test_result_t test_groupby_forged(void) {
+    for (int f = 0; f < 2; f++) {
+        ray_t* v = st_hold(ray_vec_new(RAY_STR, SF_ROWS));
+        for (int64_t i = 0; i < SF_ROWS; i++) {
+            const int k = f ? gf_entry(i) : sf_entry(i / RAY_ENC_VEC);
+            ray_t* v2 = ray_str_vec_append(v, g_sf_s[k], strlen(g_sf_s[k]));
+            st_unhold(v, v2); v = v2;
+        }
+        ray_t* tb = ray_table_new(2);
+        tb = ray_table_add_col(tb, ray_sym_intern("s", 1), v);
+        ray_t* iv = ray_vec_new(RAY_I64, SF_ROWS);
+        for (int64_t i = 0; i < SF_ROWS; i++) iv = ray_vec_append(iv, &i);
+        tb = ray_table_add_col(tb, ray_sym_intern("v", 1), iv);
+        ray_release(iv);
+        TEST_ASSERT_EQ_I(ray_env_set(ray_sym_intern("W", 1), tb), RAY_OK);
+        ray_release(tb);
+        st_unhold(v, NULL); ray_release(v);
+        ray_encw_test_force_str(RAY_ENC_STR_DICT);          /* selection keeps one-string vectors CONST */
+        ST_Q_OK(f ? "(.db.splayed.set \"" ST_TMP "/gb/\" W {compress: true})"
+                  : "(.db.splayed.set \"" ST_TMP "/ga/\" W {compress: true})");
+        ray_encw_test_force_str(-1);
+        char p[600]; TEST_ASSERT_TRUE(st_live(f ? "/gb" : "/ga", "s", p, sizeof p));
+        const char* ld = f ? "(set T (.db.splayed.get \"" ST_TMP "/gb/\"))" : "(set T (.db.splayed.get \"" ST_TMP "/ga/\"))";
+        ST_Q_OK(ld);
+        /* unforged: the codes path answers (the three entries' counts) */
+        ST_Q_TRUE("(all (== [34816 34816 368] (at (select {c: (count v) from: T by: s}) 'c)))");
+        ST_Q_TRUE("(not (at (.idx.info T 's) 'materialized))");     /* codes, not a materialization */
+        if (f == 0) TEST_ASSERT_TRUE(sf_set_code(p, 3, 9));
+        else {
+            ray_enc_desc_t d;
+            TEST_ASSERT_EQ_I(st_desc_enc(p, 3, &d), RAY_ENC_STR_DICT);
+            TEST_ASSERT_TRUE(d.min == 0 && d.max == 1);
+            ray_enc_dirent_t de = st_dirent(p, 0);
+            const long body = (long)(de.offset + d.payload_off);
+            uint8_t ch[2]; ST_READ(p, body, ch, 2);
+            TEST_ASSERT_TRUE(ch[0] == RAY_ENC_FOR_BP && ch[1] == 1);
+            const uint64_t base = 1;
+            ST_PATCH(p, body + 8, &base, 8);
+        }
+        ST_Q_OK(ld);
+        static const char* const qs[3] = {
+            "(select {c: (count v) from: T by: s})",
+            "(count (select {from: T where: (== s \"forged entry zero, a long string\")}))",
+            "(count (select {from: T where: (!= s \"forged entry zero, a long string\")}))",
+        };
+        for (int q = 0; q < 3; q++) {
+            ray_t* r = ray_eval_str(qs[q]);
+            const bool bad = r && RAY_IS_ERR(r) && strcmp(ray_err_code(r), "corrupt") == 0;
+            const char* got = r && RAY_IS_ERR(r) ? ray_err_code(r) : "an answer";
+            if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+            TEST_ASSERT_FMT(bad, "case %d %s: %s", f, qs[q], got);
+        }
+    }
+    PASS();
+}
+
+/* Task 6 review Minor 3: the segment remap's allocation fails through the
+ * materialization fail hook: the group-by answers `oom` and leaks nothing;
+ * the retry answers.  The column is all STR_DICT (no vector decodes), and
+ * after a warm run the remap is the query's only hooked allocation. */
+static test_result_t test_groupby_remap_oom(void) {
+    ray_t* v = st_hold(str_col(SF_ROWS, gen_lowcard));
+    ray_t* tb = ray_table_new(2);
+    tb = ray_table_add_col(tb, ray_sym_intern("s", 1), v);
+    ray_t* iv = ray_vec_new(RAY_I64, SF_ROWS);
+    for (int64_t i = 0; i < SF_ROWS; i++) iv = ray_vec_append(iv, &i);
+    tb = ray_table_add_col(tb, ray_sym_intern("v", 1), iv);
+    ray_release(iv);
+    TEST_ASSERT_EQ_I(ray_env_set(ray_sym_intern("W", 1), tb), RAY_OK);
+    ray_release(tb);
+    ST_Q_OK("(.db.splayed.set \"" ST_TMP "/ro/\" W {compress: true})");
+    char p[600]; TEST_ASSERT_TRUE(st_live("/ro", "s", p, sizeof p));
+    TEST_ASSERT_EQ_I(st_desc_enc(p, 0, NULL), RAY_ENC_STR_DICT);
+    TEST_ASSERT_EQ_I(st_desc_enc(p, ray_enc_nvecs(SF_ROWS) - 1, NULL), RAY_ENC_STR_DICT);
+    ST_Q_OK("(set T (.db.splayed.get \"" ST_TMP "/ro/\"))");
+    static const char q[] = "(select {c: (count v) from: T by: s})";
+    ray_t* want = st_hold(st_q_fmt(q));                     /* warm: the dictionary's once-state */
+    TEST_ASSERT_NOT_NULL(want);
+    ST_Q_TRUE("(== 37 (count (select {c: (count v) from: T by: s})))");
+    ST_Q_TRUE("(not (at (.idx.info T 's) 'materialized))");
+    /* nth 2 is never reached: one hooked allocation (the counter's next
+     * check consumes the last step) */
+    ray_enccol_test_fail_alloc(2);
+    ray_t* r = st_q_fmt(q);
+    TEST_ASSERT_NOT_NULL(r);
+    ray_release(r);
+    TEST_ASSERT_TRUE(ray_enccol_test_nth_alloc_fails());
+    ray_enccol_test_fail_alloc(0);
+    for (int k = 0; k < 2; k++) {
+        ray_mem_stats_t m0, m1; ray_mem_stats(&m0);
+        ray_enccol_test_fail_alloc(1);
+        r = ray_eval_str(q);
+        ray_enccol_test_fail_alloc(0);
+        const bool oom = r && RAY_IS_ERR(r) && strcmp(ray_err_code(r), "oom") == 0;
+        const char* got = r && RAY_IS_ERR(r) ? ray_err_code(r) : "an answer";
+        if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+        TEST_ASSERT_FMT(oom, "round %d: %s", k, got);
+        ray_mem_stats(&m1);
+        TEST_ASSERT_FMT(m1.bytes_allocated == m0.bytes_allocated, "round %d: %llu vs %llu", k,
+                        (unsigned long long)m1.bytes_allocated, (unsigned long long)m0.bytes_allocated);
+    }
+    r = st_hold(st_q_fmt(q));                              /* the retry */
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_TRUE(ray_str_len(r) == ray_str_len(want) && memcmp(ray_str_ptr(r), ray_str_ptr(want), ray_str_len(r)) == 0);
+    PASS();
+}
+
+/* ---- Task 7: abandonment, representation, stream identity ---- */
+
+/* The whole file at `path` (malloc'd, NULL on failure); its size in *n. */
+static uint8_t* slurp_file(const char* path, size_t* n) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return NULL;
+    uint8_t* p = NULL;
+    long sz = fseek(f, 0, SEEK_END) == 0 ? ftell(f) : -1;
+    if (sz >= 0 && fseek(f, 0, SEEK_SET) == 0 && (p = malloc((size_t)sz + 1)) != NULL &&
+        fread(p, 1, (size_t)sz, f) != (size_t)sz) { free(p); p = NULL; }
+    fclose(f);
+    *n = p ? (size_t)sz : 0;
+    return p;
+}
+
+/* Review focus 4: past 1<<20 entries the accumulator is abandoned.  Each
+ * random printable 24-byte string appears twice, so a chunk's dictionary
+ * (32768 entries) beats its plain encodings until the cap: chunks 0..31
+ * are STR_DICT, chunks 32 and 33 FSST or RAW. */
+static void abandon_str(int64_t pair, char* b) {
+    uint64_t x = 0x9E3779B97F4A7C15ull * (uint64_t)(pair + 1);
+    for (int k = 0; k < 24; k++) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; b[k] = (char)(33 + x % 94); }
+}
+static test_result_t test_abandonment(void) {
+    const char* p = STP("/ab");
+    int64_t n = 2 * ((int64_t)RAY_ENCW_SDICT_CAP + 65536);
+    TEST_ASSERT_EQ_I(n, 2228224);
+    ray_t* v = st_hold(ray_vec_new(RAY_STR, n));
+    char b[24];
+    for (int64_t i = 0; i < n; i++) {
+        abandon_str(i / 2, b);
+        ray_t* v2 = ray_str_vec_append(v, b, 24);
+        st_unhold(v, v2); v = v2;
+    }
+    TEST_ASSERT_TRUE(v && !RAY_IS_ERR(v) && v->len == n);
+    TEST_ASSERT_EQ_I(ray_col_save_bulk_gen(v, p, 2), RAY_OK);
+    TEST_ASSERT_EQ_I(st_desc_enc(p, 0, NULL), RAY_ENC_STR_DICT);
+    TEST_ASSERT_EQ_I(st_desc_enc(p, 31 * 64, NULL), RAY_ENC_STR_DICT);
+    TEST_ASSERT_EQ_I(st_desc_enc(p, 31 * 64 + 63, NULL), RAY_ENC_STR_DICT);
+    TEST_ASSERT_TRUE(st_desc_enc(p, 32 * 64, NULL) != RAY_ENC_STR_DICT);
+    TEST_ASSERT_TRUE(st_desc_enc(p, ray_enc_nvecs(n) - 1, NULL) != RAY_ENC_STR_DICT);
+    ray_t* c = st_hold(ray_col_mmap(p));
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+    const ray_enc_sdict_t* sd;
+    TEST_ASSERT_NULL(ray_enccol_strdict(ray_enccol_of(c), &sd));
+    TEST_ASSERT_TRUE(sd && sd->n == RAY_ENCW_SDICT_CAP);
+    TEST_ASSERT_FALSE(ray_enccol_may_have_index(c));       /* D9: chunks 32, 33 carry no code bounds */
+    ray_t* m = ray_enccol_materialize(c);                  /* borrowed: the column's cache */
+    TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m) && st_same(m, v));
+    TEST_ASSERT_EQ_I(ray_index_kind(m), RAY_IDX_NONE);
+    PASS();
+}
+
+/* Review focus 5: equal long strings at distinct pool offsets with differing
+ * cached hashes are one value for CONST and for STR_DICT. */
+static test_result_t test_representation_not_value(void) {
+    ray_t* v = st_hold(ray_vec_new(RAY_STR, 2048));
+    ray_t* u = st_hold(ray_vec_new(RAY_STR, 2048));        /* the same strings, untouched hashes */
+    for (int i = 0; i < 2048; i++) {
+        ray_t* v2 = ray_str_vec_append(v, "the same long string value", 26);
+        st_unhold(v, v2); v = v2;
+        ray_t* u2 = ray_str_vec_append(u, "the same long string value", 26);
+        st_unhold(u, u2); u = u2;
+    }
+    ray_str_t* s = (ray_str_t*)ray_data(v);
+    TEST_ASSERT_TRUE(s[0].pool_off != s[1].pool_off);
+    s[1].hash32 = s[0].hash32 ^ 0x5A5A;                    /* a different cached hash */
+    TEST_ASSERT_TRUE(s[1].hash32 != s[0].hash32);
+    static const struct { const char* rel; int enc; } fs[] = {
+        { "/rc", RAY_ENC_CONST }, { "/rd", RAY_ENC_STR_DICT }, { "/uc", RAY_ENC_CONST }, { "/ud", RAY_ENC_STR_DICT } };
+    for (int k = 0; k < 4; k++) {
+        char rel[64]; snprintf(rel, sizeof rel, ST_TMP "%s", fs[k].rel);
+        ray_encw_test_force_str(fs[k].enc);
+        ray_err_t e = ray_col_save_gen(k < 2 ? v : u, ray_test_tmp(rel), 2);
+        ray_encw_test_force_str(-1);
+        TEST_ASSERT_EQ_I(e, RAY_OK);
+    }
+    TEST_ASSERT_EQ_I(st_desc_enc(STP("/rc"), 0, NULL), RAY_ENC_CONST);
+    TEST_ASSERT_EQ_I(st_desc_enc(STP("/rc"), 1, NULL), RAY_ENC_CONST);
+    TEST_ASSERT_EQ_I(st_desc_enc(STP("/rd"), 0, NULL), RAY_ENC_STR_DICT);
+    /* the cached hash is representation: the files equal the untouched ones */
+    size_t na, nb;
+    uint8_t* fa = slurp_file(STP("/rc"), &na); uint8_t* fb = slurp_file(STP("/uc"), &nb);
+    bool same = fa && fb && na == nb && memcmp(fa, fb, na) == 0;
+    free(fa); free(fb);
+    TEST_ASSERT_TRUE(same);
+    fa = slurp_file(STP("/rd"), &na); fb = slurp_file(STP("/ud"), &nb);
+    same = fa && fb && na == nb && memcmp(fa, fb, na) == 0;
+    free(fa); free(fb);
+    TEST_ASSERT_TRUE(same);
+    ray_t* c = st_hold(ray_col_mmap(STP("/rd")));
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+    const ray_enc_sdict_t* sd;
+    TEST_ASSERT_NULL(ray_enccol_strdict(ray_enccol_of(c), &sd));
+    TEST_ASSERT_TRUE(sd && sd->n == 1);
+    ray_t* m = ray_enccol_materialize(c);
+    TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m) && st_same(m, v));
+    c = st_hold(ray_col_mmap(STP("/rc")));
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+    m = ray_enccol_materialize(c);
+    TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m) && st_same(m, v));
+    PASS();
+}
+
+/* The stream writer (.csv.splayed) and the resident writer write the same
+ * STR file, dictionary and FSST table included: the stream, the resave of
+ * the encoded source (range reads), and the plain in-memory vector through
+ * ray_col_save_gen and ray_col_save_bulk_gen (the converters' path).  Order
+ * 0 is the brief's (low cardinality first: 64 STR_DICT, 4 FSST, 69 RAW
+ * vectors); order 1 puts the URLs first (an FSST table trained on them:
+ * 64 FSST vectors, then 73 STR_DICT). */
+static const char* se_row(int o, int64_t i, char* b) {
+    return (i < 70000) == (o == 0) ? gen_lowcard(i, b) : gen_urls(i, b);
+}
+static test_result_t test_stream_equals_resident(void) {
+    char b[256], q[600], csv[64], cs[64], rs[64];
+    for (int o = 0; o < 2; o++) {
+        snprintf(csv, sizeof csv, ST_TMP "/in%d.csv", o);
+        snprintf(cs, sizeof cs, "/cs%d", o); snprintf(rs, sizeof rs, "/rs%d", o);
+        FILE* f = fopen(ray_test_tmp(csv), "w");
+        TEST_ASSERT_NOT_NULL(f);
+        fprintf(f, "s,v\n");
+        for (int64_t i = 0; i < 140000; i++) fprintf(f, "%s,%lld\n", se_row(o, i, b), (long long)i);
+        fclose(f);
+        snprintf(q, sizeof q, "(.csv.splayed {compress: true} [STR I64] \"%s\" \"" ST_TMP "%s/\")", csv, cs);
+        ST_Q_OK(q);
+        snprintf(q, sizeof q, "(.db.splayed.set \"" ST_TMP "%s/\" (.db.splayed.get \"" ST_TMP "%s/\") {compress: true})", rs, cs);
+        ST_Q_OK(q);
+        ray_t* v = st_hold(ray_vec_new(RAY_STR, 140000));
+        for (int64_t i = 0; i < 140000; i++) {
+            const char* sv = se_row(o, i, b);
+            ray_t* v2 = ray_str_vec_append(v, sv, strlen(sv));
+            st_unhold(v, v2); v = v2;
+        }
+        TEST_ASSERT_EQ_I(ray_col_save_gen(v, STP("/pl"), 2), RAY_OK);
+        TEST_ASSERT_EQ_I(ray_col_save_bulk_gen(v, STP("/pb"), 2), RAY_OK);
+        st_unhold(v, NULL); ray_release(v);
+        char pc[600], pr[600];
+        TEST_ASSERT_TRUE(st_live(cs, "s", pc, sizeof pc));
+        TEST_ASSERT_TRUE(st_live(rs, "s", pr, sizeof pr));
+        /* the subject: the dictionary and the FSST table both in use */
+        TEST_ASSERT_EQ_I(st_desc_enc(pc, o ? 64 : 0, NULL), RAY_ENC_STR_DICT);
+        TEST_ASSERT_EQ_I(st_desc_enc(pc, o ? 0 : 64, NULL), RAY_ENC_FSST);
+        if (o == 0) TEST_ASSERT_EQ_I(st_desc_enc(pc, 96, NULL), RAY_ENC_RAW);
+        size_t na;
+        uint8_t* pa = slurp_file(pc, &na);
+        TEST_ASSERT_NOT_NULL(pa);
+        free(st_mem); st_mem = pa;                         /* freed in teardown */
+        const char* const others[3] = { pr, STP("/pl"), STP("/pb") };
+        for (int k = 0; k < 3; k++) {
+            size_t nb; uint8_t* pb = slurp_file(others[k], &nb);
+            const bool same = pb && nb == na && memcmp(pa, pb, na) == 0;
+            free(pb);
+            TEST_ASSERT_FMT(same, "order %d writer %d: %zu bytes against the stream's %zu", o, k, nb, na);
+        }
+    }
+    PASS();
+}
+
 const test_entry_t encstr_entries[] = {
     { "encstr/strdict_body",       test_strdict_body,       st_setup, st_teardown },
     { "encstr/fsst_body",          test_fsst_body,          st_setup, st_teardown },
@@ -1866,5 +2142,10 @@ const test_entry_t encstr_entries[] = {
     { "encstr/cross_segment_codes", test_cross_segment_codes, st_q_setup, st_q_teardown },
     { "encstr/groupby_selection",  test_groupby_selection,  st_q_setup, st_q_teardown },
     { "encstr/mixed_str_groupby",  test_mixed_str_groupby,  st_q_setup, st_q_teardown },
+    { "encstr/groupby_forged",     test_groupby_forged,     st_q_setup, st_q_teardown },
+    { "encstr/groupby_remap_oom",  test_groupby_remap_oom,  st_q_setup, st_q_teardown },
+    { "encstr/abandonment",               test_abandonment,               st_setup,   st_teardown },
+    { "encstr/representation_not_value",  test_representation_not_value,  st_setup,   st_teardown },
+    { "encstr/stream_equals_resident",    test_stream_equals_resident,    st_q_setup, st_q_teardown },
     { NULL, NULL, NULL, NULL },
 };

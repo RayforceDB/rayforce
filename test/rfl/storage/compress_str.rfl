@@ -39,5 +39,5 @@
 ;; the file's last group-by is generation 2's: a generation-0 DICT group-by
 ;; leaves its code stash behind, which the next test's group-by frees after
 ;; the heap is gone (#865)
-(count (select {c: (count v) from: A by: zam})) -- (count (select {c: (count v) from: C by: zam}))
+(count (select {c: (count v) from: C by: zam})) -- 3
 (.sys.exec "rm -rf /tmp/rf_test_p6str") -- 0
