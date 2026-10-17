@@ -11678,8 +11678,14 @@ static bool parted_clauses_plain(ray_t* dict, ray_t* tbl);
  * clause names, in the table's order; the whole table when a clause runs
  * code whose column reads it does not show.  When the clauses name no
  * column, the whole table too, unless `keep_unread`: then `tbl` itself,
- * retained, since nothing in the select reads a column of it. */
-static ray_t* parted_flatten_read_cols(ray_t* dict, ray_t* tbl, bool keep_unread) {
+ * retained, since nothing in the select reads a column of it.  `also`, a
+ * symbol or symbol vector or NULL, names columns kept beside those: the
+ * group keys a by-dict has added under their aliases, which no clause
+ * names.  When every one of them is a column, a by-dict's values have been
+ * evaluated into them, so the source columns those values name are read
+ * only if another clause names them too. */
+static ray_t* parted_flatten_read_cols(ray_t* dict, ray_t* tbl, bool keep_unread,
+                                       ray_t* also) {
     int64_t nc = ray_table_ncols(tbl);
     ray_t* keys = ray_dict_keys(dict);
     ray_t* vals = ray_dict_vals(dict);
@@ -11689,9 +11695,21 @@ static ray_t* parted_flatten_read_cols(ray_t* dict, ray_t* tbl, bool keep_unread
     int64_t id_from = ray_sym_intern("from", 4);
     int64_t refs[256];
     int nref = 0;
+    int64_t id_by = ray_sym_intern("by", 2);
+    int64_t nalso = also && also->type == -RAY_SYM ? 1 : (also && also->type == RAY_SYM ? also->len : 0);
+    bool also_cols = nalso > 0;
+    for (int64_t j = 0; j < nalso; j++) {
+        int64_t s = also->type == -RAY_SYM ? also->i64 : sym_cell_runtime_id(also, j);
+        bool seen = false;
+        for (int r = 0; r < nref; r++) seen |= refs[r] == s;
+        if (!ray_table_get_col(tbl, s)) { also_cols = false; continue; }
+        if (!seen && nref < 256) refs[nref++] = s;
+    }
     for (int64_t i = 0; i < ray_dict_len(dict); i++) {
-        if (sym_cell_runtime_id(keys, i) == id_from) continue;
+        int64_t kid = sym_cell_runtime_id(keys, i);
+        if (kid == id_from) continue;
         ray_t* v = ((ray_t**)ray_data(vals))[i];
+        if (kid == id_by && also_cols && v && v->type == RAY_DICT) continue;
         int64_t nsym = v && v->type == -RAY_SYM ? 1 : (v && v->type == RAY_SYM ? v->len : 0);
         for (int64_t j = 0; j < nsym; j++) {   /* a sort key, quoted or not */
             int64_t s = v->type == -RAY_SYM ? v->i64 : sym_cell_runtime_id(v, j);
@@ -11800,7 +11818,7 @@ static ray_t* select_plan_computed_key(ray_t* dict, ray_t* tbl, int64_t* key_nam
                     any_out = !rsv;
                 }
                 if (!any_out) { ray_release(base); return NULL; }
-                ray_t* flat = parted_flatten_read_cols(dict, base, false);
+                ray_t* flat = parted_flatten_read_cols(dict, base, false, NULL);
                 ray_release(base);
                 if (!flat || RAY_IS_ERR(flat)) return flat ? flat : ray_error("oom", NULL);
                 base = flat;
@@ -12066,6 +12084,24 @@ static bool clause_names_sym(ray_t* v, int64_t s) {
     if (v->type != RAY_LIST) return false;
     ray_t** el = (ray_t**)ray_data(v);
     for (int64_t i = 0; i < v->len; i++) if (clause_names_sym(el[i], s)) return true;
+    return false;
+}
+
+/* Does the value of by-dict pair `i` (`d_elems` interleaves names and
+ * values) name an alias an earlier pair adds as a new column of `tbl`?
+ * The eager by-dict loop binds that column as a flat vector, so the value
+ * must be evaluated over flat columns too: over a parted table it would
+ * pair every partition with the alias column read again from row 0.  A
+ * value that runs code (a helper) may read the alias as a free name in
+ * its body, unseen here: it is taken to read it. */
+static bool bydict_names_earlier_alias(ray_t** d_elems, int64_t i, ray_t* tbl) {
+    ray_t* v = d_elems[i * 2 + 1];
+    bool runs_code = clause_runs_code_in(v, tbl, true);
+    for (int64_t j = 0; j < i; j++) {
+        ray_t* k = d_elems[j * 2];
+        if (!k || k->type != -RAY_SYM || ray_table_get_col(tbl, k->i64)) continue;
+        if (runs_code || clause_names_sym(v, k->i64)) return true;
+    }
     return false;
 }
 
@@ -13312,6 +13348,8 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
                 for (int64_t j = 0; j < i; j++)
                     if (d_elems[j * 2]->i64 == k->i64) { defer_ok = false; break; }
                 if (!defer_ok) break;
+                /* a value reading an earlier alias is evaluated eagerly */
+                if (bydict_names_earlier_alias(d_elems, i, tbl)) { defer_ok = false; break; }
                 bool trivial_self = (v && v->type == -RAY_SYM && v->i64 == k->i64);
                 if (ray_table_get_col(tbl, k->i64) && !trivial_self) {
                     defer_ok = false; break;   /* alias shadows an input column */
@@ -13561,21 +13599,22 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
         }
 
         /* A by-dict value the planner cannot lower (a helper, a builtin
-         * with no kernel) is evaluated below over whole columns: over a
-         * parted table, flatten the columns the select reads first (the
-         * whole table with no output, or when a clause runs code whose
-         * reads are unseen). */
+         * with no kernel), or one reading an earlier alias, is evaluated
+         * below over whole columns: over a parted table, flatten the
+         * columns the select reads first (the whole table with no output,
+         * or when a clause runs code whose reads are unseen). */
         if (table_has_parted_columns(tbl)) {
             bool unlowered = false;
             for (int64_t i = 0; i < nk && !unlowered; i++) {
                 ray_t* v = d_elems[i * 2 + 1];
+                if (bydict_names_earlier_alias(d_elems, i, tbl)) { unlowered = true; break; }
                 if (!v || v->type != RAY_LIST) continue;
                 ray_graph_t* pg = ray_graph_new(tbl);
                 unlowered = !pg || compile_expr_dag(pg, v) == NULL;
                 if (pg) ray_graph_free(pg);
             }
             if (unlowered) {
-                ray_t* flat = n_out > 0 ? parted_flatten_read_cols(dict, tbl, false)
+                ray_t* flat = n_out > 0 ? parted_flatten_read_cols(dict, tbl, false, NULL)
                                         : query_materialize_parted_table(tbl);
                 ray_release(tbl);
                 if (!flat || RAY_IS_ERR(flat)) {
@@ -13648,7 +13687,9 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
                 fail_err = col_vec ? col_vec : ray_error("domain", "by-dict val eval");
                 failed = true; break;
             }
-            if (!ray_is_vec(col_vec) || ray_len(col_vec) != expected_len) {
+            /* a LIST column groups by its cells, as `by: l` does */
+            if (!(ray_is_vec(col_vec) || col_vec->type == RAY_LIST) ||
+                ray_len(col_vec) != expected_len) {
                 ray_release(col_vec);
                 fail_err = ray_error("length", "by-dict val must be a column vector");
                 failed = true; break;
@@ -14409,22 +14450,24 @@ by_dict_done:
             } else {
                 ray_graph_free(g); g = NULL;
             }
-            if (by_key_sym < 0 && by_expr->type == RAY_SYM && ray_len(by_expr) > 1) {
-                /* The composite path reads key and output cells row by row,
-                 * which a parted column does not serve.  A where: hands back
-                 * a flattened copy of the rows it keeps; when the table
-                 * reaches here as is, flatten the columns the clauses read;
-                 * with no outputs every column is read (first of each group
-                 * below), so the whole table is flattened. */
-                if (eval_tbl == tbl && table_has_parted_columns(tbl)) {
-                    ray_t* flat = n_out > 0 ? parted_flatten_read_cols(dict, tbl, false)
-                                            : query_materialize_parted_table(tbl);
-                    if (!flat || RAY_IS_ERR(flat)) {
-                        ray_release(tbl);
-                        scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return flat ? flat : ray_error("oom", NULL);
-                    }
-                    eval_tbl = flat;
+            /* Eval-level grouping, composite or single-key, reads key and
+             * output cells row by row, which a parted column does not
+             * serve.  A where: hands back a flattened copy of the rows it
+             * keeps; when the table reaches here as is, flatten the columns
+             * the clauses read and the keys (a by-dict key is a column
+             * under its alias, which no clause names); with no outputs
+             * every column is read (first of each group below), so the
+             * whole table is flattened. */
+            if (eval_tbl == tbl && table_has_parted_columns(tbl)) {
+                ray_t* flat = n_out > 0 ? parted_flatten_read_cols(dict, tbl, false, by_expr)
+                                        : query_materialize_parted_table(tbl);
+                if (!flat || RAY_IS_ERR(flat)) {
+                    ray_release(tbl);
+                    scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return flat ? flat : ray_error("oom", NULL);
                 }
+                eval_tbl = flat;
+            }
+            if (by_key_sym < 0 && by_expr->type == RAY_SYM && ray_len(by_expr) > 1) {
                 int64_t nk = ray_len(by_expr);
                 int64_t* key_syms = (int64_t*)ray_data(by_expr);
                 int64_t nrows = ray_table_nrows(eval_tbl);
@@ -14518,15 +14561,25 @@ by_dict_done:
                  * the routing change above, every all-count-agg >1-key by:
                  * answers through the parallel DAG/v2 path instead (see
                  * test/rfl/query/width_matrix.rfl's ROUTING NOTE on the `rmk`
-                 * cell). The only remaining trigger into this block is a
-                 * RAY_LIST-typed by-key column, which hits a pre-existing
-                 * vec_new(LIST) bug building the key output column. Left in
-                 * place — not correctness-load-bearing — pending a follow-up
-                 * that either fixes the LIST-key case or deletes this block. */
+                 * cell). The only remaining trigger into this block was a
+                 * RAY_LIST-typed by-key column (an all-count output set is
+                 * all DAG aggregates, so only a LIST key sets
+                 * use_eval_group for it), whose cells the int64 key reader
+                 * does not hold (the key column then failed in vec_new): a
+                 * key it cannot read leaves the shape to the composite path
+                 * below, which makes the block unreachable.  The STR and
+                 * GUID arms of that gate are defensive.  Left in place —
+                 * not correctness-load-bearing — pending a follow-up that
+                 * deletes this block. */
                 int64_t pre_take_groups = nrows;
                 bool has_pre_take = unsorted_positive_take_limit(
                     dict_elems, dict_n, asc_id, desc_id, take_id,
                     nrows, &pre_take_groups);
+                for (int64_t k = 0; k < nk && has_pre_take; k++) {
+                    int8_t pkt = query_col_base_type(key_cols[k]);
+                    if (pkt == RAY_LIST || pkt == RAY_STR || pkt == RAY_GUID)
+                        has_pre_take = false;
+                }
                 if (has_pre_take && pre_take_groups <= 1024) {
                     /* Per-key reader and per-output name buffers carved to the
                      * exact key / output counts (no fixed slot cap).  Both live
@@ -14991,6 +15044,16 @@ by_dict_done:
                             size_t slen = cell ? ray_str_len(cell) : 0;
                             key_vec = ray_str_vec_append(key_vec, sp ? sp : "", sp ? slen : 0);
                         }
+                    } else if (kt == RAY_LIST) {
+                        /* A LIST key's cells are the source's items: the key
+                         * column lists them (no typed vector holds them). */
+                        key_vec = ray_list_new(out_groups);
+                        for (int64_t gi = 0; gi < out_groups && key_vec && !RAY_IS_ERR(key_vec); gi++) {
+                            ray_t* row_key = grp_items[gi * 2];
+                            ray_t* cell = (row_key && row_key->type == RAY_LIST && k < row_key->len)
+                                        ? ((ray_t**)ray_data(row_key))[k] : NULL;
+                            key_vec = ray_list_append(key_vec, cell ? cell : RAY_NULL_OBJ);
+                        }
                     } else {
                         /* The composite cells are SYM atoms (runtime ids,
                          * collection_elem's atom rule), so the key column is a
@@ -15191,6 +15254,11 @@ by_dict_done:
 	                scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("nyi", "eval-level groupby requires scalar key");
 	            }
             ray_t* key_col = ray_table_get_col(eval_tbl, by_key_sym);
+            if (!key_col) {
+                if (eval_tbl != tbl) ray_release(eval_tbl);
+                ray_release(tbl);
+                scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain", "group key column not found");
+            }
 
             /* Fast path: (select {from: t by: k}) with no aggs and
              * no non-agg expressions — we only need first-of-group
@@ -17175,7 +17243,7 @@ by_dict_done:
                      * the parted table: its columns are bound as they are
                      * (bind_all_columns in eval_expr_whole_column_impl),
                      * but nothing reads one, so none is materialised. */
-                    eval_tbl = parted_flatten_read_cols(dict, tbl, true);
+                    eval_tbl = parted_flatten_read_cols(dict, tbl, true, NULL);
                     if (!eval_tbl || RAY_IS_ERR(eval_tbl)) {
                         ray_graph_free(g); ray_release(tbl);
                         scratch_free(sagg_hdr);
