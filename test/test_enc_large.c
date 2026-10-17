@@ -31,6 +31,7 @@
 #include "table/sym.h"
 #include "store/col.h"
 #include "store/enccol.h"
+#include "store/encw.h"
 #include "store/stream.h"
 #include "store/splay.h"
 #include "store/part.h"
@@ -74,8 +75,13 @@ static ray_t* shared_str(uint32_t last_len) {
 static test_result_t test_pool_exact_limit(void) {
     ray_t* v = shared_str(65537);
     TEST_ASSERT_TRUE(v && !RAY_IS_ERR(v));
-    TEST_ASSERT_EQ_I(ray_col_save_bulk_gen(v, ray_test_tmp(LG_TMP "/ok"), 2), RAY_OK);
+    /* P6: the RAW per-occurrence pool at its limit is this test's subject
+     * (selection takes STR_DICT, whose pool holds the entry once) */
+    ray_encw_test_force(RAY_ENC_RAW);
+    ray_err_t se = ray_col_save_bulk_gen(v, ray_test_tmp(LG_TMP "/ok"), 2);
+    ray_encw_test_force(-1);
     ray_release(v);
+    TEST_ASSERT_EQ_I(se, RAY_OK);
     ray_t* c = ray_col_mmap(ray_test_tmp(LG_TMP "/ok"));
     TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
     TEST_ASSERT_EQ_U(ray_enccol_of(c)->hdr.str_pool_bytes, UINT32_MAX);
@@ -135,9 +141,11 @@ static test_result_t test_gather_pool_range(void) {
     for (int i = 0; i < 4200; i++) ids[i] = i;
     /* the source publishes its segment offsets on its first read (owned by
      * the source, freed at its release): one row first, so the baseline
-     * holds them */
+     * holds them.  P6: each partition's validated STR_DICT dictionary is a
+     * once-state its column keeps (a cache): one row of each partition */
     ray_t* out = NULL;
-    TEST_ASSERT_NULL(ray_col_gather_rows(&s, ids, 1, &out));
+    static const int64_t warm[2] = { 0, 2100 };
+    TEST_ASSERT_NULL(ray_col_gather_rows(&s, warm, 2, &out));
     ray_release(out); out = NULL;
     ray_mem_stats_t m0, m1; ray_mem_stats(&m0);
     ray_t* e = ray_col_gather_rows(&s, ids, 4200, &out);
