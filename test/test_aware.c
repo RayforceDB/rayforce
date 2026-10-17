@@ -4786,6 +4786,19 @@ static void aw_str_key_tables(const char* tag, int n_part, int n_flat) {
                  tag, gen, n_flat, n_flat, gen ? "true" : "false");
         aw_eval_ok(q);
     }
+    /* CONST vectors beside a non-dictionary vector (P6): each chunk opens
+     * with 1024 distinct long keys (no dictionary chunk, so that vector is
+     * FSST or RAW), then runs of two constants, one per vector (CONST) */
+    for (int gen = 0; gen <= 2; gen += 2) {
+        char q[900];
+        snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/%sc%d/\" "
+                 "(table [t v] (list (map (fn [j] (if (< (%% j 65536) 1024) "
+                 "(format \"https://www.example.com/path/%%/item?id=%%\" j (%% (* j 7919) 100003)) "
+                 "(if (< (%% j 2048) 1024) \"constant run text\" \"another constant run\"))) (til %d)) (til %d))) "
+                 "{compress: %s})",
+                 tag, gen, n_flat, n_flat, gen ? "true" : "false");
+        aw_eval_ok(q);
+    }
     /* nulls: "" is the STR null (its canonical empty payload): the null and
      * "" rows are one group in either generation, beside short (inline) and
      * long (pooled) keys */
@@ -4823,7 +4836,8 @@ static void aw_str_key_tables(const char* tag, int n_part, int n_flat) {
  * another key), answers only. */
 enum { AW_SK_DECLINE, AW_SK_KEY, AW_SK_STRICT };
 typedef struct { char kind; int mode; const char* q; } aw_sk_q_t;
-/* The STR key's encoding mix on generation 2 (kinds k and u): what
+/* The STR key's encoding mix on generation 2 (kinds k and u; kind c holds
+ * CONST vectors beside FSST / RAW ones under selection): what
  * selection gives the data (P6: every chunk a dictionary chunk, so every
  * vector STR_DICT, the constant runs included), or every vector RAW when
  * the tables were saved forced RAW (the RAW cursor path). */
@@ -4852,7 +4866,13 @@ static test_result_t aw_str_key_check(const char* tag, const aw_sk_q_t* qs, bool
         ray_release(t);
         if (qs[i].mode != AW_SK_DECLINE) {
             TEST_ASSERT_FMT(!info.materialized, "%s%c %s: t materialized", tag, qs[i].kind, qs[i].q);
-            if (qs[i].kind != 'n' && qs[i].kind != 'o') {
+            if (qs[i].kind == 'c' && mix == AW_SK_MIX_SELECT)
+                TEST_ASSERT_FMT(info.vectors[RAY_ENC_CONST] > 0 &&
+                                info.vectors[RAY_ENC_FSST] + info.vectors[RAY_ENC_RAW] > 0,
+                                "%sc: RAW %lld CONST %lld STR_DICT %lld FSST %lld", tag,
+                                (long long)info.vectors[RAY_ENC_RAW], (long long)info.vectors[RAY_ENC_CONST],
+                                (long long)info.vectors[RAY_ENC_STR_DICT], (long long)info.vectors[RAY_ENC_FSST]);
+            else if (qs[i].kind != 'n' && qs[i].kind != 'o') {
                 if (mix == AW_SK_MIX_SELECT)
                     TEST_ASSERT_FMT(info.vectors[RAY_ENC_STR_DICT] > 0 && info.vectors[RAY_ENC_RAW] == 0 &&
                                     info.vectors[RAY_ENC_CONST] == 0 && info.vectors[RAY_ENC_FSST] == 0,
@@ -4935,6 +4955,12 @@ static const aw_sk_q_t* aw_str_key_queries(void) {
         { 'k', AW_SK_DECLINE, "(select {d: (count (distinct t)) from: T by: t asc: t})" },
         { 'k', AW_SK_DECLINE, "(select {c: (count v) from: T by: {t: t u: (concat t \"x\")} asc: t})" },
         { 'n', AW_SK_DECLINE, "(select {c: (count v) from: T by: {t: t l: (strlen t)} asc: [t l]})" },
+        /* CONST vectors (kind c): the key path's cursor over CONST and
+         * FSST / RAW vectors, sorted and in first-occurrence order */
+        { 'c', AW_SK_STRICT,  "(select {c: (count v) s: (sum v) from: T by: t asc: t})" },
+        { 'c', AW_SK_STRICT,  "(select {c: (count v) s: (sum v) from: T by: t})" },
+        { 'c', AW_SK_STRICT,  "(select {c: (count v) from: T where: (> v 1000) by: t})" },
+        { 'c', AW_SK_KEY,     "(select {c: (count v) from: T by: {t: t m: (% v 3)} asc: [t m]})" },
         { 0, 0, NULL },
     };
     return qs;

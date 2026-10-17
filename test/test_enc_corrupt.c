@@ -1736,14 +1736,15 @@ static test_result_t test_fuzz_flips(void) {
     int rej_all_total = 0, structural_total = 0, structural_rej = 0;
     for (int base = 0; base < 12; base++) {
         ray_t* v;
-        int force = -1;                 /* bases 6..9: P5 float bodies, saved forced */
+        int force = -1;                 /* bases 6..9: P5 float bodies, saved forced; base 3: RAW STR */
         int need = -1;                  /* bases 10, 11: P6 STR bodies, by selection */
         if (base == 0) v = bool_runs();
         else if (base == 1) { v = ray_vec_new(RAY_I32, 70000); v->len = 70000;
             for (int i = 0; i < 70000; i++) ((int32_t*)ray_data(v))[i] = i % 7 ? i % 300 : NULL_I32; }
         else if (base == 2) v = f64_two_odd();
         else if (base == 3) { v = ray_vec_new(RAY_STR, 50);
-            for (int i = 0; i < 50; i++) v = ray_str_vec_append(v, i % 3 ? "a long pooled string value" : "s", i % 3 ? 26 : 1); }
+            for (int i = 0; i < 50; i++) v = ray_str_vec_append(v, i % 3 ? "a long pooled string value" : "s", i % 3 ? 26 : 1);
+            force = RAY_ENC_RAW; }   /* P6: the RAW STR body is this base's subject (selection takes STR_DICT, base 10's) */
         else if (base == 4) v = i64_dict();
         else if (base == 5) {   /* an indexed column: flips land in its index region too */
             v = ray_vec_new(RAY_I64, 70000); v->len = 70000;

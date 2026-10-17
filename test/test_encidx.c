@@ -3233,7 +3233,9 @@ static bool ixr_same_table(ray_t* a, ray_t* b) {
 }
 
 /* Every index the save path persists on generation 0 is on the generation-2
- * copy (STR DICT excepted until P6), and no auto pass touched a gen-2 file. */
+ * copy, and no auto pass touched a gen-2 file.  STR DICT (P6): generation 2
+ * persists none (`index` none), but the column is all STR_DICT and over
+ * 65536 rows, so its materialization builds the same DICT at runtime. */
 static test_result_t test_converter_parity(void) {
     FILE* f = fopen(ray_test_tmp(IDX_TMP "/in.csv"), "w");
     TEST_ASSERT_NOT_NULL(f);
@@ -3257,6 +3259,12 @@ static test_result_t test_converter_parity(void) {
         TEST_ASSERT_EQ_I(k0, ray_sym_intern("chunk_zone", 10));       /* the kind is there */
         TEST_ASSERT_EQ_I(k0, ixr_i64(q2));                             /* chunk_zone on both */
     }
+    TEST_ASSERT_EQ_I(ixr_i64("(at (.idx.info C 's) 'gen)"), 2);
+    TEST_ASSERT_EQ_I(ixr_i64("(at (.idx.info C 's) 'index)"), ray_sym_intern("none", 4));   /* none persisted */
+    TEST_ASSERT_EQ_I(ixr_i64("(at (.idx.info (at A 's)) 'kind)"), ray_sym_intern("dict", 4));
+    TEST_ASSERT_EQ_I(ixr_i64("(at (.idx.info (at C 's)) 'kind)"), ray_sym_intern("dict", 4));   /* the runtime DICT */
+    TEST_ASSERT_EQ_I(ixr_i64("(at (.idx.info (at C 's)) 'n_distinct)"), ixr_i64("(at (.idx.info (at A 's)) 'n_distinct)"));
+    TEST_ASSERT_EQ_I(ixr_i64("(at (.idx.info (at C 's)) 'n_distinct)"), 50);
     /* explicit indexes, then .db.splayed.set: generation 2 keeps the kind */
     r = ixr_eval("(.db.splayed.set \"" IDX_TMP "/e2/\" (table [u s] (list (.idx.hash (at A 'u)) (.idx.hash (at A 's)))) {compress: true})"); if (r) ray_release(r);
     r = ixr_eval("(set E (.db.splayed.get \"" IDX_TMP "/e2/\"))"); if (r) ray_release(r);

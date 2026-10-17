@@ -1025,6 +1025,11 @@ static test_result_t test_matrix_failure_inject(void) {
             TEST_ASSERT_TRUE(m1.bytes_allocated == m0.bytes_allocated);
         }
         TEST_ASSERT_FMT(ok_at > 0, "encoded -> %d: no success within the bound", g);
+        /* encoded -> 0 decodes, so its loop must really inject (7 points at
+         * HEAD: materialize, chunk_pool, pool, dict_pool_off, chunk results,
+         * DICT codes, DICT root); encoded -> 2 is a passenger copy that
+         * decodes nothing (succeeds at nth 1, recorded in Task 4b) */
+        if (g == 0) TEST_ASSERT_FMT(ok_at > 1, "encoded -> 0: no injection fired (ok at nth %d)", ok_at);
     }
     (void)remove(ray_test_tmp(CS_TMP "/g"));
     ray_mem_stats(&m0);                                     /* the successful encoded -> 0 cached its materialization */

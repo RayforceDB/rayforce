@@ -2312,8 +2312,21 @@ static test_result_t test_descriptor_null_sum(void) {
 /* STR statistics on a RAW / CONST vector are corrupt, not "newer build". */
 static test_result_t test_str_stats_corrupt(void) {
     ray_t* v = make_col(RAY_STR, 100, 0);
-    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(ENCCOL_TMP "/ss"), 2), RAY_OK);
+    /* P6: a RAW vector is this test's subject (selection takes FSST) */
+    ray_encw_test_force(RAY_ENC_RAW);
+    ray_err_t se = ray_col_save_gen(v, ray_test_tmp(ENCCOL_TMP "/ss"), 2);
+    ray_encw_test_force(-1);
     ray_release(v);
+    TEST_ASSERT_EQ_I(se, RAY_OK);
+    {
+        uint8_t enc0 = 0xFF;
+        FILE* f = fopen(ray_test_tmp(ENCCOL_TMP "/ss"), "rb");
+        TEST_ASSERT_TRUE(f != NULL);
+        bool rd = fseek(f, 160, SEEK_SET) == 0 && fread(&enc0, 1, 1, f) == 1;
+        fclose(f);
+        TEST_ASSERT_TRUE(rd);
+        TEST_ASSERT_EQ_I(enc0, RAY_ENC_RAW);                 /* the patched descriptor is RAW */
+    }
     uint16_t fl = 0; patch(ray_test_tmp(ENCCOL_TMP "/ss"), 160 + 4, &fl, 2);     /* descriptor claims statistics */
     uint64_t one = 1; patch(ray_test_tmp(ENCCOL_TMP "/ss"), 160 + 40, &one, 8);
     ray_t* c = ray_col_mmap(ray_test_tmp(ENCCOL_TMP "/ss"));
