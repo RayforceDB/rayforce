@@ -158,7 +158,7 @@ Query `concat` joins text row by row when every vector operand comes from a sour
 | `except` | binary | Set difference | `(except [1 2 3] [2])` → `[1 3]` |
 | `union` | binary | Set union | `(union [1 2] [2 3])` → `[1 2 3]` |
 | `sect` | binary | Set intersection | `(sect [1 2 3] [2 3 4])` → `[2 3]` |
-| `take` | binary | Take first/last N elements; past the length it cycles (`select … take:` stops at the table's length) | `(take [10 20 30] 2)` → `[10 20]`; `(take [1 2 3] 5)` → `[1 2 3 1 2]` |
+| `take` | binary | Take first/last N elements; past the length it cycles (`select … take:` stops at the table's length). A parted table handle (`.db.parted.get`) is taken as its flat table: the same rows `(at table (til n))` returns, cycling past the row count | `(take [10 20 30] 2)` → `[10 20]`; `(take [1 2 3] 5)` → `[1 2 3 1 2]` |
 | `drop` | binary | Drop first/last N elements | `(drop [10 20 30] 1)` → `[20 30]` |
 | `rotate` | binary | Rotate left by N positions; negative rotates right | `(rotate [1 2 3 4] 1)` → `[2 3 4 1]` |
 | `cut` | binary | Split at sorted 0-based indices | `(cut [1 2 3 4] [2])` → `([1 2] [3 4])` |
