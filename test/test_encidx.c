@@ -4058,6 +4058,12 @@ static test_result_t test_dict_codes_par(void) {
     TEST_ASSERT_NULL(err);
     ray_enc_dict_view_t v;
     TEST_ASSERT_NULL(ray_enc_dict_validate(b, rn, n, "dx", &v));
+    /* the parallel path: the check dispatches exactly when this holds */
+    ray_pool_t* tp = ray_pool_get();
+    if (!ray_pool_par_dispatch_ok(tp, n, RAY_PARALLEL_THRESHOLD)) {
+        free(b); free(c); free(f); free(o); free(by);
+        SKIP("needs pool workers (RAYFORCE_CORES >= 2)");
+    }
     int32_t* copy = malloc((size_t)n * 4);
     TEST_ASSERT_NULL(ray_enc_dict_codes_check(&v, copy, "dx"));
     TEST_ASSERT_TRUE(memcmp(copy, c, (size_t)n * 4) == 0);
@@ -4066,6 +4072,14 @@ static test_result_t test_dict_codes_par(void) {
     ray_t* e = ray_enc_dict_codes_check(&v, NULL, "dx");
     TEST_ASSERT_TRUE(e && strcmp(ray_err_code(e), "corrupt") == 0);
     TEST_ASSERT_TRUE(strstr(ray_error_msg(), "row 250000") != NULL);
+    ray_error_free(e);
+    /* a lower bad row in the first task, of the other kind (before its
+     * first occurrence): the lowest row wins whatever the task order */
+    cd[10] = 500;                                   /* first_occ[500] = 500 > 10 */
+    e = ray_enc_dict_codes_check(&v, NULL, "dx");
+    TEST_ASSERT_TRUE(e && strcmp(ray_err_code(e), "corrupt") == 0);
+    TEST_ASSERT_FMT(strstr(ray_error_msg(), "row 10 ") && strstr(ray_error_msg(), "before its first occurrence"),
+                    "message \"%s\"", ray_error_msg());
     ray_error_free(e);
     free(copy); free(b); free(c); free(f); free(o); free(by);
     PASS();
@@ -4125,7 +4139,17 @@ static test_result_t test_dict_reject_entry_tier_more(void) {
     #undef DX_PATCH_L
     DX_CORRUPT(NULL, 0, 8, "root");
     memcpy(b, g, n);
-    DX_CORRUPT(b, n, 0, "built_for_len");                           /* column of 0 rows */
+    DX_CORRUPT(b, n, 0, "built_for_len");                           /* root 8 rows, column 0: mismatch */
+    /* the len < 1 range rule: built_for_len and the column agree */
+    int64_t zero = 0, neg = -1;
+    memcpy(b + 8, &zero, 8); DX_CORRUPT(b, n, 0, "INT32_MAX");
+    memcpy(b + 8, &neg, 8);  DX_CORRUPT(b, n, -1, "INT32_MAX");
+    /* the code tier refuses the zeroed view a failed validation leaves */
+    TEST_ASSERT_NOT_NULL(e = ray_enc_dict_validate(b, n, -1, "dx", &v));
+    ray_error_free(e);
+    e = ray_enc_dict_codes_check(&v, NULL, "dx");
+    TEST_ASSERT_TRUE(e && strcmp(ray_err_code(e), "type") == 0);
+    ray_error_free(e);
     free(b); free(g);
     PASS();
 }

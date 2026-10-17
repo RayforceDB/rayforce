@@ -327,8 +327,12 @@ ray_t* ray_enc_index_write(FILE* f, const ray_enc_idx_src_t* s, uint64_t* bytes)
  * the terminal bytes_len) and the entry bytes (bytes_len), the region
  * ending at pad32.  Every pad byte is zero. */
 
-/* The count rules the writer refuses (nyi) and the entry tier rejects
- * (corrupt) on the same terms. */
+/* The count and offset rules: the writer refuses a source breaking one
+ * (nyi), the entry tier rejects a region breaking one (corrupt), both
+ * through this predicate (the entry tier on the in-region offsets, after
+ * the layout is proven, with its terminal offs[nd] == bytes_len).  The
+ * first-occurrence rules are the entry tier's alone; see the writer's
+ * header comment. */
 static const char* ei_dict_rule(int64_t len, int64_t nd, const uint64_t* offs, uint64_t bytes_len) {
     if (len < 1 || len > INT32_MAX) return "rows outside 1 .. INT32_MAX";
     if (nd < 1 || nd > len) return "n_distinct outside 1 .. rows";
@@ -349,6 +353,8 @@ ray_t* ray_enc_dict_write(FILE* f, const ray_enc_dict_src_t* s, uint64_t* bytes)
     uint64_t cb[4] = { (uint64_t)s->len * 4, nd * 4, (nd + 1) * 8, s->bytes_len };
     ei_layout_t L;
     if (!ei_layout(4, cb, 0, &L)) EI_NYI("index region: DICT too large");
+    for (int i = 0; i < 4; i++)   /* a 32-bit host: every child's size fits a size_t */
+        if ((uint64_t)(size_t)cb[i] != cb[i]) EI_NYI("index region: DICT too large");
     uint8_t root[RAY_ENC_IDX_FIRST_CHILD];
     memset(root, 0, sizeof root);
     root[0] = (uint8_t)RAY_STR;
@@ -362,7 +368,7 @@ ray_t* ray_enc_dict_write(FILE* f, const ray_enc_dict_src_t* s, uint64_t* bytes)
     EI_PUT(root, sizeof root);
     EI_PAD(L.off[0]); EI_PUT(s->codes, (size_t)cb[0]);
     EI_PAD(L.off[1]); EI_PUT(s->first_occ, (size_t)cb[1]);
-    EI_PAD(L.off[2]); EI_PUT(s->offs, (size_t)nd * 8); EI_PUT(&s->bytes_len, 8);   /* the terminal offset */
+    EI_PAD(L.off[2]); EI_PUT(s->offs, (size_t)cb[2] - 8); EI_PUT(&s->bytes_len, 8);   /* the terminal offset */
     EI_PAD(L.off[3]); if (s->bytes_len) EI_PUT(s->bytes, (size_t)s->bytes_len);
     EI_PAD(L.end);
     #undef EI_PUT
@@ -434,10 +440,14 @@ ray_t* ray_enc_dict_validate(const uint8_t* b, uint64_t size, int64_t len,
         at = L.off[i] + L.bytes[i];
     }
     if (!ev_zero(b + at, size - at)) EV("column %s: DICT region tail padding set", path);
-    /* offs[0 .. nd] lie in the region (the layout); nd <= len <= INT32_MAX */
+    /* offs[0 .. nd] lie in the region (the layout): the writer's rules on
+     * them, and the terminal pinned to bytes_len */
     const uint64_t* offs = (const uint64_t*)(b + d.offs);
-    if (!ray_enc_sdict_offsets_ok(offs, (uint32_t)nd, ray_enc_pad8(d.bytes_len)) || offs[nd] != d.bytes_len)
-        EV("column %s: DICT offsets", path);
+    const char* why = ei_dict_rule(len, d.n_distinct, offs, d.bytes_len);
+    if (why) EV("column %s: DICT offsets: %s", path, why);
+    if (offs[nd] != d.bytes_len)
+        EV("column %s: DICT offsets: terminal %llu, bytes_len %llu", path, (unsigned long long)offs[nd],
+           (unsigned long long)d.bytes_len);
     const int32_t* fo = (const int32_t*)(b + d.first_occ);
     if (fo[0] != 0) EV("column %s: DICT first occurrence of code 0 is row %d", path, fo[0]);
     for (uint64_t c = 1; c < nd; c++)
@@ -479,6 +489,9 @@ static void ev_dict_rows(void* ctx, uint32_t wid, int64_t lo, int64_t hi) {
 
 ray_t* ray_enc_dict_codes_check(const ray_enc_dict_view_t* v, int32_t* copy, const char* path) {
     if (!path) path = "?";
+    /* a zeroed view (a failed ray_enc_dict_validate) or one never validated */
+    if (!v || !v->codes || !v->first_occ || v->len < 1 || v->n_distinct < 1)
+        return ray_error("type", "column %s: DICT code check on an unvalidated view", path);
     ev_dict_par_t x = { .v = v, .copy = copy };
     atomic_store(&x.bad, INT64_MAX); atomic_store(&x.done, 0);
     ray_pool_t* pool = ray_pool_get();

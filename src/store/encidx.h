@@ -232,11 +232,14 @@ typedef struct {               /* a region past the entry tier: pointers into it
 
 /* Stream the DICT region of s to f at its position (spec "Index region",
  * DICT); *bytes its size, a multiple of 32.  nyi naming DICT for a source
- * the validator would refuse on its counts (n_distinct outside 1..len, len
- * outside 1..INT32_MAX, offsets not starting at 0, decreasing, an entry
- * over UINT32_MAX bytes or not ending at bytes_len); io on a short write.
- * The codes' order rules are not re-checked here: the writer's caller
- * (ray_encw) gives ray_dict_acc_t's codes, which hold them by construction. */
+ * the validator would refuse on its counts or offsets (the one predicate
+ * both use: n_distinct outside 1..len, len outside 1..INT32_MAX, offsets
+ * not starting at 0, decreasing, an entry over UINT32_MAX bytes or past
+ * bytes_len) or a child too large for this host's size_t; io on a short
+ * write.  The first-occurrence rules (first_occ[0] == 0, strictly
+ * ascending, below len) and the codes' rules are not checked here: the
+ * writer's caller (ray_encw) gives ray_dict_acc_t's arrays, which hold them
+ * by construction, and the validator rejects a region breaking them. */
 ray_t* ray_enc_dict_write(FILE* f, const ray_enc_dict_src_t* s, uint64_t* bytes);
 
 /* The entry tier of spec "Index validation" (DICT), except distinctness:
@@ -246,8 +249,9 @@ ray_t* ray_enc_dict_write(FILE* f, const ray_enc_dict_src_t* s, uint64_t* bytes)
 ray_t* ray_enc_dict_validate(const uint8_t* region, uint64_t size, int64_t len,
                              const char* path, ray_enc_dict_view_t* out);
 
-/* The code tier: every code in [0, n_distinct), codes[first_occ[c]] == c,
- * first_occ[codes[i]] <= i.  Parallel above RAY_PARALLEL_THRESHOLD rows;
+/* The code tier, on a view ray_enc_dict_validate filled (a zeroed or
+ * unvalidated view is a type error): every code in [0, n_distinct),
+ * codes[first_occ[c]] == c, first_occ[codes[i]] <= i.  Parallel above RAY_PARALLEL_THRESHOLD rows;
  * writes copy[0 .. len) when copy is not NULL.  NULL, an owned corrupt
  * error naming `path` and the lowest failing row, or cancel (a dispatch
  * that skipped rows, or a pending interrupt: never a verdict on part of
