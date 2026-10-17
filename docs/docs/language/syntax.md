@@ -74,6 +74,8 @@ end of its month is normalized by the calendar rather than rejected, so
 ### Times
 
 Time-of-day literals in HH:MM:SS.mmm format. Stored as milliseconds since midnight (i32).
+Values past 24 hours and negative values are valid; for the range, and what an
+out-of-range result becomes, see [Date/Time types](../guides/types.md#date-time).
 
 ```lisp
 09:30:00.000  ; 9:30 AM

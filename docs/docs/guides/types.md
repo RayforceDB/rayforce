@@ -269,6 +269,12 @@ Rayforce has three temporal types, all stored as integers internally:
 | `time` | i32 | Milliseconds since midnight | `12:30:00.000` |
 | `timestamp` | i64 | Nanoseconds since 2000-01-01 midnight | `2024.01.15D12:30:00.000000000` |
 
+`date` and `time` are 32-bit counts (of days and of milliseconds). A `time`
+is not limited to one day: `48:00:00.000` and negative values are valid, up to
+about ±596 hours. A result past the 32-bit range keeps its low 32 bits, the
+same for an atom and for a vector cell, so `(* 25 24:00:00.000)` is
+`-593:02:47.296`.
+
 **Date arithmetic:**
 
 ```lisp
