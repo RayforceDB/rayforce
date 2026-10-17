@@ -962,7 +962,7 @@ static test_result_t test_pool_order(void) {
     if (m && RAY_IS_ERR(m)) st_hold(m);
     TEST_ASSERT_FMT(m && !RAY_IS_ERR(m), "materialize: %s", ray_error_msg() ? ray_error_msg() : "");
     TEST_ASSERT_TRUE(st_same(m, v));
-    TEST_ASSERT_FALSE(ray_index_has(m));                   /* chunk 1 is no dictionary chunk: no DICT */
+    TEST_ASSERT_FALSE(ray_index_has(m));                   /* a bare file records no DICT (P6b) */
     const char* pool = (const char*)ray_data(m->str_pool);
     TEST_ASSERT_EQ_U((uint64_t)m->str_pool->len, ray_enccol_of(c)->hdr.str_pool_bytes);
     /* the dictionary region: entries over 12 bytes, once, in code order */
@@ -1978,7 +1978,7 @@ static test_result_t test_abandonment(void) {
     const ray_enc_sdict_t* sd;
     TEST_ASSERT_NULL(ray_enccol_strdict(ray_enccol_of(c), &sd));
     TEST_ASSERT_TRUE(sd && sd->n == RAY_ENCW_SDICT_CAP);
-    TEST_ASSERT_FALSE(ray_enccol_may_have_index(c));       /* D9: chunks 32, 33 carry no code bounds */
+    TEST_ASSERT_FALSE(ray_enccol_may_have_index(c));       /* a bare file: no recorded kind, no UNIQUE (P6b) */
     ray_t* m = ray_enccol_materialize(c);                  /* borrowed: the column's cache */
     TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m) && st_same(m, v));
     TEST_ASSERT_EQ_I(ray_index_kind(m), RAY_IDX_NONE);
@@ -2137,8 +2137,9 @@ static ray_t* st_dict_view(const char* rel, const char* col, uint8_t** m, ray_en
 }
 
 /* Generation 0's condition, per write path: 65535 rows (none), 65536
- * (DICT), a HASH column (HASH), a bare file and a staged save (none), the
- * test hook (none); the region's codes equal generation 0's. */
+ * (DICT), a HASH column (HASH), a bare file (none), a staged save (none on
+ * both generations: it builds no indexes), the test hook (none); the
+ * region's codes equal generation 0's. */
 static test_result_t test_idict_build_condition(void) {
     ST_Q_OK("(set S (as 'STR (map (fn [j] (format \"value % of the domain\" (% (* j 7919) 300))) (til 65536))))");
     ST_Q_OK("(.db.splayed.set \"" ST_TMP "/c65536/\" (table [s] (list S)) {compress: true})");
@@ -2168,6 +2169,21 @@ static test_result_t test_idict_build_condition(void) {
     ray_t* sv = st_hold(ray_eval_str("S"));
     TEST_ASSERT_EQ_I(ray_col_save_gen(sv, STP("/bare"), 2), RAY_OK);
     TEST_ASSERT_EQ_I(st_hdr(STP("/bare")).index_kind, 0);
+    /* a staged save (the parted converter's leaf save): generation 0
+     * attaches no DICT there, so generation 2 records none */
+    ray_t* tb = st_hold(ray_eval_str("(table [s] (list S))"));
+    TEST_ASSERT_TRUE(tb && !RAY_IS_ERR(tb));
+    TEST_ASSERT_EQ_I(ray_splay_save_staged_bulk_mode(tb, STP("/sg0"), NULL, RAY_COMPRESS_OFF), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_save_staged_bulk_mode(tb, STP("/sg2"), NULL, RAY_COMPRESS_ON), RAY_OK);
+    ray_t* s0 = st_hold(ray_eval_str(ray_test_tmp("(.db.splayed.get \"" ST_TMP "/sg0/\")")));
+    TEST_ASSERT_TRUE(s0 && !RAY_IS_ERR(s0));
+    ray_t* a0 = ray_table_col(s0, ray_sym_intern("s", 1));
+    TEST_ASSERT_TRUE(a0 && !RAY_IS_ERR(a0));
+    TEST_ASSERT_EQ_I(ray_index_kind(a0), RAY_IDX_NONE);
+    TEST_ASSERT_TRUE(st_live("/sg2", "s", p, sizeof p));
+    const ray_enc_hdr_t sh = st_hdr(p);
+    TEST_ASSERT_TRUE(memcmp(sh.magic, "RENC", 4) == 0);   /* a generation-2 file */
+    TEST_ASSERT_EQ_I(sh.index_kind, 0);
     /* the hook suppresses the build */
     ray_col_test_no_dict(true);
     ST_Q_OK("(.db.splayed.set \"" ST_TMP "/cn/\" (table [s] (list S)) {compress: true})");
@@ -2426,10 +2442,14 @@ static test_result_t test_idict_runtime_gone(void) {
 
 /* Review fix 4: pool workers race the first touch of both tiers on a fresh
  * column.  Sound file: every racer sees the one entry-tier blob, the one
- * code-tier vector and the right codes (code of row i is i % 300).
- * Forged files (a duplicate entry: the entry tier; a late code: the code
- * tier): every racer gets the one cached corrupt verdict, and no racer's
- * heap keeps anything of the failed attempt. */
+ * code-tier vector and the right codes (code of row i is i % 300), and the
+ * racers' heaps together keep exactly what one serial first touch keeps
+ * (the published blob and vector; no loser keeps a copy).  Forged files (a
+ * duplicate entry: the entry tier; a late code: the code tier): every racer
+ * gets the one cached corrupt verdict, and no racer's heap keeps anything
+ * of the failed attempt.  Every iteration requires every racer to have
+ * left the barrier with all racers arrived, so a barrier timeout (racers
+ * run one after another) fails instead of passing serially. */
 #define IR_SLOTS 64
 typedef struct {
     ray_enccol_t*      e;
@@ -2441,7 +2461,8 @@ typedef struct {
     const void*        cv[IR_SLOTS];
     char               msg[IR_SLOTS][128];
     int                bad[IR_SLOTS];
-    int64_t            leak[IR_SLOTS];
+    int64_t            leak[IR_SLOTS];         /* the racer's heap delta over its window */
+    int                met[IR_SLOTS];          /* the racer left the barrier with every racer arrived */
     uint32_t           wid[IR_SLOTS];
 } ir_race_t;
 static void ir_race_task(void* ctx, uint32_t wid, int64_t lo, int64_t hi) {
@@ -2452,6 +2473,7 @@ static void ir_race_task(void* ctx, uint32_t wid, int64_t lo, int64_t hi) {
     x->wid[k] = wid;
     atomic_fetch_add(&x->arrived, 1);
     for (long spin = 0; atomic_load(&x->arrived) < x->want && spin < 20000000L; spin++) {}
+    x->met[k] = atomic_load(&x->arrived) >= x->want;   /* else a silent timeout: the racers ran serially */
     ray_mem_stats_t m0, m1;
     const ray_enc_idict_t* d = NULL;
     ray_t* cv = NULL;
@@ -2464,6 +2486,10 @@ static void ir_race_task(void* ctx, uint32_t wid, int64_t lo, int64_t hi) {
     ray_t* err = x->mode == 2 ? NULL : ray_enccol_idict(x->e, &d);
     if (!err && x->mode != 2) x->d[k] = d;
     if (!err) err = ray_enccol_idict_codes_vec(x->e, &cv);
+    if (!err) {
+        ray_mem_stats(&m1);
+        x->leak[k] = (int64_t)m1.bytes_allocated - (int64_t)m0.bytes_allocated;
+    }
     if (err) {
         snprintf(x->msg[k], sizeof x->msg[k], "%s: %s", ray_err_code(err), ray_error_msg() ? ray_error_msg() : "");
         ray_error_free(err);
@@ -2497,6 +2523,23 @@ static test_result_t test_idict_first_touch_race(void) {
     TEST_ASSERT_NOT_NULL(pool);
     const uint32_t nw = ray_pool_total_workers(pool);
     const uint32_t ntask = nw * 2 < IR_SLOTS ? nw * 2 : IR_SLOTS;
+    /* what one serial first touch keeps on this thread's heap */
+    int64_t kept = 0;
+    {
+        ray_t* c = ray_col_mmap(p);
+        TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+        ray_mem_stats_t m0, m1;
+        const ray_enc_idict_t* d = NULL; ray_t* cv = NULL;
+        ray_mem_stats(&m0);
+        ray_t* err = ray_enccol_idict(ray_enccol_of(c), &d);
+        if (!err) err = ray_enccol_idict_codes_vec(ray_enccol_of(c), &cv);
+        ray_mem_stats(&m1);
+        ray_release(c);
+        if (err) ray_error_free(err);
+        TEST_ASSERT_TRUE(err == NULL && d && cv);
+        kept = (int64_t)m1.bytes_allocated - (int64_t)m0.bytes_allocated;
+        TEST_ASSERT_TRUE(kept > 0);
+    }
     static ir_race_t x;
     bool workers_seen = false;
     for (int mode = 0; mode < 3; mode++) {
@@ -2516,8 +2559,10 @@ static test_result_t test_idict_first_touch_race(void) {
             ray_pool_dispatch_n(pool, ir_race_task, &x, ntask);
             const int n = atomic_load(&x.next) < (int)ntask ? atomic_load(&x.next) : (int)ntask;
             bool ok = n == (int)ntask;
+            int64_t held = 0;
             for (int k = 0; k < n && ok; k++) {
-                ok = !x.bad[k] && x.leak[k] == 0;
+                ok = !x.bad[k] && x.met[k] && (mode == 0 ? x.leak[k] >= 0 : x.leak[k] == 0);
+                held += x.leak[k];
                 if (mode == 0) ok = ok && x.msg[k][0] == 0 && x.d[k] == x.d[0] && x.cv[k] == x.cv[0] &&
                                     x.cv[k] == (const void*)x.e->icodes && x.d[k] != NULL;
                 else ok = ok && x.cv[k] == NULL && strcmp(x.msg[k], x.msg[0]) == 0 &&
@@ -2526,9 +2571,11 @@ static test_result_t test_idict_first_touch_race(void) {
                           (mode == 1 ? x.d[k] == NULL : x.d[k] == x.d[0] && x.d[k] != NULL);
             }
             if (mode && ok) ok = (mode == 1 ? x.e->idict == NULL : x.e->icodes == NULL);   /* nothing published */
+            if (!mode && ok) ok = held == kept;                /* the one blob and vector, nothing else */
             for (int k = 1; k < n; k++) if (x.wid[k] != x.wid[0]) { workers_seen = true; break; }
             ray_release(c);
-            TEST_ASSERT_FMT(ok, "mode %d iteration %d (%d tasks): %s", mode, it, n, n ? x.msg[0] : "");
+            TEST_ASSERT_FMT(ok, "mode %d iteration %d (%d tasks, held %lld of %lld): %s", mode, it, n,
+                            (long long)held, (long long)kept, n ? x.msg[0] : "");
         }
     }
     if (pool->n_workers > 0) TEST_ASSERT_TRUE(workers_seen);   /* the racers ran on more than one worker */

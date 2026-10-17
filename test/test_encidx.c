@@ -3274,9 +3274,10 @@ static bool ixr_same_table(ray_t* a, ray_t* b) {
 }
 
 /* Every index the save path persists on generation 0 is on the generation-2
- * copy, and no auto pass touched a gen-2 file.  STR DICT (P6): generation 2
- * persists none (`index` none), but the column is all STR_DICT and over
- * 65536 rows, so its materialization builds the same DICT at runtime. */
+ * copy, and no auto pass touched a gen-2 file.  STR DICT (P6b): the
+ * converter persists generation 0's DICT on generation 2 (over 65536 rows,
+ * no HASH), recorded in the header before materialization and attached to
+ * the materialized column after it. */
 static test_result_t test_converter_parity(void) {
     FILE* f = fopen(ray_test_tmp(IDX_TMP "/in.csv"), "w");
     TEST_ASSERT_NOT_NULL(f);
@@ -3301,9 +3302,14 @@ static test_result_t test_converter_parity(void) {
         TEST_ASSERT_EQ_I(k0, ixr_i64(q2));                             /* chunk_zone on both */
     }
     TEST_ASSERT_EQ_I(ixr_i64("(at (.idx.info C 's) 'gen)"), 2);
-    TEST_ASSERT_EQ_I(ixr_i64("(at (.idx.info C 's) 'index)"), ray_sym_intern("none", 4));   /* none persisted */
+    /* P6b: generation 2 persists the DICT (spec "STR dictionary index"),
+     * recorded before materialization and attached after it */
+    TEST_ASSERT_EQ_I(ixr_i64("(if (at (.idx.info C 's) 'materialized) 1 0)"), 0);
+    TEST_ASSERT_EQ_I(ixr_i64("(at (.idx.info C 's) 'index)"), ray_sym_intern("dict", 4));   /* recorded */
     TEST_ASSERT_EQ_I(ixr_i64("(at (.idx.info (at A 's)) 'kind)"), ray_sym_intern("dict", 4));
-    TEST_ASSERT_EQ_I(ixr_i64("(at (.idx.info (at C 's)) 'kind)"), ray_sym_intern("dict", 4));   /* the runtime DICT */
+    TEST_ASSERT_EQ_I(ixr_i64("(at (.idx.info (at C 's)) 'kind)"), ray_sym_intern("dict", 4));   /* attached */
+    TEST_ASSERT_EQ_I(ixr_i64("(if (at (.idx.info C 's) 'materialized) 1 0)"), 1);
+    TEST_ASSERT_EQ_I(ixr_i64("(at (.idx.info C 's) 'index)"), ray_sym_intern("dict", 4));
     TEST_ASSERT_EQ_I(ixr_i64("(at (.idx.info (at C 's)) 'n_distinct)"), ixr_i64("(at (.idx.info (at A 's)) 'n_distinct)"));
     TEST_ASSERT_EQ_I(ixr_i64("(at (.idx.info (at C 's)) 'n_distinct)"), 50);
     /* explicit indexes, then .db.splayed.set: generation 2 keeps the kind */
@@ -3314,6 +3320,45 @@ static test_result_t test_converter_parity(void) {
     TEST_ASSERT_EQ_I(ixr_i64("(at (.idx.info E 's) 'gen)"), 2);
     TEST_ASSERT_EQ_I(ixr_i64("(at (.idx.info E 's) 'index)"), ray_sym_intern("hash", 4));
     TEST_ASSERT_EQ_I(ixr_i64("(count (select {from: E where: (== s \"name7\")}))"), 4000);
+    PASS();
+}
+
+/* Task 2 review Minor 2: the converter's DICT floor is generation 0's,
+ * 65536 rows.  At 65535 rows neither generation has a DICT (kind 0 recorded);
+ * at 65536 both do (kind 7 recorded, read from the header, nothing
+ * materialized). */
+static test_result_t test_converter_dict_boundary(void) {
+    static const int rows[2] = { 65535, 65536 };
+    for (int b = 0; b < 2; b++) {
+        char csv[128], q[600];
+        snprintf(csv, sizeof csv, IDX_TMP "/b%d.csv", rows[b]);
+        FILE* f = fopen(ray_test_tmp(csv), "w");
+        TEST_ASSERT_NOT_NULL(f);
+        fprintf(f, "v,s\n");
+        for (int i = 0; i < rows[b]; i++) fprintf(f, "%d,name%d\n", i, (i * 7919) % 300);
+        fclose(f);
+        for (int g = 0; g <= 2; g += 2) {
+            snprintf(q, sizeof q, "(.csv.splayed {compress: %s} [I64 STR] \"%s\" \"" IDX_TMP "/b%d_%d/\")",
+                     g ? "true" : "false", csv, rows[b], g);
+            ray_t* r = ixr_eval(q); if (r) ray_release(r);
+        }
+        snprintf(q, sizeof q, "(.db.splayed.get \"" IDX_TMP "/b%d_2/\")", rows[b]);
+        ray_t* t = ixr_eval(q);
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        ray_col_meta_t m;
+        ray_enc_counters_reset();
+        const bool got = ray_table_col_meta(t, ray_sym_intern("s", 1), &m);
+        ray_enc_counters_t k; ray_enc_counters_get(&k);
+        ray_release(t);
+        TEST_ASSERT_TRUE(got);
+        TEST_ASSERT_FMT(m.enc != NULL, "%d rows: generation 2", rows[b]);
+        TEST_ASSERT_FMT(m.index_kind == (b ? RAY_IDX_DICT : RAY_IDX_NONE), "%d rows: kind %u", rows[b], m.index_kind);
+        TEST_ASSERT_EQ_U(k.materialized, 0);
+        /* generation 0 over the same file: the same decision */
+        if (b) snprintf(q, sizeof q, "(at (.idx.info (at (.db.splayed.get \"" IDX_TMP "/b%d_0/\") 's)) 'kind)", rows[b]);
+        else   snprintf(q, sizeof q, "(if (.idx.has? (at (.db.splayed.get \"" IDX_TMP "/b%d_0/\") 's)) 1 0)", rows[b]);
+        TEST_ASSERT_EQ_I(ixr_i64(q), b ? ray_sym_intern("dict", 4) : 0);
+    }
     PASS();
 }
 
@@ -4290,6 +4335,7 @@ const test_entry_t encidx_entries[] = {
     { "idxval/sym_stale_part_unbuildable", test_sym_stale_part_unbuildable, ix_setup, ix_teardown },
     { "idxval/corrupt_sym_hash_null_key",  test_corrupt_sym_hash_null_key,  ixr_setup, ixr_teardown },
     { "idxval/converter_parity",      test_converter_parity,      ixr_setup, ixr_teardown },
+    { "idxval/converter_dict_boundary", test_converter_dict_boundary, ixr_setup, ixr_teardown },
     { "idxval/use_materializes_once", test_use_materializes_once, ixr_setup, ixr_teardown },
     { "idxval/parted_segment_index",  test_parted_segment_index,  ixr_setup, ixr_teardown },
     { "idxval/unique_attr_get",       test_unique_attr_get,       ixr_setup, ixr_teardown },

@@ -93,9 +93,9 @@
 (set _BT (table [id note] (list (til _N) (at (list "alpha" "beta" "gamma" "delta") (% (til _N) 4)))))
 (.db.splayed.set "rf_bigstr/" _BT)
 (set _BT 0)
-;; (a generation-2 save, as in the equivalence pass, persists no dict index,
-;; but the column is all STR_DICT and over 65536 rows, so materialization
-;; builds the same DICT at runtime, P6: indexed in both generations)
+;; (a generation-2 save, as in the equivalence pass, persists the same dict
+;; index in the column's index region, P6b: over 65536 rows, so indexed in
+;; both generations)
 (.idx.has? (at (.db.splayed.get "rf_bigstr/") 'note)) -- true
 
 (set _m0 (at (.sys.mem) 'sys-mapped))
