@@ -137,6 +137,11 @@
 
 /* ===== Internal Allocator Variants ===== */
 
+/* ray_free for a block whose last reference was just dropped: v is not
+ * NULL, not an error and not arena-owned, the checks ray_release_last
+ * already made.  ray_release frees through it. */
+void      ray_free_last_ref(ray_t* v);
+
 ray_t*    ray_alloc_copy(ray_t* v);
 ray_t*    ray_scratch_alloc(size_t data_size);
 ray_t*    ray_scratch_realloc(ray_t* v, size_t new_data_size);
