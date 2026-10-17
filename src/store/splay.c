@@ -691,7 +691,15 @@ static void splay_clear_created(const ray_splay_write_t* write) {
             if (stat(child, &st) != 0 || splay_was_there(write, (uint64_t)st.st_ino))
                 continue;
         }
-        splay_remove_tree_best_effort(child);
+        /* A link goes, never what it points to. */
+        struct stat st;
+#ifdef RAY_OS_WINDOWS
+        if (stat(child, &st) != 0) continue;
+#else
+        if (lstat(child, &st) != 0) continue;
+#endif
+        if (S_ISDIR(st.st_mode)) splay_remove_tree_best_effort(child);
+        else (void)unlink(child);
     }
     closedir(d);
 }

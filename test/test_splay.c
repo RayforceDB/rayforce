@@ -2539,6 +2539,34 @@ static int generation_dir_count(const char* dir) {
 }
 
 #ifndef _WIN32
+/* A failed first write clears what it created in the table directory, but
+ * only unlinks a link found there, never what the link points to. */
+static test_result_t test_failed_first_write_unlinks_symlink(void) {
+    const char* dir = TMP_SPLAY_BASE "/first_write_symlink";
+    const char* victim = TMP_SPLAY_BASE "/first_write_symlink_victim";
+    const char* victim_file = TMP_SPLAY_BASE "/first_write_symlink_victim/keep";
+    rm_rf(dir);
+    rm_rf(victim);
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(victim), 0);
+    FILE* f = fopen(victim_file, "wb");
+    TEST_ASSERT_NOT_NULL(f);
+    fputs("keep", f);
+    fclose(f);
+    ray_splay_write_t write;
+    TEST_ASSERT_EQ_I(ray_splay_write_begin(dir, &write), RAY_OK);
+    char link_path[1024];
+    int n = snprintf(link_path, sizeof(link_path), "%s/outside", dir);
+    TEST_ASSERT_TRUE(n > 0 && (size_t)n < sizeof(link_path));
+    TEST_ASSERT_EQ_I(symlink(victim, link_path), 0);
+    TEST_ASSERT_EQ_I(ray_splay_write_finish(&write, RAY_ERR_IO, false), RAY_ERR_IO);
+    TEST_ASSERT_EQ_I(access(victim_file, F_OK), 0);
+    struct stat st;
+    TEST_ASSERT_TRUE(lstat(link_path, &st) != 0);
+    rm_rf(dir);
+    rm_rf(victim);
+    PASS();
+}
+
 static test_result_t test_generation_prune_unlinks_symlink(void) {
     const char* dir = TMP_SPLAY_BASE "/generation_symlink";
     const char* victim = TMP_SPLAY_BASE "/generation_symlink_victim";
@@ -3235,6 +3263,7 @@ static test_result_t test_save_hash_in_place(void) {
 const test_entry_t splay_entries[] = {
 #ifndef _WIN32
     { "splay/generation_prune_unlinks_symlink", test_generation_prune_unlinks_symlink, splay_setup, splay_teardown },
+    { "splay/failed_first_write_unlinks_symlink", test_failed_first_write_unlinks_symlink, splay_setup, splay_teardown },
 #endif
     { "splay/generation_io_failures", test_generation_io_failures, splay_setup, splay_teardown },
     { "splay/generation_keeps_only_current", test_generation_keeps_only_current, splay_setup, splay_teardown },
