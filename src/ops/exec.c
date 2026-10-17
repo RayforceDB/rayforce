@@ -1594,6 +1594,8 @@ typedef struct {
     const char*      cs;
     uint32_t         clen;
     bool             ne;
+    const char*      cname;    /* the column's name (error texts), cname_len bytes */
+    int              cname_len;
     ray_scan_fail_t* fail;
     /* an installed selection the result is ANDed with (a later conjunct), or NULL */
     const uint8_t*   wflags;
@@ -1640,7 +1642,7 @@ static bool str_seg_fill(const str_sel_ctx_t* x, str_seg_sel_t* s, ray_col_scrat
                         const int64_t k0 = row - v * RAY_ENC_VEC;
                         if (k0 + piece > vv.n) {
                             ray_scan_fail_note(x->fail, key, ray_error("corrupt",
-                                "STR selection: vector %lld holds %d rows", (long long)v, vv.n));
+                                "column %s: STR selection: vector %lld holds %d rows", s->e->path, (long long)v, vv.n));
                             return false;
                         }
                         const uint32_t* cd = vv.codes + k0;
@@ -1659,7 +1661,9 @@ static bool str_seg_fill(const str_sel_ctx_t* x, str_seg_sel_t* s, ray_col_scrat
         ray_col_range_t rv;
         ray_t* err = ray_col_range(s->rs, row, n - at, sc, &rv);
         if (!err && rv.n <= 0)
-            err = ray_error("range", "STR selection: empty range read at row %lld", (long long)row);
+            err = s->e ? ray_error("range", "column %s: STR selection: empty range read at row %lld", s->e->path, (long long)row)
+                       : ray_error("range", "column %.*s: STR selection: empty range read at row %lld",
+                                   x->cname_len, x->cname, (long long)row);
         if (err) { ray_scan_fail_note(x->fail, key, err); return false; }
         const ray_str_t* sd = (const ray_str_t*)rv.data;
         const uint32_t cl = x->clen;
@@ -1747,26 +1751,29 @@ static ray_t* str_sel_run(ray_graph_t* g, ray_op_t* pred, int64_t nrows, ray_t* 
 
     str_sel_ctx_t x = { .cs = ray_str_ptr(re->literal), .clen = (uint32_t)ray_str_len(re->literal),
                         .ne = pred->opcode == OP_NE };
-    ray_scan_fail_t fail; ray_scan_fail_init(&fail);
-    x.fail = &fail;
     int64_t one_off[2] = { 0, nrows };
     str_seg_sel_t one;
     ray_t* ret = NULL;
     bool any_codes = false;
+    ray_t* cn = ray_sym_str(le->sym);                      /* owned: released at out */
+    x.cname = cn && !RAY_IS_ERR(cn) ? ray_str_ptr(cn) : "?";
+    x.cname_len = cn && !RAY_IS_ERR(cn) ? (int)ray_str_len(cn) : 1;
+    ray_scan_fail_t fail; ray_scan_fail_init(&fail);
+    x.fail = &fail;
+
     if (!parted) {
         ray_enccol_t* e = str_sel_codes_col(src->obj);
-        if (!e) return NULL;                       /* materialized: read in place on its path */
+        if (!e) goto decline;                      /* materialized: read in place on its path */
         one = (str_seg_sel_t){ .rs = src, .e = e, .code = -2 };
-        ray_t* ce = ray_enccol_strdict_code(e, x.cs, x.clen, &one.code);
-        if (ce) return ce;
+        if ((ret = ray_enccol_strdict_code(e, x.cs, x.clen, &one.code)) != NULL) goto out;
         x.segs = &one; x.off = one_off; x.n_segs = 1;
         ray_col_src_advise(src, 0, nrows);
     } else {
         int64_t ns = 0; ray_t** segv = NULL; const int64_t* off = NULL;
-        if (!ray_col_src_parted_segs(src, &ns, &segv, &off, &berr)) return berr;
-        if (ns <= 0 || off[ns] != nrows) return NULL;
+        if (!ray_col_src_parted_segs(src, &ns, &segv, &off, &berr)) { ret = berr; goto out; }
+        if (ns <= 0 || off[ns] != nrows) goto decline;
         x.segs = (str_seg_sel_t*)ray_calloc_raw((size_t)ns * sizeof(str_seg_sel_t));
-        if (!x.segs) return NULL;
+        if (!x.segs) goto decline;
         x.off = off; x.n_segs = ns;
         for (int64_t i = 0; i < ns; i++) {
             str_seg_sel_t* s = &x.segs[i];
@@ -1803,6 +1810,8 @@ out:
             if (x.segs[i].bound) ray_col_src_release(&x.segs[i].src);
         ray_free_raw(x.segs);
     }
+    if (cn && !RAY_IS_ERR(cn)) ray_release(cn);
+    else if (cn) ray_error_free(cn);
     return ret;
 }
 

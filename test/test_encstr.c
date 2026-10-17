@@ -1339,12 +1339,12 @@ static test_result_t test_dict_oom_retry(void) {
 
 /* ---- Task 5: STR equality and inequality in filters ---- */
 
-/* The generation-2 run's counters of st_same_q: materializations, decoded
- * bytes, and the STR selections it answered (a first conjunct, a
- * refinement). */
 /* ST_Q_OK for a long local query text: the message is cut */
 #define ST_Q_OK_N(q) TEST_ASSERT_FMT(st_q_run(q), "%.400s: %.400s", (q), st_msg)
 
+/* The generation-2 run's counters of st_same_q: materializations, decoded
+ * bytes, and the STR selections it answered (a first conjunct, a
+ * refinement). */
 typedef struct { uint64_t mat, dec, sel, refine; } st_fk_t;
 
 /* q (table T) on <name>0 and <name>2 (`load` formats the load of the
@@ -1498,6 +1498,8 @@ static test_result_t test_filter_chained(void) {
         TEST_ASSERT_FMT(k.mat == 0, "%s: %llu materializations", qs[i].q, (unsigned long long)k.mat);
         TEST_ASSERT_FMT(k.sel + k.refine >= 1, "%s: no STR selection", qs[i].q);
         if (qs[i].refines) TEST_ASSERT_FMT(k.refine == 1, "%s: %llu refinements", qs[i].q, (unsigned long long)k.refine);
+        else TEST_ASSERT_FMT(k.sel == 1 && k.refine == 0, "%s: %llu first conjuncts, %llu refinements", qs[i].q,
+                             (unsigned long long)k.sel, (unsigned long long)k.refine);
     }
     PASS();
 }
@@ -1522,29 +1524,111 @@ static test_result_t test_filter_parted(void) {
                      gen, p + 1, parts[p], enc ? "true" : "false");
             ST_Q_OK_N(q);
         }
-    static const char* const qs[] = {
-        "(count (select {from: T where: (== s \"cat 5 x\")}))",
-        "(count (select {from: T where: (!= s \"cat 5 x\")}))",
-        "(count (select {from: T where: (== s \"cat 40 x\")}))",           /* partition 2 only */
-        "(count (select {from: T where: (== s \"nope\")}))",
-        "(count (select {from: T where: (== s \"\")}))",                    /* partitions 2 and 4 */
-        "(count (select {from: T where: (!= s \"\")}))",
-        "(count (select {from: T where: (== s \"https://www.example.com/path/7/item?id=4003&ref=search\")}))",
-        "(sum (at (select {from: T where: (== s \"cat 5 x\")}) 'v))",
-        "(count (select {from: T where: (and (> v 1000) (== s \"cat 5 x\"))}))",
-        "(count (select {from: T where: (and (> v 1000) (!= s \"\"))}))",
-        "(count (select {from: T where: (and (in v [0 7 14 1000 2999 4999 69999]) (!= s \"\"))}))",
-        "(count (select {from: T where: (and (== v 7) (!= s \"cat 5 x\"))}))",
+    static const struct { const char* q; bool refines; } qs[] = {
+        { "(count (select {from: T where: (== s \"cat 5 x\")}))", false },
+        { "(count (select {from: T where: (!= s \"cat 5 x\")}))", false },
+        { "(count (select {from: T where: (== s \"cat 40 x\")}))", false },  /* partition 2 only */
+        { "(count (select {from: T where: (== s \"nope\")}))", false },
+        { "(count (select {from: T where: (== s \"\")}))", false },  /* partitions 2 and 4 */
+        { "(count (select {from: T where: (!= s \"\")}))", false },
+        { "(count (select {from: T where: (== s \"https://www.example.com/path/7/item?id=4003&ref=search\")}))", false },
+        { "(sum (at (select {from: T where: (== s \"cat 5 x\")}) 'v))", false },
+        { "(count (select {from: T where: (and (> v 1000) (== s \"cat 5 x\"))}))", false },
+        { "(count (select {from: T where: (and (> v 1000) (!= s \"\"))}))", false },
+        { "(count (select {from: T where: (and (in v [0 7 14 1000 2999 4999 69999]) (!= s \"\"))}))", true },
+        { "(count (select {from: T where: (and (== v 7) (!= s \"cat 5 x\"))}))", true },
     };
     for (size_t i = 0; i < sizeof qs / sizeof *qs; i++) {
         st_fk_t k;
-        ST_SAME_P("fp", qs[i], &k);
-        TEST_ASSERT_FMT(k.mat == 0, "%s: %llu materializations", qs[i], (unsigned long long)k.mat);
-        TEST_ASSERT_FMT(k.sel + k.refine >= 1, "%s: no STR selection", qs[i]);
-        /* the last two: the `in` / `==` on v first, the STR conjunct refines */
-        if (i + 2 >= sizeof qs / sizeof *qs)
-            TEST_ASSERT_FMT(k.refine == 1, "%s: %llu refinements", qs[i], (unsigned long long)k.refine);
+        ST_SAME_P("fp", qs[i].q, &k);
+        TEST_ASSERT_FMT(k.mat == 0, "%s: %llu materializations", qs[i].q, (unsigned long long)k.mat);
+        /* `refines`: the `in` / `==` on v runs first, the STR conjunct refines */
+        if (qs[i].refines) TEST_ASSERT_FMT(k.refine == 1, "%s: %llu refinements", qs[i].q, (unsigned long long)k.refine);
+        else TEST_ASSERT_FMT(k.sel == 1 && k.refine == 0, "%s: %llu first conjuncts, %llu refinements", qs[i].q,
+                             (unsigned long long)k.sel, (unsigned long long)k.refine);
     }
+    PASS();
+}
+
+/* Mixed-encoding chunks (D4 / D5 nesting): chunk 0 is not a dictionary
+ * chunk and mixes FSST vectors (URLs) with a CONST vector (one string) and
+ * an all-null CONST vector; chunk 1 is a STR_DICT chunk holding an all-null
+ * CONST vector, so it has no directory bounds over vectors that do. */
+#define ST_MX_TABLE "(table [s v] (list (as 'STR (map (fn [j] " \
+    "(if (and (>= j 3072) (< j 4096)) \"one constant string for this vector\" " \
+    "(if (and (>= j 5120) (< j 6144)) \"\" " \
+    "(if (< j 65536) (format \"https://www.example.com/path/%/item?id=%&ref=search\" (% j 5000) (% (* j 7919) 100003)) " \
+    "(if (and (>= j 71680) (< j 72704)) \"\" (format \"cat % x\" (% j 37))))))) (til 131072))) (til 131072)))"
+static test_result_t test_filter_mixed_chunks(void) {
+    ST_SAVE2("fm", ST_MX_TABLE);
+    char p[600]; TEST_ASSERT_TRUE(st_live("/fm2", "s", p, sizeof p));
+    TEST_ASSERT_EQ_I(st_desc_enc(p, 0, NULL), RAY_ENC_FSST);
+    TEST_ASSERT_EQ_I(st_desc_enc(p, 3, NULL), RAY_ENC_CONST);
+    TEST_ASSERT_EQ_I(st_desc_enc(p, 5, NULL), RAY_ENC_CONST);
+    TEST_ASSERT_EQ_I(st_desc_enc(p, 64, NULL), RAY_ENC_STR_DICT);
+    TEST_ASSERT_EQ_I(st_desc_enc(p, 70, NULL), RAY_ENC_CONST);
+    TEST_ASSERT_TRUE(st_dirent(p, 0).flags & RAY_ENC_STAT_ABSENT);
+    TEST_ASSERT_TRUE(st_dirent(p, 1).flags & RAY_ENC_STAT_ABSENT);   /* not every vector STR_DICT */
+    ray_enc_desc_t d; TEST_ASSERT_EQ_I(st_desc_enc(p, 64, &d), RAY_ENC_STR_DICT);
+    TEST_ASSERT_FALSE(d.flags & RAY_ENC_STAT_ABSENT);                 /* the vector keeps its bounds */
+    static const char* const lits[] = {
+        "cat 5 x", "", "one constant string for this vector", "nope",
+        "https://www.example.com/path/1000/item?id=18763&ref=search",
+    };
+    for (size_t i = 0; i < sizeof lits / sizeof *lits; i++)
+        for (int ne = 0; ne < 2; ne++) {
+            char q[400]; st_fk_t k;
+            snprintf(q, sizeof q, "(count (select {from: T where: (%s s \"%s\")}))", ne ? "!=" : "==", lits[i]);
+            ST_SAME("fm", q, &k);
+            TEST_ASSERT_FMT(k.mat == 0 && k.sel == 1, "%s: %llu materializations, %llu selections", q,
+                            (unsigned long long)k.mat, (unsigned long long)k.sel);
+        }
+    PASS();
+}
+
+/* A single-file column whose materialization is published is declined
+ * (its STR filter keeps the bool path, which reads it in place): the
+ * answer equals generation 0 before and after the materialization. */
+static test_result_t test_filter_materialized(void) {
+    ST_SAVE2("fx", ST_FL_TABLE);
+    static const char* const qs[] = {
+        "(count (select {from: T where: (== s \"cat 5 x\")}))",
+        "(count (select {from: T where: (!= s \"\")}))",
+        "(count (select {from: T where: (and (== f 1) (!= s \"cat 5 x\"))}))",
+    };
+    for (int mat = 0; mat < 2; mat++)
+        for (size_t i = 0; i < sizeof qs / sizeof *qs; i++) {
+            if (!mat) {                                   /* not materialized: the STR selection */
+                st_fk_t k;
+                ST_SAME("fx", qs[i], &k);
+                TEST_ASSERT_FMT(k.sel + k.refine == 1, "%s: not through the STR selection", qs[i]);
+                continue;
+            }
+            /* materialize generation 2's column, then filter the same table */
+            ST_Q_OK("(set T2 (.db.splayed.get \"" ST_TMP "/fx2/\"))");
+            ray_t* t = st_hold(ray_eval_str("T2"));
+            TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+            ray_t* encv = ray_table_get_col_enc(t, ray_sym_intern("s", 1));
+            TEST_ASSERT_TRUE(encv != NULL);
+            ray_t* m = ray_enccol_materialize(encv);              /* borrowed: the column's cache */
+            TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m));
+            TEST_ASSERT_TRUE(ray_enccol_decoded_peek(encv) != NULL);
+            ST_Q_OK("(set T (.db.splayed.get \"" ST_TMP "/fx0/\"))");
+            ray_t* a = st_q_fmt(qs[i]);
+            TEST_ASSERT_FMT(a != NULL, "%s gen 0: %s", qs[i], st_msg);
+            st_hold(a);
+            ST_Q_OK("(set T T2)");
+            const uint64_t s0 = ray_exec_test_str_sel(0), r0 = ray_exec_test_str_sel(1);
+            ray_t* b = st_q_fmt(qs[i]);
+            TEST_ASSERT_FMT(b != NULL, "%s materialized: %s", qs[i], st_msg);
+            st_hold(b);
+            TEST_ASSERT_FMT(ray_exec_test_str_sel(0) == s0 && ray_exec_test_str_sel(1) == r0,
+                            "%s: a published materialization took the STR selection", qs[i]);
+            TEST_ASSERT_FMT(ray_str_len(a) == ray_str_len(b) && memcmp(ray_str_ptr(a), ray_str_ptr(b), ray_str_len(a)) == 0,
+                            "%s differs after materializing", qs[i]);
+            st_unhold(a, NULL); ray_release(a); st_unhold(b, NULL); ray_release(b);
+            st_unhold(t, NULL); ray_release(t);
+        }
     PASS();
 }
 
@@ -1607,6 +1691,8 @@ const test_entry_t encstr_entries[] = {
     { "encstr/filter_decided",     test_filter_decided,     st_q_setup, st_q_teardown },
     { "encstr/filter_chained",     test_filter_chained,     st_q_setup, st_q_teardown },
     { "encstr/filter_parted",      test_filter_parted,      st_q_setup, st_q_teardown },
+    { "encstr/filter_mixed_chunks", test_filter_mixed_chunks, st_q_setup, st_q_teardown },
+    { "encstr/filter_materialized", test_filter_materialized, st_q_setup, st_q_teardown },
     { "encstr/filter_forged",      test_filter_forged,      st_q_setup, st_q_teardown },
     { NULL, NULL, NULL, NULL },
 };
