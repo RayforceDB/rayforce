@@ -121,18 +121,25 @@ typedef struct {
     ray_fsst_index_t* fsst_ix;
     bool     fsst_used;        /* some vector is FSST: the FSST_TABLE entry is written */
     uint64_t str_occ_bytes;    /* per-occurrence pooled bytes (the generation-0 bound) */
+    struct ray_dict_acc_s* idict;  /* STR, index_kind DICT (P6b): generation 0's accumulator, fed per chunk */
 } ray_encw_t;
+/* index_kind RAY_IDX_DICT (P6b, spec "Writing the index"): the writer
+ * builds the DICT region itself from the chunks it encodes and writes it at
+ * finish; RAY_ERR_NYI on a type other than STR or len outside 1..INT32_MAX.
+ * An OOM building it fails the column (ray_encw_chunk / finish). */
 ray_err_t ray_encw_begin(ray_encw_t* w, FILE* f, int8_t type, uint8_t attrs, int64_t len,
                          uint32_t sym_count, uint8_t index_kind, uint8_t col_flags);
 ray_err_t ray_encw_chunk(ray_encw_t* w, const void* data, const char* str_pool, int64_t n);
 ray_err_t ray_encw_finish(ray_encw_t* w);
 void      ray_encw_free(ray_encw_t* w);
-/* Write s's index as the region (index_kind = the root's kind).  The root
+/* Write s's index as the region (index_kind = the root's kind).  A writer
+ * begun with RAY_IDX_DICT takes neither this nor ray_encw_set_index_copy.  The root
  * must stay alive until ray_encw_finish; s->attrs is replaced by the
  * column's final persisted attrs at finish.  A region writer failure leaves
  * its "index region: ..." message in ray_error_msg(). */
 void      ray_encw_set_index(ray_encw_t* w, const ray_enc_idx_src_t* s);
-/* Copy `len` bytes of an already validated region of `kind` verbatim. */
+/* Copy `len` bytes of an already validated region of `kind` verbatim (never
+ * on a writer begun with RAY_IDX_DICT). */
 void      ray_encw_set_index_copy(ray_encw_t* w, uint8_t kind, const uint8_t* region, uint64_t len);
 
 /* An all-null generation-2 column image of `len` rows in an anonymous

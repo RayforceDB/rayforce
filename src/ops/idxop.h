@@ -48,6 +48,7 @@
 #include <stdio.h>   /* FILE: ray_index_inline_write_file */
 #include <rayforce.h>
 #include "mem/heap.h"  /* RAY_ATTR_HAS_INDEX */
+#include "vec/str.h"   /* ray_str_t: ray_dict_acc_add_raw */
 
 /* Maximum key columns a RAY_IDX_UKEY map covers.  Chosen so the arm fits
  * the existing union (see the static assert below); a wider key simply gets
@@ -475,7 +476,7 @@ ray_t* ray_index_attach_dict(ray_t** vp);
 
 /* ===== Incremental STR dictionary ===== */
 
-typedef struct {
+typedef struct ray_dict_acc_s {
     int32_t*  codes;     int64_t n_rows;     int64_t cap_rows;
     int32_t*  first_occ; int64_t n_distinct; int64_t cap_distinct;
     uint64_t* offs;      /* per distinct: byte offset into pool */
@@ -491,6 +492,10 @@ ray_err_t ray_dict_acc_init(ray_dict_acc_t* a);
  * sets dead and returns RAY_OK; further adds are no-ops. A non-OK return
  * (OOM, CANCEL) leaves the accumulator partial: free/discard it. */
 ray_err_t ray_dict_acc_add(ray_dict_acc_t* a, ray_t* v);
+/* Appends n raw STR descriptors whose pooled bytes are relative to `pool`
+ * (ray_str_t_ptr): the same codes ray_dict_acc_add assigns to the same
+ * strings, with the same dead / error rules. */
+ray_err_t ray_dict_acc_add_raw(ray_dict_acc_t* a, const ray_str_t* d, const char* pool, int64_t n);
 /* The fewest rows a saved generation-0 STR column carries its DICT index at. */
 #define RAY_DICT_MIN_ROWS 65536
 /* The standalone RAY_IDX_DICT for a column of `len` rows, identical to

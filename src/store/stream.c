@@ -75,8 +75,10 @@ static void ray_col_stream_drop_lut(ray_col_stream_t* w) {
 }
 
 ray_err_t ray_col_stream_index_begin(ray_col_stream_t* w, int64_t start_row) {
-    if (w->zone || w->dict) return RAY_ERR_DOMAIN;
+    if (w->zone || w->dict || w->want_dict) return RAY_ERR_DOMAIN;
     if (w->type == RAY_STR) {
+        /* generation 2 builds the DICT from the chunks it encodes at finish */
+        if (w->gen == 2) { w->want_dict = true; return RAY_OK; }
         w->dict = (ray_dict_acc_t*)ray_alloc_raw(sizeof(*w->dict));
         if (!w->dict) return RAY_ERR_OOM;
         ray_err_t err = ray_dict_acc_init(w->dict);
@@ -236,12 +238,14 @@ ray_err_t ray_col_stream_append(ray_col_stream_t* w,
  * mapped and transcoded chunk by chunk into a second staging file, which
  * then replaces the first (published by ray_col_stream_publish as today).
  * The zone accumulator is recorded as CHUNK_ZONE only (in the enc header);
- * no index region.  Closes w->fp on every path. */
+ * a STR column whose index_begin ran records the DICT, which the column
+ * writer builds from the chunks it encodes (P6b).  Closes w->fp on every path. */
 static ray_err_t stream_finish_gen2(ray_col_stream_t* w, bool durable) {
     if (w->zone && w->zone->saw_null) w->had_nulls = true;
     uint8_t ik = (w->zone && w->rows >= RAY_ENC_CHUNK &&
-                  ray_index_kind_admits(RAY_IDX_CHUNK_ZONE, w->type)) ? RAY_IDX_CHUNK_ZONE : 0;
-    stream_drop_index(w);                         /* no index region */
+                  ray_index_kind_admits(RAY_IDX_CHUNK_ZONE, w->type)) ? RAY_IDX_CHUNK_ZONE
+               : (w->want_dict && ray_col_dict_wanted(w->type, w->rows)) ? RAY_IDX_DICT : 0;
+    stream_drop_index(w);                         /* the DICT is built by the column writer */
     ray_err_t err = fflush(w->fp) == 0 ? RAY_OK : RAY_ERR_IO;
     if (fclose(w->fp) != 0 && err == RAY_OK) err = RAY_ERR_IO;
     w->fp = NULL;

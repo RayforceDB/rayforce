@@ -251,6 +251,12 @@ static ray_enc_hdr_t st_hdr(const char* path) {
     fclose(f);
     return eh;
 }
+/* The outer header's len (bytes 24..31: ray_t.len), the column's rows. */
+static int64_t st_rows(const char* path) {
+    int64_t n = -1; FILE* f = fopen(path, "rb"); if (!f) return -1;
+    fseek(f, 24, SEEK_SET); if (fread(&n, 8, 1, f) != 1) n = -1;
+    fclose(f); return n;
+}
 static ray_enc_dirent_t st_dirent(const char* path, int64_t c) {
     ray_enc_dirent_t de; memset(&de, 0, sizeof de);
     FILE* f = fopen(path, "rb"); if (!f) return de;
@@ -2095,14 +2101,155 @@ static test_result_t test_stream_equals_resident(void) {
         uint8_t* pa = slurp_file(pc, &na);
         TEST_ASSERT_NOT_NULL(pa);
         free(st_mem); st_mem = pa;                         /* freed in teardown */
-        const char* const others[3] = { pr, STP("/pl"), STP("/pb") };
-        for (int k = 0; k < 3; k++) {
-            size_t nb; uint8_t* pb = slurp_file(others[k], &nb);
-            const bool same = pb && nb == na && memcmp(pa, pb, na) == 0;
+        /* the stream and the resave both carry the DICT (P6b): byte identity in full */
+        size_t nr; uint8_t* pr2 = slurp_file(pr, &nr);
+        const bool rsame = pr2 && nr == na && memcmp(pa, pr2, na) == 0;
+        free(pr2);
+        TEST_ASSERT_FMT(rsame, "order %d: resave differs from the stream", o);
+        ray_enc_hdr_t eh; memcpy(&eh, pa + 32, sizeof eh);
+        TEST_ASSERT_EQ_I(eh.index_kind, RAY_IDX_DICT);
+        TEST_ASSERT_TRUE(eh.index_off > 96 && eh.index_off < na);
+        /* the bare files carry none: each is the stream's bytes before its
+         * region's 32-alignment padding, its header without the region
+         * (index_kind 0, index_off 0, end_off the bare file's size) */
+        const uint64_t cut = eh.index_off;
+        const char* const bare[2] = { STP("/pl"), STP("/pb") };
+        for (int k = 0; k < 2; k++) {
+            size_t nb; uint8_t* pb = slurp_file(bare[k], &nb);
+            bool same = pb && nb >= 96 && nb <= cut && ray_enc_pad32(nb) == cut;
+            if (same) {
+                uint8_t* norm = malloc(nb);
+                same = norm != NULL;
+                if (same) {
+                    memcpy(norm, pa, nb);
+                    ray_enc_hdr_t nh = eh; nh.index_kind = 0; nh.index_off = 0; nh.end_off = nb;
+                    memcpy(norm + 32, &nh, sizeof nh);
+                    same = memcmp(pb, norm, nb) == 0;
+                    for (uint64_t i = nb; same && i < cut; i++) same = pa[i] == 0;
+                }
+                free(norm);
+            }
             free(pb);
-            TEST_ASSERT_FMT(same, "order %d writer %d: %zu bytes against the stream's %zu", o, k, nb, na);
+            TEST_ASSERT_FMT(same, "order %d bare writer %d differs from the stream outside the region", o, k);
         }
     }
+    PASS();
+}
+
+/* ---- P6b: the persisted DICT (spec "Writing the index", "STR dictionary index") ---- */
+
+/* The live file's region view of column `col` of the table at ST_TMP `rel`:
+ * NULL with *v filled (Task 1's validator, both tiers), or the error.
+ * *m (owned) holds the file bytes, 32-aligned. */
+static ray_t* st_dict_view(const char* rel, const char* col, uint8_t** m, ray_enc_dict_view_t* v) {
+    char p[600];
+    *m = NULL;
+    if (!st_live(rel, col, p, sizeof p)) return ray_error("io", "no live file");
+    ray_enc_hdr_t eh = st_hdr(p);
+    if (eh.index_kind != RAY_IDX_DICT) return ray_error("domain", "index_kind %u", eh.index_kind);
+    size_t n = 0; uint8_t* raw = slurp_file(p, &n);
+    if (!raw) return ray_error("io", "read");
+    *m = aligned_alloc(32, (n + 31) & ~(size_t)31);
+    if (!*m) { free(raw); return ray_error("oom", "copy"); }
+    memcpy(*m, raw, n); free(raw);
+    ray_t* e = ray_enc_dict_validate(*m + eh.index_off, eh.end_off - eh.index_off,
+                                     st_rows(p), p, v);
+    return e ? e : ray_enc_dict_codes_check(v, NULL, p);
+}
+
+/* Generation 0's condition, per write path: 65535 rows (none), 65536
+ * (DICT), a HASH column (HASH), a bare file and a staged save (none), the
+ * test hook (none); the region's codes equal generation 0's. */
+static test_result_t test_idict_build_condition(void) {
+    ST_Q_OK("(set S (as 'STR (map (fn [j] (format \"value % of the domain\" (% (* j 7919) 300))) (til 65536))))");
+    ST_Q_OK("(.db.splayed.set \"" ST_TMP "/c65536/\" (table [s] (list S)) {compress: true})");
+    ST_Q_OK("(.db.splayed.set \"" ST_TMP "/c65535/\" (table [s] (list (take S 65535))) {compress: true})");
+    ST_Q_OK("(.db.splayed.set \"" ST_TMP "/ch/\" (table [s] (list (.idx.hash S))) {compress: true})");
+    ST_Q_OK("(.db.splayed.set \"" ST_TMP "/c0/\" (table [s] (list S)) {compress: false})");
+    char p[600];
+    TEST_ASSERT_TRUE(st_live("/c65535", "s", p, sizeof p)); TEST_ASSERT_EQ_I(st_hdr(p).index_kind, 0);
+    TEST_ASSERT_TRUE(st_live("/ch", "s", p, sizeof p));     TEST_ASSERT_EQ_I(st_hdr(p).index_kind, RAY_IDX_HASH);
+    uint8_t* m = NULL; ray_enc_dict_view_t v;
+    ray_t* e = st_dict_view("/c65536", "s", &m, &v);
+    free(st_mem); st_mem = m;                          /* freed in teardown */
+    if (e) st_hold(e);
+    TEST_ASSERT_NULL(e);
+    TEST_ASSERT_EQ_I(v.n_distinct, 300);
+    /* generation 0's passenger DICT over the same data */
+    ray_t* t0 = st_hold(ray_eval_str(ray_test_tmp("(.db.splayed.get \"" ST_TMP "/c0/\")")));
+    TEST_ASSERT_TRUE(t0 && !RAY_IS_ERR(t0));
+    ray_t* a = ray_table_col(t0, ray_sym_intern("s", 1));
+    TEST_ASSERT_TRUE(a && !RAY_IS_ERR(a));
+    TEST_ASSERT_EQ_I(ray_index_kind(a), RAY_IDX_DICT);
+    ray_index_t* x = ray_index_payload(a->index);
+    TEST_ASSERT_EQ_I(x->u.dict.n_distinct, v.n_distinct);
+    TEST_ASSERT_TRUE(memcmp(ray_data(x->u.dict.codes), v.codes, 65536 * 4) == 0);
+    TEST_ASSERT_TRUE(memcmp(ray_data(x->u.dict.first_occ), v.first_occ, 300 * 4) == 0);
+    /* a bare file: no DICT */
+    ray_t* sv = st_hold(ray_eval_str("S"));
+    TEST_ASSERT_EQ_I(ray_col_save_gen(sv, STP("/bare"), 2), RAY_OK);
+    TEST_ASSERT_EQ_I(st_hdr(STP("/bare")).index_kind, 0);
+    /* the hook suppresses the build */
+    ray_col_test_no_dict(true);
+    ST_Q_OK("(.db.splayed.set \"" ST_TMP "/cn/\" (table [s] (list S)) {compress: true})");
+    ray_col_test_no_dict(false);
+    TEST_ASSERT_TRUE(st_live("/cn", "s", p, sizeof p)); TEST_ASSERT_EQ_I(st_hdr(p).index_kind, 0);
+    PASS();
+}
+
+/* A generation-2 table whose column records a DICT, resaved through a
+ * path without index building, records none; resaved with index building,
+ * it records the same region bytes. */
+static test_result_t test_idict_not_inherited(void) {
+    ST_Q_OK("(set S (as 'STR (map (fn [j] (format \"value % of the domain\" (% (* j 7919) 300))) (til 70000))))");
+    ST_Q_OK("(.db.splayed.set \"" ST_TMP "/n1/\" (table [s] (list S)) {compress: true})");
+    ST_Q_OK("(.db.splayed.set \"" ST_TMP "/n2/\" (.db.splayed.get \"" ST_TMP "/n1/\") {compress: true})");
+    char p1[600], p2[600];
+    TEST_ASSERT_TRUE(st_live("/n1", "s", p1, sizeof p1));
+    TEST_ASSERT_TRUE(st_live("/n2", "s", p2, sizeof p2));
+    TEST_ASSERT_EQ_I(st_hdr(p1).index_kind, RAY_IDX_DICT);
+    size_t a = 0, b = 0;
+    uint8_t* fa = slurp_file(p1, &a); uint8_t* fb = slurp_file(p2, &b);
+    const bool same = fa && fb && a == b && memcmp(fa, fb, a) == 0;
+    free(fa); free(fb);
+    TEST_ASSERT_TRUE(same);
+    /* the column writer without the save's decision: ray_col_save_ctx with kind 0 */
+    ray_t* t = st_hold(ray_eval_str(ray_test_tmp("(.db.splayed.get \"" ST_TMP "/n1/\")")));
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    ray_t* enc = ray_table_get_col_enc(t, ray_sym_intern("s", 1));
+    TEST_ASSERT_NOT_NULL(enc);
+    ray_col_write_t w; memset(&w, 0, sizeof w);
+    TEST_ASSERT_NULL(ray_col_src_bind(enc, &w.src));
+    w.name = "s"; w.gen = 2;
+    const ray_err_t se = ray_col_save_ctx(&w, STP("/inh"));
+    ray_col_src_release(&w.src);
+    TEST_ASSERT_EQ_I(se, RAY_OK);
+    TEST_ASSERT_EQ_I(st_hdr(STP("/inh")).index_kind, 0);
+    TEST_ASSERT_EQ_U(st_hdr(STP("/inh")).index_off, 0);
+    PASS();
+}
+
+/* Load rules: kind 7 on a non-STR column, and kind 7 without a region. */
+static test_result_t test_idict_load_rules(void) {
+    ST_Q_OK("(set S (as 'STR (map (fn [j] (format \"value % of the domain\" (% (* j 7919) 300))) (til 70000))))");
+    ST_Q_OK("(.db.splayed.set \"" ST_TMP "/l/\" (table [s] (list S)) {compress: true})");
+    char p[600]; TEST_ASSERT_TRUE(st_live("/l", "s", p, sizeof p));
+    ray_enc_hdr_t eh = st_hdr(p);
+    TEST_ASSERT_EQ_I(eh.index_kind, RAY_IDX_DICT);
+    uint64_t zero = 0;
+    ST_PATCH(p, 32 + 32, &zero, 8);                 /* index_off 0 with kind 7 */
+    TEST_ASSERT_STR_EQ(st_mat(p), "corrupt");
+    TEST_ASSERT_FMT(strstr(st_msg, "index kind 7 disagrees") != NULL, "message \"%s\"", st_msg);
+    ST_PATCH(p, 32 + 32, &eh.index_off, 8);         /* restore */
+    ray_t* iv = st_hold(ray_vec_new(RAY_I64, 70000));
+    iv->len = 70000;
+    for (int i = 0; i < 70000; i++) ((int64_t*)ray_data(iv))[i] = i;
+    TEST_ASSERT_EQ_I(ray_col_save_gen(iv, STP("/i"), 2), RAY_OK);
+    /* an I64 file recording kind 7 with index_off 0: the type rule fires first */
+    uint8_t k7 = RAY_IDX_DICT;
+    ST_PATCH(STP("/i"), 32 + 6, &k7, 1);
+    TEST_ASSERT_STR_EQ(st_mat(STP("/i")), "corrupt");
+    TEST_ASSERT_FMT(strstr(st_msg, "DICT") != NULL, "message \"%s\"", st_msg);
     PASS();
 }
 
@@ -2147,5 +2294,8 @@ const test_entry_t encstr_entries[] = {
     { "encstr/abandonment",               test_abandonment,               st_setup,   st_teardown },
     { "encstr/representation_not_value",  test_representation_not_value,  st_setup,   st_teardown },
     { "encstr/stream_equals_resident",    test_stream_equals_resident,    st_q_setup, st_q_teardown },
+    { "encstr/idict_build_condition", test_idict_build_condition, st_q_setup, st_q_teardown },
+    { "encstr/idict_not_inherited",   test_idict_not_inherited,   st_q_setup, st_q_teardown },
+    { "encstr/idict_load_rules",      test_idict_load_rules,      st_q_setup, st_q_teardown },
     { NULL, NULL, NULL, NULL },
 };

@@ -595,6 +595,10 @@ static ray_err_t splay_write_table_impl(ray_t* tbl, const char* dir,
         if (w.gen == 2 && build_indexes && ray_zone_acc_supported(m.type) &&
             m.len >= RAY_ENC_CHUNK && rec_kind == 0)
             w.index_kind = RAY_IDX_CHUNK_ZONE;
+        /* generation 0 builds a STR DICT in the same pass (splay_build_index_col):
+         * at least RAY_DICT_MIN_ROWS rows, unless a HASH takes the slot */
+        if (w.gen == 2 && build_indexes && ray_col_dict_wanted(m.type, m.len) && rec_kind != RAY_IDX_HASH)
+            w.index_kind = RAY_IDX_DICT;
         ray_err_t err = ray_col_save_ctx(&w, path);
         ray_col_src_release(&w.src);
         /* No new .d or .current is published on failure. */

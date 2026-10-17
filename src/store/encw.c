@@ -557,6 +557,7 @@ void ray_encw_free(ray_encw_t* w) {
     ray_free_raw(w->fsst_ix); w->fsst_ix = NULL;
     ray_enc_buf_free(&w->chunk);
     ray_encw_vec_free(&w->vec);
+    if (w->idict) { ray_dict_acc_free(w->idict); ray_free_raw(w->idict); w->idict = NULL; }
 }
 
 ray_err_t ray_encw_begin(ray_encw_t* w, FILE* f, int8_t type, uint8_t attrs, int64_t len,
@@ -569,6 +570,14 @@ ray_err_t ray_encw_begin(ray_encw_t* w, FILE* f, int8_t type, uint8_t attrs, int
     w->f = f; w->type = type; w->attrs = attrs; w->len = len;
     w->sym_count = type == RAY_SYM ? sym_count : 0;
     w->index_kind = index_kind; w->col_flags = col_flags;
+    if (index_kind == RAY_IDX_DICT) {
+        /* spec "Writing the index" (P6b): the writer builds the DICT itself */
+        if (type != RAY_STR || len < 1 || len > INT32_MAX) return RAY_ERR_NYI;
+        w->idict = ray_alloc_raw(sizeof *w->idict);
+        if (!w->idict) return RAY_ERR_OOM;
+        ray_err_t de = ray_dict_acc_init(w->idict);
+        if (de != RAY_OK) { ray_free_raw(w->idict); w->idict = NULL; return de; }
+    }
     w->n_chunks = ray_enc_nchunks(len);
     if (w->n_chunks > 0) {
         w->dir = ray_calloc_raw((size_t)w->n_chunks * sizeof(ray_enc_dirent_t));
@@ -715,6 +724,10 @@ ray_err_t ray_encw_chunk(ray_encw_t* w, const void* data, const char* str_pool, 
     if (w->chunk_i == 0 && w->type == RAY_STR && (err = train_fsst(w, data, str_pool, n)) != RAY_OK) return err;
     ray_enc_dirent_t* de = &w->dir[w->chunk_i];
     if ((err = encw_chunk_body(w, data, str_pool, n, de)) != RAY_OK) return err;
+    /* the DICT reads the chunk the body was encoded from: every writer feeds
+     * the same rows in the same order, so the same codes and bytes */
+    if (w->idict && (err = ray_dict_acc_add_raw(w->idict, (const ray_str_t*)data, str_pool, n)) != RAY_OK)
+        return err;
     de->offset = w->pos;
     if ((err = fput(w, w->chunk.p, w->chunk.len)) != RAY_OK) return err;
     w->chunk_i++;
@@ -825,10 +838,20 @@ ray_err_t ray_encw_finish(ray_encw_t* w) {
     if (w->sdict.used) w->str_pool_bytes += w->sdict.pooled;
     /* the index region follows the side data, 32-aligned (spec "Writers") */
     uint64_t index_off = 0;
-    if (w->has_idx || w->idx_copy) {
+    if (w->has_idx || w->idx_copy || w->idict) {
         index_off = ray_enc_pad32(w->pos);
         if ((err = fput(w, NULL, (size_t)(index_off - w->pos))) != RAY_OK) return err;
-        if (w->idx_copy) {
+        if (w->idict) {
+            const ray_dict_acc_t* a = w->idict;
+            if (a->dead || a->n_rows != w->len) return RAY_ERR_RANGE;      /* internal: every row fed */
+            ray_enc_dict_src_t s = { .len = w->len, .n_distinct = a->n_distinct, .codes = a->codes,
+                                     .first_occ = a->first_occ, .offs = a->offs, .bytes = a->pool,
+                                     .bytes_len = a->pool_len };
+            uint64_t nb = 0;
+            ray_t* ie = ray_enc_dict_write(w->f, &s, &nb);
+            if (ie) { ray_err_t c = ray_err_from_obj(ie); ray_error_free(ie); return c; }
+            w->pos += nb;
+        } else if (w->idx_copy) {
             if ((err = fput(w, w->idx_copy, (size_t)w->idx_copy_len)) != RAY_OK) return err;
         } else {
             ray_enc_idx_src_t s = w->idx;

@@ -202,7 +202,10 @@ static ray_t* enc_validate_load(ray_enccol_t* e, uint32_t* saved_sym) {
     if (memcmp(eh->magic, "RENC", 4) != 0) ENC_CORRUPT("column %s: missing RENC header", e->path);
     if (eh->header_version != RAY_ENC_HDR_VERSION)
         return ray_error("version", "column %s: generation-2 header version %u", e->path, eh->header_version);
-    if (eh->index_kind > 6) ENC_CORRUPT("column %s: index kind %u", e->path, eh->index_kind);
+    if (eh->index_kind > 7) ENC_CORRUPT("column %s: index kind %u", e->path, eh->index_kind);
+    /* DICT is STR only (P6b): named before the admission matrix refuses it */
+    if (eh->index_kind == RAY_IDX_DICT && h.type != RAY_STR)
+        ENC_CORRUPT("column %s: DICT index on type %s", e->path, ray_type_name(h.type));
     /* the admission matrix, shared with the writer and the attach (spec
      * "Materialization" step 3): a pair it refuses is a wire violation */
     if (eh->index_kind && !ray_index_kind_admits((ray_idx_kind_t)eh->index_kind, h.type))
@@ -293,8 +296,7 @@ static ray_t* enc_validate_load(ray_enccol_t* e, uint32_t* saved_sym) {
                 ENC_CORRUPT("column %s: chunk %lld STR code bounds outside the dictionary", e->path, (long long)c);
         }
     }
-    bool want_index = eh->index_kind == 1 || eh->index_kind == 2 ||
-                      eh->index_kind == 4 || eh->index_kind == 6;
+    bool want_index = ray_enc_idx_kind_in_file(eh->index_kind);   /* DICT included (P6b) */
     if (want_index != (eh->index_off != 0)) ENC_CORRUPT("column %s: index kind %u disagrees with index offset", e->path, eh->index_kind);
     if (eh->index_off) {
         if (eh->index_off != ray_enc_pad32(prev)) ENC_CORRUPT("column %s: index region not at the next 32-aligned offset", e->path);

@@ -931,6 +931,7 @@ void ray_test_hooks_off(void) {
     ray_enccol_test_refuse_attach(0);
     ray_enccol_test_fail_index_parse(false);
     ray_col_test_fail_alloc(0);
+    ray_col_test_no_dict(false);
     ray_encw_test_force(-1);
     ray_encw_test_force_float(-1);
     ray_encw_test_force_str(-1);

@@ -121,6 +121,14 @@ typedef struct {
 } ray_col_write_t;
 ray_err_t ray_col_save_ctx(ray_col_write_t* w, const char* path);
 void      ray_col_test_fail_alloc(int64_t nth);   /* test hook; 0 disarms */
+/* Spec "Writing the index" (P6b): generation 0's STR DICT build condition,
+ * STR and RAY_DICT_MIN_ROWS <= len <= INT32_MAX (splay_build_index_col,
+ * ray_dict_acc_finish).  The callers add their own path rule (index
+ * building asked for, no HASH).  False while ray_col_test_no_dict is on. */
+bool      ray_col_dict_wanted(int8_t type, int64_t len);
+/* Test hook: true makes ray_col_dict_wanted answer false (a generation-2
+ * STR save writes no DICT); false disarms (ray_test_hooks_off). */
+void      ray_col_test_no_dict(bool on);
 
 /* Generation resolution, decided by a save under the destination's
  * .write.lock.  `dest_cur` is the destination's current published

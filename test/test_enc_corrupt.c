@@ -358,7 +358,8 @@ static test_result_t test_reject_headers(void) {
     SAVE(bool_runs(), p); W8(16, 1);              BAD(p, 0, "corrupt", "header mmod byte set");
     SAVE(bool_runs(), p); W8(EH, 'X');            BAD(p, 0, "corrupt", "missing RENC header");
     SAVE(bool_runs(), p); W16(EH + 4, 2);         BAD(p, 0, "version", "header version 2");
-    SAVE(bool_runs(), p); W8(EH + 6, 7);          BAD(p, 0, "corrupt", "index kind 7");
+    SAVE(bool_runs(), p); W8(EH + 6, 8);          BAD(p, 0, "corrupt", "index kind 8");
+    SAVE(bool_runs(), p); W8(EH + 6, 7);          BAD(p, 0, "corrupt", "DICT index on type");   /* P6b: STR only */
     ray_t* g = guid_raw(); SAVE(g, p); W8(EH + 6, 3); BAD(p, 0, "corrupt", "not admitted on type");  /* ZONE on GUID */
     SAVE(guid_raw(), p);  W8(EH + 7, 1);          BAD(p, 0, "corrupt", "UNIQUE not admitted");
     SAVE(bool_runs(), p); W8(EH + 7, 2);          BAD(p, 0, "corrupt", "reserved column flags");

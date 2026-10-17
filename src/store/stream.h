@@ -33,6 +33,7 @@ typedef struct {
     uint32_t* lut_pos;   /* [COL_STREAM_LUT] position per slot */
     ray_zone_acc_t* zone;   /* numeric / temporal: the running chunk zone */
     ray_dict_acc_t* dict;   /* STR: the running dictionary */
+    bool    want_dict;      /* generation 2, STR: index_begin asked for the DICT (built at finish) */
     bool    finished;       /* finish done: the tmp file is complete, not yet renamed */
     uint8_t gen;            /* output generation: 0, or 2 (transcoded at finish) */
     uint64_t dec_pool;      /* generation 2: decoded STR pool bytes so far */

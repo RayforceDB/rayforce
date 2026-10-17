@@ -120,6 +120,9 @@ static ray_err_t colw_gen2_vec(ray_t* vec, const char* path, bool durable, uint8
     bool region = ray_enc_idx_kind_has_region(ik) && (!ik_override || ik_override == ik) &&
                   ix_decision != RAY_COL_IDX_DROP;
     if (ik_override) ik = ik_override;
+    /* DICT (spec "Writing the index"): only when this save asks for it; the
+     * writer builds it from the values, so no region is taken from a root */
+    if (ik == RAY_IDX_DICT && ik_override != RAY_IDX_DICT) ik = 0;
     if (ray_enc_idx_kind_has_region(ik) && !region) ik = 0;           /* no region: none recorded */
     /* the writer applies the same matrix as the validator (spec step 3) */
     if ((ik && !ray_index_kind_admits((ray_idx_kind_t)ik, vec->type)) ||
@@ -280,6 +283,12 @@ static void* colw_alloc(void* old, size_t n) {
 }
 void ray_col_test_fail_alloc(int64_t nth) { atomic_store(&g_colw_fail_at, nth); }
 
+static _Atomic(bool) g_colw_no_dict;
+void ray_col_test_no_dict(bool on) { atomic_store(&g_colw_no_dict, on); }
+bool ray_col_dict_wanted(int8_t type, int64_t len) {
+    return type == RAY_STR && len >= RAY_DICT_MIN_ROWS && len <= INT32_MAX && !atomic_load(&g_colw_no_dict);
+}
+
 /* Generation 2 from range reads: encoded sources and every SYM source.
  * One chunk of generation-0 values is staged at a time (spec "Writers":
  * no whole-column materialization). */
@@ -316,6 +325,7 @@ static ray_err_t colw_gen2_range(ray_col_write_t* w, const char* path) {
     bool region = ray_enc_idx_kind_has_region(src_ik) && (!w->index_kind || w->index_kind == src_ik) &&
                   w->index_decision != RAY_COL_IDX_DROP;
     uint8_t ik = w->index_kind ? w->index_kind : src_ik;
+    if (ik == RAY_IDX_DICT && w->index_kind != RAY_IDX_DICT) ik = 0;   /* never inherited (P6b) */
     if (ray_enc_idx_kind_has_region(ik) && !region) ik = 0;
     if ((ik && !ray_index_kind_admits((ray_idx_kind_t)ik, type)) ||
         ((cf & RAY_ENC_FLAG_UNIQUE) && !ray_index_kind_admits(RAY_IDX_NONE, type)))

@@ -1332,12 +1332,8 @@ static ray_err_t dict_acc_rehash(ray_dict_acc_t* a) {
     return RAY_OK;
 }
 
-ray_err_t ray_dict_acc_add(ray_dict_acc_t* a, ray_t* v) {
-    if (a->dead) return RAY_OK;
-    if (!v || RAY_IS_ERR(v) || v->type != RAY_STR) return RAY_ERR_TYPE;
-    int64_t n = v->len;
-    if (n <= 0) return RAY_OK;
-    if (a->n_rows + n > INT32_MAX) { a->dead = true; ray_dict_acc_free(a); return RAY_OK; }
+/* Codes capacity for n more rows (the growth rule of ray_dict_acc_add). */
+static ray_err_t dict_acc_reserve(ray_dict_acc_t* a, int64_t n) {
     if (a->n_rows + n > a->cap_rows) {
         int64_t cap = a->cap_rows ? a->cap_rows : 65536;
         while (cap < a->n_rows + n) cap *= 2;
@@ -1345,52 +1341,86 @@ ray_err_t ray_dict_acc_add(ray_dict_acc_t* a, ray_t* v) {
         if (!p) return RAY_ERR_OOM;
         a->codes = p; a->cap_rows = cap;
     }
+    return RAY_OK;
+}
+
+/* One row of the accumulator: the code of (p, len), appended on first
+ * sight.  `row` is the column row (first_occ).  RAY_OK, or OOM. */
+static inline ray_err_t dict_acc_put(ray_dict_acc_t* a, const char* p, size_t len, int64_t row) {
+    uint64_t h = ray_hash_bytes(p, len);
+    uint64_t s = h & a->mask;
+    int32_t code = -1;
+    for (;;) {
+        uint32_t cp1 = a->slot[s];
+        if (cp1 == 0) break;
+        int32_t c = (int32_t)cp1 - 1;
+        if (a->lens[c] == len && (len == 0 || memcmp(a->pool + a->offs[c], p, len) == 0)) { code = c; break; }
+        s = (s + 1) & a->mask;
+    }
+    if (code < 0) {
+        if (a->n_distinct == a->cap_distinct) {
+            int64_t cap = a->cap_distinct ? a->cap_distinct * 2 : 1024;
+            int32_t* f = (int32_t*)ray_realloc_raw(a->first_occ, (size_t)cap * sizeof(int32_t));
+            uint64_t* o = f ? (uint64_t*)ray_realloc_raw(a->offs, (size_t)cap * sizeof(uint64_t)) : NULL;
+            uint32_t* l = o ? (uint32_t*)ray_realloc_raw(a->lens, (size_t)cap * sizeof(uint32_t)) : NULL;
+            if (f) a->first_occ = f;
+            if (o) a->offs = o;
+            if (l) a->lens = l;
+            if (!f || !o || !l) return RAY_ERR_OOM;   /* grown parts stay owned by a */
+            a->cap_distinct = cap;
+        }
+        if (len > 0) {
+            if (a->pool_len + len > a->pool_cap) {
+                uint64_t cap = a->pool_cap ? a->pool_cap * 2 : 65536;
+                while (cap < a->pool_len + len) cap *= 2;
+                char* np = (char*)ray_realloc_raw(a->pool, (size_t)cap);
+                if (!np) return RAY_ERR_OOM;
+                a->pool = np; a->pool_cap = cap;
+            }
+            memcpy(a->pool + a->pool_len, p, len);
+        }
+        code = (int32_t)a->n_distinct++;
+        a->offs[code] = a->pool_len; a->lens[code] = (uint32_t)len;
+        a->pool_len += len;
+        a->first_occ[code] = (int32_t)row;
+        a->slot[s] = (uint32_t)code + 1;
+        if ((uint64_t)a->n_distinct * 2 > a->mask + 1) {
+            ray_err_t err = dict_acc_rehash(a);
+            if (err != RAY_OK) return err;
+        }
+    }
+    a->codes[row] = code;
+    return RAY_OK;
+}
+
+ray_err_t ray_dict_acc_add(ray_dict_acc_t* a, ray_t* v) {
+    if (a->dead) return RAY_OK;
+    if (!v || RAY_IS_ERR(v) || v->type != RAY_STR) return RAY_ERR_TYPE;
+    int64_t n = v->len;
+    if (n <= 0) return RAY_OK;
+    if (a->n_rows + n > INT32_MAX) { a->dead = true; ray_dict_acc_free(a); return RAY_OK; }
+    ray_err_t e = dict_acc_reserve(a, n);
+    if (e != RAY_OK) return e;
     for (int64_t i = 0; i < n; i++) {
         if (RAY_UNLIKELY((i & 4095) == 0 && ray_interrupted())) return RAY_ERR_CANCEL;
         size_t len; const char* p = ray_str_vec_get(v, i, &len);
-        uint64_t h = ray_hash_bytes(p, len);
-        uint64_t s = h & a->mask;
-        int32_t code = -1;
-        for (;;) {
-            uint32_t cp1 = a->slot[s];
-            if (cp1 == 0) break;
-            int32_t c = (int32_t)cp1 - 1;
-            if (a->lens[c] == len && (len == 0 || memcmp(a->pool + a->offs[c], p, len) == 0)) { code = c; break; }
-            s = (s + 1) & a->mask;
-        }
-        if (code < 0) {
-            if (a->n_distinct == a->cap_distinct) {
-                int64_t cap = a->cap_distinct ? a->cap_distinct * 2 : 1024;
-                int32_t* f = (int32_t*)ray_realloc_raw(a->first_occ, (size_t)cap * sizeof(int32_t));
-                uint64_t* o = f ? (uint64_t*)ray_realloc_raw(a->offs, (size_t)cap * sizeof(uint64_t)) : NULL;
-                uint32_t* l = o ? (uint32_t*)ray_realloc_raw(a->lens, (size_t)cap * sizeof(uint32_t)) : NULL;
-                if (f) a->first_occ = f;
-                if (o) a->offs = o;
-                if (l) a->lens = l;
-                if (!f || !o || !l) return RAY_ERR_OOM;   /* grown parts stay owned by a */
-                a->cap_distinct = cap;
-            }
-            if (len > 0) {
-                if (a->pool_len + len > a->pool_cap) {
-                    uint64_t cap = a->pool_cap ? a->pool_cap * 2 : 65536;
-                    while (cap < a->pool_len + len) cap *= 2;
-                    char* np = (char*)ray_realloc_raw(a->pool, (size_t)cap);
-                    if (!np) return RAY_ERR_OOM;
-                    a->pool = np; a->pool_cap = cap;
-                }
-                memcpy(a->pool + a->pool_len, p, len);
-            }
-            code = (int32_t)a->n_distinct++;
-            a->offs[code] = a->pool_len; a->lens[code] = (uint32_t)len;
-            a->pool_len += len;
-            a->first_occ[code] = (int32_t)(a->n_rows + i);
-            a->slot[s] = (uint32_t)code + 1;
-            if ((uint64_t)a->n_distinct * 2 > a->mask + 1) {
-                ray_err_t err = dict_acc_rehash(a);
-                if (err != RAY_OK) return err;
-            }
-        }
-        a->codes[a->n_rows + i] = code;
+        if ((e = dict_acc_put(a, p, len, a->n_rows + i)) != RAY_OK) return e;
+    }
+    a->n_rows += n;
+    return RAY_OK;
+}
+
+ray_err_t ray_dict_acc_add_raw(ray_dict_acc_t* a, const ray_str_t* d, const char* pool, int64_t n) {
+    if (a->dead) return RAY_OK;
+    if (n <= 0) return RAY_OK;
+    if (a->n_rows + n > INT32_MAX) { a->dead = true; ray_dict_acc_free(a); return RAY_OK; }
+    ray_err_t e = dict_acc_reserve(a, n);
+    if (e != RAY_OK) return e;
+    for (int64_t i = 0; i < n; i++) {
+        if (RAY_UNLIKELY((i & 4095) == 0 && ray_interrupted())) return RAY_ERR_CANCEL;
+        const uint32_t len = d[i].len;
+        const char* p = len ? ray_str_t_ptr(&d[i], pool) : "";
+        if ((e = dict_acc_put(a, p, len, a->n_rows + i)) != RAY_OK) return e;
     }
     a->n_rows += n;
     return RAY_OK;
