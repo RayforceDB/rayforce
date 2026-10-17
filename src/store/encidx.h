@@ -64,6 +64,11 @@ typedef struct {               /* PART */
     int64_t  keys, starts, lens, n_parts, order_name;
 } ray_enc_idx_part_t;
 
+typedef struct {               /* DICT, in kind_area (P6b) */
+    int64_t  codes, first_occ, offs, bytes, n_distinct;
+    uint64_t bytes_len;
+} ray_enc_idx_dict_t;          /* 48 bytes */
+
 #define ENCIDX_OFF(T, f, o) _Static_assert(offsetof(T, f) == (o), #T "." #f " offset")
 _Static_assert(sizeof(ray_enc_idx_root_t) == RAY_ENC_IDX_ROOT_BYTES, "wire root is 80 bytes");
 _Static_assert(RAY_ENC_IDX_FIRST_CHILD == ((RAY_ENC_IDX_ROOT_BYTES + 31) & ~31),
@@ -101,16 +106,32 @@ ENCIDX_OFF(ray_enc_idx_part_t, lens, 16);
 ENCIDX_OFF(ray_enc_idx_part_t, n_parts, 24);
 ENCIDX_OFF(ray_enc_idx_part_t, order_name, 32);
 
+_Static_assert(sizeof(ray_enc_idx_dict_t) == 48, "DICT kind fields");
+ENCIDX_OFF(ray_enc_idx_dict_t, codes, 0);
+ENCIDX_OFF(ray_enc_idx_dict_t, first_occ, 8);
+ENCIDX_OFF(ray_enc_idx_dict_t, offs, 16);
+ENCIDX_OFF(ray_enc_idx_dict_t, bytes, 24);
+ENCIDX_OFF(ray_enc_idx_dict_t, n_distinct, 32);
+ENCIDX_OFF(ray_enc_idx_dict_t, bytes_len, 40);
+
 #define ENCIDX_FITS(T) _Static_assert(sizeof(T) <= sizeof(((ray_enc_idx_root_t*)0)->kind_area), \
                                       #T " fits in the kind area")
 ENCIDX_FITS(ray_enc_idx_hash_t);
 ENCIDX_FITS(ray_enc_idx_sort_t);
 ENCIDX_FITS(ray_enc_idx_bloom_t);
 ENCIDX_FITS(ray_enc_idx_part_t);
+ENCIDX_FITS(ray_enc_idx_dict_t);
 
 /* The index kinds that carry a region: HASH, SORT, BLOOM, PART. */
 static inline int ray_enc_idx_kind_has_region(uint8_t k) {
     return k == 1 || k == 2 || k == 4 || k == 6;
+}
+
+/* The kinds whose file carries a region after the side data: the
+ * root-parsed kinds, and DICT (P6b), whose region the column writer builds
+ * and the reader validates on its own (ray_enc_dict_validate). */
+static inline int ray_enc_idx_kind_in_file(uint8_t k) {   /* a region follows the side data */
+    return ray_enc_idx_kind_has_region(k) || k == 7;
 }
 
 #ifndef RAY_ENC_IDX_WIRE_ONLY
@@ -189,6 +210,49 @@ ray_t* ray_enc_index_parse_copy(const ray_enc_idx_view_t* v, ray_t* vec, ray_t**
 /* order_sym a writer may convert to a name (spec "Writing the index"):
  * the root's HASH / PART order_sym when RAY_MARK_MMAP is clear, else -1. */
 int64_t ray_enc_index_trusted_order(const ray_t* root);
+
+/* ---- DICT (P6b, spec "Index region": DICT) ---- */
+
+typedef struct {               /* what the writer persists (no ownership) */
+    int64_t         len, n_distinct;
+    const int32_t*  codes;      /* len */
+    const int32_t*  first_occ;  /* n_distinct */
+    const uint64_t* offs;       /* n_distinct: start of each entry in bytes */
+    const char*     bytes;      /* bytes_len: the entries in code order */
+    uint64_t        bytes_len;
+} ray_enc_dict_src_t;
+
+typedef struct {               /* a region past the entry tier: pointers into it */
+    int64_t         len, n_distinct;
+    const int32_t*  codes;      /* len */
+    const int32_t*  first_occ;  /* n_distinct */
+    const uint64_t* offs;       /* n_distinct + 1 */
+    const uint8_t*  bytes;      /* offs[n_distinct] */
+} ray_enc_dict_view_t;
+
+/* Stream the DICT region of s to f at its position (spec "Index region",
+ * DICT); *bytes its size, a multiple of 32.  nyi naming DICT for a source
+ * the validator would refuse on its counts (n_distinct outside 1..len, len
+ * outside 1..INT32_MAX, offsets not starting at 0, decreasing, an entry
+ * over UINT32_MAX bytes or not ending at bytes_len); io on a short write.
+ * The codes' order rules are not re-checked here: the writer's caller
+ * (ray_encw) gives ray_dict_acc_t's codes, which hold them by construction. */
+ray_t* ray_enc_dict_write(FILE* f, const ray_enc_dict_src_t* s, uint64_t* bytes);
+
+/* The entry tier of spec "Index validation" (DICT), except distinctness:
+ * the root, the counts, the layout, the offsets, the padding and the first
+ * occurrences.  `region` 32-aligned.  NULL with *out filled, or an owned
+ * corrupt error naming `path`. */
+ray_t* ray_enc_dict_validate(const uint8_t* region, uint64_t size, int64_t len,
+                             const char* path, ray_enc_dict_view_t* out);
+
+/* The code tier: every code in [0, n_distinct), codes[first_occ[c]] == c,
+ * first_occ[codes[i]] <= i.  Parallel above RAY_PARALLEL_THRESHOLD rows;
+ * writes copy[0 .. len) when copy is not NULL.  NULL, an owned corrupt
+ * error naming `path` and the lowest failing row, or cancel (a dispatch
+ * that skipped rows, or a pending interrupt: never a verdict on part of
+ * the rows). */
+ray_t* ray_enc_dict_codes_check(const ray_enc_dict_view_t* v, int32_t* copy, const char* path);
 #endif /* RAY_ENC_IDX_WIRE_ONLY */
 
 #endif /* RAY_ENCIDX_H */

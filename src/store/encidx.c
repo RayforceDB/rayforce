@@ -27,17 +27,21 @@
 #include "table/sym.h"
 #include "lang/format.h"
 #include "core/pool.h"
+#include "ops/ops.h"          /* RAY_PARALLEL_THRESHOLD */
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
 /* ray_enc_idx_kind_has_region (freestanding, numeric) names these kinds. */
 _Static_assert(RAY_IDX_HASH == 1 && RAY_IDX_SORT == 2 && RAY_IDX_BLOOM == 4 && RAY_IDX_PART == 6,
                "ray_enc_idx_kind_has_region kinds are HASH, SORT, BLOOM, PART");
+_Static_assert(RAY_IDX_DICT == 7, "ray_enc_idx_kind_in_file names DICT as 7");
 
 static const char* ei_kind_name(uint8_t k) {
     switch (k) {
     case RAY_IDX_HASH: return "HASH"; case RAY_IDX_SORT: return "SORT";
     case RAY_IDX_BLOOM: return "BLOOM"; case RAY_IDX_PART: return "PART";
+    case RAY_IDX_DICT: return "DICT";
     default: return "?";
     }
 }
@@ -315,6 +319,58 @@ ray_t* ray_enc_index_write(FILE* f, const ray_enc_idx_src_t* s, uint64_t* bytes)
     return NULL;
 }
 
+/* ===== DICT (P6b, spec "Index region": DICT) =====
+ *
+ * The region: the 80-byte root (parent_type STR, built_for_len, the DICT
+ * kind fields), then four children at pad32 offsets from 96: codes (I32,
+ * len), first_occ (I32, n_distinct), offs (u64, n_distinct + 1, the last
+ * the terminal bytes_len) and the entry bytes (bytes_len), the region
+ * ending at pad32.  Every pad byte is zero. */
+
+/* The count rules the writer refuses (nyi) and the entry tier rejects
+ * (corrupt) on the same terms. */
+static const char* ei_dict_rule(int64_t len, int64_t nd, const uint64_t* offs, uint64_t bytes_len) {
+    if (len < 1 || len > INT32_MAX) return "rows outside 1 .. INT32_MAX";
+    if (nd < 1 || nd > len) return "n_distinct outside 1 .. rows";
+    if (offs[0] != 0) return "offsets not starting at 0";
+    for (int64_t c = 0; c < nd; c++) {
+        uint64_t end = c + 1 < nd ? offs[c + 1] : bytes_len;
+        if (end < offs[c] || end - offs[c] > UINT32_MAX) return "offsets decreasing or an entry over UINT32_MAX bytes";
+    }
+    return NULL;
+}
+
+ray_t* ray_enc_dict_write(FILE* f, const ray_enc_dict_src_t* s, uint64_t* bytes) {
+    *bytes = 0;
+    if (!ray_enc_gen2_supported()) EI_NYI("index region: generation 2 needs a little-endian host");
+    const char* why = ei_dict_rule(s->len, s->n_distinct, s->offs, s->bytes_len);
+    if (why) EI_NYI("index region: DICT %s", why);
+    const uint64_t nd = (uint64_t)s->n_distinct;
+    uint64_t cb[4] = { (uint64_t)s->len * 4, nd * 4, (nd + 1) * 8, s->bytes_len };
+    ei_layout_t L;
+    if (!ei_layout(4, cb, 0, &L)) EI_NYI("index region: DICT too large");
+    uint8_t root[RAY_ENC_IDX_FIRST_CHILD];
+    memset(root, 0, sizeof root);
+    root[0] = (uint8_t)RAY_STR;
+    memcpy(root + 8, &s->len, 8);
+    ray_enc_idx_dict_t d = { (int64_t)L.off[0], (int64_t)L.off[1], (int64_t)L.off[2], (int64_t)L.off[3],
+                             s->n_distinct, s->bytes_len };
+    memcpy(root + 16, &d, sizeof d);
+    uint64_t pos = 0;
+    #define EI_PUT(p, n) do { if (!ei_put(f, (p), (n), &pos)) return ray_error("io", "index region: short write"); } while (0)
+    #define EI_PAD(to)   do { if (!ei_zero(f, (to), &pos)) return ray_error("io", "index region: short write"); } while (0)
+    EI_PUT(root, sizeof root);
+    EI_PAD(L.off[0]); EI_PUT(s->codes, (size_t)cb[0]);
+    EI_PAD(L.off[1]); EI_PUT(s->first_occ, (size_t)cb[1]);
+    EI_PAD(L.off[2]); EI_PUT(s->offs, (size_t)nd * 8); EI_PUT(&s->bytes_len, 8);   /* the terminal offset */
+    EI_PAD(L.off[3]); if (s->bytes_len) EI_PUT(s->bytes, (size_t)s->bytes_len);
+    EI_PAD(L.end);
+    #undef EI_PUT
+    #undef EI_PAD
+    *bytes = pos;
+    return NULL;
+}
+
 /* ===== Validation (spec "Index validation") =====
  *
  * Every read of the region goes through memcpy at an offset already
@@ -334,6 +390,119 @@ static bool ev_zero(const uint8_t* p, uint64_t n) {
 }
 static int64_t ev_i64(const uint8_t* p) { int64_t x; memcpy(&x, p, 8); return x; }
 static int64_t ev_at(const uint8_t* p, int64_t i) { return ev_i64(p + (uint64_t)i * 8); }
+
+/* ---- DICT, the entry tier (spec "Index validation": DICT) ----
+ * Root fields read before any count is trusted; every count bounded by
+ * the region before a byte count is derived; the layout matched and ending
+ * at `size` before a child is read. */
+ray_t* ray_enc_dict_validate(const uint8_t* b, uint64_t size, int64_t len,
+                             const char* path, ray_enc_dict_view_t* v) {
+    ray_t* err = NULL;
+    memset(v, 0, sizeof *v);
+    if (!path) path = "?";
+    if (((uintptr_t)b & 31) != 0) return ray_error("type", "column %s: DICT region not 32-aligned", path);
+    if (!b || size < RAY_ENC_IDX_FIRST_CHILD) EV("column %s: DICT region shorter than its root", path);
+    if ((int8_t)b[0] != RAY_STR) EV("column %s: DICT parent type %d, not STR", path, (int8_t)b[0]);
+    if (!ev_zero(b + 1, 7)) EV("column %s: DICT root reserved bytes set", path);
+    if (ev_i64(b + 8) != len)
+        EV("column %s: DICT built_for_len %lld, column has %lld rows", path, (long long)ev_i64(b + 8), (long long)len);
+    if (len < 1 || len > INT32_MAX) EV("column %s: DICT over %lld rows, outside 1 .. INT32_MAX", path, (long long)len);
+    if (!ev_zero(b + RAY_ENC_IDX_ROOT_BYTES, RAY_ENC_IDX_FIRST_CHILD - RAY_ENC_IDX_ROOT_BYTES))
+        EV("column %s: DICT root padding set", path);
+    ray_enc_idx_dict_t d; memcpy(&d, b + 16, sizeof d);
+    if (!ev_zero(b + 16 + sizeof d, 64 - sizeof d)) EV("column %s: DICT kind area reserved bytes set", path);
+    if (d.n_distinct < 1 || d.n_distinct > len)
+        EV("column %s: DICT n_distinct %lld outside 1 .. %lld", path, (long long)d.n_distinct, (long long)len);
+    /* every count is bounded by the region before a byte count is derived */
+    if ((uint64_t)len > size / 4 || (uint64_t)d.n_distinct > size / 8 || d.bytes_len > size)
+        EV("column %s: DICT children outside the region (layout)", path);
+    const uint64_t nd = (uint64_t)d.n_distinct;
+    uint64_t cb[4] = { (uint64_t)len * 4, nd * 4, (nd + 1) * 8, d.bytes_len };
+    ei_layout_t L;
+    if (!ei_layout(4, cb, 0, &L)) EV("column %s: DICT children outside the region (layout)", path);
+    const int64_t want[4] = { d.codes, d.first_occ, d.offs, d.bytes };
+    for (int i = 0; i < 4; i++)
+        if (want[i] != (int64_t)L.off[i])
+            EV("column %s: DICT child %d placement %lld, expected %llu", path, i, (long long)want[i],
+               (unsigned long long)L.off[i]);
+    if (L.end != size)
+        EV("column %s: DICT region is %llu bytes, its layout %llu", path, (unsigned long long)size,
+           (unsigned long long)L.end);
+    uint64_t at = RAY_ENC_IDX_FIRST_CHILD;
+    for (int i = 0; i < 4; i++) {
+        if (!ev_zero(b + at, L.off[i] - at)) EV("column %s: DICT padding set before child %d", path, i);
+        at = L.off[i] + L.bytes[i];
+    }
+    if (!ev_zero(b + at, size - at)) EV("column %s: DICT region tail padding set", path);
+    /* offs[0 .. nd] lie in the region (the layout); nd <= len <= INT32_MAX */
+    const uint64_t* offs = (const uint64_t*)(b + d.offs);
+    if (!ray_enc_sdict_offsets_ok(offs, (uint32_t)nd, ray_enc_pad8(d.bytes_len)) || offs[nd] != d.bytes_len)
+        EV("column %s: DICT offsets", path);
+    const int32_t* fo = (const int32_t*)(b + d.first_occ);
+    if (fo[0] != 0) EV("column %s: DICT first occurrence of code 0 is row %d", path, fo[0]);
+    for (uint64_t c = 1; c < nd; c++)
+        if (fo[c] <= fo[c - 1] || fo[c] >= len)
+            EV("column %s: DICT first occurrence of code %llu is row %d", path, (unsigned long long)c, fo[c]);
+    v->len = len; v->n_distinct = d.n_distinct;
+    v->codes = (const int32_t*)(b + d.codes); v->first_occ = fo; v->offs = offs; v->bytes = b + d.bytes;
+    return NULL;
+out:
+    memset(v, 0, sizeof *v);
+    return err;
+}
+
+/* ---- DICT, the code tier ---- */
+typedef struct {
+    const ray_enc_dict_view_t* v;
+    int32_t*          copy;
+    _Atomic(int64_t)  bad;       /* lowest failing row, INT64_MAX none */
+    _Atomic(int64_t)  done;      /* rows checked: a cancelled dispatch skips tasks */
+} ev_dict_par_t;
+
+static void ev_dict_rows(void* ctx, uint32_t wid, int64_t lo, int64_t hi) {
+    (void)wid;
+    ev_dict_par_t* x = ctx;
+    const int32_t* cd = x->v->codes; const int32_t* fo = x->v->first_occ;
+    const uint32_t nd = (uint32_t)x->v->n_distinct;
+    int64_t bad = INT64_MAX;
+    for (int64_t i = lo; i < hi; i++) {
+        const int32_t c = cd[i];
+        if ((uint32_t)c >= nd || fo[c] > i) { bad = i; break; }
+        if (x->copy) x->copy[i] = c;
+    }
+    if (bad != INT64_MAX) {
+        int64_t cur = atomic_load(&x->bad);
+        while (bad < cur && !atomic_compare_exchange_weak(&x->bad, &cur, bad)) {}
+    }
+    atomic_fetch_add(&x->done, hi - lo);
+}
+
+ray_t* ray_enc_dict_codes_check(const ray_enc_dict_view_t* v, int32_t* copy, const char* path) {
+    if (!path) path = "?";
+    ev_dict_par_t x = { .v = v, .copy = copy };
+    atomic_store(&x.bad, INT64_MAX); atomic_store(&x.done, 0);
+    ray_pool_t* pool = ray_pool_get();
+    /* par_dispatch_ok: never a nested dispatch from inside a worker */
+    if (ray_pool_par_dispatch_ok(pool, v->len, RAY_PARALLEL_THRESHOLD)) ray_pool_dispatch(pool, ev_dict_rows, &x, v->len);
+    else ev_dict_rows(&x, 0, 0, v->len);
+    /* a skipped task is not a pass, and the lowest failing row is only
+     * known when every row was read */
+    if (atomic_load(&x.done) != v->len || ray_interrupted()) return ray_error("cancel", "column %s: DICT codes", path);
+    const int64_t bad = atomic_load(&x.bad);
+    if (bad != INT64_MAX) {
+        const int32_t c = v->codes[bad];
+        if ((uint32_t)c >= (uint32_t)v->n_distinct)
+            return ray_error("corrupt", "column %s: DICT code %d at row %lld outside 0 .. %lld", path, c,
+                             (long long)bad, (long long)v->n_distinct - 1);
+        return ray_error("corrupt", "column %s: DICT code %d at row %lld before its first occurrence (row %d)",
+                         path, c, (long long)bad, v->first_occ[c]);
+    }
+    for (int64_t c = 0; c < v->n_distinct; c++)
+        if (v->codes[v->first_occ[c]] != (int32_t)c)
+            return ray_error("corrupt", "column %s: DICT first occurrence of code %lld (row %d) holds code %d",
+                             path, (long long)c, v->first_occ[c], v->codes[v->first_occ[c]]);
+    return NULL;
+}
 
 /* PART key i, integer types in native order (signed, BOOL / U8 zero-extended). */
 static int64_t ev_key_int(const uint8_t* p, int8_t t, int64_t i) {

@@ -3892,6 +3892,274 @@ static test_result_t test_hash_par_rules(void) {
     return r;
 }
 
+/* ---- P6b: the DICT region (spec "Index region", "Index validation") ---- */
+
+/* A DICT source over 8 rows: codes 0 1 0 2 1 0 2 3, first_occ 0 1 3 7,
+ * entries "a", "bb", "", "dddd" (the empty entry is the in-band null). */
+static const int32_t  dx_codes[8] = { 0, 1, 0, 2, 1, 0, 2, 3 };
+static const int32_t  dx_focc[4]  = { 0, 1, 3, 7 };
+static const uint64_t dx_offs[4]  = { 0, 1, 3, 3 };
+static const char     dx_bytes[]  = "abbdddd";      /* 7 bytes */
+static ray_enc_dict_src_t dx_src(void) {
+    return (ray_enc_dict_src_t){ .len = 8, .n_distinct = 4, .codes = dx_codes, .first_occ = dx_focc,
+                                 .offs = dx_offs, .bytes = dx_bytes, .bytes_len = 7 };
+}
+/* The region of s, written to a file and read back into a 32-aligned
+ * buffer (*n bytes; the caller frees). */
+static uint8_t* dx_region(const ray_enc_dict_src_t* s, size_t* n, ray_t** err) {
+    FILE* f = fopen(ray_test_tmp(IDX_TMP "/dr"), "wb");
+    uint64_t nb = 0;
+    *err = f ? ray_enc_dict_write(f, s, &nb) : ray_error("io", NULL);
+    if (f) fclose(f);
+    if (*err) return NULL;
+    size_t got = 0;
+    uint8_t* raw = ix_slurp(ray_test_tmp(IDX_TMP "/dr"), &got);
+    if (!raw || got != nb) { free(raw); return NULL; }
+    uint8_t* b = aligned_alloc(32, (got + 31) & ~(size_t)31);
+    memcpy(b, raw, got); free(raw);
+    *n = got;
+    return b;
+}
+static ray_t* dx_check(const uint8_t* b, size_t n, int64_t len, ray_enc_dict_view_t* v) {
+    ray_t* e = ray_enc_dict_validate(b, n, len, "dx", v);
+    return e ? e : ray_enc_dict_codes_check(v, NULL, "dx");
+}
+#define DX_CORRUPT(b, n, len, needle) do { ray_enc_dict_view_t v_; ray_error_clear(); \
+    ray_t* e_ = dx_check((b), (n), (len), &v_); \
+    TEST_ASSERT_FMT(e_ && strcmp(ray_err_code(e_), "corrupt") == 0, "want corrupt for %s", (needle)); \
+    TEST_ASSERT_FMT(strstr(ray_error_msg(), (needle)) != NULL, "message \"%s\", want [%s]", ray_error_msg(), (needle)); \
+    ray_error_free(e_); } while (0)
+
+/* Layout: root fields, children at pad32 offsets from 96, region end. */
+static test_result_t test_dict_write_layout(void) {
+    ray_enc_dict_src_t s = dx_src();
+    size_t n; ray_t* err;
+    uint8_t* b = dx_region(&s, &n, &err);
+    TEST_ASSERT_NULL(err);
+    TEST_ASSERT_NOT_NULL(b);
+    TEST_ASSERT_EQ_I((int8_t)b[0], RAY_STR);
+    TEST_ASSERT_EQ_I(rd64(b + 8), 8);
+    ray_enc_idx_dict_t d; memcpy(&d, b + 16, sizeof d);
+    TEST_ASSERT_EQ_I(d.codes, 96);
+    TEST_ASSERT_EQ_I(d.first_occ, ix_p32(96 + 8 * 4));
+    TEST_ASSERT_EQ_I(d.offs, ix_p32(d.first_occ + 4 * 4));
+    TEST_ASSERT_EQ_I(d.bytes, ix_p32(d.offs + 5 * 8));
+    TEST_ASSERT_EQ_I(d.n_distinct, 4);
+    TEST_ASSERT_EQ_U(d.bytes_len, 7);
+    for (int i = 16 + 48; i < 96; i++) TEST_ASSERT_EQ_I(b[i], 0);   /* kind-area tail, root padding */
+    TEST_ASSERT_EQ_U(n, ix_p32((uint64_t)d.bytes + 7));
+    uint64_t last; memcpy(&last, b + d.offs + 4 * 8, 8);
+    TEST_ASSERT_EQ_U(last, 7);                                      /* the terminal offset */
+    TEST_ASSERT_TRUE(memcmp(b + d.bytes, "abbdddd", 7) == 0);
+    free(b);
+    PASS();
+}
+
+/* The region validates; the view points at its children. */
+static test_result_t test_dict_validate_accepts(void) {
+    ray_enc_dict_src_t s = dx_src();
+    size_t n; ray_t* err;
+    uint8_t* b = dx_region(&s, &n, &err);
+    TEST_ASSERT_NULL(err);
+    ray_enc_dict_view_t v;
+    TEST_ASSERT_NULL(ray_enc_dict_validate(b, n, 8, "dx", &v));
+    TEST_ASSERT_EQ_I(v.n_distinct, 4);
+    TEST_ASSERT_EQ_I(v.len, 8);
+    TEST_ASSERT_TRUE(memcmp(v.codes, dx_codes, sizeof dx_codes) == 0);
+    TEST_ASSERT_TRUE(memcmp(v.first_occ, dx_focc, sizeof dx_focc) == 0);
+    TEST_ASSERT_EQ_U(v.offs[4], 7);
+    int32_t copy[8];
+    TEST_ASSERT_NULL(ray_enc_dict_codes_check(&v, copy, "dx"));
+    TEST_ASSERT_TRUE(memcmp(copy, dx_codes, sizeof copy) == 0);
+    TEST_ASSERT_STR_EQ(ray_err_code(ray_enc_dict_validate(b, n, 9, "dx", &v)), "corrupt");   /* built_for_len */
+    free(b);
+    PASS();
+}
+
+/* Every entry-tier rule, one patch each, against the written region. */
+static test_result_t test_dict_reject_entry_tier(void) {
+    ray_enc_dict_src_t s = dx_src();
+    size_t n; ray_t* err;
+    uint8_t* g = dx_region(&s, &n, &err);
+    TEST_ASSERT_NULL(err);
+    uint8_t* b = aligned_alloc(32, (n + 31) & ~(size_t)31);
+    ray_enc_idx_dict_t d; memcpy(&d, g + 16, sizeof d);
+    #define DX_PATCH(off, T, val, needle) do { memcpy(b, g, n); T x_ = (val); memcpy(b + (off), &x_, sizeof x_); \
+        DX_CORRUPT(b, n, 8, needle); } while (0)
+    DX_PATCH(0, int8_t, RAY_I64, "parent type");
+    DX_PATCH(1, uint8_t, 1, "reserved");
+    DX_PATCH(16 + 32, int64_t, 0, "n_distinct");                    /* 0 */
+    DX_PATCH(16 + 32, int64_t, 9, "n_distinct");                    /* above len */
+    DX_PATCH(16 + 40, uint64_t, 40, "layout");                      /* bytes_len moves the end */
+    DX_PATCH(16 + 48, uint8_t, 1, "kind area");
+    DX_PATCH(16 + 0, int64_t, 128, "placement");                    /* codes not at 96 */
+    DX_PATCH(d.offs, uint64_t, 1, "offsets");                       /* offs[0] != 0 */
+    DX_PATCH(d.offs + 16, uint64_t, 0, "offsets");                  /* decreasing */
+    DX_PATCH(d.offs + 32, uint64_t, 6, "offsets");                  /* terminal != bytes_len */
+    DX_PATCH(d.first_occ, int32_t, 1, "first occurrence");          /* first_occ[0] != 0 */
+    DX_PATCH(d.first_occ + 8, int32_t, 1, "first occurrence");      /* not ascending */
+    DX_PATCH(d.first_occ + 12, int32_t, 8, "first occurrence");     /* past len */
+    DX_PATCH(d.bytes + 7, uint8_t, 1, "padding");                   /* after the bytes */
+    DX_PATCH(d.first_occ + 4 * 4, uint8_t, 1, "padding");           /* between first_occ and offs */
+    #undef DX_PATCH
+    memcpy(b, g, n);
+    DX_CORRUPT(b, n - 32, 8, "layout");                             /* truncated */
+    DX_CORRUPT(b, 64, 8, "root");                                   /* shorter than the root */
+    /* len past INT32_MAX: built_for_len and the column agree, codes do not fit */
+    memcpy(b, g, n); int64_t big = (int64_t)INT32_MAX + 1; memcpy(b + 8, &big, 8);
+    DX_CORRUPT(b, n, big, "INT32_MAX");
+    free(b); free(g);
+    PASS();
+}
+
+/* The code tier: out of range, before its first occurrence, first_occ
+ * not the first row of its code, an entry that never occurs. */
+static test_result_t test_dict_reject_code_tier(void) {
+    int32_t c[8];
+    ray_enc_dict_src_t s = dx_src();
+    struct { int row; int32_t code; const char* needle; } cases[] = {
+        { 2, 4, "code" },                 /* 4 >= n_distinct */
+        { 2, -1, "code" },
+        { 2, 2, "first occurrence" },     /* code 2 at row 2, first_occ[2] = 3 */
+        { 3, 0, "first occurrence" },     /* codes[first_occ[2]] != 2, and 2 never occurs first */
+        { 7, 2, "first occurrence" },     /* code 3 never occurs: codes[first_occ[3]] != 3 */
+    };
+    for (size_t k = 0; k < sizeof cases / sizeof cases[0]; k++) {
+        memcpy(c, dx_codes, sizeof c);
+        c[cases[k].row] = cases[k].code;
+        s.codes = c;
+        size_t n; ray_t* err;
+        uint8_t* b = dx_region(&s, &n, &err);
+        /* the writer persists what it is given; the reader refuses it */
+        TEST_ASSERT_NULL(err);
+        ray_enc_dict_view_t v;
+        TEST_ASSERT_NULL(ray_enc_dict_validate(b, n, 8, "dx", &v));    /* the entry tier passes */
+        ray_error_clear();
+        ray_t* e = ray_enc_dict_codes_check(&v, NULL, "dx");
+        TEST_ASSERT_FMT(e && strcmp(ray_err_code(e), "corrupt") == 0, "case %zu: want corrupt", k);
+        TEST_ASSERT_FMT(strstr(ray_error_msg(), cases[k].needle) != NULL, "case %zu: %s", k, ray_error_msg());
+        ray_error_free(e); free(b);
+    }
+    PASS();
+}
+
+/* The code tier over 300000 rows (parallel above the dispatch threshold)
+ * gives the serial verdict, and writes the copy. */
+static test_result_t test_dict_codes_par(void) {
+    const int64_t n = 300000, nd = 1000;
+    int32_t* c = malloc((size_t)n * 4); int32_t* f = malloc((size_t)nd * 4);
+    uint64_t* o = malloc((size_t)nd * 8); char* by = malloc((size_t)nd * 4);
+    for (int64_t i = 0; i < nd; i++) { c[i] = (int32_t)i; f[i] = (int32_t)i; o[i] = (uint64_t)i * 4; memcpy(by + i * 4, &i, 4); }
+    for (int64_t i = nd; i < n; i++) c[i] = (int32_t)((i * 7919) % nd);
+    ray_enc_dict_src_t s = { .len = n, .n_distinct = nd, .codes = c, .first_occ = f, .offs = o,
+                             .bytes = by, .bytes_len = (uint64_t)nd * 4 };
+    size_t rn; ray_t* err;
+    uint8_t* b = dx_region(&s, &rn, &err);
+    TEST_ASSERT_NULL(err);
+    ray_enc_dict_view_t v;
+    TEST_ASSERT_NULL(ray_enc_dict_validate(b, rn, n, "dx", &v));
+    int32_t* copy = malloc((size_t)n * 4);
+    TEST_ASSERT_NULL(ray_enc_dict_codes_check(&v, copy, "dx"));
+    TEST_ASSERT_TRUE(memcmp(copy, c, (size_t)n * 4) == 0);
+    int32_t* cd = (int32_t*)(b + 96);
+    cd[250000] = (int32_t)nd;                       /* one bad code deep in the column */
+    ray_t* e = ray_enc_dict_codes_check(&v, NULL, "dx");
+    TEST_ASSERT_TRUE(e && strcmp(ray_err_code(e), "corrupt") == 0);
+    TEST_ASSERT_TRUE(strstr(ray_error_msg(), "row 250000") != NULL);
+    ray_error_free(e);
+    free(copy); free(b); free(c); free(f); free(o); free(by);
+    PASS();
+}
+
+/* The writer refuses a source no validator would accept: nyi naming DICT. */
+static test_result_t test_dict_write_rejects(void) {
+    ray_enc_dict_src_t s = dx_src();
+    FILE* f = fopen(ray_test_tmp(IDX_TMP "/dw"), "wb");
+    uint64_t nb;
+    s.n_distinct = 0;
+    ray_t* e = ray_enc_dict_write(f, &s, &nb);
+    TEST_ASSERT_TRUE(e && strcmp(ray_err_code(e), "nyi") == 0 && strstr(ray_error_msg(), "DICT"));
+    ray_error_free(e);
+    s = dx_src(); s.n_distinct = 9;                                    /* above len */
+    e = ray_enc_dict_write(f, &s, &nb);
+    TEST_ASSERT_TRUE(e && strcmp(ray_err_code(e), "nyi") == 0); ray_error_free(e);
+    s = dx_src(); s.bytes_len = 2;                                     /* the last entry starts past the bytes */
+    e = ray_enc_dict_write(f, &s, &nb);
+    TEST_ASSERT_TRUE(e && strcmp(ray_err_code(e), "nyi") == 0); ray_error_free(e);
+    s = dx_src(); s.len = (int64_t)INT32_MAX + 1;
+    e = ray_enc_dict_write(f, &s, &nb);
+    TEST_ASSERT_TRUE(e && strcmp(ray_err_code(e), "nyi") == 0); ray_error_free(e);
+    fclose(f);
+    PASS();
+}
+
+/* The entry-tier clauses the patch list above leaves out: alignment (a
+ * programming error, type), the root padding, the count-against-region
+ * bounds, the last child's placement and leading padding, no region. */
+static test_result_t test_dict_reject_entry_tier_more(void) {
+    ray_enc_dict_src_t s = dx_src();
+    size_t n; ray_t* err;
+    uint8_t* g = dx_region(&s, &n, &err);
+    TEST_ASSERT_NULL(err);
+    TEST_ASSERT_EQ_U(n, 256);
+    uint8_t* b = aligned_alloc(32, n + 32);
+    ray_enc_idx_dict_t d; memcpy(&d, g + 16, sizeof d);
+    ray_enc_dict_view_t v;
+    memcpy(b + 8, g, n);                                            /* 8-aligned, not 32 */
+    ray_t* e = ray_enc_dict_validate(b + 8, n, 8, "dx", &v);
+    TEST_ASSERT_TRUE(e && strcmp(ray_err_code(e), "type") == 0);
+    ray_error_free(e);
+    TEST_ASSERT_TRUE(v.codes == NULL && v.n_distinct == 0);
+    #define DX_PATCH_L(off, T, val, len, needle) do { memcpy(b, g, n); T x_ = (val); memcpy(b + (off), &x_, sizeof x_); \
+        int64_t l_ = (len); memcpy(b + 8, &l_, 8); DX_CORRUPT(b, n, l_, needle); } while (0)
+    DX_PATCH_L(80, uint8_t, 1, 8, "root padding");
+    DX_PATCH_L(95, uint8_t, 1, 8, "root padding");
+    DX_PATCH_L(16 + 32, int64_t, 40, 64, "layout");                 /* n_distinct past size / 8 */
+    DX_PATCH_L(16 + 32, int64_t, 4, 100, "layout");                 /* rows past size / 4 */
+    DX_PATCH_L(16 + 40, uint64_t, 1000, 8, "layout");               /* bytes_len past the region */
+    DX_PATCH_L(16 + 40, uint64_t, UINT64_MAX, 8, "layout");
+    DX_PATCH_L(16 + 24, int64_t, 256, 8, "placement");              /* bytes child moved */
+    DX_PATCH_L(16 + 16, int64_t, 128, 8, "placement");              /* offs child over first_occ */
+    DX_PATCH_L(d.offs + 5 * 8, uint8_t, 1, 8, "padding");           /* between offs and bytes */
+    DX_PATCH_L(d.codes + 7 * 4, int32_t, 0, 8, "first occurrence");  /* code tier: codes[7] 3 -> 0 */
+    #undef DX_PATCH_L
+    DX_CORRUPT(NULL, 0, 8, "root");
+    memcpy(b, g, n);
+    DX_CORRUPT(b, n, 0, "built_for_len");                           /* column of 0 rows */
+    free(b); free(g);
+    PASS();
+}
+
+/* A cancelled code check reports cancel, never success, serial or
+ * parallel, and passes once the interrupt is cleared. */
+static test_result_t test_dict_codes_cancel(void) {
+    const int64_t n = 300000, nd = 3;
+    int32_t* c = malloc((size_t)n * 4);
+    for (int64_t i = 0; i < n; i++) c[i] = (int32_t)(i < nd ? i : i % nd);
+    const int32_t f[3] = { 0, 1, 2 };
+    const uint64_t o[3] = { 0, 1, 2 };
+    ray_enc_dict_src_t s = { .len = n, .n_distinct = nd, .codes = c, .first_occ = f, .offs = o,
+                             .bytes = "xyz", .bytes_len = 3 };
+    size_t rn; ray_t* err;
+    uint8_t* b = dx_region(&s, &rn, &err);
+    TEST_ASSERT_NULL(err);
+    ray_enc_dict_view_t v;
+    TEST_ASSERT_NULL(ray_enc_dict_validate(b, rn, n, "dx", &v));
+    ray_enc_dict_view_t small = v; small.len = 8;                   /* the serial path */
+    ray_request_interrupt();
+    ray_t* e1 = ray_enc_dict_codes_check(&v, NULL, "dx");
+    ray_t* e2 = ray_enc_dict_codes_check(&small, NULL, "dx");
+    ray_clear_interrupt();
+    bool c1 = e1 && strcmp(ray_err_code(e1), "cancel") == 0, c2 = e2 && strcmp(ray_err_code(e2), "cancel") == 0;
+    if (e1) ray_error_free(e1);
+    if (e2) ray_error_free(e2);
+    TEST_ASSERT_TRUE(c1);
+    TEST_ASSERT_TRUE(c2);
+    TEST_ASSERT_NULL(ray_enc_dict_codes_check(&v, NULL, "dx"));
+    free(b); free(c);
+    PASS();
+}
+
 const test_entry_t encidx_entries[] = {
     { "idxval/write_hash_layout", test_write_hash_layout, ix_setup, ix_teardown },
     { "idxval/write_name_block",  test_write_name_block,  ix_setup, ix_teardown },
@@ -3962,5 +4230,13 @@ const test_entry_t encidx_entries[] = {
     { "idxval/unique_attr_get",       test_unique_attr_get,       ixr_setup, ixr_teardown },
     { "idxval/normalized_domains",    test_normalized_domains,    ixr_setup, ixr_teardown },
     { "idxval/order_sym_fast_path",   test_order_sym_fast_path,   ixr_setup, ixr_teardown },
+    { "idxval/dict_write_layout",     test_dict_write_layout,     ix_setup, ix_teardown },
+    { "idxval/dict_validate_accepts", test_dict_validate_accepts, ix_setup, ix_teardown },
+    { "idxval/dict_reject_entry_tier", test_dict_reject_entry_tier, ix_setup, ix_teardown },
+    { "idxval/dict_reject_code_tier", test_dict_reject_code_tier, ix_setup, ix_teardown },
+    { "idxval/dict_codes_par",        test_dict_codes_par,        ix_setup, ix_teardown },
+    { "idxval/dict_write_rejects",    test_dict_write_rejects,    ix_setup, ix_teardown },
+    { "idxval/dict_reject_entry_tier_more", test_dict_reject_entry_tier_more, ix_setup, ix_teardown },
+    { "idxval/dict_codes_cancel",     test_dict_codes_cancel,     ix_setup, ix_teardown },
     { NULL, NULL, NULL, NULL },
 };
