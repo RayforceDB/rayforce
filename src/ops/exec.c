@@ -1566,6 +1566,257 @@ static ray_t* idx_decode_col(ray_t* tbl, int64_t sym) {
     return col;
 }
 
+/* ---- STR equality / inequality as a selection (P6, spec Path 1) ----
+ *
+ * (== s "c") / (!= s "c") over a generation-2 STR column, single file or
+ * parted.  Byte equality, nulls included: "" is the in-band null, so a ""
+ * constant selects the null rows under ==, and a null row passes != of a
+ * non-empty constant.  Per segment the constant is looked up once in the
+ * column's STR_DICT entry (its code, -1 absent, -2 no entry).  A vector is
+ * decided whole when the constant is non-empty and its code lies outside
+ * the chunk's or the vector's code bounds (membership bounds over the
+ * non-null rows: "" is never inside them, D4); a STR_DICT vector otherwise
+ * compares its codes as a view; any other vector, a plain or materialized
+ * segment and a synthetic all-null one are read by range and compared on
+ * bytes. */
+typedef struct {
+    ray_col_src_t  src;        /* parted: the segment's own source, bound here */
+    ray_col_src_t* rs;         /* the source its rows are read from by range */
+    ray_enccol_t*  e;          /* single-file encoded, not materialized: codes and bounds; else NULL */
+    int64_t        code;       /* the constant's code in e's entry: >= 0, -1 absent, -2 no entry */
+    bool           bound;
+} str_seg_sel_t;
+
+typedef struct {
+    str_seg_sel_t*   segs;
+    const int64_t*   off;      /* segment i: rows [off[i], off[i + 1]) */
+    int64_t          n_segs;
+    const char*      cs;
+    uint32_t         clen;
+    bool             ne;
+    ray_scan_fail_t* fail;
+    /* an installed selection the result is ANDed with (a later conjunct), or NULL */
+    const uint8_t*   wflags;
+    const uint32_t*  woff;
+    const uint16_t*  widx;
+} str_sel_ctx_t;
+
+/* Rows [lr, lr + n) of segment s (segment-local rows) into out; false
+ * with the failure noted under `key` (the rest of out is the caller's). */
+static bool str_seg_fill(const str_sel_ctx_t* x, str_seg_sel_t* s, ray_col_scratch_t* sc, int64_t key,
+                         int64_t lr, int64_t n, uint8_t* out) {
+    const uint8_t miss = (uint8_t)x->ne;           /* a row that does not equal c */
+    int64_t at = 0;
+    while (at < n) {
+        const int64_t row = lr + at;
+        uint8_t* o = out + at;
+        if (s->e) {
+            const int64_t v = row / RAY_ENC_VEC;
+            int64_t piece = (v + 1) * RAY_ENC_VEC - row;
+            if (piece > n - at) piece = n - at;
+            const int64_t c = v / RAY_ENC_VECS_PER_CHUNK;
+            const int j = (int)(v % RAY_ENC_VECS_PER_CHUNK);
+            ray_t* err = NULL;
+            int64_t lo, hi;
+            bool decided = false;
+            if (x->clen > 0 && s->code >= -1) {     /* "" is never inside the bounds */
+                if (ray_enccol_code_bounds(s->e, c, -1, &lo, &hi, &err))
+                    decided = s->code < lo || s->code > hi;
+                if (!decided && !err && ray_enccol_code_bounds(s->e, c, j, &lo, &hi, &err))
+                    decided = s->code < lo || s->code > hi;
+                if (err) { ray_scan_fail_note(x->fail, key, err); return false; }
+            }
+            if (decided) { memset(o, miss, (size_t)piece); at += piece; continue; }
+            if (s->code >= -1) {
+                const ray_enc_desc_t* d;
+                if ((err = ray_enccol_chunk_descs_ref(s->e, c, &d)) != NULL) {
+                    ray_scan_fail_note(x->fail, key, err); return false;
+                }
+                if (d[j].encoding == RAY_ENC_STR_DICT) {
+                    ray_enc_vview_t vv;                 /* on this task's stack */
+                    int vr = ray_enccol_vview(s->e, v, &vv, &err);
+                    if (vr < 0) { ray_scan_fail_note(x->fail, key, err); return false; }
+                    if (vr > 0 && vv.enc == RAY_ENC_STR_DICT) {
+                        const int64_t k0 = row - v * RAY_ENC_VEC;
+                        if (k0 + piece > vv.n) {
+                            ray_scan_fail_note(x->fail, key, ray_error("corrupt",
+                                "STR selection: vector %lld holds %d rows", (long long)v, vv.n));
+                            return false;
+                        }
+                        const uint32_t* cd = vv.codes + k0;
+                        if (s->code < 0) memset(o, miss, (size_t)piece);     /* absent: no row equals c */
+                        else {
+                            const uint32_t cc = (uint32_t)s->code;
+                            for (int64_t k = 0; k < piece; k++) o[k] = (uint8_t)((cd[k] == cc) ^ x->ne);
+                        }
+                        at += piece;
+                        continue;
+                    }
+                    /* declined: the range read decodes or reports it */
+                }
+            }
+        }
+        ray_col_range_t rv;
+        ray_t* err = ray_col_range(s->rs, row, n - at, sc, &rv);
+        if (!err && rv.n <= 0)
+            err = ray_error("range", "STR selection: empty range read at row %lld", (long long)row);
+        if (err) { ray_scan_fail_note(x->fail, key, err); return false; }
+        const ray_str_t* sd = (const ray_str_t*)rv.data;
+        const uint32_t cl = x->clen;
+        for (int64_t k = 0; k < rv.n; k++) {
+            const uint32_t len = sd[k].len;
+            const bool eq = len == cl && (len == 0 || memcmp(ray_str_t_ptr(&sd[k], rv.str_pool), x->cs, len) == 0);
+            o[k] = (uint8_t)(eq ^ x->ne);
+        }
+        at += rv.n;
+    }
+    return true;
+}
+
+/* One morsel [start, start + n) (pred_sel_drive fills morsel by morsel):
+ * each piece inside one segment at segment-local rows; under an installed
+ * selection a morsel it drops is not read and a mixed one keeps only its
+ * own rows.  A failure is noted keyed by the morsel's first row and the
+ * morsel passes no row. */
+static void str_sel_fill(void* vctx, ray_col_scratch_t* sc, int64_t start, int64_t n, uint8_t* out) {
+    const str_sel_ctx_t* x = (const str_sel_ctx_t*)vctx;
+    const int64_t ms = start / RAY_MORSEL_ELEMS;
+    if (x->wflags && x->wflags[ms] == RAY_SEL_NONE) { memset(out, 0, (size_t)n); return; }
+    if (ray_scan_fail_skip(x->fail, start)) { memset(out, 0, (size_t)n); return; }
+    int64_t r = start;
+    const int64_t end = start + n;
+    while (r < end) {
+        int64_t lo = 0, hi = x->n_segs - 1;          /* the last i with off[i] <= r */
+        while (lo < hi) { int64_t mid = lo + (hi - lo + 1) / 2; if (x->off[mid] <= r) lo = mid; else hi = mid - 1; }
+        int64_t e = x->off[lo + 1] < end ? x->off[lo + 1] : end;
+        if (!str_seg_fill(x, &x->segs[lo], sc, start, r - x->off[lo], e - r, out + (r - start))) {
+            memset(out, 0, (size_t)n);
+            return;
+        }
+        r = e;
+    }
+    if (x->wflags && x->wflags[ms] == RAY_SEL_MIX) {
+        uint8_t keep[RAY_MORSEL_ELEMS];
+        memset(keep, 0, sizeof keep);
+        for (uint32_t j = x->woff[ms]; j < x->woff[ms + 1]; j++)
+            if (x->widx[j] < n) keep[x->widx[j]] = 1;
+        for (int64_t i = 0; i < n; i++) out[i] &= keep[i];
+    }
+}
+
+static _Atomic(uint64_t) g_str_sel_runs[2];   /* test hook: [0] first conjunct, [1] refinement */
+uint64_t ray_exec_test_str_sel(int within) { return atomic_load(&g_str_sel_runs[within ? 1 : 0]); }
+
+/* A segment's codes path: a single-file, non-synthetic encoded column
+ * without a published materialization (read by range otherwise). */
+static ray_enccol_t* str_sel_codes_col(ray_t* o) {
+    if (!o || o->type != RAY_ENCCOL || ray_enccol_decoded_peek(o)) return NULL;
+    ray_enccol_t* e = ray_enccol_of(o);
+    return e && e->kind == RAY_ENCCOL_SINGLE && !e->synthetic ? e : NULL;
+}
+
+static ray_t* str_sel_run(ray_graph_t* g, ray_op_t* pred, int64_t nrows, ray_t* within, bool* all_pass) {
+    *all_pass = false;
+    if (!g || !g->table || !pred || nrows <= 0) return NULL;
+    if ((pred->opcode != OP_EQ && pred->opcode != OP_NE) || pred->arity != 2) return NULL;
+    ray_op_t* lhs = op_child(g, pred, 0);
+    ray_op_t* rhs = op_child(g, pred, 1);
+    if (!lhs || !rhs) return NULL;
+    if (lhs->opcode == OP_CONST && rhs->opcode == OP_SCAN) { ray_op_t* t = lhs; lhs = rhs; rhs = t; }
+    if (lhs->opcode != OP_SCAN || rhs->opcode != OP_CONST) return NULL;
+    ray_op_ext_t* le = find_ext(g, lhs->id);
+    ray_op_ext_t* re = find_ext(g, rhs->id);
+    if (!le || !re || !re->literal || re->literal->type != -RAY_STR) return NULL;
+    uint16_t stored_table_id = 0;
+    memcpy(&stored_table_id, le->base.pad, sizeof(uint16_t));
+    if (stored_table_id != 0) return NULL;                 /* default table only */
+    ray_col_meta_t m;
+    /* generation 2 only: a generation-0 column keeps its path */
+    if (!ray_table_col_meta(g->table, le->sym, &m) || !m.enc) return NULL;
+    const bool parted = RAY_IS_PARTED(m.type);
+    if ((parted ? RAY_PARTED_BASETYPE(m.type) : m.type) != RAY_STR) return NULL;
+    if (within) {
+        ray_rowsel_t* wm = ray_rowsel_meta(within);
+        if (!wm || wm->nrows != nrows) return NULL;
+    }
+    if (ray_col_bind_declines(g->table, le->sym)) return NULL;
+    ray_t* berr = NULL;
+    ray_col_src_t* src = ray_graph_bind_col(g, g->table, le->sym, &berr);
+    if (berr) return berr;
+    if (!src || src->type != RAY_STR || src->len != nrows || src->parted != parted) return NULL;
+
+    str_sel_ctx_t x = { .cs = ray_str_ptr(re->literal), .clen = (uint32_t)ray_str_len(re->literal),
+                        .ne = pred->opcode == OP_NE };
+    ray_scan_fail_t fail; ray_scan_fail_init(&fail);
+    x.fail = &fail;
+    int64_t one_off[2] = { 0, nrows };
+    str_seg_sel_t one;
+    ray_t* ret = NULL;
+    bool any_codes = false;
+    if (!parted) {
+        ray_enccol_t* e = str_sel_codes_col(src->obj);
+        if (!e) return NULL;                       /* materialized: read in place on its path */
+        one = (str_seg_sel_t){ .rs = src, .e = e, .code = -2 };
+        ray_t* ce = ray_enccol_strdict_code(e, x.cs, x.clen, &one.code);
+        if (ce) return ce;
+        x.segs = &one; x.off = one_off; x.n_segs = 1;
+        ray_col_src_advise(src, 0, nrows);
+    } else {
+        int64_t ns = 0; ray_t** segv = NULL; const int64_t* off = NULL;
+        if (!ray_col_src_parted_segs(src, &ns, &segv, &off, &berr)) return berr;
+        if (ns <= 0 || off[ns] != nrows) return NULL;
+        x.segs = (str_seg_sel_t*)ray_calloc_raw((size_t)ns * sizeof(str_seg_sel_t));
+        if (!x.segs) return NULL;
+        x.off = off; x.n_segs = ns;
+        for (int64_t i = 0; i < ns; i++) {
+            str_seg_sel_t* s = &x.segs[i];
+            if (off[i + 1] == off[i]) continue;    /* empty: never filled */
+            ray_t* be = ray_col_src_bind(segv[i], &s->src);
+            if (be) { ray_error_free(be); goto decline; }
+            s->bound = true;
+            if (s->src.parted || s->src.type != RAY_STR || s->src.len != off[i + 1] - off[i]) goto decline;
+            s->rs = &s->src;
+            s->code = -2;
+            s->e = str_sel_codes_col(segv[i]);
+            if (s->e && (ret = ray_enccol_strdict_code(s->e, x.cs, x.clen, &s->code)) != NULL) goto out;
+            any_codes |= s->e != NULL;
+        }
+        /* no encoded segment (a generation-0 store whose ragged partitions
+         * stand in as synthetic segments): its path is unchanged */
+        if (!any_codes) goto decline;
+        for (int64_t i = 0; i < ns; i++)
+            if (x.segs[i].bound) ray_col_src_advise(&x.segs[i].src, 0, x.segs[i].src.len);
+    }
+    if (within) {
+        x.wflags = ray_rowsel_flags(within);
+        x.woff = ray_rowsel_offsets(within);
+        x.widx = ray_rowsel_idx(within);
+    }
+    ret = pred_sel_drive(nrows, str_sel_fill, &x, &fail, all_pass);
+    if ((ret && !RAY_IS_ERR(ret)) || (!ret && *all_pass)) atomic_fetch_add(&g_str_sel_runs[within ? 1 : 0], 1);
+    goto out;
+decline:
+    ret = NULL;
+out:
+    if (parted && x.segs) {
+        for (int64_t i = 0; i < x.n_segs; i++)
+            if (x.segs[i].bound) ray_col_src_release(&x.segs[i].src);
+        ray_free_raw(x.segs);
+    }
+    return ret;
+}
+
+ray_t* exec_str_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows, bool* all_pass) {
+    return str_sel_run(g, pred, nrows, NULL, all_pass);
+}
+
+ray_t* exec_str_refine_selection(ray_graph_t* g, ray_op_t* pred, ray_t* sel, bool* all_pass) {
+    *all_pass = false;
+    if (!sel) return NULL;
+    ray_rowsel_t* m = ray_rowsel_meta(sel);
+    return m ? str_sel_run(g, pred, m->nrows, sel, all_pass) : NULL;
+}
+
 static int idx_filter_decode(ray_graph_t* g, ray_op_t* pred_op, unsigned want,
                              ray_t** out_col, uint16_t* out_cmp_op,
                              int64_t* out_key_i, double* out_key_f,

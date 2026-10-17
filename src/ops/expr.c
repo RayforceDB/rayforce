@@ -3128,6 +3128,11 @@ ray_t* exec_pred_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
      * bool fallback: its 4 input-shape paths + dict-LUT pipeline don't reduce
      * to a clean per-morsel fill.  `between` desugars to >=/<= AND and so
      * already rides the expr path below.) */
+    if (pred->opcode == OP_EQ || pred->opcode == OP_NE) {
+        /* a generation-2 STR column against a STR constant (codes, code bounds) */
+        ray_t* ss = exec_str_to_selection(g, pred, nrows, all_pass);
+        if (ss || *all_pass) return ss;            /* answered, or an error */
+    }
     if (pred->opcode == OP_IN || pred->opcode == OP_NOT_IN)
         return exec_in_to_selection(g, pred, nrows, all_pass);
 
@@ -3302,6 +3307,10 @@ ray_t* exec_pred_refine_selection(ray_graph_t* g, ray_op_t* pred, ray_t* sel, bo
     ray_rowsel_t* m = ray_rowsel_meta(sel);
     const int64_t nrows = m->nrows;
     if (nrows <= 0 || nrows != ray_table_nrows(g->table)) return NULL;
+    if (pred->opcode == OP_EQ || pred->opcode == OP_NE) {
+        ray_t* ss = exec_str_refine_selection(g, pred, sel, all_pass);
+        if (ss || *all_pass) return ss;            /* answered, or an error */
+    }
     ray_expr_t ex;
     ray_t* cerr = NULL;
     if (!expr_compile(g, g->table, pred, &ex, &cerr)) return cerr;   /* NULL: unsupported */

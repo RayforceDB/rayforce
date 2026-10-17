@@ -1245,6 +1245,22 @@ ray_t* pred_sel_drive(int64_t nrows, pred_sel_fill_fn fill, void* fill_ctx,
  * error for a bind or range-read failure or a cancel. */
 ray_t* exec_in_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
                             bool* all_pass);
+/* (== s "c") / (!= s "c") on a STR column whose source is generation 2
+ * (single file or parted with an encoded segment), as a rowsel.  Byte
+ * equality, nulls included ("" is the in-band null).  Per segment: one
+ * dictionary lookup; chunks and vectors decided from code bounds; STR_DICT
+ * vectors compared on codes; other vectors range-read and compared on
+ * bytes.  Same tri-state as exec_pred_to_selection; NULL with *all_pass
+ * false for any other shape (generation 0, a published materialization of
+ * a single-file column, a SYM constant: their path is unchanged). */
+ray_t* exec_str_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows, bool* all_pass);
+/* exec_str_to_selection ANDed with the installed selection `sel`
+ * (borrowed; a later conjunct, exec_pred_refine_selection): a morsel sel
+ * drops is not read.  The same returns. */
+ray_t* exec_str_refine_selection(ray_graph_t* g, ray_op_t* pred, ray_t* sel, bool* all_pass);
+/* Test hook: STR selections answered (within 0: a first conjunct; 1: a
+ * refinement) since process start. */
+uint64_t ray_exec_test_str_sel(int within);
 ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input);
 ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* rhs);
 

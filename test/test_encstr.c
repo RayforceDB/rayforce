@@ -39,6 +39,7 @@
 #include "lang/format.h"
 #include "store/splay.h"
 #include "ops/idxop.h"
+#include "ops/internal.h"     /* ray_exec_test_str_sel */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1336,6 +1337,247 @@ static test_result_t test_dict_oom_retry(void) {
     PASS();
 }
 
+/* ---- Task 5: STR equality and inequality in filters ---- */
+
+/* The generation-2 run's counters of st_same_q: materializations, decoded
+ * bytes, and the STR selections it answered (a first conjunct, a
+ * refinement). */
+/* ST_Q_OK for a long local query text: the message is cut */
+#define ST_Q_OK_N(q) TEST_ASSERT_FMT(st_q_run(q), "%.400s: %.400s", (q), st_msg)
+
+typedef struct { uint64_t mat, dec, sel, refine; } st_fk_t;
+
+/* q (table T) on <name>0 and <name>2 (`load` formats the load of the
+ * table directory): equal formatted results; the generation-0 run takes
+ * no STR selection; the generation-2 run's counters into *k. */
+static test_result_t st_same_load(const char* name, const char* load, const char* q, st_fk_t* k) {
+    char buf[1024], ld[700];
+    ray_t* out[2] = { NULL, NULL };
+    for (int g = 0; g < 2; g++) {
+        snprintf(ld, sizeof ld, load, ST_TMP, name, g ? 2 : 0);
+        snprintf(buf, sizeof buf, "(set T %s)", ld);
+        ST_Q_OK_N(buf);
+        ray_enc_counters_reset();
+        const uint64_t s0 = ray_exec_test_str_sel(0), r0 = ray_exec_test_str_sel(1);
+        out[g] = st_q_fmt(q);
+        TEST_ASSERT_FMT(out[g] != NULL, "%s gen %d: %s", q, g ? 2 : 0, st_msg);
+        st_hold(out[g]);
+        ray_enc_counters_t c; ray_enc_counters_get(&c);
+        const uint64_t ds = ray_exec_test_str_sel(0) - s0, dr = ray_exec_test_str_sel(1) - r0;
+        if (!g) TEST_ASSERT_FMT(ds == 0 && dr == 0, "%s: generation 0 took the STR selection", q);
+        else if (k) *k = (st_fk_t){ c.materialized, c.decoded_bytes, ds, dr };
+    }
+    TEST_ASSERT_FMT(ray_str_len(out[0]) == ray_str_len(out[1]) &&
+                    memcmp(ray_str_ptr(out[0]), ray_str_ptr(out[1]), ray_str_len(out[0])) == 0,
+                    "%s differs: %.*s vs %.*s", q, (int)ray_str_len(out[0]), ray_str_ptr(out[0]),
+                    (int)ray_str_len(out[1]), ray_str_ptr(out[1]));
+    for (int g = 0; g < 2; g++) { st_unhold(out[g], NULL); ray_release(out[g]); }
+    PASS();
+}
+#define ST_SPLAY_LOAD "(.db.splayed.get \"%s/%s%d/\")"
+static test_result_t st_same_q(const char* name, const char* q, st_fk_t* k) {
+    return st_same_load(name, ST_SPLAY_LOAD, q, k);
+}
+#define ST_SAME(name, q, k) do { test_result_t r_ = st_same_q((name), (q), (k)); \
+    if (r_.status != TEST_PASS) return r_; } while (0)
+#define ST_SAME_P(name, q, k) do { test_result_t r_ = st_same_load((name), "(.db.parted.get \"%s/%s%d\" 't)", (q), (k)); \
+    if (r_.status != TEST_PASS) return r_; } while (0)
+
+/* Table text `tbl` saved as <name>0 (generation 0) and <name>2. */
+static test_result_t st_save2(const char* name, const char* tbl) {
+    char q[4096];
+    snprintf(q, sizeof q, "(set W %s)", tbl); ST_Q_OK_N(q);
+    snprintf(q, sizeof q, "(.db.splayed.set \"" ST_TMP "/%s0/\" W {compress: false})", name); ST_Q_OK_N(q);
+    snprintf(q, sizeof q, "(.db.splayed.set \"" ST_TMP "/%s2/\" W {compress: true})", name); ST_Q_OK_N(q);
+    PASS();
+}
+#define ST_SAVE2(name, tbl) do { test_result_t r_ = st_save2((name), (tbl)); \
+    if (r_.status != TEST_PASS) return r_; } while (0)
+
+/* vectors 0..63 URL-like (FSST, its table trained on them), 64..127 low
+ * cardinality (STR_DICT), 128.. short distinct strings (not STR_DICT); ""
+ * every 97th row; f a U8 flag */
+#define ST_FL_TABLE "(table [s v f] (list (as 'STR (map (fn [j] (if (== 0 (% j 97)) \"\" " \
+    "(if (< j 65536) (format \"https://www.example.com/path/%/item?id=%&ref=search\" (% j 5000) (% (* j 7919) 100003)) " \
+    "(if (< j 131072) (format \"cat % x\" (% j 37)) (format \"u%\" j))))) (til 140000))) (til 140000) (as 'U8 (% (til 140000) 3))))"
+#define ST_FL_URL "https://www.example.com/path/1000/item?id=18763&ref=search"
+
+static test_result_t test_filter_strdict(void) {
+    ST_SAVE2("fl", ST_FL_TABLE);
+    char p[600]; TEST_ASSERT_TRUE(st_live("/fl2", "s", p, sizeof p));
+    TEST_ASSERT_EQ_I(st_desc_enc(p, 0, NULL), RAY_ENC_FSST);
+    TEST_ASSERT_EQ_I(st_desc_enc(p, 64, NULL), RAY_ENC_STR_DICT);
+    TEST_ASSERT_TRUE(st_desc_enc(p, 128, NULL) != RAY_ENC_STR_DICT);
+    st_fk_t k;
+    ST_SAME("fl", "(count (select {from: T where: (== s \"cat 5 x\")}))", &k);
+    TEST_ASSERT_EQ_U(k.mat, 0);
+    TEST_ASSERT_EQ_U(k.sel, 1);
+    ST_SAME("fl", "(count (select {from: T where: (!= s \"cat 5 x\")}))", &k);
+    TEST_ASSERT_EQ_U(k.mat, 0);
+    TEST_ASSERT_EQ_U(k.sel, 1);
+    ST_SAME("fl", "(count (select {from: T where: (== \"cat 5 x\" s)}))", &k);   /* the constant first */
+    TEST_ASSERT_EQ_U(k.sel, 1);
+    /* absent everywhere: the STR_DICT chunk decided, the FSST vectors decoded */
+    ST_SAME("fl", "(count (select {from: T where: (== s \"nope\")}))", &k);
+    TEST_ASSERT_EQ_U(k.mat, 0);
+    TEST_ASSERT_TRUE(k.dec > 0);
+    ST_SAME("fl", "(count (select {from: T where: (!= s \"nope\")}))", &k);
+    TEST_ASSERT_EQ_U(k.mat, 0);
+    /* an FSST-chunk value; the select returns rows by range gather */
+    ST_SAME("fl", "(select {v: v from: T where: (== s \"" ST_FL_URL "\")})", &k);
+    TEST_ASSERT_EQ_U(k.mat, 0);
+    ST_SAME("fl", "(select {v: v s: s from: T where: (== s \"cat 36 x\")})", &k);
+    TEST_ASSERT_EQ_U(k.mat, 0);
+    /* nulls (""): byte equality, both sides */
+    ST_SAME("fl", "(count (select {from: T where: (== s \"\")}))", &k);
+    TEST_ASSERT_EQ_U(k.mat, 0);
+    TEST_ASSERT_EQ_U(k.sel, 1);
+    ST_SAME("fl", "(count (select {from: T where: (!= s \"\")}))", &k);
+    TEST_ASSERT_EQ_U(k.mat, 0);
+    PASS();
+}
+
+/* Only the STR_DICT chunk: code bounds decide the vectors, nothing decoded. */
+static test_result_t test_filter_decided(void) {
+    ST_SAVE2("fd", "(table [s] (list (as 'STR (map (fn [j] (format \"cat % x\" (% j 37))) (til 70000)))))");
+    st_fk_t k;
+    ST_SAME("fd", "(count (select {from: T where: (== s \"not a category\")}))", &k);
+    TEST_ASSERT_EQ_U(k.mat, 0);
+    TEST_ASSERT_EQ_U(k.dec, 0);
+    ST_SAME("fd", "(count (select {from: T where: (== s \"cat 3 x\")}))", &k);
+    TEST_ASSERT_EQ_U(k.mat, 0);
+    TEST_ASSERT_EQ_U(k.dec, 0);                                       /* codes compared, not strings */
+    ST_SAME("fd", "(count (select {from: T where: (!= s \"cat 3 x\")}))", &k);
+    TEST_ASSERT_EQ_U(k.dec, 0);
+    /* the `z, a, m` column of compress_str.rfl: code order is not value order */
+    ST_SAVE2("fz", "(table [s] (list (as 'STR (at [\"z\" \"a\" \"m\"] (% (til 70000) 3)))))");
+    char p[600]; TEST_ASSERT_TRUE(st_live("/fz2", "s", p, sizeof p));
+    TEST_ASSERT_EQ_I(st_desc_enc(p, 0, NULL), RAY_ENC_STR_DICT);
+    ST_SAME("fz", "(count (select {from: T where: (== s \"a\")}))", &k);
+    TEST_ASSERT_EQ_U(k.mat, 0);
+    TEST_ASSERT_EQ_U(k.dec, 0);
+    ST_SAME("fz", "(count (select {from: T where: (== s \"b\")}))", &k);   /* between codes, absent */
+    TEST_ASSERT_EQ_U(k.dec, 0);
+    ST_SAME("fz", "(count (select {from: T where: (!= s \"m\")}))", &k);
+    TEST_ASSERT_EQ_U(k.dec, 0);
+    PASS();
+}
+
+/* Chained conjuncts (ruling R1): the optimizer splits the WHERE, runs the
+ * conjunct it ranks most selective first (opt.c filter_rank_key: a STR
+ * `==` ranks first, a STR `!=` after any equality and a narrow flag), and a
+ * later STR conjunct refines the installed selection
+ * (exec_pred_refine_selection), on codes.  Generation-0 equal, nothing
+ * materialized, every query through a STR selection; `refines` marks the
+ * queries whose STR conjunct runs second. */
+static test_result_t test_filter_chained(void) {
+    ST_SAVE2("fc", ST_FL_TABLE);
+    static const struct { const char* q; bool refines; } qs[] = {
+        /* the brief's pair: the STR equality ranks first either way */
+        { "(count (select {from: T where: (and (> v 100) (== s \"cat 5 x\"))}))", false },
+        { "(count (select {from: T where: (and (== s \"cat 5 x\") (> v 100))}))", false },
+        { "(count (select {from: T where: (and (< v 70000) (!= s \"cat 5 x\"))}))", false },
+        { "(count (select {from: T where: (and (>= v 60000) (== s \"\"))}))", false },
+        { "(select {v: v from: T where: (and (< v 3000) (== s \"cat 5 x\"))})", false },
+        /* the STR conjunct second */
+        { "(count (select {from: T where: (and (== f 1) (!= s \"\"))}))", true },
+        { "(count (select {from: T where: (and (!= s \"\") (== f 1))}))", true },
+        { "(count (select {from: T where: (and (== f 2) (!= s \"cat 5 x\"))}))", true },
+        { "(count (select {from: T where: (and (== f 0) (!= s \"" ST_FL_URL "\"))}))", true },
+        { "(count (select {from: T where: (and (in v [5 97 1000 70005 70006 131100 139999]) (!= s \"\"))}))", true },
+        { "(select {v: v s: s from: T where: (and (in v [5 97 1000 70005 70006 131100 139999]) (!= s \"cat 6 x\"))})", true },
+        { "(count (select {from: T where: (and (== s \"cat 5 x\") (!= s \"cat 6 x\"))}))", true },
+        { "(count (select {from: T where: (and (== s \"cat 5 x\") (== s \"cat 6 x\"))}))", true },
+        { "(count (select {from: T where: (and (== s \"cat 5 x\") (== s \"cat 5 x\"))}))", true },
+        { "(count (select {from: T where: (and (== f 1) (!= s \"nope\"))}))", true },
+        { "(count (select {from: T where: (and (== f 1) (> v 130000) (!= s \"\"))}))", true },
+    };
+    for (size_t i = 0; i < sizeof qs / sizeof *qs; i++) {
+        st_fk_t k;
+        ST_SAME("fc", qs[i].q, &k);
+        TEST_ASSERT_FMT(k.mat == 0, "%s: %llu materializations", qs[i].q, (unsigned long long)k.mat);
+        TEST_ASSERT_FMT(k.sel + k.refine >= 1, "%s: no STR selection", qs[i].q);
+        if (qs[i].refines) TEST_ASSERT_FMT(k.refine == 1, "%s: %llu refinements", qs[i].q, (unsigned long long)k.refine);
+    }
+    PASS();
+}
+
+/* Parted: two encoded partitions with their own dictionaries (a code of
+ * one is not a code of the other), a generation-0 partition and a ragged
+ * partition without the column (a synthetic all-null segment), each
+ * against the same partitions saved as generation 0. */
+static test_result_t test_filter_parted(void) {
+    static const char* const parts[4] = {
+        "(table [v s] (list (til 70000) (as 'STR (map (fn [j] (format \"cat % x\" (% j 37))) (til 70000)))))",
+        "(table [v s] (list (til 3000) (as 'STR (map (fn [j] (if (== 0 (% j 7)) \"\" (format \"cat % x\" (% (+ j 11) 41)))) (til 3000)))))",
+        "(table [v s] (list (til 5000) (as 'STR (map (fn [j] (format \"https://www.example.com/path/%/item?id=%&ref=search\" (% j 999) j)) (til 5000)))))",
+        "(table [v] (list (til 2000)))",
+    };
+    for (int gen = 0; gen <= 2; gen += 2)
+        for (int p = 0; p < 4; p++) {
+            char q[1200];
+            /* partition 2 stays generation 0 in the encoded store */
+            const bool enc = gen == 2 && p != 1;
+            snprintf(q, sizeof q, "(.db.splayed.set \"" ST_TMP "/fp%d/2024.01.0%d/t/\" %s {compress: %s})",
+                     gen, p + 1, parts[p], enc ? "true" : "false");
+            ST_Q_OK_N(q);
+        }
+    static const char* const qs[] = {
+        "(count (select {from: T where: (== s \"cat 5 x\")}))",
+        "(count (select {from: T where: (!= s \"cat 5 x\")}))",
+        "(count (select {from: T where: (== s \"cat 40 x\")}))",           /* partition 2 only */
+        "(count (select {from: T where: (== s \"nope\")}))",
+        "(count (select {from: T where: (== s \"\")}))",                    /* partitions 2 and 4 */
+        "(count (select {from: T where: (!= s \"\")}))",
+        "(count (select {from: T where: (== s \"https://www.example.com/path/7/item?id=4003&ref=search\")}))",
+        "(sum (at (select {from: T where: (== s \"cat 5 x\")}) 'v))",
+        "(count (select {from: T where: (and (> v 1000) (== s \"cat 5 x\"))}))",
+        "(count (select {from: T where: (and (> v 1000) (!= s \"\"))}))",
+        "(count (select {from: T where: (and (in v [0 7 14 1000 2999 4999 69999]) (!= s \"\"))}))",
+        "(count (select {from: T where: (and (== v 7) (!= s \"cat 5 x\"))}))",
+    };
+    for (size_t i = 0; i < sizeof qs / sizeof *qs; i++) {
+        st_fk_t k;
+        ST_SAME_P("fp", qs[i], &k);
+        TEST_ASSERT_FMT(k.mat == 0, "%s: %llu materializations", qs[i], (unsigned long long)k.mat);
+        TEST_ASSERT_FMT(k.sel + k.refine >= 1, "%s: no STR selection", qs[i]);
+        /* the last two: the `in` / `==` on v first, the STR conjunct refines */
+        if (i + 2 >= sizeof qs / sizeof *qs)
+            TEST_ASSERT_FMT(k.refine == 1, "%s: %llu refinements", qs[i], (unsigned long long)k.refine);
+    }
+    PASS();
+}
+
+/* A forged code (outside the entry) fails the filter "corrupt"; it never
+ * answers from the bytes it would have read. */
+static test_result_t test_filter_forged(void) {
+    ray_t* v = st_hold(ray_vec_new(RAY_STR, SF_ROWS));
+    for (int64_t i = 0; i < SF_ROWS; i++) {
+        const int k = sf_entry(i / RAY_ENC_VEC);
+        ray_t* v2 = ray_str_vec_append(v, g_sf_s[k], strlen(g_sf_s[k]));
+        st_unhold(v, v2); v = v2;
+    }
+    ray_t* tb = ray_table_new(1);
+    tb = ray_table_add_col(tb, ray_sym_intern("s", 1), v);
+    TEST_ASSERT_EQ_I(ray_env_set(ray_sym_intern("W", 1), tb), RAY_OK);
+    ray_release(tb);
+    ray_encw_test_force_str(RAY_ENC_STR_DICT);              /* selection keeps one-string vectors CONST */
+    ST_Q_OK("(.db.splayed.set \"" ST_TMP "/ff/\" W {compress: true})");
+    ray_encw_test_force_str(-1);
+    char p[600]; TEST_ASSERT_TRUE(st_live("/ff", "s", p, sizeof p));
+    ST_Q_OK("(set T (.db.splayed.get \"" ST_TMP "/ff/\"))");
+    ST_Q_TRUE("(== 34816 (count (select {from: T where: (== s \"forged entry one, a long string\")})))");   /* 34 odd vectors of 1024 rows */
+    TEST_ASSERT_TRUE(sf_set_code(p, 3, 9));                  /* 3 entries: code 9 is outside */
+    ST_Q_OK("(set T (.db.splayed.get \"" ST_TMP "/ff/\"))");
+    for (int q = 0; q < 2; q++) {
+        ray_t* r = st_hold(ray_eval_str(q ? "(count (select {from: T where: (!= s \"forged entry one, a long string\")}))"
+                                          : "(count (select {from: T where: (== s \"forged entry one, a long string\")}))"));
+        TEST_ASSERT_FMT(r && RAY_IS_ERR(r) && strcmp(ray_err_code(r), "corrupt") == 0, "query %d: %s", q,
+                        r && RAY_IS_ERR(r) ? ray_err_code(r) : "an answer");
+    }
+    PASS();
+}
+
 const test_entry_t encstr_entries[] = {
     { "encstr/strdict_body",       test_strdict_body,       st_setup, st_teardown },
     { "encstr/fsst_body",          test_fsst_body,          st_setup, st_teardown },
@@ -1361,5 +1603,10 @@ const test_entry_t encstr_entries[] = {
     { "encstr/dict_forged_order",  test_dict_forged_order,  st_setup, st_teardown },
     { "encstr/dict_inband_nulls",  test_dict_inband_nulls,  st_setup, st_teardown },
     { "encstr/dict_oom_retry",     test_dict_oom_retry,     st_setup, st_teardown },
+    { "encstr/filter_strdict",     test_filter_strdict,     st_q_setup, st_q_teardown },
+    { "encstr/filter_decided",     test_filter_decided,     st_q_setup, st_q_teardown },
+    { "encstr/filter_chained",     test_filter_chained,     st_q_setup, st_q_teardown },
+    { "encstr/filter_parted",      test_filter_parted,      st_q_setup, st_q_teardown },
+    { "encstr/filter_forged",      test_filter_forged,      st_q_setup, st_q_teardown },
     { NULL, NULL, NULL, NULL },
 };
