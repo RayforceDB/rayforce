@@ -33,6 +33,7 @@
 #include "store/encw.h"
 #include "store/enccol.h"
 #include "core/pool.h"         /* the first-touch race */
+#include "core/timer.h"        /* its barrier deadline */
 #include "store/encidx.h"     /* ray_enc_idx_dict_t, ray_enc_dict_validate */
 #include "store/colrange.h"
 #include "vec/str.h"
@@ -2472,8 +2473,13 @@ static void ir_race_task(void* ctx, uint32_t wid, int64_t lo, int64_t hi) {
     if (k >= IR_SLOTS) return;
     x->wid[k] = wid;
     atomic_fetch_add(&x->arrived, 1);
-    for (long spin = 0; atomic_load(&x->arrived) < x->want && spin < 20000000L; spin++) {}
-    x->met[k] = atomic_load(&x->arrived) >= x->want;   /* else a silent timeout: the racers ran serially */
+    /* bounded by wall clock, not a spin count: a late wake-up (a loaded
+     * machine, sanitizers) still meets the barrier; only "never arrived"
+     * times out, and met[k] makes that fail the test */
+    const int64_t deadline = ray_time_now_ms() + 2000;
+    for (unsigned spin = 1; atomic_load(&x->arrived) < x->want; spin++)
+        if (!(spin & 4095) && ray_time_now_ms() > deadline) break;
+    x->met[k] = atomic_load(&x->arrived) >= x->want;   /* else a timeout: the racers ran serially */
     ray_mem_stats_t m0, m1;
     const ray_enc_idict_t* d = NULL;
     ray_t* cv = NULL;
@@ -2523,8 +2529,14 @@ static test_result_t test_idict_first_touch_race(void) {
     TEST_ASSERT_NOT_NULL(pool);
     const uint32_t nw = ray_pool_total_workers(pool);
     const uint32_t ntask = nw * 2 < IR_SLOTS ? nw * 2 : IR_SLOTS;
-    /* what one serial first touch keeps on this thread's heap */
-    int64_t kept = 0;
+    /* What one serial first touch keeps: on this thread's buddy heap (kept)
+     * and in direct mappings (kept_direct, process-wide).  The racers' per-
+     * thread bytes_allocated deltas are compared with `kept`, which assumes
+     * every heap rounds a block alike (true: one buddy policy for all
+     * threads); direct mappings are process-wide, so they are compared once
+     * per iteration around the whole dispatch (the main thread allocates
+     * nothing else meanwhile). */
+    int64_t kept = 0, kept_direct = 0;
     {
         ray_t* c = ray_col_mmap(p);
         TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
@@ -2538,6 +2550,7 @@ static test_result_t test_idict_first_touch_race(void) {
         if (err) ray_error_free(err);
         TEST_ASSERT_TRUE(err == NULL && d && cv);
         kept = (int64_t)m1.bytes_allocated - (int64_t)m0.bytes_allocated;
+        kept_direct = (int64_t)m1.direct_bytes - (int64_t)m0.direct_bytes;
         TEST_ASSERT_TRUE(kept > 0);
     }
     static ir_race_t x;
@@ -2556,7 +2569,11 @@ static test_result_t test_idict_first_touch_race(void) {
             TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
             memset(&x, 0, sizeof x);
             x.e = ray_enccol_of(c); x.mode = mode; x.want = (int)nw;
+            ray_mem_stats_t dm0, dm1;
+            ray_mem_stats(&dm0);
             ray_pool_dispatch_n(pool, ir_race_task, &x, ntask);
+            ray_mem_stats(&dm1);
+            const int64_t held_direct = (int64_t)dm1.direct_bytes - (int64_t)dm0.direct_bytes;
             const int n = atomic_load(&x.next) < (int)ntask ? atomic_load(&x.next) : (int)ntask;
             bool ok = n == (int)ntask;
             int64_t held = 0;
@@ -2571,11 +2588,13 @@ static test_result_t test_idict_first_touch_race(void) {
                           (mode == 1 ? x.d[k] == NULL : x.d[k] == x.d[0] && x.d[k] != NULL);
             }
             if (mode && ok) ok = (mode == 1 ? x.e->idict == NULL : x.e->icodes == NULL);   /* nothing published */
-            if (!mode && ok) ok = held == kept;                /* the one blob and vector, nothing else */
+            if (!mode && ok) ok = held == kept && held_direct == kept_direct;   /* the one blob and vector, nothing else */
+            if (mode && ok) ok = held_direct == 0;
             for (int k = 1; k < n; k++) if (x.wid[k] != x.wid[0]) { workers_seen = true; break; }
             ray_release(c);
-            TEST_ASSERT_FMT(ok, "mode %d iteration %d (%d tasks, held %lld of %lld): %s", mode, it, n,
-                            (long long)held, (long long)kept, n ? x.msg[0] : "");
+            TEST_ASSERT_FMT(ok, "mode %d iteration %d (%d tasks, held %lld of %lld, direct %lld of %lld): %s", mode, it, n,
+                            (long long)held, (long long)kept, (long long)held_direct,
+                            (long long)(mode ? 0 : kept_direct), n ? x.msg[0] : "");
         }
     }
     if (pool->n_workers > 0) TEST_ASSERT_TRUE(workers_seen);   /* the racers ran on more than one worker */
