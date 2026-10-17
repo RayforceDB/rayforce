@@ -188,7 +188,8 @@ static void save_vec(ray_t* v, const char* p) {
 #define SAVE_AS(v, p, enc) do { ray_encw_test_force(enc); save_vec((v), (p)); ray_encw_test_force(-1); \
     TEST_ASSERT_TRUE(g_img != NULL); } while (0)
 /* A float fixture whose patches assume a RAW body: P5 selection would
- * encode it otherwise (f64_plain is DICT, f64_stats ALP). */
+ * encode it otherwise (f64_plain is DICT, f64_stats ALP); P6 the same for
+ * the STR RAW fixture (str_mixed is FSST). */
 #define SAVE_RAW(v, p) SAVE_AS((v), (p), RAY_ENC_RAW)
 
 #define NEED_ENC(c, j, enc) TEST_ASSERT_FMT(g_img[desc_at(c, j)] == (enc), \
@@ -608,8 +609,9 @@ static test_result_t test_reject_descriptors(void) {
     W8(desc_at(0, 0), RAY_ENC_RAW);                        BAD(p, 1, "corrupt", "all-null vector not CONST");
     SAVE(i32_allnull(), p); W16(desc_at(0, 0) + 4, 0);     BAD(p, 1, "corrupt", "all-null vector carries statistics");
     SAVE(i32_nulls_raw(), p); W16(desc_at(0, 0) + 2, 9);   BAD(p, 1, "corrupt", "descriptor null counts sum to 9");
-    {   /* STR statistics on a RAW vector (directory says absent, the descriptor does not) */
-        SAVE(str_mixed(), p); W16(desc_at(0, 0) + 4, 0);   BAD(p, 1, "corrupt", "STR statistics on a vector that is not STR_DICT");
+    {   /* STR statistics on a RAW vector (directory says absent, the descriptor does not);
+         * P6: the RAW vector is the subject, saved forced RAW */
+        SAVE_RAW(str_mixed(), p); NEED_ENC(0, 0, RAY_ENC_RAW); W16(desc_at(0, 0) + 4, 0);   BAD(p, 1, "corrupt", "STR statistics on a vector that is not STR_DICT");
     }
     {   /* SYM statistics outside the domain: ids in 1..4, saved count 200 */
         uint8_t ids[4] = { 1, 2, 3, 4 };
@@ -693,9 +695,10 @@ static test_result_t test_reject_payloads(void) {
     SAVE(guid_const(), p); NEED_ENC(0, 0, RAY_ENC_CONST);
     W64(desc_at(0, 0) + 16, 24); set_chunk_bytes(0, 3072 + 24); BAD(p, 1, "corrupt", "GUID CONST body size");
     SAVE(guid_raw(), p); memset(g_img + payload_at(0, 0), 0, 16); BAD(p, 1, "corrupt", "GUID null count");
-    /* STR RAW / CONST */
+    /* STR RAW / CONST.  P6: the RAW STR body and its pool are this
+     * block's subject (selection takes FSST for str_mixed): saved forced RAW */
     for (int k = 0; k < 10; k++) {
-        SAVE(str_mixed(), p); NEED_ENC(0, 0, RAY_ENC_RAW);
+        SAVE_RAW(str_mixed(), p); NEED_ENC(0, 0, RAY_ENC_RAW);
         at = payload_at(0, 0);
         const char* needle = "";
         if (k == 0) { W32(at + 16 + 12, 7); needle = "pooled descriptor hash not zero"; }
@@ -710,9 +713,9 @@ static test_result_t test_reject_payloads(void) {
         if (k == 9) { W64(desc_at(0, 0) + 16, 16); set_chunk_bytes(0, 3072 + 16); needle = "STR RAW body short"; }
         BAD(p, 1, "corrupt", needle);
     }
-    SAVE(str_mixed(), p); W16(desc_at(0, 0) + 2, 1); W32(DIR(0) + 52, 1); BAD(p, 1, "corrupt", "STR null count");
-    SAVE(str_mixed(), p); W64(EH + 48, rd64(EH + 48) + 1);      BAD(p, 1, "corrupt", "header says");
-    SAVE(str_mixed(), p); W64(EH + 48, rd64(EH + 48) - 1);      BAD(p, 1, "corrupt", "exceeds str_pool_bytes");
+    SAVE_RAW(str_mixed(), p); W16(desc_at(0, 0) + 2, 1); W32(DIR(0) + 52, 1); BAD(p, 1, "corrupt", "STR null count");
+    SAVE_RAW(str_mixed(), p); W64(EH + 48, rd64(EH + 48) + 1);      BAD(p, 1, "corrupt", "header says");
+    SAVE_RAW(str_mixed(), p); W64(EH + 48, rd64(EH + 48) - 1);      BAD(p, 1, "corrupt", "exceeds str_pool_bytes");
     for (int k = 0; k < 4; k++) {
         SAVE(str_const(), p); NEED_ENC(0, 0, RAY_ENC_CONST);
         at = payload_at(0, 0);

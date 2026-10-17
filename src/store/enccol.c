@@ -3715,6 +3715,11 @@ ray_t* ray_enccol_info(ray_t* encv, ray_enccol_info_t* out) {
         for (int j = 0; j < nv; j++) if (d[j].encoding < 10) out->vectors[d[j].encoding]++;
     }
     out->encoded_bytes = out->synthetic ? 0 : e->hdr.end_off;
+    /* the materialized column's bytes: for STR, str_pool_bytes is the
+     * decoded pool's exact size, which holds each STR_DICT entry once (spec
+     * "STR pool"), so a STR_DICT column reports less than its generation-0
+     * file's per-occurrence pool (P6 D15; the header keeps no
+     * per-occurrence count, and .idx.info decodes nothing) */
     out->raw_bytes = (uint64_t)e->len * ray_enccol_esz(e) + (e->type == RAY_STR ? e->hdr.str_pool_bytes : 0);
     out->materialized = ray_enccol_decoded_peek(encv) != NULL;
     return NULL;

@@ -2192,12 +2192,15 @@ static void grow_payload(const char* path) {
 static test_result_t test_decode_trailing_bytes(void) {
     /* force -1: selection.  P5: a float column selects DICT, whose
      * VALUE_DICT follows the payload; the float cases are forced to the
-     * float bodies without side data, so the payload stays the tail. */
+     * float bodies without side data, so the payload stays the tail.
+     * P6: the same for STR, whose STR_DICT / FSST entries follow the
+     * payload; the side data being absent is this test's subject, so the
+     * STR cases are forced RAW. */
     static const struct { int8_t type; int s; int force; } cases[] = {
         { RAY_I32, 1, -1 }, { RAY_I64, 3, -1 }, { RAY_I16, 4, -1 }, { RAY_U8, 0, -1 }, { RAY_BOOL, 2, -1 },
         { RAY_F64, 0, RAY_ENC_RAW }, { RAY_F32, 4, RAY_ENC_RAW }, { RAY_F64, 0, RAY_ENC_RLE },
         { RAY_F64, 0, RAY_ENC_ALP }, { RAY_F32, 4, RAY_ENC_ALP }, { RAY_F64, 4, RAY_ENC_ALP_RD },
-        { RAY_GUID, 0, -1 }, { RAY_STR, 0, -1 }, { RAY_STR, 3, -1 }, { RAY_SYM, 1, -1 },
+        { RAY_GUID, 0, -1 }, { RAY_STR, 0, RAY_ENC_RAW }, { RAY_STR, 3, RAY_ENC_RAW }, { RAY_SYM, 1, -1 },
     };
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
         ray_t* v = make_col(cases[i].type, 1000, cases[i].s);
@@ -2723,6 +2726,14 @@ static test_result_t test_oom_then_retry(void) {
     TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(ENCCOL_TMP "/o"), 2), RAY_OK);
     ray_release(v);
     ray_t* c = ray_col_mmap(ray_test_tmp(ENCCOL_TMP "/o"));
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+    /* P6: the column selects STR_DICT, whose validated dictionary is a
+     * once-state the column keeps after the first successful validation
+     * (a cache, not a leak).  Validate it before the baseline so the
+     * no-leak check counts only what one materialization attempt owns. */
+    const ray_enc_sdict_t* sd = NULL;
+    ray_t* se = ray_enccol_strdict(ray_enccol_of(c), &sd);
+    TEST_ASSERT_NULL(se);
     ray_mem_stats_t m0, m1; ray_mem_stats(&m0);
     bool done = false;
     for (int nth = 1; nth <= 16 && !done; nth++) {          /* until an attempt passes every injection point */

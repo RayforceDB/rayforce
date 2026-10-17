@@ -416,7 +416,8 @@ typedef struct {
     int64_t  vectors[10];
     uint64_t encoded_bytes;   /* file bytes (end_off) of real encoded files; a plain parted segment
                                * counts its raw bytes, a synthetic stand-in counts 0 */
-    uint64_t raw_bytes;       /* generation-0 payload: len * width (+ STR pool) */
+    uint64_t raw_bytes;       /* materialized payload: len * width (+ the decoded STR pool, which
+                               * holds each STR_DICT entry once) */
     bool     materialized;
     bool     synthetic;       /* every encoded segment is a synthetic stand-in */
 } ray_enccol_info_t;

@@ -195,11 +195,12 @@
 (count (.db.splayed.set "rf_test_nullcmp_store" SU)) -- 98304
 (set ST (.db.splayed.get "rf_test_nullcmp_store" 'SU))
 (count ST) -- 98304
-;; The dict index is what a generation-0 save attaches; a generation-2
-;; (compressed) save, as in the equivalence pass, persists none, and the
-;; selects below then run the typed path: their answers must not change.
-(set ST_G2 (== 0 (.sys.exec "d=rf_test_nullcmp_store; [ -f $d/.current ] && d=$d/$(cat $d/.current); [ \"$(od -An -tu1 -j17 -N1 $d/u | tr -d ' ')\" = 2 ]")))
-(if ST_G2 (.idx.has? (at ST 'u)) (.idx.info (at ST 'u))) -- (if ST_G2 false {kind:dict length:98304 parent_type:13 saved_attrs:64 n_distinct:3})
+;; The dict index is what a generation-0 save attaches.  A generation-2
+;; (compressed) save, as in the equivalence pass, persists none, but this
+;; column is all STR_DICT ("" in band, no all-null vector) and over 65536
+;; rows, so materialization builds the same DICT at runtime (P6): one
+;; assertion for both generations.
+(.idx.info (at ST 'u)) -- {kind:dict length:98304 parent_type:13 saved_attrs:64 n_distinct:3}
 
 (set SA_F (select {u: u n: n from: ST where: (!= u "") desc: n take: 5}))
 (set SA_U (select {u: u n: n from: ST where: (or (!= u "") (== n -1)) desc: n take: 5}))

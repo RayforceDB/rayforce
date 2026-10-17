@@ -1171,6 +1171,171 @@ static test_result_t test_fsst_scopes_query(void) {
     PASS();
 }
 
+/* ---- Task 4b: the runtime DICT's fail-safe guards, "" nulls, OOM ---- */
+
+/* Vector v of the forged-file column holds one string throughout: entry
+ * v % 2 for every vector but the last, which holds entry 2 alone. */
+#define SF_ROWS 70000
+static const char* const g_sf_s[3] = {
+    "forged entry zero, a long string", "forged entry one, a long string", "forged entry two, a long string" };
+static int sf_entry(int64_t v) { return v == ray_enc_nvecs(SF_ROWS) - 1 ? 2 : (int)(v & 1); }
+
+/* Code `code` into vector `vec`'s STR_DICT code child, which is CONST or a
+ * width-0 FOR_BP (its value, or base, the 8 bytes after the child header),
+ * with the descriptor's code bounds (min / max at 32 / 40). */
+static bool sf_set_code(const char* p, int64_t vec, int64_t code) {
+    ray_enc_desc_t d;
+    if (st_desc_enc(p, vec, &d) != RAY_ENC_STR_DICT) return false;
+    ray_enc_dirent_t de = st_dirent(p, vec / 64);
+    const long body = (long)(de.offset + d.payload_off);
+    uint8_t ch[2];
+    if (!st_read(p, body, ch, 2)) return false;
+    if (!(ch[0] == RAY_ENC_CONST || (ch[0] == RAY_ENC_FOR_BP && ch[1] == 0))) return false;
+    const long desc = (long)(de.offset + (uint64_t)(vec % 64) * 48);
+    return st_patch(p, body + 8, &code, 8) && st_patch(p, desc + 32, &code, 8) && st_patch(p, desc + 40, &code, 8);
+}
+
+/* Review Minor 1 (Task 4): a file whose codes break first-occurrence order
+ * (vectors 0 and 1 swap codes), or which leaves an entry unused (the last
+ * vector's code 2 becomes 1), passes validation and materializes its rows,
+ * but gets no runtime DICT; the unforged file gets one. */
+static test_result_t test_dict_forged_order(void) {
+    for (int f = 0; f < 3; f++) {
+        const char* p = STP("/sf");
+        ray_t* v = st_hold(ray_vec_new(RAY_STR, SF_ROWS));
+        ray_t* w = st_hold(ray_vec_new(RAY_STR, SF_ROWS));       /* the rows the forged codes give */
+        for (int64_t i = 0; i < SF_ROWS; i++) {
+            const int64_t vec = i / RAY_ENC_VEC;
+            int k = sf_entry(vec), kw = k;
+            if (f == 1 && vec < 2) kw = 1 - k;                  /* swapped */
+            if (f == 2 && k == 2) kw = 1;                       /* entry 2 unused */
+            ray_t* v2 = ray_str_vec_append(v, g_sf_s[k], strlen(g_sf_s[k]));
+            st_unhold(v, v2); v = v2;
+            ray_t* w2 = ray_str_vec_append(w, g_sf_s[kw], strlen(g_sf_s[kw]));
+            st_unhold(w, w2); w = w2;
+        }
+        ray_encw_test_force_str(RAY_ENC_STR_DICT);              /* selection keeps one-string vectors CONST */
+        ray_err_t se = ray_col_save_gen(v, p, 2);
+        ray_encw_test_force_str(-1);
+        TEST_ASSERT_EQ_I(se, RAY_OK);
+        const int64_t last = ray_enc_nvecs(SF_ROWS) - 1;
+        if (f == 1) {
+            TEST_ASSERT_TRUE(sf_set_code(p, 0, 1));
+            TEST_ASSERT_TRUE(sf_set_code(p, 1, 0));
+        }
+        if (f == 2) TEST_ASSERT_TRUE(sf_set_code(p, last, 1));
+        ray_t* c = st_hold(ray_col_mmap(p));
+        TEST_ASSERT_FMT(c && !RAY_IS_ERR(c), "case %d: load", f);
+        TEST_ASSERT_TRUE(ray_enccol_may_have_index(c));         /* every chunk has code bounds */
+        ray_t* m = ray_enccol_materialize(c);                  /* borrowed: the column's cache */
+        if (m && RAY_IS_ERR(m)) st_hold(m);
+        TEST_ASSERT_FMT(m && !RAY_IS_ERR(m), "case %d: materialize: %s", f, ray_error_msg() ? ray_error_msg() : "");
+        TEST_ASSERT_FMT(st_same(m, w), "case %d: rows", f);
+        if (f == 0) {
+            TEST_ASSERT_EQ_I(ray_index_kind(m), RAY_IDX_DICT);
+            TEST_ASSERT_EQ_I(ray_index_payload(m->index)->u.dict.n_distinct, 3);
+        } else {
+            TEST_ASSERT_FMT(!ray_index_has(m), "case %d: a forged file got an index", f);
+        }
+        st_unhold(c, NULL); ray_release(c);
+        st_unhold(w, NULL); ray_release(w);
+        st_unhold(v, NULL); ray_release(v);
+    }
+    PASS();
+}
+
+/* Review Minor 2 (Task 4): D4's in-band "" null (an ordinary entry, its
+ * code at its first occurrence, here row 5, not row 0) under the runtime
+ * DICT: codes, first_occ and n_distinct equal ray_index_dict_compute over
+ * the same rows (generation 0's DICT). */
+static const char* gen_null5(int64_t i, char* b) {
+    if (i % 11 == 5) return "";
+    snprintf(b, 64, "value %lld of the domain", (long long)(i * 7919 % 300));
+    return b;
+}
+static test_result_t test_dict_inband_nulls(void) {
+    const char* p = STP("/dn");
+    ray_t* v = st_hold(str_col(SF_ROWS, gen_null5));
+    v->attrs |= RAY_ATTR_HAS_NULLS;
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, p, 2), RAY_OK);
+    for (int64_t j = 0; j < ray_enc_nvecs(SF_ROWS); j++)
+        TEST_ASSERT_FMT(st_desc_enc(p, j, NULL) == RAY_ENC_STR_DICT, "vector %lld", (long long)j);
+    ray_t* want = st_hold(ray_index_dict_compute(v));
+    TEST_ASSERT_TRUE(want && !RAY_IS_ERR(want));
+    ray_t* c = st_hold(ray_col_mmap(p));
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+    const ray_enc_sdict_t* sd;
+    TEST_ASSERT_NULL(ray_enccol_strdict(ray_enccol_of(c), &sd));
+    TEST_ASSERT_TRUE(sd && sd->null_code == 5);             /* rows 0..4 hold five distinct values */
+    ray_t* m = ray_enccol_materialize(c);
+    if (m && RAY_IS_ERR(m)) st_hold(m);
+    TEST_ASSERT_FMT(m && !RAY_IS_ERR(m), "materialize: %s", ray_error_msg() ? ray_error_msg() : "");
+    TEST_ASSERT_TRUE(st_same(m, v));
+    TEST_ASSERT_EQ_I(ray_index_kind(m), RAY_IDX_DICT);
+    const ray_index_t* x = ray_index_payload(want);
+    const ray_index_t* y = ray_index_payload(m->index);
+    TEST_ASSERT_EQ_I(x->u.dict.n_distinct, 301);            /* 300 values plus "" */
+    TEST_ASSERT_EQ_I(y->u.dict.n_distinct, x->u.dict.n_distinct);
+    TEST_ASSERT_EQ_I(y->u.dict.codes->len, SF_ROWS);
+    TEST_ASSERT_EQ_I(y->u.dict.first_occ->len, x->u.dict.n_distinct);
+    TEST_ASSERT_TRUE(memcmp(ray_data(x->u.dict.codes), ray_data(y->u.dict.codes), (size_t)SF_ROWS * 4) == 0);
+    TEST_ASSERT_TRUE(memcmp(ray_data(x->u.dict.first_occ), ray_data(y->u.dict.first_occ),
+                            (size_t)x->u.dict.n_distinct * 4) == 0);
+    TEST_ASSERT_EQ_I(((const int32_t*)ray_data(y->u.dict.first_occ))[sd->null_code], 5);
+    PASS();
+}
+
+/* Review Minor 3 (Task 4): allocation failure at every injection point of
+ * a materialization that builds the runtime DICT (70000 rows, every vector
+ * STR_DICT) frees what the attempt allocated, and the retry succeeds with
+ * the DICT.  Task 4's gated allocations are among the points: the
+ * dictionary offsets (dict_pool_off, after the pool) and the DICT's codes
+ * and root ("DICT index").  The validated dictionary is a once-state the
+ * column keeps (a cache), validated before the baseline. */
+static test_result_t test_dict_oom_retry(void) {
+    const char* p = STP("/do");
+    ray_t* v = st_hold(str_col(SF_ROWS, gen_lowcard));
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, p, 2), RAY_OK);
+    for (int c = 0; c < 2; c++) TEST_ASSERT_FALSE(st_dirent(p, c).flags & RAY_ENC_STAT_ABSENT);   /* all STR_DICT */
+    ray_t* c = st_hold(ray_col_mmap(p));
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+    const ray_enc_sdict_t* sd;
+    TEST_ASSERT_NULL(ray_enccol_strdict(ray_enccol_of(c), &sd));
+    TEST_ASSERT_NOT_NULL(sd);
+    ray_mem_stats_t m0, m1; ray_mem_stats(&m0);
+    bool done = false;
+    int dict_fails = 0, after_pool = 0;
+    for (int nth = 1; nth <= 32 && !done; nth++) {
+        const uint64_t pools0 = ray_enccol_test_str_pool_allocs();
+        ray_error_clear();
+        ray_enccol_test_fail_alloc(nth);
+        ray_t* r = ray_enccol_materialize(c);
+        ray_enccol_test_fail_alloc(0);
+        if (r && RAY_IS_ERR(r)) {
+            TEST_ASSERT_FMT(strcmp(ray_err_code(r), "oom") == 0, "nth %d: %s", nth, ray_err_code(r));
+            const char* msg = ray_error_msg() ? ray_error_msg() : "";
+            if (strstr(msg, "DICT index")) dict_fails++;
+            else if (ray_enccol_test_str_pool_allocs() != pools0) after_pool++;
+            ray_error_free(r);
+            ray_mem_stats(&m1);
+            TEST_ASSERT_FMT(m1.bytes_allocated == m0.bytes_allocated, "nth %d: %llu vs %llu", nth,
+                            (unsigned long long)m1.bytes_allocated, (unsigned long long)m0.bytes_allocated);
+        } else {
+            TEST_ASSERT_FMT(r != NULL, "nth %d: NULL", nth);
+            done = true;
+        }
+    }
+    TEST_ASSERT_TRUE(done);
+    TEST_ASSERT_EQ_I(dict_fails, 2);                        /* the DICT's codes, then its root */
+    TEST_ASSERT_EQ_I(after_pool, 2);                        /* dict_pool_off, then the chunk results */
+    ray_t* m = ray_enccol_materialize(c);                   /* the success is cached */
+    TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m));
+    TEST_ASSERT_TRUE(st_same(m, v));
+    TEST_ASSERT_EQ_I(ray_index_kind(m), RAY_IDX_DICT);
+    TEST_ASSERT_EQ_I(ray_index_payload(m->index)->u.dict.n_distinct, 37);
+    PASS();
+}
+
 const test_entry_t encstr_entries[] = {
     { "encstr/strdict_body",       test_strdict_body,       st_setup, st_teardown },
     { "encstr/fsst_body",          test_fsst_body,          st_setup, st_teardown },
@@ -1193,5 +1358,8 @@ const test_entry_t encstr_entries[] = {
     { "encstr/dict_equals_gen0",   test_dict_equals_gen0,   st_q_setup, st_q_teardown },
     { "encstr/dict_variants",      test_dict_variants,      st_q_setup, st_q_teardown },
     { "encstr/fsst_scopes_query",  test_fsst_scopes_query,  st_q_setup, st_q_teardown },
+    { "encstr/dict_forged_order",  test_dict_forged_order,  st_setup, st_teardown },
+    { "encstr/dict_inband_nulls",  test_dict_inband_nulls,  st_setup, st_teardown },
+    { "encstr/dict_oom_retry",     test_dict_oom_retry,     st_setup, st_teardown },
     { NULL, NULL, NULL, NULL },
 };

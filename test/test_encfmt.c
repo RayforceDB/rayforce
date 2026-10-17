@@ -1162,34 +1162,41 @@ static test_result_t test_str_pooled_column(void) {
         v = ray_str_vec_append(v, s, (size_t)k);
         if (k > 12) { pooled += (uint64_t)k; if (i >= 65536) chunk1_pooled += (uint64_t)k; }
     }
-    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(ENCFMT_TMP "/sp"), 2), RAY_OK);
+    /* P6: the RAW STR body is this test's subject (selection takes FSST) */
+    ray_encw_test_force(RAY_ENC_RAW);
+    ray_err_t se = ray_col_save_gen(v, ray_test_tmp(ENCFMT_TMP "/sp"), 2);
+    ray_encw_test_force(-1);
     ray_release(v);
+    TEST_ASSERT_EQ_I(se, RAY_OK);
     size_t n; uint8_t* b = read_file(ray_test_tmp(ENCFMT_TMP "/sp"), &n);
     TEST_ASSERT_NOT_NULL(b);
+    /* every check below frees the file before it fails */
+#define SP_CHECK(c) do { if (!(c)) { free(b); FAIL("str_pooled_column: " #c); } } while (0)
     ray_enc_hdr_t eh; memcpy(&eh, b + 32, 64);
-    TEST_ASSERT_EQ_U(eh.str_pool_bytes, pooled);
-    TEST_ASSERT_EQ_U(eh.end_off, n);
+    SP_CHECK(eh.str_pool_bytes == pooled);
+    SP_CHECK(eh.end_off == n);
     ray_enc_dirent_t e1; memcpy(&e1, b + 96 + 64, 64);
     ray_enc_desc_t d0; memcpy(&d0, b + e1.offset, 48);
-    TEST_ASSERT_EQ_I(d0.encoding, RAY_ENC_RAW);
+    SP_CHECK(d0.encoding == RAY_ENC_RAW);
     const uint8_t* cells = b + e1.offset + d0.payload_off;
     uint64_t pb; memcpy(&pb, cells + 40 * 16, 8);
-    TEST_ASSERT_EQ_U(pb, chunk1_pooled);
+    SP_CHECK(pb == chunk1_pooled);
     const uint8_t* pool = cells + 40 * 16 + 8;
     uint32_t want_off = 0;
     for (int j = 0; j < 40; j++) {
         int k = str_row(65536 + j, s);
         uint32_t len_c; memcpy(&len_c, cells + j * 16, 4);
-        TEST_ASSERT_EQ_I(len_c, k);
+        SP_CHECK(len_c == (uint32_t)k);
         if (k <= 12) {
-            TEST_ASSERT_TRUE(memcmp(cells + j * 16 + 4, s, (size_t)k) == 0);
+            SP_CHECK(memcmp(cells + j * 16 + 4, s, (size_t)k) == 0);
         } else {
             uint32_t off; memcpy(&off, cells + j * 16 + 8, 4);
-            TEST_ASSERT_EQ_U(off, want_off);
-            TEST_ASSERT_TRUE(memcmp(pool + off, s, (size_t)k) == 0);
+            SP_CHECK(off == want_off);
+            SP_CHECK(memcmp(pool + off, s, (size_t)k) == 0);
             want_off += (uint32_t)k;
         }
     }
+#undef SP_CHECK
     free(b);
     PASS();
 }

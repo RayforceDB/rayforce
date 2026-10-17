@@ -979,6 +979,15 @@ static test_result_t test_matrix_failure_inject(void) {
     ray_release(v);
     ray_t* enc = ray_col_mmap(ray_test_tmp(CS_TMP "/s"));
     TEST_ASSERT_TRUE(enc && !RAY_IS_ERR(enc));
+    /* P6: the 26 distinct strings select STR_DICT, whose validated
+     * dictionary is a once-state the source keeps after its first read (a
+     * cache, not a leak): validated before the baseline, so each injection
+     * counts only what the save owns.  The decode-side bound below grows by
+     * Task 4's gated allocations (the dictionary offsets) within its 16. */
+    const ray_enc_sdict_t* sd = NULL;
+    ray_t* sde = ray_enccol_strdict(ray_enccol_of(enc), &sd);
+    TEST_ASSERT_NULL(sde);
+    TEST_ASSERT_NOT_NULL(sd);
     ray_mem_stats_t m0, m1; ray_mem_stats(&m0);
     bool done = false;
     int injected = 0;
@@ -1003,17 +1012,19 @@ static test_result_t test_matrix_failure_inject(void) {
     (void)remove(ray_test_tmp(CS_TMP "/d"));
     /* decode-side allocation failures, encoded -> 2 and encoded -> 0 */
     for (int g = 0; g <= 2; g += 2) {
+        int ok_at = 0;
         for (int nth = 1; nth <= 16; nth++) {
             ray_enccol_test_fail_alloc(nth);
             ray_err_t r = save_ctx(enc, ray_test_tmp(CS_TMP "/g"), (uint8_t)g, NULL);
             ray_enccol_test_fail_alloc(0);
-            if (r == RAY_OK) { (void)remove(ray_test_tmp(CS_TMP "/g")); break; }
+            if (r == RAY_OK) { (void)remove(ray_test_tmp(CS_TMP "/g")); ok_at = nth; break; }
             TEST_ASSERT_EQ_I(r, RAY_ERR_OOM);
             TEST_ASSERT_EQ_I(file_gen(ray_test_tmp(CS_TMP "/g")), 255);
             TEST_ASSERT_EQ_I(file_gen(ray_test_tmp(CS_TMP "/g.tmp")), 255);
             ray_mem_stats(&m1);
             TEST_ASSERT_TRUE(m1.bytes_allocated == m0.bytes_allocated);
         }
+        TEST_ASSERT_FMT(ok_at > 0, "encoded -> %d: no success within the bound", g);
     }
     (void)remove(ray_test_tmp(CS_TMP "/g"));
     ray_mem_stats(&m0);                                     /* the successful encoded -> 0 cached its materialization */
@@ -1025,7 +1036,11 @@ static test_result_t test_matrix_failure_inject(void) {
     /* I/O failure while writing: file size limit */
     struct rlimit old, lim;
     if (getrlimit(RLIMIT_FSIZE, &old) == 0) {
-        lim = old; lim.rlim_cur = 65536;
+        /* half the source file: the write fails part way (P6: STR_DICT
+         * makes this file a few KiB, under the 64 KiB the RAW file had) */
+        size_t sn = 0; uint8_t* sb = slurp(ray_test_tmp(CS_TMP "/s"), &sn); free(sb);
+        TEST_ASSERT_TRUE(sn > 4096);
+        lim = old; lim.rlim_cur = (rlim_t)(sn / 2);
         void (*oldsig)(int) = signal(SIGXFSZ, SIG_IGN);
         if (setrlimit(RLIMIT_FSIZE, &lim) == 0) {
             ray_err_t r = save_ctx(enc, ray_test_tmp(CS_TMP "/f"), 2, NULL);

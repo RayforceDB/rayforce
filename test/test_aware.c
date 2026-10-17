@@ -4761,7 +4761,9 @@ static test_result_t test_group_affine_nulls(void) {
  * (strdom.c): the key column t is never materialized and the groups equal
  * generation 0's. */
 static void aw_str_key_tables(const char* tag, int n_part, int n_flat) {
-    /* STR key mixing CONST vectors (one repeated string) and RAW vectors,
+    /* STR key with vectors of one repeated string and vectors of many (CONST
+     * and RAW before P6; P6 selection makes every chunk STR_DICT, and the
+     * forced-RAW twin keeps the RAW vectors),
      * equal strings crossing every vector boundary; two partitions, the
      * second offset and longer, a string in the first only */
     for (int gen = 0; gen <= 2; gen += 2)
@@ -4811,7 +4813,7 @@ static void aw_str_key_tables(const char* tag, int n_part, int n_flat) {
 
 /* Each query on table T, loaded as <tag><kind><gen> (k and o parted), on
  * both generations: equal formatted results.  AW_SK_KEY (and AW_SK_STRICT):
- * generation 2 leaves t unmaterialized (its vectors CONST and RAW).
+ * generation 2 leaves t unmaterialized (its vectors as `mix` says).
  * AW_SK_STRICT on a large table: nothing at all materializes; the others
  * may materialize v, as below RAY_PARALLEL_THRESHOLD rows the serial
  * whole-column strategy (R-RANDOM) reads the aggregates' column whole
@@ -4821,7 +4823,12 @@ static void aw_str_key_tables(const char* tag, int n_part, int n_flat) {
  * another key), answers only. */
 enum { AW_SK_DECLINE, AW_SK_KEY, AW_SK_STRICT };
 typedef struct { char kind; int mode; const char* q; } aw_sk_q_t;
-static test_result_t aw_str_key_check(const char* tag, const aw_sk_q_t* qs, bool strict_ok) {
+/* The STR key's encoding mix on generation 2 (kinds k and u): what
+ * selection gives the data (P6: every chunk a dictionary chunk, so every
+ * vector STR_DICT, the constant runs included), or every vector RAW when
+ * the tables were saved forced RAW (the RAW cursor path). */
+enum { AW_SK_MIX_SELECT, AW_SK_MIX_RAW };
+static test_result_t aw_str_key_check(const char* tag, const aw_sk_q_t* qs, bool strict_ok, int mix) {
     int64_t tsym = ray_sym_intern("t", 1);
     for (int i = 0; qs[i].q; i++) {
         ray_t* out[2];
@@ -4845,8 +4852,18 @@ static test_result_t aw_str_key_check(const char* tag, const aw_sk_q_t* qs, bool
         ray_release(t);
         if (qs[i].mode != AW_SK_DECLINE) {
             TEST_ASSERT_FMT(!info.materialized, "%s%c %s: t materialized", tag, qs[i].kind, qs[i].q);
-            TEST_ASSERT_TRUE(qs[i].kind == 'n' || qs[i].kind == 'o' ||
-                             (info.vectors[RAY_ENC_CONST] > 0 && info.vectors[RAY_ENC_RAW] > 0));
+            if (qs[i].kind != 'n' && qs[i].kind != 'o') {
+                if (mix == AW_SK_MIX_SELECT)
+                    TEST_ASSERT_FMT(info.vectors[RAY_ENC_STR_DICT] > 0 && info.vectors[RAY_ENC_RAW] == 0 &&
+                                    info.vectors[RAY_ENC_CONST] == 0 && info.vectors[RAY_ENC_FSST] == 0,
+                                    "%s%c: RAW %lld CONST %lld STR_DICT %lld FSST %lld", tag, qs[i].kind,
+                                    (long long)info.vectors[RAY_ENC_RAW], (long long)info.vectors[RAY_ENC_CONST],
+                                    (long long)info.vectors[RAY_ENC_STR_DICT], (long long)info.vectors[RAY_ENC_FSST]);
+                else
+                    TEST_ASSERT_FMT(info.vectors[RAY_ENC_RAW] > 0 && info.vectors[RAY_ENC_CONST] == 0 &&
+                                    info.vectors[RAY_ENC_STR_DICT] == 0 && info.vectors[RAY_ENC_FSST] == 0,
+                                    "%s%c: not all RAW", tag, qs[i].kind);
+            }
         }
         if (strict_ok && qs[i].mode == AW_SK_STRICT)
             TEST_ASSERT_FMT(k.materialized == 0, "%s%c %s: %llu materializations", tag, qs[i].kind, qs[i].q,
@@ -4860,11 +4877,32 @@ static test_result_t aw_str_key_check(const char* tag, const aw_sk_q_t* qs, bool
     PASS();
 }
 
-static test_result_t test_str_key_domain(void) {
-    /* "s": the brief's sizes (the serial strategy); "l": above the parallel
+static const aw_sk_q_t* aw_str_key_queries(void);
+static test_result_t aw_str_key_run(const char* ts, const char* tl, int mix) {
+    /* ts: the brief's sizes (the serial strategy); tl: above the parallel
      * threshold, every partition too */
-    aw_str_key_tables("s", 5000, 10000);
-    aw_str_key_tables("l", 70000, 140000);
+    aw_str_key_tables(ts, 5000, 10000);
+    aw_str_key_tables(tl, 70000, 140000);
+    test_result_t r = aw_str_key_check(ts, aw_str_key_queries(), false, mix);
+    if (r.status != TEST_PASS) return r;
+    return aw_str_key_check(tl, aw_str_key_queries(), true, mix);
+}
+
+/* The key column as selection writes it (P6: all STR_DICT). */
+static test_result_t test_str_key_domain(void) {
+    return aw_str_key_run("s", "l", AW_SK_MIX_SELECT);
+}
+
+/* P6: RAW STR vectors are this twin's subject (the cursor path the key took
+ * before STR_DICT): the same tables saved with every STR vector forced RAW. */
+static test_result_t test_str_key_domain_raw(void) {
+    ray_encw_test_force_str(RAY_ENC_RAW);
+    test_result_t r = aw_str_key_run("rs", "rl", AW_SK_MIX_RAW);
+    ray_encw_test_force_str(-1);
+    return r;
+}
+
+static const aw_sk_q_t* aw_str_key_queries(void) {
     /* group order is the route's; asc: makes the comparison order-insensitive */
     static const aw_sk_q_t qs[] = {
         { 'k', AW_SK_STRICT,  "(select {c: (count v) s: (sum v) from: T by: t asc: t})" },
@@ -4899,9 +4937,7 @@ static test_result_t test_str_key_domain(void) {
         { 'n', AW_SK_DECLINE, "(select {c: (count v) from: T by: {t: t l: (strlen t)} asc: [t l]})" },
         { 0, 0, NULL },
     };
-    test_result_t r = aw_str_key_check("s", qs, false);
-    if (r.status != TEST_PASS) return r;
-    return aw_str_key_check("l", qs, true);
+    return qs;
 }
 
 /* ray_pool_dispatch clamped to a ring whose growth fails (#792; shrunk to a
@@ -5744,6 +5780,7 @@ const test_entry_t aware_entries[] = {
     { "aware/group_topn_affine",   test_group_topn_affine,   aw_setup, aw_teardown },
     { "aware/group_affine_nulls",  test_group_affine_nulls,  aw_setup, aw_teardown },
     { "aware/str_key_domain",      test_str_key_domain,      aw_setup, aw_teardown },
+    { "aware/str_key_domain_raw",  test_str_key_domain_raw,  aw_setup, aw_teardown },
     { "aware/gate_materialization", test_gate_materialization, aw_setup, aw_teardown },
     { "aware/gate_decoded_bytes",   test_gate_decoded_bytes,   aw_setup, aw_teardown },
     { "aware/cross_segment_codes",  test_cross_segment_codes,  aw_setup, aw_teardown },

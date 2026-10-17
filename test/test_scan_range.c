@@ -5569,7 +5569,13 @@ static test_result_t test_idx_info_report(void) {
     int64_t r0 = ii_i64("(at (.idx.info S0 's) 'raw_bytes)");
     int64_t e0 = ii_i64("(at (.idx.info S0 's) 'encoded_bytes)");
     TEST_ASSERT_TRUE(r0 > 70000 * 16);               /* the pool is counted */
-    TEST_ASSERT_EQ_I(r2, r0);
+    /* P6 D15: generation 2's raw_bytes is len * 16 + str_pool_bytes, the
+     * materialized column's bytes; the 977 strings are STR_DICT entries,
+     * whose decoded pool holds each once (gen 0's holds every occurrence) */
+    int64_t dict_pool = 0;
+    for (int j = 0; j < 977; j++) dict_pool += 20 + (j < 10 ? 1 : j < 100 ? 2 : 3);   /* "a-long-string-value-" + j */
+    TEST_ASSERT_EQ_I(r2, 70000 * 16 + dict_pool);
+    TEST_ASSERT_TRUE(r2 < r0);
     TEST_ASSERT_EQ_I(e0, r0);                        /* plain: encoded is raw */
     TEST_ASSERT_EQ_I(ii_i64("(at (.idx.info S2 's) 'gen)"), 2);
     TEST_ASSERT_TRUE(ii_i64("(at (.idx.info S2 's) 'encoded_bytes)") > 0);
