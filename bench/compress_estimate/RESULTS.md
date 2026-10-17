@@ -3349,3 +3349,514 @@ store has no float column.
    worst 1.036 for q1), and so does ragged (0.999, worst 1.014).
 
 **P5 gate (float round trip bit-exact, NaN payloads included): PASS**
+
+## P6 STR encodings (STR store derived from the 10M splayed store, release build, commit 00fc4a90)
+
+Driver: `W=/home/hetoku/data/tmp/p6/t8/bench bench/compress_estimate/p6_bench.sh`
+with stages prep, enc, mat, ident, warm, cold, wall, o5, clean, savet and parted
+(12:58-16:52; wall was rerun alone after a fix in the summary helper; parted was
+rerun after the fix described under R2).  Binary 00fc4a90, release build
+(sha256 e658455568da).  BASE for the writer cost and O5 is 9802ba80, the commit
+P6 Task 1 started from (0e3c5aae6df3).  The store holds the 25 columns that the
+43 ClickBench queries read from `/skull/clickbench/rfsplayed` (9 999 505
+rows), with the five text columns (URL, Title, Referer, SearchPhrase,
+MobilePhoneModel) cast SYM -> STR (`(as 'STR c)`; rulings R3 / D14).  g0 and
+g2 were saved by `.db.splayed.set`, measured and deleted.  Protocol: 9 warm
+rounds and 5 wall rounds, alternated; 3 cold trials with per-file eviction;
+ident runs g0 twice; the load average was checked before each round (73 waits,
+logged).  The disk guard ran before each store (prep: the 5.76 GB estimate
+plus 4 GB).  Raw data: /home/hetoku/data/tmp/p6/t8/bench/p6.tsv, with
+summary.txt beside it.  `p6_dictcheck` (built from `make lib`) compares
+every element of every STR column, and the runtime DICT of every all-STR_DICT
+column against generation 0's persisted DICT (codes, first occurrences,
+n_distinct).
+
+```
+meta {'p6': ['00fc4a90', 'e658455568da'], 'base': ['9802ba80', '0e3c5aae6df3']}
+| column | all STR_DICT | gen-2 index | DICT equal (codes, first occurrences, n_distinct) | elements equal | vectors | STR_DICT vectors | n_distinct g0 | n_distinct g2 |
+|---|---|---|---|---|---|---|---|---|
+| URL | false | none | - | true | 9766 | 4928 | 2620031 | -1 |
+| Title | false | none | - | true | 9766 | 3339 | 1602929 | -1 |
+| Referer | false | none | - | true | 9766 | 6144 | 2718828 | -1 |
+| MobilePhoneModel | false | none | - | true | 9766 | 9058 | 91 | -1 |
+| SearchPhrase | false | none | - | true | 9766 | 770 | 834981 | -1 |
+
+| column | g0 file B | g2 encoded B | raw B (.idx.info) | g0 / g2 | mix |
+|---|---|---|---|---|---|
+| WatchID | 588420000 | 589031872 | 79996040 | 1.00x | {raw:9702 dict:64} |
+| EventTime | 79998848 | 59112600 | 79996040 | 1.35x | {raw:1 for_bp:9237 rle:464 dict:64} |
+| EventDate | 40000832 | 563040 | 39998020 | 71.04x | {const:9634 rle:132} |
+| CounterID | 40000832 | 560760 | 39998020 | 71.33x | {const:9687 rle:79} |
+| ClientIP | 40000832 | 10639528 | 39998020 | 3.76x | {raw:228 const:3 rle:9535} |
+| RegionID | 40000832 | 8934824 | 39998020 | 4.48x | {const:3 for_bp:1508 rle:8255} |
+| UserID | 79998848 | 16765104 | 79996040 | 4.77x | {raw:76 const:3 delta_bp:97 rle:9526 dict:64} |
+| URL (STR) | 1073152224 | 432796192 | 718229513 | 2.48x | {str_dict:4928 fsst:4838} |
+| Title (STR) | 1306275776 | 450776480 | 913412536 | 2.90x | {const:328 str_dict:3339 fsst:6099} |
+| Referer (STR) | 1046435104 | 401683776 | 649408230 | 2.61x | {str_dict:6144 fsst:3622} |
+| IsRefresh | 20001824 | 1755280 | 19999010 | 11.40x | {const:5 for_bp:8347 rle:1414} |
+| ResolutionWidth | 20001824 | 5706328 | 19999010 | 3.51x | {raw:1 const:331 for_bp:839 rle:8592 dict:3} |
+| MobilePhone | 20001824 | 1627680 | 19999010 | 12.29x | {const:300 for_bp:56 rle:9347 dict:63} |
+| MobilePhoneModel (STR) | 200013952 | 1702864 | 159992268 | 117.46x | {const:708 str_dict:9058} |
+| SearchEngineID | 20001824 | 6629840 | 19999010 | 3.02x | {raw:1 const:126 for_bp:2203 rle:6809 dict:627} |
+| SearchPhrase (STR) | 284560672 | 45869184 | 241091612 | 6.20x | {const:137 str_dict:770 fsst:8859} |
+| AdvEngineID | 20001824 | 1273424 | 19999010 | 15.71x | {const:2502 for_bp:309 rle:6718 dict:237} |
+| IsLink | 20001824 | 695648 | 19999010 | 28.75x | {const:8684 for_bp:1057 rle:25} |
+| IsDownload | 20001824 | 593104 | 19999010 | 33.72x | {const:9156 for_bp:78 rle:532} |
+| DontCountHits | 20001824 | 722576 | 19999010 | 27.68x | {const:8240 for_bp:1092 rle:434} |
+| TraficSourceID | 20001824 | 4427096 | 19999010 | 4.52x | {const:1 for_bp:7298 rle:29 dict:2438} |
+| URLHash | 275928576 | 263989472 | 79996040 | 1.05x | {raw:3946 rle:5756 dict:64} |
+| RefererHash | 274911456 | 272463680 | 79996040 | 1.01x | {raw:8563 rle:1139 dict:64} |
+| WindowClientWidth | 20001824 | 12725264 | 19999010 | 1.57x | {raw:2 const:330 for_bp:7554 rle:1878 dict:2} |
+| WindowClientHeight | 20001824 | 12540552 | 19999010 | 1.59x | {raw:17 const:329 for_bp:7474 rle:1945 dict:1} |
+
+store: g0 5589719419 B (estimate 5760421679), g2 2603586739 B (x0.466); save g0 50015 ms, g2 166550 ms (prep, one run)
+BASE's generation-2 save of the same table (o5, RAW / CONST STR): 4933804739 B, save 38948 ms
+disk: prep: scratch 8200847449 B, free 3113684992 B; o5: scratch 7560024346 B, free 4538294272 B; parted: scratch 6354252974 B, free 5729128448 B
+
+| writer (O2) | save g0 ms | save g2 ms | g2 / g0 | g0 B | g2 B | runs |
+|---|---|---|---|---|---|---|
+| p6 | 33866 | 167357 | 4.942 | 5589719419 | 2603586739 | 3 |
+| base | 32858 | 37563 | 1.143 | 5589719419 | 4933804739 | 3 |
+
+save g2 p6 / base: 4.455; save g0 p6 / base: 1.031
+
+| query | warm g0 | warm g2 | ratio | first g0 | first g2 | cold g0 | cold g2 | ratio | answers | g2 materializes |
+|---|---|---|---|---|---|---|---|---|---|---|
+| q1 | 0.00 | 0.00 | 1.005 | 0.01 | 0.01 | 0.0 | 0.0 | 0.984 | same | scan |
+| q2 | 0.67 | 0.47 | 0.695 | 1.67 | 1.25 | 38.3 | 3.6 | 0.094 | same | scan |
+| q3 | 3.82 | 0.00 | 0.001 | 5.65 | 0.05 | 93.3 | 0.0 | 0.000 | same | scan |
+| q4 | 0.00 | 0.00 | 1.078 | 0.03 | 0.04 | 0.0 | 0.0 | 1.656 | same | scan |
+| q5 | 0.00 | 0.00 | 1.121 | 0.03 | 0.03 | 0.0 | 0.0 | 1.105 | same | scan |
+| q6 | 0.00 | 0.00 | 1.208 | 0.03 | 0.03 | 0.0 | 0.0 | 1.117 | same | scan |
+| q7 | 0.00 | 0.00 | 1.092 | 0.02 | 0.04 | 0.0 | 0.0 | 1.912 | same | scan |
+| q8 | 3.58 | 2.97 | 0.827 | 9.07 | 8.25 | 41.0 | 9.7 | 0.237 | same | scan |
+| q9 | 76.12 | 75.94 | 0.998 | 112.23 | 127.59 | 682.0 | 155.8 | 0.228 | same | mat: RegionID UserID |
+| q10 | 69.67 | 72.55 | 1.041 | 97.15 | 118.00 | 430.2 | 154.0 | 0.358 | same | mat: RegionID UserID |
+| q11 | 65.17 | 108.35 | 1.663 | 72.81 | 195.26 | 294.7 | 219.6 | 0.745 | same | mat: UserID MobilePhoneModel |
+| q12 | 67.62 | 39.52 | 0.584 | 72.01 | 46.82 | 259.3 | 79.1 | 0.305 | same | scan |
+| q13 | 79.33 | 379.73 | 4.787 | 95.70 | 464.32 | 170.5 | 485.0 | 2.845 | same | scan |
+| q14 | 240.28 | 419.58 | 1.746 | 332.78 | 867.72 | 555.1 | 914.3 | 1.647 | same | mat: UserID SearchPhrase |
+| q15 | 91.90 | 388.75 | 4.230 | 101.84 | 476.91 | 213.2 | 514.9 | 2.415 | same | scan |
+| q16 | 70.49 | 61.50 | 0.873 | 95.97 | 86.79 | 243.0 | 166.6 | 0.685 | same | scan |
+| q17 | 91.79 | 879.91 | 9.586 | 129.24 | 1016.16 | 443.4 | 1130.3 | 2.549 | same | scan |
+| q18 | 6.97 | 790.27 | 113.340 | 13.70 | 909.88 | 660.2 | 956.7 | 1.449 | same | scan |
+| q19 | 138.14 | 928.66 | 6.723 | 210.56 | 1104.83 | 681.0 | 1301.6 | 1.911 | same | mat: EventTime |
+| q20 | 1.18 | 0.63 | 0.531 | 6.91 | 5.99 | 56.5 | 16.5 | 0.291 | same | scan |
+| q21 | 107.05 | 110.36 | 1.031 | 110.67 | 1109.68 | 107.7 | 2393.6 | 22.228 | same | mat: URL |
+| q22 | 177.62 | 246.90 | 1.390 | 179.98 | 1255.65 | 222.0 | 2573.1 | 11.589 | same | mat: URL |
+| q23 | 286.56 | 299.81 | 1.046 | 291.98 | 3244.06 | 605.1 | 5828.5 | 9.632 | same | mat: UserID URL Title SearchPhrase |
+| q24 | 75.93 | 240.19 | 3.163 | 80.54 | 441.17 | 177.3 | 1432.7 | 8.082 | same | mat: EventTime |
+| q25 | 0.96 | 17.40 | 18.215 | 2.39 | 121.70 | 73.9 | 748.0 | 10.123 | same | mat: EventTime |
+| q26 | 12.74 | 33.26 | 2.610 | 14.69 | 373.75 | 168.0 | 944.2 | 5.622 | same | mat: SearchPhrase |
+| q27 | 0.96 | 9.34 | 9.711 | 2.45 | 371.33 | 77.6 | 1025.3 | 13.213 | same | mat: EventTime SearchPhrase |
+| q28 | 110.67 | 97.52 | 0.881 | 113.94 | 1485.94 | 181.1 | 2062.4 | 11.388 | same | mat: URL |
+| q29 | 2176.37 | 484.46 | 0.223 | 2405.44 | 1879.38 | 2406.0 | 2408.1 | 1.001 | same | mat: Referer |
+| q30 | 0.02 | 0.02 | 0.982 | 2.92 | 4.64 | 53.4 | 11.4 | 0.213 | same | mat: ResolutionWidth |
+| q31 | 112.12 | 305.35 | 2.723 | 127.08 | 355.91 | 305.1 | 417.5 | 1.368 | same | scan |
+| q32 | 119.15 | 310.20 | 2.603 | 144.54 | 371.55 | 429.4 | 578.6 | 1.348 | same | scan |
+| q33 | 207.14 | 222.23 | 1.073 | 373.12 | 377.26 | 601.2 | 609.6 | 1.014 | same | scan |
+| q34 | 28.02 | 458.43 | 16.363 | 51.40 | 1679.74 | 130.6 | 2953.3 | 22.621 | same | mat: URL |
+| q35 | 28.07 | 457.95 | 16.312 | 51.34 | 1671.40 | 130.3 | 2956.1 | 22.691 | same | mat: URL |
+| q36 | 64.86 | 58.92 | 0.908 | 87.28 | 82.36 | 162.4 | 127.3 | 0.784 | same | scan |
+| q37 | 20.64 | 166.28 | 8.057 | 31.23 | 280.43 | 49.3 | 597.9 | 12.118 | same | scan |
+| q38 | 19.49 | 31.07 | 1.594 | 29.06 | 78.56 | 45.8 | 242.9 | 5.306 | same | scan |
+| q39 | 7.40 | 272.87 | 36.861 | 14.73 | 341.85 | 44.0 | 644.8 | 14.664 | same | scan |
+| q40 | 110.63 | 243.92 | 2.205 | 202.51 | 454.73 | 217.1 | 1085.3 | 4.998 | same | scan |
+| q41 | 5.83 | 4.67 | 0.802 | 13.45 | 71.11 | 74.5 | 554.0 | 7.434 | same | mat: RefererHash |
+| q42 | 4.49 | 4.81 | 1.073 | 10.93 | 73.18 | 37.3 | 564.2 | 15.123 | same | mat: URLHash |
+| q43 | 9.07 | 7.65 | 0.844 | 18.74 | 17.22 | 41.4 | 26.6 | 0.642 | same | scan |
+
+| query | wall g0 ms/call | wall g2 ms/call | ratio | rounds |
+|---|---|---|---|---|
+| q1 | 0.082 | 0.002 | 0.610 (floored) | 5 |
+| q2 | 0.497 | 0.437 | 0.879 | 5 |
+| q3 | 3.880 | 0.006 | 0.013 (floored) | 5 |
+| q4 | 2.993 | 0.001 | 0.017 (floored) | 5 |
+| q5 | 41.611 | 41.571 | 0.999 | 5 |
+| q6 | 67.178 | 251.079 | 3.738 | 5 |
+| q7 | -0.018 | 0.005 | 1.000 (floored) | 5 |
+| q8 | 3.748 | 2.999 | 0.800 | 5 |
+| q9 | 77.914 | 76.971 | 0.988 | 5 |
+| q10 | 70.698 | 72.982 | 1.032 | 5 |
+| q11 | 64.874 | 108.749 | 1.676 | 5 |
+| q12 | 68.136 | 40.187 | 0.590 | 5 |
+| q13 | 79.998 | 380.515 | 4.757 | 5 |
+| q14 | 242.437 | 418.591 | 1.727 | 5 |
+| q15 | 91.187 | 388.036 | 4.255 | 5 |
+| q16 | 71.271 | 62.909 | 0.883 | 5 |
+| q17 | 94.228 | 877.738 | 9.315 | 5 |
+| q18 | 7.147 | 792.773 | 110.924 | 5 |
+| q19 | 138.300 | 927.711 | 6.708 | 5 |
+| q20 | 1.026 | 0.622 | 0.606 | 5 |
+| q21 | 108.276 | 111.336 | 1.028 | 5 |
+| q22 | 179.730 | 246.767 | 1.373 | 5 |
+| q23 | 287.759 | 299.688 | 1.041 | 5 |
+| q24 | 76.877 | 239.782 | 3.119 | 5 |
+| q25 | 1.041 | 17.641 | 16.946 | 5 |
+| q26 | 12.845 | 33.331 | 2.595 | 5 |
+| q27 | 0.847 | 9.583 | 11.314 | 5 |
+| q28 | 112.467 | 98.102 | 0.872 | 5 |
+| q29 | 2116.021 | 494.309 | 0.234 | 5 |
+| q30 | 0.130 | 0.100 | 0.769 | 5 |
+| q31 | 112.105 | 305.951 | 2.729 | 5 |
+| q32 | 119.897 | 311.742 | 2.600 | 5 |
+| q33 | 207.492 | 218.731 | 1.054 | 5 |
+| q34 | 28.239 | 460.388 | 16.303 | 5 |
+| q35 | 28.598 | 460.641 | 16.107 | 5 |
+| q36 | 65.185 | 60.613 | 0.930 | 5 |
+| q37 | 20.967 | 166.168 | 7.925 | 5 |
+| q38 | 19.698 | 31.440 | 1.596 | 5 |
+| q39 | 7.453 | 274.373 | 36.814 | 5 |
+| q40 | 111.349 | 243.344 | 2.185 | 5 |
+| q41 | 5.653 | 4.618 | 0.817 | 5 |
+| q42 | 4.414 | 4.570 | 1.035 | 5 |
+| q43 | 9.258 | 7.889 | 0.852 | 5 |
+
+| query | scan-only ratio g2 / g0 | source | g2 materializes |
+|---|---|---|---|
+| q1 | 0.610 | wall (floored) | scan |
+| q2 | 0.879 | max(timeit 0.695, wall 0.879) CHECK | scan |
+| q3 | 0.013 | max(timeit 0.001, wall 0.013) | scan |
+| q4 | 0.017 | wall (floored) | scan |
+| q5 | 0.999 | wall | scan |
+| q6 | 3.738 | wall | scan |
+| q7 | 1.000 | wall (floored) | scan |
+| q8 | 0.827 | max(timeit 0.827, wall 0.800) | scan |
+| q9 | 0.998 | max(timeit 0.998, wall 0.988) | mat: RegionID UserID |
+| q10 | 1.041 | max(timeit 1.041, wall 1.032) | mat: RegionID UserID |
+| q11 | 1.676 | max(timeit 1.663, wall 1.676) | mat: UserID MobilePhoneModel |
+| q12 | 0.590 | max(timeit 0.584, wall 0.590) | scan |
+| q13 | 4.787 | max(timeit 4.787, wall 4.757) | scan |
+| q14 | 1.746 | max(timeit 1.746, wall 1.727) | mat: UserID SearchPhrase |
+| q15 | 4.255 | max(timeit 4.230, wall 4.255) | scan |
+| q16 | 0.883 | max(timeit 0.873, wall 0.883) | scan |
+| q17 | 9.586 | max(timeit 9.586, wall 9.315) CHECK | scan |
+| q18 | 113.340 | max(timeit 113.340, wall 110.924) CHECK | scan |
+| q19 | 6.723 | max(timeit 6.723, wall 6.708) | mat: EventTime |
+| q20 | 0.606 | max(timeit 0.531, wall 0.606) | scan |
+| q21 | 1.031 | max(timeit 1.031, wall 1.028) | mat: URL |
+| q22 | 1.390 | max(timeit 1.390, wall 1.373) | mat: URL |
+| q23 | 1.046 | max(timeit 1.046, wall 1.041) | mat: UserID URL Title SearchPhrase |
+| q24 | 3.163 | max(timeit 3.163, wall 3.119) | mat: EventTime |
+| q25 | 18.215 | max(timeit 18.215, wall 16.946) CHECK | mat: EventTime |
+| q26 | 2.610 | max(timeit 2.610, wall 2.595) | mat: SearchPhrase |
+| q27 | 11.314 | max(timeit 9.711, wall 11.314) CHECK | mat: EventTime SearchPhrase |
+| q28 | 0.881 | max(timeit 0.881, wall 0.872) | mat: URL |
+| q29 | 0.234 | max(timeit 0.223, wall 0.234) | mat: Referer |
+| q30 | 0.769 | wall | mat: ResolutionWidth |
+| q31 | 2.729 | max(timeit 2.723, wall 2.729) | scan |
+| q32 | 2.603 | max(timeit 2.603, wall 2.600) | scan |
+| q33 | 1.073 | max(timeit 1.073, wall 1.054) | scan |
+| q34 | 16.363 | max(timeit 16.363, wall 16.303) | mat: URL |
+| q35 | 16.312 | max(timeit 16.312, wall 16.107) CHECK | mat: URL |
+| q36 | 0.930 | max(timeit 0.908, wall 0.930) | scan |
+| q37 | 8.057 | max(timeit 8.057, wall 7.925) CHECK | scan |
+| q38 | 1.596 | max(timeit 1.594, wall 1.596) | scan |
+| q39 | 36.861 | max(timeit 36.861, wall 36.814) | scan |
+| q40 | 2.205 | max(timeit 2.205, wall 2.185) | scan |
+| q41 | 0.817 | max(timeit 0.802, wall 0.817) | mat: RefererHash |
+| q42 | 1.073 | max(timeit 1.073, wall 1.035) | mat: URLHash |
+| q43 | 0.852 | max(timeit 0.844, wall 0.852) | scan |
+
+STR columns left materialized on g2 (mat stage): q11 MobilePhoneModel, q14 SearchPhrase, q21 URL, q22 URL, q23 URL+Title+SearchPhrase, q26 SearchPhrase, q27 SearchPhrase, q28 URL, q29 Referer, q34 URL, q35 URL
+
+| query | C: g0 base | C: g0 p6 | ratio | D: base on its gen-2 save | D: p6 on g2 | ratio | p6 g2 / p6 g0 (warm stage) |
+|---|---|---|---|---|---|---|---|
+| q6 | 0.00 | 0.00 | 0.978 | 0.00 | 0.00 | 0.980 | 1.208 |
+| q11 | 64.89 | 64.65 | 0.996 | 99.39 | 108.75 | 1.094 | 1.663 |
+| q12 | 67.26 | 68.79 | 1.023 | 66.95 | 39.46 | 0.589 | 0.584 |
+| q13 | 79.67 | 79.55 | 0.998 | 194.99 | 382.34 | 1.961 | 4.787 |
+| q14 | 240.06 | 240.64 | 1.002 | 406.00 | 417.12 | 1.027 | 1.746 |
+| q15 | 91.04 | 93.41 | 1.026 | 201.34 | 385.46 | 1.914 | 4.230 |
+| q17 | 91.62 | 92.14 | 1.006 | 419.44 | 878.90 | 2.095 | 9.586 |
+| q18 | 6.99 | 7.06 | 1.010 | 333.81 | 792.39 | 2.374 | 113.340 |
+| q19 | 138.37 | 137.06 | 0.990 | 470.49 | 924.82 | 1.966 | 6.723 |
+| q22 | 177.88 | 176.88 | 0.994 | 175.74 | 244.84 | 1.393 | 1.390 |
+| q23 | 286.20 | 287.85 | 1.006 | 294.34 | 300.94 | 1.022 | 1.046 |
+| q29 | 1430.36 | 1951.79 | 1.365 | 521.54 | 483.36 | 0.927 | 0.223 |
+| q34 | 27.91 | 27.87 | 0.999 | 481.41 | 457.39 | 0.950 | 16.363 |
+| q35 | 28.08 | 28.12 | 1.002 | 480.96 | 457.78 | 0.952 | 16.312 |
+| q37 | 20.62 | 20.82 | 1.009 | 78.13 | 164.24 | 2.102 | 8.057 |
+| q38 | 19.53 | 19.58 | 1.002 | 48.19 | 30.81 | 0.639 | 1.594 |
+| q39 | 7.33 | 7.37 | 1.006 | 19.10 | 275.11 | 14.403 | 36.861 |
+| q40 | 111.14 | 111.80 | 1.006 | 141.96 | 241.79 | 1.703 | 2.205 |
+
+parted arm (R2): p0 4695311694 B, p2 1636295358 B; STR mixes: URL {str_dict:7368 fsst:2402}; Title {const:330 str_dict:3322 fsst:6118}; Referer {str_dict:6182 fsst:3588}; MobilePhoneModel {const:697 str_dict:8480 fsst:593}; SearchPhrase {const:142 str_dict:798 fsst:8830}
+
+| query | warm p0 | warm p2 | ratio | first p0 | first p2 | answers | p2 materializes |
+|---|---|---|---|---|---|---|---|
+| q1 | 0.00 | 0.00 | 0.963 | 0.01 | 0.01 | same | scan |
+| q2 | 6.74 | 6.57 | 0.974 | 16.78 | 16.29 | same | scan |
+| q3 | 549.44 | 0.00 | 0.000 | 555.02 | 0.05 | same | scan |
+| q4 | 282.41 | 0.00 | 0.000 | 323.86 | 0.05 | same | scan |
+| q5 | 284.32 | 0.00 | 0.000 | 321.04 | 0.03 | same | scan |
+| q6 | 359.46 | 359.07 | 0.999 | 634.55 | 843.89 | same | mat: SearchPhrase |
+| q7 | 550.81 | 0.00 | 0.000 | 577.32 | 0.05 | same | scan |
+| q8 | 6.38 | 2.31 | 0.363 | 7.76 | 3.75 | same | scan |
+| q9 | 86.56 | 86.90 | 1.004 | 152.02 | 164.55 | same | mat: RegionID UserID |
+| q10 | 79.67 | 80.30 | 1.008 | 156.87 | 172.77 | same | mat: RegionID UserID |
+| q11 | 331.93 | 49.35 | 0.149 | 419.54 | 57.84 | same | scan |
+| q12 | 335.42 | 50.20 | 0.150 | 424.04 | 57.53 | same | scan |
+| q13 | 867.30 | 863.99 | 0.996 | 1129.19 | 1197.39 | same | mat: SearchPhrase |
+| q14 | 638.31 | 543.20 | 0.851 | 862.04 | 635.15 | same | scan |
+| q15 | 873.84 | 870.36 | 0.996 | 1120.00 | 1169.65 | same | mat: SearchPhrase |
+| q16 | 72.86 | 61.84 | 0.849 | 98.14 | 88.55 | same | scan |
+| q17 | 601.92 | 860.93 | 1.430 | 904.43 | 974.53 | same | scan |
+| q18 | 590.18 | 777.66 | 1.318 | 897.57 | 860.40 | same | scan |
+| q19 | 822.49 | 961.24 | 1.169 | 1376.85 | 1347.15 | same | mat: EventTime |
+| q20 | 4.49 | 1.49 | 0.332 | 14.45 | 12.07 | same | scan |
+| q21 | 109.98 | 110.78 | 1.007 | 114.93 | 717.45 | same | mat: URL |
+| q22 | 490.31 | 349.75 | 0.713 | 658.44 | 966.95 | same | mat: URL |
+| q23 | 590.45 | 519.93 | 0.881 | 765.13 | 2440.33 | same | mat: URL Title |
+| q24 | 110.47 | 117.65 | 1.065 | 114.96 | 766.97 | same | mat: URL |
+| q25 | 393.51 | 243.72 | 0.619 | 568.56 | 271.91 | same | scan |
+| q26 | 490.89 | 414.98 | 0.845 | 675.11 | 495.52 | same | scan |
+| q27 | 491.13 | 401.71 | 0.818 | 676.22 | 472.87 | same | scan |
+| q28 | 746.99 | 756.54 | 1.013 | 1765.61 | 1346.74 | same | mat: URL |
+| q29 | 1725.87 | 1726.94 | 1.001 | 2781.67 | 3779.16 | same | mat: Referer |
+| q30 | 271.72 | 273.41 | 1.006 | 284.22 | 288.80 | same | mat: ResolutionWidth |
+| q31 | 415.37 | 268.06 | 0.645 | 651.12 | 288.40 | same | scan |
+| q32 | 433.31 | 284.48 | 0.657 | 706.45 | 322.32 | same | scan |
+| q33 | 215.57 | 221.51 | 1.028 | 375.94 | 390.59 | same | scan |
+| q34 | 1089.12 | 1107.09 | 1.016 | 2305.17 | 2912.90 | same | mat: URL |
+| q35 | 1088.70 | 1107.31 | 1.017 | 2319.07 | 2913.25 | same | mat: URL |
+| q36 | 150.03 | 151.86 | 1.012 | 221.85 | 198.53 | same | scan |
+| q37 | 733.49 | 716.79 | 0.977 | 1739.18 | 2408.54 | same | mat: URL |
+| q38 | 1045.51 | 1033.31 | 0.988 | 2440.77 | 3761.42 | same | mat: Title |
+| q39 | 19.37 | 262.52 | 13.551 | 31.03 | 281.65 | same | scan |
+| q40 | 204.29 | 239.08 | 1.170 | 350.89 | 387.78 | same | scan |
+| q41 | 17.54 | 13.63 | 0.777 | 38.60 | 26.12 | same | scan |
+| q42 | 13.05 | 13.46 | 1.031 | 23.63 | 24.83 | same | scan |
+| q43 | 28.52 | 16.34 | 0.573 | 41.06 | 28.22 | same | scan |
+
+parted arm (R2), informational: all 43 queries present: yes; answers p2 = p0: yes
+
+load waits: 73 (13:13:49/1.65, 13:17:04/3.13, 13:17:34/1.95, 13:18:04/1.57, 13:21:17/4.00, 13:21:47/2.42, 13:22:17/1.64, 13:25:32/3.11, 13:26:02/1.88, 13:29:15/3.19)
+
+over 1.05 (scan-only line): q6 3.738, q11 1.676, q13 4.787, q14 1.746, q15 4.255, q17 9.586, q18 113.340, q19 6.723, q22 1.390, q24 3.163, q25 18.215, q26 2.610, q27 11.314, q31 2.729, q32 2.603, q33 1.073, q34 16.363, q35 16.312, q37 8.057, q38 1.596, q39 36.861, q40 2.205, q42 1.073
+
+**P6 gate (STR round trip): PASS** (every STR column element-identical, 5 columns)
+**P6 gate (DICT index equal to generation 0 on all-STR_DICT columns): FAIL** (not exercised: no all-STR_DICT column)
+**P6 STR store, all 43 queries present (and no run failed) in warm, cold, wall and ident: PASS**
+**P6 STR store, answers g2 = g0: PASS**
+**P6 STR store, scan-only warm (no regression, <= 1.05 per query): FAIL** (worst 113.340, q18, max(timeit 113.340, wall 110.924) CHECK)
+```
+
+Reading the STR-store table:
+
+- **Round trip: PASS.**  All five STR columns are element-identical between
+  g0 and g2 (`p6_dictcheck` compares every element), and all 43 answers are
+  byte-identical (raw hashes equal on every query; g0 is stable against
+  itself).  The parted arm (R2, below) gives the same result.
+- **DICT gate: FAIL, not exercised.**  No STR column of the 10M store is
+  all STR_DICT, so no column carries a runtime DICT, and the second clause is
+  not measured on this data.  The runtime DICT needs every vector to be
+  STR_DICT, so that every chunk carries code bounds (spec "STR dictionary
+  index"; `encw.c` writes chunk bounds only then).  What breaks it, per column:
+  - MobilePhoneModel (91 distinct values): 9058 of 9766 vectors are STR_DICT,
+    and the other 708 are all-`""` vectors.  The null rule (D4, the spec's
+    one-way rule) makes those CONST.
+  - Title and SearchPhrase: all-`""` CONST vectors (328 and 137), plus FSST.
+  - URL, Referer: FSST vectors (4838 and 3622) after chunk 0.
+
+  So on real text data the runtime DICT is built only for columns with no
+  all-null vector, which almost every sparse text column has.  Columns with
+  a non-STR_DICT vector carry no runtime DICT by design (spec "STR dictionary
+  index"); the DICT equality is covered by `encstr/dict_equals_gen0` (70 000
+  rows, all STR_DICT).
+- **Sizes.**  g2 is 0.466 of g0 (2.60 GB against 5.59 GB) and 0.53 of BASE's
+  own generation-2 save, whose STR is RAW / CONST (4.93 GB).  The STR
+  columns shrink 2.5-2.9x (URL, Title, Referer, all FSST / STR_DICT), 6.2x
+  (SearchPhrase) and 117x (MobilePhoneModel).
+- **Writer cost (O2): 4.46x BASE.**  The g2 save takes 167 s against 37.6 s
+  at BASE (medians of 3 alternated rounds).  g0 saves are at parity (1.03).
+  This is the pre-flight's O2 item: the chunk plan FSST-encodes each vector
+  once to size it and again to write it.  Post-spec, as P5's writer cost was.
+- **Scan-only warm: FAIL (worst q18 113x), sent to the controller and not
+  tuned (the P5 Ruling 8b-1 precedent).**  23 queries are over 1.05.  The
+  timeit and wall ratios agree everywhere (the gaps flagged CHECK are on
+  ratios far above 1.05).  Two classes:
+  1. **STR group-by keys** (q13 4.8x, q15 4.3x, q17 9.6x, q18 113x, q19 6.7x,
+     q34 / q35 16x, q37 8.1x, q38 1.6x, q39 37x, q40 2.2x).  Gen 0 has a
+     persisted DICT on every STR column and groups on its codes; gen 2 has
+     no DICT on any column of this data (above).  Profiles (`perf record`,
+     release, 8 calls after a warm-up; /home/hetoku/data/tmp/p6/t8/prof/):
+     - q18 g0: `agg_firstn_task` 21% (plus the load-time `col_validate_mapped`).
+     - q18 g2: the strdom route.  `ray_fsst_expanded_len` 31% and
+       `ray_fsst_decode` 21% (a per-row FSST decode of SearchPhrase, which is
+       8859 FSST vectors of 9766), then `sd_intern` 10%, `sd_rows` 9%,
+       `ray_enc_fsst_check` 9% and `dec_str` 9%.
+     - q34 g0: the dense partitioned aggregation over the DICT codes.
+     - q34 g2: URL is materialized (Ruling 7-1's shape), then grouped through
+       the string hash directory: `agg_key_directory_insert` 31%,
+       `ray_str_vec_get` 10%, and FSST decode 12%.
+
+     The gap is the missing DICT, not the remap.  Of the 770 STR_DICT
+     vectors of SearchPhrase, only those go through the per-dictionary remap
+     (Task 6); every FSST row is decoded and interned serially.
+  2. **STR `!= ""` filters and sort keys** (q6 count distinct SearchPhrase
+     3.7x; q24-q27 3.2-18x; q31 / q32 2.7x; q22 1.4x).  Not profiled
+     separately: the store was deleted before this split was made.  The
+     likely cause, inferred and not measured: an inequality on a FSST vector
+     has no code path (Task 5 evaluates on STR_DICT codes only), so gen 2
+     decodes the FSST vectors that q18's profile shows to be costly, while
+     gen 0 reads plain descriptors.
+  - The other FAIL rows: q11 1.68 and q14 1.75 (STR count-distinct, which
+    materializes), q33 1.073 and q42 1.073 (non-STR, the P4 Ruling 10-7 class).
+  - The fix belongs to the controller's ruling.  Candidates: a vector-scope
+    FSST fast decode (the 8b pattern); equality and inequality of a constant
+    on FSST vectors without decoding (compress the constant); building the
+    runtime DICT whenever the column's STR_DICT entries plus its decoded
+    non-dictionary vectors cover it (relaxing "every vector STR_DICT").
+- **O5, STR group-by against BASE** (5 alternated rounds; arm C: the BASE
+  and P6 binaries on g0; arm D: BASE on its own gen-2 save, RAW / CONST STR,
+  against P6 on g2):
+  - Arm C, gen 0: at parity (0.98-1.03) except q29 at 1.365 (see below).
+  - Arm D: P6's STR_DICT / FSST g2 is slower than BASE's RAW g2 on the STR
+    group-by and filter queries: q13 1.96, q15 1.91, q17 2.10, q18 2.37,
+    q19 1.97, q37 2.10, q39 14.4, q40 1.70, q22 1.39.  It is faster where the
+    dictionary pays (q12 0.59, q38 0.64) and level on q14, q23, q29 and
+    q34 / q35.
+
+  So the P3 carry ("gen-2 STR group-by ~3x BASE") is not closed on real
+  data.  The remap helps STR_DICT vectors, but the FSST vectors that
+  dominate URL, Title and SearchPhrase cost more per row than BASE's RAW
+  cursor read.
+- **q29, gen 0: 1.365x BASE on the STR store.**  The cause is layout, not
+  P6 logic; it goes to the controller.  On the STR g0 store, q29's per-group
+  `(strlen Referer)` runs `strlen_sym_task`, and `ray_sym_str` takes the
+  global spinlock `g_sym_lock` per element: 90-95% of the query.  Bisected on
+  a 2M-row copy (median of 5 runs, ms):
+
+  | binary | ms |
+  |---|---|
+  | BASE 9802ba80 | 255-281 |
+  | c8eb63b1 | 275-280 |
+  | 802fc803 | 230-237 |
+  | b08886cd | 378-424 |
+  | 6c20099b | 379-416 |
+  | 622a039b | 419-446 |
+  | 00fc4a90 | 374-418 |
+
+  b08886cd touches only `src/store/enc*` (gen-2 code).  Its new statics move
+  `.bss` by 0x20, which puts `g_sym_lock` on the same 64-byte line as `g_sym`
+  (0x9af900-0x9af93f; in 802fc803 they are on separate lines).  Every
+  acquire of the lock then invalidates the line that every reader needs:
+  false sharing.  The hot spot itself, a per-element global lock in parallel
+  SYM `strlen`, predates P6.  On the SYM ClickBench store q29 is at parity
+  (C0 1.004, 346 ms), where the same query takes 1.4-2.2 s on the STR g0
+  store.  Recommendation: put `g_sym_lock` on its own cache line, and look
+  up the string once per symbol (not per element) in `strlen_sym_task`.  Not
+  changed here.
+- **Rulings 6-2 / 7-1 (materialization shapes).**
+  - `count s by s` with no filter (q34 / q35, URL) materializes URL on g2:
+    the 7-1 shape, measured at 16x warm, 1.7 s first run.
+  - The filtered `count s by s` queries (q13 SearchPhrase, q37 URL, q38
+    Title) materialize nothing.
+  - Computed composite keys: q19's `(minute EventTime)` materializes
+    EventTime, a non-STR column, as at P3.  q42's computed STR key `(if ...
+    Referer "")` and q43's `xbar` materialize nothing.
+
+  The STR form of 6-2 did not show in the query set.  STR columns left
+  materialized: q11 MobilePhoneModel and q14 SearchPhrase (count distinct);
+  q21-q23 and q28 (LIKE, strlen); q26 / q27 (sort keys); q29 Referer
+  (strlen); q34 / q35.  All are in P3's allowed classes.
+- **Parted STR arm (R2): run, not skipped.**  Ten 1M-row partitions per
+  store, each derived from its own slice of the source: p0 4.70 GB, p2 1.64
+  GB, one store at a time under the guard.  All 43 queries present, answers
+  p2 = p0.  Informational ratios: q39 13.6x; q17 1.43, q18 1.32, q19 1.17,
+  q40 1.17.  Most other queries are at or under 1.0, because gen 0 has no
+  cross-segment DICT path either.  The first attempt sliced the derived
+  table, and its STR slices kept the parent's pool.  A gen-0 save writes
+  that pool tail, so each partition was 2.9 GB and the disk filled (`io`; the
+  partial store was deleted at once).  That reproduces on dev 2129b8aa
+  (filed as #884, with a repro).
+- **Disk.**  Peak scratch was 8.20 GB at prep, with g0 and g2 present (3.11
+  GB free).  The low point was 2.88 GB free, during the failed first parted
+  attempt above.  Every store was deleted after its stage.
+
+Step 1, the suites (logs under /home/hetoku/data/tmp/p6/t8/), all run
+before any benchmark:
+
+| run | result | runtime errors |
+|---|---|---|
+| debug `make test` (full) | 6009/6009, 0 failed | 0 |
+| debug `encstr/`, default cores | 40/40 | 0 |
+| debug `encstr/`, `TEST_CORES=8` | 40/40 | 0 |
+| debug `equiv/` | 1180/1180 | 0 |
+| `make test-large` | 5/5 | 0 |
+| release FP profile `encstr/` (`make test-release`) | 40/40 | - |
+| informational (O3), release FP profile `aware/` | 95/95 | - |
+
+### P2/P3 driver rerun against BASE 9802ba80 (I8)
+
+`W=/home/hetoku/data/tmp/p6/t8/p2_bench BASE=9802ba80 p2_bench.sh prep`,
+then `splayed` and `parted` (17:08-18:44), run after the STR stores were
+deleted, with 11.97 GB free against the stage guard's 11.81 GB.  The P6
+binary is 00fc4a90 (e658455568da), base 9802ba80 (0e3c5aae6df3).
+`p3_summary.py` is unchanged.  Raw data: /home/hetoku/data/tmp/p6/t8/p2_bench/p2.tsv
+and summary.txt.
+
+```
+totals over all 43: warm 1711.3 vs 1648.7 (0.963); first run 2529.2 vs 2708.5 (1.071); 3-run 6023.0 vs 6084.9 (1.010)
+answer_mismatches none
+scan_only(gated) n=28; gmeans over base>=1ms (per column): warm n=22 0.582, first n=23 0.701, cold n=23 0.346; worst warm=1.166
+scan_only_list_but_materializing none
+worst5 warm [(1.166, 'q6'), (1.12, 'q5'), (1.113, 'q4'), (1.094, 'q7'), (1.067, 'q33')]
+totals over all 43: warm 4673.2 vs 2899.5 (0.620); first run 16262.2 vs 13906.6 (0.855); 3-run 25782.5 vs 19857.1 (0.770)
+answer_mismatches none
+scan_only(gated) n=34; gmeans over base>=1ms (per column): warm n=33 0.179, first n=33 0.253, cold n=33 0.146; worst warm=1.028
+scan_only_list_but_materializing none
+worst5 warm [(1.028, 'q28'), (1.019, 'q33'), (1.017, 'q32'), (1.016, 'q15'), (1.012, 'q13')]
+totals over all 43: warm 1709.9 vs 1714.1 (1.002); first run 2545.6 vs 2541.0 (0.998); 3-run 6033.7 vs 6028.7 (0.999)
+answer_mismatches none
+gen0 warm_gmean(base>=1ms n=35)=0.998 warm_worst=1.175 worst5 [(1.175, 'q30'), (1.125, 'q25'), (1.05, 'q2'), (1.028, 'q7'), (1.024, 'q28')]
+totals over all 43: warm 4666.4 vs 4678.5 (1.003); first run 16289.1 vs 16321.6 (1.002); 3-run 25806.8 vs 25863.6 (1.002)
+answer_mismatches none
+gen0 warm_gmean(base>=1ms n=42)=1.000 warm_worst=1.024 worst5 [(1.024, 'q7'), (1.023, 'q2'), (1.013, 'q6'), (1.013, 'q12'), (1.011, 'q36')]
+q16 first run base 98.7 ms, p2 99.0 ms (carry 2)
+totals over all 43: warm 4429.0 vs 4443.3 (1.003); first run 16152.9 vs 16148.0 (1.000); 3-run 25222.4 vs 25195.7 (0.999)
+answer_mismatches none
+gen0 warm_gmean(base>=1ms n=42)=1.001 warm_worst=1.085 worst5 [(1.085, 'q1'), (1.025, 'q14'), (1.024, 'q7'), (1.013, 'q11'), (1.011, 'q18')]
+enc A: columns with DELTA vectors: ['UserID {raw:76 const:3 delta_bp:97 rle:9526 dict:64}]
+enc B: columns with DELTA vectors: ['UserID {raw:75 const:3 delta_bp:89 rle:8963 dict:640}]
+sizes {('A', 'g0'): 5948677939, ('A', 'g2'): 3216455899, ('B', 'p0'): 4807844987, ('B', 'p2'): 2072366907}  peak_rss_kb {('A', 'g0'): 5120292, ('A', 'g2'): 5954800, ('B', 'p0'): 12146240, ('B', 'p2'): 11970140}  evict_modes fadvise  ragged_partition ['9', '40']  meta {'p2': ['00fc4a90', 'e658455568da'], 'base': ['9802ba80', '0e3c5aae6df3']}
+GATE (strict) splayed[answers=PASS warm=FAIL cold=PASS first=PASS materializing_warm=PASS no_unexpected_materialization=PASS first_total=PASS] parted[answers=PASS warm=PASS cold=PASS first=PASS materializing_warm=PASS no_unexpected_materialization=PASS] gen0-splayed[answers=PASS warm=FAIL] gen0-parted[answers=PASS warm=FAIL q16_first=FAIL] gen0-ragged[answers=PASS warm=FAIL]
+P2 GATE (strict): FAIL
+GATE (P3-exempt) splayed[answers=PASS warm=FAIL cold=PASS first=PASS materializing_warm=PASS no_unexpected_materialization=PASS first_total=PASS] parted[answers=PASS warm=PASS cold=PASS first=PASS materializing_warm=PASS no_unexpected_materialization=PASS] gen0-splayed[answers=PASS warm=FAIL] gen0-parted[answers=PASS warm=FAIL q16_first=FAIL] gen0-ragged[answers=PASS warm=FAIL]
+P2 GATE (P3-exempt): FAIL
+P3-EXEMPT LIST 
+p3_unexpected_materializations none
+rss A: 5120292 -> 5954800 kB (x1.163 over all 43, bound 1.1)
+rss A without D2 q41,q42: 5100968 -> 5063280 kB (x0.993, bound 1.1, gated)
+rss B: 12146240 -> 11970140 kB (x0.986 over all 43, bound 1.1)
+P3GATE p2_strict=FAIL materialization=PASS rss=PASS
+P3 GATE: FAIL
+```
+
+**P2/P3 rerun strict line: FAIL by the letter** (`P2 GATE (strict): FAIL`;
+`P3 GATE: FAIL` through `p2_strict`).  Materialization PASS, RSS PASS
+(x0.993 without D2, x0.986 parted), and answers PASS on every arm.  Sizes are
+byte-identical to P5's rerun: P6 does not change the SYM store's bytes.
+Each failing clause:
+
+1. **Splayed warm (A): q33 1.067.**  Ruling 10-7, accepted; P5 had 1.068.
+   q4-q7 above 1.05 are sub-ms rows inside the noise floor.
+2. **Gen-0 splayed warm (C0): q25, 0.89 -> 1.00 ms (1.125).**  The gap is
+   0.11 ms against the 0.05 ms floor: Ruling 14-8's sub-ms class (P4: q25 /
+   q27; P5: q27).  Gmean 0.998.
+3. **Gen-0 parted q16_first: base 98.7 ms, P6 99.0 ms.**  Ruling 10-5,
+   accepted.
+4. **New: gen-0 parted warm (C1) and gen-0 ragged warm (R) FAIL on the
+   gmean clause only.**  The gmeans are 1.0005 and 1.0005 (C1: 42 queries
+   with base >= 1 ms, worst 1.024 q7; R: worst 1.085 q1, which is sub-ms).
+   The bound is `<= 1.00`.  P5's rerun had 0.999 for both.  No query in
+   either arm is over 1.05 outside the floor.  This is not covered by an
+   earlier ruling, so it goes to the controller.  The size is noise (0.05%),
+   but it is reported, not waived.
+
+**P6 gate (STR round trip): PASS** (every STR column element-identical, 5 columns)
+**P6 gate (DICT index equal to generation 0 on all-STR_DICT columns): FAIL** (not exercised: no all-STR_DICT column)
+**P6 STR store, all 43 queries present (and no run failed) in warm, cold, wall and ident: PASS**
+**P6 STR store, answers g2 = g0: PASS**
+**P6 STR store, scan-only warm (no regression, <= 1.05 per query): FAIL** (worst 113.340, q18, max(timeit 113.340, wall 110.924) CHECK)
