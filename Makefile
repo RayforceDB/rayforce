@@ -29,12 +29,14 @@ VERSION_MAJOR := $(word 1,$(subst ., ,$(RAY_VERSION)))
 VERSION_MINOR := $(word 2,$(subst ., ,$(RAY_VERSION)))
 VERSION_PATCH := $(word 3,$(subst ., ,$(RAY_VERSION)))
 GIT_HASH := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
-# The objects that embed GIT_HASH depend on a stamp rewritten only when the
-# hash changes, so an incremental build after a new commit rebuilds them
-# instead of keeping the previous hash (see GIT_HASH_OBJS below).
-GIT_HASH_STAMP := build/.git-hash
-$(shell mkdir -p build && { [ "$$(cat $(GIT_HASH_STAMP) 2>/dev/null)" = "$(GIT_HASH)" ] || echo "$(GIT_HASH)" > $(GIT_HASH_STAMP); })
 BUILD_DATE := $(shell date -u +%Y-%m-%d)
+# The objects that embed the build information (commit, version, build date)
+# depend on a stamp rewritten only when one of them changes, so an incremental
+# build after a new commit, a RAY_VERSION override or a new day rebuilds them
+# instead of keeping the previous values (see BUILD_INFO_OBJS below).
+BUILD_INFO := $(GIT_HASH) $(RAY_VERSION) $(BUILD_DATE)
+BUILD_INFO_STAMP := build/.build-info
+$(shell mkdir -p build && { [ "$$(cat $(BUILD_INFO_STAMP) 2>/dev/null)" = "$(BUILD_INFO)" ] || echo "$(BUILD_INFO)" > $(BUILD_INFO_STAMP); })
 
 WARNS   = -Wall -Wextra -Werror -Wstrict-prototypes -Wno-unused-parameter
 DEFS    = -DRAYFORCE_GIT_COMMIT=\"$(GIT_HASH)\" -DRAYFORCE_BUILD_DATE=\"$(BUILD_DATE)\" \
@@ -224,12 +226,12 @@ default: debug
 %.ndebug.o: %.c
 	$(CC) -c $(NDEBUG_CFLAGS) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
 
-# Sources that embed GIT_HASH (ray_git_commit, the REPL and crash banners,
-# and the test that compares ray_git_commit against it), in every object
-# flavour.
-GIT_HASH_SRCS := src/core/types src/app/repl src/core/crash test/test_types
-GIT_HASH_OBJS := $(foreach v,.o .rel.o .lib.o .fuzz.o .tsan.o .hard.o .ndebug.o,$(addsuffix $(v),$(GIT_HASH_SRCS)))
-$(GIT_HASH_OBJS): $(GIT_HASH_STAMP)
+# Sources that embed the build information (ray_git_commit and the version
+# accessors, the REPL and crash banners, .sys.build, and the test that compares
+# ray_git_commit against GIT_HASH), in every object flavour.
+BUILD_INFO_SRCS := src/core/types src/app/repl src/core/crash src/ops/system test/test_types
+BUILD_INFO_OBJS := $(foreach v,.o .rel.o .lib.o .fuzz.o .tsan.o .hard.o .ndebug.o,$(addsuffix $(v),$(BUILD_INFO_SRCS)))
+$(BUILD_INFO_OBJS): $(BUILD_INFO_STAMP)
 
 # Main binary for debug/test (some tests spawn ./$(TARGET) as a server).
 $(TARGET): $(LIB_OBJ) $(MAIN_OBJ)
