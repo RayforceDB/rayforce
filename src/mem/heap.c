@@ -920,7 +920,10 @@ static bool ray_atom_owns_obj(const ray_t* v) {
     return false;
 }
 
-static void ray_release_owned_refs(ray_t* v) {
+/* Forced inline: ray_free_node has two inlined copies (the per-node free
+ * and the free walk's leaf child), and a leaf free must not pay a call
+ * here to learn it owns nothing. */
+RAY_INLINE void ray_release_owned_refs(ray_t* v) {
     if (!v || RAY_IS_ERR(v)) return;
 
     if (ray_is_atom(v)) {
@@ -1771,97 +1774,12 @@ void ray_file_map_release(ray_file_map_t* m) {
     ray_sys_free(m);
 }
 
-void ray_free(ray_t* v) {
-    if (!v || RAY_IS_ERR(v)) return;
-    if (v->attrs & RAY_ATTR_ARENA) return;  /* arena-owned, bulk-freed */
-#ifdef DEBUG
-    if (dfd_contains(v)) dfd_report("ray_free (double free)", v);
-#endif
-
-    /* Guard: keep rc=1 while releasing children so buddy coalescing
-     * won't merge this block prematurely (it checks buddy_rc==0). */
-    ray_atomic_store(&v->rc, 1);
-
-    /* A mapped block owning a shared region takes its descriptor now: aux
-     * lives inside the region it describes. */
-    ray_file_map_t* owned_map = (v->mmod == 3) ? v->file_map : NULL;
-
-    /* A mapped string column reaches its own reference through its pool,
-     * which is the cheap path and needs no lock — but only while that
-     * pointer still leads to the mapped pool.  Read it before the children
-     * go, since releasing the pool may be what drops it. */
-    ray_file_map_t* col_map = NULL;
-    if (v->mmod == 1 && v->type == RAY_STR &&
-        v->str_pool && !RAY_IS_ERR(v->str_pool) && v->str_pool->mmod == 3)
-        col_map = v->str_pool->file_map;
-
-    ray_release_owned_refs(v);
-
+/* Return the block of a dying v to wherever it came from, once its owned
+ * references are gone.  The tail of the per-node free below, and all the
+ * free walk needs: the walk only takes heap blocks (mmod 0), for which the
+ * mapped-block arms of ray_free_node have nothing to do. */
+RAY_INLINE void ray_free_block(ray_t* v) {
     ray_heap_t* h = ray_tl_heap;
-
-    if (owned_map) {
-        ray_file_map_release(owned_map);
-        if (h) RAY_STAT(h->stats.free_count++);
-        return;
-    }
-
-    /* File-mapped: munmap */
-    if (v->mmod == 1) {
-        if (v->type == RAY_TABLE || v->type == RAY_DICT || v->type == RAY_LIST) return;
-        /* A column mapped by the store registered its region and holds one
-         * of its references.  Looking that up by address rather than through
-         * str_pool is the point: a mutated column's pool pointer no longer
-         * leads anywhere useful, while its address is what the region was
-         * registered under.  The descriptor also carries the true mapped
-         * length, so nothing has to re-derive it from a header that the
-         * children release may already have taken away. */
-        /* col_map is the answer whenever the pool pointer still led to the
-         * region, which is every column that was not mutated.  Only one
-         * that had its pool swapped — str_pool_cow deep-copies a mapped
-         * pool before appending — has to ask the registry, and only a
-         * string column was ever registered.  So the lock stays off the
-         * ordinary free entirely, and a mutated column pays it once. */
-        /* A column loaded with an inline index registered its region too
-         * (col.c): the index may have been detached since, and only the
-         * descriptor still knows the mapped length. */
-        ray_file_map_t* m = col_map;
-        if (!m) m = ray_file_map_lookup(v);
-        if (m) {
-            ray_file_map_release(m);
-            if (h) RAY_STAT(h->stats.free_count++);
-            return;
-        }
-        if (v->type > 0 && v->type < RAY_TYPE_COUNT) {
-            uint8_t esz = ray_sym_elem_size(v->type, v->attrs);
-            size_t data_size = 32 + (size_t)v->len * esz;
-            if (v->type == RAY_STR) {
-                size_t pool_len = 0;
-                if (v->str_pool && !RAY_IS_ERR(v->str_pool) && v->str_pool->len > 0)
-                    pool_len = (size_t)v->str_pool->len;
-                data_size += 32 + pool_len;
-            }
-            /* Inline index region: a mmap-resident (passenger) index extends the
-             * mapping past the payload by its 32-aligned inline region.  Derive
-             * that size from the index itself (ray_index_inline_size) rather than
-             * stashing it in aux — str_pool occupies _idx_pad on STR columns, and
-             * the payload size above already accounts for descriptors + pool.
-             * Heap-resident indexes (RAY_MARK_MMAP clear) keep the payload-only
-             * formula. */
-            if ((v->attrs & RAY_ATTR_HAS_INDEX) && v->index && !RAY_IS_ERR(v->index)) {
-                ray_index_t* ix = ray_index_payload(v->index);
-                if (ix->markers & RAY_MARK_MMAP) {
-                    int64_t region_off = ((int64_t)data_size + 31) & ~(int64_t)31;
-                    data_size = (size_t)(region_off + ray_index_inline_size(ix));
-                }
-            }
-            size_t mapped_size = (data_size + 4095) & ~(size_t)4095;
-            ray_vm_unmap_file(v, mapped_size);
-        } else {
-            ray_vm_unmap_file(v, 4096);
-        }
-        if (h) RAY_STAT(h->stats.free_count++);
-        return;
-    }
 
     /* Legacy mmod==2 guard */
     if (v->mmod == 2) return;
@@ -1993,6 +1911,217 @@ void ray_free(ray_t* v) {
                  &owner->foreign, &head, v,
                  memory_order_release, memory_order_relaxed));
     RAY_STAT(h->stats.free_count++);
+}
+
+/* The one-node free: v's owned references through ray_release_owned_refs,
+ * then its block.  Everything except the containers ray_free_walks accepts
+ * comes through here. */
+RAY_INLINE void ray_free_node(ray_t* v) {
+#ifdef DEBUG
+    if (dfd_contains(v)) dfd_report("ray_free (double free)", v);
+#endif
+
+    /* Guard: keep rc=1 while releasing children so buddy coalescing
+     * won't merge this block prematurely (it checks buddy_rc==0). */
+    ray_atomic_store(&v->rc, 1);
+
+    /* A mapped block owning a shared region takes its descriptor now: aux
+     * lives inside the region it describes. */
+    ray_file_map_t* owned_map = (v->mmod == 3) ? v->file_map : NULL;
+
+    /* A mapped string column reaches its own reference through its pool,
+     * which is the cheap path and needs no lock — but only while that
+     * pointer still leads to the mapped pool.  Read it before the children
+     * go, since releasing the pool may be what drops it. */
+    ray_file_map_t* col_map = NULL;
+    if (v->mmod == 1 && v->type == RAY_STR &&
+        v->str_pool && !RAY_IS_ERR(v->str_pool) && v->str_pool->mmod == 3)
+        col_map = v->str_pool->file_map;
+
+    ray_release_owned_refs(v);
+
+    ray_heap_t* h = ray_tl_heap;
+
+    if (owned_map) {
+        ray_file_map_release(owned_map);
+        if (h) RAY_STAT(h->stats.free_count++);
+        return;
+    }
+
+    /* File-mapped: munmap */
+    if (v->mmod == 1) {
+        if (v->type == RAY_TABLE || v->type == RAY_DICT || v->type == RAY_LIST) return;
+        /* A column mapped by the store registered its region and holds one
+         * of its references.  Looking that up by address rather than through
+         * str_pool is the point: a mutated column's pool pointer no longer
+         * leads anywhere useful, while its address is what the region was
+         * registered under.  The descriptor also carries the true mapped
+         * length, so nothing has to re-derive it from a header that the
+         * children release may already have taken away. */
+        /* col_map is the answer whenever the pool pointer still led to the
+         * region, which is every column that was not mutated.  Only one
+         * that had its pool swapped — str_pool_cow deep-copies a mapped
+         * pool before appending — has to ask the registry, and only a
+         * string column was ever registered.  So the lock stays off the
+         * ordinary free entirely, and a mutated column pays it once. */
+        /* A column loaded with an inline index registered its region too
+         * (col.c): the index may have been detached since, and only the
+         * descriptor still knows the mapped length. */
+        ray_file_map_t* m = col_map;
+        if (!m) m = ray_file_map_lookup(v);
+        if (m) {
+            ray_file_map_release(m);
+            if (h) RAY_STAT(h->stats.free_count++);
+            return;
+        }
+        if (v->type > 0 && v->type < RAY_TYPE_COUNT) {
+            uint8_t esz = ray_sym_elem_size(v->type, v->attrs);
+            size_t data_size = 32 + (size_t)v->len * esz;
+            if (v->type == RAY_STR) {
+                size_t pool_len = 0;
+                if (v->str_pool && !RAY_IS_ERR(v->str_pool) && v->str_pool->len > 0)
+                    pool_len = (size_t)v->str_pool->len;
+                data_size += 32 + pool_len;
+            }
+            /* Inline index region: a mmap-resident (passenger) index extends the
+             * mapping past the payload by its 32-aligned inline region.  Derive
+             * that size from the index itself (ray_index_inline_size) rather than
+             * stashing it in aux — str_pool occupies _idx_pad on STR columns, and
+             * the payload size above already accounts for descriptors + pool.
+             * Heap-resident indexes (RAY_MARK_MMAP clear) keep the payload-only
+             * formula. */
+            if ((v->attrs & RAY_ATTR_HAS_INDEX) && v->index && !RAY_IS_ERR(v->index)) {
+                ray_index_t* ix = ray_index_payload(v->index);
+                if (ix->markers & RAY_MARK_MMAP) {
+                    int64_t region_off = ((int64_t)data_size + 31) & ~(int64_t)31;
+                    data_size = (size_t)(region_off + ray_index_inline_size(ix));
+                }
+            }
+            size_t mapped_size = (data_size + 4095) & ~(size_t)4095;
+            ray_vm_unmap_file(v, mapped_size);
+        } else {
+            ray_vm_unmap_file(v, 4096);
+        }
+        if (h) RAY_STAT(h->stats.free_count++);
+        return;
+    }
+
+    ray_free_block(v);
+}
+
+/* --------------------------------------------------------------------------
+ * The free walk: nested containers without C recursion
+ *
+ * Releasing a container drops each child through ray_release, and a child
+ * whose count reaches zero is freed through ray_free, which drops ITS
+ * children — one ray_free / ray_release_owned_refs / ray_release chain of
+ * C frames per level of nesting.  A parse tree a few thousand levels deep
+ * (a nested fn literal built for eval) overflowed an 8 MB stack under
+ * ASan, and a list nested a million deep overflows it in any build.
+ *
+ * The kinds that nest without bound — lists, dicts, tables and lambdas —
+ * are freed by one loop instead.  A dying container is its own stack frame:
+ * to descend into a child the walk parks the parent, writing into the
+ * parent's aux bytes the container to resume after it (slice_parent) and
+ * the next slot to release (slice_offset).  Nothing reads those bytes
+ * again: the parent's count has reached zero so no one else holds it, its
+ * rc stays 1 so a buddy free does not coalesce it, and freeing a heap block
+ * (ray_free_block) reads its order and pool, or a direct block's header,
+ * never its aux.  The walk takes no memory and no stack beyond its own
+ * frame, whatever the depth — nothing to run out of inside a free.
+ *
+ * The order is the recursive one: children in slot order, each subtree
+ * freed whole before the next sibling, a container's block after all of
+ * its children.  Every other kind is still freed per node; a container it
+ * owns (a slice's parent, say) starts a walk of its own, so C frames grow
+ * only where the nesting alternates through such a kind, never along a
+ * chain of containers.
+ * -------------------------------------------------------------------------- */
+
+/* The containers the walk frees.  Heap blocks only: a mapped or borrowed
+ * one keeps the per-node path and its mmod arms.  A slice owns just its
+ * parent, and an index bit sends ray_release_owned_refs down its own arm
+ * first, so both stay per-node too. */
+RAY_INLINE bool ray_free_walks(const ray_t* v) {
+    if (v->type == RAY_LAMBDA) return v->mmod == 0;
+    if (v->type != RAY_LIST && v->type != RAY_DICT && v->type != RAY_TABLE)
+        return false;
+    return v->mmod == 0 && !(v->attrs & (RAY_ATTR_SLICE | RAY_ATTR_HAS_INDEX));
+}
+
+/* How many leading data slots of a walked container are owned references:
+ * the ones ray_release_owned_refs drops for its kind. */
+_Static_assert(LAMBDA_SLOT_CAPQ == LAMBDA_SLOTS - 1 &&
+               LAMBDA_SLOT_CAPROWS == LAMBDA_SLOT_CAPQ - 1 &&
+               LAMBDA_SLOT_NLOCALS < LAMBDA_SLOT_CAPROWS,
+               "the free walk drops lambda slots 0..CAPROWS except NLOCALS, "
+               "the references ray_release_owned_refs drops");
+
+RAY_INLINE int64_t ray_free_walk_width(const ray_t* v) {
+    if (v->type == RAY_LIST)   return v->len;
+    if (v->type == RAY_LAMBDA) return LAMBDA_SLOT_CAPROWS + 1;  /* NLOCALS cleared */
+    return 2;                               /* dict / table: keys, values */
+}
+
+/* Claim v for the walk, as ray_free_node claims a block. */
+RAY_INLINE void ray_free_walk_enter(ray_t* v) {
+#ifdef DEBUG
+    if (dfd_contains(v)) dfd_report("ray_free (double free)", v);
+#endif
+    /* rc=1 while the children go, so buddy coalescing skips the block. */
+    ray_atomic_store(&v->rc, 1);
+    /* A lambda's n_locals slot is not a reference.  The lambda is dying,
+     * so clear it and let the loop take slots 0..CAPROWS as one run. */
+    if (v->type == RAY_LAMBDA) ((ray_t**)ray_data(v))[LAMBDA_SLOT_NLOCALS] = NULL;
+}
+
+static void ray_free_walk(ray_t* v) {
+    ray_t*  up = NULL;   /* parked container to resume once v is done */
+    int64_t i  = 0;      /* v's next slot to release */
+    ray_free_walk_enter(v);
+    for (;;) {
+        ray_t** slots = (ray_t**)ray_data(v);
+        int64_t n     = ray_free_walk_width(v);
+        ray_t*  down  = NULL;
+        while (i < n) {
+            ray_t* c = slots[i++];
+            if (!ray_release_last(c)) continue;
+            if (!ray_free_walks(c)) { ray_free_node(c); continue; }
+            /* A container with no slots has nothing to park the walk for. */
+            if (ray_free_walk_width(c) == 0) {
+                ray_free_walk_enter(c);
+                ray_free_block(c);
+                continue;
+            }
+            down = c;
+            break;
+        }
+        if (down) {
+            v->slice_parent = up;
+            v->slice_offset = i;
+            up = v;
+            v  = down;
+            i  = 0;
+            ray_free_walk_enter(v);
+            continue;
+        }
+        ray_free_block(v);
+        if (!up) return;
+        v  = up;
+        up = v->slice_parent;
+        i  = v->slice_offset;
+    }
+}
+
+void ray_free_last_ref(ray_t* v) {
+    if (ray_free_walks(v)) ray_free_walk(v);
+    else                   ray_free_node(v);
+}
+
+void ray_free(ray_t* v) {
+    if (!v || RAY_IS_ERR(v)) return;
+    if (v->attrs & RAY_ATTR_ARENA) return;  /* arena-owned, bulk-freed */
+    ray_free_last_ref(v);
 }
 
 /* --------------------------------------------------------------------------
