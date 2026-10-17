@@ -104,6 +104,28 @@ static struct {
     int32_t count;
 } g_env;
 
+/* Every name ever given a slot in g_env, as a one-hash Bloom filter.
+ * A dotted read (`d.k`) first looks the whole name up flat, and only the
+ * reserved builtins (`.sys.gc`, `.os.getenv`, ...) have dotted slots, so
+ * that lookup nearly always misses, and a miss scans every slot.  A clear
+ * bit answers it at once.  Bits are set under env_lock before the slot is
+ * published and only cleared by ray_env_init: a clear bit proves the name
+ * has no slot, and a collision only costs the scan.  Plain names keep the
+ * scan, which their hint makes rare. */
+#define ENV_SLOT_FILTER_BITS 15
+static _Atomic uint64_t g_env_slot_filter[(1 << ENV_SLOT_FILTER_BITS) / 64];
+static inline uint32_t env_slot_filter_bit(int64_t sym_id) {
+    return (uint32_t)(((uint64_t)sym_id * UINT64_C(0x9E3779B97F4A7C15)) >> (64 - ENV_SLOT_FILTER_BITS));
+}
+static inline void env_slot_filter_add(int64_t sym_id) {
+    uint32_t b = env_slot_filter_bit(sym_id);
+    atomic_fetch_or_explicit(&g_env_slot_filter[b / 64], UINT64_C(1) << (b % 64), memory_order_release);
+}
+static inline bool env_slot_filter_may_have(int64_t sym_id) {
+    uint32_t b = env_slot_filter_bit(sym_id);
+    return (atomic_load_explicit(&g_env_slot_filter[b / 64], memory_order_acquire) >> (b % 64)) & 1;
+}
+
 /* What a name compiled code resolves stays the same while neither moves:
  * the frame epoch (this thread's scope frames: a push, a pop, a binding,
  * a frame's kind or flags) and the global epoch (any global written).
@@ -387,6 +409,8 @@ int64_t ray_sym_ipc_hook(int idx) {
 ray_err_t ray_env_init(void) {
     env_globals_moved();
     memset(&g_env, 0, sizeof(g_env));
+    for (size_t i = 0; i < sizeof(g_env_slot_filter) / sizeof(g_env_slot_filter[0]); i++)
+        atomic_store_explicit(&g_env_slot_filter[i], 0, memory_order_relaxed);
     __VM->scope_depth = 0;
     /* The IPC hook sym IDs are interned lazily on first probe via
      * `ipc_hook_syms_ensure`.  We deliberately do NOT pre-intern here:
@@ -458,6 +482,7 @@ static ray_t* env_global_lookup(int64_t sym_id) {
     int32_t i = hint[h].idx;
     int32_t n = g_env.count;
     if (hint[h].sym == sym_id && i < n && g_env.keys[i] == sym_id) return g_env.vals[i];
+    if (ray_sym_is_dotted(sym_id) && !env_slot_filter_may_have(sym_id)) return NULL;
     for (i = 0; i < n; i++) {
         if (g_env.keys[i] != sym_id) continue;
         hint[h].sym = sym_id;
@@ -762,6 +787,7 @@ static ray_err_t env_bind_global_impl(int64_t sym_id, ray_t* val, int is_user) {
         env_unlock();
         return RAY_ERR_OOM;
     }
+    env_slot_filter_add(sym_id);
     g_env.keys[g_env.count] = sym_id;
     ray_retain(val);
     g_env.vals[g_env.count] = val;
