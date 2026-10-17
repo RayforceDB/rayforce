@@ -411,6 +411,83 @@
 (at RPw 's) -- (at RFw 's)
 (at RPw 'b) -- (at RFw 'b)
 
+;; ══════════════════════════════════════════════════════════════════════════
+;; (i) EVAL-LEVEL GROUPING OVER EVERY TABLE KIND (#766) — an output that is no
+;;     plain aggregate (a literal, a row expression) sends a multi-key by: to
+;;     the composite grouping (h); a STR / GUID / LIST key goes to the
+;;     single-key eval grouping, which took no flattened copy of a parted
+;;     table: `group: argument must be a vector or list` without a where:.
+;;     A by-dict key is a column under its alias, which no clause names: the
+;;     flattened copy left it out (`group key column not found`).  A LIST key
+;;     in a composite key raised `vec_new ... got LIST` building the key
+;;     column, in the composite path and in its count-only take: block.
+;;     Oracle: the same select over an in-memory copy (Ia for the splayed
+;;     table, I2 for the two partitions).
+;; ══════════════════════════════════════════════════════════════════════════
+(.sys.exec "rm -rf /tmp/rfl_pgwh_766")
+(set Ia (table [s g k v st gu l] (list (as 'SYM (at ['aa 'bb 'cc] (% (til 24) 3))) (% (til 24) 4) (til 24) (% (* 7 (til 24)) 10) (at (list "x" "yy") (% (til 24) 2)) (at (guid 2) (% (til 24) 2)) (at (list [1 2] [3]) (% (til 24) 2)))))
+(.db.splayed.set "/tmp/rfl_pgwh_766/sp/" Ia)
+(.db.splayed.set "/tmp/rfl_pgwh_766/pt/2024.01.01/t/" Ia)
+(.db.splayed.set "/tmp/rfl_pgwh_766/pt/2024.01.02/t/" Ia)
+(set Sa (.db.splayed.get "/tmp/rfl_pgwh_766/sp/"))
+(set Pa (.db.parted.get "/tmp/rfl_pgwh_766/pt/" 't))
+(set I2 (concat Ia Ia))
+;; the issue's shapes: a literal or a row expression beside a SYM key
+(at (select {one: 1 c: (count k) from: Sa by: [s g]}) 's) -- [aa bb cc aa bb cc aa bb cc aa bb cc]
+(select {one: 1 c: (count k) from: Sa by: [s g]}) -- (select {one: 1 c: (count k) from: Ia by: [s g]})
+(select {one: 1 c: (count k) from: Pa by: [s g]}) -- (select {one: 1 c: (count k) from: I2 by: [s g]})
+(select {x: (+ g 1) c: (count k) from: Sa by: [g s]}) -- (select {x: (+ g 1) c: (count k) from: Ia by: [g s]})
+(select {x: (+ g 1) c: (count k) from: Pa by: [g s]}) -- (select {x: (+ g 1) c: (count k) from: I2 by: [g s]})
+(select {one: 1 c: (count k) from: Pa where: (> v 3) by: [s g]}) -- (select {one: 1 c: (count k) from: I2 where: (> v 3) by: [s g]})
+(select {c: (count (distinct v)) from: Sa where: (> v 3) by: [g s] take: 3}) -- (select {c: (count (distinct v)) from: Ia where: (> v 3) by: [g s] take: 3})
+(select {c: (count (distinct v)) from: Pa where: (> v 3) by: [g s] take: 3}) -- (select {c: (count (distinct v)) from: I2 where: (> v 3) by: [g s] take: 3})
+(select {c: (count (distinct v)) from: Pa by: [g s] take: 3}) -- (select {c: (count (distinct v)) from: I2 by: [g s] take: 3})
+(set RIa (select {from: Pa where: (> v 3) by: [g s] desc: k}))
+(set RIb (select {from: I2 where: (> v 3) by: [g s] desc: k}))
+(at RIa 's) -- (at RIb 's)
+(at RIa 'k) -- (at RIb 'k)
+;; single-key eval grouping: STR, GUID and LIST keys
+(select {x: s from: Sa by: st}) -- (select {x: s from: Ia by: st})
+(select {x: s from: Pa by: st}) -- (select {x: s from: I2 by: st})
+(select {x: (+ g 1) from: Pa by: gu}) -- (select {x: (+ g 1) from: I2 by: gu})
+(select {x: s from: Pa by: l}) -- (select {x: s from: I2 by: l})
+(select {c: (count k) from: Pa by: l}) -- (select {c: (count k) from: I2 by: l})
+;; by-dict keys under their aliases
+(select {x: k from: Pa by: {a: s b: g}}) -- (select {x: k from: I2 by: {a: s b: g}})
+(select {x: k from: Pa by: {a: s b: (% k 3)}}) -- (select {x: k from: I2 by: {a: s b: (% k 3)}})
+(select {x: s from: Pa by: {a: st}}) -- (select {x: s from: I2 by: {a: st}})
+;; the flattened copy takes the aliases, not the by-dict's source columns,
+;; unless an output reads one
+(select {x: s from: Pa by: {a: st b: (% k 3)}}) -- (select {x: s from: I2 by: {a: st b: (% k 3)}})
+(select {x: st y: k from: Pa by: {a: st b: g}}) -- (select {x: st y: k from: I2 by: {a: st b: g}})
+;; a by-dict value reading an earlier alias: the alias column is flat, so
+;; the value is evaluated over flat columns (over the parted table each
+;; partition paired with the alias read again from row 0); a plain aggregate
+;; beside it raised `schema: column 'a' not found`
+(set mkd (fn [n o] (table [s g k v] (list (as 'SYM (at ['aa 'bb 'cc] (% (+ o (til n)) 3))) (% (+ o (til n)) 4) (+ (* 100 o) (til n)) (% (* 7 (+ o (til n))) 10)))))
+(.db.splayed.set "/tmp/rfl_pgwh_766/pd/2024.01.01/t/" (mkd 7 0))
+(.db.splayed.set "/tmp/rfl_pgwh_766/pd/2024.01.02/t/" (mkd 5 1))
+(.db.splayed.set "/tmp/rfl_pgwh_766/pd/2024.01.03/t/" (mkd 6 2))
+(set Pd (.db.parted.get "/tmp/rfl_pgwh_766/pd/" 't))
+(set Id (concat (concat (mkd 7 0) (mkd 5 1)) (mkd 6 2)))
+(take (at (select {x: s from: Pd by: {a: (+ g 1) b: (* a k)}}) 'b) 9) -- [0 2 6 12 4 10 18 200 303]
+(select {x: s from: Pd by: {a: (+ g 1) b: (* a k)}}) -- (select {x: s from: Id by: {a: (+ g 1) b: (* a k)}})
+(select {c: (count (distinct v)) from: Pd by: {a: (+ g 1) b: (* a k)}}) -- (select {c: (count (distinct v)) from: Id by: {a: (+ g 1) b: (* a k)}})
+(select {c: (sum v) from: Pd by: {a: (+ g 1) b: (* a k)}}) -- (select {c: (sum v) from: Id by: {a: (+ g 1) b: (* a k)}})
+(select {c: (sum v) from: Pd where: (> v 2) by: {a: (+ g 1) b: (* a k)}}) -- (select {c: (sum v) from: Id where: (> v 2) by: {a: (+ g 1) b: (* a k)}})
+(select {x: s from: Pd by: {a: g b: (* a k)}}) -- (select {x: s from: Id by: {a: g b: (* a k)}})
+;; the alias read as a free name in a helper's body
+(set hbd (fn [y] (* y a)))
+(take (at (select {x: s from: Pd by: {a: (+ g 1) b: (hbd k)}}) 'b) 9) -- [0 2 6 12 4 10 18 200 303]
+(select {x: s from: Pd by: {a: (+ g 1) b: (hbd k)}}) -- (select {x: s from: Id by: {a: (+ g 1) b: (hbd k)}})
+(select {c: (sum v) from: Pd by: {a: (+ g 1) b: (hbd k)}}) -- (select {c: (sum v) from: Id by: {a: (+ g 1) b: (hbd k)}})
+;; a LIST key beside another in the composite grouping
+(select {c: (count k) one: 1 from: Ia by: [l s]}) -- (table [l s c one] (list (list [1 2] [3] [1 2] [3] [1 2] [3]) [aa bb cc aa bb cc] [4 4 4 4 4 4] [1 1 1 1 1 1]))
+(select {c: (count k) from: Pa by: [l s]}) -- (select {c: (count k) from: I2 by: [l s]})
+(select {x: k from: Sa by: [l s]}) -- (select {x: k from: Ia by: [l s]})
+(select {c: (count k) from: Pa by: [l s] take: 2}) -- (select {c: (count k) from: I2 by: [l s] take: 2})
+(select {x: k from: Pa by: [l s] take: 2}) -- (select {x: k from: I2 by: [l s] take: 2})
+
 ;; ─── cleanup ─────────────────────────────────────────────────────────────────
 (.sys.exec "rm -rf /tmp/rfl_pgwh")
-(.sys.exec "rm -rf /tmp/rfl_pgwh_str /tmp/rfl_pgwh_lst /tmp/rfl_pgwh_cmp")
+(.sys.exec "rm -rf /tmp/rfl_pgwh_str /tmp/rfl_pgwh_lst /tmp/rfl_pgwh_cmp /tmp/rfl_pgwh_766")
