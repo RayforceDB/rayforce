@@ -1,0 +1,43 @@
+;; @requires: posix  (fixtures/checks run through a POSIX shell via .sys.exec)
+;; STR encodings end to end (compressed-columns P6): generation-2 answers
+;; equal generation 0 for STR_DICT, FSST, RAW and CONST columns.
+(.sys.exec "rm -rf /tmp/rf_test_p6str")
+(set n 140000)
+(set i (til n))
+(set low (as 'STR (map (fn [j] (if (== 0 (% j 11)) "" (format "category % long" (% j 37)))) i)))
+(set url (as 'STR (map (fn [j] (format "https://www.example.com/path/%/item?id=%" (% j 4999) (% (* j 7919) 100003))) i)))
+(set zam (as 'STR (at ["z" "a" "m"] (% i 3))))
+(set T (table [low url zam v] (list low url zam i)))
+(.db.splayed.set "/tmp/rf_test_p6str/g0/" T {compress: false})
+(.db.splayed.set "/tmp/rf_test_p6str/g2/" T {compress: true})
+(set A (.db.splayed.get "/tmp/rf_test_p6str/g0/"))
+(set C (.db.splayed.get "/tmp/rf_test_p6str/g2/"))
+(at (.idx.info C 'low) 'gen) -- 2
+(at (.idx.info A 'low) 'gen) -- 0
+(at (at (.idx.info C 'low) 'enc) 'str_dict) -- 137
+(at (at (.idx.info C 'url) 'enc) 'fsst) -- 137
+(at (at (.idx.info C 'zam) 'enc) 'str_dict) -- 137
+(count (select {from: C where: (== low "category 3 long")})) -- (count (select {from: A where: (== low "category 3 long")}))
+(count (select {from: C where: (!= low "")})) -- (count (select {from: A where: (!= low "")}))
+(count (select {from: C where: (== url "https://www.example.com/path/7/item?id=55433")})) -- (count (select {from: A where: (== url "https://www.example.com/path/7/item?id=55433")}))
+(select {c: (count v) from: C by: zam asc: zam}) -- (select {c: (count v) from: A by: zam asc: zam})
+;; group keys on codes: first-occurrence order and counts, alone and composite
+(select {c: (count v) from: C by: low}) -- (select {c: (count v) from: A by: low})
+(select {c: (count v) from: C by: {low: low z: zam} asc: [low z]}) -- (select {c: (count v) from: A by: {low: low z: zam} asc: [low z]})
+(select {c: (count v) from: C where: (!= low "") by: zam}) -- (select {c: (count v) from: A where: (!= low "") by: zam})
+(count (select {c: (count v) from: C by: url})) -- (count (select {c: (count v) from: A by: url}))
+;; code order is not lexical order: ranges, like, min / max and top-k decode
+(count (select {from: C where: (< zam "m")})) -- (count (select {from: A where: (< zam "m")}))
+(count (select {from: C where: (<= zam "m")})) -- (count (select {from: A where: (<= zam "m")}))
+(count (select {from: C where: (> zam "a")})) -- (count (select {from: A where: (> zam "a")}))
+(count (select {from: C where: (>= zam "m")})) -- (count (select {from: A where: (>= zam "m")}))
+(count (select {from: C where: (like url "*path/12/*")})) -- (count (select {from: A where: (like url "*path/12/*")}))
+(min (at C 'zam)) -- (min (at A 'zam))
+(max (at C 'low)) -- (max (at A 'low))
+(at (select {z: zam from: C asc: zam take: 3}) 'z) -- (at (select {z: zam from: A asc: zam take: 3}) 'z)
+(at C 'url) -- (at A 'url)
+;; the file's last group-by is generation 2's: a generation-0 DICT group-by
+;; leaves its code stash behind, which the next test's group-by frees after
+;; the heap is gone (#865)
+(count (select {c: (count v) from: A by: zam})) -- (count (select {c: (count v) from: C by: zam}))
+(.sys.exec "rm -rf /tmp/rf_test_p6str") -- 0

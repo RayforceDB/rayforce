@@ -23,6 +23,8 @@
 
 #include "ops/strdom.h"
 #include "ops/rowsel.h"
+#include "store/enccol.h"
+#include "store/encfmt.h"
 #include "vec/str.h"
 
 #include <stdint.h>
@@ -110,9 +112,14 @@ static ray_t* sd_intern(ray_strdom_t* d, const char* p, uint32_t n, uint64_t h, 
     return NULL;
 }
 
-/* One build: the domain, the source's cursor, the destination parts and
- * the last string interned (consecutive rows repeat one often: a CONST
- * vector is one). */
+/* One build: the domain, the source's cursor, the destination parts, the
+ * last string interned (consecutive rows repeat one often: a CONST vector
+ * is one) and the source's segments (a parted source's, else the source
+ * itself as one).  A segment that is a single-file encoded column (not
+ * synthetic, not materialized) with a STR_DICT entry reads its STR_DICT
+ * vectors as views: each code maps to its id through the segment's remap,
+ * filled on the code's first occurrence among the rows read.  Codes are
+ * segment-local: a remap lives while its segment is read. */
 typedef struct {
     ray_strdom_t*     d;
     ray_col_cursor_t  cur;
@@ -123,6 +130,16 @@ typedef struct {
     const char*       lp;
     uint32_t          ln;
     int64_t           lid;
+    int64_t           n_segs;
+    ray_t* const*     segv;     /* borrowed */
+    const int64_t*    seg_off;  /* n_segs + 1 */
+    int64_t           sg;       /* the current segment, -1 before the first */
+    ray_enccol_t*     se;       /* its codes column (with a STR_DICT entry), else NULL */
+    const ray_enc_sdict_t* sdict;
+    int64_t*          remap;    /* sdict->n ids, -1 unseen; allocated on first use */
+    ray_enc_vview_t*  vv;       /* the build's view (on the builder's stack) */
+    int64_t           vv_at;    /* the segment-local vector vv describes, -1 none */
+    bool              vv_codes; /* vv_at is a STR_DICT view (else read by range) */
 } sd_build_t;
 
 /* Row r's id slot; r moves forward, or back inside a morsel (its
@@ -133,12 +150,99 @@ static inline int64_t* sd_slot(sd_build_t* b, int64_t r) {
     return &b->part_dst[b->p][r - b->part_off[b->p]];
 }
 
+/* A segment's codes column: single-file encoded, not synthetic, without a
+ * published materialization (read by range otherwise). */
+static ray_enccol_t* sd_codes_col(ray_t* o) {
+    if (!o || o->type != RAY_ENCCOL || ray_enccol_decoded_peek(o)) return NULL;
+    ray_enccol_t* e = ray_enccol_of(o);
+    return e && e->kind == RAY_ENCCOL_SINGLE && !e->synthetic ? e : NULL;
+}
+
+/* Make the segment holding row r current: a new segment drops the last
+ * one's remap and view and looks up its own dictionary. */
+static ray_t* sd_seg(sd_build_t* b, int64_t r) {
+    int64_t s = b->sg < 0 ? 0 : b->sg;
+    while (s > 0 && r < b->seg_off[s]) s--;
+    while (s + 1 < b->n_segs && r >= b->seg_off[s + 1]) s++;
+    if (s == b->sg) return NULL;
+    ray_free_raw(b->remap);
+    b->remap = NULL; b->se = NULL; b->sdict = NULL; b->vv_at = -1; b->sg = s;
+    ray_enccol_t* e = sd_codes_col(b->segv[s]);
+    if (!e) return NULL;
+    const ray_enc_sdict_t* sd = NULL;
+    ray_t* err = ray_enccol_strdict(e, &sd);
+    if (err) return err;
+    if (sd) { b->se = e; b->sdict = sd; }
+    return NULL;
+}
+
+/* Is segment-local vector v of the current segment a STR_DICT view (vv)?
+ * 1 yes, 0 no (read it by range: another encoding, or a declined view,
+ * which the range read decodes or reports), -1 an owned *err. */
+static int sd_view(sd_build_t* b, int64_t v, int64_t vrows, ray_t** err) {
+    if (b->vv_at == v) return b->vv_codes;
+    b->vv_at = -1;
+    const ray_enc_desc_t* d;
+    if ((*err = ray_enccol_chunk_descs_ref(b->se, v / RAY_ENC_VECS_PER_CHUNK, &d)) != NULL) return -1;
+    int got = 0;
+    if (d[v % RAY_ENC_VECS_PER_CHUNK].encoding == RAY_ENC_STR_DICT) {
+        got = ray_enccol_vview(b->se, v, b->vv, err);
+        if (got < 0) return -1;
+        if (got > 0 && b->vv->enc != RAY_ENC_STR_DICT) got = 0;
+        if (got > 0 && (b->vv->n != vrows || b->vv->dict_n != b->sdict->n)) {
+            *err = ray_error("corrupt", "column %s: string domain: vector %lld holds %d rows of %u entries",
+                             b->se->path, (long long)v, b->vv->n, b->vv->dict_n);
+            return -1;
+        }
+        if (got > 0 && !b->remap) {
+            b->remap = (int64_t*)ray_alloc_raw((size_t)(b->sdict->n ? b->sdict->n : 1) * sizeof(int64_t));
+            if (!b->remap) { *err = ray_error("oom", NULL); return -1; }
+            for (uint32_t k = 0; k < b->sdict->n; k++) b->remap[k] = -1;
+        }
+    }
+    b->vv_at = v; b->vv_codes = got > 0;
+    return b->vv_codes;
+}
+
 /* Intern rows [lo, hi) (idx NULL) or rows lo + idx[0..n_idx) (ascending). */
 static ray_t* sd_rows(sd_build_t* b, int64_t lo, int64_t hi, const uint16_t* idx, int64_t n_idx) {
     int64_t j = 0;
     for (int64_t r = idx ? lo + idx[0] : lo; idx ? j < n_idx : r < hi; ) {
+        ray_t* err = b->segv ? sd_seg(b, r) : NULL;
+        if (err) return err;
+        if (b->se) {
+            const int64_t base = b->seg_off[b->sg], v = (r - base) / RAY_ENC_VEC;
+            int64_t vend = base + (v + 1) * RAY_ENC_VEC;
+            if (vend > b->seg_off[b->sg + 1]) vend = b->seg_off[b->sg + 1];
+            const int got = sd_view(b, v, vend - base - v * RAY_ENC_VEC, &err);
+            if (got < 0) return err;
+            if (got) {
+                /* codes through the segment's remap: every row of the
+                 * vector read (without idx) or the selected ones */
+                const int64_t v0 = base + v * RAY_ENC_VEC;
+                const uint32_t* cd = b->vv->codes;
+                const ray_enc_sdict_t* sd = b->sdict;
+                for (; r < vend; ) {
+                    const uint32_t k = cd[r - v0];
+                    int64_t id = b->remap[k];
+                    if (id < 0) {
+                        const char* p; uint32_t n;
+                        ray_enc_sdict_entry(sd, k, &p, &n);
+                        err = sd_intern(b->d, p, n, ray_str_bytes_hash(p, n), &id);
+                        if (err) return err;
+                        b->remap[k] = id;
+                        /* the arena may have moved: the last string is this one */
+                        b->lid = id; b->ln = n; b->lp = b->d->arena + b->d->ent[id].off;
+                    }
+                    *sd_slot(b, r) = id;
+                    if (idx) { if (++j >= n_idx) return NULL; r = lo + idx[j]; }
+                    else if (++r >= hi) return NULL;
+                }
+                continue;
+            }
+        }
         const ray_col_range_t* v;
-        ray_t* err = ray_col_cursor_at(&b->cur, r, &v);
+        err = ray_col_cursor_at(&b->cur, r, &v);
         if (err) return err;
         const ray_str_t* s = (const ray_str_t*)v->data;
         int64_t vend = v->start + v->n;
@@ -177,6 +281,20 @@ ray_t* ray_strdom_build_parts(ray_col_src_t* src, ray_t* sel, int64_t n_parts, c
     ray_t* err = sd_rehash(b.d, 1024);
     if (err) { ray_strdom_free(b.d); return err; }
     b.n_parts = n_parts; b.part_off = part_off; b.part_dst = part_dst; b.lid = -1;
+    /* the segments: a parted source's, else the source as one */
+    ray_enc_vview_t vv;                 /* about 21 KB: on the stack (P3 rule) */
+    int64_t one_off[2] = { 0, len };
+    b.vv = &vv; b.sg = -1; b.vv_at = -1;
+    if (src->parted) {
+        ray_t** segs = NULL; const int64_t* off = NULL; int64_t ns = 0;
+        if (!ray_col_src_parted_segs(src, &ns, &segs, &off, &err)) {
+            ray_strdom_free(b.d);
+            return err ? err : ray_error("type", "string domain: parted source without segments");
+        }
+        if (ns > 0 && off[ns] == len) { b.n_segs = ns; b.segv = segs; b.seg_off = off; }
+    } else if (len > 0) {
+        b.n_segs = 1; b.segv = &src->obj; b.seg_off = one_off;
+    }
     /* Serial, each vector read decoded once into a stack vector: the
      * interning is the walk's shared state. */
     ray_col_fixed_t fixed;
@@ -201,6 +319,7 @@ ray_t* ray_strdom_build_parts(ray_col_src_t* src, ray_t* sel, int64_t n_parts, c
         }
     }
     ray_col_cursor_free(&b.cur);
+    ray_free_raw(b.remap);
     if (err) { ray_strdom_free(b.d); return err; }
     *dom_out = b.d;
     return NULL;

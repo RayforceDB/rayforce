@@ -1755,7 +1755,7 @@ static ray_t* str_sel_run(ray_graph_t* g, ray_op_t* pred, int64_t nrows, ray_t* 
     str_seg_sel_t one;
     ray_t* ret = NULL;
     bool any_codes = false;
-    ray_t* cn = ray_sym_str(le->sym);                      /* owned: released at out */
+    ray_t* cn = ray_sym_str(le->sym);                      /* arena-owned: the release at out is a no-op */
     x.cname = cn && !RAY_IS_ERR(cn) ? ray_str_ptr(cn) : "?";
     x.cname_len = cn && !RAY_IS_ERR(cn) ? (int)ray_str_len(cn) : 1;
     ray_scan_fail_t fail; ray_scan_fail_init(&fail);

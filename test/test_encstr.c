@@ -1662,6 +1662,174 @@ static test_result_t test_filter_forged(void) {
     PASS();
 }
 
+/* ---- Task 6: group-by on dictionary codes, cross-segment translation ---- */
+
+/* Rewrite column `col` (the column of W) of the table saved at ST_TMP `rel`
+ * chunk by chunk through the writer, chunk c's STR vectors forced to
+ * forces[c] (-1: selection), into the live generation's file (same type,
+ * name and length as the file it replaces). */
+static test_result_t st_rewrite(const char* rel, const char* col, int64_t n_chunks, const int* forces) {
+    char path[600], tmp[620];
+    TEST_ASSERT_TRUE(st_live(rel, col, path, sizeof path));
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    char q[64]; snprintf(q, sizeof q, "(at W '%s)", col);
+    ray_t* w = st_hold(ray_eval_str(q));
+    TEST_ASSERT_TRUE(w && !RAY_IS_ERR(w) && w->type == RAY_STR);
+    const int64_t n = w->len;
+    TEST_ASSERT_TRUE(n > (n_chunks - 1) * RAY_ENC_CHUNK && n <= n_chunks * RAY_ENC_CHUNK);
+    FILE* f = fopen(tmp, "wb+");
+    TEST_ASSERT_TRUE(f != NULL);
+    ray_encw_t ew;
+    ray_err_t rc = ray_encw_begin(&ew, f, RAY_STR, 0, n, 0, 0, 0);
+    const char* pool = w->str_pool ? (const char*)ray_data(w->str_pool) : NULL;
+    for (int64_t c = 0; rc == RAY_OK && c < n_chunks; c++) {
+        const int64_t m = n - c * RAY_ENC_CHUNK < RAY_ENC_CHUNK ? n - c * RAY_ENC_CHUNK : RAY_ENC_CHUNK;
+        ray_encw_test_force_str(forces[c]);
+        rc = ray_encw_chunk(&ew, (const ray_str_t*)ray_data(w) + c * RAY_ENC_CHUNK, pool, m);
+    }
+    ray_encw_test_force_str(-1);
+    if (rc == RAY_OK) rc = ray_encw_finish(&ew);
+    ray_encw_free(&ew); fclose(f);
+    TEST_ASSERT_EQ_I(rc, RAY_OK);
+    TEST_ASSERT_EQ_I(rename(tmp, path), 0);
+    st_unhold(w, NULL); ray_release(w);
+    PASS();
+}
+#define ST_REWRITE(rel, col, nc, forces) do { test_result_t r_ = st_rewrite((rel), (col), (nc), (forces)); \
+    if (r_.status != TEST_PASS) return r_; } while (0)
+
+/* Review focus 7: one hash.  Chunk 0 RAW (the cursor path hashes each
+ * ray_str_t), chunk 1 STR_DICT (the remap hashes each entry's bytes), the
+ * same three long strings in both: three groups, as generation 0. */
+static test_result_t test_remap_hash_parity(void) {
+    ST_SAVE2("hp", "(table [s v m] (list (as 'STR (at [\"first long string value\" \"second long string value\" "
+                   "\"third long string value\"] (% (til 131072) 3))) (til 131072) (as 'U8 (% (til 131072) 2))))");
+    static const int forces[2] = { RAY_ENC_RAW, RAY_ENC_STR_DICT };
+    ST_REWRITE("/hp2", "s", 2, forces);
+    char p[600]; TEST_ASSERT_TRUE(st_live("/hp2", "s", p, sizeof p));
+    TEST_ASSERT_EQ_I(st_desc_enc(p, 0, NULL), RAY_ENC_RAW);
+    TEST_ASSERT_EQ_I(st_desc_enc(p, 64, NULL), RAY_ENC_STR_DICT);
+    st_fk_t k;
+    ST_Q_OK("(set T (.db.splayed.get \"" ST_TMP "/hp2/\"))");
+    ST_Q_TRUE("(== 3 (count (select {c: (count v) from: T by: s})))");
+    ST_SAME("hp", "(select {c: (count v) from: T by: s})", &k);
+    TEST_ASSERT_EQ_U(k.mat, 0);
+    ST_SAME("hp", "(select {c: (count v) from: T by: {s: s m: m}})", &k);
+    TEST_ASSERT_EQ_U(k.mat, 0);
+    PASS();
+}
+
+/* Review focus 3: partitions with conflicting codes.  Partition 1 meets
+ * "red" first, partition 2 "blue": the same string has different codes,
+ * the same code different strings. */
+static test_result_t test_cross_segment_codes(void) {
+    static const char* const parts[2] = {
+        "(table [s v m] (list (as 'STR (at [\"red long value\" \"blue long value\" \"green\"] (% (til 70000) 3))) (til 70000) (as 'U8 (% (til 70000) 2))))",
+        "(table [s v m] (list (as 'STR (at [\"blue long value\" \"red long value\" \"amber\"] (% (til 70000) 3))) (til 70000) (as 'U8 (% (til 70000) 2))))",
+    };
+    for (int g = 0; g <= 2; g += 2)
+        for (int p = 0; p < 2; p++) {
+            char q[1200];
+            snprintf(q, sizeof q, "(.db.splayed.set \"" ST_TMP "/cs%d/2024.01.0%d/t/\" %s {compress: %s})",
+                     g, p + 1, parts[p], g ? "true" : "false");
+            ST_Q_OK_N(q);
+        }
+    for (int p = 0; p < 2; p++) {
+        char rel[64], f[600];
+        snprintf(rel, sizeof rel, "/cs2/2024.01.0%d/t", p + 1);
+        TEST_ASSERT_TRUE(st_live(rel, "s", f, sizeof f));
+        TEST_ASSERT_EQ_I(st_desc_enc(f, 0, NULL), RAY_ENC_STR_DICT);
+        TEST_ASSERT_EQ_I(st_desc_enc(f, 64, NULL), RAY_ENC_STR_DICT);
+    }
+    /* `codes`: every vector read is a STR_DICT vector and only s is read
+     * by range, so nothing is decoded (the remap reads codes) */
+    static const struct { const char* q; bool codes; } qs[] = {
+        { "(count (select {from: T where: (== s \"red long value\")}))", true },
+        { "(count (select {from: T where: (!= s \"blue long value\")}))", true },
+        { "(select {v: v from: T where: (== s \"amber\") take: 5})", false },
+        { "(select {c: (count v) from: T by: s})", true },
+        { "(select {c: (count v) from: T by: s asc: s})", true },
+        { "(select {c: (count v) from: T by: {s: s m: m} asc: [s m]})", false },
+        /* under a selection: ids first-occurrence over the selected rows */
+        { "(select {c: (count v) from: T where: (!= s \"red long value\") by: s})", false },
+        { "(select {c: (count v) from: T where: (== s \"blue long value\") by: s})", false },
+        { "(select {c: (count v) from: T where: (> v 69990) by: s})", false },
+        { "(select {c: (count v) s: (sum v) from: T where: (and (> v 1000) (!= s \"green\")) by: s})", false },
+    };
+    for (size_t i = 0; i < sizeof qs / sizeof *qs; i++) {
+        st_fk_t k;
+        ST_SAME_P("cs", qs[i].q, &k);
+        TEST_ASSERT_FMT(k.mat == 0, "%s: %llu materializations", qs[i].q, (unsigned long long)k.mat);
+        if (qs[i].codes) TEST_ASSERT_FMT(k.dec == 0, "%s: %llu bytes decoded", qs[i].q, (unsigned long long)k.dec);
+    }
+    /* a computed second key materializes v (its path binds the referenced
+     * columns, any generation-2 type); the STR key stays codes */
+    ST_SAME_P("cs", "(select {c: (count v) from: T by: {s: s r: (% v 2)} asc: [s r]})", NULL);
+    ST_Q_TRUE("(not (at (.idx.info T 's) 'materialized))");
+    PASS();
+}
+
+/* Group-by under a STR_DICT filter on a column shorter than
+ * RAY_DICT_MIN_ROWS: the ids are first-occurrence over the selected rows
+ * (generation 0 groups such a column as STR, in that order). */
+static test_result_t test_groupby_selection(void) {
+    ST_SAVE2("gs", "(table [s v m] (list (as 'STR (map (fn [j] (if (== 0 (% j 13)) \"\" "
+                   "(format \"group key % long text\" (% (* j 7) 23)))) (til 40000))) (til 40000) (as 'U8 (% (til 40000) 4))))");
+    char p[600]; TEST_ASSERT_TRUE(st_live("/gs2", "s", p, sizeof p));
+    TEST_ASSERT_EQ_I(st_desc_enc(p, 1, NULL), RAY_ENC_STR_DICT);
+    static const char* const qs[] = {
+        "(select {c: (count v) from: T by: s})",
+        "(select {c: (count v) from: T where: (!= s \"\") by: s})",
+        "(select {c: (count v) from: T where: (!= s \"group key 0 long text\") by: s})",
+        "(select {c: (count v) from: T where: (== s \"group key 5 long text\") by: s})",
+        "(select {c: (count v) from: T where: (> v 39000) by: s})",
+        "(select {c: (count v) from: T where: (and (> v 20000) (!= s \"\")) by: {s: s m: m}})",
+    };
+    for (size_t i = 0; i < sizeof qs / sizeof *qs; i++) {
+        st_fk_t k;
+        ST_SAME("gs", qs[i], &k);
+        TEST_ASSERT_FMT(k.mat == 0, "%s: %llu materializations", qs[i], (unsigned long long)k.mat);
+        if (i == 0) TEST_ASSERT_FMT(k.dec == 0, "%s: %llu bytes decoded", qs[i], (unsigned long long)k.dec);
+    }
+    PASS();
+}
+
+/* Spec "Mixed STR group-by": one unparted column mixing STR_DICT, FSST,
+ * CONST and RAW at chunk boundaries, equal strings crossing every
+ * boundary, alone and inside a composite key. */
+static test_result_t test_mixed_str_groupby(void) {
+    /* rows 131072..132095 (vector 128) are all equal: CONST by selection;
+     * the URLs are near-distinct, so unforced chunk 2 is a plain chunk */
+    ST_SAVE2("mx", "(table [s v m] (list (as 'STR (map (fn [j] (if (and (>= j 131072) (< j 132096)) \"shared long key text\" "
+                   "(if (< (% j 3) 2) (at [\"shared long key text\" \"another shared key text\" \"tiny\"] (% (div j 3) 3)) "
+                   "(format \"https://e.com/%/%\" (% j 50) j)))) (til 262144))) (til 262144) (as 'U8 (% (til 262144) 3))))");
+    static const int forces[4] = { RAY_ENC_STR_DICT, RAY_ENC_FSST, -1, RAY_ENC_RAW };
+    ST_REWRITE("/mx2", "s", 4, forces);
+    char p[600]; TEST_ASSERT_TRUE(st_live("/mx2", "s", p, sizeof p));
+    TEST_ASSERT_EQ_I(st_desc_enc(p, 0, NULL), RAY_ENC_STR_DICT);
+    TEST_ASSERT_EQ_I(st_desc_enc(p, 64, NULL), RAY_ENC_FSST);
+    TEST_ASSERT_EQ_I(st_desc_enc(p, 128, NULL), RAY_ENC_CONST);
+    TEST_ASSERT_TRUE(st_desc_enc(p, 129, NULL) != RAY_ENC_STR_DICT);
+    TEST_ASSERT_EQ_I(st_desc_enc(p, 192, NULL), RAY_ENC_RAW);
+    static const char* const qs[] = {
+        "(select {c: (count v) from: T by: s asc: s})",
+        "(select {c: (count v) from: T by: s})",
+        "(select {c: (count v) from: T by: {s: s m: m} asc: [s m]})",
+        "(select {c: (count v) from: T by: {s: s m: m}})",
+        "(select {c: (count v) from: T where: (!= s \"shared long key text\") by: s asc: s})",
+    };
+    for (size_t i = 0; i < sizeof qs / sizeof *qs; i++) {
+        st_fk_t k;
+        ST_SAME("mx", qs[i], &k);
+        TEST_ASSERT_FMT(k.mat == 0, "%s: %llu materializations", qs[i], (unsigned long long)k.mat);
+    }
+    /* a computed second key materializes v (its path binds the referenced
+     * columns, any generation-2 type); the STR key stays codes and ranges */
+    ST_SAME("mx", "(select {c: (count v) from: T by: {s: s r: (% v 3)} asc: [s r]})", NULL);
+    ST_Q_TRUE("(not (at (.idx.info T 's) 'materialized))");
+    PASS();
+}
+
 const test_entry_t encstr_entries[] = {
     { "encstr/strdict_body",       test_strdict_body,       st_setup, st_teardown },
     { "encstr/fsst_body",          test_fsst_body,          st_setup, st_teardown },
@@ -1694,5 +1862,9 @@ const test_entry_t encstr_entries[] = {
     { "encstr/filter_mixed_chunks", test_filter_mixed_chunks, st_q_setup, st_q_teardown },
     { "encstr/filter_materialized", test_filter_materialized, st_q_setup, st_q_teardown },
     { "encstr/filter_forged",      test_filter_forged,      st_q_setup, st_q_teardown },
+    { "encstr/remap_hash_parity",  test_remap_hash_parity,  st_q_setup, st_q_teardown },
+    { "encstr/cross_segment_codes", test_cross_segment_codes, st_q_setup, st_q_teardown },
+    { "encstr/groupby_selection",  test_groupby_selection,  st_q_setup, st_q_teardown },
+    { "encstr/mixed_str_groupby",  test_mixed_str_groupby,  st_q_setup, st_q_teardown },
     { NULL, NULL, NULL, NULL },
 };
