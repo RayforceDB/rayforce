@@ -3616,13 +3616,32 @@ ray_t* ray_read_csv_opts(const char* path, char delimiter, bool header,
                                   col_types_in, n_types, NULL, 0);
 }
 
+/* Fault injection for the suite: RAY_CSV_SPLAYED_INJECT names where a
+ * .csv.splayed load is cancelled: "append" (from column 0's append task,
+ * mid-dispatch), "skip" (the last column's append task returns as a
+ * skipped ticket does) or "close" (before the column finish dispatch);
+ * debug builds only.  "skip" raises no interrupt, which a real skip always
+ * comes with, so production never reaches it; it is kept because only it
+ * reaches the append done-count past the interrupt checks after it. */
+static bool csv_splayed_inject(const char* step) {
+#if defined(DEBUG)
+    const char* e = getenv("RAY_CSV_SPLAYED_INJECT");
+    return e && strcmp(e, step) == 0;
+#else
+    (void)step;
+    return false;
+#endif
+}
+
 /* Append task: column `start` of the chunk table into its writer.  The
- * first failure is kept (a later task cannot clear it). */
+ * first failure is kept (a later task cannot clear it); `done` counts the
+ * columns appended, so a task a cancel skipped reads as not done. */
 typedef struct {
     ray_col_stream_t* writers;
     ray_t*   tbl;
     int      ncols;
     _Atomic(ray_err_t) err;
+    _Atomic(int64_t) done;
     int64_t* col_ns;    /* RAY_CSV_TRACE: per-column append time, or NULL */
 } csv_splayed_append_ctx_t;
 
@@ -3630,13 +3649,17 @@ static void csv_splayed_append_task(void* raw, uint32_t wid, int64_t start, int6
     (void)wid; (void)end;
     csv_splayed_append_ctx_t* a = (csv_splayed_append_ctx_t*)raw;
     if (atomic_load_explicit(&a->err, memory_order_relaxed) != RAY_OK) return;
+    if (start == a->ncols - 1 && csv_splayed_inject("skip")) return;
     ray_t* col = ray_table_get_col_idx(a->tbl, (int64_t)start);
     int64_t tt0 = a->col_ns ? ray_profile_now_ns() : 0;
     ray_err_t e = ray_col_stream_append(&a->writers[start], col);
     if (a->col_ns) a->col_ns[start] += ray_profile_now_ns() - tt0;
+    if (start == 0 && csv_splayed_inject("append")) ray_request_interrupt();
     if (e != RAY_OK) {
         ray_err_t ok = RAY_OK;
         atomic_compare_exchange_strong_explicit(&a->err, &ok, e, memory_order_relaxed, memory_order_relaxed);
+    } else {
+        atomic_fetch_add_explicit(&a->done, 1, memory_order_relaxed);
     }
 }
 
@@ -3891,7 +3914,7 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
          * encoded and written side by side. */
         {
             csv_splayed_append_ctx_t actx = { .writers = writers, .tbl = tbl,
-                                              .ncols = ncols, .err = RAY_OK,
+                                              .ncols = ncols, .err = RAY_OK, .done = 0,
                                               .col_ns = trace ? tr_col_ns : NULL };
             ray_pool_t* wpool = ray_pool_get();
             if (ray_pool_par_dispatch_ok(wpool, ncols, 2))
@@ -3899,6 +3922,10 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
             else
                 for (int c = 0; c < ncols; c++) csv_splayed_append_task(&actx, 0, c, c + 1);
             err = actx.err;
+            /* A cancel skips the tasks not yet started and the dispatch
+             * returns normally: their columns miss this chunk (#716). */
+            if (err == RAY_OK && atomic_load_explicit(&actx.done, memory_order_relaxed) != ncols)
+                err = RAY_ERR_CANCEL;
         }
         ray_release(tbl);
         int64_t tr_c3 = ray_profile_now_ns();
@@ -3919,6 +3946,10 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
         if (cnt == 0) break;
         chunk_offset = next_offset;
     }
+    /* A cancel that lands during the last chunk's appends, once every one
+     * of them has started (or with the appends run in line), stops the
+     * load before the symfile flush and the column finish. */
+    if (err == RAY_OK && ray_interrupted()) err = RAY_ERR_CANCEL;
 
     /* Flush the symfile BEFORE committing column files (writer_close
      * renames tmp → final): columns must never reference positions the
@@ -3951,6 +3982,7 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
      * zone finish, index region, header, fclose), then the renames run
      * serially in column order; a failed finish publishes nothing. */
     memset(tr_col_ns, 0, sizeof(tr_col_ns));
+    if (err == RAY_OK && csv_splayed_inject("close")) ray_request_interrupt();
     if (err == RAY_OK) err = ray_col_stream_close_all(writers, ncols, false, trace ? tr_col_ns : NULL);
     else for (int c = 0; c < ncols; c++) ray_col_stream_abort(&writers[c]);
     int64_t tr_close_end = ray_profile_now_ns();
@@ -3985,6 +4017,11 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
         }
         fprintf(stderr, "csv.splayed: hash_phase=%.1fms\n", TR_MS(tr_hash_end - tr_rel_end));
     }
+
+    /* A cancel that landed in the finish or hash phases stops the load
+     * here: without .d nothing is committed, and the caller's write finish
+     * removes what this load created. */
+    if (err == RAY_OK && ray_interrupted()) err = RAY_ERR_CANCEL;
 
     /* .d LAST — the commit marker.  All column files are renamed into
      * place by now and the symfile is flushed; a crash or error before

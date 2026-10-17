@@ -41,6 +41,10 @@ See [RELEASE.md](RELEASE.md) for how releases are cut.
 ## Local build notes
 
 - Zero external dependencies; C17 toolchain only.
+- `make` compiles with `clang` when `CC` is not set, so a machine without clang
+  fails at the first compile. `make CC=gcc` (or `CC=gcc` in the environment)
+  builds with gcc. The fuzz, TSan, coverage and `compdb` targets use clang
+  regardless of `CC`.
 - Debug builds enable AddressSanitizer + UndefinedBehaviorSanitizer; warnings are
   errors (`-Werror -Wall -Wextra`). A warning will fail CI, so fix them locally.
 - The version reported by a local build is derived from git tags (`0.0.0` on an
@@ -95,6 +99,12 @@ The debug binaries load the ASan runtime DLL from `clang64\bin`, so keep it on
 
 Beyond the ASan/UBSan test run, the repo carries a stability toolset. These
 gate CI (fuzz smoke + TSan on every PR) and run deeper overnight.
+
+Each PR is built with these compilers (`.github/workflows/ci.yml`): gcc for
+the Ubuntu debug and release legs, clang for the macOS debug and release
+legs, upstream Clang 23 from apt.llvm.org for the Ubuntu `clang-current` test
+leg, and the Ubuntu runner's `clang` for the NDEBUG, fuzz-smoke and TSan
+legs.
 
 - **Fuzzing** (Linux + clang): coverage-guided targets under `fuzz/` cover the
   parser, numeric scanners, the binary wire/journal decoder, and the sandboxed
