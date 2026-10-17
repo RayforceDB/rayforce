@@ -340,10 +340,12 @@
 (as 'time "12x34x56") !- domain
 (as 'time "12:3") !- domain
 (as 'time "x") !- domain
-;; time literals with 1-3 digit fractional seconds
-10:00:00.1 -- 10:00:00.001
-10:00:00.01 -- 10:00:00.001
-10:00:00.12 -- 10:00:00.012
+;; time literals with 1-3 digit fractional seconds: a decimal fraction, as
+;; the string cast above reads it
+10:00:00.1 -- 10:00:00.100
+10:00:00.01 -- 10:00:00.010
+10:00:00.12 -- 10:00:00.120
+(== 10:00:00.1 (as 'time "10:00:00.1")) -- true
 10:00:00.011 -- 10:00:00.011
 10:00:00.123 -- 10:00:00.123
 ;; ========== TIME VECTOR CASTS ==========
