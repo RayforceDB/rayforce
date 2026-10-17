@@ -2372,6 +2372,20 @@ static test_result_t test_repl_run_piped_overflow_inner_drain(void) {
  * close the master from the parent — slave's read returns EIO (-1), so
  * ray_term_getc returns -1, sz <= 0 && sz != -2 → break (line 959). */
 #ifndef RAY_OS_WINDOWS
+/* A child that outlives the PTY master: its stderr off the PTY.  Once the
+ * master is closed nobody can read what the child writes there, and its
+ * leak check at exit writes there all the same — after a fork it warns
+ * that the parent's threads, still in its thread registry, were not
+ * suspended.  Older sanitizer runtimes (GCC 9) treat the failed write as
+ * fatal and kill the process from the leak checker's tracer (SIGKILL).
+ * The child's verdict is still its exit status. */
+static void pty_child_stderr_off(void) {
+    int fd = open("/dev/null", O_WRONLY);
+    if (fd < 0) return;
+    dup2(fd, STDERR_FILENO);
+    close(fd);
+}
+
 static int run_pty_nopoll_master_close(void)
 {
     int master_fd = -1;
@@ -2383,6 +2397,7 @@ static int run_pty_nopoll_master_close(void)
          * ray_term_getc sees EIO and returns ≤0, triggering the break at
          * line 959 in the no-poll loop. */
         signal(SIGHUP, SIG_IGN);
+        pty_child_stderr_off();
         ray_runtime_create(0, NULL);
         /* No poll — uses blocking fallback loop. */
         ray_repl_t* repl = ray_repl_create(NULL);
@@ -2586,6 +2601,7 @@ static int run_pty_remote_master_close(uint16_t server_port)
         /* Ignore SIGHUP so the child survives the PTY master close long
          * enough for ray_term_getc to see EIO and take the sz<=0 path. */
         signal(SIGHUP, SIG_IGN);
+        pty_child_stderr_off();
         ray_runtime_create(0, NULL);
         ray_poll_t* poll = ray_poll_create();
         ray_repl_t* repl = ray_repl_create(poll);
@@ -2658,7 +2674,7 @@ static test_result_t test_repl_pty_remote_master_close(void) {
     }
     int rc = run_pty_remote_master_close(s.port);
     repl_stop_server(&s);
-    TEST_ASSERT_FMT(rc == 0 || rc == -1 || rc == -2 || rc == -9,
+    TEST_ASSERT_FMT(rc == 0 || rc == -1 || rc == -2,
                     "unexpected child exit: %d", rc);
 #endif
     PASS();

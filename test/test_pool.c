@@ -1898,10 +1898,17 @@ static void pf_walk_gaps(void* ctx, uint32_t w, int64_t s, int64_t e) {
     }
 }
 
+/* The file's length, not 0 ("to the end"): Linux 5.4 computes the pages a
+ * whole-file FADV_DONTNEED covers as end - start + 1 with end = ~0, which
+ * wraps to 0, so it never sees that pages were left and never drains the
+ * other CPUs' LRU caches to drop them — the last pages each worker brought
+ * in (up to a pagevec, 15, per CPU) stay cached. */
 static bool pf_evict_one(const char* path) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) return false;
-    bool ok = fdatasync(fd) == 0 && posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) == 0;
+    struct stat st;
+    bool ok = fstat(fd, &st) == 0 && fdatasync(fd) == 0 &&
+              posix_fadvise(fd, 0, st.st_size, POSIX_FADV_DONTNEED) == 0;
     close(fd);
     return ok;
 }
@@ -1920,6 +1927,13 @@ static bool pf_none_resident(const uint8_t* p, size_t n) {
     for (size_t off = 0; off < n; off += n / 16)
         if (ray_vm_resident(p + off, 4096)) return false;
     return true;
+}
+
+/* Resident pages of [p, p+n), probed one by one. */
+static int64_t pf_resident_pages(const uint8_t* p, size_t n) {
+    int64_t k = 0;
+    for (size_t off = 0; off < n; off += 4096) k += ray_vm_resident(p + off, 1);
+    return k;
 }
 
 /* Pages this process has read stay mapped and are not evicted: drop both
@@ -1949,14 +1963,8 @@ static bool pf_reset(uint8_t** base, size_t* size, uint8_t** bbase, size_t* bsiz
     if (!*base || !*bbase) return false;
     scan->base[0] = *base;
     scan->base[1] = *bbase;
-    return pf_none_resident(*base, *size) && pf_none_resident(*bbase, *bsize);
-}
-
-/* Resident pages of [p, p+n), probed one by one. */
-static int64_t pf_resident_pages(const uint8_t* p, size_t n) {
-    int64_t k = 0;
-    for (size_t off = 0; off < n; off += 4096) k += ray_vm_resident(p + off, 1);
-    return k;
+    /* Every page: what an eviction leaves is a few pages here and there. */
+    return !pf_resident_pages(*base, *size) && !pf_resident_pages(*bbase, *bsize);
 }
 
 /* Bounded wait (~10 s) for `want` pages of [p, p+n) to be resident. */
@@ -2303,8 +2311,10 @@ static int pq_open_cold(const char* name, const uint8_t** p, size_t* n) {
     ray_release(col);   /* M holds it */
     uintptr_t a = (uintptr_t)*p & ~(uintptr_t)4095;
     posix_madvise((void*)a, (uintptr_t)*p + *n - a, POSIX_MADV_RANDOM);
-    /* Opening reads the header, and the kernel the pages after it. */
-    return pf_none_resident(*p + (512 << 10), *n - (512 << 10)) ? 0 : 1;
+    /* Opening reads the header, and the kernel the pages after it, and the
+     * last pages of the file.  Every page between is probed: an eviction
+     * that falls short leaves a few pages here and there. */
+    return pf_resident_pages(*p + (512 << 10), *n - (1024 << 10)) ? 1 : 0;
 }
 
 static long pq_majflt(void) {
