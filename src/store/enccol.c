@@ -798,7 +798,8 @@ typedef struct {
     ray_enc_idict_t     pub;
     ray_enc_dict_view_t view;    /* as ray_enc_dict_validate filled it: the code tier's input */
 } enc_idict_blob_t;
-_Static_assert(sizeof(enc_idict_blob_t) % 8 == 0, "the entry table follows 8-aligned");
+/* The blob: this head (88 bytes on LP64), then the entry table */
+_Static_assert(sizeof(enc_idict_blob_t) % _Alignof(ray_enc_sdict_t) == 0, "the entry table follows aligned");
 
 static ray_t* enc_idict_validate(void* ctx, ray_enc_snap_t* fail) {
     ray_enccol_t* e = ctx;
@@ -866,7 +867,7 @@ ray_t* ray_enccol_idict_codes(ray_enccol_t* e, int64_t start, int64_t n, const i
     uint32_t bad = 0;
     for (int64_t i = 0; i < n; i++) bad |= (uint32_t)((uint32_t)cd[i] >= nd);   /* branch-free */
     if (bad) {
-        int64_t i = 0; while ((uint32_t)cd[i] < nd) i++;
+        int64_t i = 0; while (i < n - 1 && (uint32_t)cd[i] < nd) i++;
         return ray_error("corrupt", "column %s: DICT code %d at row %lld outside 0 .. %lld", e->path, cd[i],
                          (long long)(start + i), (long long)d->n_distinct - 1);
     }
@@ -3436,8 +3437,8 @@ static ray_t* enc_attach_index(ray_enccol_t* e, ray_t** vp) {
         if (!err && !d) err = ray_error("corrupt", "column %s: DICT index unreadable", e->path);
         if (!err) err = ray_enccol_idict_codes_vec(e, &cv);
         if (err) return err;
-        ray_t* fo = ray_vec_new(RAY_I32, d->n_distinct);
-        root = fo && !RAY_IS_ERR(fo) ? ray_index_new_root(RAY_IDX_DICT, RAY_STR, e->len) : NULL;
+        ray_t* fo = enc_alloc_fails(e) ? NULL : ray_vec_new(RAY_I32, d->n_distinct);
+        root = fo && !RAY_IS_ERR(fo) && !enc_alloc_fails(e) ? ray_index_new_root(RAY_IDX_DICT, RAY_STR, e->len) : NULL;
         if (!root || RAY_IS_ERR(root)) {
             if (fo && !RAY_IS_ERR(fo)) ray_release(fo); else if (fo) ray_error_free(fo);
             if (root) ray_error_free(root);

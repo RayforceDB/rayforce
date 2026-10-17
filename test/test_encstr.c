@@ -32,6 +32,7 @@
 #include "store/col.h"
 #include "store/encw.h"
 #include "store/enccol.h"
+#include "core/pool.h"         /* the first-touch race */
 #include "store/encidx.h"     /* ray_enc_idx_dict_t, ray_enc_dict_validate */
 #include "store/colrange.h"
 #include "vec/str.h"
@@ -1269,15 +1270,55 @@ static test_result_t test_dict_oom_retry(void) {
     TEST_ASSERT_EQ_U(m1.bytes_allocated, m0.bytes_allocated);
     TEST_ASSERT_NULL(ray_enccol_idict_codes_vec(e, &cv));
     TEST_ASSERT_TRUE(cv && cv->len == 70000);
-    /* materialization's own DICT step: oom, then the retry attaches */
-    ray_enccol_test_fail_index_parse(true);
-    ray_t* r = ray_enccol_materialize(c);
-    ray_enccol_test_fail_index_parse(false);
-    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r) && strcmp(ray_err_code(r), "oom") == 0); ray_error_free(r);
-    ray_t* mm = ray_enccol_materialize(c);
-    TEST_ASSERT_TRUE(mm && !RAY_IS_ERR(mm));
-    TEST_ASSERT_EQ_I(ray_index_kind(mm), RAY_IDX_DICT);
-    TEST_ASSERT_TRUE(ray_index_payload(mm->index)->u.dict.codes == cv);
+    /* the warm answer: rows, codes, first occurrences */
+    ray_t* warm = ray_enccol_materialize(c);
+    TEST_ASSERT_TRUE(warm && !RAY_IS_ERR(warm) && ray_index_kind(warm) == RAY_IDX_DICT);
+    TEST_ASSERT_TRUE(ray_index_payload(warm->index)->u.dict.codes == cv);
+    /* every injection point of a materialization on a fresh column: oom,
+     * nothing leaked once the column goes, and the retry equals the warm
+     * answer; the DICT's own points are among them (P6's sweep) */
+    bool done = false;
+    int dict_tier = 0, dict_root = 0, dict_gate = 0;
+    for (int nth = 1; nth <= 64 && !done; nth++) {
+        ray_mem_stats(&m0);
+        ray_t* fc = ray_col_mmap(p);
+        TEST_ASSERT_TRUE(fc && !RAY_IS_ERR(fc));
+        ray_error_clear();
+        ray_enccol_test_fail_alloc(nth);
+        ray_t* r = ray_enccol_materialize(fc);
+        ray_enccol_test_fail_alloc(0);
+        if (r && RAY_IS_ERR(r)) {
+            const char* msg = ray_error_msg() ? ray_error_msg() : "";
+            const bool oom = strcmp(ray_err_code(r), "oom") == 0;
+            if (strstr(msg, "index parse")) dict_gate++;
+            else if (strstr(msg, "DICT index")) dict_root++;
+            else if (strstr(msg, "DICT") && !strstr(msg, "STR_DICT")) dict_tier++;   /* not the side entry */
+            ray_error_free(r);
+            if (!oom) ray_release(fc);
+            TEST_ASSERT_FMT(oom, "nth %d: not oom", nth);
+            r = ray_enccol_materialize(fc);                 /* the retry */
+        } else {
+            done = true;
+        }
+        bool same = r && !RAY_IS_ERR(r) && st_same(r, warm) && ray_index_kind(r) == RAY_IDX_DICT;
+        if (same) {
+            const ray_index_t* a = ray_index_payload(r->index);
+            const ray_index_t* b = ray_index_payload(warm->index);
+            same = a->u.dict.n_distinct == b->u.dict.n_distinct &&
+                   memcmp(ray_data(a->u.dict.codes), ray_data(b->u.dict.codes), 70000 * 4) == 0 &&
+                   memcmp(ray_data(a->u.dict.first_occ), ray_data(b->u.dict.first_occ), 300 * 4) == 0;
+        }
+        if (r && RAY_IS_ERR(r)) ray_error_free(r);
+        ray_release(fc);
+        ray_mem_stats(&m1);
+        TEST_ASSERT_FMT(same, "nth %d: retry differs from the warm answer", nth);
+        TEST_ASSERT_FMT(m1.bytes_allocated == m0.bytes_allocated, "nth %d: %llu vs %llu", nth,
+                        (unsigned long long)m1.bytes_allocated, (unsigned long long)m0.bytes_allocated);
+    }
+    TEST_ASSERT_TRUE(done);
+    TEST_ASSERT_EQ_I(dict_gate, 1);              /* the attach's gate */
+    TEST_ASSERT_EQ_I(dict_root, 2);              /* first_occ, then the root */
+    TEST_ASSERT_EQ_I(dict_tier, 2);              /* the entry tier, the code tier */
     PASS();
 }
 
@@ -2383,6 +2424,117 @@ static test_result_t test_idict_runtime_gone(void) {
     PASS();
 }
 
+/* Review fix 4: pool workers race the first touch of both tiers on a fresh
+ * column.  Sound file: every racer sees the one entry-tier blob, the one
+ * code-tier vector and the right codes (code of row i is i % 300).
+ * Forged files (a duplicate entry: the entry tier; a late code: the code
+ * tier): every racer gets the one cached corrupt verdict, and no racer's
+ * heap keeps anything of the failed attempt. */
+#define IR_SLOTS 64
+typedef struct {
+    ray_enccol_t*      e;
+    int                mode;                   /* 0 sound, 1 entry tier forged, 2 code tier forged */
+    _Atomic(int)       arrived;
+    int                want;                   /* soft barrier: the pool's worker count */
+    _Atomic(int)       next;
+    const void*        d[IR_SLOTS];
+    const void*        cv[IR_SLOTS];
+    char               msg[IR_SLOTS][128];
+    int                bad[IR_SLOTS];
+    int64_t            leak[IR_SLOTS];
+    uint32_t           wid[IR_SLOTS];
+} ir_race_t;
+static void ir_race_task(void* ctx, uint32_t wid, int64_t lo, int64_t hi) {
+    (void)lo; (void)hi;
+    ir_race_t* x = ctx;
+    const int k = atomic_fetch_add(&x->next, 1);
+    if (k >= IR_SLOTS) return;
+    x->wid[k] = wid;
+    atomic_fetch_add(&x->arrived, 1);
+    for (long spin = 0; atomic_load(&x->arrived) < x->want && spin < 20000000L; spin++) {}
+    ray_mem_stats_t m0, m1;
+    const ray_enc_idict_t* d = NULL;
+    ray_t* cv = NULL;
+    if (x->mode == 2) {                        /* the entry tier holds: measure the code tier alone */
+        ray_t* err = ray_enccol_idict(x->e, &d);
+        if (err) { x->bad[k] = 1; ray_error_free(err); return; }
+        x->d[k] = d;
+    }
+    ray_mem_stats(&m0);
+    ray_t* err = x->mode == 2 ? NULL : ray_enccol_idict(x->e, &d);
+    if (!err && x->mode != 2) x->d[k] = d;
+    if (!err) err = ray_enccol_idict_codes_vec(x->e, &cv);
+    if (err) {
+        snprintf(x->msg[k], sizeof x->msg[k], "%s: %s", ray_err_code(err), ray_error_msg() ? ray_error_msg() : "");
+        ray_error_free(err);
+        ray_mem_stats(&m1);
+        x->leak[k] = (int64_t)m1.bytes_allocated - (int64_t)m0.bytes_allocated;
+        return;
+    }
+    x->cv[k] = cv;
+    const int32_t* all = (const int32_t*)ray_data(cv);
+    for (int64_t i = 0; i < cv->len; i++) if (all[i] != (int32_t)(i % 300)) { x->bad[k] = 1; break; }
+    const int64_t r0 = ((int64_t)k * 1000) % 69000;
+    const int32_t* cd = NULL;
+    ray_t* re = ray_enccol_idict_codes(x->e, r0, 1000, &cd);
+    if (re) { ray_error_free(re); x->bad[k] = 1; return; }
+    for (int64_t i = 0; i < 1000; i++) if (cd[i] != (int32_t)((r0 + i) % 300)) { x->bad[k] = 1; break; }
+}
+
+static test_result_t test_idict_first_touch_race(void) {
+    ST_Q_OK("(set S (as 'STR (map (fn [j] (format \"value % of the domain\" (% (* j 7919) 300))) (til 70000))))");
+    ST_Q_OK("(.db.splayed.set \"" ST_TMP "/ra/\" (table [s] (list S)) {compress: true})");
+    char p[600]; TEST_ASSERT_TRUE(st_live("/ra", "s", p, sizeof p));
+    ray_enc_hdr_t eh = st_hdr(p);
+    TEST_ASSERT_EQ_I(eh.index_kind, RAY_IDX_DICT);
+    ray_enc_idx_dict_t dd; ST_READ(p, eh.index_off + 16, &dd, sizeof dd);
+    uint64_t of[4]; ST_READ(p, eh.index_off + dd.offs, of, sizeof of);
+    TEST_ASSERT_TRUE(of[2] - of[1] == of[3] - of[2] && of[2] - of[1] < 64);
+    size_t n0; uint8_t* good = slurp_file(p, &n0);
+    TEST_ASSERT_NOT_NULL(good);
+    free(st_mem); st_mem = good;
+    ray_pool_t* pool = ray_pool_get();
+    TEST_ASSERT_NOT_NULL(pool);
+    const uint32_t nw = ray_pool_total_workers(pool);
+    const uint32_t ntask = nw * 2 < IR_SLOTS ? nw * 2 : IR_SLOTS;
+    static ir_race_t x;
+    bool workers_seen = false;
+    for (int mode = 0; mode < 3; mode++) {
+        ST_PATCH(p, 0, good, n0);
+        if (mode == 1) {                                   /* entry 2 repeats entry 1 */
+            char ent[64]; ST_READ(p, eh.index_off + dd.bytes + of[1], ent, of[2] - of[1]);
+            ST_PATCH(p, eh.index_off + dd.bytes + of[2], ent, of[2] - of[1]);
+        } else if (mode == 2) {                            /* row 5 takes code 299 */
+            int32_t late = 299;
+            ST_PATCH(p, eh.index_off + dd.codes + 5 * 4, &late, 4);
+        }
+        for (int it = 0; it < 40; it++) {
+            ray_t* c = ray_col_mmap(p);
+            TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+            memset(&x, 0, sizeof x);
+            x.e = ray_enccol_of(c); x.mode = mode; x.want = (int)nw;
+            ray_pool_dispatch_n(pool, ir_race_task, &x, ntask);
+            const int n = atomic_load(&x.next) < (int)ntask ? atomic_load(&x.next) : (int)ntask;
+            bool ok = n == (int)ntask;
+            for (int k = 0; k < n && ok; k++) {
+                ok = !x.bad[k] && x.leak[k] == 0;
+                if (mode == 0) ok = ok && x.msg[k][0] == 0 && x.d[k] == x.d[0] && x.cv[k] == x.cv[0] &&
+                                    x.cv[k] == (const void*)x.e->icodes && x.d[k] != NULL;
+                else ok = ok && x.cv[k] == NULL && strcmp(x.msg[k], x.msg[0]) == 0 &&
+                          strncmp(x.msg[k], "corrupt: ", 9) == 0 &&
+                          strstr(x.msg[k], mode == 1 ? "DICT entries not distinct" : "before its first occurrence") &&
+                          (mode == 1 ? x.d[k] == NULL : x.d[k] == x.d[0] && x.d[k] != NULL);
+            }
+            if (mode && ok) ok = (mode == 1 ? x.e->idict == NULL : x.e->icodes == NULL);   /* nothing published */
+            for (int k = 1; k < n; k++) if (x.wid[k] != x.wid[0]) { workers_seen = true; break; }
+            ray_release(c);
+            TEST_ASSERT_FMT(ok, "mode %d iteration %d (%d tasks): %s", mode, it, n, n ? x.msg[0] : "");
+        }
+    }
+    if (pool->n_workers > 0) TEST_ASSERT_TRUE(workers_seen);   /* the racers ran on more than one worker */
+    PASS();
+}
+
 const test_entry_t encstr_entries[] = {
     { "encstr/strdict_body",       test_strdict_body,       st_setup, st_teardown },
     { "encstr/fsst_body",          test_fsst_body,          st_setup, st_teardown },
@@ -2430,5 +2582,6 @@ const test_entry_t encstr_entries[] = {
     { "encstr/idict_mixed_encodings", test_idict_mixed_encodings, st_q_setup, st_q_teardown },
     { "encstr/idict_dup_entry",       test_idict_dup_entry,       st_q_setup, st_q_teardown },
     { "encstr/idict_runtime_gone",    test_idict_runtime_gone,    st_q_setup, st_q_teardown },
+    { "encstr/idict_first_touch_race", test_idict_first_touch_race, st_q_setup, st_q_teardown },
     { NULL, NULL, NULL, NULL },
 };

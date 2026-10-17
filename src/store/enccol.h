@@ -83,7 +83,8 @@ typedef struct ray_enccol_s {
     ray_t*          fsst;           /* validated FSST_TABLE: a RAY_U8 blob holding a ray_fsst_table_t */
     /* persisted DICT (P6b): the entry tier and the code tier, once each */
     ray_enc_once_t  idict_once;
-    ray_t*          idict;          /* RAY_U8 blob: a ray_enc_idict_t, then its ray_enc_sdict_t */
+    ray_t*          idict;          /* RAY_U8 blob: enc_idict_blob_t (the ray_enc_idict_t and the
+                                     * validated view), then the entry table (ray_enc_sdict_t) */
     ray_enc_once_t  icodes_once;
     ray_t*          icodes;         /* RAY_I32: the validated codes */
     /* parted (Task 12) */
