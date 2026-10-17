@@ -2056,6 +2056,95 @@ ray_t* ray_sect_fn(ray_t* vec1, ray_t* vec2) {
     return result;
 }
 
+/* Rows [start, start+count) of the parted or MAPCOMMON column `col` of the
+ * table `tbl` (.db.parted.get) as a flat vector, reading only those rows
+ * (0 <= start, start + count <= the table's rows).  The table's partition
+ * counts give the rows a NULL segment (a partition without the column)
+ * spans; they come back as the type's null. */
+static ray_t* parted_col_window(ray_t* tbl, ray_t* col, int64_t start, int64_t count) {
+    int64_t ncnt = 0;
+    const int64_t* cnt = parted_table_counts(tbl, &ncnt);
+    int8_t base = col->type == RAY_MAPCOMMON
+                ? RAY_SYM : (int8_t)RAY_PARTED_BASETYPE(col->type);
+
+    /* MAPCOMMON, STR and LIST go through the row-index gathers. */
+    if (col->type == RAY_MAPCOMMON || base == RAY_STR || base == RAY_LIST) {
+        int64_t one = 0;
+        int64_t* idx = count > 0 ? (int64_t*)ray_alloc_raw((size_t)count * sizeof(int64_t)) : &one;
+        if (!idx) return ray_error("oom", NULL);
+        for (int64_t i = 0; i < count; i++) idx[i] = start + i;
+        ray_t** segs = (ray_t**)ray_data(col);
+        ray_t* out = col->type == RAY_MAPCOMMON
+                   ? materialize_mapcommon_gather(col, idx, count)
+                   : base == RAY_STR
+                   ? parted_gather_str_rows_c(segs, col->len, idx, count, cnt, ncnt)
+                   : parted_gather_list_rows_c(segs, col->len, idx, count, cnt, ncnt);
+        if (idx != &one) ray_free_raw(idx);
+        return out ? out : ray_error("oom", NULL);
+    }
+
+    ray_t** segs = (ray_t**)ray_data(col);
+    uint8_t ba = (base == RAY_SYM) ? parted_sym_max_attrs(segs, col->len) : 0;
+    ray_t* out = typed_vec_new(base, ba, count);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    out->len = count;
+    int64_t end = start + count, seg_start = 0;
+    for (int64_t s = 0; s < col->len && seg_start < end; s++) {
+        int64_t rows = parted_seg_rows(segs, s, cnt, ncnt);
+        int64_t lo = start > seg_start ? start : seg_start;
+        int64_t hi = end < seg_start + rows ? end : seg_start + rows;
+        if (lo < hi) {
+            int64_t dst = lo - start, src = lo - seg_start, n = hi - lo;
+            if (!segs[s] || RAY_IS_ERR(segs[s])) {
+                parted_fill_nulls(out, dst, n);
+            } else {
+                parted_copy_cells(ray_data(out), base, ba, dst, segs[s], src, n);
+                if (ray_vec_may_have_nulls(segs[s]))
+                    for (int64_t i = 0; i < n; i++)
+                        if (ray_vec_is_null(segs[s], src + i))
+                            ray_vec_set_null(out, dst + i, true);
+            }
+        }
+        seg_start += rows;
+    }
+    /* raw SYM cell ids copied from the segments — adopt their domain */
+    if (base == RAY_SYM) {
+        ray_t* rep = sym_domain_rep(col);
+        if (rep) ray_sym_vec_adopt_domain(out, rep);
+    }
+    return out;
+}
+
+/* take over one column of the table `tbl`.  A parted or MAPCOMMON column
+ * (.db.parted.get) is not a dense vector: materialize only the rows the
+ * count selects — the head or tail window, or a range — and, when the
+ * count wraps past the row count, all rows, then take from those as for a
+ * flat column (#855).  `n_obj` was validated by ray_take_fn. */
+static ray_t* take_table_col(ray_t* tbl, ray_t* col, ray_t* n_obj) {
+    if (!col || !(RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON))
+        return ray_take_fn(col, n_obj);
+    int64_t nrows = ray_table_nrows(tbl);
+    if (ray_is_vec(n_obj)) {
+        /* range take [start amount], clamped as for a typed vector */
+        const int64_t* r = (const int64_t*)ray_data(n_obj);
+        int64_t start = r[0], amount = r[1];
+        if (start < 0) start = nrows + start;
+        if (start < 0) start = 0;
+        if (start >= nrows) return parted_col_window(tbl, col, 0, 0);
+        int64_t count = amount < nrows - start ? amount : nrows - start;
+        return parted_col_window(tbl, col, start, count);
+    }
+    int64_t n = as_i64(n_obj);
+    int64_t abs_n = n < 0 ? -n : n;
+    if (abs_n <= nrows)
+        return parted_col_window(tbl, col, n >= 0 ? 0 : nrows - abs_n, abs_n);
+    ray_t* all = parted_col_window(tbl, col, 0, nrows);
+    if (!all || RAY_IS_ERR(all)) return all ? all : ray_error("oom", NULL);
+    ray_t* out = ray_take_fn(all, n_obj);
+    ray_release(all);
+    return out;
+}
+
 /* (take vec n) — first n elements (positive) or last |n| elements (negative) */
 ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
     if (ray_is_lazy(vec)) vec = ray_lazy_materialize(vec);
@@ -2080,7 +2169,7 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
             for (int64_t i = 0; i < ncols; i++) {
                 ray_t* col = ray_table_get_col_idx(vec, i);
                 int64_t name_id = ray_table_col_name(vec, i);
-                ray_t* taken = ray_take_fn(col, n_obj);
+                ray_t* taken = take_table_col(vec, col, n_obj);
                 if (RAY_IS_ERR(taken)) { ray_release(result); return taken; }
                 result = ray_table_add_col(result, name_id, taken);
                 ray_release(taken);
@@ -2265,7 +2354,7 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
         for (int64_t i = 0; i < ncols; i++) {
             ray_t* col = ray_table_get_col_idx(vec, i);
             int64_t name_id = ray_table_col_name(vec, i);
-            ray_t* taken = ray_take_fn(col, n_obj);
+            ray_t* taken = take_table_col(vec, col, n_obj);
             if (RAY_IS_ERR(taken)) { ray_release(result); return taken; }
             result = ray_table_add_col(result, name_id, taken);
             ray_release(taken);
