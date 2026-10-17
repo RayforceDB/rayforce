@@ -82,8 +82,15 @@ out-of-range result becomes, see [Date/Time types](../guides/types.md#date-time)
 14:15:30.500  ; 2:15:30.5 PM
 ```
 
-Hours must be `0`-`23`, minutes and seconds `0`-`59`; out-of-range
-components are a parse error.
+A time literal has two hour digits, `00`-`99`, and two digits each for
+minutes and seconds. Minutes and seconds past `59` carry into the next unit,
+the way a day past the end of its month does for dates, so `01:60:00.000`
+parses as `02:00:00.000`. A leading `-` makes the time negative
+(`-01:00:00.000`). The `.mmm` part is optional (`09:30:00` is
+`09:30:00.000`); write it with three digits, since a shorter fraction is
+currently read as a count of milliseconds (`09:30:00.5` is `09:30:00.005`),
+unlike a timestamp's. Times beyond `99:59:59.999` come from arithmetic or
+from `(as 'TIME <ms>)`: `(as 'TIME 2147483647)` is `596:31:23.647`.
 
 ### Timestamps
 
@@ -94,10 +101,13 @@ Full date+time with nanosecond precision. Stored as nanoseconds since 2000-01-01
 2024.01.15D09:30:00.000000000      ; date + time (ns)
 ```
 
-The date and time parts follow the same range rules as above. Because the
-value is a 64-bit nanosecond count from the epoch, timestamps only span
-roughly ±292 years around 2000 (about 1708 to 2292); a year outside that
-range is a parse error.
+The date part follows the date rules above. The time part is stricter than a
+time literal: hours `00`-`23` and minutes and seconds `00`-`59`, anything else
+being a parse error; no leading `-`; and the fractional part is required, with
+one to nine digits read as a decimal fraction (`.5` is half a second; digits
+past the ninth are dropped). Because the value is a 64-bit nanosecond count
+from the epoch, timestamps only span roughly ±292 years around 2000 (about
+1708 to 2292); a year outside that range is a parse error.
 
 ### GUIDs
 
