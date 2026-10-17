@@ -554,6 +554,26 @@ static bool find_needle_side_ok(ray_t* hay, ray_t* nd) {
  * Higher-order functions
  * ══════════════════════════════════════════ */
 
+/* The i-th element of `coll`, a LIST or a typed vector, for one call of an
+ * iterator's function.  A typed vector's element is boxed here, one at a
+ * time, and *owned tells the caller to release it after the call; a LIST's
+ * slot is lent.  Boxing the whole vector up front (unbox_vec_arg) kept every
+ * atom alive for the whole walk, about ten times the vector's memory (#823).
+ * A vector type collection_elem cannot box comes back as an error. */
+static inline ray_t* iter_elem(ray_t* coll, int64_t i, int* owned) {
+    ray_t* e = collection_elem(coll, i, owned);
+    if (!e) { *owned = 0; return ray_error("oom", NULL); }
+    return e;
+}
+
+/* An owned reference to the i-th element of `coll`, to seed an accumulator. */
+static ray_t* iter_elem_owned(ray_t* coll, int64_t i) {
+    int owned = 0;
+    ray_t* e = iter_elem(coll, i, &owned);
+    if (!owned && !RAY_IS_ERR(e)) ray_retain(e);
+    return e;
+}
+
 /* (map fn val vec) — apply binary fn(val, elem) to each element of vec.
  * Also supports (map fn vec) for unary mapping. */
 ray_t* ray_map_fn(ray_t** args, int64_t n) {
@@ -562,63 +582,48 @@ ray_t* ray_map_fn(ray_t** args, int64_t n) {
         if (ray_is_lazy(args[i])) args[i] = ray_lazy_materialize(args[i]);
 
     ray_t* fn = args[0];
-    ray_t* _bx = NULL;
+    ray_t* val = NULL;
+    ray_t* coll;
 
     if (n == 2) {
         /* Unary map: (map fn vec) */
-        ray_t* vec = unbox_vec_arg(args[1], &_bx);
-        if (RAY_IS_ERR(vec)) return vec;
-        if (!is_list(vec)) { if (_bx) ray_release(_bx); return ray_error("type", "map: vec arg must be a list, got %s", ray_type_name(vec->type)); }
-        int64_t len = ray_len(vec);
-        ray_t* result = ray_alloc(len * sizeof(ray_t*));
-        if (!result) { if (_bx) ray_release(_bx); return ray_error("oom", NULL); }
-        result->type = RAY_LIST;
-        result->len = len;
-        ray_t** out = (ray_t**)ray_data(result);
-        ray_t** elems = (ray_t**)ray_data(vec);
-        for (int64_t i = 0; i < len; i++) {
-            out[i] = call_fn1(fn, elems[i]);
-            /* Materialise a lazy result (e.g. the lambda returned
-             * (count (distinct x)) — distinct/count of a vec is lazy).  A LIST
-             * of unforced lazy nodes breaks every downstream consumer that
-             * doesn't force per element (sum, ==, +). */
-            if (ray_is_lazy(out[i])) out[i] = ray_lazy_materialize(out[i]);
-            if (RAY_IS_ERR(out[i])) {
-                for (int64_t j = 0; j < i; j++) ray_release(out[j]);
-                result->len = 0; ray_release(result); if (_bx) ray_release(_bx);
-                return out[i];
-            }
-        }
-        if (_bx) ray_release(_bx);
-        return result;
+        coll = args[1];
+        if (RAY_IS_ERR(coll)) return coll;
+        if (!is_collection(coll)) return ray_error("type", "map: vec arg must be a list, got %s", ray_type_name(coll->type));
+    } else {
+        /* Binary map: (map fn val vec) — apply fn(val, elem) */
+        val = args[1];
+        coll = args[2];
+        if (RAY_IS_ERR(coll)) return coll;
+        /* If vec is scalar, just call fn(val, vec) once */
+        if (!is_collection(coll)) return call_fn2(fn, val, coll);
     }
 
-    /* Binary map: (map fn val vec) — apply fn(val, elem) */
-    ray_t* val = args[1];
-    ray_t* vec = unbox_vec_arg(args[2], &_bx);
-    if (RAY_IS_ERR(vec)) return vec;
-    /* If vec is scalar, just call fn(val, vec) once */
-    if (!is_list(vec)) {
-        if (_bx) ray_release(_bx);
-        return call_fn2(fn, val, args[2]);
-    }
-    int64_t len = ray_len(vec);
+    int64_t len = ray_len(coll);
     ray_t* result = ray_alloc(len * sizeof(ray_t*));
-    if (!result) { if (_bx) ray_release(_bx); return ray_error("oom", NULL); }
+    if (!result) return ray_error("oom", NULL);
     result->type = RAY_LIST;
     result->len = len;
     ray_t** out = (ray_t**)ray_data(result);
-    ray_t** elems = (ray_t**)ray_data(vec);
     for (int64_t i = 0; i < len; i++) {
-        out[i] = call_fn2(fn, val, elems[i]);
+        int owned = 0;
+        ray_t* elem = iter_elem(coll, i, &owned);
+        if (RAY_IS_ERR(elem))  out[i] = elem;
+        else if (n == 2)       out[i] = call_fn1(fn, elem);
+        else                   out[i] = call_fn2(fn, val, elem);
+        if (owned) ray_release(elem);
+        /* Materialise a lazy result (e.g. the lambda returned
+         * (count (distinct x)) — distinct/count of a vec is lazy).  A LIST
+         * of unforced lazy nodes breaks every downstream consumer that
+         * doesn't force per element (sum, ==, +). */
         if (ray_is_lazy(out[i])) out[i] = ray_lazy_materialize(out[i]);
         if (RAY_IS_ERR(out[i])) {
+            ray_t* err = out[i];
             for (int64_t j = 0; j < i; j++) ray_release(out[j]);
-            result->len = 0; ray_release(result); if (_bx) ray_release(_bx);
-            return out[i];
+            result->len = 0; ray_release(result);
+            return err;
         }
     }
-    if (_bx) ray_release(_bx);
     return result;
 }
 
@@ -637,49 +642,38 @@ ray_t* ray_fold_fn(ray_t** args, int64_t n) {
         if (ray_is_lazy(args[i])) args[i] = ray_lazy_materialize(args[i]);
 
     ray_t* fn = args[0];
-    ray_t* vec;
+    ray_t* coll = args[n == 2 ? 1 : 2];
+    if (RAY_IS_ERR(coll)) return coll;
+    if (!is_collection(coll)) return ray_error("type", "fold: vec arg must be a list, got %s", ray_type_name(coll->type));
+    int64_t len = ray_len(coll);
     ray_t* acc;
-    ray_t* _bx = NULL;
+    int64_t start;
     if (n == 2) {
         /* (fold fn vec) — use first element as initial value */
-        vec = unbox_vec_arg(args[1], &_bx);
-        if (RAY_IS_ERR(vec)) return vec;
-        if (!is_list(vec)) { if (_bx) ray_release(_bx); return ray_error("type", "fold: vec arg must be a list, got %s", ray_type_name(vec->type)); }
-        int64_t len = ray_len(vec);
-        if (len == 0) { if (_bx) ray_release(_bx); return ray_error("domain", "fold: empty list has no initial value, got %lld", (long long)len); }
-        ray_t** elems = (ray_t**)ray_data(vec);
-        ray_retain(elems[0]);
-        acc = elems[0];
-        for (int64_t i = 1; i < len; i++) {
-            ray_t* next = call_fn2(fn, acc, elems[i]);
-            ray_release(acc);
-            if (RAY_IS_ERR(next)) { if (_bx) ray_release(_bx); return next; }
-            acc = next;
-        }
-        if (_bx) ray_release(_bx);
-        return acc;
+        if (len == 0) return ray_error("domain", "fold: empty list has no initial value, got %lld", (long long)len);
+        acc = iter_elem_owned(coll, 0);
+        if (RAY_IS_ERR(acc)) return acc;
+        start = 1;
+    } else {
+        /* (fold fn init vec) */
+        ray_retain(args[1]);
+        acc = args[1];
+        start = 0;
     }
-
-    /* (fold fn init vec) */
-    ray_retain(args[1]);
-    acc = args[1];
-    vec = unbox_vec_arg(args[2], &_bx);
-    if (RAY_IS_ERR(vec)) { ray_release(acc); return vec; }
-    if (!is_list(vec)) { ray_release(acc); if (_bx) ray_release(_bx); return ray_error("type", "fold: vec arg must be a list, got %s", ray_type_name(vec->type)); }
-    int64_t len = ray_len(vec);
-    ray_t** elems = (ray_t**)ray_data(vec);
-    for (int64_t i = 0; i < len; i++) {
-        ray_t* next = call_fn2(fn, acc, elems[i]);
+    for (int64_t i = start; i < len; i++) {
+        int owned = 0;
+        ray_t* elem = iter_elem(coll, i, &owned);
+        ray_t* next = RAY_IS_ERR(elem) ? elem : call_fn2(fn, acc, elem);
+        if (owned) ray_release(elem);
         ray_release(acc);
-        if (RAY_IS_ERR(next)) { if (_bx) ray_release(_bx); return next; }
+        if (RAY_IS_ERR(next)) return next;
         acc = next;
     }
-    if (_bx) ray_release(_bx);
     return acc;
 }
 
 /* Typed prefix-scan kernels for the native arithmetic operators.  The
- * generic scan below unboxes the vector into a LIST and drives the full
+ * generic scan below boxes each element and drives the full
  * call machinery per element — and, worse, RETURNS a LIST of boxed
  * atoms, so every downstream vector op on the running sums degrades to
  * the boxed paths too (the q28 20-row moving average spent ~13ms on
@@ -877,38 +871,30 @@ ray_t* ray_scan_fn(ray_t** args, int64_t n) {
         ray_t* fast = scan_typed_arith(fn, args[1]);
         if (fast) return fast;
     }
-    ray_t* _bx = NULL;
-    ray_t* vec = unbox_vec_arg(args[1], &_bx);
-    if (RAY_IS_ERR(vec)) return vec;
-    if (!is_list(vec)) { if (_bx) ray_release(_bx); return ray_error("type", "scan: vec arg must be a list, got %s", ray_type_name(vec->type)); }
-    int64_t len = ray_len(vec);
-    if (len == 0) {
-        if (_bx) ray_release(_bx);
-        ray_t* result = ray_alloc(0);
-        if (!result) return ray_error("oom", NULL);
-        result->type = RAY_LIST;
-        result->len = 0;
-        return result;
-    }
+    ray_t* coll = args[1];
+    if (RAY_IS_ERR(coll)) return coll;
+    if (!is_collection(coll)) return ray_error("type", "scan: vec arg must be a list, got %s", ray_type_name(coll->type));
+    int64_t len = ray_len(coll);
 
     ray_t* result = ray_alloc(len * sizeof(ray_t*));
-    if (!result) { if (_bx) ray_release(_bx); return ray_error("oom", NULL); }
+    if (!result) return ray_error("oom", NULL);
     result->type = RAY_LIST;
-    result->len = len;
+    result->len = 0;
+    if (len == 0) return result;
     ray_t** out = (ray_t**)ray_data(result);
-    ray_t** elems = (ray_t**)ray_data(vec);
 
-    ray_retain(elems[0]);
-    out[0] = elems[0];
+    out[0] = iter_elem_owned(coll, 0);
+    if (RAY_IS_ERR(out[0])) { ray_t* err = out[0]; ray_release(result); return err; }
+    result->len = 1;
     for (int64_t i = 1; i < len; i++) {
-        out[i] = call_fn2(fn, out[i - 1], elems[i]);
-        if (RAY_IS_ERR(out[i])) {
-            for (int64_t j = 0; j < i; j++) ray_release(out[j]);
-            result->len = 0; ray_release(result); if (_bx) ray_release(_bx);
-            return out[i];
-        }
+        int owned = 0;
+        ray_t* elem = iter_elem(coll, i, &owned);
+        ray_t* next = RAY_IS_ERR(elem) ? elem : call_fn2(fn, out[i - 1], elem);
+        if (owned) ray_release(elem);
+        if (RAY_IS_ERR(next)) { ray_release(result); return next; }
+        out[i] = next;
+        result->len = i + 1;
     }
-    if (_bx) ray_release(_bx);
     return result;
 }
 
@@ -1072,6 +1058,35 @@ ray_t* ray_apply_fn(ray_t** args, int64_t n) {
  * Collection operations
  * ══════════════════════════════════════════ */
 
+/* atom_eq for a column of a table / dict cell.  A SYM column is read at
+ * its storage width (the vector branch reads 8 bytes a cell) and compared
+ * by text across domains; a STR column by content (a descriptor holds a
+ * pool offset and a cached hash).  Other columns take atom_eq. */
+static int atom_eq_cell_col(ray_t* a, ray_t* b) {
+    if (a->type != b->type || a->len != b->len ||
+        (a->type != RAY_SYM && a->type != RAY_STR))
+        return atom_eq(a, b);
+    if (a->type == RAY_STR) {
+        for (int64_t i = 0; i < a->len; i++) {
+            size_t la = 0, lb = 0;
+            const char* sa = ray_str_vec_get(a, i, &la);
+            const char* sb = ray_str_vec_get(b, i, &lb);
+            if (la != lb || (la && memcmp(sa, sb, la) != 0)) return 0;
+        }
+        return 1;
+    }
+    bool same_dom = ray_sym_vec_domain(a) == ray_sym_vec_domain(b);
+    for (int64_t i = 0; i < a->len; i++) {
+        if (same_dom) {
+            if (ray_read_sym(ray_data(a), i, RAY_SYM, a->attrs) !=
+                ray_read_sym(ray_data(b), i, RAY_SYM, b->attrs)) return 0;
+        } else if (ray_str_cmp(ray_sym_vec_cell(a, i), ray_sym_vec_cell(b, i)) != 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 /* Helper: compare two atoms for equality (value-based) */
 int atom_eq(ray_t* a, ray_t* b) {
     int a_null = RAY_ATOM_IS_NULL(a);
@@ -1127,6 +1142,30 @@ int atom_eq(ray_t* a, ray_t* b) {
             if (!atom_eq(ea[i], eb[i])) return 0;
         }
         return 1;
+    }
+    case RAY_TABLE: {
+        /* Same column names in order and equal columns.  The vector branch
+         * below compares len * elem_size bytes, zero for a table, so every
+         * pair of same-length tables compared equal (one group for all). */
+        int64_t nc = ray_table_ncols(a);
+        if (nc != ray_table_ncols(b) || ray_table_nrows(a) != ray_table_nrows(b))
+            return 0;
+        for (int64_t c = 0; c < nc; c++) {
+            if (ray_table_col_name(a, c) != ray_table_col_name(b, c)) return 0;
+            ray_t* ca = ray_table_get_col_idx(a, c);
+            ray_t* cb = ray_table_get_col_idx(b, c);
+            if (!ca || !cb) { if (ca != cb) return 0; continue; }
+            if (!atom_eq_cell_col(ca, cb)) return 0;
+        }
+        return 1;
+    }
+    case RAY_DICT: {
+        /* Equal keys and equal values, position by position (the vector
+         * branch saw every pair of same-length dicts as equal too). */
+        ray_t* ka = ray_dict_keys(a); ray_t* kb = ray_dict_keys(b);
+        ray_t* va = ray_dict_vals(a); ray_t* vb = ray_dict_vals(b);
+        if (!ka || !kb || !va || !vb) return ka == kb && va == vb;
+        return atom_eq_cell_col(ka, kb) && atom_eq_cell_col(va, vb);
     }
     default:
         /* Vector equality: same type and length, element-wise comparison */
@@ -4856,13 +4895,11 @@ ray_t* ray_fold_left_fn(ray_t** args, int64_t n) {
  * BEFORE the first element, so a predicate that is false at the start
  * returns `init` untouched and touches nothing.
  *
- * Deliberately unlike ray_fold_fn in one respect: that routes its
- * collection through unbox_vec_arg -> to_boxed_list, boxing every element
- * up front.  For a primitive whose whole purpose is to stop early, paying
- * for the tail it never reaches is exactly the cost being removed here
- * (issue 588), so elements are pulled one at a time via collection_elem —
- * the same way map_iterate walks its input.  Stopping at element three of
- * a million costs three boxed atoms, not a million. */
+ * Elements are pulled one at a time via collection_elem, as ray_fold_fn
+ * does, never boxed up front: for a primitive whose whole purpose is to
+ * stop early, paying for the tail it never reaches would defeat it
+ * (issue 588).  Stopping at element three of a million costs three boxed
+ * atoms, not a million. */
 ray_t* ray_fold_while_fn(ray_t** args, int64_t n) {
     if (n != 4) return ray_error("domain", "fold-while: requires exactly 4 args (pred, fn, init, coll), got %lld", (long long)n);
     for (int64_t i = 0; i < n; i++)
@@ -4903,45 +4940,33 @@ ray_t* ray_fold_right_fn(ray_t** args, int64_t n) {
         if (ray_is_lazy(args[i])) args[i] = ray_lazy_materialize(args[i]);
 
     ray_t* fn = args[0];
-    ray_t* _bx = NULL;
+    ray_t* coll = args[n == 2 ? 1 : 2];
+    if (RAY_IS_ERR(coll)) return coll;
+    if (!is_collection(coll)) return ray_error("type", "fold-right: vec arg must be a list, got %s", ray_type_name(coll->type));
+    int64_t len = ray_len(coll);
     ray_t* acc;
-    ray_t* vec;
-
+    int64_t start;
     if (n == 2) {
         /* (fold-right fn vec) — use last element as initial value */
-        vec = unbox_vec_arg(args[1], &_bx);
-        if (RAY_IS_ERR(vec)) return vec;
-        if (!is_list(vec)) { if (_bx) ray_release(_bx); return ray_error("type", "fold-right: vec arg must be a list, got %s", ray_type_name(vec->type)); }
-        int64_t len = ray_len(vec);
-        if (len == 0) { if (_bx) ray_release(_bx); return ray_error("domain", "fold-right: empty list has no initial value, got %lld", (long long)len); }
-        ray_t** elems = (ray_t**)ray_data(vec);
-        ray_retain(elems[len - 1]);
-        acc = elems[len - 1];
-        for (int64_t i = len - 2; i >= 0; i--) {
-            ray_t* next = call_fn2(fn, elems[i], acc);
-            ray_release(acc);
-            if (RAY_IS_ERR(next)) { if (_bx) ray_release(_bx); return next; }
-            acc = next;
-        }
-        if (_bx) ray_release(_bx);
-        return acc;
+        if (len == 0) return ray_error("domain", "fold-right: empty list has no initial value, got %lld", (long long)len);
+        acc = iter_elem_owned(coll, len - 1);
+        if (RAY_IS_ERR(acc)) return acc;
+        start = len - 2;
+    } else {
+        /* (fold-right fn init coll) */
+        ray_retain(args[1]);
+        acc = args[1];
+        start = len - 1;
     }
-
-    /* (fold-right fn init coll) */
-    ray_retain(args[1]);
-    acc = args[1];
-    vec = unbox_vec_arg(args[2], &_bx);
-    if (RAY_IS_ERR(vec)) { ray_release(acc); return vec; }
-    if (!is_list(vec)) { ray_release(acc); if (_bx) ray_release(_bx); return ray_error("type", "fold-right: vec arg must be a list, got %s", ray_type_name(vec->type)); }
-    int64_t len = ray_len(vec);
-    ray_t** elems = (ray_t**)ray_data(vec);
-    for (int64_t i = len - 1; i >= 0; i--) {
-        ray_t* next = call_fn2(fn, elems[i], acc);
+    for (int64_t i = start; i >= 0; i--) {
+        int owned = 0;
+        ray_t* elem = iter_elem(coll, i, &owned);
+        ray_t* next = RAY_IS_ERR(elem) ? elem : call_fn2(fn, elem, acc);
+        if (owned) ray_release(elem);
         ray_release(acc);
-        if (RAY_IS_ERR(next)) { if (_bx) ray_release(_bx); return next; }
+        if (RAY_IS_ERR(next)) return next;
         acc = next;
     }
-    if (_bx) ray_release(_bx);
     return acc;
 }
 
@@ -4957,37 +4982,33 @@ ray_t* ray_scan_right_fn(ray_t** args, int64_t n) {
         if (ray_is_lazy(args[i])) args[i] = ray_lazy_materialize(args[i]);
 
     ray_t* fn = args[0];
-    ray_t* _bx = NULL;
-    ray_t* vec = unbox_vec_arg(args[1], &_bx);
-    if (RAY_IS_ERR(vec)) return vec;
-    if (!is_list(vec)) { if (_bx) ray_release(_bx); return ray_error("type", "scan-right: vec arg must be a list, got %s", ray_type_name(vec->type)); }
-    int64_t len = ray_len(vec);
-    if (len == 0) {
-        if (_bx) ray_release(_bx);
-        ray_t* result = ray_alloc(0);
-        if (!result) return ray_error("oom", NULL);
-        result->type = RAY_LIST;
-        result->len = 0;
-        return result;
-    }
+    ray_t* coll = args[1];
+    if (RAY_IS_ERR(coll)) return coll;
+    if (!is_collection(coll)) return ray_error("type", "scan-right: vec arg must be a list, got %s", ray_type_name(coll->type));
+    int64_t len = ray_len(coll);
 
     ray_t* result = ray_alloc(len * sizeof(ray_t*));
-    if (!result) { if (_bx) ray_release(_bx); return ray_error("oom", NULL); }
+    if (!result) return ray_error("oom", NULL);
     result->type = RAY_LIST;
-    result->len = len;
+    result->len = 0;
+    if (len == 0) return result;
     ray_t** out = (ray_t**)ray_data(result);
-    ray_t** elems = (ray_t**)ray_data(vec);
 
-    ray_retain(elems[len - 1]);
-    out[len - 1] = elems[len - 1];
+    /* Filled from the end, so the error path releases the tail by hand. */
+    out[len - 1] = iter_elem_owned(coll, len - 1);
+    if (RAY_IS_ERR(out[len - 1])) { ray_t* err = out[len - 1]; ray_release(result); return err; }
     for (int64_t i = len - 2; i >= 0; i--) {
-        out[i] = call_fn2(fn, elems[i], out[i + 1]);
-        if (RAY_IS_ERR(out[i])) {
+        int owned = 0;
+        ray_t* elem = iter_elem(coll, i, &owned);
+        ray_t* next = RAY_IS_ERR(elem) ? elem : call_fn2(fn, elem, out[i + 1]);
+        if (owned) ray_release(elem);
+        if (RAY_IS_ERR(next)) {
             for (int64_t j = i + 1; j < len; j++) ray_release(out[j]);
-            result->len = 0; ray_release(result); if (_bx) ray_release(_bx);
-            return out[i];
+            ray_release(result);
+            return next;
         }
+        out[i] = next;
     }
-    if (_bx) ray_release(_bx);
+    result->len = len;
     return result;
 }

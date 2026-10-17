@@ -1,4 +1,8 @@
-CC      ?= clang
+# GNU make predefines CC=cc, so ?= cannot select clang as the default.
+# Keep command-line and environment overrides intact.
+ifeq ($(origin CC),default)
+CC = clang
+endif
 # Some targets need clang specifically regardless of $(CC): the fuzzing
 # runtime (-fsanitize=fuzzer) and -MJ compilation-database fragments are
 # clang-only.  Same precedent as `make coverage`, which pins CC=clang.

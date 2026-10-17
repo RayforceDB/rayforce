@@ -861,7 +861,7 @@ RTimedead -- [09:30:00.000 11:00:00.000]
 ;; widened the way the out-of-band integer and float sentinels had to be.
 (set TN (table [c s] (list [true false true] (as 'SYM ["a" "b" "c"]))))
 (type (at (select {r: (if c s ') from: TN}) 'r)) -- 'SYM
-(format "%s" (at (select {r: (if c s ') from: TN}) 'r)) -- "[a null c]s"
+(format "%s" (at (select {r: (if c s ') from: TN}) 'r)) -- "[a ' c]s"
 
 ;; ── a parted column answers as the same data flattened does ────────────
 ;; Its type is carried in a wrapper that no promotion ladder knows, so the

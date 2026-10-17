@@ -544,6 +544,13 @@ static ray_err_t splay_write_table_impl(ray_t* tbl, const char* dir,
     if (build_indexes)
         ray_splay_build_indexes(dir, tbl);
 
+    /* A cancel before the commit marker leaves nothing committed: the
+     * write finish removes what this save created. */
+    if (ray_interrupted()) {
+        ray_release(schema);
+        return RAY_ERR_CANCEL;
+    }
+
     /* 3. .d LAST — the commit marker. */
     {
         char path[1024];
@@ -733,6 +740,13 @@ static void splay_remove_created(const ray_splay_write_t* write, bool unlink_loc
 
 ray_err_t ray_splay_write_finish(ray_splay_write_t* write, ray_err_t result,
                                   bool durable) {
+    /* The last moment a cancel can stop a staged write: its generation is
+     * not published yet, so the call reports the cancel and the previous
+     * one stays current.  A first write commits in place with its .d, so
+     * the writers check before writing it; this check is the deliberate
+     * backstop for the .d write itself and for writers yet to come. */
+    if (result == RAY_OK && write->staged && ray_interrupted())
+        result = RAY_ERR_CANCEL;
     if (result == RAY_OK && write->staged) {
         /* ray_file_sync_dir syncs the PARENT of its argument. */
         char schema[1100];
@@ -1380,6 +1394,12 @@ void ray_splay_build_indexes(const char* dir, ray_t* tbl) {
             else if (hi) { if (RAY_IS_ERR(hi)) ray_error_free(hi); else ray_release(hi); }
         }
         ray_pool_dispatch_n(pool, splay_persist_task, &ctx, (uint32_t)nc);
+        /* A cancel skips the persist tasks not yet started: their columns
+         * go unindexed, and what they would have written is released. */
+        for (int64_t c = 0; c < nc; c++) {
+            if (ctx.hashed[c]) ray_release(ctx.hashed[c]);
+            if (deferred[c]) ray_release(deferred[c]);
+        }
         ray_sys_free(deferred);
     } else {
         for (int64_t c = 0; c < nc; c++) splay_build_index_col(dir, tbl, c, NULL);

@@ -5502,6 +5502,40 @@ static test_result_t test_dotted_missing_key(void) {
     PASS();
 }
 
+/* A dotted read looks the whole name up flat before it walks the dicts, and
+ * the global table answers that lookup from a filter of the names it has
+ * ever held.  A dotted name bound flat must still win over the walk, from
+ * the top level and from compiled code, and the walk must take over again
+ * once the flat slot is deleted. */
+static test_result_t test_dotted_flat_binding_wins(void) {
+    ray_eval_str("(set __fb.k 1)");
+    ray_eval_str("(set __fb_read (fn [] __fb.k))");
+    ASSERT_EQ("__fb.k", "1");
+    ASSERT_EQ("(__fb_read)", "1");
+
+    static const char name[] = "__fb.k";
+    int64_t id = ray_sym_intern(name, sizeof(name) - 1);
+    TEST_ASSERT_TRUE(ray_sym_is_dotted(id));
+    ray_t* two = ray_i64(2);
+    TEST_ASSERT_EQ_I(ray_env_bind_flat(id, two), RAY_OK);
+    ray_release(two);
+    ASSERT_EQ("__fb.k", "2");
+    ASSERT_EQ("(__fb_read)", "2");
+
+    TEST_ASSERT_EQ_I(ray_env_bind_flat(id, NULL), RAY_OK);
+    ASSERT_EQ("__fb.k", "1");
+    ASSERT_EQ("(__fb_read)", "1");
+
+    /* Many globals, then reads that never had a flat slot. */
+    ray_eval_str("(set __fb_many (fn [n] (times [i n] (set __fb.k i))))");
+    ray_eval_str("(__fb_many 300)");
+    ASSERT_EQ("(__fb_read)", "299");
+    ray_t* r = ray_eval_str("__fb.missing");
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    ray_error_free(r);
+    PASS();
+}
+
 static test_result_t test_dotted_del_removes_key(void) {
     ray_eval_str("(set __dns.x 5)");
     ray_eval_str("(set __dns.y 10)");
@@ -9961,6 +9995,7 @@ const test_entry_t lang_entries[] = {
     { "lang/dotted/update_in_place", test_dotted_update_in_place, lang_setup, lang_teardown },
     { "lang/dotted/wrong_type_parent", test_dotted_wrong_type_parent, lang_setup, lang_teardown },
     { "lang/dotted/missing_key", test_dotted_missing_key, lang_setup, lang_teardown },
+    { "lang/dotted/flat_binding_wins", test_dotted_flat_binding_wins, lang_setup, lang_teardown },
     { "lang/dotted/del_removes_key", test_dotted_del_removes_key, lang_setup, lang_teardown },
     { "lang/dotted/del_nested", test_dotted_del_nested, lang_setup, lang_teardown },
     { "lang/dotted/del_cascade", test_dotted_del_cascade, lang_setup, lang_teardown },

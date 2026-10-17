@@ -212,7 +212,10 @@ Null values propagate through casts. A typed null in one type becomes a typed nu
     - `0Nt` — null time
     - `0Np` — null timestamp
 
-    `SYM` has no typed null literal (`0Ns` does not parse).
+    `SYM` has no `0N` literal (`0Ns` does not parse): its null is the empty
+    symbol, written `'`. `(nil? ')` is `true`, and it prints as `'`, so a
+    printed vector such as `[a ' b]` reads back as the same value. `STR`'s null
+    is the empty string `""`.
 
     Use `nil?` to test for null values: `(nil? 0Ni)` returns `true`.
 

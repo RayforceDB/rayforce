@@ -79,7 +79,10 @@ all columns into a fresh directory below `.generations/`. After the files are
 complete, it atomically replaces the small `.current` manifest. Readers follow
 that manifest, so they see either the previous complete generation or the new
 complete generation — never a mixture of columns from both. A failed write
-before publication leaves the previous generation selected. Tables written by
+before publication leaves the previous generation selected. A cancelled write
+reports `cancel` and changes nothing: the previous generation stays selected,
+and a cancelled first write leaves no table behind, while files that were
+already in the directory before the write are kept. Tables written by
 older Rayforce versions remain readable; the first replacement upgrades the
 directory to the generation layout.
 

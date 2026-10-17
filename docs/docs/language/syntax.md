@@ -124,7 +124,11 @@ sentinel for their type:
 (nil? 0Nl)   ; true
 ```
 
-Symbols have no typed null literal (there is no `0Ns`).
+Symbols have no `0N` null literal (there is no `0Ns`). Their null is the
+empty symbol, written as a lone quote `'`, and it works wherever a symbol
+does: `(set s ')`, `(take ' 3)` is `[' ' ']`, `[a ' b]`, `{k: '}`. It prints as
+`'` too, so a printed vector reads back as the same value. The symbol `null`
+is an ordinary symbol, not the null.
 
 `nil?` is element-wise: given a vector or a list it returns a `B8` vector with
 one entry per element, so `(where (nil? v))` and `(sum (as 'I64 (nil? v)))`

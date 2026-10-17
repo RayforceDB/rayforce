@@ -177,7 +177,7 @@ G -- 700
 ;; it read position 0's flag), a cell at position 64 is still a cell (an
 ;; empty cell is empty text, the rows where: keeps included), and a STR cell
 ;; there still makes the result STR
-(at (select {r: (concat (first s) 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z ') from: TC}) 'r) -- [null]
+(at (select {r: (concat (first s) 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z ') from: TC}) 'r) -- [']
 (at (select {r: (concat 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z (first s)) from: TC}) 'r) -- [zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzza]
 (at (select {r: (concat 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z (first s)) from: (select {from: TC where: (== x 2)})}) 'r) -- [zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz]
 (at (select {r: (concat 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z (first s)) from: TS}) 'r) -- ["zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzza"]

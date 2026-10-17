@@ -2584,7 +2584,8 @@ static void where_emit_fn(void* ctxp, uint32_t wid, int64_t start, int64_t end) 
 
 ray_t* ray_where_fn(ray_t* x) {
     if (!ray_is_vec(x) || x->type != RAY_BOOL)
-        return ray_error("type", "where: argument must be a b8 vector, got %s", ray_type_name(x->type));
+        return ray_error("type", "where: argument must be a B8 vector, got %s%s",
+                         ray_type_name(x->type), ray_is_atom(x) ? " atom" : "");
     const uint8_t* data = (const uint8_t*)ray_data(x);
     int64_t n = x->len;
 
@@ -2780,11 +2781,27 @@ uint64_t ray_atom_hash(ray_t* a) {
                 h = ray_hash_combine(h, ray_atom_hash(elems[i]));
             return h;
         }
+        case RAY_TABLE: {
+            /* atom_eq: same names in order, equal columns.  Hashing them
+             * only spreads the buckets: the default arm's type and length
+             * would put every table of one length in one bucket. */
+            int64_t nc = ray_table_ncols(a);
+            uint64_t h = ray_hash_i64(nc);
+            for (int64_t c = 0; c < nc; c++) {
+                h = ray_hash_combine(h, ray_hash_i64(ray_table_col_name(a, c)));
+                h = ray_hash_combine(h, ray_atom_hash(ray_table_get_col_idx(a, c)));
+            }
+            return h;
+        }
+        case RAY_DICT:
+            return ray_hash_combine(ray_atom_hash(ray_dict_keys(a)),
+                                    ray_atom_hash(ray_dict_vals(a)));
         default:
             /* Vec or unknown atom kind: fold type tag and length.  Two
-             * structurally-equal lists never reach here (RAY_LIST branch
-             * above) so we can't accidentally produce different hashes
-             * for atom_eq-equal pairs. */
+             * structurally-equal lists, tables or dicts never reach here
+             * (RAY_LIST / RAY_TABLE / RAY_DICT arms above) so we can't
+             * accidentally produce different hashes for atom_eq-equal
+             * pairs. */
             return ray_hash_i64(((int64_t)a->type << 32) ^ (int64_t)a->len);
     }
 }
