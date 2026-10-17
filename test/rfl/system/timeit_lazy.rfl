@@ -1,0 +1,26 @@
+;; timeit and .mem.ts must force a lazy result inside the measured span (#856).
+;; A reduction over a named vector returns a lazy handle; if it is only built
+;; (and released) inside the span, no worker ever runs and the reported time
+;; covers graph construction alone.  Worker activity is a deterministic proxy
+;; for "the work ran inside the scope", unlike a wall-clock bound.
+(set _tlv (as 'F64 (til 1000000)))
+
+;; .mem.ts: the reduction runs inside the measurement, and returns its value.
+(set _tlm (.mem.ts (sum _tlv)))
+(at _tlm 'result) -- 499999500000.0
+(> (at _tlm 'workers) 0) -- true
+(> (at _tlm 'worker-busy-ns) 0) -- true
+
+;; timeit: the timed reduction executes (observed via an enclosing .mem.ts).
+(set _tlt (.mem.ts (timeit (sum _tlv))))
+(type (at _tlt 'result)) -- 'f64
+(> (at _tlt 'workers) 0) -- true
+(> (at _tlt 'worker-busy-ns) 0) -- true
+
+;; Same through a lambda returning the lazy reduction.
+(set _tlf (fn [] (sum _tlv)))
+(set _tltf (.mem.ts (timeit (_tlf))))
+(> (at _tltf 'worker-busy-ns) 0) -- true
+
+;; Errors from the timed expression still propagate.
+(try (timeit (+ 1 'a)) (fn [e] 'err)) -- 'err

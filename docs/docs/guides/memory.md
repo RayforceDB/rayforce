@@ -152,7 +152,7 @@ The progress bar is cleared automatically when the query completes and the resul
 
 ## 6. The `timeit` Function
 
-Wrap any expression in `(timeit ...)` to measure its execution time. It evaluates the expression, discards the result, and **returns the elapsed time in milliseconds** as an f64 value.
+Wrap any expression in `(timeit ...)` to measure its execution time. It evaluates the expression, discards the result, and **returns the elapsed time in milliseconds** as an f64 value. A deferred (lazy) result, such as a bare `(sum v)`, is forced inside the timed span, so the figure covers the computation, not the construction of its graph.
 
 ```lisp
 ;; Time a simple vector operation

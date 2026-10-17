@@ -259,7 +259,7 @@ Query `concat` joins text row by row when an operand comes from a source column,
 | `except` | binary | — | Set difference (elements in A not in B) | `(except [1 2 3] [2])` → `[1 3]` |
 | `union` | binary | — | Set union (deduplicated) | `(union [1 2] [2 3])` → `[1 2 3]` |
 | `sect` | binary | — | Set intersection | `(sect [1 2 3] [2 3 4])` → `[2 3]` |
-| `take` | binary | — | Take first N elements (negative N takes from end); past the length it cycles | `(take [10 20 30] 2)` → `[10 20]`; `(take [1 2 3] -5)` → `[2 3 1 2 3]` |
+| `take` | binary | — | Take first N elements (negative N takes from end); past the length it cycles. A parted table handle (`.db.parted.get`) is taken as its flat table: the same rows `(at table (til n))` returns, cycling past the row count | `(take [10 20 30] 2)` → `[10 20]`; `(take [1 2 3] -5)` → `[2 3 1 2 3]` |
 | `drop` | binary | — | Drop first N elements (negative N drops from end) | `(drop [10 20 30] 1)` → `[20 30]` |
 | `rotate` | binary | — | Rotate left by N positions (negative rotates right) | `(rotate [1 2 3 4] 1)` → `[2 3 4 1]` |
 | `cut` | binary | — | Split a collection at sorted 0-based indices | `(cut [1 2 3 4] [2])` → `([1 2] [3 4])` |

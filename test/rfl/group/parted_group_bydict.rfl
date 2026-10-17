@@ -104,5 +104,83 @@
 (at RPd 'sv) -- (at RFd 'sv)
 (at RPd 'cv) -- (at RFd 'cv)
 
+;; ══════════════════════════════════════════════════════════════════════════
+;; (e) LIST by-dict value — `by: {a: l}` over a LIST column groups as `by: l`
+;;     does (structural equality of the cells), under the alias.  The by-dict
+;;     loop took only typed vectors and answered `by-dict val must be a
+;;     column vector`, in memory as well.  Alongside: a composite key with a
+;;     LIST part built its key column with vec_new(LIST) (non-aggregate and
+;;     no-output forms), and the eval-level grouping read the cells of a
+;;     parted table row by row without flattening it (LIST, STR and GUID keys
+;;     beside a row output; a by-dict alias the flattened copy dropped).
+;; ══════════════════════════════════════════════════════════════════════════
+(set LX1 [1 2 3 4 5])
+(set LX2 [10 20 30 40 50])
+(set LS ['a 'b 'a 'b 'a])
+(set LL (list [1 2] [3] [1 2] [0Nl] [3]))
+(set LW ["p" "q" "p" "" "q"])
+(set LGU (take (guid 2) 5))
+(set LI (table [x s l w g] (list LX1 LS LL LW LGU)))
+(.sys.exec "rm -rf /tmp/rfl_pgbd_list /tmp/rfl_pgbd_lsp")
+(.db.splayed.set "/tmp/rfl_pgbd_list/1/t/" LI)
+(.db.splayed.set "/tmp/rfl_pgbd_list/2/t/" (table [x s l w g] (list LX2 LS LL LW LGU)))
+(.db.splayed.set "/tmp/rfl_pgbd_lsp/" LI)
+(set LP (.db.parted.get "/tmp/rfl_pgbd_list/" 't))
+(set LSP (.db.splayed.get "/tmp/rfl_pgbd_lsp/"))
+;; flat oracle of the parted rows (part 1 ++ part 2)
+(set LF (table [x s l w g] (list (concat LX1 LX2) (concat LS LS) (concat LL LL) (concat LW LW) (concat LGU LGU))))
+
+;; in memory: the alias names the key, the groups are by: l's
+(set RLa (select {x: (sum x) from: LI by: {a: l}}))
+(key RLa) -- [a x]
+(at RLa 'a) -- (list [1 2] [3] [0Nl])
+(at RLa 'x) -- [4 7 4]
+(at RLa 'x) -- (at (select {x: (sum x) from: LI by: l}) 'x)
+(nil? (last (at RLa 'a))) -- [true]
+(at (select {x: x from: LI by: {a: l}}) 'x) -- (list [1 3] [2 5] [4])
+(at (select {x: (count x) from: LI where: (> x 1) by: {a: l}}) 'a) -- (list [3] [1 2] [0Nl])
+(key (select {from: LI by: {a: l}})) -- [a x s l w g]
+;; composite key with a LIST part, row output and no output
+(set RLc (select {x: x from: LI by: [l s]}))
+(at RLc 'l) -- (list [1 2] [3] [0Nl] [3])
+(at RLc 's) -- ['a 'b 'b 'a]
+(at RLc 'x) -- (list [1 3] [2] [4] [5])
+(at (select {from: LI by: [l s]}) 'x) -- [1 2 4 5]
+(set RLd (select {x: x from: LI by: {a: l t: s}}))
+(key RLd) -- [a t x]
+(at RLd 'a) -- (list [1 2] [3] [0Nl] [3])
+(at RLd 'x) -- (list [1 3] [2] [4] [5])
+(at (select {x: (sum x) from: LI by: {a: l t: s}}) 'x) -- [4 2 4 5]
+
+;; splayed: the same answers
+(at (select {x: (sum x) from: LSP by: {a: l}}) 'a) -- (at RLa 'a)
+(at (select {x: (sum x) from: LSP by: {a: l}}) 'a) -- (at (select {x: (sum x) from: LSP by: l}) 'l)
+(at (select {x: (sum x) from: LSP by: {a: l}}) 'x) -- [4 7 4]
+(at (select {x: x from: LSP by: {a: l t: s}}) 'x) -- (at RLd 'x)
+
+;; parted: parity with the flat oracle
+(set PLa (select {x: (sum x) from: LP by: {a: l}}))
+(at PLa 'a) -- (at (select {x: (sum x) from: LF by: {a: l}}) 'a)
+(at PLa 'a) -- (at (select {x: (sum x) from: LP by: l}) 'l)
+(at PLa 'x) -- [44 77 44]
+(at PLa 'x) -- (at (select {x: (sum x) from: LF by: l}) 'x)
+(at (select {x: (sum x) from: LP by: l}) 'x) -- [44 77 44]
+(at (select {x: x from: LP by: l}) 'x) -- (at (select {x: x from: LF by: l}) 'x)
+(at (select {x: x from: LP by: {a: l}}) 'x) -- (list [1 3 10 30] [2 5 20 50] [4 40])
+(at (select {x: (sum x) from: LP where: (> x 2) by: {a: l}}) 'x) -- (at (select {x: (sum x) from: LF where: (> x 2) by: {a: l}}) 'x)
+(at (select {x: (sum x) from: LP by: [l s]}) 'x) -- [44 22 44 55]
+(at (select {x: x from: LP by: [l s]}) 'x) -- (at (select {x: x from: LF by: [l s]}) 'x)
+(set PLd (select {x: x from: LP by: {a: l t: s}}))
+(at PLd 'a) -- (at RLd 'a)
+(at PLd 'a) -- (at (select {x: x from: LP by: [l s]}) 'l)
+(at PLd 'x) -- (list [1 3 10 30] [2 20] [4 40] [5 50])
+(at (select {from: LP by: {a: l t: s}}) 'x) -- [1 2 4 5]
+;; STR and GUID keys beside a row output read the parted cells the same way
+(at (select {x: x from: LP by: w}) 'x) -- (at (select {x: x from: LF by: w}) 'x)
+(at (select {x: x from: LP by: {a: w}}) 'x) -- (list [1 3 10 30] [2 5 20 50] [4 40])
+(at (select {x: x from: LP by: g}) 'x) -- (at (select {x: x from: LF by: g}) 'x)
+(at (select {x: x from: LP by: {a: g t: s}}) 'x) -- (at (select {x: x from: LF by: {a: g t: s}}) 'x)
+(.sys.exec "rm -rf /tmp/rfl_pgbd_list /tmp/rfl_pgbd_lsp")
+
 ;; ─── cleanup ─────────────────────────────────────────────────────────────────
 (.sys.exec "rm -rf /tmp/rfl_pgbd")
