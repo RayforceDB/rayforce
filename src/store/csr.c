@@ -116,16 +116,6 @@ insertion:
     ray_free_raw(cells);
 }
 
-/* Build one CSR direction straight from the edge columns by counting sort:
- * degree count, prefix sum, scatter in row order, then sort each list.
- *
- * keys[i] is the list an edge belongs to and vals[i] its target; a NULL
- * keys means key = i (an FK column: every row of the source table is one
- * node with one outgoing edge).  An edge whose key falls outside
- * [0, n_nodes) is dropped; its val is stored as-is, like the row index.
- *
- * The lists come out sorted by (target, row), the one order a build from
- * these edges has ever had, so `sort_targets` only records that fact. */
 /* Parallel two-level build.  Keys are first partitioned into B contiguous
  * node-range buckets (B ~ CSR_PAR_BUCKETS, each a power-of-two range of
  * nodes), then every bucket is counting-sorted on its own.  Each task has
@@ -135,7 +125,7 @@ insertion:
  * Scratch is (key, val) as int32 when n_nodes fits (the usual case; the
  * scatter is memory-bound and this cuts its traffic by a third) plus the
  * int64 row, so 16 bytes per edge; 24 with int64 keys. */
-int64_t ray_csr_par_min_edges = 1 << 20;   /* below this the serial build wins; tests lower it */
+int64_t ray_csr_par_min_edges = 1 << 20;
 #define CSR_PAR_MAX_TASKS  8           /* memory-bound: 4-8 tasks is the knee on a 32-thread box */
 #define CSR_PAR_BUCKETS    256
 
@@ -242,16 +232,27 @@ static void csr_par_bucket_fn(void* ctx, uint32_t wid, int64_t start, int64_t en
     }
 }
 
+/* A cancelled dispatch skips the tasks that have not started and returns
+ * normally (pool.h, ORDER CONTRACT); every pass here needs all of its
+ * tasks, so after each one the build asks and gives up on a cancel. */
+static inline bool csr_par_cancelled(ray_pool_t* pool) {
+    if (ray_interrupted()) return true;
+    return atomic_load_explicit(&pool->cancelled, memory_order_relaxed);
+}
+
 /* Count valid edges and fill out->offsets/targets/rowmap in parallel.
- * Returns false (nothing allocated into out) when the pool should not be
- * used or scratch cannot be had; the caller then builds serially. */
-static bool csr_build_parallel(const int64_t* keys, const int64_t* vals,
-                               int64_t n_edges, int64_t n_nodes,
-                               ray_csr_t* out) {
+ * Returns 1 when out is built, 0 when the pool should not be used or
+ * scratch cannot be had (nothing is left in out; the caller builds
+ * serially), -1 when a cancel interrupted a pass (nothing is left in out;
+ * the caller reports RAY_ERR_CANCEL rather than hand back a CSR whose
+ * skipped tasks never wrote their slots). */
+static int csr_build_parallel(const int64_t* keys, const int64_t* vals,
+                              int64_t n_edges, int64_t n_nodes,
+                              ray_csr_t* out) {
     ray_pool_t* pool = ray_pool_get();
     if (!ray_pool_par_dispatch_ok(pool, n_edges, ray_csr_par_min_edges) ||
         n_nodes < 2)
-        return false;
+        return 0;
     int T = (int)ray_pool_total_workers(pool);
     if (T > CSR_PAR_MAX_TASKS) T = CSR_PAR_MAX_TASKS;
     int shift = 0;
@@ -276,9 +277,13 @@ static bool csr_build_parallel(const int64_t* keys, const int64_t* vals,
     c.srow   = ray_alloc_raw((size_t)n_edges * sizeof(int64_t));
     c.pos    = ray_alloc_raw((size_t)n_nodes * sizeof(int64_t));
     bool ok = c.hist && c.bstart && c.skeys && c.svals && c.srow && c.pos;
+    bool cancelled = false;
 
     if (ok) {
         ray_pool_dispatch_n(pool, csr_par_hist_fn, &c, (uint32_t)T);
+        cancelled = csr_par_cancelled(pool);
+    }
+    if (ok && !cancelled) {
         int64_t run = 0;
         for (int b = 0; b < B; b++) {
             c.bstart[b] = run;
@@ -306,27 +311,46 @@ static bool csr_build_parallel(const int64_t* keys, const int64_t* vals,
             c.rmap = (int64_t*)ray_data(out->rowmap);
             c.off[n_nodes] = valid_edges;
             ray_pool_dispatch_n(pool, csr_par_scatter_fn, &c, (uint32_t)T);
-            ray_pool_dispatch_n(pool, csr_par_bucket_fn,  &c, (uint32_t)B);
-        } else {
+            cancelled = csr_par_cancelled(pool);
+            if (!cancelled) {
+                ray_pool_dispatch_n(pool, csr_par_bucket_fn, &c, (uint32_t)B);
+                cancelled = csr_par_cancelled(pool);
+            }
+        }
+        if (!ok || cancelled) {
             if (out->offsets && !RAY_IS_ERR(out->offsets)) ray_release(out->offsets);
             if (out->targets && !RAY_IS_ERR(out->targets)) ray_release(out->targets);
             if (out->rowmap  && !RAY_IS_ERR(out->rowmap))  ray_release(out->rowmap);
             out->offsets = out->targets = out->rowmap = NULL;
+            out->n_edges = 0;
         }
     }
     ray_free_raw(c.hist);  ray_free_raw(c.bstart);
     ray_free_raw(c.skeys); ray_free_raw(c.svals);
     ray_free_raw(c.srow);  ray_free_raw(c.pos);
-    return ok;
+    if (cancelled) return -1;
+    return ok ? 1 : 0;
 }
 
+/* Build one CSR direction straight from the edge columns by counting sort:
+ * degree count, prefix sum, scatter in row order, then sort each list.
+ *
+ * keys[i] is the list an edge belongs to and vals[i] its target; a NULL
+ * keys means key = i (an FK column: every row of the source table is one
+ * node with one outgoing edge).  An edge whose key falls outside
+ * [0, n_nodes) is dropped; its val is stored as-is, like the row index.
+ *
+ * The lists come out sorted by (target, row), the one order a build from
+ * these edges has ever had, so `sort_targets` only records that fact. */
 static ray_err_t csr_build_direct(const int64_t* keys, const int64_t* vals,
                                   int64_t n_edges, int64_t n_nodes,
                                   bool sort_targets, ray_csr_t* out) {
     out->n_nodes = n_nodes;
     out->props = NULL;
 
-    if (csr_build_parallel(keys, vals, n_edges, n_nodes, out)) {
+    int par = csr_build_parallel(keys, vals, n_edges, n_nodes, out);
+    if (par < 0) return RAY_ERR_CANCEL;
+    if (par > 0) {
         csr_sort_adjacency_lists(out);
         out->sorted = sort_targets;
         return RAY_OK;

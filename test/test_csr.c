@@ -3669,8 +3669,6 @@ static test_result_t test_csr_tiebreak_determinism(void) {
 /* A hub whose list is long enough to leave the insertion sort behind must
  * come out in the same (target, row) order as a short list does, in both
  * directions, with out-of-range keys dropped and their rows skipped. */
-extern int64_t ray_csr_par_min_edges;
-
 /* The parallel two-level build must produce the same three arrays as the
  * serial counting sort, byte for byte.  Build one graph both ways by moving
  * the size threshold: 0 forces the parallel path (the harness runs with
@@ -3745,6 +3743,38 @@ static test_result_t csr_par_vs_serial(bool wide_value) {
 
     ray_rel_free(a);
     ray_rel_free(b);
+    PASS();
+}
+
+/* A cancel during the parallel build must not hand back a CSR: skipped
+ * tasks never write their slots.  Arm the interrupt first so every pass
+ * is cut short, then check the build reports the cancel with nothing
+ * left in the relation. */
+static test_result_t test_csr_parallel_cancel(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+    enum { N_NODES = 3000, M = 20000 };
+    int64_t* s = ray_alloc_raw((size_t)M * sizeof(int64_t));
+    int64_t* d = ray_alloc_raw((size_t)M * sizeof(int64_t));
+    TEST_ASSERT(s && d, "scratch");
+    for (int64_t i = 0; i < M; i++) { s[i] = (i * 7919) % N_NODES; d[i] = (i * 104729) % N_NODES; }
+    ray_t* sv = ray_vec_from_raw(RAY_I64, s, M);
+    ray_t* dv = ray_vec_from_raw(RAY_I64, d, M);
+    ray_free_raw(s); ray_free_raw(d);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("src", 3), sv);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("dst", 3), dv);
+    ray_release(sv); ray_release(dv);
+
+    int64_t saved = ray_csr_par_min_edges;
+    ray_csr_par_min_edges = 0;
+    ray_request_interrupt();
+    ray_rel_t* r = ray_rel_from_edges(tbl, "src", "dst", N_NODES, N_NODES, true);
+    ray_clear_interrupt();
+    ray_csr_par_min_edges = saved;
+    ray_release(tbl);
+
+    TEST_ASSERT(r == NULL, "a cancelled parallel build returns no relation");
     PASS();
 }
 
@@ -3844,6 +3874,7 @@ const test_entry_t csr_entries[] = {
     { "csr/tiebreak_determinism", test_csr_tiebreak_determinism, NULL, NULL },
     { "csr/hub_order", test_csr_hub_order, NULL, NULL },
     { "csr/parallel_matches_serial", test_csr_parallel_matches_serial, NULL, NULL },
+    { "csr/parallel_cancel", test_csr_parallel_cancel, NULL, NULL },
     { "csr/build", test_csr_build, NULL, NULL },
     { "csr/sorted", test_csr_sorted, NULL, NULL },
     { "csr/expand", test_expand, NULL, NULL },
