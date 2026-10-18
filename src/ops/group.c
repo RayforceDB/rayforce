@@ -8509,6 +8509,8 @@ struct scalar_ctx_s {
     ray_t**        sym_strings;  /* borrowed sym snapshot for strlen-on-SYM aggs */
     uint32_t       sym_count;
     const ray_str_t** agg_str;   /* strlen-on-STR: descriptors resolved once */
+    const ray_sym_domain_raw_t* agg_raw;  /* strlen-on-SYM: pinned vocabulary per agg (agg_raw_ok) */
+    const uint8_t* agg_raw_ok;
     uint16_t*      agg_ops;
     agg_linear_t*  agg_linear;
     agg_prod_t*    agg_prod;     /* fused SUM/AVG(a*b) slots (may be NULL) */
@@ -8713,10 +8715,23 @@ static inline void scalar_accum_row(scalar_ctx_t* c, da_accum_t* acc, int64_t r)
             if (!c->agg_ptrs[a]) continue;
             if (c->agg_strlen && c->agg_strlen[a]) {
                 /* STR: the descriptor's length (a null is the empty
-                 * string, length 0); SYM through the borrowed snapshot. */
-                iv = c->agg_str[a] ? (int64_t)c->agg_str[a][r].len
-                                   : group_strlen_at_cached(c->agg_cols[a], r,
-                                                            c->sym_strings, c->sym_count);
+                 * string, length 0); SYM: a FILE-domain id from the pinned
+                 * mapping, else through the borrowed snapshot. */
+                if (c->agg_str[a]) {
+                    iv = (int64_t)c->agg_str[a][r].len;
+                } else if (c->agg_raw_ok[a]) {   /* a pinned SYM column */
+                    const ray_t* scol = c->agg_cols[a];
+                    int64_t sid = ray_read_sym(ray_data((ray_t*)scol), r, RAY_SYM, scol->attrs);
+                    if (sid > 0 && sid < c->agg_raw[a].count) {
+                        size_t sl;
+                        (void)ray_sym_domain_raw_str(&c->agg_raw[a], sid, &sl);
+                        iv = (int64_t)sl;
+                    } else {
+                        iv = group_strlen_at_cached(scol, r, c->sym_strings, c->sym_count);
+                    }
+                } else {
+                    iv = group_strlen_at_cached(c->agg_cols[a], r, c->sym_strings, c->sym_count);
+                }
                 fv = (double)iv;
             } else {
                 uint8_t attrs = c->agg_cols[a] ? c->agg_cols[a]->attrs : 0;
@@ -12978,13 +12993,20 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         if (sc_any_nullable)            { sc_off_nn  = sc_words; sc_words += n_aggs; }
         size_t sc_bytes = ((sc_words * sizeof(int64_t)) + sc_line - 1) / sc_line * sc_line;
         ray_t* sc_hdr = NULL;
-        void* sc_raw = scratch_calloc(&sc_hdr, (size_t)sc_n * sc_bytes + sc_line);
+        /* After the per-chunk blocks: one pinned vocabulary per aggregate. */
+        const size_t sc_pin_off = (size_t)sc_n * sc_bytes + sc_line;
+        void* sc_raw = scratch_calloc(&sc_hdr, sc_pin_off +
+            (size_t)n_aggs * (sizeof(ray_sym_domain_raw_t) + 1) + sc_line);
         if (!sc_raw) { scratch_free(sc_vla_hdr); goto da_path; }
+        ray_sym_domain_raw_t* sc_agg_raw = (ray_sym_domain_raw_t*)(void*)
+            (((uintptr_t)sc_raw + sc_pin_off + sc_line - 1) & ~(uintptr_t)(sc_line - 1));
+        uint8_t* sc_agg_raw_ok = (uint8_t*)(sc_agg_raw + n_aggs);
 
         /* strlen-on-STR: resolve the descriptors once.  strlen-on-SYM:
-         * borrow the sym snapshot once (as the DA path does) — the
-         * uncached resolve takes the domain per row, and the workers
-         * contend on it. */
+         * pin each column's vocabulary once (a FILE-domain column reads its
+         * strings from the mapping) and borrow the sym snapshot once (as the
+         * DA path does) for runtime-domain ids — the uncached resolve takes
+         * the domain per row, and the workers contend on it. */
         ray_t** sc_sym_strings = NULL;
         uint32_t sc_sym_count = 0;
         for (uint32_t a = 0; a < n_aggs; a++) {
@@ -12993,8 +13015,11 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             if (agg_vecs[a]->type == RAY_STR) {
                 const char* pool; (void)pool;
                 str_resolve(agg_vecs[a], &sc_agg_str[a], &pool);
-            } else if (agg_vecs[a]->type == RAY_SYM && !sc_sym_strings) {
-                ray_sym_strings_borrow(&sc_sym_strings, &sc_sym_count);
+            } else if (agg_vecs[a]->type == RAY_SYM) {
+                sc_agg_raw_ok[a] = ray_sym_domain_raw_pin(
+                    ray_sym_vec_domain(agg_vecs[a]), &sc_agg_raw[a]) ? 1 : 0;
+                if (!sc_sym_strings)
+                    ray_sym_strings_borrow(&sc_sym_strings, &sc_sym_count);
             }
         }
         scalar_ctx_t sc_ctx = {
@@ -13005,6 +13030,8 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             .sym_strings = sc_sym_strings,
             .sym_count  = sc_sym_count,
             .agg_str    = sc_agg_str,
+            .agg_raw    = sc_agg_raw,
+            .agg_raw_ok = sc_agg_raw_ok,
             .agg_ops    = ext->agg_ops,
             .agg_linear = agg_linear,
             .agg_prod   = agg_prod,
@@ -13042,7 +13069,10 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             (sc_int_null_has[0] ||
              (agg_vecs[0] && group_fp_type(agg_vecs[0]->type) &&
               ray_vec_may_have_nulls(agg_vecs[0])));
-        /* A strlen fusion reads lengths, never the raw cells. */
+        /* A strlen fusion reads lengths, never the raw cells: SUM(strlen) is
+         * not null-tracked (agg0_has_nulls stays false), so without this
+         * guard the raw-cell sum loops below would add symbol ids / STR
+         * descriptors instead of lengths. */
         if (n_aggs == 1 && !match_idx && !rowsel && agg_ptrs[0] != NULL && !agg0_has_nulls &&
             !agg_strlen[0]) {
             uint16_t op0 = ext->agg_ops[0];
@@ -14234,11 +14264,6 @@ da_path:;
             uint16_t op = ext->agg_ops[a];
             if (op == OP_COUNT) continue;
             if (op != OP_SUM && op != OP_AVG)
-                sp_eligible = false;
-            else if (op == OP_AVG && agg_strlen[a])
-                /* The range sums divide by the row count, and an
-                 * AVG(strlen) must not count the empty-string (null)
-                 * rows — whatever ray_vec_may_have_nulls says of STR/SYM. */
                 sp_eligible = false;
             else {
                 /* The single-key sparse aggregation path reads agg slots
