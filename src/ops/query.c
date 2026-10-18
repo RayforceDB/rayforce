@@ -348,7 +348,12 @@ static bool dag_unary_arith_type_admitted(const char* name, size_t len, int8_t t
  * of an atom has no vector to run on).  The identity is taken only over
  * a column or an I64 operand: the fused kernels compute narrower integer
  * arithmetic in I64 lanes and return it as I64 (`(neg i)` over I32), so
- * `(floor (neg i))` would lose the I32 the builtin keeps. */
+ * `(floor (neg i))` would lose the I32 the builtin keeps.  That case is
+ * left on the evaluator at its old cost (about 1.2 s over 10M rows,
+ * against 0.01 ms for the lowered forms).  The thing to fix is the
+ * widening: once a fused result over a narrow integer column comes back
+ * in the column's own width, the identity holds for any integer operand
+ * and the OP_SCAN / I64 condition below can go. */
 static ray_op_t* dag_int_rounding(ray_graph_t* g, const char* name, size_t len,
                                   ray_op_t* arg) {
     int8_t t = arg->out_type;
