@@ -1,20 +1,27 @@
-/* P6 gate (plan: compressed-columns P6, Task 8): the runtime DICT of every
- * all-STR_DICT STR column of a generation-2 store against generation 0's
- * persisted DICT, compared as data (codes, first occurrences, n_distinct)
- * along with every element.
+/* P6b gate (plan: compressed-columns P6b, Task 8): the persisted DICT of
+ * every STR column generation 0 indexes, against generation 0's DICT,
+ * compared as data (codes, first occurrences, n_distinct) along with every
+ * element.  Generation 2 is checked twice: before materialization, the
+ * region through ray_enccol_idict and the code tier
+ * (ray_enccol_idict_codes_vec); after it, the index attached to the
+ * materialized root.
  *
  * Build: make lib && cc -O2 -std=c17 -Wall -Wextra -Iinclude -Isrc \
  *          bench/compress_estimate/p6_dictcheck.c librayforce.a -lm -lpthread \
  *          -o p6_dictcheck
  * Run:   p6_dictcheck <g0 dir> <g2 dir>
  * Prints one "dict" line per STR column:
- *   dict <column> <all STR_DICT> <gen-2 index> <DICT equal> <elements equal>
- *        <vectors> <STR_DICT vectors> <n_distinct gen 0> <n_distinct gen 2>
- * and a final "dictgate" line: PASS, FAIL, or "not exercised" (no
- * all-STR_DICT column: FAIL).  "All STR_DICT" is read from the descriptors
- * (no decode); it is the condition of the runtime DICT (every chunk then
- * carries code bounds).  A gen-2 DICT on a column that is not all STR_DICT
- * would be outside that condition and fails the gate. */
+ *   dict <column> <g0 DICT> <g2 kind> <region equal> <root equal>
+ *        <elements equal> <vectors> <STR_DICT vectors> <n_distinct gen 0>
+ *        <n_distinct gen 2>
+ * and a final "dictgate" line: PASS, FAIL, or "not exercised" (no STR column
+ * with a generation-0 DICT: FAIL).  <g2 kind> is the kind generation 2
+ * records ("dict" or "none"); the equalities are "-" where generation 0 has
+ * no DICT.  A column fails when generation 0 has a DICT and generation 2
+ * records none, or either equality fails, or the elements differ, or
+ * generation 2 has a DICT (recorded or attached) where generation 0 has none.
+ * The vector counts (all_strdict, from the descriptors, no decode) are
+ * informational. */
 #include <rayforce.h>
 #include "core/runtime.h"
 #include "lang/eval.h"
@@ -81,28 +88,40 @@ int main(int argc, char** argv) {
         ray_col_meta_t m;
         if (!ray_table_col_meta(t2, name, &m) || m.type != RAY_STR) continue;
         ray_t* nm = ray_sym_str(name);
+        int nl = (int)ray_str_len(nm); const char* np = ray_str_ptr(nm);
         int64_t nvec = 0, nsd = 0;
         int all = m.enc ? all_strdict(m.enc, &nvec, &nsd) : 0;
-        if (all < 0) { bad = 1; printf("dict\t%.*s\terror\n", (int)ray_str_len(nm), ray_str_ptr(nm)); continue; }
+        if (all < 0) { bad = 1; printf("dict\t%.*s\terror\n", nl, np); continue; }
         ray_t* a = ray_table_col(t0, name);
-        ray_t* b = ray_table_col(t2, name);
-        if (!a || RAY_IS_ERR(a) || !b || RAY_IS_ERR(b)) {
-            fprintf(stderr, "%.*s: column: %s\n", (int)ray_str_len(nm), ray_str_ptr(nm), ray_error_msg());
-            return 2;
-        }
-        int elems = same_elems(a, b);
-        ray_idx_kind_t k2 = ray_index_kind(b);
-        const char* kind2 = k2 == RAY_IDX_NONE ? "none" : k2 == RAY_IDX_DICT ? "dict" : k2 == RAY_IDX_HASH ? "hash" : "other";
+        if (!a || RAY_IS_ERR(a)) { fprintf(stderr, "%.*s: column g0: %s\n", nl, np, ray_error_msg()); return 2; }
+        /* generation 0 indexes it: its passenger DICT */
         int g0dict = ray_index_kind(a) == RAY_IDX_DICT;
-        int dict_eq = g0dict && k2 == RAY_IDX_DICT && dict_same(a, b);
-        long long nd0 = g0dict ? (long long)ray_index_payload(a->index)->u.dict.n_distinct : -1;
-        long long nd2 = k2 == RAY_IDX_DICT ? (long long)ray_index_payload(b->index)->u.dict.n_distinct : -1;
-        const char* eq = all || k2 == RAY_IDX_DICT ? (dict_eq ? "true" : "false") : "-";
-        printf("dict\t%.*s\t%s\t%s\t%s\t%s\t%lld\t%lld\t%lld\t%lld\n", (int)ray_str_len(nm), ray_str_ptr(nm),
-               all ? "true" : "false", kind2, eq, elems ? "true" : "false",
-               (long long)nvec, (long long)nsd, nd0, nd2);
-        if (all) { exercised++; if (!dict_eq) bad = 1; }
-        else if (k2 == RAY_IDX_DICT) bad = 1;     /* a DICT outside its condition */
+        /* generation 2: the recorded kind, the region (before materialization), the root (after) */
+        ray_enccol_t* e = m.enc ? ray_enccol_of(m.enc) : NULL;
+        const ray_enc_idict_t* d = NULL;
+        ray_t* derr = e ? ray_enccol_idict(e, &d) : NULL;
+        ray_t* cv = NULL;
+        if (!derr && d) derr = ray_enccol_idict_codes_vec(e, &cv);
+        if (derr) { fprintf(stderr, "%.*s: %s\n", nl, np, ray_error_msg()); return 2; }
+        ray_index_t* x = g0dict ? ray_index_payload(a->index) : NULL;
+        int region_eq = x && d && d->n_distinct == x->u.dict.n_distinct &&
+                        d->len == x->u.dict.codes->len && cv && cv->len == d->len &&
+                        memcmp(ray_data(cv), ray_data(x->u.dict.codes), (size_t)d->len * 4) == 0 &&
+                        memcmp(d->first_occ, ray_data(x->u.dict.first_occ), (size_t)d->n_distinct * 4) == 0;
+        ray_t* b = ray_table_col(t2, name);            /* materialize */
+        if (!b || RAY_IS_ERR(b)) { fprintf(stderr, "%.*s: column g2: %s\n", nl, np, ray_error_msg()); return 2; }
+        ray_idx_kind_t k2 = ray_index_kind(b);
+        int root_eq = x && k2 == RAY_IDX_DICT && dict_same(a, b);
+        int elems = same_elems(a, b);
+        long long nd0 = x ? (long long)x->u.dict.n_distinct : -1;
+        long long nd2 = d ? (long long)d->n_distinct : k2 == RAY_IDX_DICT ? (long long)ray_index_payload(b->index)->u.dict.n_distinct : -1;
+        /* line: dict <col> <g0 DICT> <g2 kind> <region equal> <root equal> <elements equal> <vectors> <STR_DICT vectors> <nd g0> <nd g2> */
+        printf("dict\t%.*s\t%s\t%s\t%s\t%s\t%s\t%lld\t%lld\t%lld\t%lld\n", nl, np,
+               g0dict ? "true" : "false", d ? "dict" : "none",
+               g0dict ? (region_eq ? "true" : "false") : "-", g0dict ? (root_eq ? "true" : "false") : "-",
+               elems ? "true" : "false", (long long)nvec, (long long)nsd, nd0, nd2);
+        if (g0dict) { exercised++; if (!d || !region_eq || !root_eq) bad = 1; }
+        else if (d || k2 == RAY_IDX_DICT) bad = 1;     /* a generation-2 DICT where generation 0 has none */
         if (!elems) bad = 1;
     }
     printf("dictgate\t%s\t%d\n", !exercised ? "not exercised" : bad ? "FAIL" : "PASS", exercised);

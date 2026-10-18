@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
-# P6 gate (plan: compressed-columns P6, Task 8, pre-flight D14, rulings R2 / R3).
+# P6 gate (plan: compressed-columns P6, Task 8, pre-flight D14, rulings R2 / R3),
+# rerun as the P6b gate (P6b Task 8, D18): the persisted STR DICT.
 # The ClickBench store has no STR column, so the STR store is derived from it:
 # the 25 columns the 43 ClickBench queries read, the five text ones (URL,
 # Title, Referer, SearchPhrase, MobilePhoneModel) cast SYM -> STR, from the
 # 10M .db.splayed.get store; saved g0 / g2, measured, deleted.  Copied from
 # p5_bench.sh (calm, guard, rel_guard, alternated rounds, per-file eviction,
 # ident g0 twice, the wall stage for #856, completeness and FAIL rows).
-#   prep : release binary copied; the store's size estimated and guarded
-#          (estimate + 4 GB), g0 saved and its size printed, guarded again
-#          (4 GB), g2 saved (save times recorded); p6_dictcheck built from
-#          `make lib` and run (dict / dictgate rows); the TSV started afresh
+#   prep : release binary copied; the store's size and its DICT estimated,
+#          guarded (estimate + 4 GB), g0 saved and its size printed, guarded
+#          again (DICT estimate + 3 GB), g2 saved (save times recorded), at
+#          least 0.5 GB left after it; the DICT region bytes per STR column
+#          from the file header; p6_dictcheck built from `make lib` and run
+#          (dict / dictgate rows: the persisted DICT); the TSV started afresh
 #   enc  : per-column encoding mix and sizes of g2
 #   mat  : the columns each query leaves materialized on g2 (Rulings 6-2 / 7-1)
 #   warm : every query, ROUNDS alternated rounds (order swapped), one process
@@ -18,10 +21,13 @@
 #   ident: the full answer of every query, g0 vs g2 (g0 run twice); raw and sorted
 #   wall : per-call wall time, (T(1 + K) - T(1)) / K, WALLS alternated rounds;
 #          K per query from its warm g0 median (about 2 s of calls, 3..100)
-#   o5   : the STR group-by queries against BASE (P3 carry): arm C base vs p6
-#          binary on g0; arm D base binary on its own generation-2 save (bg2,
-#          RAW / CONST STR) vs the p6 binary on g2.  bg2 is derived and saved
-#          by the base binary after g0 is deleted (one extra store at a time)
+#   o5   : arm C base vs p6 binary on g0, all 43 queries (I8 on the STR
+#          store, D18); arm D the STR group-by queries (P3 carry), base binary
+#          on its own generation-2 save (bg2, RAW / CONST STR) vs the p6 binary
+#          on g2.  bg2 is derived and saved by the base binary after g0 is
+#          deleted (one extra store at a time), at least 0.3 GB left after it
+#   i8   : base vs p6 binary on the SYM 10M store read in place from $SRC
+#          (no copy, no disk), all 43 queries (I8, D18)
 #   clean: delete the stores
 #   savet: the writer cost (O2): SAVES alternated rounds of the g0 and g2
 #          saves, this binary and BASE's, each into a scratch store deleted
@@ -29,9 +35,9 @@
 #   parted: R2, the parted STR arm: p0 / p2 built from the derived table, ten
 #          1M-row partitions saved one by one, each store under the guard;
 #          a refusal is recorded as a `skip` row; warm / ident / mat on it
-# usage: p6_bench.sh prep | enc | mat | warm | cold | ident | wall | o5 | clean | savet | parted | all
+# usage: p6_bench.sh prep | enc | mat | warm | cold | ident | wall | o5 | i8 | clean | savet | parted | all
 set -euo pipefail
-W=${W:-/home/hetoku/data/tmp/p6/t8/bench}
+W=${W:-/home/hetoku/data/tmp/p6b/t8/bench}
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
 SRC=/skull/clickbench/rfsplayed
@@ -75,6 +81,7 @@ calm() { while ! awk '{exit !($1 < 1.5)}' /proc/loadavg; do printf 'wait\t%s\t%s
 evict() { sync; find "$1" -type f -exec dd if={} iflag=nocache count=0 status=none \; ; }
 peak() { local u; u=$(du -sb "$W" | cut -f1); printf 'peak\t%s\t%s\t%s\n' "$1" "$u" "$(avail)" >> "$OUT"; }
 loadline() { if [ "${2:-}" = parted ]; then printf '(set hits (.db.parted.get "%s/%s" (quote hits)))\n' "$W" "$1"
+             elif [ "${2:-}" = sym ]; then printf '(set hits (.db.splayed.get "%s/"))\n' "$1"
              else printf '(set hits (.db.splayed.get "%s/%s/"))\n' "$W" "$1"; fi; }
 sel() {      # the select of the derived columns from table $1
   local c e=""
@@ -94,6 +101,12 @@ estimate() {   # bytes: the numeric source files + per STR column 16 B descripto
   { derive; printf '(println (sum (map (fn [c] (+ (* 24 (count t)) (sum (strlen (at t c))))) [%s])))\n' "$(printf "'%s " $TEXT)"; } > "$s"
   str=$("$BIN" "$s" | tail -1); rm -f "$s"
   echo $((num + str))
+}
+estimate_dict() {   # bytes: per text column 4 B / row + 12 B / distinct + the distinct strings' bytes
+  local s; s=$(mktemp -p "$W/g")
+  { printf '(set h (.db.splayed.get "%s"))\n' "$SRC"
+    printf '(println (sum (map (fn [c] (+ (+ (+ (* 4 (count h)) (* 12 (count (distinct (at h c))))) (sum (strlen (distinct (at h c))))) 1024)) [%s])))\n' "$(printf "'%s " $TEXT)"; } > "$s"
+  "$BIN" "$s" | tail -1; rm -f "$s"
 }
 h_raw()  { md5sum < "$1" | cut -c1-12; }
 h_sort() { { head -n 1 "$1"; tail -n +2 "$1" | LC_ALL=C sort; } | md5sum | cut -c1-12; }
@@ -166,7 +179,7 @@ save_one() {   # bin dir compress: derive in a fresh process, save, print the ms
   { derive; printf '(println (timeit (.db.splayed.set "%s/" t {compress: %s})))\n' "$2" "$3"; } > "$s"
   r=$("$1" "$s" | tail -1); rm -f "$s"; echo "$r"
 }
-case "${1:?usage: p6_bench.sh prep|enc|mat|warm|cold|ident|wall|o5|clean|savet|parted|all}" in
+case "${1:?usage: p6_bench.sh prep|enc|mat|warm|cold|ident|wall|o5|i8|clean|savet|parted|all}" in
 prep)
   ( cd "$REPO" && make release >/dev/null ); cp "$REPO/rayforce" "$BIN"; rel_guard "$BIN"
   : > "$OUT"
@@ -174,12 +187,20 @@ prep)
   printf 'meta\tp6\t%s\t%s\n' "$(git -C "$REPO" rev-parse --short HEAD)" "$(sha256sum "$BIN" | cut -c1-12)" >> "$OUT"
   rm -rf "$W/g0" "$W/g2"
   est=$(estimate); printf 'est\tg0\t%s\n' "$est" >> "$OUT"; echo "estimated g0: $est B" >&2
+  estd=$(estimate_dict); printf 'est\tdict\t%s\n' "$estd" >> "$OUT"; echo "estimated DICT: $estd B" >&2
+  [ -n "$estd" ] && [ "$estd" -gt 0 ] || { echo "DICT estimate failed" >&2; exit 2; }
   guard $((est + 4 * GB)) "prep g0"
   printf 'save\tg0\t%s\n' "$(save_one "$BIN" "$W/g0" false)" >> "$OUT"
   printf 'size\tg0\t%s\n' "$(du -sb "$W/g0" | cut -f1)" >> "$OUT"; echo "g0: $(du -sb "$W/g0" | cut -f1) B" >&2
-  guard $((4 * GB)) "prep g2"
+  guard $((estd + 3 * GB)) "prep g2"
   printf 'save\tg2\t%s\n' "$(save_one "$BIN" "$W/g2" true)" >> "$OUT"
+  [ "$(avail)" -ge $((GB / 2)) ] || { rm -rf "$W/g2"; printf 'skip\tprep\tfree below 0.5 GB after g2\n' >> "$OUT"; exit 2; }
   printf 'size\tg2\t%s\n' "$(du -sb "$W/g2" | cut -f1)" >> "$OUT"
+  for c in $TEXT; do
+    f=$W/g2/$c
+    io=$(od -An -t u8 -j $((32 + 32)) -N 8 "$f" | tr -d ' '); eo=$(od -An -t u8 -j $((32 + 56)) -N 8 "$f" | tr -d ' ')
+    printf 'dictsize\t%s\t%s\n' "$c" "$((io ? eo - io : 0))" >> "$OUT"
+  done
   for c in $COLS; do for v in g0 g2; do
     printf 'colsize\t%s\t%s\t%s\n' "$v" "$c" "$(stat -c %s "$W/$v/$c")" >> "$OUT"
   done; done
@@ -247,26 +268,33 @@ EOF
   ;;
 o5)
   rel_guard "$BIN"; base_bin
-  warm_run o5c "$BB" g0 base "$BIN" g0 p6 "$PROUNDS" "$O5Q"
+  warm_run o5c "$BB" g0 base "$BIN" g0 p6 "$PROUNDS" "$(seq 1 $NQ)"
   rm -rf "$W/g0"; rm -rf "$W/bg2"
-  est=$(awk -F'\t' '$1=="est"{print $3}' "$OUT" | tail -1)
-  if guard $((est + 2 * GB)) "o5 bg2"; then   # one store (g0 deleted first): its estimate + 2 GB
+  # one store (g0 deleted first): bg2 / g0 was 0.883 in P6 Task 8, so 0.9 g0 + 0.5 GB
+  if guard $(( $(awk -F'\t' '$1=="size" && $2=="g0"{print $3}' "$OUT" | tail -1) * 9 / 10 + GB / 2 )) "o5 bg2"; then
     printf 'save\tbg2\t%s\n' "$(save_one "$BB" "$W/bg2" true)" >> "$OUT"
-    printf 'size\tbg2\t%s\n' "$(du -sb "$W/bg2" | cut -f1)" >> "$OUT"; peak o5
-    warm_run o5d "$BB" bg2 base "$BIN" g2 p6 "$PROUNDS" "$O5Q"
+    if [ "$(avail)" -ge $((GB * 3 / 10)) ]; then
+      printf 'size\tbg2\t%s\n' "$(du -sb "$W/bg2" | cut -f1)" >> "$OUT"; peak o5
+      warm_run o5d "$BB" bg2 base "$BIN" g2 p6 "$PROUNDS" "$O5Q"
+    else printf 'skip\to5d\tfree below 0.3 GB after bg2\n' >> "$OUT"; fi
   else printf 'skip\to5d\tguard\n' >> "$OUT"; fi
   rm -rf "$W/bg2"
+  ;;
+i8)   # I8 on the SYM store (D18): read in place from $SRC, nothing written
+  rel_guard "$BIN"; base_bin
+  warm_run i8 "$BB" "$SRC" base "$BIN" "$SRC" p6 "$PROUNDS" "$(seq 1 $NQ)" sym
   ;;
 clean) rm -rf "$W/g0" "$W/g2" "$W/bg2" "$W/s0" "$W/s2" "$W/p0" "$W/p2" ;;
 savet)
   rel_guard "$BIN"; base_bin
-  est=$(awk -F'\t' '$1=="est"{print $3}' "$OUT" | tail -1)
+  est=$(awk -F'\t' '$1=="est" && $2=="g0"{print $3}' "$OUT" | tail -1)
+  estd=$(awk -F'\t' '$1=="est" && $2=="dict"{print $3}' "$OUT" | tail -1)
   for round in $(seq 1 "$SAVES"); do
     if [ $((round % 2)) = 1 ]; then order="p6 base"; else order="base p6"; fi
     for b in $order; do
       if [ "$b" = p6 ]; then x=$BIN; else x=$BB; fi
       calm; rm -rf "$W/s0" "$W/s2"
-      guard $((est + 4 * GB)) "savet" || exit 2
+      guard $((est + estd + GB)) "savet" || exit 2   # s0 and s2 one after the other
       r0=$(save_one "$x" "$W/s0" false); z0=$(du -sb "$W/s0" | cut -f1); rm -rf "$W/s0"
       r2=$(save_one "$x" "$W/s2" true);  z2=$(du -sb "$W/s2" | cut -f1); rm -rf "$W/s2"
       printf 'savet\t%s\t%s\t%s\t%s\t%s\t%s\n' "$b" "$round" "$r0" "$r2" "$z0" "$z2" >> "$OUT"
@@ -275,10 +303,11 @@ savet)
   ;;
 parted)   # R2: one store at a time under the guard; a refusal skips the arm
   rel_guard "$BIN"
-  est=$(awk -F'\t' '$1=="est"{print $3}' "$OUT" | tail -1)
+  est=$(awk -F'\t' '$1=="est" && $2=="g0"{print $3}' "$OUT" | tail -1)
+  estd=$(awk -F'\t' '$1=="est" && $2=="dict"{print $3}' "$OUT" | tail -1)
   rm -rf "$W/p0" "$W/p2"
   for v in p0 p2; do
-    if [ "$v" = p0 ]; then need=$((est + 4 * GB)); z=false; else need=$((4 * GB)); z=true; fi
+    if [ "$v" = p0 ]; then need=$((est + 4 * GB)); z=false; else need=$((estd + 3 * GB)); z=true; fi
     if ! guard "$need" "parted $v"; then printf 'skip\tparted\tguard %s\n' "$v" >> "$OUT"; rm -rf "$W/p0" "$W/p2"; exit 0; fi
     s=$(mktemp -p "$W/g")
     # each partition is cast from its own slice of the source: a slice of a
@@ -298,5 +327,5 @@ parted)   # R2: one store at a time under the guard; a refusal skips the arm
   warm_run pm "$BIN" p0 p0 "$BIN" p2 p2 "$PROUNDS" "$(seq 1 $NQ)" parted
   rm -rf "$W/p0" "$W/p2"
   ;;
-all) for st in prep enc mat ident warm cold wall o5 clean savet parted; do "$0" "$st"; done ;;
+all) for st in prep enc mat ident warm cold wall o5 i8 clean savet parted; do "$0" "$st"; done ;;
 esac
