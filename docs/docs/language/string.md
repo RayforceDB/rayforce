@@ -50,6 +50,8 @@ All string operations in Rayforce follow strict null propagation semantics:
 - Null propagation applies uniformly to both RAY_SYM and RAY_STR columns
 - Null state is carried through the execution pipeline per morsel (1024 elements)
 
+`""` is the STR/SYM null: `strlen` maps it to a null length, `sum` and `avg` skip it, and the `avg` of an all-empty group is null.
+
 In the C API DAG, null propagation is handled automatically per morsel. String transformation opcodes (STRLEN, UPPER/LOWER/TRIM, SUBSTR, REPLACE, CONCAT) propagate nulls: null input rows produce null output rows. CONCAT is null if any argument is null.
 
 ## String Functions

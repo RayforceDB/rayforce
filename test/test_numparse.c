@@ -181,6 +181,45 @@ static test_result_t test_numparse_f64_basic(void) {
     PASS();
 }
 
+/* The sign of zero survives the parse bit-for-bit in every build flavour.
+ * `0.0 == -0.0` is true, so this test compares the bit patterns: a plain
+ * zero must be 0x0000000000000000 and a negated one 0x8000000000000000.
+ * The release flavour's -fno-signed-zeros once folded both to -0.0
+ * (#850); the debug flavour never did, so under `make test` this pins the
+ * contract and a `make release` + od check is what shows the bug. */
+static uint64_t f64_bits(double d) {
+    uint64_t b;
+    memcpy(&b, &d, sizeof b);
+    return b;
+}
+
+static test_result_t test_numparse_f64_signed_zero(void) {
+    double d;
+    TEST_ASSERT_EQ_U(ray_parse_f64("0", 1, &d), 1);
+    TEST_ASSERT_EQ_U(f64_bits(d), UINT64_C(0));
+    TEST_ASSERT_EQ_U(ray_parse_f64("0.0", 3, &d), 3);
+    TEST_ASSERT_EQ_U(f64_bits(d), UINT64_C(0));
+    TEST_ASSERT_EQ_U(ray_parse_f64("+0", 2, &d), 2);
+    TEST_ASSERT_EQ_U(f64_bits(d), UINT64_C(0));
+    TEST_ASSERT_EQ_U(ray_parse_f64("0e5", 3, &d), 3);
+    TEST_ASSERT_EQ_U(f64_bits(d), UINT64_C(0));
+    TEST_ASSERT_EQ_U(ray_parse_f64("-0", 2, &d), 2);
+    TEST_ASSERT_EQ_U(f64_bits(d), UINT64_C(1) << 63);
+    TEST_ASSERT_EQ_U(ray_parse_f64("-0.0", 4, &d), 4);
+    TEST_ASSERT_EQ_U(f64_bits(d), UINT64_C(1) << 63);
+    /* A value below the denormal range is a zero too, and keeps its sign. */
+    TEST_ASSERT_EQ_U(ray_parse_f64("1e-400", 6, &d), 6);
+    TEST_ASSERT_EQ_U(f64_bits(d), UINT64_C(0));
+    TEST_ASSERT_EQ_U(ray_parse_f64("-1e-400", 7, &d), 7);
+    TEST_ASSERT_EQ_U(f64_bits(d), UINT64_C(1) << 63);
+    /* Non-zero values are unaffected by the bit-level sign. */
+    TEST_ASSERT_EQ_U(ray_parse_f64("-1.5", 4, &d), 4);
+    TEST_ASSERT_EQ_U(f64_bits(d), f64_bits(-1.5));
+    TEST_ASSERT_EQ_U(ray_parse_f64("-1e300", 6, &d), 6);
+    TEST_ASSERT_EQ_U(f64_bits(d), f64_bits(-1e300));
+    PASS();
+}
+
 static test_result_t test_numparse_f64_special(void) {
     /* STAGE 2 (single-null float model) re-baseline: the F64 domain is
      * {finite} ∪ {0Nf}; ±Inf and NaN are NOT values.  ray_parse_f64 still
@@ -354,6 +393,7 @@ const test_entry_t numparse_entries[] = {
     { "numparse/swar_8digits",   test_numparse_swar_8digits, NULL, NULL },
     { "numparse/swar_4digits",   test_numparse_swar_4digits, NULL, NULL },
     { "numparse/i64_basic",      test_numparse_i64_basic,    NULL, NULL },
+    { "numparse/f64_signed_zero", test_numparse_f64_signed_zero, NULL, NULL },
     { "numparse/i64_swar_paths", test_numparse_i64_swar_paths, NULL, NULL },
     { "numparse/i64_overflow",   test_numparse_i64_overflow, NULL, NULL },
     { "numparse/i64_silent_wrap",test_numparse_i64_silent_wrap, NULL, NULL },

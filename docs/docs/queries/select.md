@@ -320,6 +320,11 @@ Mix ascending and descending with separate clauses. Sort priority follows the or
 (select {from: t asc: sym desc: price})
 ```
 
+The sort is stable: rows that tie on every sort key keep the order in which
+they first appear in the source, and in a grouped select the group whose first
+source row comes first wins a tie. A `take:` after the sort therefore returns
+the same rows on every run, on in-memory, splayed and parted tables alike.
+
 ### Limiting Rows with `take:`
 
 Limit the number of rows in the result. Positive values take from the beginning, negative from the end:

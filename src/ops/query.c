@@ -312,6 +312,30 @@ static bool dag_pow_type_admitted(int8_t t) {
     return dag_numeric_type_admitted(t);
 }
 
+/* The arithmetic unary verbs' kernels read any fixed-width lane as a
+ * number, while their builtins (arith.c) take a narrower set: a DATE,
+ * TIME or TIMESTAMP column came back negated, square-rooted or rounded as
+ * its raw day / millisecond / nanosecond counts where `(neg dates)`
+ * raises `type` (#854), and SYM or GUID columns were read as interned ids
+ * or bytes.  `neg`/`abs` also reject BOOL and U8, and the integer lanes of
+ * `ceil`/`floor`/`round` returned garbage where the builtin is the
+ * identity (round: the value as F64).  An operand outside the builtin's
+ * set declines to the evaluator, which applies the builtin itself. */
+static bool dag_unary_arith_type_admitted(const char* name, size_t len, int8_t t) {
+    if (t <= 0) return true;  /* unknown/uninferred: let executor validate */
+    if (RAY_IS_PARTED(t)) t = (int8_t)RAY_PARTED_BASETYPE(t);
+    if (len == 3 && (memcmp(name, "neg", 3) == 0 || memcmp(name, "abs", 3) == 0))
+        return t == RAY_I16 || t == RAY_I32 || t == RAY_I64 ||
+               t == RAY_F32 || t == RAY_F64;
+    if ((len == 3 && (memcmp(name, "exp", 3) == 0 || memcmp(name, "log", 3) == 0)) ||
+        (len == 4 && memcmp(name, "sqrt", 4) == 0))
+        return dag_numeric_type_admitted(t);
+    if ((len == 4 && memcmp(name, "ceil", 4) == 0) ||
+        (len == 5 && (memcmp(name, "floor", 5) == 0 || memcmp(name, "round", 5) == 0)))
+        return t == RAY_F32 || t == RAY_F64;
+    return true;
+}
+
 static bool dag_type_is_temporal(int8_t t) {
     if (t <= 0) return false;
     if (RAY_IS_PARTED(t)) t = (int8_t)RAY_PARTED_BASETYPE(t);
@@ -2252,6 +2276,8 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
                 if (dag_operand_type(g, arg) != arg->out_type) return NULL;
                 if (dag_unary_numeric_name(fname, fname_len) &&
                     !dag_numeric_type_admitted(arg->out_type))
+                    return NULL;
+                if (!dag_unary_arith_type_admitted(fname, fname_len, arg->out_type))
                     return NULL;
                 return uctor(g, arg);
             }
