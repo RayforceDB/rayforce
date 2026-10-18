@@ -7605,6 +7605,11 @@ typedef struct {
                           * aggs needs null tracking (no HAS_NULLS columns). */
     int64_t*  first_row; /* min row index seen per slot (FIRST) [n_slots] */
     int64_t*  last_row;  /* max row index seen per slot (LAST)  [n_slots] */
+    int64_t*  sl_null;   /* per-(group, agg) rows of length 0 under an
+                          * AVG(strlen) fusion [n_slots * n_aggs]: the empty
+                          * string is the STR/SYM null, so the emit divides
+                          * by the non-null rows (nn_count, else count)
+                          * minus these.  NULL without an AVG(strlen). */
     /* Binary-aggregator co-moments (PEARSON/COV/WAVG/WSUM): the y-side of
      * the pair.  [n_slots * n_aggs].  x-side reuses sum (Σx) + sumsq_f64
      * (Σx²).  Allocated only when DA_NEED_PAIR is set. */
@@ -7621,6 +7626,7 @@ typedef struct {
     ray_t* _h_nn_count;
     ray_t* _h_first_row;
     ray_t* _h_last_row;
+    ray_t* _h_sl_null;
     ray_t* _h_sum_y;
     ray_t* _h_sumsq_y;
     ray_t* _h_sumxy;
@@ -7636,6 +7642,7 @@ static inline void da_accum_free(da_accum_t* a) {
     scratch_free(a->_h_nn_count);
     scratch_free(a->_h_first_row);
     scratch_free(a->_h_last_row);
+    scratch_free(a->_h_sl_null);
     scratch_free(a->_h_sum_y);
     scratch_free(a->_h_sumsq_y);
     scratch_free(a->_h_sumxy);
@@ -7955,6 +7962,12 @@ typedef struct {
      * entry off the mapping instead of pinning (and checking null) per row. */
     ray_sym_domain_raw_t* agg_raw;
     uint8_t*       agg_raw_ok;
+    /* Per-agg STR descriptors of a strlen fusion's column, resolved once
+     * (slice offset applied); NULL for other aggs.  Always set. */
+    const ray_str_t** agg_str;
+    /* The one SUM/AVG(strlen) agg when every other agg is a COUNT, the key
+     * is single and all_sum holds (da_accum_strlen_fn); -1 otherwise. */
+    int32_t        sl_agg;
 } da_ctx_t;
 
 typedef struct {
@@ -8499,6 +8512,11 @@ struct scalar_ctx_s {
     int8_t*        agg_types;
     ray_t**        agg_cols;
     uint8_t*       agg_strlen;
+    ray_t**        sym_strings;  /* borrowed sym snapshot for strlen-on-SYM aggs */
+    uint32_t       sym_count;
+    const ray_str_t** agg_str;   /* strlen-on-STR: descriptors resolved once */
+    const ray_sym_domain_raw_t* agg_raw;  /* strlen-on-SYM: pinned vocabulary per agg (agg_raw_ok) */
+    const uint8_t* agg_raw_ok;
     uint16_t*      agg_ops;
     agg_linear_t*  agg_linear;
     agg_prod_t*    agg_prod;     /* fused SUM/AVG(a*b) slots (may be NULL) */
@@ -8702,7 +8720,24 @@ static inline void scalar_accum_row(scalar_ctx_t* c, da_accum_t* acc, int64_t r)
         } else {
             if (!c->agg_ptrs[a]) continue;
             if (c->agg_strlen && c->agg_strlen[a]) {
-                iv = group_strlen_at(c->agg_cols[a], r);
+                /* STR: the descriptor's length (a null is the empty
+                 * string, length 0); SYM: a FILE-domain id from the pinned
+                 * mapping, else through the borrowed snapshot. */
+                if (c->agg_str[a]) {
+                    iv = (int64_t)c->agg_str[a][r].len;
+                } else if (c->agg_raw_ok[a]) {   /* a pinned SYM column */
+                    const ray_t* scol = c->agg_cols[a];
+                    int64_t sid = ray_read_sym(ray_data((ray_t*)scol), r, RAY_SYM, scol->attrs);
+                    if (sid > 0 && sid < c->agg_raw[a].count) {
+                        size_t sl;
+                        (void)ray_sym_domain_raw_str(&c->agg_raw[a], sid, &sl);
+                        iv = (int64_t)sl;
+                    } else {
+                        iv = group_strlen_at_cached(scol, r, c->sym_strings, c->sym_count);
+                    }
+                } else {
+                    iv = group_strlen_at_cached(c->agg_cols[a], r, c->sym_strings, c->sym_count);
+                }
                 fv = (double)iv;
             } else {
                 uint8_t attrs = c->agg_cols[a] ? c->agg_cols[a]->attrs : 0;
@@ -8840,11 +8875,8 @@ static void scalar_chunk_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
  * as group_strlen_at_cached does. */
 static inline int64_t da_strlen_at(const da_ctx_t* c, uint32_t a, int64_t r) {
     const ray_t* col = c->agg_cols[a];
-    if (col->type == RAY_STR) {
-        const ray_str_t* elems; const char* pool; (void)pool;
-        str_resolve(col, &elems, &pool);
-        return (int64_t)elems[r].len;
-    }
+    /* STR: descriptors resolved once at setup (every strlen-on-STR agg). */
+    if (col->type == RAY_STR) return (int64_t)c->agg_str[a][r].len;
     if (col->type == RAY_SYM) {
         int64_t sid = ray_read_sym(ray_data((ray_t*)col), r, RAY_SYM, col->attrs);
         if (sid == 0) return 0;
@@ -8897,8 +8929,13 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
             }
             if (!c->agg_ptrs[a]) continue;
             if (c->agg_strlen && c->agg_strlen[a]) {
-                acc->sum[idx].i = wrap_add_i64(acc->sum[idx].i, da_strlen_at(c, a, r));
+                /* Length 0 is the empty string, the STR/SYM null: it adds
+                 * nothing to the sum; an AVG keeps it out of the divisor
+                 * through sl_null (exec_strlen maps it to null). */
+                int64_t len = da_strlen_at(c, a, r);
+                acc->sum[idx].i = wrap_add_i64(acc->sum[idx].i, len);
                 if (nn) nn[idx]++;
+                if (RAY_UNLIKELY(len == 0) && acc->sl_null) acc->sl_null[idx]++;
             } else if (f64m & ((uint64_t)1 << a)) {
                 /* NaN payload = null, skip from sum. */
                 double v = group_fp_at(c->agg_ptrs[a], c->agg_types[a], r);
@@ -8949,8 +8986,12 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
             fv = prod_val_f64(&c->agg_prod[a], r);
             iv = (int64_t)fv;
         } else if (c->agg_strlen && c->agg_strlen[a]) {
-            iv = da_strlen_at(c, a, r);
-            fv = (double)iv;
+            /* SUM/AVG(strlen) only: as the SUM/AVG fast path above. */
+            int64_t len = da_strlen_at(c, a, r);
+            acc->sum[idx].i = wrap_add_i64(acc->sum[idx].i, len);
+            if (nn) nn[idx]++;
+            if (RAY_UNLIKELY(len == 0) && acc->sl_null) acc->sl_null[idx]++;
+            continue;
         } else {
             uint8_t attrs = c->agg_cols[a] ? c->agg_cols[a]->attrs : 0;
             da_read_val(c->agg_ptrs[a], c->agg_types[a], attrs, r, &fv, &iv);
@@ -9070,12 +9111,130 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
     if (last_advanced)  acc->last_row[gid]  = r;
 }
 
+/* Off the hot loop: an id past the pinned mapping / snapshot. */
+static int64_t __attribute__((noinline, cold))
+da_sid_len_slow(const da_ctx_t* c, uint32_t a, int64_t r) {
+    return group_strlen_at_cached(c->agg_cols[a], r, c->sym_strings, c->sym_count);
+}
+
+/* strlen of SYM id sid (cell r of agg a): raw is the pinned FILE mapping or
+ * NULL, rt the runtime domain with the borrowed snapshot — both decided by
+ * the caller once.  Same answer as da_strlen_at. */
+RAY_INLINE int64_t da_sid_len(const da_ctx_t* c, uint32_t a, int64_t sid,
+                              const ray_sym_domain_raw_t* raw, bool rt, int64_t r) {
+    if (sid == 0) return 0;
+    if (raw && sid > 0 && sid < raw->count) {
+        size_t sl;
+        (void)ray_sym_domain_raw_str(raw, sid, &sl);
+        return (int64_t)sl;
+    }
+    if (rt && sid > 0 && (uint64_t)sid < c->sym_count) {
+        ray_t* atom = c->sym_strings[sid];
+        return atom ? (int64_t)ray_str_len(atom) : 0;
+    }
+    return da_sid_len_slow(c, a, r);
+}
+
+/* One SUM/AVG(strlen) beside COUNTs, one key, no row selection
+ * (c->sl_agg >= 0).  Per block of rows the lengths are read first by a loop
+ * of the column's own kind — STR descriptors, or SYM ids at their width —
+ * and then folded by a loop of the key's width, so neither loop carries the
+ * other's dispatch nor da_accum_row's per-agg one.  Keeps the state the
+ * SUM/AVG fast path keeps for it: count, the length sum, nn when allocated,
+ * sl_null for an AVG (COUNT emits from count alone). */
+#define DA_SL_BLK 512
+static void __attribute__((noinline))
+da_accum_strlen_fn(da_ctx_t* c, da_accum_t* acc, int64_t start, int64_t end) {
+    const uint32_t sa = (uint32_t)c->sl_agg;
+    const size_t n_aggs = c->n_aggs;
+    int64_t* restrict count = acc->count;
+    da_val_t* restrict sum = acc->sum;
+    int64_t* nn = acc->nn_count;
+    int64_t* sln = acc->sl_null;
+    const int64_t kmin = c->key_mins[0];
+    const bool ksym = c->key_types[0] == RAY_SYM;
+    const bool da_pf = c->n_slots >= 4096;
+    const ray_t* col = c->agg_cols[sa];
+    const ray_str_t* desc = c->agg_str[sa];
+    const void* ids = desc ? NULL : ray_data((ray_t*)col);
+    const uint8_t sw = col->attrs & RAY_SYM_W_MASK;
+    const ray_sym_domain_raw_t* raw =
+        (!desc && c->agg_raw_ok && c->agg_raw_ok[sa]) ? &c->agg_raw[sa] : NULL;
+    const bool rt = !desc && c->sym_strings &&
+                    ray_sym_vec_domain((ray_t*)col) == ray_sym_runtime_domain();
+    int64_t lens[DA_SL_BLK];
+    #define DA_SL_SYM(T) \
+    do { \
+        const T* sp = (const T*)ids; \
+        for (int64_t j = 0; j < n; j++) \
+            lens[j] = da_sid_len(c, sa, (int64_t)sp[b0 + j], raw, rt, b0 + j); \
+    } while (0)
+    #define DA_SL_PF_DIST 8
+    #define DA_SL_FOLD(KTYPE, KCAST) \
+    do { \
+        const KTYPE* kp = (const KTYPE*)c->key_ptrs[0]; \
+        for (int64_t j = 0; j < n; j++) { \
+            int64_t r = b0 + j; \
+            if (da_pf && RAY_LIKELY(r + DA_SL_PF_DIST < end)) { \
+                int64_t pfk = (int64_t)KCAST kp[r + DA_SL_PF_DIST]; \
+                if (ksym && pfk == 0) pfk = kmin; \
+                __builtin_prefetch(&count[(int32_t)(pfk - kmin)], 1, 1); \
+                __builtin_prefetch(&sum[(size_t)(int32_t)(pfk - kmin) * n_aggs], 1, 1); \
+            } \
+            int64_t kv = (int64_t)KCAST kp[r]; \
+            if (ksym && kv == 0) kv = kmin; \
+            int32_t gid = (int32_t)(kv - kmin); \
+            count[gid]++; \
+            size_t idx = (size_t)gid * n_aggs + sa; \
+            int64_t len = lens[j]; \
+            sum[idx].i = wrap_add_i64(sum[idx].i, len); \
+            if (nn) nn[idx]++; \
+            if (RAY_UNLIKELY(len == 0) && sln) sln[idx]++; \
+        } \
+    } while (0)
+    for (int64_t b0 = start; b0 < end; b0 += DA_SL_BLK) {
+        int64_t n = end - b0 < DA_SL_BLK ? end - b0 : DA_SL_BLK;
+        if (desc) {
+            for (int64_t j = 0; j < n; j++) lens[j] = (int64_t)desc[b0 + j].len;
+        } else {
+            switch (sw) {
+            case RAY_SYM_W8:  DA_SL_SYM(uint8_t);  break;
+            case RAY_SYM_W16: DA_SL_SYM(uint16_t); break;
+            case RAY_SYM_W32: DA_SL_SYM(uint32_t); break;
+            default:          DA_SL_SYM(int64_t);  break;
+            }
+        }
+        /* Key widths as da_accum_fn's single-key loop (sign-extend signed). */
+        if (da_key_is_unsigned(c->key_types[0])) {
+            switch (c->key_esz[0]) {
+            case 1: DA_SL_FOLD(uint8_t, ); break;
+            case 2: DA_SL_FOLD(uint16_t, ); break;
+            case 4: DA_SL_FOLD(uint32_t, (int64_t)); break;
+            default: DA_SL_FOLD(int64_t, ); break;
+            }
+        } else {
+            switch (c->key_esz[0]) {
+            case 1: DA_SL_FOLD(int8_t, ); break;
+            case 2: DA_SL_FOLD(int16_t, ); break;
+            case 4: DA_SL_FOLD(int32_t, (int64_t)); break;
+            default: DA_SL_FOLD(int64_t, ); break;
+            }
+        }
+    }
+    #undef DA_SL_FOLD
+    #undef DA_SL_PF_DIST
+    #undef DA_SL_SYM
+}
+#undef DA_SL_BLK
+
 static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
     da_ctx_t* c = (da_ctx_t*)ctx;
     da_accum_t* acc = &c->accums[worker_id];
     uint8_t n_aggs = c->n_aggs;
     uint8_t n_keys = c->n_keys;
     const int64_t* match_idx = c->match_idx;
+
+    if (c->sl_agg >= 0) { da_accum_strlen_fn(c, acc, start, end); return; }
 
     /* Fast path: single key — avoid composite GID loop overhead.
      * Templated by key element size: the entire loop is stamped out per width
@@ -9415,6 +9574,10 @@ static void da_merge_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
             if (merged->nn_count && wa->nn_count) {
                 for (uint32_t a = 0; a < n_aggs; a++)
                     merged->nn_count[base + a] += wa->nn_count[base + a];
+            }
+            if (merged->sl_null && wa->sl_null) {
+                for (uint32_t a = 0; a < n_aggs; a++)
+                    merged->sl_null[base + a] += wa->sl_null[base + a];
             }
             merged->count[s] += wa->count[s];
         }
@@ -12582,7 +12745,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         /* Keyless path serves unbounded n_aggs — VLAs here scale with the query,
          * so carve exactly (8-byte arrays first). */
         ray_t* sc_vla_hdr = NULL;
-        size_t sc_vla_bytes = (size_t)vla_aggs * (sizeof(void*) + sizeof(int64_t)
+        size_t sc_vla_bytes = (size_t)vla_aggs * (2 * sizeof(void*) + sizeof(int64_t)
                                                   + sizeof(int8_t) + sizeof(bool));
         uint8_t* sc_blk = (uint8_t*)scratch_alloc(&sc_vla_hdr, sc_vla_bytes);
         if (!sc_blk) {
@@ -12594,7 +12757,8 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             return ray_error("oom", NULL);
         }
         void*    *agg_ptrs             = (void**)sc_blk;
-        int64_t  *sc_int_null_sentinel = (int64_t*)(agg_ptrs + vla_aggs);
+        const ray_str_t** sc_agg_str   = (const ray_str_t**)(agg_ptrs + vla_aggs);
+        int64_t  *sc_int_null_sentinel = (int64_t*)(sc_agg_str + vla_aggs);
         int8_t   *agg_types            = (int8_t*)(sc_int_null_sentinel + vla_aggs);
         /* Per-element flag, not a bitmask: this path's n_aggs is VLA-sized
          * with no fixed cap, so a fixed-width bitmask would silently alias
@@ -12619,10 +12783,15 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 /* Only flag int-null for storage types whose sentinel is
                  * meaningful. BOOL/U8 are non-nullable; SYM zero is the
                  * canonical empty value and must be skipped by aggregates.
-                 * F64 has its own NaN path. */
+                 * F64 has its own NaN path.  A strlen fusion reads lengths:
+                 * its null is length 0 (the empty string, the STR/SYM null
+                 * that exec_strlen maps to null), already the STR/SYM
+                 * sentinel.  Only an AVG needs it — a SUM adds 0 either way. */
                 int8_t t = agg_vecs[a]->type;
-                bool is_sentinel_typed = (t == RAY_I16 || t == RAY_I32 || t == RAY_I64 ||
-                                          t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP || t == RAY_SYM);
+                bool is_sentinel_typed = agg_strlen[a]
+                    ? ext->agg_ops[a] == OP_AVG
+                    : (t == RAY_I16 || t == RAY_I32 || t == RAY_I64 ||
+                       t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP || t == RAY_SYM);
                 sc_int_null_has[a] = is_sentinel_typed && ray_vec_may_have_nulls(agg_vecs[a]);
                 if (ray_vec_may_have_nulls(agg_vecs[a]) &&
                     (group_fp_type(agg_vecs[a]->type) || is_sentinel_typed))
@@ -12830,14 +12999,45 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         if (sc_any_nullable)            { sc_off_nn  = sc_words; sc_words += n_aggs; }
         size_t sc_bytes = ((sc_words * sizeof(int64_t)) + sc_line - 1) / sc_line * sc_line;
         ray_t* sc_hdr = NULL;
-        void* sc_raw = scratch_calloc(&sc_hdr, (size_t)sc_n * sc_bytes + sc_line);
+        /* After the per-chunk blocks: one pinned vocabulary per aggregate. */
+        const size_t sc_pin_off = (size_t)sc_n * sc_bytes + sc_line;
+        void* sc_raw = scratch_calloc(&sc_hdr, sc_pin_off +
+            (size_t)n_aggs * (sizeof(ray_sym_domain_raw_t) + 1) + sc_line);
         if (!sc_raw) { scratch_free(sc_vla_hdr); goto da_path; }
+        ray_sym_domain_raw_t* sc_agg_raw = (ray_sym_domain_raw_t*)(void*)
+            (((uintptr_t)sc_raw + sc_pin_off + sc_line - 1) & ~(uintptr_t)(sc_line - 1));
+        uint8_t* sc_agg_raw_ok = (uint8_t*)(sc_agg_raw + n_aggs);
 
+        /* strlen-on-STR: resolve the descriptors once.  strlen-on-SYM:
+         * pin each column's vocabulary once (a FILE-domain column reads its
+         * strings from the mapping) and borrow the sym snapshot once (as the
+         * DA path does) for runtime-domain ids — the uncached resolve takes
+         * the domain per row, and the workers contend on it. */
+        ray_t** sc_sym_strings = NULL;
+        uint32_t sc_sym_count = 0;
+        for (uint32_t a = 0; a < n_aggs; a++) {
+            sc_agg_str[a] = NULL;
+            if (!agg_strlen[a] || !agg_vecs[a]) continue;
+            if (agg_vecs[a]->type == RAY_STR) {
+                const char* pool; (void)pool;
+                str_resolve(agg_vecs[a], &sc_agg_str[a], &pool);
+            } else if (agg_vecs[a]->type == RAY_SYM) {
+                sc_agg_raw_ok[a] = ray_sym_domain_raw_pin(
+                    ray_sym_vec_domain(agg_vecs[a]), &sc_agg_raw[a]) ? 1 : 0;
+                if (!sc_sym_strings)
+                    ray_sym_strings_borrow(&sc_sym_strings, &sc_sym_count);
+            }
+        }
         scalar_ctx_t sc_ctx = {
             .agg_ptrs   = agg_ptrs,
             .agg_types  = agg_types,
             .agg_cols   = agg_vecs,
             .agg_strlen = agg_strlen,
+            .sym_strings = sc_sym_strings,
+            .sym_count  = sc_sym_count,
+            .agg_str    = sc_agg_str,
+            .agg_raw    = sc_agg_raw,
+            .agg_raw_ok = sc_agg_raw_ok,
             .agg_ops    = ext->agg_ops,
             .agg_linear = agg_linear,
             .agg_prod   = agg_prod,
@@ -12875,7 +13075,12 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             (sc_int_null_has[0] ||
              (agg_vecs[0] && group_fp_type(agg_vecs[0]->type) &&
               ray_vec_may_have_nulls(agg_vecs[0])));
-        if (n_aggs == 1 && !match_idx && !rowsel && agg_ptrs[0] != NULL && !agg0_has_nulls) {
+        /* A strlen fusion reads lengths, never the raw cells: SUM(strlen) is
+         * not null-tracked (agg0_has_nulls stays false), so without this
+         * guard the raw-cell sum loops below would add symbol ids / STR
+         * descriptors instead of lengths. */
+        if (n_aggs == 1 && !match_idx && !rowsel && agg_ptrs[0] != NULL && !agg0_has_nulls &&
+            !agg_strlen[0]) {
             uint16_t op0 = ext->agg_ops[0];
             int8_t   t0  = agg_types[0];
             if ((op0 == OP_SUM || op0 == OP_AVG) &&
@@ -13377,6 +13582,8 @@ da_path:;
              * F64 with HAS_NULLS uses NaN-skip; sentinel-typed integers
              * with HAS_NULLS use sentinel-skip. */
             bool da_any_nullable = false;
+            /* An AVG(strlen) slot counts its empty-string rows (sl_null). */
+            bool da_strlen_avg = false;
             for (uint32_t a = 0; a < n_aggs; a++) {
                 /* y-side plumbing for binary aggs (PEARSON/COV/WAVG/WSUM).
                  * Eligibility (above) already rejected nullable-int and
@@ -13409,10 +13616,14 @@ da_path:;
                     da_int_null_sentinel[a] = agg_int_null_sentinel_for(agg_vecs[a]->type);
                     /* Only set the int-null mask bit for storage types whose
                      * sentinel is meaningful. BOOL/U8 are non-nullable; SYM
-                     * zero is skipped by aggregates. F64 has its own NaN path. */
+                     * zero is skipped by aggregates. F64 has its own NaN path.
+                     * A strlen fusion reads lengths, not these cells: an
+                     * AVG counts its nulls apart (sl_null), off the mask
+                     * and the per-agg non-null counts. */
                     int8_t t = agg_vecs[a]->type;
-                    bool is_sentinel_typed = (t == RAY_I16 || t == RAY_I32 || t == RAY_I64 ||
-                                              t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP || t == RAY_SYM);
+                    bool is_sentinel_typed = !agg_strlen[a] &&
+                        (t == RAY_I16 || t == RAY_I32 || t == RAY_I64 ||
+                         t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP || t == RAY_SYM);
                     if (is_sentinel_typed && ray_vec_may_have_nulls(agg_vecs[a]))
                         da_int_null_mask |= ((uint64_t)1 << a);
                     if (ray_vec_may_have_nulls(agg_vecs[a]) &&
@@ -13426,6 +13637,8 @@ da_path:;
                 if (ext->agg_ops[a] == OP_AVG && !(agg_f64_mask & ((uint64_t)1 << a)) &&
                     !agg_strlen[a] && group_avg_needs_hi(agg_types[a], nrows))
                     da_need_sum128 = true;
+                if (agg_strlen[a] && ext->agg_ops[a] == OP_AVG)
+                    da_strlen_avg = true;
             }
 
             ray_pool_t* da_pool = ray_pool_get();
@@ -13444,6 +13657,7 @@ da_path:;
             /* Nullable aggs add a per-(group, agg) non-null count array.
              * ~8 bytes per (group, agg). */
             if (da_any_nullable) arrays_per_agg += 1;
+            if (da_strlen_avg) arrays_per_agg += 1;              /* sl_null */
             uint64_t cells_per_worker = (uint64_t)n_slots
                 * ((uint64_t)arrays_per_agg * n_aggs + 1u);
             uint64_t max_workers = cells_per_worker
@@ -13537,6 +13751,11 @@ da_path:;
                         &accums[w]._h_nn_count, total * sizeof(int64_t));
                     if (!accums[w].nn_count) { alloc_ok = false; break; }
                 }
+                if (da_strlen_avg) {
+                    accums[w].sl_null = (int64_t*)scratch_calloc(
+                        &accums[w]._h_sl_null, total * sizeof(int64_t));
+                    if (!accums[w].sl_null) { alloc_ok = false; break; }
+                }
                 if (da_has_first_last) {
                     accums[w].first_row = (int64_t*)scratch_alloc(
                         &accums[w]._h_first_row, n_slots * sizeof(int64_t));
@@ -13607,6 +13826,27 @@ da_path:;
                 .rowsel      = rowsel,
                 .da_n_scan   = n_scan,
             };
+            /* strlen-on-STR: resolve each column's descriptors once. */
+            const ray_str_t* da_agg_str[vla_aggs];
+            for (uint32_t a = 0; a < n_aggs; a++) {
+                da_agg_str[a] = NULL;
+                if (agg_strlen[a] && agg_vecs[a] && agg_vecs[a]->type == RAY_STR) {
+                    const char* pool; (void)pool;
+                    str_resolve(agg_vecs[a], &da_agg_str[a], &pool);
+                }
+            }
+            da_ctx.agg_str = da_agg_str;
+            da_ctx.sl_agg = -1;
+            if (all_sum && n_keys == 1 && !match_idx && !rowsel) {
+                int32_t one = -1;
+                bool sl_ok = true;
+                for (uint32_t a = 0; a < n_aggs && sl_ok; a++) {
+                    if (agg_prod[a].enabled) sl_ok = false;
+                    else if (agg_strlen[a] && agg_vecs[a]) { if (one >= 0) sl_ok = false; else one = (int32_t)a; }
+                    else if (ext->agg_ops[a] != OP_COUNT) sl_ok = false;
+                }
+                if (sl_ok && one >= 0) da_ctx.sl_agg = one;
+            }
             /* Pin each SYM agg column's vocabulary once for the accumulate. */
             ray_t* agg_raw_hdr = NULL;
             if (n_aggs > 0) {
@@ -13744,6 +13984,10 @@ da_path:;
                         for (size_t i = 0; i < total; i++)
                             merged->nn_count[i] += wa->nn_count[i];
                     }
+                    if (merged->sl_null && wa->sl_null) {
+                        for (size_t i = 0; i < total; i++)
+                            merged->sl_null[i] += wa->sl_null[i];
+                    }
                     for (uint32_t s = 0; s < n_slots; s++)
                         merged->count[s] += wa->count[s];
                 }
@@ -13853,6 +14097,10 @@ da_path:;
                         for (size_t i = 0; i < total; i++)
                             merged->nn_count[i] += wa->nn_count[i];
                     }
+                    if (merged->sl_null && wa->sl_null) {
+                        for (size_t i = 0; i < total; i++)
+                            merged->sl_null[i] += wa->sl_null[i];
+                    }
                     for (uint32_t s = 0; s < n_slots; s++)
                         merged->count[s] += wa->count[s];
                 }
@@ -13942,7 +14190,8 @@ da_path:;
             int64_t*  dense_counts  = grp_count
                 ? (int64_t*)scratch_alloc(&_h_dcnt, grp_count * sizeof(int64_t))
                 : NULL;
-            int64_t*  dense_nn_counts = (da_nn_count && grp_count)
+            int64_t*  da_sl_null  = merged->sl_null;  /* NULL without an AVG(strlen) */
+            int64_t*  dense_nn_counts = ((da_nn_count || da_sl_null) && grp_count)
                 ? (int64_t*)scratch_alloc(&_h_dnn, dense_total * sizeof(int64_t))
                 : NULL;
 
@@ -13961,7 +14210,13 @@ da_path:;
                     if (dense_sum_y)   dense_sum_y[di]   = da_sum_y[si];
                     if (dense_sumsq_y) dense_sumsq_y[di] = da_sumsq_y[si];
                     if (dense_sumxy)   dense_sumxy[di]   = da_sumxy[si];
-                    if (dense_nn_counts) dense_nn_counts[di] = da_nn_count[si];
+                    if (dense_nn_counts) {
+                        /* An AVG(strlen) divides by its non-empty rows. */
+                        int64_t nnv = da_nn_count ? da_nn_count[si] : da_count[s];
+                        if (da_sl_null && agg_strlen[a] && ext->agg_ops[a] == OP_AVG)
+                            nnv -= da_sl_null[si];
+                        dense_nn_counts[di] = nnv;
+                    }
                 }
                 gi++;
             }

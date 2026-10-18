@@ -1704,9 +1704,12 @@ typedef struct {
  * on false *out carries no owned spill.  On success *out owns its spill_hdr
  * (NULL when inline) and every base pointer aims at *out's own storage. */
 /* Per-type integer null sentinel for an aggregation column.  Returns 0 for
- * non-nullable / non-integer types (BOOL, U8, SYM, F64) since 0 will never
- * match a value flagged as null via HAS_NULLS.  Shared by the group row-layout
- * accumulators/finalizers and the pivot finalizer. */
+ * the other types.  For SYM that is the null itself (cell id 0, the empty
+ * symbol), and so it is for a strlen fusion over STR/SYM (length 0, the
+ * empty string): the row-layout accumulators skip those zeros.  BOOL/U8 are
+ * non-nullable and F64 nulls are NaN, so 0 is never consulted for them.
+ * Shared by the group row-layout accumulators/finalizers and the pivot
+ * finalizer. */
 static inline int64_t agg_int_null_sentinel_for(int8_t t) {
     switch (t) {
         case RAY_I64: case RAY_TIMESTAMP:            return NULL_I64;
