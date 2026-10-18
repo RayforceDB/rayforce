@@ -1,0 +1,71 @@
+;; @requires: posix
+;; ════════════════════════════════════════════════════════════════════
+;; topn_parted_ties.rfl — ties at the cut of a grouped top-N over a
+;; PARTED table (issue #801).
+;;
+;; `select … by … desc:|asc: <agg> take: N` (N <= 1024) arms the group
+;; emit filter.  On the legacy radix fat-entry path (a computed key keeps
+;; the group off the v2 engine; high cardinality sends a parted input to
+;; the concat fallback) the bounded heap topn_heap_push cut the groups to
+;; exactly N comparing on the value only, so groups tied at the cut were
+;; kept in (radix partition, gid) push order — and the gid inside a radix
+;; partition depends on how workers claimed morsels.  The answer changed
+;; from run to run and did not match the stable sort.
+;;
+;; REFERENCE.  `take: 1025` is above the emit-filter cap, so it is the
+;; full group set (emitted by earliest source row) + stable sort; its
+;; first N rows break ties on earliest source row.  The heap now breaks
+;; value ties the same way (earlier first row wins), so the take: N
+;; answer must equal that prefix on every run.
+;;
+;; FIXTURE.  4 partitions x 150000 rows; partition p holds keys
+;; base_p + (i mod 15000), 10 rows each, with base_p DESCENDING
+;; (300000, 200000, 100000, 0) so key order disagrees with source-row
+;; order.  Partitions 2 and 4 append 5 more rows for each of their
+;; first 50 keys (count 15).  desc take: 120 keeps the 100 count-15
+;; groups and cuts 20 of the 59900 groups tied at 10 — those must be
+;; keys 300000..300019 (partition 1, earliest rows).  asc take: 50
+;; cuts 50 of the groups tied at 10: again partition 1's first keys.
+;; Keys are spread by a large multiplier and grouped through a computed
+;; expression (+ k 0) with a SYM side key, which reaches the radix heap.
+;; ════════════════════════════════════════════════════════════════════
+
+(.sys.exec "rm -rf /tmp/rfl_topn801")
+(set I801 (% (til 150000) 15000))
+(set E801 (concat (concat (til 50) (til 50)) (concat (concat (til 50) (til 50)) (til 50))))
+(set mk801 (fn [b ix] (table [k j v] (list (* 1000000007 (+ b ix)) (as 'SYM (% ix 7)) (til (count ix))))))
+(.db.splayed.set "/tmp/rfl_topn801/1/t/" (mk801 300000 I801))
+(.db.splayed.set "/tmp/rfl_topn801/2/t/" (mk801 200000 (concat I801 E801)))
+(.db.splayed.set "/tmp/rfl_topn801/3/t/" (mk801 100000 I801))
+(.db.splayed.set "/tmp/rfl_topn801/4/t/" (mk801 0 (concat I801 E801)))
+(set P801 (.db.parted.get "/tmp/rfl_topn801/" 't))
+
+(set REFD801 (take (select {c: (count v) by: {kk: (+ k 0) j: j} from: P801 desc: c take: 1025}) 120))
+(set REFA801 (take (select {c: (count v) by: {kk: (+ k 0) j: j} from: P801 asc: c take: 1025}) 50))
+
+;; the reference itself: 100 groups at 15, then partition 1's first keys
+;; (key x is stored as x * 1000000007)
+(sum (at REFD801 'c)) -- 1700
+(at (at REFD801 'kk) 100) -- 300000002100000
+(at (at REFD801 'kk) 119) -- 300019002100133
+(at (at REFA801 'kk) 0) -- 300000002100000
+(at (at REFA801 'kk) 49) -- 300049002100343
+
+;; desc: every run keeps exactly the reference rows, in reference order
+(set D801 (fn [] (select {c: (count v) by: {kk: (+ k 0) j: j} from: P801 desc: c take: 120})))
+(at (D801) 'kk) -- (at REFD801 'kk)
+(at (D801) 'kk) -- (at REFD801 'kk)
+(at (D801) 'kk) -- (at REFD801 'kk)
+(at (D801) 'kk) -- (at REFD801 'kk)
+(at (D801) 'kk) -- (at REFD801 'kk)
+(at (D801) 'c) -- (at REFD801 'c)
+
+;; asc: same tie-break at the bottom
+(set A801 (fn [] (select {c: (count v) by: {kk: (+ k 0) j: j} from: P801 asc: c take: 50})))
+(at (A801) 'kk) -- (at REFA801 'kk)
+(at (A801) 'kk) -- (at REFA801 'kk)
+(at (A801) 'kk) -- (at REFA801 'kk)
+(at (A801) 'kk) -- (at REFA801 'kk)
+(at (A801) 'kk) -- (at REFA801 'kk)
+
+(.sys.exec "rm -rf /tmp/rfl_topn801")

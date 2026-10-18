@@ -6082,6 +6082,7 @@ static inline uint32_t group_radix_part(uint64_t hash, uint32_t n_parts) {
 
 typedef struct {
     int64_t value;
+    int64_t first;   /* group's earliest source row (off_group_first) */
     uint32_t part;
     uint32_t gid;
 } group_topn_item_t;
@@ -6092,72 +6093,76 @@ typedef struct {
  * its cost is O(total groups) — tens of millions of rows on a high-cardinality
  * 100M-row group-by, and it ran on one thread.
  *
- * `TOPN_BETTER(desc, a, b)` is the single ordering predicate: for `desc` a
- * larger value is better, otherwise a smaller one.  The heap keeps the WORST
- * retained item at the root (min-heap when desc), so the invariant is
- * "parent is not better than child" and a swap is needed exactly when the
- * parent IS better. */
+ * `TOPN_BETTER(desc, a, b)` is the value predicate: for `desc` a larger
+ * value is better, otherwise a smaller one.  `topn_item_better` extends it to
+ * a TOTAL order over groups: equal values are broken on the group's earliest
+ * source row (off_group_first), the earlier row winning.  That is exactly the
+ * order the reference answer uses — groups are emitted by earliest source row
+ * (see the group_out ordering below) and the final sort is stable — so the
+ * heap keeps the same groups a full stable sort + take would.  Every group
+ * has a distinct first row (the emit ordering rejects duplicates), so no two
+ * candidates ever compare equal.
+ *
+ * The heap keeps the WORST retained item at the root (min-heap when desc),
+ * so the invariant is "parent is not better than child" and a swap is needed
+ * exactly when the parent IS better. */
 #define TOPN_BETTER(desc_dir, a, b) ((desc_dir) ? ((a) > (b)) : ((a) < (b)))
 
+static inline bool topn_item_better(uint8_t desc_dir, int64_t av, int64_t af,
+                                    int64_t bv, int64_t bf) {
+    if (av != bv) return TOPN_BETTER(desc_dir, av, bv);
+    return af < bf;
+}
+
 /* Push one candidate into a bounded "best k" heap; returns the new count.
- * Replacement is on STRICT improvement: an item that merely TIES the root is
- * rejected and the heap is left byte-for-byte unchanged.
+ * Replacement is on strict improvement under topn_item_better.
  *
- * That is NOT the same as "the earliest of equal values wins" — with k=2,
- * desc, pushing 5,5,7 evicts the FIRST 5, because sift-down may promote
- * either equal child to the root.  What holds is only that the outcome is a
- * deterministic function of the push sequence, which is all the callers need.
+ * Because that order is total, the retained set is the k best candidates
+ * pushed, whatever order they arrive in.  The order used to matter: on value
+ * alone, ties at the cut were settled by (partition, gid) push order, and the
+ * gid inside a radix partition depends on how workers claimed morsels in
+ * phase 1 — so `desc: c take: N` returned a run-dependent set of tied groups
+ * (issue #801).
  *
  * WHY THE PARALLEL PRE-PASS RETAINS THE SAME SET AS ONE SERIAL SCAN.  Let H
  * be the global heap of the serial scan and H_p a partition's local heap.
- * When H_p is full it holds the k best of what that partition has shown so
- * far; H at the same point holds the k best of a SUPERSET of those items, so
- * H's root is never worse than H_p's.  An item H_p rejects is therefore not
- * strictly better than H's root either — H would reject it too, leaving H
- * unchanged.  So the pre-pass elides only pushes that are provably no-ops,
- * and feeding H the survivors alone reproduces its exact trajectory.
- *
- * TWO CONDITIONS CARRY THAT ARGUMENT.  Do not "optimise" either away:
- *   (1) the per-partition cap is k_take ITSELF, never k_take/n_parts or any
- *       other share.  (It may be smaller only when the partition holds fewer
- *       than k_take groups — then the heap drops nothing at all.)  With a
- *       smaller cap H_p's root could be BETTER than H's, and H_p would drop
- *       an item the serial scan keeps.
- *   (2) the merge feeds candidates in the serial scan's order: partitions
- *       ascending, and gid ascending within a partition.  Ties are
- *       order-sensitive (see the 5,5,7 trace above), so topn_scan_fn sorts
- *       its survivors back into gid order for exactly this reason. */
+ * H_p holds the k best of its partition; any item of the global top k is
+ * among the k best of its own partition, so the union of the H_p contains
+ * the global top k and feeding H the survivors alone retains the same set.
+ * This needs the per-partition cap to be k_take ITSELF, never k_take/n_parts
+ * or any other share.  (It may be smaller only when the partition holds fewer
+ * than k_take groups — then the heap drops nothing at all.)  Do not
+ * "optimise" that away. */
 static inline int64_t topn_heap_push(group_topn_item_t* h, int64_t hn,
                                      int64_t k, uint8_t desc_dir, int64_t v,
-                                     uint32_t part, uint32_t gid) {
+                                     int64_t first, uint32_t part,
+                                     uint32_t gid) {
+#define TOPN_ITEM_BETTER(x, y) \
+    topn_item_better(desc_dir, (x).value, (x).first, (y).value, (y).first)
     if (hn < k) {
         int64_t j = hn++;
-        h[j] = (group_topn_item_t){v, part, gid};
+        h[j] = (group_topn_item_t){v, first, part, gid};
         while (j > 0) {                             /* sift up */
             int64_t pr = (j - 1) >> 1;
-            if (!TOPN_BETTER(desc_dir, h[pr].value, h[j].value)) break;
+            if (!TOPN_ITEM_BETTER(h[pr], h[j])) break;
             group_topn_item_t t = h[pr]; h[pr] = h[j]; h[j] = t;
             j = pr;
         }
         return hn;
     }
-    if (!TOPN_BETTER(desc_dir, v, h[0].value)) return hn;
-    h[0] = (group_topn_item_t){v, part, gid};
+    if (!topn_item_better(desc_dir, v, first, h[0].value, h[0].first))
+        return hn;
+    h[0] = (group_topn_item_t){v, first, part, gid};
     for (int64_t j = 0;;) {                         /* sift down */
         int64_t l = j * 2 + 1, r = l + 1, m = j;
-        if (l < hn && TOPN_BETTER(desc_dir, h[m].value, h[l].value)) m = l;
-        if (r < hn && TOPN_BETTER(desc_dir, h[m].value, h[r].value)) m = r;
+        if (l < hn && TOPN_ITEM_BETTER(h[m], h[l])) m = l;
+        if (r < hn && TOPN_ITEM_BETTER(h[m], h[r])) m = r;
         if (m == j) break;
         group_topn_item_t t = h[m]; h[m] = h[j]; h[j] = t;
         j = m;
     }
     return hn;
-}
-
-static int topn_gid_cmp(const void* a, const void* b) {
-    uint32_t ga = ((const group_topn_item_t*)a)->gid;
-    uint32_t gb = ((const group_topn_item_t*)b)->gid;
-    return ga < gb ? -1 : (ga > gb ? 1 : 0);
+#undef TOPN_ITEM_BETTER
 }
 
 static int topn_part_gid_cmp(const void* a, const void* b) {
@@ -6169,10 +6174,9 @@ static int topn_part_gid_cmp(const void* a, const void* b) {
 
 /* Parallel pre-pass: reduce each partition to its OWN top-k.  The global
  * top-k is a subset of the union of those, so the serial merge that follows
- * only walks the survivors.  Each worker sorts its survivors back into gid
- * order and the merge walks partitions in ascending order, so the merge sees
- * candidates in the same (partition, gid) sequence the single-threaded scan
- * did — the retained set, and therefore the emitted rows, are identical. */
+ * only walks the survivors.  The heap order is total (value, then earliest
+ * source row), so the retained set, and therefore the emitted rows, are the
+ * ones the single-threaded scan keeps, in any push order. */
 typedef struct {
     group_ht_t*        part_hts;
     group_topn_item_t* items;      /* [item_off[n_parts]] staging */
@@ -6191,15 +6195,17 @@ static void topn_scan_fn(void* vctx, uint32_t worker_id, int64_t start,
         group_ht_t* ph = &c->part_hts[p];
         uint32_t gc = ph->grp_count;
         uint16_t rs = ph->layout.row_stride;
+        uint16_t fo = ph->layout.off_group_first;
         group_topn_item_t* h = c->items + c->item_off[p];
         int64_t cap = (int64_t)(c->item_off[p + 1] - c->item_off[p]);
         int64_t hn = 0;
         for (uint32_t gi = 0; gi < gc; gi++) {
-            int64_t v = *(const int64_t*)(const void*)
-                        (ph->rows + (size_t)gi * rs + c->order_off);
-            hn = topn_heap_push(h, hn, cap, c->desc_dir, v, p, gi);
+            const char* row = ph->rows + (size_t)gi * rs;
+            int64_t v, first;
+            memcpy(&v, row + c->order_off, 8);
+            memcpy(&first, row + fo, 8);
+            hn = topn_heap_push(h, hn, cap, c->desc_dir, v, first, p, gi);
         }
-        if (hn > 1) qsort(h, (size_t)hn, sizeof(*h), topn_gid_cmp);
         c->item_cnt[p] = (uint32_t)hn;
     }
 }
@@ -6208,12 +6214,10 @@ static void topn_scan_fn(void* vctx, uint32_t worker_id, int64_t start,
  * the END of the phase-2 task that BUILT the partition, while its rows are
  * still in that core's L2/L3 instead of being re-read from DRAM afterwards.
  *
- * It is arithmetically the same scan — same shared topn_heap_push, the same
- * per-partition cap (`cap` is k_take ITSELF, condition (1) of the proof above,
- * here as a uniform stride because grp_count is unknown at allocation time),
- * and the same sort back into gid order so the merge still sees candidates
- * partitions-ascending / gid-ascending (condition (2)).  Fusion moves only
- * WHERE the scan runs, never what it retains.
+ * It is arithmetically the same scan — same shared topn_heap_push and the
+ * same per-partition cap (`cap` is k_take ITSELF, as the proof above requires,
+ * here as a uniform stride because grp_count is unknown at allocation time).
+ * Fusion moves only WHERE the scan runs, never what it retains.
  *
  * `items == NULL` means fusion is off and the standalone topn_scan_fn pre-pass
  * (or the serial scan) runs instead.  `item_cnt` is calloc'd by the driver and
@@ -6232,15 +6236,17 @@ static inline void topn_fuse_partition(const topn_fuse_t* f, group_ht_t* ph,
                                        uint32_t p) {
     uint32_t gc = ph->grp_count;
     uint16_t rs = ph->layout.row_stride;
+    uint16_t fo = ph->layout.off_group_first;
     group_topn_item_t* h = f->items + (size_t)p * f->cap;
     int64_t cap = (int64_t)f->cap;
     int64_t hn = 0;
     for (uint32_t gi = 0; gi < gc; gi++) {
-        int64_t v = *(const int64_t*)(const void*)
-                    (ph->rows + (size_t)gi * rs + f->order_off);
-        hn = topn_heap_push(h, hn, cap, f->desc_dir, v, p, gi);
+        const char* row = ph->rows + (size_t)gi * rs;
+        int64_t v, first;
+        memcpy(&v, row + f->order_off, 8);
+        memcpy(&first, row + fo, 8);
+        hn = topn_heap_push(h, hn, cap, f->desc_dir, v, first, p, gi);
     }
-    if (hn > 1) qsort(h, (size_t)hn, sizeof(*h), topn_gid_cmp);
     f->item_cnt[p] = (uint32_t)hn;
 }
 
@@ -7599,6 +7605,11 @@ typedef struct {
                           * aggs needs null tracking (no HAS_NULLS columns). */
     int64_t*  first_row; /* min row index seen per slot (FIRST) [n_slots] */
     int64_t*  last_row;  /* max row index seen per slot (LAST)  [n_slots] */
+    int64_t*  sl_null;   /* per-(group, agg) rows of length 0 under an
+                          * AVG(strlen) fusion [n_slots * n_aggs]: the empty
+                          * string is the STR/SYM null, so the emit divides
+                          * by the non-null rows (nn_count, else count)
+                          * minus these.  NULL without an AVG(strlen). */
     /* Binary-aggregator co-moments (PEARSON/COV/WAVG/WSUM): the y-side of
      * the pair.  [n_slots * n_aggs].  x-side reuses sum (Σx) + sumsq_f64
      * (Σx²).  Allocated only when DA_NEED_PAIR is set. */
@@ -7615,6 +7626,7 @@ typedef struct {
     ray_t* _h_nn_count;
     ray_t* _h_first_row;
     ray_t* _h_last_row;
+    ray_t* _h_sl_null;
     ray_t* _h_sum_y;
     ray_t* _h_sumsq_y;
     ray_t* _h_sumxy;
@@ -7630,6 +7642,7 @@ static inline void da_accum_free(da_accum_t* a) {
     scratch_free(a->_h_nn_count);
     scratch_free(a->_h_first_row);
     scratch_free(a->_h_last_row);
+    scratch_free(a->_h_sl_null);
     scratch_free(a->_h_sum_y);
     scratch_free(a->_h_sumsq_y);
     scratch_free(a->_h_sumxy);
@@ -7949,6 +7962,12 @@ typedef struct {
      * entry off the mapping instead of pinning (and checking null) per row. */
     ray_sym_domain_raw_t* agg_raw;
     uint8_t*       agg_raw_ok;
+    /* Per-agg STR descriptors of a strlen fusion's column, resolved once
+     * (slice offset applied); NULL for other aggs.  Always set. */
+    const ray_str_t** agg_str;
+    /* The one SUM/AVG(strlen) agg when every other agg is a COUNT, the key
+     * is single and all_sum holds (da_accum_strlen_fn); -1 otherwise. */
+    int32_t        sl_agg;
 } da_ctx_t;
 
 typedef struct {
@@ -8493,6 +8512,11 @@ struct scalar_ctx_s {
     int8_t*        agg_types;
     ray_t**        agg_cols;
     uint8_t*       agg_strlen;
+    ray_t**        sym_strings;  /* borrowed sym snapshot for strlen-on-SYM aggs */
+    uint32_t       sym_count;
+    const ray_str_t** agg_str;   /* strlen-on-STR: descriptors resolved once */
+    const ray_sym_domain_raw_t* agg_raw;  /* strlen-on-SYM: pinned vocabulary per agg (agg_raw_ok) */
+    const uint8_t* agg_raw_ok;
     uint16_t*      agg_ops;
     agg_linear_t*  agg_linear;
     agg_prod_t*    agg_prod;     /* fused SUM/AVG(a*b) slots (may be NULL) */
@@ -8696,7 +8720,24 @@ static inline void scalar_accum_row(scalar_ctx_t* c, da_accum_t* acc, int64_t r)
         } else {
             if (!c->agg_ptrs[a]) continue;
             if (c->agg_strlen && c->agg_strlen[a]) {
-                iv = group_strlen_at(c->agg_cols[a], r);
+                /* STR: the descriptor's length (a null is the empty
+                 * string, length 0); SYM: a FILE-domain id from the pinned
+                 * mapping, else through the borrowed snapshot. */
+                if (c->agg_str[a]) {
+                    iv = (int64_t)c->agg_str[a][r].len;
+                } else if (c->agg_raw_ok[a]) {   /* a pinned SYM column */
+                    const ray_t* scol = c->agg_cols[a];
+                    int64_t sid = ray_read_sym(ray_data((ray_t*)scol), r, RAY_SYM, scol->attrs);
+                    if (sid > 0 && sid < c->agg_raw[a].count) {
+                        size_t sl;
+                        (void)ray_sym_domain_raw_str(&c->agg_raw[a], sid, &sl);
+                        iv = (int64_t)sl;
+                    } else {
+                        iv = group_strlen_at_cached(scol, r, c->sym_strings, c->sym_count);
+                    }
+                } else {
+                    iv = group_strlen_at_cached(c->agg_cols[a], r, c->sym_strings, c->sym_count);
+                }
                 fv = (double)iv;
             } else {
                 uint8_t attrs = c->agg_cols[a] ? c->agg_cols[a]->attrs : 0;
@@ -8834,11 +8875,8 @@ static void scalar_chunk_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
  * as group_strlen_at_cached does. */
 static inline int64_t da_strlen_at(const da_ctx_t* c, uint32_t a, int64_t r) {
     const ray_t* col = c->agg_cols[a];
-    if (col->type == RAY_STR) {
-        const ray_str_t* elems; const char* pool; (void)pool;
-        str_resolve(col, &elems, &pool);
-        return (int64_t)elems[r].len;
-    }
+    /* STR: descriptors resolved once at setup (every strlen-on-STR agg). */
+    if (col->type == RAY_STR) return (int64_t)c->agg_str[a][r].len;
     if (col->type == RAY_SYM) {
         int64_t sid = ray_read_sym(ray_data((ray_t*)col), r, RAY_SYM, col->attrs);
         if (sid == 0) return 0;
@@ -8891,8 +8929,13 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
             }
             if (!c->agg_ptrs[a]) continue;
             if (c->agg_strlen && c->agg_strlen[a]) {
-                acc->sum[idx].i = wrap_add_i64(acc->sum[idx].i, da_strlen_at(c, a, r));
+                /* Length 0 is the empty string, the STR/SYM null: it adds
+                 * nothing to the sum; an AVG keeps it out of the divisor
+                 * through sl_null (exec_strlen maps it to null). */
+                int64_t len = da_strlen_at(c, a, r);
+                acc->sum[idx].i = wrap_add_i64(acc->sum[idx].i, len);
                 if (nn) nn[idx]++;
+                if (RAY_UNLIKELY(len == 0) && acc->sl_null) acc->sl_null[idx]++;
             } else if (f64m & ((uint64_t)1 << a)) {
                 /* NaN payload = null, skip from sum. */
                 double v = group_fp_at(c->agg_ptrs[a], c->agg_types[a], r);
@@ -8943,8 +8986,12 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
             fv = prod_val_f64(&c->agg_prod[a], r);
             iv = (int64_t)fv;
         } else if (c->agg_strlen && c->agg_strlen[a]) {
-            iv = da_strlen_at(c, a, r);
-            fv = (double)iv;
+            /* SUM/AVG(strlen) only: as the SUM/AVG fast path above. */
+            int64_t len = da_strlen_at(c, a, r);
+            acc->sum[idx].i = wrap_add_i64(acc->sum[idx].i, len);
+            if (nn) nn[idx]++;
+            if (RAY_UNLIKELY(len == 0) && acc->sl_null) acc->sl_null[idx]++;
+            continue;
         } else {
             uint8_t attrs = c->agg_cols[a] ? c->agg_cols[a]->attrs : 0;
             da_read_val(c->agg_ptrs[a], c->agg_types[a], attrs, r, &fv, &iv);
@@ -9064,12 +9111,130 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
     if (last_advanced)  acc->last_row[gid]  = r;
 }
 
+/* Off the hot loop: an id past the pinned mapping / snapshot. */
+static int64_t __attribute__((noinline, cold))
+da_sid_len_slow(const da_ctx_t* c, uint32_t a, int64_t r) {
+    return group_strlen_at_cached(c->agg_cols[a], r, c->sym_strings, c->sym_count);
+}
+
+/* strlen of SYM id sid (cell r of agg a): raw is the pinned FILE mapping or
+ * NULL, rt the runtime domain with the borrowed snapshot — both decided by
+ * the caller once.  Same answer as da_strlen_at. */
+RAY_INLINE int64_t da_sid_len(const da_ctx_t* c, uint32_t a, int64_t sid,
+                              const ray_sym_domain_raw_t* raw, bool rt, int64_t r) {
+    if (sid == 0) return 0;
+    if (raw && sid > 0 && sid < raw->count) {
+        size_t sl;
+        (void)ray_sym_domain_raw_str(raw, sid, &sl);
+        return (int64_t)sl;
+    }
+    if (rt && sid > 0 && (uint64_t)sid < c->sym_count) {
+        ray_t* atom = c->sym_strings[sid];
+        return atom ? (int64_t)ray_str_len(atom) : 0;
+    }
+    return da_sid_len_slow(c, a, r);
+}
+
+/* One SUM/AVG(strlen) beside COUNTs, one key, no row selection
+ * (c->sl_agg >= 0).  Per block of rows the lengths are read first by a loop
+ * of the column's own kind — STR descriptors, or SYM ids at their width —
+ * and then folded by a loop of the key's width, so neither loop carries the
+ * other's dispatch nor da_accum_row's per-agg one.  Keeps the state the
+ * SUM/AVG fast path keeps for it: count, the length sum, nn when allocated,
+ * sl_null for an AVG (COUNT emits from count alone). */
+#define DA_SL_BLK 512
+static void __attribute__((noinline))
+da_accum_strlen_fn(da_ctx_t* c, da_accum_t* acc, int64_t start, int64_t end) {
+    const uint32_t sa = (uint32_t)c->sl_agg;
+    const size_t n_aggs = c->n_aggs;
+    int64_t* restrict count = acc->count;
+    da_val_t* restrict sum = acc->sum;
+    int64_t* nn = acc->nn_count;
+    int64_t* sln = acc->sl_null;
+    const int64_t kmin = c->key_mins[0];
+    const bool ksym = c->key_types[0] == RAY_SYM;
+    const bool da_pf = c->n_slots >= 4096;
+    const ray_t* col = c->agg_cols[sa];
+    const ray_str_t* desc = c->agg_str[sa];
+    const void* ids = desc ? NULL : ray_data((ray_t*)col);
+    const uint8_t sw = col->attrs & RAY_SYM_W_MASK;
+    const ray_sym_domain_raw_t* raw =
+        (!desc && c->agg_raw_ok && c->agg_raw_ok[sa]) ? &c->agg_raw[sa] : NULL;
+    const bool rt = !desc && c->sym_strings &&
+                    ray_sym_vec_domain((ray_t*)col) == ray_sym_runtime_domain();
+    int64_t lens[DA_SL_BLK];
+    #define DA_SL_SYM(T) \
+    do { \
+        const T* sp = (const T*)ids; \
+        for (int64_t j = 0; j < n; j++) \
+            lens[j] = da_sid_len(c, sa, (int64_t)sp[b0 + j], raw, rt, b0 + j); \
+    } while (0)
+    #define DA_SL_PF_DIST 8
+    #define DA_SL_FOLD(KTYPE, KCAST) \
+    do { \
+        const KTYPE* kp = (const KTYPE*)c->key_ptrs[0]; \
+        for (int64_t j = 0; j < n; j++) { \
+            int64_t r = b0 + j; \
+            if (da_pf && RAY_LIKELY(r + DA_SL_PF_DIST < end)) { \
+                int64_t pfk = (int64_t)KCAST kp[r + DA_SL_PF_DIST]; \
+                if (ksym && pfk == 0) pfk = kmin; \
+                __builtin_prefetch(&count[(int32_t)(pfk - kmin)], 1, 1); \
+                __builtin_prefetch(&sum[(size_t)(int32_t)(pfk - kmin) * n_aggs], 1, 1); \
+            } \
+            int64_t kv = (int64_t)KCAST kp[r]; \
+            if (ksym && kv == 0) kv = kmin; \
+            int32_t gid = (int32_t)(kv - kmin); \
+            count[gid]++; \
+            size_t idx = (size_t)gid * n_aggs + sa; \
+            int64_t len = lens[j]; \
+            sum[idx].i = wrap_add_i64(sum[idx].i, len); \
+            if (nn) nn[idx]++; \
+            if (RAY_UNLIKELY(len == 0) && sln) sln[idx]++; \
+        } \
+    } while (0)
+    for (int64_t b0 = start; b0 < end; b0 += DA_SL_BLK) {
+        int64_t n = end - b0 < DA_SL_BLK ? end - b0 : DA_SL_BLK;
+        if (desc) {
+            for (int64_t j = 0; j < n; j++) lens[j] = (int64_t)desc[b0 + j].len;
+        } else {
+            switch (sw) {
+            case RAY_SYM_W8:  DA_SL_SYM(uint8_t);  break;
+            case RAY_SYM_W16: DA_SL_SYM(uint16_t); break;
+            case RAY_SYM_W32: DA_SL_SYM(uint32_t); break;
+            default:          DA_SL_SYM(int64_t);  break;
+            }
+        }
+        /* Key widths as da_accum_fn's single-key loop (sign-extend signed). */
+        if (da_key_is_unsigned(c->key_types[0])) {
+            switch (c->key_esz[0]) {
+            case 1: DA_SL_FOLD(uint8_t, ); break;
+            case 2: DA_SL_FOLD(uint16_t, ); break;
+            case 4: DA_SL_FOLD(uint32_t, (int64_t)); break;
+            default: DA_SL_FOLD(int64_t, ); break;
+            }
+        } else {
+            switch (c->key_esz[0]) {
+            case 1: DA_SL_FOLD(int8_t, ); break;
+            case 2: DA_SL_FOLD(int16_t, ); break;
+            case 4: DA_SL_FOLD(int32_t, (int64_t)); break;
+            default: DA_SL_FOLD(int64_t, ); break;
+            }
+        }
+    }
+    #undef DA_SL_FOLD
+    #undef DA_SL_PF_DIST
+    #undef DA_SL_SYM
+}
+#undef DA_SL_BLK
+
 static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
     da_ctx_t* c = (da_ctx_t*)ctx;
     da_accum_t* acc = &c->accums[worker_id];
     uint8_t n_aggs = c->n_aggs;
     uint8_t n_keys = c->n_keys;
     const int64_t* match_idx = c->match_idx;
+
+    if (c->sl_agg >= 0) { da_accum_strlen_fn(c, acc, start, end); return; }
 
     /* Fast path: single key — avoid composite GID loop overhead.
      * Templated by key element size: the entire loop is stamped out per width
@@ -9409,6 +9574,10 @@ static void da_merge_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
             if (merged->nn_count && wa->nn_count) {
                 for (uint32_t a = 0; a < n_aggs; a++)
                     merged->nn_count[base + a] += wa->nn_count[base + a];
+            }
+            if (merged->sl_null && wa->sl_null) {
+                for (uint32_t a = 0; a < n_aggs; a++)
+                    merged->sl_null[base + a] += wa->sl_null[base + a];
             }
             merged->count[s] += wa->count[s];
         }
@@ -12576,7 +12745,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         /* Keyless path serves unbounded n_aggs — VLAs here scale with the query,
          * so carve exactly (8-byte arrays first). */
         ray_t* sc_vla_hdr = NULL;
-        size_t sc_vla_bytes = (size_t)vla_aggs * (sizeof(void*) + sizeof(int64_t)
+        size_t sc_vla_bytes = (size_t)vla_aggs * (2 * sizeof(void*) + sizeof(int64_t)
                                                   + sizeof(int8_t) + sizeof(bool));
         uint8_t* sc_blk = (uint8_t*)scratch_alloc(&sc_vla_hdr, sc_vla_bytes);
         if (!sc_blk) {
@@ -12588,7 +12757,8 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             return ray_error("oom", NULL);
         }
         void*    *agg_ptrs             = (void**)sc_blk;
-        int64_t  *sc_int_null_sentinel = (int64_t*)(agg_ptrs + vla_aggs);
+        const ray_str_t** sc_agg_str   = (const ray_str_t**)(agg_ptrs + vla_aggs);
+        int64_t  *sc_int_null_sentinel = (int64_t*)(sc_agg_str + vla_aggs);
         int8_t   *agg_types            = (int8_t*)(sc_int_null_sentinel + vla_aggs);
         /* Per-element flag, not a bitmask: this path's n_aggs is VLA-sized
          * with no fixed cap, so a fixed-width bitmask would silently alias
@@ -12613,10 +12783,15 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 /* Only flag int-null for storage types whose sentinel is
                  * meaningful. BOOL/U8 are non-nullable; SYM zero is the
                  * canonical empty value and must be skipped by aggregates.
-                 * F64 has its own NaN path. */
+                 * F64 has its own NaN path.  A strlen fusion reads lengths:
+                 * its null is length 0 (the empty string, the STR/SYM null
+                 * that exec_strlen maps to null), already the STR/SYM
+                 * sentinel.  Only an AVG needs it — a SUM adds 0 either way. */
                 int8_t t = agg_vecs[a]->type;
-                bool is_sentinel_typed = (t == RAY_I16 || t == RAY_I32 || t == RAY_I64 ||
-                                          t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP || t == RAY_SYM);
+                bool is_sentinel_typed = agg_strlen[a]
+                    ? ext->agg_ops[a] == OP_AVG
+                    : (t == RAY_I16 || t == RAY_I32 || t == RAY_I64 ||
+                       t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP || t == RAY_SYM);
                 sc_int_null_has[a] = is_sentinel_typed && ray_vec_may_have_nulls(agg_vecs[a]);
                 if (ray_vec_may_have_nulls(agg_vecs[a]) &&
                     (group_fp_type(agg_vecs[a]->type) || is_sentinel_typed))
@@ -12824,14 +12999,45 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         if (sc_any_nullable)            { sc_off_nn  = sc_words; sc_words += n_aggs; }
         size_t sc_bytes = ((sc_words * sizeof(int64_t)) + sc_line - 1) / sc_line * sc_line;
         ray_t* sc_hdr = NULL;
-        void* sc_raw = scratch_calloc(&sc_hdr, (size_t)sc_n * sc_bytes + sc_line);
+        /* After the per-chunk blocks: one pinned vocabulary per aggregate. */
+        const size_t sc_pin_off = (size_t)sc_n * sc_bytes + sc_line;
+        void* sc_raw = scratch_calloc(&sc_hdr, sc_pin_off +
+            (size_t)n_aggs * (sizeof(ray_sym_domain_raw_t) + 1) + sc_line);
         if (!sc_raw) { scratch_free(sc_vla_hdr); goto da_path; }
+        ray_sym_domain_raw_t* sc_agg_raw = (ray_sym_domain_raw_t*)(void*)
+            (((uintptr_t)sc_raw + sc_pin_off + sc_line - 1) & ~(uintptr_t)(sc_line - 1));
+        uint8_t* sc_agg_raw_ok = (uint8_t*)(sc_agg_raw + n_aggs);
 
+        /* strlen-on-STR: resolve the descriptors once.  strlen-on-SYM:
+         * pin each column's vocabulary once (a FILE-domain column reads its
+         * strings from the mapping) and borrow the sym snapshot once (as the
+         * DA path does) for runtime-domain ids — the uncached resolve takes
+         * the domain per row, and the workers contend on it. */
+        ray_t** sc_sym_strings = NULL;
+        uint32_t sc_sym_count = 0;
+        for (uint32_t a = 0; a < n_aggs; a++) {
+            sc_agg_str[a] = NULL;
+            if (!agg_strlen[a] || !agg_vecs[a]) continue;
+            if (agg_vecs[a]->type == RAY_STR) {
+                const char* pool; (void)pool;
+                str_resolve(agg_vecs[a], &sc_agg_str[a], &pool);
+            } else if (agg_vecs[a]->type == RAY_SYM) {
+                sc_agg_raw_ok[a] = ray_sym_domain_raw_pin(
+                    ray_sym_vec_domain(agg_vecs[a]), &sc_agg_raw[a]) ? 1 : 0;
+                if (!sc_sym_strings)
+                    ray_sym_strings_borrow(&sc_sym_strings, &sc_sym_count);
+            }
+        }
         scalar_ctx_t sc_ctx = {
             .agg_ptrs   = agg_ptrs,
             .agg_types  = agg_types,
             .agg_cols   = agg_vecs,
             .agg_strlen = agg_strlen,
+            .sym_strings = sc_sym_strings,
+            .sym_count  = sc_sym_count,
+            .agg_str    = sc_agg_str,
+            .agg_raw    = sc_agg_raw,
+            .agg_raw_ok = sc_agg_raw_ok,
             .agg_ops    = ext->agg_ops,
             .agg_linear = agg_linear,
             .agg_prod   = agg_prod,
@@ -12869,7 +13075,12 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             (sc_int_null_has[0] ||
              (agg_vecs[0] && group_fp_type(agg_vecs[0]->type) &&
               ray_vec_may_have_nulls(agg_vecs[0])));
-        if (n_aggs == 1 && !match_idx && !rowsel && agg_ptrs[0] != NULL && !agg0_has_nulls) {
+        /* A strlen fusion reads lengths, never the raw cells: SUM(strlen) is
+         * not null-tracked (agg0_has_nulls stays false), so without this
+         * guard the raw-cell sum loops below would add symbol ids / STR
+         * descriptors instead of lengths. */
+        if (n_aggs == 1 && !match_idx && !rowsel && agg_ptrs[0] != NULL && !agg0_has_nulls &&
+            !agg_strlen[0]) {
             uint16_t op0 = ext->agg_ops[0];
             int8_t   t0  = agg_types[0];
             if ((op0 == OP_SUM || op0 == OP_AVG) &&
@@ -13371,6 +13582,8 @@ da_path:;
              * F64 with HAS_NULLS uses NaN-skip; sentinel-typed integers
              * with HAS_NULLS use sentinel-skip. */
             bool da_any_nullable = false;
+            /* An AVG(strlen) slot counts its empty-string rows (sl_null). */
+            bool da_strlen_avg = false;
             for (uint32_t a = 0; a < n_aggs; a++) {
                 /* y-side plumbing for binary aggs (PEARSON/COV/WAVG/WSUM).
                  * Eligibility (above) already rejected nullable-int and
@@ -13403,10 +13616,14 @@ da_path:;
                     da_int_null_sentinel[a] = agg_int_null_sentinel_for(agg_vecs[a]->type);
                     /* Only set the int-null mask bit for storage types whose
                      * sentinel is meaningful. BOOL/U8 are non-nullable; SYM
-                     * zero is skipped by aggregates. F64 has its own NaN path. */
+                     * zero is skipped by aggregates. F64 has its own NaN path.
+                     * A strlen fusion reads lengths, not these cells: an
+                     * AVG counts its nulls apart (sl_null), off the mask
+                     * and the per-agg non-null counts. */
                     int8_t t = agg_vecs[a]->type;
-                    bool is_sentinel_typed = (t == RAY_I16 || t == RAY_I32 || t == RAY_I64 ||
-                                              t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP || t == RAY_SYM);
+                    bool is_sentinel_typed = !agg_strlen[a] &&
+                        (t == RAY_I16 || t == RAY_I32 || t == RAY_I64 ||
+                         t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP || t == RAY_SYM);
                     if (is_sentinel_typed && ray_vec_may_have_nulls(agg_vecs[a]))
                         da_int_null_mask |= ((uint64_t)1 << a);
                     if (ray_vec_may_have_nulls(agg_vecs[a]) &&
@@ -13420,6 +13637,8 @@ da_path:;
                 if (ext->agg_ops[a] == OP_AVG && !(agg_f64_mask & ((uint64_t)1 << a)) &&
                     !agg_strlen[a] && group_avg_needs_hi(agg_types[a], nrows))
                     da_need_sum128 = true;
+                if (agg_strlen[a] && ext->agg_ops[a] == OP_AVG)
+                    da_strlen_avg = true;
             }
 
             ray_pool_t* da_pool = ray_pool_get();
@@ -13438,6 +13657,7 @@ da_path:;
             /* Nullable aggs add a per-(group, agg) non-null count array.
              * ~8 bytes per (group, agg). */
             if (da_any_nullable) arrays_per_agg += 1;
+            if (da_strlen_avg) arrays_per_agg += 1;              /* sl_null */
             uint64_t cells_per_worker = (uint64_t)n_slots
                 * ((uint64_t)arrays_per_agg * n_aggs + 1u);
             uint64_t max_workers = cells_per_worker
@@ -13531,6 +13751,11 @@ da_path:;
                         &accums[w]._h_nn_count, total * sizeof(int64_t));
                     if (!accums[w].nn_count) { alloc_ok = false; break; }
                 }
+                if (da_strlen_avg) {
+                    accums[w].sl_null = (int64_t*)scratch_calloc(
+                        &accums[w]._h_sl_null, total * sizeof(int64_t));
+                    if (!accums[w].sl_null) { alloc_ok = false; break; }
+                }
                 if (da_has_first_last) {
                     accums[w].first_row = (int64_t*)scratch_alloc(
                         &accums[w]._h_first_row, n_slots * sizeof(int64_t));
@@ -13601,6 +13826,27 @@ da_path:;
                 .rowsel      = rowsel,
                 .da_n_scan   = n_scan,
             };
+            /* strlen-on-STR: resolve each column's descriptors once. */
+            const ray_str_t* da_agg_str[vla_aggs];
+            for (uint32_t a = 0; a < n_aggs; a++) {
+                da_agg_str[a] = NULL;
+                if (agg_strlen[a] && agg_vecs[a] && agg_vecs[a]->type == RAY_STR) {
+                    const char* pool; (void)pool;
+                    str_resolve(agg_vecs[a], &da_agg_str[a], &pool);
+                }
+            }
+            da_ctx.agg_str = da_agg_str;
+            da_ctx.sl_agg = -1;
+            if (all_sum && n_keys == 1 && !match_idx && !rowsel) {
+                int32_t one = -1;
+                bool sl_ok = true;
+                for (uint32_t a = 0; a < n_aggs && sl_ok; a++) {
+                    if (agg_prod[a].enabled) sl_ok = false;
+                    else if (agg_strlen[a] && agg_vecs[a]) { if (one >= 0) sl_ok = false; else one = (int32_t)a; }
+                    else if (ext->agg_ops[a] != OP_COUNT) sl_ok = false;
+                }
+                if (sl_ok && one >= 0) da_ctx.sl_agg = one;
+            }
             /* Pin each SYM agg column's vocabulary once for the accumulate. */
             ray_t* agg_raw_hdr = NULL;
             if (n_aggs > 0) {
@@ -13738,6 +13984,10 @@ da_path:;
                         for (size_t i = 0; i < total; i++)
                             merged->nn_count[i] += wa->nn_count[i];
                     }
+                    if (merged->sl_null && wa->sl_null) {
+                        for (size_t i = 0; i < total; i++)
+                            merged->sl_null[i] += wa->sl_null[i];
+                    }
                     for (uint32_t s = 0; s < n_slots; s++)
                         merged->count[s] += wa->count[s];
                 }
@@ -13847,6 +14097,10 @@ da_path:;
                         for (size_t i = 0; i < total; i++)
                             merged->nn_count[i] += wa->nn_count[i];
                     }
+                    if (merged->sl_null && wa->sl_null) {
+                        for (size_t i = 0; i < total; i++)
+                            merged->sl_null[i] += wa->sl_null[i];
+                    }
                     for (uint32_t s = 0; s < n_slots; s++)
                         merged->count[s] += wa->count[s];
                 }
@@ -13936,7 +14190,8 @@ da_path:;
             int64_t*  dense_counts  = grp_count
                 ? (int64_t*)scratch_alloc(&_h_dcnt, grp_count * sizeof(int64_t))
                 : NULL;
-            int64_t*  dense_nn_counts = (da_nn_count && grp_count)
+            int64_t*  da_sl_null  = merged->sl_null;  /* NULL without an AVG(strlen) */
+            int64_t*  dense_nn_counts = ((da_nn_count || da_sl_null) && grp_count)
                 ? (int64_t*)scratch_alloc(&_h_dnn, dense_total * sizeof(int64_t))
                 : NULL;
 
@@ -13955,7 +14210,13 @@ da_path:;
                     if (dense_sum_y)   dense_sum_y[di]   = da_sum_y[si];
                     if (dense_sumsq_y) dense_sumsq_y[di] = da_sumsq_y[si];
                     if (dense_sumxy)   dense_sumxy[di]   = da_sumxy[si];
-                    if (dense_nn_counts) dense_nn_counts[di] = da_nn_count[si];
+                    if (dense_nn_counts) {
+                        /* An AVG(strlen) divides by its non-empty rows. */
+                        int64_t nnv = da_nn_count ? da_nn_count[si] : da_count[s];
+                        if (da_sl_null && agg_strlen[a] && ext->agg_ops[a] == OP_AVG)
+                            nnv -= da_sl_null[si];
+                        dense_nn_counts[di] = nnv;
+                    }
                 }
                 gi++;
             }
@@ -14769,7 +15030,7 @@ ht_path:;
      * and admits it only as a real reduction (<= an eighth of the groups).
      * Fusion has to commit before any group exists, so the same test is made
      * against the row count that bounds them: groups <= scattered rows, so
-     * n_parts * k_take <= radix_rows / 8 keeps the stash under 2 bytes per
+     * n_parts * k_take <= radix_rows / 8 caps the stash at 3 bytes per
      * scattered row — against the >= 16 bytes per row phase 1's fat entries
      * (or the v2 worker HTs) already hold, peak memory cannot move.  Failing
      * that test, or a single worker/partition, or allocation failure, leaves
@@ -15123,9 +15384,12 @@ v2_emit:;
          * total_grps is in the millions but N is much smaller.
          *
          * Implementation notes:
-         *  - The bounded heap orders by count (the agg at COUNT slot, the
-         *    first int64 in each row).  Equal counts are stable: the
-         *    first row seen wins.  Final per-partition row order is
+         *  - The bounded heap orders by the order-by agg's int64 row
+         *    slot; equal values are broken on the group's earliest source
+         *    row (off_group_first), the earlier row winning — the same
+         *    order the stable final sort over first-row-ordered groups
+         *    uses, so the kept set never depends on radix partitioning or
+         *    worker scheduling.  Final per-partition row order is
          *    preserved so apply_sort_take below can do the final
          *    arrange-by-agg deterministically.
          *  - We also handle the "fewer total rows than N" case — compact
@@ -15167,7 +15431,7 @@ v2_emit:;
                  *     topn_fuse, at a uniform k_take stride per partition.
                  *  2. the standalone topn_scan_fn pre-pass, admitted when the
                  *     staging array is a real REDUCTION — at most an eighth of
-                 *     the groups, i.e. under 2 bytes per group against the
+                 *     the groups, i.e. at most 3 bytes per group against the
                  *     >= 24-byte group rows already resident, so peak memory
                  *     cannot move.  (Fusion could not make this test: it must
                  *     commit before any group exists, so it makes the
@@ -15176,8 +15440,8 @@ v2_emit:;
                  *     allocation failure, or a staging array that would not
                  *     reduce.
                  *
-                 * All three feed the same heap in the same (partition asc,
-                 * gid asc) order, so they retain the same set. */
+                 * All three feed the same heap, whose order is total, so
+                 * they retain the same set. */
                 ray_t* stage_hdr = NULL;
                 ray_t* item_hdr = NULL;
                 const uint32_t* item_off = NULL;  /* NULL => uniform stride */
@@ -15261,10 +15525,7 @@ v2_emit:;
                     }
                 }
 
-                /* Merge the per-partition survivors: partitions ascending,
-                 * gid ascending within one — the serial scan's push order,
-                 * which is what makes the retained set identical (condition
-                 * (2) of the topn_heap_push proof).  `item_off` is the
+                /* Merge the per-partition survivors.  `item_off` is the
                  * standalone pre-pass's packed layout; the fused stash uses a
                  * uniform k_take stride instead. */
                 if (scanned)
@@ -15275,8 +15536,8 @@ v2_emit:;
                         uint32_t n = item_cnt[p];
                         for (uint32_t i = 0; i < n; i++)
                             hn = topn_heap_push(heap, hn, k_take, desc_dir,
-                                                h[i].value, h[i].part,
-                                                h[i].gid);
+                                                h[i].value, h[i].first,
+                                                h[i].part, h[i].gid);
                     }
                 scratch_free(item_hdr);
                 scratch_free(stage_hdr);
@@ -15285,12 +15546,15 @@ v2_emit:;
                     for (uint32_t p = 0; p < radix_n_parts; p++) {
                         group_ht_t* ph = &part_hts[p];
                         uint16_t rs = ph->layout.row_stride;
+                        uint16_t fo = ph->layout.off_group_first;
                         uint32_t gc = ph->grp_count;
                         for (uint32_t gi = 0; gi < gc; gi++) {
-                            int64_t v = *(const int64_t*)(const void*)
-                                        (ph->rows + (size_t)gi * rs + order_off);
+                            const char* row = ph->rows + (size_t)gi * rs;
+                            int64_t v, first;
+                            memcpy(&v, row + order_off, 8);
+                            memcpy(&first, row + fo, 8);
                             hn = topn_heap_push(heap, hn, k_take, desc_dir,
-                                                v, p, gi);
+                                                v, first, p, gi);
                         }
                     }
 

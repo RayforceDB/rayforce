@@ -74,7 +74,8 @@
 (select {c: (and date (> i 0)) from: P}) !- type
 (select {c: (and date (> i 0)) from: F}) !- type
 (at (select {d: (min date) from: P}) 'd) -- (at (select {d: (min date) from: F}) 'd)
-;; (at (select {d: (neg date) from: F}) 'd) !- type   ;; xfail BUG: over a flat DATE column the fused DAG negates the day counts ([-8766 ...], abs likewise) where the builtin and the parted key raise type
+(at (select {d: (neg date) from: F}) 'd) !- type
+(at (select {d: (abs date) from: F}) 'd) !- type
 (.sys.exec "rm -rf /tmp/rfl_evalfb_parted")
 
 ;; An integer key keeps its I64 lane; a partition with no rows takes part.

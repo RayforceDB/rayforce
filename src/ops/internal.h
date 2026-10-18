@@ -1418,6 +1418,12 @@ bool ray_key_cols_sorted(ray_t** key_cols, int64_t n_keys, uint8_t descending,
  * in exec.c; consumed by the streaming parted asof path in query.c. */
 ray_t* build_segment_table(ray_t* parted_tbl, int32_t seg_idx);
 
+/* May the DAG rooted at `root` run segment by segment with a concat merge:
+ * streamable ops only, scalar constants only, and a scan of the default
+ * table.  Defined in exec.c; the parted per-segment sort/take and asof
+ * routes in query.c decide a clause's eligibility with it. */
+bool dag_can_stream(ray_graph_t* g, ray_op_t* root);
+
 /* Ordered concat-merge of two partial partition-streamed results (tables:
  * per-column concat; vectors: direct concat).  Returns an OWNED result.
  * Defined in exec.c; consumed by the streaming parted asof path in query.c. */
@@ -1704,9 +1710,12 @@ typedef struct {
  * on false *out carries no owned spill.  On success *out owns its spill_hdr
  * (NULL when inline) and every base pointer aims at *out's own storage. */
 /* Per-type integer null sentinel for an aggregation column.  Returns 0 for
- * non-nullable / non-integer types (BOOL, U8, SYM, F64) since 0 will never
- * match a value flagged as null via HAS_NULLS.  Shared by the group row-layout
- * accumulators/finalizers and the pivot finalizer. */
+ * the other types.  For SYM that is the null itself (cell id 0, the empty
+ * symbol), and so it is for a strlen fusion over STR/SYM (length 0, the
+ * empty string): the row-layout accumulators skip those zeros.  BOOL/U8 are
+ * non-nullable and F64 nulls are NaN, so 0 is never consulted for them.
+ * Shared by the group row-layout accumulators/finalizers and the pivot
+ * finalizer. */
 static inline int64_t agg_int_null_sentinel_for(int8_t t) {
     switch (t) {
         case RAY_I64: case RAY_TIMESTAMP:            return NULL_I64;
