@@ -2786,6 +2786,17 @@ static test_result_t test_sym_serde_vec_unterminated(void) {
     PASS();
 }
 
+/* Ruling 8-2: the symbol lock shares a 64-byte line with neither the
+ * table nor the init flag. */
+static test_result_t test_sym_lock_own_line(void) {
+    uintptr_t l = ray_sym_test_lock_addr();
+    uintptr_t t = ray_sym_test_table_addr();
+    TEST_ASSERT_EQ_U(l % 64, 0);
+    TEST_ASSERT_TRUE(l + 64 <= t || t + ray_sym_test_table_size() <= l);
+    TEST_ASSERT_TRUE(ray_sym_test_inited_addr() / 64 != l / 64);
+    PASS();
+}
+
 const test_entry_t sym_entries[] = {
     { "sym/init_destroy", test_sym_init_destroy, sym_setup, sym_teardown },
     { "sym/intern_basic", test_sym_intern_basic, sym_setup, sym_teardown },
@@ -2909,6 +2920,7 @@ const test_entry_t sym_entries[] = {
     { "sym/serde/vec_high_cardinality",    test_sym_serde_vec_high_cardinality,   sym_setup, sym_teardown },
     { "sym/serde/vec_single",              test_sym_serde_vec_single,             sym_setup, sym_teardown },
     { "sym/serde/vec_empty",               test_sym_serde_vec_empty,              sym_setup, sym_teardown },
+    { "sym/lock_own_line", test_sym_lock_own_line, sym_setup, sym_teardown },
     { "sym/serde/vec_unterminated",        test_sym_serde_vec_unterminated,       sym_setup, sym_teardown },
 
     { NULL, NULL, NULL, NULL },
