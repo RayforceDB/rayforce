@@ -1525,6 +1525,61 @@ static test_result_t test_eval_select_where_in_sym(void) {
     PASS();
 }
 
+/* ---- Test: unary arithmetic lowers only on its builtin's types (#854) ----
+ * compile_expr_dag lowers `neg`/`abs`/`exp`/`log`/`sqrt`/`ceil`/`floor`/
+ * `round` over a column only when the column's type is one the builtin
+ * computes on the kernels' terms; any other column declines (NULL) so the
+ * evaluator applies the builtin itself.  The kernels read a DATE, TIME or
+ * TIMESTAMP lane as its raw counts, SYM as interned ids, and ran the integer
+ * lanes of ceil/floor/round as doubles. */
+static bool unary_arith_lowers(const char* verb, const char* col) {
+    bool temporal_or_sym = !strcmp(col, "d") || !strcmp(col, "t") ||
+                           !strcmp(col, "ts") || !strcmp(col, "s");
+    if (!strcmp(verb, "neg") || !strcmp(verb, "abs"))
+        return !temporal_or_sym && strcmp(col, "b") && strcmp(col, "u");
+    if (!strcmp(verb, "exp") || !strcmp(verb, "log") || !strcmp(verb, "sqrt"))
+        return !temporal_or_sym;
+    return !strcmp(col, "f");   /* ceil / floor / round */
+}
+
+static test_result_t test_eval_select_unary_arith_dag_admission(void) {
+    ray_t* tbl = ray_eval_str(
+        "(table [d t ts b u h l f s] (list [2024.01.01 2024.01.02] "
+        "[10:00:00.000 11:00:00.000] "
+        "[2024.01.01D10:00:00.000000000 2024.01.02D10:00:00.000000000] "
+        "[true false] (as 'U8 [1 2]) (as 'I16 [1 -2]) [1 -2] [1.5 -2.5] "
+        "['a 'b]))");
+    TEST_ASSERT_NOT_NULL(tbl);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    TEST_ASSERT_EQ_I(tbl->type, RAY_TABLE);
+
+    static const char* const verbs[] = {
+        "neg", "abs", "exp", "log", "sqrt", "ceil", "floor", "round",
+    };
+    static const char* const cols[] = {
+        "d", "t", "ts", "b", "u", "h", "l", "f", "s",
+    };
+    for (size_t v = 0; v < sizeof verbs / sizeof *verbs; v++) {
+        for (size_t c = 0; c < sizeof cols / sizeof *cols; c++) {
+            char src[32];
+            snprintf(src, sizeof src, "(%s %s)", verbs[v], cols[c]);
+            ray_t* expr = ray_parse(src);
+            TEST_ASSERT_NOT_NULL(expr);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(expr));
+            ray_graph_t* g = ray_graph_new(tbl);
+            TEST_ASSERT_NOT_NULL(g);
+            ray_op_t* op = compile_expr_dag(g, expr);
+            bool want = unary_arith_lowers(verbs[v], cols[c]);
+            TEST_ASSERT_FMT((op != NULL) == want, "%s: lowered=%d, want %d",
+                            src, op != NULL, want);
+            ray_graph_free(g);
+            ray_release(expr);
+        }
+    }
+    ray_release(tbl);
+    PASS();
+}
+
 /* ---- Test: OP_IN type-mismatch must not leak via atom probe ----
  * Deterministic regression: interns a sym so we know its numeric
  * ID N, builds an i64 column containing exactly N, then runs
@@ -9883,6 +9938,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/select_all", test_eval_select_all, lang_setup, lang_teardown },
     { "lang/eval/select_where", test_eval_select_where, lang_setup, lang_teardown },
     { "lang/eval/select_where_in_sym", test_eval_select_where_in_sym, lang_setup, lang_teardown },
+    { "lang/eval/select_unary_arith_dag_admission", test_eval_select_unary_arith_dag_admission, lang_setup, lang_teardown },
     { "lang/eval/select_where_in_i64", test_eval_select_where_in_i64, lang_setup, lang_teardown },
     { "lang/eval/select_where_in_mixed_numeric", test_eval_select_where_in_mixed_numeric, lang_setup, lang_teardown },
     { "lang/eval/select_where_in_nulls", test_eval_select_where_in_nulls, lang_setup, lang_teardown },

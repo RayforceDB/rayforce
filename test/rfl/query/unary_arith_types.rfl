@@ -1,0 +1,120 @@
+;; unary_arith_types.rfl — a unary arithmetic verb in a query takes the
+;; column types its builtin takes (#854).
+;;
+;; The planner lowered `neg`/`abs`/`exp`/`log`/`sqrt`/`ceil`/`floor`/`round`
+;; to DAG kernels that read any fixed-width lane as a number: over a DATE
+;; column `(neg d)` came back as negated day counts ([-8766 ...]) and
+;; `(sqrt d)` as roots of them, TIME and TIMESTAMP likewise, SYM as interned
+;; ids (`(round s)` crashed), and `neg`/`abs` took BOOL and U8, all of which
+;; the builtins reject with `type`.  The integer lanes of `ceil`/`floor`/
+;; `round` returned garbage where the builtin is the identity (round: F64).
+;; Such a projection now declines to the evaluator, which applies the
+;; builtin.  Oracle: the builtin over the column itself.
+;; @requires: posix
+
+(set F (table [d t ts b u h l f s k] (list [2024.01.01 2024.01.02 2024.01.03] [10:00:00.000 11:00:00.000 12:00:00.000] [2024.01.01D10:00:00.000000000 2024.01.02D10:00:00.000000000 2024.01.03D10:00:00.000000000] [true false true] (as 'U8 [1 2 3]) (as 'I16 [1 -2 3]) [1 -2 3] [1.5 -2.5 3.5] ['a 'b 'c] [1 1 2])))
+
+;; ─── the builtins reject temporal columns ───────────────────────────────────
+(neg (at F 'd)) !- type
+(sqrt (at F 'ts)) !- type
+(round (at F 't)) !- type
+
+;; ─── so does a projection over a flat table: DATE ───────────────────────────
+(select {x: (neg d) from: F}) !- type
+(select {x: (abs d) from: F}) !- type
+(select {x: (exp d) from: F}) !- type
+(select {x: (log d) from: F}) !- type
+(select {x: (sqrt d) from: F}) !- type
+(select {x: (ceil d) from: F}) !- type
+(select {x: (floor d) from: F}) !- type
+(select {x: (round d) from: F}) !- type
+
+;; TIME
+(select {x: (neg t) from: F}) !- type
+(select {x: (abs t) from: F}) !- type
+(select {x: (exp t) from: F}) !- type
+(select {x: (log t) from: F}) !- type
+(select {x: (sqrt t) from: F}) !- type
+(select {x: (ceil t) from: F}) !- type
+(select {x: (floor t) from: F}) !- type
+(select {x: (round t) from: F}) !- type
+
+;; TIMESTAMP
+(select {x: (neg ts) from: F}) !- type
+(select {x: (abs ts) from: F}) !- type
+(select {x: (exp ts) from: F}) !- type
+(select {x: (log ts) from: F}) !- type
+(select {x: (sqrt ts) from: F}) !- type
+(select {x: (ceil ts) from: F}) !- type
+(select {x: (floor ts) from: F}) !- type
+(select {x: (round ts) from: F}) !- type
+
+;; SYM: the kernels read the interned ids
+(select {x: (neg s) from: F}) !- type
+(select {x: (sqrt s) from: F}) !- type
+(select {x: (floor s) from: F}) !- type
+(select {x: (round s) from: F}) !- type
+
+;; neg / abs reject BOOL and U8 as well; exp/log/sqrt take them
+(neg (at F 'b)) !- type
+(select {x: (neg b) from: F}) !- type
+(select {x: (abs b) from: F}) !- type
+(select {x: (neg u) from: F}) !- type
+(select {x: (abs u) from: F}) !- type
+(at (select {x: (sqrt b) from: F}) 'x) -- (sqrt (at F 'b))
+(at (select {x: (exp u) from: F}) 'x) -- (exp (at F 'u))
+
+;; a temporal literal is not folded to its count either
+(neg 2024.01.01) !- type
+(select {x: (neg 2024.01.01) from: F}) !- type
+(select {x: (sqrt 10:00:00.000) from: F}) !- type
+
+;; ─── the same verb inside update, where:, by: and an aggregate ──────────────
+(update {x: (neg d) from: F}) !- type
+(select {k: k from: F where: (< (neg d) 0)}) !- type
+(select {x: (abs d) by: k from: F}) !- type
+(select {x: (sum (neg d)) from: F}) !- type
+(select {x: (+ (sqrt ts) 1) from: F}) !- type
+
+;; ─── numeric columns still compute ──────────────────────────────────────────
+(at (select {x: (neg l) from: F}) 'x) -- [-1 2 -3]
+(at (select {x: (abs h) from: F}) 'x) -- (abs (at F 'h))
+(at (select {x: (neg f) from: F}) 'x) -- [-1.5 2.5 -3.5]
+(at (select {x: (abs f) from: F}) 'x) -- [1.5 2.5 3.5]
+(at (select {x: (sqrt l) from: F}) 'x) -- (sqrt (at F 'l))
+(at (select {x: (exp f) from: F}) 'x) -- (exp (at F 'f))
+(at (select {x: (log h) from: F}) 'x) -- (log (at F 'h))
+(at (select {x: (ceil f) from: F}) 'x) -- [2.0 -2.0 4.0]
+(at (select {x: (floor f) from: F}) 'x) -- [1.0 -3.0 3.0]
+(at (select {x: (round f) from: F}) 'x) -- [2.0 -3.0 4.0]
+;; ceil / floor of an integer column is the identity; round is F64
+(at (select {x: (ceil l) from: F}) 'x) -- [1 -2 3]
+(at (select {x: (floor h) from: F}) 'x) -- (floor (at F 'h))
+(at (select {x: (round l) from: F}) 'x) -- [1.0 -2.0 3.0]
+(at (select {x: (round h) from: F}) 'x) -- (round (at F 'h))
+(at (select {x: (ceil b) from: F}) 'x) -- (ceil (at F 'b))
+(at (select {x: (neg (- d 2024.01.01)) from: F}) 'x) -- [0 -1 -2]
+(at (select {x: (sum (abs l)) from: F}) 'x) -- [6]
+(at (update {x: (neg f) from: F}) 'x) -- [-1.5 2.5 -3.5]
+(at (select {k: k from: F where: (< (neg l) 0)}) 'k) -- [1 2]
+;; order-preserving verbs on temporals are not arithmetic and stay as they were
+(at (select {x: (maxs d) from: F}) 'x) -- (maxs (at F 'd))
+(at (select {x: (deltas ts) from: F}) 'x) -- (deltas (at F 'ts))
+
+;; ─── a splayed copy and a parted table's DATE column ─────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_unary_arith_types")
+(set N (table [d ts f] (list (at F 'd) (at F 'ts) (at F 'f))))
+(.db.splayed.set "/tmp/rfl_unary_arith_types/s/" N)
+(set S (.db.splayed.get "/tmp/rfl_unary_arith_types/s/"))
+(select {x: (neg d) from: S}) !- type
+(select {x: (sqrt ts) from: S}) !- type
+(select {x: (floor d) from: S}) !- type
+(at (select {x: (neg f) from: S}) 'x) -- [-1.5 2.5 -3.5]
+(.db.splayed.set "/tmp/rfl_unary_arith_types/p/2024.01.01/t/" N)
+(.db.splayed.set "/tmp/rfl_unary_arith_types/p/2024.01.02/t/" N)
+(set P (.db.parted.get "/tmp/rfl_unary_arith_types/p/" 't))
+(select {x: (neg d) from: P}) !- type
+(select {x: (abs ts) from: P}) !- type
+(select {x: (round d) from: P}) !- type
+(at (select {x: (neg f) from: P}) 'x) -- [-1.5 2.5 -3.5 -1.5 2.5 -3.5]
+(.sys.exec "rm -rf /tmp/rfl_unary_arith_types")
