@@ -33,6 +33,7 @@
 #include "core/runtime.h"
 #include "lang/format.h"
 #include "store/col.h"
+#include "ops/idxop.h"      /* RAY_IDX_DICT */
 #include "store/enc.h"
 #include "store/encfmt.h"
 #include "store/encw.h"
@@ -4908,18 +4909,48 @@ static test_result_t aw_str_key_run(const char* ts, const char* tl, int mix) {
     return aw_str_key_check(tl, aw_str_key_queries(), true, mix);
 }
 
-/* The key column as selection writes it (P6: all STR_DICT). */
+/* The key column as selection writes it (P6: all STR_DICT).  Subject: the
+ * string-domain path over STR_DICT vectors; the persisted DICT would take
+ * the large tables' keys (P6b), so they are saved without it. */
 static test_result_t test_str_key_domain(void) {
-    return aw_str_key_run("s", "l", AW_SK_MIX_SELECT);
+    ray_col_test_no_dict(true);
+    test_result_t r = aw_str_key_run("s", "l", AW_SK_MIX_SELECT);
+    ray_col_test_no_dict(false);
+    return r;
 }
 
 /* P6: RAW STR vectors are this twin's subject (the cursor path the key took
- * before STR_DICT): the same tables saved with every STR vector forced RAW. */
+ * before STR_DICT): the same tables saved with every STR vector forced RAW,
+ * and without the persisted DICT, which would take the large tables' keys
+ * (P6b). */
 static test_result_t test_str_key_domain_raw(void) {
     ray_encw_test_force_str(RAY_ENC_RAW);
+    ray_col_test_no_dict(true);
     test_result_t r = aw_str_key_run("rs", "rl", AW_SK_MIX_RAW);
+    ray_col_test_no_dict(false);
     ray_encw_test_force_str(-1);
     return r;
+}
+
+/* P6b: the same tables as saved, the large ones with the persisted DICT:
+ * a single-file key groups on its codes, a parted one remaps each DICT
+ * segment's codes; the same answers, nothing of t materialized. */
+static test_result_t test_str_key_domain_dict(void) {
+    test_result_t r = aw_str_key_run("ds", "dl", AW_SK_MIX_SELECT);
+    if (r.status != TEST_PASS) return r;
+    /* not vacuous: a large single-file key and a large partition record it */
+    static const char* const lds[] = {
+        "(.db.splayed.get \"" AW_TMP "/dlu2/\")", "(.db.splayed.get \"" AW_TMP "/dlk2/2024.01.01/t/\")",
+    };
+    for (int i = 0; i < 2; i++) {
+        ray_t* t = ray_eval_str(ray_test_tmp(lds[i]));
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        ray_col_meta_t m;
+        const bool ok = ray_table_col_meta(t, ray_sym_intern("t", 1), &m) && m.enc && m.index_kind == RAY_IDX_DICT;
+        ray_release(t);
+        TEST_ASSERT_FMT(ok, "%s: no persisted DICT", lds[i]);
+    }
+    PASS();
 }
 
 static const aw_sk_q_t* aw_str_key_queries(void) {
@@ -5807,6 +5838,7 @@ const test_entry_t aware_entries[] = {
     { "aware/group_affine_nulls",  test_group_affine_nulls,  aw_setup, aw_teardown },
     { "aware/str_key_domain",      test_str_key_domain,      aw_setup, aw_teardown },
     { "aware/str_key_domain_raw",  test_str_key_domain_raw,  aw_setup, aw_teardown },
+    { "aware/str_key_domain_dict", test_str_key_domain_dict, aw_setup, aw_teardown },
     { "aware/gate_materialization", test_gate_materialization, aw_setup, aw_teardown },
     { "aware/gate_decoded_bytes",   test_gate_decoded_bytes,   aw_setup, aw_teardown },
     { "aware/cross_segment_codes",  test_cross_segment_codes,  aw_setup, aw_teardown },

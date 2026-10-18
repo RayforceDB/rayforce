@@ -1714,6 +1714,8 @@ static test_result_t test_cross_segment_codes(void) {
         "(table [s v m] (list (as 'STR (at [\"red long value\" \"blue long value\" \"green\"] (% (til 70000) 3))) (til 70000) (as 'U8 (% (til 70000) 2))))",
         "(table [s v m] (list (as 'STR (at [\"blue long value\" \"red long value\" \"amber\"] (% (til 70000) 3))) (til 70000) (as 'U8 (% (til 70000) 2))))",
     };
+    /* subject: the STR_DICT remap; the persisted DICT would take the key (P6b) */
+    ray_col_test_no_dict(true);
     for (int g = 0; g <= 2; g += 2)
         for (int p = 0; p < 2; p++) {
             char q[1200];
@@ -1721,10 +1723,12 @@ static test_result_t test_cross_segment_codes(void) {
                      g, p + 1, parts[p], g ? "true" : "false");
             ST_Q_OK_N(q);
         }
+    ray_col_test_no_dict(false);
     for (int p = 0; p < 2; p++) {
         char rel[64], f[600];
         snprintf(rel, sizeof rel, "/cs2/2024.01.0%d/t", p + 1);
         TEST_ASSERT_TRUE(st_live(rel, "s", f, sizeof f));
+        TEST_ASSERT_EQ_I(st_hdr(f).index_kind, 0);
         TEST_ASSERT_EQ_I(st_desc_enc(f, 0, NULL), RAY_ENC_STR_DICT);
         TEST_ASSERT_EQ_I(st_desc_enc(f, 64, NULL), RAY_ENC_STR_DICT);
     }
@@ -1844,10 +1848,14 @@ static test_result_t test_groupby_forged(void) {
         ray_release(tb);
         st_unhold(v, NULL); ray_release(v);
         ray_encw_test_force_str(RAY_ENC_STR_DICT);          /* selection keeps one-string vectors CONST */
+        /* subject: the STR_DICT remap; the persisted DICT would take the key (P6b) */
+        ray_col_test_no_dict(true);
         ST_Q_OK(f ? "(.db.splayed.set \"" ST_TMP "/gb/\" W {compress: true})"
                   : "(.db.splayed.set \"" ST_TMP "/ga/\" W {compress: true})");
+        ray_col_test_no_dict(false);
         ray_encw_test_force_str(-1);
         char p[600]; TEST_ASSERT_TRUE(st_live(f ? "/gb" : "/ga", "s", p, sizeof p));
+        TEST_ASSERT_EQ_I(st_hdr(p).index_kind, 0);
         const char* ld = f ? "(set T (.db.splayed.get \"" ST_TMP "/gb/\"))" : "(set T (.db.splayed.get \"" ST_TMP "/ga/\"))";
         ST_Q_OK(ld);
         /* unforged: the codes path answers (the three entries' counts) */
@@ -1896,8 +1904,12 @@ static test_result_t test_groupby_remap_oom(void) {
     ray_release(iv);
     TEST_ASSERT_EQ_I(ray_env_set(ray_sym_intern("W", 1), tb), RAY_OK);
     ray_release(tb);
+    /* subject: the STR_DICT remap; the persisted DICT would take the key (P6b) */
+    ray_col_test_no_dict(true);
     ST_Q_OK("(.db.splayed.set \"" ST_TMP "/ro/\" W {compress: true})");
+    ray_col_test_no_dict(false);
     char p[600]; TEST_ASSERT_TRUE(st_live("/ro", "s", p, sizeof p));
+    TEST_ASSERT_EQ_I(st_hdr(p).index_kind, 0);
     TEST_ASSERT_EQ_I(st_desc_enc(p, 0, NULL), RAY_ENC_STR_DICT);
     TEST_ASSERT_EQ_I(st_desc_enc(p, ray_enc_nvecs(SF_ROWS) - 1, NULL), RAY_ENC_STR_DICT);
     ST_Q_OK("(set T (.db.splayed.get \"" ST_TMP "/ro/\"))");
@@ -2363,6 +2375,134 @@ static test_result_t test_idict_forged(void) {
     PASS();
 }
 
+/* ---- P6b Task 4: group-by on DICT codes ---- */
+
+/* s's own decoded bytes (the per-column counter) on the loaded table T */
+static uint64_t st_col_decoded(const char* col) {
+    ray_t* t = ray_eval_str("T");
+    if (!t || RAY_IS_ERR(t)) { if (t) ray_error_free(t); return UINT64_MAX; }
+    ray_enccol_t* e = ray_enccol_of(ray_table_get_col_enc(t, ray_sym_intern(col, strlen(col))));
+    uint64_t n = e ? atomic_load(&e->decoded_bytes) : UINT64_MAX;
+    ray_release(t);
+    return n;
+}
+
+/* q18 / q34 / q35 / composite / selection shapes on a DICT column: the
+ * answers equal generation 0 (by asc: unordered group output is
+ * unspecified), nothing materialized.  Decoded bytes: the key-only shapes
+ * decode nothing at all; the shapes reading u (I64) or f (U8) by range
+ * decode those columns' vectors, so for every shape the key column's own
+ * counter (e->decoded_bytes) stays 0. */
+static test_result_t test_idict_groupby(void) {
+    ST_SAVE2("gb", "(table [s u f] (list (as 'STR (map (fn [j] (if (== 3 (% (div j 1024) 7)) \"\" "
+             "(if (== 1 (% (div j 1024) 5)) (format \"https://e.org/%/%\" j (* j 31)) (format \"category number % long\" (% j 37))))) (til 140000))) "
+             "(% (til 140000) 11) (as 'U8 (% (til 140000) 3))))");
+    char p[600]; TEST_ASSERT_TRUE(st_live("/gb2", "s", p, sizeof p));
+    TEST_ASSERT_EQ_I(st_hdr(p).index_kind, RAY_IDX_DICT);
+    static const struct { const char* q; bool key_only; } qs[] = {
+        { "(select {n: (count s) from: T by: s asc: s})", true },                     /* count s by s (q34) */
+        { "(select {one: 1 s: s n: (count s) from: T by: s asc: s})", true },         /* q35's shape */
+        { "(select {n: (count u) from: T by: s asc: s})", true },                     /* count reads no u value */
+        { "(select {n: (count u) from: T by: {u: u s: s} asc: [u s]})", false },      /* composite (q18) */
+        { "(select {n: (count u) from: T where: (== f 1) by: s asc: s})", false },    /* under a selection */
+    };
+    for (size_t i = 0; i < sizeof qs / sizeof qs[0]; i++) {
+        st_fk_t k = { 0 };
+        ST_SAME("gb", qs[i].q, &k);
+        TEST_ASSERT_FMT(k.mat == 0, "%s: materialized %llu", qs[i].q, (unsigned long long)k.mat);
+        if (qs[i].key_only)
+            TEST_ASSERT_FMT(k.dec == 0, "%s: decoded %llu", qs[i].q, (unsigned long long)k.dec);
+        else
+            TEST_ASSERT_FMT(k.dec > 0, "%s: u / f read without a decode", qs[i].q);
+        const uint64_t sd = st_col_decoded("s");
+        TEST_ASSERT_FMT(sd == 0, "%s: s decoded %llu", qs[i].q, (unsigned long long)sd);
+    }
+    /* an aggregate other than count reading the key: generation 0's rule
+     * declines the codes; the answer still equals generation 0 */
+    ST_SAME("gb", "(select {m: (max (strlen s)) from: T by: s asc: s})", NULL);
+    /* a count-distinct beside the key: the stashed result codes' consumer */
+    ST_SAME("gb", "(select {d: (count (distinct u)) from: T by: s asc: s})", NULL);
+    /* the counter sees s's range decodes: a filter decodes the URL
+     * vectors (not STR_DICT) by range */
+    ST_SAME("gb", "(count (select {from: T where: (== s \"https://e.org/1024/31744\")}))", NULL);
+    TEST_ASSERT_TRUE(st_col_decoded("s") > 0);
+    /* Task 3 review Minor 5: by: s and distinct on the DICT column equal
+     * generation 0 (sorted) */
+    ST_SAME("gb", "(select {from: T by: s asc: s})", NULL);
+    ST_SAME("gb", "(asc (distinct (at T 's)))", NULL);
+    ST_SAME("gb", "(count (distinct (at T 's)))", NULL);
+    PASS();
+}
+
+/* Parted: segments with conflicting codes (the same string, different
+ * codes; the same code, different strings), one segment below 65536 rows
+ * (no DICT, STR_DICT vectors): generation-0 answers.  An aggregate reading
+ * the key (count s) declines the string-domain swap (strdom_key_ok, P6's
+ * rule, COUNT included) and is compared on answers only; count v keeps
+ * the key on the remapped codes. */
+static test_result_t test_idict_groupby_parted(void) {
+    ST_Q_OK("(set P0 (table [s v] (list (as 'STR (map (fn [j] (format \"k%\" (% j 50))) (til 70000))) (til 70000))))");
+    ST_Q_OK("(set P1 (table [s v] (list (as 'STR (map (fn [j] (format \"k%\" (- 49 (% j 50)))) (til 70000))) (til 70000))))");
+    ST_Q_OK("(set P2 (table [s v] (list (as 'STR (map (fn [j] (format \"z%\" (% j 7))) (til 1000))) (til 1000))))");
+    for (int g = 0; g <= 2; g += 2)
+        for (int p = 0; p < 3; p++) {
+            char q[512];
+            snprintf(q, sizeof q, "(.db.splayed.set \"" ST_TMP "/gp%d/2024.01.0%d/t/\" P%d {compress: %s})",
+                     g, p + 1, p, g ? "true" : "false");
+            ST_Q_OK(q);
+        }
+    char p[600];
+    TEST_ASSERT_TRUE(st_live("/gp2/2024.01.01/t", "s", p, sizeof p)); TEST_ASSERT_EQ_I(st_hdr(p).index_kind, RAY_IDX_DICT);
+    TEST_ASSERT_TRUE(st_live("/gp2/2024.01.02/t", "s", p, sizeof p)); TEST_ASSERT_EQ_I(st_hdr(p).index_kind, RAY_IDX_DICT);
+    TEST_ASSERT_TRUE(st_live("/gp2/2024.01.03/t", "s", p, sizeof p)); TEST_ASSERT_EQ_I(st_hdr(p).index_kind, 0);
+    static const char* const qs[] = {
+        "(select {n: (count v) from: T by: s asc: s})",
+        "(select {n: (count v) from: T where: (!= s \"k3\") by: s asc: s})",
+        "(select {n: (count v) from: T where: (> v 500) by: s asc: s})",
+    };
+    for (size_t i = 0; i < sizeof qs / sizeof qs[0]; i++) {
+        st_fk_t k = { 0 };
+        ST_SAME_P("gp", qs[i], &k);
+        TEST_ASSERT_FMT(k.mat == 0, "%s: materialized %llu", qs[i], (unsigned long long)k.mat);
+        if (i == 0) TEST_ASSERT_FMT(k.dec == 0, "%s: decoded %llu", qs[i], (unsigned long long)k.dec);
+    }
+    ST_SAME_P("gp", "(select {n: (count s) from: T by: s asc: s})", NULL);
+    ST_SAME_P("gp", "(select {n: (count s) from: T where: (!= s \"k3\") by: s asc: s})", NULL);
+    /* the DICT segments are read by their codes: a code past n_distinct in
+     * partition 2's region fails the group-by naming the row */
+    TEST_ASSERT_TRUE(st_live("/gp2/2024.01.02/t", "s", p, sizeof p));
+    ray_enc_hdr_t eh = st_hdr(p);
+    ray_enc_idx_dict_t dd; ST_READ(p, eh.index_off + 16, &dd, sizeof dd);
+    int32_t big = 50;
+    ST_PATCH(p, eh.index_off + dd.codes + 9000 * 4, &big, 4);
+    ST_Q_OK("(set T (.db.parted.get \"" ST_TMP "/gp2\" 't))");
+    TEST_ASSERT_FALSE(st_q_run("(select {n: (count v) from: T by: s})"));
+    TEST_ASSERT_FMT(strstr(st_msg, "DICT code 50 at row 9000 outside 0 .. 49") != NULL, "%s", st_msg);
+    PASS();
+}
+
+/* A forged code tier (row 5 takes code 299 before its first occurrence)
+ * fails the group-by with corrupt naming the file; the next query fails
+ * the same way (cached). */
+static test_result_t test_idict_groupby_forged(void) {
+    ST_SAVE2("gf", "(table [s] (list (as 'STR (map (fn [j] (format \"value % of the domain\" (% (* j 7919) 300))) (til 70000)))))");
+    char p[600]; TEST_ASSERT_TRUE(st_live("/gf2", "s", p, sizeof p));
+    ray_enc_hdr_t eh = st_hdr(p);
+    TEST_ASSERT_EQ_I(eh.index_kind, RAY_IDX_DICT);
+    ray_enc_idx_dict_t dd; ST_READ(p, eh.index_off + 16, &dd, sizeof dd);
+    int32_t late = 299;                         /* row 5, before code 299's first occurrence (row 299) */
+    ST_PATCH(p, eh.index_off + dd.codes + 5 * 4, &late, 4);
+    ST_Q_OK("(set T (.db.splayed.get \"" ST_TMP "/gf2/\"))");
+    for (int i = 0; i < 2; i++) {
+        TEST_ASSERT_FALSE(st_q_run("(select {n: (count s) from: T by: s})"));
+        /* the file named as the load spells it: the table directory, then s */
+        TEST_ASSERT_FMT(strstr(st_msg, "before its first occurrence") != NULL &&
+                        strstr(st_msg, "rayforce_encstr/gf2/") != NULL && strstr(st_msg, "/s: DICT code 299 at row 5"),
+                        "%s", st_msg);
+    }
+    PASS();
+}
+
 /* Task 1's carry: the validator leaves entry distinctness to the reader.
  * A region whose entry 2 repeats entry 1 passes ray_enc_dict_validate and
  * fails the entry tier (the hash build), so no lookup, range read or
@@ -2649,5 +2789,8 @@ const test_entry_t encstr_entries[] = {
     { "encstr/idict_dup_entry",       test_idict_dup_entry,       st_q_setup, st_q_teardown },
     { "encstr/idict_runtime_gone",    test_idict_runtime_gone,    st_q_setup, st_q_teardown },
     { "encstr/idict_first_touch_race", test_idict_first_touch_race, st_q_setup, st_q_teardown },
+    { "encstr/idict_groupby",        test_idict_groupby,        st_q_setup, st_q_teardown },
+    { "encstr/idict_groupby_parted", test_idict_groupby_parted, st_q_setup, st_q_teardown },
+    { "encstr/idict_groupby_forged", test_idict_groupby_forged, st_q_setup, st_q_teardown },
     { NULL, NULL, NULL, NULL },
 };

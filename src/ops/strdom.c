@@ -23,6 +23,7 @@
 
 #include "ops/strdom.h"
 #include "ops/rowsel.h"
+#include "ops/idxop.h"      /* RAY_IDX_DICT: a segment's persisted DICT */
 #include "store/enccol.h"
 #include "store/encfmt.h"
 #include "vec/str.h"
@@ -118,8 +119,11 @@ static ray_t* sd_intern(ray_strdom_t* d, const char* p, uint32_t n, uint64_t h, 
  * itself as one).  A segment that is a single-file encoded column (not
  * synthetic, not materialized) with a STR_DICT entry reads its STR_DICT
  * vectors as views: each code maps to its id through the segment's remap,
- * filled on the code's first occurrence among the rows read.  Codes are
- * segment-local: a remap lives while its segment is read. */
+ * filled on the code's first occurrence among the rows read.  A segment
+ * recording a persisted DICT (P6b) takes precedence: its codes are read by
+ * range (one call per vector piece), materialized or not, and mapped the
+ * same way.  Codes are segment-local: a remap lives while its segment is
+ * read. */
 typedef struct {
     ray_strdom_t*     d;
     ray_col_cursor_t  cur;
@@ -136,7 +140,8 @@ typedef struct {
     int64_t           sg;       /* the current segment, -1 before the first */
     ray_enccol_t*     se;       /* its codes column (with a STR_DICT entry), else NULL */
     const ray_enc_sdict_t* sdict;
-    int64_t*          remap;    /* sdict->n ids, -1 unseen; allocated on first use */
+    const ray_enc_idict_t* dd;  /* the current segment's persisted DICT, else NULL */
+    int64_t*          remap;    /* sdict->n (dd->n_distinct) ids, -1 unseen; allocated on first use */
     ray_enc_vview_t*  vv;       /* the build's view (on the builder's stack) */
     int64_t           vv_at;    /* the segment-local vector vv describes, -1 none */
     bool              vv_codes; /* vv_at is a STR_DICT view (else read by range) */
@@ -150,12 +155,16 @@ static inline int64_t* sd_slot(sd_build_t* b, int64_t r) {
     return &b->part_dst[b->p][r - b->part_off[b->p]];
 }
 
-/* A segment's codes column: single-file encoded, not synthetic, without a
- * published materialization (read by range otherwise). */
+/* A segment's codes column: single-file encoded, not synthetic, and
+ * either recording a persisted DICT (its codes read the mapping, not the
+ * decoded column) or without a published materialization (read by range
+ * otherwise). */
 static ray_enccol_t* sd_codes_col(ray_t* o) {
-    if (!o || o->type != RAY_ENCCOL || ray_enccol_decoded_peek(o)) return NULL;
+    if (!o || o->type != RAY_ENCCOL) return NULL;
     ray_enccol_t* e = ray_enccol_of(o);
-    return e && e->kind == RAY_ENCCOL_SINGLE && !e->synthetic ? e : NULL;
+    if (!e || e->kind != RAY_ENCCOL_SINGLE || e->synthetic) return NULL;
+    if (e->hdr.index_kind != RAY_IDX_DICT && ray_enccol_decoded_peek(o)) return NULL;
+    return e;
 }
 
 /* Make the segment holding row r current: a new segment drops the last
@@ -166,11 +175,23 @@ static ray_t* sd_seg(sd_build_t* b, int64_t r) {
     while (s + 1 < b->n_segs && r >= b->seg_off[s + 1]) s++;
     if (s == b->sg) return NULL;
     ray_free_raw(b->remap);
-    b->remap = NULL; b->se = NULL; b->sdict = NULL; b->vv_at = -1; b->sg = s;
+    b->remap = NULL; b->se = NULL; b->sdict = NULL; b->dd = NULL; b->vv_at = -1; b->sg = s;
     ray_enccol_t* e = sd_codes_col(b->segv[s]);
     if (!e) return NULL;
+    const ray_enc_idict_t* dd = NULL;
+    ray_t* err = ray_enccol_idict(e, &dd);
+    if (err) return err;
+    if (dd) {
+        b->se = e; b->dd = dd;
+        b->remap = ray_enccol_test_nth_alloc_fails() ? NULL       /* the materialization fail hook */
+                 : (int64_t*)ray_alloc_raw((size_t)dd->n_distinct * sizeof(int64_t));
+        if (!b->remap) return ray_error("oom", NULL);
+        for (int64_t k = 0; k < dd->n_distinct; k++) b->remap[k] = -1;
+        return NULL;
+    }
+    if (ray_enccol_decoded_peek(b->segv[s])) return NULL;   /* materialized: read by range */
     const ray_enc_sdict_t* sd = NULL;
-    ray_t* err = ray_enccol_strdict(e, &sd);
+    err = ray_enccol_strdict(e, &sd);
     if (err) return err;
     if (sd) { b->se = e; b->sdict = sd; }
     return NULL;
@@ -214,6 +235,34 @@ static ray_t* sd_rows(sd_build_t* b, int64_t lo, int64_t hi, const uint16_t* idx
     for (int64_t r = idx ? lo + idx[0] : lo; idx ? j < n_idx : r < hi; ) {
         ray_t* err = b->segv ? sd_seg(b, r) : NULL;
         if (err) return err;
+        if (b->dd) {
+            /* a DICT segment: the codes of the vector piece holding r, by
+             * range (each checked below n_distinct), through the remap */
+            const int64_t base = b->seg_off[b->sg], v = (r - base) / RAY_ENC_VEC;
+            const int64_t v0 = base + v * RAY_ENC_VEC;
+            int64_t vend = v0 + RAY_ENC_VEC;
+            if (vend > b->seg_off[b->sg + 1]) vend = b->seg_off[b->sg + 1];
+            const int32_t* cd = NULL;
+            err = ray_enccol_idict_codes(b->se, v0 - base, vend - v0, &cd);
+            if (err) return err;
+            for (; r < vend; ) {
+                const int32_t c = cd[r - v0];
+                int64_t id = b->remap[c];
+                if (id < 0) {
+                    const char* p; uint32_t n;
+                    ray_enc_sdict_entry(b->dd->ent, (uint32_t)c, &p, &n);
+                    err = sd_intern(b->d, p, n, ray_str_bytes_hash(p, n), &id);
+                    if (err) return err;
+                    b->remap[c] = id;
+                    /* the arena may have moved: the last string is this one */
+                    b->lid = id; b->ln = n; b->lp = b->d->arena + b->d->ent[id].off;
+                }
+                *sd_slot(b, r) = id;
+                if (idx) { if (++j >= n_idx) return NULL; r = lo + idx[j]; }
+                else if (++r >= hi) return NULL;
+            }
+            continue;
+        }
         if (b->se) {
             const int64_t base = b->seg_off[b->sg], v = (r - base) / RAY_ENC_VEC;
             int64_t vend = base + (v + 1) * RAY_ENC_VEC;

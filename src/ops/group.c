@@ -12080,6 +12080,33 @@ static ray_t* dict_codes_to_str(const ray_t* codes_col, ray_t* src_col,
     return out;
 }
 
+/* An I32 DICT-code result column mapped back to strings through a
+ * generation-2 column's persisted entries (P6b): the bytes are read in
+ * place (no decode) and copied into the output once. */
+static ray_t* dict_entries_to_str(const ray_t* codes_col, const ray_enc_idict_t* d) {
+    int64_t n = codes_col->len;
+    if (codes_col->type != RAY_I32)
+        return ray_error("type", "group: DICT key emitted as %s", ray_type_name(codes_col->type));
+    const int32_t* cd = (const int32_t*)ray_data((ray_t*)codes_col);
+    if (n <= 0) return ray_vec_new(RAY_STR, 1);
+    const char** ptrs = (const char**)ray_alloc_raw((size_t)n * sizeof(const char*));
+    uint32_t* lens = (uint32_t*)ray_alloc_raw((size_t)n * sizeof(uint32_t));
+    if (!ptrs || !lens) {
+        if (ptrs) ray_free_raw(ptrs);
+        if (lens) ray_free_raw(lens);
+        return ray_error("oom", NULL);
+    }
+    for (int64_t i = 0; i < n; i++) {
+        int32_t c = cd[i];
+        if (c < 0 || c >= d->n_distinct) { ptrs[i] = ""; lens[i] = 0; continue; }
+        ray_enc_sdict_entry(d->ent, (uint32_t)c, &ptrs[i], &lens[i]);
+    }
+    ray_t* out = ray_str_vec_from_parts(ptrs, lens, NULL, n);
+    ray_free_raw(ptrs);
+    ray_free_raw(lens);
+    return out;
+}
+
 /* Thread-local stash of the result group dict codes so the
  * count-distinct path can build row_gid by remapping dict codes (cheap int)
  * instead of re-hashing strings. */
@@ -12280,8 +12307,10 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit)
     int64_t* dict_sym = NULL;
     ray_strdom_t** sdom = NULL; /* string domain per generation-2 STR key (owned) */
     ray_t** sd_col = NULL;      /* its id column (owned) */
+    ray_t** dc_vec = NULL;      /* a generation-2 DICT key's code vector (borrowed) */
+    const ray_enc_idict_t** dc_d = NULL;   /* its persisted DICT */
     uint32_t sd_n = 0;          /* entries of sdom / sd_col */
-    bool sd_any = false;        /* a key was swapped for string-domain ids */
+    bool sd_any = false;        /* a key was swapped for string-domain ids or DICT codes */
     if (!tbl || RAY_IS_ERR(tbl) || tbl->type != RAY_TABLE) {
         result = exec_group_run(g, op, tbl, group_limit); goto grp_done;
     }
@@ -12292,12 +12321,16 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit)
 
     uint32_t nk = ext->n_keys;
     key_col = (ray_t**)scratch_alloc(&wrap_hdr,
-        (size_t)nk * (3 * sizeof(ray_t*) + sizeof(int64_t)));
+        (size_t)nk * (5 * sizeof(void*) + sizeof(int64_t)));
     if (!key_col) { result = exec_group_run(g, op, tbl, group_limit); goto grp_done; }
     sd_col = key_col + nk;
     sdom = (ray_strdom_t**)(sd_col + nk);
-    dict_sym = (int64_t*)(sdom + nk);
-    for (uint32_t k = 0; k < nk; k++) { key_col[k] = NULL; sd_col[k] = NULL; sdom[k] = NULL; }
+    dc_vec = (ray_t**)(sdom + nk);
+    dc_d = (const ray_enc_idict_t**)(dc_vec + nk);
+    dict_sym = (int64_t*)(dc_d + nk);
+    for (uint32_t k = 0; k < nk; k++) {
+        key_col[k] = NULL; sd_col[k] = NULL; sdom[k] = NULL; dc_vec[k] = NULL; dc_d[k] = NULL;
+    }
     sd_n = nk;
     bool any = false;
     for (uint32_t k = 0; k < nk; k++) {
@@ -12307,6 +12340,37 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit)
         int64_t sym = ke->sym;
         ray_col_meta_t km;
         if (!ray_table_col_meta(tbl, sym, &km)) continue;
+        /* a single-file generation-2 STR key with a persisted DICT: its
+         * codes, as generation 0 groups on its DICT codes (spec "5. Group-by
+         * inputs", P6b), under generation 0's admission rule (below); a
+         * repeated key is swapped by the first occurrence's codes */
+        if (km.enc && !RAY_IS_PARTED(km.type) && km.type == RAY_STR && km.index_kind == RAY_IDX_DICT) {
+            bool dup = false;
+            for (uint32_t j = 0; j < k; j++)
+                if ((dc_vec[j] || sd_col[j] || key_col[j]) && dict_sym[j] == sym) dup = true;
+            /* Skip if any non-COUNT agg reads this key column as strings. */
+            bool unsafe = false;
+            for (uint32_t a = 0; a < ext->n_aggs; a++) {
+                if (ext->agg_ops[a] == OP_COUNT) continue;
+                ray_op_t* ain = op_node(g, ext->agg_ins[a]);
+                ray_op_ext_t* ae = ain ? find_ext(g, ain->id) : NULL;
+                if (ae && ae->base.opcode == OP_SCAN && ae->sym == sym) { unsafe = true; break; }
+            }
+            if (dup) continue;
+            if (!unsafe) {
+                ray_enccol_t* e = ray_enccol_of(ray_table_get_col_enc(tbl, sym));
+                const ray_enc_idict_t* d = NULL;
+                ray_t* derr = e ? ray_enccol_idict(e, &d) : NULL;
+                ray_t* cv = NULL;
+                if (!derr && d) derr = ray_enccol_idict_codes_vec(e, &cv);
+                if (derr) { result = derr; goto grp_done; }
+                if (d && cv) {
+                    dc_vec[k] = cv; dc_d[k] = d; dict_sym[k] = sym;
+                    any = true; sd_any = true;
+                    continue;
+                }
+            }
+        }
         /* a generation-2 STR key: query-wide domain ids */
         if (km.enc &&
             (RAY_IS_PARTED(km.type) ? RAY_PARTED_BASETYPE(km.type) : km.type) == RAY_STR) {
@@ -12359,7 +12423,11 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit)
         int64_t name = ray_table_col_name(tbl, c);
         ray_t* use = ray_table_slot_idx(tbl, c);     /* pass encoded slots on undecoded */
         for (uint32_t k = 0; k < nk; k++)
-            if (sd_col[k] && dict_sym[k] == name) {
+            if (dc_vec[k] && dict_sym[k] == name) {
+                use = dc_vec[k];
+                ray_grp_card_add(name, dc_d[k]->n_distinct);
+                break;
+            } else if (sd_col[k] && dict_sym[k] == name) {
                 use = sd_col[k];
                 ray_grp_card_add(name, ray_strdom_count(sdom[k]));
                 break;
@@ -12381,7 +12449,7 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit)
      * mapped back below, never returned as the key. */
     if (sd_any && result && !RAY_IS_ERR(result) && result->type != RAY_TABLE) {
         ray_release(result);
-        result = ray_error("nyi", "group: string-domain key without a table result");
+        result = ray_error("nyi", "group: a swapped STR key without a table result");
         goto grp_done;
     }
 
@@ -12389,11 +12457,34 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit)
         for (uint32_t k = 0; k < nk; k++) {
             /* the string-domain keys: every scan key of a swapped column
              * (a key repeated holds the same ids) */
-            int64_t sd = -1;
+            int64_t sd = -1, dc = -1;
             if (!key_col[k]) {
                 ray_op_ext_t* ke = find_ext(g, ext->keys[k]);
                 for (uint32_t j = 0; ke && ke->base.opcode == OP_SCAN && j < nk; j++)
-                    if (sd_col[j] && dict_sym[j] == ke->sym) { sd = j; break; }
+                    if (dc_vec[j] && dict_sym[j] == ke->sym) { dc = j; break; }
+                    else if (sd_col[j] && dict_sym[j] == ke->sym) { sd = j; break; }
+            }
+            if (dc >= 0) {
+                /* a generation-2 DICT key (every scan key of the column):
+                 * its codes through the persisted entries */
+                ray_t* codes_col = ray_table_col_idx(result, k);
+                if (!codes_col || RAY_IS_ERR(codes_col)) {
+                    ray_release(result);
+                    result = codes_col ? codes_col : ray_error("domain", "group: key column missing");
+                    break;
+                }
+                if (nk == 1 && codes_col->type == RAY_I32)
+                    ray_dict_cd_stash(codes_col, ray_table_nrows(result), dict_sym[dc], tbl,
+                                      dc_d[dc]->n_distinct);
+                ray_t* str_col = dict_entries_to_str(codes_col, dc_d[dc]);
+                if (!str_col || RAY_IS_ERR(str_col)) {
+                    ray_release(result);
+                    result = str_col ? str_col : ray_error("oom", NULL);
+                    break;
+                }
+                ray_table_set_col_idx(result, k, str_col);
+                ray_release(str_col);
+                continue;
             }
             if (sd >= 0) {
                 ray_t* ids_col = ray_table_col_idx(result, k);
