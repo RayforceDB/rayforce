@@ -96,6 +96,10 @@ typedef struct {
     ray_col_src_t* src;
     bool         enc;
     const char*  col_pool;
+    /* P6b: a STR == / != child over a generation-2 column's persisted DICT:
+     * col_type RAY_I32, cval its code; fp_bind_view reads the codes by range
+     * (never a zone decision: DICT codes are membership values) */
+    struct ray_enccol_s* idict;
 } fp_cmp_t;
 
 typedef struct {

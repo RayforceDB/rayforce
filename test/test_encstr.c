@@ -1390,8 +1390,12 @@ static test_result_t st_save2(const char* name, const char* tbl) {
 #define ST_FL_URL "https://www.example.com/path/1000/item?id=18763&ref=search"
 
 static test_result_t test_filter_strdict(void) {
+    /* subject: STR_DICT codes and bounds; the persisted DICT would answer (P6b) */
+    ray_col_test_no_dict(true);
     ST_SAVE2("fl", ST_FL_TABLE);
+    ray_col_test_no_dict(false);
     char p[600]; TEST_ASSERT_TRUE(st_live("/fl2", "s", p, sizeof p));
+    TEST_ASSERT_EQ_I(st_hdr(p).index_kind, 0);
     TEST_ASSERT_EQ_I(st_desc_enc(p, 0, NULL), RAY_ENC_FSST);
     TEST_ASSERT_EQ_I(st_desc_enc(p, 64, NULL), RAY_ENC_STR_DICT);
     TEST_ASSERT_TRUE(st_desc_enc(p, 128, NULL) != RAY_ENC_STR_DICT);
@@ -1426,7 +1430,13 @@ static test_result_t test_filter_strdict(void) {
 
 /* Only the STR_DICT chunk: code bounds decide the vectors, nothing decoded. */
 static test_result_t test_filter_decided(void) {
+    /* subject: STR_DICT codes and bounds; the persisted DICT would answer (P6b) */
+    ray_col_test_no_dict(true);
     ST_SAVE2("fd", "(table [s] (list (as 'STR (map (fn [j] (format \"cat % x\" (% j 37))) (til 70000)))))");
+    ST_SAVE2("fz", "(table [s] (list (as 'STR (at [\"z\" \"a\" \"m\"] (% (til 70000) 3)))))");
+    ray_col_test_no_dict(false);
+    char p[600]; TEST_ASSERT_TRUE(st_live("/fd2", "s", p, sizeof p));
+    TEST_ASSERT_EQ_I(st_hdr(p).index_kind, 0);
     st_fk_t k;
     ST_SAME("fd", "(count (select {from: T where: (== s \"not a category\")}))", &k);
     TEST_ASSERT_EQ_U(k.mat, 0);
@@ -1437,8 +1447,8 @@ static test_result_t test_filter_decided(void) {
     ST_SAME("fd", "(count (select {from: T where: (!= s \"cat 3 x\")}))", &k);
     TEST_ASSERT_EQ_U(k.dec, 0);
     /* the `z, a, m` column of compress_str.rfl: code order is not value order */
-    ST_SAVE2("fz", "(table [s] (list (as 'STR (at [\"z\" \"a\" \"m\"] (% (til 70000) 3)))))");
-    char p[600]; TEST_ASSERT_TRUE(st_live("/fz2", "s", p, sizeof p));
+    TEST_ASSERT_TRUE(st_live("/fz2", "s", p, sizeof p));
+    TEST_ASSERT_EQ_I(st_hdr(p).index_kind, 0);
     TEST_ASSERT_EQ_I(st_desc_enc(p, 0, NULL), RAY_ENC_STR_DICT);
     ST_SAME("fz", "(count (select {from: T where: (== s \"a\")}))", &k);
     TEST_ASSERT_EQ_U(k.mat, 0);
@@ -1458,7 +1468,11 @@ static test_result_t test_filter_decided(void) {
  * materialized, every query through a STR selection; `refines` marks the
  * queries whose STR conjunct runs second. */
 static test_result_t test_filter_chained(void) {
+    /* subject: STR_DICT codes and bounds; the persisted DICT would answer (P6b) */
+    ray_col_test_no_dict(true);
     ST_SAVE2("fc", ST_FL_TABLE);
+    ray_col_test_no_dict(false);
+    { char p[600]; TEST_ASSERT_TRUE(st_live("/fc2", "s", p, sizeof p)); TEST_ASSERT_EQ_I(st_hdr(p).index_kind, 0); }
     static const struct { const char* q; bool refines; } qs[] = {
         /* the brief's pair: the STR equality ranks first either way */
         { "(count (select {from: T where: (and (> v 100) (== s \"cat 5 x\"))}))", false },
@@ -1502,6 +1516,8 @@ static test_result_t test_filter_parted(void) {
         "(table [v s] (list (til 5000) (as 'STR (map (fn [j] (format \"https://www.example.com/path/%/item?id=%&ref=search\" (% j 999) j)) (til 5000)))))",
         "(table [v] (list (til 2000)))",
     };
+    /* subject: STR_DICT codes and bounds; the persisted DICT would answer (P6b) */
+    ray_col_test_no_dict(true);
     for (int gen = 0; gen <= 2; gen += 2)
         for (int p = 0; p < 4; p++) {
             char q[1200];
@@ -1511,6 +1527,8 @@ static test_result_t test_filter_parted(void) {
                      gen, p + 1, parts[p], enc ? "true" : "false");
             ST_Q_OK_N(q);
         }
+    ray_col_test_no_dict(false);
+    { char p[600]; TEST_ASSERT_TRUE(st_live("/fp2/2024.01.01/t", "s", p, sizeof p)); TEST_ASSERT_EQ_I(st_hdr(p).index_kind, 0); }
     static const struct { const char* q; bool refines; } qs[] = {
         { "(count (select {from: T where: (== s \"cat 5 x\")}))", false },
         { "(count (select {from: T where: (!= s \"cat 5 x\")}))", false },
@@ -1547,8 +1565,12 @@ static test_result_t test_filter_parted(void) {
     "(if (< j 65536) (format \"https://www.example.com/path/%/item?id=%&ref=search\" (% j 5000) (% (* j 7919) 100003)) " \
     "(if (and (>= j 71680) (< j 72704)) \"\" (format \"cat % x\" (% j 37))))))) (til 131072))) (til 131072)))"
 static test_result_t test_filter_mixed_chunks(void) {
+    /* subject: STR_DICT codes and bounds; the persisted DICT would answer (P6b) */
+    ray_col_test_no_dict(true);
     ST_SAVE2("fm", ST_MX_TABLE);
+    ray_col_test_no_dict(false);
     char p[600]; TEST_ASSERT_TRUE(st_live("/fm2", "s", p, sizeof p));
+    TEST_ASSERT_EQ_I(st_hdr(p).index_kind, 0);
     TEST_ASSERT_EQ_I(st_desc_enc(p, 0, NULL), RAY_ENC_FSST);
     TEST_ASSERT_EQ_I(st_desc_enc(p, 3, NULL), RAY_ENC_CONST);
     TEST_ASSERT_EQ_I(st_desc_enc(p, 5, NULL), RAY_ENC_CONST);
@@ -1577,7 +1599,12 @@ static test_result_t test_filter_mixed_chunks(void) {
  * (its STR filter keeps the bool path, which reads it in place): the
  * answer equals generation 0 before and after the materialization. */
 static test_result_t test_filter_materialized(void) {
+    /* subject: the STR_DICT path declining a published materialization; the
+     * persisted DICT serves a materialized column (P6b, idict_filter) */
+    ray_col_test_no_dict(true);
     ST_SAVE2("fx", ST_FL_TABLE);
+    ray_col_test_no_dict(false);
+    { char p[600]; TEST_ASSERT_TRUE(st_live("/fx2", "s", p, sizeof p)); TEST_ASSERT_EQ_I(st_hdr(p).index_kind, 0); }
     static const char* const qs[] = {
         "(count (select {from: T where: (== s \"cat 5 x\")}))",
         "(count (select {from: T where: (!= s \"\")}))",
@@ -1633,9 +1660,13 @@ static test_result_t test_filter_forged(void) {
     TEST_ASSERT_EQ_I(ray_env_set(ray_sym_intern("W", 1), tb), RAY_OK);
     ray_release(tb);
     ray_encw_test_force_str(RAY_ENC_STR_DICT);              /* selection keeps one-string vectors CONST */
+    /* subject: STR_DICT codes and bounds; the persisted DICT would answer (P6b) */
+    ray_col_test_no_dict(true);
     ST_Q_OK("(.db.splayed.set \"" ST_TMP "/ff/\" W {compress: true})");
+    ray_col_test_no_dict(false);
     ray_encw_test_force_str(-1);
     char p[600]; TEST_ASSERT_TRUE(st_live("/ff", "s", p, sizeof p));
+    TEST_ASSERT_EQ_I(st_hdr(p).index_kind, 0);
     ST_Q_OK("(set T (.db.splayed.get \"" ST_TMP "/ff/\"))");
     ST_Q_TRUE("(== 34816 (count (select {from: T where: (== s \"forged entry one, a long string\")})))");   /* 34 odd vectors of 1024 rows */
     TEST_ASSERT_TRUE(sf_set_code(p, 3, 9));                  /* 3 entries: code 9 is outside */
@@ -2462,9 +2493,10 @@ static test_result_t test_idict_groupby(void) {
     /* a count-distinct beside the key: the stashed result codes' consumer */
     ST_SAME("gb", "(select {d: (count (distinct u)) from: T by: s asc: s})", NULL);
     ST_SAME_MEM(ST_GB_LOAD2, "(select {d: (count (distinct u)) from: T by: s asc: s})");
-    /* the counter sees s's range decodes: a filter decodes the URL
-     * vectors (not STR_DICT) by range */
-    ST_SAME("gb", "(count (select {from: T where: (== s \"https://e.org/1024/31744\")}))", NULL);
+    /* the counter sees s's range decodes: the filter reads the DICT codes
+     * (P6b Task 5), and the output's gather of s decodes the matched URL
+     * vector (not STR_DICT) by range */
+    ST_SAME("gb", "(select {s: s from: T where: (== s \"https://e.org/1024/31744\")})", NULL);
     TEST_ASSERT_TRUE(st_col_decoded("s") > 0);
     /* Task 3 review Minor 5: by: s and distinct on the DICT column equal
      * generation 0 and the in-memory table (sorted) */
@@ -2558,6 +2590,235 @@ static test_result_t test_idict_groupby_forged(void) {
         TEST_ASSERT_FMT(strstr(st_msg, "before its first occurrence") != NULL && strstr(st_msg, want) != NULL,
                         "%s (want %s)", st_msg, want);
     }
+    PASS();
+}
+
+/* ---- P6b Task 5: equality on DICT codes ---- */
+
+/* The answer of q on T as loaded by `load` (st_q_fmt's text), or NULL with
+ * st_msg set. */
+static ray_t* st_ans(const char* load, const char* q) {
+    if (load && !st_q_run(load)) return NULL;
+    return st_q_fmt(q);
+}
+
+/* vectors cycling through "" (the in-band null), URL-like strings (FSST)
+ * and 37 categories (STR_DICT vectors); the DICT records them all; f a U8
+ * flag (a conjunct on it ranks before the STR one) */
+#define ST_FD_TABLE "(table [s v f] (list (as 'STR (map (fn [j] (if (== 3 (% (div j 1024) 7)) \"\" " \
+    "(if (== 1 (% (div j 1024) 5)) (format \"https://e.org/%/%\" j (* j 31)) (format \"category number % long\" (% j 37))))) (til 140000))) " \
+    "(til 140000) (as 'U8 (% (til 140000) 3))))"
+#define ST_FD_LOAD2 "(set T (.db.splayed.get \"" ST_TMP "/fe2/\"))"
+/* s's published materialization on the loaded table T */
+static bool st_col_mat(const char* col) {
+    ray_t* t = ray_eval_str("T");
+    if (!t || RAY_IS_ERR(t)) { if (t) ray_error_free(t); return true; }
+    ray_t* ec = ray_table_get_col_enc(t, ray_sym_intern(col, strlen(col)));
+    bool m = !ec || ray_enccol_decoded_peek(ec) != NULL;
+    ray_release(t);
+    return m;
+}
+static test_result_t test_idict_filter(void) {
+    ST_SAVE2("fe", ST_FD_TABLE);
+    ST_Q_OK_N("(set M " ST_FD_TABLE ")");
+    char p[600]; TEST_ASSERT_TRUE(st_live("/fe2", "s", p, sizeof p));
+    TEST_ASSERT_EQ_I(st_hdr(p).index_kind, RAY_IDX_DICT);
+    /* how each shape is answered: 1 the STR selection as the first
+     * conjunct, 2 as a refinement, 3 either (the optimizer ranks an STR
+     * equality beside a U8 one), 0 the fused top-k predicate.  Every
+     * shape: s neither materialized nor decoded, answers equal to
+     * generation 0 and to the in-memory table.  The count shapes'
+     * whole query materializes nothing; a top-k materializes its key v
+     * (as with a predicate on v alone: not the filter's doing), and its
+     * output is projected to v so no s value is gathered. */
+    static const struct { const char* q; int how; } qs[] = {
+        { "(count (select {from: T where: (== s \"category number 5 long\")}))", 1 },
+        { "(count (select {from: T where: (!= s \"category number 5 long\")}))", 1 },
+        { "(count (select {from: T where: (!= s \"\")}))", 1 },                          /* q24-q27, q31 */
+        { "(count (select {from: T where: (== s \"\")}))", 1 },                          /* "" is the null */
+        { "(count (select {from: T where: (== s \"absent\")}))", 1 },
+        { "(count (select {from: T where: (!= s \"absent\")}))", 1 },
+        { "(count (select {from: T where: (== s \"https://e.org/1024/31744\")}))", 1 },  /* a row of an FSST vector */
+        { "(count (select {v: v from: T where: (and (> v 1000) (!= s \"\"))}))", 1 },   /* the STR conjunct ranks first */
+        { "(count (select {v: v from: T where: (and (== f 1) (!= s \"\"))}))", 2 },          /* a later conjunct */
+        { "(count (select {v: v from: T where: (and (== f 1) (== s \"\"))}))", 1 },        /* ranks first */
+        { "(count (select {v: v from: T where: (and (== f 2) (== s \"category number 5 long\"))}))", 3 },
+        { "(count (select {v: v from: T where: (and (== f 0) (!= s \"category number 5 long\"))}))", 2 },
+        { "(count (select {v: v from: T where: (and (== f 0) (== s \"absent\"))}))", 3 },
+        { "(select {v: v from: T where: (!= s \"\") asc: v take: 10})", 0 },             /* top-k predicate (q25) */
+        { "(select {v: v from: T where: (!= s \"\") desc: v take: 10})", 0 },
+        { "(select {v: v from: T where: (== s \"\") desc: v take: 10})", 0 },
+        { "(select {v: v from: T where: (== s \"category number 5 long\") desc: v take: 10})", 0 },
+        { "(select {v: v from: T where: (!= s \"category number 5 long\") asc: v take: 10})", 0 },
+        { "(select {v: v from: T where: (and (> v 1000) (!= s \"\")) asc: v take: 10})", 0 },   /* a later child */
+        { "(select {v: v from: T where: (and (< v 100000) (== s \"\")) desc: v take: 10})", 0 },
+        { "(select {v: v from: T where: (== s \"absent\") asc: v take: 10})", 0 },
+        { "(select {v: v from: T where: (!= s \"absent\") asc: v take: 10})", 0 },
+    };
+    for (size_t i = 0; i < sizeof qs / sizeof qs[0]; i++) {
+        st_fk_t k = { 0 };
+        ST_SAME("fe", qs[i].q, &k);
+        const uint64_t sd = st_col_decoded("s");
+        TEST_ASSERT_FMT(sd == 0, "%s: s decoded %llu", qs[i].q, (unsigned long long)sd);
+        TEST_ASSERT_FMT(!st_col_mat("s"), "%s: s materialized", qs[i].q);
+        if (qs[i].how) TEST_ASSERT_FMT(k.mat == 0, "%s: materialized %llu", qs[i].q, (unsigned long long)k.mat);
+        if (qs[i].how == 1) TEST_ASSERT_FMT(k.sel == 1 && k.refine == 0, "%s: sel %llu refine %llu", qs[i].q,
+                                            (unsigned long long)k.sel, (unsigned long long)k.refine);
+        if (qs[i].how == 2) TEST_ASSERT_FMT(k.refine == 1, "%s: refine %llu", qs[i].q, (unsigned long long)k.refine);
+        if (qs[i].how == 3) TEST_ASSERT_FMT(k.sel + k.refine == 1, "%s: no STR selection", qs[i].q);
+        if (qs[i].how == 0) TEST_ASSERT_FMT(k.sel == 0 && k.refine == 0, "%s: not the fused predicate", qs[i].q);
+        ST_SAME_MEM(ST_FD_LOAD2, qs[i].q);
+    }
+    /* the brief's shapes whose output keeps s (an output gather, not the
+     * filter, reads s): answers only */
+    static const char* const ans[] = {
+        "(count (select {from: T where: (and (> v 1000) (!= s \"\"))}))",
+        "(count (select {from: T where: (and (== f 1) (== s \"\"))}))",
+        "(at (select {from: T where: (!= s \"\") asc: v take: 10}) 'v)",
+        "(at (select {from: T where: (== s \"\") asc: v take: 10}) 's)",
+    };
+    for (size_t i = 0; i < sizeof ans / sizeof ans[0]; i++) {
+        ST_SAME("fe", ans[i], NULL);
+        ST_SAME_MEM(ST_FD_LOAD2, ans[i]);
+    }
+    /* nothing decoded at all: the filter alone */
+    st_fk_t k = { 0 };
+    ST_SAME("fe", "(count (select {from: T where: (!= s \"\")}))", &k);
+    TEST_ASSERT_EQ_U(k.dec, 0);
+    /* materialized first: the same answers, the DICT still serves (the
+     * STR selection takes the materialized single file on its codes) */
+    static const char* const mq[] = {
+        "(count (select {from: T where: (== s \"category number 5 long\")}))",
+        "(count (select {from: T where: (!= s \"\")}))",
+        "(count (select {from: T where: (== s \"\")}))",
+        "(select {v: v from: T where: (== s \"\") desc: v take: 10})",
+    };
+    for (size_t i = 0; i < sizeof mq / sizeof mq[0]; i++) {
+        ray_t* want = st_ans("(set T M)", mq[i]);
+        TEST_ASSERT_FMT(want != NULL, "%s in memory: %s", mq[i], st_msg);
+        st_hold(want);
+        ST_Q_OK(ST_FD_LOAD2);
+        ST_Q_OK("(set Z (at T 's))");
+        TEST_ASSERT_TRUE(st_col_mat("s"));
+        const uint64_t s0 = ray_exec_test_str_sel(0);
+        ray_t* got = st_q_fmt(mq[i]);
+        TEST_ASSERT_FMT(got != NULL, "%s materialized: %s", mq[i], st_msg);
+        st_hold(got);
+        /* the top-k shape takes the fused predicate, the others the STR selection */
+        const uint64_t want_sel = strstr(mq[i], "take:") ? 0 : 1;
+        TEST_ASSERT_FMT(ray_exec_test_str_sel(0) - s0 == want_sel, "%s: the materialized DICT column declined", mq[i]);
+        TEST_ASSERT_FMT(ray_str_len(want) == ray_str_len(got) &&
+                        memcmp(ray_str_ptr(want), ray_str_ptr(got), ray_str_len(want)) == 0,
+                        "%s: in memory %.*s vs materialized %.*s", mq[i], (int)ray_str_len(want), ray_str_ptr(want),
+                        (int)ray_str_len(got), ray_str_ptr(got));
+        st_unhold(got, NULL); ray_release(got);
+        st_unhold(want, NULL); ray_release(want);
+        ST_Q_OK("(set Z 0)");
+    }
+    PASS();
+}
+
+/* Parted: segments with conflicting codes (the same string, different
+ * codes), "" rows at different codes, and one segment below 65536 rows (no
+ * DICT, STR_DICT vectors): generation 0 and the in-memory concatenation
+ * (no index) agree; a forged code in a DICT segment proves its codes are
+ * what the selection reads. */
+#define ST_FPT_LOAD2 "(set T (.db.parted.get \"" ST_TMP "/fpt2\" 't))"
+static test_result_t test_idict_filter_parted(void) {
+    ST_Q_OK("(set P0 (table [s] (list (as 'STR (map (fn [j] (if (== 7 (% j 50)) \"\" (format \"k%\" (% j 50)))) (til 70000))))))");
+    ST_Q_OK("(set P1 (table [s] (list (as 'STR (map (fn [j] (if (== 20 (% j 50)) \"\" (format \"k%\" (- 49 (% j 50))))) (til 70000))))))");
+    ST_Q_OK("(set P2 (table [s] (list (as 'STR (map (fn [j] (if (== 3 (% j 9)) \"\" (format \"z%\" (% j 7)))) (til 1000))))))");
+    ST_Q_OK("(set M (concat P0 (concat P1 P2)))");
+    for (int g = 0; g <= 2; g += 2)
+        for (int p = 0; p < 3; p++) {
+            char q[512];
+            snprintf(q, sizeof q, "(.db.splayed.set \"" ST_TMP "/fpt%d/2024.01.0%d/t/\" P%d {compress: %s})",
+                     g, p + 1, p, g ? "true" : "false");
+            ST_Q_OK(q);
+        }
+    char p[600];
+    TEST_ASSERT_TRUE(st_live("/fpt2/2024.01.01/t", "s", p, sizeof p)); TEST_ASSERT_EQ_I(st_hdr(p).index_kind, RAY_IDX_DICT);
+    TEST_ASSERT_TRUE(st_live("/fpt2/2024.01.02/t", "s", p, sizeof p)); TEST_ASSERT_EQ_I(st_hdr(p).index_kind, RAY_IDX_DICT);
+    TEST_ASSERT_TRUE(st_live("/fpt2/2024.01.03/t", "s", p, sizeof p)); TEST_ASSERT_EQ_I(st_hdr(p).index_kind, 0);
+    static const char* const qs[] = {
+        "(count (select {from: T where: (== s \"k3\")}))",
+        "(count (select {from: T where: (!= s \"k3\")}))",
+        "(count (select {from: T where: (!= s \"z1\")}))",
+        "(count (select {from: T where: (== s \"z1\")}))",
+        "(count (select {from: T where: (== s \"absent\")}))",
+        "(count (select {from: T where: (!= s \"absent\")}))",
+        "(count (select {from: T where: (== s \"\")}))",
+        "(count (select {from: T where: (!= s \"\")}))",
+        "(count (select {from: T where: (and (!= s \"k3\") (!= s \"\"))}))",
+    };
+    for (size_t i = 0; i < sizeof qs / sizeof qs[0]; i++) {
+        st_fk_t k = { 0 };
+        ST_SAME_P("fpt", qs[i], &k);
+        TEST_ASSERT_FMT(k.mat == 0, "%s: materialized %llu", qs[i], (unsigned long long)k.mat);
+        TEST_ASSERT_FMT(k.sel == 1, "%s: sel %llu", qs[i], (unsigned long long)k.sel);
+        ST_SAME_MEM(ST_FPT_LOAD2, qs[i]);
+    }
+    /* partition 2's codes are read: a code past n_distinct fails the
+     * filter naming the row */
+    TEST_ASSERT_TRUE(st_live("/fpt2/2024.01.02/t", "s", p, sizeof p));
+    ray_enc_hdr_t eh = st_hdr(p);
+    ray_enc_idx_dict_t dd; ST_READ(p, eh.index_off + 16, &dd, sizeof dd);
+    int32_t big = 50;
+    ST_PATCH(p, eh.index_off + dd.codes + 9000 * 4, &big, 4);
+    ST_Q_OK(ST_FPT_LOAD2);
+    TEST_ASSERT_FALSE(st_q_run("(count (select {from: T where: (!= s \"\")}))"));
+    TEST_ASSERT_FMT(strstr(st_msg, "DICT code 50 at row 9000 outside 0 .. 49") != NULL, "%s", st_msg);
+    PASS();
+}
+
+/* An out-of-range code in the rows a filter reads: corrupt naming the
+ * file, in the STR selection and in a top-k predicate; rows the filter
+ * skips are not read.  STR `in` on a DICT column: nyi in both
+ * generations (ruling Q1). */
+static test_result_t test_idict_filter_forged(void) {
+    ST_SAVE2("ff", "(table [s v w] (list (as 'STR (map (fn [j] (format \"value % of the domain\" (% (* j 7919) 300))) (til 70000))) (til 70000) "
+             "(as 'U8 (map (fn [j] (if (< j 1000) 1 0)) (til 70000)))))");
+    ST_Q_OK("(set T (.db.splayed.get \"" ST_TMP "/ff0/\"))");
+    ray_t* r0 = ray_eval_str(ray_test_tmp("(select {from: T where: (in s [\"a\" \"b\"])})"));
+    TEST_ASSERT_TRUE(r0 && RAY_IS_ERR(r0) && strcmp(ray_err_code(r0), "nyi") == 0); ray_error_free(r0);
+    ST_Q_OK("(set T (.db.splayed.get \"" ST_TMP "/ff2/\"))");
+    ray_t* r2 = ray_eval_str(ray_test_tmp("(select {from: T where: (in s [\"a\" \"b\"])})"));
+    TEST_ASSERT_TRUE(r2 && RAY_IS_ERR(r2) && strcmp(ray_err_code(r2), "nyi") == 0); ray_error_free(r2);
+    char p[600]; TEST_ASSERT_TRUE(st_live("/ff2", "s", p, sizeof p));
+    ray_enc_hdr_t eh = st_hdr(p);
+    TEST_ASSERT_EQ_I(eh.index_kind, RAY_IDX_DICT);
+    ray_enc_idx_dict_t dd; ST_READ(p, eh.index_off + 16, &dd, sizeof dd);
+    int32_t big = 300;
+    ST_PATCH(p, eh.index_off + dd.codes + 60000 * 4, &big, 4);
+    /* the file, exactly as the load spells it (see idict_groupby_forged) */
+    char want[700];
+    snprintf(want, sizeof want, "%s/s: DICT code 300 at row 60000 outside 0 .. 299", ray_test_tmp(ST_TMP "/ff2/"));
+    /* "" is absent from this column: its constant reads no code at all */
+    ST_Q_OK("(set T (.db.splayed.get \"" ST_TMP "/ff2/\"))");
+    ST_Q_OK("(count (select {from: T where: (!= s \"\")}))");
+    ST_Q_OK("(select {v: v from: T where: (!= s \"\") asc: v take: 10})");
+    static const char* const bad[] = {
+        "(count (select {from: T where: (!= s \"value 5 of the domain\")}))",
+        "(count (select {from: T where: (== s \"value 5 of the domain\")}))",
+        /* the fused top-k predicate: the window holding row 60000 always beats the bound */
+        "(select {v: v from: T where: (and (< v 60001) (!= s \"value 5 of the domain\")) desc: v take: 10})",
+    };
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        ST_Q_OK("(set T (.db.splayed.get \"" ST_TMP "/ff2/\"))");
+        TEST_ASSERT_FMT(!st_q_run(bad[i]), "%s: an answer", bad[i]);
+        TEST_ASSERT_FMT(strstr(st_msg, want) != NULL, "%s: %s (want %s)", bad[i], st_msg, want);
+    }
+    /* a conjunct that drops row 60000's morsel first never reads it: the
+     * U8 equality ranks before the STR one, which refines */
+    ST_Q_OK("(set T (.db.splayed.get \"" ST_TMP "/ff2/\"))");
+    const uint64_t r0n = ray_exec_test_str_sel(1);
+    ST_Q_OK("(count (select {v: v from: T where: (and (== w 1) (!= s \"value 5 of the domain\"))}))");
+    TEST_ASSERT_EQ_U(ray_exec_test_str_sel(1) - r0n, 1);
+    /* the brief's (< v 1000): the optimizer ranks the STR conjunct first
+     * (as P6 Task 5 found), so it reads every row's code and fails */
+    ST_Q_OK("(set T (.db.splayed.get \"" ST_TMP "/ff2/\"))");
+    TEST_ASSERT_FALSE(st_q_run("(count (select {from: T where: (and (< v 1000) (!= s \"value 5 of the domain\"))}))"));
+    TEST_ASSERT_FMT(strstr(st_msg, want) != NULL, "%s (want %s)", st_msg, want);
     PASS();
 }
 
@@ -2850,5 +3111,8 @@ const test_entry_t encstr_entries[] = {
     { "encstr/idict_groupby",        test_idict_groupby,        st_q_setup, st_q_teardown },
     { "encstr/idict_groupby_parted", test_idict_groupby_parted, st_q_setup, st_q_teardown },
     { "encstr/idict_groupby_forged", test_idict_groupby_forged, st_q_setup, st_q_teardown },
+    { "encstr/idict_filter",        test_idict_filter,        st_q_setup, st_q_teardown },
+    { "encstr/idict_filter_parted", test_idict_filter_parted, st_q_setup, st_q_teardown },
+    { "encstr/idict_filter_forged", test_idict_filter_forged, st_q_setup, st_q_teardown },
     { NULL, NULL, NULL, NULL },
 };

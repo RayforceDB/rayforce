@@ -1578,12 +1578,17 @@ static ray_t* idx_decode_col(ray_t* tbl, int64_t sym) {
  * non-null rows: "" is never inside them, D4); a STR_DICT vector otherwise
  * compares its codes as a view; any other vector, a plain or materialized
  * segment and a synthetic all-null one are read by range and compared on
- * bytes. */
+ * bytes.  A segment recording a persisted DICT (P6b), materialized or not,
+ * compares its codes by range instead, with no bounds: its constant is
+ * looked up once in the DICT's entries ("" is an entry like any other, so
+ * the null rows are selected exactly). */
 typedef struct {
     ray_col_src_t  src;        /* parted: the segment's own source, bound here */
     ray_col_src_t* rs;         /* the source its rows are read from by range */
     ray_enccol_t*  e;          /* single-file encoded, not materialized: codes and bounds; else NULL */
     int64_t        code;       /* the constant's code in e's entry: >= 0, -1 absent, -2 no entry */
+    ray_enccol_t*  de;         /* single-file encoded with a persisted DICT (materialized or not); else NULL */
+    int64_t        dcode;      /* the constant's DICT code: >= 0, -1 absent */
     bool           bound;
 } str_seg_sel_t;
 
@@ -1612,6 +1617,20 @@ static bool str_seg_fill(const str_sel_ctx_t* x, str_seg_sel_t* s, ray_col_scrat
     while (at < n) {
         const int64_t row = lr + at;
         uint8_t* o = out + at;
+        if (s->de) {
+            /* the persisted DICT (spec path 1, P6b): codes by range, no bounds */
+            const int64_t v = row / RAY_ENC_VEC;
+            int64_t piece = (v + 1) * RAY_ENC_VEC - row;
+            if (piece > n - at) piece = n - at;
+            if (s->dcode < 0) { memset(o, miss, (size_t)piece); at += piece; continue; }
+            const int32_t* cd = NULL;
+            ray_t* err = ray_enccol_idict_codes(s->de, row, piece, &cd);
+            if (err) { ray_scan_fail_note(x->fail, key, err); return false; }
+            const int32_t cc = (int32_t)s->dcode;
+            for (int64_t k = 0; k < piece; k++) o[k] = (uint8_t)((cd[k] == cc) ^ x->ne);
+            at += piece;
+            continue;
+        }
         if (s->e) {
             const int64_t v = row / RAY_ENC_VEC;
             int64_t piece = (v + 1) * RAY_ENC_VEC - row;
@@ -1719,6 +1738,14 @@ static ray_enccol_t* str_sel_codes_col(ray_t* o) {
     return e && e->kind == RAY_ENCCOL_SINGLE && !e->synthetic ? e : NULL;
 }
 
+/* A segment's persisted DICT (P6b): a single-file, non-synthetic encoded
+ * column recording one, materialized or not (the codes read the mapping). */
+static ray_enccol_t* str_sel_dict_col(ray_t* o) {
+    if (!o || o->type != RAY_ENCCOL) return NULL;
+    ray_enccol_t* e = ray_enccol_of(o);
+    return e && e->kind == RAY_ENCCOL_SINGLE && !e->synthetic && e->hdr.index_kind == RAY_IDX_DICT ? e : NULL;
+}
+
 static ray_t* str_sel_run(ray_graph_t* g, ray_op_t* pred, int64_t nrows, ray_t* within, bool* all_pass) {
     *all_pass = false;
     if (!g || !g->table || !pred || nrows <= 0) return NULL;
@@ -1762,10 +1789,16 @@ static ray_t* str_sel_run(ray_graph_t* g, ray_op_t* pred, int64_t nrows, ray_t* 
     x.fail = &fail;
 
     if (!parted) {
-        ray_enccol_t* e = str_sel_codes_col(src->obj);
-        if (!e) goto decline;                      /* materialized: read in place on its path */
-        one = (str_seg_sel_t){ .rs = src, .e = e, .code = -2 };
-        if ((ret = ray_enccol_strdict_code(e, x.cs, x.clen, &one.code)) != NULL) goto out;
+        ray_enccol_t* de = str_sel_dict_col(src->obj);
+        if (de) {
+            one = (str_seg_sel_t){ .rs = src, .de = de, .code = -2 };
+            if ((ret = ray_enccol_idict_code(de, x.cs, x.clen, &one.dcode)) != NULL) goto out;
+        } else {
+            ray_enccol_t* e = str_sel_codes_col(src->obj);
+            if (!e) goto decline;                  /* materialized: read in place on its path */
+            one = (str_seg_sel_t){ .rs = src, .e = e, .code = -2 };
+            if ((ret = ray_enccol_strdict_code(e, x.cs, x.clen, &one.code)) != NULL) goto out;
+        }
         x.segs = &one; x.off = one_off; x.n_segs = 1;
         ray_col_src_advise(src, 0, nrows);
     } else {
@@ -1784,6 +1817,12 @@ static ray_t* str_sel_run(ray_graph_t* g, ray_op_t* pred, int64_t nrows, ray_t* 
             if (s->src.parted || s->src.type != RAY_STR || s->src.len != off[i + 1] - off[i]) goto decline;
             s->rs = &s->src;
             s->code = -2;
+            s->de = str_sel_dict_col(segv[i]);
+            if (s->de) {
+                if ((ret = ray_enccol_idict_code(s->de, x.cs, x.clen, &s->dcode)) != NULL) goto out;
+                any_codes = true;
+                continue;
+            }
             s->e = str_sel_codes_col(segv[i]);
             if (s->e && (ret = ray_enccol_strdict_code(s->e, x.cs, x.clen, &s->code)) != NULL) goto out;
             any_codes |= s->e != NULL;

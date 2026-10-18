@@ -754,6 +754,16 @@ static ray_t* fp_bind_view(const fp_cmp_t* c, int64_t start, int64_t n,
                            fp_cmp_t* out, int* decided) {
     *out = *c;
     *decided = -1;
+    if (c->idict) {
+        /* the persisted DICT's codes (P6b), in the mapping: no decode, and
+         * never a zone decision (codes are membership values, D6) */
+        const int32_t* cd = NULL;
+        ray_t* e = ray_enccol_idict_codes(c->idict, start, n, &cd);
+        if (e) return e;
+        out->col_base = cd;                        /* rows are view-relative, as for a range read */
+        out->col_obj = NULL;
+        return NULL;
+    }
     if (!c->typed_compare && zone_dir_type(c->col_type) && c->op <= FP_GE &&
         (start / RAY_ENC_CHUNK) == ((start + n - 1) / RAY_ENC_CHUNK)) {
         ray_enc_chunk_stat_t st;
@@ -1049,6 +1059,23 @@ static int fp_compile_cmp(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
             out->cval_in_dict = (code >= 0) ? 1 : 0;
             if (code < 0)
                 out->fold = (out->op == FP_EQ) ? FP_FOLD_FALSE : FP_FOLD_TRUE;
+            return 0;
+        }
+        /* a generation-2 single-file column with a persisted DICT (P6b),
+         * materialized or not: its codes, read from the mapping by range
+         * (fp_bind_view); "" is an entry, so the null rows compare exactly */
+        ray_enccol_t* de = (src->obj && src->obj->type == RAY_ENCCOL) ? ray_enccol_of(src->obj) : NULL;
+        if (de && de->kind == RAY_ENCCOL_SINGLE && !de->synthetic && de->hdr.index_kind == RAY_IDX_DICT) {
+            int64_t dc = -2;
+            ray_t* ce = ray_enccol_idict_code(de, ray_str_ptr(cv_str), ray_str_len(cv_str), &dc);
+            if (ce) { *err = ce; return -1; }
+            out->col_type = RAY_I32; out->col_attrs = 0; out->col_esz = 4;
+            out->col_base = NULL; out->col_obj = NULL; out->col_len = src->len;
+            out->typed_compare = 0;
+            out->enc = true; out->idict = de;
+            out->cval = dc >= 0 ? dc : 0;
+            out->cval_in_dict = dc >= 0;
+            if (dc < 0) out->fold = (out->op == FP_EQ) ? FP_FOLD_FALSE : FP_FOLD_TRUE;
             return 0;
         }
     }
