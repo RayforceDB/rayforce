@@ -2930,6 +2930,37 @@ static test_result_t test_idict_filter_forged(void) {
     PASS();
 }
 
+/* Review M1: a parted column that fails to load surfaces the load's own
+ * `corrupt` error (naming the file) from a projected select under a where,
+ * not a row-count `length` error.  Mixed-generation root: partition 1 is
+ * generation 0, partition 2 generation 2 with its x file damaged. */
+static test_result_t test_parted_projection_corrupt(void) {
+    ST_Q_OK("(set P0 (table [x y] (list (til 6000) (% (til 6000) 3))))");
+    ST_Q_OK("(set P1 (table [x y] (list (+ 100000 (til 6000)) (% (til 6000) 3))))");
+    ST_Q_OK("(.db.splayed.set \"" ST_TMP "/pc/2024.01.01/t/\" P0 {compress: false})");
+    ST_Q_OK("(.db.splayed.set \"" ST_TMP "/pc/2024.01.02/t/\" P1 {compress: true})");
+    char p[600];
+    TEST_ASSERT_TRUE(st_live("/pc/2024.01.02/t", "x", p, sizeof p));
+    uint8_t junk[64]; memset(junk, 0xFF, sizeof junk);
+    TEST_ASSERT_TRUE(st_patch(p, 200, junk, sizeof junk));
+    static const char* const qs[] = {
+        "(select {a: x from: T where: (> y 1)})",
+        "(select {a: x b: y from: T where: (> y 1)})",
+        "(select {a: x b: 1 from: T where: (> y 1)})",
+        "(select {a: x b: (+ y 1) from: T where: (> y 1)})",
+    };
+    for (size_t i = 0; i < sizeof qs / sizeof qs[0]; i++) {
+        ST_Q_OK("(set T (.db.parted.get \"" ST_TMP "/pc\" 't))");
+        ray_t* r = ray_eval_str(ray_test_tmp(qs[i]));
+        TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "%s: no error", qs[i]);
+        TEST_ASSERT_FMT(strcmp(ray_err_code(r), "corrupt") == 0, "%s: code %s", qs[i], ray_err_code(r));
+        const char* m = ray_error_msg() ? ray_error_msg() : "";
+        TEST_ASSERT_FMT(strstr(m, "rows") == NULL && strstr(m, "/pc/2024.01.02/t/x") != NULL, "%s: %s", qs[i], m);
+        ray_error_free(r);
+    }
+    PASS();
+}
+
 /* Task 1's carry: the validator leaves entry distinctness to the reader.
  * A region whose entry 2 repeats entry 1 passes ray_enc_dict_validate and
  * fails the entry tier (the hash build), so no lookup, range read or
@@ -3223,5 +3254,6 @@ const test_entry_t encstr_entries[] = {
     { "encstr/idict_filter_parted", test_idict_filter_parted, st_q_setup, st_q_teardown },
     { "encstr/idict_filter_forged", test_idict_filter_forged, st_q_setup, st_q_teardown },
     { "encstr/idict_filter_parted_mixed", test_idict_filter_parted_mixed, st_q_setup, st_q_teardown },
+    { "encstr/parted_projection_corrupt", test_parted_projection_corrupt, st_q_setup, st_q_teardown },
     { NULL, NULL, NULL, NULL },
 };

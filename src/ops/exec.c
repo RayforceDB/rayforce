@@ -1305,7 +1305,7 @@ ray_t* ray_in_vec_exec(ray_t* col, ray_t* set, bool negate) {
 
 static ray_t* flatten_parted_col(ray_t* col, ray_t* tbl);
 static ray_t* flatten_parted_table(ray_t* tbl, ray_t* counts_src);
-static int64_t parted_table_rows(ray_t* tbl, ray_t* counts_src);
+static int64_t parted_table_rows(ray_t* tbl, ray_t* counts_src, ray_t** err_out);
 static ray_t* parted_result_validate(ray_t* tbl, ray_t* counts_src);
 
 /* Debug builds check that a parted column flattened out of a table has the
@@ -5377,14 +5377,18 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     ray_release(input);
                     return shape_err;
                 }
-                if (g->selection && parted_table_rows(result, input) != nr_in) {
-                    ray_t* err = ray_error("length",
-                        "select: collection projection has %lld rows; where requires %lld input-aligned rows",
-                        (long long)parted_table_rows(result, input), (long long)nr_in);
-                    ray_release(result);
-                    g->table = saved_table;
-                    ray_release(input);
-                    return err;
+                if (g->selection) {
+                    ray_t* rows_err = NULL;
+                    int64_t proj_rows = parted_table_rows(result, input, &rows_err);
+                    if (rows_err || proj_rows != nr_in) {
+                        ray_t* err = rows_err ? rows_err : ray_error("length",
+                            "select: collection projection has %lld rows; where requires %lld input-aligned rows",
+                            (long long)proj_rows, (long long)nr_in);
+                        ray_release(result);
+                        g->table = saved_table;
+                        ray_release(input);
+                        return err;
+                    }
                 }
             }
 
@@ -6096,7 +6100,7 @@ static ray_t* parted_result_validate(ray_t* tbl, ray_t* counts_src) {
 
 /* Rows of a table whose first column may be a parted column with missing
  * segments: counted through the partition counts. */
-static int64_t parted_table_rows(ray_t* tbl, ray_t* counts_src) {
+static int64_t parted_table_rows(ray_t* tbl, ray_t* counts_src, ray_t** err_out) {
     ray_col_meta_t m;
     if (ray_table_ncols(tbl) <= 0 || !ray_table_col_meta_idx(tbl, 0, &m) || !RAY_IS_PARTED(m.type))
         return ray_table_nrows(tbl);
@@ -6104,7 +6108,7 @@ static int64_t parted_table_rows(ray_t* tbl, ray_t* counts_src) {
     const int64_t* cnt = parted_table_counts(parted_counts_table(tbl, counts_src), &ncnt);
     ray_t* err = NULL;
     int64_t n = parted_col_rows(tbl, 0, cnt, ncnt, &err);
-    if (err) { ray_error_free(err); return -1; }   /* no row count: the caller's check fails */
+    if (err) { *err_out = err; return -1; }   /* the column's own load error, owned by the caller */
     return n;
 }
 
