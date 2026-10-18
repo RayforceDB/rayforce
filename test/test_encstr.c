@@ -2697,6 +2697,14 @@ static test_result_t test_idict_filter(void) {
         ray_t* want = st_ans("(set T M)", mq[i]);
         TEST_ASSERT_FMT(want != NULL, "%s in memory: %s", mq[i], st_msg);
         st_hold(want);
+        ray_t* want0 = st_ans("(set T (.db.splayed.get \"" ST_TMP "/fe0/\"))", mq[i]);
+        TEST_ASSERT_FMT(want0 != NULL, "%s gen 0: %s", mq[i], st_msg);
+        st_hold(want0);
+        TEST_ASSERT_FMT(ray_str_len(want) == ray_str_len(want0) &&
+                        memcmp(ray_str_ptr(want), ray_str_ptr(want0), ray_str_len(want)) == 0,
+                        "%s: in memory %.*s vs gen 0 %.*s", mq[i], (int)ray_str_len(want), ray_str_ptr(want),
+                        (int)ray_str_len(want0), ray_str_ptr(want0));
+        st_unhold(want0, NULL); ray_release(want0);
         ST_Q_OK(ST_FD_LOAD2);
         ST_Q_OK("(set Z (at T 's))");
         TEST_ASSERT_TRUE(st_col_mat("s"));
@@ -2709,7 +2717,7 @@ static test_result_t test_idict_filter(void) {
         TEST_ASSERT_FMT(ray_exec_test_str_sel(0) - s0 == want_sel, "%s: the materialized DICT column declined", mq[i]);
         TEST_ASSERT_FMT(ray_str_len(want) == ray_str_len(got) &&
                         memcmp(ray_str_ptr(want), ray_str_ptr(got), ray_str_len(want)) == 0,
-                        "%s: in memory %.*s vs materialized %.*s", mq[i], (int)ray_str_len(want), ray_str_ptr(want),
+                        "%s: in memory and gen 0 %.*s vs materialized %.*s", mq[i], (int)ray_str_len(want), ray_str_ptr(want),
                         (int)ray_str_len(got), ray_str_ptr(got));
         st_unhold(got, NULL); ray_release(got);
         st_unhold(want, NULL); ray_release(want);
@@ -2771,13 +2779,64 @@ static test_result_t test_idict_filter_parted(void) {
     PASS();
 }
 
+/* Parted beside other segment kinds (review Minor 4): two DICT segments
+ * with conflicting codes, a generation-0 partition in the encoded store and
+ * a ragged partition without s (a synthetic all-null segment): the answers
+ * of the all-generation-0 store and of the in-memory concatenation (the
+ * ragged rows as ""). */
+#define ST_FPM_LOAD2 "(set T (.db.parted.get \"" ST_TMP "/fpm2\" 't))"
+static test_result_t test_idict_filter_parted_mixed(void) {
+    ST_Q_OK("(set P0 (table [v s] (list (til 70000) (as 'STR (map (fn [j] (if (== 7 (% j 50)) \"\" (format \"k%\" (% j 50)))) (til 70000))))))");
+    ST_Q_OK("(set P1 (table [v s] (list (til 3000) (as 'STR (map (fn [j] (if (== 0 (% j 7)) \"\" (format \"g%\" (% j 41)))) (til 3000))))))");
+    ST_Q_OK("(set P2 (table [v] (list (til 2000))))");
+    ST_Q_OK("(set P2M (table [v s] (list (til 2000) (as 'STR (map (fn [j] \"\") (til 2000))))))");
+    ST_Q_OK("(set P3 (table [v s] (list (til 70000) (as 'STR (map (fn [j] (if (== 20 (% j 50)) \"\" (format \"k%\" (- 49 (% j 50))))) (til 70000))))))");
+    ST_Q_OK("(set M (concat P0 (concat P1 (concat P2M P3))))");
+    for (int g = 0; g <= 2; g += 2)
+        for (int p = 0; p < 4; p++) {
+            char q[512];
+            /* partition 2 stays generation 0 in the encoded store */
+            const bool enc = g == 2 && p != 1;
+            snprintf(q, sizeof q, "(.db.splayed.set \"" ST_TMP "/fpm%d/2024.01.0%d/t/\" P%d {compress: %s})",
+                     g, p + 1, p, enc ? "true" : "false");
+            ST_Q_OK(q);
+        }
+    char p[600];
+    TEST_ASSERT_TRUE(st_live("/fpm2/2024.01.01/t", "s", p, sizeof p)); TEST_ASSERT_EQ_I(st_hdr(p).index_kind, RAY_IDX_DICT);
+    TEST_ASSERT_TRUE(st_live("/fpm2/2024.01.04/t", "s", p, sizeof p)); TEST_ASSERT_EQ_I(st_hdr(p).index_kind, RAY_IDX_DICT);
+    static const char* const qs[] = {
+        "(count (select {from: T where: (== s \"k3\")}))",
+        "(count (select {from: T where: (!= s \"k3\")}))",
+        "(count (select {from: T where: (== s \"g5\")}))",             /* the generation-0 partition only */
+        "(count (select {from: T where: (!= s \"g5\")}))",
+        "(count (select {from: T where: (== s \"\")}))",               /* the ragged rows included */
+        "(count (select {from: T where: (!= s \"\")}))",
+        "(count (select {from: T where: (== s \"absent\")}))",
+        "(count (select {from: T where: (!= s \"absent\")}))",
+        "(sum (at (select {from: T where: (== s \"k3\")}) 'v))",
+        "(count (select {from: T where: (and (> v 1000) (== s \"\"))}))",
+        "(count (select {from: T where: (and (== v 7) (!= s \"k3\"))}))",
+    };
+    for (size_t i = 0; i < sizeof qs / sizeof qs[0]; i++) {
+        st_fk_t k = { 0 };
+        ST_SAME_P("fpm", qs[i], &k);
+        TEST_ASSERT_FMT(k.mat == 0, "%s: materialized %llu", qs[i], (unsigned long long)k.mat);
+        TEST_ASSERT_FMT(k.sel + k.refine == 1, "%s: no STR selection", qs[i]);
+        ST_SAME_MEM(ST_FPM_LOAD2, qs[i]);
+    }
+    PASS();
+}
+
 /* An out-of-range code in the rows a filter reads: corrupt naming the
  * file, in the STR selection and in a top-k predicate; rows the filter
  * skips are not read.  STR `in` on a DICT column: nyi in both
  * generations (ruling Q1). */
+#define ST_FF_TABLE "(table [s v w] (list (as 'STR (map (fn [j] (format \"value % of the domain\" (% (* j 7919) 300))) (til 70000))) (til 70000) " \
+    "(as 'U8 (map (fn [j] (if (< j 1000) 1 0)) (til 70000)))))"
+#define ST_FF_LOAD2 "(set T (.db.splayed.get \"" ST_TMP "/ff2/\"))"
 static test_result_t test_idict_filter_forged(void) {
-    ST_SAVE2("ff", "(table [s v w] (list (as 'STR (map (fn [j] (format \"value % of the domain\" (% (* j 7919) 300))) (til 70000))) (til 70000) "
-             "(as 'U8 (map (fn [j] (if (< j 1000) 1 0)) (til 70000)))))");
+    ST_SAVE2("ff", ST_FF_TABLE);
+    ST_Q_OK_N("(set M " ST_FF_TABLE ")");
     ST_Q_OK("(set T (.db.splayed.get \"" ST_TMP "/ff0/\"))");
     ray_t* r0 = ray_eval_str(ray_test_tmp("(select {from: T where: (in s [\"a\" \"b\"])})"));
     TEST_ASSERT_TRUE(r0 && RAY_IS_ERR(r0) && strcmp(ray_err_code(r0), "nyi") == 0); ray_error_free(r0);
@@ -2788,15 +2847,41 @@ static test_result_t test_idict_filter_forged(void) {
     ray_enc_hdr_t eh = st_hdr(p);
     TEST_ASSERT_EQ_I(eh.index_kind, RAY_IDX_DICT);
     ray_enc_idx_dict_t dd; ST_READ(p, eh.index_off + 16, &dd, sizeof dd);
+    /* a table whose s is materialized before the forgery: its heap copy
+     * holds the true strings, so only a read of the DICT codes can fail */
+    ST_Q_OK("(set TM (.db.splayed.get \"" ST_TMP "/ff2/\"))");
+    ST_Q_OK("(set Z (at TM 's))");
     int32_t big = 300;
     ST_PATCH(p, eh.index_off + dd.codes + 60000 * 4, &big, 4);
     /* the file, exactly as the load spells it (see idict_groupby_forged) */
     char want[700];
     snprintf(want, sizeof want, "%s/s: DICT code 300 at row 60000 outside 0 .. 299", ray_test_tmp(ST_TMP "/ff2/"));
-    /* "" is absent from this column: its constant reads no code at all */
-    ST_Q_OK("(set T (.db.splayed.get \"" ST_TMP "/ff2/\"))");
-    ST_Q_OK("(count (select {from: T where: (!= s \"\")}))");
-    ST_Q_OK("(select {v: v from: T where: (!= s \"\") asc: v take: 10})");
+    /* the materialized column's selection and top-k child read the codes
+     * (the route, not the heap copy's bytes: those would answer) */
+    ST_Q_OK("(set T TM)");
+    TEST_ASSERT_TRUE(st_col_mat("s"));
+    static const char* const badm[] = {
+        "(count (select {from: T where: (!= s \"value 5 of the domain\")}))",
+        "(select {v: v from: T where: (and (< v 60001) (!= s \"value 5 of the domain\")) desc: v take: 10})",
+    };
+    for (size_t i = 0; i < sizeof badm / sizeof badm[0]; i++) {
+        TEST_ASSERT_FMT(!st_q_run(badm[i]), "%s materialized: an answer", badm[i]);
+        TEST_ASSERT_FMT(strstr(st_msg, want) != NULL, "%s: %s (want %s)", badm[i], st_msg, want);
+    }
+    ST_Q_OK("(set Z 0)"); ST_Q_OK("(set TM 0)");
+    /* "" is absent from this column: its constant reads no code at all,
+     * and the forged file answers as generation 0 and the in-memory table */
+    static const char* const okq[] = {
+        "(count (select {from: T where: (!= s \"\")}))",
+        "(count (select {from: T where: (== s \"\")}))",
+        "(select {v: v from: T where: (!= s \"\") asc: v take: 10})",
+    };
+    for (size_t i = 0; i < sizeof okq / sizeof okq[0]; i++) {
+        ST_SAME("ff", okq[i], NULL);
+        ST_SAME_MEM(ST_FF_LOAD2, okq[i]);
+    }
+    ST_Q_OK(ST_FF_LOAD2);
+    ST_Q_TRUE("(== 70000 (count (select {from: T where: (!= s \"\")})))");
     static const char* const bad[] = {
         "(count (select {from: T where: (!= s \"value 5 of the domain\")}))",
         "(count (select {from: T where: (== s \"value 5 of the domain\")}))",
@@ -2810,10 +2895,16 @@ static test_result_t test_idict_filter_forged(void) {
     }
     /* a conjunct that drops row 60000's morsel first never reads it: the
      * U8 equality ranks before the STR one, which refines */
-    ST_Q_OK("(set T (.db.splayed.get \"" ST_TMP "/ff2/\"))");
+    static const char* const rq = "(count (select {v: v from: T where: (and (== w 1) (!= s \"value 5 of the domain\"))}))";
+    ST_Q_OK(ST_FF_LOAD2);
     const uint64_t r0n = ray_exec_test_str_sel(1);
-    ST_Q_OK("(count (select {v: v from: T where: (and (== w 1) (!= s \"value 5 of the domain\"))}))");
+    ST_Q_OK(rq);
     TEST_ASSERT_EQ_U(ray_exec_test_str_sel(1) - r0n, 1);
+    ST_SAME("ff", rq, NULL);
+    ST_SAME_MEM(ST_FF_LOAD2, rq);
+    /* rows j < 1000 whose value is 5: j = 295, 595, 895 (j * 7919 = 5 mod 300) */
+    ST_Q_OK(ST_FF_LOAD2);
+    ST_Q_TRUE("(== 997 (count (select {v: v from: T where: (and (== w 1) (!= s \"value 5 of the domain\"))})))");
     /* the brief's (< v 1000): the optimizer ranks the STR conjunct first
      * (as P6 Task 5 found), so it reads every row's code and fails */
     ST_Q_OK("(set T (.db.splayed.get \"" ST_TMP "/ff2/\"))");
@@ -3114,5 +3205,6 @@ const test_entry_t encstr_entries[] = {
     { "encstr/idict_filter",        test_idict_filter,        st_q_setup, st_q_teardown },
     { "encstr/idict_filter_parted", test_idict_filter_parted, st_q_setup, st_q_teardown },
     { "encstr/idict_filter_forged", test_idict_filter_forged, st_q_setup, st_q_teardown },
+    { "encstr/idict_filter_parted_mixed", test_idict_filter_parted_mixed, st_q_setup, st_q_teardown },
     { NULL, NULL, NULL, NULL },
 };

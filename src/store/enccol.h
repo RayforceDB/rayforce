@@ -504,6 +504,9 @@ typedef struct {
     const int32_t*         first_occ;   /* n_distinct */
     const ray_enc_sdict_t* ent;         /* ent->n == n_distinct */
 } ray_enc_idict_t;
+/* The column records a persisted DICT (P6b): a single file, not synthetic,
+ * its header naming kind 7.  The one gate of every DICT reader. */
+bool ray_enccol_has_idict(const ray_enccol_t* e);
 /* The column's persisted DICT past the entry tier (*out NULL: the column
  * records none, or is parted / synthetic), or an owned error (once). */
 ray_t* ray_enccol_idict(ray_enccol_t* e, const ray_enc_idict_t** out);

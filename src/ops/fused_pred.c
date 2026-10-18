@@ -1065,10 +1065,12 @@ static int fp_compile_cmp(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
          * materialized or not: its codes, read from the mapping by range
          * (fp_bind_view); "" is an entry, so the null rows compare exactly */
         ray_enccol_t* de = (src->obj && src->obj->type == RAY_ENCCOL) ? ray_enccol_of(src->obj) : NULL;
-        if (de && de->kind == RAY_ENCCOL_SINGLE && !de->synthetic && de->hdr.index_kind == RAY_IDX_DICT) {
-            int64_t dc = -2;
+        int64_t dc = -2;
+        if (ray_enccol_has_idict(de)) {
             ray_t* ce = ray_enccol_idict_code(de, ray_str_ptr(cv_str), ray_str_len(cv_str), &dc);
             if (ce) { *err = ce; return -1; }
+        }
+        if (dc >= -1) {                    /* -2: no DICT after all, the typed leg below */
             out->col_type = RAY_I32; out->col_attrs = 0; out->col_esz = 4;
             out->col_base = NULL; out->col_obj = NULL; out->col_len = src->len;
             out->typed_compare = 0;

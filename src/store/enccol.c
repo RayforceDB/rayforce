@@ -827,9 +827,13 @@ static const enc_idict_blob_t* enc_idict_ready(const ray_enccol_t* e) {
     return (const enc_idict_blob_t*)ray_data(e->idict);
 }
 
+bool ray_enccol_has_idict(const ray_enccol_t* e) {
+    return e && e->kind == RAY_ENCCOL_SINGLE && !e->synthetic && e->hdr.index_kind == RAY_IDX_DICT;
+}
+
 static ray_t* enc_idict_get(ray_enccol_t* e, const enc_idict_blob_t** out) {
     *out = NULL;
-    if (!e || e->kind != RAY_ENCCOL_SINGLE || e->synthetic || e->hdr.index_kind != RAY_IDX_DICT) return NULL;
+    if (!ray_enccol_has_idict(e)) return NULL;
     if ((*out = enc_idict_ready(e)) != NULL) return NULL;
     ray_t* b = ray_enc_once_get(&e->idict_once, &e->idict, enc_idict_validate, e);
     if (RAY_IS_ERR(b)) return b;

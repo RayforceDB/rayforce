@@ -1588,7 +1588,7 @@ typedef struct {
     ray_enccol_t*  e;          /* single-file encoded, not materialized: codes and bounds; else NULL */
     int64_t        code;       /* the constant's code in e's entry: >= 0, -1 absent, -2 no entry */
     ray_enccol_t*  de;         /* single-file encoded with a persisted DICT (materialized or not); else NULL */
-    int64_t        dcode;      /* the constant's DICT code: >= 0, -1 absent */
+    int64_t        dcode;      /* the constant's DICT code: >= 0, -1 absent (-2, no DICT: de stays NULL) */
     bool           bound;
 } str_seg_sel_t;
 
@@ -1743,7 +1743,7 @@ static ray_enccol_t* str_sel_codes_col(ray_t* o) {
 static ray_enccol_t* str_sel_dict_col(ray_t* o) {
     if (!o || o->type != RAY_ENCCOL) return NULL;
     ray_enccol_t* e = ray_enccol_of(o);
-    return e && e->kind == RAY_ENCCOL_SINGLE && !e->synthetic && e->hdr.index_kind == RAY_IDX_DICT ? e : NULL;
+    return ray_enccol_has_idict(e) ? e : NULL;
 }
 
 static ray_t* str_sel_run(ray_graph_t* g, ray_op_t* pred, int64_t nrows, ray_t* within, bool* all_pass) {
@@ -1790,9 +1790,10 @@ static ray_t* str_sel_run(ray_graph_t* g, ray_op_t* pred, int64_t nrows, ray_t* 
 
     if (!parted) {
         ray_enccol_t* de = str_sel_dict_col(src->obj);
-        if (de) {
-            one = (str_seg_sel_t){ .rs = src, .de = de, .code = -2 };
-            if ((ret = ray_enccol_idict_code(de, x.cs, x.clen, &one.dcode)) != NULL) goto out;
+        int64_t dc = -2;
+        if (de && (ret = ray_enccol_idict_code(de, x.cs, x.clen, &dc)) != NULL) goto out;
+        if (dc >= -1) {                            /* -2: no DICT after all, the route below */
+            one = (str_seg_sel_t){ .rs = src, .de = de, .code = -2, .dcode = dc };
         } else {
             ray_enccol_t* e = str_sel_codes_col(src->obj);
             if (!e) goto decline;                  /* materialized: read in place on its path */
@@ -1817,9 +1818,11 @@ static ray_t* str_sel_run(ray_graph_t* g, ray_op_t* pred, int64_t nrows, ray_t* 
             if (s->src.parted || s->src.type != RAY_STR || s->src.len != off[i + 1] - off[i]) goto decline;
             s->rs = &s->src;
             s->code = -2;
-            s->de = str_sel_dict_col(segv[i]);
-            if (s->de) {
-                if ((ret = ray_enccol_idict_code(s->de, x.cs, x.clen, &s->dcode)) != NULL) goto out;
+            ray_enccol_t* de = str_sel_dict_col(segv[i]);
+            int64_t dc = -2;
+            if (de && (ret = ray_enccol_idict_code(de, x.cs, x.clen, &dc)) != NULL) goto out;
+            if (dc >= -1) {                        /* -2: no DICT after all, the route below */
+                s->de = de; s->dcode = dc;
                 any_codes = true;
                 continue;
             }

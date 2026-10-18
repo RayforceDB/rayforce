@@ -89,7 +89,8 @@ typedef struct {
     uint8_t      like_empty_match;
     struct ray_sym_domain_s* like_dom;
     /* The bound source (borrowed from the graph).  enc: a generation-2
-     * single-file column without a published materialization; col_base
+     * single-file column without a published materialization, or an
+     * idict child (materialized or not); col_base
      * and col_obj are NULL at compile and a view is bound per morsel
      * (fp_eval_pred_rs).  col_pool: STR, the base of the pooled ray_str_t
      * offsets col_base's descriptors point into. */
