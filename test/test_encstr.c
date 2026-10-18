@@ -1521,7 +1521,7 @@ static test_result_t test_filter_parted(void) {
     for (int gen = 0; gen <= 2; gen += 2)
         for (int p = 0; p < 4; p++) {
             char q[1200];
-            /* partition 2 stays generation 0 in the encoded store */
+            /* the second partition (p == 1, 2024.01.02) stays generation 0 in the encoded store */
             const bool enc = gen == 2 && p != 1;
             snprintf(q, sizeof q, "(.db.splayed.set \"" ST_TMP "/fp%d/2024.01.0%d/t/\" %s {compress: %s})",
                      gen, p + 1, parts[p], enc ? "true" : "false");
@@ -2102,8 +2102,13 @@ static test_result_t test_stream_equals_resident(void) {
         fclose(f);
         snprintf(q, sizeof q, "(.csv.splayed {compress: true} [STR I64] \"%s\" \"" ST_TMP "%s/\")", csv, cs);
         ST_Q_OK(q);
+        ray_enc_counters_reset();
         snprintf(q, sizeof q, "(.db.splayed.set \"" ST_TMP "%s/\" (.db.splayed.get \"" ST_TMP "%s/\") {compress: true})", rs, cs);
         ST_Q_OK(q);
+        ray_enc_counters_t kc; ray_enc_counters_get(&kc);
+        /* the encoded source is re-encoded by range reads: nothing materialized */
+        TEST_ASSERT_FMT(kc.materialized == 0, "order %d: the resave materialized %llu columns", o,
+                        (unsigned long long)kc.materialized);
         ray_t* v = st_hold(ray_vec_new(RAY_STR, 140000));
         for (int64_t i = 0; i < 140000; i++) {
             const char* sv = se_row(o, i, b);
@@ -2795,7 +2800,7 @@ static test_result_t test_idict_filter_parted_mixed(void) {
     for (int g = 0; g <= 2; g += 2)
         for (int p = 0; p < 4; p++) {
             char q[512];
-            /* partition 2 stays generation 0 in the encoded store */
+            /* the second partition (p == 1, 2024.01.02) stays generation 0 in the encoded store */
             const bool enc = g == 2 && p != 1;
             snprintf(q, sizeof q, "(.db.splayed.set \"" ST_TMP "/fpm%d/2024.01.0%d/t/\" P%d {compress: %s})",
                      g, p + 1, p, enc ? "true" : "false");

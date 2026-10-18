@@ -182,6 +182,9 @@ static test_result_t test_str_dict_pool_limit(void) {
     ray_t* c = ray_col_mmap(ray_test_tmp(LG_TMP "/sd"));
     TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
     TEST_ASSERT_EQ_U(ray_enccol_of(c)->hdr.str_pool_bytes, 2u * 65535u);
+    const ray_enc_sdict_t* sd = NULL;
+    TEST_ASSERT_NULL(ray_enccol_strdict(ray_enccol_of(c), &sd));
+    TEST_ASSERT_TRUE(sd != NULL && sd->n == 2);                 /* the dictionary region holds two entries */
     ray_t* m = ray_enccol_materialize(c);           /* borrowed: the column's cache */
     TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m) && m->len == n);
     TEST_ASSERT_EQ_I(m->str_pool->len, 2 * 65535);
@@ -191,9 +194,9 @@ static test_result_t test_str_dict_pool_limit(void) {
     TEST_ASSERT_TRUE(l == 65535 && p[0] == 'a' && p[65534] == 'a');
     ray_release(c);
     (void)remove(ray_test_tmp(LG_TMP "/sd"));
-    /* one byte more, forced STR_DICT: shared_str's 65535 descriptors of
-     * 65537 bytes and a last of 65538 (two distinct entries' worth of
-     * pool, UINT32_MAX + 1 per occurrence) */
+    /* one byte more, forced STR_DICT: shared_str's 65534 descriptors of
+     * 65537 bytes and a last of 65538 (one pooled range shared by all, so
+     * the decoded pool is UINT32_MAX + 1 bytes per occurrence) */
     v = shared_str(65538);
     TEST_ASSERT_TRUE(v && !RAY_IS_ERR(v));
     ray_encw_test_force(RAY_ENC_STR_DICT);
