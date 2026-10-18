@@ -30,6 +30,7 @@
 #include <stdio.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include "core/pool.h"
 
 /* Forward declaration */
 static void csr_free(ray_csr_t* csr);
@@ -125,11 +126,211 @@ insertion:
  *
  * The lists come out sorted by (target, row), the one order a build from
  * these edges has ever had, so `sort_targets` only records that fact. */
+/* Parallel two-level build.  Keys are first partitioned into B contiguous
+ * node-range buckets (B ~ CSR_PAR_BUCKETS, each a power-of-two range of
+ * nodes), then every bucket is counting-sorted on its own.  Each task has
+ * a private histogram row, so no pass touches a shared counter; the only
+ * cross-task step is the serial prefix scan over T*B entries.
+ *
+ * Scratch is (key, val) as int32 when n_nodes fits (the usual case; the
+ * scatter is memory-bound and this cuts its traffic by a third) plus the
+ * int64 row, so 16 bytes per edge; 24 with int64 keys. */
+int64_t ray_csr_par_min_edges = 1 << 20;   /* below this the serial build wins; tests lower it */
+#define CSR_PAR_MAX_TASKS  8           /* memory-bound: 4-8 tasks is the knee on a 32-thread box */
+#define CSR_PAR_BUCKETS    256
+
+typedef struct {
+    const int64_t* keys;      /* NULL: key = row index */
+    const int64_t* vals;
+    int64_t   n_edges, n_nodes;
+    int       T, B, shift;
+    bool      narrow;         /* int32 scratch */
+    int64_t*  hist;           /* [T * B]: counts, then cursors */
+    int64_t*  bstart;         /* [B + 1]: bucket edge ranges in scratch */
+    void*     skeys; void* svals;   /* int32 or int64, n_edges each */
+    int64_t*  srow;           /* n_edges */
+    int64_t*  off;  int64_t* tgt;  int64_t* rmap;   /* final CSR arrays */
+    int64_t*  pos;            /* [n_nodes] cursors (per-bucket private) */
+} csr_par_t;
+
+static inline int64_t csr_par_key(const csr_par_t* c, int64_t i) {
+    return c->keys ? c->keys[i] : i;
+}
+
+static void csr_par_task_range(const csr_par_t* c, uint32_t t,
+                               int64_t* lo, int64_t* hi) {
+    *lo = c->n_edges * (int64_t)t / c->T;
+    *hi = c->n_edges * (int64_t)(t + 1) / c->T;
+}
+
+/* Phase 1: per-task bucket histogram. */
+static void csr_par_hist_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid; (void)end;
+    csr_par_t* c = (csr_par_t*)ctx;
+    uint32_t t = (uint32_t)start;
+    int64_t lo, hi; csr_par_task_range(c, t, &lo, &hi);
+    int64_t* h = c->hist + (size_t)t * c->B;
+    for (int64_t i = lo; i < hi; i++) {
+        int64_t k = csr_par_key(c, i);
+        if (k >= 0 && k < c->n_nodes) h[k >> c->shift]++;
+    }
+}
+
+/* Phase 2: per-task scatter into bucket-ordered scratch. */
+static void csr_par_scatter_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid; (void)end;
+    csr_par_t* c = (csr_par_t*)ctx;
+    uint32_t t = (uint32_t)start;
+    int64_t lo, hi; csr_par_task_range(c, t, &lo, &hi);
+    int64_t* cur = c->hist + (size_t)t * c->B;
+    if (c->narrow) {
+        int32_t* sk = (int32_t*)c->skeys; int32_t* sv = (int32_t*)c->svals;
+        for (int64_t i = lo; i < hi; i++) {
+            int64_t k = csr_par_key(c, i);
+            if (k < 0 || k >= c->n_nodes) continue;
+            int64_t p = cur[k >> c->shift]++;
+            sk[p] = (int32_t)k; sv[p] = (int32_t)c->vals[i]; c->srow[p] = i;
+        }
+    } else {
+        int64_t* sk = (int64_t*)c->skeys; int64_t* sv = (int64_t*)c->svals;
+        for (int64_t i = lo; i < hi; i++) {
+            int64_t k = csr_par_key(c, i);
+            if (k < 0 || k >= c->n_nodes) continue;
+            int64_t p = cur[k >> c->shift]++;
+            sk[p] = k; sv[p] = c->vals[i]; c->srow[p] = i;
+        }
+    }
+}
+
+/* Phase 3: one task per bucket — counting sort of that bucket's node
+ * range.  off[v] for v in the range and the bucket's edge span of tgt/rmap
+ * are written by this task only. */
+static void csr_par_bucket_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid; (void)end;
+    csr_par_t* c = (csr_par_t*)ctx;
+    int b = (int)start;
+    int64_t nlo = (int64_t)b << c->shift, nhi = (int64_t)(b + 1) << c->shift;
+    if (nhi > c->n_nodes) nhi = c->n_nodes;
+    if (nlo >= nhi) return;
+    int64_t elo = c->bstart[b], ehi = c->bstart[b + 1];
+    for (int64_t v = nlo; v < nhi; v++) c->pos[v] = 0;
+    if (c->narrow) {
+        const int32_t* sk = (const int32_t*)c->skeys;
+        for (int64_t i = elo; i < ehi; i++) c->pos[sk[i]]++;
+    } else {
+        const int64_t* sk = (const int64_t*)c->skeys;
+        for (int64_t i = elo; i < ehi; i++) c->pos[sk[i]]++;
+    }
+    int64_t run = elo;
+    for (int64_t v = nlo; v < nhi; v++) {
+        int64_t d = c->pos[v]; c->off[v] = run; c->pos[v] = run; run += d;
+    }
+    if (c->narrow) {
+        const int32_t* sk = (const int32_t*)c->skeys;
+        const int32_t* sv = (const int32_t*)c->svals;
+        for (int64_t i = elo; i < ehi; i++) {
+            int64_t p = c->pos[sk[i]]++;
+            c->tgt[p] = sv[i]; c->rmap[p] = c->srow[i];
+        }
+    } else {
+        const int64_t* sk = (const int64_t*)c->skeys;
+        const int64_t* sv = (const int64_t*)c->svals;
+        for (int64_t i = elo; i < ehi; i++) {
+            int64_t p = c->pos[sk[i]]++;
+            c->tgt[p] = sv[i]; c->rmap[p] = c->srow[i];
+        }
+    }
+}
+
+/* Count valid edges and fill out->offsets/targets/rowmap in parallel.
+ * Returns false (nothing allocated into out) when the pool should not be
+ * used or scratch cannot be had; the caller then builds serially. */
+static bool csr_build_parallel(const int64_t* keys, const int64_t* vals,
+                               int64_t n_edges, int64_t n_nodes,
+                               ray_csr_t* out) {
+    ray_pool_t* pool = ray_pool_get();
+    if (!ray_pool_par_dispatch_ok(pool, n_edges, ray_csr_par_min_edges) ||
+        n_nodes < 2)
+        return false;
+    int T = (int)ray_pool_total_workers(pool);
+    if (T > CSR_PAR_MAX_TASKS) T = CSR_PAR_MAX_TASKS;
+    int shift = 0;
+    while (((n_nodes - 1) >> shift) >= CSR_PAR_BUCKETS) shift++;
+    int B = (int)(((n_nodes - 1) >> shift) + 1);
+    bool narrow = n_nodes <= INT32_MAX;
+    /* Values are stored unchecked (an out-of-range dst stays in fwd); the
+     * narrow scratch needs every value to fit as well. */
+    if (narrow) {
+        for (int64_t i = 0; i < n_edges; i++)
+            if (vals[i] < INT32_MIN || vals[i] > INT32_MAX) { narrow = false; break; }
+    }
+    size_t cell = narrow ? sizeof(int32_t) : sizeof(int64_t);
+
+    csr_par_t c = { .keys = keys, .vals = vals, .n_edges = n_edges,
+                    .n_nodes = n_nodes, .T = T, .B = B, .shift = shift,
+                    .narrow = narrow };
+    c.hist   = ray_calloc_raw((size_t)T * B * sizeof(int64_t));
+    c.bstart = ray_alloc_raw((size_t)(B + 1) * sizeof(int64_t));
+    c.skeys  = ray_alloc_raw((size_t)n_edges * cell);
+    c.svals  = ray_alloc_raw((size_t)n_edges * cell);
+    c.srow   = ray_alloc_raw((size_t)n_edges * sizeof(int64_t));
+    c.pos    = ray_alloc_raw((size_t)n_nodes * sizeof(int64_t));
+    bool ok = c.hist && c.bstart && c.skeys && c.svals && c.srow && c.pos;
+
+    if (ok) {
+        ray_pool_dispatch_n(pool, csr_par_hist_fn, &c, (uint32_t)T);
+        int64_t run = 0;
+        for (int b = 0; b < B; b++) {
+            c.bstart[b] = run;
+            for (int t = 0; t < T; t++) {
+                int64_t* h = c.hist + (size_t)t * B + b;
+                int64_t d = *h; *h = run; run += d;
+            }
+        }
+        c.bstart[B] = run;
+        int64_t valid_edges = run;
+        out->n_edges = valid_edges;
+
+        out->offsets = ray_vec_new(RAY_I64, n_nodes + 1);
+        out->targets = ray_vec_new(RAY_I64, valid_edges > 0 ? valid_edges : 1);
+        out->rowmap  = ray_vec_new(RAY_I64, valid_edges > 0 ? valid_edges : 1);
+        ok = out->offsets && !RAY_IS_ERR(out->offsets) &&
+             out->targets && !RAY_IS_ERR(out->targets) &&
+             out->rowmap  && !RAY_IS_ERR(out->rowmap);
+        if (ok) {
+            out->offsets->len = n_nodes + 1;
+            out->targets->len = valid_edges;
+            out->rowmap->len  = valid_edges;
+            c.off  = (int64_t*)ray_data(out->offsets);
+            c.tgt  = (int64_t*)ray_data(out->targets);
+            c.rmap = (int64_t*)ray_data(out->rowmap);
+            c.off[n_nodes] = valid_edges;
+            ray_pool_dispatch_n(pool, csr_par_scatter_fn, &c, (uint32_t)T);
+            ray_pool_dispatch_n(pool, csr_par_bucket_fn,  &c, (uint32_t)B);
+        } else {
+            if (out->offsets && !RAY_IS_ERR(out->offsets)) ray_release(out->offsets);
+            if (out->targets && !RAY_IS_ERR(out->targets)) ray_release(out->targets);
+            if (out->rowmap  && !RAY_IS_ERR(out->rowmap))  ray_release(out->rowmap);
+            out->offsets = out->targets = out->rowmap = NULL;
+        }
+    }
+    ray_free_raw(c.hist);  ray_free_raw(c.bstart);
+    ray_free_raw(c.skeys); ray_free_raw(c.svals);
+    ray_free_raw(c.srow);  ray_free_raw(c.pos);
+    return ok;
+}
+
 static ray_err_t csr_build_direct(const int64_t* keys, const int64_t* vals,
                                   int64_t n_edges, int64_t n_nodes,
                                   bool sort_targets, ray_csr_t* out) {
     out->n_nodes = n_nodes;
     out->props = NULL;
+
+    if (csr_build_parallel(keys, vals, n_edges, n_nodes, out)) {
+        csr_sort_adjacency_lists(out);
+        out->sorted = sort_targets;
+        return RAY_OK;
+    }
 
     /* Offsets (n_nodes + 1), zeroed: off[k + 1] accumulates the degree of k. */
     out->offsets = ray_vec_new(RAY_I64, n_nodes + 1);
@@ -137,7 +338,6 @@ static ray_err_t csr_build_direct(const int64_t* keys, const int64_t* vals,
     out->offsets->len = n_nodes + 1;
     int64_t* off = (int64_t*)ray_data(out->offsets);
     memset(off, 0, (size_t)(n_nodes + 1) * sizeof(int64_t));
-
     int64_t valid_edges = 0;
     for (int64_t i = 0; i < n_edges; i++) {
         int64_t key = keys ? keys[i] : i;

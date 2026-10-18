@@ -3669,6 +3669,93 @@ static test_result_t test_csr_tiebreak_determinism(void) {
 /* A hub whose list is long enough to leave the insertion sort behind must
  * come out in the same (target, row) order as a short list does, in both
  * directions, with out-of-range keys dropped and their rows skipped. */
+extern int64_t ray_csr_par_min_edges;
+
+/* The parallel two-level build must produce the same three arrays as the
+ * serial counting sort, byte for byte.  Build one graph both ways by moving
+ * the size threshold: 0 forces the parallel path (the harness runs with
+ * RAYFORCE_CORES=2, so the pool has a worker), INT64_MAX forces serial.
+ * The graph spans several key buckets, has a hub past the insertion-sort
+ * cut, parallel edges, out-of-range keys on both sides and, in one
+ * variant, a value past int32 so the int64 scratch branch runs. */
+static test_result_t csr_par_vs_serial(bool wide_value) {
+    enum { N_NODES = 3000, M = 20000 };
+    int64_t* s = ray_alloc_raw((size_t)(M + 6) * sizeof(int64_t));
+    int64_t* d = ray_alloc_raw((size_t)(M + 6) * sizeof(int64_t));
+    TEST_ASSERT(s && d, "scratch");
+    int64_t n = 0;
+    for (int64_t i = 0; i < M; i++) {
+        s[n] = (i * 7919) % N_NODES;
+        d[n] = (i * 104729) % N_NODES;
+        if (i % 97 == 0) s[n] = 5;          /* a hub */
+        n++;
+    }
+    s[n] = -1;      d[n] = 5;       n++;
+    s[n] = N_NODES; d[n] = 5;       n++;
+    s[n] = 2;       d[n] = -3;      n++;
+    s[n] = 2;       d[n] = N_NODES; n++;
+    s[n] = 7;       d[n] = 7;       n++;    /* self loop */
+    s[n] = 7;       d[n] = wide_value ? (INT64_C(1) << 40) : 9; n++;
+
+    ray_t* sv = ray_vec_from_raw(RAY_I64, s, n);
+    ray_t* dv = ray_vec_from_raw(RAY_I64, d, n);
+    ray_free_raw(s); ray_free_raw(d);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("src", 3), sv);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("dst", 3), dv);
+    ray_release(sv); ray_release(dv);
+
+    int64_t saved = ray_csr_par_min_edges;
+    ray_csr_par_min_edges = INT64_MAX;
+    ray_rel_t* a = ray_rel_from_edges(tbl, "src", "dst", N_NODES, N_NODES, true);
+    ray_csr_par_min_edges = 0;
+    ray_rel_t* b = ray_rel_from_edges(tbl, "src", "dst", N_NODES, N_NODES, true);
+    ray_csr_par_min_edges = saved;
+    ray_release(tbl);
+    TEST_ASSERT(a && b, "both builds succeed");
+
+    ray_csr_t* pa[2] = { &a->fwd, &a->rev };
+    ray_csr_t* pb[2] = { &b->fwd, &b->rev };
+    for (int k = 0; k < 2; k++) {
+        TEST_ASSERT(pa[k]->n_nodes == pb[k]->n_nodes, "n_nodes");
+        TEST_ASSERT(pa[k]->n_edges == pb[k]->n_edges, "n_edges");
+        /* fwd drops the two bad-src edges; rev drops the two bad-dst ones
+         * plus the wide target when it is out of [0, N_NODES). */
+        int64_t expect = k == 0 ? M + 6 - 2 : M + 6 - 2 - (wide_value ? 1 : 0);
+        TEST_ASSERT(pa[k]->n_edges == expect, "out-of-range keys dropped per side");
+        TEST_ASSERT(pa[k]->offsets->len == pb[k]->offsets->len, "offsets len");
+        TEST_ASSERT(memcmp(ray_data(pa[k]->offsets), ray_data(pb[k]->offsets),
+                           (size_t)pa[k]->offsets->len * sizeof(int64_t)) == 0,
+                    "offsets identical");
+        TEST_ASSERT(memcmp(ray_data(pa[k]->targets), ray_data(pb[k]->targets),
+                           (size_t)pa[k]->n_edges * sizeof(int64_t)) == 0,
+                    "targets identical");
+        TEST_ASSERT(memcmp(ray_data(pa[k]->rowmap), ray_data(pb[k]->rowmap),
+                           (size_t)pa[k]->n_edges * sizeof(int64_t)) == 0,
+                    "rowmap identical");
+    }
+    /* The wide value survived in fwd (values are stored unchecked). */
+    int64_t cnt = 0;
+    int64_t* nb = ray_csr_neighbors(&b->fwd, 7, &cnt);
+    TEST_ASSERT(cnt >= 2, "node 7 has its two explicit edges");
+    bool seen = false;
+    for (int64_t i = 0; i < cnt; i++)
+        if (nb[i] == (wide_value ? (INT64_C(1) << 40) : 9)) seen = true;
+    TEST_ASSERT(seen, "node 7's explicit target is present");
+
+    ray_rel_free(a);
+    ray_rel_free(b);
+    PASS();
+}
+
+static test_result_t test_csr_parallel_matches_serial(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+    test_result_t r = csr_par_vs_serial(false);
+    if (r.status != TEST_PASS) return r;
+    return csr_par_vs_serial(true);
+}
+
 static test_result_t test_csr_hub_order(void) {
     ray_heap_init();
     (void)ray_sym_init();
@@ -3756,6 +3843,7 @@ static test_result_t test_csr_hub_order(void) {
 const test_entry_t csr_entries[] = {
     { "csr/tiebreak_determinism", test_csr_tiebreak_determinism, NULL, NULL },
     { "csr/hub_order", test_csr_hub_order, NULL, NULL },
+    { "csr/parallel_matches_serial", test_csr_parallel_matches_serial, NULL, NULL },
     { "csr/build", test_csr_build, NULL, NULL },
     { "csr/sorted", test_csr_sorted, NULL, NULL },
     { "csr/expand", test_expand, NULL, NULL },
