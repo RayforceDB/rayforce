@@ -179,14 +179,17 @@ static const char* try_parse_time(const char* start, int32_t *ms_out) {
     if (!(c[0] >= '0' && c[0] <= '9' && c[1] >= '0' && c[1] <= '9')) return NULL;
     int ss = (c[0] - '0') * 10 + (c[1] - '0'); c += 2;
 
-    /* .mmm (milliseconds) */
+    /* .fff: a decimal fraction of a second, as in a timestamp literal and
+     * the CSV reader.  Fewer than three digits are padded (.5 is 500 ms);
+     * digits past the third are dropped. */
     int ms = 0;
     if (*c == '.') {
         c++;
         if (!(*c >= '0' && *c <= '9')) return NULL;
-        ms = (*c - '0'); c++;
-        if (*c >= '0' && *c <= '9') { ms = ms * 10 + (*c - '0'); c++; }
-        if (*c >= '0' && *c <= '9') { ms = ms * 10 + (*c - '0'); c++; }
+        int nd = 0;
+        for (; *c >= '0' && *c <= '9'; c++)
+            if (nd < 3) { ms = ms * 10 + (*c - '0'); nd++; }
+        for (; nd < 3; nd++) ms *= 10;
     }
 
     *ms_out = sign * (int32_t)((hh * 3600 + mm * 60 + ss) * 1000 + ms);

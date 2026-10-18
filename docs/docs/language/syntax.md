@@ -86,11 +86,12 @@ A time literal has two hour digits, `00`-`99`, and two digits each for
 minutes and seconds. Minutes and seconds past `59` carry into the next unit,
 the way a day past the end of its month does for dates, so `01:60:00.000`
 parses as `02:00:00.000`. A leading `-` makes the time negative
-(`-01:00:00.000`). The `.mmm` part is optional (`09:30:00` is
-`09:30:00.000`); write it with three digits, since a shorter fraction is
-currently read as a count of milliseconds (`09:30:00.5` is `09:30:00.005`),
-unlike a timestamp's. Times beyond `99:59:59.999` come from arithmetic or
-from `(as 'TIME <ms>)`: `(as 'TIME 2147483647)` is `596:31:23.647`.
+(`-01:00:00.000`). The fractional part is optional (`09:30:00` is
+`09:30:00.000`) and is a decimal fraction of a second: one to three digits are
+padded (`09:30:00.5` is `09:30:00.500`), and digits past the third are
+dropped. A timestamp literal, the string cast `(as 'time "...")` and the CSV
+reader read it the same way. Times beyond `99:59:59.999` come from arithmetic
+or from `(as 'TIME <ms>)`: `(as 'TIME 2147483647)` is `596:31:23.647`.
 
 ### Timestamps
 
