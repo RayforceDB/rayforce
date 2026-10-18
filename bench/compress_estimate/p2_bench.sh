@@ -22,15 +22,27 @@
 #   desc:) is compared sorted; a raw-only difference is reported as an order
 #   difference.  Variant b runs twice to separate nondeterminism from a diff.
 # Output: $W/p2.tsv ; the verdict is printed by p2_summary.py (never typed).
-# usage: p2_bench.sh prep | splayed | parted | all | verdict
+# usage: p2_bench.sh [-w WORKDIR] -s SCHEMA -q QUERIES prep | splayed | parted | all | verdict
 set -euo pipefail
-W=${W:-/home/hetoku/data/tmp/p2_bench}
-HERE=$(cd "$(dirname "$0")" && pwd)
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
+W=${W:-$REPO/build/p2_bench}
+SCHEMA=
+QUERIES=
+USAGE="usage: p2_bench.sh [-w WORKDIR] -s SCHEMA -q QUERIES <stage>\n  -w WORKDIR  scratch directory (default $REPO/build/p2_bench)\n  -s SCHEMA   the ClickBench rayforce schema.rfl\n  -q QUERIES  the ClickBench rayforce queries.rfl\n"
+while getopts "w:s:q:" o; do
+  case $o in
+    w) W=$OPTARG ;;
+    s) SCHEMA=$OPTARG ;;
+    q) QUERIES=$OPTARG ;;
+    *) printf "%b" "$USAGE" >&2; exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+[ -n "$SCHEMA" ] || { printf "%b" "$USAGE" >&2; exit 2; }
+[ -n "$QUERIES" ] || { printf "%b" "$USAGE" >&2; exit 2; }
 SRC=/skull/clickbench/rfsplayed
 CSV=/skull/clickbench/hits_h.csv
-SCHEMA=/home/hetoku/data/work/ClickBench/rayforce/schema.rfl
-QUERIES=/home/hetoku/data/work/ClickBench/rayforce/queries.rfl
 BASE=${BASE:-80a28e49}
 ROUNDS=${ROUNDS:-5}
 NQ=43

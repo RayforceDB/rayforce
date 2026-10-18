@@ -4,13 +4,13 @@
 #   usage: p1_size.sh [SRC] [OUT] [RAYFORCE]
 #   SRC       generation-0 splayed store (default /skull/clickbench/rfsplayed)
 #   OUT       directory for the compressed copy, removed first
-#             (default /home/hetoku/data/tmp/p1_size/hits)
+#             (default <repo>/build/p1_size/hits)
 #   RAYFORCE  release binary (default ./rayforce)
 set -euo pipefail
 SRC=${1:-/skull/clickbench/rfsplayed}
-OUT=${2:-/home/hetoku/data/tmp/p1_size/hits}
-BIN=${3:-./rayforce}
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+OUT=${2:-$HERE/../../build/p1_size/hits}
+BIN=${3:-./rayforce}
 rm -rf "$OUT"
 "$BIN" "$HERE/p1_size.rfl" -- --src "$SRC" --out "$OUT" >&2
 cur() { if [ -f "$1/.current" ]; then echo "$1/$(cat "$1/.current")"; else echo "$1"; fi; }

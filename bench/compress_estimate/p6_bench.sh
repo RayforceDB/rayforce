@@ -35,13 +35,23 @@
 #   parted: R2, the parted STR arm: p0 / p2 built from the derived table, ten
 #          1M-row partitions saved one by one, each store under the guard;
 #          a refusal is recorded as a `skip` row; warm / ident / mat on it
-# usage: p6_bench.sh prep | enc | mat | warm | cold | ident | wall | o5 | i8 | clean | savet | parted | all
+# usage: p6_bench.sh [-w WORKDIR] -q QUERIES prep | enc | mat | warm | cold | ident | wall | o5 | i8 | clean | savet | parted | all
 set -euo pipefail
-W=${W:-/home/hetoku/data/tmp/p6b/t8/bench}
-HERE=$(cd "$(dirname "$0")" && pwd)
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
+W=${W:-$REPO/build/p6_bench}
+QUERIES=
+USAGE="usage: p6_bench.sh [-w WORKDIR] -q QUERIES <stage>\n  -w WORKDIR  scratch directory (default $REPO/build/p6_bench)\n  -q QUERIES  the ClickBench rayforce queries.rfl\n"
+while getopts "w:q:" o; do
+  case $o in
+    w) W=$OPTARG ;;
+    q) QUERIES=$OPTARG ;;
+    *) printf "%b" "$USAGE" >&2; exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+[ -n "$QUERIES" ] || { printf "%b" "$USAGE" >&2; exit 2; }
 SRC=/skull/clickbench/rfsplayed
-QUERIES=/home/hetoku/data/work/ClickBench/rayforce/queries.rfl
 ROUNDS=${ROUNDS:-9}
 SAVES=${SAVES:-3}
 WALLS=${WALLS:-5}
@@ -327,5 +337,5 @@ parted)   # R2: one store at a time under the guard; a refusal skips the arm
   warm_run pm "$BIN" p0 p0 "$BIN" p2 p2 "$PROUNDS" "$(seq 1 $NQ)" parted
   rm -rf "$W/p0" "$W/p2"
   ;;
-all) for st in prep enc mat ident warm cold wall o5 i8 clean savet parted; do "$0" "$st"; done ;;
+all) for st in prep enc mat ident warm cold wall o5 i8 clean savet parted; do "$0" -w "$W" -q "$QUERIES" "$st"; done ;;
 esac

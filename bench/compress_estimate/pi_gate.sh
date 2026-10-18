@@ -16,13 +16,26 @@
 #                head and dev alternated (order swapped each round)
 # Stores are converted, measured and deleted one at a time (disk guard).
 # Output: $W/gate.tsv ; the verdict is printed by pi_gate.py (never typed).
-# usage: BIN_H=... BIN_D=... pi_gate.sh run|ident|all|verdict
+# usage: BIN_H=... BIN_D=... pi_gate.sh [-w WORKDIR] -s SCHEMA -q QUERIES run|ident|all|verdict
 set -euo pipefail
-W=${W:-/home/hetoku/data/tmp/pi_bench}
-HERE=$(cd "$(dirname "$0")" && pwd)
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO=$(cd "$HERE/../.." && pwd)
+W=${W:-$REPO/build/pi_bench}
+SCHEMA=
+QUERIES=
+USAGE="usage: pi_gate.sh [-w WORKDIR] -s SCHEMA -q QUERIES <stage>\n  -w WORKDIR  scratch directory (default $REPO/build/pi_bench)\n  -s SCHEMA   the ClickBench rayforce schema.rfl\n  -q QUERIES  the ClickBench rayforce queries.rfl\n"
+while getopts "w:s:q:" o; do
+  case $o in
+    w) W=$OPTARG ;;
+    s) SCHEMA=$OPTARG ;;
+    q) QUERIES=$OPTARG ;;
+    *) printf "%b" "$USAGE" >&2; exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+[ -n "$SCHEMA" ] || { printf "%b" "$USAGE" >&2; exit 2; }
+[ -n "$QUERIES" ] || { printf "%b" "$USAGE" >&2; exit 2; }
 CSV=/skull/clickbench/hits_h.csv
-SCHEMA=/home/hetoku/data/work/ClickBench/rayforce/schema.rfl
-QUERIES=/home/hetoku/data/work/ClickBench/rayforce/queries.rfl
 BIN_H=${BIN_H:?BIN_H}
 BIN_D=${BIN_D:?BIN_D}
 OUT=$W/gate.tsv

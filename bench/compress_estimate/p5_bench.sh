@@ -17,11 +17,19 @@
 #          saves of the derived table, with this binary and with BASE's
 #          (`git archive`), each into a scratch store deleted after the round
 #   clean: delete the stores
-# usage: p5_bench.sh prep | enc | warm | cold | ident | wall | savet | clean | all
+# usage: p5_bench.sh [-w WORKDIR] prep | enc | warm | cold | ident | wall | savet | clean | all
 set -euo pipefail
-W=${W:-/home/hetoku/data/tmp/p5_bench}
-HERE=$(cd "$(dirname "$0")" && pwd)
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
+W=${W:-$REPO/build/p5_bench}
+USAGE="usage: p5_bench.sh [-w WORKDIR] <stage>\n  -w WORKDIR  scratch directory (default $REPO/build/p5_bench)\n"
+while getopts "w:" o; do
+  case $o in
+    w) W=$OPTARG ;;
+    *) printf "%b" "$USAGE" >&2; exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
 SRC=/skull/clickbench/rfsplayed
 ROUNDS=${ROUNDS:-9}
 SAVES=${SAVES:-3}
@@ -181,5 +189,5 @@ wall)   # per-call wall time, (T(1 + K) - T(1)) / K over K top-level calls: (tim
   done
   ;;
 clean) rm -rf "$W/g0" "$W/g2" "$W/s0" "$W/s2" "$W/g" ;;
-all) "$0" prep; "$0" enc; "$0" ident; "$0" warm; "$0" cold; "$0" wall; "$0" savet; "$0" clean ;;
+all) for st in prep enc ident warm cold wall savet clean; do "$0" -w "$W" "$st"; done ;;
 esac

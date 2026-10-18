@@ -10,11 +10,24 @@
 #           through dd iflag=nocache (no privileged operation)
 # Output: tab-separated lines appended to $W/pi.tsv.
 set -euo pipefail
-W=${W:-/home/hetoku/data/tmp/pi_bench}
-REPO=$(cd "$(dirname "$0")/../.." && pwd)
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO=$(cd "$HERE/../.." && pwd)
+W=${W:-$REPO/build/pi_bench}
+SCHEMA=
+QUERIES=
+USAGE="usage: pi_measure.sh [-w WORKDIR] -s SCHEMA -q QUERIES <stage>\n  -w WORKDIR  scratch directory (default $REPO/build/pi_bench)\n  -s SCHEMA   the ClickBench rayforce schema.rfl\n  -q QUERIES  the ClickBench rayforce queries.rfl\n"
+while getopts "w:s:q:" o; do
+  case $o in
+    w) W=$OPTARG ;;
+    s) SCHEMA=$OPTARG ;;
+    q) QUERIES=$OPTARG ;;
+    *) printf "%b" "$USAGE" >&2; exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+[ -n "$SCHEMA" ] || { printf "%b" "$USAGE" >&2; exit 2; }
+[ -n "$QUERIES" ] || { printf "%b" "$USAGE" >&2; exit 2; }
 CSV=/skull/clickbench/hits_h.csv
-SCHEMA=/home/hetoku/data/work/ClickBench/rayforce/schema.rfl
-QUERIES=/home/hetoku/data/work/ClickBench/rayforce/queries.rfl
 BIN_H=$W/rayforce_hash
 BIN_N=$W/rayforce_nohash
 OUT=$W/pi.tsv

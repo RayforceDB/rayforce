@@ -19,11 +19,21 @@
 # The load average is checked before every round and trial: below 1.5 or wait.
 # Output: $W/p4.tsv ; the verdict is printed by p4_summary.py (never typed).
 set -euo pipefail
-W=${W:-/home/hetoku/data/tmp/p4_bench}
-HERE=$(cd "$(dirname "$0")" && pwd)
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
+W=${W:-$REPO/build/p4_bench}
+QUERIES=
+USAGE="usage: p4_bench.sh [-w WORKDIR] -q QUERIES <stage>\n  -w WORKDIR  scratch directory (default $REPO/build/p4_bench)\n  -q QUERIES  the ClickBench rayforce queries.rfl\n"
+while getopts "w:q:" o; do
+  case $o in
+    w) W=$OPTARG ;;
+    q) QUERIES=$OPTARG ;;
+    *) printf "%b" "$USAGE" >&2; exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+[ -n "$QUERIES" ] || { printf "%b" "$USAGE" >&2; exit 2; }
 SRC=/skull/clickbench/rfsplayed
-QUERIES=/home/hetoku/data/work/ClickBench/rayforce/queries.rfl
 ROUNDS=${ROUNDS:-9}
 OUT=$W/p4.tsv
 BIN=$W/bin/p4
