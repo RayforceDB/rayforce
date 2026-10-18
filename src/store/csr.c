@@ -136,6 +136,7 @@ typedef struct {
     int       T, B, shift;
     bool      narrow;         /* int32 scratch */
     int64_t*  hist;           /* [T * B]: counts, then cursors */
+    uint8_t*  wide;           /* [T]: a task saw an in-range value past int32 */
     int64_t*  bstart;         /* [B + 1]: bucket edge ranges in scratch */
     void*     skeys; void* svals;   /* int32 or int64, n_edges each */
     int64_t*  srow;           /* n_edges */
@@ -160,10 +161,15 @@ static void csr_par_hist_fn(void* ctx, uint32_t wid, int64_t start, int64_t end)
     uint32_t t = (uint32_t)start;
     int64_t lo, hi; csr_par_task_range(c, t, &lo, &hi);
     int64_t* h = c->hist + (size_t)t * c->B;
+    bool wide = false;
     for (int64_t i = lo; i < hi; i++) {
         int64_t k = csr_par_key(c, i);
-        if (k >= 0 && k < c->n_nodes) h[k >> c->shift]++;
+        if (k < 0 || k >= c->n_nodes) continue;
+        h[k >> c->shift]++;
+        int64_t v = c->vals[i];
+        wide |= (v < INT32_MIN || v > INT32_MAX);
     }
+    c->wide[t] = wide;
 }
 
 /* Phase 2: per-task scatter into bucket-ordered scratch. */
@@ -240,6 +246,11 @@ static inline bool csr_par_cancelled(ray_pool_t* pool) {
     return atomic_load_explicit(&pool->cancelled, memory_order_relaxed);
 }
 
+static void csr_par_drop(ray_t** v) {
+    if (*v) { if (RAY_IS_ERR(*v)) ray_error_free(*v); else ray_release(*v); }
+    *v = NULL;
+}
+
 /* Count valid edges and fill out->offsets/targets/rowmap in parallel.
  * Returns 1 when out is built, 0 when the pool should not be used or
  * scratch cannot be had (nothing is left in out; the caller builds
@@ -258,30 +269,31 @@ static int csr_build_parallel(const int64_t* keys, const int64_t* vals,
     int shift = 0;
     while (((n_nodes - 1) >> shift) >= CSR_PAR_BUCKETS) shift++;
     int B = (int)(((n_nodes - 1) >> shift) + 1);
-    bool narrow = n_nodes <= INT32_MAX;
-    /* Values are stored unchecked (an out-of-range dst stays in fwd); the
-     * narrow scratch needs every value to fit as well. */
-    if (narrow) {
-        for (int64_t i = 0; i < n_edges; i++)
-            if (vals[i] < INT32_MIN || vals[i] > INT32_MAX) { narrow = false; break; }
-    }
-    size_t cell = narrow ? sizeof(int32_t) : sizeof(int64_t);
-
     csr_par_t c = { .keys = keys, .vals = vals, .n_edges = n_edges,
-                    .n_nodes = n_nodes, .T = T, .B = B, .shift = shift,
-                    .narrow = narrow };
+                    .n_nodes = n_nodes, .T = T, .B = B, .shift = shift };
     c.hist   = ray_calloc_raw((size_t)T * B * sizeof(int64_t));
+    c.wide   = ray_calloc_raw((size_t)T);
     c.bstart = ray_alloc_raw((size_t)(B + 1) * sizeof(int64_t));
-    c.skeys  = ray_alloc_raw((size_t)n_edges * cell);
-    c.svals  = ray_alloc_raw((size_t)n_edges * cell);
     c.srow   = ray_alloc_raw((size_t)n_edges * sizeof(int64_t));
     c.pos    = ray_alloc_raw((size_t)n_nodes * sizeof(int64_t));
-    bool ok = c.hist && c.bstart && c.skeys && c.svals && c.srow && c.pos;
+    bool ok = c.hist && c.wide && c.bstart && c.srow && c.pos;
     bool cancelled = false;
 
     if (ok) {
         ray_pool_dispatch_n(pool, csr_par_hist_fn, &c, (uint32_t)T);
         cancelled = csr_par_cancelled(pool);
+    }
+    if (ok && !cancelled) {
+        /* Scratch width, known only now: values are stored unchecked (an
+         * out-of-range dst stays in fwd), so the narrow scratch needs every
+         * kept edge's value to fit, and phase 1 saw them all. */
+        bool narrow = n_nodes <= INT32_MAX;
+        for (int t = 0; t < T && narrow; t++) narrow = !c.wide[t];
+        c.narrow = narrow;
+        size_t cell = narrow ? sizeof(int32_t) : sizeof(int64_t);
+        c.skeys = ray_alloc_raw((size_t)n_edges * cell);
+        c.svals = ray_alloc_raw((size_t)n_edges * cell);
+        ok = c.skeys && c.svals;
     }
     if (ok && !cancelled) {
         int64_t run = 0;
@@ -318,14 +330,15 @@ static int csr_build_parallel(const int64_t* keys, const int64_t* vals,
             }
         }
         if (!ok || cancelled) {
-            if (out->offsets && !RAY_IS_ERR(out->offsets)) ray_release(out->offsets);
-            if (out->targets && !RAY_IS_ERR(out->targets)) ray_release(out->targets);
-            if (out->rowmap  && !RAY_IS_ERR(out->rowmap))  ray_release(out->rowmap);
-            out->offsets = out->targets = out->rowmap = NULL;
+            /* ray_vec_new hands back an error object on OOM, and
+             * ray_release is a no-op on those: free them as errors. */
+            csr_par_drop(&out->offsets);
+            csr_par_drop(&out->targets);
+            csr_par_drop(&out->rowmap);
             out->n_edges = 0;
         }
     }
-    ray_free_raw(c.hist);  ray_free_raw(c.bstart);
+    ray_free_raw(c.hist);  ray_free_raw(c.wide); ray_free_raw(c.bstart);
     ray_free_raw(c.skeys); ray_free_raw(c.svals);
     ray_free_raw(c.srow);  ray_free_raw(c.pos);
     if (cancelled) return -1;

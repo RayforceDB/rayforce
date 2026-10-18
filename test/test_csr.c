@@ -27,6 +27,7 @@
 #include "mem/heap.h"
 #include "ops/ops.h"
 #include "store/csr.h"
+#include "core/pool.h"
 #include "store/col.h"
 #include "ops/fvec.h"
 #include <string.h>
@@ -3666,9 +3667,6 @@ static test_result_t test_csr_tiebreak_determinism(void) {
  * -------------------------------------------------------------------------- */
 
 
-/* A hub whose list is long enough to leave the insertion sort behind must
- * come out in the same (target, row) order as a short list does, in both
- * directions, with out-of-range keys dropped and their rows skipped. */
 /* The parallel two-level build must produce the same three arrays as the
  * serial counting sort, byte for byte.  Build one graph both ways by moving
  * the size threshold: 0 forces the parallel path (the harness runs with
@@ -3678,6 +3676,7 @@ static test_result_t test_csr_tiebreak_determinism(void) {
  * variant, a value past int32 so the int64 scratch branch runs. */
 static test_result_t csr_par_vs_serial(bool wide_value) {
     enum { N_NODES = 3000, M = 20000 };
+    if (!ray_pool_par_dispatch_ok(ray_pool_get(), M, 0)) SKIP("no pool worker");
     int64_t* s = ray_alloc_raw((size_t)(M + 6) * sizeof(int64_t));
     int64_t* d = ray_alloc_raw((size_t)(M + 6) * sizeof(int64_t));
     TEST_ASSERT(s && d, "scratch");
@@ -3746,6 +3745,52 @@ static test_result_t csr_par_vs_serial(bool wide_value) {
     PASS();
 }
 
+/* The key-less build (ray_rel_build: forward key = row index, reverse
+ * keyed by the FK with row indices as values) must match serial byte for
+ * byte too; ray_rel_from_edges never reaches that branch. */
+static test_result_t test_csr_parallel_fk_matches_serial(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+    enum { N_TARGET = 2500, M = 30000 };
+    if (!ray_pool_par_dispatch_ok(ray_pool_get(), M, 0)) SKIP("no pool worker");
+    int64_t* f = ray_alloc_raw((size_t)M * sizeof(int64_t));
+    TEST_ASSERT(f, "scratch");
+    for (int64_t i = 0; i < M; i++) f[i] = (i * 7919) % N_TARGET;
+    f[11] = -1; f[12] = N_TARGET; f[13] = INT64_C(1) << 40;   /* dropped in rev */
+    for (int64_t i = 0; i < M; i += 101) f[i] = 3;              /* a hub */
+    ray_t* fv = ray_vec_from_raw(RAY_I64, f, M);
+    ray_free_raw(f);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("fk", 2), fv);
+    ray_release(fv);
+
+    int64_t saved = ray_csr_par_min_edges;
+    ray_csr_par_min_edges = INT64_MAX;
+    ray_rel_t* a = ray_rel_build(tbl, "fk", N_TARGET, true);
+    ray_csr_par_min_edges = 0;
+    ray_rel_t* b = ray_rel_build(tbl, "fk", N_TARGET, true);
+    ray_csr_par_min_edges = saved;
+    ray_release(tbl);
+    TEST_ASSERT(a && b, "both builds succeed");
+
+    for (int k = 0; k < 2; k++) {
+        const ray_csr_t* x = k == 0 ? &a->fwd : &a->rev;
+        const ray_csr_t* y = k == 0 ? &b->fwd : &b->rev;
+        TEST_ASSERT(x->n_nodes == y->n_nodes, "n_nodes equal");
+        TEST_ASSERT(x->n_edges == y->n_edges, "n_edges equal");
+        TEST_ASSERT(x->n_edges == (k == 0 ? M : M - 3), "edges kept per side");
+        TEST_ASSERT(x->offsets->len == y->offsets->len, "offsets len");
+        TEST_ASSERT(memcmp(ray_data(x->offsets), ray_data(y->offsets),
+                           (size_t)x->offsets->len * sizeof(int64_t)) == 0, "offsets identical");
+        TEST_ASSERT(memcmp(ray_data(x->targets), ray_data(y->targets),
+                           (size_t)x->n_edges * sizeof(int64_t)) == 0, "targets identical");
+        TEST_ASSERT(memcmp(ray_data(x->rowmap), ray_data(y->rowmap),
+                           (size_t)x->n_edges * sizeof(int64_t)) == 0, "rowmap identical");
+    }
+    ray_rel_free(a); ray_rel_free(b);
+    PASS();
+}
+
 /* A cancel during the parallel build must not hand back a CSR: skipped
  * tasks never write their slots.  Arm the interrupt first so every pass
  * is cut short, then check the build reports the cancel with nothing
@@ -3754,6 +3799,7 @@ static test_result_t test_csr_parallel_cancel(void) {
     ray_heap_init();
     (void)ray_sym_init();
     enum { N_NODES = 3000, M = 20000 };
+    if (!ray_pool_par_dispatch_ok(ray_pool_get(), M, 0)) SKIP("no pool worker");
     int64_t* s = ray_alloc_raw((size_t)M * sizeof(int64_t));
     int64_t* d = ray_alloc_raw((size_t)M * sizeof(int64_t));
     TEST_ASSERT(s && d, "scratch");
@@ -3786,6 +3832,9 @@ static test_result_t test_csr_parallel_matches_serial(void) {
     return csr_par_vs_serial(true);
 }
 
+/* A hub whose list is long enough to leave the insertion sort behind must
+ * come out in the same (target, row) order as a short list does, in both
+ * directions, with out-of-range keys dropped and their rows skipped. */
 static test_result_t test_csr_hub_order(void) {
     ray_heap_init();
     (void)ray_sym_init();
@@ -3874,6 +3923,7 @@ const test_entry_t csr_entries[] = {
     { "csr/tiebreak_determinism", test_csr_tiebreak_determinism, NULL, NULL },
     { "csr/hub_order", test_csr_hub_order, NULL, NULL },
     { "csr/parallel_matches_serial", test_csr_parallel_matches_serial, NULL, NULL },
+    { "csr/parallel_fk_matches_serial", test_csr_parallel_fk_matches_serial, NULL, NULL },
     { "csr/parallel_cancel", test_csr_parallel_cancel, NULL, NULL },
     { "csr/build", test_csr_build, NULL, NULL },
     { "csr/sorted", test_csr_sorted, NULL, NULL },
