@@ -3825,7 +3825,7 @@ GATE (strict) splayed[answers=PASS warm=FAIL cold=PASS first=PASS materializing_
 P2 GATE (strict): FAIL
 GATE (P3-exempt) splayed[answers=PASS warm=FAIL cold=PASS first=PASS materializing_warm=PASS no_unexpected_materialization=PASS first_total=PASS] parted[answers=PASS warm=PASS cold=PASS first=PASS materializing_warm=PASS no_unexpected_materialization=PASS] gen0-splayed[answers=PASS warm=FAIL] gen0-parted[answers=PASS warm=FAIL q16_first=FAIL] gen0-ragged[answers=PASS warm=FAIL]
 P2 GATE (P3-exempt): FAIL
-P3-EXEMPT LIST 
+P3-EXEMPT LIST
 p3_unexpected_materializations none
 rss A: 5120292 -> 5954800 kB (x1.163 over all 43, bound 1.1)
 rss A without D2 q41,q42: 5100968 -> 5063280 kB (x0.993, bound 1.1, gated)

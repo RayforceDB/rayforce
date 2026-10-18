@@ -3998,4 +3998,3 @@ void ray_enccol_byte_range(const ray_enccol_t* e, int64_t lo, int64_t hi,
     *off = a.offset;
     *len = b.offset + b.bytes - a.offset;
 }
-
