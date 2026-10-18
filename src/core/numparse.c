@@ -452,7 +452,20 @@ size_t ray_parse_f64(const char *src, size_t len, double *dst) {
      * fallback that produced ±Inf — to NULL_F64 (0Nf).  Finite values
      * (including denormals and signed zero) pass through unchanged.  The
      * fabs <= DBL_MAX test is false for both ±Inf and NaN. */
-    double out = neg ? -val : val;
+    double out = val;
+    if (neg) {
+        /* Apply the sign through the bits, not through FP negation.  The
+         * release flavour compiles with -fno-signed-zeros, under which the
+         * compiler may fold `neg ? -val : val` for val == 0.0 to a single
+         * constant and pick -0.0, so a plain "0" or "0.0" parsed to
+         * 0x8000000000000000 (#850).  Flipping the sign bit through an
+         * integer is outside the FP model's reach and gives +0.0 for "0"
+         * and -0.0 for "-0" in every flavour. */
+        uint64_t bits;
+        memcpy(&bits, &out, sizeof bits);
+        bits ^= UINT64_C(1) << 63;
+        memcpy(&out, &bits, sizeof out);
+    }
     *dst = (__builtin_fabs(out) <= DBL_MAX) ? out : NULL_F64;
     return i;
 }
