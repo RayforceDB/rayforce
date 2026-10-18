@@ -204,6 +204,21 @@ Expressions over aggregates work with any number of keys and with binary aggrega
 (select {from: trades r2: (pow (pearson_corr price size) 2) by: {sym: sym}})
 ```
 
+A `by:` name that reads no column — a lambda parameter or a `let` (which
+hides a column of its name), or a global holding a vector — groups by the
+values it holds, under its own name. It must hold one value per row of the
+table; a key of any other length raises `length`, under a `where:` too (the
+key meets the rows the filter keeps):
+
+```lisp
+(set t (table [g x] (list [a a b b b c c c c c] (til 10))))
+(set K [1 1 1 1 1 2 2 2 2 2])
+(select {s: (sum x) by: K from: t})                        ; K [1 2], s [10 35]
+((fn [g] (select {s: (sum x) by: g from: t})) K)           ; the same: g is K
+(set K3 [1 2 3])
+(select {s: (sum x) by: K3 from: t})                       ; error: length
+```
+
 ### Aggregate sources
 
 What an aggregate reads depends on what its argument is. A column, or an
@@ -211,8 +226,9 @@ expression over columns, gives one value per row, and each group aggregates
 its own rows. An argument that reads no column follows one of two rules,
 depending on whether it is written as a value or computed.
 
-A vector written as a value — a literal, or a global holding one — stands for
-a column:
+A vector written as a value — a literal, a global holding one, or a bound
+value: a lambda parameter or a `let`, which hides a column of its name —
+stands for a column:
 
 - a vector as long as the table is sliced per group, and filtered by
   `where:` like any column (the table's rows before the filter);
@@ -220,7 +236,12 @@ a column:
   and `(sum 7)` over ten rows are `70`;
 - a vector of any other length raises a `length` error;
 - `count` keeps a vector's own length: `(count [1 2 3])` is `3` in every
-  group.
+  group;
+- `count (distinct v)` of a bound vector counts the distinct values of the
+  whole collection, the same in every group, whatever its length or name.
+  A helper whose body reads a column, itself or through another helper,
+  reads the rows: `(count (distinct (f)))` with `f` = `(fn [] y)` counts
+  each group's values of `y`.
 
 ```lisp
 (set t (table [g x] (list [a a b b b c c c c c] (til 10))))
@@ -233,6 +254,8 @@ a column:
 ; c 350
 (select {s: (sum W) by: g from: t where: (> x 2)})   ; s [70 350]
 (select {s: (sum [1 2 3]) by: g from: t})            ; error: length
+((fn [v] (select {d: (count (distinct v)) by: g from: t})) [1 1 2 2 3 3 4 4 5 5])
+; d [5 5 5]
 ```
 
 A computed argument that reads no column — `(til 5)`, `(at [1 2 3] 0)`, an

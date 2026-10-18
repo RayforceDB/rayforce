@@ -4396,6 +4396,32 @@ static bool simplify_agg_idiom(ray_t* val_expr, ray_t* tbl,
     return true;
 }
 
+/* The column a count(distinct) operand reads directly: a bare name of a
+ * column of `tbl` that no lexical local (a parameter, a let) hides.  NULL
+ * for any other operand, which the evaluator resolves. */
+static ray_t* count_distinct_src_col(ray_t* tbl, ray_t* inner) {
+    if (!tbl || !inner || inner->type != -RAY_SYM || (inner->attrs & ATTR_QUOTED))
+        return NULL;
+    if (ray_env_get_lexical_local(inner->i64)) return NULL;
+    return ray_table_get_col(tbl, inner->i64);
+}
+
+static bool sym_names_col(ray_t* tbl, int64_t s);
+
+/* Does a count(distinct) operand the evaluator resolves read none of the
+ * table's rows, so that it stays a collection counted whole in every group:
+ * a name that reads no column (a lexical local, a global), or an expression
+ * the planner lowers to constants alone (bound vectors and literals).  The
+ * planner inlines a helper, so one whose body reads a column, itself or
+ * through another helper, reads the rows; an operand the planner does not
+ * lower is taken to read them and is gathered per group. */
+static bool cd_operand_is_collection(ray_t* inner, ray_t* tbl) {
+    if (!inner) return false;
+    if (inner->type == -RAY_SYM && !(inner->attrs & ATTR_QUOTED))
+        return !sym_names_col(tbl, inner->i64);
+    return expr_is_constant_collection(inner, tbl, NULL);
+}
+
 static ray_t* match_count_distinct(ray_t* expr) {
     if (!expr || expr->type != RAY_LIST) return NULL;
     int64_t n = ray_len(expr);
@@ -7832,6 +7858,8 @@ static ray_t* try_count_distinct_v2_rewrite(
      * packed kernel. Its byte-width limit must not restrict this rewrite. */
     ray_t* K_cols[15];
     for (int j = 0; j < n_K; j++) {
+        /* A key a lexical local hides groups by the local's values. */
+        if (ray_env_get_lexical_local(K_syms[j])) return NULL;
         K_cols[j] = ray_table_get_col(tbl, K_syms[j]);
         if (!K_cols[j]) return NULL;
         int8_t kct_j = K_cols[j]->type;
@@ -7842,7 +7870,8 @@ static ray_t* try_count_distinct_v2_rewrite(
                         kct_j == RAY_STR || kct_j == RAY_GUID || kct_j == RAY_LIST);
         if (!kct_ok_j) return NULL;
     }
-    ray_t* X_col = ray_table_get_col(tbl, cd_X_sym);
+    ray_t* X_col = ray_env_get_lexical_local(cd_X_sym) ? NULL
+                 : ray_table_get_col(tbl, cd_X_sym);
     if (!X_col) return NULL;
     int8_t xct = X_col->type;
     if (RAY_IS_PARTED(xct) || xct == RAY_MAPCOMMON) return NULL;
@@ -8115,11 +8144,8 @@ static ray_t* count_distinct_per_group_buf(ray_t* inner_expr, ray_t* tbl,
     /* Resolve the source vector — either a direct column ref (zero copy)
      * or a full-table eval of the inner sub-expression. */
     ray_t* src = NULL;
-    if (inner_expr && inner_expr->type == -RAY_SYM &&
-        !(inner_expr->attrs & ATTR_QUOTED)) {
-        src = ray_table_get_col(tbl, inner_expr->i64);
-        if (src) ray_retain(src);
-    }
+    src = count_distinct_src_col(tbl, inner_expr);
+    if (src) ray_retain(src);
     if (!src) {
         if (ray_env_push_query_scope() != RAY_OK) return ray_error("oom", NULL);
         ray_t* _aqt = bind_all_columns(tbl);
@@ -8127,12 +8153,40 @@ static ray_t* count_distinct_per_group_buf(ray_t* inner_expr, ray_t* tbl,
         g_active_query_table = _aqt;
         ray_env_pop_scope();
         if (!src || RAY_IS_ERR(src)) return src ? src : ray_error("domain", "select by: failed to evaluate count-distinct source");
+        if (ray_is_lazy(src)) {
+            src = ray_lazy_materialize(src);
+            if (!src || RAY_IS_ERR(src)) return src ? src : ray_error("oom", NULL);
+        }
+        /* An operand that reads none of the table's rows (a bound vector, a
+         * parameter named like a column) stays a collection: every group
+         * counts its distinct values, as `(count v)` counts it whole. */
+        if (cd_operand_is_collection(inner_expr, tbl)) {
+            ray_t* d = ray_distinct_fn(src);
+            if (d && !RAY_IS_ERR(d) && ray_is_lazy(d)) d = ray_lazy_materialize(d);
+            ray_release(src);
+            if (!d || RAY_IS_ERR(d)) return d ? d : ray_error("oom", NULL);
+            int64_t nd = ray_len(d);
+            ray_release(d);
+            ray_t* out = ray_vec_new(RAY_I64, n_groups);
+            if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+            out->len = n_groups;
+            for (int64_t gi = 0; gi < n_groups; gi++) ((int64_t*)ray_data(out))[gi] = nd;
+            return out;
+        }
     }
     if (src && !RAY_IS_ERR(src) && (RAY_IS_PARTED(src->type) || src->type == RAY_MAPCOMMON)) {
         ray_t* flat = query_materialize_parted_col(src, tbl);
         ray_release(src);
         src = flat;
         if (!src || RAY_IS_ERR(src)) return src ? src : ray_error("oom", NULL);
+    }
+    /* The groups list rows of `tbl`: an operand of another length (a
+     * parameter, `(take y 2)`) has no cell for some of them. */
+    if (!ray_is_atom(src) && ray_len(src) != ray_table_nrows(tbl)) {
+        int64_t sl = ray_len(src);
+        ray_release(src);
+        return ray_error("length", "count distinct: operand has %lld values for %lld rows",
+                         (long long)sl, (long long)ray_table_nrows(tbl));
     }
 
     if (src->type == RAY_STR || src->type == RAY_GUID || src->type == RAY_LIST) {
@@ -11660,6 +11714,59 @@ static bool sym_names_col(ray_t* tbl, int64_t s) {
     return ray_table_get_col(tbl, head) != NULL;
 }
 
+/* Does clause `v`, run on one partition's segment of the parted table
+ * `tbl`, give that segment's rows of what it gives on the whole table, so
+ * the per-segment sort/take and asof routes may run it partition by
+ * partition?  The DAG decides: `v` is compiled into a scratch graph over
+ * `tbl` (compile_expr_dag) and the executor's streaming admission
+ * (dag_can_stream) must accept it: row-wise ops over the table's columns
+ * and scalar constants.  A lexical local or a global compiles to a
+ * constant, so a vector of any length (a mask of the table's or of one
+ * partition's rows, a projected vector) is refused, as are an aggregate, a
+ * scan, a moving window, a form the compiler does not lower (a nested
+ * query, `til`, `rand`, `eval`, a computed callee, a closure, a dict path)
+ * and a helper whose inlined body holds one of them.  Two things that
+ * admission cannot tell are settled here:
+ *   - the set of `in`/`not-in` is no row operand: a constant set (a
+ *     membership list of any length) reads the same on every segment and
+ *     is admitted, while a set computed over the columns would be one
+ *     partition's on each segment and is refused (the admission walks the
+ *     set as an elementwise operand);
+ *   - a clause that compiles to one scalar constant (a literal, a local or
+ *     global atom) is the same on every segment and is admitted (the
+ *     admission refuses a graph that scans no column, since the executor's
+ *     streaming would repeat such a result per partition). */
+static bool clause_streams_per_segment(ray_t* v, ray_t* tbl) {
+    if (!v || RAY_IS_ERR(v) || !tbl || tbl->type != RAY_TABLE) return false;
+    ray_graph_t* g = ray_graph_new(tbl);
+    if (!g) return false;
+    ray_op_t* root = compile_expr_dag(g, v);
+    bool ok = root != NULL;
+    uint32_t root_id = ok ? root->id : 0;
+    if (ok && root->opcode == OP_CONST) {
+        ray_op_ext_t* ext = find_ext(g, root_id);
+        ok = ext && ext->literal && ray_is_atom(ext->literal);
+        ray_graph_free(g);
+        return ok;
+    }
+    /* The scalar a constant set is swapped for, made before the loop
+     * takes node pointers (a new node may move g->nodes). */
+    ray_op_t* unit = ok ? ray_const_bool(g, true) : NULL;
+    ok = unit != NULL;
+    uint32_t unit_id = ok ? unit->id : 0;
+    for (uint32_t i = 0; ok && i < g->node_count; i++) {
+        ray_op_t* op = &g->nodes[i];
+        if ((op->opcode != OP_IN && op->opcode != OP_NOT_IN) || op->arity < 2) continue;
+        ray_op_t* set = op_child(g, op, 1);
+        if (!set) ok = false;
+        else if (set->opcode == OP_CONST) op->in_id[1] = unit_id;
+        else if (dag_can_stream(g, set)) ok = false;   /* a set over the rows */
+    }
+    ok = ok && dag_can_stream(g, &g->nodes[root_id]);
+    ray_graph_free(g);
+    return ok;
+}
+
 static bool clause_runs_code_in(ray_t* v, ray_t* tbl, bool containers);
 
 /* Does key `e` name, anywhere, a builtin that binds a name or quotes its
@@ -13031,7 +13138,10 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
                     if (alias_ref) { bad_clause = 1; break; }
                 }
                 if (v && v->type == -RAY_SYM && !(v->attrs & ATTR_QUOTED)) {
-                    ray_t* oc = ray_table_get_col(tbl, v->i64);
+                    /* A lexical local of that name hides the column: the
+                     * output is the local, which the gathers cannot read. */
+                    ray_t* oc = sym_names_col(tbl, v->i64)
+                              ? ray_table_get_col(tbl, v->i64) : NULL;
                     if (!oc) { bad_clause = 1; break; }
                     int8_t ot = oc->type;
                     if (RAY_IS_PARTED(ot) || ot == RAY_MAPCOMMON)
@@ -13153,6 +13263,7 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
      * FLAT path so nothing there changes. */
     bool   parted_bydict_deferred = false;
     bool   computed_single_key = false;   /* by: is one expression, compiled or const */
+    bool   named_value_key = false;       /* by: is a name holding a value, no column */
     /* Sort keys that are source columns no output scans: carried through
      * the projection (appended after the outputs) so the sort can read
      * them, dropped from the result after it ran. */
@@ -13747,6 +13858,61 @@ by_dict_done:
      * byv_hdr itself, so later exits are safe re-closing it; function-scoped
      * decl, dv-threaded returns below only close dv). */
     DICT_VIEW_CLOSE(byv);
+
+    /* A by: name that reads no column but holds one value per row of the
+     * table (a lambda parameter, a let, a global vector) is carried under a
+     * where: as the hidden column __by_key, so the filter keeps its rows in
+     * the one run of where: (the eval-level grouping, which outputs the
+     * grouping DAG does not serve take, groups on it; the DAG route reads
+     * the name itself).  A parted table is flattened first, to the columns
+     * the clauses read: a flat column beside parted ones is no table the
+     * filter reads (it kept every row of a comparison on a name the key
+     * hides), and such a grouping does not stream. */
+    bool by_key_carried = false;
+    bool by_key_carry = false;   /* an output the grouping DAG does not serve, or a where: below */
+    for (int64_t i = 0; i + 1 < dict_n && !by_key_carry; i += 2) {
+        int64_t kid = dict_elems[i]->i64;
+        if (kid == from_id || kid == where_id || kid == by_id || kid == take_id ||
+            kid == asc_id || kid == desc_id || kid == nearest_id) continue;
+        ray_t* ov = dict_elems[i + 1];
+        by_key_carry = !is_single_group_key_projection(by_expr, ov) &&
+                        !is_group_dag_agg_expr(ov, tbl) && !is_decomposable_agg_compound(ov, tbl);
+    }
+    /* A where: comparing the name of a column the key's local hides reads
+     * the local; the parted aggregate grouping raised length on that, so
+     * the key is carried (the parted table copied to the columns read) for
+     * it too.  Any other aggregate grouping keeps the table as it is, and so
+     * does a select with no outputs: it returns every input column. */
+    if (!by_key_carry && n_out > 0 && where_expr && by_expr && by_expr->type == -RAY_SYM &&
+        !(by_expr->attrs & ATTR_QUOTED) && table_has_parted_columns(tbl) &&
+        ray_table_get_col(tbl, by_expr->i64) && ray_env_get_lexical_local(by_expr->i64) &&
+        clause_names_sym(where_expr, by_expr->i64))
+        by_key_carry = true;
+    if (where_expr && by_key_carry && by_expr && by_expr->type == -RAY_SYM &&
+        !(by_expr->attrs & ATTR_QUOTED) && !sym_names_col(tbl, by_expr->i64) &&
+        !ray_table_get_col(tbl, ray_sym_intern("__by_key", 8))) {
+        ray_t* kv = sym_binding(by_expr->i64);
+        if (kv && !ray_is_atom(kv) && (ray_is_vec(kv) || kv->type == RAY_LIST) &&
+            ray_len(kv) == ray_table_nrows(tbl)) {
+            if (table_has_parted_columns(tbl)) {
+                /* by_key_carry holds only with an output (n_out > 0) */
+                ray_t* flat = parted_flatten_read_cols(dict, tbl, false, NULL);
+                ray_release(tbl);
+                if (!flat || RAY_IS_ERR(flat)) {
+                    scratch_free(dep_src_hdr);
+                    DICT_VIEW_CLOSE(dv); return flat ? flat : ray_error("oom", NULL);
+                }
+                tbl = flat;
+            }
+            ray_t* keyed = ray_table_add_col(tbl, ray_sym_intern("__by_key", 8), kv);   /* consumes tbl */
+            if (!keyed || RAY_IS_ERR(keyed)) {
+                scratch_free(dep_src_hdr);
+                DICT_VIEW_CLOSE(dv); return keyed ? keyed : ray_error("oom", NULL);
+            }
+            tbl = keyed;
+            by_key_carried = true;
+        }
+    }
 
     /* Build DAG */
     ray_graph_t* g = ray_graph_new(tbl);
@@ -14418,6 +14584,11 @@ by_dict_done:
             } else if (by_expr->type == RAY_SYM && ray_len(by_expr) == 1) {
                 single_scalar_key = 1;
             }
+            /* The scatter maps rows through the key column: a key that is
+             * no column the name reads (a lexical local hides it, or it is
+             * a global vector) is grouped by its value at eval level. */
+            if (single_scalar_key && by_key_sym >= 0 && !sym_names_col(tbl, by_key_sym))
+                single_scalar_key = 0;
             /* A plain multi-key by: stays on the DAG path when the outputs
              * the DAG cannot serve are count(distinct) aggregates and
              * literal broadcasts (no true row expression): the scatter
@@ -15218,7 +15389,14 @@ by_dict_done:
              * outputs, and the result's key column is named as the DAG path
              * names a computed key (#707). */
             int64_t key_out_name = by_key_sym;
-            if (by_key_sym < 0 && by_expr->type != RAY_SYM) {
+            /* A key name that reads no column (a lexical local hides it, or
+             * it names a global vector) is evaluated the same way. */
+            bool key_is_value = by_key_sym >= 0 && by_expr->type == -RAY_SYM &&
+                                !sym_names_col(eval_tbl, by_key_sym);
+            int64_t key_col_sym = ray_sym_intern("__by_key", 8);
+            if (key_is_value && by_key_carried && ray_table_get_col(eval_tbl, key_col_sym)) {
+                by_key_sym = key_col_sym;   /* filtered with the rows (by_key_carried) */
+            } else if ((by_key_sym < 0 && by_expr->type != RAY_SYM) || key_is_value) {
                 int64_t kn = ray_table_nrows(eval_tbl);
                 ray_t* kv = NULL;
                 if (ray_env_push_query_scope() != RAY_OK) kv = ray_error("oom", NULL);
@@ -15235,6 +15413,15 @@ by_dict_done:
                     ray_t* wide = atom_broadcast_vec(kv, kn);
                     ray_release(kv);
                     kv = wide ? wide : ray_error("type", "by: cannot broadcast the key");
+                }
+                /* A named key is one value per row of the table, as on the
+                 * DAG path; under a where: it came through the filter. */
+                if (key_is_value && kv && !RAY_IS_ERR(kv) && !ray_is_atom(kv) &&
+                    ray_len(kv) != ray_table_nrows(tbl)) {
+                    int64_t got = ray_len(kv);
+                    ray_release(kv);
+                    kv = ray_error("length", "by: key has %lld values for %lld rows",
+                                   (long long)got, (long long)ray_table_nrows(tbl));
                 }
                 if (kv && !RAY_IS_ERR(kv) && (!ray_is_vec(kv) || ray_len(kv) != kn)) {
                     int64_t got = ray_len(kv);
@@ -15264,8 +15451,10 @@ by_dict_done:
                     scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return keyed ? keyed : ray_error("oom", NULL);
                 }
                 eval_tbl = keyed;
-                key_out_name = derived_key_name(by_expr);
-                for (int64_t i = 0; i + 1 < dict_n; i += 2) {
+                /* A named key keeps its name, as on the no-output form; an
+                 * output of that name keeps both columns, the key first. */
+                key_out_name = key_is_value ? key_out_name : derived_key_name(by_expr);
+                for (int64_t i = 0; i + 1 < dict_n && !key_is_value; i += 2) {
                     int64_t kid = dict_elems[i]->i64;
                     if (kid == from_id || kid == where_id || kid == by_id ||
                         kid == take_id || kid == asc_id || kid == desc_id) continue;
@@ -16235,6 +16424,12 @@ by_dict_done:
             /* Only a real expression is renamed: a bare column symbol lands
              * here too and keeps its own name. */
             computed_single_key = (key_ops[0] != NULL && by_expr->type == RAY_LIST);
+            /* A name that reads no column (a lexical local hides it, or a
+             * global holds a vector) compiles to a constant, which carries
+             * no name: the key keeps the name, as on the eval-level path. */
+            named_value_key = key_ops[0] != NULL && key_ops[0]->opcode == OP_CONST &&
+                              by_expr->type == -RAY_SYM && !(by_expr->attrs & ATTR_QUOTED) &&
+                              !sym_names_col(tbl, by_expr->i64);
             if (!key_ops[0]) { ray_t* cerr = graph_take_compile_err(g); ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return cerr ? cerr : ray_error("domain", "select by: failed to compile group key expression"); }
             n_keys = 1;
         }
@@ -17852,6 +18047,11 @@ by_dict_done:
             if (ray_table_col_name(result, c) == kname) { kname = ray_sym_intern("key", 3); break; }
         ray_table_set_col_name(result, 0, kname);
     }
+    if (named_value_key && result && !RAY_IS_ERR(result) && ray_is_lazy(result))
+        result = ray_lazy_materialize(result);
+    if (named_value_key && result && !RAY_IS_ERR(result) && result->type == RAY_TABLE &&
+        ray_table_ncols(result) > 0)
+        ray_table_set_col_name(result, 0, by_expr->i64);
     if (self_emit_set)
         ray_group_emit_filter_set(prev_self_emit);
     if (post_group_where_expr && result && !RAY_IS_ERR(result))
@@ -18689,7 +18889,7 @@ by_dict_done:
                                             !(cd_inner->attrs & ATTR_QUOTED) &&
                                             n_groups > 50000);
                     if (simple_cd_global) {
-                        ray_t* source = ray_table_get_col(tbl, cd_inner->i64);
+                        ray_t* source = count_distinct_src_col(tbl, cd_inner);
                         int8_t type = source ? source->type : 0;
                         simple_cd_global = type == RAY_BOOL || type == RAY_U8 ||
                             type == RAY_I16 || type == RAY_I32 || type == RAY_I64 ||
@@ -18732,10 +18932,7 @@ by_dict_done:
                          * computed expressions use the per-group fallback. */
                         ray_t* src_for_global = NULL;
                         int    src_owned = 0;
-                        if (cd_inner->type == -RAY_SYM &&
-                            !(cd_inner->attrs & ATTR_QUOTED)) {
-                            src_for_global = ray_table_get_col(tbl, cd_inner->i64);
-                        }
+                        src_for_global = count_distinct_src_col(tbl, cd_inner);
                         if (src_for_global && n_groups > 50000) {
                             if (RAY_IS_PARTED(src_for_global->type) ||
                                 src_for_global->type == RAY_MAPCOMMON) {
@@ -25847,6 +26044,18 @@ static ray_t* asof_parted_select_operand(ray_t* arg_ast, ray_t** out_dict) {
                        (sl == 4 && memcmp(sp, "desc",    4) == 0) ||
                        (sl == 7 && memcmp(sp, "nearest", 7) == 0);
         if (blocked) { ray_release(tbl); return NULL; }
+        /* A where: or projection runs on each day's segment only when the
+         * DAG streams it (clause_streams_per_segment): a value of the
+         * table's rows (a local, a global vector) or a computation over the
+         * rows' order or the whole column (sums, an aggregate) misreads one
+         * day's segment. */
+        ray_t* vals = ray_dict_vals(dict);
+        bool is_from = sl == 4 && memcmp(sp, "from", 4) == 0;
+        if (!is_from && (!vals || vals->type != RAY_LIST || i >= vals->len ||
+                         !clause_streams_per_segment(((ray_t**)ray_data(vals))[i], tbl))) {
+            ray_release(tbl);
+            return NULL;
+        }
     }
     *out_dict = dict;
     return tbl;   /* owned */
@@ -25981,15 +26190,19 @@ static ray_t* try_stream_parted_order_by(
      * same invariant as try_stream_parted_order_by_topk's output-shape gate.
      * An aggregate/expression output collapses per segment (one row per
      * partition), which would concat into nseg wrong rows instead of the
-     * flat path's single correctly-aggregated result, so it declines here. */
+     * flat path's single correctly-aggregated result, so it declines here.
+     * An output must read its column (a name a lexical local hides is the
+     * local, not the column), and the where: runs on a segment only when
+     * the DAG streams it (clause_streams_per_segment). */
     for (int64_t i = 0; i + 1 < dict_n; i += 2) {
         int64_t kid = dict_elems[i]->i64;
+        if (kid == where_id && !clause_streams_per_segment(dict_elems[i + 1], tbl)) return NULL;
         if (kid == from_id || kid == where_id || kid == by_id ||
             kid == take_id || kid == asc_id || kid == desc_id ||
             kid == nearest_id) continue;
         ray_t* v = dict_elems[i + 1];
         if (!v || v->type != -RAY_SYM || (v->attrs & ATTR_QUOTED)) return NULL;
-        if (!ray_table_get_col(tbl, v->i64)) return NULL;
+        if (!ray_table_get_col(tbl, v->i64) || !sym_names_col(tbl, v->i64)) return NULL;
     }
 
     /* Carve: key syms + resolved parted columns + two per-segment key-vec
@@ -26199,15 +26412,20 @@ static ray_t* try_stream_parted_order_by_topk(
      * negative / range take is a slice, not a top-k — decline it. */
     if (k < 0) return NULL;
 
-    /* Every output column must be a bare source-column ref (row-preserving). */
+    /* Every output column must be a bare source-column ref (row-preserving)
+     * that reads its column (no lexical local hiding it), and the where:
+     * runs on a segment only when the DAG streams it
+     * (clause_streams_per_segment): a value of the table's rows would be
+     * read whole against each segment. */
     for (int64_t i = 0; i + 1 < dict_n; i += 2) {
         int64_t kid = dict_elems[i]->i64;
+        if (kid == where_id && !clause_streams_per_segment(dict_elems[i + 1], tbl)) return NULL;
         if (kid == from_id || kid == where_id || kid == by_id ||
             kid == take_id || kid == asc_id || kid == desc_id ||
             kid == nearest_id) continue;
         ray_t* v = dict_elems[i + 1];
         if (!v || v->type != -RAY_SYM || (v->attrs & ATTR_QUOTED)) return NULL;
-        if (!ray_table_get_col(tbl, v->i64)) return NULL;
+        if (!ray_table_get_col(tbl, v->i64) || !sym_names_col(tbl, v->i64)) return NULL;
     }
 
     /* Every sort key must be an output of that column under its name: the
