@@ -212,7 +212,7 @@ static ray_t* parse_number(ray_parser_t *p) {
         return ray_u8((uint8_t)v);
     }
 
-    /* Null literal: 0N{h,i,d,t,p,l,f,s} or bare 0N (defaults to i64 null). */
+    /* Null literal: 0N{h,i,d,t,p,l,f,e,g} or bare 0N (defaults to i64 null). */
     if (!is_neg && p->pos[0] == '0' && p->pos[1] == 'N') {
         switch (p->pos[2]) {
         case 'h': p->pos += 3; return ray_typed_null(-RAY_I16);
@@ -222,6 +222,8 @@ static ray_t* parse_number(ray_parser_t *p) {
         case 'p': p->pos += 3; return ray_typed_null(-RAY_TIMESTAMP);
         case 'l': p->pos += 3; return ray_typed_null(-RAY_I64);
         case 'f': p->pos += 3; return ray_typed_null(-RAY_F64);
+        case 'e': p->pos += 3; return ray_typed_null(-RAY_F32);
+        case 'g': p->pos += 3; return ray_typed_null(-RAY_GUID);
         /* SYM has no typed null and no `0Ns` literal.  The empty symbol
          * (sym 0) is written `'` (parse_symbol below). */
         }
@@ -618,6 +620,19 @@ static ray_t* parse_vector(ray_parser_t *p) {
             case RAY_F64: {
                 double* d = (double*)ray_data(vec);
                 for (int32_t i = 0; i < count; i++) d[i] = elems[i]->f64;
+                break;
+            }
+            case RAY_F32: {
+                /* F32 atoms keep their value in the f64 slot (ray_f32). */
+                float* d = (float*)ray_data(vec);
+                for (int32_t i = 0; i < count; i++) d[i] = (float)elems[i]->f64;
+                break;
+            }
+            case RAY_GUID: {
+                /* A GUID atom's 16 bytes live in its obj U8 buffer. */
+                uint8_t* d = (uint8_t*)ray_data(vec);
+                for (int32_t i = 0; i < count; i++)
+                    memcpy(d + (size_t)i * 16, ray_data(elems[i]->obj), 16);
                 break;
             }
             case RAY_I32: case RAY_DATE: case RAY_TIME: {

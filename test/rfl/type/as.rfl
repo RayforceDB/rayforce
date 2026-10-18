@@ -645,3 +645,33 @@
 (nil? (as 'I64 NaNf)) -- true
 (nil? (as 'I32 NaNf)) -- true
 (nil? (as 'I16 NaNf)) -- true
+
+;; ========== F32 (#881) ==========
+;; f32 <- atoms
+(type (as 'F32 1.5)) -- 'f32
+(as 'f32 1.5) -- (as 'F32 1.5)
+(as 'F64 (as 'F32 1.5)) -- 1.5
+(as 'F64 (as 'F32 7)) -- 7.0
+(as 'F64 (as 'F32 true)) -- 1.0
+(as 'F64 (as 'F32 "2.5")) -- 2.5
+(nil? (as 'F32 "inf")) -- true
+(nil? (as 'F32 0Nl)) -- true
+(nil? (as 'F32 0Nf)) -- true
+;; past the F32 range saturates, as integer narrowings do
+(> (as 'F64 (as 'F32 1e300)) 3e38) -- true
+(< (as 'F64 (as 'F32 -1e300)) -3e38) -- true
+;; f32 -> other atoms
+(as 'i64 (as 'F32 7.9)) -- 7
+(as 'i32 (as 'F32 7.9)) -- 7i
+(as 'b8 (as 'F32 2)) -- true
+(as 'sym (as 'F32 0.5)) -- '0.5
+;; f32 <- vectors (null-preserving), and back
+(type (as 'F32 [1 2 3])) -- 'F32
+(as 'F64 (as 'F32 [1 0Nl 3])) -- [1.0 0Nf 3.0]
+(as 'F64 (as 'F32 [1.5 0Nf 2.25])) -- [1.5 0Nf 2.25]
+(as 'I64 (as 'F32 [1.5 0Nf 7.9])) -- [1 0Nl 7]
+(as 'I16 (as 'F32 [1e10 -1e10])) -- [32767h -32767h]
+(as 'F64 (as 'F32 (list 1 2.5 0Nl))) -- [1.0 2.5 0Nf]
+(nil? (as 'F32 [0Nl 0Nf])) -- [true true]
+;; large enough for the parallel cast path
+(sum (as 'F64 (as 'F32 (til 300000)))) -- 44999850000.0

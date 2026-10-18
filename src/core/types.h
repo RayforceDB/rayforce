@@ -32,6 +32,7 @@
  * Internal .c files can include either rayforce.h directly or types.h.
  */
 #include <rayforce.h>
+#include <float.h>
 
 /* Number of types (positive range): must be > max type ID */
 #define RAY_TYPE_COUNT 15
@@ -65,6 +66,15 @@ static inline int16_t ray_cast_f64_to_i16_null(double v) {
     if (v >= (double)INT16_MAX) return INT16_MAX;
     if (v <= (double)INT16_MIN) return INT16_MIN + 1;
     return (int16_t)v;
+}
+
+/* F32 has no infinities either: a value past FLT_MAX saturates, as the
+ * integer narrowings above do.  NaN (the float null) stays null. */
+static inline float ray_cast_f64_to_f32_null(double v) {
+    if (v != v) return NULL_F32;
+    if (v >= (double)FLT_MAX) return FLT_MAX;
+    if (v <= -(double)FLT_MAX) return -FLT_MAX;
+    return (float)v;
 }
 
 static inline uint8_t ray_cast_f64_to_u8_null(double v) {
