@@ -734,6 +734,9 @@
 (set lctn (fn [tbl y] (select {x: x yy: y from: tbl})))
 (lct Tlc 5) -- (select {from: (lctn Tlc 5) take: 3})
 (lct Plc 5) -- (select {from: (lctn Plc 5) take: 3})
+(at (lct Plc 5) 'yy) -- [5 5 5]
+(lct Plc 5) -- (lct Tlc 5)
+(at (lct Plc 5) 'x) -- [3 1 4]
 (set lcw (fn [tbl y] (select {x: x yy: y from: tbl where: (> x 1) take: 2})))
 (set lcwe (fn [tbl y] (select {x: x yy: y from: tbl where: (> x 1) take: -2})))
 (set lcwn (fn [tbl y] (select {x: x yy: y from: tbl where: (> x 1)})))
@@ -760,7 +763,16 @@
 (lcm Plc 5) -- (select {from: (lcmn Plc 5) take: 3})
 (set lck (fn [tbl x] (select {x: x yy: y from: tbl asc: x take: 3})))
 (set lckn (fn [tbl x] (select {x: x yy: y from: tbl asc: x})))
-(lck Tlc 5) -- (table [x yy] (list [5 5 5] [10 15 20]))
+(count (lck Tlc 5)) -- 3
+(count (lck Plc 5)) -- 3
+(at (lck Tlc 5) 'x) -- [5 5 5]
+(at (lck Plc 5) 'x) -- [5 5 5]
+;; OPEN: which x a sort key names when a parameter x hides the column and
+;; an output is named x is undecided.  The ungrouped path sorts by the
+;; source column (yy [10 15 20] here), the grouped path by the output of
+;; that name (`(fn [tbl x] (select {x: (first x) yy: (sum y) by: y from: tbl
+;; asc: x}))`), so the order is not pinned until one rule covers both:
+;; (lck Tlc 5) -- (table [x yy] (list [5 5 5] [10 15 20]))
 (lck Tlc 5) -- (select {from: (lckn Tlc 5) take: 3})
 (lck Plc 5) -- (select {from: (lckn Plc 5) take: 3})
 ;; a local of the table's rows: gathered in the sorted order, on the flat,
@@ -804,9 +816,11 @@
 (lcb Plc Klc) -- (select {from: (lcbn Plc Klc) take: 1})
 (lcb Slc Klc) -- (select {from: (lcbn Slc Klc) take: 1})
 (value (lcb Slc Klc)) -- (list [1] [80])
-;; a where: reading a local list of another length than the table or a
-;; partition (a membership list) reads the same on every segment: the
-;; parted routes still stream it
+;; the parted routes stream a where: only when the DAG streams it: compiled,
+;; a local or a global is a constant, and only a scalar constant streams.
+;; The set of in / not-in is no row operand: a membership list reads the
+;; same on every segment, whatever its length (one partition's rows here,
+;; or none), and streams
 (set lcin (fn [tbl m] (select {x: x y: y from: tbl where: (in x m) desc: x take: 2})))
 (set lcio (fn [tbl m] (select {x: x y: y from: tbl where: (in x m) asc: x})))
 (set lcc1 (fn [tbl c] (select {x: x from: tbl where: (> x c.lo) desc: x take: 2})))
@@ -819,16 +833,49 @@
 (lcio Qlc [1 4 5 9]) -- (table [x y] (list [1 4 5] [10 30 35]))
 (- (at (.sys.mem) 'sort-perpart-runs) Bso) -- 2
 (lcio Qlc [1 4 5 9]) -- (lcio Ulc [1 4 5 9])
-;; a config dict or a table passed in reads the same on every segment
+(set Bso (at (.sys.mem) 'sort-perpart-runs))
+(lcio Qlc [1 4 5]) -- (lcio Ulc [1 4 5])
+(- (at (.sys.mem) 'sort-perpart-runs) Bso) -- 2
+(set Bso (at (.sys.mem) 'sort-perpart-runs))
+(count (lcio Qlc [])) -- 0
+(- (at (.sys.mem) 'sort-perpart-runs) Bso) -- 2
+(set Bso (at (.sys.mem) 'sort-perpart-runs))
+(at (select {x: x from: Qlc where: (within x [2 5]) desc: x take: 3}) 'x) -- [5 4 3]
+(- (at (.sys.mem) 'sort-perpart-runs) Bso) -- 2
+;; a path into a config dict or a table passed in is no form the DAG
+;; compiles: it is answered on the whole table
 (set Bsc (at (.sys.mem) 'sort-perpart-runs))
 (select {from: (lcc1 Qlc {lo: 2 hi: 9}) take: 9}) -- (lcc1 Ulc {lo: 2 hi: 9})
-(- (at (.sys.mem) 'sort-perpart-runs) Bsc) -- 2
+(- (at (.sys.mem) 'sort-perpart-runs) Bsc) -- 0
 (set Bsc (at (.sys.mem) 'sort-perpart-runs))
 (lcc2 Qlc {lo: 2 hi: 9}) -- (lcc2 Ulc {lo: 2 hi: 9})
-(- (at (.sys.mem) 'sort-perpart-runs) Bsc) -- 2
+(- (at (.sys.mem) 'sort-perpart-runs) Bsc) -- 0
 (set Bsc (at (.sys.mem) 'sort-perpart-runs))
 (lcc3 Qlc (table [x] (list [1 5]))) -- (table [x] (list [5 1]))
-(- (at (.sys.mem) 'sort-perpart-runs) Bsc) -- 2
+(- (at (.sys.mem) 'sort-perpart-runs) Bsc) -- 0
+;; a computed value of the table's or a partition's length (a til, the
+;; first of a list holding a mask, a helper returning a mask, a nested
+;; select over the outer table) is no row operand the DAG streams: parted
+;; answers as flat
+(set Bsc (at (.sys.mem) 'sort-perpart-runs))
+(select {x: x from: Qlc where: (< (til 3) 2) desc: x take: 2}) !- length
+(select {x: x from: Ulc where: (< (til 3) 2) desc: x take: 2}) !- length
+(select {x: x from: Qlc where: (< (til 6) 3) desc: x take: 2}) -- (select {x: x from: Ulc where: (< (til 6) 3) desc: x take: 2})
+(at (select {x: x from: Qlc where: (< (til 6) 3) desc: x take: 2}) 'x) -- [3 2]
+(set Lwm (list [true false true false true true]))
+(set gwm (fn [] [true false true false true true]))
+(set cyl (fn [t] (at t 'y)))
+(select {x: x from: Qlc where: (first Lwm) desc: x take: 3}) !- schema
+(select {x: x from: Ulc where: (first Lwm) desc: x take: 3}) !- schema
+;; xfail BUG: the first of a global list holding a mask raises schema
+;; ("column 'Lwm' not found") in a where: on the flat table too, where it
+;; should filter by the mask
+;; (at (select {x: x from: Ulc where: (first Lwm) desc: x take: 3}) 'x) -- [6 5 3]
+(at (select {x: x from: Qlc where: (gwm) desc: x take: 3}) 'x) -- [6 5 3]
+(select {x: x from: Qlc where: (gwm) asc: x}) -- (select {x: x from: Ulc where: (gwm) asc: x})
+(at (select {x: x from: Qlc where: (in y (cyl (select {y: y from: Qlc where: (> x 4)}))) desc: x take: 3}) 'x) -- [6 5]
+(select {x: x from: Qlc where: (in y (cyl (select {y: y from: Qlc where: (> x 4)}))) asc: x}) -- (select {x: x from: Ulc where: (in y (cyl (select {y: y from: Ulc where: (> x 4)}))) asc: x})
+(- (at (.sys.mem) 'sort-perpart-runs) Bsc) -- 0
 ;; a mask as long as one partition, local or global, is no mask of the
 ;; table: the parted routes raise length as the flat ones do (they
 ;; filtered each partition with it); a global mask of the table's rows
@@ -850,12 +897,15 @@
 (select {x: x from: Qlc where: (> x (avg x)) asc: x take: 2}) -- (select {x: x from: Ulc where: (> x (avg x)) asc: x take: 2})
 (at (select {x: x from: Qlc where: (> x (avg x)) asc: x take: 2}) 'x) -- [4 5]
 (select {x: x from: Qlc where: (> (deltas x) 0) desc: x take: 2}) -- (select {x: x from: Ulc where: (> (deltas x) 0) desc: x take: 2})
-;; only row-wise builtins keep a partition's rows: a right side of in or
-;; not-in that reads a column, bin, concat and the vector distances are the
-;; whole table's (each answered per partition)
+;; only row-wise ops keep a partition's rows: a set of in or not-in that
+;; reads a column, bin, concat and the vector distances are the whole
+;; table's (each answered per partition)
 (set Brw (at (.sys.mem) 'sort-perpart-runs))
 (select {x: x from: Qlc where: (in x (- (/ y 5) 2)) asc: x}) -- (select {x: x from: Ulc where: (in x (- (/ y 5) 2)) asc: x})
 (at (select {x: x from: Qlc where: (in x (- (/ y 5) 2)) asc: x}) 'x) -- [1 2 4 5 6]
+(at (select {x: x from: Qlc where: (in x (- (/ y 5) 4)) asc: x}) 'x) -- [2 3 4]
+(at (select {x: x from: Qlc where: (in x (- (/ y 5) 4)) desc: x take: 2}) 'x) -- [4 3]
+(at (select {x: x from: Qlc where: (not-in x (- (/ y 5) 4)) desc: x take: 2}) 'x) -- [6 5]
 (select {x: x from: Qlc where: (not-in x (- (/ y 5) 2)) asc: x}) -- (select {x: x from: Ulc where: (not-in x (- (/ y 5) 2)) asc: x})
 (select {x: x from: Qlc where: (> (bin y y) 2) asc: x take: 2}) -- (select {x: x from: Ulc where: (> (bin y y) 2) asc: x take: 2})
 (select {x: x from: Qlc where: (in x (concat (- (/ y 5) 2) [9])) asc: x}) -- (select {x: x from: Ulc where: (in x (concat (- (/ y 5) 2) [9])) asc: x})
@@ -863,21 +913,48 @@
 (select {x: x from: Qlc where: (> (* 0.01 y) (cos-dist x y)) asc: x}) -- (select {x: x from: Ulc where: (> (* 0.01 y) (cos-dist x y)) asc: x})
 (select {x: x from: Qlc where: (> (* 3 y) (l2-dist x (* 0 x))) asc: x}) -- (select {x: x from: Ulc where: (> (* 3 y) (l2-dist x (* 0 x))) asc: x})
 (- (at (.sys.mem) 'sort-perpart-runs) Brw) -- 0
-;; a lookup into a value by a column, and a membership in a subquery's
-;; result (its table as long as a partition is the subquery's), are
-;; row-wise: they still stream
+;; a lookup into a value by a column and a membership in a subquery's
+;; result (its table as long as a partition) are no forms the DAG
+;; compiles: they are answered on the whole table
 (set Dlc (dict [1 2 3 4 5 6] [0 0 1 1 0 1]))
 (set Ulc3 (table [x z] (list [1 5 9] [0 0 0])))
 (set cxlc (fn [t] (at t 'x)))
 (set Brw (at (.sys.mem) 'sort-perpart-runs))
 (at (select {x: x from: Qlc where: (== (at Dlc x) 1) desc: x take: 2}) 'x) -- [6 4]
-(- (at (.sys.mem) 'sort-perpart-runs) Brw) -- 2
-(set Brw (at (.sys.mem) 'sort-perpart-runs))
 (at ((fn [t d] (select {x: x from: t where: (== (at d x) 1) desc: x take: 2})) Qlc Dlc) 'x) -- [6 4]
+(at (select {x: x from: Qlc where: (in x (cxlc (select {x: x from: Ulc3 where: (> x 2)}))) desc: x take: 2}) 'x) -- [5]
+(- (at (.sys.mem) 'sort-perpart-runs) Brw) -- 0
+;; a helper the DAG inlines streams when its body is row-wise in its
+;; parameters, bound or written inline; one that reads an aggregate,
+;; directly or through another helper, a draw through a helper, eval, and
+;; a computed callee are answered on the whole table
+(set f2lc (fn [v] (* 2 v)))
+(set galc (fn [] (avg x)))
+(set halc (fn [] (galc)))
+(set rlc (fn [] (rand 6 100)))
+(set Brw (at (.sys.mem) 'sort-perpart-runs))
+(at (select {x: x from: Qlc where: (> (f2lc x) 5) desc: x take: 2}) 'x) -- [6 5]
 (- (at (.sys.mem) 'sort-perpart-runs) Brw) -- 2
 (set Brw (at (.sys.mem) 'sort-perpart-runs))
-(at (select {x: x from: Qlc where: (in x (cxlc (select {x: x from: Ulc3 where: (> x 2)}))) desc: x take: 2}) 'x) -- [5]
+(select {x: x from: Qlc where: (> (f2lc x) 5) asc: x}) -- (select {x: x from: Ulc where: (> (f2lc x) 5) asc: x})
 (- (at (.sys.mem) 'sort-perpart-runs) Brw) -- 2
+(set Brw (at (.sys.mem) 'sort-perpart-runs))
+(at (select {x: x from: Qlc where: (> ((fn [v] (* 2 v)) x) 5) desc: x take: 2}) 'x) -- [6 5]
+(- (at (.sys.mem) 'sort-perpart-runs) Brw) -- 2
+(set Brw (at (.sys.mem) 'sort-perpart-runs))
+(at (select {x: x from: Qlc where: (> x (halc)) asc: x take: 2}) 'x) -- [4 5]
+(at (select {x: x from: Qlc where: (> x (galc)) asc: x}) 'x) -- [4 5 6]
+(at (select {x: x from: Qlc where: (> x ((fn [] (avg x)))) asc: x take: 2}) 'x) -- [4 5]
+(count (select {x: x from: Qlc where: (>= (rlc) 0) desc: x take: 2})) -- 2
+(at (select {x: x from: Qlc where: (eval (list > 'x 4)) desc: x take: 2}) 'x) -- [6 5]
+(at (select {x: x from: Qlc where: (> ((if (> 1 0) f2lc neg) x) 5) desc: x take: 2}) 'x) -- [6 5]
+(- (at (.sys.mem) 'sort-perpart-runs) Brw) -- 0
+;; an output a helper computes takes the general path (the routes gather
+;; bare columns)
+(set Brw (at (.sys.mem) 'sort-perpart-runs))
+(select {x: x d: (f2lc x) from: Qlc desc: x take: 2}) -- (select {x: x d: (f2lc x) from: Ulc desc: x take: 2})
+(select {x: x d: ((fn [v] (* 2 v)) x) from: Qlc asc: x}) -- (select {x: x d: ((fn [v] (* 2 v)) x) from: Ulc asc: x})
+(- (at (.sys.mem) 'sort-perpart-runs) Brw) -- 0
 ;; a mask as long as one partition read through a dict path, an at chain or
 ;; a table column is no mask of the table: parted raises length as flat does
 (set Cdm {m: [true false true] a: {b: {d: {e: [true false true]}}}})
@@ -895,8 +972,9 @@
 (lctm Ulc (table [m] (list [true false true]))) !- length
 (lcde Qlc Cdw) -- (lcde Ulc Cdw)
 (at (lcde Qlc Cdw) 'x) -- [1 3 5 6]
-;; more row-wise verbs keep the stream: the null test, sym-name, str-find,
-;; text concat under like, within between row-wise bounds
+;; the null test, if and within between row-wise bounds stream; sym-name
+;; and a cast to STR are no forms the DAG compiles, so str-find, like and
+;; a text concat over them are answered on the whole table
 (.db.splayed.set "/tmp/rfl_cklocal/w/2024.01.01/t/" (table [x y s] (list [1 2 3] [10.0 0Nf 20.0] ['a 'b 'c])))
 (.db.splayed.set "/tmp/rfl_cklocal/w/2024.01.02/t/" (table [x y s] (list [4 5 6] [30.0 35.0 0Nf] ['a 'x 'b])))
 (set Pwr (.db.parted.get "/tmp/rfl_cklocal/w/" 't))
@@ -916,18 +994,25 @@
 (- (at (.sys.mem) 'sort-perpart-runs) Brw) -- 2
 (set Brw (at (.sys.mem) 'sort-perpart-runs))
 (lcw3 Pwr) -- (lcw3 Fwr)
-(- (at (.sys.mem) 'sort-perpart-runs) Brw) -- 2
+(- (at (.sys.mem) 'sort-perpart-runs) Brw) -- 0
 (set Brw (at (.sys.mem) 'sort-perpart-runs))
 (lcw4 Pwr) -- (lcw4 Fwr)
-(- (at (.sys.mem) 'sort-perpart-runs) Brw) -- 2
+(- (at (.sys.mem) 'sort-perpart-runs) Brw) -- 0
 (set Brw (at (.sys.mem) 'sort-perpart-runs))
 (lcw5 Pwr) -- (lcw5 Fwr)
-(- (at (.sys.mem) 'sort-perpart-runs) Brw) -- 2
+(- (at (.sys.mem) 'sort-perpart-runs) Brw) -- 0
 (at (lcw5 Pwr) 'x) -- [4 1]
 (set Brw (at (.sys.mem) 'sort-perpart-runs))
 (lcw6 Pwr) -- (lcw6 Fwr)
 (- (at (.sys.mem) 'sort-perpart-runs) Brw) -- 2
 (at (lcw6 Pwr) 'x) -- [5 4]
+(set Brw (at (.sys.mem) 'sort-perpart-runs))
+(at (select {x: x from: Pwr where: (like s "a*") desc: x take: 2}) 'x) -- [4 1]
+(- (at (.sys.mem) 'sort-perpart-runs) Brw) -- 2
+;; the clock verbs read the clock, not a row: answered on the whole table
+(set Brw (at (.sys.mem) 'sort-perpart-runs))
+(at (select {x: x from: Pwr where: (< 0 (as 'I64 (timestamp 'local))) desc: x take: 2}) 'x) -- [6 5]
+(- (at (.sys.mem) 'sort-perpart-runs) Brw) -- 0
 ;; a concat of collections is not row-wise (it changes the length)
 (set Brw (at (.sys.mem) 'sort-perpart-runs))
 (select {x: x from: Pwr where: (in x (concat (as 'I64 y) [4])) desc: x take: 2}) -- (select {x: x from: Fwr where: (in x (concat (as 'I64 y) [4])) desc: x take: 2})
@@ -960,6 +1045,20 @@
 (cdl Scd Vcd) -- [4 4 4]
 (cdl Pcd Vcd) -- [4 4 4]
 (cdz Pcd Vcd) -- [4 4 4]
+;; a helper that reads a column, itself or through another helper, reads
+;; the rows: its operand is counted per group, as sum sees it
+(set gycd (fn [] y))
+(set hycd (fn [z] (+ y z)))
+(set iycd (fn [] (gycd)))
+(at (select {c: (count (distinct (gycd))) by: k from: Tcd}) 'c) -- [1 2 2]
+(at (select {c: (count (distinct (gycd))) by: k from: Scd}) 'c) -- [1 2 2]
+(at (select {c: (count (distinct (gycd))) by: k from: Pcd}) 'c) -- [1 2 2]
+(at (select {c: (count (distinct (hycd 0))) by: k from: Tcd}) 'c) -- [1 2 2]
+(at (select {c: (count (distinct (hycd 0))) by: k from: Scd}) 'c) -- [1 2 2]
+(at (select {c: (count (distinct (hycd 0))) by: k from: Pcd}) 'c) -- [1 2 2]
+(at (select {c: (count (distinct (iycd))) by: k from: Tcd}) 'c) -- [1 2 2]
+(at (select {c: (count (distinct (iycd))) by: k from: Pcd}) 'c) -- [1 2 2]
+(at (select {c: (sum (gycd)) by: k from: Tcd}) 'c) -- [20 50 90]
 ((fn [tbl y] (at (select {c: (count y) by: k from: tbl}) 'c)) Tcd Vcd) -- ((fn [tbl z] (at (select {c: (count z) by: k from: tbl}) 'c)) Tcd Vcd)
 (set cdlt (fn [tbl y] (select {c: (count (distinct y)) by: k from: tbl desc: c take: 1})))
 (set cdltn (fn [tbl y] (select {c: (count (distinct y)) by: k from: tbl desc: c})))
@@ -996,6 +1095,16 @@
 (cdk Scd Kcd) -- [2 3]
 (cdk Pcd Kcd) -- [2 3]
 (at (select {c: (count (distinct y)) by: Kcd from: Tcd}) 'c) -- [2 3]
+;; the key keeps its name on the aggregate grouping too (its constant carried
+;; no name there)
+(set cdks (fn [tbl k] (select {s: (sum y) by: k from: tbl})))
+(key (cdks Tcd Kcd)) -- [k s]
+(key (cdks Scd Kcd)) -- [k s]
+(key (cdks Pcd Kcd)) -- [k s]
+(value (cdks Pcd Kcd)) -- (list [1 2] [40 120])
+(key (select {s: (sum y) by: Kcd from: Tcd})) -- [Kcd s]
+(key (select {s: (sum y) by: Kcd from: Tcd where: (> y 15)})) -- [Kcd s]
+(key ((fn [tbl k] (select {s: (sum y) by: k from: tbl where: (> y 15)})) Pcd Kcd)) -- [k s]
 (set cdkt (fn [tbl k] (select {c: (count (distinct y)) by: k from: tbl desc: c take: 1})))
 (value (cdkt Tcd Kcd)) -- (list [2] [3])
 (value (cdkt Pcd Kcd)) -- (list [2] [3])
@@ -1035,10 +1144,15 @@ Ctg -- 1
 ;; column too, and no hidden key: a where: on the name the key's local hides
 ;; leaves the parted table whole, as on its flat copy
 (set nok (fn [t k] (select {from: t by: k where: (> k 1)})))
-(nok Pcd [9 2 2 3 3 3]) -- (nok (select {from: Pcd}) [9 2 2 3 3 3])
-(key (nok Pcd [9 2 2 3 3 3])) -- (key (nok (select {from: Pcd}) [9 2 2 3 3 3]))
-(key (nok Pcd [5 5 7 7 9 9])) -- (key (nok (select {from: Pcd}) [5 5 7 7 9 9]))
-(nok Pcd [5 5 7 7 9 9]) -- (nok (select {from: Pcd}) [5 5 7 7 9 9])
+(set Fcd (select {from: Pcd where: (> y 0)}))
+(key (nok Pcd [9 2 2 3 3 3])) -- [k date y]
+(nok Pcd [9 2 2 3 3 3]) -- (nok Fcd [9 2 2 3 3 3])
+(key (nok Pcd [9 2 2 3 3 3])) -- (key (nok Fcd [9 2 2 3 3 3]))
+(key (nok Pcd [5 5 7 7 9 9])) -- (key (nok Fcd [5 5 7 7 9 9]))
+(nok Pcd [5 5 7 7 9 9]) -- (nok Fcd [5 5 7 7 9 9])
+(nok Scd [9 2 2 3 3 3]) -- (nok Tcd [9 2 2 3 3 3])
+(nok Scd [5 5 7 7 9 9]) -- (nok Tcd [5 5 7 7 9 9])
+(value (nok Scd [5 5 7 7 9 9])) -- (list [5 7 9] [10 20 40])
 ;; the carried key costs only the columns the clauses read: an aggregate
 ;; route leaves the parted table as it is (the grouping reads the name), and
 ;; the eval-level route copies the columns its clauses name, not the other

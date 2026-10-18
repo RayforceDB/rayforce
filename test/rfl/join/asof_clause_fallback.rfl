@@ -150,11 +150,12 @@
 (at (ali Lll Llr [10 50]) 'B) -- [100 500]
 (- (at (.sys.mem) 'asof-perpart-runs) Bli) -- 2
 (value (ali Lll Llr [10 50])) -- (value (ali Fll Flr [10 50]))
-;; a config dict reads the same on every day: it still streams
+;; a path into a config dict is no form the DAG compiles: the operand is
+;; joined by the flat kernel
 (set alc (fn [l r c] (asof-join [Ts] (select {from: l where: (> P c.lo)}) (select {from: r}))))
 (set Blc (at (.sys.mem) 'asof-perpart-runs))
 (at (alc Lll Llr {lo: 15}) 'B) -- [200 300 400 500 600]
-(- (at (.sys.mem) 'asof-perpart-runs) Blc) -- 2
+(- (at (.sys.mem) 'asof-perpart-runs) Blc) -- 0
 (value (alc Lll Llr {lo: 15})) -- (value (alc Fll Flr {lo: 15}))
 ;; a mask as long as one day, local or global, is no mask of the table: it
 ;; raises length as on the flat tables (it filtered each day); a global mask
@@ -185,4 +186,26 @@
 (set Brw (at (.sys.mem) 'asof-perpart-runs))
 (at (asof-join [Ts] (select {Ts: Ts c: (* 2 P) from: Lll}) (select {from: Llr})) 'c) -- [20 40 60 80 100 120]
 (- (at (.sys.mem) 'asof-perpart-runs) Brw) -- 2
+;; a projection calling a helper the DAG inlines streams when the helper is
+;; row-wise in its parameters; one reading an aggregate is the whole table's
+(set a2p (fn [v] (* 2 v)))
+(set aap (fn [] (avg P)))
+(set Brw (at (.sys.mem) 'asof-perpart-runs))
+(at (asof-join [Ts] (select {Ts: Ts c: (a2p P) from: Lll}) (select {from: Llr})) 'c) -- [20 40 60 80 100 120]
+(- (at (.sys.mem) 'asof-perpart-runs) Brw) -- 2
+(set Brw (at (.sys.mem) 'asof-perpart-runs))
+(at (asof-join [Ts] (select {from: Lll where: (> P (aap))}) (select {from: Llr})) 'P) -- [40 50 60]
+(value (asof-join [Ts] (select {Ts: Ts c: (- P (aap)) from: Lll}) (select {from: Llr}))) -- (value (asof-join [Ts] (select {Ts: Ts c: (- P (aap)) from: Fll}) (select {from: Flr})))
+(- (at (.sys.mem) 'asof-perpart-runs) Brw) -- 0
+;; a parameter that hides a projected column is the parameter: a vector of
+;; the table's rows is the whole table's, a scalar the same on every day
+(set alp (fn [l r P] (asof-join [Ts] (select {Ts: Ts P: P from: l}) (select {from: r}))))
+(set Brw (at (.sys.mem) 'asof-perpart-runs))
+(at (alp Lll Llr [1 2 3 4 5 6]) 'P) -- [1 2 3 4 5 6]
+(- (at (.sys.mem) 'asof-perpart-runs) Brw) -- 0
+(value (alp Lll Llr [1 2 3 4 5 6])) -- (value (alp Fll Flr [1 2 3 4 5 6]))
+(set Brw (at (.sys.mem) 'asof-perpart-runs))
+(at (alp Lll Llr 7) 'P) -- [7 7 7 7 7 7]
+(- (at (.sys.mem) 'asof-perpart-runs) Brw) -- 2
+(value (alp Lll Llr 7)) -- (value (alp Fll Flr 7))
 (.sys.exec "rm -rf /tmp/rfl_asof_cf_ll /tmp/rfl_asof_cf_lr")

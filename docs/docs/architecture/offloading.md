@@ -140,9 +140,32 @@ The following operations are safe for segment streaming. All other operations tr
 
 When adding new element-wise operations to Rayforce, they must be added to the `op_streamable()` whitelist in `exec.c` to participate in segment streaming.
 
+## Per-Partition Sort, Take and Asof
+
+Three routes run a `select` over a parted table one partition at a time and merge the results, counted in `.sys.mem`:
+
+- **Sorted partitions** (`sort-perpart-runs`): `asc:` or `desc:` on bare columns, without `by:` or `take:`, when every partition is sorted on the keys and their key ranges follow each other; the partitions' results are concatenated.
+- **Top-k** (`sort-perpart-runs`): `asc:`/`desc:` with a positive `take:`; each partition yields its own top `k`, and one more sort over those candidates gives the result.
+- **Asof operands** (`asof-perpart-runs`): a `(select {from: parted …})` operand of `asof-join` without `by:`, `take:`, `asc:`, `desc:` or `nearest:` is joined day by day.
+
+On the two sort routes every output must be a bare column that no lambda parameter or `let` of its name hides. A `where:`, and on the asof route every projection too, runs on a partition only when the DAG streams it: the clause is compiled as a query expression and must pass the streamable-operations check above. What streams:
+
+- row-wise operations over the columns (the table above), `if`, `within` with constant or row-wise bounds;
+- scalar constants: literals, and lambda parameters, `let`s and globals holding an atom;
+- the set of `in`/`not-in` when it is a constant (a membership list, of any length);
+- a call of a single-expression helper whose body is any of these in its parameters, named or written inline.
+
+What falls back to the flat path (the whole table in memory, the same answer):
+
+- a vector held by a lambda parameter, a `let` or a global, of any length (a mask, a projected vector), and anything computed to the table's or a partition's length (`til`, a helper returning a vector, a nested `select`);
+- aggregates, scans and windows (`avg`, `sums`, `deltas`, `fills`), also inside a helper or through a chain of helpers;
+- the set of `in`/`not-in` computed from columns;
+- forms the compiler does not lower: `rand`, `eval`, the clock functions `date`, `time` and `timestamp`, a computed callee, a closure, a path into a dict or table (`c.lo`, `(at c 'lo)`), a lookup `(at d x)`, `sym-name`, a cast to `STR`, elementwise `min`/`max`, `bin`/`binr`, `find`, `map`/`pmap`;
+- a clause that reads no column and is not one scalar constant.
+
 ## Current Limitations
 
-- **No streaming for aggregations, sorts, or joins** — these operations require seeing all data at once (or specialized merge logic). They fall back to loading all partitions into memory. This will be addressed in a future release with operator-aware merge functions.
+- **Aggregations, joins and other sorts** need seeing all data at once or specialized merge logic. Outside the per-partition routes they fall back to loading all partitions into memory.
 - **Pruning requires literal constants** — the partition pruning pass only handles comparisons against literal values (e.g., `date > 2024.01.01`), not computed expressions (e.g., `date > (today - 30)`).
 - **Single partition column** — pruning works on the single partition key inferred from directory names. Multi-column partition keys are not supported.
 - **Thread-local memory pressure** — `ray_mem_pressure()` only reads the calling thread's heap statistics, not the global total across all worker threads. It is not currently used in the streaming hot path.

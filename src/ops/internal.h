@@ -1418,6 +1418,12 @@ bool ray_key_cols_sorted(ray_t** key_cols, int64_t n_keys, uint8_t descending,
  * in exec.c; consumed by the streaming parted asof path in query.c. */
 ray_t* build_segment_table(ray_t* parted_tbl, int32_t seg_idx);
 
+/* May the DAG rooted at `root` run segment by segment with a concat merge:
+ * streamable ops only, scalar constants only, and a scan of the default
+ * table.  Defined in exec.c; the parted per-segment sort/take and asof
+ * routes in query.c decide a clause's eligibility with it. */
+bool dag_can_stream(ray_graph_t* g, ray_op_t* root);
+
 /* Ordered concat-merge of two partial partition-streamed results (tables:
  * per-column concat; vectors: direct concat).  Returns an OWNED result.
  * Defined in exec.c; consumed by the streaming parted asof path in query.c. */

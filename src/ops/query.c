@@ -4380,7 +4380,21 @@ static ray_t* count_distinct_src_col(ray_t* tbl, ray_t* inner) {
     return ray_table_get_col(tbl, inner->i64);
 }
 
-static bool clause_reads_a_col(ray_t* v, ray_t* tbl);
+static bool sym_names_col(ray_t* tbl, int64_t s);
+
+/* Does a count(distinct) operand the evaluator resolves read none of the
+ * table's rows, so that it stays a collection counted whole in every group:
+ * a name that reads no column (a lexical local, a global), or an expression
+ * the planner lowers to constants alone (bound vectors and literals).  The
+ * planner inlines a helper, so one whose body reads a column, itself or
+ * through another helper, reads the rows; an operand the planner does not
+ * lower is taken to read them and is gathered per group. */
+static bool cd_operand_is_collection(ray_t* inner, ray_t* tbl) {
+    if (!inner) return false;
+    if (inner->type == -RAY_SYM && !(inner->attrs & ATTR_QUOTED))
+        return !sym_names_col(tbl, inner->i64);
+    return expr_is_constant_collection(inner, tbl, NULL);
+}
 
 static ray_t* match_count_distinct(ray_t* expr) {
     if (!expr || expr->type != RAY_LIST) return NULL;
@@ -8117,10 +8131,10 @@ static ray_t* count_distinct_per_group_buf(ray_t* inner_expr, ray_t* tbl,
             src = ray_lazy_materialize(src);
             if (!src || RAY_IS_ERR(src)) return src ? src : ray_error("oom", NULL);
         }
-        /* An operand that reads no column of the table (a bound vector, a
+        /* An operand that reads none of the table's rows (a bound vector, a
          * parameter named like a column) stays a collection: every group
          * counts its distinct values, as `(count v)` counts it whole. */
-        if (!clause_reads_a_col(inner_expr, tbl)) {
+        if (cd_operand_is_collection(inner_expr, tbl)) {
             ray_t* d = ray_distinct_fn(src);
             if (d && !RAY_IS_ERR(d) && ray_is_lazy(d)) d = ray_lazy_materialize(d);
             ray_release(src);
@@ -11674,255 +11688,57 @@ static bool sym_names_col(ray_t* tbl, int64_t s) {
     return ray_table_get_col(tbl, head) != NULL;
 }
 
-/* Is `n` a row count of the parted table `tbl`: its own, or one of its
- * partitions'? */
-static bool parted_row_count_like(ray_t* tbl, int64_t n) {
-    if (n == ray_table_nrows(tbl)) return true;
-    int64_t nc = ray_table_ncols(tbl);
-    for (int64_t c = 0; c < nc; c++) {
-        ray_t* col = ray_table_get_col_idx(tbl, c);
-        if (!col || !RAY_IS_PARTED(col->type)) continue;
-        ray_t** segs = (ray_t**)ray_data(col);
-        for (int64_t i = 0; i < col->len; i++)
-            if (segs[i] && segs[i]->len == n) return true;
-        return false;
+/* Does clause `v`, run on one partition's segment of the parted table
+ * `tbl`, give that segment's rows of what it gives on the whole table, so
+ * the per-segment sort/take and asof routes may run it partition by
+ * partition?  The DAG decides: `v` is compiled into a scratch graph over
+ * `tbl` (compile_expr_dag) and the executor's streaming admission
+ * (dag_can_stream) must accept it: row-wise ops over the table's columns
+ * and scalar constants.  A lexical local or a global compiles to a
+ * constant, so a vector of any length (a mask of the table's or of one
+ * partition's rows, a projected vector) is refused, as are an aggregate, a
+ * scan, a moving window, a form the compiler does not lower (a nested
+ * query, `til`, `rand`, `eval`, a computed callee, a closure, a dict path)
+ * and a helper whose inlined body holds one of them.  Two things that
+ * admission cannot tell are settled here:
+ *   - the set of `in`/`not-in` is no row operand: a constant set (a
+ *     membership list of any length) reads the same on every segment and
+ *     is admitted, while a set computed over the columns would be one
+ *     partition's on each segment and is refused (the admission walks the
+ *     set as an elementwise operand);
+ *   - a clause that compiles to one scalar constant (a literal, a local or
+ *     global atom) is the same on every segment and is admitted (the
+ *     admission refuses a graph that scans no column, since the executor's
+ *     streaming would repeat such a result per partition). */
+static bool clause_streams_per_segment(ray_t* v, ray_t* tbl) {
+    if (!v || RAY_IS_ERR(v) || !tbl || tbl->type != RAY_TABLE) return false;
+    ray_graph_t* g = ray_graph_new(tbl);
+    if (!g) return false;
+    ray_op_t* root = compile_expr_dag(g, v);
+    bool ok = root != NULL;
+    uint32_t root_id = ok ? root->id : 0;
+    if (ok && root->opcode == OP_CONST) {
+        ray_op_ext_t* ext = find_ext(g, root_id);
+        ok = ext && ext->literal && ray_is_atom(ext->literal);
+        ray_graph_free(g);
+        return ok;
     }
-    return false;
-}
-
-/* Does value `b` hold one value per row of `tbl` or of one of its
- * partitions: a vector or list that long, or a table of that many rows? */
-static bool value_row_like(ray_t* b, ray_t* tbl) {
-    if (!b || RAY_IS_ERR(b) || ray_is_atom(b) || b->type == RAY_DICT) return false;
-    if (b->type == RAY_TABLE) return parted_row_count_like(tbl, ray_table_nrows(b));
-    return parted_row_count_like(tbl, ray_len(b));
-}
-
-/* Is `b` a builtin that runs a query of its own (its dict names that
- * query's table and columns, not the outer one's)? */
-static bool builtin_runs_query(ray_t* b) {
-    static const char* const q[] = { "select", "update", "insert", "upsert", "delete" };
-    return builtin_named(b, q, sizeof q / sizeof q[0]);
-}
-
-/* The entry `key` of dict `d`, or the column `key` of table `d`; owned,
- * NULL when there is none. */
-static ray_t* value_entry(ray_t* d, int64_t key) {
-    if (!d || RAY_IS_ERR(d)) return NULL;
-    if (d->type == RAY_TABLE) {
-        ray_t* c = ray_table_get_col(d, key);
-        if (c) ray_retain(c);
-        return c;
+    /* The scalar a constant set is swapped for, made before the loop
+     * takes node pointers (a new node may move g->nodes). */
+    ray_op_t* unit = ok ? ray_const_bool(g, true) : NULL;
+    ok = unit != NULL;
+    uint32_t unit_id = ok ? unit->id : 0;
+    for (uint32_t i = 0; ok && i < g->node_count; i++) {
+        ray_op_t* op = &g->nodes[i];
+        if ((op->opcode != OP_IN && op->opcode != OP_NOT_IN) || op->arity < 2) continue;
+        ray_op_t* set = op_child(g, op, 1);
+        if (!set) ok = false;
+        else if (set->opcode == OP_CONST) op->in_id[1] = unit_id;
+        else if (dag_can_stream(g, set)) ok = false;   /* a set over the rows */
     }
-    if (d->type != RAY_DICT) return NULL;
-    ray_t* k = ray_sym(key);
-    if (!k || RAY_IS_ERR(k)) return NULL;
-    ray_t* v = ray_dict_get(d, k);
-    ray_release(k);
-    return v && RAY_IS_ERR(v) ? NULL : v;
-}
-
-/* The value clause value `v` reads without the table's rows: a name that is
- * no column of `tbl` (a lexical local, a global), a dotted path into one, or
- * `(at X 'k)` / `(X 'k)` of such a value.  Owned, NULL for anything else. */
-static ray_t* clause_static_value(ray_t* v, ray_t* tbl, int depth) {
-    if (!v || RAY_IS_ERR(v) || depth > 64) return NULL;
-    if (v->type == -RAY_SYM) {
-        if (v->attrs & ATTR_QUOTED) return NULL;
-        const int64_t* segs = &v->i64;
-        int nsegs = 1;
-        if (ray_sym_is_dotted(v->i64)) nsegs = ray_sym_segs(v->i64, &segs);
-        if (nsegs < 1) return NULL;
-        ray_t* b = ray_env_get_lexical_local(segs[0]);
-        if (!b) {
-            if (ray_table_get_col(tbl, segs[0])) return NULL;   /* the column */
-            b = ray_env_get(segs[0]);
-        }
-        if (!b) return NULL;
-        ray_retain(b);
-        for (int i = 1; i < nsegs && b; i++) {
-            ray_t* nb = value_entry(b, segs[i]);
-            ray_release(b);
-            b = nb;
-        }
-        return b;
-    }
-    if (v->type != RAY_LIST || (v->len != 2 && v->len != 3)) return NULL;
-    ray_t** el = (ray_t**)ray_data(v);
-    ray_t* cont = NULL;
-    ray_t* key = NULL;
-    if (v->len == 3 && el[0] && el[0]->type == -RAY_SYM && !(el[0]->attrs & ATTR_QUOTED)) {
-        static const char* const at_fn[] = { "at" };
-        if (!builtin_named(sym_binding(el[0]->i64), at_fn, 1)) return NULL;
-        cont = el[1]; key = el[2];
-    } else if (v->len == 2) {
-        cont = el[0]; key = el[1];
-    }
-    if (!cont || !key || key->type != -RAY_SYM || !(key->attrs & ATTR_QUOTED)) return NULL;
-    ray_t* c = clause_static_value(cont, tbl, depth + 1);
-    if (!c) return NULL;
-    ray_t* r = value_entry(c, key->i64);
-    ray_release(c);
-    return r;
-}
-
-/* Does clause value `v` read a value that is no column of the parted table
- * `tbl` (a lexical local, a global, a path or an `at` into one) holding one
- * value per row of the table or of one of its partitions
- * (value_row_like)?  Run on a partition's segment, the clause would read
- * the whole table's value against that segment's rows, or a value as long
- * as one partition against every one.  Scalars, config dicts and
- * membership lists read the same on every segment.  A quoted form reads
- * nothing. */
-static bool clause_reads_row_local(ray_t* v, ray_t* tbl) {
-    if (!v || RAY_IS_ERR(v)) return false;
-    ray_t* sv = clause_static_value(v, tbl, 0);
-    if (sv) {
-        bool row = value_row_like(sv, tbl);
-        ray_release(sv);
-        return row;
-    }
-    if (v->type == RAY_DICT) {   /* each value on its own */
-        ray_t* dv = ray_dict_vals(v);
-        if (!dv || dv->type != RAY_LIST) return clause_reads_row_local(dv, tbl);
-        for (int64_t i = 0; i < dv->len; i++)
-            if (clause_reads_row_local(((ray_t**)ray_data(dv))[i], tbl)) return true;
-        return false;
-    }
-    if (v->type != RAY_LIST) return false;
-    ray_t** el = (ray_t**)ray_data(v);
-    if (v->len >= 1 && el[0] && el[0]->type == -RAY_SYM && !(el[0]->attrs & ATTR_QUOTED)) {
-        if (v->len == 2 && el[0]->i64 == ray_sym_intern("quote", 5)) return false;
-        if (builtin_runs_query(sym_binding(el[0]->i64))) return false;   /* reads its own table */
-    }
-    for (int64_t i = 0; i < v->len; i++) if (clause_reads_row_local(el[i], tbl)) return true;
-    return false;
-}
-
-
-/* Does `v` read a column of `tbl` anywhere: a name no local hides, or
- * (when `quoted`, as in a clause) a literal symbol naming one, which a
- * query reads as that column?  A nested query reads its own table. */
-static bool clause_reads_a_col_in(ray_t* v, ray_t* tbl, bool quoted) {
-    if (!v || RAY_IS_ERR(v)) return false;
-    if (v->type == -RAY_SYM)
-        return (v->attrs & ATTR_QUOTED) ? quoted && ray_table_get_col(tbl, v->i64) != NULL
-                                        : sym_names_col(tbl, v->i64);
-    if (v->type == RAY_DICT) {   /* each value on its own */
-        ray_t* dv = ray_dict_vals(v);
-        if (!dv || dv->type != RAY_LIST) return clause_reads_a_col_in(dv, tbl, quoted);
-        for (int64_t i = 0; i < dv->len; i++)
-            if (clause_reads_a_col_in(((ray_t**)ray_data(dv))[i], tbl, quoted)) return true;
-        return false;
-    }
-    if (v->type != RAY_LIST) return false;
-    ray_t** el = (ray_t**)ray_data(v);
-    if (v->len >= 1 && el[0] && el[0]->type == -RAY_SYM && !(el[0]->attrs & ATTR_QUOTED)) {
-        if (v->len == 2 && el[0]->i64 == ray_sym_intern("quote", 5)) return false;
-        if (builtin_runs_query(sym_binding(el[0]->i64))) return false;
-    }
-    for (int64_t i = 0; i < v->len; i++) if (clause_reads_a_col_in(el[i], tbl, quoted)) return true;
-    return false;
-}
-
-static bool clause_reads_a_col(ray_t* v, ray_t* tbl) {
-    return clause_reads_a_col_in(v, tbl, true);
-}
-
-/* Does lambda `lam`'s body read a column of `tbl` by a free name (a name
- * no parameter of it binds)?  Conservative: a parameter named like a
- * column counts as a read. */
-static bool lambda_reads_a_col(ray_t* lam, ray_t* tbl) {
-    if (!lam || lam->type != RAY_LAMBDA) return true;
-    return clause_reads_a_col_in(LAMBDA_BODY(lam), tbl, false);   /* a quoted name is a symbol there */
-}
-
-/* Does clause value `v` compute something over the rows of `tbl` whose
- * value on one partition's segment is not that segment's rows of its value
- * on the whole table?  Only row-wise builtins keep a segment's rows: the
- * elementwise ones (arithmetic, comparisons, logic, casts, temporal
- * fields, `nil?`, `sym-name`), `if`, `in`/`not-in`/`within`/`like`/
- * `str-find` whose right side reads no column, `within` between bounds
- * `(list lo hi)` that are row-wise themselves, text `concat` under `like`,
- * and `at`/indexing into a value that reads no column.  Any
- * other builtin over a column (an aggregate, a scan, sums, deltas, rank,
- * bin, concat, inner-prod, a moving window, take) answers per partition, as
- * do a lambda that reads a column, a callee the clause computes, and
- * `rand` (one draw per segment).  A call over values alone reads the same
- * on every segment. */
-static bool clause_segment_sensitive(ray_t* v, ray_t* tbl) {
-    static const char* const row_fn[] = {
-        "and", "or", "not", "neg", "round", "floor", "ceil", "abs", "sqrt", "log",
-        "exp", "sin", "asin", "cos", "acos", "tan", "atan", "reciprocal", "signum",
-        "pow", "div", "fill", "if", "as", "xbar", "date", "time", "timestamp", "ss",
-        "hh", "minute", "yyyy", "mm", "dd", "dow", "doy", "strlen", "nil?", "sym-name" };
-    static const char* const row_first[] = { "in", "not-in", "within", "like", "str-find" };
-    static const char* const draw[] = { "rand" };
-    if (!v || RAY_IS_ERR(v)) return false;
-    if (v->type == RAY_LAMBDA) return true;
-    if (v->type == RAY_DICT) {   /* each value on its own: the values list is no call */
-        ray_t* dv = ray_dict_vals(v);
-        if (!dv || dv->type != RAY_LIST) return clause_segment_sensitive(dv, tbl);
-        for (int64_t i = 0; i < dv->len; i++)
-            if (clause_segment_sensitive(((ray_t**)ray_data(dv))[i], tbl)) return true;
-        return false;
-    }
-    if (v->type != RAY_LIST || v->len < 1) return false;
-    ray_t** el = (ray_t**)ray_data(v);
-    ray_t* head = el[0];
-    if (!head || head->type != -RAY_SYM || (head->attrs & ATTR_QUOTED)) {
-        if (head && (head->type == RAY_LIST || head->type == RAY_LAMBDA))
-            return true;                                         /* a computed callee */
-        for (int64_t i = 0; i < v->len; i++) if (clause_segment_sensitive(el[i], tbl)) return true;
-        return false;
-    }
-    if (head->i64 == ray_sym_intern("quote", 5)) return false;
-    if (sym_names_col(tbl, head->i64)) return true;              /* indexing a column */
-    ray_t* b = sym_binding(head->i64);
-    if (b && b->type == -RAY_SYM) b = sym_binding(b->i64);       /* a name of a function */
-    static const char* const like_fn[] = { "like" };
-    static const char* const within_fn[] = { "within" };
-    static const char* const concat_fn[] = { "concat" };
-    static const char* const list_fn[] = { "list" };
-    bool args_sensitive = false;
-    for (int64_t i = 1; i < v->len && !args_sensitive; i++) {
-        ray_t* a = el[i];
-        ray_t** ae = (a && a->type == RAY_LIST && a->len >= 1) ? (ray_t**)ray_data(a) : NULL;
-        ray_t* ah = ae && ae[0] && ae[0]->type == -RAY_SYM && !(ae[0]->attrs & ATTR_QUOTED)
-                  ? sym_binding(ae[0]->i64) : NULL;
-        /* `like` matches text: a concat under it joins text row by row;
-         * `within` bounds written `(list lo hi)` are compared row by row */
-        if ((i == 1 && builtin_named(b, like_fn, 1) && builtin_named(ah, concat_fn, 1)) ||
-            (i == 2 && builtin_named(b, within_fn, 1) && builtin_named(ah, list_fn, 1))) {
-            for (int64_t j = 1; j < a->len && !args_sensitive; j++)
-                args_sensitive = clause_segment_sensitive(ae[j], tbl);
-            continue;
-        }
-        args_sensitive = clause_segment_sensitive(a, tbl);
-    }
-    if (args_sensitive) return true;
-    if (!b) return clause_reads_a_col(v, tbl);
-    if (b->type == RAY_LAMBDA)
-        return clause_reads_a_col(v, tbl) || lambda_reads_a_col(b, tbl);
-    if (builtin_runs_code(b)) return true;
-    if (builtin_named(b, draw, 1)) return true;
-    if (b->type <= RAY_LAMBDA || b->type > RAY_VARY)
-        return false;                         /* indexing a value: row-wise in its index */
-    if ((b->attrs & RAY_FN_ATOMIC) || builtin_named(b, row_fn, sizeof row_fn / sizeof row_fn[0]))
-        return false;
-    if (builtin_named(b, row_first, sizeof row_first / sizeof row_first[0])) {
-        for (int64_t i = 2; i < v->len; i++) {
-            ray_t** be = el[i] && el[i]->type == RAY_LIST && el[i]->len >= 1 ? (ray_t**)ray_data(el[i]) : NULL;
-            if (i == 2 && be && builtin_named(b, within_fn, 1) && be[0] && be[0]->type == -RAY_SYM &&
-                !(be[0]->attrs & ATTR_QUOTED) && builtin_named(sym_binding(be[0]->i64), list_fn, 1))
-                continue;                                    /* row-wise bounds, checked above */
-            if (clause_reads_a_col(el[i], tbl)) return true;
-        }
-        return false;
-    }
-    static const char* const at_fn[] = { "at" };
-    if (builtin_named(b, at_fn, 1)) return v->len >= 2 && clause_reads_a_col(el[1], tbl);
-    return clause_reads_a_col(v, tbl);
+    ok = ok && dag_can_stream(g, &g->nodes[root_id]);
+    ray_graph_free(g);
+    return ok;
 }
 
 static bool clause_runs_code_in(ray_t* v, ray_t* tbl, bool containers);
@@ -12480,40 +12296,6 @@ static bool parted_clauses_plain(ray_t* dict, ray_t* tbl) {
  * projection. */
 static bool clauses_name_their_columns(ray_t* dict, ray_t* tbl) {
     return !clauses_run_code(dict, tbl, false);
-}
-
-/* `tbl` (parted) flattened to the columns a clause of the select `dict`
- * reads, every column when a clause runs code whose reads it does not
- * show: the rest of the table is never copied.  Owned, or an error. */
-static ray_t* parted_flatten_clause_cols(ray_t* dict, ray_t* tbl) {
-    int64_t nc = ray_table_ncols(tbl);
-    bool all = clauses_run_code(dict, tbl, true);
-    ray_t* refs_hdr = NULL;
-    int64_t* refs = (int64_t*)scratch_alloc(&refs_hdr, (size_t)(nc > 0 ? nc : 1) * sizeof(int64_t));
-    if (!refs) return ray_error("oom", NULL);
-    int n = 0;
-    ray_t* keys = ray_dict_keys(dict);
-    ray_t* vals = ray_dict_vals(dict);
-    int64_t id_from = ray_sym_intern("from", 4);
-    if (!keys || keys->type != RAY_SYM || !vals || vals->type != RAY_LIST) all = true;
-    for (int64_t i = 0; !all && i < ray_dict_len(dict); i++)
-        if (sym_cell_runtime_id(keys, i) != id_from)
-            n = collect_col_refs_set(((ray_t**)ray_data(vals))[i], tbl, refs, (int)nc, n);
-    ray_t* out = ray_table_new(nc);
-    for (int64_t c = 0; c < nc && out && !RAY_IS_ERR(out); c++) {
-        int64_t cn = ray_table_col_name(tbl, c);
-        ray_t* col = ray_table_get_col_idx(tbl, c);
-        bool want = all || (n == 0 && c == 0);   /* one column keeps the row count */
-        for (int r = 0; r < n && !want; r++) want = refs[r] == cn;
-        if (!want || !col) continue;
-        ray_t* v = (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON)
-                 ? query_materialize_parted_col(col, tbl) : (ray_retain(col), col);
-        if (!v || RAY_IS_ERR(v)) { ray_release(out); out = v ? v : ray_error("oom", NULL); break; }
-        out = ray_table_add_col(out, cn, v);
-        ray_release(v);
-    }
-    scratch_free(refs_hdr);
-    return out ? out : ray_error("oom", NULL);
 }
 
 /* Does `expr` hold a vector of several values, written or named (a global
@@ -13455,6 +13237,7 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
      * FLAT path so nothing there changes. */
     bool   parted_bydict_deferred = false;
     bool   computed_single_key = false;   /* by: is one expression, compiled or const */
+    bool   named_value_key = false;       /* by: is a name holding a value, no column */
     /* Sort keys that are source columns no output scans: carried through
      * the projection (appended after the outputs) so the sort can read
      * them, dropped from the result after it ran. */
@@ -14086,7 +13869,8 @@ by_dict_done:
         if (kv && !ray_is_atom(kv) && (ray_is_vec(kv) || kv->type == RAY_LIST) &&
             ray_len(kv) == ray_table_nrows(tbl)) {
             if (table_has_parted_columns(tbl)) {
-                ray_t* flat = parted_flatten_clause_cols(dict, tbl);
+                /* by_key_carry holds only with an output (n_out > 0) */
+                ray_t* flat = parted_flatten_read_cols(dict, tbl, false, NULL);
                 ray_release(tbl);
                 if (!flat || RAY_IS_ERR(flat)) {
                     scratch_free(dep_src_hdr);
@@ -16614,6 +16398,12 @@ by_dict_done:
             /* Only a real expression is renamed: a bare column symbol lands
              * here too and keeps its own name. */
             computed_single_key = (key_ops[0] != NULL && by_expr->type == RAY_LIST);
+            /* A name that reads no column (a lexical local hides it, or a
+             * global holds a vector) compiles to a constant, which carries
+             * no name: the key keeps the name, as on the eval-level path. */
+            named_value_key = key_ops[0] != NULL && key_ops[0]->opcode == OP_CONST &&
+                              by_expr->type == -RAY_SYM && !(by_expr->attrs & ATTR_QUOTED) &&
+                              !sym_names_col(tbl, by_expr->i64);
             if (!key_ops[0]) { ray_t* cerr = graph_take_compile_err(g); ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return cerr ? cerr : ray_error("domain", "select by: failed to compile group key expression"); }
             n_keys = 1;
         }
@@ -18231,6 +18021,11 @@ by_dict_done:
             if (ray_table_col_name(result, c) == kname) { kname = ray_sym_intern("key", 3); break; }
         ray_table_set_col_name(result, 0, kname);
     }
+    if (named_value_key && result && !RAY_IS_ERR(result) && ray_is_lazy(result))
+        result = ray_lazy_materialize(result);
+    if (named_value_key && result && !RAY_IS_ERR(result) && result->type == RAY_TABLE &&
+        ray_table_ncols(result) > 0)
+        ray_table_set_col_name(result, 0, by_expr->i64);
     if (self_emit_set)
         ray_group_emit_filter_set(prev_self_emit);
     if (post_group_where_expr && result && !RAY_IS_ERR(result))
@@ -26223,14 +26018,15 @@ static ray_t* asof_parted_select_operand(ray_t* arg_ast, ray_t** out_dict) {
                        (sl == 4 && memcmp(sp, "desc",    4) == 0) ||
                        (sl == 7 && memcmp(sp, "nearest", 7) == 0);
         if (blocked) { ray_release(tbl); return NULL; }
-        /* A clause reading a value of the table's rows (a local, a global
-         * vector) or computing over the rows' order or the whole column
-         * (sums, an aggregate) misreads one day's segment. */
+        /* A where: or projection runs on each day's segment only when the
+         * DAG streams it (clause_streams_per_segment): a value of the
+         * table's rows (a local, a global vector) or a computation over the
+         * rows' order or the whole column (sums, an aggregate) misreads one
+         * day's segment. */
         ray_t* vals = ray_dict_vals(dict);
         bool is_from = sl == 4 && memcmp(sp, "from", 4) == 0;
-        if (!is_from && vals && vals->type == RAY_LIST && i < vals->len &&
-            (clause_reads_row_local(((ray_t**)ray_data(vals))[i], tbl) ||
-             clause_segment_sensitive(((ray_t**)ray_data(vals))[i], tbl))) {
+        if (!is_from && (!vals || vals->type != RAY_LIST || i >= vals->len ||
+                         !clause_streams_per_segment(((ray_t**)ray_data(vals))[i], tbl))) {
             ray_release(tbl);
             return NULL;
         }
@@ -26369,13 +26165,12 @@ static ray_t* try_stream_parted_order_by(
      * An aggregate/expression output collapses per segment (one row per
      * partition), which would concat into nseg wrong rows instead of the
      * flat path's single correctly-aggregated result, so it declines here.
-     * A name a lexical local hides is the local, not the column; a where:
-     * reading a local of the table's rows reads the whole table (both
-     * decline). */
+     * An output must read its column (a name a lexical local hides is the
+     * local, not the column), and the where: runs on a segment only when
+     * the DAG streams it (clause_streams_per_segment). */
     for (int64_t i = 0; i + 1 < dict_n; i += 2) {
         int64_t kid = dict_elems[i]->i64;
-        if (kid == where_id && (clause_reads_row_local(dict_elems[i + 1], tbl) ||
-                                clause_segment_sensitive(dict_elems[i + 1], tbl))) return NULL;
+        if (kid == where_id && !clause_streams_per_segment(dict_elems[i + 1], tbl)) return NULL;
         if (kid == from_id || kid == where_id || kid == by_id ||
             kid == take_id || kid == asc_id || kid == desc_id ||
             kid == nearest_id) continue;
@@ -26591,13 +26386,14 @@ static ray_t* try_stream_parted_order_by_topk(
      * negative / range take is a slice, not a top-k — decline it. */
     if (k < 0) return NULL;
 
-    /* Every output column must be a bare source-column ref (row-preserving),
-     * no lexical local hiding it, and a where: reads no local of the table's
-     * rows: the segments would read its rows from the top of the table. */
+    /* Every output column must be a bare source-column ref (row-preserving)
+     * that reads its column (no lexical local hiding it), and the where:
+     * runs on a segment only when the DAG streams it
+     * (clause_streams_per_segment): a value of the table's rows would be
+     * read whole against each segment. */
     for (int64_t i = 0; i + 1 < dict_n; i += 2) {
         int64_t kid = dict_elems[i]->i64;
-        if (kid == where_id && (clause_reads_row_local(dict_elems[i + 1], tbl) ||
-                                clause_segment_sensitive(dict_elems[i + 1], tbl))) return NULL;
+        if (kid == where_id && !clause_streams_per_segment(dict_elems[i + 1], tbl)) return NULL;
         if (kid == from_id || kid == where_id || kid == by_id ||
             kid == take_id || kid == asc_id || kid == desc_id ||
             kid == nearest_id) continue;
