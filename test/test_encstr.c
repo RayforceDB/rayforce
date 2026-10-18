@@ -2933,7 +2933,10 @@ static test_result_t test_idict_filter_forged(void) {
 /* Review M1: a parted column that fails to load surfaces the load's own
  * `corrupt` error (naming the file) from a projected select under a where,
  * not a row-count `length` error.  Mixed-generation root: partition 1 is
- * generation 0, partition 2 generation 2 with its x file damaged. */
+ * generation 0, partition 2 generation 2 with its x file damaged.
+ * This pins the user-visible error only: parted_result_validate reports
+ * the damage first, so no shape built here reaches parted_table_rows'
+ * second load, and the test passes without that fix too. */
 static test_result_t test_parted_projection_corrupt(void) {
     ST_Q_OK("(set P0 (table [x y] (list (til 6000) (% (til 6000) 3))))");
     ST_Q_OK("(set P1 (table [x y] (list (+ 100000 (til 6000)) (% (til 6000) 3))))");
