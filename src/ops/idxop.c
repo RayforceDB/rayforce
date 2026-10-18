@@ -34,13 +34,13 @@
 #include "ops/rowsel.h"
 #include "ops/hash.h"     /* ray_hash_bytes: STR hash-index key word */
 #include "core/pool.h"    /* parallel hash-index build */
-#include "mem/sys.h"      /* ray_sys_alloc: build scratch off the buddy heap */
 #include "lang/format.h"  /* ray_type_name */
 #include <stdatomic.h>
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include "core/platform.h"   /* ray_io_counters: the hash build trace */
 
 /* ── Routing observability counters (diagnostic, unsynchronized) ── */
 uint64_t ray_idx_consults[IDX_SITE__N];
@@ -850,8 +850,8 @@ static ray_t* prepare_attach_ex(ray_t** vp, const char* what,
     if (numeric_elem_size(v->type) == 0 &&
         !(allow_str && v->type == RAY_STR) &&
         !(allow_sym && v->type == RAY_SYM)) {
-        return ray_error("nyi", "%s: only numeric/sym vectors supported (got type %d)",
-                         what, (int)v->type);
+        return ray_error("nyi", "%s: only numeric/temporal%s%s vectors supported (got type %d)",
+                         what, allow_sym ? "/sym" : "", allow_str ? "/str" : "", (int)v->type);
     }
     return v;
 }
@@ -1456,6 +1456,7 @@ ray_t* ray_dict_acc_finish(ray_dict_acc_t* a, int64_t len) {
  * column frees the whole region with one munmap and never frees children by
  * pointer.  All blocks are 32-aligned so each is a directly-usable ray_t. */
 #define IDX_ALIGN32(n) (((n) + 31) & ~(int64_t)31)
+#define IDX_HEAD_BYTES IDX_ALIGN32(32 + (int64_t)sizeof(ray_index_t))   /* the RAY_INDEX block */
 
 /* Addresses of this kind's child ray_t* fields (so write/map read+patch them
  * uniformly).  Returns count 0..4. */
@@ -1514,6 +1515,111 @@ int64_t ray_index_inline_size(const ray_index_t* ix) {
  * Generation 1 = the CSR grouped hash layout (table/gkeys/offs/rows);
  * generation-0 regions carried the retired chain layout. */
 #define RAY_IDX_FORMAT_MAJOR ((uint8_t)1)
+/* Generation 2: the same layout with the hash `table`, `offs` and `rows`
+ * stored narrow (see hx_get).  Written only for indexes that carry a narrow
+ * array, so a binary that knows generation 1 alone loads such a column
+ * unindexed instead of misreading it; generation-1 regions read as before. */
+#define RAY_IDX_FORMAT_NARROW ((uint8_t)2)
+/* Generation 3: a hash table whose home slots are the top hash bits
+ * (RAY_MARK_HASH_HIGH, groups in hash order); arrays narrow or I64 as in
+ * generation 2.  Older binaries load such a column unindexed. */
+#define RAY_IDX_FORMAT_HASH_HIGH ((uint8_t)3)
+
+/* Hash index arrays whose values are group ids, positions or row ids
+ * (`table`, `offs`, `rows`) fit 32 bits on any column below 2^32 rows; they
+ * are stored as unsigned 32-bit values in an I32 vector when they do,
+ * halving them.  Indexes built before, or too large, keep I64.  Read either
+ * with hx_get; hand row-id slices out as ray_idx_rows_t (hx_rows). */
+static inline int64_t hx_get(const ray_t* v, int64_t i) {
+    const void* d = ray_data((ray_t*)v);
+    return v->type == RAY_I32 ? (int64_t)((const uint32_t*)d)[i]
+                              : ((const int64_t*)d)[i];
+}
+static inline void hx_set(ray_t* v, int64_t i, int64_t x) {
+    void* d = ray_data(v);
+    if (v->type == RAY_I32) ((uint32_t*)d)[i] = (uint32_t)x;
+    else                    ((int64_t*)d)[i] = x;
+}
+/* Copy `n` entries of `src` into `dst`, converting between widths. */
+static void hx_copy_into(ray_t* dst, const ray_t* src, int64_t n) {
+    if (dst->type == src->type) {
+        memcpy(ray_data(dst), ray_data((ray_t*)src), (size_t)n * (size_t)ray_elem_size(src->type));
+        return;
+    }
+    for (int64_t i = 0; i < n; i++) hx_set(dst, i, hx_get(src, i));
+}
+static inline ray_idx_rows_t hx_rows(const ray_t* rows, int64_t off) {
+    bool nw = rows->type == RAY_I32;
+    const uint8_t* d = (const uint8_t*)ray_data((ray_t*)rows);
+    return (ray_idx_rows_t){ d + off * (nw ? 4 : 8), nw };
+}
+/* Copy `n` row ids from position `off` as int64. */
+static void hx_copy_rows(int64_t* dst, const ray_t* rows, int64_t off, int64_t n) {
+    if (rows->type != RAY_I32) {
+        memcpy(dst, (const int64_t*)ray_data((ray_t*)rows) + off, (size_t)n * sizeof(int64_t));
+        return;
+    }
+    const uint32_t* src = (const uint32_t*)ray_data((ray_t*)rows) + off;
+    for (int64_t i = 0; i < n; i++) dst[i] = (int64_t)src[i];
+}
+/* Home slot of mixed hash `h` in a table of `mask + 1` slots: its top bits
+ * when the table is RAY_MARK_HASH_HIGH, else its low bits. */
+static inline uint64_t hx_home_m(uint8_t markers, uint64_t mask, uint64_t h) {
+    return (markers & RAY_MARK_HASH_HIGH) ? h >> __builtin_clzll(mask) : h & mask;
+}
+static inline uint64_t hx_home(const ray_index_t* ix, uint64_t h) {
+    return hx_home_m(ix->markers, ix->u.hash.mask, h);
+}
+static inline bool hx_narrow_ok(const ray_t* v) {
+    return v && !RAY_IS_ERR(v) && (v->type == RAY_I64 || v->type == RAY_I32);
+}
+typedef struct { const int64_t* src; uint32_t* dst; } hx_narrow_ctx_t;
+static void hx_narrow_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    hx_narrow_ctx_t* c = (hx_narrow_ctx_t*)raw;
+    for (int64_t i = start; i < end; i++) c->dst[i] = (uint32_t)c->src[i];
+}
+/* The narrow copy of an I64 array whose values all lie in [0, bound]
+ * (bound below 2^32, known to the caller), consuming `v`; `v` itself when it
+ * cannot be narrowed or the copy cannot be allocated. */
+static ray_t* hx_narrow(ray_t* v, int64_t bound) {
+    if (!v || RAY_IS_ERR(v) || v->type != RAY_I64 || bound < 0 || bound > (int64_t)UINT32_MAX) return v;
+    ray_t* n = ray_vec_new(RAY_I32, v->len > 0 ? v->len : 1);
+    if (!n || RAY_IS_ERR(n)) { if (n) ray_error_free(n); return v; }
+    n->len = v->len;
+    hx_narrow_ctx_t c = { (const int64_t*)ray_data(v), (uint32_t*)ray_data(n) };
+    ray_pool_t* pool = ray_pool_get();
+    if (ray_pool_par_dispatch_ok(pool, v->len, RAY_PARALLEL_THRESHOLD)) {
+        ray_pool_dispatch(pool, hx_narrow_fn, &c, v->len);
+        /* An interrupt makes the dispatch skip its tasks, leaving the copy
+         * unfilled: keep the wide array. */
+        if (atomic_load_explicit(&pool->cancelled, memory_order_acquire)) {
+            ray_release(n);
+            return v;
+        }
+    } else {
+        hx_narrow_fn(&c, 0, 0, v->len);
+    }
+    ray_release(v);
+    return n;
+}
+/* Narrow a freshly built hash payload in place. */
+static void hx_narrow_payload(ray_index_t* ix) {
+    ix->u.hash.table = hx_narrow(ix->u.hash.table, ix->u.hash.n_groups);
+    ix->u.hash.offs  = hx_narrow(ix->u.hash.offs,  ix->u.hash.n_keys);
+    ix->u.hash.rows  = hx_narrow(ix->u.hash.rows,  ix->built_for_len);
+}
+static uint8_t idx_format_of(const ray_index_t* ix) {
+    if (ix->kind == RAY_IDX_HASH && (ix->markers & RAY_MARK_HASH_HIGH))
+        return RAY_IDX_FORMAT_HASH_HIGH;
+    if (ix->kind == RAY_IDX_HASH) {
+        const ray_t* a[3] = { ix->u.hash.table, ix->u.hash.offs, ix->u.hash.rows };
+        for (int i = 0; i < 3; i++)
+            if (a[i] && !RAY_IS_ERR(a[i]) && a[i]->type == RAY_I32)
+                return RAY_IDX_FORMAT_NARROW;
+    }
+    return RAY_IDX_FORMAT_MAJOR;
+}
 
 /* Serialize `ix` into `dst` (>= ray_index_inline_size bytes, pre-zeroed by the
  * caller for clean 32-pad).  Child pointers become region-relative offsets. */
@@ -1522,7 +1628,7 @@ void ray_index_inline_write(uint8_t* dst, const ray_index_t* ix) {
     memset(&blkhdr, 0, 32);
     blkhdr.type = RAY_INDEX; blkhdr.len = (int64_t)sizeof(ray_index_t);
     blkhdr.mmod = 1; blkhdr.rc = 1;
-    blkhdr.order = RAY_IDX_FORMAT_MAJOR;
+    blkhdr.order = idx_format_of(ix);
     memcpy(dst, &blkhdr, 32);
 
     ray_index_t* on = (ray_index_t*)(dst + 32);
@@ -1548,15 +1654,16 @@ void ray_index_inline_write(uint8_t* dst, const ray_index_t* ix) {
     }
 }
 
-bool ray_index_inline_write_file(FILE* f, const ray_index_t* ix) {
-    static const uint8_t zeros[32] = {0};
-    _Alignas(32) uint8_t head[IDX_ALIGN32(32 + (int64_t)sizeof(ray_index_t))];
-    memset(head, 0, sizeof(head));
+/* The head block of `ix`'s region (IDX_HEAD_BYTES at `head`): the RAY_INDEX
+ * block with the child pointers turned into region offsets, the children
+ * following it in slot order. */
+static void idx_inline_head(uint8_t* head, const ray_index_t* ix) {
+    memset(head, 0, (size_t)IDX_HEAD_BYTES);
     ray_t blkhdr;
     memset(&blkhdr, 0, 32);
     blkhdr.type = RAY_INDEX; blkhdr.len = (int64_t)sizeof(ray_index_t);
     blkhdr.mmod = 1; blkhdr.rc = 1;
-    blkhdr.order = RAY_IDX_FORMAT_MAJOR;
+    blkhdr.order = idx_format_of(ix);
     memcpy(head, &blkhdr, 32);
     ray_index_t* on = (ray_index_t*)(head + 32);
     memcpy(on, ix, sizeof(ray_index_t));
@@ -1566,13 +1673,21 @@ bool ray_index_inline_write_file(FILE* f, const ray_index_t* ix) {
     ray_t** on_slots[4];
     int nch = idx_child_slots((ray_index_t*)ix, src_slots);
     idx_child_slots(on, on_slots);
-    int64_t off = (int64_t)sizeof(head);
+    int64_t off = IDX_HEAD_BYTES;
     for (int i = 0; i < nch; i++) {
         ray_t* c = *src_slots[i];
         if (!c || RAY_IS_ERR(c)) { *on_slots[i] = NULL; continue; }
         *on_slots[i] = (ray_t*)(intptr_t)off;   /* region-relative offset */
         off += idx_blk_bytes(c);
     }
+}
+
+bool ray_index_inline_write_file(FILE* f, const ray_index_t* ix) {
+    static const uint8_t zeros[32] = {0};
+    _Alignas(32) uint8_t head[IDX_HEAD_BYTES];
+    idx_inline_head(head, ix);
+    ray_t** src_slots[4];
+    int nch = idx_child_slots((ray_index_t*)ix, src_slots);
     if (fwrite(head, 1, sizeof(head), f) != sizeof(head)) return false;
     for (int i = 0; i < nch; i++) {
         ray_t* c = *src_slots[i];
@@ -1598,7 +1713,8 @@ ray_t* ray_index_inline_map(uint8_t* region, int64_t region_size) {
     int64_t head = IDX_ALIGN32(32 + (int64_t)sizeof(ray_index_t));
     if (region_size < head) return NULL;
     ray_t* idx = (ray_t*)region;
-    if (idx->order != RAY_IDX_FORMAT_MAJOR) return NULL;
+    if (idx->order != RAY_IDX_FORMAT_MAJOR && idx->order != RAY_IDX_FORMAT_NARROW &&
+        idx->order != RAY_IDX_FORMAT_HASH_HIGH) return NULL;
     if (idx->len != (int64_t)sizeof(ray_index_t)) return NULL;
     ray_index_t* ix = ray_index_payload(idx);
     ray_t** slots[4];
@@ -1627,6 +1743,25 @@ ray_t* ray_index_inline_map(uint8_t* region, int64_t region_size) {
         }
         *slots[i] = c;
     }
+    /* Hash arrays: I64 (generation 1), or I32 for the narrow ones. */
+    if (ix->kind == RAY_IDX_HASH &&
+        ((ix->u.hash.table && !hx_narrow_ok(ix->u.hash.table)) ||
+         (ix->u.hash.offs  && !hx_narrow_ok(ix->u.hash.offs))  ||
+         (ix->u.hash.rows  && !hx_narrow_ok(ix->u.hash.rows))  ||
+         (ix->u.hash.gkeys && ix->u.hash.gkeys->type != RAY_I64) ||
+         (idx->order == RAY_IDX_FORMAT_MAJOR &&
+          ((ix->u.hash.table && ix->u.hash.table->type != RAY_I64) ||
+           (ix->u.hash.offs  && ix->u.hash.offs->type  != RAY_I64) ||
+           (ix->u.hash.rows  && ix->u.hash.rows->type  != RAY_I64)))))
+        return NULL;
+    /* Generation 3 is exactly the hash tables with top-bit homes; their
+     * home shift comes from the mask, so it must match the table. */
+    bool high = ix->kind == RAY_IDX_HASH && (ix->markers & RAY_MARK_HASH_HIGH);
+    if (high != (idx->order == RAY_IDX_FORMAT_HASH_HIGH)) return NULL;
+    if (high && (ix->u.hash.mask < 7 || (ix->u.hash.mask & (ix->u.hash.mask + 1)) ||
+                 !ix->u.hash.table ||
+                 (uint64_t)ix->u.hash.table->len != ix->u.hash.mask + 1))
+        return NULL;
     /* two layouts: [lo | nn] (2 per chunk) and [lo | nn | hi] (3 per chunk) */
     if (ix->kind == RAY_IDX_CHUNK_ZONE && ix->u.chunk_zone.aggs &&
         (ix->u.chunk_zone.aggs->type != RAY_I64 || ix->u.chunk_zone.is_f64 ||
@@ -1641,365 +1776,691 @@ ray_t* ray_index_inline_map(uint8_t* region, int64_t region_size) {
 /* --------------------------------------------------------------------------
  * Hash index — CSR grouped layout
  *
- * Build: one pass assigns every non-null row a group id via an open-
- * addressing probe on its i64-canonical key (SYM: column-domain id), then a
- * counting pass lays the row ids out as contiguous ascending slices (CSR:
- * offs[] + rows[]).  The build-time bucket table is sized by ROW count so
- * insertion stays O(1); the attached/persisted table is rebuilt at
- * DISTINCT-key size — it indexes groups, not rows, so a high-duplication
- * column (the whole point of a grouped index) keeps a tiny footprint.
+ * Build: every non-null row gets a group id from an open-addressing probe on
+ * its i64-canonical key (SYM: column-domain id), and the row ids are laid out
+ * as contiguous ascending slices (CSR: offs[] + rows[]).  Numeric and SYM
+ * columns use the partitioned builder below; STR keeps a serial walk.  The
+ * persisted table is sized by DISTINCT keys — it indexes groups, not rows,
+ * so a high-duplication column (the whole point of a grouped index) keeps a
+ * tiny footprint.
  *
- * Lookup `k`: slot-walk table[hash(k) & mask] comparing gkeys[gid] == k; a
- * hit yields the contiguous ascending slice rows[offs[gid]..offs[gid+1]).
+ * Lookup `k`: slot-walk table from hx_home(mix64(k)) comparing
+ * gkeys[gid] == k; a hit yields the contiguous ascending slice
+ * rows[offs[gid]..offs[gid+1]).
  * -------------------------------------------------------------------------- */
 
-/* Parallel build of the CSR hash layout for numeric / SYM keys.  The
- * result is the serial walk's: groups numbered by first occurrence, rows
- * ascending inside a group, nulls excluded — assembled in
- * partition-parallel passes:
+/* ── Hash-index build trace ── */
+ray_hash_mark_t ray_hash_trace_mark(void) {
+    ray_hash_mark_t m = { ray_profile_now_ns(), 0, 0, 0, 0 };
+    ray_io_counters_t io;
+    ray_io_counters(false, &io);
+    m.majflt = io.majflt; m.rd = io.rd; m.wr = io.wr; m.cwr = io.cwr;
+    return m;
+}
+
+void ray_hash_trace_add(ray_hash_trace_t* t, int ph, ray_hash_mark_t since, int64_t moved) {
+    if (!t || ph < 0 || ph >= RAY_HXT_N) return;
+    ray_hash_mark_t now = ray_hash_trace_mark();
+    t->ns[ph] += now.ns - since.ns;
+    t->majflt[ph] += now.majflt - since.majflt;
+    t->rd[ph] += now.rd - since.rd;
+    t->wr[ph] += now.wr - since.wr;
+    t->cwr[ph] += now.cwr - since.cwr;
+    t->moved[ph] += moved;
+}
+
+void ray_hash_trace_print(FILE* f, const char* what, const ray_hash_trace_t* t, int64_t col_bytes) {
+    static const char* names[RAY_HXT_N] = {
+        "count", "bucket", "distinct", "groups", "table", "append" };
+    int64_t moved = 0;
+    fprintf(f, "%s:", what);
+    for (int p = 0; p < RAY_HXT_N; p++) {
+        if (!t->ns[p] && !t->moved[p]) continue;
+        moved += t->moved[p];
+        fprintf(f, " %s=%.1fms/%lldflt/%.1fMBr/%.1fMBw/%.1fMBcw/moved=%.1fMB(%.2fx)", names[p],
+                (double)t->ns[p] / 1e6, (long long)t->majflt[p],
+                (double)t->rd[p] / 1048576.0, (double)t->wr[p] / 1048576.0,
+                (double)t->cwr[p] / 1048576.0, (double)t->moved[p] / 1048576.0,
+                col_bytes > 0 ? (double)t->moved[p] / (double)col_bytes : 0.0);
+    }
+    fprintf(f, " total_moved=%.1fMB(%.2fx)\n", (double)moved / 1048576.0,
+            col_bytes > 0 ? (double)moved / (double)col_bytes : 0.0);
+}
+
+/* Partitioned build of the CSR hash layout for numeric / SYM keys.
  *
- *   A  row ranges: key word per row, rows bucketed by hash partition
- *      (a partition's rows stay ascending: the ranges are in row order);
- *   B  per partition: open-addressing dedupe into local groups, each
- *      group's first row marked in a bitmap;
- *   C  a group's number is the rank of its first row among all marked
- *      rows (block popcounts + one prefix) — exactly the order the
- *      serial walk assigns;
- *   D  per partition: keys and counts into the group's slots;
- *   E  per partition: row scatter (of[] as cursor); then the key table,
- *      filled in group order on the calling thread so its bytes match the
- *      serial build.
+ * Groups are numbered in ascending order of mix64(key word) — for these key
+ * types distinct keys have distinct words, so the order is strict — and a
+ * group's home slot is the TOP bits of that hash (RAY_MARK_HASH_HIGH).  Both
+ * follow from the data alone, so the arrays are the same bytes whatever the
+ * partition count, memory budget or core count, and every output array is
+ * written front to back:
  *
- * Every array a pass writes at random is faulted in beforehand from all
- * workers in slices: a fresh mapping faulted at random from every worker
- * serialises on the page-table locks.  Returns false (nothing allocated)
- * when the pool cannot be used; the caller then runs the serial walk. */
+ *   1  row ranges: key words and row ids bucketed by the top hash bits into
+ *      contiguous partitions (rows stay ascending inside each);
+ *   2  the number of groups, when the arrays are to be laid out at their
+ *      final size before they are written (one batch: its own dedupe;
+ *      several, into a persisted region: a counting pass per partition);
+ *   3  partitions in batches that fit the memory budget: per partition a
+ *      local dedupe, its groups sorted by hash, then its keys, row offsets
+ *      and row slices stored at the partition's place in gkeys/offs/rows —
+ *      a partition's groups follow every group of the partitions before it —
+ *      and the batch's key words and row ids punched out of their spill
+ *      files when they spilled;
+ *   4  the slot table: groups in order, each in the first free slot from its
+ *      home.  Homes ascend with the group number, so this is one forward
+ *      sweep (a run past the last slot continues from slot 0) and gives
+ *      exactly the table that inserting the groups in order would; with the
+ *      size known it runs batch by batch in step 3.
+ *
+ * Only a batch of partitions is accessed at random; the bucketed input and
+ * the outputs are streamed, so past the spill watermark they page through
+ * their files sequentially instead of thrashing.  Returns 1 on success,
+ * -1 when out of memory or interrupted (nothing left allocated; a region's
+ * memory holds no complete index). */
+#define HB_ROW_BYTES   128         /* batch working set per row, worst case in heap blocks */
+#define HB_PART_ROWS   (1 << 17)   /* rows per partition: its dedupe table stays cache-sized */
+#define HB_MAX_PARTS   4096
+#define HB_MAX_TASKS   256
+
+typedef struct {
+    uint32_t* tab;      /* slot -> local group + 1 */
+    uint64_t  tmask;
+    uint64_t* gk;       /* [cap] key word per local group */
+    int64_t*  gc;       /* [cap] rows per local group, then its row cursor */
+    uint32_t* ord;      /* [ng] local groups in ascending hash order */
+    uint32_t* lg;       /* [rows] local group of each of the partition's rows */
+    int64_t   ng, cap;
+    int64_t   g0;       /* number of the partition's first group */
+} hb_part_t;
+
 typedef struct {
     ray_t*          v;
     const uint8_t*  base;
     int64_t         n;
-    int             n_tasks;
-    int             n_part;
-    int             part_shift;    /* partition = mix64(key) >> shift */
-    uint64_t*       kw;            /* [n] key word (non-null rows) */
-    int64_t*        pr;            /* [n_keys] row ids grouped by partition */
-    int64_t*        lg;            /* [n_keys] local group of pr[j] */
-    int64_t*        cnt;           /* [n_tasks * n_part] rows per (task, partition) */
+    int64_t         n_tasks;
+    int64_t         n_part;
+    int             part_shift;    /* partition = mix64(key) >> part_shift */
+    bool            wide;          /* row ids past 32 bits */
+    int64_t*        cnt;           /* [n_tasks * n_part] rows per (task, partition), then cursors */
     int64_t*        part_off;      /* [n_part + 1] */
-    int64_t*        ng_p;          /* [n_part] local groups per partition */
-    int64_t*        gfirst;        /* [n_keys] first row per local group (partition-relative) */
-    int64_t*        gcount;        /* [n_keys] rows per local group, then its global number */
-    uint64_t*       bits;          /* [n/64 + 1] first-row marks */
-    int64_t*        blk_rank;      /* [n/HP_BLOCK + 1] exclusive prefix of block popcounts */
-    int64_t*        gk;            /* [n_groups] keys */
-    int64_t*        of;            /* [n_groups + 1] */
-    int64_t*        rw;            /* [n_keys] */
-    int64_t*        tbl;           /* [cap] */
-    uint64_t        tmask;
-    int64_t         n_groups;      /* pass F */
+    uint64_t*       kw;            /* [n_keys] key words, bucketed */
+    void*           rid;           /* [n_keys] row ids, bucketed (u32 or i64) */
+    int64_t*        gk;            /* gkeys data */
+    ray_t*          offs;
+    ray_t*          rows;
+    int64_t         b_lo;          /* first partition of the batch */
+    int64_t         part_cap0;     /* rows of a batch: a larger partition is alone in its batch */
+    hb_part_t*      part;          /* [batch] */
+    int64_t*        part_ng;       /* [n_part] groups per partition, once counted; else NULL */
+    bool            counting;      /* the dedupe only counts its groups into part_ng */
     _Atomic(bool)   oom;
-} hash_par_t;
+} hash_bld_t;
 
-#define HP_BLOCK 4096
+static inline int64_t hb_task_lo(const hash_bld_t* h, int64_t t) { return h->n * t / h->n_tasks; }
+static inline int64_t hb_rid(const hash_bld_t* h, int64_t k) {
+    return h->wide ? ((const int64_t*)h->rid)[k] : (int64_t)((const uint32_t*)h->rid)[k];
+}
 
-static inline int64_t hp_task_lo(const hash_par_t* h, int64_t t) { return h->n * t / h->n_tasks; }
-
-static void hp_pass_a(void* raw, uint32_t wid, int64_t start, int64_t end) {
+static void hb_count(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid; (void)end;
-    hash_par_t* h = (hash_par_t*)raw;
-    int64_t lo = hp_task_lo(h, start), hi = hp_task_lo(h, start + 1);
+    hash_bld_t* h = (hash_bld_t*)raw;
+    int64_t lo = hb_task_lo(h, start), hi = hb_task_lo(h, start + 1);
     int64_t* cnt = h->cnt + start * h->n_part;
     for (int64_t i = lo; i < hi; i++) {
-        if (ray_vec_is_null(h->v, i)) { h->kw[i] = 0; continue; }
-        uint64_t k = hash_row_key_word(h->v, h->base, i);
-        h->kw[i] = k;
-        cnt[mix64(k) >> h->part_shift]++;
+        if (ray_vec_is_null(h->v, i)) continue;
+        cnt[mix64(hash_row_key_word(h->v, h->base, i)) >> h->part_shift]++;
     }
 }
 
-static void hp_pass_a2(void* raw, uint32_t wid, int64_t start, int64_t end) {
+static void hb_bucket(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid; (void)end;
-    hash_par_t* h = (hash_par_t*)raw;
-    int64_t lo = hp_task_lo(h, start), hi = hp_task_lo(h, start + 1);
-    int64_t* cur = h->cnt + start * h->n_part;   /* now the write cursors */
+    hash_bld_t* h = (hash_bld_t*)raw;
+    int64_t lo = hb_task_lo(h, start), hi = hb_task_lo(h, start + 1);
+    int64_t* cur = h->cnt + start * h->n_part;
     for (int64_t i = lo; i < hi; i++) {
         if (ray_vec_is_null(h->v, i)) continue;
-        h->pr[cur[mix64(h->kw[i]) >> h->part_shift]++] = i;
+        uint64_t k = hash_row_key_word(h->v, h->base, i);
+        int64_t j = cur[mix64(k) >> h->part_shift]++;
+        h->kw[j] = k;
+        if (h->wide) ((int64_t*)h->rid)[j] = i;
+        else         ((uint32_t*)h->rid)[j] = (uint32_t)i;
     }
 }
 
-static void hp_pass_b(void* raw, uint32_t wid, int64_t start, int64_t end) {
+static void hb_part_free(hb_part_t* s) {
+    ray_free_raw(s->tab); ray_free_raw(s->gk); ray_free_raw(s->gc); ray_free_raw(s->ord);
+    ray_free_raw(s->lg);
+    memset(s, 0, sizeof(*s));
+}
+
+/* Size the group arrays for `cap` groups and re-place the groups so far. */
+static bool hb_part_reserve(hb_part_t* s, int64_t cap) {
+    uint64_t tcap = next_pow2((uint64_t)cap * 2);
+    uint64_t* gk = (uint64_t*)ray_alloc_raw((size_t)cap * sizeof(uint64_t));
+    int64_t*  gc = (int64_t*)ray_alloc_raw((size_t)cap * sizeof(int64_t));
+    uint32_t* tab = (uint32_t*)ray_alloc_raw((size_t)tcap * sizeof(uint32_t));
+    if (!gk || !gc || !tab) { ray_free_raw(gk); ray_free_raw(gc); ray_free_raw(tab); return false; }
+    memset(tab, 0, (size_t)tcap * sizeof(uint32_t));
+    if (s->ng) {
+        memcpy(gk, s->gk, (size_t)s->ng * sizeof(uint64_t));
+        memcpy(gc, s->gc, (size_t)s->ng * sizeof(int64_t));
+    }
+    for (int64_t g = 0; g < s->ng; g++) {
+        uint64_t slot = mix64(gk[g]) & (tcap - 1);
+        while (tab[slot]) slot = (slot + 1) & (tcap - 1);
+        tab[slot] = (uint32_t)(g + 1);
+    }
+    ray_free_raw(s->gk); ray_free_raw(s->gc); ray_free_raw(s->tab);
+    s->gk = gk; s->gc = gc; s->tab = tab; s->tmask = tcap - 1; s->cap = cap;
+    return true;
+}
+
+static inline int64_t hb_part_find(const hb_part_t* s, uint64_t k) {
+    uint64_t slot = mix64(k) & s->tmask;
+    for (;;) {
+        uint32_t g1 = s->tab[slot];
+        if (s->gk[g1 - 1] == k) return g1 - 1;   /* every probed key is present */
+        slot = (slot + 1) & s->tmask;
+    }
+}
+
+/* LSD radix sort of `n` hashes with their group payload; constant digits
+ * (the partition's own top bits among them) are skipped. */
+static void hb_sort(uint64_t* k, uint32_t* v, uint64_t* tk, uint32_t* tv, int64_t n) {
+    if (n < 64) {
+        for (int64_t i = 1; i < n; i++) {
+            uint64_t x = k[i]; uint32_t y = v[i]; int64_t j = i;
+            for (; j > 0 && k[j - 1] > x; j--) { k[j] = k[j - 1]; v[j] = v[j - 1]; }
+            k[j] = x; v[j] = y;
+        }
+        return;
+    }
+    int64_t hist[8][256];
+    memset(hist, 0, sizeof(hist));
+    for (int64_t i = 0; i < n; i++)
+        for (int d = 0; d < 8; d++) hist[d][(k[i] >> (8 * d)) & 0xFF]++;
+    uint64_t *sk = k, *dk = tk;
+    uint32_t *sv = v, *dv = tv;
+    for (int d = 0; d < 8; d++) {
+        int64_t* hd = hist[d];
+        if (hd[(sk[0] >> (8 * d)) & 0xFF] == n) continue;
+        int64_t run = 0;
+        for (int b = 0; b < 256; b++) { int64_t c = hd[b]; hd[b] = run; run += c; }
+        for (int64_t i = 0; i < n; i++) {
+            int64_t j = hd[(sk[i] >> (8 * d)) & 0xFF]++;
+            dk[j] = sk[i]; dv[j] = sv[i];
+        }
+        uint64_t* t1 = sk; sk = dk; dk = t1;
+        uint32_t* t2 = sv; sv = dv; dv = t2;
+    }
+    if (sk != k) {
+        memcpy(k, sk, (size_t)n * sizeof(uint64_t));
+        memcpy(v, sv, (size_t)n * sizeof(uint32_t));
+    }
+}
+
+/* Batch task: dedupe partition b_lo + start, then order its groups by hash
+ * (counting: only record how many groups it has). */
+static void hb_dedupe(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid; (void)end;
-    hash_par_t* h = (hash_par_t*)raw;
-    int64_t p = start;
+    hash_bld_t* h = (hash_bld_t*)raw;
+    hb_part_t* s = &h->part[start];
+    int64_t p = h->b_lo + start;
     int64_t lo = h->part_off[p], hi = h->part_off[p + 1];
-    int64_t cnt = hi - lo;
-    h->ng_p[p] = 0;
-    if (cnt == 0) return;
-    uint64_t cap = next_pow2((uint64_t)cnt * 2 + 1);
-    if (cap < 16) cap = 16;
-    int64_t* tab = (int64_t*)ray_sys_alloc((size_t)cap * sizeof(int64_t));
-    if (!tab) { atomic_store_explicit(&h->oom, true, memory_order_relaxed); return; }
-    memset(tab, 0, (size_t)cap * sizeof(int64_t));
-    uint64_t mask = cap - 1;
-    int64_t* gfirst = h->gfirst + lo;
-    int64_t* gcount = h->gcount + lo;
-    int64_t ng = 0;
+    if (hi == lo) return;
+    /* groups are at most the rows; a partition larger than a batch (a hot
+     * key's) starts at the batch size and grows.  Counted before, it is
+     * sized for its groups exactly. */
+    int64_t cap0 = hi - lo < h->part_cap0 ? hi - lo : h->part_cap0;
+    if (h->part_ng && !h->counting) cap0 = h->part_ng[p] > 0 ? h->part_ng[p] : 1;
+    /* each row's group, kept for the row pass when the partition fits a
+     * batch; past it the row pass probes again */
+    if (!h->counting && hi - lo <= h->part_cap0) {
+        s->lg = (uint32_t*)ray_alloc_raw((size_t)(hi - lo) * sizeof(uint32_t));
+        if (!s->lg) goto oom;
+    }
+    if (!hb_part_reserve(s, cap0)) goto oom;
     for (int64_t j = lo; j < hi; j++) {
-        int64_t i = h->pr[j];
-        uint64_t k = h->kw[i];
-        uint64_t slot = mix64(k) & mask;
+        if (RAY_UNLIKELY(((j - lo) & 0xFFFF) == 0xFFFF && ray_interrupted())) return;
+        uint64_t k = h->kw[j];
+        uint64_t slot = mix64(k) & s->tmask;
         for (;;) {
-            int64_t g1 = tab[slot];
+            uint32_t g1 = s->tab[slot];
             if (g1 == 0) {
-                tab[slot] = ng + 1;
-                gfirst[ng] = i;
-                gcount[ng] = 1;
-                h->lg[j] = ng;
-                /* the partition's rows are ascending, so i is this group's
-                 * first row; the word is shared with other partitions */
-                atomic_fetch_or_explicit((_Atomic(uint64_t)*)&h->bits[i >> 6],
-                                         (uint64_t)1 << (i & 63), memory_order_relaxed);
-                ng++;
+                if (s->ng == s->cap) {
+                    if (s->cap >= (int64_t)UINT32_MAX / 2 || !hb_part_reserve(s, s->cap * 2)) goto oom;
+                    slot = mix64(k) & s->tmask;
+                    continue;
+                }
+                s->tab[slot] = (uint32_t)(s->ng + 1);
+                s->gk[s->ng] = k;
+                s->gc[s->ng] = 1;
+                if (s->lg) s->lg[j - lo] = (uint32_t)s->ng;
+                s->ng++;
                 break;
             }
-            if (h->kw[gfirst[g1 - 1]] == k) { h->lg[j] = g1 - 1; gcount[g1 - 1]++; break; }
-            slot = (slot + 1) & mask;
+            if (s->gk[g1 - 1] == k) {
+                s->gc[g1 - 1]++;
+                if (s->lg) s->lg[j - lo] = g1 - 1;
+                break;
+            }
+            slot = (slot + 1) & s->tmask;
         }
     }
-    h->ng_p[p] = ng;
-    ray_sys_free(tab);
-}
-
-/* per-block popcount of the first-row marks (prefixed serially after) */
-static void hp_pass_c(void* raw, uint32_t wid, int64_t start, int64_t end) {
-    (void)wid; (void)end;
-    hash_par_t* h = (hash_par_t*)raw;
-    int64_t w0 = start * (HP_BLOCK / 64), w1 = w0 + HP_BLOCK / 64;
-    int64_t nw = (h->n + 63) / 64;
-    if (w1 > nw) w1 = nw;
-    int64_t c = 0;
-    for (int64_t w = w0; w < w1; w++) c += __builtin_popcountll(h->bits[w]);
-    h->blk_rank[start] = c;
-}
-
-static inline int64_t hp_rank(const hash_par_t* h, int64_t i) {
-    int64_t blk = i / HP_BLOCK;
-    int64_t r = h->blk_rank[blk];
-    int64_t w = i >> 6;
-    for (int64_t x = blk * (HP_BLOCK / 64); x < w; x++) r += __builtin_popcountll(h->bits[x]);
-    return r + __builtin_popcountll(h->bits[w] & (((uint64_t)1 << (i & 63)) - 1));
-}
-
-static void hp_pass_d(void* raw, uint32_t wid, int64_t start, int64_t end) {
-    (void)wid; (void)end;
-    hash_par_t* h = (hash_par_t*)raw;
-    int64_t p = start;
-    int64_t lo = h->part_off[p];
-    const int64_t* gfirst = h->gfirst + lo;
-    int64_t* gcount = h->gcount + lo;
-    int64_t ng = h->ng_p[p];
-    for (int64_t g = 0; g < ng; g++) {
-        int64_t G = hp_rank(h, gfirst[g]);
-        h->gk[G] = (int64_t)h->kw[gfirst[g]];
-        h->of[G + 1] = gcount[g];
-        gcount[g] = G;             /* local -> global from here on */
+    if (h->counting) {
+        h->part_ng[p] = s->ng;
+        hb_part_free(s);
+        return;
     }
+    {
+        int64_t ng = s->ng;
+        uint64_t* hs = (uint64_t*)ray_alloc_raw((size_t)ng * sizeof(uint64_t));
+        uint64_t* th = (uint64_t*)ray_alloc_raw((size_t)ng * sizeof(uint64_t));
+        uint32_t* tv = (uint32_t*)ray_alloc_raw((size_t)ng * sizeof(uint32_t));
+        s->ord = (uint32_t*)ray_alloc_raw((size_t)ng * sizeof(uint32_t));
+        if (!hs || !th || !tv || !s->ord) {
+            ray_free_raw(hs); ray_free_raw(th); ray_free_raw(tv);
+            goto oom;
+        }
+        for (int64_t g = 0; g < ng; g++) { hs[g] = mix64(s->gk[g]); s->ord[g] = (uint32_t)g; }
+        hb_sort(hs, s->ord, th, tv, ng);
+        ray_free_raw(hs); ray_free_raw(th); ray_free_raw(tv);
+    }
+    return;
+oom:
+    atomic_store_explicit(&h->oom, true, memory_order_relaxed);
 }
 
-static void hp_pass_e(void* raw, uint32_t wid, int64_t start, int64_t end) {
+/* Batch task: store partition b_lo + start's keys, row offsets and rows. */
+static void hb_emit(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid; (void)end;
-    hash_par_t* h = (hash_par_t*)raw;
-    int64_t p = start;
+    hash_bld_t* h = (hash_bld_t*)raw;
+    hb_part_t* s = &h->part[start];
+    int64_t p = h->b_lo + start;
     int64_t lo = h->part_off[p], hi = h->part_off[p + 1];
-    const int64_t* gmap = h->gcount + lo;
-    /* rows of a partition are ascending -> ascending inside each group;
-     * of[] doubles as the fill cursor (the caller shifts it back); the
-     * partition's groups are nobody else's, so the cursors are private */
+    int64_t r = lo;
+    for (int64_t j = 0; j < s->ng; j++) {
+        uint32_t g = s->ord[j];
+        h->gk[s->g0 + j] = (int64_t)s->gk[g];
+        hx_set(h->offs, s->g0 + j, r);
+        int64_t c = s->gc[g];
+        s->gc[g] = r;
+        r += c;
+    }
+    /* rows ascend inside the partition, so inside each group too */
     for (int64_t j = lo; j < hi; j++)
-        h->rw[h->of[gmap[h->lg[j]]]++] = h->pr[j];
+        hx_set(h->rows, s->gc[s->lg ? (int64_t)s->lg[j - lo] : hb_part_find(s, h->kw[j])]++,
+               hb_rid(h, j));
+    hb_part_free(s);
 }
 
-/* Zero (and so fault in) up to 8 fresh regions in parallel slices: each
- * task owns one contiguous slice per region, so the page faults spread
- * over the workers without two of them ever meeting on a page. */
-typedef struct { void* p[8]; size_t bytes[8]; int n; int n_tasks; } hp_touch_t;
-static void hp_touch_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
-    (void)wid; (void)end;
-    hp_touch_t* t = (hp_touch_t*)raw;
-    for (int r = 0; r < t->n; r++) {
-        size_t lo = t->bytes[r] * (size_t)start / (size_t)t->n_tasks;
-        size_t hi = t->bytes[r] * (size_t)(start + 1) / (size_t)t->n_tasks;
-        if (hi > lo) memset((char*)t->p[r] + lo, 0, hi - lo);
-    }
-}
-static void hp_touch(ray_pool_t* pool, int n_tasks, hp_touch_t* t) {
-    t->n_tasks = n_tasks;
-    ray_pool_dispatch_n(pool, hp_touch_fn, t, (uint32_t)n_tasks);
+/* An interrupt makes a dispatch skip its tasks, so the outputs may be
+ * incomplete: stop on either signal. */
+static bool hb_stopped(ray_pool_t* pool) {
+    return ray_interrupted() ||
+           (pool && atomic_load_explicit(&pool->cancelled, memory_order_acquire));
 }
 
-/* F (in-memory builds only): the key table filled by every worker at once,
- * each claiming its slot with a compare-and-swap.  Any insertion order gives
- * a valid open-addressing table; only its byte layout differs from the
- * group-order fill, which a persisted index needs and a cache entry does not. */
-static void hp_pass_f(void* raw, uint32_t wid, int64_t start, int64_t end) {
-    (void)wid; (void)end;
-    hash_par_t* h = (hash_par_t*)raw;
-    int64_t lo = h->n_groups * start / h->n_tasks, hi = h->n_groups * (start + 1) / h->n_tasks;
-    for (int64_t g = lo; g < hi; g++) {
-        uint64_t slot = mix64((uint64_t)h->gk[g]) & h->tmask;
-        for (;;) {
-            int64_t want = 0;
-            if (__atomic_compare_exchange_n(&h->tbl[slot], &want, g + 1, false,
-                                            __ATOMIC_RELAXED, __ATOMIC_RELAXED)) break;
-            slot = (slot + 1) & h->tmask;
+/* Is an array of `len` entries of `es` bytes, allocated for `cap`, worth
+ * cutting to size? */
+static bool hb_cut(int64_t len, int64_t cap, size_t es) {
+    size_t slack = (size_t)(cap - len) * es;
+    return !(slack < ((size_t)1 << 20) || (2 * len > cap && slack < ((size_t)64 << 20)));
+}
+
+/* `v` (room for `cap` entries, `len` used) cut to size when the slack is
+ * worth a copy; `v` itself when it is not or the copy cannot be made. */
+static ray_t* hb_trim(ray_t* v, int64_t len, int64_t cap) {
+    size_t es = (size_t)ray_elem_size(v->type);
+    if (!hb_cut(len, cap, es)) return v;
+    ray_t* t = ray_vec_new(v->type, len > 0 ? len : 1);
+    if (!t || RAY_IS_ERR(t)) { if (t) ray_error_free(t); return v; }
+    t->len = len;
+    memcpy(ray_data(t), ray_data(v), (size_t)len * es);
+    ray_release(v);
+    return t;
+}
+
+static void hb_zero(ray_t* v, int64_t lo, int64_t hi) {
+    if (hi <= lo) return;
+    size_t es = (size_t)ray_elem_size(v->type);
+    memset((uint8_t*)ray_data(v) + (size_t)lo * es, 0, (size_t)(hi - lo) * es);
+}
+
+/* Where the build puts its four arrays: heap vectors (`map` NULL), or the
+ * persisted region itself — `map(ctx, bytes)` hands back the region's
+ * zero-filled memory once its size is known, laid out as
+ * ray_index_inline_write lays an index out (the head block, then the
+ * table, gkeys, offs and rows blocks), and the arrays are the block bodies. */
+typedef struct {
+    ray_index_region_fn map;
+    void*     ctx;
+    uint8_t*  base;      /* the region: map's result */
+    bool      zeroed;    /* the arrays start zero-filled */
+    ray_err_t err;       /* why the build failed when map did */
+    ray_t    *table, *gkeys, *offs, *rows;
+} hb_dst_t;
+
+/* The order a heap block for `bytes` of vector data gets.  A vector's
+ * header carries it, and the region keeps each array's header. */
+static uint8_t hb_alloc_order(size_t bytes) {
+    uint8_t o = ray_order_for_size(bytes);
+    return o >= RAY_HEAP_POOL_ORDER ? (uint8_t)RAY_ORDER_DIRECT : o;
+}
+
+/* The block header at `at`: what ray_index_inline_write stores for a heap
+ * vector of `type` holding `len` entries in room for `cap`. */
+static ray_t* hb_region_vec(uint8_t* at, int8_t type, int64_t len, int64_t cap) {
+    ray_t* b = (ray_t*)at;
+    memset(b, 0, 32);
+    b->mmod = 1; b->rc = 1;
+    b->order = hb_alloc_order((size_t)cap * (size_t)ray_elem_size(type));
+    b->type = type;
+    b->len = len;
+    return b;
+}
+
+static void hb_dst_drop(hb_dst_t* d) {
+    ray_t** a[4] = { &d->table, &d->gkeys, &d->offs, &d->rows };
+    for (int i = 0; i < 4; i++) {
+        if (!d->map && *a[i]) {
+            if (RAY_IS_ERR(*a[i])) ray_error_free(*a[i]); else ray_release(*a[i]);
         }
+        *a[i] = NULL;
     }
 }
 
-/* canonical: the key table is filled in group order, so the bytes are the
- * same whatever the core count (a persisted .idx.hash); false lets the
- * workers fill it concurrently (the lazy in-memory index). */
-static bool hash_build_par(ray_t* v, ray_t** gkeys_out, ray_t** offs_out,
-                           ray_t** rows_out, ray_t** table_out, uint64_t* mask_out,
-                           int64_t* n_keys_out, int64_t* n_groups_out, bool canonical) {
+/* The arrays of `n_keys` keys in `n_groups` groups and a table of `cap`
+ * slots.  Each is allocated at the capacity the in-memory build ends with
+ * (gkeys and offs sized for the keys and cut to the groups when that pays,
+ * hb_trim), so a region written in place holds the bytes a heap-built
+ * index persists. */
+static bool hb_dst_open(hb_dst_t* d, int8_t aw, int64_t n_keys, int64_t n_groups, uint64_t cap) {
+    size_t es = (size_t)ray_elem_size(aw);
+    int64_t gcap = hb_cut(n_groups, n_keys, 8) ? n_groups : n_keys;
+    int64_t ocap = hb_cut(n_groups + 1, n_keys + 1, es) ? n_groups + 1 : n_keys + 1;
+    int64_t rcap = n_keys > 0 ? n_keys : 1;
+    if (gcap < 1) gcap = 1;
+    if (!d->map) {
+        d->table = ray_vec_new(aw, (int64_t)cap);
+        d->gkeys = ray_vec_new(RAY_I64, gcap);
+        d->offs  = ray_vec_new(aw, ocap);
+        d->rows  = ray_vec_new(aw, rcap);
+        if (!d->table || RAY_IS_ERR(d->table) || !d->gkeys || RAY_IS_ERR(d->gkeys) ||
+            !d->offs || RAY_IS_ERR(d->offs) || !d->rows || RAY_IS_ERR(d->rows)) {
+            hb_dst_drop(d);
+            return false;
+        }
+        d->table->len = (int64_t)cap;
+        d->gkeys->len = n_groups;
+        d->offs->len  = n_groups + 1;
+        d->rows->len  = n_keys;
+        return true;
+    }
+    int64_t tb = IDX_ALIGN32(32 + (int64_t)cap * (int64_t)es);
+    int64_t gb = IDX_ALIGN32(32 + n_groups * 8);
+    int64_t ob = IDX_ALIGN32(32 + (n_groups + 1) * (int64_t)es);
+    int64_t rb = IDX_ALIGN32(32 + n_keys * (int64_t)es);
+    d->base = d->map(d->ctx, IDX_HEAD_BYTES + tb + gb + ob + rb);
+    if (!d->base) { d->err = RAY_ERR_IO; return false; }
+    d->zeroed = true;
+    uint8_t* at = d->base + IDX_HEAD_BYTES;
+    d->table = hb_region_vec(at, aw, (int64_t)cap, (int64_t)cap); at += tb;
+    d->gkeys = hb_region_vec(at, RAY_I64, n_groups, gcap);        at += gb;
+    d->offs  = hb_region_vec(at, aw, n_groups + 1, ocap);         at += ob;
+    d->rows  = hb_region_vec(at, aw, n_keys, rcap);
+    return true;
+}
+
+/* The slot table, filled as the groups come in group order: each group in
+ * the first free slot from its home.  Homes ascend with the group number,
+ * so this is one forward sweep; the run that passes the last slot goes on
+ * from slot 0 once every group is in (hb_sweep_finish). */
+typedef struct { uint64_t cap; int shift; int64_t next, wrap; bool zeroed; } hb_sweep_t;
+
+static void hb_sweep_init(hb_sweep_t* w, uint64_t cap, bool zeroed) {
+    w->cap = cap; w->shift = __builtin_clzll(cap - 1);
+    w->next = 0; w->wrap = -1; w->zeroed = zeroed;
+}
+
+/* Groups [g_lo, g_hi); false when interrupted. */
+static bool hb_sweep(hb_sweep_t* w, ray_t* table, const int64_t* gk, int64_t g_lo, int64_t g_hi,
+                     ray_pool_t* pool) {
+    for (int64_t g = g_lo; g < g_hi && w->wrap < 0; g++) {
+        if (RAY_UNLIKELY(((g - g_lo) & 0xFFFFF) == 0xFFFFF && hb_stopped(pool))) return false;
+        int64_t home = (int64_t)(mix64((uint64_t)gk[g]) >> w->shift);
+        int64_t s = home > w->next ? home : w->next;
+        if (s >= (int64_t)w->cap) { w->wrap = g; break; }
+        if (!w->zeroed) hb_zero(table, w->next, s);
+        hx_set(table, s, g + 1);
+        w->next = s + 1;
+    }
+    return true;
+}
+
+static void hb_sweep_finish(hb_sweep_t* w, ray_t* table, int64_t n_groups) {
+    if (!w->zeroed) hb_zero(table, w->next, (int64_t)w->cap);
+    if (w->wrap < 0) return;
+    for (int64_t s = 0, g = w->wrap; g < n_groups; g++) {     /* the run that wrapped */
+        while (hx_get(table, s) != 0) s++;
+        hx_set(table, s, g + 1);
+    }
+}
+
+/* The end of the batch of partitions that starts at `p`: as many as fit
+ * `batch_rows` (at least one) and the batch's task slots. */
+static int64_t hb_batch_end(const hash_bld_t* h, int64_t p, int64_t max_batch, int64_t batch_rows) {
+    int64_t q = p, br = 0;
+    do { br += h->part_off[q + 1] - h->part_off[q]; q++; }
+    while (q < h->n_part && q - p < max_batch &&
+           br + h->part_off[q + 1] - h->part_off[q] <= batch_rows);
+    return q;
+}
+
+/* Dedupe (or count) the partitions [p, q); false when interrupted or out of
+ * memory. */
+static bool hb_dedupe_batch(hash_bld_t* h, ray_pool_t* pool, bool par, int64_t p, int64_t q) {
+    h->b_lo = p;
+    if (par && q - p > 1) ray_pool_dispatch_n(pool, hb_dedupe, h, (uint32_t)(q - p));
+    else for (int64_t i = 0; i < q - p; i++) hb_dedupe(h, 0, i, i + 1);
+    return !hb_stopped(pool) && !atomic_load_explicit(&h->oom, memory_order_relaxed);
+}
+
+/* Debug builds: the row count past which row ids are 64-bit, lowered by
+ * RAY_HASH_WIDE_ROWS so the wide layout runs on small columns in tests. */
+static int64_t hb_wide_rows(void) {
+#if defined(DEBUG)
+    const char* e = getenv("RAY_HASH_WIDE_ROWS");
+    if (e && *e) { long long x = strtoll(e, NULL, 10); if (x >= 0) return x; }
+#endif
+    return (int64_t)UINT32_MAX;
+}
+
+static int hash_build_part(ray_t* v, hb_dst_t* d, uint64_t* mask_out,
+                           int64_t* n_keys_out, int64_t* n_groups_out, ray_hash_trace_t* tr) {
     int64_t n = v->len;
     ray_pool_t* pool = ray_pool_get();
-    if (!ray_pool_par_dispatch_ok(pool, n, 1 << 16)) return false;
-    int workers = (int)ray_pool_total_workers(pool);
+    bool par = ray_pool_par_dispatch_ok(pool, n, 1 << 16);
+    int64_t workers = par ? (int64_t)ray_pool_total_workers(pool) : 1;
 
-    hash_par_t h;
+    /* Rows of a batch: the random-access working set within the budget. */
+    int64_t budget = ray_heap_anon_watermark() / 4;
+    if (budget < (INT64_C(16) << 20)) budget = INT64_C(16) << 20;
+    int64_t batch_rows = budget / HB_ROW_BYTES;
+    int64_t part_rows = batch_rows / workers;
+    if (part_rows > HB_PART_ROWS) part_rows = HB_PART_ROWS;
+    if (part_rows < 4096) part_rows = 4096;
+
+    hash_bld_t h;
     memset(&h, 0, sizeof(h));
     h.v = v; h.base = (const uint8_t*)ray_data(v); h.n = n;
-    h.n_tasks = workers * 4;
-    if (h.n_tasks > 512) h.n_tasks = 512;
+    h.wide = n > hb_wide_rows();
+    h.n_tasks = par ? workers * 4 : 1;
+    if (h.n_tasks > HB_MAX_TASKS) h.n_tasks = HB_MAX_TASKS;
     h.n_part = 2;
-    while (h.n_part < workers * 4 && h.n_part < 512) h.n_part <<= 1;
+    while (((par && h.n_part < workers * 4) || h.n_part * part_rows < n) &&
+           h.n_part < HB_MAX_PARTS)
+        h.n_part <<= 1;
     h.part_shift = 64;
-    for (int q = h.n_part; q > 1; q >>= 1) h.part_shift--;
+    for (int64_t q = h.n_part; q > 1; q >>= 1) h.part_shift--;
 
-    int64_t nw = (n + 63) / 64;
-    int64_t nblk = (n + HP_BLOCK - 1) / HP_BLOCK;
+    int8_t aw = h.wide ? RAY_I64 : RAY_I32;
+    int64_t es = h.wide ? 8 : 4;
     size_t cnt_b = (size_t)h.n_tasks * (size_t)h.n_part * sizeof(int64_t);
-    size_t po_b  = (size_t)(h.n_part + 1) * sizeof(int64_t);
-    size_t bits_b = (size_t)(nw + 1) * sizeof(uint64_t);
-    h.kw       = (uint64_t*)ray_sys_alloc((size_t)n * sizeof(uint64_t));
-    h.cnt      = (int64_t*)ray_sys_alloc(cnt_b);
-    h.part_off = (int64_t*)ray_sys_alloc(po_b);
-    h.ng_p     = (int64_t*)ray_sys_alloc(po_b);
-    h.bits     = (uint64_t*)ray_sys_alloc(bits_b);
-    h.blk_rank = (int64_t*)ray_sys_alloc((size_t)(nblk + 1) * sizeof(int64_t));
-    ray_t *gkeys = NULL, *offs = NULL, *rows = NULL, *table = NULL;
-    bool ok = h.kw && h.cnt && h.part_off && h.ng_p && h.bits && h.blk_rank;
-    if (!ok) goto done;
-    memset(h.cnt, 0, cnt_b); memset(h.part_off, 0, po_b); memset(h.ng_p, 0, po_b);
-    memset(h.blk_rank, 0, (size_t)(nblk + 1) * sizeof(int64_t));
-    {
-        hp_touch_t t = { .p = { h.kw, h.bits }, .bytes = { (size_t)n * sizeof(uint64_t), bits_b }, .n = 2 };
-        hp_touch(pool, h.n_tasks, &t);
-    }
+    int64_t n_keys = 0, n_groups = 0, ng_run = 0, kw_done = 0;
+    int64_t max_batch = h.n_part < workers * 4 ? h.n_part : workers * 4;
+    h.part_cap0 = batch_rows;
+    bool ok = false, known = false, one = false;
+    uint64_t cap = 0;
+    hb_sweep_t sw;
+    memset(&sw, 0, sizeof(sw));
+    ray_hash_mark_t tm = tr ? ray_hash_trace_mark() : (ray_hash_mark_t){0};
+    int64_t colb = n * (int64_t)ray_sym_elem_size(v->type, v->attrs);
+    h.cnt      = (int64_t*)ray_alloc_raw(cnt_b);
+    h.part_off = (int64_t*)ray_alloc_raw((size_t)(h.n_part + 1) * sizeof(int64_t));
+    h.part     = (hb_part_t*)ray_calloc_raw((size_t)max_batch * sizeof(hb_part_t));
+    if (!h.cnt || !h.part_off || !h.part) goto done;
+    memset(h.cnt, 0, cnt_b);
 
-    /* A: key words + partition counts, then the bucketed row ids */
-    ray_pool_dispatch_n(pool, hp_pass_a, &h, (uint32_t)h.n_tasks);
-    if (ray_interrupted()) { ok = false; goto done; }
+    /* 1: bucket the key words and row ids by partition */
+    if (par) ray_pool_dispatch_n(pool, hb_count, &h, (uint32_t)h.n_tasks);
+    else     hb_count(&h, 0, 0, 1);
+    if (tr) { ray_hash_trace_add(tr, RAY_HXT_COUNT, tm, colb); tm = ray_hash_trace_mark(); }
+    if (hb_stopped(pool)) goto done;
     {
         int64_t run = 0;
-        for (int p = 0; p < h.n_part; p++) {
+        for (int64_t p = 0; p < h.n_part; p++) {
             h.part_off[p] = run;
-            for (int t = 0; t < h.n_tasks; t++) {
-                int64_t c = h.cnt[(int64_t)t * h.n_part + p];
-                h.cnt[(int64_t)t * h.n_part + p] = run;
+            for (int64_t t = 0; t < h.n_tasks; t++) {
+                int64_t c = h.cnt[t * h.n_part + p];
+                h.cnt[t * h.n_part + p] = run;
                 run += c;
             }
         }
         h.part_off[h.n_part] = run;
+        n_keys = run;
     }
-    int64_t n_keys = h.part_off[h.n_part];
-    size_t kb = (size_t)(n_keys > 0 ? n_keys : 1) * sizeof(int64_t);
-    h.pr     = (int64_t*)ray_sys_alloc(kb);
-    h.lg     = (int64_t*)ray_sys_alloc(kb);
-    h.gfirst = (int64_t*)ray_sys_alloc(kb);
-    h.gcount = (int64_t*)ray_sys_alloc(kb);
-    if (!h.pr || !h.lg || !h.gfirst || !h.gcount) { ok = false; goto done; }
-    {
-        hp_touch_t t = { .p = { h.pr, h.lg, h.gfirst, h.gcount }, .bytes = { kb, kb, kb, kb }, .n = 4 };
-        hp_touch(pool, h.n_tasks, &t);
-    }
-    ray_pool_dispatch_n(pool, hp_pass_a2, &h, (uint32_t)h.n_tasks);
-    if (ray_interrupted()) { ok = false; goto done; }
+    h.kw  = (uint64_t*)ray_alloc_raw((size_t)(n_keys > 0 ? n_keys : 1) * sizeof(uint64_t));
+    h.rid = ray_alloc_raw((size_t)(n_keys > 0 ? n_keys : 1) * (size_t)es);
+    if (!h.kw || !h.rid) goto done;
+    if (par) ray_pool_dispatch_n(pool, hb_bucket, &h, (uint32_t)h.n_tasks);
+    else     hb_bucket(&h, 0, 0, 1);
+    if (tr) { ray_hash_trace_add(tr, RAY_HXT_BUCKET, tm, colb + n_keys * (8 + es)); tm = ray_hash_trace_mark(); }
+    if (hb_stopped(pool)) goto done;
 
-    /* B: per-partition dedupe */
-    ray_pool_dispatch_n(pool, hp_pass_b, &h, (uint32_t)h.n_part);
-    if (ray_interrupted() || atomic_load_explicit(&h.oom, memory_order_relaxed)) { ok = false; goto done; }
-    int64_t n_groups = 0;
-    for (int p = 0; p < h.n_part; p++) n_groups += h.ng_p[p];
-
-    /* C: first-occurrence numbering = rank of the group's first row */
-    ray_pool_dispatch_n(pool, hp_pass_c, &h, (uint32_t)nblk);
-    {
-        int64_t run = 0;
-        for (int64_t b = 0; b < nblk; b++) { int64_t c = h.blk_rank[b]; h.blk_rank[b] = run; run += c; }
-        h.blk_rank[nblk] = run;
-    }
-
-    gkeys = ray_vec_new(RAY_I64, n_groups > 0 ? n_groups : 1);
-    offs  = ray_vec_new(RAY_I64, n_groups + 1);
-    rows  = ray_vec_new(RAY_I64, n_keys > 0 ? n_keys : 1);
-    uint64_t cap = next_pow2((uint64_t)(n_groups < 4 ? 8 : 2 * n_groups));
-    if (cap < 8) cap = 8;
-    table = ray_vec_new(RAY_I64, (int64_t)cap);
-    if (!gkeys || RAY_IS_ERR(gkeys) || !offs || RAY_IS_ERR(offs) ||
-        !rows || RAY_IS_ERR(rows) || !table || RAY_IS_ERR(table)) { ok = false; goto done; }
-    gkeys->len = n_groups; offs->len = n_groups + 1; rows->len = n_keys; table->len = (int64_t)cap;
-    h.gk = (int64_t*)ray_data(gkeys); h.of = (int64_t*)ray_data(offs);
-    h.rw = (int64_t*)ray_data(rows);  h.tbl = (int64_t*)ray_data(table);
-    h.tmask = cap - 1;
-    {
-        hp_touch_t t = { .p = { h.gk, h.of, h.rw, h.tbl },
-                         .bytes = { (size_t)(n_groups > 0 ? n_groups : 1) * sizeof(int64_t),
-                                    (size_t)(n_groups + 1) * sizeof(int64_t), kb,
-                                    (size_t)cap * sizeof(int64_t) }, .n = 4 };
-        hp_touch(pool, h.n_tasks, &t);
-    }
-
-    /* D: keys and counts; E: rows and the key table */
-    ray_pool_dispatch_n(pool, hp_pass_d, &h, (uint32_t)h.n_part);
-    for (int64_t g = 0; g < n_groups; g++) h.of[g + 1] += h.of[g];
-    ray_pool_dispatch_n(pool, hp_pass_e, &h, (uint32_t)h.n_part);
-    for (int64_t g = n_groups; g > 0; g--) h.of[g] = h.of[g - 1];
-    h.of[0] = 0;
-    /* Key table filled in group order, exactly as the serial build does:
-     * the persisted index is then the same bytes whatever the core count. */
-    if (canonical) {
-        for (int64_t g = 0; g < n_groups; g++) {
-            uint64_t slot = mix64((uint64_t)h.gk[g]) & h.tmask;
-            while (h.tbl[slot] != 0) slot = (slot + 1) & h.tmask;
-            h.tbl[slot] = g + 1;
+    /* 2: the group count before any array, so each is allocated — or laid
+     * out in the persisted region — once, at its final size, and written
+     * once, front to back.  One batch: its dedupe gives the count.  Several,
+     * into a region: each partition's groups are counted first (one more
+     * read of the key words, where the arrays would otherwise go through
+     * memory at the key count's size and be copied into the file).  Several,
+     * in memory: the group arrays are sized for the keys and cut after. */
+    one = hb_batch_end(&h, 0, max_batch, batch_rows) >= h.n_part;
+    if (one) {
+        if (!hb_dedupe_batch(&h, pool, par, 0, h.n_part)) goto done;
+        for (int64_t i = 0; i < h.n_part; i++) n_groups += h.part[i].ng;
+        known = true;
+    } else if (d->map) {
+        h.part_ng = (int64_t*)ray_calloc_raw((size_t)h.n_part * sizeof(int64_t));
+        if (!h.part_ng) goto done;
+        h.counting = true;
+        for (int64_t p = 0, q; p < h.n_part; p = q) {
+            q = hb_batch_end(&h, p, max_batch, batch_rows);
+            if (!hb_dedupe_batch(&h, pool, par, p, q)) goto done;
         }
-    } else {
-        h.n_groups = n_groups;
-        ray_pool_dispatch_n(pool, hp_pass_f, &h, (uint32_t)h.n_tasks);
+        h.counting = false;
+        for (int64_t p = 0; p < h.n_part; p++) n_groups += h.part_ng[p];
+        known = true;
+        if (tr) { ray_hash_trace_add(tr, RAY_HXT_DISTINCT, tm, n_keys * 8); tm = ray_hash_trace_mark(); }
     }
-    if (ray_interrupted()) { ok = false; goto done; }
+    if (known) {
+        cap = next_pow2((uint64_t)(n_groups < 4 ? 8 : 2 * n_groups));
+        if (cap < 8) cap = 8;
+        if (!hb_dst_open(d, aw, n_keys, n_groups, cap)) goto done;
+        hb_sweep_init(&sw, cap, d->zeroed);
+    } else {
+        d->gkeys = ray_vec_new(RAY_I64, n_keys > 0 ? n_keys : 1);
+        d->offs  = ray_vec_new(aw, n_keys + 1);
+        d->rows  = ray_vec_new(aw, n_keys > 0 ? n_keys : 1);
+        if (!d->gkeys || RAY_IS_ERR(d->gkeys) || !d->offs || RAY_IS_ERR(d->offs) ||
+            !d->rows || RAY_IS_ERR(d->rows)) goto done;
+    }
+    h.gk = (int64_t*)ray_data(d->gkeys); h.offs = d->offs; h.rows = d->rows;
 
-    *gkeys_out = gkeys; *offs_out = offs; *rows_out = rows; *table_out = table;
-    *mask_out = h.tmask; *n_keys_out = n_keys; *n_groups_out = n_groups;
+    /* 3: partitions in batches: dedupe, store, and the batch's groups into
+     * the slot table while they are at hand */
+    for (int64_t p = 0, q; p < h.n_part; p = q) {
+        q = one ? h.n_part : hb_batch_end(&h, p, max_batch, batch_rows);
+        if (!one && !hb_dedupe_batch(&h, pool, par, p, q)) goto done;
+        int64_t g_lo = ng_run;
+        for (int64_t i = 0; i < q - p; i++) { h.part[i].g0 = ng_run; ng_run += h.part[i].ng; }
+        if (par && q - p > 1) ray_pool_dispatch_n(pool, hb_emit, &h, (uint32_t)(q - p));
+        else for (int64_t i = 0; i < q - p; i++) hb_emit(&h, 0, i, i + 1);
+        /* an interrupted dispatch skips tasks: their partitions are still
+         * held and their outputs unwritten */
+        for (int64_t i = 0; i < q - p; i++) hb_part_free(&h.part[i]);
+        if (hb_stopped(pool)) goto done;
+        if (known && !hb_sweep(&sw, d->table, h.gk, g_lo, ng_run, pool)) goto done;
+        /* The batch's key words and row ids are not read again: past the
+         * watermark their pages leave the spill files now instead of being
+         * written back, and make room for the arrays still to come. */
+        ray_raw_discard(h.kw, (size_t)kw_done * 8, (size_t)h.part_off[q] * 8);
+        ray_raw_discard(h.rid, (size_t)(kw_done * es), (size_t)(h.part_off[q] * es));
+        kw_done = h.part_off[q];
+    }
+    if (known && ng_run != n_groups) goto done;   /* the counts disagree: never */
+    n_groups = ng_run;
+    hx_set(d->offs, n_groups, n_keys);
+    d->gkeys->len = n_groups; d->offs->len = n_groups + 1; d->rows->len = n_keys;
+    ray_free_raw(h.kw);  h.kw = NULL;
+    ray_free_raw(h.rid); h.rid = NULL;
+    if (tr) {
+        ray_hash_trace_add(tr, RAY_HXT_GROUPS, tm, n_keys * (8 + es) + n_groups * 8 +
+                           (n_groups + 1) * es + n_keys * es + (known ? (int64_t)cap * es : 0));
+        tm = ray_hash_trace_mark();
+    }
+
+    /* 4: the slot table, unless swept batch by batch above */
+    if (!known) {
+        cap = next_pow2((uint64_t)(n_groups < 4 ? 8 : 2 * n_groups));
+        if (cap < 8) cap = 8;
+        d->table = ray_vec_new(aw, (int64_t)cap);
+        if (!d->table || RAY_IS_ERR(d->table)) goto done;
+        d->table->len = (int64_t)cap;
+        hb_sweep_init(&sw, cap, false);
+        if (!hb_sweep(&sw, d->table, h.gk, 0, n_groups, pool)) goto done;
+    }
+    hb_sweep_finish(&sw, d->table, n_groups);
+    *mask_out = cap - 1;
+    ok = true;
 
 done:
+    if (h.part)
+        for (int64_t i = 0; i < max_batch; i++) hb_part_free(&h.part[i]);
+    ray_free_raw(h.cnt); ray_free_raw(h.part_off); ray_free_raw(h.part);
+    ray_free_raw(h.kw);  ray_free_raw(h.rid); ray_free_raw(h.part_ng);
     if (!ok) {
-        if (gkeys && !RAY_IS_ERR(gkeys)) ray_release(gkeys);
-        if (offs && !RAY_IS_ERR(offs)) ray_release(offs);
-        if (rows && !RAY_IS_ERR(rows)) ray_release(rows);
-        if (table && !RAY_IS_ERR(table)) ray_release(table);
+        hb_dst_drop(d);
+        return -1;
     }
-    ray_sys_free(h.kw); ray_sys_free(h.pr); ray_sys_free(h.lg);
-    ray_sys_free(h.gfirst); ray_sys_free(h.gcount); ray_sys_free(h.cnt);
-    ray_sys_free(h.part_off); ray_sys_free(h.ng_p); ray_sys_free(h.bits);
-    ray_sys_free(h.blk_rank);
-    return ok;
+    if (!known) {
+        ray_t *g0 = d->gkeys, *o0 = d->offs;
+        d->gkeys = hb_trim(d->gkeys, n_groups, n_keys);
+        d->offs  = hb_trim(d->offs, n_groups + 1, n_keys + 1);
+        if (tr) {
+            int64_t mv = n_groups * 8 + (int64_t)cap * es;   /* the sweep */
+            if (d->gkeys != g0) mv += 2 * n_groups * 8;
+            if (d->offs != o0)  mv += 2 * (n_groups + 1) * es;
+            ray_hash_trace_add(tr, RAY_HXT_TABLE, tm, mv);
+        }
+    }
+    if (tr) { tr->n_keys = n_keys; tr->n_groups = n_groups; }
+    *n_keys_out = n_keys; *n_groups_out = n_groups;
+    return 1;
 }
 
-static ray_t* attach_hash_impl(ray_t** vp, bool canonical) {
+ray_t* ray_index_attach_hash(ray_t** vp) {
     /* allow_str: keyed on a byte hash with payload-verified compares;
      * allow_sym: RAY_SYM uses domain ids. */
     ray_t* v = prepare_attach_ex(vp, "hash", true, true);
@@ -2009,33 +2470,33 @@ static ray_t* attach_hash_impl(ray_t** vp, bool canonical) {
     int64_t n = v->len;
     ray_t* table = NULL;
     uint64_t mask = 0;
-    {
-        ray_t *pg = NULL, *po = NULL, *pr = NULL, *pt = NULL;
-        int64_t pk = 0, pn = 0;
+    if (!is_str) {
+        hb_dst_t d;
+        memset(&d, 0, sizeof(d));
         uint64_t pm = 0;
-        if (!is_str && hash_build_par(v, &pg, &po, &pr, &pt, &pm, &pk, &pn, canonical)) {
-            if (ray_interrupted()) {
-                ray_release(pg); ray_release(po); ray_release(pr); ray_release(pt);
-                return ray_error("cancel", "interrupted");
-            }
-            ray_t* idx = ray_index_alloc(RAY_IDX_HASH, v->type, n);
-            if (!idx || RAY_IS_ERR(idx)) {
-                ray_release(pg); ray_release(po); ray_release(pr); ray_release(pt);
-                return idx ? idx : ray_error("oom", NULL);
-            }
-            ray_index_t* ix = ray_index_payload(idx);
-            ix->u.hash.table    = pt;
-            ix->u.hash.gkeys    = pg;
-            ix->u.hash.offs     = po;
-            ix->u.hash.rows     = pr;
-            ix->u.hash.mask     = pm;
-            ix->u.hash.n_keys   = pk;
-            ix->u.hash.n_groups = pn;
-            ix->u.hash.order_sym = -1;
-            return attach_finalize(v, idx);
+        int64_t pk = 0, pn = 0;
+        if (hash_build_part(v, &d, &pm, &pk, &pn, NULL) < 0)
+            return hb_stopped(ray_pool_get()) ? ray_error("cancel", "interrupted")
+                                              : ray_error("oom", NULL);
+        ray_t* idx = ray_index_alloc(RAY_IDX_HASH, v->type, n);
+        if (!idx || RAY_IS_ERR(idx)) {
+            hb_dst_drop(&d);
+            return idx ? idx : ray_error("oom", NULL);
         }
+        ray_index_t* ix = ray_index_payload(idx);
+        ix->u.hash.table    = d.table;
+        ix->u.hash.gkeys    = d.gkeys;
+        ix->u.hash.offs     = d.offs;
+        ix->u.hash.rows     = d.rows;
+        ix->u.hash.mask     = pm;
+        ix->u.hash.n_keys   = pk;
+        ix->u.hash.n_groups = pn;
+        ix->u.hash.order_sym = -1;
+        ix->markers |= RAY_MARK_HASH_HIGH;
+        return attach_finalize(v, idx);
     }
-    /* Build-time capacity: sized by rows for O(1) inserts. */
+    /* STR: a serial walk, groups numbered by first occurrence.  Build-time
+     * capacity: sized by rows for O(1) inserts. */
     uint64_t bcap = next_pow2((uint64_t)(n < 4 ? 8 : 2 * n));
     if (bcap < 8) bcap = 8;
     uint64_t bmask = bcap - 1;
@@ -2173,6 +2634,7 @@ static ray_t* attach_hash_impl(ray_t** vp, bool canonical) {
     ix->u.hash.n_keys   = n_keys;
     ix->u.hash.n_groups = n_groups;
     ix->u.hash.order_sym = -1;
+    hx_narrow_payload(ix);
 
     return attach_finalize(v, idx);
 
@@ -2184,10 +2646,111 @@ hash_cancel_csr:
     return ray_error("cancel", "interrupted");
 }
 
-ray_t* ray_index_attach_hash(ray_t** vp) { return attach_hash_impl(vp, true); }
-/* The lazy cache's build: never persisted, so its key table needs no
- * canonical layout and is filled in parallel. */
-static ray_t* attach_hash_mem(ray_t** vp) { return attach_hash_impl(vp, false); }
+
+typedef struct { int64_t first, g; } hx_first_t;
+static int hx_first_cmp(const void* a, const void* b) {
+    int64_t x = ((const hx_first_t*)a)->first, y = ((const hx_first_t*)b)->first;
+    return x < y ? -1 : x > y;
+}
+
+bool ray_index_hash_legacy(const ray_index_t* ix, ray_t** table, ray_t** gkeys,
+                           ray_t** offs, ray_t** rows) {
+    *table = *gkeys = *offs = *rows = NULL;
+    if (!ix || ix->kind != RAY_IDX_HASH) return false;
+    const ray_t *t = ix->u.hash.table, *gk = ix->u.hash.gkeys, *of = ix->u.hash.offs, *rw = ix->u.hash.rows;
+    if (!t || RAY_IS_ERR(t) || !gk || RAY_IS_ERR(gk) || !of || RAY_IS_ERR(of) || !rw || RAY_IS_ERR(rw))
+        return false;
+    int64_t ng = ix->u.hash.n_groups, nk = ix->u.hash.n_keys;
+    uint64_t mask = ix->u.hash.mask;
+    if (t->type == RAY_I64 && of->type == RAY_I64 && rw->type == RAY_I64 &&
+        !(ix->markers & RAY_MARK_HASH_HIGH)) {
+        /* the generation-1 layout already: shared */
+        ray_retain((ray_t*)t); ray_retain((ray_t*)gk); ray_retain((ray_t*)of); ray_retain((ray_t*)rw);
+        *table = (ray_t*)t; *gkeys = (ray_t*)gk; *offs = (ray_t*)of; *rows = (ray_t*)rw;
+        return true;
+    }
+    /* Renumber the groups by first occurrence (the generation-1 builders'
+     * numbering: a group's rows ascend, so its first row is rows[offs[g]]),
+     * then lay the slot table out in that order under the low-bits rule. */
+    ray_t* ord_hdr = NULL;
+    hx_first_t* ord = (hx_first_t*)scratch_alloc(&ord_hdr, (size_t)(ng > 0 ? ng : 1) * sizeof(hx_first_t));
+    ray_t* nt = ray_vec_new(RAY_I64, (int64_t)(mask + 1));
+    ray_t* ngk = ray_vec_new(RAY_I64, ng > 0 ? ng : 1);
+    ray_t* nof = ray_vec_new(RAY_I64, ng + 1);
+    ray_t* nrw = ray_vec_new(RAY_I64, nk > 0 ? nk : 1);
+    bool ok = ord && nt && !RAY_IS_ERR(nt) && ngk && !RAY_IS_ERR(ngk) &&
+              nof && !RAY_IS_ERR(nof) && nrw && !RAY_IS_ERR(nrw);
+    if (ok) {
+        const int64_t* g0 = (const int64_t*)ray_data((ray_t*)gk);
+        for (int64_t g = 0; g < ng; g++) {
+            int64_t o = hx_get(of, g);
+            ord[g].first = o < hx_get(of, g + 1) ? hx_get(rw, o) : INT64_MAX;
+            ord[g].g = g;
+        }
+        if (ng > 1) qsort(ord, (size_t)ng, sizeof *ord, hx_first_cmp);
+        int64_t* td = (int64_t*)ray_data(nt);
+        int64_t* gd = (int64_t*)ray_data(ngk);
+        int64_t* od = (int64_t*)ray_data(nof);
+        int64_t* rd = (int64_t*)ray_data(nrw);
+        memset(td, 0, (size_t)(mask + 1) * sizeof(int64_t));
+        int64_t at = 0;
+        for (int64_t i = 0; i < ng; i++) {
+            int64_t g = ord[i].g;
+            gd[i] = g0[g];
+            od[i] = at;
+            for (int64_t r = hx_get(of, g); r < hx_get(of, g + 1); r++) rd[at++] = hx_get(rw, r);
+            uint64_t sl = mix64((uint64_t)gd[i]) & mask;
+            while (td[sl] != 0) sl = (sl + 1) & mask;
+            td[sl] = i + 1;
+        }
+        od[ng] = at;
+        nt->len = (int64_t)(mask + 1); ngk->len = ng; nof->len = ng + 1; nrw->len = nk;
+    }
+    scratch_free(ord_hdr);
+    if (ok) { *table = nt; *gkeys = ngk; *offs = nof; *rows = nrw; return true; }
+    ray_t* v[4] = { nt, ngk, nof, nrw };
+    for (int i = 0; i < 4; i++)
+        if (v[i]) { if (RAY_IS_ERR(v[i])) ray_error_free(v[i]); else ray_release(v[i]); }
+    return false;
+}
+
+ray_err_t ray_index_hash_build_region(ray_t* v, ray_index_region_fn map, void* ctx,
+                                      ray_hash_trace_t* tr) {
+    if (!v || RAY_IS_ERR(v) || !map) return RAY_ERR_DOMAIN;
+    if (!ray_is_vec(v) || (v->attrs & RAY_ATTR_SLICE) ||
+        (numeric_elem_size(v->type) == 0 && v->type != RAY_SYM))
+        return RAY_ERR_NYI;
+    hb_dst_t d;
+    memset(&d, 0, sizeof(d));
+    d.map = map; d.ctx = ctx;
+    uint64_t mask = 0;
+    int64_t n_keys = 0, n_groups = 0;
+    if (hash_build_part(v, &d, &mask, &n_keys, &n_groups, tr) < 0)
+        return d.err != RAY_OK ? d.err
+             : hb_stopped(ray_pool_get()) ? RAY_ERR_CANCEL : RAY_ERR_OOM;
+    /* The head as ray_index_attach_hash fills it: the parent's aux and
+     * HAS_NULLS snapshot — the aux it had before any index of its own, which
+     * an attach drops first. */
+    ray_index_t ix;
+    memset(&ix, 0, sizeof(ix));
+    ix.kind = RAY_IDX_HASH;
+    ix.parent_type = v->type;
+    ix.built_for_len = v->len;
+    ix.markers = RAY_MARK_HASH_HIGH;
+    bool has_ix = (v->attrs & RAY_ATTR_HAS_INDEX) && v->index && !RAY_IS_ERR(v->index);
+    memcpy(ix.saved_aux, has_ix ? ray_index_payload(v->index)->saved_aux : v->aux, 16);
+    ix.saved_attrs = v->attrs & RAY_ATTR_HAS_NULLS;
+    ix.u.hash.table     = d.table;
+    ix.u.hash.gkeys     = d.gkeys;
+    ix.u.hash.offs      = d.offs;
+    ix.u.hash.rows      = d.rows;
+    ix.u.hash.mask      = mask;
+    ix.u.hash.n_keys    = n_keys;
+    ix.u.hash.n_groups  = n_groups;
+    ix.u.hash.order_sym = -1;
+    idx_inline_head(d.base, &ix);
+    return RAY_OK;
+}
 
 /* --------------------------------------------------------------------------
  * Hash-index point-lookup probe — public entry point for the eq-filter
@@ -2279,11 +2842,11 @@ static ray_index_t* hash_probe_setup(ray_t* col, int64_t key,
     int64_t kw = (col->type == RAY_SYM)
         ? key
         : (int64_t)hash_key_bits(numeric_elem_size(col->type), key);
-    uint64_t slot = mix64((uint64_t)kw) & ix->u.hash.mask;
-    const int64_t* tbl = (const int64_t*)ray_data(ix->u.hash.table);
+    uint64_t slot = hx_home(ix, mix64((uint64_t)kw));
+    const ray_t* tab = ix->u.hash.table;
     const int64_t* gk  = (const int64_t*)ray_data(ix->u.hash.gkeys);
     for (;;) {
-        int64_t gp1 = tbl[slot];
+        int64_t gp1 = hx_get(tab, slot);
         if (gp1 == 0) break;                 /* key absent */
         if (gk[gp1 - 1] == kw) { *gid = gp1 - 1; break; }
         slot = (slot + 1) & ix->u.hash.mask;
@@ -2307,16 +2870,16 @@ static ray_index_t* hash_probe_setup_str(ray_t* col, const char* p, size_t l,
         !ix->u.hash.offs  || !ix->u.hash.rows) return NULL;
 
     int64_t kw = (int64_t)str_key_word(p, l);
-    uint64_t slot = mix64((uint64_t)kw) & ix->u.hash.mask;
-    const int64_t* tbl = (const int64_t*)ray_data(ix->u.hash.table);
+    uint64_t slot = hx_home(ix, mix64((uint64_t)kw));
+    const ray_t* tab = ix->u.hash.table;
     const int64_t* gk  = (const int64_t*)ray_data(ix->u.hash.gkeys);
-    const int64_t* of  = (const int64_t*)ray_data(ix->u.hash.offs);
-    const int64_t* rw  = (const int64_t*)ray_data(ix->u.hash.rows);
+    const ray_t* ofv = ix->u.hash.offs;
+    const ray_t* rwv = ix->u.hash.rows;
     for (;;) {
-        int64_t gp1 = tbl[slot];
+        int64_t gp1 = hx_get(tab, slot);
         if (gp1 == 0) break;                 /* key absent */
         if (gk[gp1 - 1] == kw &&
-            str_row_eq_bytes(col, rw[of[gp1 - 1]], p, l)) { *gid = gp1 - 1; break; }
+            str_row_eq_bytes(col, hx_get(rwv, hx_get(ofv, gp1 - 1)), p, l)) { *gid = gp1 - 1; break; }
         slot = (slot + 1) & ix->u.hash.mask;
     }
     return ix;
@@ -2472,7 +3035,8 @@ static int hash_match_cmp_i64(const void* a, const void* b) {
  * over a column of n rows.  Returns fresh rowsel (rc=1) or NULL on OOM.
  * mcnt==0 yields a valid all-NONE rowsel, NOT NULL — NULL means "no fast
  * path" to every consumer (idxop.h contract). */
-static ray_t* rowsel_from_sorted_ids(int64_t n, const int64_t* ids, int64_t mcnt) {
+static inline __attribute__((always_inline))
+ray_t* rowsel_sorted_body(int64_t n, ray_idx_rows_t ids, int64_t mcnt) {
     ray_t* block = ray_rowsel_new(n, mcnt, mcnt);
     if (!block) return NULL;
 
@@ -2511,7 +3075,7 @@ static ray_t* rowsel_from_sorted_ids(int64_t n, const int64_t* ids, int64_t mcnt
         int64_t seg_end   = seg_start + RAY_MORSEL_ELEMS;
         if (seg_end > n) seg_end = n;
         int64_t mi0 = mi;
-        while (mi < mcnt && ids[mi] < seg_end) mi++;
+        while (mi < mcnt && ray_idx_rows_at(ids, mi) < seg_end) mi++;
         int64_t pc = mi - mi0;
         if (pc == 0) continue;                 /* NONE — preset by memset */
         if (pc == seg_end - seg_start) {
@@ -2520,7 +3084,7 @@ static ray_t* rowsel_from_sorted_ids(int64_t n, const int64_t* ids, int64_t mcnt
             seg_flags[s] = RAY_SEL_MIX;
             for (int64_t i = mi0; i < mi; i++)
                 idx_arr[cum + (uint32_t)(i - mi0)] =
-                    (uint16_t)(ids[i] - seg_start);
+                    (uint16_t)(ray_idx_rows_at(ids, i) - seg_start);
             cum += (uint32_t)pc;
         }
     }
@@ -2531,6 +3095,13 @@ static ray_t* rowsel_from_sorted_ids(int64_t n, const int64_t* ids, int64_t mcnt
      * harmless; ray_rowsel_new only uses idx_count for allocation sizing. */
 
     return block;
+}
+static ray_t* rowsel_from_sorted_ids(int64_t n, const int64_t* ids, int64_t mcnt) {
+    return rowsel_sorted_body(n, (ray_idx_rows_t){ ids, false }, mcnt);
+}
+static ray_t* rowsel_from_sorted_rows(int64_t n, ray_idx_rows_t ids, int64_t mcnt) {
+    return ids.narrow ? rowsel_sorted_body(n, (ray_idx_rows_t){ ids.p, true }, mcnt)
+                      : rowsel_sorted_body(n, (ray_idx_rows_t){ ids.p, false }, mcnt);
 }
 
 /* Public wrapper: build an all-NONE rowsel for n rows.  Returns NULL on OOM. */
@@ -2555,13 +3126,12 @@ ray_t* ray_index_hash_eq_rowsel(ray_t* col, int64_t key) {
      * it to the rowsel builder directly.  Group size is known up front;
      * a dense key (where the SIMD scan would win) returns NULL with zero
      * wasted work instead of the chain-walk budget the old layout needed. */
-    const int64_t* of = (const int64_t*)ray_data(ix->u.hash.offs);
-    const int64_t* rw = (const int64_t*)ray_data(ix->u.hash.rows);
-    int64_t gsz = of[gid + 1] - of[gid];
+    const ray_t* ofv = ix->u.hash.offs;
+    int64_t gsz = hx_get(ofv, gid + 1) - hx_get(ofv, gid);
     if (gsz > 64 && gsz > (n >> 3))
         return NULL;   /* dense: fall through to the scan path */
 
-    return rowsel_from_sorted_ids(n, rw + of[gid], gsz);
+    return rowsel_from_sorted_rows(n, hx_rows(ix->u.hash.rows, hx_get(ofv, gid)), gsz);
 }
 
 /* --------------------------------------------------------------------------
@@ -2870,8 +3440,8 @@ ray_t* ray_index_in_rowsel(ray_t* col, ray_t* set_vec) {
     if (!gids) { ray_release(set_hdr); return NULL; }
 
     int64_t total = 0;
-    const int64_t* of = NULL;
-    const int64_t* rw = NULL;
+    const ray_t* ofv = NULL;
+    const ray_t* rwv = NULL;
     {
         ray_index_t* ix = ray_index_payload(col->index);
         if (!ix->u.hash.table || !ix->u.hash.gkeys ||
@@ -2880,8 +3450,8 @@ ray_t* ray_index_in_rowsel(ray_t* col, ray_t* set_vec) {
             ray_release(set_hdr);
             return NULL;
         }
-        of = (const int64_t*)ray_data(ix->u.hash.offs);
-        rw = (const int64_t*)ray_data(ix->u.hash.rows);
+        ofv = ix->u.hash.offs;
+        rwv = ix->u.hash.rows;
         int es = numeric_elem_size(col->type);
         int64_t ngid = 0;
         for (int64_t si = 0; si < set_len; si++) {
@@ -2889,18 +3459,18 @@ ray_t* ray_index_in_rowsel(ray_t* col, ray_t* set_vec) {
             int64_t kw = col_is_sym ? key
                                     : (int64_t)hash_key_bits(es, key);
             int64_t gid = -1;
-            uint64_t slot = mix64((uint64_t)kw) & ix->u.hash.mask;
-            const int64_t* tbl = (const int64_t*)ray_data(ix->u.hash.table);
+            uint64_t slot = hx_home(ix, mix64((uint64_t)kw));
+            const ray_t* tab = ix->u.hash.table;
             const int64_t* gk  = (const int64_t*)ray_data(ix->u.hash.gkeys);
             for (;;) {
-                int64_t gp1 = tbl[slot];
+                int64_t gp1 = hx_get(tab, slot);
                 if (gp1 == 0) break;
                 if (gk[gp1 - 1] == kw) { gid = gp1 - 1; break; }
                 slot = (slot + 1) & ix->u.hash.mask;
             }
             if (gid >= 0) {
                 gids[ngid++] = gid;
-                total += of[gid + 1] - of[gid];
+                total += hx_get(ofv, gid + 1) - hx_get(ofv, gid);
             }
         }
         set_len = ngid;
@@ -2927,8 +3497,8 @@ ray_t* ray_index_in_rowsel(ray_t* col, ray_t* set_vec) {
     int64_t mcnt = 0;
     for (int64_t si = 0; si < set_len; si++) {
         int64_t gid = gids[si];
-        int64_t gsz = of[gid + 1] - of[gid];
-        memcpy(matches + mcnt, rw + of[gid], (size_t)gsz * sizeof(int64_t));
+        int64_t gsz = hx_get(ofv, gid + 1) - hx_get(ofv, gid);
+        hx_copy_rows(matches + mcnt, rwv, hx_get(ofv, gid), gsz);
         mcnt += gsz;
     }
     scratch_free(gid_hdr);
@@ -3963,8 +4533,9 @@ static void index_set_order_sym(ray_t* v, int64_t order_sym) {
 }
 
 static ray_t* attach_backing_index_carry_markers(ray_t* v, ray_t* (*fn)(ray_t**)) {
+    /* The rebuilt table keeps its own home rule. */
     uint8_t carry = (v && !RAY_IS_ERR(v) && ray_index_has(v))
-                    ? ray_index_payload(v->index)->markers : 0;
+                    ? (uint8_t)(ray_index_payload(v->index)->markers & ~RAY_MARK_HASH_HIGH) : 0;
     int64_t order_sym = index_order_sym(v);
     ray_t* w = attach_via(v, fn);
     if (w && !RAY_IS_ERR(w) && carry && (w->attrs & RAY_ATTR_HAS_INDEX))
@@ -4079,9 +4650,7 @@ int64_t ray_index_find_row(ray_t* col, int64_t key) {
 
     /* CSR: rows are ascending within the group — first slice entry IS the
      * minimum matching row id.  O(1). */
-    const int64_t* of = (const int64_t*)ray_data(ix->u.hash.offs);
-    const int64_t* rw = (const int64_t*)ray_data(ix->u.hash.rows);
-    return rw[of[gid]];
+    return hx_get(ix->u.hash.rows, hx_get(ix->u.hash.offs, gid));
 }
 
 /* Public wrapper over the internal sorted-ids rowsel builder — consult
@@ -4130,7 +4699,7 @@ int64_t ray_index_sym_slices(ray_t* col, ray_t* keys,
     int64_t k = 0;
     if (kind == RAY_IDX_HASH) {
         for (int64_t i = 0; i < nd; i++) {
-            const int64_t* rows = NULL;
+            ray_idx_rows_t rows = { NULL, false };
             int64_t n = 0;
             int hit = ray_index_hash_group(col, doms[i], &rows, &n);
             if (hit < 0) { ray_free(dhdr); ray_free(shdr); return -1; }
@@ -4156,7 +4725,7 @@ int64_t ray_index_sym_slices(ray_t* col, ray_t* keys,
                 int64_t pdom = ray_read_sym(pk, p, RAY_SYM, pkeys->attrs);
                 if (pdom != doms[i]) continue;
                 if (pl[p] > 0) {
-                    sl[k].dom = doms[i]; sl[k].rows = NULL;
+                    sl[k].dom = doms[i]; sl[k].rows = (ray_idx_rows_t){ NULL, false };
                     sl[k].first = ps[p]; sl[k].n = pl[p]; k++;
                 }
                 break;
@@ -4174,9 +4743,13 @@ ray_t* ray_index_rowsel_from_ids(int64_t nrows, const int64_t* ids,
     return rowsel_from_sorted_ids(nrows, ids, n);
 }
 
+ray_t* ray_index_rowsel_from_rows(int64_t nrows, ray_idx_rows_t ids, int64_t n) {
+    return rowsel_from_sorted_rows(nrows, ids, n);
+}
+
 int ray_index_hash_group(ray_t* col, int64_t key,
-                         const int64_t** rows_out, int64_t* n_out) {
-    *rows_out = NULL;
+                         ray_idx_rows_t* rows_out, int64_t* n_out) {
+    *rows_out = (ray_idx_rows_t){ NULL, false };
     *n_out = 0;
     if (!idx_fresh(col, RAY_IDX_HASH)) return -1;
     /* A STR hash is byte-keyed: an int64 key is not a probe of it, and
@@ -4190,10 +4763,9 @@ int ray_index_hash_group(ray_t* col, int64_t key,
         return hash_key_in_range(col->type, key) ? -1 : 0;
     }
     if (gid < 0) return 0;
-    const int64_t* of = (const int64_t*)ray_data(ix->u.hash.offs);
-    const int64_t* rw = (const int64_t*)ray_data(ix->u.hash.rows);
-    *rows_out = rw + of[gid];
-    *n_out = of[gid + 1] - of[gid];
+    const ray_t* ofv = ix->u.hash.offs;
+    *rows_out = hx_rows(ix->u.hash.rows, hx_get(ofv, gid));
+    *n_out = hx_get(ofv, gid + 1) - hx_get(ofv, gid);
     return 1;
 }
 
@@ -4249,9 +4821,7 @@ int64_t ray_index_find_atom(ray_t* col, ray_t* a) {
         ray_index_t* ix = hash_probe_setup_str(col, ray_str_ptr(a), ray_str_len(a), &gid);
         if (!ix) return -2;
         if (gid < 0) return -1;
-        const int64_t* of = (const int64_t*)ray_data(ix->u.hash.offs);
-        const int64_t* rw = (const int64_t*)ray_data(ix->u.hash.rows);
-        return rw[of[gid]];
+        return hx_get(ix->u.hash.rows, hx_get(ix->u.hash.offs, gid));
     }
     default: {
         int64_t k = 0;
@@ -4297,9 +4867,7 @@ int ray_index_find_vec(ray_t* col, ray_t* nd, int64_t* out, bool* any_miss) {
             ray_index_t* ix = hash_probe_setup_str(col, p, l, &gid);
             if (!ix) return 0;
             if (gid < 0) { out[i] = NULL_I64; miss = true; continue; }
-            const int64_t* of = (const int64_t*)ray_data(ix->u.hash.offs);
-            const int64_t* rw = (const int64_t*)ray_data(ix->u.hash.rows);
-            out[i] = rw[of[gid]];
+            out[i] = hx_get(ix->u.hash.rows, hx_get(ix->u.hash.offs, gid));
         }
     } else {
         /* Integer-family column and needles only: float equality (NaN, -0)
@@ -4340,12 +4908,15 @@ void ray_index_carry_append(ray_t* src, ray_t* dst) {
     if (add > INT64_MAX - og || add > INT64_MAX - ok) return;   /* no signed overflow below */
     bool is_str = (t == RAY_STR);
 
+    /* Built in the width they end in: narrow while every value (at most
+     * n1) fits 32 bits, as hx_narrow would leave them. */
+    int8_t aw = n1 <= (int64_t)UINT32_MAX ? RAY_I32 : RAY_I64;
     ray_t* gkeys = ray_vec_new(RAY_I64, og + add > 0 ? og + add : 1);
-    ray_t* offs  = ray_vec_new(RAY_I64, og + add + 1);
-    ray_t* rows  = ray_vec_new(RAY_I64, ok + add > 0 ? ok + add : 1);
+    ray_t* offs  = ray_vec_new(aw, og + add + 1);
+    ray_t* rows  = ray_vec_new(aw, ok + add > 0 ? ok + add : 1);
     uint64_t cap = next_pow2((uint64_t)(og + add < 4 ? 8 : 2 * (og + add)));
     if (cap < 8) cap = 8;
-    ray_t* table = ray_vec_new(RAY_I64, (int64_t)cap);
+    ray_t* table = ray_vec_new(aw, (int64_t)cap);
     if (!gkeys || RAY_IS_ERR(gkeys) || !offs || RAY_IS_ERR(offs) ||
         !rows || RAY_IS_ERR(rows) || !table || RAY_IS_ERR(table)) {
         if (gkeys && !RAY_IS_ERR(gkeys)) ray_release(gkeys);
@@ -4355,22 +4926,20 @@ void ray_index_carry_append(ray_t* src, ray_t* dst) {
         return;
     }
     int64_t* gk  = (int64_t*)ray_data(gkeys);
-    int64_t* of  = (int64_t*)ray_data(offs);
-    int64_t* rw  = (int64_t*)ray_data(rows);
-    int64_t* tbl = (int64_t*)ray_data(table);
     uint64_t mask = cap - 1;
     memcpy(gk, ray_data(sx->u.hash.gkeys), (size_t)og * sizeof(int64_t));
-    memcpy(of, ray_data(sx->u.hash.offs),  (size_t)(og + 1) * sizeof(int64_t));
-    memcpy(rw, ray_data(sx->u.hash.rows),  (size_t)ok * sizeof(int64_t));
+    hx_copy_into(offs, sx->u.hash.offs, og + 1);
+    hx_copy_into(rows, sx->u.hash.rows, ok);
     if (cap == sx->u.hash.mask + 1) {
         /* Same capacity: the old slots are valid as they are. */
-        memcpy(tbl, ray_data(sx->u.hash.table), (size_t)cap * sizeof(int64_t));
+        hx_copy_into(table, sx->u.hash.table, (int64_t)cap);
     } else {
-        memset(tbl, 0, (size_t)cap * sizeof(int64_t));
+        /* Re-placed under src's home rule: its markers carry over. */
+        memset(ray_data(table), 0, (size_t)cap * (size_t)ray_elem_size(aw));
         for (int64_t g = 0; g < og; g++) {
-            uint64_t slot = mix64((uint64_t)gk[g]) & mask;
-            while (tbl[slot] != 0) slot = (slot + 1) & mask;
-            tbl[slot] = g + 1;
+            uint64_t slot = hx_home_m(sx->markers, mask, mix64((uint64_t)gk[g]));
+            while (hx_get(table, (int64_t)slot) != 0) slot = (slot + 1) & mask;
+            hx_set(table, (int64_t)slot, g + 1);
         }
     }
 
@@ -4379,22 +4948,22 @@ void ray_index_carry_append(ray_t* src, ray_t* dst) {
     int64_t ng = og, nk = ok;
     for (int64_t r = n0; r < n1; r++) {
         int64_t kw = (int64_t)hash_row_key_word(dst, base, r);
-        uint64_t slot = mix64((uint64_t)kw) & mask;
+        uint64_t slot = hx_home_m(sx->markers, mask, mix64((uint64_t)kw));
         for (;;) {
-            int64_t gp1 = tbl[slot];
+            int64_t gp1 = hx_get(table, (int64_t)slot);
             if (gp1 == 0) break;
             if (gk[gp1 - 1] == kw &&
-                (!is_str || str_rows_eq(dst, rw[of[gp1 - 1]], r))) {
+                (!is_str || str_rows_eq(dst, hx_get(rows, hx_get(offs, gp1 - 1)), r))) {
                 ray_release(gkeys); ray_release(offs);
                 ray_release(rows);  ray_release(table);
                 return;                       /* repeated key: not carried */
             }
             slot = (slot + 1) & mask;
         }
-        tbl[slot] = ng + 1;
+        hx_set(table, (int64_t)slot, ng + 1);
         gk[ng] = kw;
-        rw[nk] = r;
-        of[ng + 1] = nk + 1;
+        hx_set(rows, nk, r);
+        hx_set(offs, ng + 1, nk + 1);
         ng++; nk++;
     }
     gkeys->len = ng; offs->len = ng + 1; rows->len = nk; table->len = (int64_t)cap;
@@ -4753,7 +5322,7 @@ static ray_t* lazy_hash_keyed(ray_t* key, ray_t** out) {
     int fail = atomic_exchange(&g_lazy_fail, 0);
     ray_t* h = fail == 2 ? ray_error("cancel", "interrupted")
              : fail == 1 ? ray_error("oom", "lazy hash")
-             : attach_via(plain, attach_hash_mem);      /* copy-on-write: plain is never modified */
+             : attach_via(plain, ray_index_attach_hash);      /* copy-on-write: plain is never modified */
     if (!h) { lazy_decline(key); return ray_error("oom", "lazy hash"); }
     if (RAY_IS_ERR(h)) {
         /* an interrupted build is the query's cancellation, not the column's */

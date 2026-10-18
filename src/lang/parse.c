@@ -179,14 +179,17 @@ static const char* try_parse_time(const char* start, int32_t *ms_out) {
     if (!(c[0] >= '0' && c[0] <= '9' && c[1] >= '0' && c[1] <= '9')) return NULL;
     int ss = (c[0] - '0') * 10 + (c[1] - '0'); c += 2;
 
-    /* .mmm (milliseconds) */
+    /* .fff: a decimal fraction of a second, as in a timestamp literal and
+     * the CSV reader.  Fewer than three digits are padded (.5 is 500 ms);
+     * digits past the third are dropped. */
     int ms = 0;
     if (*c == '.') {
         c++;
         if (!(*c >= '0' && *c <= '9')) return NULL;
-        ms = (*c - '0'); c++;
-        if (*c >= '0' && *c <= '9') { ms = ms * 10 + (*c - '0'); c++; }
-        if (*c >= '0' && *c <= '9') { ms = ms * 10 + (*c - '0'); c++; }
+        int nd = 0;
+        for (; *c >= '0' && *c <= '9'; c++)
+            if (nd < 3) { ms = ms * 10 + (*c - '0'); nd++; }
+        for (; nd < 3; nd++) ms *= 10;
     }
 
     *ms_out = sign * (int32_t)((hh * 3600 + mm * 60 + ss) * 1000 + ms);
@@ -810,6 +813,52 @@ static ray_t* parse_dict(ray_parser_t *p) {
 }
 
 /* ── List (s-expression): (fn arg1 arg2 ...) ── */
+/* ── times binding: the [name count] after a `times` head ──
+ *
+ * Not a vector literal: the count is an expression, so `[i (count qty)]`
+ * or `[i 5]` would mix element types, and a bare name in it would read
+ * as a symbol literal rather than a reference.  It parses instead into
+ * the list (RAY_TIMES_BIND name count), whose head is a symbol no source
+ * token can spell (it contains a space), so it is told apart from a
+ * count expression however it was reached (see ray_times_binding). */
+static ray_t* parse_times_binding(ray_parser_t *p) {
+    int32_t sl = p->line, sc = p->col;
+    advance(p, 1); /* skip [ */
+    ray_t* list = ray_list_new(3);
+    if (RAY_IS_ERR(list)) return list;
+    ray_t* marker = ray_sym(ray_sym_intern(RAY_TIMES_BIND, sizeof(RAY_TIMES_BIND) - 1));
+    if (RAY_IS_ERR(marker)) { ray_release(list); return marker; }
+    list = ray_list_append(list, marker);
+    ray_release(marker);
+    if (RAY_IS_ERR(list)) return list;
+
+    for (int i = 0; i < 2; i++) {
+        skip_ws_and_comments(p);
+        if (*p->pos == ']') {
+            ray_release(list);
+            return ray_error("parse", "times: binding must be [name count]");
+        }
+        ray_t* elem = parse_expr(p);
+        if (RAY_IS_ERR(elem)) { ray_release(list); return elem; }
+        if (i == 0 && (elem->type != -RAY_SYM || (elem->attrs & ATTR_QUOTED))) {
+            ray_release(elem);
+            ray_release(list);
+            return ray_error("parse", "times: binding must be [name count], with a name first");
+        }
+        list = ray_list_append(list, elem);
+        ray_release(elem);
+        if (RAY_IS_ERR(list)) return list;
+    }
+    skip_ws_and_comments(p);
+    if (*p->pos != ']') {
+        ray_release(list);
+        return ray_error("parse", "times: binding must be [name count]");
+    }
+    advance(p, 1); /* skip ] */
+    nfo_record(p, list, sl, sc);
+    return list;
+}
+
 static ray_t* parse_list(ray_parser_t *p) {
     advance(p, 1); /* skip ( */
     ray_t* list = ray_list_new(4);
@@ -817,7 +866,19 @@ static ray_t* parse_list(ray_parser_t *p) {
 
     skip_ws_and_comments(p);
     while (*p->pos && *p->pos != ')') {
-        ray_t* elem = parse_expr(p);
+        ray_t* elem;
+        /* (times [i n] body...): a bracket right after a `times` head is
+         * the index binding, not a vector literal. */
+        if (list->len == 1 && *p->pos == '[') {
+            ray_t* head = ((ray_t**)ray_data(list))[0];
+            if (head->type == -RAY_SYM && !(head->attrs & ATTR_QUOTED) &&
+                head->i64 == ray_sym_intern("times", 5))
+                elem = parse_times_binding(p);
+            else
+                elem = parse_expr(p);
+        } else {
+            elem = parse_expr(p);
+        }
         if (RAY_IS_ERR(elem)) { ray_release(list); return elem; }
         list = ray_list_append(list, elem);
         ray_release(elem);

@@ -40,8 +40,24 @@ typedef struct ray_arena_chunk {
 /* Arena header */
 struct ray_arena {
     ray_arena_chunk_t* chunks;     /* linked list of all chunks (head = current) */
-    size_t            chunk_size; /* default chunk capacity */
+    size_t            chunk_size; /* capacity of the next chunk */
 };
+
+/* Chunks double from the arena's initial size up to ARENA_CHUNK_MAX, so a
+ * large arena (the string atoms of a domain with millions of entries) is a
+ * few big chunks.  Chunks come from ray_sys_alloc, which spills blocks of
+ * 1 MiB or more to a file past the anonymous watermark; a stream of small
+ * chunks would stay in RAM however far past it the arena grew (#712). */
+#define ARENA_CHUNK_MAX ((size_t)16 << 20)
+
+/* Capacity of the next chunk for a request of `need` bytes. */
+static size_t arena_next_cap(ray_arena_t* arena, size_t need) {
+    size_t cap = arena->chunk_size;
+    if (arena->chunk_size < ARENA_CHUNK_MAX)
+        arena->chunk_size = arena->chunk_size * 2 < ARENA_CHUNK_MAX
+                          ? arena->chunk_size * 2 : ARENA_CHUNK_MAX;
+    return need > cap ? ARENA_ALIGN_UP(need) : cap;
+}
 
 /* Chunk data starts at aligned offset after the header */
 static inline char* chunk_data(ray_arena_chunk_t* c) {
@@ -87,10 +103,7 @@ ray_t* ray_arena_alloc(ray_arena_t* arena, size_t nbytes) {
     ray_arena_chunk_t* c = arena->chunks;
 
     if (c->used + block_size > c->cap) {
-        size_t new_cap = arena->chunk_size;
-        if (block_size > new_cap) new_cap = ARENA_ALIGN_UP(block_size);
-
-        ray_arena_chunk_t* nc = arena_new_chunk(new_cap);
+        ray_arena_chunk_t* nc = arena_new_chunk(arena_next_cap(arena, block_size));
         if (!nc) return NULL;
 
         nc->next = arena->chunks;
@@ -121,9 +134,7 @@ void* ray_arena_alloc_raw(ray_arena_t* arena, size_t nbytes) {
     size_t block_size = ARENA_ALIGN_UP(nbytes);
     ray_arena_chunk_t* c = arena->chunks;
     if (c->used + block_size > c->cap) {
-        size_t new_cap = arena->chunk_size;
-        if (block_size > new_cap) new_cap = ARENA_ALIGN_UP(block_size);
-        ray_arena_chunk_t* nc = arena_new_chunk(new_cap);
+        ray_arena_chunk_t* nc = arena_new_chunk(arena_next_cap(arena, block_size));
         if (!nc) return NULL;
         nc->next = arena->chunks;
         arena->chunks = nc;
@@ -182,9 +193,7 @@ bool ray_arena_reserve(ray_arena_t* arena, size_t bytes) {
     if (bytes == 0) return true;
     ray_arena_chunk_t* c = arena->chunks;
     if (c && (c->cap - c->used) >= bytes) return true;
-    size_t new_cap = arena->chunk_size;
-    if (bytes > new_cap) new_cap = ARENA_ALIGN_UP(bytes);
-    ray_arena_chunk_t* nc = arena_new_chunk(new_cap);
+    ray_arena_chunk_t* nc = arena_new_chunk(arena_next_cap(arena, bytes));
     if (!nc) return false;
     nc->next = arena->chunks;
     arena->chunks = nc;

@@ -1,3 +1,6 @@
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L  /* setenv / unsetenv: the import dictionary's trace flag */
+#endif
 /*
  *   Copyright (c) 2025-2026 Anton Kundenko <singaraiona@gmail.com>
  *   All rights reserved.
@@ -37,15 +40,21 @@
 #include "mem/heap.h"
 #include "table/sym.h"
 #include "table/domain.h"
+#include "table/symimp.h"   /* ray_symimp_stats_t: the import dictionary's counts */
 #include "store/col.h"
 #include "store/serde.h"
 #include "core/pool.h"   /* the batch intern probes on the pool */
+#include "core/platform.h"   /* ray_thread_create: lookups against a reservation */
+#include "core/profile.h"    /* ray_profile_now_ns: their bounded wait */
 #include "ops/hash.h"    /* ray_hash_bytes: batch intern takes prehashed entries */
 #include "mem/sys.h"
 #include "ops/ops.h"   /* RAY_PARTED_BASE (parted-flatten adoption test) */
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <sys/stat.h>   /* stat: the symfile size behind the mapping counters */
+#include <stdlib.h>   /* setenv */
+#include <stdatomic.h>
 
 #define TMP_DOM_SYM_PATH "/tmp/rayforce_test_domain_sym"
 #define TMP_DOM_COL_PATH "/tmp/rayforce_test_domain_col"
@@ -58,6 +67,8 @@ static void domain_setup(void) {
 }
 
 static void domain_teardown(void) {
+    ray_clear_interrupt();
+    ray_sym_domain_batch_cancel_for_test(0);   /* disarm a hook a test left armed */
     ray_sym_destroy();
     ray_heap_destroy();
 }
@@ -503,6 +514,79 @@ static test_result_t test_domain_intern_batch(void) {
     ray_sys_free(pos); ray_sys_free(pos2);
     unlink(ray_test_tmp(TMP_DOM_SYM_PATH));
     unlink(ray_test_tmp(TMP_DOM_SYM_PATH ".lk"));
+    PASS();
+}
+
+/* A cancelled pool dispatch can skip tasks while still returning normally.
+ * The batch intern must not classify misses or commit dedupe output from
+ * arrays those skipped tasks never filled. */
+static test_result_t test_domain_intern_batch_cancel(void) {
+    unlink(TMP_DOM_SYM_PATH);
+    unlink(TMP_DOM_SYM_PATH ".lk");
+    ray_sym_domain_t* dom = ray_sym_domain_open_or_create(TMP_DOM_SYM_PATH);
+    TEST_ASSERT_NOT_NULL(dom);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom, "seed", 4), 1);
+    int64_t before = ray_sym_domain_count(dom);
+
+    enum { N = 8192, SL = 24 };
+    char* storage = ray_sys_alloc((size_t)N * SL);
+    const char** strs = ray_sys_alloc((size_t)N * sizeof(*strs));
+    size_t* lens = ray_sys_alloc((size_t)N * sizeof(*lens));
+    uint32_t* hashes = ray_sys_alloc((size_t)N * sizeof(*hashes));
+    int64_t* out = ray_sys_alloc((size_t)N * sizeof(*out));
+    TEST_ASSERT_NOT_NULL(storage); TEST_ASSERT_NOT_NULL(strs);
+    TEST_ASSERT_NOT_NULL(lens); TEST_ASSERT_NOT_NULL(hashes); TEST_ASSERT_NOT_NULL(out);
+    for (int64_t i = 0; i < N; i++) {
+        snprintf(storage + (size_t)i * SL, SL, "cancel-%07lld", (long long)i);
+        strs[i] = storage + (size_t)i * SL;
+        lens[i] = strlen(strs[i]);
+        hashes[i] = (uint32_t)ray_hash_bytes(strs[i], lens[i]);
+    }
+
+    /* out is zero-filled: a skipped probe task then leaves "hits" at
+     * position 0 behind, which the pre-fix code took as a complete probe
+     * with no misses and returned true with those ids. */
+    const int phases[] = {RAY_SYM_DOMAIN_CANCEL_PROBE, RAY_SYM_DOMAIN_CANCEL_DEDUPE};
+    for (size_t p = 0; p < sizeof(phases) / sizeof(phases[0]); p++) {
+        memset(out, 0, (size_t)N * sizeof(*out));
+        ray_sym_domain_batch_cancel_for_test(phases[p]);
+        TEST_ASSERT_FALSE(ray_sym_domain_intern_batch(dom, N, strs, lens, hashes, out));
+        TEST_ASSERT_TRUE(ray_interrupted());
+        ray_clear_interrupt();
+        TEST_ASSERT_EQ_I(ray_sym_domain_count(dom), before);
+        for (int64_t i = 0; i < N; i += 257)
+            TEST_ASSERT_EQ_I(ray_sym_domain_find(dom, strs[i], lens[i]), -1);
+    }
+
+    /* A cancel that lands once the commit has begun is too late to stop
+     * it: the parallel insert skips tasks, the caller completes them, and
+     * the batch is published whole. */
+    ray_sym_domain_batch_cancel_for_test(RAY_SYM_DOMAIN_CANCEL_INSERT);
+    TEST_ASSERT_TRUE(ray_sym_domain_intern_batch(dom, N, strs, lens, hashes, out));
+    TEST_ASSERT_TRUE(ray_interrupted());
+    ray_clear_interrupt();
+    TEST_ASSERT_EQ_I(ray_sym_domain_count(dom), before + N);
+    for (int64_t i = 0; i < N; i++)
+        TEST_ASSERT_EQ_I(ray_sym_domain_find(dom, strs[i], lens[i]), out[i]);
+    for (int64_t i = 0; i < N; i += 257)
+        TEST_ASSERT_EQ_I(out[i], before + i);
+
+    /* And a second batch of new strings, uncancelled, lands after them. */
+    for (int64_t i = 0; i < N; i++) {
+        snprintf(storage + (size_t)i * SL, SL, "second-%07lld", (long long)i);
+        lens[i] = strlen(strs[i]);
+        hashes[i] = (uint32_t)ray_hash_bytes(strs[i], lens[i]);
+    }
+    TEST_ASSERT_TRUE(ray_sym_domain_intern_batch(dom, N, strs, lens, hashes, out));
+    TEST_ASSERT_EQ_I(ray_sym_domain_count(dom), before + 2 * N);
+    for (int64_t i = 0; i < N; i += 257)
+        TEST_ASSERT_EQ_I(ray_sym_domain_find(dom, strs[i], lens[i]), out[i]);
+
+    ray_sym_domain_release(dom);
+    ray_sys_free(storage); ray_sys_free(strs); ray_sys_free(lens);
+    ray_sys_free(hashes); ray_sys_free(out);
+    unlink(TMP_DOM_SYM_PATH);
+    unlink(TMP_DOM_SYM_PATH ".lk");
     PASS();
 }
 
@@ -1894,10 +1978,10 @@ static test_result_t test_domain_raw_pin(void) {
     TEST_ASSERT_EQ_I(raw.count, (int64_t)count_at_save);
     ray_sym_domain_raw_unpin(dom);
     ray_sym_domain_release(dom);
-    /* The file grows under another writer while a reader holds a snapshot:
-     * the reopen extends the domain (new mapping, new offsets), and the
-     * old snapshot must still read every old position from its retired
-     * mapping, while a fresh pin sees the grown prefix. */
+    /* The file grows under another writer: the reopen extends the domain
+     * (new mapping, new offsets, the old ones freed), and a pin taken after
+     * it covers the grown prefix and still reads every old position.  A pin
+     * taken before the reopen is not readable after it (domain.h). */
     unlink(ray_test_tmp(TMP_DOM_SYM_PATH));
     unlink(ray_test_tmp(TMP_DOM_SYM_PATH ".lk"));
     TEST_ASSERT_EQ_I(ray_sym_save(ray_test_tmp(TMP_DOM_SYM_PATH)), RAY_OK);
@@ -1914,16 +1998,16 @@ static test_result_t test_domain_raw_pin(void) {
     ray_sym_domain_t* d2 = ray_sym_domain_open(ray_test_tmp(TMP_DOM_SYM_PATH));   /* cache hit → extend */
     TEST_ASSERT_EQ_PTR(d2, d1);
     TEST_ASSERT(ray_sym_domain_count(d1) > before, "reopen extended the domain");
+    ray_sym_domain_raw_t fresh;
+    TEST_ASSERT(ray_sym_domain_raw_pin(d1, &fresh), "pin after growth");
+    TEST_ASSERT(fresh.count > before, "fresh snapshot covers the grown prefix");
     for (int64_t p = 0; p < before; p++) {
         size_t rl = 0;
-        const char* rp = ray_sym_domain_raw_str(&held, p, &rl);
+        const char* rp = ray_sym_domain_raw_str(&fresh, p, &rl);
         ray_t* g = ray_sym_str(p);
         TEST_ASSERT_EQ_U(rl, ray_str_len(g));
         TEST_ASSERT_MEM_EQ(rl, rp, ray_str_ptr(g));
     }
-    ray_sym_domain_raw_t fresh;
-    TEST_ASSERT(ray_sym_domain_raw_pin(d1, &fresh), "pin after growth");
-    TEST_ASSERT(fresh.count > before, "fresh snapshot covers the grown prefix");
     ray_sym_domain_raw_unpin(d1);
     ray_sym_domain_raw_unpin(d1);
     ray_sym_domain_release(d2);
@@ -1932,6 +2016,244 @@ static test_result_t test_domain_raw_pin(void) {
     unlink(ray_test_tmp(TMP_DOM_SYM_PATH ".lk"));
     PASS();
 }
+
+/* #717: a reader that reopens a symfile another process grew must keep
+ * memory proportional to the vocabulary, however many times it reopened.
+ * Each reopen is a cache hit that extends the domain; the arrays it
+ * replaces and the mapping it supersedes used to be retired until the
+ * domain died — and a replica never lets it die. */
+static test_result_t test_domain_extend_reopen_flat(void) {
+    unlink(TMP_DOM_SYM_PATH);
+    unlink(TMP_DOM_SYM_PATH ".lk");
+    enum { VOCAB = 20000, WARM = 2, CYCLES = 30, PER_CYCLE = 10 };
+    for (int i = 0; i < VOCAB; i++) {
+        char b[32]; int n = snprintf(b, sizeof b, "flat_base_%d", i);
+        (void)ray_sym_intern(b, (size_t)n);
+    }
+    TEST_ASSERT_EQ_I(ray_sym_save(TMP_DOM_SYM_PATH), RAY_OK);
+    int64_t map_before_open = 0;
+    ray_sys_get_mapped(&map_before_open, NULL);
+    ray_sym_domain_t* dom = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    TEST_ASSERT_NOT_NULL(dom);
+    int64_t base = ray_sym_domain_count(dom);
+
+    int64_t sys0 = 0, next = 0;
+    for (int c = 0; c < WARM + CYCLES; c++) {
+        if (c == WARM) ray_sys_get_stat(&sys0, NULL);
+        for (int j = 0; j < PER_CYCLE; j++, next++) {
+            char b[32]; int n = snprintf(b, sizeof b, "flat_new_%lld", (long long)next);
+            (void)ray_sym_intern(b, (size_t)n);
+        }
+        TEST_ASSERT_EQ_I(ray_sym_save(TMP_DOM_SYM_PATH), RAY_OK);   /* tmp + rename: a new inode */
+        ray_sym_domain_t* again = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+        TEST_ASSERT_EQ_PTR(again, dom);                              /* cache hit → extend */
+        TEST_ASSERT_EQ_I(ray_sym_domain_count(dom), base + next);
+        /* the grown tail resolves both ways: lazily materialised atom and
+         * reverse index (rebuilt over the grown vocabulary) */
+        char last[32]; int ln = snprintf(last, sizeof last, "flat_new_%lld", (long long)(next - 1));
+        ray_t* s = ray_sym_domain_str(dom, base + next - 1);
+        TEST_ASSERT_NOT_NULL(s);
+        TEST_ASSERT_EQ_U(ray_str_len(s), (size_t)ln);
+        TEST_ASSERT_MEM_EQ((size_t)ln, ray_str_ptr(s), last);
+        TEST_ASSERT_EQ_I(ray_sym_domain_find(dom, last, (size_t)ln), base + next - 1);
+        ray_sym_domain_release(again);
+    }
+    int64_t sys1 = 0, map1 = 0;
+    ray_sys_get_stat(&sys1, NULL);
+    ray_sys_get_mapped(&map1, NULL);
+    struct stat st;
+    TEST_ASSERT_EQ_I(stat(TMP_DOM_SYM_PATH, &st), 0);
+    int64_t one_image = ((int64_t)st.st_size + 4095) & ~(int64_t)4095;
+    /* a pin taken after the growth covers the whole grown prefix (a pin
+     * taken before a reopen is not readable after it: see domain.h) */
+    ray_sym_domain_raw_t fresh;
+    TEST_ASSERT(ray_sym_domain_raw_pin(dom, &fresh), "pin after growth");
+    TEST_ASSERT_EQ_I(fresh.count, base + next);
+    for (int64_t p = 0; p < base + next; p += 997) {
+        size_t rl = 0;
+        const char* rp = ray_sym_domain_raw_str(&fresh, p, &rl);
+        ray_t* g = ray_sym_str(p);
+        TEST_ASSERT_EQ_U(rl, ray_str_len(g));
+        TEST_ASSERT_MEM_EQ(rl, rp, ray_str_ptr(g));
+    }
+    ray_sym_domain_raw_unpin(dom);
+    ray_sym_domain_release(dom);
+    unlink(TMP_DOM_SYM_PATH);
+    unlink(TMP_DOM_SYM_PATH ".lk");
+    /* committed RAM: nothing per reopen (slack for the atoms materialised
+     * above and arena growth); file mappings: exactly one image of the
+     * current file, whatever the number of reopens.  Asserted once the
+     * domain is released, so a failure leaves none cached behind it. */
+    /* The leak was one generation per reopen: two pointer-sized arrays
+     * over the vocabulary, about 320 KB each cycle here, 9.6 MB over the
+     * run.  The bound leaves room for arena and hash-table growth. */
+    TEST_ASSERT_FMT(sys1 - sys0 <= 1024 * 1024,
+                    "sys-current grew by %lld bytes over %d reopens",
+                    (long long)(sys1 - sys0), CYCLES);
+    TEST_ASSERT_FMT(map1 - map_before_open == one_image,
+                    "sys-mapped holds %lld bytes for a %lld-byte symfile",
+                    (long long)(map1 - map_before_open), (long long)one_image);
+    PASS();
+}
+/* Write `words` as the symfile at `path` the way another process's writer
+ * does: a tmp file renamed over it (a new inode). */
+static bool write_symfile(const char* path, const char* const* words, int n) {
+    char tmp[256];
+    snprintf(tmp, sizeof tmp, "%s.ext", path);
+    FILE* f = fopen(tmp, "wb");
+    if (!f) return false;
+    uint32_t magic = 0x4C525453U;   /* "STRL" */
+    int64_t count = n;
+    bool ok = fwrite(&magic, 4, 1, f) == 1 && fwrite(&count, 8, 1, f) == 1;
+    for (int i = 0; ok && i < n; i++) {
+        uint32_t l = (uint32_t)strlen(words[i]);
+        ok = fwrite(&l, 4, 1, f) == 1 && (l == 0 || fwrite(words[i], 1, l, f) == l);
+    }
+    ok = fclose(f) == 0 && ok;
+    return ok && rename(tmp, path) == 0;
+}
+
+/* Every position resolves to words[pos], by position and by string, and
+ * a raw pin covers them all: the extend made them file positions. */
+static bool dom_holds(ray_sym_domain_t* dom, const char* const* words, int n) {
+    if (ray_sym_domain_count(dom) != n) return false;
+    ray_sym_domain_raw_t raw;
+    if (!ray_sym_domain_raw_pin(dom, &raw) || raw.count != n) return false;
+    for (int p = 0; p < n; p++) {
+        size_t l = strlen(words[p]), rl = 0;
+        ray_t* s = ray_sym_domain_str(dom, p);
+        const char* rp = ray_sym_domain_raw_str(&raw, p, &rl);
+        if (!s || ray_str_len(s) != l || memcmp(ray_str_ptr(s), words[p], l) != 0 ||
+            rl != l || memcmp(rp, words[p], l) != 0 ||
+            ray_sym_domain_find(dom, words[p], l) != p)
+            return false;
+    }
+    ray_sym_domain_raw_unpin(dom);
+    return true;
+}
+
+/* A reopen after this process flushed its own appends: the positions the
+ * flush wrote have atoms but no offset into the mapping (none at all when
+ * the domain was created empty), yet the prefix check must still compare
+ * them against the grown file — and the extend give them offsets. */
+static test_result_t test_domain_extend_after_flush(void) {
+    unlink(TMP_DOM_SYM_PATH);
+    unlink(TMP_DOM_SYM_PATH ".lk");
+
+    /* (i) created empty, interned, flushed: nothing is mapped */
+    ray_sym_domain_t* dom = ray_sym_domain_open_or_create(TMP_DOM_SYM_PATH);
+    TEST_ASSERT_NOT_NULL(dom);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom, "fa", 2), 1);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom, "fb", 2), 2);
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush(dom, false), RAY_OK);
+    const char* grown1[] = { "", "fa", "fb", "fc", "fd" };
+    TEST_ASSERT(write_symfile(TMP_DOM_SYM_PATH, grown1, 5), "external growth");
+    ray_sym_domain_t* again = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    TEST_ASSERT_EQ_PTR(again, dom);
+    TEST_ASSERT(dom_holds(dom, grown1, 5), "created-empty domain extended");
+    ray_sym_domain_release(again);
+    ray_sym_domain_release(dom);
+
+    /* (ii) opened from 3 records, 2 interned and flushed: offsets cover 3 */
+    const char* base[] = { "", "ga", "gb" };
+    TEST_ASSERT(write_symfile(TMP_DOM_SYM_PATH, base, 3), "base file");
+    dom = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    TEST_ASSERT_NOT_NULL(dom);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom, "gc", 2), 3);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom, "gd", 2), 4);
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush(dom, false), RAY_OK);
+    /* a file that disagrees with the flushed tail is refused, and leaves
+     * the domain as it was */
+    const char* wrong[] = { "", "ga", "gb", "gc", "gX", "ge" };
+    TEST_ASSERT(write_symfile(TMP_DOM_SYM_PATH, wrong, 6), "diverging file");
+    TEST_ASSERT_NULL(ray_sym_domain_open(TMP_DOM_SYM_PATH));
+    const char* grown2[] = { "", "ga", "gb", "gc", "gd", "ge", "gf" };
+    TEST_ASSERT(write_symfile(TMP_DOM_SYM_PATH, grown2, 7), "external growth");
+    again = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    TEST_ASSERT_EQ_PTR(again, dom);
+    TEST_ASSERT(dom_holds(dom, grown2, 7), "flushed tail extended");
+    ray_sym_domain_release(again);
+    ray_sym_domain_release(dom);
+
+    unlink(TMP_DOM_SYM_PATH);
+    unlink(TMP_DOM_SYM_PATH ".lk");
+    PASS();
+}
+
+/* A reopen that extends the domain while a batch intern probes outside
+ * the lock drops the reverse index the batch then commits against.  The
+ * batch interns exactly what the external writer appends, so however the
+ * two interleave — extend first (all hits), during the probe (the misses
+ * found again in the current index), after the commit (appended in batch
+ * order; the reopen then refuses the dirty domain) — every string lands
+ * at the position the file gives it. */
+enum { XB_BASE = 64, XB_N = 50000, XB_ROUNDS = 10, XB_W = 24 };
+typedef struct {
+    ray_sym_domain_t* dom;
+    const char* const* strs;
+    const size_t*   lens;
+    const uint32_t* hashes;
+    int64_t*        out;
+    _Atomic(bool)   started;
+    bool            ok;
+} xbatch_ctx_t;
+
+static void xbatch_run(void* arg) {
+    xbatch_ctx_t* c = (xbatch_ctx_t*)arg;
+    atomic_store(&c->started, true);
+    c->ok = ray_sym_domain_intern_batch(c->dom, XB_N, c->strs, c->lens, c->hashes, c->out);
+}
+
+static test_result_t test_domain_extend_under_batch(void) {
+    unlink(TMP_DOM_SYM_PATH);
+    unlink(TMP_DOM_SYM_PATH ".lk");
+    enum { ALL = XB_BASE + XB_N };
+    char* buf = (char*)ray_sys_alloc((size_t)ALL * XB_W);
+    const char** words = (const char**)ray_sys_alloc((size_t)ALL * sizeof(char*));
+    size_t* lens = (size_t*)ray_sys_alloc((size_t)XB_N * sizeof(size_t));
+    uint32_t* hashes = (uint32_t*)ray_sys_alloc((size_t)XB_N * sizeof(uint32_t));
+    int64_t* out = (int64_t*)ray_sys_alloc((size_t)XB_N * sizeof(int64_t));
+    TEST_ASSERT(buf && words && lens && hashes && out, "buffers");
+    for (int r = 0; r < XB_ROUNDS; r++) {
+        words[0] = "";
+        for (int i = 1; i < ALL; i++) {
+            snprintf(buf + (size_t)i * XB_W, XB_W, "xb%d_%d", r, i);
+            words[i] = buf + (size_t)i * XB_W;
+        }
+        for (int i = 0; i < XB_N; i++) {
+            lens[i] = strlen(words[XB_BASE + i]);
+            hashes[i] = (uint32_t)ray_hash_bytes(words[XB_BASE + i], lens[i]);
+        }
+        TEST_ASSERT(write_symfile(TMP_DOM_SYM_PATH, words, XB_BASE), "base file");
+        TEST_ASSERT(write_symfile(TMP_DOM_SYM_PATH ".grown", words, ALL), "grown file");
+        ray_sym_domain_t* dom = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+        TEST_ASSERT_NOT_NULL(dom);
+        TEST_ASSERT_EQ_I(ray_sym_domain_find(dom, words[1], strlen(words[1])), 1);   /* index built */
+
+        xbatch_ctx_t c = { dom, words + XB_BASE, lens, hashes, out, false, false };
+        ray_thread_t th;
+        TEST_ASSERT_EQ_I(ray_thread_create(&th, xbatch_run, &c), RAY_OK);
+        while (!atomic_load(&c.started)) {}
+        int moved = rename(TMP_DOM_SYM_PATH ".grown", TMP_DOM_SYM_PATH);
+        ray_sym_domain_t* again = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+        ray_thread_join(th);
+
+        TEST_ASSERT_EQ_I(moved, 0);
+        TEST_ASSERT(c.ok, "batch interned");
+        for (int i = 0; i < XB_N; i++) TEST_ASSERT_EQ_I(out[i], XB_BASE + i);
+        if (again) ray_sym_domain_release(again);   /* NULL: the batch committed first */
+        ray_sym_domain_release(dom);
+    }
+    ray_sys_free(buf);
+    ray_sys_free(words);
+    ray_sys_free(lens);
+    ray_sys_free(hashes);
+    ray_sys_free(out);
+    unlink(TMP_DOM_SYM_PATH);
+    unlink(TMP_DOM_SYM_PATH ".lk");
+    PASS();
+}
+
 /* Runtime-id LUT: NULL for the runtime singleton; for a FILE domain a
  * position-indexed array of runtime intern ids (round-trips strings),
  * built once (idempotent: same pointer).  Divergent fixture proves the
@@ -2191,8 +2513,521 @@ static test_result_t test_domain_private(void) {
     ray_release(v);
     PASS();
 }
+
+/* ray_sym_domain_flush_append: a symfile grown in three appends (the first
+ * creating it, the last with nothing new but syncing) holds exactly the
+ * bytes one ray_sym_domain_flush of the same vocabulary writes, reopens
+ * with every position, and a file changed behind the domain's back is
+ * refused as another writer. */
+static bool dom_file_bytes(const char* path, uint8_t** out, long* n) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return false;
+    fseek(f, 0, SEEK_END); *n = ftell(f); fseek(f, 0, SEEK_SET);
+    *out = (uint8_t*)ray_sys_alloc((size_t)*n + 1);
+    bool ok = *out && fread(*out, 1, (size_t)*n, f) == (size_t)*n;
+    fclose(f);
+    return ok;
+}
+static test_result_t test_domain_flush_append(void) {
+    const char* pa = TMP_DOM_SYM_PATH "_app";
+    const char* pb = TMP_DOM_SYM_PATH "_one";
+    char buf[64];
+    for (int k = 0; k < 2; k++) {
+        const char* p = k ? pb : pa;
+        unlink(p);
+        snprintf(buf, sizeof(buf), "%s.lk", p); unlink(buf);
+    }
+    ray_sym_domain_t* a = ray_sym_domain_open_or_create(pa);
+    ray_sym_domain_t* b = ray_sym_domain_open_or_create(pb);
+    TEST_ASSERT_NOT_NULL(a); TEST_ASSERT_NOT_NULL(b);
+    for (int round = 0; round < 3; round++) {
+        int n = round == 2 ? 0 : 500 + 300 * round;
+        for (int i = 0; i < n; i++) {
+            int l = snprintf(buf, sizeof(buf), "r%d-%d%s", round, i, i % 7 ? "" : "-a-longer-string");
+            TEST_ASSERT_TRUE(ray_sym_domain_intern(a, buf, (size_t)l) >= 0);
+            TEST_ASSERT_TRUE(ray_sym_domain_intern(b, buf, (size_t)l) >= 0);
+        }
+        TEST_ASSERT_EQ_I(ray_sym_domain_flush_append(a, round == 2), RAY_OK);
+    }
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush(b, true), RAY_OK);
+    uint8_t *fa = NULL, *fb = NULL; long na = 0, nb = 0;
+    TEST_ASSERT_TRUE(dom_file_bytes(pa, &fa, &na));
+    TEST_ASSERT_TRUE(dom_file_bytes(pb, &fb, &nb));
+    TEST_ASSERT_EQ_I(na, nb);
+    TEST_ASSERT_EQ_I(memcmp(fa, fb, (size_t)na), 0);
+    ray_sys_free(fa); ray_sys_free(fb);
+    int64_t count = ray_sym_domain_count(a);
+
+    /* another writer: the file is no longer the persisted prefix */
+    FILE* f = fopen(pa, "ab");
+    TEST_ASSERT_NOT_NULL(f);
+    fputc(0, f); fclose(f);
+    TEST_ASSERT_TRUE(ray_sym_domain_intern(a, "late", 4) >= 0);
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush_append(a, false), RAY_ERR_CORRUPT);
+    ray_sym_domain_release(a);
+    ray_sym_domain_release(b);
+
+    ray_sym_domain_t* re = ray_sym_domain_open(pb);
+    TEST_ASSERT_NOT_NULL(re);
+    TEST_ASSERT_EQ_I(ray_sym_domain_count(re), count);
+    TEST_ASSERT_EQ_I(ray_sym_domain_find(re, "r1-799", 6) >= 0, 1);
+    ray_sym_domain_release(re);
+    for (int k = 0; k < 2; k++) {
+        const char* p = k ? pb : pa;
+        unlink(p);
+        snprintf(buf, sizeof(buf), "%s.lk", p); unlink(buf);
+    }
+    PASS();
+}
+
+/* ray_sym_domain_create_import: on an 8-worker pool, 32 tasks intern the
+ * same 100K strings in the same order at once (every miss is raced), then
+ * each its own slice of 800K more, so shard tables and the mapped file both
+ * grow past their first size.  A string gets one position whoever adds it,
+ * "" is position 0, the count is the distinct strings plus one, and after
+ * the durable flush the file reopens as an ordinary domain with every
+ * string at its position. */
+#define IMP_SHARED 100000
+#define IMP_OWN    800000
+#define IMP_N      (IMP_SHARED + IMP_OWN)
+#define IMP_TASKS  32
+typedef struct { ray_sym_domain_t* dom; int64_t* pos; _Atomic(int) bad; } imp_ctx_t;
+static int imp_str(int64_t i, char* buf) { return snprintf(buf, 32, "import-%lld-%c", (long long)i, (char)('a' + i % 26)); }
+static void imp_range(imp_ctx_t* c, int64_t s, int64_t e) {
+    enum { B = 512 };
+    char bufs[B][32]; const char* strs[B]; size_t lens[B]; uint32_t hs[B]; int64_t out[B];
+    for (int64_t i = s; i < e; i += B) {
+        int64_t n = e - i < B ? e - i : B;
+        for (int64_t j = 0; j < n; j++) {
+            lens[j] = (size_t)imp_str(i + j, bufs[j]); strs[j] = bufs[j];
+            hs[j] = (uint32_t)ray_hash_bytes(strs[j], lens[j]);
+        }
+        if (!ray_sym_domain_intern_batch(c->dom, n, strs, lens, hs, out)) { atomic_store(&c->bad, 1); return; }
+        for (int64_t j = 0; j < n; j++) {
+            int64_t prev = 0;
+            if (!atomic_compare_exchange_strong((_Atomic(int64_t)*)&c->pos[i + j], &prev, out[j]) && prev != out[j])
+                atomic_store(&c->bad, 1);
+        }
+    }
+}
+static void imp_task(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid; (void)end;
+    imp_ctx_t* c = (imp_ctx_t*)raw;
+    imp_range(c, 0, IMP_SHARED);
+    int64_t per = IMP_OWN / IMP_TASKS;
+    imp_range(c, IMP_SHARED + start * per, IMP_SHARED + (start + 1) * per);
+}
+static test_result_t test_domain_import_dict(void) {
+    const char* p = TMP_DOM_SYM_PATH "_imp";
+    unlink(p);
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(8), RAY_OK);
+    ray_pool_t* pool = ray_pool_get();
+    ray_sym_domain_t* dom = ray_sym_domain_create_import(p);
+    if (!dom) { ray_pool_destroy(); SKIP("import dictionary unsupported here"); }
+    TEST_ASSERT_EQ_I(ray_sym_domain_count(dom), 1);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom, "", 0), 0);
+    imp_ctx_t ctx = { dom, (int64_t*)ray_sys_alloc((size_t)IMP_N * sizeof(int64_t)), 0 };
+    TEST_ASSERT_NOT_NULL(ctx.pos);
+    memset(ctx.pos, 0, (size_t)IMP_N * sizeof(int64_t));
+    if (pool && pool->n_workers > 0) ray_pool_dispatch_n(pool, imp_task, &ctx, IMP_TASKS);
+    else for (int t = 0; t < IMP_TASKS; t++) imp_task(&ctx, 0, t, t + 1);
+    TEST_ASSERT_EQ_I(atomic_load(&ctx.bad), 0);
+    TEST_ASSERT_EQ_I(ray_sym_domain_count(dom), IMP_N + 1);
+    /* one more append and its single-string intern agree */
+    int64_t z = ray_sym_domain_intern(dom, "late-one", 8);
+    TEST_ASSERT_EQ_I(z, IMP_N + 1);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom, "late-one", 8), z);
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush(dom, true), RAY_OK);
+    ray_sym_domain_release(dom);
+
+    ray_sym_domain_t* re = ray_sym_domain_open(p);
+    TEST_ASSERT_NOT_NULL(re);
+    TEST_ASSERT_EQ_I(ray_sym_domain_count(re), IMP_N + 2);
+    int64_t bad = 0;
+    char buf[32];
+    for (int64_t i = 0; i < IMP_N; i += 997) {
+        int l = imp_str(i, buf);
+        ray_t* s = ray_sym_domain_str(re, ctx.pos[i]);
+        if (!s || ray_str_len(s) != (size_t)l || memcmp(ray_str_ptr(s), buf, (size_t)l)) bad++;
+        if (ray_sym_domain_find(re, buf, (size_t)l) != ctx.pos[i]) bad++;
+    }
+    TEST_ASSERT_EQ_I(bad, 0);
+    TEST_ASSERT_EQ_I(ray_sym_domain_find(re, "", 0), 0);
+    TEST_ASSERT_EQ_I(ray_sym_domain_find(re, "late-one", 8), IMP_N + 1);
+    ray_sym_domain_release(re);
+    ray_sys_free(ctx.pos);
+    ray_pool_destroy();
+    unlink(p);
+    unlink(TMP_DOM_SYM_PATH "_imp.lk");
+    PASS();
+}
+/* The import dictionary frees a shard table it replaced once no lookup can
+ * hold it.  Serially, 300K strings leave every one of the 1024 shard tables
+ * at its first size, and 900K at twice that (a shard's share of 900K stays
+ * under the next growth); between the two, committed memory grows by the
+ * new tables less the old ones, not by the new tables whole.  A table is
+ * cap 8-byte slots plus a header, counted in 4 KiB units as ray_sys_get_stat
+ * counts every allocation whatever the page size. */
+static int64_t imp_tab_bytes(int64_t cap) {
+    return (cap * 8 + 64 + 4095) / 4096 * 4096;
+}
+static bool imp_intern_serial(ray_sym_domain_t* dom, int64_t lo, int64_t hi) {
+    imp_ctx_t c = { dom, NULL, 0 };
+    enum { B = 512 };
+    char bufs[B][32]; const char* strs[B]; size_t lens[B]; uint32_t hs[B]; int64_t out[B];
+    for (int64_t i = lo; i < hi; i += B) {
+        int64_t n = hi - i < B ? hi - i : B;
+        for (int64_t j = 0; j < n; j++) {
+            lens[j] = (size_t)imp_str(i + j, bufs[j]); strs[j] = bufs[j];
+            hs[j] = (uint32_t)ray_hash_bytes(strs[j], lens[j]);
+        }
+        if (!ray_sym_domain_intern_batch(c.dom, n, strs, lens, hs, out)) return false;
+    }
+    return true;
+}
+static test_result_t test_domain_import_dict_reclaim(void) {
+    const char* p = TMP_DOM_SYM_PATH "_impr";
+    unlink(p);
+    ray_sym_domain_t* dom = ray_sym_domain_create_import(p);
+    if (!dom) SKIP("import dictionary unsupported here");
+    TEST_ASSERT_TRUE(imp_intern_serial(dom, 0, 300000));
+    /* one more new string: the last batch's replaced tables are freed by
+     * the next batch that adds */
+    TEST_ASSERT_TRUE(ray_sym_domain_intern(dom, "flush-a", 7) > 0);
+    int64_t a = 0, b = 0;
+    ray_sys_get_stat(&a, NULL);
+    TEST_ASSERT_TRUE(imp_intern_serial(dom, 300000, 900000));
+    TEST_ASSERT_TRUE(ray_sym_domain_intern(dom, "flush-b", 7) > 0);
+    ray_sys_get_stat(&b, NULL);
+    int64_t grew = b - a, small = imp_tab_bytes(1024), big = imp_tab_bytes(2048);
+    TEST_ASSERT_TRUE(grew >= 1024 * (big - small) - (1 << 20));   /* every shard grew */
+    TEST_ASSERT_TRUE(grew < 1024 * (big - small / 2));            /* and gave its old table back */
+    TEST_ASSERT_EQ_I(ray_sym_domain_count(dom), 900003);
+    ray_sym_domain_release(dom);
+    unlink(p);
+    unlink(TMP_DOM_SYM_PATH "_impr.lk");
+    PASS();
+}
+/* The import dictionary takes the shard from the 64-bit hash's top bits and
+ * keeps its low 32 as the slot tag.  Crafted hashes (the dictionary trusts
+ * the caller's): 1024 strings whose hashes share the low 32 bits but not
+ * the top 10 land in 1024 shards, and are added and found again without a
+ * single tag matching another string; 64 strings sharing one whole hash all
+ * get positions of their own and are found by their bytes.  Every position
+ * survives a re-intern, and the 32-bit entry point, which hashes again,
+ * finds strings the 64-bit one added under their real hashes.  The counts
+ * are kept for a dictionary made under the converters' trace (RAY_CSV_TRACE
+ * at create, set here for it); one made without it keeps none, its
+ * positions the same. */
+static void imp_trace_env(bool on) {
+#if defined(_WIN32)
+    _putenv_s("RAY_CSV_TRACE", on ? "1" : "");
+#else
+    if (on) setenv("RAY_CSV_TRACE", "1", 1); else unsetenv("RAY_CSV_TRACE");
+#endif
+}
+#define IMP_SPREAD 1024
+#define IMP_SAME   64
+static test_result_t test_domain_import_dict_tags(void) {
+    const char* p = TMP_DOM_SYM_PATH "_impt";
+    unlink(p);
+    imp_trace_env(true);
+    ray_sym_domain_t* dom = ray_sym_domain_create_import(p);
+    imp_trace_env(false);
+    if (!dom) SKIP("import dictionary unsupported here");
+    enum { N = IMP_SPREAD + IMP_SAME };
+    static char bufs[N][32];
+    const char* strs[N]; size_t lens[N]; uint64_t hs[N]; int64_t pos[N], again[N];
+    for (int i = 0; i < N; i++) {
+        lens[i] = (size_t)snprintf(bufs[i], sizeof(bufs[i]), "tag-%d", i); strs[i] = bufs[i];
+        hs[i] = i < IMP_SPREAD ? ((uint64_t)i << 54) | UINT64_C(0x5a5a5a5a)
+                               : UINT64_C(0x0123456789abcdef);
+    }
+    ray_symimp_stats_t st;
+    ray_sym_domain_import_stats(dom, &st);   /* from zero */
+    TEST_ASSERT_TRUE(ray_sym_domain_intern_batch64(dom, IMP_SPREAD, strs, lens, hs, pos));
+    TEST_ASSERT_TRUE(ray_sym_domain_intern_batch64(dom, IMP_SPREAD, strs, lens, hs, again));
+    TEST_ASSERT_TRUE(ray_sym_domain_import_stats(dom, &st));
+    TEST_ASSERT_EQ_I(st.added, IMP_SPREAD);
+    TEST_ASSERT_EQ_I(st.hits, IMP_SPREAD);
+    TEST_ASSERT_EQ_I(st.false_tags, 0);
+    /* one at a time, so each is looked up in the shard the others fill */
+    for (int i = IMP_SPREAD; i < N; i++)
+        TEST_ASSERT_TRUE(ray_sym_domain_intern_batch64(dom, 1, strs + i, lens + i, hs + i, pos + i));
+    for (int i = IMP_SPREAD; i < N; i++)
+        TEST_ASSERT_TRUE(ray_sym_domain_intern_batch64(dom, 1, strs + i, lens + i, hs + i, again + i));
+    TEST_ASSERT_TRUE(ray_sym_domain_import_stats(dom, &st));
+    TEST_ASSERT_EQ_I(st.added, IMP_SAME);
+    TEST_ASSERT_TRUE(st.false_tags > 0);
+    for (int i = 0; i < N; i++) {
+        TEST_ASSERT_EQ_I(pos[i], i + 1);   /* "" is position 0 */
+        TEST_ASSERT_EQ_I(again[i], pos[i]);
+    }
+    TEST_ASSERT_EQ_I(ray_sym_domain_count(dom), N + 1);
+    /* real hashes: added through the 64-bit entry, found through the 32-bit */
+    const char* real = "a real hash";
+    size_t rl = strlen(real);
+    uint64_t rh = ray_hash_bytes(real, rl);
+    uint32_t rh32 = (uint32_t)rh;
+    int64_t r64 = -1, r32 = -2;
+    TEST_ASSERT_TRUE(ray_sym_domain_intern_batch64(dom, 1, &real, &rl, &rh, &r64));
+    TEST_ASSERT_TRUE(ray_sym_domain_intern_batch(dom, 1, &real, &rl, &rh32, &r32));
+    TEST_ASSERT_EQ_I(r64, N + 1);
+    TEST_ASSERT_EQ_I(r32, r64);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom, real, rl), r64);
+    ray_sym_domain_release(dom);
+    unlink(p);
+    unlink(TMP_DOM_SYM_PATH "_impt.lk");
+    /* made without the trace: the same positions, no counts */
+    dom = ray_sym_domain_create_import(p);
+    TEST_ASSERT_NOT_NULL(dom);
+    TEST_ASSERT_TRUE(ray_sym_domain_intern_batch64(dom, IMP_SPREAD, strs, lens, hs, again));
+    for (int i = IMP_SPREAD; i < N; i++)
+        TEST_ASSERT_TRUE(ray_sym_domain_intern_batch64(dom, 1, strs + i, lens + i, hs + i, again + i));
+    TEST_ASSERT_TRUE(ray_sym_domain_intern_batch64(dom, N, strs, lens, hs, again));
+    for (int i = 0; i < N; i++) TEST_ASSERT_EQ_I(again[i], pos[i]);
+    TEST_ASSERT_TRUE(ray_sym_domain_import_stats(dom, &st));
+    TEST_ASSERT_EQ_I(st.strings + st.probes + st.hits + st.added + st.slots + st.false_tags + st.grows, 0);
+    TEST_ASSERT_EQ_I(st.count, N + 1);
+    ray_sym_domain_release(dom);
+    unlink(p);
+    unlink(TMP_DOM_SYM_PATH "_impt.lk");
+    PASS();
+}
+/* The first reservation (ray_symimp_reserve: the grouped import's records)
+ * ends the dictionary's interning: from it on a lookup is refused and no
+ * string is added, and the shard tables go back at once unless a lookup is
+ * in flight (which keeps them to the end).  Serially: the tables go, the
+ * counts and the index bytes read none, the reserved positions follow the
+ * interned ones, and a lookup is refused.  Then rounds of lookup threads
+ * against a reservation the main thread makes once every thread has got a
+ * batch through: 64K strings already there, found batch after batch (eight
+ * chunks, between which a thread holds no table), on one thread and on
+ * four; and on two, the same with one new string a chunk (a lookup of the
+ * chunk then adds it under the lock).  Every batch gets every position
+ * right or is refused; none reads a table freed under it (a reservation
+ * that frees regardless of a lookup in flight, or a lookup that reads the
+ * reservation before it registers, faults here) and none adds a string past
+ * the reservation (as an add that does not check it under the lock does). */
+#define IMPR_N     65536
+#define IMPR_EVERY 8192   /* the new strings' spacing: one a chunk (SI_BATCH) */
+typedef struct {
+    ray_symimp_t* imp;
+    const char* const* strs; const size_t* lens; const uint64_t* hs; const int64_t* want;
+    int fresh;                  /* 0: the known strings; else this thread's tag for its new ones */
+    char (*buf)[32]; const char** fs; size_t* fl; uint64_t* fh;   /* fresh: the batch */
+    int64_t* out;
+    _Atomic(int64_t) found;     /* batches got through */
+    _Atomic(int) done, bad;
+} impr_ctx_t;
+static void impr_lookups(void* raw) {
+    impr_ctx_t* c = (impr_ctx_t*)raw;
+    const char* const* s = c->strs; const size_t* l = c->lens; const uint64_t* h = c->hs;
+    if (c->fresh) {
+        memcpy(c->fs, c->strs, (size_t)IMPR_N * sizeof(char*));
+        memcpy(c->fl, c->lens, (size_t)IMPR_N * sizeof(size_t));
+        memcpy(c->fh, c->hs, (size_t)IMPR_N * sizeof(uint64_t));
+        s = c->fs; l = c->fl; h = c->fh;
+    }
+    for (int64_t k = 0;; k++) {
+        for (int64_t i = 0; c->fresh && i < IMPR_N; i += IMPR_EVERY) {
+            char* b = c->buf[i / IMPR_EVERY];
+            c->fl[i] = (size_t)snprintf(b, 32, "fresh-%d-%lld", c->fresh, (long long)(k * IMPR_N + i));
+            c->fs[i] = b;
+            c->fh[i] = ray_hash_bytes(b, c->fl[i]);
+        }
+        if (!ray_symimp_intern_batch(c->imp, IMPR_N, s, l, h, c->out)) break;
+        for (int64_t i = 0; i < IMPR_N; i++) {
+            bool ok = c->out[i] == c->want[i];
+            if (c->fresh && i % IMPR_EVERY == 0) {
+                uint32_t len = 0;
+                const char* r = ray_symimp_get(c->imp, c->out[i], &len);
+                ok = len == l[i] && !memcmp(r, s[i], len);
+            }
+            if (!ok) { atomic_store(&c->bad, 1); break; }
+        }
+        atomic_fetch_add(&c->found, 1);
+    }
+    atomic_store(&c->done, 1);
+}
+static test_result_t test_domain_import_dict_reserve(void) {
+    const char* p = TMP_DOM_SYM_PATH "_imps";
+    char (*bufs)[32] = (char (*)[32])ray_sys_alloc((size_t)IMPR_N * 32);
+    const char** strs = (const char**)ray_sys_alloc((size_t)IMPR_N * sizeof(char*));
+    size_t* lens = (size_t*)ray_sys_alloc((size_t)IMPR_N * sizeof(size_t));
+    uint64_t* hs = (uint64_t*)ray_sys_alloc((size_t)IMPR_N * sizeof(uint64_t));
+    int64_t* want = (int64_t*)ray_sys_alloc((size_t)IMPR_N * sizeof(int64_t));
+    int64_t* outs = (int64_t*)ray_sys_alloc((size_t)4 * IMPR_N * sizeof(int64_t));
+    char (*fbuf)[32] = (char (*)[32])ray_sys_alloc((size_t)2 * (IMPR_N / IMPR_EVERY) * 32);
+    const char** fs = (const char**)ray_sys_alloc((size_t)2 * IMPR_N * sizeof(char*));
+    size_t* fl = (size_t*)ray_sys_alloc((size_t)2 * IMPR_N * sizeof(size_t));
+    uint64_t* fh = (uint64_t*)ray_sys_alloc((size_t)2 * IMPR_N * sizeof(uint64_t));
+    TEST_ASSERT_TRUE(bufs && strs && lens && hs && want && outs && fbuf && fs && fl && fh);
+    for (int64_t i = 0; i < IMPR_N; i++) {
+        lens[i] = (size_t)imp_str(i, bufs[i]); strs[i] = bufs[i];
+        hs[i] = ray_hash_bytes(strs[i], lens[i]);
+    }
+    /* round 0 serial; 1-8 one thread finding, 9-12 four, 13-16 two adding too */
+    int timeouts = 0, bad = 0;
+    for (int round = 0; round <= 16; round++) {
+        unlink(p);
+        ray_sym_domain_t* dom = ray_sym_domain_create_import(p);
+        if (!dom) {
+            ray_sys_free(bufs); ray_sys_free(strs); ray_sys_free(lens); ray_sys_free(hs); ray_sys_free(want);
+            ray_sys_free(outs); ray_sys_free(fbuf); ray_sys_free(fs); ray_sys_free(fl); ray_sys_free(fh);
+            SKIP("import dictionary unsupported here");
+        }
+        ray_symimp_t* imp = ray_sym_domain_import(dom);
+        TEST_ASSERT_NOT_NULL(imp);
+        TEST_ASSERT_TRUE(ray_symimp_intern_batch(imp, IMPR_N, strs, lens, hs, want));
+        int64_t count = ray_symimp_count(imp), p0 = -1, o0 = -1, again = -1;
+        TEST_ASSERT_EQ_I(count, IMPR_N + 1);   /* "" is position 0 */
+        if (round == 0) {
+            TEST_ASSERT_TRUE(ray_symimp_index_bytes(imp) > 0);
+            TEST_ASSERT_TRUE(ray_symimp_reserve(imp, 2, 16, &p0, &o0));
+            TEST_ASSERT_EQ_I(p0, count);
+            TEST_ASSERT_EQ_I(ray_symimp_count(imp), count + 2);
+            TEST_ASSERT_EQ_I(ray_symimp_index_bytes(imp), 0);
+            ray_symimp_stats_t st;
+            ray_symimp_stats(imp, &st);
+            TEST_ASSERT_EQ_I(st.tab_bytes, 0);
+            TEST_ASSERT_EQ_I(st.count, count + 2);
+            TEST_ASSERT_FALSE(ray_symimp_intern_batch(imp, 1, strs, lens, hs, &again));
+            ray_symimp_put(imp, p0, o0, "res0", 4); ray_symimp_put(imp, p0 + 1, o0 + 8, "res1", 4);
+            TEST_ASSERT_TRUE(ray_symimp_reserve(imp, 1, 8, &p0, &o0));   /* a later one: nothing more to free */
+            TEST_ASSERT_EQ_I(p0, count + 2);
+            ray_symimp_put(imp, p0, o0, "res2", 4);
+        } else {
+            int nt = round <= 8 ? 1 : round <= 12 ? 4 : 2, fresh = round > 12;
+            impr_ctx_t ctx[4];
+            ray_thread_t th[4];
+            int started = 0;
+            for (int t = 0; t < nt; t++) {
+                ctx[t] = (impr_ctx_t){ imp, strs, lens, hs, want, fresh ? t + 1 : 0,
+                                       fbuf + t * (IMPR_N / IMPR_EVERY), fs + (int64_t)t * IMPR_N, fl + (int64_t)t * IMPR_N, fh + (int64_t)t * IMPR_N,
+                                       outs + (int64_t)t * IMPR_N, 0, 0, 0 };
+                if (ray_thread_create(&th[t], impr_lookups, &ctx[t]) == RAY_OK) started++;
+                else break;
+            }
+            /* every thread through a batch (or out), within a bound */
+            int64_t until = ray_profile_now_ns() + (int64_t)30 * 1000000000;
+            for (int t = 0; t < started; t++)
+                while (!atomic_load(&ctx[t].found) && !atomic_load(&ctx[t].done)) {
+                    if (ray_profile_now_ns() > until) { timeouts++; break; }
+                    RAY_CPU_RELAX();
+                }
+            bool reserved = ray_symimp_reserve(imp, 1, 8, &p0, &o0);
+            for (int t = 0; t < started; t++) ray_thread_join(th[t]);
+            TEST_ASSERT_EQ_I(started, nt);
+            TEST_ASSERT_TRUE(reserved);
+            for (int t = 0; t < nt; t++) {
+                if (atomic_load(&ctx[t].bad) || !atomic_load(&ctx[t].found)) bad++;
+            }
+            /* nothing added past the reservation */
+            if (ray_symimp_count(imp) != p0 + 1) {
+                fprintf(stderr, "  reserve round %d: %lld strings, the reservation at %lld\n", round,
+                        (long long)ray_symimp_count(imp), (long long)p0);
+                bad++;
+            }
+            TEST_ASSERT_FALSE(ray_symimp_intern_batch(imp, 1, strs, lens, hs, &again));
+            ray_symimp_put(imp, p0, o0, "res0", 4);
+        }
+        ray_sym_domain_release(dom);
+        unlink(p);
+        unlink(TMP_DOM_SYM_PATH "_imps.lk");
+    }
+    ray_sys_free(bufs); ray_sys_free(strs); ray_sys_free(lens); ray_sys_free(hs); ray_sys_free(want);
+    ray_sys_free(outs); ray_sys_free(fbuf); ray_sys_free(fs); ray_sys_free(fl); ray_sys_free(fh);
+    TEST_ASSERT_EQ_I(timeouts, 0);
+    TEST_ASSERT_EQ_I(bad, 0);
+    PASS();
+}
+/* Skeptic probe (pqio round 4).  Rounds of the reservation against lookups
+ * in flight (two threads finding the 64K strings batch after batch), as in
+ * import_dict_reserve: how often the reservation kept the shard tables (a
+ * lookup was in flight, so ray_symimp_index_bytes still reads them right
+ * after it), and that a kept set goes back with the dictionary: the
+ * committed memory (ray_heap_anon_committed, which every ray_sys_alloc
+ * counts) the same after a round as before it.  The tables are 1024
+ * mappings of 12 KB each: a kept set never freed shows as 12 MB. */
+static test_result_t test_domain_sk4_reserve_kept_freed(void) {
+    const char* p = TMP_DOM_SYM_PATH "_imk";
+    char (*bufs)[32] = (char (*)[32])ray_sys_alloc((size_t)IMPR_N * 32);
+    const char** strs = (const char**)ray_sys_alloc((size_t)IMPR_N * sizeof(char*));
+    size_t* lens = (size_t*)ray_sys_alloc((size_t)IMPR_N * sizeof(size_t));
+    uint64_t* hs = (uint64_t*)ray_sys_alloc((size_t)IMPR_N * sizeof(uint64_t));
+    int64_t* want = (int64_t*)ray_sys_alloc((size_t)IMPR_N * sizeof(int64_t));
+    int64_t* outs = (int64_t*)ray_sys_alloc((size_t)2 * IMPR_N * sizeof(int64_t));
+    TEST_ASSERT_TRUE(bufs && strs && lens && hs && want && outs);
+    for (int64_t i = 0; i < IMPR_N; i++) {
+        lens[i] = (size_t)imp_str(i, bufs[i]); strs[i] = bufs[i];
+        hs[i] = ray_hash_bytes(strs[i], lens[i]);
+    }
+    int kept = 0, freed = 0, leaks = 0, timeouts = 0, bad = 0, measured = 0;
+    for (int round = 0; round < 17; round++) {
+        unlink(p);
+        int64_t c0 = ray_heap_anon_committed();
+        ray_sym_domain_t* dom = ray_sym_domain_create_import(p);
+        if (!dom) {
+            ray_sys_free(bufs); ray_sys_free(strs); ray_sys_free(lens); ray_sys_free(hs); ray_sys_free(want); ray_sys_free(outs);
+            SKIP("import dictionary unsupported here");
+        }
+        ray_symimp_t* imp = ray_sym_domain_import(dom);
+        TEST_ASSERT_NOT_NULL(imp);
+        TEST_ASSERT_TRUE(ray_symimp_intern_batch(imp, IMPR_N, strs, lens, hs, want));
+        impr_ctx_t ctx[2];
+        ray_thread_t th[2];
+        int started = 0;
+        for (int t = 0; t < 2; t++) {
+            ctx[t] = (impr_ctx_t){ imp, strs, lens, hs, want, 0, NULL, NULL, NULL, NULL, outs + (int64_t)t * IMPR_N, 0, 0, 0 };
+            if (ray_thread_create(&th[t], impr_lookups, &ctx[t]) == RAY_OK) started++;
+            else break;
+        }
+        int64_t until = ray_profile_now_ns() + (int64_t)30 * 1000000000;
+        for (int t = 0; t < started; t++)
+            while (!atomic_load(&ctx[t].found) && !atomic_load(&ctx[t].done)) {
+                if (ray_profile_now_ns() > until) { timeouts++; break; }
+                RAY_CPU_RELAX();
+            }
+        int64_t p0 = -1, o0 = -1;
+        bool reserved = ray_symimp_reserve(imp, 1, 8, &p0, &o0);
+        int64_t ib = ray_symimp_index_bytes(imp);
+        for (int t = 0; t < started; t++) ray_thread_join(th[t]);
+        TEST_ASSERT_EQ_I(started, 2);
+        TEST_ASSERT_TRUE(reserved);
+        for (int t = 0; t < 2; t++) if (atomic_load(&ctx[t].bad) || !atomic_load(&ctx[t].found)) bad++;
+        if (ib > 0) kept++; else freed++;
+        ray_symimp_put(imp, p0, o0, "res0", 4);
+        ray_sym_domain_release(dom);
+        unlink(p);
+        unlink(TMP_DOM_SYM_PATH "_imk.lk");
+        int64_t c1 = ray_heap_anon_committed();
+        if (round > 0) {   /* the first warms whatever stays */
+            measured++;
+            if (c1 - c0 >= ((int64_t)8 << 20)) {
+                leaks++;
+                fprintf(stderr, "  sk4 reserve round %d (%s): %lld bytes more committed after the dictionary went\n", round,
+                        ib > 0 ? "kept" : "freed", (long long)(c1 - c0));
+            }
+        }
+    }
+    fprintf(stderr, "  sk4 reserve: tables kept (a lookup in flight) in %d rounds, freed at once in %d; %d of %d measured rounds leaked\n",
+            kept, freed, leaks, measured);
+    ray_sys_free(bufs); ray_sys_free(strs); ray_sys_free(lens); ray_sys_free(hs); ray_sys_free(want); ray_sys_free(outs);
+    TEST_ASSERT_EQ_I(timeouts, 0);
+    TEST_ASSERT_EQ_I(bad, 0);
+    TEST_ASSERT_EQ_I(leaks, 0);
+    PASS();
+}
 const test_entry_t domain_entries[] = {
     { "domain/private", test_domain_private, domain_setup, domain_teardown },
+    { "domain/flush_append", test_domain_flush_append, domain_setup, domain_teardown },
+    { "domain/import_dict", test_domain_import_dict, domain_setup, domain_teardown },
+    { "domain/import_dict_reclaim", test_domain_import_dict_reclaim, domain_setup, domain_teardown },
+    { "domain/import_dict_tags", test_domain_import_dict_tags, domain_setup, domain_teardown },
+    { "domain/import_dict_reserve", test_domain_import_dict_reserve, domain_setup, domain_teardown },
+    { "domain/sk4_reserve_kept_freed", test_domain_sk4_reserve_kept_freed, domain_setup, domain_teardown },
     { "domain/runtime_identity",        test_domain_runtime_identity,        domain_setup, domain_teardown },
     { "domain/runtime_delegation",      test_domain_runtime_delegation,      domain_setup, domain_teardown },
     { "domain/vec_new_attach",          test_domain_vec_new_attach,          domain_setup, domain_teardown },
@@ -2221,10 +3056,14 @@ const test_entry_t domain_entries[] = {
     { "domain/parted_flatten_adopts",   test_domain_parted_flatten_adopts,   domain_rt_setup, domain_rt_teardown },
     { "domain/str_eager_lockfree",      test_domain_str_eager_lockfree,      domain_setup, domain_teardown },
     { "domain/raw_pin",                 test_domain_raw_pin,                 domain_setup, domain_teardown },
+    { "domain/extend_reopen_flat",      test_domain_extend_reopen_flat,      domain_setup, domain_teardown },
+    { "domain/extend_after_flush",      test_domain_extend_after_flush,      domain_setup, domain_teardown },
+    { "domain/extend_under_batch",      test_domain_extend_under_batch,      domain_setup, domain_teardown },
     { "domain/concat_text_nulls",       test_domain_concat_text_nulls,       domain_rt_setup, domain_rt_teardown },
     { "domain/runtime_lut",             test_domain_runtime_lut,             domain_rt_setup, domain_rt_teardown },
     { "domain/open_position0_validation", test_domain_open_position0_validation, domain_setup, domain_teardown },
     { "domain/intern_batch",            test_domain_intern_batch,            domain_setup, domain_teardown },
+    { "domain/intern_batch_cancel",     test_domain_intern_batch_cancel,     domain_setup, domain_teardown },
     { "domain/intern_batch_concurrent", test_domain_intern_batch_concurrent, domain_setup, domain_teardown },
     { "domain/dict_upsert_file_keys",   test_domain_dict_upsert_file_keys,   domain_rt_setup, domain_rt_teardown },
     { NULL, NULL, NULL, NULL },

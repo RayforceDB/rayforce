@@ -165,9 +165,15 @@ static test_result_t test_write_hash_layout(void) {
     TEST_ASSERT_EQ_I(h.n_groups, 3);
     TEST_ASSERT_EQ_I(h.order_name, -1);
     TEST_ASSERT_EQ_U(n, ix_p32((uint64_t)h.rows + 6 * 8));
-    TEST_ASSERT_TRUE(memcmp(b + h.table, ray_data(ix->u.hash.table), cap * 8) == 0);
-    TEST_ASSERT_TRUE(memcmp(b + h.gkeys, ray_data(ix->u.hash.gkeys), 3 * 8) == 0);
-    TEST_ASSERT_TRUE(memcmp(b + h.rows, ray_data(ix->u.hash.rows), 6 * 8) == 0);
+    /* the region holds the generation-1 layout of the index (I64 arrays,
+     * groups by first occurrence, low-bits homes), whatever its builder */
+    ray_t *lt, *lg, *lo, *lr;
+    TEST_ASSERT_TRUE(ray_index_hash_legacy(ix, &lt, &lg, &lo, &lr));
+    TEST_ASSERT_TRUE(memcmp(b + h.table, ray_data(lt), cap * 8) == 0);
+    TEST_ASSERT_TRUE(memcmp(b + h.gkeys, ray_data(lg), 3 * 8) == 0);
+    TEST_ASSERT_TRUE(memcmp(b + h.offs, ray_data(lo), 4 * 8) == 0);
+    TEST_ASSERT_TRUE(memcmp(b + h.rows, ray_data(lr), 6 * 8) == 0);
+    ray_release(lt); ray_release(lg); ray_release(lo); ray_release(lr);
     for (size_t i = 80; i < 96; i++) TEST_ASSERT_EQ_I(b[i], 0);
     free(b); ray_release(v);
     PASS();
@@ -1082,12 +1088,30 @@ static bool same_child(const ray_t* a, const ray_t* b, size_t esz) {
 
 /* Parse the validated view of v's index and compare the heap root with
  * the source root field by field; name: the order_name written. */
+/* The index a region holds for source index `a`: itself, except a HASH,
+ * which a region stores in the generation-1 layout (ray_index_hash_legacy:
+ * I64 arrays, groups by first occurrence, low-bits homes).  *out is a copy
+ * of `a` with those arrays (hold[] owns them; ix_region_view_free). */
+static const ray_index_t* ix_region_view(const ray_index_t* a, ray_index_t* out, ray_t* hold[4]) {
+    for (int i = 0; i < 4; i++) hold[i] = NULL;
+    if (a->kind != RAY_IDX_HASH) return a;
+    *out = *a;
+    if (!ray_index_hash_legacy(a, &hold[0], &hold[1], &hold[2], &hold[3])) return a;
+    out->u.hash.table = hold[0]; out->u.hash.gkeys = hold[1];
+    out->u.hash.offs = hold[2]; out->u.hash.rows = hold[3];
+    out->markers &= (uint8_t)~RAY_MARK_HASH_HIGH;
+    return out;
+}
+static void ix_region_view_free(ray_t* hold[4]) {
+    for (int i = 0; i < 4; i++) if (hold[i]) ray_release(hold[i]);
+}
 static test_result_t ix_parse_same(ray_t* v, const ray_enc_idx_view_t* iv, const char* name, const char* what) {
     ray_t* root = NULL;
     ray_t* e = ray_enc_index_parse(iv, v, &root);
     if (e) ray_error_free(e);
     TEST_ASSERT_FMT(e == NULL && root != NULL, "%s: parse failed", what);
-    const ray_index_t* a = ray_index_payload(v->index);
+    ray_index_t a_view; ray_t* a_hold[4];
+    const ray_index_t* a = ix_region_view(ray_index_payload(v->index), &a_view, a_hold);
     const ray_index_t* p = ray_index_payload(root);
     bool hdr = p->kind == a->kind && p->parent_type == a->parent_type && p->built_for_len == a->built_for_len;
     bool mapped = (p->markers & RAY_MARK_MMAP) != 0;
@@ -1125,6 +1149,7 @@ static test_result_t ix_parse_same(ray_t* v, const ray_enc_idx_view_t* iv, const
     }
     }
     ray_release(root);                                  /* before any assertion can return */
+    ix_region_view_free(a_hold);
     TEST_ASSERT_FMT(hdr, "%s: root header", what);
     TEST_ASSERT_FMT(!mapped, "%s: parsed root marked mapped", what);
     TEST_ASSERT_FMT(ok, "%s: parsed root differs from the source", what);
@@ -3040,7 +3065,15 @@ static test_result_t test_passenger_order_absent(void) {
  * byte (spec "Completion additions"; "PART key types: save, load,
  * validation ... on BOOL, U8, I16, I32, I64, F32, F64, DATE, TIME,
  * TIMESTAMP and SYM").  PART equality probes then agree on every key. */
+static int ix_children_equal_raw(const ray_index_t* a, const ray_index_t* b);
+/* the builder's index `a` as a region holds it, against the parsed `b` */
 static int ix_children_equal(const ray_index_t* a, const ray_index_t* b) {
+    ray_index_t av; ray_t* hold[4];
+    int r = ix_children_equal_raw(ix_region_view(a, &av, hold), b);
+    ix_region_view_free(hold);
+    return r;
+}
+static int ix_children_equal_raw(const ray_index_t* a, const ray_index_t* b) {
     ray_t* ca[4]; ray_t* cb[4];
     int na = ray_index_child_blocks(a, ca, 4), nb = ray_index_child_blocks(b, cb, 4);
     if (na != nb) return 0;

@@ -188,6 +188,170 @@ static bool pool_steal(ray_pool_t* pool, uint32_t w, uint32_t* c0, uint32_t* c1)
  * are attributed when they run: those inside the chunk last installed here
  * (or run privately) count as stolen, the rest came with the share — so
  * own + stolen over all slots is exactly the tickets executed. */
+/* --------------------------------------------------------------------------
+ * Scan read-ahead
+ *
+ * A mapped column is read on first touch, one page fault at a time per
+ * worker (plus the kernel's own read-ahead), so a scan over storage with a
+ * high per-request latency runs at a couple of requests in flight per
+ * worker whatever the storage could serve in parallel.  A query registers
+ * the mapped columns it reads (ray_pool_scan_set); while one of its
+ * dispatches runs, each thread keeps the next `scan_bytes` of every
+ * registered column, from the row it is at, requested (MADV_WILLNEED,
+ * window by window), topping the request up once half of it is used.  A
+ * window stops where the thread's own run of rows does: the rows past it
+ * are another thread's to ask for, and asking twice costs on fast storage.
+ *
+ * The row comes from the ticket for a dispatch over exactly the registered
+ * rows (ticket base+i holds rows [i*grain, (i+1)*grain)), and from the task
+ * itself (ray_pool_scan_at) for dispatch_n tasks that walk a row range, or
+ * (ray_pool_scan_col_at) for tasks that know the one column they read.
+ * Rows of zone chunks the query's filter rules out (scan->gate) are never
+ * requested.  RAY_SCAN_PREFETCH sets the window in KiB (default 4096, 0
+ * turns read-ahead off); it is read when the pool is created.
+ * -------------------------------------------------------------------------- */
+static RAY_TLS const ray_pool_scan_t* t_scan;
+
+/* Dispatch generations, process-wide: a pool made again after
+ * ray_pool_destroy (which zeroes it) must not meet per-thread state left
+ * by a dispatch of the old one under the same number. */
+static _Atomic(uint64_t) pool_scan_gens;
+
+/* Where residency cannot be queried (ray_vm_resident is always false) the
+ * probe below would never see a column read: there every column counts as
+ * read, as before the probe. */
+#if defined(RAY_OS_WINDOWS)
+#define POOL_SCAN_PROBED 0
+#else
+#define POOL_SCAN_PROBED 1
+#endif
+
+/* What this thread has requested for the current dispatch: rows
+ * [lo[c], hi[c]) of column c.  Stale (gen differs) at a new dispatch.
+ *
+ * A dispatch reads only some of the registered columns (a filter its
+ * predicate's, a counting pass its keys).  Requesting the others too
+ * interleaves streams the dispatch does not need, which a spinning disk pays
+ * for in seeks.  So a column is requested only once the dispatch is seen to
+ * read it: its page in the middle of the rows this thread went through since
+ * its previous call is in the page cache (`active`).  A column the dispatch
+ * does not read, or reads only sparsely, stays out of the page cache there. */
+typedef struct {
+    uint64_t gen;
+    uint32_t active;   /* columns this dispatch reads, by bit */
+    int64_t  last;     /* row of the previous call in this dispatch; -1 none */
+    uint8_t  miss[RAY_POOL_SCAN_MAX];   /* probes that found column c not read */
+    int64_t  lo[RAY_POOL_SCAN_MAX];
+    int64_t  hi[RAY_POOL_SCAN_MAX];
+} pool_scan_tls_t;
+static RAY_TLS pool_scan_tls_t t_pf;
+
+const ray_pool_scan_t* ray_pool_scan_set(const ray_pool_scan_t* scan) {
+    const ray_pool_scan_t* prev = t_scan;
+    t_scan = scan;
+    return prev;
+}
+
+const ray_pool_scan_t* ray_pool_scan_get(void) { return t_scan; }
+
+/* Requested so far (all pools), for the RAY_POOL_TRACE summary. */
+static _Atomic(uint64_t) pool_scan_req_bytes, pool_scan_req_ranges;
+
+static void pool_scan_willneed(const ray_pool_scan_t* s, uint32_t c, int64_t a, int64_t b) {
+    size_t bytes = (size_t)(b - a) * s->esz[c];
+    void* p = (void*)(s->base[c] + (size_t)a * s->esz[c]);
+    /* Rows an earlier dispatch of the query requested are in the page cache
+     * already (or on their way in): asking again only walks those pages. */
+    if (ray_vm_resident(p, bytes)) return;
+    ray_vm_advise_willneed(p, bytes);
+    atomic_fetch_add_explicit(&pool_scan_req_bytes, bytes, memory_order_relaxed);
+    atomic_fetch_add_explicit(&pool_scan_req_ranges, 1, memory_order_relaxed);
+}
+
+/* Request rows [a, b) of column c, skipping the chunks the gate rules out. */
+static void pool_scan_request(const ray_pool_scan_t* s, uint32_t c, int64_t a, int64_t b) {
+    if (!s->gate) { pool_scan_willneed(s, c, a, b); return; }
+    uint8_t lg = s->gate_log2;
+    int64_t run = -1;
+    for (int64_t ch = a >> lg; (ch << lg) < b; ch++) {
+        int64_t c0 = ch << lg;
+        if (c0 < a) c0 = a;
+        if ((s->gate[ch >> 6] >> (ch & 63)) & 1) {
+            if (run < 0) run = c0;
+        } else if (run >= 0) {
+            pool_scan_willneed(s, c, run, c0);
+            run = -1;
+        }
+    }
+    if (run >= 0) pool_scan_willneed(s, c, run, b);
+}
+
+/* This thread is about to read row r and goes on towards `end`.  `reads`:
+ * the columns the caller says it reads, by bit (0 when it does not say, and
+ * the probe finds them). */
+static void pool_scan_ahead(ray_pool_t* pool, int64_t r, int64_t end, uint32_t reads) {
+    const ray_pool_scan_t* s = pool->scan;
+    if (end > s->rows) end = s->rows;
+    if (r < 0 || r >= end) return;
+    pool_scan_tls_t* t = &t_pf;
+    if (t->gen != pool->scan_gen) {
+        t->gen = pool->scan_gen;
+        t->active = POOL_SCAN_PROBED ? 0 : UINT32_MAX;
+        t->last = -1;
+        memset(t->miss, 0, sizeof(t->miss));
+        for (uint32_t c = 0; c < s->n; c++) t->lo[c] = t->hi[c] = r;
+    }
+    /* Rows the filter's zones rule out are skipped by the pass: nothing to
+     * learn or request there, and the run starts again past them. */
+    if (s->gate) {
+        int64_t ch = r >> s->gate_log2;
+        if (!((s->gate[ch >> 6] >> (ch & 63)) & 1)) { t->last = -1; return; }
+    }
+    /* Which columns were read over the rows behind this one; the rows a
+     * column had resident when registered tell nothing (scan->warm).  A
+     * column found unread a few times is one this pass reads sparsely or
+     * not at all: this thread stops probing it for the rest of the
+     * dispatch.  A caller that names its columns needs no probe, from its
+     * first call. */
+    if (reads) {
+        t->active |= reads;
+    } else if (t->last >= 0 && t->last != r) {
+        int64_t mid = (t->last < r ? t->last + r : r + t->last) / 2;
+        for (uint32_t c = 0; c < s->n && c < 32; c++) {
+            if ((t->active >> c & 1) || t->miss[c] >= 4 || mid < s->warm[c]) continue;
+            if (ray_vm_resident(s->base[c] + (size_t)mid * s->esz[c], 1))
+                t->active |= UINT32_C(1) << c;
+            else
+                t->miss[c]++;
+        }
+    }
+    t->last = r;
+    for (uint32_t c = 0; c < s->n; c++) {
+        if (c >= 32 || !(t->active >> c & 1)) continue;
+        /* A jump outside what was requested starts a new run. */
+        if (r < t->lo[c] || r > t->hi[c]) t->lo[c] = t->hi[c] = r;
+        int64_t win = (int64_t)(pool->scan_bytes / s->esz[c]);
+        if (win < 1) win = 1;
+        if (t->hi[c] - r > win / 2) continue;
+        int64_t want = end - r > win ? r + win : end;
+        if (want <= t->hi[c]) continue;
+        pool_scan_request(s, c, t->hi[c], want);
+        t->hi[c] = want;
+    }
+}
+
+/* Ticket tk is next, and this thread's run of tickets goes on to `until`
+ * (to the tail of own range `s` when given): past it are other threads'
+ * rows, which they ask for themselves. */
+static inline void pool_scan_ticket(ray_pool_t* pool, uint32_t tk, uint32_t until,
+                                    ray_pool_slot_t* s) {
+    if (!pool->scan_auto) return;
+    if (s) until = RANGE_TAIL(atomic_load_explicit(&s->range, memory_order_relaxed));
+    uint32_t base = (uint32_t)pool->scan_base;
+    pool_scan_ahead(pool, (int64_t)(uint32_t)(tk - base) * pool->scan_grain,
+                    (int64_t)(uint32_t)(until - base) * pool->scan_grain, 0);
+}
+
 static void pool_run_steal(ray_pool_t* pool, uint32_t w, bool prog) {
     ray_pool_slot_t* s = &pool->slots[w];
     uint32_t ch0 = 0, ch1 = 0;    /* installed chunk [ch0, ch1), empty at entry */
@@ -195,6 +359,7 @@ static void pool_run_steal(ray_pool_t* pool, uint32_t w, bool prog) {
         uint32_t tk;
         while (pool_range_take(s, &tk)) {
             if ((uint32_t)(tk - ch0) < (uint32_t)(ch1 - ch0)) s->stolen++; else s->own++;
+            pool_scan_ticket(pool, tk, 0, s);
             pool_exec(pool, w, tk);
             if (prog) ray_progress_pump();
         }
@@ -222,6 +387,7 @@ static void pool_run_steal(ray_pool_t* pool, uint32_t w, bool prog) {
         }
         s->stolen += c1 - c0;
         for (; c0 != c1; c0++) {
+            pool_scan_ticket(pool, c0, c1, NULL);
             pool_exec(pool, w, c0);
             if (prog) ray_progress_pump();
         }
@@ -276,6 +442,11 @@ static void pool_trace_dump(const ray_pool_t* pool) {
             (unsigned long long)(atomic_load_explicit(&pool->win_state, memory_order_relaxed) / 2),
             (unsigned long long)(own + stolen), (unsigned long long)own,
             (unsigned long long)stolen, (unsigned long long)steals);
+    fprintf(stderr, "pool: scan read-ahead %llu KiB per column, requested %llu MiB in %llu ranges, %llu MiB asked for in all\n",
+            (unsigned long long)(pool->scan_bytes >> 10),
+            (unsigned long long)(atomic_load_explicit(&pool_scan_req_bytes, memory_order_relaxed) >> 20),
+            (unsigned long long)atomic_load_explicit(&pool_scan_req_ranges, memory_order_relaxed),
+            (unsigned long long)(ray_vm_willneed_bytes() >> 20));
     for (uint32_t w = 0; w < W; w++) {
         const ray_pool_slot_t* s = &pool->slots[w];
         fprintf(stderr, "pool:  w%-3u own %12llu  stolen %12llu  steals %8llu\n", w,
@@ -298,6 +469,9 @@ static void worker_loop(void* arg) {
      * pairs with its acquire: the heap is fully initialised when seen). */
     atomic_store_explicit(&pool->worker_heaps[wctx.worker_id - 1], ray_tl_heap,
                           memory_order_release);
+    /* started: no getenv of this thread's start runs after this (the
+     * creator waits for it, ray_pool_create_impl) */
+    ray_sem_signal(&pool->started);
 
     for (;;) {
         ray_sem_wait(&pool->work_ready);
@@ -387,6 +561,9 @@ static ray_err_t ray_pool_create_impl(ray_pool_t* pool, uint32_t n_workers,
     {
         const char* e = getenv("RAY_POOL_STEAL");
         pool->steal = (e && *e) ? (strtol(e, NULL, 10) != 0) : 1;
+        e = getenv("RAY_SCAN_PREFETCH");
+        long kib = (e && *e) ? strtol(e, NULL, 10) : 4096;
+        pool->scan_bytes = kib > 0 ? (size_t)(kib > (1L << 20) ? (1L << 20) : kib) << 10 : 0;
         e = getenv("RAY_POOL_TRACE");
         pool->trace = (e && *e && strtol(e, NULL, 10) != 0);
     }
@@ -452,12 +629,19 @@ static ray_err_t ray_pool_create_impl(ray_pool_t* pool, uint32_t n_workers,
         ray_sys_free(pool->tasks);
         return err;
     }
+    err = ray_sem_init(&pool->started, 0);
+    if (err != RAY_OK) {
+        ray_sem_destroy(&pool->work_ready);
+        ray_sys_free(pool->slots_raw);
+        ray_sys_free(pool->tasks);
+        return err;
+    }
 
     /* Spawn worker threads */
     if (n_workers > 0) {
         pool->threads = (ray_thread_t*)ray_sys_alloc(n_workers * sizeof(ray_thread_t));
         if (!pool->threads) {
-            ray_sem_destroy(&pool->work_ready);
+            ray_sem_destroy(&pool->work_ready); ray_sem_destroy(&pool->started);
             ray_sys_free(pool->slots_raw);
             ray_sys_free(pool->tasks);
             return RAY_ERR_OOM;
@@ -465,7 +649,7 @@ static ray_err_t ray_pool_create_impl(ray_pool_t* pool, uint32_t n_workers,
         pool->worker_heaps = ray_sys_alloc(n_workers * sizeof(*pool->worker_heaps));
         if (!pool->worker_heaps) {
             ray_sys_free(pool->threads);
-            ray_sem_destroy(&pool->work_ready);
+            ray_sem_destroy(&pool->work_ready); ray_sem_destroy(&pool->started);
             ray_sys_free(pool->slots_raw);
             ray_sys_free(pool->tasks);
             return RAY_ERR_OOM;
@@ -486,7 +670,7 @@ static ray_err_t ray_pool_create_impl(ray_pool_t* pool, uint32_t n_workers,
                 }
                 ray_sys_free(pool->worker_heaps);
                 ray_sys_free(pool->threads);
-                ray_sem_destroy(&pool->work_ready);
+                ray_sem_destroy(&pool->work_ready); ray_sem_destroy(&pool->started);
                 ray_sys_free(pool->slots_raw);
                 ray_sys_free(pool->tasks);
                 return RAY_ERR_OOM;
@@ -506,12 +690,17 @@ static ray_err_t ray_pool_create_impl(ray_pool_t* pool, uint32_t n_workers,
                 }
                 ray_sys_free(pool->worker_heaps);
                 ray_sys_free(pool->threads);
-                ray_sem_destroy(&pool->work_ready);
+                ray_sem_destroy(&pool->work_ready); ray_sem_destroy(&pool->started);
                 ray_sys_free(pool->slots_raw);
                 ray_sys_free(pool->tasks);
                 return err;
             }
         }
+        /* Every worker through its start before the pool is handed out:
+         * ray_heap_init reads the environment (getenv), and a caller's
+         * setenv right after this returns could otherwise free the
+         * environment array under one of those reads. */
+        for (uint32_t i = 0; i < n_workers; i++) ray_sem_wait(&pool->started);
     }
 
     return RAY_OK;
@@ -543,125 +732,89 @@ void ray_pool_free(ray_pool_t* pool) {
 
     ray_sys_free(pool->worker_heaps);
     ray_sys_free(pool->threads);
-    ray_sem_destroy(&pool->work_ready);
+    ray_sem_destroy(&pool->work_ready); ray_sem_destroy(&pool->started);
     ray_sys_free(pool->slots_raw);
     ray_sys_free(pool->tasks);
     memset(pool, 0, sizeof(*pool));
 }
 
-/* --------------------------------------------------------------------------
- * ray_pool_dispatch
- * -------------------------------------------------------------------------- */
+/* Read-ahead state for the dispatch about to start: a fresh generation, so
+ * the per-thread run state (active columns, probe misses, requested window)
+ * left by the previous dispatch is not taken for this one.  Once per
+ * dispatch, not per round: the rounds of one dispatch walk one row space,
+ * and a thread's run continues across them. */
+static inline void pool_scan_dispatch_begin(ray_pool_t* pool) {
+    pool->scan_gen = atomic_fetch_add_explicit(&pool_scan_gens, 1, memory_order_relaxed) + 1;
+}
 
-/* M2: Caller (ray_execute) must reset pool->cancelled before dispatching.
- * The cancelled flag is per-query state; failing to clear it causes all
- * subsequent dispatches to skip task execution. */
+/* Arm read-ahead for the window about to be published: the caller's
+ * registration, requested per ticket when the window covers exactly its
+ * rows (`total` elements, `grain` per ticket from `base`). */
+static void pool_scan_begin(ray_pool_t* pool, int64_t total, uint64_t base, int64_t grain) {
+    const ray_pool_scan_t* sc = (pool->scan_bytes && t_scan && t_scan->n) ? t_scan : NULL;
+    pool->scan = sc;
+    pool->scan_auto = sc && pool->steal && grain > 0 && sc->rows == total;
+    pool->scan_base = base;
+    pool->scan_grain = grain;
+}
+
+/* The window has drained: nothing reads the registration any more. */
+static inline void pool_scan_end(ray_pool_t* pool) {
+    pool->scan = NULL;
+    pool->scan_auto = false;
+}
+
+/* Grow the ring towards n_tasks slots, up to MAX_RING_CAP.  A dispatch that
+ * needs more than the ring holds afterwards (the ceiling, or a realloc that
+ * failed) runs its tasks in further rounds of task_cap each.
+ *
+ * conc-L6: Ring growth is safe without synchronization because dispatch is
+ * single-producer: only the main thread (the dispatch caller) writes
+ * tasks[] and task_cap, and only while the prior window is fully claimed
+ * (no task pending).  Workers read tasks[]/task_cap only after acquiring
+ * the new task_limit (store-release), which orders the growth before any
+ * claim — so a late worker never reads a stale tasks pointer or task_cap. */
 /* Test hook (ray_pool_test_ring_fail): ring growth fails (as when its
- * ray_sys_realloc returns NULL) and the ring holds `cap` tasks, so a
- * dispatch of more tasks takes the clamp below at test sizes; 0 off. */
+ * ray_sys_realloc returns NULL) and a round holds at most `cap` tasks, so a
+ * dispatch of more tasks runs in several rounds at test sizes; 0 off. */
 static _Atomic(uint32_t) g_pool_test_cap;
 void ray_pool_test_ring_fail(uint32_t cap) { atomic_store_explicit(&g_pool_test_cap, cap, memory_order_relaxed); }
 
-/* The task geometry of a dispatch of total_elems at `grain` (a whole
- * multiple of RAY_MORSEL_ELEMS): grows the ring when it can, then clamps
- * to it.  A clamped grain is the smallest whole multiple of the requested
- * one that fits the ring, so task starts stay multiples of `grain`.  One
- * helper for ray_pool_dispatch, ray_pool_dispatch_grain and
- * ray_pool_dispatch_geometry, so a caller sizing per-task state from the
- * geometry sees what the dispatch does.  Main thread only (single
- * producer). */
-static void pool_geometry(ray_pool_t* pool, int64_t* total_elems, int64_t* grain, uint32_t* n_out) {
-    int64_t g = *grain;
-    /* Overflow guard: total_elems + grain - 1 could wrap for extreme values. */
-    if (RAY_UNLIKELY(*total_elems > INT64_MAX - g + 1))
-        *total_elems = INT64_MAX - g + 1;
-    int64_t total = *total_elems;
-    /* Limits (as before this helper): n_tasks is uint32, so totals of
-     * 2^32 * grain elements or more (about 3.5e13 at the 8192-row grain)
-     * are out of range, and a widened grain near INT64_MAX is not guarded. */
-    uint32_t n_tasks = (uint32_t)((total + g - 1) / g);
-
-    /* conc-L6: Ring growth is safe without synchronization because dispatch is
-     * single-producer: only the main thread (the dispatch caller) writes
-     * tasks[] and task_cap, and only while the prior window is fully claimed
-     * (no task pending).  Workers read tasks[]/task_cap only after acquiring
-     * the new task_limit (store-release), which orders the growth before any
-     * claim — so a late worker never reads a stale tasks pointer or task_cap. */
+/* Tasks one round may take: the ring, or the test hook's smaller cap. */
+static inline uint32_t pool_round_cap(const ray_pool_t* pool) {
     uint32_t test_cap = atomic_load_explicit(&g_pool_test_cap, memory_order_relaxed);
-    if (n_tasks > pool->task_cap) {
-        uint32_t new_cap = pool->task_cap;
-        while (new_cap < n_tasks && new_cap < MAX_RING_CAP) new_cap *= 2;
-        if (new_cap > pool->task_cap) {
-            ray_pool_task_t* new_tasks = RAY_UNLIKELY(test_cap) ? NULL   /* the hook: realloc fails */
-                : (ray_pool_task_t*)ray_sys_realloc(pool->tasks, new_cap * sizeof(ray_pool_task_t));
-            if (new_tasks) {
-                pool->tasks = new_tasks;
-                pool->task_cap = new_cap;
-            }
+    return test_cap && test_cap < pool->task_cap ? test_cap : pool->task_cap;
+}
+
+static void pool_ring_grow(ray_pool_t* pool, int64_t n_tasks) {
+    if (n_tasks <= (int64_t)pool->task_cap) return;
+    uint32_t new_cap = pool->task_cap;
+    while ((int64_t)new_cap < n_tasks && new_cap < MAX_RING_CAP) new_cap *= 2;
+    if (new_cap > pool->task_cap) {
+        ray_pool_task_t* new_tasks =
+            RAY_UNLIKELY(atomic_load_explicit(&g_pool_test_cap, memory_order_relaxed)) ? NULL   /* the hook */
+            : (ray_pool_task_t*)ray_sys_realloc(pool->tasks, new_cap * sizeof(ray_pool_task_t));
+        if (new_tasks) {
+            pool->tasks = new_tasks;
+            pool->task_cap = new_cap;
         }
     }
-
-    /* Clamp n_tasks to task_cap to prevent ring overflow.  The wider grain
-     * stays a whole multiple of the requested one, so every task still
-     * starts on a grain (morsel, vector) boundary: callers slot per-task
-     * state by start / grain (pred_sel_drive's rowsel builders) or read
-     * whole vectors per task. */
-    uint32_t cap = test_cap && test_cap < pool->task_cap ? test_cap : pool->task_cap;
-    if (n_tasks > cap) {
-        int64_t per = (total + cap - 1) / cap;
-        g = (per + *grain - 1) / *grain * *grain;
-        n_tasks = (uint32_t)((total + g - 1) / g);   /* <= cap */
-    }
-    *grain = g;
-    *n_out = n_tasks;
 }
 
-void ray_pool_dispatch_geometry(ray_pool_t* pool, int64_t total_elems, int64_t grain,
-                                uint32_t* n_tasks, int64_t* eff_grain) {
-    *n_tasks = 0; *eff_grain = grain;
-    if (total_elems <= 0) return;
-    pool_geometry(pool, &total_elems, eff_grain, n_tasks);
+/* The window the next round fills: tickets [base, base+n_tasks), carved off
+ * the monotonic high-water mark.  The prior round is fully claimed, so
+ * task_claim == task_limit == base here (in steal mode: every slots[].range
+ * is head == tail and the cursors were advanced to base at publish); the
+ * window's slots never alias a still-live slot. */
+static inline uint64_t pool_window_base(const ray_pool_t* pool) {
+    return atomic_load_explicit(&pool->task_limit, memory_order_relaxed);
 }
 
-static void pool_dispatch_at(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
-                             int64_t total_elems, int64_t grain);
-
-void ray_pool_dispatch(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
-                      int64_t total_elems) {
-    pool_dispatch_at(pool, fn, ctx, total_elems, TASK_GRAIN);
-}
-
-void ray_pool_dispatch_grain(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
-                             int64_t total_elems, int64_t grain) {
-    pool_dispatch_at(pool, fn, ctx, total_elems, grain);
-}
-
-static void pool_dispatch_at(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
-                             int64_t total_elems, int64_t grain) {
-    if (total_elems <= 0) return;
-    uint32_t n_tasks;
-    pool_geometry(pool, &total_elems, &grain, &n_tasks);
-
-    /* Carve a fresh window [base, base+n_tasks) off the monotonic high-water
-     * mark.  The prior dispatch is fully claimed, so task_claim == task_limit
-     * == base here (in steal mode: every slots[].range is head == tail and
-     * the cursors were advanced to base at publish); the window's slots
-     * never alias a still-live slot. */
-    uint64_t base = atomic_load_explicit(&pool->task_limit, memory_order_relaxed);
-
-    /* Fill task ring for tickets [base, base+n_tasks) */
-    for (uint32_t i = 0; i < n_tasks; i++) {
-        int64_t start = (int64_t)i * grain;
-        int64_t end = start + grain;
-        if (end > total_elems) end = total_elems;
-
-        uint32_t slot = (uint32_t)((base + i) & (pool->task_cap - 1));
-        pool->tasks[slot].fn = fn;
-        pool->tasks[slot].ctx = ctx;
-        pool->tasks[slot].start = start;
-        pool->tasks[slot].end = end;
-    }
-
+/* Publish the window [base, base+n_tasks) whose ring slots the caller has
+ * filled, run it with the main thread as worker 0, and wait for it to
+ * drain.  Read-ahead for the window is armed by the caller (pool_scan_begin)
+ * before this and disarmed here. */
+static void pool_run_window(ray_pool_t* pool, uint64_t base, uint32_t n_tasks, bool prog) {
     /* pending must be visible before the window opens; the task_limit
      * store-release publishes the ring fill AND pending to claimers.  In
      * steal mode the range words are the publication (release each) and
@@ -682,12 +835,6 @@ static void pool_dispatch_at(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
     /* Main thread enters atomic refcount mode during parallel dispatch */
     ray_rc_sync = true;
 
-    /* Progress: when a callback is listening (PROGRESS bit armed), baseline the
-     * row counter for this dispatch so the main thread can pump a 0→100% bar
-     * from its claim/spin path.  One relaxed load; skipped entirely otherwise. */
-    const bool prog = ray_qstats_mode() & RAY_QS_PROGRESS;
-    if (prog) ray_progress_dispatch_begin((uint64_t)total_elems);
-
     /* Wake worker threads — only as many as have something to claim.  Main
      * participates as worker 0, so at most n_tasks-1 helpers can be useful;
      * signalling the whole pool woke threads that raced to an already-drained
@@ -707,18 +854,7 @@ static void pool_dispatch_at(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
     } else {
         uint64_t idx;
         while (pool_claim(pool, &idx)) {
-            if (RAY_UNLIKELY(atomic_load_explicit(&pool->cancelled,
-                                                  memory_order_relaxed))) {
-                atomic_fetch_sub_explicit(&pool->pending, 1, memory_order_acq_rel);
-                continue;
-            }
-
-            ray_pool_task_t* t = &pool->tasks[idx & (pool->task_cap - 1)];
-            int64_t _qs_t0; uint32_t _qs_m = ray_qstats_task_begin(&_qs_t0);
-            t->fn(t->ctx, 0, t->start, t->end);
-            ray_qstats_task_end(_qs_m, 0, t->end - t->start, _qs_t0);
-
-            atomic_fetch_sub_explicit(&pool->pending, 1, memory_order_acq_rel);
+            pool_exec(pool, 0, (uint32_t)idx);
             if (prog) ray_progress_pump();
         }
 
@@ -730,6 +866,8 @@ static void pool_dispatch_at(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
             if (++spin_count % 1024 == 0) { sched_yield(); if (prog) ray_progress_pump(); }
         }
     }
+
+    pool_scan_end(pool);
 
     /* All tasks done, workers heading to sem_wait (no GC in loop).
      * Safe for main to modify worker heaps between dispatches. */
@@ -744,13 +882,108 @@ static void pool_dispatch_at(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
     pool_reclaim_worker_heaps(pool);
 }
 
+/* One round of ray_pool_dispatch: tasks [first, first+n_tasks) of the
+ * element space, task i handed to fn as [i*grain, min((i+1)*grain,
+ * total_elems)), n_tasks <= task_cap. */
+static void dispatch_round(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
+                           int64_t total_elems, int64_t grain, int64_t first,
+                           uint32_t n_tasks, bool prog) {
+    uint64_t base = pool_window_base(pool);
+
+    /* Fill task ring for tickets [base, base+n_tasks) */
+    for (uint32_t i = 0; i < n_tasks; i++) {
+        int64_t start = (first + (int64_t)i) * grain;
+        int64_t end = start + grain;
+        if (end > total_elems) end = total_elems;
+
+        uint32_t slot = (uint32_t)((base + i) & (pool->task_cap - 1));
+        pool->tasks[slot].fn = fn;
+        pool->tasks[slot].ctx = ctx;
+        pool->tasks[slot].start = start;
+        pool->tasks[slot].end = end;
+    }
+
+    /* Scan read-ahead for this window, published with the ranges.  Ticket
+     * base maps to task `first`, so the registration's ticket 0 is
+     * base - first (ticket arithmetic wraps as uint32 there). */
+    pool_scan_begin(pool, total_elems, base - (uint64_t)first, grain);
+    pool_run_window(pool, base, n_tasks, prog);
+}
+
+/* --------------------------------------------------------------------------
+ * ray_pool_dispatch
+ * -------------------------------------------------------------------------- */
+
+/* M2: Caller (ray_execute) must reset pool->cancelled before dispatching.
+ * The cancelled flag is per-query state; failing to clear it causes all
+ * subsequent dispatches to skip task execution.
+ *
+ * Every task is exactly [i*grain, min((i+1)*grain, total_elems)) (grain
+ * TASK_GRAIN for ray_pool_dispatch): callers index per-task state by
+ * start / grain (fused WHERE rowsel builders, per-task histograms) and rely
+ * on grain-aligned starts. */
+static void pool_dispatch_at(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
+                             int64_t total_elems, int64_t grain) {
+    if (total_elems <= 0) return;
+
+    /* Calculate number of tasks.
+     * Overflow guard: total_elems + grain - 1 could wrap for extreme values. */
+    if (RAY_UNLIKELY(total_elems > INT64_MAX - grain + 1))
+        total_elems = INT64_MAX - grain + 1;
+    int64_t n_tasks = (total_elems + grain - 1) / grain;
+
+    pool_ring_grow(pool, n_tasks);
+
+    /* Progress: when a callback is listening (PROGRESS bit armed), baseline the
+     * row counter for this dispatch so the main thread can pump a 0→100% bar
+     * from its claim/spin path.  One relaxed load; skipped entirely otherwise.
+     * Baselined once for all rounds: the counter accumulates across them. */
+    const bool prog = ray_qstats_mode() & RAY_QS_PROGRESS;
+    if (prog) ray_progress_dispatch_begin((uint64_t)total_elems);
+    pool_scan_dispatch_begin(pool);
+
+    /* The ring holds task_cap tasks at a time (MAX_RING_CAP, or less when
+     * growing it failed).  Anything past that runs in further rounds of the
+     * same grain: widening the grain to fit the ring instead moved task
+     * starts off the grain boundaries every caller indexes by (#792).
+     * A cancelled query runs no further round: every ticket of one would be
+     * skipped anyway, and the rounds left can number in the hundreds. */
+    const uint32_t cap = pool_round_cap(pool);
+    for (int64_t first = 0; first < n_tasks; ) {
+        if (RAY_UNLIKELY(atomic_load_explicit(&pool->cancelled, memory_order_relaxed)))
+            break;
+        int64_t batch = n_tasks - first;
+        if (batch > (int64_t)cap) batch = cap;
+        dispatch_round(pool, fn, ctx, total_elems, grain, first, (uint32_t)batch, prog);
+        first += batch;
+    }
+}
+
+void ray_pool_dispatch(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
+                      int64_t total_elems) {
+    pool_dispatch_at(pool, fn, ctx, total_elems, TASK_GRAIN);
+}
+
+void ray_pool_dispatch_grain(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
+                             int64_t total_elems, int64_t grain) {
+    pool_dispatch_at(pool, fn, ctx, total_elems, grain);
+}
+
+void ray_pool_dispatch_geometry(ray_pool_t* pool, int64_t total_elems, int64_t grain,
+                                uint32_t* n_tasks, int64_t* eff_grain) {
+    (void)pool;   /* rounds keep the grain: the geometry is the arithmetic */
+    *n_tasks = 0; *eff_grain = grain;
+    if (total_elems <= 0) return;
+    if (RAY_UNLIKELY(total_elems > INT64_MAX - grain + 1))
+        total_elems = INT64_MAX - grain + 1;
+    *n_tasks = (uint32_t)((total_elems + grain - 1) / grain);
+}
+
 /* One round of ray_pool_dispatch_n: tasks [first, first+n_tasks), each handed
  * to fn as [i, i+1) with its ABSOLUTE index, n_tasks <= task_cap. */
 static void dispatch_n_round(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
-                             uint32_t first, uint32_t n_tasks) {
-    /* Carve a fresh window [base, base+n_tasks) off the monotonic high-water
-     * mark (the prior dispatch is fully claimed, so base == task_claim). */
-    uint64_t base = atomic_load_explicit(&pool->task_limit, memory_order_relaxed);
+                             uint32_t first, uint32_t n_tasks, bool prog) {
+    uint64_t base = pool_window_base(pool);
 
     /* Fill task ring: one task per partition, tickets [base, base+n_tasks) */
     for (uint32_t i = 0; i < n_tasks; i++) {
@@ -761,68 +994,8 @@ static void dispatch_n_round(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
         pool->tasks[slot].end = (int64_t)(first + i) + 1;
     }
 
-    atomic_store_explicit(&pool->pending, n_tasks, memory_order_relaxed);
-    if (pool->steal) {
-        atomic_store_explicit(&pool->task_claim, base + n_tasks, memory_order_relaxed);
-        atomic_store_explicit(&pool->task_limit, base + n_tasks, memory_order_relaxed);
-        pool_publish_ranges(pool, base, n_tasks);
-    } else {
-        atomic_store_explicit(&pool->task_limit, base + n_tasks, memory_order_release);
-    }
-
-    atomic_store_explicit(&ray_parallel_flag, 1, memory_order_release);
-    ray_rc_sync = true;
-
-    /* Progress: baseline this dispatch (one unit per task/partition). */
-    const bool prog = ray_qstats_mode() & RAY_QS_PROGRESS;
-    if (prog) ray_progress_dispatch_begin((uint64_t)n_tasks);
-
-    /* Wake worker threads — only as many as have something to claim.  Main
-     * participates as worker 0, so at most n_tasks-1 helpers can be useful;
-     * signalling the whole pool woke threads that raced to an already-drained
-     * window and went straight back to sleep, which is pure overhead on any
-     * dispatch narrower than the machine (#599).  Signalling FEWER is safe:
-     * completion is governed by the `pending` spin-wait below, never by the
-     * signal count, so an unsignalled worker simply stays asleep. */
-    uint32_t wake = n_tasks > 0 ? n_tasks - 1 : 0;
-    if (wake > pool->n_workers) wake = pool->n_workers;
-    for (uint32_t i = 0; i < wake; i++) {
-        ray_sem_signal(&pool->work_ready);
-    }
-
-    /* Main thread participates as worker 0 */
-    if (pool->steal) {
-        pool_main_run_steal(pool, prog);
-    } else {
-        uint64_t idx;
-        while (pool_claim(pool, &idx)) {
-            if (RAY_UNLIKELY(atomic_load_explicit(&pool->cancelled,
-                                                  memory_order_relaxed))) {
-                atomic_fetch_sub_explicit(&pool->pending, 1, memory_order_acq_rel);
-                continue;
-            }
-
-            ray_pool_task_t* t = &pool->tasks[idx & (pool->task_cap - 1)];
-            int64_t _qs_t0; uint32_t _qs_m = ray_qstats_task_begin(&_qs_t0);
-            t->fn(t->ctx, 0, t->start, t->end);
-            ray_qstats_task_end(_qs_m, 0, t->end - t->start, _qs_t0);
-
-            atomic_fetch_sub_explicit(&pool->pending, 1, memory_order_acq_rel);
-            if (prog) ray_progress_pump();
-        }
-
-        /* Spin-wait for workers to finish remaining tasks */
-        unsigned spin_count = 0;
-        while (atomic_load_explicit(&pool->pending, memory_order_acquire) > 0) {
-            RAY_CPU_RELAX();
-            if (++spin_count % 1024 == 0) { sched_yield(); if (prog) ray_progress_pump(); }
-        }
-    }
-
-    atomic_store_explicit(&ray_parallel_flag, 0, memory_order_release);
-    atomic_thread_fence(memory_order_seq_cst);
-    ray_rc_sync = false;
-    pool_reclaim_worker_heaps(pool);
+    pool_scan_begin(pool, -1, base, 0);   /* tasks are not row ranges */
+    pool_run_window(pool, base, n_tasks, prog);
 }
 
 /* --------------------------------------------------------------------------
@@ -833,28 +1006,25 @@ void ray_pool_dispatch_n(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
                          uint32_t n_tasks) {
     if (n_tasks == 0) return;
 
-    /* Grow ring if needed */
-    if (n_tasks > pool->task_cap) {
-        uint32_t new_cap = pool->task_cap;
-        while (new_cap < n_tasks && new_cap < MAX_RING_CAP) new_cap *= 2;
-        if (new_cap > pool->task_cap) {
-            ray_pool_task_t* new_tasks = (ray_pool_task_t*)ray_sys_realloc(
-                pool->tasks, new_cap * sizeof(ray_pool_task_t));
-            if (new_tasks) {
-                pool->tasks = new_tasks;
-                pool->task_cap = new_cap;
-            }
-        }
-    }
+    pool_ring_grow(pool, (int64_t)n_tasks);
+
+    /* Progress: baseline this dispatch (one unit per task/partition), once
+     * for all of its rounds. */
+    const bool prog = ray_qstats_mode() & RAY_QS_PROGRESS;
+    if (prog) ray_progress_dispatch_begin((uint64_t)n_tasks);
+    pool_scan_dispatch_begin(pool);
 
     /* The ring holds task_cap tasks at a time.  Anything past that runs in
      * further rounds rather than being dropped: a window with more
      * partitions than the ring, or a join with more morsels, used to lose
-     * every task past the cap silently. */
+     * every task past the cap silently.  A cancelled query runs no further
+     * round (see ray_pool_dispatch). */
     for (uint32_t first = 0; first < n_tasks; ) {
+        if (RAY_UNLIKELY(atomic_load_explicit(&pool->cancelled, memory_order_relaxed)))
+            break;
         uint32_t batch = n_tasks - first;
         if (batch > pool->task_cap) batch = pool->task_cap;
-        dispatch_n_round(pool, fn, ctx, first, batch);
+        dispatch_n_round(pool, fn, ctx, first, batch, prog);
         first += batch;
     }
 }
@@ -917,6 +1087,72 @@ ray_pool_t* ray_pool_get(void) {
             if (++spin_count % 1024 == 0) sched_yield();
         }
     }
+}
+
+/* Read-ahead from inside a task of the singleton's open dispatch (the only
+ * pool the executor's kernels run on).  Outside a dispatch `scan` is NULL. */
+void ray_pool_scan_at(int64_t nrows, int64_t r, int64_t end) {
+    ray_pool_t* pool = &g_pool;
+    const ray_pool_scan_t* s = pool->scan;
+    if (!s || s->rows != nrows) return;
+    pool_scan_ahead(pool, r, end, 0);
+}
+
+/* The bit of the `nrows`-row column at `col` in registration `s`; 0 when
+ * it is not registered there. */
+static uint32_t pool_scan_col_bit(const ray_pool_scan_t* s, const void* col, int64_t nrows) {
+    if (!s || s->rows != nrows) return 0;
+    for (uint32_t c = 0; c < s->n && c < 32; c++)
+        if (s->base[c] == (const uint8_t*)col) return UINT32_C(1) << c;
+    return 0;
+}
+
+void ray_pool_scan_col_at(const void* col, int64_t nrows, int64_t r, int64_t end) {
+    ray_pool_t* pool = &g_pool;
+    uint32_t bit = pool_scan_col_bit(pool->scan, col, nrows);
+    if (bit) pool_scan_ahead(pool, r, end, bit);
+}
+
+bool ray_pool_scan_holds(const void* col, int64_t nrows) {
+    return g_pool.scan_bytes && pool_scan_col_bit(t_scan, col, nrows);
+}
+
+bool ray_pool_scan_on(void) {
+    if (atomic_load_explicit(&g_pool_init_state, memory_order_acquire) == 2)
+        return g_pool.scan_bytes != 0;
+    /* no pool yet: the switch as the pool will read it */
+    const char* e = getenv("RAY_SCAN_PREFETCH");
+    return !(e && *e && strtol(e, NULL, 10) <= 0);
+}
+
+/* Asking for a range costs the caller about a microsecond a page: the
+ * kernel allocates and queues each page before the call returns.  A large
+ * range asked for outside a dispatch is split over the pool's threads. */
+typedef struct {
+    uintptr_t a, end;
+    size_t    step;
+} pool_want_ctx_t;
+
+static void pool_want_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    const pool_want_ctx_t* c = raw;
+    for (int64_t i = start; i < end; i++) {
+        uintptr_t a = c->a + (uintptr_t)i * c->step;
+        ray_vm_advise_willneed((void*)a, c->end - a < c->step ? c->end - a : c->step);
+    }
+}
+
+void ray_pool_want(const void* p, size_t bytes) {
+    ray_pool_t* pool = &g_pool;
+    size_t step = (size_t)1 << 20;
+    if (bytes / step > RAY_POOL_INIT_TASKS) step = (bytes + RAY_POOL_INIT_TASKS - 1) / RAY_POOL_INIT_TASKS;
+    uint32_t n = (uint32_t)((bytes + step - 1) / step);
+    if (n < 4 || !ray_pool_par_dispatch_ok(pool, n, 4)) {
+        ray_vm_advise_willneed((void*)p, bytes);
+        return;
+    }
+    pool_want_ctx_t c = { (uintptr_t)p, (uintptr_t)p + bytes, step };
+    ray_pool_dispatch_n(pool, pool_want_fn, &c, n);
 }
 
 /* --------------------------------------------------------------------------
@@ -990,4 +1226,18 @@ void ray_cancel(void) {
 void ray_cancel_reset(void) {
     if (atomic_load_explicit(&g_pool_init_state, memory_order_acquire) == 2)
         atomic_store_explicit(&g_pool.cancelled, 0, memory_order_release);
+}
+
+/* The worker heaps of the live pool, for heap maintenance run from the
+ * dispatcher's thread between dispatches (see pool_reclaim_worker_heaps for
+ * why only these).  Like ray_cancel it touches the pool only when it is
+ * already live, so maintenance never starts one. */
+void ray_pool_each_worker_heap(void (*fn)(ray_heap_t* h, void* ctx), void* ctx) {
+    if (atomic_load_explicit(&g_pool_init_state, memory_order_acquire) != 2)
+        return;
+    for (uint32_t i = 0; i < g_pool.n_workers; i++) {
+        ray_heap_t* h = (ray_heap_t*)atomic_load_explicit(&g_pool.worker_heaps[i],
+                                                          memory_order_acquire);
+        if (h) fn(h, ctx);
+    }
 }

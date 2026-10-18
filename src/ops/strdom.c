@@ -80,7 +80,7 @@ static ray_t* sd_intern(ray_strdom_t* d, const char* p, uint32_t n, uint64_t h, 
     for (uint64_t s; (s = d->slots[q]) != 0; q = (q + 1) & d->mask) {
         if ((s >> SD_ID_BITS) != tag) continue;
         int64_t i = (int64_t)(s & SD_ID_MASK) - 1;
-        if (d->ent[i].len == n && memcmp(d->arena + d->ent[i].off, p, n) == 0) { *id = i; return NULL; }
+        if (d->ent[i].len == n && (n == 0 || memcmp(d->arena + d->ent[i].off, p, n) == 0)) { *id = i; return NULL; }
     }
     if (d->used + n > UINT32_MAX)
         return ray_error("range", "string domain: more than %u bytes of distinct strings", UINT32_MAX);
@@ -255,7 +255,7 @@ static ray_t* sd_rows(sd_build_t* b, int64_t lo, int64_t hi, const uint16_t* idx
                     if (err) return err;
                     b->remap[c] = id;
                     /* the arena may have moved: the last string is this one */
-                    b->lid = id; b->ln = n; b->lp = b->d->arena + b->d->ent[id].off;
+                    b->lid = id; b->ln = n; b->lp = n ? b->d->arena + b->d->ent[id].off : p;   /* "": maybe no arena yet */
                 }
                 *sd_slot(b, r) = id;
                 if (idx) { if (++j >= n_idx) return NULL; r = lo + idx[j]; }
@@ -285,7 +285,7 @@ static ray_t* sd_rows(sd_build_t* b, int64_t lo, int64_t hi, const uint16_t* idx
                         if (err) return err;
                         b->remap[k] = id;
                         /* the arena may have moved: the last string is this one */
-                        b->lid = id; b->ln = n; b->lp = b->d->arena + b->d->ent[id].off;
+                        b->lid = id; b->ln = n; b->lp = n ? b->d->arena + b->d->ent[id].off : p;   /* "": maybe no arena yet */
                     }
                     *sd_slot(b, r) = id;
                     if (idx) { if (++j >= n_idx) return NULL; r = lo + idx[j]; }
@@ -308,7 +308,7 @@ static ray_t* sd_rows(sd_build_t* b, int64_t lo, int64_t hi, const uint16_t* idx
             else {
                 err = sd_intern(b->d, p, n, ray_str_t_hash(e, v->str_pool), &id);
                 if (err) return err;
-                b->lid = id; b->ln = n; b->lp = b->d->arena + b->d->ent[id].off;
+                b->lid = id; b->ln = n; b->lp = n ? b->d->arena + b->d->ent[id].off : p;   /* "": maybe no arena yet */
             }
             *sd_slot(b, r) = id;
             if (idx) { if (++j >= n_idx) return NULL; r = lo + idx[j]; }
@@ -407,7 +407,7 @@ ray_t* ray_strdom_emit(const ray_strdom_t* d, const int64_t* ids, int64_t n, ray
     for (int64_t i = 0; i < n; i++) {
         int64_t id = ids[i];
         if (id < 0 || id >= d->n) { ptrs[i] = ""; lens[i] = 0; }
-        else { ptrs[i] = d->arena + d->ent[id].off; lens[i] = d->ent[id].len; }
+        else { lens[i] = d->ent[id].len; ptrs[i] = lens[i] ? d->arena + d->ent[id].off : ""; }
     }
     ray_t* v = ray_str_vec_from_parts(ptrs, lens, NULL, n);
     ray_free_raw(ptrs); ray_free_raw(lens);

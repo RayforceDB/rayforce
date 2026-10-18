@@ -17,8 +17,16 @@ The header carries a single-byte format generation. The current generation is `0
  * Bytes  0-31:   ray_t header (type, attrs, len, etc.)
  * Bytes 32-N:    element data (len * elem_size bytes)
  *                nulls use type-correct sentinels in this payload
+ *
+ * String columns (RAY_STR) continue:
+ * Bytes 32-N:    16-byte descriptors; a string longer than 12 bytes
+ *                lives in the pool and its descriptor carries the
+ *                pool offset and a 32-bit content hash
+ * Bytes N+1..:   32-byte pool header, then the pool bytes
  */
 ```
+
+A string column file written by the current engine stores the content hash of every pooled string in its descriptor and marks the header to say so. Loading or mapping such a file checks descriptor bounds only: no string bytes are read and no descriptor page is written, so the mapping stays shared with the page cache. Files written before the hash was stored carry padding in that field; the loaders detect the missing mark, recompute the hashes and repair them in the private mapping, without touching the file.
 
 ### C API
 
@@ -71,9 +79,15 @@ all columns into a fresh directory below `.generations/`. After the files are
 complete, it atomically replaces the small `.current` manifest. Readers follow
 that manifest, so they see either the previous complete generation or the new
 complete generation — never a mixture of columns from both. A failed write
-before publication leaves the previous generation selected. Tables written by
-older Rayforce versions remain readable; the first replacement upgrades the
-directory to the generation layout.
+before publication leaves the previous generation selected. A cancelled write
+reports `cancel` and changes nothing: the previous generation stays selected,
+and a cancelled first write leaves no table behind, while files that were
+already in the directory before the write are kept. Superseded generations,
+and what a failed first write created, are removed afterwards; a symbolic
+link found among them is unlinked, never followed, so nothing outside the
+table directory is touched. Tables written by older Rayforce versions remain
+readable; the first replacement upgrades the directory to the generation
+layout.
 
 The table, partition and CSV entry points follow the same publication protocol.
 Indexes are built in the new generation before it is published. The CSV and
@@ -186,6 +200,14 @@ ray_t* trades = ray_read_parted("db", "trades");
 
 !!! note "Rayfall builtin"
     Use `.db.parted.get` from Rayfall to load partitioned tables: `(.db.parted.get "db" 'trades)`. See the [Rayfall Storage Builtins](#rayfall-storage) section below.
+
+Mounting the same root again on the same thread reuses unchanged partitions while the earlier view is held. Cache entries record the resolved generation directory and the device, inode, size, modification time and change time of the schema and every column file. A changed partition is loaded afresh; a disappeared partition is dropped. Symbol columns must match the root's current domain, so a missing `.sym` is still an error.
+
+The cache holds at most 1024 partition tables per thread. GC, symbol-domain opens and the next mount discard entries whose columns have no external references; heap abandonment, heap teardown and runtime shutdown clear the thread's entries. To release a dropped view's mappings and copied LIST values immediately, call `(.sys.gc)`. C callers can also use `ray_parted_cache_clear()` from `store/part.h` to clear their thread's cache.
+
+### Partitions without a column (ragged tables)
+
+A partition may hold fewer columns than the first one, as long as the columns it has come first in the same order with the same names and types; a column it lacks is a NULL segment for that partition. Such a ragged table reads as the flat table with typed nulls in the missing rows, wherever its rows are read: a select over it (projections, `where:`, `asc:`/`desc:`, `take:`, `by:` and aggregates), `(at table 'col)`, the standalone `take` verb, printing and `show`, and `ser`, whose bytes equal those of the equivalent flat table. The partition-key column's row counts give the missing rows; `BOOL` and `U8`, which have no null, read as `false` and `0`. A parted column met away from its table (through `get` on a column value rather than a query) still contributes no rows for a partition that lacks it.
 
 !!! warning "`update` over a partitioned table materializes in memory"
     `update` on a partitioned table flattens the whole table into memory first — the parted/`MAPCOMMON` columns cannot be mutated in place — so the result is an ordinary in-memory table. It is **not** written back to the store: re-reading the root returns the original values, and the returned table loses its parted / memory-mapped identity.

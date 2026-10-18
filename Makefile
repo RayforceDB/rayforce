@@ -1,4 +1,8 @@
-CC      ?= clang
+# GNU make predefines CC=cc, so ?= cannot select clang as the default.
+# Keep command-line and environment overrides intact.
+ifeq ($(origin CC),default)
+CC = clang
+endif
 # Some targets need clang specifically regardless of $(CC): the fuzzing
 # runtime (-fsanitize=fuzzer) and -MJ compilation-database fragments are
 # clang-only.  Same precedent as `make coverage`, which pins CC=clang.
@@ -25,12 +29,14 @@ VERSION_MAJOR := $(word 1,$(subst ., ,$(RAY_VERSION)))
 VERSION_MINOR := $(word 2,$(subst ., ,$(RAY_VERSION)))
 VERSION_PATCH := $(word 3,$(subst ., ,$(RAY_VERSION)))
 GIT_HASH := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
-# The objects that embed GIT_HASH depend on a stamp rewritten only when the
-# hash changes, so an incremental build after a new commit rebuilds them
-# instead of keeping the previous hash (see GIT_HASH_OBJS below).
-GIT_HASH_STAMP := build/.git-hash
-$(shell mkdir -p build && { [ "$$(cat $(GIT_HASH_STAMP) 2>/dev/null)" = "$(GIT_HASH)" ] || echo "$(GIT_HASH)" > $(GIT_HASH_STAMP); })
 BUILD_DATE := $(shell date -u +%Y-%m-%d)
+# The objects that embed the build information (commit, version, build date)
+# depend on a stamp rewritten only when one of them changes, so an incremental
+# build after a new commit, a RAY_VERSION override or a new day rebuilds them
+# instead of keeping the previous values (see BUILD_INFO_OBJS below).
+BUILD_INFO := $(GIT_HASH) $(RAY_VERSION) $(BUILD_DATE)
+BUILD_INFO_STAMP := build/.build-info
+$(shell mkdir -p build && { [ "$$(cat $(BUILD_INFO_STAMP) 2>/dev/null)" = "$(BUILD_INFO)" ] || echo "$(BUILD_INFO)" > $(BUILD_INFO_STAMP); })
 
 WARNS   = -Wall -Wextra -Werror -Wstrict-prototypes -Wno-unused-parameter
 DEFS    = -DRAYFORCE_GIT_COMMIT=\"$(GIT_HASH)\" -DRAYFORCE_BUILD_DATE=\"$(BUILD_DATE)\" \
@@ -58,6 +64,10 @@ DEBUG_CFLAGS   = -fPIC $(WARNS) -std=$(STD) -g -O0 -march=$(RAY_MARCH) -DDEBUG \
 RELEASE_CFLAGS = -fPIC $(WARNS) -std=$(STD) -O3 -march=$(RAY_MARCH) \
   -funroll-loops -fomit-frame-pointer -fno-math-errno -falign-functions=64 \
   -fassociative-math -ffp-contract=fast -fno-signed-zeros -fno-trapping-math
+# -ffunction-sections/-fdata-sections: isolate code/data so static-library
+#   clients can discard unused sections with linker GC. Keep this library-only:
+#   the server keeps nearly all code live and gains little from these flags.
+LIB_CFLAGS = $(RELEASE_CFLAGS) -ffunction-sections -fdata-sections
 # -falign-functions=64: start every function on a cache line.  The default
 #   16-byte alignment makes hot leaf functions' cost depend on where unrelated
 #   edits elsewhere in the same translation unit happen to push them —
@@ -175,6 +185,7 @@ TEST_OBJ = $(TEST_SRC:.c=.o)
 
 # Per-flavour object lists (see the flavour CFLAGS block above).
 REL_LIB_OBJ   = $(LIB_SRC:.c=.rel.o)
+LIB_LIB_OBJ   = $(LIB_SRC:.c=.lib.o)
 REL_MAIN_OBJ  = $(MAIN_SRC:.c=.rel.o)
 FUZZ_LIB_OBJ  = $(LIB_SRC:.c=.fuzz.o)
 TSAN_LIB_OBJ  = $(LIB_SRC:.c=.tsan.o)
@@ -193,7 +204,7 @@ RELT_TEST_OBJ = $(TEST_SRC:.c=.reltest.o)
 # them here would let a .d's first rule (e.g. `foo.o: ...`) become the
 # default goal, so bare `make` would build one object instead of `debug`.
 DEPS = $(LIB_OBJ:.o=.d) $(MAIN_OBJ:.o=.d) $(TEST_OBJ:.o=.d) \
-       $(REL_LIB_OBJ:.o=.d) $(REL_MAIN_OBJ:.o=.d) \
+       $(REL_LIB_OBJ:.o=.d) $(REL_MAIN_OBJ:.o=.d) $(LIB_LIB_OBJ:.o=.d) \
        $(FUZZ_LIB_OBJ:.o=.d) \
        $(TSAN_LIB_OBJ:.o=.d) $(TSAN_MAIN_OBJ:.o=.d) $(TSAN_TEST_OBJ:.o=.d) \
        $(HARD_LIB_OBJ:.o=.d) $(HARD_MAIN_OBJ:.o=.d) \
@@ -209,6 +220,9 @@ default: debug
 
 %.rel.o: %.c
 	$(CC) -c $(RELEASE_CFLAGS) $(FP_STRICT_$*) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
+
+%.lib.o: %.c
+	$(CC) -c $(LIB_CFLAGS) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
 
 %.fuzz.o: %.c
 	$(CLANG) -c $(FUZZ_CFLAGS) $(FP_STRICT_$*) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
@@ -233,12 +247,12 @@ default: debug
 %.reltest.o: %.c
 	$(CC) -c $(RELEASE_CFLAGS) -DDEBUG $(FP_STRICT_$*) $(if $(filter test/%,$<),$(STRICT_FP_CFLAGS) -Itest) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
 
-# Sources that embed GIT_HASH (ray_git_commit, the REPL and crash banners,
-# and the test that compares ray_git_commit against it), in every object
-# flavour.
-GIT_HASH_SRCS := src/core/types src/app/repl src/core/crash test/test_types
-GIT_HASH_OBJS := $(foreach v,.o .rel.o .fuzz.o .tsan.o .hard.o .ndebug.o .reltest.o,$(addsuffix $(v),$(GIT_HASH_SRCS)))
-$(GIT_HASH_OBJS): $(GIT_HASH_STAMP)
+# Sources that embed the build information (ray_git_commit and the version
+# accessors, the REPL and crash banners, .sys.build, and the test that compares
+# ray_git_commit against GIT_HASH), in every object flavour.
+BUILD_INFO_SRCS := src/core/types src/app/repl src/core/crash src/ops/system test/test_types
+BUILD_INFO_OBJS := $(foreach v,.o .rel.o .lib.o .fuzz.o .tsan.o .hard.o .ndebug.o .reltest.o,$(addsuffix $(v),$(BUILD_INFO_SRCS)))
+$(BUILD_INFO_OBJS): $(BUILD_INFO_STAMP)
 
 # Main binary for debug/test (some tests spawn ./$(TARGET) as a server).
 $(TARGET): $(LIB_OBJ) $(MAIN_OBJ)
@@ -255,8 +269,9 @@ release: $(REL_LIB_OBJ) $(REL_MAIN_OBJ)
 	$(CC) $(RELEASE_CFLAGS) -o $(TARGET) $(REL_LIB_OBJ) $(REL_MAIN_OBJ) $(LIBS) $(RELEASE_LDFLAGS)
 
 # Static library
-lib: $(REL_LIB_OBJ)
-	$(AR) rc lib$(TARGET).a $(REL_LIB_OBJ)
+lib: $(LIB_LIB_OBJ)
+	rm -f lib$(TARGET).a
+	$(AR) rc lib$(TARGET).a $(LIB_LIB_OBJ)
 
 # Release tarball: build the optimized binary and package it as
 # dist/rayforce-<version>-<os>-<arch>.tar.gz plus a SHA-256 checksum.
@@ -417,8 +432,9 @@ compdb:
 # The system toolchain on macOS does not ship the fuzzer runtime, so
 # these targets are Linux-only by design; CI gates them to ubuntu.
 FUZZ_RUNTIME ?= 60
+FUZZ_CORPUS_ROOT ?= fuzz/corpus
 FUZZ_OPTS     = -rss_limit_mb=4096 -timeout=10 -max_len=65536 -print_final_stats=1
-FUZZ_TARGETS  = parse numparse de eval csv journal parquet
+FUZZ_TARGETS  = parse numparse de eval csv journal parquet select_merge
 # Escape hatch for hosts where clang auto-selects a gcc toolchain dir that
 # lacks libstdc++ (e.g. a partially-installed newer gcc shadowing the real
 # one).  Normally empty; set on such a box, e.g.
@@ -447,14 +463,14 @@ build_fuzz/fuzz_%: fuzz/fuzz_%.c $(FUZZ_LIB_OBJ)
 .PRECIOUS: build_fuzz/fuzz_%
 
 fuzz-%: build_fuzz/fuzz_%
-	@mkdir -p fuzz/corpus/$*
+	@mkdir -p "$(FUZZ_CORPUS_ROOT)/$*"
 	@dict=$(DICT_$*); \
 	 dictopt=$${dict:+-dict=fuzz/dict/$$dict.dict}; \
 	 seeds=$$( [ -d fuzz/seeds/$* ] && echo fuzz/seeds/$* ); \
 	 set -x; \
 	 ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 \
 	 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
-	   ./build_fuzz/fuzz_$* fuzz/corpus/$* $$seeds \
+	   ./build_fuzz/fuzz_$* "$(FUZZ_CORPUS_ROOT)/$*" $$seeds \
 	   $$dictopt $(FUZZ_OPTS) -max_total_time=$(FUZZ_RUNTIME)
 
 # Short smoke pass for PR CI — a healthy corpus finds nothing new in a
@@ -504,7 +520,7 @@ cppcheck:
 .PHONY: tidy cppcheck
 
 clean:
-	-rm -f $(LIB_OBJ) $(MAIN_OBJ) $(TEST_OBJ) $(REL_LIB_OBJ) $(REL_MAIN_OBJ)
+	-rm -f $(LIB_OBJ) $(MAIN_OBJ) $(TEST_OBJ) $(REL_LIB_OBJ) $(REL_MAIN_OBJ) $(LIB_LIB_OBJ)
 	-rm -f $(FUZZ_LIB_OBJ) $(TSAN_LIB_OBJ) $(TSAN_MAIN_OBJ) $(TSAN_TEST_OBJ) \
 	       $(HARD_LIB_OBJ) $(HARD_MAIN_OBJ) \
 	       $(NDEBUG_LIB_OBJ) $(NDEBUG_MAIN_OBJ) $(NDEBUG_TEST_OBJ) \

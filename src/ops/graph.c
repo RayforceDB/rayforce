@@ -143,7 +143,7 @@ void ray_graph_free(ray_graph_t* g) {
     if (!g) return;
 
     ray_graph_binds_free(g);
-    if (g->compile_err) { ray_release(g->compile_err); g->compile_err = NULL; }
+    if (g->compile_err) { ray_error_free(g->compile_err); g->compile_err = NULL; }   /* errors are not refcounted */
 
     /* Unconsumed slice-group hint (error paths / shapes that never
      * reached exec_group). */

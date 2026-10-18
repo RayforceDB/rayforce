@@ -15,6 +15,7 @@ runtime).
 | `fuzz_csv`      | `ray_read_csv*`        | CSV reader (input via memfd) |
 | `fuzz_journal`  | `ray_journal_validate` / `ray_journal_replay` | journal framing walk + replay |
 | `fuzz_parquet`  | `ray_parquet_open` / `ray_parquet_next` | footer, page, encoding and optional index parsers |
+| `fuzz_select_merge` | nested `select` vs materialized `select` | two/three-layer queries, nullable numeric/SYM/STR columns, serialized results and errors |
 
 The journal log is a sequence of IPC frames verbatim, so the `de` corpus also
 hardens journal replay's decode step.
@@ -37,15 +38,32 @@ input has no such construct.
 make fuzz-parse                 # 60s (default) run of one target
 make fuzz-parse FUZZ_RUNTIME=0  # run until a crash / Ctrl-C
 make fuzz-smoke                 # short pass over the fast targets (PR CI gate)
+make fuzz-select_merge FUZZ_RUNTIME=600 # structured nested-query differential check
 ```
 
+`select_merge` generates two/three-layer queries and compares them with the
+same queries wrapped in `do` to force inner materialization. It checks serialized
+results and error codes, allowing relative/absolute tolerance `1e-12` only for
+F64 aggregate values (fusion changes addition order). Row expressions, schema,
+order and null metadata still compare exactly.
+The generator also covers extreme F64 values and tables of 8,191, 8,192,
+16,385 and 131,073 rows. Run `RAY_FUZZ_CORES=4 make fuzz-select_merge` to
+exercise parallel execution; the default remains serial for deterministic
+coverage. `RAY_FUZZ_CORES` is read only by this fuzz driver. The generator
+includes products of two independent F64 columns, squares, nested products,
+and scalar/grouped reductions. PR CI runs this target for one minute each in
+serial and four-worker modes, each with a fresh corpus and the committed seeds.
+This leaves time for mutations instead of spending the whole short run replaying
+the growing cache. Its nightly campaign uses four workers and a cached corpus.
+
 `fuzz-smoke` covers `parse`, `numparse`, and `de` (the fast, stateless
-targets); `eval`, `csv`, and `journal` run in the nightly `fuzz-long` job
+targets); `eval`, `csv`, `journal`, and `select_merge` run in the nightly `fuzz-long` job
 (`.github/workflows/nightly.yml`), 15 minutes each over a cached corpus.
 
-Grown corpora live in `fuzz/corpus/<target>/` (gitignored); committed starter
-inputs live in `fuzz/seeds/<target>/`.  Regenerate the working corpora from the
-test suite before a session:
+Grown corpora live in `fuzz/corpus/<target>/` (gitignored); override the root with
+`FUZZ_CORPUS_ROOT=/path/to/corpus` to use a separate working corpus. Committed
+starter inputs in `fuzz/seeds/<target>/` are included with either root.
+Regenerate the working corpora from the test suite before a session:
 
 ```sh
 scripts/fuzz-seed-parse.sh      # parse/eval inputs from test/rfl

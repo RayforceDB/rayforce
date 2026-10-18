@@ -190,12 +190,7 @@ static bool ei_child_ok(const ray_t* c, int8_t type, int64_t n) {
     return c && !RAY_IS_ERR(c) && c->type == type && c->len == n;
 }
 
-ray_t* ray_enc_index_write(FILE* f, const ray_enc_idx_src_t* s, uint64_t* bytes) {
-    *bytes = 0;
-    if (!ray_enc_gen2_supported()) EI_NYI("index region: generation 2 needs a little-endian host");
-    if (!s->root || RAY_IS_ERR(s->root) || s->root->type != RAY_INDEX)
-        return ray_error("type", "index region: not an index object");
-    const ray_index_t* ix = ray_index_payload((ray_t*)s->root);
+static ray_t* ei_index_write(FILE* f, const ray_enc_idx_src_t* s, const ray_index_t* ix, uint64_t* bytes) {
     uint8_t kind = ix->kind;
     if (!ray_enc_idx_kind_has_region(kind))
         EI_NYI("index region: kind %u has no region", kind);
@@ -317,6 +312,29 @@ ray_t* ray_enc_index_write(FILE* f, const ray_enc_idx_src_t* s, uint64_t* bytes)
     if (!ei_zero(f, L.end, &pos)) return ray_error("io", "index region: short write");
     *bytes = pos;
     return NULL;
+}
+
+ray_t* ray_enc_index_write(FILE* f, const ray_enc_idx_src_t* s, uint64_t* bytes) {
+    *bytes = 0;
+    if (!ray_enc_gen2_supported()) EI_NYI("index region: generation 2 needs a little-endian host");
+    if (!s->root || RAY_IS_ERR(s->root) || s->root->type != RAY_INDEX)
+        return ray_error("type", "index region: not an index object");
+    const ray_index_t* ix = ray_index_payload((ray_t*)s->root);
+    if (ix->kind != RAY_IDX_HASH) return ei_index_write(f, s, ix, bytes);
+    /* A HASH region stores the generation-1 layout (I64 arrays, the low-bits
+     * home rule, groups by first occurrence): an index built narrow or under
+     * the high-bits rule (RAY_MARK_HASH_HIGH) is written as that layout, so
+     * the region's bytes do not depend on the builder. */
+    ray_index_t lx = *ix;
+    if (!ray_index_hash_legacy(ix, &lx.u.hash.table, &lx.u.hash.gkeys, &lx.u.hash.offs, &lx.u.hash.rows))
+        return ei_index_write(f, s, ix, bytes);   /* no arrays to lay out: the writer's own refusal */
+    lx.markers &= (uint8_t)~RAY_MARK_HASH_HIGH;
+    ray_t* err = ei_index_write(f, s, &lx, bytes);
+    ray_release(lx.u.hash.table);
+    ray_release(lx.u.hash.gkeys);
+    ray_release(lx.u.hash.offs);
+    ray_release(lx.u.hash.rows);
+    return err;
 }
 
 /* ===== DICT (P6b, spec "Index region": DICT) =====

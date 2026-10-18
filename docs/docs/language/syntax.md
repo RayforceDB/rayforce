@@ -74,14 +74,24 @@ end of its month is normalized by the calendar rather than rejected, so
 ### Times
 
 Time-of-day literals in HH:MM:SS.mmm format. Stored as milliseconds since midnight (i32).
+Values past 24 hours and negative values are valid; for the range, and what an
+out-of-range result becomes, see [Date/Time types](../guides/types.md#date-time).
 
 ```lisp
 09:30:00.000  ; 9:30 AM
 14:15:30.500  ; 2:15:30.5 PM
 ```
 
-Hours must be `0`-`23`, minutes and seconds `0`-`59`; out-of-range
-components are a parse error.
+A time literal has two hour digits, `00`-`99`, and two digits each for
+minutes and seconds. Minutes and seconds past `59` carry into the next unit,
+the way a day past the end of its month does for dates, so `01:60:00.000`
+parses as `02:00:00.000`. A leading `-` makes the time negative
+(`-01:00:00.000`). The fractional part is optional (`09:30:00` is
+`09:30:00.000`) and is a decimal fraction of a second: one to three digits are
+padded (`09:30:00.5` is `09:30:00.500`), and digits past the third are
+dropped. A timestamp literal, the string cast `(as 'time "...")` and the CSV
+reader read it the same way. Times beyond `99:59:59.999` come from arithmetic
+or from `(as 'TIME <ms>)`: `(as 'TIME 2147483647)` is `596:31:23.647`.
 
 ### Timestamps
 
@@ -92,10 +102,13 @@ Full date+time with nanosecond precision. Stored as nanoseconds since 2000-01-01
 2024.01.15D09:30:00.000000000      ; date + time (ns)
 ```
 
-The date and time parts follow the same range rules as above. Because the
-value is a 64-bit nanosecond count from the epoch, timestamps only span
-roughly ±292 years around 2000 (about 1708 to 2292); a year outside that
-range is a parse error.
+The date part follows the date rules above. The time part is stricter than a
+time literal: hours `00`-`23` and minutes and seconds `00`-`59`, anything else
+being a parse error; no leading `-`; and the fractional part is required, with
+one to nine digits read as a decimal fraction (`.5` is half a second; digits
+past the ninth are dropped). Because the value is a 64-bit nanosecond count
+from the epoch, timestamps only span roughly ±292 years around 2000 (about
+1708 to 2292); a year outside that range is a parse error.
 
 ### GUIDs
 
@@ -124,7 +137,11 @@ sentinel for their type:
 (nil? 0Nl)   ; true
 ```
 
-Symbols have no typed null literal (there is no `0Ns`).
+Symbols have no `0N` null literal (there is no `0Ns`). Their null is the
+empty symbol, written as a lone quote `'`, and it works wherever a symbol
+does: `(set s ')`, `(take ' 3)` is `[' ' ']`, `[a ' b]`, `{k: '}`. It prints as
+`'` too, so a printed vector reads back as the same value. The symbol `null`
+is an ordinary symbol, not the null.
 
 `nil?` is element-wise: given a vector or a list it returns a `B8` vector with
 one entry per element, so `(where (nil? v))` and `(sum (as 'I64 (nil? v)))`
@@ -362,8 +379,8 @@ Every `.`-prefixed name is protected: `set`, `let`, lambda parameters, and `del`
   (raise "oops")     ; throws an error
   (fn [e] "caught")) ; handler receives error → "caught"
 
-; Unhandled raise:
-; (raise "custom error") ; error: domain
+; Unhandled raise: the error code, then the raised value
+; (raise "custom error") ; error: domain: custom error
 ```
 
 ## Lambdas & the VM
@@ -386,6 +403,8 @@ User-defined functions are created with `fn`. Lambdas compile lazily to bytecode
 ```
 
 The VM supports trap frames for `try`/`raise` error handling, ensuring exceptions unwind cleanly through compiled code.
+
+A lambda made inside another function is a closure over the locals visible where it was made. A `fn` literal inside a compiled body is compiled once, as a template, when the enclosing function compiles; every closure made from it shares that bytecode and captures only the enclosing locals its body mentions (all of them when the body uses `eval` or `resolve`), so making a closure costs no compilation and its recursion depth does not shrink with the bindings in scope. Its captures are locals of its own body: a `let` of a captured name rebinds it for that call, a capture (or a parameter or `let`) named like a builtin or a special form is the callee, a parameter shadows a capture of its name, `self` inside a closure is the closure itself, and a caller's local of the same name never stands in for a capture. A `let` that has not run leaves its name unbound, in the body and in a closure made after it, so a read of it finds the global of that name or raises a name error, as on the tree walker. Capture is lexical: a closure captures the bindings of the function it is written in, never a caller's locals. A closure body resolves the names it does not capture when it runs, so a global rebound after the closure was made is seen; a lambda made with nothing captured keeps the builtins it names as they were when it compiled. `eval` and `resolve` inside a compiled body see its locals and captures; their arguments run as part of the body. A lazy value is materialized when captured. A body nested deeper than 2048 levels (built at run time; parsed text stops at 1024) is not compiled and runs on the interpreter, whose own depth limit of 512 nested evaluations applies. A closure made by interpreted code (at the top level, by `eval`, or inside a special form the compiler hands to the tree walker) shares a template too, kept per literal and capture set in a per-thread table of 256 entries, so it is born compiled as well; one written inside a query stays on the tree walker and keeps the query's rule for quoted symbols.
 
 ## Select & Update
 

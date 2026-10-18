@@ -21,6 +21,9 @@
  *   SOFTWARE.
  */
 
+#if !defined(_WIN32)
+#define _POSIX_C_SOURCE 200809L  /* setenv / unsetenv */
+#endif
 #include "test.h"
 #include "table/table.h"
 #include <rayforce.h>
@@ -32,7 +35,9 @@
 #include "table/sym.h"
 #include "ops/idxop.h"
 #include "core/runtime.h"
+#include "core/pool.h"      /* the cancelled column finish needs the pool */
 #include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/stat.h>
@@ -2293,7 +2298,181 @@ static test_result_t test_csv_splayed_sentinel_literal(void) {
     PASS();
 }
 
+/* A cancel skips the pool tasks not yet started and the dispatch returns
+ * normally (#716): a .csv.splayed load cancelled while it appends or
+ * finishes its columns must fail with a cancel and leave the previous
+ * generation current, never publish one whose columns missed a chunk or
+ * were never finished.  RAY_CSV_SPLAYED_INJECT places the cancel. */
+static void csv_cancel_write(int64_t rows, int ncols) {
+    FILE* f = fopen(TMP_CSV, "w");
+    if (!f) return;
+    fputs(ncols == 1 ? "a\n" : "a,b,s,n\n", f);
+    for (int64_t i = 0; i < rows; i++) {
+        if (ncols == 1) fprintf(f, "%lld\n", (long long)i);
+        else fprintf(f, "%lld,%lld,text %lld,%lld\n", (long long)i, (long long)(i * 7),
+                     (long long)i, (long long)(rows - i));
+    }
+    fclose(f);
+}
+static test_result_t test_csv_splayed_cancel(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    char dir[128]; snprintf(dir,sizeof(dir),"/tmp/rayforce-csv-cancel-%d",(int)getpid());
+    csv_test_rm_rf(dir);
+    int8_t types[] = {RAY_I64,RAY_I64,RAY_STR,RAY_I64};
+    csv_cancel_write(10, 4);
+    TEST_ASSERT_EQ_I(ray_csv_save_splayed_named_opts(TMP_CSV,',',true,types,4,NULL,0,dir,100000),RAY_OK);
+    /* "append": cancelled from column 0's task, the others run or are
+     * skipped; "skip": the last column misses the chunk; "close": every
+     * finish task is skipped (needs the pool); the single column appends
+     * and finishes in line, so only the load's own checks see the cancel. */
+    ray_pool_t* pool = ray_pool_get();
+    bool par = pool && pool->n_workers > 0;
+    struct { const char* step; int ncols; } cases[] = {
+        {"append",4}, {"skip",4}, {"close",4}, {"append",1},
+    };
+    for (size_t k = 0; k < sizeof(cases) / sizeof(cases[0]); k++) {
+        if (!strcmp(cases[k].step, "close") && !par) continue;
+        csv_cancel_write(5000, cases[k].ncols);
+        setenv("RAY_CSV_SPLAYED_INJECT", cases[k].step, 1);
+        ray_err_t e = ray_csv_save_splayed_named_opts(TMP_CSV,',',true,types,cases[k].ncols,
+                                                      NULL,0,dir,100000);
+        unsetenv("RAY_CSV_SPLAYED_INJECT");
+        ray_clear_interrupt();
+        TEST_ASSERT_FMT(e == RAY_ERR_CANCEL, "%s over %d columns: got %d, expected a cancel",
+                        cases[k].step, cases[k].ncols, (int)e);
+        ray_t* t = ray_read_splayed(dir, NULL);
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        TEST_ASSERT_EQ_I(ray_table_ncols(t), 4);
+        for (int c = 0; c < 4; c++) TEST_ASSERT_EQ_I(ray_table_get_col_idx(t, c)->len, 10);
+        TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_table_get_col_idx(t, 3)))[0], 10);
+        ray_release(t);
+    }
+    /* an uncancelled load still replaces it */
+    csv_cancel_write(5000, 4);
+    TEST_ASSERT_EQ_I(ray_csv_save_splayed_named_opts(TMP_CSV,',',true,types,4,NULL,0,dir,100000),RAY_OK);
+    ray_t* t = ray_read_splayed(dir, NULL);
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    for (int c = 0; c < 4; c++) TEST_ASSERT_EQ_I(ray_table_get_col_idx(t, c)->len, 5000);
+    ray_release(t);
+    csv_test_rm_rf(dir);
+    /* a first write commits in place with its .d: cancelled before it,
+     * it leaves no table behind */
+    csv_cancel_write(5000, 1);
+    setenv("RAY_CSV_SPLAYED_INJECT", "append", 1);
+    ray_err_t e = ray_csv_save_splayed_named_opts(TMP_CSV,',',true,types,1,NULL,0,dir,100000);
+    unsetenv("RAY_CSV_SPLAYED_INJECT");
+    ray_clear_interrupt();
+    TEST_ASSERT_EQ_I(e, RAY_ERR_CANCEL);
+    char schema[160]; snprintf(schema, sizeof(schema), "%s/.d", dir);
+    TEST_ASSERT_TRUE(access(schema, F_OK) != 0);
+    csv_test_rm_rf(dir);
+    unlink(TMP_CSV); ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* A cancel that lands once every column is finished (debug builds raise
+ * one inside the first hash build, RAY_HASH_INJECT=build) still stops the
+ * load: over an existing table the previous generation stays current, and
+ * a first write leaves no table (a directory made beforehand keeps what
+ * else it holds). */
+static test_result_t test_csv_splayed_cancel_hash(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    char dir[128]; snprintf(dir,sizeof(dir),"/tmp/rayforce-csv-hcancel-%d",(int)getpid());
+    csv_test_rm_rf(dir);
+    int8_t types[] = {RAY_I64,RAY_I64};
+    FILE* f = fopen(TMP_CSV, "w"); TEST_ASSERT_NOT_NULL(f);
+    fputs("a,b\n1,2\n3,4\n5,6\n", f); fclose(f);
+    TEST_ASSERT_EQ_I(ray_csv_save_splayed_named_opts(TMP_CSV,',',true,types,2,NULL,0,dir,100000),RAY_OK);
+    f = fopen(TMP_CSV, "w"); TEST_ASSERT_NOT_NULL(f);
+    fputs("a,b\n", f);
+    for (long long i = 0; i < 300000; i++)
+        fprintf(f, "%lld,%lld\n", (i * 7919) % 1000003, (i * 104729 + 7) % 1000003);
+    fclose(f);
+    setenv("RAY_HASH_INJECT", "build", 1);
+    ray_err_t e = ray_csv_save_splayed_named_opts(TMP_CSV,',',true,types,2,NULL,0,dir,100000);
+    unsetenv("RAY_HASH_INJECT");
+    bool cancelled = ray_interrupted();
+    ray_clear_interrupt();
+    if (!cancelled) {
+        csv_test_rm_rf(dir); unlink(TMP_CSV); ray_sym_destroy(); ray_heap_destroy();
+        SKIP("no in-place hash build on this filesystem");
+    }
+    TEST_ASSERT_EQ_I(e, RAY_ERR_CANCEL);
+    ray_t* t = ray_read_splayed(dir, NULL);
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    TEST_ASSERT_EQ_I(ray_table_nrows(t), 3);
+    ray_release(t);
+    csv_test_rm_rf(dir);
+    char schema[160], keep[160];
+    snprintf(schema, sizeof(schema), "%s/.d", dir);
+    snprintf(keep, sizeof(keep), "%s/keep.txt", dir);
+    for (int premade = 0; premade < 2; premade++) {
+        if (premade) {
+            TEST_ASSERT_EQ_I(mkdir(dir, 0755), 0);
+            f = fopen(keep, "w"); TEST_ASSERT_NOT_NULL(f); fputs("foreign\n", f); fclose(f);
+        }
+        setenv("RAY_HASH_INJECT", "build", 1);
+        e = ray_csv_save_splayed_named_opts(TMP_CSV,',',true,types,2,NULL,0,dir,100000);
+        unsetenv("RAY_HASH_INJECT");
+        ray_clear_interrupt();
+        TEST_ASSERT_EQ_I(e, RAY_ERR_CANCEL);
+        TEST_ASSERT_TRUE(access(schema, F_OK) != 0);
+        if (premade) {
+            TEST_ASSERT_TRUE(access(keep, F_OK) == 0);
+            char col[160]; snprintf(col, sizeof(col), "%s/a", dir);
+            TEST_ASSERT_TRUE(access(col, F_OK) != 0);
+        } else {
+            TEST_ASSERT_TRUE(access(dir, F_OK) != 0);
+        }
+    }
+    csv_test_rm_rf(dir);
+    unlink(TMP_CSV); ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* A cancel during the last chunk's appends stops the load before the
+ * symfile flush: the root .sym a staged load shares with the current
+ * generation does not take the cancelled load's vocabulary. */
+static int64_t csv_file_size(const char* path) {
+    struct stat st;
+    return stat(path, &st) == 0 ? (int64_t)st.st_size : -1;
+}
+static test_result_t test_csv_splayed_cancel_symfile(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    char dir[128], sym[160];
+    snprintf(dir,sizeof(dir),"/tmp/rayforce-csv-scancel-%d",(int)getpid());
+    snprintf(sym,sizeof(sym),"%s/.sym",dir);
+    csv_test_rm_rf(dir);
+    int8_t types[] = {RAY_SYM};
+    FILE* f = fopen(TMP_CSV, "w"); TEST_ASSERT_NOT_NULL(f);
+    fputs("s\nalpha\nbeta\nalpha\n", f); fclose(f);
+    for (int run = 0; run < 2; run++)
+        TEST_ASSERT_EQ_I(ray_csv_save_splayed_named_opts(TMP_CSV,',',true,types,1,NULL,0,dir,100000),RAY_OK);
+    int64_t before = csv_file_size(sym);
+    TEST_ASSERT_TRUE(before > 0);
+    f = fopen(TMP_CSV, "w"); TEST_ASSERT_NOT_NULL(f);
+    fputs("s\n", f);
+    for (int i = 0; i < 5000; i++) fprintf(f, "word%05d\n", i);
+    fclose(f);
+    setenv("RAY_CSV_SPLAYED_INJECT", "append", 1);
+    ray_err_t e = ray_csv_save_splayed_named_opts(TMP_CSV,',',true,types,1,NULL,0,dir,100000);
+    unsetenv("RAY_CSV_SPLAYED_INJECT");
+    ray_clear_interrupt();
+    TEST_ASSERT_EQ_I(e, RAY_ERR_CANCEL);
+    TEST_ASSERT_EQ_I(csv_file_size(sym), before);
+    ray_t* t = ray_read_splayed(dir, sym);
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    TEST_ASSERT_EQ_I(ray_table_nrows(t), 3);
+    ray_release(t);
+    csv_test_rm_rf(dir);
+    unlink(TMP_CSV); ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t csv_entries[] = {
+    { "csv/splayed_cancel", test_csv_splayed_cancel, NULL, NULL },
+    { "csv/splayed_cancel_hash", test_csv_splayed_cancel_hash, NULL, NULL },
+    { "csv/splayed_cancel_symfile", test_csv_splayed_cancel_symfile, NULL, NULL },
     { "csv/splayed_sentinel_literal", test_csv_splayed_sentinel_literal, NULL, NULL },
     { "csv/parted_staging", test_csv_parted_staging, NULL, NULL },
     { "csv/parted_zones", test_csv_parted_zones, NULL, NULL },

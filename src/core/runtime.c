@@ -28,6 +28,7 @@
 #include "table/sym.h"
 #include "ops/idxop.h"     /* ray_idx_lazy_clear — the lazy hash cache */
 #include "ops/internal.h"  /* ray_dict_cd_runtime_gone — the group-by DICT code stash */
+#include "store/part.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -288,7 +289,10 @@ static ray_runtime_t* runtime_create_impl(const char* sym_path,
     rt->ram_limit = rt->total_ram;
     {
         int64_t cg = ray_os_cgroup_mem_limit();
-        if (cg > 0 && cg < rt->ram_limit) rt->ram_limit = cg;
+        if (cg > 0 && cg < rt->ram_limit) {
+            rt->ram_limit = cg;
+            ray_os_cgroup_mem_dir(rt->mem_cg, sizeof(rt->mem_cg));
+        }
     }
 
     /* __RUNTIME must be visible before ray_sym_load so the sym-load size
@@ -389,6 +393,10 @@ int64_t ray_sys_ram_limit(void) {
     return __RUNTIME ? __RUNTIME->ram_limit : 0;
 }
 
+void ray_sys_mem_flush(void) {
+    if (__RUNTIME && __RUNTIME->mem_cg[0]) (void)ray_os_cgroup_stat_flush(__RUNTIME->mem_cg);
+}
+
 int8_t ray_obj_type(ray_t* v) {
     return v ? v->type : 0;
 }
@@ -436,6 +444,7 @@ void ray_runtime_destroy(ray_runtime_t* rt) {
     for (int32_t i = 0; i < rt->n_vms; i++) {
         ray_vm_t* vm = rt->vms[i];
         if (vm->raise_val) ray_release(vm->raise_val);
+        if (vm->return_val) ray_release(vm->return_val);
         if (vm->trace) { ray_release(vm->trace); vm->trace = NULL; }
         ray_sys_free(vm);
     }
@@ -461,6 +470,7 @@ void ray_runtime_destroy(ray_runtime_t* rt) {
      * frees a pointer into the dead heap (#865). */
     ray_dict_cd_runtime_gone();
 
+    ray_parted_cache_clear();
     ray_sym_destroy();
     ray_heap_destroy();
 

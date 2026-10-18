@@ -278,45 +278,70 @@ static test_result_t test_large_ragged(void) {
     PASS();
 }
 
-/* A hand-built parted column whose segments do not cover the table's rows
- * (here a missing segment, which ray_read_parted never produces) is refused
- * by the executor, never read past its end. */
-static test_result_t test_short_column_refused(void) {
+/* A hand-built parted column with a missing (NULL) segment, which
+ * ray_read_parted never produces: the executor reads the missing partition
+ * as its rows of nulls (the partition-key counts give them), never past the
+ * column's end.  Every query answers as over the same table with that
+ * segment an all-null vector of the partition's rows. */
+static ray_t* pr_fmt_q(const char* q) {
+    ray_t* r = ray_eval_str(q);
+    if (!r || RAY_IS_ERR(r)) { drop_out(r); return NULL; }
+    ray_t* f = ray_fmt(r, 0);
+    drop_out(r);
+    return f;
+}
+static test_result_t test_missing_segment_nulls(void) {
     TEST_ASSERT_TRUE(write_db(ray_test_tmp(PR_TMP "/hand"), 0, false));
     ray_t* src = load_db(ray_test_tmp(PR_TMP "/hand"));
     TEST_ASSERT_NOT_NULL(src);
     ray_t* b = ray_table_col(src, ray_sym_intern("b", 1));
     TEST_ASSERT_TRUE(b && RAY_IS_PARTED(b->type) && b->len == 3);
-    ray_t* w = ray_alloc(3 * sizeof(ray_t*));
-    TEST_ASSERT_NOT_NULL(w);
-    w->type = b->type; w->len = 3; w->attrs = 0; memset(w->aux, 0, 16);
-    ray_t** ws = (ray_t**)ray_data(w);
-    for (int i = 0; i < 3; i++) {
-        ws[i] = i == 2 ? NULL : ((ray_t**)ray_data(b))[i];
-        if (ws[i]) ray_retain(ws[i]);
+    ray_t* seg2 = ((ray_t**)ray_data(b))[2];
+    TEST_ASSERT_TRUE(seg2 && !RAY_IS_ERR(seg2) && seg2->type != RAY_ENCCOL);
+    ray_t* w[2];
+    for (int k = 0; k < 2; k++) {                       /* 0: the missing segment; 1: its nulls */
+        w[k] = ray_alloc(3 * sizeof(ray_t*));
+        TEST_ASSERT_NOT_NULL(w[k]);
+        w[k]->type = b->type; w[k]->len = 3; w[k]->attrs = 0; memset(w[k]->aux, 0, 16);
+        ray_t** ws = (ray_t**)ray_data(w[k]);
+        for (int i = 0; i < 3; i++) {
+            ws[i] = i == 2 ? NULL : ((ray_t**)ray_data(b))[i];
+            if (ws[i]) ray_retain(ws[i]);
+        }
+        if (k == 1) {
+            ray_t* nv = ray_vec_new(seg2->type, seg2->len);
+            TEST_ASSERT_TRUE(nv && !RAY_IS_ERR(nv));
+            nv->len = seg2->len;
+            for (int64_t r = 0; r < nv->len; r++) ray_vec_set_null(nv, r, true);
+            ws[2] = nv;
+        }
     }
-    ray_t* t = ray_table_new(3);
-    t = ray_table_add_col(t, ray_table_col_name(src, 0), ray_table_col_idx(src, 0));
-    t = ray_table_add_col(t, ray_sym_intern("a", 1), ray_table_col(src, ray_sym_intern("a", 1)));
-    t = ray_table_add_col(t, ray_sym_intern("b", 1), w);
-    ray_release(w);
-    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
-    bind_t(t);
+    ray_t* t[2];
+    for (int k = 0; k < 2; k++) {
+        t[k] = ray_table_new(3);
+        t[k] = ray_table_add_col(t[k], ray_table_col_name(src, 0), ray_table_col_idx(src, 0));
+        t[k] = ray_table_add_col(t[k], ray_sym_intern("a", 1), ray_table_col(src, ray_sym_intern("a", 1)));
+        t[k] = ray_table_add_col(t[k], ray_sym_intern("b", 1), w[k]);
+        ray_release(w[k]);
+        TEST_ASSERT_TRUE(t[k] && !RAY_IS_ERR(t[k]));
+    }
     static const char* const hq[] = {
         "(select {s: (sum b) from: t})",
-        "(select {c: (count a) by: b from: t})",
+        "(select {c: (count a) by: b from: t asc: b})",
         "(select {b: b from: t where: (>= date 2024.01.02)})",
         "(select {a: a b: b from: t})",
         NULL,
     };
     for (int i = 0; hq[i]; i++) {
-        ray_t* r = ray_eval_str(hq[i]);
-        bool err = r && RAY_IS_ERR(r) && strcmp(ray_err_code(r), "length") == 0;
-        drop_out(r);
-        TEST_ASSERT_FMT(err, "%s: refused with length", hq[i]);
+        ray_t* f[2];
+        for (int k = 0; k < 2; k++) { bind_t(t[k]); f[k] = pr_fmt_q(hq[i]); }
+        bool same = f[0] && f[1] && ray_str_len(f[0]) == ray_str_len(f[1]) &&
+                    memcmp(ray_str_ptr(f[0]), ray_str_ptr(f[1]), ray_str_len(f[0])) == 0;
+        for (int k = 0; k < 2; k++) if (f[k]) ray_release(f[k]);
+        TEST_ASSERT_FMT(same, "%s: the missing segment does not read as its nulls", hq[i]);
     }
     bind_t(NULL);
-    ray_release(t); ray_release(src);
+    ray_release(t[0]); ray_release(t[1]); ray_release(src);
     PASS();
 }
 
@@ -750,7 +775,7 @@ const test_entry_t parted_ragged_entries[] = {
     { "parted_ragged/mixed",                test_ragged_mixed,         pr_setup, pr_teardown },
     { "parted_ragged/segments_full",        test_segments_full,        pr_setup, pr_teardown },
     { "parted_ragged/large",                test_large_ragged,         pr_setup, pr_teardown },
-    { "parted_ragged/short_column_refused", test_short_column_refused, pr_setup, pr_teardown },
+    { "parted_ragged/missing_segment_nulls", test_missing_segment_nulls, pr_setup, pr_teardown },
     { "parted_ragged/null_image_shapes",    test_null_image_shapes,    pr_setup, pr_teardown },
     { "parted_ragged/null_image_writer",    test_null_image_is_writer_output, pr_setup, pr_teardown },
     { "parted_ragged/lazy_inherits_gen0",   test_lazy_inherits_gen0,   pr_setup, pr_teardown },

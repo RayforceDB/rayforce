@@ -1,0 +1,47 @@
+;; #752: nesting must preserve aggregate scope, empty-source behavior and schema.
+(set T752 (table [x] (list [1.0 2.0 3.0])))
+(at (select {from:(select {from:T752 x:x q:(- x (avg x))}) where:(> x 1) q:q}) 'q) -- [0.0 1.0]
+(at (select {from:T752 where:(> x 1) q:(- x (avg x))}) 'q) -- [-0.5 0.5]
+
+;; Empty inner source vs nonempty source filtered to zero have distinct behavior.
+(count (select {from:(select {from:T752 where:(> x 9) x:x}) where:(> x 1) s:(sum x)})) -- 0
+(count (select {from:(select {from:T752 where:(> x 1) x:x}) where:(> x 9) s:(sum x)})) -- 1
+
+;; Alias substitution, including earlier inner aliases, preserves values.
+(at (select {from:(select {from:T752 q:(* x 2) r:(+ q 1)}) s:(sum r)}) 's) -- [15.0]
+(at (select {from:(select {from:T752 q:(* x 2)}) where:(> q 3)}) 'q) -- [4.0 6.0]
+(set N752 (table [x] (list [0Nf 1.0 2.0])))
+(at (select {from:(select {from:N752 x:x q:(- x 0.7)}) where:(== x 0Nf) s:(sum q)}) 's) -- [0.0]
+
+;; Overflow creates nulls even though the source has no HAS_NULLS flag.
+(set D754 (table [f] (list [1.7976931348623157e308 -1.7976931348623157e308 1.0])))
+(at (select {from:(select {from:D754 c:(+ f 1e300)}) total:(sum c)}) 'total) -- (at (select {from:(do (select {from:D754 c:(+ f 1e300)})) total:(sum c)}) 'total)
+(at (select {from:(select {from:D754 c:(+ f 1e300)}) total:(avg c)}) 'total) -- (at (select {from:(do (select {from:D754 c:(+ f 1e300)})) total:(avg c)}) 'total)
+
+;; Numeric width and dropped-column errors must survive.
+(set W752 (table [x y] (list (as 'I32 [1 2 3]) [4 5 6])))
+(at (select {from:(select {from:W752 x:x}) take:2}) 'x) -- [1i 2i]
+(select {from:(select {from:W752 x:x}) y:y}) !- schema
+
+;; AND + take over more than one morsel stays on the established path.
+(set I752 (til 20000))
+(set L752 (table [x y] (list I752 (% I752 3))))
+(at (select {from:(select {from:L752 where:(> x 8192)}) where:(== y 1) take:3}) 'x) -- [8194 8197 8200]
+
+;; Admitted rewrites on a table above the size cutoff: combine filters and
+;; preserve empty grouped column output, including its serialized schema.
+(at (select {from:(select {from:L752 where:(< x 100)}) where:(== y 1) by:y total:(sum x)}) 'total) -- [1617]
+(ser (select {from:(select {from:L752 where:(> x 20000)}) by:y x:x})) -- (ser (select {from:(do (select {from:L752 where:(> x 20000)})) by:y x:x}))
+
+;; A lambda source shadows the global table: its rows and types govern planning.
+((fn [L752] (count (select {from:(select {from:L752 where:(> x 5)}) where:(> x 0) s:(sum x)}))) (table [x] (list [1 2 3]))) -- 0
+((fn [L752] (count (select {from:(do (select {from:L752 where:(> x 5)})) where:(> x 0) s:(sum x)}))) (table [x] (list [1 2 3]))) -- 0
+(set F752 (take (table [x] (list [1.0 2.0 3.0])) 10000))
+(set Int752 (take (table [x] (list [9223372036854775807 1 2])) 10000))
+((fn [F752] (ser (select {from:(select {from:F752 q:(* x 2)}) total:(sum q)}))) Int752) -- ((fn [F752] (ser (select {from:(do (select {from:F752 q:(* x 2)})) total:(sum q)}))) Int752)
+
+;; Column products overflow into null lanes before a materialized reduction.
+(set E754 (take (table [f g] (list [1e300 1e10 -1e300 3.0] [1e300 2.0 1e300 4.0])) 10000))
+(at (select {from:(select {from:E754 c:(* f g)}) total:(sum c)}) 'total) -- [50000000030000.0]
+(at (select {from:(select {from:E754 c:(* f g)}) total:(avg c)}) 'total) -- [10000000006.0]
+(ser (select {from:(select {from:E754 c:(* f f)}) total:(sum c)})) -- (ser (select {from:(do (select {from:E754 c:(* f f)})) total:(sum c)}))

@@ -37,6 +37,7 @@ typedef struct {
 #define RAY_FRAME_CAP  64
 #define RAY_SCOPE_LEXICAL 0
 #define RAY_SCOPE_QUERY   1
+#define RAY_SCOPE_CALL    2  /* interpreted named call: stop at globals */
 
 /* One lexical or synthetic query scope frame.  keys/vals start out pointing
  * at the inline arrays and move to heap blocks if the frame grows past
@@ -45,11 +46,42 @@ typedef struct {
 typedef struct {
     int64_t  keys_inline[RAY_FRAME_CAP];
     ray_t*   vals_inline[RAY_FRAME_CAP];
+    uint8_t  rows_inline[RAY_FRAME_CAP];
     int64_t* keys;     /* -> keys_inline, or heap once grown */
     ray_t**  vals;     /* -> vals_inline, or heap once grown */
+    /* Row provenance of each binding while a query runs: 1 derived from
+     * the query's rows (a column, its cell or its group slice, a value
+     * computed from one), 0 not, 2 unknown. */
+    uint8_t* rows;
     int32_t  cap;
     int32_t  count;
     uint8_t  kind;
+    /* A lambda call's frame: a closure made inside the body captures the
+     * bindings down to here and no further.  A caller's locals are not
+     * the body's, whether the body runs compiled or interpreted. */
+    uint8_t  lexical;
+    /* A compiled frame's window around `eval` or `resolve`: it binds the
+     * frame's locals for the text being evaluated, and for nothing that
+     * text calls.  A lookup made by compiled code, or from inside a lambda
+     * called under the window, passes it by. */
+    uint8_t  eval_window;
+    /* RAY_SCOPE_CALL only: the call was made by name, so the body's text
+     * was written outside the query and its literal symbols are literals. */
+    uint8_t  named;
+    /* RAY_SCOPE_CALL only: the query's source table (borrowed, may be
+     * NULL).  Lookups that reach this frame still see its columns before
+     * falling to the globals, as a helper body compiled in a query does;
+     * the query's aliases and locals below the frame stay hidden. */
+    ray_t*   table;
+    /* RAY_SCOPE_CALL only: bindings at this index and above are source
+     * columns bound on demand; earlier ones are a closure's captured
+     * values or the call's parameters. */
+    int32_t  table_from;
+    /* RAY_SCOPE_QUERY only: a serial unique to this frame instance.  A
+     * closure made while it was the innermost query records it with its
+     * captures' row flags; those flags apply only while a frame with this
+     * serial is the innermost query again. */
+    uint32_t serial;
 } ray_scope_frame_t;
 
 /* ===== Per-thread VM =====
@@ -68,6 +100,9 @@ typedef struct {
      * block within the first 32 bytes — ray_sys_alloc data starts at
      * page+32, so offsets 0..31 share one cache line. */
     int32_t          eval_depth;
+    /* Bumped when a conditional tests a vector condition derived from the
+     * active query's rows: the expression needed row-by-row evaluation. */
+    int32_t          rows_cond;
     int32_t          scope_depth;
     bool             restricted; /* -U connection on this stack */
     int32_t          id;
@@ -104,6 +139,10 @@ typedef struct {
     /* ── cold: error paths only */
     ray_t           *trace;      /* error trace list (owned) */
     ray_t           *raise_val;  /* pending (raise x) value (owned) */
+    ray_t           *return_val; /* pending (return x) value (owned) */
+    int32_t          lambda_depth; /* lambda bodies running on this thread
+                                    * (tree-walked calls and VM runs); a
+                                    * `return` outside any is its value */
     ray_err_info_t   err;
     /* ── big: lexical scope stack, own cache lines */
     ray_scope_frame_t scope_stack[RAY_SCOPE_CAP];
@@ -119,6 +158,7 @@ typedef struct ray_runtime_s {
     int32_t          n_vms;
     int64_t          total_ram;    /* total physical RAM, bytes */
     int64_t          ram_limit;    /* min(total_ram, cgroup limit) — default anon watermark */
+    char             mem_cg[512];  /* limiting cgroup's directory; "" = the machine */
     void            *poll;         /* opaque ray_poll_t* — see ray_runtime_(set|get)_poll */
     void            *sys_args;     /* opaque ray_t* dict — see ray_runtime_(set|get)_sys_args */
 } ray_runtime_t;
@@ -130,6 +170,10 @@ extern _Thread_local ray_vm_t *__VM;
 /* Lifecycle */
 ray_runtime_t* ray_runtime_create(int argc, char** argv);
 void           ray_runtime_destroy(ray_runtime_t* rt);
+
+/* Flush the statistics of the cgroup that limits the process
+ * (ray_os_cgroup_stat_flush); nothing outside a limiting cgroup. */
+void ray_sys_mem_flush(void);
 
 /* Main event-loop accessors.  The host (main.c) registers the poll it
  * created; runtime-level builtins read it back through these to avoid

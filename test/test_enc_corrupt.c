@@ -1686,11 +1686,13 @@ static bool fuzz_one(const char* p, const char** bad) {
             /* an accepted region may answer wrongly, never unsafely: every
              * probed row is in bounds and the row list ascends */
             for (int64_t key = 0; key < 8 && !*bad; key++) {
-                const int64_t* rows = NULL; int64_t n = 0;
+                ray_idx_rows_t rows = { NULL, false }; int64_t n = 0;
                 if (ray_index_hash_group(m, key, &rows, &n) != 1) continue;
-                for (int64_t i = 0; i < n && !*bad; i++)
-                    if (rows[i] < 0 || rows[i] >= m->len || (i && rows[i] <= rows[i - 1]))
+                for (int64_t i = 0; i < n && !*bad; i++) {
+                    int64_t ri = ray_idx_rows_at(rows, i);
+                    if (ri < 0 || ri >= m->len || (i && ri <= ray_idx_rows_at(rows, i - 1)))
                         *bad = "hash probe: row out of bounds or out of order";
+                }
             }
         }
         ray_release(c);

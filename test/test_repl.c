@@ -280,6 +280,58 @@ static test_result_t test_repl_run_file_eval_error(void) {
     PASS();
 }
 
+/* Run tmp_rfl_path() through ray_repl_run_file with stderr captured into
+ * out (NUL-terminated, up to cap-1 bytes) and stdout muted.  Returns rc. */
+static int run_file_capture_stderr(char* out, size_t cap) {
+    char path[96];
+    snprintf(path, sizeof path, "/tmp/ray_test_repl_err_%d", (int)getpid());
+    fflush(stdout);
+    fflush(stderr);
+    int saved_out = dup(fileno(stdout));
+    int saved_err = dup(fileno(stderr));
+    int devnull = open("/dev/null", O_WRONLY);
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (devnull >= 0) dup2(devnull, fileno(stdout));
+    if (fd >= 0) dup2(fd, fileno(stderr));
+
+    int rc = ray_repl_run_file(tmp_rfl_path());
+
+    fflush(stdout);
+    fflush(stderr);
+    if (saved_out >= 0) { dup2(saved_out, fileno(stdout)); close(saved_out); }
+    if (saved_err >= 0) { dup2(saved_err, fileno(stderr)); close(saved_err); }
+    if (devnull >= 0) close(devnull);
+    size_t n = 0;
+    if (fd >= 0) {
+        lseek(fd, 0, SEEK_SET);
+        ssize_t r = read(fd, out, cap - 1);
+        if (r > 0) n = (size_t)r;
+        close(fd);
+    }
+    out[n] = '\0';
+    unlink(path);
+    return rc;
+}
+
+/* An uncaught (raise x) prints x after the error code, on the plain path
+ * (top level) and on the traced path (inside a lambda). */
+static test_result_t test_repl_run_file_raise_prints_value(void) {
+    char out[4096];
+
+    TEST_ASSERT_EQ_I(write_rfl("(raise \"order 7 rejected\")\n"), 0);
+    int rc = run_file_capture_stderr(out, sizeof out);
+    TEST_ASSERT_EQ_I(rc, 1);
+    TEST_ASSERT_NOT_NULL(strstr(out, "error: domain: order 7 rejected"));
+
+    TEST_ASSERT_EQ_I(write_rfl("(set f (fn [] (raise [1 2 3])))\n(f)\n"), 0);
+    rc = run_file_capture_stderr(out, sizeof out);
+    TEST_ASSERT_EQ_I(rc, 1);
+    TEST_ASSERT_NOT_NULL(strstr(out, "domain: [1 2 3]"));
+
+    unlink_rfl();
+    PASS();
+}
+
 /* Empty file: ray_repl_run_file shortcircuits (nread == 0 path) and
  * returns 0 without calling parse/eval. */
 static test_result_t test_repl_run_file_empty(void) {
@@ -2320,6 +2372,20 @@ static test_result_t test_repl_run_piped_overflow_inner_drain(void) {
  * close the master from the parent — slave's read returns EIO (-1), so
  * ray_term_getc returns -1, sz <= 0 && sz != -2 → break (line 959). */
 #ifndef RAY_OS_WINDOWS
+/* A child that outlives the PTY master: its stderr off the PTY.  Once the
+ * master is closed nobody can read what the child writes there, and its
+ * leak check at exit writes there all the same — after a fork it warns
+ * that the parent's threads, still in its thread registry, were not
+ * suspended.  Older sanitizer runtimes (GCC 9) treat the failed write as
+ * fatal and kill the process from the leak checker's tracer (SIGKILL).
+ * The child's verdict is still its exit status. */
+static void pty_child_stderr_off(void) {
+    int fd = open("/dev/null", O_WRONLY);
+    if (fd < 0) return;
+    dup2(fd, STDERR_FILENO);
+    close(fd);
+}
+
 static int run_pty_nopoll_master_close(void)
 {
     int master_fd = -1;
@@ -2331,6 +2397,7 @@ static int run_pty_nopoll_master_close(void)
          * ray_term_getc sees EIO and returns ≤0, triggering the break at
          * line 959 in the no-poll loop. */
         signal(SIGHUP, SIG_IGN);
+        pty_child_stderr_off();
         ray_runtime_create(0, NULL);
         /* No poll — uses blocking fallback loop. */
         ray_repl_t* repl = ray_repl_create(NULL);
@@ -2534,6 +2601,7 @@ static int run_pty_remote_master_close(uint16_t server_port)
         /* Ignore SIGHUP so the child survives the PTY master close long
          * enough for ray_term_getc to see EIO and take the sz<=0 path. */
         signal(SIGHUP, SIG_IGN);
+        pty_child_stderr_off();
         ray_runtime_create(0, NULL);
         ray_poll_t* poll = ray_poll_create();
         ray_repl_t* repl = ray_repl_create(poll);
@@ -2606,7 +2674,7 @@ static test_result_t test_repl_pty_remote_master_close(void) {
     }
     int rc = run_pty_remote_master_close(s.port);
     repl_stop_server(&s);
-    TEST_ASSERT_FMT(rc == 0 || rc == -1 || rc == -2 || rc == -9,
+    TEST_ASSERT_FMT(rc == 0 || rc == -1 || rc == -2,
                     "unexpected child exit: %d", rc);
 #endif
     PASS();
@@ -2935,41 +3003,80 @@ static test_result_t test_repl_pty_ctrl_c_during_lazy_materialize(void) {
 }
 
 #if defined(__linux__)
-/* Run the real launcher in piped REPL mode and count its live task threads.
- * /proc/self/task observes the exact process-wide total, so this catches both
+/* Share command capture and subprocess-status handling across launcher tests. */
+static int run_cli_capture(const char* command, char* output, size_t capacity,
+                           int* status_out) {
+    if (!command || !output || capacity < 2 || !status_out) return -1;
+    FILE* pipe = popen(command, "r");
+    if (!pipe) return -2;
+    size_t used = fread(output, 1, capacity - 1, pipe);
+    output[used] = '\0';
+    *status_out = pclose(pipe);
+    return *status_out == -1 ? -3 : 0;
+}
+
+/* /proc/self/task observes the exact process-wide total, so this catches both
  * the ordinary off-by-one and the -c 1 collision with the pool's auto mode. */
-static int run_cli_task_count(unsigned cores, long* out_count) {
-    char command[256];
+static int run_cli_task_count(const char* cores, long* out_count) {
+    char command[256], output[512];
+    int status;
     snprintf(command, sizeof(command),
              "printf '(count (.fs.list \"/proc/self/task\"))\\n'"
-             " | ./rayforce -c %u -i", cores);
-
-    FILE* pipe = popen(command, "r");
-    if (!pipe) return -1;
-
-    char line[128];
-    bool have_line = fgets(line, sizeof(line), pipe) != NULL;
-    int status = pclose(pipe);
-    if (!have_line || status == -1 || !WIFEXITED(status) ||
-        WEXITSTATUS(status) != 0)
-        return -2;
-
+             " | ./rayforce -c %s -i 2>&1", cores);
+    if (run_cli_capture(command, output, sizeof(output), &status) != 0 ||
+        !WIFEXITED(status) || WEXITSTATUS(status) != 0 ||
+        strstr(output, "ray_pool_init_total") != NULL ||
+        strstr(output, "heap-ID pool exhausted") != NULL)
+        return -1;
     char* end = NULL;
-    long count = strtol(line, &end, 10);
-    if (end == line) return -3;
+    long count = strtol(output, &end, 10);
+    if (end == output) return -2;
     *out_count = count;
     return 0;
 }
 
 static test_result_t test_repl_cli_cores_are_total(void) {
     long count = 0;
-    int rc = run_cli_task_count(1, &count);
+    int rc = run_cli_task_count("1", &count);
     TEST_ASSERT_FMT(rc == 0, "-c 1 launcher probe failed: %d", rc);
     TEST_ASSERT_FMT(count == 1, "-c 1 created %ld total threads", count);
 
-    rc = run_cli_task_count(3, &count);
+    rc = run_cli_task_count("3", &count);
     TEST_ASSERT_FMT(rc == 0, "-c 3 launcher probe failed: %d", rc);
     TEST_ASSERT_FMT(count == 3, "-c 3 created %ld total threads", count);
+
+    rc = run_cli_task_count("007", &count);
+    TEST_ASSERT_FMT(rc == 0, "-c 007 launcher probe failed: %d", rc);
+    TEST_ASSERT_FMT(count == 7, "-c 007 created %ld total threads", count);
+
+    rc = run_cli_task_count("1023", &count);
+    TEST_ASSERT_FMT(rc == 0, "-c 1023 launcher probe failed: %d", rc);
+    TEST_ASSERT_FMT(count == 1023, "-c 1023 created %ld total threads", count);
+    PASS();
+}
+
+static test_result_t test_repl_cli_cores_reject_malformed(void) {
+    const struct { const char* args; const char* token; } bad[] = {
+        { "-c -1", "-1" },
+        { "-c +4", "+4" },
+        { "-c 1024", "1024" },
+        { "-t 1abc", "1abc" },
+        { "-Q 0abc", "0abc" },
+    };
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        char command[256], output[512];
+        int status;
+        snprintf(command, sizeof command,
+                 "./rayforce %s </dev/null 2>&1", bad[i].args);
+        int rc = run_cli_capture(command, output, sizeof(output), &status);
+        TEST_ASSERT_FMT(rc == 0 && WIFEXITED(status) &&
+                            WEXITSTATUS(status) == 2,
+                        "%s exited with status %d and output %s", bad[i].args,
+                        status, output);
+        TEST_ASSERT_FMT(strstr(output, "error:") != NULL &&
+                            strstr(output, bad[i].token) != NULL,
+                        "%s was not clearly rejected: %s", bad[i].args, output);
+    }
     PASS();
 }
 #endif
@@ -2979,12 +3086,14 @@ static test_result_t test_repl_cli_cores_are_total(void) {
 const test_entry_t repl_entries[] = {
 #if defined(__linux__)
     { "repl/cli/cores_are_total",       test_repl_cli_cores_are_total,       NULL,       NULL          },
+    { "repl/cli/cores_reject_malformed", test_repl_cli_cores_reject_malformed, NULL,       NULL          },
 #endif
     /* file-batch entrypoint — ray_repl_run_file */
     { "repl/run_file/happy",            test_repl_run_file_happy,            repl_setup, repl_teardown },
     { "repl/run_file/multi_form",       test_repl_run_file_multi_form,       repl_setup, repl_teardown },
     { "repl/run_file/parse_error",      test_repl_run_file_parse_error,      repl_setup, repl_teardown },
     { "repl/run_file/eval_error",       test_repl_run_file_eval_error,       repl_setup, repl_teardown },
+    { "repl/run_file/raise_prints_value", test_repl_run_file_raise_prints_value, repl_setup, repl_teardown },
     { "repl/run_file/empty",            test_repl_run_file_empty,            repl_setup, repl_teardown },
     { "repl/run_file/comments_only",    test_repl_run_file_comments_only,    repl_setup, repl_teardown },
     { "repl/run_file/nonexistent",      test_repl_run_file_nonexistent,      repl_setup, repl_teardown },

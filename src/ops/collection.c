@@ -24,6 +24,7 @@
 /*  Collection / higher-order builtins — extracted from eval.c  */
 
 #include "lang/internal.h"
+#include "lang/env.h"
 #include "core/types.h"
 #include "core/pool.h"
 #include "ops/hash.h"
@@ -52,6 +53,7 @@
  * ══════════════════════════════════════════ */
 
 #define HS_EMPTY ((int64_t)-1)
+#define HS_NULL_CLASSES 32
 
 typedef struct hashset_t {
     int64_t* slots;        /* cap entries; -1 = empty, else row index */
@@ -59,8 +61,11 @@ typedef struct hashset_t {
     int64_t  cap;          /* power of 2 */
     int64_t  mask;         /* cap - 1 */
     int64_t  count;        /* live entries (excl. null bucket) */
-    int      null_seen;    /* 1 if any null has been recorded */
-    int64_t  null_idx;     /* row index of first null encountered */
+    /* First null row of each null class (hs_null_class): nulls equal one
+     * another only within a class, as atom_eq has it. */
+    int      n_null;
+    int8_t   null_cls[HS_NULL_CLASSES];
+    int64_t  null_at[HS_NULL_CLASSES];
     /* Cached typed-vec data pointers to avoid re-derefs in hot loops. */
     ray_t*   src;          /* source vec or list */
     int8_t   src_type;     /* ray_t.type */
@@ -243,6 +248,15 @@ static inline int hs_row_is_null(ray_t* src, int64_t i, void* data) {
     return ray_vec_may_have_nulls(src) && ray_vec_is_null(src, i);
 }
 
+/* The class of a null row: two nulls are equal when two values of their
+ * types can be — the same type, or both numeric (atom_eq).  A LIST cell
+ * carries its own type; a missing cell is the untyped null. */
+static int8_t hs_null_class(ray_t* src, int64_t i, void* data) {
+    if (src->type != RAY_LIST) return ray_null_class(src->type);
+    ray_t* e = ((ray_t**)data)[i];
+    return e ? ray_null_class(e->type) : RAY_NULL;
+}
+
 static bool hashset_init(hashset_t* hs, ray_t* src, int64_t hint) {
     int64_t cap = 16;
     /* Cap target: 2× hint to keep load factor under 0.5. */
@@ -254,8 +268,7 @@ static bool hashset_init(hashset_t* hs, ray_t* src, int64_t hint) {
     hs->cap = cap;
     hs->mask = cap - 1;
     hs->count = 0;
-    hs->null_seen = 0;
-    hs->null_idx = HS_EMPTY;
+    hs->n_null = 0;
     hs->src = src;
     hs->src_type = src ? src->type : 0;
     hs->src_has_nulls = src ? ray_vec_may_have_nulls(src) : false;
@@ -343,8 +356,12 @@ hashset_scan(hashset_t* hs, ray_t* probe_src, int64_t probe_i,
 
 static int64_t hashset_find_xrow(hashset_t* hs, ray_t* probe_src, int64_t probe_i,
                                   int8_t probe_type, void* probe_data) {
-    if (hs_row_is_null(probe_src, probe_i, probe_data))
-        return hs->null_seen ? hs->null_idx : HS_EMPTY;
+    if (hs_row_is_null(probe_src, probe_i, probe_data)) {
+        int8_t c = hs_null_class(probe_src, probe_i, probe_data);
+        for (int k = 0; k < hs->n_null; k++)
+            if (hs->null_cls[k] == c) return hs->null_at[k];
+        return HS_EMPTY;
+    }
     /* sym-domain Phase 2: SYM-vec vs SYM-vec probes across DIFFERENT
      * domains cannot compare (or hash) raw ids.  Re-express the probe
      * cell in the build side's domain once, then run the standard raw
@@ -459,9 +476,12 @@ static void distinct_sort_indices(ray_t* src, int64_t* idx, int64_t count) {
  * the set silently keeps the previous capacity (caller proceeds). */
 static bool hashset_insert(hashset_t* hs, int64_t i) {
     if (hs_row_is_null(hs->src, i, hs->src_data)) {
-        if (hs->null_seen) return false;
-        hs->null_seen = 1;
-        hs->null_idx = i;
+        int8_t c = hs_null_class(hs->src, i, hs->src_data);
+        for (int k = 0; k < hs->n_null; k++)
+            if (hs->null_cls[k] == c) return false;
+        if (hs->n_null == HS_NULL_CLASSES) return false;  /* cannot happen */
+        hs->null_cls[hs->n_null] = c;
+        hs->null_at[hs->n_null++] = i;
         return true;
     }
     if (hs->count * 2 >= hs->cap) {
@@ -535,6 +555,26 @@ static bool find_needle_side_ok(ray_t* hay, ray_t* nd) {
  * Higher-order functions
  * ══════════════════════════════════════════ */
 
+/* The i-th element of `coll`, a LIST or a typed vector, for one call of an
+ * iterator's function.  A typed vector's element is boxed here, one at a
+ * time, and *owned tells the caller to release it after the call; a LIST's
+ * slot is lent.  Boxing the whole vector up front (unbox_vec_arg) kept every
+ * atom alive for the whole walk, about ten times the vector's memory (#823).
+ * A vector type collection_elem cannot box comes back as an error. */
+static inline ray_t* iter_elem(ray_t* coll, int64_t i, int* owned) {
+    ray_t* e = collection_elem(coll, i, owned);
+    if (!e) { *owned = 0; return ray_error("oom", NULL); }
+    return e;
+}
+
+/* An owned reference to the i-th element of `coll`, to seed an accumulator. */
+static ray_t* iter_elem_owned(ray_t* coll, int64_t i) {
+    int owned = 0;
+    ray_t* e = iter_elem(coll, i, &owned);
+    if (!owned && !RAY_IS_ERR(e)) ray_retain(e);
+    return e;
+}
+
 /* (map fn val vec) — apply binary fn(val, elem) to each element of vec.
  * Also supports (map fn vec) for unary mapping. */
 ray_t* ray_map_fn(ray_t** args, int64_t n) {
@@ -543,63 +583,48 @@ ray_t* ray_map_fn(ray_t** args, int64_t n) {
         if (ray_is_lazy(args[i])) args[i] = ray_lazy_materialize(args[i]);
 
     ray_t* fn = args[0];
-    ray_t* _bx = NULL;
+    ray_t* val = NULL;
+    ray_t* coll;
 
     if (n == 2) {
         /* Unary map: (map fn vec) */
-        ray_t* vec = unbox_vec_arg(args[1], &_bx);
-        if (RAY_IS_ERR(vec)) return vec;
-        if (!is_list(vec)) { if (_bx) ray_release(_bx); return ray_error("type", "map: vec arg must be a list, got %s", ray_type_name(vec->type)); }
-        int64_t len = ray_len(vec);
-        ray_t* result = ray_alloc(len * sizeof(ray_t*));
-        if (!result) { if (_bx) ray_release(_bx); return ray_error("oom", NULL); }
-        result->type = RAY_LIST;
-        result->len = len;
-        ray_t** out = (ray_t**)ray_data(result);
-        ray_t** elems = (ray_t**)ray_data(vec);
-        for (int64_t i = 0; i < len; i++) {
-            out[i] = call_fn1(fn, elems[i]);
-            /* Materialise a lazy result (e.g. the lambda returned
-             * (count (distinct x)) — distinct/count of a vec is lazy).  A LIST
-             * of unforced lazy nodes breaks every downstream consumer that
-             * doesn't force per element (sum, ==, +). */
-            if (ray_is_lazy(out[i])) out[i] = ray_lazy_materialize(out[i]);
-            if (RAY_IS_ERR(out[i])) {
-                for (int64_t j = 0; j < i; j++) ray_release(out[j]);
-                result->len = 0; ray_release(result); if (_bx) ray_release(_bx);
-                return out[i];
-            }
-        }
-        if (_bx) ray_release(_bx);
-        return result;
+        coll = args[1];
+        if (RAY_IS_ERR(coll)) return coll;
+        if (!is_collection(coll)) return ray_error("type", "map: vec arg must be a list, got %s", ray_type_name(coll->type));
+    } else {
+        /* Binary map: (map fn val vec) — apply fn(val, elem) */
+        val = args[1];
+        coll = args[2];
+        if (RAY_IS_ERR(coll)) return coll;
+        /* If vec is scalar, just call fn(val, vec) once */
+        if (!is_collection(coll)) return call_fn2(fn, val, coll);
     }
 
-    /* Binary map: (map fn val vec) — apply fn(val, elem) */
-    ray_t* val = args[1];
-    ray_t* vec = unbox_vec_arg(args[2], &_bx);
-    if (RAY_IS_ERR(vec)) return vec;
-    /* If vec is scalar, just call fn(val, vec) once */
-    if (!is_list(vec)) {
-        if (_bx) ray_release(_bx);
-        return call_fn2(fn, val, args[2]);
-    }
-    int64_t len = ray_len(vec);
+    int64_t len = ray_len(coll);
     ray_t* result = ray_alloc(len * sizeof(ray_t*));
-    if (!result) { if (_bx) ray_release(_bx); return ray_error("oom", NULL); }
+    if (!result) return ray_error("oom", NULL);
     result->type = RAY_LIST;
     result->len = len;
     ray_t** out = (ray_t**)ray_data(result);
-    ray_t** elems = (ray_t**)ray_data(vec);
     for (int64_t i = 0; i < len; i++) {
-        out[i] = call_fn2(fn, val, elems[i]);
+        int owned = 0;
+        ray_t* elem = iter_elem(coll, i, &owned);
+        if (RAY_IS_ERR(elem))  out[i] = elem;
+        else if (n == 2)       out[i] = call_fn1(fn, elem);
+        else                   out[i] = call_fn2(fn, val, elem);
+        if (owned) ray_release(elem);
+        /* Materialise a lazy result (e.g. the lambda returned
+         * (count (distinct x)) — distinct/count of a vec is lazy).  A LIST
+         * of unforced lazy nodes breaks every downstream consumer that
+         * doesn't force per element (sum, ==, +). */
         if (ray_is_lazy(out[i])) out[i] = ray_lazy_materialize(out[i]);
         if (RAY_IS_ERR(out[i])) {
+            ray_t* err = out[i];
             for (int64_t j = 0; j < i; j++) ray_release(out[j]);
-            result->len = 0; ray_release(result); if (_bx) ray_release(_bx);
-            return out[i];
+            result->len = 0; ray_release(result);
+            return err;
         }
     }
-    if (_bx) ray_release(_bx);
     return result;
 }
 
@@ -618,49 +643,38 @@ ray_t* ray_fold_fn(ray_t** args, int64_t n) {
         if (ray_is_lazy(args[i])) args[i] = ray_lazy_materialize(args[i]);
 
     ray_t* fn = args[0];
-    ray_t* vec;
+    ray_t* coll = args[n == 2 ? 1 : 2];
+    if (RAY_IS_ERR(coll)) return coll;
+    if (!is_collection(coll)) return ray_error("type", "fold: vec arg must be a list, got %s", ray_type_name(coll->type));
+    int64_t len = ray_len(coll);
     ray_t* acc;
-    ray_t* _bx = NULL;
+    int64_t start;
     if (n == 2) {
         /* (fold fn vec) — use first element as initial value */
-        vec = unbox_vec_arg(args[1], &_bx);
-        if (RAY_IS_ERR(vec)) return vec;
-        if (!is_list(vec)) { if (_bx) ray_release(_bx); return ray_error("type", "fold: vec arg must be a list, got %s", ray_type_name(vec->type)); }
-        int64_t len = ray_len(vec);
-        if (len == 0) { if (_bx) ray_release(_bx); return ray_error("domain", "fold: empty list has no initial value, got %lld", (long long)len); }
-        ray_t** elems = (ray_t**)ray_data(vec);
-        ray_retain(elems[0]);
-        acc = elems[0];
-        for (int64_t i = 1; i < len; i++) {
-            ray_t* next = call_fn2(fn, acc, elems[i]);
-            ray_release(acc);
-            if (RAY_IS_ERR(next)) { if (_bx) ray_release(_bx); return next; }
-            acc = next;
-        }
-        if (_bx) ray_release(_bx);
-        return acc;
+        if (len == 0) return ray_error("domain", "fold: empty list has no initial value, got %lld", (long long)len);
+        acc = iter_elem_owned(coll, 0);
+        if (RAY_IS_ERR(acc)) return acc;
+        start = 1;
+    } else {
+        /* (fold fn init vec) */
+        ray_retain(args[1]);
+        acc = args[1];
+        start = 0;
     }
-
-    /* (fold fn init vec) */
-    ray_retain(args[1]);
-    acc = args[1];
-    vec = unbox_vec_arg(args[2], &_bx);
-    if (RAY_IS_ERR(vec)) { ray_release(acc); return vec; }
-    if (!is_list(vec)) { ray_release(acc); if (_bx) ray_release(_bx); return ray_error("type", "fold: vec arg must be a list, got %s", ray_type_name(vec->type)); }
-    int64_t len = ray_len(vec);
-    ray_t** elems = (ray_t**)ray_data(vec);
-    for (int64_t i = 0; i < len; i++) {
-        ray_t* next = call_fn2(fn, acc, elems[i]);
+    for (int64_t i = start; i < len; i++) {
+        int owned = 0;
+        ray_t* elem = iter_elem(coll, i, &owned);
+        ray_t* next = RAY_IS_ERR(elem) ? elem : call_fn2(fn, acc, elem);
+        if (owned) ray_release(elem);
         ray_release(acc);
-        if (RAY_IS_ERR(next)) { if (_bx) ray_release(_bx); return next; }
+        if (RAY_IS_ERR(next)) return next;
         acc = next;
     }
-    if (_bx) ray_release(_bx);
     return acc;
 }
 
 /* Typed prefix-scan kernels for the native arithmetic operators.  The
- * generic scan below unboxes the vector into a LIST and drives the full
+ * generic scan below boxes each element and drives the full
  * call machinery per element — and, worse, RETURNS a LIST of boxed
  * atoms, so every downstream vector op on the running sums degrades to
  * the boxed paths too (the q28 20-row moving average spent ~13ms on
@@ -858,38 +872,30 @@ ray_t* ray_scan_fn(ray_t** args, int64_t n) {
         ray_t* fast = scan_typed_arith(fn, args[1]);
         if (fast) return fast;
     }
-    ray_t* _bx = NULL;
-    ray_t* vec = unbox_vec_arg(args[1], &_bx);
-    if (RAY_IS_ERR(vec)) return vec;
-    if (!is_list(vec)) { if (_bx) ray_release(_bx); return ray_error("type", "scan: vec arg must be a list, got %s", ray_type_name(vec->type)); }
-    int64_t len = ray_len(vec);
-    if (len == 0) {
-        if (_bx) ray_release(_bx);
-        ray_t* result = ray_alloc(0);
-        if (!result) return ray_error("oom", NULL);
-        result->type = RAY_LIST;
-        result->len = 0;
-        return result;
-    }
+    ray_t* coll = args[1];
+    if (RAY_IS_ERR(coll)) return coll;
+    if (!is_collection(coll)) return ray_error("type", "scan: vec arg must be a list, got %s", ray_type_name(coll->type));
+    int64_t len = ray_len(coll);
 
     ray_t* result = ray_alloc(len * sizeof(ray_t*));
-    if (!result) { if (_bx) ray_release(_bx); return ray_error("oom", NULL); }
+    if (!result) return ray_error("oom", NULL);
     result->type = RAY_LIST;
-    result->len = len;
+    result->len = 0;
+    if (len == 0) return result;
     ray_t** out = (ray_t**)ray_data(result);
-    ray_t** elems = (ray_t**)ray_data(vec);
 
-    ray_retain(elems[0]);
-    out[0] = elems[0];
+    out[0] = iter_elem_owned(coll, 0);
+    if (RAY_IS_ERR(out[0])) { ray_t* err = out[0]; ray_release(result); return err; }
+    result->len = 1;
     for (int64_t i = 1; i < len; i++) {
-        out[i] = call_fn2(fn, out[i - 1], elems[i]);
-        if (RAY_IS_ERR(out[i])) {
-            for (int64_t j = 0; j < i; j++) ray_release(out[j]);
-            result->len = 0; ray_release(result); if (_bx) ray_release(_bx);
-            return out[i];
-        }
+        int owned = 0;
+        ray_t* elem = iter_elem(coll, i, &owned);
+        ray_t* next = RAY_IS_ERR(elem) ? elem : call_fn2(fn, out[i - 1], elem);
+        if (owned) ray_release(elem);
+        if (RAY_IS_ERR(next)) { ray_release(result); return next; }
+        out[i] = next;
+        result->len = i + 1;
     }
-    if (_bx) ray_release(_bx);
     return result;
 }
 
@@ -1054,11 +1060,45 @@ ray_t* ray_apply_fn(ray_t** args, int64_t n) {
  * Collection operations
  * ══════════════════════════════════════════ */
 
+/* atom_eq for a column of a table / dict cell.  A SYM column is read at
+ * its storage width (the vector branch reads 8 bytes a cell) and compared
+ * by text across domains; a STR column by content (a descriptor holds a
+ * pool offset and a cached hash).  Other columns take atom_eq. */
+static int atom_eq_cell_col(ray_t* a, ray_t* b) {
+    if (a->type != b->type || a->len != b->len ||
+        (a->type != RAY_SYM && a->type != RAY_STR))
+        return atom_eq(a, b);
+    if (a->type == RAY_STR) {
+        for (int64_t i = 0; i < a->len; i++) {
+            size_t la = 0, lb = 0;
+            const char* sa = ray_str_vec_get(a, i, &la);
+            const char* sb = ray_str_vec_get(b, i, &lb);
+            if (la != lb || (la && memcmp(sa, sb, la) != 0)) return 0;
+        }
+        return 1;
+    }
+    bool same_dom = ray_sym_vec_domain(a) == ray_sym_vec_domain(b);
+    for (int64_t i = 0; i < a->len; i++) {
+        if (same_dom) {
+            if (ray_read_sym(ray_data(a), i, RAY_SYM, a->attrs) !=
+                ray_read_sym(ray_data(b), i, RAY_SYM, b->attrs)) return 0;
+        } else if (ray_str_cmp(ray_sym_vec_cell(a, i), ray_sym_vec_cell(b, i)) != 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 /* Helper: compare two atoms for equality (value-based) */
 int atom_eq(ray_t* a, ray_t* b) {
     int a_null = RAY_ATOM_IS_NULL(a);
     int b_null = RAY_ATOM_IS_NULL(b);
-    if (a_null && b_null) return 1;
+    /* Two nulls are equal where two values of their types can be: the same
+     * type, or both numeric.  A symbol null, the empty string and an integer
+     * null are different values, as 'a, "a" and 1 are — treating every null
+     * as one collapsed (distinct (list ' "" 0Nl)) to a single cell. */
+    if (a_null && b_null)
+        return ray_null_class(a->type) == ray_null_class(b->type);
     if (a_null || b_null) return 0;
     if (a->type != b->type) {
         if (is_numeric(a) && is_numeric(b))
@@ -1104,6 +1144,34 @@ int atom_eq(ray_t* a, ray_t* b) {
             if (!atom_eq(ea[i], eb[i])) return 0;
         }
         return 1;
+    }
+    case RAY_TABLE: {
+        /* Same column names in order and equal columns.  The vector branch
+         * below compares len * elem_size bytes, zero for a table, so every
+         * pair of same-length tables compared equal (one group for all). */
+        int64_t nc = ray_table_ncols(a);
+        if (nc != ray_table_ncols(b) || ray_table_nrows(a) != ray_table_nrows(b))
+            return 0;
+        for (int64_t c = 0; c < nc; c++) {
+            if (ray_table_col_name(a, c) != ray_table_col_name(b, c)) return 0;
+            ray_t* ca = ray_table_col_idx(a, c);
+            ray_t* cb = ray_table_col_idx(b, c);
+            bool ea = ca && RAY_IS_ERR(ca), eb = cb && RAY_IS_ERR(cb);
+            if (ea) ray_error_free(ca);
+            if (eb) ray_error_free(cb);
+            if (ea || eb) return 0;            /* a column that cannot be read compares unequal */
+            if (!ca || !cb) { if (ca != cb) return 0; continue; }
+            if (!atom_eq_cell_col(ca, cb)) return 0;
+        }
+        return 1;
+    }
+    case RAY_DICT: {
+        /* Equal keys and equal values, position by position (the vector
+         * branch saw every pair of same-length dicts as equal too). */
+        ray_t* ka = ray_dict_keys(a); ray_t* kb = ray_dict_keys(b);
+        ray_t* va = ray_dict_vals(a); ray_t* vb = ray_dict_vals(b);
+        if (!ka || !kb || !va || !vb) return ka == kb && va == vb;
+        return atom_eq_cell_col(ka, kb) && atom_eq_cell_col(va, vb);
     }
     default:
         /* Vector equality: same type and length, element-wise comparison */
@@ -1237,18 +1305,19 @@ ray_t* distinct_vec_eager(ray_t* x) {
     return result;
 }
 
-static ray_t* parted_to_flat_vec(ray_t* x) {
+/* `cnt`/`ncnt` are the partition row counts of the column's table (NULL
+ * when the column is met on its own): a NULL segment, a partition without
+ * the column, then yields its rows as the type's null. */
+static ray_t* parted_to_flat_vec_c(ray_t* x, const int64_t* cnt, int64_t ncnt) {
     if (!x || !RAY_IS_PARTED(x->type)) return ray_error("type", NULL);
     int8_t base = (int8_t)RAY_PARTED_BASETYPE(x->type);
     ray_t** segs = (ray_t**)ray_data(x);
-    int64_t total = 0;
-    for (int64_t s = 0; s < x->len; s++)
-        if (segs[s]) total += segs[s]->len;
+    int64_t total = parted_rows_counted(x, cnt, ncnt);
 
     /* RAY_LIST: share (retain) elements — ray_vec_new rejects type 0 and
      * the per-cell copy below has no notion of nested elements. */
     if (base == RAY_LIST)
-        return parted_flatten_list(segs, x->len, total);
+        return parted_flatten_list_c(segs, x->len, cnt, ncnt);
 
     ray_t* out = ray_vec_new(base, base == RAY_STR ? 0 : total);
     if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
@@ -1257,7 +1326,20 @@ static ray_t* parted_to_flat_vec(ray_t* x) {
     int64_t pos = 0;
     for (int64_t s = 0; s < x->len; s++) {
         ray_t* seg = segs[s];
-        if (!seg) continue;
+        if (!seg) {
+            int64_t n = parted_seg_rows(segs, s, cnt, ncnt);
+            if (base == RAY_STR) {
+                for (int64_t i = 0; i < n; i++) {
+                    out = ray_str_vec_append(out, "", 0);
+                    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+                    ray_vec_set_null(out, pos++, true);
+                }
+            } else {
+                parted_fill_nulls(out, pos, n);
+                pos += n;
+            }
+            continue;
+        }
         for (int64_t i = 0; i < seg->len; i++) {
             if (base == RAY_STR) {
                 size_t slen = 0;
@@ -1279,6 +1361,10 @@ static ray_t* parted_to_flat_vec(ray_t* x) {
         }
     }
     return out;
+}
+
+static ray_t* parted_to_flat_vec(ray_t* x) {
+    return parted_to_flat_vec_c(x, NULL, 0);
 }
 
 /* (distinct x) — remove duplicates. Dispatches on type:
@@ -1371,6 +1457,23 @@ ray_t* ray_distinct_fn(ray_t* x) {
 }
 
 /* (in val vec) — check membership */
+/* One element of a collection left operand.  A string element is one whole
+ * value: the lone-string arms of ray_in_fn answer per character, which is
+ * right for a string atom on its own but not for a row of a collection —
+ * (in ["p" "qq"] (list "qq" "zz")) answered [[false] [false false]].  A
+ * string set (vector) already compares whole strings in ray_in_fn. */
+static ray_t* in_row(ray_t* elem, ray_t* vec) {
+    if (elem->type == -RAY_STR && ray_is_atom(vec))
+        return make_bool(atom_eq(elem, vec) ? 1 : 0);
+    if (elem->type == -RAY_STR && vec->type == RAY_LIST) {
+        ray_t** set = (ray_t**)ray_data(vec);
+        for (int64_t j = 0; j < ray_len(vec); j++)
+            if (atom_eq(elem, set[j])) return make_bool(1);
+        return make_bool(0);
+    }
+    return ray_in_fn(elem, vec);
+}
+
 ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
     if (ray_is_lazy(val)) val = ray_lazy_materialize(val);
     if (ray_is_lazy(vec)) vec = ray_lazy_materialize(vec);
@@ -1398,6 +1501,11 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
         if (flat_vec) ray_release(flat_vec);
         return r;
     }
+    /* A string column's cell, bound for one row of a query, is one value:
+     * the per-character arms below are for a lone string literal. */
+    if (val->type == -RAY_STR && (val->attrs & RAY_ATTR_STR_CELL) &&
+        (ray_is_atom(vec) || vec->type == RAY_LIST))
+        return in_row(val, vec);
     /* STR in STR: for each char of val, check membership in vec string */
     if (ray_is_atom(val) && (-val->type) == RAY_STR && ray_is_atom(vec) && (-vec->type) == RAY_STR) {
         const char* vp = ray_str_ptr(val);
@@ -1443,8 +1551,31 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
     if (is_collection(val) && !ray_is_atom(val)) {
         int64_t vlen = ray_len(val);
         if (vlen == 0) {
-            /* Empty collection → return empty list */
-            return ray_list_new(0);
+            /* No needles: an empty B8, the shape every other left operand
+             * answers — `where` over it must not raise (#785). */
+            return ray_vec_new(RAY_BOOL, 0);
+        }
+        /* A string vector against a string atom or a list: its rows can only
+         * equal the set's string elements, so the set is the string vector
+         * of those and the hash-set path below answers — one probe per row
+         * instead of a boxed cell and a scan of the set per row. */
+        if (val->type == RAY_STR && (vec->type == -RAY_STR || vec->type == RAY_LIST)) {
+            ray_t* sv;
+            if (vec->type == -RAY_STR) {
+                sv = ray_vec_new(RAY_STR, 1);
+                if (sv && !RAY_IS_ERR(sv))
+                    sv = ray_str_vec_append(sv, ray_str_ptr(vec), ray_str_len(vec));
+            } else {
+                ray_t** el = (ray_t**)ray_data(vec);
+                sv = ray_vec_new(RAY_STR, ray_len(vec));
+                for (int64_t j = 0; j < ray_len(vec) && sv && !RAY_IS_ERR(sv); j++)
+                    if (el[j] && el[j]->type == -RAY_STR)
+                        sv = ray_str_vec_append(sv, ray_str_ptr(el[j]), ray_str_len(el[j]));
+            }
+            if (!sv || RAY_IS_ERR(sv)) return sv ? sv : ray_error("oom", NULL);
+            ray_t* r = ray_in_fn(val, sv);
+            ray_release(sv);
+            return r;
         }
         /* Hash-based fast path: both sides are typed vecs of compatible
          * shape and the result is a row-aligned bool vec.  Build a
@@ -1535,52 +1666,53 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
             hashset_destroy(&hs);
             return result;
         }
-        /* Probe first element to check if result is scalar or vector */
-        int alloc0 = 0;
-        ray_t* e0 = collection_elem(val, 0, &alloc0);
-        if (RAY_IS_ERR(e0)) return e0;
-        ray_t* r0 = ray_in_fn(e0, vec);
-        if (alloc0) ray_release(e0);
-        if (RAY_IS_ERR(r0)) return r0;
-        if (ray_is_atom(r0) && r0->type == -RAY_BOOL) {
-            /* All results are scalar bools — use typed bool vector */
-            ray_t* result = ray_vec_new(RAY_BOOL, vlen);
-            if (RAY_IS_ERR(result)) { ray_release(r0); return result; }
-            result->len = vlen;
-            bool* out = (bool*)ray_data(result);
-            out[0] = r0->b8;
-            ray_release(r0);
-            for (int64_t i = 1; i < vlen; i++) {
-                int alloc = 0;
-                ray_t* elem = collection_elem(val, i, &alloc);
-                if (RAY_IS_ERR(elem)) { ray_release(result); return elem; }
-                ray_t* r = ray_in_fn(elem, vec);
-                if (alloc) ray_release(elem);
-                if (RAY_IS_ERR(r)) { ray_release(result); return r; }
-                out[i] = r->b8;
+        /* One verdict per element: a bool vector while every answer is a
+         * bool, a list from the first answer that is not (a nested element
+         * answers a vector).  The verdicts so far are boxed into the list
+         * and collection carries on there. */
+        ray_t* result = ray_vec_new(RAY_BOOL, vlen);
+        if (!result || RAY_IS_ERR(result)) return result ? result : ray_error("oom", NULL);
+        result->len = vlen;
+        int64_t i = 0;
+        for (; i < vlen; i++) {
+            int alloc = 0;
+            ray_t* elem = collection_elem(val, i, &alloc);
+            if (RAY_IS_ERR(elem)) { ray_release(result); return elem; }
+            ray_t* r = in_row(elem, vec);
+            if (alloc) ray_release(elem);
+            if (RAY_IS_ERR(r)) { ray_release(result); return r; }
+            if (!(ray_is_atom(r) && r->type == -RAY_BOOL)) {
+                bool* out = (bool*)ray_data(result);
+                ray_t* lst = ray_list_new(vlen);
+                for (int64_t k = 0; k < i && lst && !RAY_IS_ERR(lst); k++) {
+                    ray_t* b = make_bool(out[k]);
+                    lst = ray_list_append(lst, b);
+                    ray_release(b);
+                }
+                ray_release(result);
+                if (lst && !RAY_IS_ERR(lst)) lst = ray_list_append(lst, r);
                 ray_release(r);
+                if (!lst || RAY_IS_ERR(lst)) return lst ? lst : ray_error("oom", NULL);
+                result = lst;
+                i++;
+                break;
             }
-            return result;
-        } else {
-            /* Results are non-scalar — collect as list */
-            ray_t* result = ray_list_new(vlen);
-            if (RAY_IS_ERR(result)) { ray_release(r0); return result; }
-            result = ray_list_append(result, r0);
-            ray_release(r0);
-            if (RAY_IS_ERR(result)) return result;
-            for (int64_t i = 1; i < vlen; i++) {
-                int alloc = 0;
-                ray_t* elem = collection_elem(val, i, &alloc);
-                if (RAY_IS_ERR(elem)) { ray_release(result); return elem; }
-                ray_t* r = ray_in_fn(elem, vec);
-                if (alloc) ray_release(elem);
-                if (RAY_IS_ERR(r)) { ray_release(result); return r; }
-                result = ray_list_append(result, r);
-                ray_release(r);
-                if (RAY_IS_ERR(result)) return result;
-            }
-            return result;
+            ((bool*)ray_data(result))[i] = r->b8;
+            ray_release(r);
         }
+        if (result->type == RAY_BOOL) return result;
+        for (; i < vlen; i++) {
+            int alloc = 0;
+            ray_t* elem = collection_elem(val, i, &alloc);
+            if (RAY_IS_ERR(elem)) { ray_release(result); return elem; }
+            ray_t* r = in_row(elem, vec);
+            if (alloc) ray_release(elem);
+            if (RAY_IS_ERR(r)) { ray_release(result); return r; }
+            result = ray_list_append(result, r);
+            ray_release(r);
+            if (RAY_IS_ERR(result)) return result;
+        }
+        return result;
     }
     /* Typed vector: search without boxing */
     if (ray_is_vec(vec) && ray_is_atom(val)) {
@@ -1589,10 +1721,10 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
         bool val_null = RAY_ATOM_IS_NULL(val);
         if (has_nulls) {
             for (int64_t i = 0; i < len; i++) {
-                if (ray_vec_is_null(vec, i)) {
-                    if (val_null) return make_bool(1);
-                    continue;
-                }
+                /* Only a null row can match a null needle, and only a null
+                 * of its class (atom_eq): the untyped null or a symbol null
+                 * is not 0Nl.  A non-null needle skips the null rows. */
+                if (ray_vec_is_null(vec, i) != val_null) continue;
                 int alloc = 0;
                 ray_t* elem = collection_elem(vec, i, &alloc);
                 int eq = atom_eq(val, elem);
@@ -1622,6 +1754,88 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
     }
     if (_bx) ray_release(_bx);
     return make_bool(0);
+}
+
+/* Interpreter membership inside queries follows the plan's null-row rule.
+ * Keep ray_in_fn itself context-free: collection operations and the GUID
+ * plan fallback call it directly and apply their own semantics. */
+static ray_t* membership_not(ray_t* r) {
+    if (r->type != RAY_LIST) return ray_not_fn(r);
+    ray_t* out = ray_list_new(r->len);
+    if (!out || RAY_IS_ERR(out)) return out;
+    for (int64_t i = 0; i < r->len; i++) {
+        ray_t* item = membership_not(((ray_t**)ray_data(r))[i]);
+        if (!item || RAY_IS_ERR(item)) { ray_release(out); return item; }
+        out = ray_list_append(out, item);
+        ray_release(item);
+        if (!out || RAY_IS_ERR(out)) return out;
+    }
+    return out;
+}
+
+static ray_t* eval_membership(ray_t* val, ray_t* vec, bool negate) {
+    bool query = ray_env_query_scope_above(0);
+    if (query && (RAY_IS_PARTED(val->type) || val->type == RAY_MAPCOMMON)) {
+        ray_t* flat = val->type == RAY_MAPCOMMON ? materialize_mapcommon(val)
+                                                : parted_to_flat_vec(val);
+        if (!flat || RAY_IS_ERR(flat)) return flat ? flat : ray_error("oom", NULL);
+        ray_t* r = eval_membership(flat, vec, negate);
+        ray_release(flat);
+        return r;
+    }
+    if (query && (RAY_IS_PARTED(vec->type) || vec->type == RAY_MAPCOMMON)) {
+        ray_t* flat = vec->type == RAY_MAPCOMMON ? materialize_mapcommon(vec)
+                                                : parted_to_flat_vec(vec);
+        if (!flat || RAY_IS_ERR(flat)) return flat ? flat : ray_error("oom", NULL);
+        ray_t* r = eval_membership(val, flat, negate);
+        ray_release(flat);
+        return r;
+    }
+    /* The typed kernel already excludes null rows and parallelizes both
+     * membership and negation. LIST probes need the general comparator. */
+    if (query && ray_is_vec(val) && (ray_is_vec(vec) || ray_is_atom(vec))) {
+        ray_t* fast = ray_in_vec_exec(val, vec, negate);
+        if (fast) return fast;
+    }
+    if (query && !ray_is_atom(val) && ray_len(val) == 0)
+        return ray_vec_new(RAY_BOOL, 0);
+    ray_t* r = ray_in_fn(val, vec);
+    if (!r || RAY_IS_ERR(r)) return r;
+    if (query && ray_is_atom(val) && RAY_ATOM_IS_NULL(val)) {
+        ray_release(r);
+        return make_bool(0);
+    }
+    if (r->type == RAY_BOOL) {
+        uint8_t* out = (uint8_t*)ray_data(r);
+        for (int64_t i = 0; i < r->len; i++) {
+            if (negate) out[i] = (uint8_t)!out[i];
+            if (query && !ray_is_atom(val)) {
+                static const uint8_t zero_guid[16] = {0};
+                bool is_null = val->type == RAY_GUID
+                    ? memcmp((const uint8_t*)ray_data(val) + i * 16, zero_guid, 16) == 0
+                    : val->type == RAY_LIST
+                    ? RAY_ATOM_IS_NULL(((ray_t**)ray_data(val))[i])
+                    : ray_vec_is_null(val, i);
+                if (is_null) out[i] = 0;
+            }
+        }
+        return r;
+    }
+    if (negate) {
+        ray_t* out = membership_not(r);
+        ray_release(r);
+        return out;
+    }
+    return r;
+}
+
+ray_t* ray_in_eval_fn(ray_t* val, ray_t* vec) {
+    if (!ray_env_query_scope_above(0)) return ray_in_fn(val, vec);
+    return eval_membership(val, vec, false);
+}
+
+ray_t* ray_not_in_fn(ray_t* val, ray_t* vec) {
+    return eval_membership(val, vec, true);
 }
 
 /* Helper: convert a boxed list result back to a typed vector if the original was typed */
@@ -1850,6 +2064,95 @@ ray_t* ray_sect_fn(ray_t* vec1, ray_t* vec2) {
     return result;
 }
 
+/* Rows [start, start+count) of the parted or MAPCOMMON column `col` of the
+ * table `tbl` (.db.parted.get) as a flat vector, reading only those rows
+ * (0 <= start, start + count <= the table's rows).  The table's partition
+ * counts give the rows a NULL segment (a partition without the column)
+ * spans; they come back as the type's null. */
+static ray_t* parted_col_window(ray_t* tbl, ray_t* col, int64_t start, int64_t count) {
+    int64_t ncnt = 0;
+    const int64_t* cnt = parted_table_counts(tbl, &ncnt);
+    int8_t base = col->type == RAY_MAPCOMMON
+                ? RAY_SYM : (int8_t)RAY_PARTED_BASETYPE(col->type);
+
+    /* MAPCOMMON, STR and LIST go through the row-index gathers. */
+    if (col->type == RAY_MAPCOMMON || base == RAY_STR || base == RAY_LIST) {
+        int64_t one = 0;
+        int64_t* idx = count > 0 ? (int64_t*)ray_alloc_raw((size_t)count * sizeof(int64_t)) : &one;
+        if (!idx) return ray_error("oom", NULL);
+        for (int64_t i = 0; i < count; i++) idx[i] = start + i;
+        ray_t** segs = (ray_t**)ray_data(col);
+        ray_t* out = col->type == RAY_MAPCOMMON
+                   ? materialize_mapcommon_gather(col, idx, count)
+                   : base == RAY_STR
+                   ? parted_gather_str_rows_c(segs, col->len, idx, count, cnt, ncnt)
+                   : parted_gather_list_rows_c(segs, col->len, idx, count, cnt, ncnt);
+        if (idx != &one) ray_free_raw(idx);
+        return out ? out : ray_error("oom", NULL);
+    }
+
+    ray_t** segs = (ray_t**)ray_data(col);
+    uint8_t ba = (base == RAY_SYM) ? parted_sym_max_attrs(segs, col->len) : 0;
+    ray_t* out = typed_vec_new(base, ba, count);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    out->len = count;
+    int64_t end = start + count, seg_start = 0;
+    for (int64_t s = 0; s < col->len && seg_start < end; s++) {
+        int64_t rows = parted_seg_rows(segs, s, cnt, ncnt);
+        int64_t lo = start > seg_start ? start : seg_start;
+        int64_t hi = end < seg_start + rows ? end : seg_start + rows;
+        if (lo < hi) {
+            int64_t dst = lo - start, src = lo - seg_start, n = hi - lo;
+            if (!segs[s] || RAY_IS_ERR(segs[s])) {
+                parted_fill_nulls(out, dst, n);
+            } else {
+                parted_copy_cells(ray_data(out), base, ba, dst, segs[s], src, n);
+                if (ray_vec_may_have_nulls(segs[s]))
+                    for (int64_t i = 0; i < n; i++)
+                        if (ray_vec_is_null(segs[s], src + i))
+                            ray_vec_set_null(out, dst + i, true);
+            }
+        }
+        seg_start += rows;
+    }
+    /* raw SYM cell ids copied from the segments — adopt their domain */
+    if (base == RAY_SYM) {
+        ray_t* rep = sym_domain_rep(col);
+        if (rep) ray_sym_vec_adopt_domain(out, rep);
+    }
+    return out;
+}
+
+/* take over one column of the table `tbl`.  A parted or MAPCOMMON column
+ * (.db.parted.get) is not a dense vector: materialize only the rows the
+ * count selects — the head or tail window, or a range — and, when the
+ * count wraps past the row count, all rows, then take from those as for a
+ * flat column (#855).  `n_obj` was validated by ray_take_fn. */
+static ray_t* take_table_col(ray_t* tbl, ray_t* col, ray_t* n_obj) {
+    if (!col || !(RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON))
+        return ray_take_fn(col, n_obj);
+    int64_t nrows = ray_table_nrows(tbl);
+    if (ray_is_vec(n_obj)) {
+        /* range take [start amount], clamped as for a typed vector */
+        const int64_t* r = (const int64_t*)ray_data(n_obj);
+        int64_t start = r[0], amount = r[1];
+        if (start < 0) start = nrows + start;
+        if (start < 0) start = 0;
+        if (start >= nrows) return parted_col_window(tbl, col, 0, 0);
+        int64_t count = amount < nrows - start ? amount : nrows - start;
+        return parted_col_window(tbl, col, start, count);
+    }
+    int64_t n = as_i64(n_obj);
+    int64_t abs_n = n < 0 ? -n : n;
+    if (abs_n <= nrows)
+        return parted_col_window(tbl, col, n >= 0 ? 0 : nrows - abs_n, abs_n);
+    ray_t* all = parted_col_window(tbl, col, 0, nrows);
+    if (!all || RAY_IS_ERR(all)) return all ? all : ray_error("oom", NULL);
+    ray_t* out = ray_take_fn(all, n_obj);
+    ray_release(all);
+    return out;
+}
+
 /* (take vec n) — first n elements (positive) or last |n| elements (negative) */
 ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
     if (ray_is_lazy(vec)) vec = ray_lazy_materialize(vec);
@@ -1875,7 +2178,7 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
                 ray_t* col = ray_table_col_idx(vec, i);
                 if (col && RAY_IS_ERR(col)) { ray_release(result); return col; }
                 int64_t name_id = ray_table_col_name(vec, i);
-                ray_t* taken = ray_take_fn(col, n_obj);
+                ray_t* taken = take_table_col(vec, col, n_obj);
                 if (RAY_IS_ERR(taken)) { ray_release(result); return taken; }
                 result = ray_table_add_col(result, name_id, taken);
                 ray_release(taken);
@@ -2061,7 +2364,7 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
             ray_t* col = ray_table_col_idx(vec, i);
             if (col && RAY_IS_ERR(col)) { ray_release(result); return col; }
             int64_t name_id = ray_table_col_name(vec, i);
-            ray_t* taken = ray_take_fn(col, n_obj);
+            ray_t* taken = take_table_col(vec, col, n_obj);
             if (RAY_IS_ERR(taken)) { ray_release(result); return taken; }
             result = ray_table_add_col(result, name_id, taken);
             ray_release(taken);
@@ -2443,13 +2746,87 @@ ray_t* ray_table_col_value(ray_t* tbl, int64_t sym) {
     ray_t* col = ray_table_col(tbl, sym);
     if (col && RAY_IS_ERR(col)) return col;
     if (!col) return ray_error("domain", "at: unknown table column");
-    if (RAY_IS_PARTED(col->type)) return parted_to_flat_vec(col);
+    if (RAY_IS_PARTED(col->type)) {
+        int64_t ncnt = 0;
+        const int64_t* cnt = parted_table_counts(tbl, &ncnt);
+        return parted_to_flat_vec_c(col, cnt, ncnt);
+    }
     if (col->type == RAY_MAPCOMMON) return materialize_mapcommon(col);
     ray_retain(col);
     return col;
 }
 
 /* (at vec idx) or (at table 'col) — index into vector or table */
+/* Row j of an integer index vector as a row id into a vec of vlen rows,
+ * or -1 when it is null or out of range. */
+static int64_t at_row(ray_t* idx, const void* ids, int64_t j, int64_t vlen, bool nulls) {
+    if (nulls && ray_vec_is_null(idx, j)) return -1;
+    int64_t k;
+    switch (idx->type) {
+    case RAY_I64: k = ((const int64_t*)ids)[j]; break;
+    case RAY_I32: k = ((const int32_t*)ids)[j]; break;
+    case RAY_I16: k = ((const int16_t*)ids)[j]; break;
+    default:      k = ((const uint8_t*)ids)[j]; break;
+    }
+    return k >= 0 && k < vlen ? k : -1;
+}
+
+/* (at vec idx) for a typed vec and an integer index vector — see the
+ * caller in ray_at_fn.  The valid row ids are gathered; an invalid one
+ * reads row 0 (nothing, from an empty vec) and is then set to the type's
+ * null, or to zero for BOOL and U8, which have none. */
+static ray_t* at_gather_typed(ray_t* vec, ray_t* idx) {
+    int64_t n = ray_len(idx);
+    int64_t vlen = ray_len(vec);
+    bool nulls = ray_vec_may_have_nulls(idx);
+    const void* ids = ray_data(idx);
+
+    /* The common case: I64 row ids, all valid — gather straight from them. */
+    int64_t nbad = 0;
+    for (int64_t j = 0; j < n; j++)
+        if (at_row(idx, ids, j, vlen, nulls) < 0) nbad++;
+    if (idx->type == RAY_I64 && nbad == 0)
+        return gather_by_idx(vec, (int64_t*)ids, n);
+
+    ray_t* out;
+    if (vlen > 0) {
+        ray_t* rows = ray_vec_new(RAY_I64, n);
+        if (!rows || RAY_IS_ERR(rows)) return rows ? rows : ray_error("oom", NULL);
+        rows->len = n;
+        int64_t* r = (int64_t*)ray_data(rows);
+        for (int64_t j = 0; j < n; j++) {
+            int64_t k = at_row(idx, ids, j, vlen, nulls);
+            r[j] = k < 0 ? 0 : k;
+        }
+        out = gather_by_idx(vec, r, n);
+        ray_release(rows);
+    } else if (vec->type == RAY_SYM) {
+        out = ray_sym_vec_new(vec->attrs & RAY_SYM_W_MASK, n);
+        if (out && !RAY_IS_ERR(out)) {
+            ray_sym_vec_adopt_domain(out, vec);
+            out->len = n;
+            memset(ray_data(out), 0, (size_t)n * RAY_SYM_ELEM(vec->attrs & RAY_SYM_W_MASK));
+        }
+    } else {
+        out = ray_vec_new(vec->type, n);
+        if (out && !RAY_IS_ERR(out)) {
+            out->len = n;
+            memset(ray_data(out), 0, (size_t)n * ray_type_sizes[vec->type]);
+        }
+    }
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    if (nbad == 0) return out;
+
+    bool nullable = vec->type != RAY_BOOL && vec->type != RAY_U8;
+    uint8_t* bytes = (uint8_t*)ray_data(out);
+    for (int64_t j = 0; j < n; j++) {
+        if (at_row(idx, ids, j, vlen, nulls) >= 0) continue;
+        if (nullable) ray_vec_set_null(out, j, true);
+        else          bytes[j] = 0;
+    }
+    return out;
+}
+
 ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
     if (ray_is_lazy(vec)) vec = ray_lazy_materialize(vec);
     /* Table column access by symbol key — return the typed vector directly.
@@ -2515,7 +2892,22 @@ ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
             if (col && RAY_IS_ERR(col)) { ray_release(result); return col; }
             int64_t name = ray_table_col_name(vec, c);
             if (!col) continue;
-            ray_t* gathered = gather_by_idx(col, ids, nidx);
+            /* Parted and MAPCOMMON columns (.db.parted.get) are not dense
+             * vectors: flatten them the way the symbol arm does, then gather. */
+            ray_t* flat = NULL;
+            if (RAY_IS_PARTED(col->type)) {
+                int64_t ncnt = 0;
+                const int64_t* cnt = parted_table_counts(vec, &ncnt);
+                flat = parted_to_flat_vec_c(col, cnt, ncnt);
+            } else if (col->type == RAY_MAPCOMMON) {
+                flat = materialize_mapcommon(col);
+            }
+            if (flat && RAY_IS_ERR(flat)) {
+                ray_release(result);
+                return flat;
+            }
+            ray_t* gathered = gather_by_idx(flat ? flat : col, ids, nidx);
+            if (flat) ray_release(flat);
             if (!gathered || RAY_IS_ERR(gathered)) {
                 ray_release(result);
                 return gathered ? gathered : ray_error("oom", NULL);
@@ -2622,24 +3014,15 @@ ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
         return ray_str(&s[i], 1);
     }
 
-    /* Typed vector index: keep the result typed when every row id is valid.
-     * The generic path below remains responsible for out-of-range/null row ids,
-     * because it preserves the scalar `at` rule of producing typed null atoms. */
-    if (ray_is_vec(vec) && idx->type == RAY_I64 && ray_is_vec(idx)) {
-        int64_t idxlen = ray_len(idx);
-        int64_t vlen = ray_len(vec);
-        int64_t* ids = (int64_t*)ray_data(idx);
-        bool idx_has_nulls = ray_vec_may_have_nulls(idx);
-        bool valid = true;
-        for (int64_t j = 0; j < idxlen; j++) {
-            if ((idx_has_nulls && ray_vec_is_null(idx, j)) ||
-                ids[j] < 0 || ids[j] >= vlen) {
-                valid = false;
-                break;
-            }
-        }
-        if (valid) return gather_by_idx(vec, ids, idxlen);
-    }
+    /* Typed vector indexed by an integer vector: the result has the
+     * source's type, whatever the index holds.  A null or out-of-range
+     * index gives the type's null there, as the scalar `at` gives a typed
+     * null atom; BOOL and U8 have no null and give false / 0x00.  Only a
+     * nested index (a LIST of index vectors) takes the generic path. */
+    if (ray_is_vec(vec) && ray_is_vec(idx) &&
+        (idx->type == RAY_I64 || idx->type == RAY_I32 ||
+         idx->type == RAY_I16 || idx->type == RAY_U8))
+        return at_gather_typed(vec, idx);
 
     /* Vector index: (at vec [i j k]) → vector of values */
     if (is_collection(idx) && idx->type != -RAY_SYM) {
@@ -2801,11 +3184,9 @@ ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
 
         if (has_nulls) {
             for (int64_t i = 0; i < len; i++) {
-                if (ray_vec_is_null(vec, i)) {
-                    if (val_null) return make_i64(i);
-                    continue;
-                }
-                if (val_null) continue;
+                /* A null row matches only a null of its class (atom_eq),
+                 * as in `in`: 0Nl is not found among dates. */
+                if (ray_vec_is_null(vec, i) != val_null) continue;
                 int alloc = 0;
                 ray_t* elem = collection_elem(vec, i, &alloc);
                 int eq = atom_eq(elem, val);
@@ -4308,7 +4689,7 @@ ray_t* ray_mdev_fn(ray_t* n, ray_t* x) {
     return ts_moving_fn(n, x, OP_MDEV);
 }
 
-/* (reverse vec) — reverse a vector */
+/* (reverse x) — reverse a vector, table's rows, or dictionary's entries */
 ray_t* ray_reverse_fn(ray_t* x) {
     if (!x || RAY_IS_ERR(x)) return x;
 
@@ -4316,6 +4697,28 @@ ray_t* ray_reverse_fn(ray_t* x) {
     if (ray_is_lazy(x)) return ray_lazy_append(x, OP_REVERSE);
 
     if (ray_is_atom(x)) { ray_retain(x); return x; }
+
+    if (x->type == RAY_TABLE) {
+        int64_t nrows = ray_table_nrows(x);
+        ray_t* ids = ray_vec_new(RAY_I64, nrows);
+        if (!ids || RAY_IS_ERR(ids)) return ids ? ids : ray_error("oom", NULL);
+        ids->len = nrows;
+        int64_t* rows = (int64_t*)ray_data(ids);
+        for (int64_t i = 0; i < nrows; i++) rows[i] = nrows - 1 - i;
+        ray_t* result = ray_at_fn(x, ids);
+        ray_release(ids);
+        return result;
+    }
+
+    if (x->type == RAY_DICT) {
+        ray_t* keys = ray_dict_keys(x);
+        ray_t* vals = ray_dict_vals(x);
+        if (!keys || !vals) return ray_error("domain", "reverse: malformed dictionary");
+        ray_t* nk = ray_is_vec(keys) ? reverse_vec_eager(keys) : ray_reverse_fn(keys);
+        if (!nk || RAY_IS_ERR(nk)) return nk ? nk : ray_error("oom", NULL);
+        ray_t* nv = ray_is_vec(vals) ? reverse_vec_eager(vals) : ray_reverse_fn(vals);
+        return ray_dict_new(nk, nv);
+    }
 
     /* Typed vector path: start a fresh lazy chain.  The DAG executor will
      * call reverse_vec_eager() when the chain is materialised. */
@@ -4537,13 +4940,11 @@ ray_t* ray_fold_left_fn(ray_t** args, int64_t n) {
  * BEFORE the first element, so a predicate that is false at the start
  * returns `init` untouched and touches nothing.
  *
- * Deliberately unlike ray_fold_fn in one respect: that routes its
- * collection through unbox_vec_arg -> to_boxed_list, boxing every element
- * up front.  For a primitive whose whole purpose is to stop early, paying
- * for the tail it never reaches is exactly the cost being removed here
- * (issue 588), so elements are pulled one at a time via collection_elem —
- * the same way map_iterate walks its input.  Stopping at element three of
- * a million costs three boxed atoms, not a million. */
+ * Elements are pulled one at a time via collection_elem, as ray_fold_fn
+ * does, never boxed up front: for a primitive whose whole purpose is to
+ * stop early, paying for the tail it never reaches would defeat it
+ * (issue 588).  Stopping at element three of a million costs three boxed
+ * atoms, not a million. */
 ray_t* ray_fold_while_fn(ray_t** args, int64_t n) {
     if (n != 4) return ray_error("domain", "fold-while: requires exactly 4 args (pred, fn, init, coll), got %lld", (long long)n);
     for (int64_t i = 0; i < n; i++)
@@ -4584,45 +4985,33 @@ ray_t* ray_fold_right_fn(ray_t** args, int64_t n) {
         if (ray_is_lazy(args[i])) args[i] = ray_lazy_materialize(args[i]);
 
     ray_t* fn = args[0];
-    ray_t* _bx = NULL;
+    ray_t* coll = args[n == 2 ? 1 : 2];
+    if (RAY_IS_ERR(coll)) return coll;
+    if (!is_collection(coll)) return ray_error("type", "fold-right: vec arg must be a list, got %s", ray_type_name(coll->type));
+    int64_t len = ray_len(coll);
     ray_t* acc;
-    ray_t* vec;
-
+    int64_t start;
     if (n == 2) {
         /* (fold-right fn vec) — use last element as initial value */
-        vec = unbox_vec_arg(args[1], &_bx);
-        if (RAY_IS_ERR(vec)) return vec;
-        if (!is_list(vec)) { if (_bx) ray_release(_bx); return ray_error("type", "fold-right: vec arg must be a list, got %s", ray_type_name(vec->type)); }
-        int64_t len = ray_len(vec);
-        if (len == 0) { if (_bx) ray_release(_bx); return ray_error("domain", "fold-right: empty list has no initial value, got %lld", (long long)len); }
-        ray_t** elems = (ray_t**)ray_data(vec);
-        ray_retain(elems[len - 1]);
-        acc = elems[len - 1];
-        for (int64_t i = len - 2; i >= 0; i--) {
-            ray_t* next = call_fn2(fn, elems[i], acc);
-            ray_release(acc);
-            if (RAY_IS_ERR(next)) { if (_bx) ray_release(_bx); return next; }
-            acc = next;
-        }
-        if (_bx) ray_release(_bx);
-        return acc;
+        if (len == 0) return ray_error("domain", "fold-right: empty list has no initial value, got %lld", (long long)len);
+        acc = iter_elem_owned(coll, len - 1);
+        if (RAY_IS_ERR(acc)) return acc;
+        start = len - 2;
+    } else {
+        /* (fold-right fn init coll) */
+        ray_retain(args[1]);
+        acc = args[1];
+        start = len - 1;
     }
-
-    /* (fold-right fn init coll) */
-    ray_retain(args[1]);
-    acc = args[1];
-    vec = unbox_vec_arg(args[2], &_bx);
-    if (RAY_IS_ERR(vec)) { ray_release(acc); return vec; }
-    if (!is_list(vec)) { ray_release(acc); if (_bx) ray_release(_bx); return ray_error("type", "fold-right: vec arg must be a list, got %s", ray_type_name(vec->type)); }
-    int64_t len = ray_len(vec);
-    ray_t** elems = (ray_t**)ray_data(vec);
-    for (int64_t i = len - 1; i >= 0; i--) {
-        ray_t* next = call_fn2(fn, elems[i], acc);
+    for (int64_t i = start; i >= 0; i--) {
+        int owned = 0;
+        ray_t* elem = iter_elem(coll, i, &owned);
+        ray_t* next = RAY_IS_ERR(elem) ? elem : call_fn2(fn, elem, acc);
+        if (owned) ray_release(elem);
         ray_release(acc);
-        if (RAY_IS_ERR(next)) { if (_bx) ray_release(_bx); return next; }
+        if (RAY_IS_ERR(next)) return next;
         acc = next;
     }
-    if (_bx) ray_release(_bx);
     return acc;
 }
 
@@ -4638,37 +5027,33 @@ ray_t* ray_scan_right_fn(ray_t** args, int64_t n) {
         if (ray_is_lazy(args[i])) args[i] = ray_lazy_materialize(args[i]);
 
     ray_t* fn = args[0];
-    ray_t* _bx = NULL;
-    ray_t* vec = unbox_vec_arg(args[1], &_bx);
-    if (RAY_IS_ERR(vec)) return vec;
-    if (!is_list(vec)) { if (_bx) ray_release(_bx); return ray_error("type", "scan-right: vec arg must be a list, got %s", ray_type_name(vec->type)); }
-    int64_t len = ray_len(vec);
-    if (len == 0) {
-        if (_bx) ray_release(_bx);
-        ray_t* result = ray_alloc(0);
-        if (!result) return ray_error("oom", NULL);
-        result->type = RAY_LIST;
-        result->len = 0;
-        return result;
-    }
+    ray_t* coll = args[1];
+    if (RAY_IS_ERR(coll)) return coll;
+    if (!is_collection(coll)) return ray_error("type", "scan-right: vec arg must be a list, got %s", ray_type_name(coll->type));
+    int64_t len = ray_len(coll);
 
     ray_t* result = ray_alloc(len * sizeof(ray_t*));
-    if (!result) { if (_bx) ray_release(_bx); return ray_error("oom", NULL); }
+    if (!result) return ray_error("oom", NULL);
     result->type = RAY_LIST;
-    result->len = len;
+    result->len = 0;
+    if (len == 0) return result;
     ray_t** out = (ray_t**)ray_data(result);
-    ray_t** elems = (ray_t**)ray_data(vec);
 
-    ray_retain(elems[len - 1]);
-    out[len - 1] = elems[len - 1];
+    /* Filled from the end, so the error path releases the tail by hand. */
+    out[len - 1] = iter_elem_owned(coll, len - 1);
+    if (RAY_IS_ERR(out[len - 1])) { ray_t* err = out[len - 1]; ray_release(result); return err; }
     for (int64_t i = len - 2; i >= 0; i--) {
-        out[i] = call_fn2(fn, elems[i], out[i + 1]);
-        if (RAY_IS_ERR(out[i])) {
+        int owned = 0;
+        ray_t* elem = iter_elem(coll, i, &owned);
+        ray_t* next = RAY_IS_ERR(elem) ? elem : call_fn2(fn, elem, out[i + 1]);
+        if (owned) ray_release(elem);
+        if (RAY_IS_ERR(next)) {
             for (int64_t j = i + 1; j < len; j++) ray_release(out[j]);
-            result->len = 0; ray_release(result); if (_bx) ray_release(_bx);
-            return out[i];
+            ray_release(result);
+            return next;
         }
+        out[i] = next;
     }
-    if (_bx) ray_release(_bx);
+    result->len = len;
     return result;
 }

@@ -4994,9 +4994,8 @@ ray_t* ray_dl_provenance_fn(ray_t* prog_obj, ray_t* pred_obj) {
 }
 
 /* (dl-free prog) — free a dl-program handle created by (dl-program).
- * The handle wraps a raw dl_program_t* with no automatic finalizer, so
- * without an explicit free the program block and all relation tables it
- * owns leak.  On free we clear RAY_ATTR_DLPROG and zero the pointer, so a
+ * The heap finalizer frees an owning handle on release; this builtin allows
+ * early release.  On free we clear RAY_ATTR_DLPROG and zero the pointer, so a
  * second call is an idempotent no-op (returns false) rather than a
  * double-free.  A tagged pointer that isn't an i64 is a type error, and a
  * plain/forged integer (RAY_ATTR_DLPROG absent, non-zero value) is rejected

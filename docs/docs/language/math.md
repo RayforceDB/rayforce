@@ -237,16 +237,21 @@ Check if each element of a vector is within a range (inclusive). The second argu
 
 ### `(and a b)` — atomic
 
-Logical AND. Works on booleans and boolean vectors.
+Logical AND. On atoms it answers one boolean; on a vector or a list it
+works element by element, each element by its truthiness, and returns a
+boolean vector (a nested list keeps its shape). An atom broadcasts, and two
+collections of different lengths are a `length` error.
 
 ```lisp
 (set x 5)
 (and (> x 0) (< x 10))
+(and [true false] (list true true))  ; [true false]
+(and [1 0 2] true)                   ; [true false true]
 ```
 
 ### `(or a b)` — atomic
 
-Logical OR.
+Logical OR, element by element on collections, as `and` is.
 
 ```lisp
 (set x 5)
@@ -260,7 +265,11 @@ Logical NOT. Flips boolean values.
 ```lisp
 (not true)  ; false
 (not [true false true])  ; [false true false]
+(not (list 1 0))         ; [false true]
 ```
+
+Comparisons (`==`, `!=`, `<`, `<=`, `>`, `>=`) on a list also give a
+boolean vector, element by element, as on a typed vector.
 
 ## Aggregation
 
@@ -509,10 +518,14 @@ Take the first `n` elements from a vector, or repeat/cycle `x` to length `n`.
 
 ### `(reverse x)`
 
-Reverse a vector.
+Reverse a vector, a table's rows, or a dictionary's entries. A table keeps
+its column names and types; a dictionary's keys and values move together.
 
 ```lisp
 (reverse [1 2 3])  ; [3 2 1]
+(set t (table [a b] (list [1 2 3] ["x" "y" "z"])))
+(at (reverse t) 'a)  ; [3 2 1]
+(reverse (dict ['a 'b 'c] [10 20 30]))  ; {c:30 b:20 a:10}
 ```
 
 ### `(where x)`

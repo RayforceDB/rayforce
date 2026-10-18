@@ -67,8 +67,8 @@ All comparison operators are **atomic** and return boolean results.
 
 | Function | Type | Description | Example |
 |---|---|---|---|
-| `and` | binary | Logical AND | `(and true false)` → `false` |
-| `or` | binary | Logical OR | `(or true false)` → `true` |
+| `and` | binary | Logical AND; element-wise on vectors and lists, each element by its truthiness (lengths must match) | `(and true false)` → `false`, `(and [1 0 2] [1 1 0])` → `[true false false]` |
+| `or` | binary | Logical OR; element-wise on vectors and lists (lengths must match) | `(or true false)` → `true` |
 | `not` | unary | Logical NOT; element-wise over a BOOL, numeric or temporal vector (zero and null are not true) | `(not true)` → `false`, `(not [1 0 0N])` → `[false true true]` |
 
 ## Aggregation
@@ -146,22 +146,27 @@ Functions that take other functions as arguments.
 
 Operations on vectors as collections.
 
+Outside queries, `in` matches null to null. `not-in` inverts each membership result, preserving nested list/vector shapes. For numeric, temporal, SYM, and GUID membership evaluated during a query (including called functions), null input rows return `false` for both operations. STR string/character membership keeps its collection behavior and is not supported by the typed query-plan kernel.
+
+Query `concat` joins text row by row when every vector operand comes from a source column, including computed text columns and column arguments to inlined helpers. Scalar text operands also retain query string concatenation. A literal or bound collection operand keeps ordinary collection concatenation, in either argument order. Inside a user function `concat` keeps ordinary collection semantics unless an operand derives from the query's rows. Numeric collection concatenation evaluates over the whole column, or each group inside an aggregate. Non-text collection concatenation is binary. Scalars broadcast to the projected collection length; a one-row input column is still a column. Non-scalar output columns of different lengths are rejected before `take:`; a standalone collection projection may change the row count. When a `where:` selection is applied to a collection projection, its rows must align with the input rows. Counting a constant collection returns its length, independently of the source row count or group size. In a projection, a `concat` operand the planner has no node for (a reordered, indexed or cast column such as `(reverse s)`, `(at s 0)` or `(as 'STR x)`) is evaluated over the whole column, so select, update, `where:` and `by:` agree. Inside a helper body a quoted symbol is the symbol itself, as when the helper runs as bytecode, and a nested helper's free names are globals or source columns, never its caller's formals; a helper whose body uses only pure builtins is inlined; a closure never is, since its body reads its captures. Grouped outputs that the planner cannot serve natively keep the requested output order, and an output named like a group key keeps both columns, the key first. A helper that the planner cannot inline (several statements, a closure, recursion) runs as bytecode when called from a query fallback; `return`, lazy arguments and recursion depth behave as outside a query, and each value carries whether it derives from the query's rows, so `concat` keeps text semantics through `let` bindings, nested calls and helper results while a bound vector stays a collection. Inside such a helper a free name that is a source column is the row's cell during row-by-row evaluation and the whole column otherwise; an output alias never captures it, and other free names are globals. Such a helper can also be the `by:` key, evaluated over the rows `where:` keeps: a body built from pure builtins and pure helpers runs whole first, and again row by row when a conditional in it tested a vector or the whole-column run failed (a failed run is swallowed whole, its `raise` payload included); a body with an effect runs row by row from the start, so the effect happens once per row. The decision follows each callee wherever it is bound (a global helper, a parameter, a `let`, a capture, a lambda literal bound earlier in the body): `set`, `eval`, system and I/O builtins and a callee that is computed or unknown are effects; every other builtin and every helper built from them is pure, and a pure body keeps the whole-column semantics whichever way it is reached. A source column shadows a global of the same name inside a helper, on the planned path and in fallbacks alike. A text cell reduced from a column (`first`, `last`, `min`, `max`) is a cell of those rows: in a grouped select or update `(concat (first s) 'zz)` joins each group's cell with the literal, and an empty symbol cell is empty text, as for the cell itself; a cell reduced from a STR column makes the result STR, as the column does.
+
 | Function | Type | Description | Example |
 |---|---|---|---|
 | `distinct` | unary | Remove duplicates | `(distinct [1 2 2 3])` → `[1 2 3]` |
 | `in` | binary | Membership test (element in vector) | `(in 2 [1 2 3])` → `true` |
+| `not-in` | binary | Negated membership test | `(not-in 2 [1 3])` → `true` |
 | `except` | binary | Set difference | `(except [1 2 3] [2])` → `[1 3]` |
 | `union` | binary | Set union | `(union [1 2] [2 3])` → `[1 2 3]` |
 | `sect` | binary | Set intersection | `(sect [1 2 3] [2 3 4])` → `[2 3]` |
-| `take` | binary | Take first/last N elements | `(take [10 20 30] 2)` → `[10 20]` |
+| `take` | binary | Take first/last N elements; past the length it cycles (`select … take:` stops at the table's length). A parted table handle (`.db.parted.get`) is taken as its flat table: the same rows `(at table (til n))` returns, cycling past the row count | `(take [10 20 30] 2)` → `[10 20]`; `(take [1 2 3] 5)` → `[1 2 3 1 2]` |
 | `drop` | binary | Drop first/last N elements | `(drop [10 20 30] 1)` → `[20 30]` |
 | `rotate` | binary | Rotate left by N positions; negative rotates right | `(rotate [1 2 3 4] 1)` → `[2 3 4 1]` |
 | `cut` | binary | Split at sorted 0-based indices | `(cut [1 2 3 4] [2])` → `([1 2] [3 4])` |
 | `cross` | binary | Cartesian product as pairs | `(cross [1 2] ['a 'b])` → `((1 'a) (1 'b) (2 'a) (2 'b))` |
-| `at` | binary | Index a collection; vector keys batch dictionary lookups | `(at [10 20 30] 1)` → `20` |
+| `at` | binary | Index a collection; vector keys batch dictionary lookups. A typed vector indexed by an integer vector keeps its type: a null or out-of-range index gives the type's null (`false`/`0x00` for BOOL/U8) | `(at [10 20 30] 1)` → `20`, `(at [10 20 30] [2 9])` → `[30 0Nl]` |
 | `find` | binary | Find index of value | `(find [10 20 30] 20)` → `1` |
 | `fill` | binary, atomic | Replace null values; the replacement is the first argument | `(fill 0 [1 0Nl 3])` → `[1 0 3]` |
-| `reverse` | unary | Reverse order | `(reverse [1 2 3])` → `[3 2 1]` |
+| `reverse` | unary | Reverse order; a table reverses its rows (columns and types kept), a dictionary its entries (keys and values together) | `(reverse [1 2 3])` → `[3 2 1]` |
 | `til` | unary | Range [0..n) | `(til 5)` → `[0 1 2 3 4]` |
 | `lag` | unary | Shift values one row back; first row is null/sentinel | `(lag [10 20 30])` → `[0Nl 10 20]` |
 | `lead` | unary | Shift values one row forward; last row is null/sentinel | `(lead [10 20 30])` → `[20 30 0Nl]` |
@@ -226,7 +231,7 @@ The time-series vector functions above are lazy-aware DAG operations for vector 
 | `xkey` | binary | Build a dict keyed by unique column value(s), with row dict values for remaining columns | `(xkey trades 'time)` |
 | `xgroup` | binary | Group rows by column value(s), returning dict key -> table slice | `(xgroup trades 'sym)` |
 | `fkeys` | unary | Inspect linked-column metadata as `column -> target table` | `(fkeys fact)` |
-| `alter` | variadic, special | In-place mutation of table column | `(alter trades 'price (* price 1.1))` |
+| `alter` | variadic, special | Amend a global binding in place and return its name: `(alter 'name set idx val)` writes `val` at an index or index vector, `(alter 'name concat vals)` appends, `(alter 'name remove idx)` drops list items. The target must be a global binding; a name bound by `let` or a parameter of the enclosing function raises `domain` | `(alter 'v set 0 99)` |
 | `del` | variadic, special | Delete columns or rows from table | `(del trades 'temp_col)` |
 | `modify` | variadic | Functional table update (returns new table) | `(modify trades 'price (fn [p] (* p 1.1)))` |
 
@@ -289,7 +294,7 @@ These are **special forms** that bridge to the Rayforce DAG executor.
 
 Indices are *pre-insertion* positions in `[0, count]`; `idx == count` is equivalent to append. Vector positional inserts of a same-typed vector splice that vector in. List positional inserts always add the value as a single slot — use `concat` to splice. Multi-insert is stable on duplicate indices, preserving input order. Typed-null atoms (`0Nl`, `0Nf`, …) carry their null flag through — the inserted slot is marked null, not zero.
 
-For a parted target, `rows` must match the physical data-column schema exactly in name and concrete vector type. Do **not** include the virtual `date` or `part` column. A list maps values in physical column order; a table or dictionary may reorder columns, but must contain every physical name exactly once. Atoms append one row. Equal-length vectors append a batch, and atom values alongside them broadcast across that batch. Generic `null` is accepted for sentinel-nullable columns; `SYM` and `STR` map it to their empty value because those types have no distinct null, while `BOOL` and `U8` reject it because they are non-nullable.
+For a parted target, `rows` must match the physical data-column schema exactly in name and concrete vector type. Do **not** include the virtual `date` or `part` column. A list maps values in physical column order; a table or dictionary may reorder columns, but must contain every physical name exactly once. Atoms append one row. Equal-length vectors append a batch, and atom values alongside them broadcast across that batch. Generic `null` is accepted for sentinel-nullable columns; `SYM` and `STR` map it to their null, which is their empty value (`'` or `""`), while `BOOL` and `U8` reject it because they are non-nullable.
 
 The partition key must equal the current last key, which grows that live segment, or be strictly later, which starts a new live segment. Earlier keys — including an existing historical partition — are immutable and cannot be inserted into. Existing partition metadata must already be strictly increasing in logical key order; integer directory names are ordered by value (`1`, `2`, `10` — no zero-padding needed), so only two spellings of one value (`1` and `01`) violate this, and they are rejected as `corrupt`. Every historical physical segment must be present. A missing segment in the last partition can be repaired only by a non-empty same-key append; it blocks an empty insert or a move to a later key. `BOOL`/`U8` cannot be null-backfilled when that missing segment already represents existing rows, but a missing zero-row segment needs no backfill.
 
@@ -492,12 +497,12 @@ spills exactly as it did before.
 |---|---|---|---|
 | `set` | binary, special | Bind value to global variable | `(set x 42)` |
 | `let` | binary, special | Bind value to local variable | `(let y (+ x 1))` |
-| `if` | variadic, special | Conditional (if/then/else) | `(if (> x 0) "pos" "neg")` |
+| `if` | variadic, special | Conditional: condition/result pairs, optional final else | `(if (> x 0) "pos" "neg")` |
 | `do` | variadic, special | Sequential execution, returns last | `(do (set x 1) (set y 2) (+ x y))` |
 | `fn` | variadic, special | Create lambda function | `(fn [x] (* x x))` |
 | `try` | binary, special | Error handling (expr handler-or-fallback) | `(try (/ 1 0) (fn [e] 0))` |
 | `raise` | unary | Throw an error | `(raise "bad input")` |
-| `return` | variadic | Early return from compiled lambda (0 args → null) | `(return 42)` |
+| `return` | variadic | Early return from the enclosing lambda (0 args → null) | `(return 42)` |
 | `quote` | variadic, special | Return argument unevaluated; a bare name becomes a literal symbol (`(quote x)` ≡ `'x`) | `(quote (+ 1 2))` → `(+ 1 2)` |
 | `resolve` | variadic, special | Resolve a symbol in current scope | `(resolve 'x)` |
 
@@ -519,8 +524,8 @@ spills exactly as it did before.
 | `.sys.args` | nullary | Application arguments as a typed dict (`user` subdict for post-`--` args) | `(.sys.args)` |
 | `env` | unary | List all global environment bindings | `(env 0)` |
 | `.sys.build` | nullary | Build metadata: `version` + `build-date` | `(.sys.build)` |
-| `.sys.mem` | variadic | Memory allocator statistics (alloc/peak/slab) | `(.sys.mem)` |
-| `.sys.info` | variadic | System information (cores, page size, memory) | `(.sys.info)` |
+| `.sys.mem` | nullary | Memory allocator statistics (alloc/peak/slab) | `(.sys.mem)` |
+| `.sys.info` | nullary | System information (cores, page size, memory) | `(.sys.info)` |
 
 ## Serialization & Storage
 
@@ -607,6 +612,8 @@ Low-level API for building and evaluating Datalog programs directly, bypassing t
 | `dl-eval` | unary | Evaluate program to fixpoint | `(dl-eval prog)` |
 | `dl-query` | binary | Query a derived or base relation | `(dl-query prog 'edge)` |
 | `dl-provenance` | binary | Reserved provenance hook; currently returns `domain: not available` | `(dl-provenance prog 'rel)` |
+
+A `dl-program` handle owns its program. Rebinding its symbol or leaving the handle's scope releases the program automatically; use `(dl-free prog)` to release it earlier.
 
 ```lisp
 ; Low-level Datalog program

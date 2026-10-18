@@ -46,6 +46,11 @@
 #define ATTR_QUOTED  0x20  /* -RAY_SYM atom with this flag SET = quoted/literal symbol;
                               CLEAR (default) = name reference, resolved at eval. */
 
+/* Head of the list the parser makes from the [name count] binding of an
+ * indexed `times`: (RAY_TIMES_BIND name count).  The space keeps any
+ * source token from spelling it. */
+#define RAY_TIMES_BIND "times bind"
+
 /* Internal eval flag for RAY_LIST values carried as nested IPC arguments.
  * The evaluator still runs callable lists normally; this only makes a
  * non-callable list head fall back to returning the list as data. */
@@ -96,6 +101,28 @@ enum {
                        * push handler as a fallback value */
     OP_FORCE,         /* materialize TOS if it is a lazy handle (so a
                        * let-bound local holds a concrete, reusable value) */
+    OP_BINDCAPS,      /* bind the closure's captures to local slots:
+                       * cpool[operand] is an I64 vector of (name, slot)
+                       * pairs; each name is looked up in the closure dict
+                       * and its value stored into the slot (a name the dict
+                       * lacks leaves the slot empty).  The prologue of every
+                       * compiled closure */
+    OP_LOADSELF,      /* push the running lambda (bare `self` as a value) */
+    OP_MKCLOSURE,     /* pop slots (I64), names (SYM), template (LAMBDA):
+                       * push a closure sharing the template's bytecode,
+                       * capturing the current frame's named slots */
+    OP_LOADENVG,      /* push local slot (1 byte) or, when the slot is still
+                       * empty (a `let` that has not run), the global named
+                       * by cpool[2-byte index], as the tree walker would */
+    OP_SCOPE_EVAL,    /* OP_SCOPE_BEGIN for the windows compiled code opens
+                       * around text it hands to the tree walker (eval, a
+                       * dynamic special form, a fn literal): the frame
+                       * binds the locals for that text only, not for what
+                       * it calls, and ends its scope */
+    OP_CALL1R,        /* OP_CALL1 / OP_CALL2 / OP_CALLN, each with an argc   */
+    OP_CALL2R,        /* operand, for a builtin a closure body resolves when */
+    OP_CALLNR,        /* it runs: the fast call while the name holds a builtin
+                       * of that kind, OP_CALLF's general call otherwise */
     OP__COUNT
 };
 
@@ -112,7 +139,17 @@ enum {
  *   data[5] = ray_t* nfo          (source location info, NULL if absent)
  *   data[6] = ray_t* dbg          (debug metadata, NULL if absent)
  *   data[7] = ray_t* closure      (captured lexical locals, NULL if empty)
+ *   data[8] = ray_t* caprows      (RAY_U8 row flag per capture, or NULL)
+ *   data[9] = uint32_t capq       (serial of the query frame the closure was
+ *                                  made under, 0 if none; never serialized)
  */
+#define LAMBDA_SLOTS 10
+
+/* The slots that hold no reference, and the last one that does.  The free
+ * walk in mem/heap.c drops slots 0 .. LAMBDA_SLOT_CAPROWS but n_locals. */
+#define LAMBDA_SLOT_NLOCALS   4
+#define LAMBDA_SLOT_CAPROWS   8
+#define LAMBDA_SLOT_CAPQ      9
 
 #define RAY_FN_COMPILED  0x40   /* lambda has been compiled to bytecode */
 
@@ -120,10 +157,12 @@ enum {
 #define LAMBDA_BODY(lam)      (((ray_t**)ray_data(lam))[1])   /* not-a-table */
 #define LAMBDA_BC(lam)        (((ray_t**)ray_data(lam))[2])
 #define LAMBDA_CONSTS(lam)    (((ray_t**)ray_data(lam))[3])
-#define LAMBDA_NLOCALS(lam)   (*((int32_t*)&((ray_t**)ray_data(lam))[4]))
+#define LAMBDA_NLOCALS(lam)   (*((int32_t*)&((ray_t**)ray_data(lam))[LAMBDA_SLOT_NLOCALS]))
 #define LAMBDA_NFO(lam)       (((ray_t**)ray_data(lam))[5])
 #define LAMBDA_DBG(lam)       (((ray_t**)ray_data(lam))[6])
 #define LAMBDA_CLOSURE(lam)   (((ray_t**)ray_data(lam))[7])
+#define LAMBDA_CAPROWS(lam)   (((ray_t**)ray_data(lam))[LAMBDA_SLOT_CAPROWS])
+#define LAMBDA_CAPQ(lam)      (*((uint32_t*)&((ray_t**)ray_data(lam))[LAMBDA_SLOT_CAPQ]))
 
 #define LAMBDA_IS_COMPILED(lam) ((lam)->attrs & RAY_FN_COMPILED)
 
@@ -163,6 +202,7 @@ typedef struct {
     ray_t    *fn;                    /* current lambda */
     int32_t  tp;                    /* trap stack pointer */
     ray_t    *ps[VM_STACK_SIZE];     /* program stack */
+    uint8_t  rows[VM_STACK_SIZE];    /* ps[i] is derived from query rows */
     vm_ctx_t rs[VM_STACK_SIZE];     /* return stack */
     vm_trap_t ts[VM_TRAP_SIZE];     /* trap frames */
 } ray_exec_t;
@@ -181,6 +221,23 @@ ray_t* ray_eval_str(const char* source);
 
 /* Compile a lambda's body to bytecode. Called lazily on first invocation. */
 void ray_compile(ray_t* lambda);
+/* ray_compile for a lambda with nothing captured, also handing back the
+ * bindings its code depends on (see compile.c). */
+bool ray_compile_definition(ray_t* lambda, ray_t** deps);
+/* The most bytes a literal's text may hold for the template table to keep
+ * it (eval.c), and where the compiler's weight count may stop. */
+#define RAY_CLOSURE_TMPL_MAX_BYTES ((int64_t)64 * 1024)
+/* The capture names a closure's body can reach (its dict keys the body
+ * mentions; all of them under eval/resolve), as a SYM vector or NULL. */
+ray_t* ray_closure_capture_names(ray_t* lambda);
+ray_t* ray_closure_mentioned_syms(ray_t* body, bool* dynamic, int64_t* weight);
+ray_t* ray_closure_names_from(ray_t* closure, ray_t* mentioned, bool dynamic);
+/* The closure dict shape the compiled capture binding assumes: NULL, or SYM
+ * keys with a LIST of values of the same length. */
+bool   ray_closure_shape_ok(ray_t* closure);
+/* Compile `lambda` with `capnames` bound as locals ahead of the body; false
+ * when the body cannot be compiled. */
+bool   ray_compile_with_captures(ray_t* lambda, ray_t* capnames, bool closure_body);
 
 /* Reset compiler cached state (call from ray_lang_destroy). */
 void ray_compile_reset(void);
@@ -207,6 +264,13 @@ void   ray_eval_set_nfo(ray_t* nfo);
  * a VM error propagates without a trap.  Cleared at the start of ray_eval_str. */
 ray_t* ray_get_error_trace(void);
 void   ray_clear_error_trace(void);
+
+/* Pending uncaught (raise x) value.  ray_raise_clear drops it — call at each
+ * top-level evaluation boundary (ray_eval_str does).  ray_raise_render
+ * writes a bounded rendering into buf for an error printer; false when no
+ * raise is pending. */
+void   ray_raise_clear(void);
+bool   ray_raise_render(char* buf, size_t cap);
 
 /* Restricted mode: when true, builtins with RAY_FN_RESTRICTED are blocked. */
 void ray_eval_set_restricted(bool on);
@@ -277,6 +341,13 @@ ray_t* ray_apply_fn(ray_t** args, int64_t n);
 /* Collection */
 ray_t* ray_distinct_fn(ray_t* x);
 ray_t* ray_in_fn(ray_t* val, ray_t* vec);
+ray_t* ray_in_eval_fn(ray_t* val, ray_t* vec);
+/* Query text concat; str_out: a STR atom operand is a STR column's cell.
+ * rows_mask bit 0 / bit 1: a / b is a column's cell, so a null one is the
+ * empty text the vector kernel sees, not the null literal that nulls the
+ * result. */
+ray_t* ray_concat_text_fn(ray_t* a, ray_t* b, bool str_out, uint8_t rows_mask);
+ray_t* ray_not_in_fn(ray_t* val, ray_t* vec);
 ray_t* ray_except_fn(ray_t* vec1, ray_t* vec2);
 ray_t* ray_union_fn(ray_t* vec1, ray_t* vec2);
 ray_t* ray_sect_fn(ray_t* vec1, ray_t* vec2);
@@ -367,9 +438,14 @@ ray_t* ray_while_fn(ray_t** args, int64_t n);
 ray_t* ray_times_fn(ray_t** args, int64_t n);
 ray_t* ray_times_norm_fn(ray_t* x);
 ray_t* ray_times_dec_fn(ray_t* x);
+ray_t* ray_times_idx_fn(ray_t* lim, ray_t* ctr);
+bool   ray_times_binding(ray_t* ast, int64_t* name, ray_t** count);
 ray_t* ray_fn(ray_t** args, int64_t n);
 ray_t* ray_raise_fn(ray_t* val);
 ray_t* ray_try_fn(ray_t* expr, ray_t* handler_expr);
 
+
+bool ray_eval_query_helper_active(void);
+bool ray_eval_query_helper_literals(void);
 
 #endif /* RAY_EVAL_H */

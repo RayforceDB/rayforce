@@ -30,6 +30,7 @@
 #include <rayforce.h>
 #include "mem/heap.h"
 #include "ops/datalog.h"
+#include "store/serde.h"
 #include "table/sym.h"     /* ray_read_sym for SYM column inspection */
 #include "lang/eval.h"
 #include <stdio.h>         /* fprintf in datalog_rf_setup */
@@ -2710,6 +2711,68 @@ static test_result_t test_rule_expr_ownership(void) {
     PASS();
 }
 
+/* A program handle is uniquely owned.  A shallow block copy must be
+ * detached, and serialization must not turn its opaque pointer into an i64. */
+static test_result_t test_program_handle_ownership(void) {
+    dl_program_t* program = dl_program_new();
+    TEST_ASSERT_NOT_NULL(program);
+    ray_t* handle = ray_alloc(0);
+    TEST_ASSERT_NOT_NULL(handle);
+    handle->type = -RAY_I64;
+    handle->i64 = (int64_t)(uintptr_t)program;
+    handle->attrs |= RAY_ATTR_DLPROG;
+
+    TEST_ASSERT_EQ_I(ray_serde_size(handle), 0);
+    uint8_t serialized[16];
+    TEST_ASSERT_EQ_I(ray_ser_raw(serialized, handle), 0);
+    ray_t* copy = ray_alloc_copy(handle);
+    TEST_ASSERT_NOT_NULL(copy);
+    TEST_ASSERT_EQ_I(copy->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(copy->i64, 0);
+    TEST_ASSERT_FALSE((copy->attrs & RAY_ATTR_DLPROG) != 0);
+    TEST_ASSERT_TRUE((handle->attrs & RAY_ATTR_DLPROG) != 0);
+    TEST_ASSERT_EQ_I(handle->i64, (int64_t)(uintptr_t)program);
+
+    ray_release(copy);
+    ray_release(handle);
+
+    /* HNSW handles use the same opaque-I64 representation and must not be
+     * serialized as if their pointer payload were an ordinary integer. */
+    ray_t* hnsw = ray_alloc(0);
+    TEST_ASSERT_NOT_NULL(hnsw);
+    hnsw->type = -RAY_I64;
+    hnsw->i64 = 1; /* opaque dummy payload; serialization must reject first */
+    hnsw->attrs |= RAY_ATTR_HNSW;
+    TEST_ASSERT_EQ_I(ray_serde_size(hnsw), 0);
+    TEST_ASSERT_EQ_I(ray_ser_raw(serialized, hnsw), 0);
+    hnsw->attrs &= (uint8_t)~RAY_ATTR_HNSW;
+    ray_release(hnsw);
+    PASS();
+}
+
+/* Rebinding a live program handle must run the heap finalizer. The trace
+ * covers both program allocations and their releases, so deleting that
+ * finalizer makes the net live bytes positive. */
+static test_result_t test_program_rebind_releases(void) {
+    ray_t* result = ray_eval_str("(set __datalog_owned_prog (dl-program))");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    ray_release(result);
+
+    ray_mem_trace_t trace;
+    TEST_ASSERT_TRUE(ray_mem_trace_begin());
+    result = ray_eval_str("(set __datalog_owned_prog (dl-program))");
+    ray_release(result);
+    ray_mem_trace_end(&trace);
+    TEST_ASSERT_FMT(trace.net_bytes == 0,
+                    "Datalog handle rebind retained %lld bytes",
+                    (long long)trace.net_bytes);
+
+    result = ray_eval_str(
+        "(do (dl-free __datalog_owned_prog) (set __datalog_owned_prog 0))");
+    ray_release(result);
+    PASS();
+}
+
 const test_entry_t datalog_entries[] = {
     { "datalog/source_provenance", test_source_provenance, datalog_setup, datalog_teardown },
     { "datalog/source_prov_requires_flag", test_source_prov_requires_flag, datalog_setup, datalog_teardown },
@@ -2779,6 +2842,8 @@ const test_entry_t datalog_entries[] = {
     { "datalog/nonlinear_closure_chain", test_nonlinear_closure_chain, datalog_setup, datalog_teardown },
     { "datalog/const_filter_f64_column", test_const_filter_f64_column, datalog_setup, datalog_teardown },
     { "datalog/rule_expr_ownership", test_rule_expr_ownership, datalog_setup, datalog_teardown },
+    { "datalog/program_handle_ownership", test_program_handle_ownership, datalog_setup, datalog_teardown },
+    { "datalog/program_rebind_releases", test_program_rebind_releases, datalog_rf_setup, datalog_rf_teardown },
     { NULL, NULL, NULL, NULL },
 };
 

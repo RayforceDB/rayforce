@@ -652,15 +652,16 @@ static inline bool join_keys_eq(ray_t* const* l_vecs, ray_t* const* r_vecs, uint
         ray_t* lc = l_vecs[k];
         ray_t* rc = r_vecs[k];
         if (!lc || !rc) return false;
-        /* null == null, null != non-null.  This is the rule the rest of the
-         * runtime already applies to key columns: collection.c's hashset
-         * folds every null into one bucket (so `distinct` keeps exactly one
-         * null and `in` matches null against null), group.c folds them into
-         * one group, and atom_eq answers 1 for two nulls.  Joins used to
-         * reject a null outright, which made `anti-join [c] X X` non-empty
-         * whenever c held a null and made left-join miss a null-keyed match.
-         * As-of join keeps its own documented NULLs-never-match rule; it
-         * does not route through here. */
+        /* null == null, null != non-null.  Joins used to reject a null
+         * outright, which made `anti-join [c] X X` non-empty whenever c held
+         * a null and made left-join miss a null-keyed match.  Two nulls pair
+         * where two values of their key types would be compared: the value
+         * arms below pair STR only with STR and GUID only with GUID and read
+         * every other key type as a raw integer, so the nulls follow that
+         * rule rather than `in`'s (which keeps, say, a date null apart from
+         * an integer null) — a join must not match 5 to 5 across two key
+         * types yet refuse their nulls.  As-of join keeps its own documented
+         * NULLs-never-match rule; it does not route through here. */
         bool l_null = !nullfree && ray_vec_is_null(lc, l);
         bool r_null = !nullfree && ray_vec_is_null(rc, r);
         if (l_null || r_null) {
@@ -2470,18 +2471,18 @@ static int asof_lslot_cmp(const void* a, const void* b) {
 }
 
 typedef struct {
-    const int64_t* rows;
+    ray_idx_rows_t rows;
     int64_t start;
     int64_t n;
     uint8_t contig;
 } asof_idx_slice_t;
 
 static inline int64_t asof_slice_row(const asof_idx_slice_t* s, int64_t p) {
-    return s->contig ? s->start + p : s->rows[p];
+    return s->contig ? s->start + p : ray_idx_rows_at(s->rows, p);
 }
 
 static int asof_part_group(ray_t* col, int64_t key, asof_idx_slice_t* out) {
-    out->rows = NULL;
+    out->rows = (ray_idx_rows_t){ NULL, false };
     out->start = 0;
     out->n = 0;
     out->contig = 1;
@@ -2535,7 +2536,7 @@ static int asof_part_group(ray_t* col, int64_t key, asof_idx_slice_t* out) {
 }
 
 static int asof_index_group(ray_t* col, int64_t key, asof_idx_slice_t* out) {
-    out->rows = NULL;
+    out->rows = (ray_idx_rows_t){ NULL, false };
     out->start = 0;
     out->n = 0;
     out->contig = 0;
@@ -2575,14 +2576,14 @@ static bool asof_verify_idx_slices(const asof_idx_slice_t* sl, int32_t n_groups,
 }
 
 /* Per-slice ascending-time verify over a collected probe set (see the
- * single-eq index variant below).  gsl holds n_groups (grows, gn) pairs.
+ * single-eq index variant below).  gsl holds the n_groups hash slices.
  * Contiguous slices verify with a sequential scan over rt_time; scattered
  * ones fall back to the gathered walk.  Above the parallel threshold the
  * pairs are chunked across the pool; each chunk covers the adjacent
  * pairs (i-1, i) for i in [max(start,1), end) within its slice, so
  * chunk boundaries re-check the crossing pair and no pair is skipped.
  * Returns false at the first violation (shared bail flag). */
-typedef struct { const int64_t* grows; int64_t lo, hi; } asof_vchunk_t;
+typedef struct { ray_idx_rows_t grows; int64_t lo, hi; } asof_vchunk_t;
 typedef struct {
     const asof_vchunk_t* chunks;
     const int64_t* rt_time;
@@ -2597,16 +2598,17 @@ static void asof_verify_fn(void* raw, uint32_t wid, int64_t cstart,
     for (int64_t ci = cstart; ci < cend; ci++) {
         if (!*c->ok) return;
         const asof_vchunk_t* ch = &c->chunks[ci];
-        const int64_t* restrict rows = ch->grows;
+        ray_idx_rows_t rows = ch->grows;
         int64_t lo = ch->lo, hi = ch->hi;
         if (lo < 1) lo = 1;
         bool contig = (hi > lo) &&
-                      (rows[hi - 1] - rows[lo - 1] == hi - lo);
+                      (ray_idx_rows_at(rows, hi - 1) -
+                       ray_idx_rows_at(rows, lo - 1) == hi - lo);
         if (contig) {
             /* Branchless block accumulation: `bad += (next < cur)` maps to
              * packed i64 compares (the early-exit form stays scalar), with
              * a per-block bail so a violation still stops the scan early. */
-            const int64_t* restrict tv = t + rows[lo - 1];
+            const int64_t* restrict tv = t + ray_idx_rows_at(rows, lo - 1);
             int64_t n = hi - lo;
             int64_t bad = 0;
             for (int64_t b = 0; b < n; b += 4096) {
@@ -2615,38 +2617,35 @@ static void asof_verify_fn(void* raw, uint32_t wid, int64_t cstart,
                     bad += (int64_t)(tv[i + 1] < tv[i]);
                 if (bad) { *c->ok = 0; return; }
             }
-        } else {
+        } else if (rows.narrow) {
+            const uint32_t* restrict r = (const uint32_t*)rows.p;
             for (int64_t i = lo; i < hi; i++)
-                if (t[rows[i]] < t[rows[i - 1]]) { *c->ok = 0; return; }
+                if (t[r[i]] < t[r[i - 1]]) { *c->ok = 0; return; }
+        } else {
+            const int64_t* restrict r = (const int64_t*)rows.p;
+            for (int64_t i = lo; i < hi; i++)
+                if (t[r[i]] < t[r[i - 1]]) { *c->ok = 0; return; }
         }
     }
 }
 
 #define ASOF_VERIFY_CHUNK 65536
-static bool asof_verify_slices(const int64_t* gsl, int32_t n_groups,
+static bool asof_verify_slices(const asof_idx_slice_t* gsl, int32_t n_groups,
                                const int64_t* rt_time, int64_t total_rows) {
     int64_t n_chunks = 0;
     for (int32_t g = 0; g < n_groups; g++)
-        n_chunks += (gsl[2 * g + 1] + ASOF_VERIFY_CHUNK - 1)
+        n_chunks += (gsl[g].n + ASOF_VERIFY_CHUNK - 1)
                     / ASOF_VERIFY_CHUNK;
     if (n_chunks <= 0) return true;
     ray_t* ch_hdr = NULL;
     asof_vchunk_t* chunks = (asof_vchunk_t*)scratch_alloc(&ch_hdr,
                                 (size_t)n_chunks * sizeof(asof_vchunk_t));
-    if (!chunks) {
-        /* OOM — serial gathered walk, no allocation. */
-        for (int32_t g = 0; g < n_groups; g++) {
-            const int64_t* rows = (const int64_t*)(intptr_t)gsl[2 * g];
-            int64_t gn = gsl[2 * g + 1];
-            for (int64_t p = 1; p < gn; p++)
-                if (rt_time[rows[p]] < rt_time[rows[p - 1]]) return false;
-        }
-        return true;
-    }
+    if (!chunks)   /* OOM — serial gathered walk, no allocation. */
+        return asof_verify_idx_slices(gsl, n_groups, rt_time);
     int64_t w = 0;
     for (int32_t g = 0; g < n_groups; g++) {
-        const int64_t* rows = (const int64_t*)(intptr_t)gsl[2 * g];
-        int64_t gn = gsl[2 * g + 1];
+        ray_idx_rows_t rows = gsl[g].rows;
+        int64_t gn = gsl[g].n;
         for (int64_t lo = 0; lo < gn; lo += ASOF_VERIFY_CHUNK) {
             int64_t hi = lo + ASOF_VERIFY_CHUNK;
             if (hi > gn) hi = gn;
@@ -2709,6 +2708,16 @@ static void asof_idx_match_fn(void* raw, uint32_t wid,
         }
         mo[li] = (best >= 0) ? asof_slice_row(s, best) : -1;
     }
+}
+
+/* The two index variants of asof_hash_group_match (single key and
+ * multi-key) admit only a right side whose FIRST eq key carries a grouped
+ * HASH or PART index.  Shared with the caller so it pays the exact text
+ * null proof (rt_no_nulls) only when one of those variants can use it. */
+static bool asof_rt_eq_indexed(uint32_t n_eq, ray_t* const* rt_eq) {
+    if (n_eq == 0) return false;
+    ray_idx_kind_t kind = ray_index_kind(rt_eq[0]);
+    return kind == RAY_IDX_HASH || kind == RAY_IDX_PART;
 }
 
 static bool asof_hash_group_match(uint32_t n_eq,
@@ -2841,9 +2850,7 @@ static bool asof_hash_group_match(uint32_t n_eq,
      * sequential memory and costs a fraction of the binary searches it
      * unlocks.  No pass over the right table is needed: cost is
      * per-probed-key, not per-row. */
-    if (ok && n_eq == 1 && rt_no_nulls &&
-        (ray_index_kind(rt_eq[0]) == RAY_IDX_HASH ||
-         ray_index_kind(rt_eq[0]) == RAY_IDX_PART)) {
+    if (ok && n_eq == 1 && rt_no_nulls && asof_rt_eq_indexed(n_eq, rt_eq)) {
         ray_idx_consults[IDX_SITE_ASOF]++;
         bool served = true;
         ray_t* gsl_hdr = NULL;
@@ -2869,21 +2876,8 @@ static bool asof_hash_group_match(uint32_t n_eq,
             }
             if (served && !rt_time_sorted && !idx_ordered && verify_rows > 0) {
                 if (ray_index_kind(rt_eq[0]) == RAY_IDX_HASH) {
-                    ray_t* hv_hdr = NULL;
-                    int64_t* hv = (int64_t*)scratch_alloc(&hv_hdr,
-                        (size_t)(n_groups > 0 ? n_groups : 1) * 2 *
-                        sizeof(int64_t));
-                    if (hv) {
-                        for (int32_t g = 0; g < n_groups; g++) {
-                            hv[2 * g] = (int64_t)(intptr_t)gsl[g].rows;
-                            hv[2 * g + 1] = gsl[g].n;
-                        }
-                        served = asof_verify_slices(hv, n_groups, rt_time,
-                                                    verify_rows);
-                        scratch_free(hv_hdr);
-                    } else {
-                        served = asof_verify_idx_slices(gsl, n_groups, rt_time);
-                    }
+                    served = asof_verify_slices(gsl, n_groups, rt_time,
+                                                verify_rows);
                 } else {
                     served = asof_verify_idx_slices(gsl, n_groups, rt_time);
                 }
@@ -2921,8 +2915,7 @@ static bool asof_hash_group_match(uint32_t n_eq,
      * table anyway, the sequential full pass is cheaper per row, so bail
      * upfront on the (known!) slice-length sum. */
     if (ok && n_eq >= 2 && rt_no_nulls && n_groups > 0 &&
-        (ray_index_kind(rt_eq[0]) == RAY_IDX_HASH ||
-         ray_index_kind(rt_eq[0]) == RAY_IDX_PART)) {
+        asof_rt_eq_indexed(n_eq, rt_eq)) {
         ray_idx_consults[IDX_SITE_ASOF]++;
         bool served = true;
 
@@ -3693,10 +3686,27 @@ static ray_t* exec_window_join_flat(ray_graph_t* g, ray_op_t* op,
      * (no sorting of either side; a fresh CSR grouped index on a single eq
      * key answers groups with no right pass at all).  Falls back to the
      * sort-merge when the per-group right-time monotonicity precondition
-     * fails. */
+     * fails.
+     *
+     * rt_no_nulls feeds only the index variants.  The O(1) attrs check
+     * settles every key it can; a SYM/STR key, which that check can never
+     * clear, is proven by a full payload scan — so take that scan only
+     * when the first key carries an index the variants accept, and only
+     * after every flag-readable key has passed.  Without such an index
+     * rt_no_nulls stays false at no cost, as nothing would consume it. */
     bool rt_no_nulls = !ray_vec_may_have_nulls(rt_time_vec);
-    for (uint32_t k = 0; k < n_eq && rt_no_nulls; k++)
-        if (ray_vec_may_have_nulls(rt_eq[k])) rt_no_nulls = false;
+    bool rt_text_keys = false;
+    for (uint32_t k = 0; k < n_eq && rt_no_nulls; k++) {
+        if (!ray_vec_may_have_nulls(rt_eq[k])) continue;
+        if (join_key_col_scanned(rt_eq[k])) rt_text_keys = true;
+        else rt_no_nulls = false;
+    }
+    if (rt_no_nulls && rt_text_keys) {
+        if (!asof_rt_eq_indexed(n_eq, rt_eq)) rt_no_nulls = false;
+        for (uint32_t k = 0; k < n_eq && rt_no_nulls; k++)
+            if (join_key_col_scanned(rt_eq[k]) &&
+                !join_key_col_nullfree(rt_eq[k])) rt_no_nulls = false;
+    }
     if (asof_hash_group_match(n_eq, lt_eq, rt_eq, eq_xlut, eq_xn,
                               lt_time, rt_time, lt_null, rt_null,
                               left_n, right_n,

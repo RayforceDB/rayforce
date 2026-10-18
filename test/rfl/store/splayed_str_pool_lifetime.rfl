@@ -104,9 +104,25 @@
 (set u (.db.splayed.get "rf_bigstr/")) (set v (take (at u 'note) 3)) (set u 0) (set v 0)
 (set u (.db.splayed.get "rf_bigstr/")) (set v (take (at u 'note) 3)) (set u 0) (set v 0)
 (set u (.db.splayed.get "rf_bigstr/")) (set v (take (at u 'note) 3)) (set u 0) (set v 0)
-;; One file's worth of growth would be over a million bytes; the small
-;; negative drift is the release path rounding to whole pages while the
-;; map counted the file, and predates this change.
-(< (- (at (.sys.mem) 'sys-mapped) _m0) 4096) -- true
+;; One file's worth of growth would be over a million bytes.  Map and
+;; release both count whole pages, so the count comes back exactly.
+(- (at (.sys.mem) 'sys-mapped) _m0) -- 0
 
 (.sys.exec "rm -rf rf_bigstr") -- 0
+
+;; ── The mapped-byte count balances for plain columns too (#786).  Mapping
+;;    counted each file's exact length while the free re-derived it from the
+;;    header and rounded it to a page, so every read of a column whose file
+;;    is not a whole number of pages left its tail behind: a 20,000-row
+;;    table read 1,000 times ended millions of bytes below zero. ─────────
+(.sys.exec "rm -rf rf_mapcnt") -- 0
+;;    Saved as generation 0: the count is of files mapped in place.
+(.db.splayed.set "rf_mapcnt/" (table [i f s c] (list (til 20000) (as 'F64 (til 20000)) (take [x y z] 20000) (take ["ab" "cde" ""] 20000))) {compress: false})
+(set _m0 (at (.sys.mem) 'sys-mapped))
+(set u (.db.splayed.get "rf_mapcnt/"))
+;; Held, the table is counted: the check below is not vacuous.
+(> (- (at (.sys.mem) 'sys-mapped) _m0) 160000) -- true
+(set u 0)
+(do (set _k 0) (while (< _k 200) (set u (.db.splayed.get "rf_mapcnt/")) (set u 0) (set _k (+ _k 1))))
+(- (at (.sys.mem) 'sys-mapped) _m0) -- 0
+(.sys.exec "rm -rf rf_mapcnt") -- 0

@@ -1,0 +1,60 @@
+;; @requires: posix  (fixtures/checks run through a POSIX shell via .sys.exec)
+;; take over a parted table handle (.db.parted.get): the parted columns and
+;; the MAPCOMMON partition key are not dense vectors, so the table arm of
+;; take materializes just the rows it needs (head or tail window, or all
+;; rows when the count wraps) and then answers exactly as for the flat table
+;; with the same rows (#855).
+(.sys.exec "rm -rf /tmp/rfl_take_parted")
+;; partition 2024.01.02 lacks the b and name columns (NULL segments, read
+;; back as typed nulls); c carries i64 nulls.
+(.db.splayed.set "/tmp/rfl_take_parted/2024.01.01/t/" (table [a s c b name] (list [1 2] [x y] [10 0Nl] [0.5 1.5] (list "alpha" "beta"))))
+(.db.splayed.set "/tmp/rfl_take_parted/2024.01.02/t/" (table [a s c] (list [3 4 5] [z w v] [0Nl 40 50])))
+(.db.splayed.set "/tmp/rfl_take_parted/2024.01.03/t/" (table [a s c b name] (list [6 7] [u x] [60 70] [6.5 7.5] (list "gamma" "delta"))))
+(set _tp (.db.parted.get "/tmp/rfl_take_parted/" 't))
+(set _tf (table [date a s c b name] (list [2024.01.01 2024.01.01 2024.01.02 2024.01.02 2024.01.02 2024.01.03 2024.01.03] [1 2 3 4 5 6 7] [x y z w v u x] [10 0Nl 0Nl 40 50 60 70] [0.5 1.5 0Nf 0Nf 0Nf 6.5 7.5] (list "alpha" "beta" "" "" "" "gamma" "delta"))))
+(count _tp) -- 7
+
+;; the issue's repro: head and tail
+(count (take _tp 2)) -- 2
+(at (take _tp 2) 'a) -- [1 2]
+(at (take _tp -2) 'a) -- [6 7]
+(take _tp 2) -- (at _tp (til 2))
+(take _tp -2) -- (at _tp [5 6])
+
+;; same rows as the flat table, crossing partition boundaries
+(take _tp 3) -- (take _tf 3)
+(take _tp -4) -- (take _tf -4)
+(take _tp 7) -- (take _tf 7)
+(take _tp -7) -- (take _tf -7)
+
+;; the partition key, sym and string columns
+(at (take _tp 3) 'date) -- [2024.01.01 2024.01.01 2024.01.02]
+(at (take _tp -3) 'date) -- [2024.01.02 2024.01.03 2024.01.03]
+(at (take _tp 3) 's) -- ['x 'y 'z]
+(at (take _tp -3) 's) -- ['v 'u 'x]
+(at (take _tp 2) 'name) -- (list "alpha" "beta")
+(at (take _tp -2) 'name) -- (list "gamma" "delta")
+
+;; nulls in a column and in the partition without the column stay null
+(at (take _tp 4) 'c) -- [10 0Nl 0Nl 40]
+(nil? (at (at (take _tp 2) 'c) 1)) -- true
+(at (take _tp -5) 'b) -- [0Nf 0Nf 0Nf 6.5 7.5]
+(nil? (at (at (take _tp -5) 'name) 0)) -- true
+(at (at (take _tp -5) 'name) 3) -- "gamma"
+
+;; zero rows keeps the schema
+(count (take _tp 0)) -- 0
+(take _tp 0) -- (take _tf 0)
+
+;; a count past the row count wraps, as for flat tables and vectors
+(count (take _tp 9)) -- 9
+(take _tp 9) -- (take _tf 9)
+(take _tp -9) -- (take _tf -9)
+(at (take _tp 9) 'date) -- [2024.01.01 2024.01.01 2024.01.02 2024.01.02 2024.01.02 2024.01.03 2024.01.03 2024.01.01 2024.01.01]
+
+;; range take [start amount]
+(take _tp [1 3]) -- (take _tf [1 3])
+(take _tp [-3 2]) -- (take _tf [-3 2])
+(take _tp [5 10]) -- (take _tf [5 10])
+(count (take _tp [7 2])) -- 0
+(.sys.exec "rm -rf /tmp/rfl_take_parted")

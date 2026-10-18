@@ -648,7 +648,8 @@ typedef struct {
     uint8_t*       ob;       /* output base; element i writes ob[i - ob_base] */
     int64_t        ob_base;  /* 0 for full-vec output; morsel start for fused-sel */
     int8_t         ct;
-    /* SYM columns: per-domain-position membership verdict (1 = in set),
+    /* SYM columns: per-domain-position membership verdict (1 = in set;
+     * null slot preadjusted so XOR with negate always yields 0),
      * built once over the VOCABULARY in in_build_worker_ctx.  Turns the
      * per-row linear set scan into one byte load — any set size, width-
      * specialized, vectorizable.  NULL when not applicable. */
@@ -1155,6 +1156,9 @@ static in_ctx_status_t in_build_ctx_core(ray_t* atom, int8_t ct, bool may_null,
                 memset(lut, 0, (size_t)d);
                 for (int64_t j = 0; j < sv_len; j++)
                     if (svi[j] >= 0 && svi[j] < d) lut[svi[j]] = 1;
+                /* Null rows fail both in and not-in. The worker XORs every
+                 * entry with negate, so preadjust ID 0 to keep it false. */
+                lut[0] = (uint8_t)negate;
                 *lut_hdr_out = lh;
                 symlut = lut;
             }
@@ -1299,7 +1303,10 @@ ray_t* ray_in_vec_exec(ray_t* col, ray_t* set, bool negate) {
     return out;
 }
 
-static ray_t* flatten_parted_col(ray_t* col);
+static ray_t* flatten_parted_col(ray_t* col, ray_t* tbl);
+static ray_t* flatten_parted_table(ray_t* tbl, ray_t* counts_src);
+static int64_t parted_table_rows(ray_t* tbl, ray_t* counts_src);
+static ray_t* parted_result_validate(ray_t* tbl, ray_t* counts_src);
 
 /* Debug builds check that a parted column flattened out of a table has the
  * table's row count, its MAPCOMMON total (#724: a short flat column was read
@@ -1307,6 +1314,7 @@ static ray_t* flatten_parted_col(ray_t* col);
 #ifdef DEBUG
 #include <assert.h>
 static int64_t dbg_mapcommon_rows(ray_t* tbl) {
+    if (!tbl || RAY_IS_ERR(tbl) || tbl->type != RAY_TABLE) return -1;
     for (int64_t c = 0; c < ray_table_ncols(tbl); c++) {
         ray_col_meta_t m;
         if (ray_table_col_meta_idx(tbl, c, &m) && m.type == RAY_MAPCOMMON) return m.len;
@@ -1320,16 +1328,18 @@ static int64_t dbg_mapcommon_rows(ray_t* tbl) {
 #define PARTED_FLAT_DCHECK(tbl, flat) ((void)0)
 #endif
 
-/* GUID membership fallback: the typed `in` kernel bails on guid operands
- * (16-byte cells it can't compare), so route them through the general
- * ray_in_fn path, which builds a guid-aware hashset.  `col` is a materialized
- * column vector, so ray_in_fn returns a fresh RAY_BOOL vector we own and may
- * invert in place for not-in. */
-static ray_t* exec_in_guid_fallback(ray_t* col, ray_t* set, bool negate) {
+/* General membership fallback: the typed `in` kernel bails on guid operands
+ * (16-byte cells it can't compare) and on string columns (variable-length
+ * cells), so route them through the general ray_in_fn path, which builds a
+ * guid- and string-aware hashset.  `col` is a materialized column vector, so
+ * ray_in_fn returns a fresh RAY_BOOL vector we own and may invert in place
+ * for not-in. */
+static ray_t* exec_in_general_fallback(ray_t* col, ray_t* set, bool negate,
+                                       ray_t* tbl) {
     ray_t* input = col;
     bool owns_input = false;
     if (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON) {
-        input = flatten_parted_col(col);
+        input = flatten_parted_col(col, tbl);
         if (!input || RAY_IS_ERR(input)) return input ? input : ray_error("oom", NULL);
         owns_input = true;
     }
@@ -1354,7 +1364,17 @@ static ray_t* exec_in_guid_fallback(ray_t* col, ray_t* set, bool negate) {
         r = out;
     }
 
-    if (r->type == RAY_BOOL) {
+    /* The caller indexes the answer as one bool per row; anything else is
+     * not a membership verdict for this column. */
+    if (r->type != RAY_BOOL || r->len != (ray_is_atom(col) ? 1 : ray_len(input))) {
+        int8_t rt = r->type;
+        ray_release(r);
+        if (owns_input) ray_release(input);
+        return ray_error("type", "in: membership of a %s column answered %s, not a bool per row",
+                         ray_type_name(ray_is_atom(col) ? (int8_t)-col->type : input->type),
+                         ray_type_name(rt));
+    }
+    {
         uint8_t* b = (uint8_t*)ray_data(r);
         if (negate)
             for (int64_t i = 0; i < r->len; i++) b[i] = (uint8_t)!b[i];
@@ -1370,7 +1390,7 @@ static ray_t* exec_in_guid_fallback(ray_t* col, ray_t* set, bool negate) {
             const uint8_t* data = (const uint8_t*)ray_data(input);
             for (int64_t i = 0; i < r->len; i++)
                 if (memcmp(data + i * 16, null_guid, 16) == 0) b[i] = 0;
-        } else if (ray_vec_may_have_nulls(col)) {
+        } else if (ray_vec_may_have_nulls(input)) {
             for (int64_t i = 0; i < r->len; i++)
                 if (ray_vec_is_null(input, i)) b[i] = 0;
         }
@@ -1379,13 +1399,26 @@ static ray_t* exec_in_guid_fallback(ray_t* col, ray_t* set, bool negate) {
     return r;
 }
 
-/* True when either operand is a guid column/atom (parted base included). */
-static bool in_is_guid(ray_t* col, ray_t* set) {
+/* True when the typed kernel's refusal is a shape the general path answers:
+ * a guid on either side, or a string on either side (parted base included)
+ * — a string column, or any column against a string set, which matches no
+ * row of another type exactly as the bare `in` does.  A string ATOM subject
+ * has one verdict only against a column of cells; against a lone string or
+ * a list, ray_in_fn answers it per character, which is not a row verdict,
+ * so those shapes stay out. */
+static bool in_has_general_fallback(ray_t* col, ray_t* set) {
     int8_t ct = ray_is_atom(col) ? (int8_t)(-col->type) : col->type;
     int8_t st = ray_is_atom(set) ? (int8_t)(-set->type) : set->type;
     if (RAY_IS_PARTED(ct)) ct = (int8_t)RAY_PARTED_BASETYPE(ct);
     if (RAY_IS_PARTED(st)) st = (int8_t)RAY_PARTED_BASETYPE(st);
-    return ct == RAY_GUID || st == RAY_GUID;
+    if (ct == RAY_GUID || st == RAY_GUID) return true;
+    if (ct != RAY_STR && st != RAY_STR) return false;
+    /* Only a column of cells answers one verdict per row: a LIST column's
+     * cell may be a vector, and its answer a list no mask can use. */
+    if (!ray_is_atom(col) && !(ct >= RAY_BOOL && ct <= RAY_STR)) return false;
+    if (ct == RAY_STR && ray_is_atom(col))
+        return !ray_is_atom(set) && st != RAY_LIST;
+    return true;
 }
 
 static ray_t* exec_in(ray_graph_t* g, ray_op_t* op, ray_t* col, ray_t* set) {
@@ -1417,8 +1450,8 @@ static ray_t* exec_in(ray_graph_t* g, ray_op_t* op, ray_t* col, ray_t* set) {
                                              svf_stack, svi_stack,
                                              &in_ctx, &sv_hdr, &lut_hdr);
     if (st == IN_CTX_UNSUPPORTED) {
-        if (in_is_guid(col, set))
-            return exec_in_guid_fallback(col, set, negate);
+        if (in_has_general_fallback(col, set))
+            return exec_in_general_fallback(col, set, negate, g ? g->table : NULL);
         return ray_error("nyi", "OP_IN on RAY_STR not yet implemented");
     }
     if (st == IN_CTX_OOM)
@@ -2021,7 +2054,7 @@ typedef struct {
     int              nkeys;
     bool             has_zero;
     bool             negate;
-    bool             sym_view_ok;      /* SYM: a view's id-0 rows answer as the kernel's */
+    bool             sym_zero_fails;   /* SYM: id-0 rows fail both in and not in, as in the kernel */
     /* The float twin (a float column or set: the kernel compares doubles
      * with ==, so -0.0 matches +0.0 and a NaN matches nothing): the probe
      * as doubles, sorted, NaN dropped (fkeys == NULL: no float bounds);
@@ -2104,11 +2137,16 @@ static int in_sel_bounds(const in_sel_rfill_ctx_t* c, int64_t start, int64_t n, 
     ray_enc_vview_t v;                                  /* on this task's stack */
     int vr = ray_col_src_vview(c->src, start / RAY_ENC_VEC, &v, err);
     if (vr <= 0 || v.n != n) return vr < 0 ? -1 : 0;
-    if (v.type == RAY_SYM && !c->sym_view_ok && v.n_nulls > 0) return 0;
     if (!ray_enc_eval_in(&v, c->keys, c->nkeys, 0, out)) return 0;
     if (c->negate) {
         for (int64_t i = 0; i < n; i++) out[i] ^= 1;
         ray_enc_mask_nulls(&v, 0, out);
+    }
+    if (v.type == RAY_SYM && c->sym_zero_fails && v.n_nulls > 0) {
+        uint8_t zero[RAY_ENC_VEC];                      /* the view's id-0 rows */
+        const int64_t z = 0;
+        if (!ray_enc_eval_in(&v, &z, 1, 0, zero)) return 0;
+        for (int64_t i = 0; i < n; i++) out[i] &= (uint8_t)(zero[i] ^ 1);
     }
     return 1;
 }
@@ -2170,10 +2208,11 @@ static void in_rfill_setup(in_sel_rfill_ctx_t* f, in_worker_ctx_t* ic, ray_col_s
             f->keys = keys;
             f->nkeys = (int)nk;
             f->has_zero = src->type == RAY_SYM && nk > 0 && keys[0] == 0;
-            /* a SYM view's id-0 rows answer (0 in set) ^ negate, as the
-             * verdict LUT and the unchecked loop do; the null-checked
-             * loop passes them as 0, so it takes views without them */
-            f->sym_view_ok = ic->symlut || !ic->col_has_nulls;
+            /* a SYM view's id-0 rows answer as the kernel's: 0 under the
+             * verdict LUT and the null-checked loop (null rows fail both
+             * in and not in, #739), (0 in set) ^ negate under the
+             * unchecked loop */
+            f->sym_zero_fails = ic->symlut || ic->col_has_nulls;
         }
     }
     if (ic->use_double && ic->sv_len <= INT32_MAX) {
@@ -2697,11 +2736,14 @@ static inline bool group_has_keys(ray_graph_t* g, ray_op_t* group_op) {
 
 /* True when every leaf of the op tree under `id` is a constant or, with
  * `reduced`, sits under a reduction. */
-static bool op_tree_leaves(ray_graph_t* g, uint32_t id, bool reduced, int depth) {
+static bool op_tree_leaves(ray_graph_t* g, uint32_t id, bool reduced, bool atoms_only, int depth) {
     if (id >= g->node_count || depth > 64) return false;
     ray_op_t* n = &g->nodes[id];
     switch (n->opcode) {
-    case OP_CONST: return true;
+    case OP_CONST: {
+        ray_op_ext_t* x = find_ext(g, id);
+        return !atoms_only || (x && x->literal && ray_is_atom(x->literal));
+    }
     case OP_SCAN:  return false;
     case OP_SUM: case OP_PROD: case OP_ALL: case OP_ANY:
     case OP_MIN: case OP_MAX:
@@ -2713,10 +2755,17 @@ static bool op_tree_leaves(ray_graph_t* g, uint32_t id, bool reduced, int depth)
     }
     if (n->arity == 0) return false;
     for (uint32_t i = 0; i < n->arity && i < 2; i++)
-        if (!op_tree_leaves(g, n->in_id[i], reduced, depth + 1)) return false;
+        if (!op_tree_leaves(g, n->in_id[i], reduced, atoms_only, depth + 1)) return false;
     if (n->opcode == OP_IF) {           /* the else branch rides in the ext */
         ray_op_ext_t* x = find_ext(g, id);
-        if (!x || !op_tree_leaves(g, x->third_in, reduced, depth + 1)) return false;
+        if (!x || !op_tree_leaves(g, x->third_in, reduced, atoms_only, depth + 1)) return false;
+    }
+    if (n->opcode == OP_CONCAT) {
+        ray_op_ext_t* x = find_ext(g, id);
+        if (!x) return false;
+        uint32_t* extra = (uint32_t*)(x + 1);
+        for (int64_t i = 2; i < x->sym; i++)
+            if (!op_tree_leaves(g, extra[i - 2], reduced, atoms_only, depth + 1)) return false;
     }
     return true;
 }
@@ -2725,14 +2774,19 @@ static bool op_tree_leaves(ray_graph_t* g, uint32_t id, bool reduced, int depth)
  * leaf is a constant or sits under a reduction.  Tells a scalar-only SELECT
  * column (`(+ (sum x) 0)`) from a one-row one, which the column lengths
  * cannot on a one-row table (#675). */
-static bool op_tree_is_scalar(ray_graph_t* g, uint32_t id) {
-    return op_tree_leaves(g, id, true, 0);
+bool op_tree_is_scalar(ray_graph_t* g, uint32_t id) {
+    return op_tree_leaves(g, id, true, false, 0);
+}
+
+/* As above, but vector constants do not count as scalar atoms. */
+bool op_tree_is_atom(ray_graph_t* g, uint32_t id) {
+    return op_tree_leaves(g, id, true, true, 0);
 }
 
 /* True when the op tree under `id` reads no column at all, not even under a
  * reduction: a literal, or an expression over literals. */
 static bool op_tree_is_const(ray_graph_t* g, uint32_t id) {
-    return op_tree_leaves(g, id, false, 0);
+    return op_tree_leaves(g, id, false, false, 0);
 }
 
 /* Execute a pushed-down filter interposed as a GROUP's inputs[0]
@@ -2763,7 +2817,11 @@ static ray_t* exec_pushed_group_filter(ray_graph_t* g, ray_op_t* filter_op) {
  * scan or literal.  Only scalar expression nodes (OP_SCAN/OP_CONST and the
  * element-wise range OP_ROUND..OP_IDIV) are admitted in the walk; any other
  * opcode, an oversized graph, or overflow returns -1 — callers must treat
- * that as "unknown" and skip the optimisation. */
+ * that as "unknown" and skip the optimisation.  So does a constant holding
+ * several values: a vector of the table's length stands for a column, row
+ * aligned with the table, and the compacted survivors would read it from
+ * its first cell on (one of another length is the group's length error,
+ * which measures it against the table). */
 /* Opcodes handled by the elementwise case of exec_node_inner — must
  * match its case labels (ROUND sits at 9, outside NEG..CAST; IDIV at
  * 49, outside ADD..MAX2; extra unary math starts at 137). */
@@ -2811,7 +2869,12 @@ static int collect_scan_syms(ray_graph_t* g, const uint32_t* roots, int nroots,
             }
             continue;
         }
-        if (node->opcode == OP_CONST) continue;
+        if (node->opcode == OP_CONST) {
+            ray_op_ext_t* cx = find_ext(g, nid);
+            ray_t* lit = cx ? cx->literal : NULL;
+            if (lit && !ray_is_atom(lit) && ray_len(lit) != 1) return -1;
+            continue;
+        }
         /* Admit only scalar element-wise expression nodes. */
         if (!op_is_elementwise(node->opcode)) return -1;
 
@@ -2856,6 +2919,63 @@ static int refine_in_keep(ray_graph_t* g, ray_op_t* pred, ray_t* tbl, int64_t* k
     keep[0] = x->sym;
     atomic_fetch_add(&g_refine_in, 1);
     return 1;
+}
+
+/* Does a GROUP read a constant of several values as rows: a vector
+ * literal under its key or aggregate inputs, as one or as an operand of an
+ * element-wise node?  Such a vector stands for a column of the table it was
+ * written against, so compacting the table under a where: would leave it
+ * longer than the survivors.  An operand of any other node (the set of an
+ * `in`, say) is no row input and does not count. */
+static bool group_reads_vector_const(ray_graph_t* g, ray_op_ext_t* gx) {
+    if (!gx) return false;
+    uint32_t nc = g->node_count;
+    if (nc > 4096) return true;
+    bool visited[4096];
+    memset(visited, 0, nc * sizeof(bool));
+    uint32_t stack[64];
+    bool rows[64];
+    int sp = 0;
+    for (uint8_t k = 0; k < gx->n_keys; k++) {
+        if (sp >= 64) return true;
+        stack[sp] = gx->keys[k]; rows[sp++] = true;
+    }
+    for (uint8_t a = 0; a < gx->n_aggs; a++) {
+        uint32_t ins[2] = { gx->agg_ins ? gx->agg_ins[a] : RAY_OP_NONE,
+                            gx->agg_ins2 ? gx->agg_ins2[a] : RAY_OP_NONE };
+        for (int i = 0; i < 2; i++) {
+            if (ins[i] == RAY_OP_NONE) continue;
+            if (sp >= 64) return true;
+            stack[sp] = ins[i]; rows[sp++] = true;
+        }
+    }
+    while (sp > 0) {
+        sp--;
+        uint32_t nid = stack[sp];
+        bool as_rows = rows[sp];
+        if (nid >= nc) return true;
+        ray_op_t* node = &g->nodes[nid];
+        if (node->flags & OP_FLAG_DEAD) continue;
+        if (node->opcode == OP_CONST) {
+            ray_op_ext_t* cx = find_ext(g, nid);
+            ray_t* lit = cx ? cx->literal : NULL;
+            if (as_rows && lit && !ray_is_atom(lit) && ray_len(lit) != 1) return true;
+            continue;
+        }
+        if (visited[nid]) continue;
+        visited[nid] = true;
+        bool child_rows = op_is_elementwise(node->opcode);
+        ray_op_ext_t* nx = find_ext(g, nid);
+        uint32_t kids[3] = { node->arity > 0 ? node->in_id[0] : RAY_OP_NONE,
+                             node->arity > 1 ? node->in_id[1] : RAY_OP_NONE,
+                             nx && nx->third_in != 0 ? nx->third_in : RAY_OP_NONE };
+        for (int i = 0; i < 3; i++) {
+            if (kids[i] == RAY_OP_NONE) continue;
+            if (sp >= 64) return true;
+            stack[sp] = kids[i]; rows[sp++] = child_rows;
+        }
+    }
+    return false;
 }
 
 /* collect_scan_syms over a GROUP's key + agg-input subtrees. */
@@ -3199,6 +3319,9 @@ void ray_exec_memo_pop(ray_graph_t* g, const ray_exec_memo_save_t* save) {
     g->memo_hdr = save->hdr; g->memo_table = save->table;
 }
 
+/* Row filters being executed on this thread, the outermost first. */
+static RAY_TLS int tl_filter_depth;
+
 ray_t* exec_node(ray_graph_t* g, ray_op_t* op) {
     if (!op) return ray_error("nyi", NULL);
 
@@ -3250,8 +3373,21 @@ ray_t* exec_node(ray_graph_t* g, ray_op_t* op) {
         }
     }
 
+    /* A row filter (not a HAVING over a group); an `and` runs as a chain of
+     * them, each executing the next one in as its input. */
+    bool row_filter = false;
+    if (op->opcode == OP_FILTER) {
+        ray_op_t* fc = op_child(g, op, 0);
+        row_filter = !fc || fc->opcode != OP_GROUP;
+    }
+    if (row_filter) tl_filter_depth++;
     ray_t* _prof_result = exec_node_inner(g, op);
     tl_exec_depth--;
+    /* The outermost filter of a chain has the final selection: the
+     * select's columns held back for it can be requested now. */
+    if (row_filter && --tl_filter_depth == 0 && _prof_result && !RAY_IS_ERR(_prof_result))
+        ray_select_scan_filtered(g->selection,
+            _prof_result->type == RAY_TABLE ? ray_table_nrows(_prof_result) : 0);
 
     /* First consumer of a shared node: keep a ref for the others (a lazy
      * value is not kept — materialising it is the consumer's business). */
@@ -3348,49 +3484,14 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
             if (col->type == RAY_MAPCOMMON)
                 return materialize_mapcommon(col);
             if (RAY_IS_PARTED(col->type)) {
-                /* Concat parted segments into flat vector (cold path) */
-                int8_t base = (int8_t)RAY_PARTED_BASETYPE(col->type);
-                ray_t** sps = (ray_t**)ray_data(col);
-                int64_t total = ray_parted_nrows(col);
-
-                /* RAY_STR: deep-copy to handle multi-pool segments */
-                if (base == RAY_STR) {
-                    ray_t* f = parted_flatten_str(sps, col->len, total);
+                /* Concat parted segments into a flat vector (cold path);
+                 * the table's partition counts give a missing segment its
+                 * rows as typed nulls (ragged parted table). */
+                {
+                    ray_t* f = flatten_parted_col(col, scan_tbl);
                     PARTED_FLAT_DCHECK(scan_tbl, f);
                     return f;
                 }
-                /* RAY_LIST: share (retain) elements — byte-copy would
-                 * alias them without a refcount (issue #355). */
-                if (base == RAY_LIST) {
-                    ray_t* f = parted_flatten_list(sps, col->len, total);
-                    PARTED_FLAT_DCHECK(scan_tbl, f);
-                    return f;
-                }
-
-                uint8_t sba = (base == RAY_SYM)
-                            ? parted_sym_max_attrs(sps, col->len) : 0;
-                ray_t* flat = typed_vec_new(base, sba, total);
-                if (!flat || RAY_IS_ERR(flat))
-                    return flat ? flat : ray_error("oom", NULL);
-                flat->len = total;
-                ray_t** segs = sps;
-                int64_t off = 0;
-                uint8_t seg_nulls = 0;
-                for (int64_t s = 0; s < col->len; s++) {
-                    if (!segs[s] || segs[s]->len <= 0) continue;
-                    parted_copy_cells(ray_data(flat), base, sba, off,
-                                      segs[s], 0, segs[s]->len);
-                    seg_nulls |= segs[s]->attrs & RAY_ATTR_HAS_NULLS;
-                    off += segs[s]->len;
-                }
-                /* Null propagation: propagate HAS_NULLS across segments. */
-                flat->attrs |= seg_nulls;
-                /* Raw-copied SYM cell ids resolve over the partitions'
-                 * shared domain (first SYM segment is the rep). */
-                if (flat->type == RAY_SYM)
-                    ray_sym_vec_adopt_domain(flat, sym_domain_rep(col));
-                PARTED_FLAT_DCHECK(scan_tbl, flat);
-                return flat;
             }
             ray_retain(col);
             return col;
@@ -3996,7 +4097,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                             if (dom_id < 0) absent = true;
                             else probe = dom_id;
                         }
-                        const int64_t* grows = NULL;
+                        ray_idx_rows_t grows = { NULL, false };
                         int64_t gn = 0;
                         int hit = absent ? 0
                             : ray_index_hash_group(eq_col, probe, &grows, &gn);
@@ -4018,7 +4119,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                             bool mono = true;
                             int64_t prevv = INT64_MIN;
                             for (int64_t pp = 0; pp < gn; pp++) {
-                                int64_t v = read_col_i64(rgd, grows[pp], rt, ra);
+                                int64_t v = read_col_i64(rgd, ray_idx_rows_at(grows, pp), rt, ra);
                                 if (v < prevv) { mono = false; break; }
                                 prevv = v;
                             }
@@ -4026,19 +4127,19 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                                 int64_t a = 0, b = gn;   /* first pos >= lo */
                                 while (a < b) {
                                     int64_t m = a + (b - a) / 2;
-                                    if (read_col_i64(rgd, grows[m], rt, ra) < lo) a = m + 1;
+                                    if (read_col_i64(rgd, ray_idx_rows_at(grows, m), rt, ra) < lo) a = m + 1;
                                     else b = m;
                                 }
                                 int64_t startp = a;
                                 b = gn;                   /* first pos > hi */
                                 while (a < b) {
                                     int64_t m = a + (b - a) / 2;
-                                    if (read_col_i64(rgd, grows[m], rt, ra) <= hi) a = m + 1;
+                                    if (read_col_i64(rgd, ray_idx_rows_at(grows, m), rt, ra) <= hi) a = m + 1;
                                     else b = m;
                                 }
                                 int64_t nrows = ray_table_nrows(input);
-                                ray_t* sel = ray_index_rowsel_from_ids(
-                                    nrows, grows + startp, a - startp);
+                                ray_t* sel = ray_index_rowsel_from_rows(
+                                    nrows, ray_idx_rows_from(grows, startp), a - startp);
                                 if (sel) {
                                     ray_idx_hits[IDX_SITE_FILTER_EQRANGE]++;
                                     ray_idx_note_use(eq_col);
@@ -4132,8 +4233,8 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                  * expr-evaluable BOOL subtree, stream its per-morsel bools
                  * straight into a rowsel — skipping both the full BOOL vec and
                  * the second BOOL→rowsel scan.  Any unsupported shape (parted,
-                 * >RAY_POOL_MAX_TASKS, OOM) returns NULL+all_pass=false,
-                 * falling through to the bool path. */
+                 * OOM) returns NULL+all_pass=false, falling through to the
+                 * bool path. */
                 ray_op_t* pred_root = op_child(g, op, 1);
                 {
                     int64_t fnrows = ray_table_nrows(input);
@@ -4343,6 +4444,19 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 g->selection = NULL;
                 input = compacted;
                 tbl = compacted;
+            }
+            /* An all-pass where: leaves no selection and hands over the
+             * source itself; a parted source still has segmented columns,
+             * which the sort cannot gather.  Sort a flattened copy, as the
+             * partial-where path above does. */
+            if (!g->selection && tbl && tbl->type == RAY_TABLE) {
+                ray_t* flat = flatten_parted_table(tbl, g->table);
+                if (flat) {
+                    ray_release(input);
+                    if (RAY_IS_ERR(flat)) return flat;
+                    input = flat;
+                    tbl = flat;
+                }
             }
             ray_t* result = exec_sort(g, op, tbl, 0);
             exec_release_tmp(g, input);
@@ -4583,9 +4697,11 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
             ray_op_ext_t* ext = find_ext(g, op->id);
             int64_t n = ext ? ext->sym : 10;
 
-            /* Fused sort+limit: detect SORT child → only gather N rows */
+            /* Fused sort+limit: detect SORT child → only gather N rows.  Not
+             * for N = 0: exec_sort reads a 0 limit as none (every row); the
+             * plain HEAD below trims the sort to no rows. */
             ray_op_t* child_op = op_child(g, op, 0);
-            if (child_op && child_op->opcode == OP_SORT) {
+            if (child_op && child_op->opcode == OP_SORT && n > 0) {
                 ray_t* sort_input = exec_node(g, op_child(g, child_op, 0));
                 if (!sort_input || RAY_IS_ERR(sort_input)) return sort_input;
                 ray_t* tbl = (sort_input->type == RAY_TABLE) ? sort_input : g->table;
@@ -4613,6 +4729,16 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     g->selection = NULL;
                     sort_input = compacted;
                     tbl = compacted;
+                }
+                /* All-pass where: over a parted source: see OP_SORT */
+                if (!g->selection && tbl && tbl->type == RAY_TABLE) {
+                    ray_t* flat = flatten_parted_table(tbl, g->table);
+                    if (flat) {
+                        ray_release(sort_input);
+                        if (RAY_IS_ERR(flat)) return flat;
+                        sort_input = flat;
+                        tbl = flat;
+                    }
                 }
                 ray_t* result = exec_sort(g, child_op, tbl, n);
                 exec_release_tmp(g, sort_input);
@@ -4642,7 +4768,8 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     if (res) { owned_tbl = res; tbl = res; }
                     /* NULL → lazy path; g->selection installed, tbl unchanged */
                 } else if (g->selection && tbl->type == RAY_TABLE &&
-                           group_has_keys(g, child_op)) {
+                           group_has_keys(g, child_op) &&
+                           !group_reads_vector_const(g, find_ext(g, child_op->id))) {
                     /* A keyless group (an all-aggregate select) is one row
                      * whatever the limit, and its aggregates read the
                      * selection themselves: compacting a no-match where:
@@ -4746,10 +4873,12 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                         int8_t base = (int8_t)RAY_PARTED_BASETYPE(col->type);
                         ray_t** sp = (ray_t**)ray_data(col);
                         ray_t* head_vec;
+                        int64_t hcn = 0;
+                        const int64_t* hcnt = parted_table_counts(input, &hcn);
                         if (base == RAY_STR) {
-                            head_vec = parted_head_str(sp, col->len, n);
+                            head_vec = parted_head_str_c(sp, col->len, n, hcnt, hcn);
                         } else if (base == RAY_LIST) {
-                            head_vec = parted_head_list(sp, col->len, n);
+                            head_vec = parted_head_list_c(sp, col->len, n, hcnt, hcn);
                         } else {
                             uint8_t ba = (base == RAY_SYM)
                                        ? parted_sym_max_attrs(sp, col->len) : 0;
@@ -4761,9 +4890,15 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                                 int64_t dst_off = 0;
                                 uint8_t seg_nulls = 0;
                                 for (int64_t s = 0; s < col->len && remaining > 0; s++) {
-                                    if (!segs[s]) continue;
-                                    int64_t take = segs[s]->len;
+                                    int64_t take = parted_seg_rows(segs, s, hcnt, hcn);
                                     if (take > remaining) take = remaining;
+                                    if (!segs[s]) {
+                                        /* a partition without the column */
+                                        parted_fill_nulls(head_vec, dst_off, take);
+                                        dst_off += take;
+                                        remaining -= take;
+                                        continue;
+                                    }
                                     parted_copy_cells(ray_data(head_vec), base,
                                                       ba, dst_off, segs[s], 0,
                                                       take);
@@ -4899,10 +5034,12 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                         int8_t base = (int8_t)RAY_PARTED_BASETYPE(col->type);
                         ray_t** tsp = (ray_t**)ray_data(col);
                         ray_t* tail_vec;
+                        int64_t tcn = 0;
+                        const int64_t* tcnt = parted_table_counts(input, &tcn);
                         if (base == RAY_STR) {
-                            tail_vec = parted_tail_str(tsp, col->len, n);
+                            tail_vec = parted_tail_str_c(tsp, col->len, n, tcnt, tcn);
                         } else if (base == RAY_LIST) {
-                            tail_vec = parted_tail_list(tsp, col->len, n);
+                            tail_vec = parted_tail_list_c(tsp, col->len, n, tcnt, tcn);
                         } else {
                             uint8_t tba = (base == RAY_SYM)
                                         ? parted_sym_max_attrs(tsp, col->len) : 0;
@@ -4914,10 +5051,15 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                                 int64_t dst = n;
                                 uint8_t seg_nulls = 0;
                                 for (int64_t s = col->len - 1; s >= 0 && remaining > 0; s--) {
-                                    if (!segs[s]) continue;
-                                    int64_t take = segs[s]->len;
+                                    int64_t take = parted_seg_rows(segs, s, tcnt, tcn);
                                     if (take > remaining) take = remaining;
                                     dst -= take;
+                                    if (!segs[s]) {
+                                        /* a partition without the column */
+                                        parted_fill_nulls(tail_vec, dst, take);
+                                        remaining -= take;
+                                        continue;
+                                    }
                                     parted_copy_cells(ray_data(tail_vec), base,
                                                       tba, dst, segs[s],
                                                       segs[s]->len - take, take);
@@ -5149,6 +5291,19 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
             int64_t nr_in = ray_table_nrows(input);
             if (result && !RAY_IS_ERR(result)) {
                 int64_t rc = ray_table_ncols(result);
+                /* A collection projection may change the row count. Use
+                 * its length for scalar broadcasting; unequal non-scalar
+                 * lengths are rejected below, independently of column order. */
+                int64_t broadcast_len = nr_in;
+                bool has_collection = false;
+                for (int64_t c = 0; c < rc; c++) {
+                    ray_col_meta_t lm;   /* metadata: an encoded column stays encoded */
+                    if (!ray_table_col_meta_idx(result, c, &lm) || lm.type < 0) continue;
+                    int64_t len = lm.len;   /* a parted column: its rows across segments */
+                    if (len == 1) continue;
+                    if (!has_collection) broadcast_len = len;
+                    has_collection = true;
+                }
                 bool has_full = false;
                 if (nr_in != 1) {
                     for (int64_t c = 0; c < rc; c++) {
@@ -5172,6 +5327,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                         if (!op_tree_is_const(g, columns[c])) all_const = false;
                     has_full = all_const;
                 }
+                if (has_collection) has_full = true;
                 /* Every column a scalar: the reductions inside them already
                  * walked the where: selection (exec_reduction), so the
                  * one-row result is final.  Left installed, the selection
@@ -5182,11 +5338,14 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     g->selection = NULL;
                 }
                 /* A LIST here is an atom enlist has no vector for (F32). */
-                for (int64_t c = 0; nr_in != 1 && has_full && c < rc; c++) {
+                for (int64_t c = 0; broadcast_len != 1 && has_full && c < rc; c++) {
                     ray_col_meta_t cm;
                     if (!ray_table_col_meta_idx(result, c, &cm) || cm.type < 0 ||
                         RAY_IS_PARTED(cm.type) || cm.type == RAY_MAPCOMMON ||
                         cm.len != 1) continue;
+                    /* One input row does not turn a row-aligned expression
+                     * into a scalar. Only constants/reductions may expand. */
+                    if (nr_in == 1 && !op_tree_is_scalar(g, columns[c])) continue;
                     ray_t* cv = ray_table_col_idx(result, c);
                     if (cv && RAY_IS_ERR(cv)) {
                         ray_release(result);
@@ -5194,7 +5353,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                         ray_release(input);
                         return cv;
                     }
-                    ray_t* n_obj = make_i64(nr_in);
+                    ray_t* n_obj = make_i64(broadcast_len);
                     ray_t* wide = n_obj ? ray_take_fn(cv, n_obj) : ray_error("oom", NULL);
                     if (n_obj) ray_release(n_obj);
                     if (!wide || RAY_IS_ERR(wide)) {
@@ -5205,6 +5364,27 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     }
                     ray_table_set_col_idx(result, c, wide);
                     ray_release(wide);
+                }
+                /* Length-changing constant projections must not silently
+                 * truncate or pad the other columns during materialization.
+                 * A parted column with missing segments (ragged parted
+                 * table) is measured through the source's partition counts,
+                 * which the generic check does not know. */
+                ray_t* shape_err = parted_result_validate(result, input);
+                if (shape_err) {
+                    ray_release(result);
+                    g->table = saved_table;
+                    ray_release(input);
+                    return shape_err;
+                }
+                if (g->selection && parted_table_rows(result, input) != nr_in) {
+                    ray_t* err = ray_error("length",
+                        "select: collection projection has %lld rows; where requires %lld input-aligned rows",
+                        (long long)parted_table_rows(result, input), (long long)nr_in);
+                    ray_release(result);
+                    g->table = saved_table;
+                    ray_release(input);
+                    return err;
                 }
             }
 
@@ -5416,14 +5596,21 @@ ray_t* build_segment_table(ray_t* parted_tbl, int32_t seg_idx) {
     ray_t* seg_tbl = ray_table_new(ncols);
     if (!seg_tbl || RAY_IS_ERR(seg_tbl)) return seg_tbl;
 
-    /* Find segment row count from first parted column */
+    /* The segment's row count: the partition-key counts, else the first
+     * parted column's segment (a ragged table may lack a column in this
+     * partition; its counts still give the rows). */
     int64_t seg_rows = 0;
-    for (int64_t c = 0; c < ncols; c++) {
-        ray_col_meta_t m;
-        if (ray_table_col_meta_idx(parted_tbl, c, &m) && RAY_IS_PARTED(m.type)) {
-            ray_t* seg = seg_idx < m.n_segs ? ray_table_parted_seg_idx(parted_tbl, c, seg_idx) : NULL;
-            if (seg) seg_rows = ray_table_col_nrows(seg);
-            break;
+    {
+        int64_t ncnt = 0;
+        const int64_t* cnt = parted_table_counts(parted_tbl, &ncnt);
+        if (cnt && seg_idx < ncnt) seg_rows = cnt[seg_idx];
+        else for (int64_t c = 0; c < ncols; c++) {
+            ray_col_meta_t m;
+            if (ray_table_col_meta_idx(parted_tbl, c, &m) && RAY_IS_PARTED(m.type)) {
+                ray_t* seg = seg_idx < m.n_segs ? ray_table_parted_seg_idx(parted_tbl, c, seg_idx) : NULL;
+                if (seg) seg_rows = ray_table_col_nrows(seg);
+                break;
+            }
         }
     }
 
@@ -5477,10 +5664,53 @@ ray_t* build_segment_table(ray_t* parted_tbl, int32_t seg_idx) {
             seg_tbl = ray_table_add_col(seg_tbl, name_id, flat);
             ray_release(flat);
         } else if (RAY_IS_PARTED(m.type)) {
-            ray_t* seg = seg_idx < m.n_segs ? ray_table_parted_seg_idx(parted_tbl, c, seg_idx) : NULL;
-            if (!seg) {
+            if (seg_idx >= m.n_segs) {
                 ray_release(seg_tbl);
                 return ray_error("schema", NULL);
+            }
+            ray_t* seg = ray_table_parted_seg_idx(parted_tbl, c, seg_idx);
+            if (!seg) {
+                /* A partition without this column (a ragged parted table
+                 * built elsewhere than ray_read_parted, whose missing
+                 * segments are lazy all-null segments): its rows are the
+                 * type's null. */
+                int8_t base = (int8_t)RAY_PARTED_BASETYPE(m.type);
+                ray_t* nulls;
+                if (base == RAY_STR) {
+                    nulls = ray_vec_new(RAY_STR, seg_rows);
+                    for (int64_t r = 0; nulls && !RAY_IS_ERR(nulls) && r < seg_rows; r++) {
+                        nulls = ray_str_vec_append(nulls, "", 0);
+                        if (nulls && !RAY_IS_ERR(nulls)) ray_vec_set_null(nulls, r, true);
+                    }
+                } else if (base == RAY_LIST) {
+                    nulls = ray_list_new(seg_rows);
+                    if (nulls && !RAY_IS_ERR(nulls)) {
+                        ray_t** d = (ray_t**)ray_data(nulls);
+                        for (int64_t r = 0; r < seg_rows; r++) { ray_retain(RAY_NULL_OBJ); d[r] = RAY_NULL_OBJ; }
+                        nulls->len = seg_rows;
+                    }
+                } else {
+                    nulls = typed_vec_new(base, 0, seg_rows);
+                    if (nulls && !RAY_IS_ERR(nulls)) {
+                        nulls->len = seg_rows;
+                        parted_fill_nulls(nulls, 0, seg_rows);
+                        /* the domain of the first present segment */
+                        for (int64_t s = 0; base == RAY_SYM && s < m.n_segs; s++) {
+                            ray_t* rep = ray_table_parted_seg_idx(parted_tbl, c, s);
+                            if (!rep) continue;
+                            if (rep->type == RAY_ENCCOL) ray_enccol_adopt_domain(nulls, rep);
+                            else ray_sym_vec_adopt_domain(nulls, rep);
+                            break;
+                        }
+                    }
+                }
+                if (!nulls || RAY_IS_ERR(nulls)) {
+                    ray_release(seg_tbl);
+                    return nulls ? nulls : ray_error("oom", NULL);
+                }
+                seg_tbl = ray_table_add_col(seg_tbl, name_id, nulls);
+                ray_release(nulls);
+                continue;
             }
             if (ray_table_col_nrows(seg) != seg_rows) {        /* segments of one partition align */
                 ray_release(seg_tbl);
@@ -5638,7 +5868,8 @@ static bool dag_can_stream(ray_graph_t* g, ray_op_t* root) {
     return ok && has_default_scan;
 }
 
-static ray_t* ray_execute_inner(ray_graph_t* g, ray_op_t* root);
+static ray_t* ray_execute_inner(ray_graph_t* g, ray_op_t* root, bool reset_cancel);
+static _Thread_local int exec_depth;   /* nesting of ray_execute on this thread */
 
 /* Validate compiler-marked missing scans before execution.  Optimizer rewrites
  * may replace a root or eliminate such a scan from the live DAG (for example
@@ -5664,6 +5895,58 @@ static ray_t* validate_scan_columns(ray_graph_t* g) {
     return NULL;
 }
 
+void exec_scan_init(ray_pool_scan_t* s) {
+    s->n = 0;
+    s->rows = -1;
+    s->gate = NULL;
+    s->gate_log2 = 0;
+}
+
+void exec_scan_add_col(ray_pool_scan_t* s, ray_t* col) {
+    if (!col || col->mmod != 1 || col->type <= 0 || RAY_IS_PARTED(col->type) ||
+        col->type == RAY_MAPCOMMON || col->type == RAY_LIST || col->type == RAY_STR) return;
+    if (col->len <= 0 || (s->rows >= 0 && col->len != s->rows)) return;
+    size_t esz = ray_sym_elem_size(col->type, col->attrs);
+    if (esz == 0) return;
+    s->rows = col->len;
+    const uint8_t* base = (const uint8_t*)ray_data(col);
+    for (uint32_t k = 0; k < s->n; k++) if (s->base[k] == base) return;
+    size_t bytes = (size_t)col->len * esz;
+    if (s->n >= RAY_POOL_SCAN_MAX || ray_vm_resident(base, bytes)) return;
+    /* The pages at its start that are resident already, up to 4 MiB: read
+     * ahead with the header when the column was opened (see warm).  They
+     * run on from the first, so halving finds where they end. */
+    size_t lo = 0, hi = (bytes < ((size_t)4 << 20) ? bytes : ((size_t)4 << 20)) / 4096;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (ray_vm_resident(base + mid * 4096, 1)) lo = mid + 1; else hi = mid;
+    }
+    s->base[s->n] = base;
+    s->esz[s->n] = (uint32_t)esz;
+    s->warm[s->n] = (int64_t)(lo * 4096 / esz);
+    s->n++;
+}
+
+/* The graph's scanned columns, when they are mapped (see exec_scan_add_col);
+ * NULL when no scan reads a mapped column. */
+static const ray_pool_scan_t* exec_scan_columns(ray_graph_t* g, ray_pool_scan_t* s) {
+    exec_scan_init(s);
+    for (uint32_t i = 0; i < g->node_count; i++) {
+        ray_op_t* op = &g->nodes[i];
+        if (op->opcode != OP_SCAN) continue;
+        ray_op_ext_t* ext = find_ext(g, op->id);
+        if (!ext) continue;
+        uint16_t tid = 0;
+        memcpy(&tid, ext->base.pad, sizeof(tid));
+        ray_t* tbl = (tid > 0 && g->tables && (uint32_t)(tid - 1) < g->n_tables)
+                   ? g->tables[tid - 1] : g->table;
+        if (!tbl || tbl->type != RAY_TABLE) continue;
+        if (!ray_table_get_col_enc(tbl, ext->sym))   /* generation 2 reads by range */
+            exec_scan_add_col(s, ray_table_col(tbl, ext->sym));   /* a plain slot: no decode, no error */
+    }
+    return s->rows >= 0 ? s : NULL;
+}
+
 ray_t* ray_execute(ray_graph_t* g, ray_op_t* root) {
     /* The qstats capture mode is armed once per query at the eval boundary
      * (ray_eval, eval_depth==0) — covering PROF (profiler/query-log) AND the
@@ -5678,29 +5961,48 @@ ray_t* ray_execute(ray_graph_t* g, ray_op_t* root) {
      * would reset the elapsed clock and fire premature "final" ticks. */
     ray_t* scan_err = validate_scan_columns(g);
     if (scan_err) return scan_err;
+    /* Scan read-ahead: a registration over mapped columns made by the
+     * caller (a select, which also knows its filter) stands; otherwise the
+     * graph's own mapped scans are registered for its dispatches. */
+    ray_pool_scan_t scan;
+    const ray_pool_scan_t* prev_scan = ray_pool_scan_get();
+    bool own_scan = !prev_scan || prev_scan->rows < 0;
+    if (own_scan) ray_pool_scan_set(exec_scan_columns(g, &scan));
     /* Never NULL: callers test RAY_IS_ERR, which is false for NULL, and then
      * dereference.  The inner paths hand NULL back unchanged when a node,
      * a compaction or a merge fails to allocate (the flat path's
      * `return result`, the streaming path's seg_tbl / partial / merged
      * returns); `(times <lazy> ...)` would then crash in loop_count. */
-    ray_t* result = ray_execute_inner(g, root);
+    /* The cancel flag is reset at the outermost call only.  A node's own
+     * path may execute a sub-graph (the grouped expression bridge
+     * materializing an input the element-wise compiler declines, #756);
+     * were that call to reset the flag, a cancel that arrived before it
+     * would be dropped and the workers would run the remaining tickets. */
+    bool outermost = exec_depth++ == 0;
+    ray_t* result = ray_execute_inner(g, root, outermost);
+    exec_depth--;
+    if (own_scan) ray_pool_scan_set(prev_scan);
     return result ? result : ray_error("oom", NULL);
 }
 
 /* Flatten one parted/mapcommon column into a dense vector (mirrors the
  * OP_SCAN cold-path flatten at the top of this file).  Returns an owned
  * flat vector or a RAY_ERR.  Precondition: col is RAY_MAPCOMMON or
- * RAY_IS_PARTED. */
-static ray_t* flatten_parted_col(ray_t* col) {
+ * RAY_IS_PARTED.  `tbl` is the column's table, or NULL: its partition
+ * counts give a NULL segment (a partition without the column, see
+ * store/part.c) its rows, filled with the type's null. */
+static ray_t* flatten_parted_col(ray_t* col, ray_t* tbl) {
     if (col->type == RAY_MAPCOMMON)
         return materialize_mapcommon(col);
     int8_t base = (int8_t)RAY_PARTED_BASETYPE(col->type);
     ray_t** segs = (ray_t**)ray_data(col);
-    int64_t total = ray_parted_nrows(col);
+    int64_t ncnt = 0;
+    const int64_t* cnt = parted_table_counts(tbl, &ncnt);
     if (base == RAY_STR)
-        return parted_flatten_str(segs, col->len, total);
+        return parted_flatten_str_c(segs, col->len, cnt, ncnt);
     if (base == RAY_LIST)
-        return parted_flatten_list(segs, col->len, total);
+        return parted_flatten_list_c(segs, col->len, cnt, ncnt);
+    int64_t total = parted_rows_counted(col, cnt, ncnt);
     uint8_t sba = (base == RAY_SYM) ? parted_sym_max_attrs(segs, col->len) : 0;
     ray_t* flat = typed_vec_new(base, sba, total);
     if (!flat || RAY_IS_ERR(flat)) return flat ? flat : ray_error("oom", NULL);
@@ -5708,7 +6010,13 @@ static ray_t* flatten_parted_col(ray_t* col) {
     int64_t off = 0;
     uint8_t seg_nulls = 0;
     for (int64_t s = 0; s < col->len; s++) {
-        if (!segs[s] || segs[s]->len <= 0) continue;
+        if (!segs[s] || RAY_IS_ERR(segs[s])) {
+            int64_t n = parted_seg_rows(segs, s, cnt, ncnt);
+            parted_fill_nulls(flat, off, n);
+            off += n;
+            continue;
+        }
+        if (segs[s]->len <= 0) continue;
         parted_copy_cells(ray_data(flat), base, sba, off,
                           segs[s], 0, segs[s]->len);
         seg_nulls |= segs[s]->attrs & RAY_ATTR_HAS_NULLS;
@@ -5736,15 +6044,123 @@ static void exec_filt_keep(const int64_t** keep, int* keep_n) {
     }
 }
 
-static ray_t* ray_execute_inner(ray_graph_t* g, ray_op_t* root) {
+/* The partition-count source for `tbl`: itself when it carries the
+ * partition-key column, else `counts_src` (the source table a projection
+ * of parted columns was taken from, whose partitions it shares). */
+static ray_t* parted_counts_table(ray_t* tbl, ray_t* counts_src) {
+    int64_t n = 0;
+    if (parted_table_counts(tbl, &n)) return tbl;
+    return counts_src;
+}
+
+/* Rows of column c of `tbl`, a parted one counted through the partition
+ * counts; reads metadata only, except a parted column (its segments).
+ * -1 with *err set when the column fails to load. */
+static int64_t parted_col_rows(ray_t* tbl, int64_t c, const int64_t* cnt, int64_t ncnt, ray_t** err) {
+    *err = NULL;
+    ray_col_meta_t m;
+    if (!ray_table_col_meta_idx(tbl, c, &m)) return -2;   /* no column */
+    if (!RAY_IS_PARTED(m.type) || m.enc) return m.len;   /* an encoded parted column has every segment */
+    ray_t* col = ray_table_col_idx(tbl, c);
+    if (col && RAY_IS_ERR(col)) { *err = col; return -1; }
+    if (!col) return -2;
+    return parted_rows_counted(col, cnt, ncnt);
+}
+
+/* ray_table_validate_rectangular for a result that may hold parted columns
+ * with missing segments: every column must span the rows the partition
+ * counts (of `tbl`, else `counts_src`) give a parted column. */
+static ray_t* parted_result_validate(ray_t* tbl, ray_t* counts_src) {
+    int64_t ncols = ray_table_ncols(tbl);
+    bool any_parted = false;
+    for (int64_t c = 0; c < ncols && !any_parted; c++) {
+        ray_col_meta_t m;
+        if (ray_table_col_meta_idx(tbl, c, &m) && RAY_IS_PARTED(m.type)) any_parted = true;
+    }
+    if (!any_parted) return ray_table_validate_rectangular(tbl, "select");
+    int64_t ncnt = 0;
+    const int64_t* cnt = parted_table_counts(parted_counts_table(tbl, counts_src), &ncnt);
+    int64_t want = -1;
+    for (int64_t c = 0; c < ncols; c++) {
+        ray_t* err = NULL;
+        int64_t n = parted_col_rows(tbl, c, cnt, ncnt, &err);
+        if (err) return err;
+        if (n < 0) continue;
+        if (want < 0) want = n;
+        else if (n != want)
+            return ray_error("domain", "select: ragged columns (column %lld has %lld rows, expected %lld)",
+                             (long long)c, (long long)n, (long long)want);
+    }
+    return NULL;
+}
+
+/* Rows of a table whose first column may be a parted column with missing
+ * segments: counted through the partition counts. */
+static int64_t parted_table_rows(ray_t* tbl, ray_t* counts_src) {
+    ray_col_meta_t m;
+    if (ray_table_ncols(tbl) <= 0 || !ray_table_col_meta_idx(tbl, 0, &m) || !RAY_IS_PARTED(m.type))
+        return ray_table_nrows(tbl);
+    int64_t ncnt = 0;
+    const int64_t* cnt = parted_table_counts(parted_counts_table(tbl, counts_src), &ncnt);
+    ray_t* err = NULL;
+    int64_t n = parted_col_rows(tbl, 0, cnt, ncnt, &err);
+    if (err) { ray_error_free(err); return -1; }   /* no row count: the caller's check fails */
+    return n;
+}
+
+/* A flattened copy of `tbl` when any column is parted / mapcommon, built
+ * without mutating the (possibly stored) source; NULL when every column is
+ * already dense.  Returns an owned table or a RAY_ERR.  A ragged table (a
+ * partition without some column) flattens to the table's row count in
+ * every column, the missing rows as typed nulls; the counts come from
+ * `tbl`, or from `counts_src` when `tbl` is a projection without the
+ * partition-key column.  Only the parted columns are read (an encoded one
+ * through its materialization); the others are carried as they are. */
+static ray_t* flatten_parted_table(ray_t* tbl, ray_t* counts_src) {
+    int64_t ncols = ray_table_ncols(tbl);
+    ray_t* ctbl = parted_counts_table(tbl, counts_src);
+    bool any_parted = false;
+    for (int64_t c = 0; c < ncols; c++) {
+        ray_col_meta_t m;
+        if (ray_table_col_meta_idx(tbl, c, &m) && (RAY_IS_PARTED(m.type) || m.type == RAY_MAPCOMMON)) {
+            any_parted = true; break;
+        }
+    }
+    if (!any_parted) return NULL;
+    ray_t* out = ray_table_new(ncols);
+    for (int64_t c = 0; out && !RAY_IS_ERR(out) && c < ncols; c++) {
+        ray_col_meta_t m;
+        if (!ray_table_col_meta_idx(tbl, c, &m)) continue;
+        int64_t name = ray_table_col_name(tbl, c);
+        if (RAY_IS_PARTED(m.type) || m.type == RAY_MAPCOMMON) {
+            ray_t* col = ray_table_col_idx(tbl, c);
+            if (!col || RAY_IS_ERR(col)) { ray_release(out); return col ? col : ray_error("oom", NULL); }
+            ray_t* flat = flatten_parted_col(col, ctbl);
+            PARTED_FLAT_DCHECK(ctbl, flat);
+            if (!flat || RAY_IS_ERR(flat)) {
+                ray_release(out);
+                return flat ? flat : ray_error("oom", NULL);
+            }
+            out = ray_table_add_col(out, name, flat);
+            ray_release(flat);
+        } else {
+            ray_t* slot = ray_table_slot_idx(tbl, c);   /* encoded or plain, not decoded */
+            if (slot) out = ray_table_add_col(out, name, slot);
+        }
+    }
+    return out ? out : ray_error("oom", NULL);
+}
+
+static ray_t* ray_execute_inner(ray_graph_t* g, ray_op_t* root, bool reset_cancel) {
     ray_enc_note_exec_start();
     if (!g || !root) return ray_error("nyi", NULL);
 
     /* Lazy-init the global thread pool on first call */
     ray_pool_t* pool = ray_pool_get();
 
-    /* Reset cancellation flag at the start of each query */
-    if (pool)
+    /* Reset cancellation flag at the start of each query (not of a nested
+     * execution — see ray_execute) */
+    if (pool && reset_cancel)
         atomic_store_explicit(&pool->cancelled, 0, memory_order_relaxed);
 
     /* Detect streaming mode: check if g->table has parted columns.
@@ -5758,18 +6174,27 @@ static ray_t* ray_execute_inner(ray_graph_t* g, ray_op_t* root) {
         bool has_flat = false;
         /* Every parted and MAPCOMMON column covers the same rows: a
          * flattened column is sized by its own row count and consumers
-         * index up to the table's, so a shorter one (a hand-built wrapper
-         * with a missing segment; ray_read_parted fills those, #724) is
-         * refused here rather than read past its end. */
+         * index up to the table's, so a shorter one (#724) is refused here
+         * rather than read past its end.  A missing (NULL) segment of a
+         * hand-built wrapper counts its partition's rows, from the
+         * partition-key counts: the segment table and every flatten fill
+         * them with the type's null (ray_read_parted builds none). */
         int64_t parted_rows = -1;
+        int64_t pncnt = 0;
+        const int64_t* pcnt = parted_table_counts(g->table, &pncnt);
         for (int64_t c = 0; c < ray_table_ncols(g->table); c++) {
             ray_col_meta_t m;
             if (!ray_table_col_meta_idx(g->table, c, &m)) continue;
             if (RAY_IS_PARTED(m.type) || m.type == RAY_MAPCOMMON) {
-                if (parted_rows < 0) parted_rows = m.len;
-                else if (m.len != parted_rows)
+                int64_t rows = m.len;
+                if (RAY_IS_PARTED(m.type) && !m.enc && pcnt) {
+                    ray_t* pc = ray_table_col_idx(g->table, c);   /* a plain wrapper: no decode */
+                    if (pc && !RAY_IS_ERR(pc)) rows = parted_rows_counted(pc, pcnt, pncnt);
+                }
+                if (parted_rows < 0) parted_rows = rows;
+                else if (rows != parted_rows)
                     return ray_error("length", "parted table: column %lld has %lld rows, expected %lld",
-                                     (long long)c, (long long)m.len, (long long)parted_rows);
+                                     (long long)c, (long long)rows, (long long)parted_rows);
             }
             if (RAY_IS_PARTED(m.type)) {
                 if (seg_count == 0)
@@ -5823,6 +6248,7 @@ static ray_t* ray_execute_inner(ray_graph_t* g, ray_op_t* root) {
                 }
             }
             if (any_parted) {
+                ray_t* ctbl = parted_counts_table(result, g->table);
                 /* the same keep-set as the partial filter's sel_compact */
                 const int64_t* keep = NULL; int keep_n = 0;
                 exec_filt_keep(&keep, &keep_n);
@@ -5837,8 +6263,8 @@ static ray_t* ray_execute_inner(ray_graph_t* g, ray_op_t* root) {
                     ray_t* col = ray_table_col_idx(result, c);
                     if (col && RAY_IS_ERR(col)) { ray_release(out); ray_release(result); return col; }
                     if (col && (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON)) {
-                        ray_t* flat = flatten_parted_col(col);
-                        PARTED_FLAT_DCHECK(result, flat);
+                        ray_t* flat = flatten_parted_col(col, ctbl);
+                        PARTED_FLAT_DCHECK(ctbl, flat);
                         if (!flat || RAY_IS_ERR(flat)) {
                             ray_release(out); ray_release(result);
                             return flat ? flat : ray_error("oom", NULL);

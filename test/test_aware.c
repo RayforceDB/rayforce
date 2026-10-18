@@ -1394,10 +1394,7 @@ static test_result_t test_sym_membership(void) {
     /* ordered compares on a file-domain SYM column keep
      * EXPR_BAIL_SYM_DOMAIN (the fused program never orders ids).  This pins
      * only the bail and generation 0 == generation 2 == the unfused
-     * executor: on this branch the unfused executor still orders file-domain
-     * SYM by raw file ids (the #738 fix is on dev), so the pinned count is
-     * not the string-order count.  Revisit (a by-construction string-order
-     * oracle) when dev's #738 is merged. */
+     * executor, which orders file-domain SYM by string (#738). */
     {
         ray_t* t = aw_load("sy", 0);
         ray_graph_t* g = ray_graph_new(t);
@@ -1537,12 +1534,11 @@ static test_result_t test_sym_in_bounds(void) {
     int64_t nin = 0;
     for (int64_t j = 0; j < 200000; j++) { int v = aw_sy_val(j); nin += v == 7 || v == 1; }
     TEST_ASSERT_EQ_I(aw_sel_count("sb", 2, ap_s_in, NULL), nin);
-    /* the view gate (sym_view_ok false): without a LUT the null-checked
-     * loop answers id-0 rows 0 under `not in`, which a view's
-     * (0 in set) ^ negate would not, so every vector holding "" is read by
-     * range instead: chunks 1 and 2 whole (128 x 1024 W8 ids) and chunk 3
-     * (3392 ids); chunk 0, without "", is decided from its statistics */
-    if ((r = aw_sel_same("sb", ap_s_notin_none, 128 * 1024 + 3392)).status != TEST_PASS) return r;
+    /* without a LUT the null-checked loop answers id-0 rows 0 under
+     * `not in`, as the LUT does (#739); the views clear their id-0 rows
+     * the same way, so only the RAW tail vector is decoded; chunk 0,
+     * without "", is decided from its statistics */
+    if ((r = aw_sel_same("sb", ap_s_notin_none, 320)).status != TEST_PASS) return r;
     {
         int64_t want = 0;
         for (int64_t j = 0; j < 200000; j++) want += aw_sy_val(j) >= 0;
@@ -5520,9 +5516,10 @@ static test_result_t test_symbol_order(void) {
     TEST_ASSERT_EQ_I(aw_sym_width("so", "s"), RAY_SYM_W8);
     /* Absolute pins: gen 0 and gen 2 share the string-order code of min, max,
      * LIKE and the top-k, so equal answers alone would not catch id order.
-     * The range operators get no absolute count here: on this branch both
-     * generations still compare SYM ranges by id (#738, fixed on dev); pin
-     * them at the dev merge. */
+     * The range operators compare by string in both generations (#738):
+     * z a m b repeat, 750 rows each. */
+    AW_EXPECT("so", "(count (select {from: T where: (< s 'm)}))", "1500");
+    AW_EXPECT("so", "(count (select {from: T where: (>= s 'b)}))", "2250");
     AW_EXPECT("so", "(min (at T 's))", "a");
     AW_EXPECT("so", "(max (at T 's))", "z");
     AW_EXPECT("so", "(at (select {s: s k: k from: T asc: s take: 3}) 's)", "[a a a]");

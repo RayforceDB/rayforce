@@ -103,3 +103,28 @@
 ;; folded the zeros) -- an independent oracle for the same count.
 (count (distinct BU)) -- 199981
 (sum (at (select {n: (count v) by: {f: f} from: (table [f v] (list BU (til BN)))}) 'n)) -- 3000000
+
+;; ── count(distinct) beside the group: the post-group row→group probe ──────
+;; A `(count (distinct x))` beside another aggregate (and a composite key,
+;; #756) is served after the grouping by a probe that maps every row back to
+;; its group through the key's bits (key_read_i64).  The group holds +0.0 for
+;; the merged zero group; a row carrying -0.0 read raw missed it and was
+;; dropped from the per-group dedup — n fell to 0 for the zero group while
+;; the count beside it stayed right.  The probe canonicalises the way the
+;; grouping does.  F64 and F32 keys, one key and a composite, with where:,
+;; and the distinct count alone (a composite key that is not dense takes the
+;; same probe).
+(set CZ (table [p s x] (list (as 'F64 (take (list Z 1.5) 8)) (take ['a 'b 'c 'd] 8) (til 8))))
+(at (select {from: CZ by: [p s] n: (count (distinct x)) c: (count x) asc: [p s]}) 'n) -- [2 2 2 2]
+(at (select {from: CZ by: [p s] n: (count (distinct x)) c: (count x) asc: [p s]}) 'c) -- [2 2 2 2]
+(at (select {from: CZ by: p n: (count (distinct x)) c: (count x) asc: p}) 'n) -- [4 4]
+(at (select {from: CZ by: [p s] n: (count (distinct x)) asc: [p s]}) 'n) -- [2 2 2 2]
+(at (select {from: CZ where: (< x 6) by: [p s] n: (count (distinct x)) c: (count x) asc: [p s]}) 'n) -- [2 1 2 1]
+;; both signs in one column: the zero group's rows all reach the dedup
+(set CZ2 (table [p s x] (list (as 'F64 (take (list 0.0 Z 1.5 Z) 8)) (take ['a 'b] 8) (til 8))))
+(at (select {from: CZ2 by: [p s] n: (count (distinct x)) c: (count x) asc: [p s]}) 'n) -- [2 4 2]
+(at (select {from: CZ2 by: p n: (count (distinct x)) c: (count x) asc: p}) 'n) -- [6 2]
+;; F32 (the cast is a projection)
+(set CZ3 (select {from: CZ p: (as 'F32 p) s: s x: x}))
+(at (select {from: CZ3 by: [p s] n: (count (distinct x)) c: (count x) asc: [p s]}) 'n) -- [2 2 2 2]
+(at (select {from: CZ3 by: p n: (count (distinct x)) c: (count x) asc: p}) 'n) -- [4 4]

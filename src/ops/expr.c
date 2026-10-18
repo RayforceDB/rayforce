@@ -141,6 +141,11 @@ static bool eval_const_numeric_expr(ray_graph_t* g, ray_op_t* op,
     if (op->opcode == OP_CONST) {
         ray_op_ext_t* ext = find_ext(g, op->id);
         if (!ext || !ext->literal) return false;
+        /* A null constant has no numeric value: atom_to_numeric would hand
+         * back its sentinel (INT64_MIN for 0Nl) and the SUM/AVG linear and
+         * affine folds would sum it per row.  Decline, as expr_compile does,
+         * so the null-aware path evaluates it. */
+        if (RAY_ATOM_IS_NULL(ext->literal)) return false;
         return atom_to_numeric(ext->literal, out_f, out_i, out_is_f64);
     }
 
@@ -792,12 +797,12 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
     /* Issue #533: which nodes may skip the SYM null proof.  A null SYM is
      * id 0, below every real intern id, and the fallback ranks a null SYM
      * below everything in all six comparisons (null == null, null != x,
-     * null < x hold; null == x, x < null do not).  Raw id compares in the
-     * fused lane produce the same table, so a SYM column whose every
-     * consumer in this subtree is EQ..GE against a constant (a null
-     * literal bails at OP_CONST, except "" and the null SYM, id 0, read
-     * only by an EQ / NE on file-domain ids: null == null holds, as the
-     * fallback ranks it) or another SYM scan needs no O(n)
+     * null < x hold; null == x, x < null do not).  Raw id equality compares
+     * preserve this; ordered compares bail below to lexical LUTs.  A SYM
+     * column whose every consumer in this subtree is EQ..GE against a
+     * constant (a null literal bails at OP_CONST, except "" and the null
+     * SYM, id 0, read only by an EQ / NE on file-domain ids: null == null
+     * holds, as the fallback ranks it) or another SYM scan needs no O(n)
      * ray_vec_has_nulls walk.  Any other consumer — ISNULL, CAST,
      * arithmetic — reads the lane as a value and keeps the proof. */
     uint8_t sym_cmp_safe[nc];
@@ -1074,6 +1079,14 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
                 int8_t t2 = (s2 != 0xFF) ? out->regs[s2].type : t1;
                 uint16_t op = node->opcode;
                 int8_t ot;
+
+                /* SYM lanes contain intern ids, not lexical ranks. Route
+                 * ordering through the used-id lookup/rank executor;
+                 * equality can keep using the fused integer kernels. */
+                if ((op == OP_LT || op == OP_LE || op == OP_GT || op == OP_GE) &&
+                    (op_child(g, node, 0)->out_type == RAY_SYM ||
+                     (s2 != 0xFF && op_child(g, node, 1)->out_type == RAY_SYM)))
+                    EXPR_BAIL(EXPR_BAIL_OTHER);
 
                 /* Determine output type */
                 if (op == OP_CAST)
@@ -2960,12 +2973,10 @@ void ray_expr_test_eval_range(const ray_expr_t* expr, int64_t start, int64_t end
 /* Allocate + init one rowsel builder per dispatched grain task (parallel) or a
  * single builder over all segments (serial).  ray_pool_dispatch carves task i
  * as [i*grain, min((i+1)*grain, nrows)); grain is morsel-aligned so each task
- * owns a contiguous run of whole segments.  On return *parallel and *n_builders
- * describe the dispatch geometry.  A clamped dispatch (a ring that cannot
- * grow) hands out tasks of several grains, still grain-aligned; the workers
- * (expr_full_fn, pred_sel_worker) then fill one builder per grain.  Returns
- * NULL when the table needs more builders than RAY_POOL_MAX_TASKS, or on
- * OOM — caller falls back to the bool path. */
+ * owns a contiguous run of whole segments; tasks past the ring run in further
+ * rounds of the same grain, so one builder per task holds for any table.  On
+ * return *parallel and *n_builders describe the dispatch geometry.  Returns
+ * NULL on OOM — caller falls back to the bool path. */
 static rowsel_builder_t* pred_sel_builders_alloc(int64_t nrows, ray_pool_t* pool,
                                                  bool* parallel,
                                                  uint32_t* n_builders_out) {
@@ -2974,7 +2985,6 @@ static rowsel_builder_t* pred_sel_builders_alloc(int64_t nrows, ray_pool_t* pool
     bool          par    = (pool && nrows >= RAY_PARALLEL_THRESHOLD);
 
     uint32_t n_builders = par ? (uint32_t)((nrows + grain - 1) / grain) : 1u;
-    if (par && n_builders > RAY_POOL_MAX_TASKS) return NULL;
 
     rowsel_builder_t* builders =
         (rowsel_builder_t*)ray_alloc_raw((size_t)n_builders * sizeof(rowsel_builder_t));
@@ -4182,9 +4192,9 @@ static void binary_range(ray_op_t* op, int8_t out_type,
         } else if (l_esz == 4) {
             /* SYM W32 stores unsigned IDs; for EQ/NE the unsigned compare
              * gives the same result as the signed compare against r_i64
-             * (truncated to 32-bit).  For ordering ops we keep the signed
-             * compare (matches the previous generic-path semantics for
-             * I32/DATE/TIME). */
+             * (truncated to 32-bit). Ordered SYM/SYM and SYM/STR
+             * comparisons go to exec_sym_order; the raw ordered arm is
+             * retained for mixed SYM/numeric DAG operands. */
             if (RAY_IS_SYM(lhs->type)) {
                 if (opc == OP_EQ || opc == OP_NE) {
                     const uint32_t* d = (const uint32_t*)lbase;
@@ -4269,9 +4279,8 @@ static void binary_range(ray_op_t* op, int8_t out_type,
 
     /* SYM index scratch — needed ONLY by narrow-width (W8/W16) or cross-domain
      * SYM columns.  Allocated lazily on the heap (freed at `done:`) rather than
-     * as a stack VLA: the pool can hand a worker a morsel far larger than a page
-     * (grain is total/task_cap once the ring saturates), so an n-sized stack
-     * array would overflow the worker stack.  Non-SYM ops (the common case)
+     * as a stack VLA: a caller can hand a worker a range far larger than a
+     * page, so an n-sized stack array would overflow the worker stack.  Non-SYM ops (the common case)
      * allocate nothing. */
     int64_t* lsym_buf = NULL;
     int64_t* rsym_buf = NULL;
@@ -4681,6 +4690,14 @@ ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* 
     } else if (!l_scalar && r_scalar) {
         len = lhs->len;
     }
+
+    int8_t lt = lhs->type < 0 ? (int8_t)-lhs->type : lhs->type;
+    int8_t rt = rhs->type < 0 ? (int8_t)-rhs->type : rhs->type;
+    if ((op->opcode == OP_LT || op->opcode == OP_LE ||
+         op->opcode == OP_GT || op->opcode == OP_GE) &&
+        ((lt == RAY_SYM && (rt == RAY_SYM || rt == RAY_STR)) ||
+         (rt == RAY_SYM && lt == RAY_STR)))
+        return exec_sym_order(op->opcode, lhs, rhs, l_scalar, r_scalar);
 
     if (op->opcode == OP_POW) {
         int8_t lt = ew_value_base_type(lhs);

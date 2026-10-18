@@ -37,6 +37,7 @@
 #include "core/block.h"
 #include "ops/idxop.h"
 #include "core/profile.h"   /* g_ray_profile — (.sys.prof) */
+#include "core/runtime.h"  /* __VM — (return x) parks its value on the VM */
 #include "core/qmeasure.h"  /* shared per-query measurement lifecycle */
 #include "core/qlog.h"      /* g_qlog — (.sys.querylog) */
 #include "store/serde.h"
@@ -71,8 +72,8 @@ void* ray_runtime_get_sys_args(void);
 #define RAY_PCLOSE(f)    _pclose(f)
 #endif
 
-static int parse_sys_int_arg(const char* s, bool nonnegative, bool core_count,
-                             int64_t* out) {
+int parse_sys_int_arg(const char* s, bool nonnegative, bool core_count,
+                      int64_t* out) {
     if (!s || !*s) return 0;
     const unsigned char* p = (const unsigned char*)s;
     if (!nonnegative && (*p == '+' || *p == '-')) p++;
@@ -84,7 +85,8 @@ static int parse_sys_int_arg(const char* s, bool nonnegative, bool core_count,
     errno = 0;
     long long v = strtoll(s, &end, 10);
     if (errno == ERANGE || end == s || *end != '\0' ||
-        (nonnegative && v < 0) || (core_count && v > INT_MAX))
+        (nonnegative && v < 0) ||
+        (core_count && v > (int64_t)RAY_HEAP_ID_BITS - 1))
         return 0;
     *out = (int64_t)v;
     return 1;
@@ -671,7 +673,7 @@ static bool objsize_seen_insert(ray_objsize_walk_t* w, ray_t* p, bool* ok) {
 static size_t objsize_shallow(ray_t* v) {
     if (v->attrs & RAY_ATTR_SLICE) return sizeof(ray_t);
     if (v->type == RAY_LAMBDA)
-        return sizeof(ray_t) + 7 * sizeof(ray_t*);
+        return sizeof(ray_t) + LAMBDA_SLOTS * sizeof(ray_t*);
     if (v->type == RAY_INDEX)
         return sizeof(ray_t) + sizeof(ray_index_t);
     if (RAY_IS_PARTED(v->type))
@@ -717,8 +719,10 @@ static bool objsize_push_children(ray_objsize_walk_t* w, ray_t* v) {
     if (v->type == RAY_LAMBDA) {
         ray_t** slots = (ray_t**)ray_data(v);
         for (int i = 0; i < 4; i++) OBJSIZE_PUSH(slots[i]);
-        OBJSIZE_PUSH(slots[5]);
-        OBJSIZE_PUSH(slots[6]);
+        OBJSIZE_PUSH(LAMBDA_NFO(v));
+        OBJSIZE_PUSH(LAMBDA_DBG(v));
+        OBJSIZE_PUSH(LAMBDA_CLOSURE(v));
+        OBJSIZE_PUSH(LAMBDA_CAPROWS(v));
         return true;
     }
     if (ray_is_atom(v)) {
@@ -810,6 +814,10 @@ ray_t* ray_mem_ts_fn(ray_t** args, int64_t n) {
     ray_query_measure_t measure;
     ray_query_measure_begin(&measure);
     ray_t* result = ray_eval(args[0]);
+    /* Force a lazy result inside the measured scope so the time, worker and
+     * allocation figures cover the computation, not just graph construction
+     * (#856).  Consumes the handle; yields an owned value or an error. */
+    if (ray_is_lazy(result)) result = ray_lazy_materialize(result);
     ray_query_metrics_t metrics;
     ray_query_measure_end(&measure, &metrics);
 
@@ -898,8 +906,10 @@ ray_t* ray_gc_fn(ray_t** args, int64_t n) {
     (void)args;
     if (n != 0) return ray_error("arity", ".sys.gc takes no arguments");
     ray_heap_gc();
-    /* Same statement-boundary rule as the REPL: an explicit maintenance
-     * call is also a chance to notice the process has gone quiet. */
+    /* Same statement-boundary rules as the REPL: under memory pressure what
+     * is free goes back now, and an explicit maintenance call is also a
+     * chance to notice the process has gone quiet. */
+    ray_heap_relieve();
     ray_heap_decay();
     return ray_i64(0);
 }
@@ -1130,15 +1140,21 @@ ray_t* ray_quote_fn(ray_t** args, int64_t n) {
     return a;
 }
 
-/* (return) | (return x) — early exit from enclosing compiled lambda.
- * Outside a compiled lambda (e.g. value position: (map return xs), or
- * REPL top-level) this collapses to: identity for one arg, null for
- * zero, domain error otherwise. The early-exit semantics are emitted
- * by the bytecode compiler — see compile.c. */
+/* (return) | (return x) — early exit from the enclosing lambda.  The
+ * bytecode compiler emits the exit itself (see compile.c); this is the
+ * tree walker's form.  Inside a lambda it parks the value on the VM and
+ * returns the `return` marker, an error-typed value every form propagates
+ * and the lambda call boundary turns back into the value (`try` lets it
+ * through).  Outside any lambda (REPL top level) it is the identity: the
+ * value, or null for no arg. */
 ray_t* ray_return_fn(ray_t** args, int64_t n) {
-    if (n == 0) return RAY_NULL_OBJ;
-    if (n == 1) { ray_retain(args[0]); return args[0]; }
-    return ray_error("domain", "return expects 0 or 1 argument");
+    if (n > 1) return ray_error("domain", "return expects 0 or 1 argument");
+    ray_t* val = n == 1 ? args[0] : RAY_NULL_OBJ;
+    ray_retain(val);
+    if (!__VM || __VM->lambda_depth == 0) return val;
+    if (__VM->return_val) ray_release(__VM->return_val);
+    __VM->return_val = val;
+    return ray_error("return", NULL);
 }
 
 /* (rc x) -- return reference count of object */
@@ -1282,7 +1298,8 @@ ray_t* ray_internals_fn(ray_t** args, int64_t n) {
 
 /* (.sys.mem) -- return dict with memory allocator statistics */
 ray_t* ray_memstat_fn(ray_t** args, int64_t n) {
-    (void)args; (void)n;
+    (void)args;
+    if (n != 0) return ray_error("arity", ".sys.mem takes no arguments");
     ray_mem_stats_t st;
     ray_mem_stats(&st);
 
@@ -1344,7 +1361,8 @@ ray_t* ray_memstat_fn(ray_t** args, int64_t n) {
  * no query has run.  Profiling is toggled with `:t` / the `-t` flag.
  */
 ray_t* ray_prof_fn(ray_t** args, int64_t n) {
-    (void)args; (void)n;
+    (void)args;
+    if (n != 0) return ray_error("arity", ".sys.prof takes no arguments");
 
     /* Read the snapshot of the last completed query — NOT the in-flight
      * buffer, which currently holds this `(.sys.prof)` call's own spans.
@@ -1539,7 +1557,8 @@ static bool ray_os_hostname(char* buf, size_t cap) {
 }
 
 ray_t* ray_sysinfo_fn(ray_t** args, int64_t n) {
-    (void)args; (void)n;
+    (void)args;
+    if (n != 0) return ray_error("arity", ".sys.info takes no arguments");
     ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 5);
     if (RAY_IS_ERR(keys)) return keys;
     ray_t* vals = ray_list_new(5);
@@ -1649,6 +1668,8 @@ ray_t* ray_build_sys_args(int argc, char** argv) {
         else if (strcmp(argv[i], "-U") == 0 && i + 1 < argc) i++;   /* skip secret */
         else if ((strcmp(argv[i], "-l") == 0 || strcmp(argv[i], "-L") == 0) && i + 1 < argc)
             log = argv[++i];
+        else if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--mem") == 0) && i + 1 < argc)
+            i++;   /* RAM budget is configured by the launcher, not exposed here */
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) { /* ignore */ }
         else file = argv[i];
     }

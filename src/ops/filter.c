@@ -33,7 +33,8 @@
 /* Gather from a parted column using global row indices (sorted ascending).
  * Walks match_idx with an advancing segment cursor — O(count + n_segs). */
 static void parted_gather_col(ray_t* parted_col, const int64_t* match_idx,
-                               int64_t count, ray_t* dst_col) {
+                               int64_t count, ray_t* dst_col,
+                               const int64_t* cnt, int64_t ncnt) {
     int64_t n_segs = parted_col->len;
     if (n_segs == 0) return;  /* zero-length VLA is UB in C17 */
     ray_t** segs = (ray_t**)ray_data(parted_col);
@@ -45,11 +46,12 @@ static void parted_gather_col(ray_t* parted_col, const int64_t* match_idx,
     char* dst = (char*)ray_data(dst_col);
     memset(dst, 0, (size_t)count * esz);
 
-    /* Build prefix-sum segment end table */
+    /* Build prefix-sum segment end table (a NULL segment spans its
+     * partition's rows, from the table's partition counts) */
     int64_t seg_ends[n_segs];
     int64_t cumul = 0;
     for (int64_t i = 0; i < n_segs; i++) {
-        cumul += segs[i] ? segs[i]->len : 0;
+        cumul += parted_seg_rows(segs, i, cnt, ncnt);
         seg_ends[i] = cumul;
     }
 
@@ -58,8 +60,10 @@ static void parted_gather_col(ray_t* parted_col, const int64_t* match_idx,
     for (int64_t i = 0; i < count; i++) {
         int64_t row = match_idx[i];
         while (seg < n_segs - 1 && row >= seg_ends[seg]) seg++;
-        if (!segs[seg])
-            continue;  /* NULL segment — zero-fill from vec_new */
+        if (!segs[seg]) {
+            parted_fill_nulls(dst_col, i, 1);   /* a missing segment's row */
+            continue;
+        }
         int64_t seg_start = (seg > 0) ? seg_ends[seg - 1] : 0;
         int64_t local_row = row - seg_start;
         parted_copy_cells(dst, base, out_attrs, i, segs[seg], local_row, 1);
@@ -136,9 +140,13 @@ static ray_t* exec_filter_vec(ray_t* input, ray_t* pred, int64_t pass_count) {
     return result;
 }
 
-/* Filter a parted column by boolean predicate (sequential). */
+/* Filter a parted column by boolean predicate (sequential).  `cnt`/`ncnt`
+ * are the table's partition counts: a NULL segment (a partition without
+ * the column) spans that many predicate rows, and those it passes come out
+ * as the type's null. */
 static ray_t* exec_filter_parted_vec(ray_t* parted_col, ray_t* pred,
-                                     int64_t pass_count) {
+                                     int64_t pass_count,
+                                     const int64_t* cnt, int64_t ncnt) {
     int8_t base = (int8_t)RAY_PARTED_BASETYPE(parted_col->type);
     ray_t** segs = (ray_t**)ray_data(parted_col);
     int64_t n_segs = parted_col->len;
@@ -147,7 +155,7 @@ static ray_t* exec_filter_parted_vec(ray_t* parted_col, ray_t* pred,
     /* RAY_LIST: share (retain) elements — the byte-copy path below would
      * alias them without a refcount and double-free on release. */
     if (base == RAY_LIST)
-        return parted_filter_list(segs, n_segs, pred_data, pass_count);
+        return parted_filter_list_c(segs, n_segs, pred_data, pass_count, cnt, ncnt);
 
     /* RAY_STR: deep-copy to handle multi-pool segments */
     if (base == RAY_STR) {
@@ -155,7 +163,17 @@ static ray_t* exec_filter_parted_vec(ray_t* parted_col, ray_t* pred,
         if (!result || RAY_IS_ERR(result)) return result;
         int64_t pred_off = 0;
         for (int64_t s = 0; s < n_segs; s++) {
-            if (!segs[s]) continue;
+            if (!segs[s]) {
+                int64_t n = parted_seg_rows(segs, s, cnt, ncnt);
+                for (int64_t i = 0; i < n; i++) {
+                    if (!pred_data[pred_off + i]) continue;
+                    result = ray_str_vec_append(result, "", 0);
+                    if (RAY_IS_ERR(result)) return result;
+                    ray_vec_set_null(result, result->len - 1, true);
+                }
+                pred_off += n;
+                continue;
+            }
             int64_t seg_len = segs[s]->len;
             const char* pool_base = segs[s]->str_pool
                                   ? (const char*)ray_data(segs[s]->str_pool) : NULL;
@@ -180,7 +198,16 @@ static ray_t* exec_filter_parted_vec(ray_t* parted_col, ray_t* pred,
     int64_t pred_off = 0;
 
     for (int64_t s = 0; s < n_segs; s++) {
-        if (!segs[s]) continue;
+        if (!segs[s]) {
+            int64_t n = parted_seg_rows(segs, s, cnt, ncnt);
+            for (int64_t i = 0; i < n; i++) {
+                if (!pred_data[pred_off + i]) continue;
+                parted_fill_nulls(result, out_idx, 1);
+                out_idx++;
+            }
+            pred_off += n;
+            continue;
+        }
         int64_t seg_len = segs[s]->len;
         char* dst = (char*)ray_data(result);
         bool seg_has_nulls = ray_vec_may_have_nulls(segs[s]);
@@ -215,6 +242,8 @@ static ray_t* exec_filter_parted_vec(ray_t* parted_col, ray_t* pred,
 /* Sequential table filter fallback (small tables or alloc failure). */
 static ray_t* exec_filter_seq(ray_t* input, ray_t* pred, int64_t ncols,
                              int64_t pass_count) {
+    int64_t ncnt = 0;
+    const int64_t* cnt = parted_table_counts(input, &ncnt);
     ray_t* tbl = ray_table_new(ncols);
     if (!tbl || RAY_IS_ERR(tbl)) return tbl;
     /* Generation-2 slots gather under the predicate's selection, built
@@ -256,7 +285,7 @@ static ray_t* exec_filter_seq(ray_t* input, ray_t* pred, int64_t ncols,
         }
         ray_t* filtered;
         if (RAY_IS_PARTED(col->type))
-            filtered = exec_filter_parted_vec(col, pred, pass_count);
+            filtered = exec_filter_parted_vec(col, pred, pass_count, cnt, ncnt);
         else
             filtered = exec_filter_vec(col, pred, pass_count);
         if (!filtered || RAY_IS_ERR(filtered)) { if (sel) ray_rowsel_release(sel); ray_release(tbl); return filtered; }
@@ -372,6 +401,8 @@ ray_t* ray_where_mask_coerce(ray_t* pred, int64_t tn, const char* label) {
 }
 
 ray_t* exec_filter(ray_graph_t* g, ray_op_t* op, ray_t* input, ray_t* pred) {
+    int64_t ncnt = 0;
+    const int64_t* cnt = parted_table_counts(input, &ncnt);   /* ragged partitions */
     (void)g;
     (void)op;
     if (!input || RAY_IS_ERR(input)) return input;
@@ -587,9 +618,9 @@ ray_t* exec_filter(ray_graph_t* g, ray_op_t* op, ray_t* input, ray_t* pred) {
             }
         } else if (parted_base_is_list(col)) {
             ray_release(new_cols[c]);
-            new_cols[c] = parted_gather_list_rows((ray_t**)ray_data(col),
-                                                  col->len, match_idx,
-                                                  pass_count);
+            new_cols[c] = parted_gather_list_rows_c((ray_t**)ray_data(col),
+                                                    col->len, match_idx,
+                                                    pass_count, cnt, ncnt);
             if (new_cols[c] && RAY_IS_ERR(new_cols[c])) {
                 ray_error_free(new_cols[c]);
                 new_cols[c] = NULL;
@@ -611,10 +642,12 @@ ray_t* exec_filter(ray_graph_t* g, ray_op_t* op, ray_t* input, ray_t* pred) {
                 if (pbase == RAY_STR) {
                     ray_t** psegs = (ray_t**)ray_data(col);
                     ray_release(new_cols[c]);
-                    new_cols[c] = parted_gather_str_rows(psegs, col->len,
-                                                         match_idx, pass_count);
+                    new_cols[c] = parted_gather_str_rows_c(psegs, col->len,
+                                                           match_idx, pass_count,
+                                                           cnt, ncnt);
                 } else {
-                    parted_gather_col(col, match_idx, pass_count, new_cols[c]);
+                    parted_gather_col(col, match_idx, pass_count, new_cols[c],
+                                      cnt, ncnt);
                 }
             } else {
                 uint8_t esz = col_esz(col);
@@ -709,6 +742,8 @@ ray_t* exec_filter(ray_graph_t* g, ray_op_t* op, ray_t* input, ray_t* pred) {
  * number of matches far exceeds the limit.
  * ============================================================================ */
 ray_t* exec_filter_head(ray_t* input, ray_t* pred, int64_t limit) {
+    int64_t ncnt = 0;
+    const int64_t* cnt = parted_table_counts(input, &ncnt);   /* ragged partitions */
     if (!input || RAY_IS_ERR(input)) return input;
     if (!pred || RAY_IS_ERR(pred)) return pred;
     /* Over a table the predicate goes through the one where: rule
@@ -821,8 +856,8 @@ ray_t* exec_filter_head(ray_t* input, ray_t* pred, int64_t limit) {
         if (out_type == RAY_LIST) {
             ray_t* lcol;
             if (RAY_IS_PARTED(col->type)) {
-                lcol = parted_gather_list_rows((ray_t**)ray_data(col),
-                                               col->len, match_idx, found);
+                lcol = parted_gather_list_rows_c((ray_t**)ray_data(col),
+                                               col->len, match_idx, found, cnt, ncnt);
             } else {
                 lcol = ray_list_new(found);
                 if (lcol && !RAY_IS_ERR(lcol)) {
@@ -855,29 +890,13 @@ ray_t* exec_filter_head(ray_t* input, ray_t* pred, int64_t limit) {
             if (out_type == RAY_STR) {
                 /* Deep-copy STR to handle multi-pool segments */
                 ray_release(new_col);
-                new_col = parted_gather_str_rows(segs, n_segs, match_idx, found);
+                new_col = parted_gather_str_rows_c(segs, n_segs, match_idx, found,
+                                                   cnt, ncnt);
             } else {
-                /* Non-STR parted gather */
-                int64_t seg_start = 0;
-                int64_t cur_seg = 0;
-                int64_t cur_seg_end = (n_segs > 0 && segs[0]) ? segs[0]->len : 0;
-                for (int64_t j = 0; j < found; j++) {
-                    int64_t r = match_idx[j];
-                    while (cur_seg < n_segs - 1 && r >= cur_seg_end) {
-                        seg_start = cur_seg_end;
-                        cur_seg++;
-                        cur_seg_end += segs[cur_seg] ? segs[cur_seg]->len : 0;
-                    }
-                    if (!segs[cur_seg])
-                        continue;  /* NULL segment — zero-fill from memset */
-                    parted_copy_cells(dst, out_type, out_attrs, j,
-                                      segs[cur_seg], r - seg_start, 1);
-                    /* the null bit travels with the cell (parted_gather_col);
-                     * SYM nulls are the copied id itself (#784) */
-                    if (out_type != RAY_SYM && ray_vec_may_have_nulls(segs[cur_seg]) &&
-                        ray_vec_is_null(segs[cur_seg], r - seg_start))
-                        ray_vec_set_null(new_col, j, true);
-                }
+                /* Non-STR parted gather: the shared helper spans a NULL
+                 * segment over its partition's rows and carries each
+                 * present segment's null cells over. */
+                parted_gather_col(col, match_idx, found, new_col, cnt, ncnt);
             }
         } else {
             char* src = (char*)ray_data(col);
@@ -959,6 +978,11 @@ static inline bool sel_compact_keep(int64_t nm, const int64_t* keep_syms, int ke
 
 ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
                    const int64_t* keep_syms, int keep_n) {
+    int64_t ncnt = 0;
+    const int64_t* cnt = parted_table_counts(tbl, &ncnt);   /* ragged partitions */
+    /* A projection of parted columns carries no partition-key column: the
+     * counts come from the graph's source table, whose partitions it shares. */
+    if (!cnt && g && g->table) cnt = parted_table_counts(g->table, &ncnt);
     (void)g;
     if (!tbl || RAY_IS_ERR(tbl) || !sel) return tbl;
 
@@ -966,7 +990,21 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
      * keep_syms (order preserved); NULL/0 => materialize all columns. */
     bool use_keep = (keep_syms != NULL && keep_n > 0);
 
+    /* The table's rows: through the partition counts when its first column
+     * is a parted column with missing segments (ragged parted table). */
     int64_t nrows = ray_table_nrows(tbl);
+    {
+        ray_col_meta_t fm;   /* metadata first: an encoded column stays encoded */
+        bool parted = ray_table_ncols(tbl) > 0 && ray_table_col_meta_idx(tbl, 0, &fm) &&
+                      RAY_IS_PARTED(fm.type);
+        /* an encoded parted column has every segment (lazy all-null ones
+         * for a ragged partition): its rows are its length */
+        if (parted && fm.enc) { parted = false; nrows = fm.len; }
+        ray_t* first = parted ? ray_table_col_idx(tbl, 0) : NULL;
+        if (first && RAY_IS_ERR(first)) return first;
+        if (first && RAY_IS_PARTED(first->type))
+            nrows = parted_rows_counted(first, cnt, ncnt);
+    }
     ray_rowsel_t* meta = ray_rowsel_meta(sel);
 
     /* Defensive: the selection must have been built for a table
@@ -1197,9 +1235,9 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
         if (!col) continue;
         if (parted_base_is_list(col)) {
             ray_release(new_cols[c]);
-            new_cols[c] = parted_gather_list_rows((ray_t**)ray_data(col),
+            new_cols[c] = parted_gather_list_rows_c((ray_t**)ray_data(col),
                                                   col->len, match_idx,
-                                                  pass_count);
+                                                  pass_count, cnt, ncnt);
             if (new_cols[c] && RAY_IS_ERR(new_cols[c])) {
                 ray_error_free(new_cols[c]);
                 new_cols[c] = NULL;
@@ -1227,10 +1265,12 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
                 if (pbase == RAY_STR) {
                     ray_t** psegs = (ray_t**)ray_data(col);
                     ray_release(new_cols[c]);
-                    new_cols[c] = parted_gather_str_rows(psegs, col->len,
-                                                         match_idx, pass_count);
+                    new_cols[c] = parted_gather_str_rows_c(psegs, col->len,
+                                                           match_idx, pass_count,
+                                                           cnt, ncnt);
                 } else {
-                    parted_gather_col(col, match_idx, pass_count, new_cols[c]);
+                    parted_gather_col(col, match_idx, pass_count, new_cols[c],
+                                      cnt, ncnt);
                 }
             } else {
                 uint8_t esz = col_esz(col);

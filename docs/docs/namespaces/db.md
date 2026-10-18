@@ -59,6 +59,10 @@ Returns a `table` with every column memory-mapped. Generation-0 columns are read
 
 Signature: `(.db.parted.get "db_root" 'tbl_name)`. The table name **must** be a quoted symbol atom (e.g. `'trades`), not a string.
 
+Calling it again on the same thread reuses unchanged partitions while the earlier view is still held. The loader checks the resolved generation directory and each schema/column file's device, inode, size, modification time and change time. New or changed partitions are loaded afresh; disappeared partitions are dropped. An earlier view keeps its rows when a writer publishes a replacement generation.
+
+Each thread caches at most 1024 partition tables, evicting the least recently mounted entries first. GC (including `(.sys.gc)`), symbol-domain opens and the next mount release cached tables whose columns have no remaining users. Dropping a view and running GC therefore releases its mappings and copied LIST payloads, even if the database directory was deleted. Thread heap teardown and runtime shutdown clear the cache.
+
 Returns a single logical table assembled from every partition directory under `db_root/tbl_name/`. The result carries a virtual `MAPCOMMON` partition column derived from directory names, and every data column is a `RAY_PARTED_*` view over the segment files. Partition pruning kicks in automatically for `select` predicates on the virtual column.
 
 The directory names decide the key type and the partition order. `YYYY.MM.DD` names give a `date` column; digit-only names give an `int64` `part` column and are ordered by value, so `1`, `2`, `10` load as `[1 2 10]` with no zero-padding; any other digit/dot names give a `sym` `part` column in name order. A digit-only name that does not fit `int64` is rejected as `corrupt`, and the message names the directory.

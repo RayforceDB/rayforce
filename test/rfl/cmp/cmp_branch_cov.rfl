@@ -272,11 +272,11 @@
 (<= 'foo 1) !- type
 
 ;; ══════════════════════════════════════════════════════════════════
-;; 19. BOOL_VEC_BINOP — min-length truncation (line 209)
-;;     When vectors have different lengths, uses the shorter.
+;; 19. BOOL_VEC_BINOP — vectors of different lengths are a length
+;;     error, as for comparisons (they used to truncate to the shorter).
 ;; ══════════════════════════════════════════════════════════════════
-(and [true true true false] [true false]) -- [true false]
-(or  [true false] [false false true])     -- [true false]
+(and [true true true false] [true false]) !- length
+(or  [true false] [false false true])     !- length
 
 ;; ══════════════════════════════════════════════════════════════════
 ;; 20. gt/lt temporal — false branch of temporal_as_ns comparison

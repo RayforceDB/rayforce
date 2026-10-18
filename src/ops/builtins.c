@@ -502,6 +502,12 @@ ray_t* ray_timeit_fn(ray_t** args, int64_t n) {
     if (n < 1) return ray_error("arity", "timeit: expects 1 argument, got %lld", (long long)n);
     int64_t t0 = ray_profile_now_ns();
     ray_t* result = ray_eval(args[0]);
+    /* Reductions such as (sum v) return a lazy handle whose work only runs
+     * on materialization.  Force it inside the timed span, or timeit reports
+     * the cost of building the graph rather than of the computation (#856).
+     * ray_lazy_materialize consumes the handle and returns an owned value or
+     * an error. */
+    if (ray_is_lazy(result)) result = ray_lazy_materialize(result);
     int64_t t1 = ray_profile_now_ns();
     /* Propagate errors instead of swallowing them — otherwise a failing
      * expression silently reports a timing as if it had succeeded. */
@@ -2628,17 +2634,16 @@ static void where_emit_fn(void* ctxp, uint32_t wid, int64_t start, int64_t end) 
 
 ray_t* ray_where_fn(ray_t* x) {
     if (!ray_is_vec(x) || x->type != RAY_BOOL)
-        return ray_error("type", "where: argument must be a b8 vector, got %s", ray_type_name(x->type));
+        return ray_error("type", "where: argument must be a B8 vector, got %s%s",
+                         ray_type_name(x->type), ray_is_atom(x) ? " atom" : "");
     const uint8_t* data = (const uint8_t*)ray_data(x);
     int64_t n = x->len;
 
     ray_pool_t* pool = ray_pool_get();
     if (ray_pool_par_dispatch_ok(pool, n, RAY_PARALLEL_THRESHOLD)) {
         /* One task per chunk (ray_pool_dispatch_n).  Chunk count is capped
-         * at 1024 — the pool's INITIAL ring capacity — so dispatch_n never
-         * needs to grow the ring (its clamp-on-grow-failure silently DROPS
-         * tasks, which here would mean uninitialized prefix entries and
-         * out-of-bounds emit offsets).  1024 tasks is ample granularity. */
+         * at 1024 — the pool's INITIAL ring capacity — so dispatch_n runs in
+         * one window with no ring growth; 1024 tasks is ample granularity. */
         int64_t chunk_rows = WHERE_CHUNK_ROWS;
         while ((n + chunk_rows - 1) / chunk_rows > RAY_POOL_INIT_TASKS) chunk_rows *= 2;
         int64_t n_chunks = (n + chunk_rows - 1) / chunk_rows;
@@ -2826,11 +2831,29 @@ uint64_t ray_atom_hash(ray_t* a) {
                 h = ray_hash_combine(h, ray_atom_hash(elems[i]));
             return h;
         }
+        case RAY_TABLE: {
+            /* atom_eq: same names in order, equal columns.  Hashing them
+             * only spreads the buckets: the default arm's type and length
+             * would put every table of one length in one bucket. */
+            int64_t nc = ray_table_ncols(a);
+            uint64_t h = ray_hash_i64(nc);
+            for (int64_t c = 0; c < nc; c++) {
+                h = ray_hash_combine(h, ray_hash_i64(ray_table_col_name(a, c)));
+                ray_t* col = ray_table_col_idx(a, c);
+                if (col && RAY_IS_ERR(col)) { ray_error_free(col); col = NULL; }   /* hashes as absent */
+                h = ray_hash_combine(h, ray_atom_hash(col));
+            }
+            return h;
+        }
+        case RAY_DICT:
+            return ray_hash_combine(ray_atom_hash(ray_dict_keys(a)),
+                                    ray_atom_hash(ray_dict_vals(a)));
         default:
             /* Vec or unknown atom kind: fold type tag and length.  Two
-             * structurally-equal lists never reach here (RAY_LIST branch
-             * above) so we can't accidentally produce different hashes
-             * for atom_eq-equal pairs. */
+             * structurally-equal lists, tables or dicts never reach here
+             * (RAY_LIST / RAY_TABLE / RAY_DICT arms above) so we can't
+             * accidentally produce different hashes for atom_eq-equal
+             * pairs. */
             return ray_hash_i64(((int64_t)a->type << 32) ^ (int64_t)a->len);
     }
 }

@@ -61,6 +61,9 @@ typedef struct {
 
 bool    ray_col_meta_of(ray_t* col, ray_col_meta_t* m);          /* any slot object */
 bool    ray_table_col_meta(ray_t* tbl, int64_t name_id, ray_col_meta_t* m);
+/* Whether `tbl` (a table) has column `name_id`, from metadata: an encoded
+ * column is not materialized. */
+bool    ray_table_has_col(ray_t* tbl, int64_t name_id);
 bool    ray_table_col_meta_idx(ray_t* tbl, int64_t idx, ray_col_meta_t* m);
 
 /* Index of a column without decoding when it cannot carry one: NULL with

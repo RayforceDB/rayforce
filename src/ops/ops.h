@@ -236,6 +236,11 @@ void     ray_cancel_reset(void);
 #define OP_BOT_N        90   /* per-group smallest K values (bounded min-heap) */
 #define OP_QUANTILE     91   /* exact quantile per group (literal probability) */
 #define OP_MODE        145   /* most frequent non-null value per group */
+/* Internal aggregate, never compiled from Rayfall: the non-null count of its
+ * input (the per-partition AVG/VAR divisor).  The v2 engine counts it in
+ * place (agg_stream.c); a group bound for the legacy engine is re-planned
+ * with the slot as SUM over a not-null indicator (exec_group_run). */
+#define OP_COUNT_NN    147
 #define OP_ALL          131  /* truthy-all reduction (nulls skipped) */
 #define OP_ANY          132  /* truthy-any reduction (nulls skipped) */
 #define OP_COV          133  /* population covariance per group (binary input) */
@@ -552,6 +557,15 @@ typedef struct ray_graph {
         uint32_t   node_id;
     } cexpr_env[32];
     int             cexpr_env_top;
+    /* Lookups stop above this slot while a named helper's body compiles:
+     * its free names are lexical (globals or columns), never the formals
+     * of the helper that called it. */
+    int             cexpr_env_base;
+    /* Depth of named-helper bodies being inlined.  Their text was written
+     * outside the query, so a literal symbol in them is the symbol, as in
+     * bytecode; a lambda written inline in the query keeps the query's
+     * column rule for literals. */
+    int             cexpr_helper_depth;
 
     /* Output aliases of the select being compiled (src/ops/query.c):
      * the projections compiled so far, in order.  A name reference or a
@@ -989,7 +1003,17 @@ ray_t*    ray_lazy_promote(ray_t* lazy);
  * so a literal never captures a lambda/let local and resolution fires only
  * inside a query.  Returns NULL when no query is active. */
 ray_t* ray_active_query_table(void);
+/* The table a helper called from a query may read columns from: the
+ * source schema while a projection binds aliases, else the active table. */
+ray_t* ray_query_helper_table(void);
+/* Owned: the source column `sym` names, or its cell during a per-row
+ * evaluation; NULL when it names none. */
+ray_t* ray_query_helper_value(int64_t sym);
+/* A builtin the planner lowers row by row: its result over a column-derived
+ * operand is itself column-derived. */
+bool ray_query_rowwise_builtin(int64_t sym_id);
 ray_t* ray_active_query_literal(int64_t sym);
+bool ray_query_expr_reads_rows(ray_t* expr);
 
 #ifdef __cplusplus
 }

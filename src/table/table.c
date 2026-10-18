@@ -504,3 +504,8 @@ ray_t* ray_table_cols_inplace(ray_t* tbl) {
         if (cv[i] && cv[i]->type == RAY_ENCCOL) return NULL;
     return cols;
 }
+
+bool ray_table_has_col(ray_t* tbl, int64_t name_id) {
+    ray_col_meta_t m;
+    return tbl && !RAY_IS_ERR(tbl) && tbl->type == RAY_TABLE && ray_table_col_meta(tbl, name_id, &m);
+}

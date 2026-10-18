@@ -22,18 +22,22 @@ jobs:
         include:
           - os: ubuntu-latest
             target: debug
+            compiler: gcc
           - os: ubuntu-latest
             target: release
+            compiler: gcc
           - os: macos-latest
             target: debug
+            compiler: clang
           - os: macos-latest
             target: release
+            compiler: clang
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Build (${{ matrix.target }})
-        run: make ${{ matrix.target }}
+        run: make ${{ matrix.target }} CC=${{ matrix.compiler }}
 
       # Tests build their own debug+ASan objects, so they only make sense after a
       # debug build. Running `make test` after `make release` reuses the
@@ -42,7 +46,23 @@ jobs:
       # verify the optimized build compiles + links; the debug legs run the tests.
       - name: Test
         if: matrix.target == 'debug'
-        run: make test
+        run: make test CC=${{ matrix.compiler }}
+
+  # The default Ubuntu compiler is gcc. Exercise the suite with a recent
+  # upstream Clang as well, so new -Werror diagnostics reach CI before users
+  # of rolling-release toolchains encounter them.
+  clang-current:
+    runs-on: ubuntu-latest
+    env:
+      RAY_MARCH: x86-64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Clang 23
+        run: |
+          wget -qO llvm.sh https://apt.llvm.org/llvm.sh
+          sudo bash llvm.sh 23
+      - name: Test with Clang 23
+        run: make test CC=clang-23
 
   # The suite with every assert() compiled out (-DNDEBUG).  Our own builds keep
   # asserts on, but CMake Release, distro packagers and `zig cc` define NDEBUG;
@@ -82,6 +102,13 @@ jobs:
           scripts/fuzz-seed-frames.sh || true
       - name: Fuzz smoke
         run: make fuzz-smoke
+      - name: Nested select differential fuzz (serial and parallel)
+        run: |
+          # Start each mode from committed seeds. Replaying the growing cache
+          # can exhaust the short run before it reaches any mutations.
+          corpus_root=$(mktemp -d "$RUNNER_TEMP/select-merge.XXXXXX")
+          make fuzz-select_merge FUZZ_RUNTIME=60 FUZZ_CORPUS_ROOT="$corpus_root/serial"
+          RAY_FUZZ_CORES=4 make fuzz-select_merge FUZZ_RUNTIME=60 FUZZ_CORPUS_ROOT="$corpus_root/parallel"
       - name: Upload crash artifacts
         if: failure()
         uses: actions/upload-artifact@v4
@@ -108,7 +135,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: TSan concurrency suites
         run: |
-          for f in pool heap parallel stress; do
+          for f in pool heap parallel stress store/parted_concurrent_mounts; do
             echo "::group::tsan -f $f"
             make tsan-test TSAN_FILTER=$f || exit 1
             echo "::endgroup::"
@@ -141,15 +168,16 @@ jobs:
   # skipped required check can be treated as passed, silently opening the gate.
   # static-analysis is intentionally NOT in `needs` — it is advisory only.
   ci-success:
-    needs: [build-and-test, ndebug, fuzz-smoke, tsan]
+    needs: [build-and-test, clang-current, ndebug, fuzz-smoke, tsan]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Verify all required jobs passed
         run: |
           bt='${{ needs.build-and-test.result }}'
+          cl='${{ needs.clang-current.result }}'
           nd='${{ needs.ndebug.result }}'
           fz='${{ needs.fuzz-smoke.result }}'
           ts='${{ needs.tsan.result }}'
-          echo "build-and-test: $bt   ndebug: $nd   fuzz-smoke: $fz   tsan: $ts"
-          [ "$bt" = "success" ] && [ "$nd" = "success" ] && [ "$fz" = "success" ] && [ "$ts" = "success" ] || exit 1
+          echo "build-and-test: $bt   clang-current: $cl   ndebug: $nd   fuzz-smoke: $fz   tsan: $ts"
+          [ "$bt" = "success" ] && [ "$cl" = "success" ] && [ "$nd" = "success" ] && [ "$fz" = "success" ] && [ "$ts" = "success" ] || exit 1

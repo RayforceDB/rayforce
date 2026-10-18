@@ -1654,15 +1654,14 @@ static test_result_t test_signed_zeros_battery(void) {
 /* Review focus 5: float sums bit-identical while vectors change encoding:
  * cancellation, overflow to infinity, all -0.0, ALP decimals, and a column
  * whose vectors select CONST and DICT in turn (chunk 0's dictionary holds
- * every value, so DICT, its codes RLE where they run, takes the rest).  The tables stay
- * below RAY_PARALLEL_THRESHOLD: over it, this branch's float reduction keeps
- * one accumulator per worker while tasks are claimed dynamically, so float
- * sums vary from run to run in generation 0 itself (fixed on dev by #744,
- * chunk-ordered partials; it arrives with the dev merge). */
+ * every value, so DICT, its codes RLE where they run, takes the rest).  The
+ * 70000-row tables pass RAY_PARALLEL_THRESHOLD: both generations fold their
+ * float partials per chunk in chunk order (#744), so the sums are the same
+ * bits at any worker count. */
 static test_result_t test_float_sums(void) {
-    static const int64_t ns[] = { 64512, 4096, 5000, 64512, 64512 };
+    static const int64_t ns[] = { 70000, 4096, 5000, 70000, 70000 };
     static const int encs[] = { -1, RAY_ENC_RAW, RAY_ENC_RLE, RAY_ENC_CONST, RAY_ENC_ALP, RAY_ENC_ALP_RD };
-    _Static_assert(64512 < RAY_PARALLEL_THRESHOLD, "the float sums must stay serial");
+    _Static_assert(70000 > RAY_PARALLEL_THRESHOLD, "the float sums run in parallel");
     for (int t = 0; t < 5; t++)
         for (size_t k = 0; k < sizeof encs / sizeof encs[0]; k++) {
             if (encs[k] == RAY_ENC_CONST && t != 2) continue;          /* constant per vector only there */

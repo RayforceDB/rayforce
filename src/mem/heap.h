@@ -52,11 +52,13 @@
  *
  *   Bits 0x01-0x03  RAY_SYM vectors:  sym index width (RAY_SYM_W8/W16/W32/W64)
  *   Bits 0x01-0x10  function objects (RAY_UNARY/BINARY/VARY): RAY_FN_* flags
+ *   Bit  0x01       -RAY_STR atoms:  RAY_ATTR_STR_CELL (a string column's cell bound for a row)
  *   Bit  0x02       -RAY_I64 atoms:  RAY_ATTR_GRAPH (ray_rel_t* CSR handle in .i64)
  *   Bit  0x04       -RAY_I64 atoms:  RAY_ATTR_HNSW (HNSW handle in .i64)
  *   Bit  0x08       vectors:         RAY_ATTR_HAS_INDEX (index ray_t* in aux[0..7])
  *   Bit  0x10       vectors:         RAY_ATTR_SLICE
  *   Bit  0x20       -RAY_SYM:        ATTR_QUOTED (quoted/literal symbol; default = name reference)
+ *   Bit  0x20       -RAY_I64 atoms:  RAY_ATTR_DLPROG (Datalog program handle in .i64)
  *   Bit  0x20       vectors:         RAY_ATTR_SORTED (non-descending order marker)
  *   Bit  0x40       vectors:         RAY_ATTR_HAS_NULLS (sentinel-encoded; payload is truth;
  *                                    a slice inherits its parent's bit)
@@ -86,6 +88,11 @@
  * (.graph.free h) explicitly; the heap finalizer also frees the underlying
  * ray_rel_t when the atom's rc drops to zero so rebindings/scope-exit
  * never leak the graph. */
+/* RAY_ATTR_STR_CELL (-RAY_STR atoms): the atom is one cell of a string
+ * column, bound by a query that evaluates an expression row by row.  `in`
+ * answers it as one value, as it answers a string element of a collection,
+ * not character by character as it answers a lone string literal. */
+#define RAY_ATTR_STR_CELL     0x01
 #define RAY_ATTR_GRAPH        0x02
 
 /* I64 atom carries an owning ray_hnsw_t* in its .i64 slot.
@@ -97,8 +104,8 @@
  * integer or an arithmetic copy (which drops attrs) is rejected with a type
  * error instead of being reinterpreted as a pointer — see dl_unwrap_program.
  * Reuses 0x20 (RAY_ATTR_SORTED on vectors / ATTR_QUOTED on -RAY_SYM); the
- * -RAY_I64 type tag disambiguates, and no free-path or generic check reads
- * 0x20 on a -RAY_I64 atom.  User must (dl-free h). */
+ * -RAY_I64 type tag disambiguates.  The heap finalizer frees the program when
+ * its owning atom is released; users may call (dl-free h) for early release. */
 #define RAY_ATTR_DLPROG       0x20
 
 /* Vector is a linked column.  The 8 bytes of the aux union at offset
@@ -129,6 +136,11 @@
 #define RAY_ATTR_HAS_INDEX    0x08
 
 /* ===== Internal Allocator Variants ===== */
+
+/* ray_free for a block whose last reference was just dropped: v is not
+ * NULL, not an error and not arena-owned, the checks ray_release_last
+ * already made.  ray_release frees through it. */
+void      ray_free_last_ref(ray_t* v);
 
 ray_t*    ray_alloc_copy(ray_t* v);
 ray_t*    ray_scratch_alloc(size_t data_size);
@@ -213,6 +225,7 @@ typedef struct ray_dispatch  ray_dispatch_t;
 
 void     ray_heap_init(void);
 void     ray_heap_destroy(void);
+
 /* Detach the calling thread from its heap WITHOUT tearing the heap down:
  * the heap stays registered with its pools intact and is handed to the next
  * thread that calls ray_heap_init().
@@ -259,8 +272,10 @@ void ray_heap_release_pages(void);
  *   none is pending (nothing to release, or decay disabled).  An event loop
  *   uses it to bound a wait it would otherwise make indefinite.
  * ray_heap_decay          — sweep if due and if the worker pool is
- *   quiescent; returns the number of blocks released, or -1 if it did
- *   nothing.  Safe to call from any maintenance point.
+ *   quiescent: release the pages of free blocks and unmap empty spill pools
+ *   of the caller's heap and the workers'; returns the number of blocks
+ *   released, or -1 if it did nothing.  Safe to call from any maintenance
+ *   point.
  *
  * The threshold is fixed policy, reachable only through
  * ray_heap_set_decay_ms: negative disables the decay, 0 releases at the
@@ -268,11 +283,35 @@ void ray_heap_release_pages(void);
 void    ray_heap_note_activity(void);
 int64_t ray_heap_decay_due_ms(void);
 int64_t ray_heap_decay(void);
+/* At a statement boundary: after a statement that spilled (or one that,
+ * right after such a relief, needed its room for large blocks), unmap the
+ * empty pools of the heaps that did not spill a pool when that makes room
+ * for the next pool under the anon watermark, drain the direct-block cache
+ * and release the pages of free blocks — unless the last relief was
+ * followed by a spill all the same.  Otherwise, near the watermark, park
+ * empty pools.  Empty spill pools are parked too, their files and mappings
+ * kept for the next spill but their pages discarded, a dirty one unwritten
+ * (where the platform cannot discard them, unmapped instead), and unmapped
+ * when the relief acts, from every heap but for a heap's last pool, or at
+ * the decay threshold.
+ * No-op inside parallel work and without file spill (Windows). */
+int64_t ray_heap_relieve(void);
 
 /* Set the threshold directly; negative disables.  The environment is read
  * once on first use, so this exists to let a test drive the policy without
  * re-exec — not as a runtime knob. */
 void ray_heap_set_decay_ms(int64_t ms);
+
+/* Whether an empty parked spill pool's pages are discarded at the boundary
+ * (true) or the pool is unmapped, as where the platform cannot discard
+ * them (false).  Policy; it exists for tests, as ray_heap_set_decay_ms. */
+bool ray_heap_set_spill_discard(bool on);   /* returns the setting it replaced */
+/* Whether a parked spill pool's pages are discarded here and now: the
+ * platform can punch a mapped range, and the setting allows it. */
+bool ray_heap_spill_discards(void);
+/* How many parked spill pools a boundary has set out to discard so far —
+ * each once per use (ray_heap_relieve).  For tests. */
+int64_t ray_heap_spill_discard_count(void);
 
 /* --------------------------------------------------------------------------
  * Constants
@@ -329,21 +368,37 @@ static inline bool ray_direct_file_backed(const ray_t* v) {
     return ((const ray_direct_hdr_t*)((const char*)v - RAY_DIRECT_HDR))->swap_fd >= 0;
 }
 
-/* Anonymous (RAM-resident, OOM-killable) pool + direct bytes currently
- * committed by the heap.  Allocations that would push this past the anon
- * watermark (default: physical RAM, or the container's cgroup memory limit
- * when that is smaller — ray_sys_ram_limit) are backed by a disk spill file
+/* Bytes [0, upto) of ray_alloc_raw block `p` are not read again, and [0,
+ * from) of them were reported before.  When `p` is spilled (a direct block
+ * over a spill file), the whole pages among them are punched out of the
+ * file now: a dirty one is never written back, and the page cache it held
+ * is free for what comes next.  They read zero after.  A no-op for every
+ * other block, and where the platform cannot punch a mapped range.  True
+ * when pages were punched out. */
+bool ray_raw_discard(void* p, size_t from, size_t upto);
+
+/* Anonymous (RAM-resident, OOM-killable) pool, direct and sys bytes currently
+ * committed.  Allocations that would push this past the anon watermark
+ * (default: ray_sys_ram_limit — physical RAM, or the container's cgroup
+ * memory limit when that is smaller — less a quarter of it, at least 3 GiB
+ * and at most half, left to the page cache) are backed by a disk spill file
  * instead — file-backed pages are always reclaimable, so they cannot trigger
  * the OOM killer.  ray_heap_set_anon_watermark overrides the threshold (0
  * restores the default); intended for diagnostics and tests. */
 int64_t ray_heap_anon_committed(void);
 /* High-water mark of the anon-committed footprint since process start — the
- * peak RAM an operator actually demanded (pools + direct; excludes spill). */
+ * peak RAM an operator actually demanded (pools, direct and sys blocks;
+ * excludes spill). */
 int64_t ray_heap_anon_peak(void);
 /* Current anon watermark in bytes (the effective spill threshold; resolves 0
- * to ray_sys_ram_limit()). */
+ * to the default, ray_sys_ram_limit() less the page-cache room). */
 int64_t ray_heap_anon_watermark(void);
 void    ray_heap_set_anon_watermark(int64_t bytes);
+/* The RAM a query may plan for (sizing gates, cache budgets): the watermark
+ * when one was set (-m), else ray_sys_ram_limit().  Unlike the default
+ * watermark it does not leave the page-cache room, which decides where new
+ * memory goes, not how much a query may hold. */
+int64_t ray_heap_mem_budget(void);
 /* Release every block held by the direct-allocation reuse cache back to
  * the kernel (their committed-RAM accounting drops with them).  The cache
  * self-drains under watermark pressure; this is for tests and explicit
@@ -360,7 +415,8 @@ void    ray_heap_direct_cache_drain(void);
 typedef struct {
     uint16_t heap_id;     /* owning heap ID (for cross-thread free) */
     uint8_t  pool_order;  /* pool's top order */
-    uint8_t  _pad[5];
+    uint8_t  _pad;
+    uint32_t parked_ms;   /* when it was last parked, ms, wrapping (heap_park_empty_pools) */
     void*    vm_base;     /* original mmap base (for ray_vm_free on Windows) */
 } ray_pool_hdr_t;
 
@@ -420,7 +476,11 @@ typedef struct {
     uint8_t  pool_order;   /* pool order for munmap sizing */
     uint8_t  backed;       /* 0 = anon mmap, 1 = file-backed swap */
     uint8_t  hugepage;     /* 1 = THP hint issued (Linux); 0 otherwise */
-    uint8_t  _pad[1];
+    uint8_t  parked    : 1;  /* empty, its blocks off the freelists
+                              * (heap_park_empty_pools) */
+    uint8_t  discarded : 1;  /* parked spill pool whose pages were discarded
+                              * since it was last in use
+                              * (heap_spill_pools_discard) */
 } ray_pool_entry_t;
 
 /* --------------------------------------------------------------------------
@@ -537,6 +597,8 @@ typedef struct ray_heap {
     ray_mem_stats_t  stats;
     uint32_t        pool_count;                  /* number of tracked pools */
     uint32_t        last_pool_idx;               /* MRU pool index for warm-first ray_free */
+    uint32_t        parked;                      /* pools parked among them */
+    uint32_t        spilled;                     /* a pool spilled since a boundary looked */
     ray_pool_entry_t pools[RAY_MAX_POOLS];         /* pool tracking for destroy/merge */
     struct ray_heap* pending_next;                /* link for pending-merge LIFO queue */
     struct ray_heap* idle_next;                   /* link for the abandoned-heap LIFO */

@@ -66,6 +66,26 @@ typedef struct {
     uint64_t steals;   /* successful steal operations */
 } ray_pool_slot_t;
 
+/* Scan read-ahead: the mapped columns a query reads, registered for the
+ * dispatches it runs (ray_pool_scan_set).  While a dispatch runs, each
+ * worker keeps the rows just ahead of the ones it reads requested from
+ * storage (see pool.c).  `gate`, when set, is the zone-index verdict of the
+ * query's filter: bit c clear means no row of [c << gate_log2,
+ * (c + 1) << gate_log2) can pass it, so nothing there is requested.
+ * warm[c]: the rows at the start of column c that were resident when it was
+ * registered (the kernel reads them ahead with the header when the column
+ * is opened); their residency says nothing of what a pass reads. */
+#define RAY_POOL_SCAN_MAX 32
+typedef struct {
+    const uint8_t*  base[RAY_POOL_SCAN_MAX];
+    uint32_t        esz[RAY_POOL_SCAN_MAX];
+    int64_t         warm[RAY_POOL_SCAN_MAX];
+    uint32_t        n;
+    int64_t         rows;
+    const uint64_t* gate;
+    uint8_t         gate_log2;
+} ray_pool_scan_t;
+
 /* Thread pool */
 struct ray_pool {
     ray_thread_t*       threads;       /* worker thread handles [n_workers] */
@@ -113,12 +133,25 @@ struct ray_pool {
     uint32_t           steal;
     uint32_t           trace;         /* RAY_POOL_TRACE: histogram at destroy */
     ray_pool_slot_t*    slots;         /* [n_workers+1], 64-byte aligned */
+    /* Scan read-ahead of the open dispatch: the registered columns (NULL
+     * when none), set by the dispatcher before the window is published and
+     * cleared once it has drained.  With scan_auto the dispatch covers
+     * exactly their rows, ticket base+i holding rows [i*grain, (i+1)*grain),
+     * and the pool requests ahead itself; otherwise only tasks that report
+     * their position (ray_pool_scan_at) do. */
+    const ray_pool_scan_t* scan;
+    bool               scan_auto;
+    uint64_t           scan_base;     /* first ticket of the window */
+    int64_t            scan_grain;    /* rows per ticket */
+    uint64_t           scan_gen;      /* dispatches so far: resets per-thread state */
+    size_t             scan_bytes;    /* bytes kept requested per column and worker */
     void*              slots_raw;     /* the allocation behind `slots` */
     _Atomic(uint64_t)  win_state;     /* 2*windows + (publishing ? 1 : 0) */
 
     /* Barrier */
     _Atomic(uint32_t)  pending;       /* decremented by each task completion */
     ray_sem_t           work_ready;    /* workers sleep here */
+    ray_sem_t           started;       /* a signal from each worker once its heap is up */
 
     /* Query cancellation — set by ray_cancel(), checked per-morsel */
     _Atomic(uint32_t)  cancelled;
@@ -127,18 +160,16 @@ struct ray_pool {
 /* Total workers = n_workers + 1 (main thread is worker 0) */
 #define ray_pool_total_workers(p) ((p)->n_workers + 1)
 
-/* Maximum number of tasks per ray_pool_dispatch call (ring capacity ceiling).
- * Workloads that would require more tasks must either fall back to a serial
- * path or be restructured — the dispatcher clamps n_tasks and re-derives a
- * non-morsel-aligned grain, which breaks slot math in morsel-sensitive callers
- * (e.g. exec_pred_to_selection).  Value must stay in sync with MAX_RING_CAP
- * in pool.c. */
+/* Task-ring capacity ceiling.  A dispatch that needs more tasks than the ring
+ * holds (this ceiling, or a smaller ring that failed to grow) runs them in
+ * further rounds; the per-task ranges are unchanged, so ray_pool_dispatch's
+ * tasks always start on TASK_GRAIN boundaries.  Value must stay in sync with
+ * MAX_RING_CAP in pool.c. */
 #define RAY_POOL_MAX_TASKS  (1u << 16)
 
 /* Initial task-ring capacity (power of 2).  ray_pool_dispatch_n callers that
- * must never trigger ring growth (its clamp-on-grow-failure silently DROPS
- * tasks) cap their task count at this value — one shared constant instead of
- * a hardcoded 1024 at every site. */
+ * want their tasks in one round, with no ring growth, cap their task count at
+ * this value — one shared constant instead of a hardcoded 1024 at every site. */
 #define RAY_POOL_INIT_TASKS 1024u
 
 /* True when a data-parallel dispatch is both worthwhile AND safe: a live
@@ -166,38 +197,79 @@ void ray_pool_free(ray_pool_t* pool);
  * walks its own slice in order and then takes chunks cut from the END of
  * other workers' slices; with the shared cursor tasks start in index order
  * but still finish in any order).  Callers may rely only on (a) each task
- * running exactly once, (b) a task's identity — its [start, end) or index —
- * which is what results must be placed by, and (c) everything being done
- * when the dispatch returns.  Anything that stops early ("first N", a
- * cutoff, a bound) must be sound whatever the order: derive it from row
- * positions or values, never from "the tasks before this one have run"
- * (see ray_fused_take_select in fused_topk.c for the pattern). */
+ * running at most once, and exactly once unless the dispatch was
+ * cancelled, (b) a task's identity — its [start, end) or index — which is
+ * what results must be placed by, and (c) everything that ran being done
+ * when the dispatch returns.  A cancel (ray_request_interrupt, or the
+ * pool's cancelled flag) makes the dispatch skip every task that has not
+ * started and return normally; a task that has started runs to its end.
+ * A caller whose outputs need every task must check ray_interrupted() and
+ * the pool's cancelled flag after the dispatch before consuming them, and
+ * either give up or run the skipped tasks itself (see
+ * ray_sym_domain_intern_batch in table/domain.c).  Anything that stops
+ * early ("first N", a cutoff, a bound) must be sound whatever the order:
+ * derive it from row positions or values, never from "the tasks before
+ * this one have run" (see ray_fused_take_select in fused_topk.c for the
+ * pattern). */
+
+/* Register the columns the calling thread's next dispatches scan (NULL
+ * clears); returns the previous registration so nested executions can
+ * restore it.  The registration must outlive those dispatches. */
+const ray_pool_scan_t* ray_pool_scan_set(const ray_pool_scan_t* scan);
+const ray_pool_scan_t* ray_pool_scan_get(void);
+
+/* Called by a task about to read rows [r, end) of an `nrows`-row input:
+ * when that input is the registered one, keep the rows just ahead of r
+ * requested.  For dispatch_n tasks that walk row ranges of their own; a
+ * dispatch over exactly the registered rows needs no call (the pool
+ * requests per ticket).  Cheap when nothing is registered. */
+void ray_pool_scan_at(int64_t nrows, int64_t r, int64_t end);
+
+/* ray_pool_scan_at for a task that reads one registered column, its data
+ * at `col` (a gather): only that column is requested, from the first call
+ * on.  No-op when `col` is not registered for the open dispatch. */
+void ray_pool_scan_col_at(const void* col, int64_t nrows, int64_t r, int64_t end);
+
+/* True when read-ahead is on and the calling thread's registration holds
+ * the `nrows`-row column with data at `col`: a dispatch it makes next can
+ * have its tasks report positions in that column (ray_pool_scan_col_at). */
+bool ray_pool_scan_holds(const void* col, int64_t nrows);
+
+/* Read-ahead is on (RAY_SCAN_PREFETCH unset, or a positive number of KiB).
+ * For requests made outside the per-dispatch windows, which honour the same
+ * switch. */
+bool ray_pool_scan_on(void);
+
+/* Ask for [p, p+bytes) of a file mapping (ray_vm_advise_willneed), with the
+ * work of a large range split over the pool's threads when called outside
+ * a dispatch. */
+void ray_pool_want(const void* p, size_t bytes);
 
 /* Dispatch fn over [0, total_elems) partitioned into morsel-sized tasks.
  * Blocks until all tasks complete. Main thread participates as worker 0.
- * Contract: task starts are multiples of the requested grain (TASK_GRAIN,
- * RAY_DISPATCH_MORSELS morsels).  When the tasks outnumber the ring (above
- * RAY_POOL_MAX_TASKS, or a ring whose growth failed) a task covers several
- * grains, still starting on a grain boundary: a caller keeping per-grain
- * state walks its task grain by grain. */
+ * Contract: every task is one grain, [i*grain, min((i+1)*grain, total))
+ * (TASK_GRAIN, RAY_DISPATCH_MORSELS morsels).  When the tasks outnumber the
+ * ring (above RAY_POOL_MAX_TASKS, or a ring whose growth failed) they run
+ * in further rounds of the same grain (#792), so a caller keeping per-grain
+ * state may still walk its task grain by grain. */
 void ray_pool_dispatch(ray_pool_t* pool, ray_pool_fn fn, void* ctx, int64_t total_elems);
 /* ray_pool_dispatch at `grain` elements per task (a whole multiple of
  * RAY_MORSEL_ELEMS), under the same clamp and contract. */
 void ray_pool_dispatch_grain(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
                              int64_t total_elems, int64_t grain);
-/* The task count and grain a dispatch of total_elems at `grain` takes
- * (after the ring's growth and clamp; the default grain is
- * RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS).  A ring never shrinks, so a
- * later ray_pool_dispatch_grain at *eff_grain runs exactly *n_tasks tasks
+/* The task count and grain a dispatch of total_elems at `grain` takes (the
+ * default grain is RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS): rounds keep the
+ * grain, so *eff_grain == grain and *n_tasks is ceil(total / grain); a
+ * ray_pool_dispatch_grain at *eff_grain runs exactly *n_tasks tasks
  * starting at multiples of *eff_grain: two passes that size per-task state
- * from this agree.  Main thread only, as a dispatch. */
+ * from this agree. */
 void ray_pool_dispatch_geometry(ray_pool_t* pool, int64_t total_elems, int64_t grain,
                                 uint32_t* n_tasks, int64_t* eff_grain);
 /* Test hook (C tests only): ray_pool_dispatch's ring growth fails (its
- * realloc returns NULL) and the ring holds at most `cap` tasks, so the clamp
- * runs at test sizes as it does above task_cap * TASK_GRAIN elements when
- * the realloc fails, or above RAY_POOL_MAX_TASKS tasks; 0 off.  Disarmed by
- * ray_test_hooks_off. */
+ * realloc returns NULL) and a round holds at most `cap` tasks, so the
+ * further rounds run at test sizes as they do above task_cap * TASK_GRAIN
+ * elements when the realloc fails, or above RAY_POOL_MAX_TASKS tasks; 0 off.
+ * Disarmed by ray_test_hooks_off. */
 void ray_pool_test_ring_fail(uint32_t cap);
 
 /* Dispatch exactly n_tasks tasks, each with range [i, i+1).
@@ -213,5 +285,13 @@ ray_err_t ray_pool_init(uint32_t n_workers);
  * Pass 0 to auto-detect. Used by the CLI, where -c is a total-core count. */
 ray_err_t ray_pool_init_total(uint32_t total_workers);
 void     ray_pool_destroy(void);
+
+/* Call fn on the heap of every worker of the live singleton pool; nothing
+ * when no pool is running (this never starts one).  For heap maintenance on
+ * the dispatcher's thread with ray_parallel_flag clear: a parked worker
+ * allocates and frees nothing until the next dispatch, so its heap may be
+ * worked on from there — which holds for no other thread's heap. */
+struct ray_heap;
+void ray_pool_each_worker_heap(void (*fn)(struct ray_heap* h, void* ctx), void* ctx);
 
 #endif /* RAY_POOL_H */

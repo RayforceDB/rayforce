@@ -3378,7 +3378,9 @@ static ray_t* ex_run(ray_t* t, ex_case_t k) {
     case EX_HEAD_FILTER: root = ray_head(g, ray_filter(g, tb, ray_gt(g, sb, ray_const_i64(g, 50))), 4); break;
     case EX_FILTER_SOME: root = ray_filter(g, tb, ray_gt(g, sb, ray_const_i64(g, 500))); break;
     case EX_FILTER_NONE: root = ray_filter(g, tb, ray_lt(g, sb, ray_const_i64(g, -1))); break;
-    case EX_SORT_B: { ray_op_t* ks[1] = { sb }; root = ray_sort_op(g, tb, ks, d0, nf0, 1); break; }
+    case EX_SORT_B: {   /* descending: b ascends, and an ordered table is returned ungathered */
+        uint8_t d1[1] = { 1 };
+        ray_op_t* ks[1] = { sb }; root = ray_sort_op(g, tb, ks, d1, nf0, 1); break; }
     case EX_SORT_A: { ray_op_t* ks[1] = { ray_scan(g, "a") }; root = ray_sort_op(g, tb, ks, d0, nf0, 1); break; }
     case EX_TOPK_A: { ray_op_t* ks[1] = { ray_scan(g, "a") }; root = ray_head(g, ray_sort_op(g, tb, ks, d0, nf0, 1), 3); break; }
     case EX_TOPK_B: { ray_op_t* ks[1] = { sb }; root = ray_head(g, ray_sort_op(g, tb, ks, d0, nf0, 1), 3); break; }
@@ -5291,8 +5293,8 @@ static test_result_t test_select_parted_prunes_shadow(void) {
 /* Nothing survives, partitions of different sizes: the source is the
  * stand-in alone (01.01's key, one synthetic row), nothing is decoded, and
  * the answers equal the whole scan's — an empty table with the source's
- * schema, a zero count, and (the whole scan's empty first-partition group)
- * one 2024.01.01 group with count 0 under by: date. */
+ * schema, a zero count, and no group under by: date (an empty selection
+ * forms no group, as in memory). */
 static test_result_t test_select_parted_prunes_none(void) {
     static const int64_t rows[3] = { 2500, 700, 1800 };
     ray_t* t = pdb_make_rows(ray_test_tmp(CS_TMP "/sn"), 7, false, rows);
@@ -5329,7 +5331,7 @@ static test_result_t test_select_parted_prunes_none(void) {
     ray_t* cnt = got[1] && got[1]->type == RAY_TABLE ? ray_table_get_col(got[1], ray_sym_intern("c", 1)) : NULL;
     bool zero = cnt && cnt->len == 1 && ((const int64_t*)ray_data(cnt))[0] == 0;
     ray_t* key = got[2] && got[2]->type == RAY_TABLE ? ray_table_get_col(got[2], ray_sym_intern("date", 4)) : NULL;
-    bool group = key && key->type == RAY_DATE && key->len == 1 && ((const int32_t*)ray_data(key))[0] == 8766;
+    bool group = key && key->type == RAY_DATE && key->len == 0;
     bool by_b = got[3] && got[3]->type == RAY_TABLE && ray_table_nrows(got[3]) == 0;
     bool topk = got[4] && got[4]->type == RAY_TABLE && ray_table_nrows(got[4]) == 0;
     for (int i = 0; i < 5; i++) drop_out(got[i]);
@@ -5463,7 +5465,7 @@ static test_result_t test_grouped_nonagg_binds_referenced(void) {
 
 /* simplify_agg_idiom: (first (asc c)) -> min is taken only for a null-free
  * column.  Over a parted generation-0 column with a null in one segment the
- * rewrite must decline (it would answer the min of the non-null cells); the
+ * rewrite declines and the group answers as the same rows in memory; the
  * parted null-free column still takes it. */
 static test_result_t test_query_first_asc_parted_nulls_gen0(void) {
     ray_t* s0 = i64_col(5, 1); ray_t* s1 = i64_col(5, 1);
@@ -5480,11 +5482,17 @@ static test_result_t test_query_first_asc_parted_nulls_gen0(void) {
     t = ray_table_add_col(t, ray_sym_intern("k", 1), kc);
     ray_release(kc);
     ray_env_set(ray_sym_intern("pt", 2), t);
-    ray_t* r = ray_eval_str("(select {m: (first (asc p)) by: k from: pt})");
-    ray_t* mc = (r && !RAY_IS_ERR(r) && r->type == RAY_TABLE) ? ray_table_col(r, ray_sym_intern("m", 1)) : NULL;
-    bool declined = !(mc && mc->type == RAY_I64 && mc->len == 1 && !ray_vec_is_null(mc, 0));
-    if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
-    TEST_ASSERT_TRUE(declined);
+    /* the rewrite declines (simplify_agg_idiom sees the segment's null);
+     * the group then answers as the same rows in memory do */
+    ray_t* fl = ray_eval_str("(at (select {m: (first (asc p)) by: k from: "
+                             "(table [p k] (list [0 1 2 3 4 0 1 0N 3 4] [0 0 0 0 0 0 0 0 0 0]))}) 'm)");
+    TEST_ASSERT_TRUE(fl && !RAY_IS_ERR(fl) && fl->type == RAY_I64 && fl->len == 1);
+    ray_t* r = ray_eval_str("(at (select {m: (first (asc p)) by: k from: pt}) 'm)");
+    TEST_ASSERT_FMT(r && !RAY_IS_ERR(r) && r->type == RAY_I64 && r->len == 1, "%s",
+                    r && RAY_IS_ERR(r) ? ray_error_msg() : "not one I64");
+    TEST_ASSERT_EQ_I(ray_vec_is_null(r, 0), ray_vec_is_null(fl, 0));
+    if (!ray_vec_is_null(fl, 0)) TEST_ASSERT_EQ_I(((const int64_t*)ray_data(r))[0], ((const int64_t*)ray_data(fl))[0]);
+    ray_release(r); ray_release(fl);
     /* without a null the rewrite is taken: the answer is the minimum */
     ray_vec_set_null(s1, 2, false);
     ((int64_t*)ray_data(s1))[2] = 7;

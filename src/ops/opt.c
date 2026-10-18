@@ -162,6 +162,11 @@ static void pass_type_inference(ray_graph_t* g, ray_op_t* root) {
                     for (uint32_t a = 0; a < ext->n_aggs; a++)
                         if (op_node(g, ext->agg_ins[a]) && !visited[ext->agg_ins[a]] && sp < (int)stack_cap)
                             stack[sp++] = ext->agg_ins[a];
+                    /* Second inputs of binary aggs (wsum/wavg/cov/pearson). */
+                    if (ext->agg_ins2)
+                        for (uint32_t a = 0; a < ext->n_aggs; a++)
+                            if (op_node(g, ext->agg_ins2[a]) && !visited[ext->agg_ins2[a]] && sp < (int)stack_cap)
+                                stack[sp++] = ext->agg_ins2[a];
                     break;
                 case OP_SORT:
                 case OP_SELECT:
@@ -457,6 +462,12 @@ static bool fold_binary_const(ray_graph_t* g, ray_op_t* node) {
     ray_op_ext_t* re = find_ext(g, rhs->id);
     if (!le || !re || !le->literal || !re->literal) return false;
     if (!ray_is_atom(le->literal) || !ray_is_atom(re->literal)) return false;
+
+    /* Symbol ids cannot be constant-folded as ordered integers (#738). */
+    if ((node->opcode == OP_LT || node->opcode == OP_LE ||
+         node->opcode == OP_GT || node->opcode == OP_GE) &&
+        (le->literal->type == -RAY_SYM || re->literal->type == -RAY_SYM))
+        return false;
 
     double lf = 0.0, rf = 0.0;
     int64_t li = 0, ri = 0;
@@ -773,6 +784,11 @@ static void pass_constant_fold(ray_graph_t* g, ray_op_t* root) {
                     for (uint32_t a = 0; a < ext->n_aggs; a++)
                         if (op_node(g, ext->agg_ins[a]) && !visited[ext->agg_ins[a]] && sp < (int)stack_cap)
                             stack[sp++] = ext->agg_ins[a];
+                    /* Second inputs of binary aggs (wsum/wavg/cov/pearson). */
+                    if (ext->agg_ins2)
+                        for (uint32_t a = 0; a < ext->n_aggs; a++)
+                            if (op_node(g, ext->agg_ins2[a]) && !visited[ext->agg_ins2[a]] && sp < (int)stack_cap)
+                                stack[sp++] = ext->agg_ins2[a];
                     break;
                 case OP_SORT:
                 case OP_SELECT:
@@ -919,6 +935,13 @@ static void mark_live(ray_graph_t* g, ray_op_t* root, bool* live) {
                             if (op_node(g, ext->agg_ins[a]) && !live[ext->agg_ins[a]] && sp < (int)stack_cap)
                                 stack[sp++] = ext->agg_ins[a];
                         }
+                        /* Second inputs of binary aggs: an expression
+                         * referenced only here must stay live. */
+                        if (ext->agg_ins2)
+                            for (uint32_t a = 0; a < ext->n_aggs; a++) {
+                                if (op_node(g, ext->agg_ins2[a]) && !live[ext->agg_ins2[a]] && sp < (int)stack_cap)
+                                    stack[sp++] = ext->agg_ins2[a];
+                            }
                         break;
                     case OP_SORT:
                     case OP_SELECT:
@@ -1829,6 +1852,12 @@ static bool pass_projection_pushdown(ray_graph_t* g, ray_op_t* root) {
                             live[ext->agg_ins[a]] = true;
                             if (qt < (int)nc) q[qt++] = ext->agg_ins[a];
                         }
+                    if (ext->agg_ins2)
+                        for (uint32_t a = 0; a < ext->n_aggs; a++)
+                            if (op_node(g, ext->agg_ins2[a]) && !live[ext->agg_ins2[a]]) {
+                                live[ext->agg_ins2[a]] = true;
+                                if (qt < (int)nc) q[qt++] = ext->agg_ins2[a];
+                            }
                     break;
                 case OP_SORT:
                 case OP_SELECT:
@@ -1952,6 +1981,11 @@ bool ray_part_prune_mask(ray_t* key_values, uint16_t cmp_op, bool swapped,
     bool pkey_is_sym = (pkey_t == RAY_SYM);
     bool lit_is_sym  = (lit_base == RAY_SYM);
     if (pkey_is_sym != lit_is_sym) return false;
+    /* Raw partition ids have no lexical ordering (#738). Let the
+     * domain-aware predicate executor select these rows instead. */
+    if (pkey_is_sym && (cmp_op == OP_LT || cmp_op == OP_LE ||
+                        cmp_op == OP_GT || cmp_op == OP_GE))
+        return false;
 
     /* OP_IN / OP_NOT_IN expects a literal vector const on the RHS.
      * For the scalar ops, the const is a single atom or 1-elem vec. */

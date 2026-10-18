@@ -2414,10 +2414,8 @@ static test_result_t test_idict_forged(void) {
 /* ---- P6b Task 4: group-by on DICT codes ---- */
 
 /* q on the in-memory table M (no index: the plain STR answer) and on the
- * generation-2 load `load2`: equal formatted results.  The reference the
- * DICT routes answer to, beside generation 0 (whose DICT arm answers an
- * aggregate over an expression of the key on its codes on this branch until
- * the dev merge brings #760's reroute). */
+ * load `load2` (generation 2, or generation 0 with its DICT): equal
+ * formatted results.  The reference the DICT routes answer to. */
 static test_result_t st_same_mem(const char* load2, const char* q) {
     ray_t* out[2] = { NULL, NULL };
     for (int g = 0; g < 2; g++) {
@@ -2448,14 +2446,15 @@ static uint64_t st_col_decoded(const char* col) {
 
 /* q18 / q34 / q35 / composite / selection shapes on a DICT column: the
  * answers equal generation 0 (by asc: unordered group output is
- * unspecified), nothing materialized.  Decoded bytes: the key-only shapes
- * decode nothing at all; the shapes reading u (I64) or f (U8) by range
- * decode those columns' vectors, so for every shape the key column's own
- * counter (e->decoded_bytes) stays 0. */
+ * unspecified), nothing materialized.  Decoded bytes: the shapes that read
+ * no value decode nothing at all; the composite key reads u (I64) by range,
+ * decoding its vectors; for every shape the key column's own counter
+ * (e->decoded_bytes) stays 0. */
 #define ST_GB_TABLE "(table [s u f] (list (as 'STR (map (fn [j] (if (== 3 (% (div j 1024) 7)) \"\" " \
     "(if (== 1 (% (div j 1024) 5)) (format \"https://e.org/%/%\" j (* j 31)) (format \"category number % long\" (% j 37))))) (til 140000))) " \
     "(% (til 140000) 11) (as 'U8 (% (til 140000) 3))))"
 #define ST_GB_LOAD2 "(set T (.db.splayed.get \"" ST_TMP "/gb2/\"))"
+#define ST_GB_LOAD0 "(set T (.db.splayed.get \"" ST_TMP "/gb0/\"))"
 static test_result_t test_idict_groupby(void) {
     ST_SAVE2("gb", ST_GB_TABLE);
     ST_Q_OK_N("(set M " ST_GB_TABLE ")");
@@ -2466,7 +2465,9 @@ static test_result_t test_idict_groupby(void) {
         { "(select {one: 1 s: s n: (count s) from: T by: s asc: s})", true },         /* q35's shape */
         { "(select {n: (count u) from: T by: s asc: s})", true },                     /* count reads no u value */
         { "(select {n: (count u) from: T by: {u: u s: s} asc: [u s]})", false },      /* composite (q18) */
-        { "(select {n: (count u) from: T where: (== f 1) by: s asc: s})", false },    /* under a selection */
+        /* under a selection: count reads no u value, and the where compares
+         * on f's encoded vectors, so nothing decodes */
+        { "(select {n: (count u) from: T where: (== f 1) by: s asc: s})", true },
     };
     for (size_t i = 0; i < sizeof qs / sizeof qs[0]; i++) {
         st_fk_t k = { 0 };
@@ -2483,9 +2484,7 @@ static test_result_t test_idict_groupby(void) {
     /* an aggregate over an expression of the key, or of the key itself
      * other than a plain count: the swap rule declines the codes and the
      * column is read as strings.  Compared with the in-memory table (no
-     * index) only: generation 0's DICT arm admits the strlen shapes on its
-     * codes at this branch's dev base (#760's reroute comes with the dev
-     * merge). */
+     * index), from generation 2 and from generation 0 (its DICT arm). */
     static const char* const decl[] = {
         "(select {m: (max (strlen s)) from: T by: s asc: s})",
         "(select {m: (sum (strlen s)) from: T by: s asc: s})",
@@ -2493,7 +2492,16 @@ static test_result_t test_idict_groupby(void) {
         "(select {m: (first s) from: T by: s asc: s})",
         "(select {n: (count u) from: T by: {s: s l: (strlen s)} asc: [s l]})",
     };
-    for (size_t i = 0; i < sizeof decl / sizeof decl[0]; i++) ST_SAME_MEM(ST_GB_LOAD2, decl[i]);
+    {   /* generation 0 keeps its DICT (the arm under test) */
+        ST_Q_OK_N(ST_GB_LOAD0);
+        ray_t* kd = ray_eval_str("(at (.idx.info (at T 's)) 'kind)");
+        TEST_ASSERT_TRUE(kd && !RAY_IS_ERR(kd) && kd->type == -RAY_SYM && kd->i64 == ray_sym_intern("dict", 4));
+        ray_release(kd);
+    }
+    for (size_t i = 0; i < sizeof decl / sizeof decl[0]; i++) {
+        ST_SAME_MEM(ST_GB_LOAD2, decl[i]);
+        ST_SAME_MEM(ST_GB_LOAD0, decl[i]);
+    }
     ST_SAME("gb", "(select {m: (first s) from: T by: s asc: s})", NULL);
     /* a count-distinct beside the key: the stashed result codes' consumer */
     ST_SAME("gb", "(select {d: (count (distinct u)) from: T by: s asc: s})", NULL);
@@ -2834,20 +2842,24 @@ static test_result_t test_idict_filter_parted_mixed(void) {
 
 /* An out-of-range code in the rows a filter reads: corrupt naming the
  * file, in the STR selection and in a top-k predicate; rows the filter
- * skips are not read.  STR `in` on a DICT column: nyi in both
- * generations (ruling Q1). */
+ * skips are not read.  STR `in` on a DICT column answers in both
+ * generations (ruling Q1 predates string membership). */
 #define ST_FF_TABLE "(table [s v w] (list (as 'STR (map (fn [j] (format \"value % of the domain\" (% (* j 7919) 300))) (til 70000))) (til 70000) " \
     "(as 'U8 (map (fn [j] (if (< j 1000) 1 0)) (til 70000)))))"
 #define ST_FF_LOAD2 "(set T (.db.splayed.get \"" ST_TMP "/ff2/\"))"
 static test_result_t test_idict_filter_forged(void) {
     ST_SAVE2("ff", ST_FF_TABLE);
     ST_Q_OK_N("(set M " ST_FF_TABLE ")");
-    ST_Q_OK("(set T (.db.splayed.get \"" ST_TMP "/ff0/\"))");
-    ray_t* r0 = ray_eval_str(ray_test_tmp("(select {from: T where: (in s [\"a\" \"b\"])})"));
-    TEST_ASSERT_TRUE(r0 && RAY_IS_ERR(r0) && strcmp(ray_err_code(r0), "nyi") == 0); ray_error_free(r0);
-    ST_Q_OK("(set T (.db.splayed.get \"" ST_TMP "/ff2/\"))");
-    ray_t* r2 = ray_eval_str(ray_test_tmp("(select {from: T where: (in s [\"a\" \"b\"])})"));
-    TEST_ASSERT_TRUE(r2 && RAY_IS_ERR(r2) && strcmp(ray_err_code(r2), "nyi") == 0); ray_error_free(r2);
+    /* STR `in` on a DICT column answers as over the in-memory table, in both
+     * generations (string membership, dev #789: no longer nyi) */
+    static const char* const inq[] = {
+        "(count (select {from: T where: (in s [\"a\" \"b\"])}))",
+        "(count (select {from: T where: (in s [\"value 3 of the domain\" \"b\"])}))",
+    };
+    for (size_t i = 0; i < sizeof inq / sizeof inq[0]; i++) {
+        ST_SAME("ff", inq[i], NULL);
+        ST_SAME_MEM(ST_FF_LOAD2, inq[i]);
+    }
     char p[600]; TEST_ASSERT_TRUE(st_live("/ff2", "s", p, sizeof p));
     ray_enc_hdr_t eh = st_hdr(p);
     TEST_ASSERT_EQ_I(eh.index_kind, RAY_IDX_DICT);

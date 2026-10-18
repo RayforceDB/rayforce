@@ -1055,6 +1055,10 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                 uint16_t total_bits = 0;
                 bool fits = true;
 
+                /* A null-bearing F64 key packs its nulls into a reserved
+                 * slot below its minimum (radix_key_bounds_finish), so it
+                 * stays on the composite with the placement the single-key
+                 * encode and the merge comparator give, at every row count. */
                 ray_pool_t* mk_prescan_pool2 = (nrows >= SMALL_POOL_THRESHOLD) ? pool2 : NULL;
                 if (n_sort <= MK_PRESCAN_MAX_KEYS && mk_prescan_pool2) {
                     uint32_t nw = ray_pool_total_workers(mk_prescan_pool2);
@@ -1086,11 +1090,14 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                             if (wmin < kmin) kmin = wmin;
                             if (wmax > kmax) kmax = wmax;
                         }
+                        radix_key_bounds_finish(sort_vecs[k], &kmin, &kmax);
                         mins[k] = kmin;
                         maxs[k] = kmax;
-                        uint64_t range = (uint64_t)(kmax - kmin);
+                        /* Unsigned subtraction: kmin can be the i64 null
+                         * sentinel, and kmax - kmin then overflows i64. */
+                        uint64_t range = (uint64_t)kmax - (uint64_t)kmin;
                         uint8_t bits = 1;
-                        while (((uint64_t)1 << bits) <= range && bits < 64)
+                        while (bits < 64 && ((uint64_t)1 << bits) <= range)
                             bits++;
                         total_bits += bits;
                     }
@@ -1116,6 +1123,14 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                                 if (d[i] < kmin) kmin = d[i];
                                 if (d[i] > kmax) kmax = d[i];
                             }
+                        } else if (col->type == RAY_F64) {
+                            const double* d = (const double*)ray_data(col);
+                            for (int64_t i = 0; i < nrows; i++) {
+                                if (radix_f64_is_null(d[i])) continue;
+                                int64_t v = radix_f64_ord(d[i]);
+                                if (v < kmin) kmin = v;
+                                if (v > kmax) kmax = v;
+                            }
                         } else if (col->type == RAY_I32 || col->type == RAY_DATE || col->type == RAY_TIME) {
                             const int32_t* d = (const int32_t*)ray_data(col);
                             for (int64_t i = 0; i < nrows; i++) {
@@ -1135,11 +1150,14 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                                 if (d[i] > kmax) kmax = (int64_t)d[i];
                             }
                         }
+                        radix_key_bounds_finish(sort_vecs[k], &kmin, &kmax);
                         mins[k] = kmin;
                         maxs[k] = kmax;
-                        uint64_t range = (uint64_t)(kmax - kmin);
+                        /* Unsigned subtraction: kmin can be the i64 null
+                         * sentinel, and kmax - kmin then overflows i64. */
+                        uint64_t range = (uint64_t)kmax - (uint64_t)kmin;
                         uint8_t bits = 1;
-                        while (((uint64_t)1 << bits) <= range && bits < 64)
+                        while (bits < 64 && ((uint64_t)1 << bits) <= range)
                             bits++;
                         total_bits += bits;
                     }
@@ -1157,9 +1175,9 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                     uint8_t accum = 0;
                     for (int k = n_sort - 1; k >= 0; k--) {
                         bit_shifts[k] = accum;
-                        uint64_t range = (uint64_t)(maxs[k] - mins[k]);
+                        uint64_t range = (uint64_t)maxs[k] - (uint64_t)mins[k];
                         uint8_t bits = 1;
-                        while (((uint64_t)1 << bits) <= range && bits < 64)
+                        while (bits < 64 && ((uint64_t)1 << bits) <= range)
                             bits++;
                         accum += bits;
                     }
@@ -1177,7 +1195,7 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                         };
                         for (uint32_t k = 0; k < n_sort; k++) {
                             enc.mins[k] = mins[k];
-                            enc.ranges[k] = maxs[k] - mins[k];
+                            enc.ranges[k] = (int64_t)((uint64_t)maxs[k] - (uint64_t)mins[k]);
                             enc.bit_shifts[k] = bit_shifts[k];
                             enc.descs[k] = sort_descs[k];
                             enc.enum_ranks[k] = enum_ranks[k];

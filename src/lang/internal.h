@@ -96,6 +96,22 @@ static inline int is_numeric(ray_t* x) {
            x->type == -RAY_U8  || x->type == -RAY_BOOL;
 }
 
+/* The class of a null of type tag `t` (either sign): two nulls are equal
+ * when their classes are, as two values are — the same type, or any two
+ * numerics (is_numeric: 1 equals 1i, so 0Nl equals 0Ni).  A symbol null,
+ * the empty string, a temporal null and the untyped null each stand
+ * apart.  atom_eq and the membership hash set both ask this. */
+static inline int8_t ray_null_class(int8_t t) {
+    if (t < 0) t = (int8_t)-t;
+    switch (t) {
+    case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8: case RAY_BOOL:
+    case RAY_F64: case RAY_F32:
+        return RAY_I64;
+    default:
+        return t;
+    }
+}
+
 /* Check if an atom is a temporal type */
 static inline int is_temporal(ray_t* x) {
     return x->type == -RAY_DATE || x->type == -RAY_TIME || x->type == -RAY_TIMESTAMP;
@@ -781,6 +797,11 @@ ray_t* ray_graph_k_shortest_fn(ray_t** args, int64_t n);
 ray_t* ray_graph_shortest_path_fn(ray_t** args, int64_t n);
 ray_t* ray_graph_expand_fn(ray_t** args, int64_t n);
 ray_t* ray_graph_var_expand_fn(ray_t** args, int64_t n);
+
+/* A LIST whose every element is a BOOL atom as a B8 vector (the list is
+ * released); any other list is returned as it is: an atomic op over a
+ * LIST yields a vector when its results are uniform booleans. */
+ray_t* ray_list_collapse_bool(ray_t* list);
 
 /* Convenience wrapper: atomic_map_binary with no DAG opcode */
 static inline ray_t* atomic_map_binary(ray_binary_fn fn, ray_t* left, ray_t* right) {

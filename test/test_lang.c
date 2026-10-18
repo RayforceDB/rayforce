@@ -157,6 +157,239 @@ static void lang_teardown(void) {
     ray_runtime_destroy(__RUNTIME);
 }
 
+
+/* ---- Test: query helper row provenance survives a runtime re-init ----
+ * The row-wise builtin tables and the per-object verdict cache behind the
+ * bytecode provenance flags are keyed on the symbol-table epoch; a stale
+ * entry would silently turn text concat into a collection append. */
+static test_result_t test_query_helper_reinit(void) {
+    for (int round = 0; round < 2; round++) {
+        if (round) {
+            ray_runtime_destroy(__RUNTIME);
+            ray_runtime_create(0, NULL);
+            /* Shift user symbol ids before the helpers are defined again. */
+            ray_t* shift = ray_eval_str("(set shifted (list 'zz0 'zz1 'zz2 'zz3 'zz4 'zz5 'zz6 'zz7))");
+            if (shift && !RAY_IS_ERR(shift)) ray_release(shift); else if (shift) ray_error_free(shift);
+        }
+        ray_t* setup = ray_eval_str("(do (set T (table [x s] (list [1 2 3] ['a 'b 'c])))"
+                                    " (set hup (fn [v] 1 (concat (upper v) \"!\")))"
+                                    " (set hif (fn [v] 1 (if (> 1 0) (concat v \"?\") v))) 1)");
+        TEST_ASSERT_NOT_NULL(setup);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+        ray_release(setup);
+        ASSERT_EQ("(at (update {r: (hup s) from: T}) 'r)", "['A! 'B! 'C!]");
+        ASSERT_EQ("(at (update {r: (hif s) from: T}) 'r)", "['a? 'b? 'c?]");
+        ASSERT_EQ("(at (select {from: T where: (in (hup s) ['A! 'C!])}) 'x)", "[1 3]");
+    }
+    PASS();
+}
+
+
+/* ---- Test: a closure whose capture values are not a LIST never compiles ----
+ * A deserialized lambda may carry a dict with a typed value vector; the
+ * compiled capture load would read its payload as pointers.  Such a
+ * closure stays on the tree walker, whose capture binding reports a type
+ * error, inside and outside a query. */
+static test_result_t test_closure_malformed_capture(void) {
+    /* A closure as the deserializer hands it back: no bytecode yet, so the
+     * compile gate decides.  (A closure made by interpreted code shares
+     * its literal's template at birth; strip that to get the shape.) */
+    ray_t* lam = ray_eval_str("(do (let k 1) (fn [v] (+ v k)))");
+    TEST_ASSERT_NOT_NULL(lam);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(lam));
+    TEST_ASSERT_EQ_I(lam->type, RAY_LAMBDA);
+    TEST_ASSERT_NOT_NULL(LAMBDA_CLOSURE(lam));
+    if (LAMBDA_BC(lam)) { ray_release(LAMBDA_BC(lam)); LAMBDA_BC(lam) = NULL; }
+    if (LAMBDA_CONSTS(lam)) { ray_release(LAMBDA_CONSTS(lam)); LAMBDA_CONSTS(lam) = NULL; }
+    if (LAMBDA_DBG(lam)) { ray_release(LAMBDA_DBG(lam)); LAMBDA_DBG(lam) = NULL; }
+    LAMBDA_NLOCALS(lam) = 0;
+    lam->attrs &= (uint8_t)~RAY_FN_COMPILED;
+    TEST_ASSERT(!LAMBDA_IS_COMPILED(lam), "the closure is uncompiled before the call");
+    /* Replace the closure's values with a typed vector of the same length. */
+    ray_t* keys = ray_dict_keys(LAMBDA_CLOSURE(lam));
+    ray_t* vals = ray_vec_new(RAY_I64, keys->len);
+    TEST_ASSERT_NOT_NULL(vals);
+    for (int64_t i = 0; i < keys->len; i++) ((int64_t*)ray_data(vals))[i] = 0x4141414141414141LL;
+    vals->len = keys->len;
+    ray_retain(keys);
+    ray_t* bad = ray_dict_new(keys, vals);
+    TEST_ASSERT_NOT_NULL(bad);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(bad));
+    ray_release(LAMBDA_CLOSURE(lam));
+    LAMBDA_CLOSURE(lam) = bad;
+    ray_t* arg = ray_i64(2);
+    ray_t* args[1] = { arg };
+    ray_t* r = call_lambda(lam, args, 1);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT(RAY_IS_ERR(r), "malformed closure must fail, not be dereferenced");
+    TEST_ASSERT(!LAMBDA_IS_COMPILED(lam), "malformed closure must not compile");
+    ray_error_free(r);
+    ray_release(lam);
+
+    /* A closure made by compiled code shares its literal's bytecode from
+     * birth; its capture binding checks the dict's shape at run time. */
+    lam = ray_eval_str("((fn [k] (fn [v] (+ v k))) 1)");
+    TEST_ASSERT_NOT_NULL(lam);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(lam));
+    TEST_ASSERT(LAMBDA_IS_COMPILED(lam), "a closure made by compiled code is born compiled");
+    keys = ray_dict_keys(LAMBDA_CLOSURE(lam));
+    vals = ray_vec_new(RAY_I64, keys->len);
+    TEST_ASSERT_NOT_NULL(vals);
+    for (int64_t i = 0; i < keys->len; i++) ((int64_t*)ray_data(vals))[i] = 0x4141414141414141LL;
+    vals->len = keys->len;
+    ray_retain(keys);
+    bad = ray_dict_new(keys, vals);
+    TEST_ASSERT_NOT_NULL(bad);
+    ray_release(LAMBDA_CLOSURE(lam));
+    LAMBDA_CLOSURE(lam) = bad;
+    r = call_lambda(lam, args, 1);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT(RAY_IS_ERR(r), "a malformed closure dict must fail the capture binding");
+    ray_error_free(r);
+    ray_release(arg);
+    ray_release(lam);
+    PASS();
+}
+
+/* A lazy handle passed through the C API to a compiled closure maker reaches
+ * the maker's parameter slot unmaterialized (Rayfall call sites materialize
+ * lazy arguments, call_lambda does not).  The closure must capture the
+ * concrete value: a lazy handle is single-use, and a dict holding the
+ * handle would fail the closure's second call. */
+static test_result_t test_closure_lazy_capture_vm(void) {
+    ray_t* mk = ray_eval_str("(fn [v] (fn [] (at v 0)))");
+    TEST_ASSERT_NOT_NULL(mk);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(mk));
+    /* A lazy handle over a constant vector, as a deferred DAG result is. */
+    ray_t* vec = ray_eval_str("[1 2 3]");
+    TEST_ASSERT_NOT_NULL(vec);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+    ray_graph_t* g = ray_graph_new(NULL);
+    TEST_ASSERT_NOT_NULL(g);
+    ray_t* lazy = ray_lazy_wrap(g, ray_graph_input_vec(g, vec));
+    TEST_ASSERT_NOT_NULL(lazy);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(lazy));
+    TEST_ASSERT(ray_is_lazy(lazy), "the argument must be a lazy handle");
+    ray_t* args[1] = { lazy };
+    ray_t* clo = call_lambda(mk, args, 1);
+    TEST_ASSERT_NOT_NULL(clo);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(clo));
+    TEST_ASSERT_EQ_I(clo->type, RAY_LAMBDA);
+    TEST_ASSERT(LAMBDA_IS_COMPILED(mk), "the maker compiles on its first call");
+    TEST_ASSERT(LAMBDA_IS_COMPILED(clo), "a closure made by compiled code is born compiled");
+    for (int i = 0; i < 3; i++) {
+        ray_t* r = call_lambda(clo, NULL, 0);
+        TEST_ASSERT_NOT_NULL(r);
+        TEST_ASSERT_FMT(!RAY_IS_ERR(r), "call %d of a closure over a lazy capture failed: %s", i + 1, ray_err_code(r));
+        TEST_ASSERT_EQ_I(r->type, -RAY_I64);
+        TEST_ASSERT_EQ_I(r->i64, 1);
+        ray_release(r);
+    }
+    ray_release(clo);
+    ray_release(lazy);
+    ray_release(vec);
+    ray_release(mk);
+    PASS();
+}
+
+/* The symbol walk behind a closure's capture names stops at 1024 levels
+ * of nesting rather than following the text down the C stack; the closure
+ * compiler then binds every capture (closure_locals.rfl pins that). */
+static test_result_t test_closure_sym_walk_guard(void) {
+    ray_t* mk = ray_eval_str("(do (set nestw (fn [n] (let a (parse \"kw\")) (times n (let a (list a))) a)) 0)");
+    TEST_ASSERT_NOT_NULL(mk);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(mk));
+    ray_release(mk);
+    int depths[2] = { 1000, 1100 };
+    for (int i = 0; i < 2; i++) {
+        char src[64];
+        snprintf(src, sizeof src, "(nestw %d)", depths[i]);
+        ray_t* ast = ray_eval_str(src);
+        TEST_ASSERT_NOT_NULL(ast);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(ast));
+        bool dynamic = false;
+        int64_t weight = 0;
+        ray_t* ment = ray_closure_mentioned_syms(ast, &dynamic, &weight);
+        if (i == 0) {
+            TEST_ASSERT(ment != NULL, "a body within the guard is walked");
+            TEST_ASSERT_EQ_I(ment->len, 1);
+            ray_release(ment);
+        } else {
+            TEST_ASSERT(ment == NULL, "a body past the guard is given up on");
+        }
+        ray_release(ast);
+    }
+    PASS();
+}
+
+/* A body that does not compile is marked (NLOCALS -1) so it stays on the
+ * tree walker without a compile attempt per call, and a lambda so marked
+ * is never compiled again. */
+static test_result_t test_lambda_compile_failure_mark(void) {
+    ray_t* bad = ray_eval_str("(fn [x] (if false (set 1 2)) (+ x 1))");
+    TEST_ASSERT_NOT_NULL(bad);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(bad));
+    TEST_ASSERT_EQ_I(bad->type, RAY_LAMBDA);
+    /* (Made by interpreted code, it may carry the literal's verdict
+     * already; clear it so ray_compile decides.) */
+    LAMBDA_NLOCALS(bad) = 0;
+    ray_compile(bad);
+    TEST_ASSERT(!LAMBDA_IS_COMPILED(bad), "the body does not compile");
+    TEST_ASSERT_EQ_I(LAMBDA_NLOCALS(bad), -1);
+    ray_t* arg = ray_i64(2);
+    ray_t* args[1] = { arg };
+    for (int i = 0; i < 2; i++) {
+        ray_t* r = call_lambda(bad, args, 1);
+        TEST_ASSERT_NOT_NULL(r);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        TEST_ASSERT_EQ_I(r->i64, 3);
+        ray_release(r);
+        TEST_ASSERT_EQ_I(LAMBDA_NLOCALS(bad), -1);
+    }
+    ray_release(bad);
+
+    /* The mark alone keeps a compilable body interpreted. */
+    ray_t* good = ray_eval_str("(fn [x] (+ x 1))");
+    TEST_ASSERT_NOT_NULL(good);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(good));
+    TEST_ASSERT(!LAMBDA_IS_COMPILED(good), "a definition compiles on its first call");
+    LAMBDA_NLOCALS(good) = -1;
+    ray_t* r = call_lambda(good, args, 1);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->i64, 3);
+    ray_release(r);
+    TEST_ASSERT(!LAMBDA_IS_COMPILED(good), "a lambda marked not compilable is not compiled");
+    ray_release(good);
+    ray_release(arg);
+    PASS();
+}
+
+/* A closure whose text is heavy (a 66 KB string constant) but small in
+ * nodes still binds only the captures its body mentions: one slot for v7,
+ * not one per binding in scope. */
+static test_result_t test_closure_heavy_literal_captures(void) {
+    static char src[200 * 24 + 70000 + 256];
+    size_t cap = sizeof src;
+    size_t n = (size_t)snprintf(src, cap, "(do (set mkHv (fn [] (if false (set 1 2))");
+    for (int i = 0; i < 200; i++) n += (size_t)snprintf(src + n, cap - n, " (let v%d %d)", i, i);
+    n += (size_t)snprintf(src + n, cap - n, " (fn [x] (+ x (+ v7 (count \"");
+    for (int i = 0; i < 66000; i++) src[n++] = 'a';
+    n += (size_t)snprintf(src + n, cap - n, "\")))))) (set cHv (mkHv)) (cHv 1))");
+    ray_t* r = ray_eval_str(src);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->i64, 66008);
+    ray_release(r);
+    ray_t* c = ray_eval_str("cHv");
+    TEST_ASSERT_NOT_NULL(c);
+    TEST_ASSERT_EQ_I(c->type, RAY_LAMBDA);
+    TEST_ASSERT(LAMBDA_IS_COMPILED(c), "the closure compiles");
+    TEST_ASSERT(LAMBDA_NLOCALS(c) <= 4, "only the mentioned capture takes a slot");
+    ray_release(c);
+    PASS();
+}
+
 /* ---- Dummy function for testing ---- */
 static ray_t* dummy_unary(ray_t* x) { return ray_retain(x), x; }
 static ray_t* dummy_binary(ray_t* x, ray_t* y) { (void)y; return ray_retain(x), x; }
@@ -892,6 +1125,15 @@ static test_result_t test_eval_select_where_in_guid_nulls(void) {
     TEST_ASSERT_EQ_I(ray_table_nrows(result), 1);
 
     ray_release(result);
+    /* GUID producers can emit payload nulls without HAS_NULLS.
+     * The inline distinct probe forces evaluator membership. */
+    col->attrs &= (uint8_t)~RAY_ATTR_HAS_NULLS;
+    ray_t* bound = ray_eval_str("(set Pg (at t 'g))");
+    TEST_ASSERT_NOT_NULL(bound);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(bound));
+    ray_release(bound);
+    ASSERT_EQ("(count (select {from: t where: (in g (distinct Pg))}))", "1");
+    ASSERT_EQ("(count (select {from: t where: (not-in g (distinct (list probe)))}))", "1");
     ray_release(table);
     PASS();
 }
@@ -1283,6 +1525,61 @@ static test_result_t test_eval_select_where_in_sym(void) {
     PASS();
 }
 
+/* ---- Test: unary arithmetic lowers only on its builtin's types (#854) ----
+ * compile_expr_dag lowers `neg`/`abs`/`exp`/`log`/`sqrt`/`ceil`/`floor`/
+ * `round` over a column only when the column's type is one the builtin
+ * computes on the kernels' terms; any other column declines (NULL) so the
+ * evaluator applies the builtin itself.  The kernels read a DATE, TIME or
+ * TIMESTAMP lane as its raw counts, SYM as interned ids, and ran the integer
+ * lanes of ceil/floor/round as doubles. */
+static bool unary_arith_lowers(const char* verb, const char* col) {
+    bool temporal_or_sym = !strcmp(col, "d") || !strcmp(col, "t") ||
+                           !strcmp(col, "ts") || !strcmp(col, "s");
+    if (!strcmp(verb, "neg") || !strcmp(verb, "abs"))
+        return !temporal_or_sym && strcmp(col, "b") && strcmp(col, "u");
+    if (!strcmp(verb, "exp") || !strcmp(verb, "log") || !strcmp(verb, "sqrt"))
+        return !temporal_or_sym;
+    return !strcmp(col, "f");   /* ceil / floor / round */
+}
+
+static test_result_t test_eval_select_unary_arith_dag_admission(void) {
+    ray_t* tbl = ray_eval_str(
+        "(table [d t ts b u h l f s] (list [2024.01.01 2024.01.02] "
+        "[10:00:00.000 11:00:00.000] "
+        "[2024.01.01D10:00:00.000000000 2024.01.02D10:00:00.000000000] "
+        "[true false] (as 'U8 [1 2]) (as 'I16 [1 -2]) [1 -2] [1.5 -2.5] "
+        "['a 'b]))");
+    TEST_ASSERT_NOT_NULL(tbl);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    TEST_ASSERT_EQ_I(tbl->type, RAY_TABLE);
+
+    static const char* const verbs[] = {
+        "neg", "abs", "exp", "log", "sqrt", "ceil", "floor", "round",
+    };
+    static const char* const cols[] = {
+        "d", "t", "ts", "b", "u", "h", "l", "f", "s",
+    };
+    for (size_t v = 0; v < sizeof verbs / sizeof *verbs; v++) {
+        for (size_t c = 0; c < sizeof cols / sizeof *cols; c++) {
+            char src[32];
+            snprintf(src, sizeof src, "(%s %s)", verbs[v], cols[c]);
+            ray_t* expr = ray_parse(src);
+            TEST_ASSERT_NOT_NULL(expr);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(expr));
+            ray_graph_t* g = ray_graph_new(tbl);
+            TEST_ASSERT_NOT_NULL(g);
+            ray_op_t* op = compile_expr_dag(g, expr);
+            bool want = unary_arith_lowers(verbs[v], cols[c]);
+            TEST_ASSERT_FMT((op != NULL) == want, "%s: lowered=%d, want %d",
+                            src, op != NULL, want);
+            ray_graph_free(g);
+            ray_release(expr);
+        }
+    }
+    ray_release(tbl);
+    PASS();
+}
+
 /* ---- Test: OP_IN type-mismatch must not leak via atom probe ----
  * Deterministic regression: interns a sym so we know its numeric
  * ID N, builds an i64 column containing exactly N, then runs
@@ -1557,6 +1854,17 @@ static test_result_t test_eval_pivot_multi_index(void) {
         else TEST_ASSERT_TRUE(false);
     }
     TEST_ASSERT_TRUE(seen_A10 && seen_A20 && seen_B10 && seen_B20);
+    ray_release(r);
+    PASS();
+}
+
+static test_result_t test_eval_zone_sym_diagnostic(void) {
+    ray_t* r = ray_eval_str("(.idx.zone ['a 'b])");
+    TEST_ASSERT(r && RAY_IS_ERR(r), "SYM zone index remains unsupported");
+    TEST_ASSERT_STR_EQ(ray_err_code(r), "nyi");
+    TEST_ASSERT_NOT_NULL(ray_error_msg());
+    TEST_ASSERT_STR_EQ(ray_error_msg(),
+                      "zone: only numeric/temporal vectors supported (got type 12)");
     ray_release(r);
     PASS();
 }
@@ -2323,6 +2631,28 @@ static test_result_t test_eval_select_by_nonagg_colref_vs_const(void) {
     TEST_ASSERT((a[0]) == (20.0), "double == failed");
     TEST_ASSERT((b[0]) == (40.0), "double == failed");
     ray_release(r3);
+    PASS();
+}
+
+/* ---- Test: a by: key that is no value ----
+ * A name bound to a function or to null is refused, with or without an
+ * output, by what it is: the refusal of a function once caught null too
+ * and called it a function. */
+static test_result_t test_eval_select_by_key_not_a_value(void) {
+    static const char* const cases[][2] = {
+        { "(select {by: sum from: (table [x y] (list [3 1] [30 10]))})", "function" },
+        { "(select {c: (count y) by: sum from: (table [x y] (list [3 1] [30 10]))})", "function" },
+        { "(do (set Nk (println \"\")) (select {by: Nk from: (table [x y] (list [3 1] [30 10]))}))", "null" },
+        { "(do (set Nk (println \"\")) (select {c: (count y) by: Nk from: (table [x y] (list [3 1] [30 10]))}))", "null" },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        ray_t* r = ray_eval_str(cases[i][0]);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+        TEST_ASSERT_STR_EQ(ray_err_code(r), "domain");
+        const char* msg = ray_error_msg();
+        TEST_ASSERT_FMT(msg && strstr(msg, cases[i][1]), "case %zu: %s", i, msg ? msg : "(none)");
+        ray_error_free(r);
+    }
     PASS();
 }
 
@@ -5224,6 +5554,40 @@ static test_result_t test_dotted_missing_key(void) {
     /* Reading a missing key under a real dict reports 'undefined' */
     ray_t* r = ray_eval_str("only.missing");
     TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    PASS();
+}
+
+/* A dotted read looks the whole name up flat before it walks the dicts, and
+ * the global table answers that lookup from a filter of the names it has
+ * ever held.  A dotted name bound flat must still win over the walk, from
+ * the top level and from compiled code, and the walk must take over again
+ * once the flat slot is deleted. */
+static test_result_t test_dotted_flat_binding_wins(void) {
+    ray_eval_str("(set __fb.k 1)");
+    ray_eval_str("(set __fb_read (fn [] __fb.k))");
+    ASSERT_EQ("__fb.k", "1");
+    ASSERT_EQ("(__fb_read)", "1");
+
+    static const char name[] = "__fb.k";
+    int64_t id = ray_sym_intern(name, sizeof(name) - 1);
+    TEST_ASSERT_TRUE(ray_sym_is_dotted(id));
+    ray_t* two = ray_i64(2);
+    TEST_ASSERT_EQ_I(ray_env_bind_flat(id, two), RAY_OK);
+    ray_release(two);
+    ASSERT_EQ("__fb.k", "2");
+    ASSERT_EQ("(__fb_read)", "2");
+
+    TEST_ASSERT_EQ_I(ray_env_bind_flat(id, NULL), RAY_OK);
+    ASSERT_EQ("__fb.k", "1");
+    ASSERT_EQ("(__fb_read)", "1");
+
+    /* Many globals, then reads that never had a flat slot. */
+    ray_eval_str("(set __fb_many (fn [n] (times [i n] (set __fb.k i))))");
+    ray_eval_str("(__fb_many 300)");
+    ASSERT_EQ("(__fb_read)", "299");
+    ray_t* r = ray_eval_str("__fb.missing");
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    ray_error_free(r);
     PASS();
 }
 
@@ -9418,12 +9782,13 @@ static test_result_t test_read_unsized_stream_is_bounded(void) {
     if (!probe) SKIP("/dev/zero unavailable");
     fclose(probe);
 
-    /* ray_heap_anon_watermark() resolves the 0 sentinel to physical RAM, so
-     * restoring what it returns would pin the watermark to a number where
-     * the suite found "use physical RAM".  Detect that case and put the
-     * sentinel back instead, which keeps this test order-independent. */
+    /* ray_heap_anon_watermark() resolves the 0 sentinel to the default
+     * threshold, so restoring what it returns would pin the watermark to a
+     * number where the suite found "use the default".  Detect that case and
+     * put the sentinel back instead, which keeps this test order-independent. */
     int64_t saved = ray_heap_anon_watermark();
-    bool was_default = (saved == ray_sys_total_ram());
+    ray_heap_set_anon_watermark(0);
+    bool was_default = (saved == ray_heap_anon_watermark());
     /* budget = (watermark - committed) / 4, so this leaves ~1 MB. */
     ray_heap_set_anon_watermark(ray_heap_anon_committed() + 4 * 1024 * 1024);
 
@@ -9480,7 +9845,8 @@ static test_result_t test_exec_capture_is_bounded(void) {
     SKIP("shell capture unavailable");
 #else
     int64_t saved = ray_heap_anon_watermark();
-    bool was_default = (saved == ray_sys_total_ram());
+    ray_heap_set_anon_watermark(0);
+    bool was_default = (saved == ray_heap_anon_watermark());
     ray_heap_set_anon_watermark(ray_heap_anon_committed() + 4 * 1024 * 1024);
 
     ray_t* args[2];
@@ -9572,6 +9938,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/select_all", test_eval_select_all, lang_setup, lang_teardown },
     { "lang/eval/select_where", test_eval_select_where, lang_setup, lang_teardown },
     { "lang/eval/select_where_in_sym", test_eval_select_where_in_sym, lang_setup, lang_teardown },
+    { "lang/eval/select_unary_arith_dag_admission", test_eval_select_unary_arith_dag_admission, lang_setup, lang_teardown },
     { "lang/eval/select_where_in_i64", test_eval_select_where_in_i64, lang_setup, lang_teardown },
     { "lang/eval/select_where_in_mixed_numeric", test_eval_select_where_in_mixed_numeric, lang_setup, lang_teardown },
     { "lang/eval/select_where_in_nulls", test_eval_select_where_in_nulls, lang_setup, lang_teardown },
@@ -9615,6 +9982,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/select_by_str_nonagg_list_col", test_eval_select_by_str_nonagg_list_col, lang_setup, lang_teardown },
     { "lang/eval/select_by_nonagg_broadcast", test_eval_select_by_nonagg_broadcast, lang_setup, lang_teardown },
     { "lang/eval/select_by_nonagg_colref_vs_const", test_eval_select_by_nonagg_colref_vs_const, lang_setup, lang_teardown },
+    { "lang/eval/select_by_key_not_a_value", test_eval_select_by_key_not_a_value, lang_setup, lang_teardown },
     { "lang/eval/select_by_nonagg_with_agg_subexpr", test_eval_select_by_nonagg_with_agg_subexpr, lang_setup, lang_teardown },
     { "lang/eval/select_by_nonagg_sort_take", test_eval_select_by_nonagg_sort_take, lang_setup, lang_teardown },
     { "lang/eval/select_by_take_clamps", test_eval_select_by_take_clamps, lang_setup, lang_teardown },
@@ -9683,6 +10051,7 @@ const test_entry_t lang_entries[] = {
     { "lang/dotted/update_in_place", test_dotted_update_in_place, lang_setup, lang_teardown },
     { "lang/dotted/wrong_type_parent", test_dotted_wrong_type_parent, lang_setup, lang_teardown },
     { "lang/dotted/missing_key", test_dotted_missing_key, lang_setup, lang_teardown },
+    { "lang/dotted/flat_binding_wins", test_dotted_flat_binding_wins, lang_setup, lang_teardown },
     { "lang/dotted/del_removes_key", test_dotted_del_removes_key, lang_setup, lang_teardown },
     { "lang/dotted/del_nested", test_dotted_del_nested, lang_setup, lang_teardown },
     { "lang/dotted/del_cascade", test_dotted_del_cascade, lang_setup, lang_teardown },
@@ -9924,6 +10293,13 @@ const test_entry_t lang_entries[] = {
     { "lang/temporal/extract_epoch",            test_temporal_extract_epoch,            lang_setup, lang_teardown },
     { "lang/temporal/date_trunc_month_case",    test_temporal_date_trunc_month_case,    lang_setup, lang_teardown },
 
+    { "lang/zone_sym_diagnostic", test_eval_zone_sym_diagnostic, lang_setup, lang_teardown },
+    { "lang/query_helper_reinit", test_query_helper_reinit, lang_setup, lang_teardown },
+    { "lang/closure_malformed_capture", test_closure_malformed_capture, lang_setup, lang_teardown },
+    { "lang/closure_lazy_capture_vm", test_closure_lazy_capture_vm, lang_setup, lang_teardown },
+    { "lang/closure_sym_walk_guard", test_closure_sym_walk_guard, lang_setup, lang_teardown },
+    { "lang/lambda_compile_failure_mark", test_lambda_compile_failure_mark, lang_setup, lang_teardown },
+    { "lang/closure_heavy_literal_captures", test_closure_heavy_literal_captures, lang_setup, lang_teardown },
     { "lang/io/read_procfs_zero_size", test_read_procfs_reports_zero_size, lang_setup, lang_teardown },
     { "lang/io/read_unsized_bounded", test_read_unsized_stream_is_bounded, lang_setup, lang_teardown },
     { "lang/io/exec_capture_bounded", test_exec_capture_is_bounded, lang_setup, lang_teardown },

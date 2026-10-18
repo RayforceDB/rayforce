@@ -17,7 +17,7 @@ The `rayforce` binary operates in three modes depending on how it is invoked:
 echo '(+ 1 2)' | ./rayforce
 ```
 
-Interactive mode is detected automatically when stdin is a terminal. On startup the REPL prints a banner with the version, CPU, memory, logical CPU count, and worker count, then shows the `‣` prompt. By default the pool includes every online logical CPU, including SMT threads. Use `-c N` to choose a total worker count explicitly. Individual operations may use fewer tasks when their workload or memory budget requires it.
+Interactive mode is detected automatically when stdin is a terminal. On startup the REPL prints a banner with the version, CPU, memory, logical CPU count, and worker count, then shows the `‣` prompt. By default the pool includes every online logical CPU, including SMT threads. Use `-c N` to choose a total worker count explicitly: N must contain decimal digits only; `0` selects the automatic size, and `1..1023` sets the total count, including the main thread. Values outside this range are rejected before the pool starts. Individual operations may use fewer tasks when their workload or memory budget requires it. Use `-m SIZE` (`--mem`; a byte count or a `K`/`M`/`G`/`T` suffix) to set the RAM budget: anonymous memory past it spills to disk instead of risking the OOM killer. `(.sys.mem)` reports the effective value as [`anon-watermark`](../namespaces/sys.md#sys-mem).
 
 ### Environment Variables
 
