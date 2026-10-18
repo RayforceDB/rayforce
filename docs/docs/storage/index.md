@@ -82,9 +82,12 @@ complete generation — never a mixture of columns from both. A failed write
 before publication leaves the previous generation selected. A cancelled write
 reports `cancel` and changes nothing: the previous generation stays selected,
 and a cancelled first write leaves no table behind, while files that were
-already in the directory before the write are kept. Tables written by
-older Rayforce versions remain readable; the first replacement upgrades the
-directory to the generation layout.
+already in the directory before the write are kept. Superseded generations,
+and what a failed first write created, are removed afterwards; a symbolic
+link found among them is unlinked, never followed, so nothing outside the
+table directory is touched. Tables written by older Rayforce versions remain
+readable; the first replacement upgrades the directory to the generation
+layout.
 
 The table, partition and CSV entry points follow the same publication protocol.
 Indexes are built in the new generation before it is published. The CSV and
