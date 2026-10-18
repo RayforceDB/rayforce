@@ -3665,8 +3665,97 @@ static test_result_t test_csr_tiebreak_determinism(void) {
  * Suite definition
  * -------------------------------------------------------------------------- */
 
+
+/* A hub whose list is long enough to leave the insertion sort behind must
+ * come out in the same (target, row) order as a short list does, in both
+ * directions, with out-of-range keys dropped and their rows skipped. */
+static test_result_t test_csr_hub_order(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* 200 edges out of node 0 to targets 0..49, each 4 times, interleaved
+     * so that neither targets nor rows arrive sorted; node 1 gets 3 edges;
+     * four edges fall outside [0, 60) on one side or the other. */
+    enum { HUB = 200, N_NODES = 60 };
+    int64_t s[HUB + 3 + 4], d[HUB + 3 + 4];
+    int64_t n = 0;
+    for (int64_t i = 0; i < HUB; i++) {
+        s[n] = 0;
+        d[n] = (i * 37) % 50;
+        n++;
+    }
+    s[n] = 1; d[n] = 7; n++;
+    s[n] = 1; d[n] = 3; n++;
+    s[n] = 1; d[n] = 7; n++;
+    s[n] = -1; d[n] = 5;  n++;    /* src out of range: dropped from fwd */
+    s[n] = 60; d[n] = 5;  n++;    /* src out of range: dropped from fwd */
+    s[n] = 2;  d[n] = -3; n++;    /* dst out of range: kept in fwd, dropped from rev */
+    s[n] = 2;  d[n] = 61; n++;
+
+    ray_t* sv = ray_vec_from_raw(RAY_I64, s, n);
+    ray_t* dv = ray_vec_from_raw(RAY_I64, d, n);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("src", 3), sv);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("dst", 3), dv);
+    ray_release(sv); ray_release(dv);
+    ray_rel_t* rel = ray_rel_from_edges(tbl, "src", "dst", N_NODES, N_NODES, true);
+    ray_release(tbl);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    /* Forward: 200 + 3 + 2 kept (the two src=2 edges carry unchecked dsts). */
+    TEST_ASSERT_EQ_I(rel->fwd.n_edges, HUB + 3 + 2);
+    TEST_ASSERT_TRUE(rel->fwd.sorted);
+    int64_t* off = (int64_t*)ray_data(rel->fwd.offsets);
+    int64_t* tgt = (int64_t*)ray_data(rel->fwd.targets);
+    int64_t* row = (int64_t*)ray_data(rel->fwd.rowmap);
+    TEST_ASSERT_EQ_I(off[1] - off[0], HUB);
+    for (int64_t i = off[0] + 1; i < off[1]; i++) {
+        /* (target, row) strictly ascending: no two cells compare equal. */
+        TEST_ASSERT_TRUE(tgt[i - 1] < tgt[i] ||
+                         (tgt[i - 1] == tgt[i] && row[i - 1] < row[i]));
+    }
+    /* Every target 0..49 exactly four times, and each row maps back. */
+    for (int64_t i = off[0]; i < off[1]; i++) {
+        TEST_ASSERT_EQ_I(tgt[i], (row[i] * 37) % 50);
+        TEST_ASSERT_TRUE(row[i] >= 0 && row[i] < HUB);
+    }
+    /* Node 1: 3, 7(row 200), 7(row 202). */
+    TEST_ASSERT_EQ_I(off[2] - off[1], 3);
+    TEST_ASSERT_EQ_I(tgt[off[1]], 3);     TEST_ASSERT_EQ_I(row[off[1]], HUB + 1);
+    TEST_ASSERT_EQ_I(tgt[off[1] + 1], 7); TEST_ASSERT_EQ_I(row[off[1] + 1], HUB);
+    TEST_ASSERT_EQ_I(tgt[off[1] + 2], 7); TEST_ASSERT_EQ_I(row[off[1] + 2], HUB + 2);
+    /* Node 2 keeps both edges with their out-of-range dsts as given. */
+    TEST_ASSERT_EQ_I(off[3] - off[2], 2);
+    TEST_ASSERT_EQ_I(tgt[off[2]], -3);
+    TEST_ASSERT_EQ_I(tgt[off[2] + 1], 61);
+
+    /* Reverse: keyed by dst.  Node 5 gets the two edges whose src was out
+     * of range (their src is stored unchecked); node 7 gets rows 200, 202
+     * from src 1 plus whichever hub edges hit 7. */
+    int64_t* roff = (int64_t*)ray_data(rel->rev.offsets);
+    int64_t* rtgt = (int64_t*)ray_data(rel->rev.targets);
+    int64_t* rrow = (int64_t*)ray_data(rel->rev.rowmap);
+    TEST_ASSERT_EQ_I(rel->rev.n_edges, HUB + 3 + 2);
+    TEST_ASSERT_EQ_I(roff[6] - roff[5], 4 + 2);   /* 4 hub edges to 5, plus 2 */
+    TEST_ASSERT_EQ_I(rtgt[roff[5]], -1);          /* src -1 sorts first */
+    TEST_ASSERT_EQ_I(rtgt[roff[6] - 1], 60);      /* src 60 sorts last */
+    for (int64_t i = roff[5] + 1; i < roff[6]; i++)
+        TEST_ASSERT_TRUE(rtgt[i - 1] < rtgt[i] ||
+                         (rtgt[i - 1] == rtgt[i] && rrow[i - 1] < rrow[i]));
+    int64_t seen_from_1 = 0;
+    for (int64_t i = roff[7]; i < roff[8]; i++)
+        if (rtgt[i] == 1) { TEST_ASSERT_TRUE(rrow[i] == HUB || rrow[i] == HUB + 2); seen_from_1++; }
+    TEST_ASSERT_EQ_I(seen_from_1, 2);
+
+    ray_rel_free(rel);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t csr_entries[] = {
     { "csr/tiebreak_determinism", test_csr_tiebreak_determinism, NULL, NULL },
+    { "csr/hub_order", test_csr_hub_order, NULL, NULL },
     { "csr/build", test_csr_build, NULL, NULL },
     { "csr/sorted", test_csr_sorted, NULL, NULL },
     { "csr/expand", test_expand, NULL, NULL },
