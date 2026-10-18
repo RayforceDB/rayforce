@@ -3381,16 +3381,57 @@ static int64_t relieve_dirty(int fd) {
     if (fd < 0 || syscall(451 /* __NR_cachestat */, fd, &range, &cs, 0) != 0) return -1;
     return (int64_t)(cs.dirty * pg);
 }
+
+/* Whether the file system under spill directory dir drops the dirty pages
+ * a punched hole covers unwritten, in this thread's cancelled writes: a
+ * probe file of dir, dirtied through a shared mapping and punched past its
+ * first page, as heap_spill_discard punches a pool, the writes cancelled
+ * counting at least its dirty pages just before (relieve_dirty).  XFS
+ * writes the range back before it punches it — its pages go all the same,
+ * and it reads zero after, but no write is cancelled — so where this says
+ * no, the cancelled writes tell nothing of the discard.  tmpfs says yes:
+ * nothing there is dirty. */
+static bool relieve_punch_cancels(const char* dir) {
+#if defined(FALLOC_FL_PUNCH_HOLE)
+    long ps = sysconf(_SC_PAGESIZE);
+    size_t pg = ps > 0 ? (size_t)ps : 4096, len = 16 * pg;
+    char path[300];
+    snprintf(path, sizeof(path), "%srayprobe_XXXXXX", dir);
+    int fd = mkstemp(path);
+    if (fd < 0) return false;
+    unlink(path);
+    bool ok = false;
+    char* m = posix_fallocate(fd, 0, (off_t)len) == 0
+            ? mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) : MAP_FAILED;
+    if (m != MAP_FAILED) {
+        memset(m, 0x5A, len);
+        int64_t dirty = relieve_dirty(fd);
+        int64_t c0 = relieve_cancelled();
+        ok = dirty >= 0 && c0 >= 0
+          && fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                       (off_t)pg, (off_t)(len - pg)) == 0
+          && relieve_cancelled() - c0 >= dirty;
+        munmap(m, len);
+    }
+    close(fd);
+    return ok;
+#else
+    (void)dir;
+    return false;
+#endif
+}
 #endif
 
 /* An empty spill pool parked at a boundary keeps its file and its mapping
  * for the next statement that spills, but its pages — dead data — are
- * discarded: punched out of the file, the dirty ones unwritten (the
- * thread's cancelled writes count at least the file's dirty pages just
- * before: none on tmpfs, which writes nothing back), then reserved again,
- * so the file keeps its disk blocks.  A spill pool still in use keeps its
- * data.  Taken back, the pool serves blocks anew, no pool mapped for them.
- * An idle event loop does not wake for a parked pool
+ * discarded: out of RAM (mincore), punched out of the file, so they read
+ * zero after, not their data written back, the dirty ones unwritten where
+ * the file system cancels the writes a punch drops (relieve_punch_cancels:
+ * the thread's cancelled writes then count at least the file's dirty pages
+ * just before; XFS writes them back first, and none are cancelled), then
+ * reserved again, so the file keeps its disk blocks.  A spill pool still
+ * in use keeps its data.  Taken back, the pool serves blocks anew, no pool
+ * mapped for them.  An idle event loop does not wake for a parked pool
  * (ray_heap_decay_due_ms). */
 static test_result_t test_relieve_spill_discard(void) {
 #if !defined(__linux__)
@@ -3417,6 +3458,7 @@ static test_result_t test_relieve_spill_discard(void) {
     }
     if (s2) ray_free(s2);
 
+    bool cancels = layout && relieve_punch_cancels(h->swap_path);
     int64_t dirty = relieve_dirty(fd);
     int64_t c0 = relieve_cancelled();
     ray_heap_set_anon_watermark(INT64_C(1) << 40);
@@ -3429,6 +3471,11 @@ static test_result_t test_relieve_spill_discard(void) {
     bool kept = i2 >= 0 && h->pools[i2].parked && h->pools[i2].backed
              && h->pool_count == 4;
     int res = probe ? relieve_resident(probe) : -1;
+    /* Punched, not written back and dropped: s2's dead data reads zero
+     * (read after the residency, as reading brings the pages back). */
+    bool zeroed = i2 >= 0;
+    for (size_t i = 0; zeroed && i < ((size_t)4 << 20); i += 4096)
+        zeroed = ((const unsigned char*)probe)[i] == 0;
     struct stat st;
     bool reserved = fd >= 0 && fstat(fd, &st) == 0
                  && (int64_t)st.st_blocks * 512 >= (int64_t)st.st_size;
@@ -3454,7 +3501,8 @@ static test_result_t test_relieve_spill_discard(void) {
     if (i2 < 0) SKIP("the spill directory cannot punch holes");
     TEST_ASSERT(kept, "the emptied spill pool was parked, file and mapping kept");
     if (relieve_mincore()) TEST_ASSERT(res == 0, "its pages were discarded");
-    if (cw >= 0) TEST_ASSERT(cw >= dirty, "the dirty ones unwritten");
+    TEST_ASSERT(zeroed, "punched out of the file: its dead data reads zero");
+    if (cw >= 0 && cancels) TEST_ASSERT(cw >= dirty, "the dirty ones unwritten");
     TEST_ASSERT(reserved, "its file keeps its disk blocks");
     TEST_ASSERT(live, "the spill pool in use kept its data");
     TEST_ASSERT(due > 0, "an idle event loop does not wake for the parked pool");
