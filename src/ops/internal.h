@@ -1494,6 +1494,9 @@ typedef struct {
 } ray_dict_cd_t;
 ray_dict_cd_t ray_dict_cd_get(void);
 void ray_dict_cd_clear(void);
+/* Runtime teardown, before the heap goes: frees this thread's stash and
+ * makes every other thread's stale (dropped, never freed: #865). */
+void ray_dict_cd_runtime_gone(void);
 
 /* ── collection.c ── */
 ray_t* distinct_vec_eager(ray_t* x);

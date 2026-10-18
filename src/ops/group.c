@@ -12111,10 +12111,27 @@ static ray_t* dict_entries_to_str(const ray_t* codes_col, const ray_enc_idict_t*
  * count-distinct path can build row_gid by remapping dict codes (cheap int)
  * instead of re-hashing strings. */
 static _Thread_local ray_dict_cd_t tl_dict_cd;
+/* The stash is heap memory of the runtime that made it.  A thread's stash
+ * outliving its runtime (the heap destroyed and made again) is dropped, never
+ * freed (#865): each stash records the runtime epoch, which teardown bumps
+ * (ray_dict_cd_runtime_gone), so a stale one is forgotten on any thread. */
+static _Atomic(uint64_t) g_dict_cd_epoch;
+static _Thread_local uint64_t tl_dict_cd_epoch;
+static void ray_dict_cd_forget_stale(void) {
+    if (tl_dict_cd.result_codes &&
+        tl_dict_cd_epoch != atomic_load_explicit(&g_dict_cd_epoch, memory_order_acquire))
+        memset(&tl_dict_cd, 0, sizeof(tl_dict_cd));       /* its heap is gone */
+}
+void ray_dict_cd_runtime_gone(void) {
+    ray_dict_cd_clear();                                   /* this thread's: still freeable */
+    atomic_fetch_add_explicit(&g_dict_cd_epoch, 1, memory_order_acq_rel);
+}
 static void ray_dict_cd_stash(ray_t* codes_col, int64_t n_groups, int64_t key_sym,
                               const ray_t* tbl, int64_t n_distinct) {
+    ray_dict_cd_forget_stale();
     if (tl_dict_cd.result_codes) { ray_free_raw(tl_dict_cd.result_codes); tl_dict_cd.result_codes = NULL; }
     tl_dict_cd.valid = 0;
+    tl_dict_cd_epoch = atomic_load_explicit(&g_dict_cd_epoch, memory_order_acquire);
     if (!codes_col || n_groups <= 0) return;
     int32_t* rc = ray_alloc_raw((size_t)n_groups * sizeof(int32_t));
     if (!rc) return;
@@ -12126,8 +12143,9 @@ static void ray_dict_cd_stash(ray_t* codes_col, int64_t n_groups, int64_t key_sy
     tl_dict_cd.n_distinct = n_distinct;
     tl_dict_cd.valid = 1;
 }
-ray_dict_cd_t ray_dict_cd_get(void) { return tl_dict_cd; }
+ray_dict_cd_t ray_dict_cd_get(void) { ray_dict_cd_forget_stale(); return tl_dict_cd; }
 void ray_dict_cd_clear(void) {
+    ray_dict_cd_forget_stale();
     if (tl_dict_cd.result_codes) ray_free_raw(tl_dict_cd.result_codes);
     memset(&tl_dict_cd, 0, sizeof(tl_dict_cd));
 }
@@ -12169,9 +12187,12 @@ static int64_t ray_grp_card_lookup(int64_t sym) {
  * (strdom.c) read by range, never materializing the column: the key's
  * column is swapped for the ids, as a DICT key's for its codes, and the
  * groups' ids map back to strings.  A generation-0 STR key keeps its route.
- * The swap is safe only when nothing but the key itself reads the column:
- * no aggregate input (COUNT included: the ids have no nulls) and no other
- * key's expression may scan it. */
+ * The swap (string-domain ids, or a generation-2 key's persisted DICT codes)
+ * is safe only when nothing but the key itself reads the column: no other
+ * key's expression and no aggregate input may read it, at any depth of the
+ * expression.  The one exception is a plain COUNT of the key column (a bare
+ * scan, no second input): COUNT is the group size, it reads no values
+ * (nulls and "" rows included), so it answers the same over ids or codes. */
 static bool strdom_key_ok(ray_graph_t* g, const ray_op_ext_t* ext, int64_t sym) {
     int64_t syms[64];
     for (uint32_t k = 0; k < ext->n_keys; k++) {
@@ -12181,7 +12202,13 @@ static bool strdom_key_ok(ray_graph_t* g, const ray_op_ext_t* ext, int64_t sym) 
         if (n < 0) return false;
         for (int i = 0; i < n; i++) if (syms[i] == sym) return false;
     }
-    for (uint32_t a = 0; a < ext->n_aggs; a++)
+    for (uint32_t a = 0; a < ext->n_aggs; a++) {
+        if (ext->agg_ops[a] == OP_COUNT &&
+            (!ext->agg_ins2 || ext->agg_ins2[a] == RAY_OP_NONE)) {
+            ray_op_t* ain = op_node(g, ext->agg_ins[a]);
+            ray_op_ext_t* ae = ain ? find_ext(g, ain->id) : NULL;
+            if (ae && ae->base.opcode == OP_SCAN && ae->sym == sym) continue;   /* the group size */
+        }
         for (int w = 0; w < 2; w++) {
             uint32_t in = w ? (ext->agg_ins2 ? ext->agg_ins2[a] : RAY_OP_NONE) : ext->agg_ins[a];
             if (in == RAY_OP_NONE) continue;
@@ -12189,6 +12216,7 @@ static bool strdom_key_ok(ray_graph_t* g, const ray_op_ext_t* ext, int64_t sym) 
             if (n < 0) return false;
             for (int i = 0; i < n; i++) if (syms[i] == sym) return false;
         }
+    }
     return true;
 }
 
@@ -12342,22 +12370,16 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit)
         if (!ray_table_col_meta(tbl, sym, &km)) continue;
         /* a single-file generation-2 STR key with a persisted DICT: its
          * codes, as generation 0 groups on its DICT codes (spec "5. Group-by
-         * inputs", P6b), under generation 0's admission rule (below); a
-         * repeated key is swapped by the first occurrence's codes */
+         * inputs", P6b), admitted by the swap rule (strdom_key_ok: nothing
+         * but the key and a plain COUNT of it reads the column, at any
+         * expression depth); a repeated key is swapped by the first
+         * occurrence's codes.  Declined, the column is read as strings. */
         if (km.enc && !RAY_IS_PARTED(km.type) && km.type == RAY_STR && km.index_kind == RAY_IDX_DICT) {
             bool dup = false;
             for (uint32_t j = 0; j < k; j++)
                 if ((dc_vec[j] || sd_col[j] || key_col[j]) && dict_sym[j] == sym) dup = true;
-            /* Skip if any non-COUNT agg reads this key column as strings. */
-            bool unsafe = false;
-            for (uint32_t a = 0; a < ext->n_aggs; a++) {
-                if (ext->agg_ops[a] == OP_COUNT) continue;
-                ray_op_t* ain = op_node(g, ext->agg_ins[a]);
-                ray_op_ext_t* ae = ain ? find_ext(g, ain->id) : NULL;
-                if (ae && ae->base.opcode == OP_SCAN && ae->sym == sym) { unsafe = true; break; }
-            }
             if (dup) continue;
-            if (!unsafe) {
+            if (strdom_key_ok(g, ext, sym)) {
                 ray_enccol_t* e = ray_enccol_of(ray_table_get_col_enc(tbl, sym));
                 const ray_enc_idict_t* d = NULL;
                 ray_t* derr = e ? ray_enccol_idict(e, &d) : NULL;

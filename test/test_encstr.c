@@ -2377,6 +2377,29 @@ static test_result_t test_idict_forged(void) {
 
 /* ---- P6b Task 4: group-by on DICT codes ---- */
 
+/* q on the in-memory table M (no index: the plain STR answer) and on the
+ * generation-2 load `load2`: equal formatted results.  The reference the
+ * DICT routes answer to, beside generation 0 (whose DICT arm answers an
+ * aggregate over an expression of the key on its codes on this branch until
+ * the dev merge brings #760's reroute). */
+static test_result_t st_same_mem(const char* load2, const char* q) {
+    ray_t* out[2] = { NULL, NULL };
+    for (int g = 0; g < 2; g++) {
+        if (g) ST_Q_OK_N(load2); else ST_Q_OK_N("(set T M)");
+        out[g] = st_q_fmt(q);
+        TEST_ASSERT_FMT(out[g] != NULL, "%s %s: %s", q, g ? "gen 2" : "in memory", st_msg);
+        st_hold(out[g]);
+    }
+    TEST_ASSERT_FMT(ray_str_len(out[0]) == ray_str_len(out[1]) &&
+                    memcmp(ray_str_ptr(out[0]), ray_str_ptr(out[1]), ray_str_len(out[0])) == 0,
+                    "%s: in memory %.*s vs gen 2 %.*s", q, (int)ray_str_len(out[0]), ray_str_ptr(out[0]),
+                    (int)ray_str_len(out[1]), ray_str_ptr(out[1]));
+    for (int g = 0; g < 2; g++) { st_unhold(out[g], NULL); ray_release(out[g]); }
+    PASS();
+}
+#define ST_SAME_MEM(load2, q) do { test_result_t r_ = st_same_mem((load2), (q)); \
+    if (r_.status != TEST_PASS) return r_; } while (0)
+
 /* s's own decoded bytes (the per-column counter) on the loaded table T */
 static uint64_t st_col_decoded(const char* col) {
     ray_t* t = ray_eval_str("T");
@@ -2393,10 +2416,13 @@ static uint64_t st_col_decoded(const char* col) {
  * decode nothing at all; the shapes reading u (I64) or f (U8) by range
  * decode those columns' vectors, so for every shape the key column's own
  * counter (e->decoded_bytes) stays 0. */
+#define ST_GB_TABLE "(table [s u f] (list (as 'STR (map (fn [j] (if (== 3 (% (div j 1024) 7)) \"\" " \
+    "(if (== 1 (% (div j 1024) 5)) (format \"https://e.org/%/%\" j (* j 31)) (format \"category number % long\" (% j 37))))) (til 140000))) " \
+    "(% (til 140000) 11) (as 'U8 (% (til 140000) 3))))"
+#define ST_GB_LOAD2 "(set T (.db.splayed.get \"" ST_TMP "/gb2/\"))"
 static test_result_t test_idict_groupby(void) {
-    ST_SAVE2("gb", "(table [s u f] (list (as 'STR (map (fn [j] (if (== 3 (% (div j 1024) 7)) \"\" "
-             "(if (== 1 (% (div j 1024) 5)) (format \"https://e.org/%/%\" j (* j 31)) (format \"category number % long\" (% j 37))))) (til 140000))) "
-             "(% (til 140000) 11) (as 'U8 (% (til 140000) 3))))");
+    ST_SAVE2("gb", ST_GB_TABLE);
+    ST_Q_OK_N("(set M " ST_GB_TABLE ")");
     char p[600]; TEST_ASSERT_TRUE(st_live("/gb2", "s", p, sizeof p));
     TEST_ASSERT_EQ_I(st_hdr(p).index_kind, RAY_IDX_DICT);
     static const struct { const char* q; bool key_only; } qs[] = {
@@ -2416,34 +2442,53 @@ static test_result_t test_idict_groupby(void) {
             TEST_ASSERT_FMT(k.dec > 0, "%s: u / f read without a decode", qs[i].q);
         const uint64_t sd = st_col_decoded("s");
         TEST_ASSERT_FMT(sd == 0, "%s: s decoded %llu", qs[i].q, (unsigned long long)sd);
+        ST_SAME_MEM(ST_GB_LOAD2, qs[i].q);
     }
-    /* an aggregate other than count reading the key: generation 0's rule
-     * declines the codes; the answer still equals generation 0 */
-    ST_SAME("gb", "(select {m: (max (strlen s)) from: T by: s asc: s})", NULL);
+    /* an aggregate over an expression of the key, or of the key itself
+     * other than a plain count: the swap rule declines the codes and the
+     * column is read as strings.  Compared with the in-memory table (no
+     * index) only: generation 0's DICT arm admits the strlen shapes on its
+     * codes at this branch's dev base (#760's reroute comes with the dev
+     * merge). */
+    static const char* const decl[] = {
+        "(select {m: (max (strlen s)) from: T by: s asc: s})",
+        "(select {m: (sum (strlen s)) from: T by: s asc: s})",
+        "(select {m: (sum (strlen s)) n: (count s) from: T where: (== f 1) by: s asc: s})",
+        "(select {m: (first s) from: T by: s asc: s})",
+        "(select {n: (count u) from: T by: {s: s l: (strlen s)} asc: [s l]})",
+    };
+    for (size_t i = 0; i < sizeof decl / sizeof decl[0]; i++) ST_SAME_MEM(ST_GB_LOAD2, decl[i]);
+    ST_SAME("gb", "(select {m: (first s) from: T by: s asc: s})", NULL);
     /* a count-distinct beside the key: the stashed result codes' consumer */
     ST_SAME("gb", "(select {d: (count (distinct u)) from: T by: s asc: s})", NULL);
+    ST_SAME_MEM(ST_GB_LOAD2, "(select {d: (count (distinct u)) from: T by: s asc: s})");
     /* the counter sees s's range decodes: a filter decodes the URL
      * vectors (not STR_DICT) by range */
     ST_SAME("gb", "(count (select {from: T where: (== s \"https://e.org/1024/31744\")}))", NULL);
     TEST_ASSERT_TRUE(st_col_decoded("s") > 0);
     /* Task 3 review Minor 5: by: s and distinct on the DICT column equal
-     * generation 0 (sorted) */
-    ST_SAME("gb", "(select {from: T by: s asc: s})", NULL);
-    ST_SAME("gb", "(asc (distinct (at T 's)))", NULL);
-    ST_SAME("gb", "(count (distinct (at T 's)))", NULL);
+     * generation 0 and the in-memory table (sorted) */
+    static const char* const par[] = {
+        "(select {from: T by: s asc: s})", "(asc (distinct (at T 's)))", "(count (distinct (at T 's)))",
+    };
+    for (size_t i = 0; i < sizeof par / sizeof par[0]; i++) {
+        ST_SAME("gb", par[i], NULL);
+        ST_SAME_MEM(ST_GB_LOAD2, par[i]);
+    }
     PASS();
 }
 
 /* Parted: segments with conflicting codes (the same string, different
  * codes; the same code, different strings), one segment below 65536 rows
- * (no DICT, STR_DICT vectors): generation-0 answers.  An aggregate reading
- * the key (count s) declines the string-domain swap (strdom_key_ok, P6's
- * rule, COUNT included) and is compared on answers only; count v keeps
- * the key on the remapped codes. */
+ * (no DICT, STR_DICT vectors): the answers of generation 0 and of the
+ * in-memory concatenation (no index), nothing materialized where the swap
+ * admits the key (a plain count of it included). */
+#define ST_GP_LOAD2 "(set T (.db.parted.get \"" ST_TMP "/gp2\" 't))"
 static test_result_t test_idict_groupby_parted(void) {
     ST_Q_OK("(set P0 (table [s v] (list (as 'STR (map (fn [j] (format \"k%\" (% j 50))) (til 70000))) (til 70000))))");
     ST_Q_OK("(set P1 (table [s v] (list (as 'STR (map (fn [j] (format \"k%\" (- 49 (% j 50)))) (til 70000))) (til 70000))))");
     ST_Q_OK("(set P2 (table [s v] (list (as 'STR (map (fn [j] (format \"z%\" (% j 7))) (til 1000))) (til 1000))))");
+    ST_Q_OK("(set M (concat P0 (concat P1 P2)))");
     for (int g = 0; g <= 2; g += 2)
         for (int p = 0; p < 3; p++) {
             char q[512];
@@ -2455,19 +2500,30 @@ static test_result_t test_idict_groupby_parted(void) {
     TEST_ASSERT_TRUE(st_live("/gp2/2024.01.01/t", "s", p, sizeof p)); TEST_ASSERT_EQ_I(st_hdr(p).index_kind, RAY_IDX_DICT);
     TEST_ASSERT_TRUE(st_live("/gp2/2024.01.02/t", "s", p, sizeof p)); TEST_ASSERT_EQ_I(st_hdr(p).index_kind, RAY_IDX_DICT);
     TEST_ASSERT_TRUE(st_live("/gp2/2024.01.03/t", "s", p, sizeof p)); TEST_ASSERT_EQ_I(st_hdr(p).index_kind, 0);
-    static const char* const qs[] = {
-        "(select {n: (count v) from: T by: s asc: s})",
-        "(select {n: (count v) from: T where: (!= s \"k3\") by: s asc: s})",
-        "(select {n: (count v) from: T where: (> v 500) by: s asc: s})",
+    static const struct { const char* q; bool key_only; } qs[] = {
+        { "(select {n: (count s) from: T by: s asc: s})", true },                     /* the brief's q34 shape */
+        { "(select {one: 1 s: s n: (count s) from: T by: s asc: s})", true },         /* q35's */
+        { "(select {n: (count v) from: T by: s asc: s})", true },
+        { "(select {n: (count s) from: T where: (!= s \"k3\") by: s asc: s})", false },
+        { "(select {n: (count v) from: T where: (> v 500) by: s asc: s})", false },
     };
     for (size_t i = 0; i < sizeof qs / sizeof qs[0]; i++) {
         st_fk_t k = { 0 };
-        ST_SAME_P("gp", qs[i], &k);
-        TEST_ASSERT_FMT(k.mat == 0, "%s: materialized %llu", qs[i], (unsigned long long)k.mat);
-        if (i == 0) TEST_ASSERT_FMT(k.dec == 0, "%s: decoded %llu", qs[i], (unsigned long long)k.dec);
+        ST_SAME_P("gp", qs[i].q, &k);
+        TEST_ASSERT_FMT(k.mat == 0, "%s: materialized %llu", qs[i].q, (unsigned long long)k.mat);
+        if (qs[i].key_only) TEST_ASSERT_FMT(k.dec == 0, "%s: decoded %llu", qs[i].q, (unsigned long long)k.dec);
+        ST_SAME_MEM(ST_GP_LOAD2, qs[i].q);
     }
-    ST_SAME_P("gp", "(select {n: (count s) from: T by: s asc: s})", NULL);
-    ST_SAME_P("gp", "(select {n: (count s) from: T where: (!= s \"k3\") by: s asc: s})", NULL);
+    /* an aggregate over an expression of the key: declined, read as strings */
+    static const char* const decl[] = {
+        "(select {m: (max (strlen s)) from: T by: s asc: s})",
+        "(select {m: (sum (strlen s)) from: T by: s asc: s})",
+        "(select {m: (sum (strlen s)) from: T where: (> v 500) by: s asc: s})",
+    };
+    for (size_t i = 0; i < sizeof decl / sizeof decl[0]; i++) {
+        ST_SAME_P("gp", decl[i], NULL);
+        ST_SAME_MEM(ST_GP_LOAD2, decl[i]);
+    }
     /* the DICT segments are read by their codes: a code past n_distinct in
      * partition 2's region fails the group-by naming the row */
     TEST_ASSERT_TRUE(st_live("/gp2/2024.01.02/t", "s", p, sizeof p));
@@ -2475,7 +2531,7 @@ static test_result_t test_idict_groupby_parted(void) {
     ray_enc_idx_dict_t dd; ST_READ(p, eh.index_off + 16, &dd, sizeof dd);
     int32_t big = 50;
     ST_PATCH(p, eh.index_off + dd.codes + 9000 * 4, &big, 4);
-    ST_Q_OK("(set T (.db.parted.get \"" ST_TMP "/gp2\" 't))");
+    ST_Q_OK(ST_GP_LOAD2);
     TEST_ASSERT_FALSE(st_q_run("(select {n: (count v) from: T by: s})"));
     TEST_ASSERT_FMT(strstr(st_msg, "DICT code 50 at row 9000 outside 0 .. 49") != NULL, "%s", st_msg);
     PASS();
@@ -2495,10 +2551,12 @@ static test_result_t test_idict_groupby_forged(void) {
     ST_Q_OK("(set T (.db.splayed.get \"" ST_TMP "/gf2/\"))");
     for (int i = 0; i < 2; i++) {
         TEST_ASSERT_FALSE(st_q_run("(select {n: (count s) from: T by: s})"));
-        /* the file named as the load spells it: the table directory, then s */
-        TEST_ASSERT_FMT(strstr(st_msg, "before its first occurrence") != NULL &&
-                        strstr(st_msg, "rayforce_encstr/gf2/") != NULL && strstr(st_msg, "/s: DICT code 299 at row 5"),
-                        "%s", st_msg);
+        /* the file, exactly as the load spells it: the directory given
+         * (its trailing slash kept), then "/s" */
+        char want[700];
+        snprintf(want, sizeof want, "%s/s: DICT code 299 at row 5", ray_test_tmp(ST_TMP "/gf2/"));
+        TEST_ASSERT_FMT(strstr(st_msg, "before its first occurrence") != NULL && strstr(st_msg, want) != NULL,
+                        "%s (want %s)", st_msg, want);
     }
     PASS();
 }

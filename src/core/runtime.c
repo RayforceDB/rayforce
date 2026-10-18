@@ -27,7 +27,7 @@
 #include "mem/sys.h"
 #include "table/sym.h"
 #include "ops/idxop.h"     /* ray_idx_lazy_clear — the lazy hash cache */
-#include "ops/internal.h"  /* ray_dict_cd_clear — the group-by DICT code stash */
+#include "ops/internal.h"  /* ray_dict_cd_runtime_gone — the group-by DICT code stash */
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -456,9 +456,10 @@ void ray_runtime_destroy(ray_runtime_t* rt) {
     g_ray_profile_last.n = 0;
 
     /* exec_group's DICT code stash (thread-local, for a later count-
-     * distinct) is heap memory: drop it before the heap goes, or the next
-     * runtime's first group-by frees a pointer into the dead heap (#865). */
-    ray_dict_cd_clear();
+     * distinct) is heap memory: free this thread's before the heap goes and
+     * mark every other thread's stale, or the next runtime's first group-by
+     * frees a pointer into the dead heap (#865). */
+    ray_dict_cd_runtime_gone();
 
     ray_sym_destroy();
     ray_heap_destroy();
