@@ -1031,6 +1031,14 @@ Ctg -- 1
 Ctg -- 1
 (value ((fn [t k] (select {c: (count y) by: k from: t where: (> y 15)})) Pcd Kcd)) -- (list [1 2] [1 3])
 (value ((fn [t k] (select {c: (count (distinct y)) d: (reverse y) by: k from: t where: (> y 15)})) Pcd Kcd)) -- (list [1 2] [1 3] (list [20] [50 40 30]))
+;; with no outputs the select returns every input column, the partition
+;; column too, and no hidden key: a where: on the name the key's local hides
+;; leaves the parted table whole, as on its flat copy
+(set nok (fn [t k] (select {from: t by: k where: (> k 1)})))
+(nok Pcd [9 2 2 3 3 3]) -- (nok (select {from: Pcd}) [9 2 2 3 3 3])
+(key (nok Pcd [9 2 2 3 3 3])) -- (key (nok (select {from: Pcd}) [9 2 2 3 3 3]))
+(key (nok Pcd [5 5 7 7 9 9])) -- (key (nok (select {from: Pcd}) [5 5 7 7 9 9]))
+(nok Pcd [5 5 7 7 9 9]) -- (nok (select {from: Pcd}) [5 5 7 7 9 9])
 ;; the carried key costs only the columns the clauses read: an aggregate
 ;; route leaves the parted table as it is (the grouping reads the name), and
 ;; the eval-level route copies the columns its clauses name, not the other

@@ -14072,8 +14072,9 @@ by_dict_done:
     /* A where: comparing the name of a column the key's local hides reads
      * the local; the parted aggregate grouping raised length on that, so
      * the key is carried (the parted table copied to the columns read) for
-     * it too.  Any other aggregate grouping keeps the table as it is. */
-    if (!by_key_carry && where_expr && by_expr && by_expr->type == -RAY_SYM &&
+     * it too.  Any other aggregate grouping keeps the table as it is, and so
+     * does a select with no outputs: it returns every input column. */
+    if (!by_key_carry && n_out > 0 && where_expr && by_expr && by_expr->type == -RAY_SYM &&
         !(by_expr->attrs & ATTR_QUOTED) && table_has_parted_columns(tbl) &&
         ray_table_get_col(tbl, by_expr->i64) && ray_env_get_lexical_local(by_expr->i64) &&
         clause_names_sym(where_expr, by_expr->i64))
