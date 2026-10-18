@@ -247,7 +247,22 @@ static ray_err_t splay_has_file(const char* dir, const char* name, bool* exists)
     return *exists || errno == ENOENT ? RAY_OK : RAY_ERR_IO;
 }
 
+/* Removes what `path` names, best effort.  A link goes, never what it
+ * points to: opendir follows a link, so the path is examined with lstat
+ * first and only a real directory is descended.  Every caller relies on
+ * this: the generation prune (a link placed directly under .generations),
+ * the staged-directory removal and the clearing of a failed first write. */
 static void splay_remove_tree_best_effort(const char* path) {
+    struct stat top;
+#ifdef RAY_OS_WINDOWS
+    if (stat(path, &top) != 0) return;
+#else
+    if (lstat(path, &top) != 0) return;
+#endif
+    if (!S_ISDIR(top.st_mode)) {
+        (void)unlink(path);
+        return;
+    }
     DIR* d = opendir(path);
     if (!d) {
         (void)unlink(path);

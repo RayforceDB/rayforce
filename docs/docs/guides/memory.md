@@ -26,6 +26,12 @@ Call `(.sys.mem)` to get a snapshot of the current heap's allocation statistics.
 | `sys-current` | i64 | Committed RAM: every anonymous mapping (buddy pools, sys allocations, swap-fallback pool) |
 | `sys-mapped` | i64 | File-backed bytes currently mapped (splayed columns, symbol file, parse buffers) |
 | `sys-mapped-peak` | i64 | High-water mark of `sys-mapped` |
+| `anon-committed` | i64 | Anonymous RAM the heap has committed (pools, direct and sys blocks; spill excluded) |
+| `anon-peak` | i64 | High-water mark of `anon-committed` |
+| `anon-watermark` | i64 | Spill threshold: set by `-m SIZE`, see [section 8](#8-total-ram-and-out-of-core-spill) |
+
+It also returns diagnostic `*-perpart-runs` counters and the symbol-table size;
+the [`.sys.mem` reference](../namespaces/sys.md#sys-mem) documents every key.
 
 ### Basic Usage
 
@@ -235,7 +241,8 @@ has committed, and when a new pool or large allocation would push that past the
 watermark — by default the smaller of total physical RAM and the container's
 cgroup memory limit (cgroup v2 `memory.max` / v1 `memory.limit_in_bytes`,
 including limits set on a parent slice), less a quarter of it (at least 3 GiB,
-at most half) left to the page cache, or the `-m SIZE` flag when given — it
+at most half) left to the page cache, or the `-m SIZE` flag when given
+(reported as [`anon-watermark`](../namespaces/sys.md#sys-mem)) — it
 backs that allocation with a disk spill file **instead of** anonymous RAM. This never rejects work; it just routes
 the overflow to disk so it spills rather than getting OOM-killed. A query like
 `(til 10000000000)` (a 74 GiB vector) on a smaller machine now spills to disk and
@@ -259,7 +266,8 @@ total-mem | 16777216000
 ### Gauging headroom
 
 To see how close a workload is to spilling to disk, compare the anonymous
-footprint the heap has committed (`anon-committed` from `(.sys.mem)`: pools,
+footprint the heap has committed (`anon-committed` from
+[`(.sys.mem)`](../namespaces/sys.md#sys-mem): pools,
 large blocks and the off-heap tables such as the symbol arenas) against the
 spill threshold (`anon-watermark`):
 
