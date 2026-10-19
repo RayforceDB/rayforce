@@ -1393,11 +1393,10 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
             goto oom;
         }
         result_vecs[f]->len = nrows;
-        /* Pre-stamp every slot with the width-correct null sentinel.  The
-         * per-partition compute loops below write valid values into
-         * "active" slots and call win_set_null on null-producing slots
-         * without re-writing the payload — pre-stamping ensures every
-         * null slot already holds the correct sentinel. */
+        /* Pre-stamp every slot with the width-correct null sentinel. The
+         * per-partition loops overwrite active slots and also store the
+         * sentinel through win_set_null on null-producing slots. Headers
+         * stay unchanged until win_finalize_nulls after the dispatch. */
         if (is_f64[f]) {
             double* d = (double*)ray_data(result_vecs[f]);
             for (int64_t i = 0; i < nrows; i++) d[i] = NULL_F64;
