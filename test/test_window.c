@@ -16,6 +16,7 @@
 
 #include "test.h"
 #include <rayforce.h>
+#include "core/pool.h"
 #include "mem/heap.h"
 #include "ops/ops.h"
 #include "table/sym.h"
@@ -1341,6 +1342,60 @@ static test_result_t test_window_radix_path(void) {
 }
 
 /* ─── Very large table: parallel radix + parallel partition path ────── */
+
+/* LAG/LEAD write boundary nulls from distinct partition tasks. Both output
+ * types must keep payloads and post-join HAS_NULLS metadata correct. The
+ * name also selects this fixture in the existing TSan 'parallel' sweep. */
+static test_result_t test_window_parallel_null_flags(void) {
+    ray_pool_t* pool = ray_pool_get();
+    if (!pool || ray_pool_total_workers(pool) < 2) SKIP("no pool worker");
+    ray_heap_init(); (void)ray_sym_init();
+    const int64_t n = 9000, partitions = 100;
+    for (int dtype = 0; dtype < 2; dtype++) {
+        ray_t* gv = ray_vec_new(RAY_I64, n); gv->len = n;
+        ray_t* vv = ray_vec_new(dtype ? RAY_F64 : RAY_I64, n); vv->len = n;
+        int64_t* gd = (int64_t*)ray_data(gv);
+        void* vd = ray_data(vv);
+        for (int64_t i = 0; i < n; i++) {
+            gd[i] = i % partitions;
+            if (dtype) ((double*)vd)[i] = (double)i;
+            else ((int64_t*)vd)[i] = i;
+        }
+        ray_t* tbl = ray_table_new(2);
+        tbl = ray_table_add_col(tbl, ray_sym_intern("g", 1), gv);
+        tbl = ray_table_add_col(tbl, ray_sym_intern("v", 1), vv);
+        ray_release(gv); ray_release(vv);
+        for (int lead = 0; lead < 2; lead++) {
+            ray_graph_t* g = ray_graph_new(tbl);
+            ray_op_t* t = ray_const_table(g, tbl);
+            ray_op_t* w = build_whole_window(g, t, "g", "v",
+                                             lead ? RAY_WIN_LEAD : RAY_WIN_LAG, "v", 1);
+            ray_t* result = ray_execute(g, w);
+            TEST_ASSERT_TRUE(result && !RAY_IS_ERR(result));
+            ray_t* rc = win_result_col(result, 2);
+            TEST_ASSERT_EQ_I(rc->type, dtype ? RAY_F64 : RAY_I64);
+            TEST_ASSERT_EQ_I(rc->len, n);
+            TEST_ASSERT_TRUE(rc->attrs & RAY_ATTR_HAS_NULLS);
+            const void* rd = ray_data(rc);
+            int64_t nulls = 0;
+            for (int64_t i = 0; i < n; i++) {
+                bool is_null = lead ? i >= n - partitions : i < partitions;
+                TEST_ASSERT_EQ_I(ray_vec_is_null(rc, i), is_null);
+                nulls += is_null;
+                if (!is_null) {
+                    int64_t want = lead ? i + partitions : i - partitions;
+                    if (dtype) TEST_ASSERT_TRUE(((const double*)rd)[i] == (double)want);
+                    else TEST_ASSERT_EQ_I(((const int64_t*)rd)[i], want);
+                }
+            }
+            TEST_ASSERT_EQ_I(nulls, partitions);
+            ray_release(result); ray_graph_free(g);
+        }
+        ray_release(tbl);
+    }
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
 
 static test_result_t test_window_parallel_path(void) {
     ray_heap_init(); (void)ray_sym_init();
@@ -4317,6 +4372,7 @@ const test_entry_t window_entries[] = {
     { "window/multikey_partition",     test_window_multikey_partition,     NULL, NULL },
     { "window/multiple_funcs",         test_window_multiple_funcs,         NULL, NULL },
     { "window/radix_path",             test_window_radix_path,             NULL, NULL },
+    { "window/parallel_null_flags",       test_window_parallel_null_flags,       NULL, NULL },
     { "window/parallel_path",          test_window_parallel_path,          NULL, NULL },
     { "window/order_desc",             test_window_order_desc,             NULL, NULL },
     { "window/date_partition",         test_window_date_partition,         NULL, NULL },

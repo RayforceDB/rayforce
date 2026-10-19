@@ -1917,14 +1917,14 @@ ray_t* broadcast_scalar(ray_t* atom, int64_t nrows);
 ray_t* exec_node(ray_graph_t* g, ray_op_t* op);
 
 /* ══════════════════════════════════════════
- * Thread-safe null bitmap helpers (parallel group/window)
+ * Parallel null-sentinel helpers (group/window)
  * ══════════════════════════════════════════ */
 
-/* Parallel-safe null marker.  Writes the type-correct NULL_* sentinel
- * into payload[idx] and atomically ORs HAS_NULLS into vec->attrs.
- * Payload write needs no synchronisation — different threads call this
- * with different idx, so each per-slot store is uncontended.  attrs OR
- * is atomic so the read-modify-write on the shared attrs byte is safe.
+/* Write the type-correct NULL_* sentinel into a worker-owned payload slot.
+ * Workers must own disjoint slots and leave the shared header unchanged:
+ * even an atomic attrs OR races with ray_data()'s ordinary SLICE-bit read.
+ * The producer derives HAS_NULLS with par_finalize_nulls after workers join,
+ * before exposing the result to metadata consumers.
  *
  * BOOL/U8 are non-nullable (rejected at the producer surface).  SYM/STR/GUID
  * don't appear in parallel aggregation/window output columns and are no-ops
@@ -1939,15 +1939,12 @@ static inline void par_set_null(ray_t* vec, int64_t idx) {
         case RAY_I16:                          ((int16_t*)p)[idx] = NULL_I16; break;
         default: return;
     }
-    __atomic_fetch_or(&vec->attrs, (uint8_t)RAY_ATTR_HAS_NULLS,
-                      __ATOMIC_RELAXED);
 }
 
-/* Scan payload after parallel execution and set RAY_ATTR_HAS_NULLS if
- * any element carries the type-correct NULL_* sentinel.  This catches
- * the case where par_set_null's atomic OR raced with another thread's
- * load before it took effect — the scan is the post-hoc authoritative
- * check.  No-op for non-sentinel types. */
+/* After workers join, derive RAY_ATTR_HAS_NULLS from type-correct NULL_*
+ * sentinels before publishing the output. This serial pass is not a repair
+ * for racing header accesses: workers must not write attrs in the first
+ * place. No-op for non-sentinel types. */
 static inline void par_finalize_nulls(ray_t* vec) {
     int64_t n = vec->len;
     const void* p = ray_data(vec);
