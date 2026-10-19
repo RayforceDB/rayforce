@@ -1724,6 +1724,10 @@ bool dag_can_stream(ray_graph_t* g, ray_op_t* root);
  * Read-only and bounded; false declines a rewrite, not the language program.
  * This does not prove structural-domain or exception-order equivalence. */
 bool ray_expr_subset_invariant(ray_graph_t* g, uint32_t root_id);
+/* Does node `id` read the default table's rows, through filters, aliases
+ * and materializations only?  Defined in opt.c; the correspondence
+ * ray_expr_subset_invariant leaves to its caller. */
+bool filter_input_default_domain(ray_graph_t* g, uint32_t id);
 
 /* Ordered concat-merge of two partial partition-streamed results (tables:
  * per-column concat; vectors: direct concat).  Returns an OWNED result.

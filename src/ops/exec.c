@@ -2895,6 +2895,18 @@ static int collect_scan_syms(ray_graph_t* g, const uint32_t* roots, int nroots,
     return n;
 }
 
+/* Is `filter` chained (it reads another FILTER, as a split `and` does)
+ * over the default table's rows, with a term whose verdicts survive a
+ * subset of those rows (ray_expr_subset_invariant)?  A term reading other
+ * rows (an aggregate, a running function) answers false. */
+static bool filter_chain_subset_invariant(ray_graph_t* g, ray_op_t* filter) {
+    ray_op_t* in = op_child(g, filter, 0);
+    ray_op_t* term = op_child(g, filter, 1);
+    if (!in || in->opcode != OP_FILTER || !term) return false;
+    return filter_input_default_domain(g, in->id) &&
+           ray_expr_subset_invariant(g, term->id);
+}
+
 /* The sparse refinement's keep set for a membership test the element-wise
  * walk declines: `in` / `not in` of one generation-2 column (not SYM: its
  * ids resolve over the file's domain, which exec_in does not translate)
@@ -4799,6 +4811,12 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     ray_release(g->selection);
                     g->selection = NULL;
                 }
+            } else if (child_op && child_op->opcode == OP_FILTER && n >= 0 &&
+                       filter_chain_subset_invariant(g, child_op)) {
+                /* The chain narrows the inner filters' selection and the
+                 * head below gathers the first N rows it keeps.  A negative
+                 * N keeps the filter head's empty result. */
+                input = exec_node(g, child_op);
             } else if (child_op && child_op->opcode == OP_FILTER) {
                 /* HEAD(FILTER): early-termination filter — gather only
                  * the first N matching rows instead of all matches. */
@@ -4839,7 +4857,11 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
             }
             if (!input || RAY_IS_ERR(input)) return input;
             if (g->selection && input->type == RAY_TABLE) {
-                ray_t* compacted = sel_compact(g, input, g->selection, NULL, 0);
+                /* only the first n rows the selection keeps */
+                ray_t* hsel = (n >= 0 && n < ray_rowsel_meta(g->selection)->total_pass)
+                            ? ray_rowsel_head(g->selection, n) : NULL;
+                ray_t* compacted = sel_compact(g, input, hsel ? hsel : g->selection, NULL, 0);
+                if (hsel) ray_rowsel_release(hsel);
                 ray_release(input);
                 ray_release(g->selection);
                 g->selection = NULL;
