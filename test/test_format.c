@@ -1896,6 +1896,42 @@ static test_result_t fmt_ragged_case(int64_t mid) {
     PASS();
 }
 
+/* println and show print through ray_lang_print, not ray_fmt.  Its null
+ * atoms must use the same table as ray_fmt: the GUID null printed as `null`
+ * there while format already wrote 0Ng (#881). */
+static size_t lang_print_to_buf(ray_t* obj, char* buf, size_t cap) {
+    FILE* fp = tmpfile();
+    if (!fp) return 0;
+    ray_lang_print(fp, obj);
+    fflush(fp);
+    rewind(fp);
+    size_t n = fread(buf, 1, cap - 1, fp);
+    buf[n] = '\0';
+    fclose(fp);
+    return n;
+}
+
+static test_result_t test_lang_print_nulls(void) {
+    static const uint8_t zero[16] = {0};
+    char buf[64];
+    ray_t* g = ray_typed_null(-RAY_GUID);
+    TEST_ASSERT_FALSE(!g || RAY_IS_ERR(g));
+    lang_print_to_buf(g, buf, sizeof(buf));
+    TEST_ASSERT_STR_EQ(buf, "0Ng");
+    ray_release(g);
+    ray_t* gz = ray_guid(zero);
+    TEST_ASSERT_FALSE(!gz || RAY_IS_ERR(gz));
+    lang_print_to_buf(gz, buf, sizeof(buf));
+    TEST_ASSERT_STR_EQ(buf, "0Ng");
+    ray_release(gz);
+    ray_t* e = ray_typed_null(-RAY_F32);
+    TEST_ASSERT_FALSE(!e || RAY_IS_ERR(e));
+    lang_print_to_buf(e, buf, sizeof(buf));
+    TEST_ASSERT_STR_EQ(buf, "0Ne");
+    ray_release(e);
+    PASS();
+}
+
 static test_result_t test_fmt_table_parted_ragged(void) {
     test_result_t res = fmt_ragged_case(2);
     if (res.status != TEST_PASS) return res;
@@ -2014,5 +2050,6 @@ const test_entry_t format_entries[] = {
     { "format/times_binding", test_fmt_times_binding, fmt_setup_full, fmt_teardown_full },
     { "format/table/parted", test_fmt_table_parted, fmt_setup_full, fmt_teardown_full },
     { "format/table/parted_ragged", test_fmt_table_parted_ragged, fmt_setup_full, fmt_teardown_full },
+    { "format/lang_print/nulls", test_lang_print_nulls, fmt_setup_full, fmt_teardown_full },
     { NULL, NULL, NULL, NULL },
 };

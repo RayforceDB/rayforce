@@ -657,9 +657,18 @@
 (nil? (as 'F32 "inf")) -- true
 (nil? (as 'F32 0Nl)) -- true
 (nil? (as 'F32 0Nf)) -- true
-;; past the F32 range saturates, as integer narrowings do
-(> (as 'F64 (as 'F32 1e300)) 3e38) -- true
-(< (as 'F64 (as 'F32 -1e300)) -3e38) -- true
+;; past the F32 range saturates to exactly +-FLT_MAX, as integer
+;; narrowings do; it is not the null
+(as 'F64 (as 'F32 1e300)) -- 3.4028234663852886e38
+(as 'F64 (as 'F32 -1e300)) -- -3.4028234663852886e38
+(nil? (as 'F32 [1e300 -1e300])) -- [false false]
+;; temporal atoms, vectors and lists cast through their storage
+(as 'F64 (as 'F32 2024.01.15)) -- 8780.0
+(as 'F64 (as 'F32 [2024.01.15])) -- [8780.0]
+(as 'F64 (as 'F32 00:00:01.000)) -- 1000.0
+(as 'F64 (as 'F32 [00:00:01.000])) -- [1000.0]
+(as 'F64 (as 'F32 2000.01.01D00:00:00.000001000)) -- 1000.0
+(as 'F64 (as 'F32 (list 2024.01.15 00:00:01.000))) -- [8780.0 1000.0]
 ;; f32 -> other atoms
 (as 'i64 (as 'F32 7.9)) -- 7
 (as 'i32 (as 'F32 7.9)) -- 7i
@@ -675,3 +684,11 @@
 (nil? (as 'F32 [0Nl 0Nf])) -- [true true]
 ;; large enough for the parallel cast path
 (sum (as 'F64 (as 'F32 (til 300000)))) -- 44999850000.0
+;; the builtin, vector and query casts agree, both signs and nulls
+(set F32V [1e300 -1e300 0Nf 1.5])
+(set F32T (table [v d] (list F32V [2024.01.15 2024.01.16 0Nd 2024.01.17])))
+(as 'F64 (as 'F32 F32V)) -- [3.4028234663852886e38 -3.4028234663852886e38 0Nf 1.5]
+(as 'F64 (at (select {x: (as 'F32 v) from: F32T}) 'x)) -- [3.4028234663852886e38 -3.4028234663852886e38 0Nf 1.5]
+(as 'F64 (at (update {w: (as 'F32 v) from: F32T}) 'w)) -- [3.4028234663852886e38 -3.4028234663852886e38 0Nf 1.5]
+(as 'F64 (at (select {x: (as 'F32 d) from: F32T}) 'x)) -- [8780.0 8781.0 0Nf 8782.0]
+(as 'F64 (as 'F32 (at F32T 'd))) -- [8780.0 8781.0 0Nf 8782.0]

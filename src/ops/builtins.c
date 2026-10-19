@@ -1516,6 +1516,10 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         if (val->type == -RAY_I32) return ray_f32((float)val->i32);
         if (val->type == -RAY_I16) return ray_f32((float)val->i16);
         if (val->type == -RAY_U8)  return ray_f32((float)val->u8);
+        /* Temporal atoms cast through their storage, as for F64 and as the
+         * vector and query casts already do. */
+        if (val->type == -RAY_DATE || val->type == -RAY_TIME) return ray_f32((float)val->i32);
+        if (val->type == -RAY_TIMESTAMP) return ray_f32((float)val->i64);
         if (val->type == -RAY_STR) {
             const char* sp = ray_str_ptr(val);
             if (!sp) return ray_error("domain", "as: cannot parse empty str as f32");
