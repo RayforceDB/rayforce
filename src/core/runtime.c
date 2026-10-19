@@ -114,6 +114,7 @@ const char* ray_err_code_str(ray_err_t e) {
          * is capped at 7 bytes — the past-tense form would truncate. */
         [RAY_ERR_RESERVED] = "reserve",
         [RAY_ERR_VERSION] = "version",
+        [RAY_ERR_FPENV]   = "fpenv",
     };
     if ((unsigned)e >= sizeof(codes)/sizeof(codes[0])) return "error";
     return codes[e];
@@ -133,6 +134,7 @@ ray_err_t ray_err_from_obj(ray_t* err) {
         {"name",    4, RAY_ERR_NAME},    {"limit",   5, RAY_ERR_LIMIT},
         {"reserve", 7, RAY_ERR_RESERVED},
         {"version", 7, RAY_ERR_VERSION},
+        {"fpenv",   5, RAY_ERR_FPENV},
     };
     for (int i = 0; i < (int)(sizeof(map)/sizeof(map[0])); i++)
         if (n == map[i].len && memcmp(s, map[i].s, n) == 0) return map[i].e;
@@ -174,6 +176,13 @@ static ray_t* ray_verror(const char* code, const char* fmt, va_list ap) {
 }
 
 ray_t* ray_error(const char* code, const char* fmt, ...) {
+    /* Enum-only save wrappers reconstruct errors with fmt == NULL. Give
+     * this caller-environment error useful context without reusing stale TLS
+     * text or changing the message behavior of any other error code. This
+     * literal deliberately contains no printf conversions. */
+    if (!fmt && code && strcmp(code, "fpenv") == 0)
+        fmt = "compressed floating-point I/O requires default FP controls "
+              "(FE_TONEAREST, masked exceptions, no FTZ/DAZ)";
     if (fmt) {
         va_list ap;
         va_start(ap, fmt);

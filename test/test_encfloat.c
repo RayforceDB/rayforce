@@ -41,6 +41,10 @@
 #include "lang/format.h"
 #include "table/table.h"
 #include "vec/str.h"
+#include <fenv.h>
+#if defined(__SSE__)
+#include <xmmintrin.h>
+#endif
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -2188,7 +2192,128 @@ static test_result_t test_fast_equals_reference(void) {
     PASS();
 }
 
+/* Caller control state must fail explicitly, and must not poison once state. */
+static test_result_t test_fp_environment(void) {
+#if !defined(FE_UPWARD)
+    SKIP("FE_UPWARD unavailable");
+#else
+    fenv_t saved;
+    if (fegetenv(&saved) != 0) SKIP("cannot save FP environment");
+    if (fesetenv(FE_DFL_ENV) != 0 || fesetround(FE_UPWARD) != 0) {
+        (void)fesetenv(&saved); SKIP("cannot select FE_UPWARD");
+    }
+    const char* why = NULL;
+    ray_t* err = NULL;
+    ray_t* back = NULL;
+    FILE* f = NULL;
+    ray_encw_t w = {0};
+    ray_encw_vec_t vout; ray_encw_vec_init(&vout);
+    _Alignas(64) uint8_t out[8192];
+    char path[512], stream[512];
+    const int64_t n = 2055;
+    if (fesetround(FE_TONEAREST) != 0) { why = "restore nearest"; goto done; }
+    for (int pass = 0; pass < 2; pass++) {
+        int8_t type = pass ? RAY_F32 : RAY_F64;
+        size_t esz = pass ? 4 : 8;
+        fl_vec = ray_vec_new(type, n);
+        if (!fl_vec || RAY_IS_ERR(fl_vec)) {
+            if (fl_vec) ray_error_free(fl_vec);
+            fl_vec = NULL; why = "allocate input"; goto done;
+        }
+        fl_vec->len = n;
+        for (int64_t i = 0; i < n; i++) {
+            double d = (double)((i * 73) % 10000) / 100.0;
+            if (pass) ((float*)ray_data(fl_vec))[i] = (float)d;
+            else ((double*)ray_data(fl_vec))[i] = d;
+        }
+        snprintf(path, sizeof path, "%s/fpenv-%d", ray_test_tmp(FL_TMP), pass);
+        snprintf(stream, sizeof stream, "%s/fpenv-stream-%d", ray_test_tmp(FL_TMP), pass);
+        if (fl_roundtrip(fl_vec, RAY_ENC_ALP, path) != 0 ||
+            desc_enc(path, 0) != RAY_ENC_ALP || desc_enc(path, 2) != RAY_ENC_ALP) {
+            why = "nearest ALP bit roundtrip/fixture"; goto done;
+        }
+        fl_map = ray_col_mmap(path);
+        if (!fl_map || RAY_IS_ERR(fl_map)) {
+            if (fl_map) ray_error_free(fl_map);
+            fl_map = NULL; why = "map fresh input"; goto done;
+        }
+        ray_enccol_t* e = ray_enccol_of(fl_map);
+        if (!e || ray_enccol_decoded_peek(fl_map)) { why = "expected undecoded column"; goto done; }
+        f = fopen(stream, "wb+");
+        if (!f) { why = "open stream"; goto done; }
+        if (ray_encw_begin(&w, f, type, 0, n, 0, 0, 0) != RAY_OK) { why = "begin stream"; goto done; }
+        if (fesetround(FE_UPWARD) != 0) { why = "select upward"; goto done; }
+        if (ray_enc_fp_env_ok()) { why = "upward admitted"; goto done; }
+        if (ray_encw_vec(type, 0, ray_data(fl_vec), NULL, 0, 1024, NULL, &vout) != RAY_ERR_FPENV) {
+            why = "vector encoder did not reject environment"; goto done;
+        }
+        if (ray_encw_chunk(&w, ray_data(fl_vec), NULL, n) != RAY_ERR_FPENV ||
+            w.chunk_i != 0 || w.chunk.len != 0 || w.dict_v || w.alp.n != 0) {
+            why = "stream rejected after training/mutation"; goto done;
+        }
+        err = ray_enccol_decode_vec(e, 2, out, NULL, 0, 0);
+        if (!err || ray_err_from_obj(err) != RAY_ERR_FPENV) { why = "tail decode did not report fpenv"; goto done; }
+        ray_error_free(err); err = NULL;
+        err = ray_enccol_materialize(fl_map);
+        if (!err || !RAY_IS_ERR(err) || ray_err_from_obj(err) != RAY_ERR_FPENV) {
+            if (err && !RAY_IS_ERR(err)) err = NULL; /* a successful result is borrowed */
+            why = "materializer did not report fpenv"; goto done;
+        }
+        ray_error_free(err); err = NULL;
+        if (ray_enccol_decoded_peek(fl_map)) { why = "rejection cached decoded data"; goto done; }
+        if (fesetround(FE_TONEAREST) != 0) { why = "restore nearest"; goto done; }
+        if (ray_encw_chunk(&w, ray_data(fl_vec), NULL, n) != RAY_OK || ray_encw_finish(&w) != RAY_OK) {
+            why = "stream could not retry after restoring nearest"; goto done;
+        }
+        ray_encw_free(&w); w = (ray_encw_t){0};
+        if (fclose(f) != 0) { f = NULL; why = "close stream"; goto done; } f = NULL;
+        back = ray_col_load(stream);
+        if (!back || RAY_IS_ERR(back) || back->len != n ||
+            memcmp(ray_data(back), ray_data(fl_vec), (size_t)n * esz) != 0) {
+            why = "restored stream bit roundtrip"; goto done;
+        }
+        ray_release(back); back = NULL;
+        ray_t* plain = ray_enccol_materialize(fl_map);
+        if (!plain || RAY_IS_ERR(plain)) { err = plain; why = "same-column nearest retry"; goto done; }
+        if (plain->len != n || memcmp(ray_data(plain), ray_data(fl_vec), (size_t)n * esz) != 0) {
+            why = "same-column bit mismatch"; goto done;
+        }
+        if (fesetround(FE_UPWARD) != 0) { why = "select upward for cache hit"; goto done; }
+        err = ray_enccol_materialize(fl_map);
+        if (!err || !RAY_IS_ERR(err) || ray_err_from_obj(err) != RAY_ERR_FPENV) {
+            if (err && !RAY_IS_ERR(err)) err = NULL;
+            why = "cached materialization bypassed preflight"; goto done;
+        }
+        ray_error_free(err); err = NULL;
+        if (fesetround(FE_TONEAREST) != 0) { why = "restore nearest"; goto done; }
+        ray_release(fl_map); fl_map = NULL; fl_drop();
+    }
+#if defined(__SSE__)
+    {
+        unsigned saved_csr = _mm_getcsr();
+        const unsigned altered[] = { 0x8000u, 0x0040u, 0x4000u }; /* FTZ, DAZ, SSE-only round-up */
+        for (size_t i = 0; i < sizeof altered / sizeof altered[0]; i++) {
+            _mm_setcsr(saved_csr | altered[i]);
+            bool accepted = ray_enc_fp_env_ok();
+            _mm_setcsr(saved_csr);
+            if (accepted) { why = "SSE control mismatch admitted"; goto done; }
+        }
+    }
+#endif
+done:
+    /* No assertion or engine cleanup while this test's nondefault state is live. */
+    (void)fesetenv(&saved);
+    if (err && RAY_IS_ERR(err)) ray_error_free(err);
+    if (back) { if (RAY_IS_ERR(back)) ray_error_free(back); else ray_release(back); }
+    ray_encw_vec_free(&vout); ray_encw_free(&w);
+    if (f) fclose(f);
+    TEST_ASSERT_FMT(why == NULL, "%s", why ? why : "");
+    PASS();
+#endif
+}
+
 const test_entry_t encfloat_entries[] = {
+    { "encfloat/fp_environment", test_fp_environment, fl_setup, fl_teardown },
     { "encfloat/float_order",      test_float_order,      fl_setup, fl_teardown },
     { "encfloat/float_train_dict", test_float_train_dict, fl_setup, fl_teardown },
     { "encfloat/float_bodies",     test_float_bodies,     fl_setup, fl_teardown },

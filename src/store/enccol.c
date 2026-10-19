@@ -2114,10 +2114,13 @@ static ray_t* dec_aside(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t*
 static ray_t* decode_vec(ray_enccol_t* e, int64_t c, int j, const ray_enc_desc_t* d,
                          void* out, char* pool_out, uint64_t pool_base, uint64_t pool_cap,
                          bool priv, uint64_t* produced, const uint32_t* dict_pool_off) {
+    *produced = 0;
+    if ((e->type == RAY_F32 || e->type == RAY_F64) &&
+        d->encoding == RAY_ENC_ALP && !ray_enc_fp_env_ok())
+        return ray_error("fpenv", "column %s: " RAY_ENC_FPENV_MSG, e->path);
     int64_t rows = chunk_rows(e, c);
     int vlen = (int)(rows - (int64_t)j * RAY_ENC_VEC < RAY_ENC_VEC ? rows - (int64_t)j * RAY_ENC_VEC : RAY_ENC_VEC);
     const uint8_t* body = NULL; uint64_t avail = 0; const uint8_t* bm = NULL;
-    *produced = 0;
     ray_t* err = payload_parts(e, c, j, d, vlen, &body, &avail, &bm);
     if (err) return err;
     uint64_t pooled = 0;
@@ -3734,6 +3737,10 @@ static ray_t* enc_materialize_parted(void* ctx, ray_enc_snap_t* fail) {
 ray_t* ray_enccol_materialize(ray_t* encv) {
     ray_enccol_t* e = ray_enccol_of(encv);
     if (!e) return ray_error("type", "materialize: not an encoded column");
+    /* Reject before the once/cache lookup: caller control state is not a
+     * permanent property of the file, and workers can have distinct state. */
+    if ((e->type == RAY_F32 || e->type == RAY_F64) && !ray_enc_fp_env_ok())
+        return ray_error("fpenv", "column %s: " RAY_ENC_FPENV_MSG, e->path);
     return ray_enc_once_get(&e->once, &e->decoded,
                             e->kind == RAY_ENCCOL_PARTED ? enc_materialize_parted : enc_materialize_single, e);
 }

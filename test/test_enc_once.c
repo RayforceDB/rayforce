@@ -63,6 +63,7 @@ static ray_t* once_fn(void* raw, ray_enc_snap_t* fail) {
         ray_enc_snap_set(fail, "corrupt", "held attempt %d", n);
         return NULL;
     }
+    if (c->mode == 9 && n == 1) return ray_error("fpenv", NULL);
     if (c->mode == 3) return ray_error("corrupt", "returned error object");
     if (c->mode == 4) return NULL;      /* NULL with an empty fail */
     if (c->mode == 8) { ray_enc_snap_set(fail, "cancel", "cancelled %d", n); return NULL; }
@@ -143,6 +144,7 @@ static test_result_t test_once_deterministic_cached(void) {
 static test_result_t test_once_transient_codes(void) {
     TEST_ASSERT_TRUE(ray_enc_code_transient("oom"));
     TEST_ASSERT_TRUE(ray_enc_code_transient("cancel"));
+    TEST_ASSERT_TRUE(ray_enc_code_transient("fpenv"));
     TEST_ASSERT_FALSE(ray_enc_code_transient("corrupt"));
     TEST_ASSERT_FALSE(ray_enc_code_transient("nyi"));
     ray_enc_snap_t s;
@@ -267,6 +269,69 @@ static test_result_t test_once_transient_no_leak(void) {
     PASS();
 }
 
+/* Exercise the actual error-object -> snapshot -> error-object path, as
+ * used when a decoding worker rejects its own FP controls. No FP state is
+ * changed here: this tests classification/retry, not platform detection. */
+static test_result_t test_once_fpenv_retries(void) {
+    once_ctx_t c; memset(&c, 0, sizeof c); ray_enc_once_init(&c.once);
+    c.mode = 9;
+    ray_t* r = ray_enc_once_get(&c.once, &c.slot, once_fn, &c);
+    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+    TEST_ASSERT_STR_EQ(ray_err_code(r), "fpenv");
+    TEST_ASSERT_EQ_I(ray_err_from_obj(r), RAY_ERR_FPENV);
+    TEST_ASSERT_TRUE(ray_error_msg() && strstr(ray_error_msg(), "FE_TONEAREST"));
+    ray_error_free(r);
+    TEST_ASSERT_EQ_U(atomic_load(&c.once.state), RAY_ENC_ONCE_IDLE);
+    TEST_ASSERT_TRUE(c.slot == NULL);
+    r = ray_enc_once_get(&c.once, &c.slot, once_fn, &c);
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_PTR(r, c.slot);
+    TEST_ASSERT_EQ_I(atomic_load(&c.calls), 2);
+    TEST_ASSERT_EQ_U(atomic_load(&c.once.state), RAY_ENC_ONCE_DONE);
+    TEST_ASSERT_EQ_PTR(ray_enc_once_get(&c.once, &c.slot, once_fn, &c), r);
+    TEST_ASSERT_EQ_I(atomic_load(&c.calls), 2);
+    ray_release(c.slot);
+    PASS();
+}
+
+static test_result_t test_once_fpenv_snapshot(void) {
+    TEST_ASSERT_STR_EQ(ray_err_code_str(RAY_ERR_FPENV), "fpenv");
+    ray_enc_snap_t s;
+    ray_enc_snap_set(&s, "fpenv", "worker %d controls unsupported", 3);
+    TEST_ASSERT_TRUE(s.is_transient);
+    ray_t* e = ray_enc_snap_error(&s);
+    TEST_ASSERT_TRUE(e && RAY_IS_ERR(e));
+    TEST_ASSERT_EQ_I(ray_err_from_obj(e), RAY_ERR_FPENV);
+    TEST_ASSERT_STR_EQ(ray_error_msg(), "worker 3 controls unsupported");
+    ray_enc_snap_take(&s, e);
+    TEST_ASSERT_TRUE(s.is_transient);
+    TEST_ASSERT_STR_EQ(s.code, "fpenv");
+    TEST_ASSERT_STR_EQ(s.msg, "worker 3 controls unsupported");
+
+    /* Enum-only save conversions must not lose the explanation. */
+    e = ray_error(ray_err_code_str(RAY_ERR_FPENV), NULL);
+    TEST_ASSERT_TRUE(e && RAY_IS_ERR(e));
+    TEST_ASSERT_TRUE(ray_error_msg() && strstr(ray_error_msg(), "FE_TONEAREST"));
+    TEST_ASSERT_TRUE(strstr(ray_error_msg(), "masked exceptions") != NULL);
+    TEST_ASSERT_TRUE(strstr(ray_error_msg(), "no FTZ/DAZ") != NULL);
+    ray_enc_snap_take(&s, e);
+    TEST_ASSERT_TRUE(s.is_transient);
+    TEST_ASSERT_STR_EQ(s.code, "fpenv");
+    TEST_ASSERT_TRUE(strstr(s.msg, "FE_TONEAREST") != NULL);
+    e = ray_enc_snap_error(&s);
+    TEST_ASSERT_TRUE(e && RAY_IS_ERR(e));
+    TEST_ASSERT_EQ_I(ray_err_from_obj(e), RAY_ERR_FPENV);
+    TEST_ASSERT_STR_EQ(ray_error_msg(), s.msg);
+    ray_error_free(e);
+
+    /* Other constructors retain their NULL-format clearing behavior. */
+    e = ray_error("domain", NULL);
+    TEST_ASSERT_TRUE(e && RAY_IS_ERR(e));
+    TEST_ASSERT_TRUE(ray_error_msg() == NULL);
+    ray_error_free(e);
+    PASS();
+}
+
 const test_entry_t enconce_entries[] = {
     { "enconce/success_shared",        test_once_success_shared,        once_setup, once_teardown },
     { "enconce/many_waiters_transient",test_once_many_waiters_transient,once_setup, once_teardown },
@@ -278,5 +343,7 @@ const test_entry_t enconce_entries[] = {
     { "enconce/null_without_snapshot", test_once_null_without_snapshot, once_setup, once_teardown },
     { "enconce/transient_no_waiters_retries", test_once_transient_no_waiters_retries, once_setup, once_teardown },
     { "enconce/transient_no_leak", test_once_transient_no_leak, once_setup, once_teardown },
+    { "enconce/fpenv_retries", test_once_fpenv_retries, once_setup, once_teardown },
+    { "enconce/fpenv_snapshot", test_once_fpenv_snapshot, once_setup, once_teardown },
     { NULL, NULL, NULL, NULL },
 };

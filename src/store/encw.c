@@ -162,6 +162,7 @@ static const ray_enc_alp_cands_t g_alp00 = { { { 0, 0 } }, 1 };
 
 static ray_err_t encw_float(int8_t type, const void* data, int64_t start, int n,
                             const ray_encw_side_t* side, ray_encw_vec_t* o) {
+    if (!ray_enc_fp_env_ok()) return RAY_ERR_FPENV;
     if (!canon_matches()) return RAY_ERR_RANGE;
     const bool f32 = type == RAY_F32;
     const size_t esz = f32 ? 4 : 8;
@@ -718,6 +719,9 @@ ray_err_t ray_encw_chunk(ray_encw_t* w, const void* data, const char* str_pool, 
     int64_t want = w->len - w->chunk_i * RAY_ENC_CHUNK;
     if (want > RAY_ENC_CHUNK) want = RAY_ENC_CHUNK;
     if (n != want) return RAY_ERR_RANGE;
+    /* First-chunk dictionary training tries ALP before encw_float. */
+    if ((w->type == RAY_F32 || w->type == RAY_F64) && !ray_enc_fp_env_ok())
+        return RAY_ERR_FPENV;
     ray_err_t err;
     if (w->chunk_i == 0 && ray_encw_type_has_dict(w->type) &&
         (err = train_dict(w, data, n)) != RAY_OK) return err;

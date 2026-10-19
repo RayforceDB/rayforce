@@ -341,6 +341,14 @@ An optional third argument specifies a custom symbol table path: `(.db.splayed.s
 
 A trailing options dict selects the column file format: `(.db.splayed.set "/tmp/weather" t {compress: true})`, also after the symbol path. `true` writes generation-2 (compressed) files where eligible, `false` generation 0; when absent each file inherits (generation 2 when its source is an encoded column or the destination's current file is generation 2). Unknown keys or a non-bool value are a `domain` error. Linked, nested/list and explicitly indexed (hash, sort, bloom, part) columns are always written uncompressed. Compressed files keep their chunk zones but carry no persisted hash or dictionary index: a column that a generation-0 save would give one is written without it, and queries over it run without that accelerator.
 
+### Compressed floating-point environment
+
+Generation-2 compressed F32/F64 I/O requires **default floating-point controls** on every calling/executing thread: round-to-nearest (`FE_TONEAREST`), masked FP exceptions, and gradual underflow (FTZ and DAZ disabled). Embedders must maintain those controls during calls. Rayforce does not silently change or normalize them; sticky exception status flags need not be clear and arithmetic may set them. Detected unsupported controls produce `fpenv` (`RAY_ERR_FPENV` in C), not a corruption error. Restore supported controls before retrying the same mapped column; an environment failure is transient, not permanently cached.
+
+The refusal applies conservatively to compressed float writes and whole-column materialization, including decoded-cache hits and non-ALP encodings. ALP range decoding also checks the executing thread. It does not change the file format or require every non-ALP range read to reject nondefault controls.
+
+Detection is deliberately limited: standard rounding is checked, plus SSE rounding, FTZ/DAZ and exception masks on supported x86 SSE builds. This is **not a complete portable FP-environment validator**: x87 trap masks are not checked, and on other native architectures only standard rounding is checked. WebAssembly has fixed nearest rounding. Maintaining other required controls remains the embedder's responsibility; passing a check is not proof that every control is supported.
+
 ### `.db.splayed.get` — Load a Splayed Table
 
 Loads a splayed table from a directory. Columns are memory-mapped: generation-0 files for zero-copy access, while a compressed (generation-2) column decodes into heap memory the first time a query reads it.

@@ -36,6 +36,29 @@
 #include <float.h>
 #include <stdlib.h>          /* qsort (ALP_RD) */
 #include <string.h>
+#if !defined(__wasm__)
+#include <fenv.h>
+#endif
+#if defined(__SSE__)
+#include <xmmintrin.h>
+#endif
+
+bool ray_enc_fp_env_ok(void) {
+#if defined(__wasm__)
+    /* WebAssembly's arithmetic has fixed nearest rounding and no host FCSR. */
+    return true;
+#else
+    if (fegetround() != FE_TONEAREST) return false;
+#if defined(__SSE__)
+    /* Ignore accrued exception status; validate rounding, denormal controls
+     * and exception masks, including an SSE/x87 rounding mismatch. */
+    const unsigned control_mask = 0xffc0u;
+    const unsigned default_controls = 0x1f80u;
+    if ((_mm_getcsr() & control_mask) != default_controls) return false;
+#endif
+    return true;
+#endif
+}
 
 #if defined(__FAST_MATH__) || defined(__ASSOCIATIVE_MATH__) || defined(__NO_SIGNED_ZEROS__) || \
     (defined(__GCC_IEC_559) && __GCC_IEC_559 < 2)

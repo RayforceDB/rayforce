@@ -168,6 +168,11 @@ int     ray_enc_train_dict(const uint64_t* v, int64_t n, ray_enc_kind_t k,
 
 /* ---- ALP (src/store/enc_alp.c, compiled with strict IEEE flags) ----
  * v holds T-bit float patterns (T 32 or 64), n in 1..1024. */
+/* Runtime control check, not a change of the caller's FP environment.
+ * Checks standard rounding, and SSE controls where available. Other control
+ * modes must still obey the documented default-environment precondition. */
+bool ray_enc_fp_env_ok(void);
+#define RAY_ENC_FPENV_MSG "generation-2 float encoding/decoding requires default FP controls (FE_TONEAREST, masked exceptions, no FTZ/DAZ)"
 #define RAY_ENC_ALP_CANDS 5
 typedef struct { uint8_t e, f; } ray_enc_alp_ef_t;
 typedef struct { ray_enc_alp_ef_t c[RAY_ENC_ALP_CANDS]; int n; } ray_enc_alp_cands_t;

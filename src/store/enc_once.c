@@ -78,7 +78,8 @@ uint32_t ray_enc_once_waiters(ray_enc_once_t* o) {
 }
 
 bool ray_enc_code_transient(const char* code) {
-    return code && (strcmp(code, "oom") == 0 || strcmp(code, "cancel") == 0);
+    return code && (strcmp(code, "oom") == 0 || strcmp(code, "cancel") == 0 ||
+                    strcmp(code, "fpenv") == 0);
 }
 
 void ray_enc_snap_set(ray_enc_snap_t* s, const char* code, const char* fmt, ...) {

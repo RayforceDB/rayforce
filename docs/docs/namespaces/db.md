@@ -30,6 +30,9 @@ Signatures:
 
 `compress` (dict option, `{compress: true}` or `{compress: false}`): `true` writes generation-2 (compressed) column files where the column is eligible; `false` writes generation 0; when absent each file inherits: generation 2 when its source is an encoded column or the destination's current file is generation 2, else generation 0. Unknown keys and a non-bool `compress` are a `domain` error, as is a second options dict. Linked and nested/list columns are always written uncompressed. A compressed file keeps its chunk zones and persists the column's hash, sort, bloom and dictionary index (`.idx.info` shows it), so a reload needs no rebuild.
 
+Compressed F32/F64 writes and whole-column materialization require default FP controls (nearest rounding, masked exceptions, no FTZ/DAZ) on every calling/executing thread. Rayforce never silently normalizes the host's controls. Detected unsupported controls return `fpenv`; restore supported controls before retrying. Detection is not a complete portable validator: see [the compressed floating-point environment contract](../storage/index.md#compressed-floating-point-environment) for conservative refusal scope, platform-specific checks, and embedder responsibilities.
+
+
 Returns `tbl` (retained), so the call can be threaded inside a larger expression.
 
 Errors: `type` (dir/sym not strings, tbl not a table), `domain` (paths empty / too long), and any `io`/`oom`/`corrupt` error code surfaced by the splayed writer.
