@@ -2869,7 +2869,21 @@ static test_result_t test_idict_filter_forged(void) {
     ST_Q_OK("(set TM (.db.splayed.get \"" ST_TMP "/ff2/\"))");
     ST_Q_OK("(set Z (at TM 's))");
     int32_t big = 300;
-    ST_PATCH(p, eh.index_off + dd.codes + 60000 * 4, &big, 4);
+    uint64_t bad_off = eh.index_off + dd.codes + 60000 * 4;
+    ST_PATCH(p, bad_off, &big, sizeof big);
+    /* The held materialized table must see the forged code too. A write
+     * through the file is not guaranteed to appear in an existing private
+     * mapping (notably on macOS). Forge its writable COW view explicitly;
+     * later fresh opens still exercise the patched file above. This keeps
+     * the code-reader-versus-decoded-copy assertion deterministic. */
+    ray_t* held_tbl = ray_eval_str("TM");
+    TEST_ASSERT_TRUE(held_tbl && !RAY_IS_ERR(held_tbl));
+    ray_t* held_col = ray_table_get_col_enc(held_tbl, ray_sym_intern("s", 1));
+    TEST_ASSERT_TRUE(held_col && held_col->type == RAY_ENCCOL);
+    ray_enccol_t* held = ray_enccol_of(held_col);
+    TEST_ASSERT_TRUE(bad_off <= held->size && sizeof big <= held->size - bad_off);
+    memcpy((uint8_t*)held->base + bad_off, &big, sizeof big);
+    ray_release(held_tbl);
     /* the file, exactly as the load spells it (see idict_groupby_forged) */
     char want[700];
     snprintf(want, sizeof want, "%s/s: DICT code 300 at row 60000 outside 0 .. 299", ray_test_tmp(ST_TMP "/ff2/"));
