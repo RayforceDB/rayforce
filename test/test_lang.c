@@ -1618,6 +1618,75 @@ static test_result_t test_eval_select_unary_arith_dag_admission(void) {
     PASS();
 }
 
+/* ---- Test: temporal modulo by an integer literal lowers to the DAG ----
+ * `(% temporal n)` keeps the left type in the builtin (ray_mod_fn), and
+ * the DAG's MOD kernel computes the same floor modulo on the raw counts,
+ * so compile_expr_dag lowers a temporal column by a non-null, nonzero
+ * integer literal to MOD cast back to the column's type.  A zero or null
+ * literal, a float literal, a divisor column, a temporal literal on the
+ * left and the other verbs decline (NULL) to the builtin. */
+static test_result_t test_eval_select_temporal_mod_dag_admission(void) {
+    ray_t* tbl = ray_eval_str(
+        "(table [d t ts i l] (list [2024.01.01 2024.01.02] "
+        "[10:00:00.000 11:00:00.000] "
+        "[2024.01.01D10:00:00.000000000 2024.01.02D10:00:00.000000000] "
+        "(as 'I32 [2 3]) [2 3]))");
+    TEST_ASSERT_NOT_NULL(tbl);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+
+    static const char* const cols[] = { "d", "t", "ts" };
+    static const int8_t col_t[] = { RAY_DATE, RAY_TIME, RAY_TIMESTAMP };
+    static const char* const lowers[] = {
+        "2", "-3", "2i", "2h", "true", "5000000000",
+    };
+    static const char* const declines[] = {
+        "0", "0i", "false", "0N", "2.5", "0.0", "i", "l", "d",
+        "2024.01.02",
+    };
+    for (size_t c = 0; c < sizeof cols / sizeof *cols; c++) {
+        for (size_t k = 0; k < sizeof lowers / sizeof *lowers + sizeof declines / sizeof *declines; k++) {
+            bool want = k < sizeof lowers / sizeof *lowers;
+            const char* rhs = want ? lowers[k] : declines[k - sizeof lowers / sizeof *lowers];
+            char src[64];
+            snprintf(src, sizeof src, "(%% %s %s)", cols[c], rhs);
+            ray_t* expr = ray_parse(src);
+            TEST_ASSERT_NOT_NULL(expr);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(expr));
+            ray_graph_t* g = ray_graph_new(tbl);
+            TEST_ASSERT_NOT_NULL(g);
+            ray_op_t* op = compile_expr_dag(g, expr);
+            TEST_ASSERT_FMT((op != NULL) == want, "%s: lowered=%d, want %d",
+                            src, op != NULL, want);
+            if (op) {
+                TEST_ASSERT_FMT(op->opcode == OP_CAST && op->out_type == col_t[c],
+                                "%s: opcode %d out_type %d", src,
+                                (int)op->opcode, (int)op->out_type);
+                ray_op_t* m = &g->nodes[op->in_id[0]];
+                TEST_ASSERT_FMT(m->opcode == OP_MOD, "%s: input opcode %d",
+                                src, (int)m->opcode);
+            }
+            ray_graph_free(g);
+            ray_release(expr);
+        }
+    }
+    static const char* const other[] = {
+        "(% 2024.01.01 2)", "(/ d 2)", "(div d 2)", "(+ d 1)", "(* t 2)", "(pow ts 2)",
+    };
+    for (size_t k = 0; k < sizeof other / sizeof *other; k++) {
+        ray_t* expr = ray_parse(other[k]);
+        TEST_ASSERT_NOT_NULL(expr);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(expr));
+        ray_graph_t* g = ray_graph_new(tbl);
+        TEST_ASSERT_NOT_NULL(g);
+        ray_op_t* op = compile_expr_dag(g, expr);
+        TEST_ASSERT_FMT(op == NULL, "%s: lowered", other[k]);
+        ray_graph_free(g);
+        ray_release(expr);
+    }
+    ray_release(tbl);
+    PASS();
+}
+
 /* ---- Test: OP_IN type-mismatch must not leak via atom probe ----
  * Deterministic regression: interns a sym so we know its numeric
  * ID N, builds an i64 column containing exactly N, then runs
@@ -9977,6 +10046,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/select_where", test_eval_select_where, lang_setup, lang_teardown },
     { "lang/eval/select_where_in_sym", test_eval_select_where_in_sym, lang_setup, lang_teardown },
     { "lang/eval/select_unary_arith_dag_admission", test_eval_select_unary_arith_dag_admission, lang_setup, lang_teardown },
+    { "lang/eval/select_temporal_mod_dag_admission", test_eval_select_temporal_mod_dag_admission, lang_setup, lang_teardown },
     { "lang/eval/select_where_in_i64", test_eval_select_where_in_i64, lang_setup, lang_teardown },
     { "lang/eval/select_where_in_mixed_numeric", test_eval_select_where_in_mixed_numeric, lang_setup, lang_teardown },
     { "lang/eval/select_where_in_nulls", test_eval_select_where_in_nulls, lang_setup, lang_teardown },

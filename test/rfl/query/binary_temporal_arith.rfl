@@ -5,10 +5,15 @@
 ;; dag_temporal_arith_needs_eval (src/ops/query.c) declined only + - * on a
 ;; DATE / TIME / TIMESTAMP operand.  `/`, `div` and `%` were lowered to the
 ;; DAG, which saw day / millisecond / nanosecond counts: `(/ d 2)` came back
-;; as F64 4383.0 and `(div d 2)` as I64 4383 where the builtin raises
-;; `cannot divide date by i64`, and `(% d 2)` came back as I64 [0 1 0] where
-;; the builtin keeps DATE.  Every arithmetic verb the DAG lowers now
-;; declines a temporal operand to the evaluator.
+;; as F64 4383.0 and `(div d 2)` as I64 4383 where the builtins raise
+;; `cannot divide date by i64` and `cannot div date by i64`, and `(% d 2)`
+;; came back as I64 [0 1 0] where the builtin keeps DATE.  Every arithmetic
+;; verb the DAG lowers now declines a temporal operand and leaves the
+;; builtin to the evaluator: select's fallback applies it row by row, an
+;; ordinary update to the whole columns.  The exception is `%` of a temporal
+;; column by a non-null, nonzero integer literal (dag_temporal_mod): the MOD
+;; kernel computes the builtin's floor modulo on the raw counts and the
+;; result is cast back to the column's type.
 
 (set F (table [d t p i j f k] (list [2024.01.01 2024.01.02 2024.01.03] [00:00:01.000 00:00:02.000 00:00:03.000] [2024.01.01D00:00:00.000000001 2024.01.02D00:00:00.000000002 2024.01.03D00:00:00.000000003] [1 2 3] (as 'I32 [1 2 3]) [1.5 2.0 2.5] [1 1 2])))
 
@@ -92,6 +97,48 @@
 (update {x: (/ d 2) from: F}) !- type
 (update {x: (div p 2) from: F}) !- type
 
+;; ── `%` by an integer literal in the DAG: the builtin's values and nulls ─────
+(set N (table [d t p z] (list [2024.01.01 0Nd 1999.12.30 1900.01.01] [00:00:01.003 0Nt 00:00:00.000 23:59:59.999] [2024.01.01D00:00:00.000000001 0Np 1990.01.01D00:00:00.000000007 1710.01.01D00:00:00.000000003] [0 3 -3 0])))
+(% (at N 'd) -3) -- [2000.01.01 0Nd 1999.12.30 1999.12.30]
+(at (select {x: (% d -3) from: N}) 'x) -- [2000.01.01 0Nd 1999.12.30 1999.12.30]
+(at (select {x: (% d 7) from: N}) 'x) -- (% (at N 'd) 7)
+(at (select {x: (% d 2h) from: N}) 'x) -- (% (at N 'd) 2h)
+(at (select {x: (% d 5000000000) from: N}) 'x) -- (% (at N 'd) 5000000000)
+(at (select {x: (% t -7i) from: N}) 'x) -- (% (at N 't) -7i)
+(at (select {x: (% t 86400000) from: N}) 'x) -- (% (at N 't) 86400000)
+(at (select {x: (% p 1000000007) from: N}) 'x) -- (% (at N 'p) 1000000007)
+(at (select {x: (% p -5000000000) from: N}) 'x) -- (% (at N 'p) -5000000000)
+(at (select {x: (% p true) from: N}) 'x) -- (% (at N 'p) true)
+(at (update {x: (% p -3) from: N}) 'x) -- (% (at N 'p) -3)
+(at (select {k: z from: N where: (== (% d -3) 1999.12.30)}) 'k) -- [-3 0]
+;; a zero or null divisor is a typed null, over a column without nulls too
+(set Z (table [d t p z] (list [2024.01.01 2024.01.02] [00:00:01.000 00:00:02.000] [2024.01.01D00:00:00.000000001 2024.01.02D00:00:00.000000002] [0 3])))
+(at (select {x: (% d 0) from: Z}) 'x) -- [0Nd 0Nd]
+(at (select {x: (% t 0i) from: Z}) 'x) -- [0Nt 0Nt]
+(at (select {x: (% p false) from: Z}) 'x) -- [0Np 0Np]
+(at (select {x: (% d 0N) from: Z}) 'x) -- [0Nd 0Nd]
+(at (update {x: (% p 0) from: Z}) 'x) -- [0Np 0Np]
+(at (select {x: (% d z) from: Z}) 'x) -- (% (at Z 'd) (at Z 'z))
+(at (select {x: (% p z) from: Z}) 'x) -- (% (at Z 'p) (at Z 'z))
+
+;; ── no rows: the builtin's typed empty result, not an empty LIST ────────────
+(set E (table [d t p i f] (list (as 'DATE []) (as 'TIME []) (as 'TIMESTAMP []) (as 'I64 []) (as 'F64 []))))
+(type (% (at E 'd) 2)) -- 'DATE
+(type (at (select {x: (% d 2) from: E}) 'x)) -- 'DATE
+(type (at (select {x: (% t 2) from: E}) 'x)) -- 'TIME
+(type (at (select {x: (% p 2) from: E}) 'x)) -- 'TIMESTAMP
+(type (at (select {x: (% d 2.0) from: E}) 'x)) -- 'DATE
+(type (at (select {x: (% t i) from: E}) 'x)) -- 'TIME
+(type (at (select {x: (% p f) from: E}) 'x)) -- 'TIMESTAMP
+(type (at (update {x: (% d 2) from: E}) 'x)) -- 'DATE
+(type (at (update {x: (% t 2.0) from: E}) 'x)) -- 'TIME
+(type (at (select {x: (% d 2) from: F where: (> i 5)}) 'x)) -- 'DATE
+(type (at (select {x: (% t 2.0) from: F where: (> i 5)}) 'x)) -- 'TIME
+(type (at (select {x: (% p j) from: F where: (> i 5)}) 'x)) -- 'TIMESTAMP
+(type (at (select {x: (+ d 1) from: E}) 'x)) -- 'DATE
+(type (at (select {x: (- d d) from: E}) 'x)) -- 'I32
+(type (at (select {x: (* t 2) from: E}) 'x)) -- 'TIME
+
 ;; ── splayed table ───────────────────────────────────────────────────────────
 (.sys.exec "rm -rf /tmp/rfl_binary_temporal_arith")
 (.db.splayed.set "/tmp/rfl_binary_temporal_arith/sp/t/" (table [a d] (list [1 2 3] [2024.01.05 2024.01.06 2024.01.07])) "/tmp/rfl_binary_temporal_arith/sp/.sym")
@@ -116,5 +163,7 @@
 (select {x: (div d a) from: _P}) !- type
 (at (select {x: (% date 2) from: _P where: (> a 1)}) 'x) -- [2000.01.01 2000.01.02 2000.01.02 2000.01.02]
 (at (select {n: (count a) from: _P by: {x: (% date 2)}}) 'x) -- [2000.01.01 2000.01.02]
+(at (select {n: (count a) from: _P by: {x: (% date 0)}}) 'x) -- [0Nd]
+(at (update {x: (% date 0) from: _P}) 'x) -- [0Nd 0Nd 0Nd 0Nd 0Nd]
 (select {a: a from: _P where: (> (/ date 2) 0)}) !- type
 (.sys.exec "rm -rf /tmp/rfl_binary_temporal_arith")
