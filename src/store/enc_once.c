@@ -177,6 +177,10 @@ ray_t* ray_enc_once_get(ray_enc_once_t* o, ray_t** slot, ray_enc_once_fn fn, voi
         *slot = v;
         atomic_store_explicit(&o->state, RAY_ENC_ONCE_DONE, memory_order_release);
         once_unlock(o);
+        /* fn returns a heap object, not the address of its output-only
+         * stack snapshot (enc_once.h). cppcheck propagates &fail through
+         * an opaque callback as a possible return value. */
+        // cppcheck-suppress returnDanglingLifetime
         return v;
     }
     o->snap = fail;

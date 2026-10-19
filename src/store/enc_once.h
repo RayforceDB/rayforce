@@ -50,6 +50,8 @@ typedef struct {
     ray_enc_snap_t snap;
 } ray_enc_once_t;
 
+/* The result is an independently allocated object, never `fail` or any
+ * storage within it. `fail` is an output-only, copied error snapshot. */
 typedef ray_t* (*ray_enc_once_fn)(void* ctx, ray_enc_snap_t* fail);
 
 void     ray_enc_once_init(ray_enc_once_t* o);

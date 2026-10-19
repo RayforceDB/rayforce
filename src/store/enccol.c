@@ -3858,6 +3858,9 @@ static bool dir_range_ok(int8_t type, const void* data, int64_t n, bool may_null
     default: return true;
     }
 #undef DIR_REDUCE
+    /* Each integer case returns inside DIR_REDUCE; keep the fallback
+     * explicit for analyzers that treat its do/while as fallthrough. */
+    return false;
 }
 
 bool ray_enccol_dir_vec_ok(const ray_enccol_t* e, int64_t c, int j) {

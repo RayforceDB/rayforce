@@ -854,7 +854,13 @@ ray_t* fp_eval_pred_rs(const fp_pred_t* p, int64_t start, int64_t end,
         }
         uint8_t any = 0;
         if (i == 0) for (int64_t r = 0; r < n; r++) any |= bits[r];
-        else        for (int64_t r = 0; r < n; r++) { bits[r] &= tmp[r]; any |= bits[r]; }
+        else for (int64_t r = 0; r < n; r++) {
+            /* Each non-error branch writes n bytes through dst == tmp:
+             * memset, fp_eval_cmp, or fp_bind_view's decided==2 view. */
+            // cppcheck-suppress legacyUninitvar
+            bits[r] &= tmp[r];
+            any |= bits[r];
+        }
         if (!any) break;                          /* the window is decided: all fail */
     }
     return NULL;

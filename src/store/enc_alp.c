@@ -355,7 +355,7 @@ static void alprd_plan_rb(const uint64_t* v, int n, int T, int rb, alprd_plan_t*
     const uint64_t m = alprd_mask(T);
     uint16_t s[RAY_ENC_VEC];
     for (int i = 0; i < n; i++) s[i] = (uint16_t)((v[i] & m) >> rb);
-    qsort(s, (size_t)n, 2, u16_cmp);
+    if (n > 1) qsort(s, (size_t)n, 2, u16_cmp);
     /* the eight most frequent left parts; ties: the smaller value */
     uint16_t val[8]; int cnt[8]; int nd = 0;
     for (int i = 0; i < n;) {
@@ -370,9 +370,9 @@ static void alprd_plan_rb(const uint64_t* v, int n, int T, int rb, alprd_plan_t*
         }
         i = j;
     }
-    qsort(val, (size_t)nd, 2, u16_cmp);                                /* strictly ascending */
+    if (nd > 1) qsort(val, (size_t)nd, 2, u16_cmp);                                /* strictly ascending */
     p->rb = rb; p->dict_n = nd; p->n_exc = 0;
-    memcpy(p->dict, val, (size_t)nd * 2);
+    if (nd > 0) memcpy(p->dict, val, (size_t)nd * 2);
     for (int i = 0; i < n; i++) {
         uint16_t l = (uint16_t)((v[i] & m) >> rb);
         int code = -1;
