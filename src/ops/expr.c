@@ -2653,8 +2653,9 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
             int64_t n = m.morsel_len;
             float* dst = (float*)ray_data(result) + out_off;
             if (in_type == RAY_F64) {
+                /* Saturate past the F32 range, as the `as` builtin does. */
                 const double* src = (const double*)m.morsel_ptr;
-                for (int64_t i = 0; i < n; i++) dst[i] = (float)src[i];
+                for (int64_t i = 0; i < n; i++) dst[i] = ray_cast_f64_to_f32_null(src[i]);
             } else if (in_type == RAY_F32) {
                 memcpy(dst, m.morsel_ptr, (size_t)n * sizeof(float));
             } else if (in_type == RAY_I64 || in_type == RAY_TIMESTAMP) {

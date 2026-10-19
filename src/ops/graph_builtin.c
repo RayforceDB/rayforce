@@ -209,7 +209,9 @@ ray_t* ray_graph_build_fn(ray_t** args, int64_t n) {
                                          n_nodes, n_nodes, true);
     if (!rel) {
         ray_release(edges);
-        return ray_error("oom", NULL);
+        /* The build gives up on an interrupt (csr.c); report that, not oom. */
+        return ray_interrupted() ? ray_error("cancel", "interrupted")
+                                 : ray_error("oom", NULL);
     }
 
     /* Optional: attach a weight column.  Algorithms that need edge weights

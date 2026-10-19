@@ -319,8 +319,10 @@ static bool dag_pow_type_admitted(int8_t t) {
  * raises `type` (#854), and SYM or GUID columns were read as interned ids
  * or bytes.  `neg`/`abs` also reject BOOL and U8, and the integer lanes of
  * `ceil`/`floor`/`round` returned garbage where the builtin is the
- * identity (round: the value as F64).  An operand outside the builtin's
- * set declines to the evaluator, which applies the builtin itself. */
+ * identity (round: the value as F64); compile_expr_dag lowers those to
+ * the operand and to a cast (dag_int_rounding below).  An operand outside
+ * the builtin's set declines to the evaluator, which applies the builtin
+ * itself. */
 static bool dag_unary_arith_type_admitted(const char* name, size_t len, int8_t t) {
     if (t <= 0) return true;  /* unknown/uninferred: let executor validate */
     if (RAY_IS_PARTED(t)) t = (int8_t)RAY_PARTED_BASETYPE(t);
@@ -334,6 +336,38 @@ static bool dag_unary_arith_type_admitted(const char* name, size_t len, int8_t t
         (len == 5 && (memcmp(name, "floor", 5) == 0 || memcmp(name, "round", 5) == 0)))
         return t == RAY_F32 || t == RAY_F64;
     return true;
+}
+
+/* `ceil`/`floor`/`round` of an integer operand (BOOL, U8, I16, I32, I64,
+ * as the builtins' is_numeric takes them): ceil and floor are the identity,
+ * type and nulls kept, and round is the value as F64, a null becoming 0Nf
+ * as `(as 'F64 x)` does.  The DAG computes both without a kernel: the
+ * operand node itself, or a cast to F64.  NULL for any other verb or
+ * operand type, which the regular admission then handles; a literal
+ * operand is left to it as well (the evaluator folds it, where a cast
+ * of an atom has no vector to run on).  The identity is taken only over
+ * a column or an I64 operand: the fused kernels compute narrower integer
+ * arithmetic in I64 lanes and return it as I64 (`(neg i)` over I32), so
+ * `(floor (neg i))` would lose the I32 the builtin keeps.  That case is
+ * left on the evaluator at its old cost (about 1.2 s over 10M rows,
+ * against 0.01 ms for the lowered forms).  The thing to fix is the
+ * widening: once a fused result over a narrow integer column comes back
+ * in the column's own width, the identity holds for any integer operand
+ * and the OP_SCAN / I64 condition below can go. */
+static ray_op_t* dag_int_rounding(ray_graph_t* g, const char* name, size_t len,
+                                  ray_op_t* arg) {
+    int8_t t = arg->out_type;
+    if (t <= 0 || arg->opcode == OP_CONST) return NULL;
+    if (RAY_IS_PARTED(t)) t = (int8_t)RAY_PARTED_BASETYPE(t);
+    if (t != RAY_BOOL && t != RAY_U8 && t != RAY_I16 &&
+        t != RAY_I32 && t != RAY_I64)
+        return NULL;
+    if ((len == 4 && memcmp(name, "ceil", 4) == 0) ||
+        (len == 5 && memcmp(name, "floor", 5) == 0))
+        return t == RAY_I64 || arg->opcode == OP_SCAN ? arg : NULL;
+    if (len == 5 && memcmp(name, "round", 5) == 0)
+        return ray_cast(g, arg, RAY_F64);
+    return NULL;
 }
 
 static bool dag_type_is_temporal(int8_t t) {
@@ -2277,6 +2311,8 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
                 if (dag_unary_numeric_name(fname, fname_len) &&
                     !dag_numeric_type_admitted(arg->out_type))
                     return NULL;
+                ray_op_t* r = dag_int_rounding(g, fname, fname_len, arg);
+                if (r) return r;
                 if (!dag_unary_arith_type_admitted(fname, fname_len, arg->out_type))
                     return NULL;
                 return uctor(g, arg);
@@ -11377,7 +11413,7 @@ ray_t* query_cd_gate_where_rows(ray_t* tbl, ray_t* where_expr, int64_t n_table,
         for (int64_t ch = 0; ch < nch; ch++)
             if ((ss.scan.gate[ch >> 6] >> (ch & 63)) & 1) pass[n_pass++] = (uint32_t)ch;
         if (n_pass == nch) {
-            scratch_free(pass_hdr); pass = NULL;   /* nothing ruled out */
+            scratch_free(pass_hdr); pass_hdr = NULL; pass = NULL;   /* nothing ruled out */
         } else {
             P = n_pass << lg;
             if (n_pass > 0 && pass[n_pass - 1] == (uint32_t)(nch - 1))

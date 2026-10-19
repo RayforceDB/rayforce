@@ -40,6 +40,7 @@
 #include <rayforce.h>
 #include "mem/heap.h"
 #include "store/csr.h"
+#include "core/pool.h"
 #include "lang/internal.h"
 #include <string.h>
 
@@ -531,6 +532,41 @@ static test_result_t test_graph_pagerank_direct(void) {
 
     ray_release(result);
     ray_release(h);
+    ray_release(sym_src); ray_release(sym_dst);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* A build cut short by an interrupt must report "cancel", not the "oom"
+ * that a NULL relation otherwise means (the parallel CSR build gives up on
+ * a cancelled dispatch; the threshold is lowered so the small table takes
+ * that path). */
+static test_result_t test_graph_build_cancel(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+    if (!ray_pool_par_dispatch_ok(ray_pool_get(), 1, 0)) {
+        ray_sym_destroy(); ray_heap_destroy();
+        SKIP("no pool worker");
+    }
+
+    ray_t* tbl = make_i64_edge_table();
+    ray_t* sym_src = ray_sym(ray_sym_intern("src", 3));
+    ray_t* sym_dst = ray_sym(ray_sym_intern("dst", 3));
+    ray_t* build_args[3] = { tbl, sym_src, sym_dst };
+
+    int64_t saved = ray_csr_par_min_edges;
+    ray_csr_par_min_edges = 0;
+    ray_request_interrupt();
+    ray_t* h = ray_graph_build_fn(build_args, 3);
+    ray_clear_interrupt();
+    ray_csr_par_min_edges = saved;
+
+    TEST_ASSERT_TRUE(RAY_IS_ERR(h));
+    TEST_ASSERT_STR_EQ(ray_err_code(h), "cancel");
+    ray_error_free(h);
+
     ray_release(sym_src); ray_release(sym_dst);
     ray_release(tbl);
     ray_sym_destroy();
@@ -2613,6 +2649,7 @@ const test_entry_t graph_builtin_entries[] = {
     { "graph_builtin/handle_block_copy",    test_graph_handle_block_copy,    NULL, NULL },
     { "graph_builtin/pagerank_direct",      test_graph_pagerank_direct,      NULL, NULL },
     { "graph_builtin/cancel",               test_graph_cancel,               NULL, NULL },
+    { "graph_builtin/build_cancel",         test_graph_build_cancel,         NULL, NULL },
     { "graph_builtin/build_widen_i64_w",    test_graph_build_widen_i64_weight, NULL, NULL },
     { "graph_builtin/atom_to_i64_narrow",   test_atom_to_i64_narrow,         NULL, NULL },
     { "graph_builtin/pagerank_bad_iter",    test_pagerank_bad_iter_type,     NULL, NULL },

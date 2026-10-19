@@ -29,6 +29,7 @@ The `as` function performs explicit type conversion. It takes a type symbol and 
 | `'i32` | 32-bit integer | Standard integer |
 | `'i64` | 64-bit integer | Long integer (default) |
 | `'u8` | unsigned 8-bit | Byte values |
+| `'f32` | 32-bit float | Single precision; an f64 past its range saturates to ±3.40e+38 |
 | `'f64` | 64-bit float | Double precision (default) |
 | `'b8` | Boolean | true / false |
 | `'str` | String | Variable-length text |
@@ -208,6 +209,8 @@ Null values propagate through casts. A typed null in one type becomes a typed nu
     - `0Nl` — null i64
     - `0Nh` — null i16
     - `0Nf` — null f64
+    - `0Ne` — null f32
+    - `0Ng` — null guid (the all-zero GUID)
     - `0Nd` — null date
     - `0Nt` — null time
     - `0Np` — null timestamp
