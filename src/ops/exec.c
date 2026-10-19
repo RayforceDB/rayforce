@@ -1311,7 +1311,7 @@ static ray_t* parted_result_validate(ray_t* tbl, ray_t* counts_src);
 /* Debug builds check that a parted column flattened out of a table has the
  * table's row count, its MAPCOMMON total (#724: a short flat column was read
  * past its end).  Release builds compile the check out. */
-#ifdef DEBUG
+#if defined(DEBUG) && !defined(NDEBUG)
 #include <assert.h>
 static int64_t dbg_mapcommon_rows(ray_t* tbl) {
     if (!tbl || RAY_IS_ERR(tbl) || tbl->type != RAY_TABLE) return -1;
