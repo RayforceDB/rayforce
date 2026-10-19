@@ -629,7 +629,11 @@ static ray_t* enc_dict_validate(void* ctx, ray_enc_snap_t* fail) {
         if (dict_len != 8 + ray_enc_pad8((uint64_t)n * esz)) { why = "VALUE_DICT entry size"; goto bad; }
         if (!all_zero(d + 8 + (size_t)n * esz, (size_t)(ray_enc_pad8((uint64_t)n * esz) - (uint64_t)n * esz))) { why = "VALUE_DICT entry padding"; goto bad; }
         ray_t* vals = ray_vec_new(RAY_I64, n);
-        if (!vals || RAY_IS_ERR(vals)) { ray_enc_snap_set(fail, "oom", "column %s: VALUE_DICT", e->path); return NULL; }
+        if (!vals || RAY_IS_ERR(vals)) {
+            ray_error_free(vals);  /* vec_new can return an owned error, not just NULL */
+            ray_enc_snap_set(fail, "oom", "column %s: VALUE_DICT", e->path);
+            return NULL;
+        }
         vals->len = n;
         uint64_t* out = (uint64_t*)ray_data(vals);
         for (uint32_t i = 0; i < n; i++) {
