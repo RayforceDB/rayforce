@@ -76,4 +76,9 @@ static inline int64_t* ray_csr_neighbors(ray_csr_t* csr, int64_t node, int64_t* 
     return &t[o[node]];
 }
 
+/* Edge count from which ray_rel_from_edges / ray_rel_build count and
+ * scatter on the pool (csr.c); below it the build is serial.  Tests move
+ * it to force one path or the other. */
+extern int64_t ray_csr_par_min_edges;
+
 #endif /* RAY_CSR_H */
