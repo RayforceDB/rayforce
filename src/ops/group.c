@@ -7368,7 +7368,7 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                              * width — the same payload
                              * ray_vec_set_null_checked writes on the serial
                              * emit path.  The HAS_NULLS bit these three need
-                             * (par_set_null does not write it for them) is
+                             * (not derived by the numeric sentinel rescan) is
                              * seeded from the source column BEFORE the
                              * dispatch, so no worker touches attrs here. */
                             memset(dst + doff, 0, esz);
@@ -19245,9 +19245,9 @@ v2_emit:;
             new_col->len = (int64_t)total_grps;
             /* Seed HAS_NULLS from the source key column, exactly as the
              * gather-based emit does (agg_gather_key_col).  radix_phase3_fn
-             * runs in parallel without writing header flags; sentinel
-             * flags are finalized afterwards. Setting this once here — serially,
-             * before the dispatch — keeps SYM/STR/GUID null keys flagged
+             * runs in parallel without changing headers; sentinel types
+             * are finalized after the dispatch. Seeding this bit serially
+             * before the dispatch keeps SYM/STR/GUID null keys flagged
              * without a worker ever storing into a shared attrs byte that
              * other workers read non-atomically via ray_data().
              *
