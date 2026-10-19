@@ -131,6 +131,8 @@ sentinel for their type:
 0Ni   ; i32 null
 0Nh   ; i16 null
 0Nf   ; f64 null
+0Ne   ; f32 null
+0Ng   ; guid null (the all-zero GUID)
 0Nd   ; date null
 0Nt   ; time null
 0Np   ; timestamp null

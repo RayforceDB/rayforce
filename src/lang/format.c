@@ -416,7 +416,7 @@ static void fmt_obj(fmt_buf_t* b, ray_t* obj, int mode);
 
 /* ===== Null literal display (type → "0Nx" string) ===== */
 
-static const char* null_literal(int8_t type) {
+const char* ray_fmt_null_literal(int8_t type) {
     switch (type) {
     case RAY_BOOL:      return "0Nb";
     case RAY_U8:        return "0Nu";
@@ -444,7 +444,7 @@ static void fmt_raw_elem(fmt_buf_t* b, ray_t* vec, int64_t idx) {
      * distinct null (empty and null are the same value), so it renders
      * as "" via the RAY_STR case below rather than a 0Nc literal. */
     if (vec->type != RAY_STR && ray_vec_is_null(vec, idx)) {
-        fmt_puts(b, null_literal(vec->type));
+        fmt_puts(b, ray_fmt_null_literal(vec->type));
         return;
     }
 
@@ -949,7 +949,7 @@ static void fmt_missing_cell(fmt_buf_t* b, int8_t type) {
     case RAY_BOOL: fmt_bool(b, 0); return;
     case RAY_U8:   fmt_u8(b, 0); return;
     case RAY_STR:  fmt_puts(b, "\"\""); return;
-    default:       fmt_puts(b, null_literal(type)); return;
+    default:       fmt_puts(b, ray_fmt_null_literal(type)); return;
     }
 }
 
@@ -1545,7 +1545,7 @@ static void fmt_obj(fmt_buf_t* b, ray_t* obj, int mode) {
         /* STR/SYM use their empty literals as canonical null spellings, so
          * retain those parseable representations instead of inventing 0Nc/0Ns. */
         if (-type != RAY_STR && -type != RAY_SYM && RAY_ATOM_IS_NULL(obj)) {
-            fmt_puts(b, null_literal(-type));
+            fmt_puts(b, ray_fmt_null_literal(-type));
             return;
         }
         /* Atom: type is negated */

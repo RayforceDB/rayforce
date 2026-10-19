@@ -57,6 +57,11 @@ void ray_fmt_print(FILE* fp, ray_t* obj, int mode);
  * ray_error_free); *cause is NULL otherwise. */
 ray_err_t ray_fmt_write(FILE* fp, ray_t* obj, ray_t** cause);
 
+/* The printed null of a vector or atom of `type` (a positive type tag):
+ * 0Nl, 0Ne, 0Ng, ...  The one table every printer uses, so a null reads
+ * back the same way whichever printer wrote it. */
+const char* ray_fmt_null_literal(int8_t type);
+
 /* Display settings */
 void ray_fmt_set_precision(int digits);
 void ray_fmt_set_width(int cols);
