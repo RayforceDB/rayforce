@@ -1,0 +1,36 @@
+;; F32 and GUID nulls read back: 0Ne and 0Ng parse, and every printer
+;; writes them that way (#881).
+
+;; ----- 1. Literals -----
+
+(type 0Ne)          -- 'f32
+(nil? 0Ne)          -- true
+(type 0Ng)          -- 'guid
+(nil? 0Ng)          -- true
+(type [0Ne 0Ne])    -- 'F32
+(nil? [0Ne 0Ne])    -- [true true]
+(type [0Ng 0Ng])    -- 'GUID
+(count [0Ng 0Ng])   -- 2
+
+;; ----- 2. The literal is the value a cast produces -----
+
+0Ne                 -- (as 'F32 0Nl)
+0Ng                 -- (as 'GUID 0Nl)
+0Ng                 -- (as 'GUID "00000000-0000-0000-0000-000000000000")
+[0Ng]               -- (enlist (as 'GUID 0Nl))
+
+;; ----- 3. Every printer writes the literal -----
+
+(format "%" 0Ne)                      -- "0Ne"
+(format "%" 0Ng)                      -- "0Ng"
+(format "%" (as 'GUID 0Nl))           -- "0Ng"
+(format "%" [0Ne 0Ne])                -- "[0Ne 0Ne]"
+(format "%" [0Ng 0Ng])                -- "[0Ng 0Ng]"
+
+;; ----- 4. as 'F32 keeps nulls -----
+;; A non-null F32 element prints as an F64 literal (Rayfall has no F32
+;; number literal), so only an all-null F32 vector reads back as F32.
+
+(type (as 'F32 [1 0Nl 3]))            -- 'F32
+(nil? (as 'F32 [1 0Nl 3]))            -- [false true false]
+(format "%" (as 'F32 [1 0Nl 3]))      -- "[1.0 0Ne 3.0]"
