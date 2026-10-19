@@ -1625,6 +1625,54 @@ static test_result_t test_eval_select_unary_arith_dag_admission(void) {
  * integer literal to MOD cast back to the column's type.  A zero or null
  * literal, a float literal, a divisor column, a temporal literal on the
  * left and the other verbs decline (NULL) to the builtin. */
+/* An empty operand makes the atomic mappers probe `fn` on a fabricated
+ * zero atom to learn the result type.  A probe the builtin rejects —
+ * `(/ empty_DATE 2)`, `(neg empty_DATE)` — used to leak its error object
+ * and leave its message behind.  Repeated, through the builtins and
+ * through select's empty-result probe, nothing stays allocated and no
+ * message is left over; the valid probe is the control. */
+static test_result_t test_eval_empty_probe_error_ownership(void) {
+    ray_t* setup = ray_eval_str("(set _EP (table [d] (list (as 'DATE []))))");
+    TEST_ASSERT_NOT_NULL(setup);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+    ray_release(setup);
+    static const char* const exprs[] = {
+        "(+ (at _EP 'd) 2)",                          /* valid: control */
+        "(/ (at _EP 'd) 2)",                          /* binary, rejected */
+        "(div (at _EP 'd) 2)",
+        "(neg (at _EP 'd))",                          /* unary, rejected */
+        "(at (select {x: (/ d 2) from: _EP}) 'x)",    /* select's probe */
+        "(at (select {x: (neg d) from: _EP}) 'x)",
+    };
+    for (size_t e = 0; e < sizeof(exprs) / sizeof(exprs[0]); e++) {
+        /* warm up: first-use allocations (symbols, caches) are not a leak */
+        for (int i = 0; i < 4; i++) {
+            ray_t* r = ray_eval_str(exprs[e]);
+            if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+        }
+        ray_error_clear();
+        ray_mem_stats_t s0, s1;
+        ray_mem_stats(&s0);
+        for (int i = 0; i < 1000; i++) {
+            ray_t* r = ray_eval_str(exprs[e]);
+            TEST_ASSERT_NOT_NULL(r);
+            TEST_ASSERT_FMT(!RAY_IS_ERR(r), "%s: %s", exprs[e], ray_error_msg());
+            TEST_ASSERT_FMT(ray_len(r) == 0, "%s: %lld rows", exprs[e], (long long)ray_len(r));
+            ray_release(r);
+        }
+        ray_mem_stats(&s1);
+        TEST_ASSERT_FMT(s1.bytes_allocated <= s0.bytes_allocated,
+                        "%s: %zu bytes left allocated after 1000 probes",
+                        exprs[e], s1.bytes_allocated - s0.bytes_allocated);
+        const char* msg = ray_error_msg();   /* NULL when no message is set */
+        TEST_ASSERT_FMT(!msg || !msg[0], "%s: stale message \"%s\"",
+                        exprs[e], msg ? msg : "");
+    }
+    ray_t* drop = ray_eval_str("(set _EP 0)");
+    if (drop && !RAY_IS_ERR(drop)) ray_release(drop);
+    PASS();
+}
+
 static test_result_t test_eval_select_temporal_mod_dag_admission(void) {
     ray_t* tbl = ray_eval_str(
         "(table [d t ts i l] (list [2024.01.01 2024.01.02] "
@@ -10047,6 +10095,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/select_where_in_sym", test_eval_select_where_in_sym, lang_setup, lang_teardown },
     { "lang/eval/select_unary_arith_dag_admission", test_eval_select_unary_arith_dag_admission, lang_setup, lang_teardown },
     { "lang/eval/select_temporal_mod_dag_admission", test_eval_select_temporal_mod_dag_admission, lang_setup, lang_teardown },
+    { "lang/eval/empty_probe_error_ownership", test_eval_empty_probe_error_ownership, lang_setup, lang_teardown },
     { "lang/eval/select_where_in_i64", test_eval_select_where_in_i64, lang_setup, lang_teardown },
     { "lang/eval/select_where_in_mixed_numeric", test_eval_select_where_in_mixed_numeric, lang_setup, lang_teardown },
     { "lang/eval/select_where_in_nulls", test_eval_select_where_in_nulls, lang_setup, lang_teardown },

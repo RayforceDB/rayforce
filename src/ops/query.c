@@ -7436,7 +7436,7 @@ static ray_t* select_fallback_empty_col(ray_t* expr, ray_t* tbl) {
             if (__VM->raise_val) { ray_release(__VM->raise_val); __VM->raise_val = NULL; }
             if (__VM->return_val) { ray_release(__VM->return_val); __VM->return_val = NULL; }
             ray_clear_error_trace();
-            __VM->err.msg[0] = '\0';
+            ray_error_clear();   /* both the VM's and ray_error_msg()'s copy */
         } else if (col) {
             ray_release(col);
         }

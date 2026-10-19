@@ -875,14 +875,23 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
         ray_t* ra = right_coll ? zero_atom_for_elem_type(right) : right;
         ray_t* probe = (la && ra && !RAY_IS_ERR(la) && !RAY_IS_ERR(ra))
                        ? fn(la, ra) : NULL;
-        if (left_coll  && la) ray_release(la);
-        if (right_coll && ra) ray_release(ra);
+        /* The probe and the fabricated operands are ours.  A failed
+         * probe — `(/ empty_DATE 2)`: ray_div_fn rejects the fabricated
+         * DATE — or a failed fabrication is freed and its message
+         * cleared; the empty result keeps its I64 fallback type.  A
+         * caller's own operand (not fabricated) is not touched. */
+        bool failed = (probe && RAY_IS_ERR(probe)) ||
+                      (left_coll  && la && RAY_IS_ERR(la)) ||
+                      (right_coll && ra && RAY_IS_ERR(ra));
+        if (left_coll  && la) { if (RAY_IS_ERR(la)) ray_error_free(la); else ray_release(la); }
+        if (right_coll && ra) { if (RAY_IS_ERR(ra)) ray_error_free(ra); else ray_release(ra); }
         if (probe && !RAY_IS_ERR(probe) && probe->type < 0) {
             int8_t t = (int8_t)(-probe->type);
             ray_release(probe);
             return ray_vec_new(t, 0);
         }
-        if (probe && !RAY_IS_ERR(probe)) ray_release(probe);
+        if (probe) { if (RAY_IS_ERR(probe)) ray_error_free(probe); else ray_release(probe); }
+        if (failed) ray_error_clear();
         return ray_vec_new(RAY_I64, 0);
     }
 
@@ -1455,16 +1464,20 @@ ray_t* atomic_map_unary(ray_unary_fn fn, ray_t* arg) {
     if (len == 0) {
         /* Empty — fabricate a zero atom of the element type and run
          * `fn` to learn the output type; fall back to I64 if the
-         * probe can't resolve a typed atom. */
+         * probe can't resolve a typed atom.  The probe is ours: a
+         * failed one (or a failed fabricated operand) is freed and its
+         * message cleared, since only the type is wanted from it. */
         ray_t* z = zero_atom_for_elem_type(arg);
         ray_t* probe = (z && !RAY_IS_ERR(z)) ? fn(z) : NULL;
-        if (z) ray_release(z);
+        bool failed = (z && RAY_IS_ERR(z)) || (probe && RAY_IS_ERR(probe));
+        if (z) { if (RAY_IS_ERR(z)) ray_error_free(z); else ray_release(z); }
         if (probe && !RAY_IS_ERR(probe) && probe->type < 0) {
             int8_t t = (int8_t)(-probe->type);
             ray_release(probe);
             return ray_vec_new(t, 0);
         }
-        if (probe && !RAY_IS_ERR(probe)) ray_release(probe);
+        if (probe) { if (RAY_IS_ERR(probe)) ray_error_free(probe); else ray_release(probe); }
+        if (failed) ray_error_clear();
         return ray_vec_new(RAY_I64, 0);
     }
 
