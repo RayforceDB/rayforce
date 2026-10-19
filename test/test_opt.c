@@ -59,6 +59,229 @@ static ray_t* make_test_table(void) {
     return tbl;
 }
 
+/* Direct proof fixtures intentionally do not execute or optimize malformed DAGs. */
+static test_result_t test_subset_proof_pointwise(void) {
+    ray_heap_init();
+    ray_t* tbl = make_test_table();
+    int64_t labels[10];
+    for (int i = 0; i < 10; i++) labels[i] = ray_sym_intern("abc", 3);
+    ray_t* strings = ray_vec_from_raw(RAY_SYM, labels, 10);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("label", 5), strings);
+    ray_release(strings);
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* x = ray_scan(g, "v1");
+    ray_op_t* c = ray_const_i64(g, 2);
+    ray_op_t* add = ray_add(g, x, c);
+    ray_op_t* cmp = ray_gt(g, add, c);
+    ray_op_t* shared = ray_and(g, cmp, cmp);
+    TEST_ASSERT_TRUE(ray_expr_subset_invariant(g, shared->id));
+    ray_op_t* scalar = ray_add(g, c, c);
+    TEST_ASSERT_TRUE(ray_expr_subset_invariant(g, scalar->id));
+    ray_op_t* text = ray_const_str(g, "ab*", 3);
+    ray_op_t* strcol = ray_scan(g, "label");
+    ray_op_t* upper = ray_upper(g, strcol);
+    ray_op_t* like = ray_like(g, upper, text);
+    TEST_ASSERT_TRUE(ray_expr_subset_invariant(g, like->id));
+    ray_op_t* ilike = ray_ilike(g, strcol, text);
+    TEST_ASSERT_TRUE(ray_expr_subset_invariant(g, ilike->id));
+    ray_op_t* args[] = {strcol, text};
+    ray_op_t* concat = ray_concat(g, args, 2);
+    TEST_ASSERT_TRUE(ray_expr_subset_invariant(g, concat->id));
+    ray_op_t* length = ray_strlen(g, text);
+    TEST_ASSERT_TRUE(ray_expr_subset_invariant(g, length->id));
+    /* Same table object still has alternate-source provenance. */
+    uint16_t tid = ray_graph_add_table(g, tbl);
+    ray_op_t* foreign = ray_scan_table(g, tid, "v1");
+    TEST_ASSERT_FALSE(ray_expr_subset_invariant(g, foreign->id));
+    TEST_ASSERT_FALSE(ray_expr_subset_invariant(NULL, 0));
+    TEST_ASSERT_FALSE(ray_expr_subset_invariant(g, RAY_OP_NONE));
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+static test_result_t test_subset_proof_membership_roles(void) {
+    ray_heap_init();
+    ray_t* tbl = make_test_table();
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* x = ray_scan(g, "v1");
+    ray_op_t* c = ray_const_i64(g, 1);
+    int64_t raw[] = {1, 2, 3};
+    ray_t* v = ray_vec_from_raw(RAY_I64, raw, 3);
+    ray_op_t* set = ray_const_vec(g, v);
+    ray_release(v);
+    ray_op_t* in = ray_in(g, x, set);
+    ray_op_t* notin = ray_not_in(g, x, set);
+    TEST_ASSERT_TRUE(ray_expr_subset_invariant(g, in->id));
+    TEST_ASSERT_TRUE(ray_expr_subset_invariant(g, notin->id));
+    TEST_ASSERT_FALSE(ray_expr_subset_invariant(g, set->id));
+    ray_op_t* misuse = ray_eq(g, x, set);
+    ray_op_t* both = ray_and(g, in, misuse);
+    TEST_ASSERT_FALSE(ray_expr_subset_invariant(g, both->id));
+    /* Set success in one edge/call must never certify a vector value edge. */
+    TEST_ASSERT_TRUE(ray_expr_subset_invariant(g, in->id));
+    TEST_ASSERT_FALSE(ray_expr_subset_invariant(g, misuse->id));
+    ray_op_t* scalar_in = ray_in(g, c, set);
+    ray_op_t* column_set = ray_in(g, x, x);
+    TEST_ASSERT_FALSE(ray_expr_subset_invariant(g, scalar_in->id));
+    TEST_ASSERT_FALSE(ray_expr_subset_invariant(g, column_set->id));
+    v = ray_vec_from_raw(RAY_I64, raw, 1);
+    ray_op_t* onevec = ray_const_vec(g, v);
+    ray_release(v);
+    TEST_ASSERT_FALSE(ray_expr_subset_invariant(g, onevec->id));
+    v = ray_vec_new(RAY_I64, 0);
+    ray_op_t* empty = ray_const_vec(g, v);
+    ray_release(v);
+    ray_op_t* empty_in = ray_in(g, x, empty);
+    TEST_ASSERT_TRUE(ray_expr_subset_invariant(g, empty_in->id));
+    v = ray_list_new(0);
+    ray_op_t* list = ray_const_vec(g, v);
+    ray_release(v);
+    ray_op_t* list_in = ray_in(g, x, list);
+    TEST_ASSERT_FALSE(ray_expr_subset_invariant(g, list_in->id));
+    ray_op_t* table = ray_const_table(g, tbl);
+    TEST_ASSERT_FALSE(ray_expr_subset_invariant(g, table->id));
+    /* ray_is_atom also accepts positive object types: those are not data. */
+    ray_op_ext_t* ce = find_ext(g, c->id);
+    int8_t saved_type = ce->literal->type;
+    ce->literal->type = RAY_UNARY;
+    TEST_ASSERT_FALSE(ray_expr_subset_invariant(g, c->id));
+    ce->literal->type = saved_type;
+    TEST_ASSERT_TRUE(ray_expr_subset_invariant(g, c->id));
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+static test_result_t test_subset_proof_hidden_crossrow(void) {
+    ray_heap_init();
+    ray_t* tbl = make_test_table();
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* zero = ray_const_i64(g, 0); /* ID 0 is a required third child */
+    TEST_ASSERT_EQ_I(zero->id, 0);
+    ray_op_t* x = ray_scan(g, "v1");
+    ray_op_t* safe = ray_gt(g, x, zero);
+    ray_op_t* choose = ray_if(g, safe, x, zero);
+    TEST_ASSERT_TRUE(ray_expr_subset_invariant(g, choose->id));
+    ray_op_ext_t* e = find_ext(g, choose->id);
+    e->third_in = RAY_OP_NONE;
+    TEST_ASSERT_FALSE(ray_expr_subset_invariant(g, choose->id));
+    e->third_in = 0;
+    TEST_ASSERT_TRUE(ray_expr_subset_invariant(g, choose->id));
+    ray_op_t* scalar_cond = ray_const_bool(g, true);
+    ray_op_t* ambiguous = ray_if(g, scalar_cond, x, zero);
+    TEST_ASSERT_FALSE(ray_expr_subset_invariant(g, ambiguous->id));
+    ray_op_t* avg = ray_avg(g, x);
+    ray_op_t* running = ray_sums_op(g, x);
+    ray_op_t* badavg = ray_gt(g, x, avg);
+    ray_op_t* badrun = ray_gt(g, running, zero);
+    ray_op_t* nest = ray_and(g, safe, safe);
+    ray_op_t* whole = ray_and(g, nest, badavg);
+    TEST_ASSERT_FALSE(ray_expr_subset_invariant(g, whole->id));
+    whole = ray_and(g, badrun, nest);
+    TEST_ASSERT_FALSE(ray_expr_subset_invariant(g, whole->id));
+    e->third_in = badrun->id;
+    TEST_ASSERT_FALSE(ray_expr_subset_invariant(g, choose->id));
+    e->third_in = badavg->id;
+    TEST_ASSERT_FALSE(ray_expr_subset_invariant(g, choose->id));
+    ray_op_t* filter = ray_filter(g, x, safe);
+    TEST_ASSERT_FALSE(ray_expr_subset_invariant(g, filter->id));
+    ray_op_t* text = ray_const_str(g, "x", 1);
+    ray_op_t* args[] = {text, text, badrun};
+    ray_op_t* concat = ray_concat(g, args, 3);
+    TEST_ASSERT_FALSE(ray_expr_subset_invariant(g, concat->id));
+    /* Even safe long CONCAT is refused: no recorded tail allocation size. */
+    args[2] = text;
+    concat = ray_concat(g, args, 3);
+    TEST_ASSERT_FALSE(ray_expr_subset_invariant(g, concat->id));
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+static test_result_t test_subset_proof_malformed_and_cycles(void) {
+    ray_heap_init();
+    ray_t* tbl = make_test_table();
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* x = ray_scan(g, "v1");
+    ray_op_t* c = ray_const_i64(g, 1);
+    ray_op_t* pred = ray_gt(g, x, c);
+    uint32_t pid = pred->id;
+    TEST_ASSERT_TRUE(ray_expr_subset_invariant(g, pid));
+    x->flags |= OP_FLAG_DEAD;
+    TEST_ASSERT_FALSE(ray_expr_subset_invariant(g, pid));
+    x->flags &= ~OP_FLAG_DEAD;
+    x->flags |= OP_FLAG_INVALID_SCAN;
+    TEST_ASSERT_FALSE(ray_expr_subset_invariant(g, pid));
+    x->flags &= ~OP_FLAG_INVALID_SCAN;
+    pred->arity = 1;
+    TEST_ASSERT_FALSE(ray_expr_subset_invariant(g, pid));
+    pred->arity = 2;
+    pred->in_id[1] = g->node_count;
+    TEST_ASSERT_FALSE(ray_expr_subset_invariant(g, pid));
+    pred->in_id[1] = pid;
+    TEST_ASSERT_FALSE(ray_expr_subset_invariant(g, pid)); /* self cycle */
+    pred->in_id[1] = c->id;
+    ray_op_t* neg = ray_neg(g, pred);
+    pred->in_id[1] = neg->id;
+    TEST_ASSERT_FALSE(ray_expr_subset_invariant(g, pid)); /* two-node cycle */
+    pred->in_id[1] = c->id;
+    TEST_ASSERT_TRUE(ray_expr_subset_invariant(g, pid));
+    uint32_t saved_id = x->id;
+    x->id = c->id;
+    TEST_ASSERT_FALSE(ray_expr_subset_invariant(g, pid));
+    x->id = saved_id;
+    ray_op_ext_t* xe = find_ext(g, x->id);
+    uint16_t source = UINT16_MAX;
+    memcpy(xe->base.pad, &source, sizeof(source));
+    TEST_ASSERT_FALSE(ray_expr_subset_invariant(g, pid));
+    source = 0;
+    memcpy(xe->base.pad, &source, sizeof(source));
+    /* Unused input slots may be zero; only required edges are traversed. */
+    x->in_id[0] = x->in_id[1] = 0;
+    TEST_ASSERT_TRUE(ray_expr_subset_invariant(g, pid));
+    ray_t* literal = find_ext(g, c->id)->literal;
+    find_ext(g, c->id)->literal = NULL;
+    TEST_ASSERT_FALSE(ray_expr_subset_invariant(g, pid));
+    find_ext(g, c->id)->literal = literal;
+    uint32_t ext_count = g->ext_count;
+    g->ext_count = 0;
+    TEST_ASSERT_FALSE(ray_expr_subset_invariant(g, pid));
+    g->ext_count = ext_count;
+    TEST_ASSERT_TRUE(ray_expr_subset_invariant(g, pid));
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+static test_result_t test_subset_proof_budgets(void) {
+    ray_heap_init();
+    ray_t* tbl = make_test_table();
+    ray_graph_t* g = ray_graph_new(tbl);
+    uint32_t root = ray_scan(g, "v1")->id;
+    for (int i = 0; i < 63; i++) root = ray_neg(g, &g->nodes[root])->id;
+    TEST_ASSERT_TRUE(ray_expr_subset_invariant(g, root));
+    root = ray_neg(g, &g->nodes[root])->id;
+    TEST_ASSERT_FALSE(ray_expr_subset_invariant(g, root));
+    while (g->node_count < 4096) (void)ray_const_i64(g, 1);
+    TEST_ASSERT_TRUE(ray_expr_subset_invariant(g, 0));
+    (void)ray_const_i64(g, 1);
+    TEST_ASSERT_FALSE(ray_expr_subset_invariant(g, 0));
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 /*
  * Test: filter with AND-combined predicates in "wrong" order.
  *
@@ -2633,7 +2856,82 @@ static test_result_t test_type_infer_unary(void) {
     PASS();
 }
 
+/* A source-domain-dependent predicate is a boundary, not a rankable cheap
+ * comparison.  The equality on AVG would otherwise sort ahead of a range. */
+static test_result_t test_filter_domain_barriers(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+    ray_t* tbl = make_test_table();
+    ray_graph_t* g = ray_graph_new(tbl);
+    uint32_t input = ray_const_table(g, tbl)->id;
+    uint32_t scan = ray_scan(g, "v1")->id;
+    uint32_t threshold = ray_const_i64(g, 50)->id;
+    uint32_t scalar = ray_const_f64(g, 80.0)->id;
+    uint32_t pointwise = ray_gt(g, &g->nodes[scan], &g->nodes[threshold])->id;
+    uint32_t avg = ray_avg(g, &g->nodes[scan])->id;
+    uint32_t nonlocal = ray_eq(g, &g->nodes[avg], &g->nodes[scalar])->id;
+    uint32_t inner = ray_filter(g, &g->nodes[input], &g->nodes[pointwise])->id;
+    ray_op_t* root = ray_filter(g, &g->nodes[inner], &g->nodes[nonlocal]);
+    root = ray_optimize(g, root);
+    TEST_ASSERT_NOT_NULL(root);
+    TEST_ASSERT_EQ_I(root->opcode, OP_FILTER);
+    TEST_ASSERT_EQ_I(root->in_id[1], nonlocal);
+    TEST_ASSERT_EQ_I(g->nodes[inner].in_id[1], pointwise);
+    ray_graph_free(g);
+
+    /* No extracting a safe inner limb of an unsafe whole conjunction. */
+    g = ray_graph_new(tbl);
+    input = ray_const_table(g, tbl)->id;
+    scan = ray_scan(g, "v1")->id;
+    threshold = ray_const_i64(g, 50)->id;
+    scalar = ray_const_f64(g, 80.0)->id;
+    pointwise = ray_gt(g, &g->nodes[scan], &g->nodes[threshold])->id;
+    avg = ray_avg(g, &g->nodes[scan])->id;
+    nonlocal = ray_eq(g, &g->nodes[avg], &g->nodes[scalar])->id;
+    uint32_t conjunction = ray_and(g, &g->nodes[pointwise], &g->nodes[nonlocal])->id;
+    root = ray_filter(g, &g->nodes[input], &g->nodes[conjunction]);
+    root = ray_optimize(g, root);
+    TEST_ASSERT_NOT_NULL(root);
+    int filters = 0;
+    for (uint32_t i = 0; i < g->node_count; i++)
+        if (!(g->nodes[i].flags & OP_FLAG_DEAD) && g->nodes[i].opcode == OP_FILTER)
+            filters++;
+    TEST_ASSERT_EQ_I(filters, 1);
+    TEST_ASSERT_EQ_I(g->nodes[root->in_id[1]].opcode, OP_AND);
+    ray_graph_free(g);
+
+    /* Positive route control: don't repair this by disabling all splitting. */
+    g = ray_graph_new(tbl);
+    input = ray_const_table(g, tbl)->id;
+    scan = ray_scan(g, "v1")->id;
+    uint32_t scan2 = ray_scan(g, "id1")->id;
+    threshold = ray_const_i64(g, 50)->id;
+    uint32_t one = ray_const_i64(g, 1)->id;
+    pointwise = ray_gt(g, &g->nodes[scan], &g->nodes[threshold])->id;
+    uint32_t other = ray_eq(g, &g->nodes[scan2], &g->nodes[one])->id;
+    conjunction = ray_and(g, &g->nodes[pointwise], &g->nodes[other])->id;
+    root = ray_filter(g, &g->nodes[input], &g->nodes[conjunction]);
+    root = ray_optimize(g, root);
+    TEST_ASSERT_NOT_NULL(root);
+    filters = 0;
+    for (uint32_t i = 0; i < g->node_count; i++)
+        if (!(g->nodes[i].flags & OP_FLAG_DEAD) && g->nodes[i].opcode == OP_FILTER)
+            filters++;
+    TEST_ASSERT_EQ_I(filters, 2);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t opt_entries[] = {
+    { "opt/filter_domain_barriers", test_filter_domain_barriers, NULL, NULL },
+    { "opt/subset_proof_pointwise", test_subset_proof_pointwise, NULL, NULL },
+    { "opt/subset_proof_membership_roles", test_subset_proof_membership_roles, NULL, NULL },
+    { "opt/subset_proof_hidden_crossrow", test_subset_proof_hidden_crossrow, NULL, NULL },
+    { "opt/subset_proof_malformed_and_cycles", test_subset_proof_malformed_and_cycles, NULL, NULL },
+    { "opt/subset_proof_budgets", test_subset_proof_budgets, NULL, NULL },
     { "opt/filter_reorder_type", test_filter_reorder_by_type, NULL, NULL },
     { "opt/filter_and_split", test_filter_and_split, NULL, NULL },
     { "opt/filter_reorder_dag", test_filter_reorder_dag, NULL, NULL },

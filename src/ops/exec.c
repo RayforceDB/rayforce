@@ -5733,42 +5733,161 @@ ray_t* build_segment_table(ray_t* parted_tbl, int32_t seg_idx) {
     return seg_tbl;
 }
 
-/* Is this opcode safe for segment streaming with concatenation merge?
- * Only element-wise, scan, filter, project, and alias ops produce
- * results that can be correctly concatenated across segments.
- * Everything else (joins, aggregations, sorts, graph ops, etc.)
- * requires specialized merge or global state. */
-static bool op_streamable(uint16_t opc) {
+/* Resolved pointwise layouts shared by streaming admission and the stricter
+ * row-subset proof.  This is NOT op_is_elementwise's executor-dispatch set. */
+enum { EXPR_NONE, EXPR_UNARY, EXPR_BINARY, EXPR_THIRD, EXPR_CONCAT, EXPR_SET };
+static unsigned pointwise_layout(uint16_t opc) {
     switch (opc) {
-        /* Data access (OP_CONST excluded: vector constants have total-row
-         * length and produce length mismatches with per-segment data.
-         * Scalar constants are checked separately in dag_can_stream.) */
-        case OP_SCAN:
-        /* Element-wise unary */
         case OP_NEG: case OP_ABS: case OP_NOT: case OP_SQRT:
         case OP_LOG: case OP_EXP: case OP_CEIL: case OP_FLOOR: case OP_ROUND:
         case OP_SIN: case OP_ASIN: case OP_COS: case OP_ACOS:
         case OP_TAN: case OP_ATAN: case OP_RECIPROCAL: case OP_SIGNUM:
         case OP_ISNULL: case OP_CAST:
-        /* Element-wise binary */
-        case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_IDIV: case OP_MOD:
-        case OP_POW:
-        case OP_EQ: case OP_NE: case OP_LT: case OP_LE:
-        case OP_GT: case OP_GE: case OP_AND: case OP_OR:
-        case OP_MIN2: case OP_MAX2: case OP_IF: case OP_IN: case OP_NOT_IN:
-        /* String element-wise */
-        case OP_LIKE: case OP_ILIKE: case OP_UPPER: case OP_LOWER:
-        case OP_STRLEN: case OP_SUBSTR: case OP_REPLACE: case OP_TRIM:
-        case OP_CONCAT: case OP_STR_FIND:
-        /* Temporal element-wise */
+        case OP_UPPER: case OP_LOWER: case OP_STRLEN: case OP_TRIM:
         case OP_EXTRACT: case OP_DATE_TRUNC:
-        /* Structure */
-        case OP_FILTER: case OP_SELECT: case OP_ALIAS:
+            return EXPR_UNARY;
+        case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_IDIV: case OP_MOD:
+        case OP_POW: case OP_EQ: case OP_NE: case OP_LT: case OP_LE:
+        case OP_GT: case OP_GE: case OP_AND: case OP_OR: case OP_MIN2: case OP_MAX2:
+        case OP_LIKE: case OP_ILIKE: case OP_STR_FIND:
+            return EXPR_BINARY;
+        case OP_IF: case OP_SUBSTR: case OP_REPLACE:
+            return EXPR_THIRD;
+        case OP_CONCAT:
+            return EXPR_CONCAT;
+        case OP_IN: case OP_NOT_IN:
+            return EXPR_SET;
+        default:
+            return EXPR_NONE;
+    }
+}
+
+/* Streaming keeps its historical structural permissions and root/constant
+ * policies.  Sharing the classification does not widen its admission. */
+static bool op_streamable(uint16_t opc) {
+    if (pointwise_layout(opc)) return true;
+    switch (opc) {
+        case OP_SCAN: case OP_FILTER: case OP_SELECT: case OP_ALIAS:
         case OP_MATERIALIZE:
             return true;
         default:
             return false;
     }
+}
+
+/* A bounded rewrite-safety proof, not an execution validator for arbitrary
+ * malformed graphs.  Shapes: 0 unproved, 1 scalar, 2 default-source rows.
+ * Set literals are checked on their edge and NEVER cached as value shapes. */
+#define SUBSET_NODE_LIMIT 4096
+#define SUBSET_DEPTH_LIMIT 64
+typedef struct {
+    ray_graph_t* g;
+    uint8_t state[SUBSET_NODE_LIMIT]; /* 0 unseen, 1 active, 2 done */
+    uint8_t shape[SUBSET_NODE_LIMIT];
+} subset_proof_t;
+
+static bool subset_data_atom(ray_t* v) {
+    return v && v->type <= -RAY_BOOL && v->type >= -RAY_STR;
+}
+
+static ray_op_t* subset_node(subset_proof_t* p, uint32_t id) {
+    if (id >= p->g->node_count) return NULL;
+    ray_op_t* n = &p->g->nodes[id];
+    if (n->id != id || (n->flags & (OP_FLAG_DEAD | OP_FLAG_INVALID_SCAN))) return NULL;
+    return n;
+}
+
+static ray_op_ext_t* subset_ext(subset_proof_t* p, ray_op_t* n) {
+    ray_op_ext_t* e = find_ext(p->g, n->id);
+    return e && e->base.opcode == n->opcode && e->base.arity == n->arity ? e : NULL;
+}
+
+static bool subset_set(subset_proof_t* p, uint32_t id) {
+    ray_op_t* n = subset_node(p, id);
+    if (!n || n->opcode != OP_CONST || n->arity != 0) return false;
+    ray_op_ext_t* e = subset_ext(p, n);
+    /* Flat typed vectors only: excludes LIST, callable, lazy and table values.
+     * No data reads or mutation; the held literal is fixed during the rewrite. */
+    return e && e->literal && e->literal->type >= RAY_BOOL &&
+           e->literal->type <= RAY_STR && e->literal->len >= 0;
+}
+
+static uint8_t subset_visit(subset_proof_t* p, uint32_t id, unsigned depth) {
+    if (depth >= SUBSET_DEPTH_LIMIT) return 0;
+    ray_op_t* n = subset_node(p, id);
+    if (!n || p->state[id] == 1) return 0;
+    if (p->state[id] == 2) return p->shape[id];
+    p->state[id] = 1;
+    uint8_t shape = 0;
+    if (n->opcode == OP_CONST || n->opcode == OP_SCAN) {
+        ray_op_ext_t* e = subset_ext(p, n);
+        if (n->arity != 0 || !e) return 0;
+        if (n->opcode == OP_CONST) {
+            if (!subset_data_atom(e->literal)) return 0;
+            shape = 1;
+        } else {
+            uint16_t source;
+            memcpy(&source, e->base.pad, sizeof(source));
+            if (source != 0) return 0;
+            shape = 2;
+        }
+    } else {
+        unsigned layout = pointwise_layout(n->opcode);
+        if (!layout || n->arity != (layout == EXPR_UNARY ? 1 : 2)) return 0;
+        ray_op_ext_t* e = NULL;
+        if (layout == EXPR_THIRD || layout == EXPR_CONCAT ||
+            n->opcode == OP_EXTRACT || n->opcode == OP_DATE_TRUNC) {
+            e = subset_ext(p, n);
+            if (!e) return 0;
+        }
+        /* Tail allocation capacity is not recorded: do not silently omit
+         * hidden arguments or read an unverifiable variadic tail. */
+        if (layout == EXPR_CONCAT && e->sym != 2) return 0;
+        if (n->opcode == OP_EXTRACT &&
+            (e->sym < RAY_EXTRACT_YEAR || e->sym > RAY_EXTRACT_EPOCH)) return 0;
+        if (n->opcode == OP_DATE_TRUNC &&
+            e->sym != RAY_EXTRACT_DAY && e->sym != RAY_EXTRACT_SECOND) return 0;
+        if (n->opcode == OP_CAST &&
+            (n->out_type < RAY_BOOL || n->out_type > RAY_STR)) return 0;
+        uint8_t a = subset_visit(p, n->in_id[0], depth + 1);
+        if (!a) return 0;
+        /* These special executors own row shape through their first input;
+         * do not infer row output merely from a parameter/unchosen branch. */
+        if ((layout == EXPR_THIRD || n->opcode == OP_LIKE ||
+             n->opcode == OP_ILIKE || n->opcode == OP_STR_FIND) && a != 2) return 0;
+        shape = a;
+        if (layout == EXPR_SET) {
+            /* Atom-left IN returns a one-cell vector, not scalar broadcast. */
+            if (a != 2 || !subset_set(p, n->in_id[1])) return 0;
+        } else if (n->arity == 2) {
+            uint8_t b = subset_visit(p, n->in_id[1], depth + 1);
+            if (!b) return 0;
+            if ((n->opcode == OP_LIKE || n->opcode == OP_ILIKE ||
+                 n->opcode == OP_STR_FIND || n->opcode == OP_REPLACE) && b != 1) return 0;
+            if (b == 2) shape = 2;
+        }
+        if (layout == EXPR_THIRD) {
+            uint8_t c = subset_visit(p, e->third_in, depth + 1); /* ID zero is valid */
+            if (!c || (n->opcode == OP_REPLACE && c != 1)) return 0;
+            if (c == 2) shape = 2;
+        }
+        /* Numeric primitive scalar dispatch is established.  Decline other
+         * scan-free compositions unless their atom return is explicit. */
+        if (shape == 1 && !op_is_elementwise(n->opcode) &&
+            n->opcode != OP_UPPER && n->opcode != OP_LOWER &&
+            n->opcode != OP_TRIM && n->opcode != OP_STRLEN &&
+            n->opcode != OP_EXTRACT && n->opcode != OP_DATE_TRUNC) return 0;
+    }
+    p->state[id] = 2;
+    return p->shape[id] = shape;
+}
+
+bool ray_expr_subset_invariant(ray_graph_t* g, uint32_t root_id) {
+    if (!g || !g->nodes || !g->node_count || g->node_count > SUBSET_NODE_LIMIT ||
+        g->node_count > g->node_cap || g->ext_count > g->ext_cap ||
+        (g->ext_count && !g->ext_nodes)) return false;
+    subset_proof_t p = { .g = g };
+    return subset_visit(&p, root_id, 0) != 0;
 }
 
 /* Walk the root's input subtree to check if it reaches a default-table
