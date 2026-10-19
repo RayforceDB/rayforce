@@ -26,6 +26,7 @@
 #include "mem/heap.h"
 #include "ops/ops.h"
 #include "table/sym.h"
+#include "table/domain.h"
 #include "table/table.h"
 #include "core/runtime.h"
 #include "core/platform.h"
@@ -6355,6 +6356,160 @@ static int64_t sr_strlen_len(int64_t r) {
     default: return (r / 7) % 3 == 0 ? 0 : 7;
     }
 }
+static test_result_t strlen_runtime_sym_gen2_case(int64_t n, bool byte_key) {
+    const int64_t repeats = n / 6;
+    const int8_t key_type = byte_key ? RAY_U8 : RAY_I32;
+    const int64_t kid = ray_sym_intern("k", 1);
+    const int64_t sid = ray_sym_intern("s", 1);
+    const int64_t zid = ray_sym_intern("z", 1);
+    const int64_t nid = ray_sym_intern("n", 1);
+    const int64_t tid = ray_sym_intern("T", 1);
+    const int64_t ids[6] = { 0, 0, ray_sym_intern("a", 1),
+        ray_sym_intern("bb", 2), ray_sym_intern("ccc", 3),
+        ray_sym_intern("dddd", 4) };
+    const uint32_t bound = ray_sym_count();
+    ray_t *sv = NULL, *kv = NULL, *enc = NULL, *tbl = NULL, *res = NULL;
+    const char* why = "interned IDs";
+    int qi = -1;
+    char path[512];
+    snprintf(path, sizeof path, "%s/strlen-runtime-sym", sr_root());
+    for (int j = 2; j < 6; j++)
+        if (ids[j] <= 0 || (uint64_t)ids[j] >= bound) goto done;
+
+    why = "source allocation";
+    sv = ray_sym_vec_new(RAY_SYM_W64, n);
+    kv = ray_vec_new(key_type, n);
+    if (!sv || RAY_IS_ERR(sv) || !kv || RAY_IS_ERR(kv)) goto done;
+    sv->len = kv->len = n;
+    sv->attrs |= RAY_ATTR_HAS_NULLS;
+    for (int64_t r = 0; r < n; r++) {
+        ((int64_t*)ray_data(sv))[r] = ids[r % 6];
+        if (byte_key) ((uint8_t*)ray_data(kv))[r] = (uint8_t)(1 + r % 2);
+        else ((int32_t*)ray_data(kv))[r] = (int32_t)(r % 2);
+    }
+
+    /* No assertion may leave an open FILE or live writer allocation. */
+    why = "open writer";
+    FILE* f = fopen(path, "wb+");
+    if (!f) goto done;
+    ray_encw_t w;
+    ray_err_t rc = ray_encw_begin(&w, f, RAY_SYM, RAY_SYM_W64,
+                                 n, bound, 0, 0);
+    for (int64_t off = 0; rc == RAY_OK && off < n; off += 65536) {
+        int64_t rows = n - off < 65536 ? n - off : 65536;
+        rc = ray_encw_chunk(&w, (const int64_t*)ray_data(sv) + off, NULL, rows);
+    }
+    if (rc == RAY_OK) rc = ray_encw_finish(&w);
+    ray_encw_free(&w);
+    int close_rc = fclose(f);
+    why = "write/finish/close";
+    if (rc != RAY_OK || close_rc != 0) goto done;
+    sr_drop(sv); sv = NULL;
+
+    /* Direct mmap intentionally preserves the runtime domain: no splayed
+     * loader, .sym file, domain rebind, or forged header. */
+    why = "map runtime W64 SYM";
+    enc = ray_col_mmap(path);
+    if (!enc || RAY_IS_ERR(enc) || enc->type != RAY_ENCCOL) goto done;
+    ray_enccol_t* e = ray_enccol_of(enc);
+    if (!e || e->type != RAY_SYM || e->len != n ||
+        (e->attrs & RAY_SYM_W_MASK) != RAY_SYM_W64 ||
+        e->dom != ray_sym_runtime_domain() || e->sym_bound != bound ||
+        ray_enccol_decoded_peek(enc) != NULL) goto done;
+
+    why = "table allocation/binding";
+    tbl = ray_table_new(2);
+    if (!tbl || RAY_IS_ERR(tbl)) goto done;
+    tbl = ray_table_add_col(tbl, kid, kv);
+    if (!tbl || RAY_IS_ERR(tbl)) goto done;
+    tbl = ray_table_add_col(tbl, sid, enc);
+    if (!tbl || RAY_IS_ERR(tbl)) goto done;
+    if (ray_env_set(tid, tbl) != RAY_OK) goto done;
+    /* add_col retains columns, env_set retains tbl. Keep enc's owning ref
+     * through both queries; result-column pointers below are borrowed. */
+    sr_drop(kv); kv = NULL;
+    sr_drop(tbl); tbl = NULL;
+
+    static const char* qs[] = {
+        "(select {z: (sum (strlen s)) n: (count k) from: T by: k asc: k})",
+        "(select {z: (avg (strlen s)) n: (count k) from: T by: k asc: k})",
+    };
+    ray_group_test_route(0);
+    for (qi = 0; qi < 2; qi++) {
+        why = "source decoded before query";
+        if (ray_enccol_decoded_peek(enc) != NULL) goto done;
+        ray_enc_counters_reset();
+        res = sr_eval(qs[qi]);
+        ray_enc_counters_t c;
+        ray_enc_counters_get(&c);
+        why = "query/counters/cache";
+        if (!res || RAY_IS_ERR(res) || res->type != RAY_TABLE ||
+            c.materialized != 0 || c.at_first_exec != 0 ||
+            ray_enccol_decoded_peek(enc) != NULL) goto done;
+        /* These are result columns only; do not access T.s. */
+        ray_t* k = ray_table_col(res, kid);
+        ray_t* z = ray_table_col(res, zid);
+        ray_t* cnt = ray_table_col(res, nid);
+        why = "result column lookup";
+        if (!k || RAY_IS_ERR(k) || !z || RAY_IS_ERR(z) || !cnt || RAY_IS_ERR(cnt)) {
+            /* Normal columns are borrowed; only lookup errors are owned. */
+            if (k && RAY_IS_ERR(k)) ray_error_free(k);
+            if (z && RAY_IS_ERR(z)) ray_error_free(z);
+            if (cnt && RAY_IS_ERR(cnt)) ray_error_free(cnt);
+            goto done;
+        }
+        why = "result column types/lengths/null cells";
+        if (k->type != key_type || z->type != (qi == 0 ? RAY_I64 : RAY_F64) ||
+            cnt->type != RAY_I64 || k->len != 2 || z->len != 2 || cnt->len != 2)
+            goto done;
+        /* HAS_NULLS is a conservative gate: require non-null cells, not a
+         * minimal hint bit on a correctly populated result. */
+        for (int64_t row = 0; row < 2; row++)
+            if (ray_vec_is_null(k, row) || ray_vec_is_null(z, row) ||
+                ray_vec_is_null(cnt, row)) goto done;
+        why = "keys/counts/strlen aggregate values";
+        int64_t k0 = byte_key ? ((uint8_t*)ray_data(k))[0] : ((int32_t*)ray_data(k))[0];
+        int64_t k1 = byte_key ? ((uint8_t*)ray_data(k))[1] : ((int32_t*)ray_data(k))[1];
+        if (k0 != (byte_key ? 1 : 0) || k1 != (byte_key ? 2 : 1) ||
+            ((int64_t*)ray_data(cnt))[0] != 3 * repeats ||
+            ((int64_t*)ray_data(cnt))[1] != 3 * repeats) goto done;
+        if (qi == 0) {
+            if (((int64_t*)ray_data(z))[0] != 4 * repeats ||
+                ((int64_t*)ray_data(z))[1] != 6 * repeats) goto done;
+        } else {
+            /* Null IDs contribute to COUNT(k), not to AVG's divisor. */
+            if (((double*)ray_data(z))[0] != 2.0 ||
+                ((double*)ray_data(z))[1] != 3.0) goto done;
+        }
+        sr_drop(res); res = NULL;
+    }
+    why = NULL;
+done:
+    ray_group_test_route(0);
+    sr_drop(res); sr_drop(tbl); sr_drop(enc); sr_drop(kv); sr_drop(sv);
+    /* T's retained table/column references are released by sr_rt_teardown;
+     * the runtime must outlive those and all local SYM/encoded references. */
+    TEST_ASSERT_FMT(why == NULL, "runtime SYM strlen query %d: %s", qi,
+                    why ? why : "ok");
+    PASS();
+}
+
+static test_result_t test_strlen_runtime_sym_gen2(void) {
+    return strlen_runtime_sym_gen2_case(1032, false);
+}
+
+static test_result_t test_parallel_strlen_runtime_sym_gen2(void) {
+    ray_pool_t* pool = ray_pool_get();
+    if (!pool || ray_pool_total_workers(pool) < 2) SKIP("no pool worker");
+    /* Two full chunks and a tail; default parallel admission remains active. */
+    return strlen_runtime_sym_gen2_case(132000, false);
+}
+
+static test_result_t test_strlen_runtime_sym_bytekey(void) {
+    /* Nonzero U8 keys avoid unrelated byte-null policy; one-byte piece loads. */
+    return strlen_runtime_sym_gen2_case(1032, true);
+}
+
 static test_result_t test_strlen_str_gen2_routes(void) {
     const int64_t n = 70000;
     static const char abc[] = "abcdefg";
@@ -6855,6 +7010,9 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/parted_nullable_stats", test_parted_nullable_stats, srr_setup, srr_teardown },
     { "scanrange/parted_expr_null_free", test_parted_expr_null_free, srr_setup, srr_teardown },
     { "scanrange/strlen_str_gen2_routes", test_strlen_str_gen2_routes, sr_rt_setup, sr_rt_teardown },
+    { "scanrange/strlen_runtime_sym_gen2", test_strlen_runtime_sym_gen2, sr_rt_setup, sr_rt_teardown },
+    { "scanrange/strlen_runtime_sym_bytekey", test_strlen_runtime_sym_bytekey, sr_rt_setup, sr_rt_teardown },
+    { "scanrange/parallel_strlen_runtime_sym_gen2", test_parallel_strlen_runtime_sym_gen2, sr_rt_setup, sr_rt_teardown },
     { "scanrange/ragged_gen0_no_decode", test_ragged_gen0_no_decode, srr_setup, srr_teardown },
     { "scanrange/ragged_fill_bounded",   test_ragged_fill_bounded,   srr_setup, srr_teardown },
     { "scanrange/vec_stat_decide",       test_vec_stat_decide,       sr_rt_setup, sr_rt_teardown },

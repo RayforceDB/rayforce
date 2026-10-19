@@ -1,0 +1,4 @@
+(set X (.db.splayed.get "bench/staged_strlen/data/s2/" "bench/staged_strlen/data/s2.sym"))
+(set result (at (select {a: (avg (strlen y)) from: X by: k asc: k}) 'a))
+(println "checksum: %" (sum result))
+(println "ms: %" (list (timeit (at (select {a: (avg (strlen y)) from: X by: k asc: k}) 'a)) (timeit (at (select {a: (avg (strlen y)) from: X by: k asc: k}) 'a)) (timeit (at (select {a: (avg (strlen y)) from: X by: k asc: k}) 'a)) (timeit (at (select {a: (avg (strlen y)) from: X by: k asc: k}) 'a)) (timeit (at (select {a: (avg (strlen y)) from: X by: k asc: k}) 'a)) (timeit (at (select {a: (avg (strlen y)) from: X by: k asc: k}) 'a)) (timeit (at (select {a: (avg (strlen y)) from: X by: k asc: k}) 'a))))
