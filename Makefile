@@ -222,7 +222,7 @@ default: debug
 	$(CC) -c $(RELEASE_CFLAGS) $(FP_STRICT_$*) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
 
 %.lib.o: %.c
-	$(CC) -c $(LIB_CFLAGS) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
+	$(CC) -c $(LIB_CFLAGS) $(FP_STRICT_$*) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
 
 %.fuzz.o: %.c
 	$(CLANG) -c $(FUZZ_CFLAGS) $(FP_STRICT_$*) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
