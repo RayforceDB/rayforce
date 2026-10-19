@@ -23,6 +23,7 @@
 
 #include "lang/format.h"
 #include "lang/env.h"
+#include "table/table.h"
 #include "table/sym.h"
 #include "lang/eval.h"
 #include "ops/ops.h"    /* RAY_LAZY, ray_lazy_materialize */
@@ -52,6 +53,8 @@ typedef struct {
                          * appended (mode 2) */
     bool    io_err;     /* err was a failed write to sink */
     bool    flushed;    /* some output already reached sink */
+    char    cause_code[16];   /* code of the error that stopped a column from loading */
+    char    cause_msg[192];   /* its detail (names the column file) */
 } fmt_buf_t;
 
 #define FMT_SINK_FLUSH ((int64_t)1 << 20)
@@ -71,6 +74,8 @@ static void fmt_init(fmt_buf_t* b) {
     b->sink    = NULL;
     b->io_err  = false;
     b->flushed = false;
+    b->cause_code[0] = '\0';
+    b->cause_msg[0]  = '\0';
     b->block   = ray_alloc(256);
     if (!b->block) {   /* ray_alloc returns NULL (never an error object) on failure */
         b->err = true; b->err_msg = "cannot allocate the initial output buffer";
@@ -184,7 +189,9 @@ static void fmt_putn(fmt_buf_t* b, const char* s, int64_t n) {
 
 static ray_t* fmt_to_str(fmt_buf_t* b) {
     if (b->err) {
-        ray_t* e = ray_error("format", "%s", b->err_msg ? b->err_msg : "output buffer error");
+        ray_t* e = b->cause_code[0]
+            ? ray_error(b->cause_code, "%s: %s", b->err_msg, b->cause_msg)
+            : ray_error("format", "%s", b->err_msg ? b->err_msg : "output buffer error");
         fmt_destroy(b);
         return e;
     }
@@ -530,7 +537,7 @@ static void fmt_list(fmt_buf_t* b, ray_t* list, int mode) {
         ray_t* bcount = NULL;
         if (ray_times_binding(list, &bname, &bcount)) {
             fmt_putc(b, '[');
-            fmt_obj(b, ((ray_t**)ray_data(list))[1], mode);
+            fmt_obj(b, ((ray_t**)ray_data(list))[1], mode);   /* not-a-table */
             fmt_putc(b, ' ');
             fmt_obj(b, bcount, mode);
             fmt_putc(b, ']');
@@ -862,9 +869,11 @@ static int8_t fmt_col_type(ray_t* col) {
 static ray_t* fmt_part_counts(ray_t* tbl) {
     int64_t ncols = ray_table_ncols(tbl);
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* col = ray_table_get_col_idx(tbl, c);
-        if (col && col->type == RAY_MAPCOMMON) {
-            ray_t* rc = ((ray_t**)ray_data(col))[1];
+        ray_col_meta_t m;   /* metadata first: MAPCOMMON is plain, nothing decodes */
+        if (!ray_table_col_meta_idx(tbl, c, &m) || m.type != RAY_MAPCOMMON) continue;
+        ray_t* col = ray_table_col_idx(tbl, c);
+        if (col && !RAY_IS_ERR(col) && col->type == RAY_MAPCOMMON) {
+            ray_t* rc = ((ray_t**)ray_data(col))[1];   /* not-a-table */
             return rc && !RAY_IS_ERR(rc) ? rc : NULL;
         }
     }
@@ -878,7 +887,7 @@ static void fmt_col_init(fmt_col_t* c, ray_t* col, ray_t* counts) {
     c->ncnt = 0;
     c->s = 0;
     c->start = 0;
-    if (col && col->type == RAY_MAPCOMMON) counts = ((ray_t**)ray_data(col))[1];
+    if (col && col->type == RAY_MAPCOMMON) counts = ((ray_t**)ray_data(col))[1];   /* not-a-table */
     if (counts && !RAY_IS_ERR(counts)) {
         c->cnt  = (const int64_t*)ray_data(counts);
         c->ncnt = counts->len;
@@ -1028,6 +1037,23 @@ static void fmt_stream_rule(fmt_buf_t* b, const int32_t* w, int64_t n,
  * value in 10k rows wrote 100 MB of spaces). */
 #define FMT_SHOW_PAD_MAX 256
 
+/* Column ci as a plain vector.  A column that fails to materialize sets the
+ * builder's error (the thread-local message keeps the detail) and yields NULL;
+ * callers stop on b->err. */
+static ray_t* fmt_col_idx(fmt_buf_t* b, ray_t* tbl, int64_t ci) {
+    ray_t* c = ray_table_col_idx(tbl, ci);
+    if (c && RAY_IS_ERR(c)) {
+        const char* code = ray_err_code(c);
+        const char* msg  = ray_error_msg();
+        snprintf(b->cause_code, sizeof b->cause_code, "%s", code ? code : "format");
+        snprintf(b->cause_msg, sizeof b->cause_msg, "%s", msg ? msg : "");
+        ray_error_free(c);
+        b->err = true; b->err_msg = "column failed to load";
+        return NULL;
+    }
+    return c;
+}
+
 static void fmt_table_stream(fmt_buf_t* b, ray_t* tbl) {
     int64_t ncols = ray_table_ncols(tbl);
     int64_t nrows = ray_table_nrows(tbl);
@@ -1035,8 +1061,8 @@ static void fmt_table_stream(fmt_buf_t* b, ray_t* tbl) {
 
     ray_t* wblk = ray_alloc((size_t)ncols * sizeof(int32_t));
     ray_t* nblk = ray_alloc((size_t)ncols * sizeof(ray_t*));
-    ray_t* cblk = ray_alloc((size_t)ncols * sizeof(fmt_col_t));
     if (nblk) memset(ray_data(nblk), 0, (size_t)ncols * sizeof(ray_t*));
+    ray_t* cblk = ray_alloc((size_t)ncols * sizeof(fmt_col_t));   /* cursors over borrowed plain columns */
     fmt_buf_t tmp;
     fmt_init(&tmp);
     if (!wblk || !nblk || !cblk || tmp.err) {
@@ -1051,8 +1077,10 @@ static void fmt_table_stream(fmt_buf_t* b, ray_t* tbl) {
     for (int64_t ci = 0; ci < ncols; ci++) {
         ray_t* nm = ray_sym_str(ray_table_col_name(tbl, ci));
         names[ci] = (nm && !RAY_IS_ERR(nm)) ? nm : NULL;
+        ray_t* plain = fmt_col_idx(b, tbl, ci);
+        if (b->err) goto done;
         fmt_col_t* col = &cols[ci];
-        fmt_col_init(col, ray_table_get_col_idx(tbl, ci), counts);
+        fmt_col_init(col, plain, counts);
         const char* tname = ray_type_name(col->type);
         int32_t w = names[ci] ? fmt_utf8_width(ray_str_ptr(names[ci]), (int32_t)ray_str_len(names[ci])) : 1;
         if ((int32_t)strlen(tname) > w) w = (int32_t)strlen(tname);
@@ -1152,7 +1180,8 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
         fmt_puts(b, "] (list ");
         for (int64_t i = 0; i < ncols; i++) {
             if (i > 0) fmt_putc(b, ' ');
-            ray_t* col = ray_table_get_col_idx(tbl, i);
+            ray_t* col = fmt_col_idx(b, tbl, i);
+            if (b->err) return;
             if (fmt_col_is_parted(col)) {
                 fmt_col_t cur;
                 fmt_col_init(&cur, col, part_counts);
@@ -1265,7 +1294,16 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
         }
 
         /* Column type */
-        ray_t* col_vec = ray_table_get_col_idx(tbl, ci);
+        ray_t* col_vec = fmt_col_idx(b, tbl, ci);
+        if (b->err) {
+            for (int64_t k = 0; k <= ci; k++) if (name_refs[k]) ray_release(name_refs[k]);
+            if (heap_alloc) {
+                ray_free(heap_widths_blk); ray_free(heap_names_blk); ray_free(heap_nlen_blk);
+                ray_free(heap_types_blk); ray_free(heap_tlen_blk); ray_free(heap_refs_blk);
+                ray_free(heap_cells_blk);
+            }
+            return;
+        }
         fmt_col_t cur;
         fmt_col_init(&cur, col_vec, part_counts);
         const char* tname = ray_type_name(cur.type);
@@ -1666,8 +1704,14 @@ void ray_fmt_pp_print(FILE* fp, ray_t* obj) {
 
 /* Write obj to fp in full (show): no row, column or width limits, and
  * streamed, so memory stays bounded whatever the size of obj.  RAY_ERR_IO if
- * fp fails, RAY_ERR_OOM if a scratch buffer cannot be allocated. */
-ray_err_t ray_fmt_write(FILE* fp, ray_t* obj) {
+ * fp fails, RAY_ERR_OOM if a scratch buffer cannot be allocated.  A column
+ * that fails to load is reported with its own code: *cause (when non-NULL)
+ * receives an owned error carrying its code and message, and the matching
+ * ray_err_t is returned.  Output flushed before the failure stays written
+ * (a table's columns are all loaded before its first byte, so only values
+ * formatted ahead of it in the same call are affected). */
+ray_err_t ray_fmt_write(FILE* fp, ray_t* obj, ray_t** cause) {
+    if (cause) *cause = NULL;
     fmt_buf_t b;
     fmt_init(&b);
     if (b.err) return RAY_ERR_OOM;
@@ -1675,6 +1719,11 @@ ray_err_t ray_fmt_write(FILE* fp, ray_t* obj) {
     fmt_obj(&b, obj, 2);
     if (!b.err && b.len > 0 && fwrite(b.buf, 1, (size_t)b.len, fp) != (size_t)b.len)
         b.io_err = b.err = true;
+    if (b.err && b.cause_code[0] && cause) {
+        *cause = ray_error(b.cause_code, "%s: %s", b.err_msg, b.cause_msg);
+        fmt_destroy(&b);
+        return ray_err_from_obj(*cause);
+    }
     ray_err_t e = !b.err ? RAY_OK : b.io_err ? RAY_ERR_IO : RAY_ERR_OOM;
     /* Out of memory after part of the output was written: end that part
      * with a marker, and report it as written so the caller does not print

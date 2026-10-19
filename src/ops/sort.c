@@ -26,6 +26,9 @@
 #include "ops/ops.h"
 #include "ops/idxop.h"
 #include "mem/sys.h"
+#include "ops/colgather.h"   /* generation-2 top-K gathers */
+#include "ops/rowsel.h"      /* exec_sort_head_sel: the winners' rowsel */
+#include <stdatomic.h>
 
 /* --------------------------------------------------------------------------
  * Sort comparator: compare two row indices across all sort keys.
@@ -251,6 +254,12 @@ static void sortedness_fn(void* arg, uint32_t wid, int64_t start, int64_t end) {
     for (int64_t i = start + 1; i < end; i++) {
         if (keys[i] < keys[i - 1]) unsorted++;
     }
+    /* a clamped dispatch's task spans several grains: the caller counts
+     * every grain boundary pair, so this task's inner ones are taken back */
+    const int64_t grain = RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS;
+    if (RAY_UNLIKELY(end - start > grain))
+        for (int64_t b = (start / grain + 1) * grain; b < end; b += grain)
+            if (keys[b] < keys[b - 1]) unsorted--;
     c->pw_unsorted[wid] += unsorted;
 }
 
@@ -3113,8 +3122,10 @@ static void topk_cmp_sift_down(const sort_cmp_ctx_t* ctx, int64_t* heap,
 
 /* Comparator-based top-K: works for any comparable sort key types and any
  * number of keys (1..n).  Used when the radix-encoded fast path is not
- * applicable.  O(n log K + K log K). */
-static ray_t* topk_indices_cmp(ray_t** cols, uint8_t* descs, uint8_t* nfs,
+ * applicable.  O(n log K + K log K).  Always inlined: ray_topk_table_multi
+ * keeps the code it had as the only caller (exec_sort_head_sel is the
+ * second). */
+static inline __attribute__((always_inline)) ray_t* topk_indices_cmp(ray_t** cols, uint8_t* descs, uint8_t* nfs,
                                uint8_t n_cols, int64_t nrows, int64_t k) {
     if (!cols || n_cols == 0 || k <= 0 || nrows <= 0 || k >= nrows) return NULL;
     for (uint8_t c = 0; c < n_cols; c++) if (!cols[c]) return NULL;
@@ -3323,8 +3334,9 @@ static ray_t* topk_indices_single(ray_t* col, uint8_t desc, uint8_t nf,
 static bool table_has_parted_col(ray_t* tbl) {
     int64_t ncols = ray_table_ncols(tbl);
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* col = ray_table_get_col_idx(tbl, c);
-        if (col && (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON))
+        ray_col_meta_t m;
+        if (ray_table_col_meta_idx(tbl, c, &m) &&
+            (RAY_IS_PARTED(m.type) || m.type == RAY_MAPCOMMON))
             return true;
     }
     return false;
@@ -3339,10 +3351,21 @@ static ray_t* topk_gather_rows(ray_t* tbl, ray_t* idx, int64_t k) {
     ray_t* result = ray_table_new(ncols);
     if (!result || RAY_IS_ERR(result)) { ray_release(idx); return result; }
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* src = ray_table_get_col_idx(tbl, c);
         int64_t name = ray_table_col_name(tbl, c);
+        ray_t* dst = NULL;
+        /* a generation-2 slot: the K rows' vectors, decoded by range */
+        ray_t* enc = ray_col_gather_slot(ray_table_get_col_enc_idx(tbl, c));
+        if (enc) {
+            ray_t* err = ray_col_gather_enc(enc, NULL, true, idx_data, k, &dst);
+            if (err) { ray_release(idx); ray_release(result); return err; }
+            result = ray_table_add_col(result, name, dst);
+            ray_release(dst);
+            if (!result || RAY_IS_ERR(result)) { ray_release(idx); return result ? result : ray_error("oom", NULL); }
+            continue;
+        }
+        ray_t* src = ray_table_col_idx(tbl, c);
+        if (src && RAY_IS_ERR(src)) { ray_release(idx); ray_release(result); return src; }
         if (!src) continue;
-        ray_t* dst;
         if (src->type == RAY_LIST) {
             dst = ray_list_new(k);
             if (!dst || RAY_IS_ERR(dst)) {
@@ -3385,8 +3408,8 @@ ray_t* ray_topk_table(ray_t* tbl, ray_t* col, uint8_t desc, uint8_t nf,
     if (k >= nrows) return NULL;
     int64_t ncols = ray_table_ncols(tbl);
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* src = ray_table_get_col_idx(tbl, c);
-        if (src && src->type == RAY_LIST) return NULL;
+        ray_col_meta_t m;
+        if (ray_table_col_meta_idx(tbl, c, &m) && m.type == RAY_LIST) return NULL;
     }
 
     ray_t* idx = topk_indices_single(col, desc, nf, nrows, k);
@@ -3412,8 +3435,8 @@ ray_t* ray_topk_table_multi(ray_t* tbl, ray_t** key_cols, uint8_t* descs,
     if (k <= 0 || nrows <= 0 || k >= nrows) return NULL;
     int64_t ncols = ray_table_ncols(tbl);
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* src = ray_table_get_col_idx(tbl, c);
-        if (src && src->type == RAY_LIST) return NULL;
+        ray_col_meta_t m;
+        if (ray_table_col_meta_idx(tbl, c, &m) && m.type == RAY_LIST) return NULL;
     }
     for (uint8_t i = 0; i < n_keys; i++)
         if (!key_cols[i] || key_cols[i]->len < nrows) return NULL;
@@ -3550,7 +3573,8 @@ ray_t* ray_sort(ray_t** cols, uint8_t* descs, uint8_t* nulls_first,
  * POSITION: the projection names scans by their source column and
  * expressions `_e<c>`, so a hidden key or a renamed output can share a
  * name with another projected column and a name lookup would read the
- * wrong one.  Any other key resolves by name.  Borrowed. */
+ * wrong one.  Any other key resolves by name.  Borrowed; NULL when absent,
+ * an owned error when an encoded column fails to materialize. */
 static ray_t* sort_key_scan_col(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                                 uint32_t key_id, int64_t key_sym) {
     ray_op_t* child = g ? op_child(g, op, 0) : NULL;
@@ -3560,9 +3584,58 @@ static ray_t* sort_key_scan_col(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             (int64_t)se->sort.n_cols == ray_table_ncols(tbl))
             for (uint32_t c = 0; c < se->sort.n_cols; c++)
                 if (se->sort.columns[c] == key_id)
-                    return ray_table_get_col_idx(tbl, c);
+                    return ray_table_col_idx(tbl, c);
     }
-    return ray_table_get_col(tbl, key_sym);
+    return ray_table_col(tbl, key_sym);
+}
+
+/* ---- The top-k shortcut's gate, one copy for exec_sort and
+ * exec_sort_head_sel (the late route must decline exactly where the
+ * shortcut would not run on the compacted table) ---- */
+
+/* The shape: 1..16 keys (the shortcut's fixed key arrays), K below the
+ * rows and at most 8192. */
+static inline bool topk_shortcut_shape(uint32_t n_sort, int64_t limit, int64_t nrows) {
+    return limit > 0 && n_sort >= 1 && n_sort <= 16 && limit < nrows && limit <= 8192;
+}
+
+/* Key k is a column scan (the shortcut takes no computed key): its op id
+ * and name symbol. */
+static inline bool topk_scan_key(ray_graph_t* g, const ray_op_ext_t* ext, uint32_t k, uint32_t* id, int64_t* sym) {
+    ray_op_t* key_op = op_node(g, ext->sort.columns[k]);
+    ray_op_ext_t* key_ext = find_ext(g, key_op->id);
+    if (!key_ext || key_ext->base.opcode != OP_SCAN) return false;
+    *id = key_op->id;
+    *sym = key_ext->sym;
+    return true;
+}
+
+/* Key k's column of `tbl` as the shortcut reads it (sort_key_scan_col);
+ * NULL for a computed key or a missing column (an error, freed: the full
+ * sort re-reads the key and reports it). */
+static inline ray_t* topk_key_col(ray_graph_t* g, ray_op_t* op, const ray_op_ext_t* ext, ray_t* tbl, uint32_t k) {
+    uint32_t id; int64_t sym;
+    if (!topk_scan_key(g, ext, k, &id, &sym)) return NULL;
+    ray_t* col = sort_key_scan_col(g, op, tbl, id, sym);
+    if (col && RAY_IS_ERR(col)) { ray_error_free(col); col = NULL; }
+    return col;
+}
+
+/* Key k's nulls-first flag, the sort's default when unset. */
+static inline uint8_t topk_key_nf(const ray_op_ext_t* ext, uint32_t k) {
+    uint8_t d = ext->sort.desc ? ext->sort.desc[k] : 0;
+    return ext->sort.nulls_first ? ext->sort.nulls_first[k] : sort_nulls_first(d);
+}
+
+/* A LIST column (flat or parted): ray_topk_table / _multi decline. */
+static inline bool topk_has_list(ray_t* tbl) {
+    int64_t ncols = ray_table_ncols(tbl);
+    for (int64_t c = 0; c < ncols; c++) {
+        ray_col_meta_t m;
+        if (ray_table_col_meta_idx(tbl, c, &m) && (m.type == RAY_LIST || m.type == RAY_PARTED_BASE + RAY_LIST))
+            return true;
+    }
+    return false;
 }
 
 ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit) {
@@ -3588,38 +3661,20 @@ ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit) {
      * n_sort <= 16: the shortcut's key_cols/nfs scratch below is a
      * fixed-16 stack array; wider sorts skip straight to the general
      * sort_indices_ex path (itself n_cols-unbounded). */
-    if (limit > 0 && n_sort >= 1 && n_sort <= 16 && limit < nrows && limit <= 8192 &&
-        g && g->selection == NULL) {
+    if (topk_shortcut_shape(n_sort, limit, nrows) && g && g->selection == NULL) {
         ray_t* key_cols[16];
         int    all_scan = 1;
-        for (uint32_t k = 0; k < n_sort; k++) {
-            ray_op_t* key_op = op_node(g, ext->sort.columns[k]);
-            ray_op_ext_t* key_ext = find_ext(g, key_op->id);
-            if (key_ext && key_ext->base.opcode == OP_SCAN) {
-                key_cols[k] = sort_key_scan_col(g, op, tbl, key_op->id, key_ext->sym);
-                if (!key_cols[k]) { all_scan = 0; break; }
-            } else {
-                all_scan = 0;
-                break;
-            }
-        }
+        for (uint32_t k = 0; k < n_sort; k++)
+            if (!(key_cols[k] = topk_key_col(g, op, ext, tbl, k))) { all_scan = 0; break; }
         if (all_scan) {
             if (n_sort == 1) {
                 uint8_t desc = ext->sort.desc ? ext->sort.desc[0] : 0;
-                uint8_t nf   = ext->sort.nulls_first
-                              ? ext->sort.nulls_first[0]
-                              : sort_nulls_first(desc);
-                ray_t* topk_res = ray_topk_table(tbl, key_cols[0], desc, nf, limit);
+                ray_t* topk_res = ray_topk_table(tbl, key_cols[0], desc, topk_key_nf(ext, 0), limit);
                 if (topk_res && !RAY_IS_ERR(topk_res)) return topk_res;
                 if (topk_res && RAY_IS_ERR(topk_res)) ray_release(topk_res);
             } else {
                 uint8_t nfs[16];
-                for (uint32_t k = 0; k < n_sort; k++) {
-                    uint8_t d = ext->sort.desc ? ext->sort.desc[k] : 0;
-                    nfs[k] = ext->sort.nulls_first
-                             ? ext->sort.nulls_first[k]
-                             : sort_nulls_first(d);
-                }
+                for (uint32_t k = 0; k < n_sort; k++) nfs[k] = topk_key_nf(ext, k);
                 ray_t* topk_res = ray_topk_table_multi(tbl, key_cols,
                     ext->sort.desc, nfs, n_sort, limit);
                 if (topk_res && !RAY_IS_ERR(topk_res)) return topk_res;
@@ -3719,6 +3774,7 @@ ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit) {
             /* Index eligible and fresh: consult + hit. */
             ray_idx_consults[IDX_SITE_SORT]++;
             ray_idx_hits[IDX_SITE_SORT]++;
+            ray_idx_note_use(sort_vecs[0]);
             ray_retain(perm);
             idx_vec = perm;
             goto sort_idx_ready;
@@ -3774,10 +3830,24 @@ sort_idx_ready:;
     /* Pre-allocate all output columns, then do a single fused gather pass */
     ray_pool_t* gather_pool = (gather_rows > RAY_PARALLEL_THRESHOLD) ? ray_pool_get() : NULL;
     ray_t* new_cols[ncols];
+    ray_t* src_cols[ncols];   /* borrowed: the plain source columns */
     int64_t col_names[ncols];
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* col = ray_table_get_col_idx(tbl, c);
+        ray_t* col = ray_table_col_idx(tbl, c);
         col_names[c] = ray_table_col_name(tbl, c);
+        src_cols[c] = col;
+        if (col && RAY_IS_ERR(col)) {
+            for (int64_t j = 0; j < c; j++)
+                if (new_cols[j]) ray_release(new_cols[j]);
+            ray_release(result);
+            if (sorted_keys_hdr) scratch_free(sorted_keys_hdr);
+            for (uint32_t k = 0; k < n_sort; k++)
+                if (sort_owned[k] && sort_vecs[k] && !RAY_IS_ERR(sort_vecs[k]))
+                    ray_release(sort_vecs[k]);
+            scratch_free(sort_hdr);
+            ray_release(idx_vec);
+            return col;
+        }
         if (!col) { new_cols[c] = NULL; continue; }
         ray_t* nc;
         if (col->type == RAY_LIST) {
@@ -3855,7 +3925,7 @@ sort_idx_ready:;
         int64_t g_nc = 0;
         for (; base < ncols && g_nc < MGATHER_MAX_COLS; base++) {
             if (!new_cols[base] || base == decode_col_idx) continue;
-            ray_t* col = ray_table_get_col_idx(tbl, base);
+            ray_t* col = src_cols[base];
             if (col->type == RAY_LIST) continue;
             g_srcs[g_nc] = (char*)ray_data(col);
             g_dsts[g_nc] = (char*)ray_data(new_cols[base]);
@@ -3884,7 +3954,7 @@ sort_idx_ready:;
     /* Propagate str_pool / null bitmaps from source columns */
     for (int64_t c = 0; c < ncols; c++) {
         if (!new_cols[c]) continue;
-        ray_t* col = ray_table_get_col_idx(tbl, c);
+        ray_t* col = src_cols[c];
         if (!col) continue;
         col_propagate_str_pool(new_cols[c], col);
         /* Gather null bits in sorted order */
@@ -3913,6 +3983,164 @@ sort_idx_ready:;
     scratch_free(sort_hdr);
 
     ray_release(idx_vec);
+    return result;
+}
+
+/* ---- HEAD(SORT) under a lazy selection: late materialization ----
+ * The old route compacted every column of the table under the selection,
+ * then took the top `limit` rows of the compacted table (ray_topk_table /
+ * _multi) and gathered them again.  Here only the sort keys are compacted;
+ * the top-k runs on them exactly as it ran on the compacted table (the
+ * same values at the same positions, ties kept by the lower position);
+ * the winners' positions are mapped back to source rows through the
+ * selection, and only those rows of every column are compacted (a rowsel
+ * of the winners, ascending) and put in the top-k order by the same
+ * gather.  So the answer is the old route's, row for row, and every
+ * column but the keys is read for `limit` rows instead of the selection's
+ * (parted q24: 646 survivors of 105 columns gathered for 10 results).
+ * NULL when the shape is not the one the top-k shortcut takes (the caller
+ * compacts the whole table and sorts, as before). */
+static ray_t* sel_rows_rowsel(int64_t nrows, const int64_t* rows, int64_t k) {
+    int64_t idx_count = 0;
+    for (int64_t i = 0; i < k; ) {
+        int64_t seg = rows[i] / RAY_MORSEL_ELEMS, j = i;
+        while (j < k && rows[j] / RAY_MORSEL_ELEMS == seg) j++;
+        int64_t seglen = nrows - seg * RAY_MORSEL_ELEMS < RAY_MORSEL_ELEMS ? nrows - seg * RAY_MORSEL_ELEMS : RAY_MORSEL_ELEMS;
+        if (j - i != seglen) idx_count += j - i;
+        i = j;
+    }
+    ray_t* sel = ray_rowsel_new(nrows, k, idx_count);
+    if (!sel) return NULL;
+    ray_rowsel_t* m = ray_rowsel_meta(sel);
+    uint8_t* flags = ray_rowsel_flags(sel);
+    uint32_t* offs = ray_rowsel_offsets(sel);
+    uint16_t* idx = ray_rowsel_idx(sel);
+    memset(flags, RAY_SEL_NONE, m->n_segs);
+    uint32_t at = 0;
+    int64_t i = 0;
+    for (uint32_t seg = 0; seg < m->n_segs; seg++) {
+        offs[seg] = at;
+        int64_t j = i;
+        while (j < k && rows[j] / RAY_MORSEL_ELEMS == (int64_t)seg) j++;
+        if (j == i) continue;
+        int64_t seglen = nrows - (int64_t)seg * RAY_MORSEL_ELEMS < RAY_MORSEL_ELEMS
+                       ? nrows - (int64_t)seg * RAY_MORSEL_ELEMS : RAY_MORSEL_ELEMS;
+        if (j - i == seglen) {
+            flags[seg] = RAY_SEL_ALL;
+        } else {
+            flags[seg] = RAY_SEL_MIX;
+            for (int64_t q = i; q < j; q++) idx[at++] = (uint16_t)(rows[q] - (int64_t)seg * RAY_MORSEL_ELEMS);
+        }
+        i = j;
+    }
+    offs[m->n_segs] = at;
+    return sel;
+}
+
+/* A position pair: the winner's position in the compacted keys and its
+ * rank in the top-k order. */
+typedef struct { int64_t pos, rank; } sel_late_pair_t;
+static int sel_late_cmp(const void* a, const void* b) {
+    int64_t x = ((const sel_late_pair_t*)a)->pos, y = ((const sel_late_pair_t*)b)->pos;
+    return (x > y) - (x < y);
+}
+
+static _Atomic(uint64_t) g_late_heads;   /* test hook: late-materialized HEAD(SORT)s */
+uint64_t ray_sort_test_late_heads(void) { return atomic_load_explicit(&g_late_heads, memory_order_relaxed); }
+
+ray_t* exec_sort_head_sel(ray_graph_t* g, ray_op_t* op, ray_t* tbl, ray_t* sel, int64_t limit) {
+    if (!g || !tbl || tbl->type != RAY_TABLE || !sel) return NULL;
+    ray_op_ext_t* ext = find_ext(g, op->id);
+    if (!ext) return NULL;
+    uint32_t n_sort = ext->sort.n_cols;
+    ray_rowsel_t* meta = ray_rowsel_meta(sel);
+    int64_t nrows = ray_table_nrows(tbl), pass = meta->total_pass;
+    /* exec_sort's top-k shortcut gate, as it would see the compacted
+     * table (its rows: the selection's), and ray_topk_table's LIST rule */
+    if (!topk_shortcut_shape(n_sort, limit, pass) || meta->nrows != nrows || topk_has_list(tbl)) return NULL;
+    /* keys resolved by name on the key table (sort_key_scan_col's
+     * projected-child case keeps the old route) */
+    ray_op_t* child = op_child(g, op, 0);
+    if (child && child->opcode == OP_SELECT) return NULL;
+    int64_t ncols = ray_table_ncols(tbl);
+    int64_t keys[16];
+    for (uint32_t k = 0; k < n_sort; k++) {
+        uint32_t id;
+        if (!topk_scan_key(g, ext, k, &id, &keys[k])) return NULL;
+        bool found = false;
+        for (int64_t c = 0; c < ncols && !found; c++) found = ray_table_col_name(tbl, c) == keys[k];
+        if (!found) return NULL;
+    }
+    ray_t* ktbl = sel_compact(g, tbl, sel, keys, (int)n_sort);
+    if (!ktbl || RAY_IS_ERR(ktbl)) return ktbl;
+    ray_t* key_cols[16];
+    uint8_t nfs[16];
+    for (uint32_t k = 0; k < n_sort; k++) {
+        key_cols[k] = topk_key_col(g, op, ext, ktbl, k);
+        nfs[k] = topk_key_nf(ext, k);
+        /* a short key: sel_compact's alloc fallback handed back the table */
+        if (!key_cols[k] || key_cols[k]->len != pass) { ray_release(ktbl); return key_cols[k] ? ray_error("oom", NULL) : NULL; }
+    }
+    ray_t* idx = n_sort == 1
+        ? topk_indices_single(key_cols[0], ext->sort.desc ? ext->sort.desc[0] : 0, nfs[0], pass, limit)
+        : topk_indices_cmp(key_cols, ext->sort.desc, nfs, (uint8_t)n_sort, pass, limit);
+    ray_release(ktbl);
+    if (!idx || RAY_IS_ERR(idx)) {                      /* unsupported, or the full sort reports it */
+        if (idx) ray_error_free(idx);
+        return NULL;
+    }
+    /* the winners' source rows, ascending, through the selection's segments */
+    const int64_t* pos = (const int64_t*)ray_data(idx);
+    ray_t* ph = NULL;
+    sel_late_pair_t* pr = (sel_late_pair_t*)scratch_alloc(&ph, (size_t)limit * sizeof(sel_late_pair_t));
+    ray_t* rh = NULL;
+    int64_t* rows = (int64_t*)scratch_alloc(&rh, (size_t)limit * sizeof(int64_t));
+    ray_t* perm = ray_vec_new(RAY_I64, limit);
+    if (!pr || !rows || !perm || RAY_IS_ERR(perm)) {
+        if (ph) scratch_free(ph);
+        if (rh) scratch_free(rh);
+        if (perm && !RAY_IS_ERR(perm)) ray_release(perm);
+        ray_release(idx);
+        return ray_error("oom", NULL);
+    }
+    for (int64_t i = 0; i < limit; i++) { pr[i].pos = pos[i]; pr[i].rank = i; }
+    ray_release(idx);
+    qsort(pr, (size_t)limit, sizeof *pr, sel_late_cmp);
+    const uint8_t* flags = ray_rowsel_flags(sel);
+    const uint32_t* offs = ray_rowsel_offsets(sel);
+    const uint16_t* sidx = ray_rowsel_idx(sel);
+    int64_t cum = 0, q = 0;
+    for (uint32_t seg = 0; seg < meta->n_segs && q < limit; seg++) {
+        if (flags[seg] == RAY_SEL_NONE) continue;
+        int64_t lo = (int64_t)seg * RAY_MORSEL_ELEMS;
+        int64_t cnt = flags[seg] == RAY_SEL_ALL ? (nrows - lo < RAY_MORSEL_ELEMS ? nrows - lo : RAY_MORSEL_ELEMS)
+                                                : (int64_t)offs[seg + 1] - (int64_t)offs[seg];
+        for (; q < limit && pr[q].pos < cum + cnt; q++) {
+            int64_t l = pr[q].pos - cum;
+            rows[q] = lo + (flags[seg] == RAY_SEL_ALL ? l : (int64_t)sidx[offs[seg] + l]);
+        }
+        cum += cnt;
+    }
+    perm->len = limit;
+    int64_t* pm = (int64_t*)ray_data(perm);
+    for (int64_t i = 0; i < limit; i++) pm[pr[i].rank] = i;  /* rank -> its row's place among the winners */
+    scratch_free(ph);
+    ray_t* err = NULL;
+    if (q != limit) err = ray_error("corrupt", "sort: selection holds fewer rows than its %lld", (long long)pass);
+    ray_t* wsel = err ? NULL : sel_rows_rowsel(nrows, rows, limit);
+    scratch_free(rh);
+    if (!err && !wsel) err = ray_error("oom", NULL);
+    if (err) { ray_release(perm); return err; }
+    ray_t* wtbl = sel_compact(g, tbl, wsel, NULL, 0);
+    ray_rowsel_release(wsel);
+    if (!wtbl || RAY_IS_ERR(wtbl)) { ray_release(perm); return wtbl ? wtbl : ray_error("oom", NULL); }
+    if (ray_table_nrows(wtbl) != limit) {               /* sel_compact's alloc fallback: the table itself */
+        ray_release(wtbl); ray_release(perm);
+        return ray_error("oom", NULL);
+    }
+    ray_t* result = topk_gather_rows(wtbl, perm, limit);   /* releases perm */
+    ray_release(wtbl);
+    atomic_fetch_add_explicit(&g_late_heads, 1, memory_order_relaxed);
     return result;
 }
 
@@ -4215,7 +4443,10 @@ static ray_t* sort_stamp_ordered_table(ray_t* tbl, int64_t key_id,
     }
     for (int64_t c = 0; c < ncols; c++) {
         int64_t cn = ray_table_col_name(tbl, c);
-        ray_t* col = (cn == key_id) ? stamped : ray_table_get_col_idx(tbl, c);
+        ray_t* col = stamped;
+        if (cn != key_id) {
+            col = ray_table_slot_idx(tbl, c);
+        }
         out = ray_table_add_col(out, cn, col);
         if (!out || RAY_IS_ERR(out)) {
             ray_release(stamped);
@@ -4282,7 +4513,12 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
 
     /* Resolve key columns */
     for (int64_t i = 0; i < n_keys; i++) {
-        key_cols[i] = ray_table_get_col(tbl, key_ids[i]);
+        key_cols[i] = ray_table_col(tbl, key_ids[i]);
+        if (key_cols[i] && RAY_IS_ERR(key_cols[i])) {
+            ray_t* err = key_cols[i];
+            scratch_free(k_hdr);
+            return err;
+        }
         if (!key_cols[i]) {
             scratch_free(k_hdr);
             return ray_error("domain", "xasc/xdesc: key column not found in table");
@@ -4364,7 +4600,8 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
 
     ray_t* nc_hdr = NULL;
     ray_t** new_cols = (ray_t**)scratch_alloc(&nc_hdr,
-                             (size_t)ncols * sizeof(ray_t*));
+                             (size_t)ncols * 2 * sizeof(ray_t*));
+    ray_t** src_cols = new_cols ? new_cols + ncols : NULL;   /* borrowed plain sources */
     ray_t* cn_hdr = NULL;
     int64_t* col_names = (int64_t*)scratch_alloc(&cn_hdr,
                              (size_t)ncols * sizeof(int64_t));
@@ -4376,11 +4613,22 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
         ray_release(idx);
         return ray_error("oom", NULL);
     }
-    for (int64_t c = 0; c < ncols; c++) new_cols[c] = NULL;
+    for (int64_t c = 0; c < ncols; c++) { new_cols[c] = NULL; src_cols[c] = NULL; }
 
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* col = ray_table_get_col_idx(tbl, c);
+        ray_t* col = ray_table_col_idx(tbl, c);
         col_names[c] = ray_table_col_name(tbl, c);
+        src_cols[c] = col;
+        if (col && RAY_IS_ERR(col)) {
+            for (int64_t j = 0; j < c; j++)
+                if (new_cols[j]) ray_release(new_cols[j]);
+            scratch_free(nc_hdr);
+            scratch_free(cn_hdr);
+            if (sorted_keys_hdr) scratch_free(sorted_keys_hdr);
+            scratch_free(k_hdr);
+            ray_release(idx);
+            return col;
+        }
         if (!col) continue;
         ray_t* nc;
         if (col->type == RAY_LIST)
@@ -4448,7 +4696,7 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
         int64_t g_nc = 0;
         for (; base < ncols && g_nc < MGATHER_MAX_COLS; base++) {
             if (!new_cols[base] || base == decode_col_idx) continue;
-            ray_t* col = ray_table_get_col_idx(tbl, base);
+            ray_t* col = src_cols[base];
             if (col->type == RAY_LIST) continue;
             g_srcs[g_nc] = (char*)ray_data(col);
             g_dsts[g_nc] = (char*)ray_data(new_cols[base]);
@@ -4479,7 +4727,7 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
      * gather_by_idx. */
     for (int64_t c = 0; c < ncols; c++) {
         if (!new_cols[c]) continue;
-        ray_t* col = ray_table_get_col_idx(tbl, c);
+        ray_t* col = src_cols[c];
         if (!col) continue;
         col_propagate_str_pool(new_cols[c], col);
         bool src_has_nulls = ray_vec_may_have_nulls(col);

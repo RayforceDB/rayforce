@@ -127,7 +127,7 @@ trades/
 
 Pass a `sym_path` to automatically save/load the symbol table alongside the data. Pass `NULL` if you manage symbols separately.
 
-From Rayfall, use `(.db.splayed.set "/tmp/weather" t)` to save and `(.db.splayed.get "/tmp/weather")` to load — no C code required.
+From Rayfall, use `(.db.splayed.set "/tmp/weather" t)` to save (add `{compress: true}` for compressed column files) and `(.db.splayed.get "/tmp/weather")` to load — no C code required.
 
 ## 5. Partitioned Tables { #partitioned-tables }
 
@@ -380,6 +380,9 @@ decoding, and streaming grouped queries remain future work.
 
 Both `.parquet.splayed [types] path directory` and
 `.parquet.parted [types] path root table-name` return the imported row count.
+An options dict in place of the type vector may add `compress: true` for
+compressed (generation-2) column files; `.csv.splayed` and `.csv.parted` take
+`{compress: true}` as a leading argument.
 The optional positional type vector has one entry per source column. It accepts
 matching native types, checked signed integer widths, and `SYM` for text. Raw
 integer dates/timestamps require explicit `UNIX_DATE` (days), `UNIX_SECONDS`,

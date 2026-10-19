@@ -93,6 +93,9 @@
 (set _BT (table [id note] (list (til _N) (at (list "alpha" "beta" "gamma" "delta") (% (til _N) 4)))))
 (.db.splayed.set "rf_bigstr/" _BT)
 (set _BT 0)
+;; (a generation-2 save, as in the equivalence pass, persists the same dict
+;; index in the column's index region, P6b: over 65536 rows, so indexed in
+;; both generations)
 (.idx.has? (at (.db.splayed.get "rf_bigstr/") 'note)) -- true
 
 (set _m0 (at (.sys.mem) 'sys-mapped))
@@ -113,7 +116,8 @@
 ;;    is not a whole number of pages left its tail behind: a 20,000-row
 ;;    table read 1,000 times ended millions of bytes below zero. ─────────
 (.sys.exec "rm -rf rf_mapcnt") -- 0
-(.db.splayed.set "rf_mapcnt/" (table [i f s c] (list (til 20000) (as 'F64 (til 20000)) (take [x y z] 20000) (take ["ab" "cde" ""] 20000))))
+;;    Saved as generation 0: the count is of files mapped in place.
+(.db.splayed.set "rf_mapcnt/" (table [i f s c] (list (til 20000) (as 'F64 (til 20000)) (take [x y z] 20000) (take ["ab" "cde" ""] 20000))) {compress: false})
 (set _m0 (at (.sys.mem) 'sys-mapped))
 (set u (.db.splayed.get "rf_mapcnt/"))
 ;; Held, the table is counted: the check below is not vacuous.

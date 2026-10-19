@@ -35,6 +35,7 @@
 
 #include "test.h"
 #include "ops/agg_engine.h"   /* --census: agg_route_stats */
+#include "core/pool.h"         /* ray_pool_test_ring_fail */
 #include "test_rfl.h"
 
 #include <stdio.h>
@@ -51,6 +52,10 @@
 #include "ops/internal.h"
 #include "ops/idxop.h"
 #include "store/fileio.h"   /* ray_mkdir_p — ray_test_mkdir_p */
+#include "store/col.h"      /* ray_store_test_force_compress — equivalence pass */
+#include "store/enccol.h"   /* ray_test_hooks_off */
+#include "store/encw.h"
+#include "ops/colbind.h"
 
 /* __RUNTIME is internal test plumbing; runtime API declarations come from
  * <rayforce.h>. */
@@ -161,7 +166,24 @@ extern const test_entry_t sel_entries[];
 extern const test_entry_t select_merge_entries[];
 extern const test_entry_t sort_entries[];
 extern const test_entry_t splay_entries[];
+extern const test_entry_t srccheck_entries[];
 extern const test_entry_t store_entries[];
+extern const test_entry_t idx_uses_entries[];
+extern const test_entry_t enc_entries[];
+extern const test_entry_t encfmt_entries[];
+extern const test_entry_t encidx_entries[];
+extern const test_entry_t encfloat_entries[];
+extern const test_entry_t encstr_entries[];
+extern const test_entry_t enconce_entries[];
+extern const test_entry_t enccol_entries[];
+extern const test_entry_t enccorrupt_entries[];
+extern const test_entry_t large_entries[];
+extern const test_entry_t colrange_entries[];
+extern const test_entry_t scanrange_entries[];
+extern const test_entry_t aware_entries[];
+extern const test_entry_t parted_ragged_entries[];
+extern const test_entry_t compress_entries[];
+extern const test_entry_t fsst_entries[];
 extern const test_entry_t stress_eval_entries[];
 extern const test_entry_t stress_matrix_entries[];
 extern const test_entry_t stress_random_entries[];
@@ -205,7 +227,16 @@ static const test_entry_t* const compiled_groups[] = {
     pool_entries,     progress_entries,
     public_api_entries,
     repl_entries,     rowsel_entries,   runtime_entries,  sel_entries, select_merge_entries,
-    sort_entries,     splay_entries,    store_entries,
+    sort_entries,     splay_entries,    srccheck_entries, store_entries,    enc_entries,
+    encfmt_entries,   encidx_entries,   encfloat_entries, encstr_entries, enconce_entries,   enccol_entries, enccorrupt_entries,
+    large_entries,
+    colrange_entries,
+    scanrange_entries,
+    aware_entries,
+    parted_ragged_entries,
+    compress_entries,
+    idx_uses_entries,
+    fsst_entries,
     stress_eval_entries,
     stress_matrix_entries,
     stress_random_entries,
@@ -366,6 +397,8 @@ static ray_t* rfl_eval(const char* src, const char* path, int line_no) {
     return v;
 }
 
+static char* tmp_subst(const char* s);   /* the per-process /tmp rewrite, below */
+
 static test_result_t run_rfl_file(const char* path) {
     FILE* f = fopen(path, "rb");
     if (!f) FAILF("cannot open %s", path);
@@ -378,6 +411,9 @@ static test_result_t run_rfl_file(const char* path) {
     size_t r = fread(src, 1, (size_t)n, f);
     src[r] = '\0';
     fclose(f);
+    /* every "/tmp" path the file names moves under this process's root */
+    char* moved = tmp_subst(src);
+    if (moved) { free(src); src = moved; }
 
     /* ";; @requires: posix" anywhere in a file marks it as depending on a
      * POSIX shell / filesystem (.sys.exec pipelines, /proc).  Where that
@@ -888,6 +924,112 @@ int ray_test_mkdir_p(const char* path) {
     return ray_mkdir_p(path) == RAY_OK ? 0 : -1;
 }
 
+void ray_test_hooks_off(void) {
+    ray_enccol_test_fail_alloc(0);
+    ray_enccol_test_fail_path(NULL);
+    ray_enccol_test_interrupt_after(0);
+    ray_enccol_test_parted_mode(0);
+    ray_enccol_test_refuse_attach(0);
+    ray_enccol_test_fail_index_parse(false);
+    ray_col_test_fail_alloc(0);
+    ray_col_test_no_dict(false);
+    ray_encw_test_force(-1);
+    ray_encw_test_force_float(-1);
+    ray_encw_test_force_str(-1);
+    ray_graph_bind_test_fail_alloc(0);
+    ray_store_test_force_compress(false);
+    ray_idx_lazy_test_fail_build(NULL);
+    ray_expr_test_parted_all_segments(false);
+    ray_group_test_route(0);
+    ray_group_test_scalar_grain(0);
+    ray_pool_test_ring_fail(0);
+    agg_test_force_smallhash(false);
+    ray_clear_interrupt();
+}
+
+/* ---- Per-process scratch root (declared in test.h) ---- */
+
+static char   g_tmp_root[64];   /* "/tmp/rayforce_t.<pid>", set in main() */
+static size_t g_tmp_root_len;
+
+/* A "/tmp" path starts at s[i]: "/tmp" as a whole path component, not part
+ * of a longer name ("/var/tmp", "/tmpx"), and not already under the root. */
+static bool tmp_hit(const char* s, size_t n, size_t i) {
+    if (i + 4 > n || memcmp(s + i, "/tmp", 4) != 0) return false;
+    if (i > 0) {
+        char c = s[i - 1];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+            c == '_' || c == '.' || c == '-' || c == '/' || c == '~') return false;
+    }
+    char r = s[i + 4];
+    if (!(r == '/' || r == '\0' || r == '"' || r == '\\' || r == '\'' || r == ' ' ||
+          r == ')' || r == ';' || r == '\n' || r == '\t')) return false;
+    bool under_root = strncmp(s + i, g_tmp_root, g_tmp_root_len) == 0 &&
+                      (s[i + g_tmp_root_len] == '/' || s[i + g_tmp_root_len] == '\0');
+    return !under_root;
+}
+
+/* The rewrite of `s` (malloc'd), or NULL when `s` names no "/tmp" path or
+ * the root is not set yet. */
+static char* tmp_subst(const char* s) {
+    if (!g_tmp_root_len || !s) return NULL;
+    size_t n = strlen(s), hits = 0;
+    for (size_t i = 0; i < n; i++) if (tmp_hit(s, n, i)) hits++;
+    if (!hits) return NULL;
+    char* out = (char*)malloc(n + hits * g_tmp_root_len + 1);
+    if (!out) { fprintf(stderr, "ray_test_tmp: out of memory\n"); abort(); }
+    size_t o = 0;
+    for (size_t i = 0; i < n; ) {
+        if (tmp_hit(s, n, i)) { memcpy(out + o, g_tmp_root, g_tmp_root_len); o += g_tmp_root_len; i += 4; }
+        else out[o++] = s[i++];
+    }
+    out[o] = '\0';
+    return out;
+}
+
+/* Interned results: an open-addressed table keyed by the argument's text. */
+typedef struct { char* key; char* val; } tmp_ent_t;
+static tmp_ent_t* g_tmp_tab;
+static size_t     g_tmp_cap, g_tmp_n;
+
+static size_t tmp_hash(const char* s) {
+    uint64_t h = 1469598103934665603ull;
+    for (; *s; s++) h = (h ^ (unsigned char)*s) * 1099511628211ull;
+    return (size_t)h;
+}
+static char* tmp_strdup(const char* s) {
+    size_t n = strlen(s) + 1;
+    char* d = (char*)malloc(n);
+    if (!d) { fprintf(stderr, "ray_test_tmp: out of memory\n"); abort(); }
+    return memcpy(d, s, n);
+}
+
+const char* ray_test_tmp(const char* s) {
+    if (!s) return s;
+    if (g_tmp_n * 2 >= g_tmp_cap) {
+        size_t ncap = g_tmp_cap ? g_tmp_cap * 2 : 1024;
+        tmp_ent_t* nt = (tmp_ent_t*)calloc(ncap, sizeof *nt);
+        if (!nt) { fprintf(stderr, "ray_test_tmp: out of memory\n"); abort(); }
+        for (size_t i = 0; i < g_tmp_cap; i++) {
+            if (!g_tmp_tab[i].key) continue;
+            size_t j = tmp_hash(g_tmp_tab[i].key) & (ncap - 1);
+            while (nt[j].key) j = (j + 1) & (ncap - 1);
+            nt[j] = g_tmp_tab[i];
+        }
+        free(g_tmp_tab); g_tmp_tab = nt; g_tmp_cap = ncap;
+    }
+    size_t j = tmp_hash(s) & (g_tmp_cap - 1);
+    while (g_tmp_tab[j].key) {
+        if (strcmp(g_tmp_tab[j].key, s) == 0) return g_tmp_tab[j].val;
+        j = (j + 1) & (g_tmp_cap - 1);
+    }
+    char* v = tmp_subst(s);
+    g_tmp_tab[j].key = tmp_strdup(s);
+    g_tmp_tab[j].val = v ? v : g_tmp_tab[j].key;
+    g_tmp_n++;
+    return g_tmp_tab[j].val;
+}
+
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -908,6 +1050,58 @@ long ray_test_sysconf(int name) {
     }
 }
 #endif
+
+/* ─── Equivalence pass ────────────────────────────────────────────────
+ * Every save in these tests is written as generation 2 (absent compress
+ * behaves as true) and every load reads it back: results must equal the
+ * generation-0 run.  An assert on a generation-0 property (mapped-in-place
+ * residency, an auto-built persisted index, header bytes) is written
+ * generation-aware (TEST_ASSERT_LOADED_MMOD, a header check, or an explicit
+ * {compress: false} save) so the rest of the test still runs here; a test
+ * that cannot run twice in one process is listed in equiv_skip with the
+ * reason.  Anything else that differs is a bug in the generation-2 path,
+ * never a test change. */
+static const char* const equiv_skip[] = {
+    /* runs its own heap lifecycle and leaks a domain into the process-wide
+     * cache on purpose: a second run in the same process (this pass) opens
+     * no domain.  It saves a symbol file only, no table. */
+    "equiv/domain/survives_heap_recycle",
+    NULL,
+};
+
+static bool equiv_skipped(const char* name) {
+    for (int i = 0; equiv_skip[i]; i++) if (strcmp(equiv_skip[i], name) == 0) return true;
+    return false;
+}
+
+static bool rfl_file_saves(const char* path) {
+    static const char* const forms[] = { ".db.splayed.set", ".csv.splayed", ".csv.parted",
+                                         ".parquet.splayed", ".parquet.parted", NULL };
+    FILE* f = fopen(path, "rb");
+    if (!f) return false;
+    static char buf[1 << 20];
+    size_t n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    for (int i = 0; forms[i]; i++) if (strstr(buf, forms[i])) return true;
+    return false;
+}
+
+static const test_entry_t* g_equiv_inner;
+static bool g_equiv_on;
+bool ray_test_equiv_pass(void) { return g_equiv_on; }
+static void equiv_c_setup(void) {
+    if (g_equiv_inner->setup) g_equiv_inner->setup();
+    ray_store_test_force_compress(true);
+    g_equiv_on = true;
+}
+static void equiv_c_teardown(void) {
+    g_equiv_on = false;
+    ray_store_test_force_compress(false);
+    if (g_equiv_inner->teardown) g_equiv_inner->teardown();
+}
+static void equiv_rfl_setup(void)    { rfl_setup(); ray_store_test_force_compress(true); g_equiv_on = true; }
+static void equiv_rfl_teardown(void) { g_equiv_on = false; ray_store_test_force_compress(false); rfl_teardown(); }
 
 int main(int argc, char** argv) {
 #if defined(_WIN32)
@@ -937,6 +1131,10 @@ int main(int argc, char** argv) {
     }
 
     if (g_census) setvbuf(g_census, NULL, _IOLBF, 0);   /* closed by the OS at exit; lines land as written */
+    snprintf(g_tmp_root, sizeof g_tmp_root, "/tmp/rayforce_t.%ld", (long)getpid());
+    (void)ray_test_rm_rf(g_tmp_root);                    /* a dead run's leftovers under a reused pid */
+    if (ray_test_mkdir_p(g_tmp_root) != 0) { fprintf(stderr, "cannot create %s\n", g_tmp_root); return 2; }
+    g_tmp_root_len = strlen(g_tmp_root);
     const char* rfl_root = getenv("RFL_ROOT");
     if (!rfl_root || !*rfl_root) rfl_root = "test/rfl";
     if (rfl_scan(rfl_root) < 0) return 2;
@@ -948,6 +1146,9 @@ int main(int argc, char** argv) {
         const test_entry_t* g = compiled_groups[gi];
         for (int i = 0; g[i].name; i++) {
             if (!name_matches_filter(g[i].name, filter)) continue;
+            /* large/ tests need several GiB of RAM and disk: only on request */
+            if (strncmp(g[i].name, "large/", 6) == 0 &&
+                !(filter && strncmp(filter, "large/", 6) == 0)) continue;
             total++;
             run_one(&g[i], &pass, &fail, &skip);
         }
@@ -965,6 +1166,39 @@ int main(int argc, char** argv) {
         };
         run_one(&e, &pass, &fail, &skip);
     }
+
+    /* Equivalence pass: C groups that save and reload tables, then every
+     * .rfl file that saves one. */
+    static const test_entry_t* const equiv_groups[] = {
+        splay_entries, store_entries, partition_exec_entries, link_entries,
+        /* query-heavy groups that save tables */
+        stress_eval_entries, stress_matrix_entries, stress_random_entries,
+        lang_entries, index_entries, csr_entries, domain_entries, sym_entries,
+        NULL,
+    };
+    char ename[600];
+    for (int gi = 0; equiv_groups[gi]; gi++) {
+        for (int i = 0; equiv_groups[gi][i].name; i++) {
+            snprintf(ename, sizeof ename, "equiv/%s", equiv_groups[gi][i].name);
+            if (!name_matches_filter(ename, filter) || equiv_skipped(ename)) continue;
+            g_equiv_inner = &equiv_groups[gi][i];
+            test_entry_t e = { .name = ename, .func = equiv_groups[gi][i].func,
+                               .setup = equiv_c_setup, .teardown = equiv_c_teardown };
+            total++;
+            run_one(&e, &pass, &fail, &skip);
+        }
+    }
+    for (int i = 0; i < g_rfl_count; i++) {
+        snprintf(ename, sizeof ename, "equiv/%s", g_rfl_names[i]);
+        if (!name_matches_filter(ename, filter) || equiv_skipped(ename)) continue;
+        if (!rfl_file_saves(g_rfl_paths[i])) continue;
+        test_entry_t e = { .name = ename, .func = rfl_thunks[i],
+                           .setup = equiv_rfl_setup, .teardown = equiv_rfl_teardown };
+        total++;
+        run_one(&e, &pass, &fail, &skip);
+    }
+
+    (void)ray_test_rm_rf(g_tmp_root);
 
     printf("\n%s=== %d of %d passed (%d skipped, %d failed) ===%s\n",
            fail ? C_RED : (skip ? C_YELLOW : C_GREEN),

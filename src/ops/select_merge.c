@@ -99,7 +99,7 @@ static ray_t* merge_put(ray_t* d, int64_t id, ray_t* value) {
 /* Reject shadowed builtins, including source columns used as call heads. */
 static ray_t* merge_fn(merge_scope_t* s, ray_t* head) {
     if (!head || head->type != -RAY_SYM || (head->attrs & ATTR_QUOTED) ||
-        ray_table_get_col(s->table, head->i64) || ray_env_has_lexical_local(head->i64)) return NULL;
+        ray_table_has_col(s->table, head->i64) || ray_env_has_lexical_local(head->i64)) return NULL;
     for (int i = 0; i < s->n; i++) if (s->cols[i].name == head->i64) return NULL;
     return ray_env_get(head->i64);
 }
@@ -129,9 +129,10 @@ static ray_t* merge_expr(merge_scope_t* s, ray_t* e, int* type, bool* column, in
             *type = s->cols[i].type; *column = true;
             return merge_ref(s->cols[i].expr);
         }
-        ray_t* col = ray_table_get_col(s->table, e->i64);
-        if (col && !s->projected && col->type > 0 && col->type <= RAY_STR) {
-            *type = col->type; *column = true;
+        ray_col_meta_t cm;   /* metadata: an encoded column stays encoded */
+        bool col = ray_table_col_meta(s->table, e->i64, &cm);
+        if (col && !s->projected && cm.type > 0 && cm.type <= RAY_STR) {
+            *type = cm.type; *column = true;
             return merge_ref(e);
         }
         /* A quoted literal must not become a column reference after merge. */
@@ -178,8 +179,8 @@ static ray_t* merge_expr(merge_scope_t* s, ray_t* e, int* type, bool* column, in
  * intermediates (even when a later multiplier promotes the result to F64). */
 static bool merge_scaled_f64(ray_t* table, ray_t* e) {
     if (e->type == -RAY_SYM) {
-        ray_t* col = ray_table_get_col(table, e->i64);
-        return col && col->type == RAY_F64;
+        ray_col_meta_t cm;
+        return ray_table_col_meta(table, e->i64, &cm) && cm.type == RAY_F64;
     }
     if (e->type != RAY_LIST || e->len != 3) return false;
     ray_t** es = ray_data(e);
@@ -236,7 +237,10 @@ static bool merge_prefix_nonempty(ray_t* table, ray_t* where) {
     ray_t* prefix = ray_table_new(nc);
     if (!prefix || RAY_IS_ERR(prefix)) { merge_drop(prefix); return false; }
     for (int64_t i = 0; i < nc; i++) {
-        ray_t* c = ray_vec_slice(ray_table_get_col_idx(table, i), 0, MERGE_PREFIX_ROWS);
+        /* an encoded column is not sliced (that would decode it whole):
+         * no proof, the query stays as written */
+        if (ray_table_get_col_enc_idx(table, i)) { merge_drop(prefix); return false; }
+        ray_t* c = ray_vec_slice(ray_table_col_idx(table, i), 0, MERGE_PREFIX_ROWS);   /* plain: checked above */
         if (!c || RAY_IS_ERR(c)) { merge_drop(c); merge_drop(prefix); return false; }
         prefix = ray_table_add_col(prefix, ray_table_col_name(table, i), c);
         merge_drop(c);
@@ -265,8 +269,8 @@ static ray_t* merge_pair(ray_t* outer, ray_t* inner) {
     /* Partitioned/lazy and list columns need their own materialization proof,
      * including errors from columns an outer projection would discard. */
     for (int64_t i = 0; i < ray_table_ncols(tbl); i++) {
-        ray_t* c = ray_table_get_col_idx(tbl, i);
-        if (!c || c->type <= 0 || c->type > RAY_STR) return NULL;
+        ray_col_meta_t m;   /* metadata: an encoded column stays encoded */
+        if (!ray_table_col_meta_idx(tbl, i, &m) || m.type <= 0 || m.type > RAY_STR) return NULL;
     }
     ray_t* ik = ray_dict_keys(inner), **iv = ray_data(ray_dict_vals(inner));
     ray_t* ok = ray_dict_keys(outer), **ov = ray_data(ray_dict_vals(outer));
@@ -293,7 +297,7 @@ static ray_t* merge_pair(ray_t* outer, ray_t* inner) {
         int64_t name = sym_cell_runtime_id(ik, i);
         if (merge_clause(name)) continue;
         v = merge_expr(&s, iv[i], &type, &col, 0);
-        if (!v || !col || (ray_table_get_col(tbl, name) && !merge_identity(v, name))) goto done;
+        if (!v || !col || (ray_table_has_col(tbl, name) && !merge_identity(v, name))) goto done;
         s.cols[s.n++] = (merge_col_t){.name = name, .expr = v, .type = type,
                                      .computed = v->type == RAY_LIST};
         v = NULL;
@@ -338,7 +342,7 @@ static ray_t* merge_pair(ray_t* outer, ray_t* inner) {
             v = merge_ref(ov[i]);
         } else {
             v = merge_output(&s, ov[i], &type);
-            if (!v || (ray_table_get_col(tbl, name) && !merge_identity(v, name))) goto decline;
+            if (!v || (ray_table_has_col(tbl, name) && !merge_identity(v, name))) goto decline;
             aggregate |= v->type == RAY_LIST && v->len == 2;
             if (merge_get(outer, 4) && !(v->type == RAY_LIST && v->len == 2) &&
                 (type == RAY_SYM || type == RAY_STR)) goto decline;
@@ -363,8 +367,8 @@ static ray_t* merge_pair(ray_t* outer, ray_t* inner) {
     }
     if (!nout && !s.projected && merge_get(outer, 4)) {
         for (int64_t i = 0; i < ray_table_ncols(tbl); i++) {
-            ray_t* c = ray_table_get_col_idx(tbl, i);
-            if (!c || c->type == RAY_SYM || c->type == RAY_STR) goto decline;
+            ray_col_meta_t m;
+            if (!ray_table_col_meta_idx(tbl, i, &m) || m.type == RAY_SYM || m.type == RAY_STR) goto decline;
         }
     }
     for (int clause = 5; clause <= 6; clause++) {
@@ -375,7 +379,7 @@ static ray_t* merge_pair(ray_t* outer, ray_t* inner) {
         for (int i = 0; i < s.n; i++)
             if (s.cols[i].name == sort->i64 &&
                 !merge_identity(s.cols[i].expr, sort->i64)) goto decline;
-        bool visible = !nout && !s.projected && ray_table_get_col(tbl, sort->i64);
+        bool visible = !nout && !s.projected && ray_table_has_col(tbl, sort->i64);
         for (int i = 0; i < nout; i++) visible |= outputs[i] == sort->i64;
         if (!nout) for (int i = 0; i < s.n; i++) visible |= s.cols[i].name == sort->i64;
         /* A group key is also an output even without an explicit projection. */

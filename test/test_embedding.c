@@ -390,7 +390,7 @@ static test_result_t test_ann_recall_saturated(void) {
 /* ============ Persistence round-trip ============ */
 
 static test_result_t test_hnsw_save_load(void) {
-    const char* dir = "/tmp/ray_hnsw_test_idx";
+    const char* dir = ray_test_tmp("/tmp/ray_hnsw_test_idx");
     /* Build and save in 'ip metric. */
     ray_eval_str("(set __idx (hnsw-build " FIVE_VECS " 'ip 4 50))");
     char expr[512];
@@ -943,7 +943,7 @@ static test_result_t test_hnsw_search_filter_null_accept(void) {
 
 /* ray_hnsw_mmap: exercised via the C API directly (not exposed as a builtin). */
 static test_result_t test_hnsw_mmap_load(void) {
-    const char* dir = "/tmp/ray_hnsw_mmap_test";
+    const char* dir = ray_test_tmp("/tmp/ray_hnsw_mmap_test");
     /* Build & save a small index. */
     float vecs[5 * 3] = {
         1.0f, 0.0f, 0.0f,
@@ -1016,7 +1016,7 @@ static test_result_t test_hnsw_vec_size_valid_guard(void) {
  * malformed file must be rejected by both load entry points before a query
  * can turn it into an out-of-bounds read / process crash. */
 static test_result_t test_hnsw_load_rejects_bad_neighbor(void) {
-    const char* dir = "/tmp/ray_hnsw_bad_neighbor";
+    const char* dir = ray_test_tmp("/tmp/ray_hnsw_bad_neighbor");
     float vecs[2 * 2] = { 1.0f, 0.0f, 0.0f, 1.0f };
     ray_hnsw_t* idx = ray_hnsw_build(vecs, 2, 2, RAY_HNSW_L2, 4, 50);
     TEST_ASSERT_NOT_NULL(idx);
@@ -1042,9 +1042,9 @@ static test_result_t test_hnsw_load_rejects_bad_neighbor(void) {
  * upper layer. Loading should discard that unusable edge, while still
  * rejecting malformed entry-point and layer-width metadata. */
 static test_result_t test_hnsw_load_repairs_legacy_layer_edge(void) {
-    const char* neighbor_dir = "/tmp/ray_hnsw_wrong_layer_neighbor";
-    const char* entry_dir = "/tmp/ray_hnsw_wrong_layer_entry";
-    const char* width_dir = "/tmp/ray_hnsw_wrong_layer_width";
+    const char* neighbor_dir = ray_test_tmp("/tmp/ray_hnsw_wrong_layer_neighbor");
+    const char* entry_dir = ray_test_tmp("/tmp/ray_hnsw_wrong_layer_entry");
+    const char* width_dir = ray_test_tmp("/tmp/ray_hnsw_wrong_layer_width");
     float vecs[128 * 2];
     for (int i = 0; i < 128; i++) {
         vecs[i * 2] = (float)i;

@@ -21,6 +21,14 @@
 #include "ops/rowsel.h"      /* ray_rowsel_from_pred, ray_rowsel_release */
 #include "core/pool.h"
 #include "table/sym.h"
+#include "core/runtime.h"
+#include "core/platform.h"
+#include "lang/eval.h"
+#include "store/enccol.h"
+#include "store/encfmt.h"
+#include "store/splay.h"
+#include "table/table.h"
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -2381,6 +2389,435 @@ static test_result_t test_avg_exact_i128_engines(void) {
     return res;
 }
 
+/* ---- Task 17c: the fused radix chunk cap, the parallel parted flatten ----
+ * Runtime fixtures over stores saved under the process's own tmp root. */
+#define AE_TMP "/tmp/rayforce_aeroutes"
+static ray_runtime_t* g_ae_rt;
+static void ae_rt_setup(void) {
+    g_ae_rt = ray_runtime_create(0, NULL);
+    (void)ray_test_rm_rf(ray_test_tmp(AE_TMP)); (void)ray_test_mkdir_p(ray_test_tmp(AE_TMP));
+}
+static void ae_rt_teardown(void) {
+    ray_cache_llc_set_for_test(0);
+    ray_cancel_reset();
+    ray_pool_destroy(); (void)ray_pool_init_total(0);
+    ray_test_hooks_off();
+    (void)ray_test_rm_rf(ray_test_tmp(AE_TMP));
+    ray_runtime_destroy(g_ae_rt);
+}
+static ray_t* ae_eval(const char* src) { return ray_eval_str(ray_test_tmp(src)); }
+static void ae_drop(ray_t* o) { if (!o) return; if (RAY_IS_ERR(o)) ray_error_free(o); else ray_release(o); }
+static void ae_eval_ok(const char* src) {
+    ray_t* r = ae_eval(src);
+    if (r && RAY_IS_ERR(r)) { fprintf(stderr, "ae_eval_ok: %s: %s\n", src, ray_error_msg()); ray_error_free(r); abort(); }
+    if (r) ray_release(r);
+}
+static void ae_evalf_ok(const char* fmt, ...) {
+    char buf[2048];
+    va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof buf, fmt, ap); va_end(ap);
+    ae_eval_ok(buf);
+}
+/* Bytes decoded so far of column `name` of table t (summed over a parted
+ * column's encoded segments); *full: its generation-0 bytes. */
+static uint64_t ae_col_dec(ray_t* t, const char* name, uint64_t* full) {
+    ray_t* ec = ray_table_get_col_enc(t, ray_sym_intern(name, strlen(name)));
+    uint64_t r = 0;
+    *full = 0;
+    if (!ec) return 0;
+    ray_enccol_t* e = ray_enccol_of(ec);
+    if (e->kind == RAY_ENCCOL_SINGLE) {
+        *full = (uint64_t)e->len * ray_enccol_esz(e);
+        return atomic_load(&e->decoded_bytes);
+    }
+    for (int64_t i = 0; e->wrapper && i < e->wrapper->len; i++) {
+        ray_t* sg = ray_enccol_seg(ec, i);
+        if (!sg || sg->type != RAY_ENCCOL) continue;
+        ray_enccol_t* se = ray_enccol_of(sg);
+        r += atomic_load(&se->decoded_bytes);
+        *full += (uint64_t)se->len * ray_enccol_esz(se);
+    }
+    return r;
+}
+static uint64_t ae_dec(const char* name, uint64_t* full) {
+    ray_t* t = ae_eval("T");
+    uint64_t r = ae_col_dec(t, name, full);
+    ae_drop(t);
+    return r;
+}
+/* q's answer as .csv.write bytes (malloc'd; NULL on a failure). */
+static char* ae_csv(const char* q, size_t* n) {
+    char path[512], e[1024];
+    snprintf(path, sizeof path, "%s/a.csv", ray_test_tmp(AE_TMP));
+    snprintf(e, sizeof e, "(.csv.write %s \"%s\")", q, path);
+    ray_t* r = ae_eval(e);
+    bool ok = r && !RAY_IS_ERR(r);
+    ae_drop(r);
+    FILE* f = ok ? fopen(path, "rb") : NULL;
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END); long len = ftell(f); fseek(f, 0, SEEK_SET);
+    char* b = malloc((size_t)len + 1);
+    *n = b ? fread(b, 1, (size_t)len, f) : 0;
+    fclose(f);
+    if (b && *n != (size_t)len) { free(b); b = NULL; }
+    return b;
+}
+
+/* q17's shape on the v2 radix route: two wide keys, a count and an F64
+ * sum, 1.2M rows (2048 partitions: a run wants 16384-row chunks, 2
+ * blocks).  The last-level cache is set for 2 workers so a worker's
+ * staging share holds (0.75 * llc / 2 - 4 * 2048) / 26 rows (the staged
+ * k, m and f, 8 bytes each, and a partition id): about 14100 (one block
+ * fits, half a run: the fused pass on 8192-row chunks, the keys decode
+ * once per run, within 5% for the vectors a chunk starts inside), then
+ * about 6900 (under a block, under half a run: the two
+ * passes, the keys decode twice; whole chunks are
+ * scanrange/v2_radix_decode_once's).  Every answer is generation 0's
+ * byte for byte (the F64 sum's bits follow the records' order inside a
+ * partition). */
+static test_result_t test_radix_fused_capped_decode_once(void) {
+    ae_eval_ok("(set j (til 1200000))");
+    ae_eval_ok("(set R (table [k m f] (list (* (% (* j 7919) 300007) 1000003) (* (% j 13) 1000033) "
+                "(/ (as 'F64 j) 7.0))))");
+    ae_eval_ok("(.db.splayed.set \"" AE_TMP "/r0/\" R {compress: false})");
+    ae_eval_ok("(.db.splayed.set \"" AE_TMP "/r2/\" R {compress: true})");
+    ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(2), RAY_OK);
+    static const char* const q = "(select {c: (count f) a: (sum f) from: T by: {k: k m: m}})";
+    static const struct { uint64_t llc; double lo, hi; const char* what; } cs[] = {
+        { 1000000, 1.0, 1.05, "fused, one-block chunks at half a run" },
+        { 500000,  2.0, 2.2,  "two passes under half a run" },
+    };
+    ae_eval_ok("(set T (.db.splayed.get \"" AE_TMP "/r0/\"))");
+    size_t nref = 0;
+    char* ref = ae_csv(q, &nref);
+    TEST_ASSERT_TRUE(ref != NULL && nref > 0);
+    ae_eval_ok("(set T (.db.splayed.get \"" AE_TMP "/r2/\"))");
+    ae_drop(ae_eval(q));                                  /* binds and loads once: the pin is per run */
+    for (size_t i = 0; i < sizeof cs / sizeof cs[0]; i++) {
+        uint64_t fk, fm, k0 = ae_dec("k", &fk), m0 = ae_dec("m", &fm);
+        ray_cache_llc_set_for_test(cs[i].llc);
+        agg_route_reset();
+        size_t n = 0;
+        char* b = ae_csv(q, &n);
+        agg_route_stats_t st = agg_route_stats();
+        ray_cache_llc_set_for_test(0);
+        double xk = (double)(ae_dec("k", &fk) - k0) / (double)fk, xm = (double)(ae_dec("m", &fm) - m0) / (double)fm;
+        bool same = b && n == nref && memcmp(b, ref, n) == 0;
+        free(b);
+        if (!same || st.routes[AGG_ROUTE_V2_RADIX] != 1 || !(xk >= cs[i].lo && xk <= cs[i].hi) ||
+            !(xm >= cs[i].lo && xm <= cs[i].hi)) {
+            free(ref);
+            TEST_ASSERT_FMT(same, "%s: generation 2 differs from generation 0", cs[i].what);
+            TEST_ASSERT_FMT(false, "%s: radix %llu, k decoded %.4fx, m %.4fx", cs[i].what,
+                            (unsigned long long)st.routes[AGG_ROUTE_V2_RADIX], xk, xm);
+        }
+    }
+    free(ref);
+    PASS();
+}
+
+/* The below-half side of the fused cap: 4.2M rows (4096 partitions, so a
+ * run wants 32768-row chunks, 4 blocks) over 2 workers, the last-level
+ * cache set so a worker's staging share holds about 13700 rows ((0.75 *
+ * llc / 2 - 4 * 4096) / 18: the staged k and m, 8 bytes each, and a
+ * partition id).  The cap rounds down to one block, which holds a quarter of a run:
+ * the two passes, the keys decode twice (fused on one-block chunks, they
+ * would decode once).  The answer is the in-memory table's. */
+static test_result_t test_radix_fused_capped_below_half(void) {
+    ae_eval_ok("(set j (til 4200000))");
+    ae_eval_ok("(set R (table [k m] (list (* (% j 20011) 1000003) (% j 13))))");
+    ae_eval_ok("(.db.splayed.set \"" AE_TMP "/r2/\" R {compress: true})");
+    ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(2), RAY_OK);
+    static const char* const q = "(select {c: (count k) from: T by: {k: k m: m}})";
+    ae_eval_ok("(set T R)");
+    size_t nref = 0;
+    char* ref = ae_csv(q, &nref);
+    TEST_ASSERT_TRUE(ref != NULL && nref > 0);
+    ae_eval_ok("(set T (.db.splayed.get \"" AE_TMP "/r2/\"))");
+    ae_drop(ae_eval(q));                                  /* binds and loads once: the pin is per run */
+    uint64_t fk, fm, k0 = ae_dec("k", &fk), m0 = ae_dec("m", &fm);
+    ray_cache_llc_set_for_test(700000);
+    agg_route_reset();
+    size_t n = 0;
+    char* b = ae_csv(q, &n);
+    agg_route_stats_t st = agg_route_stats();
+    ray_cache_llc_set_for_test(0);
+    double xk = (double)(ae_dec("k", &fk) - k0) / (double)fk, xm = (double)(ae_dec("m", &fm) - m0) / (double)fm;
+    bool same = b && n == nref && memcmp(b, ref, n) == 0;
+    free(b); free(ref);
+    TEST_ASSERT_FMT(same, "generation 2 differs from the in-memory table");
+    TEST_ASSERT_FMT(st.routes[AGG_ROUTE_V2_RADIX] == 1 && xk >= 2.0 && xk <= 2.2 && xm >= 2.0 && xm <= 2.2,
+                    "two passes at a quarter of a run: radix %llu, k decoded %.4fx, m %.4fx",
+                    (unsigned long long)st.routes[AGG_ROUTE_V2_RADIX], xk, xm);
+    PASS();
+}
+
+/* Chunk c's directory entry of column col in partition part of a parted
+ * store: a reserved byte set (the read is `corrupt`); *path: the column. */
+static void ae_parted_bad(const char* root, int part, const char* col, int64_t c, char* path, size_t cap) {
+    char rel[512], dir[512];
+    snprintf(rel, sizeof rel, "%s/2024.01.0%d/t/", root, part);
+    if (ray_splay_resolve_dir(ray_test_tmp(rel), dir, sizeof dir) != RAY_OK) abort();
+    size_t dl = strlen(dir);
+    snprintf(path, cap, "%s%s%s", dir, (dl && dir[dl - 1] == '/') ? "" : "/", col);
+    ray_enc_dirent_t de; memset(&de, 0, sizeof de);
+    FILE* f = fopen(path, "r+b");
+    if (!f) abort();
+    if (fseek(f, (long)(RAY_ENC_DIR_OFF + (uint64_t)c * sizeof de), SEEK_SET) != 0 ||
+        fread(&de, sizeof de, 1, f) != 1 || !de.offset) abort();
+    if (fseek(f, (long)de.offset + 6, SEEK_SET) == 0) fputc(1, f);
+    fclose(f);
+}
+static ray_t* ae_flatten(ray_t* t, const char* col, int64_t total) {
+    return parted_flatten_fixed(ray_table_slot(t, ray_sym_intern(col, strlen(col))), total);
+}
+
+/* parted_flatten_fixed on the pool (4 workers), three partitions of
+ * 200000 rows: an I64 column, a SYM one and an F64 one with nulls flatten
+ * byte for byte as generation 0's (whose plain segments stay one serial
+ * copy), each generation-2 column decoding once (within 5%: a slice's
+ * first vector); q18's shape (first-n over the segment-streamed table,
+ * which flattens its keys) answers as generation 0.  Only a flatten that
+ * decodes runs on the pool: a cancelled generation-2 flatten is `cancel`,
+ * while generation 0 (plain segments) and a generation-2 column whose
+ * materialization is published are one serial copy, which completes under
+ * ray_cancel() (it does not poll) and decodes nothing.  Failures:
+ * test_parted_flatten_lowest_failure. */
+static test_result_t test_parted_flatten_parallel(void) {
+    ae_eval_ok("(set j (til 600000))");
+    ae_eval_ok("(set P (table [u s f] (list (* (% (* j 7919) 50021) 1000003) "
+                "(as 'SYMBOL (map (fn [x] (format \"w%\" (% x 300))) (% (* j 31) 9973))) "
+                "(map (fn [x] (if (== 0 (% x 97)) 0Nf (/ (as 'F64 x) 3.0))) j))))");
+    for (int gen = 0; gen <= 2; gen += 2)
+        for (int p = 0; p < 3; p++)
+            ae_evalf_ok("(.db.splayed.set \"" AE_TMP "/p%d/2024.01.0%d/t/\" (take (drop P %d) 200000) {compress: %s})",
+                        gen, p + 1, p * 200000, gen ? "true" : "false");
+    ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    ray_t* t0 = ae_eval("(.db.parted.get \"" AE_TMP "/p0\" 't)");
+    ray_t* t2 = ae_eval("(.db.parted.get \"" AE_TMP "/p2\" 't)");
+    TEST_ASSERT_TRUE(t0 && !RAY_IS_ERR(t0) && t2 && !RAY_IS_ERR(t2));
+    static const char* const cols[] = { "u", "s", "f" };
+    for (int c = 0; c < 3; c++) {
+        uint64_t full, d0 = ae_col_dec(t2, cols[c], &full);
+        ray_t* a = ae_flatten(t0, cols[c], 600000);
+        ray_t* b = ae_flatten(t2, cols[c], 600000);
+        double x = (double)(ae_col_dec(t2, cols[c], &full) - d0) / (double)(full ? full : 1);
+        bool ok = a && !RAY_IS_ERR(a) && b && !RAY_IS_ERR(b) && a->type == b->type && a->len == 600000 &&
+                  b->len == 600000 && a->attrs == b->attrs &&
+                  memcmp(ray_data(a), ray_data(b), (size_t)600000 * ray_sym_elem_size(a->type, a->attrs)) == 0;
+        ae_drop(a); ae_drop(b);
+        if (!ok || !(x >= 1.0 && x <= 1.05)) { ae_drop(t0); ae_drop(t2); }
+        TEST_ASSERT_FMT(ok, "%s: the flat copies differ", cols[c]);
+        TEST_ASSERT_FMT(x >= 1.0 && x <= 1.05, "%s: decoded %.4fx", cols[c], x);
+    }
+    static const char* const q = "(select {c: (count f) from: T by: {u: u s: s} take: 10})";
+    ae_eval_ok("(set T (.db.parted.get \"" AE_TMP "/p0\" 't))");
+    size_t n0 = 0, n2 = 0;
+    char* a0 = ae_csv(q, &n0);
+    ae_eval_ok("(set T (.db.parted.get \"" AE_TMP "/p2\" 't))");
+    char* a2 = ae_csv(q, &n2);
+    bool same = a0 && a2 && n0 == n2 && n0 > 0 && memcmp(a0, a2, n0) == 0;
+    free(a0); free(a2);
+    if (!same) { ae_drop(t0); ae_drop(t2); }
+    TEST_ASSERT_FMT(same, "%s: generation 2 differs from generation 0", q);
+
+    ray_cancel();                                         /* the pool skips every slice */
+    ray_t* v = ae_flatten(t2, "u", 600000);
+    ray_cancel_reset();
+    bool cancelled = v && RAY_IS_ERR(v) && strcmp(ray_err_code(v), "cancel") == 0;
+    ae_drop(v);
+    if (!cancelled) { ae_drop(t0); ae_drop(t2); }
+    TEST_ASSERT_TRUE(cancelled);
+
+    /* the serial copies: generation 0, then generation 2 once its
+     * materialization is published, each under ray_cancel() */
+    ray_t* ref = ae_flatten(t0, "u", 600000);
+    ray_t* mat = ray_enccol_materialize(ray_table_slot(t2, ray_sym_intern("u", 1)));
+    bool mat_ok = ref && !RAY_IS_ERR(ref) && mat && !RAY_IS_ERR(mat);
+    if (mat && RAY_IS_ERR(mat)) ray_error_free(mat);      /* else borrowed: the column's */
+    if (!mat_ok) { ae_drop(ref); ae_drop(t0); ae_drop(t2); }
+    TEST_ASSERT_TRUE(mat_ok);
+    uint64_t full, d0 = ae_col_dec(t2, "u", &full);
+    for (int gen = 0; gen <= 2; gen += 2) {
+        ray_cancel();
+        v = ae_flatten(gen ? t2 : t0, "u", 600000);
+        ray_cancel_reset();
+        bool ok = v && !RAY_IS_ERR(v) && v->len == 600000 &&
+                  memcmp(ray_data(v), ray_data(ref), (size_t)600000 * sizeof(int64_t)) == 0;
+        ae_drop(v);
+        if (!ok) { ae_drop(ref); ae_drop(t0); ae_drop(t2); }
+        TEST_ASSERT_FMT(ok, "generation %d under ray_cancel(): not the serial copy", gen);
+    }
+    uint64_t d1 = ae_col_dec(t2, "u", &full);
+    ae_drop(ref); ae_drop(t0); ae_drop(t2);
+    TEST_ASSERT_FMT(d1 == d0, "materialized u decoded %llu bytes", (unsigned long long)(d1 - d0));
+    PASS();
+}
+
+/* Task 17i: a parallel flatten decodes each whole vector of an encoded
+ * segment straight into the flat vector, and copies a run of RAW vectors
+ * lying end to end at once.  Three partitions of 200001, 199999 and
+ * 200000 rows (segments end inside vectors): r wide random I64 (RAW
+ * vectors), k an RLE-ish I32 with nulls, s a SYM; each flattens byte for
+ * byte as generation 0's, the whole vectors arriving straight (all rows
+ * but the slices' cut vectors), r's RAW runs in under half as many copies
+ * as its vectors (a run ends at a chunk, a slice or a non-RAW vector). */
+static test_result_t test_parted_flatten_in_place(void) {
+    ae_eval_ok("(set j (til 600000))");
+    ae_eval_ok("(set P (table [r k s] (list (* (% (* j 7919) 600011) -6148914691236517205) "
+                "(as 'I32 (map (fn [x] (if (== 0 (% x 1001)) 0N (/ x 37))) j)) "
+                "(as 'SYMBOL (map (fn [x] (format \"w%\" (% x 300))) (% (* j 31) 9973))))))");
+    static const int64_t rows[3] = { 200001, 199999, 200000 };
+    for (int gen = 0; gen <= 2; gen += 2)
+        for (int p = 0, at = 0; p < 3; at += (int)rows[p], p++)
+            ae_evalf_ok("(.db.splayed.set \"" AE_TMP "/f%d/2024.01.0%d/t/\" (take (drop P %d) %lld) {compress: %s})",
+                        gen, p + 1, at, (long long)rows[p], gen ? "true" : "false");
+    ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    ray_t* t0 = ae_eval("(.db.parted.get \"" AE_TMP "/f0\" 't)");
+    ray_t* t2 = ae_eval("(.db.parted.get \"" AE_TMP "/f2\" 't)");
+    TEST_ASSERT_TRUE(t0 && !RAY_IS_ERR(t0) && t2 && !RAY_IS_ERR(t2));
+    static const char* const cols[] = { "r", "k", "s" };
+    for (int c = 0; c < 3; c++) {
+        uint64_t c0, r0, c1, r1;
+        ray_col_test_into(&c0, &r0);
+        ray_t* a = ae_flatten(t0, cols[c], 600000);
+        ray_t* b = ae_flatten(t2, cols[c], 600000);
+        ray_col_test_into(&c1, &r1);
+        bool ok = a && !RAY_IS_ERR(a) && b && !RAY_IS_ERR(b) && a->type == b->type && a->len == 600000 &&
+                  b->len == 600000 && a->attrs == b->attrs &&
+                  memcmp(ray_data(a), ray_data(b), (size_t)600000 * ray_sym_elem_size(a->type, a->attrs)) == 0;
+        ae_drop(a); ae_drop(b);
+        /* 16 slices of 40960 rows: at most two cut vectors each, read by the cursor */
+        bool straight = r1 - r0 >= 600000 - 16 * 2 * 1024;
+        bool runs = c != 0 || (c1 - c0) * 2 < 600000 / 1024;
+        if (!ok || !straight || !runs) { ae_drop(t0); ae_drop(t2); }
+        TEST_ASSERT_FMT(ok, "%s: the flat copies differ", cols[c]);
+        TEST_ASSERT_FMT(straight, "%s: %llu rows decoded in place", cols[c], (unsigned long long)(r1 - r0));
+        TEST_ASSERT_FMT(runs, "%s: %llu copies for %d vectors", cols[c], (unsigned long long)(c1 - c0), 600000 / 1024);
+    }
+    ae_drop(t0); ae_drop(t2);
+    PASS();
+}
+
+/* Fix round 1: ray_col_range_into's bounds, each pinned by a call into
+ * a buffer of exactly n elements (ASan) and by the parallel flatten.
+ * Three partitions of 200001 / 199999 / 200000 rows: r wide random I64
+ * (RAW vectors), s a SYM whose first segment holds 100 symbols (W8) and
+ * the others 1000 (W16).
+ * - Another SYM width declines: segment 0 into a W16 output delivers
+ *   nothing (at W8 it delivers its first vector), and the flatten of s
+ *   (W16) equals generation 0's byte for byte.
+ * - A vector longer than the range declines: 500 or 1023 rows from a
+ *   vector's first row deliver nothing.
+ * - A RAW run (chunk 1's vectors are RAW, laid end to end) stops at the
+ *   vector that would cross the range's end: 3 vectors and 100 rows
+ *   deliver 3 vectors, in partition 2 (vectors offset by 200001) as in
+ *   partition 1.
+ * - A flatten to fewer rows than the column (its last slice ends inside a
+ *   vector) equals generation 0's. */
+static test_result_t test_parted_flatten_into_bounds(void) {
+    static const int64_t rows[3] = { 200001, 199999, 200000 };
+    for (int gen = 0; gen <= 2; gen += 2)
+        for (int p = 0, at = 0; p < 3; at += (int)rows[p], p++) {
+            ae_evalf_ok("(set j (+ %d (til %lld)))", at, (long long)rows[p]);
+            ae_evalf_ok("(.db.splayed.set \"" AE_TMP "/b%d/2024.01.0%d/t/\" (table [r s] (list "
+                        "(* (%% (* j 7919) 600011) -6148914691236517205) "
+                        "(as 'SYMBOL (map (fn [x] (format \"w%%\" x)) (%% (* j 31) %d))))) {compress: %s})",
+                        gen, p + 1, p ? 1000 : 100, gen ? "true" : "false");
+        }
+    ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    ray_t* t0 = ae_eval("(.db.parted.get \"" AE_TMP "/b0\" 't)");
+    ray_t* t2 = ae_eval("(.db.parted.get \"" AE_TMP "/b2\" 't)");
+    TEST_ASSERT_TRUE(t0 && !RAY_IS_ERR(t0) && t2 && !RAY_IS_ERR(t2));
+    ray_t* sc2 = ray_table_slot(t2, ray_sym_intern("s", 1));
+    ray_col_meta_t m0, m1;
+    bool widths = ray_col_meta_of(ray_enccol_seg(sc2, 0), &m0) && ray_col_meta_of(ray_enccol_seg(sc2, 1), &m1) &&
+                  (m0.attrs & RAY_SYM_W_MASK) == RAY_SYM_W8 && (m1.attrs & RAY_SYM_W_MASK) == RAY_SYM_W16;
+    if (!widths) { ae_drop(t0); ae_drop(t2); }
+    TEST_ASSERT_FMT(widths, "s: segment widths %u / %u, want W8 / W16", m0.attrs & RAY_SYM_W_MASK, m1.attrs & RAY_SYM_W_MASK);
+
+    /* the direct calls, each into a buffer of exactly n elements */
+    struct { const char* col; int64_t start, n; uint8_t attrs; int64_t want; } calls[] = {
+        { "s", 0, 4096, RAY_SYM_W16, 0 },          /* another width */
+        { "s", 0, 4096, RAY_SYM_W8, 4096 },        /* its own: the control (a RAW run) */
+        { "r", 0, 500, 0, 0 },                     /* vector longer than the range */
+        { "r", 1024, 1023, 0, 0 },
+        { "r", 65536, 500, 0, 0 },                 /* a RAW one (chunk 1's vectors are) */
+        { "r", 65536, 3 * 1024 + 100, 0, 3 * 1024 },   /* RAW run stops before the crossing vector */
+        { "r", 200001 + 65536, 2 * 1024 + 5, 0, 2 * 1024 },
+    };
+    for (size_t i = 0; i < sizeof calls / sizeof calls[0]; i++) {
+        ray_col_src_t src;
+        ray_t* err = ray_col_src_bind(ray_table_slot(t2, ray_sym_intern(calls[i].col, 1)), &src);
+        TEST_ASSERT_TRUE(err == NULL);
+        ray_col_cursor_t cur;
+        ray_col_cursor_init(&cur, &src);
+        size_t esz = calls[i].col[0] == 's' ? (calls[i].attrs == RAY_SYM_W8 ? 1 : 2) : 8;
+        void* dst = malloc((size_t)calls[i].n * esz);
+        int64_t got = -1;
+        err = ray_col_range_into(&src, calls[i].start, calls[i].n, &cur.sc, calls[i].attrs, dst, &got);
+        free(dst);
+        ray_col_cursor_free(&cur);
+        ray_col_src_release(&src);
+        bool ok = err == NULL && got == calls[i].want;
+        if (err) ray_error_free(err);
+        if (!ok) { ae_drop(t0); ae_drop(t2); }
+        TEST_ASSERT_FMT(ok, "%s at %lld for %lld (width %u): delivered %lld, want %lld", calls[i].col,
+                        (long long)calls[i].start, (long long)calls[i].n, calls[i].attrs,
+                        (long long)got, (long long)calls[i].want);
+    }
+
+    /* the flatten: whole, and to fewer rows than the column */
+    static const struct { const char* col; int64_t total; } fl[] = {
+        { "s", 600000 }, { "r", 600000 }, { "r", 600000 - 500 }, { "s", 600000 - 1500 },
+    };
+    for (size_t i = 0; i < sizeof fl / sizeof fl[0]; i++) {
+        ray_t* a = ae_flatten(t0, fl[i].col, fl[i].total);
+        ray_t* b = ae_flatten(t2, fl[i].col, fl[i].total);
+        bool ok = a && !RAY_IS_ERR(a) && b && !RAY_IS_ERR(b) && a->type == b->type && a->len == fl[i].total &&
+                  b->len == fl[i].total && a->attrs == b->attrs &&
+                  (fl[i].col[0] != 's' || (b->attrs & RAY_SYM_W_MASK) == RAY_SYM_W16) &&
+                  memcmp(ray_data(a), ray_data(b), (size_t)fl[i].total * ray_sym_elem_size(a->type, a->attrs)) == 0;
+        ae_drop(a); ae_drop(b);
+        if (!ok) { ae_drop(t0); ae_drop(t2); }
+        TEST_ASSERT_FMT(ok, "%s to %lld rows: the flat copies differ", fl[i].col, (long long)fl[i].total);
+    }
+    ae_drop(t0); ae_drop(t2);
+    PASS();
+}
+
+/* The lowest failure of a parallel flatten, by global row, when time
+ * order says otherwise.  4 workers over 2^20 rows of u: slices of 65536
+ * rows.  Partition 2 (rows 61440..131071) is corrupt in chunk 1, its last
+ * 4096 rows, which lie at the end of slice 1 (after 61440 good rows);
+ * partition 3 (rows 131072..) is corrupt in chunk 0, so slice 2 fails at
+ * its first read, well before slice 1 gets there.  Every run answers
+ * partition 2's: failures are keyed by the slice's first row, not taken
+ * in the order they happen. */
+static test_result_t test_parted_flatten_lowest_failure(void) {
+    static const int64_t rows[3] = { 61440, 69632, 917504 };
+    ae_eval_ok("(set j (til 1048576))");
+    ae_eval_ok("(set P (table [u] (list (* (% (* j 7919) 50021) 1000003))))");
+    for (int p = 0, at = 0; p < 3; at += (int)rows[p], p++)
+        ae_evalf_ok("(.db.splayed.set \"" AE_TMP "/q/2024.01.0%d/t/\" (take (drop P %d) %lld) {compress: true})",
+                    p + 1, at, (long long)rows[p]);
+    ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    char p2[600], p3[600];
+    ae_parted_bad(AE_TMP "/q", 2, "u", 1, p2, sizeof p2);
+    ae_parted_bad(AE_TMP "/q", 3, "u", 0, p3, sizeof p3);
+    for (int i = 0; i < 8; i++) {
+        ray_t* t = ae_eval("(.db.parted.get \"" AE_TMP "/q\" 't)");
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        ray_error_clear();
+        ray_t* v = ae_flatten(t, "u", 1048576);
+        bool corrupt = v && RAY_IS_ERR(v) && strcmp(ray_err_code(v), "corrupt") == 0;
+        bool first = corrupt && strstr(ray_error_msg(), p2) != NULL;
+        ae_drop(v); ae_drop(t);
+        TEST_ASSERT_FMT(corrupt, "run %d: not corrupt", i);
+        TEST_ASSERT_FMT(first, "run %d: not %s: %s", i, p2, ray_error_msg());
+    }
+    PASS();
+}
+
 const test_entry_t agg_engine_entries[] = {
     { "pearson_old_engine_r_vs_r2",  test_pearson_old_engine_r_vs_r2, NULL, NULL },
     { "diff_group_pearson_1k",       test_diff_group_pearson_1k,    NULL, NULL },
@@ -2459,5 +2896,11 @@ const test_entry_t agg_engine_entries[] = {
     { "group_keys_multi",            test_group_keys_multi,            NULL, NULL },
     { "agg_run_one_i64",             test_agg_run_one_i64,             NULL, NULL },
     { "avg_exact_i128_engines",      test_avg_exact_i128_engines,      NULL, NULL },
+    { "radix_fused_capped_decode_once", test_radix_fused_capped_decode_once, ae_rt_setup, ae_rt_teardown },
+    { "radix_fused_capped_below_half", test_radix_fused_capped_below_half, ae_rt_setup, ae_rt_teardown },
+    { "parted_flatten_parallel",     test_parted_flatten_parallel,     ae_rt_setup, ae_rt_teardown },
+    { "parted_flatten_lowest_failure", test_parted_flatten_lowest_failure, ae_rt_setup, ae_rt_teardown },
+    { "parted_flatten_in_place",     test_parted_flatten_in_place,     ae_rt_setup, ae_rt_teardown },
+    { "parted_flatten_into_bounds",  test_parted_flatten_into_bounds,  ae_rt_setup, ae_rt_teardown },
     { NULL, NULL, NULL, NULL },
 };

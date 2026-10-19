@@ -34,6 +34,8 @@
 #include "mem/sys.h"   /* ray_sys_alloc — the shared-mapping descriptor */
 #include "store/serde.h"
 #include "store/fileio.h"
+#include "store/encfmt.h"
+#include "store/enccol.h"
 #include "table/sym.h"
 #include "table/domain.h"
 #include "table/dict.h"
@@ -44,6 +46,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdatomic.h>
+
+_Static_assert(COL_DISK_ATTRS_MASK == (uint8_t)(RAY_SYM_W_MASK | RAY_ATTR_SORTED | RAY_ATTR_HAS_NULLS),
+               "COL_DISK_ATTRS_MASK literal values drifted");
 #ifdef RAY_OS_WINDOWS
 #include <io.h>
 #else
@@ -112,6 +117,16 @@ static ray_err_t validate_sym_bounds(const void* data, int64_t len,
 
 static size_t col_str_pool_payload_len(const ray_t* vec);
 
+/* A file in one of the magic-prefixed formats above (no ray_t header; may
+ * be shorter than 32 bytes): always generation 0. */
+bool ray_col_header_is_ext(const void* head, size_t n) {
+    if (n < 4) return false;
+    uint32_t magic;
+    memcpy(&magic, head, 4);
+    return magic == STR_LIST_MAGIC || magic == STR_VEC_MAGIC ||
+           magic == LIST_MAGIC     || magic == TABLE_MAGIC;
+}
+
 /* --------------------------------------------------------------------------
  * Column file format:
  *   Bytes 0-15:  aux — RESERVED for postponed on-disk index persistence
@@ -148,8 +163,8 @@ static size_t col_str_pool_payload_len(const ray_t* vec);
  * materialization, BEFORE any error path can release the object.  Link
  * sidecar reattach (try_load_link_sidecar) runs after masking and sets
  * HAS_LINK with a freshly interned sym ID, so legit links are unaffected. */
-#define COL_DISK_ATTRS_MASK \
-    ((uint8_t)(RAY_SYM_W_MASK | RAY_ATTR_SORTED | RAY_ATTR_HAS_NULLS))
+/* The definition lives in col.h so the generation-2 writer and reader
+ * share it. */
 
 /* "Index present" marker written to the on-disk header's reserved aux[0..3]
  * (see col.h: aux is reserved for index persistence).  Existing files leave
@@ -182,6 +197,7 @@ static bool is_serializable_type(int8_t t) {
 static ray_err_t col_preflight_recursive(ray_t* obj) {
     if (!obj || RAY_IS_ERR(obj)) return RAY_ERR_TYPE;
     int8_t type = obj->type;
+    if (type == RAY_ENCCOL) return RAY_OK;
     if (type < 0 || is_serializable_type(type)) return RAY_OK;
 
     if (type == RAY_LIST) {
@@ -196,8 +212,10 @@ static ray_err_t col_preflight_recursive(ray_t* obj) {
     if (type == RAY_TABLE) {
         int64_t ncols = ray_table_ncols(obj);
         for (int64_t c = 0; c < ncols; c++) {
-            ray_err_t err = col_preflight_recursive(
-                ray_table_get_col_idx(obj, c));
+            ray_t* sc = ray_table_get_col_enc_idx(obj, c);
+            if (!sc) sc = ray_table_col_idx(obj, c);
+            ray_err_t err = col_preflight_recursive(sc);
+            if (sc && RAY_IS_ERR(sc)) ray_error_free(sc);
             if (err != RAY_OK) return err;
         }
         return RAY_OK;
@@ -215,6 +233,9 @@ static ray_err_t col_preflight_recursive(ray_t* obj) {
 
 ray_err_t ray_col_save_preflight(ray_t* vec) {
     if (!vec || RAY_IS_ERR(vec)) return RAY_ERR_TYPE;
+    /* An encoded column's logical type is always storable; a parted one
+     * (like a plain parted wrapper) has no single-file form. */
+    if (vec->type == RAY_ENCCOL) return ray_enccol_is_parted(vec) ? RAY_ERR_NYI : RAY_OK;
     if (is_serializable_type(vec->type)) return RAY_OK;
     if (vec->type == RAY_LIST || vec->type == RAY_TABLE)
         return col_preflight_recursive(vec);
@@ -425,7 +446,12 @@ static ray_err_t col_write_recursive(ray_t* obj, FILE* f) {
         for (int64_t c = 0; c < ncols; c++) {
             int64_t name_sym = ray_table_col_name(obj, c);
             if (fwrite(&name_sym, 8, 1, f) != 1) return RAY_ERR_IO;
-            ray_t* col = ray_table_get_col_idx(obj, c);
+            ray_t* col = ray_table_col_idx(obj, c);
+            if (col && RAY_IS_ERR(col)) {
+                ray_err_t ce = ray_err_from_obj(col);
+                ray_error_free(col);
+                return ce;
+            }
             ray_err_t err = col_write_recursive(col, f);
             if (err != RAY_OK) return err;
         }
@@ -787,8 +813,12 @@ ray_err_t ray_col_append_index(const char* path, const void* ix_v,
     (void)col_len; (void)col_type;
     FILE* f = fopen(path, "r+b");
     if (!f) return RAY_ERR_IO;
-    uint32_t cur_mg = 0;
-    if (fread(&cur_mg, 1, 4, f) == 4 && cur_mg == COL_IDX_AUX_MAGIC) { fclose(f); return RAY_ERR_CORRUPT; }
+    uint8_t h32[32];
+    if (fread(h32, 1, 32, f) != 32) { fclose(f); return RAY_ERR_CORRUPT; }
+    int gen = ray_col_gen_of(h32);
+    if (gen != 0) { fclose(f); return gen == RAY_ENC_GEN_CORRUPT ? RAY_ERR_CORRUPT : RAY_ERR_VERSION; }
+    uint32_t cur_mg; memcpy(&cur_mg, h32, 4);
+    if (cur_mg == COL_IDX_AUX_MAGIC) { fclose(f); return RAY_ERR_CORRUPT; }
     int64_t payload_end = 0;
     ray_err_t err = ray_col_write_index_region(f, ix_v, &payload_end);
     if (err == RAY_OK) {
@@ -1137,14 +1167,26 @@ static ray_err_t col_save_impl(ray_t* vec, const char* path, bool durable) {
          * Load/mmap reattach the domain below. */
         if (vec->type == RAY_SYM)
             memset(header.aux, 0, 16);
+        /* RAY_STR: aux bytes 8-15 hold the runtime str_pool pointer; it used
+         * to reach the file whenever HAS_NULLS kept aux above (a heap address
+         * on disk, different on every run).  No reader uses those bytes: both
+         * loaders zero aux before attaching the pool. */
+        if (vec->type == RAY_STR)
+            memset(header.aux + 8, 0, 8);
         /* FILE-domain SYM re-expressed to runtime ids: width follows the
          * global table, SORTED dropped (id order changed). */
         if (sym_xlate)
             header.attrs = (uint8_t)((header.attrs &
                 ~(uint8_t)(RAY_SYM_W_MASK | RAY_ATTR_SORTED)) | sym_xlate_attrs);
 
+        /* aux[0..3] is the generation discriminator on disk: nothing durable
+         * lives there except the index marker stamped below, so zero it
+         * unconditionally (in-memory aux bytes, e.g. a saved_aux restore on a
+         * nullable column, must never reach the file). */
+        memset(header.aux, 0, 4);
+
         /* Stamp the "index present" marker into the reserved aux (after all
-         * other aux manipulation, which zeroes it for the common cases). */
+         * other aux manipulation). */
         if (persist_index) {
             ray_col_stamp_index(&header);
         }
@@ -1498,6 +1540,7 @@ typedef struct {
     uint32_t saved_sym_count;
     bool    has_index;         /* aux marker present → inline index region at tail */
     size_t  index_offset;      /* 32-aligned start of the index region (has_index) */
+    bool    gen2;              /* generation-2 file: only mapped/header are set */
 } col_mapped_t;
 
 static size_t col_str_pool_payload_len(const ray_t* vec) {
@@ -1623,15 +1666,29 @@ static ray_t* col_validate_mapped(const char* path, col_mapped_t* out) {
 
     ray_t* hdr = (ray_t*)ptr;
 
-    /* Validate the on-disk format major version (the `order` byte) BEFORE
-     * interpreting type/len.  FRESH SWAP, NO LEGACY: a file whose major
-     * does not match the reader is rejected here.  The loaders below reset
-     * the runtime `order` to its correct value, so reading the version out
-     * of `order` here does not leak into the live block order. */
-    if (ray_col_check_format(hdr) != RAY_OK) {
+    /* Generation discriminator (spec "Generation discriminator"): the pair
+     * (order, aux[0..3]) is validated BEFORE type/len are interpreted or
+     * either parser runs.  FRESH SWAP, NO LEGACY: an unknown major is
+     * rejected, and a cross pair is corrupt, never a fallback to the other
+     * layout.  The loaders below reset the runtime `order`, so reading the
+     * version out of `order` here does not leak into the live block order. */
+    int gen = ray_col_gen_of(ptr);
+    if (gen == RAY_ENC_GEN_VERSION) {
         ray_vm_unmap_file(ptr, mapped_size);
-        return ray_error("version", "col %s: bad format version", path);
+        return ray_error("version", "column %s: bad format version", path);
     }
+    if (gen == RAY_ENC_GEN_CORRUPT) {
+        ray_vm_unmap_file(ptr, mapped_size);
+        return ray_error("corrupt", "column %s: format byte and generation marker disagree", path);
+    }
+    if (gen == 2) {
+        out->gen2        = true;
+        out->mapped      = ptr;
+        out->mapped_size = mapped_size;
+        out->header      = hdr;
+        return NULL;          /* the generation-2 parser validates the rest */
+    }
+    out->gen2 = false;
 
     /* Validate type from untrusted file data -- allowlist only */
     if (!is_serializable_type(hdr->type)) {
@@ -1760,6 +1817,14 @@ static ray_t* col_load_impl(const char* path, struct ray_sym_domain_s* dom,
     col_mapped_t cm = {0};
     ray_t* err = col_validate_mapped(path, &cm);
     if (err) return err;
+    if (cm.gen2) {
+        ray_t* enc = ray_enccol_open(cm.mapped, cm.mapped_size, path, dom, require_dom);
+        if (!enc || RAY_IS_ERR(enc)) return enc;
+        ray_t* v = ray_enccol_materialize(enc);
+        if (!RAY_IS_ERR(v)) ray_retain(v);     /* outlives the object */
+        ray_release(enc);
+        return v;
+    }
 
     /* Allocate buddy block and copy file data */
     ray_t* vec = ray_alloc(cm.data_size);
@@ -1874,6 +1939,8 @@ static ray_t* col_mmap_impl(const char* path, struct ray_sym_domain_s* dom,
     col_mapped_t cm = {0};
     ray_t* err = col_validate_mapped(path, &cm);
     if (err) return err;
+    if (cm.gen2)
+        return ray_enccol_open(cm.mapped, cm.mapped_size, path, dom, require_dom);
 
     /* Validate that the file size matches the expected layout.  Without an
      * inline index the payload is the whole file (ray_free reconstructs the

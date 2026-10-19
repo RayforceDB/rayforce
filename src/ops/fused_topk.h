@@ -81,7 +81,8 @@ int ray_fused_topk_supported(ray_t* where_expr, ray_t* tbl);
  * serves `asc: key take: K` when the key column carries RAY_ATTR_SORTED
  * and no nulls (the first K passing rows are then the K smallest, ties in
  * table order — what the stable sort returns).
- * Returns NULL on a shape the path does not take (caller falls back). */
+ * Returns NULL on a shape the path does not take (caller falls back), or an
+ * owned error only when binding a column failed (the query's error). */
 ray_t* ray_fused_take_select(ray_t* tbl,
                              ray_t* where_expr,
                              int64_t k,
@@ -98,5 +99,13 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
                              const int64_t* out_col_syms,
                              const int64_t* out_alias_syms,
                              uint32_t n_out);
+
+/* Test hooks: predicates compiled by the fused selects / declined. */
+void ray_fused_topk_counters(uint64_t* ran, uint64_t* declined);
+void ray_fused_topk_counters_reset(void);
+/* Test hook: pruning of the last ray_fused_topk_select on a generation-2
+ * first key: chunk-slot prunes (one per task fragment of a chunk, so they
+ * follow the dispatch geometry, not distinct chunks) and pruned morsels. */
+void ray_fused_topk_test_pruned(uint64_t* chunks, uint64_t* vectors);
 
 #endif /* RAY_OPS_FUSED_TOPK_H */

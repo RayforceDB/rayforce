@@ -230,7 +230,7 @@ static test_result_t test_sym_bulk(void) {
 /* ---- sym_save_load_roundtrip ------------------------------------------- */
 
 static test_result_t test_sym_save_load_roundtrip(void) {
-    const char* sym_path = "/tmp/test_sym_roundtrip.sym";
+    const char* sym_path = ray_test_tmp("/tmp/test_sym_roundtrip.sym");
 
     /* Intern some symbols */
     int64_t id_hello = ray_sym_intern("hello", 5);
@@ -286,7 +286,7 @@ static test_result_t test_sym_save_load_roundtrip(void) {
  * stable across repeated save/load cycles because the table itself is
  * append-only (a later snapshot is always a superset of an earlier one). */
 static test_result_t test_sym_save_rewrite_stable_ids(void) {
-    const char* sym_path = "/tmp/test_sym_append.sym";
+    const char* sym_path = ray_test_tmp("/tmp/test_sym_append.sym");
 
     /* Intern initial batch */
     int64_t id_a = ray_sym_intern("alpha", 5);
@@ -349,7 +349,7 @@ static test_result_t test_sym_save_rewrite_stable_ids(void) {
 /* ---- sym_load_corrupt -------------------------------------------------- */
 
 static test_result_t test_sym_load_corrupt(void) {
-    const char* sym_path = "/tmp/test_sym_corrupt.sym";
+    const char* sym_path = ray_test_tmp("/tmp/test_sym_corrupt.sym");
 
     /* Write garbage data */
     FILE* f = fopen(sym_path, "wb");
@@ -377,7 +377,7 @@ static test_result_t test_sym_load_corrupt(void) {
 /* ---- sym_load_truncated ------------------------------------------------ */
 
 static test_result_t test_sym_load_truncated(void) {
-    const char* sym_path = "/tmp/test_sym_trunc.sym";
+    const char* sym_path = ray_test_tmp("/tmp/test_sym_trunc.sym");
 
     /* Intern and save valid sym file */
     ray_sym_intern("abc", 3);
@@ -737,7 +737,7 @@ static test_result_t test_sym_rebuild_segments_contract(void) {
  * succeed: segment sub-interning during load would otherwise shift
  * subsequent disk positions and trip the id==pos check. */
 static test_result_t test_sym_load_legacy_dotted(void) {
-    const char* sym_path = "/tmp/test_sym_legacy_dotted.sym";
+    const char* sym_path = ray_test_tmp("/tmp/test_sym_legacy_dotted.sym");
     remove(sym_path);
     char lk_path[4096];
     snprintf(lk_path, sizeof(lk_path), "%s.lk", sym_path);
@@ -794,7 +794,7 @@ static test_result_t test_sym_load_legacy_dotted(void) {
  * interaction between segment sub-interning and the disk-position ==
  * sym_id invariant that ray_sym_load/ray_sym_save rely on. */
 static test_result_t test_sym_save_load_dotted(void) {
-    const char* sym_path = "/tmp/test_sym_dotted.sym";
+    const char* sym_path = ray_test_tmp("/tmp/test_sym_dotted.sym");
     remove(sym_path);
     char lk_path[4096];
     snprintf(lk_path, sizeof(lk_path), "%s.lk", sym_path);
@@ -859,7 +859,7 @@ static test_result_t test_sym_save_load_dotted(void) {
 /* ---- sym_load_missing_file --------------------------------------------- */
 
 static test_result_t test_sym_load_missing(void) {
-    ray_err_t err = ray_sym_load("/tmp/nonexistent_sym_file_xyz.sym");
+    ray_err_t err = ray_sym_load(ray_test_tmp("/tmp/nonexistent_sym_file_xyz.sym"));
     TEST_ASSERT((err) != (RAY_OK), "err != RAY_OK");
     TEST_ASSERT_EQ_U(ray_sym_count(), 1);  /* "" only */
 
@@ -1121,7 +1121,7 @@ static test_result_t test_sym_load_null_path(void) {
 /* ray_sym_load rejects a valid STRL file that contains something other than
  * a RAY_LIST (e.g. a RAY_I64 vector). */
 static test_result_t test_sym_load_non_list(void) {
-    const char* sym_path = "/tmp/test_sym_nonlist.sym";
+    const char* sym_path = ray_test_tmp("/tmp/test_sym_nonlist.sym");
     remove(sym_path);
 
     /* Write a RAY_I64 vector instead of a RAY_LIST. */
@@ -1153,7 +1153,7 @@ static test_result_t test_sym_load_non_list(void) {
 /* ray_sym_load rejects a file that has fewer entries than what was
  * previously persisted (stale / truncated on disk). */
 static test_result_t test_sym_load_shorter_snapshot_ok(void) {
-    const char* sym_path = "/tmp/test_sym_stale.sym";
+    const char* sym_path = ray_test_tmp("/tmp/test_sym_stale.sym");
     remove(sym_path);
     char lk_path[4096];
     snprintf(lk_path, sizeof(lk_path), "%s.lk", sym_path);
@@ -1205,7 +1205,7 @@ static test_result_t test_sym_load_shorter_snapshot_ok(void) {
 /* ray_sym_load rejects a reload where the first (already-loaded) entry
  * has a different string than what is in memory. */
 static test_result_t test_sym_load_prefix_mismatch(void) {
-    const char* sym_path = "/tmp/test_sym_mismatch.sym";
+    const char* sym_path = ray_test_tmp("/tmp/test_sym_mismatch.sym");
     remove(sym_path);
     char lk_path[4096];
     snprintf(lk_path, sizeof(lk_path), "%s.lk", sym_path);
@@ -1248,7 +1248,7 @@ static test_result_t test_sym_load_prefix_mismatch(void) {
  * in-memory id != its disk position.  This happens when a transient
  * symbol already occupies the slot. */
 static test_result_t test_sym_load_id_mismatch(void) {
-    const char* sym_path = "/tmp/test_sym_idmismatch.sym";
+    const char* sym_path = ray_test_tmp("/tmp/test_sym_idmismatch.sym");
     remove(sym_path);
     char lk_path[4096];
     snprintf(lk_path, sizeof(lk_path), "%s.lk", sym_path);
@@ -1287,7 +1287,7 @@ static test_result_t test_sym_load_id_mismatch(void) {
  * whatever is at the path (single-writer contract).  A foreign/garbage
  * file is simply healed by the atomic rename. */
 static test_result_t test_sym_save_overwrites_foreign_file(void) {
-    const char* sym_path = "/tmp/test_sym_save_notlist.sym";
+    const char* sym_path = ray_test_tmp("/tmp/test_sym_save_notlist.sym");
     remove(sym_path);
     char lk_path[4096];
     snprintf(lk_path, sizeof(lk_path), "%s.lk", sym_path);
@@ -1527,7 +1527,7 @@ static bool write_strl_raw(const char* path,
 /* ray_sym_load rejects a STRL file whose 8-byte count field is negative
  * (disk_count < 0 check at sym.c line 1327).  Covers lines 1328-1332. */
 static test_result_t test_sym_load_neg_disk_count(void) {
-    const char* sym_path = "/tmp/test_sym_negcnt.sym";
+    const char* sym_path = ray_test_tmp("/tmp/test_sym_negcnt.sym");
     char lk_path[4096];
     snprintf(lk_path, sizeof(lk_path), "%s.lk", sym_path);
     remove(sym_path); remove(lk_path);
@@ -1556,7 +1556,7 @@ static test_result_t test_sym_load_neg_disk_count(void) {
  * File layout: magic + count=1 + slen=99 + 0 bytes of string data.
  * After reading slen=99: remaining==0, which is < 99 → error. */
 static test_result_t test_sym_load_slen_overflow(void) {
-    const char* sym_path = "/tmp/test_sym_slen_ovf.sym";
+    const char* sym_path = ray_test_tmp("/tmp/test_sym_slen_ovf.sym");
     char lk_path[4096];
     snprintf(lk_path, sizeof(lk_path), "%s.lk", sym_path);
     remove(sym_path); remove(lk_path);
@@ -1588,7 +1588,7 @@ static test_result_t test_sym_load_slen_overflow(void) {
  *   3. Build a STRL with the same 3 entries but entry 1 changed ("zzz").
  *   4. Load again → position check at i=1 fails. */
 static test_result_t test_sym_load_prefix_mismatch_strl(void) {
-    const char* sym_path = "/tmp/test_sym_pfx_mm.sym";
+    const char* sym_path = ray_test_tmp("/tmp/test_sym_pfx_mm.sym");
     char lk_path[4096];
     snprintf(lk_path, sizeof(lk_path), "%s.lk", sym_path);
     remove(sym_path); remove(lk_path);
@@ -1634,7 +1634,7 @@ static test_result_t test_sym_load_prefix_mismatch_strl(void) {
  *
  * File: magic + count=1 + entry[0]="" + one extra 0x00 byte at the end. */
 static test_result_t test_sym_load_trailing_junk(void) {
-    const char* sym_path = "/tmp/test_sym_trail.sym";
+    const char* sym_path = ray_test_tmp("/tmp/test_sym_trail.sym");
     char lk_path[4096];
     snprintf(lk_path, sizeof(lk_path), "%s.lk", sym_path);
     remove(sym_path); remove(lk_path);
@@ -1730,7 +1730,7 @@ static test_result_t test_sym_cache_segs_many_dots(void) {
  *   - saved_errno != EROFS && errno != EROFS is TRUE → returns RAY_ERR_IO
  */
 static test_result_t test_sym_load_no_parent_dir(void) {
-    ray_err_t err = ray_sym_load("/tmp/no_such_dir_sym_xq7/sym.sym");
+    ray_err_t err = ray_sym_load(ray_test_tmp("/tmp/no_such_dir_sym_xq7/sym.sym"));
     TEST_ASSERT_EQ_I(err, RAY_ERR_IO);
     PASS();
 }
@@ -1773,7 +1773,7 @@ static test_result_t test_sym_save_replaces_divergent_file(void) {
         0x05, 0x00, 0x00, 0x00,              /* entry 1: slen=5 */
         'a', 'p', 'p', 'l', 'e'             /* "apple" */
     };
-    const char* path = "/tmp/sym_test_diverge_id.sym";
+    const char* path = ray_test_tmp("/tmp/sym_test_diverge_id.sym");
     char lk_path[4096];
     snprintf(lk_path, sizeof(lk_path), "%s.lk", path);
     bool ok = write_strl_raw(path, strl_buf, sizeof(strl_buf));
@@ -1855,8 +1855,8 @@ static bool write_lazy_strl_64mb(const char* path) {
  * ----------------------------------------------------------------------- */
 static test_result_t test_sym_lazy_load_basic(void) {
     /* skip if running as root: 64MB sparse files need a writable /tmp */
-    const char* path1 = "/tmp/test_sym_lazy1.sym";
-    const char* path2 = "/tmp/test_sym_lazy2.sym";
+    const char* path1 = ray_test_tmp("/tmp/test_sym_lazy1.sym");
+    const char* path2 = ray_test_tmp("/tmp/test_sym_lazy2.sym");
     char lk1[4096], lk2[4096];
     snprintf(lk1, sizeof(lk1), "%s.lk", path1);
     snprintf(lk2, sizeof(lk2), "%s.lk", path2);
@@ -1909,7 +1909,7 @@ static test_result_t test_sym_lazy_load_basic(void) {
 static test_result_t test_sym_save_tmp_blocked(void) {
     if (geteuid() == 0) PASS(); /* root bypasses file permissions */
 
-    const char* path = "/tmp/test_sym_tmpblk.sym";
+    const char* path = ray_test_tmp("/tmp/test_sym_tmpblk.sym");
     char tmp_path[4096], lk_path[4096];
     snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
     snprintf(lk_path, sizeof(lk_path), "%s.lk", path);
@@ -2786,6 +2786,17 @@ static test_result_t test_sym_serde_vec_unterminated(void) {
     PASS();
 }
 
+/* Ruling 8-2: the symbol lock shares a 64-byte line with neither the
+ * table nor the init flag. */
+static test_result_t test_sym_lock_own_line(void) {
+    uintptr_t l = ray_sym_test_lock_addr();
+    uintptr_t t = ray_sym_test_table_addr();
+    TEST_ASSERT_EQ_U(l % 64, 0);
+    TEST_ASSERT_TRUE(l + 64 <= t || t + ray_sym_test_table_size() <= l);
+    TEST_ASSERT_TRUE(ray_sym_test_inited_addr() / 64 != l / 64);
+    PASS();
+}
+
 const test_entry_t sym_entries[] = {
     { "sym/init_destroy", test_sym_init_destroy, sym_setup, sym_teardown },
     { "sym/intern_basic", test_sym_intern_basic, sym_setup, sym_teardown },
@@ -2909,6 +2920,7 @@ const test_entry_t sym_entries[] = {
     { "sym/serde/vec_high_cardinality",    test_sym_serde_vec_high_cardinality,   sym_setup, sym_teardown },
     { "sym/serde/vec_single",              test_sym_serde_vec_single,             sym_setup, sym_teardown },
     { "sym/serde/vec_empty",               test_sym_serde_vec_empty,              sym_setup, sym_teardown },
+    { "sym/lock_own_line", test_sym_lock_own_line, sym_setup, sym_teardown },
     { "sym/serde/vec_unterminated",        test_sym_serde_vec_unterminated,       sym_setup, sym_teardown },
 
     { NULL, NULL, NULL, NULL },

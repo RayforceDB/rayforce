@@ -34,6 +34,10 @@ extern "C" {
 /* ===== Internal Type Constants ===== */
 
 #define RAY_SEL       14   /* selection bitmap (lazy filter) */
+/* Encoded (generation-2) column held by a table slot: payload is one
+ * pointer to a refcounted ray_enccol_t (src/store/enccol.h).  Never seen
+ * outside the store layer, the table accessors and the aware paths. */
+#define RAY_ENCCOL    15
 
 /* Lazy DAG handle (atom-only; stored inline in aux region) */
 #define RAY_LAZY      104
@@ -521,6 +525,7 @@ typedef struct ray_graph {
     uint32_t       ext_count;   /* number of extended nodes */
     uint32_t       ext_cap;     /* capacity of ext_nodes array */
     ray_t*          selection;   /* RAY_SEL bitmap — lazy filter (NULL = all pass) */
+    struct ray_col_binds_s* binds;   /* sources bound by this execution (ops/colbind.c) */
 
     /* Slice-group hint (FILTER(in/eq on c) + GROUP(by c) fusion).
      * Armed by ray_slice_group_probe (exec.c) INSTEAD of executing the
@@ -610,6 +615,11 @@ typedef struct ray_graph {
      * retry, since the interpreter's `if` tests one truth value and would
      * write the then-branch to every row. */
     bool            if_refused;
+
+    /* Set by exec_group_parted around an in-place concat group: the
+     * table's parted columns are grouped from their segments (no flatten);
+     * exec_group_run skips its parted dispatch. */
+    bool            grp_seg_stream;
 } ray_graph_t;
 
 /* ===== Morsel Iterator ===== */
@@ -973,6 +983,18 @@ ray_t* ray_execute(ray_graph_t* g, ray_op_t* root);
 ray_op_t* ray_graph_input_vec(ray_graph_t* g, ray_t* vec);
 ray_t*    ray_lazy_wrap(ray_graph_t* g, ray_op_t* op);
 ray_t*    ray_lazy_append(ray_t* lazy, uint16_t opcode);
+
+/* Column-reference lazy: (at tbl 'col) of an encoded slot.  A RAY_LAZY header
+ * with RAY_LAZY_COLREF in attrs and no graph (GRAPH / OP slots NULL); its
+ * data holds the retained table and the column sym.  The aggregate builtins
+ * answer it on the bound source; ray_lazy_append / ray_lazy_materialize and
+ * every other reader of the lazy slots promote or force it first. */
+#define RAY_LAZY_COLREF 0x01
+ray_t*    ray_lazy_colref(ray_t* tbl, int64_t sym);          /* retains tbl */
+bool      ray_lazy_colref_get(ray_t* lazy, ray_t** tbl, int64_t* sym);   /* borrowed */
+/* Turn a column reference into the OP_SCAN graph it stands for, in place;
+ * a no-op for any other lazy.  NULL or an owned error. */
+ray_t*    ray_lazy_promote(ray_t* lazy);
 
 /* Active query from-table during tree-walk evaluation of query expressions
  * (B3 Part 2).  Set by bind_all_columns while a query's columns are mounted

@@ -28,6 +28,7 @@
  */
 
 #include "ops/internal.h"
+#include "table/table.h"
 #include "ops/rowsel.h"
 #include "lang/format.h"
 #include "store/hnsw.h"
@@ -98,10 +99,10 @@ static ray_t* empty_result_with_dist(ray_t* src) {
     ray_t* out = ray_table_new(ncols + 1);
     if (!out || RAY_IS_ERR(out)) return NULL;
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* sc = ray_table_get_col_idx(src, c);
-        if (!sc) continue;
-        int8_t ct = RAY_IS_PARTED(sc->type)
-                  ? (int8_t)RAY_PARTED_BASETYPE(sc->type) : sc->type;
+        ray_col_meta_t sm;
+        if (!ray_table_col_meta_idx(src, c, &sm)) continue;
+        int8_t ct = RAY_IS_PARTED(sm.type)
+                  ? (int8_t)RAY_PARTED_BASETYPE(sm.type) : sm.type;
         ray_t* nc = (ct == RAY_LIST) ? ray_list_new(0) : ray_vec_new(ct, 0);
         if (!nc || RAY_IS_ERR(nc)) { ray_release(out); return NULL; }
         nc->len = 0;
@@ -119,7 +120,8 @@ static ray_t* empty_result_with_dist(ray_t* src) {
 
 /* Gather k rows from `tbl` at dense `rowids[]`, appending a `_dist` F64
  * column with the parallel distances.  Caller owns the returned table.
- * Returns NULL on OOM. */
+ * Returns NULL on OOM, or an error object (unsupported column, a column that
+ * fails to load). */
 static ray_t* gather_rows_with_dist(ray_t* tbl,
                                      const int64_t* rowids, const double* dists,
                                      int64_t k) {
@@ -128,7 +130,8 @@ static ray_t* gather_rows_with_dist(ray_t* tbl,
     if (!result || RAY_IS_ERR(result)) return NULL;
 
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* src_col = ray_table_get_col_idx(tbl, c);
+        ray_t* src_col = ray_table_col_idx(tbl, c);
+        if (src_col && RAY_IS_ERR(src_col)) { ray_release(result); return src_col; }
         if (!src_col) { ray_release(result); return NULL; }
 
         /* PARTED columns carry ray_t** segment pointers in their data
@@ -450,7 +453,8 @@ ray_t* exec_knn_rerank(ray_graph_t* g, ray_op_t* op, ray_t* src) {
     /* We walk the ORIGINAL source table and skip non-accepted rows via
      * an accepted-rowid list.  Avoids sel_compact, which currently
      * doesn't correctly materialise RAY_LIST columns. */
-    ray_t* col = ray_table_get_col(src, col_sym);
+    ray_t* col = ray_table_col(src, col_sym);
+    if (col && RAY_IS_ERR(col)) return col;
     if (!col) return ray_error("name", NULL);
     if (col->type != RAY_LIST) return ray_error("type", "knn rerank: vector column must be a list of vectors, got %s", ray_type_name(col->type));
 

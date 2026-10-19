@@ -196,7 +196,7 @@ static test_result_t test_nullfree_stream_unchanged(void) {
                                      ray_const_i64(g, 1)),
                           ray_const_i64(g, 2));
     ray_expr_t ex;
-    TEST_ASSERT(expr_compile(g, tbl, e, &ex), "null-free compiles");
+    TEST_ASSERT(expr_compile(g, tbl, e, &ex, &(ray_t*){NULL}), "null-free compiles");
     for (uint8_t i = 0; i < ex.n_ins; i++)
         TEST_ASSERT(ex.ins[i].null_aware == 0, "no null_aware on null-free");
     for (uint8_t r2 = 0; r2 < ex.n_regs; r2++)
@@ -323,7 +323,7 @@ static test_result_t test_nullfree_promotion_invariance(void) {
 
     ray_graph_t* g = ray_graph_new(tbl);
     ray_expr_t ex;
-    TEST_ASSERT(expr_compile(g, tbl, build_i64_plus_f64(g), &ex),
+    TEST_ASSERT(expr_compile(g, tbl, build_i64_plus_f64(g), &ex, &(ray_t*){NULL}),
                 "null-free promotion compiles");
     /* No INPUT is nullable, so the compiler marks no instruction null_aware
      * and no reg null_src (column-derived nullability).  Single-null float
@@ -917,7 +917,7 @@ static test_result_t test_scalar_broadcast_col_bails(void) {
 
     uint64_t bail_other_before = ray_expr_bail_counts[EXPR_BAIL_OTHER];
     ray_expr_t ex;
-    bool compiled = expr_compile(gc, tbl, add, &ex);
+    bool compiled = expr_compile(gc, tbl, add, &ex, &(ray_t*){NULL});
     TEST_ASSERT_FALSE(compiled);
     TEST_ASSERT_FMT(ray_expr_bail_counts[EXPR_BAIL_OTHER] > bail_other_before,
                     "EXPR_BAIL_OTHER must increment (was %llu, now %llu)",
@@ -1111,7 +1111,7 @@ static test_result_t test_fused_agg_input_allnull_group(void) {
         ray_op_t* mulA = ray_mul(gA, xA, ray_const_i64(gA, 2));
 
         ray_expr_t exA;
-        bool compiled = expr_compile(gA, tbl, mulA, &exA);
+        bool compiled = expr_compile(gA, tbl, mulA, &exA, &(ray_t*){NULL});
         TEST_ASSERT(compiled, "Part A: x*2 expr_compile must succeed for nullable i64");
         TEST_ASSERT(ray_expr_compile_ok > ok_before,
                     "Part A: compile_ok must increment");
@@ -1304,7 +1304,7 @@ static test_result_t test_diff_parted_nullable(void) {
     ray_graph_t* gc = ray_graph_new(tbl);
     ray_op_t* root_b = build_add_const(gc);
     ray_expr_t ex;
-    bool ok = expr_compile(gc, tbl, root_b, &ex);
+    bool ok = expr_compile(gc, tbl, root_b, &ex, &(ray_t*){NULL});
     TEST_ASSERT(ok, "expr_compile on parted tbl succeeds");
     TEST_ASSERT(ex.has_parted, "has_parted set");
     TEST_ASSERT(ex.regs[ex.out_reg].nullable,
@@ -1617,7 +1617,7 @@ static test_result_t test_zone_skip_keeps_nulls_fused_pred(void) {
         zn_op = ops[k];
         ray_graph_t* g = ray_graph_new(tbl);
         fp_pred_t fp;
-        TEST_ASSERT(fp_compile_pred(g, b_zone_cmp(g), tbl, &fp) == 0, "fp compiles");
+        TEST_ASSERT(fp_compile_pred(g, b_zone_cmp(g), tbl, &fp, &(ray_t*){NULL}) == 0, "fp compiles");
         for (int64_t ms = 0; ms < ZN_ROWS; ms += 1024)
             fp_eval_pred(&fp, ms, ms + 1024, bits + ms);
         for (int64_t i = 0; i < ZN_ROWS; i++)

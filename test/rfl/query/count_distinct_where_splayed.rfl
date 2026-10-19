@@ -11,6 +11,6 @@
 ;; every zone holds a survivor: the gate rules nothing out
 (count (select {c: (count (distinct v)) by: k from: U where: (> v 100)})) -- 7
 (select {c: (count (distinct v)) by: k from: U where: (> v 100)}) -- (select {c: (count (distinct v)) by: k from: T where: (> v 100)})
-;; and a predicate that does rule zones out keeps answering
+;; A second row-selection predicate agrees too; zone-elimination coverage is not claimed.
 (select {c: (count (distinct v)) by: k from: U where: (< v 50)}) -- (select {c: (count (distinct v)) by: k from: T where: (< v 50)})
 (.sys.exec "rm -rf /tmp/rfl_cd_where_splayed")

@@ -65,7 +65,8 @@ uint16_t pivot_fn_to_agg_op(ray_t* fn) {
  * Returns NULL when the column has no -0.0 (caller uses the original table),
  * or RAY_ERR on allocation failure. */
 static ray_t* pivot_normalize_f64_key(ray_t* tbl, int64_t pcol_name) {
-    ray_t* pcol = ray_table_get_col(tbl, pcol_name);
+    ray_t* pcol = ray_table_col(tbl, pcol_name);
+    if (pcol && RAY_IS_ERR(pcol)) return pcol;
     if (!pcol || pcol->type != RAY_F64) return NULL;
     int64_t nr = pcol->len;
     const double* src = (const double*)ray_data(pcol);
@@ -85,7 +86,10 @@ static ray_t* pivot_normalize_f64_key(ray_t* tbl, int64_t pcol_name) {
     if (!wt || RAY_IS_ERR(wt)) { ray_release(norm); return wt ? wt : ray_error("oom", NULL); }
     for (int64_t c = 0; c < ncols && !RAY_IS_ERR(wt); c++) {
         int64_t cn = ray_table_col_name(tbl, c);
-        ray_t* cv = (cn == pcol_name) ? norm : ray_table_get_col_idx(tbl, c);
+        ray_t* cv = norm;
+        if (cn != pcol_name) {
+            cv = ray_table_slot_idx(tbl, c);
+        }
         wt = ray_table_add_col(wt, cn, cv);
     }
     ray_release(norm);
@@ -109,7 +113,7 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
     /* Determine index columns.  idx_syms are column NAME ids: atoms are
      * runtime-domain by design and collection_elem re-expresses SYM vec
      * cells into runtime atoms (the Task-3 chokepoint), so the
-     * ray_sym_str / ray_table_get_col calls below stay global.
+     * ray_sym_str / ray_table_col calls below stay global.
      *
      * No count cap: pivot's index-column bound used to mirror exec_pivot's
      * ght layout's fixed [8]-slot key array (pivot.c: n_keys = n_idx + 1 >
@@ -165,9 +169,11 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
     }
 
     /* Get pivot column, value column */
-    ray_t* pcol = ray_table_get_col(tbl, pivot_col_name->i64);
+    ray_t* pcol = ray_table_col(tbl, pivot_col_name->i64);
+    if (pcol && RAY_IS_ERR(pcol)) { scratch_free(ic_hdr); return pcol; }
     if (!pcol) { scratch_free(ic_hdr); return ray_error("domain", "pivot: pivot column not found"); }
-    ray_t* vcol = ray_table_get_col(tbl, value_col_name->i64);
+    ray_t* vcol = ray_table_col(tbl, value_col_name->i64);
+    if (vcol && RAY_IS_ERR(vcol)) { scratch_free(ic_hdr); return vcol; }
     if (!vcol) { scratch_free(ic_hdr); return ray_error("domain", "pivot: value column not found"); }
 
     /* The pivot column's distinct values become output column NAMES (syms);
@@ -181,7 +187,8 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
 
     /* Get index columns (icols carved together with idx_syms above) */
     for (int64_t i = 0; i < n_idx; i++) {
-        icols[i] = ray_table_get_col(tbl, idx_syms[i]);
+        icols[i] = ray_table_col(tbl, idx_syms[i]);
+        if (icols[i] && RAY_IS_ERR(icols[i])) { ray_t* e = icols[i]; scratch_free(ic_hdr); return e; }
         if (!icols[i]) { scratch_free(ic_hdr); return ray_error("domain", "pivot: index column not found"); }
     }
 
@@ -311,9 +318,19 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
     ray_t* g_icols_hdr = NULL;
     ray_t** g_icols = (ray_t**)scratch_alloc(&g_icols_hdr, (size_t)vla_idx * sizeof(ray_t*));
     if (!g_icols) { ray_release(grouped); scratch_free(ic_hdr); return ray_error("oom", NULL); }
-    for (int64_t i = 0; i < n_idx; i++)
-        g_icols[i] = ray_table_get_col(grouped, idx_syms[i]);
-    ray_t* g_pcol = ray_table_get_col(grouped, pivot_col_name->i64);
+    for (int64_t i = 0; i < n_idx; i++) {
+        g_icols[i] = ray_table_col(grouped, idx_syms[i]);
+        if (g_icols[i] && RAY_IS_ERR(g_icols[i])) {
+            ray_t* e = g_icols[i];
+            scratch_free(g_icols_hdr); ray_release(grouped); scratch_free(ic_hdr);
+            return e;
+        }
+    }
+    ray_t* g_pcol = ray_table_col(grouped, pivot_col_name->i64);
+    if (g_pcol && RAY_IS_ERR(g_pcol)) {
+        scratch_free(g_icols_hdr); ray_release(grouped); scratch_free(ic_hdr);
+        return g_pcol;
+    }
 
     /* Collect distinct pivot values and index keys from grouped table.
      * ray_distinct_fn returns a lazy for concrete vecs; materialise here
@@ -790,7 +807,12 @@ static ray_t* table_row_value_dict(ray_t* tbl, const int64_t* key_syms,
             return nkeys_obj ? nkeys_obj : ray_error("oom", NULL);
         }
         keys = nkeys_obj;
-        ray_t* col = ray_table_get_col_idx(tbl, c);
+        ray_t* col = ray_table_col_idx(tbl, c);
+        if (col && RAY_IS_ERR(col)) {
+            ray_release(keys);
+            ray_release(vals);
+            return col;
+        }
         int alloc = 0;
         ray_t* cell = collection_elem(col, row, &alloc);
         if (!cell || RAY_IS_ERR(cell)) {
@@ -838,7 +860,7 @@ ray_t* ray_xcol_fn(ray_t* tbl, ray_t* names) {
     ray_t* out = ray_table_new(ncols);
     if (!out || RAY_IS_ERR(out)) { ray_free_raw(syms); return out ? out : ray_error("oom", NULL); }
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* col = ray_table_get_col_idx(tbl, c);
+        ray_t* col = ray_table_slot_idx(tbl, c);
         out = ray_table_add_col(out, syms[c], col);
         if (!out || RAY_IS_ERR(out)) { ray_free_raw(syms); return out ? out : ray_error("oom", NULL); }
     }
@@ -859,7 +881,7 @@ ray_t* ray_xcols_fn(ray_t* tbl, ray_t* cols) {
     ray_t* out = ray_table_new(n);
     if (!out || RAY_IS_ERR(out)) { ray_free_raw(syms); return out ? out : ray_error("oom", NULL); }
     for (int64_t i = 0; i < n; i++) {
-        ray_t* col = ray_table_get_col(tbl, syms[i]);
+        ray_t* col = ray_table_slot(tbl, syms[i]);
         if (!col) {
             ray_release(out);
             ray_free_raw(syms);
@@ -886,7 +908,13 @@ ray_t* ray_xkey_fn(ray_t* tbl, ray_t* keys_arg) {
     ray_t** key_cols = (ray_t**)ray_alloc_raw((size_t)nkeys * sizeof(ray_t*));
     if (!key_cols) { ray_free_raw(key_syms); return ray_error("oom", NULL); }
     for (int64_t k = 0; k < nkeys; k++) {
-        key_cols[k] = ray_table_get_col(tbl, key_syms[k]);
+        key_cols[k] = ray_table_col(tbl, key_syms[k]);
+        if (key_cols[k] && RAY_IS_ERR(key_cols[k])) {
+            ray_t* e = key_cols[k];
+            ray_free_raw(key_cols);
+            ray_free_raw(key_syms);
+            return e;
+        }
         if (!key_cols[k]) {
             ray_free_raw(key_cols);
             ray_free_raw(key_syms);
@@ -998,7 +1026,13 @@ ray_t* ray_xgroup_fn(ray_t* tbl, ray_t* keys_arg) {
     ray_t** key_cols = (ray_t**)ray_alloc_raw((size_t)nkeys * sizeof(ray_t*));
     if (!key_cols) { ray_free_raw(key_syms); return ray_error("oom", NULL); }
     for (int64_t k = 0; k < nkeys; k++) {
-        key_cols[k] = ray_table_get_col(tbl, key_syms[k]);
+        key_cols[k] = ray_table_col(tbl, key_syms[k]);
+        if (key_cols[k] && RAY_IS_ERR(key_cols[k])) {
+            ray_t* e = key_cols[k];
+            ray_free_raw(key_cols);
+            ray_free_raw(key_syms);
+            return e;
+        }
         if (!key_cols[k]) {
             ray_free_raw(key_cols);
             ray_free_raw(key_syms);
@@ -1127,6 +1161,16 @@ ray_t* ray_xgroup_fn(ray_t* tbl, ray_t* keys_arg) {
     return ray_dict_new(keys, vals);
 }
 
+/* The plain column at `c` when it carries a link, else NULL.  A generation-2
+ * column is never linked (metadata answers without decoding); a generation-0
+ * slot is plain, so the fetch cannot fail. */
+static ray_t* fkeys_linked_col(ray_t* tbl, int64_t c) {
+    ray_col_meta_t m;
+    if (!ray_table_col_meta_idx(tbl, c, &m) || m.enc) return NULL;
+    ray_t* col = ray_table_col_idx(tbl, c);
+    return ray_link_has(col) ? col : NULL;
+}
+
 /* (fkeys table) — linked-column metadata as col->target dict. */
 ray_t* ray_fkeys_fn(ray_t* tbl) {
     if (!tbl || tbl->type != RAY_TABLE)
@@ -1135,8 +1179,7 @@ ray_t* ray_fkeys_fn(ray_t* tbl) {
     int64_t ncols = ray_table_ncols(tbl);
     int64_t count = 0;
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* col = ray_table_get_col_idx(tbl, c);
-        if (ray_link_has(col)) count++;
+        if (fkeys_linked_col(tbl, c)) count++;
     }
 
     ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, count);
@@ -1145,8 +1188,8 @@ ray_t* ray_fkeys_fn(ray_t* tbl) {
     if (!vals || RAY_IS_ERR(vals)) { ray_release(keys); return vals ? vals : ray_error("oom", NULL); }
 
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* col = ray_table_get_col_idx(tbl, c);
-        if (!ray_link_has(col)) continue;
+        ray_t* col = fkeys_linked_col(tbl, c);
+        if (!col) continue;
         int64_t name = ray_table_col_name(tbl, c);
         int64_t target = ray_link_target_id(col);
         ray_t* nkeys_obj = ray_vec_append(keys, &name);
@@ -1191,7 +1234,8 @@ ray_t* ray_modify_fn(ray_t** args, int64_t n) {
         return ray_error("type", "modify: second arg must be a symbol, got %s", ray_type_name(col_name->type));
 
     int64_t target_sym = col_name->i64;
-    ray_t* col = ray_table_get_col(tbl, target_sym);
+    ray_t* col = ray_table_col(tbl, target_sym);
+    if (col && RAY_IS_ERR(col)) return col;
     if (!col) return ray_error("domain", "modify: column not found");
 
     /* Apply fn to the entire column vector (atomic fns will map element-wise) */
@@ -1205,7 +1249,10 @@ ray_t* ray_modify_fn(ray_t** args, int64_t n) {
 
     for (int64_t i = 0; i < ncols; i++) {
         int64_t cname = ray_table_col_name(tbl, i);
-        ray_t* cvec = (cname == target_sym) ? new_col : ray_table_get_col_idx(tbl, i);
+        ray_t* cvec = new_col;
+        if (cname != target_sym) {
+            cvec = ray_table_slot_idx(tbl, i);
+        }
         result = ray_table_add_col(result, cname, cvec);
         if (RAY_IS_ERR(result)) { ray_release(new_col); return result; }
     }
@@ -1573,8 +1620,14 @@ ray_t* ray_union_all_fn(ray_t* t1, ray_t* t2) {
 
     for (int64_t c = 0; c < ncols; c++) {
         int64_t name_id = ray_table_col_name(t1, c);
-        ray_t* col1 = ray_table_get_col_idx(t1, c);
-        ray_t* col2 = ray_table_get_col_idx(t2, c);
+        ray_t* col1 = ray_table_col_idx(t1, c);
+        ray_t* col2 = ray_table_col_idx(t2, c);
+        if ((col1 && RAY_IS_ERR(col1)) || (col2 && RAY_IS_ERR(col2))) {
+            ray_t* e = (col1 && RAY_IS_ERR(col1)) ? col1 : col2;
+            if (e == col1 && col2 && RAY_IS_ERR(col2)) ray_error_free(col2);
+            ray_release(result);
+            return e;
+        }
 
         if (!col1 || !col2) {
             ray_release(result);

@@ -542,6 +542,9 @@ ray_t* ray_env_get_local(int64_t sym_id) {
     return NULL;
 }
 
+/* Borrowed lookup.  A NULL for a dotted path into a table may also mean the
+ * column failed to load (the detail is in ray_error_msg()); ray_env_resolve
+ * returns that failure as an error instead. */
 static ray_t* env_get_impl(int64_t sym_id, bool in_callee);
 ray_t* ray_env_get(int64_t sym_id) {
     return env_get_impl(sym_id, false);
@@ -577,6 +580,12 @@ static ray_t* env_get_impl(int64_t sym_id, bool in_callee) {
     ray_t* v = env_lookup_flat_impl(segs[0], NULL, in_callee);
     for (int i = 1; v && i < n; i++) {
         v = ray_container_probe_sym(v, segs[i]);
+        if (v && RAY_IS_ERR(v)) {
+            /* A borrowed-ref API has no channel for the owned error: report
+             * "undefined"; ray_env_resolve (the evaluator's path) surfaces it. */
+            ray_error_free(v);
+            return NULL;
+        }
     }
     return v;
 }
@@ -683,7 +692,13 @@ static ray_t* env_resolve_impl(int64_t sym_id, uint8_t* rows, bool in_callee) {
             }
             next_fresh = (next != NULL);
         }
-        if (!next) next = ray_container_probe_sym(v, segs[i]);
+        if (!next) {
+            next = ray_container_probe_sym(v, segs[i]);
+            if (next && RAY_IS_ERR(next)) {   /* a column that failed to load */
+                if (fresh) ray_release(v);
+                return next;
+            }
+        }
         if (next) {
             if (fresh) ray_release(v);
             v = next;

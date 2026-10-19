@@ -249,6 +249,17 @@ void rowsel_builder_init(rowsel_builder_t* b, uint32_t n_segs);
 void rowsel_emit_segment(rowsel_builder_t* b, uint32_t seg,
                          const uint8_t* morsel_bool, int64_t n);
 
+/* rowsel_emit_segment of `n` bools all equal to d (0 / 1), never
+ * scanned: NONE or ALL. */
+void rowsel_emit_uniform(rowsel_builder_t* b, uint32_t seg, uint8_t d, int64_t n);
+
+/* rowsel_emit_segment of a morsel given as n_runs runs: run r covers the
+ * rows [ends[r - 1], ends[r]) (ends[-1] = 0, ends[n_runs - 1] = n) and
+ * passes when pass[r] is set.  The segment is byte-identical to emitting
+ * the runs' expanded bools. */
+void rowsel_emit_runs(rowsel_builder_t* b, uint32_t seg, const uint16_t* ends,
+                      const uint8_t* pass, uint32_t n_runs, int64_t n);
+
 /* Concatenate `n_workers` builders (segment ranges globally ordered by
  * worker index) into a fresh ray_rowsel_new(nrows, total_pass, idx_count)
  * block with the standard layout: seg_flags, seg_offsets (prefix sum

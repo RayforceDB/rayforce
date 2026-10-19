@@ -62,7 +62,9 @@ int64_t ray_dict_find_sym(ray_t* d, int64_t sym_id);
 ray_t* ray_dict_probe_sym_borrowed(ray_t* d, int64_t sym_id);
 
 /* Borrowed sym-key probe for either RAY_DICT or RAY_TABLE — returns the
- * value slot for dicts and the column vector for tables.  NULL on miss. */
+ * value slot for dicts and the column vector for tables.  NULL on miss.  A
+ * table slot that fails to materialize yields an owned RAY_ERROR (free it with
+ * ray_error_free); callers test RAY_IS_ERR on a non-NULL result. */
 ray_t* ray_container_probe_sym(ray_t* v, int64_t sym_id);
 
 #endif /* RAY_DICT_H */

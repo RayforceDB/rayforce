@@ -34,7 +34,7 @@ A string column file written by the current engine stores the content hash of ev
 |---|---|
 | `ray_col_save(vec, path)` | Write a vector to a column file. Handles slices, sentinel nulls, and string pools transparently. |
 | `ray_col_load(path)` | Read a column file into a heap-allocated vector. The file is read entirely into memory. |
-| `ray_col_mmap(path)` | Memory-map a column file for zero-copy access. The returned vector points directly into the mapped file pages. Ideal for large datasets that exceed available RAM. |
+| `ray_col_mmap(path)` | Memory-map a column file. A generation-0 file is zero-copy: the returned vector points directly into the mapped file pages. Ideal for large datasets that exceed available RAM. A compressed (generation-2) file is mapped too, but the column decodes into heap memory the first time it is read. |
 
 ```c
 // Save a vector
@@ -50,7 +50,7 @@ ray_t* mapped = ray_col_mmap("db/trades/price");
 ```
 
 !!! note "Memory-mapped vectors"
-    Memory-mapped vectors have `mmod = 1` in their header, distinguishing them from heap-allocated vectors. The buddy allocator skips them during free. Slices of mmap'd vectors retain a reference to the parent mapping.
+    Memory-mapped generation-0 vectors have `mmod = 1` in their header, distinguishing them from heap-allocated vectors; a decoded compressed column is heap memory. The buddy allocator skips them during free. Slices of mmap'd vectors retain a reference to the parent mapping.
 
 ## Splayed Tables
 
@@ -93,12 +93,13 @@ The table, partition and CSV entry points follow the same publication protocol.
 Indexes are built in the new generation before it is published. The CSV and
 Parquet converters build each column's chunk zone or string dictionary from
 the rows as they are streamed and write it with the column, so a conversion
-does not read its own output back; only integer columns whose zone qualifies
-for a hash index are re-read, one column at a time, to build it. An index
-that cannot be written (for example, the disk fills) is dropped and the column
-is published without it. Writers to the
-same table serialize on `.write.lock`; readers resolve the manifest once and
-continue using that generation. The symbol vocabulary stays at its original
+does not read its own output back. The converters add no hash index of their
+own: a hash index is persisted only when the column carries one built with
+`.idx.hash` when the table is saved (a table resaved from an older store keeps
+a hash it already has), and a parted conversion builds none for its segments.
+An index that cannot be written (for example, the disk fills) is dropped and the
+column is published without it. Writers to the same table serialize on
+`.write.lock`; readers resolve the manifest once and continue using that generation. The symbol vocabulary stays at its original
 location and grows append-only.
 
 Publication keeps only the selected generation and removes the others
@@ -338,9 +339,19 @@ Writes a table as column files to a directory. A symbol table file is saved auto
 
 An optional third argument specifies a custom symbol table path: `(.db.splayed.set "/tmp/weather" t "/tmp/my_sym")`. Without it, a `sym` file is created in the table directory.
 
+A trailing options dict selects the column file format: `(.db.splayed.set "/tmp/weather" t {compress: true})`, also after the symbol path. `true` writes generation-2 (compressed) files where eligible, `false` generation 0; when absent each file inherits (generation 2 when its source is an encoded column or the destination's current file is generation 2). Unknown keys or a non-bool value are a `domain` error. Linked, nested/list and explicitly indexed (hash, sort, bloom, part) columns are always written uncompressed. Compressed files keep their chunk zones but carry no persisted hash or dictionary index: a column that a generation-0 save would give one is written without it, and queries over it run without that accelerator.
+
+### Compressed floating-point environment
+
+Generation-2 compressed F32/F64 I/O requires **default floating-point controls** on every calling/executing thread: round-to-nearest (`FE_TONEAREST`), masked FP exceptions, and gradual underflow (FTZ and DAZ disabled). Embedders must maintain those controls during calls. Rayforce does not silently change or normalize them; sticky exception status flags need not be clear and arithmetic may set them. Detected unsupported controls produce `fpenv` (`RAY_ERR_FPENV` in C), not a corruption error. Restore supported controls before retrying the same mapped column; an environment failure is transient, not permanently cached.
+
+The refusal applies conservatively to compressed float writes and whole-column materialization, including decoded-cache hits and non-ALP encodings. ALP range decoding also checks the executing thread. It does not change the file format or require every non-ALP range read to reject nondefault controls.
+
+Detection is deliberately limited: standard rounding is checked, plus SSE rounding, FTZ/DAZ and exception masks on supported x86 SSE builds. This is **not a complete portable FP-environment validator**: x87 trap masks are not checked, and on other native architectures only standard rounding is checked. WebAssembly has fixed nearest rounding. Maintaining other required controls remains the embedder's responsibility; passing a check is not proof that every control is supported.
+
 ### `.db.splayed.get` — Load a Splayed Table
 
-Loads a splayed table from a directory. Columns are memory-mapped for zero-copy access.
+Loads a splayed table from a directory. Columns are memory-mapped: generation-0 files for zero-copy access, while a compressed (generation-2) column decodes into heap memory the first time a query reads it.
 
 ```lisp
 (.db.splayed.get "/tmp/weather")

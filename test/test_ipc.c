@@ -1062,7 +1062,7 @@ static void ipc_rm_journal(const char* jbase) {
 }
 
 static test_result_t test_ipc_journal_path(void) {
-    const char* jbase = "/tmp/rayforce_test_ipc_journal";
+    const char* jbase = ray_test_tmp("/tmp/rayforce_test_ipc_journal");
     /* Remove stale files */
     ipc_rm_journal(jbase);
 
@@ -1464,7 +1464,7 @@ static test_result_t test_ipc_send_verbose_large_result(void) {
  * setting srv.restricted = true triggers the restricted journal path.
  */
 static test_result_t test_ipc_journal_restricted(void) {
-    const char* jbase = "/tmp/rayforce_test_ipc_jrestr";
+    const char* jbase = ray_test_tmp("/tmp/rayforce_test_ipc_jrestr");
     ipc_rm_journal(jbase);
 
     ray_err_t jerr = ray_journal_open(jbase, RAY_JOURNAL_ASYNC);
