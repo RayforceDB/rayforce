@@ -46,3 +46,12 @@
 (nil? (at (select {from:T b:(as 'BOOL f)}) 'b)) -- [false false false]
 (nil? (as 'B8 (list 0Nl 0Nf))) -- [false false]
 (nil? (as 'U8 (list 0Nl 0Nf))) -- [false false]
+
+;; A whole-column producer forces the cast through the typed fallback.
+;; The leading null survives fills, and must still convert to true.
+(set C (table [i h n f] (list [0Nl 0 -1] [0Nh 0h -1h] [0Ni 0i -1i] [0Nf 0.0 -1.0])))
+(as 'BOOL (fills (at C 'i))) -- [true false true]
+(at (select {from:C b:(as 'BOOL (fills i))}) 'b) -- [true false true]
+(at (select {from:C b:(as 'BOOL (fills h))}) 'b) -- [true false true]
+(at (select {from:C b:(as 'BOOL (fills n))}) 'b) -- [true false true]
+(at (select {from:C b:(as 'BOOL (fills f))}) 'b) -- [true false true]
