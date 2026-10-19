@@ -7259,8 +7259,21 @@ typedef struct {
     ray_t*  vec;
 } agg_out_t;
 
-/* Aliases for shared parallel null helpers from internal.h */
-#define grp_set_null       par_set_null
+/* Radix outputs are fresh, unsliced vectors. Workers own disjoint slots,
+ * but all read attrs through ray_data(); even an atomic HAS_NULLS update
+ * races with those plain header reads. Write only payload here and derive
+ * the flag with grp_finalize_nulls after the dispatch joins. */
+static inline void grp_set_null(ray_t* vec, int64_t idx) {
+    void* p = vec->data;
+    switch (vec->type) {
+        case RAY_F64: ((double*)p)[idx] = NULL_F64; break;
+        case RAY_F32: ((float*)p)[idx] = NULL_F32; break;
+        case RAY_I64: case RAY_TIMESTAMP: ((int64_t*)p)[idx] = NULL_I64; break;
+        case RAY_I32: case RAY_DATE: case RAY_TIME: ((int32_t*)p)[idx] = NULL_I32; break;
+        case RAY_I16: ((int16_t*)p)[idx] = NULL_I16; break;
+        default: break;
+    }
+}
 #define grp_finalize_nulls par_finalize_nulls
 
 typedef struct {
@@ -19232,8 +19245,8 @@ v2_emit:;
             new_col->len = (int64_t)total_grps;
             /* Seed HAS_NULLS from the source key column, exactly as the
              * gather-based emit does (agg_gather_key_col).  radix_phase3_fn
-             * runs in parallel and par_set_null writes this bit for the
-             * sentinel types only, so setting it once here — serially,
+             * runs in parallel without writing header flags; sentinel
+             * flags are finalized afterwards. Setting this once here — serially,
              * before the dispatch — keeps SYM/STR/GUID null keys flagged
              * without a worker ever storing into a shared attrs byte that
              * other workers read non-atomically via ray_data().
