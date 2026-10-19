@@ -1,0 +1,24 @@
+;; A conjunct's aggregate reads the original WHERE input, not survivors
+;; of another conjunct.  This must hold for both AST construction and
+;; optimizer splitting/reordering, including an unsafe nested subtree.
+(set S (table [name room score] (list ['Ann 'Cid 'Bob 'Dan] ['A 'A 'B 'B] [60 45 20 35])))
+(at (select {from: S where: (and (== room 'A) (> score (avg score)))}) 'name) -- ['Ann 'Cid]
+(at (select {from: S where: (and (> score (avg score)) (== room 'A))}) 'name) -- ['Ann 'Cid]
+(at (select {from: S where: (and (== room 'A) (> score (avg score))) take: 5}) 'name) -- ['Ann 'Cid]
+(at (select {from: S where: (and (and (== room 'A) (> score (avg score))) (< score 70))}) 'name) -- ['Ann 'Cid]
+(at (select {from: S where: (and (and (== room 'A) (< score 70)) (> score (avg score)))}) 'name) -- ['Ann 'Cid]
+(at (select {from: S where: (== (and (== room 'A) (> score (avg score))) true)}) 'name) -- ['Ann 'Cid]
+(first (at (select {from: S where: (and (== room 'A) (> score (avg score))) take: 1}) 'name)) -- 'Ann
+(count (select {from: S where: (and (== room 'A) (> score (avg score))) take: 0})) -- 0
+;; Legitimate SELECT reductions still consume WHERE survivors.
+(first (at (select {a: (avg score) s: (sum score) from: S where: (== room 'A)}) 'a)) -- 52.5
+(first (at (select {a: (avg score) s: (sum score) from: S where: (== room 'A)}) 's)) -- 105
+(at (select {from: S where: (and (> score 20) (< score 60))}) 'name) -- ['Cid 'Dan]
+;; A captured row-aligned vector is not a scalar broadcast after a gather.
+(set aligned_scores [60 45 20 35])
+(at (select {from: S where: (and (== room 'A) (== score aligned_scores)) take: 5}) 'name) -- ['Ann 'Cid]
+;; Nonlocal descendants remain nonlocal through OR and a hidden IF branch.
+(at (select {from: S where: (and (== room 'A) (or (> score (avg score)) (== name 'Nobody)))}) 'name) -- ['Ann 'Cid]
+(at (select {from: S where: (and (== room 'A) (if (== room 'A) (> score (avg score)) false))}) 'name) -- ['Ann 'Cid]
+;; A genuine nested SELECT establishes a new logical input domain.
+(at (select {from: (select {from: S where: (== room 'A)}) where: (> score (avg score))}) 'name) -- ['Ann]

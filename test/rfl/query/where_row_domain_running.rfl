@@ -1,0 +1,18 @@
+;; The running predicate needs actual contributions from every original
+;; row, including whole morsels rejected by its sibling conjunct. Filling
+;; unproduced lanes with zero is not a semantic repair.
+(set N 200000)
+(set x (til N))
+(set T (table [order region amount] (list x (at ['US 'EU] (as 'I64 (or (< x 1024) (>= x 199000)))) (+ 1 (* 0 x)))))
+(set T (update {from: T amount: (if (== 5 (% order 10)) 0Nl amount)}))
+(set Q (fn [] (count (select {from: T where: (and (== region 'EU) (>= (sums (* (fills amount) 2)) 398000))}))))
+(set K (fn [] (count (select {from: T where: (and (== region 'EU) (>= (sums (* (fills amount) 2)) 398000)) take: 5000}))))
+(set U (fn [] (count (select {from: T where: (== (and (== region 'EU) (>= (sums (* (fills amount) 2)) 398000)) true)}))))
+(Q) -- 1000
+(K) -- 1000
+(U) -- 1000
+(Q) -- 1000
+(K) -- 1000
+;; Pin every surviving row, not only its count.
+(at (select {from: T where: (and (== region 'EU) (>= (sums (* (fills amount) 2)) 398000))}) 'order) -- (+ 199000 (til 1000))
+(at (select {from: T where: (and (== region 'EU) (>= (sums (* (fills amount) 2)) 398000)) take: 5000}) 'order) -- (+ 199000 (til 1000))

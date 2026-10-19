@@ -1718,6 +1718,12 @@ ray_t* build_segment_table(ray_t* parted_tbl, int32_t seg_idx);
  * table.  Defined in exec.c; the parted per-segment sort/take and asof
  * routes in query.c decide a clause's eligibility with it. */
 bool dag_can_stream(ray_graph_t* g, ray_op_t* root);
+/* Value invariance under order-preserving restriction of the default rows:
+ * primitive scalars/row expressions only, with fixed membership-set edges.
+ * Caller must separately establish the input/default-table correspondence.
+ * Read-only and bounded; false declines a rewrite, not the language program.
+ * This does not prove structural-domain or exception-order equivalence. */
+bool ray_expr_subset_invariant(ray_graph_t* g, uint32_t root_id);
 
 /* Ordered concat-merge of two partial partition-streamed results (tables:
  * per-column concat; vectors: direct concat).  Returns an OWNED result.
