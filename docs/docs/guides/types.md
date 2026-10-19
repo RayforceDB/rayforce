@@ -39,6 +39,13 @@ The `as` function performs explicit type conversion. It takes a type symbol and 
 | `'timestamp` | Timestamp | Nanoseconds since 2000-01-01T00:00:00 |
 | `'guid` | GUID | 16-byte unique identifier |
 
+F32 literals use a trailing lowercase `e`: `42e`, `1.5e`, or `-1.5e`.
+Scientific notation keeps its exponent: `1e3` is F64, while `1e3e` is F32.
+F32 vectors require a suffix on each non-null element: `[1e 2e 0Ne]`.
+Finite values beyond the F32 range saturate just as casts do. F32 values
+print with the suffix so parsing the output preserves the element type;
+the configured display precision still controls decimal rounding.
+
 **Numeric casts:**
 
 ```lisp

@@ -1,0 +1,34 @@
+;; F32 suffixes, exponent disambiguation, and printer/readback types.
+(type 42e) -- 'f32
+(type 1.5e) -- 'f32
+(type -1.5e) -- 'f32
+(type 0e) -- 'f32
+(type -0e) -- 'f32
+1.5e -- (as 'F32 1.5)
+-42e -- (as 'F32 -42)
+(type 1e3) -- 'f64
+(type 1E3) -- 'f64
+(type 1e+3) -- 'f64
+(type 1e-3) -- 'f64
+(type 1e3e) -- 'f32
+(type 1E-3e) -- 'f32
+1e3e -- (as 'F32 1000)
+1e-3e -- (as 'F32 0.001)
+1e39e -- (as 'F32 1e39)
+-1e39e -- (as 'F32 -1e39)
+1e-46e -- 0e
+(type [1e -2.5e 0Ne]) -- 'F32
+(nil? [1e -2.5e 0Ne]) -- [false false true]
+(format "%" 1.5e) -- "1.5e"
+(format "%" [1e 0Ne 3e]) -- "[1.0e 0Ne 3.0e]"
+(type (eval (parse (format "%" 1.5e)))) -- 'f32
+(type (eval (parse (format "%" [1e 0Ne 3e])))) -- 'F32
+(eval (parse (format "%" [1e 0Ne 3e]))) -- [1e 0Ne 3e]
+(type (eval (parse (format "%" 1e20e)))) -- 'f32
+(type (eval (parse (format "%" 1e-20e)))) -- 'f32
+(parse "1e+") !- parse
+(parse "1e-") !- parse
+(parse "1E") !- parse
+(parse "1ee") !- parse
+(parse "1.5ex") !- parse
+(parse "1e3ee") !- parse
