@@ -6280,13 +6280,11 @@ static test_result_t test_parted_nullable_stats(void) {
     PASS();
 }
 
-/* Task 17d: a per-partition avg over an expression builds a non-null
- * count slot only when the expression can yield a null.  `avg`/`sum` of
- * (strlen c) reads a null cell as length 0 on every grouped route (the
- * inline strlen), so it keeps the row count; a cast of a null-free integer
- * to F64 is null-free.  Arithmetic over strlen and var/dev of strlen
- * (evaluated, a null cell a null length) still count non-nulls.  Answers
- * equal the same rows in memory, generation 0 and 2. */
+/* Task 17d: a per-partition AVG over an expression builds a non-null
+ * count slot when the expression can yield null.  strlen maps the empty
+ * STR/SYM value to null (#888), so its AVG counts only non-empty inputs.
+ * A cast of a null-free integer to F64 is null-free.  Answers agree over
+ * the same rows in memory, generation 0 and generation 2. */
 static test_result_t test_parted_expr_null_free(void) {
     for (int gen = 0; gen <= 2; gen += 2)
         for (int p = 0; p < 3; p++)
@@ -6301,9 +6299,9 @@ static test_result_t test_parted_expr_null_free(void) {
                "(map (fn [i] (if (== 0 (% i 4)) \"\" (if (== 0 (% i 3)) \"abcdef\" \"ab\"))) jj) "
                "(map (fn [i] (if (== 0 (% i 6)) (as 'SYM \"\") (if (== 0 (% i 5)) 'xyz 'q))) jj) jj)))");
     static const struct { const char* q; int64_t nn; } qs[] = {
-        { "(select {a: (avg (strlen s)) from: T by: g asc: g})", 0 },
-        { "(select {a: (avg (strlen y)) b: (sum (strlen s)) c: (count s) from: T by: g asc: g})", 0 },
-        { "(select {a: (avg (strlen s)) from: T where: (!= s \"\") by: g asc: g})", 0 },
+        { "(select {a: (avg (strlen s)) from: T by: g asc: g})", 3 },
+        { "(select {a: (avg (strlen y)) b: (sum (strlen s)) c: (count s) from: T by: g asc: g})", 3 },
+        { "(select {a: (avg (strlen s)) from: T where: (!= s \"\") by: g asc: g})", 3 },
         { "(select {a: (avg (as 'F64 z)) b: (avg (as 'I64 g)) from: T by: g asc: g})", 0 },
         { "(select {a: (avg (+ 1 (strlen s))) from: T by: g asc: g})", 3 },   /* one slot per partition */
         { "(select {v: (var (strlen s)) from: T by: g asc: g})", 3 },
@@ -6322,16 +6320,13 @@ static test_result_t test_parted_expr_null_free(void) {
                             gen, qs[i].q, (long long)(ray_group_perpart_nn_slots() - n0), (long long)qs[i].nn);
         }
     }
-    /* Fix round 1: the pre-range-read base (80a28e49) answers this parted
-     * avg over the rows, an empty string a length-0 row: 2.5, 2.5,
-     * 2.4994285714, 2.5005714286, 2.5 (base's (* 1e7 a) as I64:
-     * 25000000 25000000 24994285 25005714 25000000).  Generation 0 and 2
-     * give exactly that value, per partition. */
+    /* Explicit reference: an empty string contributes neither a length
+     * nor a count to AVG, on both storage generations. */
     int64_t lsum[5] = { 0 }, lcnt[5] = { 0 };
     for (int p = 0; p < 3; p++)
         for (int64_t i = 0; i < 35000; i++) {
             lsum[i % 5] += i % 4 == 0 ? 0 : i % 3 == 0 ? 6 : 2;
-            lcnt[i % 5]++;
+            if (i % 4 != 0) lcnt[i % 5]++;
         }
     for (int gen = 0; gen <= 2; gen += 2) {
         sr_evalf_ok("(set T (.db.parted.get \"" SR_TMP "/ne%d\" 't))", gen);
@@ -6348,19 +6343,11 @@ static test_result_t test_parted_expr_null_free(void) {
     PASS();
 }
 
-/* Task 17g: sum / avg of (strlen s) over a generation-2 STR column give
- * generation 0's answers and the same rows' in memory on every route: the
- * scalar route, the normal routing (the v2 engine declines a strlen input:
- * the legacy ladder), the direct array, legacy radix (a wide key), under a
- * selection, beside a staged SYM strlen, and per partition.  The encoded
- * STR is read through its plain column (one materialization); declining it
- * left the input to the expression path, whose strlen makes an empty
- * string (the STR null) a null that the average skipped, where the scalar
- * and direct-array routes count it as length 0 (checked against the
- * reference below).  With the direct array skipped, the legacy ladder's
- * divisor skips the STR null on every source alike (pre-existing; only the
- * sources' agreement is checked there).  The lengths differ by group, so a
- * mixed-up group shows. */
+/* Task 17g: strlen SUM/AVG over generation-2 STR agrees with generation
+ * 0 and the same rows in memory: scalar, direct-array, legacy radix,
+ * selection, mixed staged SYM and per-partition routes.  Encoded STR
+ * currently materializes once.  AVG skips empty STR/SYM values (#888);
+ * the explicit reference below checks that rule, not just agreement. */
 static int64_t sr_strlen_len(int64_t r) {
     switch (r % 3) {
     case 0:  return (r / 3) % 2 ? 0 : 4;
@@ -6372,11 +6359,12 @@ static test_result_t test_strlen_str_gen2_routes(void) {
     const int64_t n = 70000;
     static const char abc[] = "abcdefg";
     ray_t* sv = ray_vec_new(RAY_STR, n); sv->len = 0;
-    int64_t gsum[3] = { 0 }, gcnt[3] = { 0 }, tsum = 0;
+    int64_t gsum[3] = { 0 }, gcnt[3] = { 0 }, tsum = 0, tcnt = 0;
     for (int64_t r = 0; r < n; r++) {
         int64_t l = sr_strlen_len(r);
         sv = ray_str_vec_append(sv, abc, (size_t)l);
-        gsum[r % 3] += l; gcnt[r % 3]++; tsum += l;
+        gsum[r % 3] += l; tsum += l;
+        if (l != 0) { gcnt[r % 3]++; tcnt++; }
     }
     ray_env_set(ray_sym_intern("slv", 3), sv); ray_release(sv);
     sr_eval_ok("(set i (til 70000))");
@@ -6386,7 +6374,7 @@ static test_result_t test_strlen_str_gen2_routes(void) {
     const char* t0 = "(.db.splayed.get \"" SR_TMP "/sl0/\")";
     const char* t2 = "(.db.splayed.get \"" SR_TMP "/sl2/\")";
     /* the reference itself on the scalar and direct-array routes: an empty
-     * string is a length-0 row */
+     * string is null and is excluded from the AVG divisor (#888) */
     for (int k3 = 0; k3 < 6; k3++) {
         int gen = k3 % 3;
         ray_group_test_route(k3 / 3);
@@ -6401,7 +6389,7 @@ static test_result_t test_strlen_str_gen2_routes(void) {
         ray_t* s = sr_eval("(first (at (select {a: (avg (strlen s)) from: T}) 'a))");
         ray_group_test_route(0);
         TEST_ASSERT_FMT(s && !RAY_IS_ERR(s) && s->type == -RAY_F64 &&
-                        fabs(s->f64 - (double)tsum / (double)n) < 1e-9, "source %d: scalar avg", gen);
+                        fabs(s->f64 - (double)tsum / (double)tcnt) < 1e-9, "source %d: scalar avg", gen);
         sr_drop(s);
     }
     static const struct { const char* q; uint64_t mat; } qs[] = {

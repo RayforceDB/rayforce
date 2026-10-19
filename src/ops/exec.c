@@ -5854,7 +5854,7 @@ static bool subtree_has_default_scan(ray_graph_t* g, ray_op_t* op, bool* ok,
  * DAGs that never scan the default table (e.g. a bare OP_CONST behind
  * passthrough ops) are rejected to avoid duplicating table-independent
  * results across partitions. */
-static bool dag_can_stream(ray_graph_t* g, ray_op_t* root) {
+bool dag_can_stream(ray_graph_t* g, ray_op_t* root) {
     uint32_t n_words = (g->node_count + 63) / 64;
     uint64_t  stack_buf[16];                  /* covers DAGs up to 1024 nodes */
     ray_t* visited_hdr = NULL;
