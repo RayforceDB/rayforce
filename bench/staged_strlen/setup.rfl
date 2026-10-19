@@ -1,0 +1,7 @@
+;; Run from the repository root. Creates only this benchmark fixture.
+(.sys.exec "mkdir -p bench/staged_strlen/data")
+(set i (+ 0 (til 10000000)))
+(set s (at ["" "alpha" "bb" "cccccc" "a longer repeated string"] (% i 5)))
+(set T (table [i k v f s y] (list i (% i 997) (at [0N -7 1 99 1234] (% i 5)) (at [-0.0 0.0 0Nf 2.5 -3.25] (% i 5)) s (as 'SYM s))))
+(println "splayed gen0 writer_ms: %" (timeit (.db.splayed.set "bench/staged_strlen/data/s0/" T "bench/staged_strlen/data/s0.sym" {compress: false})))
+(println "splayed gen2 writer_ms: %" (timeit (.db.splayed.set "bench/staged_strlen/data/s2/" T "bench/staged_strlen/data/s2.sym" {compress: true})))

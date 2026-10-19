@@ -10557,11 +10557,18 @@ da_sid_len_slow(const da_ctx_t* c, uint32_t a, int64_t r) {
     return group_strlen_at_cached(c->agg_cols[a], r, c->sym_strings, c->sym_count);
 }
 
+static int64_t __attribute__((noinline, cold))
+da_sid_len_piece_slow(const da_ctx_t* c, uint32_t a, int64_t rr) {
+    return sym_strlen_raw(c->agg_ptrs[a], rr, da_agg_attrs(c, a, true),
+                          ray_sym_vec_domain((ray_t*)c->agg_cols[a]));
+}
+
 /* strlen of SYM id sid (cell r of agg a): raw is the pinned FILE mapping or
  * NULL, rt the runtime domain with the borrowed snapshot — both decided by
  * the caller once.  Same answer as da_strlen_at. */
 RAY_INLINE int64_t da_sid_len(const da_ctx_t* c, uint32_t a, int64_t sid,
-                              const ray_sym_domain_raw_t* raw, bool rt, int64_t r) {
+                              const ray_sym_domain_raw_t* raw, bool rt, int64_t r,
+                              int64_t rr, const bool staged) {
     if (sid == 0) return 0;
     if (raw && sid > 0 && sid < raw->count) {
         size_t sl;
@@ -10572,7 +10579,7 @@ RAY_INLINE int64_t da_sid_len(const da_ctx_t* c, uint32_t a, int64_t sid,
         ray_t* atom = c->sym_strings[sid];
         return atom ? (int64_t)ray_str_len(atom) : 0;
     }
-    return da_sid_len_slow(c, a, r);
+    return staged ? da_sid_len_piece_slow(c, a, rr) : da_sid_len_slow(c, a, r);
 }
 
 /* One SUM/AVG(strlen) beside COUNTs, one key, no row selection
@@ -10583,8 +10590,10 @@ RAY_INLINE int64_t da_sid_len(const da_ctx_t* c, uint32_t a, int64_t sid,
  * SUM/AVG fast path keeps for it: count, the length sum, nn when allocated,
  * sl_null for an AVG (COUNT emits from count alone). */
 #define DA_SL_BLK 512
-static void __attribute__((noinline))
-da_accum_strlen_fn(da_ctx_t* c, da_accum_t* acc, int64_t start, int64_t end) {
+/* The two wrappers instantiate this with a constant mode. Piece pointers
+ * address row_base; lengths are consumed synchronously before the walk advances. */
+RAY_INLINE void da_accum_strlen_body(da_ctx_t* c, da_accum_t* acc,
+                                    int64_t start, int64_t end, const bool staged) {
     const uint32_t sa = (uint32_t)c->sl_agg;
     const size_t n_aggs = c->n_aggs;
     int64_t* restrict count = acc->count;
@@ -10595,19 +10604,22 @@ da_accum_strlen_fn(da_ctx_t* c, da_accum_t* acc, int64_t start, int64_t end) {
     const bool ksym = c->key_types[0] == RAY_SYM;
     const bool da_pf = c->n_slots >= 4096;
     const ray_t* col = c->agg_cols[sa];
-    const ray_str_t* desc = c->agg_str[sa];
-    const void* ids = desc ? NULL : ray_data((ray_t*)col);
-    const uint8_t sw = col->attrs & RAY_SYM_W_MASK;
+    const int64_t rb = staged ? c->row_base : 0;
+    /* Staged admission is SYM only; STR retains its whole-column descriptors. */
+    const ray_str_t* desc = staged ? NULL : c->agg_str[sa];
+    const void* ids = desc ? NULL : (staged ? c->agg_ptrs[sa] : ray_data((ray_t*)col));
+    const uint8_t sw = (staged ? da_agg_attrs(c, sa, true) : col->attrs) & RAY_SYM_W_MASK;
     const ray_sym_domain_raw_t* raw =
         (!desc && c->agg_raw_ok && c->agg_raw_ok[sa]) ? &c->agg_raw[sa] : NULL;
-    const bool rt = !desc && c->sym_strings &&
+    const bool rt = !staged && !desc && c->sym_strings &&
                     ray_sym_vec_domain((ray_t*)col) == ray_sym_runtime_domain();
     int64_t lens[DA_SL_BLK];
     #define DA_SL_SYM(T) \
     do { \
         const T* sp = (const T*)ids; \
         for (int64_t j = 0; j < n; j++) \
-            lens[j] = da_sid_len(c, sa, (int64_t)sp[b0 + j], raw, rt, b0 + j); \
+            lens[j] = da_sid_len(c, sa, (int64_t)sp[b0 + j - rb], raw, rt, \
+                                 b0 + j, b0 + j - rb, staged); \
     } while (0)
     #define DA_SL_PF_DIST 8
     #define DA_SL_FOLD(KTYPE, KCAST) \
@@ -10616,12 +10628,12 @@ da_accum_strlen_fn(da_ctx_t* c, da_accum_t* acc, int64_t start, int64_t end) {
         for (int64_t j = 0; j < n; j++) { \
             int64_t r = b0 + j; \
             if (da_pf && RAY_LIKELY(r + DA_SL_PF_DIST < end)) { \
-                int64_t pfk = (int64_t)KCAST kp[r + DA_SL_PF_DIST]; \
+                int64_t pfk = (int64_t)KCAST kp[r + DA_SL_PF_DIST - rb]; \
                 if (ksym && pfk == 0) pfk = kmin; \
                 __builtin_prefetch(&count[(int32_t)(pfk - kmin)], 1, 1); \
                 __builtin_prefetch(&sum[(size_t)(int32_t)(pfk - kmin) * n_aggs], 1, 1); \
             } \
-            int64_t kv = (int64_t)KCAST kp[r]; \
+            int64_t kv = (int64_t)KCAST kp[r - rb]; \
             if (ksym && kv == 0) kv = kmin; \
             int32_t gid = (int32_t)(kv - kmin); \
             count[gid]++; \
@@ -10667,6 +10679,16 @@ da_accum_strlen_fn(da_ctx_t* c, da_accum_t* acc, int64_t start, int64_t end) {
 }
 #undef DA_SL_BLK
 
+static void __attribute__((noinline))
+da_accum_strlen_fn(da_ctx_t* c, da_accum_t* acc, int64_t start, int64_t end) {
+    da_accum_strlen_body(c, acc, start, end, false);
+}
+
+static void __attribute__((noinline))
+da_accum_strlen_staged_fn(da_ctx_t* c, da_accum_t* acc, int64_t start, int64_t end) {
+    da_accum_strlen_body(c, acc, start, end, true);
+}
+
 /* The row step, out of line once per instance (as before range reads):
  * the plain one reads whole columns with no piece widths. */
 static void da_accum_row_plain(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64_t r, int64_t rr) {
@@ -10694,7 +10716,11 @@ RAY_INLINE void da_accum_body(da_ctx_t* c, uint32_t worker_id, int64_t start, in
     uint8_t n_keys = c->n_keys;
     const int64_t* match_idx = c->match_idx;
 
-    if (!staged && c->sl_agg >= 0) { da_accum_strlen_fn(c, acc, start, end); return; }
+    if (c->sl_agg >= 0) {
+        if (staged) da_accum_strlen_staged_fn(c, acc, start, end);
+        else        da_accum_strlen_fn(c, acc, start, end);
+        return;
+    }
 
     /* Fast path: single key — avoid composite GID loop overhead.
      * Templated by key element size: the entire loop is stamped out per width
@@ -16968,12 +16994,16 @@ da_path:;
             }
             da_ctx.agg_str = da_agg_str;
             da_ctx.sl_agg = -1;
-            if (!grp_staged && all_sum && n_keys == 1 && !match_idx && !rowsel) {
+            if (all_sum && n_keys == 1 && !match_idx && !rowsel) {
                 int32_t one = -1;
                 bool sl_ok = true;
                 for (uint32_t a = 0; a < n_aggs && sl_ok; a++) {
                     if (agg_prod[a].enabled) sl_ok = false;
-                    else if (agg_strlen[a] && agg_vecs[a]) { if (one >= 0) sl_ok = false; else one = (int32_t)a; }
+                    else if (agg_strlen[a] && da_agg_cols[a] &&
+                             (!grp_staged || (da_agg_cols[a]->type == RAY_SYM &&
+                              (ext->agg_ops[a] == OP_SUM || ext->agg_ops[a] == OP_AVG)))) {
+                        if (one >= 0) sl_ok = false; else one = (int32_t)a;
+                    }
                     else if (ext->agg_ops[a] != OP_COUNT) sl_ok = false;
                 }
                 if (sl_ok && one >= 0) da_ctx.sl_agg = one;

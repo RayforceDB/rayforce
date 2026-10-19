@@ -1,0 +1,190 @@
+;; Relative fixture paths stay isolated in the harness per-process working directory.
+;; @requires: posix
+;; Staged SYM strlen uses piece-relative rows and widths.
+;; SUM and AVG are separate queries: exactly one strlen aggregate beside COUNT.
+(.sys.exec "rm -rf rfl_strlen_staged; mkdir -p rfl_strlen_staged")
+(set SLI (til 131079))
+(set SLH (as 'I16 (- (% SLI 7) 3)))
+(set SLM (as 'I32 SLH))
+(set SLL (as 'I64 SLH))
+(set SLQ (as 'I32 (- (% SLI 8192) 4096)))
+(set SLY (as 'SYM (at ["" "a" "bb" "cccccc" "lengthier" "" "a" "" "cccccc" "lengthier" "" "a" "bb" "cccccc" "" "" "a" "bb" "cccccc" "lengthier" "" "" "bb" "cccccc" "lengthier" "" "a" "bb" "" "lengthier" "" "a" "bb" "cccccc" "lengthier"] (% SLI 35))))
+(set SLT (table [h m l p y] (list SLH SLM SLL SLQ SLY)))
+(.db.splayed.set "rfl_strlen_staged/small/" SLT "rfl_strlen_staged/small.sym" {compress: true})
+(set SLU (.db.splayed.get "rfl_strlen_staged/small/" "rfl_strlen_staged/small.sym"))
+;; small: h, sum
+(set SLR (select {a: (sum (strlen y)) c: (count y) from: SLU by: h asc: h}))
+(set SLP (select {a: (sum (strlen y)) c: (count y) from: SLT by: h asc: h}))
+(as 'I64 (at SLR 'h)) -- [-3 -2 -1 0 1 2 3]
+(type (at SLR 'h)) -- (type (at SLP 'h))
+(at SLR 'a) -- [0 67411 67412 67416 67410 67410 67410]
+(at SLR 'c) -- [18726 18726 18726 18726 18725 18725 18725]
+(value SLR) -- (value SLP)
+;; small: h, avg
+(set SLR (select {a: (avg (strlen y)) c: (count y) from: SLU by: h asc: h}))
+(set SLP (select {a: (avg (strlen y)) c: (count y) from: SLT by: h asc: h}))
+(as 'I64 (at SLR 'h)) -- [-3 -2 -1 0 1 2 3]
+(type (at SLR 'h)) -- (type (at SLP 'h))
+(at SLR 'a) -- [0Nf 4.499766370736266 4.499833121954476 4.500100126827315 4.5 4.5 4.5]
+(at SLR 'c) -- [18726 18726 18726 18726 18725 18725 18725]
+(value SLR) -- (value SLP)
+(nil? (at SLR 'a)) -- [true false false false false false false]
+;; small: m, sum
+(set SLR (select {a: (sum (strlen y)) c: (count y) from: SLU by: m asc: m}))
+(set SLP (select {a: (sum (strlen y)) c: (count y) from: SLT by: m asc: m}))
+(as 'I64 (at SLR 'm)) -- [-3 -2 -1 0 1 2 3]
+(type (at SLR 'm)) -- (type (at SLP 'm))
+(at SLR 'a) -- [0 67411 67412 67416 67410 67410 67410]
+(at SLR 'c) -- [18726 18726 18726 18726 18725 18725 18725]
+(value SLR) -- (value SLP)
+;; small: m, avg
+(set SLR (select {a: (avg (strlen y)) c: (count y) from: SLU by: m asc: m}))
+(set SLP (select {a: (avg (strlen y)) c: (count y) from: SLT by: m asc: m}))
+(as 'I64 (at SLR 'm)) -- [-3 -2 -1 0 1 2 3]
+(type (at SLR 'm)) -- (type (at SLP 'm))
+(at SLR 'a) -- [0Nf 4.499766370736266 4.499833121954476 4.500100126827315 4.5 4.5 4.5]
+(at SLR 'c) -- [18726 18726 18726 18726 18725 18725 18725]
+(value SLR) -- (value SLP)
+(nil? (at SLR 'a)) -- [true false false false false false false]
+;; small: l, sum
+(set SLR (select {a: (sum (strlen y)) c: (count y) from: SLU by: l asc: l}))
+(set SLP (select {a: (sum (strlen y)) c: (count y) from: SLT by: l asc: l}))
+(as 'I64 (at SLR 'l)) -- [-3 -2 -1 0 1 2 3]
+(type (at SLR 'l)) -- (type (at SLP 'l))
+(at SLR 'a) -- [0 67411 67412 67416 67410 67410 67410]
+(at SLR 'c) -- [18726 18726 18726 18726 18725 18725 18725]
+(value SLR) -- (value SLP)
+;; small: l, avg
+(set SLR (select {a: (avg (strlen y)) c: (count y) from: SLU by: l asc: l}))
+(set SLP (select {a: (avg (strlen y)) c: (count y) from: SLT by: l asc: l}))
+(as 'I64 (at SLR 'l)) -- [-3 -2 -1 0 1 2 3]
+(type (at SLR 'l)) -- (type (at SLP 'l))
+(at SLR 'a) -- [0Nf 4.499766370736266 4.499833121954476 4.500100126827315 4.5 4.5 4.5]
+(at SLR 'c) -- [18726 18726 18726 18726 18725 18725 18725]
+(value SLR) -- (value SLP)
+(nil? (at SLR 'a)) -- [true false false false false false false]
+;; 8192 slots enables the piece-bounded prefetch loop.
+(set SLR (select {a: (sum (strlen y)) c: (count y) from: SLU by: p asc: p}))
+(set SLP (select {a: (sum (strlen y)) c: (count y) from: SLT by: p asc: p}))
+(as 'I64 (at SLR 'p)) -- (- (til 8192) 4096)
+(sum (at SLR 'c)) -- 131079
+(value SLR) -- (value SLP)
+;; 8192 slots enables the piece-bounded prefetch loop.
+(set SLR (select {a: (avg (strlen y)) c: (count y) from: SLU by: p asc: p}))
+(set SLP (select {a: (avg (strlen y)) c: (count y) from: SLT by: p asc: p}))
+(as 'I64 (at SLR 'p)) -- (- (til 8192) 4096)
+(sum (at SLR 'c)) -- 131079
+(value SLR) -- (value SLP)
+(set SLV (as 'SYM (map (fn [j] (format "v%" j)) (til 300))))
+(set SLY (at (concat (enlist (as 'SYM "")) SLV) (% SLI 301)))
+(set SLT (table [h m l p y] (list SLH SLM SLL SLQ SLY)))
+(.db.splayed.set "rfl_strlen_staged/wide16/" SLT "rfl_strlen_staged/wide16.sym" {compress: true})
+(set SLU (.db.splayed.get "rfl_strlen_staged/wide16/" "rfl_strlen_staged/wide16.sym"))
+;; wide16: h, sum
+(set SLR (select {a: (sum (strlen y)) c: (count y) from: SLU by: h asc: h}))
+(set SLP (select {a: (sum (strlen y)) c: (count y) from: SLT by: h asc: h}))
+(as 'I64 (at SLR 'h)) -- [-3 -2 -1 0 1 2 3]
+(type (at SLR 'h)) -- (type (at SLP 'h))
+(at SLR 'a) -- [66620 67492 67492 67928 68360 68360 68360]
+(at SLR 'c) -- [18726 18726 18726 18726 18725 18725 18725]
+(value SLR) -- (value SLP)
+;; wide16: h, avg
+(set SLR (select {a: (avg (strlen y)) c: (count y) from: SLU by: h asc: h}))
+(set SLP (select {a: (avg (strlen y)) c: (count y) from: SLT by: h asc: h}))
+(as 'I64 (at SLR 'h)) -- [-3 -2 -1 0 1 2 3]
+(type (at SLR 'h)) -- (type (at SLP 'h))
+(at SLR 'a) -- [3.642427556041553 3.6041866922994767 3.6041866922994767 3.6274698280465665 3.650734312416555 3.650734312416555 3.650734312416555]
+(at SLR 'c) -- [18726 18726 18726 18726 18725 18725 18725]
+(value SLR) -- (value SLP)
+(nil? (at SLR 'a)) -- [false false false false false false false]
+;; wide16: m, sum
+(set SLR (select {a: (sum (strlen y)) c: (count y) from: SLU by: m asc: m}))
+(set SLP (select {a: (sum (strlen y)) c: (count y) from: SLT by: m asc: m}))
+(as 'I64 (at SLR 'm)) -- [-3 -2 -1 0 1 2 3]
+(type (at SLR 'm)) -- (type (at SLP 'm))
+(at SLR 'a) -- [66620 67492 67492 67928 68360 68360 68360]
+(at SLR 'c) -- [18726 18726 18726 18726 18725 18725 18725]
+(value SLR) -- (value SLP)
+;; wide16: m, avg
+(set SLR (select {a: (avg (strlen y)) c: (count y) from: SLU by: m asc: m}))
+(set SLP (select {a: (avg (strlen y)) c: (count y) from: SLT by: m asc: m}))
+(as 'I64 (at SLR 'm)) -- [-3 -2 -1 0 1 2 3]
+(type (at SLR 'm)) -- (type (at SLP 'm))
+(at SLR 'a) -- [3.642427556041553 3.6041866922994767 3.6041866922994767 3.6274698280465665 3.650734312416555 3.650734312416555 3.650734312416555]
+(at SLR 'c) -- [18726 18726 18726 18726 18725 18725 18725]
+(value SLR) -- (value SLP)
+(nil? (at SLR 'a)) -- [false false false false false false false]
+;; wide16: l, sum
+(set SLR (select {a: (sum (strlen y)) c: (count y) from: SLU by: l asc: l}))
+(set SLP (select {a: (sum (strlen y)) c: (count y) from: SLT by: l asc: l}))
+(as 'I64 (at SLR 'l)) -- [-3 -2 -1 0 1 2 3]
+(type (at SLR 'l)) -- (type (at SLP 'l))
+(at SLR 'a) -- [66620 67492 67492 67928 68360 68360 68360]
+(at SLR 'c) -- [18726 18726 18726 18726 18725 18725 18725]
+(value SLR) -- (value SLP)
+;; wide16: l, avg
+(set SLR (select {a: (avg (strlen y)) c: (count y) from: SLU by: l asc: l}))
+(set SLP (select {a: (avg (strlen y)) c: (count y) from: SLT by: l asc: l}))
+(as 'I64 (at SLR 'l)) -- [-3 -2 -1 0 1 2 3]
+(type (at SLR 'l)) -- (type (at SLP 'l))
+(at SLR 'a) -- [3.642427556041553 3.6041866922994767 3.6041866922994767 3.6274698280465665 3.650734312416555 3.650734312416555 3.650734312416555]
+(at SLR 'c) -- [18726 18726 18726 18726 18725 18725 18725]
+(value SLR) -- (value SLP)
+(nil? (at SLR 'a)) -- [false false false false false false false]
+(set SLV (as 'SYM (map (fn [j] (format "v%" j)) (til 80000))))
+(set SLY (at (concat (enlist (as 'SYM "")) SLV) (% SLI 80001)))
+(set SLT (table [h m l p y] (list SLH SLM SLL SLQ SLY)))
+(.db.splayed.set "rfl_strlen_staged/wide32/" SLT "rfl_strlen_staged/wide32.sym" {compress: true})
+(set SLU (.db.splayed.get "rfl_strlen_staged/wide32/" "rfl_strlen_staged/wide32.sym"))
+;; wide32: h, sum
+(set SLR (select {a: (sum (strlen y)) c: (count y) from: SLU by: h asc: h}))
+(set SLP (select {a: (sum (strlen y)) c: (count y) from: SLT by: h asc: h}))
+(as 'I64 (at SLR 'h)) -- [-3 -2 -1 0 1 2 3]
+(type (at SLR 'h)) -- (type (at SLP 'h))
+(at SLR 'a) -- [109176 109179 109180 109182 109177 109173 109175]
+(at SLR 'c) -- [18726 18726 18726 18726 18725 18725 18725]
+(value SLR) -- (value SLP)
+;; wide32: h, avg
+(set SLR (select {a: (avg (strlen y)) c: (count y) from: SLU by: h asc: h}))
+(set SLP (select {a: (avg (strlen y)) c: (count y) from: SLT by: h asc: h}))
+(as 'I64 (at SLR 'h)) -- [-3 -2 -1 0 1 2 3]
+(type (at SLR 'h)) -- (type (at SLP 'h))
+(at SLR 'a) -- [5.830493991989319 5.830342838833707 5.830396240521201 5.830503043896187 5.830547396528705 5.830645161290323 5.830440587449933]
+(at SLR 'c) -- [18726 18726 18726 18726 18725 18725 18725]
+(value SLR) -- (value SLP)
+(nil? (at SLR 'a)) -- [false false false false false false false]
+;; wide32: m, sum
+(set SLR (select {a: (sum (strlen y)) c: (count y) from: SLU by: m asc: m}))
+(set SLP (select {a: (sum (strlen y)) c: (count y) from: SLT by: m asc: m}))
+(as 'I64 (at SLR 'm)) -- [-3 -2 -1 0 1 2 3]
+(type (at SLR 'm)) -- (type (at SLP 'm))
+(at SLR 'a) -- [109176 109179 109180 109182 109177 109173 109175]
+(at SLR 'c) -- [18726 18726 18726 18726 18725 18725 18725]
+(value SLR) -- (value SLP)
+;; wide32: m, avg
+(set SLR (select {a: (avg (strlen y)) c: (count y) from: SLU by: m asc: m}))
+(set SLP (select {a: (avg (strlen y)) c: (count y) from: SLT by: m asc: m}))
+(as 'I64 (at SLR 'm)) -- [-3 -2 -1 0 1 2 3]
+(type (at SLR 'm)) -- (type (at SLP 'm))
+(at SLR 'a) -- [5.830493991989319 5.830342838833707 5.830396240521201 5.830503043896187 5.830547396528705 5.830645161290323 5.830440587449933]
+(at SLR 'c) -- [18726 18726 18726 18726 18725 18725 18725]
+(value SLR) -- (value SLP)
+(nil? (at SLR 'a)) -- [false false false false false false false]
+;; wide32: l, sum
+(set SLR (select {a: (sum (strlen y)) c: (count y) from: SLU by: l asc: l}))
+(set SLP (select {a: (sum (strlen y)) c: (count y) from: SLT by: l asc: l}))
+(as 'I64 (at SLR 'l)) -- [-3 -2 -1 0 1 2 3]
+(type (at SLR 'l)) -- (type (at SLP 'l))
+(at SLR 'a) -- [109176 109179 109180 109182 109177 109173 109175]
+(at SLR 'c) -- [18726 18726 18726 18726 18725 18725 18725]
+(value SLR) -- (value SLP)
+;; wide32: l, avg
+(set SLR (select {a: (avg (strlen y)) c: (count y) from: SLU by: l asc: l}))
+(set SLP (select {a: (avg (strlen y)) c: (count y) from: SLT by: l asc: l}))
+(as 'I64 (at SLR 'l)) -- [-3 -2 -1 0 1 2 3]
+(type (at SLR 'l)) -- (type (at SLP 'l))
+(at SLR 'a) -- [5.830493991989319 5.830342838833707 5.830396240521201 5.830503043896187 5.830547396528705 5.830645161290323 5.830440587449933]
+(at SLR 'c) -- [18726 18726 18726 18726 18725 18725 18725]
+(value SLR) -- (value SLP)
+(nil? (at SLR 'a)) -- [false false false false false false false]
+(.sys.exec "rm -rf rfl_strlen_staged")
