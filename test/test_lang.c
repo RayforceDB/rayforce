@@ -1531,7 +1531,9 @@ static test_result_t test_eval_select_where_in_sym(void) {
  * computes on the kernels' terms; any other column declines (NULL) so the
  * evaluator applies the builtin itself.  The kernels read a DATE, TIME or
  * TIMESTAMP lane as its raw counts, SYM as interned ids, and ran the integer
- * lanes of ceil/floor/round as doubles. */
+ * lanes of ceil/floor/round as doubles.  Over an integer column (BOOL, U8,
+ * I16, I32, I64) ceil and floor lower to the column's own scan, and round
+ * to a cast to F64, the builtins' answers. */
 static bool unary_arith_lowers(const char* verb, const char* col) {
     bool temporal_or_sym = !strcmp(col, "d") || !strcmp(col, "t") ||
                            !strcmp(col, "ts") || !strcmp(col, "s");
@@ -1539,16 +1541,21 @@ static bool unary_arith_lowers(const char* verb, const char* col) {
         return !temporal_or_sym && strcmp(col, "b") && strcmp(col, "u");
     if (!strcmp(verb, "exp") || !strcmp(verb, "log") || !strcmp(verb, "sqrt"))
         return !temporal_or_sym;
-    return !strcmp(col, "f");   /* ceil / floor / round */
+    return !temporal_or_sym;   /* ceil / floor / round */
+}
+
+static bool unary_arith_int_col(const char* col) {
+    return !strcmp(col, "b") || !strcmp(col, "u") || !strcmp(col, "h") ||
+           !strcmp(col, "i") || !strcmp(col, "l");
 }
 
 static test_result_t test_eval_select_unary_arith_dag_admission(void) {
     ray_t* tbl = ray_eval_str(
-        "(table [d t ts b u h l f s] (list [2024.01.01 2024.01.02] "
+        "(table [d t ts b u h i l f s] (list [2024.01.01 2024.01.02] "
         "[10:00:00.000 11:00:00.000] "
         "[2024.01.01D10:00:00.000000000 2024.01.02D10:00:00.000000000] "
-        "[true false] (as 'U8 [1 2]) (as 'I16 [1 -2]) [1 -2] [1.5 -2.5] "
-        "['a 'b]))");
+        "[true false] (as 'U8 [1 2]) (as 'I16 [1 -2]) (as 'I32 [1 -2]) [1 -2] "
+        "[1.5 -2.5] ['a 'b]))");
     TEST_ASSERT_NOT_NULL(tbl);
     TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
     TEST_ASSERT_EQ_I(tbl->type, RAY_TABLE);
@@ -1557,7 +1564,7 @@ static test_result_t test_eval_select_unary_arith_dag_admission(void) {
         "neg", "abs", "exp", "log", "sqrt", "ceil", "floor", "round",
     };
     static const char* const cols[] = {
-        "d", "t", "ts", "b", "u", "h", "l", "f", "s",
+        "d", "t", "ts", "b", "u", "h", "i", "l", "f", "s",
     };
     for (size_t v = 0; v < sizeof verbs / sizeof *verbs; v++) {
         for (size_t c = 0; c < sizeof cols / sizeof *cols; c++) {
@@ -1572,11 +1579,42 @@ static test_result_t test_eval_select_unary_arith_dag_admission(void) {
             bool want = unary_arith_lowers(verbs[v], cols[c]);
             TEST_ASSERT_FMT((op != NULL) == want, "%s: lowered=%d, want %d",
                             src, op != NULL, want);
+            if (op && v >= 5 && unary_arith_int_col(cols[c])) {
+                /* ceil / floor: the scan itself; round: a cast to F64 */
+                bool is_round = !strcmp(verbs[v], "round");
+                TEST_ASSERT_FMT(op->opcode == (is_round ? OP_CAST : OP_SCAN),
+                                "%s: opcode %d", src, (int)op->opcode);
+                TEST_ASSERT_FMT(is_round ? op->out_type == RAY_F64
+                                         : op->out_type > 0,
+                                "%s: out_type %d", src, (int)op->out_type);
+            }
             ray_graph_free(g);
             ray_release(expr);
         }
     }
     ray_release(tbl);
+
+    /* Over a column with nulls the lowered identity keeps the column's type
+     * and its HAS_NULLS mark; round maps the null to 0Nf. */
+    static const char* const qs[] = {
+        "(do (set Tn (table [v] (list (as 'I32 [1 0N 3])))) (at (select {x: (floor v) from: Tn}) 'x))",
+        "(do (set Tn (table [v] (list (as 'I16 [1 0N 3])))) (at (select {x: (ceil v) from: Tn}) 'x))",
+        "(do (set Tn (table [v] (list [1 0N 3]))) (at (select {x: (round v) from: Tn}) 'x))",
+    };
+    static const int8_t want_t[] = { RAY_I32, RAY_I16, RAY_F64 };
+    for (size_t q = 0; q < sizeof qs / sizeof *qs; q++) {
+        ray_t* r = ray_eval_str(qs[q]);
+        TEST_ASSERT_NOT_NULL(r);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        TEST_ASSERT_FMT(r->type == want_t[q], "%s: type %d", qs[q], (int)r->type);
+        TEST_ASSERT_EQ_I(r->len, 3);
+        TEST_ASSERT_TRUE(r->attrs & RAY_ATTR_HAS_NULLS);
+        TEST_ASSERT_TRUE(ray_vec_is_null(r, 1));
+        TEST_ASSERT_FALSE(ray_vec_is_null(r, 0));
+        if (want_t[q] == RAY_F64)
+            TEST_ASSERT_TRUE(((double*)ray_data(r))[2] == 3.0);
+        ray_release(r);
+    }
     PASS();
 }
 
