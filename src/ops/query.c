@@ -11377,7 +11377,7 @@ ray_t* query_cd_gate_where_rows(ray_t* tbl, ray_t* where_expr, int64_t n_table,
         for (int64_t ch = 0; ch < nch; ch++)
             if ((ss.scan.gate[ch >> 6] >> (ch & 63)) & 1) pass[n_pass++] = (uint32_t)ch;
         if (n_pass == nch) {
-            scratch_free(pass_hdr); pass = NULL;   /* nothing ruled out */
+            scratch_free(pass_hdr); pass_hdr = NULL; pass = NULL;   /* nothing ruled out */
         } else {
             P = n_pass << lg;
             if (n_pass > 0 && pass[n_pass - 1] == (uint32_t)(nch - 1))

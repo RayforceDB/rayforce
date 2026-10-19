@@ -1,0 +1,16 @@
+;; @requires: posix
+;; Grouped count-distinct under a where: on a splayed (mapped) table.  The
+;; route's where-sample gates the table's zones first; when the gate rules
+;; out no chunk it dropped its chunk list and then dropped it again on the
+;; way out, and the allocator handed the freed block out twice (#898).  The
+;; answer must match the in-memory table's.
+(.sys.exec "rm -rf /tmp/rfl_cd_where_splayed")
+(set T (table [k v] (list (% (til 80000) 7) (% (* (til 80000) 13) 1000))))
+(.db.splayed.set "/tmp/rfl_cd_where_splayed/t/" T)
+(set U (.db.splayed.get "/tmp/rfl_cd_where_splayed/t/"))
+;; every zone holds a survivor: the gate rules nothing out
+(count (select {c: (count (distinct v)) by: k from: U where: (> v 100)})) -- 7
+(select {c: (count (distinct v)) by: k from: U where: (> v 100)}) -- (select {c: (count (distinct v)) by: k from: T where: (> v 100)})
+;; and a predicate that does rule zones out keeps answering
+(select {c: (count (distinct v)) by: k from: U where: (< v 50)}) -- (select {c: (count (distinct v)) by: k from: T where: (< v 50)})
+(.sys.exec "rm -rf /tmp/rfl_cd_where_splayed")
