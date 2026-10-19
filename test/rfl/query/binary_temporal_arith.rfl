@@ -138,6 +138,11 @@
 (type (at (select {x: (+ d 1) from: E}) 'x)) -- 'DATE
 (type (at (select {x: (- d d) from: E}) 'x)) -- 'I32
 (type (at (select {x: (* t 2) from: E}) 'x)) -- 'TIME
+;; a lexical local shadows the column of its name, over no rows as over
+;; rows: the empty-result probe must not read the column for it
+(set _shadow (fn [d tb] (at (select {x: (% d 2) from: tb}) 'x)))
+(_shadow 7 (table [d] (list [2024.01.01 2024.01.02]))) -- [1 1]
+(type (_shadow 7 E)) -- 'I64
 
 ;; ── splayed table ───────────────────────────────────────────────────────────
 (.sys.exec "rm -rf /tmp/rfl_binary_temporal_arith")

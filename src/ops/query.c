@@ -7414,7 +7414,7 @@ static ray_t* eval_expr_whole_column(ray_t* expr, ray_t* tbl) {
     return result;
 }
 
-static bool update_expr_elementwise(ray_t* e, ray_t* tbl);
+static bool update_expr_elementwise(ray_t* e, ray_t* tbl, bool meta_cols);
 
 /* A projection over no rows.  The per-row pass evaluates nothing and
  * leaves an empty LIST, where the builtin over the empty columns keeps its
@@ -7423,9 +7423,11 @@ static bool update_expr_elementwise(ray_t* e, ray_t* tbl);
  * literals, update_expr_elementwise) runs no lambda and no effect, so it
  * is evaluated once over the empty columns and its result taken when that
  * is an empty typed vector.  Anything else, or a failure, which is
- * swallowed whole, keeps the empty LIST. */
+ * swallowed whole, keeps the empty LIST.  The check is select's
+ * (meta_cols): a name bound as a lexical local shadows the column of that
+ * name, so it is not a column and the probe never reads the column for it. */
 static ray_t* select_fallback_empty_col(ray_t* expr, ray_t* tbl) {
-    if (update_expr_elementwise(expr, tbl)) {
+    if (update_expr_elementwise(expr, tbl, true)) {
         ray_t* col = eval_expr_whole_column_impl(expr, tbl);
         if (col && !RAY_IS_ERR(col) && ray_is_vec(col) && ray_len(col) == 0)
             return col;
