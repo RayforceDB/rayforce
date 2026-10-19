@@ -1900,6 +1900,7 @@ static test_result_t fmt_ragged_case(int64_t mid) {
  * atoms must use the same table as ray_fmt: the GUID null printed as `null`
  * there while format already wrote 0Ng (#881). */
 static size_t lang_print_to_buf(ray_t* obj, char* buf, size_t cap) {
+    buf[0] = '\0';
     FILE* fp = tmpfile();
     if (!fp) return 0;
     ray_lang_print(fp, obj);
@@ -1916,17 +1917,17 @@ static test_result_t test_lang_print_nulls(void) {
     char buf[64];
     ray_t* g = ray_typed_null(-RAY_GUID);
     TEST_ASSERT_FALSE(!g || RAY_IS_ERR(g));
-    lang_print_to_buf(g, buf, sizeof(buf));
+    TEST_ASSERT_TRUE(lang_print_to_buf(g, buf, sizeof(buf)) > 0);
     TEST_ASSERT_STR_EQ(buf, "0Ng");
     ray_release(g);
     ray_t* gz = ray_guid(zero);
     TEST_ASSERT_FALSE(!gz || RAY_IS_ERR(gz));
-    lang_print_to_buf(gz, buf, sizeof(buf));
+    TEST_ASSERT_TRUE(lang_print_to_buf(gz, buf, sizeof(buf)) > 0);
     TEST_ASSERT_STR_EQ(buf, "0Ng");
     ray_release(gz);
     ray_t* e = ray_typed_null(-RAY_F32);
     TEST_ASSERT_FALSE(!e || RAY_IS_ERR(e));
-    lang_print_to_buf(e, buf, sizeof(buf));
+    TEST_ASSERT_TRUE(lang_print_to_buf(e, buf, sizeof(buf)) > 0);
     TEST_ASSERT_STR_EQ(buf, "0Ne");
     ray_release(e);
     PASS();
