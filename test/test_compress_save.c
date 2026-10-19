@@ -1922,11 +1922,13 @@ static test_result_t test_stream_sym_gen2(void) {
 /* A generation-2 transcode that cannot write its output (RLIMIT_FSIZE at
  * the raw staging size, so only the encoded file overflows) fails the close
  * and leaves nothing: no column file, no .stream-* staging or .g2 file. */
+#ifdef RAY_OS_LINUX
 static bool cs_dir_has_stream_tmp(const char* dir) {
     char cmd[256];
     snprintf(cmd, sizeof cmd, "ls -A %s | grep -q '^\\.stream-'", dir);
     return system(cmd) == 0;
 }
+#endif
 static test_result_t test_stream_gen2_transcode_failure(void) {
 #ifdef RAY_OS_LINUX
     int64_t n = 140000;
