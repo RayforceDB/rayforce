@@ -10150,20 +10150,15 @@ static test_result_t test_expr_f64_to_narrow_cast(void) {
     ray_release(result);
     ray_graph_free(g);
 
-    /* (as 'BOOL v) on nullable F64 col — F64→BOOL CAST with NaN-handling.
-     * Regression for prior bug where NaN (= NULL_F64 sentinel) was treated
-     * as truthy because IEEE `NaN != 0.0` is true.  Fixed by adding an
-     * explicit NaN check (`src[i] == src[i]`).
-     * Raw data: [1.7, 2.3, 0.0, 4.9, 0.5] but row 2 was overwritten with
-     * NULL_F64 sentinel via ray_vec_set_null(v, 2, true).  So the seen
-     * input is [1.7, 2.3, NaN(null), 4.9, 0.5] → [1, 1, 0, 1, 1] → sum 4. */
+    /* F64→BOOL: only zero is false, so the NaN null sentinel is true.
+     * Input [1.7, 2.3, NaN, 4.9, 0.5] yields five true values. */
     g = ray_graph_new(tbl);
     col = ray_scan(g, "v");
     ray_op_t* cbool = ray_cast(g, col, RAY_BOOL);
     s = ray_sum(g, cbool);
     result = ray_execute(g, s);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    TEST_ASSERT_EQ_I(result->i64, 4);
+    TEST_ASSERT_EQ_I(result->i64, 5);
     ray_release(result);
     ray_graph_free(g);
 
@@ -11958,8 +11953,8 @@ static test_result_t test_expr_unary_i64_to_bool_cast(void) {
     ray_op_t* s   = ray_sum(g, ca);
     ray_t* result = ray_execute(g, s);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    /* cast(0)=false=0, cast(5)=true=1, cast(-3)=true=1, pos3=null=0 → sum=2 */
-    TEST_ASSERT_EQ_I(result->i64, 2);
+    /* Only zero is false; the non-zero null sentinel also casts to true. */
+    TEST_ASSERT_EQ_I(result->i64, 3);
     ray_release(result);
     ray_graph_free(g);
 

@@ -1,0 +1,48 @@
+;; #880: non-nullable casts agree for atoms, vectors, lists and queries.
+(as 'U8 0Nl) -- 0x00
+(as 'B8 0Nl) -- true
+(type (as 'U8 0Nl)) -- 'u8
+(type (as 'B8 0Nl)) -- 'b8
+(nil? (as 'U8 0Nl)) -- false
+(nil? (as 'B8 0Nl)) -- false
+(as 'U8 [1 0Nl 3]) -- [0x01 0x00 0x03]
+(as 'B8 [1 0Nl 3]) -- [true true true]
+(enlist (as 'U8 0Nl)) -- [0x00]
+(enlist (as 'B8 0Nl)) -- [true]
+(+ (as 'U8 0Nl) (as 'U8 1)) -- 0x01
+(as 'B8 [0 0Nl -1]) -- [false true true]
+(as 'B8 (list 0 0Nl -1)) -- [false true true]
+(as 'U8 (list 1 0Nl 3)) -- [0x01 0x00 0x03]
+;; All numeric and temporal null widths use the same rule.
+(set nulls (list 0Nh 0Ni 0Nl 0Ne 0Nf 0Nd 0Nt 0Np))
+(map (fn [x] (as 'B8 x)) nulls) -- (take [true] 8)
+(map (fn [x] (nil? (as 'B8 x))) nulls) -- (take [false] 8)
+(map (fn [x] (as 'U8 x)) nulls) -- (take [0x00] 8)
+(map (fn [x] (nil? (as 'U8 x))) nulls) -- (take [false] 8)
+(map (fn [x] (== (enlist (as 'B8 x)) (as 'B8 (enlist x)))) nulls) -- (take (list [true]) 8)
+(map (fn [x] (== (enlist (as 'U8 x)) (as 'U8 (enlist x)))) nulls) -- (take (list [true]) 8)
+;; Floating nulls are true too; floating zero remains false.
+(as 'B8 [0.0 0Nf -1.5]) -- [false true true]
+(as 'B8 (as 'F32 [0.0 0Nf -1.5])) -- [false true true]
+(as 'U8 [0.0 0Nf 3.0]) -- [0x00 0x00 0x03]
+;; Empty text converts to false; nullable numeric targets preserve nulls.
+(as 'B8 "") -- false
+(nil? (as 'F64 0Nl)) -- true
+(nil? (as 'I32 0Nl)) -- true
+;; Direct column casts and casts consumed by aggregates or predicates.
+(set T (table [i f h n r] (list [0 0Nl -1] [0.0 0Nf -1.5] [0h 0Nh -1h] [0i 0Ni -1i] (as 'F32 [0.0 0Nf -1.5]))))
+(at (select {from:T b:(as 'BOOL i)}) 'b) -- [false true true]
+(at (select {from:T b:(as 'BOOL f)}) 'b) -- [false true true]
+(at (select {from:T b:(as 'BOOL h)}) 'b) -- [false true true]
+(at (select {from:T b:(as 'BOOL n)}) 'b) -- [false true true]
+(at (select {from:T b:(as 'BOOL r)}) 'b) -- [false true true]
+(at (select {from:T b:(as 'U8 f)}) 'b) -- [0x00 0x00 0x00]
+(at (select {from:T s:(sum (as 'BOOL i))}) 's) -- [2]
+(at (select {from:T s:(sum (as 'BOOL f))}) 's) -- [2]
+(count (select {from:T where:(as 'BOOL f)})) -- 2
+;; Exercise the bulk parallel conversion path with null-containing vectors.
+(sum (as 'B8 (take [0Nf 0.0] 300000))) -- 150000
+(sum (as 'U8 (take [0Nf 1.0] 300000))) -- 150000
+(nil? (at (select {from:T b:(as 'BOOL f)}) 'b)) -- [false false false]
+(nil? (as 'B8 (list 0Nl 0Nf))) -- [false false]
+(nil? (as 'U8 (list 0Nl 0Nf))) -- [false false]
