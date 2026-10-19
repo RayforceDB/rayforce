@@ -32,3 +32,20 @@
 (parse "1ee") !- parse
 (parse "1.5ex") !- parse
 (parse "1e3ee") !- parse
+
+;; STR casts produce numeric data, while format produces literal syntax.
+(as 'STR 1.5e) -- "1.5"
+(as 'str -2.5e) -- "-2.5"
+(as 'STR -0e) -- "0"
+(as 'STR 0Ne) -- ""
+(as 'STR [1.5e -2.5e 0e 0Ne]) -- ["1.5" "-2.5" "0" ""]
+(as 'F32 (as 'STR 1.5e)) -- 1.5e
+(as 'F64 (as 'STR 1.5e)) -- 1.5
+(as 'F32 (as 'STR [1.5e -2.5e 0e 0Ne])) -- [1.5e -2.5e 0e 0Ne]
+(as 'F64 (as 'STR [1.5e -2.5e 0e 0Ne])) -- [1.5 -2.5 0.0 0Nf]
+;; Nine significant digits suffice for exact F32 readback, including values
+;; beyond the display precision, scientific notation and subnormals.
+(set f32_text_values [1.23456789e 1e20e 1e-20e 1e-40e])
+(all (== f32_text_values (as 'F32 (as 'STR f32_text_values)))) -- true
+(as 'STR f32_text_values) -- (as 'STR (as 'SYMBOL f32_text_values))
+(format "%" 1.5e) -- "1.5e"
