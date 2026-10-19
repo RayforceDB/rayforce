@@ -774,13 +774,26 @@ static inline void pool_scan_end(ray_pool_t* pool) {
  * (no task pending).  Workers read tasks[]/task_cap only after acquiring
  * the new task_limit (store-release), which orders the growth before any
  * claim — so a late worker never reads a stale tasks pointer or task_cap. */
+/* Test hook (ray_pool_test_ring_fail): ring growth fails (as when its
+ * ray_sys_realloc returns NULL) and a round holds at most `cap` tasks, so a
+ * dispatch of more tasks runs in several rounds at test sizes; 0 off. */
+static _Atomic(uint32_t) g_pool_test_cap;
+void ray_pool_test_ring_fail(uint32_t cap) { atomic_store_explicit(&g_pool_test_cap, cap, memory_order_relaxed); }
+
+/* Tasks one round may take: the ring, or the test hook's smaller cap. */
+static inline uint32_t pool_round_cap(const ray_pool_t* pool) {
+    uint32_t test_cap = atomic_load_explicit(&g_pool_test_cap, memory_order_relaxed);
+    return test_cap && test_cap < pool->task_cap ? test_cap : pool->task_cap;
+}
+
 static void pool_ring_grow(ray_pool_t* pool, int64_t n_tasks) {
     if (n_tasks <= (int64_t)pool->task_cap) return;
     uint32_t new_cap = pool->task_cap;
     while ((int64_t)new_cap < n_tasks && new_cap < MAX_RING_CAP) new_cap *= 2;
     if (new_cap > pool->task_cap) {
-        ray_pool_task_t* new_tasks = (ray_pool_task_t*)ray_sys_realloc(
-            pool->tasks, new_cap * sizeof(ray_pool_task_t));
+        ray_pool_task_t* new_tasks =
+            RAY_UNLIKELY(atomic_load_explicit(&g_pool_test_cap, memory_order_relaxed)) ? NULL   /* the hook */
+            : (ray_pool_task_t*)ray_sys_realloc(pool->tasks, new_cap * sizeof(ray_pool_task_t));
         if (new_tasks) {
             pool->tasks = new_tasks;
             pool->task_cap = new_cap;
@@ -870,12 +883,11 @@ static void pool_run_window(ray_pool_t* pool, uint64_t base, uint32_t n_tasks, b
 }
 
 /* One round of ray_pool_dispatch: tasks [first, first+n_tasks) of the
- * element space, task i handed to fn as [i*TASK_GRAIN, min((i+1)*TASK_GRAIN,
+ * element space, task i handed to fn as [i*grain, min((i+1)*grain,
  * total_elems)), n_tasks <= task_cap. */
 static void dispatch_round(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
-                           int64_t total_elems, int64_t first, uint32_t n_tasks,
-                           bool prog) {
-    const int64_t grain = TASK_GRAIN;
+                           int64_t total_elems, int64_t grain, int64_t first,
+                           uint32_t n_tasks, bool prog) {
     uint64_t base = pool_window_base(pool);
 
     /* Fill task ring for tickets [base, base+n_tasks) */
@@ -906,16 +918,16 @@ static void dispatch_round(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
  * The cancelled flag is per-query state; failing to clear it causes all
  * subsequent dispatches to skip task execution.
  *
- * Every task is exactly [i*TASK_GRAIN, min((i+1)*TASK_GRAIN, total_elems)):
- * callers index per-task state by start / TASK_GRAIN (fused WHERE rowsel
- * builders, per-task histograms) and rely on morsel-aligned starts. */
-void ray_pool_dispatch(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
-                      int64_t total_elems) {
+ * Every task is exactly [i*grain, min((i+1)*grain, total_elems)) (grain
+ * TASK_GRAIN for ray_pool_dispatch): callers index per-task state by
+ * start / grain (fused WHERE rowsel builders, per-task histograms) and rely
+ * on grain-aligned starts. */
+static void pool_dispatch_at(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
+                             int64_t total_elems, int64_t grain) {
     if (total_elems <= 0) return;
 
     /* Calculate number of tasks.
      * Overflow guard: total_elems + grain - 1 could wrap for extreme values. */
-    const int64_t grain = TASK_GRAIN;
     if (RAY_UNLIKELY(total_elems > INT64_MAX - grain + 1))
         total_elems = INT64_MAX - grain + 1;
     int64_t n_tasks = (total_elems + grain - 1) / grain;
@@ -933,17 +945,38 @@ void ray_pool_dispatch(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
     /* The ring holds task_cap tasks at a time (MAX_RING_CAP, or less when
      * growing it failed).  Anything past that runs in further rounds of the
      * same grain: widening the grain to fit the ring instead moved task
-     * starts off the TASK_GRAIN boundaries every caller indexes by (#792).
+     * starts off the grain boundaries every caller indexes by (#792).
      * A cancelled query runs no further round: every ticket of one would be
      * skipped anyway, and the rounds left can number in the hundreds. */
+    const uint32_t cap = pool_round_cap(pool);
     for (int64_t first = 0; first < n_tasks; ) {
         if (RAY_UNLIKELY(atomic_load_explicit(&pool->cancelled, memory_order_relaxed)))
             break;
         int64_t batch = n_tasks - first;
-        if (batch > (int64_t)pool->task_cap) batch = pool->task_cap;
-        dispatch_round(pool, fn, ctx, total_elems, first, (uint32_t)batch, prog);
+        if (batch > (int64_t)cap) batch = cap;
+        dispatch_round(pool, fn, ctx, total_elems, grain, first, (uint32_t)batch, prog);
         first += batch;
     }
+}
+
+void ray_pool_dispatch(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
+                      int64_t total_elems) {
+    pool_dispatch_at(pool, fn, ctx, total_elems, TASK_GRAIN);
+}
+
+void ray_pool_dispatch_grain(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
+                             int64_t total_elems, int64_t grain) {
+    pool_dispatch_at(pool, fn, ctx, total_elems, grain);
+}
+
+void ray_pool_dispatch_geometry(ray_pool_t* pool, int64_t total_elems, int64_t grain,
+                                uint32_t* n_tasks, int64_t* eff_grain) {
+    (void)pool;   /* rounds keep the grain: the geometry is the arithmetic */
+    *n_tasks = 0; *eff_grain = grain;
+    if (total_elems <= 0) return;
+    if (RAY_UNLIKELY(total_elems > INT64_MAX - grain + 1))
+        total_elems = INT64_MAX - grain + 1;
+    *n_tasks = (uint32_t)((total_elems + grain - 1) / grain);
 }
 
 /* One round of ray_pool_dispatch_n: tasks [first, first+n_tasks), each handed

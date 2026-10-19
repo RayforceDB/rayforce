@@ -34,7 +34,69 @@
  */
 
 #include <rayforce.h>
+#include <stdbool.h>
 
+/* Rows of a parted wrapper: the sum of its present segments' lengths (a
+ * MAPCOMMON: the sum of its row counts; anything else: len).  A wrapper from
+ * ray_read_parted has every segment, a ragged partition's absent column
+ * a segment of nulls of the partition's row count, so this is the table's row count
+ * (#724).  A missing segment (hand-built wrappers only) counts 0 rows; the
+ * executor refuses a table whose parted and MAPCOMMON row counts differ. */
 int64_t ray_parted_nrows(ray_t* parted_col);
+
+/* Logical rows of any column object (plain, parted wrapper, MAPCOMMON,
+ * RAY_ENCCOL) without decoding. */
+int64_t ray_table_col_nrows(ray_t* col);
+
+typedef struct {
+    int8_t   type;        /* logical type; parted: RAY_PARTED_BASE + base */
+    uint8_t  attrs;       /* generation 0: the vector's attrs; generation 2: persisted attrs */
+    int64_t  len;         /* rows (parted: sum over segments) */
+    int64_t  n_segs;      /* parted: segment count; else 0 */
+    uint8_t  index_kind;  /* attached (gen 0) or recorded (gen 2) ray_idx_kind_t */
+    bool     unique;
+    int64_t  null_count;  /* generation 2: exact, from the directory; -1 when unknown */
+    ray_t*   enc;         /* borrowed RAY_ENCCOL, or NULL */
+} ray_col_meta_t;
+
+bool    ray_col_meta_of(ray_t* col, ray_col_meta_t* m);          /* any slot object */
+bool    ray_table_col_meta(ray_t* tbl, int64_t name_id, ray_col_meta_t* m);
+/* Whether `tbl` (a table) has column `name_id`, from metadata: an encoded
+ * column is not materialized. */
+bool    ray_table_has_col(ray_t* tbl, int64_t name_id);
+bool    ray_table_col_meta_idx(ray_t* tbl, int64_t idx, ray_col_meta_t* m);
+
+/* Index of a column without decoding when it cannot carry one: NULL with
+ * *index set (borrowed RAY_INDEX block or NULL), or an owned error. */
+ray_t*  ray_table_col_index(ray_t* tbl, int64_t name_id, ray_t** index);
+ray_t*  ray_table_col_index_idx(ray_t* tbl, int64_t idx, ray_t** index);
+
+/* The borrowed RAY_ENCCOL object of a slot, or NULL (absent, plain). */
+ray_t*  ray_table_get_col_enc(ray_t* tbl, int64_t name_id);
+ray_t*  ray_table_get_col_enc_idx(ray_t* tbl, int64_t idx);
+
+/* The slot object itself, plain or encoded (borrowed; never decodes), or
+ * NULL when absent: for handing a column to another table unread. */
+ray_t*  ray_table_slot(ray_t* tbl, int64_t name_id);
+ray_t*  ray_table_slot_idx(ray_t* tbl, int64_t idx);
+
+/* Segment s of a parted slot (borrowed; never decodes): the encoded
+ * wrapper's segment object or the plain wrapper's segment.  NULL when the
+ * slot is absent or not parted, s is out of range, or the segment is
+ * missing (a hand-built wrapper). */
+ray_t*  ray_table_parted_seg(ray_t* tbl, int64_t name_id, int64_t s);
+ray_t*  ray_table_parted_seg_idx(ray_t* tbl, int64_t idx, int64_t s);
+
+/* Null presence from metadata; never materializes. */
+bool    ray_table_col_has_nulls(ray_t* tbl, int64_t name_id);
+
+/* The table's column list for an in-place value write, or NULL when the
+ * table is not a table or any slot holds a RAY_ENCCOL (callers then take
+ * their copy route).  Ownership checks (rc) stay with the caller. */
+ray_t*  ray_table_cols_inplace(ray_t* tbl);
+
+/* The column-list container is canonical: a RAY_LIST with zero attrs whose
+ * length is the schema's.  Reads only the container header, never a slot. */
+bool    ray_table_cols_canonical(ray_t* tbl);
 
 #endif /* RAY_TABLE_H */

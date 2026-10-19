@@ -1759,7 +1759,7 @@ static test_result_t test_epoll_hup_no_errfn(void) {
      * Only a write to the pipe — no selector-array mutation from here. */
     if (have_wake) {
         char b = 'x';
-        (void)write(wake_pipe[1], &b, 1);
+        if (write(wake_pipe[1], &b, 1) != 1) { /* the loop then exits on its timeout */ }
         epoll_sleep_ms(30);
         close(wake_pipe[1]);
         /* wake_pipe[0] is owned by the poll selector; destroy will clean it */

@@ -28,8 +28,10 @@
 #include "serde.h"
 #include "store/col.h"
 #include "store/fileio.h"
+#include "store/enccol.h"   /* ray_enccol_is_parted */
 #include "core/types.h"
 #include "mem/heap.h"
+#include "table/table.h"
 #include "vec/str.h"
 #include "vec/vec.h"
 #include "ops/ops.h"
@@ -343,32 +345,46 @@ static bool serde_col_is_parted(ray_t* col) {
            (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON);
 }
 
+/* A table slot is parted: a plain parted wrapper or MAPCOMMON, or an
+ * encoded column over a parted wrapper (generation-2 segments). */
 static bool serde_table_is_parted(ray_t* tbl) {
-    ray_t* cols = ((ray_t**)ray_data(tbl))[1];
+    ray_t* cols = ((ray_t**)ray_data(tbl))[1];   /* plain-table */
     if (!cols || RAY_IS_ERR(cols) || cols->type != RAY_LIST) return false;
-    ray_t** cv = (ray_t**)ray_data(cols);
-    for (int64_t c = 0; c < cols->len; c++)
-        if (serde_col_is_parted(cv[c])) return true;
+    for (int64_t c = 0; c < cols->len; c++) {
+        ray_t* slot = ray_table_slot_idx(tbl, c);
+        if (serde_col_is_parted(slot)) return true;
+        if (slot && slot->type == RAY_ENCCOL && ray_enccol_is_parted(slot)) return true;
+    }
     return false;
 }
 
 typedef struct {
-    ray_t**        cols;    /* the table's columns */
+    ray_t*         tbl;     /* the table; columns read through ray_table_col_idx */
     int64_t        ncols;
     const int64_t* counts;  /* partition-key row counts, NULL if none */
     int64_t        nparts;
 } serde_parted_t;
 
+/* Column c as plain (an encoded slot's cached materialization; borrowed),
+ * NULL when absent or when it fails to load: the size pass
+ * (serde_parted_cols_size) reports a failure first, so a write meets the
+ * cached column. */
+static ray_t* serde_pcol(const serde_parted_t* x, int64_t c) {
+    ray_t* col = ray_table_col_idx(x->tbl, c);
+    if (col && RAY_IS_ERR(col)) { ray_error_free(col); return NULL; }
+    return col;
+}
+
 static void serde_parted_init(serde_parted_t* x, ray_t* tbl) {
-    ray_t* cols = ((ray_t**)ray_data(tbl))[1];
-    x->cols   = (ray_t**)ray_data(cols);
+    ray_t* cols = ((ray_t**)ray_data(tbl))[1];   /* plain-table */
+    x->tbl    = tbl;
     x->ncols  = cols->len;
     x->counts = NULL;
     x->nparts = 0;
     for (int64_t c = 0; c < x->ncols; c++) {
-        ray_t* col = x->cols[c];
+        ray_t* col = serde_pcol(x, c);
         if (!col || RAY_IS_ERR(col) || col->type != RAY_MAPCOMMON) continue;
-        ray_t* rc = ((ray_t**)ray_data(col))[1];
+        ray_t* rc = ((ray_t**)ray_data(col))[1];   /* not-a-table */
         if (rc && !RAY_IS_ERR(rc)) {
             x->counts = (const int64_t*)ray_data(rc);
             x->nparts = rc->len;
@@ -383,7 +399,7 @@ static int64_t serde_part_rows(const serde_parted_t* x, int64_t p) {
     if (x->counts) return p < x->nparts ? x->counts[p] : 0;
     int64_t n = 0;
     for (int64_t c = 0; c < x->ncols; c++) {
-        ray_t* col = x->cols[c];
+        ray_t* col = serde_pcol(x, c);
         if (!col || RAY_IS_ERR(col) || !RAY_IS_PARTED(col->type) || p >= col->len)
             continue;
         ray_t* seg = ((ray_t**)ray_data(col))[p];
@@ -409,7 +425,7 @@ static int64_t serde_parted_header(const serde_parted_t* x, ray_t* col,
     uint8_t a = 0;
     if (col->type == RAY_MAPCOMMON) {
         ray_t* kv = ((ray_t**)ray_data(col))[0];
-        ray_t* rc = ((ray_t**)ray_data(col))[1];
+        ray_t* rc = ((ray_t**)ray_data(col))[1];   /* not-a-table */
         *type = kv ? kv->type : 0;
         if (rc) {
             const int64_t* cnt = (const int64_t*)ray_data(rc);
@@ -443,7 +459,7 @@ static int64_t serde_parted_col_size(const serde_parted_t* x, ray_t* col) {
     if (col->type == RAY_MAPCOMMON) {
         /* keys: DATE / I64 are fixed-width (above); SYM keys repeat */
         ray_t* kv = ((ray_t**)ray_data(col))[0];
-        ray_t* rc = ((ray_t**)ray_data(col))[1];
+        ray_t* rc = ((ray_t**)ray_data(col))[1];   /* not-a-table */
         if (type != RAY_SYM || !kv || !rc) return 0;
         const int64_t* cnt = (const int64_t*)ray_data(rc);
         for (int64_t p = 0; p < rc->len && p < kv->len; p++) {
@@ -524,7 +540,7 @@ static int64_t serde_parted_col_write(uint8_t* buf, const serde_parted_t* x,
 
     if (col->type == RAY_MAPCOMMON) {
         ray_t* kv = ((ray_t**)ray_data(col))[0];
-        ray_t* rc = ((ray_t**)ray_data(col))[1];
+        ray_t* rc = ((ray_t**)ray_data(col))[1];   /* not-a-table */
         if (!kv || !rc) return 0;
         const int64_t* cnt = (const int64_t*)ray_data(rc);
         for (int64_t p = 0; p < rc->len && p < kv->len; p++) {
@@ -586,12 +602,18 @@ static int64_t serde_parted_col_write(uint8_t* buf, const serde_parted_t* x,
 
 /* The column list of a parted table, laid out as ray_ser_raw lays out the
  * RAY_LIST of a flat table's columns. */
+static int64_t ser_note_col_failure(ray_t* err);
 static int64_t serde_parted_cols_size(ray_t* tbl) {
+    ray_t* cl = ((ray_t**)ray_data(tbl))[1];   /* plain-table */
+    for (int64_t c = 0; c < cl->len; c++) {   /* a column that fails to load fails the size */
+        ray_t* col = ray_table_col_idx(tbl, c);
+        if (col && RAY_IS_ERR(col)) return ser_note_col_failure(col);
+    }
     serde_parted_t x;
     serde_parted_init(&x, tbl);
     int64_t size = 1 + 1 + 8;
     for (int64_t c = 0; c < x.ncols; c++) {
-        ray_t* col = x.cols[c];
+        ray_t* col = serde_pcol(&x, c);
         int64_t child = serde_col_is_parted(col) ? serde_parted_col_size(&x, col)
                                                  : ray_serde_size(col);
         if (child <= 0) return child;
@@ -603,13 +625,13 @@ static int64_t serde_parted_cols_size(ray_t* tbl) {
 static int64_t serde_parted_cols_write(uint8_t* buf, ray_t* tbl) {
     serde_parted_t x;
     serde_parted_init(&x, tbl);
-    ray_t* cols = ((ray_t**)ray_data(tbl))[1];
+    ray_t* cols = ((ray_t**)ray_data(tbl))[1];   /* plain-table */
     buf[0] = (uint8_t)RAY_LIST;
     buf[1] = cols->attrs & RAY_SERDE_ATTR_WIRE_MASK;
     memcpy(buf + 2, &cols->len, 8);
     int64_t c = 1 + 1 + 8;
     for (int64_t i = 0; i < x.ncols; i++) {
-        ray_t* col = x.cols[i];
+        ray_t* col = serde_pcol(&x, i);
         int64_t child = serde_col_is_parted(col) ? serde_parted_col_write(buf + c, &x, col)
                                                  : ray_ser_raw(buf + c, col);
         if (child <= 0) return child;
@@ -621,6 +643,36 @@ static int64_t serde_parted_cols_write(uint8_t* buf, ray_t* tbl) {
 /* --------------------------------------------------------------------------
  * ray_serde_size — calculate serialized size (excluding IPC header)
  * -------------------------------------------------------------------------- */
+
+/* A column whose decode failed during the size phase: its code is kept here
+ * (the message stays in the error slot) so ray_ser reports it as itself. */
+static _Thread_local char g_ser_fail_code[8];
+
+void ray_serde_fail_clear(void) { g_ser_fail_code[0] = '\0'; }
+const char* ray_serde_fail_code(void) { return g_ser_fail_code[0] ? g_ser_fail_code : NULL; }
+
+static int64_t ser_note_col_failure(ray_t* err) {
+    const char* code = ray_err_code(err);
+    snprintf(g_ser_fail_code, sizeof g_ser_fail_code, "%s", code ? code : "domain");
+    ray_error_free(err);
+    return -1;
+}
+
+/* Wire size of a table's cols LIST, framed by hand: each column is read
+ * through ray_table_col_idx, so an encoded column is serialized from its
+ * cached materialization and no scratch table is built. */
+static int64_t ser_table_cols_size(ray_t* tbl, ray_t* cols_list) {
+    int64_t nc = cols_list ? cols_list->len : 0;
+    int64_t size = 1 + 1 + 8;
+    for (int64_t c = 0; c < nc; c++) {
+        ray_t* col = ray_table_col_idx(tbl, c);
+        if (col && RAY_IS_ERR(col)) return ser_note_col_failure(col);
+        int64_t child = ray_serde_size(col);
+        if (child <= 0) return child;
+        size += child;
+    }
+    return size;
+}
 
 int64_t ray_serde_size(ray_t* obj) {
     if (!obj) return 1; /* RAY_SERDE_NULL marker */
@@ -700,7 +752,7 @@ int64_t ray_serde_size(ray_t* obj) {
         int64_t schema = schema_names_serde_size(slots[0]);
         if (schema <= 0) return schema;
         int64_t cols = serde_table_is_parted(obj) ? serde_parted_cols_size(obj)
-                                                  : ray_serde_size(slots[1]);
+                                                  : ser_table_cols_size(obj, slots[1]);   /* plain-table */
         if (cols <= 0) return cols;
         return 1 + 1 + schema + cols;
     }
@@ -709,7 +761,7 @@ int64_t ray_serde_size(ray_t* obj) {
         ray_t** slots = (ray_t**)ray_data(obj);
         int64_t keys = ray_serde_size(slots[0]);
         if (keys <= 0) return keys;
-        int64_t vals = ray_serde_size(slots[1]);
+        int64_t vals = ray_serde_size(slots[1]);   /* not-a-table */
         if (vals <= 0) return vals;
         return 1 + 1 + keys + vals;
     }
@@ -717,7 +769,7 @@ int64_t ray_serde_size(ray_t* obj) {
         ray_t** slots = (ray_t**)ray_data(obj);
         int64_t params = ray_serde_size(slots[0]);
         if (params <= 0) return params;
-        int64_t body = ray_serde_size(slots[1]);
+        int64_t body = ray_serde_size(slots[1]);   /* not-a-table */
         if (body <= 0) return body;
         int64_t size = 1 + 1 + params + body;
         if (LAMBDA_CLOSURE(obj)) {
@@ -939,10 +991,27 @@ int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
         ray_t** slots = (ray_t**)ray_data(obj);
         c = ser_schema_names(buf, slots[0]);     /* schema names as RAY_SYM vector */
         if (c <= 0) return c;
-        int64_t cols = serde_table_is_parted(obj)          /* cols (RAY_LIST) */
-                     ? serde_parted_cols_write(buf + c, obj)
-                     : ray_ser_raw(buf + c, slots[1]);
-        if (cols <= 0) return cols;
+        int64_t cols;
+        if (serde_table_is_parted(obj)) {                    /* cols (RAY_LIST) */
+            cols = serde_parted_cols_write(buf + c, obj);
+            if (cols <= 0) return cols;
+        } else {
+            /* cols LIST framed by hand, each column through ray_table_col_idx */
+            ray_t* cl = slots[1];   /* plain-table */
+            int64_t ncl = cl ? cl->len : 0;          /* NULL cols: 0 columns, as the size arm */
+            uint8_t* lp = buf + c;
+            lp[0] = (uint8_t)RAY_LIST;
+            lp[1] = cl ? cl->attrs & RAY_SERDE_ATTR_WIRE_MASK : 0;
+            memcpy(lp + 2, &ncl, 8);
+            cols = 1 + 1 + 8;
+            for (int64_t i = 0; i < ncl; i++) {
+                ray_t* col = ray_table_col_idx(obj, i);
+                if (col && RAY_IS_ERR(col)) { ray_error_free(col); return -1; }
+                int64_t child = ray_ser_raw(lp + cols, col);
+                if (child <= 0) return child;
+                cols += child;
+            }
+        }
         c += cols;
         return 1 + 1 + c;
     }
@@ -953,7 +1022,7 @@ int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
         ray_t** slots = (ray_t**)ray_data(obj);
         c = ray_ser_raw(buf, slots[0]);
         if (c <= 0) return c;
-        int64_t vals = ray_ser_raw(buf + c, slots[1]);
+        int64_t vals = ray_ser_raw(buf + c, slots[1]);   /* not-a-table */
         if (vals <= 0) return vals;
         c += vals;
         return 1 + 1 + c;
@@ -965,7 +1034,7 @@ int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
         ray_t** slots = (ray_t**)ray_data(obj);
         c = ray_ser_raw(buf, slots[0]);     /* params */
         if (c <= 0) return c;
-        int64_t body = ray_ser_raw(buf + c, slots[1]); /* body */
+        int64_t body = ray_ser_raw(buf + c, slots[1]);   /* not-a-table */ /* body */
         if (body <= 0) return body;
         c += body;
         if (LAMBDA_CLOSURE(obj)) {
@@ -1449,7 +1518,7 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len) {
         dict->attrs = dict_attrs & RAY_SERDE_ATTR_WIRE_MASK;
         dict->len = 2;
         ((ray_t**)ray_data(dict))[0] = keys;
-        ((ray_t**)ray_data(dict))[1] = vals;
+        ((ray_t**)ray_data(dict))[1] = vals;   /* not-a-table */
         return dict;
     }
 
@@ -1501,7 +1570,7 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len) {
         lambda->len = 0;
         memset(ray_data(lambda), 0, LAMBDA_SLOTS * sizeof(ray_t*));
         ((ray_t**)ray_data(lambda))[0] = params;
-        ((ray_t**)ray_data(lambda))[1] = body;
+        ((ray_t**)ray_data(lambda))[1] = body;   /* not-a-table */
         LAMBDA_CLOSURE(lambda) = closure;
         return lambda;
     }
@@ -1553,7 +1622,15 @@ ray_t* ray_ser(ray_t* obj) {
         owned = true;
     }
 
+    g_ser_fail_code[0] = '\0';
     int64_t payload = ray_serde_size(obj);
+    if (payload < 0 && g_ser_fail_code[0]) {      /* an encoded column failed to decode */
+        char code[8], msg[256];
+        snprintf(code, sizeof code, "%s", g_ser_fail_code);
+        snprintf(msg, sizeof msg, "%s", ray_error_msg() ? ray_error_msg() : "");
+        if (owned) ray_release(obj);
+        return ray_error(code, "%s", msg);
+    }
     if (payload <= 0) {
         ray_t* e = ray_error("domain", payload < 0
             ? "serialize: payload size overflow"
@@ -1579,8 +1656,9 @@ ray_t* ray_ser(ray_t* obj) {
     hdr->size    = payload;
 
     int64_t written = ray_ser_raw((uint8_t*)ray_data(buf) + sizeof(ray_ipc_header_t), obj);
-    if (written == 0) {
-        ray_t* e = ray_error("domain", "serialize: ray_ser_raw wrote 0 bytes for %s", ray_type_name(obj->type));
+    if (written != payload) {
+        ray_t* e = ray_error("domain", "serialize: ray_ser_raw wrote %lld of %lld bytes for %s",
+                             (long long)written, (long long)payload, ray_type_name(obj->type));
         ray_release(buf);
         if (owned) ray_release(obj);
         return e;

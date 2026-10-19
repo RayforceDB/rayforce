@@ -15,7 +15,7 @@ The `get` builtins memory-map every column file — load is constant-time regard
 | Function | Arity | Flags | Description |
 |---|---|---|---|
 | [`.db.splayed.set`](#db-splayed-set) | variadic | restricted | Save a table to a splayed directory. |
-| [`.db.splayed.get`](#db-splayed-get) | variadic | — | Load a splayed table (columns mmap'd). |
+| [`.db.splayed.get`](#db-splayed-get) | variadic | — | Load a splayed table (columns mmap'd; compressed columns decode on first read). |
 | [`.db.parted.get`](#db-parted-get) | variadic | — | Load a partitioned table by name from a db root. |
 | [`.db.parted.tables`](#db-parted-tables) | variadic | — | List the table names available under a parted db root. |
 | [`.db.parted.fill`](#db-parted-fill) | variadic | restricted | Fill missing tables across a parted db's partitions. |
@@ -26,6 +26,12 @@ Signatures:
 
 - `(.db.splayed.set "dir" tbl)` — write columns to `dir/`; emit a `.sym` file in the same directory.
 - `(.db.splayed.set "dir" tbl "sym_path")` — write the symbol table to a custom location (typically a shared db-root `.sym`).
+- `(.db.splayed.set "dir" tbl opts)` and `(.db.splayed.set "dir" tbl "sym_path" opts)` — the same with an options dict.
+
+`compress` (dict option, `{compress: true}` or `{compress: false}`): `true` writes generation-2 (compressed) column files where the column is eligible; `false` writes generation 0; when absent each file inherits: generation 2 when its source is an encoded column or the destination's current file is generation 2, else generation 0. Unknown keys and a non-bool `compress` are a `domain` error, as is a second options dict. Linked and nested/list columns are always written uncompressed. A compressed file keeps its chunk zones and persists the column's hash, sort, bloom and dictionary index (`.idx.info` shows it), so a reload needs no rebuild.
+
+Compressed F32/F64 writes and whole-column materialization require default FP controls (nearest rounding, masked exceptions, no FTZ/DAZ) on every calling/executing thread. Rayforce never silently normalizes the host's controls. Detected unsupported controls return `fpenv`; restore supported controls before retrying. Detection is not a complete portable validator: see [the compressed floating-point environment contract](../storage/index.md#compressed-floating-point-environment) for conservative refusal scope, platform-specific checks, and embedder responsibilities.
+
 
 Returns `tbl` (retained), so the call can be threaded inside a larger expression.
 
@@ -45,7 +51,7 @@ Signatures:
 - `(.db.splayed.get "dir")` — look for `dir/.sym` automatically.
 - `(.db.splayed.get "dir" "sym_path")` — use a custom symbol-table path (e.g. a shared db-root sym).
 
-Returns a `table` with every column memory-mapped — zero allocation per row.
+Returns a `table` with every column memory-mapped. Generation-0 columns are read in place — zero allocation per row; a compressed (generation-2) column decodes into heap memory the first time a query reads it.
 
 ```lisp
 (set loaded (.db.splayed.get "/tmp/weather"))

@@ -195,6 +195,10 @@
 (count (.db.splayed.set "rf_test_nullcmp_store" SU)) -- 98304
 (set ST (.db.splayed.get "rf_test_nullcmp_store" 'SU))
 (count ST) -- 98304
+;; The dict index is what a generation-0 save attaches.  A generation-2
+;; (compressed) save, as in the equivalence pass, persists the same DICT in
+;; the column's index region (P6b: over 65536 rows, "" in band) and attaches
+;; it at materialization: one assertion for both generations.
 (.idx.info (at ST 'u)) -- {kind:dict length:98304 parent_type:13 saved_attrs:64 n_distinct:3}
 
 (set SA_F (select {u: u n: n from: ST where: (!= u "") desc: n take: 5}))

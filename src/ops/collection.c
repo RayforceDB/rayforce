@@ -31,6 +31,7 @@
 #include "ops/internal.h"   /* col_propagate_str_pool */
 #include "ops/idxop.h"
 #include "ops/ops.h"
+#include "store/enccol.h"   /* ray_enccol_is_parted: (at tbl 'col) on an encoded slot */
 #include <stdatomic.h>
 #include <math.h>
 #include <stdint.h>
@@ -912,7 +913,8 @@ ray_t* ray_filter_fn(ray_t* vec, ray_t* mask) {
         if (RAY_IS_ERR(result)) return result;
         for (int64_t c = 0; c < ncols; c++) {
             int64_t cn = ray_table_col_name(vec, c);
-            ray_t* src_col = ray_table_get_col_idx(vec, c);
+            ray_t* src_col = ray_table_col_idx(vec, c);
+            if (src_col && RAY_IS_ERR(src_col)) { ray_release(result); return src_col; }
             ray_t* filtered = ray_filter_fn(src_col, mask);
             if (RAY_IS_ERR(filtered)) { ray_release(result); return filtered; }
             result = ray_table_add_col(result, cn, filtered);
@@ -1152,8 +1154,12 @@ int atom_eq(ray_t* a, ray_t* b) {
             return 0;
         for (int64_t c = 0; c < nc; c++) {
             if (ray_table_col_name(a, c) != ray_table_col_name(b, c)) return 0;
-            ray_t* ca = ray_table_get_col_idx(a, c);
-            ray_t* cb = ray_table_get_col_idx(b, c);
+            ray_t* ca = ray_table_col_idx(a, c);
+            ray_t* cb = ray_table_col_idx(b, c);
+            bool ea = ca && RAY_IS_ERR(ca), eb = cb && RAY_IS_ERR(cb);
+            if (ea) ray_error_free(ca);
+            if (eb) ray_error_free(cb);
+            if (ea || eb) return 0;            /* a column that cannot be read compares unequal */
             if (!ca || !cb) { if (ca != cb) return 0; continue; }
             if (!atom_eq_cell_col(ca, cb)) return 0;
         }
@@ -1200,6 +1206,7 @@ ray_t* distinct_vec_eager(ray_t* x) {
         ray_t* ids = ray_index_distinct_ids(x, &count);
         if (ids) {
             ray_idx_hits[IDX_SITE_DISTINCT]++;
+            ray_idx_note_use(x);
             ray_t* result = gather_by_idx(x, (int64_t*)ray_data(ids), count);
             ray_release(ids);
             return result;
@@ -1585,6 +1592,7 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
                 bool miss = false;
                 if (ray_index_find_vec(vec, val, pos, &miss)) {
                     ray_idx_hits[IDX_SITE_IN]++;
+                    ray_idx_note_use(vec);
                     ray_t* result = ray_vec_new(RAY_BOOL, vlen);
                     if (RAY_IS_ERR(result)) { ray_free_raw(pos); return result; }
                     result->len = vlen;
@@ -2167,7 +2175,8 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
             ray_t* result = ray_table_new(ncols);
             if (RAY_IS_ERR(result)) return result;
             for (int64_t i = 0; i < ncols; i++) {
-                ray_t* col = ray_table_get_col_idx(vec, i);
+                ray_t* col = ray_table_col_idx(vec, i);
+                if (col && RAY_IS_ERR(col)) { ray_release(result); return col; }
                 int64_t name_id = ray_table_col_name(vec, i);
                 ray_t* taken = take_table_col(vec, col, n_obj);
                 if (RAY_IS_ERR(taken)) { ray_release(result); return taken; }
@@ -2352,7 +2361,8 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
         ray_t* result = ray_table_new(ncols);
         if (RAY_IS_ERR(result)) return result;
         for (int64_t i = 0; i < ncols; i++) {
-            ray_t* col = ray_table_get_col_idx(vec, i);
+            ray_t* col = ray_table_col_idx(vec, i);
+            if (col && RAY_IS_ERR(col)) { ray_release(result); return col; }
             int64_t name_id = ray_table_col_name(vec, i);
             ray_t* taken = take_table_col(vec, col, n_obj);
             if (RAY_IS_ERR(taken)) { ray_release(result); return taken; }
@@ -2713,6 +2723,39 @@ ray_t* ray_cross_fn(ray_t* a, ray_t* b) {
     return out;
 }
 
+/* An encoded slot whose promoted scan equals today's `at` value: a
+ * single-file column (OP_SCAN materializes it exactly as ray_table_col
+ * does), or a parted one of a numeric / temporal base type (OP_SCAN's
+ * flatten and parted_to_flat_vec then build the same vector).  Forcing the
+ * reference itself always reads ray_table_col_value. */
+static bool at_lazy_ok(ray_t* enc) {
+    ray_col_meta_t m;
+    if (!ray_col_meta_of(enc, &m)) return false;
+    int8_t b = RAY_IS_PARTED(m.type) ? (int8_t)RAY_PARTED_BASETYPE(m.type) : m.type;
+    if (!ray_enccol_is_parted(enc)) return true;
+    switch (b) {
+    case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
+    case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: case RAY_F32: case RAY_F64: return true;
+    default: return false;
+    }
+}
+
+/* The value (at tbl 'col) returns eagerly: the column, a parted one
+ * flattened, MAPCOMMON materialized.  An owned value or error. */
+ray_t* ray_table_col_value(ray_t* tbl, int64_t sym) {
+    ray_t* col = ray_table_col(tbl, sym);
+    if (col && RAY_IS_ERR(col)) return col;
+    if (!col) return ray_error("domain", "at: unknown table column");
+    if (RAY_IS_PARTED(col->type)) {
+        int64_t ncnt = 0;
+        const int64_t* cnt = parted_table_counts(tbl, &ncnt);
+        return parted_to_flat_vec_c(col, cnt, ncnt);
+    }
+    if (col->type == RAY_MAPCOMMON) return materialize_mapcommon(col);
+    ray_retain(col);
+    return col;
+}
+
 /* (at vec idx) or (at table 'col) — index into vector or table */
 /* Row j of an integer index vector as a row id into a vec of vlen rows,
  * or -1 when it is null or out of range. */
@@ -2792,16 +2835,11 @@ ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
      * direct `(at table 'col)` must materialize it so downstream `(at col i)` /
      * count / formatting see a dense vector instead of failing with `type`. */
     if (vec->type == RAY_TABLE && idx->type == -RAY_SYM) {
-        ray_t* col = ray_table_get_col(vec, idx->i64);
-        if (!col) return ray_error("domain", "at: unknown table column");
-        if (RAY_IS_PARTED(col->type)) {
-            int64_t ncnt = 0;
-            const int64_t* cnt = parted_table_counts(vec, &ncnt);
-            return parted_to_flat_vec_c(col, cnt, ncnt);
-        }
-        if (col->type == RAY_MAPCOMMON) return materialize_mapcommon(col);
-        ray_retain(col);
-        return col;
+        /* An encoded slot stays a column reference: an aggregate over it
+         * reduces on the bound source; forcing it reads the column below. */
+        ray_t* enc = ray_table_get_col_enc(vec, idx->i64);
+        if (enc && at_lazy_ok(enc)) return ray_lazy_colref(vec, idx->i64);
+        return ray_table_col_value(vec, idx->i64);
     }
 
     /* Table row access by integer index: (at table 0) → {col1: val1, col2: val2} */
@@ -2821,7 +2859,8 @@ ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
             int64_t key_id = ray_table_col_name(vec, c);
             keys = ray_vec_append(keys, &key_id);
             if (RAY_IS_ERR(keys)) { ray_release(vals); return keys; }
-            ray_t* col = ray_table_get_col_idx(vec, c);
+            ray_t* col = ray_table_col_idx(vec, c);
+            if (col && RAY_IS_ERR(col)) { ray_release(keys); ray_release(vals); return col; }
             int alloc = 0;
             ray_t* val = collection_elem(col, row, &alloc);
             if (RAY_IS_ERR(val)) { ray_release(keys); ray_release(vals); return val; }
@@ -2849,7 +2888,8 @@ ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
         ray_t* result = ray_table_new(ncols);
         if (!result || RAY_IS_ERR(result)) return result ? result : ray_error("oom", NULL);
         for (int64_t c = 0; c < ncols; c++) {
-            ray_t* col = ray_table_get_col_idx(vec, c);
+            ray_t* col = ray_table_col_idx(vec, c);
+            if (col && RAY_IS_ERR(col)) { ray_release(result); return col; }
             int64_t name = ray_table_col_name(vec, c);
             if (!col) continue;
             /* Parted and MAPCOMMON columns (.db.parted.get) are not dense
@@ -3006,6 +3046,8 @@ ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
             ray_t* sub_idx = idx_elem;
             ray_t* val = ray_at_fn(vec, sub_idx);
             if (alloc) ray_release(idx_elem);
+            /* a list holds values, never a lazy column scan */
+            if (val && !RAY_IS_ERR(val) && ray_is_lazy(val)) val = ray_lazy_materialize(val);
             if (RAY_IS_ERR(val)) {
                 result->len = j;
                 ray_release(result);
@@ -3082,6 +3124,7 @@ ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
                 ray_idx_consults[IDX_SITE_FIND]++;
                 if (ray_index_find_vec(vec, val, out, &any_null)) {
                     ray_idx_hits[IDX_SITE_FIND]++;
+                    ray_idx_note_use(vec);
                     done = true;
                 }
             }
@@ -3132,6 +3175,7 @@ ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
             int64_t row = ray_index_find_atom(vec, val);
             if (row >= -1) {   /* -2 means not eligible — fall through */
                 ray_idx_hits[IDX_SITE_FIND]++;
+                ray_idx_note_use(vec);
                 if (row < 0)
                     return ray_typed_null(-RAY_I64);
                 return make_i64(row);
@@ -4564,7 +4608,8 @@ ray_t* ray_fills_fn(ray_t* x) {
         if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
 
         for (int64_t c = 0; c < ncols; c++) {
-            ray_t* col = ray_table_get_col_idx(x, c);
+            ray_t* col = ray_table_col_idx(x, c);
+            if (col && RAY_IS_ERR(col)) { ray_release(out); return col; }
             ray_t* filled = fills_vec_eager(col);
             if (!filled || RAY_IS_ERR(filled)) {
                 ray_release(out);

@@ -23,6 +23,7 @@
 
 #include "csr.h"
 #include "store/col.h"
+#include "store/enccol.h"
 #include "mem/sys.h"
 #include "store/fileio.h"   /* ray_mkdir */
 #include <stdlib.h>
@@ -444,8 +445,15 @@ ray_rel_t* ray_rel_from_edges(ray_t* edge_table,
     int64_t dst_sym = ray_sym_intern(dst_col, strlen(dst_col));
     if (src_sym < 0 || dst_sym < 0) return NULL;  /* sym intern OOM */
 
-    ray_t* src_vec = ray_table_get_col(edge_table, src_sym);
-    ray_t* dst_vec = ray_table_get_col(edge_table, dst_sym);
+    /* Known gap: the signature has no error channel, so a column that cannot
+     * materialize declines with NULL and the error message is dropped. */
+    ray_t* src_vec = ray_table_col(edge_table, src_sym);
+    ray_t* dst_vec = ray_table_col(edge_table, dst_sym);
+    if ((src_vec && RAY_IS_ERR(src_vec)) || (dst_vec && RAY_IS_ERR(dst_vec))) {
+        if (src_vec && RAY_IS_ERR(src_vec)) ray_error_free(src_vec);
+        if (dst_vec && RAY_IS_ERR(dst_vec)) ray_error_free(dst_vec);
+        return NULL;
+    }
     if (!src_vec || !dst_vec) return NULL;
     if (src_vec->type != RAY_I64 || dst_vec->type != RAY_I64) return NULL;
 
@@ -491,7 +499,10 @@ ray_rel_t* ray_rel_build(ray_t* from_table, const char* fk_col,
         return NULL;
 
     int64_t fk_sym = ray_sym_intern(fk_col, strlen(fk_col));
-    ray_t* fk_vec = ray_table_get_col(from_table, fk_sym);
+    /* Known gap: a column that cannot materialize declines with NULL and the
+     * error message is dropped (no error channel in the signature). */
+    ray_t* fk_vec = ray_table_col(from_table, fk_sym);
+    if (fk_vec && RAY_IS_ERR(fk_vec)) { ray_error_free(fk_vec); return NULL; }
     if (!fk_vec || fk_vec->type != RAY_I64) return NULL;
     if (n_target_nodes < 0) return NULL;
 
@@ -612,6 +623,31 @@ static ray_err_t csr_save(ray_csr_t* csr, const char* dir, const char* prefix) {
     return RAY_OK;
 }
 
+/* The CSR files are plain vectors.  The mapping loader refuses an encoded
+ * (generation-2) column; the copying loader materializes it into a plain
+ * vector.  RAY_OK with *out set; RAY_ERR_NYI for an encoded file mapped
+ * (the optional ones included: only a missing file is "absent");
+ * RAY_ERR_IO for anything else. */
+static ray_err_t csr_col(const char* path, bool use_mmap, ray_t** out) {
+    *out = NULL;
+    ray_t* c = use_mmap ? ray_col_mmap(path) : ray_col_load(path);
+    if (c && !RAY_IS_ERR(c) && c->type == RAY_ENCCOL) { ray_release(c); return RAY_ERR_NYI; }
+    if (c && RAY_IS_ERR(c)) {
+        /* a nyi on a generation-2 file (e.g. a big-endian host) */
+        bool enc = false;
+        if (strcmp(ray_err_code(c), "nyi") == 0) {
+            FILE* f = fopen(path, "rb");
+            uint8_t h[32];
+            if (f) { enc = fread(h, 1, 32, f) == 32 && ray_col_gen_of(h) == 2; fclose(f); }
+        }
+        ray_error_free(c);
+        return enc ? RAY_ERR_NYI : RAY_ERR_IO;
+    }
+    if (!c) return RAY_ERR_IO;
+    *out = c;
+    return RAY_OK;
+}
+
 static ray_err_t csr_load_impl(ray_csr_t* csr, const char* dir, const char* prefix,
                                 bool use_mmap) {
     char path[1024];
@@ -619,28 +655,26 @@ static ray_err_t csr_load_impl(ray_csr_t* csr, const char* dir, const char* pref
 
     len = snprintf(path, sizeof(path), "%s/%s_offsets", dir, prefix);
     if (len < 0 || (size_t)len >= sizeof(path)) return RAY_ERR_IO;
-    csr->offsets = use_mmap ? ray_col_mmap(path) : ray_col_load(path);
-    if (!csr->offsets || RAY_IS_ERR(csr->offsets)) {
-        csr->offsets = NULL;
-        return RAY_ERR_IO;
-    }
+    ray_err_t ce = csr_col(path, use_mmap, &csr->offsets);
+    if (ce != RAY_OK) return ce;
 
     len = snprintf(path, sizeof(path), "%s/%s_targets", dir, prefix);
     if (len < 0 || (size_t)len >= sizeof(path)) return RAY_ERR_IO;
-    csr->targets = use_mmap ? ray_col_mmap(path) : ray_col_load(path);
-    if (!csr->targets || RAY_IS_ERR(csr->targets)) {
+    ce = csr_col(path, use_mmap, &csr->targets);
+    if (ce != RAY_OK) {
         ray_release(csr->offsets); csr->offsets = NULL;
-        csr->targets = NULL;
-        return RAY_ERR_IO;
+        return ce;
     }
 
     len = snprintf(path, sizeof(path), "%s/%s_rowmap", dir, prefix);
     if (len < 0 || (size_t)len >= sizeof(path)) return RAY_ERR_IO;
-    csr->rowmap = use_mmap ? ray_col_mmap(path) : ray_col_load(path);
-    if (!csr->rowmap || RAY_IS_ERR(csr->rowmap)) {
-        /* rowmap is optional — ignore error */
-        csr->rowmap = NULL;
+    ce = csr_col(path, use_mmap, &csr->rowmap);
+    if (ce == RAY_ERR_NYI) {
+        ray_release(csr->offsets); csr->offsets = NULL;
+        ray_release(csr->targets); csr->targets = NULL;
+        return ce;
     }
+    /* rowmap is optional — a missing or unreadable file is absent */
 
     if (csr->offsets->len < 1) {
         ray_release(csr->offsets); csr->offsets = NULL;
@@ -729,8 +763,13 @@ static ray_rel_t* rel_load_impl(const char* dir, bool use_mmap) {
     char path[1024];
     int len = snprintf(path, sizeof(path), "%s/meta", dir);
     if (len >= 0 && (size_t)len < sizeof(path)) {
-        ray_t* meta = use_mmap ? ray_col_mmap(path) : ray_col_load(path);
-        if (meta && !RAY_IS_ERR(meta) && meta->len >= 5) {
+        ray_t* meta = NULL;
+        if (csr_col(path, use_mmap, &meta) == RAY_ERR_NYI) {
+            csr_free(&rel->fwd); csr_free(&rel->rev);
+            ray_sys_free(rel);
+            return NULL;
+        }
+        if (meta && meta->len >= 5) {
             int64_t* md = (int64_t*)ray_data(meta);
             rel->from_table = (uint16_t)md[0];
             rel->to_table = (uint16_t)md[1];
@@ -738,7 +777,7 @@ static ray_rel_t* rel_load_impl(const char* dir, bool use_mmap) {
             rel->fwd.sorted = md[3] != 0;
             rel->rev.sorted = md[4] != 0;
             ray_release(meta);
-        } else if (meta && !RAY_IS_ERR(meta)) {
+        } else if (meta) {
             ray_release(meta);
         }
     }

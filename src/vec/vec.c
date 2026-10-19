@@ -43,45 +43,33 @@ static int pair_cmp_idx_then_k(const void* a, const void* b) {
     return (pa[1] > pb[1]) - (pa[1] < pb[1]);
 }
 
-/* Sentinel-based per-element null test.  Caller guarantees v is a
- * non-slice vector (type > 0) and idx is in range.  Returns true iff
- * payload[idx] equals the type-correct NULL_* sentinel.  F64/F32 use
- * (x != x) to detect any NaN bit pattern.  BOOL/U8 are non-nullable
- * and return false. */
-static inline bool sentinel_is_null(const ray_t* v, int64_t idx) {
-    const void* p = ray_data((ray_t*)v);
-    switch (v->type) {
-        case RAY_F64: {
-            double x = ((const double*)p)[idx];
-            return x != x;
-        }
-        case RAY_F32: {
-            float x = ((const float*)p)[idx];
-            return x != x;
-        }
-        case RAY_I64:
-        case RAY_TIMESTAMP:
-            return ((const int64_t*)p)[idx] == NULL_I64;
-        case RAY_I32:
-        case RAY_DATE:
-        case RAY_TIME:
-            return ((const int32_t*)p)[idx] == NULL_I32;
-        case RAY_I16:
-            return ((const int16_t*)p)[idx] == NULL_I16;
-        /* SYM uses id 0 as its canonical in-band null.  Width-aware handling
-         * lives in ray_vec_is_null, so there is no arm here. */
-        case RAY_STR:
-            return ((const ray_str_t*)p)[idx].len == 0;
+/* Sentinel null test on a raw generation-0 element array.  F64/F32 use
+ * (x != x) to detect any NaN bit pattern; SYM tests id 0 at the width class
+ * in `attrs`; BOOL/U8 are non-nullable and return false. */
+bool ray_raw_is_null(int8_t type, uint8_t attrs, const void* p, int64_t idx) {
+    switch (type) {
+        case RAY_F64: { double x = ((const double*)p)[idx]; return x != x; }
+        case RAY_F32: { float x = ((const float*)p)[idx];   return x != x; }
+        case RAY_I64: case RAY_TIMESTAMP: return ((const int64_t*)p)[idx] == NULL_I64;
+        case RAY_I32: case RAY_DATE: case RAY_TIME: return ((const int32_t*)p)[idx] == NULL_I32;
+        case RAY_I16: return ((const int16_t*)p)[idx] == NULL_I16;
+        case RAY_SYM: return ray_read_sym(p, idx, RAY_SYM, attrs) == 0;
+        case RAY_STR: return ((const ray_str_t*)p)[idx].len == 0;
         case RAY_GUID: {
             /* GUID null = 16 all-zero bytes (canonical convention). */
             static const uint8_t Z[16] = {0};
             return memcmp((const uint8_t*)p + idx * 16, Z, 16) == 0;
         }
-        case RAY_BOOL:
-        case RAY_U8:
-        default:
-            return false;
+        default: return false;     /* BOOL, U8: non-nullable */
     }
+}
+
+/* Sentinel-based per-element null test.  Caller guarantees v is a
+ * non-slice vector (type > 0) and idx is in range.  Returns true iff
+ * payload[idx] equals the type-correct NULL_* sentinel.  SYM is resolved
+ * (width-aware) by ray_vec_is_null before it gets here. */
+static inline bool sentinel_is_null(const ray_t* v, int64_t idx) {
+    return ray_raw_is_null(v->type, v->attrs, ray_data((ray_t*)v), idx);
 }
 
 /* In-place drop of attached index — caller must hold a unique ref (rc==1)
@@ -1153,6 +1141,51 @@ static inline void str_pool_add_dead(ray_t* vec, uint32_t bytes) {
 }
 
 /* --------------------------------------------------------------------------
+ * ray_str_pool_reserve — room for len more bytes in a STR pool
+ *
+ * Creates the pool on first use (a RAY_U8 block of max(256, 2 * len)
+ * bytes), refuses an end offset above UINT32_MAX (RAY_ERR_RANGE), and
+ * doubles the block until the bytes fit (RAY_ERR_OOM; a failed grow
+ * leaves *pool as it was).  *off is the offset the bytes go at; the
+ * caller copies them and advances (*pool)->len.
+ * -------------------------------------------------------------------------- */
+
+static inline ray_err_t str_pool_reserve(ray_t** pool, size_t len, int64_t* off) {
+    if (!*pool) {
+        ray_t* p = ray_alloc(len < 256 ? 256 : len * 2);
+        if (!p || RAY_IS_ERR(p)) return RAY_ERR_OOM;
+        p->type = RAY_U8;
+        p->len = 0;
+        *pool = p;
+    }
+    int64_t pool_used = (*pool)->len;
+    if (pool_used < 0 || (uint64_t)pool_used > UINT32_MAX ||
+        (uint64_t)len > UINT32_MAX - (uint64_t)pool_used)
+        return RAY_ERR_RANGE;
+    size_t pool_cap = ray_block_data_bytes(*pool);
+    size_t need = (size_t)pool_used + len;
+    if (need > pool_cap) {
+        size_t new_cap = pool_cap;
+        if (new_cap == 0) new_cap = 256;
+        while (new_cap < need) {
+            if (new_cap > SIZE_MAX / 2) return RAY_ERR_OOM;
+            new_cap *= 2;
+        }
+        ray_t* np = ray_scratch_realloc(*pool, new_cap);
+        if (!np || RAY_IS_ERR(np)) return RAY_ERR_OOM;
+        *pool = np;
+    }
+    *off = pool_used;
+    return RAY_OK;
+}
+
+/* Exported for builders outside this file; ray_str_vec_append inlines the
+ * same body. */
+ray_err_t ray_str_pool_reserve(ray_t** pool, size_t len, int64_t* off) {
+    return str_pool_reserve(pool, len, off);
+}
+
+/* --------------------------------------------------------------------------
  * ray_str_vec_append — append a string to a RAY_STR vector
  *
  * Strings <= 12 bytes are inlined in the ray_str_t element.
@@ -1171,36 +1204,9 @@ ray_t* ray_str_vec_append(ray_t* vec, const char* s, size_t len) {
 
     int64_t pool_off = 0;
     if (len > RAY_STR_INLINE_MAX) {
-        if (!vec->str_pool) {
-            size_t init_pool = len < 256 ? 256 : len * 2;
-            vec->str_pool = ray_alloc(init_pool);
-            if (!vec->str_pool || RAY_IS_ERR(vec->str_pool)) {
-                vec->str_pool = NULL;
-                goto fail_oom;
-            }
-            vec->str_pool->type = RAY_U8;
-            vec->str_pool->len = 0;
-        }
-
-        int64_t pool_used = vec->str_pool->len;
-        if (pool_used < 0 || (uint64_t)pool_used > UINT32_MAX ||
-            (uint64_t)len > UINT32_MAX - (uint64_t)pool_used)
-            goto fail_range;
-        size_t pool_cap = ray_block_data_bytes(vec->str_pool);
-        size_t need = (size_t)pool_used + len;
-        if (need > pool_cap) {
-            size_t new_cap = pool_cap;
-            if (new_cap == 0) new_cap = 256;
-            while (new_cap < need) {
-                if (new_cap > SIZE_MAX / 2) goto fail_oom;
-                new_cap *= 2;
-            }
-            ray_t* np = ray_scratch_realloc(vec->str_pool, new_cap);
-            if (!np || RAY_IS_ERR(np)) goto fail_oom;
-            vec->str_pool = np;
-        }
-
-        pool_off = pool_used;
+        ray_err_t pe = str_pool_reserve(&vec->str_pool, len, &pool_off);
+        if (pe == RAY_ERR_RANGE) goto fail_range;
+        if (pe != RAY_OK) goto fail_oom;
     }
 
     /* Grow element array if needed — pool is already ready */

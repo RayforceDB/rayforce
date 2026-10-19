@@ -26,6 +26,8 @@
 #include "mem/heap.h"
 #include "mem/sys.h"
 #include "table/sym.h"
+#include "ops/idxop.h"     /* ray_idx_lazy_clear — the lazy hash cache */
+#include "ops/internal.h"  /* ray_dict_cd_runtime_gone — the group-by DICT code stash */
 #include "store/part.h"
 #include <stdarg.h>
 #include <stdio.h>
@@ -112,6 +114,7 @@ const char* ray_err_code_str(ray_err_t e) {
          * is capped at 7 bytes — the past-tense form would truncate. */
         [RAY_ERR_RESERVED] = "reserve",
         [RAY_ERR_VERSION] = "version",
+        [RAY_ERR_FPENV]   = "fpenv",
     };
     if ((unsigned)e >= sizeof(codes)/sizeof(codes[0])) return "error";
     return codes[e];
@@ -131,6 +134,7 @@ ray_err_t ray_err_from_obj(ray_t* err) {
         {"name",    4, RAY_ERR_NAME},    {"limit",   5, RAY_ERR_LIMIT},
         {"reserve", 7, RAY_ERR_RESERVED},
         {"version", 7, RAY_ERR_VERSION},
+        {"fpenv",   5, RAY_ERR_FPENV},
     };
     for (int i = 0; i < (int)(sizeof(map)/sizeof(map[0])); i++)
         if (n == map[i].len && memcmp(s, map[i].s, n) == 0) return map[i].e;
@@ -172,6 +176,13 @@ static ray_t* ray_verror(const char* code, const char* fmt, va_list ap) {
 }
 
 ray_t* ray_error(const char* code, const char* fmt, ...) {
+    /* Enum-only save wrappers reconstruct errors with fmt == NULL. Give
+     * this caller-environment error useful context without reusing stale TLS
+     * text or changing the message behavior of any other error code. This
+     * literal deliberately contains no printf conversions. */
+    if (!fmt && code && strcmp(code, "fpenv") == 0)
+        fmt = "compressed floating-point I/O requires default FP controls "
+              "(FE_TONEAREST, masked exceptions, no FTZ/DAZ)";
     if (fmt) {
         va_list ap;
         va_start(ap, fmt);
@@ -432,6 +443,10 @@ int64_t ray_vec_get_sym_id(ray_t* vec, int64_t idx) {
 void ray_runtime_destroy(ray_runtime_t* rt) {
     if (!rt) return;
 
+    /* The lazy hash cache holds column references: release them while the
+     * heap and the globals that share those columns are still alive. */
+    ray_idx_lazy_clear();
+
     ray_lang_destroy();
 
     /* Free VMs */
@@ -457,6 +472,12 @@ void ray_runtime_destroy(ray_runtime_t* rt) {
     g_ray_profile.active = false;
     g_ray_profile.n = 0;
     g_ray_profile_last.n = 0;
+
+    /* exec_group's DICT code stash (thread-local, for a later count-
+     * distinct) is heap memory: free this thread's before the heap goes and
+     * mark every other thread's stale, or the next runtime's first group-by
+     * frees a pointer into the dead heap (#865). */
+    ray_dict_cd_runtime_gone();
 
     ray_parted_cache_clear();
     ray_sym_destroy();

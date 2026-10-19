@@ -212,8 +212,6 @@ void ray_pool_free(ray_pool_t* pool);
  * this one have run" (see ray_fused_take_select in fused_topk.c for the
  * pattern). */
 
-/* Dispatch fn over [0, total_elems) partitioned into morsel-sized tasks.
- * Blocks until all tasks complete. Main thread participates as worker 0. */
 /* Register the columns the calling thread's next dispatches scan (NULL
  * clears); returns the previous registration so nested executions can
  * restore it.  The registration must outlive those dispatches. */
@@ -247,7 +245,32 @@ bool ray_pool_scan_on(void);
  * a dispatch. */
 void ray_pool_want(const void* p, size_t bytes);
 
+/* Dispatch fn over [0, total_elems) partitioned into morsel-sized tasks.
+ * Blocks until all tasks complete. Main thread participates as worker 0.
+ * Contract: every task is one grain, [i*grain, min((i+1)*grain, total))
+ * (TASK_GRAIN, RAY_DISPATCH_MORSELS morsels).  When the tasks outnumber the
+ * ring (above RAY_POOL_MAX_TASKS, or a ring whose growth failed) they run
+ * in further rounds of the same grain (#792), so a caller keeping per-grain
+ * state may still walk its task grain by grain. */
 void ray_pool_dispatch(ray_pool_t* pool, ray_pool_fn fn, void* ctx, int64_t total_elems);
+/* ray_pool_dispatch at `grain` elements per task (a whole multiple of
+ * RAY_MORSEL_ELEMS), under the same clamp and contract. */
+void ray_pool_dispatch_grain(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
+                             int64_t total_elems, int64_t grain);
+/* The task count and grain a dispatch of total_elems at `grain` takes (the
+ * default grain is RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS): rounds keep the
+ * grain, so *eff_grain == grain and *n_tasks is ceil(total / grain); a
+ * ray_pool_dispatch_grain at *eff_grain runs exactly *n_tasks tasks
+ * starting at multiples of *eff_grain: two passes that size per-task state
+ * from this agree. */
+void ray_pool_dispatch_geometry(ray_pool_t* pool, int64_t total_elems, int64_t grain,
+                                uint32_t* n_tasks, int64_t* eff_grain);
+/* Test hook (C tests only): ray_pool_dispatch's ring growth fails (its
+ * realloc returns NULL) and a round holds at most `cap` tasks, so the
+ * further rounds run at test sizes as they do above task_cap * TASK_GRAIN
+ * elements when the realloc fails, or above RAY_POOL_MAX_TASKS tasks; 0 off.
+ * Disarmed by ray_test_hooks_off. */
+void ray_pool_test_ring_fail(uint32_t cap);
 
 /* Dispatch exactly n_tasks tasks, each with range [i, i+1).
  * Used for partition-parallel workloads where each task is one partition. */

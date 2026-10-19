@@ -1767,7 +1767,9 @@ static test_result_t test_fmt_times_binding(void) {
 static size_t fmt_write_to_buf(ray_t* obj, char* buf, size_t cap) {
     FILE* fp = tmpfile();
     if (!fp) return 0;
-    ray_err_t e = ray_fmt_write(fp, obj);
+    ray_t* cause = NULL;
+    ray_err_t e = ray_fmt_write(fp, obj, &cause);
+    if (cause) ray_error_free(cause);
     size_t n = 0;
     if (e == RAY_OK) {
         rewind(fp);

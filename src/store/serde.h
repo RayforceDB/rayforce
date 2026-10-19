@@ -83,6 +83,12 @@ ray_t*  ray_ser(ray_t* obj);
 /* Top-level: deserialize from U8 vector (validates IPC header) */
 ray_t*  ray_de(ray_t* bytes);
 
+/* After ray_serde_size() returned < 0: the error code of the encoded column
+ * whose decode failed (its message is in ray_error_msg()), or NULL when the
+ * object was simply not serializable. */
+const char* ray_serde_fail_code(void);
+void ray_serde_fail_clear(void);              /* call before ray_serde_size */
+
 /* File I/O: save/load any object in binary format */
 ray_err_t ray_obj_save(ray_t* obj, const char* path);
 ray_t*    ray_obj_load(const char* path);

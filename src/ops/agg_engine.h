@@ -5,6 +5,7 @@
 #include <rayforce.h>
 #include "ops/internal.h"   /* ray_graph_t, ray_op_t, ray_op_ext_t, find_ext */
 #include "ops/agg_acc.h"    /* agg_vtable_t */
+#include "table/sym.h"    /* ray_read_sym */
 
 /* Test/feature knob: route OP_GROUP through the v2 engine when it can handle
  * the query (see agg_v2_can_handle). Enabled by default. */
@@ -18,6 +19,38 @@ extern bool ray_agg_first_n;
  * aggregate into per-task top-bit tables (table stack) and scatter only
  * all-distinct tails; off = the former radix scatter of every row. */
 extern bool ray_agg_tablestack;
+
+/* Unordered take: N first-N limits, shared by the pre-pass (agg_first_n_run)
+ * and the parted group's first-key scan (group.c). */
+#define AGG_FIRSTN_MAX        1024     /* largest take: N the pre-pass serves */
+#define AGG_FIRSTN_PROBE_ROWS 65536    /* prefix budget for the serial scan, at least */
+
+/* The group's transient-state budget: the dense compaction's per-task
+ * bitmaps (agg_engine.c) and the null fills a ragged parted group builds
+ * for one query (group.c, grp_synth_plain) stay within it. */
+#define AGG_COMPACT_BITMAP_BUDGET ((size_t)32 << 20)
+
+/* Read element `i` of integer/temporal/SYM data of `type` widened to int64;
+ * a SYM element's width comes from `attrs` (a column's, or a range piece's). */
+static inline int64_t agg_read_key_i64_raw(int8_t type, uint8_t attrs, const void* data, int64_t i) {
+    switch (type) {
+        case RAY_I64: case RAY_TIMESTAMP: return ((const int64_t*)data)[i];
+        case RAY_I32: case RAY_DATE: case RAY_TIME: return ((const int32_t*)data)[i];
+        case RAY_I16: return ((const int16_t*)data)[i];
+        case RAY_U8:  case RAY_BOOL: return ((const uint8_t*)data)[i];
+        case RAY_SYM: return (int64_t)ray_read_sym(data, i, RAY_SYM, attrs);
+        default: return 0;  /* gate guarantees only the above reach here */
+    }
+}
+/* Read element `row` of an integer/temporal/SYM column widened to int64. */
+static inline int64_t agg_read_key_i64(ray_t* col, const void* data, int64_t row) {
+    return agg_read_key_i64_raw(col->type, col->attrs, data, row);
+}
+/* The key types agg_read_key_i64 reads. */
+static inline bool agg_key_i64_type(int8_t t) {
+    return t == RAY_I64 || t == RAY_TIMESTAMP || t == RAY_I32 || t == RAY_DATE || t == RAY_TIME ||
+           t == RAY_I16 || t == RAY_U8 || t == RAY_BOOL || t == RAY_SYM;
+}
 
 /* Admission is pure: inspecting a plan must not change execution diagnostics. */
 typedef enum {
@@ -80,12 +113,24 @@ typedef struct {
     uint32_t ts_tasks;              /* last table-stack run: phase-1 tasks */
     uint32_t ts_scatter_tasks;      /* ...of which switched to raw scatter */
     uint64_t ts_tables;             /* ...tables created across all tasks */
+    uint8_t radix_phase1;           /* last radix run's phase 1: AGG_RADIX_P1_* */
 } agg_route_stats_t;
+/* Phase 1 of a radix run: plain or staged two passes, the fused pass
+ * staging whole records (sel mode), or the fused pass staging only the
+ * sources it decodes (plain columns read in place by its scatter). */
+enum { AGG_RADIX_P1_TWO_PASS = 1, AGG_RADIX_P1_FUSED_RECORDS, AGG_RADIX_P1_FUSED_COMPACT };
 void agg_route_reset(void);
 void agg_route_note_key_domain(void);
 agg_route_stats_t agg_route_stats(void);
 void agg_route_record(agg_route_t route);
 void agg_route_reason(agg_v2_reason_t reason);
+/* Test hook (C tests only): the parallel int/SYM-key strategies run the
+ * small hash (their allocation-failure fallback) in place of the table
+ * stack and the radix scatter.  Disarmed by ray_test_hooks_off. */
+void agg_test_force_smallhash(bool on);
+/* Test hook: dense plans over a selection that the row probe proved
+ * impossible (agg_sel_bounds_impossible) since process start. */
+uint64_t ray_agg_test_sel_probe_hits(void);
 
 /* True iff the v2 engine fully supports this group node over this table.
  * Conservative: any uncertainty → false → caller uses the existing engine. */
@@ -116,6 +161,9 @@ bool agg_group_values_f64(const agg_vtable_t* vt, const char* states,
 
 /* Trim a finished group result to the emit filter's kept superset (row order
  * preserved; consumes `result`).  Used by routes that emit every group. */
+/* True when the armed emit filter names this group node's slot (the
+ * operation it names, count when unset): the one routing and trim test. */
+bool agg_emit_filter_targets(const ray_group_emit_filter_t* ef, const ray_op_ext_t* ext);
 ray_t* agg_emit_filter_trim(ray_t* result, uint32_t n_keys, uint32_t n_aggs,
                             const uint16_t* agg_ops, const ray_group_emit_filter_t* ef);
 

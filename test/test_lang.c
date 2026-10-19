@@ -3586,8 +3586,8 @@ static test_result_t test_eval_insert_parted_e2e_impl(const char* root) {
         old_tail[i] = segs[1];
         TEST_ASSERT_EQ_I(segs[0]->len, 2);
         TEST_ASSERT_EQ_I(segs[1]->len, 2);
-        TEST_ASSERT_EQ_U(segs[0]->mmod, 1);
-        TEST_ASSERT_EQ_U(segs[1]->mmod, 1);
+        TEST_ASSERT_LOADED_MMOD(segs[0], 1);
+        TEST_ASSERT_LOADED_MMOD(segs[1], 1);
     }
 
     ray_t* base_sym_col = lang_parted_insert_col(before, "ticker");
@@ -3718,7 +3718,7 @@ static test_result_t test_eval_insert_parted_e2e_impl(const char* root) {
         ray_t** segs = (ray_t**)ray_data(col);
         TEST_ASSERT_EQ_PTR(segs[0], hist_seg[i]);
         TEST_ASSERT_EQ_I(segs[0]->len, 2);
-        TEST_ASSERT_EQ_U(segs[0]->mmod, 1);
+        TEST_ASSERT_LOADED_MMOD(segs[0], 1);
         TEST_ASSERT_EQ_I(segs[1]->len, 5);
         TEST_ASSERT_EQ_U(segs[1]->mmod, 0);
         TEST_ASSERT_EQ_I(segs[2]->len, 2);
@@ -3788,7 +3788,7 @@ static test_result_t test_eval_insert_parted_e2e_impl(const char* root) {
     TEST_ASSERT_EQ_PTR(future_sym[0], live_sym[0]);
     TEST_ASSERT_EQ_PTR(future_sym[1], live_sym[1]);
     TEST_ASSERT_EQ_PTR(future_sym[2], live_sym[2]);
-    TEST_ASSERT_EQ_U(future_sym[0]->mmod, 1);
+    TEST_ASSERT_LOADED_MMOD(future_sym[0], 1);
     TEST_ASSERT_EQ_U(future_sym[1]->mmod, 0);
     TEST_ASSERT_EQ_U(future_sym[2]->mmod, 0);
     TEST_ASSERT_EQ_U(future_sym[3]->mmod, 0);
@@ -3848,8 +3848,8 @@ static test_result_t test_eval_insert_parted_e2e_impl(const char* root) {
     ray_t* cold_id = lang_parted_insert_col(cold, "id");
     TEST_ASSERT_NOT_NULL(cold_id);
     ray_t** cold_id_segs = (ray_t**)ray_data(cold_id);
-    TEST_ASSERT_EQ_U(cold_id_segs[0]->mmod, 1);
-    TEST_ASSERT_EQ_U(cold_id_segs[1]->mmod, 1);
+    TEST_ASSERT_LOADED_MMOD(cold_id_segs[0], 1);
+    TEST_ASSERT_LOADED_MMOD(cold_id_segs[1], 1);
 
     ray_release(cold);
     ray_release(future);
@@ -3965,8 +3965,8 @@ static test_result_t test_eval_insert_parted_rollover_impl(const char* root) {
         TEST_ASSERT_EQ_PTR(ray_sym_vec_domain(live_ticker[pidx]), live_dom);
         TEST_ASSERT_EQ_PTR(ray_sym_vec_domain(live_venue[pidx]), live_dom);
     }
-    TEST_ASSERT_EQ_U(live_ticker[0]->mmod, 1);
-    TEST_ASSERT_EQ_U(live_venue[0]->mmod, 1);
+    TEST_ASSERT_LOADED_MMOD(live_ticker[0], 1);
+    TEST_ASSERT_LOADED_MMOD(live_venue[0], 1);
     for (int64_t pidx = 1; pidx < 3; pidx++) {
         TEST_ASSERT_EQ_U(live_ticker[pidx]->mmod, 0);
         TEST_ASSERT_EQ_U(live_venue[pidx]->mmod, 0);
@@ -4048,8 +4048,8 @@ static test_result_t test_eval_insert_parted_rollover_impl(const char* root) {
     for (int64_t pidx = 0; pidx < 3; pidx++) {
         TEST_ASSERT_EQ_PTR(ray_sym_vec_domain(cold_ticker[pidx]), cold_dom);
         TEST_ASSERT_EQ_PTR(ray_sym_vec_domain(cold_venue[pidx]), cold_dom);
-        TEST_ASSERT_EQ_U(cold_ticker[pidx]->mmod, 1);
-        TEST_ASSERT_EQ_U(cold_venue[pidx]->mmod, 1);
+        TEST_ASSERT_LOADED_MMOD(cold_ticker[pidx], 1);
+        TEST_ASSERT_LOADED_MMOD(cold_venue[pidx], 1);
     }
     TEST_ASSERT_EQ_I(ray_sym_domain_count(cold_dom), disk_syms_persisted);
     TEST_ASSERT_EQ_I(ray_sym_domain_find(cold_dom, "omni", 4), omni_pos);
@@ -4074,7 +4074,7 @@ static test_result_t test_eval_insert_parted_rollover_impl(const char* root) {
     ray_t* cold_id_col = lang_parted_insert_col(cold, "id");
     TEST_ASSERT_NOT_NULL(cold_id_col);
     ray_t** cold_id = (ray_t**)ray_data(cold_id_col);
-    TEST_ASSERT_EQ_U(cold_id[2]->mmod, 1);
+    TEST_ASSERT_LOADED_MMOD(cold_id[2], 1);
     TEST_ASSERT_EQ_I(((int64_t*)ray_data(cold_id[2]))[0], 7);
     TEST_ASSERT_EQ_I(((int64_t*)ray_data(cold_id[2]))[1], 8);
 
@@ -4246,8 +4246,8 @@ static test_result_t test_eval_insert_parted_errors_impl(const char* root) {
         ray_t** segs = (ray_t**)ray_data(col);
         TEST_ASSERT_EQ_I(segs[0]->len, 2);
         TEST_ASSERT_EQ_I(segs[1]->len, 2);
-        TEST_ASSERT_EQ_U(segs[0]->mmod, 1);
-        TEST_ASSERT_EQ_U(segs[1]->mmod, 1);
+        TEST_ASSERT_LOADED_MMOD(segs[0], 1);
+        TEST_ASSERT_LOADED_MMOD(segs[1], 1);
     }
 
     char day3[1200];
@@ -4479,8 +4479,8 @@ static test_result_t test_eval_insert_parted_physical_types_impl(
         historical[i] = segs[0];
         TEST_ASSERT_EQ_I(segs[0]->len, 1);
         TEST_ASSERT_EQ_I(segs[1]->len, 1);
-        TEST_ASSERT_EQ_U(segs[0]->mmod, 1);
-        TEST_ASSERT_EQ_U(segs[1]->mmod, 1);
+        TEST_ASSERT_LOADED_MMOD(segs[0], 1);
+        TEST_ASSERT_LOADED_MMOD(segs[1], 1);
     }
 
     /* A fully validated exact-schema zero-vector batch is pointer-identical
@@ -4526,7 +4526,7 @@ static test_result_t test_eval_insert_parted_physical_types_impl(
                          lang_parted_wide_types[i]);
         ray_t** segs = (ray_t**)ray_data(wrapper);
         TEST_ASSERT_EQ_PTR(segs[0], historical[i]);
-        TEST_ASSERT_EQ_U(segs[0]->mmod, 1);
+        TEST_ASSERT_LOADED_MMOD(segs[0], 1);
         TEST_ASSERT_EQ_I(segs[0]->len, 1);
         TEST_ASSERT_EQ_I(segs[1]->type, lang_parted_wide_types[i]);
         TEST_ASSERT_EQ_I(segs[1]->len, 3);
@@ -5170,10 +5170,10 @@ static test_result_t test_sort_embedded_nul(void) {
 static test_result_t test_eval_read_write_csv(void) {
     /* Create a table, write it to CSV, read it back */
     ray_t* result = ray_eval_str(
-        "(do (set t (table ['a 'b] (list [1 2 3] [10 20 30]))) "
+        ray_test_tmp("(do (set t (table ['a 'b] (list [1 2 3] [10 20 30]))) "
         "(.csv.write t \"/tmp/test_rayfall.csv\") "
         "(set t2 (.csv.read \"/tmp/test_rayfall.csv\")) "
-        "(count t2))");
+        "(count t2))"));
     TEST_ASSERT_NOT_NULL(result);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
     TEST_ASSERT_EQ_I(result->type, -RAY_I64);
@@ -9385,7 +9385,7 @@ static test_result_t test_select_releases_input_table(void) {
 
 static test_result_t test_select_derived_key_file_chunks(void) {
     ray_t* r = ray_eval_str(
-        "(do (set __dk_i (til 20000)) "
+        ray_test_tmp("(do (set __dk_i (til 20000)) "
         "    (set __dk_hosts (map (fn [k] (format \"h%.example.com\" k)) (til 37))) "
         "    (set __dk_mk (fn [k] ((fn [j] (if (== 0 (% j 11)) \"\" (if (== 0 (% j 7)) "
         "        (format \"https://www.%/p/%\" (at __dk_hosts (% (* 31 j) 37)) (% j 13)) "
@@ -9404,7 +9404,7 @@ static test_result_t test_select_derived_key_file_chunks(void) {
         "        (if (and (within p [4 5]) (== (substr ref 1 4) \"http\") (not (nil? sl))) (substr r 1 sl) ref))))) "
         "        ref: ref v: v where: (!= ref \"\")}) by: p c: (count ref) sv: (sum v) mn: (min ref)}))) "
         "    (set __dk_fp (fn [r] (ser (xasc (xasc (table [k c sv mn] (list (at (value r) 0) (at r 'c) (at r 'sv) (at r 'mn))) 'mn) 'c)))) "
-        "    (count (distinct (at __dk_F 'ref))))");
+        "    (count (distinct (at __dk_F 'ref))))"));
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     TEST_ASSERT_EQ_I(r->i64, 414);              /* vocabulary of 414 values */
@@ -9420,7 +9420,7 @@ static test_result_t test_select_derived_key_file_chunks(void) {
     ray_derived_key_chunk_set_for_test(7);      /* 60 chunks, the last one short */
     ray_t* same7 = ray_eval_str("(all (== (__dk_fp (__dk_keyq __dk_F)) (__dk_fp __dk_r7)))");
     ray_derived_key_chunk_set_for_test(0);
-    ray_t* cleanup = ray_eval_str("(.sys.exec \"rm -rf /tmp/rf_test_dk_chunks/\")");
+    ray_t* cleanup = ray_eval_str(ray_test_tmp("(.sys.exec \"rm -rf /tmp/rf_test_dk_chunks/\")"));
     ray_release(cleanup);
 
     TEST_ASSERT_NOT_NULL(same);
@@ -9846,7 +9846,7 @@ static test_result_t test_read_unsized_stream_is_bounded(void) {
      * a finite claim the filesystem backs.  Bounding this path would turn a
      * large-file read that previously allocated and spilled into a hard
      * error, and would make success depend on live process state. */
-    const char* big = "/tmp/rf_read_big_sized.bin";
+    const char* big = ray_test_tmp("/tmp/rf_read_big_sized.bin");
     FILE* bf = fopen(big, "wb");
     TEST_ASSERT_NOT_NULL(bf);
     static char chunk[65536];

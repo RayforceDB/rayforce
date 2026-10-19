@@ -25,6 +25,7 @@
 #define RAY_CSV_H
 
 #include <rayforce.h>
+#include "store/col.h"
 
 /* --------------------------------------------------------------------------
  * Column type tokens used during CSV parse and schema resolution.
@@ -83,16 +84,21 @@ ray_err_t ray_csv_save_parted_named_opts(const char* path, char delimiter, bool 
                                          const int64_t* col_names, int32_t n_names,
                                          const char* root, const char* table_name,
                                          int64_t rows_per_part);
+ray_err_t ray_csv_save_parted_mode(const char* path, char delimiter, bool header,
+                                   const int8_t* col_types, int32_t n_types,
+                                   const int64_t* col_names, int32_t n_names,
+                                   const char* root, const char* table_name,
+                                   int64_t rows_per_part, ray_compress_t mode);
 ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool header,
                                           const int8_t* col_types, int32_t n_types,
                                           const int64_t* col_names, int32_t n_names,
                                           const char* dir, int64_t rows_per_chunk);
+/* The same with the call's compress option (ray_compress_t); the form above
+ * passes RAY_COMPRESS_ABSENT, so each column inherits the destination's. */
+ray_err_t ray_csv_save_splayed_mode(const char* path, char delimiter, bool header,
+                                    const int8_t* col_types, int32_t n_types,
+                                    const int64_t* col_names, int32_t n_names,
+                                    const char* dir, int64_t rows_per_chunk, ray_compress_t mode);
 ray_err_t ray_write_csv(ray_t* table, const char* path);
-
-/* Hash-vs-chunk-zone index policy for a column, from its chunk-zone entropy
- * (payload-level; see csv.c).  Shared by the in-memory CSV load and the
- * .csv.splayed store index builder so both make the same decision. */
-int ray_csv_hash_upgrade_check(int8_t type, int64_t len,
-                               const void* index_payload);
 
 #endif /* RAY_CSV_H */

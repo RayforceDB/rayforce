@@ -1,0 +1,69 @@
+;; @requires: posix  (fixtures/checks run through a POSIX shell via .sys.exec)
+;; Indexed columns written as generation 2 (compressed-columns P4): every
+;; persisted kind round-trips with generation-0 answers.
+(.sys.exec "rm -rf /tmp/rf_test_p4idx /tmp/rf_test_p4idx_child.rfl /tmp/rf_test_p4idx_route.rfl")
+
+(set n 100000)
+(set i (til n))
+(set K (.idx.hash (% (* i 7919) 100003)))
+(set S (.idx.sort (as 'I32 (- (% (* i 31) 9973) 4000))))
+(set B (.idx.bloom (% (* i 17) 50021)))
+(set P (.attr.set 'parted (div i 1000)))
+(set Y (.attr.set 'grouped (at ['zeta 'alpha 'mu 'omega] (% i 4))))
+;; four ascending blocks; the -0.0 and +0.0 blocks merge into one PART block
+;; whose key keeps the first row's sign (-0.0)
+(set Z (.attr.set 'parted (at [-2.5 -0.0 0.0 1.5] (div (* i 4) n))))
+(set T (table [k s b p y z v] (list K S B P Y Z i)))
+(.db.splayed.set "/tmp/rf_test_p4idx/g0/" T {compress: false})
+(.db.splayed.set "/tmp/rf_test_p4idx/g2/" T {compress: true})
+(set A (.db.splayed.get "/tmp/rf_test_p4idx/g0/"))
+(set C (.db.splayed.get "/tmp/rf_test_p4idx/g2/"))
+
+;; generation 2 records the kinds, without materializing
+(at (.idx.info C 'k) 'gen) -- 2
+(at (.idx.info C 'k) 'index) -- 'hash
+(at (.idx.info C 's) 'index) -- 'sort
+(at (.idx.info C 'b) 'index) -- 'bloom
+(at (.idx.info C 'p) 'index) -- 'part
+(at (.idx.info C 'y) 'index) -- 'hash
+(at (.idx.info C 'z) 'index) -- 'part
+(at (.idx.info C 'k) 'materialized) -- false
+
+;; equality, in, ranges, grouping: generation-0 answers (a projected column,
+;; so the select runs the filter; count(select) would take the count fast
+;; path, which consults no index)
+(sum (at (select {from: C where: (== k 4242)}) 'v)) -- (sum (at (select {from: A where: (== k 4242)}) 'v))
+(sum (at (select {from: C where: (in k [1 2 3 4242])}) 'v)) -- (sum (at (select {from: A where: (in k [1 2 3 4242])}) 'v))
+(sum (at (select {from: C where: (> s 3000)}) 'v)) -- (sum (at (select {from: A where: (> s 3000)}) 'v))
+(sum (at (select {from: C where: (== p 77)}) 'v)) -- (sum (at (select {from: A where: (== p 77)}) 'v))
+(sum (at (select {from: C where: (== y 'mu)}) 'v)) -- (sum (at (select {from: A where: (== y 'mu)}) 'v))
+(select {c: (count v) from: C by: y asc: y}) -- (select {c: (count v) from: A by: y asc: y})
+(sum (at (select {from: C where: (== z 0.0)}) 'v)) -- (sum (at (select {from: A where: (== z 0.0)}) 'v))
+(sum (at (select {from: C where: (== z -0.0)}) 'v)) -- (sum (at (select {from: A where: (== z -0.0)}) 'v))
+
+;; .attr.get after materialization, index kind on the column value
+(.attr.get (at C 'y)) -- (.attr.get (at A 'y))
+(.attr.get (at C 'p)) -- (.attr.get (at A 'p))
+(at (.idx.info (at C 'k)) 'kind) -- 'hash
+
+;; as-of on a PART-indexed key ordered by time, in another process with a
+;; different interning order: the name block, not the id, carries order_sym.
+;; The key is I64: the as-of index variant needs a right side proven
+;; null-free, and a SYM column never is (ray_vec_may_have_nulls), so a SYM
+;; key never reaches the ordered route on either generation (#842).
+;; xasc of an already ordered table stamps PART on id with order_sym ts
+;; (sort_stamp_ordered_table, src/ops/sort.c): sort once, then again
+(set Q (xasc (xasc (table [id ts bid] (list (% (til 3000) 3) (til 3000) (as 'F64 (til 3000)))) ['id 'ts]) ['id 'ts]))
+(at (.idx.info (at Q 'id)) 'kind) -- 'part
+(.db.splayed.set "/tmp/rf_test_p4idx/q2/" Q {compress: true})
+(.db.splayed.set "/tmp/rf_test_p4idx/q0/" Q {compress: false})
+(at (.idx.info (.db.splayed.get "/tmp/rf_test_p4idx/q2/") 'id) 'index) -- 'part
+;; the answers: tables do not compare with ==, so column by column
+(.sys.exec "printf '%s\n' '(set junk (map (fn [j] (as (quote SYMBOL) (format \"w%\" j))) (til 2000)))' '(set Q2 (.db.splayed.get \"/tmp/rf_test_p4idx/q2/\"))' '(set Q0 (.db.splayed.get \"/tmp/rf_test_p4idx/q0/\"))' '(set L (table [id ts] (list [0 1 2] [100 200 2999])))' '(set A2 (asof-join [id ts] L Q2))' '(set A0 (asof-join [id ts] L Q0))' '(println (and (== (count A2) (count A0)) (all (map (fn [c] (all (== (at A2 c) (at A0 c)))) (key A0)))))' > /tmp/rf_test_p4idx_child.rfl") -- 0
+;; the route, on the generation-2 load alone (generation 0 keeps an integer
+;; PART's order too, so the answer script would show it either way)
+(.sys.exec "printf '%s\n' '(set junk (map (fn [j] (as (quote SYMBOL) (format \"w%\" j))) (til 2000)))' '(set Q2 (.db.splayed.get \"/tmp/rf_test_p4idx/q2/\"))' '(set L (table [id ts] (list [0 1 2] [100 200 2999])))' '(println (count (asof-join [id ts] L Q2)))' > /tmp/rf_test_p4idx_route.rfl") -- 0
+(.sys.exec "RAY_IDX_STATS=1 ./rayforce -f /tmp/rf_test_p4idx_route.rfl 2>&1 | grep -q 'idx_route asof-ordered consults=1 '") -- 0
+(.sys.exec "./rayforce -f /tmp/rf_test_p4idx_child.rfl 2>/dev/null | tail -1 | grep -q true") -- 0
+
+(.sys.exec "rm -rf /tmp/rf_test_p4idx /tmp/rf_test_p4idx_child.rfl /tmp/rf_test_p4idx_route.rfl") -- 0

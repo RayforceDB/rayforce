@@ -284,7 +284,7 @@ static bool ast_refs_locals(compiler_t *c, ray_t *ast) {
     }
     if (ast->type == RAY_DICT) {  /* slot[0]=keys, slot[1]=vals */
         ray_t **slots = (ray_t**)ray_data(ast);
-        return ast_refs_locals(c, slots[0]) || ast_refs_locals(c, slots[1]);
+        return ast_refs_locals(c, slots[0]) || ast_refs_locals(c, slots[1]);   /* not-a-table */
     }
     return false;
 }
@@ -1018,7 +1018,7 @@ static bool ast_collect_syms_at(ray_t *ast, ray_t **out, bool *dynamic, int dept
     if (ast->type == RAY_DICT) {
         ray_t **slots = (ray_t**)ray_data(ast);
         return ast_collect_syms_at(slots[0], out, dynamic, depth + 1, weight, stop, nodes) &&
-               ast_collect_syms_at(slots[1], out, dynamic, depth + 1, weight, stop, nodes);
+               ast_collect_syms_at(slots[1], out, dynamic, depth + 1, weight, stop, nodes);   /* not-a-table */
     }
     return true;
 }

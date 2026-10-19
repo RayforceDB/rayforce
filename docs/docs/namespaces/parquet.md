@@ -83,7 +83,7 @@ Retaining batches increases memory use.
 ## `.parquet.splayed` { #parquet-splayed }
 
 Convert into a new native directory and return the row count. The optional
-argument is a type vector or `{types: [...] rows: n strict: true}`. For example,
+argument is a type vector or `{types: [...] rows: n strict: true compress: true}`. For example,
 a source containing an integer ID and text can be imported as:
 
 ```lisp
@@ -109,3 +109,14 @@ output, and publish it without replacing an existing destination. Failed staging
 data is retained; existing staging directories are rejected. Imports do not
 support resume or append. Format or conversion failures return `parquet`
 errors; argument, I/O, allocation, and cancellation errors also propagate.
+
+The options dict also takes `compress`: `true` writes generation-2
+(compressed) column files where the column is eligible, `false` (or no
+option, since the destination is always new) generation 0. A non-bool
+`compress` or a second options dict is a `domain` error. Compressed files keep their chunk zones and persist the same indexes a generation-0 save does, because the import writes through the same splayed-table writer as `.db.splayed.set`.
+For example:
+
+```lisp
+(.parquet.splayed {compress: true} "events.parquet" "/tmp/events-native")
+(.parquet.parted {compress: true rows: 262144} "events.parquet" "/tmp/events-db" 'events)
+```

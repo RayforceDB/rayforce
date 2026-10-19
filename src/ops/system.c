@@ -41,6 +41,7 @@
 #include "core/qmeasure.h"  /* shared per-query measurement lifecycle */
 #include "core/qlog.h"      /* g_qlog — (.sys.querylog) */
 #include "store/serde.h"
+#include "store/enccol.h"
 #include "store/splay.h"
 #include "store/part.h"
 #include "core/ipc.h"
@@ -176,10 +177,10 @@ static const char* str_to_cpath(ray_t* s, char* buf, size_t bufsz) {
     return buf;
 }
 
-/* (.db.splayed.set "dir" table) or (.db.splayed.set "dir" table "sym_path") */
+/* (.db.splayed.set "dir" table), (... "sym_path"), (... opts), (... "sym_path" opts) */
 ray_t* ray_set_splayed_fn(ray_t** args, int64_t n) {
-    if (n < 2 || n > 3)
-        return ray_error("domain", ".db.splayed.set expects 2 or 3 arguments, got %lld", (long long)n);
+    if (n < 2 || n > 4)
+        return ray_error("domain", ".db.splayed.set expects 2 to 4 arguments, got %lld", (long long)n);
 
     char dir[1024];
     if (!str_to_cpath(args[0], dir, sizeof(dir)))
@@ -191,12 +192,31 @@ ray_t* ray_set_splayed_fn(ray_t** args, int64_t n) {
 
     char sym[1024];
     const char* sym_path = NULL;
-    if (n == 3 && args[2] && args[2]->type == -RAY_STR)
-        sym_path = str_to_cpath(args[2], sym, sizeof(sym));
-    else
-        sym_path = splay_resolve_sym(dir, sym, sizeof(sym), true);
+    ray_t* opts = NULL;
+    bool sym_given = false;
+    for (int64_t i = 2; i < n; i++) {
+        ray_t* a = args[i];
+        if (a && a->type == RAY_DICT) {
+            if (opts) return ray_error("domain", ".db.splayed.set: a second options dict");
+            opts = a;
+        } else if (i == 2) {
+            /* a string names the symfile; anything else is ignored and the
+             * convention applies, as before */
+            if (a && a->type == -RAY_STR) {
+                sym_given = true;   /* an empty or over-long path stays NULL */
+                sym_path = str_to_cpath(a, sym, sizeof(sym));
+            }
+        } else {
+            return ray_error("domain", ".db.splayed.set: argument 4 must be an options dict, got %s",
+                             a ? ray_type_name(a->type) : "null");
+        }
+    }
+    ray_compress_t mode;
+    ray_t* oerr = ray_compress_opt_parse(opts, true, &mode);
+    if (oerr) return oerr;
+    if (!sym_given) sym_path = splay_resolve_sym(dir, sym, sizeof(sym), true);
 
-    ray_err_t err = ray_splay_save(tbl, dir, sym_path);
+    ray_err_t err = ray_splay_save_mode(tbl, dir, sym_path, mode);
     if (err != RAY_OK) return ray_error(ray_err_code_str(err), NULL);
 
     ray_retain(tbl);
@@ -712,6 +732,12 @@ static bool objsize_push_children(ray_objsize_walk_t* w, ray_t* v) {
             OBJSIZE_PUSH(v->obj);
         return true;
     }
+    if (v->type == RAY_ENCCOL) {          /* the decoded cache (and its index), the parted wrapper */
+        ray_t* kids[2];
+        int nk = ray_enccol_children(v, kids);
+        for (int i = 0; i < nk; i++) OBJSIZE_PUSH(kids[i]);
+        return true;
+    }
     if (v->attrs & RAY_ATTR_SLICE) {
         OBJSIZE_PUSH(v->slice_parent);
         return true;
@@ -740,7 +766,7 @@ static bool objsize_push_children(ray_objsize_walk_t* w, ray_t* v) {
     if (v->type == RAY_MAPCOMMON || v->type == RAY_TABLE || v->type == RAY_DICT) {
         ray_t** slots = (ray_t**)ray_data(v);
         OBJSIZE_PUSH(slots[0]);
-        OBJSIZE_PUSH(slots[1]);
+        OBJSIZE_PUSH(slots[1]);   /* plain-table */
         return true;
     }
     if (v->type == RAY_LIST) {

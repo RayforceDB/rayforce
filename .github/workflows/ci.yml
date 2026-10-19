@@ -39,11 +39,15 @@ jobs:
       - name: Build (${{ matrix.target }})
         run: make ${{ matrix.target }} CC=${{ matrix.compiler }}
 
-      # Tests build their own debug+ASan objects, so they only make sense after a
-      # debug build. Running `make test` after `make release` reuses the
-      # release-compiled src objects (no -DDEBUG), which omits DEBUG-only symbols
-      # like ray_check_null_invariant and fails to link. The release legs still
-      # verify the optimized build compiles + links; the debug legs run the tests.
+      # The embedding archive has its own .lib.o flags: binary-only builds
+      # do not exercise codec strict-FP overrides in that profile.
+      - name: Build static library
+        if: matrix.target == 'release' && matrix.compiler == 'gcc'
+        run: make -j2 lib CC=${{ matrix.compiler }}
+
+      # Debug legs execute the sanitizer suite; release legs verify optimized
+      # artifacts. Runtime tests under release FP flags use the separate
+      # `make test-release` profile, not the debug suite below.
       - name: Test
         if: matrix.target == 'debug'
         run: make test CC=${{ matrix.compiler }}

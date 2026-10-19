@@ -146,7 +146,7 @@ static void cleanup_base(const char* base) {
     }
 #else
     snprintf(path, sizeof(path), "rm -f '%s'.*.log 2>/dev/null", base);
-    (void)system(path);
+    if (system(path) != 0) { /* nothing to remove */ }
 #endif
 }
 
@@ -200,7 +200,7 @@ static test_result_t test_journal_validate_empty(void) {
 
 /* 1c. Validate non-existent file — must return RAY_ERR_IO. */
 static test_result_t test_journal_validate_no_file(void) {
-    ray_err_t e = ray_journal_validate("/tmp/jrn_nosuchfile_xyzzy.log", NULL, NULL);
+    ray_err_t e = ray_journal_validate(ray_test_tmp("/tmp/jrn_nosuchfile_xyzzy.log"), NULL, NULL);
     TEST_ASSERT_EQ_I(e, RAY_ERR_IO);
     PASS();
 }
@@ -388,7 +388,7 @@ static test_result_t test_journal_validate_growing_payload(void) {
 static test_result_t test_journal_replay_no_file(void) {
     int64_t chunks = 99, errs = 99;
     ray_jreplay_status_t status = RAY_JREPLAY_OK;
-    ray_err_t e = ray_journal_replay("/tmp/jrn_nosuch_replay.log",
+    ray_err_t e = ray_journal_replay(ray_test_tmp("/tmp/jrn_nosuch_replay.log"),
                                      &chunks, &errs, &status);
     TEST_ASSERT_EQ_I(e, RAY_ERR_IO);
     TEST_ASSERT_EQ_I(status, RAY_JREPLAY_IO);
@@ -706,15 +706,18 @@ static test_result_t test_journal_open_long_base_releases_lock(void) {
     SKIP("deep-mkdir fixture not portable (PATH_MAX / MAX_PATH)");
 #endif
     char dir[2048];
-    const char* root = "/tmp/jrn_test_longbase";  /* 22 chars */
+    const char* root = ray_test_tmp("/tmp/jrn_test_longbase");
     const char* comp = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; /* 50 chars */
     int off = snprintf(dir, sizeof(dir), "%s", root);
-    /* 22 + 19 * 51 = 991; a 27-char leaf makes the base 1019 bytes. */
-    for (int i = 0; i < 19; i++) off += snprintf(dir + off, sizeof(dir) - (size_t)off, "/%s", comp);
+    /* the root plus 18 * 51 stays under 1000 bytes; a leaf of 'b' fills the base to 1019 bytes */
+    for (int i = 0; i < 18; i++) off += snprintf(dir + off, sizeof(dir) - (size_t)off, "/%s", comp);
+    TEST_ASSERT_TRUE(off < 1000);
     TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
     char base[2048];
-    int blen = snprintf(base, sizeof(base), "%s/bbbbbbbbbbbbbbbbbbbbbbbbbbb", dir);
-    TEST_ASSERT_EQ_I(blen, 1019);
+    int blen = snprintf(base, sizeof(base), "%s/", dir);
+    while (blen < 1019) base[blen++] = 'b';
+    base[blen] = '\0';
+    TEST_ASSERT_EQ_I((int)strlen(base), 1019);
 
     TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_ERR_DOMAIN);
     TEST_ASSERT_FALSE(ray_journal_is_open());
@@ -1975,7 +1978,7 @@ static test_result_t test_ops_open_rank(void) {
 
 /* 22h. ray_log_open_fn: args[0] = NULL — !args[0] branch. */
 static test_result_t test_ops_open_null_mode(void) {
-    ray_t* str_arg = ray_str("/tmp/jrn_ops_test", 17);
+    ray_t* str_arg = ray_str(ray_test_tmp("/tmp/jrn_ops_test"), strlen(ray_test_tmp("/tmp/jrn_ops_test")));
     ray_t* args[2] = { NULL, str_arg };
     ray_t* r = ray_log_open_fn(args, 2);
     TEST_ASSERT_NOT_NULL(r);
@@ -1988,7 +1991,7 @@ static test_result_t test_ops_open_null_mode(void) {
 /* 22i. ray_log_open_fn: args[0] = integer — type != -RAY_SYM. */
 static test_result_t test_ops_open_int_mode(void) {
     ray_t* int_arg = ray_i64(1);
-    ray_t* str_arg = ray_str("/tmp/jrn_ops_test", 17);
+    ray_t* str_arg = ray_str(ray_test_tmp("/tmp/jrn_ops_test"), strlen(ray_test_tmp("/tmp/jrn_ops_test")));
     ray_t* args[2] = { int_arg, str_arg };
     ray_t* r = ray_log_open_fn(args, 2);
     TEST_ASSERT_NOT_NULL(r);
@@ -2032,7 +2035,7 @@ static test_result_t test_ops_open_sym_base(void) {
 static test_result_t test_ops_open_bad_mode(void) {
     int64_t bogus_id = ray_sym_intern("bogus", 5);
     ray_t*  sym_mode = ray_sym(bogus_id);
-    ray_t*  str_base = ray_str("/tmp/jrn_ops_test", 17);
+    ray_t*  str_base = ray_str(ray_test_tmp("/tmp/jrn_ops_test"), strlen(ray_test_tmp("/tmp/jrn_ops_test")));
     ray_t*  args[2]  = { sym_mode, str_base };
     ray_t*  r        = ray_log_open_fn(args, 2);
     TEST_ASSERT_NOT_NULL(r);

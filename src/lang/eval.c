@@ -2035,7 +2035,8 @@ ray_t* ray_value_fn(ray_t* x) {
         ray_t* result = ray_list_new(ncols);
         if (!result || RAY_IS_ERR(result)) return result ? result : ray_error("oom", NULL);
         for (int64_t i = 0; i < ncols; i++) {
-            ray_t* c = ray_table_get_col_idx(x, i);
+            ray_t* c = ray_table_col_idx(x, i);
+            if (c && RAY_IS_ERR(c)) { ray_release(result); return c; }
             result = ray_list_append(result, c);
             if (RAY_IS_ERR(result)) return result;
         }
@@ -4600,6 +4601,7 @@ static void ray_register_builtins(void) {
     register_vary("del",          RAY_FN_SPECIAL_FORM | RAY_FN_RESTRICTED, ray_del_fn);
     register_vary(".sys.build", RAY_FN_NONE, ray_internals_fn);
     register_vary(".sys.mem",   RAY_FN_NONE, ray_memstat_fn);
+    register_unary(".idx.uses", RAY_FN_NONE, ray_idx_uses_fn);
     register_vary(".sys.prof",  RAY_FN_NONE, ray_prof_fn);
     register_vary(".sys.querylog",        RAY_FN_NONE,       ray_qlog_fn);
     register_vary(".sys.querylog.enable", RAY_FN_RESTRICTED, ray_qlog_enable_fn);
@@ -4650,7 +4652,7 @@ static void ray_register_builtins(void) {
     register_unary (".idx.bloom",  RAY_FN_NONE, ray_idx_bloom_fn);
     register_unary (".idx.drop",   RAY_FN_NONE, ray_idx_drop_fn);
     register_unary (".idx.has?",   RAY_FN_NONE, ray_idx_has_fn);
-    register_unary (".idx.info",   RAY_FN_NONE, ray_idx_info_fn);
+    register_vary  (".idx.info",   RAY_FN_NONE, ray_idx_info_vary_fn);
 
     /* Semantic attributes (see src/ops/idxop.c: (.attr.*) family) */
     register_binary(".attr.set",   RAY_FN_NONE, ray_attr_set_fn);

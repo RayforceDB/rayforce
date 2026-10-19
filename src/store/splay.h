@@ -26,6 +26,7 @@
 
 #include <rayforce.h>
 #include "store/fileio.h"
+#include "store/col.h"
 
 struct ray_sym_domain_s;
 
@@ -45,14 +46,27 @@ typedef struct {
     char created[1024];     /* shallowest directory of root begin created */
     char dir[1024];
     char generation[256];
+    ray_compress_t mode;    /* the call's tri-state compress option */
+    char cur[1024];         /* destination's current generation dir, "" when none (under the lock) */
+    ray_err_t cur_err;      /* resolving cur failed: only an inheriting column fails on it */
+    uint8_t* gens;          /* resolved generation per column file (ray_alloc_raw), freed by finish */
+    int64_t ngens;
 } ray_splay_write_t;
 
 ray_err_t ray_splay_write_begin(const char* dir, ray_splay_write_t* write);
+/* begin with the call's compress option; the generations are resolved
+ * per file by ray_splay_write_table_ctx against write->cur. */
+ray_err_t ray_splay_write_begin_mode(const char* dir, ray_compress_t mode,
+                                     ray_splay_write_t* write);
 ray_err_t ray_splay_write_finish(ray_splay_write_t* write, ray_err_t result,
                                   bool durable);
 /* Write only to a fresh/unpublished directory owned by the caller. */
 ray_err_t ray_splay_write_table(ray_t* tbl, const char* dir,
                                  const char* sym_path, bool durable);
+/* Write into write->dir under the held lock, resolving each file's
+ * generation from write->mode and write->cur (kept in write->gens). */
+ray_err_t ray_splay_write_table_ctx(ray_t* tbl, ray_splay_write_t* write,
+                                     const char* sym_path, bool durable);
 /* The returned generation may be removed by the next publish: open every file
  * of a read right after resolving, and resolve again if one is missing (the
  * splayed loaders and ray_splay_has_schema do). */
@@ -72,6 +86,14 @@ ray_err_t ray_splay_save_bulk(ray_t* tbl, const char* dir, const char* sym_path)
 /* Private import directory only: caller holds the shared symbol domain alive
  * and flushes it before publishing the root. Bulk writes are not durable. */
 ray_err_t ray_splay_save_staged_bulk(ray_t* tbl, const char* dir, const char* sym_path);
+/* The same with the call's compress option (ray_compress_t); the forms
+ * above pass RAY_COMPRESS_ABSENT, so every caller inherits. */
+ray_err_t ray_splay_save_mode(ray_t* tbl, const char* dir, const char* sym_path,
+                              ray_compress_t mode);
+ray_err_t ray_splay_save_bulk_mode(ray_t* tbl, const char* dir, const char* sym_path,
+                                   ray_compress_t mode);
+ray_err_t ray_splay_save_staged_bulk_mode(ray_t* tbl, const char* dir, const char* sym_path,
+                                          ray_compress_t mode);
 ray_t*    ray_splay_load(const char* dir, const char* sym_path);
 ray_t*    ray_read_splayed(const char* dir, const char* sym_path);
 
@@ -80,10 +102,6 @@ ray_t*    ray_read_splayed(const char* dir, const char* sym_path);
  * `.db.splayed.set` only; the CSV and Parquet converters build their indexes
  * inline in the stream writer.  Best-effort, per numeric column. */
 void      ray_splay_build_indexes(const char* dir, ray_t* tbl);
-/* Append a hash index to the column file at path, using its kept chunk zone
- * Re-reads the column file, appends a hash, and falls back to appending
- * `zone` when no hash results. The caller keeps ownership of zone. Best effort. */
-ray_err_t ray_splay_hash_column(const char* path, ray_t* zone);
 
 /* Loader accepting a shared FILE domain. It resolves the generation first,
  * then refreshes the cached domain to include any externally appended symbols. */

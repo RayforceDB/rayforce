@@ -86,19 +86,14 @@ static inline int ray_str_t_cmp(const ray_str_t* a, const char* pool_a,
     return (a->len > b->len) - (a->len < b->len);
 }
 
-/* Hash a ray_str_t element.  Uses FNV-1a which is self-contained and fast for
- * the typical short-to-medium strings stored in ray_str_t.
- * pool_base: pool base pointer for pooled strings (NULL when inline-only). */
-static inline uint64_t ray_str_t_hash(const ray_str_t* s, const char* pool_base) {
-    if (s->len == 0) return 0x9E3779B97F4A7C15ULL; /* golden ratio constant for empty */
-    if (!ray_str_is_inline(s)) {
-        assert(pool_base != NULL && "ray_str_t_hash: pooled string requires non-NULL pool_base");
-    }
-    const char* p = ray_str_is_inline(s) ? s->data : pool_base + s->pool_off;
-    /* 8-byte-block multiply-mix hash: far fewer multiplies than per-byte
-     * hashing for medium/long keys (URLs, titles). */
+/* Hash the bytes [p, p + len) of a string: an 8-byte-block multiply-mix
+ * hash, far fewer multiplies than per-byte hashing for medium/long keys
+ * (URLs, titles); "" hashes to a constant (p unread).  The one string hash
+ * of ray_str_t_hash: a consumer hashing bytes it holds outside a ray_str_t
+ * (a STR_DICT entry) gets the same hash for the same string. */
+static inline uint64_t ray_str_bytes_hash(const char* p, uint32_t len) {
+    if (len == 0) return 0x9E3779B97F4A7C15ULL; /* golden ratio constant for empty */
     const uint64_t m = 0xc6a4a7935bd1e995ULL;
-    uint32_t len = s->len;
     uint64_t h = 0xe17a1465ULL ^ ((uint64_t)len * m);
     uint32_t i = 0;
     for (; i + 8 <= len; i += 8) {
@@ -116,6 +111,17 @@ static inline uint64_t ray_str_t_hash(const ray_str_t* s, const char* pool_base)
     }
     h ^= h >> 47; h *= m; h ^= h >> 47;
     return h;
+}
+
+/* Hash a ray_str_t element: ray_str_bytes_hash of its bytes.
+ * pool_base: pool base pointer for pooled strings (NULL when inline-only). */
+static inline uint64_t ray_str_t_hash(const ray_str_t* s, const char* pool_base) {
+    if (s->len == 0) return ray_str_bytes_hash(NULL, 0);
+    if (!ray_str_is_inline(s)) {
+        assert(pool_base != NULL && "ray_str_t_hash: pooled string requires non-NULL pool_base");
+    }
+    const char* p = ray_str_is_inline(s) ? s->data : pool_base + s->pool_off;
+    return ray_str_bytes_hash(p, s->len);
 }
 
 /* Pooled descriptors have four bytes that are not needed for addressing.

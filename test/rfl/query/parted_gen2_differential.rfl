@@ -1,0 +1,53 @@
+;; The same parted table saved as generation 0 and as generation 2 answers
+;; every query identically: grouped outputs (aggregate and not), pruned,
+;; partial and contradictory wheres, sorts, takes, and update by.  The
+;; partitions are uneven, one is tiny, and the columns carry nulls.
+(.sys.exec "rm -rf rf_test_pdiff0 rf_test_pdiff2") -- 0
+(set syms ['p 'q 'r 'u 'v 'w 'z 'a 'm])
+(set mk (fn [n o] (table [a b s f x i bo ts] (list (concat [0Nl] (- (% (* (+ o (til (- n 1))) 7919) 1000) 500)) (% (* (+ o (til n)) 31) 97) (at syms (% (* (+ o (til n)) 13) 9)) (concat (as 'F64 (% (* (+ o (til (- n 1))) 17) 101)) [0Nf]) (at (list "aa" "bb" "" "cc" "dddd") (% (+ o (til n)) 5)) (as 'I32 (% (+ o (til n)) 50)) (== 0 (% (+ o (til n)) 3)) (+ 2024.01.01D00:00:00.000000000 (* 1000000000 (+ o (til n))))))))
+(set days [2024.01.01 2024.01.02 2024.01.03 2024.01.04 2024.01.05 2024.01.06])
+(set ns [50 2000 3 70000 10 3])
+(set offs [0 50 2050 2053 72053 72063])
+(set wr (fn [root k c] (.db.splayed.set (format "%/%/t/" root (at days k)) (mk (at ns k) (at offs k)) (format "%/.sym" root) (if c {compress: true} {compress: false}))))
+(count (map (fn [k] (wr "rf_test_pdiff0" k false)) (til 6))) -- 6
+(count (map (fn [k] (wr "rf_test_pdiff2" k true)) (til 6))) -- 6
+(set P0 (.db.parted.get "rf_test_pdiff0/" 't))
+(set P2 (.db.parted.get "rf_test_pdiff2/" 't))
+;; an answer, or the error's text, in printed form
+(set ans (fn [q t] (format "%" (try (q t) (fn [e] (format "error %" e))))))
+(set same (fn [q] (== (ans q P0) (ans q P2))))
+(same (fn [t] (select {a: a by: s from: t asc: s}))) -- true
+(same (fn [t] (select {a: a by: s from: t where: (== date 2024.01.04) asc: s}))) -- true
+(same (fn [t] (select {a: a by: s from: t where: (> b 50) asc: s}))) -- true
+(same (fn [t] (select {a: a by: s from: t where: (> date 2024.01.02) asc: s}))) -- true
+(same (fn [t] (select {a: a by: s from: t where: (or (== date 2024.01.03) (> a 450)) asc: s}))) -- true
+(same (fn [t] (select {u: (- a (avg a)) by: s from: t asc: s}))) -- true
+(same (fn [t] (select {u: (- a (avg a)) by: bo from: t where: (> b 10) asc: bo}))) -- true
+(same (fn [t] (select {l: (last a) f: (first b) d: (deltas b) by: s from: t where: (> date 2024.01.03) asc: s}))) -- true
+(same (fn [t] (select {x: x by: s from: t where: (> b 90) asc: s}))) -- true
+(same (fn [t] (select {a: a by: s from: t where: (in s ['p 'q]) asc: s}))) -- true
+(same (fn [t] (select {c: (count a) top: (first a) by: s from: t where: (> b 90) asc: s}))) -- true
+(same (fn [t] (select {a: (+ a 1) by: s from: t where: (> b 90) asc: s}))) -- true
+(same (fn [t] (select {c: (count a) sm: (sum a) mx: (max f) mn: (min ts) by: s from: t asc: s}))) -- true
+(same (fn [t] (select {c: (count a) by: [s i] from: t where: (>= date 2024.01.04) asc: c take: 3}))) -- true
+(same (fn [t] (select {c: (count a) by: [s x] from: t where: (>= date 2024.01.04) take: 3}))) -- true
+(same (fn [t] (select {c: (count a) by: x from: t where: (in date [2024.01.03 2024.01.06]) asc: x}))) -- true
+(same (fn [t] (select {c: (count a) by: date from: t where: (< date 2024.01.03) desc: c}))) -- true
+(same (fn [t] (select {d: date c: (count a) by: date from: t where: (> date 2024.01.02)}))) -- true
+(same (fn [t] (select {f: (first s) l: (last x) by: date from: t where: (in date [2024.01.02 2024.01.05])}))) -- true
+(same (fn [t] (select {from: t where: (== date 0Nd)}))) -- true
+(same (fn [t] (select {c: (count a) from: t where: (in date (as 'DATE []))}))) -- true
+(same (fn [t] (select {from: t where: (not (== date 2024.01.02)) take: 3}))) -- true
+(same (fn [t] (select {a: a from: t where: (== date 2024.01.04) take: -3}))) -- true
+(same (fn [t] (select {from: t where: (and (== date 2024.01.02) (== date 2024.01.04))}))) -- true
+(same (fn [t] (select {c: (count a) by: s from: t where: (and (== date 2024.01.02) (== date 2024.01.04))}))) -- true
+(same (fn [t] (select {s: (sum a) m: (max ts) from: t where: (and (== date 2024.01.02) (== date 2024.01.04))}))) -- true
+(same (fn [t] (select {x: (count (distinct date)) from: t where: (> date 2024.01.02)}))) -- true
+(same (fn [t] (select {m: (min x) from: t where: (== date 2024.01.03)}))) -- true
+(same (fn [t] (select {z: (* 2 a) from: t where: (and (> date 2024.01.04) (null a))}))) -- true
+(same (fn [t] (select {from: t where: (== date 2024.01.03) asc: x}))) -- true
+(same (fn [t] (select {from: t where: (>= date 2024.01.05) desc: ts}))) -- true
+(same (fn [t] (count (select {from: t where: (!= date 2024.01.04)})))) -- true
+(same (fn [t] (select {c: (count a) s: (sum f) by: (% b 7) from: t where: (== date 2024.01.02) asc: b}))) -- true
+(same (fn [t] (count (update {m: (max a) from: t by: s})))) -- true
+(.sys.exec "rm -rf rf_test_pdiff0 rf_test_pdiff2") -- 0

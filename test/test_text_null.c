@@ -250,8 +250,8 @@ static test_result_t test_sym_expr_admission(void) {
             ray_op_t* cmp = ray_eq(g, ray_scan(g, "k"), ray_const_str(g, "beta", 4));
             ray_op_t* val = ray_isnull(g, ray_scan(g, "k"));
             ray_expr_t expr;
-            TEST_ASSERT_EQ_I(expr_compile(g, tbl, cmp, &expr), 1);
-            TEST_ASSERT_EQ_I(expr_compile(g, tbl, val, &expr), !nullable);
+            TEST_ASSERT_EQ_I(expr_compile(g, tbl, cmp, &expr, &(ray_t*){NULL}), 1);
+            TEST_ASSERT_EQ_I(expr_compile(g, tbl, val, &expr, &(ray_t*){NULL}), !nullable);
             ray_graph_free(g);
             ray_release(tbl);
         }

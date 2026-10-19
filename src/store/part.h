@@ -49,4 +49,14 @@ ray_t*    ray_parted_tables(const char* db_root);
  * nothing needed fixing), or an error. */
 ray_t*    ray_parted_fill(const char* db_root);
 
+/* `rows` cells of `type`'s null on the heap: the sentinel ray_vec_set_null
+ * writes, HAS_NULLS set; the non-nullable BOOL / U8 read 0; STR cells are
+ * the empty string, GUID cells zero; SYM cells are id 0, the empty symbol,
+ * at width W8 (id 0 fits it, and it is the width a ragged partition's
+ * stand-in is encoded at, so its decode is this vector), resolved over
+ * `dom` when given; LIST cells are the null object.  An owned vector, or an
+ * error (`oom`; `nyi` for a type without a null fill). */
+struct ray_sym_domain_s;
+ray_t*    ray_null_fill(int8_t type, int64_t rows, struct ray_sym_domain_s* dom);
+
 #endif /* RAY_PART_H */

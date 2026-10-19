@@ -12,10 +12,13 @@
 (set T-Gen (table [a b] (list [1 2 3] [10.0 20.0 30.0])))
 
 ;; ─── generation-0 (legacy/pre-stamp) data loads ───
+;; Both saves ask for generation 0 explicitly: the byte patched below is the
+;; generation-0 discriminator, which a generation-2 file (the equivalence
+;; pass's default) refuses as corrupt by design.
 ;; Force every column file + .d to order==0, mimicking data written before any
 ;; version byte existed.  This fails loudly if the generation is ever bumped
 ;; back off 0 (writer would stamp non-zero, reader would reject the forced 0s).
-(.db.splayed.set "/tmp/rfl_colgen_legacy/" T-Gen)
+(.db.splayed.set "/tmp/rfl_colgen_legacy/" T-Gen {compress: false})
 (.sys.exec "for f in /tmp/rfl_colgen_legacy/.d /tmp/rfl_colgen_legacy/a /tmp/rfl_colgen_legacy/b; do printf '\\000' | dd of=$f bs=1 seek=17 count=1 conv=notrunc 2>/dev/null; done") -- 0
 (count (.db.splayed.get "/tmp/rfl_colgen_legacy/")) -- 3
 (at (.db.splayed.get "/tmp/rfl_colgen_legacy/") 'a) -- (at T-Gen 'a)
@@ -24,6 +27,6 @@
 ;; ─── the version gate still rejects an unknown generation ───
 ;; Stamp the .d header's order byte to 0x07 and confirm the load is refused
 ;; (proves the check did not regress into accepting everything).
-(.db.splayed.set "/tmp/rfl_colgen_bad/" T-Gen)
+(.db.splayed.set "/tmp/rfl_colgen_bad/" T-Gen {compress: false})
 (.sys.exec "printf '\\007' | dd of=/tmp/rfl_colgen_bad/.d bs=1 seek=17 count=1 conv=notrunc 2>/dev/null") -- 0
 (.db.splayed.get "/tmp/rfl_colgen_bad/") !- version

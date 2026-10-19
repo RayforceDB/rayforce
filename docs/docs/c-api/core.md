@@ -3,6 +3,16 @@
 !!! note "Headers"
     Include `<rayforce.h>` for the bulk of the public API. A few internal helpers documented here live in their own headers — in particular `ray_cow` and the `ray_heap_init` / `ray_heap_destroy` lifecycle calls are declared in `"mem/heap.h"`, not in `<rayforce.h>`. The Makefile builds the static archive `librayforce.a`; it does not provide a shared-library target. On Linux, link the archive with `-Wl,--gc-sections -lm -lpthread` so the linker can discard unused function and data sections.
 
+## Floating-point environment for compressed columns
+
+Generation-2 compressed F32/F64 I/O requires **default floating-point controls** on every calling/executing thread: round-to-nearest (`FE_TONEAREST`), masked FP exceptions, and gradual underflow (FTZ and DAZ disabled). Embedders must maintain those controls during calls. Rayforce does not silently change or normalize them; sticky exception status flags need not be clear and arithmetic may set them. Detected unsupported controls produce `fpenv` (`RAY_ERR_FPENV` in C), not a corruption error. Restore supported controls before retrying the same mapped column; an environment failure is transient, not permanently cached.
+
+The refusal applies conservatively to compressed float writes and whole-column materialization, including decoded-cache hits and non-ALP encodings. ALP range decoding also checks the executing thread. It does not change the file format or require every non-ALP range read to reject nondefault controls.
+
+Detection is deliberately limited: standard rounding is checked, plus SSE rounding, FTZ/DAZ and exception masks on supported x86 SSE builds. This is **not a complete portable FP-environment validator**: x87 trap masks are not checked, and on other native architectures only standard rounding is checked. WebAssembly has fixed nearest rounding. Maintaining other required controls remains the embedder's responsibility; passing a check is not proof that every control is supported.
+
+Use `ray_table_col` / `ray_table_col_idx` to obtain an owned `RAY_ERROR` on a failed materialization (free it with `ray_error_free`). The older `ray_table_get_col` / `ray_table_get_col_idx` getters collapse decode errors to `NULL`. Successful plain columns returned by these getters are borrowed from the table. Enum-returning save APIs report `RAY_ERR_FPENV`; reconstructing it with `ray_error(ray_err_code_str(err), NULL)` supplies the default explanation.
+
 ## Lifecycle
 
 Every program must initialize the heap allocator and symbol table before using any other API. Destroy them in reverse order when done.

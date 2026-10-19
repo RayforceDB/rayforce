@@ -42,6 +42,7 @@
 #include "store/part.h"
 #include "ops/datalog.h"
 #include "ops/idxop.h"
+#include "store/enccol.h"
 #include <string.h>
 #include <stdlib.h>     /* getenv */
 #include <stdio.h>      /* snprintf */
@@ -948,6 +949,10 @@ RAY_INLINE void ray_release_owned_refs(ray_t* v) {
                 ray_graph_free(g);
                 RAY_LAZY_GRAPH(v) = NULL;
             }
+            if (v->attrs & RAY_LAZY_COLREF) {           /* a column reference holds its table */
+                ray_t** tp = (ray_t**)ray_data(v);
+                if (*tp) { ray_release(*tp); *tp = NULL; }
+            }
             return;
         }
         /* I64 atom tagged as an HNSW handle owns a ray_hnsw_t — free it
@@ -997,6 +1002,11 @@ RAY_INLINE void ray_release_owned_refs(ray_t* v) {
         ray_index_t* ix = ray_index_payload(v);
         ray_index_release_payload(ix);
         ray_index_release_saved(ix);
+        return;
+    }
+
+    if (v->type == RAY_ENCCOL) {
+        ray_enccol_payload_release(v);
         return;
     }
 
@@ -1056,7 +1066,7 @@ RAY_INLINE void ray_release_owned_refs(ray_t* v) {
     if (v->type == RAY_TABLE || v->type == RAY_DICT) {
         ray_t** slots = (ray_t**)ray_data(v);
         if (slots[0] && !RAY_IS_ERR(slots[0])) ray_release(slots[0]);
-        if (slots[1] && !RAY_IS_ERR(slots[1])) ray_release(slots[1]);
+        if (slots[1] && !RAY_IS_ERR(slots[1])) ray_release(slots[1]);   /* plain-table */
         return;
     }
 
@@ -1085,8 +1095,15 @@ bool ray_retain_owned_refs(ray_t* v) {
             if (LAMBDA_CAPROWS(v)) ray_retain(LAMBDA_CAPROWS(v));
             return true;
         }
-        /* Lazy handles own their graph uniquely — no retain on copy */
-        if (v->type == RAY_LAZY) return true;
+        /* Lazy handles own their graph uniquely — no retain on copy; a
+         * column reference shares its table */
+        if (v->type == RAY_LAZY) {
+            if (v->attrs & RAY_LAZY_COLREF) {
+                ray_t* t = *(ray_t**)ray_data(v);
+                if (t) ray_retain(t);
+            }
+            return true;
+        }
         /* HNSW handle owns its ray_hnsw_t uniquely.  Deep-clone the index
          * so the copy is an independent owner with the same semantics as
          * the source.  On clone-OOM, detach the copy (so caller can free
@@ -1141,6 +1158,11 @@ bool ray_retain_owned_refs(ray_t* v) {
         return true;
     }
 
+    if (v->type == RAY_ENCCOL) {
+        ray_enccol_payload_retain(v);
+        return true;
+    }
+
     if (v->attrs & RAY_ATTR_HAS_INDEX) {
         /* Mirror ray_release_owned_refs: a mmap-resident passenger index
          * (mmod==1) is owned by the column's mapping, not refcounted here,
@@ -1183,7 +1205,7 @@ bool ray_retain_owned_refs(ray_t* v) {
     if (v->type == RAY_TABLE || v->type == RAY_DICT) {
         ray_t** slots = (ray_t**)ray_data(v);
         if (slots[0] && !RAY_IS_ERR(slots[0])) ray_retain(slots[0]);
-        if (slots[1] && !RAY_IS_ERR(slots[1])) ray_retain(slots[1]);
+        if (slots[1] && !RAY_IS_ERR(slots[1])) ray_retain(slots[1]);   /* plain-table */
         return true;
     }
 
@@ -1214,6 +1236,7 @@ static void ray_detach_owned_refs(ray_t* v) {
         if (v->type == RAY_LAZY) {
             RAY_LAZY_GRAPH(v) = NULL;
             RAY_LAZY_OP(v)    = NULL;
+            if (v->attrs & RAY_LAZY_COLREF) *(ray_t**)ray_data(v) = NULL;
             return;
         }
         /* HNSW handle: ownership has been transferred elsewhere; stop the
@@ -1264,6 +1287,11 @@ static void ray_detach_owned_refs(ray_t* v) {
         return;
     }
 
+    if (v->type == RAY_ENCCOL) {
+        ray_enccol_payload_detach(v);
+        return;
+    }
+
     if (v->attrs & RAY_ATTR_HAS_INDEX) {
         v->index    = NULL;
         v->_idx_pad = NULL;
@@ -1302,7 +1330,7 @@ static void ray_detach_owned_refs(ray_t* v) {
     if (v->type == RAY_TABLE || v->type == RAY_DICT) {
         ray_t** slots = (ray_t**)ray_data(v);
         slots[0] = NULL;
-        slots[1] = NULL;
+        slots[1] = NULL;   /* plain-table */
         v->len = 0;
         return;
     }
@@ -2213,6 +2241,8 @@ ray_t* ray_alloc_copy(ray_t* v) {
         if (v->type == RAY_MAPCOMMON) n_ptrs = 2;
         if (n_ptrs < 0) return ray_error("oom", NULL);
         data_size = (size_t)n_ptrs * sizeof(ray_t*);
+    } else if (v->type == RAY_ENCCOL) {
+        data_size = sizeof(void*);          /* the payload pointer; payload is refcounted */
     } else if (v->type == RAY_LIST) {
         /* RAY_LIST has type==0, which the generic branch below (t <= 0)
          * would route to data_size=0, silently producing a header-only copy
@@ -3902,6 +3932,7 @@ size_t ray_shallow_bytes(const ray_t* v) {
     }
     if (v->attrs & RAY_ATTR_SLICE) return n;
     if (v->type == RAY_INDEX) return index_own_bytes(v);
+    if (v->type == RAY_ENCCOL) return block_own_bytes(v) + ray_enccol_own_bytes((ray_t*)v);
     if (v->attrs & RAY_ATTR_HAS_INDEX) n += index_own_bytes(v->index);
     if (v->type == RAY_STR && v->str_pool && !RAY_IS_ERR(v->str_pool))
         n += block_own_bytes(v->str_pool);
@@ -3967,6 +3998,12 @@ static size_t retained_walk(const ray_t* v, ptrset_t* seen) {
         for (int i = 0; i < k; i++) n += retained_walk(kids[i], seen);
         return n;
     }
+    if (v->type == RAY_ENCCOL) {
+        ray_t* kids[2];
+        int nk = ray_enccol_children((ray_t*)v, kids);
+        for (int i = 0; i < nk; i++) n += retained_walk(kids[i], seen);
+        return n;
+    }
     if ((v->attrs & RAY_ATTR_HAS_INDEX) && v->index && !RAY_IS_ERR(v->index) &&
         v->index->mmod != 1)
         n += retained_walk(v->index, seen);
@@ -3983,7 +4020,7 @@ static size_t retained_walk(const ray_t* v, ptrset_t* seen) {
     if (v->type == RAY_MAPCOMMON || v->type == RAY_TABLE || v->type == RAY_DICT) {
         ray_t** slots = (ray_t**)ray_data((ray_t*)v);
         n += retained_walk(slots[0], seen);
-        n += retained_walk(slots[1], seen);
+        n += retained_walk(slots[1], seen);   /* plain-table */
     }
     return n;
 }

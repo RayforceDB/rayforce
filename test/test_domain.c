@@ -292,7 +292,7 @@ static test_result_t test_domain_serde_roundtrip(void) {
 
 static test_result_t test_domain_col_save_load_mmap(void) {
     ray_sym_domain_t* rt = ray_sym_runtime_domain();
-    unlink(TMP_DOM_COL_PATH);
+    unlink(ray_test_tmp(TMP_DOM_COL_PATH));
 
     int64_t ida = ray_sym_intern("col_a", 5);
     int64_t idb = ray_sym_intern("col_b", 5);
@@ -306,12 +306,12 @@ static test_result_t test_domain_col_save_load_mmap(void) {
      * verbatim — the on-disk header must still be pointer-free. */
     v->attrs |= RAY_ATTR_HAS_NULLS;
 
-    TEST_ASSERT_EQ_I(ray_col_save(v, TMP_DOM_COL_PATH), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save(v, ray_test_tmp(TMP_DOM_COL_PATH)), RAY_OK);
 
     /* Domain pointer never serialized: scan the file bytes. */
     {
         ray_sym_domain_t* dom = v->sym_domain;
-        FILE* f = fopen(TMP_DOM_COL_PATH, "rb");
+        FILE* f = fopen(ray_test_tmp(TMP_DOM_COL_PATH), "rb");
         TEST_ASSERT_NOT_NULL(f);
         uint8_t buf[4096];
         size_t n = fread(buf, 1, sizeof(buf), f);
@@ -324,13 +324,13 @@ static test_result_t test_domain_col_save_load_mmap(void) {
         TEST_ASSERT_FALSE(found);
     }
 
-    ray_t* loaded = ray_col_load(TMP_DOM_COL_PATH);
+    ray_t* loaded = ray_col_load(ray_test_tmp(TMP_DOM_COL_PATH));
     TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
     TEST_ASSERT_EQ_I(loaded->type, RAY_SYM);
     TEST_ASSERT_EQ_PTR(loaded->sym_domain, rt);
     ray_release(loaded);
 
-    ray_t* mapped = ray_col_mmap(TMP_DOM_COL_PATH);
+    ray_t* mapped = ray_col_mmap(ray_test_tmp(TMP_DOM_COL_PATH));
     TEST_ASSERT_FALSE(RAY_IS_ERR(mapped));
     TEST_ASSERT_EQ_I(mapped->type, RAY_SYM);
     TEST_ASSERT_EQ_PTR(mapped->sym_domain, rt);
@@ -338,22 +338,22 @@ static test_result_t test_domain_col_save_load_mmap(void) {
     ray_release(mapped);
 
     ray_release(v);
-    unlink(TMP_DOM_COL_PATH);
+    unlink(ray_test_tmp(TMP_DOM_COL_PATH));
     PASS();
 }
 
 /* ---- FILE domains over a real symfile ----------------------------------- */
 
 static test_result_t test_domain_open_basic(void) {
-    unlink(TMP_DOM_SYM_PATH);
-    unlink(TMP_DOM_SYM_PATH ".lk");
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH));
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH ".lk"));
 
     int64_t id_h = ray_sym_intern("file_hello", 10);
     int64_t id_w = ray_sym_intern("file_world", 10);
     uint32_t count_at_save = ray_sym_count();
-    TEST_ASSERT_EQ_I(ray_sym_save(TMP_DOM_SYM_PATH), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_sym_save(ray_test_tmp(TMP_DOM_SYM_PATH)), RAY_OK);
 
-    ray_sym_domain_t* dom = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    ray_sym_domain_t* dom = ray_sym_domain_open(ray_test_tmp(TMP_DOM_SYM_PATH));
     TEST_ASSERT_NOT_NULL(dom);
     TEST_ASSERT(dom != ray_sym_runtime_domain(), "FILE domain is not the singleton");
 
@@ -404,14 +404,14 @@ static test_result_t test_domain_open_basic(void) {
     TEST_ASSERT_EQ_I(ray_sym_domain_flush(dom, true), RAY_OK);
     TEST_ASSERT_EQ_I(ray_sym_domain_flush(dom, true), RAY_OK); /* idempotent */
     ray_sym_domain_release(dom);
-    ray_sym_domain_t* re = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    ray_sym_domain_t* re = ray_sym_domain_open(ray_test_tmp(TMP_DOM_SYM_PATH));
     TEST_ASSERT_NOT_NULL(re);
     TEST_ASSERT_EQ_I(ray_sym_domain_count(re), (int64_t)count_at_save + 1);
     TEST_ASSERT_EQ_I(ray_sym_domain_find(re, "file_new", 8), new_pos);
     ray_sym_domain_release(re);
 
-    unlink(TMP_DOM_SYM_PATH);
-    unlink(TMP_DOM_SYM_PATH ".lk");
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH));
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH ".lk"));
     PASS();
 }
 
@@ -422,11 +422,11 @@ static test_result_t test_domain_open_basic(void) {
  * new distinct strings, a second identical batch changes nothing and ""
  * is position 0. */
 static test_result_t test_domain_intern_batch(void) {
-    unlink(TMP_DOM_SYM_PATH);
-    unlink(TMP_DOM_SYM_PATH ".lk");
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH));
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH ".lk"));
     TEST_ASSERT_NOT_NULL(ray_pool_get());   /* parallel probe path */
 
-    ray_sym_domain_t* dom = ray_sym_domain_open_or_create(TMP_DOM_SYM_PATH);
+    ray_sym_domain_t* dom = ray_sym_domain_open_or_create(ray_test_tmp(TMP_DOM_SYM_PATH));
     TEST_ASSERT_NOT_NULL(dom);
 
     enum { NV = 20000, NB = 60000, SL = 16 };
@@ -502,7 +502,7 @@ static test_result_t test_domain_intern_batch(void) {
     /* the flushed file reopens with the same vocabulary */
     TEST_ASSERT_EQ_I(ray_sym_domain_flush(dom, false), RAY_OK);
     ray_sym_domain_release(dom);
-    ray_sym_domain_t* re = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    ray_sym_domain_t* re = ray_sym_domain_open(ray_test_tmp(TMP_DOM_SYM_PATH));
     TEST_ASSERT_NOT_NULL(re);
     TEST_ASSERT_EQ_I(ray_sym_domain_count(re), NV + 2);
     for (int j = 0; j < NB; j += 997)
@@ -512,8 +512,8 @@ static test_result_t test_domain_intern_batch(void) {
     ray_sys_free(vocab); ray_sys_free(pre); ray_sys_free(seen);
     ray_sys_free(strs); ray_sys_free(lens); ray_sys_free(hashes);
     ray_sys_free(pos); ray_sys_free(pos2);
-    unlink(TMP_DOM_SYM_PATH);
-    unlink(TMP_DOM_SYM_PATH ".lk");
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH));
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH ".lk"));
     PASS();
 }
 
@@ -622,9 +622,9 @@ static void domain_concurrent_batch_task(void* raw, uint32_t wid, int64_t start,
  * Check all returned positions and the persisted domain, including a second
  * all-hit pass after the concurrent growth. */
 static test_result_t test_domain_intern_batch_concurrent(void) {
-    unlink(TMP_DOM_SYM_PATH); unlink(TMP_DOM_SYM_PATH ".lk");
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH)); unlink(ray_test_tmp(TMP_DOM_SYM_PATH ".lk"));
     domain_concurrent_batch_t ctx = {0};
-    ctx.domain = ray_sym_domain_open_or_create(TMP_DOM_SYM_PATH);
+    ctx.domain = ray_sym_domain_open_or_create(ray_test_tmp(TMP_DOM_SYM_PATH));
     ctx.vocabulary = ray_sys_alloc(DOM_CONCURRENT_VOCAB*DOM_CONCURRENT_STRING);
     ctx.positions = ray_sys_alloc(DOM_CONCURRENT_TASKS*DOM_CONCURRENT_BATCH*sizeof(int64_t));
     TEST_ASSERT_NOT_NULL(ctx.domain); TEST_ASSERT_NOT_NULL(ctx.vocabulary); TEST_ASSERT_NOT_NULL(ctx.positions);
@@ -650,12 +650,12 @@ static test_result_t test_domain_intern_batch_concurrent(void) {
         }
         TEST_ASSERT_EQ_I(ray_sym_domain_flush(ctx.domain, false), RAY_OK);
         ray_sym_domain_release(ctx.domain);
-        ctx.domain = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+        ctx.domain = ray_sym_domain_open(ray_test_tmp(TMP_DOM_SYM_PATH));
         TEST_ASSERT_NOT_NULL(ctx.domain);
     }
     ray_sym_domain_release(ctx.domain);
     ray_sys_free(ctx.vocabulary); ray_sys_free(ctx.positions);
-    unlink(TMP_DOM_SYM_PATH); unlink(TMP_DOM_SYM_PATH ".lk");
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH)); unlink(ray_test_tmp(TMP_DOM_SYM_PATH ".lk"));
     PASS();
 }
 
@@ -663,13 +663,13 @@ static test_result_t test_domain_intern_batch_concurrent(void) {
  * domain; "" is seeded at position 0 by the first intern; flush creates
  * the file; verify-base-unchanged makes a racing writer LOUD. */
 static test_result_t test_domain_create_flush_concurrent(void) {
-    unlink(TMP_DOM_SYM_PATH);
-    unlink(TMP_DOM_SYM_PATH ".lk");
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH));
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH ".lk"));
 
     /* plain open of a missing file still fails */
-    TEST_ASSERT_NULL(ray_sym_domain_open(TMP_DOM_SYM_PATH));
+    TEST_ASSERT_NULL(ray_sym_domain_open(ray_test_tmp(TMP_DOM_SYM_PATH)));
 
-    ray_sym_domain_t* dom = ray_sym_domain_open_or_create(TMP_DOM_SYM_PATH);
+    ray_sym_domain_t* dom = ray_sym_domain_open_or_create(ray_test_tmp(TMP_DOM_SYM_PATH));
     TEST_ASSERT_NOT_NULL(dom);
     TEST_ASSERT_EQ_I(ray_sym_domain_count(dom), 0);
 
@@ -684,7 +684,7 @@ static test_result_t test_domain_create_flush_concurrent(void) {
     /* flush creates the file with "" first */
     TEST_ASSERT_EQ_I(ray_sym_domain_flush(dom, false), RAY_OK);
     {
-        FILE* f = fopen(TMP_DOM_SYM_PATH, "rb");
+        FILE* f = fopen(ray_test_tmp(TMP_DOM_SYM_PATH), "rb");
         TEST_ASSERT_NOT_NULL(f);
         uint32_t magic = 0, len0 = 1;
         int64_t cnt = -1;
@@ -701,7 +701,7 @@ static test_result_t test_domain_create_flush_concurrent(void) {
      * under us; the next flush of OUR dirty tail must fail loudly. */
     TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom, "cre_b", 5), 2);
     {
-        FILE* f = fopen(TMP_DOM_SYM_PATH, "wb");
+        FILE* f = fopen(ray_test_tmp(TMP_DOM_SYM_PATH), "wb");
         TEST_ASSERT_NOT_NULL(f);
         uint32_t magic = 0x4C525453u;
         int64_t cnt = 1;
@@ -714,9 +714,9 @@ static test_result_t test_domain_create_flush_concurrent(void) {
     TEST_ASSERT_EQ_I(ray_sym_domain_flush(dom, false), RAY_ERR_CORRUPT);
 
     ray_sym_domain_release(dom);
-    unlink(TMP_DOM_SYM_PATH);
-    unlink(TMP_DOM_SYM_PATH ".lk");
-    unlink(TMP_DOM_SYM_PATH ".tmp");
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH));
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH ".lk"));
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH ".tmp"));
     PASS();
 }
 
@@ -739,15 +739,15 @@ static test_result_t test_domain_create_flush_concurrent(void) {
  * reopen stays clean and the drop hook keeps the cache coherent. */
 #define TMP_DOM_RECYCLE_PATH "/tmp/rayforce_test_domain_recycle_sym"
 static test_result_t test_domain_survives_heap_recycle(void) {
-    unlink(TMP_DOM_RECYCLE_PATH);
-    unlink(TMP_DOM_RECYCLE_PATH ".lk");
+    unlink(ray_test_tmp(TMP_DOM_RECYCLE_PATH));
+    unlink(ray_test_tmp(TMP_DOM_RECYCLE_PATH ".lk"));
 
     /* --- heap A: open a domain with a SMALL vocabulary --- */
     ray_heap_init();
     (void)ray_sym_init();
     (void)ray_sym_intern("recyc_a", 7);
-    TEST_ASSERT_EQ_I(ray_sym_save(TMP_DOM_RECYCLE_PATH), RAY_OK);
-    ray_sym_domain_t* d1 = ray_sym_domain_open(TMP_DOM_RECYCLE_PATH);
+    TEST_ASSERT_EQ_I(ray_sym_save(ray_test_tmp(TMP_DOM_RECYCLE_PATH)), RAY_OK);
+    ray_sym_domain_t* d1 = ray_sym_domain_open(ray_test_tmp(TMP_DOM_RECYCLE_PATH));
     TEST_ASSERT_NOT_NULL(d1);          /* atoms now live on heap A */
     /* Deliberately DO NOT release d1 — it stays in the global cache,
      * exactly the leak that exposed the dangling bug. */
@@ -765,35 +765,35 @@ static test_result_t test_domain_survives_heap_recycle(void) {
     }
     (void)ray_sym_intern("recyc_a", 7);
     (void)ray_sym_intern("recyc_b", 7);     /* different vocabulary/size */
-    TEST_ASSERT_EQ_I(ray_sym_save(TMP_DOM_RECYCLE_PATH), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_sym_save(ray_test_tmp(TMP_DOM_RECYCLE_PATH)), RAY_OK);
     /* Re-open the SAME path.  Pre-fix: cache hit on the stale d1; the
      * size differs so dom_extend dereferences d1's atoms (freed, now
      * overwritten by the churn above) → SEGV or garbage.  Post-fix: the
      * stale entry is gone, so this builds a fresh domain. */
-    ray_sym_domain_t* d2 = ray_sym_domain_open(TMP_DOM_RECYCLE_PATH);
+    ray_sym_domain_t* d2 = ray_sym_domain_open(ray_test_tmp(TMP_DOM_RECYCLE_PATH));
     TEST_ASSERT_NOT_NULL(d2);
     ray_t* s0 = ray_sym_domain_str(d2, 0);  /* touch the atoms */
     TEST_ASSERT_NOT_NULL(s0);
     TEST_ASSERT_EQ_U(ray_str_len(s0), 0);   /* position 0 is "" */
     ray_sym_domain_release(d2);
 
-    unlink(TMP_DOM_RECYCLE_PATH);
-    unlink(TMP_DOM_RECYCLE_PATH ".lk");
+    unlink(ray_test_tmp(TMP_DOM_RECYCLE_PATH));
+    unlink(ray_test_tmp(TMP_DOM_RECYCLE_PATH ".lk"));
     ray_sym_destroy();
     ray_heap_destroy();
     PASS();
 }
 
 static test_result_t test_domain_open_identity_and_release(void) {
-    unlink(TMP_DOM_SYM_PATH);
-    unlink(TMP_DOM_SYM_PATH ".lk");
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH));
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH ".lk"));
 
     (void)ray_sym_intern("ident_x", 7);
-    TEST_ASSERT_EQ_I(ray_sym_save(TMP_DOM_SYM_PATH), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_sym_save(ray_test_tmp(TMP_DOM_SYM_PATH)), RAY_OK);
 
     /* Same resolved path => same object (pointer equality = identity). */
-    ray_sym_domain_t* d1 = ray_sym_domain_open(TMP_DOM_SYM_PATH);
-    ray_sym_domain_t* d2 = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    ray_sym_domain_t* d1 = ray_sym_domain_open(ray_test_tmp(TMP_DOM_SYM_PATH));
+    ray_sym_domain_t* d2 = ray_sym_domain_open(ray_test_tmp(TMP_DOM_SYM_PATH));
     TEST_ASSERT_NOT_NULL(d1);
     TEST_ASSERT_EQ_PTR(d1, d2);
 
@@ -806,17 +806,17 @@ static test_result_t test_domain_open_identity_and_release(void) {
 
     /* Last release dropped the cache entry: a fresh open must build a
      * fresh, fully functional mapping (and not crash under ASan). */
-    ray_sym_domain_t* d3 = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    ray_sym_domain_t* d3 = ray_sym_domain_open(ray_test_tmp(TMP_DOM_SYM_PATH));
     TEST_ASSERT_NOT_NULL(d3);
     TEST_ASSERT_EQ_I(ray_sym_domain_find(d3, "ident_x", 7),
                      ray_sym_find("ident_x", 7));
     ray_sym_domain_release(d3);
 
     /* Missing file -> NULL, no crash. */
-    TEST_ASSERT_NULL(ray_sym_domain_open("/tmp/rayforce_test_domain_nonexistent"));
+    TEST_ASSERT_NULL(ray_sym_domain_open(ray_test_tmp("/tmp/rayforce_test_domain_nonexistent")));
 
-    unlink(TMP_DOM_SYM_PATH);
-    unlink(TMP_DOM_SYM_PATH ".lk");
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH));
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH ".lk"));
     PASS();
 }
 
@@ -887,14 +887,14 @@ static test_result_t test_domain_vec_lookup_hit_miss(void) {
 /* adopt_domain: ref balance with a real FILE domain (ASan is the leak
  * oracle), plus cell/lookup resolution through the adopted domain. */
 static test_result_t test_domain_adopt_domain_refcount(void) {
-    unlink(TMP_DOM_SYM_PATH);
-    unlink(TMP_DOM_SYM_PATH ".lk");
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH));
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH ".lk"));
 
     (void)ray_sym_intern("adopt_x", 7);
     (void)ray_sym_intern("adopt_y", 7);
-    TEST_ASSERT_EQ_I(ray_sym_save(TMP_DOM_SYM_PATH), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_sym_save(ray_test_tmp(TMP_DOM_SYM_PATH)), RAY_OK);
 
-    ray_sym_domain_t* dom = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    ray_sym_domain_t* dom = ray_sym_domain_open(ray_test_tmp(TMP_DOM_SYM_PATH));
     TEST_ASSERT_NOT_NULL(dom);
 
     int64_t pos_x = ray_sym_domain_find(dom, "adopt_x", 7);
@@ -958,13 +958,13 @@ static test_result_t test_domain_adopt_domain_refcount(void) {
 
     /* Balance proof: the cache entry must be gone; a fresh open builds a
      * fully functional mapping (ASan flags any leak/double-free). */
-    ray_sym_domain_t* d2 = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    ray_sym_domain_t* d2 = ray_sym_domain_open(ray_test_tmp(TMP_DOM_SYM_PATH));
     TEST_ASSERT_NOT_NULL(d2);
     TEST_ASSERT_EQ_I(ray_sym_domain_find(d2, "adopt_x", 7), pos_x);
     ray_sym_domain_release(d2);
 
-    unlink(TMP_DOM_SYM_PATH);
-    unlink(TMP_DOM_SYM_PATH ".lk");
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH));
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH ".lk"));
     PASS();
 }
 
@@ -981,16 +981,16 @@ static void domain_rt_teardown(void) { ray_runtime_destroy(pvt_rt); }
  * attaches the runtime singleton, and only the adopt call at the pivot
  * scatter site transfers the FILE-domain pointer. */
 static test_result_t test_domain_pivot_index_adopts(void) {
-    unlink(TMP_DOM_SYM_PATH);
-    unlink(TMP_DOM_SYM_PATH ".lk");
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH));
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH ".lk"));
 
     int64_t id_A = ray_sym_intern("pd_A", 4);
     int64_t id_B = ray_sym_intern("pd_B", 4);
     int64_t id_x = ray_sym_intern("pd_x", 4);
     int64_t id_y = ray_sym_intern("pd_y", 4);
-    TEST_ASSERT_EQ_I(ray_sym_save(TMP_DOM_SYM_PATH), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_sym_save(ray_test_tmp(TMP_DOM_SYM_PATH)), RAY_OK);
 
-    ray_sym_domain_t* dom = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    ray_sym_domain_t* dom = ray_sym_domain_open(ray_test_tmp(TMP_DOM_SYM_PATH));
     TEST_ASSERT_NOT_NULL(dom);
 
     /* Index col 'a': manually attached to the FILE domain (positions
@@ -1055,12 +1055,12 @@ static test_result_t test_domain_pivot_index_adopts(void) {
     ray_release(t);
     ray_sym_domain_release(dom);
 
-    ray_sym_domain_t* d2 = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    ray_sym_domain_t* d2 = ray_sym_domain_open(ray_test_tmp(TMP_DOM_SYM_PATH));
     TEST_ASSERT_NOT_NULL(d2);
     ray_sym_domain_release(d2);
 
-    unlink(TMP_DOM_SYM_PATH);
-    unlink(TMP_DOM_SYM_PATH ".lk");
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH));
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH ".lk"));
     PASS();
 }
 
@@ -1080,12 +1080,12 @@ static test_result_t test_domain_pivot_index_adopts(void) {
  * of dq_a/dq_b.  Returns false if the fixture could not be built. */
 static int build_divergent_qsym_fixture(ray_sym_domain_t** out_dom,
                                         int64_t* pos_a, int64_t* pos_b) {
-    unlink(TMP_DOM_QSYM_PATH);
-    unlink(TMP_DOM_QSYM_PATH ".lk");
+    unlink(ray_test_tmp(TMP_DOM_QSYM_PATH));
+    unlink(ray_test_tmp(TMP_DOM_QSYM_PATH ".lk"));
 
     (void)ray_sym_intern("dq_a", 4);
     (void)ray_sym_intern("dq_b", 4);
-    if (ray_sym_save(TMP_DOM_QSYM_PATH) != RAY_OK) return 0;
+    if (ray_sym_save(ray_test_tmp(TMP_DOM_QSYM_PATH)) != RAY_OK) return 0;
 
     /* Restart: fresh global table, REVERSED intern order. */
     ray_runtime_destroy(pvt_rt);
@@ -1094,7 +1094,7 @@ static int build_divergent_qsym_fixture(ray_sym_domain_t** out_dom,
     (void)ray_sym_intern("dq_b", 4);
     (void)ray_sym_intern("dq_a", 4);
 
-    ray_sym_domain_t* dom = ray_sym_domain_open(TMP_DOM_QSYM_PATH);
+    ray_sym_domain_t* dom = ray_sym_domain_open(ray_test_tmp(TMP_DOM_QSYM_PATH));
     if (!dom) return 0;
     *pos_a = ray_sym_domain_find(dom, "dq_a", 4);
     *pos_b = ray_sym_domain_find(dom, "dq_b", 4);
@@ -1181,12 +1181,12 @@ static test_result_t test_domain_query_upsert_key_lookup(void) {
     ray_sym_domain_release(dom);
 
     /* ref balance: the cache entry must be gone (fresh open rebuilds) */
-    ray_sym_domain_t* d2 = ray_sym_domain_open(TMP_DOM_QSYM_PATH);
+    ray_sym_domain_t* d2 = ray_sym_domain_open(ray_test_tmp(TMP_DOM_QSYM_PATH));
     TEST_ASSERT_NOT_NULL(d2);
     ray_sym_domain_release(d2);
 
-    unlink(TMP_DOM_QSYM_PATH);
-    unlink(TMP_DOM_QSYM_PATH ".lk");
+    unlink(ray_test_tmp(TMP_DOM_QSYM_PATH));
+    unlink(ray_test_tmp(TMP_DOM_QSYM_PATH ".lk"));
     PASS();
 }
 
@@ -1224,12 +1224,12 @@ static test_result_t test_domain_query_insert_cell_reexpress(void) {
     ray_release(t);
     ray_sym_domain_release(dom);
 
-    ray_sym_domain_t* d2 = ray_sym_domain_open(TMP_DOM_QSYM_PATH);
+    ray_sym_domain_t* d2 = ray_sym_domain_open(ray_test_tmp(TMP_DOM_QSYM_PATH));
     TEST_ASSERT_NOT_NULL(d2);
     ray_sym_domain_release(d2);
 
-    unlink(TMP_DOM_QSYM_PATH);
-    unlink(TMP_DOM_QSYM_PATH ".lk");
+    unlink(ray_test_tmp(TMP_DOM_QSYM_PATH));
+    unlink(ray_test_tmp(TMP_DOM_QSYM_PATH ".lk"));
     PASS();
 }
 
@@ -1310,12 +1310,12 @@ static test_result_t test_domain_gather_adopts_domain(void) {
     ray_sym_domain_release(dom);
 
     /* ref balance: the cache entry must be gone (fresh open rebuilds) */
-    ray_sym_domain_t* d2 = ray_sym_domain_open(TMP_DOM_QSYM_PATH);
+    ray_sym_domain_t* d2 = ray_sym_domain_open(ray_test_tmp(TMP_DOM_QSYM_PATH));
     TEST_ASSERT_NOT_NULL(d2);
     ray_sym_domain_release(d2);
 
-    unlink(TMP_DOM_QSYM_PATH);
-    unlink(TMP_DOM_QSYM_PATH ".lk");
+    unlink(ray_test_tmp(TMP_DOM_QSYM_PATH));
+    unlink(ray_test_tmp(TMP_DOM_QSYM_PATH ".lk"));
     PASS();
 }
 
@@ -1432,12 +1432,12 @@ static test_result_t test_domain_group_by_adopts_domain(void) {
     ray_sym_domain_release(dom);
 
     /* ref balance: the cache entry must be gone (fresh open rebuilds) */
-    ray_sym_domain_t* d2 = ray_sym_domain_open(TMP_DOM_QSYM_PATH);
+    ray_sym_domain_t* d2 = ray_sym_domain_open(ray_test_tmp(TMP_DOM_QSYM_PATH));
     TEST_ASSERT_NOT_NULL(d2);
     ray_sym_domain_release(d2);
 
-    unlink(TMP_DOM_QSYM_PATH);
-    unlink(TMP_DOM_QSYM_PATH ".lk");
+    unlink(ray_test_tmp(TMP_DOM_QSYM_PATH));
+    unlink(ray_test_tmp(TMP_DOM_QSYM_PATH ".lk"));
     PASS();
 }
 
@@ -1523,12 +1523,12 @@ static test_result_t test_domain_r7_eq_fast_path(void) {
     ray_sym_domain_release(dom);
 
     /* ref balance: the cache entry must be gone (fresh open rebuilds) */
-    ray_sym_domain_t* d2 = ray_sym_domain_open(TMP_DOM_QSYM_PATH);
+    ray_sym_domain_t* d2 = ray_sym_domain_open(ray_test_tmp(TMP_DOM_QSYM_PATH));
     TEST_ASSERT_NOT_NULL(d2);
     ray_sym_domain_release(d2);
 
-    unlink(TMP_DOM_QSYM_PATH);
-    unlink(TMP_DOM_QSYM_PATH ".lk");
+    unlink(ray_test_tmp(TMP_DOM_QSYM_PATH));
+    unlink(ray_test_tmp(TMP_DOM_QSYM_PATH ".lk"));
     PASS();
 }
 
@@ -1588,12 +1588,12 @@ static test_result_t test_domain_sort_and_upper_resolve_domain(void) {
     ray_release(t);
     ray_sym_domain_release(dom);
 
-    ray_sym_domain_t* d2 = ray_sym_domain_open(TMP_DOM_QSYM_PATH);
+    ray_sym_domain_t* d2 = ray_sym_domain_open(ray_test_tmp(TMP_DOM_QSYM_PATH));
     TEST_ASSERT_NOT_NULL(d2);
     ray_sym_domain_release(d2);
 
-    unlink(TMP_DOM_QSYM_PATH);
-    unlink(TMP_DOM_QSYM_PATH ".lk");
+    unlink(ray_test_tmp(TMP_DOM_QSYM_PATH));
+    unlink(ray_test_tmp(TMP_DOM_QSYM_PATH ".lk"));
     PASS();
 }
 
@@ -1645,12 +1645,12 @@ static test_result_t test_domain_serde_sym_file_domain(void) {
     ray_release(t);
     ray_sym_domain_release(dom);
 
-    ray_sym_domain_t* d2 = ray_sym_domain_open(TMP_DOM_QSYM_PATH);
+    ray_sym_domain_t* d2 = ray_sym_domain_open(ray_test_tmp(TMP_DOM_QSYM_PATH));
     TEST_ASSERT_NOT_NULL(d2);
     ray_sym_domain_release(d2);
 
-    unlink(TMP_DOM_QSYM_PATH);
-    unlink(TMP_DOM_QSYM_PATH ".lk");
+    unlink(ray_test_tmp(TMP_DOM_QSYM_PATH));
+    unlink(ray_test_tmp(TMP_DOM_QSYM_PATH ".lk"));
     PASS();
 }
 
@@ -1715,12 +1715,12 @@ static test_result_t test_domain_join_across_domains(void) {
     ray_release(lt);
     ray_sym_domain_release(dom);
 
-    ray_sym_domain_t* d2 = ray_sym_domain_open(TMP_DOM_QSYM_PATH);
+    ray_sym_domain_t* d2 = ray_sym_domain_open(ray_test_tmp(TMP_DOM_QSYM_PATH));
     TEST_ASSERT_NOT_NULL(d2);
     ray_sym_domain_release(d2);
 
-    unlink(TMP_DOM_QSYM_PATH);
-    unlink(TMP_DOM_QSYM_PATH ".lk");
+    unlink(ray_test_tmp(TMP_DOM_QSYM_PATH));
+    unlink(ray_test_tmp(TMP_DOM_QSYM_PATH ".lk"));
     PASS();
 }
 
@@ -1782,12 +1782,12 @@ static test_result_t test_domain_asof_join_across_domains(void) {
     ray_release(lt);
     ray_sym_domain_release(dom);
 
-    ray_sym_domain_t* d2 = ray_sym_domain_open(TMP_DOM_QSYM_PATH);
+    ray_sym_domain_t* d2 = ray_sym_domain_open(ray_test_tmp(TMP_DOM_QSYM_PATH));
     TEST_ASSERT_NOT_NULL(d2);
     ray_sym_domain_release(d2);
 
-    unlink(TMP_DOM_QSYM_PATH);
-    unlink(TMP_DOM_QSYM_PATH ".lk");
+    unlink(ray_test_tmp(TMP_DOM_QSYM_PATH));
+    unlink(ray_test_tmp(TMP_DOM_QSYM_PATH ".lk"));
     PASS();
 }
 
@@ -1887,12 +1887,12 @@ static test_result_t test_domain_parted_flatten_adopts(void) {
     ray_release(t);
     ray_sym_domain_release(dom);
 
-    ray_sym_domain_t* d2 = ray_sym_domain_open(TMP_DOM_QSYM_PATH);
+    ray_sym_domain_t* d2 = ray_sym_domain_open(ray_test_tmp(TMP_DOM_QSYM_PATH));
     TEST_ASSERT_NOT_NULL(d2);
     ray_sym_domain_release(d2);
 
-    unlink(TMP_DOM_QSYM_PATH);
-    unlink(TMP_DOM_QSYM_PATH ".lk");
+    unlink(ray_test_tmp(TMP_DOM_QSYM_PATH));
+    unlink(ray_test_tmp(TMP_DOM_QSYM_PATH ".lk"));
     PASS();
 }
 
@@ -1904,15 +1904,15 @@ static test_result_t test_domain_parted_flatten_adopts(void) {
  * resolved bytes match the vocabulary — i.e. behavior is unchanged from
  * the lazy per-position cache, minus the per-call lock. */
 static test_result_t test_domain_str_eager_lockfree(void) {
-    unlink(TMP_DOM_SYM_PATH);
-    unlink(TMP_DOM_SYM_PATH ".lk");
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH));
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH ".lk"));
 
     int64_t id_a = ray_sym_intern("eager_a", 7);
     int64_t id_b = ray_sym_intern("eager_b", 7);
     uint32_t count_at_save = ray_sym_count();
-    TEST_ASSERT_EQ_I(ray_sym_save(TMP_DOM_SYM_PATH), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_sym_save(ray_test_tmp(TMP_DOM_SYM_PATH)), RAY_OK);
 
-    ray_sym_domain_t* dom = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    ray_sym_domain_t* dom = ray_sym_domain_open(ray_test_tmp(TMP_DOM_SYM_PATH));
     TEST_ASSERT_NOT_NULL(dom);
 
     /* First touch after open: walk EVERY position before any find/LUT
@@ -1936,8 +1936,8 @@ static test_result_t test_domain_str_eager_lockfree(void) {
     TEST_ASSERT_NULL(ray_sym_domain_str(dom, -1));
 
     ray_sym_domain_release(dom);
-    unlink(TMP_DOM_SYM_PATH);
-    unlink(TMP_DOM_SYM_PATH ".lk");
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH));
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH ".lk"));
     PASS();
 }
 
@@ -1945,14 +1945,14 @@ static test_result_t test_domain_str_eager_lockfree(void) {
  * bytes and length straight from the mapping, equal to the materialised
  * atom; the runtime singleton refuses; pins nest and release. */
 static test_result_t test_domain_raw_pin(void) {
-    unlink(TMP_DOM_SYM_PATH);
-    unlink(TMP_DOM_SYM_PATH ".lk");
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH));
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH ".lk"));
     int64_t id_a = ray_sym_intern("raw_alpha", 9);
     int64_t id_b = ray_sym_intern("raw_beta_longer_entry", 21);
     (void)id_a; (void)id_b;
     uint32_t count_at_save = ray_sym_count();
-    TEST_ASSERT_EQ_I(ray_sym_save(TMP_DOM_SYM_PATH), RAY_OK);
-    ray_sym_domain_t* dom = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    TEST_ASSERT_EQ_I(ray_sym_save(ray_test_tmp(TMP_DOM_SYM_PATH)), RAY_OK);
+    ray_sym_domain_t* dom = ray_sym_domain_open(ray_test_tmp(TMP_DOM_SYM_PATH));
     TEST_ASSERT_NOT_NULL(dom);
     ray_sym_domain_raw_t raw;
     TEST_ASSERT_FALSE(ray_sym_domain_raw_pin(ray_sym_runtime_domain(), &raw));
@@ -1982,10 +1982,10 @@ static test_result_t test_domain_raw_pin(void) {
      * (new mapping, new offsets, the old ones freed), and a pin taken after
      * it covers the grown prefix and still reads every old position.  A pin
      * taken before the reopen is not readable after it (domain.h). */
-    unlink(TMP_DOM_SYM_PATH);
-    unlink(TMP_DOM_SYM_PATH ".lk");
-    TEST_ASSERT_EQ_I(ray_sym_save(TMP_DOM_SYM_PATH), RAY_OK);
-    ray_sym_domain_t* d1 = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH));
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH ".lk"));
+    TEST_ASSERT_EQ_I(ray_sym_save(ray_test_tmp(TMP_DOM_SYM_PATH)), RAY_OK);
+    ray_sym_domain_t* d1 = ray_sym_domain_open(ray_test_tmp(TMP_DOM_SYM_PATH));
     TEST_ASSERT_NOT_NULL(d1);
     ray_sym_domain_raw_t held;
     TEST_ASSERT(ray_sym_domain_raw_pin(d1, &held), "pin before growth");
@@ -1994,8 +1994,8 @@ static test_result_t test_domain_raw_pin(void) {
         char buf[32]; int n = snprintf(buf, sizeof buf, "raw_grow_%d", i);
         (void)ray_sym_intern(buf, (size_t)n);
     }
-    TEST_ASSERT_EQ_I(ray_sym_save(TMP_DOM_SYM_PATH), RAY_OK);   /* grown image, same prefix */
-    ray_sym_domain_t* d2 = ray_sym_domain_open(TMP_DOM_SYM_PATH);   /* cache hit → extend */
+    TEST_ASSERT_EQ_I(ray_sym_save(ray_test_tmp(TMP_DOM_SYM_PATH)), RAY_OK);   /* grown image, same prefix */
+    ray_sym_domain_t* d2 = ray_sym_domain_open(ray_test_tmp(TMP_DOM_SYM_PATH));   /* cache hit → extend */
     TEST_ASSERT_EQ_PTR(d2, d1);
     TEST_ASSERT(ray_sym_domain_count(d1) > before, "reopen extended the domain");
     ray_sym_domain_raw_t fresh;
@@ -2012,8 +2012,8 @@ static test_result_t test_domain_raw_pin(void) {
     ray_sym_domain_raw_unpin(d1);
     ray_sym_domain_release(d2);
     ray_sym_domain_release(d1);
-    unlink(TMP_DOM_SYM_PATH);
-    unlink(TMP_DOM_SYM_PATH ".lk");
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH));
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH ".lk"));
     PASS();
 }
 
@@ -2295,8 +2295,8 @@ static test_result_t test_domain_runtime_lut(void) {
     TEST_ASSERT_EQ_I(lut[0], 0);  /* "" reserves position 0 AND global id 0 */
 
     ray_sym_domain_release(dom);
-    unlink(TMP_DOM_QSYM_PATH);
-    unlink(TMP_DOM_QSYM_PATH ".lk");
+    unlink(ray_test_tmp(TMP_DOM_QSYM_PATH));
+    unlink(ray_test_tmp(TMP_DOM_QSYM_PATH ".lk"));
     PASS();
 }
 
@@ -2336,8 +2336,8 @@ static test_result_t test_domain_concat_text_nulls(void) {
         ray_release(slice); ray_release(file); ray_release(runtime);
     }
     ray_sym_domain_release(dom);
-    unlink(TMP_DOM_QSYM_PATH);
-    unlink(TMP_DOM_QSYM_PATH ".lk");
+    unlink(ray_test_tmp(TMP_DOM_QSYM_PATH));
+    unlink(ray_test_tmp(TMP_DOM_QSYM_PATH ".lk"));
     PASS();
 }
 
@@ -2347,14 +2347,14 @@ static test_result_t test_domain_concat_text_nulls(void) {
  * position 0 (global id 0) and open fine; a crafted symfile whose first
  * entry is NOT "" is refused (NULL); an EMPTY vocabulary is fine. */
 static test_result_t test_domain_open_position0_validation(void) {
-    unlink(TMP_DOM_SYM_PATH);
-    unlink(TMP_DOM_SYM_PATH ".lk");
-    unlink(TMP_DOM_BADSYM_PATH);
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH));
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH ".lk"));
+    unlink(ray_test_tmp(TMP_DOM_BADSYM_PATH));
 
     /* (a) the save path today: "" at position 0 — opens. */
     (void)ray_sym_intern("p0_ok", 5);
-    TEST_ASSERT_EQ_I(ray_sym_save(TMP_DOM_SYM_PATH), RAY_OK);
-    ray_sym_domain_t* good = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    TEST_ASSERT_EQ_I(ray_sym_save(ray_test_tmp(TMP_DOM_SYM_PATH)), RAY_OK);
+    ray_sym_domain_t* good = ray_sym_domain_open(ray_test_tmp(TMP_DOM_SYM_PATH));
     TEST_ASSERT_NOT_NULL(good);
     ray_t* s0 = ray_sym_domain_str(good, 0);
     TEST_ASSERT_NOT_NULL(s0);
@@ -2363,7 +2363,7 @@ static test_result_t test_domain_open_position0_validation(void) {
 
     /* (b) crafted STRL whose position 0 is "x": refused. */
     {
-        FILE* f = fopen(TMP_DOM_BADSYM_PATH, "wb");
+        FILE* f = fopen(ray_test_tmp(TMP_DOM_BADSYM_PATH), "wb");
         TEST_ASSERT_NOT_NULL(f);
         uint32_t magic = 0x4C525453U; /* "STRL" */
         int64_t  count = 2;
@@ -2375,11 +2375,11 @@ static test_result_t test_domain_open_position0_validation(void) {
         fwrite(&len_e, 4, 1, f);
         fclose(f);
     }
-    TEST_ASSERT_NULL(ray_sym_domain_open(TMP_DOM_BADSYM_PATH));
+    TEST_ASSERT_NULL(ray_sym_domain_open(ray_test_tmp(TMP_DOM_BADSYM_PATH)));
 
     /* (c) empty vocabulary (count 0): structurally fine. */
     {
-        FILE* f = fopen(TMP_DOM_BADSYM_PATH, "wb");
+        FILE* f = fopen(ray_test_tmp(TMP_DOM_BADSYM_PATH), "wb");
         TEST_ASSERT_NOT_NULL(f);
         uint32_t magic = 0x4C525453U;
         int64_t  count = 0;
@@ -2387,7 +2387,7 @@ static test_result_t test_domain_open_position0_validation(void) {
         fwrite(&count, 8, 1, f);
         fclose(f);
     }
-    ray_sym_domain_t* empty = ray_sym_domain_open(TMP_DOM_BADSYM_PATH);
+    ray_sym_domain_t* empty = ray_sym_domain_open(ray_test_tmp(TMP_DOM_BADSYM_PATH));
     TEST_ASSERT_NOT_NULL(empty);
     TEST_ASSERT_EQ_I(ray_sym_domain_count(empty), 0);
     TEST_ASSERT_NULL(ray_sym_domain_str(empty, 0));
@@ -2396,9 +2396,9 @@ static test_result_t test_domain_open_position0_validation(void) {
     TEST_ASSERT_NOT_NULL(ray_sym_domain_runtime_lut(empty));
     ray_sym_domain_release(empty);
 
-    unlink(TMP_DOM_BADSYM_PATH);
-    unlink(TMP_DOM_SYM_PATH);
-    unlink(TMP_DOM_SYM_PATH ".lk");
+    unlink(ray_test_tmp(TMP_DOM_BADSYM_PATH));
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH));
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH ".lk"));
     PASS();
 }
 
@@ -2483,12 +2483,12 @@ static test_result_t test_domain_dict_upsert_file_keys(void) {
 
     /* ref balance: the dict's converted keys dropped the FILE-domain ref
      * (fresh open rebuilds the cache entry). */
-    ray_sym_domain_t* d2 = ray_sym_domain_open(TMP_DOM_QSYM_PATH);
+    ray_sym_domain_t* d2 = ray_sym_domain_open(ray_test_tmp(TMP_DOM_QSYM_PATH));
     TEST_ASSERT_NOT_NULL(d2);
     ray_sym_domain_release(d2);
 
-    unlink(TMP_DOM_QSYM_PATH);
-    unlink(TMP_DOM_QSYM_PATH ".lk");
+    unlink(ray_test_tmp(TMP_DOM_QSYM_PATH));
+    unlink(ray_test_tmp(TMP_DOM_QSYM_PATH ".lk"));
     PASS();
 }
 

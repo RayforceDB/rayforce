@@ -55,6 +55,18 @@ dl_program_t* dl_program_new(void) {
     return prog;
 }
 
+/* Keep the first error an evaluation step failed with (the rest are
+ * disposed of); dl_eval's callers report it instead of a generic failure. */
+static void dl_keep_err(dl_program_t* prog, ray_t* e) {
+    if (!e) return;
+    /* Program-shape errors (type, domain) keep the generic domain report;
+     * what is kept is a column that failed to materialize and the like. */
+    const char* code = RAY_IS_ERR(e) ? ray_err_code(e) : "";
+    bool shape = strcmp(code, "type") == 0 || strcmp(code, "domain") == 0;
+    if (!prog->first_err && !shape) prog->first_err = e;
+    else ray_error_free(e);
+}
+
 /* Recover the ray_t header from a dl_program_t pointer for ray_free. */
 static inline ray_t* dl_prog_block(dl_program_t* prog) {
     return (ray_t*)((char*)prog - 32);  /* ray_data is at offset 32 */
@@ -74,6 +86,7 @@ void dl_program_free(dl_program_t* prog) {
     }
     for (int i = 0; i < prog->n_rules; i++)
         dl_rule_free_exprs(&prog->rules[i]);
+    if (prog->first_err) ray_error_free(prog->first_err);
     ray_free(dl_prog_block(prog));
 }
 
@@ -95,6 +108,19 @@ static int64_t dl_col_sym(const char* rel_name, int col_idx) {
     snprintf(buf, sizeof(buf), "%s__c%d", rel_name, col_idx);
     return ray_sym_intern(buf, strlen(buf));
 }
+
+/* Best-effort borrow of the first `n` plain columns of `tbl` into cols[]
+ * (one fetch per call, for loops that would otherwise fetch per row).  An
+ * absent column or one that fails to materialize leaves NULL (the failure
+ * stays cached in the slot); callers treat NULL as a missing column. */
+static void dl_cols_borrow(ray_t* tbl, int64_t n, ray_t** cols) {
+    for (int64_t c = 0; c < n; c++) {
+        ray_t* col = ray_table_col_idx(tbl, c);
+        if (col && RAY_IS_ERR(col)) { ray_error_free(col); col = NULL; }
+        cols[c] = col;
+    }
+}
+
 
 int dl_add_edb(dl_program_t* prog, const char* name, ray_t* table, int arity) {
     if (!prog || !name || !table || prog->n_rels >= DL_MAX_RELS)
@@ -123,7 +149,7 @@ int dl_add_edb(dl_program_t* prog, const char* name, ray_t* table, int arity) {
 
     ray_t* new_tbl = ray_table_new(arity);
     for (int c = 0; c < arity; c++) {
-        ray_t* col = ray_table_get_col_idx(table, c);
+        ray_t* col = ray_table_slot_idx(table, c);
         if (!col) { ray_release(new_tbl); return -1; }
         new_tbl = ray_table_add_col(new_tbl, rel->col_names[c], col);
         if (RAY_IS_ERR(new_tbl)) return -1;
@@ -188,8 +214,8 @@ static void dl_idb_align_head_const_types(dl_program_t* prog, const dl_rule_t* r
     bool any_change = false;
     int8_t desired[DL_MAX_ARITY];
     for (int c = 0; c < rel->arity; c++) {
-        ray_t* col = ray_table_get_col_idx(rel->table, c);
-        int8_t cur = col ? col->type : RAY_I64;
+        ray_col_meta_t m;
+        int8_t cur = ray_table_col_meta_idx(rel->table, c, &m) ? m.type : RAY_I64;
         int8_t want = rule->head_const_types[c];
         if (want == 0) {
             desired[c] = cur;
@@ -760,8 +786,9 @@ static ray_t* dl_eval_expr(dl_expr_t* expr, ray_t* accum,
     }
     case DL_EXPR_VAR: {
         int ci = var_col[expr->var_idx];
-        ray_t* src = ray_table_get_col_idx(accum, ci);
+        ray_t* src = ray_table_col_idx(accum, ci);
         if (!src) return NULL;
+        if (RAY_IS_ERR(src)) return src;
         if (src->type != RAY_I64 && src->type != RAY_F64) return NULL;
         size_t elem = (src->type == RAY_F64) ? sizeof(double) : sizeof(int64_t);
         ray_t* dst = ray_vec_new(src->type, nrows);
@@ -774,6 +801,14 @@ static ray_t* dl_eval_expr(dl_expr_t* expr, ray_t* accum,
     case DL_EXPR_BINOP: {
         ray_t* lv = dl_eval_expr(expr->left, accum, var_col, nrows);
         ray_t* rv = dl_eval_expr(expr->right, accum, var_col, nrows);
+        /* A column that failed to materialize comes back as an owned error:
+         * hand it up (the other operand, if any, is disposed of here). */
+        if ((lv && RAY_IS_ERR(lv)) || (rv && RAY_IS_ERR(rv))) {
+            ray_t* e = (lv && RAY_IS_ERR(lv)) ? lv : rv;
+            ray_t* o = (e == lv) ? rv : lv;
+            if (o) { if (RAY_IS_ERR(o)) ray_error_free(o); else ray_release(o); }
+            return e;
+        }
         if (!lv || !rv) {
             if (lv) ray_release(lv);
             if (rv) ray_release(rv);
@@ -845,7 +880,7 @@ static ray_t* dl_table_add_computed_col(ray_t* tbl, ray_t* new_col, const char* 
     int64_t ncols = ray_table_ncols(tbl);
     ray_t* out = ray_table_new((int)(ncols + 1));
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* col = ray_table_get_col_idx(tbl, c);
+        ray_t* col = ray_table_slot_idx(tbl, c);
         if (col)
             out = ray_table_add_col(out, ray_table_col_name(tbl, c), col);
     }
@@ -871,8 +906,15 @@ static ray_t* dl_builtin_before(ray_t* tbl, int s_col, int t_col) {
 
     int64_t nrows = ray_table_nrows(tbl);
     int64_t ncols = ray_table_ncols(tbl);
-    int64_t* sd = (int64_t*)ray_data(ray_table_get_col_idx(tbl, s_col));
-    int64_t* t_data = (int64_t*)ray_data(ray_table_get_col_idx(tbl, t_col));
+    ray_t* s_vec = ray_table_col_idx(tbl, s_col);
+    ray_t* t_vec = ray_table_col_idx(tbl, t_col);
+    if (s_vec && RAY_IS_ERR(s_vec)) {
+        if (t_vec && RAY_IS_ERR(t_vec)) ray_error_free(t_vec);
+        return s_vec;
+    }
+    if (t_vec && RAY_IS_ERR(t_vec)) return t_vec;
+    int64_t* sd = (int64_t*)ray_data(s_vec);
+    int64_t* t_data = (int64_t*)ray_data(t_vec);
 
     int64_t count = 0;
     for (int64_t r = 0; r < nrows; r++)
@@ -882,8 +924,9 @@ static ray_t* dl_builtin_before(ray_t* tbl, int s_col, int t_col) {
 
     ray_t* out = ray_table_new((int)ncols);
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* src = ray_table_get_col_idx(tbl, c);
+        ray_t* src = ray_table_col_idx(tbl, c);
         if (!src) continue;
+        if (RAY_IS_ERR(src)) { ray_release(out); return src; }
         ray_t* dst = ray_vec_new(src->type, count);
         if (!dst || RAY_IS_ERR(dst)) continue;
         dst->len = count;
@@ -906,8 +949,15 @@ static ray_t* dl_builtin_duration_since(ray_t* tbl, int t1_col, int t2_col,
                                           const char* out_name) {
     if (!tbl || RAY_IS_ERR(tbl)) return tbl;
     int64_t nrows = ray_table_nrows(tbl);
-    int64_t* t1 = (int64_t*)ray_data(ray_table_get_col_idx(tbl, t1_col));
-    int64_t* t2 = (int64_t*)ray_data(ray_table_get_col_idx(tbl, t2_col));
+    ray_t* t1_vec = ray_table_col_idx(tbl, t1_col);
+    ray_t* t2_vec = ray_table_col_idx(tbl, t2_col);
+    if (t1_vec && RAY_IS_ERR(t1_vec)) {
+        if (t2_vec && RAY_IS_ERR(t2_vec)) ray_error_free(t2_vec);
+        return t1_vec;
+    }
+    if (t2_vec && RAY_IS_ERR(t2_vec)) return t2_vec;
+    int64_t* t1 = (int64_t*)ray_data(t1_vec);
+    int64_t* t2 = (int64_t*)ray_data(t2_vec);
 
     ray_t* col = ray_vec_new(RAY_I64, nrows);
     if (!col || RAY_IS_ERR(col)) { ray_retain(tbl); return tbl; }
@@ -925,7 +975,9 @@ static ray_t* dl_builtin_duration_since(ray_t* tbl, int t1_col, int t2_col,
 static ray_t* dl_builtin_abs(ray_t* tbl, int x_col, const char* out_name) {
     if (!tbl || RAY_IS_ERR(tbl)) return tbl;
     int64_t nrows = ray_table_nrows(tbl);
-    int64_t* xd = (int64_t*)ray_data(ray_table_get_col_idx(tbl, x_col));
+    ray_t* x_vec = ray_table_col_idx(tbl, x_col);
+    if (x_vec && RAY_IS_ERR(x_vec)) return x_vec;
+    int64_t* xd = (int64_t*)ray_data(x_vec);
 
     ray_t* col = ray_vec_new(RAY_I64, nrows);
     if (!col || RAY_IS_ERR(col)) { ray_retain(tbl); return tbl; }
@@ -950,9 +1002,9 @@ static ray_t* dl_join_tables(ray_t* left, ray_t* right,
         int64_t rnc = ray_table_ncols(right);
         ray_t* empty = ray_table_new((int)(lnc + rnc));
         for (int64_t c = 0; c < lnc; c++) {
-            ray_t* col = ray_table_get_col_idx(left, c);
-            if (!col) continue;
-            ray_t* ec = ray_vec_new(col->type, 0);
+            ray_col_meta_t m;
+            if (!ray_table_col_meta_idx(left, c, &m)) continue;
+            ray_t* ec = ray_vec_new(m.type, 0);
             if (ec && !RAY_IS_ERR(ec)) {
                 empty = ray_table_add_col(empty, ray_table_col_name(left, c), ec);
                 ray_release(ec);
@@ -970,7 +1022,7 @@ static ray_t* dl_join_tables(ray_t* left, ray_t* right,
     int64_t rnc = ray_table_ncols(right);
     ray_t* ltbl = ray_table_new((int)lnc);
     for (int64_t c = 0; c < lnc; c++) {
-        ray_t* col = ray_table_get_col_idx(left, c);
+        ray_t* col = ray_table_slot_idx(left, c);
         if (!col) continue;
         char name[32]; snprintf(name, sizeof(name), "L%d", (int)c);
         int64_t sym = ray_sym_intern(name, strlen(name));
@@ -978,7 +1030,7 @@ static ray_t* dl_join_tables(ray_t* left, ray_t* right,
     }
     ray_t* rtbl = ray_table_new((int)rnc);
     for (int64_t c = 0; c < rnc; c++) {
-        ray_t* col = ray_table_get_col_idx(right, c);
+        ray_t* col = ray_table_slot_idx(right, c);
         if (!col) continue;
         char name[32]; snprintf(name, sizeof(name), "R%d", (int)c);
         int64_t sym = ray_sym_intern(name, strlen(name));
@@ -1023,14 +1075,14 @@ static ray_t* dl_antijoin_tables(ray_t* left, ray_t* right,
     int64_t rnc = ray_table_ncols(right);
     ray_t* ltbl = ray_table_new((int)lnc);
     for (int64_t c = 0; c < lnc; c++) {
-        ray_t* col = ray_table_get_col_idx(left, c);
+        ray_t* col = ray_table_slot_idx(left, c);
         if (!col) continue;
         char name[32]; snprintf(name, sizeof(name), "L%d", (int)c);
         ltbl = ray_table_add_col(ltbl, ray_sym_intern(name, strlen(name)), col);
     }
     ray_t* rtbl = ray_table_new((int)rnc);
     for (int64_t c = 0; c < rnc; c++) {
-        ray_t* col = ray_table_get_col_idx(right, c);
+        ray_t* col = ray_table_slot_idx(right, c);
         if (!col) continue;
         char name[32]; snprintf(name, sizeof(name), "R%d", (int)c);
         rtbl = ray_table_add_col(rtbl, ray_sym_intern(name, strlen(name)), col);
@@ -1143,7 +1195,8 @@ static ray_t* dl_table_take_mask(ray_t* tbl, const uint8_t* keep, int64_t count)
     if (!out) return ray_error("memory", "dl_table_take_mask: table_new");
     if (RAY_IS_ERR(out)) return out;
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* src = ray_table_get_col_idx(tbl, c);
+        ray_t* src = ray_table_col_idx(tbl, c);
+        if (src && RAY_IS_ERR(src)) { ray_release(out); return src; }
         if (!src) { ray_release(out); return ray_error("domain", "dl_table_take_mask: missing source column"); }
         ray_t* dst = (src->type == RAY_SYM)
             ? ray_sym_vec_new(src->attrs & RAY_SYM_W_MASK, count)
@@ -1207,7 +1260,8 @@ static ray_t* dl_filter_eq(ray_t* tbl, int col_idx, int64_t value,
     if (!tbl || RAY_IS_ERR(tbl)) { if (tbl) ray_retain(tbl); return tbl; }
     if (ray_table_nrows(tbl) == 0) { ray_retain(tbl); return tbl; }
 
-    ray_t* col = ray_table_get_col_idx(tbl, col_idx);
+    ray_t* col = ray_table_col_idx(tbl, col_idx);
+    if (col && RAY_IS_ERR(col)) return col;
     if (!col) { ray_retain(tbl); return tbl; }
     /* Non-numeric, non-sym keys: not supported by this filter — raise a
      * type error rather than silently passing every row through. */
@@ -1265,8 +1319,13 @@ static ray_t* dl_filter_col_eq(ray_t* tbl, int c1, int c2) {
     if (!tbl || RAY_IS_ERR(tbl)) { if (tbl) ray_retain(tbl); return tbl; }
     int64_t nrows = ray_table_nrows(tbl);
     if (nrows == 0) { ray_retain(tbl); return tbl; }
-    ray_t* a = ray_table_get_col_idx(tbl, c1);
-    ray_t* b = ray_table_get_col_idx(tbl, c2);
+    ray_t* a = ray_table_col_idx(tbl, c1);
+    ray_t* b = ray_table_col_idx(tbl, c2);
+    if ((a && RAY_IS_ERR(a)) || (b && RAY_IS_ERR(b))) {
+        ray_t* e = (a && RAY_IS_ERR(a)) ? a : b;
+        if (e == a && b && RAY_IS_ERR(b)) ray_error_free(b);
+        return e;
+    }
     if (!a || !b) return ray_error("domain", "datalog: repeated-variable filter on missing column");
     if ((a->type != RAY_I64 && a->type != RAY_SYM) || (b->type != RAY_I64 && b->type != RAY_SYM))
         return ray_error("type", "datalog: repeated variable over unsupported column type %s",
@@ -1311,8 +1370,8 @@ static ray_t* dl_filter_repeated_vars(ray_t* tbl, const dl_body_t* body) {
  * Correctness note: this must be a real, heap-allocated vec — not a view
  * onto rule-local scratch — so that the IDB relation table can outlive the
  * per-iteration scratch that built it.  Cross-IDB reads at subsequent
- * strata borrow from this column via ray_table_get_col_idx. */
-/* width_template: when type == RAY_SYM, this column is consulted for its
+ * strata borrow from this column via the table accessors. */
+/* width_template: when type == RAY_SYM, this column's metadata is consulted for its
  * SYM attrs/width so the broadcast matches the IDB relation's existing
  * adaptive width (otherwise ray_vec_new would default to W64 and a
  * later table_union would hit a ray_vec_concat width mismatch).  Pass
@@ -1320,7 +1379,7 @@ static ray_t* dl_filter_repeated_vars(ray_t* tbl, const dl_body_t* body) {
  * here rather than a uint8_t hint avoids the W8=0 sentinel ambiguity
  * of an "a zero hint means default" convention. */
 static ray_t* dl_broadcast_const_col(int64_t nrows, int8_t type, int64_t val,
-                                      const ray_t* width_template) {
+                                      const ray_col_meta_t* width_template) {
     if (type != RAY_I64 && type != RAY_SYM && type != RAY_F64) {
         return ray_error("type", "datalog: broadcast const column expects i64/sym/f64, got %s", ray_type_name(type));
     }
@@ -1372,18 +1431,20 @@ static ray_t* dl_project(ray_t* tbl, const int* col_indices, int n_out,
     for (int c = 0; c < n_out; c++) {
         int src_idx = col_indices[c];
         if (src_idx >= 0) {
-            ray_t* src = ray_table_get_col_idx(tbl, src_idx);
+            ray_t* src = ray_table_col_idx(tbl, src_idx);
+            if (src && RAY_IS_ERR(src)) { ray_release(out); return src; }
             if (!src) {
                 if (empty_accum && head_rel && head_rel->table) {
-                    ray_t* hcol = ray_table_get_col_idx(head_rel->table, c);
-                    int8_t htype = hcol ? hcol->type : RAY_I64;
+                    ray_col_meta_t hm;
+                    bool hcol = ray_table_col_meta_idx(head_rel->table, c, &hm);
+                    int8_t htype = hcol ? hm.type : RAY_I64;
                     /* For SYM columns, preserve the head-relation's
                      * adaptive-width attrs — ray_vec_new(RAY_SYM, …) would
                      * force W64 and a later table_union onto a narrower
                      * head-rel column would hit the column-count check,
                      * or worse, produce a width-mismatched merge. */
                     ray_t* ecol = (htype == RAY_SYM && hcol)
-                        ? ray_sym_vec_new(hcol->attrs & RAY_SYM_W_MASK, 0)
+                        ? ray_sym_vec_new(hm.attrs & RAY_SYM_W_MASK, 0)
                         : ray_vec_new(htype, 0);
                     if (!ecol) {
                         ray_release(out);
@@ -1466,9 +1527,11 @@ static ray_t* dl_project(ray_t* tbl, const int* col_indices, int n_out,
              * (from a prior aligned rule), match its width so
              * table_union's ray_vec_concat doesn't reject a W64 vs
              * narrow mismatch. */
-            const ray_t* width_tpl = NULL;
-            if (ctype == RAY_SYM && head_rel && head_rel->table)
-                width_tpl = ray_table_get_col_idx(head_rel->table, c);
+            ray_col_meta_t width_m;
+            const ray_col_meta_t* width_tpl = NULL;
+            if (ctype == RAY_SYM && head_rel && head_rel->table &&
+                ray_table_col_meta_idx(head_rel->table, c, &width_m))
+                width_tpl = &width_m;
             ray_t* bcast = dl_broadcast_const_col(nrows, ctype, head_consts[c], width_tpl);
             if (!bcast || RAY_IS_ERR(bcast)) {
                 ray_release(out);
@@ -1542,7 +1605,7 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
                     return NULL;
                 }
                 if (RAY_IS_ERR(filtered)) {
-                    ray_error_free(filtered);
+                    dl_keep_err(prog, filtered);
                     if (accum) ray_release(accum);
                     prog->eval_err = true;
                     return NULL;
@@ -1554,7 +1617,7 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
         body_tbl = dl_filter_repeated_vars(body_tbl, body);
         if (!body_tbl) { if (accum) ray_release(accum); prog->eval_err = true; return NULL; }
         if (RAY_IS_ERR(body_tbl)) {
-            ray_error_free(body_tbl);
+            dl_keep_err(prog, body_tbl);
             if (accum) ray_release(accum);
             prog->eval_err = true;
             return NULL;
@@ -1643,7 +1706,7 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
         ray_t* one_val = ray_vec_new(RAY_I64, 1);
         if (!one_val) { prog->eval_err = true; return NULL; }
         if (RAY_IS_ERR(one_val)) {
-            ray_error_free(one_val);
+            dl_keep_err(prog, one_val);
             prog->eval_err = true;
             return NULL;
         }
@@ -1656,7 +1719,7 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
             return NULL;
         }
         if (RAY_IS_ERR(accum)) {
-            ray_error_free(accum);
+            dl_keep_err(prog, accum);
             ray_release(one_val);
             prog->eval_err = true;
             return NULL;
@@ -1672,7 +1735,7 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
             return NULL;
         }
         if (RAY_IS_ERR(accum_unit)) {
-            ray_error_free(accum_unit);
+            dl_keep_err(prog, accum_unit);
             ray_release(accum);
             prog->eval_err = true;
             return NULL;
@@ -1711,7 +1774,7 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
                         return NULL;
                     }
                     if (RAY_IS_ERR(filtered)) {
-                        ray_error_free(filtered);
+                        dl_keep_err(prog, filtered);
                         ray_release(accum);
                         prog->eval_err = true;
                         return NULL;
@@ -1723,7 +1786,7 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
             neg_tbl = dl_filter_repeated_vars(neg_tbl, body);
             if (!neg_tbl) { ray_release(accum); prog->eval_err = true; return NULL; }
             if (RAY_IS_ERR(neg_tbl)) {
-                ray_error_free(neg_tbl);
+                dl_keep_err(prog, neg_tbl);
                 ray_release(accum);
                 prog->eval_err = true;
                 return NULL;
@@ -1769,7 +1832,7 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
                 return NULL;
             }
             if (RAY_IS_ERR(new_col)) {
-                ray_error_free(new_col);
+                dl_keep_err(prog, new_col);
                 ray_release(accum);
                 prog->eval_err = true;
                 return NULL;
@@ -1783,7 +1846,7 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
             ray_release(accum);
             if (!new_accum) { prog->eval_err = true; return NULL; }
             if (RAY_IS_ERR(new_accum)) {
-                ray_error_free(new_accum);
+                dl_keep_err(prog, new_accum);
                 prog->eval_err = true;
                 return NULL;
             }
@@ -1923,7 +1986,7 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
                     return NULL;
                 }
                 if (RAY_IS_ERR(group_tbl)) {
-                    ray_error_free(group_tbl);
+                    dl_keep_err(prog, group_tbl);
                     ray_release(accum);
                     prog->eval_err = true;
                     return NULL;
@@ -1995,11 +2058,11 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
              * correct result type. */
             bool    is_float = is_avg;
             if (need_value_col) {
-                ray_t* vc0 = ray_table_get_col_idx(src_table, body->agg_value_col);
-                if (vc0) {
-                    if (vc0->type == RAY_F64) {
+                ray_col_meta_t vc0;
+                if (ray_table_col_meta_idx(src_table, body->agg_value_col, &vc0)) {
+                    if (vc0.type == RAY_F64) {
                         is_float = true;
-                    } else if (vc0->type != RAY_I64) {
+                    } else if (vc0.type != RAY_I64) {
                         /* Non-numeric source: reject regardless of row count. */
                         ray_release(accum);
                         prog->eval_err = true;
@@ -2017,7 +2080,14 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
             case DL_AGG_AVG:
                 if (src_nrows > 0) {
                     ray_t* val_col =
-                        ray_table_get_col_idx(src_table, body->agg_value_col);
+                        ray_table_col_idx(src_table, body->agg_value_col);
+                    if (val_col && RAY_IS_ERR(val_col)) {
+                        /* the failure stays cached in the slot */
+                        dl_keep_err(prog, val_col);
+                        ray_release(accum);
+                        prog->eval_err = true;
+                        return NULL;
+                    }
                     if (!val_col) {
                         ray_release(accum);
                         return NULL;
@@ -2097,7 +2167,7 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
                 return NULL;
             }
             if (RAY_IS_ERR(new_col)) {
-                ray_error_free(new_col);
+                dl_keep_err(prog, new_col);
                 ray_release(accum);
                 prog->eval_err = true;
                 return NULL;
@@ -2131,6 +2201,11 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
                 int t_col = var_col[body->vars[2]];
                 ray_t* filtered = dl_builtin_before(accum, s_col, t_col);
                 ray_release(accum);
+                if (!filtered || RAY_IS_ERR(filtered)) {
+                    if (filtered) dl_keep_err(prog, filtered);
+                    prog->eval_err = true;
+                    return NULL;
+                }
                 accum = filtered;
                 break;
             }
@@ -2143,6 +2218,11 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
                 snprintf(colname, sizeof(colname), "_d%d", d_var);
                 ray_t* result = dl_builtin_duration_since(accum, t1_col, t2_col, colname);
                 ray_release(accum);
+                if (!result || RAY_IS_ERR(result)) {
+                    if (result) dl_keep_err(prog, result);
+                    prog->eval_err = true;
+                    return NULL;
+                }
                 accum = result;
                 var_bound[d_var] = true;
                 var_col[d_var] = new_idx;
@@ -2156,6 +2236,11 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
                 snprintf(colname, sizeof(colname), "_abs%d", y_var);
                 ray_t* result = dl_builtin_abs(accum, x_col, colname);
                 ray_release(accum);
+                if (!result || RAY_IS_ERR(result)) {
+                    if (result) dl_keep_err(prog, result);
+                    prog->eval_err = true;
+                    return NULL;
+                }
                 accum = result;
                 var_bound[y_var] = true;
                 var_col[y_var] = new_idx;
@@ -2184,7 +2269,7 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
                     return NULL;
                 }
                 if (RAY_IS_ERR(lhs_evaled)) {
-                    ray_error_free(lhs_evaled);
+                    dl_keep_err(prog, lhs_evaled);
                     prog->eval_err = true;
                     ray_release(accum);
                     return NULL;
@@ -2192,8 +2277,9 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
                 lhs_src = lhs_evaled;
             } else {
                 int lhs_col = var_col[body->cmp_lhs];
-                lhs_src = ray_table_get_col_idx(accum, lhs_col);
-                if (!lhs_src) {
+                lhs_src = ray_table_col_idx(accum, lhs_col);
+                if (!lhs_src || RAY_IS_ERR(lhs_src)) {
+                    if (lhs_src) dl_keep_err(prog, lhs_src);
                     prog->eval_err = true;
                     ray_release(accum);
                     return NULL;
@@ -2209,7 +2295,7 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
                     return NULL;
                 }
                 if (RAY_IS_ERR(rhs_evaled)) {
-                    ray_error_free(rhs_evaled);
+                    dl_keep_err(prog, rhs_evaled);
                     if (lhs_evaled) ray_release(lhs_evaled);
                     prog->eval_err = true;
                     ray_release(accum);
@@ -2218,8 +2304,9 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
                 rhs_src = rhs_evaled;
             } else if (body->cmp_rhs != DL_CONST) {
                 int rhs_col = var_col[body->cmp_rhs];
-                rhs_src = ray_table_get_col_idx(accum, rhs_col);
-                if (!rhs_src) {
+                rhs_src = ray_table_col_idx(accum, rhs_col);
+                if (!rhs_src || RAY_IS_ERR(rhs_src)) {
+                    if (rhs_src) dl_keep_err(prog, rhs_src);
                     if (lhs_evaled) ray_release(lhs_evaled);
                     prog->eval_err = true;
                     ray_release(accum);
@@ -2318,15 +2405,16 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
             int64_t ncols = ray_table_ncols(accum);
             ray_t* out = ray_table_new((int)ncols);
             if (!out || RAY_IS_ERR(out)) {
-                if (out && RAY_IS_ERR(out)) ray_error_free(out);
+                if (out && RAY_IS_ERR(out)) dl_keep_err(prog, out);
                 ray_free(mask_block);
                 ray_release(accum);
                 prog->eval_err = true;
                 return NULL;
             }
             for (int64_t c = 0; c < ncols; c++) {
-                ray_t* src = ray_table_get_col_idx(accum, c);
-                if (!src) {
+                ray_t* src = ray_table_col_idx(accum, c);
+                if (!src || RAY_IS_ERR(src)) {
+                    if (src) dl_keep_err(prog, src);
                     ray_release(out); ray_free(mask_block);
                     ray_release(accum);
                     prog->eval_err = true;
@@ -2342,7 +2430,7 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
                     return NULL;
                 }
                 if (RAY_IS_ERR(dst)) {
-                    ray_error_free(dst);
+                    dl_keep_err(prog, dst);
                     ray_release(out); ray_free(mask_block);
                     ray_release(accum);
                     prog->eval_err = true;
@@ -2370,7 +2458,7 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
                     return NULL;
                 }
                 if (RAY_IS_ERR(next)) {
-                    ray_error_free(next);
+                    dl_keep_err(prog, next);
                     ray_release(out); ray_free(mask_block);
                     ray_release(accum);
                     prog->eval_err = true;
@@ -2424,7 +2512,7 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
      * output via the const_table/execute chain. */
     if (!projected) return NULL;
     if (RAY_IS_ERR(projected)) {
-        ray_error_free(projected);
+        dl_keep_err(prog, projected);
         prog->eval_err = true;
         return NULL;
     }
@@ -2464,7 +2552,7 @@ static ray_t* table_rename_cols(ray_t* tbl, dl_rel_t* target_rel) {
     /* Build new table with correct column names sharing the same column data */
     ray_t* out = ray_table_new(arity);
     for (int c = 0; c < arity; c++) {
-        ray_t* col = ray_table_get_col_idx(tbl, c);
+        ray_t* col = ray_table_slot_idx(tbl, c);
         if (col)
             out = ray_table_add_col(out, target_rel->col_names[c], col);
     }
@@ -2477,7 +2565,7 @@ static ray_t* canonicalize(ray_t* tbl) {
     int64_t nc = ray_table_ncols(tbl);
     ray_t* out = ray_table_new(nc);
     for (int64_t c = 0; c < nc; c++) {
-        ray_t* col = ray_table_get_col_idx(tbl, c);
+        ray_t* col = ray_table_slot_idx(tbl, c);
         if (!col) continue;
         char buf[16];
         snprintf(buf, sizeof(buf), "c%d", (int)c);
@@ -2493,7 +2581,7 @@ static ray_t* restore_names(ray_t* tbl, ray_t* src) {
     int64_t nc = ray_table_ncols(tbl);
     ray_t* out = ray_table_new(nc);
     for (int64_t c = 0; c < nc; c++) {
-        ray_t* col = ray_table_get_col_idx(tbl, c);
+        ray_t* col = ray_table_slot_idx(tbl, c);
         if (col)
             out = ray_table_add_col(out, ray_table_col_name(src, c), col);
     }
@@ -2543,8 +2631,14 @@ static ray_t* table_union(ray_t* a, ray_t* b) {
     if (!out || RAY_IS_ERR(out))
         return out ? out : ray_error("memory", "table_union: table_new");
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* col_a = ray_table_get_col_idx(a, c);
-        ray_t* col_b = ray_table_get_col_idx(b, c);
+        ray_t* col_a = ray_table_col_idx(a, c);
+        ray_t* col_b = ray_table_col_idx(b, c);
+        if ((col_a && RAY_IS_ERR(col_a)) || (col_b && RAY_IS_ERR(col_b))) {
+            ray_t* e = (col_a && RAY_IS_ERR(col_a)) ? col_a : col_b;
+            if (e == col_a && col_b && RAY_IS_ERR(col_b)) ray_error_free(col_b);
+            ray_release(out);
+            return e;
+        }
         if (!col_a || !col_b) {
             /* Silently dropping a column would produce a schema-incomplete
              * result that the caller mistakes for a successful union. */
@@ -2717,15 +2811,26 @@ typedef struct {
     int64_t  ncols;
 } dl_rowset_t;
 
-static bool dl_rowset_init(dl_rowset_t* rs, ray_t* ref) {
+static bool dl_rowset_init(dl_program_t* prog, dl_rowset_t* rs, ray_t* ref) {
     int64_t ncols = ray_table_ncols(ref);
     int64_t nrows = ray_table_nrows(ref);
     rs->ncols = ncols;
     rs->ref_cols = (int64_t**)ray_calloc_raw(sizeof(int64_t*) * (size_t)ncols);
     if (!rs->ref_cols) return false;
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* col = ray_table_get_col_idx(ref, c);
-        rs->ref_cols[c] = col ? (int64_t*)ray_data(col) : NULL;
+        ray_t* col = ray_table_col_idx(ref, c);
+        if (col && RAY_IS_ERR(col)) {
+            dl_keep_err(prog, col);         /* the rule's marking is skipped */
+            ray_free_raw(rs->ref_cols);
+            rs->ref_cols = NULL;
+            return false;
+        }
+        if (!col) {                     /* the hash reads every column of every row */
+            ray_free_raw(rs->ref_cols);
+            rs->ref_cols = NULL;
+            return false;
+        }
+        rs->ref_cols[c] = (int64_t*)ray_data(col);
     }
     int64_t cap = 16;
     while (cap < (nrows > 0 ? nrows * 2 : 16)) cap *= 2;
@@ -2795,6 +2900,9 @@ static void dl_build_source_prov(dl_program_t* prog, dl_rel_t* rel,
     int64_t* buf = (int64_t*)ray_data(buf_block);
     int64_t buf_len = 0;
 
+    ray_t* head_cols[DL_MAX_ARITY] = {0};
+    dl_cols_borrow(rel->table, rel->arity < DL_MAX_ARITY ? rel->arity : DL_MAX_ARITY, head_cols);
+
     for (int64_t row = 0; row < nrows; row++) {
         off[row] = buf_len;
         if (pd[row] < 0) continue;
@@ -2809,7 +2917,7 @@ static void dl_build_source_prov(dl_program_t* prog, dl_rel_t* rel,
         for (int h = 0; h < rule->head_arity; h++) {
             int v = rule->head_vars[h];
             if (v == DL_CONST) continue;
-            ray_t* col = ray_table_get_col_idx(rel->table, h);
+            ray_t* col = h < DL_MAX_ARITY ? head_cols[h] : NULL;
             if (!col) continue;
             var_vals[v] = ((int64_t*)ray_data(col))[row];
             var_set[v]  = true;
@@ -2824,11 +2932,13 @@ static void dl_build_source_prov(dl_program_t* prog, dl_rel_t* rel,
             if (bri < 0) continue;
             dl_rel_t* brel   = &prog->rels[bri];
             int64_t   bnrows = ray_table_nrows(brel->table);
+            ray_t*    bcols[DL_MAX_ARITY] = {0};
+            dl_cols_borrow(brel->table, body->arity < DL_MAX_ARITY ? body->arity : DL_MAX_ARITY, bcols);
 
             for (int64_t br = 0; br < bnrows; br++) {
                 bool match = true;
                 for (int c = 0; c < body->arity; c++) {
-                    ray_t* bcol = ray_table_get_col_idx(brel->table, c);
+                    ray_t* bcol = c < DL_MAX_ARITY ? bcols[c] : NULL;
                     if (!bcol) { match = false; break; }
                     int     v    = body->vars[c];
                     if (v == DL_CONST) {
@@ -2935,21 +3045,28 @@ static void dl_build_provenance(dl_program_t* prog) {
              * hashset over `derived` once and probe per row of rel —
              * was O(nrows × derived_rows × ncols), now O(nrows + derived_rows). */
             dl_rowset_t rs;
-            if (dl_rowset_init(&rs, derived)) {
+            if (dl_rowset_init(prog, &rs, derived)) {
                 int64_t ncols_t = ray_table_ncols(rel->table);
                 int64_t** tbl_cols = (int64_t**)ray_calloc_raw(sizeof(int64_t*) * (size_t)ncols_t);
-                if (tbl_cols) {
-                    for (int64_t c = 0; c < ncols_t; c++) {
-                        ray_t* col = ray_table_get_col_idx(rel->table, c);
-                        tbl_cols[c] = col ? (int64_t*)ray_data(col) : NULL;
-                    }
+                /* every column must be readable: the probe reads each
+                 * row's cell of every column.  A column that fails to
+                 * materialize skips this rule's marking and is kept as the
+                 * program's error. */
+                bool cols_ok = tbl_cols != NULL;
+                for (int64_t c = 0; cols_ok && c < ncols_t; c++) {
+                    ray_t* col = ray_table_col_idx(rel->table, c);
+                    if (col && RAY_IS_ERR(col)) { dl_keep_err(prog, col); col = NULL; }
+                    if (!col) cols_ok = false;
+                    else tbl_cols[c] = (int64_t*)ray_data(col);
+                }
+                if (cols_ok) {
                     for (int64_t row = 0; row < nrows; row++) {
                         if (pd[row] >= 0) continue;
                         if (dl_rowset_contains(&rs, tbl_cols, row))
                             pd[row] = r;
                     }
-                    ray_free_raw(tbl_cols);
                 }
+                ray_free_raw(tbl_cols);
                 dl_rowset_destroy(&rs);
             }
             ray_release(derived);
@@ -3069,8 +3186,8 @@ int dl_eval(dl_program_t* prog) {
                  * non-i64 columns (e.g. RAY_SYM from head-constant slots). */
                 prev_tables[rel_idx] = ray_table_new(rel->arity);
                 for (int c = 0; c < rel->arity && c < DL_MAX_ARITY; c++) {
-                    ray_t* src = ray_table_get_col_idx(rel->table, c);
-                    int8_t ctype = src ? src->type : RAY_I64;
+                    ray_col_meta_t sm;
+                    int8_t ctype = ray_table_col_meta_idx(rel->table, c, &sm) ? sm.type : RAY_I64;
                     ray_t* empty_col = ray_vec_new(ctype, 0);
                     if (empty_col && !RAY_IS_ERR(empty_col)) {
                         prev_tables[rel_idx] = ray_table_add_col(
@@ -3348,6 +3465,22 @@ ray_t* ray_datoms_fn(ray_t** args, int64_t n) {
     return tbl;
 }
 
+/* Borrow the three plain datoms columns (e, a, v) of `db`.  Returns NULL, or
+ * the owned error of the first column that failed to materialize. */
+static ray_t* dl_datoms_cols(ray_t* db, ray_t** e, ray_t** a, ray_t** v) {
+    *e = ray_table_col_idx(db, 0);
+    *a = ray_table_col_idx(db, 1);
+    *v = ray_table_col_idx(db, 2);
+    ray_t* err = NULL;
+    ray_t** cols[3] = { e, a, v };
+    for (int i = 0; i < 3; i++) {
+        if (!*cols[i] || !RAY_IS_ERR(*cols[i])) continue;
+        if (err) ray_error_free(*cols[i]);
+        else err = *cols[i];
+    }
+    return err;
+}
+
 /* (assert-fact db entity attr value) — append a triple to the datoms table */
 ray_t* ray_assert_fact_fn(ray_t** args, int64_t n) {
     if (n != 4) return ray_error("arity", "assert-fact expects 4 arguments: db entity attr value");
@@ -3385,10 +3518,13 @@ ray_t* ray_assert_fact_fn(ray_t** args, int64_t n) {
     if (RAY_IS_ERR(result)) return result;
 
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* old_col = ray_table_get_col_idx(db, c);
+        ray_t* old_col = ray_table_col_idx(db, c);
+        if (old_col && RAY_IS_ERR(old_col)) { ray_release(result); return old_col; }
         int64_t col_name = ray_table_col_name(db, c);
 
-        /* Clone the column via retain + COW on append */
+        /* Clone the column via retain + COW on append.  A slot holding an
+         * encoded column reaches the append with two references (the table's
+         * cache and ours), so the cached materialization is copied. */
         ray_retain(old_col);
         ray_t* new_col = old_col;
 
@@ -3447,9 +3583,9 @@ ray_t* ray_retract_fact_fn(ray_t** args, int64_t n) {
         return ray_error("type", "retract-fact: value must be an integer or symbol");
 
     /* Get existing columns */
-    ray_t* e_col = ray_table_get_col_idx(db, 0);
-    ray_t* a_col = ray_table_get_col_idx(db, 1);
-    ray_t* v_col = ray_table_get_col_idx(db, 2);
+    ray_t *e_col, *a_col, *v_col;
+    ray_t* col_err = dl_datoms_cols(db, &e_col, &a_col, &v_col);
+    if (col_err) return col_err;
     int64_t nrows = ray_len(e_col);
 
     int64_t* e_data = (int64_t*)ray_data(e_col);
@@ -3502,9 +3638,9 @@ ray_t* ray_scan_eav_fn(ray_t** args, int64_t n) {
     if (db->type != RAY_TABLE || ray_table_ncols(db) != 3)
         return ray_error("type", "scan-eav: first arg must be a datoms table");
 
-    ray_t* e_col = ray_table_get_col_idx(db, 0);
-    ray_t* a_col = ray_table_get_col_idx(db, 1);
-    ray_t* v_col = ray_table_get_col_idx(db, 2);
+    ray_t *e_col, *a_col, *v_col;
+    ray_t* col_err = dl_datoms_cols(db, &e_col, &a_col, &v_col);
+    if (col_err) return col_err;
     int64_t nrows = ray_table_nrows(db);
 
     if (n == 2) {
@@ -3620,9 +3756,9 @@ ray_t* ray_pull_fn(ray_t** args, int64_t n) {
     }
 
     int64_t entity_id = entity->i64;
-    ray_t* e_col = ray_table_get_col_idx(db, 0);
-    ray_t* a_col = ray_table_get_col_idx(db, 1);
-    ray_t* v_col = ray_table_get_col_idx(db, 2);
+    ray_t *e_col, *a_col, *v_col;
+    ray_t* col_err = dl_datoms_cols(db, &e_col, &a_col, &v_col);
+    if (col_err) return col_err;
     int64_t nrows = ray_table_nrows(db);
 
     const int64_t* e_data = (const int64_t*)ray_data(e_col);
@@ -4414,9 +4550,21 @@ ray_t* ray_query_fn(ray_t** args, int64_t n) {
         int64_t nrows_db = ray_table_nrows(db);
         ray_t* eav_tbl = ray_table_new(3);
         for (int c = 0; c < 3; c++) {
-            ray_t* col = ray_table_get_col_idx(db, c);
+            /* A SYM column is read (converted to I64 ids); any other column
+             * goes into the EAV table as it is, encoded or not. */
+            ray_col_meta_t cm;
+            if (!ray_table_col_meta_idx(db, c, &cm)) continue;
+            ray_t* col = (cm.type == RAY_SYM) ? ray_table_col_idx(db, c)
+                                              : ray_table_slot_idx(db, c);
             if (!col) continue;
-            if (col->type == RAY_SYM) {
+            if (RAY_IS_ERR(col)) {
+                ray_release(eav_tbl);
+                dl_rule_free_exprs(&qrule);
+                dl_program_free(prog);
+                ray_release(db);
+                return col;
+            }
+            if (cm.type == RAY_SYM) {
                 /* Convert SYM -> I64.  The I64 ids flow into datalog's
                  * runtime-id world (literal compares, joins with parsed
                  * constants), so each cell must be re-expressed as a
@@ -4552,8 +4700,18 @@ ray_t* ray_query_fn(ray_t** args, int64_t n) {
                 return ray_error("memory", "query: failed to create env-backed EDB table");
             }
             for (int c = 0; c < pred_arity; c++) {
-                ray_t* col = ray_table_get_col_idx(env_val, c);
+                ray_col_meta_t cm;
+                bool have_col = ray_table_col_meta_idx(env_val, c, &cm);
+                ray_t* col = !have_col ? NULL
+                           : (cm.type == RAY_SYM) ? ray_table_col_idx(env_val, c)
+                                                  : ray_table_slot_idx(env_val, c);
                 ray_t* next_clean;
+                if (col && RAY_IS_ERR(col)) {
+                    ray_release(clean);
+                    dl_program_free(prog);
+                    ray_release(db);
+                    return col;
+                }
                 if (!col) {
                     /* Silently skipping would build `clean` with fewer than
                      * pred_arity columns yet still register it via dl_add_edb
@@ -4563,7 +4721,7 @@ ray_t* ray_query_fn(ray_t** args, int64_t n) {
                     ray_release(db);
                     return ray_error("schema", "query: env-backed EDB table missing expected column");
                 }
-                if (col->type == RAY_SYM) {
+                if (cm.type == RAY_SYM) {
                     ray_t* i64col = ray_vec_new(RAY_I64, nrows_env);
                     if (!i64col) {
                         ray_release(clean);
@@ -4667,10 +4825,15 @@ ray_t* ray_query_fn(ray_t** args, int64_t n) {
             strncpy(prev, p, sizeof(prev) - 1);
             prev[sizeof(prev) - 1] = '\0';
         }
+        ray_t* first = prog->first_err;
+        prog->first_err = NULL;
         dl_program_free(prog);
         ray_release(db);
-        if (ray_interrupted())
+        if (ray_interrupted()) {
+            if (first) ray_error_free(first);
             return ray_error("cancel", "interrupted");
+        }
+        if (first) return first;     /* the failing column's own error */
         if (prev[0]) {
             return ray_error("domain", "query: evaluation failed: %s", prev);
         }
@@ -4690,8 +4853,9 @@ ray_t* ray_query_fn(ray_t** args, int64_t n) {
     int64_t ncols = ray_table_ncols(raw);
     ray_t* result = ray_table_new(n_find_vars);
     for (int i = 0; i < n_find_vars && i < (int)ncols; i++) {
-        ray_t* col = ray_table_get_col_idx(raw, i);
+        ray_t* col = ray_table_col_idx(raw, i);
         if (!col) continue;
+        if (RAY_IS_ERR(col)) { ray_release(result); dl_program_free(prog); ray_release(db); return col; }
         ray_t* clean = dl_untag_i64_col(col);   /* returns retained col when nothing is tagged */
         if (!clean || RAY_IS_ERR(clean)) { ray_release(result); dl_program_free(prog); ray_release(db);
             return clean ? clean : ray_error("memory", "query: untag"); }
@@ -4789,6 +4953,7 @@ ray_t* ray_dl_eval_fn(ray_t* x) {
     int rc = dl_eval(prog);
     if (rc == 0) return ray_bool(true);
     if (ray_interrupted()) return ray_error("cancel", "interrupted");
+    if (prog->first_err) { ray_t* e = prog->first_err; prog->first_err = NULL; return e; }
     return ray_error("domain", "dl-eval: evaluation failed");
 }
 

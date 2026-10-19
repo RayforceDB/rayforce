@@ -36,6 +36,8 @@
 #include "exec.h"
 #include "core/pool.h"
 #include "core/profile.h"
+#include "core/runtime.h"   /* ray_err_code — expr_eval_err_fatal */
+#include "store/colrange.h"
 #include "store/csr.h"
 #include "store/hnsw.h"
 #include "lftj.h"
@@ -328,10 +330,18 @@ static inline void col_propagate_str_pool_parted(ray_t* dst, ray_t** segs, int64
 static inline void col_propagate_nulls_gather(ray_t* dst, const ray_t* src,
                                                const int64_t* indices,
                                                int64_t count) {
-    bool src_has_nulls = ray_vec_may_have_nulls(src);
+    /* Two loops, the may-have-nulls test hoisted out: this runs once per
+     * row per gathered column, and with the test inside, inlined into a
+     * large caller (sel_compact), the loop lost its registers and cost ~8%
+     * on where-heavy group queries. */
+    if (!ray_vec_may_have_nulls(src)) {
+        for (int64_t r = 0; r < count; r++)
+            if (indices[r] < 0) ray_vec_set_null(dst, r, true);
+        return;
+    }
     for (int64_t r = 0; r < count; r++) {
-        if (indices[r] < 0 ||
-            (src_has_nulls && ray_vec_is_null((ray_t*)src, indices[r])))
+        int64_t i = indices[r];
+        if (i < 0 || ray_vec_is_null((ray_t*)src, i))
             ray_vec_set_null(dst, r, true);
     }
 }
@@ -378,9 +388,12 @@ static inline const int64_t* parted_table_counts(ray_t* tbl, int64_t* n_out) {
     if (!tbl || RAY_IS_ERR(tbl) || tbl->type != RAY_TABLE) return NULL;
     int64_t nc = ray_table_ncols(tbl);
     for (int64_t c = 0; c < nc; c++) {
-        ray_t* col = ray_table_get_col_idx(tbl, c);
-        if (col && col->type == RAY_MAPCOMMON) {
-            ray_t* rc = ((ray_t**)ray_data(col))[1];
+        /* metadata first: an encoded column stays encoded; MAPCOMMON is plain */
+        ray_col_meta_t m;
+        if (!ray_table_col_meta_idx(tbl, c, &m) || m.type != RAY_MAPCOMMON) continue;
+        ray_t* col = ray_table_col_idx(tbl, c);
+        if (col && !RAY_IS_ERR(col) && col->type == RAY_MAPCOMMON) {
+            ray_t* rc = ((ray_t**)ray_data(col))[1];   /* not-a-table */
             if (!rc || RAY_IS_ERR(rc)) return NULL;
             *n_out = rc->len;
             return (const int64_t*)ray_data(rc);
@@ -1037,15 +1050,42 @@ typedef struct {
         bool        nullable;   /* lanes may contain NULL_I64 / NaN */
         bool        null_src;   /* that nullability traces to a nullable column
                                  * (else: only op-generated sentinels) */
+        ray_col_src_t* src;     /* bound source (REG_SCAN; borrowed from the graph) */
+        bool        enc;        /* src is range-read per morsel (generation 2,
+                                 * single file, not materialized; or, rebound
+                                 * per segment, an encoded parted segment):
+                                 * data is NULL */
         const void* data;       /* column data pointer (REG_SCAN only) */
         ray_t*       col_obj;    /* source column vec (REG_SCAN, non-parted) —
                                   * carries the chunk-zone index for zone-skip */
-        ray_t*       parted_col; /* parted wrapper (is_parted only) */
+        ray_t*       parted_col; /* parted wrapper, or a RAY_ENCCOL_PARTED without a
+                                  * published materialization (is_parted only):
+                                  * expr_eval_full_parted rebinds it per segment */
         double      const_f64;  /* scalar value (REG_CONST) */
         int64_t     const_i64;  /* scalar value (REG_CONST) */
     } regs[EXPR_MAX_REGS];
     expr_ins_t ins[EXPR_MAX_INS];
 } ray_expr_t;
+
+/* Encoded leaves of a fused BOOL program (expr.c, expr_enc_plan_build): a
+ * comparison of an encoded single-file scan register with a constant of
+ * the same lane type, evaluated on the vector's view instead of its
+ * decoded values. */
+typedef struct {
+    uint8_t  ins;          /* the compare instruction */
+    uint8_t  reg;          /* its encoded scan register */
+    uint16_t op;           /* normalized: the column on the left */
+    bool     is_f64;       /* F64 lanes: the scan register and the constant are both F64 */
+    int64_t  ci;           /* the constant, I64 lanes */
+    double   cf;           /* the constant, F64 lanes */
+    uint8_t  null_result;  /* the leaf kernel's result on the lane's null sentinel */
+} expr_enc_leaf_t;
+typedef struct {
+    uint8_t         n_leaves;
+    int8_t          leaf_of_ins[EXPR_MAX_INS];
+    bool            load_reg[EXPR_MAX_REGS];   /* some non-leaf instruction reads the register */
+    expr_enc_leaf_t leaf[EXPR_MAX_INS];
+} expr_enc_plan_t;
 
 /* ══════════════════════════════════════════
  * Shared gather types — used by filter.c, exec.c (sort, join)
@@ -1086,6 +1126,109 @@ typedef struct {
  * position depend on the row count and the column type, since which path runs
  * is chosen by both. */
 static inline uint8_t sort_nulls_first(uint8_t desc) { return (uint8_t)!desc; }
+
+/* Column types whose directory statistics are ordered for the zone gate
+ * in P2: BOOL, U8, I16, I32, I64, DATE, TIME, TIMESTAMP. */
+static inline bool zone_dir_type(int8_t t) {
+    return t == RAY_BOOL || t == RAY_U8 || t == RAY_I16 || t == RAY_I32 || t == RAY_I64 ||
+           t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP;
+}
+
+/* Three-valued decision of (col cmp_op cval) over a range from its
+ * non-null extrema: 1 all-pass, 0 all-fail, -1 undecided.  Nulls rank
+ * below every value (zone_cmp_decision's rule).  all_null ranges and
+ * ranges without extrema are undecided. */
+static inline int zone_cmp_core(int64_t cmin, int64_t cmax, bool has_minmax, bool has_nulls,
+                                bool all_null, uint16_t cmp_op, int64_t cval) {
+    if (all_null || !has_minmax || cmin > cmax) return -1;   /* leave to the kernel */
+    switch (cmp_op) {
+    case OP_EQ:
+        if (cval < cmin || cval > cmax)                 return 0;
+        if (!has_nulls && cmin == cmax)                 return 1;
+        break;
+    case OP_NE:
+        if (!has_nulls && (cval < cmin || cval > cmax)) return 1;
+        if (!has_nulls && cmin == cmax && cval == cmin) return 0;
+        break;
+    case OP_LT:
+        if (!has_nulls && cmin >= cval)                 return 0;
+        if (!has_nulls && cmax <  cval)                 return 1;
+        break;
+    case OP_LE:
+        if (!has_nulls && cmin >  cval)                 return 0;
+        if (!has_nulls && cmax <= cval)                 return 1;
+        break;
+    case OP_GT:
+        if (cmax <= cval)                               return 0;
+        if (!has_nulls && cmin >  cval)                 return 1;
+        break;
+    case OP_GE:
+        if (cmax <  cval)                               return 0;
+        if (!has_nulls && cmin >= cval)                 return 1;
+        break;
+    default: break;
+    }
+    return -1;
+}
+
+/* The SYM membership rule: (ids == c) or (ids != c) over a range whose
+ * statistics exclude id 0 ("", the in-band null): min / max over the
+ * nonzero ids (has_minmax false when every row is id 0), n_nulls the id-0
+ * rows of `rows`.  1 all-pass, 0 all-fail, -1 undecided.  c is an id of
+ * the column's domain, or -1 for a string absent from it (EQ all-fail, NE
+ * all-pass, without statistics).  c == 0 is decided by the null count
+ * alone, a nonzero c by [min, max].  EQ / NE only: ids are never ordered
+ * (#738); any other operator is undecided. */
+static inline int zone_sym_decision(int64_t cmin, int64_t cmax, bool has_minmax, int64_t n_nulls,
+                                    int64_t rows, uint16_t op, int64_t c) {
+    if (op != OP_EQ && op != OP_NE) return -1;
+    int eq = -1;
+    if (c < 0) eq = 0;
+    else if (rows <= 0) eq = -1;
+    else if (c == 0) eq = n_nulls == 0 ? 0 : n_nulls == rows ? 1 : -1;
+    else if (n_nulls == rows) eq = 0;
+    else if (!has_minmax || cmin > cmax) eq = -1;
+    else if (c < cmin || c > cmax) eq = 0;
+    else if (cmin == cmax && n_nulls == 0) eq = 1;
+    if (eq < 0) return -1;
+    return op == OP_EQ ? eq : 1 - eq;
+}
+
+/* zone_cmp_core over double extrema (F32 / F64 directory and descriptor
+ * statistics, NaN excluded as the null): the same table under the
+ * predicate comparator, where -0.0 == +0.0 as plain C comparison gives. */
+static inline int zone_cmp_core_f64(double cmin, double cmax, bool has_minmax, bool has_nulls,
+                                    bool all_null, uint16_t cmp_op, double cval) {
+    if (all_null || !has_minmax || !(cmin <= cmax) || cval != cval) return -1;   /* leave to the kernel */
+    switch (cmp_op) {
+    case OP_EQ:
+        if (cval < cmin || cval > cmax)                 return 0;
+        if (!has_nulls && cmin == cmax)                 return 1;
+        break;
+    case OP_NE:
+        if (!has_nulls && (cval < cmin || cval > cmax)) return 1;
+        if (!has_nulls && cmin == cmax && cval == cmin) return 0;
+        break;
+    case OP_LT:
+        if (!has_nulls && cmin >= cval)                 return 0;
+        if (!has_nulls && cmax <  cval)                 return 1;
+        break;
+    case OP_LE:
+        if (!has_nulls && cmin >  cval)                 return 0;
+        if (!has_nulls && cmax <= cval)                 return 1;
+        break;
+    case OP_GT:
+        if (cmax <= cval)                               return 0;
+        if (!has_nulls && cmin >  cval)                 return 1;
+        break;
+    case OP_GE:
+        if (cmax <  cval)                               return 0;
+        if (!has_nulls && cmin >= cval)                 return 1;
+        break;
+    default: break;
+    }
+    return -1;
+}
 
 typedef struct {
     ray_t**       vecs;
@@ -1211,14 +1354,57 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
                    const int64_t* keep_syms, int keep_n);
 
 /* ── expr.c ── */
+/* The try_* planners and expr_compile return false for "not this shape".  A
+ * failed column bind (or plain request) also returns false but leaves an
+ * owned error in *err (ray_error_free); *err is NULL otherwise. */
+/* try_affine_sumavg_input's *out_vec is the base scan's column object: the
+ * plain column when it is ready, else a RAY_ENCCOL the caller binds
+ * (ray_col_src_bind) and reads by range.  try_linear_sumavg_input_i64 and
+ * try_prod_sumavg_input_f64 read whole-column pointers: an encoded term not
+ * yet materialized declines them (*err NULL). */
 bool try_affine_sumavg_input(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
-                             ray_t** out_vec, agg_affine_t* out_affine);
+                             ray_t** out_vec, agg_affine_t* out_affine, ray_t** err);
 bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
-                                 agg_linear_t* out_plan);
+                                 agg_linear_t* out_plan, ray_t** err);
 bool try_prod_sumavg_input_f64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
-                               agg_prod_t* out);
-bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out);
+                               agg_prod_t* out, ray_t** err);
+bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, ray_t** err);
 ray_t* expr_eval_full(const ray_expr_t* expr, int64_t nrows);
+/* A failed expr_eval_full result: NULL or oom keeps the caller's fallback;
+ * any other error (a range read's corrupt, a cancel) is the query's answer,
+ * since a fallback would re-read the same column and hide the path. */
+static inline bool expr_eval_err_fatal(ray_t* v) {
+    return v && RAY_IS_ERR(v) && strcmp(ray_err_code(v), "oom") != 0;
+}
+/* Test hook: run the morsel evaluator of a BOOL program over [start, end)
+ * (at most EXPR_MORSEL rows, any alignment) into out[0 .. end - start). */
+void ray_expr_test_eval_range(const ray_expr_t* expr, int64_t start, int64_t end,
+                              uint8_t* out, ray_t** err);
+/* Test hook: the parted evaluator runs every segment instead of stopping
+ * at the first failing one (false restores the stop). */
+void ray_expr_test_parted_all_segments(bool on);
+/* Monotonic count of fused-expression morsels decided from statistics
+ * (zone or directory) without reading their rows.  Tests. */
+int64_t ray_expr_test_zone_skips(void);
+/* Test hook: selection segments a single-leaf program emitted from an RLE
+ * view's runs (expr_leaf_emit), never expanded to bools. */
+int64_t ray_expr_test_leaf_runs(void);
+
+/* exec.c test hook: membership tests the sparse filter refinement took
+ * (refine_in_keep) since process start. */
+uint64_t ray_exec_test_refine_in(void);
+/* exec.c test hook: later `in` conjuncts over a single-file generation-2
+ * column answered by range (in_sel_single_within) since process start. */
+uint64_t ray_exec_test_in_single_within(void);
+/* query.c test hook: counts the (count (select ... where <compare>)) fast
+ * path answered since process start. */
+uint64_t ray_query_test_count_fast(void);
+/* query.c test hook: rows of data[0, n) of `type` (BOOL, U8, I16, I32,
+ * I64, DATE, TIME, TIMESTAMP) for which `x op rhs` holds, op 1..6 = == !=
+ * < <= > >=; ref: through the reference widening compare instead of the
+ * native-width kernels. */
+int64_t  ray_query_test_count_compare(int8_t type, const void* data, int64_t n, int64_t rhs,
+                                      int op, bool ref);
 
 /* Fused predicate→selection (skips the full BOOL vec).
  *
@@ -1228,30 +1414,64 @@ ray_t* expr_eval_full(const ray_expr_t* expr, int64_t nrows);
  * Returns:
  *   - non-NULL rowsel block  → the selection (caller installs / reads it).
  *   - NULL with *all_pass=1  → every row passed (all-pass = "no selection").
- *   - NULL with *all_pass=0  → disabled / unsupported / OOM — caller falls
- *                              back to exec_node→ray_rowsel_from_pred unchanged. */
+ *   - NULL with *all_pass=0  → disabled / unsupported, or an OOM before the
+ *                              dispatch (builders, rowsel block) — caller falls
+ *                              back to exec_node→ray_rowsel_from_pred unchanged.
+ *   - an owned error         → a column bind or a range read failed, a task's
+ *                              fused or range scratch ran out of memory (oom),
+ *                              or the dispatch was cancelled; the caller
+ *                              returns it (no fallback). */
 ray_t* exec_pred_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
                               bool* all_pass);
+/* exec_pred_to_selection of `pred` ANDed with the existing selection `sel`
+ * (borrowed): only the segments sel keeps are evaluated, with the fused
+ * path's encoded leaves.  The same tri-state return (a block, NULL with
+ * *all_pass, NULL unsupported) or an owned error. */
+ray_t* exec_pred_refine_selection(ray_graph_t* g, ray_op_t* pred, ray_t* sel, bool* all_pass);
 
 /* Per-morsel "fill this morsel's bool" callback used by pred_sel_drive.
  * Writes out[0..n) (1=selected, 0=not) for the kernel's verdict on global
- * rows [start, start+n).  Null rows must resolve to 0 (not-selected). */
-typedef void (*pred_sel_fill_fn)(void* ctx, int64_t start, int64_t n,
-                                 uint8_t* out);
+ * rows [start, start+n).  Null rows must resolve to 0 (not-selected).  `sc`
+ * is the calling task's range scratch: initialized at the task's start and
+ * freed at its end on the same thread, so a fill that range-reads one
+ * source keeps one decode buffer per task, not per morsel. */
+typedef void (*pred_sel_fill_fn)(void* ctx, ray_col_scratch_t* sc, int64_t start,
+                                 int64_t n, uint8_t* out);
 
 /* Generic selection-output driver: dispatch `fill` over [0,nrows) in the
  * per-task rowsel-builder model, stitch into one block.  Same tri-state
  * return as exec_pred_to_selection (block / NULL+all_pass / NULL).  Used by
- * the standalone predicate kernels (exec_in_to_selection). */
+ * the standalone predicate kernels (exec_in_to_selection).  With `fail`
+ * (initialized by the caller, noted by the fill), the dispatch's verdict is
+ * ray_scan_fail_finish's: the lowest noted failure, else `cancel` for a
+ * cancelled dispatch, returned as an owned error (no block). */
 ray_t* pred_sel_drive(int64_t nrows, pred_sel_fill_fn fill, void* fill_ctx,
-                      bool* all_pass);
+                      ray_scan_fail_t* fail, bool* all_pass);
 
-/* `in` selection-output worker: a root OP_IN over a flat column + literal set,
- * streaming membership bools straight into a rowsel.  Same tri-state return as
+/* `in` / `not-in` selection-output worker: a root OP_IN / OP_NOT_IN over a
+ * flat column + literal set, streaming membership bools straight into a
+ * rowsel (a generation-2 column is read by range).  Same tri-state return as
  * exec_pred_to_selection; NULL+all_pass=0 for any unsupported shape (non-CONST
- * set, parted/MAPCOMMON/STR column, or OP_NOT_IN) → bool-path fallback. */
+ * set, parted/MAPCOMMON/STR/GUID column) → bool-path fallback; an owned
+ * error for a bind or range-read failure or a cancel. */
 ray_t* exec_in_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
                             bool* all_pass);
+/* (== s "c") / (!= s "c") on a STR column whose source is generation 2
+ * (single file or parted with an encoded segment), as a rowsel.  Byte
+ * equality, nulls included ("" is the in-band null).  Per segment: one
+ * dictionary lookup; chunks and vectors decided from code bounds; STR_DICT
+ * vectors compared on codes; other vectors range-read and compared on
+ * bytes.  Same tri-state as exec_pred_to_selection; NULL with *all_pass
+ * false for any other shape (generation 0, a published materialization of
+ * a single-file column, a SYM constant: their path is unchanged). */
+ray_t* exec_str_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows, bool* all_pass);
+/* exec_str_to_selection ANDed with the installed selection `sel`
+ * (borrowed; a later conjunct, exec_pred_refine_selection): a morsel sel
+ * drops is not read.  The same returns. */
+ray_t* exec_str_refine_selection(ray_graph_t* g, ray_op_t* pred, ray_t* sel, bool* all_pass);
+/* Test hook: STR selections answered (within 0: a first conjunct; 1: a
+ * refinement) since process start. */
+uint64_t ray_exec_test_str_sel(int within);
 ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input);
 ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* rhs);
 ray_t* exec_sym_order(uint16_t opcode, ray_t* lhs, ray_t* rhs,
@@ -1315,6 +1535,12 @@ static inline void radix_key_bounds_finish(ray_t* col, int64_t* kmin, int64_t* k
 void mk_prescan_fn(void* arg, uint32_t wid, int64_t start, int64_t end);
 uint32_t* build_enum_rank(ray_t* col, int64_t nrows, ray_t** hdr_out);
 ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit);
+/* HEAD(SORT) of `limit` rows under the lazy selection `sel` (borrowed),
+ * late materialization: the keys compacted and top-k'd, then only the
+ * winners' rows gathered, the old route's answer row for row.  NULL when
+ * the shape is not the top-k shortcut's (compact the table and sort). */
+ray_t* exec_sort_head_sel(ray_graph_t* g, ray_op_t* op, ray_t* tbl, ray_t* sel, int64_t limit);
+uint64_t ray_sort_test_late_heads(void);   /* test hook: HEAD(SORT)s it answered */
 
 /* ── join.c ── */
 ray_t* exec_join(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ray_t* right_table);
@@ -1325,6 +1551,36 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
 
 /* ── group.c ── */
 ray_t* exec_reduction(ray_graph_t* g, ray_op_t* op, ray_t* input);
+/* Reduction `opcode` (out_type: the op's, 0 for the input's) over a bound
+ * encoded source without a selection: the result exec_reduction gives over
+ * its materialization, from directory statistics where agg.c answers a
+ * generation-0 CHUNK_ZONE column from its zone (ray_zone_dir_answer),
+ * else by range reads.  NULL when the type or op is not served here (the
+ * caller takes the plain path); otherwise a result or an owned error. */
+ray_t* ray_reduce_src(ray_col_src_t* src, uint16_t opcode, int8_t out_type);
+/* Test hook (C tests only): 0 normal routing; 1 skip the v2 aggregate
+ * engine (legacy ladder); 2 also skip the direct-array route (legacy
+ * radix); 3 also skip the slice-group probe.  Disarmed by
+ * ray_test_hooks_off. */
+void ray_group_test_route(int route);
+/* Test hook (C tests only): the scalar route's chunk walk (scalar_chunk_fn)
+ * runs serially in tasks of `rows` rows, any cut (as ray_pool_dispatch's
+ * grain after its ring clamp); 0 dispatches as usual.  Disarmed by
+ * ray_test_hooks_off. */
+void ray_group_test_scalar_grain(int64_t rows);
+/* Test hook (C tests only): the scalar route's F64 lane sum of d[0, n) at
+ * absolute row row0, as one block (*whole) and as pieces cut at cuts[]
+ * through the staged piece function (*cut). */
+void ray_group_test_f64_lanes(const double* d, int64_t row0, int64_t n, const int64_t* cuts,
+                              int ncuts, double* whole, double* cut);
+ray_t* exec_reduction_src(ray_graph_t* g, ray_op_t* op, ray_col_src_t* src);
+/* ray_first_fn / ray_last_fn of a bound source for the types they read
+ * with collection_elem among those served here (I32, I16, BOOL, U8, DATE,
+ * TIME, TIMESTAMP): row 0 (len - 1) itself, a null row a typed null, read
+ * by range.  NULL for any other type; else an atom or an owned error. */
+ray_t* ray_reduce_src_elem(ray_col_src_t* src, bool last);
+/* (collection.c) The value (at tbl 'col) returns eagerly. */
+ray_t* ray_table_col_value(ray_t* tbl, int64_t sym);
 ray_t* exec_count_distinct(ray_graph_t* g, ray_op_t* op, ray_t* input);
 
 /* Parallel distinct for large fixed-width columns: radix-partitioned
@@ -1383,6 +1639,45 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit)
 /* Monotonic count of streaming parted-GROUP kernel (exec_group_per_partition)
  * entries.  O(1) per query; surfaced via (.sys.mem)'s "group-perpart-runs". */
 int64_t ray_group_perpart_runs(void);
+/* Monotonic count of exec_group_per_partition runs that returned their
+ * result (not the concat fallback's NULL, not an error).  Tests. */
+int64_t ray_group_perpart_done(void);
+/* Per-partition non-null count slots built for nullable AVG/VAR/DEV inputs
+ * (test hook; a null-free input keeps the row count). */
+int64_t ray_group_perpart_nn_slots(void);
+
+/* Monotonic count of exec_group_parted's in-place concat groups (the
+ * parted columns grouped from their segments, no flatten).  Tests. */
+int64_t ray_group_segstream_runs(void);
+/* Monotonic bytes of null fill the parted group built for ragged
+ * partitions' stand-ins (bounded per query by the group's transient
+ * budget, AGG_COMPACT_BITMAP_BUDGET).  Tests. */
+int64_t ray_group_null_fill_bytes(void);
+/* Monotonic count of rows the direct-array key prescan walked over a
+ * staged (generation-2) key by range (minmax_piece).  Tests. */
+int64_t ray_group_test_minmax_staged_rows(void);
+/* Monotonic count of per-partition unordered takes answered from the
+ * first keys read up front (grp_first_keys_scan).  Tests. */
+int64_t ray_group_firstkeys_runs(void);
+
+/* A parted fixed-width column (a plain parted wrapper or a RAY_ENCCOL_PARTED
+ * slot; base neither STR nor LIST) copied into one owned flat vector of
+ * `total` rows: segments read by range (in place when plain or already
+ * materialized, a vector at a time when encoded; never materialized), SYM
+ * cells at the widest segment's width over the first segment's domain,
+ * HAS_NULLS from the segments.  An owned vector or error. */
+ray_t* parted_flatten_fixed(ray_t* col, int64_t total);
+/* parted_flatten_fixed reading a hand-built plain wrapper's missing (NULL)
+ * segments as their partitions' rows of nulls (cnt / ncnt: the partition-key
+ * counts, parted_table_counts). */
+ray_t* parted_flatten_fixed_c(ray_t* col, int64_t total, const int64_t* cnt, int64_t ncnt);
+/* Test hook: parted_flatten_fixed calls since process start (the flat
+ * copies of parted columns the group fallbacks make). */
+int64_t ray_group_test_flat_copies(void);
+/* The widest SYM width class over a parted SYM column's segments (a plain
+ * parted wrapper or a RAY_ENCCOL_PARTED slot), read from their headers: the
+ * width a vector holding every segment's ids needs.  0 for anything else. */
+uint8_t parted_sym_width(ray_t* col);
 
 /* Monotonic count of streaming parted asof-join per-partition (day) runs
  * bumped once per partition processed by the streaming asof path in query.c.
@@ -1455,6 +1750,9 @@ typedef struct {
 } ray_dict_cd_t;
 ray_dict_cd_t ray_dict_cd_get(void);
 void ray_dict_cd_clear(void);
+/* Runtime teardown, before the heap goes: frees this thread's stash and
+ * makes every other thread's stale (dropped, never freed: #865). */
+void ray_dict_cd_runtime_gone(void);
 
 /* ── collection.c ── */
 ray_t* distinct_vec_eager(ray_t* x);

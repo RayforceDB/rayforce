@@ -48,6 +48,7 @@ void ray_morsel_init(ray_morsel_t* m, ray_t* vec) {
 
     /* One-time hint for mmap'd vectors */
     if (vec->mmod == 1) {
+        /* generation-2 scans hint through ray_col_src_advise (store/colrange.c) */
         ray_vm_advise_seq(ray_data(vec), (size_t)m->len * m->elem_size);
     }
 }

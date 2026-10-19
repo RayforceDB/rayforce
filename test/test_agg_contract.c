@@ -994,7 +994,7 @@ static test_result_t test_fused_typed_comparisons(void) {
                 ray_op_t* rhs = ray_const_atom(graph, constant);
                 ray_op_t* predicate = ctors[op](graph, &graph->nodes[id], rhs);
                 fp_pred_t compiled = {0};
-                TEST_ASSERT_FMT(fp_compile_pred(graph, predicate, tbl, &compiled) == 0,
+                TEST_ASSERT_FMT(fp_compile_pred(graph, predicate, tbl, &compiled, &(ray_t*){NULL}) == 0,
                                 "fused %s comparison %d declined", ray_type_name(types[t]), op);
                 uint8_t bits[4]; fp_eval_pred(&compiled, 0, 4, bits);
                 for (int r = 0; r < 4; r++) {
@@ -2070,6 +2070,46 @@ static test_result_t test_dense_unordered_take(void) {
     PASS();
 }
 
+static bool first_n_same_table(ray_t* a, ray_t* b);
+
+/* Unordered take: N where the first N groups hold a large share of the
+ * rows (one heavy group) on a dense key: the pre-pass gives the shape to the
+ * bounded full run, whose task-local dense route selects the N smallest
+ * first rows itself (an unbounded run plus a pick is slower there).  The
+ * pick is taken only where the bounded run would leave the dense routes. */
+static test_result_t test_first_n_heavy_dense(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(8), RAY_OK);
+    ray_t* setup = ray_eval_str(
+        "(set hv_i (til 400000)) "
+        "(set hv_t (table [k v] (list (as 'I32 (* (!= 0 (% hv_i 3)) (% (* hv_i 7919) 50000))) hv_i)))");
+    TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup)); ray_release(setup);
+    ray_agg_first_n = false;
+    ray_t* old = ray_eval_str("(select {from:hv_t c:(count v) s:(sum v) by:k take:10})");
+    ray_agg_first_n = true;
+    agg_route_reset();
+    ray_t* r = ray_eval_str("(select {from:hv_t c:(count v) s:(sum v) by:k take:10})");
+    agg_route_stats_t stats = agg_route_stats();
+    TEST_ASSERT_TRUE(old && !RAY_IS_ERR(old) && r && !RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(stats.first_n, 0);
+    TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_V2_DENSE], 1);
+    TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_V2_RADIX], 0);
+    TEST_ASSERT_EQ_I(stats.dense_strategy, AGG_DENSE_TASK_LOCAL);
+    TEST_ASSERT_TRUE(first_n_same_table(old, r));
+    /* row 0 starts the heavy group 0 (a third of the rows), then rows 1, 2,
+     * 4, 5, ... start (i*7919) % 50000 */
+    const int32_t* k = (const int32_t*)ray_data(ray_table_get_col_idx(r, 0));
+    const int64_t* c = (const int64_t*)ray_data(ray_table_get_col_idx(r, 1));
+    TEST_ASSERT_EQ_I(k[0], 0);
+    TEST_ASSERT_TRUE(c[0] > 130000);
+    TEST_ASSERT_EQ_I(k[1], 7919);
+    TEST_ASSERT_EQ_I(k[2], (2 * 7919) % 50000);
+    TEST_ASSERT_EQ_I(k[3], (4 * 7919) % 50000);
+    ray_release(old); ray_release(r);
+    ray_release(ray_eval_str("(set hv_t 0) (set hv_i 0)"));
+    PASS();
+}
+
 /* Same names, types, row order and cells (SYM cells by their text). */
 static bool first_n_same_table(ray_t* a, ray_t* b) {
     if (!a || !b || RAY_IS_ERR(a) || RAY_IS_ERR(b)) return false;
@@ -2134,13 +2174,15 @@ static test_result_t test_first_n_take(void) {
         { "(select {from:fn_t by:u sf:(sum fl) take:10})", 0 },
         { "(select {from:fn_t by:u fv:(first v) take:10})", 0 },
         { "(select {from:fn_t by:u c:(count u) take:2000})", 0 },
-        { "(select {from:fn_t by:g c:(count u) take:10})", 0 },
         { "(select {from:fn_t by:u c:(count u) desc:c take:10})", 0 },
         { "(select {from:fn_t by:u c:(count u) take:-5})", 0 },
         { "(select {from:fn_t by:u c:(count u) take:0})", 0 },
         { "(select {from:fn_t by:u c:(count u) take:[-5 3]})", 0 },
         { "(select {from:fn_small by:u c:(count u) take:10})", 0 },
         { "(select {from:fn_t by:w c:(count u) take:100})", 0 },
+        /* the 10 groups hold 10/97 of the rows: the bounded run, on its
+         * dense route, selects them */
+        { "(select {from:fn_t by:g c:(count u) take:10})", 0 },
         { "(select {from:fn_t where:(> v 100000) by:u c:(count u) take:10})", 0 },
     };
     for (size_t q = 0; q < sizeof(shapes) / sizeof(shapes[0]); q++) {
@@ -2918,6 +2960,7 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/derived_key_per_symbol_route", test_derived_key_per_symbol_route, contract_setup, contract_teardown },
     { "agg_contract/narrow_extrema_limits", test_narrow_extrema_limits, contract_setup, contract_teardown },
     { "agg_contract/dense_strategies", test_dense_strategies, contract_setup, contract_teardown },
+    { "agg_contract/first_n_heavy_dense", test_first_n_heavy_dense, contract_setup, contract_teardown },
     { "agg_contract/dense_symbol_output", test_dense_symbol_output, contract_setup, contract_teardown },
     { "agg_contract/dense_task_local", test_dense_task_local, contract_setup, contract_teardown },
     { "agg_contract/dense_cache_bound", test_dense_cache_bound, contract_setup, contract_teardown },

@@ -27,6 +27,7 @@
 #include <rayforce.h>
 #include <string.h>
 #include <stdio.h>
+#include "store/colrange.h"
 
 struct ray_sym_domain_s;
 
@@ -66,13 +67,19 @@ static inline void ray_col_stamp_format(ray_t* header) {
     header->order = RAY_COL_FORMAT_MAJOR;
 }
 
-/* Validate the format generation in a mapped/built column header's `order`
- * byte (offset 17).  Returns RAY_OK iff it matches the reader's generation,
- * else RAY_ERR_VERSION.  Strict equality: with the current generation at 0,
- * legacy/pre-stamp files (order==0) load and any other generation is refused. */
+/* Accepts the generations this build reads (0 and 2); the pair check that
+ * separates them is ray_col_gen_of (store/encfmt.h). */
 static inline ray_err_t ray_col_check_format(const ray_t* header) {
-    return header->order == RAY_COL_FORMAT_MAJOR ? RAY_OK : RAY_ERR_VERSION;
+    return (header->order == RAY_COL_FORMAT_MAJOR || header->order == 2)
+           ? RAY_OK : RAY_ERR_VERSION;
 }
+
+/* Allowlist of attr bits the save path persists; see the rationale in
+ * col.c (loaders mask untrusted disk attrs to this set).  Literal values
+ * because this header does not include table/sym.h; col.c asserts them. */
+#define COL_DISK_ATTRS_MASK ((uint8_t)(0x03 /* RAY_SYM_W_MASK */ | \
+                                       0x20 /* RAY_ATTR_SORTED */ | \
+                                       0x40 /* RAY_ATTR_HAS_NULLS */))
 
 /* STR column files: a writer that stored every pooled descriptor's content
  * hash (ray_str_t.hash32) says so by putting this value in the header's
@@ -101,6 +108,87 @@ static inline void ray_col_stamp_str_hashed(ray_t* header) {
  * loads attach that symfile's domain (sym-domain architecture spec). */
 ray_err_t ray_col_save(ray_t* vec, const char* path);
 ray_err_t ray_col_save_bulk(ray_t* vec, const char* path);
+/* Write `vec` in the given generation (0 or 2).  ray_col_save / _bulk stay
+ * generation 0 only.  A column generation 2 cannot hold is written as 0. */
+ray_err_t ray_col_save_gen(ray_t* vec, const char* path, uint8_t gen);
+ray_err_t ray_col_save_bulk_gen(ray_t* vec, const char* path, uint8_t gen);
+
+/* Write context (spec "Writers"): a bound source (plain or encoded), the
+ * resolved generation and the SYM target domain.  Handles plain->0,
+ * plain->2, encoded->0 (materialize, then the generation-0 writer) and
+ * encoded->2 (range reads, SYM ids remapped into the target domain, no
+ * whole-column materialization).  On failure every temporary is released and
+ * the staging file removed; nothing is renamed into place. */
+/* The tri-state `compress` option of a save (spec "Generation
+ * resolution"): explicit true / false set every file; absent inherits. */
+typedef enum { RAY_COMPRESS_ABSENT = 0, RAY_COMPRESS_ON = 1, RAY_COMPRESS_OFF = 2 } ray_compress_t;
+
+enum { RAY_COL_IDX_KEEP = 0, RAY_COL_IDX_REBUILD = 1, RAY_COL_IDX_DROP = 2 };
+typedef struct {
+    ray_col_src_t src;                    /* bound by the caller (ray_col_src_bind); not released here */
+    const char*   name;                   /* column name, diagnostics */
+    uint8_t       gen;                    /* resolved generation: 0 or 2 */
+    struct ray_sym_domain_s* target_dom;  /* SYM: destination symfile domain; NULL = bare */
+    uint8_t       index_decision;         /* RAY_COL_IDX_*: generation 2 keeps, rebuilds or drops a
+                                           * region index; generation 0 takes KEEP only */
+    uint8_t       index_kind;             /* generation 2: kind to record (0 = from the source) */
+    bool          durable;
+} ray_col_write_t;
+ray_err_t ray_col_save_ctx(ray_col_write_t* w, const char* path);
+void      ray_col_test_fail_alloc(int64_t nth);   /* test hook; 0 disarms */
+/* Spec "Writing the index" (P6b): generation 0's STR DICT build condition,
+ * STR and RAY_DICT_MIN_ROWS <= len <= INT32_MAX (splay_build_index_col,
+ * ray_dict_acc_finish).  The callers add their own path rule (index
+ * building asked for, no HASH).  False while ray_col_test_no_dict is on. */
+bool      ray_col_dict_wanted(int8_t type, int64_t len);
+/* Test hook: true makes ray_col_dict_wanted answer false (a generation-2
+ * STR save writes no DICT); false disarms (ray_test_hooks_off). */
+void      ray_col_test_no_dict(bool on);
+
+/* Generation resolution, decided by a save under the destination's
+ * .write.lock.  `dest_cur` is the destination's current published
+ * generation directory, NULL or "" when it holds no published table.
+ * ON: 2 for every file generation 2 can hold; OFF: 0; ABSENT: 2 when the
+ * source is a RAY_ENCCOL or the destination's current generation stores the
+ * file `name` as generation 2, else 0.  Linked, nested and list columns
+ * are always 0; an indexed column is generation 2 with its index region
+ * (a SYM column's HASH or PART rebuilt over the target ids). */
+/* lossy: read errors read as 0 — writers use the *_err forms */
+uint8_t ray_col_file_gen(const char* path);   /* 2 when the file is generation 2, else 0 (missing included) */
+/* lossy: read errors read as 0 — writers use the *_err forms */
+uint8_t ray_col_resolve_gen(ray_compress_t mode, ray_t* src,
+                            const char* dest_cur, const char* name, size_t name_len);
+/* The same rule for writers that have only the column's type (streams).
+ * lossy: read errors read as 0 — writers use the *_err forms */
+uint8_t ray_col_resolve_gen_type(ray_compress_t mode, int8_t type,
+                                 const char* dest_cur, const char* name, size_t name_len);
+/* Checked forms, for savers: a missing destination file is generation 0,
+ * but a file that cannot be read (permissions, short, bad discriminator) or
+ * a path that overflows is an error, never a silent 0.  The uint8_t forms
+ * above read every error as 0. */
+ray_err_t ray_col_file_gen_err(const char* path, uint8_t* gen);
+/* First bytes of a magic-prefixed (header-less, generation-0) column file? */
+bool      ray_col_header_is_ext(const void* head, size_t n);
+ray_err_t ray_col_resolve_gen_err(ray_compress_t mode, ray_t* src, const char* dest_cur,
+                                  const char* name, size_t name_len, uint8_t* gen);
+/* Would resolving `src` under `mode` consult the destination?  Only an
+ * inheriting (ABSENT) save of a plain eligible column does. */
+bool      ray_col_resolve_needs_dest(ray_compress_t mode, ray_t* src);
+/* The same question for writers that have only the column's type (streams). */
+bool      ray_col_resolve_type_needs_dest(ray_compress_t mode, int8_t type);
+ray_err_t ray_col_resolve_gen_type_err(ray_compress_t mode, int8_t type, const char* dest_cur,
+                                       const char* name, size_t name_len, uint8_t* gen);
+/* Parse the `compress` option from `opts` (a RAY_DICT with SYM keys; NULL:
+ * absent).  strict: any key other than `compress` is a domain error.  A
+ * non-bool `compress` is a domain error.  Returns NULL or an owned error. */
+ray_t* ray_compress_opt_parse(ray_t* opts, bool strict, ray_compress_t* mode);
+void    ray_store_test_force_compress(bool on);   /* equivalence run: absent behaves as true */
+
+/* Can generation 2 hold this plain vector (type, no link)?  Index meta:
+ * the kind (every fresh kind) and the UNIQUE flag a plain column records;
+ * a stale root records none. */
+bool ray_col_gen2_eligible(ray_t* col);
+void ray_col_gen2_index_meta(ray_t* col, uint8_t* index_kind, uint8_t* col_flags);
 /* Validate the complete object graph accepted by ray_col_save without
  * opening or modifying a file.  Splayed saves use this before mutating a
  * symfile or any already-committed column generation. */

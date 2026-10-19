@@ -8,6 +8,7 @@
 #include "mem/heap.h"
 #include "mem/sys.h"
 #include "table/sym.h"
+#include "table/table.h"
 #include "store/part.h"
 #include "store/splay.h"
 #include "ops/idxop.h"
@@ -815,7 +816,7 @@ static void* pq_small_stack_worker(void* result) {
 }
 #endif
 /* Direct path: 7 uneven row groups merge into the whole-column zone; the
- * unclustered column with nulls gets a hash. */
+ * unclustered column with nulls keeps its zone (no converter HASH). */
 static test_result_t test_pq_splayed_inline_indexes(void) {
     const char* names[] = {"x","y"};
     for (int run = 0; run < 4; run++) {
@@ -843,10 +844,46 @@ static test_result_t test_pq_splayed_inline_indexes(void) {
         if (w->u.chunk_zone.null_bits)
             TEST_ASSERT_EQ_I(memcmp(ray_data(g->u.chunk_zone.null_bits),ray_data(w->u.chunk_zone.null_bits),(size_t)((g->u.chunk_zone.n_chunks+7)/8)),0);
         ray_release(want); ray_release(plain);
-        TEST_ASSERT_EQ_I(ray_index_kind(ray_table_get_col_idx(table,1)),RAY_IDX_HASH);
+        /* index policy: the converter persists no HASH of its own */
+        { ray_col_meta_t m1; TEST_ASSERT_TRUE(ray_table_col_meta_idx(table,1,&m1));
+          TEST_ASSERT_EQ_I(m1.index_kind,RAY_IDX_CHUNK_ZONE);
+          TEST_ASSERT_EQ_I(ray_index_kind(ray_table_get_col_idx(table,1)),RAY_IDX_CHUNK_ZONE); }
         ray_release(table); pq_remove_native(dir,names,2);
         ray_pool_destroy();
     }
+    PASS();
+}
+
+/* Smoke test: the parted Parquet conversion persists no HASH in any segment.
+ * zones.parquet's row groups (30-40K rows) are below one chunk, so the auto
+ * heuristic cannot fire here; the policy itself is pinned by
+ * store/staged_bulk_no_hash, which exercises the save this route uses.  The
+ * pin is still live: forcing an explicit hash onto each decoded batch in
+ * pq_write_reader makes it fail ("column 1 segment 0"). */
+static test_result_t test_pq_parted_no_segment_hash(void) {
+    char root[160];
+    snprintf(root, sizeof(root), "%s", ray_test_tmp("/tmp/rayforce-pq-nohash"));
+    (void)ray_test_rm_rf(root);
+    ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    ray_t* r = ray_parquet_parted_typed(FIX "zones.parquet", root, "t", NULL);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r)); TEST_ASSERT_EQ_I(r->i64, 200000); ray_release(r);
+    ray_t* t = ray_read_parted(root, "t");
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    int nparted = 0;
+    for (int64_t c = 0; c < ray_table_ncols(t); c++) {
+        ray_t* w = ray_table_get_col_idx(t, c);
+        TEST_ASSERT_TRUE(w != NULL);
+        if (!RAY_IS_PARTED(w->type)) continue;       /* the virtual partition-key column */
+        nparted++;
+        ray_t** segs = (ray_t**)ray_data(w);
+        for (int64_t s = 0; s < w->len; s++)
+            TEST_ASSERT_FMT(!segs[s] || ray_index_kind(segs[s]) != RAY_IDX_HASH,
+                            "column %lld segment %lld", (long long)c, (long long)s);
+    }
+    TEST_ASSERT_TRUE(nparted >= 2);
+    ray_release(t);
+    ray_pool_destroy();
+    (void)ray_test_rm_rf(root);
     PASS();
 }
 
@@ -3674,6 +3711,7 @@ const test_entry_t parquet_entries[] = {
     {"parquet/chunk_flush_error",test_pq_chunk_flush_error,pq_setup,pq_teardown},
 #endif
     {"parquet/splayed_inline_indexes",test_pq_splayed_inline_indexes,pq_setup,pq_teardown},
+    {"parquet/parted_no_segment_hash",test_pq_parted_no_segment_hash,pq_setup,pq_teardown},
     {"parquet/parallel",test_pq_parallel,pq_setup,pq_teardown},
     {"parquet/range",test_pq_range,pq_setup,pq_teardown},
     {NULL,NULL,NULL,NULL}

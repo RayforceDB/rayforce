@@ -2518,7 +2518,7 @@ static int run_pty_remote_ctrlD(uint16_t server_port)
      * at lines 858-866 rather than exiting the REPL. */
     {
         char ctrlD = 4;  /* ASCII EOT / Ctrl-D */
-        write(master_fd, &ctrlD, 1);
+        if (write(master_fd, &ctrlD, 1) != 1) { /* the checks below then fail */ }
     }
     usleep(200 * 1000);
 
@@ -2976,7 +2976,7 @@ static int run_pty_ctrl_c_during_lazy_materialize(void) {
         usleep(10 * 1000);
     }
 
-    (void)write(master_fd, ":q\n", 3);
+    if (write(master_fd, ":q\n", 3) != 3) { /* the wait below then times out */ }
     int status = 0;
     for (int i = 0; i < 30; i++) {
         pid_t r = waitpid(pid, &status, WNOHANG);

@@ -1,0 +1,36 @@
+;; Non-aggregate outputs beside by: over a saved parted table (the grouped
+;; scatter reads a flat copy of the source).  Every answer equals the same
+;; query over an in-memory copy, with no where, a pruned where and a partial
+;; where; the equivalence pass runs it over generation-2 saves.
+(.sys.exec "rm -rf rf_test_nagby") -- 0
+(set syms ['p 'q 'r 'u 'v 'w])
+(set mk (fn [n o] (table [a b s x i f bo ts] (list (- (% (* (+ o (til n)) 7919) 1000) 500) (% (* (+ o (til n)) 31) 97) (at syms (% (* (+ o (til n)) 13) 6)) (at (list "aa" "bb" "" "cc") (% (+ o (til n)) 4)) (as 'I32 (% (+ o (til n)) 50)) (as 'F64 (% (* (+ o (til n)) 17) 101)) (== 0 (% (+ o (til n)) 3)) (+ 2024.01.01D00:00:00.000000000 (* 1000000000 (+ o (til n))))))))
+(set days [2024.01.01 2024.01.02 2024.01.03 2024.01.04 2024.01.05 2024.01.06])
+(set ns [50 2000 3 70000 10 3])
+(set offs [0 50 2050 2053 72053 72063])
+(count (map (fn [k] (.db.splayed.set (format "rf_test_nagby/%/t/" (at days k)) (mk (at ns k) (at offs k)) "rf_test_nagby/.sym")) (til 6))) -- 6
+(set P (.db.parted.get "rf_test_nagby/" 't))
+(set F (raze (map (fn [k] (update {date: (take (at days k) (at ns k)) from: (mk (at ns k) (at offs k))})) (til 6))))
+;; tables with list columns compared through their printed form
+(set eqt (fn [a b] (== (format "%" a) (format "%" b))))
+(set n1 (fn [tb] (select {a: a by: s from: tb asc: s})))
+(set n2 (fn [tb] (select {u: (- a (avg a)) by: s from: tb asc: s})))
+(set n3 (fn [tb] (select {a: a x: x by: s from: tb where: (== date 2024.01.03) asc: s})))
+(set n4 (fn [tb] (select {a: a by: s from: tb where: (>= date 2024.01.02) asc: s})))
+(set n5 (fn [tb] (select {a: a by: s from: tb where: (or (== date 2024.01.03) (> a 450)) asc: s})))
+(set n6 (fn [tb] (select {a: a b: b by: s from: tb where: (> b 90) asc: s})))
+(set n7 (fn [tb] (select {c: (count a) a: a by: s from: tb where: (and (>= date 2024.01.02) (< b 10)) asc: s})))
+(eqt (n1 P) (n1 F)) -- true
+(eqt (n2 P) (n2 F)) -- true
+(eqt (n3 P) (n3 F)) -- true
+(eqt (n4 P) (n4 F)) -- true
+(eqt (n5 P) (n5 F)) -- true
+(eqt (n6 P) (n6 F)) -- true
+(eqt (n7 P) (n7 F)) -- true
+(count (n5 P)) -- 6
+;; the unsorted forms: every row lands in its own group
+(count (select {a: a by: s from: P})) -- 6
+(set w5 (fn [tb] (select {a: a by: s from: tb where: (or (== date 2024.01.03) (> a 450))})))
+(== (sum (map count (at (w5 P) 'a))) (count (select {from: F where: (or (== date 2024.01.03) (> a 450))}))) -- true
+(eqt (xasc (w5 P) 's) (xasc (w5 F) 's)) -- true
+(.sys.exec "rm -rf rf_test_nagby") -- 0

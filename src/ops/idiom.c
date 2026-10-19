@@ -24,6 +24,7 @@
 #include "vec/vec.h"
 #include "idiom.h"
 #include "opt.h"
+#include "table/table.h"   /* ray_table_col_meta */
 #include "mem/heap.h"
 #include <string.h>
 
@@ -86,11 +87,13 @@ static ray_op_t* rw_count_passthrough(ray_graph_t* g, ray_op_t* node) {
     return repl;
 }
 
-static ray_t* scan_source_col(ray_graph_t* g, ray_op_t* src) {
-    if (!g || !src || src->opcode != OP_SCAN) return NULL;
+/* The table and column a scan reads, by metadata (no decode). */
+static bool scan_source_meta(ray_graph_t* g, ray_op_t* src, ray_t** tbl_out,
+                             int64_t* sym_out, ray_col_meta_t* m) {
+    if (!g || !src || src->opcode != OP_SCAN) return false;
 
     ray_op_ext_t* ext = find_ext(g, src->id);
-    if (!ext) return NULL;
+    if (!ext) return false;
 
     uint16_t stored_table_id = 0;
     memcpy(&stored_table_id, src->pad, sizeof(uint16_t));
@@ -104,8 +107,10 @@ static ray_t* scan_source_col(ray_graph_t* g, ray_op_t* src) {
         tbl = g->table;
     }
 
-    if (!tbl) return NULL;
-    return ray_table_get_col(tbl, ext->sym);
+    if (!tbl || !ray_table_col_meta(tbl, ext->sym, m)) return false;
+    *tbl_out = tbl;
+    *sym_out = ext->sym;
+    return true;
 }
 
 /* True only when the input vector to (asc …) is statically known to
@@ -131,10 +136,10 @@ static bool pre_no_nulls_on_asc_input(ray_graph_t* g, ray_op_t* node) {
     }
 
     if (src->opcode == OP_SCAN) {
-        ray_t* col = scan_source_col(g, src);
-        if (!col) return false;
-        if (!ray_is_vec(col) && !RAY_IS_PARTED(col->type)) return false;
-        return !ray_vec_has_nulls(col);
+        ray_t* st; int64_t ss; ray_col_meta_t sm;
+        if (!scan_source_meta(g, src, &st, &ss, &sm)) return false;
+        if (!(sm.type >= RAY_BOOL && sm.type <= RAY_STR) && !RAY_IS_PARTED(sm.type)) return false;
+        return !ray_table_col_has_nulls(st, ss);
     }
 
     return false;
