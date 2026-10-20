@@ -1069,6 +1069,14 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
                  * the typed executor until the VM has a real F32 lane. */
                 if (node->out_type == RAY_F32)
                     EXPR_BAIL(EXPR_BAIL_OTHER);
+                /* An integer zero divisor gives NULL_I64 in the I64 lanes,
+                 * but `%` by a U8 divisor is the builtin's unsigned byte
+                 * modulo, where a zero divisor gives 0 (U8 has no null).
+                 * Leave it to the typed executor. */
+                if (node->opcode == OP_MOD && node->arity >= 2 &&
+                    node->out_type != RAY_F64 && op_child(g, node, 1) &&
+                    op_child(g, node, 1)->out_type == RAY_U8)
+                    EXPR_BAIL(EXPR_BAIL_NULL_SHAPE);
                 if (!op_child(g, node, 0)) EXPR_BAIL(EXPR_BAIL_OTHER);
                 uint8_t s1 = node_reg[node->in_id[0]];
                 if (s1 == 0xFF) EXPR_BAIL(EXPR_BAIL_OTHER);
@@ -1511,22 +1519,28 @@ static void expr_exec_binary(uint8_t opcode, uint8_t null_aware, int8_t dt, void
                 case OP_ADD: for (int64_t j = 0; j < n; j++) d[j] = (int64_t)((uint64_t)a[j] + (uint64_t)b[j]); break;
                 case OP_SUB: for (int64_t j = 0; j < n; j++) d[j] = (int64_t)((uint64_t)a[j] - (uint64_t)b[j]); break;
                 case OP_MUL: for (int64_t j = 0; j < n; j++) d[j] = (int64_t)((uint64_t)a[j] * (uint64_t)b[j]); break;
+                /* DIV/IDIV/MOD: a zero divisor (or the INT64_MIN / -1
+                 * overflow) yields NULL_I64, as in the fallback's zero-divisor
+                 * pass.  The inputs are null-free here, so the sentinel is
+                 * unambiguous; the destination register is nullable
+                 * (expr_op_generates_null) and expr_flag_output_nulls scans
+                 * it to set HAS_NULLS.  Same select as writing 0: no cost. */
                 case OP_DIV:
                 case OP_IDIV:
                     /* Whole morsel within ±2^53 → the vectorizable double kernel
                      * (bit-exact there); otherwise the exact scalar int64 kernel. */
                     if (i64_span2_dbl_exact(a, b, n)) {
                         for (int64_t j = 0; j < n; j++)
-                            d[j] = b[j] != 0 ? (int64_t)floor((double)a[j] / (double)b[j]) : 0;
+                            d[j] = b[j] != 0 ? (int64_t)floor((double)a[j] / (double)b[j]) : NULL_I64;
                     } else {
                         for (int64_t j = 0; j < n; j++) {
                             int64_t q = 0;
-                            d[j] = floor_idiv_i64_checked(a[j], b[j], &q) ? q : 0;
+                            d[j] = floor_idiv_i64_checked(a[j], b[j], &q) ? q : NULL_I64;
                         }
                     }
                     break;
                 case OP_MOD: for (int64_t j = 0; j < n; j++) {
-                    if (b[j]==0 || (b[j]==-1 && a[j]==INT64_MIN)) { d[j]=0; continue; }
+                    if (b[j]==0 || (b[j]==-1 && a[j]==INT64_MIN)) { d[j]=NULL_I64; continue; }
                     int64_t m = a[j]%b[j];
                     if (m && (m^b[j])<0) m+=b[j];
                     d[j] = m;
@@ -5006,8 +5020,28 @@ ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* 
                 const int32_t* b = (const int32_t*)ray_data(rhs);
                 for (int64_t i = 0; i < len; i++)
                     if (b[i] == 0) ray_vec_set_null(result, i, true);
+            } else if (rt == RAY_I16) {
+                const int16_t* b = (const int16_t*)ray_data(rhs);
+                for (int64_t i = 0; i < len; i++)
+                    if (b[i] == 0) ray_vec_set_null(result, i, true);
+            } else if ((rt == RAY_U8 && opc != OP_MOD) || rt == RAY_BOOL) {
+                /* `%` by a U8 divisor is unsigned byte modulo: 0, no null */
+                const uint8_t* b = (const uint8_t*)ray_data(rhs);
+                for (int64_t i = 0; i < len; i++)
+                    if (b[i] == 0) ray_vec_set_null(result, i, true);
+            } else if (rt == RAY_F64 && result->type != RAY_F64) {
+                /* An F64 result already holds NULL_F64 there; an integer
+                 * one (div of floats) holds 0. */
+                const double* b = (const double*)ray_data(rhs);
+                for (int64_t i = 0; i < len; i++)
+                    if (b[i] == 0.0) ray_vec_set_null(result, i, true);
+            } else if (rt == RAY_F32 && result->type != RAY_F32 &&
+                       result->type != RAY_F64) {
+                const float* b = (const float*)ray_data(rhs);
+                for (int64_t i = 0; i < len; i++)
+                    if (b[i] == 0.0f) ray_vec_set_null(result, i, true);
             }
-            /* F64 div-by-zero produces NaN which is handled by propagate_nulls */
+            /* A U8 / BOOL result has no null (ray_vec_set_null declines). */
         } else {
             /* Scalar divisor: check for zero using the correct type */
             bool is_zero = false;
@@ -5016,6 +5050,8 @@ ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* 
                 is_zero = (r_f64_val == 0.0);
             else
                 is_zero = (r_i64_val == 0);
+            if (opc == OP_MOD && rhs->type == -RAY_U8)
+                is_zero = false;   /* unsigned byte modulo: 0, no null */
             if (is_zero) {
                 for (int64_t i = 0; i < len; i++)
                     ray_vec_set_null(result, i, true);

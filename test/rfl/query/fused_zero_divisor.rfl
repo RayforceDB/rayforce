@@ -1,0 +1,101 @@
+;; @requires: posix  (splayed / parted fixtures under /tmp, cleaned through a POSIX shell via .sys.exec)
+;; A zero divisor gives a typed null in a query, as in the builtin.
+;;
+;; A select / update / where / by expression over null-free columns
+;; compiles to the fused expression kernel with every instruction plain
+;; (null_aware = 0).  The plain I64 DIV / IDIV / MOD kernels wrote 0 for a
+;; zero divisor, so `(select {x: (% k 0) from: T})` gave [0 0] where
+;; `(% (at T 'k) 0)` gives [0Nl 0Nl].  They now write the null sentinel
+;; (the destination is already nullable, expr_op_generates_null), and the
+;; output scan sets HAS_NULLS, so nil? finds the nulls and sum / avg skip
+;; them.  The typed executor's zero-divisor pass also covers I16, U8, BOOL,
+;; F64 and F32 divisor columns (it covered I64 / I32 only), and constant
+;; folding no longer folds a zero divisor to 0 (or x/0 to inf).  Where the
+;; builtin's result is U8, or `%` takes a U8 divisor, there is no null: the
+;; result stays 0.
+
+(set T (table [k i h u b f e g w] (list [5 7 -3 9 4 -8] (as 'I32 [2 0 5 0 3 1]) (as 'I16 [2 0 5 0 3 1]) (as 'U8 [2 0 5 0 3 1]) [true false true false true true] [2.0 0.0 5.0 0.0 3.0 1.0] (as 'F32 [2.0 0.0 5.0 0.0 3.0 1.0]) [0 1 0 1 0 1] [1 1 0 1 1 1])))
+
+;; ── the reported cases ──────────────────────────────────────────────────────
+(% (at T 'k) 0) -- [0Nl 0Nl 0Nl 0Nl 0Nl 0Nl]
+(at (select {x: (% k 0) from: T}) 'x) -- [0Nl 0Nl 0Nl 0Nl 0Nl 0Nl]
+(% 2 (at T 'b)) -- [0 0Nl 0 0Nl 0 0]
+(at (select {x: (% 2 b) from: T}) 'x) -- [0 0Nl 0 0Nl 0 0]
+
+;; ── `%`, `div`, `/` by every divisor type, against the builtin ─────────────
+(at (select {x: (% k i) from: T}) 'x) -- [1 0Nl 2 0Nl 1 0]
+(at (select {x: (% k h) from: T}) 'x) -- [1 0Nl 2 0Nl 1 0]
+(at (select {x: (% k b) from: T}) 'x) -- (% (at T 'k) (at T 'b))
+(at (select {x: (% k f) from: T}) 'x) -- (% (at T 'k) (at T 'f))
+(at (select {x: (% k e) from: T}) 'x) -- (% (at T 'k) (at T 'e))
+(at (select {x: (div k 0) from: T}) 'x) -- [0Nl 0Nl 0Nl 0Nl 0Nl 0Nl]
+(at (select {x: (div k i) from: T}) 'x) -- [2 0Nl -1 0Nl 1 -8]
+(at (select {x: (div k i) from: T}) 'x) -- (div (at T 'k) (at T 'i))
+(at (select {x: (div k h) from: T}) 'x) -- (div (at T 'k) (at T 'h))
+(at (select {x: (div k u) from: T}) 'x) -- [2 0Nl -1 0Nl 1 -8]
+(at (select {x: (div k u) from: T}) 'x) -- (div (at T 'k) (at T 'u))
+(at (select {x: (div k b) from: T}) 'x) -- (div (at T 'k) (at T 'b))
+(at (select {x: (div k f) from: T}) 'x) -- (div (at T 'k) (at T 'f))
+(at (select {x: (div k e) from: T}) 'x) -- (div (at T 'k) (at T 'e))
+(at (select {x: (div e e) from: T}) 'x) -- [1 0Nl 1 0Nl 1 1]
+(at (select {x: (/ k 0) from: T}) 'x) -- [0Nf 0Nf 0Nf 0Nf 0Nf 0Nf]
+(at (select {x: (/ k i) from: T}) 'x) -- (/ (at T 'k) (at T 'i))
+(at (select {x: (/ k u) from: T}) 'x) -- (/ (at T 'k) (at T 'u))
+(at (select {x: (/ k f) from: T}) 'x) -- (/ (at T 'k) (at T 'f))
+
+;; ── no null where the builtin's result has none ─────────────────────────────
+(% (at T 'u) (at T 'u)) -- [0x00 0x00 0x00 0x00 0x00 0x00]
+(at (select {x: (% u u) from: T}) 'x) -- [0x00 0x00 0x00 0x00 0x00 0x00]
+(at (select {x: (% i u) from: T}) 'x) -- (% (at T 'i) (at T 'u))
+(at (update {x: (% i u) from: T}) 'x) -- (% (at T 'i) (at T 'u))
+(% (at T 'k) 0x00) -- [0 0 0 0 0 0]
+(at (select {x: (% k 0x00) from: T}) 'x) -- [0 0 0 0 0 0]
+
+;; ── HAS_NULLS: nil? finds the nulls, aggregates skip them ───────────────────
+(sum (nil? (at (select {x: (% k i) from: T}) 'x))) -- 2
+(at (select {n: (sum (nil? (% k i))) from: T}) 'n) -- [2]
+(at (select {s: (sum (% k i)) from: T}) 's) -- [4]
+(at (select {s: (sum (div k i)) from: T}) 's) -- [-6]
+(at (select {s: (avg (% k i)) from: T}) 's) -- [1.0]
+(at (select {s: (min (div k 0)) from: T}) 's) -- [0Nl]
+(at (select {s: (sum (% k 0)) from: T}) 's) -- [0]
+(at (select {x: (+ (% k i) 1) from: T}) 'x) -- [2 0Nl 3 0Nl 2 1]
+
+;; ── update / where / by ─────────────────────────────────────────────────────
+(at (update {x: (% k i) from: T}) 'x) -- [1 0Nl 2 0Nl 1 0]
+(at (update {x: (div k 0) from: T}) 'x) -- [0Nl 0Nl 0Nl 0Nl 0Nl 0Nl]
+(at (select {x: (% k i) from: T where: (> w 0)}) 'x) -- [1 0Nl 0Nl 1 0]
+(at (select {x: k from: T where: (nil? (% k i))}) 'x) -- [7 9]
+(at (select {x: k from: T where: (nil? (div k b))}) 'x) -- [7 9]
+(at (select {s: (sum (% k i)) from: T by: g}) 's) -- [4 0]
+(at (select {n: (sum (nil? (% k i))) from: T by: g}) 'n) -- [0 2]
+(asc (at (select {n: (count g) from: T by: {x: (% k i)}}) 'x)) -- [0Nl 0 1 2]
+
+;; ── a literal zero folded with a literal dividend ───────────────────────────
+(at (select {x: (% 7 0) from: T}) 'x) -- [0Nl 0Nl 0Nl 0Nl 0Nl 0Nl]
+(at (select {x: (div 7 0) from: T}) 'x) -- [0Nl 0Nl 0Nl 0Nl 0Nl 0Nl]
+(at (select {x: (/ 7 0) from: T}) 'x) -- [0Nf 0Nf 0Nf 0Nf 0Nf 0Nf]
+(at (select {x: (% -7 2) from: T}) 'x) -- [1 1 1 1 1 1]
+(at (select {x: (% -7.5 2.0) from: T}) 'x) -- [0.5 0.5 0.5 0.5 0.5 0.5]
+
+;; ── parallel morsels ────────────────────────────────────────────────────────
+(set B (table [k j] (list (til 200000) (% (til 200000) 7))))
+(at (select {n: (sum (nil? (% k j))) from: B}) 'n) -- [28572]
+(at (select {s: (sum (% k j)) from: B}) 's) -- (enlist (sum (% (at B 'k) (at B 'j))))
+(at (select {x: (div k j) from: B}) 'x) -- (div (at B 'k) (at B 'j))
+
+;; ── splayed and parted tables ───────────────────────────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_fused_zero_divisor")
+(.db.splayed.set "/tmp/rfl_fused_zero_divisor/sp/t/" T "/tmp/rfl_fused_zero_divisor/sp/.sym")
+(set _S (.db.splayed.get "/tmp/rfl_fused_zero_divisor/sp/t/" "/tmp/rfl_fused_zero_divisor/sp/.sym"))
+(at (select {x: (% k i) from: _S}) 'x) -- [1 0Nl 2 0Nl 1 0]
+(at (select {x: (div k b) from: _S}) 'x) -- (div (at T 'k) (at T 'b))
+(at (select {n: (sum (nil? (% k 0))) from: _S}) 'n) -- [6]
+(.db.splayed.set "/tmp/rfl_fused_zero_divisor/db/2024.01.01/t/" (take T 3) "/tmp/rfl_fused_zero_divisor/db/.sym")
+(.db.splayed.set "/tmp/rfl_fused_zero_divisor/db/2024.01.02/t/" (take T -3) "/tmp/rfl_fused_zero_divisor/db/.sym")
+(set _P (.db.parted.get "/tmp/rfl_fused_zero_divisor/db/" 't))
+(at (select {x: (% k i) from: _P}) 'x) -- [1 0Nl 2 0Nl 1 0]
+(at (select {x: (div k 0) from: _P}) 'x) -- [0Nl 0Nl 0Nl 0Nl 0Nl 0Nl]
+(at (select {n: (sum (nil? (div k i))) from: _P}) 'n) -- [2]
+(at (select {s: (sum (% k i)) from: _P by: g}) 's) -- [4 0]
+(.sys.exec "rm -rf /tmp/rfl_fused_zero_divisor")
