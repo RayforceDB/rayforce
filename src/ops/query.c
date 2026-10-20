@@ -429,11 +429,58 @@ static int8_t dag_operand_type(ray_graph_t* g, ray_op_t* x) {
     return keys ? keys->type : x->out_type;
 }
 
+/* Arithmetic with a temporal operand keeps its meaning only in the
+ * builtins (arith.c), which pick the result type (DATE + I64 is DATE,
+ * DATE - DATE is I32 days) or reject the pair outright.  The DAG kernels
+ * see raw day / millisecond / nanosecond counts, so `(/ date 2)` and
+ * `(div date 2)` came back as F64 / I64 numbers where the builtins raise
+ * `cannot divide date by i64` and `cannot div date by i64`, and
+ * `(% date 2)` came back as I64 where the builtin keeps DATE.  Every verb
+ * the DAG lowers declines a temporal operand, so the projection is left to
+ * the builtin through the evaluator: select's fallback applies it row by
+ * row, an ordinary update to the whole bound columns.  The one exception
+ * is the modulo dag_temporal_mod admits. */
 static bool dag_temporal_arith_needs_eval(const char* name, size_t len,
                                           int8_t left_type, int8_t right_type) {
     if (!dag_type_is_temporal(left_type) && !dag_type_is_temporal(right_type))
         return false;
-    return len == 1 && (name[0] == '+' || name[0] == '-' || name[0] == '*');
+    if (len == 1)
+        return name[0] == '+' || name[0] == '-' || name[0] == '*' ||
+               name[0] == '/' || name[0] == '%';
+    return len == 3 && (memcmp(name, "div", 3) == 0 ||
+                        memcmp(name, "pow", 3) == 0);
+}
+
+/* `(% temporal n)` keeps the left operand's type (ray_mod_fn): the raw
+ * day / millisecond / nanosecond count is reduced by floor modulo, which
+ * takes the divisor's sign, and retagged; a null left cell is a typed
+ * null.  The DAG's integer MOD kernel computes the same floor modulo on
+ * the raw counts (in I64 when either side is I64, so a DATE / TIME count
+ * by a wide divisor narrows as the builtin's store does) and keeps the
+ * null cells null, so the node only needs its result cast back to the left
+ * type, as the xbar lowering does.  Admitted only where the kernel
+ * provably agrees: a temporal column (not a literal, not the partition
+ * key's MAPCOMMON wrapper) by a non-null, nonzero integer literal.
+ * Everything else stays with the builtin: a zero divisor, which the
+ * builtin nulls but the fused kernel writes as 0 over a column with no
+ * nulls (as it does for `(% i 0)`); a divisor column, which may hold such
+ * a zero; a null literal; a float divisor, which the builtin truncates to
+ * an integer first; and a temporal divisor, an error. */
+static bool const_op_i64(ray_graph_t* g, ray_op_t* op, int64_t* out);
+
+static ray_op_t* dag_temporal_mod(ray_graph_t* g, const char* name, size_t len,
+                                  ray_op_t* left, ray_op_t* right,
+                                  int8_t left_type) {
+    if (len != 1 || name[0] != '%') return NULL;
+    if (left->opcode == OP_CONST || left->out_type != left_type) return NULL;
+    if (!dag_type_is_temporal(left_type)) return NULL;
+    int64_t divisor = 0;
+    if (!const_op_i64(g, right, &divisor) || divisor == 0) return NULL;
+    int8_t lt = left_type;
+    if (RAY_IS_PARTED(lt)) lt = (int8_t)RAY_PARTED_BASETYPE(lt);
+    ray_op_t* m = ray_mod(g, left, right);
+    if (!m) return NULL;
+    return ray_cast(g, m, lt);
 }
 
 /* A comparison between a temporal and a float has no meaning — the eval
@@ -2416,7 +2463,7 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
                 int8_t lvt = dag_operand_type(g, left);
                 int8_t rvt = dag_operand_type(g, right);
                 if (dag_temporal_arith_needs_eval(fname, fname_len, lvt, rvt))
-                    return NULL;
+                    return dag_temporal_mod(g, fname, fname_len, left, right, lvt);
                 if (g->if_arm_depth == 0 &&
                     dag_arith_rejects_sym(fname, fname_len, lvt, rvt)) {
                     if (!g->compile_err)
@@ -7365,6 +7412,36 @@ static ray_t* eval_expr_whole_column(ray_t* expr, ray_t* tbl) {
     ray_t* result = eval_expr_whole_column_impl(expanded, tbl);
     ray_release(expanded);
     return result;
+}
+
+static bool update_expr_elementwise(ray_t* e, ray_t* tbl, bool meta_cols);
+
+/* A projection over no rows.  The per-row pass evaluates nothing and
+ * leaves an empty LIST, where the builtin over the empty columns keeps its
+ * result type: `(% d 2)` over an empty DATE column is an empty DATE
+ * vector.  An elementwise expression (atomic builtins over columns and
+ * literals, update_expr_elementwise) runs no lambda and no effect, so it
+ * is evaluated once over the empty columns and its result taken when that
+ * is an empty typed vector.  Anything else, or a failure, which is
+ * swallowed whole, keeps the empty LIST.  The check is select's
+ * (meta_cols): a name bound as a lexical local shadows the column of that
+ * name, so it is not a column and the probe never reads the column for it. */
+static ray_t* select_fallback_empty_col(ray_t* expr, ray_t* tbl) {
+    if (update_expr_elementwise(expr, tbl, true)) {
+        ray_t* col = eval_expr_whole_column_impl(expr, tbl);
+        if (col && !RAY_IS_ERR(col) && ray_is_vec(col) && ray_len(col) == 0)
+            return col;
+        if (col && RAY_IS_ERR(col)) {
+            ray_error_free(col);
+            if (__VM->raise_val) { ray_release(__VM->raise_val); __VM->raise_val = NULL; }
+            if (__VM->return_val) { ray_release(__VM->return_val); __VM->return_val = NULL; }
+            ray_clear_error_trace();
+            ray_error_clear();   /* both the VM's and ray_error_msg()'s copy */
+        } else if (col) {
+            ray_release(col);
+        }
+    }
+    return eval_expr_per_row_impl(expr, tbl, 0);
 }
 
 /* Zero groups still need the aggregate's column.  Run the aggregate once over
@@ -19081,6 +19158,7 @@ by_dict_done:
                                 col = at_row0 ? eval_expr_per_row_impl(expr, eval_tbl, 1)
                                     : (whole_verb || one_value)
                                     ? eval_expr_whole_column_impl(expr, eval_tbl)
+                                    : nrows == 0 ? select_fallback_empty_col(expr, eval_tbl)
                                     : eval_expr_per_row_impl(expr, eval_tbl, nrows);
                                 bool enlist_scalar = whole_verb && expr->type == RAY_LIST &&
                                     ((ray_t**)ray_data(expr))[0]->i64 == ray_sym_intern("enlist", 6);

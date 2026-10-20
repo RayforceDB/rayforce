@@ -1,0 +1,174 @@
+;; @requires: posix  (splayed / parted fixtures under /tmp, cleaned through a POSIX shell via .sys.exec)
+;; Binary arithmetic with a temporal operand inside a query follows the
+;; builtin, not the DAG kernel's raw counts.
+;;
+;; dag_temporal_arith_needs_eval (src/ops/query.c) declined only + - * on a
+;; DATE / TIME / TIMESTAMP operand.  `/`, `div` and `%` were lowered to the
+;; DAG, which saw day / millisecond / nanosecond counts: `(/ d 2)` came back
+;; as F64 4383.0 and `(div d 2)` as I64 4383 where the builtins raise
+;; `cannot divide date by i64` and `cannot div date by i64`, and `(% d 2)`
+;; came back as I64 [0 1 0] where the builtin keeps DATE.  Every arithmetic
+;; verb the DAG lowers now declines a temporal operand and leaves the
+;; builtin to the evaluator: select's fallback applies it row by row, an
+;; ordinary update to the whole columns.  The exception is `%` of a temporal
+;; column by a non-null, nonzero integer literal (dag_temporal_mod): the MOD
+;; kernel computes the builtin's floor modulo on the raw counts and the
+;; result is cast back to the column's type.
+
+(set F (table [d t p i j f k] (list [2024.01.01 2024.01.02 2024.01.03] [00:00:01.000 00:00:02.000 00:00:03.000] [2024.01.01D00:00:00.000000001 2024.01.02D00:00:00.000000002 2024.01.03D00:00:00.000000003] [1 2 3] (as 'I32 [1 2 3]) [1.5 2.0 2.5] [1 1 2])))
+
+;; ── the builtins are the oracle ─────────────────────────────────────────────
+(/ (at F 'd) 2) !- type
+(div (at F 'd) 2) !- type
+(% (at F 'd) 2) -- [2000.01.01 2000.01.02 2000.01.01]
+
+;; ── `/`: rejected with any temporal operand, either side ────────────────────
+(select {x: (/ d 2) from: F}) !- type
+(select {x: (/ d 2i) from: F}) !- type
+(select {x: (/ d 2.0) from: F}) !- type
+(select {x: (/ d i) from: F}) !- type
+(select {x: (/ d j) from: F}) !- type
+(select {x: (/ d f) from: F}) !- type
+(select {x: (/ d d) from: F}) !- type
+(select {x: (/ t 2) from: F}) !- type
+(select {x: (/ t t) from: F}) !- type
+(select {x: (/ p i) from: F}) !- type
+(select {x: (/ p p) from: F}) !- type
+(select {x: (/ 2 d) from: F}) !- type
+(select {x: (/ i t) from: F}) !- type
+(select {x: (/ f p) from: F}) !- type
+(select {x: (/ 2024.01.02 i) from: F}) !- type
+
+;; ── `div`: rejected with any temporal operand, either side ──────────────────
+(select {x: (div d 2) from: F}) !- type
+(select {x: (div d i) from: F}) !- type
+(select {x: (div d j) from: F}) !- type
+(select {x: (div d f) from: F}) !- type
+(select {x: (div d d) from: F}) !- type
+(select {x: (div t 2) from: F}) !- type
+(select {x: (div t 2.0) from: F}) !- type
+(select {x: (div p 2) from: F}) !- type
+(select {x: (div p t) from: F}) !- type
+(select {x: (div 2 d) from: F}) !- type
+(select {x: (div j t) from: F}) !- type
+(select {x: (div f p) from: F}) !- type
+(select {x: (div 00:00:02.000 i) from: F}) !- type
+
+;; ── `%`: temporal by a number keeps the temporal type ───────────────────────
+(type (at (select {x: (% d 2) from: F}) 'x)) -- 'DATE
+(at (select {x: (% d 2) from: F}) 'x) -- [2000.01.01 2000.01.02 2000.01.01]
+(at (select {x: (% d 2i) from: F}) 'x) -- [2000.01.01 2000.01.02 2000.01.01]
+(at (select {x: (% d i) from: F}) 'x) -- [2000.01.01 2000.01.02 2000.01.03]
+(at (select {x: (% d j) from: F}) 'x) -- (% (at F 'd) (at F 'j))
+(at (select {x: (% d 2.0) from: F}) 'x) -- (% (at F 'd) 2.0)
+(at (select {x: (% d f) from: F}) 'x) -- (% (at F 'd) (at F 'f))
+(type (at (select {x: (% t 2) from: F}) 'x)) -- 'TIME
+(at (select {x: (% t 7) from: F}) 'x) -- (% (at F 't) 7)
+(at (select {x: (% t i) from: F}) 'x) -- (% (at F 't) (at F 'i))
+(type (at (select {x: (% p 2) from: F}) 'x)) -- 'TIMESTAMP
+(at (select {x: (% p 2) from: F}) 'x) -- [2000.01.01D00:00:00.000000001 2000.01.01D00:00:00.000000000 2000.01.01D00:00:00.000000001]
+(at (select {x: (% p j) from: F}) 'x) -- (% (at F 'p) (at F 'j))
+(at (select {x: (% 2024.01.02 i) from: F}) 'x) -- (% 2024.01.02 (at F 'i))
+
+;; ── `%`: rejected with a temporal divisor or two temporals ──────────────────
+(select {x: (% 2 d) from: F}) !- type
+(select {x: (% i t) from: F}) !- type
+(select {x: (% f p) from: F}) !- type
+(select {x: (% d d) from: F}) !- type
+(select {x: (% t t) from: F}) !- type
+(select {x: (% p d) from: F}) !- type
+
+;; ── `pow` keeps rejecting temporals; + - * keep their meaning ───────────────
+(select {x: (pow d 2) from: F}) !- type
+(select {x: (pow 2 t) from: F}) !- type
+(at (select {x: (+ d 1) from: F}) 'x) -- [2024.01.02 2024.01.03 2024.01.04]
+(at (select {x: (- d 2024.01.01) from: F}) 'x) -- (- (at F 'd) 2024.01.01)
+(at (select {x: (* t 2) from: F}) 'x) -- (* (at F 't) 2)
+
+;; ── where: / by: / update ───────────────────────────────────────────────────
+(select {i: i from: F where: (> (/ d 2) 0)}) !- type
+(select {i: i from: F where: (> (div t 2) 0)}) !- type
+(at (select {i: i from: F where: (== (% d 2) 2000.01.02)}) 'i) -- [2]
+(at (select {n: (count i) from: F by: {x: (% d 2)}}) 'x) -- [2000.01.01 2000.01.02]
+(type (at (select {n: (count i) from: F by: {x: (% d 2)}}) 'x)) -- 'DATE
+(select {n: (count i) from: F by: {x: (div d 2)}}) !- type
+(at (select {x: (% p 2) from: F by: k}) 'x) -- (list [2000.01.01D00:00:00.000000001 2000.01.01D00:00:00.000000000] [2000.01.01D00:00:00.000000001])
+(at (update {x: (% d 2) from: F}) 'x) -- [2000.01.01 2000.01.02 2000.01.01]
+(update {x: (/ d 2) from: F}) !- type
+(update {x: (div p 2) from: F}) !- type
+
+;; ── `%` by an integer literal in the DAG: the builtin's values and nulls ─────
+(set N (table [d t p z] (list [2024.01.01 0Nd 1999.12.30 1900.01.01] [00:00:01.003 0Nt 00:00:00.000 23:59:59.999] [2024.01.01D00:00:00.000000001 0Np 1990.01.01D00:00:00.000000007 1710.01.01D00:00:00.000000003] [0 3 -3 0])))
+(% (at N 'd) -3) -- [2000.01.01 0Nd 1999.12.30 1999.12.30]
+(at (select {x: (% d -3) from: N}) 'x) -- [2000.01.01 0Nd 1999.12.30 1999.12.30]
+(at (select {x: (% d 7) from: N}) 'x) -- (% (at N 'd) 7)
+(at (select {x: (% d 2h) from: N}) 'x) -- (% (at N 'd) 2h)
+(at (select {x: (% d 5000000000) from: N}) 'x) -- (% (at N 'd) 5000000000)
+(at (select {x: (% t -7i) from: N}) 'x) -- (% (at N 't) -7i)
+(at (select {x: (% t 86400000) from: N}) 'x) -- (% (at N 't) 86400000)
+(at (select {x: (% p 1000000007) from: N}) 'x) -- (% (at N 'p) 1000000007)
+(at (select {x: (% p -5000000000) from: N}) 'x) -- (% (at N 'p) -5000000000)
+(at (select {x: (% p true) from: N}) 'x) -- (% (at N 'p) true)
+(at (update {x: (% p -3) from: N}) 'x) -- (% (at N 'p) -3)
+(at (select {k: z from: N where: (== (% d -3) 1999.12.30)}) 'k) -- [-3 0]
+;; a zero or null divisor is a typed null, over a column without nulls too
+(set Z (table [d t p z] (list [2024.01.01 2024.01.02] [00:00:01.000 00:00:02.000] [2024.01.01D00:00:00.000000001 2024.01.02D00:00:00.000000002] [0 3])))
+(at (select {x: (% d 0) from: Z}) 'x) -- [0Nd 0Nd]
+(at (select {x: (% t 0i) from: Z}) 'x) -- [0Nt 0Nt]
+(at (select {x: (% p false) from: Z}) 'x) -- [0Np 0Np]
+(at (select {x: (% d 0N) from: Z}) 'x) -- [0Nd 0Nd]
+(at (update {x: (% p 0) from: Z}) 'x) -- [0Np 0Np]
+(at (select {x: (% d z) from: Z}) 'x) -- (% (at Z 'd) (at Z 'z))
+(at (select {x: (% p z) from: Z}) 'x) -- (% (at Z 'p) (at Z 'z))
+
+;; ── no rows: the builtin's typed empty result, not an empty LIST ────────────
+(set E (table [d t p i f] (list (as 'DATE []) (as 'TIME []) (as 'TIMESTAMP []) (as 'I64 []) (as 'F64 []))))
+(type (% (at E 'd) 2)) -- 'DATE
+(type (at (select {x: (% d 2) from: E}) 'x)) -- 'DATE
+(type (at (select {x: (% t 2) from: E}) 'x)) -- 'TIME
+(type (at (select {x: (% p 2) from: E}) 'x)) -- 'TIMESTAMP
+(type (at (select {x: (% d 2.0) from: E}) 'x)) -- 'DATE
+(type (at (select {x: (% t i) from: E}) 'x)) -- 'TIME
+(type (at (select {x: (% p f) from: E}) 'x)) -- 'TIMESTAMP
+(type (at (update {x: (% d 2) from: E}) 'x)) -- 'DATE
+(type (at (update {x: (% t 2.0) from: E}) 'x)) -- 'TIME
+(type (at (select {x: (% d 2) from: F where: (> i 5)}) 'x)) -- 'DATE
+(type (at (select {x: (% t 2.0) from: F where: (> i 5)}) 'x)) -- 'TIME
+(type (at (select {x: (% p j) from: F where: (> i 5)}) 'x)) -- 'TIMESTAMP
+(type (at (select {x: (+ d 1) from: E}) 'x)) -- 'DATE
+(type (at (select {x: (- d d) from: E}) 'x)) -- 'I32
+(type (at (select {x: (* t 2) from: E}) 'x)) -- 'TIME
+;; a lexical local shadows the column of its name, over no rows as over
+;; rows: the empty-result probe must not read the column for it
+(set _shadow (fn [d tb] (at (select {x: (% d 2) from: tb}) 'x)))
+(_shadow 7 (table [d] (list [2024.01.01 2024.01.02]))) -- [1 1]
+(type (_shadow 7 E)) -- 'I64
+
+;; ── splayed table ───────────────────────────────────────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_binary_temporal_arith")
+(.db.splayed.set "/tmp/rfl_binary_temporal_arith/sp/t/" (table [a d] (list [1 2 3] [2024.01.05 2024.01.06 2024.01.07])) "/tmp/rfl_binary_temporal_arith/sp/.sym")
+(set _S (.db.splayed.get "/tmp/rfl_binary_temporal_arith/sp/t/" "/tmp/rfl_binary_temporal_arith/sp/.sym"))
+(select {x: (/ d 2) from: _S}) !- type
+(select {x: (div d a) from: _S}) !- type
+(at (select {x: (% d 2) from: _S}) 'x) -- (% (at _S 'd) 2)
+(at (select {x: (% d 2) from: _S}) 'x) -- [2000.01.01 2000.01.02 2000.01.01]
+(at (update {x: (% d 2) from: _S}) 'x) -- [2000.01.01 2000.01.02 2000.01.01]
+
+;; ── parted table: the DATE partition key and a stored DATE column ───────────
+(.db.splayed.set "/tmp/rfl_binary_temporal_arith/db/2024.01.01/t/" (table [a d] (list [1 2] [2024.01.05 2024.01.06])) "/tmp/rfl_binary_temporal_arith/db/.sym")
+(.db.splayed.set "/tmp/rfl_binary_temporal_arith/db/2024.01.02/t/" (table [a d] (list [3 4 5] [2024.01.07 2024.01.08 2024.01.09])) "/tmp/rfl_binary_temporal_arith/db/.sym")
+(set _P (.db.parted.get "/tmp/rfl_binary_temporal_arith/db/" 't))
+(% (at _P 'date) 2) -- [2000.01.01 2000.01.01 2000.01.02 2000.01.02 2000.01.02]
+(at (select {x: (% date 2) from: _P}) 'x) -- [2000.01.01 2000.01.01 2000.01.02 2000.01.02 2000.01.02]
+(select {x: (/ date 2) from: _P}) !- type
+(select {x: (div date 2) from: _P}) !- type
+(select {x: (pow date 2) from: _P}) !- type
+(at (select {x: (% d 2) from: _P}) 'x) -- [2000.01.01 2000.01.02 2000.01.01 2000.01.02 2000.01.01]
+(select {x: (/ d 2) from: _P}) !- type
+(select {x: (div d a) from: _P}) !- type
+(at (select {x: (% date 2) from: _P where: (> a 1)}) 'x) -- [2000.01.01 2000.01.02 2000.01.02 2000.01.02]
+(at (select {n: (count a) from: _P by: {x: (% date 2)}}) 'x) -- [2000.01.01 2000.01.02]
+(at (select {n: (count a) from: _P by: {x: (% date 0)}}) 'x) -- [0Nd]
+(at (update {x: (% date 0) from: _P}) 'x) -- [0Nd 0Nd 0Nd 0Nd 0Nd]
+(select {a: a from: _P where: (> (/ date 2) 0)}) !- type
+(.sys.exec "rm -rf /tmp/rfl_binary_temporal_arith")
