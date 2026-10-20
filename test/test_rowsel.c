@@ -581,6 +581,53 @@ static test_result_t test_rowsel_emit_runs_equiv(void) {
     PASS();
 }
 
+/* ray_rowsel_head keeps the first `limit` rows of a selection, in order:
+ * whole segments before the cut as they are, the cut segment MIX (an ALL
+ * one too), NONE after it.  Segments: MIX, ALL, NONE, a partial MIX. */
+static test_result_t test_rowsel_head(void) {
+    ray_heap_init();
+    int64_t nrows = (int64_t)RAY_MORSEL_ELEMS * 3 + 7;
+    ray_t* pred = ray_vec_new(RAY_BOOL, nrows);
+    TEST_ASSERT_NOT_NULL(pred);
+    uint8_t* p = (uint8_t*)ray_data(pred);
+    for (int64_t i = 0; i < nrows; i++) {
+        uint32_t seg = (uint32_t)(i / RAY_MORSEL_ELEMS);
+        p[i] = (seg == 0) ? (uint8_t)(i % 3 == 0)
+             : (seg == 1) ? 1
+             : (seg == 2) ? 0
+             : (uint8_t)(i % 2 == 0);
+    }
+    pred->len = nrows;
+    ray_t* sel = ray_rowsel_from_pred(pred);
+    TEST_ASSERT_NOT_NULL(sel);
+    int64_t total = ray_rowsel_meta(sel)->total_pass;
+    int64_t k0 = (RAY_MORSEL_ELEMS + 2) / 3;            /* rows kept in seg 0 */
+
+    static int64_t all[RAY_MORSEL_ELEMS * 4], got[RAY_MORSEL_ELEMS * 4];
+    TEST_ASSERT_EQ_I(reconstruct(sel, all), total);
+    int64_t limits[] = { 0, 1, 5, k0, k0 + 10, k0 + RAY_MORSEL_ELEMS,
+                         k0 + RAY_MORSEL_ELEMS + 2, total - 1 };
+    for (size_t t = 0; t < sizeof(limits) / sizeof(limits[0]); t++) {
+        int64_t lim = limits[t];
+        ray_t* h = ray_rowsel_head(sel, lim);
+        TEST_ASSERT_NOT_NULL(h);
+        TEST_ASSERT_EQ_I(ray_rowsel_meta(h)->nrows, nrows);
+        TEST_ASSERT_EQ_I(ray_rowsel_meta(h)->total_pass, lim);
+        TEST_ASSERT_EQ_I(reconstruct(h, got), lim);
+        for (int64_t i = 0; i < lim; i++) TEST_ASSERT_EQ_I(got[i], all[i]);
+        if (lim == k0 + RAY_MORSEL_ELEMS)                 /* cut at a segment end */
+            TEST_ASSERT_EQ_I(ray_rowsel_flags(h)[1], RAY_SEL_ALL);
+        if (lim == k0 + 10)                               /* cut inside an ALL */
+            TEST_ASSERT_EQ_I(ray_rowsel_flags(h)[1], RAY_SEL_MIX);
+        TEST_ASSERT_EQ_I(ray_rowsel_flags(h)[3], lim > k0 + RAY_MORSEL_ELEMS ? RAY_SEL_MIX : RAY_SEL_NONE);
+        ray_rowsel_release(h);
+    }
+    ray_rowsel_release(sel);
+    ray_release(pred);
+    ray_heap_destroy();
+    PASS();
+}
+
 /* ──────────────────────────────────────────────────────────────────
  * Suite registration
  * ────────────────────────────────────────────────────────────────── */
@@ -600,6 +647,7 @@ const test_entry_t rowsel_entries[] = {
     { "rowsel/intersect_mixed_reused_block", test_rowsel_intersect_mixed_reused_block, NULL, NULL },
     { "rowsel/emit_equiv", test_rowsel_emit_equiv, NULL, NULL },
     { "rowsel/emit_runs_equiv", test_rowsel_emit_runs_equiv, NULL, NULL },
+    { "rowsel/head", test_rowsel_head, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
 

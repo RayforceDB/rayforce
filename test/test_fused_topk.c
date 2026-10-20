@@ -1411,6 +1411,38 @@ static test_result_t test_topk_and_pred(void) {
     PASS();
 }
 
+/* gate: a nested `and` is the flat `and` of its leaves, so it is accepted
+ * whenever the flat form would be: the compiler (fp_compile_pred_dag)
+ * already walks nested OP_AND nodes.  The leaf cap and the leaf shapes
+ * still apply across the nesting. */
+static test_result_t test_topk_gate_nested_and(void) {
+    ray_t* tbl = make_i64_table(100);
+    const char* accepted[] = {
+        "(and (and (>= v 5) (< v 80)) (== g 1))",
+        "(and (== g 1) (and (>= v 5) (and (< v 80) (!= v 9))))",
+        "(and (and (> v 0) (> v 1) (> v 2) (> v 3)) (and (> v 4) (> v 5) (> v 6) (> v 7)))",
+    };
+    for (size_t i = 0; i < sizeof(accepted) / sizeof(accepted[0]); i++) {
+        ray_t* e = ray_parse(accepted[i]);
+        TEST_ASSERT_EQ_I(ray_fused_topk_supported(e, tbl), 1);
+        ray_release(e);
+    }
+    const char* refused[] = {
+        /* nine leaves across the nesting */
+        "(and (and (> v 0) (> v 1) (> v 2) (> v 3)) (and (> v 4) (> v 5) (> v 6) (> v 7) (> v 8)))",
+        /* a leaf the fused evaluator cannot run */
+        "(and (and (>= v 5) (or (== g 1) (== g 2))) (< v 80))",
+        "(and (and (>= v 5) (not (== g 1))) (< v 80))",
+    };
+    for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) {
+        ray_t* e = ray_parse(refused[i]);
+        TEST_ASSERT_EQ_I(ray_fused_topk_supported(e, tbl), 0);
+        ray_release(e);
+    }
+    ray_release(tbl);
+    PASS();
+}
+
 /* gate: sort key column not found in table (line 288). */
 static test_result_t test_topk_gate_sort_key_missing(void) {
     int64_t N = 50;
@@ -1644,6 +1676,7 @@ const test_entry_t fused_topk_entries[] = {
     { "fused_topk/i16_with_nulls",           test_topk_i16_with_nulls,            topk_setup, topk_teardown },
     /* Branch-coverage: AND predicate */
     { "fused_topk/and_pred",                 test_topk_and_pred,                  topk_setup, topk_teardown },
+    { "fused_topk/gate_nested_and",          test_topk_gate_nested_and,           topk_setup, topk_teardown },
     /* Branch-coverage: gate rejections */
     { "fused_topk/gate_sort_key_missing",    test_topk_gate_sort_key_missing,     topk_setup, topk_teardown },
     { "fused_topk/gate_out_col_missing",     test_topk_gate_out_col_missing,      topk_setup, topk_teardown },
