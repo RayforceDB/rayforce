@@ -3487,7 +3487,8 @@ static __attribute__((noinline)) ray_t* exec_filter_refine_enc(ray_graph_t* g, r
  * is evaluated with the selection cleared and comes back at full length, as
  * the group path does for a declined input (group.c).  As for an `if` branch
  * (pivot.c), the input gets a memo of its own: a shared node's value depends
- * on the rows it was computed over, so neither domain may serve the other's. */
+ * on the rows it was computed over, so neither domain may serve the other's.
+ * A selection the input installs (a FILTER child) is the input's to drop. */
 static ray_t* exec_node_all_rows(ray_graph_t* g, ray_op_t* child) {
     ray_t* saved = g->selection;
     if (!saved) return exec_node(g, child);
@@ -3496,6 +3497,7 @@ static ray_t* exec_node_all_rows(ray_graph_t* g, ray_op_t* child) {
     ray_exec_memo_push(g, child, &memo_save);
     ray_t* v = exec_node(g, child);
     ray_exec_memo_pop(g, &memo_save);
+    if (g->selection) ray_release(g->selection);
     g->selection = saved;
     return v;
 }

@@ -9234,6 +9234,51 @@ static test_result_t test_exec_memo_across_row_domains(void) {
     PASS();
 }
 
+/* SUMS over a FILTER, which installs a selection and returns a table:
+ * rejected, with and without an outer FILTER's selection installed.  The
+ * selection the inner FILTER installs is released either way: after a
+ * warm-up, repeated calls leave the heap as they found it. */
+static test_result_t test_exec_all_rows_child_selection(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    ray_t* tbl = make_room_table();
+    for (int outer = 0; outer <= 1; outer++) {
+        size_t before = 0;
+        for (int call = 0; call < 110; call++) {
+            if (call == 10) {
+                ray_mem_stats_t st;
+                ray_mem_stats(&st);
+                before = st.bytes_allocated;
+            }
+            ray_graph_t* g = ray_graph_new(tbl);
+            ray_op_t* inner = ray_filter(g, ray_const_table(g, tbl),
+                                         ray_eq(g, ray_scan(g, "flag"), ray_const_i64(g, 1)));
+            ray_op_t* root = ray_sums_op(g, inner);
+            if (outer) {
+                ray_op_t* kept = ray_filter(g, ray_const_table(g, tbl),
+                                            ray_eq(g, ray_scan(g, "flag"), ray_const_i64(g, 1)));
+                ray_op_t* cols[] = { root };
+                root = ray_select_op(g, kept, cols, 1);
+            }
+            ray_t* result = ray_execute(g, root);
+            ray_graph_free(g);
+            TEST_ASSERT_NOT_NULL(result);
+            TEST_ASSERT_TRUE(RAY_IS_ERR(result));
+            ray_error_free(result);
+        }
+        ray_mem_stats_t st;
+        ray_mem_stats(&st);
+        TEST_ASSERT_FMT(st.bytes_allocated == before, "outer %d: %zu bytes allocated, %zu before",
+                        outer, st.bytes_allocated, before);
+    }
+
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 /* ---- OP_SELECT with failing expression column — exec.c L1613-1617.
  *
  * When a SELECT projection expression evaluates to an error, the SELECT
@@ -18011,6 +18056,7 @@ const test_entry_t exec_entries[] = {
     { "exec/memo_under_selection",             test_exec_memo_under_selection,             NULL, NULL },
     { "exec/order_ops_under_selection",        test_exec_order_ops_under_selection,        NULL, NULL },
     { "exec/memo_across_row_domains",          test_exec_memo_across_row_domains,          NULL, NULL },
+    { "exec/all_rows_child_selection",         test_exec_all_rows_child_selection,         NULL, NULL },
     { "exec/select_expr_col_error",            test_exec_select_expr_col_error,            NULL, NULL },
     { "exec/streaming_large_dag",              test_exec_streaming_large_dag,              NULL, NULL },
     { "exec/deep_binary_chain",                test_exec_deep_binary_chain,                NULL, NULL },
