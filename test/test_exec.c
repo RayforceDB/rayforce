@@ -10240,20 +10240,15 @@ static test_result_t test_expr_f64_to_narrow_cast(void) {
     ray_release(result);
     ray_graph_free(g);
 
-    /* (as 'BOOL v) on nullable F64 col — F64→BOOL CAST with NaN-handling.
-     * Regression for prior bug where NaN (= NULL_F64 sentinel) was treated
-     * as truthy because IEEE `NaN != 0.0` is true.  Fixed by adding an
-     * explicit NaN check (`src[i] == src[i]`).
-     * Raw data: [1.7, 2.3, 0.0, 4.9, 0.5] but row 2 was overwritten with
-     * NULL_F64 sentinel via ray_vec_set_null(v, 2, true).  So the seen
-     * input is [1.7, 2.3, NaN(null), 4.9, 0.5] → [1, 1, 0, 1, 1] → sum 4. */
+    /* F64→BOOL: only zero is false, so the NaN null sentinel is true.
+     * Input [1.7, 2.3, NaN, 4.9, 0.5] yields five true values. */
     g = ray_graph_new(tbl);
     col = ray_scan(g, "v");
     ray_op_t* cbool = ray_cast(g, col, RAY_BOOL);
     s = ray_sum(g, cbool);
     result = ray_execute(g, s);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    TEST_ASSERT_EQ_I(result->i64, 4);
+    TEST_ASSERT_EQ_I(result->i64, 5);
     ray_release(result);
     ray_graph_free(g);
 
@@ -12048,12 +12043,51 @@ static test_result_t test_expr_unary_i64_to_bool_cast(void) {
     ray_op_t* s   = ray_sum(g, ca);
     ray_t* result = ray_execute(g, s);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    /* cast(0)=false=0, cast(5)=true=1, cast(-3)=true=1, pos3=null=0 → sum=2 */
-    TEST_ASSERT_EQ_I(result->i64, 2);
+    /* Only zero is false; the non-zero null sentinel also casts to true. */
+    TEST_ASSERT_EQ_I(result->i64, 3);
     ray_release(result);
     ray_graph_free(g);
 
     ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* Call the typed fallback directly so expression fusion cannot mask a
+ * regression in its null-to-BOOL or post-cast null propagation rules. */
+static test_result_t test_expr_typed_null_to_bool_cast(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    const int16_t h[] = {NULL_I16, 0, -1};
+    const int32_t i[] = {NULL_I32, 0, -1};
+    const int64_t l[] = {NULL_I64, 0, -1};
+    const float e[] = {NULL_F32, 0.0f, -1.0f};
+    const double f[] = {NULL_F64, 0.0, -1.0};
+    const int8_t types[] = {RAY_I16, RAY_I32, RAY_I64, RAY_F32, RAY_F64};
+    const void* values[] = {h, i, l, e, f};
+    ray_op_t op = {.opcode = OP_CAST, .out_type = RAY_BOOL};
+
+    for (size_t k = 0; k < sizeof(types) / sizeof(types[0]); k++) {
+        ray_t* input = ray_vec_from_raw(types[k], values[k], 3);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(input));
+        ray_vec_set_null(input, 0, true);
+        ray_t* result = exec_elementwise_unary(NULL, &op, input);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->type, RAY_BOOL);
+        TEST_ASSERT_EQ_I(result->len, 3);
+        const uint8_t* data = (const uint8_t*)ray_data(result);
+        TEST_ASSERT_EQ_I(data[0], 1);
+        TEST_ASSERT_EQ_I(data[1], 0);
+        TEST_ASSERT_EQ_I(data[2], 1);
+        TEST_ASSERT_FALSE(ray_vec_may_have_nulls(result));
+        for (int64_t row = 0; row < 3; row++)
+            TEST_ASSERT_FALSE(ray_vec_is_null(result, row));
+        ray_release(result);
+        ray_release(input);
+    }
+
     ray_sym_destroy();
     ray_heap_destroy();
     PASS();
@@ -17884,6 +17918,7 @@ const test_entry_t exec_entries[] = {
     { "exec/expr_set_all_null_f32",              test_expr_set_all_null_f32,              NULL, NULL },
     { "exec/expr_unary_f64_cast_default",        test_expr_unary_f64_cast_default,        NULL, NULL },
     { "exec/expr_unary_i64_to_f64_cast",         test_expr_unary_i64_to_f64_cast,         NULL, NULL },
+    { "exec/expr_typed_null_to_bool_cast", test_expr_typed_null_to_bool_cast, NULL, NULL },
     { "exec/expr_unary_i64_to_bool_cast",        test_expr_unary_i64_to_bool_cast,        NULL, NULL },
     { "exec/expr_binary_f64_and_or",             test_expr_binary_f64_and_or,             NULL, NULL },
     { "exec/expr_sym_w32_fast_eq_ne",            test_expr_sym_w32_fast_eq_ne,            NULL, NULL },

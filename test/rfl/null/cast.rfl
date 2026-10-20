@@ -4,7 +4,7 @@
 (sum (map nil? (as 'I32 [1 0N 3]))) -- 1
 (sum (map nil? (as 'I16 [1 0N 3]))) -- 1
 ;; Post-Phase-1: B8 / U8 are non-nullable.  Casting an integer null to
-;; B8 collapses the null to b8-zero (no NULL_B8 sentinel exists), so
+;; B8 converts the non-zero integer null sentinel to true, so
 ;; the post-cast nil? scan reports 0 nulls.
 (sum (map nil? (as 'B8  [1 0N 3]))) -- 0
 
