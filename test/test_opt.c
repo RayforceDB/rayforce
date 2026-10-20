@@ -282,6 +282,287 @@ static test_result_t test_subset_proof_budgets(void) {
     PASS();
 }
 
+/* Deterministic subset oracle: generator choices below are NOT the trait's
+ * whitelist.  Only the dedicated SUM self-control bypasses admission. */
+static void subset_drop(ray_t* v) {
+    if (v && RAY_IS_ERR(v)) ray_error_free(v);
+    else ray_release(v);
+}
+
+static bool subset_ok(ray_t* v) { return v && !RAY_IS_ERR(v); }
+
+/* Copy every column, without asking filtering/selection code for the oracle. */
+static ray_t* subset_table(ray_t* src, const int* rows, int n) {
+    static const char* names[] = {"rid", "x", "y", "b"};
+    ray_t* t = ray_table_new(4);
+    if (!subset_ok(t)) return t;
+    for (int c = 0; c < 4; c++) {
+        ray_t* v = ray_vec_new(c == 3 ? RAY_BOOL : RAY_I64, n);
+        if (!subset_ok(v)) { subset_drop(t); return v; }
+        v->len = n;
+        v->attrs &= ~RAY_ATTR_HAS_NULLS;
+        ray_t* from = src ? ray_table_col_idx(src, c) : NULL; /* borrowed */
+        if (src && !subset_ok(from)) { ray_error_free(from); subset_drop(v); subset_drop(t); return NULL; }
+        for (int j = 0; j < n; j++) {
+            int i = rows ? rows[j] : j;
+            if (c == 3) {
+                ((uint8_t*)ray_data(v))[j] = src ? ((uint8_t*)ray_data(from))[i] : i % 2;
+            } else {
+                int64_t x = src ? ((int64_t*)ray_data(from))[i] :
+                    c == 0 ? 100 + i : c == 1 ? i % 7 - 3 : (i * 3) % 7 - 3;
+                if (!src && ((c == 1 && (i == 1 || i == 8)) || (c == 2 && i == 4))) x = NULL_I64;
+                ((int64_t*)ray_data(v))[j] = x;
+                if (x == NULL_I64) v->attrs |= RAY_ATTR_HAS_NULLS;
+            }
+        }
+        int64_t name = ray_sym_intern(names[c], strlen(names[c]));
+        if (name < 0) { subset_drop(v); subset_drop(t); return NULL; }
+        t = ray_table_add_col(t, name, v); /* consumes table, retains vector */
+        subset_drop(v);
+        if (!subset_ok(t)) return t;
+    }
+    return t;
+}
+
+static bool subset_rids(ray_t* t, ray_t* u, const int* rows, int n) {
+    if (ray_table_nrows(u) != n) return false;
+    ray_t* a = ray_table_col_idx(t, 0);
+    ray_t* b = ray_table_col_idx(u, 0);
+    if (!subset_ok(a) || !subset_ok(b) || b->type != RAY_I64 || b->len != n) return false;
+    for (int j = 0; j < n; j++)
+        if (((int64_t*)ray_data(a))[rows[j]] != ((int64_t*)ray_data(b))[j]) return false;
+    return true;
+}
+
+static bool subset_shape(ray_t* v, int n, bool scalar_recipe) {
+    if (!subset_ok(v)) return false;
+    if (v->type == -RAY_BOOL) return RAY_ATOM_IS_NULL(v) || v->b8 <= 1;
+    /* Scalar-only binary evaluation may return a one-cell BOOL vector.
+     * Broadcast it only for recipes known to have no row-valued input;
+     * a literal/row-valued one-cell vector is not proof of scalar shape. */
+    if (v->type != RAY_BOOL || (v->len != n && !(scalar_recipe && v->len == 1))) return false;
+    for (int64_t i = 0; i < v->len; i++) if (((uint8_t*)ray_data(v))[i] > 1) return false;
+    return true;
+}
+
+/* Logical cell codes: null=2, false=0, true=1. Never read null atom payload. */
+static int subset_cell(ray_t* v, int i) {
+    return v->type == -RAY_BOOL ? (RAY_ATOM_IS_NULL(v) ? 2 : v->b8) : ((uint8_t*)ray_data(v))[v->len == 1 ? 0 : i];
+}
+
+static bool subset_equal(ray_t* a, ray_t* b, const int* rows, int n, int* bad) {
+    for (int j = 0; j < n; j++) {
+        int x = subset_cell(a, rows[j]), y = subset_cell(b, j);
+        if (x > 2 || y > 2 || x != y) { *bad = j; return false; }
+    }
+    return true;
+}
+
+typedef ray_op_t* (*subset_binary_t)(ray_graph_t*, ray_op_t*, ray_op_t*);
+
+/* One small topological recipe, with seeded source/operator choices. IDs, not
+ * node pointers, survive growth. Repeated indices preserve DAG sharing. Finite
+ * inputs <=3 and arithmetic depth<=3 bound magnitude by 6561. */
+static bool subset_recipe(ray_graph_t* g, uint32_t seed, int root, uint32_t* out) {
+    static subset_binary_t arith[] = {ray_add, ray_sub, ray_mul};
+    static subset_binary_t cmp[] = {ray_eq, ray_ne, ray_lt, ray_le, ray_gt, ray_ge};
+    uint32_t ids[37] = {0};
+    uint32_t rng = seed;
+    for (int i = 0; i <= root; i++) {
+        ray_op_t* p = NULL;
+        ray_t* tmp = NULL;
+#define SP_NODE(k) (&g->nodes[ids[(k)]])
+        rng = rng * 1664525u + 1013904223u; /* fixed unsigned draw per node */
+        switch (i) {
+        case 0: p = ray_scan(g, "x"); break;
+        case 1: p = ray_scan(g, "y"); break;
+        case 2: p = ray_scan(g, "b"); break;
+        case 3: p = ray_const_i64(g, (int64_t)(rng % 7) - 3); break;
+        case 4: p = ray_const_i64(g, NULL_I64); break;
+        case 5: case 6: p = ray_const_bool(g, i == 6); break;
+        case 7:
+            tmp = ray_typed_null(-RAY_BOOL);
+            if (subset_ok(tmp)) p = ray_const_atom(g, tmp);
+            break;
+        case 8: {
+            int64_t set[] = {-3, 0, 3, NULL_I64};
+            tmp = ray_vec_from_raw(RAY_I64, set, seed % 3 == 0 ? 0 : seed % 3 == 1 ? 3 : 4);
+            if (subset_ok(tmp)) {
+                tmp->attrs &= ~RAY_ATTR_HAS_NULLS;
+                if (tmp->len == 4) tmp->attrs |= RAY_ATTR_HAS_NULLS;
+                p = ray_const_vec(g, tmp);
+            }
+            break;
+        }
+        case 9: p = arith[rng % 3](g, SP_NODE(rng % 2), SP_NODE(3)); break;
+        case 10: case 11: p = arith[rng % 3](g, SP_NODE(i - 1), SP_NODE(i - 1)); break;
+        case 12: case 13: case 14: case 15: case 16: case 17:
+            p = cmp[i - 12](g, SP_NODE(11), SP_NODE((rng & 1) ? 3 : 4)); break;
+        case 18: p = ray_and(g, SP_NODE(12), SP_NODE(13)); break;
+        case 19: p = ray_or(g, SP_NODE(14), SP_NODE(15)); break;
+        case 20: p = ray_not(g, SP_NODE(19)); break;
+        case 21: p = ray_if(g, SP_NODE(2), SP_NODE(9), SP_NODE(1)); break;
+        case 22: p = ray_gt(g, SP_NODE(21), SP_NODE(4)); break;
+        case 23: p = ray_if(g, SP_NODE(18), SP_NODE(22), SP_NODE(20)); break;
+        case 24: p = ray_and(g, SP_NODE(23), SP_NODE(23)); break;
+        case 25: p = ray_in(g, SP_NODE(0), SP_NODE(8)); break;
+        case 26: p = ray_sum(g, SP_NODE(0)); break;
+        case 27: p = ray_gt(g, SP_NODE(0), SP_NODE(26)); break;
+        case 28: p = ray_sums_op(g, SP_NODE(0)); break;
+        case 29: p = ray_gt(g, SP_NODE(28), SP_NODE(3)); break;
+        case 30: {
+            uint16_t tid = ray_graph_add_table(g, g->table);
+            if (tid == UINT16_MAX) return false;
+            p = ray_scan_table(g, tid, "x"); break;
+        }
+        case 31: p = ray_gt(g, SP_NODE(30), SP_NODE(3)); break;
+        case 32: p = ray_and(g, SP_NODE(18), SP_NODE(27)); break;
+        case 33: p = ray_if(g, SP_NODE(2), SP_NODE(29), SP_NODE(18)); break;
+        case 34: p = ray_eq(g, SP_NODE(4), SP_NODE(4)); break;
+        case 35: p = ray_ne(g, SP_NODE(4), SP_NODE(3)); break;
+        case 36: p = ray_lt(g, SP_NODE(4), SP_NODE(3)); break;
+        }
+#undef SP_NODE
+        subset_drop(tmp);
+        if (!p) return false;
+        ids[i] = p->id;
+        if (p->opcode == OP_CONST && !subset_ok(find_ext(g, p->id)->literal)) return false;
+    }
+    *out = ids[root];
+    return true;
+}
+
+typedef struct { ray_t* t[2]; ray_t* v[2]; ray_graph_t* g; } subset_fixture_t;
+
+static test_result_t subset_property_body(subset_fixture_t* f) {
+    static const int roots[] = {2, 5, 6, 7, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 23, 24, 25, 34, 35, 36};
+    static const int negatives[] = {27, 29, 31, 32, 33};
+    static const int masks[5][17] = {
+        {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16}, {0}, {8},
+        {0,2,4,6,8,10,12,14,16}, {1,3,4,8,12,15}
+    };
+    static const int sizes[] = {17, 0, 1, 9, 6};
+    unsigned coverage = 0, executed = 0, declined = 0;
+    f->t[0] = subset_table(NULL, NULL, 17);
+    TEST_ASSERT_TRUE(subset_ok(f->t[0]));
+    for (int c = 0; c < 6; c++) {
+        uint32_t seed = 904u + (uint32_t)c;
+        for (int r = 0; r < 20; r++) {
+            bool admitted = false;
+            for (int m = 0; m < 5; m++) {
+                f->t[1] = subset_table(f->t[0], masks[m], sizes[m]);
+                TEST_ASSERT_TRUE(subset_ok(f->t[1]));
+                TEST_ASSERT_TRUE(subset_rids(f->t[0], f->t[1], masks[m], sizes[m]));
+                for (int side = 0; side < 2; side++) {
+                    f->g = ray_graph_new(f->t[side]);
+                    TEST_ASSERT_NOT_NULL(f->g);
+                    uint32_t id;
+                    TEST_ASSERT_FMT(subset_recipe(f->g, seed, roots[r], &id),
+                                    "seed=%u root=%d mask=%d side=%d recipe failed: %s", seed, roots[r], m, side,
+                                    ray_error_msg() ? ray_error_msg() : "no error message");
+                    bool accept = ray_expr_subset_invariant(f->g, id);
+                    if (side == 0) admitted = accept;
+                    else TEST_ASSERT_EQ_I(accept, admitted);
+                    if (accept) {
+                        f->v[side] = ray_execute(f->g, &f->g->nodes[id]);
+                        TEST_ASSERT_FMT(subset_shape(f->v[side], side ? sizes[m] : 17, (roots[r] >= 5 && roots[r] <= 7) || roots[r] >= 34),
+                                        "seed=%u root=%d mask=%d side=%d invalid BOOL result type=%d attrs=%u payload=%lld err=%s",
+                                        seed, roots[r], m, side, f->v[side] ? f->v[side]->type : 0,
+                                        f->v[side] ? (unsigned)f->v[side]->attrs : 0,
+                                        subset_ok(f->v[side]) ? (long long)f->v[side]->i64 : 0,
+                                        ray_error_msg() ? ray_error_msg() : "none");
+                    }
+                    ray_graph_free(f->g); f->g = NULL;
+                }
+                if (admitted) {
+                    int bad = -1;
+                    TEST_ASSERT_FMT(subset_equal(f->v[0], f->v[1], masks[m], sizes[m], &bad),
+                                    "seed=%u root=%d mask=%d cell=%d rid=%d full=%d subset=%d", seed, roots[r], m, bad,
+                                    bad < 0 ? -1 : 100 + masks[m][bad],
+                                    bad < 0 ? -1 : subset_cell(f->v[0], masks[m][bad]),
+                                    bad < 0 ? -1 : subset_cell(f->v[1], bad));
+                    /* Pin scalar/null behavior and the engine's null ordering,
+                     * independently of two executions agreeing with each other. */
+                    if (r >= 1 && r <= 3)
+                        TEST_ASSERT_EQ_I(subset_cell(f->v[0], 0), r == 1 ? 0 : r == 2 ? 1 : 2);
+                    if (r >= 17) TEST_ASSERT_EQ_I(subset_cell(f->v[0], 0), 1);
+                    coverage |= 1u << r; executed++;
+                } else declined++;
+                for (int side = 0; side < 2; side++) { subset_drop(f->v[side]); f->v[side] = NULL; }
+                subset_drop(f->t[1]); f->t[1] = NULL;
+            }
+            if (r < 4) TEST_ASSERT_TRUE(admitted); /* scan + scalar/broadcast/null controls */
+        }
+    }
+    TEST_ASSERT_FMT(executed > 0 && coverage == (1u << 20) - 1,
+                    "coverage=%x executed=%u declined=%u", coverage, executed, declined);
+    for (int i = 0; i < 5; i++) {
+        uint32_t id;
+        f->g = ray_graph_new(f->t[0]);
+        TEST_ASSERT_NOT_NULL(f->g);
+        TEST_ASSERT_TRUE(subset_recipe(f->g, 904, negatives[i], &id));
+        TEST_ASSERT_FALSE(ray_expr_subset_invariant(f->g, id));
+        ray_graph_free(f->g); f->g = NULL;
+    }
+    /* Independent known-nonlocal oracle: full SUM=0, subset SUM=3.
+     * Deliberately bypass the trait ONLY here, on well-typed graphs. */
+    subset_drop(f->t[0]); f->t[0] = subset_table(NULL, NULL, 3);
+    TEST_ASSERT_TRUE(subset_ok(f->t[0]));
+    ray_t* x = ray_table_col_idx(f->t[0], 1);
+    int64_t values[] = {1, -3, 2};
+    memcpy(ray_data(x), values, sizeof(values)); x->attrs &= ~RAY_ATTR_HAS_NULLS;
+    const int pick[] = {0, 2};
+    f->t[1] = subset_table(f->t[0], pick, 2);
+    TEST_ASSERT_TRUE(subset_ok(f->t[1]));
+    TEST_ASSERT_TRUE(subset_rids(f->t[0], f->t[1], pick, 2));
+    ray_t* rid = ray_table_col_idx(f->t[1], 0);
+    ((int64_t*)ray_data(rid))[0]++;
+    TEST_ASSERT_FALSE(subset_rids(f->t[0], f->t[1], pick, 2));
+    ((int64_t*)ray_data(rid))[0]--;
+    ((int64_t*)ray_data(rid))[1]++;
+    TEST_ASSERT_FALSE(subset_rids(f->t[0], f->t[1], pick, 2));
+    ((int64_t*)ray_data(rid))[1]--;
+    for (int side = 0; side < 2; side++) {
+        uint32_t id;
+        f->g = ray_graph_new(f->t[side]);
+        TEST_ASSERT_NOT_NULL(f->g);
+        TEST_ASSERT_TRUE(subset_recipe(f->g, 904, 27, &id));
+        f->v[side] = ray_execute(f->g, &f->g->nodes[id]);
+        TEST_ASSERT_TRUE(subset_shape(f->v[side], side ? 2 : 3, false));
+        ray_graph_free(f->g); f->g = NULL;
+    }
+    for (int j = 0; j < 2; j++) {
+        TEST_ASSERT_EQ_I(subset_cell(f->v[0], pick[j]), 1);
+        TEST_ASSERT_EQ_I(subset_cell(f->v[1], j), 0);
+    }
+    int bad = -1;
+    TEST_ASSERT_FALSE(subset_equal(f->v[0], f->v[1], pick, 2, &bad));
+    TEST_ASSERT_EQ_I(bad, 0);
+    /* Comparator sensitivity without relying on admission or engine mutation. */
+    subset_drop(f->v[1]);
+    uint8_t flipped[] = {1, 1};
+    f->v[1] = ray_vec_from_raw(RAY_BOOL, flipped, 2);
+    TEST_ASSERT_TRUE(subset_shape(f->v[1], 2, false));
+    TEST_ASSERT_TRUE(subset_equal(f->v[0], f->v[1], pick, 2, &bad));
+    ((uint8_t*)ray_data(f->v[1]))[1] = 0;
+    TEST_ASSERT_FALSE(subset_equal(f->v[0], f->v[1], pick, 2, &bad));
+    TEST_ASSERT_EQ_I(bad, 1);
+    PASS();
+}
+
+static test_result_t test_subset_property(void) {
+    subset_fixture_t f = {0};
+    ray_heap_init();
+    test_result_t result;
+    if (ray_sym_init() != RAY_OK) result = (test_result_t){TEST_FAIL, "subset sym init"};
+    else result = subset_property_body(&f);
+    if (f.g) ray_graph_free(f.g);
+    for (int i = 0; i < 2; i++) { subset_drop(f.v[i]); subset_drop(f.t[i]); }
+    ray_sym_destroy();
+    ray_heap_destroy();
+    return result;
+}
+
 /*
  * Test: filter with AND-combined predicates in "wrong" order.
  *
@@ -2926,6 +3207,7 @@ static test_result_t test_filter_domain_barriers(void) {
 }
 
 const test_entry_t opt_entries[] = {
+    { "opt/subset_property", test_subset_property, NULL, NULL },
     { "opt/filter_domain_barriers", test_filter_domain_barriers, NULL, NULL },
     { "opt/subset_proof_pointwise", test_subset_proof_pointwise, NULL, NULL },
     { "opt/subset_proof_membership_roles", test_subset_proof_membership_roles, NULL, NULL },
