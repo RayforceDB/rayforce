@@ -1,0 +1,43 @@
+;; A running, moving or order verb in a projection reads its input over
+;; the whole table, rows the WHERE drops included, then keeps the WHERE's
+;; rows.  Its input's producer must therefore write every row: a binary op
+;; under the lazy selection skips whole 1024-row blocks with no kept row.
+(set N 200000)
+(set x (til N))
+(set T (table [order region amount] (list x (at ['US 'EU] (as 'I64 (or (< x 1024) (>= x 199000)))) (+ 1 (* 0 x)))))
+(set T (update {from: T amount: (if (== 5 (% order 10)) 0Nl amount)}))
+(set W (fn [v] (at v (at (select {from: T where: (== region 'EU)}) 'order))))
+(set P (* (fills (at T 'amount)) 2))
+(set S (fn [] (last (at (select {from: T where: (== region 'EU) s: (sums (* (fills amount) 2))}) 's))))
+(S) -- 400000
+(S) -- 400000
+(last (at (select {from: T where: (== region 'EU) s: (sums (* (fills amount) 2)) take: 5000}) 's)) -- 400000
+(last (at (select {from: T where: (== region 'EU) s: (sums (* (fills amount) 2)) sort: order}) 's)) -- 400000
+(at (select {from: T where: (== region 'EU) by: region s: (last (sums (* (fills amount) 2)))}) 's) -- [400000]
+;; Every kept row, against the verb over the whole column.
+(at (select {from: T where: (== region 'EU) o: order s: (sums (* (fills amount) 2))}) 's) -- (W (sums P))
+(set V (* (fills (at T 'amount)) (at T 'order)))
+(set K (fn [v] (at v [0 2048])))
+;; Row 2048 opens a block after one the WHERE drops whole: a verb reading
+;; the row before it reads a row the binary op would leave unwritten.
+(at (select {from: T where: (in order [0 2048]) s: (deltas (* (fills amount) order))}) 's) -- (K (deltas V))
+(at (select {from: T where: (in order [0 2048]) s: (ratios (* (fills amount) order))}) 's) -- (K (ratios V))
+(at (select {from: T where: (in order [0 2048]) s: (lag (* (fills amount) order))}) 's) -- (K (lag V))
+(at (select {from: T where: (in order [0 2048]) s: (msum 3 (* (fills amount) order))}) 's) -- (K (msum 3 V))
+;; Other producers that skip or zero-fill dropped rows: the SYM like
+;; kernel, and `if` with a branch that is not a bare column or literal.
+;; An eager `if` takes a vector condition as one truth value, so its
+;; row-wise oracle is `update`, which evaluates over the whole table.
+(at (select {from: T where: (== region 'EU) s: (sums (as 'I64 (like region "U*")))}) 's) -- (W (sums (as 'I64 (like (at T 'region) "U*"))))
+(at (select {from: T where: (== region 'EU) s: (sums (if (== region 'EU) 0 (* amount 3)))}) 's) -- (W (at (update {from: T s: (sums (if (== region 'EU) 0 (* amount 3)))}) 's))
+;; Whole-table rule on a small table: running verbs see rows B too, an
+;; aggregate and a nested select as from: see the survivors only.
+(set R (table [name room score] (list ['Ann 'Bob 'Cid 'Dan] ['A 'B 'A 'B] [60 20 45 35])))
+(at (select {from: R where: (== room 'A) s: (sums score)}) 's) -- [60 125]
+(at (select {from: R where: (== room 'A) s: (deltas score)}) 's) -- [0Nl 25]
+(at (select {from: (select {from: R where: (== room 'A)}) s: (sums score)}) 's) -- [60 105]
+(at (select {from: R where: (== room 'A) s: (avg score)}) 's) -- [52.5]
+;; The aggregate nested under the running verb sees the whole table too:
+;; avg over all four rows is 40, the running sum of 20 -20 5 -5 is
+;; 20 0 5 0, and rows A keep 20 and 5.
+(at (select {from: R where: (== room 'A) s: (sums (- score (avg score)))}) 's) -- [20.0 5.0]

@@ -9005,19 +9005,23 @@ static test_result_t test_exec_head_filter_pred_error(void) {
     PASS();
 }
 
-/* 6000 rows: id = id_base + row, amount 1, flag on the first and last 100
- * rows, or on every even row. */
-static ray_t* make_chain_table(int64_t id_base, bool even_flag) {
-    enum { N = 6000 };
-    ray_t* id = ray_vec_new(RAY_I64, N);
-    ray_t* amount = ray_vec_new(RAY_I64, N);
-    ray_t* flag = ray_vec_new(RAY_I64, N);
-    id->len = amount->len = flag->len = N;
-    for (int64_t i = 0; i < N; i++) {
+/* Where make_chain_table sets flag: on the first and last 100 rows, on
+ * every even row, or on the first 100 rows only. */
+typedef enum { CHAIN_FLAG_EDGES, CHAIN_FLAG_EVEN, CHAIN_FLAG_HEAD } chain_flag_t;
+
+/* n rows: id = id_base + row, amount 1, flag where `where` says. */
+static ray_t* make_chain_table(int64_t n, int64_t id_base, chain_flag_t where) {
+    ray_t* id = ray_vec_new(RAY_I64, n);
+    ray_t* amount = ray_vec_new(RAY_I64, n);
+    ray_t* flag = ray_vec_new(RAY_I64, n);
+    id->len = amount->len = flag->len = n;
+    for (int64_t i = 0; i < n; i++) {
         ((int64_t*)ray_data(id))[i] = id_base + i;
         ((int64_t*)ray_data(amount))[i] = 1;
-        ((int64_t*)ray_data(flag))[i] = even_flag ? i % 2 == 0
-                                                  : (i < 100 || i >= N - 100);
+        ((int64_t*)ray_data(flag))[i] =
+            where == CHAIN_FLAG_EVEN ? i % 2 == 0
+          : where == CHAIN_FLAG_HEAD ? i < 100
+          : (i < 100 || i >= n - 100);
     }
     ray_t* tbl = ray_table_new(3);
     tbl = ray_table_add_col(tbl, ray_sym_intern("id", 2), id);
@@ -9054,7 +9058,7 @@ static test_result_t test_exec_head_filter_chain_domain(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    ray_t* tbl = make_chain_table(0, false);
+    ray_t* tbl = make_chain_table(6000, 0, CHAIN_FLAG_EDGES);
     for (int running = 1; running >= 0; running--) {
         ray_t* result = exec_head_filter_chain(tbl, tbl, running,
                                                running ? 150 : 5920, 50);
@@ -9076,8 +9080,8 @@ static test_result_t test_exec_head_filter_chain_domain(void) {
         ray_release(result);
     }
 
-    ray_t* deflt = make_chain_table(0, true);
-    ray_t* other = make_chain_table(10000, true);
+    ray_t* deflt = make_chain_table(6000, 0, CHAIN_FLAG_EVEN);
+    ray_t* other = make_chain_table(6000, 10000, CHAIN_FLAG_EVEN);
     ray_t* result = exec_head_filter_chain(deflt, other, false, 10000, 50);
     TEST_ASSERT_NOT_NULL(result);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
@@ -9089,6 +9093,46 @@ static test_result_t test_exec_head_filter_chain_domain(void) {
 
     ray_release(other);
     ray_release(deflt);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* SELECT over FILTER(flag == 1, CONST(input)) of one order op over
+ * MUL(FILLS(amount), id) = id, flag on the first EDGE rows only.  Under the
+ * filter's selection the parallel MUL writes the first block alone; the
+ * order op reads every row, so kept row i is N-1-i under reverse and desc
+ * and i under asc.  Rayfall projections reach these verbs through the
+ * eval fallback over the kept rows, so only a C-API graph gets here. */
+static test_result_t test_exec_order_ops_under_selection(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    enum { N = 2 * RAY_PARALLEL_THRESHOLD, EDGE = 100 };
+    ray_t* tbl = make_chain_table(N, 0, CHAIN_FLAG_HEAD);
+
+    struct { ray_op_t* (*op)(ray_graph_t*, ray_op_t*); bool ascending; } order_ops[] =
+        { { ray_reverse_op, false }, { ray_asc_op, true }, { ray_desc_op, false } };
+    for (int k = 0; k < 3; k++) {
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* kept = ray_filter(g, ray_const_table(g, tbl),
+                                    ray_eq(g, ray_scan(g, "flag"), ray_const_i64(g, 1)));
+        ray_op_t* ids = ray_mul(g, ray_fills_op(g, ray_scan(g, "amount")),
+                                ray_scan(g, "id"));
+        ray_op_t* cols[] = { order_ops[k].op(g, ids) };
+        ray_t* result = ray_execute(g, ray_select_op(g, kept, cols, 1));
+        ray_graph_free(g);
+
+        TEST_ASSERT_NOT_NULL(result);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(ray_table_nrows(result), EDGE);
+        const int64_t* got = (const int64_t*)ray_data(ray_table_get_col_idx(result, 0));
+        for (int64_t i = 0; i < EDGE; i++)
+            TEST_ASSERT_EQ_I(got[i], order_ops[k].ascending ? i : N - 1 - i);
+        ray_release(result);
+    }
+
     ray_release(tbl);
     ray_sym_destroy();
     ray_heap_destroy();
@@ -17869,6 +17913,7 @@ const test_entry_t exec_entries[] = {
     { "exec/head_filter_input_error",          test_exec_head_filter_input_error,          NULL, NULL },
     { "exec/head_filter_pred_error",           test_exec_head_filter_pred_error,           NULL, NULL },
     { "exec/head_filter_chain_domain",         test_exec_head_filter_chain_domain,         NULL, NULL },
+    { "exec/order_ops_under_selection",        test_exec_order_ops_under_selection,        NULL, NULL },
     { "exec/select_expr_col_error",            test_exec_select_expr_col_error,            NULL, NULL },
     { "exec/streaming_large_dag",              test_exec_streaming_large_dag,              NULL, NULL },
     { "exec/deep_binary_chain",                test_exec_deep_binary_chain,                NULL, NULL },

@@ -3480,6 +3480,20 @@ static __attribute__((noinline)) ray_t* exec_filter_refine_enc(ray_graph_t* g, r
     return input;
 }
 
+/* A whole-vector reader (running, moving, order, distinct) reads every row of
+ * its input, rows a lazy selection drops included.  Producers evaluated under a
+ * selection may leave those rows unwritten (par_binary_fn skips NONE blocks,
+ * the SYM like kernel skips dropped rows, `if` zero-fills them), so the input
+ * is evaluated with the selection cleared and comes back at full length, as
+ * the group path does for a declined input (group.c). */
+static ray_t* exec_node_all_rows(ray_graph_t* g, ray_op_t* child) {
+    ray_t* saved = g->selection;
+    g->selection = NULL;
+    ray_t* v = exec_node(g, child);
+    g->selection = saved;
+    return v;
+}
+
 static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
     if (!op) return ray_error("nyi", NULL);
 
@@ -3635,7 +3649,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
         }
 
         case OP_DISTINCT: {
-            ray_t* input = exec_node(g, op_child(g, op, 0));
+            ray_t* input = exec_node_all_rows(g, op_child(g, op, 0));
             if (!input || RAY_IS_ERR(input)) return input;
             if (!ray_is_vec(input)) {
                 ray_release(input);
@@ -3647,7 +3661,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
         }
 
         case OP_ASC: {
-            ray_t* input = exec_node(g, op_child(g, op, 0));
+            ray_t* input = exec_node_all_rows(g, op_child(g, op, 0));
             if (!input || RAY_IS_ERR(input)) return input;
             if (!ray_is_vec(input)) {
                 ray_release(input);
@@ -3659,7 +3673,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
         }
 
         case OP_DESC: {
-            ray_t* input = exec_node(g, op_child(g, op, 0));
+            ray_t* input = exec_node_all_rows(g, op_child(g, op, 0));
             if (!input || RAY_IS_ERR(input)) return input;
             if (!ray_is_vec(input)) {
                 ray_release(input);
@@ -3671,7 +3685,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
         }
 
         case OP_REVERSE: {
-            ray_t* input = exec_node(g, op_child(g, op, 0));
+            ray_t* input = exec_node_all_rows(g, op_child(g, op, 0));
             if (!input || RAY_IS_ERR(input)) return input;
             if (!ray_is_vec(input)) {
                 ray_release(input);
@@ -3687,7 +3701,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
         case OP_MAXS: case OP_PRDS: case OP_DIFFER:
         case OP_MSUM: case OP_MAVG: case OP_MMIN: case OP_MMAX:
         case OP_MCOUNT: case OP_MVAR: case OP_MDEV: {
-            ray_t* input = exec_node(g, op_child(g, op, 0));
+            ray_t* input = exec_node_all_rows(g, op_child(g, op, 0));
             if (!input || RAY_IS_ERR(input)) return input;
             if (!ray_is_vec(input)) {
                 ray_release(input);
