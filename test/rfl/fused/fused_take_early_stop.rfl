@@ -74,3 +74,14 @@ tcnt -- 1
 (sum FD) -- 104852100
 (first FD) -- 200007
 (at (select {x: x from: TK where: (and (== c 7) (> x 900000)) asc: s take: 3}) 'x) -- [900007 901007 902007]
+
+;; A nested `and` is the flat `and` of its leaves: (and (and a b) c) takes
+;; the fused path as (and a b c) does, and keeps the null flags of the rows
+;; it gathers: p is null on every 7th row, so x = 0 and 70 are null here.
+(set TN (table [x c p] (list (til 1000) (% (til 1000) 10) (til 1000))))
+(set TN (update {from: TN p: (if (== 0 (% p 7)) 0Nl p)}))
+(at (select {from: TN where: (and (and (== c 0) (>= x 0)) (< x 500)) take: 10}) 'x) -- [0 10 20 30 40 50 60 70 80 90]
+(at (select {from: TN where: (and (== c 0) (and (>= x 0) (and (< x 500) (!= x 30)))) take: 3}) 'x) -- [0 10 20]
+(sum (nil? (at (select {from: TN where: (and (and (== c 0) (>= x 0)) (< x 500)) take: 10}) 'p))) -- 2
+;; the fused top-K reads the same gate
+(at (select {from: TN where: (and (and (== c 0) (>= x 100)) (< x 500)) desc: x take: 3}) 'x) -- [490 480 470]
