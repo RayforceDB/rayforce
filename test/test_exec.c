@@ -9178,6 +9178,62 @@ static test_result_t test_exec_order_ops_under_selection(void) {
     PASS();
 }
 
+/* flag 1 0 1 0, score 60 20 45 35: the whole table's avg score is 40,
+ * the flag == 1 rows' 52.5. */
+static ray_t* make_room_table(void) {
+    const int64_t flags[] = { 1, 0, 1, 0 }, scores[] = { 60, 20, 45, 35 };
+    ray_t* flag = ray_vec_new(RAY_I64, 4);
+    ray_t* score = ray_vec_new(RAY_I64, 4);
+    flag->len = score->len = 4;
+    memcpy(ray_data(flag), flags, sizeof flags);
+    memcpy(ray_data(score), scores, sizeof scores);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("flag", 4), flag);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("score", 5), score);
+    ray_release(flag);
+    ray_release(score);
+    return tbl;
+}
+
+/* SELECT over FILTER(flag == 1, CONST(input)) whose columns share one
+ * x = SUB(score, AVG(score)), SUMS(x) and SUM(x) in either order.  SUMS
+ * reads x over the whole table (20 -20 5 -5, running 20 0 5 0, kept 20 5);
+ * SUM reads it over the kept rows (7.5 -7.5, sum 0).  Neither may be
+ * handed the other's x. */
+static test_result_t test_exec_memo_across_row_domains(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    ray_t* tbl = make_room_table();
+    for (int sums_first = 1; sums_first >= 0; sums_first--) {
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* kept = ray_filter(g, ray_const_table(g, tbl),
+                                    ray_eq(g, ray_scan(g, "flag"), ray_const_i64(g, 1)));
+        ray_op_t* x = ray_sub(g, ray_scan(g, "score"), ray_avg(g, ray_scan(g, "score")));
+        ray_op_t* running = ray_sums_op(g, x);
+        ray_op_t* total = ray_sum(g, x);
+        ray_op_t* cols[] = { sums_first ? running : total, sums_first ? total : running };
+        ray_t* result = ray_execute(g, ray_select_op(g, kept, cols, 2));
+        ray_graph_free(g);
+
+        TEST_ASSERT_NOT_NULL(result);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(ray_table_nrows(result), 2);
+        const double* sums = (const double*)ray_data(ray_table_get_col_idx(result, !sums_first));
+        const double* sum = (const double*)ray_data(ray_table_get_col_idx(result, sums_first));
+        TEST_ASSERT_EQ_F(sums[0], 20.0, 1e-9);
+        TEST_ASSERT_EQ_F(sums[1], 5.0, 1e-9);
+        TEST_ASSERT_EQ_F(sum[0], 0.0, 1e-9);
+        TEST_ASSERT_EQ_F(sum[1], 0.0, 1e-9);
+        ray_release(result);
+    }
+
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 /* ---- OP_SELECT with failing expression column — exec.c L1613-1617.
  *
  * When a SELECT projection expression evaluates to an error, the SELECT
@@ -17954,6 +18010,7 @@ const test_entry_t exec_entries[] = {
     { "exec/head_filter_chain_domain",         test_exec_head_filter_chain_domain,         NULL, NULL },
     { "exec/memo_under_selection",             test_exec_memo_under_selection,             NULL, NULL },
     { "exec/order_ops_under_selection",        test_exec_order_ops_under_selection,        NULL, NULL },
+    { "exec/memo_across_row_domains",          test_exec_memo_across_row_domains,          NULL, NULL },
     { "exec/select_expr_col_error",            test_exec_select_expr_col_error,            NULL, NULL },
     { "exec/streaming_large_dag",              test_exec_streaming_large_dag,              NULL, NULL },
     { "exec/deep_binary_chain",                test_exec_deep_binary_chain,                NULL, NULL },

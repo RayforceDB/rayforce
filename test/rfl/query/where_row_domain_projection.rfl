@@ -41,3 +41,14 @@
 ;; avg over all four rows is 40, the running sum of 20 -20 5 -5 is
 ;; 20 0 5 0, and rows A keep 20 and 5.
 (at (select {from: R where: (== room 'A) s: (sums (- score (avg score)))}) 's) -- [20.0 5.0]
+;; A `let` value used both under a running verb and outside it is one
+;; value per row domain: whole table under sums, the kept rows elsewhere.
+;; The expansion and the swapped `if` give the same result.
+(at (select {from: R where: (== room 'A) s: (let x (* score (count score)) (+ (sums x) (max x)))}) 's) -- [360 620]
+(at (select {from: R where: (== room 'A) s: (+ (sums (* score (count score))) (max (* score (count score))))}) 's) -- [360 620]
+(at (select {from: R where: (== room 'A) s: (let p (- score (avg score)) (if (<= score 50) (sums p) p))}) 's) -- [7.5 5.0]
+(at (select {from: R where: (== room 'A) s: (let p (- score (avg score)) (if (> score 50) p (sums p)))}) 's) -- [7.5 5.0]
+;; A `let` value the `if` reads under the selection, then sums over every
+;; row: the binary op under the selection skips the dropped blocks.
+(set E (as 'I64 (== 0 (% (at T 'order) 2))))
+(at (select {from: T where: (== region 'EU) s: (let p (* (fills amount) 2) (if (== 0 (% order 2)) p (sums p)))}) 's) -- (W (+ (* E P) (* (- 1 E) (sums P))))
