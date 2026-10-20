@@ -24,6 +24,7 @@
 /**   I/O builtins, type casting, and misc builtins extracted from eval.c.
  */
 
+#include "core/timespan.h"
 #include <errno.h>
 #include <stdint.h>
 #include "lang/eval.h"
@@ -542,6 +543,7 @@ static int8_t resolve_type_name(int64_t sym_id) {
     else if (len == 3 && memcmp(name, "F32", 3) == 0) result = RAY_F32;
     else if (len == 4 && memcmp(name, "DATE", 4) == 0) result = RAY_DATE;
     else if (len == 4 && memcmp(name, "TIME", 4) == 0) result = RAY_TIME;
+    else if (len == 8 && memcmp(name, "TIMESPAN", 8) == 0) result = RAY_TIMESPAN;
     else if (len == 9 && memcmp(name, "TIMESTAMP", 9) == 0) result = RAY_TIMESTAMP;
     else if (len == 4 && memcmp(name, "GUID", 4) == 0) result = RAY_GUID;
     ray_release(s);
@@ -898,7 +900,7 @@ static ray_t* cast_vec_copy_nulls(ray_t* vec, ray_t* val) {
                     if (ray_vec_is_null(val, j)) d[j] = NULL_F64;
                 break;
             }
-            case RAY_I64: case RAY_TIMESTAMP: {
+            case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: {
                 int64_t* d = (int64_t*)ray_data(vec);
                 for (int64_t j = 0; j < vec->len; j++)
                     if (ray_vec_is_null(val, j)) d[j] = NULL_I64;
@@ -1004,7 +1006,7 @@ static bool cast_range_worker(const void* _src_p, void* _dst_p,
      * in_type); each leaf is a tight typed loop the compiler vectorizes. */
 #define CL(R, W, EXPR) do { CAST_LOOP_RANGE(R, W, EXPR, lo, hi); return true; } while (0)
     switch (out_type) {
-    case RAY_I64: case RAY_TIMESTAMP:
+    case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP:
         switch (in_type) {
         case RAY_BOOL:  CL(uint8_t,  int64_t, _v ? 1 : 0);
         case RAY_U8:    CL(uint8_t,  int64_t, (int64_t)_v);
@@ -1020,7 +1022,7 @@ static bool cast_range_worker(const void* _src_p, void* _dst_p,
         case RAY_BOOL:  CL(uint8_t,  int32_t, _v ? 1 : 0);
         case RAY_U8:    CL(uint8_t,  int32_t, (int32_t)_v);
         case RAY_I16:   CL(int16_t,  int32_t, (int32_t)_v);
-        case RAY_I64: case RAY_TIMESTAMP:
+        case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP:
                         CL(int64_t,  int32_t, (int32_t)_v);
         case RAY_F64:   CL(double,   int32_t, ray_cast_f64_to_i32_null(_v));
         case RAY_F32:   CL(float,    int32_t, ray_cast_f64_to_i32_null((double)_v));
@@ -1032,7 +1034,7 @@ static bool cast_range_worker(const void* _src_p, void* _dst_p,
         case RAY_U8:    CL(uint8_t,  int16_t, (int16_t)_v);
         case RAY_I32: case RAY_DATE: case RAY_TIME:
                         CL(int32_t,  int16_t, (int16_t)_v);
-        case RAY_I64: case RAY_TIMESTAMP:
+        case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP:
                         CL(int64_t,  int16_t, (int16_t)_v);
         case RAY_F64:   CL(double,   int16_t, ray_cast_f64_to_i16_null(_v));
         case RAY_F32:   CL(float,    int16_t, ray_cast_f64_to_i16_null((double)_v));
@@ -1044,7 +1046,7 @@ static bool cast_range_worker(const void* _src_p, void* _dst_p,
         case RAY_I16:   CL(int16_t,  uint8_t, (uint8_t)_v);
         case RAY_I32: case RAY_DATE: case RAY_TIME:
                         CL(int32_t,  uint8_t, (uint8_t)_v);
-        case RAY_I64: case RAY_TIMESTAMP:
+        case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP:
                         CL(int64_t,  uint8_t, (uint8_t)_v);
         case RAY_F64:   CL(double,   uint8_t, ray_cast_f64_to_u8_null(_v));
         case RAY_F32:   CL(float,    uint8_t, ray_cast_f64_to_u8_null((double)_v));
@@ -1057,7 +1059,7 @@ static bool cast_range_worker(const void* _src_p, void* _dst_p,
         case RAY_I16:   CL(int16_t,  double, (double)_v);
         case RAY_I32: case RAY_DATE: case RAY_TIME:
                         CL(int32_t,  double, (double)_v);
-        case RAY_I64: case RAY_TIMESTAMP:
+        case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP:
                         CL(int64_t,  double, (double)_v);
         case RAY_F32:   CL(float,    double, (double)_v);
         }
@@ -1069,7 +1071,7 @@ static bool cast_range_worker(const void* _src_p, void* _dst_p,
         case RAY_I16:   CL(int16_t,  float, (float)_v);
         case RAY_I32: case RAY_DATE: case RAY_TIME:
                         CL(int32_t,  float, (float)_v);
-        case RAY_I64: case RAY_TIMESTAMP:
+        case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP:
                         CL(int64_t,  float, (float)_v);
         case RAY_F64:   CL(double,   float, ray_cast_f64_to_f32_null(_v));
         }
@@ -1080,7 +1082,7 @@ static bool cast_range_worker(const void* _src_p, void* _dst_p,
         case RAY_I16:   CL(int16_t,  uint8_t, _v != 0 ? 1 : 0);
         case RAY_I32: case RAY_DATE: case RAY_TIME:
                         CL(int32_t,  uint8_t, _v != 0 ? 1 : 0);
-        case RAY_I64: case RAY_TIMESTAMP:
+        case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP:
                         CL(int64_t,  uint8_t, _v != 0 ? 1 : 0);
         case RAY_F64:   CL(double,   uint8_t, ray_cast_f64_to_bool_null(_v));
         case RAY_F32:   CL(float,    uint8_t, ray_cast_f64_to_bool_null((double)_v));
@@ -1263,7 +1265,7 @@ static void cast_mark_output_sentinels(ray_t* vec, int8_t out_type, int64_t n) {
                 if (d[i] != d[i]) { vec->attrs |= RAY_ATTR_HAS_NULLS; return; }
             return;
         }
-        case RAY_I64: case RAY_TIMESTAMP: {
+        case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: {
             const int64_t* d = (const int64_t*)out;
             for (int64_t i = 0; i < n; i++)
                 if (d[i] == NULL_I64) { vec->attrs |= RAY_ATTR_HAS_NULLS; return; }
@@ -1289,7 +1291,8 @@ static ray_t* cast_vec_numeric(ray_t* type_sym, ray_t* val, int8_t out_type) {
 
     /* Fast path: typed numeric vec → numeric vec, no list/string. */
     if (ray_is_vec(val) && val->type != RAY_STR && val->type != RAY_SYM &&
-        val->type != RAY_GUID && out_type != RAY_SYM) {
+        val->type != RAY_GUID && out_type != RAY_SYM &&
+        val->type != RAY_TIMESPAN && out_type != RAY_TIMESPAN) {
         ray_t* fast = cast_vec_numeric_fast(val, vec, out_type);
         /* Three return states (helper does NOT release `vec`):
          *   - vec on success
@@ -1348,7 +1351,7 @@ static ray_t* cast_vec_numeric(ray_t* type_sym, ray_t* val, int8_t out_type) {
         if (alloc) ray_release(elem);
         if (RAY_IS_ERR(cast)) { ray_release(vec); return cast; }
         switch (out_type) {
-        case RAY_I64: case RAY_TIMESTAMP: case RAY_SYM:
+        case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: case RAY_SYM:
             ((int64_t*)out)[i] = cast->i64; break;
         case RAY_I32: case RAY_DATE: case RAY_TIME:
             ((int32_t*)out)[i] = cast->i32; break;
@@ -1395,6 +1398,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         else if (cast_match(tn, tl, "SYMBOL") || cast_match(tn, tl, "symbol") || cast_match(tn, tl, "sym")) tt = -RAY_SYM;
         else if (cast_match(tn, tl, "DATE") || cast_match(tn, tl, "date")) tt = -RAY_DATE;
         else if (cast_match(tn, tl, "TIME") || cast_match(tn, tl, "time")) tt = -RAY_TIME;
+        else if (cast_match(tn, tl, "TIMESPAN") || cast_match(tn, tl, "timespan")) tt = -RAY_TIMESPAN;
         else if (cast_match(tn, tl, "TIMESTAMP") || cast_match(tn, tl, "timestamp")) tt = -RAY_TIMESTAMP;
         else if (cast_match(tn, tl, "GUID") || cast_match(tn, tl, "guid")) tt = -RAY_GUID;
         else if (cast_match(tn, tl, "STR") || cast_match(tn, tl, "str")) { ray_release(s2); return ray_str("", 0); }
@@ -1403,7 +1407,8 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         if (tt == -RAY_BOOL) {
             /* Numeric and temporal null sentinels are non-zero. Empty
              * text and zero-payload internal nulls convert to false. */
-            return make_bool(val->type <= -RAY_I16 && val->type >= -RAY_TIMESTAMP);
+            return make_bool((val->type <= -RAY_I16 && val->type >= -RAY_TIMESTAMP) ||
+                             val->type == -RAY_TIMESPAN);
         }
         if (tt) return ray_typed_null(tt);
         return ray_error("domain", "as: unknown target type name");
@@ -1413,6 +1418,44 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
     const char* tname = ray_str_ptr(s);
     size_t tlen = ray_str_len(s);
 
+    if (cast_match(tname, tlen, "TIMESPAN") || cast_match(tname, tlen, "timespan")) {
+        ray_release(s);
+        if (val->type == -RAY_TIMESPAN) { ray_retain(val); return val; }
+        if (val->type == -RAY_TIME) return ray_timespan((int64_t)val->i32 * INT64_C(1000000));
+        if (val->type == -RAY_TIMESTAMP) {
+            int64_t ns = val->i64 % INT64_C(86400000000000);
+            return ray_timespan(ns < 0 ? ns + INT64_C(86400000000000) : ns);
+        }
+        if (val->type == -RAY_F64 || val->type == -RAY_F32)
+            return ray_timespan(ray_cast_f64_to_i64_null(round(val->f64)));
+        if (is_numeric(val)) return ray_timespan(as_i64(val));
+        if (val->type == -RAY_STR) {
+            size_t used = 0;
+            int64_t ns;
+            if (!ray_parse_timespan(ray_str_ptr(val), &used, &ns) || used != ray_str_len(val))
+                return ray_error("domain", "as: invalid duration string");
+            return ray_timespan(ns);
+        }
+        if (ray_is_vec(val) || val->type == RAY_LIST)
+            return cast_vec_numeric(type_sym, val, RAY_TIMESPAN);
+        return ray_error("type", "as: cannot convert %s to TIMESPAN", ray_type_name(val->type));
+    }
+    if (val->type == -RAY_TIMESPAN &&
+        (cast_match(tname, tlen, "I64") || cast_match(tname, tlen, "i64") ||
+         cast_match(tname, tlen, "I32") || cast_match(tname, tlen, "i32") ||
+         cast_match(tname, tlen, "I16") || cast_match(tname, tlen, "i16") ||
+         cast_match(tname, tlen, "U8") || cast_match(tname, tlen, "u8") ||
+         cast_match(tname, tlen, "F64") || cast_match(tname, tlen, "f64") ||
+         cast_match(tname, tlen, "F32") || cast_match(tname, tlen, "f32") ||
+         cast_match(tname, tlen, "B8") || cast_match(tname, tlen, "b8") ||
+         cast_match(tname, tlen, "BOOL"))) {
+        ray_release(s);
+        ray_t* count = ray_i64(val->i64);
+        if (RAY_IS_ERR(count)) return count;
+        ray_t* result = ray_cast_fn(type_sym, count);
+        ray_release(count);
+        return result;
+    }
     /* Cast to I64 / i64 */
     if (cast_match(tname, tlen, "I64") || cast_match(tname, tlen, "i64")) {
         ray_release(s);
@@ -2487,7 +2530,7 @@ ray_t* ray_enlist_fn(ray_t** args, int64_t n) {
         ray_t* vec = ray_vec_new(vtype, n);
         if (RAY_IS_ERR(vec)) return vec;
         switch (vtype) {
-        case RAY_I64: case RAY_TIMESTAMP: {
+        case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: {
             int64_t* d = (int64_t*)ray_data(vec);
             for (int64_t i = 0; i < n; i++) d[i] = args[i]->i64;
             break;
@@ -3478,7 +3521,7 @@ ray_t* ray_group_indices_fn(ray_t* x) {
                  * agree with the bitmap. */
                 void* base = ray_data(keys_vec);
                 switch (key_type) {
-                    case RAY_I64: case RAY_TIMESTAMP:
+                    case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP:
                         ((int64_t*)base)[g] = NULL_I64; break;
                     case RAY_I32: case RAY_DATE: case RAY_TIME:
                         ((int32_t*)base)[g] = NULL_I32; break;
@@ -3662,7 +3705,7 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
         if (RAY_IS_ERR(result)) return result;
         /* Copy atom value as first element */
         switch (b->type) {
-        case RAY_I64: case RAY_TIMESTAMP: case RAY_SYM:
+        case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: case RAY_SYM:
             ((int64_t*)ray_data(result))[0] = a->i64; break;
         case RAY_F64:
             ((double*)ray_data(result))[0] = a->f64; break;
@@ -3713,7 +3756,7 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
             memcpy(ray_data(result), ray_data(a), (size_t)(na * esz));
         }
         switch (a->type) {
-        case RAY_I64: case RAY_TIMESTAMP: case RAY_SYM:
+        case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: case RAY_SYM:
             ((int64_t*)ray_data(result))[na] = b->i64; break;
         case RAY_F64:
             ((double*)ray_data(result))[na] = b->f64; break;
@@ -3746,7 +3789,7 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
         if (RAY_IS_ERR(result)) return result;
         result->len = 2;
         switch (vtype) {
-        case RAY_I64: case RAY_TIMESTAMP: case RAY_SYM:
+        case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: case RAY_SYM:
             ((int64_t*)ray_data(result))[0] = a->i64;
             ((int64_t*)ray_data(result))[1] = b->i64;
             break;

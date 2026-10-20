@@ -51,7 +51,7 @@ bool ray_raw_is_null(int8_t type, uint8_t attrs, const void* p, int64_t idx) {
     switch (type) {
         case RAY_F64: { double x = ((const double*)p)[idx]; return x != x; }
         case RAY_F32: { float x = ((const float*)p)[idx];   return x != x; }
-        case RAY_I64: case RAY_TIMESTAMP: return ((const int64_t*)p)[idx] == NULL_I64;
+        case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP: return ((const int64_t*)p)[idx] == NULL_I64;
         case RAY_I32: case RAY_DATE: case RAY_TIME: return ((const int32_t*)p)[idx] == NULL_I32;
         case RAY_I16: return ((const int16_t*)p)[idx] == NULL_I16;
         case RAY_SYM: return ray_read_sym(p, idx, RAY_SYM, attrs) == 0;
@@ -141,7 +141,7 @@ static int64_t vec_capacity(ray_t* vec) {
  * -------------------------------------------------------------------------- */
 
 ray_t* ray_vec_new(int8_t type, int64_t capacity) {
-    if (type <= 0 || type >= RAY_TYPE_COUNT)
+    if (!ray_is_vector_type(type))
         return ray_error("type", "vec_new: type must be a positive concrete vector type, got %s", ray_type_name(type));
     if (type == RAY_SYM)
         return ray_sym_vec_new(RAY_SYM_W64, capacity);  /* default: global sym IDs */
@@ -231,7 +231,7 @@ void ray_sym_vec_adopt_domain(ray_t* out, ray_t* in) {
 
 ray_t* ray_vec_append(ray_t* vec, const void* elem) {
     if (!vec || RAY_IS_ERR(vec)) return vec;
-    if (vec->type <= 0 || vec->type >= RAY_TYPE_COUNT)
+    if (!ray_is_vec(vec))
         return ray_error("type", "vec_append: expects a concrete vector type, got %s", ray_type_name(vec->type));
     if (vec->type == RAY_STR) return ray_error("type", "vec_append: str vectors use ray_str_vec_append, got %s", ray_type_name(vec->type));
 
@@ -294,7 +294,7 @@ fail:
 
 ray_t* ray_vec_append_raw(ray_t* vec, const void* src, int64_t count) {
     if (!vec || RAY_IS_ERR(vec)) return vec;
-    if (vec->type <= 0 || vec->type >= RAY_TYPE_COUNT)
+    if (!ray_is_vec(vec))
         return ray_error("type", "vec_append_raw: expects a concrete vector type, got %s", ray_type_name(vec->type));
     if (vec->type == RAY_STR) return ray_error("type", "vec_append_raw: str vectors use ray_str_vec_append, got %s", ray_type_name(vec->type));
     if (count < 0) return ray_error("range", "vec_append_raw: count must be non-negative, got %lld", (long long)count);
@@ -669,7 +669,7 @@ ray_t* ray_vec_concat(ray_t* a, ray_t* b) {
 
 ray_t* ray_vec_insert_at(ray_t* vec, int64_t idx, const void* elem) {
     if (!vec || RAY_IS_ERR(vec)) return vec;
-    if (vec->type <= 0 || vec->type >= RAY_TYPE_COUNT)
+    if (!ray_is_vec(vec))
         return ray_error("type", "vec_insert_at: expects a concrete vector type, got %s", ray_type_name(vec->type));
     if (vec->type == RAY_STR) return ray_error("type", "vec_insert_at: str vectors use ray_str_vec_insert_at, got %s", ray_type_name(vec->type));
     if (idx < 0 || idx > vec->len) return ray_error("range", "vec_insert_at: index out of bounds [0,%lld], got %lld", (long long)vec->len, (long long)idx);
@@ -786,7 +786,7 @@ ray_t* ray_vec_insert_many(ray_t* vec, ray_t* idxs, ray_t* vals) {
     if (!vec || RAY_IS_ERR(vec)) return vec;
     if (!idxs || RAY_IS_ERR(idxs)) return idxs;
     if (!vals || RAY_IS_ERR(vals)) return vals;
-    if (vec->type <= 0 || vec->type >= RAY_TYPE_COUNT) return ray_error("type", "vec_insert_many: dest expects a concrete vector type, got %s", ray_type_name(vec->type));
+    if (!ray_is_vec(vec)) return ray_error("type", "vec_insert_many: dest expects a concrete vector type, got %s", ray_type_name(vec->type));
     if (vec->type == RAY_STR) return ray_error("type", "vec_insert_many: str vectors are unsupported, use ray_vec_insert_vec_at in a loop, got %s", ray_type_name(vec->type));
     if (idxs->type != RAY_I64) return ray_error("type", "vec_insert_many: indices must be an i64 vector, got %s", ray_type_name(idxs->type));
 
@@ -941,7 +941,7 @@ ray_t* ray_vec_insert_many(ray_t* vec, ray_t* idxs, ray_t* vals) {
  * -------------------------------------------------------------------------- */
 
 ray_t* ray_vec_from_raw(int8_t type, const void* data, int64_t count) {
-    if (type <= 0 || type >= RAY_TYPE_COUNT)
+    if (!ray_is_vector_type(type))
         return ray_error("type", "vec_from_raw: type must be a positive concrete vector type, got %s", ray_type_name(type));
     if (type == RAY_STR) return ray_error("type", "vec_from_raw: str vectors are unsupported (no pool), got %s", ray_type_name(type));
     if (count < 0) return ray_error("range", "vec_from_raw: count must be non-negative, got %lld", (long long)count);
@@ -982,7 +982,7 @@ ray_t* ray_vec_from_raw(int8_t type, const void* data, int64_t count) {
             }
             break;
         case RAY_F64: case RAY_F32:
-        case RAY_I64: case RAY_TIMESTAMP:
+        case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP:
         case RAY_I32: case RAY_DATE: case RAY_TIME:
         case RAY_I16: case RAY_GUID:
             for (int64_t i = 0; i < count; i++) {
@@ -1043,7 +1043,7 @@ ray_err_t ray_vec_set_null_checked(ray_t* vec, int64_t idx, bool is_null) {
         switch (vec->type) {
             case RAY_F64:                          ((double*)p)[idx] = NULL_F64; break;
             case RAY_F32:                          ((float*)p)[idx]  = NULL_F32; break;
-            case RAY_I64: case RAY_TIMESTAMP:      ((int64_t*)p)[idx] = NULL_I64; break;
+            case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP:      ((int64_t*)p)[idx] = NULL_I64; break;
             case RAY_I32: case RAY_DATE: case RAY_TIME: ((int32_t*)p)[idx] = NULL_I32; break;
             case RAY_I16:                          ((int16_t*)p)[idx] = NULL_I16; break;
             case RAY_SYM:
@@ -1606,7 +1606,7 @@ bool ray_vec_is_null(ray_t* vec, int64_t idx) {
     switch (vec->type) {
         case RAY_F64:
         case RAY_F32:
-        case RAY_I64: case RAY_TIMESTAMP:
+        case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP:
         case RAY_I32: case RAY_DATE: case RAY_TIME:
         case RAY_I16:
         case RAY_GUID:

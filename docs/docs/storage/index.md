@@ -446,3 +446,16 @@ A complete workflow: create a table, save it to disk, load it back, and verify t
 ```
 
 The loaded table is fully functional — you can run `select`, `update`, joins, and aggregations on it just like an in-memory table. Symbol columns resolve correctly because the symbol table was saved and loaded alongside the data.
+
+## Duration column compatibility
+
+TIMESPAN uses the concrete type tag 16 and a signed 64-bit nanosecond
+payload. Serialization, generation-0 and generation-2 splayed columns,
+and partitioned columns preserve the tag and `0Nn` nulls. Tags 14 and 15
+remain internal selection and encoded-column tags.
+
+Readers built before TIMESPAN support reject the new tag, including when
+it appears in a table schema. Upgrade readers before writing duration
+columns to shared storage. Existing column tags and format generations
+retain their meanings. Parquet logical time and duration mappings are
+separate from this column format.

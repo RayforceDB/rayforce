@@ -1,0 +1,129 @@
+;; Scalar result types and values at duration operation boundaries.
+(type (min [0Nn])) -- 'timespan
+(as 'I64 (min [0Nn])) -- 9223372036854775807
+(type (max [0Nn])) -- 'timespan
+(as 'I64 (max [0Nn])) -- -9223372036854775807
+(type (min (as 'TIMESPAN []))) -- 'timespan
+(as 'I64 (min (as 'TIMESPAN []))) -- 9223372036854775807
+(type (max (as 'TIMESPAN []))) -- 'timespan
+(as 'I64 (max (as 'TIMESPAN []))) -- -9223372036854775807
+(type (min [0Wn])) -- 'timespan
+(as 'I64 (min [0Wn])) -- 9223372036854775807
+(type (max [-0Wn])) -- 'timespan
+(as 'I64 (max [-0Wn])) -- -9223372036854775807
+(type 0D1) -- 'timespan
+(as 'I64 0D1) -- 3600000000000
+(type 1D001) -- 'timespan
+(as 'I64 1D001) -- 86460000000000
+(type 0D12345) -- 'timespan
+(as 'I64 0D12345) -- 445500000000000
+(type 0D123456) -- 'timespan
+(as 'I64 0D123456) -- 45296000000000
+(type 1D1.5) -- 'timespan
+(as 'I64 1D1.5) -- 90000500000000
+(type 106752D) -- 'timespan
+(as 'I64 106752D) -- -9223371273709551616
+(type 999999D) -- 'timespan
+(as 'I64 999999D) -- -5833806768547758080
+(type (div 0D00:00:01 00:00:01.000)) -- 'timespan
+(as 'I64 (div 0D00:00:01 00:00:01.000)) -- 1000000
+(type (/ 0D00:00:01 00:00:01.000)) -- 'f64
+(/ 0D00:00:01 00:00:01.000) -- 1000000.0
+(type (in 1D [86400000000000])) -- 'b8
+(in 1D [86400000000000]) -- true
+(type (in 0Nn [0Nl])) -- 'b8
+(in 0Nn [0Nl]) -- true
+(type (xbar 2000.01.02D01:00:00.000000000 1D)) -- 'timestamp
+(as 'I64 (xbar 2000.01.02D01:00:00.000000000 1D)) -- 86400000000000
+(type (xbar 2000.01.02D01:00:00.000000000 0D)) -- 'timestamp
+(nil? (xbar 2000.01.02D01:00:00.000000000 0D)) -- true
+(type (xbar 2000.01.02D01:00:00.000000000 0Nn)) -- 'timestamp
+(nil? (xbar 2000.01.02D01:00:00.000000000 0Nn)) -- true
+(type (xbar 1D -2D)) -- 'timespan
+(as 'I64 (xbar 1D -2D)) -- 172800000000000
+(type (xbar -0D00:00:00.000000001 0D00:00:01)) -- 'timespan
+(as 'I64 (xbar -0D00:00:00.000000001 0D00:00:01)) -- -1000000000
+(type (xbar 2000.01.02 1D)) -- 'date
+(as 'I64 (xbar 2000.01.02 1D)) -- 0
+(type (xbar 86400000000000 1D)) -- 'i64
+(xbar 86400000000000 1D) -- 86400000000000
+(type (xbar 0D00:00:00.000000004 2.5)) -- 'f64
+(xbar 0D00:00:00.000000004 2.5) -- 2.5
+(type 1D) -- 'timespan
+(as 'I64 1D) -- 86400000000000
+(type -0D00:00:00.000000001) -- 'timespan
+(as 'I64 -0D00:00:00.000000001) -- -1
+(type 1D01) -- 'timespan
+(as 'I64 1D01) -- 90000000000000
+(type 0D24:00:00) -- 'timespan
+(as 'I64 0D24:00:00) -- 86400000000000
+(type 0D99:00:00) -- 'timespan
+(as 'I64 0D99:00:00) -- 356400000000000
+(type 0D00:00:00.1234567899) -- 'timespan
+(as 'I64 0D00:00:00.1234567899) -- 123456789
+(type 0Wn) -- 'timespan
+(as 'I64 0Wn) -- 9223372036854775807
+(type -0Wn) -- 'timespan
+(as 'I64 -0Wn) -- -9223372036854775807
+(type (+ 0Wn 1)) -- 'timespan
+(nil? (+ 0Wn 1)) -- true
+(type (+ 0Wn 0Wn)) -- 'timespan
+(as 'I64 (+ 0Wn 0Wn)) -- -2
+(type (+ 1D 1)) -- 'timespan
+(as 'I64 (+ 1D 1)) -- 86400000000001
+(type (+ 1 1D)) -- 'timespan
+(as 'I64 (+ 1 1D)) -- 86400000000001
+(type (- 1D 1)) -- 'timespan
+(as 'I64 (- 1D 1)) -- 86399999999999
+(type (- 1 1D)) -- 'timespan
+(as 'I64 (- 1 1D)) -- -86399999999999
+(type (+ 1D (as 'F32 1))) -- 'timespan
+(as 'I64 (+ 1D (as 'F32 1))) -- 86400000000001
+(type (+ 1D 1.0)) -- 'f64
+(+ 1D 1.0) -- 86400000000000.0
+(type (* 1D 2)) -- 'timespan
+(as 'I64 (* 1D 2)) -- 172800000000000
+(type (* 2 1D)) -- 'timespan
+(as 'I64 (* 2 1D)) -- 172800000000000
+(type (* 1D (as 'F32 0.5))) -- 'timespan
+(as 'I64 (* 1D (as 'F32 0.5))) -- 86400000000000
+(type (* 1D 0.5)) -- 'f64
+(* 1D 0.5) -- 43200000000000.0
+(* 1D 1D) !- type
+(type (div 1D 1D)) -- 'timespan
+(as 'I64 (div 1D 1D)) -- 1
+(type (div 1D 2)) -- 'timespan
+(as 'I64 (div 1D 2)) -- 43200000000000
+(type (div 1D 2.5)) -- 'timespan
+(as 'I64 (div 1D 2.5)) -- 28800000000000
+(type (div 1D 0)) -- 'timespan
+(nil? (div 1D 0)) -- true
+(% 1D 1D) !- type
+(type (div -0D00:00:00.000000001 2)) -- 'timespan
+(as 'I64 (div -0D00:00:00.000000001 2)) -- -1
+(type (% -0D00:00:00.000000001 1000000000)) -- 'timespan
+(as 'I64 (% -0D00:00:00.000000001 1000000000)) -- 999999999
+(type (/ 1D 1D)) -- 'f64
+(/ 1D 1D) -- 1.0
+(type (/ 0D00:00:03 0D00:00:02)) -- 'f64
+(/ 0D00:00:03 0D00:00:02) -- 1.5
+(type (== 1D 86400000000000)) -- 'b8
+(== 1D 86400000000000) -- true
+(type (== 0Nn 0Nl)) -- 'b8
+(== 0Nn 0Nl) -- true
+(type (< 1D 86400000000001)) -- 'b8
+(< 1D 86400000000001) -- true
+(type (- 2000.01.02D00:00:00.000000000 2000.01.01D00:00:00.000000000)) -- 'timespan
+(as 'I64 (- 2000.01.02D00:00:00.000000000 2000.01.01D00:00:00.000000000)) -- 86400000000000
+(type (sum [1D 0Nn 2D])) -- 'timespan
+(as 'I64 (sum [1D 0Nn 2D])) -- 259200000000000
+(type (avg [1D 0Nn 2D])) -- 'f64
+(avg [1D 0Nn 2D]) -- 129600000000000.0
+(type (min [1D 0Nn 2D])) -- 'timespan
+(as 'I64 (min [1D 0Nn 2D])) -- 86400000000000
+(type (max [1D 0Nn 2D])) -- 'timespan
+(as 'I64 (max [1D 0Nn 2D])) -- 172800000000000
+(type (neg 1D)) -- 'timespan
+(as 'I64 (neg 1D)) -- -86400000000000
+(type (abs -1D)) -- 'timespan
+(as 'I64 (abs -1D)) -- 86400000000000

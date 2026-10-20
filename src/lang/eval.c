@@ -214,7 +214,7 @@ static ray_t* list_collapse_uniform(ray_t* list) {
     int8_t t = e[0] ? e[0]->type : 0;
     switch (t) {
     case -RAY_BOOL: case -RAY_U8: case -RAY_I16: case -RAY_I32: case -RAY_I64:
-    case -RAY_F32: case -RAY_F64: case -RAY_DATE: case -RAY_TIME: case -RAY_TIMESTAMP:
+    case -RAY_TIMESPAN: case -RAY_F32: case -RAY_F64: case -RAY_DATE: case -RAY_TIME: case -RAY_TIMESTAMP:
         break;
     default:
         return list;
@@ -262,6 +262,7 @@ static ray_t* materialize_owned_args(ray_t** args, int64_t n) {
 static int64_t numeric_atom_i64(ray_t* x) {
     switch (x->type) {
     case -RAY_I64:
+    case -RAY_TIMESPAN:
     case -RAY_TIMESTAMP:
     case -RAY_SYM:
         return x->i64;
@@ -555,6 +556,7 @@ static ray_t* zero_atom_for_elem_type(ray_t* coll) {
         case RAY_F64:       return make_f64(0.0);
         case RAY_DATE:      return ray_date(0);
         case RAY_TIME:      return ray_time(0);
+        case RAY_TIMESPAN: return ray_timespan(0);
         case RAY_TIMESTAMP: return ray_timestamp(0);
         case RAY_SYM:       return ray_sym(0);
         case RAY_STR:       return ray_str("", 0);
@@ -839,6 +841,17 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
     if ((left && !RAY_IS_ERR(left) && RAY_IS_PARTED(left->type)) ||
         (right && !RAY_IS_ERR(right) && RAY_IS_PARTED(right->type)))
         return atomic_map_binary_parted(fn, dag_opcode, left, right);
+
+    bool duration_binary = fn == ray_add_fn || fn == ray_sub_fn || fn == ray_mul_fn ||
+        fn == ray_div_fn || fn == ray_idiv_fn || fn == ray_mod_fn || fn == ray_xbar_fn ||
+        fn == ray_eq_fn || fn == ray_neq_fn || fn == ray_lt_fn || fn == ray_lte_fn ||
+        fn == ray_gt_fn || fn == ray_gte_fn;
+    if (duration_binary && left->type != RAY_LIST && right->type != RAY_LIST &&
+        (ray_has_timespan(left) || ray_has_timespan(right) ||
+         (fn == ray_sub_fn &&
+          (left->type == RAY_TIMESTAMP || left->type == -RAY_TIMESTAMP) &&
+          (right->type == RAY_TIMESTAMP || right->type == -RAY_TIMESTAMP))))
+        return fn(left, right);
 
     int left_coll = is_collection(left);
     int right_coll = is_collection(right);
@@ -1352,7 +1365,7 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
     if (!force_boxed &&
         (out_type == RAY_I64 || out_type == RAY_F64 || out_type == RAY_I32 ||
          out_type == RAY_I16 || out_type == RAY_BOOL || out_type == RAY_U8 ||
-         out_type == RAY_DATE || out_type == RAY_TIME || out_type == RAY_TIMESTAMP)) {
+         out_type == RAY_DATE || out_type == RAY_TIME || out_type == RAY_TIMESTAMP || out_type == RAY_TIMESPAN)) {
         ray_t* vec = ray_vec_new(out_type, len);
         if (RAY_IS_ERR(vec)) { ray_release(e0); return vec; }
         vec->len = len;
@@ -1493,7 +1506,7 @@ ray_t* atomic_map_unary(ray_unary_fn fn, ray_t* arg) {
     /* Try typed vector path for numeric/bool/temporal output */
     if (out_type == RAY_I64 || out_type == RAY_F64 || out_type == RAY_I32 ||
         out_type == RAY_I16 || out_type == RAY_BOOL || out_type == RAY_U8 ||
-        out_type == RAY_DATE || out_type == RAY_TIME || out_type == RAY_TIMESTAMP) {
+        out_type == RAY_DATE || out_type == RAY_TIME || out_type == RAY_TIMESTAMP || out_type == RAY_TIMESPAN) {
         ray_t* vec = ray_vec_new(out_type, len);
         if (RAY_IS_ERR(vec)) { ray_release(e0); return vec; }
         vec->len = len;

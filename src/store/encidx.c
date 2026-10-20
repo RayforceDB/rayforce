@@ -52,7 +52,7 @@ static int ei_key_esz(int8_t t, uint8_t attrs) {
     case RAY_BOOL: case RAY_U8: return 1;
     case RAY_I16: return 2;
     case RAY_I32: case RAY_DATE: case RAY_TIME: case RAY_F32: return 4;
-    case RAY_I64: case RAY_TIMESTAMP: case RAY_F64: return 8;
+    case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP: case RAY_F64: return 8;
     case RAY_SYM: return ray_sym_elem_size(RAY_SYM, attrs);
     default: return 0;
     }

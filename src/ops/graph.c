@@ -421,7 +421,8 @@ static ray_op_t* make_binary(ray_graph_t* g, uint16_t opcode, ray_op_t* a, ray_o
     n->arity = 2;
     n->in_id[0] = a->id;
     n->in_id[1] = b->id;
-    n->out_type = out_type;
+    int8_t span_out = ray_timespan_binary_type(opcode, a->out_type, b->out_type);
+    n->out_type = span_out > 0 ? span_out : out_type;
     n->est_rows = est;
     return n;
 }
@@ -829,7 +830,13 @@ ray_op_t* ray_concat(ray_graph_t* g, ray_op_t** args, int n) {
  * Reduction ops
  * -------------------------------------------------------------------------- */
 
-ray_op_t* ray_sum(ray_graph_t* g, ray_op_t* a)    { return make_unary(g, OP_SUM, a, (a->out_type == RAY_F64 || a->out_type == RAY_F32) ? RAY_F64 : RAY_I64); }
+ray_op_t* ray_sum(ray_graph_t* g, ray_op_t* a) {
+    int8_t type = a->out_type;
+    if (RAY_IS_PARTED(type)) type = (int8_t)RAY_PARTED_BASETYPE(type);
+    int8_t out = type == RAY_F64 || type == RAY_F32 ? RAY_F64
+                 : type == RAY_TIMESPAN ? RAY_TIMESPAN : RAY_I64;
+    return make_unary(g, OP_SUM, a, out);
+}
 ray_op_t* ray_prod(ray_graph_t* g, ray_op_t* a)   { return make_unary(g, OP_PROD, a, (a->out_type == RAY_F64 || a->out_type == RAY_F32) ? RAY_F64 : RAY_I64); }
 ray_op_t* ray_all(ray_graph_t* g, ray_op_t* a)    { return make_unary(g, OP_ALL, a, RAY_BOOL); }
 ray_op_t* ray_any(ray_graph_t* g, ray_op_t* a)    { return make_unary(g, OP_ANY, a, RAY_BOOL); }

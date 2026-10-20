@@ -1,0 +1,39 @@
+;; Duration columns retain their type in ordinary, encoded and parted storage.
+(.sys.exec "rm -rf /tmp/rfl_timespan_store") -- 0
+(set S (table [k s] (list [1 1 2 2] [1D 0Nn -1D 0D01:00:00])))
+(.db.splayed.set "/tmp/rfl_timespan_store/plain" S {compress:false})
+(set P (.db.splayed.get "/tmp/rfl_timespan_store/plain"))
+(type (at P 's)) -- 'TIMESPAN
+(at P 's) -- [1D 0Nn -1D 0D01:00:00]
+(at (select {from:P y:(+ s 1D)}) 'y) -- [2D 0Nn 0D 1D01:00:00]
+(.db.splayed.set "/tmp/rfl_timespan_store/encoded" S {compress:true})
+(set E (.db.splayed.get "/tmp/rfl_timespan_store/encoded"))
+(type (at E 's)) -- 'TIMESPAN
+(at E 's) -- [1D 0Nn -1D 0D01:00:00]
+(at (select {from:E y:(+ s 1D)}) 'y) -- [2D 0Nn 0D 1D01:00:00]
+(sum (at E 's)) -- 0D01:00:00
+(min (at E 's)) -- -1D
+(at (select {from:E by:k y:(sum s) asc:k}) 'y) -- [1D -0D23:00:00]
+(at (select {from:E by:s n:(count k) asc:s}) 's) -- [0Nn -1D 0D01:00:00 1D]
+(.db.splayed.set "/tmp/rfl_timespan_store/parts/2024.01.01/t" S {compress:false})
+(.db.splayed.set "/tmp/rfl_timespan_store/parts/2024.01.02/t" S {compress:true})
+(set D (.db.parted.get "/tmp/rfl_timespan_store/parts" 't))
+(at D 's) -- [1D 0Nn -1D 0D01:00:00 1D 0Nn -1D 0D01:00:00]
+(sum (at D 's)) -- 0D02:00:00
+(at (select {from:D by:k y:(sum s) asc:k}) 'y) -- [2D -1D22:00:00]
+(type (de (ser (at E 's)))) -- 'TIMESPAN
+(.sys.exec "rm -rf /tmp/rfl_timespan_store") -- 0
+(.csv.write S "/tmp/rfl_timespan_store.csv")
+(set C (.csv.read [I64 TIMESPAN] "/tmp/rfl_timespan_store.csv"))
+(at C 's) -- [1D 0Nn -1D 0D01:00:00]
+(.sys.exec "rm -f /tmp/rfl_timespan_store.csv") -- 0
+
+;; Endpoint values and all-null groups retain duration extrema in encoded storage.
+(set X (table [k s] (list [1 1 2 2] [0Wn 0Wn 0Nn 0Nn])))
+(.db.splayed.set "/tmp/rfl_timespan_extrema" X {compress:true})
+(set X (.db.splayed.get "/tmp/rfl_timespan_extrema"))
+(min (at X 's)) -- 0Wn
+(max (at X 's)) -- 0Wn
+(at (select {from:X by:k lo:(min s) hi:(max s) asc:k}) 'lo) -- [0Wn 0Wn]
+(at (select {from:X by:k lo:(min s) hi:(max s) asc:k}) 'hi) -- [0Wn -0Wn]
+(.sys.exec "rm -rf /tmp/rfl_timespan_extrema") -- 0

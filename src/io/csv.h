@@ -41,6 +41,7 @@ typedef enum {
     CSV_TYPE_DATE,
     CSV_TYPE_TIME,
     CSV_TYPE_TIMESTAMP,
+    CSV_TYPE_TIMESPAN,
     CSV_TYPE_GUID,
     /* Narrow-int parse types — selected only via explicit schema (never from
      * inference, so they do not appear in promote_csv_type). Each parses the

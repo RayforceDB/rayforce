@@ -61,6 +61,11 @@ static inline bool ray_is_lazy(ray_t* x) {
 ray_t*    ray_lazy_materialize(ray_t* val);
 ray_t*    ray_lazy_append_param(ray_t* lazy, uint16_t opcode, int64_t param);
 
+bool ray_has_timespan(const ray_t* x);
+int8_t ray_timespan_binary_type(uint16_t op, int8_t a, int8_t b);
+ray_t* ray_timespan_binary(uint16_t op, ray_t* a, ray_t* b);
+ray_t* ray_timespan_xbar(ray_t* values, ray_t* width);
+
 /* ===== Cancel API ===== */
 
 void     ray_cancel(void);
@@ -271,7 +276,7 @@ static inline bool agg_type_admitted(uint16_t op, int8_t t) {
      * wrappers (e.g. RAY_MAPCOMMON) and out_type==0 to the runtime so a
      * plan-time guard never false-rejects a column it can't classify. */
     bool nonnum   = (t == RAY_SYM || t == RAY_STR || t == RAY_GUID);
-    bool temporal = (t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP);
+    bool temporal = (t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP || t == RAY_TIMESPAN);
     switch (op) {
         /* sum: numeric + TIME (duration-like ms count).  SYM/STR/GUID and the
          * absolute temporals DATE/TIMESTAMP are meaningless to sum → reject. */

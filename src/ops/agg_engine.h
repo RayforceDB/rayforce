@@ -34,7 +34,7 @@ extern bool ray_agg_tablestack;
  * a SYM element's width comes from `attrs` (a column's, or a range piece's). */
 static inline int64_t agg_read_key_i64_raw(int8_t type, uint8_t attrs, const void* data, int64_t i) {
     switch (type) {
-        case RAY_I64: case RAY_TIMESTAMP: return ((const int64_t*)data)[i];
+        case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP: return ((const int64_t*)data)[i];
         case RAY_I32: case RAY_DATE: case RAY_TIME: return ((const int32_t*)data)[i];
         case RAY_I16: return ((const int16_t*)data)[i];
         case RAY_U8:  case RAY_BOOL: return ((const uint8_t*)data)[i];
@@ -48,7 +48,7 @@ static inline int64_t agg_read_key_i64(ray_t* col, const void* data, int64_t row
 }
 /* The key types agg_read_key_i64 reads. */
 static inline bool agg_key_i64_type(int8_t t) {
-    return t == RAY_I64 || t == RAY_TIMESTAMP || t == RAY_I32 || t == RAY_DATE || t == RAY_TIME ||
+    return t == RAY_I64 || t == RAY_TIMESPAN || t == RAY_TIMESTAMP || t == RAY_I32 || t == RAY_DATE || t == RAY_TIME ||
            t == RAY_I16 || t == RAY_U8 || t == RAY_BOOL || t == RAY_SYM;
 }
 

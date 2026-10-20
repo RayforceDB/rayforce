@@ -159,7 +159,7 @@ static int numeric_elem_size(int8_t t) {
     case RAY_BOOL: case RAY_U8:                       return 1;
     case RAY_I16:                                     return 2;
     case RAY_I32: case RAY_DATE: case RAY_TIME: case RAY_F32:  return 4;
-    case RAY_I64: case RAY_TIMESTAMP: case RAY_F64:            return 8;
+    case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP: case RAY_F64:            return 8;
     default:                                          return 0;
     }
 }
@@ -253,7 +253,7 @@ static bool vec_is_ascending(const ray_t* v) {
         for (int64_t i = 1; i < n; i++) if (p[i] < p[i-1]) return false;
         return true;
     }
-    case RAY_I64: case RAY_TIMESTAMP: {
+    case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP: {
         const int64_t* p = (const int64_t*)b;
         for (int64_t i = 1; i < n; i++) if (p[i] < p[i-1]) return false;
         return true;
@@ -659,7 +659,7 @@ static ray_err_t zone_scan(ray_t* v, ray_index_t* ix) {
     case RAY_DATE:
     case RAY_TIME:      return zone_scan_int(v, ix, 4);  /* TIME is 4-byte int32 */
     case RAY_I64:
-    case RAY_TIMESTAMP: return zone_scan_int(v, ix, 8);
+    case RAY_TIMESPAN: case RAY_TIMESTAMP: return zone_scan_int(v, ix, 8);
     case RAY_F32:       return zone_scan_float(v, ix, 4);
     case RAY_F64:       return zone_scan_float(v, ix, 8);
     default:            return RAY_ERR_NYI;
@@ -774,7 +774,7 @@ static ray_err_t chunk_zone_scan(ray_t* v, ray_index_t* ix) {
     case RAY_DATE:
     case RAY_TIME:      return chunk_zone_scan_int(v, ix, 4);  /* TIME is 4-byte int32 */
     case RAY_I64:
-    case RAY_TIMESTAMP: return chunk_zone_scan_int(v, ix, 8);
+    case RAY_TIMESPAN: case RAY_TIMESTAMP: return chunk_zone_scan_int(v, ix, 8);
     case RAY_F32:       return chunk_zone_scan_float(v, ix, 4);
     case RAY_F64:       return chunk_zone_scan_float(v, ix, 8);
     default:            return RAY_ERR_NYI;
@@ -2775,7 +2775,7 @@ static int hash_key_in_range(int8_t t, int64_t k) {
     case RAY_I32: case RAY_DATE:
     case RAY_TIME:                     return k >= INT32_MIN && k <= INT32_MAX;
     case RAY_I64:
-    case RAY_TIMESTAMP:                return 1;
+    case RAY_TIMESPAN: case RAY_TIMESTAMP:                return 1;
     case RAY_SYM:                      return k >= 0; /* domain id; non-neg guaranteed by resolve */
     default:                           return 0;
     }
@@ -2790,7 +2790,7 @@ static int64_t hash_col_read_i64(const uint8_t* base, int8_t t, int64_t i) {
     case RAY_I32: case RAY_DATE:
     case RAY_TIME:                     es = 4; break;  /* TIME is 4-byte int32 */
     case RAY_I64:
-    case RAY_TIMESTAMP:                es = 8; break;
+    case RAY_TIMESPAN: case RAY_TIMESTAMP:                es = 8; break;
     default:                           return 0;
     }
     switch (es) {
@@ -3150,7 +3150,7 @@ static int64_t set_vec_read_i64(const uint8_t* base, int8_t t, int64_t i) {
     case RAY_I16:  { int16_t v; memcpy(&v, base + i*2, 2); return (int64_t)v; }
     case RAY_I32: case RAY_DATE: case RAY_TIME:
                    { int32_t v; memcpy(&v, base + i*4, 4); return (int64_t)v; }
-    case RAY_I64: case RAY_TIMESTAMP:
+    case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP:
                    { int64_t v; memcpy(&v, base + i*8, 8); return v; }
     default:       return 0;
     }
@@ -4781,7 +4781,7 @@ int ray_index_hash_group(ray_t* col, int64_t key,
 static bool int_atom_key(const ray_t* a, int64_t* k) {
     switch (a->type) {
     case -RAY_I64:
-    case -RAY_TIMESTAMP: *k = a->i64;            return true;
+    case -RAY_TIMESPAN: case -RAY_TIMESTAMP: *k = a->i64;            return true;
     case -RAY_I32:
     case -RAY_DATE:
     case -RAY_TIME:      *k = (int64_t)a->i32;   return true;

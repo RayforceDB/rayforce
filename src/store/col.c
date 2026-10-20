@@ -182,7 +182,7 @@ static bool is_serializable_type(int8_t t) {
     switch (t) {
     case RAY_BOOL: case RAY_U8:   case RAY_I16:
     case RAY_I32:  case RAY_I64:  case RAY_F32: case RAY_F64:
-    case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: case RAY_GUID:
+    case RAY_DATE: case RAY_TIME: case RAY_TIMESPAN: case RAY_TIMESTAMP: case RAY_GUID:
     case RAY_SYM:  case RAY_STR:
         return true;
     default:
@@ -999,7 +999,7 @@ static bool col_payload_has_nulls(ray_t* vec) {
             for (int64_t i = 0; i < n; i++) if (d[i] != d[i]) return true;
             return false;
         }
-        case RAY_I64: case RAY_TIMESTAMP: {
+        case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP: {
             const int64_t* d = (const int64_t*)p;
             for (int64_t i = 0; i < n; i++) if (d[i] == NULL_I64) return true;
             return false;

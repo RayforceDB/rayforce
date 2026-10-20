@@ -37,6 +37,7 @@
   #define _GNU_SOURCE
 #endif
 
+#include "core/timespan.h"
 #include "csv.h"
 #include "mem/heap.h"
 #include "mem/sys.h"
@@ -298,6 +299,19 @@ static void csv_cardinality_note(uint32_t* hashes, uint16_t* lens,
     non_null[col]++;
 }
 
+static int64_t fast_timespan(const char* field, size_t len, bool* is_null) {
+    char text[128];
+    size_t used = 0;
+    int64_t value = NULL_I64;
+    *is_null = true;
+    if (len >= sizeof(text)) return value;
+    memcpy(text, field, len);
+    text[len] = 0;
+    if (ray_parse_timespan(text, &used, &value) && used == len)
+        *is_null = value == NULL_I64;
+    return *is_null ? NULL_I64 : value;
+}
+
 static int8_t csv_resolve_inferred_type(csv_type_t t,
                                         uint16_t distinct,
                                         uint16_t non_null) {
@@ -307,6 +321,7 @@ static int8_t csv_resolve_inferred_type(csv_type_t t,
         case CSV_TYPE_F64:       return RAY_F64;
         case CSV_TYPE_DATE:      return RAY_DATE;
         case CSV_TYPE_TIME:      return RAY_TIME;
+        case CSV_TYPE_TIMESPAN: return RAY_TIMESPAN;
         case CSV_TYPE_TIMESTAMP: return RAY_TIMESTAMP;
         case CSV_TYPE_GUID:      return RAY_GUID;
         case CSV_TYPE_STR:
@@ -2225,6 +2240,7 @@ static void csv_parse_fn(void* arg, uint32_t worker_id,
                         case CSV_TYPE_F64:  ((double*)ctx->col_data[c])[row] = NULL_F64; break;
                         case CSV_TYPE_DATE: ((int32_t*)ctx->col_data[c])[row] = NULL_I32; break;
                         case CSV_TYPE_TIME: ((int32_t*)ctx->col_data[c])[row] = NULL_I32; break;
+                        case CSV_TYPE_TIMESPAN:
                         case CSV_TYPE_TIMESTAMP:
                             ((int64_t*)ctx->col_data[c])[row] = NULL_I64; break;
                         case CSV_TYPE_GUID:
@@ -2320,6 +2336,13 @@ static void csv_parse_fn(void* arg, uint32_t worker_id,
                     if (is_null) my_had_null[c] = true;
                     break;
                 }
+                case CSV_TYPE_TIMESPAN: {
+                    bool is_null;
+                    int64_t v = fast_timespan(fld, flen, &is_null);
+                    ((int64_t*)ctx->col_data[c])[row] = is_null ? NULL_I64 : v;
+                    if (is_null) my_had_null[c] = true;
+                    break;
+                }
                 case CSV_TYPE_TIMESTAMP: {
                     bool is_null;
                     int64_t v = fast_timestamp(fld, flen, &is_null);
@@ -2412,6 +2435,7 @@ static bool csv_parse_serial(const char* buf, size_t buf_size,
                         case CSV_TYPE_F64:  ((double*)col_data[c])[row] = NULL_F64; break;
                         case CSV_TYPE_DATE: ((int32_t*)col_data[c])[row] = NULL_I32; break;
                         case CSV_TYPE_TIME: ((int32_t*)col_data[c])[row] = NULL_I32; break;
+                        case CSV_TYPE_TIMESPAN:
                         case CSV_TYPE_TIMESTAMP:
                             ((int64_t*)col_data[c])[row] = NULL_I64; break;
                         case CSV_TYPE_GUID:
@@ -2502,6 +2526,13 @@ static bool csv_parse_serial(const char* buf, size_t buf_size,
                     bool is_null;
                     int32_t v = fast_time(fld, flen, &is_null);
                     ((int32_t*)col_data[c])[row] = is_null ? NULL_I32 : v;
+                    if (is_null) col_had_null[c] = true;
+                    break;
+                }
+                case CSV_TYPE_TIMESPAN: {
+                    bool is_null;
+                    int64_t v = fast_timespan(fld, flen, &is_null);
+                    ((int64_t*)col_data[c])[row] = is_null ? NULL_I64 : v;
                     if (is_null) col_had_null[c] = true;
                     break;
                 }
@@ -2761,6 +2792,7 @@ static ray_t* csv_materialize_rows(const char* buf, size_t file_size,
             case RAY_F64:       parse_types[c] = CSV_TYPE_F64;       break;
             case RAY_DATE:      parse_types[c] = CSV_TYPE_DATE;      break;
             case RAY_TIME:      parse_types[c] = CSV_TYPE_TIME;      break;
+            case RAY_TIMESPAN: parse_types[c] = CSV_TYPE_TIMESPAN; break;
             case RAY_TIMESTAMP: parse_types[c] = CSV_TYPE_TIMESTAMP; break;
             case RAY_GUID:      parse_types[c] = CSV_TYPE_GUID;      break;
             default:            parse_types[c] = CSV_TYPE_STR;       break;
@@ -3159,7 +3191,7 @@ static ray_t* csv_read_named_opts_inner(const char* path, char delimiter, bool h
         for (int c = 0; c < ncols; c++) {
             int8_t t = col_types_in[c];
             if (t < RAY_BOOL ||
-                (t >= RAY_TYPE_COUNT && t != RAY_CSV_AUTO_TAG) ||
+                ((t >= RAY_TYPE_COUNT || !ray_elem_size(t)) && t != RAY_CSV_AUTO_TAG) ||
                 t == RAY_TABLE) {
                 scratch_free(row_offsets_hdr);
                 ray_vm_unmap_file(buf, file_size);
@@ -3227,6 +3259,7 @@ static ray_t* csv_read_named_opts_inner(const char* path, char delimiter, bool h
             case RAY_F64:       parse_types[c] = CSV_TYPE_F64;       break;
             case RAY_DATE:      parse_types[c] = CSV_TYPE_DATE;      break;
             case RAY_TIME:      parse_types[c] = CSV_TYPE_TIME;      break;
+            case RAY_TIMESPAN: parse_types[c] = CSV_TYPE_TIMESPAN; break;
             case RAY_TIMESTAMP: parse_types[c] = CSV_TYPE_TIMESTAMP; break;
             case RAY_GUID:      parse_types[c] = CSV_TYPE_GUID;      break;
             default:           parse_types[c] = CSV_TYPE_STR;       break;
@@ -3650,7 +3683,7 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
         for (int c = 0; c < ncols; c++) {
             int8_t t = col_types_in[c];
             if (t < RAY_BOOL ||
-                (t >= RAY_TYPE_COUNT && t != RAY_CSV_AUTO_TAG) ||
+                ((t >= RAY_TYPE_COUNT || !ray_elem_size(t)) && t != RAY_CSV_AUTO_TAG) ||
                 t == RAY_TABLE) {
                 ray_vm_unmap_file(buf, file_size);
                 return RAY_ERR_TYPE;
@@ -4069,7 +4102,7 @@ static ray_err_t csv_save_parted_impl(const char* path, char delimiter, bool hea
         for (int c = 0; c < ncols; c++) {
             int8_t t = col_types_in[c];
             if (t < RAY_BOOL ||
-                (t >= RAY_TYPE_COUNT && t != RAY_CSV_AUTO_TAG) ||
+                ((t >= RAY_TYPE_COUNT || !ray_elem_size(t)) && t != RAY_CSV_AUTO_TAG) ||
                 t == RAY_TABLE) {
                 ray_vm_unmap_file(buf, file_size);
                 return RAY_ERR_TYPE;
@@ -4537,6 +4570,12 @@ static void csv_write_cell(csv_writer_t* w, const csv_col_info_t* ci, int64_t r)
     case RAY_TIME:
         csv_write_time(w, ((const int32_t*)d)[dr]);
         break;
+    case RAY_TIMESPAN: {
+        char text[64];
+        int n = ray_format_timespan(text, sizeof(text), ((const int64_t*)d)[dr]);
+        if (n > 0 && n < (int)sizeof(text)) cw_write(w, text, (size_t)n);
+        break;
+    }
     case RAY_TIMESTAMP:
         csv_write_timestamp(w, ((const int64_t*)d)[dr]);
         break;

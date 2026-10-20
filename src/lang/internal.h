@@ -105,7 +105,7 @@ static inline int8_t ray_null_class(int8_t t) {
     if (t < 0) t = (int8_t)-t;
     switch (t) {
     case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8: case RAY_BOOL:
-    case RAY_F64: case RAY_F32:
+    case RAY_F64: case RAY_F32: case RAY_TIMESPAN:
         return RAY_I64;
     default:
         return t;
@@ -340,6 +340,7 @@ static inline ray_t* collection_elem(ray_t* coll, int64_t i, int *allocated) {
         case RAY_U8:        return ray_u8(((uint8_t*)d)[i]);
         case RAY_DATE:      return ray_date((int64_t)((int32_t*)d)[i]);
         case RAY_TIME:      return ray_time((int64_t)((int32_t*)d)[i]);
+        case RAY_TIMESPAN: return ray_timespan(((int64_t*)d)[i]);
         case RAY_TIMESTAMP: return ray_timestamp(((int64_t*)d)[i]);
         case RAY_GUID: {
             const uint8_t* gd = ((uint8_t*)d) + i * 16;
@@ -408,6 +409,7 @@ static inline int store_typed_elem(ray_t* vec, int64_t i, ray_t* elem) {
         case RAY_U8:        ((uint8_t*)ray_data(vec))[i]   = (uint8_t)elem_as_i64(elem); return 0;
         case RAY_DATE:      ((int32_t*)ray_data(vec))[i]   = (int32_t)elem_as_i64(elem); return 0;
         case RAY_TIME:      ((int32_t*)ray_data(vec))[i]   = (int32_t)elem_as_i64(elem); return 0;
+        case RAY_TIMESPAN: ((int64_t*)ray_data(vec))[i]   = elem_as_i64(elem); return 0;
         case RAY_TIMESTAMP: ((int64_t*)ray_data(vec))[i]   = elem_as_i64(elem); return 0;
         /* SYM atoms are runtime-domain by design.  Runtime-domain target:
          * the id is written raw (today's behavior).  FILE-domain target
