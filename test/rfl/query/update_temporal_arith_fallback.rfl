@@ -20,7 +20,7 @@
 (type (at (update {from: t x: (+ ts 1)}) 'name)) -- 'SYM
 (at (update {from: t x: (+ ts 1)}) 'name) -- [Alice Bob Carol]
 ;; in place on a quoted table name
-(do (update {from: 't y: (- ts ts)}) (type (at t 'y))) -- 'I64
+(do (update {from: 't y: (- ts ts)}) (type (at t 'y))) -- 'TIMESPAN
 
 ;; ─── update by: with temporal arithmetic in the aggregate ───────────────────
 (set g (table [k ts] (list [a a b] [2001.01.01D01:01:01.000000000 2002.02.02D02:02:02.000000000 2003.03.03D03:03:03.000000000])))

@@ -34,7 +34,7 @@ bool ray_enc_kind_of(int8_t type, uint8_t attrs, ray_enc_kind_t* k) {
     case RAY_I16:                     *k = (ray_enc_kind_t){ 16, true,  false }; return true;
     case RAY_I32: case RAY_DATE:
     case RAY_TIME:                    *k = (ray_enc_kind_t){ 32, true,  false }; return true;
-    case RAY_I64: case RAY_TIMESTAMP: *k = (ray_enc_kind_t){ 64, true,  false }; return true;
+    case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP: *k = (ray_enc_kind_t){ 64, true,  false }; return true;
     case RAY_SYM:
         *k = (ray_enc_kind_t){ (uint8_t)(8 * RAY_SYM_ELEM(attrs)), false, false };
         return true;
@@ -51,7 +51,7 @@ bool ray_enc_value_kind(int8_t type, uint8_t attrs, ray_enc_kind_t* k) {
 bool ray_enc_has_bitmap(int8_t type) {
     switch (type) {
     case RAY_I16: case RAY_I32: case RAY_I64: case RAY_DATE: case RAY_TIME:
-    case RAY_TIMESTAMP: case RAY_F32: case RAY_F64: return true;
+    case RAY_TIMESPAN: case RAY_TIMESTAMP: case RAY_F32: case RAY_F64: return true;
     default: return false;
     }
 }
@@ -93,7 +93,7 @@ bool ray_enc_load(const void* data, int8_t type, uint8_t attrs,
         case RAY_I16: { int16_t v = ((const int16_t*)data)[r]; null = v == NULL_I16; b = (uint64_t)(uint16_t)v; break; }
         case RAY_I32: case RAY_DATE: case RAY_TIME:
             { int32_t v = ((const int32_t*)data)[r]; null = v == NULL_I32; b = (uint64_t)(uint32_t)v; break; }
-        case RAY_I64: case RAY_TIMESTAMP:
+        case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP:
             { int64_t v = ((const int64_t*)data)[r]; null = v == NULL_I64; b = (uint64_t)v; break; }
         case RAY_SYM: { int64_t v = ray_read_sym(data, r, type, attrs); null = v == 0; b = (uint64_t)v; break; }
         default: return false;

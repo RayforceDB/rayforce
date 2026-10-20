@@ -131,7 +131,7 @@ static ray_t* merge_expr(merge_scope_t* s, ray_t* e, int* type, bool* column, in
         }
         ray_col_meta_t cm;   /* metadata: an encoded column stays encoded */
         bool col = ray_table_col_meta(s->table, e->i64, &cm);
-        if (col && !s->projected && cm.type > 0 && cm.type <= RAY_STR) {
+        if (col && !s->projected && ray_is_vector_type(cm.type)) {
             *type = cm.type; *column = true;
             return merge_ref(e);
         }

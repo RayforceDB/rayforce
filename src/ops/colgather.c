@@ -95,7 +95,7 @@ static void acc_null(gather_acc_t* a, int64_t pos) {
     switch (a->out->type) {
     case RAY_F64:                               ((double*)p)[pos]  = NULL_F64; break;
     case RAY_F32:                               ((float*)p)[pos]   = NULL_F32; break;
-    case RAY_I64: case RAY_TIMESTAMP:           ((int64_t*)p)[pos] = NULL_I64; break;
+    case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP:           ((int64_t*)p)[pos] = NULL_I64; break;
     case RAY_I32: case RAY_DATE: case RAY_TIME: ((int32_t*)p)[pos] = NULL_I32; break;
     case RAY_I16:                               ((int16_t*)p)[pos] = NULL_I16; break;
     case RAY_GUID:                              memset((uint8_t*)p + pos * 16, 0, 16); break;
@@ -235,7 +235,7 @@ static bool gather_point_src(const ray_col_src_t* src) {
     if (!ray_col_src_encoded(src)) return false;
     switch (src->type) {
     case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8: case RAY_BOOL:
-    case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: case RAY_SYM: return true;
+    case RAY_DATE: case RAY_TIME: case RAY_TIMESPAN: case RAY_TIMESTAMP: case RAY_SYM: return true;
     default: return false;
     }
 }

@@ -21,6 +21,7 @@
  *   SOFTWARE.
  */
 
+#include "core/timespan.h"
 #include "lang/format.h"
 #include "lang/env.h"
 #include "table/table.h"
@@ -230,6 +231,7 @@ const char* ray_type_name(int8_t type) {
     case RAY_F64:       return type < 0 ? "f64"       : "F64";
     case RAY_DATE:      return type < 0 ? "date"      : "DATE";
     case RAY_TIME:      return type < 0 ? "time"      : "TIME";
+    case RAY_TIMESPAN:  return type < 0 ? "timespan" : "TIMESPAN";
     case RAY_TIMESTAMP: return type < 0 ? "timestamp" : "TIMESTAMP";
     case RAY_SYM:       return type < 0 ? "sym"       : "SYM";
     case RAY_STR:       return type < 0 ? "str"       : "STR";
@@ -395,6 +397,12 @@ static void fmt_time(fmt_buf_t* b, int32_t val) {
     fmt_printf(b, "%02d:%02d:%02d.%03d", h, m, s, ms);
 }
 
+static void fmt_timespan(fmt_buf_t* b, int64_t ns) {
+    char text[64];
+    int n = ray_format_timespan(text, sizeof(text), ns);
+    if (n > 0 && n < (int)sizeof(text)) fmt_putn(b, text, n);
+}
+
 static void fmt_timestamp(fmt_buf_t* b, int64_t val) {
     int y, mo, d, h, mi, s, ns;
     ts_to_parts(val, &y, &mo, &d, &h, &mi, &s, &ns);
@@ -427,6 +435,7 @@ const char* ray_fmt_null_literal(int8_t type) {
     case RAY_F32:       return "0Ne";
     case RAY_DATE:      return "0Nd";
     case RAY_TIME:      return "0Nt";
+    case RAY_TIMESPAN: return "0Nn";
     case RAY_TIMESTAMP: return "0Np";
     /* SYM's null is the empty symbol, written ' (as fmt_sym_atom renders
      * it); `null` would read back as the symbol `null`.  STR's null is "",
@@ -459,6 +468,7 @@ static void fmt_raw_elem(fmt_buf_t* b, ray_t* vec, int64_t idx) {
     case RAY_F64:       fmt_f64(b, ((double*)ray_data(vec))[idx]); break;
     case RAY_DATE:      fmt_date(b, ((int32_t*)ray_data(vec))[idx]); break;
     case RAY_TIME:      fmt_time(b, ((int32_t*)ray_data(vec))[idx]); break;
+    case RAY_TIMESPAN: fmt_timespan(b, ((int64_t*)ray_data(vec))[idx]); break;
     case RAY_TIMESTAMP: fmt_timestamp(b, ((int64_t*)ray_data(vec))[idx]); break;
     case RAY_SYM:
         /* cell-data: resolve through the column's domain */
@@ -618,7 +628,7 @@ static void fmt_dict_key(fmt_buf_t* b, ray_t* keys, int64_t i, int mode) {
         const char* sp = ray_str_vec_get(keys, i, &slen);
         k_atom = ray_str(sp ? sp : "", sp ? slen : 0);
         k_owned = true;
-    } else if (keys->type == RAY_I64 || keys->type == RAY_TIMESTAMP) {
+    } else if (keys->type == RAY_I64 || keys->type == RAY_TIMESPAN || keys->type == RAY_TIMESTAMP) {
         k_atom_storage.type = (int8_t)-keys->type;
         k_atom_storage.i64  = ((int64_t*)ray_data(keys))[i];
         k_atom = &k_atom_storage;
@@ -683,7 +693,7 @@ static void fmt_dict_val(fmt_buf_t* b, ray_t* vals, int64_t i, int mode) {
                                 v_storage.i32  = ((int32_t*)ray_data(vals))[i];
                                 v_atom = &v_storage; break;
             case RAY_I64:
-            case RAY_TIMESTAMP: v_storage.type = (int8_t)-vals->type;
+            case RAY_TIMESPAN: case RAY_TIMESTAMP: v_storage.type = (int8_t)-vals->type;
                                 v_storage.i64  = ((int64_t*)ray_data(vals))[i];
                                 v_atom = &v_storage; break;
             case RAY_F32:       v_storage.type = -RAY_F32;
@@ -1560,6 +1570,7 @@ static void fmt_obj(fmt_buf_t* b, ray_t* obj, int mode) {
         case RAY_F64:       fmt_f64(b, obj->f64); break;
         case RAY_DATE:      fmt_date(b, obj->i32); break;
         case RAY_TIME:      fmt_time(b, obj->i32); break;
+        case RAY_TIMESPAN: fmt_timespan(b, obj->i64); break;
         case RAY_TIMESTAMP: fmt_timestamp(b, obj->i64); break;
         case RAY_SYM:  fmt_sym(b, obj->i64); break;
         case RAY_STR:  fmt_str_atom(b, obj, mode > 0); break;

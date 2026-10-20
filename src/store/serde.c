@@ -226,7 +226,7 @@ static int64_t serde_fixed_esz(int8_t type) {
     case RAY_I16:                                       return 2;
     case RAY_I32: case RAY_DATE: case RAY_TIME:
     case RAY_F32:                                       return 4;
-    case RAY_I64: case RAY_TIMESTAMP: case RAY_F64:     return 8;
+    case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP: case RAY_F64:     return 8;
     case RAY_GUID:                                      return 16;
     default:                                            return 0;
     }
@@ -507,7 +507,7 @@ static void serde_fill_nulls(uint8_t* buf, int8_t type, int64_t n) {
         for (int64_t i = 0; i < n; i++) memcpy(buf + i * 4, &v, 4);
         return;
     }
-    case RAY_I64: case RAY_TIMESTAMP: {
+    case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP: {
         int64_t v = NULL_I64;
         for (int64_t i = 0; i < n; i++) memcpy(buf + i * 8, &v, 8);
         return;
@@ -698,7 +698,7 @@ int64_t ray_serde_size(ray_t* obj) {
         case RAY_I64:
             if (obj->attrs & (RAY_ATTR_GRAPH | RAY_ATTR_HNSW | RAY_ATTR_DLPROG)) return 0;
             return 1 + 1 + 8;
-        case RAY_TIMESTAMP:
+        case RAY_TIMESPAN: case RAY_TIMESTAMP:
         case RAY_F64:       return 1 + 1 + 8;
         case RAY_GUID:      return 1 + 1 + 16;
         case RAY_SYM: {
@@ -731,7 +731,7 @@ int64_t ray_serde_size(ray_t* obj) {
     case RAY_TIME:
     case RAY_F32:       return 1 + 1 + 8 + obj->len * 4;
     case RAY_I64:
-    case RAY_TIMESTAMP:
+    case RAY_TIMESPAN: case RAY_TIMESTAMP:
     case RAY_F64:       return 1 + 1 + 8 + obj->len * 8;
     case RAY_GUID:      return 1 + 1 + 8 + obj->len * 16;
     case RAY_SYM:       return 1 + 1 + 8 + sym_cells_size(obj);
@@ -863,7 +863,7 @@ int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
             return 1 + 1 + 4;
         }
         case RAY_I64:
-        case RAY_TIMESTAMP:
+        case RAY_TIMESPAN: case RAY_TIMESTAMP:
             memcpy(buf, &obj->i64, 8);
             return 1 + 1 + 8;
         case RAY_F64:
@@ -938,7 +938,7 @@ int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
         return c;
     }
     case RAY_I64:
-    case RAY_TIMESTAMP:
+    case RAY_TIMESPAN: case RAY_TIMESTAMP:
     case RAY_F64: {
         buf[0] = wire_attrs; buf++;
         memcpy(buf, &obj->len, 8); buf += 8;
@@ -1145,10 +1145,10 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len) {
             if (*len < 8) return ray_error("domain", "deserialize atom: truncated i64, need 8 bytes");
             { int64_t v; memcpy(&v, buf, 8); *len -= 8;
               return is_null ? ray_typed_null(type) : ray_i64(v); }
-        case RAY_TIMESTAMP:
+        case RAY_TIMESPAN: case RAY_TIMESTAMP:
             if (*len < 8) return ray_error("domain", "deserialize atom: truncated timestamp, need 8 bytes");
             { int64_t v; memcpy(&v, buf, 8); *len -= 8;
-              return is_null ? ray_typed_null(type) : ray_timestamp(v); }
+              return is_null ? ray_typed_null(type) : (type == -RAY_TIMESPAN ? ray_timespan(v) : ray_timestamp(v)); }
         case RAY_F64:
             if (*len < 8) return ray_error("domain", "deserialize atom: truncated f64, need 8 bytes");
             { double v; memcpy(&v, buf, 8); *len -= 8;
@@ -1196,7 +1196,7 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len) {
     case RAY_TIME:
     case RAY_F32:
     case RAY_I64:
-    case RAY_TIMESTAMP:
+    case RAY_TIMESPAN: case RAY_TIMESTAMP:
     case RAY_F64:
     case RAY_GUID: {
         if (*len < 9) return ray_error("domain", "deserialize vector: truncated %s header, need 9 bytes (attr+len)", ray_type_name(type));

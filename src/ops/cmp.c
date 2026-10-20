@@ -84,6 +84,7 @@ static inline int both_int_atoms(const ray_t* a, const ray_t* b) {
 
 /* Comparison */
 ray_t* ray_gt_fn(ray_t* a, ray_t* b) {
+    if (ray_has_timespan(a) || ray_has_timespan(b)) return ray_timespan_binary(OP_GT, a, b);
     { int c; if (char_str_cmp(a, b, &c) == 0) return make_bool(c > 0 ? 1 : 0); }
     if (a->type == -RAY_SYM && b->type == -RAY_SYM)
         return make_bool(sym_atom_cmp(a, b) > 0 ? 1 : 0);
@@ -107,6 +108,7 @@ ray_t* ray_gt_fn(ray_t* a, ray_t* b) {
 }
 
 ray_t* ray_lt_fn(ray_t* a, ray_t* b) {
+    if (ray_has_timespan(a) || ray_has_timespan(b)) return ray_timespan_binary(OP_LT, a, b);
     { int c; if (char_str_cmp(a, b, &c) == 0) return make_bool(c < 0 ? 1 : 0); }
     if (a->type == -RAY_SYM && b->type == -RAY_SYM)
         return make_bool(sym_atom_cmp(a, b) < 0 ? 1 : 0);
@@ -129,6 +131,7 @@ ray_t* ray_lt_fn(ray_t* a, ray_t* b) {
 }
 
 ray_t* ray_gte_fn(ray_t* a, ray_t* b) {
+    if (ray_has_timespan(a) || ray_has_timespan(b)) return ray_timespan_binary(OP_GE, a, b);
     { int c; if (char_str_cmp(a, b, &c) == 0) return make_bool(c >= 0 ? 1 : 0); }
     if (a->type == -RAY_SYM && b->type == -RAY_SYM)
         return make_bool(sym_atom_cmp(a, b) >= 0 ? 1 : 0);
@@ -152,6 +155,7 @@ ray_t* ray_gte_fn(ray_t* a, ray_t* b) {
 }
 
 ray_t* ray_lte_fn(ray_t* a, ray_t* b) {
+    if (ray_has_timespan(a) || ray_has_timespan(b)) return ray_timespan_binary(OP_LE, a, b);
     { int c; if (char_str_cmp(a, b, &c) == 0) return make_bool(c <= 0 ? 1 : 0); }
     if (a->type == -RAY_SYM && b->type == -RAY_SYM)
         return make_bool(sym_atom_cmp(a, b) <= 0 ? 1 : 0);
@@ -232,6 +236,7 @@ ray_t* ray_max2_fn(ray_t* a, ray_t* b) { return minmax_pick(a, b, ray_gte_fn(a, 
 
 
 ray_t* ray_eq_fn(ray_t* a, ray_t* b) {
+    if (ray_has_timespan(a) || ray_has_timespan(b)) return ray_timespan_binary(OP_EQ, a, b);
     /* Handle null forms (RAY_NULL_OBJ, typed null atoms) */
     RAY_ASSERT_VALUE(a); RAY_ASSERT_VALUE(b);
     int na = RAY_ATOM_IS_NULL(a), nb = RAY_ATOM_IS_NULL(b);
@@ -254,6 +259,7 @@ ray_t* ray_eq_fn(ray_t* a, ray_t* b) {
 }
 
 ray_t* ray_neq_fn(ray_t* a, ray_t* b) {
+    if (ray_has_timespan(a) || ray_has_timespan(b)) return ray_timespan_binary(OP_NE, a, b);
     /* Handle null forms (RAY_NULL_OBJ, typed null atoms) */
     RAY_ASSERT_VALUE(a); RAY_ASSERT_VALUE(b);
     int na = RAY_ATOM_IS_NULL(a), nb = RAY_ATOM_IS_NULL(b);

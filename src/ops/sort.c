@@ -64,7 +64,7 @@ int sort_cmp(const sort_cmp_ctx_t* ctx, int64_t a, int64_t b) {
             float vb = ((float*)ray_data(col))[b];
             if (va < vb) cmp = -1;
             else if (va > vb) cmp = 1;
-        } else if (col->type == RAY_I64 || col->type == RAY_TIMESTAMP) {
+        } else if (col->type == RAY_I64 || col->type == RAY_TIMESPAN || col->type == RAY_TIMESTAMP) {
             int64_t va = ((int64_t*)ray_data(col))[a];
             int64_t vb = ((int64_t*)ray_data(col))[b];
             if (va < vb) cmp = -1;
@@ -957,7 +957,7 @@ void radix_encode_fn(void* arg, uint32_t wid, int64_t start, int64_t end) {
     if (c->n_keys <= 1) {
         /* Single-key fast path */
         switch (c->type) {
-        case RAY_I64: case RAY_TIMESTAMP: {
+        case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP: {
             const int64_t* d = (const int64_t*)c->data;
             bool has_nulls = c->col && ray_vec_may_have_nulls(c->col);
             bool nf = c->nulls_first;
@@ -1148,7 +1148,7 @@ void radix_encode_fn(void* arg, uint32_t wid, int64_t start, int64_t end) {
                 if (c->enum_ranks[k]) {
                     uint32_t raw = (uint32_t)ray_read_sym(ray_data(col), i, col->type, col->attrs);
                     val = (int64_t)c->enum_ranks[k][raw];
-                } else if (col->type == RAY_I64 || col->type == RAY_TIMESTAMP) {
+                } else if (col->type == RAY_I64 || col->type == RAY_TIMESPAN || col->type == RAY_TIMESTAMP) {
                     val = ((const int64_t*)ray_data(col))[i];
                 } else if (col->type == RAY_F64) {
                     double x = ((const double*)ray_data(col))[i];
@@ -2221,7 +2221,7 @@ void mk_prescan_fn(void* arg, uint32_t wid,
                 if (v < kmin) kmin = v;
                 if (v > kmax) kmax = v;
             }
-        } else if (col->type == RAY_I64 || col->type == RAY_TIMESTAMP) {
+        } else if (col->type == RAY_I64 || col->type == RAY_TIMESPAN || col->type == RAY_TIMESTAMP) {
             const int64_t* d = (const int64_t*)ray_data(col);
             for (int64_t i = start; i < end; i++) {
                 if (d[i] < kmin) kmin = d[i];
@@ -2267,7 +2267,7 @@ void mk_prescan_fn(void* arg, uint32_t wid,
  * Sequential writes — no random access. */
 static void radix_decode_into(void* dst, int8_t type, const uint64_t* sorted_keys,
                                int64_t n, bool desc) {
-    if (type == RAY_I64 || type == RAY_TIMESTAMP) {
+    if (type == RAY_I64 || type == RAY_TIMESPAN || type == RAY_TIMESTAMP) {
         int64_t* d = (int64_t*)dst;
         if (desc)
             for (int64_t i = 0; i < n; i++)
@@ -2717,7 +2717,7 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
                                 if (v < kmin) kmin = v;
                                 if (v > kmax) kmax = v;
                             }
-                        } else if (col->type == RAY_I64 || col->type == RAY_TIMESTAMP) {
+                        } else if (col->type == RAY_I64 || col->type == RAY_TIMESPAN || col->type == RAY_TIMESTAMP) {
                             const int64_t* d = (const int64_t*)ray_data(col);
                             for (int64_t i = 0; i < nrows; i++) {
                                 if (d[i] < kmin) kmin = d[i];
@@ -3215,7 +3215,7 @@ static ray_t* topk_indices_single(ray_t* col, uint8_t desc, uint8_t nf,
     int8_t type = col->type;
     /* Whitelist of types where radix_encode_fn produces an order-preserving
      * uint64 — exactly the cases topk can handle without a comparator. */
-    bool ok = (type == RAY_I64 || type == RAY_TIMESTAMP ||
+    bool ok = (type == RAY_I64 || type == RAY_TIMESPAN || type == RAY_TIMESTAMP ||
                type == RAY_F64 || type == RAY_F32 ||
                type == RAY_I32 || type == RAY_DATE || type == RAY_TIME ||
                type == RAY_SYM || type == RAY_STR || type == RAY_GUID ||

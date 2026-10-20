@@ -247,7 +247,7 @@ ray_t* ray_link_deref(ray_t* v, int64_t sym_id) {
                 if (ray_vec_is_null(result, i)) d[i] = NULL_F64;
             break;
         }
-        case RAY_I64: case RAY_TIMESTAMP: {
+        case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP: {
             int64_t* d = (int64_t*)ray_data(result);
             for (int64_t i = 0; i < n; i++)
                 if (ray_vec_is_null(result, i)) d[i] = NULL_I64;

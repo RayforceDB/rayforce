@@ -831,6 +831,9 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
         if (root->id < nc) { seen[root->id] = 1; stk[ssp++] = root->id; }
         while (ssp > 0) {
             ray_op_t* n = &g->nodes[stk[--ssp]];
+            int8_t type = n->out_type;
+            if (RAY_IS_PARTED(type)) type = (int8_t)RAY_PARTED_BASETYPE(type);
+            if (type == RAY_TIMESPAN) EXPR_BAIL(EXPR_BAIL_ROOT);
             bool cmp = n->arity == 2 && n->opcode >= OP_EQ && n->opcode <= OP_GE;
             bool eqne = n->arity == 2 && (n->opcode == OP_EQ || n->opcode == OP_NE);
             for (int i = 0; i < n->arity; i++) {
@@ -3534,6 +3537,20 @@ static bool ew_unary_math_type_admitted(uint16_t opcode, int8_t t) {
 }
 
 ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
+    if (input && !RAY_IS_ERR(input) && (ray_has_timespan(input) || op->out_type == RAY_TIMESPAN)) {
+        if (op->opcode == OP_CAST) {
+            const char* name = ray_type_name(op->out_type);
+            ray_t* target = ray_sym(ray_sym_intern(name, strlen(name)));
+            if (RAY_IS_ERR(target)) return target;
+            ray_t* result = ray_cast_fn(target, input);
+            ray_release(target);
+            return result;
+        }
+        if (op->opcode == OP_NEG) return ray_neg_fn(input);
+        if (op->opcode == OP_ABS) return ray_abs_fn(input);
+        if (op->opcode != OP_ISNULL) return ray_error("type", "unsupported duration unary operation");
+    }
+
     (void)g;
     if (!input || RAY_IS_ERR(input)) return input;
     if (!ray_is_vec(input)) return ray_error("type", "expr eval: unary op expects a vector, got %s", ray_type_name(input->type));
@@ -4669,6 +4686,21 @@ static void par_binary_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t 
 ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* rhs) {
     if (!lhs || RAY_IS_ERR(lhs)) return lhs;
     if (!rhs || RAY_IS_ERR(rhs)) return rhs;
+    int8_t left_type = g->nodes[op->in_id[0]].out_type;
+    int8_t right_type = g->nodes[op->in_id[1]].out_type;
+    if (ray_has_timespan(lhs) || ray_has_timespan(rhs) ||
+        left_type == RAY_TIMESPAN || right_type == RAY_TIMESPAN ||
+        (op->opcode == OP_SUB && left_type == RAY_TIMESTAMP && right_type == RAY_TIMESTAMP)) {
+        /* Constant payloads are integers; the graph carries their temporal types. */
+        ray_t left_atom, right_atom;
+        if (ray_is_atom(lhs) && (left_type == RAY_TIMESPAN || left_type == RAY_TIMESTAMP)) {
+            left_atom = *lhs; left_atom.type = -left_type; lhs = &left_atom;
+        }
+        if (ray_is_atom(rhs) && (right_type == RAY_TIMESPAN || right_type == RAY_TIMESTAMP)) {
+            right_atom = *rhs; right_atom.type = -right_type; rhs = &right_atom;
+        }
+        return ray_timespan_binary(op->opcode, lhs, rhs);
+    }
 
     bool l_scalar = ray_is_atom(lhs) || (lhs->type > 0 && lhs->len == 1);
     bool r_scalar = ray_is_atom(rhs) || (rhs->type > 0 && rhs->len == 1);

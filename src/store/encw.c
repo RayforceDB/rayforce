@@ -41,7 +41,7 @@ static bool canon_matches(void) {
 
 bool ray_encw_type_has_dict(int8_t t) {
     return t == RAY_I16 || t == RAY_I32 || t == RAY_I64 ||
-           t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP ||
+           t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP || t == RAY_TIMESPAN ||
            t == RAY_F32 || t == RAY_F64;
 }
 
@@ -50,7 +50,7 @@ bool ray_encw_type_summable(int8_t t) {
            t == RAY_I64 || t == RAY_TIME;
 }
 
-bool ray_encw_type_supported(int8_t t) { return t >= RAY_BOOL && t <= RAY_STR; }
+bool ray_encw_type_supported(int8_t t) { return ray_is_vector_type(t); }
 
 static _Atomic(int) g_encw_force = -1;
 void ray_encw_test_force(int enc) { atomic_store(&g_encw_force, enc); }
@@ -520,7 +520,7 @@ ray_err_t ray_encw_vec_side(int8_t type, uint8_t attrs, const void* data, const 
     case RAY_GUID:              err = encw_guid(data, start, n, o); break;
     case RAY_STR:               err = encw_str(data, str_pool, start, n, side, o); break;
     case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
-    case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: case RAY_SYM:
+    case RAY_DATE: case RAY_TIME: case RAY_TIMESPAN: case RAY_TIMESTAMP: case RAY_SYM:
         err = encw_int(type, attrs, data, start, n,
                        ray_encw_type_has_dict(type) && side ? side->dict : NULL, o);
         break;

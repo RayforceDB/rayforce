@@ -138,7 +138,7 @@ static bool pre_no_nulls_on_asc_input(ray_graph_t* g, ray_op_t* node) {
     if (src->opcode == OP_SCAN) {
         ray_t* st; int64_t ss; ray_col_meta_t sm;
         if (!scan_source_meta(g, src, &st, &ss, &sm)) return false;
-        if (!(sm.type >= RAY_BOOL && sm.type <= RAY_STR) && !RAY_IS_PARTED(sm.type)) return false;
+        if (!ray_is_vector_type(sm.type) && !RAY_IS_PARTED(sm.type)) return false;
         return !ray_table_col_has_nulls(st, ss);
     }
 

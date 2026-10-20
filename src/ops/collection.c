@@ -83,7 +83,7 @@ typedef struct hashset_t {
 enum { HS_NUM_NONE = 0, HS_NUM_INT = 1, HS_NUM_FLT = 2 };
 static inline int hs_num_class(int8_t t) {
     switch (t) {
-        case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
+        case RAY_TIMESPAN: case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
             return HS_NUM_INT;
         case RAY_F32: case RAY_F64:
             return HS_NUM_FLT;
@@ -99,7 +99,7 @@ static inline double hs_cell_f64(int8_t t, const void* data, int64_t i) {
         case RAY_U8:   return (double)((const uint8_t*)data)[i];
         case RAY_I16:  return (double)((const int16_t*)data)[i];
         case RAY_I32:  return (double)((const int32_t*)data)[i];
-        case RAY_I64:  return (double)((const int64_t*)data)[i];
+        case RAY_TIMESPAN: case RAY_I64:  return (double)((const int64_t*)data)[i];
         case RAY_F32:  return (double)((const float*)data)[i];
         default:       return ((const double*)data)[i];
     }
@@ -135,6 +135,7 @@ static uint64_t hs_hash_row(ray_t* src, int64_t i, int8_t t, void* data,
         case RAY_F32:       return ray_hash_f64((double)((const float*)data)[i]);
         case RAY_DATE:      return ray_hash_i64((int64_t)((const int32_t*)data)[i]);
         case RAY_TIME:      return ray_hash_i64((int64_t)((const int32_t*)data)[i]);
+        case RAY_TIMESPAN: return ray_hash_i64(((const int64_t*)data)[i]);
         case RAY_TIMESTAMP: return ray_hash_i64(((const int64_t*)data)[i]);
         case RAY_SYM: {
             /* Hashes the raw cell id, i.e. the BUILD side's id space.
@@ -157,11 +158,12 @@ static uint64_t hs_hash_row(ray_t* src, int64_t i, int8_t t, void* data,
             if (!e || RAY_ATOM_IS_NULL(e)) return 0;
             /* Numeric coercion: hash as f64 so distinct numeric types
              * holding the same value collide (atom_eq does the same). */
-            if (is_numeric(e)) return ray_hash_f64(as_f64(e));
+            if (is_numeric(e) || e->type == -RAY_TIMESPAN) return ray_hash_f64(as_f64(e));
             switch (e->type) {
                 case -RAY_SYM:       return ray_hash_i64(e->i64);
                 case -RAY_DATE:
                 case -RAY_TIME:      return ray_hash_i64((int64_t)e->i32);
+                case -RAY_TIMESPAN: return ray_hash_i64(e->i64);
                 case -RAY_TIMESTAMP: return ray_hash_i64(e->i64);
                 case -RAY_GUID: {
                     const uint8_t* g = e->obj
@@ -195,6 +197,7 @@ static int hs_eq_rows(ray_t* a_src, int64_t ai, int8_t at, void* a_data,
             case RAY_F32:       return ((const float*)a_data)[ai] == ((const float*)b_data)[bi];
             case RAY_DATE:
             case RAY_TIME:      return ((const int32_t*)a_data)[ai] == ((const int32_t*)b_data)[bi];
+            case RAY_TIMESPAN: return ((const int64_t*)a_data)[ai] == ((const int64_t*)b_data)[bi];
             case RAY_TIMESTAMP: return ((const int64_t*)a_data)[ai] == ((const int64_t*)b_data)[bi];
             case RAY_SYM: {
                 /* Raw index equality is only meaningful within ONE id
@@ -1091,6 +1094,15 @@ static int atom_eq_cell_col(ray_t* a, ray_t* b) {
 
 /* Helper: compare two atoms for equality (value-based) */
 int atom_eq(ray_t* a, ray_t* b) {
+    if (ray_has_timespan(a) || ray_has_timespan(b)) {
+        if (ray_timespan_binary_type(OP_EQ, a->type, b->type) <= 0) return 0;
+        ray_t* result = ray_timespan_binary(OP_EQ, a, b);
+        if (RAY_IS_ERR(result)) return 0;
+        int equal = result->b8;
+        ray_release(result);
+        return equal;
+    }
+
     int a_null = RAY_ATOM_IS_NULL(a);
     int b_null = RAY_ATOM_IS_NULL(b);
     /* Two nulls are equal where two values of their types can be: the same
@@ -1116,6 +1128,7 @@ int atom_eq(ray_t* a, ray_t* b) {
     case -RAY_SYM:  return a->i64 == b->i64;
     case -RAY_DATE: case -RAY_TIME:
         return a->i32 == b->i32;
+    case -RAY_TIMESPAN:
     case -RAY_TIMESTAMP:
         return a->i64 == b->i64;
     case -RAY_GUID: {
@@ -4023,6 +4036,7 @@ static bool ts_cell_equal(ray_t* x, int64_t a, int64_t b) {
         case RAY_TIME:
             return ((const int32_t*)d)[a] == ((const int32_t*)d)[b];
         case RAY_I64:
+        case RAY_TIMESPAN:
         case RAY_TIMESTAMP:
             return ((const int64_t*)d)[a] == ((const int64_t*)d)[b];
         case RAY_F32:

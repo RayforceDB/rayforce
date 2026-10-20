@@ -58,7 +58,7 @@ static inline bool group_fp_type(int8_t t) {
  * unknown type (0: a linear plan without a source vector) is treated as
  * 64-bit. */
 static inline bool group_avg_needs_hi(int8_t t, int64_t nrows) {
-    return t == RAY_I64 || t == RAY_TIMESTAMP || t == RAY_SYM || t == 0 ||
+    return t == RAY_I64 || t == RAY_TIMESPAN || t == RAY_TIMESTAMP || t == RAY_SYM || t == 0 ||
            nrows >= ((int64_t)1 << 31);
 }
 
@@ -666,7 +666,7 @@ static void reduce_range_raw(int8_t type, uint8_t attrs, const void* cbase,
     case RAY_I32: case RAY_DATE: case RAY_TIME:
         DISPATCH_I_OPCODE(int32_t, NULL_I32, base, start, end, acc,
                           has_nulls, idx, opcode); break;
-    case RAY_I64: case RAY_TIMESTAMP:
+    case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP:
         DISPATCH_I_OPCODE(int64_t, NULL_I64, base, start, end, acc,
                           has_nulls, idx, opcode); break;
     case RAY_F32:
@@ -971,7 +971,7 @@ static void cd_hist_fn(void* ctx, uint32_t worker_id,
             uint64_t p = (h ^ (h >> 33)) & p_mask;
             hist[p]++;
         }
-    } else if (in_type == RAY_I64 || in_type == RAY_TIMESTAMP) {
+    } else if (in_type == RAY_I64 || in_type == RAY_TIMESPAN || in_type == RAY_TIMESTAMP) {
         const int64_t* d = (const int64_t*)base;
         for (int64_t i = start; i < end; i++) {
             int64_t val = d[i];
@@ -1070,7 +1070,7 @@ static void cd_scatter_fn(void* ctx, uint32_t worker_id,
             uint64_t p = (h ^ (h >> 33)) & p_mask;
             out[cur[p]++] = val;
         }
-    } else if (in_type == RAY_I64 || in_type == RAY_TIMESTAMP) {
+    } else if (in_type == RAY_I64 || in_type == RAY_TIMESPAN || in_type == RAY_TIMESTAMP) {
         const int64_t* d = (const int64_t*)base;
         SCATTER_BODY(d[i])
     } else if (in_type == RAY_I32 || in_type == RAY_DATE || in_type == RAY_TIME) {
@@ -1236,7 +1236,7 @@ ray_t* exec_count_distinct(ray_graph_t* g, ray_op_t* op, ray_t* input) {
     switch (in_type) {
     case RAY_BOOL: case RAY_U8:
     case RAY_I16: case RAY_I32: case RAY_I64:
-    case RAY_F64: case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP:
+    case RAY_F64: case RAY_DATE: case RAY_TIME: case RAY_TIMESPAN: case RAY_TIMESTAMP:
     case RAY_SYM:
         break;
     case RAY_STR:
@@ -1465,7 +1465,7 @@ static void dv_scatter_fn(void* ctx, uint32_t worker_id,
             out[c] = val;
             rid[c] = i;
         }
-    } else if (x->type == RAY_I64 || x->type == RAY_TIMESTAMP) {
+    } else if (x->type == RAY_I64 || x->type == RAY_TIMESPAN || x->type == RAY_TIMESTAMP) {
         const int64_t* d = (const int64_t*)base;
         DV_SCATTER_BODY(d[i])
     } else if (x->type == RAY_I32 || x->type == RAY_DATE || x->type == RAY_TIME) {
@@ -1548,7 +1548,7 @@ ray_t* distinct_radix_first_ids(ray_t* input) {
 
     switch (in_type) {
     case RAY_I16: case RAY_I32: case RAY_I64:
-    case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP:
+    case RAY_DATE: case RAY_TIME: case RAY_TIMESPAN: case RAY_TIMESTAMP:
         break;
     case RAY_F64:
         /* The kernel canonicalizes every NaN to one value.  The eager
@@ -2095,7 +2095,7 @@ ray_t* ray_count_distinct_per_group(ray_t* src, const int64_t* row_gid,
     switch (in_type) {
     case RAY_BOOL: case RAY_U8:
     case RAY_I16: case RAY_I32: case RAY_I64:
-    case RAY_F64: case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP:
+    case RAY_F64: case RAY_DATE: case RAY_TIME: case RAY_TIMESPAN: case RAY_TIMESTAMP:
     case RAY_SYM:
         break;
     default:
@@ -2331,7 +2331,7 @@ static inline double med_read_as_f64(const void* base, int8_t t, int64_t row) {
         case RAY_I32: { int32_t v; memcpy(&v, (const char*)base + (size_t)row * 4, 4); return (double)v; }
         case RAY_DATE:
         case RAY_TIME: { int32_t v; memcpy(&v, (const char*)base + (size_t)row * 4, 4); return (double)v; }
-        case RAY_TIMESTAMP: { int64_t v; memcpy(&v, (const char*)base + (size_t)row * 8, 8); return (double)v; }
+        case RAY_TIMESPAN: case RAY_TIMESTAMP: { int64_t v; memcpy(&v, (const char*)base + (size_t)row * 8, 8); return (double)v; }
         case RAY_I16: { int16_t v; memcpy(&v, (const char*)base + (size_t)row * 2, 2); return (double)v; }
         case RAY_BOOL: case RAY_U8: return (double)((const uint8_t*)base)[row];
         default:      return 0.0;
@@ -2348,7 +2348,7 @@ static inline bool med_is_null(const void* base, int8_t t, int64_t row) {
         case RAY_I32: return ((const int32_t*)base)[row] == NULL_I32;
         case RAY_DATE:
         case RAY_TIME: return ((const int32_t*)base)[row] == NULL_I32;
-        case RAY_TIMESTAMP: return ((const int64_t*)base)[row] == NULL_I64;
+        case RAY_TIMESPAN: case RAY_TIMESTAMP: return ((const int64_t*)base)[row] == NULL_I64;
         case RAY_I16: return ((const int16_t*)base)[row] == NULL_I16;
         case RAY_BOOL: case RAY_U8: return false;  /* non-nullable */
         default:      return false;
@@ -2771,7 +2771,7 @@ static inline uint64_t mode_scalar_key(ray_t* src, int64_t row) {
         case RAY_SYM:
             return (uint64_t)ray_read_sym(base, row, src->type, src->attrs);
         case RAY_I64:
-        case RAY_TIMESTAMP: {
+        case RAY_TIMESPAN: case RAY_TIMESTAMP: {
             int64_t v;
             memcpy(&v, (const char*)base + (size_t)row * 8, 8);
             return (uint64_t)v;
@@ -3190,7 +3190,7 @@ ray_t* ray_mode_per_group_buf(ray_t* src, const int64_t* rows,
     if (!src || RAY_IS_ERR(src) || ng < 0) return NULL;
     switch (src->type) {
         case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
-        case RAY_F32: case RAY_F64: case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP:
+        case RAY_F32: case RAY_F64: case RAY_DATE: case RAY_TIME: case RAY_TIMESPAN: case RAY_TIMESTAMP:
         case RAY_GUID: case RAY_SYM: case RAY_STR: break;
         default: return NULL;
     }
@@ -3281,7 +3281,7 @@ static inline double topk_read_f64(const void* base, int64_t row) {
 /* Read src element as int64 for integer source types. */
 static inline int64_t topk_read_i64(const void* base, int8_t t, int64_t row) {
     switch (t) {
-        case RAY_I64: case RAY_TIMESTAMP:
+        case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP:
             { int64_t v; memcpy(&v, (const char*)base + (size_t)row * 8, 8); return v; }
         case RAY_I32: case RAY_DATE: case RAY_TIME:
             { int32_t v; memcpy(&v, (const char*)base + (size_t)row * 4, 4); return (int64_t)v; }
@@ -3511,7 +3511,7 @@ static void topk_rows_sift(ray_t* src, int64_t* heap, int64_t n, int64_t root, b
         case RAY_BOOL: case RAY_U8: TOPK_SIFT_NATIVE(uint8_t);
         case RAY_I16: TOPK_SIFT_NATIVE(int16_t);
         case RAY_I32: case RAY_DATE: case RAY_TIME: TOPK_SIFT_NATIVE(int32_t);
-        case RAY_I64: case RAY_TIMESTAMP: TOPK_SIFT_NATIVE(int64_t);
+        case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP: TOPK_SIFT_NATIVE(int64_t);
         case RAY_F32: TOPK_SIFT_NATIVE(float);
         case RAY_F64: TOPK_SIFT_NATIVE(double);
         default: break;
@@ -3756,7 +3756,7 @@ static void topk_chunks_run(void* raw, uint32_t wid, int64_t start, int64_t end)
             case RAY_I16: TOPK_SCAN_NATIVE(int16_t, value != NULL_I16); break;
             case RAY_I32: case RAY_DATE: case RAY_TIME:
                 TOPK_SCAN_NATIVE(int32_t, value != NULL_I32); break;
-            case RAY_I64: case RAY_TIMESTAMP:
+            case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP:
                 TOPK_SCAN_NATIVE(int64_t, value != NULL_I64); break;
             case RAY_F32: TOPK_SCAN_NATIVE(float, value == value); break;
             case RAY_F64: TOPK_SCAN_NATIVE(double, value == value); break;
@@ -3865,7 +3865,7 @@ static void topk_select_count(void* raw, uint32_t wid, int64_t start, int64_t en
         case RAY_BOOL: case RAY_U8: TOPK_SELECT_COUNT(uint8_t);
         case RAY_I16: TOPK_SELECT_COUNT(int16_t);
         case RAY_I32: case RAY_DATE: case RAY_TIME: TOPK_SELECT_COUNT(int32_t);
-        case RAY_I64: case RAY_TIMESTAMP: TOPK_SELECT_COUNT(int64_t);
+        case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP: TOPK_SELECT_COUNT(int64_t);
         case RAY_F32: TOPK_SELECT_COUNT(float);
         case RAY_F64: TOPK_SELECT_COUNT(double);
         default: break;
@@ -3910,7 +3910,7 @@ static void topk_select_scatter(void* raw, uint32_t wid, int64_t start, int64_t 
         case RAY_BOOL: case RAY_U8: TOPK_SELECT_SCATTER(uint8_t);
         case RAY_I16: TOPK_SELECT_SCATTER(int16_t);
         case RAY_I32: case RAY_DATE: case RAY_TIME: TOPK_SELECT_SCATTER(int32_t);
-        case RAY_I64: case RAY_TIMESTAMP: TOPK_SELECT_SCATTER(int64_t);
+        case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP: TOPK_SELECT_SCATTER(int64_t);
         case RAY_F32: TOPK_SELECT_SCATTER(float);
         case RAY_F64: TOPK_SELECT_SCATTER(double);
         default: break;
@@ -4231,7 +4231,8 @@ static ray_t* reduction_i64_result(int64_t val, int8_t out_type, ray_t* src) {
         case RAY_BOOL:      return ray_bool((bool)val);
         case RAY_DATE:      return ray_date((int32_t)val);
         case RAY_TIME:      return ray_time(val);
-        case RAY_TIMESTAMP: return ray_timestamp(val);
+        case RAY_TIMESPAN: return ray_timespan(val);
+    case RAY_TIMESTAMP: return ray_timestamp(val);
         case RAY_I32:       return ray_i32((int32_t)val);
         case RAY_I16:       return ray_i16((int16_t)val);
         case RAY_U8:        return ray_u8((uint8_t)val);
@@ -4291,6 +4292,13 @@ static ray_t* reduce_result(uint16_t opcode, int8_t op_out_type, int8_t in_type,
 }
 
 ray_t* exec_reduction(ray_graph_t* g, ray_op_t* op, ray_t* input) {
+    if (input && input->type == RAY_TIMESPAN) {
+        if (op->opcode == OP_SUM) return ray_sum_fn(input);
+        if (op->opcode == OP_AVG) return ray_avg_fn(input);
+        if (op->opcode == OP_MIN) return ray_min_fn(input);
+        if (op->opcode == OP_MAX) return ray_max_fn(input);
+    }
+
     if (!input || RAY_IS_ERR(input)) return input;
 
     /* TABLE input: COUNT returns row count, others need a column */
@@ -4892,7 +4900,7 @@ bool ght_compute_layout(ght_layout_t* out, uint32_t n_keys, uint32_t n_aggs,
                 switch (key_types[k]) {
                 case RAY_BOOL: case RAY_U8:  case RAY_I16: case RAY_I32:
                 case RAY_I64:  case RAY_DATE: case RAY_TIME:
-                case RAY_TIMESTAMP: case RAY_SYM:
+                case RAY_TIMESPAN: case RAY_TIMESTAMP: case RAY_SYM:
                     break;
                 default:
                     packed = false;
@@ -5339,7 +5347,7 @@ static inline void group_keys_gather(int64_t* dst, const void* data,
                                      const int64_t* rows, int64_t base, uint32_t m,
                                      int8_t type, uint8_t attrs) {
     switch (type) {
-    case RAY_I64: case RAY_TIMESTAMP:
+    case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP:
         for (uint32_t j = 0; j < m; j++) dst[j] = ((const int64_t*)data)[rows[j] - base];
         return;
     case RAY_SYM:
@@ -5377,7 +5385,7 @@ static inline void group_keys_gather_seq(int64_t* dst, const void* data,
                                          int64_t row0, uint32_t m,
                                          int8_t type, uint8_t attrs) {
     switch (type) {
-    case RAY_I64: case RAY_TIMESTAMP: {
+    case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP: {
         const int64_t* p = (const int64_t*)data + row0;
         for (uint32_t j = 0; j < m; j++) dst[j] = p[j];
         return;
@@ -7268,7 +7276,7 @@ static inline void grp_set_null(ray_t* vec, int64_t idx) {
     switch (vec->type) {
         case RAY_F64: ((double*)p)[idx] = NULL_F64; break;
         case RAY_F32: ((float*)p)[idx] = NULL_F32; break;
-        case RAY_I64: case RAY_TIMESTAMP: ((int64_t*)p)[idx] = NULL_I64; break;
+        case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP: ((int64_t*)p)[idx] = NULL_I64; break;
         case RAY_I32: case RAY_DATE: case RAY_TIME: ((int32_t*)p)[idx] = NULL_I32; break;
         case RAY_I16: ((int16_t*)p)[idx] = NULL_I16; break;
         default: break;
@@ -7352,7 +7360,7 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                         case RAY_F32: {
                             float v = NULL_F32; memcpy(dst + doff, &v, 4); break;
                         }
-                        case RAY_I64: case RAY_TIMESTAMP: {
+                        case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP: {
                             int64_t v = NULL_I64; memcpy(dst + doff, &v, 8); break;
                         }
                         case RAY_I32: case RAY_DATE: case RAY_TIME: {
@@ -8257,7 +8265,7 @@ static void minmax_scan_body(minmax_ctx_t* c, uint32_t worker_id, int64_t start,
             } \
         } while (0)
 
-    if (t == RAY_I64 || t == RAY_TIMESTAMP)
+    if (t == RAY_I64 || t == RAY_TIMESPAN || t == RAY_TIMESTAMP)
         MINMAX_SEG_LOOP(int64_t, );
     else if (RAY_IS_SYM(t)) {
         uint8_t w = c->key_attrs & RAY_SYM_W_MASK;
@@ -9651,7 +9659,7 @@ static void scalar_sum_linear_i64_fn(void* ctx, uint32_t worker_id, int64_t star
         bool bare = lin->n_terms == 1 && lin->coeff_i64[0] == 1 &&
                     lin->bias_i64 == 0 && lin->term_ptrs[0];
         int8_t t0 = lin->term_types[0];
-        if (bare && (t0 == RAY_I64 || t0 == RAY_TIMESTAMP)) {
+        if (bare && (t0 == RAY_I64 || t0 == RAY_TIMESPAN || t0 == RAY_TIMESTAMP)) {
             group_i128_sum_i64_range((const int64_t*)lin->term_ptrs[0] + start, n,
                                      &acc->sum_hi[0], (uint64_t*)&acc->sum[0].i);
         } else if (bare && t0 != RAY_SYM) {
@@ -9705,7 +9713,7 @@ static bool scalar_stageable(int8_t t, uint16_t op) {
     if (op == OP_COUNT) return true;
     switch (t) {
     case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
-    case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: case RAY_F32: case RAY_F64: case RAY_SYM:
+    case RAY_DATE: case RAY_TIME: case RAY_TIMESPAN: case RAY_TIMESTAMP: case RAY_F32: case RAY_F64: case RAY_SYM:
         break;
     default:
         return false;
@@ -11828,7 +11836,7 @@ static int64_t grp_synth_fill_bytes(ray_t* sg) {
     if (!ray_col_meta_of(sg, &sm)) return -1;
     switch (sm.type) {
     case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
-    case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: case RAY_F32: case RAY_F64: case RAY_SYM:
+    case RAY_DATE: case RAY_TIME: case RAY_TIMESPAN: case RAY_TIMESTAMP: case RAY_F32: case RAY_F64: case RAY_SYM:
         break;
     default:
         return -1;
@@ -12208,13 +12216,13 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
                 for (size_t i = 0; i < bwords; i++)
                     card += __builtin_popcountll(cc.bits[i]);
                 scratch_free(bits_hdr);
-            } else if (bt == RAY_I64 || bt == RAY_TIMESTAMP ||
+            } else if (bt == RAY_I64 || bt == RAY_TIMESPAN || bt == RAY_TIMESTAMP ||
                        bt == RAY_I32 || bt == RAY_DATE || bt == RAY_TIME ||
                        bt == RAY_I16) {
                 /* Range proxy for every integer-like key, by width, over
                  * the non-null values, plus one group when a null shows
                  * (grp_card_t). */
-                bool w64 = bt == RAY_I64 || bt == RAY_TIMESTAMP;
+                bool w64 = bt == RAY_I64 || bt == RAY_TIMESPAN || bt == RAY_TIMESTAMP;
                 cc.null = w64 ? NULL_I64 : bt == RAY_I16 ? NULL_I16 : NULL_I32;
                 if (!grp_card_dir(&ss, &cc))
                     serr = grp_seg_read(&ss, 0, ss.len, &cc,
@@ -13143,7 +13151,7 @@ static inline double sg_prod_range(const agg_prod_t* p, int64_t r0, int64_t n,
             a2 += x[j + 2] * y[j + 2]; a3 += x[j + 3] * y[j + 3];
         }
         for (; j < n; j++) a0 += x[j] * y[j];
-    } else if (ta == RAY_F64 && (tb == RAY_I64 || tb == RAY_TIMESTAMP)) {
+    } else if (ta == RAY_F64 && (tb == RAY_I64 || tb == RAY_TIMESPAN || tb == RAY_TIMESTAMP)) {
         const double*  restrict x = (const double*)pa + r0;
         const int64_t* restrict y = (const int64_t*)pb + r0;
         uint64_t s0 = 0;
@@ -13323,7 +13331,7 @@ static void sg_accum_fn(void* raw, uint32_t wid, int64_t tstart, int64_t tend) {
                 bool need_sq = c->partial_sumsq &&
                     (op == OP_STDDEV || op == OP_STDDEV_POP ||
                      op == OP_VAR || op == OP_VAR_POP);
-                if (contig && (t == RAY_I64 || t == RAY_TIMESTAMP)) {
+                if (contig && (t == RAY_I64 || t == RAY_TIMESPAN || t == RAY_TIMESTAMP)) {
                     const int64_t* restrict x = (const int64_t*)p + r0;
                     if (c->partials_hi) {
                         /* exact 128-bit total, still a vectorized stream */
@@ -19762,7 +19770,7 @@ sequential_fallback:;
                 switch (kt) {
                     case RAY_F64:
                         ((double*)ray_data(new_col))[gi] = NULL_F64; break;
-                    case RAY_I64: case RAY_TIMESTAMP:
+                    case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP:
                         ((int64_t*)ray_data(new_col))[gi] = NULL_I64; break;
                     case RAY_I32: case RAY_DATE: case RAY_TIME:
                         ((int32_t*)ray_data(new_col))[gi] = NULL_I32; break;

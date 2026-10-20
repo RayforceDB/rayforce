@@ -97,7 +97,7 @@ static void nth_element_dbl(double* a, int64_t lo, int64_t hi, int64_t k) {
 static int agg_parted_numeric_base(int8_t t) {
     return t == RAY_BOOL || t == RAY_U8 || t == RAY_I16 ||
            t == RAY_I32 || t == RAY_I64 || t == RAY_F32 || t == RAY_F64 ||
-           t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP;
+           t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP || t == RAY_TIMESPAN;
 }
 
 static int64_t agg_read_i64(ray_t* v, int64_t i) {
@@ -110,7 +110,7 @@ static int64_t agg_read_i64(ray_t* v, int64_t i) {
     case RAY_DATE:
     case RAY_TIME: return ((int32_t*)d)[i];
     case RAY_I64:
-    case RAY_TIMESTAMP: return ((int64_t*)d)[i];
+    case RAY_TIMESPAN: case RAY_TIMESTAMP: return ((int64_t*)d)[i];
     default: return 0;
     }
 }
@@ -123,6 +123,7 @@ static ray_t* agg_atom_i64_for_type(int8_t t, int64_t v) {
     case RAY_I32: return ray_i32((int32_t)v);
     case RAY_DATE: return ray_date(v);
     case RAY_TIME: return ray_time(v);
+    case RAY_TIMESPAN: return ray_timespan(v);
     case RAY_TIMESTAMP: return ray_timestamp(v);
     default: return ray_i64(v);
     }
@@ -163,6 +164,7 @@ static ray_t* agg_parted_sum(ray_t* x) {
         for (int64_t i = 0; i < seg->len; i++)
             if (!has_nulls || !ray_vec_is_null(seg, i)) sum = wrap_add_i64(sum, agg_read_i64(seg, i));
     }
+    if (base == RAY_TIMESPAN) return ray_timespan(sum);
     if (base == RAY_TIME) return ray_time(sum);
     return make_i64(sum);
 }
@@ -200,7 +202,7 @@ static ray_t* agg_parted_avg(ray_t* x) {
 static ray_t* agg_parted_prod(ray_t* x) {
     int8_t base = (int8_t)RAY_PARTED_BASETYPE(x->type);
     if (!agg_parted_numeric_base(base) ||
-        base == RAY_DATE || base == RAY_TIME || base == RAY_TIMESTAMP) {
+        base == RAY_DATE || base == RAY_TIME || base == RAY_TIMESTAMP || base == RAY_TIMESPAN) {
         return ray_error("type", "prod expects a numeric parted column, got %s", ray_type_name(base));
     }
     ray_t** segs = (ray_t**)ray_data(x);
@@ -263,7 +265,8 @@ static ray_t* agg_parted_minmax(ray_t* x, int want_max) {
             }
         }
     }
-    if (!found) return ray_typed_null(-base);
+    if (!found) return base == RAY_TIMESPAN
+        ? ray_timespan(want_max ? -INT64_MAX : INT64_MAX) : ray_typed_null(-base);
     if (base == RAY_F64) return make_f64(best_f);
     if (base == RAY_F32) return ray_f32((float)best_f);
     return agg_atom_i64_for_type(base, best_i);
@@ -505,7 +508,7 @@ static ray_t* colref_answer(ray_t* x, uint16_t op, bool* done) {
     default: break;
     }
     bool elem_type = t == RAY_SYM || t == RAY_I32 || t == RAY_I16 || t == RAY_GUID || t == RAY_STR ||
-                     t == RAY_BOOL || t == RAY_U8 || t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP;
+                     t == RAY_BOOL || t == RAY_U8 || t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP || t == RAY_TIMESPAN;
     if (!r) {
         if (op == OP_COUNT) {
             r = make_i64(src.len);
@@ -602,6 +605,8 @@ static ray_t* dir_answer(ray_enccol_t* e, uint16_t opcode) {
             return make_f64(m);
         }
         int64_t m = mx ? z.max_i : z.min_i;
+        if (t == RAY_TIMESPAN)
+            return ray_timespan(z.nonnull ? m : (mx ? -INT64_MAX : INT64_MAX));
         /* all-null by the non-null counts when the directory has sums */
         if (have_aggs ? z.nonnull == 0 : m == (mx ? INT64_MIN : INT64_MAX)) return ray_typed_null(-t);
         switch (t) {
@@ -611,6 +616,7 @@ static ray_t* dir_answer(ray_enccol_t* e, uint16_t opcode) {
         case RAY_I32:       return ray_i32((int32_t)m);
         case RAY_DATE:      return ray_date((int32_t)m);
         case RAY_TIME:      return ray_time(m);
+        case RAY_TIMESPAN: return ray_timespan(m);
         case RAY_TIMESTAMP: return ray_timestamp(m);
         default:            return ray_i64(m);
         }
@@ -644,6 +650,17 @@ bool ray_zone_dir_int_sum128(ray_t* encv, int64_t* hi, uint64_t* lo, int64_t* nn
 }
 
 ray_t* ray_sum_fn(ray_t* x) {
+    if (x->type == RAY_TIMESPAN) {
+        ray_t* counts = ray_vec_from_raw(RAY_I64, ray_data(x), x->len);
+        if (RAY_IS_ERR(counts)) return counts;
+        counts->attrs |= x->attrs & RAY_ATTR_HAS_NULLS;
+        ray_t* result = ray_sum_fn(counts);
+        ray_release(counts);
+        if (ray_is_lazy(result)) result = ray_lazy_materialize(result);
+        if (!RAY_IS_ERR(result)) result->type = -RAY_TIMESPAN;
+        return result;
+    }
+
     if (ray_is_lazy(x)) AGG_LAZY(x, OP_SUM);
     if (RAY_IS_PARTED(x->type)) return agg_parted_sum(x);
     if (ray_is_atom(x)) {
@@ -803,6 +820,17 @@ ray_t* ray_count_fn(ray_t* x) {
 }
 
 ray_t* ray_avg_fn(ray_t* x) {
+    if (x->type == -RAY_TIMESPAN)
+        return RAY_ATOM_IS_NULL(x) ? ray_typed_null(-RAY_F64) : ray_f64((double)x->i64);
+    if (x->type == RAY_TIMESPAN) {
+        ray_t* counts = ray_vec_from_raw(RAY_I64, ray_data(x), x->len);
+        if (RAY_IS_ERR(counts)) return counts;
+        counts->attrs |= x->attrs & RAY_ATTR_HAS_NULLS;
+        ray_t* result = ray_avg_fn(counts);
+        ray_release(counts);
+        return result;
+    }
+
     if (ray_is_lazy(x)) AGG_LAZY(x, OP_AVG);
     if (RAY_IS_PARTED(x->type)) return agg_parted_avg(x);
     if (ray_is_atom(x)) {
@@ -846,6 +874,13 @@ ray_t* ray_min_fn(ray_t* x) {
     if (RAY_IS_PARTED(x->type)) return agg_parted_minmax(x, 0);
     if (ray_is_atom(x)) { ray_retain(x); return x; }
     if (ray_is_vec(x)) {
+        if (x->type == RAY_TIMESPAN) {
+            const int64_t* d = ray_data(x);
+            int64_t best = INT64_MAX;
+            for (int64_t i = 0; i < x->len; i++)
+                if (d[i] != NULL_I64 && d[i] < best) best = d[i];
+            return ray_timespan(best);
+        }
         /* Per-chunk zone index fast path: O(n_chunks) instead of O(n_rows).
          * Only valid when the index was built for the column's current len
          * (mutation paths call ray_index_drop). */
@@ -879,6 +914,7 @@ ray_t* ray_min_fn(ray_t* x) {
                     case RAY_I32:       return ray_i32((int32_t)mn);
                     case RAY_DATE:      return ray_date((int32_t)mn);
                     case RAY_TIME:      return ray_time(mn);
+                    case RAY_TIMESPAN: return ray_timespan(mn);
                     case RAY_TIMESTAMP: return ray_timestamp(mn);
                     default:            return ray_i64(mn);
                     }
@@ -909,6 +945,13 @@ ray_t* ray_max_fn(ray_t* x) {
     if (RAY_IS_PARTED(x->type)) return agg_parted_minmax(x, 1);
     if (ray_is_atom(x)) { ray_retain(x); return x; }
     if (ray_is_vec(x)) {
+        if (x->type == RAY_TIMESPAN) {
+            const int64_t* d = ray_data(x);
+            int64_t best = -INT64_MAX;
+            for (int64_t i = 0; i < x->len; i++)
+                if (d[i] != NULL_I64 && d[i] > best) best = d[i];
+            return ray_timespan(best);
+        }
         if (ray_index_kind(x) == RAY_IDX_CHUNK_ZONE) {
             ray_index_t* ix = ray_index_payload(x->index);
             if (ix->built_for_len == x->len && ix->u.chunk_zone.maxs) {
@@ -938,6 +981,7 @@ ray_t* ray_max_fn(ray_t* x) {
                     case RAY_I32:       return ray_i32((int32_t)mx);
                     case RAY_DATE:      return ray_date((int32_t)mx);
                     case RAY_TIME:      return ray_time(mx);
+                    case RAY_TIMESPAN: return ray_timespan(mx);
                     case RAY_TIMESTAMP: return ray_timestamp(mx);
                     default:            return ray_i64(mx);
                     }
@@ -989,7 +1033,7 @@ ray_t* ray_first_fn(ray_t* x) {
         if (x->type == RAY_SYM   || x->type == RAY_I32  || x->type == RAY_I16 ||
             x->type == RAY_GUID  || x->type == RAY_STR  || x->type == RAY_BOOL ||
             x->type == RAY_U8    || x->type == RAY_DATE || x->type == RAY_TIME ||
-            x->type == RAY_TIMESTAMP) {
+            x->type == RAY_TIMESTAMP || x->type == RAY_TIMESPAN) {
             int alloc = 0;
             return collection_elem(x, 0, &alloc);
         }
@@ -1027,7 +1071,7 @@ ray_t* ray_last_fn(ray_t* x) {
         if (x->type == RAY_SYM   || x->type == RAY_I32  || x->type == RAY_I16 ||
             x->type == RAY_GUID  || x->type == RAY_STR  || x->type == RAY_BOOL ||
             x->type == RAY_U8    || x->type == RAY_DATE || x->type == RAY_TIME ||
-            x->type == RAY_TIMESTAMP) {
+            x->type == RAY_TIMESTAMP || x->type == RAY_TIMESPAN) {
             int alloc = 0;
             return collection_elem(x, ray_len(x) - 1, &alloc);
         }
@@ -1074,7 +1118,7 @@ static ray_t* vec_to_f64_scratch(ray_t* x, double** out_vals) {
          * raw counts (result F64), per the canonical admission table. */
         int32_t* d = (int32_t*)ray_data(x);
         for (int64_t i = 0; i < len; i++) { if (!ray_vec_is_null(x, i)) vals[cnt++] = (double)d[i]; }
-    } else if (x->type == RAY_TIMESTAMP) {
+    } else if (x->type == RAY_TIMESTAMP || x->type == RAY_TIMESPAN) {
         int64_t* d = (int64_t*)ray_data(x);
         for (int64_t i = 0; i < len; i++) { if (!ray_vec_is_null(x, i)) vals[cnt++] = (double)d[i]; }
     } else {

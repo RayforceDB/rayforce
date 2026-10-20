@@ -198,6 +198,7 @@ static ray_t* groups_to_pair_list(ray_t* d) {
                 case RAY_SYM: k = ray_sym(sym_cell_runtime_id(keys, i)); break;
                 case RAY_I64:
                 case RAY_TIMESTAMP: k = ray_i64(((int64_t*)base)[i]); break;
+                case RAY_TIMESPAN: k = ray_timespan(((int64_t*)base)[i]); break;
                 case RAY_I32:
                 case RAY_DATE:
                 case RAY_TIME: k = ray_i32(((int32_t*)base)[i]); break;
@@ -2032,6 +2033,9 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
              * it to nanoseconds). */
             int8_t col_t = col->out_type;
             if (RAY_IS_PARTED(col_t)) col_t = (int8_t)RAY_PARTED_BASETYPE(col_t);
+            int8_t bucket_type = bucket->out_type;
+            if (RAY_IS_PARTED(bucket_type)) bucket_type = (int8_t)RAY_PARTED_BASETYPE(bucket_type);
+            if (col_t == RAY_TIMESPAN || bucket_type == RAY_TIMESPAN) return NULL;
             int8_t temporal = dag_type_is_temporal(col_t) ? col_t : 0;
             if (temporal) {
                 int8_t bt = bucket->out_type;
@@ -4240,7 +4244,7 @@ static int64_t key_col_read_i64(ray_t* col, int64_t row) {
     case RAY_DATE:
     case RAY_TIME: return ((const int32_t*)d)[row];
     case RAY_I64:
-    case RAY_TIMESTAMP: return ((const int64_t*)d)[row];
+    case RAY_TIMESPAN: case RAY_TIMESTAMP: return ((const int64_t*)d)[row];
     default: return 0;
     }
 }
@@ -8765,7 +8769,7 @@ static inline int64_t key_read_i64(const void* d, int64_t idx,
     case RAY_DATE:
     case RAY_TIME:      return ((const int32_t*)d)[idx];
     case RAY_I64:
-    case RAY_TIMESTAMP: return ((const int64_t*)d)[idx];
+    case RAY_TIMESPAN: case RAY_TIMESTAMP: return ((const int64_t*)d)[idx];
     /* F32/F64: the bits, with -0.0 canonicalised to +0.0 the way the
      * grouping reads its keys (group_key_f64_bits, #407).  The group result
      * holds +0.0 for the merged zero group; a row carrying -0.0 read raw
@@ -9064,7 +9068,7 @@ static int rgid_mk_key_type_ok(int8_t bt) {
     switch (bt) {
     case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
     case RAY_F32: case RAY_F64: case RAY_DATE: case RAY_TIME:
-    case RAY_TIMESTAMP: case RAY_SYM:
+    case RAY_TIMESPAN: case RAY_TIMESTAMP: case RAY_SYM:
         return 1;
     default:
         return 0;
@@ -9224,7 +9228,7 @@ static int can_atom_broadcast(ray_t* a) {
     case RAY_BOOL: case RAY_U8:
     case RAY_I16:  case RAY_I32:
     case RAY_I64: case RAY_F32: case RAY_F64: case RAY_GUID: case RAY_STR:
-    case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP:
+    case RAY_DATE: case RAY_TIME: case RAY_TIMESPAN: case RAY_TIMESTAMP:
     case RAY_SYM:
         return 1;
     default:
@@ -9295,7 +9299,7 @@ static ray_t* atom_broadcast_vec(ray_t* a, int64_t n) {
         break;
     }
     case RAY_I64:
-    case RAY_TIMESTAMP: {
+    case RAY_TIMESPAN: case RAY_TIMESTAMP: {
         int64_t val = a->i64;
         int64_t* d = (int64_t*)dst;
         for (int64_t i = 0; i < n; i++) d[i] = val;
@@ -9946,7 +9950,7 @@ static int64_t count_compare_span_ref(int8_t type, uint8_t attrs, const void* da
         break;
     }
     case RAY_I64:
-    case RAY_TIMESTAMP: {
+    case RAY_TIMESPAN: case RAY_TIMESTAMP: {
         const int64_t* x = (const int64_t*)data;
         for (int64_t i = start; i < end; i++) local += count_compare_i64(x[i], rhs, op);
         break;
@@ -10211,7 +10215,7 @@ static bool count_cmp_parse(ray_t* tbl, ray_t* e, count_cmp_op_t* op_out,
 static bool count_cmp_types_ok(int8_t type, count_cmp_op_t op, ray_t* rhs, bool float_ok) {
     switch (type) {
     case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
-    case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP:
+    case RAY_DATE: case RAY_TIME: case RAY_TIMESPAN: case RAY_TIMESTAMP:
         if (!is_numeric(rhs) && !is_temporal(rhs)) return false;
         if (rhs->type == -RAY_F64 || rhs->type == -RAY_F32) return false;
         if (is_temporal(rhs) && rhs->type != -type && type != RAY_TIMESTAMP) return false;
@@ -10663,7 +10667,7 @@ static bool expr_reads_named_columns_only(ray_t* e, ray_t* tbl) {
         return true;
     }
     if (e->type < 0) return true;                                /* a non-symbol atom */
-    return e->type >= RAY_BOOL && e->type <= RAY_STR && e->type != RAY_SYM;   /* a literal vector */
+    return ray_is_vec(e) && e->type != RAY_SYM;   /* a literal vector */
 }
 
 /* Bind the columns of `tbl` as query locals for evaluating exprs[0..n): every
@@ -10896,7 +10900,7 @@ static int filt_compact_keep(ray_t* dict, ray_t* by_expr, ray_t* tbl,
         switch (kcm.type) {
             case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8:
             case RAY_BOOL: case RAY_DATE: case RAY_TIME:
-            case RAY_TIMESTAMP: case RAY_SYM: case RAY_STR: break;
+            case RAY_TIMESPAN: case RAY_TIMESTAMP: case RAY_SYM: case RAY_STR: break;
             default: return 0;
         }
     }
@@ -10907,7 +10911,7 @@ static int filt_compact_keep(ray_t* dict, ray_t* by_expr, ray_t* tbl,
         switch (ccm.type) {
             case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8:
             case RAY_BOOL: case RAY_DATE: case RAY_TIME:
-            case RAY_TIMESTAMP: case RAY_SYM: case RAY_F64:
+            case RAY_TIMESPAN: case RAY_TIMESTAMP: case RAY_SYM: case RAY_F64:
             case RAY_GUID: case RAY_STR: case RAY_LIST: break;
             default: return 0;
         }
@@ -12174,7 +12178,7 @@ ray_t* query_cd_gate_where_rows(ray_t* tbl, ray_t* where_expr, int64_t n_table,
             c->len < n_table) { n_ref = 0; break; }
         switch (c->type) {
         case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8: case RAY_BOOL:
-        case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: case RAY_F64: case RAY_F32:
+        case RAY_DATE: case RAY_TIME: case RAY_TIMESPAN: case RAY_TIMESTAMP: case RAY_F64: case RAY_F32:
         case RAY_SYM: break;
         default: n_ref = 0; break;
         }
@@ -13150,7 +13154,7 @@ static void prune_where_mask(ray_t* e, int64_t key_id, ray_t* kv,
 static bool prune_stand_in_type_ok(int8_t t) {
     switch (t) {
     case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
-    case RAY_F32: case RAY_F64: case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP:
+    case RAY_F32: case RAY_F64: case RAY_DATE: case RAY_TIME: case RAY_TIMESPAN: case RAY_TIMESTAMP:
     case RAY_GUID: case RAY_SYM: case RAY_STR:
         return true;
     default:
@@ -16022,7 +16026,7 @@ by_dict_done:
                     switch (key_cols[k]->type) {
                         case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8:
                         case RAY_BOOL: case RAY_DATE: case RAY_TIME:
-                        case RAY_TIMESTAMP: case RAY_SYM: case RAY_STR: break;
+                        case RAY_TIMESPAN: case RAY_TIMESTAMP: case RAY_SYM: case RAY_STR: break;
                         default: distinct_only = false; break;
                     }
                 }
@@ -16035,7 +16039,7 @@ by_dict_done:
                     switch (cm.type) {
                         case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8:
                         case RAY_BOOL: case RAY_DATE: case RAY_TIME:
-                        case RAY_TIMESTAMP: case RAY_SYM: case RAY_F64:
+                        case RAY_TIMESPAN: case RAY_TIMESTAMP: case RAY_SYM: case RAY_F64:
                         case RAY_GUID: case RAY_STR: case RAY_LIST: break;
                         default: distinct_only = false; break;
                     }
@@ -16243,6 +16247,7 @@ by_dict_done:
                                     case RAY_SYM: atom = ray_sym(key_vals[off]); break;
                                     case RAY_I64:
                                     case RAY_TIMESTAMP: atom = ray_i64(key_vals[off]); break;
+                                    case RAY_TIMESPAN: atom = ray_timespan(key_vals[off]); break;
                                     case RAY_I32:
                                     case RAY_DATE:
                                     case RAY_TIME: atom = ray_i32((int32_t)key_vals[off]); break;
@@ -19957,7 +19962,7 @@ by_dict_done:
                         (dst) = _u; break; }                                   \
                     case RAY_DATE: case RAY_TIME:                              \
                         (dst) = ((const int32_t*)_d)[idx]; break;              \
-                    case RAY_TIMESTAMP:                                        \
+                    case RAY_TIMESPAN: case RAY_TIMESTAMP:                                        \
                         (dst) = ((const int64_t*)_d)[idx]; break;              \
                     /* SYM: raw index — scan_key vs grp_key, where grp_key  \
                      * is gathered FROM scan_key (same domain), never a     \
@@ -20784,6 +20789,8 @@ static bool xbar_bucket_fits_vec_type(int8_t out_type, int64_t b) {
 }
 
 ray_t* ray_xbar_fn(ray_t* col, ray_t* bucket) {
+    if (ray_has_timespan(col) || ray_has_timespan(bucket))
+        return ray_timespan_xbar(col, bucket);
     /* Vectorised fast path for `(xbar VEC scalar_int)` on integer or
      * temporal columns.  The generic atomic_map_binary path was
      * allocating one ray_t* atom per row and calling ray_xbar_fn
@@ -20986,6 +20993,11 @@ static ray_t* append_atom_to_col(ray_t* col_vec, ray_t* atom) {
     case RAY_TIME: {
         if (at != -RAY_TIME) return ray_error("type", "insert: time column requires a time value, got %s", ray_type_name(at));
         int32_t v = atom->i32;
+        return ray_vec_append(col_vec, &v);
+    }
+    case RAY_TIMESPAN: {
+        if (at != -RAY_TIMESPAN) return ray_error("type", "insert: timespan column requires a timespan value, got %s", ray_type_name(at));
+        int64_t v = atom->i64;
         return ray_vec_append(col_vec, &v);
     }
     case RAY_TIMESTAMP: {
@@ -22166,7 +22178,7 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                             ray_vec_set_null(new_col, r, true);
                             switch (ct) {
                                 case RAY_F64:                              ((double*)ray_data(new_col))[r]  = NULL_F64; break;
-                                case RAY_I64: case RAY_TIMESTAMP:          ((int64_t*)ray_data(new_col))[r] = NULL_I64; break;
+                                case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP:          ((int64_t*)ray_data(new_col))[r] = NULL_I64; break;
                                 case RAY_I32: case RAY_DATE: case RAY_TIME:((int32_t*)ray_data(new_col))[r] = NULL_I32; break;
                                 case RAY_I16:                              ((int16_t*)ray_data(new_col))[r] = NULL_I16; break;
                                 default: break;
@@ -22247,7 +22259,7 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                                 for (int64_t r = 0; r < nrows; r++) d[r] = NULL_F64;
                                 break;
                             }
-                            case RAY_I64: case RAY_TIMESTAMP: {
+                            case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP: {
                                 int64_t* d = (int64_t*)ray_data(bcast);
                                 for (int64_t r = 0; r < nrows; r++) d[r] = NULL_I64;
                                 break;
@@ -22522,7 +22534,7 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                             for (int64_t r = 0; r < nrows; r++) d[r] = NULL_F64;
                             break;
                         }
-                        case RAY_I64: case RAY_TIMESTAMP: {
+                        case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP: {
                             int64_t* d = (int64_t*)ray_data(bcast);
                             for (int64_t r = 0; r < nrows; r++) d[r] = NULL_I64;
                             break;
@@ -22662,7 +22674,7 @@ no_where_add_col:
                         for (int64_t r = 0; r < nrows; r++) d[r] = NULL_F64;
                         break;
                     }
-                    case RAY_I64: case RAY_TIMESTAMP: {
+                    case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP: {
                         int64_t* d = (int64_t*)ray_data(bcast);
                         for (int64_t r = 0; r < nrows; r++) d[r] = NULL_I64;
                         break;
@@ -23321,7 +23333,7 @@ static ray_t* append_parted_atom(ray_t* vec, int8_t dst, ray_t* atom) {
     case RAY_F64:  { double x = atom->f64; return ray_vec_append(vec, &x); }
     case RAY_DATE: { int32_t x = atom->i32; return ray_vec_append(vec, &x); }
     case RAY_TIME: { int32_t x = atom->i32; return ray_vec_append(vec, &x); }
-    case RAY_TIMESTAMP: { int64_t x = atom->i64; return ray_vec_append(vec, &x); }
+    case RAY_TIMESPAN: case RAY_TIMESTAMP: { int64_t x = atom->i64; return ray_vec_append(vec, &x); }
     case RAY_GUID: return ray_vec_append(vec, ray_data(atom->obj));
     case RAY_STR: return ray_str_vec_append(vec, ray_str_ptr(atom), ray_str_len(atom));
     default: return ray_error("type", "insert: unsupported parted append type %s", ray_type_name(dst));
@@ -24605,7 +24617,7 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
 static bool upsert_key_type_ok(int8_t t) {
     switch (t) {
     case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
-    case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP:
+    case RAY_DATE: case RAY_TIME: case RAY_TIMESPAN: case RAY_TIMESTAMP:
     case RAY_F64: case RAY_SYM: case RAY_STR: case RAY_GUID:
         return true;
     default:
@@ -24921,6 +24933,7 @@ static ray_t* upsert_cell_fits(int8_t ct, ray_t* cell) {
     case RAY_DATE:      ok = (at == -RAY_DATE); break;
     case RAY_TIME:      ok = (at == -RAY_TIME); break;
     case RAY_TIMESTAMP: ok = (at == -RAY_TIMESTAMP); break;
+    case RAY_TIMESPAN:  ok = (at == -RAY_TIMESPAN); break;
     case RAY_GUID:      ok = (at == -RAY_GUID); break;
     case RAY_SYM:       ok = (at == -RAY_SYM); break;
     case RAY_STR:       ok = (at == -RAY_STR); break;
@@ -25020,7 +25033,7 @@ static bool upsert_vec_payload_ok(ray_t* tbl, ray_t** src_cols, int64_t ncols, i
         if (sc->len != m) return false;
         switch (tm.type) {
         case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
-        case RAY_F64: case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP:
+        case RAY_F64: case RAY_DATE: case RAY_TIME: case RAY_TIMESPAN: case RAY_TIMESTAMP:
         case RAY_GUID:
             break;
         case RAY_SYM:
@@ -25107,7 +25120,7 @@ upsert_vec_move_impl(ray_t* dst, const int64_t* di, int64_t dbase,
     case RAY_BOOL: case RAY_U8:  UPSERT_MOVE(uint8_t); break;
     case RAY_I16:                UPSERT_MOVE(int16_t); break;
     case RAY_I32: case RAY_DATE: case RAY_TIME: UPSERT_MOVE(int32_t); break;
-    case RAY_I64: case RAY_TIMESTAMP: UPSERT_MOVE(int64_t); break;
+    case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP: UPSERT_MOVE(int64_t); break;
     case RAY_F64:                UPSERT_MOVE(double); break;
     case RAY_GUID:
         for (int64_t i = 0; i < n; i++) {
@@ -26759,7 +26772,7 @@ static bool join_i64_eq_key_supported(int8_t t) {
     case RAY_I64:
     case RAY_DATE:
     case RAY_TIME:
-    case RAY_TIMESTAMP:
+    case RAY_TIMESPAN: case RAY_TIMESTAMP:
     case RAY_SYM:
         return true;
     default:
@@ -27008,7 +27021,7 @@ static ray_t* window_join_impl(ray_t** args, int64_t n, int mode) {
                 switch (t) {
                 case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8:
                 case RAY_F64: case RAY_F32: case RAY_BOOL:
-                case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP:
+                case RAY_DATE: case RAY_TIME: case RAY_TIMESPAN: case RAY_TIMESTAMP:
                     break;
                 default:
                     for (int64_t b = 0; b < a; b++) ray_release(agg_result_vecs[b]);

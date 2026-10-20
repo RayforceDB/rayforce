@@ -289,7 +289,7 @@ ray_t* ray_null_fill(int8_t type, int64_t rows, struct ray_sym_domain_s* dom) {
         case RAY_F32:
             for (int64_t i = 0; i < rows; i++) ((float*)p)[i] = NULL_F32;
             break;
-        case RAY_I64: case RAY_TIMESTAMP:
+        case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP:
             for (int64_t i = 0; i < rows; i++) ((int64_t*)p)[i] = NULL_I64;
             break;
         case RAY_I32: case RAY_DATE: case RAY_TIME:

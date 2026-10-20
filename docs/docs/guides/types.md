@@ -37,6 +37,7 @@ The `as` function performs explicit type conversion. It takes a type symbol and 
 | `'date` | Date | Days since 2000-01-01 |
 | `'time` | Time | Milliseconds since midnight |
 | `'timestamp` | Timestamp | Nanoseconds since 2000-01-01T00:00:00 |
+| `'timespan` | Duration | Signed count of nanoseconds |
 | `'guid` | GUID | 16-byte unique identifier |
 
 **Numeric casts:**
@@ -225,6 +226,7 @@ as `false`. Invalid numeric string parses raise a domain error.
     - `0Nd` — null date
     - `0Nt` — null time
     - `0Np` — null timestamp
+    - `0Nn` — null timespan
 
     `SYM` has no `0N` literal (`0Ns` does not parse): its null is the empty
     symbol, written `'`. `(nil? ')` is `true`, and it prints as `'`, so a
@@ -275,19 +277,25 @@ Rayforce has two string representations with different performance characteristi
 
 ## 7. Date/Time Types { #date-time }
 
-Rayforce has three temporal types, all stored as integers internally:
+Rayforce represents calendar points and clock times with DATE, TIME, and TIMESTAMP, and nanosecond durations with TIMESPAN. All use integer storage:
 
 | Type | Internal | Epoch | Literal Format |
 |---|---|---|---|
 | `date` | i32 | Days since 2000-01-01 | `2024.01.15` |
 | `time` | i32 | Milliseconds since midnight | `12:30:00.000` |
 | `timestamp` | i64 | Nanoseconds since 2000-01-01 midnight | `2024.01.15D12:30:00.000000000` |
+| `timespan` | i64 | Nanoseconds of duration | `1D`, `0D01:00:00.000000000` |
 
 `date` and `time` are 32-bit counts (of days and of milliseconds). A `time`
 is not limited to one day: `48:00:00.000` and negative values are valid, up to
 about ±596 hours. A result past the 32-bit range keeps its low 32 bits, the
 same for an atom and for a vector cell, so `(* 25 24:00:00.000)` is
 `-593:02:47.296`.
+
+Subtracting two timestamps returns TIMESPAN. Cast the difference with
+`as 'I64` when an integer nanosecond count is needed. A duration may be
+added to a timestamp, scaled by an integer, or used as an `xbar` width.
+See [Timespan](timespan.md) for operator result types and migration details.
 
 **Date arithmetic:**
 

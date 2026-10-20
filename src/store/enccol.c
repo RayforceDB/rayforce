@@ -421,7 +421,7 @@ static int top_encoding_class(int8_t t, uint8_t enc) {
     switch (t) {
     case RAY_BOOL: case RAY_U8:
         return (enc == RAY_ENC_RAW || enc == RAY_ENC_CONST || enc == RAY_ENC_FOR_BP || enc == RAY_ENC_RLE) ? 1 : 0;
-    case RAY_I16: case RAY_I32: case RAY_I64: case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP:
+    case RAY_I16: case RAY_I32: case RAY_I64: case RAY_DATE: case RAY_TIME: case RAY_TIMESPAN: case RAY_TIMESTAMP:
         return enc <= RAY_ENC_DICT ? 1 : 0;
     case RAY_SYM:
         return (enc == RAY_ENC_RAW || enc == RAY_ENC_CONST || enc == RAY_ENC_FOR_BP || enc == RAY_ENC_RLE) ? 1 : 0;
@@ -3865,7 +3865,7 @@ static bool dir_range_ok(int8_t type, const void* data, int64_t n, bool may_null
     case RAY_BOOL: case RAY_U8:                 DIR_REDUCE(uint8_t, uint8_t, 0, UINT8_MAX, 0); break;   /* never null */
     case RAY_I16:                               DIR_REDUCE(int16_t, uint16_t, INT16_MIN, INT16_MAX, NULL_I16); break;
     case RAY_I32: case RAY_DATE: case RAY_TIME: DIR_REDUCE(int32_t, uint32_t, INT32_MIN, INT32_MAX, NULL_I32); break;
-    case RAY_I64: case RAY_TIMESTAMP:           DIR_REDUCE(int64_t, uint64_t, INT64_MIN, INT64_MAX, NULL_I64); break;
+    case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP:           DIR_REDUCE(int64_t, uint64_t, INT64_MIN, INT64_MAX, NULL_I64); break;
     default: return true;
     }
 #undef DIR_REDUCE

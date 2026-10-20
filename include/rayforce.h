@@ -87,6 +87,8 @@ const char* ray_git_commit(void);
 #define RAY_SYM       12
 /* Variable-length string column (inline + pool) */
 #define RAY_STR       13
+/* Signed nanosecond duration; 14/15 belong to internal selection/encoded columns. */
+#define RAY_TIMESPAN  16
 
 /* Compound types */
 #define RAY_INDEX     97   /* Accelerator index attached to a vector (see ops/idxop.h) */
@@ -277,11 +279,14 @@ void        ray_error_clear(void);
 
 #define ray_type(v)       ((v)->type)
 #define ray_is_atom(v)    ((v)->type < 0 || (v)->type >= RAY_LAMBDA)
-#define ray_is_vec(v)     ((v)->type >= RAY_BOOL && (v)->type <= RAY_STR)
+static inline bool ray_is_vector_type(int8_t type) {
+    return (type >= RAY_BOOL && type <= RAY_STR) || type == RAY_TIMESPAN;
+}
+#define ray_is_vec(v)     ray_is_vector_type((v)->type)
 #define ray_len(v)        ((v)->len)
 
 /* Element type sizes indexed by type tag — covers all uint8_t values.
- * Only types 1-14 (vectors) have non-zero entries. */
+ * Only concrete vector types and LIST have non-zero entries. */
 extern const uint8_t ray_type_sizes[256];
 
 /* Out-of-line slice deref: keeps the hot path of ray_data_fn (a single
@@ -525,6 +530,7 @@ ray_t* ray_sym(int64_t id);
 ray_t* ray_date(int64_t val);
 ray_t* ray_time(int64_t val);
 ray_t* ray_timestamp(int64_t val);
+ray_t* ray_timespan(int64_t nanoseconds);
 /* Current UTC wall-clock time as a RAY_TIMESTAMP value (ns since 2000-01-01).
  * Shared "now as a timestamp" primitive — the single owner of the epoch
  * conversion; callers must not re-derive it. */
@@ -572,7 +578,8 @@ static inline bool ray_atom_is_null_fn(const union ray_t* x) {
             return f != f;
         }
         case RAY_I64:
-        case RAY_TIMESTAMP: return x->i64 == NULL_I64;
+        case RAY_TIMESTAMP:
+        case RAY_TIMESPAN:  return x->i64 == NULL_I64;
         case RAY_I32:
         case RAY_DATE:
         case RAY_TIME:      return x->i32 == NULL_I32;

@@ -41,7 +41,7 @@
 (at (select {m: (== n (last n)) x: (+ ts 1) from: T}) 'm) -- [false false false true]
 
 ;; ── the temporal column mixed with its own aggregate ─────────────────────────
-(at (select {m: (- ts (min ts)) x: i from: T}) 'm) -- [0 10 20 30]
+(at (select {m: (- ts (min ts)) x: i from: T}) 'm) -- (as 'TIMESPAN [0 10 20 30])
 (at (select {m: (- ts.yyyy (max i)) x: (+ ts 1) from: T}) 'm) -- [2020 2020 2020 2020]
 
 ;; ── where: filters before the aggregate is reduced ───────────────────────────

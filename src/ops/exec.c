@@ -861,7 +861,7 @@ RAY_INLINE void exec_in_body(const in_worker_ctx_t* c, int64_t start, int64_t en
                 IN_FAST(int32_t, (sj >= INT32_MIN && sj <= INT32_MAX),
                         NULL_I32, 1);
                 break;
-            case RAY_I64: case RAY_TIMESTAMP:
+            case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP:
                 IN_FAST(int64_t, 1, NULL_I64, 1);  /* all i64 fit */
                 break;
             default: break;  /* SYM / unsupported → generic below */
@@ -5830,8 +5830,7 @@ static bool subset_set(subset_proof_t* p, uint32_t id) {
     ray_op_ext_t* e = subset_ext(p, n);
     /* Flat typed vectors only: excludes LIST, callable, lazy and table values.
      * No data reads or mutation; the held literal is fixed during the rewrite. */
-    return e && e->literal && e->literal->type >= RAY_BOOL &&
-           e->literal->type <= RAY_STR && e->literal->len >= 0;
+    return e && e->literal && ray_is_vec(e->literal) && e->literal->len >= 0;
 }
 
 static uint8_t subset_visit(subset_proof_t* p, uint32_t id, unsigned depth) {

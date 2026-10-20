@@ -35,7 +35,7 @@ static inline bool win_keys_differ(ray_t* const* vecs, uint32_t n_keys,
         ray_t* col = vecs[k];
         if (!col) continue;
         switch (col->type) {
-        case RAY_I64: case RAY_TIMESTAMP:
+        case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP:
             if (((const int64_t*)ray_data(col))[ra] !=
                 ((const int64_t*)ray_data(col))[rb]) return true;
             break;
@@ -96,7 +96,7 @@ static inline double win_read_f64(ray_t* col, int64_t row) {
     switch (col->type) {
     case RAY_F64: return ((const double*)ray_data(col))[row];
     case RAY_F32: return (double)((const float*)ray_data(col))[row];
-    case RAY_I64: case RAY_TIMESTAMP:
+    case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP:
         return (double)((const int64_t*)ray_data(col))[row];
     case RAY_I32: case RAY_DATE: case RAY_TIME:
         return (double)((const int32_t*)ray_data(col))[row];
@@ -110,7 +110,7 @@ static inline double win_read_f64(ray_t* col, int64_t row) {
 
 static inline int64_t win_read_i64(ray_t* col, int64_t row) {
     switch (col->type) {
-    case RAY_I64: case RAY_TIMESTAMP:
+    case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP:
         return ((const int64_t*)ray_data(col))[row];
     case RAY_I32: case RAY_DATE: case RAY_TIME:
         return (int64_t)((const int32_t*)ray_data(col))[row];
@@ -1117,7 +1117,7 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                                 if (v < kmin) kmin = v;
                                 if (v > kmax) kmax = v;
                             }
-                        } else if (col->type == RAY_I64 || col->type == RAY_TIMESTAMP) {
+                        } else if (col->type == RAY_I64 || col->type == RAY_TIMESPAN || col->type == RAY_TIMESTAMP) {
                             const int64_t* d = (const int64_t*)ray_data(col);
                             for (int64_t i = 0; i < nrows; i++) {
                                 if (d[i] < kmin) kmin = d[i];

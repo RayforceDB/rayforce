@@ -23,8 +23,8 @@
 
 #include "core/types.h"
 
-/* Element sizes indexed by type tag.  Only types 0-14 (vectors) have
- * non-zero entries; remaining indices are zero (safe for non-vector types). */
+/* Element sizes indexed by type tag.  Concrete vectors and LIST have
+ * non-zero entries; internal tag holes remain zero. */
 const uint8_t ray_type_sizes[256] = {
     /* [RAY_LIST]      =  0 */ 8,   /* pointer-sized (ray_t*) */
     /* [RAY_BOOL]      =  1 */ 1,
@@ -41,6 +41,7 @@ const uint8_t ray_type_sizes[256] = {
     /* [RAY_SYM]       = 12 */ 8,   /* W64 default; narrow widths use ray_sym_elem_size */
     /* [RAY_STR]       = 13 */ 16,  /* sizeof(ray_str_t) */
     /* [RAY_SEL]       = 14 */ 0,   /* variable-size layout, no elem_size */
+    [RAY_TIMESPAN] = 8,
 };
 
 /* ===== Semantic Version API ===== */

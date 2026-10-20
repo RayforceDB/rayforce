@@ -266,6 +266,7 @@ int64_t ray_dict_find_idx(ray_t* d, ray_t* key_atom) {
             }
         }
         case RAY_I64:
+        case RAY_TIMESPAN:
         case RAY_TIMESTAMP: {
             const int64_t* a = (const int64_t*)base;
             int64_t v = key_atom->i64;
@@ -361,6 +362,7 @@ static ray_t* dict_vals_at(ray_t* vals, int64_t idx, bool* owned_out) {
         case RAY_F64:       atom = ray_f64(((double*)base)[idx]);                    break;
         case RAY_DATE:      atom = ray_date(((int32_t*)base)[idx]);                  break;
         case RAY_TIME:      atom = ray_time(((int32_t*)base)[idx]);                  break;
+        case RAY_TIMESPAN: atom = ray_timespan(((int64_t*)base)[idx]);              break;
         case RAY_TIMESTAMP: atom = ray_timestamp(((int64_t*)base)[idx]);              break;
         case RAY_SYM: {
             int64_t id = ray_read_sym(base, idx, vals->type, vals->attrs);

@@ -168,6 +168,7 @@ nav:
           - Error Handling: docs/guides/errors.md
           - Memory & Monitoring: docs/guides/memory.md
           - Type Casting: docs/guides/types.md
+          - Timespan: docs/guides/timespan.md
       - Architecture:
           - Pipeline & Optimizer: docs/architecture/pipeline.md
           - Memory Model: docs/architecture/memory.md

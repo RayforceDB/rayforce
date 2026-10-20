@@ -637,7 +637,7 @@ static void agg_key_bounds_raw(int8_t type, uint8_t attrs, const void* data,
         } \
     } while (0)
     switch (type) {
-        case RAY_I64: case RAY_TIMESTAMP: KEY_BOUNDS(int64_t); break;
+        case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: KEY_BOUNDS(int64_t); break;
         case RAY_I32: case RAY_DATE: case RAY_TIME: KEY_BOUNDS(int32_t); break;
         case RAY_I16: KEY_BOUNDS(int16_t); break;
         case RAY_U8: case RAY_BOOL: KEY_BOUNDS(uint8_t); break;
@@ -1076,7 +1076,7 @@ enum { AGG_EST_SAMPLE = AGG_EST_SAMPLE_ROWS, AGG_EST_PREFETCH = 16,
  * one more value), a SYM's code. */
 static inline int64_t agg_est_read(const void* d, int8_t t, uint8_t attrs, int64_t r) {
     switch (t) {
-    case RAY_I64: case RAY_TIMESTAMP: return ((const int64_t*)d)[r];
+    case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: return ((const int64_t*)d)[r];
     case RAY_I32: case RAY_DATE: case RAY_TIME: return ((const int32_t*)d)[r];
     case RAY_I16: return ((const int16_t*)d)[r];
     case RAY_U8: case RAY_BOOL: return ((const uint8_t*)d)[r];
@@ -1594,7 +1594,7 @@ static bool key_null_in_range(const ray_t* v, int64_t start, int64_t end) {
         switch (v->type) {
             case RAY_F64: { const double* d = p; for (int64_t i = s; i < e; i++) any |= (d[i] != d[i]); break; }
             case RAY_F32: { const float* d = p; for (int64_t i = s; i < e; i++) any |= (d[i] != d[i]); break; }
-            case RAY_I64: case RAY_TIMESTAMP: { const int64_t* d = p; for (int64_t i = s; i < e; i++) any |= (d[i] == NULL_I64); break; }
+            case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: { const int64_t* d = p; for (int64_t i = s; i < e; i++) any |= (d[i] == NULL_I64); break; }
             case RAY_I32: case RAY_DATE: case RAY_TIME: { const int32_t* d = p; for (int64_t i = s; i < e; i++) any |= (d[i] == NULL_I32); break; }
             case RAY_I16: { const int16_t* d = p; for (int64_t i = s; i < e; i++) any |= (d[i] == NULL_I16); break; }
             case RAY_GUID: { const uint64_t* d = p; for (int64_t i = s; i < e; i++) any |= (d[2 * i] == 0 && d[2 * i + 1] == 0); break; }
@@ -1621,7 +1621,7 @@ static void key_null_scan_fn(void* raw, uint32_t wid, int64_t start, int64_t end
 void ray_group_key_settle_nulls(ray_t* kc) {
     if (!kc || RAY_IS_ERR(kc) || !(kc->attrs & RAY_ATTR_HAS_NULLS)) return;
     switch (kc->type) {
-        case RAY_F64: case RAY_F32: case RAY_I64: case RAY_TIMESTAMP:
+        case RAY_F64: case RAY_F32: case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP:
         case RAY_I32: case RAY_DATE: case RAY_TIME: case RAY_I16: case RAY_GUID: break;
         default: return;
     }
@@ -1678,7 +1678,7 @@ ray_t* ray_group_gather(ray_t* src_col, const int64_t* first_row, int64_t n) {
     switch (src_col->type) {
         case RAY_F64: GATHER_NULL(double, NULL_F64); break;
         case RAY_F32: GATHER_NULL(float, NULL_F32); break;
-        case RAY_I64: case RAY_TIMESTAMP: GATHER_NULL(int64_t, NULL_I64); break;
+        case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: GATHER_NULL(int64_t, NULL_I64); break;
         case RAY_I32: case RAY_DATE: case RAY_TIME: GATHER_NULL(int32_t, NULL_I32); break;
         case RAY_I16: GATHER_NULL(int16_t, NULL_I16); break;
         default: break; /* SYM/GUID use zero payloads; BOOL/U8 have no null. */
@@ -2188,7 +2188,7 @@ AGG_ONE_COPY static void agg_sel_bounds_rows(void* raw, const agg_view_t* v, uin
             if (val > mx) mx = val;                                             \
         }
         switch (c->krr->key_types[k]) {
-        case RAY_I64: case RAY_TIMESTAMP:        SEL_BOUNDS_LOOP(((const int64_t*)kd)[rows[i] - base]); break;
+        case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP:        SEL_BOUNDS_LOOP(((const int64_t*)kd)[rows[i] - base]); break;
         case RAY_I32: case RAY_DATE: case RAY_TIME: SEL_BOUNDS_LOOP(((const int32_t*)kd)[rows[i] - base]); break;
         case RAY_I16:                            SEL_BOUNDS_LOOP(((const int16_t*)kd)[rows[i] - base]); break;
         case RAY_U8: case RAY_BOOL:              SEL_BOUNDS_LOOP(((const uint8_t*)kd)[rows[i] - base]); break;
@@ -2214,7 +2214,7 @@ static void agg_sel_bounds_fold(const agg_sel_bounds_ctx_t* c, uint32_t k, uint8
             if (val > mx) mx = val;                                             \
         }
     switch (c->krr->key_types[k]) {
-    case RAY_I64: case RAY_TIMESTAMP:        SEL_BOUNDS_LOOP(((const int64_t*)kd)[rows[i] - base]); break;
+    case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP:        SEL_BOUNDS_LOOP(((const int64_t*)kd)[rows[i] - base]); break;
     case RAY_I32: case RAY_DATE: case RAY_TIME: SEL_BOUNDS_LOOP(((const int32_t*)kd)[rows[i] - base]); break;
     case RAY_I16:                            SEL_BOUNDS_LOOP(((const int16_t*)kd)[rows[i] - base]); break;
     case RAY_U8: case RAY_BOOL:              SEL_BOUNDS_LOOP(((const uint8_t*)kd)[rows[i] - base]); break;
@@ -3102,7 +3102,7 @@ bool agg_group_values_f64(const agg_vtable_t* vt, const char* states,
                           int64_t n, int64_t param, double* out) {
     int8_t t = vt->out_type;
     switch (t) {
-        case RAY_F64: case RAY_F32: case RAY_I64: case RAY_TIMESTAMP:
+        case RAY_F64: case RAY_F32: case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP:
         case RAY_I32: case RAY_DATE: case RAY_TIME: case RAY_I16:
         case RAY_U8: case RAY_BOOL: break;
         default: return false;
@@ -3123,7 +3123,7 @@ bool agg_group_values_f64(const agg_vtable_t* vt, const char* states,
         switch (t) {
             case RAY_F64: v = ((const double*)ray_data(cell))[0]; break;
             case RAY_F32: v = ((const float*)ray_data(cell))[0]; break;
-            case RAY_I64: case RAY_TIMESTAMP: v = (double)((const int64_t*)ray_data(cell))[0]; break;
+            case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: v = (double)((const int64_t*)ray_data(cell))[0]; break;
             case RAY_I32: case RAY_DATE: case RAY_TIME: v = (double)((const int32_t*)ray_data(cell))[0]; break;
             case RAY_I16: v = (double)((const int16_t*)ray_data(cell))[0]; break;
             default: v = (double)((const uint8_t*)ray_data(cell))[0]; break;
@@ -3301,7 +3301,7 @@ static void agg_dense_phaseA_fn(void* vctx, const agg_view_t* v, uint32_t wid, i
             else { DENSE_SLOT1_LAZY(LD, v == null ? null_slot : v - kmin); } \
         } while (0)
         switch (c->key_cols[0]->type) {
-            case RAY_I64: case RAY_TIMESTAMP: DENSE_SLOT1(((const int64_t*)kd)[r - kbase]); break;
+            case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: DENSE_SLOT1(((const int64_t*)kd)[r - kbase]); break;
             case RAY_I32: case RAY_DATE: case RAY_TIME: DENSE_SLOT1(((const int32_t*)kd)[r - kbase]); break;
             case RAY_I16: DENSE_SLOT1(((const int16_t*)kd)[r - kbase]); break;
             case RAY_U8: case RAY_BOOL: DENSE_SLOT1(((const uint8_t*)kd)[r - kbase]); break;
@@ -4010,7 +4010,7 @@ static void agg_dense_partition_count_rows(void* raw, const agg_view_t* v, uint3
         } \
     } while (0)
     switch (c->key->type) {
-        case RAY_I64: case RAY_TIMESTAMP: PART_COUNT(int64_t); break;
+        case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: PART_COUNT(int64_t); break;
         case RAY_I32: case RAY_DATE: case RAY_TIME: PART_COUNT(int32_t); break;
         case RAY_I16: PART_COUNT(int16_t); break;
         case RAY_U8: case RAY_BOOL: PART_COUNT(uint8_t); break;
@@ -4416,7 +4416,7 @@ static void agg_dense_shared_block(void* raw, const agg_view_t* v, uint32_t wid,
         } \
     } while (0)
     switch (c->key->type) {
-        case RAY_I64: case RAY_TIMESTAMP: SHARED_GIDS(int64_t); break;
+        case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: SHARED_GIDS(int64_t); break;
         case RAY_I32: case RAY_DATE: case RAY_TIME: SHARED_GIDS(int32_t); break;
         case RAY_I16: SHARED_GIDS(int16_t); break;
         case RAY_U8: case RAY_BOOL: SHARED_GIDS(uint8_t); break;
@@ -5437,7 +5437,7 @@ static inline uint64_t agg_radix_fmix64(uint64_t h) {
  * and the scatter loop then loads them for every key of every row). */
 RAY_INLINE int64_t agg_radix_key_at(const ray_t* col, const void* data, int64_t row) {
     switch (col->type) {
-        case RAY_I64: case RAY_TIMESTAMP: return ((const int64_t*)data)[row];
+        case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: return ((const int64_t*)data)[row];
         case RAY_I32: case RAY_DATE: case RAY_TIME: return ((const int32_t*)data)[row];
         case RAY_I16: return ((const int16_t*)data)[row];
         case RAY_U8:  case RAY_BOOL: return ((const uint8_t*)data)[row];
@@ -5619,7 +5619,7 @@ static void agg_radix_stage_block(agg_radix_stage_t* t, const agg_view_t* v, int
                 h[i] = (h[i] ^ (uint64_t)val) * 1099511628211ULL;                      \
             } } while (0)
         switch (c->key_cols[k]->type) {
-            case RAY_I64: case RAY_TIMESTAMP: STAGE_KEY(int64_t); break;
+            case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: STAGE_KEY(int64_t); break;
             case RAY_I32: case RAY_DATE: case RAY_TIME: STAGE_KEY(int32_t); break;
             case RAY_I16: STAGE_KEY(int16_t); break;
             case RAY_U8: case RAY_BOOL: STAGE_KEY(uint8_t); break;
@@ -5730,7 +5730,7 @@ static void agg_radix_stage_block_c(agg_radix_stage_t* t, const agg_view_t* v, i
                     h[i] = (h[i] ^ (uint64_t)val) * 1099511628211ULL;                  \
                 } } while (0)
             switch (c->key_cols[k]->type) {
-                case RAY_I64: case RAY_TIMESTAMP: STAGE_KEY(int64_t); break;
+                case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: STAGE_KEY(int64_t); break;
                 case RAY_I32: case RAY_DATE: case RAY_TIME: STAGE_KEY(int32_t); break;
                 case RAY_I16: STAGE_KEY(int16_t); break;
                 case RAY_U8: case RAY_BOOL: STAGE_KEY(uint8_t); break;
@@ -7314,7 +7314,7 @@ static ray_t* exec_group_v2_parallel_radix(
         if (!f->plain) { compact = false; break; }
         if (!key) { f->kind = AGG_CF_VAL; continue; }
         switch (d.rr.key_types[i]) {
-            case RAY_I64: case RAY_TIMESTAMP: f->kind = AGG_CF_KEY_I64; break;
+            case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: f->kind = AGG_CF_KEY_I64; break;
             case RAY_I32: case RAY_DATE: case RAY_TIME: f->kind = AGG_CF_KEY_I32; break;
             case RAY_I16: f->kind = AGG_CF_KEY_I16; break;
             case RAY_U8: case RAY_BOOL: f->kind = AGG_CF_KEY_U8; break;
@@ -9114,7 +9114,7 @@ static int64_t agg_index_winner(void* raw, const int64_t* rows, int64_t count) {
             case RAY_I16: INDEX_FIRST_VALID(int16_t, value != NULL_I16);
             case RAY_I32: case RAY_DATE: case RAY_TIME:
                 INDEX_FIRST_VALID(int32_t, value != NULL_I32);
-            case RAY_I64: case RAY_TIMESTAMP:
+            case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP:
                 INDEX_FIRST_VALID(int64_t, value != NULL_I64);
             case RAY_F32: INDEX_FIRST_VALID(float, value == value);
             case RAY_F64: INDEX_FIRST_VALID(double, value == value);
@@ -9602,7 +9602,7 @@ static inline int64_t agg_firstn_probe(agg_firstn_set_t* s, const int64_t* kv,
 static inline __attribute__((always_inline)) void agg_firstn_hash_block(uint64_t* h, ray_t* col, const void* data,
                                   int64_t b, int64_t n) {
     switch (col->type) {
-        case RAY_I64: case RAY_TIMESTAMP: {
+        case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: {
             const int64_t* d = (const int64_t*)data + b;
             for (int64_t i = 0; i < n; i++) AGG_FIRSTN_MIX(h[i], d[i]);
             break;
@@ -9657,7 +9657,7 @@ static inline __attribute__((always_inline)) void agg_firstn_hash_block(uint64_t
 static inline __attribute__((always_inline)) void agg_firstn_hash_raw(uint64_t* h, int8_t type, uint8_t attrs,
                                   const void* data, int64_t b, int64_t n) {
     switch (type) {
-        case RAY_I64: case RAY_TIMESTAMP: {
+        case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: {
             const int64_t* d = (const int64_t*)data + b;
             for (int64_t i = 0; i < n; i++) AGG_FIRSTN_MIX(h[i], d[i]);
             break;

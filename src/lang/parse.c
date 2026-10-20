@@ -21,6 +21,7 @@
  *   SOFTWARE.
  */
 
+#include "core/timespan.h"
 #include "lang/parse.h"
 #include "lang/nfo.h"
 #include "lang/env.h"
@@ -202,6 +203,11 @@ static ray_t* parse_number(ray_parser_t *p) {
     int is_neg = 0;
     if (*p->pos == '-') { is_neg = 1; p->pos++; }
 
+    if (p->pos[0] == '0' && p->pos[1] == 'W' && p->pos[2] == 'n') {
+        p->pos += 3;
+        return ray_timespan(is_neg ? -INT64_MAX : INT64_MAX);
+    }
+
     /* Hex literal: 0x.. */
     if (p->pos[0] == '0' && p->pos[1] == 'x') {
         p->pos += 2;
@@ -220,6 +226,7 @@ static ray_t* parse_number(ray_parser_t *p) {
         case 'd': p->pos += 3; return ray_typed_null(-RAY_DATE);
         case 't': p->pos += 3; return ray_typed_null(-RAY_TIME);
         case 'p': p->pos += 3; return ray_typed_null(-RAY_TIMESTAMP);
+        case 'n': p->pos += 3; return ray_typed_null(-RAY_TIMESPAN);
         case 'l': p->pos += 3; return ray_typed_null(-RAY_I64);
         case 'f': p->pos += 3; return ray_typed_null(-RAY_F64);
         case 'e': p->pos += 3; return ray_typed_null(-RAY_F32);
@@ -241,6 +248,15 @@ static ray_t* parse_number(ray_parser_t *p) {
     const char *dstart = p->pos;
     while (*p->pos >= '0' && *p->pos <= '9') p->pos++;
     int ndigits = (int)(p->pos - dstart);
+    if (*p->pos == 'D') {
+        size_t consumed;
+        int64_t ns;
+        if (!ray_parse_timespan(start, &consumed, &ns))
+            return ray_error("domain", "parse: invalid or out-of-range timespan");
+        p->pos = start + consumed;
+        return ray_timespan(ns);
+    }
+
 
     /* Date/Timestamp: YYYY.MM.DD or YYYY.MM.DDDhh:mm:ss.nnnnnnnnn */
     if (ndigits == 4 && !is_neg && *p->pos == '.' &&
@@ -612,7 +628,7 @@ static ray_t* parse_vector(ray_parser_t *p) {
             return vec;
         }
         switch (vec_type) {
-            case RAY_I64: case RAY_TIMESTAMP: {
+            case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: {
                 int64_t* d = (int64_t*)ray_data(vec);
                 for (int32_t i = 0; i < count; i++) d[i] = elems[i]->i64;
                 break;

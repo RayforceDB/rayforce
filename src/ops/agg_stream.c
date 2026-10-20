@@ -601,7 +601,7 @@ static inline double pearson_read_f64(const ray_valid_t* v, int64_t i) {
     switch (v->type) {
         case RAY_F32:                       return ((const float*)v->base)[i];
         case RAY_F64:                       return ((const double*)v->base)[i];
-        case RAY_I64: case RAY_TIMESTAMP:   return (double)((const int64_t*)v->base)[i];
+        case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP:   return (double)((const int64_t*)v->base)[i];
         case RAY_I32: case RAY_DATE: case RAY_TIME:
                                             return (double)((const int32_t*)v->base)[i];
         case RAY_I16:                       return (double)((const int16_t*)v->base)[i];
@@ -704,7 +704,7 @@ static inline int truth_read(const ray_valid_t* v, int64_t i) {
     switch (v->type) {
         case RAY_F32:                       return ((const float*)v->base)[i] != 0.0f;
         case RAY_F64:                       return ((const double*)v->base)[i] != 0.0;
-        case RAY_I64: case RAY_TIMESTAMP:   return ((const int64_t*)v->base)[i] != 0;
+        case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP:   return ((const int64_t*)v->base)[i] != 0;
         case RAY_I32: case RAY_DATE: case RAY_TIME:
                                             return ((const int32_t*)v->base)[i] != 0;
         case RAY_I16:                       return ((const int16_t*)v->base)[i] != 0;
@@ -1872,12 +1872,51 @@ static const agg_vtable_t PROD_F64 = {
     .merge = prod_f64_merge, .finalize = prod_f64_final, .finalize_value = prod_f64_final_value,
 };
 
+static ray_t* sum_timespan_final(const void* s, acc_arena_t* a, int64_t param) {
+    (void)a; (void)param;
+    return ray_timespan(((const sum_i64_state*)s)->sum);
+}
+static bool ext_timespan_value(const void* s, void* dst) {
+    *(int64_t*)dst = ((const ext_i64_state*)s)->v;
+    return false;
+}
+static ray_t* ext_timespan_final(const void* s, acc_arena_t* a, int64_t param) {
+    (void)a; (void)param;
+    return ray_timespan(((const ext_i64_state*)s)->v);
+}
+static const agg_vtable_t SUM_TIMESPAN = {
+    .state_size = sizeof(sum_i64_state), .kind = ACC_STREAMING, .out_type = RAY_TIMESPAN,
+    .init = sum_i64_init, .update_batch = sum_i64_update,
+    .merge = sum_i64_merge, .finalize = sum_timespan_final, .finalize_value = sum_i64_final_value,
+};
+static const agg_vtable_t MIN_TIMESPAN = {
+    .state_size = sizeof(ext_i64_state), .kind = ACC_STREAMING, .out_type = RAY_TIMESPAN,
+    .init = min_i64_init, .update_batch = min_timestamp_native_update,
+    .merge = min_i64_merge, .finalize = ext_timespan_final, .finalize_value = ext_timespan_value,
+};
+static void max_timespan_init(void* s) {
+    max_i64_init(s);
+    ((ext_i64_state*)s)->v = -INT64_MAX;
+}
+static const agg_vtable_t MAX_TIMESPAN = {
+    .state_size = sizeof(ext_i64_state), .kind = ACC_STREAMING, .out_type = RAY_TIMESPAN,
+    .init = max_timespan_init, .update_batch = max_timestamp_native_update,
+    .merge = max_i64_merge, .finalize = ext_timespan_final, .finalize_value = ext_timespan_value,
+};
+
 const agg_vtable_t* agg_resolve(uint16_t agg_kind, int8_t in_type) {
+    if (in_type == RAY_TIMESPAN) {
+        if (agg_kind == OP_SUM) return &SUM_TIMESPAN;
+        if (agg_kind == OP_MIN) return &MIN_TIMESPAN;
+        if (agg_kind == OP_MAX) return &MAX_TIMESPAN;
+        return agg_resolve(agg_kind, RAY_I64);
+    }
+
     if (agg_kind == OP_COUNT_NN) {
         switch (in_type) {
             case RAY_F64: return &COUNT_NN_F64;
             case RAY_F32: return &COUNT_NN_F32;
-            case RAY_I64: case RAY_TIMESTAMP: return &COUNT_NN_I64;
+            case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: return &COUNT_NN_I64;
             case RAY_I32: case RAY_DATE: case RAY_TIME: return &COUNT_NN_I32;
             case RAY_I16: return &COUNT_NN_I16;
             default: return NULL;

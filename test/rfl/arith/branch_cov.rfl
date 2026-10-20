@@ -219,13 +219,13 @@
 (nil? (- (as 'TIMESTAMP 5000) 0Nt)) -- true
 (type (- (as 'TIMESTAMP 5000) 0Nt)) -- 'timestamp
 
-;; ── L146-148: TIMESTAMP - TIMESTAMP null → null I64 ──
+;; ── L146-148: TIMESTAMP - TIMESTAMP null → null TIMESPAN ──
 
 (nil? (- 0Np (as 'TIMESTAMP 2000))) -- true
-(type (- 0Np (as 'TIMESTAMP 2000))) -- 'i64
+(type (- 0Np (as 'TIMESTAMP 2000))) -- 'timespan
 
 (nil? (- (as 'TIMESTAMP 5000) 0Np)) -- true
-(type (- (as 'TIMESTAMP 5000) 0Np)) -- 'i64
+(type (- (as 'TIMESTAMP 5000) 0Np)) -- 'timespan
 
 ;; ── L158: numeric null sub propagation (I16 null) ──
 

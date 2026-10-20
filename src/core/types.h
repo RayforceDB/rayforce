@@ -35,7 +35,7 @@
 #include <float.h>
 
 /* Number of types (positive range): must be > max type ID */
-#define RAY_TYPE_COUNT 15
+#define RAY_TYPE_COUNT 17
 
 /* Type sizes lookup table (defined in types.c) */
 extern const uint8_t ray_type_sizes[256];
