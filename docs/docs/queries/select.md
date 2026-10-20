@@ -163,6 +163,35 @@ Combine multiple conditions:
 ; GOOG   280    400
 ```
 
+### Running functions under `where:`
+
+A running, moving or shift function in a projection (`sums`, `deltas`,
+`msum`, `lag` and the rest) runs over the whole table, rows the `where:`
+drops included, and the query then keeps the `where:` rows. An aggregate
+nested inside such a function sees the whole table too; an aggregate on its
+own sees the surviving rows:
+
+```lisp
+(set r (table [name room score] (list ['Ann 'Bob 'Cid 'Dan] ['A 'B 'A 'B] [60 20 45 35])))
+(select {s: (sums score) from: r where: (== room 'A)})                 ; s: [60 125]
+(select {s: (avg score) from: r where: (== room 'A)})                  ; s: [52.5]
+(select {s: (sums (- score (avg score))) from: r where: (== room 'A)}) ; s: [20.0 5.0]
+```
+
+In the last query `avg` averages all four rows (40), the running sum of
+`20 -20 5 -5` is `20 0 5 0`, and rows A keep `20` and `5`. A select used as
+`from:` establishes its own input, so to run over the surviving rows only,
+select them first:
+
+```lisp
+(set a (select {from: r where: (== room 'A)}))
+(select {s: (sums score) from: a})                 ; s: [60 105]
+(select {s: (sums (- score (avg score))) from: a}) ; s: [7.5 0.0]
+```
+
+The [whole-column verbs](#whole-column-projections) (`distinct`, `asc`,
+`desc`, `reverse`, `where`) are different: they see the surviving rows only.
+
 ### Group-by Aggregation
 
 The `by:` clause groups rows by one or more key columns. Aggregation functions are specified as additional key-value pairs in the query dict:
