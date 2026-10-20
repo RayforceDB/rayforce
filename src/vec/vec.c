@@ -24,6 +24,7 @@
 #include "vec.h"
 #include "core/platform.h"
 #include "mem/heap.h"
+#include "vec/growth.h"
 #include "table/sym.h"
 #include "table/domain.h"
 #include "vec/embedding.h"
@@ -121,7 +122,8 @@ static inline void vec_drop_index_inplace(ray_t* v) {
  *
  * A vector's capacity is determined by its buddy order:
  *   capacity = (2^order - 32) / elem_size
- * When len reaches capacity, realloc to next power-of-2 data size.
+ * Growth requests include header-aware buddy rounding or explicit direct-block
+ * doubling; payload alone is not pre-rounded.
  * -------------------------------------------------------------------------- */
 
 static int64_t vec_capacity(ray_t* vec) {
@@ -234,6 +236,11 @@ ray_t* ray_vec_append(ray_t* vec, const void* elem) {
     if (vec->type == RAY_STR) return ray_error("type", "vec_append: str vectors use ray_str_vec_append, got %s", ray_type_name(vec->type));
 
     /* COW: if shared, copy first */
+    uint8_t esz = ray_sym_elem_size(vec->type, vec->attrs);
+    size_t required;
+    if (!ray_cell_growth_bytes(vec->len, 1, esz, &required))
+        return ray_error("oom", NULL);
+
     ray_t* original = vec;
     vec = ray_cow(vec);
     if (!vec || RAY_IS_ERR(vec)) return vec;
@@ -241,22 +248,13 @@ ray_t* ray_vec_append(ray_t* vec, const void* elem) {
     /* Append changes len + writes data; any attached index is now stale. */
     vec_drop_index_inplace(vec);
 
-    uint8_t esz = ray_sym_elem_size(vec->type, vec->attrs);
     int64_t cap = vec_capacity(vec);
 
     /* Grow if needed */
     if (vec->len >= cap) {
-        size_t new_data_size = (size_t)(vec->len + 1) * esz;
-        /* Round up to next power of 2 block */
-        if (new_data_size < 32) new_data_size = 32;
-        else {
-            size_t s = 32;
-            while (s < new_data_size) {
-                if (s > SIZE_MAX / 2) goto fail;
-                s *= 2;
-            }
-            new_data_size = s;
-        }
+        size_t new_data_size;
+        if (!ray_cell_growth_request(ray_block_data_bytes(vec), required, &new_data_size))
+            goto fail;
         ray_t* new_vec = ray_scratch_realloc(vec, new_data_size);
         if (!new_vec || RAY_IS_ERR(new_vec)) {
             if (vec != original) ray_release(vec);
@@ -285,7 +283,7 @@ fail:
  *
  * Append `count` raw elements with one capacity reserve and one memcpy.
  * Same contract as ray_vec_append (COW when shared, index drop, amortized
- * power-of-two growth, original left alive on failure), minus the
+ * geometric growth, original left alive on failure), minus the
  * per-element call overhead — this is the batch-ingest primitive.
  *
  * The raw cells are copied verbatim, sentinels included; the caller
@@ -303,27 +301,23 @@ ray_t* ray_vec_append_raw(ray_t* vec, const void* src, int64_t count) {
     if (count == 0) return vec;
     if (!src) return ray_error("domain", "vec_append_raw: source pointer is null but count is %lld", (long long)count);
 
+    uint8_t esz = ray_sym_elem_size(vec->type, vec->attrs);
+    size_t required;
+    if (!ray_cell_growth_bytes(vec->len, count, esz, &required))
+        return ray_error("oom", NULL);
+
     ray_t* original = vec;
     vec = ray_cow(vec);
     if (!vec || RAY_IS_ERR(vec)) return vec;
 
     vec_drop_index_inplace(vec);
 
-    uint8_t esz = ray_sym_elem_size(vec->type, vec->attrs);
     int64_t cap = vec_capacity(vec);
 
-    if (vec->len > INT64_MAX - count) goto fail;
     if (vec->len + count > cap) {
-        size_t new_data_size = (size_t)(vec->len + count) * esz;
-        if (new_data_size < 32) new_data_size = 32;
-        else {
-            size_t s = 32;
-            while (s < new_data_size) {
-                if (s > SIZE_MAX / 2) goto fail;
-                s *= 2;
-            }
-            new_data_size = s;
-        }
+        size_t new_data_size;
+        if (!ray_cell_growth_request(ray_block_data_bytes(vec), required, &new_data_size))
+            goto fail;
         ray_t* new_vec = ray_scratch_realloc(vec, new_data_size);
         if (!new_vec || RAY_IS_ERR(new_vec)) {
             if (vec != original) ray_release(vec);
@@ -681,6 +675,11 @@ ray_t* ray_vec_insert_at(ray_t* vec, int64_t idx, const void* elem) {
     if (idx < 0 || idx > vec->len) return ray_error("range", "vec_insert_at: index out of bounds [0,%lld], got %lld", (long long)vec->len, (long long)idx);
 
     /* COW: if shared, copy first */
+    uint8_t esz = ray_sym_elem_size(vec->type, vec->attrs);
+    size_t required;
+    if (!ray_cell_growth_bytes(vec->len, 1, esz, &required))
+        return ray_error("oom", NULL);
+
     ray_t* original = vec;
     vec = ray_cow(vec);
     if (!vec || RAY_IS_ERR(vec)) return vec;
@@ -689,21 +688,13 @@ ray_t* ray_vec_insert_at(ray_t* vec, int64_t idx, const void* elem) {
      * accelerator index is now stale. */
     vec_drop_index_inplace(vec);
 
-    uint8_t esz = ray_sym_elem_size(vec->type, vec->attrs);
     int64_t cap = vec_capacity(vec);
 
     /* Grow if needed */
     if (vec->len >= cap) {
-        size_t new_data_size = (size_t)(vec->len + 1) * esz;
-        if (new_data_size < 32) new_data_size = 32;
-        else {
-            size_t s = 32;
-            while (s < new_data_size) {
-                if (s > SIZE_MAX / 2) goto fail_oom;
-                s *= 2;
-            }
-            new_data_size = s;
-        }
+        size_t new_data_size;
+        if (!ray_cell_growth_request(ray_block_data_bytes(vec), required, &new_data_size))
+            goto fail_oom;
         ray_t* new_vec = ray_scratch_realloc(vec, new_data_size);
         if (!new_vec || RAY_IS_ERR(new_vec)) {
             if (vec != original) ray_release(vec);
@@ -1197,6 +1188,10 @@ ray_t* ray_str_vec_append(ray_t* vec, const char* s, size_t len) {
     if (vec->type != RAY_STR) return ray_error("type", "str_vec_append: expects a str vector, got %s", ray_type_name(vec->type));
     if (len > UINT32_MAX) return ray_error("range", "str_vec_append: string length exceeds %lld bytes, got %lld", (long long)UINT32_MAX, (long long)len);
 
+    size_t required;
+    if (!ray_cell_growth_bytes(vec->len, 1, sizeof(ray_str_t), &required))
+        return ray_error("oom", NULL);
+
     ray_t* original = vec;
     vec = ray_cow(vec);
     if (!vec || RAY_IS_ERR(vec)) return vec;
@@ -1212,16 +1207,9 @@ ray_t* ray_str_vec_append(ray_t* vec, const char* s, size_t len) {
     /* Grow element array if needed — pool is already ready */
     int64_t cap = vec_capacity(vec);
     if (vec->len >= cap) {
-        size_t new_data_size = (size_t)(vec->len + 1) * sizeof(ray_str_t);
-        if (new_data_size < 32) new_data_size = 32;
-        else {
-            size_t s2 = 32;
-            while (s2 < new_data_size) {
-                if (s2 > SIZE_MAX / 2) goto fail_oom;
-                s2 *= 2;
-            }
-            new_data_size = s2;
-        }
+        size_t new_data_size;
+        if (!ray_cell_growth_request(ray_block_data_bytes(vec), required, &new_data_size))
+            goto fail_oom;
         ray_t* nv = ray_scratch_realloc(vec, new_data_size);
         if (!nv || RAY_IS_ERR(nv)) goto fail_oom;
         vec = nv;
