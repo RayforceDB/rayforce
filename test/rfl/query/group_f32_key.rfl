@@ -10,18 +10,18 @@
 (set T (select {from: (table [p s x] (list (as 'F64 (% (til N) 10)) (take ['a 'b] N) (til N))) p: (as 'F32 p) s: s x: x}))
 (set R (select {from: T by: p c: (count x) asc: p}))
 (count R) -- 10
-(at R 'p) -- (as 'F64 (til 10))
+(at R 'p) -- (as 'F32 (til 10))
 (at R 'c) -- (take [10000] 10)
 (set Rd (select {from: T by: p n: (count (distinct x)) asc: p}))
-(at Rd 'p) -- (as 'F64 (til 10))
+(at Rd 'p) -- (as 'F32 (til 10))
 (at Rd 'n) -- (take [10000] 10)
 (set Rc (select {from: T by: [p s] c: (count x) n: (count (distinct x)) asc: [p s]}))
 (count Rc) -- 10
-(at Rc 'p) -- (as 'F64 (til 10))
+(at Rc 'p) -- (as 'F32 (til 10))
 (at Rc 's) -- (take ['a 'b] 10)
 (at Rc 'c) -- (take [10000] 10)
 (at Rc 'n) -- (take [10000] 10)
-(at (select {from: T by: [s p] c: (count x) asc: [s p]}) 'p) -- (as 'F64 [0 2 4 6 8 1 3 5 7 9])
+(at (select {from: T by: [s p] c: (count x) asc: [s p]}) 'p) -- (as 'F32 [0 2 4 6 8 1 3 5 7 9])
 ;; -0.0 and +0.0 are one group on the parallel path too, and a null key its own
 (set Z (select {from: (table [z s x] (list (as 'F64 (% (til N) 4)) (take ['a 'b] N) (til N))) z: (as 'F32 (* (if (== z 1.0) -1.0 1.0) (if (< z 2.0) 0.0 z))) s: s x: x}))
 (at (select {from: Z by: z c: (count x) asc: z}) 'c) -- [50000 25000 25000]
