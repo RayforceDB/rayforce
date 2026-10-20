@@ -9099,6 +9099,45 @@ static test_result_t test_exec_head_filter_chain_domain(void) {
     PASS();
 }
 
+/* SELECT over FILTER(flag == 1, CONST(input)) whose columns share one
+ * MUL(FILLS(amount), 2) node: the node itself first, then SUMS of it, then
+ * ADD(node, 0) — SUMS and ADD are its two DAG consumers, which arms the
+ * memo (the select's own column list is not counted).  Under the filter's
+ * selection the parallel MUL skips every block without a kept row, so a
+ * memo of that value would hand SUMS unwritten rows; SUMS reads every row,
+ * so kept row i must be 2 * (i + 1), as a serial sum. */
+static test_result_t test_exec_memo_under_selection(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    enum { N = 2 * RAY_PARALLEL_THRESHOLD, EDGE = 100 };
+    ray_t* tbl = make_chain_table(N, 0, CHAIN_FLAG_EDGES);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* kept = ray_filter(g, ray_const_table(g, tbl),
+                                ray_eq(g, ray_scan(g, "flag"), ray_const_i64(g, 1)));
+    ray_op_t* twice = ray_mul(g, ray_fills_op(g, ray_scan(g, "amount")),
+                              ray_const_i64(g, 2));
+    ray_op_t* cols[] = { ray_scan(g, "id"), twice, ray_sums_op(g, twice),
+                         ray_add(g, twice, ray_const_i64(g, 0)) };
+    ray_t* result = ray_execute(g, ray_select_op(g, kept, cols, 4));
+    ray_graph_free(g);
+
+    TEST_ASSERT_NOT_NULL(result);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(ray_table_nrows(result), 2 * EDGE);
+    const int64_t* ids = (const int64_t*)ray_data(ray_table_get_col_idx(result, 0));
+    const int64_t* sums = (const int64_t*)ray_data(ray_table_get_col_idx(result, 2));
+    for (int64_t i = 0; i < 2 * EDGE; i++)
+        TEST_ASSERT_EQ_I(sums[i], 2 * (ids[i] + 1));
+
+    ray_release(result);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 /* SELECT over FILTER(flag == 1, CONST(input)) of one order op over
  * MUL(FILLS(amount), id) = id, flag on the first EDGE rows only.  Under the
  * filter's selection the parallel MUL writes the first block alone; the
@@ -17913,6 +17952,7 @@ const test_entry_t exec_entries[] = {
     { "exec/head_filter_input_error",          test_exec_head_filter_input_error,          NULL, NULL },
     { "exec/head_filter_pred_error",           test_exec_head_filter_pred_error,           NULL, NULL },
     { "exec/head_filter_chain_domain",         test_exec_head_filter_chain_domain,         NULL, NULL },
+    { "exec/memo_under_selection",             test_exec_memo_under_selection,             NULL, NULL },
     { "exec/order_ops_under_selection",        test_exec_order_ops_under_selection,        NULL, NULL },
     { "exec/select_expr_col_error",            test_exec_select_expr_col_error,            NULL, NULL },
     { "exec/streaming_large_dag",              test_exec_streaming_large_dag,              NULL, NULL },

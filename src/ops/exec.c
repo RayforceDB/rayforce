@@ -3402,8 +3402,10 @@ ray_t* exec_node(ray_graph_t* g, ray_op_t* op) {
             _prof_result->type == RAY_TABLE ? ray_table_nrows(_prof_result) : 0);
 
     /* First consumer of a shared node: keep a ref for the others (a lazy
-     * value is not kept — materialising it is the consumer's business). */
-    if (memo_shared && _prof_result && !RAY_IS_ERR(_prof_result) &&
+     * value is not kept — materialising it is the consumer's business).
+     * Nor is one computed under a selection: rows it drops may be left
+     * unwritten, and a whole-vector reader recomputes over every row. */
+    if (memo_shared && !g->selection && _prof_result && !RAY_IS_ERR(_prof_result) &&
         !ray_is_lazy(_prof_result) && g->memo_uses && g->table == g->memo_table &&
         !g->memo_vals[op->id]) {
         ray_retain(_prof_result);
