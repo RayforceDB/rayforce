@@ -1625,7 +1625,7 @@ static int filter_rank_key(ray_graph_t* g, ray_op_t* pred) {
  * Filters preserve schema; an unsafe predicate may be an immovable barrier
  * inside this ancestry.  Do not infer correspondence through a group, join,
  * projection, order/position change, or a registered secondary scan. */
-static bool filter_input_default_domain(ray_graph_t* g, uint32_t id) {
+bool filter_input_default_domain(ray_graph_t* g, uint32_t id) {
     if (!g || !g->nodes) return false;
     uint32_t budget = g->node_count;
     while (budget--) {

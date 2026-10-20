@@ -752,3 +752,56 @@ ray_t* ray_rowsel_intersect(ray_t* a, ray_t* b) {
     oo[ns] = cum;
     return out;
 }
+
+ray_t* ray_rowsel_head(ray_t* sel, int64_t limit) {
+    if (!sel) return NULL;
+    ray_rowsel_t* m = ray_rowsel_meta(sel);
+    const uint8_t* fl = ray_rowsel_flags(sel);
+    const uint32_t* off = ray_rowsel_offsets(sel);
+    const uint16_t* ix = ray_rowsel_idx(sel);
+    uint32_t ns = m->n_segs;
+    if (limit < 0) limit = 0;
+    if (limit > m->total_pass) limit = m->total_pass;
+
+    /* Segments [0, whole) are kept as they are; cut_n rows of segment
+     * `whole` finish the head. */
+    uint32_t whole = 0;
+    int64_t kept = 0, cut_n = 0, idx_count = 0;
+    for (; whole < ns && kept < limit; whole++) {
+        int64_t ss = (int64_t)whole * RAY_MORSEL_ELEMS;
+        int64_t se = ss + RAY_MORSEL_ELEMS;
+        if (se > m->nrows) se = m->nrows;
+        int64_t pc = fl[whole] == RAY_SEL_NONE ? 0
+                   : fl[whole] == RAY_SEL_ALL  ? se - ss
+                   : (int64_t)(off[whole + 1] - off[whole]);
+        if (kept + pc > limit) { cut_n = limit - kept; idx_count += cut_n; break; }
+        kept += pc;
+        if (fl[whole] == RAY_SEL_MIX) idx_count += pc;
+    }
+
+    ray_t* out = ray_rowsel_new(m->nrows, limit, idx_count);
+    if (!out) return NULL;
+    uint8_t* of = ray_rowsel_flags(out);
+    uint32_t* oo = ray_rowsel_offsets(out);
+    uint16_t* oi = ray_rowsel_idx(out);
+    uint32_t cum = 0;
+    for (uint32_t s = 0; s < ns; s++) {
+        oo[s] = cum;
+        if (s < whole) {
+            of[s] = fl[s];
+            if (fl[s] == RAY_SEL_MIX) {
+                uint32_t pc = off[s + 1] - off[s];
+                memcpy(oi + cum, ix + off[s], pc * sizeof(uint16_t));
+                cum += pc;
+            }
+        } else if (s == whole && cut_n > 0) {
+            of[s] = RAY_SEL_MIX;
+            for (int64_t i = 0; i < cut_n; i++)
+                oi[cum++] = fl[s] == RAY_SEL_ALL ? (uint16_t)i : ix[off[s] + i];
+        } else {
+            of[s] = RAY_SEL_NONE;
+        }
+    }
+    oo[ns] = cum;
+    return out;
+}

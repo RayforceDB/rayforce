@@ -259,7 +259,41 @@ static int fp_check_in(ray_t* expr, ray_t* tbl) {
  *   pred  = simple_cmp | (and simple_cmp simple_cmp …)
  *   simple_cmp = (op col const) where op ∈ {==, !=, <, <=, >, >=}
  *   ordering ops require col to be a numeric/temporal (non-SYM) column.
- *   AND fan-in is bounded by FP_PRED_MAX_CHILDREN (defined in fused_pred.h). */
+ *   AND fan-in is bounded by FP_PRED_MAX_CHILDREN (defined in fused_pred.h).
+ *
+ * A nested `and` is the flat `and` of its leaves: fp_compile_pred_dag
+ * walks nested OP_AND nodes into one child list, so (and (and a b) c) runs
+ * as (and a b c).  The leaf cap counts across the nesting. */
+
+static int fp_is_and(ray_t* expr) {
+    if (!expr || expr->type != RAY_LIST || ray_len(expr) < 2) return 0;
+    ray_t** elems = (ray_t**)ray_data(expr);
+    if (!elems[0] || elems[0]->type != -RAY_SYM) return 0;
+    ray_t* head_sym = ray_sym_str(elems[0]->i64);
+    return head_sym && ray_str_len(head_sym) == 3 &&
+           memcmp(ray_str_ptr(head_sym), "and", 3) == 0;
+}
+
+/* Add the leaves of `(and …)` to *n_leaves; 0 once a leaf is not a fused
+ * comparison or the leaves pass the cap.  Every level holds a leaf or an
+ * `and`, so FP_PRED_MAX_CHILDREN also bounds the depth. */
+static int fp_and_leaves_supported(ray_t* expr, ray_t* tbl, int* n_leaves, int depth) {
+    if (depth > FP_PRED_MAX_CHILDREN) return 0;
+    int64_t n = ray_len(expr);
+    ray_t** elems = (ray_t**)ray_data(expr);
+    for (int64_t i = 1; i < n; i++) {
+        ray_t* leaf = elems[i];
+        if (fp_is_and(leaf)) {
+            if (!fp_and_leaves_supported(leaf, tbl, n_leaves, depth + 1)) return 0;
+            continue;
+        }
+        if (++*n_leaves > FP_PRED_MAX_CHILDREN) return 0;
+        if (fp_check_simple_cmp(leaf, tbl) < 0
+            && !fp_check_like(leaf, tbl)
+            && !fp_check_in(leaf, tbl)) return 0;
+    }
+    return 1;
+}
 
 int ray_fused_group_supported(ray_t* expr, ray_t* tbl) {
     if (!expr || expr->type != RAY_LIST) return 0;
@@ -268,21 +302,9 @@ int ray_fused_group_supported(ray_t* expr, ray_t* tbl) {
     ray_t** elems = (ray_t**)ray_data(expr);
     if (!elems[0] || elems[0]->type != -RAY_SYM) return 0;
 
-    /* Detect (and …). */
-    ray_t* head_sym = ray_sym_str(elems[0]->i64);
-    if (head_sym) {
-        size_t hlen = ray_str_len(head_sym);
-        const char* hstr = ray_str_ptr(head_sym);
-        if (hlen == 3 && memcmp(hstr, "and", 3) == 0) {
-            int64_t k = n - 1;
-            if (k < 1 || k > FP_PRED_MAX_CHILDREN) return 0;
-            for (int64_t i = 0; i < k; i++) {
-                if (fp_check_simple_cmp(elems[i + 1], tbl) < 0
-                    && !fp_check_like(elems[i + 1], tbl)
-                    && !fp_check_in(elems[i + 1], tbl)) return 0;
-            }
-            return 1;
-        }
+    if (fp_is_and(expr)) {
+        int n_leaves = 0;
+        return fp_and_leaves_supported(expr, tbl, &n_leaves, 0);
     }
     /* Fall through: single simple cmp. */
     return (fp_check_simple_cmp(expr, tbl) >= 0 ||
