@@ -38,6 +38,10 @@
 /* Forward declaration — defined below, used by type inference and DCE passes. */
 ray_op_ext_t* find_ext(ray_graph_t* g, uint32_t node_id);
 
+/* Shared resolved-expression dependency proof (exec.c/internal.h).  Keep
+ * the optimizer's local edge accessors rather than including internal.h. */
+bool ray_expr_subset_invariant(ray_graph_t* g, uint32_t root_id);
+
 /* Shared 32-byte node allocator (graph.c).  Forwarded by graph_alloc_node_opt;
  * node ids are realloc-stable so no pointer fixups are needed. */
 ray_op_t* graph_alloc_node(ray_graph_t* g);
@@ -1617,11 +1621,44 @@ static int filter_rank_key(ray_graph_t* g, ray_op_t* pred) {
     return filter_selectivity_rank(g, pred) * 100 + filter_cost(g, pred);
 }
 
-/* Split FILTER(AND(a, b), input) into FILTER(a, FILTER(b, input)).
+/* A reorderable filter run must stay in the default table's row domain.
+ * Filters preserve schema; an unsafe predicate may be an immovable barrier
+ * inside this ancestry.  Do not infer correspondence through a group, join,
+ * projection, order/position change, or a registered secondary scan. */
+bool filter_input_default_domain(ray_graph_t* g, uint32_t id) {
+    if (!g || !g->nodes) return false;
+    uint32_t budget = g->node_count;
+    while (budget--) {
+        if (id >= g->node_count) return false;
+        ray_op_t* n = &g->nodes[id];
+        if (n->id != id || (n->flags & OP_FLAG_DEAD)) return false;
+        if (n->opcode == OP_FILTER) {
+            if (n->arity != 2 || n->in_id[1] >= g->node_count) return false;
+            id = n->in_id[0];
+        } else if (n->opcode == OP_ALIAS || n->opcode == OP_MATERIALIZE) {
+            if (n->arity != 1) return false;
+            id = n->in_id[0];
+        } else if (n->opcode == OP_SCAN) {
+            return ray_expr_subset_invariant(g, id);
+        } else if (n->opcode == OP_CONST) {
+            ray_op_ext_t* x = find_ext(g, id);
+            return n->arity == 0 && x && g->table &&
+                   g->table->type == RAY_TABLE && x->literal == g->table;
+        } else {
+            return false;
+        }
+    }
+    return false;  /* cyclic or unproved ancestry */
+}
+
+/* Split FILTER(AND(a, b), input) into FILTER(b, FILTER(a, input)) only
+ * when both complete limbs preserve verdicts under a source-row subset.
  * Returns the new outer filter node, or the original if no split. */
 static ray_op_t* split_and_filter(ray_graph_t* g, ray_op_t* filter_node) {
     if (!filter_node || filter_node->opcode != OP_FILTER) return filter_node;
-    if (filter_node->arity != 2) return filter_node;
+    if (filter_node->arity != 2 ||
+        filter_node->in_id[0] >= g->node_count ||
+        filter_node->in_id[1] >= g->node_count) return filter_node;
 
     ray_op_t* pred = op_child(g, filter_node, 1);
     if (!pred || pred->opcode != OP_AND || pred->arity != 2) return filter_node;
@@ -1638,6 +1675,8 @@ static ray_op_t* split_and_filter(ray_graph_t* g, ray_op_t* filter_node) {
      * on an agg-output ref, row-count mismatch on a key ref).  Left intact, the
      * single FILTER(AND, GROUP) is handled correctly by the HAVING fusion. */
     if (input->opcode == OP_GROUP) return filter_node;
+    if (!filter_input_default_domain(g, input->id) ||
+        !ray_expr_subset_invariant(g, pred->id)) return filter_node;
 
     /* Save IDs before potential realloc */
     uint32_t filter_id = filter_node->id;
@@ -1675,8 +1714,15 @@ static ray_op_t* split_and_filter(ray_graph_t* g, ray_op_t* filter_node) {
 static int collect_filter_chain(ray_graph_t* g, ray_op_t* top, ray_op_t** chain, int max) {
     int n = 0;
     ray_op_t* cur = top;
+    if (!top || !filter_input_default_domain(g, top->id)) return 0;
     while (cur && cur->opcode == OP_FILTER &&
            !(cur->flags & OP_FLAG_PUSHED) && n < max) {
+        if ((cur->flags & OP_FLAG_DEAD) || cur->arity != 2 ||
+            cur->in_id[0] >= g->node_count ||
+            cur->in_id[1] >= g->node_count ||
+            !ray_expr_subset_invariant(g, cur->in_id[1])) break;
+        /* Stop BEFORE the unsafe predicate: it is a domain barrier, not
+         * an expensive predicate that may be sorted across its neighbors. */
         chain[n++] = cur;
         cur = op_child(g, cur, 0);
     }

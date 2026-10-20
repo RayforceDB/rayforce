@@ -1378,7 +1378,7 @@ static ray_t* cast_vec_numeric(ray_t* type_sym, ray_t* val, int8_t out_type) {
 
 ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
     if (type_sym->type != -RAY_SYM) return ray_error("type", "as: target type must be sym, got %s", ray_type_name(type_sym->type));
-    /* Null propagation: casting a typed null atom produces a typed null of target type */
+    /* Nullable targets preserve nulls; BOOL/U8 produce ordinary values. */
     if (ray_is_atom(val) && RAY_ATOM_IS_NULL(val)) {
         ray_t* s2 = ray_sym_str(type_sym->i64);
         if (!s2) return ray_error("domain", NULL);
@@ -1399,6 +1399,12 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         else if (cast_match(tn, tl, "GUID") || cast_match(tn, tl, "guid")) tt = -RAY_GUID;
         else if (cast_match(tn, tl, "STR") || cast_match(tn, tl, "str")) { ray_release(s2); return ray_str("", 0); }
         ray_release(s2);
+        if (tt == -RAY_U8) return ray_u8(0);
+        if (tt == -RAY_BOOL) {
+            /* Numeric and temporal null sentinels are non-zero. Empty
+             * text and zero-payload internal nulls convert to false. */
+            return make_bool(val->type <= -RAY_I16 && val->type >= -RAY_TIMESTAMP);
+        }
         if (tt) return ray_typed_null(tt);
         return ray_error("domain", "as: unknown target type name");
     }

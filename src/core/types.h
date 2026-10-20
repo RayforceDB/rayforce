@@ -84,7 +84,8 @@ static inline uint8_t ray_cast_f64_to_u8_null(double v) {
 }
 
 static inline uint8_t ray_cast_f64_to_bool_null(double v) {
-    return (v == v && v != 0.0) ? 1 : 0;
+    /* BOOL has no null: every non-zero value, including NaN, is true. */
+    return v != 0.0 ? 1 : 0;
 }
 
 /* Two's-complement wraparound integer add/mul.  Signed overflow is UB in C;

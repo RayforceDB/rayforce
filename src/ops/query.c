@@ -15292,8 +15292,11 @@ by_dict_done:
 
     /* Apply WHERE filter. */
     if (where_expr) {
+        uint32_t where_input_id = root->id;
         /* When the WHERE is `(and a b c …)`, compile each conjunct as its
-         * own OP_FILTER.
+         * own OP_FILTER only when every complete subtree is invariant
+         * under default-source row restriction.  A reduction or running
+         * descendant must see the original WHERE input, not prior survivors.
          * exec_filter on a TABLE input refines g->selection in place via
          * ray_rowsel_refine, so subsequent conjuncts only need to make
          * their predicate's output bool VALID for surviving rows — the
@@ -15325,16 +15328,11 @@ by_dict_done:
                      * to the existing OP_AND tree, which ray_optimize
                      * already constant-folds. */
                     int all_ok = 1;
-                    /* `reorder_safe` flips to 0 when any conjunct contains
-                     * an op that can fault, error or have observable
-                     * side effects — division, modulo, call into a user
-                     * function, etc.  In that case we still chain the
-                     * conjuncts as separate filters (the selection-aware
-                     * win), but evaluate them in user-given order so an
-                     * earlier guard like `(!= y 0)` keeps protecting a
-                     * later `(< (/ x y) 10)`. */
+                    /* Keep the existing conservative error/order cost
+                     * policy in addition to the domain proof.  This flag
+                     * alone never licenses chaining a cross-row expression. */
                     int reorder_safe = 1;
-                    ray_op_t* compiled[64];
+                    uint32_t compiled[64];
                     int       cost[64];
                     if (k > 64) all_ok = 0;
                     /* Each conjunct must compile, must not be a pure
@@ -15349,8 +15347,14 @@ by_dict_done:
                      * evaluate over a far smaller rowsel. */
                     for (int64_t i = 0; i < k && all_ok; i++) {
                         ray_op_t* p = compile_expr_dag(g, elems[i + 1]);
-                        if (!p || p->opcode == OP_CONST) { all_ok = 0; break; }
-                        /* Walk the sub-DAG via stack DFS, looking for
+                        if (!p || p->opcode == OP_CONST ||
+                            !ray_expr_subset_invariant(g, p->id)) {
+                            all_ok = 0;
+                            break;
+                        }
+                        /* Cost only: the complete dependency proof above
+                         * covers hidden operands and fails closed on limits.
+                         * Walk the sub-DAG via stack DFS, looking for
                          * any OP_SCAN; tally cost contributions along
                          * the way.  Bound the depth to keep this check
                          * cheap on degenerate trees. */
@@ -15358,8 +15362,10 @@ by_dict_done:
                         int c = 0;
                         ray_op_t* stk[64];
                         int sp = 0;
+                        uint32_t cost_budget = 4096;
                         stk[sp++] = p;
-                        while (sp > 0) {
+                        while (sp > 0 && cost_budget > 0) {
+                            cost_budget--;
                             ray_op_t* cur = stk[--sp];
                             if (cur->opcode == OP_SCAN) has_scan = 1;
                             /* Coarse per-node cost: comparison ops are
@@ -15385,15 +15391,10 @@ by_dict_done:
                                 break;  /* leaves — no compute cost */
                             default:
                                 c += 5;
-                                /* Unknown op — could be arithmetic that
-                                 * faults (OP_DIV / OP_MOD divide-by-zero),
-                                 * a user-defined call with side effects,
-                                 * or any op whose error behavior depends
-                                 * on what the prior conjuncts already
-                                 * filtered out.  Keep this conjunct in
-                                 * its user-given position so a guard like
-                                 * `(!= y 0)` continues to short-circuit
-                                 * a later `(< (/ x y) 10)`. */
+                                /* Do not broaden the old cost-based order
+                                 * policy merely because the expression is
+                                 * now proved row-local.  Domain admission
+                                 * and error/order conservatism are separate. */
                                 reorder_safe = 0;
                                 break;
                             }
@@ -15402,8 +15403,10 @@ by_dict_done:
                                 if (ch) stk[sp++] = ch;
                             }
                         }
+                        if (sp > 0) reorder_safe = 0;  /* truncated cost, not a proof */
                         if (!has_scan) { all_ok = 0; break; }
-                        compiled[i] = p;
+                        /* Later conjunct compilation may grow g->nodes. */
+                        compiled[i] = p->id;
                         cost[i] = c;
                     }
                     if (all_ok) {
@@ -15428,8 +15431,13 @@ by_dict_done:
                                 }
                             }
                         }
-                        for (int64_t i = 0; i < k; i++)
-                            root = ray_filter(g, root, compiled[order[i]]);
+                        uint32_t input_id = where_input_id;
+                        for (int64_t i = 0; i < k; i++) {
+                            root = ray_filter(g, op_node(g, input_id),
+                                              op_node(g, compiled[order[i]]));
+                            if (!root) break;
+                            input_id = root->id;
+                        }
                         and_chained = 1;
                     }
                 }
@@ -15445,7 +15453,12 @@ by_dict_done:
                 return pred_err ? pred_err :
                     ray_error("domain", "select: failed to evaluate `where:` predicate");
             }
-            root = ray_filter(g, root, pred);
+            root = ray_filter(g, op_node(g, where_input_id), pred);
+        }
+        if (!root) {
+            ray_graph_free(g); ray_release(tbl);
+            scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv);
+            return ray_error("oom", NULL);
         }
     }
 

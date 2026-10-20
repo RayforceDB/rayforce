@@ -1829,32 +1829,26 @@ static void expr_exec_unary(uint8_t opcode, uint8_t null_aware, int8_t dt, void*
                 for (int64_t j = 0; j < n; j++) d[j] = (a[j] == NULL_I64) ? 1 : 0;
             }
         } else if (opcode == OP_CAST) {
-            /* (as 'BOOL ...) — truthy semantics, but treat null sentinel
-             * as false (BOOL is non-nullable, so we can't preserve null
-             * structurally; a SQL-style "missing → not true" mapping is
-             * the least-surprising convention).  For F64, NULL_F64 = NaN:
-             * the IEEE `NaN != 0.0` is true, so add an explicit NaN check
-             * (`a[j] == a[j]` is false iff NaN).  For I64, NULL_I64 =
-             * INT64_MIN is a regular non-zero value, so skip it. */
+            /* BOOL has no null; only numeric zero converts to false. */
             if (t1 == RAY_F64) {
                 const double* a = (const double*)ap;
                 for (int64_t j = 0; j < n; j++)
-                    d[j] = (a[j] != 0.0 && a[j] == a[j]) ? 1 : 0;
+                    d[j] = ray_cast_f64_to_bool_null(a[j]);
             } else if (t1 == RAY_I32) {
                 const int32_t* a = (const int32_t*)ap;
                 for (int64_t j = 0; j < n; j++)
-                    d[j] = (a[j] != 0 && a[j] != NULL_I32) ? 1 : 0;
+                    d[j] = a[j] != 0 ? 1 : 0;
             } else if (t1 == RAY_I16) {
                 const int16_t* a = (const int16_t*)ap;
                 for (int64_t j = 0; j < n; j++)
-                    d[j] = (a[j] != 0 && a[j] != NULL_I16) ? 1 : 0;
+                    d[j] = a[j] != 0 ? 1 : 0;
             } else if (t1 == RAY_BOOL || t1 == RAY_U8) {
                 const uint8_t* a = (const uint8_t*)ap;
                 for (int64_t j = 0; j < n; j++) d[j] = a[j] ? 1 : 0;
             } else {
                 const int64_t* a = (const int64_t*)ap;
                 for (int64_t j = 0; j < n; j++)
-                    d[j] = (a[j] != 0 && a[j] != NULL_I64) ? 1 : 0;
+                    d[j] = a[j] != 0 ? 1 : 0;
             }
         } else if (opcode == OP_NOT) {
             /* The source lane keeps its producer's width: a REG_SCAN of a
@@ -3795,14 +3789,13 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
         }
     } else if (in_type == RAY_I64 && out_type == RAY_BOOL && opc == OP_CAST) {
         {
-            /* (as 'BOOL i64_col) — truthy semantics; NULL_I64 = INT64_MIN
-             * sentinel is non-zero but logically missing, so skip it. */
+            /* BOOL has no null; its integer null sentinel is non-zero. */
             while (ray_morsel_next(&m)) {
                 int64_t n = m.morsel_len;
                 int64_t* src = (int64_t*)m.morsel_ptr;
                 uint8_t* dst = (uint8_t*)((char*)ray_data(result) + out_off);
                 for (int64_t i = 0; i < n; i++)
-                    dst[i] = (src[i] != 0 && src[i] != NULL_I64) ? 1 : 0;
+                    dst[i] = src[i] != 0 ? 1 : 0;
                 out_off += n;
             }
         }
@@ -3860,9 +3853,8 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
                 if (out_type == RAY_I32)      ((int32_t*)dst)[i] = (int32_t)v;
                 else if (out_type == RAY_I16) ((int16_t*)dst)[i] = (int16_t)v;
                 else if (out_type == RAY_U8)  ((uint8_t*)dst)[i] = (uint8_t)v;
-                else /* BOOL: a null is not true, as in the I64 and F64 arms */
-                    ((uint8_t*)dst)[i] = v != 0 && !(it == RAY_I32 && v == NULL_I32) &&
-                                         !(it == RAY_I16 && v == NULL_I16);
+                else /* BOOL: a non-zero null sentinel also becomes true. */
+                    ((uint8_t*)dst)[i] = v != 0;
             }
             out_off += n;
         }
@@ -3992,9 +3984,7 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
                     double* src = (double*)m.morsel_ptr;
                     uint8_t* dst = (uint8_t*)((char*)ray_data(result) + out_off);
                     if (ot == RAY_BOOL)
-                        /* NaN (NULL_F64 sentinel) is "missing"; IEEE
-                         * `NaN != 0.0` is true so add an explicit
-                         * `src[i] == src[i]` to filter NaN to false. */
+                        /* Non-zero values, including NaN, become true. */
                         for (int64_t i = 0; i < n; i++)
                             dst[i] = ray_cast_f64_to_bool_null(src[i]);
                     else
@@ -4007,7 +3997,8 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
 
     /* Propagate null bitmap from input to result.  OP_ISNULL never reaches
      * here — it is handled and returned before the typed dispatch above. */
-    if (vec_may_have_nulls(input))
+    if (vec_may_have_nulls(input) &&
+        !(opc == OP_CAST && (out_type == RAY_BOOL || out_type == RAY_U8)))
         propagate_nulls(input, result, len);
 
     /* OP_NEG/OP_ABS over i64: |INT64_MIN| and -INT64_MIN don't fit — surface

@@ -9005,6 +9005,96 @@ static test_result_t test_exec_head_filter_pred_error(void) {
     PASS();
 }
 
+/* 6000 rows: id = id_base + row, amount 1, flag on the first and last 100
+ * rows, or on every even row. */
+static ray_t* make_chain_table(int64_t id_base, bool even_flag) {
+    enum { N = 6000 };
+    ray_t* id = ray_vec_new(RAY_I64, N);
+    ray_t* amount = ray_vec_new(RAY_I64, N);
+    ray_t* flag = ray_vec_new(RAY_I64, N);
+    id->len = amount->len = flag->len = N;
+    for (int64_t i = 0; i < N; i++) {
+        ((int64_t*)ray_data(id))[i] = id_base + i;
+        ((int64_t*)ray_data(amount))[i] = 1;
+        ((int64_t*)ray_data(flag))[i] = even_flag ? i % 2 == 0
+                                                  : (i < 100 || i >= N - 100);
+    }
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("id", 2), id);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("amount", 6), amount);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("flag", 4), flag);
+    ray_release(id);
+    ray_release(amount);
+    ray_release(flag);
+    return tbl;
+}
+
+/* HEAD(limit, FILTER(term, FILTER(flag == 1, CONST(input)))) over a graph
+ * whose default table is `deflt`. */
+static ray_t* exec_head_filter_chain(ray_t* deflt, ray_t* input, bool running,
+                                     int64_t bound, int64_t limit) {
+    ray_graph_t* g = ray_graph_new(deflt);
+    ray_op_t* inner = ray_filter(g, ray_const_table(g, input),
+                                 ray_eq(g, ray_scan(g, "flag"), ray_const_i64(g, 1)));
+    ray_op_t* term = running
+        ? ray_gt(g, ray_sums_op(g, ray_scan(g, "amount")), ray_const_i64(g, bound))
+        : ray_gt(g, ray_scan(g, "id"), ray_const_i64(g, bound));
+    ray_t* result = ray_execute(g, ray_head(g, ray_filter(g, inner, term), limit));
+    ray_graph_free(g);
+    return result;
+}
+
+/* HEAD over a filter chain: the outer term sees the inner filter's rows.
+ * Flag on the first and last 100 rows: a running outer term
+ * (sums(amount) > 150) keeps rows 151..200 of those 200, ids 5950..5999;
+ * a row-local one (id > 5920) keeps the first 50 past 5920, and a
+ * negative limit keeps none.  Over tables A (the default) and B with
+ * flag on even rows and B's ids from 10000, a chain on B reads B's rows. */
+static test_result_t test_exec_head_filter_chain_domain(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    ray_t* tbl = make_chain_table(0, false);
+    for (int running = 1; running >= 0; running--) {
+        ray_t* result = exec_head_filter_chain(tbl, tbl, running,
+                                               running ? 150 : 5920, 50);
+        TEST_ASSERT_NOT_NULL(result);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(ray_table_nrows(result), 50);
+        ray_t* ids = ray_table_get_col(result, ray_sym_intern("id", 2));
+        int64_t first = running ? 5950 : 5921;
+        for (int64_t i = 0; i < 50; i++)
+            TEST_ASSERT_EQ_I(((int64_t*)ray_data(ids))[i], first + i);
+        ray_release(result);
+
+        result = exec_head_filter_chain(tbl, tbl, running, 0, -1);
+        TEST_ASSERT_NOT_NULL(result);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
+        TEST_ASSERT_EQ_I(ray_table_ncols(result), 3);
+        TEST_ASSERT_EQ_I(ray_table_nrows(result), 0);
+        ray_release(result);
+    }
+
+    ray_t* deflt = make_chain_table(0, true);
+    ray_t* other = make_chain_table(10000, true);
+    ray_t* result = exec_head_filter_chain(deflt, other, false, 10000, 50);
+    TEST_ASSERT_NOT_NULL(result);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(ray_table_nrows(result), 50);
+    ray_t* ids = ray_table_get_col(result, ray_sym_intern("id", 2));
+    for (int64_t i = 0; i < 50; i++)
+        TEST_ASSERT_EQ_I(((int64_t*)ray_data(ids))[i], 10002 + 2 * i);
+    ray_release(result);
+
+    ray_release(other);
+    ray_release(deflt);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 /* ---- OP_SELECT with failing expression column — exec.c L1613-1617.
  *
  * When a SELECT projection expression evaluates to an error, the SELECT
@@ -10150,20 +10240,15 @@ static test_result_t test_expr_f64_to_narrow_cast(void) {
     ray_release(result);
     ray_graph_free(g);
 
-    /* (as 'BOOL v) on nullable F64 col — F64→BOOL CAST with NaN-handling.
-     * Regression for prior bug where NaN (= NULL_F64 sentinel) was treated
-     * as truthy because IEEE `NaN != 0.0` is true.  Fixed by adding an
-     * explicit NaN check (`src[i] == src[i]`).
-     * Raw data: [1.7, 2.3, 0.0, 4.9, 0.5] but row 2 was overwritten with
-     * NULL_F64 sentinel via ray_vec_set_null(v, 2, true).  So the seen
-     * input is [1.7, 2.3, NaN(null), 4.9, 0.5] → [1, 1, 0, 1, 1] → sum 4. */
+    /* F64→BOOL: only zero is false, so the NaN null sentinel is true.
+     * Input [1.7, 2.3, NaN, 4.9, 0.5] yields five true values. */
     g = ray_graph_new(tbl);
     col = ray_scan(g, "v");
     ray_op_t* cbool = ray_cast(g, col, RAY_BOOL);
     s = ray_sum(g, cbool);
     result = ray_execute(g, s);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    TEST_ASSERT_EQ_I(result->i64, 4);
+    TEST_ASSERT_EQ_I(result->i64, 5);
     ray_release(result);
     ray_graph_free(g);
 
@@ -11958,12 +12043,51 @@ static test_result_t test_expr_unary_i64_to_bool_cast(void) {
     ray_op_t* s   = ray_sum(g, ca);
     ray_t* result = ray_execute(g, s);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    /* cast(0)=false=0, cast(5)=true=1, cast(-3)=true=1, pos3=null=0 → sum=2 */
-    TEST_ASSERT_EQ_I(result->i64, 2);
+    /* Only zero is false; the non-zero null sentinel also casts to true. */
+    TEST_ASSERT_EQ_I(result->i64, 3);
     ray_release(result);
     ray_graph_free(g);
 
     ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* Call the typed fallback directly so expression fusion cannot mask a
+ * regression in its null-to-BOOL or post-cast null propagation rules. */
+static test_result_t test_expr_typed_null_to_bool_cast(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    const int16_t h[] = {NULL_I16, 0, -1};
+    const int32_t i[] = {NULL_I32, 0, -1};
+    const int64_t l[] = {NULL_I64, 0, -1};
+    const float e[] = {NULL_F32, 0.0f, -1.0f};
+    const double f[] = {NULL_F64, 0.0, -1.0};
+    const int8_t types[] = {RAY_I16, RAY_I32, RAY_I64, RAY_F32, RAY_F64};
+    const void* values[] = {h, i, l, e, f};
+    ray_op_t op = {.opcode = OP_CAST, .out_type = RAY_BOOL};
+
+    for (size_t k = 0; k < sizeof(types) / sizeof(types[0]); k++) {
+        ray_t* input = ray_vec_from_raw(types[k], values[k], 3);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(input));
+        ray_vec_set_null(input, 0, true);
+        ray_t* result = exec_elementwise_unary(NULL, &op, input);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->type, RAY_BOOL);
+        TEST_ASSERT_EQ_I(result->len, 3);
+        const uint8_t* data = (const uint8_t*)ray_data(result);
+        TEST_ASSERT_EQ_I(data[0], 1);
+        TEST_ASSERT_EQ_I(data[1], 0);
+        TEST_ASSERT_EQ_I(data[2], 1);
+        TEST_ASSERT_FALSE(ray_vec_may_have_nulls(result));
+        for (int64_t row = 0; row < 3; row++)
+            TEST_ASSERT_FALSE(ray_vec_is_null(result, row));
+        ray_release(result);
+        ray_release(input);
+    }
+
     ray_sym_destroy();
     ray_heap_destroy();
     PASS();
@@ -17744,6 +17868,7 @@ const test_entry_t exec_entries[] = {
     { "exec/filter_group_pred_error",          test_exec_filter_group_pred_error,          NULL, NULL },
     { "exec/head_filter_input_error",          test_exec_head_filter_input_error,          NULL, NULL },
     { "exec/head_filter_pred_error",           test_exec_head_filter_pred_error,           NULL, NULL },
+    { "exec/head_filter_chain_domain",         test_exec_head_filter_chain_domain,         NULL, NULL },
     { "exec/select_expr_col_error",            test_exec_select_expr_col_error,            NULL, NULL },
     { "exec/streaming_large_dag",              test_exec_streaming_large_dag,              NULL, NULL },
     { "exec/deep_binary_chain",                test_exec_deep_binary_chain,                NULL, NULL },
@@ -17793,6 +17918,7 @@ const test_entry_t exec_entries[] = {
     { "exec/expr_set_all_null_f32",              test_expr_set_all_null_f32,              NULL, NULL },
     { "exec/expr_unary_f64_cast_default",        test_expr_unary_f64_cast_default,        NULL, NULL },
     { "exec/expr_unary_i64_to_f64_cast",         test_expr_unary_i64_to_f64_cast,         NULL, NULL },
+    { "exec/expr_typed_null_to_bool_cast", test_expr_typed_null_to_bool_cast, NULL, NULL },
     { "exec/expr_unary_i64_to_bool_cast",        test_expr_unary_i64_to_bool_cast,        NULL, NULL },
     { "exec/expr_binary_f64_and_or",             test_expr_binary_f64_and_or,             NULL, NULL },
     { "exec/expr_sym_w32_fast_eq_ne",            test_expr_sym_w32_fast_eq_ne,            NULL, NULL },

@@ -188,7 +188,18 @@ Strings can be parsed into numeric, temporal, and symbol types with `as`. Conver
 
 ## 5. Null Semantics in Casting { #null-semantics }
 
-Null values propagate through casts. A typed null in one type becomes a typed null in the target type. Invalid string parses raise a domain error.
+Null values propagate through casts to nullable types. BOOL/B8 and U8 have
+no null value: a numeric or temporal null casts to `true` for BOOL/B8 and
+`0x00` for U8. The result is an ordinary non-null value, consistently for
+atoms, vectors, lists, and query column casts. Empty strings cast to BOOL/B8
+as `false`. Invalid numeric string parses raise a domain error.
+
+```lisp
+(as 'B8 0Nl)             ; true
+(as 'B8 [0 0Nl 1])       ; [false true true]
+(as 'U8 0Nl)             ; 0x00
+(nil? (as 'U8 0Nl))      ; false
+```
 
 ```text
 ; Casting a typed null produces a typed null

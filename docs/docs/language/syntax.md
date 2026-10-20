@@ -511,7 +511,7 @@ ray_t* result = ray_execute(g, projected);
 3. **SIP** (Sideways Information Passing) — propagate selection bitmaps backward through expand chains
 4. **Factorize** — avoid materializing cross-products with factorized vectors
 5. **Predicate pushdown** — move filters closer to data sources
-6. **Filter reorder** — cheapest filters first
+6. **Filter reorder** — rank eligible row-local filters by static selectivity and cost without crossing row-domain barriers
 7. **Fusion** — merge adjacent operations into single morsel loops
 8. **DCE** (Dead Code Elimination) — remove unused DAG nodes
 
