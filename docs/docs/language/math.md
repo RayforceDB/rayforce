@@ -548,9 +548,13 @@ Find the index of the first occurrence of `val` in vector `x`.
 ### `(xbar x n)`
 
 Round each element down to the nearest multiple of `n` (bucketing).
+A temporal `x` keeps its type. A null `x`, atom or element, gives the null of
+the result type.
 
 ```lisp
-(xbar [3 7 12 18] 5)  ; [0 5 10 15]
+(xbar [3 7 12 18] 5)       ; [0 5 10 15]
+(xbar [2000.01.10 0Nd] 7)  ; [2000.01.08 0Nd]
+(xbar 0Nd 7)               ; 0Nd
 ```
 
 ## Higher-order Functions
