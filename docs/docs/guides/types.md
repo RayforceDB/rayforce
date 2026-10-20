@@ -101,6 +101,11 @@ significant digits so casting the string back to F32 preserves the value.
 
 **Vector casts:** `as` maps element-wise over vectors.
 
+Casting to `STR` produces a flat string vector from a vector or a LIST of
+atoms. Each outer element must convert to one string atom. A nested vector or
+LIST cell is rejected with a `type` error; this cast does not implicitly format
+or flatten a whole inner collection into a string cell.
+
 ```lisp
 ; Cast an integer vector to float
 (as 'f64 [1 2 3])     ; [1.0 2.0 3.0]

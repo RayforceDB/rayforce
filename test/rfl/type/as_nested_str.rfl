@@ -1,0 +1,16 @@
+;; A flat STR result needs one string atom per input cell, not a nested vector.
+(set NestedStrSource (list [1 2] [3 4]))
+(as 'STR NestedStrSource) !- type
+NestedStrSource -- (list [1 2] [3 4])
+(as 'STR (list 7 [1 2])) !- type
+(as 'STR (list "a long first string cell" [1 2])) !- type
+(as 'STR (list (list 1 2))) !- type
+(as 'STR (list [])) !- type
+
+(as 'STR 42) -- "42"
+(as 'STR [1 2]) -- ["1" "2"]
+(as 'STR (list 1 2)) -- ["1" "2"]
+(as 'STR (list 1 true 'x)) -- ["1" "true" "x"]
+(as 'STR (list "" "text")) -- ["" "text"]
+(type (as 'STR [])) -- 'STR
+(count (as 'STR [])) -- 0

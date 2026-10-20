@@ -1700,6 +1700,14 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
                 ray_t* cast = ray_cast_fn(type_sym, elem);
                 if (alloc) ray_release(elem);
                 if (RAY_IS_ERR(cast)) { ray_release(vec); return cast; }
+                if (!cast) { ray_release(vec); return ray_error("oom", NULL); }
+                /* Each output cell needs a string atom. A nested input can
+                 * recursively produce a STR vector, not an atom to inspect. */
+                if (cast->type != -RAY_STR) {
+                    ray_release(cast);
+                    ray_release(vec);
+                    return ray_error("type", "as: STR vector elements must cast to string atoms");
+                }
                 const char* sp = ray_str_ptr(cast);
                 size_t slen = ray_str_len(cast);
                 vec = ray_str_vec_append(vec, sp ? sp : "", sp ? slen : 0);
