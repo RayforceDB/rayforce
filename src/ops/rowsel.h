@@ -189,6 +189,12 @@ ray_t* ray_rowsel_refine(ray_t* existing, ray_t* pred);
  * preserving NONE/ALL compression without materializing a bool vector. */
 ray_t* ray_rowsel_intersect(ray_t* a, ray_t* b);
 
+/* The first `limit` rows `sel` keeps (borrowed), as a fresh rowsel over
+ * the same rows: segments before the cut as they are, the cut segment MIX,
+ * NONE after it.  A limit past total_pass keeps every row.  O(n_segs +
+ * limit).  NULL on OOM. */
+ray_t* ray_rowsel_head(ray_t* sel, int64_t limit);
+
 /* ──────────────────────────────────────────────────────────────────
  * Streaming builder — per-morsel selection emitter
  *

@@ -28,9 +28,8 @@
 (format "%" [0Ng 0Ng])                -- "[0Ng 0Ng]"
 
 ;; ----- 4. as 'F32 keeps nulls -----
-;; A non-null F32 element prints as an F64 literal (Rayfall has no F32
-;; number literal), so only an all-null F32 vector reads back as F32.
+;; Non-null F32 elements retain their type through printing and parsing.
 
 (type (as 'F32 [1 0Nl 3]))            -- 'F32
 (nil? (as 'F32 [1 0Nl 3]))            -- [false true false]
-(format "%" (as 'F32 [1 0Nl 3]))      -- "[1.0 0Ne 3.0]"
+(format "%" (as 'F32 [1 0Nl 3]))      -- "[1.0e 0Ne 3.0e]"

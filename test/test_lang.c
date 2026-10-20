@@ -1618,6 +1618,130 @@ static test_result_t test_eval_select_unary_arith_dag_admission(void) {
     PASS();
 }
 
+/* ---- Test: an empty-operand type probe that fails leaves nothing behind ----
+ * An empty operand makes the atomic mappers probe `fn` on a fabricated
+ * zero atom to learn the result type.  A probe the builtin rejects —
+ * `(/ empty_DATE 2)`, `(neg empty_DATE)` — used to leak its error object
+ * and leave its message behind.  select's empty-result probe evaluates an
+ * elementwise projection over the empty columns, and a whole-column
+ * failure there (`(+ d)`, `(neg d 1)`, `(pow d 2 3)`: the wrong arity) is
+ * swallowed by query.c itself, not inside a mapper.  Repeated, through the
+ * builtins and through select, nothing stays allocated and no message is
+ * left over; the valid probe is the control. */
+static test_result_t test_eval_empty_probe_error_ownership(void) {
+    ray_t* setup = ray_eval_str("(set _EP (table [d] (list (as 'DATE []))))");
+    TEST_ASSERT_NOT_NULL(setup);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+    ray_release(setup);
+    static const char* const exprs[] = {
+        "(+ (at _EP 'd) 2)",                          /* valid: control */
+        "(/ (at _EP 'd) 2)",                          /* binary, rejected */
+        "(div (at _EP 'd) 2)",
+        "(neg (at _EP 'd))",                          /* unary, rejected */
+        "(at (select {x: (/ d 2) from: _EP}) 'x)",    /* select's probe */
+        "(at (select {x: (neg d) from: _EP}) 'x)",
+        "(at (select {x: (+ d) from: _EP}) 'x)",      /* whole-column failure, */
+        "(at (select {x: (neg d 1) from: _EP}) 'x)",  /* swallowed in query.c */
+        "(at (select {x: (pow d 2 3) from: _EP}) 'x)",
+    };
+    for (size_t e = 0; e < sizeof(exprs) / sizeof(exprs[0]); e++) {
+        /* warm up: first-use allocations (symbols, caches) are not a leak */
+        for (int i = 0; i < 4; i++) {
+            ray_t* r = ray_eval_str(exprs[e]);
+            if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+        }
+        ray_error_clear();
+        ray_mem_stats_t s0, s1;
+        ray_mem_stats(&s0);
+        for (int i = 0; i < 1000; i++) {
+            ray_t* r = ray_eval_str(exprs[e]);
+            TEST_ASSERT_NOT_NULL(r);
+            TEST_ASSERT_FMT(!RAY_IS_ERR(r), "%s: %s", exprs[e], ray_error_msg());
+            TEST_ASSERT_FMT(ray_len(r) == 0, "%s: %lld rows", exprs[e], (long long)ray_len(r));
+            ray_release(r);
+        }
+        ray_mem_stats(&s1);
+        TEST_ASSERT_FMT(s1.bytes_allocated <= s0.bytes_allocated,
+                        "%s: %zu bytes left allocated after 1000 probes",
+                        exprs[e], s1.bytes_allocated - s0.bytes_allocated);
+        const char* msg = ray_error_msg();   /* NULL when no message is set */
+        TEST_ASSERT_FMT(!msg || !msg[0], "%s: stale message \"%s\"",
+                        exprs[e], msg ? msg : "");
+    }
+    ray_t* drop = ray_eval_str("(set _EP 0)");
+    if (drop && !RAY_IS_ERR(drop)) ray_release(drop);
+    PASS();
+}
+
+/* ---- Test: temporal modulo by an integer literal lowers to the DAG ----
+ * `(% temporal n)` keeps the left type in the builtin (ray_mod_fn), and
+ * the DAG's MOD kernel computes the same floor modulo on the raw counts,
+ * so compile_expr_dag lowers a temporal column by a non-null, nonzero
+ * integer literal to MOD cast back to the column's type.  A zero or null
+ * literal, a float literal, a divisor column, a temporal literal on the
+ * left and the other verbs decline (NULL) to the builtin. */
+static test_result_t test_eval_select_temporal_mod_dag_admission(void) {
+    ray_t* tbl = ray_eval_str(
+        "(table [d t ts i l] (list [2024.01.01 2024.01.02] "
+        "[10:00:00.000 11:00:00.000] "
+        "[2024.01.01D10:00:00.000000000 2024.01.02D10:00:00.000000000] "
+        "(as 'I32 [2 3]) [2 3]))");
+    TEST_ASSERT_NOT_NULL(tbl);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+
+    static const char* const cols[] = { "d", "t", "ts" };
+    static const int8_t col_t[] = { RAY_DATE, RAY_TIME, RAY_TIMESTAMP };
+    static const char* const lowers[] = {
+        "2", "-3", "2i", "2h", "true", "5000000000",
+    };
+    static const char* const declines[] = {
+        "0", "0i", "false", "0N", "2.5", "0.0", "i", "l", "d",
+        "2024.01.02",
+    };
+    for (size_t c = 0; c < sizeof cols / sizeof *cols; c++) {
+        for (size_t k = 0; k < sizeof lowers / sizeof *lowers + sizeof declines / sizeof *declines; k++) {
+            bool want = k < sizeof lowers / sizeof *lowers;
+            const char* rhs = want ? lowers[k] : declines[k - sizeof lowers / sizeof *lowers];
+            char src[64];
+            snprintf(src, sizeof src, "(%% %s %s)", cols[c], rhs);
+            ray_t* expr = ray_parse(src);
+            TEST_ASSERT_NOT_NULL(expr);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(expr));
+            ray_graph_t* g = ray_graph_new(tbl);
+            TEST_ASSERT_NOT_NULL(g);
+            ray_op_t* op = compile_expr_dag(g, expr);
+            TEST_ASSERT_FMT((op != NULL) == want, "%s: lowered=%d, want %d",
+                            src, op != NULL, want);
+            if (op) {
+                TEST_ASSERT_FMT(op->opcode == OP_CAST && op->out_type == col_t[c],
+                                "%s: opcode %d out_type %d", src,
+                                (int)op->opcode, (int)op->out_type);
+                ray_op_t* m = &g->nodes[op->in_id[0]];
+                TEST_ASSERT_FMT(m->opcode == OP_MOD, "%s: input opcode %d",
+                                src, (int)m->opcode);
+            }
+            ray_graph_free(g);
+            ray_release(expr);
+        }
+    }
+    static const char* const other[] = {
+        "(% 2024.01.01 2)", "(/ d 2)", "(div d 2)", "(+ d 1)", "(* t 2)", "(pow ts 2)",
+    };
+    for (size_t k = 0; k < sizeof other / sizeof *other; k++) {
+        ray_t* expr = ray_parse(other[k]);
+        TEST_ASSERT_NOT_NULL(expr);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(expr));
+        ray_graph_t* g = ray_graph_new(tbl);
+        TEST_ASSERT_NOT_NULL(g);
+        ray_op_t* op = compile_expr_dag(g, expr);
+        TEST_ASSERT_FMT(op == NULL, "%s: lowered", other[k]);
+        ray_graph_free(g);
+        ray_release(expr);
+    }
+    ray_release(tbl);
+    PASS();
+}
+
 /* ---- Test: OP_IN type-mismatch must not leak via atom probe ----
  * Deterministic regression: interns a sym so we know its numeric
  * ID N, builds an i64 column containing exactly N, then runs
@@ -9977,6 +10101,8 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/select_where", test_eval_select_where, lang_setup, lang_teardown },
     { "lang/eval/select_where_in_sym", test_eval_select_where_in_sym, lang_setup, lang_teardown },
     { "lang/eval/select_unary_arith_dag_admission", test_eval_select_unary_arith_dag_admission, lang_setup, lang_teardown },
+    { "lang/eval/select_temporal_mod_dag_admission", test_eval_select_temporal_mod_dag_admission, lang_setup, lang_teardown },
+    { "lang/eval/empty_probe_error_ownership", test_eval_empty_probe_error_ownership, lang_setup, lang_teardown },
     { "lang/eval/select_where_in_i64", test_eval_select_where_in_i64, lang_setup, lang_teardown },
     { "lang/eval/select_where_in_mixed_numeric", test_eval_select_where_in_mixed_numeric, lang_setup, lang_teardown },
     { "lang/eval/select_where_in_nulls", test_eval_select_where_in_nulls, lang_setup, lang_teardown },

@@ -53,7 +53,6 @@
 ;; prints as 0Ng, which reads back as the same value.
 (format "%" (as 'GUID "00000000-0000-0000-0000-000000000000")) -- "0Ng"
 (format "%" 0Ne) -- "0Ne"
-(format "%" (as 'B8 0Nl)) -- "0Nb"
 
 ;; ═════════════════════════════════════════════════════════════════════
 ;; 2. ray_lang_print branches — println drives the switch
@@ -67,6 +66,9 @@
 
 ;; -RAY_BOOL true path
 (format "%" true) -- "true"
+
+;; Casting to non-nullable BOOL produces an ordinary true value.
+(format "%" (as 'B8 0Nl)) -- "true"
 
 ;; ═════════════════════════════════════════════════════════════════════
 ;; 3. fmt_interpolate — per-type branches in "format" / println
@@ -140,15 +142,15 @@
 ;; null → I16
 (nil? (as 'I16 0Nh)) -- true
 
-;; null → U8 — produces null U8 sentinel
-(nil? (as 'U8 0Nl)) -- true
+;; null → U8 — produces ordinary zero
+(nil? (as 'U8 0Nl)) -- false
 
 ;; null → F64
 (nil? (as 'F64 0Nf)) -- true
 (nil? (as 'F64 0Nl)) -- true
 
-;; null → BOOL — produces null BOOL sentinel
-(nil? (as 'BOOL 0Nl)) -- true
+;; numeric null → BOOL — produces ordinary true
+(nil? (as 'BOOL 0Nl)) -- false
 
 ;; empty sym → canonical SYMBOL null
 (nil? (as 'SYMBOL ')) -- true
@@ -218,7 +220,7 @@
 (as 'BOOL 1.0)   -- true    ;; F64 → BOOL
 (as 'BOOL 0.0)   -- false   ;; F64 → BOOL (zero)
 (as 'BOOL "hi")  -- true    ;; STR → BOOL (non-empty)
-(nil? (as 'BOOL ""))  -- true
+(nil? (as 'BOOL ""))  -- false
 
 ;; --- Cast to STR ---
 (as 'STR "hi")   -- "hi"    ;; already STR

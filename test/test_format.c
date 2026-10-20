@@ -700,7 +700,7 @@ static test_result_t test_fmt_atom_f32(void) {
     TEST_ASSERT_NOT_NULL(result);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
     const char* s = ray_str_ptr(result);
-    TEST_ASSERT_NOT_NULL(strstr(s, "2.5"));
+    TEST_ASSERT_STR_EQ(s, "2.5e");
     ray_release(result);
     PASS();
 }
@@ -884,7 +884,7 @@ static test_result_t test_fmt_vec_f32(void) {
     TEST_ASSERT_NOT_NULL(result);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
     const char* s = ray_str_ptr(result);
-    TEST_ASSERT_NOT_NULL(strstr(s, "1.5"));
+    TEST_ASSERT_STR_EQ(s, "[1.5e 2.5e 3.5e]");
     ray_release(result);
     ray_release(vec);
     PASS();
