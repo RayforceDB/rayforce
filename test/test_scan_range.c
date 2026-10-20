@@ -87,6 +87,207 @@ static void sr_evalf_ok(const char* fmt, ...) {
 __attribute__((unused)) static ray_t* sr_eval(const char* src) { return ray_eval_str(ray_test_tmp(src)); }
 __attribute__((unused)) static void sr_drop(ray_t* o) { if (!o) return; if (RAY_IS_ERR(o)) ray_error_free(o); else ray_release(o); }
 
+/* Cold computed-key fallback: source identities alone cannot detect a
+ * temporary gen0 flatten.  The all-heap cumulative allocation scope below
+ * additionally rejects copying the 64 unused I32 columns (10,240,000 bytes
+ * of payload alone).  This is not a historical peak/scratch-space budget. */
+static ray_t *sr_cold_table, *sr_cold_result;
+static bool sr_cold_tracing;
+static void sr_cold_teardown(void) {
+    if (sr_cold_tracing) {
+        ray_mem_trace_t ignored;
+        ray_mem_trace_end(&ignored);
+        sr_cold_tracing = false;
+    }
+    ray_enccol_test_parted_mode(0);
+    sr_drop(sr_cold_result); sr_cold_result = NULL;
+    sr_drop(sr_cold_table); sr_cold_table = NULL;
+    sr_rt_teardown();
+}
+
+typedef struct {
+    int64_t names[66];
+    ray_t* slots[66];
+    ray_t* segs[66][8];
+    ray_t* decoded[2];
+    ray_t* decoded_segs[2][8];
+} sr_cold_source_t;
+
+/* All observations here borrow; the owned sr_cold_table keeps them alive.
+ * Do not use ray_table_get_col / ray_enccol_seg_col on the source. */
+static test_result_t sr_cold_snapshot(sr_cold_source_t* src, int gen) {
+    TEST_ASSERT_EQ_I(ray_table_nrows(sr_cold_table), 40000);
+    for (int c = 0; c < 66; c++) {
+        char name[16];
+        if (c < 2) snprintf(name, sizeof name, "%s", c ? "lo" : "k");
+        else snprintf(name, sizeof name, "c%d", c - 2);
+        src->names[c] = ray_sym_intern(name, strlen(name));
+        ray_t* slot = src->slots[c] = ray_table_slot(sr_cold_table, src->names[c]);
+        int base = c < 2 ? RAY_I64 : RAY_I32;
+        TEST_ASSERT_FMT(slot, "gen%d missing slot %s", gen, name);
+        if (gen == 2) {
+            TEST_ASSERT_EQ_I(slot->type, RAY_ENCCOL);
+            TEST_ASSERT_TRUE(ray_enccol_is_parted(slot));
+            TEST_ASSERT_EQ_I(ray_enccol_of(slot)->type, base);
+            TEST_ASSERT_EQ_I(ray_enccol_of(slot)->len, 40000);
+            TEST_ASSERT_EQ_I(ray_enccol_of(slot)->wrapper->len, 8);
+            TEST_ASSERT_FMT(!ray_enccol_decoded_peek(slot), "gen2 %s wrapper not cold", name);
+        } else {
+            TEST_ASSERT_EQ_I(slot->type, RAY_PARTED_BASE + base);
+            TEST_ASSERT_EQ_I(slot->len, 8);
+        }
+        for (int p = 0; p < 8; p++) {
+            ray_t* seg = src->segs[c][p] = ray_table_parted_seg(sr_cold_table, src->names[c], p);
+            TEST_ASSERT_FMT(seg, "gen%d %s missing partition %d", gen, name, p);
+            if (gen == 2) {
+                TEST_ASSERT_EQ_I(seg->type, RAY_ENCCOL);
+                TEST_ASSERT_FALSE(ray_enccol_is_parted(seg));
+                TEST_ASSERT_FALSE(ray_enccol_is_synthetic(seg));
+                TEST_ASSERT_EQ_I(ray_col_gen_of(ray_enccol_of(seg)->base), 2);
+                TEST_ASSERT_EQ_I(ray_enccol_of(seg)->type, base);
+                TEST_ASSERT_EQ_I(ray_enccol_of(seg)->len, 5000);
+                TEST_ASSERT_FMT(!ray_enccol_decoded_peek(seg), "gen2 %s partition %d not cold", name, p);
+            } else {
+                TEST_ASSERT_EQ_I(seg->type, base);
+                TEST_ASSERT_EQ_I(seg->len, 5000);
+                TEST_ASSERT_EQ_U(seg->mmod, 1);  /* explicit uncompressed save, not equivalence default */
+            }
+        }
+        TEST_ASSERT_NULL(ray_table_parted_seg(sr_cold_table, src->names[c], 8));
+    }
+    PASS();
+}
+
+static test_result_t sr_cold_after(sr_cold_source_t* src, int gen, bool repeat) {
+    for (int c = 0; c < 66; c++) {
+        ray_t* slot = ray_table_slot(sr_cold_table, src->names[c]);
+        TEST_ASSERT_EQ_PTR(slot, src->slots[c]);
+        ray_t* dec = gen == 2 ? ray_enccol_decoded_peek(slot) : NULL;
+        if (gen == 2 && c < 2) {
+            TEST_ASSERT_NOT_NULL(dec);
+            TEST_ASSERT_EQ_I(dec->type, RAY_PARTED_BASE + RAY_I64);
+            TEST_ASSERT_EQ_I(dec->len, 8);
+            if (repeat) TEST_ASSERT_EQ_PTR(dec, src->decoded[c]);
+            else src->decoded[c] = dec;
+        } else TEST_ASSERT_NULL(dec);
+        for (int p = 0; p < 8; p++) {
+            ray_t* seg = ray_table_parted_seg(sr_cold_table, src->names[c], p);
+            TEST_ASSERT_EQ_PTR(seg, src->segs[c][p]);
+            ray_t* d = gen == 2 ? ray_enccol_decoded_peek(seg) : NULL;
+            if (gen == 2 && c < 2) {
+                TEST_ASSERT_NOT_NULL(d);
+                TEST_ASSERT_EQ_I(d->type, RAY_I64);
+                TEST_ASSERT_EQ_I(d->len, 5000);
+                TEST_ASSERT_EQ_PTR(((ray_t**)ray_data(dec))[p], d);
+                if (repeat) TEST_ASSERT_EQ_PTR(d, src->decoded_segs[c][p]);
+                else src->decoded_segs[c][p] = d;
+            } else TEST_ASSERT_FMT(!d, "unused column %d partition %d decoded", c, p);
+        }
+    }
+    PASS();
+}
+
+static test_result_t cold_fallback_pruning(int gen, int dict) {
+    /* Construction tables are call-local; no table binding is retained.
+     * Explicit options override the suite's save defaults. */
+    sr_eval_ok("(set SRcoldMk (fn [p] (table "
+               "(concat ['k 'lo] (as 'SYMBOL (map (fn [j] (format \"c%\" j)) (til 64)))) "
+               "(concat (list (as 'I64 (+ (* p 5000) (til 5000))) (as 'I64 (% (til 5000) 10))) "
+               "(map (fn [j] (as 'I32 (+ j (til 5000)))) (til 64))))))");
+    for (int p = 0; p < 8; p++)
+            sr_evalf_ok("(.db.splayed.set \"" SR_TMP "/cold%d/2024.01.0%d/t/\" (SRcoldMk %d) {compress: %s})",
+                        gen, p + 1, p, gen ? "true" : "false");
+    sr_eval_ok("(set SRcoldMk 0)");
+
+    for (int mode = 0; mode <= 1; mode++) {
+        ray_enccol_test_parted_mode(mode);
+        ray_parted_cache_prune();
+        int64_t live_before = ray_enccol_test_live();
+        sr_evalf_ok("(set SRcoldP (.db.parted.get \"" SR_TMP "/cold%d/\" 't))", gen);
+        sr_cold_table = sr_eval("SRcoldP");
+        TEST_ASSERT_TRUE(sr_cold_table && !RAY_IS_ERR(sr_cold_table));
+        uint32_t refs_before = ray_atomic_load(&sr_cold_table->rc);
+        sr_cold_source_t src = {0};
+        test_result_t check = sr_cold_snapshot(&src, gen);
+        if (check.status != TEST_PASS) return check;
+        const char* q = dict
+            ? "(do (set SRcoldQ (select {c: (count k) by: {kk: (reverse lo)} from: SRcoldP})) (count SRcoldQ))"
+            : "(do (set SRcoldQ (select {c: (count k) by: (reverse lo) from: SRcoldP})) (count SRcoldQ))";
+        ray_enc_counters_reset();
+        /* Stop before inspecting either a result or error. No assert
+         * or early return occurs inside this process-global scope. */
+        sr_cold_tracing = ray_mem_trace_begin();
+        if (!sr_cold_tracing) FAIL("could not begin cold allocation trace");
+        sr_cold_result = sr_eval(q);
+        ray_mem_trace_t traffic;
+        ray_mem_trace_end(&traffic);
+        sr_cold_tracing = false;
+        TEST_ASSERT_FMT(sr_cold_result && !RAY_IS_ERR(sr_cold_result),
+                        "cold gen%d mode%d dict%d: %s", gen, mode, dict, ray_error_msg());
+        TEST_ASSERT_EQ_I(sr_cold_result->type, -RAY_I64);
+        TEST_ASSERT_EQ_I(sr_cold_result->i64, 10);
+        TEST_ASSERT_FMT(traffic.allocated_bytes < 8u * 1024u * 1024u,
+                        "gen%d mode%d dict%d allocated %llu bytes (budget <8MiB)", gen, mode, dict,
+                        (unsigned long long)traffic.allocated_bytes);
+        sr_drop(sr_cold_result); sr_cold_result = NULL;
+        ray_enc_counters_t counters;
+        ray_enc_counters_get(&counters);
+        /* Only successful single segment materializations count;
+         * the two parted wrapper publications do not add two. */
+        TEST_ASSERT_EQ_U(counters.materialized, gen == 2 ? 16 : 0);
+        check = sr_cold_after(&src, gen, false);
+        if (check.status != TEST_PASS) return check;
+        sr_cold_result = sr_eval("SRcoldQ");
+        TEST_ASSERT_TRUE(sr_cold_result && !RAY_IS_ERR(sr_cold_result));
+        TEST_ASSERT_EQ_I(ray_table_nrows(sr_cold_result), 10);
+        /* Result-only get_col is allowed to force; source peeks above
+         * and below must never force materialization. */
+        ray_t* counts = ray_table_get_col(sr_cold_result, ray_sym_intern("c", 1));
+        TEST_ASSERT_TRUE(counts && !RAY_IS_ERR(counts));
+        TEST_ASSERT_EQ_I(counts->type, RAY_I64);
+        TEST_ASSERT_EQ_I(counts->len, 10);
+        for (int i = 0; i < 10; i++) TEST_ASSERT_EQ_I(((int64_t*)ray_data(counts))[i], 4000);
+        sr_drop(sr_cold_result); sr_cold_result = NULL;
+        sr_eval_ok("(set SRcoldQ 0)");
+        TEST_ASSERT_EQ_U(ray_atomic_load(&sr_cold_table->rc), refs_before);
+        sr_cold_result = sr_eval(q);
+        TEST_ASSERT_TRUE(sr_cold_result && !RAY_IS_ERR(sr_cold_result));
+        TEST_ASSERT_EQ_I(sr_cold_result->i64, 10);
+        ray_enc_counters_get(&counters);
+        TEST_ASSERT_EQ_U(counters.materialized, gen == 2 ? 16 : 0);
+        check = sr_cold_after(&src, gen, true);
+        if (check.status != TEST_PASS) return check;
+        sr_drop(sr_cold_result); sr_cold_result = NULL;
+        sr_eval_ok("(set SRcoldQ 0)");
+        TEST_ASSERT_EQ_U(ray_atomic_load(&sr_cold_table->rc), refs_before);
+        sr_eval_ok("(set SRcoldP 0)");
+        sr_drop(sr_cold_table); sr_cold_table = NULL;
+        /* The loader deliberately caches partition sub-tables. Prune only
+         * unused entries; leaked outside references would keep them alive. */
+        ray_parted_cache_prune();
+        TEST_ASSERT_EQ_I(ray_enccol_test_live(), live_before);
+        /* Reload next time; cold assertions deliberately fail if a
+         * loader ever shares already-published segment caches. */
+    }
+    PASS();
+}
+
+static test_result_t test_cold_fallback_gen0_bare(void) {
+    return cold_fallback_pruning(0, 0);
+}
+
+static test_result_t test_cold_fallback_gen0_dict(void) {
+    return cold_fallback_pruning(0, 1);
+}
+
+static test_result_t test_cold_fallback_gen2_bare(void) {
+    return cold_fallback_pruning(2, 0);
+}
+
+static test_result_t test_cold_fallback_gen2_dict(void) {
+    return cold_fallback_pruning(2, 1);
+}
+
 static ray_t* sr_i32(int64_t n, int64_t null_every) {
     ray_t* v = ray_vec_new(RAY_I32, n); v->len = n;
     for (int64_t i = 0; i < n; i++)
@@ -7020,5 +7221,9 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/v2_sel_bounds_boundary", test_v2_sel_bounds_boundary, sr_rt_setup, sr_rt_teardown },
     { "scanrange/v2_forged_split",       test_v2_forged_split,       sr_rt_setup, sr_rt_teardown },
     { "scanrange/const_beside_parted_group", test_const_beside_parted_group, srr_setup, srr_teardown },
+    { "scanrange/cold_fallback_gen0_bare", test_cold_fallback_gen0_bare, sr_rt_setup, sr_cold_teardown },
+    { "scanrange/cold_fallback_gen0_dict", test_cold_fallback_gen0_dict, sr_rt_setup, sr_cold_teardown },
+    { "scanrange/cold_fallback_gen2_bare", test_cold_fallback_gen2_bare, sr_rt_setup, sr_cold_teardown },
+    { "scanrange/cold_fallback_gen2_dict", test_cold_fallback_gen2_dict, sr_rt_setup, sr_cold_teardown },
     { NULL, NULL, NULL, NULL },
 };

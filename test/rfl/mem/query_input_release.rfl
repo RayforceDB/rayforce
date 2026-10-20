@@ -18,8 +18,8 @@
 (set probe (fn [f warm reps] (do (map f (til warm)) (map f (til reps)) (set h0 (heapb)) (map f (til reps)) (< (- (heapb) h0) 4096))))
 
 ;; Peak memory of selects over a parted table, measured first in this file:
-;; the peak counter starts with the file, so nothing larger run before hides
-;; a query's own peak.  A grouped select with no outputs, or a sort without
+;; peak-bytes is the calling heap's historical high-water mark, not a
+;; process-wide query peak. These checks precede larger result probes.  A grouped select with no outputs, or a sort without
 ;; by:, reads the columns its clauses name and gathers the others at the rows
 ;; it keeps; whatever the number of groups or rows kept, its peak stays
 ;; below what flattening the table costs (the table, then its rows again for
@@ -58,14 +58,13 @@
 (set pk0 (at (.sys.mem) 'peak-bytes))
 (count (select {by: {kk: (+ lo 1)} from: Pmw})) -- 10
 (< (- (at (.sys.mem) 'peak-bytes) pk0) (/ Bmw 4)) -- true
-;; a key the planner cannot lower flattens only the columns the select reads
-(set pk0 (at (.sys.mem) 'peak-bytes))
+;; A key the planner cannot lower flattens only named source columns.
+;; Its resource oracle lives in query_fallback_alloc.rfl and the cold-cache
+;; scanrange test: decoded caches can belong to the caller or helper heaps,
+;; so subtracting the caller's historical peak is not a query-scoped budget.
 (count (select {c: (count k) by: (reverse lo) from: Pmw})) -- 10
-(< (- (at (.sys.mem) 'peak-bytes) pk0) (/ Bmw 4)) -- true
 ;; as a by-dict value too
-(set pk0 (at (.sys.mem) 'peak-bytes))
 (count (select {c: (count k) by: {kk: (reverse lo)} from: Pmw})) -- 10
-(< (- (at (.sys.mem) 'peak-bytes) pk0) (/ Bmw 4)) -- true
 ;; every key unique: the result is the whole table, and little more
 (set pk0 (at (.sys.mem) 'peak-bytes))
 (count (select {by: k from: Pmw})) -- 40000

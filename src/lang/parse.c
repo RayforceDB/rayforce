@@ -340,19 +340,26 @@ plain_number:;
         while (*p->pos >= '0' && *p->pos <= '9') p->pos++;
     }
     if (*p->pos == 'e' || *p->pos == 'E') {
-        is_float = 1;
-        p->pos++;
-        if (*p->pos == '+' || *p->pos == '-') p->pos++;
-        while (*p->pos >= '0' && *p->pos <= '9') p->pos++;
+        /* A trailing lowercase e is the F32 suffix; an exponent must
+         * have digits (optionally after a sign). */
+        const char *exp = p->pos + 1;
+        if (*exp == '+' || *exp == '-') exp++;
+        if (*exp >= '0' && *exp <= '9') {
+            is_float = 1;
+            p->pos = exp;
+            while (*p->pos >= '0' && *p->pos <= '9') p->pos++;
+        }
     }
 
     size_t span = (size_t)(p->pos - start);
 
-    if (is_float) {
+    int is_f32 = (*p->pos == 'e');
+    if (is_f32) p->pos++;
+    if (is_float || is_f32) {
         double v = 0.0;
         if (ray_parse_f64(start, span, &v) == 0)
             return ray_error("parse", NULL);
-        return ray_f64(v);
+        return is_f32 ? ray_f32(ray_cast_f64_to_f32_null(v)) : ray_f64(v);
     }
 
     /* Integer parse — overflow signalled by `n == 0` (digits present but

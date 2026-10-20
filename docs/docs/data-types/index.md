@@ -13,7 +13,7 @@ All scalar types, their internal constants, storage sizes, and Rayfall literal s
 | **Short integer** | `RAY_I16` | 3 | 2 bytes | `0Nh` | Small integers |
 | **Integer** | `RAY_I32` | 4 | 4 bytes | `0Ni` | `42i` |
 | **Long integer** | `RAY_I64` | 5 | 8 bytes | `0Nl` | `42` |
-| **Single float** | `RAY_F32` | 6 | 4 bytes | `0Ne` | none; `(as 'F32 1.5)` |
+| **Single float** | `RAY_F32` | 6 | 4 bytes | `0Ne` | `1.5e` |
 | **Double float** | `RAY_F64` | 7 | 8 bytes | `0Nf` | `3.14` |
 | **Date** | `RAY_DATE` | 8 | 4 bytes | `0Nd` | `2024.01.15` |
 | **Time** | `RAY_TIME` | 9 | 4 bytes | `0Nt` | `09:30:00.000` |

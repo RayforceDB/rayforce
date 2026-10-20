@@ -308,6 +308,7 @@ static void fmt_f64(fmt_buf_t* b, double val) {
 
 static void fmt_f32(fmt_buf_t* b, float val) {
     fmt_f64(b, (double)val);
+    fmt_putc(b, 'e');
 }
 
 static void fmt_guid(fmt_buf_t* b, const uint8_t* bytes) {

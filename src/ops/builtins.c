@@ -1629,6 +1629,13 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
             char buf[32]; int n2 = snprintf(buf, sizeof(buf), "%g", fv);
             return ray_str(buf, (size_t)n2);
         }
+        if (val->type == -RAY_F32) {
+            /* Data conversion uses plain decimal text, independent of the
+             * literal printer and its configured display precision. */
+            double fv = clear_neg_zero((double)(float)val->f64);
+            char buf[32]; int n2 = snprintf(buf, sizeof(buf), "%.9g", fv);
+            return ray_str(buf, (size_t)n2);
+        }
         if (val->type == -RAY_BOOL) {
             return val->b8 ? ray_str("true", 4) : ray_str("false", 5);
         }
