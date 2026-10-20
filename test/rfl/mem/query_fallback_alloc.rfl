@@ -1,0 +1,41 @@
+;; @requires: posix
+;; Query-scoped, all-thread managed allocation traffic for computed keys.
+;; 64 unused I32 columns x40000 rows require 10240000 payload bytes for
+;; a full flatten (before headers/buddy rounding). The 8MiB traffic bound
+;; separates that from the measured <4.2MiB required-column path. It is NOT
+;; the old 960000-byte calling-heap historical-peak-growth assertion.
+;; Cold pruning/cache publication is independently checked in C; here prime
+;; ONLY the two named columns, never the select whose behavior we constrain.
+(.sys.exec "rm -rf rfl_fallback_alloc")
+(set Nma 5000)
+(set mkma (fn [p] (table (concat ['k 'lo] (as 'SYMBOL (map (fn [j] (format "c%" j)) (til 64)))) (concat (list (+ (* p Nma) (til Nma)) (% (til Nma) 10)) (map (fn [j] (as 'I32 (+ j (til Nma)))) (til 64))))))
+(map (fn [p] (do (.db.splayed.set (format "rfl_fallback_alloc/2024.01.0%/t/" (+ p 1)) (mkma p)) 0)) (til 8))
+(set Pma (.db.parted.get "rfl_fallback_alloc/" 't))
+(set _prime (at Pma 'k))
+(set _prime 0)
+(set _prime (at Pma 'lo))
+(set _prime 0)
+(set ma_bare (fn [] (count (select {c: (count k) by: (reverse lo) from: Pma}))))
+(set ma_dict (fn [] (count (select {c: (count k) by: {kk: (reverse lo)} from: Pma}))))
+(set _measurement (.mem.ts (ma_bare)))
+(at _measurement 'result) -- 10
+(< (at _measurement 'allocated-bytes) 8388608) -- true
+(set _measurement 0)
+(set _measurement (.mem.ts (ma_dict)))
+(at _measurement 'result) -- 10
+(< (at _measurement 'allocated-bytes) 8388608) -- true
+(set _measurement 0)
+;; Stabilize closures/caches, then discard all per-call results inside a
+;; separate scope. Do not free a previous measurement inside the next trace.
+(times 20 (ma_bare))
+(set _measurement (.mem.ts (do (times 20 (ma_bare)) 0)))
+(at _measurement 'result) -- 0
+(< (abs (at _measurement 'net-bytes)) 4096) -- true
+(set _measurement 0)
+(times 20 (ma_dict))
+(set _measurement (.mem.ts (do (times 20 (ma_dict)) 0)))
+(at _measurement 'result) -- 0
+(< (abs (at _measurement 'net-bytes)) 4096) -- true
+(set _measurement 0)
+(set Pma 0)
+(.sys.exec "rm -rf rfl_fallback_alloc")
