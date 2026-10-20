@@ -1618,19 +1618,16 @@ static test_result_t test_eval_select_unary_arith_dag_admission(void) {
     PASS();
 }
 
-/* ---- Test: temporal modulo by an integer literal lowers to the DAG ----
- * `(% temporal n)` keeps the left type in the builtin (ray_mod_fn), and
- * the DAG's MOD kernel computes the same floor modulo on the raw counts,
- * so compile_expr_dag lowers a temporal column by a non-null, nonzero
- * integer literal to MOD cast back to the column's type.  A zero or null
- * literal, a float literal, a divisor column, a temporal literal on the
- * left and the other verbs decline (NULL) to the builtin. */
-/* An empty operand makes the atomic mappers probe `fn` on a fabricated
+/* ---- Test: an empty-operand type probe that fails leaves nothing behind ----
+ * An empty operand makes the atomic mappers probe `fn` on a fabricated
  * zero atom to learn the result type.  A probe the builtin rejects —
  * `(/ empty_DATE 2)`, `(neg empty_DATE)` — used to leak its error object
- * and leave its message behind.  Repeated, through the builtins and
- * through select's empty-result probe, nothing stays allocated and no
- * message is left over; the valid probe is the control. */
+ * and leave its message behind.  select's empty-result probe evaluates an
+ * elementwise projection over the empty columns, and a whole-column
+ * failure there (`(+ d)`, `(neg d 1)`, `(pow d 2 3)`: the wrong arity) is
+ * swallowed by query.c itself, not inside a mapper.  Repeated, through the
+ * builtins and through select, nothing stays allocated and no message is
+ * left over; the valid probe is the control. */
 static test_result_t test_eval_empty_probe_error_ownership(void) {
     ray_t* setup = ray_eval_str("(set _EP (table [d] (list (as 'DATE []))))");
     TEST_ASSERT_NOT_NULL(setup);
@@ -1643,6 +1640,9 @@ static test_result_t test_eval_empty_probe_error_ownership(void) {
         "(neg (at _EP 'd))",                          /* unary, rejected */
         "(at (select {x: (/ d 2) from: _EP}) 'x)",    /* select's probe */
         "(at (select {x: (neg d) from: _EP}) 'x)",
+        "(at (select {x: (+ d) from: _EP}) 'x)",      /* whole-column failure, */
+        "(at (select {x: (neg d 1) from: _EP}) 'x)",  /* swallowed in query.c */
+        "(at (select {x: (pow d 2 3) from: _EP}) 'x)",
     };
     for (size_t e = 0; e < sizeof(exprs) / sizeof(exprs[0]); e++) {
         /* warm up: first-use allocations (symbols, caches) are not a leak */
@@ -1673,6 +1673,13 @@ static test_result_t test_eval_empty_probe_error_ownership(void) {
     PASS();
 }
 
+/* ---- Test: temporal modulo by an integer literal lowers to the DAG ----
+ * `(% temporal n)` keeps the left type in the builtin (ray_mod_fn), and
+ * the DAG's MOD kernel computes the same floor modulo on the raw counts,
+ * so compile_expr_dag lowers a temporal column by a non-null, nonzero
+ * integer literal to MOD cast back to the column's type.  A zero or null
+ * literal, a float literal, a divisor column, a temporal literal on the
+ * left and the other verbs decline (NULL) to the builtin. */
 static test_result_t test_eval_select_temporal_mod_dag_admission(void) {
     ray_t* tbl = ray_eval_str(
         "(table [d t ts i l] (list [2024.01.01 2024.01.02] "
