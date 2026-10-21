@@ -13292,11 +13292,11 @@ static ray_t* parted_keep_partitions(ray_t* tbl, const uint64_t* keep, int64_t n
 }
 
 /* Does partition p of the parted table hold a segment of every column? */
-static bool parted_partition_whole(ray_t* tbl, int64_t p) {
+static bool parted_partition_whole(ray_t* tbl, int64_t p, int64_t key_col) {
+    /* The caller validated one MAPCOMMON key and all other parted columns. */
     int64_t ncols = ray_table_ncols(tbl);
     for (int64_t c = 0; c < ncols; c++) {
-        ray_col_meta_t m;
-        if (!ray_table_col_meta_idx(tbl, c, &m) || m.type == RAY_MAPCOMMON) continue;
+        if (c == key_col) continue;
         if (!prune_seg(tbl, c, p)) return false;
     }
     return true;
@@ -13386,6 +13386,7 @@ static ray_t* select_prune_partitions(ray_t* dict, ray_t* tbl, ray_t* where) {
     if (!where || where->type != RAY_LIST || !tbl || tbl->type != RAY_TABLE) return NULL;
     int64_t ncols = ray_table_ncols(tbl);
     int64_t key_id = -1;
+    int64_t key_col = -1;
     ray_t* kv = NULL;
     for (int64_t c = 0; c < ncols; c++) {
         ray_col_meta_t m;
@@ -13398,6 +13399,7 @@ static ray_t* select_prune_partitions(ray_t* dict, ray_t* tbl, ray_t* where) {
         if (!mp[0] || !mp[1] || mp[1]->type != RAY_I64 || mp[0]->len != mp[1]->len) return NULL;
         kv = mp[0];
         key_id = ray_table_col_name(tbl, c);
+        key_col = c;
     }
     if (!kv || kv->len <= 0) return NULL;
     if (ray_env_has_lexical_local(key_id)) return NULL;          /* a formal shadows the key */
@@ -13420,13 +13422,20 @@ static ray_t* select_prune_partitions(ray_t* dict, ray_t* tbl, ray_t* where) {
     prune_where_mask(where, key_id, kv, acc, tmp, n_words);
     int64_t n_keep = 0;
     int64_t stand = -1;                                          /* the first pruned partition */
+    for (int64_t p = 0; p < n_parts; p++) {
+        bool kept = (acc[p / 64] >> (p % 64)) & 1;
+        n_keep += kept;
+        if (!kept && stand < 0) stand = p;
+    }
+    if (n_keep == n_parts) {
+        ray_free_raw(acc);
+        return NULL;                                            /* the full source stays unchanged */
+    }
     bool ok = true;
     for (int64_t p = 0; ok && p < n_parts; p++) {
         bool kept = (acc[p / 64] >> (p % 64)) & 1;
-        n_keep += kept;
         /* a kept ragged partition: the pruned copy would be just as malformed */
-        if (kept && !parted_partition_whole(tbl, p)) ok = false;
-        if (!kept && stand < 0) stand = p;
+        if (kept && !parted_partition_whole(tbl, p, key_col)) ok = false;
     }
     ray_t* out = NULL;
     if (ok && n_keep < n_parts && stand >= 0 && prune_shape_ok(dict, tbl, where))
