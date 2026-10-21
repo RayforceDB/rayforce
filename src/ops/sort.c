@@ -4255,55 +4255,64 @@ typedef struct {
     _Atomic int* ordered;
 } sorted_check_ctx_t;
 
+/* Instantiate the same scan for each physical lane width. Width selection
+ * happens outside the row loop; no generic per-cell type/width validation. */
+#define SORTED_SYM_SECONDARY(lane_t) do { \
+    ray_t* sc = c->key_cols[0]; \
+    const void* sd = ray_data(sc); \
+    uint8_t sattrs = sc->attrs; \
+    const lane_t* restrict tv = (const lane_t*)ray_data(c->key_cols[1]); \
+    struct ray_sym_domain_s* dom = ray_sym_vec_domain(sc); \
+    for (int64_t b = start; b < end; b += 4096) { \
+        if (!atomic_load_explicit(c->ordered, memory_order_relaxed)) return; \
+        int64_t e = b + 4096 < end ? b + 4096 : end; \
+        for (int64_t i = b; i < e; i++) { \
+            int64_t ia = ray_read_sym(sd, i - 1, RAY_SYM, sattrs); \
+            int64_t ib = ray_read_sym(sd, i,     RAY_SYM, sattrs); \
+            if (RAY_LIKELY(ia == ib)) { \
+                if (tv[i] < tv[i - 1]) { atomic_store_explicit(c->ordered, 0, memory_order_relaxed); return; } \
+            } else { \
+                ray_t* sa = ray_sym_domain_str(dom, ia); \
+                ray_t* sb = ray_sym_domain_str(dom, ib); \
+                uint32_t la = sa ? (uint32_t)ray_str_len(sa) : 0; \
+                uint32_t lb = sb ? (uint32_t)ray_str_len(sb) : 0; \
+                uint32_t ml = la < lb ? la : lb; \
+                int cmp = ml ? memcmp(ray_str_ptr(sa), ray_str_ptr(sb), ml) : 0; \
+                if (cmp == 0) cmp = (la > lb) - (la < lb); \
+                if (cmp > 0) { atomic_store_explicit(c->ordered, 0, memory_order_relaxed); return; } \
+            } \
+        } \
+    } \
+    return; \
+} while (0)
+
 static void sorted_check_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
     sorted_check_ctx_t* c = (sorted_check_ctx_t*)raw;
     if (start < 1) start = 1;
 
-    /* Specialized (SYM, i64-family) two-key loop — the canonical
-     * (sym, time) shape.  The generic loop below pays a type-switch per
+    /* Specialized (SYM, integer-secondary) two-key loop. TIME cells are
+     * int32_t; I64/TIMESTAMP cells are int64_t.  The generic loop below pays a type-switch per
      * read and an atomic flag load per row; here adjacent sym ids
      * compare directly (equal ids on ~all rows of a sorted table — the
      * string comparison only runs at run boundaries), the secondary key
-     * reads raw i64, and the bail flag is polled per 4096-row block.
+     * reads its physical lane, and the bail flag is polled per 4096-row block.
      *
      * Callers reach this only for null-free keys (ray_key_cols_sorted rejects
      * actual nulls up front, including for SYM).  That is not squeamishness
      * about in-band nulls: this loop ranks sym 0 by its domain string, i.e.
      * smallest, whereas the real sort places nulls by the `nulls_first` flag
      * independently of payload.  See the note on ray_key_cols_sorted. */
-    /* TIME/DATE have 32-bit cells; the direct secondary loads below are i64. */
     if (!c->descending && c->n_keys == 2 &&
         c->key_cols[0]->type == RAY_SYM &&
         (c->key_cols[1]->type == RAY_I64 ||
-         c->key_cols[1]->type == RAY_TIMESTAMP) &&
+         c->key_cols[1]->type == RAY_TIMESTAMP ||
+         c->key_cols[1]->type == RAY_TIME) &&
         !ray_vec_may_have_nulls(c->key_cols[1])) {
-        ray_t* sc = c->key_cols[0];
-        const void* sd = ray_data(sc);
-        uint8_t sattrs = sc->attrs;
-        const int64_t* restrict tv = (const int64_t*)ray_data(c->key_cols[1]);
-        struct ray_sym_domain_s* dom = ray_sym_vec_domain(sc);
-        for (int64_t b = start; b < end; b += 4096) {
-            if (!atomic_load_explicit(c->ordered, memory_order_relaxed)) return;
-            int64_t e = b + 4096 < end ? b + 4096 : end;
-            for (int64_t i = b; i < e; i++) {
-                int64_t ia = ray_read_sym(sd, i - 1, RAY_SYM, sattrs);
-                int64_t ib = ray_read_sym(sd, i,     RAY_SYM, sattrs);
-                if (RAY_LIKELY(ia == ib)) {
-                    if (tv[i] < tv[i - 1]) { atomic_store_explicit(c->ordered, 0, memory_order_relaxed); return; }
-                } else {
-                    ray_t* sa = ray_sym_domain_str(dom, ia);
-                    ray_t* sb = ray_sym_domain_str(dom, ib);
-                    uint32_t la = sa ? (uint32_t)ray_str_len(sa) : 0;
-                    uint32_t lb = sb ? (uint32_t)ray_str_len(sb) : 0;
-                    uint32_t ml = la < lb ? la : lb;
-                    int cmp = ml ? memcmp(ray_str_ptr(sa), ray_str_ptr(sb), ml) : 0;
-                    if (cmp == 0) cmp = (la > lb) - (la < lb);
-                    if (cmp > 0) { atomic_store_explicit(c->ordered, 0, memory_order_relaxed); return; }
-                }
-            }
-        }
-        return;
+        if (c->key_cols[1]->type == RAY_TIME)
+            SORTED_SYM_SECONDARY(int32_t);
+        else
+            SORTED_SYM_SECONDARY(int64_t);
     }
 
     for (int64_t i = start; i < end; i++) {
@@ -4333,6 +4342,8 @@ static void sorted_check_fn(void* raw, uint32_t wid, int64_t start, int64_t end)
         if (c->descending ? (cmp < 0) : (cmp > 0)) { atomic_store_explicit(c->ordered, 0, memory_order_relaxed); return; }
     }
 }
+
+#undef SORTED_SYM_SECONDARY
 
 /* Public: are these key columns already in sorted order under the sort's
  * lexicographic ordering (single uniform direction across all keys)?  Only

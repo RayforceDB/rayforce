@@ -1550,6 +1550,9 @@ static test_result_t test_time_key_width(void) {
             TEST_ASSERT_TRUE(got && !RAY_IS_ERR(got) && got->type == RAY_TIME && got->len == 2);
             TEST_ASSERT_EQ_I(((int32_t*)ray_data(got))[0], raw[offset + 1]);
             TEST_ASSERT_EQ_I(((int32_t*)ray_data(got))[1], raw[offset]);
+            ray_t* sorted_cols[] = {syms, got};
+            TEST_ASSERT_TRUE(ray_key_cols_sorted(sorted_cols, 2, 0, 2));
+            TEST_ASSERT_FALSE(ray_key_cols_sorted(sorted_cols, 2, 1, 2));
             TEST_ASSERT_TRUE(memcmp(ray_data(parent), raw, (size_t)(offset + 4) * sizeof(int32_t)) == 0);
             ray_release(out); ray_release(keys); ray_release(table);
             ray_release(syms); ray_release(times); ray_release(parent);
@@ -1598,6 +1601,9 @@ static test_result_t test_time_key_width_parallel(void) {
     TEST_ASSERT_TRUE(got && !RAY_IS_ERR(got) && got->type == RAY_TIME && got->len == n);
     const int32_t* data = ray_data(got);
     for (int64_t i = 0; i < n; i++) TEST_ASSERT_EQ_I(data[i], i);
+    ray_t* sorted_cols[] = {syms, got};
+    TEST_ASSERT_TRUE(ray_key_cols_sorted(sorted_cols, 2, 0, n));
+    TEST_ASSERT_FALSE(ray_key_cols_sorted(sorted_cols, 2, 1, n));
     const int32_t* input = ray_data(parent);
     for (int64_t i = 0; i < 2 * n; i++) {
         int32_t expected = i == edge - 1 ? (int32_t)edge :
