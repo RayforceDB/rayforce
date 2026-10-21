@@ -1512,6 +1512,56 @@ static test_result_t test_sort_sym_w8_gather(void) {
     PASS();
 }
 
+/* A late inversion must lend prepared ranks to the real sort without
+ * freeing them too early; early/small cases avoid precheck rank setup.
+ * Row identities independently verify stability of the repeated keys. */
+static test_result_t test_unsorted_symbol_rank_reuse(void) {
+    ray_heap_init(); ray_sym_init();
+    int64_t z = ray_sym_intern("reuse-z", 7);
+    int64_t a = ray_sym_intern("reuse-a", 7);
+    int64_t ts_name = ray_sym_intern("reuse-time", 10);
+    int64_t sym_name = ray_sym_intern("reuse-sym", 9);
+    int64_t row_name = ray_sym_intern("reuse-row", 9);
+    int64_t key_ids[] = {ts_name, sym_name};
+    ray_t* keys = ray_vec_from_raw(RAY_SYM, key_ids, 2);
+    for (int desc = 0; desc < 2; desc++) {
+        for (int kind = 0; kind < 3; kind++) {
+            int64_t n = kind == 0 ? 8 : 200000;
+            int64_t inversion = kind == 2 ? n - 2 : 0;
+            ray_t* sym = ray_vec_new(RAY_SYM, n);
+            ray_t* time = ray_vec_new(RAY_I64, n);
+            ray_t* row = ray_vec_new(RAY_I64, n);
+            sym->len = time->len = row->len = n;
+            for (int64_t i = 0; i < n; i++) {
+                ((int64_t*)ray_data(sym))[i] = i == inversion ? (desc ? a : z) : (desc ? z : a);
+                ((int64_t*)ray_data(time))[i] = 0;
+                ((int64_t*)ray_data(row))[i] = i;
+            }
+            ray_t* table = ray_table_new(3);
+            table = ray_table_add_col(table, ts_name, time);
+            table = ray_table_add_col(table, sym_name, sym);
+            table = ray_table_add_col(table, row_name, row);
+            ray_t* result = desc ? ray_xdesc_fn(table, keys) : ray_xasc_fn(table, keys);
+            TEST_ASSERT_NOT_NULL(result);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+            TEST_ASSERT_EQ_I(ray_table_nrows(result), n);
+            ray_t* out_sym = ray_table_get_col(result, sym_name);
+            ray_t* out_row = ray_table_get_col(result, row_name);
+            for (int64_t i = 0; i < n; i++) {
+                int64_t expected_sym = i == n - 1 ? (desc ? a : z) : (desc ? z : a);
+                int64_t expected_row = i == n - 1 ? inversion : i + (i >= inversion);
+                TEST_ASSERT_EQ_I(ray_read_sym(ray_data(out_sym), i, out_sym->type, out_sym->attrs), expected_sym);
+                TEST_ASSERT_EQ_I(((int64_t*)ray_data(out_row))[i], expected_row);
+            }
+            ray_release(result); ray_release(table);
+            ray_release(sym); ray_release(time); ray_release(row);
+        }
+    }
+    ray_release(keys);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
 /* The optional LUT must not turn a sparse but sorted column into a
  * declined shortcut. Intern padding BEFORE the used names. */
 static test_result_t test_sorted_symbol_sparse_fallback(void) {
@@ -1618,6 +1668,7 @@ static test_result_t test_sorted_symbol_rank_check(void) {
 /* ─── Entry table ────────────────────────────────────────────────── */
 
 const test_entry_t sort_entries[] = {
+    { "sort/unsorted_symbol_rank_reuse", test_unsorted_symbol_rank_reuse, NULL, NULL },
     { "sort/sorted_symbol_sparse_fallback", test_sorted_symbol_sparse_fallback, NULL, NULL },
     { "sort/sorted_symbol_rank_check", test_sorted_symbol_rank_check, NULL, NULL },
     /* xrank tests */

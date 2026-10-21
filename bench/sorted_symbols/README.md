@@ -24,7 +24,9 @@ The early sortedness scan compares adjacent rows, so timestamp ties often
 require a symbol comparison on every row. Resolving those symbol IDs inside
 parallel workers takes the shared runtime symbol lock repeatedly. Preparing
 lexical ranks with `build_enum_rank` before dispatch replaces those lookups
-with integer comparisons for table sorts. When ranks are unavailable because
+with integer comparisons for large parallel table checks. First, an unranked
+one-morsel probe rejects an early inversion without preparing ranks. Small
+tables and scans without secondary workers retain the serial string scan. When ranks are unavailable because
 of the density budget or allocation failure, the check keeps the string
 comparator and scans serially; unavailable ranks never mean "not sorted".
 Integer-only keys retain their existing parallel scan. Null and type
@@ -34,9 +36,12 @@ admissibility gates are unchanged.
 preparation entirely. Symbol segments use the original equal-ID/string scan
 serially, so constant segments need no string resolution and repeated small
 segments do not repeatedly sort the domain. This also avoids shared-lock
-contention. Table sorts still prepare call-local ranks and free them after
-workers join. Their rank storage is sized through the maximum used intern
-ID, and unsorted input may prepare those ranks again in the normal sort.
+contention. Table sorts retain any prepared ranks after workers join. The
+real sort borrows them after a late inversion, including recursive single-key
+sorts, so successful maps are not built twice. The caller frees them after
+the real sort returns, or immediately on the already-sorted shortcut. Rank
+storage remains sized through the maximum used intern ID; unavailable maps
+may be retried by the real sort.
 The serial fallback trades parallelism for bounded setup and no contention.
 This change does not persist ordering ranks or change symbol representation.
 
@@ -102,12 +107,72 @@ The sparse eight-row streaming case is covered separately by
 counter deltas and full sequence checks in both budget regimes. It fails
 on `f62ca12d` and passes after this fix.
 
-A fresh run of the original 2,630,400-row benchmark after the fallback fix
-retained the speedup (three measurements after one discarded warm-up):
+A fresh run of the original 2,630,400-row benchmark after the unsorted-input
+fix retained the parallel speedup (three measurements after one warm-up).
+The serial case now deliberately uses the original string scan, like
+upstream, rather than preparing ranks without secondary workers:
 
 | Secondary workers | Symbols, ms | Integer ranks, ms |
 |---:|---:|---:|
-| 0 | 20.307 | 19.572 |
-| 1 | 17.948 | 15.820 |
-| 4 | 13.793 | 13.001 |
-| 16 | 12.842 | 12.076 |
+| 0 | 50.825 | 19.238 |
+| 1 | 17.234 | 15.049 |
+| 4 | 14.060 | 12.622 |
+| 16 | 12.734 | 12.032 |
+
+## Unsorted and small table controls
+
+`unsorted_work.c` pads the runtime domain with 60,000 unused names before
+creating the used keys. It exercises ascending and descending table sorts:
+8-row unsorted input, 200,000-row input with an inversion at the first pair,
+and 200,000-row input with an inversion at the last pair. The latter passes
+the leading probe and exercises borrowed rank lifetime. It also checks the
+large unsorted case without secondary workers. Every output key is checked.
+The C regression additionally verifies stable row identities for these cases.
+
+For uninstrumented timing, build after `make release`:
+
+```sh
+clang -O3 -march=native -std=c17 -Iinclude -Isrc \
+  bench/sorted_symbols/unsorted_work.c \
+  $(find src -name '*.rel.o' ! -path 'src/app/main.rel.o') \
+  -lm -lpthread -o /tmp/unsorted-sort-time
+/tmp/unsorted-sort-time
+```
+
+For string-resolution counts, add `-DCOUNT_RESOLUTIONS` and
+`-Wl,--wrap=ray_sym_domain_str` to that command. Ignore timing from this
+instrumented build. The probe initializes five total workers for the first
+six cases, then one for the serial control.
+
+| Case (ascending) | Resolutions at eaff260a | After unsorted fix |
+|---|---:|---:|
+| Small | 60029 | 28 |
+| Early inversion | 120006 | 60005 |
+| Late inversion | 120006 | 60003 |
+| Serial | 120006 | 60005 |
+
+Descending counts match the corresponding ascending cases. Early input
+now pays for one real-sort rank build plus its two probe lookups; late input
+prepares that map once and lends it to the real sort. Small input stays on
+the comparison path without a dense LUT. Counts are measured over the entire
+table sort, including its precheck, rather than just the precheck.
+
+The uninstrumented ascending medians in milliseconds were:
+
+| Case | Upstream 64645998 | eaff260a | After unsorted fix |
+|---|---:|---:|---:|
+| Small | 0.022 | 2.155 | 0.025 |
+| Early inversion | 3.030 | 5.131 | 3.161 |
+| Late inversion | 3.191 | 5.023 | 3.072 |
+| Serial | 2.919 | 4.883 | 3.032 |
+
+These are three fresh-process observations after one discarded warm-up per
+build. Other release objects were identical; the upstream and eaff260a sort
+objects were compiled separately with clang `-O3 -march=native -std=c17`.
+The current sort object uses the release Makefile flags. Cases run in a fixed
+order within each process, so the small ascending case includes first-sort
+initialization and should not be compared with the later descending case.
+Construction and validation are outside timing. The machine was a shared
+desktop; these controls demonstrate removal of the extra work, not absence
+of regressions for every input shape. Borrowed-rank ownership was checked
+under ASan/UBSan with both serial and parallel sort tests.
