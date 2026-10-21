@@ -1,0 +1,65 @@
+;; affine_float_bias_type.rfl — sum/avg of (col +/- c) over an integer col with
+;; a FLOAT constant c is F64, as the builtin over the column gives it, and so
+;; are the linear forms (* col 2.0) and (- 100.0 col).
+;;
+;; try_affine_sumavg_input folded a whole-number FLOAT c (100.0, 2.0e) into an
+;; integer bias on the integer accumulator, and const_expr_to_i64 did the same
+;; for the linear plan, so SUM came back I64: keyless selects over in-memory
+;; and splayed tables, grouped selects over zero rows, grouped top-N
+;; (desc:/asc: take:) and the parted by-dict route.  100.5 was declined and
+;; already F64.  Now the scalar (keyless) route takes the FLOAT bias and emits
+;; the integer sum as F64; every other route, and the linear plan, decline it.
+;; @requires: posix
+
+;; ─── fixtures: nullable I64 w, I32 i, non-null n and U8 u ──────────────────
+(set T (table [k w n i u] (list [0 1 0 1 0] [1 2 0Nl 4 50] [1 2 3 4 5] (as 'I32 [1 2 0Nl 4 50]) (as 'U8 [1 2 3 4 5]))))
+(.sys.exec "rm -rf /tmp/rfl_affine_f64")
+(.db.splayed.set "/tmp/rfl_affine_f64/sp/t/" T "/tmp/rfl_affine_f64/sp/.sym")
+(set S (.db.splayed.get "/tmp/rfl_affine_f64/sp/t/" "/tmp/rfl_affine_f64/sp/.sym"))
+;; 2000-group sym key over 2 partitions (the parted by-dict route)
+(set K (% (* (til 8000) 7919) 2000))
+(set W (table [s w v] (list (at (as 'SYMBOL (map (fn [j] (format "w%" j)) (til 2000))) K) (as 'I64 (map (fn [k] (if (< (% k 5) 1) 0Nl (% k 13))) K)) (til 8000))))
+(.db.splayed.set "/tmp/rfl_affine_f64/tn/2024.01.01/t/" (take W 4000) "/tmp/rfl_affine_f64/tn/.sym")
+(.db.splayed.set "/tmp/rfl_affine_f64/tn/2024.01.02/t/" (drop W 4000) "/tmp/rfl_affine_f64/tn/.sym")
+(set P (.db.parted.get "/tmp/rfl_affine_f64/tn" 't))
+
+;; ─── keyless, in-memory: c on either side, -, F32 c, narrow columns ───────
+(at (select {m: (sum (+ w 100.0)) from: T}) 'm) -- [457.0]
+(at (select {m: (sum (+ 100.0 w)) from: T}) 'm) -- [457.0]
+(at (select {m: (sum (- w 100.0)) from: T}) 'm) -- [-343.0]
+(at (select {m: (sum (+ w 2.0e)) from: T}) 'm) -- [65.0]
+(at (select {m: (sum (+ i 100.0)) from: T}) 'm) -- [457.0]
+(at (select {m: (sum (+ u 100.0)) from: T}) 'm) -- [515.0]
+
+;; ─── keyless, filtered, zero rows, splayed ────────────────────────────────
+(at (select {m: (sum (+ w 100.0)) from: T where: (> n 3)}) 'm) -- [254.0]
+(at (select {m: (sum (+ w 100.0)) from: T where: (> n 9)}) 'm) -- [0.0]
+(type (at (select {m: (sum (+ w 100.0)) from: (take T 0)}) 'm)) -- 'F64
+(at (select {m: (sum (+ w 100.0)) from: S}) 'm) -- [457.0]
+
+;; ─── the F64 sum does not wrap at 2^63, as the builtin's does not ─────────
+(set B (table [w] (list [9000000000000000000 9000000000000000000])))
+(== (at (at (select {m: (sum (+ w 100.0)) from: B}) 'm) 0) 1.8e19) -- true
+
+;; ─── avg: the F64 values summed, then divided, as the builtin avg does ────
+(set X (+ (at W 'w) -3.0))
+(== (at (select {m: (avg (+ w -3.0)) from: W}) 'm) (enlist (avg X))) -- [true]
+
+;; ─── linear plan: a FLOAT factor or constant over a non-null column ───────
+(at (select {m: (sum (* n 2.0)) from: T}) 'm) -- [30.0]
+(at (select {m: (sum (- 100.0 n)) from: T}) 'm) -- [485.0]
+
+;; ─── grouped: zero rows, top-N, parted by-dict ────────────────────────────
+(type (at (select {m: (sum (+ w 100.0)) from: T by: k where: (> n 9)}) 'm)) -- 'F64
+(type (at (select {m: (sum (+ w 100.0)) from: (take T 0) by: k}) 'm)) -- 'F64
+(at (select {m: (sum (+ w 100.0)) from: T by: k desc: m take: 1}) 'm) -- [251.0]
+(at (select {m: (sum (+ w 100.0)) from: T by: k asc: m take: 1}) 'm) -- [206.0]
+(take (at (select {m: (sum (+ w 100.0)) from: P by: {s: s z: (% v 1) t: s}}) 'm) 3) -- [0.0 432.0 420.0]
+(at (select {m: (sum (+ w 100.0)) from: P by: {s: s z: (% v 1) t: s} desc: m take: 3}) 'm) -- [448.0 448.0 448.0]
+
+;; ─── controls: unchanged on dev ───────────────────────────────────────────
+(at (select {m: (sum (+ w 100.5)) from: T}) 'm) -- [459.0]
+(at (select {m: (sum (+ w 100)) from: T}) 'm) -- [457]
+(at (select {m: (sum (+ w 100.0)) from: T by: k}) 'm) -- [251.0 206.0]
+
+(.sys.exec "rm -rf /tmp/rfl_affine_f64")

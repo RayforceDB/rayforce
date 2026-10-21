@@ -960,6 +960,8 @@ static inline void sym_elem(const ray_t* input, int64_t i,
 
 typedef struct {
     bool    enabled;
+    bool    f64;        /* a FLOAT bias over an integer column: SUM and AVG
+                         * emit F64 from the integer sum (bias_i64 unused) */
     double  bias_f64;
     int64_t bias_i64;
 } agg_affine_t;
@@ -1363,6 +1365,7 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
  * try_prod_sumavg_input_f64 read whole-column pointers: an encoded term not
  * yet materialized declines them (*err NULL). */
 bool try_affine_sumavg_input(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
+                             bool f64_bias_ok,
                              ray_t** out_vec, agg_affine_t* out_affine, ray_t** err);
 bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
                                  agg_linear_t* out_plan, ray_t** err);

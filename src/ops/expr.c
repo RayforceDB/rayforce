@@ -269,15 +269,11 @@ static bool const_expr_to_i64(ray_graph_t* g, ray_op_t* op, int64_t* out) {
     int64_t c_i = 0;
     bool c_is_f64 = false;
     if (!eval_const_numeric_expr(g, op, &c_f, &c_i, &c_is_f64)) return false;
-    if (!c_is_f64) {
-        *out = c_i;
-        return true;
-    }
-    if (!isfinite(c_f)) return false;
-    double ip = 0.0;
-    if (modf(c_f, &ip) != 0.0) return false;
-    if (ip > (double)INT64_MAX || ip < (double)INT64_MIN) return false;
-    *out = (int64_t)ip;
+    /* A FLOAT constant, even a whole-number one (2.0), makes the expression
+     * F64, but the linear plan sums integer terms and emits SUM as I64.
+     * Decline it so the expression is evaluated with its F64 type. */
+    if (c_is_f64) return false;
+    *out = c_i;
     return true;
 }
 
@@ -489,8 +485,10 @@ static ray_t* affine_base_obj(ray_col_src_t* src) {
 /* Detect SUM/AVG affine inputs of form (scan +/- const) and return the scan's
  * column object (a plain vector, or a RAY_ENCCOL the caller binds: see
  * affine_base_obj) plus the additive bias so we can adjust results from
- * (sum,count) directly. */
+ * (sum,count) directly.  f64_bias_ok: the caller emits a FLOAT bias over an
+ * integer column as F64 (agg_affine_t.f64). */
 bool try_affine_sumavg_input(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
+                                    bool f64_bias_ok,
                                     ray_t** out_vec, agg_affine_t* out_affine, ray_t** err) {
     *err = NULL;
     if (!g || !tbl || !input_op || !out_vec || !out_affine) return false;
@@ -557,16 +555,23 @@ bool try_affine_sumavg_input(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
     if (bt == RAY_I64 || bt == RAY_TIMESTAMP ||
         bt == RAY_I32 || bt == RAY_I16 || bt == RAY_U8 || bt == RAY_BOOL ||
         RAY_IS_SYM(bt)) {
-        int64_t c = 0;
+        /* (col +/- c) with a FLOAT c, even a whole-number one (100.0), is
+         * F64.  Only a caller that emits the integer sum as F64 takes it
+         * (f64_bias_ok); every other one declines, and the expression is
+         * evaluated with its F64 type.  A temporal or SYM col + FLOAT is
+         * not an F64 sum at all (the builtin rejects it). */
         if (c_is_f64) {
-            if (!isfinite(c_f)) return false;
-            double ip = 0.0;
-            if (modf(c_f, &ip) != 0.0) return false;
-            if (ip > (double)INT64_MAX || ip < (double)INT64_MIN) return false;
-            c = (int64_t)ip;
-        } else {
-            c = c_i;
+            if (!f64_bias_ok || !isfinite(c_f) ||
+                bt == RAY_TIMESTAMP || RAY_IS_SYM(bt)) return false;
+            base_vec = affine_base_obj(base_src);
+            out_affine->enabled = true;
+            out_affine->f64 = true;
+            out_affine->bias_f64 = (double)sign * c_f;
+            out_affine->bias_i64 = 0;
+            *out_vec = base_vec;
+            return true;
         }
+        int64_t c = c_i;
         base_vec = affine_base_obj(base_src);
         out_affine->enabled = true;
         out_affine->bias_i64 = sign > 0 ? c : -c;
