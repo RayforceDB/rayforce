@@ -94,7 +94,7 @@ ray_op_t* price_f = ray_cast(g, ray_scan(g, "price"), RAY_F64);
 
 ## Binary Operations
 
-Element-wise binary operations. All are fuseable into morsel passes.
+Eligible element-wise binary operations can fuse into morsel passes.
 
 | Function | Opcode | Description |
 |---|---|---|
@@ -116,6 +116,16 @@ Element-wise binary operations. All are fuseable into morsel passes.
 | `ray_ilike(g, a, b)` | `OP_ILIKE` | SQL LIKE (case-insensitive) |
 | `ray_min2(g, a, b)` | `OP_MIN2` | Element-wise minimum |
 | `ray_max2(g, a, b)` | `OP_MAX2` | Element-wise maximum |
+
+Equality constructors can return `NULL` when a known SYM operand is paired
+with a non-SYM/non-STR or unknown logical type. Symbol IDs are not numeric
+comparison values. This is a **construction decline**, not an allocated
+language error: query compilation can fall back to the evaluator, preserving
+value-sensitive null behavior. Direct C callers must check the constructor
+result before passing it to filters, optimization or execution. String literals
+retain their text identity even when execution metadata uses SYM. Symbol/text
+pairs are not rejected by this gate; their existing operand-shape checks still
+apply at execution.
 
 ### ray_if
 
