@@ -91,13 +91,20 @@ column of that name, in that order; one naming neither stays a constant
 symbol.  Arithmetic on a symbol — a literal or a symbol column — is a `type`
 error inside a select, as it is outside.
 
+Equality (`==`) and inequality (`!=`) between a non-null symbol and a
+non-null numeric or boolean value also raise `type`, rather than comparing
+internal symbol IDs. Those IDs are not numeric values and can differ
+between in-memory and file-backed symbol domains. Null operands retain the
+ordinary comparison builtin's value-sensitive null rules; this is not a
+blanket error based only on declared column types.
+
 To use a symbol that is also a column name as a constant, write it as
 `(quote name)` or pass it in through a variable.  `enlist` does not escape it:
 its argument resolves first, so `(enlist 'price)` enlists the `price` column.
 
 ```lisp
 (set t (table [sym price] (list [AAPL GOOG price] [10 20 30])))
-(select {from: t x: (== sym 'price)})          ; x: [false false false], compares with the column
+(select {from: t x: (== sym 'price)})          ; error: type, compares SYM with the I64 column
 (select {from: t x: (== sym (quote price))})   ; x: [false false true]
 ```
 

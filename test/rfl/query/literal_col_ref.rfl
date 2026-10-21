@@ -41,13 +41,12 @@
 ;; --- regression: count-select fast path must agree with materialised select.
 ;; T2 has both a SYM column `s` and a BOOL column `b`.  `'b` names a column,
 ;; so inside the query `(== s 'b)` compares the sym column against the bool
-;; column (0 matches) — the in-query collision rule.  The count fast path
-;; (try_count_simple_compare) and the materialised path MUST return the same
-;; value; pin BOTH to 0 so a future divergence fails the suite.
+;; column — the in-query collision rule, not a literal-symbol comparison.
+;; SYM/BOOL is incompatible: both count-select and materialised select must
+;; report the builtin type error rather than comparing symbol IDs with bits.
 (set T2 (table [s b] (list ['a 'b 'c 'a] [true false true false])))
-(count (select {from: T2 where: (== s 'b)})) -- 0
-(set R2 (select {from: T2 where: (== s 'b)}))
-(count R2) -- 0
+(count (select {from: T2 where: (== s 'b)})) !- type
+(select {from: T2 where: (== s 'b)}) !- type
 
 ;; --- regression: a literal `by:` symbol naming NO column must produce a
 ;; clean column-not-found error (domain) — the SAME as a bare `by: nonexistent`
@@ -75,9 +74,9 @@
 ;; stays the literal even when it names a column (the AST-shape boundary above).
 ;; T2 has SYM col `s` (['a 'b 'c 'a]) and BOOL col `b`.
 ;;   (quote b): literal 'b  -> (== s 'b-literal) matches the 'b row     -> 1
-;;   'b (tick): resolves to col b -> (== s b) sym-vs-bool               -> 0
+;;   'b (tick): resolves to col b -> (== s b) sym-vs-bool               -> type
 (count (select {from: T2 where: (== s (quote b))})) -- 1
-(count (select {from: T2 where: (== s 'b)})) -- 0
+(count (select {from: T2 where: (== s 'b)})) !- type
 ;; a symbol naming NO column: (quote a) and 'a agree (both literal)     -> 2
 (count (select {from: T2 where: (== s (quote a))})) -- 2
 (count (select {from: T2 where: (== s 'a)})) -- 2
