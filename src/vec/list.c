@@ -73,9 +73,6 @@ ray_t* ray_list_append(ray_t* list, ray_t* item) {
     if (!list || RAY_IS_ERR(list)) return list;
 
     /* COW if shared */
-    size_t required;
-    if (!ray_cell_growth_bytes(list->len, 1, sizeof(ray_t*), &required))
-        return ray_error("oom", NULL);
 
     ray_t* original = list;
     list = ray_cow(list);
@@ -85,12 +82,7 @@ ray_t* ray_list_append(ray_t* list, ray_t* item) {
 
     /* Grow if needed */
     if (list->len >= cap) {
-        size_t new_data_size;
-        if (!ray_cell_growth_request(ray_block_data_bytes(list), required, &new_data_size)) {
-            if (list != original) ray_release(list);
-            return ray_error("oom", NULL);
-        }
-        ray_t* new_list = ray_scratch_realloc(list, new_data_size);
+        ray_t* new_list = ray_cell_grow_one(list, sizeof(ray_t*));
         if (!new_list || RAY_IS_ERR(new_list)) {
             if (list != original) ray_release(list);
             return new_list ? new_list : ray_error("oom", NULL);
@@ -158,9 +150,6 @@ ray_t* ray_list_insert_at(ray_t* list, int64_t idx, ray_t* item) {
     if (idx < 0 || idx > list->len) return ray_error("range", "list_insert_at: index out of bounds [0,%lld], got %lld",
                                                      (long long)list->len, (long long)idx);
 
-    size_t required;
-    if (!ray_cell_growth_bytes(list->len, 1, sizeof(ray_t*), &required))
-        return ray_error("oom", NULL);
 
     ray_t* original = list;
     list = ray_cow(list);
@@ -169,12 +158,7 @@ ray_t* ray_list_insert_at(ray_t* list, int64_t idx, ray_t* item) {
     int64_t cap = list_capacity(list);
 
     if (list->len >= cap) {
-        size_t new_data_size;
-        if (!ray_cell_growth_request(ray_block_data_bytes(list), required, &new_data_size)) {
-            if (list != original) ray_release(list);
-            return ray_error("oom", NULL);
-        }
-        ray_t* new_list = ray_scratch_realloc(list, new_data_size);
+        ray_t* new_list = ray_cell_grow_one(list, sizeof(ray_t*));
         if (!new_list || RAY_IS_ERR(new_list)) {
             if (list != original) ray_release(list);
             return new_list ? new_list : ray_error("oom", NULL);
