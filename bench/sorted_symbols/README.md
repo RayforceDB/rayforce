@@ -176,3 +176,23 @@ Construction and validation are outside timing. The machine was a shared
 desktop; these controls demonstrate removal of the extra work, not absence
 of regressions for every input shape. Borrowed-rank ownership was checked
 under ASan/UBSan with both serial and parallel sort tests.
+
+## Unbounded key-count regression
+
+The table caller stores key IDs, columns, rank pointers, rank scratch headers
+and direction bytes in one checked, zeroed heap allocation. The sortedness
+helper borrows the rank buffers directly and has no key-count-sized stack
+arrays; the partition caller supplies no rank buffers at all. Allocation
+failure returns an error before sorting, and the caller frees the block on
+every exit, after releasing any prepared rank headers.
+
+`test/rfl/sort/sort_many_repeated_keys.rfl` checks `xasc` and `xdesc` on tiny
+symbol and integer tables with 300,000 repeated key names. The C regression
+`sort/sorted_many_repeated_keys` checks the query/partition helper directly
+with a heap-backed 300,000-entry column list. These all-tie inputs force the
+checks to visit every key. A reduced-stack sanitizer run verifies stack use
+is independent of the user-supplied key count:
+
+```sh
+(ulimit -s 2048; RAYFORCE_CORES=4 ./rayforce.test -f many_repeated_keys)
+```

@@ -45,6 +45,7 @@
 #include "lang/internal.h"
 #include <string.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 /* ─── Helpers ────────────────────────────────────────────────────── */
 
@@ -1512,6 +1513,24 @@ static test_result_t test_sort_sym_w8_gather(void) {
     PASS();
 }
 
+/* The query/partition helper is also callable with an unbounded key
+ * count. All keys tie, forcing it to visit the entire heap-backed list. */
+static test_result_t test_sorted_many_repeated_keys(void) {
+    ray_heap_init(); ray_sym_init();
+    const int64_t n_keys = 300000;
+    int64_t id = ray_sym_intern("repeated-key", 12);
+    int64_t values[] = {id, id};
+    ray_t* sym = ray_vec_from_raw(RAY_SYM, values, 2);
+    ray_t** cols = calloc((size_t)n_keys, sizeof(*cols));
+    TEST_ASSERT_NOT_NULL(cols);
+    for (int64_t k = 0; k < n_keys; k++) cols[k] = sym;
+    TEST_ASSERT_TRUE(ray_key_cols_sorted(cols, n_keys, 0, 2));
+    TEST_ASSERT_TRUE(ray_key_cols_sorted(cols, n_keys, 1, 2));
+    free(cols); ray_release(sym);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
 /* A late inversion must lend prepared ranks to the real sort without
  * freeing them too early; early/small cases avoid precheck rank setup.
  * Row identities independently verify stability of the repeated keys. */
@@ -1668,6 +1687,7 @@ static test_result_t test_sorted_symbol_rank_check(void) {
 /* ─── Entry table ────────────────────────────────────────────────── */
 
 const test_entry_t sort_entries[] = {
+    { "sort/sorted_many_repeated_keys", test_sorted_many_repeated_keys, NULL, NULL },
     { "sort/unsorted_symbol_rank_reuse", test_unsorted_symbol_rank_reuse, NULL, NULL },
     { "sort/sorted_symbol_sparse_fallback", test_sorted_symbol_sparse_fallback, NULL, NULL },
     { "sort/sorted_symbol_rank_check", test_sorted_symbol_rank_check, NULL, NULL },
