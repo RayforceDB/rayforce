@@ -4344,8 +4344,42 @@ static void sorted_check_fn(void* raw, uint32_t wid, int64_t start, int64_t end)
     }
 }
 
+/* Preparation-only serial probe. Spend at most one morsel of actual
+ * symbol comparisons, rather than one morsel of rows. Equal IDs and keys
+ * bypassed by a preceding key's ordering consume no budget. Constant and
+ * low-transition inputs finish here without any rank preparation. */
+static bool sorted_check_probe(sorted_check_ctx_t* c, int64_t nrows,
+                                int64_t* next_row) {
+    int64_t comparisons = 0;
+    for (int64_t i = 1; i < nrows; i++) {
+        int cmp = 0;
+        for (int64_t k = 0; k < c->n_keys && cmp == 0; k++) {
+            ray_t* col = c->key_cols[k];
+            if (col->type == RAY_SYM) {
+                int64_t ia = ray_read_sym(ray_data(col), i - 1, RAY_SYM, col->attrs);
+                int64_t ib = ray_read_sym(ray_data(col), i, RAY_SYM, col->attrs);
+                if (ia != ib) {
+                    comparisons++;
+                    cmp = sorted_check_sym_cmp(c, k, ia, ib);
+                }
+            } else {
+                int64_t va = read_col_i64(ray_data(col), i - 1, col->type, col->attrs);
+                int64_t vb = read_col_i64(ray_data(col), i, col->type, col->attrs);
+                cmp = (va > vb) - (va < vb);
+            }
+        }
+        if (c->descending ? cmp < 0 : cmp > 0) return false;
+        if (comparisons >= RAY_MORSEL_ELEMS) {
+            *next_row = i + 1;
+            return true;
+        }
+    }
+    *next_row = nrows;
+    return true;
+}
+
 /* Only table scans large enough to use secondary workers prepare ranks,
- * and only after an unranked one-morsel probe finds no inversion. Small,
+ * and only after the unranked probe exhausts its comparison budget. Small,
  * serial and partition checks keep their cheap early-exit string scan.
  * Prepared ranks are returned to the table caller, which either frees them
  * on the sorted shortcut or lends them to the real sort after a late
@@ -4369,9 +4403,8 @@ static bool sorted_check_run(ray_t** key_cols, int64_t n_keys,
         if (key_cols[k]->type == RAY_SYM) { has_sym = true; break; }
     int64_t start = 1;
     if (has_sym && ranks && rank_hdrs && parallel) {
-        sorted_check_fn(&sctx, 0, 1, RAY_MORSEL_ELEMS);
-        if (!atomic_load_explicit(&ordered, memory_order_relaxed)) return false;
-        start = RAY_MORSEL_ELEMS;
+        if (!sorted_check_probe(&sctx, nrows, &start)) return false;
+        if (start == nrows) return true;
         for (int64_t k = 0; k < n_keys; k++) {
             if (key_cols[k]->type != RAY_SYM) continue;
             ranks[k] = build_enum_rank(key_cols[k], nrows, &rank_hdrs[k]);
@@ -4584,8 +4617,9 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
      * input retained: the sort, the whole-table gather and the null/attr
      * propagation all vanish.  Restricted to null-free integer-family and
      * SYM keys: null placement and float NaN ordering belong to the real
-     * sort. A one-morsel serial probe rejects common unsorted inputs before
-     * rank setup. Late inversions reuse prepared ranks in the real sort. */
+     * sort. A bounded-comparison serial probe rejects common unsorted inputs
+     * and finishes low-transition inputs without rank setup. Late inversions
+     * after rank setup reuse prepared ranks in the real sort. */
     {
         bool detectable = true;
         for (int64_t k = 0; k < n_keys && detectable; k++) {

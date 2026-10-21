@@ -25,8 +25,11 @@ require a symbol comparison on every row. Resolving those symbol IDs inside
 parallel workers takes the shared runtime symbol lock repeatedly. Preparing
 lexical ranks with `build_enum_rank` before dispatch replaces those lookups
 with integer comparisons for large parallel table checks. First, an unranked
-one-morsel probe rejects an early inversion without preparing ranks. Small
-tables and scans without secondary workers retain the serial string scan. When ranks are unavailable because
+probe budgets one morsel (1024) of actual unequal-ID symbol comparisons,
+rather than rows. Constant, low-transition, and bypassed secondary keys can
+finish that probe without rank setup. A preceding key that already orders a
+pair consumes no symbol budget. Early inversions still stop immediately.
+Small tables and scans without secondary workers retain the serial scan. When ranks are unavailable because
 of the density budget or allocation failure, the check keeps the string
 comparator and scans serially; unavailable ranks never mean "not sorted".
 Integer-only keys retain their existing parallel scan. Null and type
@@ -124,8 +127,10 @@ upstream, rather than preparing ranks without secondary workers:
 `unsorted_work.c` pads the runtime domain with 60,000 unused names before
 creating the used keys. It exercises ascending and descending table sorts:
 8-row unsorted input, 200,000-row input with an inversion at the first pair,
-and 200,000-row input with an inversion at the last pair. The latter passes
-the leading probe and exercises borrowed rank lifetime. It also checks the
+and 200,000-row input with an inversion at the last pair. Under the current
+adaptive probe, that low-transition late inversion is discovered without
+preparing ranks. A separate high-transition sorted-prefix C regression
+exercises the rank handoff and borrowed lifetime after the budget is spent. It also checks the
 large unsorted case without secondary workers. Every output key is checked.
 The C regression additionally verifies stable row identities for these cases.
 
@@ -144,7 +149,7 @@ For string-resolution counts, add `-DCOUNT_RESOLUTIONS` and
 instrumented build. The probe initializes five total workers for the first
 six cases, then one for the serial control.
 
-| Case (ascending) | Resolutions at eaff260a | After unsorted fix |
+| Case (ascending) | Resolutions at eaff260a | At 8fcd0bc4 |
 |---|---:|---:|
 | Small | 60029 | 28 |
 | Early inversion | 120006 | 60005 |
@@ -157,7 +162,8 @@ prepares that map once and lends it to the real sort. Small input stays on
 the comparison path without a dense LUT. Counts are measured over the entire
 table sort, including its precheck, rather than just the precheck.
 
-The uninstrumented ascending medians in milliseconds were:
+The uninstrumented ascending medians in milliseconds at the unsorted-input
+revision `8fcd0bc4` were:
 
 | Case | Upstream 64645998 | eaff260a | After unsorted fix |
 |---|---:|---:|---:|
@@ -196,3 +202,64 @@ is independent of the user-supplied key count:
 ```sh
 (ulimit -s 2048; RAYFORCE_CORES=4 ./rayforce.test -f many_repeated_keys)
 ```
+
+## Large constant and low-transition controls
+
+`constant_work.c` reproduces the additional review case with three total
+participants, 70,000 unused names interned before the used keys, and 65,537
+rows. It checks ascending and descending sorts for a constant symbol key,
+two long symbol runs, and a changing secondary symbol key bypassed by a
+unique leading integer key. Every output key and row identity is validated.
+
+Build it like `unsorted_work.c`, substituting `constant_work.c`. By default
+it reports uninstrumented sort time. Adding `-DCOUNT_RESOLUTIONS` and
+`-Wl,--wrap=ray_sym_domain_str` asserts exact lookup counts: zero, two, and
+zero for those three cases. The previous `73f7c0ea` source fails these work
+assertions while still returning correct rows.
+
+| Shape, 65,537 rows | Upstream lookups | At 73f7c0ea | Adaptive probe |
+|---|---:|---:|---:|
+| Constant | 0 | 70003 | 0 |
+| Two long runs | 2 | 70003 | 2 |
+| Secondary key bypassed | 0 | 70003 | 0 |
+
+Counts agree in both directions. The larger raw ID prefix in the review's
+process produced 70,422 lookups; this fresh process has 70,003 prefix IDs.
+The underlying issue and repaired work counts are the same.
+
+Uninstrumented ascending medians over three processes after one warm-up:
+
+| Shape | Upstream, ms | At 73f7c0ea, ms | Adaptive probe, ms |
+|---|---:|---:|---:|
+| Constant | 0.080 | 3.771 | 0.091 |
+| Two long runs | 0.069 | 2.440 | 0.084 |
+| Secondary key bypassed | 0.625 | 3.252 | 0.530 |
+
+Other release objects were identical. The upstream and old sort objects
+used clang `-O3 -march=native -std=c17`; the current object uses the release
+Makefile flags. Inputs/validation are outside timing, cases run in fixed
+order, and the host was shared. Submillisecond differences are not rankings.
+The work-count checks, rather than the timings, pin the removal of setup.
+
+The adaptive probe leaves the worker comparator, heap buffer ownership,
+sparse fallback, partition route, and borrowed-rank handoff unchanged. The
+single-outlier late-inversion work control now makes 60,007 resolutions:
+four probe lookups plus one 60,003-ID real-sort rank build. Early, small and
+serial counts remain 60,005, 28 and 60,005. The updated C stability test has
+1024 actual symbol comparisons in its sorted prefix, then a late inversion,
+so ASan/UBSan still exercises the handoff instead of accidentally bypassing
+it. Constant, two-run and bypassed-key C tests cover the newly cheap route.
+
+A contemporary dense-target control linked the `73f7c0ea` sort source with
+matching release flags and otherwise identical objects. Three observations
+after a warm-up, on the same shared host:
+
+| Secondary workers | 73f7c0ea symbols, ms | Adaptive symbols, ms | 73f7c0ea integers, ms | Adaptive integers, ms |
+|---:|---:|---:|---:|---:|
+| 4 | 19.881 | 20.554 | 18.036 | 16.930 |
+| 16 | 21.416 | 20.914 | 19.399 | 18.585 |
+
+The parallel contention fix remains effective; small differences should not
+be treated as a regression factor. Earlier measurements near 14 ms used a
+different host load/CPU state, so this table compares the two revisions in
+the current session instead of comparing only against historical timings.

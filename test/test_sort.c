@@ -1513,6 +1513,60 @@ static test_result_t test_sort_sym_w8_gather(void) {
     PASS();
 }
 
+/* A large late-used constant/low-transition key must finish the probe,
+ * rather than resolving an entire intern prefix merely for passing 64K. */
+static test_result_t test_sorted_large_constant_symbols(void) {
+    ray_heap_init(); ray_sym_init();
+    for (int i = 0; i < 70000; i++) {
+        char name[40]; int len = snprintf(name, sizeof(name), "constant-padding-%d", i);
+        ray_sym_intern(name, (size_t)len);
+    }
+    int64_t z = ray_sym_intern("constant-z", 10);
+    int64_t a = ray_sym_intern("constant-a", 10);
+    TEST_ASSERT_TRUE(a > 65536);
+    int64_t sn = ray_sym_intern("s", 1), tn = ray_sym_intern("t", 1);
+    int64_t rn = ray_sym_intern("row", 3);
+    int64_t key_ids[] = {tn, sn};
+    ray_t* one_key = make_sym_atom(sn);
+    ray_t* two_keys = ray_vec_from_raw(RAY_SYM, key_ids, 2);
+    const int64_t n = RAY_PARALLEL_THRESHOLD + 1;
+    for (int desc = 0; desc < 2; desc++) {
+        for (int kind = 0; kind < 3; kind++) {
+            ray_t* sym = ray_vec_new(RAY_SYM, n);
+            ray_t* time = ray_vec_new(RAY_I64, n);
+            ray_t* row = ray_vec_new(RAY_I64, n);
+            sym->len = time->len = row->len = n;
+            for (int64_t i = 0; i < n; i++) {
+                bool first = kind == 2 ? i % 2 == 0 : i < n / 2;
+                ((int64_t*)ray_data(sym))[i] = kind == 0 ? a : (first ? (desc ? z : a) : (desc ? a : z));
+                ((int64_t*)ray_data(time))[i] = desc ? n - 1 - i : i;
+                ((int64_t*)ray_data(row))[i] = i;
+            }
+            ray_t* table = ray_table_new(3);
+            table = ray_table_add_col(table, sn, sym);
+            table = ray_table_add_col(table, tn, time);
+            table = ray_table_add_col(table, rn, row);
+            ray_t* keys = kind == 2 ? two_keys : one_key;
+            ray_t* result = desc ? ray_xdesc_fn(table, keys) : ray_xasc_fn(table, keys);
+            TEST_ASSERT_NOT_NULL(result);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+            if (kind != 2) TEST_ASSERT_TRUE(result == table);
+            TEST_ASSERT_EQ_I(ray_table_nrows(result), n);
+            ray_t* result_rows = ray_table_get_col(result, rn);
+            ray_t* result_syms = ray_table_get_col(result, sn);
+            for (int64_t i = 0; i < n; i++) {
+                TEST_ASSERT_EQ_I(((int64_t*)ray_data(result_rows))[i], i);
+                TEST_ASSERT_EQ_I(ray_read_sym(ray_data(result_syms), i, result_syms->type, result_syms->attrs), ((int64_t*)ray_data(sym))[i]);
+            }
+            ray_release(result); ray_release(table);
+            ray_release(sym); ray_release(time); ray_release(row);
+        }
+    }
+    ray_release(one_key); ray_release(two_keys);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
 /* The query/partition helper is also callable with an unbounded key
  * count. All keys tie, forcing it to visit the entire heap-backed list. */
 static test_result_t test_sorted_many_repeated_keys(void) {
@@ -1546,16 +1600,21 @@ static test_result_t test_unsorted_symbol_rank_reuse(void) {
     for (int desc = 0; desc < 2; desc++) {
         for (int kind = 0; kind < 3; kind++) {
             int64_t n = kind == 0 ? 8 : 200000;
-            int64_t inversion = kind == 2 ? n - 2 : 0;
+            int64_t block = kind == 0 ? n : 100;
+            int64_t inversion = (kind == 2 ? n - block : 0) + block / 2 - 1;
             ray_t* sym = ray_vec_new(RAY_SYM, n);
             ray_t* time = ray_vec_new(RAY_I64, n);
             ray_t* row = ray_vec_new(RAY_I64, n);
             sym->len = time->len = row->len = n;
             for (int64_t i = 0; i < n; i++) {
-                ((int64_t*)ray_data(sym))[i] = i == inversion ? (desc ? a : z) : (desc ? z : a);
-                ((int64_t*)ray_data(time))[i] = 0;
+                bool first = i % block < block / 2;
+                ((int64_t*)ray_data(sym))[i] = first ? (desc ? z : a) : (desc ? a : z);
+                ((int64_t*)ray_data(time))[i] = (desc ? n - 1 - i : i) / block;
                 ((int64_t*)ray_data(row))[i] = i;
             }
+            int64_t* sv = ray_data(sym);
+            int64_t swap = sv[inversion];
+            sv[inversion] = sv[inversion + 1]; sv[inversion + 1] = swap;
             ray_t* table = ray_table_new(3);
             table = ray_table_add_col(table, ts_name, time);
             table = ray_table_add_col(table, sym_name, sym);
@@ -1567,8 +1626,9 @@ static test_result_t test_unsorted_symbol_rank_reuse(void) {
             ray_t* out_sym = ray_table_get_col(result, sym_name);
             ray_t* out_row = ray_table_get_col(result, row_name);
             for (int64_t i = 0; i < n; i++) {
-                int64_t expected_sym = i == n - 1 ? (desc ? a : z) : (desc ? z : a);
-                int64_t expected_row = i == n - 1 ? inversion : i + (i >= inversion);
+                bool first = i % block < block / 2;
+                int64_t expected_sym = first ? (desc ? z : a) : (desc ? a : z);
+                int64_t expected_row = i == inversion ? i + 1 : (i == inversion + 1 ? i - 1 : i);
                 TEST_ASSERT_EQ_I(ray_read_sym(ray_data(out_sym), i, out_sym->type, out_sym->attrs), expected_sym);
                 TEST_ASSERT_EQ_I(((int64_t*)ray_data(out_row))[i], expected_row);
             }
@@ -1687,6 +1747,7 @@ static test_result_t test_sorted_symbol_rank_check(void) {
 /* ─── Entry table ────────────────────────────────────────────────── */
 
 const test_entry_t sort_entries[] = {
+    { "sort/sorted_large_constant_symbols", test_sorted_large_constant_symbols, NULL, NULL },
     { "sort/sorted_many_repeated_keys", test_sorted_many_repeated_keys, NULL, NULL },
     { "sort/unsorted_symbol_rank_reuse", test_unsorted_symbol_rank_reuse, NULL, NULL },
     { "sort/sorted_symbol_sparse_fallback", test_sorted_symbol_sparse_fallback, NULL, NULL },
