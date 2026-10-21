@@ -40,6 +40,7 @@
 #include <rayforce.h>
 #include "mem/heap.h"
 #include "ops/ops.h"
+#include "ops/internal.h"
 #include "table/sym.h"
 #include "lang/internal.h"
 #include <string.h>
@@ -1511,9 +1512,60 @@ static test_result_t test_sort_sym_w8_gather(void) {
     PASS();
 }
 
+/* Lexical rank checks must not compare raw intern order. Exercise the
+ * generic and specialized key orders, both directions, and a late inversion
+ * beyond a dispatch boundary. The runner's pool supplies parallel coverage. */
+static test_result_t test_sorted_symbol_rank_check(void) {
+    ray_heap_init();
+    ray_sym_init();
+    int64_t z = ray_sym_intern("rank-z", 6);
+    int64_t a = ray_sym_intern("rank-a", 6);
+    TEST_ASSERT_TRUE(z < a);
+    const int64_t n = 200000;
+    ray_t* sym = ray_vec_new(RAY_SYM, n);
+    ray_t* time = ray_vec_new(RAY_I64, n);
+    sym->len = time->len = n;
+    int64_t* sv = ray_data(sym);
+    int64_t* tv = ray_data(time);
+    ray_t* cols[] = {time, sym};
+    for (int direction = 0; direction < 2; direction++) {
+        for (int64_t i = 0; i < n; i++) {
+            int64_t j = direction ? n - 1 - i : i;
+            tv[i] = j / 2;
+            sv[i] = j % 2 ? z : a;
+        }
+        TEST_ASSERT_TRUE(ray_key_cols_sorted(cols, 2, direction, n));
+        TEST_ASSERT_FALSE(ray_key_cols_sorted(cols, 2, !direction, n));
+        /* Swap a same-time symbol pair late in the column. */
+        int64_t v = sv[n - 2]; sv[n - 2] = sv[n - 1]; sv[n - 1] = v;
+        TEST_ASSERT_FALSE(ray_key_cols_sorted(cols, 2, direction, n));
+        cols[0] = sym; cols[1] = time;
+        for (int64_t i = 0; i < n; i++) {
+            int64_t j = direction ? n - 1 - i : i;
+            sv[i] = j < n / 2 ? a : z;
+            tv[i] = j % (n / 2);
+        }
+        TEST_ASSERT_TRUE(ray_key_cols_sorted(cols, 2, direction, n));
+        tv[n - 1] = direction ? n : -1;
+        TEST_ASSERT_FALSE(ray_key_cols_sorted(cols, 2, direction, n));
+        cols[0] = time; cols[1] = sym;
+    }
+    /* Symbol nulls must still decline the shortcut, even for one row. */
+    int64_t null_id = 0;
+    ray_t* nullable = ray_vec_from_raw(RAY_SYM, &null_id, 1);
+    TEST_ASSERT_FALSE(ray_key_cols_sorted(&nullable, 1, 0, 1));
+    ray_release(nullable);
+    ray_release(time);
+    ray_release(sym);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 /* ─── Entry table ────────────────────────────────────────────────── */
 
 const test_entry_t sort_entries[] = {
+    { "sort/sorted_symbol_rank_check", test_sorted_symbol_rank_check, NULL, NULL },
     /* xrank tests */
     { "sort/xrank_basic",               test_xrank_basic,               NULL, NULL },
     { "sort/xrank_single_group",        test_xrank_single_group,        NULL, NULL },
