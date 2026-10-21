@@ -4575,7 +4575,9 @@ static void binary_range(ray_op_t* op, int8_t out_type,
                     for(int64_t i=0;i<n;i++){double lv=LV_READ(i),rv=RV_READ(i);odst[i]=rv!=0.0?ray_cast_f64_to_i16_null(floor(lv/rv)):0;}
                 }
                 break;
-            case OP_MOD: for(int64_t i=0;i<n;i++){int16_t li=(int16_t)LV_INT(i),ri=(int16_t)RV_INT(i);odst[i]=ri?li%ri:0;}break;
+            /* Floor modulo, the sign of the divisor, as in the I32 / I64
+             * arms (bare C % truncated: (% -7h 2h) gave -1, builtin 1). */
+            case OP_MOD: for(int64_t i=0;i<n;i++){int16_t li=(int16_t)LV_INT(i),ri=(int16_t)RV_INT(i);int16_t r;if(ri==0||(ri==-1&&li==INT16_MIN)){r=0;}else{r=(int16_t)(li%ri);if(r&&(r^ri)<0)r=(int16_t)(r+ri);}odst[i]=r;}break;
             case OP_MIN2:for(int64_t i=0;i<n;i++){int16_t li=(int16_t)LV_INT(i),ri=(int16_t)RV_INT(i);odst[i]=li<ri?li:ri;}break;
             case OP_MAX2:for(int64_t i=0;i<n;i++){int16_t li=(int16_t)LV_INT(i),ri=(int16_t)RV_INT(i);odst[i]=li>ri?li:ri;}break;
             default:     for(int64_t i=0;i<n;i++)odst[i]=0;break;
@@ -5050,7 +5052,8 @@ ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* 
                 is_zero = (r_f64_val == 0.0);
             else
                 is_zero = (r_i64_val == 0);
-            if (opc == OP_MOD && rhs->type == -RAY_U8)
+            /* rt: an atom or a length-one vector alike */
+            if (opc == OP_MOD && rt == RAY_U8)
                 is_zero = false;   /* unsigned byte modulo: 0, no null */
             if (is_zero) {
                 for (int64_t i = 0; i < len; i++)

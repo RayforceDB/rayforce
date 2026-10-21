@@ -84,6 +84,43 @@
 (at (select {s: (sum (% k j)) from: B}) 's) -- (enlist (sum (% (at B 'k) (at B 'j))))
 (at (select {x: (div k j) from: B}) 'x) -- (div (at B 'k) (at B 'j))
 
+;; ── `%` by a U8 divisor ─────────────────────────────────────────────────────
+;; A zero U8 divisor gives the builtin's 0 (U8 has no null).  A length-one
+;; U8 column is a scalar to the typed executor, and its zero-divisor pass
+;; nulled it where an atom 0x00 gave 0.
+(set Z (table [k u] (list [5] (as 'U8 [0]))))
+(at (select {x: (% k u) from: Z}) 'x) -- [0]
+(nil? (at (select {x: (% k u) from: Z}) 'x)) -- [false]
+(at (select {n: (sum (nil? (% k u))) from: Z}) 'n) -- [0]
+(at (update {x: (% k u) from: Z}) 'x) -- [0]
+(set Z (table [k u] (list [-7] (as 'U8 [0]))))
+(at (select {x: (% k u) from: Z}) 'x) -- (% (at Z 'k) (at Z 'u))
+(nil? (at (select {x: (% k u) from: Z}) 'x)) -- [false]
+(at (select {x: k from: Z where: (nil? (% k u))}) 'x) -- (take [0] 0)
+(at (update {x: (% k u) from: Z}) 'x) -- [0]
+(set Z (table [h u] (list (as 'I16 [-7]) (as 'U8 [0]))))
+(at (select {x: (% h u) from: Z}) 'x) -- (% (at Z 'h) (at Z 'u))
+(nil? (at (select {x: (% h u) from: Z}) 'x)) -- [false]
+(at (select {n: (sum (nil? (% h u))) from: Z}) 'n) -- [0]
+;; A narrow dividend takes the typed executor's I16 arm, which computed
+;; bare C % ((% -7h 2) gave -1, builtin 1): floor modulo, as I32 / I64.
+(set Z (table [h u] (list (as 'I16 [-7 -7]) (as 'U8 [2 2]))))
+(list (at (select {x: (% h u) from: Z}) 'x) (% (at Z 'h) (at Z 'u))) -- (list (as 'I16 [1 1]) (as 'I16 [1 1]))
+(set Z (table [h u] (list (as 'I16 [-7 300 5 -1]) (as 'U8 [3 7 0 4]))))
+(at (select {x: (% h u) from: Z}) 'x) -- (as 'I16 [2 6 0 3])
+(at (update {x: (% h u) from: Z}) 'x) -- (as 'I16 [2 6 0 3])
+(at (select {x: (% h 0x03) from: Z}) 'x) -- (as 'I16 [2 0 2 2])
+
+;; ── floor modulo in the I16 arm (xbar's lowering, I16 divisors) ─────────────
+;; xbar lowers to (- x (% x b)) with floor modulo; with a U8 bucket the
+;; modulo takes the typed executor.
+(set X (table [h u] (list (as 'I16 [-7 300 5 9 -1]) (as 'U8 [3 7 1 2 4]))))
+(at (select {x: (xbar h u) from: X}) 'x) -- (xbar (at X 'h) (at X 'u))
+(at (select {x: (xbar h u) from: X}) 'x) -- (as 'I16 [-9 294 5 8 -4])
+(at (select {x: (xbar h 0x07) from: X}) 'x) -- (xbar (at X 'h) 0x07)
+(at (select {x: (% h (as 'I16 [3 3 3 3 3])) from: X}) 'x) -- (% (at X 'h) (as 'I16 [3 3 3 3 3]))
+(at (select {x: (% h (as 'I16 [-3 -3 -3 -3 -3])) from: X}) 'x) -- (% (at X 'h) (as 'I16 [-3 -3 -3 -3 -3]))
+
 ;; ── splayed and parted tables ───────────────────────────────────────────────
 (.sys.exec "rm -rf /tmp/rfl_fused_zero_divisor")
 (.db.splayed.set "/tmp/rfl_fused_zero_divisor/sp/t/" T "/tmp/rfl_fused_zero_divisor/sp/.sym")
