@@ -1513,6 +1513,64 @@ static test_result_t test_sort_sym_w8_gather(void) {
     PASS();
 }
 
+/* Both sides of the comparison budget must retain the typed SYM-first
+ * route. Signed secondary values and a late secondary inversion exercise
+ * its raw-i64 compare and the borrowed-rank path after many symbol runs. */
+static test_result_t test_sorted_sym_i64_probe(void) {
+    ray_heap_init(); ray_sym_init();
+    int64_t* ids = calloc(2048, sizeof(*ids));
+    TEST_ASSERT_NOT_NULL(ids);
+    for (int i = 2047; i >= 0; i--) {
+        char name[32]; int len = snprintf(name, sizeof(name), "typed-%04d", i);
+        ids[i] = ray_sym_intern(name, (size_t)len);
+    }
+    int64_t sn = ray_sym_intern("s", 1), tn = ray_sym_intern("t", 1);
+    int64_t rn = ray_sym_intern("row", 3);
+    int64_t key_ids[] = {sn, tn};
+    ray_t* keys = ray_vec_from_raw(RAY_SYM, key_ids, 2);
+    const int8_t types[] = {RAY_I64, RAY_TIMESTAMP};
+    for (int type = 0; type < 2; type++) {
+        for (int busy = 0; busy < 2; busy++) {
+            int64_t runs = busy ? 2048 : 100, run_rows = busy ? 100 : 2000;
+            int64_t n = runs * run_rows;
+            for (int inversion = 0; inversion < 2; inversion++) {
+                ray_t* sym = ray_vec_new(RAY_SYM, n);
+                ray_t* time = ray_vec_new(types[type], n);
+                ray_t* row = ray_vec_new(RAY_I64, n);
+                sym->len = time->len = row->len = n;
+                for (int64_t i = 0; i < n; i++) {
+                    ((int64_t*)ray_data(sym))[i] = ids[i / run_rows];
+                    ((int64_t*)ray_data(time))[i] = (i % run_rows - run_rows / 2) * 1000000;
+                    ((int64_t*)ray_data(row))[i] = i;
+                }
+                if (inversion) ((int64_t*)ray_data(time))[n - 1] = ((int64_t*)ray_data(time))[n - 2] - 1;
+                ray_t* table = ray_table_new(3);
+                table = ray_table_add_col(table, sn, sym);
+                table = ray_table_add_col(table, tn, time);
+                table = ray_table_add_col(table, rn, row);
+                ray_t* result = ray_xasc_fn(table, keys);
+                TEST_ASSERT_NOT_NULL(result);
+                TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+                TEST_ASSERT_EQ_I(ray_table_nrows(result), n);
+                ray_t* os = ray_table_get_col(result, sn);
+                ray_t* ot = ray_table_get_col(result, tn);
+                ray_t* orow = ray_table_get_col(result, rn);
+                for (int64_t i = 0; i < n; i++) {
+                    int64_t r = inversion && i >= n - 2 ? (i == n - 2 ? n - 1 : n - 2) : i;
+                    TEST_ASSERT_EQ_I(((int64_t*)ray_data(orow))[i], r);
+                    TEST_ASSERT_EQ_I(ray_read_sym(ray_data(os), i, os->type, os->attrs), ids[r / run_rows]);
+                    TEST_ASSERT_EQ_I(((int64_t*)ray_data(ot))[i], ((int64_t*)ray_data(time))[r]);
+                }
+                ray_release(result); ray_release(table);
+                ray_release(sym); ray_release(time); ray_release(row);
+            }
+        }
+    }
+    free(ids); ray_release(keys);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
 /* A large late-used constant/low-transition key must finish the probe,
  * rather than resolving an entire intern prefix merely for passing 64K. */
 static test_result_t test_sorted_large_constant_symbols(void) {
@@ -1747,6 +1805,7 @@ static test_result_t test_sorted_symbol_rank_check(void) {
 /* ─── Entry table ────────────────────────────────────────────────── */
 
 const test_entry_t sort_entries[] = {
+    { "sort/sorted_sym_i64_probe", test_sorted_sym_i64_probe, NULL, NULL },
     { "sort/sorted_large_constant_symbols", test_sorted_large_constant_symbols, NULL, NULL },
     { "sort/sorted_many_repeated_keys", test_sorted_many_repeated_keys, NULL, NULL },
     { "sort/unsorted_symbol_rank_reuse", test_unsorted_symbol_rank_reuse, NULL, NULL },

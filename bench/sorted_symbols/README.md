@@ -263,3 +263,60 @@ The parallel contention fix remains effective; small differences should not
 be treated as a regression factor. Earlier measurements near 14 ms used a
 different host load/CPU state, so this table compares the two revisions in
 the current session instead of comparing only against historical timings.
+
+## Typed SYM-first scan control
+
+The comparison-budget probe shares the existing ascending SYM-first raw-i64
+scan with the worker for I64 and TIMESTAMP secondary keys. Rows within a
+symbol run compare the secondary values directly, with no generic key/type
+loop. The budget is polled only at symbol run boundaries; low-transition
+inputs still finish without rank setup. This does not restore unconditional
+row-count-based rank preparation or change the separate TIME-width repair.
+
+`typed_runs.c` reproduces the review recipe: 100 lexical symbols, 20,000
+contiguous rows each, with signed secondary values
+`(i % 20000 - 10000) * 1000000`. It times whole `ray_xasc_fn` and checks
+all output keys and both original source buffers outside timing. Symbol
+creation order is the reverse of lexical order. Two arguments select total
+participants and whether the secondary type is TIMESTAMP (1) or I64 (0).
+
+After `make release`, build from the repository root:
+
+```sh
+clang -O3 -march=native -std=c17 -Iinclude -Isrc \
+  bench/sorted_symbols/typed_runs.c \
+  $(find src -name '*.rel.o' ! -path 'src/app/main.rel.o') \
+  -lm -lpthread -o /tmp/typed-runs
+taskset -c 0,1,2,3 /tmp/typed-runs 4 0
+taskset -c 0,1,2,3 /tmp/typed-runs 4 1
+```
+
+Choose four CPUs available in the current affinity mask. The reported
+comparison used CPUs 0–3, two discarded warm-up processes per case, then
+12 fresh processes per case in randomized order (Python seed 937). There
+were no concurrent local test/build jobs. The host/governor remained shared
+and uncontrolled. Each variant replaced only the sort object, compiled with
+matching release flags; all other release objects and the driver were
+identical. The upstream reference is 64645998, rather than the reviewer's
+later a587 reference; this is an independent reproduction on this host.
+
+| Secondary type | Total participants | Upstream median, ms | 43415820, ms | Typed probe, ms |
+|---|---:|---:|---:|---:|
+| I64 | 1 | 9.619 | 9.956 | 9.784 |
+| I64 | 4 | 9.177 | 13.513 | 9.788 |
+| TIMESTAMP | 1 | 9.654 | 9.980 | 9.825 |
+| TIMESTAMP | 4 | 9.386 | 13.661 | 9.820 |
+
+The probe retains serial execution while deciding whether ranks are useful;
+this fixes its generic per-cell dispatch overhead, rather than claiming the
+same parallel strategy or identical latency as upstream. Four-participant
+I64 ranges were 8.911–15.177 ms upstream, 13.307–14.724 ms on 43415820,
+and 9.083–16.666 ms with the typed probe. These are workload controls, not
+universal performance guarantees.
+
+The C regression `sort/sorted_sym_i64_probe` covers both secondary types,
+negative/positive values, 100 low-transition runs, 2048 runs that spend the
+budget, and a late secondary inversion. It verifies every row identity and
+key after sorting. The high-transition inversion still exercises borrowed
+rank lifetime; constant/work-count, sparse/streaming and reduced-stack
+regressions remain separate controls.
