@@ -267,6 +267,12 @@ The single quote `'` prevents evaluation, creating a symbol atom. Useful for col
 
 `quote` returns its argument unevaluated. When the argument is a bare name, the result is a literal symbol — `(quote name)` is equal to the tick form `'name`. Such a literal symbol, when it names a from-table column, resolves to that column during query evaluation. This is how the dynamic-query idiom works: a query assembled as data evaluates `(quote name)` to the literal symbol `'name` during construction, and that symbol resolves to the column when the query runs (see [IPC](../storage/ipc.md)). Inside a query, the tick form `'name` and a bare `name` resolve the same way.
 
+An inline `(quote name)` node written directly inside a query expression is
+different: it keeps a literal symbol even when a column has that name (see
+[Select](../queries/select.md)). In the dynamic-query idiom above, `quote`
+was evaluated while constructing the query as data, before query evaluation.
+
+
 ## Comments
 
 Line comments start with a semicolon and extend to the end of the line:
